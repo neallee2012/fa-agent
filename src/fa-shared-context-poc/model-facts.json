@@ -1,0 +1,40 @@
+{
+  "gpt-4.1-mini": {
+    "context_window_tokens": null,
+    "max_output_tokens": 32768,
+    "input_microusd_per_million": 400000,
+    "output_microusd_per_million": 1600000,
+    "supports_reasoning_effort": false,
+    "supports_image_input": true
+  },
+  "gpt-5.4-mini": {
+    "context_window_tokens": 400000,
+    "max_prompt_tokens": 272000,
+    "max_output_tokens": 128000,
+    "input_microusd_per_million": 750000,
+    "output_microusd_per_million": 4500000,
+    "supports_reasoning_effort": true,
+    "supports_image_input": true,
+    "supports_reasoning_summary": true
+  },
+  "gpt-6-luna": {
+    "context_window_tokens": 1050000,
+    "max_prompt_tokens": 272000,
+    "max_output_tokens": 128000,
+    "input_microusd_per_million": 100000,
+    "output_microusd_per_million": 500000,
+    "supports_reasoning_effort": true,
+    "supports_image_input": true,
+    "supports_reasoning_summary": true
+  },
+  "gpt-6.1-sol": {
+    "context_window_tokens": 1050000,
+    "max_prompt_tokens": 272000,
+    "max_output_tokens": 128000,
+    "input_microusd_per_million": 2000000,
+    "output_microusd_per_million": 10000000,
+    "supports_reasoning_effort": true,
+    "supports_image_input": true,
+    "supports_reasoning_summary": true
+  }
+}

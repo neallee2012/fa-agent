@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!Dockerfile.diagnostics
+!Dockerfile.smb-oauth
+!requirements.txt
+!requirements-smb-oauth.txt
+!main.py
+!poc_core.py
+!desktop_smoke.py
+!smb_oauth.py
+!check_smb_oauth_image.py
+!Dockerfile.smb-diagnostics
+!smb_diagnostics.py

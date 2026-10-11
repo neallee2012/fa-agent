@@ -1,0 +1,11 @@
+FROM crcontosodemo01.azurecr.io/fa-hosted-sandbox-poc/fa-hosted-sandbox-poc-faexample@sha256:10b6f915a0f425c93e7acd056d536bd704cdb49e4059693f94ebff08364e95b9
+ENV POC_MI_MOUNT_DIAGNOSTICS=1
+ENV POC_MI_NETWORK_DIAGNOSTICS=1
+ENV POC_MI_KEY_DIAGNOSTICS=1
+COPY poc_core.py smb_diagnostics.py /app/
+RUN printf 'create cifs.spnego * * /usr/local/bin/python /app/smb_diagnostics.py %%k\n' > /etc/request-key.d/cifs.spnego.conf \
+    && printf 'create user fa-poc-callout:* * |/bin/echo fa-poc-probe\n' > /etc/request-key.d/fa-poc-callout.conf \
+    && mkdir -p /team \
+    && python -m py_compile /app/poc_core.py /app/smb_diagnostics.py \
+    && python /app/smb_diagnostics.py --self-check \
+    && dmesg --kernel --syslog --buffer-size=65536 --color=never --nopager --help > /dev/null

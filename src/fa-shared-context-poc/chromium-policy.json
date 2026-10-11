@@ -1,0 +1,5 @@
+{
+  "URLBlocklist": ["*", "javascript://*"],
+  "URLAllowlist": ["http://127.0.0.1"],
+  "DeveloperToolsAvailability": 2
+}

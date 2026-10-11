@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "westus3"
+    },
+    "identityName": {
+      "value": "id-fa-stage-deploy"
+    },
+    "federatedSubject": {
+      "value": "repo:example-owner@0000000/foundry-agents@0000000000:environment:staging:ref:refs/heads/main"
+    },
+    "registryName": {
+      "value": "crfacontextstagedemo"
+    },
+    "apiAppName": {
+      "value": "ca-fa-behavior-stage"
+    },
+    "syncJobName": {
+      "value": "job-fa-agent-sync-stage"
+    },
+    "apiIdentityName": {
+      "value": "id-facontext-api-stage"
+    },
+    "extraAppNames": {
+      "value": ["ca-fa-console-stage", "ca-fa-feed-stage"]
+    },
+    "extraIdentityNames": {
+      "value": ["id-fa-console-stage", "id-fa-feed-stage"]
+    }
+  }
+}

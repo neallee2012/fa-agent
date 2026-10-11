@@ -1,0 +1,9 @@
+FROM python:3.11.14-slim-bookworm
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt && useradd --create-home --uid 10001 app
+COPY shared_context ./shared_context
+USER 10001
+EXPOSE 8080
+CMD ["python", "-m", "uvicorn", "shared_context.production:create_production_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]

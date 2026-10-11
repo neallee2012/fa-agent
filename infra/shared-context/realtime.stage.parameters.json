@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "westus3"
+    },
+    "name": {
+      "value": "wps-fa-stage-demo"
+    },
+    "sku": {
+      "value": "Free_F1"
+    },
+    "apiIdentityName": {
+      "value": "id-facontext-api-stage"
+    },
+    "tags": {
+      "value": {
+        "workload": "hosted-sandbox-poc",
+        "environment": "stage"
+      }
+    }
+  }
+}

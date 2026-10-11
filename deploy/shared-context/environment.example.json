@@ -1,0 +1,37 @@
+{
+  "name_prefix": "fa-agent-v18",
+  "subscription_id": "<subscription-guid>",
+  "tenant_id": "<tenant-guid>",
+  "location": "westus3",
+  "resource_group": "rg-fa-agent-v18",
+  "operator_object_id": "<operator-object-guid>",
+  "read_write_role_definition_guid": "<custom-role-guid>",
+  "foundry_resource_group": "rg-fa-agent-v18",
+  "table_name": "workstate",
+  "backup_container": "m1-environment-backups",
+  "artifacts_container": "m3-artifacts",
+  "api_subnet_nat_egress": false,
+  "model_version_upgrade_option": "NoAutoUpgrade",
+  "model_capacity": {},
+  "tags": {
+    "workload": "hosted-sandbox-poc",
+    "architecture": "shared-context",
+    "dataClassification": "synthetic-only"
+  },
+  "names": {
+    "foundry_account": "cog-fa-agent-v18-demo",
+    "project": "fa-agent-v18",
+    "registry": "crfaagentv18demo",
+    "container_apps_environment": "cae-fa-agent-v18",
+    "api_identity": "id-fa-agent-v18",
+    "storage": "stfav18exampledemo",
+    "backup_storage": "stfav18examplebk",
+    "vnet": "vnet-fa-agent-v18",
+    "api_app": "ca-fa-behavior-v18",
+    "sync_job": "job-fa-agent-sync-v18",
+    "webpubsub": "wps-fa-v18-example",
+    "log_analytics": "log-fa-agent-v18",
+    "app_insights": "appi-fa-agent-v18",
+    "backup_private_endpoint": "pe-fa-agent-v18-backup-blob"
+  }
+}

@@ -1,0 +1,48 @@
+ARG BASE_IMAGE=crcontosodemo01.azurecr.io/fa-hosted-sandbox-poc/fa-hosted-sandbox-poc-faexample@sha256:c3861e70477956cd341547ad5d75fc8c84a8bf7f6da36aa7fd4d771104563bfe
+FROM ${BASE_IMAGE} AS upcall-build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        autoconf automake build-essential libcap-ng-dev libkeyutils-dev libkrb5-dev libtalloc-dev pkg-config
+RUN curl --fail --silent --show-error --location \
+        https://codeload.github.com/smfrench/smb3-utils/tar.gz/edac7178bec9520fb57d14946e67f5dd33b82d43 \
+        --output /tmp/cifs-utils.tar.gz \
+    && echo 'ea161bdf224d77a76a1da9475be7a761bbb9ff6d2a37bd13fd7e366595bee876  /tmp/cifs-utils.tar.gz' | sha256sum --check --strict \
+    && mkdir /tmp/cifs-utils-src /out \
+    && tar -xzf /tmp/cifs-utils.tar.gz --directory /tmp/cifs-utils-src --strip-components=1
+WORKDIR /tmp/cifs-utils-src
+RUN autoreconf -i \
+    && ./configure --enable-cifsupcall --disable-cifscreds --disable-cifsidmap \
+        --disable-cifsacl --disable-smbinfo --disable-pythontools --disable-pam --disable-systemd --disable-man \
+    && make -j2 cifs.upcall \
+    && ./cifs.upcall --version \
+    && install -m 0755 cifs.upcall /out/cifs.upcall
+
+FROM ${BASE_IMAGE}
+
+COPY requirements-smb-oauth.txt /app/requirements-smb-oauth.txt
+RUN python -m pip install --no-cache-dir --progress-bar off -r /app/requirements-smb-oauth.txt \
+    && python3 -c 'import sys, azure.identity, azure.core, yaml; print("image Python:", sys.executable)'
+
+RUN curl --fail --silent --show-error --location \
+        https://packages.microsoft.com/ubuntu/22.04/prod/pool/main/a/azfilesauth/azfilesauth_1.0-12_amd64.deb \
+        --output /tmp/azfilesauth_1.0-12_amd64.deb \
+    && echo '6138d2c4c5ba3c1272bce7fbfd1e60cd236fbfed911b4968275e58cdaee7d5af  /tmp/azfilesauth_1.0-12_amd64.deb' | sha256sum --check --strict \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive AZFILESAUTH_SKIP_PIP_INSTALL=1 \
+        apt-get -o 'DPkg::Path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+        install -y --no-install-recommends \
+        keyutils krb5-user libcap-ng0 libtalloc2 /tmp/azfilesauth_1.0-12_amd64.deb \
+    && rm /tmp/azfilesauth_1.0-12_amd64.deb
+
+RUN groupadd --gid 10002 azfilesuser \
+    && useradd --uid 10002 --gid 10002 --no-create-home --shell /usr/sbin/nologin azfilesuser \
+    && printf 'USER_UID: 10002\nKRB5_CC_NAME: FILE:/tmp/krb5cc_10002\nLOG_DESTINATION: file\nLOG_FILE_PATH: /dev/null\nCURL_CONNECT_TIMEOUT: 10\nCURL_TOTAL_TIMEOUT: 30\n' > /etc/azfilesauth/config.yaml \
+    && chmod 644 /etc/azfilesauth/config.yaml \
+    && printf '[libdefaults]\n default_realm = FILES.AZURE.STORAGE.MICROSOFT.COM\n default_ccache_name = FILE:/tmp/krb5cc_%%{uid}\n dns_lookup_kdc = false\n rdns = false\n' > /etc/krb5.conf \
+    && printf 'create cifs.spnego * * /usr/local/sbin/cifs.upcall %%k\n' > /etc/request-key.d/cifs.spnego.conf
+
+COPY --from=upcall-build /out/cifs.upcall /usr/local/sbin/cifs.upcall
+COPY poc_core.py smb_oauth.py check_smb_oauth_image.py /app/
+RUN python -m py_compile /app/poc_core.py /app/smb_oauth.py \
+    && python /app/check_smb_oauth_image.py

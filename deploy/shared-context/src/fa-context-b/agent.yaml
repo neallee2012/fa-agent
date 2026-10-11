@@ -1,0 +1,10 @@
+name: fa-context-b
+template:
+    description: Hosted container agent using pre-built image crfacontextpocdemo.azurecr.io/fa-context-hosted:poc1
+    kind: hosted
+    name: fa-context-b
+    protocols:
+        - protocol: invocations
+          version: 2.0.0
+        - protocol: responses
+          version: 2.0.0

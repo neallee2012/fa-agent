@@ -1,0 +1,27 @@
+FROM python:3.11.14-slim-bookworm
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HOME=/home/app
+ENV COPILOT_CLI_EXTRACT_DIR=/opt/copilot/1.0.83
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates chromium fonts-liberation imagemagick openbox x11-utils xdotool xvfb \
+    && rm -rf /var/lib/apt/lists/*
+COPY src/fa-shared-context-poc/requirements-hosted.txt .
+RUN pip install --no-cache-dir -r requirements-hosted.txt \
+    && python -m copilot download-runtime \
+    && chmod -R a+rX /opt/copilot/1.0.83 \
+    && test -x /opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime \
+    && useradd --create-home --uid 10001 app \
+    && install -d -m 0700 -o app -g app /home/session
+COPY src/fa-shared-context-poc/shared_context ./shared_context
+COPY src/fa-shared-context-poc/hosted_main.py .
+COPY src/fa-shared-context-poc/hosted_bootstrap.py .
+COPY src/fa-shared-context-poc/runtime_probe.py .
+COPY src/fa-hosted-sandbox-poc/desktop_smoke.py .
+COPY src/fa-shared-context-poc/chromium-policy.json /etc/chromium/policies/managed/fa-poc.json
+ENV COPILOT_SKIP_CLI_DOWNLOAD=1
+USER 10001
+RUN python -c "import shared_context.hosted" && python runtime_probe.py
+USER 0
+EXPOSE 8088
+CMD ["python", "hosted_bootstrap.py"]

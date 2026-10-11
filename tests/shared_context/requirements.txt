@@ -1,0 +1,3 @@
+-r ../../src/fa-shared-context-poc/requirements.txt
+-r ../../src/fa-shared-context-poc/requirements-hosted.txt
+pytest==9.0.2

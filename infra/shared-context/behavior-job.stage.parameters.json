@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "jobName": {
+      "value": "job-fa-agent-sync-stage"
+    },
+    "environmentName": {
+      "value": "cae-facontext-stage"
+    },
+    "identityName": {
+      "value": "id-facontext-api-stage"
+    },
+    "registryName": {
+      "value": "crfacontextstagedemo"
+    },
+    "imageRepository": {
+      "value": "fa-behavior-api"
+    },
+    "timeoutSeconds": {
+      "value": 1800
+    },
+    "containerResources": {
+      "value": {
+        "cpu": "0.5",
+        "memory": "1Gi"
+      }
+    },
+    "tags": {
+      "value": {
+        "workload": "hosted-sandbox-poc",
+        "environment": "stage"
+      }
+    }
+  }
+}

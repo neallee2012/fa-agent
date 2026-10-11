@@ -1,0 +1,249 @@
+{
+  "run_id": "m2-20260914-1638",
+  "status": "PARTIAL_BLOCKED_AUTONOMOUS_UI",
+  "full_m2_pass": false,
+  "region": "westus3",
+  "core_versions": {
+    "a": "12",
+    "b": "9"
+  },
+  "ui_versions": [
+    "12",
+    "13"
+  ],
+  "current_versions": {
+    "a": "13",
+    "b": "9"
+  },
+  "current_images": {
+    "api": "crfacontextpocdemo.azurecr.io/fa-context-api@sha256:f23b6720fbb932a1967955ff36d4f7bb3004adbb15b6eb02f9d1309444cedc29",
+    "hosted_a": "crfacontextpocdemo.azurecr.io/fa-context-hosted@sha256:59521480555111716eb5b6f873c3991062aa407cf81f33b3ce575c1f3eebccec",
+    "hosted_b": "crfacontextpocdemo.azurecr.io/fa-context-hosted@sha256:f54559651c084dd1497de4696300bee838fe1bf93f86de1c0aebbbddff8611d2"
+  },
+  "sdk": {
+    "package": "github-copilot-sdk==1.0.13",
+    "runtime_release": "1.0.83",
+    "native_reported_version": "0.0.0"
+  },
+  "published_work": {
+    "revision": 6,
+    "owner": "agent-b",
+    "sha256": "515924eb0f1f33406c91fefa6600fecef00d620fd8e9eaeb6706bdd75e97fc0d",
+    "result_file": "m2-published-result.txt",
+    "unchanged_after_ui_failure": true
+  },
+  "core_passed": [
+    "natural_language_tool_execution",
+    "unfinished_checkpoint_stop_resume_same_sdk",
+    "a_to_b_handoff_review_publish",
+    "cross_agent_private_access_denied",
+    "native_data_permissions_denied"
+  ],
+  "ui": {
+    "variant_0": "FAIL_FOR_TESTED_CONFIG",
+    "variant_1": "NOT_RUN_ALLOWANCE_EXHAUSTED",
+    "latest_valid_tool_completions": 49,
+    "latest_actions": 48,
+    "latest_observations": 49,
+    "native_file_chooser_seen": true,
+    "submission": null,
+    "download_verified": false,
+    "cleanup_success": true,
+    "visible_last_fields": {
+      "label": "amber sample",
+      "count": 77,
+      "file_selected": false
+    },
+    "expected_fields": {
+      "label": "amber sample",
+      "count": 7
+    },
+    "native_error": "429 model attempt budget is exhausted",
+    "last_screenshot": {
+      "path": "m2-ui-failed.png",
+      "sha256": "28e85bc735c986cb1cb2e2762428cb7156a0e98158e0519189aa121c0a40aef6"
+    },
+    "native_events_sha256": "9aa5fef806e8450885747f601da4918dd0d982937a11571f8ec81c1599dcd175"
+  },
+  "accounting": {
+    "invocations": 84,
+    "explicit_stops": 12,
+    "owned_sessions_created": 5,
+    "acr_submissions": 8,
+    "agent_deployments": {
+      "a": 4,
+      "b": 3
+    },
+    "api_revisions": 3,
+    "original_model_allowance": 120,
+    "amendment": {
+      "id": "m2-ui-contract-1",
+      "additional_requests": 40
+    },
+    "model_attempts": 160,
+    "remaining_attempts": 0,
+    "attempt_states": {
+      "upstream_response": 159,
+      "unknown": 1
+    },
+    "reported_usage": {
+      "prompt_tokens": 851387,
+      "completion_tokens": 5947,
+      "total_tokens": 857334
+    },
+    "separate_initial_model_probe_tokens": 16,
+    "separate_initial_model_probe_requests": 1,
+    "unknown_attempts_not_refunded": true,
+    "original_109_receipts_preserved": true
+  },
+  "closeout": {
+    "all_five_owned_sessions_idle": true,
+    "inventories": {
+      "a": {
+        "total": 96,
+        "states": {
+          "idle": 95,
+          "active": 1
+        },
+        "sha256": "ca4eab2ee88fa4a1edd3101099fb19c68347666bcf70d9a0a21eea99b2d07eaf"
+      },
+      "b": {
+        "total": 55,
+        "states": {
+          "idle": 55
+        },
+        "sha256": "10d586392aabfbba2d39a2bc75f4f50bfcfd9447b62e75f5696e84f6ec28115f"
+      }
+    },
+    "unattributed_active_session_not_stopped": true,
+    "no_resource_deletion": true,
+    "cost": {
+      "at": "2026-09-14T13:02:03.617367+00:00",
+      "lagged_month_to_date_usd": "14.69475929567367127",
+      "not_final_billing": true,
+      "scope": "rg-faexample",
+      "query": {
+        "type": "ActualCost",
+        "timeframe": "MonthToDate",
+        "dataset": {
+          "granularity": "None",
+          "aggregation": {
+            "totalCost": {
+              "name": "Cost",
+              "function": "Sum"
+            }
+          },
+          "grouping": [
+            {
+              "type": "Dimension",
+              "name": "ServiceName"
+            }
+          ]
+        }
+      }
+    },
+    "total_budget_usd": 100,
+    "m2_reserve_usd": 15
+  },
+  "runtime_evidence": {
+    "runs": [
+      {
+        "path": "evidence\\m2-20260914-1638",
+        "status": "FAILED_OR_BLOCKED",
+        "report_sha256": "6c492721ca4c5e428563fef14f74e9232a608fea6c1cc8fdba586421dc736016",
+        "manifest_sha256": "55d45aacbb6c9af49d5a0f88beeccd90348f144234b9ae98e18b5bdd0700558f",
+        "files": 11,
+        "bytes": 174679,
+        "started_at": "2026-09-14T10:52:46.682071+00:00",
+        "finished_at": "2026-09-14T10:52:52.194558+00:00",
+        "completed_steps": []
+      },
+      {
+        "path": "evidence\\m2-20260914-1638-continue-1",
+        "status": "FAILED_OR_BLOCKED",
+        "report_sha256": "def80c0bc192098496d2bc67b266c369fa9415397326edcd6c2b2b8fda985c32",
+        "manifest_sha256": "ef9e13611432f1cddcee5f1df0697c2241d5a9fbff52fb1b2398d968d0c352c9",
+        "files": 31,
+        "bytes": 305254,
+        "started_at": "2026-09-14T10:52:46.682071+00:00",
+        "finished_at": "2026-09-14T10:59:19.092525+00:00",
+        "completed_steps": []
+      },
+      {
+        "path": "evidence\\m2-20260914-1638-continue-2",
+        "status": "FAILED_OR_BLOCKED",
+        "report_sha256": "c8db1a1006c847816bafae98d64f3873729331891a003d64075e7196dcf12d5e",
+        "manifest_sha256": "87751e18af4055952f486517dcce2ffbe1a8bf7ab71fa98428437b072e811d3b",
+        "files": 39,
+        "bytes": 320485,
+        "started_at": "2026-09-14T10:52:46.682071+00:00",
+        "finished_at": "2026-09-14T11:10:46.942762+00:00",
+        "completed_steps": []
+      },
+      {
+        "path": "evidence\\m2-20260914-1638-continue-3",
+        "status": "FAILED_OR_BLOCKED",
+        "report_sha256": "7abb371f380705a4c4e4930e6a82460017d650f1c903ede5a4db1829e07129b7",
+        "manifest_sha256": "8379f1cf2e675f369c4662890c5c7257bc335a13a02a0cd5ec2a60aacb010a3c",
+        "files": 59,
+        "bytes": 375989,
+        "started_at": "2026-09-14T10:52:46.682071+00:00",
+        "finished_at": "2026-09-14T11:34:22.514813+00:00",
+        "completed_steps": []
+      },
+      {
+        "path": "evidence\\m2-20260914-1638-continue-4",
+        "status": "FAILED_OR_BLOCKED",
+        "report_sha256": "13c5884bbcb8794cc7b934c81c4f2072498ad66270233732117b823c1e2ab016",
+        "manifest_sha256": "834efc7af1bb515a168b46d722d97e69fc327696535213b255b8ad924693ce91",
+        "files": 41,
+        "bytes": 363836,
+        "started_at": "2026-09-14T10:52:46.682071+00:00",
+        "finished_at": "2026-09-14T11:51:44.195871+00:00",
+        "completed_steps": []
+      },
+      {
+        "path": "evidence\\m2-20260914-1638-continue-5",
+        "status": "FAILED_OR_BLOCKED",
+        "report_sha256": "f97474f956f36123bffc52f90e5b5ffda05567804f40a5f689844e09a22cab98",
+        "manifest_sha256": "086984e8b438253223426b6bfb177d5f987335b19845982831da252a419e66c6",
+        "files": 181,
+        "bytes": 1001635,
+        "started_at": "2026-09-14T10:52:46.682071+00:00",
+        "finished_at": "2026-09-14T12:03:26.445982+00:00",
+        "completed_steps": [
+          "a-work-and-cold-resume",
+          "b-handoff-review-publish"
+        ]
+      },
+      {
+        "path": "evidence\\m2-20260914-1638-continue-6",
+        "status": "FAILED_OR_BLOCKED",
+        "report_sha256": "69679fa167489d878afaaab849a15883517179a5d3a3fc4c4df7b1ee0b85b8a8",
+        "manifest_sha256": "483fadd8548419dd8b478dd73e6c69f383e19a8589787c48779c39272d931a4a",
+        "files": 110,
+        "bytes": 3011408,
+        "started_at": "2026-09-14T10:52:46.682071+00:00",
+        "finished_at": "2026-09-14T13:01:01.193105+00:00",
+        "completed_steps": [
+          "a-work-and-cold-resume",
+          "b-handoff-review-publish"
+        ]
+      }
+    ],
+    "files": 472,
+    "bytes": 5553286,
+    "raw_directories_are_not_published": true,
+    "build_sources": "evidence\\m2-20260914-1638-build-sources"
+  },
+  "not_tested": [
+    "gui_stop_resume",
+    "sdk_restore_to_replacement_session_or_version",
+    "natural_token_expiry",
+    "arbitrary_desktop_apps",
+    "human_takeover",
+    "four_agent_scheduling",
+    "ten_times_performance"
+  ],
+  "legacy_g4": "NOT_RUN_OPTIONAL"
+}

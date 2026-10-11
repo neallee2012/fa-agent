@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "appName": {
+      "value": "ca-fa-behavior-stage"
+    },
+    "environmentName": {
+      "value": "cae-facontext-stage"
+    },
+    "identityName": {
+      "value": "id-facontext-api-stage"
+    },
+    "registryName": {
+      "value": "crfacontextstagedemo"
+    },
+    "computeProfile": {
+      "value": "assistant-large"
+    },
+    "minReplicas": {
+      "value": 1
+    },
+    "startupFailureThreshold": {
+      "value": 120
+    },
+    "tags": {
+      "value": {
+        "workload": "hosted-sandbox-poc",
+        "environment": "stage"
+      }
+    }
+  }
+}

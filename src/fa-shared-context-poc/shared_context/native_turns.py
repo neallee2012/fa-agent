@@ -1,0 +1,2043 @@
+"""ADR-0007 application receipts over the official resilient chain and State store."""
+
+from __future__ import annotations
+
+import asyncio
+from collections import OrderedDict
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
+import hashlib
+import json
+import logging
+from pathlib import Path
+from time import monotonic, perf_counter
+from typing import Annotated, Awaitable, Callable, Literal
+from uuid import uuid4
+
+from azure.ai.agentserver.core import get_request_context
+from azure.ai.agentserver.core.storage import (
+    FoundryStorageConflictError, FoundryStorageError, FoundryStorageNotFoundError, FoundryStoragePreconditionError,
+)
+from azure.ai.agentserver.core.tasks import (
+    RetryPolicy, SteeringQueueFull, TaskCancelled, TaskConflictError, TaskContext, TaskDeferred, TaskFailed,
+    multi_turn_task, task,
+)
+# core 2.2.0 still raises this outside the handler without exporting it from tasks.
+from azure.ai.agentserver.core.tasks._client import TransportClassifiedError
+from azure.core.exceptions import AzureError
+from pydantic import Field, model_validator
+
+from .backup_models import MAX_BACKUP_BYTES
+from .behavior_timing import elapsed_timing, phase_timing, timing_id, work_timing
+from .behavior_native_turn_wire import (
+    Cursor, NativeAgentReceive, NativeRoutineSubmit, NativeCancel, NativeConversation, NativeConversationRead, NativeDelivered,
+    NativeHistory, NativeHistoryPage, NativeHitlHistoryRead, NativePublicTurn, NativeRead, NativeReceipt, NativeResponseNotStarted,
+    NativeRequest, NativeResult, NativeResultPage, NativeResultReference, NativeSubmit,
+    NATIVE_REQUEST, NATIVE_STATE_PROFILE, NATIVE_TURN_HEADER,
+    NativeTurnCapture, TurnNumber, canonical_bytes, material_digest,
+    NativeSessionRead, NativeSessionPrepare, NativeSessionPreparation, NativeSessionState, NativeCandidateRead,
+    NativeEnvironmentView, NativeSessionFollow, NativeSessionRetarget,
+)
+from .behavior_sdk_state import (
+    NativeCheckpointRef, NativeCheckpointScope, NativeCheckpointTurn, NativeCompactionExecution, SdkState,
+)
+from .behavior_native_agent_wire import NativeRelayAcceptance
+from .behavior_turn_usage import TurnModelUsage
+from .behavior_wire import AssistantSdkStop, Digest, HostedIdentity, Identifier, WireModel
+from .errors import Problem
+from .native_responses_wire import NATIVE_RESPONSES_PROFILE, NativeResponseDispatch, NativeStateProfile
+from .native_append_wire import NativeAppend, NativeAppendRead
+from .native_progress_wire import NativeProgressRead
+from .copilot_steering import SdkSteeringChannel
+from .native_assembly import NativeAssembly
+
+TURNS_STORE = "fa/v1/turns"
+EFFECTS_STORE = "fa/v1/effects"
+MAX_ITEM_BYTES = 1_000_000
+TEXT_PART_BYTES = 128 * 1024
+# Long-lived store clients kept per process: the fixed stores plus recently used conversations.
+STORE_CLIENTS = 32
+_UNCERTAIN = (FoundryStorageError, AzureError, OSError)
+_CONFLICT = (FoundryStorageConflictError, FoundryStoragePreconditionError)
+_TASK_TRANSPORT_ERRORS = (AzureError, OSError, TransportClassifiedError)
+# Record reads the API sends to its cached reader session (and the typing prewarm, sent to the same reader); environment
+# commands are not included.
+_RECORD_READS = frozenset({
+    "read", "conversation", "history", "result", "hitl-reviews", "received", "memory_candidate", "append_read",
+    "progress", "turn_status", "images", "image", "continuation", "prewarm"})
+log = logging.getLogger(__name__)
+# A read this admission has not done yet (``None`` is a real result: no conversation).
+_UNREAD = object()
+
+
+def _raised(value):
+    """A read done earlier in this admission: its failure is raised where the ordinary order reads it."""
+    if isinstance(value, BaseException):
+        raise value
+    return value
+
+
+def _changed(model, **updates):
+    return type(model).model_validate_json(model.model_copy(update=updates).model_dump_json())
+
+
+def _created_at(item):
+    """When the official State store created this item (epoch seconds), for display; no FA format change."""
+    created = getattr(item, "created_at", None)
+    return None if isinstance(created, bool) or not isinstance(created, int) else datetime.fromtimestamp(created, UTC)
+
+
+def _json(model):
+    data = model.model_dump(mode="json") if isinstance(model, WireModel) else model
+    # core 2.1.0 serializes State store values with json.dumps defaults (ASCII escapes).
+    raw = json.dumps(data, allow_nan=False).encode("utf-8")
+    if len(raw) > MAX_ITEM_BYTES:
+        raise Problem(413, "NATIVE_REQUEST_TOO_LARGE", "the complete item exceeds the State store limit")
+    return json.loads(raw)
+
+
+def _fit_assembly(assembly, *required):
+    if assembly is None:
+        return None
+    available = min(MAX_ITEM_BYTES - len(json.dumps(
+        value.model_dump(mode="json"), allow_nan=False).encode("utf-8")) for value in required)
+    for candidate in (assembly, NativeAssembly(state="partial", reason="item_bound",
+                                               tools_reason="item_bound", sdk_binding_reason="item_bound")):
+        # A nonempty object's new member uses the same bytes as this single-member envelope
+        # (two braces become the existing object's comma and space). Match the SDK's ASCII encoding.
+        size = len(json.dumps({"assembly": candidate.model_dump(mode="json")},
+                              allow_nan=False).encode("utf-8"))
+        if size <= available:
+            if candidate is not assembly:
+                log.warning("FA_NATIVE_ASSEMBLY_PARTIAL reason=item_bound")
+            return candidate
+    log.warning("FA_NATIVE_ASSEMBLY_DROPPED reason=item_bound")
+    return None
+
+
+def _decode(value, model):
+    try:
+        return model.model_validate_json(json.dumps(value, ensure_ascii=False, allow_nan=False))
+    except (ValueError, TypeError):
+        raise Problem(409, "NATIVE_STATE_INVALID", "the saved native state has an invalid shape") from None
+
+
+def _conversation_capture(capture, *, include_model=True):
+    # Resolved attachments, the current capability intersection, the Team memory scope and the approved role head
+    # (CAP-06: a new role version applies from the next turn of every conversation) are per-turn. So are the Team
+    # connectors, within the conversation's first set (_capture_fits).
+    excluded = {"attached_text", "capabilities", "sdk_start_code_sha256", "team_memory", "role_prompt", "connectors"}
+    # The model choice and the facts derived from it.
+    return capture.model_dump(mode="json", exclude=excluded if include_model else excluded | {
+        "model", "model_capacity", "reasoning_summary"})
+
+
+def _connector_ids(capture):
+    return frozenset() if capture.connectors is None else capture.connectors.connector_ids
+
+
+class NativeTaskInput(WireModel):
+    request_id: Identifier
+    accepted_etag: Annotated[str, Field(min_length=1, max_length=256)]
+    call_id: Annotated[str, Field(min_length=1)] | None = None
+    continuation_of: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
+    execution_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
+
+
+class _Rid(WireModel):
+    receipt: NativeReceipt
+    call_id: str | None = None
+    run_token: Identifier | None = None
+
+    @model_validator(mode="after")
+    def execution_identity(self):
+        if self.receipt.dispatch is not None:
+            raise ValueError("Read-time dispatch instructions are never durable RID state")
+        if ((self.receipt.status in {"started", "completed"} and self.run_token is None)
+                or self.receipt.status == "accepted" and self.run_token is not None):
+            raise ValueError("Started and completed receipts retain their original execution token")
+        return self
+
+
+class _Meta(WireModel):
+    agent_id: Identifier
+    hosted_session_id: Identifier
+    conversation_id: Identifier
+    sdk_session_id: Identifier
+    capture: NativeTurnCapture
+    n: Cursor = 0
+    rid: Identifier | None = None
+    base_ckpt: NativeCheckpointRef | None = None
+    state_profile: NativeStateProfile = Field(
+        default=NATIVE_STATE_PROFILE, exclude_if=lambda value: value == NATIVE_STATE_PROFILE)
+    inflight_rid: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def responses_slot(self):
+        if self.state_profile == NATIVE_STATE_PROFILE and self.inflight_rid is not None:
+            raise ValueError("An Invocations conversation retains its original queue")
+        return self
+
+
+class _Turn(WireModel):
+    request_id: Identifier
+    conversation_id: Identifier
+    n: TurnNumber
+    submit_digest: Digest
+    text_sha256: Digest
+    text_bytes: Annotated[int, Field(ge=0, le=MAX_BACKUP_BYTES)]
+    text_parts: Annotated[tuple[Digest, ...], Field(min_length=1, max_length=65)]
+    checkpoints: tuple[NativeCheckpointRef]
+    usage: TurnModelUsage | None = None
+    delegation: NativeRelayAcceptance | None = Field(default=None, exclude_if=lambda value: value is None)
+    assembly: NativeAssembly | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    def reference(self):
+        return NativeResultReference(
+            turn_number=self.n, turn_key=f"turn:{self.n}", result_digest=material_digest(self),
+            text_sha256=self.text_sha256, text_bytes=self.text_bytes, text_parts=len(self.text_parts),
+            checkpoint_sha256=self.checkpoints[0].sha256,
+        )
+
+
+@dataclass(frozen=True)
+class _Versioned:
+    value: _Rid
+    etag: str
+
+
+class _StoreClients:
+    """One event loop's long-lived official State store clients and the credential they share."""
+
+    def __init__(self, loop):
+        self.loop, self.stores, self.users = loop, OrderedDict(), {}
+        self.lock, self.credential, self.credential_scope = asyncio.Lock(), None, AsyncExitStack()
+
+
+class _UnchangedRidWrite(Problem):
+    """A failed RID CAS read back exactly the original ETag and value."""
+
+
+class _UnknownRidWrite(Problem):
+    """An unconfirmed unknown transition must escape the execution error handler."""
+
+
+class _PeerQueueWaiting(Exception):
+    """Capacity is normal waiting for an already accepted peer message, not a failed attempt."""
+
+
+@dataclass
+class NativeTurnControl:
+    """Cooperative SDK abort, never the steering queue's generic cancel signal."""
+
+    cancelled: bool = False
+    timeout: bool = False
+    shutdown: bool = False
+    fenced: bool = False
+    retain_delegation: Callable[[NativeRelayAcceptance], Awaitable[None]] | None = None
+    checkpoint_turn: NativeCheckpointTurn | None = None
+    on_event: Callable[[dict], None] | None = None
+    steering: SdkSteeringChannel | None = None
+
+    def stop_requested(self):
+        return self.cancelled or self.timeout or self.shutdown or self.fenced
+
+
+@dataclass(frozen=True)
+class NativeSdkResult:
+    text: str
+    state: SdkState
+    sdk_stop: AssistantSdkStop
+    usage: TurnModelUsage | None = None
+    delegation: NativeRelayAcceptance | None = None
+    compaction: NativeCompactionExecution | None = None
+    assembly: NativeAssembly | None = None
+
+
+class NativeSdkFailure(Problem):
+    def __init__(self, code, usage, *, delegation=None, assembly=None):
+        super().__init__(503, code, "the original SDK turn did not produce a publishable complete result")
+        self.usage = usage
+        self.delegation = delegation
+        self.assembly = assembly
+
+
+class NativePostTurnPending(Problem):
+    def __init__(self):
+        super().__init__(503, "NATIVE_POST_TURN_UNKNOWN",
+                         "the turn is saved; its original downstream acknowledgment is pending")
+
+
+NativeExecutor = Callable[
+    [NativeReceipt, NativeCheckpointScope, SdkState | None, NativeTurnControl],
+    Awaitable[NativeSdkResult],
+]
+
+
+class _Admission(WireModel):
+    request_id: Identifier
+    submit_digest: Digest
+
+
+def binding_task_id(agent_id, session_id):
+    return "fa-chain-" + material_digest({"agent_id": agent_id, "hosted_session_id": session_id})[:48]
+
+
+class _AgentSession(WireModel):
+    agent_id: Identifier
+    agent_name: Identifier
+    hosted_session_id: Identifier
+    admission_started: bool = Field(default=False, exclude_if=lambda value: not value)
+    preparation: NativeSessionPreparation | None = Field(default=None, exclude_if=lambda value: value is None)
+    environment: NativeEnvironmentView | None = Field(default=None, exclude_if=lambda value: value is None)
+    admitting: _Admission | None = Field(default=None, exclude_if=lambda value: value is None)
+    following_supported: bool = Field(default=False, exclude_if=lambda value: not value)
+    chain_task_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @property
+    def task_id(self):
+        # Existing bindings keep their original Agent-scoped task until an explicit environment change.
+        return self.agent_id if self.chain_task_id is None else self.chain_task_id
+
+    @model_validator(mode="after")
+    def preparation_scope(self):
+        if self.chain_task_id is not None and self.chain_task_id != binding_task_id(self.agent_id, self.hosted_session_id):
+            raise ValueError("the chain task must belong to the persisted Agent session binding")
+        if self.preparation is not None and (self.preparation.agent_id != self.agent_id or (
+                self.environment is None and self.preparation.hosted_session_id != self.hosted_session_id)):
+            raise ValueError("the preparation must belong to this original Agent and session")
+        if self.environment is not None:
+            expected = (self.environment.hosted_session_id if self.environment.state == "ready"
+                        else self.environment.previous_hosted_session_id)
+            if (self.environment.state not in {"pending", "ready"} or self.environment.agent_id != self.agent_id
+                    or expected != self.hosted_session_id):
+                raise ValueError("the environment transition must retain the original Agent binding")
+        return self
+
+
+class NativeTurnRuntime:
+    def __init__(self, identity: HostedIdentity, executor: NativeExecutor, *,
+                 credential_factory=None, cache_root: Path | None = None, preflight=None,
+                 on_terminal=None, on_completed=None, on_unconfirmed=None, bootstrap_source_inactive=None,
+                 delivery_retry: RetryPolicy | None = None, task_observer=None, workspace_files=None):
+        self.identity, self.executor = identity, executor
+        self.credential_factory, self.cache_root, self.preflight = credential_factory, cache_root, preflight
+        self._agent_session = None
+        self.on_terminal, self.on_completed = on_terminal, on_completed
+        self.on_unconfirmed = on_unconfirmed
+        self.bootstrap_source_inactive = bootstrap_source_inactive
+        self.task_observer = task_observer
+        self.workspace_files = workspace_files
+        self._recovery_error = None
+        self._admission_lock = asyncio.Lock()
+        self._clients = None
+        self.execution_lock = asyncio.Lock()
+        self.execution_owner: str | None = None
+        self.progress_recorder = None
+        self.on_continuation = None
+        self.on_recover_queued = None
+        self.responses_enabled = False
+        self.responses_queued: set[str] = set()
+        self._queue_retry = delivery_retry or RetryPolicy(
+            max_attempts=10, initial_delay=1, max_delay=60,
+            retry_on=(SteeringQueueFull, NativePostTurnPending))
+        self._notification_retry = self._queue_retry
+
+        @multi_turn_task(name="fa-native-agent-turn-v1", steerable=True,
+                         retry=self._queue_retry)
+        async def turn(ctx: TaskContext[NativeTaskInput]):
+            return await self.handle_turn(ctx)
+
+        self.chain = turn
+
+        @task(name="fa-native-agent-enqueue-v1", retry=self._queue_retry)
+        async def enqueue(ctx: TaskContext[NativeTaskInput]):
+            return await self._enqueue_pending(ctx)
+
+        self.enqueue = enqueue
+
+        @task(name="fa-native-terminal-notification-v1", retry=self._notification_retry)
+        async def notify(ctx: TaskContext[str]):
+            try:
+                receipt = await self.read(ctx.input)
+            except Problem as error:
+                if error.status >= 500:
+                    raise NativePostTurnPending() from None
+                raise
+            try:
+                await self._deliver_notifications(receipt)
+            except NativePostTurnPending:
+                if ctx.retry_attempt + 1 == self._notification_retry.max_attempts:
+                    await self._notification_status(receipt.request_id, "NATIVE_POST_TURN_UNKNOWN")
+                raise
+            await self._notification_status(receipt.request_id, None)
+            return receipt.request_id
+
+        self.notifications = notify
+
+    async def _notification_status(self, rid, code):
+        current = await self._rid(rid)
+        if code is None and current.value.receipt.notification_error != "NATIVE_POST_TURN_UNKNOWN":
+            return
+        if current.value.receipt.notification_error != code:
+            receipt = _changed(current.value.receipt, notification_error=code)
+            observed, _ = await self._cas(current, _changed(current.value, receipt=receipt))
+            if observed.value.receipt.notification_error != code:
+                raise NativePostTurnPending()
+
+    async def _root_wake_failure(self, receipt):
+        source = receipt.source
+        if (receipt.status not in {"unknown", "busy_refused"} or source is None
+                or source.kind == "agent_request" or source.continuation is None
+                or receipt.agent_id != source.root.agent_id or receipt.conversation_id != source.root.conversation_id):
+            return
+        parent = await self.read(source.continuation.request_id)
+        if (parent.conversation_id != receipt.conversation_id or parent.delegation is None
+                or parent.delegation.message_id != source.in_reply_to
+                or parent.delegation.recipient_agent_id != source.sender.agent_id):
+            raise Problem(409, "NATIVE_STATE_INVALID", "the refused wake has no original sender delegation")
+        await self._notification_status(parent.request_id, receipt.failure_code or "NATIVE_TURN_UNKNOWN")
+
+    async def _retain_delegation(self, original, accepted, *, started_only=False):
+        current = await self._rid(original.value.receipt.request_id)
+        if (current.value.run_token != original.value.run_token
+                or current.value.receipt.submit_digest != original.value.receipt.submit_digest
+                or current.value.receipt.status == "accepted"):
+            raise Problem(409, "NATIVE_TURN_UNKNOWN", "the original delegation belongs to a fenced execution")
+        if current.value.receipt.delegation is not None:
+            if current.value.receipt.delegation != accepted:
+                raise Problem(409, "NATIVE_RID_CONFLICT", "the original turn already retained another delegation")
+            return
+        if started_only and current.value.receipt.status != "started":
+            raise Problem(409, "NATIVE_TURN_UNKNOWN", "the queued acceptance cannot rewrite a settled sender")
+        saved = _changed(current.value.receipt, delegation=accepted)
+        observed, _ = await self._cas(current, _changed(current.value, receipt=saved))
+        if observed.value.receipt.delegation != accepted:
+            raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "the accepted delegation receipt is not confirmed")
+
+    async def _enqueue_pending(self, ctx):
+        while True:
+            try:
+                return await self._enqueue_attempt(ctx)
+            except _PeerQueueWaiting:
+                if ctx.shutdown.is_set():
+                    return await ctx.exit_for_recovery()
+                if ctx.cancel.is_set():
+                    supplied = ctx.input if isinstance(ctx.input, NativeTaskInput) else _decode(ctx.input, NativeTaskInput)
+                    original = await self._rid(supplied.request_id)
+                    if original.value.receipt.status == "accepted":
+                        await self._notify_terminal(await self._unknown(
+                            original, "NATIVE_TURN_TIMEOUT" if ctx.timeout_exceeded else "NATIVE_TURN_CANCELLED"))
+                    return supplied.request_id
+                signals = (asyncio.create_task(ctx.shutdown.wait()), asyncio.create_task(ctx.cancel.wait()))
+                try:
+                    await asyncio.wait(signals, timeout=min(2, self._queue_retry.compute_delay(1)),
+                                       return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for signal in signals:
+                        signal.cancel()
+                    await asyncio.gather(*signals, return_exceptions=True)
+
+    async def _enqueue_attempt(self, ctx):
+        supplied = ctx.input if isinstance(ctx.input, NativeTaskInput) else _decode(ctx.input, NativeTaskInput)
+        if ctx.shutdown.is_set():
+            return await ctx.exit_for_recovery()
+        if supplied.continuation_of is not None:
+            if ctx.shutdown.is_set():
+                return await ctx.exit_for_recovery()
+            if ctx.cancel_requested or ctx.timeout_exceeded:
+                from .native_continuations import stop_handoff
+                await stop_handoff(self, await self.read(supplied.continuation_of), failure_code=(
+                    "NATIVE_TURN_CANCELLED" if ctx.cancel_requested else "NATIVE_TURN_TIMEOUT"))
+                raise Problem(409, "NATIVE_TURN_CANCELLED" if ctx.cancel_requested else "NATIVE_TURN_TIMEOUT",
+                              "the original continuation dispatch stopped before submission")
+            from .native_continuations import dispatch_continuation
+            try:
+                return await dispatch_continuation(self, supplied)
+            except Problem as error:
+                if error.status >= 500:
+                    raise NativePostTurnPending() from None
+                raise
+        if supplied.execution_version is not None and supplied.execution_version != self.identity.agent_version:
+            raise Problem(409, "NATIVE_SESSION_CHANGED", "the queued input belongs to another execution version")
+        try:
+            original = await self._rid(supplied.request_id)
+        except Problem as error:
+            if error.status >= 500:
+                return await self._enqueue_unconfirmed(ctx, error.body["error"]["code"])
+            raise
+        receipt = original.value.receipt
+        if receipt.status != "accepted":
+            await self._notify_terminal(receipt)
+            return receipt.request_id
+        if receipt.source is not None and ctx.cancel.is_set():
+            await self._notify_terminal(await self._unknown(
+                original, "NATIVE_TURN_TIMEOUT" if ctx.timeout_exceeded else "NATIVE_TURN_CANCELLED"))
+            return receipt.request_id
+        try:
+            binding = await self._require_original_session(receipt=receipt)
+            if receipt.cancel_requested:
+                await self._notify_terminal(await self._unknown(original, "NATIVE_TURN_CANCELLED"))
+                return receipt.request_id
+            await self.chain.start(
+                task_id=binding.task_id, input_id=receipt.request_id,
+                input=NativeTaskInput(request_id=receipt.request_id, accepted_etag=original.etag,
+                                      call_id=original.value.call_id, execution_version=self.identity.agent_version))
+        except SteeringQueueFull:
+            if receipt.source is not None:
+                raise _PeerQueueWaiting() from None
+            if ctx.retry_attempt + 1 < self._queue_retry.max_attempts:
+                raise
+            refused = _changed(receipt, status="busy_refused", failure_code="NATIVE_TURN_BUSY")
+            current, _ = await self._cas(original, _changed(original.value, receipt=refused))
+            await self._notify_terminal(current.value.receipt)
+        except Problem as error:
+            if error.status >= 500:
+                return await self._enqueue_unconfirmed(ctx, error.body["error"]["code"])
+            raise
+        except _TASK_TRANSPORT_ERRORS:
+            return await self._enqueue_unconfirmed(ctx, "NATIVE_TURN_UNKNOWN")
+        return receipt.request_id
+
+    async def _enqueue_unconfirmed(self, ctx, code):
+        if ctx.retry_attempt + 1 < self._queue_retry.max_attempts:
+            raise NativePostTurnPending() from None
+        original = await self._rid(ctx.input.request_id)
+        receipt = original.value.receipt
+        if receipt.status == "accepted":
+            receipt = await self._unknown(original, code)
+        await self._notify_terminal(receipt)
+        return receipt.request_id
+
+    async def _defer_enqueue(self, original):
+        receipt = original.value.receipt
+        identifier = material_digest({"kind": "fa-native-agent-enqueue-v1",
+                                      "agent": self.identity.agent_id, "rid": receipt.request_id})
+        try:
+            await self.enqueue.start(
+                task_id=identifier,
+                input=NativeTaskInput(request_id=receipt.request_id, accepted_etag=original.etag,
+                                      call_id=original.value.call_id, execution_version=self.identity.agent_version))
+        except TaskConflictError:
+            log.info("FA_NATIVE_ENQUEUE_RETAINED rid=%s", receipt.request_id)
+        except _TASK_TRANSPORT_ERRORS as error:
+            log.warning("FA_NATIVE_ENQUEUE_START_UNCONFIRMED exception_type=%s", type(error).__name__)
+            await self._close_unstarted(original)
+
+    async def initialize(self):
+        """Run before the official host's recovery scan; reads never initialize stores."""
+        expected = _AgentSession(agent_id=self.identity.agent_id, agent_name=self.identity.agent_name,
+                                 hosted_session_id=self.identity.session_id, following_supported=True)
+        async with self._store(TURNS_STORE, create=True) as store, self._store(EFFECTS_STORE, create=True):
+            item = await store.get_item("agent")
+            if item is None:
+                try:
+                    await store.create_item("agent", _json(expected))
+                except _CONFLICT:
+                    pass
+                item = await store.get_item("agent")
+            if item is None:
+                raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "the original Agent session is unconfirmed")
+            original = _decode(item.value, _AgentSession)
+            if original.agent_id != self.identity.agent_id:
+                raise Problem(403, "NATIVE_STATE_SCOPE", "the store belongs to another Agent")
+            self._agent_session = original
+
+    async def _agent_record(self):
+        async with self._store(TURNS_STORE) as store:
+            item = await store.get_item("agent")
+        if item is None:
+            raise Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "the original Agent session record is missing")
+        value = _decode(item.value, _AgentSession)
+        if (value.agent_id, value.agent_name) != (self.identity.agent_id, self.identity.agent_name):
+            raise Problem(403, "NATIVE_STATE_SCOPE", "the session record belongs to another Agent")
+        return value, item.etag
+
+    def replaced(self, current):
+        """A newer environment (versions only increase) took this Agent from this session."""
+        if current.hosted_session_id == self.identity.session_id:
+            return False
+        environment = current.environment
+        if environment is None:
+            version = None if current.preparation is None else current.preparation.hosted_agent_version
+        else:
+            version = environment.previous_agent_version if environment.state == "pending" else environment.hosted_agent_version
+        return version is not None and int(version) > int(self.identity.agent_version)
+
+    async def recover_owned(self):
+        """The fixed SDK scan misses a chain whose creation SID predates this execution SID."""
+        if self.task_observer is None:
+            return
+        current, _ = await self._agent_record()
+        if current.hosted_session_id != self.identity.session_id or current.environment is None:
+            return
+        try:
+            value = await self.task_observer.owned_input(task_id=current.task_id)
+            if value is None:
+                self._recovery_error = None
+                return
+            supplied = _decode(value, NativeTaskInput)
+            original = await self._rid(supplied.request_id)
+            if (original.value.receipt.hosted_session_id != self.identity.session_id
+                    or original.value.call_id != supplied.call_id):
+                raise Problem(409, "NATIVE_STATE_SCOPE", "the original recovery input belongs to another execution")
+            run = await self.chain.start(
+                task_id=current.task_id, input_id=supplied.request_id, input=supplied)
+            self._recovery_error = "task_active" if run.is_queued else None
+        except (Problem, *_TASK_TRANSPORT_ERRORS, TaskConflictError, SteeringQueueFull) as error:
+            self._recovery_error = "task_unconfirmed"
+            log.warning("FA_NATIVE_OWNED_RECOVERY_UNCONFIRMED exception_type=%s", type(error).__name__)
+
+    async def session_state(self, *, environment_request_id=None):
+        from .native_environment import following_view, current_source_refused
+        from .native_files_wire import FILES_PROFILE
+        value, etag = await self._agent_record()
+        return NativeSessionState(agent_id=value.agent_id, hosted_session_id=value.hosted_session_id,
+                                  etag=etag, preparation=value.preparation, environment=value.environment,
+                                  following=await following_view(self, value, environment_request_id=environment_request_id),
+                                  admission_request_id=None if value.admitting is None else value.admitting.request_id,
+                                  files_profile=FILES_PROFILE if self.workspace_files is not None else None,
+                                  files_omission_profile="fa-files-omission-v1",
+                                  source_invocation_refused=await current_source_refused(self, value))
+
+    async def prepare_session(self, command: NativeSessionPrepare):
+        """Bootstrap only: original RID/task/checkpoint records are never rewritten or replayed."""
+        value, etag = await self._agent_record()
+        if value.preparation is not None:
+            if value.hosted_session_id != self.identity.session_id:
+                raise Problem(409, "NATIVE_SESSION_CHANGED", "the original preparation belongs to another session")
+            return value.preparation
+        if (value.hosted_session_id, etag) != (command.expected_session_id, command.expected_etag):
+            raise Problem(409, "NATIVE_BOOTSTRAP_CONFLICT", "the original bootstrap comparison changed")
+        if value.admission_started:
+            raise Problem(409, "NATIVE_BOOTSTRAP_HAS_WORK", "an Agent with native admission cannot change its bootstrap session")
+        previous = value.hosted_session_id if value.hosted_session_id != self.identity.session_id else None
+        async with self._store(TURNS_STORE) as turns, self._store(EFFECTS_STORE) as effects:
+            keys, pending = await turns.list_keys(limit=2), await effects.list_keys(limit=1)
+            if keys.has_more or {key.key for key in keys.keys} != {"agent"} or pending.keys or pending.has_more:
+                raise Problem(409, "NATIVE_BOOTSTRAP_HAS_WORK", "native work or effects already exist; bootstrap cannot migrate them")
+            if self.workspace_files is not None:
+                self.workspace_files.initialize()
+            prepared = NativeSessionPreparation(
+                agent_id=self.identity.agent_id, request_id=command.request_id,
+                previous_hosted_session_id=previous, hosted_session_id=self.identity.session_id,
+                hosted_agent_version=self.identity.agent_version,
+                files_profile="fa-workspace-files-v1" if self.workspace_files is not None else None,
+            )
+            changed = _changed(value, hosted_session_id=self.identity.session_id, preparation=prepared)
+            try:
+                await turns.set_item("agent", _json(changed), if_match=etag)
+            except _UNCERTAIN as error:
+                found = await turns.get_item("agent")
+                confirmed = None if found is None else _decode(found.value, _AgentSession)
+                if (confirmed is None or confirmed.preparation is None
+                        or confirmed.hosted_session_id != self.identity.session_id
+                        or confirmed.preparation.previous_hosted_session_id != previous):
+                    conflict = isinstance(error, _CONFLICT)
+                    raise Problem(409 if conflict else 503,
+                                  "NATIVE_BOOTSTRAP_CONFLICT" if conflict else "NATIVE_BOOTSTRAP_UNKNOWN",
+                                  "bootstrap update did not confirm the original comparison; read the same session") from None
+                prepared, changed = confirmed.preparation, confirmed
+        self._agent_session = changed
+        return prepared
+
+    async def _require_original_session(self, *, admitting=False, receipt=None, request=None, known=None):
+        return (await self._original_session(admitting=admitting, receipt=receipt, request=request, known=known))[0]
+
+    async def _original_session(self, *, admitting=False, receipt=None, request=None, known=None):
+        """The checked Agent record and its ETag (None when unknown).
+
+        ``known``: the (record, ETag) this admission read or wrote a moment ago under the admission lock. A check that
+        writes nothing uses it as is; the admission mark uses it only with its ETag, as the CAS precondition, and a
+        record changed since (e.g. by an environment follow, which does not take this lock) is checked and marked
+        again from a fresh read. A stale record for a check that writes nothing only delays a refusal: the mark's CAS
+        and the turn start check the session again."""
+        if self._agent_session is None:
+            raise Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "native State stores have not initialized")
+        if known is not None and (not admitting or known[1] is not None):
+            current, etag = known
+        else:
+            known, (current, etag) = None, await self._agent_record()
+        wanted = None if request is None else _Admission(request_id=request.command.request_id, submit_digest=request.sha256)
+        retained = wanted is not None and current.admitting == wanted
+        if (wanted is not None and current.admitting is not None
+                and current.admitting.request_id == wanted.request_id and not retained):
+            raise Problem(409, "NATIVE_RID_CONFLICT", "the original admission retains different submitted material")
+        if self._recovery_error is not None and receipt is None:
+            raise Problem(503, "AGENT_VERSION_FOLLOWING", "the original owned task is not yet confirmed")
+        if (current.environment is not None and current.environment.state == "pending"
+                and receipt is None and not retained):
+            raise Problem(503, "AGENT_VERSION_FOLLOWING", "this Agent is changing environments; no new work was accepted")
+        if current.hosted_session_id != self.identity.session_id or (
+                receipt is not None and receipt.hosted_session_id != self.identity.session_id):
+            raise Problem(409, "NATIVE_SESSION_CHANGED",
+                          "read-only: the official chain belongs to the original Hosted session; do not replace its task ID")
+        if admitting and (not current.admission_started or wanted is not None and not retained):
+            if wanted is not None and current.admitting is not None:
+                raise Problem(503, "NATIVE_ADMISSION_PENDING", "the original admission must be reconciled first")
+            marked = _changed(current, admission_started=True,
+                              admitting=current.admitting if wanted is None else wanted)
+            moved = False
+            async with self._store(TURNS_STORE) as store:
+                try:
+                    ref = await store.set_item("agent", _json(marked), if_match=etag)
+                    etag = getattr(ref, "etag", None) or None
+                except _UNCERTAIN as error:
+                    found = await store.get_item("agent")
+                    value = None if found is None else _decode(found.value, _AgentSession)
+                    if value == marked:
+                        etag = found.etag or None
+                    elif known is not None and isinstance(error, _CONFLICT):
+                        moved = True
+                    else:
+                        raise Problem(503, "NATIVE_BOOTSTRAP_UNKNOWN", "original admission binding is unconfirmed") from None
+            if moved:
+                log.info("FA_NATIVE_ADMISSION_MARK_REREAD")
+                return await self._original_session(admitting=admitting, receipt=receipt, request=request)
+            current = marked
+        self._agent_session = current
+        return current, etag
+
+    async def _settle_admission(self, *, admitted=None):
+        """Clear a finished admission intent; returns the Agent record this leaves and its ETag (None when unknown).
+
+        ``admitted``: the (record, ETag) this request just marked and the ``rid:<RID>`` it then created, both under the
+        admission lock; the clear uses them instead of reading both again. Any failed write reads them again below."""
+        from .native_environment import _save_agent
+        if admitted is not None:
+            (current, etag), saved = admitted
+            pending = current.admitting
+            if (etag is not None and pending is not None
+                    and (saved.value.receipt.request_id, saved.value.receipt.submit_digest) == (
+                        pending.request_id, pending.submit_digest)
+                    and saved.value.receipt.hosted_session_id == current.hosted_session_id):
+                cleared = _changed(current, admitting=None)
+                try:
+                    return cleared, await _save_agent(self, current, etag, cleared)
+                except Problem as error:
+                    log.info("FA_NATIVE_ADMISSION_SETTLE_REREAD code=%s", error.body["error"]["code"])
+        current, etag = await self._agent_record()
+        pending = current.admitting
+        if pending is None:
+            return current, etag
+        try:
+            saved = await self._rid(pending.request_id)
+        except Problem as error:
+            if error.body["error"]["code"] == "NATIVE_RID_MISSING":
+                return current, etag
+            raise
+        if (saved.value.receipt.submit_digest != pending.submit_digest
+                or saved.value.receipt.hosted_session_id != current.hosted_session_id):
+            raise Problem(409, "NATIVE_STATE_INVALID", "the admission intent differs from its saved receipt")
+        cleared = _changed(current, admitting=None)
+        return cleared, await _save_agent(self, current, etag, cleared)
+
+    async def _admission_reads(self, request):
+        """The settle read, this RID and its conversation's meta, read together: none depends on another. A failed
+        RID or meta read is returned and raised where the ordinary order reads it."""
+        async def nothing():
+            return None
+
+        cid = request.command.conversation_id
+        settled, found, meta = await asyncio.gather(
+            self._settle_admission(), self._rid(request.command.request_id),
+            nothing() if cid is None else self._meta(cid), return_exceptions=True)
+        if isinstance(settled, BaseException):
+            raise settled
+        for value in (found, meta):
+            if isinstance(value, BaseException) and not isinstance(value, Exception):
+                raise value
+        return settled, found, meta
+
+    @asynccontextmanager
+    async def _store(self, name, *, create=False):
+        """One long-lived official client per store name; its TTL is checked once, when this process first opens it.
+
+        Azure SDK clients and credentials are meant to be reused (connection pool, in-memory token cache); a store's
+        TTL cannot change after creation (ADR-0007 §1), so re-reading it on every open only added a round trip.
+        """
+        try:
+            clients = self._store_clients()
+            store = await self._open_store(clients, name, create=create)
+            clients.users[name] = clients.users.get(name, 0) + 1
+            try:
+                yield store
+            except FoundryStorageNotFoundError:
+                # A cached client skipped the open-time existence read; confirm it only on this error path.
+                if await self._store_missing(clients, name, store):
+                    raise Problem(404, "NATIVE_STATE_STORE_MISSING",
+                                  "the State store does not exist; nothing was created") from None
+                raise
+            finally:
+                clients.users[name] -= 1
+                if clients.stores.get(name) is not store and not clients.users[name]:
+                    await store.aclose()
+                await self._trim_stores(clients)
+        except _UNCERTAIN as exc:
+            log.warning("FA_NATIVE_STATE_UNCONFIRMED exception_type=%s errno=%s winerror=%s",
+                        type(exc).__name__, getattr(exc, "errno", None), getattr(exc, "winerror", None))
+            raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "the original State store outcome is unconfirmed") from None
+
+    def _store_clients(self):
+        loop = asyncio.get_running_loop()
+        if self._clients is None or self._clients.loop is not loop:
+            # Clients are bound to the loop that opened them; another loop (tests) starts its own set.
+            self._clients = _StoreClients(loop)
+        return self._clients
+
+    async def _open_store(self, clients, name, *, create):
+        from .native_checkpoint import open_durable_store
+
+        cached = clients.stores.get(name)
+        if cached is None:
+            async with clients.lock:
+                cached = clients.stores.get(name)
+                if cached is None:
+                    if clients.credential is None and self.credential_factory is not None:
+                        clients.credential = await clients.credential_scope.enter_async_context(
+                            self.credential_factory())
+                    cached = await open_durable_store(name, create=create, credential=clients.credential)
+                    clients.stores[name] = cached
+        clients.stores.move_to_end(name)
+        return cached
+
+    @staticmethod
+    async def _store_missing(clients, name, store):
+        try:
+            await store.get()
+        except FoundryStorageNotFoundError:
+            if clients.stores.get(name) is store:
+                clients.stores.pop(name)
+            return True
+        except _UNCERTAIN:
+            return False
+        return False
+
+    @staticmethod
+    async def _trim_stores(clients):
+        while len(clients.stores) > STORE_CLIENTS:
+            name = next((key for key in clients.stores if not clients.users.get(key)), None)
+            if name is None:
+                return
+            await clients.stores.pop(name).aclose()
+
+    def _check_rid(self, item, rid):
+        if item is None:
+            raise Problem(404, "NATIVE_RID_MISSING", "the RID is not visible; this does not prove nonacceptance")
+        value = _decode(item.value, _Rid)
+        if (item.key != f"rid:{rid}" or value.receipt.request_id != rid
+                or value.receipt.agent_id != self.identity.agent_id or not item.etag):
+            raise Problem(403, "NATIVE_STATE_SCOPE", "the receipt belongs to another Agent or request")
+        return _Versioned(value, item.etag)
+
+    async def _rid(self, rid):
+        async with self._store(TURNS_STORE) as store:
+            return self._check_rid(await store.get_item(f"rid:{rid}"), rid)
+
+    async def read(self, rid):
+        receipt = (await self._rid(rid)).value.receipt
+        if receipt.state_profile == NATIVE_RESPONSES_PROFILE and receipt.status == "accepted":
+            return await self._response_dispatch(receipt)
+        from .native_relay_delivery import project
+        return await project(self, receipt)
+
+    async def _response_dispatch(self, receipt, *, meta=None, previous=None):
+        """``meta``: the slot this request just confirmed; ``previous``: a terminal receipt it already read."""
+        if meta is None:
+            try:
+                meta, _ = await self._meta(receipt.conversation_id)
+            except Problem as error:
+                if error.body["error"]["code"] not in {"NATIVE_CONVERSATION_MISSING", "NATIVE_STATE_STORE_MISSING"}:
+                    raise
+                return _changed(receipt, dispatch=NativeResponseDispatch(state="not_taken"))
+        if meta.state_profile != receipt.state_profile:
+            raise Problem(409, "NATIVE_STATE_SCOPE", "the original conversation uses another state profile")
+        if meta.rid is None:
+            previous = None
+        elif previous is None or previous.request_id != meta.rid:
+            previous = (await self._rid(meta.rid)).value.receipt
+        state = ("already_queued" if receipt.request_id in self.responses_queued else
+                 "needs_response" if meta.inflight_rid == receipt.request_id and self.responses_enabled
+                 and not (not receipt.human_origin and self.response_queue_full()) else "not_taken")
+        return _changed(receipt, dispatch=NativeResponseDispatch(
+            state=state, inflight_request_id=meta.inflight_rid,
+            previous_response_id=None if previous is None else previous.response_id))
+
+    def response_queue_full(self):
+        # The active Responses entry stays in the duplicate set, but is not one of the nine waiters.
+        capacity = 10 if self.execution_owner in self.responses_queued or not self.execution_lock.locked() else 9
+        return len(self.responses_queued) >= capacity
+
+    async def _response_slot(self, original, *, known=None, fresh=False):
+        """Take the conversation's Responses slot for this RID.
+
+        ``known``: the (meta, ETag) this admission just checked, used as the CAS precondition; a meta changed since
+        (e.g. the previous turn's save) is read again. ``fresh``: this admission just named a new CID, so its meta is
+        created without reading first (an existing one fails the create and is read back)."""
+        from .native_checkpoint import conversation_store_name
+
+        receipt = original.value.receipt
+        # The slot this request created, wrote or read with an acknowledgment; None leaves the decision to a read-back.
+        confirmed = previous = None
+        moved = False
+        async with self._store(conversation_store_name(receipt.conversation_id),
+                               create=receipt.command.conversation_id is None) as store:
+            if known is not None:
+                meta, etag = known
+            elif fresh:
+                meta = etag = None
+            else:
+                item = await store.get_item("meta")
+                meta, etag = (None, None) if item is None else (_decode(item.value, _Meta), item.etag)
+            if meta is None:
+                meta = _Meta(
+                    agent_id=self.identity.agent_id, hosted_session_id=receipt.hosted_session_id,
+                    conversation_id=receipt.conversation_id, capture=receipt.capture,
+                    sdk_session_id="sdk-" + material_digest({
+                        "agent": self.identity.agent_id, "cid": receipt.conversation_id})[:48],
+                    state_profile=NATIVE_RESPONSES_PROFILE, inflight_rid=receipt.request_id,
+                )
+                try:
+                    await store.create_item("meta", _json(meta))
+                    confirmed = meta
+                except _UNCERTAIN as error:
+                    log.warning("FA_NATIVE_SLOT_UNCONFIRMED exception_type=%s", type(error).__name__)
+                    item = await store.get_item("meta")
+                    if item is None:
+                        return _changed(receipt, dispatch=NativeResponseDispatch(state="not_taken"))
+                    meta, etag = _decode(item.value, _Meta), item.etag
+            if ((meta.agent_id, meta.conversation_id, meta.state_profile) != (
+                    self.identity.agent_id, receipt.conversation_id, receipt.state_profile)
+                    or not await self._capture_fits(meta, receipt.capture)):
+                raise Problem(409, "NATIVE_STATE_SCOPE", "the original conversation scope or capture differs")
+            if meta.inflight_rid != receipt.request_id:
+                if meta.inflight_rid is not None:
+                    previous = (await self._rid(meta.inflight_rid)).value.receipt
+                    self._address(previous, receipt.conversation_id)
+                    if previous.status not in {"completed", "unknown", "busy_refused"}:
+                        if receipt.human_origin:
+                            refused = _changed(receipt, status="busy_refused", failure_code="NATIVE_TURN_BUSY")
+                            current, _ = await self._cas(original, _changed(original.value, receipt=refused))
+                            return await self._notify_terminal(current.value.receipt)
+                        return await self._response_dispatch(receipt)
+                replacement = _changed(meta, inflight_rid=receipt.request_id)
+                try:
+                    await store.set_item("meta", _json(replacement), if_match=etag)
+                    confirmed = replacement
+                except _UNCERTAIN as error:
+                    if known is not None and isinstance(error, _CONFLICT):
+                        moved = True
+                    else:
+                        log.warning("FA_NATIVE_SLOT_UNCONFIRMED exception_type=%s", type(error).__name__)
+            else:
+                confirmed = meta
+        if moved:
+            log.info("FA_NATIVE_SLOT_REREAD")
+            return await self._response_slot(original)
+        if confirmed is not None:
+            return await self._response_dispatch(receipt, meta=confirmed, previous=previous)
+        # An unacknowledged slot write: the actual read-back, not the missing ACK, decides whether step two is available.
+        return await self.read(receipt.request_id)
+
+    async def _cas(self, original: _Versioned, replacement: _Rid):
+        """A lost ACK may be our own write; never retry a write using a new ETag."""
+        payload = _json(replacement)
+        rid = original.value.receipt.request_id
+        async with self._store(TURNS_STORE) as store:
+            try:
+                ref = await store.set_item(f"rid:{rid}", payload, if_match=original.etag)
+                return _Versioned(replacement, ref.etag), True
+            except _UNCERTAIN as exc:
+                current = self._check_rid(await store.get_item(f"rid:{rid}"), rid)
+                if current.etag == original.etag and current.value == original.value:
+                    log.warning("FA_NATIVE_RID_WRITE_UNCONFIRMED transition=%s exception_type=%s errno=%s winerror=%s",
+                                replacement.receipt.status, type(exc).__name__,
+                                getattr(exc, "errno", None), getattr(exc, "winerror", None))
+                    raise _UnchangedRidWrite(
+                        503, "NATIVE_STATE_STORE_UNKNOWN",
+                        "the original RID transition was not confirmed; unchanged state is not completion") from None
+                return current, current.value == replacement
+
+    async def _immutable(self, store, key, value):
+        payload = _json(value)
+        try:
+            await store.create_item(key, payload)
+        except _CONFLICT:
+            pass
+        # Unknown transport errors propagate; no fallback provider or new key is used.
+        found = await store.get_item(key)
+        if found is None or canonical_bytes(found.value) != canonical_bytes(payload):
+            raise Problem(409, "NATIVE_STATE_INVALID", "the immutable item is missing or differs")
+
+    async def submit(self, request: NativeSubmit):
+        request = NativeSubmit.model_validate_json(request.model_dump_json())
+        return await self._submit(request)
+
+    async def receive(self, request: NativeAgentReceive):
+        request = NativeAgentReceive.model_validate_json(request.model_dump_json())
+        if request.source.recipient_agent_id != self.identity.agent_id:
+            raise Problem(403, "NATIVE_AGENT_SOURCE_INVALID", "the resolved message recipient is not this Agent")
+        return await self._submit(request)
+
+    async def receive_routine(self, request: NativeRoutineSubmit):
+        from .native_routine_wire import native_routines_enabled
+
+        if not native_routines_enabled():
+            raise Problem(403, "NATIVE_ROUTINES_DISABLED", "native routine admission is not enabled")
+        request = NativeRoutineSubmit.model_validate_json(request.model_dump_json())
+        if request.routine.agent_id != self.identity.agent_id:
+            raise Problem(403, "NATIVE_STATE_SCOPE", "the original routine belongs to another Agent")
+        return await self._submit(request)
+
+    async def continue_turn(self, request):
+        from .behavior_native_turn_wire import NativeContinuationSubmit
+        from .native_continuations import check_submission
+
+        request = NativeContinuationSubmit.model_validate_json(request.model_dump_json())
+        async with self._admission_lock:
+            await check_submission(self, request)
+            agent = await self._settle_admission()
+            return await self._submit_locked(request, agent=agent)
+
+    async def _submit(self, request: NativeSubmit | NativeAgentReceive | NativeRoutineSubmit):
+        async with self._admission_lock:
+            with phase_timing("native_submit_pending", job_id=timing_id(request.command.request_id)):
+                if self._recovery_error is not None:
+                    await self.recover_owned()
+                agent, found, meta = await self._admission_reads(request)
+            return await self._submit_locked(request, agent=agent, found=found, meta=meta)
+
+    async def _admission_checks(self, request, *, agent=None, meta=_UNREAD):
+        """Checks before ``rid:<RID>`` is created; only the last one marks the admission it is about to create.
+
+        ``agent`` is the (record, ETag) this request's settle just read and ``meta`` its conversation read (or its
+        failure); returns the marked (record, ETag) and the conversation's (meta, ETag) it checked."""
+        if request.state_profile == NATIVE_RESPONSES_PROFILE and not self.responses_enabled:
+            raise Problem(403, "NATIVE_TURNS_DISABLED", "the Responses handler is not enabled")
+        await self._require_original_session(request=request, known=agent)
+        if self.preflight is not None:
+            self.preflight(request.capture)
+        from .native_user_images import check_user_images
+        await check_user_images(self, request)
+        checked = None
+        if request.command.conversation_id is not None:
+            checked = (await self._meta(request.command.conversation_id) if meta is _UNREAD
+                       else _raised(meta))
+            meta = checked[0]
+            if meta.state_profile != request.state_profile:
+                raise Problem(409, "NATIVE_STATE_SCOPE", "the original conversation must retain its state profile")
+            if not await self._capture_fits(meta, request.capture):
+                raise Problem(409, "NATIVE_CAPTURE_CHANGED", "continue with the original conversation capture")
+            blocker = await self._continuation_blocker(meta, self.identity.session_id)
+            if blocker is not None:
+                raise Problem(409, blocker, "the original conversation has no completed checkpoint to restore")
+        return await self._original_session(admitting=True, request=request, known=agent), checked
+
+    async def _submit_locked(self, request: NativeSubmit | NativeAgentReceive | NativeRoutineSubmit, *, agent=None,
+                             found=_UNREAD, meta=_UNREAD):
+        from .sdk_telemetry import remember
+        remember(request.command.request_id)
+        # Content-free admission segments (README "rtt-a-timing").
+        timed, started = timing_id(request.command.request_id), perf_counter()
+        try:
+            original = await self._rid(request.command.request_id) if found is _UNREAD else _raised(found)
+        except Problem as exc:
+            if exc.body["error"]["code"] != "NATIVE_RID_MISSING":
+                raise
+            original = None
+        elapsed_timing("native_submit_rid_read", started, job_id=timed)
+        marked = checked = None
+        if original is None:
+            try:
+                with phase_timing("native_submit_checks", job_id=timed):
+                    marked, checked = await self._admission_checks(request, agent=agent, meta=meta)
+            except Problem as refusal:
+                # A definite refusal before ``rid:<RID>`` exists admitted nothing; the same RID may be sent again.
+                code = refusal.body["error"]["code"]
+                if (400 <= refusal.status < 500 or code == "AGENT_VERSION_FOLLOWING") and code != "NATIVE_RID_CONFLICT":
+                    refusal.body["error"]["not_dispatched"] = True
+                raise
+            cid = request.command.conversation_id or request.new_conversation_id or "native-" + uuid4().hex
+            receipt = NativeReceipt(
+                state_profile=request.state_profile,
+                agent_id=self.identity.agent_id, hosted_session_id=self.identity.session_id,
+                request_id=request.command.request_id,
+                conversation_id=cid, command=request.command, capture=request.capture,
+                submit_digest=request.sha256, capture_digest=request.capture.sha256, status="accepted",
+                source=getattr(request, "source", None),
+                routine=getattr(request, "routine", None),
+                continuation=getattr(request, "continuation", None),
+                continuation_available=self.on_continuation is not None,
+            )
+            record = _Rid(receipt=receipt, call_id=get_request_context().call_id)
+            payload = _json(record)
+            started = perf_counter()
+            async with self._store(EFFECTS_STORE):
+                pass
+            async with self._store(TURNS_STORE) as store:
+                try:
+                    ref = await store.create_item(f"rid:{receipt.request_id}", payload)
+                    original = _Versioned(record, ref.etag)
+                except _UNCERTAIN as exc:
+                    item = await store.get_item(f"rid:{receipt.request_id}")
+                    if item is None:
+                        log.warning("FA_NATIVE_ACCEPT_UNCONFIRMED exception_type=%s errno=%s winerror=%s",
+                                    type(exc).__name__, getattr(exc, "errno", None), getattr(exc, "winerror", None))
+                        raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "acceptance is unconfirmed; retain the RID") from None
+                    original = self._check_rid(item, receipt.request_id)
+            elapsed_timing("native_submit_create", started, job_id=timed)
+        if original.value.receipt.submit_digest != request.sha256:
+            raise Problem(409, "NATIVE_RID_CONFLICT", "the RID already names a different original request or capture")
+        with phase_timing("native_submit_settle", job_id=timed):
+            agent = await self._settle_admission(admitted=None if marked is None else (marked, original))
+        was_terminal = original.value.receipt.status in {"completed", "unknown", "busy_refused"}
+        if original.value.receipt.status == "accepted":
+            with phase_timing("native_submit_session", job_id=timed):
+                binding = await self._require_original_session(receipt=original.value.receipt, known=agent)
+            if original.value.receipt.cancel_requested:
+                return await self._notify_terminal(await self._unknown(original, "NATIVE_TURN_CANCELLED"))
+            if original.value.receipt.state_profile == NATIVE_RESPONSES_PROFILE:
+                if not self.responses_enabled:
+                    return await self.read(request.command.request_id)
+                with phase_timing("native_submit_slot", job_id=timed):
+                    return await self._response_slot(original, known=checked,
+                                                     fresh=marked is not None and request.command.conversation_id is None)
+            try:
+                with phase_timing("native_submit_start", job_id=timed):
+                    await self.chain.start(
+                        task_id=binding.task_id, input_id=request.command.request_id,
+                        input=NativeTaskInput(request_id=request.command.request_id,
+                                              accepted_etag=original.etag, call_id=original.value.call_id,
+                                              execution_version=self.identity.agent_version),
+                    )
+            except SteeringQueueFull:
+                if isinstance(request, (NativeAgentReceive, NativeRoutineSubmit)):
+                    await self._defer_enqueue(original)
+                    return await self.read(request.command.request_id)
+                receipt = _changed(original.value.receipt, status="busy_refused", failure_code="NATIVE_TURN_BUSY")
+                current, _ = await self._cas(original, _changed(original.value, receipt=receipt))
+                return await self._notify_terminal(current.value.receipt)
+            except TaskConflictError:
+                raise Problem(409, "NATIVE_TURN_UNKNOWN", "the original chain is bound or active elsewhere; retain the RID") from None
+            except _TASK_TRANSPORT_ERRORS as error:
+                log.warning("FA_NATIVE_START_UNCONFIRMED exception_type=%s status=%s classification=%s",
+                            type(error).__name__, getattr(error, "status", None),
+                            getattr(error, "classification", None))
+                return await self._close_unstarted(original)
+        result = await self.read(request.command.request_id)
+        return await self._notify_terminal(result) if was_terminal else result
+
+    async def _notify_terminal(self, receipt, *, continuation_stopped=False):
+        if receipt.status not in {"completed", "unknown", "busy_refused"}:
+            return receipt
+        if receipt.continuation is not None:
+            from .native_continuations import pending_handoffs
+            try:
+                await pending_handoffs(self, remove=receipt.continuation.continuation_of)
+            except Problem as error:
+                log.warning("NATIVE_CONTINUATION_HANDOFF_PENDING code=%s", error.body["error"]["code"])
+        if self.on_terminal is None and self.on_completed is None and self.on_unconfirmed is None:
+            return receipt
+        identifier = material_digest({"kind": ("fa-native-continuation-stopped-v1" if continuation_stopped
+                                              else "fa-native-terminal-notification-v1"),
+                                      "agent": self.identity.agent_id, "rid": receipt.request_id})
+        try:
+            with phase_timing("native_notify_start", job_id=timing_id(receipt.request_id)):
+                await self.notifications.start(task_id=identifier, input=receipt.request_id)
+        except TaskConflictError:
+            log.info("FA_NATIVE_NOTIFICATION_RETAINED rid=%s", receipt.request_id)
+        except _TASK_TRANSPORT_ERRORS:
+            raise NativePostTurnPending() from None
+        return receipt
+
+    async def _deliver_notifications(self, receipt):
+        from .native_continuations import read_continuation, schedule_continuation
+
+        pending = False
+        continuing = False
+        try:
+            if receipt.continuation_available:
+                try:
+                    view = await read_continuation(self, receipt.request_id)
+                except Problem as error:
+                    if error.body["error"]["code"] != "NATIVE_CONTINUATION_MISSING":
+                        raise
+                else:
+                    continuing = view.owns_outcome
+                    if continuing and view.state == "prepared":
+                        await schedule_continuation(self, receipt)
+        except Problem as error:
+            if error.status >= 500:
+                raise NativePostTurnPending() from None
+            raise
+        try:
+            if not continuing:
+                await self._root_wake_failure(receipt)
+        except Problem as exc:
+            pending = True
+            log.warning("FA_NATIVE_WAKE_VISIBILITY_PENDING code=%s", exc.body["error"]["code"])
+        if self.on_terminal is not None:
+            try:
+                await self.on_terminal(receipt)
+            except Exception as exc:
+                pending = True
+                log.warning("FA_NATIVE_USAGE_PENDING exception_type=%s", type(exc).__name__)
+        if receipt.status == "completed" and self.on_completed is not None:
+            try:
+                await self.on_completed(receipt, receipt.result)
+            except Exception as exc:
+                pending = True
+                log.warning("FA_NATIVE_POST_TURN_UNKNOWN exception_type=%s", type(exc).__name__)
+        if not continuing and receipt.status in {"unknown", "busy_refused"} and self.on_unconfirmed is not None:
+            try:
+                await self.on_unconfirmed(receipt)
+            except Exception as exc:
+                pending = True
+                log.warning("FA_NATIVE_OUTCOME_NOTICE_PENDING exception_type=%s", type(exc).__name__)
+        if pending:
+            raise NativePostTurnPending()
+        return receipt
+
+    async def _meta(self, cid, *, store=None):
+        from .native_checkpoint import conversation_store_name
+
+        if store is None:
+            async with self._store(conversation_store_name(cid)) as current:
+                return await self._meta(cid, store=current)
+        item = await store.get_item("meta")
+        if item is None:
+            raise Problem(404, "NATIVE_CONVERSATION_MISSING", "the original conversation is not visible")
+        meta = _decode(item.value, _Meta)
+        if (meta.agent_id, meta.conversation_id) != (self.identity.agent_id, cid):
+            raise Problem(403, "NATIVE_STATE_SCOPE", "conversation belongs to another Agent")
+        return meta, item.etag
+
+    def _scope(self, meta):
+        return NativeCheckpointScope(
+            agent_id=meta.agent_id, conversation_id=meta.conversation_id, sdk_session_id=meta.sdk_session_id,
+            model_provider=meta.capture.template.settings.model_provider,
+        )
+
+    async def _capture_fits(self, meta, capture):
+        """The conversation keeps its capture; only its model may change, and only before any saved SDK state.
+
+        With no completed turn (e.g. the first one was refused by its model) the next turn starts an empty SDK
+        session, so nothing produced by the old model is resumed. _allocate then adopts the new model.
+        """
+        if not _connector_ids(capture) <= _connector_ids(meta.capture):
+            return False
+        if _conversation_capture(meta.capture) == _conversation_capture(capture):
+            return True
+        if _conversation_capture(meta.capture, include_model=False) != _conversation_capture(capture, include_model=False):
+            return False
+        return meta.base_ckpt is None and (
+            meta.rid is None or (await self._rid(meta.rid)).value.receipt.status != "completed")
+
+    def _checkpoint_turn(self, receipt, meta):
+        return NativeCheckpointTurn(
+            scope=self._scope(meta), request_id=receipt.request_id, turn_number=meta.n,
+            capture_digest=receipt.capture_digest, profile=receipt.capture.template.settings.checkpoint_profile,
+            previous=meta.base_ckpt,
+        )
+
+    async def _turn(self, store, receipt, *, n=None, item=None):
+        number = receipt.turn_number if n is None else n
+        if item is None:
+            item = await store.get_item(f"turn:{number}")
+        if item is None:
+            raise Problem(409, "NATIVE_RESULT_MISSING", "the original turn has no durable result")
+        turn = _decode(item.value, _Turn)
+        if ((turn.request_id, turn.conversation_id, turn.n, turn.submit_digest) !=
+                (receipt.request_id, receipt.conversation_id, number, receipt.submit_digest)
+                or receipt.result is not None and receipt.result != turn.reference()):
+            raise Problem(409, "NATIVE_RESULT_INCOMPLETE", "the saved result differs from the original receipt")
+        for checkpoint in turn.checkpoints:
+            lineage = checkpoint.lineage
+            if lineage is not None and (lineage.request_id, lineage.turn_number, lineage.capture_digest) != (
+                    receipt.request_id, number, receipt.capture_digest):
+                raise Problem(409, "SDK_STATE_SOURCE_UNVERIFIED", "the checkpoint lineage differs from its original turn")
+        return turn
+
+    async def _allocate_timed(self, original):
+        """Turn number and checkpoint restore, timed without content (FA_TIMING)."""
+        with phase_timing("native_allocate", job_id=timing_id(original.value.receipt.request_id)):
+            return await self._allocate(original)
+
+    async def _allocate(self, original):
+        from .native_checkpoint import conversation_store_name, load_checkpoint
+
+        receipt = original.value.receipt
+        cid = receipt.conversation_id
+        async with self._store(conversation_store_name(cid), create=receipt.command.conversation_id is None) as store:
+            item = await store.get_item("meta")
+            if item is None:
+                meta = _Meta(
+                    agent_id=self.identity.agent_id, hosted_session_id=receipt.hosted_session_id,
+                    conversation_id=cid, capture=receipt.capture,
+                    sdk_session_id="sdk-" + material_digest({"agent": self.identity.agent_id, "cid": cid})[:48],
+                )
+                await self._immutable(store, "meta", meta)
+                item = await store.get_item("meta")
+            meta = _decode(item.value, _Meta)
+            if (meta.agent_id != self.identity.agent_id or meta.conversation_id != cid
+                    or meta.state_profile != receipt.state_profile
+                    or not await self._capture_fits(meta, receipt.capture)):
+                raise Problem(409, "NATIVE_CAPTURE_CHANGED", "the original conversation capture differs")
+            if receipt.state_profile == NATIVE_RESPONSES_PROFILE and meta.inflight_rid != receipt.request_id:
+                raise Problem(409, "NATIVE_TURN_NOT_TAKEN", "this RID does not own its conversation slot")
+            checkpoint = meta.base_ckpt
+            if meta.rid is not None:
+                previous = await self.read(meta.rid)
+                if previous.status == "completed":
+                    checkpoint = (await self._turn(store, previous)).checkpoints[0]
+            # A capture that still differs here differs only in its model, before any saved state (_capture_fits).
+            adopted = _conversation_capture(meta.capture) != _conversation_capture(receipt.capture)
+            allocated = _changed(meta, n=meta.n + 1, rid=receipt.request_id, base_ckpt=checkpoint,
+                                 **({"capture": receipt.capture} if adopted else {}))
+            try:
+                await store.set_item("meta", _json(allocated), if_match=item.etag)
+            except _UNCERTAIN:
+                found = await store.get_item("meta")
+                if found is None or _decode(found.value, _Meta) != allocated:
+                    raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "turn allocation is unconfirmed") from None
+            scoped = self._scope(allocated)
+            state = (None if checkpoint is None else
+                     await load_checkpoint(store, scoped, checkpoint, cache_root=self.cache_root,
+                                           checkpoint_profile=receipt.capture.template.settings.checkpoint_profile))
+        updated = _changed(receipt, turn_number=allocated.n)
+        current, ours = await self._cas(original, _changed(original.value, receipt=updated))
+        if not ours:
+            raise Problem(409, "NATIVE_TURN_UNKNOWN", "the original execution was fenced before SDK entry")
+        return current, allocated, state
+
+    async def close_suspended_start(self, original, source_sid, task_id):
+        receipt = original.value.receipt
+        if (receipt.status != "accepted"
+                or receipt.hosted_session_id != source_sid
+                or original.value.run_token is not None or receipt.turn_number is not None):
+            return receipt
+        if receipt.state_profile == NATIVE_RESPONSES_PROFILE:
+            from .native_responses_wire import responses_environment_blocker
+
+            current, _ = await self._agent_record()
+            if (responses_environment_blocker() is not None or receipt.response_id is not None
+                    or current.environment is None or current.environment.state != "pending"
+                    or current.environment.previous_hosted_session_id != source_sid
+                    or current.hosted_session_id != source_sid):
+                return receipt
+            # This explicit transition's accepted ETag fences a late Responses handler before SDK entry.
+            return await self._close_unstarted(original)
+        if self.task_observer is None:
+            return receipt
+        value = await self.task_observer.suspended_input(task_id=task_id)
+        if value is None:
+            return receipt
+        supplied = _decode(value, NativeTaskInput)
+        if supplied.request_id != receipt.request_id:
+            return receipt
+        if supplied.accepted_etag != original.etag or supplied.call_id != original.value.call_id:
+            raise Problem(409, "NATIVE_STATE_INVALID", "the saved input differs from the original unstarted receipt")
+        return await self._close_unstarted(original)
+
+    async def _close_unstarted(self, original):
+        receipt = original.value.receipt
+        if receipt.status != "accepted" or original.value.run_token is not None or receipt.turn_number is not None:
+            return receipt
+        closed = await self._unknown(original, "NATIVE_TURN_NOT_STARTED", usage=receipt.usage)
+        if closed.status == "accepted":
+            raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "the original unstarted outcome was not confirmed")
+        return await self._notify_terminal(closed)
+
+    async def _unknown(self, original, code, *, usage=None, delegation=None, assembly=None):
+        if original.value.receipt.status not in {"accepted", "started"}:
+            return original.value.receipt
+        retained = original.value.receipt.delegation
+        if delegation is not None and retained is not None and delegation != retained:
+            raise Problem(409, "NATIVE_RID_CONFLICT", "the original accepted delegation differs")
+        receipt = _changed(original.value.receipt, status="unknown", failure_code=code, usage=usage,
+                           delegation=retained or delegation,
+                           assembly=assembly or original.value.receipt.assembly)
+        required = _changed(original.value, receipt=_changed(receipt, assembly=None))
+        receipt = _changed(receipt, assembly=_fit_assembly(receipt.assembly, required))
+        try:
+            current, _ = await self._cas(original, _changed(original.value, receipt=receipt))
+        except Problem as error:
+            if error.body["error"]["code"] != "NATIVE_STATE_STORE_UNKNOWN":
+                raise
+            raise _UnknownRidWrite(error.status, error.body["error"]["code"], error.body["error"]["message"]) from None
+        if current.value.receipt.status in {"accepted", "started"}:
+            raise _UnknownRidWrite(503, "NATIVE_STATE_STORE_UNKNOWN",
+                                   "the original unknown transition is unconfirmed; retain the original RID")
+        return current.value.receipt
+
+    async def _text(self, store, turn, part):
+        if not 0 <= part < len(turn.text_parts):
+            raise Problem(422, "NATIVE_REQUEST_INVALID", "the result part is outside the original manifest")
+        item = await store.get_item(f"text:{turn.text_sha256}:{part}")
+        value = None if item is None else item.value
+        if (not isinstance(value, dict) or set(value) != {"text", "sha256"}
+                or not isinstance(value["text"], str) or value["sha256"] != turn.text_parts[part]
+                or hashlib.sha256(value["text"].encode("utf-8")).hexdigest() != turn.text_parts[part]):
+            raise Problem(409, "NATIVE_RESULT_INCOMPLETE", "a public result segment is missing or differs")
+        return value["text"]
+
+    async def _verify_result(self, store, turn):
+        raw = "".join([await self._text(store, turn, i) for i in range(len(turn.text_parts))]).encode("utf-8")
+        if len(raw) != turn.text_bytes or hashlib.sha256(raw).hexdigest() != turn.text_sha256:
+            raise Problem(409, "NATIVE_RESULT_INCOMPLETE", "the complete result differs from its original digest")
+
+    async def _reenter(self, original, *, failure_code=None, usage=None, delegation=None, assembly=None,
+                       recovered=False):
+        from .native_checkpoint import conversation_store_name, verify_checkpoint
+
+        receipt = original.value.receipt
+        if receipt.status != "started":
+            return receipt
+        if (recovered and not receipt.cancel_requested and receipt.delegation is None and receipt.queued_relay is None
+                and self.on_recover_queued is not None):
+            try:
+                await self.on_recover_queued(original)
+            except (TaskFailed, TaskCancelled, Problem, *_TASK_TRANSPORT_ERRORS) as error:
+                code = error.body["error"]["code"] if isinstance(error, Problem) else "NATIVE_RELAY_OUTCOME_UNKNOWN"
+                log.warning("NATIVE_RELAY_RECOVERY_UNCONFIRMED code=%s exception_type=%s", code, type(error).__name__)
+                current = await self._rid(receipt.request_id)
+                return await self._unknown(
+                    current, "NATIVE_TURN_CANCELLED" if current.value.receipt.cancel_requested else code)
+            original = await self._rid(receipt.request_id)
+            receipt = original.value.receipt
+            if receipt.status != "started":
+                return receipt
+        try:
+            meta, _ = await self._meta(receipt.conversation_id)
+            if meta.rid != receipt.request_id:
+                return await self._unknown(original, failure_code or "NATIVE_TURN_UNKNOWN",
+                                           usage=usage, delegation=delegation, assembly=assembly)
+            async with self._store(conversation_store_name(receipt.conversation_id)) as store:
+                turn = await self._turn(store, receipt, n=meta.n)
+                await self._verify_result(store, turn)
+                for checkpoint in turn.checkpoints:
+                    await verify_checkpoint(store, self._scope(meta), checkpoint,
+                                            checkpoint_profile=receipt.capture.template.settings.checkpoint_profile)
+        except Problem as exc:
+            if exc.status == 503 or exc.body["error"]["code"] == "NATIVE_STATE_STORE_TTL":
+                raise
+            if recovered:
+                from .native_continuations import prepare_continuation
+                return await prepare_continuation(
+                    self, original, failure_code=failure_code or exc.body["error"]["code"])
+            return await self._unknown(original, failure_code or exc.body["error"]["code"],
+                                       usage=usage, delegation=delegation, assembly=assembly)
+        if receipt.delegation is not None and turn.delegation is not None and receipt.delegation != turn.delegation:
+            return await self._unknown(original, "NATIVE_RID_CONFLICT")
+        completed = _changed(receipt, status="completed", turn_number=turn.n, result=turn.reference(),
+                             usage=turn.usage, delegation=receipt.delegation or turn.delegation, assembly=turn.assembly)
+        current, _ = await self._cas(original, _changed(original.value, receipt=completed))
+        return current.value.receipt
+
+    async def _observe_control(self, signals, original, control):
+        rid, token = original.value.receipt.request_id, original.value.run_token
+        append_delivery = None
+        try:
+            while True:
+                signals(control)
+                if control.stop_requested():
+                    return
+                try:
+                    current = await self._rid(rid)
+                    if append_delivery is not None and append_delivery.done():
+                        append_delivery.result()
+                        append_delivery = None
+                except Problem:
+                    control.fenced = True
+                    raise
+                control.cancelled = current.value.receipt.cancel_requested
+                if current.value.receipt.continuation is not None:
+                    from .native_continuations import stop_requested
+                    control.cancelled = control.cancelled or await stop_requested(self, current.value.receipt)
+                control.fenced = (current.value.receipt.status != original.value.receipt.status
+                                  or current.value.run_token != token)
+                if control.stop_requested():
+                    return
+                if (append_delivery is None and control.steering is not None
+                        and control.steering.ready and not control.steering.closed):
+                    from .native_appends import deliver_appends
+                    append_delivery = asyncio.create_task(deliver_appends(self, current.value.receipt, control))
+                # SDK steering does not replace the independent cancellation observer.
+                await asyncio.sleep(0.1)
+        finally:
+            if append_delivery is not None:
+                append_delivery.cancel()
+                await asyncio.gather(append_delivery, return_exceptions=True)
+
+    @asynccontextmanager
+    async def execution_slot(self, original, control, signals):
+        """Both native lanes acquire once; the existing control observer also covers the wait."""
+        async def acquire():
+            await self.execution_lock.acquire()
+            self.execution_owner = original.value.receipt.request_id
+            return True
+
+        waiter = asyncio.create_task(acquire())
+        watcher = asyncio.create_task(self._observe_control(signals, original, control))
+        waiting = perf_counter()
+        try:
+            await asyncio.wait((waiter, watcher), return_when=asyncio.FIRST_COMPLETED)
+            if watcher.done():
+                watcher.result()
+            signals(control)
+            acquired = waiter.done() and not waiter.cancelled() and waiter.result()
+            if acquired:
+                elapsed_timing("native_queue_wait", waiting, job_id=timing_id(original.value.receipt.request_id))
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+            yield bool(acquired and not control.stop_requested())
+        finally:
+            watcher.cancel()
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, watcher, return_exceptions=True)
+            if waiter.done() and not waiter.cancelled() and waiter.exception() is None and waiter.result():
+                self.execution_owner = None
+                self.execution_lock.release()
+
+    async def _save_turn(self, original, meta, outcome):
+        from .native_checkpoint import conversation_store_name, save_checkpoint
+
+        # A resident release (ADR-0005) is published like an exit; the native checkpoint never stores sdk_stop, and
+        # diagnostic compaction state still refuses a release in save_checkpoint.
+        if not outcome.sdk_stop.graceful:
+            raise Problem(409, "SDK_STATE_INCOMPLETE", "native checkpoint publication requires a graceful SDK end")
+        raw = outcome.text.encode("utf-8")
+        if len(raw) > MAX_BACKUP_BYTES:
+            raise Problem(413, "NATIVE_RESULT_TOO_LARGE", "the full public result exceeds the supported segmented bound")
+        parts, offset = [], 0
+        while offset < len(raw):
+            end = min(len(raw), offset + TEXT_PART_BYTES)
+            while end < len(raw) and raw[end] & 0xC0 == 0x80:
+                end -= 1
+            parts.append(raw[offset:end].decode("utf-8"))
+            offset = end
+        if not parts:
+            parts = [""]
+        sha = hashlib.sha256(raw).hexdigest()
+        async with self._store(conversation_store_name(meta.conversation_id)) as store:
+            checkpoint = await save_checkpoint(
+                store, self._scope(meta), outcome.state, cache_root=self.cache_root,
+                turn=self._checkpoint_turn(original.value.receipt, meta),
+                compaction=outcome.compaction, sdk_stop=outcome.sdk_stop)
+            hashes = tuple(hashlib.sha256(part.encode("utf-8")).hexdigest() for part in parts)
+            for index, text in enumerate(parts):
+                await self._immutable(store, f"text:{sha}:{index}", {"text": text, "sha256": hashes[index]})
+            delegation = outcome.delegation or original.value.receipt.delegation
+            if (outcome.delegation is not None and original.value.receipt.delegation is not None
+                    and outcome.delegation != original.value.receipt.delegation):
+                raise Problem(409, "NATIVE_STATE_INVALID", "the published delegation differs from its original receipt")
+            turn = _Turn(
+                request_id=original.value.receipt.request_id, conversation_id=meta.conversation_id, n=meta.n,
+                submit_digest=original.value.receipt.submit_digest, text_sha256=sha, text_bytes=len(raw),
+                text_parts=hashes, checkpoints=(checkpoint,), usage=outcome.usage, delegation=delegation,
+                assembly=outcome.assembly,
+            )
+            required_turn = _changed(turn, assembly=None)
+            required_rid = _changed(original.value, receipt=_changed(
+                original.value.receipt, status="completed", result=required_turn.reference(),
+                usage=outcome.usage, delegation=turn.delegation, assembly=None))
+            turn = _changed(turn, assembly=_fit_assembly(turn.assembly, required_turn, required_rid))
+            await self._verify_result(store, turn)
+            await self._immutable(store, f"turn:{meta.n}", turn)
+        receipt = _changed(original.value.receipt, status="completed", result=turn.reference(),
+                           usage=outcome.usage, delegation=turn.delegation, assembly=turn.assembly)
+        current, _ = await self._cas(original, _changed(original.value, receipt=receipt))
+        if current.value.receipt.status == "started" and current.value.receipt.cancel_requested:
+            return await self._unknown(current, "NATIVE_TURN_CANCELLED",
+                                       usage=outcome.usage, delegation=turn.delegation, assembly=turn.assembly)
+        if current.value.receipt.status == "started":
+            return await self._reenter(current)
+        return current.value.receipt
+
+    async def handle_turn(self, ctx: TaskContext[NativeTaskInput]):
+        result = await self._handle_turn(ctx)
+        if isinstance(result, NativeReceipt):
+            if ctx.entry_mode == "recovered" and not ctx.cancel_requested and not ctx.timeout_exceeded:
+                from .native_continuations import schedule_continuation
+                try:
+                    await schedule_continuation(self, result)
+                except NativePostTurnPending:
+                    await self._notify_terminal(result)
+                    raise
+            return await self._notify_terminal(result)
+        return result
+
+    async def _handle_turn(self, ctx: TaskContext[NativeTaskInput]):
+        supplied = ctx.input if isinstance(ctx.input, NativeTaskInput) else _decode(ctx.input, NativeTaskInput)
+        binding, _ = await self._agent_record()
+        if ctx.shutdown.is_set():
+            return await ctx.exit_for_recovery()
+        original = await self._rid(supplied.request_id)
+        if ctx.task_id != binding.task_id or binding.hosted_session_id != self.identity.session_id:
+            source = original.value.receipt
+            if (ctx.entry_mode != "recovered" or source.status == "accepted"
+                    or ctx.task_id not in {source.agent_id, binding_task_id(source.agent_id, source.hosted_session_id)}):
+                raise Problem(403, "NATIVE_STATE_SCOPE", "the task does not belong to this Agent session binding")
+        # core 2.1.0 steering reports last_input_id on ctx; the persisted input owns this RID.
+        if supplied.call_id != original.value.call_id:
+            raise Problem(403, "NATIVE_STATE_SCOPE", "the persisted caller context differs from the accepted request")
+        if original.value.receipt.status != "accepted":
+            try:
+                return await self._reenter(original, recovered=(
+                    ctx.entry_mode == "recovered" and not ctx.cancel_requested and not ctx.timeout_exceeded))
+            except TaskDeferred:
+                if not ctx.shutdown.is_set():
+                    raise
+                return await ctx.exit_for_recovery()
+        if supplied.execution_version is not None and supplied.execution_version != self.identity.agent_version:
+            raise Problem(409, "NATIVE_SESSION_CHANGED", "the original input cannot execute in another Hosted version")
+        if original.value.receipt.state_profile != NATIVE_STATE_PROFILE:
+            raise Problem(409, "NATIVE_STATE_SCOPE", "Responses turns never run through the Invocations chain")
+        await self._require_original_session(receipt=original.value.receipt)
+        control = NativeTurnControl()
+
+        def signals(value):
+            value.shutdown = ctx.shutdown.is_set()
+            value.timeout = ctx.timeout_exceeded
+            value.cancelled = value.cancelled or ctx.cancel_requested
+
+        async with self.execution_slot(original, control, signals) as acquired:
+            starting = perf_counter()
+            if ctx.shutdown.is_set():
+                return await ctx.exit_for_recovery()
+            original = await self._rid(supplied.request_id)
+            if original.value.receipt.status != "accepted":
+                return await self._reenter(original)
+            if control.timeout:
+                return await self._unknown(original, "NATIVE_TURN_TIMEOUT")
+            if control.cancelled or original.value.receipt.cancel_requested:
+                return await self._unknown(original, "NATIVE_TURN_CANCELLED")
+            if not acquired:
+                return original.value.receipt
+            started = _changed(original.value, run_token=uuid4().hex,
+                               receipt=_changed(original.value.receipt, status="started"))
+            # Use the ETag persisted in the accepted task input, not a refreshed read.
+            try:
+                original, ours = await self._cas(_Versioned(original.value, supplied.accepted_etag), started)
+            except _UnchangedRidWrite:
+                return await self._unknown(original, "NATIVE_STATE_STORE_UNKNOWN")
+            elapsed_timing("native_start", starting, job_id=timing_id(supplied.request_id))
+            if not ours:
+                return await self._reenter(original)
+            result = await self._execute_started(original, control, signals)
+            if ctx.shutdown.is_set():
+                return await ctx.exit_for_recovery()
+            return result
+
+    async def _execute_started(self, original, control, signals):
+        watcher = None
+        appends_settled = False
+        saving = False
+        outcome = None
+        rid = original.value.receipt.request_id
+        try:
+            if original.value.receipt.continuation is not None:
+                from .native_continuations import stop_requested
+                if await stop_requested(self, original.value.receipt):
+                    return await self._unknown(original, "NATIVE_TURN_CANCELLED")
+            original, meta, previous = await self._allocate_timed(original)
+            control.checkpoint_turn = self._checkpoint_turn(original.value.receipt, meta)
+            control.retain_delegation = lambda accepted, bound=original: self._retain_delegation(bound, accepted)
+            watcher = asyncio.create_task(self._observe_control(signals, original, control))
+            # Phases recorded inside the SDK turn (memory recall, sdk_process_start) inherit this turn's timing ID.
+            with work_timing(timing_id(rid)), phase_timing("native_executor"):
+                outcome = await self.executor(original.value.receipt, self._scope(meta), previous, control)
+            if watcher.done():
+                watcher.result()
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            if control.steering is not None:
+                from .native_appends import settle_appends
+                appends_settled = True
+                await settle_appends(self, original.value.receipt, control, finished=True)
+            signals(control)
+            current = await self._rid(rid)
+            if control.shutdown:
+                return current.value.receipt
+            if current.value.run_token != original.value.run_token or current.value.receipt.status != "started":
+                return current.value.receipt
+            if control.fenced:
+                return await self._unknown(current, "NATIVE_TURN_UNKNOWN",
+                                           usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
+            if control.timeout:
+                return await self._unknown(current, "NATIVE_TURN_TIMEOUT",
+                                           usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
+            if control.cancelled or current.value.receipt.cancel_requested:
+                return await self._unknown(current, "NATIVE_TURN_CANCELLED",
+                                           usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
+            saving = True
+            with phase_timing("native_save_turn", job_id=timing_id(rid)):
+                return await self._save_turn(current, meta, outcome)
+        except _UnknownRidWrite:
+            raise
+        except Exception as exc:
+            # Never repeat the SDK after started, including provider and persistence failures.
+            signals(control)
+            if control.shutdown:
+                return (await self._rid(rid)).value.receipt
+            code = ("NATIVE_TURN_TIMEOUT" if control.timeout else
+                    "NATIVE_TURN_CANCELLED" if control.cancelled else
+                    "NATIVE_TURN_UNKNOWN" if control.fenced else
+                    exc.body["error"]["code"] if isinstance(exc, Problem) else "NATIVE_TURN_UNKNOWN")
+            usage = exc.usage if isinstance(exc, NativeSdkFailure) else None if outcome is None else outcome.usage
+            delegation = (exc.delegation if isinstance(exc, NativeSdkFailure)
+                          else None if outcome is None else outcome.delegation)
+            assembly = (exc.assembly if isinstance(exc, NativeSdkFailure)
+                        else None if outcome is None else outcome.assembly)
+            log.warning("FA_NATIVE_TURN_UNKNOWN code=%s exception_type=%s", code, type(exc).__name__)
+            current = await self._rid(rid)
+            if current.value.run_token != original.value.run_token:
+                return current.value.receipt
+            if saving:
+                return await self._reenter(current, failure_code=code, usage=usage,
+                                           delegation=delegation, assembly=assembly)
+            return await self._unknown(current, code, usage=usage, delegation=delegation, assembly=assembly)
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+            if control.steering is not None and not appends_settled:
+                from .native_appends import settle_appends
+                control.steering.close()
+                await settle_appends(self, original.value.receipt, control, finished=True)
+
+    async def _continuation_blocker(self, meta, execution_sid):
+        if meta.state_profile == NATIVE_RESPONSES_PROFILE and meta.hosted_session_id != execution_sid:
+            from .native_responses_wire import responses_environment_blocker
+
+            blocker = responses_environment_blocker()
+            if blocker is not None:
+                return blocker
+        if meta.hosted_session_id == execution_sid or meta.n == 0 or meta.base_ckpt is not None:
+            return None
+        if meta.rid is not None:
+            previous = await self.read(meta.rid)
+            if previous.status == "completed" and previous.result is not None:
+                return None
+        return "NATIVE_ENVIRONMENT_CHECKPOINT_UNAVAILABLE"
+
+    async def conversation(self, cid):
+        meta, _ = await self._meta(cid)
+        current, _ = await self._agent_record()
+        previous = (None if meta.state_profile != NATIVE_RESPONSES_PROFILE or meta.rid is None else
+                    (await self._rid(meta.rid)).value.receipt.response_id)
+        return NativeConversation(
+            state_profile=meta.state_profile,
+            agent_id=meta.agent_id, hosted_session_id=meta.hosted_session_id,
+            execution_hosted_session_id=(current.hosted_session_id if current.environment is not None
+                                        and current.environment.state == "ready" else None),
+            continuation_blocker=await self._continuation_blocker(meta, current.hosted_session_id),
+            conversation_id=cid, last_turn=meta.n, last_request_id=meta.rid,
+            capture=meta.capture, capture_digest=meta.capture.sha256,
+            inflight_request_id=meta.inflight_rid, last_response_id=previous,
+        )
+
+    async def history(self, command: NativeHistory):
+        from .native_checkpoint import conversation_store_name
+
+        conversation = await self.conversation(command.conversation_id)
+        stop = min(conversation.last_turn, command.after_turn + command.limit)
+        turns = []
+        async with self._store(conversation_store_name(command.conversation_id)) as store:
+            for n in range(command.after_turn + 1, stop + 1):
+                item = await store.get_item(f"turn:{n}")
+                if item is None:
+                    continue
+                stored = _decode(item.value, _Turn)
+                receipt = await self.read(stored.request_id)
+                if receipt.status != "completed":
+                    continue
+                turn = await self._turn(store, receipt, n=n, item=item)
+                turns.append(NativePublicTurn(
+                    conversation_id=command.conversation_id, request_id=turn.request_id, turn_number=n,
+                    user_text=receipt.command.content if receipt.human_origin and receipt.continuation is None else None,
+                    agent_text=receipt.command.content if receipt.source is not None and receipt.continuation is None else None,
+                    routine=receipt.routine,
+                    routine_text=receipt.command.content if receipt.routine is not None and receipt.continuation is None else None,
+                    continuation=receipt.continuation,
+                    continuation_text=receipt.command.content if receipt.continuation is not None else None,
+                    source=receipt.source, result=turn.reference(), usage=turn.usage,
+                    delegation=receipt.delegation, queued_relay=receipt.queued_relay,
+                    notification_error=receipt.notification_error, finished_at=_created_at(item),
+                ))
+        return NativeHistoryPage(conversation=conversation, turns=tuple(turns),
+                                 next_after_turn=stop if stop < conversation.last_turn else None)
+
+    async def result(self, command: NativeResult):
+        from .native_checkpoint import conversation_store_name
+
+        receipt = await self.read(command.request_id)
+        self._address(receipt, command.conversation_id)
+        if receipt.status != "completed":
+            raise Problem(409, "NATIVE_RESULT_MISSING", "this RID has no confirmed complete result")
+        async with self._store(conversation_store_name(receipt.conversation_id)) as store:
+            turn = await self._turn(store, receipt)
+            text = await self._text(store, turn, command.part)
+        return NativeResultPage(
+            conversation_id=receipt.conversation_id, request_id=receipt.request_id, result=turn.reference(),
+            part=command.part, text=text, next_part=command.part + 1 if command.part + 1 < len(turn.text_parts) else None,
+            complete=len(turn.text_parts) == 1,
+        )
+
+    @staticmethod
+    def _address(receipt, cid):
+        if receipt.conversation_id != cid:
+            raise Problem(403, "NATIVE_STATE_SCOPE", "the RID does not belong to this conversation")
+
+    async def turn_status(self, command):
+        """One invocation for a poller: the receipt, its public progress and a completed single-page reply."""
+        from .behavior_native_turn_wire import NativeTurnStatus
+        from .native_checkpoint import conversation_store_name
+        from .native_progress import read_preview, read_progress
+
+        receipt = await self.read(command.request_id)
+        self._address(receipt, command.conversation_id)
+        progress = await read_progress(self, NativeProgressRead(
+            conversation_id=command.conversation_id, request_id=command.request_id))
+        text = next_part = finished_at = None
+        if receipt.status == "completed" and receipt.result is not None:
+            async with self._store(conversation_store_name(receipt.conversation_id)) as store:
+                item = await store.get_item(f"turn:{receipt.turn_number}")
+                turn = await self._turn(store, receipt, item=item)
+                if len(turn.text_parts) == 1:
+                    text = await self._text(store, turn, 0)
+                else:
+                    next_part = 0
+            finished_at = _created_at(item)
+        return NativeTurnStatus(receipt=receipt, progress=progress, text=text, next_part=next_part,
+                                preview=await read_preview(self, receipt), finished_at=finished_at)
+
+    async def response_not_started(self, command: NativeResponseNotStarted):
+        original = await self._rid(command.request_id)
+        receipt = original.value.receipt
+        self._address(receipt, command.conversation_id)
+        if receipt.state_profile != NATIVE_RESPONSES_PROFILE:
+            raise Problem(409, "NATIVE_STATE_SCOPE", "this rejection can only close the Responses lane")
+        if command.submit_digest != receipt.submit_digest:
+            raise Problem(409, "NATIVE_RID_CONFLICT", "the rejection differs from the original submission")
+        if receipt.status != "accepted":
+            return receipt
+        await self._require_original_session(receipt=receipt)
+        if original.value.run_token is not None or receipt.turn_number is not None or receipt.response_id is not None:
+            raise Problem(409, "NATIVE_STATE_INVALID", "this original receipt already has execution material")
+        if receipt.request_id in self.responses_queued:
+            raise Problem(409, "NATIVE_TURN_QUEUED", "the original response is already in the Agent queue")
+        log.warning("FA_NATIVE_RESPONSE_NOT_STARTED reason=%s", command.reason)
+        if receipt.cancel_requested:
+            return await self._notify_terminal(await self._unknown(original, "NATIVE_TURN_CANCELLED"))
+        return await self._close_unstarted(original)
+
+    async def cancel(self, command: NativeCancel):
+        original = await self._rid(command.request_id)
+        for _ in range(3):
+            receipt = original.value.receipt
+            self._address(receipt, command.conversation_id)
+            unstarted_response = receipt.state_profile == NATIVE_RESPONSES_PROFILE and receipt.status == "accepted"
+            if receipt.status not in {"accepted", "started"} or receipt.cancel_requested and not unstarted_response:
+                if receipt.status == "unknown":
+                    from .native_continuations import stop_handoff
+                    await stop_handoff(self, receipt)
+                return receipt
+            cancelled = _changed(receipt, cancel_requested=True)
+            if unstarted_response:
+                cancelled = _changed(cancelled, status="unknown", failure_code="NATIVE_TURN_CANCELLED")
+            replacement = _changed(original.value, receipt=cancelled)
+            current, saved = await self._cas(original, replacement)
+            if saved:
+                return await self._notify_terminal(current.value.receipt) if unstarted_response else current.value.receipt
+            original = current
+        # The durable flag targets this RID; never cancel or reclaim the whole Agent chain.
+        raise Problem(409, "NATIVE_TURN_UNKNOWN", "cancellation was not confirmed; read the original RID")
+
+    async def delivered(self, command: NativeDelivered):
+        original = await self._rid(command.request_id)
+        receipt = original.value.receipt
+        self._address(receipt, command.conversation_id)
+        if receipt.result is None or receipt.result.result_digest != command.result_digest:
+            raise Problem(409, "NATIVE_DELIVERY_CONFLICT", "delivery must acknowledge the original complete result")
+        if receipt.delivered:
+            return receipt
+        current, _ = await self._cas(original, _changed(original.value, receipt=_changed(receipt, delivered=True)))
+        return current.value.receipt
+
+    async def dispatch(self, command: NativeRequest):
+        from .behavior_native_turn_wire import NativeSessionFilesOmission
+        if isinstance(command, NativeSessionFilesOmission):
+            from .native_files_omission import confirm_omission
+            return await confirm_omission(self, command)
+        from .native_files_wire import NativeSessionFiles
+        if isinstance(command, NativeSessionFiles):
+            from .native_environment_files import session_files
+            return await session_files(self, command)
+        from .behavior_native_turn_wire import NativeContinuationRead, NativeContinuationReady, NativeContinuationSubmit
+        if isinstance(command, NativeContinuationReady):
+            from .native_continuations import acknowledge_ready
+            return await acknowledge_ready(self, command)
+        if isinstance(command, NativeContinuationRead):
+            from .native_continuations import read_continuation
+            return await read_continuation(self, command.request_id)
+        if isinstance(command, NativeContinuationSubmit):
+            return await self.continue_turn(command)
+        if isinstance(command, NativeHitlHistoryRead):
+            from .native_effects import read_hitl_history
+            return await read_hitl_history(self, command)
+        from .behavior_native_turn_wire import NativeReceivedRead
+        if isinstance(command, NativeReceivedRead):
+            from .native_received import read_received
+            return await read_received(self, command)
+        if isinstance(command, NativeProgressRead):
+            from .native_progress import read_progress
+            return await read_progress(self, command)
+        from .native_progress_wire import NativeTurnStatusRead
+        if isinstance(command, NativeTurnStatusRead):
+            return await self.turn_status(command)
+        if isinstance(command, (NativeAppend, NativeAppendRead)):
+            from .native_appends import append, read_append
+            return await (append(self, command) if isinstance(command, NativeAppend) else read_append(self, command))
+        if isinstance(command, NativeSessionRetarget):
+            from .native_environment import retarget_session
+            return await retarget_session(self, command)
+        from .native_skill_draft_wire import NativeSkillDraftIntentRead
+        from .native_image_wire import NativeImageRead, NativeImagesRead
+
+        if isinstance(command, (NativeImagesRead, NativeImageRead)):
+            from .native_images import read_image, read_images
+            return await (read_image(self, command) if isinstance(command, NativeImageRead) else read_images(self, command))
+        if isinstance(command, NativeSkillDraftIntentRead):
+            from .native_skill_draft import read_intent
+            return await read_intent(self, command)
+        from .behavior_user_images import NativeUserImageUpload
+        if isinstance(command, NativeUserImageUpload):
+            from .native_user_images import upload
+            return await upload(self, command)
+        if isinstance(command, NativeSessionFollow):
+            from .native_environment import follow_session
+            return await follow_session(self, command)
+        if isinstance(command, NativeSessionRead):
+            return await self.session_state(environment_request_id=command.environment_request_id)
+        if isinstance(command, NativeSessionPrepare):
+            return await self.prepare_session(command)
+        if isinstance(command, NativeSubmit):
+            return await self.submit(command)
+        if isinstance(command, NativeAgentReceive):
+            return await self.receive(command)
+        if isinstance(command, NativeRoutineSubmit):
+            return await self.receive_routine(command)
+        if isinstance(command, NativeRead):
+            return await self.read(command.request_id)
+        if isinstance(command, NativeConversationRead):
+            return await self.conversation(command.conversation_id)
+        if isinstance(command, NativeHistory):
+            return await self.history(command)
+        if isinstance(command, NativeResult):
+            return await self.result(command)
+        if isinstance(command, NativeCancel):
+            return await self.cancel(command)
+        if isinstance(command, NativeResponseNotStarted):
+            return await self.response_not_started(command)
+        if isinstance(command, NativeDelivered):
+            return await self.delivered(command)
+        if isinstance(command, NativeCandidateRead):
+            from .native_memory_candidate import read_candidate
+            return await read_candidate(self, command)
+        from .behavior_native_turn_wire import NativePrewarm
+        if isinstance(command, NativePrewarm):
+            return await self.prewarm(command)
+        raise Problem(422, "NATIVE_REQUEST_INVALID", "unknown native operation")
+
+    async def prewarm(self, command):
+        """The owner is typing (README#typing-prewarm). Reaching this session already woke its compute (the platform
+        provisions compute when a session is referenced), and ``native_response`` refused a replaced session as for
+        every read on the API's reader. Here only the named toolbox versions start listing in the background. No task,
+        RID, record, admission or execution lock is touched, and nothing is written."""
+        from .behavior_native_turn_wire import NativePrewarmView
+        start = getattr(self.executor, "prewarm", None)
+        count = 0 if start is None else start(command.toolboxes)
+        return NativePrewarmView(agent_id=self.identity.agent_id, hosted_session_id=self.identity.session_id,
+                                 toolboxes=count)
+
+
+async def native_response(request, runtime: NativeTurnRuntime | None, *, action="invoke"):
+    from starlette.responses import JSONResponse
+    from .behavior_http_diagnostics import _exception_type, native_correlation_id
+    from .behavior_native_turn_wire import NATIVE_TURN_ERRORS, NativeContinuationSubmit
+
+    entered = monotonic()
+    details = {
+        "action": action if action in {"invoke", "observe", "cancel"} else "unknown",
+        "agent_id": None if runtime is None else runtime.identity.agent_id,
+        "agent_version": None if runtime is None else runtime.identity.agent_version,
+        "session_id": None if runtime is None else runtime.identity.session_id,
+        "invocation_id": native_correlation_id(getattr(request.state, "invocation_id", None)),
+        "operation": None, "request_id_sha256": None,
+    }
+
+    def diagnostic(phase, *, status=None, code=None, exception=None):
+        log.warning("FA_NATIVE_HTTP %s", json.dumps({
+            **details, "phase": phase, "status": status, "code": code,
+            "exception_type": None if exception is None else _exception_type(exception),
+            "elapsed_ms": round((monotonic() - entered) * 1000),
+        }, sort_keys=True))
+
+    diagnostic("entered")
+    try:
+        if runtime is None or request.headers.getlist(NATIVE_TURN_HEADER) != [NATIVE_STATE_PROFILE]:
+            raise Problem(403, "NATIVE_TURNS_DISABLED", "the Hosted native path is not enabled")
+        if request.state.session_id != runtime.identity.session_id:
+            raise Problem(403, "NATIVE_STATE_SCOPE", "the platform session differs from this Hosted process")
+        from .behavior_native_turn_wire import NATIVE_EXPECTED_VERSION_HEADER, require_expected_version
+        expected = request.headers.getlist(NATIVE_EXPECTED_VERSION_HEADER)
+        if len(expected) > 1:
+            raise Problem(422, "NATIVE_REQUEST_INVALID", "one expected Hosted version is required")
+        require_expected_version(expected[0] if expected else None, runtime.identity.agent_version)
+        if action == "observe":
+            raise Problem(422, "NATIVE_REQUEST_INVALID", "use a read-RID invocation; GET does not infer a RID")
+        raw = bytearray()
+        async for chunk in request.stream():
+            if len(raw) + len(chunk) > MAX_ITEM_BYTES:
+                raise Problem(413, "NATIVE_REQUEST_TOO_LARGE", "the complete native request exceeds its bound")
+            raw.extend(chunk)
+        try:
+            def unique(pairs):
+                value = dict(pairs)
+                if len(value) != len(pairs):
+                    raise ValueError("duplicate fields")
+                return value
+
+            json.loads(raw, object_pairs_hook=unique)
+            command = NATIVE_REQUEST.validate_json(raw)
+        except (ValueError, TypeError):
+            raise Problem(422, "NATIVE_REQUEST_INVALID", "only the typed native request is accepted") from None
+        details["operation"] = command.operation
+        original = command.command if isinstance(command, (
+            NativeSubmit, NativeAgentReceive, NativeRoutineSubmit, NativeContinuationSubmit)) else command
+        rid = getattr(original, "request_id", None)
+        if rid is not None:
+            details["request_id_sha256"] = hashlib.sha256(rid.encode("utf-8")).hexdigest()
+        if action == "cancel" and not isinstance(command, NativeCancel):
+            raise Problem(422, "NATIVE_REQUEST_INVALID", "cancellation must name its original CID and RID")
+        if command.operation in _RECORD_READS and runtime.replaced((await runtime._agent_record())[0]):
+            # The API invokes its known session directly; one State store read here refuses a stale binding.
+            raise Problem(409, "NATIVE_SESSION_CHANGED", "a newer environment replaced this Hosted session; nothing was read")
+        result = await runtime.dispatch(command)
+        status = 202 if isinstance(command, (
+            NativeSubmit, NativeAgentReceive, NativeRoutineSubmit, NativeContinuationSubmit, NativeAppend)) else 200
+        response = JSONResponse(result.model_dump(mode="json"), status_code=status)
+        diagnostic("returned", status=status)
+        return response
+    except Problem as exc:
+        response = JSONResponse(exc.body, status_code=exc.status)
+        code = exc.body["error"]["code"]
+        diagnostic("returned", status=exc.status, code=code if code in NATIVE_TURN_ERRORS else "UNCLASSIFIED")
+        return response
+    except (Exception, asyncio.CancelledError) as exc:
+        diagnostic("raised", exception=exc)
+        raise

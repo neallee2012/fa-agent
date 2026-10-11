@@ -1,0 +1,23 @@
+FROM python:3.11.14-slim-bookworm
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HOME=/home/session
+ENV COPILOT_CLI_EXTRACT_DIR=/opt/copilot/1.0.83
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements-hosted.txt .
+RUN pip install --no-cache-dir -r requirements-hosted.txt \
+    && python -m copilot download-runtime \
+    && chmod -R a+rX /opt/copilot/1.0.83 \
+    && test -x /opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime \
+    && useradd --create-home --uid 10001 app \
+    && install -d -m 0755 /home/session
+COPY shared_context ./shared_context
+COPY hosted_bootstrap.py behavior_server_main.py behavior_assistant_main.py runtime_probe.py ./
+ENV COPILOT_SKIP_CLI_DOWNLOAD=1
+ENV BEHAVIOR_ASSISTANT_RUNTIME_PATH=/opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime
+USER 10001
+RUN python -c "import behavior_assistant_main" && python runtime_probe.py
+USER 0
+EXPOSE 8088
+CMD ["python", "behavior_server_main.py", "assistant-hosted-bootstrap"]

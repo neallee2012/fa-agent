@@ -1,0 +1,23 @@
+# Feed reader MCP server (separate Container App; README "Feed reader MCP"). Same pins as requirements.txt and
+# requirements-behavior.txt for the packages it shares with the API, so no new release enters the build.
+mcp==1.30.0
+starlette==1.6.0
+uvicorn==0.42.0
+httpx==0.28.1
+pydantic==2.12.5
+PyJWT[crypto]==2.13.0
+httpx-sse==0.4.3
+jsonschema==4.25.1
+jsonschema-specifications==2025.9.1
+referencing==0.37.0
+rpds-py==2026.6.3
+attrs==26.1.0
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+python-multipart==0.0.32
+sse-starlette==3.4.11
+# Imported directly by feed_mcp (fetch.py, server.py, shared_context/feed_signature.py); each released over 7 days ago.
+httpcore==1.0.9
+anyio==4.15.1
+certifi==2026.7.22
+cryptography==50.0.1

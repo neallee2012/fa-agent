@@ -1,0 +1,109 @@
+{
+  "schema": 1,
+  "source_kind": "sanitized_native_evidence_catalog",
+  "batch_id": "m4-context-01-r3",
+  "original_closeout_at": "2026-09-15T18:57:53.860025+08:00",
+  "execution_closeout": "STOPPED_AFTER_INCOMPLETE_CHECKPOINT_CASE",
+  "milestone_summary": "PARTIAL_NOT_FULL_PASS",
+  "five_case_acceptance": "FAIL",
+  "full_scenario_pass": false,
+  "case_results": {
+    "short-cold": "PASS",
+    "short-warm": "PASS",
+    "long-warm": "PASS",
+    "long-new-conversation": "PASS",
+    "long-resumed": "INCOMPLETE_BEFORE_CHECKPOINT"
+  },
+  "incomplete_case": {
+    "case_id": "long-resumed",
+    "checkpoint_wait_observed": false,
+    "task_verified": false,
+    "sdk_resumes": 0,
+    "root_cause": "UNVERIFIED_STATUS_ONLY_NO_FINAL_SDK_TRACE_COLLECTED"
+  },
+  "manual_semantic_source_review": "four completed cases checked against actual work, memory and approved policy context",
+  "counts": {
+    "explicit_stops": 3,
+    "memory_update_submissions": 4,
+    "native_file_downloads": 8,
+    "native_invocations": 53,
+    "new_sessions": 2,
+    "sdk_resumes": 0,
+    "sdk_starts": 5
+  },
+  "cumulative_counts_last_observed": {
+    "acr_builds": 5,
+    "active_test_seconds": 1151.436033964157,
+    "api_revisions": 3,
+    "explicit_stops": 10,
+    "memory_update_submissions": 12,
+    "model_attempts": 36,
+    "native_file_downloads": 18,
+    "native_invocations": 115,
+    "new_memory_stores": 3,
+    "new_sessions": 6,
+    "new_versions_a": 2,
+    "new_versions_b": 2,
+    "sdk_resumes": 0,
+    "sdk_starts": 10
+  },
+  "model_count_note": "36 is the last successful cumulative budget read before long-resumed; subsequent usage unknown, not zero or a final total",
+  "cleanup_verified_in_original_closeout": true,
+  "native_idle_inventory": {
+    "a": 102,
+    "b": 58,
+    "source": "m4-context-01-final-closeout-inventory.json",
+    "is_live_inventory": false
+  },
+  "deployment": {
+    "api_revision": "ca-facontext-poc--m4-3",
+    "a_version": "17",
+    "b_version": "11",
+    "api_image_digest": "sha256:0ab4839668b8b455ac203637ccbd1fd5bfbaa370fb5f32cb62b394f973888ba4",
+    "hosted_image_digest": "sha256:b68857acd95100247c28c2e6561e0d3d103fc9c02a7135ddb80dbfedf6ddfa78",
+    "later_behavior_delivery_core_in_image": false
+  },
+  "local_integrity_check": {
+    "date": "2026-09-15",
+    "mode": "read_only_local_hash_comparison",
+    "cloud_calls": 0,
+    "closeout_manifest": {
+      "path": ".azure\\m4-r3-closeout.json",
+      "sha256": "c06cf1fa62b0630281c73cf27c6dcbc3c72c905ef4e2321f59cc58e97b880819",
+      "entries": 804,
+      "mismatches": 0
+    },
+    "source_gate_manifest": {
+      "path": ".azure\\m4-final-local-gates.json",
+      "sha256": "cbab827c4ceddab4d904a0e0131e1a1c324b06181b8fde6f2dea57b7188d9741",
+      "entries": 48,
+      "mismatches": 0,
+      "recorded_tests_passed": 1220,
+      "tests_rerun_during_this_check": false,
+      "is_git_commit": false
+    }
+  },
+  "M4_code_commit": "1ca1c762050cdcafb51484b5155ad5b65503cd65",
+  "M4_code_tree": "8534cba7d0b93c869ac3922061a0ec8c81dfb1a9",
+  "M4_code_remote_readback": "1ca1c762050cdcafb51484b5155ad5b65503cd65",
+  "commit_push_status": "CODE_COMMIT_PUSHED_AND_READ_BACK",
+  "publication_authorization_at": "2026-09-15T21:18:05.426+08:00",
+  "publication_validation": {
+    "kind": "offline_isolated_publication_tree",
+    "tests_passed": 1114,
+    "excluded_behavior_core_and_test_files": 6,
+    "initial_copy_path_and_runtime_setup_errors_retained": true,
+    "runtime_source_changed_to_pass": false,
+    "cloud_calls": 0
+  },
+  "BR01_formal_wiring": "BASELINE_FIXED_IMPLEMENTATION_NOT_STARTED",
+  "new_cloud_run_authorized_by_this_catalog": false,
+  "full_raw_memory_and_sdk_trace_in_git": false,
+  "not_shared_filesystem_proof": true,
+  "not_behavior_v12_pass": true,
+  "prior_batch_catalog": "m4-20260915-closeout.json",
+  "prior_failures_or_unknowns_rewritten": false,
+  "total_budget_usd": 100,
+  "exact_M4_cost": "UNKNOWN_DUE_TO_BILLING_LAG_AND_INCOMPLETE_FINAL_USAGE",
+  "resources_retained": true
+}

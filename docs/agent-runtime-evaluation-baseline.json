@@ -1,0 +1,3035 @@
+{
+  "schema_version": "fa-agent-runtime-baseline-v1",
+  "baseline_commit": "cb7a2d8b6868e06d9a941a6bdeb77ba399252159",
+  "scope_selected_on": "2026-09-25",
+  "target_document": "agent-runtime-target-state.md",
+  "report_document": "agent-runtime-evaluation-baseline.md",
+  "scope": "Selected existing offline contract tests, not agent quality or full-target acceptance",
+  "new_agent_traces": 0,
+  "human_labels": null,
+  "semantic_quality": "not_evaluated",
+  "hosted_verification": "not_run",
+  "full_target_acceptance": "not_evaluated",
+  "groups": [
+    {
+      "id": "tools",
+      "selectors": [
+        "tests\\shared_context\\test_behavior_operations.py::test_no_adapter_or_grant_can_be_supplied_by_tool_intent",
+        "tests\\shared_context\\test_behavior_operations.py::test_model_cannot_mint_a_new_operation_id_to_retry_an_unknown_action",
+        "tests\\shared_context\\test_behavior_dispatch.py::test_real_httpx_single_get_records_result_and_obligation_atomically",
+        "tests\\shared_context\\test_behavior_dispatch.py::test_approval_a_alias_b_then_c_after_gate_still_consumes_saved_a",
+        "tests\\shared_context\\test_behavior_dispatch.py::test_real_client_transport_gate_rejects_altered_wire_request",
+        "tests\\shared_context\\test_behavior_assistant.py::test_profile_cannot_be_enabled_by_model_payload_or_invalid_legacy_input"
+      ],
+      "limitations": [
+        "Nine cases from test_behavior_dispatch.py exercise ContextArtifactAdapter over offline HTTP transports; that adapter is not configured by build_server.",
+        "build_server configures WorkStateEffectAdapter -> WorkStateDispatcher -> in-process WorkStateEffectReceiver. This batch has no test_behavior_effects selectors and does not verify that configured operation path.",
+        "The other three cases check two ToolBrokerCore input/original-ID contracts and one legacy profile refusal, not end-to-end free-instruction dispatch.",
+        "Does not run Copilot's tool loop or measure model tool selection.",
+        "Does not establish dynamic connector discovery, shell/browser routing or tool-catalog cache benefit."
+      ]
+    },
+    {
+      "id": "wakes",
+      "selectors": [
+        "tests\\shared_context\\test_behavior_delivery.py::test_role_and_approval_fields_never_supply_actor_or_authorization",
+        "tests\\shared_context\\test_behavior_delivery.py::test_admission_commits_complete_set_in_one_conditional_batch",
+        "tests\\shared_context\\test_behavior_delivery.py::test_replay_returns_original_sequence_without_creating_more_work_or_quota",
+        "tests\\shared_context\\test_behavior_delivery.py::test_unknown_admission_keeps_original_request_and_never_retries_or_fake_acks",
+        "tests\\shared_context\\test_instruction_completion.py::test_ready_notification_wakes_one_existing_observer_without_timer_delay",
+        "tests\\shared_context\\test_behavior_delivery.py::test_due_uses_saved_results_first_and_does_not_rerun_the_work"
+      ],
+      "limitations": [
+        "Seven test_behavior_delivery cases use Harness with work_policy=None: fixed-work admission/redrive branches, not free-instruction admission.",
+        "One test_instruction_completion case checks in-process ready notification with a substituted controller, not durable API-down wake delivery.",
+        "Does not demonstrate routine occurrences, external connector events, group-chat silence or API-down wake delivery."
+      ]
+    },
+    {
+      "id": "lifecycle",
+      "selectors": [
+        "tests\\shared_context\\test_behavior_workers.py::test_c4_fifth_is_queued_until_verified_completion_not_four_permits_as_native_proof",
+        "tests\\shared_context\\test_behavior_workers.py::test_executor_start_response_loss_never_reruns_business_work",
+        "tests\\shared_context\\test_behavior_workers.py::test_expired_lease_unknown_and_cancel_acceptance_never_release_an_executor",
+        "tests\\shared_context\\test_behavior_delivery.py::test_succeeded_plus_acked_still_owes_final_and_outbox_persistence_is_not_delivery",
+        "tests\\shared_context\\test_behavior_delivery.py::test_failed_or_cancelled_work_still_requires_a_verified_failure_delivery",
+        "tests\\shared_context\\test_instruction_completion.py::test_final_save_waits_for_inflight_public_progress",
+        "tests\\shared_context\\test_sdk_checkpoint.py::test_recovery_refuses_wrong_scope_hash_version_or_missing_material",
+        "tests\\shared_context\\test_sdk_checkpoint.py::test_all_sdk_files_survive_storage_without_inline_limits",
+        "tests\\shared_context\\test_sdk_checkpoint.py::test_resume_cannot_start_with_an_empty_same_id_filesystem"
+      ],
+      "limitations": [
+        "SDK execution and executor activity are synthetic in these selected tests.",
+        "Three WorkerCore and three DeliveryCore cases use work_policy=None: fixed-work branches, not the current free-instruction branches.",
+        "The C4 test covers the legacy shared-pool algorithm, not four live agents or the free-instruction per-work pools.",
+        "The other eight cases cover two progress/final ordering cases and six synthetic checkpoint boundary cases, not end-to-end free-instruction settlement.",
+        "Does not measure compaction quality, Hosted recovery, browser persistence, latency SLO or delivery to a human."
+      ]
+    },
+    {
+      "id": "memory",
+      "selectors": [
+        "tests\\shared_context\\test_memory_governance.py::test_existing_source_is_not_a_review_and_rule_review_is_not_human_approval",
+        "tests\\shared_context\\test_memory_governance.py::test_fake_citation_and_private_scope_leak_fail_before_review",
+        "tests\\shared_context\\test_memory_governance.py::test_source_correction_rejects_stale_claim_and_stale_summary",
+        "tests\\shared_context\\test_memory_governance.py::test_revocation_blocks_context_and_late_projection_cannot_reinstate",
+        "tests\\shared_context\\test_memory_governance.py::test_required_fact_absence_wrong_actor_and_unknown_token_count_are_not_empty_success",
+        "tests\\shared_context\\test_memory_projection.py::test_native_completed_operation_preserves_receipt_and_candidate_lineage",
+        "tests\\shared_context\\test_memory_projection.py::test_lost_native_accepted_response_restart_stays_unknown_without_id_or_second_post",
+        "tests\\shared_context\\test_memory_projection.py::test_native_extraction_losing_cobalt_never_loses_exact_original_or_claim",
+        "tests\\shared_context\\test_memory_projection.py::test_similarity_or_exact_text_without_original_receipt_relation_is_excluded",
+        "tests\\shared_context\\test_memory_projection.py::test_corrected_claim_uses_current_exact_fallback_not_stale_native",
+        "tests\\shared_context\\test_memory_projection.py::test_private_projection_wrong_actor_cannot_read_plan_send_search_or_assemble"
+      ],
+      "limitations": [
+        "Uses the real azure-ai-projects serializer with local transport and constructed extraction/search results.",
+        "Review decisions are test fixtures, not human evaluation labels.",
+        "Does not measure automatic post-turn extraction, synthesis quality, native Memory recall or general retrieval relevance."
+      ]
+    },
+    {
+      "id": "subagents",
+      "selectors": [
+        "tests\\shared_context\\test_behavior_child_runtime.py::test_authenticated_child_enqueue_requires_started_parent_and_replays_one_registered_job",
+        "tests\\shared_context\\test_behavior_child_runtime.py::test_native_style_c1_parent_park_child_completion_exact_checkpoint_resume_and_delivery",
+        "tests\\shared_context\\test_behavior_child_runtime.py::test_child_http_cannot_supply_execution_authority_or_raw_work",
+        "tests\\shared_context\\test_behavior_child_runtime.py::test_child_enqueue_unknown_reconciles_exact_core_egt_without_resending",
+        "tests\\shared_context\\test_behavior_child_runtime.py::test_lost_native_park_and_expired_lease_never_start_child_or_release_parent_slot",
+        "tests\\shared_context\\test_behavior_child_runtime.py::test_native_callback_rejects_registered_child_with_mismatched_saved_job",
+        "tests\\shared_context\\test_behavior_workers.py::test_parked_cancel_retains_child_responsibilities_without_claiming_the_child_stopped"
+      ],
+      "limitations": [
+        "Exercises configured checksum child jobs and real local child processes through offline transports.",
+        "This is not Copilot SDK custom-agent orchestration, model delegation or separate Hosted agent isolation.",
+        "The general assistant profile currently rejects child_jobs and configures custom_agents as an empty list."
+      ]
+    }
+  ],
+  "run": {
+    "id": "agent-runtime-offline-20260925",
+    "started_at": "2026-09-25T09:10:17.1934790+08:00",
+    "completed_at": "2026-09-25T09:10:50.5743805+08:00",
+    "execution": "completed",
+    "outcome": "pass",
+    "coverage": "offline_contract_subset",
+    "exit_code": 0,
+    "product_test_cases": 68,
+    "evaluation_tooling_test_cases": 34,
+    "total_test_cases": 102,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "pytest_seconds": 28.21,
+    "versions": {
+      "platform": "Windows",
+      "python": "3.12.10",
+      "pytest": "9.0.2",
+      "github-copilot-sdk": "1.0.13",
+      "azure-ai-projects": "2.3.0",
+      "tiktoken": "0.11.0"
+    },
+    "copilot_runtime_execution": "not_run",
+    "live_model_execution": "not_run",
+    "tooling_selectors": [
+      "tests\\context_eval\\test_m4_context_eval.py"
+    ],
+    "group_results": {
+      "tools": {"passed": 12, "failed": 0, "errors": 0, "skipped": 0},
+      "wakes": {"passed": 8, "failed": 0, "errors": 0, "skipped": 0},
+      "lifecycle": {"passed": 14, "failed": 0, "errors": 0, "skipped": 0},
+      "memory": {"passed": 19, "failed": 0, "errors": 0, "skipped": 0},
+      "subagents": {"passed": 15, "failed": 0, "errors": 0, "skipped": 0}
+    },
+    "evidence": [
+      {
+        "ref": "agent-runtime-scope-20260925.json",
+        "kind": "withheld_artifact",
+        "sha256": "f236b1bf3ec097af9d4ebe266623c387ce14079c1ce11b5244bc0c877114f290",
+        "description": "Pre-execution copy of this scope with run=null; not the hash of the final result document."
+      },
+      {
+        "ref": "agent-runtime-offline-20260925.xml",
+        "kind": "test_report",
+        "sha256": "795637d7056ee731854a99cf9145271c8514ab1875481b69670aa977ac8de473"
+      },
+      {
+        "ref": "agent-runtime-offline-20260925.log",
+        "kind": "withheld_artifact",
+        "sha256": "399ba2635a032306b483c40f825d039bf6bb6e049315fa23fe29a5037c6be7df"
+      }
+    ],
+    "warnings": [
+      "One Starlette BlockingPortal alias deprecation warning; no code was changed to suppress it."
+    ],
+    "setup": {
+      "initial_system_python_attempt": "blocked: No module named pytest; no tests collected",
+      "resolution": "Worktree-local virtual environment, existing test and behavior requirements, pinned tokenizer cache",
+      "product_source_changes": false,
+      "package_manifests_changed": false
+    }
+  },
+  "checker_probe": {
+    "scope": "Six constructed M4 checker inputs; not agent traces or human gold",
+    "checker_source_sha256": "017c07da10ede91d78e9a6626aaa37adf827f26d1fa8f5b1e4acf89f49fdd040",
+    "evidence_ref": "agent-runtime-checker-probes-20260925.json",
+    "evidence_sha256": "8aead290ab28d2540d2c20dfb35c4bb9153104bd834609f5540c1e9b2bd8778d",
+    "accepted": ["positive-control", "negated-owner", "different-project-owner"],
+    "rejected": ["unknown-citation", "rejected-policy", "token-bound-exceeded"],
+    "semantic_proxy_counterexamples": ["negated-owner", "different-project-owner"],
+    "human_gold": null,
+    "product_failure_rate": null
+  },
+  "historical_ledger_observation": {
+    "path": "context-evaluation-status.json",
+    "working_bytes_sha256": "d22c4c0b8eb756fe662d305a18173a213b1e83acaa2f2b8dda67d2178f616268",
+    "schema_version": 2,
+    "runs": 172,
+    "environment_counts": {
+      "hosted": 4,
+      "local_sdk_offline": 48,
+      "offline_checker": 69,
+      "source_only": 51
+    },
+    "target_count": 76,
+    "scenario_count": 12,
+    "declared_target_acceptances": 1,
+    "declared_scenario_acceptances": 0,
+    "human_batch_acceptances": 2,
+    "human_target_acceptances": 0,
+    "modified_by_this_work": false,
+    "limitation": "Historical declarations on their recorded baselines, not re-execution or new acceptance on cb7a2d8. The source reports still describe PA-02 acceptance as a proposal pending revised two-axis review; that review outcome was not verified in this assessment."
+  },
+  "assessment_correction": {
+    "observed_on": "2026-09-25",
+    "reason": "Opus review P2: retain unverified PA-02 review follow-up and distinguish configured consumers from the adapters/branches actually tested.",
+    "scope": "Document interpretation and group limitations only; original selectors, run results and evidence are unchanged.",
+    "product_tests_rerun": false,
+    "opus_rereview": "completed_point_review",
+    "review_model": "claude-opus-5.5",
+    "standards_p1": 0,
+    "standards_p2": 0,
+    "spec_p1": 0,
+    "spec_p2": 0,
+    "review_evidence_ref": "opus55-runtime-p2-rereview-20260925/result.json",
+    "review_evidence_sha256": "28f1c33f4bf0d2bf52653ad1ac0d52b2d668fe8400245b6e0bb06d9f0043f728",
+    "review_limit": "The two document P2 fixes only; not a full PR review, PA-02 product review or new evaluation acceptance."
+  },
+  "follow_up_runs": [
+    {
+      "id": "native-routines-reminders-20261004",
+      "targets": ["PA-09", "PA-10", "WAKE-05"],
+      "plan_sha256": "20c11b363afb428d38602eaee38f94d76dd49df3dfd0bbcc61a19974cd5e1e68",
+      "base_commit": "bd3c4ba8da5db58f49b741aa753aeff0ef43453e",
+      "code_commit": "a229be94e8f6d06e6d9450e5bea9c8208b8827b4",
+      "delivery": {
+        "pull_request": "（原私有 repo 連結）",
+        "method": "squash",
+        "merge_commit": "f7a45f20b44fe583f1bee134616fb5a02c673055",
+        "merged_at": "2026-10-03T19:39:40Z",
+        "final_head": "220e0cf01d422372700a2f4f2d95bf07fec4b04f",
+        "tree": "86dd6b5e441a87816212fbaa588c9061205527d7",
+        "tree_equal": true,
+        "artifact": "routines-delivery-20261004.json",
+        "artifact_sha256": "e7c1a0703a9beb3527a2b64081ea8271fccc0a0ad908ce7140ad20364a9eefa3",
+        "cloud": "not_deployed"
+      },
+      "execution": "completed_local",
+      "outcome": "pass_with_separately_retained_regression_failures",
+      "acceptance": "code_offline_reviewed",
+      "review": {
+        "model": "claude-opus-5.5",
+        "standards": "CLEAN",
+        "spec": "CLEAN",
+        "reviewed_head": "090a56cd1709bdef5a138a016ef86f62700d6023",
+        "final_standards": {"p1": 0, "p2": 0},
+        "final_spec": {"p1": 0, "p2": 0},
+        "artifact": "routines-final-review-20261004.json",
+        "artifact_sha256": "4757e6944e08e5cd11fc02b03e093c2936055752a971a6564a3987e5db384cae",
+        "initial_head": "6e4ac0dcc36e11faec64c0d58796030437b7fd76",
+        "initial_standards": {"p1": 0, "p2": 1},
+        "initial_spec": {"p1": 0, "p2": 3},
+        "distinct_p2": 4,
+        "delivery_method": "squash",
+        "baseline_follow_up": "PA-09/PA-10 current_baseline points to actual main f7a45f20; original run baselines/artifacts are retained."
+      },
+      "review_fix_run": {
+        "head": "1679dede236a6a30880b93255278e8d11b597ce2",
+        "artifact": "routines-review-fixes-qualification.xml",
+        "sha256": "4b3d0ca33cae4e113d0bac49b4858d87dfefc44ad082a11374a55894b47965bb",
+        "passed": 106,
+        "failed": 0,
+        "ui_artifact": "routines-review-fixes-dom.log",
+        "ui_sha256": "8979ce40c5a60509f1a44f4826b1739cdaf45af63596a4ec610cf8b417195f48",
+        "ui_passed": 494,
+        "main_join": "5b92a5188be5ba017bb753e3b5073166b7b6817c",
+        "scope": "Four distinct P2 fixes, both native lanes, real fixed SDK with synthetic HTTP, Effects/continuation and published no-source-invoke controls",
+        "review_status": "CLEAN_original_axes"
+      },
+      "versions": {"sdk": "1.0.13", "runtime": "1.0.83", "core_responses": "2.2.0", "invocations": "1.2.0"},
+      "evidence_session": "00000000-0000-0000-0000-000000000036",
+      "runs": [
+        {
+          "artifact": "routines-scope-final-a229be94.xml",
+          "sha256": "9a18563a604ad42c8d06872dc7558aacf1c21828fca3bfa3a0be867982d582ac",
+          "passed": 36, "failed": 0,
+          "scope": "New routine/producer/context/attention contracts, both handlers, real fixed SDK with synthetic HTTP, cold API import"
+        },
+        {
+          "artifact": "routines-dom-final-a229be94.log",
+          "sha256": "ef3342e8fe14cdb2be8393414c110c645e681111b3cc40d9efd2a15888c46eb2",
+          "passed": 485, "failed": 0,
+          "scope": "Complete shared DOM suite; not 485 routine-only or live tests"
+        },
+        {
+          "artifact": "routines-qualify-a229be94.xml",
+          "sha256": "2644516cc1e0edb5d8a32fcdda2072135f7939d069f60a02081a2932716ec108",
+          "passed": 529, "failed": 9, "deselected": 1,
+          "scope": "34-file regression; original mixed result retained"
+        },
+        {
+          "artifact": "routines-qualification-narrow-20261004.xml",
+          "sha256": "b55c9fe079fe11003d8e1ef3638118baa9ceb7bc67f4ea528672639b9c04118d",
+          "passed": 25, "failed": 0,
+          "scope": "Two incomplete lane DTO fixtures corrected; four State-store/admission cases independently rerun; product unchanged"
+        }
+      ],
+      "limitations": [
+        "S1/S3 and S2 code only. Native routines and the dedicated producer default off; #259 remains off and is not the native execution route.",
+        "Container Apps Scheduled Jobs GA is the planned clock, not a deployed resource. New MI, API app role/assignment, ACR pull, environment flags and S4 live require Neal's separate approval.",
+        "No new agent loop, timer, lease or execution ledger. Existing metadata CAS retains definitions and dispatch intents; N1 and NativeEffects remain the work/effect authorities.",
+        "Original UNKNOWN/cancelled work and approvals are not rewritten; same occurrence never acquires a new root RID from retries or definition version changes.",
+        "Model HTTP is synthetic, not live model quality. Native M follow-up behavior and full PA-09/PA-10/WAKE-05 acceptance are not claimed.",
+        "Broad-run failures are not replaced by later PASS. Three console RPC-order assertions and the excluded direct-executor factory case also fail on unmodified bd3c4ba8. Linux was not run because Docker engine was unavailable."
+      ]
+    },
+    {
+      "id": "native-continuation-20261003",
+      "targets": ["joint-plan-slice-4", "CTX-03", "WAKE-03"],
+      "plan_sha256": "5f18a290073cebfe4fc51aef97cc0576c6a21942b44e85bb65f33c84705cc9b2",
+      "base_commit": "d0d8d9676432c6f07ac54a46da17d3a2f3715924",
+      "execution": "completed_local",
+      "outcome": "pass",
+      "acceptance": "code_offline_reviewed",
+      "review": {
+        "standards": "CLEAN",
+        "spec": "CLEAN",
+        "model": "claude-opus-5.5",
+        "reviewed_head": "4ac051e6d233c7696a8a64e0890dbff783d9b9b1",
+        "final_standards": {"p1": 0, "p2": 0},
+        "final_spec": {"p1": 0, "p2": 0},
+        "artifact": "continuation-final-review-1003.json",
+        "artifact_sha256": "1fed1245fddbb3c0afb81af5156f86ea4dafd3fbbe4281e74acd57d49daaccfe",
+        "initial_head": "ee8ef6b7c920f1d6eb7b30cda04d01f903181bd5",
+        "initial_standards": {"p1": 0, "p2": 3},
+        "initial_spec": {"p1": 0, "p2": 1},
+        "distinct_p2": 3,
+        "first_delta_head": "3169cee0a48b3af14bed455ee83781096887b4cf",
+        "first_delta_standards": {"p1": 0, "p2": 2, "initial_p2_closed": 3},
+        "first_delta_spec": {"p1": 0, "p2": 1, "initial_p2_closed": 1},
+        "second_delta_head": "561d3db97390f97491cbb3503bf033f0d7501607",
+        "second_delta_standards": {"p1": 0, "p2": 1},
+        "second_delta_spec": {"p1": 0, "p2": 1},
+        "lifecycle_correction": "Both original axes confirmed core 2.2.0 one-shot @task is ephemeral and deletes terminal records. A stable task ID is not lifetime deduplication; existing original message/post/usage identities provide idempotent effects."
+      },
+      "second_review_delta": {
+        "status": "closed_by_final_original_axes_review",
+        "artifact": "continuation-delta2-focused-1003.xml",
+        "sha256": "d19e2233138015428572e15eaed3216eea9a3b6471494ac2fdaa518160db0f1c",
+        "passed": 20,
+        "failed": 0,
+        "errors": 0,
+        "scope": "All current continuation runtime cases plus original TC06 same-name file reader. Covers handoff-read transient failure/exhaustion, indeterminate stopped admission, cancellation racing real recovered handler entry, fresh enqueue metadata retry, and completed continuation not shadowing human attachments.",
+        "red_artifact": "continuation-delta2-red2-1003.xml",
+        "red_sha256": "300d7b883022fb294b7d4cbdd597b2c308d89225fa663619e18913a8d61634e5",
+        "red_failed": 4,
+        "red_passed": 1,
+        "observation_red_artifact": "continuation-observation-red-1003.xml",
+        "observation_red_sha256": "5596cb25bcee5c49ccaad3829ef6f21471cee5b9568c3b1dc60d3af005cfb65d",
+        "bounded_green_artifact": "continuation-delta2-green2-1003.xml",
+        "bounded_green_sha256": "1e0f8d2ca4cfeb05a468cbc375ecbd2ee4a84c3bacbbc18ab4d91d4590b2adf0",
+        "file_origin_red_artifact": "continuation-file-origin-red-1003.xml",
+        "file_origin_red_sha256": "9252889dff91ca552e59fe1002f674beb657f5a78aaccc4b3c13f25f635afded",
+        "linux_attempt": "not_run",
+        "linux_attempt_log": "continuation-linux-delta2-1003.log",
+        "linux_attempt_log_sha256": "2ed017e0b43372859cb60cb341cdd4645ce8db7b2f2e75876c9dbc37d2e37498",
+        "linux_limitation": "Docker Desktop Linux engine pipe disappeared before the command could run. Shared services were not restarted. Earlier Linux 115 PASS remains evidence for its original snapshot, not this delta."
+      },
+      "dispatch_start_delta": {
+        "status": "original_axes_clean",
+        "artifact": "continuation-dispatch-final-1003.xml",
+        "sha256": "b1e70c9f5f8347e6be12cb928cfeffec40deee049dbe8245dbdd2e3e3434e38f",
+        "passed": 23,
+        "failed": 0,
+        "errors": 0,
+        "red_artifact": "continuation-dispatch-red-1003.xml",
+        "red_sha256": "4ddf4ede320c5e9dab73121d1c2f606a7d5fac41ea7d4fcf36c4514c46b78c16",
+        "red_failed": 4,
+        "first_green_artifact": "continuation-dispatch-green-1003.xml",
+        "first_green_sha256": "2f4b14f341166aa67426c1e7e11e8e945d00026cc42135848babcabeb3e5091f",
+        "scope": "The existing notification retry reschedules a prepared original intent after enqueue.start failure. Pending N1 references exist before task API calls. Full task-transport errors are classified, with real AzureError/TransportClassifiedError injections and both lanes. Original N1 admission still owns model-once behavior. Human attachment lookup follows verified continuation lineage and returns newer, different original content/RID/turn.",
+        "linux": "not_run_docker_engine_unavailable"
+      },
+      "review_fix_run": {
+        "snapshot_tree": "04ce353f2b3059d82eb0e4d029dc5b9f4d4e4d84",
+        "artifact": "continuation-linux-review/full.xml",
+        "sha256": "f2b27ab36fa6206bbaad3a86db3143a0bad6eb30995664c18a5f7fccedb879d0",
+        "log_artifact": "continuation-linux-review-1003.log",
+        "log_sha256": "9a6a1667ad5eb6e7734f54b39e823d4c1eea028347d1e564179ad2c2578c598c",
+        "passed": 72,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "seconds": 71.30,
+        "environment": "Existing local fa-selector-offline:79fa image, network=none, empty HOME, Linux tmpfs; same fixed SDK and runtime. No cloud/model network.",
+        "image_id": "sha256:e351a360d73dbe0a63f29675c18eec04db956f972a1870be4dc7eb8e9d11c5c8"
+      },
+      "published_integration": {
+        "main_commit": "92bd2986777079c983c120ff95f37dad7c0c95b5",
+        "selector_merge": "14ba0e899e378eddc43668d25da9779f05309a08",
+        "snapshot_tree": "3ac0f183ddbd0eccf3d47954e27b829f601d871b",
+        "artifact": "continuation-linux-review/integrated-qualified.xml",
+        "sha256": "0bf386b8da18a4db17e4cf3dacdfb91d904bbf2266cf84a57b69454ddded5e11",
+        "log_artifact": "continuation-linux-integrated-qualified-1003.log",
+        "log_sha256": "b96a4a49f787900e268925fedef48309994a1e32add4d0567ae2c294206778b5",
+        "passed": 115,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "seconds": 106.61,
+        "node_artifact": "continuation-integrated-ui-1003.log",
+        "node_sha256": "35fb5a115e0cadf44cffae34a2427fa972de03d3b085febab155710dd420150a",
+        "node_passed": 205,
+        "scope": "Same offline Linux environment; includes complete continuation delta, shared relay fixture, group/effects/original-final-save, both published Files paths and both real API first-submit paths. Node preserves current settings/environment UI.",
+        "retained_join_runs": [
+          {"artifact": "continuation-linux-review/integrated.xml", "passed": 64, "failed": 27, "sha256": "84595b1c0729c3c4fdc9f13b6638fc522483c5d2f00c6468b14d19e1f777f7ce"},
+          {"artifact": "continuation-linux-review/integrated-final.xml", "passed": 112, "failed": 3, "sha256": "a916d6cf87e31b2218a5ab17dc01c4eca15b716b6f82521d81494f874fd2ff7e"}
+        ],
+        "fixture_adjustment": "Relay fixtures must use the currently selected version-specific SID after slice 2, not the old unversioned prepared cache. Recipient-unavailable injection now affects only the receiver, not the healthy sender's fresh metadata read. No product version guard was weakened."
+      },
+      "files_omission_join": {
+        "main_commit": "b2ff46ba026df770dc3c5f36a8b300eedb6dddfa",
+        "scope": "Preserve published omission workflow; a ready environment with no manifest remains insufficient for automatic cross-SID continuation. Only the existing continuation read projection adds WORKSPACE_REQUIRED, without releasing the original pending intent or rewriting UNKNOWN.",
+        "red_artifact": "continuation-omission-red-1003.xml",
+        "red_sha256": "157800eee4f023adf4f401fb070491f4cdd4c2939f01768216b14620285e28bf",
+        "artifact": "continuation-omission-join-1003.xml",
+        "sha256": "1a118d295dd02b04be43a8b1eac8698a325e4694edd909eb852ebef6442433b7",
+        "passed": 48,
+        "failed": 1,
+        "errors": 1,
+        "failure_scope": "Two existing omission cases hit Windows StateStore acceptance PermissionError; no product guard was relaxed.",
+        "isolated_artifact": "continuation-omission-single-1003.xml",
+        "isolated_sha256": "cef4075158f0adfeea81ada3706f8c6c9c9cb1b9c8bdaa9d85a964ecca86c058",
+        "isolated_passed": 2,
+        "node_artifact": "continuation-omission-ui-1003.log",
+        "node_sha256": "d8641e2c87ebc7bafbd63ec874ea73a763a509c64d512123af0183f52c818117",
+        "node_passed": 209
+      },
+      "scope": [
+        "Official TaskContext recovered and ResponseContext is_recovery only; ordinary errors, reads and duplicate submits never replay historical UNKNOWN.",
+        "Immutable N1 intent, original CID/checkpoint, stable continuation_of/root_request_id/attempt and two continuations per root; release the old execution slot before using the existing enqueue primitive.",
+        "Original done results are reused; new dispatch watermarks and operation binding reject dispatched, unknown, refused or uncorrelated effects despite changed SDK call IDs. Legacy absent watermarks remain unknown.",
+        "Fresh review/once, original question and append data, pending/active root cancellation, original peer/group result references, independent attempt progress and visible unknown usage.",
+        "Published slice 3 Files staging/publisher/ready CAS joins both official recovery lanes before one destination input. The first and idempotent ready POST use the same notification identity; metadata GET and reconciliation never dispatch."
+      ],
+      "versions": {
+        "github-copilot-sdk": "1.0.13",
+        "copilot-runtime-package": "1.0.83",
+        "azure-ai-agentserver-core": "2.2.0",
+        "azure-ai-agentserver-responses": "2.2.0",
+        "azure-ai-agentserver-invocations": "1.2.0"
+      },
+      "evidence_session": "00000000-0000-0000-0000-000000000036",
+      "runs": [
+        {"artifact": "continuation-review-red-1003.xml", "passed": 2, "failed": 3, "errors": 0, "sha256": "86a6130bdfde7b05cb6465efb868592e8abeb2dbc1da9a7feafcd516515a2cb6", "scope": "Three P2 regressions: stopped outcome, unconfirmed intent notification and six parallel index updates with a network yield."},
+        {"artifact": "continuation-review-green-1003.xml", "passed": 5, "failed": 0, "errors": 0, "sha256": "f052adb4b284a0fd030a91a83d39cfd6137af354639406437a469a4abd0a3ce1"},
+        {"artifact": "continuation-refusal-wire-red-1003.xml", "passed": 5, "failed": 3, "errors": 0, "sha256": "22d1f75aab7b686e6f364b9f789ed5c58e00c51c5ecf9e4166ff91f2092ba1d0", "scope": "The real signed API and Hosted relay masked three definite refusal codes. The corrected cases and temporary-refusal controls are included in the Linux 72-case run."},
+        {"artifact": "continuation-stopped-source-1003.xml", "passed": 8, "failed": 0, "errors": 0, "sha256": "fbf1fbb3f1ff2ef053aa153fe226305c7538e4584e143726690cede62e6233db"},
+        {"artifact": "continuation-review-final-1003.xml", "passed": 70, "failed": 2, "errors": 0, "sha256": "d8b75cc52924210f3a9c5bb9e53153fddcc01ee89d2e356305c8e4e2fd3f370d", "scope": "Retained Windows run: one first-start store failure and one overconstrained callback-count assertion. Linux reproduced the latter; tests now verify identical original material and actual receiver idempotency, not callback exactly-once."},
+        {"artifact": "continuation-ee8-fixed-1003.xml", "passed": 35, "failed": 1, "errors": 0, "sha256": "9d52863fa3572cb5c95a62784d37e3365b1e7e7d37bc4f0d2b3770df9adb63f2"},
+        {"artifact": "continuation-ee8-active-1003.xml", "passed": 1, "failed": 0, "errors": 0, "sha256": "94eb005b9a420302a4ef088c595a403189a6c9ac47700dc94bea7668f2278eb3"},
+        {"artifact": "continuation-core-1003.xml", "passed": 92, "failed": 1, "errors": 0, "sha256": "53e74a870f28d8d33ff037c418ca33f6ba7449590c2467f6ed4e67b5646287a9", "scope": "Earlier core batch; original segment readback encountered PermissionError before the new continuation branch."},
+        {"artifact": "continuation-final-1003.xml", "passed": 68, "failed": 2, "errors": 0, "sha256": "2ea5189d5164a5000e88fba114530f83786b32dd38535962b5cc147f36ce1909", "scope": "08df WIP; original effects cases failed at admission/checkpoint, before their effect assertions."},
+        {"artifact": "continuation-effects-min-1003.xml", "passed": 3, "failed": 1, "errors": 0, "sha256": "4bef38d2f471e9a53a11a97aa5b0a00cd03757ca6ce48b4f1ad116f5ec1f8bbb"},
+        {"artifact": "continuation-effects-baseline-1003.xml", "passed": 3, "failed": 1, "errors": 0, "sha256": "8ffe52a0c798110301f1d56ec685a6d8bdc6fc4edb932577188eb688e9eee163", "scope": "Unmodified 08df archive, same environment: absent case hit PermissionError errno 13 / winerror 5. This does not establish every other failure's sole cause."},
+        {"artifact": "continuation-b7-final-1003.xml", "passed": 85, "failed": 1, "errors": 0, "sha256": "7b8084a1e44f03e837d7f12bfe4952eaafca30a9f758083a1b8bbc52b53780e7", "scope": "b7ded4c7 plus candidate; all continuation, real SDK custom/task, API cold imports and original reentry cases pass. Original raced effect case fails before admission."},
+        {"artifact": "continuation-d0-raced-1003.xml", "passed": 1, "failed": 0, "errors": 0, "sha256": "6838872ef6a3479ee807879ea47710ce42b67acd3ea4234f76916738632feaed", "scope": "Original raced selector in an isolated process after the published Files merge; no production refusal relaxed."},
+        {"artifact": "continuation-real-files-1003.xml", "passed": 2, "failed": 0, "errors": 2, "sha256": "249f1511728ec720d00810191a65fb31ff41a1259ed2ab170879de7cf884316a", "scope": "New fixture reused a closed event loop; not a product RED."},
+        {"artifact": "continuation-real-files2-1003.xml", "passed": 4, "failed": 0, "errors": 0, "sha256": "67796ee5f3dd1a84d1c3fd9ddabf5b2ada084cad342851359480f93ba682b922", "scope": "Both lanes: official process recovery, signed environment API, real Files staging/publisher/ready CAS, original checkpoint and one destination input; original two-lane Files controls retained."},
+        {"artifact": "continuation-ready-final-1003.xml", "passed": 27, "failed": 0, "errors": 0, "sha256": "61cb7d5d8c9117f409010b14235ef93089edd6a8a65c253714822a4987f050b7", "scope": "First/already-ready POST, notification ACK loss, read-only no-dispatch paths and original environment API controls."},
+        {"artifact": "continuation-d0-ui-1003.log", "passed": 199, "failed": 0, "errors": 0, "sha256": "79853c81ea0e9ba4d20b0cd6813af8157d85e1d7c8176237466e004aced8068c", "scope": "Continuation, chat, progress, append, attention, groups, settings and Files follow/environment DOM."}
+      ],
+      "direct_boundaries": [
+        {"artifact": "continuation-intent-loss-green-1003.xml", "passed": 2, "sha256": "c109e599a049a4b7a5dd084d26cdeb1784c57dc6be89f8bc04291f023610852f", "scope": "Lost intent ACK: continue only after identical original readback; absence stops as original UNKNOWN, not a second create."},
+        {"artifact": "continuation-cancel-active-1003.xml", "passed": 2, "sha256": "69f17c0c1386335be5737694987579b34f0ccff1726eea705ffe13a6b58cd51d", "scope": "Root cancellation before admission and during child execution without rewriting original UNKNOWN."},
+        {"artifact": "continuation-recovery-boundaries-1003.xml", "passed": 3, "sha256": "b027462b2edfdf17d2b0ad903193aef1c565b7e755bada61c9d7b584d0a5b4e3", "scope": "Missing checkpoint/watermark stops; normal failure/read/duplicate submit/restart does not invent recovery."}
+      ],
+      "limitations": [
+        "Overlapping batches are not summed; original FAIL/ERROR records are retained. Early red/fixture artifacts remain under the same session's continuation-* files.",
+        "Model HTTP, external effects, platform version/task observations and Session Files network I/O are named offline substitutes; the integrated new-SID test executes the real publisher and ready CAS, not a forged manifest.",
+        "The earlier read-side cross-SID test substitutes publication and is not evidence of file copying. The initial join run also omitted the existing tokenizer cache; a fixture then lacked the new first-ready notification.",
+        "Published slices 2/3 and #564 are integrated. Both original Opus5.5 axes are CLEAN for 4ac051e6; no review result from another PR is reused. Subsequent changes only record results.",
+        "No manual cloud deployment, real model, Hosted live, IAM change, new scheduler or full Target State acceptance."
+      ]
+    },
+    {
+      "id": "sp22-round-feedback-20261003",
+      "targets": ["SP-22", "WAKE-06"],
+      "base_commit": "160bde100bbfd40a208552e5f291d964f99ec6da",
+      "execution": "completed_local",
+      "outcome": "pass",
+      "acceptance": "code_offline_reviewed",
+      "scope": [
+        "Official Pydantic field description states expected_round is the currently observed group.round, not the destination, for the original concurrency check.",
+        "Only next_group_round exact409 NATIVE_GROUP_ROUND_CHANGED reaches the registered model boundary as fixed read-current-round guidance, not a generic authority refusal.",
+        "Original group-member request/handoff to the orchestrator remains refused; with HITL off, exact409 NATIVE_GROUP_REPLY_REQUIRED survives the real signed API, Hosted client and model boundary with original-result guidance.",
+        "Other-member requests, original result return, wrong status, unknown code, actual authority refusal, original IDs, CAS, counters and default-off behavior remain intact."
+      ],
+      "live_source": {
+        "commit": "300641f3",
+        "reference": "progress.md#2026-10-03main-300641f3採用ab開hitlsp-22群組通過role-v3探針3過",
+        "g4": "round_advance_not_exercised_in_original_run",
+        "g5": "passed_with_explicit_current_round_instruction",
+        "g5_member_send_failure": "original_call_and_log_unavailable; code-path conclusion is not a unique live-cause claim"
+      },
+      "evidence": [
+        {
+          "ref": "sp22-round-red-1003.xml",
+          "sha256": "6c0e1e51badc0b15604a6490d8c0d22adba8dd1e3b253615f6e91eaffd020365",
+          "passed": 0, "failed": 0, "errors": 2,
+          "scope": "New Windows event-loop fixture ordering errors; not product RED."
+        },
+        {
+          "ref": "sp22-round-red2-1003.xml",
+          "sha256": "b233bb52c01752d5518558fa2f437a70f85fb1d2a94a3cd36d6586e38eb408bf",
+          "passed": 0, "failed": 2, "errors": 0, "seconds": 7.504,
+          "scope": "Real signed API and tool schema: current-round description and actionable mismatch feedback absent."
+        },
+        {
+          "ref": "sp22-round-seams-red-1003.xml",
+          "sha256": "93d992a91eed07face7be49a1ce2b8d2d06d9cca9fb7f6b2d5f30d09c82288f6",
+          "passed": 1, "failed": 7, "errors": 0, "seconds": 19.478,
+          "scope": "Four product failures including pinned-SDK model-visible errors; three new fixture failures (async token and import). Actual permission-refusal control passed."
+        },
+        {
+          "ref": "sp22-round-member-red2-1003.xml",
+          "sha256": "98ae3e86bac4d077a74463aff929e56fafb99fdce7a28810f41306eb3c1388d1",
+          "passed": 1, "failed": 2, "errors": 0, "seconds": 10.713,
+          "scope": "Real request/handoff circular refusal is masked by the original HTTP/Hosted boundary; legitimate other-member request passed."
+        },
+        {
+          "ref": "sp22-round-seams-green-1003.xml",
+          "sha256": "e6ec08b8a35e3e5454c0fda198f1eda1368e66c6aebc8899523ddb614d43db4f",
+          "passed": 8, "failed": 0, "errors": 0, "seconds": 18.317
+        },
+        {
+          "ref": "sp22-round-regression-1003.xml",
+          "sha256": "160850b46182e83273b5aa4c5fc7d99d0928de6d7029b9f36f717c5436dcb5fb",
+          "source_commit": "9ba27aff89b986e48e200b88cf57b40de1112d71",
+          "passed": 63, "failed": 0, "errors": 0, "skipped": 0, "seconds": 58.097,
+          "selectors": [
+            "tests\\shared_context\\test_native_group_api.py",
+            "tests\\shared_context\\test_native_group_tools.py",
+            "tests\\shared_context\\test_native_groups.py",
+            "tests\\shared_context\\test_native_agent_tools.py",
+            "tests\\shared_context\\test_native_agent_api.py::test_native_recipient_feedback_survives_the_real_api_error_handler"
+          ]
+        },
+        {
+          "ref": "sp22-round-api-import-1003.log",
+          "sha256": "d37c9f57be008f02d5206d645444de6625bd6ce6a8b68e7ff0fe6a4ec5f5de15",
+          "outcome": "pass",
+          "scope": "Cold API/server/boundary/group/relay imports with Copilot and azure.ai.agentserver imports prohibited."
+        },
+        {
+          "ref": "sp22-round-readback-red-1003.xml",
+          "sha256": "feb8cac011ffb15f30b47a659a5c05ec316806068efcbc910300a25b3eb6b4b4",
+          "passed": 0, "failed": 2, "errors": 0, "seconds": 12.124,
+          "scope": "Initial feedback lacks the non-blocking reviewer clarification: do not advance again if the observed round already meets the original intent."
+        },
+        {
+          "ref": "sp22-round-readback-green-1003.xml",
+          "sha256": "d4feab4d766d7d98f582d9562c5bcfde0125a88ec4a2e0f48e47f44a7179f075",
+          "passed": 3, "failed": 0, "errors": 0, "seconds": 10.516,
+          "scope": "Only the guidance delta after 9ba27aff: schema, signed API and pinned-SDK model feedback. Original CAS unchanged; does not relabel the earlier 63-case run."
+        }
+      ],
+      "versions": {
+        "github-copilot-sdk": "1.0.13",
+        "runtime_package_manifest": "1.0.83",
+        "azure-ai-agentserver-core": "2.2.0",
+        "azure-ai-agentserver-responses": "2.2.0",
+        "azure-ai-agentserver-invocations": "1.2.0"
+      },
+      "review": {
+        "state": "completed_clean",
+        "model": "claude-opus-5.5",
+        "axes": ["Standards", "Spec"],
+        "initial_head": "9ba27aff89b986e48e200b88cf57b40de1112d71",
+        "initial_standards": {"p1": 0, "p2": 1},
+        "initial_spec": {"p1": 0, "p2": 0},
+        "reviewed_head": "ae7a10f7c5b344045b6b35e8485cad2656b1437f",
+        "final_standards": {"p1": 0, "p2": 0, "original_p2": "closed"},
+        "final_spec": {"p1": 0, "p2": 0},
+        "final_scope": "Original axes reviewed only the 9ba27aff..ae7a10f7 delta; subsequent edits record review outcomes and handoff only, not product/test changes.",
+        "evidence_ref": "sp22-round-review-1003.json",
+        "evidence_sha256": "edddde5237b115d02400c02e70086943a9e75fb02a21d455951cf6c9cb327f5c",
+        "finding": "Documentation overstated peer guidance with HITL enabled; existing agent_call ToolFailure is converted into NATIVE_HITL_EFFECT_UNKNOWN.",
+        "resolution": "Explicit HITL-off qualification in spec/README/evaluation/current state, as recommended by Standards; HITL and once-effect behavior unchanged.",
+        "nonblocking_delta": "Read the current round and do not advance again if it already meets the original intent.",
+        "reviewer_test_limit": "Spec reported 19 and 63 passing cases without persisted log/XML; not counted as another qualification batch."
+      },
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "deployment": "not_performed",
+      "limitations": [
+        "Pinned real SDK with scripted model/HTTP and explicit VM/storage substitutes, not semantic group quality or live acceptance.",
+        "Peer refusal guidance is qualified only with HITL off, as in the 3006 t1/t2 run. With HITL on, the existing agent_call wrapper converts handler ToolFailure into NATIVE_HITL_EFFECT_UNKNOWN; this combination is not wired to the new peer guidance. No HITL or once-effect behavior was changed.",
+        "Does not relabel the original G4 or infer G5's unobserved call failure; no flag, IAM, scheduling, image, UI or storage-format change.",
+        "Batches overlap and are not summed; all original RED and fixture-error artifacts are retained.",
+        "Runtime --version probe is unsupported; version is read from the installed package manifest, not fabricated CLI output."
+      ]
+    },
+    {
+      "id": "sp22-wake06-bounded-groups-20261003",
+      "targets": ["SP-22", "WAKE-06", "FR-32"],
+      "execution": "completed_local",
+      "outcome": "qualified_local_with_retained_regression_failure",
+      "acceptance": "code_offline_reviewed_default_off",
+      "base_commit": "db039f186e85233b841e1c20c182efcc925d59c2",
+      "product_commit": "03f0f571417ca6eea7da39c249a817dcb9cc42d4",
+      "qa_delta_commit": "3904928df280e34334dca45e9c2c3b824e8c384c",
+      "released_main_join": {
+        "main": "b3fa25c8690ec81285c76a60f0a69fe4e42f96a2",
+        "merge": "d14ecb33c90ca255c137d99b339f2184b4bf54e8",
+        "group_modules_unchanged_since_qa": true,
+        "python_ref": "sp22-b3fa-join-1003.xml",
+        "python_sha256": "50d16e45b77d0e22449ef7b44d478f83a6132194a1547bdb6ef427000e95b5dd",
+        "python_passed": 6, "python_seconds": 13.49,
+        "node_ref": "sp22-b3fa-node-1003.log",
+        "node_sha256": "fb80e28f826795a50be6804235888b5e6bc4b355217ecb8eb39552b1c8796251",
+        "node_passed": 86,
+        "scope": "Published native progress and remote fixes crossed the existing SDK/console seams; only three documentation conflicts required resolution."
+      },
+      "scope": [
+        "Original Team group root, immutable public text, root CAS, three rounds, ten public posts, three per member per round, reserved orchestrator final and pending-result slots.",
+        "Original T5 request/handoff and original result/blocked/final, typed FYI/receipt silence without new peer execution or erased human obligations.",
+        "Default-off API/Hosted/console, one existing SDK turn, independent thin panel and original native/attention control reads."
+      ],
+      "final_new_files": {
+        "ref": "sp22-final-code-1003.xml",
+        "sha256": "c8bff7da324d6ba7e9851de4c6ea28d22b59398d5caeeb422f4793ba7cf0d6f5",
+        "passed": 22, "failed": 0, "seconds": 24.64
+      },
+      "final_publication_delta": {
+        "ref": "sp22-publication-final-1003.xml",
+        "sha256": "829ffc68742fb0043737b6e6be3714d8cafa4bc70565e095a44ee859ce73b7b1",
+        "passed": 9, "failed": 0, "seconds": 0.79,
+        "scope": "Last addressee/reference consistency guard and the original group count/CAS tests."
+      },
+      "sdk": {
+        "ref": "sp22-pinned-sdk-1003.xml",
+        "sha256": "79dff221feb81bad778cc3f088a2581f867cf7bb547c6a4c93cc6543171a9594",
+        "passed": 2, "failed": 0, "seconds": 6.51,
+        "scope": "Pinned Copilot SDK 1.0.13/runtime 1.0.83, scripted model and group HTTP transport; FYI tool followed by original final, no peer start."
+      },
+      "integrated": {
+        "ref": "sp22-integrated-1003.xml",
+        "sha256": "e10b4f99fd335f87cacab6c2f14ccce0e0ceae1b4ebe2170e3b7821eb7dafc8d",
+        "passed": 86, "failed": 1, "seconds": 122.14,
+        "failure": "Existing console-append case returned NATIVE_ENVIRONMENT_UNKNOWN during original admission before its append; cause not established and not described as pre-existing."
+      },
+      "last_ui_sdk_delta": {
+        "ref": "sp22-ui-sdk-delta-1003.xml",
+        "sha256": "ce959f4bc913173d1777b25352a871621fc5f41d5750df3c95233f81a4081e0f",
+        "passed": 6, "failed": 0, "seconds": 16.76,
+        "scope": "The failed append selector plus final group console and SDK cases; does not relabel the integrated batch."
+      },
+      "h3_intersection": {
+        "ref": "sp22-h3-intersection-1003.xml",
+        "sha256": "09e2b3dd9f8e833523af24bd05c72c451b0febf8576d40fe299199b0e15919c7",
+        "passed": 9, "failed": 0, "seconds": 24.00,
+        "scope": "Original attention/three owner choices, remote journal and stale-cookie refusal, off and legacy no-I/O."
+      },
+      "node": {
+        "ref": "sp22-ui-node-final-1003.log",
+        "sha256": "abdc000e67ef6ff1d8ac02672a962f18ff6c8d387770c64403a47675f5ab21d3",
+        "passed": 71, "failed": 0,
+        "scope": "Group panel/default-off/literal text/stale login and original Responses, append, attachment toolbar, HITL and attention."
+      },
+      "counterexample": {
+        "ref": "sp22-reply-reservation-red-1003.xml",
+        "sha256": "a52ffc290f64853bbe5bbcf915d6279963d4abdceb52248a1843fb1b25789665",
+        "failed": 1,
+        "cause": "An outstanding member result did not block advancing the group round; fixed with original result-slot reservations."
+      },
+      "api_only_cold_import": "passed with copilot and azure.ai.agentserver imports explicitly denied",
+      "qa_delta": {
+        "scope": "Single-Agent console start bound to the server default Agent, group menu closes, readable labels and original pending body/newer draft preservation.",
+        "python_ref": "sp22-opening-scope-final-1003.xml",
+        "python_sha256": "0b8347c46108b56e276c85346b732df9f684c25e1b3b3cc6fc0f4f9a429d810e",
+        "python_passed": 14, "python_seconds": 9.86,
+        "node_ref": "sp22-ui-qa-delta-1003.log",
+        "node_sha256": "4aec65db5a724532c311fc67e7ad49dc2101783a857dba7c0c4a8e62315d2f48",
+        "node_passed": 4,
+        "red_ref": "sp22-opening-bound-red-1003.xml",
+        "red_sha256": "6435c601311068c78bcfa811dff7954c100ce69c8bcf8cc77a0692080f8b21f7",
+        "red_cause": "A group opening could fit the new raw-byte limit yet exceed the original quoted submit limit; now uses the original InstructionSubmit validator before persistence."
+      },
+      "browser_preview": {
+        "source": "Production HTML on an isolated loopback port with synthetic read-only responses.",
+        "ref": "sp22-panel-light-final-1003.png",
+        "sha256": "c23c2372801b07251b7a9ae47baa99dfaf58dc750685cc59c32c633e5842af2f",
+        "menu_closed": true,
+        "horizontal_overflow": false,
+        "injected_scripts": 0,
+        "attention_panels": 1,
+        "original_toolbar_icons": 3,
+        "mutation_requests": 0,
+        "helper_stopped": true,
+        "limit": "The group list POST is read-only; no real backend, model, original8765, cloud or shared data was used."
+      },
+      "review_status": "completed_clean",
+      "final_review": {
+        "head": "efa9c58f9b004796e0e9b81ffc4295fed0208fef",
+        "model": "claude-opus-5.5",
+        "standards": {"p1": 0, "p2": 0},
+        "spec": {"p1": 0, "p2": 0},
+        "all_reported_findings_closed": true,
+        "ref": "sp22-review-final-1003.json",
+        "sha256": "ebcbc5d6dc742bb0b966cbed28df95b3b77a0c4c7bcd5259819942514813d61b",
+        "spec_closure_ref": "sp22-spec-p2-closure-efa9c58f-1003.xml",
+        "spec_closure_sha256": "28dff258a35686ef65dba0674718713a0e84d8b3a0a0c67221405232589a8e2c",
+        "spec_closure_passed": 2
+      },
+      "final_main_join": {
+        "main": "c4c55b061c18f819af36516dd4c4aec3ac9157ca",
+        "merge": "62531a89290afde971f4c148dac6b371c83a3c3f",
+        "group_modules_match_reviewed_head": true,
+        "python_ref": "sp22-c4c5-join-1003.xml",
+        "python_sha256": "767fff7c3a428110f85ca7fa89011b0aa40d7ceb2e74bf1bead40d574130e07f",
+        "python_passed": 15, "python_seconds": 25.87,
+        "node_ref": "sp22-c4c5-node-1003.log",
+        "node_sha256": "cd46721647c8300a8dd80d77c2e98577fed95b978a27926d5a6199a7170c1d1a",
+        "node_passed": 72,
+        "scope": "Published ask-user and role updates; bridge retains both question/group route sets, original CSRF/body bounds and one attention mount."
+      },
+      "last_refusal_fix": {
+        "previous_review_head": "f8255bda4cbc651707f5841a8329a2c0d0472e19",
+        "previous_standards": {"p1": 0, "p2": 0},
+        "previous_spec": {"p1": 0, "p2": 1},
+        "reason": "Original findings closed; Spec additionally found a first-review omission: a definite pre-admission refusal could leave a reserved group result awaiting.",
+        "head": "efa9c58f9b004796e0e9b81ffc4295fed0208fef",
+        "ref": "sp22-review-refusal-1003.json",
+        "sha256": "56cfc82e6b5dbf99ed26baefdbb897d4bb9e237140816d6815680abb95f3ca6d",
+        "red_ref": "sp22-refusal-red-1003.xml",
+        "red_sha256": "5eac715564b3802ae8e0aeaddcb8a8a83929e3c4bc47d34106cf6b0c69c2644f",
+        "red_failed": 1, "red_passed": 1,
+        "green_ref": "sp22-refusal-green-1003.xml",
+        "green_sha256": "c486cbcee423fde9ddeb904dd5e59f242df6a9e18f207e0ddb49d782365508d5",
+        "green_passed": 17, "green_failed": 0, "green_seconds": 11.76,
+        "ui_ref": "sp22-refusal-ui-scope-1003.log",
+        "ui_sha256": "d475b49f77072e29c5c9995a8ffe4f6fdfcc02757dd7fe4896e33b3ae93497d3",
+        "ui_passed": 1,
+        "limit": "Only exact version/session pre-admission refusals with no original peer RID; unknown/transport errors stay pending. The server observation does not count as an Agent public post or fabricate a NativeReceipt."
+      },
+      "initial_review": {
+        "model": "claude-opus-5.5",
+        "head": "03f0f571417ca6eea7da39c249a817dcb9cc42d4",
+        "standards": {"p1": 1, "p2": 1},
+        "spec": {"p1": 0, "p2": 2},
+        "unique_findings": 3,
+        "ref": "sp22-review-findings-1003.json",
+        "sha256": "d5c78468b8b3f61defa54dfeca144b6ecb5b0f0cb0c4ff718883dd571ca39b09"
+      },
+      "review_fix": {
+        "head": "f8255bda4cbc651707f5841a8329a2c0d0472e19",
+        "p1_red_ref": "sp22-review-p1-red-1003.xml",
+        "p1_red_sha256": "4fa363a96febd7830cefa46b946fbb592c7cc2eedbc5a13fceeed014b33fbc8d",
+        "p1_red_failed": 4,
+        "first_red_ref": "sp22-review-red-1003.xml",
+        "first_red_sha256": "172006af05f9028e92ca83c3b1fe30a847ae34a84ee6736c8a21de3f8862dfa3",
+        "first_red_limit": "Three actual P2 counterexamples and four fixture reference errors; fixture errors are not counted as product RED.",
+        "ref": "sp22-review-final-1003.xml",
+        "sha256": "b4d5c78d29c975b4ea4666873c6fbbf2901b09b4006e3fdd11fe23332d938d4e",
+        "passed": 35, "failed": 0, "seconds": 33.42,
+        "scope": "Context failure degrades explicitly, original peer notifications always run, deferred verified final converges after the last member publication, orchestrator-directed requests refused, and unknown opening only continues under the same original ID after exact NOT_FOUND.",
+        "node_ref": "sp22-review-node-final-1003.log",
+        "node_sha256": "7ba1179c5443e916c7115e6ca5de9daf0a9d20bf2cdfd2ac93385b29052875f7",
+        "node_passed": 86,
+        "last_ui_ref": "sp22-review-ui-last-1003.log",
+        "last_ui_sha256": "c05b53cc7e69028b8c92cb47c1d0f5a01db9c1fb72add35bbfd437904c307110",
+        "last_ui_passed": 4,
+        "intermediate_limit": "Intermediate batch retained eight passes and three failures: one required Journal timestamp omitted, and two fixtures incorrectly reused an old Invocations CID as a Responses root. Fixed before the final batch."
+      },
+      "enabled_by_default": false,
+      "live_execution": false,
+      "limitations": [
+        "Table/platform/VM HTTP are explicit test substitutes; no Azure, model billing, human-delivery or broad exactly-once claim.",
+        "Earlier missing-module RED, strict JSON decoder, validator binding, insertion-layout, fixture and cancellation/reader-boundary failures remain in session artifacts; no historical pass backfill.",
+        "Runs overlap and are not summed. The wider admission failure is retained with unverified cause.",
+        "Public group text and original N1 execution receipts remain separate; unknown acceptance is not silently retried under new IDs."
+      ]
+    },
+    {
+      "id": "n6-production-mode-adoption-20261002",
+      "targets": ["CAP-02", "TOOL-05", "TOOL-06"],
+      "execution": "completed",
+      "outcome": "pass",
+      "acceptance": "code_offline_reviewed_not_deployed",
+      "base_commit": "ba09c3c87ead1b17ee0545c23334cb9ec4eb4440",
+      "product_commit": "34b49c6719a703f444d3d9abd27262f90c666d47",
+      "scope": [
+        "Adopt conversation and retain-cid through the two existing code constants, not environment variables.",
+        "Both existing source builders retain the source's formal Responses flag without inventing a value; all probe keys are still removed.",
+        "Keep original build, minimum-active-version, identity, flags, protocol, template and old-CID checks."
+      ],
+      "red": {
+        "ref": "n6-adopt-red-1002.xml",
+        "sha256": "3fb87d514f0d1739749a0f333ce2f9d91caa17ddc2d303f8e5bdd0826da4defd",
+        "failed": 4, "passed": 1, "seconds": 9.65
+      },
+      "green": {
+        "ref": "n6-adopt-green-1002.xml",
+        "sha256": "c44cfe409f0229bdf75157edcf9b641f3b4f928a15a0dc58570c0e094848ec6f",
+        "passed": 5, "failed": 0, "seconds": 7.69
+      },
+      "targeted": {
+        "ref": "n6-adopt-targeted-1002.xml",
+        "sha256": "40fc052c758dd5098619661e7f9540d278341f42eb3713e16da362884fa6fcb0",
+        "passed": 104, "failed": 0, "seconds": 96.34,
+        "scope": "Agent version/source builders; Responses owner API, environment and entry; original Invocations CID and missing-phase known-RID console reads."
+      },
+      "review_status": "completed_clean",
+      "review": {
+        "model": "claude-opus-5.5",
+        "head": "34b49c6719a703f444d3d9abd27262f90c666d47",
+        "standards": {"p1": 0, "p2": 0},
+        "spec": {"p1": 0, "p2": 0},
+        "ref": "n6-adopt-review-final-1002.json",
+        "sha256": "7c6d125d45e99f901abfc6b9533915ac633730ac196e206d2086390ad609ca59",
+        "supplemental_report_limit": "Spec separately reported 255 passed/2 failed/10 errors without full saved output. That batch is not PASS and is not added to the targeted result; its broad initial attribution was retracted."
+      },
+      "main_join": {
+        "main": "d10cc7106b88a14957a875509706e93c720be6d6",
+        "merge": "f855707a797acf08f1fa47bc65a03d66bdae7203",
+        "reviewed_product_and_tests_unchanged": true,
+        "ref": "n6-adopt-d10c-join-1002.xml",
+        "sha256": "abcb0e869b3f47af218121d417a2cd17819e242402caccb81d40d336c597977a",
+        "passed": 6, "errors": 1,
+        "error": "Original admission fixture returned NATIVE_BOOTSTRAP_UNKNOWN before the policy case.",
+        "single_ref": "n6-adopt-d10c-env-single-1002.xml",
+        "single_sha256": "d87701b97e8bbed03e0eba97f7e0df55d544472776694d959a6de823b2cb8dcf",
+        "single_passed": 1, "single_seconds": 4.29,
+        "admission_error_cause_verified": false
+      },
+      "unrelated_baseline_fixture": {
+        "base": "ba09c3c87ead1b17ee0545c23334cb9ec4eb4440",
+        "selector": "test_conversation_profile_selection.py::test_selected_attachment_work_reconciles_original_submission",
+        "result": "The same missing InstructionControl.store error reproduces on the isolated base archive; no unrelated fix included.",
+        "ref": "n6-adopt-base-missing-store-1002.xml",
+        "sha256": "54e17b1946b05f00f835dc8a07942f212b83068b06388bcc2ea8185af2de3c4e"
+      },
+      "production_modes_in_code": {"conversation": "conversation", "environment": "retain-cid"},
+      "live_execution": false,
+      "cloud_settings_changed": false,
+      "limitations": [
+        "Formal flag propagation does not set source ENV, create or alter cloud versions, change endpoint protocols, or select any user's new-conversation template.",
+        "Default template remains native; code adoption is not live enablement.",
+        "Official local SDK and explicit VM/platform HTTP substitutions, not a live model or Hosted acceptance.",
+        "Direct and targeted runs overlap; historical default-off results remain unchanged."
+      ]
+    },
+    {
+      "id": "n6-first-ack-convergence-20261002",
+      "targets": ["CAP-02", "TOOL-05", "TOOL-06"],
+      "execution": "completed",
+      "outcome": "pass",
+      "acceptance": "code_offline_reviewed_default_off",
+      "product_commit": "ed5e88433c602f615cee5f4d48da2906fb2b5747",
+      "delta_base": "eb7933b58b3bd5aa67cea290885711aa599f51dc",
+      "prior_delta_review": {
+        "head": "18984879525343239fccb84b657ac755f4a8af98",
+        "standards": {"p1_open": 1, "p2_closed": true},
+        "spec": {"p1_open": 1, "p2_closed": true}
+      },
+      "decision": "83d4 confirmed that the sender may wait for the original admission ACK only; bounded exhaustion or cancellation remains unknown, without a new registry or relaxed completed-sender permission.",
+      "main_join": {
+        "main": "1326a82cbce6c48ffb8d22abb5ffc35743744084",
+        "merge": "eb7933b58b3bd5aa67cea290885711aa599f51dc",
+        "ref": "n6-main-1326-join-1002.xml",
+        "sha256": "719f28a8a9adea3ce61d07bdce6a8957126d97f8247784e3c2aa5785ee0d37bd",
+        "passed": 11, "errors": 4,
+        "missing_configuration": "M2_TEST_RUNTIME was not set; reused the existing pinned runtime, no installation.",
+        "sdk_first_ref": "n6-main-1326-sdk-1002.xml",
+        "sdk_first_sha256": "0700bda27358d88a939baa3c819f8e07571fa0fe570307db30c36eccafa55dfa",
+        "sdk_first_passed": 3, "sdk_first_failed": 1,
+        "sdk_fixed_ref": "n6-main-1326-sdk-fixed-1002.xml",
+        "sdk_fixed_sha256": "9e244fa2073d4de516d4be34698155f5e54c9bcd2a1814ee2f0acf34c6250532",
+        "sdk_fixed_passed": 4,
+        "sdk_boundary": "Real Copilot SDK with scripted model transport; Hosted task registration is explicit test substitution, not a running Hosted task service."
+      },
+      "overlap_red": {
+        "ref": "n6-overlap-red-1002.xml",
+        "sha256": "16778aa573349c91b9287669ac0ec28cde46feb7b2bb409f47269c7ce56db6dd",
+        "failed": 4, "passed": 0, "seconds": 15.65,
+        "scope": "Real gateway and shared helper with deterministically interleaved HTTP boundaries: both reads miss, distinct candidate CIDs, both winner orders and changed capture selections."
+      },
+      "cancellation": {
+        "interrupted_shell": "198",
+        "interrupted_run_has_no_complete_junit": true,
+        "cause": "Raw-input task did not observe cooperative cancel/shutdown during retry; the new cancellation test failed and teardown exceeded 120 seconds.",
+        "ref": "n6-ack-cancel-fixed-1002.xml",
+        "sha256": "82d0cf7561432fc9a7c168639fc94a72f2ca045620d65edca06a86caa7670758",
+        "passed": 1, "failed": 0, "seconds": 4.44
+      },
+      "regression": {
+        "ref": "n6-p1-convergence-final-1002.xml",
+        "sha256": "602eb6c2b182a352e01b1c7c558e9792d7142f7ce4fc8d539b67db4e3bbd1310",
+        "passed": 71, "failed": 2, "seconds": 91.51,
+        "fixture_failures": [
+          "A deliberately mismatched digest was rejected by NativeReceipt before the gateway; corrected to a valid receipt with different command and matching digest.",
+          "An HTTP-only test had no Hosted task manager; now explicitly records unavailable task registration and preserves original uncertainty."
+        ],
+        "scope": "Complete Responses relay/client files, original T5 API, four real Copilot SDK terminal-tool cases; includes ACK-only waiting, finite exhaustion, cancellation, old input recovery and original-scope refusal."
+      },
+      "final_boundary_delta": {
+        "ref": "n6-p1-boundary-fixed-1002.xml",
+        "sha256": "2b65179ee7c73f5582f95d3e51f748c190a43e76a15c885ee13cd4149849e292",
+        "passed": 8, "failed": 0, "seconds": 15.57,
+        "only_fixture_boundaries_changed": true
+      },
+      "review_status": "completed_clean",
+      "final_review": {
+        "model": "claude-opus-5.5",
+        "head": "ed5e88433c602f615cee5f4d48da2906fb2b5747",
+        "standards": {"p1": 0, "p2": 0},
+        "spec": {"p1": 0, "p2": 0},
+        "original_findings_closed": true,
+        "ref": "n6-review-final-1002.json",
+        "sha256": "713a76fcc311455c5e2c1b7fd9216c293e1ab06dab5d2cfa591d904bc870b4f7",
+        "method": "Each original axis reviewed only its fixing deltas; final P1 review was source-based, not a rerun of the recorded product batches."
+      },
+      "final_main_join": {
+        "main": "69e7853d47ac6311de380eb8bfdb4ade50036873",
+        "merge": "c6af682e5fbb9a3def28f0d67faff4cc5671cb4f",
+        "own_reviewed_product_unchanged": true,
+        "passed": 14, "failed": 0, "seconds": 27.24,
+        "ref": "n6-main-69e7-join-1002.xml",
+        "sha256": "fe62a1dc25afb8428e719cbc5a223ce58e5a40075df8bd26763e831f9717e4ee",
+        "scope": "Released steering and original-source changes with native SDK handoff, first-ACK waiting, T5 result wake, pinned console routing and explicit known-RID history fallback."
+      },
+      "production_mode": null,
+      "live_execution": false,
+      "limitations": [
+        "One N1 RID, adopted CID, digest and root message after collision; two candidate platform conversations may exist and are not deleted.",
+        "Finite retry exhaustion may leave a later acceptance unconfirmed; preserve unknown instead of adding unbounded retries or a pending registry.",
+        "Original failed and interrupted results remain, and overlapping batches are not summed.",
+        "No new durable task input, queue, runner, VM behavior, shared-helper wire or enabled lane."
+      ]
+    },
+    {
+      "id": "n6-console-t5-review-fixes-20261002",
+      "targets": ["CAP-02", "TOOL-05", "TOOL-06"],
+      "execution": "completed",
+      "outcome": "pass",
+      "acceptance": "code_offline_pending_delta_review",
+      "product_commit": "18984879525343239fccb84b657ac755f4a8af98",
+      "initial_review": {
+        "model": "claude-opus-5.5",
+        "base": "751f28168e673295212a63059af9afebc0eb4cc5",
+        "head": "f0c89e55b0983c3ead80cf6b34acec2942dd4e32",
+        "standards": {"p1": 1, "p2": 1},
+        "spec": {"p1": 1, "p2": 1},
+        "unique_findings": 2,
+        "ref": "n6-review-initial-1002.json",
+        "sha256": "251ed3efc0671881f870488762942a39510a5712d818bddde76f479bc3f1d217",
+        "scope": "Uncertain first T5 ACK lacks a follow; redundant template GET precedes local validation and affects pinned legacy routes."
+      },
+      "fixture_error": {
+        "ref": "n6-spec-red-1002.xml",
+        "sha256": "65845dc0407f081fc31e6eef13ce00e4e6e6f95879d21769a4bb0cc6227f7888",
+        "failed": 3, "passed": 6,
+        "cause": "New test used Problem.code instead of Problem.body; not a product counterexample."
+      },
+      "actual_red": {
+        "ref": "n6-spec-actual-red-1002.xml",
+        "sha256": "99a9c4d20011d4c25e110380524af4b35056f46c6a0f72a3eb6e302ec8c1ee24",
+        "failed": 23, "passed": 1, "errors": 0, "seconds": 50.381,
+        "scope": "Three first-ACK timeout/500/503 cases plus the twenty legacy failures and one positive control."
+      },
+      "direct_green": {
+        "ref": "n6-spec-green-1002.xml",
+        "sha256": "b949eb2f61f5a2b8649d084e885eb201fe58301473267fce4010051321c676b9",
+        "passed": 24, "failed": 0, "seconds": 40.02,
+        "oracle_delta": "A valid fresh draft must GET the server template before freezing its lane; SQLite rollback still leaves no command, submit intent or POST."
+      },
+      "regression": {
+        "ref": "n6-review-fixes-regression-1002.xml",
+        "sha256": "b41a8f100737e6e641ae139894955f5f2912ac872b5f2c6f0771dcc3c3f42348",
+        "passed": 152, "failed": 1, "seconds": 236.89,
+        "scope": "Official relay tasks and original version/quota/wake cases, complete Responses console, attachments, text-file and frozen-interface files.",
+        "failure": "The new template-outage test expected local HTTP503; existing ConsoleError correctly exposes HTTP409 BACKEND_UNAVAILABLE with upstream_status503.",
+        "product_changed_after_this_run": false
+      },
+      "oracle_correction": {
+        "diagnostic_ref": "n6-pinned-diagnostic-1002.xml",
+        "diagnostic_sha256": "4090a0b9182879af8b9e1559c1565093de914db18de7028164b4027a6e8aee11",
+        "ref": "n6-pinned-green-1002.xml",
+        "sha256": "3a06adc69892201b6263ac4e9c848fc60afecbd66121011959388ae2ecb5a35d",
+        "passed": 1, "failed": 0, "seconds": 6.19,
+        "scope": "Pinned native login and model read skip unavailable template; a genuinely new draft refuses without a POST or stored command.",
+        "only_test_expectation_changed": true,
+        "whole_regression_rerun": false
+      },
+      "review_status": "p2_closed_p1_parallel_admission_open_see_first_ack_convergence",
+      "live_execution": false,
+      "production_mode": null,
+      "limitations": [
+        "Retains the original 152/1 failed-batch result; no backfill, no sum of overlapping runs.",
+        "Official local SDK task execution and synthetic API/VM transports, not Hosted or model acceptance.",
+        "No new durable input shape, queue, runner, external side effects, deployment or cloud flag change."
+      ]
+    },
+    {
+      "id": "n6-console-t5-complete-consumers-20261002",
+      "targets": ["CAP-02", "TOOL-05", "TOOL-06"],
+      "execution": "completed",
+      "outcome": "pass",
+      "acceptance": "code_offline_pending_review",
+      "product_commit": "ce344928a5974ac92f31690f1b82966dbde424ec",
+      "final_test_commit": "555f8776012324b5fbc83ab53c1c3c5745ad20a3",
+      "n6_2_main": "2e88a05e7160d2493fcc609283f11ae0e6f1320a",
+      "main_join": {
+        "main": "751f28168e673295212a63059af9afebc0eb4cc5",
+        "integration_commit": "f0c89e55b0983c3ead80cf6b34acec2942dd4e32",
+        "passed": 5, "failed": 0, "errors": 0, "seconds": 13.710,
+        "ref": "n6-final-main-join-1002.xml",
+        "sha256": "e70a79ebea0ec07aa8ba6e6de572a260611237fa74102c3fc65269aa9321e7f9",
+        "scope": "Same-session follow recovery, original persisted task input, terminal receipt with official task still active, and old Invocations CID after server template selection changes."
+      },
+      "later_main_join": {
+        "main": "177147e090ab28bff32214359242c775efe4af31",
+        "integration_commit": "b250909806922852f4d5da1e7bf6e3bef10f38a8",
+        "passed": 8, "failed": 0, "errors": 0, "seconds": 26.21,
+        "ref": "n6-main-1771-join-1002.xml",
+        "sha256": "28d2e8c4a6efa5f2adec14ef51187b7bae620893f2d1ca33bbce94f828526bff",
+        "scope": "The newly released optional Team-memory capture field and original T5 admission/replay, lost first ACK, same-CID result wake in both lanes, and old console CID routing.",
+        "own_product_and_test_files_match_review_candidate": "f0c89e55b0983c3ead80cf6b34acec2942dd4e32",
+        "conflict_resolution": "CURRENT-STATE only; preserved released live results, default-off slices, native approval-card priority and N6-3/4 delivery status."
+      },
+      "joined_run": {
+        "passed": 144, "failed": 0, "seconds": 247.05,
+        "ref": "n6-ui-t5-joined-1002.xml",
+        "sha256": "5309bd2414c69e5b6d49298118e23d11ef5988e78905102360be2f582707fbc7",
+        "scope": "New console/relay cases plus original native console, environment and template consumers; precedes the final permission and HTTP-code delta."
+      },
+      "final_delta": {
+        "passed": 29, "failed": 0, "seconds": 88.52,
+        "ref": "n6-final-ui-delta-1002.xml",
+        "sha256": "2addcb9943c34eb28d6693729bb737f653e8b89bc729a2c8cbc6d8c0af629213",
+        "scope": "Complete console Responses file, signed T5 temporary-code route and original version-follow refusal."
+      },
+      "node_final": {
+        "passed": 44, "failed": 0,
+        "ref": "n6-ui-node-final-1002.xml",
+        "sha256": "bc06ec1bea94b28fdbb68a86ecf89fa76aac71756cd573808f60839c7e331f1b",
+        "scope": "Eligibility-gated selection, role-safe platform messages/cursors, late-login refusal, CSRF automatic original-RID reconciliation and directly related legacy UI."
+      },
+      "browser_preview": {
+        "source_commit": "f0c89e55b0983c3ead80cf6b34acec2942dd4e32",
+        "source": "Unmodified production HTML with synthetic local read-only HTTP responses; separate loopback port, never original8765.",
+        "ref": "n6-history-browser-observations.json",
+        "sha256": "da183b23d3726113c7062c1a6bccc5f9f5a528644e5c124092b69d43f1a50094",
+        "image_ref": "n6-history-light.png",
+        "image_sha256": "c8b724fb3c2d602925e516b59165dda510158340b02d7440293596f154c94ff2",
+        "writes": 0,
+        "scope": "Literal platform input, saved answer, unconfirmed phase notice, one cursor GET to the next page, no next-page control after the last page, no horizontal overflow.",
+        "helper_stopped": true,
+        "live_backend": false
+      },
+      "last_development_reds": [
+        {
+          "failed": 2, "ref": "n6-ui-permission-red.xml",
+          "sha256": "21888c97ee2a740c34d6044bcb70864b970800e9313d00cf07170ae19e98464f",
+          "cause": "The first 401/403 could be reinterpreted as retryable merely because the durable RID remained accepted.",
+          "green_ref": "n6-ui-permission-green.xml",
+          "green_passed": 3,
+          "green_sha256": "36c58a53276457ae7941859951e69f4af16d8ac74d62b3163951bc3d8b721ac1"
+        },
+        {
+          "failed": 1, "ref": "n6-t5-signed-error-red.xml",
+          "sha256": "d97a0988b9e9b764455179130b3410adf254222945645e52e9dbf408d417e033",
+          "cause": "The real signed relay HTTP handler masked NATIVE_RESPONSE_UNCONFIRMED; fixed locally without weakening the global error handler."
+        }
+      ],
+      "scope": [
+        "Existing official T5 follow task, shared two-step helper, original message/root/source/digest and same-CID wake; no new queue, runner or A2A.",
+        "Server-selected template and eligibility, transactional local lane pin, read-only progress GET with separate CSRF POST.",
+        "Finite original-RID error budget persists across controller reload; 401/403 stops; queued/started/unknown never automatically replay.",
+        "Platform history uses server mode and platform cursors only, never infers FA RID or speaker; missing final phase stays unconfirmed with known-RID NativeResult access."
+      ],
+      "runtime": {"core": "2.2.0", "responses": "2.2.0", "invocations": "1.2.0", "azure_core": "1.41.0"},
+      "review_status": "completed_with_findings_see_review_fix_run",
+      "live_execution": false,
+      "production_mode": null,
+      "limitations": [
+        "API and VM/platform I/O are explicit local HTTP doubles; official SDK task tests do not establish real model or Hosted behavior.",
+        "Runs overlap and are not summed. All earlier RED, interrupted and fixture-error records remain separate.",
+        "No production enablement, deployment, IAM, original8765 modification or unknown-RID replay.",
+        "SP-22 group chat and WAKE-06 remain separate future work; no speculative group-chat abstraction added."
+      ]
+    },
+    {
+      "id": "n6-t5-follow-consumer-20261002",
+      "targets": ["CAP-02", "TOOL-05", "TOOL-06"],
+      "execution": "completed_consumer_only",
+      "outcome": "pass",
+      "acceptance": "partial_no_api_producer_integration",
+      "source_commit": "44773107b275c522143ff4754ce23c2389ad3b00",
+      "n6_1a_dependency": "0829adcd26cbe6b070d45c46db836c5ba1086e25",
+      "n6_0_dependency": "4869cab8",
+      "normal_merge": "332a0746e313f366aa36240c5f5b1295847a59de",
+      "released_1a_integration": {
+        "main": "09ae3dff2ad3eae78d05deaf3ac2403e65927dd3",
+        "merge": "1d519faac540ef75bd9844a7eff65ff841a5e5f2",
+        "owner_runtime_and_wire_match_main": true,
+        "consumer_code_and_tests_unchanged": true,
+        "passed": 23, "failed": 0, "seconds": 10.634,
+        "ref": "n6-consumer-released-1a-integration.xml",
+        "sha256": "0e39df56dd2f33e4d970953faa929a7df29c9cd32730de2ca9c9415ef39f272f",
+        "scope": "Own follow cases plus shared Responses wire and local console lane; this is not the earlier fixed 23-case selector set.",
+        "node_passed": 10,
+        "node_scope": "Native skill drafts and two-profile presentation/CID/image checks after upstream HTML changes."
+      },
+      "owner_vm_wire_unchanged": true,
+      "fixed_verification": {
+        "passed": 23, "failed": 0, "seconds": 14.114,
+        "ref": "n6-t5-follow-client-fixed.xml",
+        "sha256": "a2fc011229990bf31ad2661177fe6c8ff05d74920af4e003a33bc32de7686ef5",
+        "scope": "Original ACK returns without waiting for peer; normal slot waits exceed ten without exhausting error budget; wake, owned/terminal stop, real errors bounded, changed scope refusal, unconfirmed follow registration preserves ACK, cancellation and same-SID recovery including old task input; legacy direct regressions."
+      },
+      "initial_red": {
+        "failed": 1, "seconds": 6.267,
+        "ref": "n6-t5-accepted-follow-red.xml",
+        "sha256": "4a634f44102edd2132527732838183cdc7cb73d4ae0b1e5a7ae28d18a5e1da5d",
+        "cause": "Accepted Responses work had no continuation after the durable peer ACK."
+      },
+      "recovery_development_runs": [
+        {
+          "passed": 1, "failed": 1, "seconds": 33.225,
+          "ref": "n6-t5-follow-cancel-recovery.xml",
+          "sha256": "1e7c19932f013985de1d34fd0b32913b66d1632086f2a9ca8c0cde9f208d0b1a",
+          "cause": "The task awaited but did not return the official recovery sentinel."
+        },
+        {
+          "passed": 1, "failed": 1, "seconds": 8.185,
+          "ref": "n6-t5-follow-cancel-recovery-green.xml",
+          "sha256": "27423c201cbdb81673a05d530bd0374ebdf29b12ea1bbb618ed462cda5a4e36d",
+          "cause": "Filename does not determine outcome: recovered union input was a dict, not the typed model."
+        },
+        {
+          "passed": 2, "failed": 0, "seconds": 3.897,
+          "ref": "n6-t5-follow-cancel-recovery-typed-green.xml",
+          "sha256": "8ecf562aeff9d9c36fcefad2332d35241f9176c6f1bd33c6c2cf73bc2a55dbab",
+          "fix": "Return the SDK sentinel and restore the original published input with its TypeAdapter."
+        }
+      ],
+      "sdk_independent_wire_integration": {
+        "passed": 22, "failed": 0, "seconds": 2.259,
+        "ref": "n6-consumer-published-wire-merge.xml",
+        "sha256": "602e023d7ba85e0f4434fa83d15e4b526098d25b81f71bf0ddb143e383f5a3c3",
+        "limitation": "DTO and API-only cold import only, using the preexisting environment; not a core2.2 execution claim."
+      },
+      "runtime": {"core": "2.2.0", "responses": "2.2.0", "invocations": "1.2.0", "azure_core": "1.41.0"},
+      "old_follow_name_and_input_preserved": true,
+      "new_queue_or_runner": false,
+      "review_status": "not_run",
+      "live_execution": false,
+      "remaining": [
+        "Published N6-2 common two-step producer and T5 relay acceptance projection.",
+        "API eligibility and platform-history integration for native8765.",
+        "N6-0 merge prerequisite, final integration and two Opus5.5 review axes."
+      ]
+    },
+    {
+      "id": "n6-console-local-preparation-20261002",
+      "targets": ["TOOL-05", "TOOL-06"],
+      "execution": "completed_local_preparation_only",
+      "outcome": "pass",
+      "acceptance": "partial_not_responses_integration",
+      "source_commit": "3a214dc5353390a628dc5ecf99320a49b5237964",
+      "base": "75696b6fc7171ada7cd871e699ede1684b8e6723",
+      "lane_red": {
+        "failed": 1, "ref": "n6-console-lane-actual-red.xml",
+        "sha256": "cd28a14992e3355907c8897c35129118ce9219eaefff0a080a42beb6af69fd00",
+        "cause": "Existing local lane selector refuses foundry-responses-v1.",
+        "separate_fixture_failure": "n6-console-lane-red.xml omitted Journal.begin.created_at; not product RED."
+      },
+      "lane_verification": {
+        "passed": 9, "failed": 0, "seconds": 11.416,
+        "ref": "n6-console-lane-fixed.xml",
+        "sha256": "2722f380265d2718fc9b2180821080277e301aee85befd78b895a851bdef5953",
+        "scope": "Transactional SQLite lane extension; existing Table/native commands/CIDs/pins/unknowns preserved, unpinned old input never upgraded and new Responses pin survives preference changes."
+      },
+      "presentation_red": {
+        "passed": 1, "failed": 2,
+        "ref": "n6-console-presentation-red.xml",
+        "sha256": "fdd77cf2491af6aa3452175f63feb5a7b384b8a28f91f65cfd85d26fd5bf584b",
+        "cause": "Responses state lacks native progress panel and its Agent view fails to filter another CID."
+      },
+      "presentation_verification": {
+        "passed": 15, "failed": 0,
+        "ref": "n6-console-presentation-green.xml",
+        "sha256": "5f505e5f15e24c212c7b0ad3df2936fe028dbcc84dadb3b8a3925154edfb7f53",
+        "scope": "Two native display profiles, original Agent/thread filtering, native image digest protection and related old presentation cases; no POST."
+      },
+      "transport_enabled": false,
+      "review_status": "not_run",
+      "live_execution": false,
+      "remaining": [
+        "Published N6-1a state_profile/response_id/dispatch wire, original inflight ownership and queue outcome.",
+        "Published N6-2 common Invocations acceptance/Responses execution, explicit reconcile POST and platform-history pagination.",
+        "Responses-only original RID/SID automatic reconciliation and original T5 follow; no generic replay for old Invocations or unknown.",
+        "N6-0 merge dependency, narrow integration tests and two Opus5.5 axes before PR merge."
+      ]
+    },
+    {
+      "id": "c5-native-images-20261002",
+      "targets": ["TOOL-01", "TOOL-04", "TOOL-06"],
+      "execution": "completed",
+      "outcome": "pass",
+      "acceptance": "code_offline_reviewed_merged",
+      "source_commit": "72db7bc1ab502685601d1443a95af81e3608cec7",
+      "base": "c1f0e61b2d526acaf48711936e59b6f583707f25",
+      "delivery": {
+        "pr": 361, "url": "（原私有 repo 連結）",
+        "head": "9e0c9b661e87c2f9b62a74e7fd3cc63642c258e4",
+        "merge_commit": "4fcc5821545bb8a99c214d6ae3bb51874c9a34ea",
+        "merged_at": "2026-10-02T06:06:28+08:00",
+        "parents": ["c1f0e61b2d526acaf48711936e59b6f583707f25", "9e0c9b661e87c2f9b62a74e7fd3cc63642c258e4"],
+        "tree": "5cc3e960df9aeb97c31b4b2230ec51db04a160fd",
+        "final_head_tree_matches_merge": true,
+        "method": "Normal exact-head merge after both Opus5.5 axes cleared and GitHub reported CLEAN.",
+        "deployed_by_this_workstream": false
+      },
+      "fixed_verification": {
+        "passed": 43, "failed": 0, "errors": 0, "seconds": 41.231,
+        "ref": "c5-native-image-integrated.xml",
+        "sha256": "66c69e6176c99ef4825987e7e911872d91612ea76c11ca3934e607ec2d7406c4",
+        "scope": "Original PNG/digest, 512 KiB exact size, same-image/lost-ACK readback, four-image/concurrent bounds, rejected invalid material, native N1/N2/8765 and legacy readers, wire imports and other providers.",
+        "true_sdk_cases": 3
+      },
+      "ui_verification": {
+        "passed": 17, "failed": 0,
+        "ref": "c5-native-image-ui.xml",
+        "sha256": "8778db86d541b3e3f9ea86d7afdbf7edc1aec99fed5f3510763b37f14e46ea20",
+        "scope": "Seven native image cases, four existing gallery cases and six skill-draft cases. No implicit POST; original length/hash and login fencing before preview/download."
+      },
+      "sdk_initial": {
+        "passed": 2, "failed": 0, "seconds": 19.548,
+        "ref": "c5-native-image-real-sdk-first.xml",
+        "sha256": "c7a926546450379b8f4c2b19412d16914f4e022cb1cc76738f7e9a30fe3e02e3",
+        "scope": "Real SDK Completions/Responses and stdio MCP image callback, stored once and no latest_image reused by the next RID."
+      },
+      "original_reds": [
+        {"ref": "c5-native-image-first-red.xml", "failed": 1, "sha256": "3fd6f7b49c286902950f9c5432595913089528b7b9fc0c6dd9df739a66638c09", "cause": "Native provider/reader absent"},
+        {"ref": "c5-native-image-api-red.xml", "failed": 1, "sha256": "2f29d9f9f81971cdf2b9606bf1c06f062cbbc179b4818eee455b7b9ac7ba4685", "cause": "Missing N2 images route (404)"},
+        {"ref": "c5-native-image-console-red.xml", "failed": 1, "sha256": "fa9a602e012927b7f8bffb60586c5022e839e14c800d61022e4188dfab669198", "cause": "8765 image lookup still used legacy gate (403)"}
+      ],
+      "storage_initial": {
+        "passed": 7, "failed": 1, "seconds": 5.846,
+        "ref": "c5-native-image-storage-bounds.xml",
+        "sha256": "251b4d9d740cd4783927925016cd87340168aa0028f598f7956dbb5071cfa4b2",
+        "failure": "Windows PermissionError errno=13/winerror=5 during N1 store initialization, before image execution; no product storage retry added."
+      },
+      "max_image_separate": {
+        "passed": 1, "failed": 0, "seconds": 3.525,
+        "ref": "c5-native-image-max-separate.xml",
+        "sha256": "5f657ea09323d0ce86713f3cd9f6e8d59e02dcedf2af54b000d14b8847822d1a",
+        "same_code": true,
+        "raw_bytes": 524288,
+        "json_item_less_than_bytes": 1000000,
+        "original_failure_retained": true
+      },
+      "isolated_browser_preview": {
+        "source_commit": "f44507f3d8a2ba1d8f2efdfb3aa2fc873adf279e",
+        "outcome": "pass",
+        "ref": "c5-native-image-browser.json",
+        "sha256": "a3a669b9caa674cd00cd4bf81e477146e8050592ae7724811279966bd9a7117c",
+        "scope": "Production HTML with a synthetic read-only loopback fixture in a real browser; decoded the exact 1x1 PNG, blob preview/download rendered, zero POST.",
+        "cleaned_up": true,
+        "limitation": "Not live 8765, a true Hosted screenshot or a production browser workflow; missing fixture favicon returned 404."
+      },
+      "review_status": "cleared",
+      "review": {
+        "model": "claude-opus-5.5",
+        "base": "c1f0e61b2d526acaf48711936e59b6f583707f25",
+        "head": "f44507f3d8a2ba1d8f2efdfb3aa2fc873adf279e",
+        "standards": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-000000000037"},
+        "spec": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-000000000038"},
+        "scope": "This image slice only. Neither reviewer reran C4/C6 matrices or modified code; later changes only record evidence and review status."
+      },
+      "live_execution": false,
+      "limitations": [
+        "SDK 1.0.13/runtime1.0.83/core2.1.0 local backend; models and stdio MCP are scripted, not a real browser or Hosted.",
+        "Overlapping runs are not summed; the original Windows initialization failure remains a separate run.",
+        "No public URL, M3 image, fake Job/binding, new queue or live 8765 change; a stored PNG is not a human delivery acknowledgement.",
+        "C6 whole-A capability integration is separate."
+      ]
+    },
+    {
+      "id": "c5-native-skillify-20261002",
+      "targets": ["TOOL-01", "TOOL-03", "TOOL-06"],
+      "execution": "completed_with_separate_rerun",
+      "outcome": "mixed_original_batch_retained",
+      "acceptance": "local_contracts_not_live",
+      "source_commit": "f79219a03d4bb9f4e6a4220afc8afb98492211d0",
+      "delivery": {
+        "pr": 358, "url": "（原私有 repo 連結）",
+        "head": "29b485c606c7a4cbe4edeaca43dd6b0cc95531fa",
+        "merge_commit": "c1f0e61b2d526acaf48711936e59b6f583707f25",
+        "merged_at": "2026-10-02T05:37:07+08:00",
+        "tree": "45d86fd56e021aec815edab38dda8adef837a704",
+        "method": "Normal merge after both original Opus5.5 axes cleared, exact final head and CLEAN readback.",
+        "deployed_by_this_workstream": false
+      },
+      "main_integrated": "d8d2df4d8089171bd584a541bc6df9441d3d07ac",
+      "source_contracts": {
+        "source_commit": "933a62dcfa3198cd89fe298226d97b6c58b1ce71",
+        "passed": 89, "failed": 0, "seconds": 6.464,
+        "ref": "c5-native-m3-contracts.xml",
+        "sha256": "b401545f2301f67d6b37998a033b25e0ca5ecc0195204ad13535edc494e50342"
+      },
+      "reconcile_red": {
+        "failed": 1, "seconds": 5.978,
+        "ref": "c5-draft-reconcile-old-session-red.xml",
+        "sha256": "265b10432836426099c7514820d7d34f5e93fd876a2225352b039d3852acd165",
+        "observed": "The stored original M3 upload could not reconcile without invoking the retired original Hosted session."
+      },
+      "reconcile_green": {
+        "passed": 3, "failed": 0, "seconds": 7.220,
+        "ref": "c5-draft-reconcile-old-session-green.xml",
+        "sha256": "48bd14ae0a2aa8adb22f857faa2f00262edbf7ce4b78c301b559d14f87324eaa",
+        "scope": "Running/retired original session reconciliation without a second upload, plus signed Agent write and owner read."
+      },
+      "sdk_fixture_correction": {
+        "failed": 3, "seconds": 28.401,
+        "ref": "c5-draft-real-sdk-first.xml",
+        "sha256": "975bb64caa4ec0082d3bb65ceb3f7c2d2810f52fb8ba7b6a9e9c38783f37652d",
+        "cause": "Test capture selected Responses while its model stub returned Completions; not product RED evidence."
+      },
+      "sdk_verification": {
+        "passed": 3, "failed": 0, "seconds": 13.196,
+        "ref": "c5-draft-real-sdk-green.xml",
+        "sha256": "9c1685f916e65568202a746fa2de041524527cd502e20c40c4cae3580f17b4f9",
+        "selector": "tests\\shared_context\\test_native_skill_draft.py::test_real_sdk_native_skillify_keeps_one_original_draft_across_tool_calls",
+        "runtime": {"sdk": "1.0.13", "runtime_package": "1.0.83", "wire_api": "completions"},
+        "scope": "Real SDK and official local effects, unselected/no tool, same original draft across callbacks, save response lost -> reconcile only; model and M3 HTTP are named doubles."
+      },
+      "main_integration": {
+        "passed": 45, "failed": 1, "errors": 0, "skipped": 0, "seconds": 29.938,
+        "ref": "c5-draft-main-integration.xml",
+        "sha256": "fc218982096989e524544bfcb3f22a0afc06d3173f5f8798b33c83813c27f864",
+        "scope": "C5 original-source/M3/JWT/provider/8765 plus N1 union, C1 and candidate registry/read, and environment-follow intersections.",
+        "failure": "not-selected case: pre-SDK original RID started write raised Windows PermissionError errno=13/winerror=5; no attribution beyond the captured stage."
+      },
+      "separate_failed_case_rerun": {
+        "passed": 1, "failed": 0, "seconds": 6.526,
+        "ref": "c5-draft-main-unselected-reread.xml",
+        "sha256": "5cc7f624016cc4c16c2a2c3c612368ec49fe0a57b1923271718accda32ac43af",
+        "same_code": true,
+        "original_batch_unchanged": true
+      },
+      "ui_verification": {
+        "passed": 10, "failed": 0,
+        "command": "node --test --test-name-pattern 'native skill draft|native environment|previous native ready|definite native refusal|native states' tests\\shared_context\\test_web_test_console_workbench.cjs",
+        "scope": "Six draft read/download cases and four existing environment/native UI cases; only original bytes can download, earlier-login responses are discarded, no implicit POST/approval."
+      },
+      "c6_feature_integration": {
+        "source_commit": "7420cc4b190ebcafbc5396d399889bd78cfede4c",
+        "test_source_ref": "c6-tracer-13-test.py",
+        "test_source_sha256": "bf50efec93eceba2f72d79bbf7bb88755ffd8c549997f4cc4101fee072f722bb",
+        "passed": 2, "failed": 0, "seconds": 23.144,
+        "ref": "c6-tracer-13.xml",
+        "sha256": "10f7b8a123bb8bc0c13ed207e9516e777fae0810fa2eae38a348f61e4fe7c434",
+        "evidence_owner_session": "00000000-0000-0000-0000-000000000039",
+        "scope": "Real SDK/factory -> Agent token and original N2/effect proof -> unchanged C5 M3 writer -> signed human approval -> C2 read from another native CID; normal and lost-save-response paths each PUT once. Retired SID read/reconcile works, effective view and original unapproved receipt remain distinct, legacy skill is unchanged.",
+        "limitation": "C6 feature merge containing f79219a0 plus the identified test WIP; not main, a rerun of this PR's final head, Azure storage or a live model. C6's earlier JWT-fixture failure remains separate."
+      },
+      "review_status": "cleared",
+      "review": {
+        "model": "claude-opus-5.5",
+        "base": "d8d2df4d8089171bd584a541bc6df9441d3d07ac",
+        "head": "10fb4aff118ab5587c35f7bbc655ff5fa0767f94",
+        "standards": {"p1": 0, "p2": 1, "agent_id": "00000000-0000-0000-0000-00000000003a"},
+        "spec": {"p1": 0, "p2": 1, "agent_id": "00000000-0000-0000-0000-00000000003b"},
+        "distinct_findings": 1,
+        "finding": "Four approved native skills with ordinary-length purposes overflow the 4096 B catalog and block Team options/onboarding.",
+        "fix_head": "c4f70b222e47c14f4a447e655602986b9ab1f853",
+        "fix": "Catalogs carry the existing native_submit_sha256 instead of full source; reads still bind it and the immutable metadata. Team options enumerate single exact references without applying a selected model catalog budget to unrelated long purposes.",
+        "rereview_scope": "Both original axes rechecked only their common P2's five-file delta.",
+        "rereview": {
+          "base": "4abf507af973cdfa1ca8d340c76222ee7fe82060",
+          "head": "c4f70b222e47c14f4a447e655602986b9ab1f853",
+          "standards": {"p1": 0, "p2": 0},
+          "spec": {"p1": 0, "p2": 0},
+          "original_finding_cleared": true
+        }
+      },
+      "catalog_red": {
+        "failed": 1, "seconds": 0.673,
+        "ref": "c5-skillify-catalog-p2-actual-red.xml",
+        "sha256": "7440b45d22cb4c68ec863bcbd5b663440b6bb02aa3badc7599af2225a209df45"
+      },
+      "options_red": {
+        "passed": 1, "failed": 1, "seconds": 4.818,
+        "ref": "c5-skillify-options-p2-actual-red.xml",
+        "sha256": "1bd5dceb04e8508505960e5691d820168bba6f1883e71f9d0dab1af108ecfbd8"
+      },
+      "p2_verification": {
+        "passed": 21, "failed": 0, "seconds": 20.566,
+        "ref": "c5-skillify-p2-fixed.xml",
+        "sha256": "9eab45b29f436a4e769ad776c503065c9add0039e84d8c994029b4ae6654c8f0",
+        "scope": "Four 179-byte purposes catalog/read/select within 4096 B; 512-byte purposes do not block Team options or old skills; changed source refs refused, legacy M3 and original native writer/read/reconcile preserved.",
+        "fixture_failures_retained": ["c5-skillify-catalog-p2-red.xml", "c5-skillify-options-p2-red.xml"]
+      },
+      "source_version_integration": {
+        "main": "74e28a9d80305e09402ea5d67a4d330e7875a6ba",
+        "merge": "4abf507af973cdfa1ca8d340c76222ee7fe82060",
+        "passed": 3, "failed": 0, "seconds": 8.017,
+        "ref": "c5-skillify-source-version-integration.xml",
+        "sha256": "cbde27ca54aa98c0d476d1b4df046d2db3c0a2784f3915c429f3f64692772058",
+        "original_reviewed_c5_files_unchanged_before_p2_fix": true
+      },
+      "live_execution": false,
+      "image_delivery_complete": false,
+      "limitations": [
+        "Overlapping batches are not added together or backfilled.",
+        "M3 service, HumanApprover and C2 reader are real code on in-memory storage; SDK tests use offline model and M3 HTTP doubles.",
+        "No live model, Hosted, Azure Blob or complete C6 claim; the Windows write failure remains in its original run.",
+        "Human approval and later C2 selection remain mandatory; an original unapproved write receipt is not the current M3 review state.",
+        "Image delivery/native 8765 image reads are a separate next slice."
+      ]
+    },
+    {
+      "id": "c4-native-delegation-20261002",
+      "targets": ["CAP-01"],
+      "execution": "completed",
+      "outcome": "pass",
+      "acceptance": "code_offline_reviewed_merged",
+      "delivery": {
+        "pr": 354,
+        "url": "（原私有 repo 連結）",
+        "merge_commit": "f9b40824c2af8cdff3053ad89cbb6681fdba6f95",
+        "head": "40871e597d4ef5334cc7ac501cf3a54de357faed",
+        "merged_at": "2026-10-02T03:36:03+08:00",
+        "parents": ["4b4a24c1e314da5a9092c165c13ac0588cba5d7f", "40871e597d4ef5334cc7ac501cf3a54de357faed"],
+        "tree": "f6a64be86fd5cfb3f570bb42fae215989030c42c",
+        "method": "Normal merge, exact-head guard, live CLEAN; C0 and its original CAS fixes were on main first.",
+        "deployed_by_this_workstream": false
+      },
+      "source_commit": "71011f88162c471c7a8d8a617666361871b5489e",
+      "c0_dependency": {
+        "published_interface": "cb8970c45e5e3b2fa47f5817adbb452ff63e862c",
+        "effect_observe_commit": "dcedf6032ad02a7c4a70accd5de5dc94a624b202",
+        "main_merged": true,
+        "merge_commit": "4b4a24c1e314da5a9092c165c13ac0588cba5d7f",
+        "merged_at": "2026-10-02T03:32:36+08:00",
+        "merge_tree_matches_reviewed_c0_head": true,
+        "original_cancel_hook": "7fd36ff59dfa8ae480a69020e94a90c7bd222e60"
+      },
+      "cas_main_integration": {
+        "main": "fe55cedf2b047c48050ae2451321c720826a3857",
+        "commit": "aa1bdfef83e923b159e8198dc9fdf68a27eee79a",
+        "reviewed_c4_code_unchanged": true,
+        "passed": 3, "failed": 0, "seconds": 22.768,
+        "ref": "c4-cas-main-integration.xml",
+        "sha256": "891d8bc68fc9ae8218ffe216de47c16753c97a9204c82a091ee280a32d2dccc5",
+        "scope": "Actual SDK original child success/cold follow-up, cancellation and prepare outcome unknown after the final upstream RID CAS fix."
+      },
+      "fixed_verification": {
+        "passed": 28, "failed": 0, "errors": 0, "skipped": 0, "seconds": 46.988,
+        "selectors": [
+          "tests\\shared_context\\test_native_delegation.py",
+          "tests\\shared_context\\test_delegation_runtime.py",
+          "tests\\shared_context\\test_delegation_model_schema.py"
+        ],
+        "ref": "c4-fixed-71011f88.xml",
+        "sha256": "059981c048f762ca989c77cb8c0d98138d90633a1baad9fe4bf7da4bdb824c7b",
+        "scope": "Ten true pinned SDK C4 cases including both model wire APIs and cold follow-up, plus eighteen legacy event/model-schema regression cases."
+      },
+      "sdk_cases": {
+        "passed": 7, "failed": 0, "deselected": 1, "seconds": 32.774,
+        "ref": "c4-native-current.xml",
+        "sha256": "5037c94f0a28c3af36131c39285d6c683d0040ee33e46bd289fee28a4cd99f93",
+        "coverage": "Actual SDK task/custom_agents and official local effect store: original RID result/usage, unselected no task, second task denied, mode/model override denial, prepare unknown no respawn, incomplete child cannot publish parent success."
+      },
+      "cancel_red": {
+        "tests": 1, "failed": 1, "seconds": 6.606,
+        "ref": "c4-native-cancel-red.xml",
+        "sha256": "c9c98898062d014264f667b45e3f9a0e45b81751e3797f7203e5b2bbb202aa64",
+        "observed": "Original RID becomes unknown; childCancelled and parentIdle are recorded; cancel_requested=false until C0 wires the original request_cancel hook."
+      },
+      "cancel_green": {
+        "integration_commit": "d52a6a20db4f97c7fbc8b3610fc45cfdcfbfa03b",
+        "passed": 3, "failed": 0, "seconds": 14.124,
+        "ref": "c4-c0-cancel-integration.xml",
+        "sha256": "43ef6fc576a81fe37622201b5712094938bd23bb829e31df9ea99d65d0c9b2e8",
+        "scope": "Actual SDK cancellation and selected/unselected parent result; original cancellation is saved without delaying abort."
+      },
+      "effect_interface": {
+        "passed": 20, "failed": 0, "seconds": 6.144,
+        "ref": "c4-observe-c0-integration.xml",
+        "sha256": "9441c5337b4d3e5594a3c88a256a68976481e72c5c09dbc39521dbac4ed8c411"
+      },
+      "legacy_regression": {
+        "passed": 43, "failed": 0, "seconds": 27.063,
+        "ref": "c4-legacy-storage-codec.xml",
+        "sha256": "dcdaeb4a95f92deebd695e99fa3097b98e2d8e17d5f2cf53a6ace3839518a79e"
+      },
+      "runtime": {"sdk": "1.0.13", "runtime_package": "1.0.83", "model_transport": "scripted offline"},
+      "default_provider_enabled": true,
+      "capability_selected_before_bind": true,
+      "uses_fake_job_or_claim": false,
+      "uses_legacy_delegation_api": false,
+      "shared_model_usage_per_rid": true,
+      "hosted_import_boundary": "Native provider imports while legacy Job/worker/ledger/server and azure.data modules are explicitly blocked.",
+      "review_status": "cleared",
+      "review": {
+        "model": "claude-opus-5.5",
+        "base": "1fb8f0da34373679c98598f5ce5c7182b65801a1",
+        "head": "f4b232e2c6975a587a35fff904ed57da4b9af046",
+        "standards": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-00000000003c"},
+        "spec": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-00000000003d"},
+        "scope": "C4-only delta; C0 shared effects, profiles and cancellation ordering are reviewed by C0. Existing passing suites were not rerun.",
+        "merge_prerequisite": "Met: C0 and the original CAS fixes are on main; ordinary integration preserves the exact reviewed C4 code and tests."
+      },
+      "live_execution": false,
+      "limitations": [
+        "This is C4 code/offline validation, not native A/B feature parity or deployment acceptance.",
+        "Do not merge C4 before C0 is reviewed and merged; shared effects correctness is reviewed with C0.",
+        "No fake Job, claim or API delegation ticket, no additional queue or custom agent loop.",
+        "Test URLs and real-SDK wait configuration corrections are not product RED evidence."
+      ]
+    },
+    {
+      "id": "native-t5-inbox-wake-20261001",
+      "delivery": {
+        "pr": 332,
+        "url": "（原私有 repo 連結）",
+        "merge_commit": "13cc1156e95aacf490ad2d1b6d55c8e4af4913e8",
+        "head": "76dfa76de0f7b4fb43c34998d8cc56fc579f58ba",
+        "merged_at": "2026-10-02T00:57:03+08:00",
+        "parents": ["3aaf1e9aff576f9cf9eca7e939a48a54ff439387", "76dfa76de0f7b4fb43c34998d8cc56fc579f58ba"],
+        "tree": "d343551978e2428153b6877892e0f80c1986c2c0",
+        "method": "Normal merge, match-head-commit, live CLEAN/MERGEABLE, no admin or force",
+        "review": "Standards 0 P1/P2 and original Spec final delta 0 P1/P2",
+        "notified": ["coordinator", "deployment_workstream"],
+        "live_scope": "Coordinator's current batch: newly onboarded native test agent 2 to test agent 3, once; A/B stay legacy until native version continuation."
+      },
+      "tested_commit": "203ceb34dbda3634344acb90386682c5cf3d6dbd",
+      "main_integration": {
+        "main_commit": "bd957654080e991e8ddba6b14f8b761d53aaa7a4",
+        "tested_commit": "f6b593df11a612a24bec5a7608332b2afa883b4d",
+        "passed": 10, "failed": 0, "errors": 0, "skipped": 0,
+        "seconds": 15.936,
+        "ref": "t5-main-bd957.xml",
+        "sha256": "77b451910554e130a9cb2d39be1f8beb82a5be9c8c3997eef6f2d5e4799d048f",
+        "scope": "API registry/receive/wake, same-wake callback, real SDK terminal outcomes and original human entry"
+      },
+      "targets": ["CAP-02"],
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "native_agent_receive_and_same_rid_result_wake",
+      "passed": 88, "failed": 0, "errors": 0, "skipped": 0, "seconds": 55.861,
+      "selectors": [
+        "tests\\shared_context\\test_native_agent_relay.py",
+        "tests\\shared_context\\test_native_relay_quota.py",
+        "tests\\shared_context\\test_native_agent_capture.py",
+        "tests\\shared_context\\test_native_agent_transport.py",
+        "tests\\shared_context\\test_native_agent_api.py",
+        "tests\\shared_context\\test_native_agent_tools.py",
+        "tests\\shared_context\\test_native_agent_client.py",
+        "tests\\shared_context\\test_native_capture.py",
+        "tests\\shared_context\\test_native_turn_api.py",
+        "tests\\shared_context\\test_native_sdk.py"
+      ],
+      "evidence": [
+        {"ref": "t5-fixed-203ceb34.xml",
+         "sha256": "e4e259de48783ab01a25b199558d946805f2b6a7a5569856cb9224e6183b2838"}
+      ],
+      "receive": {
+        "durable_receipt_before_ack": true,
+        "busy_queued_not_failed": true,
+        "same_rid_one_execution": true,
+        "onboarded_registry_recipient": true,
+        "fake_human_authorization": false,
+        "terminal_sdk_model_requests": 1,
+        "terminal_sdk_send_calls": 1,
+        "peer_poll_calls": 0
+      },
+      "wake": {
+        "key": "original request message ID/in_reply_to",
+        "original_cid_new_rid": true,
+        "duplicate_wake_new_turns": 1,
+        "completed_hook_unknown_reruns_sdk": false,
+        "large_results_paginated": true
+      },
+      "quota": {
+        "constant": "MAX_NATIVE_RELAY_MESSAGES",
+        "new_messages": 10,
+        "root_items": 1,
+        "ten_entry_payload_bytes": 1785,
+        "payload_max_bytes": 4096,
+        "legacy_inventory_partition": false,
+        "stores_content_or_receipts": false,
+        "stores_reply_slots": false,
+        "native_hop_cap": null,
+        "native_per_turn_100_cap": false,
+        "decision": "Neal 2026-10-01 18:46 靠近Grokbot; 18:47 不要比grokbot嚴格"
+      },
+      "review": {
+        "model": "claude-opus-5.5",
+        "original_head": "736ca29d864abc6f2541997cf01007b307b3ce65",
+        "standards": {"p1": 1, "p2": 1, "agent_id": "00000000-0000-0000-0000-00000000003e"},
+        "spec": {"p1": 1, "p2": 2, "agent_id": "00000000-0000-0000-0000-00000000003f"},
+        "delta_status": "cleared",
+        "fixed_code": "a066d6460504f45c1ad776aab9e5b9615d0f3529",
+        "second_review": {
+          "head": "174920b5b5b3ffaa0f4722ba8aa3f1baa791af22",
+          "standards": {"p1": 0, "p2": 0, "direct_tests": 20, "seconds": 36.19},
+          "spec": {"p1": 0, "p2": 2},
+          "remaining": [
+            "Default three-attempt retry is only about three seconds; root wake exhaustion is not visible to the human.",
+            "A child acceptance is lost as delegation metadata when its sender becomes unknown before checkpoint/completed."
+          ],
+          "next_fixed_code": "2e6973e0b163335cec6efa78596f6d1cf005cc0f",
+          "next_spec_status": {"head": "eecfcd4107e8704ce00a6d92e527bd2b22d6b531", "p1": 0, "p2": 2},
+          "last_fixed_code": "f328a498f2be63f5766e9b17cd681fee624fc814",
+          "last_spec_status": {
+            "head": "ff6a788f9422a7554bd6b5890b511e8c5370ddfa",
+            "code": "f328a498f2be63f5766e9b17cd681fee624fc814",
+            "p1": 0, "p2": 0, "direct_tests": 7, "seconds": 8.78,
+            "official_probe": "Queue full plus one State store 503 recovered automatically with the original RID and one SDK execution."
+          }
+        }
+      },
+      "final_main_integration": {
+        "main": "3aaf1e9aff576f9cf9eca7e939a48a54ff439387",
+        "commit": "f81c3e12b2f245bfae7d54cff0304368a03a10f3",
+        "tree": "c5b43d80f0f5861a2dec3d0b89de74742eb0e1b9",
+        "t5_product_delta": "None; take reviewed upstream native factory root under supervisor.journal.root, not HOME/.fa-native-turns.",
+        "batch": {
+          "passed": 6, "failed": 1, "seconds": 17.385,
+          "ref": "t5-main-3aaf1e9a.xml",
+          "sha256": "e1527e125bd1bb9e4529b2b928ab22597ddeb7f96d9da2e847c31fb2441ce725",
+          "failure": "Factory cache assertion under the long worktree basetemp; expected cache path length 286 and temporary path 297, cache write warning. Factory work/sdk and authoritative store checks succeeded."
+        },
+        "same_factory_short_temp": {
+          "passed": 1, "failed": 0, "seconds": 1.982,
+          "ref": "t5-root-short-path.xml",
+          "sha256": "1fcd18bbf9f610f2bee7bd398bc0155d208b2a2ec68b2576c18b24dbbb0178c8"
+        },
+        "browser": {"passed": 4, "selector": "node --test --test-name-pattern 'native ' tests\\shared_context\\test_web_test_console_workbench.cjs"},
+        "upstream_vendor_bytes": "Unchanged from main, including original license and author files."
+      },
+      "second_review_fix_verification": {
+        "prepared_main": "9dde56e16ed408b57917ef036aebd2a43227ef7d",
+        "native_session_behavior": "Use explicit prepared API-MI client; do not create or fall back to registry fa-session in relay.",
+        "changes": [
+          "Official RetryPolicy: ten attempts, exponential from one second with a sixty-second delay cap; not a model execution limit.",
+          "Original A read/view surfaces exhausted child notification status without changing reply/usage; a refused root wake also marks its original A delegation receipt.",
+          "Persist the true child acceptance on the original started RID before terminal tool return; preserve it through cancel/shutdown/checkpoint failure.",
+          "The SDK completion CAS uses the refreshed same-run record after storing delegation metadata."
+        ],
+        "critical_8": {
+          "passed": 8, "failed": 0, "seconds": 47.473,
+          "ref": "t5-review-round2.xml",
+          "sha256": "94da6a16b9918d26fdc9c71bd6aaf6da8a0bd5016a1f71aafc1cfb625590cbff",
+          "covers": "Real ten-second notification outage and queue occupancy; no manual replay; delegation then cancellation; original A failure visibility and unchanged reply."
+        },
+        "browser_contract": {
+          "passed": 1,
+          "selector": "node --test --test-name-pattern 'native notification exhaustion' tests\\shared_context\\test_web_test_console_workbench.cjs"
+        },
+        "fixed_batch": {
+          "code": "2e6973e0b163335cec6efa78596f6d1cf005cc0f",
+          "passed": 105, "failed": 1, "deselected": 2, "seconds": 69.683,
+          "ref": "t5-2e6973e0.xml",
+          "sha256": "8bdf060255f8ed7e853e74618a4a1c48f09903a14d9e869e353ae488424b7c93",
+          "failure": "cancel-after-child stayed accepted before SDK entry; local task suspended/run_completion, root cause unconfirmed",
+          "deselected_reason": "The two production-delay ten-second cases already passed in the critical batch."
+        },
+        "isolated_case": {
+          "passed": 1, "failed": 0, "seconds": 2.605,
+          "ref": "t5-r2-cancel-isolated.xml",
+          "sha256": "7c8721a43f1ca6428a7854dd815851de9f4234688b017b5692e35b68461188f5"
+        }
+      },
+      "last_review_fix_verification": {
+        "code": "f328a498f2be63f5766e9b17cd681fee624fc814",
+        "scope": "Deferred SID/task-start 5xx or AzureError joins the same official retry and exhaustion notification; child ACK remains success if local retain is unconfirmed, and unknown/cancel carries outcome.delegation.",
+        "retry_test_contract": "Shortened test delays retain the exact production retry_on exception types and ten-attempt budget.",
+        "enqueue_red": {
+          "tests": 2, "failed": 2, "ref": "t5-enqueue-predicate-red.xml",
+          "sha256": "c7b40a64d26fba4db1b0e882155c88b42b8347568a4606fdc84a92171ced53d8"
+        },
+        "retain_red": {
+          "tests": 2, "failed": 2, "ref": "t5-retain-interrupted-red.xml",
+          "sha256": "6b6fc037b9e9276dce4a4da949f73d2e0ca3124b7c92a676bf6fa25100170cef"
+        },
+        "fixed_critical": {
+          "passed": 5, "failed": 0, "seconds": 8.584,
+          "ref": "t5-f328a498-critical.xml",
+          "sha256": "2dfd229492b7c96ab29b4aaaf1cccc69070ff4ea9c0c1c174b46df5a524afdf7"
+        },
+        "adjacent_batch": {
+          "passed": 24, "failed": 1, "deselected": 2, "seconds": 28.466,
+          "ref": "t5-r4-targeted.xml",
+          "sha256": "aa204c22425a41407d18f448dfa68e1548ce3311f1512fe3312a5caea93be509",
+          "failure": "Directory test reached NATIVE_STATE_STORE_UNKNOWN with logged local PermissionError errno13/winerror5; not attributed to the earlier trace-less SDK_STATE_UPLOAD_UNKNOWN."
+        },
+        "isolated_directory": {
+          "passed": 1, "failed": 0, "seconds": 2.615,
+          "ref": "t5-r4-directory-isolated.xml",
+          "sha256": "bd41e57d2524ae01ba47927d614dd7baefbbf59a2cefdc21097e215d38d84ff7"
+        }
+      },
+      "review_fix_verification": {
+        "critical_contracts": {
+          "passed": 12, "failed": 0, "seconds": 23.124,
+          "ref": "t5-review-fixes-contract.xml",
+          "sha256": "5c518391e07aad3a652f1390ef714c91239e6dee06cbd37937d6a8e5eb4bc893"
+        },
+        "fixed_batch": {
+          "commit": "a066d6460504f45c1ad776aab9e5b9615d0f3529",
+          "passed": 98, "failed": 1, "errors": 0, "seconds": 58.725,
+          "ref": "t5-a066d646.xml",
+          "sha256": "4a58f41c4e157bf2eb361a0e120574122fe449d1ee63ef43d3ab9e1f16b82eb4",
+          "failure": "test_terminal_usage_is_sent_without_user_poll_and_reuses_original_report[wrong_rid]: SDK_STATE_UPLOAD_UNKNOWN before its callback; underlying cause not recorded"
+        },
+        "isolated_failed_case": {
+          "passed": 1, "failed": 0, "seconds": 5.017,
+          "ref": "t5-wrong-rid-isolated.xml",
+          "sha256": "b5a524957c39d183e0d45f95d57c16d55e26255be9c4b746e09fa7c100198914"
+        },
+        "n1_independent_probe": {
+          "ref": "n1-sdk-storage-probe28.log",
+          "sha256": "7d44358103cbd47772ffacbdabdb059f4171cb14c2e47c568cb245745e49457e",
+          "observation": "completed=155, then PermissionError errno13/winerror5 at official local storage os.replace",
+          "same_cause_as_t5_failure_confirmed": false
+        },
+        "changes": [
+          "Official one-shot notification task with default three-attempt RetryPolicy; usage failures do not prevent wake; exhausted notification_error remains visible on the original receipt.",
+          "Only a full official chain uses an official one-shot enqueue task for the accepted original RID; exhausted queue admission is explicit and sends the original failure notice.",
+          "Unavailable recipient directory disables only send tools and gives a model-visible notice, not an irreversible unknown turn.",
+          "agent_notice references the original unknown/busy_refused status, digest and failure code; it never claims the SDK stopped.",
+          "Delegation and continuation metadata distinguish handoff acknowledgments from the final upstream result; A-to-B-to-C final result returns through B's new turn to A's original CID."
+        ]
+      },
+      "live_execution": false,
+      "hosted_import_check": "native_agent_tools imports while azure.data and API composition/work-policy imports are explicitly refused",
+      "limitations": [
+        "N1 official local chain/State store and two real pinned SDK terminal scenarios; API/Table/model I/O otherwise synthetic.",
+        "No Azure invocation or paid-model run; N0 evidence is a separate prerequisite already recorded by its owning workstream.",
+        "Legacy Table CID, existing limits and B23 records are unchanged.",
+        "agent_notice is only an unconfirmed-outcome reference, not a server stop proof; fabricated server_notice and FYI remain outside this slice.",
+        "Registry/onboarding and A-to-B live samples are still required after coordinated deployment."
+      ]
+    },
+    {
+      "id": "stopped-peer-receipt-close-20261001",
+      "live_follow_up": {
+        "source": "fdbb i-p1/d23/b23-apply-result.json; exact original lines read back",
+        "receipt_recorded_at": "2026-10-01T18:21:57+08:00",
+        "api_build": "341dc110",
+        "operator_executions": 1,
+        "exit_code": 0,
+        "job_state": "cancelled",
+        "result_forwarded": true,
+        "original_message_consumed": true,
+        "provider_stop_claimed": false,
+        "sdk_result_created": false,
+        "new_work_dispatched_by_script": false,
+        "receipt_sha256": "35e831723d5e5a5e40abcd5fd66b60670a4033d0fc20c03c57a22ce93443aa10",
+        "later_queued": {
+          "receipt_sha256": "22188330c506eb4c3502fa236b07d4619346e4de87511c379c5a8d6a37bee108",
+          "deadlines_elapsed": true,
+          "receiver_jobs_exist": false,
+          "action": "preserve unchanged; no replay, new ID, deadline extension or legacy-code change"
+        }
+      },
+      "merge": {
+        "pr": 314,
+        "commit": "172df7379fbe1f7cb537dfc4827ca30c4734146b",
+        "head": "878225ca48b0568b9d1e5e552ebca7ceaa6022d5",
+        "merged_at": "2026-10-01T17:35:21+08:00",
+        "live_receipt_status": "awaiting_deployment_workstream"
+      },
+      "tested_commit": "dadfc7b415e47124874d83046db50ecd549f4f05",
+      "post_review_integration": {
+        "main_commit": "0592b4352054d3ad1c3035d29c00685024e57923",
+        "tested_commit": "2508b7f2d5c5b71b107124f16543b81b6428b092",
+        "passed": 1, "failed": 0, "seconds": 13.305,
+        "code_and_tests_unchanged": true,
+        "ref": "b23-closure-main-0592.xml",
+        "sha256": "fce6d7d981ce770bf8ad7bd579a6aeeafca7574b2d56b85384231a7c65b2926b"
+      },
+      "main_integration": {
+        "main_commit": "7d9dd97aa46bfef0a486788dbedf3792cc338c6b",
+        "tested_commit": "08d860f65ccd25b2837e3baf258998f8fb2d8ac3",
+        "passed": 1, "failed": 0, "seconds": 13.672,
+        "ref": "b23-closure-main-7d9.xml",
+        "sha256": "310e3b070c7f2824fdd15f25649922c46cac10c316e4467429598dea8d42139f",
+        "scope": "unclaimed fence with an already ended later A turn"
+      },
+      "targets": ["CAP-02"],
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "retained_stop_or_unclaimed_fence_to_blocked_queue_receipt",
+      "final_targeted": {
+        "passed": 6, "failed": 0, "errors": 0, "skipped": 0, "seconds": 40.268,
+        "ref": "b23-closure-final.xml",
+        "sha256": "bb189fc31fff2f3966eba19ace5dd193d2f55814929f2884d8d0d09a45fa1de5"
+      },
+      "operator_function": {
+        "passed": 1, "failed": 0, "seconds": 11.290,
+        "ref": "b23-operator-local-green.xml",
+        "sha256": "afaa72132285b7fdf13672aec65aceddbebf74a04d296dc8bbea3eae7a057ff4",
+        "live_cli_executed": false,
+        "script": "b23_close_unclaimed.py",
+        "script_sha256": "4aa7be8e3bab1e4cf4e21d57eda779744b008599fd5d336a86a0e3e4fb25bef1",
+        "reviewed_script_sha256": "f078fbe1cdbb298751c5bd12c305d863c4fbce34d23922a9e8c1c6c09251d6a3",
+        "script_delta": "Only main's unused azure-core placeholder was replaced with httpx invocation transports; close_original and its preconditions/writes/readback are unchanged. Session APIs are not called rather than intercepted.",
+        "read_script": "b23_read_original_state.py",
+        "read_script_sha256": "a3532375b27707cf3aa8be3dc3cd046f538a01364f824f863bc43ace352ae5b9"
+      },
+      "red": {
+        "failed": 1, "ref": "b23-stopped-receiver-red2.xml",
+        "cause": "verified stopped peer has no SDK result, so forwarding fails with OPERATION_RECORD_MISSING",
+        "sha256": "4685d1e0bed2dc167fbdce97599d6ef5af144e34c9e73f5b051f96ae8a1ae9e3"
+      },
+      "earlier_targeted": {
+        "passed": 14, "failed": 2, "ref": "b23-stopped-receiver-targeted.xml",
+        "cause": "unclaimed recovery reader only recognized a version-refusal result; fixed before final qualification",
+        "sha256": "da69d971f84cdd73f65845c56cd89703a0fbf2ebab5130526229752691e7e9c6"
+      },
+      "selectors": [
+        "tests\\shared_context\\test_peer_stopped_receiver.py",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_b_version_refusal_before_sdk_returns_the_verified_worker_failure",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_cancel_after_enqueue_but_before_start_keeps_a_verified_no_sdk_result"
+      ],
+      "review": {
+        "model": "claude-opus-5.5",
+        "head": "37b8e67096b07d5b481706c71047fcd1389158b8",
+        "base": "7d9dd97aa46bfef0a486788dbedf3792cc338c6b",
+        "standards": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-000000000040"},
+        "spec": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-000000000041"},
+        "operator_delta": {"axis": "spec", "p1": 0, "p2": 0,
+          "sha256": "f078fbe1cdbb298751c5bd12c305d863c4fbce34d23922a9e8c1c6c09251d6a3"}
+      },
+      "live_write_scope_approved": "only the original B23 unclaimed work after review and readback match",
+      "live_write_executed": false,
+      "official_sources": [
+        "https://learn.microsoft.com/azure/foundry/agents/how-to/manage-hosted-agent",
+        "https://learn.microsoft.com/rest/api/storageservices/performing-entity-group-transactions"
+      ],
+      "limitations": [
+        "Synthetic native/worker/message transports, no SDK/model/Azure execution in these tests.",
+        "This is a legacy-data receipt adapter, not a new inbox or scheduler and not a reason to retain FA authority in the native-first design.",
+        "Unclaimed fencing proves that this FA execution cannot start; it does not claim provider compute stopped.",
+        "Later queued work follows original rules, including retiring it when its A turn already ended.",
+        "Deploy the matching writer/reader build before the approved scoped live closure; never replay the old work."
+      ]
+    },
+    {
+      "id": "b23-peer-origin-reuse-20261001",
+      "merge": {
+        "pr": 294,
+        "commit": "104edef88d727e868759ac0b534df572ec2a517f",
+        "head": "5322dd00c0021cbfbf7ecb9ed363a850e162bfcd",
+        "merged_at": "2026-10-01T15:11:29+08:00",
+        "mode": "normal_merge_after_clean",
+        "deployed_by_this_workstream": false
+      },
+      "baseline_commit": "edae6d28d028a4e8e88f7e6aceab61d7553772d8",
+      "tested_commit": "c988bf01659f0bb632d426521bca7a774fe2b39c",
+      "targets": ["CAP-02"],
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "same_process_root_origin_to_first_peer_claim",
+      "passed": 19, "failed": 0, "errors": 0, "skipped": 0,
+      "pytest_seconds": 25.005,
+      "inventory_reads_in_first_claim": 0,
+      "claim_state": "fresh",
+      "post_review_integration": {
+        "main_commit": "09fe8e056869acf579cf9c326270933837cc4bf6",
+        "tested_commit": "404bdb44f9cdaec96545cb8406240e1514867f2a",
+        "passed": 2, "failed": 0, "errors": 0, "skipped": 0,
+        "seconds": 6.940,
+        "code_and_tests_unchanged": true,
+        "ref": "b23-origin-main-09fe.xml",
+        "sha256": "5dcaf953fab03016ebb61d812d5b2f33134d83d97e72057e714dc9c231440d49",
+        "scope": "first signed B claim and full root revalidation"
+      },
+      "main_integration": {
+        "main_commit": "e0ece8062c645b7a4b5936eac2f361b0f038394f",
+        "tested_commit": "d120715231dc9ec656617e668c646f1e65f2818c",
+        "passed": 1, "failed": 0, "errors": 0, "skipped": 0,
+        "seconds": 7.594,
+        "ref": "b23-origin-main-e0ec.xml",
+        "sha256": "0db796e3ea36ec3b65fb85516b6d417b47ba7056397b00202d2ef2ad4f4871c2",
+        "selector": "tests\\shared_context\\test_peer_installation_origin.py::test_first_signed_peer_claim_uses_the_validated_origin_without_inventory"
+      },
+      "timeout_changed": false,
+      "retry_added": false,
+      "review": {
+        "model": "claude-opus-5.5",
+        "head": "029dc84bcb598c6141a1a670e4f1729dffa8109e",
+        "base": "e0ece8062c645b7a4b5936eac2f361b0f038394f",
+        "standards": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-000000000042"},
+        "spec": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-000000000043"},
+        "additional_targeted_check": "Standards reran the original peer-app read-failure/rebuild test: 1 passed."
+      },
+      "selectors": [
+        "tests\\shared_context\\test_peer_installation_origin.py",
+        "tests\\shared_context\\test_agent_runtime_routing.py",
+        "tests\\shared_context\\test_behavior_server.py::test_missing_evidence_plain_startup_never_initializes_anything",
+        "tests\\shared_context\\test_behavior_server.py::test_external_catalog_cannot_replace_missing_own_application_authority_probe",
+        "tests\\shared_context\\test_behavior_server.py::test_bootstrap_probes_own_binding_with_two_clients_and_retained_atomic_readback"
+      ],
+      "evidence": [
+        {"ref": "b23-origin-qualified.xml", "kind": "junit",
+         "sha256": "7fdaac342eefa150d062fc6a02e38e9237a6c53708c61065c43d347ef590fc5f"}
+      ],
+      "red_evidence": [
+        {"ref": "b23-origin-red.xml", "failed": 1, "inventory_reads_in_first_claim": 1,
+         "sha256": "96abb3d7205a2b5dda16251e7270f8d0be94a0804358e50a9324520d153839c6"}
+      ],
+      "base_fixture_comparison": {
+        "commit": "edae6d28d028a4e8e88f7e6aceab61d7553772d8",
+        "failed": 1, "ref": "b23-base-startup-read.xml",
+        "sha256": "64f66a338ad6b73b9b0bdebba249ded3420e256ea434a9af2a7522018a474379",
+        "finding": "missing-evidence startup already performs one GET; only the no-write fixture assertion was corrected"
+      },
+      "limitations": [
+        "Root installation genuinely verifies the genesis before the existing fixture adds synthetic standing-history rows.",
+        "The B path uses real application, fence, atomic probe, policy/target and signed claim logic with offline storage/platform I/O.",
+        "Synthetic predecessor handoff hashes do not provide a complete standing-history golden qualification.",
+        "A separate historical golden fixture could not collect because test_channel_window is absent; no environment was rebuilt.",
+        "This is not proof that B23's exact boot failure caused the observed cache miss, not a live rerun, and not business completion.",
+        "The original failed or unknown B execution is not retried, reset, cancelled or reclassified."
+      ]
+    },
+    {
+      "id": "cap02-human-cap-feedback-20261001",
+      "deployment_report": {
+        "source": "fdbb workstream report",
+        "reported_build": "0cbe40a4135a81c2ffd16ee46972cc634f2fef78",
+        "fix_ancestry_verified": true,
+        "collaboration_reselected_minute": "2026-10-01T15:06+08:00",
+        "model_requests_observed": 12,
+        "ninth_request_blocked": false,
+        "original_trace_independently_read": false,
+        "b23_origin_fix_deployed": false
+      },
+      "merge": {
+        "pr": 289,
+        "commit": "edae6d28d028a4e8e88f7e6aceab61d7553772d8",
+        "head": "8b633769b4d4530508e8c5d35fbbe0ae1cd3c98a",
+        "merged_at": "2026-10-01T14:10:29+08:00",
+        "mode": "normal_merge_after_clean",
+        "deployed_by_this_workstream": false
+      },
+      "baseline_commit": "48223e994d57c415dd8624c08b36a4308097e1b4",
+      "tested_commit": "200f0a80abe2dd4faa43629e821475ff735f57e8",
+      "targets": ["CAP-02"],
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "remove_shared_model_cap_and_preserve_confirmed_message_status",
+      "python": {"passed": 134, "failed": 0, "errors": 0, "skipped": 0, "seconds": 92.121,
+        "ref": "peer-urgent-targeted.xml",
+        "sha256": "4939fb14e9f13f7ad917133161180f0a327e83e983e8955a264676858b7bcf9b"},
+      "ui": {"passed": 14, "failed": 0, "errors": 0,
+        "ref": "peer-urgent-ui.xml",
+        "sha256": "037c976ffb33d89794e901c3e3deb04e3d597aa2ad8d96825e2f1e078cb2b465"},
+      "shared_model_limit_removed": true,
+      "main_integration": {
+        "main_commit": "3a66a3e66a0a2c838034e21b417822d492fa7967",
+        "tested_commit": "cc88b45fb603baa5f16747d0c66b6e18eb19458a",
+        "passed": 7, "failed": 0, "errors": 0, "skipped": 0,
+        "seconds": 26.827,
+        "ref": "peer-urgent-main-3a66.xml",
+        "sha256": "8615f34ebc604258eeefb54cbd85b9920b4bf40074977e23173779171d278fc4",
+        "scope": "human and B ninth requests, deadline code, both native peer feedback protocols, and two signed progress/bridge cases"
+      },
+      "message_and_hop_limits_preserved": true,
+      "peer_turn_model_limit": 100,
+      "original_live_requests_resent": false,
+      "review": {
+        "model": "claude-opus-5.5",
+        "head": "d421888a38097639cf38dd9a5bdda9ce1cdbd45a",
+        "base": "3a66a3e66a0a2c838034e21b417822d492fa7967",
+        "standards": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-000000000044"},
+        "spec": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-000000000045"},
+        "additional_test_suites": false
+      },
+      "selectors": [
+        "tests\\shared_context\\test_agent_message_tools.py",
+        "tests\\shared_context\\test_instruction_progress.py",
+        "tests\\shared_context\\test_model_call_limit.py",
+        "tests\\shared_context\\test_agent_message_api.py::test_selected_collaboration_without_handoff_allows_the_ninth_human_model_request",
+        "tests\\shared_context\\test_agent_message_api.py::test_original_signed_assignment_records_one_handoff_and_replays_only_its_receipt",
+        "tests\\shared_context\\test_agent_message_api.py::test_exhausted_message_allowance_does_not_reserve_the_receiver_conversation",
+        "tests\\shared_context\\test_agent_message_api.py::test_rejected_send_preserves_a_safe_reason_from_api_through_hosted_without_recording_private_values",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_a_and_b_model_requests_are_not_capped_by_the_old_shared_eight",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_peer_deadline_refusal_keeps_its_code_through_hosted",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_model_limit_finishes_the_original_peer_and_returns_one_explicit_blocked_notice",
+        "tests\\shared_context\\test_behavior_agent_messages.py::test_root_allowance_reserves_the_one_original_result_instead_of_losing_it_to_fyi",
+        "tests\\shared_context\\test_behavior_agent_messages.py::test_transport_receipt_is_late_readback_not_another_hop_or_model_turn",
+        "tests\\shared_context\\test_tool_progress_correlation.py::test_fixed_failure_code_survives_signed_progress_and_thin_client",
+        "tests\\shared_context\\test_tool_progress_correlation.py::test_signed_progress_and_thin_client_preserve_pairs_without_new_authority",
+        "tests\\shared_context\\test_tool_progress_correlation.py::test_capability_tool_calls_are_public_with_the_stored_name_format"
+      ],
+      "ui_selector": "node --test --test-name-pattern='inline processing|verified model limit failure|wrong-work or malformed cancellation' tests\\shared_context\\test_web_test_console_workbench.cjs",
+      "red_evidence": [
+        {"ref": "peer-human-nine-red.xml", "failed": 1,
+         "cause": "the ninth human model reservation without any handoff returns 429",
+         "sha256": "9e7ad0358e49479e189082e8257f11e6ead26425d2c64b2d5d15e6eb7aa3e91d"},
+        {"ref": "peer-accepted-feedback-red.xml", "failed": 3,
+         "cause": "accepted unknown/read-timeout/deadline failures lack accepted-result status",
+         "sha256": "5ce1b8b17c62cf5d6d18b4439dcc06f0879cd47005d0fcfdef98dfcb366fe145"},
+        {"ref": "peer-limit-public-red.xml", "failed": 1,
+         "cause": "the known model call limit does not reach public progress",
+         "sha256": "3da6b456bb3f75a05dfd984fce30390fc15cbf2978fb2616493f13ad531b018b"}
+      ],
+      "limitations": [
+        "Includes real pinned local SDK/runtime with scripted Chat Completions and Responses, plus SDK/platform/storage I/O doubles; no paid model or Azure run.",
+        "The original failed/unknown live turns are unchanged and are not resent.",
+        "B23 claim timeout and peer inventory revalidation are a separate follow-up; no timeout increase or retry was added.",
+        "The current two-hop/eight-message/one-handoff and per-peer-turn 100 model guards remain.",
+        "This is not completion of the new T5 ticket-based relay or full Target State acceptance."
+      ]
+    },
+    {
+      "id": "t5-peer-model-call-limit-20261001",
+      "baseline_commit": "5053fd3c35438d94e09036fbe7a09b99e229935d",
+      "tested_commit": "ec1653274695d986311e06f4e71d8d7c137bce1b",
+      "targets": ["CAP-02"],
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "per_turn_model_gateway_and_peer_failure_receipts",
+      "passed": 37, "failed": 0, "errors": 0, "skipped": 0,
+      "pytest_seconds": 66.628,
+      "native_sdk_cases": 5,
+      "sdk_version": "1.0.13",
+      "runtime_version": "1.0.83",
+      "peer_model_call_limit": 100,
+      "human_instruction_limit_added": false,
+      "old_peer_limit_preserved": true,
+      "b_ticket_producer_integrated": false,
+      "review": {
+        "model": "claude-opus-5.5",
+        "head": "25be1558a31d30b7925350b1180cc823380c80e1",
+        "base": "5053fd3c35438d94e09036fbe7a09b99e229935d",
+        "standards": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-000000000046"},
+        "spec": {"p1": 0, "p2": 0, "agent_id": "00000000-0000-0000-0000-000000000047"},
+        "additional_tests_run": false
+      },
+      "main_integration": {
+        "main_commit": "df013f70d5bf3141e9414b511b27d93b293542b7",
+        "tested_commit": "69f21bdaaa04ba6fe4ba6651c31a0c74c1ca2191",
+        "tested_tree": "607794ea488fbd8d186f15fb7e2badbf6cb00832",
+        "passed": 6, "failed": 0, "errors": 0, "skipped": 0,
+        "pytest_seconds": 27.995,
+        "reviewed_core_and_tests_unchanged": true,
+        "ref": "t5-limit-main-df013.xml",
+        "sha256": "7f22eddaa7544b58ba74213bb69b4e70cf332bd630eb373e14e499c28977efca",
+        "selectors": [
+          "tests\\shared_context\\test_model_call_limit.py::test_per_turn_limit_counts_actual_model_sends[stricter-caller-limit]",
+          "tests\\shared_context\\test_agent_message_continuation.py::test_model_limit_finishes_the_original_peer_and_returns_one_explicit_blocked_notice",
+          "tests\\shared_context\\test_agent_message_continuation.py::test_a_and_b_share_eight_original_model_requests_with_one_final_slot_for_a",
+          "tests\\shared_context\\test_agent_message_api.py::test_original_signed_assignment_records_one_handoff_and_replays_only_its_receipt",
+          "tests\\shared_context\\test_instruction_prompt.py::test_human_turn_cannot_report_the_peer_only_model_limit"
+        ]
+      },
+      "merge_readback": {
+        "pr": 279,
+        "commit": "48223e994d57c415dd8624c08b36a4308097e1b4",
+        "head": "d1379653b1a2207d367819ad3607ce53c0965d49",
+        "base": "30c2c02ed33a9c9c967a665e23fb8040c135b4b2",
+        "merged_at": "2026-10-01T12:45:34+08:00",
+        "kind": "normal_merge_after_clean",
+        "model_limit_code_unchanged": true,
+        "follow_up": {
+          "reason": "main admitted CAP-06 PR3a identity lookup immediately before the final merge",
+          "passed": 1, "failed": 0, "errors": 0, "skipped": 0,
+          "pytest_seconds": 9.238,
+          "selector": "tests\\shared_context\\test_agent_message_continuation.py::test_model_limit_finishes_the_original_peer_and_returns_one_explicit_blocked_notice",
+          "ref": "t5-limit-merged-48223.xml",
+          "sha256": "fde8cb2243423746d643629fafe8e5a006d44cb6203f675c4844b8f52bebe0dd"
+        }
+      },
+      "selectors": [
+        "tests\\shared_context\\test_model_call_limit.py",
+        "tests\\shared_context\\test_m2_copilot_exception_binding.py",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_model_limit_finishes_the_original_peer_and_returns_one_explicit_blocked_notice",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_a_and_b_share_eight_original_model_requests_with_one_final_slot_for_a",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_saved_b_result_returns_to_the_original_a_work_without_fulfilling_the_human",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_cancel_after_enqueue_but_before_start_keeps_a_verified_no_sdk_result",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_lost_result_response_reconciles_the_same_message_without_reexecuting_b",
+        "tests\\shared_context\\test_instruction_prompt.py::test_human_turn_cannot_report_the_peer_only_model_limit",
+        "tests\\shared_context\\test_instruction_prompt.py::test_failed_turn_retains_configuration_metadata_without_claiming_model_execution",
+        "tests\\shared_context\\test_instruction_flow.py::test_failed_instruction_has_failure_delivery_not_a_nonexistent_text_reply",
+        "tests\\shared_context\\test_delegation_model_schema.py"
+      ],
+      "evidence": [
+        {"ref": "t5-model-limit-ec165327.xml", "kind": "junit",
+         "sha256": "bab0a4427cfd7595f9e1ac7b6966500658de962570c4b0efe7699b66e0ed1baa"}
+      ],
+      "red_evidence": [
+        {"ref": "t5-model-limit-red.xml", "failed": 1,
+         "cause": "run_copilot lacked the trusted caller model_call_limit input",
+         "sha256": "fa0b410e03013380bf9af8b83ae51e03c888fbd119c608d67bc621373e2215d2"},
+        {"ref": "t5-limit-save-red.xml", "failed": 1,
+         "cause": "the saved peer model-limit failure was rejected with HTTP 422",
+         "sha256": "760ec8cdcd7cca4d8ff1257d60d22656b5f9cae4b8b1811edebf14f3914f0427"}
+      ],
+      "earlier_regression_run": {
+        "passed": 33, "failed": 4, "errors": 0,
+        "ref": "t5-model-limit-final.xml",
+        "sha256": "d4d07cf38a9a47c36329a2e8d8df08e70267761e2ff22f41639972efd3cc311e",
+        "base_comparison": {
+          "commit": "5053fd3c35438d94e09036fbe7a09b99e229935d",
+          "passed": 1, "failed": 3,
+          "ref": "t5-model-limit-base-comparison.xml",
+          "sha256": "e8c2b4fe8258db85740408fbf88c054562619a0286f35059661c86c93b8bfcf7",
+          "finding": "the same Hosted fixture task omission and string-vs-URL fixture errors reproduce on main"
+        },
+        "targeted_correction": {
+          "passed": 5, "failed": 0,
+          "ref": "t5-limit-fixture-correction.xml",
+          "sha256": "0c00238528a0319e711e040edd326c46b327b053c1639dfb6ae24d1df6da529b"
+        }
+      },
+      "limitations": [
+        "Five cases execute the pinned local SDK/runtime against scripted offline model HTTP responses, not a paid model or Hosted VM.",
+        "Other cases use SDK/platform/storage I/O doubles or validate inputs without starting the SDK.",
+        "The existing aggregate-eight peer model and message protections remain; this does not enable the new T5 relay or T4 direct model path.",
+        "A confirmed model limit never substitutes for actual SDK stop or saved-result receipts.",
+        "No live, cloud, package installation, routine schedule, quality evaluation or full Target State acceptance is claimed."
+      ]
+    },
+    {
+      "id": "cap02-original-archive-diagnosis-20261001",
+      "observed_at": "2026-10-01T08:32:54+08:00",
+      "reader_commit": "fec04a8e16ea2b7c90b56440e97f08932ebc0ed4",
+      "targets": ["CAP-02"],
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "read_only_original_archive_and_recipient_diagnosis",
+      "original_live_outcome": "failed",
+      "archive_sha256": "72996c3a9db353fefb6b9d6bffa9dc5cff80b510f7e7054ec07b712e08ba1d7d",
+      "archive_bytes": 17609,
+      "archive_verified": true,
+      "distinct_tool_calls": 1,
+      "observed_recipient": "B",
+      "recipient_matches_server_agent_id": false,
+      "observed_kind": "request",
+      "kind_supported": true,
+      "reader_issue": "diagnostic_import_shadowing",
+      "product_reader_changed": false,
+      "original_rejection_code_recovered": false,
+      "registry_read": false,
+      "original_turn_resent": false,
+      "new_live_success_claimed": false,
+      "evidence": [
+        {"ref": "cap02-live-send-diagnosis-20261001.json", "kind": "sanitized_diagnostic",
+         "sha256": "a6ed1ed52c4240111334176a64354a71dfdfc56bb12d6f8fd26126e3a8fc83b4"}
+      ],
+      "limitations": [
+        "The operator's /tmp script imported old /opt/fa-checkout code; PYTHONPATH=/app selected the actual API code.",
+        "The actual API module hashes matched the fixed reader commit and accepted the original TurnArchive.",
+        "The original tool arguments identify the invalid B alias, but the original API refusal code was not retained.",
+        "This read-only diagnosis is not a new successful CAP-02 live turn or a full history/resume/console requalification."
+      ]
+    },
+    {
+      "id": "wake05-owner-producer-20261001",
+      "baseline_commit": "45f87d103012d0890a23f7ec79196424da146108",
+      "tested_commit": "50433c485351aedac802c5cd7524b0bce391f05f",
+      "targets": ["WAKE-01", "WAKE-02", "WAKE-05"],
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "disabled_owner_daily_occurrence_to_original_admission_and_receipt",
+      "passed": 61, "failed": 0, "errors": 0, "skipped": 0,
+      "pytest_seconds": 53.819,
+      "main_integration": {
+        "main_commit": "fec04a8e16ea2b7c90b56440e97f08932ebc0ed4",
+        "tested_commit": "cfa78c5515dbb185ce799cd004d347fef801826d",
+        "tested_tree": "5694471dc5c9e6bac67d8d906c9e082089e55096",
+        "passed": 61, "failed": 0, "errors": 0, "skipped": 0,
+        "pytest_seconds": 55.444,
+        "evidence": "wake05-main-fec04.xml",
+        "evidence_sha256": "5770f791f60f311a3029268b20a33a10483d4200599e78c73e279d886fa3b2b2"
+      },
+      "product_changed": true,
+      "enabled_by_default": false,
+      "selectors": [
+        "tests\\shared_context\\test_routine_producer.py",
+        "tests\\shared_context\\test_routine_native.py",
+        "tests\\shared_context\\test_instruction_turn_origin.py",
+        "tests\\shared_context\\test_work_policy_submit_compatibility.py"
+      ],
+      "evidence": [
+        {"ref": "wake05-fixed-50433c48.xml", "kind": "test_report",
+         "sha256": "821a5c10dc2d88583ce3e572c9b7d6fa343d721679380c7879adf54b28c3cd9f"}
+      ],
+      "red_evidence": [
+        {"ref": "wake05-disabled-route-red.xml", "symptom": "missing owner route",
+         "sha256": "ba3b67bc31e392c489dd3d44cf1c03d4df755bac304ee91449403f1fd7fc5850"},
+        {"ref": "wake05-definition-red.xml", "symptom": "routine definition not represented",
+         "sha256": "b3ededafe5a7c9e09a9d01fab1609ad02a43f06a1298742fd9720e31c73aac10"},
+        {"ref": "wake05-admission-red.xml", "symptom": "approved due occurrence cannot enter the queue",
+         "sha256": "08dce532be9b40501e0263a4f31a307114ee762fa6d624be7111c6e4f1b98eb5"},
+        {"ref": "wake05-origin-source-red.xml", "symptom": "routine misreported as human",
+         "sha256": "2c2ac62025db08b24bfab8dcffbf5d259c93333591afb5979898df039ffa6643"},
+        {"ref": "wake05-reconcile-red.xml", "symptom": "original occurrence has no read-only reconciliation route",
+         "sha256": "a20c9ee3c929cc24caf8c82ba9f7e9ba4e15e9e91c7577bfc4dd38083af0f325"}
+      ],
+      "review": {
+        "model": "claude-opus-5.5",
+        "initial_head": "f4b7de0e4dffdcfcafed433c74aff24659e73233",
+        "standards_initial": {"p1": 0, "p2": 1},
+        "spec_initial": {"p1": 0, "p2": 1},
+        "fix_commit": "b281300d339ccb309745e5bb249bd4a45945024e",
+        "delta_review": "cleared_original_axes",
+        "reviewed_delta_head": "b281300d339ccb309745e5bb249bd4a45945024e",
+        "standards_final": {"p1": 0, "p2": 0, "reviewer_selected_passed": 5},
+        "spec_final": {"p1": 0, "p2": 0, "reviewer_selected_passed": 13}
+      },
+      "review_fix_validation": {
+        "tested_commit": "b281300d339ccb309745e5bb249bd4a45945024e",
+        "passed": 67, "failed": 0, "errors": 0, "skipped": 0,
+        "pytest_seconds": 257.157,
+        "evidence": "wake05-fixed-p2-b281300d.xml",
+        "evidence_sha256": "0f0bffcff09a60603e6d7cd8fc439178e7c8325e2bf0af8df8c5416d8d77a19d",
+        "red_evidence": [
+          {"ref": "wake05-standard-source-red.xml", "axis": "standards",
+           "sha256": "ef9dd6e779e18d541bf1bfdaf9950c409939a6dc95df3b1c438b085debbdb89f"},
+          {"ref": "wake05-spec-partial-red.xml", "axis": "spec",
+           "sha256": "f39a817484bb5bdd198bd907e747030cfebf1b2c5e85e3a7f0db3664faf09477"}
+        ]
+      },
+      "final_main_integration": {
+        "main_commit": "43115cf7d5a2d757e293cce35a78195d3071f629",
+        "tested_commit": "0315fc9a4056053611a14f4c3605428144483c1b",
+        "tested_tree": "030088e98543e473f73aede26a8905bd3aa67f84",
+        "routine_product_and_test_blobs_changed": false,
+        "passed": 29, "failed": 0, "errors": 0, "skipped": 0,
+        "pytest_seconds": 157.966,
+        "evidence": "wake05-main-final-43115.xml",
+        "evidence_sha256": "4e17e753ecec2ef86ab2cb4fa81ff4404d02759e8edefcab05902e28052afc08"
+      },
+      "copilot_runtime_execution": "not_run",
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "human_review": null,
+      "limitations": [
+        "Only an authenticated owner and fixed daily local time are supported; no timer, cron, CRUD or machine trigger was created.",
+        "Native-mode startup records and runtime reconstruction use synthetic storage/platform I/O, not a Hosted process restart.",
+        "An ordinary concurrent 412 is reconciled using the original receipt; no retry or another state machine was added.",
+        "Runtime path, request ID, revocation route, bound-inbox and event-loop setup corrections are fixture issues, not product REDs.",
+        "IANA data was missing in the existing Windows environment; only pinned API tzdata was added.",
+        "No B2 percentage, 76-target ledger, CAP-02 original FAIL, or original cloud conversation was changed.",
+        "Live schedule activation requires separate explicit approval."
+      ]
+    },
+    {
+      "id": "wake-main-integration-20261001",
+      "original_run_id": "wake-saved-results-20261001",
+      "tested_commit": "9a0d9ad4753ba0486b4b20c7f8207c8527812366",
+      "tested_tree": "c60138d8cc4582353ff25b1712bee06fb8bc48a8",
+      "integrated_main_commit": "919f1899e99b5979c22823cfe788e7343f5dbbd2",
+      "recorded_at": "2026-10-01T05:42:28.334175+08:00",
+      "targets": ["WAKE-04", "WAKE-07"],
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "mechanical_main_integration_of_saved_result_regressions",
+      "passed": 12, "failed": 0, "errors": 0, "skipped": 0,
+      "pytest_seconds": 17.254,
+      "product_changed": false,
+      "test_logic_changed": false,
+      "selectors": [
+        "tests\\shared_context\\test_instruction_completion.py",
+        "tests\\shared_context\\test_instruction_observer_resume.py"
+      ],
+      "evidence": [
+        {"ref": "wake-saved-result-main-919f-20261001.xml", "kind": "test_report",
+         "sha256": "efd9be4da3846cdab460c765142fc526828d09091cf7072ca3559e75e8d53ee6"}
+      ],
+      "review": {
+        "model": "claude-opus-5.5", "axis": "standards",
+        "reviewed_commit": "c49e337b9b9529be18b55752cb2059db7c8b63d4",
+        "p1": 0, "p2": 0, "repeated": false,
+        "reuse_basis": "Observer regression file is byte-identical to the reviewed head; completion fixture is byte-identical to main, with the same work_policy=None keyword in a different position."
+      },
+      "copilot_runtime_execution": "not_run",
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "human_review": null,
+      "limitations": [
+        "This is a separate local integration run, not additional unique coverage or a performance comparison.",
+        "No product fix, routine producer, API-down wake timing, live model, Hosted or M/H acceptance is claimed.",
+        "The original CAP-02 live failure and archive-read investigation remain unresolved."
+      ]
+    },
+    {
+      "id": "wake-saved-results-20261001",
+      "baseline_commit": "fa10c71ee5201b738c1cab573fd71482aec4001c",
+      "targets": ["WAKE-04", "WAKE-07"],
+      "started_at": "2026-10-01T03:31:37.774378+08:00",
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "saved_result_before_ready_and_original_final_preparation_reconciliation",
+      "passed": 12, "failed": 0, "errors": 0, "skipped": 0,
+      "pytest_seconds": 39.017,
+      "new_regression_cases": 2,
+      "product_changed": false,
+      "product_red_to_green": false,
+      "selectors": [
+        "tests\\shared_context\\test_instruction_completion.py",
+        "tests\\shared_context\\test_instruction_observer_resume.py"
+      ],
+      "new_selectors": [
+        "tests\\shared_context\\test_instruction_observer_resume.py::test_ready_callback_can_observe_only_the_persisted_original_result",
+        "tests\\shared_context\\test_instruction_observer_resume.py::test_saved_result_repairs_missing_final_after_response_loss_without_running_work_again"
+      ],
+      "evidence": [
+        {"ref": "wake-saved-result-checked.xml", "kind": "test_report",
+         "sha256": "806d375f90a310ce67a633937d2e99c70ce9fe7fd48c2b9383390fad65681200"}
+      ],
+      "review": {
+        "model": "claude-opus-5.5", "axis": "standards",
+        "reviewed_commit": "c49e337b9b9529be18b55752cb2059db7c8b63d4",
+        "p1": 0, "p2": 0, "reviewer_rerun_passed": 4
+      },
+      "copilot_runtime_execution": "not_run",
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "human_review": null,
+      "limitations": [
+        "The new tests qualify existing behavior, not a product RED-to-green change.",
+        "Only the final preparation response loss is injected; it is not a live incident.",
+        "Native-mode metadata, signed API and original storage/readers use local I/O; no SDK process or model is started.",
+        "No API-down wake latency, general routine/connector producer, cross-channel repair counter or M/H acceptance claim.",
+        "Routine remains unimplemented; only the five-point minimal design is recorded.",
+        "No B2 percentage change and no new live/model probe requested."
+      ]
+    },
+    {
+      "id": "cap02-send-rejections-20261001",
+      "baseline_commit": "fa10c71ee5201b738c1cab573fd71482aec4001c",
+      "implementation_commit": "e6b97173926da9adce6687dd0f768ffad831852f",
+      "integrated_main_commit": "5b195899e831a0b50e4a6a90df23807efc8d93b6",
+      "tested_commit": "bfe0007d8e589690db03c5748644483f03b386ad",
+      "targets": ["CAP-02", "SP-04", "SP-08", "WAKE-01"],
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "original_assignment_recipient_and_sanitized_peer_failure_feedback",
+      "passed": 91, "failed": 0, "errors": 0, "skipped": 0,
+      "pytest_seconds": 137.56,
+      "sdk_version": "1.0.13",
+      "runtime_version": "1.0.83",
+      "review_delta": {
+        "review_head": "304c57b3b0691aadde71caed245f3775b09af620",
+        "standards_p1": 0, "standards_p2": 0, "spec_p1": 0, "spec_p2": 1,
+        "fix_commit": "fc77d7d9ae22c312bc66c9664655c3a9fb931943",
+        "scope": "只改API內部logger記原Problem.code；公開header／Hosted／模型的白名單不擴大。",
+        "red_failed": 2,
+        "red_evidence": "cap02-spec-log-red.xml",
+        "red_evidence_sha256": "bdba6f42eb0f1069edebd94bfb5f56f4a5769cc877965446654c6676440ffa02",
+        "passed": 7, "failed": 0, "errors": 0, "skipped": 0, "pytest_seconds": 17.55,
+        "selectors": [
+          "tests\\shared_context\\test_agent_message_api.py::test_b_registry_rejection_logs_original_code_before_masking_public_feedback",
+          "tests\\shared_context\\test_agent_message_api.py::test_rejected_send_preserves_a_safe_reason_from_api_through_hosted_without_recording_private_values",
+          "tests\\shared_context\\test_agent_message_tools.py::test_hosted_peer_refusal_codes_are_allowlisted_without_reading_error_bodies"
+        ],
+        "evidence": "cap02-spec-log-green.xml",
+        "evidence_sha256": "0c62890f6f1a7098e0a65365f36a9afae5839b2a08731fee1d3f19c839ccaf86",
+        "rereview_scope": "original Spec axis delta only"
+      },
+      "selectors": [
+        "tests\\shared_context\\test_agent_message_tools.py",
+        "tests\\shared_context\\test_agent_message_wire.py",
+        "tests\\shared_context\\test_instruction_tool_feedback.py",
+        "tests\\shared_context\\test_agent_message_api.py::test_original_signed_assignment_records_one_handoff_and_replays_only_its_receipt",
+        "tests\\shared_context\\test_agent_message_api.py::test_rejected_send_preserves_a_safe_reason_from_api_through_hosted_without_recording_private_values",
+        "tests\\shared_context\\test_agent_message_api.py::test_lost_send_response_is_recovered_by_read_without_client_reposting",
+        "tests\\shared_context\\test_agent_message_api.py::test_signed_handoff_uses_both_registered_source_readers_and_current_revocation",
+        "tests\\shared_context\\test_agent_message_api.py::test_root_references_cannot_expand_the_original_receiver_source_scope",
+        "tests\\shared_context\\test_agent_message_api.py::test_same_message_id_with_different_content_cannot_replace_the_original",
+        "tests\\shared_context\\test_agent_message_api.py::test_peer_message_requires_the_original_agent_ticket_and_binding",
+        "tests\\shared_context\\test_agent_message_api.py::test_selected_collaboration_caps_the_original_provider_intents_at_eight",
+        "tests\\shared_context\\test_agent_message_api.py::test_informational_message_silence_keeps_the_original_human_obligation",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_two_pinned_sdks_use_the_real_message_api_and_only_a_delivers_final",
+        "tests\\shared_context\\test_agent_runtime.py::test_peer_native_claim_saved_result_and_forward_stay_in_b_scope",
+        "tests\\shared_context\\test_instruction_responses_native.py::test_native_responses_tool_loop_carries_its_own_history_without_provider_storage"
+      ],
+      "evidence": [
+        {"ref": "cap02-send-main-integration.xml", "kind": "test_report",
+         "sha256": "4dd5e426766fe7c976ebb9af6ee7cd89aa5198830a29d507f4d8a8585f5e933d"},
+        {"ref": "cap02-tool-red.txt", "kind": "factory_red",
+         "sha256": "320c61ef8077c3a9588130e5e305495e678b36a6cb1f4edf9906ec7213c0c008"},
+        {"ref": "cap02-http-red.txt", "kind": "signed_api_red",
+         "sha256": "1b295720470e9a39632cd8cc6509d4e80d973dc8ab92070a81a8e2b3d9bfd069"},
+        {"ref": "cap02-recipient-red.txt", "kind": "recipient_schema_red",
+         "sha256": "41359eecf9676cdddaada19622b59d118fa01b3965ea6fd2be70a0641a0b97ab"},
+        {"ref": "cap02-model-feedback-red.txt", "kind": "fixed_sdk_feedback_red",
+         "sha256": "9ee4ae26a6de843e0684c62c91580ca1f5814ca8a1297098a099c75ccb19b082"}
+      ],
+      "original_live_observation": {
+        "outcome": "failed",
+        "root_cause_confirmed": false,
+        "a_model_requests": 2,
+        "send_tool_calls": 1,
+        "projected_message_count": 0,
+        "observation_reference": "cap02-live-send-fa10c71-observation-reference-20261001.json",
+        "observation_reference_sha256": "c94e9d8de0e3ca1d69768eaae1e2721834355bb0595bdd7d07e2f378193acce6",
+        "reader_scope": "本線只核父線去值索引，沒有重核其六份原件或Azure。",
+        "pending_fields": ["function_call.arguments.recipient_agent_id", "function_call.arguments.kind",
+                           "function_call.arguments.in_reply_to", "function_call.arguments.refs",
+                           "original_server_rejection_code", "original_b_registry"],
+        "follow_up_owner": "parent",
+        "blocks_this_fix_delivery": false
+      },
+      "earlier_setup_correction": {
+        "passed": 87, "errors": 1,
+        "reason": "測試誤把archive codec字串填作checkpoint profile；只改為現有model_provider設定，不改產品。",
+        "evidence": "cap02-send-targeted.xml",
+        "evidence_sha256": "6a240707554a02d04514f8bb4542ca5c3218570c3601d633739139fb1d896fbc",
+        "corrected_passed": 1,
+        "corrected_evidence": "cap02-v2-responses-corrected.xml",
+        "corrected_evidence_sha256": "75498e120d488d6dea7e3a826de49e5d13013e05f58129d32e414a19d5268536"
+      },
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "human_review": null,
+      "limitations": [
+        "SDK為真本機；Table、平台與模型provider I/O為合成替身，不代表真模型品質或live成功。",
+        "本機B登錄讀取通過，不代表原live當時的B registry已核清；未放寬原registered read。",
+        "空投影、空B log或timing returned不證明未寫入／未送達；unknown不改判為未執行。",
+        "原live失敗保留，原參數匹配前不斷言收件人名稱是根因。",
+        "沒有重試原RID、操作8765／Azure、改76項帳冊或恢復WAKE-04／07。"
+      ]
+    },
+    {
+      "id": "cap02-terminal-queue-20261001",
+      "baseline_commit": "9e2e104854b2a45bd35f62881cca32bda64b9b89",
+      "targets": ["CAP-02", "WAKE-03", "WAKE-06"],
+      "started_at": "2026-10-01T03:00:48.217424+08:00",
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "verified_terminal_peer_result_queue_progress",
+      "passed": 5, "failed": 0, "errors": 0, "skipped": 0,
+      "pytest_seconds": 79.016,
+      "selectors": [
+        "tests\\shared_context\\test_agent_message_continuation.py::test_saved_b_result_with_unavailable_refs_releases_only_a_blocked_notice",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_b_version_refusal_before_sdk_returns_the_verified_worker_failure",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_oversized_saved_b_result_is_retained_and_returns_an_explicit_blocked_notice",
+        "tests\\shared_context\\test_agent_message_continuation.py::test_lost_result_response_reconciles_the_same_message_without_reexecuting_b",
+        "tests\\shared_context\\test_conversation_transfer_startup.py::test_transfer_pending_ready_and_post_turn_are_readable_at_startup"
+      ],
+      "evidence": [
+        {"ref": "cap02-terminal-delta-regression.xml", "kind": "test_report",
+         "sha256": "057f883c6b07c81fa311a0a38c7a9ad1b84a22cffe51d55700041fbbdd929640"}
+      ],
+      "review": {
+        "model": "claude-opus-5.5", "axis": "standards",
+        "reviewed_commit": "55670ec9a1dff1970299ad14a31e08fa152ad212",
+        "p1": 0, "p2": 0, "scope": "terminal queue delta only; original two-axis clearance remains"
+      },
+      "main_integration": {
+        "main_commit": "48d89d8905a6dc573a9153acd80f41ab103bd40c",
+        "tested_commit": "c184f9311a105908a81ebb2816dc2d2498255353",
+        "cap02_logic_changed": false,
+        "passed": 3, "pytest_seconds": 75.628,
+        "evidence": "cap02-terminal-main-final.xml",
+        "evidence_sha256": "ff3ca5718d626340aa3101f4fbb9d6f22275b7d78445c5421e5f483413442401"
+      },
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "human_review": null,
+      "limitations": [
+        "Only already-verified terminal jobs can advance with a data-free blocked notice.",
+        "Unavailable reference notices retain the full saved result and do not bypass current work read permissions.",
+        "Pre-SDK version refusal uses the exact retained worker result, not a fabricated assistant result.",
+        "Unknown execution or globally revoked B access remains unresolved; this change does not release that work."
+      ]
+    },
+    {
+      "id": "cap02-second-review-fixes-20261001",
+      "baseline_commit": "b156341ea931502ad80397317bb8aa1bac53c1f5",
+      "integration_commit": "8ab239e041aa08cc552eaf53a6443c8c6368eacd",
+      "targets": ["CAP-02", "WAKE-03", "WAKE-06"],
+      "started_at": "2026-10-01T02:32:46.835896+08:00",
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "unclaimed_start_and_original_a_lifecycle_isolation",
+      "passed": 17, "failed": 0, "errors": 0, "skipped": 0, "deselected": 1,
+      "pytest_seconds": 236.254,
+      "selectors": ["tests\\shared_context\\test_agent_message_continuation.py"],
+      "filter": "not two_pinned",
+      "original_review": {"standards_p1": 2, "standards_p2": 0, "spec_p1": 1, "spec_p2": 0, "distinct_p1": 2},
+      "delta_review": {
+        "reviewed_commit": "513284ab7f43961fc6c36a9fe043d82d5fa8821c",
+        "model": "claude-opus-5.5",
+        "standards_p1": 0, "standards_p2": 0, "spec_p1": 0, "spec_p2": 0,
+        "scope": "Only the original findings in each axis"
+      },
+      "evidence": [
+        {"ref": "cap02-review-second-regression.xml", "kind": "test_report",
+         "sha256": "d9d7d42542ab3e493f8e67e5aafb3788bfb68e327e053eb3cb732b8126e46054"}
+      ],
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "human_review": null,
+      "limitations": [
+        "B errors are logged, not hidden as a successful peer result; only A's independent lifecycle proceeds through its original gates.",
+        "An unclaimed starting B remains starting rather than being marked unknown by a premature query.",
+        "No SDK or provider rerun in this regression batch; the paired SDK evidence remains a separate run.",
+        "This result is not review clearance, live acceptance or a progress-percentage change."
+      ]
+    },
+    {
+      "id": "cap02-queue-return-20261001",
+      "baseline_commit": "99c3d17bba88795438d2659a41bbe13706c663cb",
+      "tested_source": "baseline plus the second-slice queue, original SDK wait, result return and reader changes",
+      "targets": ["CAP-02", "WAKE-01", "WAKE-03", "WAKE-06"],
+      "started_at": "2026-10-01T01:42:49.746761+08:00",
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "two_registered_agents_original_queue_and_result_continuation",
+      "passed": 126,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "deselected": 2,
+      "pytest_seconds": 293.857,
+      "selectors": [
+        "tests\\shared_context\\test_agent_message_continuation.py",
+        "tests\\shared_context\\test_agent_message_api.py",
+        "tests\\shared_context\\test_agent_message_tools.py",
+        "tests\\shared_context\\test_agent_message_wire.py",
+        "tests\\shared_context\\test_behavior_agent_messages.py"
+      ],
+      "filter": "not pinned",
+      "native_follow_up": {
+        "passed": 2,
+        "pytest_seconds": 31.257,
+        "sdk": "1.0.13",
+        "runtime": "1.0.83",
+        "pair_sdk_processes": 2,
+        "pair_provider_requests": {"a": 2, "b": 1, "transport": "offline"},
+        "separate_single_tool_case": true,
+        "controllers": "production controller calls driven by the local test",
+        "platform": "offline transport and original native claim/report contracts"
+      },
+      "existing_behavior_follow_up": {"passed": 4, "pytest_seconds": 40.488},
+      "evidence": [
+        {"ref": "cap02-second-targeted.xml", "kind": "test_report",
+         "sha256": "10becabb449fa196864b115373fc58c57d2eba9c9000c7534906422096ac67d5"},
+        {"ref": "cap02-second-native-final.xml", "kind": "fixed_sdk_offline_report",
+         "sha256": "e0dd0e8fffd9fa8a435d66b5bed75f49614be7c932b5c391b4905e8efba40889"},
+        {"ref": "cap02-second-existing.xml", "kind": "existing_behavior_regression",
+         "sha256": "8b4f3713a22b6a6c3cd75508b933aae75adabc1b32949684cab1c9944fed91fa"}
+      ],
+      "review": {
+        "model": "claude-opus-5.5",
+        "initial_commit": "b156341ea931502ad80397317bb8aa1bac53c1f5",
+        "fix_commit": "513284ab7f43961fc6c36a9fe043d82d5fa8821c",
+        "standards_p1": 0, "standards_p2": 0, "spec_p1": 0, "spec_p2": 0,
+        "additional_delta": "cap02-terminal-queue-20261001"
+      },
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "semantic_quality": "not_evaluated",
+      "human_review": null,
+      "limitations": [
+        "The native pair uses two real pinned SDK processes but synthetic provider/platform I/O; it is not Hosted or model-quality evidence.",
+        "The single-tool SDK case is a separate test, not another sample from the paired root.",
+        "No live API outage or Hosted process-recovery qualification; original queue notifications, cold readers and same-ID reconciliation are exercised locally.",
+        "No B human obligation; internal completed receipts do not prove human delivery or read acknowledgment.",
+        "Original Scope, CAS, once-start, current references, SDK save/stop evidence and the shared CostLedger remain authoritative.",
+        "The 126-case batch predates only the explicit SDK prompt provenance label; the final native pair verifies that label.",
+        "No Azure, original 8765/journal modification, B2 percentage change or target acceptance promotion."
+      ]
+    },
+    {
+      "id": "cap02-pr1-review-fixes-20260930",
+      "baseline_commit": "22bff2df2405e525752c7bfa18aa869173cb820d",
+      "targets": ["CAP-02", "WAKE-01", "WAKE-03", "WAKE-06"],
+      "started_at": "2026-09-30T22:12:42.131977+08:00",
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "original_root_preflight_and_receipt_conflict_regressions",
+      "passed": 84,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "pytest_seconds": 607.373,
+      "selectors": [
+        "tests\\shared_context\\test_agent_message_api.py",
+        "tests\\shared_context\\test_agent_message_refs.py",
+        "tests\\shared_context\\test_behavior_agent_messages.py"
+      ],
+      "original_review": {
+        "standards_p1": 0, "standards_p2": 2,
+        "spec_p1": 0, "spec_p2": 1,
+        "delta_review": "completed"
+      },
+      "delta_review": {
+        "head": "24fd228e302325d20ea4e4604584f68c79d0e9fc",
+        "model": "claude-opus-5.5",
+        "standards_p1": 0, "standards_p2": 0,
+        "spec_p1": 0, "spec_p2": 0,
+        "scope": "Only the findings raised by each original axis; Standards result recovered in a narrow same-model review after the original agent was unavailable"
+      },
+      "main_integration": {
+        "main_commit": "cf63ba9e7a7beb55e824fd25be06d368674d55fb",
+        "cap02_code_changed": false,
+        "passed": 2,
+        "execution": "two separate single-case runs",
+        "earlier_memory_error_attribution": "unverified; unchanged single-case reruns passed"
+      },
+      "evidence": [
+        {"ref": "cap02-review-targeted.xml", "kind": "test_report",
+         "sha256": "9f6d6dca1261f07acf72266bdeafbd1437c12cda461bbce46bab424c518eae10"},
+        {"ref": "cap02-final-main-a.xml", "kind": "main_integration_report",
+         "sha256": "cd57da2c0eb25f0956a43e6ce1b165100e1bfb70b3f4b7ffb8c4d3b7ebefb0cb"},
+        {"ref": "cap02-final-main-refs.xml", "kind": "main_integration_report",
+         "sha256": "34e6a3fe44540e7d677d3bbd96e37d5202271acf8a61139b7f9c36f3419a37a8"}
+      ],
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "semantic_quality": "not_evaluated",
+      "human_review": null,
+      "limitations": [
+        "Pure preflight can only reject; the registered receiver's current read gate still runs after registration.",
+        "Only exact 412 BEHAVIOR_CONFLICT retries the same local ledger request; unknown outcomes, HTTP tools and model calls are not resent.",
+        "A retained receiver registration is immutable and may reconcile only its original ID and bytes, not a replacement message.",
+        "Terminal revocation or expiry after registration retains metadata; without an accepted message it does not make the receiver busy.",
+        "This is PR1 producer/read coverage, not B dispatch, A continuation, full CAP-02 acceptance or live evidence."
+      ]
+    },
+    {
+      "id": "cap02-api-producer-20260930",
+      "baseline_commit": "51ad9ed165b42a8607ef25bfb1c7941979e5da58",
+      "tested_source": "wire and delegated tool commits through 90e194c plus the API/receiver-registration integration in this change",
+      "targets": ["CAP-02", "WAKE-01", "WAKE-03", "WAKE-06"],
+      "started_at": "2026-09-30T21:06:06.852570+08:00",
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "trusted_api_producer_and_unpaid_receiver_registration_subset",
+      "passed": 51,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "deselected": 1,
+      "pytest_seconds": 211.366,
+      "post_run_delta": {
+        "scope": "A receiver registration without a worker job remains busy instead of rejecting the new handoff",
+        "passed": 2,
+        "failed": 0,
+        "errors": 0,
+        "pytest_seconds": 13.834,
+        "not_additive_to_primary_case_count": true
+      },
+      "selectors": [
+        "tests\\shared_context\\test_agent_message_api.py",
+        "tests\\shared_context\\test_agent_message_wire.py",
+        "tests\\shared_context\\test_agent_message_tools.py"
+      ],
+      "filter": "not pinned_sdk",
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "full_target_acceptance": "not_evaluated",
+      "semantic_quality": "not_evaluated",
+      "human_review": null,
+      "evidence": [
+        {"ref": "cap02-pr1-targeted.xml", "kind": "test_report", "sha256": "bda586f8ba69ecf64208c5460210c21dbd8647fd668038a531ae228c0a685ac7"},
+        {"ref": "cap02-busy-green.xml", "kind": "test_report", "sha256": "d23c033acf510e450aac64da210d6101c346d8ecbf13bbc7975ce1a5db3a0cca"},
+        {"ref": "cap02-api-runtime.xml", "kind": "earlier_regression_report", "sha256": "cd03b0361143c7d9a6cfda16683a1ac2f81e56f63171536f52e4dfe17c867782"},
+        {"ref": "cap02-hosted-wire-green.xml", "kind": "earlier_regression_report", "sha256": "f7878c24d913f14639510d0089c45e66fca6c13bcb503654b42e6fc60007f94e"},
+        {"ref": "cap02-refs-checked.xml", "kind": "test_report", "sha256": "5aa399617e3dfa41942bfab38a89ae46df7d37545b84b89ac9110b1a64c1e9c8"}
+      ],
+      "limitations": [
+        "No B worker job, model dispatch, B human obligation, SDK wait or B-to-A result consumer is installed by this slice.",
+        "The provider limit test reserves A's original intents only; it is not eight live provider requests or a combined A/B execution qualification.",
+        "The current root pins only A's original profile Source, also requiring the receiver's existing source scope; arbitrary Artifact sharing is not enabled.",
+        "Save-response loss and cold-cache cases use explicit fault injection, not live incident evidence.",
+        "The 28-case and 59-case reports are earlier regression batches; overlapping reports are not distinct model-quality samples.",
+        "A stopped cold-cache test did not yield a verdict; an unchanged diagnostic rerun passed without establishing the cause of the wait.",
+        "No Azure, original 8765, progress percentage change or human quality judgment."
+      ]
+    },
+    {
+      "id": "wake-entry-cancel-20260930",
+      "baseline_commit": "17765726201ac2898b85624e1a27f79c46fe98b5",
+      "tested_source": "unchanged product baseline plus two regression tests",
+      "targets": ["WAKE-01", "WAKE-03"],
+      "started_at": "2026-09-30T18:31:29.781798+08:00",
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "signed_instruction_entry_and_cancel_subset",
+      "passed": 33,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "pytest_seconds": 108.869,
+      "new_regression_cases": 2,
+      "product_red_to_green": false,
+      "copilot_runtime_execution": "not_run",
+      "live_model_execution": "not_run",
+      "hosted_verification": "not_run",
+      "semantic_quality": "not_evaluated",
+      "human_review": null,
+      "selectors": ["tests\\shared_context\\test_instruction_turn_origin.py"],
+      "new_selectors": [
+        "tests\\shared_context\\test_instruction_turn_origin.py::test_agent_cannot_replay_the_same_human_instruction_or_promote_its_embedded_markers",
+        "tests\\shared_context\\test_instruction_turn_origin.py::test_busy_instruction_rejects_textual_control_but_accepts_only_its_human_cancel"
+      ],
+      "test_source_sha256": "56c42f79a5173495451fa24238a08689366f7f7d6138013a79bb762d2010f73f",
+      "evidence": [
+        {"ref": "wake-entry-full.xml", "kind": "test_report",
+         "sha256": "88739d26806bbf25e03ef8d4e5166e9f5b45367d527a7cdb2da3b3f0040d113b"}
+      ],
+      "limitations": [
+        "Existing behavior is confirmed by regression tests, not a reproduced product defect.",
+        "Signed JWT and production instruction/cancel/receipt handlers use offline HTTP and Table transports.",
+        "Routine, general tool-result and long-lived agent message producers remain unimplemented or unwired.",
+        "Busy text is explicitly refused; safe-point appending and late approvals are not qualified by this batch.",
+        "No model process, live operation, human quality judgment, full-target acceptance or progress percentage change."
+      ]
+    },
+    {
+      "id": "agent-runtime-current-path-20260925",
+      "baseline_commit": "cb7a2d8b6868e06d9a941a6bdeb77ba399252159",
+      "started_at": "2026-09-25T16:45:17.4737723+08:00",
+      "completed_at": "2026-09-25T16:45:52.6328449+08:00",
+      "execution": "completed",
+      "outcome": "pass",
+      "coverage": "offline_branch_subset",
+      "selector_count": 22,
+      "passed": 33,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "pytest_seconds": 26.79,
+      "copilot_runtime_execution": "not_run",
+      "live_model_execution": "not_run",
+      "semantic_quality": "not_evaluated",
+      "human_review": null,
+      "groups": [
+        {
+          "id": "configured-effect-component",
+          "passed": 14,
+          "selectors": [
+            "tests\\shared_context\\test_behavior_effects.py::test_actual_receiver_mutates_only_existing_v12_work_and_creates_receipt_in_same_egt",
+            "tests\\shared_context\\test_behavior_effects.py::test_end_to_end_dispatch_acknowledges_operation_but_does_not_complete_work_or_delivery",
+            "tests\\shared_context\\test_behavior_effects.py::test_unknown_receiver_commit_reconciles_original_id_without_resend",
+            "tests\\shared_context\\test_behavior_effects.py::test_prepare_a_then_alias_b_and_c_cannot_change_the_effect_content",
+            "tests\\shared_context\\test_behavior_effects.py::test_receiver_rechecks_controls_after_dispatch_gate_before_effect",
+            "tests\\shared_context\\test_behavior_effects.py::test_applied_but_sender_ack_lost_keeps_unknown_until_original_receipt_reconciliation"
+          ],
+          "limitation": "Configured adapter implementation on a deliberately mutable queued fixture with offline Table transport; not a positive general-assistant operation on an already enqueued work."
+        },
+        {
+          "id": "runtime-effect-fences",
+          "passed": 5,
+          "selectors": [
+            "tests\\shared_context\\test_behavior_effects_runtime.py::test_bound_goal_edit_is_rejected_and_original_job_can_still_complete",
+            "tests\\shared_context\\test_behavior_effects_runtime.py::test_fixed_runtime_goal_is_also_protected_between_admission_and_enqueue",
+            "tests\\shared_context\\test_behavior_effects_runtime.py::test_concurrent_enqueue_marker_fences_the_goal_edit_transaction",
+            "tests\\shared_context\\test_behavior_effects_runtime.py::test_applied_receipt_remains_reconcilable_after_later_enqueue"
+          ],
+          "limitation": "Current immutability guards through runtime interfaces, with fixed-work fixtures; no new operation authority."
+        },
+        {
+          "id": "free-instruction-admission-and-wake",
+          "passed": 8,
+          "selectors": [
+            "tests\\shared_context\\test_free_instruction.py::test_free_admission_binds_original_task_and_does_not_repeat_unknown",
+            "tests\\shared_context\\test_free_instruction.py::test_new_instruction_is_not_a_six_call_two_dollar_timed_work",
+            "tests\\shared_context\\test_free_instruction.py::test_independent_instructions_reserve_distinct_live_slots_without_touching_old_pool",
+            "tests\\shared_context\\test_free_instruction.py::test_instruction_effect_uses_its_transaction_snapshot_not_repeated_registration_reads",
+            "tests\\shared_context\\test_free_instruction.py::test_api_startup_resumes_only_admitted_original_work_once",
+            "tests\\shared_context\\test_free_instruction.py::test_public_progress_is_bound_and_pure_to_read"
+          ],
+          "limitation": "InstructionSubmit with installed WorkPolicyControl and real authority/API code; executor starts are substituted. The instruction_effect test checks model reservation, not the WorkState receiver."
+        },
+        {
+          "id": "free-instruction-lifecycle",
+          "passed": 6,
+          "selectors": [
+            "tests\\shared_context\\test_instruction_flow.py::test_http_two_turns_use_saved_sdk_context_and_exact_reply_without_ack_gate",
+            "tests\\shared_context\\test_instruction_flow.py::test_cancel_reaches_official_sdk_abort_and_keeps_original_work",
+            "tests\\shared_context\\test_instruction_flow.py::test_unknown_checkpoint_upload_keeps_reply_but_never_restarts_empty",
+            "tests\\shared_context\\test_instruction_flow.py::test_missing_checkpoint_part_never_starts_an_empty_sdk_and_keeps_old_answer",
+            "tests\\shared_context\\test_instruction_flow.py::test_failed_instruction_has_failure_delivery_not_a_nonexistent_text_reply",
+            "tests\\shared_context\\test_instruction_flow.py::test_completion_notification_requires_original_saved_session_and_ticket"
+          ],
+          "limitation": "Real API/authority/Hosted adapter path with WorkPolicyControl, pinned SDK method doubles and scripted provider replies; no actual Copilot runtime or semantic traces."
+        }
+      ],
+      "evidence": [
+        {"ref": "agent-runtime-current-path-scope-20260925.json", "sha256": "f23bf6a517a60379421188f8fc66e32df973e8299cd48c5096dab50cacda11c4"},
+        {"ref": "agent-runtime-current-path-20260925.xml", "sha256": "363da95660b56aaf80364c3e97901129ebaecef4f9e0f042689f3599a30856a0"},
+        {"ref": "agent-runtime-current-path-20260925.log", "sha256": "1fd0c8e7def9f09212baf397c5b26c85078d6f7d117794939979f437347642ae"}
+      ]
+    }
+  ],
+  "implementation_slices": [
+    {
+      "id": "tool-06-schema-feedback",
+      "target": "TOOL-06",
+      "implementation": "partial",
+      "acceptance": "offline_callback_subset",
+      "tested_base": "b6b25cd9c03634d93c97ac3ac56014115fbdfb1e",
+      "tested_source": "base plus uncommitted source/test changes",
+      "early_red_test_source_sha256": null,
+      "early_red_test_limit": "The 4-fail/3-pass RED used an earlier seven-case test overlay whose source hash was not retained; it is not the final eleven-case test version.",
+      "product_source_sha256": "bf45b0273e6f1f81404687b01c664090c78a4df1eac9884efdcfe17284cb270b",
+      "test_source_sha256": "a9439df6c6ca2b1e16933d0fb7bb0c9273d8a6fb37f0d776390eeea40cfb615a",
+      "passed": 25,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "pytest_seconds": 71.06,
+      "selectors": [
+        "tests\\shared_context\\test_instruction_tool_feedback.py",
+        "tests\\shared_context\\test_instruction_tool_continuation.py",
+        "tests\\shared_context\\test_instruction_flow.py",
+        "tests\\shared_context\\test_instruction_completion.py::test_final_save_waits_for_inflight_public_progress",
+        "tests\\shared_context\\test_instruction_completion.py::test_ready_notification_wakes_one_existing_observer_without_timer_delay",
+        "tests\\shared_context\\test_instruction_completion.py::test_progress_cannot_overlap_next_model_or_tool_authority"
+      ],
+      "evidence": [
+        {"ref": "instruction-tool-feedback-red-20260925.xml", "outcome": "test_collection_error", "sha256": "bdc4ed49d896ccafe4fff6f8ed63bc7c11621825617ac727c1a0fd52859ecd1b"},
+        {"ref": "instruction-tool-feedback-red-callbacks-20260925.xml", "outcome": "four_product_failures_three_passes", "sha256": "a92e2075e1d83b4c71c20c42c310117d819c9ff8558658a78935d5a3bc849834"},
+        {"ref": "instruction-tool-feedback-green-20260925.xml", "outcome": "mixed_21_passed_6_failed", "sha256": "25bae7236356ef868933e9fd78bd57239bbf3c1246670625f2a3e14655183554"},
+        {"ref": "instruction-progress-base-b6b25cd-20260925.xml", "outcome": "two_progress_fixture_failures_reproduced_on_base", "sha256": "0b9102b07441531b0fced702858411f0b2c35720c4dc7b91bbced3be465a8dcc"},
+        {"ref": "instruction-tool-feedback-targeted-20260925.xml", "outcome": "25_passed", "sha256": "34d0eac73bbcd3b22b0ea355cf2fa9764c353a2a51c599d29e9598f98d0ebe7b"}
+      ],
+      "limitations": [
+        "SDK I/O doubles and scripted offline provider replies; no runtime, live model, human quality labels or Hosted validation.",
+        "Two existing progress fixture failures are retained and reproduced on the fixed unmodified base; the final targeted set explicitly does not include them.",
+        "Only local schema diagnostics are improved. Handler/authority failures remain masked; full TOOL-06 acceptance is not claimed."
+      ],
+      "review_correction": {
+        "reviewed_head": "52615e29d09c33f0050cce9de94ec71120d552a7",
+        "issue": "Approved-skill catalog/schema refusals must retain the previously accepted authority-denial contract.",
+        "resolution": "read_skill never bypasses masking, including catalog enum and additionalProperties failures; native expectations stay unchanged.",
+        "tested_base": "b1d4ababed2285a1f949f93773fd969c0d9d5eef",
+        "tested_source": "base plus uncommitted source/test changes",
+        "product_source_sha256": "79488b6fb80ca71925ff89bfe363641fd0e880278b16d777aaec507fc7a774bf",
+        "test_source_sha256": "9b141c053390fb801c1651b63d6b90d2c739c1d87736b3197a96bbea9a87ea04",
+        "passed": 33,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "pytest_seconds": 19.96,
+        "native_suite": "not_run",
+        "native_limit": "No pinned runtime 1.0.83 in this worktree; callback doubles and signed API tests do not establish a new native acceptance.",
+        "selectors": [
+          "tests\\shared_context\\test_instruction_tool_feedback.py",
+          "tests\\shared_context\\test_instruction_tool_continuation.py",
+          "tests\\shared_context\\test_approved_skill_api.py::test_signed_api_catalog_and_body_are_bound_to_the_original_assignment",
+          "tests\\shared_context\\test_approved_skill_api.py::test_current_source_or_approval_change_denies_the_original_catalog_and_read",
+          "tests\\shared_context\\test_approved_skill_api.py::test_read_body_cannot_select_paths_versions_principals_or_profiles",
+          "tests\\shared_context\\test_approved_skill_api.py::test_last_provider_gate_rejects_revoked_skill_material_without_sending_or_replaying"
+        ],
+        "evidence": [
+          {"ref": "instruction-skill-feedback-p2-red-20260925.xml", "failed": 4, "sha256": "ecfdc612d66d19deaceca1c6f5429581b84108dbd36b1eac8ddb3239583b2975"},
+          {"ref": "instruction-skill-feedback-p2-red-feedback-20260925.xml", "failed": 4, "sha256": "e8d4206f8ba218e54eb35035767765397b2ab4c9e0e6db6e8c1efd475577a187"},
+          {"ref": "instruction-skill-feedback-p2-green-20260925.xml", "passed": 15, "sha256": "916089852b817dc4670c0ecc56c9a1f1cf21260ec138e77ea58ce816684fc905"},
+          {"ref": "instruction-skill-feedback-p2-targeted-20260925.xml", "passed": 33, "sha256": "d097a0620ef67cb063fac52c2808e3e4720622ee30cadac5041c0e7b7cd7a801"}
+        ]
+      }
+    },
+    {
+      "id": "public-tool-event-correlation",
+      "delivery": "merged",
+      "merge_receipt": {
+        "pr": 31,
+        "reviewed_base": "7b819cca1f3cb44b8d06621c691dba1abcb11a1f",
+        "reviewed_head": "e029b98cc68cfc864ef62d42e94b1a7ae0c4ac27",
+        "model": "claude-opus-5.5",
+        "standards_p1": 0,
+        "standards_p2": 0,
+        "spec_p1": 0,
+        "spec_p2": 0,
+        "merge_commit": "0dac615451024fafd4c87ab275f244df569ea866",
+        "merged_at": "2026-09-25T12:25:11Z",
+        "merge_tree": "1e6186b11be3915d197acf3bf838735bb7d724cf",
+        "tree_equals_reviewed_head": true,
+        "admin_bypass": false
+      },
+      "tc01_requalification": {
+        "baseline_commit": "0dac615451024fafd4c87ab275f244df569ea866",
+        "python_cases_passed": 76,
+        "minimal_dom_cases_passed": 33,
+        "scope_node_ids_matched": true,
+        "candidate": "full_TC-01_C",
+        "status": "accepted_C_after_candidate_two_axis_confirmation",
+        "qualification_reviewed_head": "e730dd52d760c032e176971235353f4bb1244982",
+        "standards_p1": 0,
+        "standards_p2": 0,
+        "spec_p1": 0,
+        "spec_p2": 0,
+        "acceptance_state_delta_final_head_confirmation": "54d3298 confirmed 0P1/P2 by both Opus5.5 axes; merged as 3f7391d",
+        "qualification_merge": "3f7391d1e92c7210ca0bded33f54b9eba9241c13",
+        "report": "tc01-public-pairs-requalification.md",
+        "live_model_execution": "not_run",
+        "hosted": "not_run",
+        "human_review": null
+      },
+      "targets": ["TURN-02", "TOOL-05"],
+      "implementation": "partial",
+      "acceptance": "offline_projection_and_browser_renderer_subset",
+      "source_snapshot": "snapshot:c191d28e71fa9f0bd7970e1643cfcb3668004403a96e91d988b5ac274e4fd073",
+      "report": "tool-progress-correlation-evaluation.md",
+      "python_cases_passed": 40,
+      "minimal_dom_cases_passed": 33,
+      "browser_renderer": "passed_with_direct_synthetic_input",
+      "native_sdk": "local_pinned_sdk_offline_provider_subset_passed",
+      "native_subset_cases_passed": 4,
+      "native_test_sha256": "711985d5d7283f8ea40b35001152df3f3b219b1b138a52a37fd03cf296a6bf15",
+      "main30_integration": {
+        "base": "748bb6590724e997b741806184bcbc6deb51e0ce",
+        "source_snapshot": "snapshot:accbf394537216acb4c086b6c360426ae91183ede2a8d5ed118c60f1d8da7ebd",
+        "tested_source": "base plus source/test WIP",
+        "python_cases_passed": 68,
+        "native_subset_cases_passed": 5,
+        "minimal_dom_cases_passed": 33,
+        "registry_default": "empty",
+        "ui_label": "工具關聯",
+        "read_work_memory_public_fields": "configured tool name, status and public start sequence only; no claim text, alias, originals or raw IDs",
+        "final_head_review": "6905954 full Standards and Spec both 0 P1/P2; preserved as pre-main32 history"
+      },
+      "main32_integration": {
+        "main": "7b819cca1f3cb44b8d06621c691dba1abcb11a1f",
+        "main_ledger_prefix": 318,
+        "branch_records_appended": 14,
+        "new_integration_run": {
+          "baseline_commit": "60cd87e440c1d068516b3ea685b380ba32e8734d",
+          "cases_passed": 2,
+          "environment": "pinned_sdk_offline_provider",
+          "junit_sha256": "894479327bd6f15b3fe6b32d01b0f7974aa04b1387df3cc30aab5c6c3481cceb",
+          "full_target_acceptance": false
+        },
+        "branch_payloads_and_spec_bindings_unchanged": true,
+        "unmerged_branch_sequences_relocated_after_main": true,
+        "PA-02": "retain main32 seven-profile qualification; this slice does not change prompt",
+        "TC-01": "partial after newer public producer/DTO/UI",
+        "final_head_review": "e029b98 full Standards and Spec both 0 P1/P2; merged as 0dac615"
+      },
+      "hosted": "not_run",
+      "human_review": null,
+      "limits": [
+        "Not a new agent trace dataset or complete tool/job lifecycle acceptance.",
+        "Snapshot correlation is execution-local, display-only and may refer to a start pruned by the existing byte limit.",
+        "TC-01 was partial at this slice's delivery; later qualification is recorded separately and prior acceptance runs remain immutable."
+      ]
+    },
+    {
+      "id": "tool-06-user-turn-refusal-guidance",
+      "target": "TOOL-06",
+      "implementation": "partial",
+      "acceptance": "fixed_code_feedback_subset",
+      "source_commit": "7305070507d357c7a0504fe07f5f6200ffabab05",
+      "base_commit": "3f7391d1e92c7210ca0bded33f54b9eba9241c13",
+      "delivery": "merged",
+      "merge_receipt": {
+        "pr": 35,
+        "merge_commit": "291dd4b6105fd5d5b9622477bf6b75223dccde4b"
+      },
+      "report": "user-turn-refusal-feedback-evaluation.md",
+      "fixed_unit_cases_passed": 43,
+      "fixed_native_cases_passed": 4,
+      "public_projection_test_commit": "e0d185d6c540a0305f6d3b7bc27ca16794a5a76b",
+      "public_projection_fixed_cases_passed": 19,
+      "native_environment": "sdk1.0.13/runtime1.0.83 with scripted offline provider",
+      "human_review": null,
+      "public_codes": [
+        "USER_TURN_SCOPE_DENIED",
+        "USER_TURN_NOT_AVAILABLE",
+        "USER_TURN_SOURCE_CHANGED",
+        "USER_TURN_SOURCE_LIMIT"
+      ],
+      "evidence": [
+        {"ref": "user-turn-refusal-feedback-red-20260925.xml", "failed": 1, "sha256": "530b80f15afa1218360f2a7aea6143ecc62883ef73eb030a13d83fdde5561b8c"},
+        {"ref": "user-turn-refusal-feedback-unit-20260925.xml", "passed": 43, "sha256": "3232fe366dc0e917b315d1c66f668567fe9368376781993a77c40f79f42ca279"},
+        {"ref": "user-turn-refusal-feedback-native-20260925.xml", "passed": 4, "sha256": "7b838cf009632604e4b38b57a8c9704acc6353f0bcb958d13ae68988c7c6588a"},
+        {"ref": "user-turn-refusal-fixed-unit-20260925.xml", "passed": 43, "sha256": "1cdb0f712ffaa0e7ea3b548ec238ba83c3fd34e5e63bb9742c97abef9b8d0431"},
+        {"ref": "user-turn-refusal-fixed-native-20260925.xml", "passed": 4, "sha256": "447f8b2872d2f9255ce9f0e0eaec140a177926fa13b367e07b2508dc3cfc9b98"},
+        {"ref": "user-turn-refusal-public-projection-20260925.xml", "passed": 19, "sha256": "f8ac2be7e127d97472a5e18d043ccb422405ca76a07f383899a3fad2d6ca16e3"},
+        {"ref": "user-turn-refusal-public-fixed-20260925.xml", "passed": 19, "sha256": "ccf421319cddc29a8d312fb0c60d0bdf1ef2a70973a39b80863b2eca95aff0b0"}
+      ],
+      "limitations": [
+        "Post-entry read_user_turn only; no change to pre-entry/no-SDK closure or general ASSISTANT_SOURCE_CHANGED handling.",
+        "Other tools, structured profiles, unknown/integrity outcomes and arbitrary handler details remain opaque.",
+        "The provider script chooses the corrected request; no claim that a real LLM autonomously corrects it.",
+        "No new permissions, work IDs, automatic retries, live model or Hosted execution."
+      ],
+      "review_correction": {
+        "initial_reviewed_head": "d26c51bd5d7994217a89af521c50d46da898b5fc",
+        "standards_p2": "CURRENT recent-completions list exceeded the three-item rule.",
+        "spec_p2": "Client response identity mismatch reused actionable scope code instead of opaque integrity failure.",
+        "main33": "ddbcd64e222daa53024e5cfa58eebf9a438e9b38",
+        "pure_merge": "71dd74d1d3088d91d158a26f169e1f8d2f254e1c",
+        "fixed_tested_commit": "1a80402c02d48f8829413328f8eef0d844347f9f",
+        "fixed_cases": {"callbacks_api": 60, "native_offline": 7},
+        "provenance": "Known local original-assignment scope precondition or verified API error code; mismatched successful response is SOURCE_INVALID and stays opaque.",
+        "old_results_retained": true,
+        "final_head_review": "pending",
+        "evidence": [
+          {"ref": "reader-refusal-integrity-p2-red-20260925.xml", "failed": 2, "sha256": "7bee3f149afbe9cddeecdcbfb21e12bf648a1568aaa9ef5f27c770eed61a48f7"},
+          {"ref": "reader-refusal-p2-green-unit-20260925.xml", "passed": 60, "sha256": "8e237074f73e2d3fd46ec943c125f53f9ec1c23f4a68fc4c7ddbac5290cf3a6f"},
+          {"ref": "reader-refusal-p2-green-native-20260925.xml", "passed": 7, "sha256": "1ff671cb01e774a210021762f0f9e282ec442149762b9dcc325f6b383d7032aa"},
+          {"ref": "reader-refusal-p2-fixed-unit-20260925.xml", "passed": 60, "sha256": "eeb52746643ec17e427d84209557104bca5ed3c84d9724d57a059fe386d8b49f"},
+          {"ref": "reader-refusal-p2-fixed-native-20260925.xml", "passed": 7, "sha256": "ed38ab47035038fecd6be41b1c6ec4145cab2161670b19096403b679efe8ee0d"}
+        ]
+      }
+    }
+  ],
+  "delivery": {
+    "scope": "First TOOL-06 schema-feedback slice and initial evaluation documents only; not later implementation slices.",
+    "state": "merged",
+    "pr": 29,
+    "review_model": "claude-opus-5.5",
+    "reviewed_base": "0d391245542a1bcb4f91ca3daf0f756b3cb4ec1a",
+    "reviewed_head": "24e0da4bb7467ac6de92fb083c5dbd6795618e27",
+    "standards_p1": 0,
+    "standards_p2": 0,
+    "spec_p1": 0,
+    "spec_p2": 0,
+    "merge_commit": "d5e875d0b9bb73824771dc1b005b03d1c33a05d7",
+    "merge_tree": "2aa169a5a76371b8ca008dd587524ebd129bcc44",
+    "merged_at": "2026-09-25T09:58:14Z",
+    "merge_tree_matches_reviewed_head": true,
+    "admin_bypass": false,
+    "post_merge_handoff_committed": true,
+    "full_target_complete": false
+  },
+  "error_discovery": {
+    "status": "blocked_before_trace_review",
+    "local_complete_agent_traces": 0,
+    "tuple_fixture": "tests\\context_eval\\fixtures\\agent_runtime_error_discovery_tuples.json",
+    "draft_tuples": 20,
+    "human_tuple_review": null,
+    "queries_generated": false,
+    "review_ui_started": false,
+    "reason": "No applicable complete agent trace exports in this worktree or this session. Synthetic tuple realism awaits human review; no fabricated outputs or labels."
+  }
+}

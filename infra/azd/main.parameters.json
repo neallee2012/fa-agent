@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": {
+      "value": "${AZURE_ENV_NAME}"
+    },
+    "location": {
+      "value": "${AZURE_LOCATION}"
+    },
+    "principalId": {
+      "value": "${AZURE_PRINCIPAL_ID}"
+    },
+    "resourceGroupName": {
+      "value": "${AZURE_RESOURCE_GROUP}"
+    },
+    "modelCapacityJson": {
+      "value": "${FA_MODEL_CAPACITY_JSON}"
+    },
+    "modelDeploymentNames": {
+      "value": "${FA_MODEL_DEPLOYMENTS}"
+    },
+    "modelVersionUpgradeOption": {
+      "value": "${FA_MODEL_VERSION_UPGRADE_OPTION=NoAutoUpgrade}"
+    },
+    "apiSubnetNatEgress": {
+      "value": "${FA_API_SUBNET_NAT_EGRESS=false}"
+    },
+    "enableAgentOnboarding": {
+      "value": "${FA_ENABLE_AGENT_ONBOARDING=false}"
+    },
+    "enableTeamMcpConnections": {
+      "value": "${FA_ENABLE_TEAM_MCP_CONNECTIONS=true}"
+    }
+  }
+}

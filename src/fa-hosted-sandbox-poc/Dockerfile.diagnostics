@@ -1,0 +1,11 @@
+FROM crcontosodemo01.azurecr.io/fa-hosted-sandbox-poc/fa-hosted-sandbox-poc-faexample@sha256:d6f8f7134abc4b2cf5089ecc2c5e1de2a6cf1b189bd962afb547f668c51bab01
+
+ENV POC_MOUNT_DIAGNOSTICS=1
+
+COPY poc_core.py /app/poc_core.py
+RUN python -m py_compile /app/poc_core.py \
+    && dmesg --kernel --syslog --buffer-size=65536 --color=never --nopager --help > /dev/null \
+    && printf '<6>[   10.000000] CIFS: diagnostic fixture\n' > /tmp/fasample-dmesg-fixture \
+    && dmesg --kernel --buffer-size=65536 --color=never --nopager --file /tmp/fasample-dmesg-fixture > /tmp/fasample-dmesg-output \
+    && grep -Eq '^\[[[:space:]]*10\.000000\] CIFS: diagnostic fixture$' /tmp/fasample-dmesg-output \
+    && rm /tmp/fasample-dmesg-fixture /tmp/fasample-dmesg-output

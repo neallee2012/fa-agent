@@ -1,0 +1,117 @@
+{
+ "schema_version": "fa-fresh-installation-inputs-v1",
+ "policy": {
+  "schema_version": "fa-steady-work-policy-v1",
+  "policy_id": "stage-standing-policy-v1",
+  "revision": 1,
+  "configuration_sha256": "8f1ad5eb3fbc09a5c4558057057fb544ff300034bf0f12b58c2f75d29106dcd0",
+  "evidence_mode": "native",
+  "authority_domain": "fa-stage-v1",
+  "control_binding": "3dc6687c2eb777b3400b99632842df66a03aada7216cc5148cf10472bae6060b",
+  "active": true,
+  "read_enabled": true,
+  "template": {
+   "binding_id": "stage-binding-v1",
+   "tenant_id": "00000000-0000-0000-0000-000000000013",
+   "team_id": "team-stage",
+   "human_oid": "00000000-0000-0000-0000-00000000001b",
+   "agent_oid": "00000000-0000-0000-0000-00000000001d",
+   "owner": {
+    "owner_record_id": "stage-owner-v1",
+    "principal_id": "00000000-0000-0000-0000-00000000001d",
+    "epoch": 1,
+    "conversation_id": "stage-conversation-v1",
+    "policy_id": "stage-policy-v1",
+    "root_budget_id": "root"
+   },
+   "ingress_id": "authenticated-api",
+   "source_ids": [
+    "stage-source-v1"
+   ],
+   "claim_ids": [
+    "stage-claim-v1"
+   ],
+   "subject": "stage-subject-v1",
+   "event_id": "stage-event-v1",
+   "root_request_id": "stage-root-v1",
+   "job_id": "stage-job-v1",
+   "work": {
+    "work_id": "stage-work-v1",
+    "goal": "Use the reviewed metrics to compute remaining items and save my result.",
+    "criteria_version": "assistant-criteria-stage-v1",
+    "result_kind": "answer",
+    "required_checks": [
+     "answer_verified",
+     "artifact_verified",
+     "finish_verified"
+    ],
+    "human_checks": []
+   },
+   "route": {
+    "tenant_id": "00000000-0000-0000-0000-000000000013",
+    "account_id": "fa-stage-account",
+    "recipient_id": "00000000-0000-0000-0000-00000000001b",
+    "channel_id": "authenticated-pull",
+    "thread_id": "stage-thread-v1"
+   },
+   "operation_id": "stage-operation-v1",
+   "attempt_id": "stage-operation-attempt-v1",
+   "grant_id": "stage-operation-grant-v1",
+   "allowed_input_refs": [
+    "stage-goal-v1"
+   ],
+   "context_versions": {
+    "work_revision": 1,
+    "release_version": "release-v1",
+    "catalog_version": "catalog-v1",
+    "memory_schema_version": "memory-v1"
+   }
+  },
+  "profile": {
+   "binding_id": "stage-binding-v1",
+   "source": {
+    "source_id": "stage-source-v1",
+    "version": 1,
+    "sha256": "3836bd839034d93160f505b6d685ea7a884a628ae0d242244a0ca3cbc1b14d88",
+    "byte_length": 84
+   },
+   "claim_id": "stage-claim-v1",
+   "legacy_source_work": "stage-legacy-source-none",
+   "artifact_id": "stage-report-v1",
+   "artifact_version": "00000000000000000000000000000000",
+   "policy_version": "assistant-own-result-v1",
+   "max_model_requests": 6,
+   "require_operation": false
+  },
+  "legacy_template_policy": {
+   "binding_digest": "c60fd5bc8039d0693856e93f10a5b3a81da8211396e698618e71d669bded46f6",
+   "operation_policy_revision": 1,
+   "active": true,
+   "source_visibility": "team",
+   "purpose": "metrics",
+   "allowed_purposes": [
+    "metrics"
+   ],
+   "max_commands": 64,
+   "max_grant_seconds": 300,
+   "valid_until": "2026-10-02T00:00:00Z",
+   "human_text_enabled": false,
+   "text_policy_version": null
+  },
+  "cost_scope_sha256": "27def4f7b6233a0134693e40a66e5a154a7b5aacbf67c8396b6bf2fd6fc484af",
+  "cost_observer_oid": "00000000-0000-0000-0000-00000000001b",
+  "cumulative_ceiling_microusd": 110000000,
+  "safety_reserve_microusd": 10000000,
+  "minimum_observed_microusd": 0,
+  "work_estimate_microusd": 2000000,
+  "cost_max_age_seconds": 3600,
+  "queue_seconds": 600,
+  "execution_seconds": 240,
+  "max_model_requests": 6,
+  "max_generations": 1
+ },
+ "peer_agent_id": "00000000-0000-0000-0000-000000000022",
+ "peer_registration_id": "stage-b-registration-v1",
+ "initial_accounted_microusd": 0,
+ "budget_enforced": false
+}

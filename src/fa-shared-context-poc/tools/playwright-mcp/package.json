@@ -1,0 +1,9 @@
+{
+  "name": "fa-playwright-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Image-preinstalled Playwright MCP for the FA CAP-03 capability; installed only with npm ci.",
+  "dependencies": {
+    "@playwright/mcp": "0.0.82"
+  }
+}

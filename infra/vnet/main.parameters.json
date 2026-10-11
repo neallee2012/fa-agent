@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "westus3"
+    },
+    "environmentName": {
+      "value": "faexample"
+    },
+    "accountName": {
+      "value": "cog-fasample-vnet-demo"
+    },
+    "projectName": {
+      "value": "faexample"
+    },
+    "existingKeyVaultResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample/providers/Microsoft.KeyVault/vaults/kv-faexample-de"
+    },
+    "existingStorageResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample/providers/Microsoft.Storage/storageAccounts/stfaexampledemo"
+    },
+    "existingContainerRegistryResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample/providers/Microsoft.ContainerRegistry/registries/crcontosodemo01"
+    },
+    "operatorObjectId": {
+      "value": "00000000-0000-0000-0000-00000000001b"
+    },
+    "enableController": {
+      "value": false
+    }
+  }
+}

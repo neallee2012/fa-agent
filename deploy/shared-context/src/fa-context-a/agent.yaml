@@ -1,0 +1,10 @@
+name: fa-context-a
+template:
+    description: Hosted FA assistant with controlled API tools and versioned conversation state.
+    kind: hosted
+    name: fa-context-a
+    protocols:
+        - protocol: invocations
+          version: 2.0.0
+        - protocol: responses
+          version: 2.0.0

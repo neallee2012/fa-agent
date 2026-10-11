@@ -1,0 +1,78 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+#
+# New FA environment in your own subscription: `azd up` (docs/azd-new-environment.md, deploy/azd/README.md).
+# azd core only (Bicep provider and hooks); no Foundry extension service host. The hooks call the same scripts the
+# stage CI uses, so there is one implementation of every step. Nothing here names a tenant, subscription or resource.
+#
+# - preprovision  (read only) sign-in, Team owner, model settings, subscription preflight
+# - provision     infra/azd/main.bicep: Foundry, monitoring, foundation, Web PubSub, backup, artifacts
+# - postprovision (read only) ACA platform gate; then the Entra API/Portal apps and the owner's consent
+# - postdeploy    images, Hosted Agents, first install (the owner types the plan hash), API, Portal, first session;
+#                 a later `azd deploy` runs the stage CI's upgrade steps instead
+# Resume a stopped hook with `azd hooks run <hook>`; every write reads back its own intent first.
+name: foundry-agents
+
+requiredVersions:
+    azd: ">=1.32.0"
+
+infra:
+    provider: bicep
+    path: infra/azd
+    module: main
+
+hooks:
+    preprovision:
+        windows:
+            shell: pwsh
+            run: python deploy/azd/fa_azd.py preprovision
+            interactive: true
+            continueOnError: false
+        posix:
+            shell: sh
+            run: python3 deploy/azd/fa_azd.py preprovision
+            interactive: true
+            continueOnError: false
+    postprovision:
+        windows:
+            shell: pwsh
+            run: python deploy/azd/fa_azd.py postprovision
+            interactive: true
+            continueOnError: false
+        posix:
+            shell: sh
+            run: python3 deploy/azd/fa_azd.py postprovision
+            interactive: true
+            continueOnError: false
+    postdeploy:
+        windows:
+            shell: pwsh
+            run: python deploy/azd/fa_azd.py deploy
+            interactive: true
+            continueOnError: false
+        posix:
+            shell: sh
+            run: python3 deploy/azd/fa_azd.py deploy
+            interactive: true
+            continueOnError: false
+    predown:
+        windows:
+            shell: pwsh
+            run: python deploy/azd/fa_azd.py predown
+            interactive: true
+            continueOnError: false
+        posix:
+            shell: sh
+            run: python3 deploy/azd/fa_azd.py predown
+            interactive: true
+            continueOnError: false
+    postdown:
+        windows:
+            shell: pwsh
+            run: python deploy/azd/fa_azd.py postdown
+            interactive: true
+            continueOnError: false
+        posix:
+            shell: sh
+            run: python3 deploy/azd/fa_azd.py postdown
+            interactive: true
+            continueOnError: false

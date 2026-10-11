@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "run_id": "m1-e2e-20260914-1400",
+  "status": "M1_END_TO_END_PASS_AFTER_CONTINUATION",
+  "full_m1_pass": true,
+  "scope": "真正Hosted的合成私人檔案、工具設定、Chromium profile、隔離、私網Blob備份、替代session及相容設定版本恢復。",
+  "started_at_utc": "2026-09-14T07:15:29.351763Z",
+  "finished_at_utc": "2026-09-14T07:28:35.534344Z",
+  "elapsed_seconds_including_diagnosis_and_gap": 786.177,
+  "source_base_commit": "7cb76f19a512386344ae63985b0cfd0c5aa1b26d",
+  "source_includes_uncommitted_changes": true,
+  "versions": {"source_a": "8", "b": "6", "upgrade_a": "9"},
+  "hosted_image_digest": "sha256:1661873f09bc5b2d4f76dae06b37b398ef9186fb55d83ce6aa25f220fa556e52",
+  "api_image_digest": "sha256:685b084f9517c3ad2b6a63e70dfd1d9aa4a79279e573cb8530acc28876ec4b08",
+  "api_revision": "ca-facontext-poc--m1backup",
+  "builds": {"hosted": "dsb", "api": "dsc", "count": 2, "ceiling": 3},
+  "runtime_uid": 10001,
+  "browser_uid_fields": [10001, 10001, 10001, 10001],
+  "cumulative_usage": {
+    "hosted_invocations": 26,
+    "invocation_ceiling": 40,
+    "stop_calls": 7,
+    "stop_ceiling": 10,
+    "new_sessions": 4,
+    "new_session_ceiling": 4,
+    "max_owned_active_sessions": 2,
+    "session_version_inventory_reads": 51,
+    "read_ceiling": 80,
+    "real_gui_invocations": 12,
+    "png_files": 14,
+    "model_calls": 0,
+    "memory_updates": 0
+  },
+  "verified_scenarios": [
+    "A/B私人檔案、實際套用工具設定與不同browser cookie",
+    "A/B warm與stop/resume，原檔／cookie／工具基線相符且程序更換",
+    "跨agent HOME拒絕、A/B跨雲端backup拒絕及精確application/upstream錯誤",
+    "API容器DNS解析符合Blob PE，固定版本／ETag／hash雲端讀回",
+    "新A8 session先無資料，再只從Azure備份恢復並啟動原profile",
+    "重複restore不覆寫，錯hash不提交，之後正常還原成功",
+    "新A9 session從A8備份恢復，再stop/resume及真正browser驗證",
+    "最終完整session集合吻合且全部native idle"
+  ],
+  "compatible_version": {
+    "same_image": true,
+    "only_definition_delta": {"environment_variables": {"PYTHONUTF8": "1"}},
+    "stable_guid_identity_endpoints_preserved": true,
+    "identical_definition_redeploy_observed_to_reuse_version_8": true,
+    "native_version_listing_confirmed_no_hidden_version_9_before_correction": true,
+    "original_attempt_status_preserved": "FAILED_OR_BLOCKED",
+    "original_checks": {"passed": 335, "failed": 1},
+    "continuation_checks": {"passed": 106, "failed": 0},
+    "arbitrary_binary_or_tool_upgrade_validated": false
+  },
+  "backup": {
+    "storage_account": "stfam1backupdemo",
+    "container": "m1-environment-backups",
+    "public_network_access": "Disabled",
+    "shared_key_access": false,
+    "blob_public_access": false,
+    "private_ip_observed_inside_api": "192.168.96.69",
+    "versioning": true,
+    "blob_soft_delete_days": 7,
+    "container_soft_delete_days": 7,
+    "account_lock": "CanNotDelete",
+    "api_role_scope": "專用container；有效直接、繼承及群組角色已核對。",
+    "api_added_data_actions": [
+      "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+      "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
+    ],
+    "local_archive_fallback_used": false,
+    "receipts": {
+      "a": {"bytes": 658450, "files": 180, "file_bytes": 19458822, "sha256": "3c09c42232c735ed465895a3173abe225cce50ff98d8fa309bed157bf3f2c8af", "version_id": "2026-09-14T07:17:05.4609531Z"},
+      "b": {"bytes": 661419, "files": 180, "file_bytes": 19458824, "sha256": "4a6dc6fd29c78b3f8d50160c05924cc0f7bc52e09bc52e4df30faeb5751d88a7", "version_id": "2026-09-14T07:17:12.0185037Z"}
+    }
+  },
+  "inventory": {
+    "before": {"a": 87, "b": 53, "active": 0},
+    "final": {"a": 90, "b": 54, "active": 0, "all_idle": true},
+    "exact_sets_verified": true,
+    "continuous_sampling_claimed": false
+  },
+  "evidence": {
+    "raw_files_gitignored": true,
+    "runtime_files_excluding_manifests": 241,
+    "runtime_bytes_excluding_manifests": 3821563,
+    "deployment_files_excluding_manifest": 128,
+    "all_paths_sizes_hashes_verified": true,
+    "original_directory": "evidence\\m1-e2e-20260914-1400",
+    "original_report_sha256": "770af47bac767b97032d72166fdb4adedb6969f2bb0c0ed26ac5579efa012954",
+    "original_manifest_sha256": "42de8ed5ae233ad4c314688c8e194d82e902bc13da9c745d0e1c40f732546c3e",
+    "continuation_directory": "evidence\\m1-e2e-20260914-1400-upgrade",
+    "continuation_report_sha256": "dcf04af81fee12ba84b2af2fdcac0796a3f2502f2b0bfddf97bac82f58335169",
+    "continuation_manifest_sha256": "21803c4a980a7df8cd76a12c6d2ea617502801738622187542ac3f0ba9cecf44",
+    "deployment_directory": "evidence\\m1-e2e-20260914-1400-deployment",
+    "deployment_manifest_sha256": "c258273a32a49ad013cc448d3dfe276818fed8c438991d80a9ce8b87be2a99b9",
+    "executed_operator_sources_preserved": true,
+    "historical_home_failure_and_root_report_unchanged": true
+  },
+  "cost": {
+    "total_budget_usd": 100,
+    "additional_test_reserve_usd": 10,
+    "preflight_reported_mtd_usd": "13.06733675156014597",
+    "closeout_reported_mtd_usd": "13.45929129279025447",
+    "closeout_observed_at_utc": "2026-09-14T07:31:27.496070Z",
+    "billing_lag": true,
+    "difference_is_not_attributed_to_this_run": true,
+    "final_cost_verified": false,
+    "retained_resources_continue_to_cost": true
+  },
+  "not_validated": [
+    "整個HOME或任意桌面應用恢復",
+    "30天實際失效及真實網站登入續期",
+    "任意OS／Chromium大版本遷移",
+    "Copilot SDK對話／業務工作恢復及自主OS UI",
+    "四agent排程或10倍效能"
+  ],
+  "local_suite_passed": 365,
+  "cloud_resources_or_data_deleted": false,
+  "commit_or_push_performed": false
+}

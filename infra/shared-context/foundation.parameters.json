@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {"value": "westus3"},
+    "environmentName": {"value": "cae-facontext-private"},
+    "apiIdentityName": {"value": "id-facontext-api"},
+    "storageName": {"value": "stfacontextpocdemo"},
+    "tableName": {"value": "workstate"},
+    "registryName": {"value": "crfacontextpocdemo"},
+    "foundryAccountName": {"value": "cog-fasample-memory-demo"},
+    "projectName": {"value": "faexample"}
+  }
+}

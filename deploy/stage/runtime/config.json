@@ -1,0 +1,309 @@
+{
+ "schema_version": "fa-behavior-server-v1",
+ "deployment_id": "fa-stage-v1",
+ "identity": {
+  "tenant_id": "00000000-0000-0000-0000-000000000013",
+  "audience": "api://00000000-0000-0000-0000-000000000013/fa-context-poc-api",
+  "team_id": "team-stage",
+  "human_oid": "00000000-0000-0000-0000-00000000001b",
+  "admin_client_id": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+  "managed_identity_client_id": "00000000-0000-0000-0000-00000000001c",
+  "agents": [
+   {
+    "oid": "00000000-0000-0000-0000-00000000001d",
+    "actor": "agent-a"
+   },
+   {
+    "oid": "00000000-0000-0000-0000-00000000001e",
+    "actor": "agent-b"
+   },
+   {
+    "oid": "00000000-0000-0000-0000-00000000001f",
+    "actor": "agent-c"
+   },
+   {
+    "oid": "00000000-0000-0000-0000-000000000020",
+    "actor": "agent-d"
+   }
+  ]
+ },
+ "table": {
+  "account_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample-stage/providers/Microsoft.Storage/storageAccounts/stfacontextstagedemo",
+  "endpoint": "https://stfacontextstagedemo.table.core.windows.net",
+  "scope": {
+   "authority_domain": "fa-stage-v1",
+   "table_name": "workstate",
+   "partition_key": "fa-stage-v1",
+   "max_operations": 100,
+   "max_batch_bytes": 4194304,
+   "max_payload_bytes": 49152
+  }
+ },
+ "sources": {
+  "account_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample-stage/providers/Microsoft.Storage/storageAccounts/stfam1bkstagedemo",
+  "protection": {
+   "mode": "no-auto-gc",
+   "authority_domain": "fa-stage-v1",
+   "generation": "no-gc-stage-v1",
+   "container_url": "https://stfam1bkstagedemo.blob.core.windows.net/m3-artifacts",
+   "protected_prefix": "m3/v1/00000000-0000-0000-0000-000000000013/",
+   "configuration_version": "fa-storage-stage-v1",
+   "evidence_sha256": "30bb2949138331ea2c392ad415a659aac0c3fd2139d96744931aa0fb4179c80e"
+  }
+ },
+ "backups": {
+  "account_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample-stage/providers/Microsoft.Storage/storageAccounts/stfam1bkstagedemo",
+  "protection": {
+   "mode": "no-auto-gc",
+   "authority_domain": "fa-stage-v1",
+   "generation": "no-gc-stage-v1",
+   "container_url": "https://stfam1bkstagedemo.blob.core.windows.net/m1-environment-backups",
+   "protected_prefix": "v1/00000000-0000-0000-0000-000000000013/",
+   "configuration_version": "fa-storage-stage-v1",
+   "evidence_sha256": "e7c9fb30febb7c21fbe2db7b85c4aca9ed8e950fff4087f6f901bc3ecb92454a"
+  }
+ },
+ "delivery": {
+  "runtime_version": "fa-delivery-contract-v1",
+  "control_binding": "3dc6687c2eb777b3400b99632842df66a03aada7216cc5148cf10472bae6060b",
+  "team_id": "team-stage",
+  "entry_id": "behavior-stage-api",
+  "protection_version": "assistant-inline-and-m3-retention-v1",
+  "consumer_version": "behavior-controller-v1",
+  "timer_version": "bounded-tick-v1",
+  "verifier_version": "assistant-result-verifier-v1",
+  "channel": {
+   "channel_id": "authenticated-pull",
+   "version": "fa-pull-inbox-v1",
+   "supported_levels": [
+    "client_received"
+   ],
+   "max_confirmation_level": "client_received"
+  },
+  "max_queue_seconds": 3600,
+  "review_interval_seconds": 60,
+  "normal_control_units": 8,
+  "max_delivery_versions": 4,
+  "max_receipts_per_delivery": 4,
+  "max_due_generations": 4,
+  "scan_page_size": 4,
+  "model_repair_contract": null,
+  "model_repair_units": 1
+ },
+ "workers": {
+  "workspace_id": "fa-stage-v1",
+  "control_binding": "3dc6687c2eb777b3400b99632842df66a03aada7216cc5148cf10472bae6060b",
+  "executor_id": "native-pool",
+  "executor_version": "assistant-sdk-1-0-13-runtime-1-0-83",
+  "protection_version": "assistant-inline-and-m3-retention-v1",
+  "capacity": 1,
+  "pending_limit": 16,
+  "max_generations": 4,
+  "control_units": 8,
+  "reservation_units": 1,
+  "lease_seconds": 60,
+  "queries_per_generation": 16
+ },
+ "bindings": [
+  {
+   "binding_id": "stage-binding-v1",
+   "tenant_id": "00000000-0000-0000-0000-000000000013",
+   "team_id": "team-stage",
+   "human_oid": "00000000-0000-0000-0000-00000000001b",
+   "agent_oid": "00000000-0000-0000-0000-00000000001d",
+   "owner": {
+    "owner_record_id": "stage-owner-v1",
+    "principal_id": "00000000-0000-0000-0000-00000000001d",
+    "epoch": 1,
+    "conversation_id": "stage-conversation-v1",
+    "policy_id": "stage-policy-v1",
+    "root_budget_id": "root"
+   },
+   "ingress_id": "authenticated-api",
+   "source_ids": [
+    "stage-source-v1"
+   ],
+   "claim_ids": [
+    "stage-claim-v1"
+   ],
+   "subject": "stage-subject-v1",
+   "event_id": "stage-event-v1",
+   "root_request_id": "stage-root-v1",
+   "job_id": "stage-job-v1",
+   "work": {
+    "work_id": "stage-work-v1",
+    "goal": "Use the reviewed metrics to compute remaining items and save my result.",
+    "criteria_version": "assistant-criteria-stage-v1",
+    "result_kind": "answer",
+    "required_checks": [
+     "answer_verified",
+     "artifact_verified",
+     "finish_verified"
+    ],
+    "human_checks": []
+   },
+   "route": {
+    "tenant_id": "00000000-0000-0000-0000-000000000013",
+    "account_id": "fa-stage-account",
+    "recipient_id": "00000000-0000-0000-0000-00000000001b",
+    "channel_id": "authenticated-pull",
+    "thread_id": "stage-thread-v1"
+   },
+   "operation_id": "stage-operation-v1",
+   "attempt_id": "stage-operation-attempt-v1",
+   "grant_id": "stage-operation-grant-v1",
+   "allowed_input_refs": [
+    "stage-goal-v1"
+   ],
+   "context_versions": {
+    "work_revision": 1,
+    "release_version": "release-v1",
+    "catalog_version": "catalog-v1",
+    "memory_schema_version": "memory-v1"
+   }
+  }
+ ],
+ "policies": [
+  {
+   "binding_id": "stage-binding-v1",
+   "policy": {
+    "binding_digest": "c60fd5bc8039d0693856e93f10a5b3a81da8211396e698618e71d669bded46f6",
+    "operation_policy_revision": 1,
+    "active": true,
+    "source_visibility": "team",
+    "purpose": "metrics",
+    "allowed_purposes": [
+     "metrics"
+    ],
+    "max_commands": 64,
+    "max_grant_seconds": 300,
+    "valid_until": "2026-10-02T00:00:00Z",
+    "human_text_enabled": false,
+    "text_policy_version": null
+   }
+  }
+ ],
+ "roots": [
+  {
+   "root_budget_id": "root",
+   "root_request_id": "stage-root-v1",
+   "attempts": 1000,
+   "units": 10000,
+   "control_units": 10000,
+   "scans": 1000,
+   "pending_limit": 32
+  }
+ ],
+ "operations": [
+  {
+   "input_ref": "stage-goal-v1",
+   "binding_id": "stage-binding-v1",
+   "goal": "Review the prepared result against the pinned work requirements."
+  }
+ ],
+ "targets": [
+  {
+   "executor_id": "executor-a",
+   "project_endpoint": "https://cog-fasample-memory-demo.services.ai.azure.com/api/projects/faexample-stage",
+   "agent_id": "00000000-0000-0000-0000-000000000021",
+   "agent_name": "fa-stage-a",
+   "agent_version": "1",
+   "session_id": "fa-stage-a-session-v1",
+   "agent_oid": "00000000-0000-0000-0000-00000000001d"
+  },
+  {
+   "executor_id": "executor-b",
+   "project_endpoint": "https://cog-fasample-memory-demo.services.ai.azure.com/api/projects/faexample-stage",
+   "agent_id": "00000000-0000-0000-0000-000000000022",
+   "agent_name": "fa-stage-b",
+   "agent_version": "1",
+   "session_id": "fa-stage-b-session-v1",
+   "agent_oid": "00000000-0000-0000-0000-00000000001e"
+  },
+  {
+   "executor_id": "executor-c",
+   "project_endpoint": "https://cog-fasample-memory-demo.services.ai.azure.com/api/projects/faexample-stage",
+   "agent_id": "00000000-0000-0000-0000-000000000023",
+   "agent_name": "fa-stage-c",
+   "agent_version": "1",
+   "session_id": "fa-stage-c-session-v1",
+   "agent_oid": "00000000-0000-0000-0000-00000000001f"
+  },
+  {
+   "executor_id": "executor-d",
+   "project_endpoint": "https://cog-fasample-memory-demo.services.ai.azure.com/api/projects/faexample-stage",
+   "agent_id": "00000000-0000-0000-0000-000000000024",
+   "agent_name": "fa-stage-d",
+   "agent_version": "1",
+   "session_id": "fa-stage-d-session-v1",
+   "agent_oid": "00000000-0000-0000-0000-000000000020"
+  }
+ ],
+ "controller_id": "fa-stage-controller-v1",
+ "controller_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample-stage/providers/Microsoft.App/jobs/job-fa-behavior-controller-stage",
+ "api_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample-stage/providers/Microsoft.App/containerApps/ca-fa-behavior-stage",
+ "authentication_version": "behavior-jwt-v1",
+ "review_policy_version": "human-review-v1",
+ "evidence": {
+  "path": "/tmp/fa-stage-runtime/evidence.json",
+  "catalog_id": "fa-stage-native-v1",
+  "observer_oid": "00000000-0000-0000-0000-00000000001b",
+  "minimum_revision": 1,
+  "max_age_seconds": 14400,
+  "inventory_scopes": [
+   "fa-runtime",
+   "storage-lifecycle",
+   "defender-response",
+   "private-network"
+  ]
+ },
+ "tokenizer": {
+  "version": "0.11.0",
+  "encoding": "o200k_base",
+  "cache_directory": "/opt/fa-tokenizer",
+  "accounting_scope": "context-text-sections-only"
+ },
+ "supervisor": {
+  "ticks": 1,
+  "page_limit": 1,
+  "interval_seconds": 2.0,
+  "max_run_seconds": 120.0
+ },
+ "team_pending_limit": 32,
+ "entry_pending_limit": 32,
+ "max_context_tokens": 8192,
+ "max_context_bytes": 1048576,
+ "workload_version": "assistant-v1.2",
+ "automatic_model_repairs": 0,
+ "total_poc_budget_usd": 100,
+ "memory_projections": [],
+ "assistant": {
+  "profiles": [
+   {
+    "binding_id": "stage-binding-v1",
+    "source": {
+     "source_id": "stage-source-v1",
+     "version": 1,
+     "sha256": "3836bd839034d93160f505b6d685ea7a884a628ae0d242244a0ca3cbc1b14d88",
+     "byte_length": 84
+    },
+    "claim_id": "stage-claim-v1",
+    "legacy_source_work": "stage-legacy-source-none",
+    "artifact_id": "stage-report-v1",
+    "artifact_version": "00000000000000000000000000000000",
+    "policy_version": "assistant-own-result-v1",
+    "max_model_requests": 6,
+    "require_operation": false
+   }
+  ],
+  "provider_endpoint": "https://cog-fasample-memory-demo.services.ai.azure.com/api/projects/faexample-stage/openai/v1/chat/completions",
+  "model": "gpt-4.1-mini",
+  "credential_binding": "server-api-uami",
+  "m3_context": {
+   "account_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample-stage/providers/Microsoft.Storage/storageAccounts/stfacontextstagedemo",
+   "endpoint": "https://stfacontextstagedemo.table.core.windows.net",
+   "table_name": "workstate"
+  },
+  "artifact_container_url": "https://stfam1bkstagedemo.blob.core.windows.net/m3-artifacts"
+ }
+}

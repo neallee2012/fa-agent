@@ -1,0 +1,37 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.19/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.19",
+  "version": "1.0.0",
+  "id": "<TEAMS_APP_PACKAGE_ID>",
+  "developer": {
+    "name": "FA POC",
+    "websiteUrl": "<WEBSITE_HTTPS_URL>",
+    "privacyUrl": "<PRIVACY_HTTPS_URL>",
+    "termsOfUseUrl": "<TERMS_HTTPS_URL>"
+  },
+  "name": {
+    "short": "FA Personal POC",
+    "full": "FA same-tenant personal-chat POC"
+  },
+  "description": {
+    "short": "Bounded personal-chat POC for the designated tenant test user.",
+    "full": "A controlled personal-chat proof of concept. No group or channel scope, delegated approval, file upload, calling, or proactive broadcast is enabled. Installation and metadata do not establish native delivery readiness."
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "accentColor": "#1D4ED8",
+  "bots": [
+    {
+      "botId": "<UAMI_CLIENT_ID>",
+      "scopes": ["personal"],
+      "isNotificationOnly": false,
+      "supportsFiles": false,
+      "supportsCalling": false,
+      "supportsVideo": false
+    }
+  ],
+  "defaultInstallScope": "personal",
+  "validDomains": []
+}

@@ -1,0 +1,253 @@
+{
+  "evidence": "OFFLINE real HTTP/Table producers; SDK I/O is a test double; no native/provider/model",
+  "first_command": {
+    "request_id": "poem-one",
+    "content": "  請寫一首關於雨的詩。\n",
+    "authorize_own_result": true
+  },
+  "second_command": {
+    "request_id": "poem-two",
+    "content": "把上一首縮短，保留雨聲。",
+    "authorize_own_result": true,
+    "conversation_id": "0857917cc2d979074e4e1ba5d7101981348722319dc13e6a2bf2f28be90ca38f"
+  },
+  "preflight": {
+    "schema_version": "fa-steady-work-preflight-v1",
+    "read_id": "read-one",
+    "request_id": "poem-one",
+    "submit_body_sha256": "6ba7ef51dd9b2c835ceebf2ec35a70963220b7d9b5937b359c59afa3e92edf1d",
+    "configuration_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "policy_sha256": "f65b57fbac2f6c8247ac5b3a41cc828e77dc6b4cb637c4cb555131d20fb13fa3",
+    "tenant_id": "11111111-1111-1111-1111-111111111111",
+    "team_id": "team-one",
+    "human_oid": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+    "template_binding_id": "binding-one",
+    "binding": {
+      "binding_id": "bf7175693b7be66b9223bb75552f372ecfdc06899941805092bee03e5d5bdd5e",
+      "tenant_id": "11111111-1111-1111-1111-111111111111",
+      "team_id": "team-one",
+      "human_oid": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+      "agent_oid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "owner": {
+        "owner_record_id": "512a15a0768aac7d1c1f5b80d44ae26f6dbca84916f96fb7af38ecf64a704240",
+        "principal_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "epoch": 1,
+        "conversation_id": "7d970152113fa680d5b1f8e41ef5bca3491e8c1cb0c19130aa951fd7d11bc542",
+        "policy_id": "7ac801b8f0a3d22cf280001c53e67464ffa5c12fab0121350e6df6a56b63857c",
+        "root_budget_id": "root"
+      },
+      "ingress_id": "authenticated-api",
+      "source_ids": [
+        "metrics",
+        "dependency"
+      ],
+      "claim_ids": [
+        "claim-one"
+      ],
+      "subject": "metrics-subject",
+      "event_id": "d79c3e5deb6c277c7d3ef5810cb3706f3e9487ba360cf0dcdf5f559e6d1c45b3",
+      "root_request_id": "root-request",
+      "job_id": "83f7c7f1876866e81f4a86d77b339c9d4dbf1681502180dc299eea4f1e08a500",
+      "work": {
+        "work_id": "09547618a488e40048b2a95a9aec8308fdeed365a3fcbb75975fce0ef25b3ddd",
+        "goal": "Follow the original human instruction: 1698c57215552eb89974f3975d56f561dc9e738d31a1b6b70bc0746343e5bf55",
+        "criteria_version": "criteria-v1",
+        "result_kind": "answer",
+        "required_checks": [
+          "sdk_response_saved",
+          "sdk_turn_completed"
+        ],
+        "human_checks": []
+      },
+      "route": {
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "account_id": "account",
+        "recipient_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+        "channel_id": "authenticated-pull",
+        "thread_id": "thread-one"
+      },
+      "operation_id": "9da4c663e321b42095a7cb01615336d79325297468171cf37e75ebfeb609b50b",
+      "attempt_id": "bf28c08d61ea7c841270c5514cd96305f2f6216f418e525b3a52f814b9a4e321",
+      "grant_id": "a5d4973d9b8897e89d88104d8ac3ca1232952e3a661198a0adc07975f88e4790",
+      "allowed_input_refs": [
+        "goal"
+      ],
+      "context_versions": {
+        "work_revision": 1,
+        "release_version": "r1",
+        "catalog_version": "c1",
+        "memory_schema_version": "m1"
+      }
+    },
+    "decision": "allow",
+    "reason": "allowed",
+    "observed_at": "2026-09-15T10:00:00Z",
+    "guard_revision": 13,
+    "execution_deadline": null,
+    "queue_deadline": null,
+    "already_admitted": false,
+    "capacity_available": true,
+    "monetary_budget": {
+      "schema_version": "fa-work-policy-decision-v1",
+      "read_id": "read-one",
+      "policy_id": "same-poc-standing-work",
+      "policy_revision": 1,
+      "decision": "allow",
+      "reason": "allowed",
+      "observed_at": "2026-09-15T10:00:00Z",
+      "budget_id": "419880edfa4dd22d040f0b9637f306244cef9d71dd62404a8b0d6d1e3ad26c40",
+      "unit": "USD-micro",
+      "remaining_microusd": 52520000,
+      "required_microusd": 0,
+      "observed_high_water_microusd": 45480000,
+      "reserved_microusd": 2000000,
+      "safety_reserve_microusd": 10000000,
+      "cumulative_ceiling_microusd": 110000000,
+      "authorization": false,
+      "provider_hard_cap": false
+    },
+    "abstract_attempts_remaining": 20,
+    "abstract_units_remaining": 40,
+    "authorization": false,
+    "conversation_id": "0857917cc2d979074e4e1ba5d7101981348722319dc13e6a2bf2f28be90ca38f",
+    "turn_number": 1,
+    "model": "gpt-4.1-mini"
+  },
+  "submit": {
+    "binding_id": "bf7175693b7be66b9223bb75552f372ecfdc06899941805092bee03e5d5bdd5e",
+    "status": {
+      "job_id": "83f7c7f1876866e81f4a86d77b339c9d4dbf1681502180dc299eea4f1e08a500",
+      "work_id": "09547618a488e40048b2a95a9aec8308fdeed365a3fcbb75975fce0ef25b3ddd",
+      "state": "queued",
+      "generation": 0,
+      "result_forwarded": false,
+      "delivery_id": null,
+      "obligation_fulfilled": false
+    },
+    "conversation_id": "0857917cc2d979074e4e1ba5d7101981348722319dc13e6a2bf2f28be90ca38f",
+    "turn_number": 1,
+    "model": "gpt-4.1-mini"
+  },
+  "second_submit": {
+    "binding_id": "e84b16f3642fc0d32be33bd5e6f9f5d64ce4a89f24735558405d5107582cbd2b",
+    "status": {
+      "job_id": "9758fc0f1be3f07ee09165f3553997323dca1a021487c2087f8cf705aeac1cfe",
+      "work_id": "80e86c9512e0c684890253b4b2d89c2e98b6448beafa4c1635ed2e158a9417af",
+      "state": "queued",
+      "generation": 0,
+      "result_forwarded": false,
+      "delivery_id": null,
+      "obligation_fulfilled": false
+    },
+    "conversation_id": "0857917cc2d979074e4e1ba5d7101981348722319dc13e6a2bf2f28be90ca38f",
+    "turn_number": 2,
+    "model": "gpt-4.1-mini"
+  },
+  "reconcile_missing": {
+    "status": 503,
+    "body": {
+      "error": {
+        "code": "WORK_SUBMIT_UNKNOWN",
+        "message": "Original submission is not fully admitted. Reconcile the same ID; do not resend.",
+        "reconcile_original": true,
+        "automatic_retry": false
+      }
+    }
+  },
+  "reconcile_present": {
+    "binding_id": "bf7175693b7be66b9223bb75552f372ecfdc06899941805092bee03e5d5bdd5e",
+    "status": {
+      "job_id": "83f7c7f1876866e81f4a86d77b339c9d4dbf1681502180dc299eea4f1e08a500",
+      "work_id": "09547618a488e40048b2a95a9aec8308fdeed365a3fcbb75975fce0ef25b3ddd",
+      "state": "succeeded",
+      "generation": 1,
+      "result_forwarded": true,
+      "delivery_id": "dc6cb25bbe48989ce84a2205cbe25eeb6d5bd6d7a0c79420149fbe0924afd61d",
+      "obligation_fulfilled": false
+    },
+    "conversation_id": "0857917cc2d979074e4e1ba5d7101981348722319dc13e6a2bf2f28be90ca38f",
+    "turn_number": 1,
+    "model": "gpt-4.1-mini"
+  },
+  "conversation": {
+    "conversation_id": "0857917cc2d979074e4e1ba5d7101981348722319dc13e6a2bf2f28be90ca38f",
+    "sdk_session_id": "794c5c7efd471bcce0cb4e9273e77a8a9483d822c13ae1931c4f252b5f127116",
+    "can_follow_up": true,
+    "follow_up_blocker": null,
+    "turns": [
+      {
+        "request_id": "poem-one",
+        "binding_id": "bf7175693b7be66b9223bb75552f372ecfdc06899941805092bee03e5d5bdd5e",
+        "job_id": "83f7c7f1876866e81f4a86d77b339c9d4dbf1681502180dc299eea4f1e08a500",
+        "work_id": "09547618a488e40048b2a95a9aec8308fdeed365a3fcbb75975fce0ef25b3ddd",
+        "turn_number": 1,
+        "state": "succeeded",
+        "model_requests": 1,
+        "reply_available": true,
+        "model": "gpt-4.1-mini",
+        "delivery_id": "dc6cb25bbe48989ce84a2205cbe25eeb6d5bd6d7a0c79420149fbe0924afd61d",
+        "progress": {
+          "events": [],
+          "reasoning_summary": {
+            "availability": "not_provided",
+            "source": "copilot-sdk-1.0.13",
+            "text": null
+          }
+        }
+      },
+      {
+        "request_id": "poem-two",
+        "binding_id": "e84b16f3642fc0d32be33bd5e6f9f5d64ce4a89f24735558405d5107582cbd2b",
+        "job_id": "9758fc0f1be3f07ee09165f3553997323dca1a021487c2087f8cf705aeac1cfe",
+        "work_id": "80e86c9512e0c684890253b4b2d89c2e98b6448beafa4c1635ed2e158a9417af",
+        "turn_number": 2,
+        "state": "succeeded",
+        "model_requests": 1,
+        "reply_available": true,
+        "model": "gpt-4.1-mini",
+        "delivery_id": "20df1fd03b1b7f8f909768d94b7512161c5d3e7b886906f92b80f15cd85219bd",
+        "progress": {
+          "events": [],
+          "reasoning_summary": {
+            "availability": "not_provided",
+            "source": "copilot-sdk-1.0.13",
+            "text": null
+          }
+        }
+      }
+    ]
+  },
+  "models": {
+    "default_model": "gpt-4.1-mini",
+    "models": [
+      {
+        "id": "configured-second-model",
+        "display_name": "configured-second-model",
+        "context_window_tokens": null,
+        "max_output_tokens": 32768,
+        "reasoning_summary_available": false
+      },
+      {
+        "id": "gpt-4.1-mini",
+        "display_name": "gpt-4.1-mini",
+        "context_window_tokens": null,
+        "max_output_tokens": 32768,
+        "reasoning_summary_available": false
+      }
+    ]
+  },
+  "reply": {
+    "body": {
+      "schema_version": "fa-assistant-text-result-v1",
+      "text": "第二則真回覆：雨聲輕，晚風停。",
+      "sdk_session_id": "794c5c7efd471bcce0cb4e9273e77a8a9483d822c13ae1931c4f252b5f127116",
+      "conversation_id": "0857917cc2d979074e4e1ba5d7101981348722319dc13e6a2bf2f28be90ca38f",
+      "turn_number": 2
+    },
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "x-content-sha256": "656ff53dc10a79099100447d2eb7c77405193a32e90bce03899baaac9ca6927f"
+    }
+  }
+}

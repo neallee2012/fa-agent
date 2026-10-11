@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "westus3"
+    },
+    "environmentName": {
+      "value": "cae-facontext-stage"
+    },
+    "apiIdentityName": {
+      "value": "id-facontext-api-stage"
+    },
+    "storageName": {
+      "value": "stfacontextstagedemo"
+    },
+    "tableName": {
+      "value": "workstate"
+    },
+    "registryName": {
+      "value": "crfacontextstagedemo"
+    },
+    "foundryAccountName": {
+      "value": "cog-fasample-memory-demo"
+    },
+    "projectName": {
+      "value": "faexample-stage"
+    },
+    "vnetName": {
+      "value": "vnet-facontext-api"
+    },
+    "foundryResourceGroupName": {
+      "value": "rg-faexample"
+    },
+    "logAnalyticsWorkspaceResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample-stage/providers/Microsoft.OperationalInsights/workspaces/log-fa-stage"
+    },
+    "tags": {
+      "value": {
+        "workload": "hosted-sandbox-poc",
+        "architecture": "shared-context",
+        "dataClassification": "synthetic-only",
+        "environment": "stage"
+      }
+    },
+    "foundryDeploymentPrefix": {
+      "value": "stage"
+    },
+    "registryConnectionName": {
+      "value": "stage-container-registry"
+    }
+  }
+}

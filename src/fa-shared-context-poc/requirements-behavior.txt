@@ -1,0 +1,18 @@
+-r requirements.txt
+tiktoken==0.11.0
+tzdata==2026.4
+# API-side MCP client (tool catalog capabilities); transitive pins keep builds on releases older than 7 days.
+mcp==1.30.0
+httpx-sse==0.4.3
+jsonschema==4.25.1
+jsonschema-specifications==2025.9.1
+referencing==0.37.0
+rpds-py==2026.6.3
+attrs==26.1.0
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+python-multipart==0.0.32
+sse-starlette==3.4.11
+pywin32==312; sys_platform == "win32"
+# Realtime hints (v16): API-only Web PubSub publisher; its deps (azure-core, isodate, PyJWT) are already pinned/present.
+azure-messaging-webpubsubservice==1.3.0

@@ -1,0 +1,17 @@
+# Feed reader MCP server (README "Feed reader MCP"); build context: src/fa-shared-context-poc.
+# Only the signature module of shared_context is copied: this app holds no Azure identity, Team data or secret, only
+# the API's public key (FEED_MCP_PUBLIC_KEY).
+FROM python:3.11.14-slim-bookworm
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+COPY requirements-feed-mcp.txt ./
+RUN pip install --no-cache-dir -r requirements-feed-mcp.txt \
+    && pip check \
+    && useradd --create-home --uid 10001 app
+COPY shared_context/__init__.py shared_context/feed_signature.py ./shared_context/
+COPY feed_mcp ./feed_mcp
+USER 10001
+RUN python -c "import feed_mcp.server, feed_mcp.__main__"
+EXPOSE 8080
+ENTRYPOINT ["python", "-m", "feed_mcp"]
+CMD ["serve"]

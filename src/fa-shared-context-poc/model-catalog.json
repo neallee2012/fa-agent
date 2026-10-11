@@ -1,0 +1,135 @@
+[
+  {
+    "capabilities": {
+      "agentsV2": "true",
+      "area": "US",
+      "assistants": "true",
+      "chatCompletion": "true",
+      "responses": "true"
+    },
+    "deployment": "gpt-4.1-mini",
+    "model": {
+      "callRateLimit": null,
+      "format": "OpenAI",
+      "name": "gpt-4.1-mini",
+      "publisher": null,
+      "source": null,
+      "sourceAccount": null,
+      "version": "2025-04-14"
+    },
+    "provisioning": "Succeeded",
+    "sku": {
+      "capacity": 500,
+      "family": null,
+      "name": "GlobalStandard",
+      "size": null,
+      "tier": null
+    }
+  },
+  {
+    "capabilities": {
+      "area": "US",
+      "embeddings": "true",
+      "embeddingsMaxInputs": "2048"
+    },
+    "deployment": "text-embedding-3-small",
+    "model": {
+      "callRateLimit": null,
+      "format": "OpenAI",
+      "name": "text-embedding-3-small",
+      "publisher": null,
+      "source": null,
+      "sourceAccount": null,
+      "version": "1"
+    },
+    "provisioning": "Succeeded",
+    "sku": {
+      "capacity": 10,
+      "family": null,
+      "name": "GlobalStandard",
+      "size": null,
+      "tier": null
+    }
+  },
+  {
+    "capabilities": {
+      "agentsV2": "true",
+      "area": "US",
+      "assistants": "true",
+      "chatCompletion": "true",
+      "responses": "true"
+    },
+    "deployment": "gpt-5.4-mini",
+    "model": {
+      "callRateLimit": null,
+      "format": "OpenAI",
+      "name": "gpt-5.4-mini",
+      "publisher": null,
+      "source": null,
+      "sourceAccount": null,
+      "version": "2026-03-17"
+    },
+    "provisioning": "Succeeded",
+    "sku": {
+      "capacity": 100,
+      "family": null,
+      "name": "GlobalStandard",
+      "size": null,
+      "tier": null
+    }
+  },
+  {
+    "capabilities": {
+      "agentsV2": "true",
+      "area": "US",
+      "assistants": "true",
+      "chatCompletion": "true",
+      "responses": "true"
+    },
+    "deployment": "gpt-6-luna",
+    "model": {
+      "callRateLimit": null,
+      "format": "OpenAI",
+      "name": "gpt-6-luna",
+      "publisher": null,
+      "source": null,
+      "sourceAccount": null,
+      "version": "2026-09-22"
+    },
+    "provisioning": "Succeeded",
+    "sku": {
+      "capacity": 500,
+      "family": null,
+      "name": "GlobalStandard",
+      "size": null,
+      "tier": null
+    }
+  },
+  {
+    "capabilities": {
+      "agentsV2": "true",
+      "area": "US",
+      "assistants": "true",
+      "chatCompletion": "true",
+      "responses": "true"
+    },
+    "deployment": "gpt-6.1-sol",
+    "model": {
+      "callRateLimit": null,
+      "format": "OpenAI",
+      "name": "gpt-6.1-sol",
+      "publisher": null,
+      "source": null,
+      "sourceAccount": null,
+      "version": "2026-09-29"
+    },
+    "provisioning": "Succeeded",
+    "sku": {
+      "capacity": 500,
+      "family": null,
+      "name": "GlobalStandard",
+      "size": null,
+      "tier": null
+    }
+  }
+]

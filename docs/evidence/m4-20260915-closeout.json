@@ -1,0 +1,116 @@
+{
+  "run_id": "m4-context-01",
+  "at": "2026-09-15T08:59:43.062664+00:00",
+  "execution_closeout": "COMPLETED_AFTER_QUALITY_FAILURE",
+  "quality_result": "FAIL",
+  "full_scenario_pass": false,
+  "case_results": {
+    "short-cold": "FAIL",
+    "short-warm": "NOT_RUN_AFTER_FAILURE",
+    "long-warm": "NOT_RUN_AFTER_FAILURE",
+    "long-new-conversation": "NOT_RUN_AFTER_FAILURE",
+    "long-resumed": "NOT_RUN_AFTER_FAILURE"
+  },
+  "counts": {
+    "explicit_stops": 3,
+    "memory_update_submissions": 3,
+    "native_file_downloads": 2,
+    "native_invocations": 16,
+    "new_sessions": 2,
+    "sdk_resumes": 0,
+    "sdk_starts": 1
+  },
+  "active_seconds": 182.31104493141174,
+  "model_attempts": 4,
+  "manual_semantic_source_review": {
+    "completed": true,
+    "failed_checks": [
+      "private_theme_correct",
+      "private_theme_source_terms"
+    ],
+    "earliest_observed_gap": "private_a extraction completion content omitted the concrete cobalt preference",
+    "unsupported_model_fill": "Agent A internal preferences",
+    "provider_internal_reason": "NOT_CONFIRMED"
+  },
+  "inventory": {
+    "at": "2026-09-15T08:54:41.212761+00:00",
+    "a": 100,
+    "b": 56,
+    "non_idle": 0,
+    "source_sha256": "ce7b518d2cb2b9271a427fd25278aad9fa41b78cd0fb93b30aa4543d310cba68"
+  },
+  "cost": {
+    "at": "2026-09-15T08:54:37.763335+00:00",
+    "lagged_mtd_usd": "19.07802700322689707",
+    "conservative_mtd_usd": "27.079258133377022439",
+    "reservation_usd": 10,
+    "total_budget_usd": 100,
+    "not_final_bill": true
+  },
+  "exact_M4_cost": "UNKNOWN_DUE_TO_BILLING_LAG",
+  "resources_retained": true,
+  "deployment": {
+    "api_revision": "ca-facontext-poc--m4-1",
+    "a_version": "16",
+    "b_version": "10",
+    "api_image": "crfacontextpocdemo.azurecr.io/fa-context-api@sha256:5ff02897b6afe1d8105c167119e4f2f676ed60073052ae407c87ddd7335f6ad0",
+    "hosted_image": "crfacontextpocdemo.azurecr.io/fa-context-hosted@sha256:f9d889815915048069822072ba71ee3b328a80400ba96b30bfb56535abdc2120"
+  },
+  "source_freeze_sha256": "c1b970a38411a3cda5cc7383ca75bb3ebff72d3de80c7d45f2b583901c0e5c02",
+  "manifest_sha256": "c417be86d83a693b534fd97aa24fe4f04d2a66122c5233b1a0e6a0d99c6c0539",
+  "M4_code_commit": null,
+  "commit_push_status": "AWAITING_USER_APPROVAL",
+  "resume_authorized": false,
+  "BR01_formal_wiring": "BLOCKED_PENDING_FIXED_CODE_SHA",
+  "schema": 1,
+  "source_kind": "sanitized_native_evidence_catalog",
+  "full_raw_memory_and_sdk_trace_in_git": false,
+  "fixture_sha256": "8f37192bd3c9aa93d4f7855eb5ec133ba368d136772bba96147c4cf19178c090",
+  "chat_model": {
+    "deployment": "gpt-4.1-mini",
+    "version": "2025-04-14"
+  },
+  "embedding_deployment": "text-embedding-3-small",
+  "native_collection_complete": false,
+  "short_cold_native_evidence_verified": true,
+  "checker_cloud_evidence_verified": false,
+  "ten_x_performance": "NOT_EVALUATED",
+  "metrics": {
+    "context_ms": 1603.4753370000008,
+    "e2e_ms": 47541.44287109375,
+    "model_input_tokens": [
+      630,
+      2338,
+      2622,
+      3038
+    ]
+  },
+  "context_bytes": 4930,
+  "artifacts": [
+    {
+      "path": ".azure\\m4-context-01-closeout.json",
+      "bytes": 2641,
+      "sha256": "ad243940bb8a4df57b890c1341d2b8b2ea15eb42c223eb35b1363185e3b8151e"
+    },
+    {
+      "path": ".azure\\m4-context-01-ledger.json",
+      "bytes": 148524,
+      "sha256": "2ce8448565da08efcfb7c9ca28aa120fbb6cd8d7f785356b1684db51ad55828d"
+    },
+    {
+      "path": "evidence\\m4-context-01-operator\\short-cold.final-context.native.json",
+      "bytes": 4930,
+      "sha256": "c176e852ca446524ee01c0b6cac86e3f5125eb289689b222e9351517e3ea5953"
+    },
+    {
+      "path": "evidence\\m4-context-01-operator\\short-cold.final-sdk.native.json",
+      "bytes": 436404,
+      "sha256": "50d6f01e85f3e9c18ad4ed9cda111bf9e4e17f82ca720f7c442efeebdb15ce7c"
+    },
+    {
+      "path": "evidence\\m4-context-01-operator\\short-cold.assessment.json",
+      "bytes": 1881,
+      "sha256": "5a99b02c8033d1c9f27d1fa932d4375841c68a211180287f32d83edba01f189e"
+    }
+  ]
+}

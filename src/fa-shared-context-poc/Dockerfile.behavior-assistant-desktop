@@ -1,0 +1,56 @@
+# Behavior assistant image plus one owned desktop (CAP-05, x11vnc for the live viewer) and preinstalled Playwright MCP (CAP-03);
+# build context: src/fa-shared-context-poc. Same SDK/runtime layers as Dockerfile.behavior-assistant;
+# the slim image stays unchanged for agents without these capabilities.
+# git (SP-16) is for fa-shell-v1 run_command on the Agent's own computer; nothing here sets up a remote, login or push.
+# Playwright runs its own pinned Chromium (the chrome-for-testing channel that the catalog's --browser chromium
+# selects): headless, or on the Agent's desktop when the turn has one, where the desktop starts this same
+# executable once with a persistent profile and the MCP attaches over CDP; nothing is downloaded at run time.
+FROM node:22.23.2-bookworm-slim AS fa-tools
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/fa-tools/ms-playwright
+WORKDIR /opt/fa-tools/playwright-mcp
+COPY tools/playwright-mcp/package.json tools/playwright-mcp/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && node node_modules/playwright-core/cli.js install --no-shell chromium \
+    && install -d -m 0755 /opt/fa-tools/bin \
+    && printf '#!/bin/sh\nexec /usr/local/bin/node /opt/fa-tools/playwright-mcp/node_modules/@playwright/mcp/cli.js "$@"\n' \
+        > /opt/fa-tools/bin/playwright-mcp
+
+FROM python:3.11.14-slim-bookworm
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HOME=/home/session
+ENV COPILOT_CLI_EXTRACT_DIR=/opt/copilot/1.0.83
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
+        xvfb openbox xdotool x11-utils imagemagick l3afpad procps x11vnc git \
+        fonts-dejavu-core fonts-liberation fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=fa-tools /usr/local/bin/node /usr/local/bin/node
+COPY --from=fa-tools /opt/fa-tools /opt/fa-tools
+RUN node /opt/fa-tools/playwright-mcp/node_modules/playwright-core/cli.js install-deps chromium \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod 0755 /opt/fa-tools/bin/playwright-mcp \
+    && chmod -R a+rX,go-w /opt/fa-tools
+COPY requirements-hosted.txt .
+RUN pip install --no-cache-dir -r requirements-hosted.txt \
+    && python -m copilot download-runtime \
+    && chmod -R a+rX /opt/copilot/1.0.83 \
+    && test -x /opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime \
+    && useradd --create-home --uid 10001 app \
+    && install -d -m 0755 /home/session
+COPY shared_context ./shared_context
+COPY hosted_bootstrap.py behavior_server_main.py behavior_assistant_main.py runtime_probe.py ./
+ENV COPILOT_SKIP_CLI_DOWNLOAD=1
+ENV BEHAVIOR_ASSISTANT_RUNTIME_PATH=/opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime
+USER 10001
+# fa-shell-v1 commands run as this UID: every code and tool path must stay read-only for it.
+RUN python -c "import os,sys; bad=[p for r in ('/app','/usr/local','/opt/copilot','/opt/fa-tools') for d,_,fs in os.walk(r) for p in (d,*(os.path.join(d,f) for f in fs)) if os.access(p,os.W_OK)]; sys.exit('writable by UID10001: '+' '.join(bad[:5]) if bad else 0)" \
+    && python -c "import behavior_assistant_main" && python runtime_probe.py \
+    && python -c "from shared_context.behavior_desktop import prerequisites; prerequisites()" \
+    && command -v x11vnc > /dev/null \
+    && git --version > /dev/null \
+    && /opt/fa-tools/bin/playwright-mcp --help > /dev/null \
+    && test "$(ls -d /opt/fa-tools/ms-playwright/chromium-*/chrome-linux64/chrome | wc -l)" = 1 \
+    && cd /tmp && HOME=/tmp PLAYWRIGHT_BROWSERS_PATH=/opt/fa-tools/ms-playwright node -e "const {chromium}=require('/opt/fa-tools/playwright-mcp/node_modules/playwright-core'); chromium.launch({channel:'chrome-for-testing',headless:true}).then(async b=>{const p=await b.newPage(); await p.setContent('<h1>fa-tools-ok</h1>'); const t=await p.textContent('h1'); await b.close(); if(t!=='fa-tools-ok') process.exit(1);})"
+USER 0
+EXPOSE 8088
+CMD ["python", "behavior_server_main.py", "assistant-hosted-bootstrap"]

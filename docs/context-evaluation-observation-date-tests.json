@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "scope": "evaluation_tooling_observation_date_regressions",
+  "recorded_at": "2026-09-24T08:10:50.199420+00:00",
+  "result": "pass",
+  "passed": 91,
+  "failed": 0,
+  "duration_seconds": 1.19,
+  "source_snapshot_sha256": "956299eb0dd3f719783262a62e300225bc1072d63f54e1b4f713b4fded3328c7",
+  "source_snapshot": {
+    "git_head": "b6dc783198020a684547ede9dfd86f96400bce3a",
+    "source_state": "working_tree_observation_date_fix",
+    "files": {
+      "controller/context_target_eval.py": "89b9c3f6e4e3b9f2652f11cc97a65ea9c127040a50393539555a3e25c02037df",
+      "tests/context_eval/test_context_target_eval.py": "5d1fa4f49f8898cba24f13f22e7e961063cbc190b453cfc3d083069b3f0ec41c",
+      "controller/m4_context_eval.py": "017c07da10ede91d78e9a6626aaa37adf827f26d1fa8f5b1e4acf89f49fdd040",
+      "tests/context_eval/test_m4_context_eval.py": "d086bf766a72fb39af9a10c4c1bfd5d9ba1c93ab1f4f82e4c2e5d24fa0f965c7",
+      "docs/grok-aligned-target-state.md": "d65e9e730f1932a09b55acac8af439dbefc22147922f11c259d57b1b3a6ab380"
+    },
+    "environment": {
+      "python": "3.12.10",
+      "pytest": "9.1.1",
+      "platform": "Windows AMD64"
+    }
+  },
+  "log_sha256": "b5da53f61688928777458a5c7a5bb8c281de5b4f47dbf566b12d20d617fd895c",
+  "raw_log_included": false,
+  "guidelines_adopted": "a811f634615945c3f92c6fd860aa9bcdaddf8a93",
+  "sdk_or_model_requests": 0,
+  "azure_requests": 0,
+  "opus_review_clean_claimed": false
+}

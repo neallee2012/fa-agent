@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "WebIQ": {
+      "type": "toolbox",
+      "toolbox": "fa-org-tools",
+      "server_label": "WebIQ",
+      "tools": ["web", "browse"]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+**
+!src/
+!src/fa-shared-context-poc/
+!src/fa-shared-context-poc/Dockerfile.hosted
+!src/fa-shared-context-poc/requirements-hosted.txt
+!src/fa-shared-context-poc/hosted_main.py
+!src/fa-shared-context-poc/hosted_bootstrap.py
+!src/fa-shared-context-poc/shared_context/
+!src/fa-shared-context-poc/shared_context/*.py
+!src/fa-hosted-sandbox-poc/
+!src/fa-hosted-sandbox-poc/desktop_smoke.py

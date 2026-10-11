@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+import hashlib
+import os
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+
+from shared_context.errors import Problem
+from shared_context.m3_cli import main
+from shared_context.m3_client import ArtifactClient
+from shared_context.m3_models import ApprovalInput
+from test_m3_api import client
+from test_m3_artifacts import HUMAN, V1, V2, create, m3, upload
+
+
+def test_cli_download_is_verified_complete_and_never_overwrites_user_files(m3, tmp_path):
+    service, _, _ = m3
+    create(service)
+    upload(service)
+    consumer = ArtifactClient(client(service, HUMAN), HUMAN.team, lambda: "synthetic-token")
+    output = tmp_path / "delivered.txt"
+    version = consumer.download("report", V1, output)
+    assert output.read_bytes() == b"report v1\n"
+    assert version.sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
+    output.write_bytes(b"user modification")
+    with patch.object(consumer.http, "stream", wraps=consumer.http.stream) as request:
+        with pytest.raises(FileExistsError):
+            consumer.download("report", V1, output)
+    request.assert_not_called()
+    assert output.read_bytes() == b"user modification"
+    assert list(tmp_path.glob(".fa-m3-download-*")) == []
+
+
+def test_racing_download_destination_preserves_existing_data(m3, tmp_path):
+    service, _, _ = m3
+    create(service)
+    upload(service)
+    consumer = ArtifactClient(client(service, HUMAN), HUMAN.team, lambda: "synthetic-token")
+    destination = tmp_path / "racing.txt"
+    native_link = os.link
+
+    def race(source, target):
+        destination.write_bytes(b"racing user file")
+        native_link(source, target)
+
+    with patch("shared_context.m3_client.os.link", side_effect=race), pytest.raises(FileExistsError):
+        consumer.download("report", V1, destination)
+    assert destination.read_bytes() == b"racing user file"
+    assert list(tmp_path.glob(".fa-m3-download-*")) == []
+
+
+def test_download_integrity_error_does_not_create_output(m3, tmp_path):
+    service, _, _ = m3
+    create(service)
+    upload(service)
+    consumer = ArtifactClient(client(service, HUMAN), HUMAN.team, lambda: "synthetic-token")
+    native_request = consumer._request
+
+    def corrupt(method, path, **kwargs):
+        headers, data = native_request(method, path, **kwargs)
+        return (headers, b"wrong bytes") if kwargs.get("binary") else (headers, data)
+
+    with patch.object(consumer, "_request", side_effect=corrupt), pytest.raises(Problem):
+        consumer.download("report", V1, tmp_path / "bad.txt")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cli_submits_an_exact_decision_once_and_checks_receipt(m3):
+    service, _, _ = m3
+    create(service, "sop")
+    upload(service)
+    consumer = ArtifactClient(client(service, HUMAN), HUMAN.team, lambda: "synthetic-token")
+    snapshot = consumer.get("report")
+    version = consumer.version(snapshot, V1)
+    body = ApprovalInput(decision_id=V1, version_id=V1, decision="approve", sha256=version.sha256)
+    with patch.object(consumer.http, "stream", wraps=consumer.http.stream) as requests:
+        result = consumer.decide("report", snapshot, body)
+    assert requests.call_count == 1
+    assert result.payload["effective_version_id"] == V1
+
+
+def test_cli_does_not_retry_an_unknown_decision(m3):
+    service, _, _ = m3
+    create(service, "sop")
+    upload(service)
+    consumer = ArtifactClient(client(service, HUMAN), HUMAN.team, lambda: "synthetic-token")
+    snapshot = consumer.get("report")
+    body = ApprovalInput(decision_id=V1, version_id=V1, decision="approve", sha256=consumer.version(snapshot, V1).sha256)
+    with patch.object(consumer.http, "stream", side_effect=httpx.ReadTimeout("lost response")) as requests:
+        with pytest.raises(Problem) as exc:
+            consumer.decide("report", snapshot, body)
+    assert exc.value.body["error"]["code"] == "M3_REQUEST_UNKNOWN"
+    requests.assert_called_once()
+
+
+def test_reading_old_snapshot_does_not_approve_a_newer_proposal(m3):
+    service, _, _ = m3
+    create(service, "sop")
+    upload(service)
+    consumer = ArtifactClient(client(service, HUMAN), HUMAN.team, lambda: "synthetic-token")
+    snapshot = consumer.get("report")
+    upload(service, V2, b"a newer proposal")
+    body = ApprovalInput(decision_id=V1, version_id=V1, decision="approve", sha256=consumer.version(snapshot, V1).sha256)
+    with pytest.raises(Problem) as exc:
+        consumer.decide("report", snapshot, body)
+    assert exc.value.status == 412
+    assert service.get(HUMAN, HUMAN.team, "report").payload["effective_version_id"] is None
+
+
+def test_http_redirects_do_not_forward_credentials_to_another_origin():
+    seen = []
+
+    def respond(request):
+        seen.append(request)
+        return httpx.Response(307, headers={"Location": "https://outside.invalid/receive"}, json={
+            "error": {"code": "REDIRECT_DENIED", "message": "synthetic redirect"},
+        })
+
+    with httpx.Client(base_url="https://testserver", transport=httpx.MockTransport(respond)) as http:
+        consumer = ArtifactClient(http, HUMAN.team, lambda: "synthetic-token")
+        with pytest.raises(Problem):
+            consumer.get("report")
+    assert len(seen) == 1 and seen[0].url.host == "testserver"
+
+
+@pytest.mark.parametrize("payload", [
+    b"not-json", b"[]", b'{"versions":[]}',
+    b'{"error":{"code":"SYNTHETIC","message":"not an artifact"}}',
+])
+def test_invalid_metadata_is_never_presented_as_a_valid_artifact(payload):
+    with httpx.Client(base_url="https://testserver", transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, content=payload),
+    )) as http:
+        with pytest.raises(Problem):
+            ArtifactClient(http, HUMAN.team, lambda: "synthetic-token").get("report")
+
+
+def test_main_refuses_noninteractive_approval_before_opening_login(monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with patch("shared_context.m3_cli.InteractiveBrowserCredential") as credential:
+        result = main([
+            "--api", "https://poc.example.westus3.azurecontainerapps.io",
+            "--tenant", "11111111-1111-1111-1111-111111111111",
+            "--audience", "api://22222222-2222-2222-2222-222222222222",
+            "--client-id", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "--team", HUMAN.team,
+            "approve", "report", "--version", V1, "--sha256", "0" * 64,
+        ])
+    assert result == 1
+    credential.assert_not_called()
+
+
+@pytest.mark.parametrize("answer,expected", [("approve", 0), ("cancel", 1)])
+def test_human_cli_preview_and_confirmation_control_the_actual_decision(m3, monkeypatch, capsys, answer, expected):
+    service, _, _ = m3
+    create(service, "sop")
+    record = upload(service)
+    digest = record.payload["versions"][0]["sha256"]
+    http = client(service, HUMAN)
+    credential = MagicMock()
+    credential.__enter__.return_value = credential
+    credential.get_token.return_value = SimpleNamespace(token="synthetic-human-token")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with patch("shared_context.m3_cli.InteractiveBrowserCredential", return_value=credential), \
+            patch("shared_context.m3_cli.httpx.Client", return_value=http), \
+            patch("builtins.input", return_value=answer):
+        outcome = main([
+            "--api", "https://poc.example.westus3.azurecontainerapps.io",
+            "--tenant", "11111111-1111-1111-1111-111111111111",
+            "--audience", "api://22222222-2222-2222-2222-222222222222",
+            "--client-id", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "--team", HUMAN.team,
+            "approve", "report", "--version", V1, "--sha256", digest, "--decision-id", V1,
+        ])
+    assert outcome == expected
+    credential.authenticate.assert_called_once_with(
+        scopes=["api://22222222-2222-2222-2222-222222222222/Artifacts.Approve"],
+    )
+    captured = capsys.readouterr()
+    assert "report v1" in captured.out and digest in captured.out
+    assert "synthetic-human-token" not in captured.out + captured.err
+    assert service.get(HUMAN, HUMAN.team, "report").payload["effective_version_id"] == (V1 if expected == 0 else None)
+
+
+@pytest.mark.parametrize("failure", [
+    "metadata_timeout", "content_timeout", "decision_timeout", "metadata_connect_error", "metadata_repeated_timeout",
+])
+def test_cli_retries_only_preview_timeouts_once_without_reauthenticating(m3, monkeypatch, capsys, failure):
+    service, _, _ = m3
+    create(service, "sop")
+    record = upload(service)
+    digest = record.payload["versions"][0]["sha256"]
+    http = client(service, HUMAN)
+    original_stream = http.stream
+    calls, failed = [], []
+
+    def stream(method, path, **kwargs):
+        phase = "decision" if method == "POST" else ("content" if path.endswith("/content") else "metadata")
+        calls.append(phase)
+        if failure.startswith(phase + "_") and (not failed or failure == "metadata_repeated_timeout"):
+            failed.append(phase)
+            if phase == "decision":
+                with original_stream(method, path, **kwargs) as response:
+                    response.read()
+                    assert response.status_code == 200
+            error = httpx.ConnectError if failure == "metadata_connect_error" else httpx.ReadTimeout
+            raise error("sensitive diagnostic text must not be printed")
+        return original_stream(method, path, **kwargs)
+
+    credential = MagicMock()
+    credential.__enter__.return_value = credential
+    credential.get_token.return_value = SimpleNamespace(token="synthetic-human-token")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with patch("shared_context.m3_cli.InteractiveBrowserCredential", return_value=credential), \
+            patch("shared_context.m3_cli.httpx.Client", return_value=http), \
+            patch.object(http, "stream", side_effect=stream), \
+            patch("builtins.input", return_value="approve") as confirm:
+        outcome = main([
+            "--api", "https://poc.example.westus3.azurecontainerapps.io",
+            "--tenant", "11111111-1111-1111-1111-111111111111",
+            "--audience", "api://22222222-2222-2222-2222-222222222222",
+            "--client-id", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "--team", HUMAN.team,
+            "approve", "report", "--version", V1, "--sha256", digest, "--decision-id", V1,
+        ])
+    recovered = failure in ("metadata_timeout", "content_timeout")
+    decision_sent = recovered or failure == "decision_timeout"
+    assert outcome == (0 if recovered else 1)
+    assert calls.count("decision") == int(decision_sent)
+    assert confirm.call_count == int(decision_sent)
+    credential.authenticate.assert_called_once()
+    phase = failure.split("_")[0]
+    read_retry = failure in ("metadata_timeout", "content_timeout", "metadata_repeated_timeout")
+    assert calls.count(phase) == (2 if read_retry else 1)
+    captured = capsys.readouterr()
+    assert ("M3_READ_RETRY" in captured.err) == read_retry
+    if not recovered:
+        assert f'"phase": "{phase}"' in captured.err
+    assert "sensitive diagnostic text" not in captured.out + captured.err
+    assert "synthetic-human-token" not in captured.out + captured.err
+    assert service.get(HUMAN, HUMAN.team, "report").payload["effective_version_id"] == (V1 if decision_sent else None)

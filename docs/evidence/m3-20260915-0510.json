@@ -1,0 +1,357 @@
+{
+  "run_id": "m3-artifacts-01",
+  "status": "CORE_E2E_PASS_WITH_RETAINED_FAILURES",
+  "core_e2e_pass": true,
+  "full_scenario_pass": false,
+  "retained_failures": {
+    "deliverable-v1": "OUTPUT_FORMAT_MISMATCH",
+    "sop-v1": "RETIRED_UNKNOWN_NOT_REPLAYED",
+    "sop-v3-version-read": {
+      "http_status": 500,
+      "code": "server_error",
+      "request_id": "f95c2fda0d22ded645dcf4bcb91c5fc6",
+      "job_replayed": false,
+      "later_read_verified": true
+    }
+  },
+  "region": "westus3",
+  "deployment": {
+    "api_revision": "ca-facontext-poc--m3-2",
+    "a_version": "15",
+    "b_version": "9"
+  },
+  "versions": {
+    "deliverable-v1": {
+      "artifact_id": "m3-artifacts-01-deliverable",
+      "version": {
+        "filename": "result.txt",
+        "media_type": "text/plain",
+        "sha256": "e2118fb14ca57fd2fe0ccdabf69ede324f6c4795690a9a8147b54bc56c15a422",
+        "source_work": "m3-artifacts-01-w-deliverable-v1",
+        "version_id": "a3e569b2d33b88a70975ac9c62b8fcdd",
+        "number": 1,
+        "blob": {
+          "native_version": "2026-09-15T01:00:10.4427725Z",
+          "etag": "\"0x8DF12C4B11F98CD\"",
+          "sha256": "e2118fb14ca57fd2fe0ccdabf69ede324f6c4795690a9a8147b54bc56c15a422",
+          "bytes": 142
+        },
+        "created_by_oid": "00000000-0000-0000-0000-00000000004d",
+        "source_work_revision": 2,
+        "created_at": "2026-09-15T01:00:09.685820+00:00"
+      },
+      "delivery_verified": true,
+      "output_format": false
+    },
+    "deliverable-v2": {
+      "artifact_id": "m3-artifacts-01-deliverable",
+      "version": {
+        "filename": "result.txt",
+        "media_type": "text/plain",
+        "sha256": "18c4446933569a327c543286e7840213e29bb0750673f1d7fcf3e642aa70b174",
+        "source_work": "m3-artifacts-01-w-deliverable-v2",
+        "version_id": "41e248c76c0d6c6ca83e824d6e6db404",
+        "number": 2,
+        "blob": {
+          "native_version": "2026-09-15T01:47:22.2506318Z",
+          "etag": "\"0x8DF12CB49030847\"",
+          "sha256": "18c4446933569a327c543286e7840213e29bb0750673f1d7fcf3e642aa70b174",
+          "bytes": 156
+        },
+        "created_by_oid": "00000000-0000-0000-0000-00000000004d",
+        "source_work_revision": 2,
+        "created_at": "2026-09-15T01:47:22.236039+00:00"
+      },
+      "delivery_verified": true,
+      "output_format": true
+    },
+    "repair-sop-v1": {
+      "artifact_id": "m3-artifacts-01-sop-repair",
+      "version": {
+        "filename": "result.txt",
+        "media_type": "text/plain",
+        "sha256": "47c682d192a8364284b82b48ad638cbac195102189c4b9f80218fd904a1fe8d8",
+        "source_work": "m3-artifacts-01-w-repair-sop-v1",
+        "version_id": "22b40dca4920d6ec640fbe5abb52cc4d",
+        "number": 1,
+        "blob": {
+          "native_version": "2026-09-15T03:06:53.7860214Z",
+          "etag": "\"0x8DF12D66511B476\"",
+          "sha256": "47c682d192a8364284b82b48ad638cbac195102189c4b9f80218fd904a1fe8d8",
+          "bytes": 18
+        },
+        "created_by_oid": "00000000-0000-0000-0000-00000000004d",
+        "source_work_revision": 2,
+        "created_at": "2026-09-15T03:06:53.696994+00:00",
+        "approval": {
+          "decision_id": "4f6f328df52472cf0b820efb9d495a2a",
+          "version_id": "22b40dca4920d6ec640fbe5abb52cc4d",
+          "sha256": "47c682d192a8364284b82b48ad638cbac195102189c4b9f80218fd904a1fe8d8",
+          "decision": "approve",
+          "approver_oid": "00000000-0000-0000-0000-00000000001b",
+          "decided_at": "2026-09-15T04:38:43.909723+00:00"
+        }
+      },
+      "delivery_verified": true,
+      "output_format": null
+    },
+    "repair-consumer-v1": {
+      "artifact_id": "m3-artifacts-01-repair-consumer-v1",
+      "version": {
+        "filename": "result.txt",
+        "media_type": "text/plain",
+        "sha256": "63a9f59222332a40a6f779a47c58208a56aa8fba33c3b8210e8827c327ad6da1",
+        "source_work": "m3-artifacts-01-w-repair-consumer-v1",
+        "version_id": "13136acec8c5c34039e344061a12e463",
+        "number": 1,
+        "blob": {
+          "native_version": "2026-09-15T04:42:15.3181464Z",
+          "etag": "\"0x8DF12E3B75E3918\"",
+          "sha256": "63a9f59222332a40a6f779a47c58208a56aa8fba33c3b8210e8827c327ad6da1",
+          "bytes": 19
+        },
+        "created_by_oid": "00000000-0000-0000-0000-00000000004d",
+        "source_work_revision": 2,
+        "created_at": "2026-09-15T04:42:15.285986+00:00"
+      },
+      "delivery_verified": true,
+      "output_format": true
+    },
+    "repair-sop-v2": {
+      "artifact_id": "m3-artifacts-01-sop-repair",
+      "version": {
+        "filename": "result.txt",
+        "media_type": "text/plain",
+        "sha256": "0e5339e8c2a51fff1d4216f2785d6f22b9cf4d0ff352d2b0de166b8fe5b8228f",
+        "source_work": "m3-artifacts-01-w-repair-sop-v2",
+        "version_id": "6bd9370c4e0e13123844c71bf1f09ddc",
+        "number": 2,
+        "blob": {
+          "native_version": "2026-09-15T04:43:53.8374216Z",
+          "etag": "\"0x8DF12E3F2171248\"",
+          "sha256": "0e5339e8c2a51fff1d4216f2785d6f22b9cf4d0ff352d2b0de166b8fe5b8228f",
+          "bytes": 18
+        },
+        "created_by_oid": "00000000-0000-0000-0000-00000000004d",
+        "source_work_revision": 2,
+        "created_at": "2026-09-15T04:43:53.816268+00:00",
+        "approval": {
+          "decision_id": "122fec02f6c50e387f1fe07c99c82168",
+          "version_id": "6bd9370c4e0e13123844c71bf1f09ddc",
+          "sha256": "0e5339e8c2a51fff1d4216f2785d6f22b9cf4d0ff352d2b0de166b8fe5b8228f",
+          "decision": "reject",
+          "approver_oid": "00000000-0000-0000-0000-00000000001b",
+          "decided_at": "2026-09-15T04:52:34.943196+00:00"
+        }
+      },
+      "delivery_verified": true,
+      "output_format": null
+    },
+    "repair-sop-v3": {
+      "artifact_id": "m3-artifacts-01-sop-repair",
+      "version": {
+        "filename": "result.txt",
+        "media_type": "text/plain",
+        "sha256": "8ca595e5201e7069aee68127fa2d451b18a40aaf75ad645ef985f6f590fa0d2c",
+        "source_work": "m3-artifacts-01-w-repair-sop-v3",
+        "version_id": "57f3ccdd2ff512b90ded888d8d9a2ec8",
+        "number": 3,
+        "blob": {
+          "native_version": "2026-09-15T04:55:25.9424348Z",
+          "etag": "\"0x8DF12E58E9DEA5C\"",
+          "sha256": "8ca595e5201e7069aee68127fa2d451b18a40aaf75ad645ef985f6f590fa0d2c",
+          "bytes": 18
+        },
+        "created_by_oid": "00000000-0000-0000-0000-00000000004d",
+        "source_work_revision": 3,
+        "created_at": "2026-09-15T04:55:25.916573+00:00",
+        "approval": {
+          "decision_id": "310752fcdcb7a72a77dd7b4d02e34f3d",
+          "version_id": "57f3ccdd2ff512b90ded888d8d9a2ec8",
+          "sha256": "8ca595e5201e7069aee68127fa2d451b18a40aaf75ad645ef985f6f590fa0d2c",
+          "decision": "approve",
+          "approver_oid": "00000000-0000-0000-0000-00000000001b",
+          "decided_at": "2026-09-15T05:06:17.036493+00:00"
+        }
+      },
+      "delivery_verified": true,
+      "output_format": null
+    },
+    "repair-consumer-v3": {
+      "artifact_id": "m3-artifacts-01-repair-consumer-v3",
+      "version": {
+        "filename": "result.txt",
+        "media_type": "text/plain",
+        "sha256": "7d75dcc02c9f7c7ac096bfdcc2eead54b254ea92124170a0ed819f9669af32ea",
+        "source_work": "m3-artifacts-01-w-repair-consumer-v3",
+        "version_id": "30edfe7794fbfba0b76a3c52f8200261",
+        "number": 1,
+        "blob": {
+          "native_version": "2026-09-15T05:08:20.1079970Z",
+          "etag": "\"0x8DF12E75C0E0DA0\"",
+          "sha256": "7d75dcc02c9f7c7ac096bfdcc2eead54b254ea92124170a0ed819f9669af32ea",
+          "bytes": 19
+        },
+        "created_by_oid": "00000000-0000-0000-0000-00000000004d",
+        "source_work_revision": 2,
+        "created_at": "2026-09-15T05:08:20.083306+00:00"
+      },
+      "delivery_verified": true,
+      "output_format": true
+    }
+  },
+  "human_decisions": [
+    {
+      "step": "approve-v1",
+      "decision": {
+        "decision_id": "4f6f328df52472cf0b820efb9d495a2a",
+        "version_id": "22b40dca4920d6ec640fbe5abb52cc4d",
+        "sha256": "47c682d192a8364284b82b48ad638cbac195102189c4b9f80218fd904a1fe8d8",
+        "decision": "approve",
+        "approver_oid": "00000000-0000-0000-0000-00000000001b",
+        "decided_at": "2026-09-15T04:38:43.909723+00:00"
+      },
+      "source": ".azure\\m3-human-approve-v1-20260915-123756-191.log",
+      "source_sha256": "aee9e74a2ef19091ae98b234d3795a166a39f66c3c289114209e81d05dc0f229",
+      "read_timeout_retry_observed": false,
+      "effective_version_id": "22b40dca4920d6ec640fbe5abb52cc4d"
+    },
+    {
+      "step": "reject-v2",
+      "decision": {
+        "decision_id": "122fec02f6c50e387f1fe07c99c82168",
+        "version_id": "6bd9370c4e0e13123844c71bf1f09ddc",
+        "sha256": "0e5339e8c2a51fff1d4216f2785d6f22b9cf4d0ff352d2b0de166b8fe5b8228f",
+        "decision": "reject",
+        "approver_oid": "00000000-0000-0000-0000-00000000001b",
+        "decided_at": "2026-09-15T04:52:34.943196+00:00"
+      },
+      "source": ".azure\\m3-human-reject-v2-20260915-125139-548.log",
+      "source_sha256": "9c944c47e0a3eeec05638f49ed3ac7742343d8484a858ba5bc16e070cb143748",
+      "read_timeout_retry_observed": true,
+      "effective_version_id": "22b40dca4920d6ec640fbe5abb52cc4d"
+    },
+    {
+      "step": "approve-v3",
+      "decision": {
+        "decision_id": "310752fcdcb7a72a77dd7b4d02e34f3d",
+        "version_id": "57f3ccdd2ff512b90ded888d8d9a2ec8",
+        "sha256": "8ca595e5201e7069aee68127fa2d451b18a40aaf75ad645ef985f6f590fa0d2c",
+        "decision": "approve",
+        "approver_oid": "00000000-0000-0000-0000-00000000001b",
+        "decided_at": "2026-09-15T05:06:17.036493+00:00"
+      },
+      "source": ".azure\\m3-human-approve-v3-20260915-130532-312.log",
+      "source_sha256": "811464548511ee16f0fef5e797546f6062c3e5a25caf7bc55754a9fc6879e517",
+      "read_timeout_retry_observed": true,
+      "effective_version_id": "57f3ccdd2ff512b90ded888d8d9a2ec8"
+    }
+  ],
+  "policy_gates": {
+    "unapproved_content_absent": true,
+    "agent_decision_status": 403,
+    "agent_decision_error": "M3_HUMAN_REQUIRED",
+    "unapproved_v2_retains_v1": true,
+    "rejected_v2_retains_v1": true,
+    "effective_version_id": "57f3ccdd2ff512b90ded888d8d9a2ec8",
+    "consumer_v1_output": "APPROVED_POLICY=V1\n",
+    "consumer_v3_output": "APPROVED_POLICY=V3\n",
+    "consumer_v3_trace_read_context_verified": true,
+    "consumer_v3_trace_sha256": "1b31a489ef932cfc260cac199cc76817f19b617b3f1e623d617737f140c87857",
+    "consumer_v3_sdk_session_id": "00000000-0000-0000-0000-00000000004e",
+    "not_a_blind_model_comparison": true
+  },
+  "accounting": {
+    "counts": {
+      "native_invocations": 72,
+      "sdk_jobs": 8,
+      "explicit_stops": 7,
+      "native_file_downloads": 2,
+      "new_sessions": 2
+    },
+    "limits": {
+      "native_invocations": 80,
+      "sdk_jobs": 8,
+      "explicit_stops": 7,
+      "native_file_downloads": 24,
+      "new_sessions": 2,
+      "active_test_seconds": 3600,
+      "owned_active_sessions": 1,
+      "all_active_sessions": 2,
+      "model_attempts": 80
+    },
+    "active_seconds": 1471.357855796814,
+    "model": "gpt-4.1-mini",
+    "model_version": "2025-04-14",
+    "model_attempts": 59,
+    "model_remaining": 21,
+    "attempt_states": {
+      "upstream_response": 59
+    },
+    "reported_usage": {
+      "prompt_tokens": 137142,
+      "completion_tokens": 1684,
+      "total_tokens": 138826
+    },
+    "budget_delivery_state": "unknown",
+    "human_blob_downloads": 2,
+    "new_sdk_jobs_allowed": false
+  },
+  "closeout": {
+    "at": "2026-09-15T05:09:58.578100+00:00",
+    "active_since": null,
+    "all_inventoried_sessions_idle": true,
+    "inventories": {
+      "a": {
+        "total": 99,
+        "states": {
+          "idle": 99
+        },
+        "source_sha256": "22131251b40541a5bcfc18514681c182084e69fc510f1505fcb4cdf640f72294"
+      },
+      "b": {
+        "total": 55,
+        "states": {
+          "idle": 55
+        },
+        "source_sha256": "f172e00e42500355c7ade2b0121b232d592280526df399f3d54839faf54ff854"
+      }
+    },
+    "cost": {
+      "at": "2026-09-15T05:10:16.756105+00:00",
+      "lagged_mtd_usd": "18.16541083236238097",
+      "not_final_bill": true,
+      "reservation_usd": 10
+    },
+    "conservative_previous_mtd_usd": "27.079258133377022439",
+    "total_budget_usd": 100,
+    "m3_reservation_usd": 10,
+    "m3_exact_cost_known": false,
+    "retained_resources_may_bill": true,
+    "m2_ui_status": "PARTIAL_UNCHANGED",
+    "shared_mount_proven": false
+  },
+  "provenance": {
+    "manifest": ".azure\\m3-final-evidence-manifest.json",
+    "manifest_sha256": "6f64ab61091a81e8e51c7da0a2aa61e777ff7ca482f6fe35444550b98ace7e8f",
+    "source_file_count": 684,
+    "source_total_bytes": 6088605,
+    "ledger_sha256": "3632e0a19c3699933efe3304feab6d160e658b73d3ceb0af07f748d8edf6f8b2",
+    "raw_sources_in_git": false,
+    "raw_tokens_or_memory_exported": false
+  },
+  "downloadable_synthetic_outputs": {
+    "m3-deliverable-v1.txt": {
+      "bytes": 142,
+      "sha256": "e2118fb14ca57fd2fe0ccdabf69ede324f6c4795690a9a8147b54bc56c15a422"
+    },
+    "m3-deliverable-v2.txt": {
+      "bytes": 156,
+      "sha256": "18c4446933569a327c543286e7840213e29bb0750673f1d7fcf3e642aa70b174"
+    },
+    "m3-consumer-v3.txt": {
+      "bytes": 19,
+      "sha256": "7d75dcc02c9f7c7ac096bfdcc2eead54b254ea92124170a0ed819f9669af32ea"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "westus3"
+    },
+    "workspaceName": {
+      "value": "log-fa-dev"
+    },
+    "appInsightsName": {
+      "value": "appi-fa-dev"
+    },
+    "foundryResourceGroupName": {
+      "value": "rg-faexample"
+    },
+    "foundryAccountName": {
+      "value": "cog-fasample-memory-demo"
+    },
+    "projectName": {
+      "value": "faexample"
+    },
+    "connectionName": {
+      "value": "dev-appinsights"
+    },
+    "foundryDeploymentPrefix": {
+      "value": "dev"
+    },
+    "dailyQuotaGb": {
+      "value": "0.5"
+    },
+    "tags": {
+      "value": {
+        "workload": "hosted-sandbox-poc",
+        "environment": "dev"
+      }
+    }
+  }
+}

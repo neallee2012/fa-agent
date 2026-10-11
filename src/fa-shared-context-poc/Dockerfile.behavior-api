@@ -1,0 +1,25 @@
+FROM python:3.11.14-slim-bookworm
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TIKTOKEN_CACHE_DIR=/opt/fa-tokenizer
+WORKDIR /app
+COPY requirements.txt requirements-behavior.txt ./
+RUN pip install --no-cache-dir -r requirements-behavior.txt \
+    && pip check \
+    && useradd --create-home --uid 10001 app
+COPY shared_context ./shared_context
+COPY behavior_server_main.py .
+COPY tool_catalog /opt/fa-catalog
+# Model catalog/facts read through FA_INSTRUCTION_MODEL_CATALOG_FILE / FA_INSTRUCTION_MODEL_FACTS_FILE.
+COPY model-catalog.json model-facts.json /app/
+# The organization catalog is read only when the deploy sets FA_TOOL_CATALOG_DIR=/opt/fa-catalog.
+RUN python -c "import os,tiktoken; from shared_context.behavior_server import ServerTokenizer; from shared_context.behavior_server_config import TokenizerConfiguration; tiktoken.get_encoding('o200k_base'); ServerTokenizer(TokenizerConfiguration(version='0.11.0', encoding='o200k_base', cache_directory=os.environ['TIKTOKEN_CACHE_DIR']))" \
+    && find /opt/fa-tokenizer -type f -exec chmod 0444 {} + \
+    && find /opt/fa-tokenizer -type d -exec chmod 0555 {} + \
+    && python -c "from pathlib import Path; from shared_context.tool_catalog import load_catalog; load_catalog(Path('/opt/fa-catalog'))" \
+    && find /opt/fa-catalog -type f -exec chmod 0444 {} + \
+    && find /opt/fa-catalog -type d -exec chmod 0555 {} + \
+    && FA_INSTRUCTION_MODEL_CATALOG_FILE=/app/model-catalog.json FA_INSTRUCTION_MODEL_FACTS_FILE=/app/model-facts.json FA_INSTRUCTION_DEFAULT_MODEL=gpt-4.1-mini python -c "from shared_context.behavior_instruction_models import InstructionModels as M; m=M.from_environment(); s=m.select('gpt-5.4-mini'); assert s.supports_image_input is True and m.select('gpt-4.1-mini').supports_image_input is True and m.default=='gpt-4.1-mini'; print('FA_MODELS_OK', sorted(m.models))" \
+    && python -c "import mcp, shared_context.mcp_client, shared_context.behavior_server; from shared_context.behavior_code_identity import code_sha256; print('FA_DEPLOYED_CORE=' + code_sha256())"
+USER 10001
+EXPOSE 8080
+ENTRYPOINT ["python", "-m", "shared_context.behavior_server"]
+CMD ["serve"]

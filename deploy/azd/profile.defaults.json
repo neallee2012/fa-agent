@@ -1,0 +1,75 @@
+{
+  "_comment": "Feature flags of a new azd environment (docs/azd-new-environment.md). Every key also exists in deploy/stage/stage.json (tests/shared_context/test_azd_profile.py); identifiers, endpoints and environment names are filled in by deploy/azd/profile.py. memory_environment is added unless FA_ENABLE_MEMORY=false (deploy creates the store). Left out on purpose: FA_ONBOARDING_* and FA_CAPABILITY_TOOLBOX_ENTRIES (opt-in), the feed reader and its signing key secret.",
+  "hosted_idle_timeout_seconds": 3600,
+  "assistant_environment": {
+    "BEHAVIOR_ASSISTANT_PROFILE": "assistant-v1.2",
+    "BEHAVIOR_ASSISTANT_RUNTIME_PATH": "/opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime",
+    "FA_NATIVE_TURNS": "foundry-native-v1"
+  },
+  "assistant_hosted_environment": {
+    "FA_NATIVE_HITL_ENABLED": "1",
+    "FA_NATIVE_HITL_TTL_SECONDS": "600",
+    "FA_NATIVE_GROUPS_ENABLED": "1",
+    "FA_RESPONSES_ENABLED": "1",
+    "FA_NATIVE_ROUTINES_ENABLED": "1",
+    "FA_NATIVE_ROUTINE_PROPOSALS": "1"
+  },
+  "conversation_defaults": {
+    "prompt_profile": "fa-instruction-v4",
+    "settings": {
+      "checkpoint_profile": {
+        "name": "auto-no-custom-v1",
+        "platform": "linux-x64",
+        "provider": "openai-responses"
+      },
+      "model_provider": "openai-responses",
+      "sdk_start_profile": "fa-sdk-start-gate-v1",
+      "model_capacity_profile": "fa-model-capacity-v1",
+      "text_attachment_profile": "fa-source-text-attachments-v1",
+      "user_text_file_profile": "fa-user-text-files-v1",
+      "turn_origin_profile": "fa-instruction-context-origin-v1",
+      "state_profile": "foundry-responses-v1"
+    },
+    "excluded_capabilities": [
+      "WebIQ-MCP"
+    ]
+  },
+  "api_environment": {
+    "PYTHONUTF8": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "FA_INSTRUCTION_MODEL_CATALOG_FILE": "/app/model-catalog.json",
+    "FA_INSTRUCTION_MODEL_FACTS_FILE": "/app/model-facts.json",
+    "FA_INSTRUCTION_DEFAULT_MODEL": "gpt-6.1-sol",
+    "FA_INSTRUCTION_DEFAULT_PROMPT_PROFILE": "fa-instruction-v1",
+    "FA_TOOL_CATALOG_DIR": "/opt/fa-catalog",
+    "FA_CAPABILITY_BUILTINS": "fa-desktop-v1,fa-delegate-v1,fa-delegate-reader-v1,fa-skills-v1,fa-skill-resources-v1,fa-memory-candidate-v1,fa-skillify-v1,fa-image-delivery-v1,fa-shell-v1,fa-agent-collaboration-v1",
+    "FA_DELIVERY_PENDING_INDEX_WRITER": "true",
+    "FA_WORK_REGISTRY_WRITER": "true",
+    "FA_NATIVE_TURNS": "foundry-native-v1",
+    "FA_NATIVE_HITL_ENABLED": "1",
+    "FA_NATIVE_HITL_TTL_SECONDS": "600",
+    "FA_NATIVE_GROUPS_ENABLED": "1",
+    "FA_NATIVE_ROUTINES_ENABLED": "1",
+    "FA_NATIVE_ROUTINE_CLOCK": "api",
+    "FA_NATIVE_ROUTINE_PROPOSALS": "1",
+    "FA_TEAM_MCP_ENABLED": "1",
+    "FA_TEAM_MCP_SINGLE_TEAM": "1",
+    "FA_REALTIME_HUB": "fa"
+  },
+  "console_environment": {
+    "FA_NATIVE_HITL_ENABLED": "1",
+    "FA_NATIVE_HITL_TTL_SECONDS": "600",
+    "FA_NATIVE_GROUPS_ENABLED": "1",
+    "FA_NATIVE_ROUTINES_ENABLED": "1",
+    "FA_CONSOLE_PREWARM": "1"
+  },
+  "memory_environment": {
+    "assistant": {
+      "FA_PRIVATE_MEMORY_STORE": "poc-team-memory",
+      "FA_TEAM_MEMORY_ENABLED": "1"
+    },
+    "api": {
+      "FA_TEAM_MEMORY_ENABLED": "1"
+    }
+  }
+}

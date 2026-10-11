@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "westus3"
+    },
+    "workspaceName": {
+      "value": "log-fa-stage"
+    },
+    "appInsightsName": {
+      "value": "appi-fa-stage"
+    },
+    "foundryResourceGroupName": {
+      "value": "rg-faexample"
+    },
+    "foundryAccountName": {
+      "value": "cog-fasample-memory-demo"
+    },
+    "projectName": {
+      "value": "faexample-stage"
+    },
+    "dailyQuotaGb": {
+      "value": "0.5"
+    }
+  }
+}

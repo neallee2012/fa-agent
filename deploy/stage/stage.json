@@ -1,0 +1,148 @@
+{
+  "environment": "stage",
+  "tenant_id": "00000000-0000-0000-0000-000000000013",
+  "subscription_id": "00000000-0000-0000-0000-000000000012",
+  "resource_group": "rg-faexample-stage",
+  "foundry_resource_group": "rg-faexample",
+  "foundry_account": "cog-fasample-memory-demo",
+  "project": "faexample-stage",
+  "project_endpoint": "https://cog-fasample-memory-demo.services.ai.azure.com/api/projects/faexample-stage",
+  "registry": "crfacontextstagedemo.azurecr.io",
+  "registry_name": "crfacontextstagedemo",
+  "container_apps_environment": "cae-facontext-stage",
+  "api_app": "ca-fa-behavior-stage",
+  "api_url": "https://ca-fa-behavior-stage.example-00000000.westus3.azurecontainerapps.io",
+  "api_audience": "api://00000000-0000-0000-0000-000000000013/fa-context-poc-api",
+  "api_identity": "id-facontext-api-stage",
+  "sync_job": "job-fa-agent-sync-stage",
+  "console_app": "ca-fa-console-stage",
+  "hosted_idle_timeout_seconds": 3600,
+  "assistant_environment": {
+    "BEHAVIOR_ASSISTANT_PROFILE": "assistant-v1.2",
+    "BEHAVIOR_ASSISTANT_RUNTIME_PATH": "/opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime",
+    "FA_NATIVE_TURNS": "foundry-native-v1",
+    "FA_PRIVATE_MEMORY_STORE": "poc-team-memory",
+    "FA_TEAM_MEMORY_ENABLED": "1",
+    "TZ": "Asia/Taipei"
+  },
+  "agents": [
+    {
+      "name": "fa-stage-a",
+      "kind": "assistant",
+      "description": "Stage FA assistant A (ADR-0008).",
+      "agent_id": "00000000-0000-0000-0000-000000000021",
+      "agent_oid": "00000000-0000-0000-0000-00000000001d",
+      "hosted_environment": {
+        "FA_NATIVE_HITL_ENABLED": "1",
+        "FA_NATIVE_HITL_TTL_SECONDS": "600",
+        "FA_NATIVE_GROUPS_ENABLED": "1",
+        "FA_RESPONSES_ENABLED": "1",
+        "FA_NATIVE_ROUTINES_ENABLED": "1",
+        "FA_NATIVE_ROUTINE_PROPOSALS": "1"
+      }
+    },
+    {
+      "name": "fa-stage-b",
+      "kind": "assistant",
+      "description": "Stage FA assistant B (ADR-0008).",
+      "agent_id": "00000000-0000-0000-0000-000000000022",
+      "agent_oid": "00000000-0000-0000-0000-00000000001e",
+      "hosted_environment": {
+        "FA_NATIVE_HITL_ENABLED": "1",
+        "FA_NATIVE_HITL_TTL_SECONDS": "600",
+        "FA_NATIVE_GROUPS_ENABLED": "1",
+        "FA_RESPONSES_ENABLED": "1",
+        "FA_NATIVE_ROUTINES_ENABLED": "1",
+        "FA_NATIVE_ROUTINE_PROPOSALS": "1"
+      }
+    },
+    {
+      "name": "fa-stage-c",
+      "kind": "executor",
+      "description": "Stage configured target C; never invoked (config needs 4 targets).",
+      "agent_id": "00000000-0000-0000-0000-000000000023",
+      "agent_oid": "00000000-0000-0000-0000-00000000001f"
+    },
+    {
+      "name": "fa-stage-d",
+      "kind": "executor",
+      "description": "Stage configured target D; never invoked (config needs 4 targets).",
+      "agent_id": "00000000-0000-0000-0000-000000000024",
+      "agent_oid": "00000000-0000-0000-0000-000000000020"
+    }
+  ],
+  "api_identity_client_id": "00000000-0000-0000-0000-00000000001c",
+  "deploy_client_id": "00000000-0000-0000-0000-000000000025",
+  "conversation_defaults": {
+    "prompt_profile": "fa-instruction-v4",
+    "settings": {
+      "checkpoint_profile": {"name": "auto-no-custom-v1", "platform": "linux-x64", "provider": "openai-responses"},
+      "model_provider": "openai-responses",
+      "sdk_start_profile": "fa-sdk-start-gate-v1",
+      "model_capacity_profile": "fa-model-capacity-v1",
+      "text_attachment_profile": "fa-source-text-attachments-v1",
+      "user_text_file_profile": "fa-user-text-files-v1",
+      "turn_origin_profile": "fa-instruction-context-origin-v1",
+      "state_profile": "foundry-responses-v1"
+    },
+    "excluded_capabilities": ["WebIQ-MCP"]
+  },
+  "api_environment": {
+    "AZURE_CLIENT_ID": "00000000-0000-0000-0000-00000000001c",
+    "PYTHONUTF8": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "FA_INSTRUCTION_MODEL_CATALOG_FILE": "/app/model-catalog.json",
+    "FA_INSTRUCTION_MODEL_FACTS_FILE": "/app/model-facts.json",
+    "FA_INSTRUCTION_DEFAULT_MODEL": "gpt-6.1-sol",
+    "FA_INSTRUCTION_DEFAULT_PROMPT_PROFILE": "fa-instruction-v1",
+    "FA_TOOL_CATALOG_DIR": "/opt/fa-catalog",
+    "FA_CAPABILITY_BUILTINS": "fa-desktop-v1,fa-delegate-v1,fa-delegate-reader-v1,fa-skills-v1,fa-skill-resources-v1,fa-memory-candidate-v1,fa-skillify-v1,fa-image-delivery-v1,fa-shell-v1,fa-agent-collaboration-v1",
+    "FA_CAPABILITY_TOOLBOX_ENTRIES": "WebIQ",
+    "FA_DELIVERY_PENDING_INDEX_WRITER": "true",
+    "FA_WORK_REGISTRY_WRITER": "true",
+    "FA_NATIVE_TURNS": "foundry-native-v1",
+    "FA_NATIVE_HITL_ENABLED": "1",
+    "FA_NATIVE_HITL_TTL_SECONDS": "600",
+    "FA_NATIVE_GROUPS_ENABLED": "1",
+    "FA_NATIVE_ROUTINES_ENABLED": "1",
+    "FA_NATIVE_ROUTINE_CLOCK": "api",
+    "FA_NATIVE_ROUTINE_PROPOSALS": "1",
+    "FA_TEAM_MCP_ENABLED": "1",
+    "FA_TEAM_MCP_SINGLE_TEAM": "1",
+    "FA_TEAM_MCP_PROJECT_RESOURCE_ID": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample/providers/Microsoft.CognitiveServices/accounts/cog-fasample-memory-demo/projects/faexample-stage",
+    "FA_TEAM_CONNECTORS_ENABLED": "1",
+    "FA_CONNECTOR_TEAMS_CLIENT_ID": "00000000-0000-0000-0000-000000000049",
+    "FA_TEAM_MEMORY_ENABLED": "1",
+    "FA_REMOTE_CONSOLE_CLIENT_ID": "00000000-0000-0000-0000-000000000026",
+    "FA_ONBOARDING_ENDPOINT_PROTOCOLS": "true",
+    "FA_ONBOARDING_ROLE_SCOPE": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample/providers/Microsoft.CognitiveServices/accounts/cog-fasample-memory-demo/projects/faexample-stage",
+    "FA_REALTIME_ENDPOINT": "https://wps-fa-stage-demo.webpubsub.azure.com",
+    "FA_REALTIME_HUB": "fa"
+  },
+  "api_secret_environment": {
+    "FA_FEED_MCP_SIGNING_KEY": "fa-feed-mcp-signing-key"
+  },
+  "feed_app": "ca-fa-feed-stage",
+  "feed_environment": {
+    "FEED_MCP_PUBLIC_KEY": "PHQZWeNjOr9bJP5N7pVbJ1KJmE/HRNl/s/jflrAV22I="
+  },
+  "console_environment": {
+    "FA_NATIVE_HITL_ENABLED": "1",
+    "FA_NATIVE_HITL_TTL_SECONDS": "600",
+    "FA_NATIVE_GROUPS_ENABLED": "1",
+    "FA_NATIVE_ROUTINES_ENABLED": "1",
+    "FA_REALTIME_ENDPOINT": "https://wps-fa-stage-demo.webpubsub.azure.com",
+    "FA_CONSOLE_PREWARM": "1"
+  },
+  "runtime": {
+    "team_id": "team-stage",
+    "authority_domain": "fa-stage-v1",
+    "human_oid": "00000000-0000-0000-0000-00000000001b",
+    "admin_client_id": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+    "table_account": "stfacontextstagedemo",
+    "table_name": "workstate",
+    "blob_account": "stfam1bkstagedemo",
+    "sources_container": "m3-artifacts",
+    "backups_container": "m1-environment-backups"
+  }
+}

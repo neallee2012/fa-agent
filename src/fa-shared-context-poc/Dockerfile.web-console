@@ -1,0 +1,17 @@
+# Remote web test console (ADR-0008 §3); build context: src/fa-shared-context-poc.
+# Same Python base and API requirement set as Dockerfile.behavior-api; no new packages. Container Apps built-in
+# Entra authentication sits in front, so the process only serves signed-in, assigned users.
+FROM python:3.11.14-slim-bookworm
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+COPY requirements.txt requirements-behavior.txt ./
+RUN pip install --no-cache-dir -r requirements-behavior.txt \
+    && useradd --create-home --uid 10001 app \
+    && install -d -m 0700 -o app -g app /data
+COPY shared_context ./shared_context
+COPY web_test_console ./web_test_console
+USER 10001
+RUN python -c "import web_test_console.__main__, web_test_console.remote, web_test_console.bridge"
+EXPOSE 8080
+ENTRYPOINT ["python", "-m", "web_test_console"]
+CMD ["serve-remote"]

@@ -1,0 +1,4 @@
+*.compiled.json
+foundry.json
+foundation.json
+api.json

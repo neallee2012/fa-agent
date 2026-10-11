@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "type": "stdio",
+      "command": "/opt/fa-tools/bin/playwright-mcp",
+      "args": ["--headless", "--isolated", "--browser", "chromium"],
+      "env": {"PLAYWRIGHT_BROWSERS_PATH": "/opt/fa-tools/ms-playwright"},
+      "tools": [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_take_screenshot",
+        "browser_click",
+        "browser_type",
+        "browser_fill_form",
+        "browser_select_option",
+        "browser_wait_for",
+        "browser_navigate_back"
+      ]
+    }
+  }
+}

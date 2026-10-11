@@ -1,0 +1,57 @@
+"""Shared Responses routing contracts, independent of the Hosted SDK."""
+
+from typing import Annotated, Literal
+
+from pydantic import Field, model_validator
+
+from .behavior_wire import Digest, Identifier, WireModel
+
+
+NATIVE_STATE_PROFILE = "foundry-native-v1"
+NATIVE_RESPONSES_PROFILE = "foundry-responses-v1"
+NativeStateProfile = Literal["foundry-native-v1", "foundry-responses-v1"]
+NativeResponseId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")]
+NATIVE_RESPONSE_RID_HEADER = "x-client-fa-rid"
+NATIVE_RESPONSE_CID_HEADER = "x-client-fa-cid"
+NATIVE_RESPONSE_DIGEST_HEADER = "x-client-fa-submit-digest"
+RESPONSES_ENVIRONMENT_MODE: Literal["retain-cid"] | None = "retain-cid"
+
+
+def responses_environment_blocker():
+    """D1/D2 select whether the original Responses CID may continue in a new explicit session."""
+    return None if RESPONSES_ENVIRONMENT_MODE == "retain-cid" else "NATIVE_ENVIRONMENT_UNAVAILABLE"
+
+
+class NativeResponseHeaders(WireModel):
+    request_id: Identifier
+    conversation_id: Identifier
+    submit_digest: Digest
+
+
+class NativeResponseDispatch(WireModel):
+    """A read-time transport instruction, not a stored execution or acceptance authority."""
+
+    state: Literal["needs_response", "already_queued", "not_taken"]
+    inflight_request_id: Identifier | None = None
+    previous_response_id: NativeResponseId | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def owned_slot(self):
+        if self.state != "not_taken" and self.inflight_request_id is None:
+            raise ValueError("Dispatch requires the original CID slot")
+        return self
+
+
+def check_response_state(profile, status, rid, response_id, dispatch):
+    if profile == NATIVE_STATE_PROFILE:
+        if response_id is not None or dispatch is not None:
+            raise ValueError("An Invocations receipt cannot acquire Responses transport state")
+        return
+    if status in {"started", "completed"} and response_id is None:
+        raise ValueError("A started Responses turn retains its official response ID")
+    if status == "accepted" and response_id is not None:
+        raise ValueError("The official response ID is persisted with the started CAS")
+    if dispatch is not None and (
+            status != "accepted"
+            or dispatch.state != "not_taken" and dispatch.inflight_request_id != rid):
+        raise ValueError("Only the original accepted RID may request its second transport step")

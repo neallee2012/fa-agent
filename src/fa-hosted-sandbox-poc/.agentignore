@@ -1,0 +1,6 @@
+.env
+.foundry/
+__pycache__/
+tests/
+*.pyc
+local-evidence/

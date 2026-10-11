@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "westus3"
+    },
+    "storageName": {
+      "value": "stfam1bkstagedemo"
+    },
+    "containerName": {
+      "value": "m1-environment-backups"
+    },
+    "apiIdentityName": {
+      "value": "id-facontext-api-stage"
+    },
+    "vnetName": {
+      "value": "vnet-facontext-api"
+    },
+    "privateEndpointSubnetName": {
+      "value": "snet-private-endpoints"
+    },
+    "privateEndpointName": {
+      "value": "pe-fam1-backup-blob"
+    },
+    "createBlobPrivateDnsZone": {
+      "value": true
+    },
+    "createBlobDnsVnetLink": {
+      "value": true
+    },
+    "blobDnsVnetLinkName": {
+      "value": "facontext-api-link"
+    }
+  }
+}

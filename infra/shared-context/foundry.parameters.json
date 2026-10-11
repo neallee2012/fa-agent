@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {"value": "westus3"},
+    "accountName": {"value": "cog-fasample-memory-demo"},
+    "projectName": {"value": "faexample"},
+    "operatorObjectId": {"value": "00000000-0000-0000-0000-00000000001b"}
+  }
+}
