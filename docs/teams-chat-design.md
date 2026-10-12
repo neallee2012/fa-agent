@@ -162,7 +162,7 @@ ADR-0006 第 1 節是「入口確認一次下指令的是團隊主人本人」�
 |---|---|---|
 | 自己用 REST 建 bot 時，endpoint 少了 `?api-version=2025-11-15-preview`，Teams 訊息會默默消失 | 已實測現象；原因是推論 | 用入口網站一鍵發布。要用 REST 時，照抄一鍵發布產生的 endpoint，不照官方 REST 範例 |
 | 第一次使用會出「User Sign-in」卡 | 已實測 | 上線說明告訴使用者點一次；原訊息登入後會照常回覆 |
-| `/foundry_new_preview` 由平台處理，不進容器 | 已實測 | FA 用平台 conversation 當對話 key，自然跟著開新對話 |
+| `/foundry_new_preview` 由平台處理，不進容器 | 已實測（echo 探針；經 relay 的實測見 [progress](progress.md#teams-relay-observed-1011)） | FA 用平台 conversation 當對話 key，自然跟著開新對話 |
 | 沒有串流、沒有 citation；長回合只顯示「Please wait…」 | 已實測；官方文件 | 回最後一則完整回覆；超過等待上限改回固定文字 |
 | relay 每個 Teams 對話一台 VM | 已實測 | relay 用 0.5 vCPU／1 GiB、閒置 300 秒；不叫模型，只花 VM 時間（推論：依 ADR-0006 的 2 vCPU／4 GiB 約 US$0.25／小時換算，約 US$0.06／小時） |
 | 一鍵發布自動建 S1 的 bot | 已實測 | Teams 是標準頻道，不計訊息費 |

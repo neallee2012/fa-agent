@@ -6,8 +6,6 @@
 
 ![FA Agent 示範：助理 A 在自己的桌面開瀏覽器查路線，再把查天氣的工作交給助理 B](docs/assets/fa-demo.gif)
 
-<sub>畫面錄自作者的預備環境（stage），等待模型回覆的空檔已剪掉。</sub>
-
 ## FA Agent 是什麼？
 
 FA（Foundry Agents）是給單一組織使用的代管 AI 助理平台。一個 Team 屬於一位使用者，Team 裡可以有好幾位助理，每位助理有自己的角色、記憶和工具。資料模型可以放很多個 Team，但目前一套部署只設定一個 Team、一位 Team 主人；讓多個 Team 各自獨立運作的部分已有設計，部分已實作、還沒部署。
@@ -99,6 +97,8 @@ python .\deploy\azd\fa_azd.py prereq     # 唯讀：列出你已具備什麼、�
 azd up
 ```
 
+不知道訂閱 ID 或租用戶 ID 時，`az login` 後執行 `az account list --query "[].{name:name, id:id, tenant:tenantId}" -o table`。訂閱在 `azd env new --subscription` 時就固定在該 azd 環境，不使用 az CLI 的預設訂閱；hook 會檢查 az 與 azd 登入的是同一個租用戶，不同就停止。
+
 主人的 object ID 用 `az ad user show --id <主人 UPN> --query id -o tsv` 查（主人自己登入時，`az ad signed-in-user show --query id -o tsv` 也行）。沒設 `FA_TEAM_OWNER_OID` 時，部署的人會成為 Team 主人，主人以外的人登入不了工作台，要 `azd down --purge` 才能重來。所以 preprovision 會印出「Team owner = 目前登入的部署者」，在終端機裡要你輸入 `y` 確認，其他回答就停下、什麼都不寫。`azd up` 一開始會再跑同一份檢查，缺東西就在建立任何計費資源前停下。
 
 **中途要你回答的地方。**
@@ -146,7 +146,7 @@ cd .\src\fa-shared-context-poc
 | 預設模型與可選模型 | 環境設定的 `FA_INSTRUCTION_DEFAULT_MODEL`，以及 [`model-catalog.json`](src/fa-shared-context-poc/model-catalog.json) |
 | 系統提示版本 | 環境設定的 `conversation_defaults.prompt_profile`，全文在 [`behavior_instruction_prompt.py`](src/fa-shared-context-poc/shared_context/behavior_instruction_prompt.py) |
 | 工具定義 | [`tool_catalog/`](src/fa-shared-context-poc/tool_catalog) |
-| 環境旗標 | 環境 profile JSON，用 `--config` 或 `FA_DEPLOY_CONFIG` 指定。Hosted 的環境變數要隨新的 Hosted 版本一起發布 |
+| 環境開關 | 環境 profile JSON，用 `--config` 或 `FA_DEPLOY_CONFIG` 指定。Hosted 的環境變數要隨新的 Hosted 版本一起發布 |
 
 <a id="extending"></a>
 ## 擴充：MCP、skills 與 connector
@@ -158,6 +158,15 @@ cd .\src\fa-shared-context-poc
 - **Plugin。** FA 沒有 plugin 機制。助理 ⚙ 裡的「Plugins」分頁是 FA 內建能力（桌面、shell、交辦等）的開關，不能安裝新的。
 - **Connector 是選用的。** `azd up` 不需要 Teams、Work IQ 或 GitHub，完成時 connector 是關的，Team MCP 是開的。目前只有 Microsoft Teams（經 Work IQ）一種，要自備 Entra app 並在 API 設 `FA_TEAM_CONNECTORS_ENABLED=1`；azd 環境還沒有對應的設定，沒驗證過。
 - **加自己的 connector。** 金鑰驗證的服務直接用 Team MCP。Entra OAuth 的服務要在 [`connector_registry.py`](src/fa-shared-context-poc/shared_context/connector_registry.py) 加一筆 `ConnectorRef`，只改設定不行。這條路還沒有人實際做過。
+
+<a id="in-development"></a>
+## 開發中的功能
+
+下面的功能已經有程式，但還沒在每個環境驗收，`azd up` 也不會替你打開。
+
+- **Microsoft Teams connector（經 Work IQ MCP）。** 助理能讀 Teams 的聊天和頻道訊息，也能代你發訊息；發訊息預設每次都要你在批准卡上按允許。已在作者的測試環境用真人走過，`azd up` 建的環境預設關閉。步驟見 [開啟 Teams connector](docs/extending.md#開啟-teams-connector)，驗收到哪裡見 [驗收紀錄](docs/extending.md#connector-acceptance)。
+- **在 Teams 裡和助理對話（Teams relay）。** 在 Teams 直接傳訊息給助理，助理在自己的 VM 跑回合並把回覆送回 Teams；需要批准時回覆「允許 代碼」或「拒絕 代碼」，輸入 `/foundry_new_preview` 開新對話，都已在作者的測試環境從 Teams 實測。預備環境沒開，也還沒有部署腳本；設計、限制和步驟見 [Teams 對話設計](docs/teams-chat-design.md) 與 [relay 說明](src/fa-teams-relay/README.md)，實測紀錄見 [progress](docs/progress.md#teams-relay-observed-1011)。
+- **GitHub connector。** 還在設計，程式裡沒有。見 [connector 設計](docs/connector-design.md#分階段)。
 
 ## 文件
 

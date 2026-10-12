@@ -1,4 +1,6 @@
-# Teams relay（N2 T1，2026-10-10，CODE/offline，未部署）
+# Teams relay（N2 T1，2026-10-10）
+
+**狀態：** 已部署在作者的測試環境（dev）並從 Teams 實測；預備環境（stage）沒開。實測紀錄見 [progress](../../docs/progress.md#teams-relay-observed-1011)。
 
 在 Teams 裡和 FA Agent 對話的轉送 agent。設計見 [teams-chat-design.md](../../docs/teams-chat-design.md#n2-設計)。
 每個 FA Agent 發布一個 relay（Foundry 入口網站一鍵發布到 Teams）。它不叫模型、不存東西、不碰 Teams API。
@@ -25,5 +27,4 @@ API 端要設 `FA_TEAMS_RELAY_ENABLED=1` 和 `FA_TEAMS_RELAY_AGENTS`（見
 **測試。** `tests/fa_teams_relay/test_teams_relay.py`：Starlette `TestClient` 打真的 ASGI app，FA API 是
 `httpx.MockTransport` 假 server，時鐘與 sleep 可注入（110 秒上限不必真等）。
 
-**還沒驗證。** image 沒有 build、沒有部署；`pip check` 只在 echo 探針的 Docker build 跑過同一組（多了 httpx／httpcore，
-兩者的相依都已在清單內，但這份清單本身還沒 build 過）。平台實際送來的 body 欄位以 10-10 探針為準。
+**驗證。** image 已在作者的測試環境 build 並部署（[progress](../../docs/progress.md#teams-relay-t2-1010)）；平台實際送來的 body 欄位以 10-10 探針為準。預備環境沒開，沒有部署腳本。

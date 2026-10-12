@@ -8,7 +8,7 @@
 
 ![FA Agent demo: assistant A opens a browser on its own desktop to find a route, then hands a weather check to assistant B](docs/assets/fa-demo.gif)
 
-<sub>Recorded on the author's staging environment (stage). Waiting time for model replies is cut. The workbench UI is in Traditional Chinese.</sub>
+<sub>The workbench UI is in Traditional Chinese.</sub>
 
 ## What is FA Agent?
 
@@ -102,6 +102,8 @@ python .\deploy\azd\fa_azd.py prereq     # read-only: lists what you have, what 
 azd up
 ```
 
+If you do not know the subscription ID or tenant ID, run `az account list --query "[].{name:name, id:id, tenant:tenantId}" -o table` after `az login`. The subscription is fixed per azd environment by `azd env new --subscription`; the az CLI default subscription is not used, and the hooks stop if az and azd are signed in to different tenants.
+
 Get the owner's object ID with `az ad user show --id <owner UPN> --query id -o tsv` (the owner can also run `az ad signed-in-user show --query id -o tsv` after signing in). Without `FA_TEAM_OWNER_OID`, the person who deploys becomes the Team owner, anyone else cannot sign in to the workbench, and only `azd down --purge` lets you start over. So preprovision prints "Team owner = the signed-in deployer" and, in a terminal, asks you to type `y`; any other answer stops it and nothing is written. `azd up` runs the same check again at the start, and stops before it creates any billable resource if something is missing.
 
 **Where it asks you.**
@@ -149,7 +151,7 @@ Preview mode gets no token and does not connect to a backend. Every action is di
 | Default and available models | `FA_INSTRUCTION_DEFAULT_MODEL` in the environment settings, and [`model-catalog.json`](src/fa-shared-context-poc/model-catalog.json) |
 | System prompt version | `conversation_defaults.prompt_profile` in the environment settings. The full text is in [`behavior_instruction_prompt.py`](src/fa-shared-context-poc/shared_context/behavior_instruction_prompt.py) |
 | Tool definitions | [`tool_catalog/`](src/fa-shared-context-poc/tool_catalog) |
-| Environment flags | The environment profile JSON, chosen with `--config` or `FA_DEPLOY_CONFIG`. Environment variables of the assistant VM must ship with a new Hosted Agents version |
+| Environment switches | The environment profile JSON, chosen with `--config` or `FA_DEPLOY_CONFIG`. Environment variables of the assistant VM must ship with a new Hosted Agents version |
 
 <a id="extending"></a>
 ## Extending: MCP, skills and connectors
@@ -161,6 +163,15 @@ The full steps and code locations are in [docs/extending.md](docs/extending.md),
 - **Plugins.** FA has no plugin mechanism. The Plugins tab under an assistant's ⚙ turns FA's built-in capabilities (desktop, shell, delegation and so on) on or off. You cannot install new ones there.
 - **Connectors are optional.** `azd up` needs no Teams, Work IQ or GitHub. When it finishes, connectors are off and Team MCP is on. Microsoft Teams (through Work IQ) is the only connector today. It needs your own Entra app and `FA_TEAM_CONNECTORS_ENABLED=1` on the API. An azd environment has no setting for it yet, and this is not verified.
 - **Adding your own connector.** For a service that uses a key, use Team MCP. For a service that uses Entra OAuth, add a `ConnectorRef` to [`connector_registry.py`](src/fa-shared-context-poc/shared_context/connector_registry.py); configuration alone cannot add one. Nobody has done this for real yet.
+
+<a id="in-development"></a>
+## In development
+
+The features below have code, but they are not accepted in every environment yet, and `azd up` does not turn them on. The linked documents are in Traditional Chinese.
+
+- **Microsoft Teams connector (through Work IQ MCP).** Assistants can read Teams chat and channel messages and post messages for you; by default, every post needs you to press allow on an approval card. A person has gone through it on the author's test environment, and environments created by `azd up` have it off. The steps are in [turning on the Teams connector](docs/extending.md#開啟-teams-connector), and how far acceptance has gone is in the [acceptance record](docs/extending.md#connector-acceptance).
+- **Chat with an assistant in Teams (the Teams relay).** Send a message to an assistant directly in Teams; the assistant runs the turn on its own VM and sends the reply back to Teams. When it needs approval, reply `允許 code` or `拒絕 code` (you must type the Chinese words 允許 for allow or 拒絕 for deny; English words are treated as a normal message), and type `/foundry_new_preview` to start a new conversation; both were tested from Teams on the author's test environment. It is off on the author's staging environment and there is no deploy script yet; the design, limits and steps are in [Teams chat design](docs/teams-chat-design.md) and the [relay notes](src/fa-teams-relay/README.md), and the test record is in [progress](docs/progress.md#teams-relay-observed-1011).
+- **GitHub connector.** Still in design; there is no code for it. See [connector design](docs/connector-design.md#分階段).
 
 ## Documentation
 

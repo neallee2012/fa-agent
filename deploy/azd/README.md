@@ -18,6 +18,8 @@ azd env new <name> --subscription <subscription-id> --location <region>
 python deploy/azd/fa_azd.py prereq
 ```
 
+不知道訂閱 ID 或租用戶 ID 時，`az login` 後執行 `az account list --query "[].{name:name, id:id, tenant:tenantId}" -o table`。訂閱在 `azd env new --subscription` 時就固定在該 azd 環境，不使用 az CLI 的預設訂閱；hook 會檢查 az 與 azd 登入的是同一個租用戶，不同就停止。
+
 （這裡先指定區域，是因為 `prereq` 不經過 azd 的區域選單。）
 
 `azd up` 的 preprovision 也會跑同一份檢查；標 `blocked` 的項目會在**任何計費資源建立前**停下。
@@ -60,6 +62,8 @@ azd auth login --tenant-id <tenant-id>
 azd env new <name> --subscription <subscription-id>
 azd up
 ```
+
+訂閱與租用戶 ID 的查法見上方[「事前準備」](#prerequisites)；訂閱固定在這個 azd 環境，不使用 az CLI 的預設訂閱。
 
 - `<name>`：2–20 個小寫英數字或 `-`，是資源名稱前綴，RG 預設 `rg-<name>`。
 - 區域與模型：見下一節。已知區域時也可以 `azd env new … --location <region>` 跳過選單。

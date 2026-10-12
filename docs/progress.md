@@ -4,6 +4,14 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="teams-relay-observed-1011"></a>
+## 2026-10-11：Teams relay 在 dev 的實測補記（`/foundry_new_preview`、文字批准；README 狀態依據）
+
+- **範圍**：總協調工作階段經 Neal 同意，在作者的 dev 測試環境用 Teams 網頁跑 Teams relay 測試。這一節只補記 README 與 relay 文件要引用的觀察；完整逐項表在 stage release PR #760、#790 的 dev 測試報告。
+- **`/foundry_new_preview`（實測）**：10-11 15:52 與 21:11（+08）各輸入一次，Teams 都回「Conversation reset. Send a new message to start a fresh thread.」，下一則訊息從新對話開始（助理不再知道先前的內容）。程式路徑：relay 用平台的 `context.conversation_id` 當 `chat_id`（`src/fa-teams-relay/main.py`），API 由 relay 身分加 `chat_id` 推出 TeamsChat key（`shared_context/native_teams_relay.py`），平台換新 conversation，FA 就跟著開新對話。
+- **文字批准（實測）**：main `7eb334d7`（#760，API `7eb3-v138-1011`）與 main `5fee7ec8`（#790，API `5fee-v139-1011`）各跑一輪，在 Teams 回「允許 代碼」、再送同一個代碼、回「拒絕 代碼」，都 PASS：頻道讀回只有允許的那一則，App Insights 只有一次 `tools/call teams_write___create_entity`，拒絕後沒有寫入。細節見兩份 PR body 的 dev 測試報告。
+- **環境**：stage 的 relay 保持關閉（`stage.json` 沒有 `FA_TEAMS_RELAY_ENABLED`）；README 的「開發中」只引用這一節，不另記環境細節。
+
 <a id="azd-eastus2-1011"></a>
 ## 2026-10-11：`azd up` 區域與模型選擇實跑（fazd1012，eastus2；#766 已合併）
 

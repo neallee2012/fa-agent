@@ -1,7 +1,7 @@
 # Shared Context POC
 
 <a id="teams-relay"></a>
-## Teams 聊天轉送路由（N2 T1，2026-10-10，CODE/offline，預設關閉、未部署）
+## Teams 聊天轉送路由（N2 T1，2026-10-10，預設關閉；已在作者的測試環境部署並實測，預備環境沒開）
 
 設計見 [teams-chat-design.md](../../docs/teams-chat-design.md#n2-設計)；relay 本身見 [fa-teams-relay](../fa-teams-relay/README.md)。
 程式在 `shared_context/native_teams_relay.py`，只有 `FA_TEAMS_RELAY_ENABLED=1` 才裝 `POST /teams-relay/v1/turns` 和 `POST /teams-relay/v1/decisions`
