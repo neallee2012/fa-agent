@@ -140,7 +140,7 @@ def test_unprepared_bootstrap_uses_current_build_reader_and_preserves_old_sessio
     assert all(command.operation in {"read", "session_read", "session_prepare"} for _, command in case.remote.calls)
 
 
-def test_new_build_prepare_reads_original_version_result_without_creating_or_rebinding(native_api, monkeypatch):
+def test_new_build_prepare_never_invokes_the_original_version_session_nor_creates_one(native_api, monkeypatch):
     case = native_api
     created, calls = new_environment(case, monkeypatch)
     prepared = case.client.post(PREFIX + "/prepare", headers=case.headers,
@@ -161,13 +161,14 @@ def test_new_build_prepare_reads_original_version_result_without_creating_or_reb
     monkeypatch.setattr(FoundryHttpClient, "create_session", create)
     repeated = case.client.post(PREFIX + "/prepare", headers=case.headers,
                                 json={"request_id": "not-an-implicit-upgrade"})
-    assert repeated.status_code == 200 and repeated.json() == prepared.json()
+    # Only the 41 session exists: invoking it would let the platform bring it back; the follow creates 42's.
+    assert (repeated.status_code, repeated.json()["error"]["code"]) == (503, "AGENT_VERSION_FOLLOWING"), repeated.text
     assert len(created) == len(calls) == 1
     assert case.remote.session_binding == original.session_id
-    assert case.remote.calls and all(command.operation == "session_read" for _, command in case.remote.calls)
+    assert case.remote.calls == []
 
 
-def test_existing_fixed_bootstrap_preparation_remains_read_only_on_new_build(native_api, monkeypatch):
+def test_existing_fixed_bootstrap_preparation_is_not_invoked_on_new_build(native_api, monkeypatch):
     case = native_api
     original = case.remote.preparation.model_dump(mode="json")
     case.composition._native_sessions = NativeSessions(case.composition)
@@ -178,9 +179,10 @@ def test_existing_fixed_bootstrap_preparation_remains_read_only_on_new_build(nat
     monkeypatch.setattr("shared_context.behavior_native_sessions._latest_version_reader", lambda *_: case.remote.target)
     response = case.client.post(PREFIX + "/prepare", headers=case.headers,
                                 json={"request_id": "keep-original-preparation"})
-    assert response.status_code == 200 and response.json() == original
+    assert (response.status_code, response.json()["error"]["code"]) == (503, "AGENT_VERSION_FOLLOWING"), response.text
     assert not created
-    assert case.remote.calls and all(command.operation == "session_read" for _, command in case.remote.calls)
+    assert case.remote.calls == []
+    assert case.remote.preparation.model_dump(mode="json") == original
 
 
 @pytest.mark.parametrize("code", ["NATIVE_BOOTSTRAP_HAS_WORK", "NATIVE_BOOTSTRAP_CONFLICT"])

@@ -82,7 +82,8 @@ class SyntheticSessionClient:
     def verify_session(self, *, before_send):
         before_send()
         self.observations.calls.append(("get", self.target))
-        return SimpleNamespace(agent_session_id=self.target.session_id, status="idle")
+        # An existing conversation continues only on an active SID (ADR-0009 §10); idle is refused at admission.
+        return SimpleNamespace(agent_session_id=self.target.session_id, status="active")
 
 
 @pytest.fixture

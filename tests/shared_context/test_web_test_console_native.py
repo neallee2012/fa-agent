@@ -393,7 +393,9 @@ def test_native_errors_remain_visible_and_do_not_switch_lane(native_console, cod
     failed = send(c, draft)
     assert failed.status_code == status and failed.json()["error"]["code"] == code
     assert c.ui.console.native_thread(draft["thread_id"])
-    assert [command.operation for _, command in c.api.remote.calls] == ["read"]
+    # Since 7ade5fc9 (#553) the API's submit reads the Agent's current session before it reads the RID, so the store
+    # error refuses the turn at that first read; nothing is submitted (same as test_submit_does_not_turn_store_errors_*).
+    assert [command.operation for _, command in c.api.remote.calls] == ["session_read"]
     assert not any(path == "/work-policy/v1/submit" for _, path, _ in c.calls)
 
 
@@ -1334,8 +1336,284 @@ def test_a_status_reply_that_differs_from_its_receipt_is_never_shown(native_cons
 
     c.mutate[0] = altered
     read = c.ui.client.get("/api/instructions/" + rid + "/status")
-    assert read.status_code == 502 and read.json()["error"]["code"] == "NATIVE_RESULT_INCOMPLETE"
+    # The turn's receipt still reaches the page; the reply is not shown and its failure stays on that turn.
+    assert read.status_code == 200, read.text
+    task = next(t for t in read.json()["tasks"] if t["task_id"] == rid)
+    assert task["reply"] is None and task["error"] == {"code": "NATIVE_RESULT_INCOMPLETE"}
     assert rid not in c.ui.console.native_instructions.answers
+
+
+# stage/dev 2026-10-12: a finished turn kept showing 「回覆中，尚未確認保存。」 and 「正在準備」; 「更新回覆」 (this same
+# /status read) changed nothing, and only 「更新工作狀態」 (POST /api/tasks/<rid>/status, a receipt-only refresh) showed
+# it saved. The /status read had already seen the completed receipt, but a failed reply read failed the whole read, so
+# the page never received the receipt. The reply's failure now stays on that turn; the receipt still reaches the page.
+@pytest.mark.parametrize("failure", ["altered-single-page", "result-page-error"])
+def test_a_reply_read_failure_still_returns_the_completed_receipt(native_console, failure):
+    c = native_console
+    draft = first(c)
+    assert send(c, draft).status_code == 200
+    rid = draft["request_id"]
+    status = lambda: c.ui.client.get("/api/instructions/" + rid + "/status")
+    running = status()
+    assert running.status_code == 200, running.text
+    assert next(t for t in running.json()["tasks"] if t["task_id"] == rid)["native_receipt"]["status"] != "completed"
+    if failure == "altered-single-page":
+        _single_page(c, rid)
+    else:
+        c.api.remote.completed(rid)
+
+    def broken(request, response):
+        if failure == "altered-single-page" and request.url.path.endswith("/status") and response.status_code == 200:
+            data = response.json()
+            data["text"] = "別的內容"
+            return httpx.Response(200, content=json.dumps(data).encode(), request=request,
+                                  headers={"content-type": "application/json"})
+        if failure == "result-page-error" and request.url.path.endswith("/result"):
+            return httpx.Response(503, json={"error": {"code": "NATIVE_STATE_STORE_UNKNOWN", "message": "fixed"}})
+        return response
+
+    c.mutate[0] = broken
+    before = len(c.calls)
+    read = status()
+    assert read.status_code == 200, read.text
+    task = next(t for t in read.json()["tasks"] if t["task_id"] == rid)
+    assert task["native_receipt"]["status"] == "completed" and task["status"]["data"]["state"] == "completed"
+    assert task["reply"] is None and task["error"]["code"]
+    assert rid not in c.ui.console.native_instructions.answers
+    assert all(method == "GET" for method, *_ in c.calls[before:]), "a read never sends anything"
+    # Once the reply can be read, the same /status read brings it; nothing was sent again.
+    c.mutate[0] = lambda request, response: response
+    task = next(t for t in status().json()["tasks"] if t["task_id"] == rid)
+    expected = c.api.remote.single_text if failure == "altered-single-page" else c.api.remote.text
+    assert task["reply"]["data"]["text"] == expected and task["error"] is None
+    assert all(method == "GET" for method, *_ in c.calls[before:])
+
+
+# stage 2026-10-10 15:17: after a reload the page's first status read queued behind an earlier read of the same
+# conversation that had not come back, so no read reached the API until 15:24. A read now waits for that lock only for
+# a bounded time and answers as retryable, so the page backs off and reads again instead of hanging.
+def read_behind_a_stuck_read(c, monkeypatch, thread, path):
+    """Hold the conversation's progress lock like a read that never came back, then GET `path` from another thread.
+
+    Fails when that GET is still waiting after 5 s (the unbounded wait); otherwise returns its response and the API
+    calls made while the lock was held."""
+    import threading
+    import web_test_console.bridge as bridge
+
+    # raising=False: a bridge without the bound must fail this by waiting, not by a missing name.
+    monkeypatch.setattr(bridge, "PROGRESS_LOCK_WAIT_SECONDS", 0.2, raising=False)
+    lock = c.ui.console.message_lock("progress:" + thread)
+    held, release, answers = threading.Event(), threading.Event(), []
+
+    def stuck():
+        with lock:
+            held.set()
+            release.wait(30)
+
+    holder = threading.Thread(target=stuck, daemon=True)
+    holder.start()
+    reader = threading.Thread(target=lambda: answers.append(c.ui.client.get(path)), daemon=True)
+    try:
+        assert held.wait(5)
+        before = len(c.calls)
+        reader.start()
+        reader.join(5)
+        waiting, calls = reader.is_alive(), c.calls[before:]
+    finally:
+        release.set()
+        holder.join(5)
+        if reader.ident is not None:
+            reader.join(30)
+    assert not waiting, "the read still waits behind the stuck read of the same conversation"
+    return answers[0], calls
+
+
+@pytest.mark.parametrize("route", ["status", "progress"])
+def test_a_read_behind_a_stuck_read_of_the_same_conversation_answers_retryable(native_console, monkeypatch, route):
+    c = native_console
+    draft = first(c)
+    assert send(c, draft).status_code == 200
+    rid, thread = draft["request_id"], draft["thread_id"]
+    path = "/api/instructions/" + rid + "/status" if route == "status" else "/api/instructions/progress?thread_id=" + thread
+    read, calls = read_behind_a_stuck_read(c, monkeypatch, thread, path)
+    assert read.status_code == 409, read.text
+    assert read.json()["error"]["code"] == "PROGRESS_READ_BUSY" and read.json()["error"]["automatic_retry"] is True
+    assert calls == [], "nothing reaches the API while the other read holds the conversation"
+    assert c.ui.client.get(path).status_code == 200
+
+
+# stage 2026-10-10 15:13-15:24: 「停止這次回覆」 sent no stop to the API while the turn waited for an approval. The bridge
+# first re-read the receipt (and continuations) and only then posted the stop, so a read that failed or hung kept the
+# stop from going out. A turn this bridge already knows is running now posts its stop at once; the API answers it.
+def test_stopping_a_known_running_turn_posts_the_stop_without_reading_first(native_console):
+    c = native_console
+    draft = first(c)
+    assert send(c, draft).status_code == 200
+    rid = draft["request_id"]
+    assert c.ui.console.native_instructions.receipts[rid].status in {"accepted", "started"}
+    c.mutate[0] = lambda request, response: (
+        httpx.Response(503, json={"error": {"code": "NATIVE_STATE_STORE_UNKNOWN", "message": "fixed"}})
+        if request.method == "GET" else response)
+    before = len(c.calls)
+    stop = post(c, "/api/instructions/" + rid + "/cancel")
+    assert stop.status_code == 200, stop.text
+    sent = [(method, path) for method, path, _ in c.calls[before:]]
+    assert sent == [("POST", "/work-policy/v1/native-turns/cancel")], sent
+    assert stop.json()["task"]["native_receipt"]["cancel_requested"] is True
+    assert c.ui.console.journal.get(rid, "cancel")["state"] == "CONFIRMED"
+    # Pressing it again sends nothing more (the original stop is kept, never resent).
+    post(c, "/api/instructions/" + rid + "/cancel")
+    assert [call for call in c.calls[before:] if call[0] == "POST"] == [c.calls[before]]
+
+
+# The bridge still held the turn as running, but it had already finished: the API answers the stop with the original,
+# unchanged receipt (native_turns.cancel). That answer is recorded as "already finished", never as an unknown stop.
+def test_a_stop_for_a_turn_that_already_finished_records_the_api_answer(native_console):
+    c = native_console
+    draft = first(c)
+    assert send(c, draft).status_code == 200
+    rid = draft["request_id"]
+    assert c.ui.console.native_instructions.receipts[rid].status in {"accepted", "started"}
+    c.api.remote.completed(rid)
+    finished = c.api.remote.records[rid]
+
+    def unchanged(request, response):
+        if request.method == "POST" and request.url.path.endswith("/native-turns/cancel"):
+            c.api.remote.records[rid] = finished
+            headers = {key: value for key, value in response.headers.items() if key.lower() != "content-length"}
+            return httpx.Response(200, content=finished.model_dump_json().encode("utf-8"), headers=headers)
+        return response
+
+    c.mutate[0] = unchanged
+    before = len(c.calls)
+    stop = post(c, "/api/instructions/" + rid + "/cancel")
+    assert stop.status_code == 200, stop.text
+    assert [(method, path) for method, path, _ in c.calls[before:]] == [("POST", "/work-policy/v1/native-turns/cancel")]
+    task = stop.json()["task"]
+    assert task["native_receipt"]["status"] == "completed"
+    assert task["native_receipt"]["cancel_requested"] is False
+    assert task["cancellation"]["state"] == "CONFIRMED"
+    assert task["cancellation"]["receipt"] == {"result": {"cancel_accepted": False, "status": "completed"}}
+    assert c.ui.console.journal.get(rid, "cancel")["state"] == "CONFIRMED"
+
+
+# #804 review: only a completed receipt means "the work already finished, no stop needed". An unchanged receipt in
+# another state (busy_refused here) is not recorded as finished; the stop stays unknown and the page offers the check.
+def test_a_stop_answered_with_a_busy_refused_receipt_is_not_recorded_as_finished(native_console):
+    c = native_console
+    draft = first(c)
+    assert send(c, draft).status_code == 200
+    rid = draft["request_id"]
+    assert c.ui.console.native_instructions.receipts[rid].status in {"accepted", "started"}
+    refused = c.api.remote.records[rid].model_copy(update={"status": "busy_refused", "failure_code": "NATIVE_TURN_BUSY"})
+
+    def unchanged(request, response):
+        if request.method == "POST" and request.url.path.endswith("/native-turns/cancel"):
+            c.api.remote.records[rid] = refused
+            headers = {key: value for key, value in response.headers.items() if key.lower() != "content-length"}
+            return httpx.Response(200, content=refused.model_dump_json().encode("utf-8"), headers=headers)
+        return response
+
+    c.mutate[0] = unchanged
+    before = len(c.calls)
+    stop = post(c, "/api/instructions/" + rid + "/cancel")
+    assert stop.status_code == 200, stop.text
+    assert [(method, path) for method, path, _ in c.calls[before:]] == [("POST", "/work-policy/v1/native-turns/cancel")]
+    task = stop.json()["task"]
+    assert task["native_receipt"]["status"] == "busy_refused"
+    assert task["native_receipt"]["cancel_requested"] is False
+    assert task["cancellation"]["state"] == "UNKNOWN"
+    assert "receipt" not in task["cancellation"]
+    assert c.ui.console.journal.get(rid, "cancel")["state"] == "UNKNOWN"
+
+
+# #813 review round 3: during a deploy window the API may invoke no session for a stop (the turn's session is not
+# active). It says so (not_dispatched); the stop is recorded as not sent, and pressing it again sends the same stop.
+def test_a_stop_the_api_sent_nowhere_is_recorded_refused_and_the_same_stop_is_sent_again(native_console):
+    c = native_console
+    draft = first(c)
+    assert send(c, draft).status_code == 200
+    rid = draft["request_id"]
+    cid = c.ui.console.native_instructions.receipts[rid].conversation_id
+    assert c.ui.console.native_instructions.receipts[rid].status in {"accepted", "started"}
+    running = c.api.remote.records[rid]
+
+    def nowhere(request, response):
+        if request.method == "POST" and request.url.path.endswith("/native-turns/cancel"):
+            c.api.remote.records[rid] = running  # The API invoked no session: the turn is unchanged.
+            return httpx.Response(409, json={"error": {
+                "code": "NATIVE_SESSION_CHANGED", "message": "fixed", "automatic_retry": False,
+                "not_dispatched": True, "request_id": rid}})
+        return response
+
+    c.mutate[0] = nowhere
+    before = len(c.calls)
+    stop = post(c, "/api/instructions/" + rid + "/cancel")
+    assert stop.status_code == 200, stop.text
+    cancellation = stop.json()["task"]["cancellation"]
+    assert (cancellation["state"], cancellation["code"], cancellation["not_dispatched"]) == (
+        "REFUSED", "NATIVE_SESSION_CHANGED", True)
+    # The next progress read still offers 「停止這次回覆」: the stop went nowhere.
+    update = progress(c, draft["thread_id"])
+    task = next(row for row in update.json()["tasks"] if row["task_id"] == rid)
+    assert task["actions"]["cancel"]["enabled"] is True and task["cancellation"]["state"] == "REFUSED"
+    first_stop = [call for call in c.calls[before:] if call[0] == "POST"]
+    assert [(method, path) for method, path, _ in first_stop] == [("POST", "/work-policy/v1/native-turns/cancel")]
+    assert json.loads(first_stop[0][2]) == {"operation": "cancel", "conversation_id": cid, "request_id": rid}
+    # Pressed again (the API now reaches the turn's session): the same stop, same IDs, goes out once more.
+    c.mutate[0] = lambda request, response: response
+    again = post(c, "/api/instructions/" + rid + "/cancel")
+    assert again.status_code == 200, again.text
+    posts = [call for call in c.calls[before:] if call[0] == "POST"]
+    assert [(method, path) for method, path, _ in posts] == [("POST", "/work-policy/v1/native-turns/cancel")] * 2
+    assert posts[1][2] == posts[0][2]
+    assert again.json()["task"]["native_receipt"]["cancel_requested"] is True
+    assert c.ui.console.journal.get(rid, "cancel")["state"] == "CONFIRMED"
+
+
+# #813 review round 4: the delivery acknowledgement the API sent nowhere is recorded REFUSED on its journal row, and
+# pressing 「確認收到」 again sends the same NativeDelivered (same RID, CID and digest) on that same row.
+def test_a_delivery_acknowledgement_the_api_sent_nowhere_is_recorded_refused_and_the_same_one_is_sent_again(
+        native_console):
+    c = native_console
+    draft = first(c)
+    assert send(c, draft).status_code == 200
+    rid = draft["request_id"]
+    c.api.remote.completed(rid)
+    assert progress(c, draft["thread_id"]).status_code == 200
+    completed = c.api.remote.records[rid]
+    assert not completed.delivered
+
+    def nowhere(request, response):
+        if request.method == "POST" and request.url.path.endswith("/native-turns/delivered"):
+            c.api.remote.records[rid] = completed  # The API invoked no session: the turn is unchanged.
+            return httpx.Response(409, json={"error": {
+                "code": "NATIVE_SESSION_CHANGED", "message": "fixed", "automatic_retry": False,
+                "not_dispatched": True, "request_id": rid}})
+        return response
+
+    c.mutate[0] = nowhere
+    before = len(c.calls)
+    refused = post(c, "/api/instructions/" + rid + "/confirm-reply")
+    assert refused.status_code == 409, refused.text
+    error = refused.json()["error"]
+    assert (error["code"], error["not_dispatched"]) == ("NATIVE_SESSION_CHANGED", True)
+    row = c.ui.console.journal.get(rid, "acknowledge")
+    assert (row["state"], row["code"], row["not_dispatched"]) == ("REFUSED", "NATIVE_SESSION_CHANGED", True)
+    first_ack = [call for call in c.calls[before:] if call[0] == "POST"]
+    assert [(method, path) for method, path, _ in first_ack] == [("POST", "/work-policy/v1/native-turns/delivered")]
+    assert not c.ui.console.native_instructions.receipts[rid].delivered
+    # Pressed again (the API now reaches the turn's session): the same acknowledgement goes out once more.
+    c.mutate[0] = lambda request, response: response
+    again = post(c, "/api/instructions/" + rid + "/confirm-reply")
+    assert again.status_code == 200, again.text
+    posts = [call for call in c.calls[before:] if call[0] == "POST"]
+    assert [(method, path) for method, path, _ in posts] == [("POST", "/work-policy/v1/native-turns/delivered")] * 2
+    assert posts[1][2] == posts[0][2]
+    assert json.loads(posts[0][2])["request_id"] == rid
+    assert c.ui.console.native_instructions.receipts[rid].delivered
+    final = c.ui.console.journal.get(rid, "acknowledge")
+    assert final["state"] == "CONFIRMED" and final["intent"] == row["intent"]
 
 
 def test_a_sign_in_failure_on_the_status_read_is_reported_without_other_reads(native_console):
@@ -1390,17 +1668,21 @@ def test_responses_progress_rereads_only_the_latest_or_unfinished_turns(native_c
     native = native_console.ui.console.native_instructions
     read = []
     monkeypatch.setattr(native, "_saved", lambda thread: None)
-    monkeypatch.setattr(native.store, "all", lambda thread: [{"request_id": rid} for rid in ("old", "open", "new")])
+    monkeypatch.setattr(native.store, "all", lambda thread: [
+        {"request_id": rid} for rid in ("old", "relayed", "open", "new")])
     monkeypatch.setattr(native.journal, "get", lambda rid, phase: {"state": "CONFIRMED"} if phase == "submit" else None)
     monkeypatch.setattr(native, "_not_accepted", lambda rid: False)
     monkeypatch.setattr(native, "_read_original", lambda thread, rid, token: read.append(rid))
     monkeypatch.setattr(native, "_cid", lambda thread: None)
     monkeypatch.setattr(native, "_refresh_peer_replies", lambda thread, token: None)
-    monkeypatch.setattr(native, "receipts", {"old": SimpleNamespace(status="completed"),
-                                             "open": SimpleNamespace(status="accepted"),
-                                             "new": SimpleNamespace(status="completed")})
+    # Since 3397dc64 (#692) an older finished turn that still holds a queued relay is read again (its relay can change);
+    # the receipts carry `queued_relay` like a real NativeReceipt.
+    monkeypatch.setattr(native, "receipts", {"old": SimpleNamespace(status="completed", queued_relay=None),
+                                             "relayed": SimpleNamespace(status="completed", queued_relay=object()),
+                                             "open": SimpleNamespace(status="accepted", queued_relay=None),
+                                             "new": SimpleNamespace(status="completed", queued_relay=None)})
     native._refresh_responses("thread", "token")
-    assert read == ["open", "new"]
+    assert read == ["relayed", "open", "new"]
 
 
 def test_closed_finished_turn_approvals_are_not_reread(native_console, monkeypatch):

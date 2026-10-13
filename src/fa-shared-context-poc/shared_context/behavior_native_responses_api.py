@@ -230,7 +230,7 @@ def reconcile(gateway, principal, command):
 
 
 def cancel(gateway, principal, command):
-    control, client = gateway._context(principal, "read")
+    control, client = gateway._turn_context(principal, "read", command.request_id)
     gateway._legacy(control, command.conversation_id)
     original, response = gateway._invoke(client, NativeRead(request_id=command.request_id))
     if original.state_profile != NATIVE_RESPONSES_PROFILE or original.conversation_id != command.conversation_id:

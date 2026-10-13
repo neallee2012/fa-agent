@@ -174,6 +174,12 @@ h1{font-size:16px;line-height:1.3;margin:0;overflow:hidden;text-overflow:ellipsi
 .hitl-card>*{margin:0}
 .turn-attention{display:grid;gap:10px;justify-self:start;width:100%;max-width:800px}
 .turn-attention>.hitl-card{margin:0}
+.turn-attention>.hitl-waiting{margin:0;font-size:13px;color:var(--cp-text-muted)}
+/* Pending cards of the open conversation (Neal 2026-10-12): above the composer, outside the chat scroll. */
+#attention-dock{display:grid;gap:8px;margin:0 0 8px;max-height:min(45dvh,420px);overflow:auto}
+#attention-dock>.hitl-card{margin:0}
+#attention-dock .hitl-card pre{max-height:min(140px,20dvh)}
+#attention-dock .hitl-actions{position:sticky;bottom:0;z-index:1;padding:8px 0 2px;background:var(--cp-surface-soft)}
 .hitl-card h3{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;line-height:1.4;color:var(--cp-text-muted)}
 .hitl-card h3::before{content:"";flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:var(--cp-accent)}
 .consent-link{display:inline-flex;align-items:center;padding:6px 12px;border:1px solid var(--cp-accent);border-radius:.625rem;background:var(--cp-accent);color:var(--cp-accent-fg);text-decoration:none}
@@ -289,6 +295,11 @@ button.deny:hover:not(:disabled){background:color-mix(in srgb,var(--cp-danger) 1
 #model{min-width:0;max-width:65%;padding:4px 8px;background:var(--cp-bg-elevated);color:var(--cp-text-muted);border:0;border-radius:.625rem;font-size:12px}
 #send-instruction{min-width:60px;padding:6px 14px;font-size:13px}
 #cancel-instruction{white-space:nowrap;padding:6px 10px;font-size:13px}
+/* Confirmations are asked in the page: embedded browsers answer the native confirm dialog with false and show nothing. */
+.page-confirm{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.32)}
+.page-confirm-box{width:min(520px,100%);max-height:calc(100dvh - 32px);overflow:auto;padding:18px 20px;background:var(--cp-bg-elevated);color:var(--cp-text);border:1px solid var(--cp-border);border-radius:.625rem;box-shadow:var(--cp-shadow)}
+#page-confirm-message{margin:0 0 14px;white-space:pre-line;overflow-wrap:anywhere;font-size:14px;line-height:1.6}
+.page-confirm-actions{display:flex;justify-content:flex-end;gap:8px}
 /* Under the input: one place for status lines, each shown only while it has something to say. Capped so it never
    pushes the conversation off a short window; the lines stay in place and scroll, nothing is removed. */
 .composer-status{max-height:clamp(3.6em,16dvh,14em);overflow-y:auto;overscroll-behavior:contain;font-size:12px;line-height:1.5;color:var(--cp-text-muted)}
@@ -537,6 +548,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <a id="scoped-download" hidden></a>
 </div>
 <div class="composer-area"><div class="composer-wrap">
+<div id="attention-dock" role="region" aria-label="待你處理" hidden></div>
 <div id="error" role="alert" hidden><p id="error-message"></p><div class="error-actions">
 <button id="copy-error-request" type="button" hidden>複製 request ID</button>
 <button id="open-error-details" type="button">詳情</button></div></div>
@@ -715,6 +727,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 </aside>
 </main>
 </div>
+<div id="page-confirm" class="page-confirm" hidden><div class="page-confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="page-confirm-message"><p id="page-confirm-message"></p><div class="page-confirm-actions"><button id="page-confirm-cancel" type="button">取消</button><button id="page-confirm-ok" type="button" class="primary">確定</button></div></div></div>
 <script>
 "use strict";
 let state=null,selected="",selectedThread=null,busy=false,lastError=null,draftId=null,progressTimer=null,progressBusy=false,progressPaused=false,stateRevision=0,threadLoading=false;
@@ -824,6 +837,7 @@ const realtime={scope:null,phase:"off",socket:null,team:null,timer:null,attempts
 // 5 minute safety read is due 5 minutes after the last read, not 5 minutes after the page was last shown.
 let teamHitlTimerMode=null,teamHitlReadAt=0;
 const inlineAttentionHosts=new Map();
+const dockCards=new Map();
 // Each rendered turn's ⋯ menu and its summary; closed like the header menus (outside click, Esc).
 const turnMenus=new Map();
 let openTurnMenu=null;
@@ -918,6 +932,44 @@ waiting_dependency:"等待相依項目",succeeded:"工作成功",failed:"工作�
 accepted:"已接單",started:"執行中",completed:"已保存回覆",unknown:"結果未確認",busy_refused:"忙碌，未執行",
 not_accepted:"這次尚未接單"};
 function text(id,value){el(id).textContent=value??""}
+// Every confirmation is asked in the page, never with the browser's native confirm dialog: embedded browsers (e.g. a
+// desktop app's built-in browser) answer that with false and show nothing, so the action would silently not happen.
+// Resolves true only on 確定; 取消, Esc, a newer question or stillValid() turning false (checked on render) resolve
+// false. The dialog does not block the page's own updates, so callers re-check their state after awaiting it.
+let pageConfirm=null;
+function confirmInPage(message,{returnFocus=null,stillValid=null}={}){
+  closePageConfirm(false);
+  return new Promise(resolve=>{
+    pageConfirm={resolve,stillValid,returnFocus:returnFocus||document.activeElement||null};
+    // The rest of the page (#app-shell, the dialog's only sibling) cannot be focused or clicked while it is open.
+    el("app-shell").inert=true;
+    text("page-confirm-message",message);el("page-confirm").hidden=false;
+    // Cancel, not 確定: Enter or a held Enter must not confirm a delete, disable, stop or archive.
+    el("page-confirm-cancel").focus?.();
+  });
+}
+function closePageConfirm(answer){
+  const open=pageConfirm;
+  if(!open)return;
+  pageConfirm=null;el("page-confirm").hidden=true;text("page-confirm-message","");
+  // Before focus returns: an inert element cannot take focus.
+  el("app-shell").inert=false;
+  open.resolve(answer);
+  // A list re-rendered while the question was open leaves a detached node; only an element still on the page gets focus.
+  if(open.returnFocus?.isConnected!==false)open.returnFocus?.focus?.();
+}
+function checkPageConfirm(){if(pageConfirm?.stillValid&&!pageConfirm.stillValid())closePageConfirm(false)}
+el("page-confirm-ok").addEventListener("click",()=>closePageConfirm(true));
+el("page-confirm-cancel").addEventListener("click",()=>closePageConfirm(false));
+el("page-confirm").addEventListener("keydown",event=>{
+  if(!pageConfirm)return;
+  if(event?.key==="Escape"){event.stopPropagation?.();event.preventDefault?.();closePageConfirm(false)}
+  else if(event?.key==="Tab"){
+    // Keep focus on the two answers while the question is open.
+    event.preventDefault?.();
+    (document.activeElement===el("page-confirm-ok")?el("page-confirm-cancel"):el("page-confirm-ok")).focus?.();
+  }
+});
 const publicFailureMessages=new Map([
   ["MODEL_CALL_LIMIT_REACHED","已達單回合模型呼叫上限，停止新的模型請求；不會自動重送。"],
   ["ASSISTANT_MODEL_BUDGET","這次模型請求沒有可用的工作額度；不會自動重送。"],
@@ -1006,7 +1058,9 @@ function friendlyError(error){
     NATIVE_ENVIRONMENT_CONFLICT:"助理換版暫時沒有完成，訊息沒有送出，請稍後再送。",
     FOUNDRY_INVOCATION_UNKNOWN:"助理換版暫時沒有完成，訊息沒有送出，請稍後再送。",
   };
-  if(error?.not_dispatched===true&&Object.hasOwn(notDispatchedMessages,error.code))return notDispatchedMessages[error.code];
+  if(error?.not_dispatched===true&&Object.hasOwn(notDispatchedMessages,error.code))
+    return error.phase!=="acknowledge"?notDispatchedMessages[error.code]:error.code==="WORK_POLICY_REVOKED"?
+      "你目前沒有確認收到的權限，確認收到沒有送出。":"確認收到沒有送出，請稍後再按一次。";
   const messages={
     SERVER_FOLLOWING_TIMEOUT:"換版還沒完成，訊息已保留；可稍後以原內容重送。",
     NATIVE_SESSION_CHANGED:"傳送結果尚未確認；保留原請求，不會自動重送。",
@@ -2025,7 +2079,7 @@ async function applySettings(){
   if(hash===null||!unchanged())return;
   const message=[`確定把${settingsAgentName()?`「${settingsAgentName()}」`:"這位助理"}的新對話設定改成下列內容？`,...changes,
     "只影響之後的新對話；舊對話和已開始的工作不變，也不是新增操作權限。","後端仍會核對 Team 已批准的版本與相容設定。"].join("\n");
-  if(!window.confirm(message)){settingsNote="沒有送出任何變更。";renderSettings();return}
+  if(!await confirmInPage(message)){if(unchanged()){settingsNote="沒有送出任何變更。";renderSettings()}return}
   if(!unchanged()||settingsBusy)return;
   const command={request_id:"ui-settings-"+crypto.randomUUID(),expected_selection_id:view.current.selection_id,template:candidate};
   settingsBusy=true;settingsAction="select";renderSettings();
@@ -2280,7 +2334,7 @@ function decideSkill(entry,decision){
     const message=decision==="approve"?
       `批准 skill「${entry.title}」第 ${version.number} 版？\n批准後整個 Team 都能在各助理的設定裡選用；不會自動開到任何助理。`:
       `拒絕 skill「${entry.title}」第 ${version.number} 版？\n拒絕後這個版本不能再改；要修改請起草新的一份（請助理起草或自己寫）。原內容保留。`;
-    if(!window.confirm(message)||!skillLive(revision,agent))return;
+    if(!await confirmInPage(message)||!skillLive(revision,agent))return;
     await sendSkillDecision(entry.artifact_id,"decision",skillDecisionBody("decision",version,decision),revision,agent);
     if(skillLive(revision,agent))await loadSkillReviews(revision,agent);
   });
@@ -2291,7 +2345,7 @@ function deactivateSkill(entry){
     if(!view)return;
     const version=view.artifact.versions.find(item=>item.version_id===view.artifact.effective_version_id);
     if(!version)throw {code:"M3_NO_EFFECTIVE_VERSION"};
-    if(!window.confirm(`停用 skill「${entry.title}」目前生效的第 ${version.number} 版？\n停用後新對話不能再選它，已選用的助理之後也讀不到它；原內容和批准紀錄保留，不刪除。`)
+    if(!await confirmInPage(`停用 skill「${entry.title}」目前生效的第 ${version.number} 版？\n停用後新對話不能再選它，已選用的助理之後也讀不到它；原內容和批准紀錄保留，不刪除。`)
         ||!skillLive(revision,agent))return;
     await sendSkillDecision(entry.artifact_id,"deactivation",skillDecisionBody("deactivation",version),revision,agent);
     if(skillLive(revision,agent))await loadSkillReviews(revision,agent);
@@ -2304,7 +2358,7 @@ function retrySkillDecision(artifact){
     const view=await readSkillView(artifact,revision,agent);
     if(!view)return;
     if(skillRecorded(view.artifact,pending.kind,pending.body)){pending.state="done";pending.error=null}
-    else if(window.confirm("重新讀取後還沒看到這個決定。用同一個決定編號再送一次？同一編號只會記一次，不會變成兩個決定。")
+    else if(await confirmInPage("重新讀取後還沒看到這個決定。用同一個決定編號再送一次？同一編號只會記一次，不會變成兩個決定。")
         &&skillLive(revision,agent))await sendSkillDecision(artifact,pending.kind,pending.body,revision,agent);
     if(skillLive(revision,agent))await loadSkillReviews(revision,agent);
   });
@@ -2320,7 +2374,7 @@ function replaceSkill(entry,oldArtifact){
     if(!viewed||version?.version_id!==viewed.version_id)throw {code:"M3_STALE_PROPOSAL"};
     if(!version||version.approval)throw {code:"M3_ALREADY_DECIDED"};
     if(!oldVersion)throw {code:"M3_NO_EFFECTIVE_VERSION"};
-    if(!window.confirm(`用「${entry.title}」第 ${version.number} 版取代「${old.artifact.title}」？\n會依序：1. 批准新 skill（整個 Team 生效）；2. 停用舊 skill；3. 打開目前選中的助理「${settingsAgentName()||"這位助理"}」的設定，在它的新對話設定把舊的換成新的，再請你確認套用。\n每一步都只送一次；任何一步失敗就停下，不會往下做。`)
+    if(!await confirmInPage(`用「${entry.title}」第 ${version.number} 版取代「${old.artifact.title}」？\n會依序：1. 批准新 skill（整個 Team 生效）；2. 停用舊 skill；3. 打開目前選中的助理「${settingsAgentName()||"這位助理"}」的設定，在它的新對話設定把舊的換成新的，再請你確認套用。\n每一步都只送一次；任何一步失敗就停下，不會往下做。`)
         ||!skillLive(revision,agent))return;
     skillReplace={newArtifact:entry.artifact_id,newTitle:entry.title,oldArtifact,oldTitle:old.artifact.title,step:1,
       // Known only when this Agent's settings were already read; otherwise the reread after step 2 lists the old
@@ -2411,7 +2465,7 @@ function saveSkillDraft(){
   if(draft.problems.length||el("skill-new-save").disabled)return;
   skillNewNote="";skillNewError=null;
   skillTask("draft",async(revision,agent)=>{
-    if(!window.confirm(`建立 skill 草稿「${draft.value.title}」？\n只建立未批准的草稿，不會生效；你在清單裡查看並批准後，才能在各助理的設定裡選用。\n相同內容只會建立一次。`)
+    if(!await confirmInPage(`建立 skill 草稿「${draft.value.title}」？\n只建立未批准的草稿，不會生效；你在清單裡查看並批准後，才能在各助理的設定裡選用。\n相同內容只會建立一次。`)
         ||!skillLive(revision,agent))return;
     let result;
     try{result=await teamSkillCall("/api/team-skills/drafts",draft.value,agent)}
@@ -2546,7 +2600,7 @@ function saveTeamMcp(){
     const key=newConnection?`\n會用你輸入的金鑰建立 Team 自己的 connection；金鑰只送給 Foundry，不會顯示或保存在這裡。`:"";
     const message=editing?`修改 MCP「${server.server_label}」？\n${approval}所有對話（含進行中的）從下一回合起改用新設定；網址、connection 或工具改了的話，要到各助理的設定（助理清單右側的 ⚙）→ MCP 重新打開並套用。Team toolbox 會建立新版本並設為預設，舊版本保留。${key}`:
       `新增 MCP「${server.server_label}」？\n${approval}Team toolbox 會建立新版本並設為預設；之後要到每位助理的設定（助理清單右側的 ⚙）→ MCP 打開並套用，才會用到。只送一次。${key}`;
-    if(!window.confirm(message)||!teamMcpLive(revision,agent))return;
+    if(!await confirmInPage(message)||!teamMcpLive(revision,agent))return;
     teamMcpNote="";el("team-mcp-secret").value="";
     await sendTeamMcp(teamMcpCommand(operation,server.server_label,server,newConnection),
       editing?`已修改「${server.server_label}」`:`已新增「${server.server_label}」；要給助理用，請到那位助理的設定（助理清單右側的 ⚙）→ MCP 打開並套用到新對話`,
@@ -2555,7 +2609,7 @@ function saveTeamMcp(){
 }
 function disableTeamMcp(server){
   teamMcpTask("change",async(revision,agent)=>{
-    if(!window.confirm(`停用 MCP「${server.server_label}」？\n停用後，所有對話（含進行中的）從下一回合起都不能再用這個工具；舊紀錄保留，不重送。Team toolbox 會建立新版本並設為預設，舊版本保留不刪。`)
+    if(!await confirmInPage(`停用 MCP「${server.server_label}」？\n停用後，所有對話（含進行中的）從下一回合起都不能再用這個工具；舊紀錄保留，不重送。Team toolbox 會建立新版本並設為預設，舊版本保留不刪。`)
         ||!teamMcpLive(revision,agent))return;
     teamMcpNote="";
     await sendTeamMcp(teamMcpCommand("disable",server.server_label,null,null),`已停用「${server.server_label}」`,revision,agent);
@@ -2565,7 +2619,7 @@ function retryTeamMcp(){
   const retry=teamMcpRetry;
   if(!retry)return;
   teamMcpTask("change",async(revision,agent)=>{
-    if(!window.confirm(`用原編號重送上一個變更（${retry.command.server_label}）？\n內容和編號都和原本相同；若原本其實已完成，只會讀回同一個版本，不會建立第二個。`)
+    if(!await confirmInPage(`用原編號重送上一個變更（${retry.command.server_label}）？\n內容和編號都和原本相同；若原本其實已完成，只會讀回同一個版本，不會建立第二個。`)
         ||!teamMcpLive(revision,agent))return;
     teamMcpNote="";
     await sendTeamMcp(retry.command,retry.message,revision,agent);
@@ -2740,7 +2794,7 @@ function addTeamConnector(card){
   if(!controls)return;
   teamConnectorsTask("change",async(revision,agent)=>{
     const choice=connectorChoice(controls);
-    if(!window.confirm(`加入 ${card.display_name}？\n${card.disclosure}\n${connectorApprovals(choice)}\n`+
+    if(!await confirmInPage(`加入 ${card.display_name}？\n${card.disclosure}\n${connectorApprovals(choice)}\n`+
         "Team 裡每位助理的新對話都能用（可在各助理的設定關掉）。每位助理第一次用到時，對話裡會出現連線卡，要用你的帳號同意一次。"+
         "用戶端密碼只送給 Foundry 一次，不會顯示或保存在這裡。只送一次。")||!teamConnectorsLive(revision,agent))return;
     const command=connectorCommand(card,true,choice),secret=controls.secret.value;
@@ -2754,7 +2808,7 @@ function saveTeamConnectorApprovals(card){
   if(!controls)return;
   teamConnectorsTask("change",async(revision,agent)=>{
     const choice=connectorChoice(controls);
-    if(!window.confirm(`變更 ${card.display_name} 的批准設定？\n${connectorApprovals(choice)}\n`+
+    if(!await confirmInPage(`變更 ${card.display_name} 的批准設定？\n${connectorApprovals(choice)}\n`+
         "所有對話（含進行中的）從下一回合起套用。Team 的 connector toolbox 會建立新版本並設為預設，舊版本保留。只送一次。")
         ||!teamConnectorsLive(revision,agent))return;
     const command=connectorCommand(card,card.settings.enabled,choice);
@@ -2766,7 +2820,7 @@ function toggleTeamConnector(card){
   teamConnectorsTask("change",async(revision,agent)=>{
     const message=enable?`重新啟用 ${card.display_name}？\n之前用過它的對話和之後的新對話，從下一回合起可以再用；在助理設定裡關掉它的助理，新對話仍然不用。沿用同一條連線。只送一次。`:
       `停用 ${card.display_name}？\n所有助理（含進行中的對話）從下一回合起都不能再用。不會撤銷授權，也不刪除連線、toolbox 或舊版本。只送一次。`;
-    if(!window.confirm(message)||!teamConnectorsLive(revision,agent))return;
+    if(!await confirmInPage(message)||!teamConnectorsLive(revision,agent))return;
     // The saved approvals, not unsaved edits in the selects.
     const command=connectorCommand(card,enable,{read_approval:card.settings.read_approval,write_approval:card.settings.write_approval});
     await sendTeamConnector(command,command,`已${enable?"重新啟用":"停用"} ${card.display_name}`,revision,agent);
@@ -2777,7 +2831,7 @@ function retryTeamConnector(){
   if(!retry)return;
   const controls=teamConnectorControls.get(retry.command.connector_id);
   teamConnectorsTask("change",async(revision,agent)=>{
-    if(!window.confirm("用原編號重送上一個變更？\n內容和編號都和原本相同；若原本其實已完成，只會讀回同一個版本，不會建立第二個。"+
+    if(!await confirmInPage("用原編號重送上一個變更？\n內容和編號都和原本相同；若原本其實已完成，只會讀回同一個版本，不會建立第二個。"+
         (retry.secret?"\n頁面沒有保存用戶端密碼，這次送出你剛重新輸入的。":""))||!teamConnectorsLive(revision,agent))return;
     const secret=retry.secret?controls?.secret.value:"";
     if(controls)controls.secret.value="";
@@ -2929,7 +2983,7 @@ async function sendAgentConnectors(command,message,revision,agent){
 function switchAgentConnector(item,on){
   const view=agentConnectors,name=settingsAgentName()||"這位助理";
   agentConnectorsTask("change",async(revision,agent)=>{
-    if(!window.confirm(`${on?"開啟":"關閉"}「${name}」的 ${item.display_name}？\n只影響這位助理之後的新對話；進行中的對話不變。只送一次。`)
+    if(!await confirmInPage(`${on?"開啟":"關閉"}「${name}」的 ${item.display_name}？\n只影響這位助理之後的新對話；進行中的對話不變。只送一次。`)
         ||!agentConnectorsLive(revision,agent))return;
     const disabled=view.connectors.filter(entry=>entry.connector_id===item.connector_id?!on:!entry.on)
       .map(entry=>entry.connector_id).sort();
@@ -2942,7 +2996,7 @@ function retryAgentConnectors(){
   const retry=agentConnectorRetry;
   if(!retry)return;
   agentConnectorsTask("change",async(revision,agent)=>{
-    if(!window.confirm("用原編號重送上一個開關變更？\n內容和編號都和原本相同；若原本其實已完成，只會讀回同一個結果。")
+    if(!await confirmInPage("用原編號重送上一個開關變更？\n內容和編號都和原本相同；若原本其實已完成，只會讀回同一個結果。")
         ||!agentConnectorsLive(revision,agent))return;
     await sendAgentConnectors(retry.command,retry.message,revision,agent);
   });
@@ -3074,9 +3128,11 @@ async function loadRoutineSettings(revision,agent){
   if(value.schema_version!=="fa-console-routines-v1"||!Array.isArray(value.routines))throw {code:"ROUTINE_SETTINGS_RESPONSE_INVALID"};
   routineSettings=value;
 }
-function disableRoutine(view){
+async function disableRoutine(view){
   const routine=view.definition,draft=routineDraft({...routine.schedule,content:routine.content});
-  if(!draft||!window.confirm(`停用這個排程？\n${routineText(draft)}\n停用後下一次到點不會執行；要再用，請在對話裡重新請助理提出。`))return;
+  const revision=routineSettingsRevision,agent=selectedAgent;
+  if(!draft||!await confirmInPage(`停用這個排程？\n${routineText(draft)}\n停用後下一次到點不會執行；要再用，請在對話裡重新請助理提出。`)
+      ||revision!==routineSettingsRevision||agent!==selectedAgent)return;
   routineSettingsNote="";
   routineSettingsTask("disable",async(revision,agent)=>{
     const result=await routineCall(`/api/routines/${encodeURIComponent(routine.routine_id)}/versions/`+
@@ -3897,6 +3953,11 @@ function cancellationMessage(task){
   if(pendingCancellations.has(scopeKey(task?.task_id)))return "正在送出停止請求…";
   if(nativeProfile(task?.state_profile)){
     if(task.native_receipt?.cancel_requested)return "已要求停止這次回覆。";
+    if(task.cancellation?.state==="CONFIRMED"&&task.cancellation.receipt?.result)
+      return cancellationReceiptMessage(task,task.cancellation.receipt.result);
+    // The server invoked no session (not_dispatched): nothing was sent, and the same stop can be sent again.
+    if(task.cancellation?.state==="REFUSED"&&task.cancellation.not_dispatched===true)
+      return "停止請求沒有送出：助理正在換版本，這次沒有送到任何工作環境。可以稍後再按一次「停止這次回覆」。";
     return task.cancellation?.state==="UNKNOWN"?
       "還不確定停止請求有沒有送到；可以按這則訊息下方「⋯」裡的「核對原停止回條」。":"";
   }
@@ -4441,13 +4502,15 @@ function newNativeHitlRule(rule=null){
     base:{revision:hitlRulesView.rules.revision,etag:hitlRulesView.rules.etag}});
   renderNativeHitlRules();
 }
-function saveNativeHitlRule(){
+async function saveNativeHitlRule(){
   if(el("save-hitl-rule").disabled)return;
   const draft=hitlDraft(),operation=draft.rule_id===null?"add":"update";
-  if(!window.confirm(`確認${operation==="add"?"新增":"更新"}這條 Team 規則？\n${draft.text}\n處理：${
-      draft.behavior==="ask_first"?"先問我":"自動允許"}\n不替舊待批操作作決定，也不放寬原能力上限。`))return;
-  sendNativeHitlRule({operation,rule_id:draft.rule_id,rule:{text:draft.text,behavior:draft.behavior},
-    expected_rules_revision:draft.base.revision,expected_rules_etag:draft.base.etag});
+  const body={operation,rule_id:draft.rule_id,rule:{text:draft.text,behavior:draft.behavior},
+    expected_rules_revision:draft.base.revision,expected_rules_etag:draft.base.etag};
+  if(!await confirmInPage(`確認${operation==="add"?"新增":"更新"}這條 Team 規則？\n${draft.text}\n處理：${
+      draft.behavior==="ask_first"?"先問我":"自動允許"}\n不替舊待批操作作決定，也不放寬原能力上限。`)
+      ||el("save-hitl-rule").disabled||hitlDraft()!==draft)return;
+  sendNativeHitlRule(body);
 }
 function reconcileNativeHitl(entry){
   const target=hitlEntryTarget(entry);
@@ -4486,8 +4549,9 @@ function renderNativeHitlRules(){
     edit.textContent="編輯";remove.textContent="刪除";
     edit.disabled=remove.disabled=!editable;
     edit.addEventListener("click",()=>{if(!edit.disabled&&hitlRulesView===view)newNativeHitlRule(rule)});
-    remove.addEventListener("click",()=>{
-      if(remove.disabled||hitlRulesView!==view||!window.confirm(`確認從目前清單刪除這條規則？\n${rule.text}\n原批准、效果與歷史會保留。`))return;
+    remove.addEventListener("click",async()=>{
+      if(remove.disabled||hitlRulesView!==view||!await confirmInPage(`確認從目前清單刪除這條規則？\n${rule.text}\n原批准、效果與歷史會保留。`)
+          ||hitlRulesView!==view||!hitlReady()||hitlActive("rules-read")||hitlActive("rule-write"))return;
       sendNativeHitlRule({operation:"delete",rule_id:rule.rule_id,rule:null,
         expected_rules_revision:view.rules.revision,expected_rules_etag:view.rules.etag});
     });
@@ -4705,6 +4769,7 @@ function renderHitlCard(reference,label,thread,item=null,entry=null){
     const button=document.createElement("button");
     button.className={allow_once:"primary",allow_rule:"secondary",deny:"secondary deny"}[choice];
     button.textContent=choice==="allow_rule"&&ruleOpen?"確認規則並允許":label;button.setAttribute("data-hitl-choice",choice);
+    if(choice==="allow_once")button.setAttribute("data-primary","");
     button.disabled=!hitlCanDecide(value,target)||hitlActive("decision:"+pid)||choice==="allow_rule"&&
       (value.rules.rules.length>=20||ruleOpen&&(!input.value.trim()||[...input.value].length>512));
     button.addEventListener("click",()=>{
@@ -5057,6 +5122,7 @@ function renderConsentCard(entry,inline=false){
   for(const [choice,label,className] of [["resume","我連好了，繼續","primary"],["decline","先不用","secondary"]]){
     const button=document.createElement("button");button.className=className;button.textContent=label;
     button.setAttribute("data-consent-"+choice,cid);button.disabled=disabled;
+    if(choice==="resume")button.setAttribute("data-primary","");
     button.addEventListener("click",()=>{if(!button.disabled&&scopeAtRender===hitlObservationScope)
       sendConsentClick(entry,choice)});
     actions.append(button);
@@ -5115,7 +5181,14 @@ function renderAttention(){
       overview.setAttribute("data-attention-overview",entry.item.item_id);
       overview.textContent=attentionLabel(entry)+(entry.item.type==="approval_required"?"：待批准":
         entry.item.type==="connect_required"?"：待連線":"：待回答");
-      open.textContent="查看原回合";open.addEventListener("click",()=>inlineAttentionHosts.get(original)?.scrollIntoView?.());
+      open.textContent="查看原回合";open.addEventListener("click",()=>{
+        // A pending card lives in the dock above the composer: bring the dock up and focus the card itself.
+        const card=dockCards.get(attentionIdentity(entry));
+        if(card&&!el("attention-dock").hidden){
+          el("attention-dock").scrollIntoView?.();primaryControl(card)?.focus?.();return;
+        }
+        inlineAttentionHosts.get(original)?.scrollIntoView?.();
+      });
       overview.append(open);list.append(overview);continue;
     }
     const card=renderAttentionCard(entry);
@@ -5145,12 +5218,44 @@ function renderAttentionCard(entry,inline=false){
     renderHitlCard(entry.item.approval,own?"":attentionLabel(entry),entry.thread_id,entry.item,entry):
     entry.item.type==="connect_required"?renderConsentCard(entry,own):renderQuestionCard(entry,own);
 }
+const HITL_WAITING_NOTE={approval_required:"正在等你批准，卡片在輸入框上方。",
+  question_required:"助理有問題要問你，卡片在輸入框上方。",connect_required:"需要連線，卡片在輸入框上方。"};
+// The control a pending card is waiting for: the button marked data-primary (允許這次, 我連好了，繼續) or the first
+// question option; never one that is disabled, hidden or inside a closed <details>.
+function primaryControl(node){
+  const usable=n=>!n.disabled&&!n.hidden;
+  const find=(n,match)=>{
+    if(n.hidden||n.tagName==="DETAILS"&&!n.open)return null;
+    if(n.tagName==="BUTTON"&&usable(n)&&match(n))return n;
+    for(const child of n.children||[]){const found=find(child,match);if(found)return found}
+    return null;
+  };
+  return find(node,n=>n.getAttribute("data-primary")!==null)||find(node,n=>n.className==="hitl-option");
+}
 function renderInlineAttention(){
   const items=currentAttention(),records=savedHitlRecords(new Set(items.map(hitlItemKey)));
+  const dock=el("attention-dock");dock.replaceChildren();dockCards.clear();
+  // Pending cards of the open conversation live in the dock above the composer; the turn keeps a one-line note.
+  // Oldest card first (item.created_at); if any card has a missing or unreadable time, the arrival order is kept.
+  const pending=items.filter(entry=>attentionTurn(entry)&&!hitlSettled(entry));
+  const born=entry=>Date.parse(entry.item.created_at);
+  if(pending.every(entry=>Number.isFinite(born(entry))))pending.sort((a,b)=>born(a)-born(b));
+  if(pending.length>1){
+    const count=document.createElement("p");count.className="muted";count.setAttribute("data-dock-count","");
+    count.textContent=`有 ${pending.length} 張待處理卡片`;dock.append(count);
+  }
+  for(const entry of pending){const card=renderAttentionCard(entry,true);dockCards.set(attentionIdentity(entry),card);dock.append(card)}
+  dock.hidden=!pending.length;
   for(const [rid,host] of inlineAttentionHosts){
     host.replaceChildren();
     for(const record of records)if(record.turn===rid)host.append(renderHitlRecord(record));
-    for(const entry of items)if(attentionTurn(entry)===rid)host.append(renderAttentionCard(entry,true));
+    for(const entry of items)if(attentionTurn(entry)===rid){
+      if(hitlSettled(entry))host.append(renderAttentionCard(entry,true));
+      else{
+        const note=document.createElement("p");note.className="hitl-waiting";note.setAttribute("data-hitl-waiting",entry.item.item_id);
+        note.textContent=HITL_WAITING_NOTE[entry.item.type];host.append(note);
+      }
+    }
     host.hidden=!host.children.length;
   }
 }
@@ -5543,6 +5648,8 @@ function processingLine(event,events,active,now){
   return label+detail;
 }
 // What the assistant is doing right now, in the words of the main screen.
+// A running native turn held by the owner's card says so instead of a generic running line (stage 2026-10-10).
+const HELD_TURN_TEXT={"正在等你批准":"這個回合正在等你批准","正在等你回答":"這個回合正在等你回答"};
 function processingActivity(task,events){
   // A card answered a moment ago no longer holds the turn: what the assistant does next shows at once.
   const waiting=currentAttention().filter(entry=>attentionTurn(entry)===task.task_id&&!hitlSettled(entry));
@@ -6339,7 +6446,8 @@ function renderConversation(tasks){
       progress?.stream?.durable===false&&progress.stream.text?{stream:progress.stream.text}:
       liveTextFor(task)?{stream:liveTextFor(task),live:true}:
       ["queued","starting","running","capacity_uncertain","waiting_dependency","accepted","started"].includes(progress?.state||task.status?.data?.state)?
-        {wait:"正在準備回覆…"}:olderTurnNeedsRead(task)||olderTurnReads.has(scopeKey(task.task_id))?{wait:"正在載入回覆…"}:
+        {wait:nativeProfile(task.state_profile)&&HELD_TURN_TEXT[processingActivity(task,[])]||"正在準備回覆…"}:
+      olderTurnNeedsRead(task)||olderTurnReads.has(scopeKey(task.task_id))?{wait:"正在載入回覆…"}:
         "尚未載入回覆，可從選單更新。");
     if(typeof content==="string"||typeof content.wait==="string"){
       // A reply still on its way pulses; a settled placeholder does not.
@@ -6462,7 +6570,9 @@ function renderConversation(tasks){
     }
     // The turn's cards and answered records come after what the owner said and before the assistant's reply, so what
     // the assistant does after an answer shows below it (Neal 2026-10-07, like the Copilot app's timeline). Only a
-    // turn that has one gets this slot; every other turn keeps its layout.
+    // turn that has one gets this slot; every other turn keeps its layout. Pending cards now live in the dock above
+    // the composer (Neal 2026-10-12, so the owner never has to scroll to find them); the slot keeps a one-line note
+    // while one waits and the settled records stay inline.
     if(hitlTurns.slots.has(task.task_id)){
       const attention=document.createElement("div");attention.className="turn-attention";attention.hidden=true;
       inlineAttentionHosts.set(task.task_id,attention);turn.append(attention);
@@ -6784,6 +6894,7 @@ function render(){
   scheduleProgress();
   scheduleAuthentication();
   scheduleTeamAttention();
+  checkPageConfirm();
 }
 function scheduleAuthentication(){
   if(authenticationTimer!==null){clearTimeout(authenticationTimer);authenticationTimer=null}
@@ -6974,6 +7085,10 @@ function openingTurn(){
     task.native_receipt).at(-1);
   return latest&&!openReads.has(scopeKey(latest.task_id))?latest:null;
 }
+// stage 2026-10-10/12: one progress read that never came back held progressBusy, so no later read (timer, push hint,
+// 「更新回覆」) went out and a pending card or the saved reply never showed. A read is a GET (nothing to resend), so the
+// page stops waiting for it after this long and reads again with the usual backoff; a late answer is ignored.
+const PROGRESS_READ_TIMEOUT_MS=45000;
 async function updateProgress(refreshChildren=false){
   progressTimer=null;
   if(busy||progressBusy||document.hidden){scheduleProgress();return}
@@ -6984,11 +7099,17 @@ async function updateProgress(refreshChildren=false){
   if(!opening)realtime.progressDue=false;
   const revision=stateRevision,scope=agentRevision;
   if(opening){openReads.add(scopeKey(opening.task_id));openingRead=true}
-  let fullRead=false;
+  let fullRead=false,readTimer=null;
   try{
-    const response=await agentFetch(turn?`/api/instructions/${encodeURIComponent(turn.task_id)}/status`:
-      "/api/instructions/progress"+threadQuery(),{cache:"no-store",credentials:"same-origin"});
-    const value=await response.json();
+    const read=(async()=>{
+      const response=await agentFetch(turn?`/api/instructions/${encodeURIComponent(turn.task_id)}/status`:
+        "/api/instructions/progress"+threadQuery(),{cache:"no-store",credentials:"same-origin"});
+      return {response,value:await response.json()};
+    })();
+    const timeout=new Promise((_,reject)=>{
+      readTimer=setTimeout(()=>reject(new Error("進度讀取逾時")),PROGRESS_READ_TIMEOUT_MS);
+    });
+    const {response,value}=await Promise.race([read,timeout]).finally(()=>clearTimeout(readTimer));
     if(revision!==stateRevision)return;
     if(!response.ok){
       // A failed read goes back to its own pace and backoff; the whole-conversation read waits for a later read.
@@ -7082,7 +7203,9 @@ async function run(path,body={},messageScope=null){
   const sameAgentLogin=()=>originAgent===selectedAgent&&auth===attachmentAuthRevision;
   // A failed action on one message's own route carries that message's request ID for 複製 request ID.
   const ownRequest=typeof messageScope==="string"&&path.includes(`/${encodeURIComponent(messageScope)}/`)?messageScope:null;
-  const withRequest=error=>ownRequest&&!error.request_id?{...error,request_id:ownRequest}:error;
+  const withOwnRequest=error=>ownRequest&&!error.request_id?{...error,request_id:ownRequest}:error;
+  // 「確認收到」 has its own wording when it was not sent; every other action keeps the message wording.
+  const withRequest=path.endsWith("/confirm-reply")?error=>({...withOwnRequest(error),phase:"acknowledge"}):withOwnRequest;
   const live=()=>scope===agentRevision&&sameAgentLogin();
   stateRevision++;if(messageScope)pendingMessages.add(messageKey);else setScopeBusy(originAgent,true);
   lastError=null;threadErrors.delete(errorKey);progressPaused=false;render();el("error").hidden=true;
@@ -7513,12 +7636,14 @@ async function readOlderTurn(task){
     const read=value.tasks?.find(entry=>entry.task_id===id&&entry.thread_id===thread);
     const current=state.tasks?.find(entry=>entry.task_id===id&&entry.thread_id===thread);
     if(read&&current){
-      for(const field of ["reply","progress","progress_error","native_receipt","status"])current[field]=read[field];
-      conversationRenderKey=null;render();
+      for(const field of ["reply","progress","progress_error","native_receipt","status","error"])current[field]=read[field];
     }
   }catch{}
   finally{
     if(olderTurnReads.get(key)===live)olderTurnReads.delete(key);
+    // Drawn once the read is over, whatever it brought: a failed read or one without the reply no longer says
+    // 「正在載入回覆…」 (the bubble's key does not hold this read) but 「尚未載入回覆，可從選單更新。」.
+    if(live()){conversationRenderKey=null;render()}
     if(live()&&olderTurnQueue.length)queueOlderTurns([]);
   }
 }
@@ -7862,13 +7987,13 @@ el("read-template-selection").addEventListener("click",async()=>{
     if(templateLive(revision)){templateBusy=false;renderTemplate()}
   }
 });
-el("select-template").addEventListener("click",()=>{
+el("select-template").addEventListener("click",async()=>{
   if(el("select-template").disabled)return;
   const revision=templateRevision,candidate=templateCandidate,current=templateCurrent.current;
   const message="確定將下列模板選定為新對話設定？\n只影響新對話，不改原 policy／舊對話，不是新增操作權限。"
     +"\n後端仍會核對角色 hash、目的 Team 技能及相容設定。\n"
     +el("template-target").textContent+"\nexpected_selection_id: "+JSON.stringify(current.selection_id);
-  if(!window.confirm(message)||!templateLive(revision)||el("select-template").disabled)return;
+  if(!await confirmInPage(message)||!templateLive(revision)||el("select-template").disabled)return;
   sendTemplateSelection("/api/agent-template/select",{
     request_id:"ui-template-"+crypto.randomUUID(),expected_selection_id:current.selection_id,template:candidate,
   },"select",templateResult.template_sha256);
@@ -7971,6 +8096,8 @@ el("platform-history-next").addEventListener("click",()=>readPlatformHistory("ne
 el("platform-history-previous").addEventListener("click",()=>readPlatformHistory("previous"));
 el("close-diagnostics").addEventListener("click",()=>{el("diagnostics").hidden=true;el("menu-button").focus?.()});
 document.addEventListener("keydown",event=>{
+  // An open in-page confirmation takes Esc as 取消 even when focus left it; nothing else closes on the same key.
+  if(event.key==="Escape"&&pageConfirm){closePageConfirm(false);return}
   if(event.key==="Escape"){
     const focused=document.activeElement;
     const returnFocus=[["chat-menu","menu-button"],["settings-menu","settings-button"]]
@@ -8300,9 +8427,16 @@ for(const [id,kind] of [["payload-download","payload"],["summary-download","summ
 }
 el("send-instruction").addEventListener("click",sendChat);
 el("cancel-instruction").addEventListener("click",async()=>{
-  if(el("cancel-instruction").disabled)return;
+  if(el("cancel-instruction").disabled||el("cancel-instruction").hidden)return;
   const task=cancellableTask();
-  if(!task||!window.confirm("送出停止這次回覆的請求？原對話與已保存資料會保留；是否已停止仍以後端狀態為準。"))return;
+  if(!task)return;
+  // The question lasts only while the same turn can still be stopped; another turn, a finished one or a disabled
+  // button closes it without sending.
+  const asked=scopeKey(task.task_id);
+  const sameTurn=()=>!el("cancel-instruction").hidden&&!el("cancel-instruction").disabled
+    &&scopeKey(cancellableTask()?.task_id)===asked;
+  if(!await confirmInPage("送出停止這次回覆的請求？原對話與已保存資料會保留；是否已停止仍以後端狀態為準。",
+    {returnFocus:el("cancel-instruction"),stillValid:sameTurn})||!sameTurn())return;
   const id=task.task_id,key=scopeKey(id),scope=agentRevision;
   pendingCancellations.add(key);
   try{await run(`/api/instructions/${encodeURIComponent(id)}/cancel`,{},id)}
@@ -8324,6 +8458,8 @@ el("refresh-progress").addEventListener("click",()=>{
   if(el("refresh-progress").disabled)return;
   progressPaused=false;progressRetryMs=1000;
   if(progressTimer!==null){clearTimeout(progressTimer);progressTimer=null}
+  // A finished turn whose saved reply did not load is read again (its own /status) once it is on screen.
+  olderTurnDone.clear();conversationRenderKey=null;
   updateProgress(true);
 });
 el("read-context").addEventListener("click",async()=>{
@@ -8345,10 +8481,12 @@ el("read-context").addEventListener("click",async()=>{
     if(revision===contextRevision){turnContexts.delete(id);contextErrors.set(id,{code:"LOCAL_OFFLINE",message:error.message})}
   }finally{if(revision===contextRevision){contextReads.delete(id);render()}}
 });
-el("reset-session").addEventListener("click",()=>{
+el("reset-session").addEventListener("click",async()=>{
   if(el("reset-session").disabled||!selectedThread)return;
-  if(window.confirm("封存目前對話並開新 session？舊紀錄與檔案會保留；執行中或未知的工作不會被丟棄。"))
-    run(`/api/instructions/${encodeURIComponent(selectedThread)}/reset`,{},state.composer.request_id);
+  const thread=selectedThread,request=state.composer.request_id;
+  if(!await confirmInPage("封存目前對話並開新 session？舊紀錄與檔案會保留；執行中或未知的工作不會被丟棄。")
+      ||el("reset-session").disabled||selectedThread!==thread||state.composer?.request_id!==request)return;
+  run(`/api/instructions/${encodeURIComponent(thread)}/reset`,{},request);
 });
 for(const action of ["status","fetch","acknowledge","reconcile","submit-reconcile","submit-retry"]){
   el(action).addEventListener("click",async()=>{

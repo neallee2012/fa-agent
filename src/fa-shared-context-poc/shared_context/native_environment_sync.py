@@ -50,7 +50,9 @@ def follow_agent(composition, agent_id, *, wait_seconds=FOLLOW_WAIT_SECONDS, sle
         if view.files_manifest_sha256 is not None:
             current()
             try:
-                NativeTurnGateway._signal_ready_handoffs(sessions.current(client), view)
+                # A ready handoff delivers work: the selector is read now, not taken from the reader window.
+                NativeTurnGateway._signal_ready_handoffs(
+                    sessions.current(client, checked_since=time.monotonic()), view)
             except Problem as error:
                 log.warning("NATIVE_CONTINUATION_HANDOFF_PENDING code=%s", error.body["error"]["code"])
         try:

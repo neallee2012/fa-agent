@@ -85,7 +85,8 @@ def stream_source(gateway, principal, conversation_id, request_id, starting_afte
     """T1, then the original receipt: only its own response is replayed, never a caller-chosen one."""
     from .behavior_native_responses_api import platform_client
 
-    control, client = gateway._context(principal, "read")
+    # A read: the selector window and a recently confirmed reader apply, as for the other reads and polls.
+    control, client = gateway._read_context(principal)
     gateway._legacy(control, conversation_id)
     original, _ = gateway._invoke(client, NativeRead(request_id=request_id))
     if original.state_profile != NATIVE_RESPONSES_PROFILE or original.conversation_id != conversation_id:

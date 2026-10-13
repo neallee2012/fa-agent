@@ -1,1 +1,1 @@
-{"version":"2026.10.12-27","milestone":"第 27 版：README 補上開發中的功能（Teams connector、在 Teams 和助理對話、GitHub connector）與訂閱 ID 查法；執行期程式與第 26 版相同"}
+{"version":"2026.10.13-28","milestone":"第 28 版：工作台待處理卡片移到輸入框上方、停止改成頁面內確認、回合完成不必手動更新；Connect 卡「先不用」換版後仍保留；換版後不再呼叫舊版本 session，也不叫醒已回收的舊 session 讀檔（版本模型 G phase 0）"}

@@ -398,6 +398,89 @@ def test_native_admission_branch_rejects_drift_before_creating_any_new_record(as
         client.close()
 
 
+def test_native_admission_never_wakes_an_idle_legacy_conversation_session(assistant, monkeypatch):
+    """ADR-0009 §10: an idle fa-chat SID is not invoked; reset or a new conversation stays explicit."""
+    import httpx
+    from shared_context.behavior_assistant_wire import InstructionSubmit, PROFILE
+    from shared_context.behavior_foundry import (
+        FoundryExecutor, FoundryHttpClient, NativeExecutionGrant, NativeJobRoute, NativeLaunchAuthority,
+    )
+    from test_behavior_foundry import TARGET
+    from test_foundry_start_diagnostics import Credential, SessionTransport, inject_sdk
+    from test_work_policy_lifecycle import enabled
+
+    deployed_versions(monkeypatch, TARGET.agent_version)
+    h, control, human, _ = enabled(assistant)
+    sdk_io(monkeypatch)
+    h.endpoint.unbounded = True
+    h.endpoint.replies = iter([{"content": "Retained reply before the session went idle."}])
+    first, _ = control.submit(human, InstructionSubmit(request_id="idle-first", content="Keep this history."))
+    assert h.runtime.controller.step(first.binding_id).state == "succeeded"
+    record = control.records[first.binding_id]
+    assert record.hosted_session_id.startswith("fa-chat-")
+    target = TARGET.model_copy(update={"executor_id": h.workers.contract.executor_id, "agent_oid": first.agent_oid})
+    native = NativeLaunchAuthority(
+        h.workers, team_id=first.team_id, controller_id="internal-controller", targets=(target,),
+        jobs=(NativeJobRoute(job_id=first.job_id, api_binding_id=first.binding_id, grant_id="unused"),),
+        verifier_version=h.config.verifier_version, clock=lambda: h.time,
+    )
+    native.assistant = h.assistant
+    credential = Credential()
+    # Same SID and version as recorded; only the platform status says the compute was reclaimed.
+    transport = SessionTransport(session_change={"agent_session_id": record.hosted_session_id, "status": "idle"})
+    inject_sdk(monkeypatch, credential, transport)
+    invoked = []
+
+    def invoke(request):
+        invoked.append((request.method, request.url.path))
+        return httpx.Response(503, json={"error": {"code": "OFFLINE_INVOKE", "message": "offline"}})
+
+    client = FoundryHttpClient(target, credential, transport=httpx.MockTransport(invoke))
+    executor = FoundryExecutor(native, (client,))
+    verify_session, offline = FoundryHttpClient.verify_session, h.runtime.mode
+
+    def admission_branch_only(self, *, before_send):
+        # Only the native admission branch runs as native: the offline harness has no native final store guard,
+        # so the rest of admission is offline and, without the metadata gate, the turn reaches the native start.
+        try:
+            return verify_session(self, before_send=before_send)
+        finally:
+            h.runtime.mode = offline
+
+    before = h.transport.backing.rows.copy()
+    try:
+        with monkeypatch.context() as branch:
+            branch.setattr(h.runtime, "mode", "native")
+            branch.setattr(h.runtime, "dep", replace(h.runtime.dep, native_launches=native))
+            branch.setattr(h.workers, "adapter", replace(h.workers.adapter, start=executor.start))
+            branch.setattr(FoundryHttpClient, "verify_session", admission_branch_only)
+            try:
+                second, _ = control.submit(human, InstructionSubmit(
+                    request_id="refused-idle-session",
+                    conversation_id=record.profile.instruction.conversation_id, content="Continue."))
+            except Problem as error:
+                denied = error
+            else:
+                denied, grant_id = None, native_key("bootstrap-grant", second.job_id)
+                h.seed([(native_key("grant", grant_id), NativeExecutionGrant(
+                    grant_id=grant_id, controller_id=native.controller_id, owner=second.owner, policy_revision=1,
+                    job_id=second.job_id, definition=second.work,
+                    input_digest=hashlib.sha256(h.runtime.job_input(second)).hexdigest(),
+                    targets=native.targets_for(second.job_id), active=True, remaining_uses=1,
+                    not_before=h.time, expires_at=None, workload_version=PROFILE))])
+                try:
+                    h.workers.start(second.job_id, second.owner)
+                except Problem:
+                    pass
+        assert invoked == [], "an idle legacy session cannot be invoked"
+        assert denied is not None and denied.status == 409
+        assert denied.body["error"]["code"] == "CONVERSATION_SESSION_UNAVAILABLE", denied.body
+        assert h.transport.backing.rows == before
+        assert [call["method"] for call in transport.calls] == ["GET"]
+    finally:
+        client.close()
+
+
 def test_routine_version_failures_do_not_consume_the_manual_cancellation_limit():
     from shared_context.behavior_migration import _UnclaimedFence
     from shared_context.behavior_recovery_history import _check_unclaimed_fence_limit

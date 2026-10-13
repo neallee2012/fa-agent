@@ -42,6 +42,9 @@ from shared_context.assistant_image_wire import MAX_IMAGE_BYTES as _MAX_USER_IMA
 
 # One base64 PNG plus its name; the API refuses anything over the same image bound.
 MAX_IMAGE_UPLOAD_BODY_BYTES = (_MAX_USER_IMAGE_BYTES + 2) // 3 * 4 + 4096
+# A conversation's progress reads take turns. One that does not come back must not hold the next ones (a reload's first
+# read included) forever: a read waits this long for its turn, then answers retryable and the page reads again.
+PROGRESS_LOCK_WAIT_SECONDS = 25
 
 MESSAGES = {
     **AGENT_MESSAGES,
@@ -126,6 +129,7 @@ MESSAGES = {
     "BACKEND_OFFLINE": "後端無法連線或回應中斷；已送出的請求結果未知，不會自動重送。",
     "BACKEND_UNAVAILABLE": "後端未能完成請求；結果未確認，不會自動重送。",
     "BACKEND_DENIED": "後端拒絕：可能許可過期、撤銷或身份不符；不能當作沒有結果。",
+    "PROGRESS_READ_BUSY": "這段對話的上一次讀取還沒回來；稍後自動再讀，不會重送訊息。",
     "BACKEND_LIMIT": "後端有限配額已達上限；不會自動重試或退額。",
     "NO_RESULT": "尚無可取得的成果；不是成功，也不是已收件。",
     "RESULT_UNKNOWN": "原請求結果仍未知；請查原工作狀態，不要重送。",
@@ -312,6 +316,16 @@ class Console:
     def message_lock(self, key):
         with self.locks_guard:
             return self.message_locks.setdefault(key, RLock())
+
+    @contextmanager
+    def progress_lock(self, thread_id):
+        lock = self.message_lock("progress:" + thread_id)
+        if not lock.acquire(timeout=PROGRESS_LOCK_WAIT_SECONDS):
+            raise ConsoleError("PROGRESS_READ_BUSY", 409, automatic_retry=True)
+        try:
+            yield
+        finally:
+            lock.release()
 
     def operation_lock(self, task_id):
         if self.instructions is not None and self.instructions.store.command(task_id) is not None:
@@ -840,7 +854,7 @@ class Console:
         self.active()
         self.native_instructions.open_received(self.vault.get(), thread_id)
         thread_id = self.instructions.store.current(thread_id)["thread_id"]
-        with self.message_lock("progress:"+thread_id):
+        with self.progress_lock(thread_id):
             self.active()
             require(self.instructions is not None, "ACTION_NOT_ALLOWED", 403)
             thread_id = self.instructions.store.current(thread_id)["thread_id"]
@@ -868,7 +882,7 @@ class Console:
         require(self.instructions is not None, "ACTION_NOT_ALLOWED", 403)
         thread = self.native_request(request_id)
         require(thread is not None, "ACTION_NOT_ALLOWED", 403)
-        with self.message_lock("progress:" + thread):
+        with self.progress_lock(thread):
             self.active()
             self.native_instructions.turn_status(request_id, self.vault.get())
             return self.state(thread)
@@ -882,7 +896,7 @@ class Console:
 
     def instruction_platform_history(self, thread_id, *, after=None, previous=False):
         require(self.instructions is not None and self.native_thread(thread_id), "ACTION_NOT_ALLOWED", 403)
-        with self.message_lock("progress:" + thread_id):
+        with self.progress_lock(thread_id):
             self.active()
             self.native_instructions.read_platform_history(
                 thread_id, self.vault.get(), after=after, previous=previous)

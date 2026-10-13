@@ -885,8 +885,16 @@ class NativeInstructionControl:
             if rid in self.consents.pages:
                 self.consents.refresh(thread, token, only=rid)
         if value.result is not None:
-            self._answer(value.conversation_id, rid, value.result, token,
-                         text=None if status is None else status.text)
+            # The receipt above is already saved here; a reply read that fails must not keep it from the page (which
+            # would go on showing the turn as running). The failure stays on this turn, and the next read tries again.
+            try:
+                self._answer(value.conversation_id, rid, value.result, token,
+                             text=None if status is None else status.text)
+                self.errors.pop(rid, None)
+            except ConsoleError as error:
+                if _signed_out(error):
+                    raise
+                self.errors[rid] = error.code
         self.observed[thread] = self.clock().isoformat()
         return thread
 
@@ -1261,9 +1269,18 @@ class NativeInstructionControl:
     def change(self, rid, phase, token):
         thread = self.thread_for(rid)
         require(thread is not None, "INSTRUCTION_SCOPE")
-        original = self._remember(thread, self._receipt(rid, token))
-        if phase == "cancel":
+        known = self.receipts.get(rid)
+        if (phase == "cancel" and known is not None and known.status in {"accepted", "started"}
+                and not known.cancel_requested):
+            # A turn already read as running: the stop goes out at once, and the API answers it from the original
+            # receipt (it returns that receipt unchanged if the turn has ended). A receipt read first could fail or
+            # hang and keep the stop from being sent (stage 2026-10-10).
+            original = known
+        else:
+            original = self._remember(thread, self._receipt(rid, token))
+        if phase == "cancel" and original is not known:
             self._refresh_continuations(thread, token)
+        if phase == "cancel":
             continuation = self.continuations.get(rid)
             require(original.status in {"accepted", "started"} or original.status == "unknown" and (
                 continuation is not None and continuation.continuation is not None
@@ -1276,13 +1293,31 @@ class NativeInstructionControl:
                                       result_digest=original.result.result_digest)
         prior = self.journal.get(rid, phase)
         profile = self.profile(thread)
+        body = command.model_dump(mode="json")
         if prior is not None:
             require(prior["intent"].get("state_profile") == profile, "INSTRUCTION_ROUTE_CHANGED")
-            return
-        self.journal.begin(rid, phase, {"state_profile": profile,
-                                      "body": command.model_dump(mode="json"), "created_at": self.clock().isoformat()})
+            if not (prior["state"] == "REFUSED" and prior.get("not_dispatched") is True):
+                return
+            # The API invoked no session for the earlier attempt: the same command (same RID) goes out again, recorded
+            # as unconfirmed on the same row before it is sent.
+            require(prior["intent"].get("body") == body, "NATIVE_RID_CONFLICT")
+            self.journal.finish(rid, phase, {"state": "UNKNOWN", "code": "RECONCILE_REQUIRED",
+                                           "observed_at": self.clock().isoformat()})
+        else:
+            self.journal.begin(rid, phase, {"state_profile": profile, "body": body,
+                                          "created_at": self.clock().isoformat()})
         self._current(token)
-        result = self.turn_adapter(thread).change(command, token)
+        try:
+            result = self.turn_adapter(thread).change(command, token)
+        except ConsoleError as error:
+            if not error.not_dispatched:
+                raise
+            self.journal.finish(rid, phase, {"state": "REFUSED", "code": error.code, "not_dispatched": True,
+                                           "observed_at": self.clock().isoformat(), "automatic_retry": False})
+            if phase == "cancel":
+                # The task view says the stop was not sent and can be pressed again; no error banner about a message.
+                return
+            raise
         self._current(token)
         value = self._remember(thread, result)
         confirmed = value.cancel_requested if phase == "cancel" else value.delivered
@@ -1290,6 +1325,14 @@ class NativeInstructionControl:
             self._refresh_continuations(thread, token)
             continuation = self.continuations.get(rid)
             confirmed = continuation is not None and continuation.cancel_requested
+        if phase == "cancel" and not confirmed and value.status == "completed":
+            # The API answered with the original receipt of a turn that had already completed (the bridge still held
+            # it as running): the stop reached the API and was not needed. Record that answer, not an unknown stop.
+            # Any other answer (busy_refused included) is not "the work finished"; it stays an unknown stop below.
+            self.journal.finish(rid, phase, {"state": "CONFIRMED",
+                                           "receipt": {"result": {"cancel_accepted": False, "status": value.status}},
+                                           "observed_at": self.clock().isoformat(), "automatic_retry": False})
+            return
         self.journal.finish(rid, phase, {"state": "CONFIRMED" if confirmed else "UNKNOWN",
                                        "confirmation_level": "client_received" if confirmed and phase == "acknowledge" else None,
                                        "observed_at": self.clock().isoformat(), "automatic_retry": False})

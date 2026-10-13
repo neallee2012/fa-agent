@@ -240,6 +240,7 @@ class FoundryHttpClient:
             raise _session_failure(error,phase) from None
 
     def stop_session(self):
+        """True when this stop was accepted; False when the platform says the session was already stopped."""
         from azure.ai.projects import AIProjectClient
         from azure.core.exceptions import AzureError
         phase="client_init"
@@ -252,8 +253,9 @@ class FoundryHttpClient:
         except AzureError as error:
             if (getattr(error,"status_code",None)==409
                     and getattr(getattr(error,"error",None),"code",None)=="session_already_stopped"):
-                return
+                return False
             raise _session_failure(error,phase,stopping=True) from None
+        return True
 
     def verify_session(self,*,before_send):
         from azure.ai.projects import AIProjectClient

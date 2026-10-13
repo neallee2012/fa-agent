@@ -257,8 +257,15 @@ def test_generated_parameter_files_remain_compatible_with_the_compiled_modules(c
     assert values["behavior-api.parameters.json"]["minReplicas"] == 1
 
 
+WORKFLOWS = ROOT / ".github" / "workflows"
+
+
+@pytest.mark.skipif(
+    not WORKFLOWS.is_dir(),
+    reason=".github/workflows/ is absent: the public copy excludes it (scrub_export.py EXCLUDED_PREFIXES)",
+)
 def test_infrastructure_workflow_compiles_without_azure_credentials_or_deployment():
-    path = ROOT / ".github" / "workflows" / "validate-infrastructure.yml"
+    path = WORKFLOWS / "validate-infrastructure.yml"
     workflow = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     assert workflow["permissions"] == {"contents": "read"}
     assert "infra/**" in workflow["on"]["pull_request"]["paths"]

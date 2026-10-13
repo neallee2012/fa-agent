@@ -45,11 +45,11 @@ python deploy/azd/fa_azd.py prereq
 
 | 項目 | 需要的角色 | 什麼時候 |
 |---|---|---|
-| 允許你註冊應用程式：租戶預設允許；若關閉，給你 **Application Developer** | Privileged Role Administrator 指派 | `azd up` 前（否則 preprovision 停下） |
-| 租戶裡要有 Azure CLI 的 service principal（大多已存在）：`az ad sp create --id 04b07795-8ddb-461a-bbee-02f9e1bf7b46` | Cloud Application Administrator 以上 | `azd up` 前；`prereq` 會顯示是否缺 |
+| 允許你註冊應用程式：租用戶預設允許；若關閉，給你 **Application Developer** | Privileged Role Administrator 指派 | `azd up` 前（否則 preprovision 停下） |
+| 租用戶裡要有 Azure CLI 的 service principal（大多已存在）：`az ad sp create --id 04b07795-8ddb-461a-bbee-02f9e1bf7b46` | Cloud Application Administrator 以上 | `azd up` 前；`prereq` 會顯示是否缺 |
 | 替 **Team 主人一人** 建 3 筆 delegated grant（Azure CLI→FA API、Portal→FA API、Portal→登入範圍） | Cloud Application Administrator、Application Administrator 或 Global Administrator | `azd provision` 之後。hook 會把 3 個請求 body 與指令寫到 `.azure/<name>/fa/admin-consent/`（只有 object ID，沒有秘密），交給管理員照 `README.txt` 執行即可，不需要 repo 或 azd |
 
-grant 只給主人一人（`consentType=Principal`），不是全租戶同意；FA API 也只接受該主人。
+grant 只給主人一人（`consentType=Principal`），不是全租用戶同意；FA API 也只接受該主人。
 管理員還沒做 C 的第 3 項時，`azd up` 仍會把資源、Agent、API 與 Portal 部署完，停在第一次 session 準備前；
 管理員做完後，你再跑 `azd hooks run postdeploy` 接續。
 

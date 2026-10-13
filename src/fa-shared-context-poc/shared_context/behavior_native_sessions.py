@@ -10,6 +10,7 @@ from time import monotonic
 
 from azure.core.exceptions import AzureError, ResourceNotFoundError
 
+from .behavior_agent_versions import SelectorUnreadable
 from .behavior_foundry import PLATFORM_READ_RETRY, FoundryTarget
 from .behavior_native_turn_wire import (
     NATIVE_STATE_PROFILE, NativeEnvironmentMetadata, NativeEnvironmentReplacementPreview, NativeEnvironmentView, NativeSessionMetadata,
@@ -26,6 +27,15 @@ class _RetiredSession(Problem):
 # Foundry deletes a session only after 30 days without activity (Learn: manage-hosted-sessions); a cached binding
 # unused for a day is read again, so a kept ID never invokes an expired session.
 READER_IDLE_SECONDS = 24 * 3600
+# Another process (agent-versions sync, a follow, a deploy) can move the endpoint selector while a reader is kept.
+# Invoking a session of an unselected version makes the platform bring it back (possibly as another version), so a
+# kept reader is used only after a selector read that started at most this long ago still names its version.
+# Only reads and polls use this window; anything that delivers work (submit, owner writes, routine, Agent relay,
+# prewarm) uses a selector read started within its own request.
+SELECTOR_CHECK_SECONDS = 10
+# A read or status poll keeps using a reader whose version the selector confirmed at most this long ago while the
+# selector itself cannot be read (SelectorUnreadable); work delivery never does.
+SELECTOR_STALE_READ_SECONDS = 120
 # Refusals meaning the cached binding moved: the platform is read once more (reads are idempotent).
 _MOVED = frozenset({"NATIVE_SESSION_CHANGED", "AGENT_VERSION_FOLLOWING", "FOUNDRY_NATIVE_BINDING_MISMATCH"})
 
@@ -88,6 +98,13 @@ def _read_platform_session(client):
     return _target(client.target, agent_version=session.version_indicator.agent_version)
 
 
+def _active_session(client):
+    """Platform metadata (it wakes nothing) says ``client``'s session is active on the version it was recorded with."""
+    session = _session_metadata(client)
+    return (session is not None and session.status == "active"
+            and session.version_indicator.agent_version == client.target.agent_version)
+
+
 def _source_session_status(client, phase):
     session = _session_metadata(client)
     if session is None or not isinstance(session.status, str) or session.status not in {
@@ -120,10 +137,18 @@ def _require_native_version(client):
         raise Problem(409, "NATIVE_TURNS_DISABLED", "the selected build version must explicitly enable native turns")
 
 
-def _latest_version_reader(client, client_id):
+def _latest_version_reader(client, client_id, selected):
+    """This API identity's active or idle version session: ``selected``'s when listed, else any other version's.
+
+    Versions are not ordered (neither the listing nor the version numbers say which is current), so another
+    version's session only says that one exists. Listing invokes no session; a caller invokes the result only
+    when it is ``selected``'s (``_require_selected_version``). The bound is one page of 100 listed sessions of any
+    status and any identity; a listing that goes past it before ``selected``'s session appears is 503
+    ``NATIVE_ENVIRONMENT_UNAVAILABLE``."""
     from azure.ai.projects import AIProjectClient
     from azure.ai.projects.models import VersionRefIndicator
 
+    found = {}
     try:
         with AIProjectClient(endpoint=client.target.project_endpoint, credential=client.credential,
                              **PLATFORM_READ_RETRY,
@@ -138,12 +163,27 @@ def _latest_version_reader(client, client_id):
                 if not isinstance(version, str) or re.fullmatch(r"[1-9][0-9]{0,15}", version) is None:
                     continue
                 if session.agent_session_id == native_session_id(client.target, client_id, version=version):
-                    return _target(client.target, session_id=session.agent_session_id, agent_version=version)
+                    found[version] = session.agent_session_id
+                    if version == selected:
+                        break
     except AzureError as error:
         status = getattr(error, "status_code", None)
         raise Problem(status if status in {401, 403} else 503, "NATIVE_ENVIRONMENT_UNAVAILABLE",
                       "the original native environment locator could not be read") from None
-    return None
+    if not found:
+        return None
+    version = selected if selected in found else next(iter(found))
+    return _target(client.target, session_id=found[version], agent_version=version)
+
+
+def _require_selected_version(found, selected):
+    """Refuse before invoking a session that platform metadata places on another version than the selected one.
+
+    Invoking it would make the platform bring it back (possibly as yet another version); the follow, an
+    agent-versions sync or the ADR-0003 replacement creates the selected version's session instead."""
+    if found.agent_version != selected:
+        raise Problem(503, "AGENT_VERSION_FOLLOWING",
+                      "the selected version has no session yet; no other version's session is invoked")
 
 
 def _metadata_record(session):
@@ -203,6 +243,7 @@ class NativeSessions:
         self.desired_version = None
         self.admission_request_id = None
         self._reader = None
+        self._selector = None
         self._reader_generation = 0
         self._reader_lock = Lock()
 
@@ -211,22 +252,30 @@ class NativeSessions:
         with self._reader_lock:
             self._reader_generation += 1
             self._reader = None
+            self._selector = None
 
     def reader_cached(self):
         return self._reader is not None
 
     def cached_reader(self, client):
-        """The kept reader for ``client``'s Agent without any platform read; None when none is kept."""
+        """The kept reader for ``client``'s Agent without any platform read; None when none is kept or the selector
+        was not read within ``SELECTOR_CHECK_SECONDS`` naming the kept reader's version."""
+        scope = _scope(client.target)
         with self._reader_lock:
-            cached = self._reader
-            if (cached is not None and cached[0] == _scope(client.target)
-                    and monotonic() - cached[2] < READER_IDLE_SECONDS):
+            cached, selector, now = self._reader, self._selector, monotonic()
+            if (cached is not None and cached[0] == scope and now - cached[2] < READER_IDLE_SECONDS
+                    and selector is not None and selector[0] == scope and now - selector[2] < SELECTOR_CHECK_SECONDS
+                    and selector[1] == cached[1].agent_version):
                 return client.for_target(cached[1])
         return None
 
     @staticmethod
     def binding_moved(error):
-        """True when the refusal says the Agent's binding moved (reads nothing and forgets nothing)."""
+        """True when the refusal says the Agent's binding moved (reads nothing and forgets nothing).
+
+        An unreadable selector says nothing about the binding, so the kept reader stays."""
+        if isinstance(error, SelectorUnreadable):
+            return False
         detail = error.body["error"]
         return detail["code"] in _MOVED or (
             detail["code"] == "FOUNDRY_INVOCATION_UNKNOWN" and detail.get("upstream_status") == 404)
@@ -260,6 +309,37 @@ class NativeSessions:
         from .behavior_agent_versions import current_hosted_version
         self.desired_version = current_hosted_version(self.composition.runtime, client.target)
         return self.desired_version
+
+    def _checked_version(self, client, checked_since=None, *, stale_read=False):
+        """The selected version from a selector read started after ``checked_since`` (default:
+        ``SELECTOR_CHECK_SECONDS`` ago), reading it now if none is that recent.
+
+        "After" is strict: with a coarse clock (about 16 ms on Windows) an earlier request's read can share the
+        tick in which a submit starts. ``stale_read``: see ``reader``."""
+        scope = _scope(client.target)
+        started = monotonic()
+        if checked_since is None:
+            checked_since = started - SELECTOR_CHECK_SECONDS
+        with self._reader_lock:
+            selector, generation = self._selector, self._reader_generation
+            if selector is not None and selector[0] == scope and selector[2] > checked_since:
+                return selector[1]
+        try:
+            version = self.selected_version(client)
+        except SelectorUnreadable:
+            if not (stale_read and selector is not None and selector[0] == scope
+                    and monotonic() - selector[2] < SELECTOR_STALE_READ_SECONDS):
+                raise
+            logging.getLogger(__name__).warning(
+                "NATIVE_SELECTOR_UNREADABLE kept_version=%s confirmed_seconds_ago=%d",
+                selector[1], monotonic() - selector[2])
+            return selector[1]
+        with self._reader_lock:
+            kept = self._selector
+            # A concurrent read that started later saw a newer selector; an earlier-started one never replaces it.
+            if self._reader_generation == generation and (kept is None or kept[0] != scope or started > kept[2]):
+                self._selector = (scope, version, started)
+        return version
 
     def _scoped(self, client, target):
         fields = ("project_endpoint", "agent_id", "agent_name", "agent_oid", "executor_id")
@@ -306,14 +386,15 @@ class NativeSessions:
         self.binding = _target(client.target, session_id=sid, agent_version=version)
         return self._scoped(client, self.binding)
 
-    def current(self, client, *, refresh=False):
+    def current(self, client, *, refresh=False, checked_since=None):
+        """``checked_since``: see ``reader``."""
         with self.lock:
-            return self._current(client)
+            return self._current(client, checked_since)
 
-    def _current(self, client):
+    def _current(self, client, checked_since=None):
         retry = self.reader_cached()
         while True:
-            reader = self.reader(client)
+            reader = self.reader(client, checked_since=checked_since)
             try:
                 current = self._remember_state(reader, self._state(reader))
             except Problem as error:
@@ -334,6 +415,31 @@ class NativeSessions:
             raise Problem(409, "NATIVE_SESSION_CHANGED",
                           "the published version has not become the Agent's current environment")
 
+    def turn_session(self, client):
+        """The session the Agent record last named, while platform metadata says it is active; else None.
+
+        Only a cancel or a delivery acknowledgement uses it, after ``current`` refused because the selected version
+        has no session yet or pending work keeps the Agent on that earlier session: the turn lives there. A running
+        turn keeps its session active; an idle or reclaimed one is never invoked, as invoking it makes the platform
+        bring it back, possibly as another version. A denied metadata read (401/403) is raised unchanged.
+        The session can still go idle between the metadata read and the call, which may then wake it: accepted, as it
+        is bounded to an explicit user Stop or acknowledgement on a session that was active a moment ago."""
+        binding = self.binding
+        if binding is None or _scope(binding) != _scope(client.target):
+            logging.getLogger(__name__).warning("NATIVE_TURN_SESSION_UNKNOWN")
+            return None
+        try:
+            holder = self._scoped(client, binding)
+            if _active_session(holder):
+                return holder
+        except Problem as error:
+            if error.status in {401, 403}:
+                raise  # A denied platform read is reported as is, not as a stop that may simply be sent again.
+            logging.getLogger(__name__).warning("NATIVE_TURN_SESSION_UNCONFIRMED code=%s", error.body["error"]["code"])
+            return None
+        logging.getLogger(__name__).warning("NATIVE_TURN_SESSION_NOT_ACTIVE version=%s", binding.agent_version)
+        return None
+
     def admission(self, client, *, request_id=None, resolved=False):
         """``resolved=True``: this request just got ``client`` from ``current()``; it is not read again."""
         with self.lock:
@@ -348,26 +454,40 @@ class NativeSessions:
                               "the entire Agent is changing environments; this new request was not accepted")
             return current
 
-    def reader(self, client):
-        """The selected version's existing session, kept until an environment change or a refusal says otherwise.
+    def reader(self, client, *, checked_since=None, stale_read=False):
+        """The selected version's existing session, kept while the endpoint selector still names its version.
 
-        A session is bound to one version when it is created and the endpoint selector never moves it (Learn:
-        manage-hosted-sessions, configure-agent); like charter-agent's saved ``agent_session_id``, a known binding
-        is invoked directly. Hosted's expected-version and replaced-session preconditions refuse a moved one."""
+        Another process can move the selector at any time, so the selected version comes from a selector read
+        started after ``checked_since`` (default ``SELECTOR_CHECK_SECONDS`` ago, which only reads may use; work
+        delivery passes its own start). A kept reader of another version is dropped before anything is invoked.
+        ``stale_read`` (reads only): while the selector cannot be read, a version it confirmed within
+        ``SELECTOR_STALE_READ_SECONDS`` is kept; otherwise ``SelectorUnreadable`` is raised and the reader stays."""
         scope = _scope(client.target)
         with self._reader_lock:
             cached, generation = self._reader, self._reader_generation
-            if cached is not None and cached[0] == scope and monotonic() - cached[2] < READER_IDLE_SECONDS:
-                self._reader = (scope, cached[1], monotonic())
+            if not (cached is not None and cached[0] == scope and monotonic() - cached[2] < READER_IDLE_SECONDS):
+                cached = None
+        version = self._checked_version(client, checked_since, stale_read=stale_read and cached is not None)
+        if cached is not None:
+            if version == cached[1].agent_version:
+                with self._reader_lock:
+                    if self._reader_generation == generation:
+                        self._reader = (scope, cached[1], monotonic())
                 return client.for_target(cached[1])
-        selected = self._platform_reader(client)
+            logging.getLogger(__name__).warning(
+                "NATIVE_READER_VERSION_MOVED kept_version=%s selected_version=%s", cached[1].agent_version, version)
+            with self._reader_lock:
+                # The selector read just now stays; only the reader of the unselected version is dropped.
+                self._reader_generation += 1
+                self._reader = None
+                generation = self._reader_generation
+        selected = self._platform_reader(client, version=version)
         with self._reader_lock:
             if self._reader_generation == generation:
                 self._reader = (scope, selected.target, monotonic())
         return selected
 
-    def _platform_reader(self, client):
-        version = self.selected_version(client)
+    def _platform_reader(self, client, *, version):
         selected = self.candidate(client, version=version)
         actual = _read_platform_session(selected)
         if actual is not None:
@@ -576,18 +696,31 @@ class NativeSessions:
             if value.files_manifest_sha256 is None and not skip_files:
                 raise Problem(409, "NATIVE_FILES_UNSUPPORTED", "the original follow has no verified workspace manifest")
             files = None if skip_files else FollowFiles(destination, value, before_send)
+            stop_recorded = False
             if files is not None:
-                files.require_source_version()
-                files.before_stop()
+                # Version only here: once FA's own stop is recorded the source is inactive by that stop; before it,
+                # `before_stop` itself refuses a source that is not active.
+                files.require_source_version(active=False)
+                stop_recorded = files.before_stop()
             source = client.for_target(_target(
                 client.target, session_id=value.previous_hosted_session_id, agent_version=value.previous_agent_version))
             before_send()
             phase = "source_status"
             try:
                 status = _source_session_status(source, phase)
-                if status not in {"idle", "failed", "deleted", "expired"}:
+                # ADR-0009 §10: stop only an active source. Idle or terminal has no compute to stop; creating,
+                # updating or deleting is left alone and reported below as `source_active` for a later retry.
+                if status == "active":
                     phase = "stop_session"
-                    source.stop_session()
+                    accepted = source.stop_session()
+                    # `is not False` on purpose: only an explicit False (`session_already_stopped`, not FA's stop) skips the record;
+                    # clients and test doubles that return None are treated as accepted.
+                    if files is not None and not stop_recorded and accepted is not False:
+                        # `stop_started` is written only after the platform accepted FA's own stop: a source found
+                        # inactive without it was reclaimed, and `stopped_step` never reads its files.
+                        phase = "stop_record"
+                        files.record_stop()
+                        stop_recorded = True
                 phase = "source_readback"
                 status = _source_session_status(source, phase)
             except Problem as error:
@@ -598,6 +731,10 @@ class NativeSessions:
                 return value.model_copy(update={"reason": "source_unavailable"})
             if status not in {"idle", "failed", "deleted", "expired"}:
                 return value.model_copy(update={"reason": "source_active"})
+            if files is not None and not stop_recorded:
+                # Inactive although FA never had its own stop accepted: the platform reclaimed it (ADR-0009 §10).
+                raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE",
+                              "the original source became inactive without FA's stop; its files are not read")
             if files is not None and not files.stopped_step():
                 return value.model_copy(update={"reason": "files_pending"})
             before_send()
@@ -652,7 +789,8 @@ class NativeSessions:
                 source = _session_metadata(client.for_target(_target(
                     client.target, session_id=pending.previous_hosted_session_id,
                     agent_version=pending.previous_agent_version)))
-                if (source is not None and source.status in {"active", "idle"} and not pending.source_invocation_refused
+                # Retargeting keeps the files transfer, which calls the source: only an active one (ADR-0009 §10).
+                if (source is not None and source.status == "active" and not pending.source_invocation_refused
                         and source.version_indicator.agent_version == pending.previous_agent_version):
                     retarget = NativeEnvironmentRetargetCommand(
                         request_id=command.request_id, expected_agent_version=command.expected_agent_version,
@@ -915,8 +1053,10 @@ class NativeSessions:
             else:
                 actual = _read_platform_session(selected)
                 if actual is None:
-                    reader = _latest_version_reader(client, self.composition.config.identity.managed_identity_client_id)
+                    reader = _latest_version_reader(
+                        client, self.composition.config.identity.managed_identity_client_id, version)
                     if reader is not None:
+                        _require_selected_version(reader, version)
                         selected = self._scoped(client, reader)
                         actual = _read_platform_session(selected)
                         if actual is None:
@@ -924,6 +1064,7 @@ class NativeSessions:
                         if actual.agent_version != reader.agent_version:
                             raise Problem(409, "NATIVE_SESSION_CHANGED", "the original version reader has another version")
                 if actual is not None:
+                    _require_selected_version(actual, version)
                     selected = selected.for_target(actual)
                     state = self._state(selected)
                     if state.preparation is not None:

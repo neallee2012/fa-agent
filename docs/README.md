@@ -20,6 +20,7 @@
 | [行為控制規格 v1.2](FA-AGENT-BEHAVIOR-SPEC.md) | 完整後續契約：補終局未生效、實際內容批准綁定、必要材料 pin／GC；B01–B12 分離線與環境證據，P2 待辦及啟用限制明列，新增能力未實作 |
 | [行為控制分工決策](adr/0004-agent-behavior-control.md) | Hosted Harness＋FA 耐久控制＋平台執行端；承接 M4，不擴張本批批准 |
 | [Hosted 優先與連續性決策](adr/0003-hosted-environment-continuity.md) | 現行原則：允許 compute 更換，驗收獨立環境與工作連續性 |
+| [版本模型 G](adr/0009-version-model-g-actual-version-idle-upgrade.md) | 照 session 實際版本執行、相容就跑；取代 ADR-0003 的選項 A。「決定」部分 Neal 已確認、未實作；閒置升級機制仍是草案 |
 | [原始持久助理決策](adr/0001-persistent-agent-computer.md) | 長期助理、context 與 10 倍目標；同一 VM 限制已被 ADR-0003 取代 |
 | [共享 context 決策](adr/0002-shared-context-without-file-share.md) | 以共享工作狀態、長期記憶與工具取代 File Share；Non-VNet Foundry 的取捨 |
 | [領域用語](../CONTEXT.md) | Agent、助理電腦、工作、記憶與本輪脈絡的區別 |

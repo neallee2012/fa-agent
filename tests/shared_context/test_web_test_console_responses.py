@@ -17,7 +17,8 @@ from shared_context.behavior_native_turn_wire import NativeCancel
 from test_native_responses_api import responses_api
 from test_native_stream_api import platform
 from test_web_test_console_native import (
-    first, instruction_models, jwk_client, native_api, native_console, progress, send, signing_key, synthetic_standing_v1,
+    first, instruction_models, jwk_client, native_api, native_console, progress, read_behind_a_stuck_read, send,
+    signing_key, synthetic_standing_v1,
 )
 
 RESPONSES_PROFILE = "foundry-responses-v1"
@@ -586,6 +587,22 @@ def test_responses_progress_never_reads_platform_history_until_it_is_requested(r
     assert not any(method == "POST" for method, _path, _body in c.calls[before:])
     again = progress(c, draft["thread_id"])
     assert again.json()["composer"]["platform_history"]["page"]["source_kind"] == "conversation"
+
+
+# The platform-history read takes the same per-conversation progress lock as the status and progress reads, so it is
+# bounded the same way: behind a read that never came back it answers 409 PROGRESS_READ_BUSY (automatic_retry), and
+# nothing reaches the API, instead of hanging until that read returns.
+def test_a_platform_history_read_behind_a_stuck_read_answers_retryable(responses_console, monkeypatch):
+    c, _env = responses_console
+    draft = first(c)
+    assert send(c, draft, "Original local input.").status_code == 200
+    path = "/api/instructions/" + draft["thread_id"] + "/platform-history"
+    read, calls = read_behind_a_stuck_read(c, monkeypatch, draft["thread_id"], path)
+    assert read.status_code == 409, read.text
+    assert read.json()["error"]["code"] == "PROGRESS_READ_BUSY" and read.json()["error"]["automatic_retry"] is True
+    assert calls == [], "nothing reaches the API while the other read holds the conversation"
+    assert c.ui.client.get(path).status_code == 200
+
 
 def test_responses_peer_return_is_read_on_the_original_thread_without_console_restart(peer_return_console, monkeypatch):
     from shared_context.behavior_native_agent_wire import NativeRelayAcceptance

@@ -21,6 +21,27 @@ const models={default_model:"offline-chat-a",models:[
   {id:"offline-chat-a",display_name:"OFFLINE 聊天部署 A",context_window_tokens:null,max_output_tokens:null,reasoning_summary_available:false},
   {id:"offline-chat-b",display_name:"OFFLINE 聊天部署 B",context_window_tokens:64000,max_output_tokens:8000,reasoning_summary_available:false}]};
 
+test("the page asks every confirmation in the page, never with a native dialog",()=>{
+  // Embedded browsers (e.g. a desktop app's built-in browser) answer window.confirm with false and show nothing.
+  const script=[...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match=>match[1]).join("\n");
+  assert.doesNotMatch(html,/window\.(confirm|alert|prompt)\b/);
+  assert.doesNotMatch(script,/\b(confirm|alert|prompt)\s*\(/,"no confirm(…), window.confirm(…), globalThis.confirm(…) or the like");
+  assert.match(html,/<div id="page-confirm" class="page-confirm" hidden><div class="page-confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="page-confirm-message">/);
+});
+
+test("every in-page confirmation is awaited before its action is sent",()=>{
+  // confirmInPage returns a Promise, which is always truthy: `if(!confirmInPage(…))return` would send at once.
+  const offenders=[],sites=[];
+  for(const match of html.matchAll(/\bconfirmInPage\b/g)){
+    const before=html.slice(0,match.index),line=before.split("\n").length;
+    if(/\bfunction\s+$/.test(before))continue;
+    sites.push(line);
+    if(!/\bawait\s+$/.test(before)||html[match.index+"confirmInPage".length]!=="(")offenders.push(`index.html:${line}`);
+  }
+  assert.deepEqual(offenders,[],"every confirmInPage call site reads `await confirmInPage(`");
+  assert.ok(sites.length>0,"the scan found the call sites");
+});
+
 test("legacy fixed work and budget controls are not present in the page",()=>{
   for(const removed of ["預算與期限","既有固定測試操作","交辦這筆工作","核對原取件回條","續接原取件"])
     assert.doesNotMatch(html,new RegExp(removed));
@@ -81,6 +102,8 @@ async function open(initial=fixture(),responses={}){
   };
   const tags=new Map([...html.matchAll(/<([a-z0-9]+)\b[^<>]*?\sid="([^"]+)"/g)].map(m=>[m[2],m[1]]));
   const nodes=new Map([...html.matchAll(/id="([^"]+)"/g)].map(m=>[m[1],element(tags.get(m[1]))]));
+  // The dialog starts closed through its markup (`hidden`), not through script.
+  nodes.get("page-confirm").hidden=/<div id="page-confirm"[^>]*\shidden>/.test(html);
   const calls=[],holder={current:copy(initial),pending:null,pendingPosts:[],response:null,sockets:[],observers:[],...responses},timers=new Map(),timerDelays=new Map(),documentEvents={};
   let timerId=0;
   const context={console,URLSearchParams,TextEncoder,TextDecoder,Blob,Response,crypto:require("node:crypto").webcrypto,
@@ -89,7 +112,10 @@ async function open(initial=fixture(),responses={}){
       revokeObjectURL(url){holder.revoked=url}},
     setTimeout(fn,delay){timers.set(++timerId,fn);timerDelays.set(timerId,delay);return timerId},
     clearTimeout(id){timers.delete(id);timerDelays.delete(id)},
-    window:{location:{search:"",...(responses.location||{})},matchMedia:()=>({matches:false}),confirm:()=>true,
+    // Native dialogs fail the test: embedded browsers answer them with false and show nothing, so the page asks in
+    // the page instead (#page-confirm; answer it with ui.answer).
+    window:{location:{search:"",...(responses.location||{})},matchMedia:()=>({matches:false}),
+      confirm:nativeDialog("confirm"),alert:nativeDialog("alert"),prompt:nativeDialog("prompt"),
       innerWidth:responses.innerWidth??1440},
     // Browser storage; pass the same responses.storage to a second open() to model a page reload.
     localStorage:responses.storage??memoryStorage(),
@@ -167,8 +193,18 @@ async function open(initial=fixture(),responses={}){
   return {nodes,calls,holder,context,timers,timerDelays,documentEvents,text:id=>nodes.get(id).textContent,
     render(value){holder.current=copy(value);context.next=copy(value);vm.runInContext("state=next;render()",context)},
     click(id){nodes.get(id).events.click()},
-    tick:()=>new Promise(resolve=>setImmediate(resolve))};
+    tick:()=>new Promise(resolve=>setImmediate(resolve)),
+    // Waits for the in-page confirmation, answers 確定 (true) or 取消 (false) and returns the question it asked.
+    async answer(yes){
+      for(let i=0;i<20&&nodes.get("page-confirm").hidden;i++)await new Promise(resolve=>setImmediate(resolve));
+      assert.equal(nodes.get("page-confirm").hidden,false,"an in-page confirmation is open");
+      const question=nodes.get("page-confirm-message").textContent;
+      nodes.get(yes?"page-confirm-ok":"page-confirm-cancel").events.click();
+      await new Promise(resolve=>setImmediate(resolve));
+      return question;
+    }};
 }
+function nativeDialog(name){return ()=>{throw new Error(`native ${name} dialog used; ask in the page instead`)}}
 
 test("remote sign-in connects once on page load, shows the user and sends no work",async()=>{
   const data={...fixture(),authentication:"LOGIN_REQUIRED",authentication_refresh_at:null,remote_user:"neal@example.org"};
@@ -830,7 +866,6 @@ test("a question choice sends one answer, never a decision, and an unconfirmed o
   }});
   const buttons=hitlNodes(ui,"data-question-choice",qid);
   assert.deepEqual(buttons.map(button=>button.textContent),["Ann","Bo"]);
-  let confirms=0;ui.context.window.confirm=()=>{confirms++;return false};
   buttons[1].events.click();
   // The same redraw turns the card into its record (Neal 2026-10-07); a second click on the old node sends nothing.
   assert.equal(hitlNodes(ui,"data-question-card",qid).length,0);
@@ -838,7 +873,7 @@ test("a question choice sends one answer, never a decision, and an unconfirmed o
     ["助理問：要寄給 <b>誰</b>？","你的回答：Bo","送出中…"]);
   buttons[1].events.click();buttons[0].events.click();
   await ui.tick();await ui.tick();await ui.tick();
-  assert.equal(confirms,0,"one click answers; no second confirmation");
+  assert.equal(ui.nodes.get("page-confirm").hidden,true,"one click answers; no second confirmation");
   assert.equal(posts.length,1);
   assert.ok(posts[0].url.endsWith("/"+data.composer.thread_id+"/answers"));
   assert.deepEqual(posts[0].body,{question:entry.item.question,answer:"Bo",was_freeform:false});
@@ -875,10 +910,9 @@ test("an own answer keeps its draft across refreshes and is sent as freeform onc
   assert.equal(hitlNodes(ui,"data-question-send",qid)[0].disabled,false);
   ui.render(data);
   assert.equal(hitlNodes(ui,"data-hitl-rule","question:"+qid)[0].value,"寄給 Cy");
-  let confirms=0;ui.context.window.confirm=()=>{confirms++;return false};
   hitlNodes(ui,"data-question-send",qid)[0].events.click();
   await ui.tick();await ui.tick();await ui.tick();
-  assert.equal(confirms,0,"one click sends; no second confirmation");
+  assert.equal(ui.nodes.get("page-confirm").hidden,true,"one click sends; no second confirmation");
   assert.deepEqual(posts,[{question:entry.item.question,answer:"寄給 Cy",was_freeform:true}]);
   assert.equal(hitlNodes(ui,"data-hitl-record",qid)[0].children[1].textContent,"你的回答：寄給 Cy");
 });
@@ -934,7 +968,7 @@ function hitlNodes(ui,attribute,value){
     if(node.attributes?.[attribute]===value)found.push(node);
     for(const child of node.children||[])walk(child);
   };
-  for(const id of ["attention-items","conversation-history","hitl-rule-list","hitl-command-list","hitl-history-items"])if(ui.nodes.has(id))walk(ui.nodes.get(id));
+  for(const id of ["attention-items","attention-dock","conversation-history","hitl-rule-list","hitl-command-list","hitl-history-items"])if(ui.nodes.has(id))walk(ui.nodes.get(id));
   return found;
 }
 function teamAttentionCase(target="agent-two",kind="approval"){
@@ -966,7 +1000,7 @@ function teamAttentionCase(target="agent-two",kind="approval"){
 }
 for(const target of ["agent-one","agent-two"]){
   test(`Team approval ${target} appears under A's original turn and keeps the original decision route`,async()=>{
-    const c=teamAttentionCase(target),posts=[],reads=[],warnings=[];
+    const c=teamAttentionCase(target),posts=[],reads=[];
     const ui=await open(c.data,{now:Date.parse(when),hitl:async(url,options)=>{
       if(options.method==="POST"){
         const body=JSON.parse(options.body);posts.push({url,body,headers:options.headers});
@@ -984,9 +1018,8 @@ for(const target of ["agent-one","agent-two"]){
     assert.match(JSON.stringify(card),/shell 先問我/);
     assert.ok(reads.some(read=>read.url.includes("/team/pending/")&&read.headers["X-Console-Agent"]===target));
     assert.equal(posts.length,0);
-    ui.context.window.confirm=text=>{warnings.push(text);return true};
     hitlNodes(ui,"data-hitl-choice","allow_once")[0].events.click();await ui.tick();await ui.tick();
-    assert.equal(warnings.length,0,"one click decides; no second confirmation");
+    assert.equal(ui.nodes.get("page-confirm").hidden,true,"one click decides; no second confirmation");
     assert.ok(JSON.stringify(row).includes(c.reference.pending_id));
     assert.deepEqual(hitlNodes(ui,"data-hitl-record",c.reference.pending_id)[0].children.map(node=>node.textContent),
       [`${target==="agent-one"?"助理":"第二位助理"}要執行：free -h`,"你允許了這次"],"another Agent's record names it");
@@ -1729,11 +1762,10 @@ for(const choice of ["deny","allow_rule"]){
       const input=hitlNodes(ui,"data-hitl-rule",c.reference.pending_id)[0];
       input.value="只允許B在原工作目錄讀CPU資訊";input.events.input();
     }
-    let confirms=0;ui.context.window.confirm=()=>{confirms++;return false};
     const button=hitlNodes(ui,"data-hitl-choice",choice)[0];
     button.events.click();button.events.click();
     await ui.tick();await ui.tick();
-    assert.equal(confirms,0);
+    assert.equal(ui.nodes.get("page-confirm").hidden,true);
     assert.equal(posts.length,1);
     assert.equal(posts[0].headers["X-Console-Agent"],"agent-two");
     assert.equal(posts[0].body.approval.pending_id,c.reference.pending_id);
@@ -1809,11 +1841,10 @@ test("allow this kind first opens an editable scoped suggestion and only 確認�
   input.value="只允許第一位助理查詢這個 VM 的記憶體資訊";input.events.input();
   ui.render(data);await ui.tick();
   assert.equal(hitlNodes(ui,"data-hitl-rule",pid)[0].value,input.value);
-  let confirms=0;ui.context.window.confirm=()=>{confirms++;return false};
   const confirm=hitlNodes(ui,"data-hitl-choice","allow_rule")[0];
   assert.equal(confirm.textContent,"確認規則並允許");
   confirm.events.click();await ui.tick();await ui.tick();
-  assert.equal(confirms,0,"the rule editor's own button is the confirmation; no dialog on top");
+  assert.equal(ui.nodes.get("page-confirm").hidden,true,"the rule editor's own button is the confirmation; no dialog on top");
   assert.equal(posts.length,1);
   assert.equal(posts[0].body.choice,"allow_rule");
   assert.equal(posts[0].body.rule.text,"只允許第一位助理查詢這個 VM 的記憶體資訊");
@@ -1838,9 +1869,8 @@ test("a toolbox tool set to always shows its name and exact arguments and is app
   assert.deepEqual(JSON.parse(hitlNodes(ui,"data-hitl-arguments",pid)[0].textContent),{query:"quarterly numbers",limit:3});
   assert.match(hitlNodes(ui,"data-hitl-reason",pid)[0].textContent,/每次呼叫都要你批准/);
   assert.equal(hitlNodes(ui,"data-hitl-choice","allow_rule").length,0,"an always tool never becomes a Team rule");
-  let confirms=0;ui.context.window.confirm=()=>{confirms++;return true};
   hitlNodes(ui,"data-hitl-choice","allow_once")[0].events.click();await ui.tick();await ui.tick();
-  assert.equal(confirms,0,"the card already shows the tool and its exact arguments");
+  assert.equal(ui.nodes.get("page-confirm").hidden,true,"the card already shows the tool and its exact arguments");
   assert.equal(posts.length,1);assert.equal(posts[0].choice,"allow_once");assert.equal(posts[0].rule,null);
   assert.deepEqual(hitlNodes(ui,"data-hitl-record",pid)[0].children.map(node=>node.textContent),
     ["助理要使用 Toolbox 工具：team-Docs-search","你允許了這次"]);
@@ -1943,11 +1973,18 @@ test("new approval rule waits for the rules read before accepting the first edit
   const input=ui.nodes.get("hitl-rule-text");input.value="Ask before changing this workspace.";input.events.input();
   assert.equal(input.value,"Ask before changing this workspace.");
   assert.equal(ui.nodes.get("save-hitl-rule").disabled,false);
-  let warnings=0;
-  ui.context.window.confirm=()=>{warnings++;return false};
+  ui.click("save-hitl-rule");
+  assert.match(await ui.answer(false),/^確認新增這條 Team 規則？\nAsk before changing this workspace.\n處理：先問我\n/);
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false,"取消 sends nothing");
+  // 確定 sends the confirmed rule exactly once, even when pressed twice.
   ui.click("save-hitl-rule");await ui.tick();
-  assert.equal(warnings,1);
-  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+  ui.click("page-confirm-ok");ui.click("page-confirm-ok");await ui.tick();await ui.tick();
+  const posts=ui.calls.filter(call=>call.method==="POST");
+  assert.equal(posts.length,1);
+  assert.match(posts[0].url,/^\/api\/native-hitl\/[^/]+\/rules$/);
+  assert.deepEqual(JSON.parse(posts[0].body),{operation:"add",rule_id:null,
+    rule:{text:"Ask before changing this workspace.",behavior:"ask_first"},
+    expected_rules_revision:rules.revision,expected_rules_etag:rules.etag});
 });
 
 test("native HITL joins the same attention panel and displays complete original data before three choices",async()=>{
@@ -2056,15 +2093,18 @@ test("native HITL rule CRUD shows exact text and uses the observed revision",asy
   }});
   ui.click("read-hitl-rules");await ui.tick();await ui.tick();
   const input=ui.nodes.get("hitl-rule-text");input.value="Ask before <script>literal</script>";input.events.input();
-  ui.click("save-hitl-rule");await ui.tick();await ui.tick();await ui.tick();
+  ui.click("save-hitl-rule");
+  assert.match(await ui.answer(true),/\nAsk before <script>literal<\/script>\n/);await ui.tick();await ui.tick();
   assert.equal(posts.length,1);assert.equal(posts[0].operation,"add");
   assert.equal(ui.nodes.get("hitl-rule-list").children[0].children[0].textContent,"Ask before <script>literal</script>");
   ui.nodes.get("hitl-rule-list").children[0].children.find(node=>node.textContent==="編輯").events.click();
   input.value="Updated scope";input.events.input();
-  ui.click("save-hitl-rule");await ui.tick();await ui.tick();await ui.tick();
+  ui.click("save-hitl-rule");
+  assert.match(await ui.answer(true),/^確認更新這條 Team 規則？\nUpdated scope\n/);await ui.tick();await ui.tick();
   assert.equal(posts[1].operation,"update");assert.equal(posts[1].rule_id,"original-rule");
   ui.nodes.get("hitl-rule-list").children[0].children.find(node=>node.textContent==="刪除").events.click();
-  await ui.tick();await ui.tick();await ui.tick();
+  assert.equal(await ui.answer(true),"確認從目前清單刪除這條規則？\nUpdated scope\n原批准、效果與歷史會保留。");
+  await ui.tick();await ui.tick();
   assert.equal(posts[2].operation,"delete");assert.equal(posts[2].rule,null);
   assert.deepEqual(posts.map(body=>body.expected_rules_revision),[0,1,2]);
 });
@@ -2089,7 +2129,7 @@ for(const editing of [false,true]){
     const input=ui.nodes.get("hitl-rule-text");input.value="My still-unsent exact rule text";input.events.input();
     const before=JSON.parse(JSON.stringify(ui.context.hitlDraft()));
     ui.nodes.get("hitl-rule-list").children[0].children.find(node=>node.textContent==="刪除").events.click();
-    await ui.tick();await ui.tick();await ui.tick();
+    await ui.answer(true);await ui.tick();await ui.tick();
     assert.deepEqual(posts.map(body=>body.operation),["delete"]);
     assert.equal(input.value,"My still-unsent exact rule text");
     assert.deepEqual(JSON.parse(JSON.stringify(ui.context.hitlDraft())),before);
@@ -3152,6 +3192,64 @@ test("older turns load their reply as they scroll into view, newest first and tw
   assert.match(JSON.stringify(ui.nodes.get("conversation-history").children),/回覆 rid-3/);
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
 });
+
+// stage 2026-10-10 15:13-15:24: while a turn waited for an approval the page sent one progress read and then none, also
+// after a reload, so the pending card and the final state never showed. A read that does not come back no longer holds
+// every later read.
+test("a running turn's status read that never comes back stops holding the next reads",async()=>{
+  const data=nativeChat("started"),rid=data.tasks[0].task_id;
+  let answer=new Promise(()=>{});
+  const ui=await open(data,{progressResponse:()=>answer});await ui.tick();
+  const statusReads=()=>ui.calls.filter(call=>call.url===`/api/instructions/${rid}/status`).length;
+  const fire=async delay=>{const timer=[...ui.timers.entries()].find(([id])=>ui.timerDelays.get(id)===delay);
+    assert.ok(timer,`a ${delay} ms timer is scheduled`);ui.timers.delete(timer[0]);timer[1]();for(let i=0;i<4;i++)await ui.tick()};
+  await fire(1000);
+  assert.equal(statusReads(),1);
+  await fire(45000);
+  assert.equal(ui.nodes.get("refresh-progress").disabled,false,"更新回覆 works again");
+  assert.match(ui.text("error-message"),/暫時讀不到進度，正在重試/);
+  const done=nativeChat("completed");
+  done.tasks[0].reply={data:{text:"逾時後讀到的回覆"},sha256:"a".repeat(64),byte_length:24,observed_at:when};
+  answer={ok:true,json:async()=>copy(done)};
+  await fire(2000);
+  assert.equal(statusReads(),2,"the next read goes out after the usual backoff");
+  assert.match(JSON.stringify(ui.nodes.get("conversation-history").children,(key,value)=>key==="events"?undefined:value),
+    /逾時後讀到的回覆/);
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false,"nothing is sent");
+});
+
+// stage/dev 2026-10-12: completed replies showed 「正在載入回覆…」 for good. That turn's /status read had failed (or came
+// back without the reply), the bubble was not drawn again, and nothing read it later; 「更新回覆」 did not either.
+for(const outcome of ["failed","no-reply"]){
+  test(`an older turn whose reply read ${outcome==="failed"?"fails":"brings no reply"} stops saying it is loading, and 更新回覆 reads it again`,async()=>{
+    const {data}=restartedConversation(2);
+    data.composer.observed_at=when;
+    const finishes=[];
+    const ui=await open(data,{progressResponse:url=>/\/status$/.test(url)?new Promise(resolve=>finishes.push(resolve)):
+      {ok:true,json:async()=>copy(data)}});
+    // Only rid-0's turn (the first one); rid-1 is not on screen and keeps waiting for its own read.
+    const shown=()=>JSON.stringify(ui.nodes.get("conversation-history").children[0],(key,value)=>key==="events"?undefined:value);
+    const statusReads=()=>ui.calls.filter(call=>call.url==="/api/instructions/rid-0/status").length;
+    seeTurns(ui,["rid-0"]);await ui.tick();
+    assert.equal(statusReads(),1);
+    assert.match(shown(),/正在載入回覆/);
+    finishes.shift()(outcome==="failed"?{ok:false,status:502,json:async()=>({error:{code:"NATIVE_RESULT_INCOMPLETE"}})}:
+      {ok:true,json:async()=>{const value=copy(data);value.tasks[0].error={code:"NATIVE_RESULT_INCOMPLETE"};return value}});
+    for(let i=0;i<4;i++)await ui.tick();
+    assert.doesNotMatch(shown(),/正在載入回覆/,"the bubble no longer says it is loading");
+    assert.match(shown(),/尚未載入回覆，可從選單更新。/);
+    assert.equal(statusReads(),1,"not read again by itself");
+    ui.click("refresh-progress");
+    for(let i=0;i<4;i++)await ui.tick();
+    seeTurns(ui,["rid-0"]);await ui.tick();
+    assert.equal(statusReads(),2,"更新回覆 reads that turn's saved reply again");
+    const value=copy(data);value.tasks[0].reply={data:{text:"補讀到的回覆"},sha256:"a".repeat(64),byte_length:18,observed_at:when};
+    finishes.shift()({ok:true,json:async()=>value});
+    for(let i=0;i<4;i++)await ui.tick();
+    assert.match(shown(),/補讀到的回覆/);
+    assert.equal(ui.calls.some(call=>call.method==="POST"),false,"nothing is sent");
+  });
+}
 
 test("a turn that ended unknown does not block a new message, and that turn is never sent again",async()=>{
   const data=nativeChat("unknown"),composer=data.composer,old=data.tasks[0].task_id;
@@ -6015,6 +6113,9 @@ test("old-login cancellation receipt response cannot unlock or overwrite a newer
   assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
 });
 
+// The stop is confirmed in the page like every other action (the harness fails on any native dialog).
+const STOP_QUESTION="送出停止這次回覆的請求？原對話與已保存資料會保留；是否已停止仍以後端狀態為準。";
+
 test("stopping a reply sends the original task cancellation once and preserves the draft",async()=>{
   const data=cancellableChat(),task=data.tasks[0];
   task.reply={data:{text:"Original saved answer"},sha256:"a".repeat(64),byte_length:21};
@@ -6022,11 +6123,19 @@ test("stopping a reply sends the original task cancellation once and preserves t
   ui.nodes.get("instruction").value="A draft to keep";
   assert.equal(ui.nodes.get("cancel-instruction").hidden,false);
   assert.equal(ui.nodes.get("cancel-instruction").disabled,false);
-  ui.click("cancel-instruction");ui.click("cancel-instruction");
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
+  ui.click("cancel-instruction");ui.click("cancel-instruction");await ui.tick();
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,0,"the first click only asks");
+  assert.equal(ui.nodes.get("page-confirm").hidden,false);
+  assert.equal(ui.text("page-confirm-message"),STOP_QUESTION);
+  assert.equal(ui.nodes.get("page-confirm-cancel").focused,true,"focus starts on 取消, so Enter cannot confirm");
+  assert.notEqual(ui.nodes.get("page-confirm-ok").focused,true);
+  ui.click("page-confirm-ok");ui.click("page-confirm-ok");await ui.tick();
   const sent=ui.calls.filter(call=>call.method==="POST");
   assert.equal(sent.length,1);
   assert.equal(sent[0].url,"/api/instructions/offline/cancel");
   assert.deepEqual(JSON.parse(sent[0].body),{});
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
   assert.equal(ui.text("cancellation-note"),"正在送出停止請求…");
   task.cancellation={state:"CONFIRMED",receipt:{result:{status:"running",cancel_accepted:true,executor_stopped:false}}};
   task.actions.cancel=action(false);
@@ -6038,17 +6147,129 @@ test("stopping a reply sends the original task cancellation once and preserves t
   assert.equal(ui.text("answer"),answer);
   assert.equal(ui.nodes.get("cancel-instruction").disabled,true);
   assert.equal(ui.text("ack-state"),"未確認");
-  ui.click("cancel-instruction");
+  ui.click("cancel-instruction");ui.click("page-confirm-ok");await ui.tick();
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
   assert.equal(ui.calls.filter(call=>call.method==="POST").length,1);
+});
+
+// The bridge still held the native turn as running when 「停止這次回覆」 was pressed, but it had already finished: the API
+// answered with the original receipt. The finished turn says no stop was needed, not 「還不確定停止請求有沒有送到」.
+test("a native stop the API answered for an already finished turn says no stop was needed",async()=>{
+  const data=nativeChat("completed"),task=data.tasks[0];
+  task.cancellation={state:"CONFIRMED",receipt:{result:{cancel_accepted:false,status:"completed"}},automatic_retry:false};
+  const ui=await open(data);
+  const shown=ui.nodes.get("conversation-history").children[0].children.map(node=>node.textContent).join("\n");
+  assert.match(shown,/工作已經結束，不需要停止。/);
+  assert.doesNotMatch(shown,/還不確定停止請求有沒有送到/);
+  assert.doesNotMatch(ui.text("cancellation-note"),/還不確定停止請求有沒有送到/);
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
 });
 
 test("dismissing the stop confirmation has no cancellation or other side effects",async()=>{
   const ui=await open(cancellableChat());
-  ui.context.window.confirm=()=>false;
   ui.click("cancel-instruction");await ui.tick();
+  assert.equal(ui.nodes.get("page-confirm").hidden,false);
+  ui.click("page-confirm-cancel");await ui.tick();
   assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
+  assert.equal(ui.nodes.get("cancel-instruction").hidden,false);
   assert.equal(ui.nodes.get("cancel-instruction").disabled,false);
+  assert.equal(ui.nodes.get("cancel-instruction").focused,true);
   assert.equal(ui.text("cancellation-note"),"");
+  ui.click("page-confirm-ok");await ui.tick();
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,0,"a dismissed confirmation cannot be used later");
+});
+
+test("Escape closes the stop confirmation without sending, inside the dialog or elsewhere on the page",async()=>{
+  const ui=await open(cancellableChat());
+  ui.click("cancel-instruction");
+  let stopped=false;
+  ui.nodes.get("page-confirm").events.keydown({key:"Escape",stopPropagation(){stopped=true}});
+  await ui.tick();
+  assert.equal(stopped,true,"the page's own Escape handling (closing settings, menus) does not also run");
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
+  assert.equal(ui.nodes.get("cancel-instruction").focused,true);
+  ui.click("cancel-instruction");
+  assert.equal(ui.nodes.get("page-confirm").hidden,false);
+  ui.documentEvents.keydown({key:"Escape"});await ui.tick();
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
+  ui.click("page-confirm-ok");await ui.tick();
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
+});
+
+test("a newer in-page question answers the older one 取消; only the open one can be confirmed",async()=>{
+  const ui=await open(cancellableChat());
+  const answers=[];
+  ui.context.confirmInPage("first").then(value=>answers.push(["first",value]));
+  ui.context.confirmInPage("second").then(value=>answers.push(["second",value]));
+  await ui.tick();
+  assert.deepEqual(answers,[["first",false]]);
+  assert.equal(ui.text("page-confirm-message"),"second");
+  ui.click("page-confirm-ok");ui.click("page-confirm-ok");await ui.tick();
+  assert.deepEqual(answers,[["first",false],["second",true]]);
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
+  assert.equal(ui.text("page-confirm-message"),"");
+});
+
+test("the page behind an open in-page question is inert, and comes back on every way it closes",async()=>{
+  // aria-modal alone does not stop Tab or a click from reaching the page behind; #app-shell is the dialog's only sibling.
+  assert.match(html,/<\/main>\s*<\/div>\s*<div id="page-confirm" class="page-confirm" hidden>/);
+  assert.match(html,/<body>\s*<div class="app-shell" id="app-shell">/);
+  const first=cancellableChat(),ui=await open(first),shell=ui.nodes.get("app-shell");
+  assert.ok(!shell.inert);
+  ui.click("cancel-instruction");
+  assert.equal(shell.inert,true,"open: the page behind is inert");
+  ui.nodes.get("cancel-instruction").focused=false;
+  ui.click("page-confirm-cancel");await ui.tick();
+  assert.equal(shell.inert,false,"取消");
+  assert.equal(ui.nodes.get("cancel-instruction").focused,true,"focus returns to the button");
+  ui.click("cancel-instruction");
+  ui.context.confirmInPage("a newer question");
+  assert.equal(shell.inert,true,"a newer question keeps the page behind inert");
+  ui.nodes.get("page-confirm").events.keydown({key:"Escape",stopPropagation(){},preventDefault(){}});
+  assert.equal(shell.inert,false,"Esc");
+  ui.click("cancel-instruction");
+  assert.equal(shell.inert,true);
+  const second=cancellableChat();
+  second.tasks[0]={...second.tasks[0],task_id:"other",submit_request_id:"other",job_id:"other-job",thread_id:"other-thread"};
+  second.composer={...second.composer,thread_id:"other-thread",request_id:"other"};
+  second.composer.conversation.turns[0].request_id="other";
+  ui.render(second);
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
+  assert.equal(shell.inert,false,"closed because the question no longer applies");
+  ui.click("cancel-instruction");ui.click("page-confirm-ok");await ui.tick();
+  assert.equal(shell.inert,false,"確定");
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,1);
+});
+
+test("focus returns only to an element still on the page",async()=>{
+  const ui=await open(cancellableChat());
+  const gone={isConnected:false,focus(){this.focused=true}},here={isConnected:true,focus(){this.focused=true}};
+  ui.context.confirmInPage("detached",{returnFocus:gone});
+  ui.click("page-confirm-cancel");await ui.tick();
+  assert.equal(gone.focused,undefined,"a list re-rendered while the question was open leaves a detached node");
+  assert.equal(ui.nodes.get("app-shell").inert,false);
+  ui.context.confirmInPage("attached",{returnFocus:here});
+  ui.click("page-confirm-cancel");await ui.tick();
+  assert.equal(here.focused,true);
+});
+
+test("a stop confirmation left open closes when the conversation changes and cannot stop the other one",async()=>{
+  const first=cancellableChat(),ui=await open(first);
+  ui.click("cancel-instruction");
+  assert.equal(ui.nodes.get("page-confirm").hidden,false);
+  const second=cancellableChat();
+  second.tasks[0]={...second.tasks[0],task_id:"other",submit_request_id:"other",job_id:"other-job",thread_id:"other-thread"};
+  second.composer={...second.composer,thread_id:"other-thread",request_id:"other"};
+  second.composer.conversation.turns[0].request_id="other";
+  ui.render(second);
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
+  ui.click("page-confirm-ok");await ui.tick();
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
+  ui.click("cancel-instruction");ui.click("page-confirm-ok");await ui.tick();
+  const sent=ui.calls.filter(call=>call.method==="POST");
+  assert.equal(sent.length,1);
+  assert.equal(sent[0].url,"/api/instructions/other/cancel");
 });
 
 test("unknown stop response remains unknown after terminal progress and page reconstruction",async()=>{
@@ -6107,7 +6328,7 @@ test("another task's terminal progress cannot settle this task's accepted stop r
 
 test("late stop response cannot change another conversation or its draft",async()=>{
   const first=cancellableChat(),ui=await open(first);
-  ui.click("cancel-instruction");
+  ui.click("cancel-instruction");ui.click("page-confirm-ok");await ui.tick();
   const second=cancellableChat();
   second.tasks[0]={...second.tasks[0],task_id:"other",submit_request_id:"other",job_id:"other-job",thread_id:"other-thread"};
   second.composer={...second.composer,thread_id:"other-thread",request_id:"other",content:null,editable:true,can_submit:true};
@@ -6126,10 +6347,14 @@ test("fixed work and unauthenticated chat cannot expose an actionable stop butto
   const fixed=await open(fixture());
   assert.equal(fixed.nodes.get("cancel-instruction").hidden,true);
   fixed.click("cancel-instruction");
+  assert.equal(fixed.nodes.get("page-confirm").hidden,true);
+  fixed.click("page-confirm-ok");await fixed.tick();
   const data=cancellableChat();data.authentication="LOGIN_REQUIRED";
   const ui=await open(data);
   assert.equal(ui.nodes.get("cancel-instruction").disabled,true);
   ui.click("cancel-instruction");
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
+  ui.click("page-confirm-ok");await ui.tick();
   assert.equal(fixed.calls.filter(call=>call.method==="POST").length,0);
   assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
 });
@@ -6173,13 +6398,13 @@ test("template selection requires a fresh read and human confirmation even when 
   assert.equal(ui.nodes.get("select-template").disabled,false);
   assert.match(ui.text("template-target"),/fa-instruction-v1/);
   assert.match(ui.text("template-target"),/text_attachment_profile/);
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return false};
-  ui.click("select-template");await ui.tick();
+  ui.click("select-template");
+  const question=await ui.answer(false);
   assert.equal(ui.calls.some(call=>call.url==="/api/agent-template/select"),false);
-  assert.match(ui.holder.confirmation,/只影響新對話/);
-  assert.match(ui.holder.confirmation,/不是新增操作權限/);
-  ui.context.window.confirm=()=>true;
+  assert.match(question,/只影響新對話/);
+  assert.match(question,/不是新增操作權限/);
   ui.click("select-template");ui.click("select-template");await ui.tick();
+  ui.click("page-confirm-ok");ui.click("page-confirm-ok");await ui.tick();
   const posts=ui.calls.filter(call=>call.url==="/api/agent-template/select");
   assert.equal(posts.length,1);
   const command=JSON.parse(posts[0].body);
@@ -6211,7 +6436,7 @@ test("template selection success keeps the draft and old result and requires a n
   await readyTemplateSelection(ui,candidate);
   const oldAnswer=ui.text("answer"),oldAck=ui.text("ack-state");
   ui.nodes.get("instruction").value="Keep my unsent draft";
-  ui.click("select-template");await ui.tick();
+  ui.click("select-template");await ui.answer(true);
   const post=ui.calls.find(call=>call.url==="/api/agent-template/select"),command=JSON.parse(post.body);
   const value=selectedTemplateResponse(command);
   ui.holder.pending(value);await ui.tick();await ui.tick();
@@ -6227,7 +6452,7 @@ test("template selection success keeps the draft and old result and requires a n
   const next=copy(candidate);next.role.profile="fa-instruction-skill-resources-v1";
   await readyTemplateSelection(ui,next,current,"f".repeat(64));
   assert.equal(ui.nodes.get("select-template").disabled,false);
-  ui.click("select-template");await ui.tick();
+  ui.click("select-template");await ui.answer(true);
   const posts=ui.calls.filter(call=>call.url==="/api/agent-template/select");
   assert.equal(posts.length,2);
   assert.equal(JSON.parse(posts[1].body).expected_selection_id,current.selection_id);
@@ -6236,11 +6461,11 @@ test("template selection success keeps the draft and old result and requires a n
 
 test("template confirmation invalidated by another file cannot post the old candidate",async()=>{
   const ui=await open(templateData());await readyTemplateSelection(ui);
-  ui.context.window.confirm=()=>{
-    ui.nodes.get("template-file").files=[{size:2,text:async()=>"{}"}];
-    ui.nodes.get("template-file").events.change();return true;
-  };
+  // Another file is chosen while the in-page question is still open; 確定 afterwards cannot post the old candidate.
   ui.click("select-template");await ui.tick();
+  ui.nodes.get("template-file").files=[{size:2,text:async()=>"{}"}];
+  ui.nodes.get("template-file").events.change();
+  await ui.answer(true);
   assert.equal(ui.calls.some(call=>call.url==="/api/agent-template/select"),false);
   assert.equal(ui.text("template-target"),"");
 });
@@ -6249,7 +6474,7 @@ test("template response loss exposes the saved original and reconciles only its 
   const data=templateData(),ui=await open(data);await readyTemplateSelection(ui);
   let lost;
   ui.holder.templateResponses["/api/agent-template/select"]=new Promise(resolve=>{lost=resolve});
-  ui.click("select-template");await ui.tick();
+  ui.click("select-template");await ui.answer(true);
   const command=JSON.parse(ui.calls.find(call=>call.url==="/api/agent-template/select").body);
   const retained=selectedTemplateResponse(command,{state:"UNKNOWN"});
   data.template_selections=retained.selections;ui.holder.current=data;
@@ -6302,7 +6527,7 @@ for(const outcome of ["success","http-error","rejection"]){
     const ui=await open(templateData());await readyTemplateSelection(ui);
     let finish,fail,nextRead;
     ui.holder.templateResponses["/api/agent-template/select"]=new Promise((resolve,reject)=>{finish=resolve;fail=reject});
-    ui.click("select-template");await ui.tick();
+    ui.click("select-template");await ui.answer(true);
     const command=JSON.parse(ui.calls.find(call=>call.url==="/api/agent-template/select").body);
     const next=selectableTemplate();next.role.profile="NEW-FILE";
     await readyTemplateSelection(ui,next);
@@ -6360,7 +6585,7 @@ test("losing login clears template candidate and suppresses a late selection rec
   const data=templateData(),ui=await open(data);await readyTemplateSelection(ui);
   let finish;
   ui.holder.templateResponses["/api/agent-template/select"]=new Promise(resolve=>{finish=resolve});
-  ui.click("select-template");await ui.tick();
+  ui.click("select-template");await ui.answer(true);
   const command=JSON.parse(ui.calls.find(call=>call.url==="/api/agent-template/select").body);
   data.authentication="LOGIN_REQUIRED";ui.render(data);
   finish({ok:true,json:async()=>selectedTemplateResponse(command)});await ui.tick();await ui.tick();
@@ -6374,7 +6599,7 @@ test("login loss during template error history refresh also clears the visible o
   const data=templateData(),ui=await open(data);await readyTemplateSelection(ui);
   data.authentication="LOGIN_EXPIRED";ui.holder.current=data;
   ui.holder.templateResponses["/api/agent-template/select"]={ok:false,json:async()=>({error:{code:"LOGIN_EXPIRED"}})};
-  ui.click("select-template");await ui.tick();await ui.tick();
+  ui.click("select-template");await ui.answer(true);await ui.tick();
   assert.equal(ui.text("template-target"),"");
   assert.equal(ui.nodes.get("read-template-selection").disabled,true);
   assert.equal(ui.nodes.get("select-template").disabled,true);
@@ -6385,7 +6610,7 @@ test("late template history finally cannot overwrite a new file's observation or
   let oldHistory,newRead;
   ui.holder.stateResponse=new Promise(resolve=>{oldHistory=resolve});
   ui.holder.templateResponses["/api/agent-template/select"]={ok:false,json:async()=>({error:{code:"BACKEND_OFFLINE"}})};
-  ui.click("select-template");await ui.tick();
+  ui.click("select-template");await ui.answer(true);
   assert.equal(ui.calls.at(-1).url,"/api/state");
   await readyTemplateSelection(ui);
   ui.holder.templateResponses["/api/agent-template/selection"]=new Promise(resolve=>{newRead=resolve});
@@ -7311,13 +7536,16 @@ test("reset needs explicit confirmation and never duplicates a pending reset",as
     hosted_session_id:"fa-chat-original",content:"old",editable:false,can_submit:false,models};
   const ui=await open(data);
   assert.match(ui.text("hosted-session"),/fa-chat-original.*沿用/);
-  ui.context.window.confirm=()=>false;
   ui.click("reset-session");
-  assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
-  ui.context.window.confirm=()=>true;
-  ui.click("reset-session");ui.click("reset-session");
-  assert.deepEqual(ui.calls.filter(call=>call.method==="POST").map(call=>call.url),
-    ["/api/instructions/old-thread/reset"]);
+  assert.equal(await ui.answer(false),"封存目前對話並開新 session？舊紀錄與檔案會保留；執行中或未知的工作不會被丟棄。");
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,0,"取消 sends nothing");
+  ui.click("reset-session");ui.click("reset-session");await ui.tick();
+  ui.click("page-confirm-ok");ui.click("page-confirm-ok");await ui.tick();
+  ui.click("reset-session");await ui.tick();
+  assert.equal(ui.nodes.get("page-confirm").hidden,true,"a reset in flight is not asked again");
+  const posts=ui.calls.filter(call=>call.method==="POST");
+  assert.deepEqual(posts.map(call=>call.url),["/api/instructions/old-thread/reset"]);
+  assert.deepEqual(JSON.parse(posts[0].body),{});
   const fresh=copy(data);fresh.composer={...fresh.composer,thread_id:"new-thread",request_id:"new-request",
     can_reset:false,hosted_session_id:null,content:null,editable:true};
   ui.holder.current=fresh;
@@ -7584,8 +7812,7 @@ test("template options add approved skills and capabilities, then use the same i
   assert.deepEqual(built.unavailable_skills,[]);
   assert.equal(ui.calls.some(call=>call.url==="/api/agent-template/select"),false);
   ui.click("read-template-selection");await ui.tick();
-  ui.context.window.confirm=()=>true;
-  ui.click("select-template");await ui.tick();
+  ui.click("select-template");await ui.answer(true);
   const posts=ui.calls.filter(call=>call.url==="/api/agent-template/select");
   assert.equal(posts.length,1);
   assert.deepEqual(JSON.parse(posts[0].body).template,built);
@@ -8102,11 +8329,12 @@ test("settings stages switches and sends one inspected selection that changes on
   assert.match(ui.text("settings-changes"),/關閉：在自己的 sandbox 執行命令/);
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
   ui.holder.templateResponses["/api/agent-template/inspect"]={ok:true,json:async()=>({...inspectedTemplate(),template_sha256:"a".repeat(64)})};
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
-  ui.click("settings-apply");ui.click("settings-apply");await ui.tick();await ui.tick();await ui.tick();
+  ui.click("settings-apply");ui.click("settings-apply");
+  const question=await ui.answer(true);await ui.tick();
   ui.click("settings-apply");await ui.tick();
-  assert.match(ui.holder.confirmation,/只影響之後的新對話；舊對話和已開始的工作不變，也不是新增操作權限/);
-  assert.match(ui.holder.confirmation,/關閉：在自己的 sandbox 執行命令/);
+  assert.equal(ui.nodes.get("page-confirm").hidden,true,"an apply in flight is not asked again");
+  assert.match(question,/只影響之後的新對話；舊對話和已開始的工作不變，也不是新增操作權限/);
+  assert.match(question,/關閉：在自己的 sandbox 執行命令/);
   const inspects=ui.calls.filter(call=>call.url==="/api/agent-template/inspect");
   const selects=ui.calls.filter(call=>call.url==="/api/agent-template/select");
   assert.equal(inspects.length,1);assert.equal(selects.length,1);
@@ -8128,17 +8356,18 @@ test("settings cancel or a changed draft sends nothing; a lost select is only re
   const ui=await openSettingsPage();
   ui.click("settings-tab-mcp");settingsSwitch(ui,"WebIQ",true);
   ui.holder.templateResponses["/api/agent-template/inspect"]={ok:true,json:async()=>({...inspectedTemplate(),template_sha256:"a".repeat(64)})};
-  ui.context.window.confirm=()=>false;
-  ui.click("settings-apply");await ui.tick();await ui.tick();await ui.tick();
+  ui.click("settings-apply");await ui.answer(false);await ui.tick();
   assert.equal(ui.calls.some(call=>call.url==="/api/agent-template/select"),false);
   assert.equal(ui.text("settings-note"),"沒有送出任何變更。");
-  ui.context.window.confirm=()=>{settingsSwitch(ui,"WebIQ",false);settingsSwitch(ui,"WebIQ",true);return true};
-  ui.click("settings-apply");await ui.tick();await ui.tick();await ui.tick();
+  // The draft changes while the in-page question is open: 確定 afterwards sends nothing.
+  ui.click("settings-apply");await ui.tick();await ui.tick();
+  assert.equal(ui.nodes.get("page-confirm").hidden,false);
+  settingsSwitch(ui,"WebIQ",false);settingsSwitch(ui,"WebIQ",true);
+  await ui.answer(true);await ui.tick();
   assert.equal(ui.calls.some(call=>call.url==="/api/agent-template/select"),false);
-  ui.context.window.confirm=()=>true;
   let lost;
   ui.holder.templateResponses["/api/agent-template/select"]=new Promise(resolve=>{lost=resolve});
-  ui.click("settings-apply");await ui.tick();await ui.tick();await ui.tick();
+  ui.click("settings-apply");await ui.answer(true);await ui.tick();
   const command=JSON.parse(ui.calls.find(call=>call.url==="/api/agent-template/select").body);
   const retained=selectedTemplateResponse(command,{state:"UNKNOWN"});
   ui.holder.current.template_selections=retained.selections;
@@ -8284,7 +8513,7 @@ test("settings follows the offered version of an installed item and blocks apply
   assert.match(ui.text("settings-changes"),/改用目前批准的版本：在自己的 sandbox 執行命令/);
   assert.equal(ui.nodes.get("settings-apply").disabled,false);
   ui.holder.templateResponses["/api/agent-template/inspect"]={ok:true,json:async()=>({...inspectedTemplate(),template_sha256:"a".repeat(64)})};
-  ui.click("settings-apply");await ui.tick();await ui.tick();await ui.tick();
+  ui.click("settings-apply");await ui.answer(true);await ui.tick();
   const command=JSON.parse(ui.calls.find(call=>call.url==="/api/agent-template/select").body);
   assert.deepEqual(command.template.settings.capabilities,[{entry_id:"fa-shell-v1",entry_sha256:"5".repeat(64)}]);
   const withdrawn=settingsOptions();withdrawn.capabilities=withdrawn.capabilities.filter(entry=>entry.entry_id!=="fa-shell-v1");
@@ -8310,7 +8539,7 @@ test("settings work in flight is dropped when the page is closed and another Age
   }});
   agentGear(ui,"agent-one").events.click();await ui.tick();await ui.tick();
   ui.click("settings-tab-mcp");settingsSwitch(ui,"WebIQ",true);
-  ui.click("settings-apply");await ui.tick();await ui.tick();await ui.tick();
+  ui.click("settings-apply");await ui.answer(true);await ui.tick();
   assert.equal(ui.calls.filter(call=>call.url==="/api/agent-template/select").length,1);
   ui.click("close-settings");
   sidebar(ui,"agent-two").button.events.click();for(let n=0;n<6;n++)await ui.tick();
@@ -8334,7 +8563,7 @@ test("settings keeps an installed skill applicable while a newer version of it a
   assert.equal(ui.nodes.get("settings-apply").disabled,false);
   assert.doesNotMatch(ui.text("settings-changes"),/目前環境未提供/);
   ui.holder.templateResponses["/api/agent-template/inspect"]={ok:true,json:async()=>({...inspectedTemplate(),template_sha256:"a".repeat(64)})};
-  ui.click("settings-apply");await ui.tick();await ui.tick();await ui.tick();
+  ui.click("settings-apply");await ui.answer(true);await ui.tick();
   const command=JSON.parse(ui.calls.find(call=>call.url==="/api/agent-template/select").body);
   assert.deepEqual(command.template.skills,[settingsSkill]);
 });
@@ -8390,11 +8619,14 @@ test("skill review: content must be viewed first, then one approval with a fixed
   assert.ok(row.children.some(node=>node.textContent==="# 新指南\n步驟一"));
   assert.ok(row.children.some(node=>node.textContent==="用途：整理收據"));
   assert.equal(reviewButton(row,"批准").disabled,false);
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
-  reviewButton(row,"批准").events.click();reviewButton(row,"批准").events.click();await settleReviews(ui);
+  reviewButton(row,"批准").events.click();
+  assert.match(await ui.answer(false),/^批准 skill「新指南」第 1 版？\n/);await settleReviews(ui);
+  assert.equal(ui.calls.filter(call=>call.url.endsWith("/decisions")).length,0,"取消 sends nothing");
+  row=reviewRow(ui,"新指南");
+  reviewButton(row,"批准").events.click();reviewButton(row,"批准").events.click();await ui.tick();
+  ui.click("page-confirm-ok");ui.click("page-confirm-ok");await settleReviews(ui);
   const posts=ui.calls.filter(call=>call.url==="/api/team-skills/skills/new-guide/decisions");
   assert.equal(posts.length,1);
-  assert.match(ui.holder.confirmation,/不會自動開到任何助理/);
   const body=JSON.parse(posts[0].body);
   assert.match(body.decision_id,/^[a-f0-9]{32}$/);
   assert.deepEqual({...body,decision_id:null},{decision_id:null,version_id:"1".repeat(32),sha256:"e".repeat(64),
@@ -8411,20 +8643,20 @@ test("skill review: a failed decision is read back first and only resent with th
   const ui=await openReviews();
   reviewButton(reviewRow(ui,"新指南"),"查看內容").events.click();await settleReviews(ui);
   ui.holder.templateResponses["/api/team-skills/skills/new-guide/decisions"]={ok:false,json:async()=>({error:{code:"BACKEND_OFFLINE"}})};
-  reviewButton(reviewRow(ui,"新指南"),"拒絕").events.click();await settleReviews(ui);
+  reviewButton(reviewRow(ui,"新指南"),"拒絕").events.click();
+  assert.match(await ui.answer(true),/^拒絕 skill「新指南」第 1 版？\n/);await settleReviews(ui);
   const first=JSON.parse(ui.calls.find(call=>call.url.endsWith("/decisions")).body);
   assert.equal(first.decision,"reject");
   const reads=()=>ui.calls.filter(call=>call.url==="/api/team-skills/skills/new-guide").length;
   assert.equal(reads(),2);
   let row=reviewRow(ui,"新指南");
   assert.ok(row.children.some(node=>/決定沒有確認/.test(node.textContent)));
-  ui.context.window.confirm=()=>false;
-  reviewButton(row,"重新讀取並核對").events.click();await settleReviews(ui);
+  reviewButton(row,"重新讀取並核對").events.click();
+  assert.match(await ui.answer(false),/用同一個決定編號再送一次/);await settleReviews(ui);
   assert.equal(reads(),3);
   assert.equal(ui.calls.filter(call=>call.url.endsWith("/decisions")).length,1);
-  ui.context.window.confirm=()=>true;
   delete ui.holder.templateResponses["/api/team-skills/skills/new-guide/decisions"];
-  reviewButton(reviewRow(ui,"新指南"),"重新讀取並核對").events.click();await settleReviews(ui);
+  reviewButton(reviewRow(ui,"新指南"),"重新讀取並核對").events.click();await ui.answer(true);await settleReviews(ui);
   const posts=ui.calls.filter(call=>call.url.endsWith("/decisions"));
   assert.equal(posts.length,2);
   assert.equal(JSON.parse(posts[1].body).decision_id,first.decision_id);
@@ -8432,9 +8664,8 @@ test("skill review: a failed decision is read back first and only resent with th
 
 test("skill review: deactivation names the effective version and keeps the original",async()=>{
   const ui=await openReviews();
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
-  reviewButton(reviewRow(ui,"舊指南"),"停用").events.click();await settleReviews(ui);
-  assert.match(ui.holder.confirmation,/原內容和批准紀錄保留，不刪除/);
+  reviewButton(reviewRow(ui,"舊指南"),"停用").events.click();
+  assert.match(await ui.answer(true),/原內容和批准紀錄保留，不刪除/);await settleReviews(ui);
   const posts=ui.calls.filter(call=>call.url==="/api/team-skills/skills/old-guide/deactivations");
   assert.equal(posts.length,1);
   const body=JSON.parse(posts[0].body);
@@ -8448,11 +8679,11 @@ test("skill review: replace approves the new skill, deactivates the old one, the
   base.settings.capabilities=[{entry_id:"fa-skills-v1",entry_sha256:"6".repeat(64)}];
   const ui=await openReviews(settingsOptions(),base);
   reviewButton(reviewRow(ui,"新指南"),"查看內容").events.click();await settleReviews(ui);
-  ui.context.window.confirm=message=>{ui.holder.confirmations=[...(ui.holder.confirmations||[]),message];return true};
   const after=settingsOptions();after.skills=[{name:"new-guide",version_id:"1".repeat(32),sha256:"e".repeat(64),metadata_sha256:"f".repeat(64)}];
   ui.holder.templateResponses["/api/agent-template/options"]=reply(after);
-  reviewButton(reviewRow(ui,"新指南"),"批准並取代").events.click();await settleReviews(ui);
-  assert.match(ui.holder.confirmations[0],/1\. 批准新 skill.*2\. 停用舊 skill.*3\./s);
+  reviewButton(reviewRow(ui,"新指南"),"批准並取代").events.click();
+  const confirmations=[await ui.answer(true)];await settleReviews(ui);
+  assert.match(confirmations[0],/1\. 批准新 skill.*2\. 停用舊 skill.*3\./s);
   const approval=JSON.parse(ui.calls.find(call=>call.url.endsWith("new-guide/decisions")).body);
   ui.holder.pending({artifact:skillDoc("new-guide","新指南",{approval:skillApproval(approval.decision_id),effective:true}),
     etag:"etag-2",decision_id:approval.decision_id,original_request_resent:false});
@@ -8470,10 +8701,11 @@ test("skill review: replace approves the new skill, deactivates the old one, the
   assert.equal(ui.text("settings-title"),"FA 助理 的設定");
   assert.equal(ui.nodes.get("settings-tab-skills").getAttribute("aria-selected"),"true");
   assert.equal(ui.nodes.get("settings-catalog").hidden,false);assert.equal(ui.nodes.get("settings-skill-reviews").hidden,true);
-  assert.match(ui.holder.confirmations[0],/3\. 打開目前選中的助理「FA 助理」的設定/);
+  assert.match(confirmations[0],/3\. 打開目前選中的助理「FA 助理」的設定/);
   ui.holder.templateResponses["/api/agent-template/inspect"]=reply({...inspectedTemplate(),template_sha256:"a".repeat(64)});
   for(const [id,fn] of [...ui.timers])if(ui.timerDelays.get(id)===0){ui.timers.delete(id);fn()}
-  await settleReviews(ui);
+  confirmations.push(await ui.answer(true));await settleReviews(ui);
+  assert.match(confirmations[1],/^確定把「FA 助理」的新對話設定改成下列內容？\n/);
   const selects=ui.calls.filter(call=>call.url==="/api/agent-template/select");
   assert.equal(selects.length,1);
   assert.deepEqual(JSON.parse(selects[0].body).template.skills.map(ref=>ref.name),["new-guide"]);
@@ -8487,9 +8719,8 @@ test("skill review: a failed read at replace step 3 stays on the Team page, wher
   base.settings.capabilities=[{entry_id:"fa-skills-v1",entry_sha256:"6".repeat(64)}];
   const ui=await openReviews(settingsOptions(),base);
   reviewButton(reviewRow(ui,"新指南"),"查看內容").events.click();await settleReviews(ui);
-  ui.context.window.confirm=()=>true;
   ui.holder.templateResponses["/api/agent-template/options"]={ok:false,json:async()=>({error:{code:"BACKEND_OFFLINE"}})};
-  reviewButton(reviewRow(ui,"新指南"),"批准並取代").events.click();await settleReviews(ui);
+  reviewButton(reviewRow(ui,"新指南"),"批准並取代").events.click();await ui.answer(true);await settleReviews(ui);
   const approval=JSON.parse(ui.calls.find(call=>call.url.endsWith("new-guide/decisions")).body);
   ui.holder.pending({artifact:skillDoc("new-guide","新指南",{approval:skillApproval(approval.decision_id),effective:true}),
     etag:"etag-2",decision_id:approval.decision_id,original_request_resent:false});
@@ -8523,8 +8754,8 @@ test("skill review: replace refuses to approve a newer version than the one the 
   ui.holder.templateResponses["/api/team-skills/skills/new-guide"]=reply({artifact:newer,etag:"etag-new-2"});
   ui.holder.templateResponses["/api/team-skills/skills/new-guide/versions/"+"2".repeat(32)]=
     reply({version:{...skillVersion(),version_id:"2".repeat(32),number:2,sha256:"9".repeat(64)},text:"# 新指南 v2"});
-  ui.context.window.confirm=()=>{throw new Error("no confirmation may be asked")};
   reviewButton(reviewRow(ui,"新指南"),"批准並取代").events.click();await settleReviews(ui);
+  assert.equal(ui.nodes.get("page-confirm").hidden,true,"no confirmation may be asked");
   assert.equal(ui.calls.some(call=>call.url.endsWith("/decisions")||call.url.endsWith("/deactivations")),false);
   assert.equal(ui.text("settings-skill-review-note"),"這份 skill 已有新的草稿版本；請重新查看內容後再決定。");
   assert.ok(reviewRow(ui,"新指南").children.some(node=>node.textContent==="# 新指南 v2"));
@@ -8536,7 +8767,7 @@ test("settings: a selection the API rejected before writing shows the truth and 
   ui.holder.templateResponses["/api/agent-template/inspect"]={ok:true,json:async()=>({...inspectedTemplate(),template_sha256:"a".repeat(64)})};
   let refuse;
   ui.holder.templateResponses["/api/agent-template/select"]=new Promise(resolve=>{refuse=resolve});
-  ui.click("settings-apply");await ui.tick();await ui.tick();await ui.tick();
+  ui.click("settings-apply");await ui.answer(true);await ui.tick();
   const command=JSON.parse(ui.calls.find(call=>call.url==="/api/agent-template/select").body);
   const rejected={...selectedTemplateResponse(command,{state:"UNKNOWN"}).selections[0],state:"REJECTED",code:"PROFILE_SELECTION_CONFLICT"};
   ui.holder.current.template_selections=[rejected];
@@ -8569,10 +8800,10 @@ test("owner skill draft: one confirmed save, then the list shows the owner's dra
   assert.equal(ui.nodes.get("skill-new-save").disabled,true,"an empty form cannot be saved");
   fillSkillNew(ui);
   assert.equal(ui.nodes.get("skill-new-save").disabled,false);
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
-  ui.click("skill-new-save");ui.click("skill-new-save");await settleReviews(ui);
+  ui.click("skill-new-save");ui.click("skill-new-save");
+  const question=await ui.answer(true);await settleReviews(ui);
   assert.equal(draftPosts(ui).length,1);
-  assert.match(ui.holder.confirmation,/只建立未批准的草稿，不會生效.*相同內容只會建立一次/s);
+  assert.match(question,/只建立未批准的草稿，不會生效.*相同內容只會建立一次/s);
   assert.deepEqual(JSON.parse(draftPosts(ui)[0].body),{schema_version:"fa-team-owner-skill-draft-v1",title:"收據指南",
     arguments:{purpose:"整理收據時使用",body:"# 收據指南\n步驟一"}});
   assert.equal(ui.text("skill-new-note"),"正在保存草稿一次；回應不明時，用相同內容再送只會對到同一份草稿。");
@@ -8598,14 +8829,14 @@ test("owner skill draft: a lost reply keeps the form and resending sends the ide
   const ui=await openReviews();
   fillSkillNew(ui);
   ui.holder.templateResponses["/api/team-skills/drafts"]={ok:false,json:async()=>({error:{code:"SKILL_DRAFT_OUTCOME_UNKNOWN"}})};
-  ui.click("skill-new-save");await settleReviews(ui);
+  ui.click("skill-new-save");await ui.answer(true);await settleReviews(ui);
   assert.match(ui.text("skill-new-note"),/草稿保存結果未確認；內容還在表單裡.*不會另建/);
   assert.equal(ui.nodes.get("skill-new-title").value,"收據指南");
   ui.holder.templateResponses["/api/team-skills/drafts"]={ok:false,json:async()=>({error:{code:"LOCAL_OFFLINE"}})};
-  ui.click("skill-new-save");await settleReviews(ui);
+  ui.click("skill-new-save");await ui.answer(true);await settleReviews(ui);
   assert.match(ui.text("skill-new-note"),/表單內容保留；相同內容再送一次只會對到同一份草稿/);
   ui.holder.templateResponses["/api/team-skills/drafts"]=reply({entry:ownerEntry("effective"),original_request_resent:false});
-  ui.click("skill-new-save");await settleReviews(ui);
+  ui.click("skill-new-save");await ui.answer(true);await settleReviews(ui);
   const bodies=draftPosts(ui).map(call=>call.body);
   assert.equal(bodies.length,3);
   assert.equal(new Set(bodies).size,1,"every resend carries exactly the same content");
@@ -8638,11 +8869,9 @@ test("owner skill draft: invalid fields, files and a dismissed confirmation send
   files.files=[pick("notes.md","附檔內容"),pick("data.json","{}")];await files.events.change();
   assert.equal(ui.text("skill-new-files-note"),"已選 2 個附檔：notes.md、data.json");
   assert.equal(ui.nodes.get("skill-new-save").disabled,false);
-  ui.context.window.confirm=()=>false;
-  ui.click("skill-new-save");await settleReviews(ui);
+  ui.click("skill-new-save");await ui.answer(false);await settleReviews(ui);
   assert.equal(draftPosts(ui).length,0);
-  ui.context.window.confirm=()=>true;
-  ui.click("skill-new-save");await settleReviews(ui);
+  ui.click("skill-new-save");await ui.answer(true);await settleReviews(ui);
   assert.deepEqual(JSON.parse(draftPosts(ui)[0].body).arguments.resources,[
     {name:"notes.md",media_type:"text/markdown",text:"附檔內容"},{name:"data.json",media_type:"application/json",text:"{}"}]);
 });
@@ -8688,8 +8917,7 @@ test("team MCP: one confirmed add asks every call by default and reloads the Age
   fillTeamMcp(ui);
   assert.equal(ui.nodes.get("team-mcp-save").disabled,false);
   const optionReads=()=>ui.calls.filter(call=>call.url==="/api/agent-template/options").length,before=optionReads();
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
-  ui.click("team-mcp-save");ui.click("team-mcp-save");await settleReviews(ui);
+  ui.click("team-mcp-save");ui.click("team-mcp-save");ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   assert.equal(teamMcpPosts(ui).length,1);
   assert.match(ui.holder.confirmation,/新增 MCP「Docs」？\n呼叫前：每次呼叫都要我批准。.*之後要到每位助理的設定（助理清單右側的 ⚙）→ MCP 打開並套用/s);
   const command=JSON.parse(teamMcpPosts(ui)[0].body);
@@ -8713,8 +8941,7 @@ test("team MCP: one confirmed add asks every call by default and reloads the Age
 test("team MCP: an unknown disable outcome is resent once as the same body and request ID",async()=>{
   const ui=await openTeamMcp(teamMcpView({version:"v2",servers:[teamMcpServer("Docs","v2"),teamMcpServer("Wiki","v2")]}));
   ui.holder.templateResponses["/api/team-mcp/changes"]={ok:false,json:async()=>({error:{code:"TEAM_MCP_OUTCOME_UNKNOWN"}})};
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
-  teamMcpAction(ui,0,"停用").events.click();await settleReviews(ui);
+  teamMcpAction(ui,0,"停用").events.click();ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   assert.match(ui.holder.confirmation,/停用後，所有對話（含進行中的）從下一回合起都不能再用這個工具；舊紀錄保留，不重送。/);
   const first=JSON.parse(teamMcpPosts(ui)[0].body);
   assert.deepEqual({...first,request_id:null},{schema_version:"fa-team-mcp-change-v2",request_id:null,
@@ -8728,7 +8955,8 @@ test("team MCP: an unknown disable outcome is resent once as the same body and r
   ui.holder.templateResponses["/api/team-mcp/changes"]=reply({schema_version:"fa-team-mcp-change-result-v2",
     request_id:first.request_id,state:"applied",toolbox_version:"v3",view:done,original_request_resent:false});
   ui.setTeamMcp(done);
-  ui.click("team-mcp-retry");await settleReviews(ui,12);
+  ui.click("team-mcp-retry");
+  assert.match(await ui.answer(true),/^用原編號重送上一個變更（Docs）？/);await settleReviews(ui,12);
   const posts=teamMcpPosts(ui);
   assert.equal(posts.length,2);
   assert.equal(posts[1].body,posts[0].body,"the resend is the original body with its request ID");
@@ -8757,8 +8985,7 @@ test("team MCP: a new connection key is sent once in the change body and never k
   assert.equal(ui.nodes.get("team-mcp-new-connection").hidden,false);
   assert.equal(ui.text("team-mcp-form-note"),"還需填好：金鑰。");
   ui.nodes.get("team-mcp-secret").value=key;ui.nodes.get("team-mcp-secret").events.input();
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
-  ui.click("team-mcp-save");await settleReviews(ui);
+  ui.click("team-mcp-save");ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   assert.match(ui.holder.confirmation,/金鑰只送給 Foundry/);assert.doesNotMatch(ui.holder.confirmation,new RegExp(key));
   assert.equal(ui.nodes.get("team-mcp-secret").value,"","the key field is cleared as soon as it is sent");
   const command=JSON.parse(teamMcpPosts(ui)[0].body);
@@ -8811,8 +9038,7 @@ test("team MCP: editing keeps the server's own connection and its approval setti
   assert.match(ui.nodes.get("team-mcp-connection").children.at(-1).textContent,/old-key（目前設定，未在清單中）/);
   assert.equal(ui.nodes.get("team-mcp-approval").value,"never");
   assert.equal(ui.nodes.get("team-mcp-label").disabled,true);
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
-  ui.click("team-mcp-save");await settleReviews(ui);
+  ui.click("team-mcp-save");ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   assert.match(ui.holder.confirmation,/修改 MCP「Docs」？\n呼叫前：不用批准。所有對話（含進行中的）從下一回合起改用新設定/);
   const command=JSON.parse(teamMcpPosts(ui)[0].body);
   assert.equal(command.operation,"modify");assert.equal(command.server.project_connection_id,"old-key");
@@ -9507,6 +9733,29 @@ function inlineQuestionChat(lane="foundry-responses-v1"){
   return {data,task,entry,qid:entry.item.item_id};
 }
 const shownNode=node=>JSON.stringify(node,(key,value)=>key==="events"?undefined:value);
+// stage 2026-10-10: a turn held by an approval card kept saying 「正在準備回覆…」 as if it were simply running.
+for(const kind of ["approval","question"]){
+  test(`a running turn held by the owner's ${kind} card says so in its reply`,async()=>{
+    let data;
+    if(kind==="question")data=inlineQuestionChat("foundry-native-v1").data;
+    else{
+      data=nativeChat("started");const task=data.tasks[0],pid="a".repeat(64);
+      const approval={pending_id:pid,pending_digest:"b".repeat(64),call:{agent_id:"configured-agent",
+        conversation_id:task.admission.conversation_id,request_id:task.task_id,sdk_session_id:"sdk",tool_call_id:"call"}};
+      data.composer.native_hitl={enabled:true,can_approve:true,references:[approval],commands:[],error:null};
+      data.composer.attention=[{thread_id:data.composer.thread_id,label:"原工作",item:{
+        schema_version:"fa-native-attention-v1",type:"approval_required",item_id:pid,approval,
+        created_at:when,expires_at:"2026-01-01T00:10:00Z",purpose:"attention-only-not-approval"}}];
+    }
+    const ui=await open(data,{now:Date.parse(when)});
+    const reply=turnNode(ui).children.find(node=>String(node.className).startsWith("assistant-message"));
+    assert.equal(reply.textContent,kind==="approval"?"這個回合正在等你批准":"這個回合正在等你回答");
+    const running=nativeChat("started");ui.render(running);
+    assert.equal(turnNode(ui).children.find(node=>String(node.className).startsWith("assistant-message")).textContent,
+      "正在準備回覆…","without a card it is the usual running line");
+    assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+  });
+}
 test("HITL 10-07: an answered card in a running turn becomes its record above the reply and the turn stops waiting at once",async()=>{
   const {data,entry,qid}=inlineQuestionChat(),streams=[],posts=[];let finish;
   const ui=await open(data,{now:Date.parse(when),
@@ -9525,11 +9774,10 @@ test("HITL 10-07: an answered card in a running turn becomes its record above th
   assert.match(shownNode(turn),/正在等你回答/);
   assert.equal(ui.nodes.get("attention-panel").hidden,false);
   assert.equal(ui.text("chat-presence"),"需要處理");
-  let confirms=0;ui.context.window.confirm=()=>{confirms++;return true};
   hitlNodes(ui,"data-question-choice",qid)[0].events.click();
   // Same redraw, before the bridge answers: the record replaces the card and the turn no longer waits.
   turn=turnNode(ui);
-  assert.equal(confirms,0);
+  assert.equal(ui.nodes.get("page-confirm").hidden,true);
   assert.equal(hitlNodes(ui,"data-question-card",qid).length,0);
   const record=hitlNodes(ui,"data-hitl-record",qid)[0];
   assert.ok(turn.children[slot].children.includes(record),"the record stays where the question was");
@@ -9711,9 +9959,8 @@ test("routine from chat: a schedule card shows the exact draft, says only the ow
   assert.match(hitlNodes(ui,"data-hitl-reason",pid)[0].textContent,/助理說的話或你在對話裡的回覆都不算批准/);
   assert.match(hitlNodes(ui,"data-hitl-reason",pid)[0].textContent,/要停用請到「助理清單右側的 ⚙ → 排程」/);
   assert.equal(hitlNodes(ui,"data-hitl-choice","allow_rule").length,0,"a schedule never becomes a Team rule");
-  let confirms=0;ui.context.window.confirm=()=>{confirms++;return true};
   hitlNodes(ui,"data-hitl-choice","allow_once")[0].events.click();await ui.tick();await ui.tick();
-  assert.equal(confirms,0,"the card already shows the exact schedule");
+  assert.equal(ui.nodes.get("page-confirm").hidden,true,"the card already shows the exact schedule");
   assert.equal(posts.length,1);assert.equal(posts[0].choice,"allow_once");assert.equal(posts[0].rule,null);
   assert.deepEqual(hitlNodes(ui,"data-hitl-record",pid)[0].children.map(node=>node.textContent),
     ["助理要排程："+ROUTINE_TEXT,"你允許了這次"]);
@@ -9800,8 +10047,7 @@ test("routine settings: the owner disables one schedule against the version show
   assert.equal(routineRows(ui)[1].children.length,3,"a disabled schedule has no button");
   const path="/api/routines/r1/versions/v-r1/disable";
   ui.holder.templateResponses[path]={ok:false,json:async()=>({error:{code:"LOCAL_OFFLINE"}})};
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
-  routineRows(ui)[0].children[3].children[0].events.click();await settleReviews(ui);
+  routineRows(ui)[0].children[3].children[0].events.click();ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   assert.match(ui.holder.confirmation,/停用這個排程？\n每天 09:00（Asia\/Taipei）在這個對話執行：「檢查 Foundry 有沒有新文章」/);
   assert.equal(routinePosts(ui).length,1);
   assert.equal(routinePosts(ui)[0].url,path);assert.equal(routinePosts(ui)[0].body,"{}");
@@ -9809,7 +10055,7 @@ test("routine settings: the owner disables one schedule against the version show
   const off=routineView("r1",{enabled:false,version:"v-r1-off"});
   ui.holder.templateResponses[path]=reply({routine:off});
   ui.setRoutines(routinesRead([off,routineView("r2",{enabled:false})]));
-  routineRows(ui)[0].children[3].children[0].events.click();await settleReviews(ui,12);
+  routineRows(ui)[0].children[3].children[0].events.click();await ui.answer(true);await settleReviews(ui,12);
   assert.equal(routinePosts(ui).length,2);
   assert.equal(routinePosts(ui)[1].url,path,"the resend names the same version the owner saw");
   assert.equal(ui.text("routines-note"),"已停用；下一次到點不會執行。");
@@ -9817,11 +10063,15 @@ test("routine settings: the owner disables one schedule against the version show
   assert.equal(routineRows(ui)[0].children.length,3);
 });
 
-test("routine settings: a cancelled confirmation or a read-only login sends nothing",async()=>{
+test("routine settings: a cancelled confirmation or a read-only login sends nothing; 確定 sends one disable",async()=>{
   const ui=await openRoutineSettings(routinesRead([routineView("r1")]));
-  ui.context.window.confirm=()=>false;
-  routineRows(ui)[0].children[3].children[0].events.click();await settleReviews(ui);
-  assert.equal(routinePosts(ui).length,0);
+  routineRows(ui)[0].children[3].children[0].events.click();
+  assert.match(await ui.answer(false),/^停用這個排程？\n/);await settleReviews(ui);
+  assert.equal(routinePosts(ui).length,0,"取消 sends nothing");
+  const disable=routineRows(ui)[0].children[3].children[0];
+  disable.events.click();disable.events.click();await ui.tick();
+  ui.click("page-confirm-ok");ui.click("page-confirm-ok");await settleReviews(ui);
+  assert.deepEqual(routinePosts(ui).map(call=>[call.url,call.body]),[["/api/routines/r1/versions/v-r1/disable","{}"]]);
   const reader=await openRoutineSettings(routinesRead([routineView("r1")],false));
   assert.equal(routineRows(reader)[0].children.length,3,"no disable button without Behavior.Approve");
   assert.equal(routinePosts(reader).length,0);
@@ -10043,7 +10293,6 @@ async function openConnectors(view=connectorView()){
   Object.assign(ui.holder.templateResponses,{"/api/team-mcp/servers":reply(teamMcpView()),
     "/api/team-mcp/connections":reply(teamMcpConnections)});
   ui.setConnectors=value=>{current=copy(value)};
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
   return openTeamSettings(ui,"team-connectors");
 }
 const connectorRow=ui=>ui.nodes.get("team-connectors-list").children[0];
@@ -10099,7 +10348,7 @@ test("connectors: the first add sends the secret once in one body, clears it and
   const secret=typeConnectorSecret(ui,CONNECTOR_SECRET);
   assert.equal(connectorButton(ui,"加入 Microsoft Teams").disabled,false);
   connectorButton(ui,"加入 Microsoft Teams").events.click();connectorButton(ui,"加入 Microsoft Teams").events.click();
-  await settleReviews(ui);
+  ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   assert.equal(connectorPosts(ui).length,1);
   assert.equal(secret.value,"","the field is cleared as soon as the add is sent");
   assert.match(ui.holder.confirmation,/^加入 Microsoft Teams？\nMicrosoft Teams 經 Work IQ 連線。Agent 能讀取的不只 Teams，也可能包含你的 Microsoft 365 郵件與檔案。\n讀取：不用批准，直接執行；寫入：每次都要我批准。\n/);
@@ -10121,7 +10370,7 @@ test("connectors: an unknown add is resent only with its original body, after th
   ui.holder.templateResponses["/api/team-connectors/changes"]={ok:false,
     json:async()=>({error:{code:"TEAM_CONNECTOR_OUTCOME_UNKNOWN"}})};
   typeConnectorSecret(ui,CONNECTOR_SECRET);
-  connectorButton(ui,"加入 Microsoft Teams").events.click();await settleReviews(ui);
+  connectorButton(ui,"加入 Microsoft Teams").events.click();ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   assert.equal(ui.text("team-connectors-note"),"Connector 變更結果未確認；請按「用原編號重送」，不會建立第二個版本。");
   assert.equal(pageHolds(ui,CONNECTOR_SECRET),false,"an unconfirmed add keeps its body without the secret");
   assert.equal(ui.nodes.get("team-connectors-retry").hidden,false);
@@ -10134,7 +10383,7 @@ test("connectors: an unknown add is resent only with its original body, after th
   ui.holder.templateResponses["/api/team-connectors/changes"]=reply(
     connectorApplied(first.request_id,"v1",connectorCard("enabled","v1",connectorSettings())));
   ui.setConnectors(connectorView(connectorCard("enabled","v1",connectorSettings())));
-  ui.click("team-connectors-retry");await settleReviews(ui,12);
+  ui.click("team-connectors-retry");ui.holder.confirmation=await ui.answer(true);await settleReviews(ui,12);
   assert.equal(connectorPosts(ui).length,2);
   assert.equal(connectorPosts(ui)[1].body,connectorPosts(ui)[0].body,"the same body and request ID");
   assert.match(ui.holder.confirmation,/頁面沒有保存用戶端密碼，這次送出你剛重新輸入的。/);
@@ -10151,16 +10400,16 @@ test("connectors: approval change, disable and re-enable each send one new versi
   };
   const [read]=connectorFields(ui);read.value="always";read.events.change();
   assert.equal(connectorButton(ui,"儲存批准設定").disabled,false);
-  connectorButton(ui,"儲存批准設定").events.click();await settleReviews(ui);
+  connectorButton(ui,"儲存批准設定").events.click();ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   assert.match(ui.holder.confirmation,/^變更 Microsoft Teams 的批准設定？\n讀取：每次都要我批准；寫入：每次都要我批准。\n所有對話（含進行中的）從下一回合起套用。/);
   await settle("v2",connectorCard("enabled","v2",connectorSettings(true,"always")));
   assert.equal(ui.text("team-connectors-note"),"已更新 Microsoft Teams 的批准設定（toolbox 版本 v2）。");
-  connectorButton(ui,"停用").events.click();await settleReviews(ui);
+  connectorButton(ui,"停用").events.click();ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   assert.match(ui.holder.confirmation,/^停用 Microsoft Teams？\n所有助理（含進行中的對話）從下一回合起都不能再用。不會撤銷授權/);
   await settle("v3",connectorCard("disabled","v3",connectorSettings(false,"always")));
   assert.equal(connectorRow(ui).children[2].textContent,"已加入，但已停用：所有助理從下一回合起都不能用 · 連線狀態：要實際使用才知道");
   const [, write]=connectorFields(ui);write.value="never";write.events.change();
-  connectorButton(ui,"重新啟用").events.click();await settleReviews(ui);
+  connectorButton(ui,"重新啟用").events.click();ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   await settle("v4",connectorCard("enabled","v4",connectorSettings(true,"always")));
   assert.equal(ui.text("team-connectors-note"),"已重新啟用 Microsoft Teams（toolbox 版本 v4）。");
   const change=(expected_version,enabled)=>({schema_version:"fa-team-connector-change-v1",request_id:null,
@@ -10175,7 +10424,7 @@ test("connectors: a stale version is refused, re-read and never resent",async()=
   ui.holder.templateResponses["/api/team-connectors/changes"]={ok:false,json:async()=>({error:{code:"TEAM_CONNECTOR_CHANGED"}})};
   const reads=()=>ui.calls.filter(call=>call.url==="/api/team-connectors").length,before=reads();
   ui.setConnectors(connectorView(connectorCard("disabled","v2",connectorSettings(false))));
-  connectorButton(ui,"停用").events.click();await settleReviews(ui);
+  connectorButton(ui,"停用").events.click();ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
   assert.equal(ui.text("team-connectors-note"),"Connector 設定剛被改過，這次沒有套用。已重新讀取，請確認後再改。");
   assert.equal(reads(),before+1);
   assert.equal(ui.nodes.get("team-connectors-retry").hidden,true);
@@ -10199,7 +10448,6 @@ const agentConnectorPosts=ui=>ui.calls.filter(call=>call.method==="POST"&&call.u
 const agentConnectorSwitch=ui=>ui.nodes.get("settings-connectors-list").children[0].children[1];
 async function openAgentConnectors(){
   const ui=await openSettingsPage();
-  ui.context.window.confirm=message=>{ui.holder.confirmation=message;return true};
   ui.click("settings-tab-mcp");await settleReviews(ui);
   return ui;
 }
@@ -10212,8 +10460,9 @@ test("an Agent's switch turns a connector off for its new conversations only, se
   assert.deepEqual(row.children[0].children.map(node=>node.textContent),["Microsoft Teams","這位助理的新對話：使用（Team 加入並啟用時）"]);
   const toggle=agentConnectorSwitch(ui);
   assert.deepEqual([toggle.checked,toggle.disabled,toggle.getAttribute("role")],[true,false,"switch"]);
-  toggle.checked=false;toggle.events.change();await settleReviews(ui);
-  assert.equal(ui.holder.confirmation,"關閉「FA 助理」的 Microsoft Teams？\n只影響這位助理之後的新對話；進行中的對話不變。只送一次。");
+  toggle.checked=false;toggle.events.change();
+  assert.equal(await ui.answer(true),"關閉「FA 助理」的 Microsoft Teams？\n只影響這位助理之後的新對話；進行中的對話不變。只送一次。");
+  await settleReviews(ui);
   assert.equal(agentConnectorPosts(ui).length,1);
   const sent=JSON.parse(agentConnectorPosts(ui)[0].body);
   assert.match(sent.request_id,/^[a-f0-9]{32}$/);
@@ -10223,7 +10472,7 @@ test("an Agent's switch turns a connector off for its new conversations only, se
   assert.equal(ui.text("settings-connectors-note"),"已關閉 Microsoft Teams；只影響「FA 助理」之後的新對話。");
   assert.deepEqual([agentConnectorSwitch(ui).checked,ui.nodes.get("settings-connectors-list").children[0].children[0].children[1].textContent],
     [false,"這位助理的新對話：不使用"]);
-  agentConnectorSwitch(ui).checked=true;agentConnectorSwitch(ui).events.change();await settleReviews(ui);
+  agentConnectorSwitch(ui).checked=true;agentConnectorSwitch(ui).events.change();await ui.answer(true);await settleReviews(ui);
   assert.deepEqual({...JSON.parse(agentConnectorPosts(ui)[1].body),request_id:null},{schema_version:"fa-agent-connectors-command-v1",
     request_id:null,expected_revision:1,disabled_connector_ids:[]});
   assert.equal(ui.calls.some(call=>call.url.startsWith("/api/team-")),false,"an Agent's page writes nothing of the Team");
@@ -10232,11 +10481,12 @@ test("an Agent's switch turns a connector off for its new conversations only, se
 test("an Agent's switch with an unknown outcome is resent only as the same body",async()=>{
   const ui=await openAgentConnectors();
   ui.holder.templateResponses["/api/agent-connectors"]={ok:false,json:async()=>({error:{code:"BACKEND_OFFLINE"}})};
-  agentConnectorSwitch(ui).checked=false;agentConnectorSwitch(ui).events.change();await settleReviews(ui);
+  agentConnectorSwitch(ui).checked=false;agentConnectorSwitch(ui).events.change();await ui.answer(true);await settleReviews(ui);
   assert.equal(ui.nodes.get("settings-connectors-retry").hidden,false);
   assert.equal(agentConnectorSwitch(ui).disabled,true,"no new change while one is unconfirmed");
   ui.holder.templateResponses["/api/agent-connectors"]=reply(agentConnectorsView(1,false));
-  ui.click("settings-connectors-retry");await settleReviews(ui);
+  ui.click("settings-connectors-retry");
+  assert.match(await ui.answer(true),/^用原編號重送上一個開關變更？/);await settleReviews(ui);
   assert.equal(agentConnectorPosts(ui).length,2);
   assert.equal(agentConnectorPosts(ui)[1].body,agentConnectorPosts(ui)[0].body);
   assert.equal(ui.nodes.get("settings-connectors-retry").hidden,true);
@@ -10266,4 +10516,282 @@ test("an Agent's switch is read-only without Approve and re-read for each Agent"
   ui.click("close-settings");
   assert.equal(agentGear(ui,"agent-two").focused,true,"closing an Agent's settings returns focus to its ⚙");
   assert.equal(agentConnectorPosts(ui).length,0);
+});
+
+// Neal 2026-10-12: a pending card of the open conversation sits in the dock above the composer, never in the chat scroll.
+function walkNodes(node,visit){visit(node);for(const child of node.children||[])walkNodes(child,visit)}
+test("HITL 10-12: a pending question shows in the dock, the turn keeps a one-liner, and the answer leaves a record inline",async()=>{
+  const {data,qid}=inlineQuestionChat("foundry-native-v1");
+  const ui=await open(data,{now:Date.parse(when),hitl:async(url,options)=>({ok:true,json:async()=>answerReply(
+    data.composer.attention[0].item,JSON.parse(options.body))})});
+  const dock=ui.nodes.get("attention-dock"),slot=turnNode(ui).children.find(node=>node.className==="turn-attention");
+  assert.equal(dock.hidden,false);
+  assert.equal(hitlNodes(ui,"data-question-card",qid).length,1);
+  const inDock=[];walkNodes(dock,node=>{if(node.attributes?.["data-question-card"]===qid)inDock.push(node)});
+  assert.equal(inDock.length,1,"the card is in the dock");
+  const inSlot=[];walkNodes(slot,node=>{if(node.attributes?.["data-question-card"]===qid)inSlot.push(node)});
+  assert.equal(inSlot.length,0,"not in the turn");
+  assert.deepEqual(slot.children.map(node=>node.textContent),["助理有問題要問你，卡片在輸入框上方。"]);
+  const ids=[];for(const root of [dock,ui.nodes.get("conversation-history")])walkNodes(root,node=>{if(node.attributes?.id)ids.push(node.attributes.id)});
+  assert.equal(new Set(ids).size,ids.length,"no duplicate ids");
+  hitlNodes(ui,"data-question-choice",qid)[0].events.click();
+  await ui.tick();await ui.tick();
+  assert.equal(dock.hidden,true);assert.equal(dock.children.length,0);
+  const record=hitlNodes(ui,"data-hitl-record",qid);
+  assert.equal(record.length,1);
+  assert.ok(record[0].children[1].textContent.startsWith("你的回答："));
+});
+
+test("HITL 10-12: a pending approval shows in the dock with its one-liner and a card of another conversation stays out",async()=>{
+  const c=teamAttentionCase("agent-one"),pid=c.reference.pending_id;
+  const ui=await open(c.data,{now:Date.parse(when),hitl:async(url,options)=>({ok:true,
+    json:async()=>copy(url.includes("/attention")?c.page:c.view)})});
+  await ui.tick();await ui.tick();await ui.tick();
+  const dock=ui.nodes.get("attention-dock"),slot=turnNode(ui).children.find(node=>node.className==="turn-attention");
+  assert.equal(dock.children.length,1);
+  assert.equal(dock.children[0].attributes["data-hitl-card"],pid);
+  assert.deepEqual(slot.children.map(node=>node.textContent),["正在等你批准，卡片在輸入框上方。"]);
+  const focusedIn=card=>{const hit=[];walkNodes(card,node=>{if(node.tagName==="BUTTON"&&node.focused)hit.push(node)});return hit};
+  const approvalOpen=[];walkNodes(ui.nodes.get("attention-items"),node=>{if(node.attributes?.["data-attention-overview"])approvalOpen.push(node)});
+  assert.equal(approvalOpen.length,1);
+  approvalOpen[0].children.find(node=>node.textContent==="查看原回合").events.click();
+  assert.deepEqual(focusedIn(dock.children[0]).map(node=>node.textContent),["允許這次"],"focus lands on 允許這次, not the collapsed 重新讀取原操作");
+  const other=teamAttentionCase("agent-two");
+  other.page.items[0].origin.root={...other.page.items[0].origin.root,conversation_id:"another-cid"};
+  other.page.items[0].origin.sender=null;
+  const ui2=await open(other.data,{now:Date.parse(when),hitl:async(url,options)=>({ok:true,
+    json:async()=>copy(url.includes("/attention")?other.page:other.view)})});
+  await ui2.tick();await ui2.tick();await ui2.tick();
+  assert.equal(ui2.nodes.get("attention-dock").children.length,0,"a card whose turn is in another conversation is not in this dock");
+  assert.equal(ui2.nodes.get("attention-dock").hidden,true);
+});
+
+test("HITL dock: a Connect card of the open conversation shows in the dock with its one-liner",async()=>{
+  const {data,task}=inlineQuestionChat("foundry-native-v1");
+  const c=consentCase("consent"),entry=c.entry;
+  Object.assign(entry.item.consent.call,{conversation_id:task.admission.conversation_id,request_id:task.task_id});
+  entry.thread_id=data.composer.thread_id;data.composer.attention=[entry];
+  const ui=await open(data,{now:Date.parse(when),hitl:c.hitl});
+  await ui.tick();await ui.tick();
+  const dock=ui.nodes.get("attention-dock"),slot=turnNode(ui).children.find(node=>node.className==="turn-attention");
+  assert.equal(dock.hidden,false);
+  assert.equal(dock.children.length,1);
+  assert.equal(dock.children[0].attributes["data-consent-card"],c.cid);
+  assert.deepEqual(slot.children.map(node=>node.textContent),["需要連線，卡片在輸入框上方。"]);
+  const consentOpen=[];walkNodes(ui.nodes.get("attention-items"),node=>{if(node.attributes?.["data-attention-overview"])consentOpen.push(node)});
+  assert.equal(consentOpen.length,1);
+  consentOpen[0].children.find(node=>node.textContent==="查看原回合").events.click();
+  const focusedConsent=[];walkNodes(dock.children[0],node=>{if(node.tagName==="BUTTON"&&node.focused)focusedConsent.push(node)});
+  assert.deepEqual(focusedConsent.map(node=>node.textContent),["我連好了，繼續"]);
+});
+
+test("HITL dock: two pending cards sit oldest first under a count line, and 查看原回合 goes to the dock",async()=>{
+  const {data,task,entry}=inlineQuestionChat("foundry-native-v1");
+  const older=copy(entry),id2="c".repeat(64);
+  older.item.item_id=id2;older.item.question.question_id=id2;older.item.created_at="2025-12-31T23:00:00Z";
+  older.item.text="較早的問題";
+  data.composer.attention=[entry,older];
+  const ui=await open(data,{now:Date.parse(when)});
+  const dock=ui.nodes.get("attention-dock");
+  assert.equal(dock.children.length,3);
+  assert.equal(dock.children[0].textContent,"有 2 張待處理卡片");
+  assert.deepEqual(dock.children.slice(1).map(card=>card.attributes["data-question-card"]),[id2,entry.item.item_id]);
+  const calls=[];dock.scrollIntoView=()=>calls.push("dock");
+  const host=turnNode(ui).children.find(node=>node.className==="turn-attention");host.scrollIntoView=()=>calls.push("turn");
+  const overview=[];walkNodes(ui.nodes.get("attention-items"),node=>{if(node.attributes?.["data-attention-overview"])overview.push(node)});
+  assert.equal(overview.length,2,"the Team overview lists both pending cards");
+  const open1=overview.find(node=>node.attributes["data-attention-overview"]===entry.item.item_id).children.find(node=>node.textContent==="查看原回合");
+  open1.events.click();
+  assert.deepEqual(calls,["dock"]);
+  const buttons=[];walkNodes(dock.children[2],node=>{if(node.tagName==="BUTTON"&&node.focused)buttons.push(node)});
+  assert.equal(buttons.length,1,"the first button of that card has focus");
+});
+
+// #813: during a deploy window the API may send a stop to no session (not_dispatched). The page says the stop was not
+// sent and can be pressed again, not 「傳送結果尚未確認」 or an unknown stop to check.
+test("a native stop the API sent to no session says it was not sent and stop stays available",async()=>{
+  const data=nativeChat("started"),task=data.tasks[0];
+  task.cancellation={state:"REFUSED",code:"NATIVE_SESSION_CHANGED",not_dispatched:true,automatic_retry:false};
+  const ui=await open(data);
+  assert.equal(ui.text("cancellation-note"),
+    "停止請求沒有送出：助理正在換版本，這次沒有送到任何工作環境。可以稍後再按一次「停止這次回覆」。");
+  assert.doesNotMatch(ui.text("cancellation-note"),/還不確定停止請求有沒有送到|傳送結果尚未確認/);
+  assert.equal(ui.nodes.get("cancel-instruction").hidden,false);
+  assert.equal(ui.nodes.get("cancel-instruction").disabled,false);
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
+});
+
+// #813 through the button: the stop is asked in the page, the API sends it to no session, and pressing again asks again
+// and posts the same task's stop (the bridge resends the same NativeCancel, same RID and CID, on the same journal row).
+test("a native stop refused as not sent asks again in the page and posts the same task's stop on the second click",async()=>{
+  const data=nativeChat("started"),task=data.tasks[0];
+  const ui=await open(data);
+  ui.click("cancel-instruction");await ui.tick();
+  assert.equal(ui.nodes.get("page-confirm").hidden,false);
+  assert.equal(ui.text("page-confirm-message"),STOP_QUESTION);
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,0,"the first click only asks");
+  ui.click("page-confirm-ok");await ui.tick();
+  let sent=ui.calls.filter(call=>call.method==="POST");
+  assert.deepEqual(sent.map(call=>[call.url,JSON.parse(call.body)]),[["/api/instructions/offline/cancel",{}]]);
+  task.cancellation={state:"REFUSED",code:"NATIVE_SESSION_CHANGED",not_dispatched:true,automatic_retry:false};
+  task.actions.cancel=action(true);
+  ui.holder.current=data;ui.holder.pending({task});
+  await ui.tick();await ui.tick();
+  assert.equal(ui.text("cancellation-note"),
+    "停止請求沒有送出：助理正在換版本，這次沒有送到任何工作環境。可以稍後再按一次「停止這次回覆」。");
+  assert.equal(ui.nodes.get("cancel-instruction").hidden,false);
+  assert.equal(ui.nodes.get("cancel-instruction").disabled,false);
+  ui.click("cancel-instruction");await ui.tick();
+  assert.equal(ui.nodes.get("page-confirm").hidden,false,"the second stop asks in the page too");
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,1,"asking again sends nothing yet");
+  ui.click("page-confirm-ok");await ui.tick();
+  sent=ui.calls.filter(call=>call.method==="POST");
+  assert.deepEqual(sent.map(call=>[call.url,JSON.parse(call.body)]),
+    [["/api/instructions/offline/cancel",{}],["/api/instructions/offline/cancel",{}]]);
+});
+
+// #813 review round 4: a delivery acknowledgement the API sent to no session says 「確認收到」 was not sent, not the
+// message-send wording; a refused message send keeps its own wording.
+test("a native delivery acknowledgement the API sent to no session says the acknowledgement was not sent",async()=>{
+  const data=nativeChat("completed"),task=data.tasks[0];
+  const ui=await open(data);
+  ui.holder.templateResponses={[`/api/instructions/${task.task_id}/confirm-reply`]:{ok:false,status:409,
+    json:async()=>({error:{code:"NATIVE_SESSION_CHANGED",not_dispatched:true,request_id:task.task_id,automatic_retry:false}})}};
+  assert.equal(ui.nodes.get("acknowledge").disabled,false);
+  ui.click("acknowledge");await ui.tick();await ui.tick();
+  assert.deepEqual(ui.calls.filter(call=>call.method==="POST").map(call=>call.url),
+    [`/api/instructions/${task.task_id}/confirm-reply`]);
+  assert.equal(ui.text("error-message"),"確認收到沒有送出，請稍後再按一次。");
+  assert.doesNotMatch(ui.text("error-message"),/訊息沒有送出/);
+  assert.equal(vm.runInContext('friendlyError({code:"NATIVE_SESSION_CHANGED",not_dispatched:true})',ui.context),
+    "助理的新版本還沒準備好，訊息沒有送出，請稍後再送。");
+});
+
+// Every confirm-gated action, one row each: 取消 sends nothing to the gated path; 確定 sends exactly one request there.
+// Pre-confirmation reads (and settings' /inspect) are not the gated request. A call site that forgets `await` gets a
+// truthy Promise and sends while the question is still open, so its 取消 step fails here.
+const hitlRulesUi=async()=>{
+  const data=hitlChat(),rules=hitlRead(data).rules;
+  rules.revision=1;rules.etag="etag-1";rules.rules=[{rule_id:"existing-rule",text:"Existing rule",behavior:"ask_first"}];
+  const ui=await open(data,{now:Date.parse(when),hitl:async(url,options)=>options.method==="POST"?new Promise(()=>{}):
+    {ok:true,json:async()=>({rules:copy(rules),commands:[],can_approve:true,read_at:when})}});
+  ui.click("read-hitl-rules");await ui.tick();await ui.tick();
+  return ui;
+};
+const hitlRuleButton=(ui,label)=>ui.nodes.get("hitl-rule-list").children[0].children.find(node=>node.textContent===label);
+const typeHitlRule=(ui,text)=>{const input=ui.nodes.get("hitl-rule-text");input.value=text;input.events.input()};
+const unknownOutcome=code=>({ok:false,json:async()=>({error:{code}})});
+async function viewedReviews(options,base){
+  const ui=await openReviews(options,base);
+  reviewButton(reviewRow(ui,"新指南"),"查看內容").events.click();await settleReviews(ui);
+  return ui;
+}
+function replaceSkillUi(){
+  const base=settingsBase();
+  base.skills=[{name:"old-guide",version_id:"1".repeat(32),sha256:"e".repeat(64),metadata_sha256:"f".repeat(64)}];
+  base.settings.capabilities=[{entry_id:"fa-skills-v1",entry_sha256:"6".repeat(64)}];
+  return viewedReviews(settingsOptions(),base);
+}
+const twoTeamMcp=()=>openTeamMcp(teamMcpView({version:"v2",servers:[teamMcpServer("Docs","v2"),teamMcpServer("Wiki","v2")]}));
+const enabledConnector=()=>openConnectors(connectorView(connectorCard("enabled","v1",connectorSettings())));
+const SKILL_DECISIONS="/api/team-skills/skills/new-guide/decisions",HITL_RULES=/^\/api\/native-hitl\/[^/]+\/rules$/;
+const confirmGatedActions=[
+  {name:"settings 套用",url:"/api/agent-template/select",open:async()=>{
+    const ui=await openSettingsPage();
+    ui.click("settings-tab-mcp");settingsSwitch(ui,"WebIQ",true);
+    ui.holder.templateResponses["/api/agent-template/inspect"]=reply({...inspectedTemplate(),template_sha256:"a".repeat(64)});
+    return ui;
+  },trigger:ui=>ui.click("settings-apply")},
+  {name:"skill 批准",url:SKILL_DECISIONS,open:()=>viewedReviews(),
+    trigger:ui=>reviewButton(reviewRow(ui,"新指南"),"批准").events.click()},
+  {name:"skill 拒絕",url:SKILL_DECISIONS,open:()=>viewedReviews(),
+    trigger:ui=>reviewButton(reviewRow(ui,"新指南"),"拒絕").events.click()},
+  {name:"skill 停用",url:"/api/team-skills/skills/old-guide/deactivations",open:()=>openReviews(),
+    trigger:ui=>reviewButton(reviewRow(ui,"舊指南"),"停用").events.click()},
+  {name:"skill 用同一個決定編號重送",url:SKILL_DECISIONS,open:async()=>{
+    const ui=await viewedReviews();
+    ui.holder.templateResponses[SKILL_DECISIONS]=unknownOutcome("BACKEND_OFFLINE");
+    reviewButton(reviewRow(ui,"新指南"),"拒絕").events.click();await ui.answer(true);await settleReviews(ui);
+    return ui;
+  },trigger:ui=>reviewButton(reviewRow(ui,"新指南"),"重新讀取並核對").events.click()},
+  {name:"skill 批准並取代",url:SKILL_DECISIONS,open:replaceSkillUi,
+    trigger:ui=>reviewButton(reviewRow(ui,"新指南"),"批准並取代").events.click()},
+  {name:"skill 建立草稿",url:"/api/team-skills/drafts",open:async()=>{const ui=await openReviews();fillSkillNew(ui);return ui},
+    trigger:ui=>ui.click("skill-new-save")},
+  {name:"Team MCP 新增",url:"/api/team-mcp/changes",open:async()=>{const ui=await openTeamMcp();fillTeamMcp(ui);return ui},
+    trigger:ui=>ui.click("team-mcp-save")},
+  {name:"Team MCP 修改",url:"/api/team-mcp/changes",open:twoTeamMcp,
+    trigger:ui=>{teamMcpAction(ui,0,"修改").events.click();ui.click("team-mcp-save")}},
+  {name:"Team MCP 停用",url:"/api/team-mcp/changes",open:twoTeamMcp,
+    trigger:ui=>teamMcpAction(ui,0,"停用").events.click()},
+  {name:"Team MCP 用原編號重送",url:"/api/team-mcp/changes",open:async()=>{
+    const ui=await twoTeamMcp();
+    ui.holder.templateResponses["/api/team-mcp/changes"]=unknownOutcome("TEAM_MCP_OUTCOME_UNKNOWN");
+    teamMcpAction(ui,0,"停用").events.click();await ui.answer(true);await settleReviews(ui);
+    return ui;
+  },trigger:ui=>ui.click("team-mcp-retry")},
+  {name:"Team connector 加入",url:"/api/team-connectors/changes",open:()=>openConnectors(),
+    trigger:ui=>{typeConnectorSecret(ui,CONNECTOR_SECRET);connectorButton(ui,"加入 Microsoft Teams").events.click()}},
+  {name:"Team connector 儲存批准設定",url:"/api/team-connectors/changes",open:enabledConnector,
+    trigger:ui=>{const [read]=connectorFields(ui);read.value="always";read.events.change();
+      connectorButton(ui,"儲存批准設定").events.click()}},
+  {name:"Team connector 停用",url:"/api/team-connectors/changes",open:enabledConnector,
+    trigger:ui=>connectorButton(ui,"停用").events.click()},
+  {name:"Team connector 重新啟用",url:"/api/team-connectors/changes",
+    open:()=>openConnectors(connectorView(connectorCard("disabled","v2",connectorSettings(false)))),
+    trigger:ui=>connectorButton(ui,"重新啟用").events.click()},
+  {name:"Team connector 用原編號重送",url:"/api/team-connectors/changes",open:async()=>{
+    const ui=await enabledConnector();
+    ui.holder.templateResponses["/api/team-connectors/changes"]=unknownOutcome("TEAM_CONNECTOR_OUTCOME_UNKNOWN");
+    connectorButton(ui,"停用").events.click();await ui.answer(true);await settleReviews(ui);
+    return ui;
+  },trigger:ui=>ui.click("team-connectors-retry")},
+  {name:"助理 connector 開關",url:"/api/agent-connectors",open:async()=>{
+    const ui=await openAgentConnectors();delete ui.holder.templateResponses["/api/agent-connectors"];return ui;
+  },trigger:ui=>{const toggle=agentConnectorSwitch(ui);toggle.checked=false;toggle.events.change()}},
+  {name:"助理 connector 用原編號重送",url:"/api/agent-connectors",open:async()=>{
+    const ui=await openAgentConnectors();
+    ui.holder.templateResponses["/api/agent-connectors"]=unknownOutcome("BACKEND_OFFLINE");
+    const toggle=agentConnectorSwitch(ui);toggle.checked=false;toggle.events.change();await ui.answer(true);await settleReviews(ui);
+    return ui;
+  },trigger:ui=>ui.click("settings-connectors-retry")},
+  {name:"排程停用",url:"/api/routines/r1/versions/v-r1/disable",open:()=>openRoutineSettings(routinesRead([routineView("r1")])),
+    trigger:ui=>routineRows(ui)[0].children[3].children[0].events.click()},
+  {name:"HITL 規則新增",url:HITL_RULES,open:hitlRulesUi,
+    trigger:ui=>{typeHitlRule(ui,"Ask before changing this workspace.");ui.click("save-hitl-rule")}},
+  {name:"HITL 規則更新",url:HITL_RULES,open:hitlRulesUi,
+    trigger:ui=>{hitlRuleButton(ui,"編輯").events.click();typeHitlRule(ui,"Updated scope");ui.click("save-hitl-rule")}},
+  {name:"HITL 規則刪除",url:HITL_RULES,open:hitlRulesUi,
+    trigger:ui=>hitlRuleButton(ui,"刪除").events.click()},
+  {name:"模板選用",url:"/api/agent-template/select",open:async()=>{
+    const ui=await open(templateData());await readyTemplateSelection(ui,selectableTemplate());return ui;
+  },trigger:ui=>ui.click("select-template")},
+  {name:"停止這次回覆",url:"/api/instructions/offline/cancel",open:()=>open(cancellableChat()),
+    trigger:ui=>ui.click("cancel-instruction")},
+  {name:"封存目前對話並開新 session",url:"/api/instructions/old-thread/reset",open:()=>{
+    const data=fixture();
+    data.composer={thread_id:"old-thread",request_id:"old-request",can_reset:true,can_new_conversation:true,
+      hosted_session_id:"fa-chat-original",content:"old",editable:false,can_submit:false,models};
+    return open(data);
+  },trigger:ui=>ui.click("reset-session")},
+];
+for(const row of confirmGatedActions){
+  test(`in-page confirmation gates ${row.name}: 取消 sends nothing, 確定 sends one request`,async()=>{
+    const ui=await row.open();
+    const gated=()=>ui.calls.filter(call=>call.method==="POST"&&
+      (row.url instanceof RegExp?row.url.test(call.url):call.url===row.url)).length;
+    const before=gated();
+    // Not awaited: a click handler may return the whole action, which waits for the answer below.
+    row.trigger(ui);
+    assert.ok(await ui.answer(false),"the action asks first");await settleReviews(ui,12);
+    assert.equal(gated(),before,`${row.name}: 取消 sends nothing`);
+    assert.equal(ui.nodes.get("page-confirm").hidden,true);
+    row.trigger(ui);
+    assert.ok(await ui.answer(true));await settleReviews(ui,12);
+    assert.equal(gated(),before+1,`${row.name}: 確定 sends exactly one request`);
+  });
+}
+test("the confirm-gated action table has one row per action",()=>{
+  assert.equal(confirmGatedActions.length,25);
+  assert.equal(new Set(confirmGatedActions.map(row=>row.name)).size,confirmGatedActions.length);
 });

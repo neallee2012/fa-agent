@@ -1,5 +1,60 @@
 # FA 本機工作台
 
+## 回合結束、等批准與停止不再要手動更新（stage／dev 2026-10-10～12 現場，CODE/offline，未部署）
+
+現場：回覆寫完後一直顯示「回覆中，尚未確認保存。」「正在準備」「停止這次回覆」，按「更新回覆」沒用，只有「詳細 → 更新工作狀態」才變「已完成」；
+有些完成的回覆一直「正在載入回覆…」；回合等批准的 10 分鐘裡頁面只讀了一次進度、重新整理後也不讀，按「停止這次回覆」API 沒收到停止。
+
+- **回覆讀取失敗不再擋住回條**：`GET /api/instructions/<rid>/status`（bridge `turn_status`）先存好已完成的回條，再讀回覆；
+  原本回覆讀取一失敗（雜湊／長度不符、`/result` 上游錯誤）整個讀取就失敗，頁面拿不到「已完成」，不可重試的錯誤還會停掉輪詢。
+  現在回覆的錯誤記在那一則（task `error`），回條照常回給頁面；下一次讀取再讀回覆。登入失敗照舊往上丟。
+- **「正在載入回覆…」會結束**：舊回合的 `/status` 讀完（失敗、或沒帶回覆）後重畫，改顯示「尚未載入回覆，可從選單更新。」；
+  按「更新回覆」會讓這種回合在畫面上時再讀一次自己的 `/status`。
+- **進度讀取有上限**：頁面一次進度讀取最多等 45 秒，逾時照讀取重試的退避再讀（顯示「暫時讀不到進度，正在重試」），晚到的回應不採用；
+  bridge 同一段對話的進度讀取排隊最多 25 秒，等不到回 409 `PROGRESS_READ_BUSY`（`automatic_retry: true`），頁面退避再讀。只限 GET，POST 不設逾時、不重送。
+  平台歷史讀取（`GET /api/instructions/<thread>/platform-history`）用同一個排隊與同一個上限，等不到時同樣回 409、不送到 API。
+- **停止直接送出**：bridge 已知在跑（accepted／started、尚未要求停止）的回合，按「停止這次回覆」直接記 journal 並送 `NativeCancel`，
+  不先重讀回條與接續；其他情況照舊先讀。同一個 RID，重按不再送。
+- **所有確認都在頁面內問**（dev 8765 2026-10-12 現場：bridge 與 API 都沒收到停止）：原本按「停止這次回覆」先跳 `window.confirm`，
+  內嵌瀏覽器（例如 Claude desktop app 的內建瀏覽器）不顯示原生對話框、直接回 false，停止就默默沒送；設定／管理頁另外 20 處確認也一樣。
+  現在全部改用同一個頁面內確認框（`#page-confirm`，`role="alertdialog"`，`confirmInPage()`）：原本的問題文字原封不動，
+  焦點起始在「取消」（按 Enter 或一直按住 Enter 都不會確認刪除、停用、停止、封存），Tab 只在「確定／取消」間切換；開著時頁面其餘部分（`#app-shell`）設為 `inert`，焦點和點擊都到不了背後，關閉時恢復；按「取消」或 Esc 關閉、不送任何東西；停止與位置固定的按鈕關閉後焦點回到原按鈕，設定頁清單裡的按鈕（確認前頁面已重畫、原按鈕已不在頁面上）不回焦點；按「確定」才送原本那一個請求，
+  連按不會送第二次。同時只會有一個問題，開新的會把舊的當成取消。停止的確認在換對話、回合結束或按鈕停用時自動關閉。
+  確認框開著時頁面仍會更新，所以每一處在「確定」後再核對一次原本的前提（同一位助理／同一份讀取／同一份草稿／同一段對話與 request ID），
+  不符合就不送；request、body 與 request ID 都和原本一樣，沒有新增請求或重送。
+- **已完成的回合不需要停止**：API 對停止回了原本、未變的回條，而且狀態是 `completed`（bridge 還以為在跑）時，記成已確認的答覆
+  （`cancel_accepted: false`），頁面寫「工作已經結束，不需要停止。」；其他狀態（例如 `busy_refused`）不說已結束，照舊記成停止結果未知，
+  頁面提供「核對原停止回條」。
+- **API 沒送出的停止可以再按**（#813）：換版期間 API 找不到可安全呼叫的 session 時，停止回帶 `not_dispatched: true` 的拒絕
+  （adapter 在 cancel、delivered、append 也讀這個欄位）。bridge 把停止記成 `REFUSED`（原本記成未確認、之後重按都默默不送，
+  頁面還寫「傳送結果尚未確認」），頁面寫「停止請求沒有送出：助理正在換版本，這次沒有送到任何工作環境。可以稍後再按一次
+  「停止這次回覆」。」；重按在同一筆 journal 上先記回未確認，再送同一個 `NativeCancel`（同一個 RID 與 CID）。送達回條同樣記
+  `REFUSED`、可再送，錯誤寫「確認收到沒有送出，請稍後再按一次。」（不用送訊息的說法）。
+- **等批准時講明**：回合被主人的批准卡／提問卡擋住時，回覆泡泡寫「這個回合正在等你批准」／「這個回合正在等你回答」。卡片的畫法與位置不變。
+
+還要雲端核對：stage bridge 對那個 RID 的 `/status` 是哪一步失敗（回覆讀取？）、15:15:34 那次進度讀取花了多久、
+停止時 bridge 有沒有發出 `GET /requests/<rid>` 及何時回來。`/api/state` 直接在網址列打開（沒有 `X-Console-Agent`）會回 agent 模式的 bootstrap，
+其中 `automatic_polling:false` 不是頁面輪詢的開關，頁面也不讀它。
+
+### Verified against（回合結束與停止）
+
+- 程式路徑：`index.html` 的 `updateProgress`／`readOlderTurn`／`scheduleProgress`／「更新回覆」與「停止這次回覆」按鈕；
+  `bridge.py` 的 `progress_lock`（`PROGRESS_LOCK_WAIT_SECONDS`）、`instruction_status`／`instruction_progress`／`instruction_platform_history`／`cancel_instruction`；
+  `native.py` 的 `turn_status`／`change`／`_refresh_responses`。
+- 離線測試：`test_web_test_console_native.py` 新增回覆讀取失敗仍回回條（2 案）、進度讀取排隊上限（2 案）、已知在跑的回合直接送停止、
+  已完成回合的停止記 API 原答（`test_a_stop_for_a_turn_that_already_finished_records_the_api_answer`）、
+  `busy_refused` 回條不記成已結束（`test_a_stop_answered_with_a_busy_refused_receipt_is_not_recorded_as_finished`）；
+  `test_web_test_console_responses.py` 新增平台歷史讀取排隊上限（`test_a_platform_history_read_behind_a_stuck_read_answers_retryable`）；
+  `test_web_test_console_workbench.cjs` 新增舊回合讀取失敗／沒帶回覆（2 案）、進度讀取逾時、已完成回合的停止顯示「不需要停止」、
+  等批准／等回答字樣（2 案），皆在修改前失敗、修改後通過。
+- 頁面內確認：`test_web_test_console_workbench.cjs` 的 harness 把 `window.confirm`／`alert`／`prompt` 換成一呼叫就失敗的替身，
+  不再預設回 true，所有 `window.confirm` stub 都拿掉，改用 `ui.answer(true|false)` 回答頁面內的確認框。
+  新增 index.html 不含原生對話框呼叫的 guard、新問題把舊問題當取消（2 案）；Esc 案例另驗頁面任一處按 Esc 也關閉不送；
+  HITL 規則新增、skill 批准、排程停用、封存並開新 session 各驗「取消不送、確定（連按兩次）只送一次」。
+  另有 guard 要求每個 `confirmInPage(` 呼叫處都寫成 `await confirmInPage(`（不符就報 index.html 行號）；
+  表格測試（25 列，涵蓋全部 21 個呼叫處）逐一按下動作、按「取消」驗證沒送到該路徑，再按「確定」驗證剛好送一個；
+  任一處拿掉 `await` 都會讓對應列失敗。另驗確認框開著時 `#app-shell` 是 `inert`，取消／確定／Esc／失效關閉後都恢復。
+
 <a id="connectors-settings"></a>
 ## Connectors 設定頁與助理的 connector 開關（C4，2026-10-10，CODE/offline，未部署）
 
@@ -247,7 +302,7 @@ Neal 2026-10-07 08:29（附 stage 截圖）：「按下HTLT的按鈕時，應該
 |---|---|---|
 | 卡片按鈕先跳瀏覽器確認框（提問卡的選項、「送出我的回答」；批准卡的「允許這次」「拒絕」「確認規則並允許」） | Copilot App 的提問：點選項就送出（Neal 附圖二）；Grok Bot 把提問與批准放在對話時間軸裡處理（[chat and collaboration](https://docs.x.ai/grok-bot/chat-and-collaboration)）。確認框本來就不是防重送機制。 | 一按就送。防重送照舊：按下的同一次重畫，整張卡換成紀錄，舊按鈕再按也因同一個請求還在進行而不送。提問的 request ID 由原問題決定，同一題再按、換答案或重開工作台都只回原紀錄；批准的 request ID 由原 call 加這次的選擇決定，同一個選擇只送一次，換另一個選擇時 bridge 先重讀原 call，已有決定就拒絕（H1 也只留第一個決定）。結果不明只能「只核對原回答／只核對原決定」。「以後允許這類」仍是兩步：先展開規則草稿，按「確認規則並允許」才送。卡片以外的確認（設定、skill、MCP、規則清單刪除、停止回覆、封存對話）不變。 |
 | 送出後卡片只多一行「已送出回答：…」，下一次讀取後整張卡消失，畫面沒有留下問答；回合進度停在「正在等你回答」直到下次讀取 | Copilot App：「Asked user: …」下一行「Answer: …」，接著是助理的工作過程（Neal 附圖二）。 | 按下當下卡片收成兩行：「助理問：…」「你的回答：…」；批准卡是「助理要執行：命令」（或「助理要使用：工具（目標）」、「助理要使用 Toolbox 工具：名稱」）加「你允許了這次」／「你允許了，並新增規則「…」」／「你拒絕了」；別的助理的卡寫出那位助理的名字。送出中加小字「送出中…」，bridge 回了原紀錄（或核對後讀回原回條）才拿掉，不寫「已送達」。被拒（例如已過期）就展開回原卡片並顯示原因，同時立刻讀一次狀態：若 bridge 已把這次存成「結果不明」，卡片馬上換成「還不確定有沒有送到」與核對按鈕。同一次重畫，回合進度從「正在等你回答」換成目前動作（例如「正在回覆」），上方「需要處理」與標題列也不再列它。 |
-| 卡片放在回合最後（助理回覆與進度之下） | Copilot App 的時間軸：問答之後才是助理接著做的事。 | 有卡片或問答紀錄的回合，這一格放在你的訊息之後、助理回覆之前；助理收到決定後的串流文字與進度就出現在紀錄下方。沒有卡片的回合版面完全不變。 |
+| 卡片放在回合最後（助理回覆與進度之下） | Copilot App 的時間軸：問答之後才是助理接著做的事。 | 有卡片或問答紀錄的回合，這一格放在你的訊息之後、助理回覆之前；助理收到決定後的串流文字與進度就出現在紀錄下方。沒有卡片的回合版面完全不變。**（Neal 2026-10-12 修訂）** 還在等你的批准／提問／Connect 卡改放在輸入框正上方（不在聊天捲動區內，不必捲動就看得到，太高時卡片區自己捲動）；回合那一格只留一行「卡片在輸入框上方」，按下後卡片換成紀錄留在回合裡。其他對話的卡片位置不變。卡片區內多張卡片依建立時間由舊到新排列，2 張以上頂端顯示「有 N 張待處理卡片」；總覽的「查看原回合」會捲到卡片區並聚焦該卡。 |
 | 選項相連沒有間距、自由回答框三行寬且送出鈕在下一行、批准三鈕同一樣式 | Copilot App／GitHub 深色主題的選單與按鈕 | 選項是有編號的整列（細邊框，滑過與鍵盤焦點用主題強調色），上下鍵可在選項間移動、Enter／空白鍵選取；自由回答框和「送出」併成一列（Enter 送出、Shift＋Enter 換行，輸入法選字時的 Enter 不送）；批准卡「允許這次」是主要按鈕、「以後允許這類」次要、「拒絕」紅色外框。顏色全用既有 `--cp-*` 變數，深色、淺色主題都適用。 |
 
 **重新整理或切換對話後紀錄還在：** 來源是 bridge 已保存的原紀錄（`composer.native_questions.commands`、`composer.native_hitl.commands`），
@@ -1309,6 +1364,8 @@ FA不自行實作credential injection；connection分類是原薄API的選項／
 
 ## 環境自動接續（Neal 2026-10-04確認，CODE/offline）
 
+> **已由 P06 取代（通知部分）：** 第 16 版 P06（`f56020a5`，2026-10-06）起，工作台不再顯示下方 ready 後的「已換到新版環境…」通知；API 仍在回條記 `files_migrated=false`／`files_omission_reason`，補回顯示列在 [ADR-0009 §8 待辦](../../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#8-使用者看到的通知)。
+
 Neal **10:22:31（台灣）**問「這兩個功能應該是FA應該要幫user處理的? 使用者不需要處理?」，
 於 **10:24:05** 回覆「對」。正常native畫面不再要求使用者核對環境或同意不搬檔；
 新bridge固定回`environment_policy=fa-environment-system-policy-20261004`，HTML依server契約啟動，
@@ -1378,6 +1435,8 @@ ready後通知原句：「已換到新版環境；這次沒有搬工作檔，舊
 
 <a id="no-files-ready-note"></a>
 ## 不搬檔 ready 的完成提示（CODE/offline）
+
+> **已由 P06 取代：** 第 16 版 P06（`f56020a5`，2026-10-06）起，工作台不再顯示這個 ready 完成提示；API 仍在回條記 `files_migrated=false`／`files_omission_reason`，補回顯示列在 [ADR-0009 §8 待辦](../../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#8-使用者看到的通知)。以下是當時設計的歷史紀錄。
 
 原控制POST收到ready後，仍要等尾端GET composer完成才記通知，所以畫面會繼續顯示檢查中。
 現在核對原Agent／thread／目標後，先記已確認的ready，立即顯示「這次沒有搬工作檔」；

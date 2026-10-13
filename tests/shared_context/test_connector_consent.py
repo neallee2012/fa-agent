@@ -12,14 +12,16 @@ from datetime import timedelta
 import httpx
 import pytest
 
+from shared_context.behavior_operations import _write
+from shared_context.behavior_store import ControlChanges, ControlRequest
 from shared_context.m2_copilot import ToolFailure
-from shared_context.native_hitl import validate_native_hitl_history
+from shared_context.native_hitl import _Intent, validate_native_hitl_history
 from shared_context.native_hitl_wire import (
-    ConnectorConsent, ConnectorConsentDecision, ConnectorConsentReadback, NativeHitlCall, NativeHitlEnd,
+    ConnectorConsent, ConnectorConsentCreate, ConnectorConsentDecision, ConnectorConsentReadback, NativeHitlCall, NativeHitlEnd,
     NativeHitlPendingQuery,
 )
 from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_hitl import error, hitl, inventory, post  # noqa: F401
+from test_native_hitl import A, TENANT, error, hitl, inventory, post  # noqa: F401
 from test_native_hitl_attention import attention  # noqa: F401
 from test_native_toolbox import REVOKED, Toolbox
 from test_native_toolbox_approval import ARGUMENTS, packet, permit, platform, setup  # noqa: F401
@@ -255,6 +257,7 @@ def test_after_a_decline_the_same_conversation_binds_the_stub_and_another_conver
         toolbox = Provider("tools/list")
         case = setup(hitl, tmp_path, "never", toolbox=toolbox, rid=rid)
         case.context.receipt = case.context.receipt.model_copy(update={"conversation_id": conversation})
+        case.gate.turn = case.gate.turn.model_copy(update={"conversation_id": conversation})
         binding = asyncio.create_task(case.bind())
         for _ in range(100):
             if binding.done() or page(hitl, case.gate.turn).json()["references"]:
@@ -359,3 +362,69 @@ def test_the_wire_keeps_one_step_and_no_link_for_a_revoked_connection():
                 {"consent_urls": ("http://insecure.test/x",)}, {"consent_urls": (FIRST,) * 5}, {"attempt": 2}):
         with pytest.raises(ValueError):
             ConnectorConsent(**{**base, **bad})
+
+
+def create_card(c, *, call_id, conversation="cid-one", toolbox="fa-connector-team-one-teams", request_id=None):
+    consent = ConnectorConsent(
+        call=NativeHitlCall(agent_id="native-a", conversation_id=conversation, request_id="rid-" + call_id,
+                            sdk_session_id="sdk-original", tool_call_id=call_id),
+        need="consent", connector_id="teams", toolbox_name=toolbox, server_label="teams_read",
+        step="tools/list", consent_urls=(FIRST,))
+    return post(c, "/consents", ConnectorConsentCreate(
+        request_id=request_id or "create-" + call_id, consent=consent, consent_digest=consent.sha256), c.agent)
+
+
+def item_of(created):
+    result = created.json()["result"]
+    return {"item_id": result["consent_id"], "consent": {"consent_digest": result["consent_digest"]}}
+
+
+def test_a_decline_is_stored_with_the_conversation_and_refuses_a_new_card_for_that_toolbox(hitl):
+    first = create_card(hitl, call_id="connect-1")
+    assert first.status_code == 200, first.text
+    assert click(hitl, item_of(first), "decline").status_code == 200
+    rows = len(hitl.table.submissions)
+    error(create_card(hitl, call_id="connect-2"), 409, "NATIVE_HITL_HUMAN_DENIED")
+    assert len(hitl.table.submissions) == rows
+    # The same Agent and toolbox in another conversation, or another toolbox in this one, still asks.
+    assert create_card(hitl, call_id="connect-3", conversation="cid-two").status_code == 200
+    assert create_card(hitl, call_id="connect-4", toolbox="fa-connector-team-one-other").status_code == 200
+
+
+def test_a_second_decline_in_the_conversation_keeps_the_first_marker(hitl):
+    first = create_card(hitl, call_id="connect-1")
+    other = create_card(hitl, call_id="connect-2")
+    assert click(hitl, item_of(first), "decline").status_code == 200
+    assert click(hitl, item_of(other), "decline", request_id="owner-click-two").status_code == 200
+    marker = [row for row in hitl.table.backing.rows.values()
+              if "native_hitl_consent_declined" in json.dumps(row, default=str)]
+    assert len(marker) == 1 and item_of(first)["item_id"] in json.dumps(marker[0], default=str)
+
+
+def test_a_resume_click_writes_no_decline_marker(hitl):
+    first = create_card(hitl, call_id="connect-1")
+    assert click(hitl, item_of(first), "resume").status_code == 200
+    assert "native_hitl_consent_declined" not in json.dumps(list(hitl.table.backing.rows.values()), default=str)
+    assert create_card(hitl, call_id="connect-2").status_code == 200
+
+
+def test_a_card_saved_with_the_old_read_set_still_reconciles(hitl):
+    # 現行 submit 只會寫出含 consent-declined 的新 read set；要重現 #807 之前存下、沒有這個 key 的 intent，
+    # 只能直接寫入 _Intent。這是為了證明舊 intent 仍走 legacy request reconcile。
+    command = ConnectorConsentCreate(
+        request_id="create-old", consent=(consent := ConnectorConsent(
+            call=NativeHitlCall(agent_id="native-a", conversation_id="cid-one", request_id="rid-old",
+                                sdk_session_id="sdk-original", tool_call_id="connect-old"),
+            need="consent", connector_id="teams", toolbox_name="fa-connector-team-one-teams",
+            server_label="teams_read", step="tools/list", consent_urls=(FIRST,))), consent_digest=consent.sha256)
+    c = hitl
+    old, new = c.service._request(c.agent, command, legacy=True), c.service._request(c.agent, command)
+    assert old != new
+    key = c.service._intent_key(c.agent, command)
+    intent = _Intent(tenant_id=TENANT, team_id=A.team, intent_id=key, principal_oid=A.oid, principal_kind="agent",
+                     command=command, created_at=c.now, expires_at=c.now + timedelta(seconds=600), request=old)
+    c.store.transact(ControlRequest(request_id=key, request_digest=old.request_digest, read_set=old.read_set),
+                     lambda _: ControlChanges(writes=(_write(key, intent, "create"),), result={"intent_id": key}))
+    assert c.service._original(c.agent, command, c.store.read_record(key)).request == old
+    done = c.store.transact(old, lambda _: ControlChanges(writes=(), result={"status": "pending"}))
+    assert c.service.reconcile(c.agent, command) == done

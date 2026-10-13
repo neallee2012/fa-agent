@@ -1,5 +1,6 @@
 """N2 owner-checked forwarding. Native records stay in the Agent, never in an API index."""
 
+import contextlib
 import json
 import hashlib
 import logging
@@ -74,7 +75,8 @@ def configured_native_turns():
 
 
 class _BeforeAdmission(Problem):
-    """This submit reached no native admission; the same RID and body may be sent again."""
+    """This command was sent to no session (a submit reached no native admission); the same RID and body may be sent
+    again."""
 
     def __init__(self, cause, request_id, *, server_following=False):
         super().__init__(cause.status, cause.body["error"]["code"], str(cause))
@@ -190,7 +192,8 @@ class NativeTurnGateway:
             toolboxes = _prewarm_toolboxes(control.runtime)
             # The kept reader or one platform read: it creates and follows nothing, and unlike sessions.current() it
             # takes no session lock, so a send started meanwhile is never held behind the platform waking the compute.
-            client = sessions.reader(base)
+            # Waking compute is the point, so the selector is read now: an old version's session is never woken.
+            client = sessions.reader(base, checked_since=monotonic())
             value, _ = self._invoke(client, NativePrewarm(toolboxes=toolboxes))
         except Problem as error:
             if sessions.binding_moved(error):
@@ -223,24 +226,48 @@ class NativeTurnGateway:
             raise Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "the original Foundry transport is unavailable")
         client = clients[0].for_target(target)
         if prepared:
+            # Image upload and append take this path (cancel and delivery go through ``_turn_context``): they deliver
+            # to the Agent's current session, so the selector is read in-request.
             from .behavior_native_sessions import native_sessions
-            client = native_sessions(self.composition).current(client)
+            client = native_sessions(self.composition).current(client, checked_since=monotonic())
         return control, client
+
+    def _turn_context(self, principal, action, request_id):
+        """A cancel or delivery acknowledgement goes to the session that holds its turn.
+
+        That is the Agent's current session (selector read in this request), or, when ``current`` refuses because the
+        selected version has no session yet or pending work keeps the Agent on its earlier session, the session the
+        Agent record still names while platform metadata says it is active (``NativeSessions.turn_session``).
+        Otherwise nothing is sent: the refusal carries ``not_dispatched`` and the same command may be sent again."""
+        from .behavior_native_sessions import native_sessions
+        control, client = self._context(principal, action, prepared=False)
+        sessions = native_sessions(self.composition)
+        try:
+            return control, sessions.current(client, checked_since=monotonic())
+        except Problem as error:
+            if error.body["error"]["code"] not in {"NATIVE_SESSION_CHANGED", "AGENT_VERSION_FOLLOWING"}:
+                raise
+            holder = sessions.turn_session(client)
+            if holder is None:
+                raise _BeforeAdmission(error, request_id) from None
+            return control, holder
 
     def _read_context(self, principal):
         from .behavior_native_sessions import native_sessions
         control, client = self._context(principal, "read", prepared=False)
-        return control, native_sessions(self.composition).reader(client)
+        return control, native_sessions(self.composition).reader(client, stale_read=True)
 
     def _reading(self, principal, operation):
-        """One idempotent read on the cached reader; when the binding moved, the platform is read once more."""
+        """One idempotent read on the cached reader; when the binding moved, the platform is read once more.
+
+        A selector that cannot be read now keeps a recently confirmed reader (``SELECTOR_STALE_READ_SECONDS``)."""
         from .behavior_native_sessions import native_sessions
         sessions = native_sessions(self.composition)
         retry = sessions.reader_cached()
         control, client = self._context(principal, "read", prepared=False)
         while True:
             try:
-                return operation(control, sessions.reader(client))
+                return operation(control, sessions.reader(client, stale_read=True))
             except Problem as error:
                 if not (sessions.moved(error) and retry):
                     raise
@@ -463,7 +490,10 @@ class NativeTurnGateway:
         if value.state != "ready" or manifest is None:
             return
         try:
-            _, client = self._read_context(principal)
+            from .behavior_native_sessions import native_sessions
+            # A handoff delivers work: a selector read made now, never the read window or a stale confirmation.
+            _, client = self._context(principal, "read", prepared=False)
+            client = native_sessions(self.composition).reader(client, checked_since=monotonic())
             if (client.target.session_id, client.target.agent_version) != (
                     value.hosted_session_id, value.hosted_agent_version):
                 raise Problem(409, "NATIVE_SESSION_CHANGED", "the ready environment is no longer current")
@@ -574,6 +604,8 @@ class NativeTurnGateway:
         command = InstructionSubmit.model_validate_json(command.model_dump_json())
         rid = command.request_id
         timed = timing_id(rid)
+        # The selected version comes from a selector read made in this request (once, shared with the prefetch).
+        started = monotonic()
         try:
             with phase_timing("api_submit_context", job_id=timed):
                 control, reader = self._context(principal, "submit", prepared=False)
@@ -588,11 +620,11 @@ class NativeTurnGateway:
             def defer(send):
                 # A refused after-reply POST forgets the cached reader as a refused synchronous one did.
                 queue(partial(send, refused=sessions.moved))
-        prefetch = (self._prefetch(control, sessions, reader, principal, command)
+        prefetch = (self._prefetch(control, sessions, reader, principal, command, checked_since=started)
                     if original is None and command.conversation_id is not None else None)
         try:
             with phase_timing("api_submit_session", job_id=timed):
-                client = sessions.current(reader)
+                client = sessions.current(reader, checked_since=started)
         except Problem as error:
             if error.body["error"]["code"] == "NATIVE_SESSION_CHANGED":
                 # A submit never bootstraps: it follows only an Agent prepared earlier, seen either as prepared state
@@ -602,7 +634,14 @@ class NativeTurnGateway:
                     raise
                 try:
                     prepared = sessions.following_candidate is not None or self._prepared_before(sessions, reader)
-                except Problem:
+                except Problem as unconfirmed:
+                    code = unconfirmed.body["error"]["code"]
+                    if code == "AGENT_VERSION_FOLLOWING" or (
+                            unconfirmed.status == 503 and code == "NATIVE_ENVIRONMENT_UNAVAILABLE"):
+                        # Only another version's session exists, or the session listing could not be read (or the
+                        # selected session is past its bounded page): nothing is invoked or followed from here, and
+                        # the same RID and body are sent again later. It is not "never prepared".
+                        raise _BeforeAdmission(unconfirmed, rid) from None
                     prepared = False
                 raise (self._follow_before_admission(principal, reader, sessions, error, rid)
                        if prepared else _BeforeAdmission(error, rid)) from None
@@ -657,17 +696,26 @@ class NativeTurnGateway:
         return self._retained(control, client, command, original, state_profile, response=response, defer=defer)
 
     def _prepared_before(self, sessions, reader):
-        """An existing earlier session (version reader, else the legacy one) whose Agent state names a preparation.
+        """The selected version's existing session (version reader, else the legacy one) names a preparation.
 
         Platform metadata finds it and one read-only state read confirms it, as /prepare does; nothing is created,
-        so a never-prepared Agent keeps its original refusal even when a deploy-time follow created a session."""
-        from .behavior_native_sessions import _latest_version_reader, _read_platform_session
+        so a never-prepared Agent keeps its original refusal even when a deploy-time follow created a session.
+        A session found only on another version is never invoked: 503 ``AGENT_VERSION_FOLLOWING``."""
+        from .behavior_native_sessions import (
+            _latest_version_reader, _read_platform_session, _require_selected_version,
+        )
 
         client_id = self.composition.config.identity.managed_identity_client_id
-        target = _latest_version_reader(reader, client_id)
+        selected = sessions.desired_version or sessions.selected_version(reader)
+        target = _latest_version_reader(reader, client_id, selected)
+        if target is None or target.agent_version != selected:
+            legacy = _read_platform_session(sessions.candidate(reader))
+            if legacy is not None and (target is None or legacy.agent_version == selected):
+                target = legacy
         if target is None:
-            target = _read_platform_session(sessions.candidate(reader))
-        return target is not None and sessions._state(reader.for_target(target)).preparation is not None
+            return False
+        _require_selected_version(target, selected)
+        return sessions._state(reader.for_target(target)).preparation is not None
 
     def _follow_before_admission(self, principal, reader, sessions, refusal, request_id, *, refused_session_id=None):
         """The submit itself moves the Agent to its current version (one bounded ``advance``, like the deploy-time
@@ -705,8 +753,12 @@ class NativeTurnGateway:
                 return None, None
             raise
 
-    def _prefetch(self, control, sessions, reader, principal, command):
+    def _prefetch(self, control, sessions, reader, principal, command, *, checked_since):
         """Start the follow-up's conversation read and capture while ``sessions.current`` confirms the session."""
+        # The submit's selector read, taken without the session lock so the conversation read starts early;
+        # ``sessions.current`` reuses it and raises any refusal.
+        with contextlib.suppress(Problem):
+            sessions.reader(reader, checked_since=checked_since)
         kept_reader = sessions.cached_reader(reader)
         conversation = None
         if kept_reader is not None:
@@ -795,7 +847,8 @@ class NativeTurnGateway:
             raise Problem(422, "NATIVE_REQUEST_INVALID", "one original typed native command is required") from None
         if not isinstance(command, (NativeCancel, NativeDelivered)):
             raise Problem(422, "NATIVE_REQUEST_INVALID", "only cancellation or delivery acknowledgement is supported")
-        control, client = self._context(principal, "acknowledge" if isinstance(command, NativeDelivered) else "read")
+        control, client = self._turn_context(
+            principal, "acknowledge" if isinstance(command, NativeDelivered) else "read", command.request_id)
         self._legacy(control, command.conversation_id)
         return self._accounted(control, self._invoke(client, command))
 

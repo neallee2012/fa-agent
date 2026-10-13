@@ -545,10 +545,10 @@ def test_a_pending_sender_environment_does_not_block_its_recorded_background_del
         "session_id": "OFFLINE-new-pending-reader", "agent_version": "99"}))
     case.remotes[0].target = reader.target
 
-    def pending(scope, *, prepared=True):
+    def pending(scope, *, prepared=True, **kwargs):
         if scope.target.agent_id == sender.agent_id and prepared:
             raise Problem(409, "NATIVE_SESSION_CHANGED", "OFFLINE new sender environment is waiting for this task")
-        return client(scope, prepared=prepared)
+        return client(scope, prepared=prepared, **kwargs)
 
     monkeypatch.setattr(gateway, "_client", pending)
     monkeypatch.setattr(native_sessions(case.base.a), "reader", lambda _client: reader)
@@ -814,3 +814,45 @@ def test_a_reply_from_another_conversation_is_refused_and_the_real_one_returns_t
     returned = case.remotes[0].records[wake.message_id]
     assert returned.command.conversation_id == case.sender.conversation_id
     assert returned.source.kind == "agent_result" and returned.source.in_reply_to == accepted.message_id
+
+
+def test_a_relay_send_reads_the_recipient_selector_and_never_invokes_its_kept_old_session(relay_case, monkeypatch):
+    from shared_context.native_agent_api import NativeAgentRelayGateway
+
+    case = relay_case
+    gateway = NativeAgentRelayGateway(case.base.a, enabled=True, repository=case.repository)
+    assert gateway.send(case.principal, send_command(case)).status == "accepted"
+    assert native_sessions(case.base.b).reader_cached()
+    # Another process moved the recipient's selector to 99 just now; nobody created 99's session yet.
+    selected, read = behavior_agent_versions.current_hosted_version, behavior_native_sessions._read_platform_session
+    monkeypatch.setattr(behavior_agent_versions, "current_hosted_version", lambda runtime, target, **kwargs: (
+        "99" if target.agent_id == case.base.b.agent_id else selected(runtime, target, **kwargs)))
+    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", lambda client: (
+        None if client.target.agent_version == "99" else read(client)))
+    before = len(case.remotes[1].calls)
+    with pytest.raises(Problem) as refused:
+        gateway.send(case.principal, send_command(case))
+    assert (refused.value.status, refused.value.body["error"]["code"]) == (503, "AGENT_VERSION_FOLLOWING")
+    assert len(case.remotes[1].calls) == before
+
+
+def test_a_continuation_reads_the_sender_selector_and_never_invokes_its_kept_old_session(relay_case, monkeypatch):
+    from shared_context.behavior_native_agent_wire import NativeRelayResult
+    from shared_context.native_agent_api import NativeAgentRelayGateway
+
+    case = relay_case
+    gateway = NativeAgentRelayGateway(case.base.a, enabled=True, repository=case.repository)
+    assert gateway.send(case.principal, send_command(case)).status == "accepted"
+    assert native_sessions(case.base.a).reader_cached()
+    # Another process moved the sender's selector to 99 just now; nobody created 99's session yet.
+    selected, read = behavior_agent_versions.current_hosted_version, behavior_native_sessions._read_platform_session
+    monkeypatch.setattr(behavior_agent_versions, "current_hosted_version", lambda runtime, target, **kwargs: (
+        "99" if target.agent_id == case.sender.agent_id else selected(runtime, target, **kwargs)))
+    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", lambda client: (
+        None if client.target.agent_version == "99" else read(client)))
+    before = len(case.remotes[0].calls)
+    with pytest.raises(Problem) as refused:
+        gateway.continue_original(case.principal, NativeRelayResult(
+            conversation_id=case.sender.conversation_id, request_id=case.sender.request_id))
+    assert (refused.value.status, refused.value.body["error"]["code"]) == (409, "NATIVE_SESSION_CHANGED")
+    assert len(case.remotes[0].calls) == before

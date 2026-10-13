@@ -168,7 +168,7 @@ AgentNarrowing             # 既有 /select，意思改成「這個 Agent 不用
 
 connection 名稱固定，因為同意範圍是「per tool (connection) name per Foundry project」（https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/mcp-authentication ），換名就要 owner 重新同意。金鑰類 Team MCP 照舊每次換名。
 
-FA 不存 token，也不存「已連線」旗標，因為只有 Foundry 知道 token 還在不在，而 toolbox 每次呼叫都會回答。要留的只有兩份既有紀錄，一是連線卡，放在 HITL pending 紀錄裡，600 秒後過期；二是 Agent 收窄清單。設定頁顯示「已加入」，和 Grok 的 Added 一樣。consent URL 只放在連線卡上，不給模型，不寫 log。如果 prompt injection 讓模型把連結送出去，別人可以用自己的帳號完成同意，之後 Agent 的寫入就進了別人的帳號（推論）。
+FA 不存 token，也不存「已連線」旗標，因為只有 Foundry 知道 token 還在不在，而 toolbox 每次呼叫都會回答。要留的只有三份既有紀錄，一是連線卡，放在 HITL pending 紀錄裡，600 秒後過期；二是 Agent 收窄清單；三是每個對話的「先不用」紀錄。設定頁顯示「已加入」，和 Grok 的 Added 一樣。consent URL 只放在連線卡上，不給模型，不寫 log。如果 prompt injection 讓模型把連結送出去，別人可以用自己的帳號完成同意，之後 Agent 的寫入就進了別人的帳號（推論）。
 
 ## 流程
 

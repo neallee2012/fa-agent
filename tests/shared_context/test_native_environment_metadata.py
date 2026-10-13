@@ -190,24 +190,16 @@ def test_a_cached_old_binding_cannot_receive_a_new_request_after_publication_cha
     monkeypatch.setattr("shared_context.behavior_agent_versions.current_hosted_version", lambda *_: "42")
     advances = []
 
-    def advance(_sessions, client, command, *, before_send):
-        # P06: the prepared Agent's old reader exists, so the server follows instead of leaving the user stuck.
-        from shared_context.behavior_native_turn_wire import NativeEnvironmentView
-        advances.append(command)
-        return NativeEnvironmentView(
-            agent_id=client.target.agent_id, request_id=command.request_id,
-            previous_hosted_session_id=old.session_id, previous_agent_version="41",
-            hosted_session_id="OFFLINE-version-42-session", hosted_agent_version="42",
-            state="pending", reason="source_active")
-
-    monkeypatch.setattr(NativeSessions, "advance", advance)
+    monkeypatch.setattr(NativeSessions, "advance", lambda *args, **_kwargs: advances.append(args))
     response = submit(case, rid="new-after-publication")
-    assert response.status_code == 409, response.text
-    assert response.json()["error"]["code"] == "NATIVE_SESSION_CHANGED"
-    assert response.json()["error"]["server_following"] is True
-    assert [command.expected_agent_version for command in advances] == ["42"]
-    # One read-only state read on the existing 41 reader confirms the preparation; no work reaches the old session.
-    assert all(command.operation == "session_read" for _, command in case.remote.calls)
+    error = response.json()["error"]
+    # Only the 41 session exists: it is never invoked (invoking it lets the platform bring it back), and the
+    # follow or sync that creates 42's session is not started from a submit. The same RID waits, not dispatched.
+    assert (response.status_code, error["code"]) == (503, "AGENT_VERSION_FOLLOWING"), response.text
+    assert error["not_dispatched"] is True and error["request_id"] == "new-after-publication"
+    assert "server_following" not in error
+    assert advances == []
+    assert case.remote.calls == []
     assert not case.remote.records
 
 

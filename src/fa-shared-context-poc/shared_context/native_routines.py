@@ -3,6 +3,7 @@
 import json
 import logging
 from datetime import datetime
+from time import monotonic
 from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
@@ -517,7 +518,8 @@ class NativeRoutineService:
         sessions = native_sessions(composition)
         environment_command = None
         try:
-            client = sessions.current(raw_client)
+            # A routine dispatches work, so (like an owner submit) the selector is read in this request.
+            client = sessions.current(raw_client, checked_since=monotonic())
         except Problem as error:
             if error.body["error"]["code"] not in {"NATIVE_SESSION_CHANGED", "AGENT_VERSION_FOLLOWING"}:
                 raise
@@ -581,7 +583,7 @@ class NativeRoutineService:
                 raise Problem(error.status, "NATIVE_ROUTINE_UNCONFIRMED",
                               "the original environment is not ready; its routine was not resubmitted",
                               request_id=rid, environment_code=error.body["error"]["code"]) from None
-            client = sessions.current(raw_client)
+            client = sessions.current(raw_client, checked_since=monotonic())
             conversation, _ = NativeTurnGateway._invoke(
                 client, NativeConversationRead(conversation_id=definition.conversation_id))
             NativeTurnGateway._same_session(client, conversation)

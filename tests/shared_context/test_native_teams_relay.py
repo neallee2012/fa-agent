@@ -249,6 +249,26 @@ def test_a_refused_queue_answers_busy_and_is_not_resent(relay):
     assert len(submits(relay.env)) == 2 and len(relay.records.data) == 1
 
 
+def test_a_message_while_the_selected_version_has_no_session_waits_and_is_sent_with_the_same_rid(relay, monkeypatch):
+    env = relay.env
+    old = env.case.remote.target
+    version = ["42"]  # Another process moved the selector; nobody created the 42 session yet.
+    monkeypatch.setattr("shared_context.behavior_agent_versions.current_hosted_version",
+                        lambda runtime, target, **_: version[0])
+    monkeypatch.setattr("shared_context.behavior_native_sessions._latest_version_reader",
+                        lambda client, client_id, selected=None: old)
+    before = len(env.calls)
+    waiting = relay.post()
+    # The receipt read and the submit both invoke nothing; the relay's next poll sends the same RID again.
+    assert waiting.status_code == 200, waiting.text
+    assert waiting.json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。"}
+    assert [call for call in env.calls[before:] if call.url.path.endswith("/invocations")] == []
+    assert rid("act-1") not in env.case.remote.records
+    version[0] = old.agent_version
+    assert relay.post().json()["state"] == "running"
+    assert len(submits(env)) == 1 and list(env.case.remote.records) == [rid("act-1")]
+
+
 WORKBENCH = "這一步需要你批准，請到工作台處理，批准後結果會在工作台。"
 NO_CARD = "這個代碼沒有對應的待批准項目（可能已處理或過期）。"
 

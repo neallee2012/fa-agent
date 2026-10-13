@@ -59,7 +59,11 @@
 2. API `POST /work-policy/v1/native-turns/prewarm`（body `{}`）：
    - 入口檢查和送出相同（`_context(principal, "submit")`：Team 主人、有送出權、native 已啟用）。
    - 同一位 Agent 在同一個 API 程序內 60 秒最多送一次（`PREWARM_INTERVAL_SECONDS`），擋住每打一個字就送一次的 client。
-   - 用 `NativeSessions.reader()` 找這位 Agent 目前版本已存在的 session（沿用 reader 快取，或一次平台讀取）：不建立、不 follow。
+   - 用 `NativeSessions.reader(checked_since=<這次請求開始>)` 找這位 Agent 目前版本已存在的 session：先讀一次 endpoint selector，
+     快取的 reader 版本和它相同才沿用，不同就丟掉快取、讀選定版本的 session；不建立、不 follow，也絕不叫醒舊版本的 session
+     （叫舊 SID 會讓平台在那一刻把它重建）。送出、寫入、排程 routine 與 Agent 間交辦也一樣在請求內讀 selector
+     （見下方「送出與寫入」）；只有讀取與輪詢沿用最多 `SELECTOR_CHECK_SECONDS`（10 秒）內開始的 selector 讀取
+     （見下方「何時重查」）。
      它也**不拿 `NativeSessions.lock`**（`current()` 會拿），所以平台還在開 VM 時，同時送出的訊息不會排在它後面。
    - toolbox 清單 = `runtime_grants(runtime)` 裡所有 `mcp-toolbox` grant 的（名稱, 版本）去重。capture 一定是
      「選取 ∩ head ∩ 這組 grant」的子集，所以不必讀 template、selection 或對話；多列一個只是一次唯讀列表。
@@ -305,26 +309,83 @@ Neal 2026-10-05：「請嚴格依照hosted agent官方和grok bot的方式，詳
 [configure-agent](https://learn.microsoft.com/azure/foundry/agents/how-to/configure-agent)）；charter-agent 也是保存
 `agent_session_id` 後直接帶著呼叫（[研究文件步驟 5A](../../docs/charter-agent-desktop-client-research.md)）。
 所以 `NativeSessions.reader()` 現在把「Agent → 選定版本＋session」記在 API 程序內，讀取直接呼叫該 session。
+但 selector 會被另一個程序（agent-versions sync、follow、deploy）移到新版本，所以用記住的 session 前一定先比對 selector
+（2026-10-12 修正，見下方「不呼叫舊 SID」）。
 
-- **何時重查。** ① 本程序做環境操作（prepare／follow／advance／retarget／不搬檔／自動接續觀察）時，開始與結束各清一次
+- **不呼叫舊 SID。** API 不呼叫版本不等於 selector 目前選定版本的 session。呼叫舊 SID 時，平台會在 Hosted 程式執行**之前**
+  就用另一個版本把它重建（dev 2026-10-12 實測），所以 Hosted 的 409 擋不住這個傷害，不能當成退路。
+  reader 快取、送出前找已 prepare 的 session（`_prepared_before`）、`/prepare` 都只呼叫選定版本的 session；
+  平台 session 列表與 metadata 只用來定位，不叫醒任何 session。唯一的例外是取消與送達回條：它們送到持有那個回合的 session，
+  而且只在 metadata 確認它 `active` 時（見下方「送出與寫入」）。「active 的 session 正在跑，呼叫它不會讓平台重建」是
+  總協調 2026-10-12 的決定，dev 觀察到的重建都是 idle／已回收的舊 SID；呼叫 active 舊 SID 的行為**未在雲端驗證**。
+  這條規則現已寫進
+  [ADR-0009 §10](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#10-不叫醒已回收-session-的規則立即適用phase-0)：
+  不叫醒已回收的 session，只有 `active` 的 SID 可以呼叫。換環境檢查與搬移舊來源也一樣，見
+  [換環境不叫醒已回收的來源](#follow-no-wake)。
+- **何時重查。** ⓪ **selector 檢查窗口**：每次用 reader 前先拿 selector 目前選定的版本。讀取與輪詢沿用
+  `SELECTOR_CHECK_SECONDS`（10 秒）內**開始**的那次 selector 讀取（從讀取開始前計時，窗口不含讀取本身的時間；
+  比較用嚴格的「之後」），超過就重讀一次（`get_agent`＋`get_version`）。版本相同才用記住的 session；
+  不同就丟掉它（記 `NATIVE_READER_VERSION_MOVED`），改讀選定版本的 session。
+  ① 本程序做環境操作（prepare／follow／advance／retarget／不搬檔／自動接續觀察）時，開始與結束各清一次
   （操作期間的讀取改走平台選定的新 session，不會喚醒正要停止的舊 session）；
   ② Hosted 或平台回 `NATIVE_SESSION_CHANGED`、`AGENT_VERSION_FOLLOWING`、`FOUNDRY_NATIVE_BINDING_MISMATCH`
   或平台 404：重查平台一次並把**同一個讀取**再做一次（讀取不改資料，重做不會重送）；
+  selector 暫時讀不到（`SelectorUnreadable`，見下）不算綁定移動，不清快取；
   ③ 其他 `FOUNDRY_*` 失敗：原錯誤照回，下一個請求重查；④ 同一個綁定超過 1 天沒用就重查
   （平台 30 天無活動才刪 session，所以不會呼叫到已過期的 ID）。
-- **送出。** 仍沿原 `current()`：在記住的 session 做一次 `session_read`，Agent 紀錄指向別的 session 就重查平台一次。
-  Hosted 在接單前拒絕（換版中、session 不符）時只清掉快取、不在這裡重送；工作台照舊用**同一個 RID** 重送。
-  UNKNOWN 不重送的規則不變。排程 routine 與 Agent 間交辦的收件端同樣走 `current()`：selector 換版後、follow 前，
-  有快取時照常送到 Agent 紀錄上的 session，要等快取清空或 Hosted 拒絕才走原本的自動跟版／「收件人換版中」分支。
-- **Hosted 是最後一道防線。** 紀錄讀取（`read`、`turn_status`、`conversation`、`history`、`result`、`progress`、`images`…）
+- **selector 暫時讀不到。** `get_agent`／`get_version` 逾時、無狀態碼、408、429 或 5xx 時，`HostedVersions.current`
+  丟 `SelectorUnreadable`（回應仍是 503 `AGENT_VERSION_FOLLOWING`，與「選定版本這個 API build 不能服務」分開）。
+  只有**讀取與輪詢**（回條、`status`、對話、歷史、Responses 即時串流的來源…）會沿用 selector 在 `SELECTOR_STALE_READ_SECONDS`（120 秒）內確認過的
+  reader 繼續回答，並保留快取；超過 120 秒回 503 `AGENT_VERSION_FOLLOWING`，快取仍保留，selector 恢復後照常。
+  送出、寫入、排程 routine、Agent 間交辦與 prewarm 不沿用，一定要這次讀到 selector。
+- **送出與寫入。** 每次送出都在請求內讀一次 selector（`current(checked_since=<請求開始>)`；後續訊息的對話預讀與
+  `current()` 共用這一次），版本相同才在記住的 session 做一次 `session_read`，Agent 紀錄指向別的 session 就重查平台一次。
+  群組開場與 Teams relay 走同一個送出（Teams relay 的回條讀取遇到選定版本沒有 session 的 409 `NATIVE_SESSION_CHANGED`
+  時，照「還沒有這則」處理、改走同一個 RID 的送出，由送出回 503 `not_dispatched`，relay 下一次輪詢再送）。
+  其他把工作或寫入送到 session 的路徑也都在請求內讀 selector：owner 的圖片上傳與追加（`_context(prepared=True)`）、
+  取消與送達回條（`_turn_context`）、排程 routine 觸發（`NativeRoutineService.trigger` 的兩次 `current()`）、
+  Agent 間交辦送到收件端（`send` 與回傳結果）、Agent 接續原工作（`continue`），以及換版完成後的接續通知
+  （`NativeContinuationReady`：環境 API、交辦收件端換版與 agent-versions sync 三處）。選定版本沒有 session 時：
+  - 圖片上傳、追加與接續不呼叫任何 session，回 409 `NATIVE_SESSION_CHANGED`（追加是終態：原回合在舊 session 上）；
+    交辦收件回 503 `AGENT_VERSION_FOLLOWING`。
+  - **取消與送達回條**送到持有那個回合的 session：`current()` 拒絕（選定版本還沒有 session，或待處理的工作擋住指標切換）時，
+    改用 Agent 紀錄最後指向的 session，但先用平台 metadata（`get_session`，不叫醒 session）確認它是 `active` 且版本相同
+    才呼叫；在跑的回合所在的 session 是 active。不是 active（idle、已回收）、版本不同或不知道是哪一個時，不呼叫任何 session，
+    照原錯誤碼回（例如 409 `NATIVE_SESSION_CHANGED`）並帶 `not_dispatched: true` 與原 `request_id`；同一個指令稍後可原樣再送。
+    metadata 讀取被拒（401／403，例如 `NATIVE_BOOTSTRAP_SOURCE_UNAVAILABLE`）原樣回報，不帶 `not_dispatched`。
+    metadata 讀取與呼叫之間 session 仍可能轉成 idle，這時呼叫可能叫醒它：此風險接受，只限使用者明確按下的停止或送達回條，
+    對象片刻前還是 active。Responses 的取消（`/responses-turns/cancel`）用同一條路徑。
+  - 排程 routine **不呼叫舊 SID**，但會建立選定版本的 session：`current()` 拒絕時走 `_destination`（沒有 session 就
+    `create_session`），在新 session 讀對話，再用 `idle_only` 的 `advance` 換環境；環境沒準備好就回
+    `environment_pending`，失敗回 `NATIVE_ROUTINE_UNCONFIRMED`。routine 時鐘把拒絕記成 `FA_NATIVE_ROUTINE_CLOCK_REFUSED`，
+    下一個 tick 的 `due()` 再給出同一個固定 RID（由 routine 與排定時間推導）。
+  Hosted 在接單前拒絕（換版中、session 不符）時只清掉快取、不在這裡重送；工作台照舊用
+  **同一個 RID** 重送。UNKNOWN 不重送的規則不變。
+- **503 `AGENT_VERSION_FOLLOWING` 的情形。** ⓐ 選定版本還沒有 session、只有其他版本的 session：送出回 503 並帶
+  `not_dispatched: true`（同一個 RID 稍後重送；不從送出啟動 follow），`/prepare` 回同樣的 503；由 follow／
+  agent-versions sync 或 ADR-0003 的漂移替換建立選定版本的 session。完全沒有 session（從未 prepare）時照舊回 409
+  `NATIVE_SESSION_CHANGED`。session 列表讀不到，或列到 100 筆的界（一頁，任何狀態、任何身分的 session 都算）還沒看到
+  選定版本時，送出回 503 `NATIVE_ENVIRONMENT_UNAVAILABLE` 並帶 `not_dispatched: true`，不當成「從未 prepare」。ⓑ 送出、寫入、routine 或交辦時 selector 讀不到：503（送出另帶 `not_dispatched: true`）。ⓒ 讀取或輪詢時 selector 讀不到且超過
+  120 秒沒確認過。ⓓ 原有的：selector 指向這個 API build 不相容或還沒 active 的版本、Agent 正在換環境。
+- **窗口內的殘餘。** 讀取與輪詢在 10 秒窗口內，仍可能打到另一個程序剛移走版本的舊 SID 一次；送出、寫入、routine、
+  交辦與 prewarm 不會。
+- **要靠外部 follow 才會恢復。** 送出不再自己啟動 follow；選定版本的 session 由 follow、agent-versions sync、
+  ADR-0003 的漂移替換，或到期的排程 routine（上面的 `idle_only` 路徑）建立。若部署用 `--defer-follow` 卻沒有接著 follow，
+  或 follow 在選定版本的 session 建好前失敗，這位 Agent 的送出會一直回 503 `AGENT_VERSION_FOLLOWING`（`not_dispatched: true`），
+  圖片上傳、追加與接續回 409；在跑的回合仍可取消（它的 session 是 active），其他取消與送達回條回帶 `not_dispatched` 的拒絕；
+  直到有人重跑 follow。
+- **Hosted 是紀錄層的最後一道防線。** 紀錄讀取（`read`、`turn_status`、`conversation`、`history`、`result`、`progress`、`images`…）
   會先讀一次 Agent 紀錄（VM 內的 State store），若有**更新版本**的環境已接手這個 Agent，回 409
   `NATIVE_SESSION_CHANGED`、不讀任何紀錄。`session_read` 不擋（API 用它找目前環境）；
   `x-client-fa-expected-version` 版本前置條件照舊。只認版本號較大的接手者，bootstrap 前的舊 session 不受影響。
+  這道防線只管紀錄：它在 VM 內執行，舊 SID 被呼叫時平台已先重建 session，所以上面的「不呼叫舊 SID」仍由 API 負責。
 - **沒有改的。** 環境畫面（`GET /environment`）與所有換版操作仍每次讀 selector；版本解析器本身不快取。
 
 **量測（本機離線替身計呼叫次數；暫時測試未提交）。** main 每次讀取與每次送出都是 Foundry 控制面 3 次
 （`get_agent`、`get_version`、`get_session`）；本分支命中快取後 0 次，Hosted 呼叫次數不變（讀取 1、送出 2）。
 每個 API 程序的第一次讀取仍是 3 次。Hosted 端每次紀錄讀取多一次 State store 讀取。
+2026-10-12 修正後：讀取每位 Agent 每 10 秒最多多一次 selector 讀取（2 次控制面）；每次送出、寫入、routine 觸發與交辦
+多 2 次控制面（selector），session 本身仍不重讀。
 
 **部署注意。**
 - stage：先發布版本（`--defer-follow`）→ API 換新 revision（新程序、快取是空的）→ follow，新程序直接讀到新版本。
@@ -765,6 +826,49 @@ SDK-first：只修原 `NativeHitlRuntime.invoke/_observe_failure` 與
 - 模型／HTTP／StateStore I/O 都是具名離線替身，原 writer／讀回／JWT／HITL／guard 為真接點。
   沒有 SDK runtime 程序、真模型、stage GET、部署或規則／IAM／release 設定修改。
   原 stage 現象只沿總協調提供的觀察，不宣稱此處重跑過 live。
+
+<a id="follow-no-wake"></a>
+## 換環境不叫醒已回收的來源（ADR-0009 §10 phase 0，CODE/offline，未部署）
+
+dev 2026-10-12：呼叫 idle（compute 已回收）的舊 session，平台會在 FA 程式執行前把它重建，綁到的版本不一定是原來那版
+（8 次裡 3 次符合 selector、4 次兩邊都不符）；16:20 `FollowFiles._source` 為了搬檔叫醒過 db0386d0。規則見
+[ADR-0009 §10](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#10-不叫醒已回收-session-的規則立即適用phase-0)：
+先用 `get_session`（不叫醒）讀 metadata，只有 `active` 才可以 invoke 它或用 Files API 讀它的檔案。
+
+- **開始搬檔前來源已 idle：** `FollowFiles._source()` 與複製前的 `require_source_version()` 只接受 `active`；
+  idle 或其他狀態不 invoke、不讀檔，回 409 `NATIVE_FILES_SOURCE_UNAVAILABLE`，`copy_step` 照既有對應在目的端記
+  `source_unavailable`（`source_invocation_refused`）。自動接續（`advance`、送出前接續、routine）因此以
+  `files_omission_reason=source` 不搬檔換好環境，API 回條記 `files_migrated=false` 與 `files_omission_reason`。
+  **工作台目前不顯示通知**：2026-10-04 原句「已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。」在
+  2026-10-06（`f56020a5`）隨工作台不再處理換環境一起移除，`agent.environment` 事件只叫醒等待中的請求；
+  補回通知列在 [ADR-0009 §8](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#8-使用者看到的通知)
+  的待辦。owner 直接 `POST /environment` 會看到這個 409，走既有不搬檔確認。
+- **檔案已複製、停止前來源變成 idle：** 不再為了 `verify_source` 叫醒它，也不 stop（compute 已回收，不需要 stop）、
+  不再讀它的檔案；回同一個 409，自動接續以 `source_not_migratable` 不搬檔完成，已核對的 staging 保留、不發布、不刪除。
+- **stop 只送給 `active` 的來源：** idle 或已失效沒有 compute 可停；`creating`／`updating`／`deleting` 不 stop，
+  回 `source_active`，下一次再看。
+- **自動接續的 retarget**（保留原 pending、改指新目標，仍要搬檔）只在來源 `active` 時走；不是 active 就直接走不搬檔決定。
+- **來源 `active` 時照舊搬檔：** inspect、複製、核對、stop 與停止後核對都不變。
+- **停止後核對只讀 FA 自己 stop 的來源：** `stop_started` 改成在平台接受 FA 的 `stop_session` **之後**才寫
+  （以前在送 stop 之前就寫）；平台回 409 `session_already_stopped` 不算 FA 的 stop。FA 的 stop 失敗、之後來源被回收：
+  沒有這個紀錄，`before_stop` 不叫醒它、follow 不讀它的檔案，回 409 `NATIVE_FILES_SOURCE_UNAVAILABLE`，自動接續以
+  `source_not_migratable` 不搬檔完成。`stopped_step` 自己也先核 `stop_started`。代價：FA 的 stop 已被接受、但紀錄沒寫成
+  （崩潰或寫入失敗）時，下一次當成被回收，不搬檔；不會叫醒來源。部署前已在途、舊程式先寫了 `stop_started` 的 follow 無法區分。
+- **舊版 `fa-chat-…` 對話：** admission 時 `verify_session` 只讀 metadata；SID 不是 `active` 就回 409
+  `CONVERSATION_SESSION_UNAVAILABLE`，不送回合去叫醒它；工作台顯示既有訊息
+  「原 Hosted session 無法使用；未自動替換，請選擇 reset 或 new session。」。代價（§10 接受）：閒置超過逾時的舊對話
+  要明確 reset 或開新對話才能繼續；reset 用 `stop_session`，不 invoke。
+- **§10 的窄例外與已接受風險：** ① FA 自己的 stop 被接受並記下之後，`stopped_step` 仍用 Files API 逐檔讀一次停止後的
+  來源，確認 stop 前後檔案沒變（既有「stop 後 Files GET」互鎖，[來源漂移且已有 staging 的出口](#source-drift-staging-exit)）。
+  官方：stop 結束 compute、保留檔案系統；Files 呼叫會不會重新配置 compute，官方沒有寫，列為 dev 驗證項
+  （ADR-0009 §10）。② metadata 讀到 `active` 到實際呼叫之間仍可能轉成 idle（同上方取消與送達回條的已接受風險）；
+  舊版對話 admission 之後到實際送出之間也一樣。
+
+**Verified against：** `origin/main` `8732d7b7` 的 `FollowFiles`、`NativeSessions.follow/advance`、
+`behavior_work_policy` admission；`test_native_follow_no_wake.py`（idle 來源零 invoke／零 Files／零 stop 並以不搬檔完成、
+`active` 來源照舊搬檔、複製後才 idle、非 active 不 stop、FA 的 stop 失敗後來源被回收不讀檔、retarget 只在來源 `active`
+時走）與 `test_session_version_failure.py`（idle 的 `fa-chat-` SID 不 invoke）。拿掉修正時這些測試都失敗
+（`active` 照舊搬檔與 retarget 的 `active`／`creating` 對照組除外）。離線替身，未部署、未在雲端驗證。
 
 <a id="automatic-environment-policy"></a>
 ## FA自動核對與不搬檔接續（CODE/offline）
@@ -1670,7 +1774,8 @@ root停止及判定留在admission lock內，child取消移到鎖外，避免chi
 `14ba0e89` 的真路徑會在 source 沒有 `files_profile` 時回 `NATIVE_FILES_UNSUPPORTED`；
 新版 selector 下整個 Agent 尚未 ready，因此原 CID 和新對話都不能送新工作。
 這不是來源空目錄，也不是等一會就完成。此修正保留正常 Files 路徑，增加一次真人明確決定，
-不替 idle 自動跟版預設略過工作檔。
+不替 idle 自動跟版預設略過工作檔（2026-10-12 起例外：來源本身 idle 時不叫醒它搬檔，自動接續改以不搬檔完成，
+見[換環境不叫醒已回收的來源](#follow-no-wake)）。
 
 - UI 先按「檢查不搬檔接續」，server 核 source／destination 能力、原操作無檔案傳送材料、
   admission／accepted／started／UNKNOWN／task 與目前 checkpoint；通過才顯示
@@ -9614,8 +9719,9 @@ URL，約 2,300 字）；`tools/call` 也會回 `-32006`。provider 端撤銷後
     不重新列工具，回 `NATIVE_CONNECTOR_NOT_CONNECTED`。
   - 不開卡、不等待，直接回這兩個代碼（和 HITL 沒開時相同，替身工具照綁，其他工具照常）：HITL 沒開；非真人來源（Agent 間、
     排程）；Teams relay 送的回合（request id 以 `tr-` 開頭，`behavior_native_turn_wire.RELAY_PREFIX`，Teams 上按不到卡）；
-    owner 已在**同一個對話**對該 toolbox 按過「先不用」（Hosted 行程內的 `_DECLINED`，key 為 (agent, conversation_id,
-    toolbox)；VM 重啟後可能再問一次，換對話也會再問）。工作台的真人回合照舊開卡，等待照 #751。替身說明告訴模型：
+    owner 已在**同一個對話**對該 toolbox 按過「先不用」（決定存在 API 的 `consent-declined` 紀錄，key 為 (agent, conversation_id,
+    toolbox)，新卡一律回 409 `NATIVE_HITL_HUMAN_DENIED`，換 Agent 版本或 VM 重啟後仍有效；同一個對話內不能撤回「先不用」；主人在其他對話連好 Teams 後，這個對話的 Teams 工具也會變成可用（連線每位 Agent 一份）；若仍未連線，新對話會再出卡。Hosted 行程內的
+    `_DECLINED` 只是省一趟來回的快取）。工作台的真人回合照舊開卡，等待照 #751。替身說明告訴模型：
     owner 只能在工作台、與這位 Agent 的對話裡連線。
 - **模型看到的**：`behavior_capabilities.TOOLBOX_FAILURE_GUIDANCE` 的固定英文說明，經 model boundary 顯示為
   「Tool call failed [code]. …」，要模型告訴使用者尚未連好或要重新連線、這回合不要再呼叫、不要索取或編造登入連結。
@@ -9624,13 +9730,13 @@ URL，約 2,300 字）；`tools/call` 也會回 `-32006`。provider 端撤銷後
 
 | 路徑 | 語意 |
 |---|---|
-| `POST /consents`、`/consents/reconcile` | `ConnectorConsentCreate`，只有原 Agent；回合已關 409 `NATIVE_HITL_TURN_CLOSED`，同一 call 已有卡 409 `NATIVE_HITL_CALL_EXISTS`。 |
+| `POST /consents`、`/consents/reconcile` | `ConnectorConsentCreate`，只有原 Agent；回合已關 409 `NATIVE_HITL_TURN_CLOSED`，同一 call 已有卡 409 `NATIVE_HITL_CALL_EXISTS`；owner 已在這個對話對該 connector 按過「先不用」409 `NATIVE_HITL_HUMAN_DENIED`（不建卡）。 |
 | `GET /consents/{consent_id}` | `ConnectorConsentReadback`（owner 或原 Agent）：**唯一帶 consent URL 的回應**，另有 `status=pending/resume/decline`、`expired`、`turn_closed`。 |
 | `POST /turn-consents` | `ConnectorConsentPage`，`attention` 是 `NativeConnectRequiredItem`（`type=connect_required`），不含 URL。 |
 | `POST /consent-decisions`、`/consent-decisions/reconcile` | `ConnectorConsentDecision`（`resume`／`decline`），Team owner 一般登入即可（和回答問題一樣，不需 `Behavior.Approve`）；每張卡只收一次：第二次 409 `NATIVE_HITL_STATE_CONFLICT`，digest 不符 409 `NATIVE_HITL_ACTION_CHANGED`，過期 410、回合已關 409。 |
 
   Team 待辦（`/attention`）也列 `connect_required`（不含 URL）；realtime 多一種 `hitl.consent` 提示，只帶 ID 與狀態。
-  history 讀取器認得 `native_hitl_consent` 與 `native_hitl_consent_decision`。
+  history 讀取器認得 `native_hitl_consent`、`native_hitl_consent_decision` 與 `native_hitl_consent_declined`。
 - **不做**：不自動重試、不用 VM 瀏覽器繞過、不刪使用者 token（官方沒有對應 API）、不寫第二份連線狀態。
 
 #### Verified against（C3 Connect 卡）

@@ -30,9 +30,18 @@ log = logging.getLogger(__name__)
 METADATA_BUILD, METADATA_SOURCE = "fa_build", "fa_source"
 METADATA_DEFINITION = "fa_definition_sha256"
 FOLLOWING = "AGENT_VERSION_FOLLOWING"
+# Platform answers that say nothing about which version is selected (transport failure, timeout, throttling, 5xx).
+_TRANSIENT_STATUSES = frozenset({408, 429})
 _SETTLED = frozenset({"active", "failed", "deleting", "deleted"})
 SYNC_WAIT_SECONDS = 900
 _POLL_SECONDS = 5
+
+
+class SelectorUnreadable(Problem):
+    """503 ``AGENT_VERSION_FOLLOWING`` because the endpoint selector could not be read this time.
+
+    Unlike the other 503 ``AGENT_VERSION_FOLLOWING`` answers (an incompatible or unready selected version), it
+    does not say the selected version moved; the body is the same, so every caller handling a Problem is unchanged."""
 
 
 def _number(item):
@@ -155,7 +164,9 @@ class HostedVersions:
             if require_responses and error.status in {401, 403}:
                 raise Problem(error.status, "NATIVE_TURNS_DISABLED",
                               "the selected Responses build definition cannot be read") from None
-            raise Problem(503, FOLLOWING, "this Agent's Hosted version for the deployed build is not readable yet") from None
+            refusal = (SelectorUnreadable if error.status is None or error.status in _TRANSIENT_STATUSES
+                       or error.status >= 500 else Problem)
+            raise refusal(503, FOLLOWING, "this Agent's Hosted version for the deployed build is not readable yet") from None
         if (not isinstance(observed, dict) or observed.get("name") != target.agent_name or observed.get("version") != version
                 or not _same_identity(observed, target) or not _of_build([observed], self.build)
                 or observed.get("status") != "active" or not isinstance(observed.get("definition"), dict)

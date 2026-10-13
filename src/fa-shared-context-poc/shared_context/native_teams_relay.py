@@ -131,7 +131,9 @@ class TeamsRelay:
         try:
             original, _ = gateway.read(owner, NativeRead(request_id=rid))
         except Problem as error:
-            if error.body["error"]["code"] != "NATIVE_RID_MISSING":
+            # NATIVE_SESSION_CHANGED: the selected version has no session yet, so nothing was read. The submit of the
+            # same deterministic RID answers it (503 not_dispatched: the relay polls and sends it again).
+            if error.body["error"]["code"] not in {"NATIVE_RID_MISSING", "NATIVE_SESSION_CHANGED"}:
                 raise
             original = self._submit(gateway, owner, rid, chat.conversation_id(), turn.text)
             if original is None:

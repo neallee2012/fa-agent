@@ -9,7 +9,9 @@ import pytest
 import shared_context.behavior_agent_versions as versions
 from shared_context.behavior_agent_message_api import public_agents
 from shared_context.behavior_agent_onboarding import FoundryCallError
-from shared_context.behavior_agent_versions import FOLLOWING, HostedVersions, sync_agent_version, sync_all
+from shared_context.behavior_agent_versions import (
+    FOLLOWING, HostedVersions, SelectorUnreadable, sync_agent_version, sync_all,
+)
 from shared_context.behavior_work_target import instruction_hosted_version
 from shared_context.errors import Problem
 from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
@@ -639,3 +641,29 @@ def test_a_conversation_pins_the_build_version_ignores_the_environment_and_the_d
     assert instruction_hosted_version(c.control, None, existing=False) == "42"
     entry = next(item for item in public_agents(a, c.human).agents if item.agent_id == original.agent_id)
     assert entry.state == "ready"
+
+
+@pytest.mark.parametrize("status, transient", [(None, True), (408, True), (429, True), (500, True), (503, True),
+                                               (401, False), (403, False), (404, False)])
+def test_an_unreadable_selector_is_told_apart_from_a_confirmed_selection(status, transient):
+    foundry = Foundry(R)
+    foundry.add(R.agent_name, 4, "new")
+
+    def unreadable(_name):
+        raise FoundryCallError(status)
+
+    foundry.get_agent = unreadable
+    with pytest.raises(Problem) as refused:
+        HostedVersions(lambda endpoint: foundry, build="new").current(R)
+    # Same answer either way; only a transient platform failure is marked as saying nothing about the selection.
+    assert _code(refused) == (503, FOLLOWING)
+    assert isinstance(refused.value, SelectorUnreadable) is transient
+
+
+def test_a_selected_version_this_build_cannot_serve_is_not_an_unreadable_selector():
+    foundry = Foundry(R)
+    foundry.add(R.agent_name, 3, "old")
+    with pytest.raises(Problem) as incompatible:
+        HostedVersions(lambda endpoint: foundry, build="new").current(R)
+    assert _code(incompatible) == (503, FOLLOWING)
+    assert not isinstance(incompatible.value, SelectorUnreadable)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from time import monotonic
 
 from fastapi import Depends, Request
 from fastapi.responses import JSONResponse
@@ -55,7 +56,9 @@ class NativeAgentRelayGateway:
             raise Problem(403, "NATIVE_AGENT_SOURCE_INVALID", "the verified Agent differs from its server scope")
         return scope
 
-    def _client(self, scope, *, prepared=True):
+    def _client(self, scope, *, prepared=True, dispatch=False):
+        """``dispatch``: work is delivered to this Agent's session, so (like an owner submit) the endpoint selector
+        is read in this request rather than reused from the last ``SELECTOR_CHECK_SECONDS``."""
         composition = self.owner.for_agent(scope.target.agent_id)
         control = composition.runtime.work_policy
         targets = selected_targets(control.store, composition.config, agent_id=scope.target.agent_id)
@@ -66,7 +69,10 @@ class NativeAgentRelayGateway:
         if len(clients) != 1:
             raise Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "the original native transport is unavailable")
         original = clients[0].for_target(targets[0])
-        return composition, native_sessions(composition).current(original) if prepared else original
+        if not prepared:
+            return composition, original
+        return composition, native_sessions(composition).current(
+            original, checked_since=monotonic() if dispatch else None)
 
     def _quota(self, principal):
         repository = self.repository
@@ -221,7 +227,7 @@ class NativeAgentRelayGateway:
         identifier = message_identifier(principal, sender, command.tool_call_id)
         try:
             recipient = self._recipient(principal, command.message.recipient_agent_id)
-            peer, client = self._client(recipient)
+            peer, client = self._client(recipient, dispatch=True)
             original = self._original(client, identifier)
             if sender.queued_relay is not None and original is None and not queued_request_matches(sender, command):
                 raise Problem(403, "NATIVE_AGENT_SOURCE_INVALID", "only the original queued command may be delivered")
@@ -326,7 +332,8 @@ class NativeAgentRelayGateway:
         if not observe and view.state == "ready" and view.files_manifest_sha256 is not None:
             current()
             try:
-                NativeTurnGateway._signal_ready_handoffs(sessions.current(client), view)
+                # A ready handoff delivers work: the selector is read in this request.
+                NativeTurnGateway._signal_ready_handoffs(sessions.current(client, checked_since=monotonic()), view)
             except Problem as error:
                 logging.getLogger(__name__).warning(
                     "NATIVE_CONTINUATION_HANDOFF_PENDING code=%s", error.body["error"]["code"])
@@ -338,7 +345,7 @@ class NativeAgentRelayGateway:
         from .native_continuation_wire import CONTINUATION_STOP_STATUS
 
         scope = self._sender_scope(principal)
-        composition, client = self._client(scope)
+        composition, client = self._client(scope, dispatch=True)
         control = composition.runtime.work_policy
         NativeTurnGateway._legacy(control, command.conversation_id)
         source = self._original(client, command.request_id)
@@ -413,7 +420,7 @@ class NativeAgentRelayGateway:
                 logging.getLogger(__name__).warning(
                     "NATIVE_GROUP_PUBLICATION_PENDING code=%s", error.body["error"]["code"])
         recipient = self._recipient(principal, source.sender.agent_id)
-        target, client = self._client(recipient)
+        target, client = self._client(recipient, dispatch=True)
         NativeTurnGateway._legacy(target.runtime.work_policy, source.sender.conversation_id)
         original = self._original(client, source.message_id)
         conversation = None

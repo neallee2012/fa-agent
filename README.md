@@ -25,7 +25,7 @@ B ：（搜尋天氣，把結果回報給 A）
 A ：（被 B 的回報喚醒，在原對話整理天氣和運動建議給你）
 ```
 
-**需要什麼。** 一個 Azure 訂閱，你在上面能建立資源和角色指派（Owner 最簡單）；一個有 Foundry Hosted Agents 的區域，以及你要用的模型 quota；一個 Entra 租戶：你要能註冊 app，另外需要管理員替 Team 主人建立委派授權（Cloud Application Administrator 以上；你不是管理員也能部署，這一步交給管理員）；Team 主人的 Entra 帳號。助理用的是你在 Foundry 部署的模型（BYOK），所以不需要 GitHub 帳號或 GitHub Copilot 訂閱。完整條件和步驟見下方「部署到你的 Azure」。
+**需要什麼。** 一個 Azure 訂閱，你在上面能建立資源和角色指派（Owner 最簡單）；一個有 Foundry Hosted Agents 的區域，以及你要用的模型 quota；一個 Entra 租用戶：你要能註冊 app，另外需要管理員替 Team 主人建立委派授權（Cloud Application Administrator 以上；你不是管理員也能部署，這一步交給管理員）；Team 主人的 Entra 帳號。助理用的是你在 Foundry 部署的模型（BYOK），所以不需要 GitHub 帳號或 GitHub Copilot 訂閱。完整條件和步驟見下方「部署到你的 Azure」。
 
 **費用。** 每位助理的 VM 運作時約 US$0.25／小時，閒置回收後不計；常駐的工作台約 US$5.83／月，API 等其他資源另計。作者環境的估算見下方「費用參考」，實際以你的帳單為準。
 

@@ -2,13 +2,13 @@
 
 這個私有 repo 每次**成功部署到 stage** 之後，會把那一版去識別化，推到一個公開 repo。公開 repo 只會看到已經上過 stage 的版本，看不到開發中的分支或未部署的提交。
 
-目前狀態：第一次實際同步已推到公開 repo（release `v2026.10.10-24`，repo 仍是 private）。事後獨立檢查發現匯出還留著作者環境的資源名稱、GitHub 擁有者數字 ID、私有 repo 的純文字名稱與一個私有 commit；替換規則與 verify 已補上（見下方「保留與替換的資源名稱」），下一次同步才會帶到公開 repo。
+目前狀態（2026-10-12）：公開 repo `neallee2012/fa-agent` 已改成 public，最新同步是 release `v2026.10.12-27`。第一次同步（release 24）事後檢查發現的洩漏，已由替換規則與 verify 補上（見下方「保留與替換的資源名稱」）；經過與歷史改寫見「公開紀錄」。
 
 ## 何時同步、同步什麼
 
 1. stage release PR（改 `deploy/stage/release.json`）合併到 `main`，[deploy-staging](../.github/workflows/deploy-staging.yml) 部署 stage。手動觸發的 deploy-staging 也算。
 2. 只有那次 deploy-staging **成功**，[public-sync](../.github/workflows/public-sync.yml) 才會開始；失敗、取消或跳過都不會。
-3. 環境 `public-sync` 只允許 `main`。目前的 GitHub 方案不支援 private repo 的必要審核人，所以不會停下來等人核准；改由公開 repo 先保持 private 當審核關（Neal 2026-10-11 決定），Neal 看過推進去的內容再自己改成 public（審查流程見下方「每一版的兩道人工審查」）。
+3. 環境 `public-sync` 只允許 `main`。目前的 GitHub 方案不支援 private repo 的必要審核人，所以不會停下來等人核准；改由公開 repo 先保持 private 當審核關（Neal 2026-10-11 決定），Neal 看過推進去的內容再自己改成 public（審查流程見下方「每一版的兩道人工審查」）。2026-10-12 已改成 public，之後每次同步立刻公開，第一道審查要在 release PR 合併前完成。
 4. 取出那次部署的**同一個 commit**，只匯出該 commit 追蹤的檔案，套用替換表，再跑下面的 fail-closed 檢查。任何一項沒過就停，什麼都不推。
 5. 讀 `release.json` 的 `version` 與 `milestone`。`milestone` 經同一套替換與檢查後當作 Release 說明。
 6. 用公開 repo 的權杖 clone 公開 repo，把整棵樹換成這次匯出（保留 `.git`），以 `github-actions[bot]` 名義建立**一個** commit `Release <version>`，打 tag `v<version>`，推到公開 repo 的 `main`，再建立同名 GitHub Release。
@@ -32,7 +32,7 @@
 | `.github/workflows/`（整個目錄） | 推送 workflow 檔需要 Workflows 權限，只開 Contents 的權杖推不上去；`public-sync.yml`、`deploy-staging.yml` 也只對私有 repo 與 Neal 的 stage 有意義 |
 | `.claude/` | 本機 agent 設定 |
 
-所以公開 repo **沒有任何 CI workflow**。也因此公開 repo 裡有三個讀 workflow 檔的測試會失敗：`tests/shared_context/test_stage_ci_deploy_feed.py` 與 `test_stage_version_publication.py` 各一個（讀 `deploy-staging.yml`），以及 `tests/infra/test_shared_context_avm.py::test_infrastructure_workflow_compiles_without_azure_credentials_or_deployment`（讀 `validate-infrastructure.yml`）；本次沒有改這三個測試。另外 `tests/context_eval/test_context_target_eval.py::test_committed_ledger_preserves_the_historical_strict_failure_and_batch_review` 在公開副本也會失敗（`run content fingerprint differs`）：`docs/context-evaluation-status.json` 目前有 4 個 run 的內容被替換（各自記錄的 `sha256` 原樣保留），重算的指紋對不上；補強替換規則（#786）之前的匯出就已如此。
+所以公開 repo **沒有任何 CI workflow**。也因此公開 repo 裡有兩個讀 workflow 檔的測試會失敗：`tests/shared_context/test_stage_ci_deploy_feed.py` 與 `test_stage_version_publication.py` 各一個（讀 `deploy-staging.yml`），目前沒有改。`tests/infra/test_shared_context_avm.py::test_infrastructure_workflow_compiles_without_azure_credentials_or_deployment`（讀 `validate-infrastructure.yml`）在沒有 `.github/workflows/` 目錄時改成跳過並寫明原因；私有 repo 有這個目錄，照常執行。另外 `tests/context_eval/test_context_target_eval.py::test_committed_ledger_preserves_the_historical_strict_failure_and_batch_review` 在公開副本也會失敗（`run content fingerprint differs`）：`docs/context-evaluation-status.json` 目前有 4 個 run 的內容被替換（各自記錄的 `sha256` 原樣保留），重算的指紋對不上；補強替換規則（#786）之前的匯出就已如此。
 
 ## 替換與 fail-closed 檢查
 
@@ -55,7 +55,7 @@ CI 用的 gitleaks 是 8.30.1 官方 release，下載後先核對 sha256 才使�
 
 順序建議如下；最後才設 `PUBLIC_REPO`，因為它一設好，下一次 stage 部署成功就會觸發同步。
 
-1. **建立公開 repo**：可以是空的；若建立時勾了 README，第一次同步會整棵取代。預設分支用 `main`。（已完成：`neallee2012/fa-agent`，2026-10-11 建為 private；何時改成 public 由 Neal 決定。）
+1. **建立公開 repo**：可以是空的；若建立時勾了 README，第一次同步會整棵取代。預設分支用 `main`。（已完成：`neallee2012/fa-agent`，2026-10-11 建為 private，2026-10-12 由 Neal 改成 public。）
 2. **建立 fine-grained PAT**（GitHub → Settings → Developer settings → Fine-grained tokens）：
    - Repository access 選 **Only select repositories**，只選這個公開 repo。
    - Repository permissions 只開 **Contents: Read and write**（Metadata 會自動是 Read-only）。
@@ -68,7 +68,7 @@ CI 用的 gitleaks 是 8.30.1 官方 release，下載後先核對 sha256 才使�
 
 若日後加了 Required reviewers，想取消時到 Settings → Environments → `public-sync` 取消勾選後儲存。想暫停同步：刪除 `PUBLIC_REPO` 變數即可。
 
-目前狀態（2026-10-11）：`neallee2012/fa-agent`（private）、環境 `public-sync`（限 `main`、無審核人）、secret `PUBLIC_REPO_TOKEN`、變數 `PUBLIC_REPO` 都已設定；第一次同步已完成（release `v2026.10.10-24`）。
+目前狀態（2026-10-12）：`neallee2012/fa-agent`（public）、環境 `public-sync`（限 `main`、無審核人）、secret `PUBLIC_REPO_TOKEN`、變數 `PUBLIC_REPO` 都已設定；最新同步是 release `v2026.10.12-27`（見「公開紀錄」）。
 
 同步用的權杖：
 
@@ -165,6 +165,17 @@ verify 只擋已知的值與通用樣式，所以每一版的人工殘留掃描�
 - 其他單獨出現的 commit SHA（狀態、進度、各文件 `Verified against` 的程式基準）不替換：公開 repo 沒有私有歷史，這些 SHA 在公開 repo 指不到任何東西。要擋的是和私有 repo 名稱或網址一起出現、能拿來定位的引用。
 
 規則在 `review.json` 的 `this-repo-progress-constant`、`this-repo-md-link`、`this-repo-autolink`、`this-repo-url`。想讓連結原樣公開：刪掉這四條規則後重跑 `discover.py`，把 `review.json` 與 `mapping.json` 一起 commit。根目錄 README 的「GitHub issue」用相對連結 `../../issues`，在兩個 repo 都指向各自的 issues。
+
+## 公開紀錄
+
+依日期記下公開 repo 實際發生的事；各版的審查細節在對應的 release PR。
+
+- **2026-10-11 release 24 第一次同步**：事後獨立檢查發現匯出留有作者環境的資源名稱、GitHub 擁有者數字 ID、私有 repo 的純文字名稱與一個私有 commit。公開 repo 當時是 private，已刪除後重建；替換規則與 verify 隨後補上。
+- **release 25（10-11）**：第二道人工審查未過：M365 租戶名稱的縮寫（原規則只認全名）與 v18 環境的儲存體帳戶名稱還留在匯出裡。已用 `tenant-name-abbrev`、`storage-v18-stem` 規則修正，隨 release 26 同步。
+- **release 26（10-11）**：第二道審查通過（內容樹 `b8654bda`）。Neal 核准把公開 repo 的歷史改寫成單一乾淨的 root commit `d6f6a976`（內容就是 release 26 的樹），並刪除 v25 的 tag 與 Release；腳本由 Neal 自己執行。
+- **2026-10-12**：Neal 把 `fa-agent` 改成 **public**。
+- **release 27（10-12）**：接在 `d6f6a976` 之後的 commit `a493fefc`，9 個檔案，都是文件。第二道審查通過：gitleaks 掃描目錄 143 個發現、掃描 git 歷史 144 個，全部對上已知誤判清單；183 個連結都能解析。
+- **限制**：GitHub 可能仍保留沒有任何引用的 v25 commit 物件，要請 GitHub Support 清除才會消失；這是擁有者向 GitHub 提出的要求，agent 不代做。
 
 ## Verified against
 

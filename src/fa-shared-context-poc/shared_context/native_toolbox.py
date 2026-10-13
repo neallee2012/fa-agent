@@ -531,8 +531,8 @@ class _Calls:
 _FAILED = frozenset({UNKNOWN, TOOLBOX_NOT_RUN, TOOLBOX_READ_FAILED, TOOLBOX_OUTCOME_UNKNOWN, CONNECTOR_NOT_CONNECTED,
                      CONNECTOR_RECONNECT})
 _CALLS = _Calls()
-# C3: (agent, conversation, toolbox) whose Connect card the owner declined; this Hosted process only, so a VM restart
-# may show the card once more.
+# C3: (agent, conversation, toolbox) whose Connect card the owner declined. The durable record is the API's
+# "consent-declined" marker (a new card is refused with NATIVE_HITL_HUMAN_DENIED); this process cache only saves a round trip.
 _DECLINED: set[tuple[str, str, str]] = set()
 
 

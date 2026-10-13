@@ -93,10 +93,10 @@ connector 是用 Entra OAuth 代 Team 主人登入外部服務的 MCP。每個 T
 
    後兩件和 Team MCP 新增金鑰 connection 用的是同一套。azd 環境預設 `FA_ENABLE_TEAM_MCP_CONNECTIONS=true`，已經有了（`deploy/azd/profile.py:106-111`、`infra/azd/main.bicep:82-83,262`）。
 2. Team 主人在「Agent Team 設定」→「Connectors」加入 Teams，貼一次 client secret。secret 只經過送往 API 的那一個請求，由 API 寫進 Foundry 的 OAuth connection。沒設 client ID 時，加入會回 `TEAM_MCP_CONNECTION_CREATE_UNAVAILABLE`（`shared_context/team_connector.py:100-103`）。
-3. 把這個 connection 的 redirect URI 加進 Entra app。redirect URI 由 Foundry 指定（`shared_context/team_mcp.py:260-261`），格式像 `https://global.consent.azure-apim.net/redirect/<id>`，每條 connection 的 `<id>` 不同。connection 名稱每個 Team 固定一個（`shared_context/team_connector.py:36-38`），所以每個 Team 第一次加入時做一次。這是改 Entra app 的租戶寫入，要有該 app 的擁有者或管理員權限。依據是 dev 10-10 的實跑：新 connection 的 redirect 不在 app 裡，要另外加進去（[紀錄](progress.md#connector-m1-dev-1010)）；FA 程式不會替你加，其他租戶是否一樣沒有驗證過。
+3. 把這個 connection 的 redirect URI 加進 Entra app。redirect URI 由 Foundry 指定（`shared_context/team_mcp.py:260-261`），格式像 `https://global.consent.azure-apim.net/redirect/<id>`，每條 connection 的 `<id>` 不同。connection 名稱每個 Team 固定一個（`shared_context/team_connector.py:36-38`），所以每個 Team 第一次加入時做一次。這是改 Entra app 的租用戶寫入，要有該 app 的擁有者或管理員權限。依據是 dev 10-10 的實跑：新 connection 的 redirect 不在 app 裡，要另外加進去（[紀錄](progress.md#connector-m1-dev-1010)）；FA 程式不會替你加，其他租用戶是否一樣沒有驗證過。
 4. 加入後，Team 的每位助理預設都帶這個 connector（`shared_context/team_connector_narrowing.py:1-7`）；不想讓某位助理用，到它的 ⚙ →「MCP」關掉，只影響之後的新對話。同意是每位助理各自的（`shared_context/team_connector.py:5-6`）：
    - 還沒同意的助理，在工作台由真人送出的回合裡，回合一開始、模型還沒動之前列工具時就會出「需要連線」卡，不管這則訊息要不要用 Teams（`shared_context/native_toolbox.py:680-693`）。回合停在卡上等主人。主人在卡上的連結同意後按「我連好了，繼續」，同一回合接著跑；之後這位助理的對話不再問。
-   - 按「先不用」，這個對話之後的回合不再出卡，Teams 工具只回報尚未連線，其他工具照常。這個記憶只在助理 VM 的程序裡，換對話或 VM 重啟後會再問一次（`shared_context/native_toolbox.py:534-536`）。
+   - 按「先不用」，這個對話之後的回合不再出卡，Teams 工具只回報尚未連線，其他工具照常。這個決定隨對話存在 API 的 `consent-declined` 紀錄裡（Agent、對話、toolbox 為 key），換版本或 VM 重啟後仍有效；同一個對話內不能撤回；主人在其他對話連好 Teams 後，這個對話的 Teams 工具也會變成可用（連線每位 Agent 一份）；若仍未連線，新對話會再出卡。VM 程序內另有 `_DECLINED` 只省一趟來回（`shared_context/native_toolbox.py`）。
    - 已同意的連線被撤銷時，會出同一種卡，要求重新連線（呼叫工具時見 `shared_context/native_toolbox.py:809-818`）。
    - 助理之間交辦、排程，以及從 Teams 轉來的回合（request ID 以 `tr-` 開頭，含它的自動接續）不出卡、不等待，直接當成尚未連線繼續（`shared_context/native_toolbox.py:539-543,629-647`；#778）。
 

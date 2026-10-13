@@ -204,10 +204,28 @@ Neal：「請嚴格依照hosted agent官方和grok bot的方式，詳細審視FA
 - API 在程序內記住每個 Agent 的「選定版本＋session」，讀取（含 2026-10-05 新增的 `status`）直接呼叫；
   即 10-05「讀取路由不再重做舊對話檢查」所說另案處理的 3 次 Foundry 重讀。官方 session 建立時綁定版本、selector 不搬既有
   session；charter-agent 也是保存 `agent_session_id` 直接帶著呼叫。
-- selector 換版後、follow 開始前，Agent 紀錄仍指向舊 session，已記住的 reader 照常把讀取與送出交給它（不會資料遺失或重送）；
-  需接續的提示靠 `GET /environment` 或部署端 follow 結果，follow 一開始 Hosted 就以 `AGENT_VERSION_FOLLOWING` 擋新請求。
-  排程 routine 的自動跟版與交辦的「收件人換版中」同樣要等快取清空（API 重啟、本程序環境操作、1 天未用或平台錯誤）
-  或 Hosted 拒絕才觸發；stage 部署會重啟 API。
+- （2026-10-12 修正）用已記住的 reader 前先比對 endpoint selector：版本不同就丟掉，不呼叫舊版本的 session
+  （呼叫舊 SID 會讓平台在 Hosted 執行前用另一個版本把它重建）。只有讀取與輪詢沿用 10 秒內開始的 selector 讀取，
+  selector 暫時讀不到時沿用 120 秒內確認過的 reader；送出、寫入（圖片上傳、取消、送達回條、追加）、排程 routine、
+  Agent 間交辦與接續、換版後的接續通知、prewarm 每次在請求內讀 selector。選定版本還沒有 session 時不呼叫舊版本的 session：
+  送出回 503 `AGENT_VERSION_FOLLOWING`（`not_dispatched: true`），交辦收件回 503，圖片上傳、追加與接續回 409
+  `NATIVE_SESSION_CHANGED`。取消與送達回條送到持有回合的 session：Agent 紀錄仍指向它，且平台 metadata（不叫醒 session）
+  確認它 `active` 時才呼叫（在跑的回合所在的 session 是 active；只有 `active` 的 SID 可呼叫，見
+  [ADR-0009 §10](adr/0009-version-model-g-actual-version-idle-upgrade.md#10-不叫醒已回收-session-的規則立即適用phase-0)）；
+  否則不呼叫任何 session，回原錯誤碼並帶 `not_dispatched: true`，同一個指令可原樣再送；metadata 讀取被拒（401／403）
+  則原樣回報，不帶 `not_dispatched`。metadata 讀取與呼叫之間 session 仍可能轉成 idle，這時呼叫可能叫醒它：此風險接受，
+  只限使用者明確按下的停止或送達回條，對象片刻前還是 active。
+  排程 routine 不呼叫舊 SID，但會建立選定版本的 session（`_destination`，再以 `idle_only` 換環境）；
+  被拒絕時 routine 時鐘記 `FA_NATIVE_ROUTINE_CLOCK_REFUSED`，下一個 tick 以同一個固定 RID 再試。
+  其餘恢復要靠外部 follow、agent-versions sync 或漂移替換建立選定版本的 session。
+- （2026-10-12，ADR-0009 §10 phase 0）換環境（follow／`advance`／retarget）也只碰 `active` 的來源：來源 idle
+  （compute 已回收）或其他非 active 狀態時，不 invoke、不經 Files API 讀檔、不 stop，回 409
+  `NATIVE_FILES_SOURCE_UNAVAILABLE`；自動接續以不搬檔完成，API 回條記 `files_migrated=false` 與
+  `files_omission_reason`（工作台目前不顯示通知，2026-10-06 起；補回列在 ADR-0009 §8）。檔案已複製、停止前才變 idle
+  也一樣（已核對的 staging 保留、不發布）。stop 只送給 `active` 的來源。停止後核對讀來源檔案只限 FA 自己的 stop：
+  `stop_started` 在平台接受 FA 的 `stop_session` 之後才寫；沒有這個紀錄就變 inactive 的來源當成被回收，不讀檔、不搬檔
+  （ADR-0009 §10 窄例外）。舊版 `fa-chat-…` 對話在 admission 只讀 metadata，SID 不是 `active` 就回 409
+  `CONVERSATION_SESSION_UNAVAILABLE`，照既有規則明確 reset 或開新對話（reset 用 `stop_session`，不 invoke）。
 - 只在已知會變時重查：本程序的環境操作開始與結束時（操作期間的讀取不會喚醒正要停止的舊 session）；Hosted／平台回 `NATIVE_SESSION_CHANGED`、`AGENT_VERSION_FOLLOWING`、
   binding 不符或 404（重查一次並重做同一個讀取）；其他平台失敗（下一個請求重查）；同一綁定 1 天未用。
 - Hosted 的紀錄讀取先讀一次 Agent 紀錄，已有更新版本接手就 409 `NATIVE_SESSION_CHANGED`、不讀紀錄；

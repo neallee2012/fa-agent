@@ -1,8 +1,57 @@
 # FA 進度與交接狀態
 
-更新日期：2026-10-10。
+更新日期：2026-10-13。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="adr0009-phase0-merged-1013"></a>
+## 2026-10-12～13：G phase 0 合併、dev 部署批准（已合併；dev 部署測試中）
+
+- #812（`1d2d5f91`）：工作台確認改在頁內，不再用瀏覽器對話框。
+- #814（`5c4f9de0`）：ADR-0009 G 設計合併；Neal 10-12 19:53 確認 8 項，AGENTS 界線 2 已改，閒置升級仍是草案（[下一節（10-12）](#adr0009-version-model-g-1012)）。
+- #813（`8732d7b7`）：不再呼叫 selector 已不選的舊 SID；版本定位器取選定版本否則最高版本。
+- #815（`01e0fdb2`）：follow 與舊對話只碰 `active` 的 session，`idle` 走不搬檔。#813＋#815 都合併，[ADR-0009 §10](adr/0009-version-model-g-actual-version-idle-upgrade.md) 的 phase 0 程式部分完成；dev 驗證項：`get_session` 不喚醒已 PASS（10-13，24 個 session 兩次快照約 50 秒無欄位改變）；Files GET 前後狀態仍待做。
+- dev 證據更正（10-13，唯讀）：`list_sessions` 的 `created_at` 等於 `last_accessed_at`，`get_session` 的建立時間叫醒不會重設，先前「`created_at` 重設＝平台重建」是誤讀；同一 session 物件上確認有版本漂移（`db0386d0`、`8d9a3d14`、`95b9ee1b`）。ADR-0009 已改成漂移靠 `version_indicator` 比對，第一次設定同一 SID 漂移旗標時附「平台把助理的執行環境換成了另一個版本」通知（總協調決定，文案待 Neal 確認）；`created_at` 只讀 `get_session`，是順便讀到的保底訊號，沒有保證的讀取點。
+- 費用：Neal 10-13 早上回答「上限 650，停損 630，批准部署」：重申 10-11 起的上限 USD650／停損 USD630（沒有改變），並批准這一次 dev 部署 `01e0fdb2` 測 release 28（[紀錄](fa-cloud-budget-status.md#dev-cap-650-1013)）。
+- 取代 #801 的 CURRENT-STATE 刷新（10-12 01:28，已過時）。
+
+<a id="adr0009-version-model-g-1012"></a>
+## 2026-10-12：版本模型改走 G（Neal 確認「決定」部分；選項 A 不實作；閒置升級仍是草案；都未實作）
+
+- **決定**：Neal 2026-10-12 表示「我比較prefer G」，參考 Grok Bot：版本是 VM 自己回報的事實，相容就照跑，不因不是最新版就拒收；升級只在助理閒置時做（暫停新回合、有工作就延後、有界重試、會崩的版本否決），做完從對話歷史與 checkpoint 接續。下面 A 那一節因此不實作。
+- **新證據（總協調唯讀整理 dev）**：8 次叫醒重建中 3 次等於當下 selector、4 次兩邊都不等；FA 自己會叫醒舊 SID（follow 檢查舊來源、prepare 定位、API 舊 reader 快取、舊 `fa-chat` 對話）。Neal 決定不向 Microsoft 回報。
+- **設計**：[ADR-0009](adr/0009-version-model-g-actual-version-idle-upgrade.md)：API 綁定列記錄實際版本；以 `FA_NATIVE_TURNS` profile 判斷相容並凍結同 profile 內的 schema；expected-version 改當漂移偵測器；閒置升級 U0～U9；工作檔建議切換當下存 Blob、只碰 `active` 的舊 session，退路是不搬檔並明說。分 phase 0～6 實作，phase 0 是 #813 加「不叫醒已回收 session」。
+- **審查第 1 輪（同日）**：`foundry-native-v1` 一律不相容（wire schema 改過多次卻沒換字串），相容改由 v2 profile 加 schema 快照判斷；新增送出前的派送意圖紀錄當跨副本柵欄與閒置依據；已接的工作仍釘在接單版本；被否決的目前版本不受閒置門檻；快照每次 Files 呼叫前重確認 `active`。
+- **審查第 2 輪（同日）與拆分**：前兩輪每次補一個協調物件（租約、派送意圖紀錄、Hosted `pending`）卻沒定生命週期，下一輪就找到讓 Agent 永遠不閒置的卡死點。這輪不再加機制，改把 ADR 拆成「決定」與「草案：閒置升級機制」，並加一張協調物件生命週期表：程式或官方文件填不出的格子寫「未定」，有「未定」的物件只留在草案。決定部分另修：checkpoint codec 改在 Hosted 載入時檢查（API 沒有 codec 標記）；phase 2 必須把來源 403 `NATIVE_TURNS_DISABLED` 當來源拒絕；舊 SID 上非終態的 RID 不改送新 SID；409 且版本相同是綁定不一致、不是漂移；metadata `idle` 不代表沒有進行中的回合；phase 0 要 #813 加 follow 不叫醒的 PR 都合併才算完成。草案列 7 個已知未解問題。
+- **Neal 已決定（19:53「都同意」）**：①採用 G，AGENTS 界線 2 改成 ADR-0009 第 11 點措辭（同 PR 已改）；②工作檔切換當下存 Blob、不搬檔當退路，上限沿用 `fa-workspace-files-v1`，保留 30 天；③crash-loop 否決＋自動退回前一版＋通知，需 30 分鐘內 ≥3 次、分屬 ≥3 個對話與 RID；④延後超過 6 小時只通知；⑤相容但 compute 已回收的 Agent 等下一個回合結束再升；⑥支援集合只放目前 profile；⑦派送意圖紀錄要做，但先定結束與過期；⑧漂移後釘在舊版本的工作標「版本已變、無法接續」、通知重送、不擋升級。
+- **審查第 3 輪（同日）**：v1→v2 的 follow 會卡死（`idle_only` 掃描等 v1 來源上的 `accepted` 回條，v2 碰不到、也不准叫醒）→ 決定 8 明確套用到這次遷移：不相容且 `idle`／404 的來源上的非終態回條不擋 follow，回條原樣、讀到時通知主人重送；決定 8 在全文用同一種「決定／草案」切法。另修：#813 之後送出時不 follow 的真正缺口（改成有綁定列就算準備過）、`replaced()` 不誤拒 `pending` 目標 SID、v2 每個 state store 項目明寫 profile（v1 image 無法改，所以 v1 永不再 invoke）、部署閘門與版本保留移到決定的 phase 3b；「每個對話通知一次」的標記列為草案未解問題 8。AGENTS 界線 2 在 Neal 原句後加括號說明過渡做法。
+- **審查第 4 輪（同日）**：第 3、4 輪找到的卡死點都出在 follow「來源碰得到」的假設（來源上的 `admitting`、chain task、metadata 404 等），所以改前提：來源不相容且已回收、已刪除或 404 時，不是 follow 而是「棄用來源換新環境」——不 invoke、不 stop、不接續來源上的任何東西、不搬檔；來源還 `active` 就只等 metadata。寫成 phase 2 的需求與驗收表 (a)～(g)；綁定列記「之前的 SID」清單，讀到 RID 時以它正向判斷是否回「版本已變、無法接續」。`created_at` 通知改附在偵測到的那次回應；同一 SID 漂移時怎麼判定列為草案未解問題 9。
+- **審查第 5 輪（同日）**：棄用來源換新環境升成 ADR 第 7a 點，驗收表擴到 (a)～(o)：commit 後、綁定列 CAS 前崩潰靠重跑切換補寫；不相容 SID 在每個 API 入口零呼叫，`active` 逾時留專用 log、轉需批准的操作者決定；相容來源 404 要讀兩次才棄用；同一 SID 漂移且已閒置的 SID 不再卡住換環境（不依賴未解問題 9）；既有回條改為上線後唯讀讀回，不靠測試推定。**待 Neal 確認**：第 8 點兩句新文案（舊環境已失效／舊環境逾時仍在運作；前者是總協調的決定）。
+- **審查第 6 輪（同日）**：綁定列改記「同一 SID 漂移旗標」（第一次看到不同於建立時的版本就設定，版本漂回也不清除，換 SID 才清除），換環境 commit 時同時寫新 SID 建立時綁的版本；驗收表加 (p)(q)。另補：重跑切換前 selector 又換版時原來源也進之前的 SID 清單；零呼叫的兩個檢查點與 `stop_session`；相容來源再讀的間隔由實作 PR 訂、5xx／逾時不算。逾時句改成「舊環境仍在運作，暫時無法換到新版本；這則訊息沒有送出，需要管理者處理。」（FA 只留 log 與狀態，不說「已轉請」）；兩句新文案仍**待 Neal 確認**。
+- **狀態**：「決定」部分已確認、未實作；草案待生命週期「未定」格子與 9 個未解問題解決才定稿。設計 PR #814 審查中；沒有雲端呼叫。
+
+<a id="adr0003-drift-replacement-1012"></a>
+## 2026-10-12：平台把 Agent 版本漂走時換到新 session 接續（Neal 選 A；已確認、未實作；同日被 G 取代）
+
+- **起因**：dev 10-12 中午，A 的 session 閒置回收後再叫醒，平台回報 v141，FA 紀錄與選定的是 v145。現行程式的 SID 由版本算出，同一個 SID 永遠讀不回 v145，只會一直回 409 `NATIVE_SESSION_CHANGED`，A 因此不收新回合（[費用紀錄 10-12 更正](fa-cloud-budget-status.md#dev-cost-cleanup-1011)）。
+- **決定**：Neal 2026-10-12 在選項中回覆「選 A」：漂移時 FA 自動在目前選定版本的新 session 接續，對話歷史與 checkpoint 照常恢復，回覆明說「助理換到新的執行環境，之前 VM 裡的工作檔不在了」，同一個 request ID 不偷偷換。總協調依 Neal 授權定兩個預設：舊 session 可能還有未決或已派送的回合時，不等待、不替換，明確失敗 `pending_work`；每個版本最多世代 3，用完明確失敗並說需要發新版本（主人動作）。
+- **設計重點**：目前世代記在 API 端 Table 的 Agent 綁定列，讀它不呼叫任何 session；之後的回合、另一個對話與非真人來源都由這一列找到新世代，不會一路建立世代 2、3。建立前先用 metadata 找可重用的世代，沒有才先預留編號再建立；寫入走既有 owner／ETag／CAS，同一 Agent 同時漂移最多產生一個新世代。
+- **狀態**：設計契約在 [ADR-0003](adr/0003-hosted-environment-continuity.md#platform-version-drift-replacement)，PR #811 審查中；程式、測試與部署另走實作 PR，並依賴另一個修正 reader 快取（`READER_IDLE_SECONDS` 24 小時）的 PR。這輪沒有雲端呼叫。
+
+<a id="stage-smoke-v27-1012"></a>
+## 2026-10-12：stage 第 27 版（2026.10.12-27）冒煙測試與工作台觀察
+
+- **範圍與證據**：總協調在 Chrome 開 stage 工作台，用 Neal 既有登入，Agent `fa-stage-a`，模型 gpt-5.4-mini，每項都開新對話。證據只有畫面；stage App Insights 這次沒讀。第 27 版執行期同第 25／26 版（只有文件／工具差異）。
+- **結果（全 PASS）**：
+
+| 時間（+08） | 項目 | 結果 |
+|---|---|---|
+| 10:00 | 一般回合 | PASS，未呼叫工具 |
+| 10:03 | WebIQ | PASS：呼叫兩次 `WebIQ_web`，答案附中央氣象署來源連結（stage WebIQ 金鑰可用） |
+| 10:04 | A→B | PASS：A 用 `send_agent_message` 交辦 `fa-stage-b`，B 回信義區天氣並附來源，A 摘要；沒有批准卡，也沒有 Connect 卡 |
+
+- **Neal 自己用過 stage**：第 24 版部署後，10-11 16:38 路線圖（4 個工具）、17:51 餐廳搜尋（14 個工具）。
+- **P3 觀察（工作台）**：stage 工作台不會自動更新已完成的回合，畫面停在「回覆中，尚未確認保存」，按「更新工作狀態」後才變「已保存回覆／已完成」；另有些已完成的回覆一直停在「正在載入回覆…」（dev 8765 也看過）。尚未調查，已列入 [CURRENT-STATE](status/CURRENT-STATE.md) 開放項目。
 
 <a id="teams-relay-observed-1011"></a>
 ## 2026-10-11：Teams relay 在 dev 的實測補記（`/foundry_new_preview`、文字批准；README 狀態依據）

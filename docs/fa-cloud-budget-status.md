@@ -1,5 +1,14 @@
 # FA 雲端授權與 USD150 成本 preflight
 
+<a id="dev-cap-650-1013"></a>
+## 2026-10-13 dev 部署批准（上限 USD650／停損 USD630 維持）
+
+- **Neal 10-13 早上（07:1x 前）回答**（他自己選了選項）：「上限 650，停損 630，批准部署」。
+- **上限**：沒有改變。dev 共用上限自 10-11 起就是 **USD650**、停損 **USD630**（[10-11 紀錄](#dev-cap-650-1011)）；這次回答是重申這兩個數字，到停損就先停下來回報。總協調當時的提問誤引了舊的停損 USD580（那是 USD600 上限時的數字），以本節與 10-11 紀錄為準。
+- **批准範圍**：只批准這一次 dev 部署，目標是 main `01e0fdb2`（#812、#813、#814、#815 都已合併），用來測 release 28。不含 stage 部署；stage 仍每次都要 Neal 核准。
+- **實查**（Cost Management `ActualCost`，RG 範圍，2025-10-14 起到 10-12 報表日：API 單次查詢最長一年，所以起點是往回約一年的滾動窗口，不是 dev 的開帳日；API `2023-11-01`）：`rg-faexample` USD549.15、`ME_cae-facontext-private` USD20.83，合計約 **USD570**。每日 RG：10-08 21.87、10-09 15.14、10-10 21.63、10-11 30.29、10-12 14.09（10-12 只是部分資料，報表約晚一天）。
+- 其他規則不變：不清帳；`budget_enforced=false`，這仍是記錄用的上限，沒有建立 Azure Budget；stage 照舊另列每月 USD200。
+
 <a id="dev-cost-cleanup-1011"></a>
 ## 2026-10-11 dev 費用最佳化（Neal 批准）
 
@@ -10,7 +19,10 @@
   - 先從 `snet-agents`、`snet-controller` 解除 NAT，再刪 `nat-fasample-westus3` 與 `pip-fasample-egress`，約 USD1.1／天。之後如果要重開 controller VM，得先用 `infra/vnet` 重建 NAT。
   - `pe-fasample-foundry`（指向已刪除的帳號）與 `pe-fasample-file`（File Share 依 ADR-0002 已停用），約 USD0.45／天。`pe-fasample-vault` 保留：key vault 關閉了公開存取，只能從這個 PE 連進去。
   - 合計約 USD3.3／天，由 8 天實際費用換算，實際節省以之後的報表為準。
-- **A／B 閒置逾時從 3600 秒改為 900 秒**：A 改為 v145、B 改為 v101，都已 route 並 follow 完成，讀回 `idle_timeout_seconds=900`。官方 sync 只會把閒置逾時往上調，所以這次用同一個 sync 加上覆寫，只對 A、B 設定精確值；之後的一般 sync 會維持 900。代價是對話間隔超過 15 分鐘時，要先從 checkpoint 冷啟動，第一則回覆會慢一些。省下多少看測試頻率。
+- **A／B 閒置逾時從 3600 秒改為 900 秒**：A 改為 v145、B 改為 v101（core `0b09441b`），都已 route 並 follow 完成，讀回 `idle_timeout_seconds=900`。官方 sync 只會把閒置逾時往上調，所以這次用同一個 sync 加上覆寫，只對 A、B 設定精確值；～～之後的一般 sync 會維持 900；代價是對話間隔超過 15 分鐘要冷啟動～～（已被下方 10-12 更正取代：A／B 現為 3540 秒）。
+  - **10-12 更正**：上面「都已 route 並 follow 完成」只是讀回，當時沒有用實際回合驗證。10-12 中午 A 不收新回合（`NATIVE_SESSION_CHANGED`）：10-11 22:10 follow 建的 A session（…8d9a3d14）閒置被回收再叫醒後，平台回報的版本變成 v141，不是 FA 記錄的 v145，FA 依設計拒絕悄悄換環境。progress 以前也記過平台在 session 叫醒時換版本（3 次）；閒置改成 15 分鐘會讓叫醒更頻繁，增加碰到平台換版的機會。B 做了相同的改動，10-12 12:24 重跑官方 follow 時建了新 session（v101）並 ready，沒有碰到換版。
+  - **恢復**（Neal 10-12 選「A／B 都改回 1 小時」）：用官方 sync 指定 3600 時，因為取較大值、定義相同就沿用舊版本，B 被改回舊的 v100，follow 失敗；A 那次在連進容器時就收到 503，沒有送出。改用同一個 sync 加閒置覆寫，設成舊版本都沒用過的 **3540 秒（59 分鐘）**，產生新的具體版本：B **v102**、A **v146**，route 和 follow 都 ready。
+  - **實際回合驗證**（10-12，dev 8765）：A v146 一則 Learn 搜尋回合，經批准後完成（13:20～13:22，用了 1 個工具）；A 那張批准卡出現在輸入框上方的停靠區（#805）。B v102 一則回合被接受並執行，但先停在 Teams 連線卡：B 沒連 Teams，而且 12:31 按過的「先不用」只記在 VM 記憶體，換版到 v102 後就遺失（持久化修正見 #807）；Neal 13:30 再按一次「先不用」後，回合完成，回覆「B 正常」。A 舊環境的工作檔留在舊 session，新環境看不到；對話與 checkpoint 不受影響。
 - **部署 follow 只叫醒 A、B、C**：其餘 Agent 仍會收到新版本，但不叫醒。原本 4 個 `fa-agent-*`（各 2 vCPU／4Gi、閒置 1 小時）每次部署都會白跑；粗估每次部署省約 USD1（推論：用 Container Apps 單價推算，沒有查 Foundry Hosted 的實際單價）。這只改了本機部署腳本，沒有寫入雲端。
 - 上一節 `dev-cap-650-1011` 補充：起因還包括 10-11 的 Teams 短測；dev 規格維持現狀，沒有降規模（Neal 10-11 確認）。上述最佳化只刪除閒置資源並調整閒置逾時，A／B 的規格沒有變。
 
@@ -20,7 +32,7 @@
 - **Neal 10-11 原話**：「同意 Teams 短測，預算上限提高到 USD650」。
 - **上限**：dev 共用上限由 USD600 提高到 **USD650**。停損比照原本的間隔，訂在 **USD630**，到這個數字就先停下來回報。
 - **實查**（Cost Management `ActualCost`，RG 範圍，2025-10-11 起到 10-11 報表日，API `2023-11-01`）：`rg-faexample` USD506.60、`ME_cae-facontext-private` USD19.87，合計約 **USD526.5**。報表約晚一天，10-11 只出現 1.84；10-08～10-10 每日 RG 約 USD21.9、15.1、21.6。
-- 起因：照每日固定開銷，約 10-13 會到原停損 USD580。10-11 的計費操作：dev 三次部署（`ff4b4cbb`、`7eb334d7`、第 25 版候選 `5fee7ec8`，各兩個 build、一次 API 換版、一次 Hosted sync）與一次 relay 新版本。
+- 起因：照每日固定開銷，約 10-13 會到原停損 USD580；另外還有 Neal 同意的 10-11 Teams 短測。dev 規格維持現狀（Neal 10-11 確認：只提高上限、不降規模）。10-11 的計費操作：dev 三次部署（`ff4b4cbb`、`7eb334d7`、第 25 版候選 `5fee7ec8`，各兩個 build、一次 API 換版、一次 Hosted sync）與一次 relay 新版本。
 - 其他規則不變：不清帳；`budget_enforced=false`，這仍是記錄用的上限，沒有建立 Azure Budget；stage 照舊另列每月 USD200。
 
 <a id="dev-cap-600-1010"></a>

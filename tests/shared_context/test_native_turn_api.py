@@ -448,7 +448,8 @@ def test_every_wait_answer_advanced_the_follow_and_the_same_rid_is_accepted_once
     monkeypatch.setattr(NativeSessions, "admission", admission)
     monkeypatch.setattr(NativeSessions, "advance", advance)
     monkeypatch.setattr("shared_context.behavior_native_sessions._latest_version_reader",
-                        lambda client, _id: case.remote.target if source == "prepared-without-new-reader" else None)
+                        lambda client, _id, _selected=None:
+                        case.remote.target if source == "prepared-without-new-reader" else None)
     monkeypatch.setattr(case.foundry.http, "_transport", httpx.MockTransport(hosted))
     monkeypatch.setattr(NativeTurnGateway, "_ready_handoffs", lambda _g, _p, view: sent.append(view.state))
     body = InstructionSubmit(request_id="sent-during-follow", content="Original user text").model_dump(mode="json")
@@ -563,7 +564,8 @@ def test_a_submit_never_bootstraps_an_unprepared_agent(native_api, monkeypatch, 
     monkeypatch.setattr(NativeSessions, "current", current)
     monkeypatch.setattr(NativeSessions, "advance", lambda *_a, **_k: pytest.fail("a submit must not bootstrap"))
     monkeypatch.setattr("shared_context.behavior_native_sessions._latest_version_reader",
-                        lambda client, _id: case.remote.target if platform == "session-without-preparation" else None)
+                        lambda client, _id, _selected=None:
+                        case.remote.target if platform == "session-without-preparation" else None)
     refused = submit(case, rid="before-prepare")
     error = refused.json()["error"]
     assert (refused.status_code, error["code"]) == (409, "NATIVE_SESSION_CHANGED")

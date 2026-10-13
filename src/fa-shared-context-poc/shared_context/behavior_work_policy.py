@@ -1408,7 +1408,12 @@ class WorkPolicyControl:
                     agent_version=conversation.hosted_agent_version,session_id=conversation.hosted_session_id)
                 original=executor.clients[target.executor_id]
                 client=original if original.target==target else original.for_target(target)
-                client.verify_session(before_send=lambda:self._human(principal,"submit"))
+                session=client.verify_session(before_send=lambda:self._human(principal,"submit"))
+                if session.status!="active":
+                    # ADR-0009 §10: the metadata read wakes nothing, but a turn sent to an idle (reclaimed) SID makes
+                    # the platform re-create it on an arbitrary version; reset or a new conversation stays explicit.
+                    raise Problem(409,"CONVERSATION_SESSION_UNAVAILABLE",
+                        "the original session is not active and is not woken; reset or new session must be explicit")
             selected_model=self.models.select(instruction.model)
             if capability_capture is not None and capability_capture.vision and selected_model.supports_image_input is not True:
                 raise Problem(422,"CAPABILITY_MODEL_UNSUPPORTED","a selected capability needs a model that accepts images")

@@ -129,21 +129,26 @@ class FollowFiles:
             self.destination.target, session_id=self.view.previous_hosted_session_id,
             agent_version=self.view.previous_agent_version))
         actual = _session_metadata(client)
-        if actual is None or actual.status not in {"active", "idle"}:
-            raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE", "the original source is not available for a file snapshot")
+        # ADR-0009 §10: only an `active` source may be called. Invoking an `idle` (compute-reclaimed) session makes the
+        # platform re-create it, possibly bound to another version, before any FA code runs.
+        if actual is None or actual.status != "active":
+            raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE",
+                          "the original source is not active; it was not woken for a file snapshot")
         if actual.version_indicator.agent_version != self.view.previous_agent_version:
             raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE", "the source version differs from its FA binding; no source was invoked")
         return client
 
-    def require_source_version(self):
+    def require_source_version(self, *, active=True):
+        """Metadata only. ``active=False`` only checks the version; reads still need FA's recorded stop."""
         from .behavior_native_sessions import _session_metadata, _target
         source = self.destination.for_target(_target(
             self.destination.target, session_id=self.view.previous_hosted_session_id,
             agent_version=self.view.previous_agent_version))
         metadata = _session_metadata(source)
-        if metadata is None or metadata.version_indicator.agent_version != self.view.previous_agent_version:
+        if (metadata is None or metadata.version_indicator.agent_version != self.view.previous_agent_version
+                or active and metadata.status != "active"):
             raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE",
-                          "the original source version is unavailable; no source file read or stop was sent")
+                          "the original source is not active on its version; no source file read or stop was sent")
 
     def copy_step(self):
         observed = self.step("read")
@@ -205,18 +210,29 @@ class FollowFiles:
         return files
 
     def before_stop(self):
+        """Verify an active source before FA stops it; True when FA's own accepted stop is already recorded."""
         files = self.step("read").progress
         if files is None or not files.source_verified:
             raise Problem(409, "NATIVE_FILES_UNAVAILABLE", "the original workspace has not been verified")
         if not files.stop_started:
+            # `_source()` refuses a non-active source: an idle one was reclaimed by the platform, so FA neither wakes
+            # it to verify nor stops it; the follow ends without files (NATIVE_FILES_SOURCE_UNAVAILABLE).
             self.step("verify_source", client=self._source())
-            self.step("stop")
+        return files.stop_started
+
+    def record_stop(self):
+        """Only after the platform accepted FA's own stop: ``stop_started`` means FA stopped this source."""
+        self.step("stop")
 
     def stopped_step(self):
-        self.require_source_version()
+        self.require_source_version(active=False)
         files = self.step("read").progress
         if files is None or not files.source_verified:
             raise Problem(409, "NATIVE_FILES_UNAVAILABLE", "the original transfer has not been verified")
+        if not files.stop_started:
+            # ADR-0009 §10 exception: an inactive source's files are read only after FA's own recorded stop.
+            raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE",
+                          "the original source was not stopped by FA; its files are not read")
         if files.source_stopped_verified:
             return True
         deadline = monotonic() + FILE_STEP_SECONDS

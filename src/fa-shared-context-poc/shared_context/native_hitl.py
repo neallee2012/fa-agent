@@ -119,6 +119,18 @@ class _ConsentDecision(_Scope):
     command: ConnectorConsentDecision
 
 
+class _ConsentDeclined(_Scope):
+    """The owner's first 「先不用」 for one toolbox in one conversation; later cards for it are refused."""
+
+    kind: Literal["native_hitl_consent_declined"] = "native_hitl_consent_declined"
+    agent_id: Identifier
+    conversation_id: Identifier
+    toolbox_name: str
+    consent_id: Digest
+    owner_oid: Identifier
+    created_at: datetime
+
+
 class _Authorization(_Scope):
     kind: Literal["native_hitl_authorization"] = "native_hitl_authorization"
     authorization: NativeHitlAuthorization
@@ -205,6 +217,11 @@ class NativeHitlService:
         if (str(scope.tenant_id), scope.team_id, str(scope.identity.oid), scope.identity.actor) != (
                 principal.tenant_id, principal.team, principal.oid, principal.actor_id):
             raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "the call belongs to another Agent or Team")
+
+    @staticmethod
+    def _declined_key(principal, call, toolbox_name):
+        return hitl_key("consent-declined", principal.tenant_id, principal.team, call.agent_id,
+                        call.conversation_id, toolbox_name)
 
     @staticmethod
     def _head_key(principal):
@@ -305,6 +322,8 @@ class NativeHitlService:
             cid = consent_id(principal.tenant_id, principal.team, command.consent.call)
             reads.extend((cid, hitl_key("consent-decision", principal.tenant_id, principal.team, cid),
                           self._index_key(principal, self._turn(command.consent.call))))
+            if not legacy:
+                reads.append(self._declined_key(principal, command.consent.call, command.consent.toolbox_name))
         elif isinstance(command, ConnectorConsentDecision):
             reads.extend((command.consent_id,
                           hitl_key("consent-decision", principal.tenant_id, principal.team, command.consent_id)))
@@ -312,6 +331,9 @@ class NativeHitlService:
             if row is not None:
                 consent = self._load(row, command.consent_id, ConnectorConsentPending)
                 reads.append(self._index_key(principal, self._turn(consent.command.consent.call)))
+                if not legacy:
+                    reads.append(self._declined_key(
+                        principal, consent.command.consent.call, consent.command.consent.toolbox_name))
         if not legacy:
             if pid is not None:
                 reads.append(hitl_key("authorization", principal.tenant_id, principal.team, pid))
@@ -692,6 +714,8 @@ class NativeHitlService:
             cid = consent_id(principal.tenant_id, principal.team, call)
             if rows[cid] is not None:
                 raise Problem(409, "NATIVE_HITL_CALL_EXISTS", "read the original Connect card; never restart its wait")
+            if rows[self._declined_key(principal, call, command.consent.toolbox_name)] is not None:
+                raise Problem(409, "NATIVE_HITL_HUMAN_DENIED", "the owner declined this connector in this conversation")
             pending = ConnectorConsentPending(
                 **scope, consent_id=cid, agent_oid=principal.oid, command=command,
                 created_at=intent.created_at, expires_at=intent.expires_at)
@@ -715,7 +739,16 @@ class NativeHitlService:
             if index.closed:
                 raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn has ended")
             decision = _ConsentDecision(**scope, consent_id=consent.consent_id, owner_oid=principal.oid, command=command)
-            return ControlChanges(writes=(_write(dkey, decision, "create"),), result={
+            writes = [_write(dkey, decision, "create")]
+            if command.choice == "decline":
+                asked = consent.command.consent
+                mkey = self._declined_key(principal, asked.call, asked.toolbox_name)
+                if rows[mkey] is None:  # an earlier decline in this conversation keeps its row
+                    writes.append(_write(mkey, _ConsentDeclined(
+                        **scope, agent_id=asked.call.agent_id, conversation_id=asked.call.conversation_id,
+                        toolbox_name=asked.toolbox_name, consent_id=consent.consent_id, owner_oid=principal.oid,
+                        created_at=now), "create"))
+            return ControlChanges(writes=tuple(writes), result={
                 **result, "consent_id": consent.consent_id, "status": command.choice})
         if isinstance(command, NativeHitlAnswer):
             question = self._question(principal, command.question_id, rows)
@@ -953,7 +986,7 @@ def validate_native_hitl_history(inventory, config):
     models = {model.model_fields["kind"].default: model for model in (
         _RulesHead, _RulesSnapshot, _Intent, _State, _Decision, NativeHitlPending, NativeHitlOnceGrant,
         _TurnIndex, _Authorization, HitlMaterialPart, NativeHitlQuestionPending, _QuestionAnswer,
-        ConnectorConsentPending, _ConsentDecision,
+        ConnectorConsentPending, _ConsentDecision, _ConsentDeclined,
     )}
     values = {}
     for key, row in inventory.rows.items():
@@ -1021,6 +1054,10 @@ def validate_native_hitl_history(inventory, config):
             expected = hitl_key("consent-decision", tenant, team, value.consent_id)
             if value.owner_oid != owner_oid:
                 raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the original click has no matching Team owner")
+        elif isinstance(value, _ConsentDeclined):
+            expected = hitl_key("consent-declined", tenant, team, value.agent_id, value.conversation_id, value.toolbox_name)
+            if value.owner_oid != owner_oid:
+                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the original decline has no matching Team owner")
         elif isinstance(value, _QuestionAnswer):
             expected = hitl_key("answer", tenant, team, value.question_id)
             if value.owner_oid != owner_oid:

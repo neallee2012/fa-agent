@@ -529,8 +529,11 @@ class PullAdapter:
                             # The server says this send certainly did not go out (rid:<RID> was not created). API #680
                             # sets it only then, on a 4xx refusal or a 5xx whose uncertainty is about a version follow,
                             # not this message. Without it a 5xx stays UNKNOWN. Its own code is kept, whatever it is.
+                            # A cancel or delivery acknowledgement carries it when no session was invoked (#813).
                             not_dispatched = (method == "POST" and path in {
-                                "/work-policy/v1/native-turns/submit", "/work-policy/v1/responses-turns/submit"}
+                                "/work-policy/v1/native-turns/submit", "/work-policy/v1/responses-turns/submit",
+                                "/work-policy/v1/native-turns/cancel", "/work-policy/v1/responses-turns/cancel",
+                                "/work-policy/v1/native-turns/delivered", "/work-policy/v1/native-turns/append"}
                                 and 400 <= response.status_code < 600 and type(code) is str
                                 and re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", code) is not None
                                 and error.get("not_dispatched") is True and isinstance(body, dict)
