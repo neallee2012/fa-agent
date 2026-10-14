@@ -870,6 +870,43 @@ dev 2026-10-12：呼叫 idle（compute 已回收）的舊 session，平台會在
 時走）與 `test_session_version_failure.py`（idle 的 `fa-chat-` SID 不 invoke）。拿掉修正時這些測試都失敗
 （`active` 照舊搬檔與 retarget 的 `active`／`creating` 對照組除外）。離線替身，未部署、未在雲端驗證。
 
+<a id="binding-row"></a>
+## Agent 綁定列（ADR-0009 phase 1，CODE/offline，未部署）
+
+[ADR-0009 §2](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#2-agent-綁定列只記位置與實際版本)：
+API 在既有 Context Table 為每個 Agent 記一列「目前的 SID 在哪、它實際跑哪一版」。phase 1 **只記錄**：不改任何回合的
+結果，送出、讀取與換環境仍照現行程式定位（`_scoped`、`_latest_version_reader`、`_metadata_sessions` 到 phase 3 才改查這一列）。
+
+- **位置與寫法：** `shared_context/native_binding.py`。PartitionKey `native-binding:<sha256(tenant, team)>`（不與舊的
+  authority 分割區共用），RowKey `agent:<agent_id>`；經 `TableRepository` 的 get／create／replace，寫入一律帶剛讀到的
+  ETag（create 409、replace 412 就重讀再算，最多 4 次）。讀寫這一列不呼叫任何 session（不 invoke、不讀 metadata、
+  不經 Files、不 stop）。FA 不刪這一列。
+- **欄位：** 目前 SID、這個 SID 建立時綁的版本、同一 SID 漂移旗標、漂移通知待送位與通知的 vY（`notice_to_version`：設定
+  旗標時觀察到的版本，與旗標同一次寫入；紀錄的實際版本之後還會變）、紀錄的實際版本（含觀察時間與來源：`vm`＝VM 接受為
+  expected 或自報，`claim`＝認領時讀到、沒有 VM 確認的 metadata；`metadata-active` 是 ADR 的標籤，phase 1 不寫）、最近一次讀到的 `get_session` `created_at`（只在既有流程本來就讀時順便記，可能是空的）、
+  協定 profile、之前的 SID 清單（各附版本，最多 64 個）、最近一次換環境的理由與 `files_migrated`。
+- **寫入時點：** ① 認領（Insert Entity，已存在就讀回、不覆寫）：主人送出成功後、或 follow 停止來源前讀來源 metadata 時；
+  讀到的版本不同於建立時的版本，同一次寫入設定漂移旗標與通知位。② 觀察到不同版本：較新 image 的 409
+  `NATIVE_SESSION_CHANGED` 帶 `actual_version`（來源 `vm`）；舊 image 只在 VM 接受了 expected＝這個版本（送出成功）之後寫
+  （來源 `vm`），被拒絕時什麼都不寫。旗標只從「未設定」變「設定」那次一起設通知位；漂移後漂回也不清旗標。
+  ③ 換環境 commit 後（follow／retarget 的 `ready` 結果，含重跑回傳的同一個 `ready`）：目前 SID＝新 SID、建立時的版本＝
+  commit 結果的 `hosted_agent_version`、清旗標與通知位、來源 SID 加進之前的 SID 清單；commit 的之前 SID 不是這一列的目前
+  SID 時，兩個都加。已寫過就不再寫，所以 commit 後、寫入前崩潰由下一次 follow 補寫。
+- **通知：** 通知位是「待送」時，主人本人的回應帶結構化欄位 `environment_notice`
+  （`{"kind":"platform_version_changed","from_version":"vX","to_version":"vY"}`；vX＝SID 建立時的版本、vY＝`notice_to_version`）：工作台的 `/native-turns/submit`、
+  `/responses-turns/submit` 回條，以及 Teams 主人回覆的 `RelayReply`。群組啟動、routine、Agent 間交辦、HITL 等非主人
+  路徑不帶也不清。**phase 1 不清除**：清除與工作台、Teams 的顯示一起在 phase 2 實作（ADR-0009 §4 末段、
+  §8 待辦），現在清了就沒人看到；所以在 phase 2 之前每個主人回應都會再帶一次。
+- **失敗不影響回合：** 這一列讀寫失敗只留 `NATIVE_BINDING_UNRECORDED` log，回合照原結果回（讀失敗時這次不帶通知）；
+  下一次觀察再寫同一個 CAS。送出成功後多一次 Table 點讀（約 10–30 ms，未量測；沒有與送出並行）。
+  其他 log：`NATIVE_BINDING_CLAIMED`、`NATIVE_VERSION_OBSERVED`、`NATIVE_BINDING_DIVERGED`（觀察到的 SID 不是這一列的
+  目前 SID：不一致，不記漂移）。
+- **限制：** 現行 image 的 409 沒有 `actual_version`，而現行讀取器在 metadata 版本不同時就不送（`_platform_reader`），
+  所以 phase 1 在舊 image 上實際寫得到的漂移只有「認領時已漂移、之後又漂回」；漂移重送與核回條屬 phase 3。
+
+**Verified against：** `tests/shared_context/test_native_binding.py`（離線替身，`InMemoryRepository` 代 Table）。
+未部署、未在 Azure Table 或雲端驗證。
+
 <a id="automatic-environment-policy"></a>
 ## FA自動核對與不搬檔接續（CODE/offline）
 
@@ -4644,8 +4681,9 @@ native 每個 RID 都從該回合的 capture 重組完整 system message，以 S
   同一對話必須相同的 capture，角色更新後舊對話追問會回 409 `NATIVE_CAPTURE_CHANGED`；現在它和能力、Team 記憶範圍一樣屬於
   每回合的部分（`native_turns._conversation_capture`）。同一 RID 的 capture 仍固定在回條裡，重送不會換角色。
 - **仍固定在對話上的**：模板（含 `turn_origin_profile`、provider）與模型選擇，沿用 API 對既有對話讀原模板的做法；
-  改模板只對新對話生效，舊對話送不同模板仍回 409。模型選擇的唯一例外：對話還沒有任何 completed 回合（例如第一回合就被模型拒絕），
-  見 [VM 直連的模型拒絕段](#vm-直連-responsesadr-0006-5-t4b預設關閉)。
+  改模板只對新對話生效，舊對話送不同模板仍回 409。模型選擇的例外：對話還沒有任何 completed 回合（例如第一回合就被模型拒絕），
+  見 [VM 直連的模型拒絕段](#vm-直連-responsesadr-0006-5-t4b預設關閉)；以及 Hosted 打開 `FA_NATIVE_MODEL_SWITCH` 時，
+  已有完成回合的對話也能換模型，見[對話中換模型](#native-model-switch)。
 - **其他段落**：能力每回合依目前 head 取交集；隊友名單（PA-03）與記憶都是每回合重組，沒有就不出現。
 
 直接測項：`tests/shared_context/test_native_sdk_runtime.py::test_pinned_sdk_resume_replaces_the_previous_role_in_the_same_conversation`
@@ -14253,8 +14291,51 @@ API 讀到結束回條後，**先**呼叫 `record_turn_usage(control, job_id=…
       （`base_ckpt` 為空、上一回合不是 completed），例如第一回合就被模型拒絕：此時下一回合本來就從空白 SDK session 開始，
       沒有舊模型產生的內容會被接續，所以接受只差在模型選擇（`model`、`model_capacity`、`reasoning_summary`）的新 RID，
       並在 `_allocate` 佔用回合時把對話 capture 換成新模型。模板、provider 等其他欄位不同仍回 409；
-      之後一旦有 completed 回合，再換模型仍回 409 `NATIVE_CAPTURE_CHANGED`。規則只寫在 `NativeTurnRuntime._capture_fits`，
+      預設（`FA_NATIVE_MODEL_SWITCH` 未設或 `0`）之後一旦有 completed 回合，再換模型仍回 409 `NATIVE_CAPTURE_CHANGED`；
+      打開後已有完成回合也能換，見下方[對話中換模型](#native-model-switch)。規則只寫在 `NativeTurnRuntime._capture_fits`，
       由 `_submit_locked`、`_response_slot`、`_allocate` 共用。
+      開關關閉時，工作台在這種對話把模型選單固定在原模型、改提供「用新模型開新對話」，被拒時說明原因（2026-10-13 過渡做法，
+      見[工作台說明](web_test_console/README.md#model-lock)）；開關打開時不固定。
+
+<a id="native-model-switch"></a>
+- **對話中換模型（`FA_NATIVE_MODEL_SWITCH`，預設關；LOCAL，未部署）**：Neal 2026-10-13 批准實作，要先在 dev 用真模型探測再打開。
+  - **設定**：只有一個開關，放在 Hosted definition 的環境變數（部署 overlay，`behavior_agent_versions._ENVIRONMENT_FLAGS`
+    已接受 `"0"`／`"1"`；`deploy/azd/profile.defaults.json` 與 `deploy/stage/stage.json` 都沒有寫，所以 dev／stage 照舊關閉）。
+    要打開時在該環境的 Hosted overlay 加 `"FA_NATIVE_MODEL_SWITCH": "1"`；值不是 `0`／`1` 時 admission 回 503。
+    API 不另設：它讀所選 Hosted 版本 definition 上的同一個值（和判斷 Responses lane 同一次讀取），放在 template options 的
+    `responses.model_switch`（關閉時省略，bytes 不變），工作台只照它顯示。
+  - **接單**：`_capture_fits` 在開關打開時接受「只差模型選擇」（`model`、`model_capacity`、`reasoning_summary`）的新 RID，
+    即使已有 completed 回合；模板、provider、connector 範圍等其他部分不同仍回 409 `NATIVE_CAPTURE_CHANGED`。
+    這個 RID 的回條記自己的 capture，`_allocate` 在 meta ETag 下把對話 capture 換成新模型；之前的回條與 checkpoint lineage
+    的 `capture_digest` 都不改（界線 7、8）。
+    - **connector 上限**：採用新模型時，對話 capture 的 `connectors` 仍保留第一次的 Team connector 集合，當作之後的上限
+      （`_capture_fits` 拒絕上限外的 connector；API 的 `team_connector_narrowing.resolve_connectors` 每回合只給 Team 仍授予的）。
+      換模型那一回合 connector 較少時，不會把上限縮小，之後重新啟用的 connector 還能回來。
+      **開關關閉時也有行為變更**：還沒有 completed 回合前換模型（例如第一回合被模型拒絕後）原本會把對話 capture 整個換成新回合的
+      capture（connector 集合也跟著換成新回合的、可能較小的集合），現在同樣保留第一次的集合。這不是擴權：上限不會超過
+      這段對話第一次就已允許的集合，而每回合實際拿到的 connector 仍由 `resolve_connectors` 依 Team 目前的授予重新決定。
+  - **放不下就不送**：換模型時，若上一個 completed 回合記錄的 SDK context 快照（`session.usage_info` 的 `current_tokens`，
+    PA-16 B `sdk_context`；上一回合沒有 completed 時，量下一回合要恢復的 `base_ckpt` 那一回合）大於新模型宣告的
+    `max_prompt_tokens`（沒有就用 context window），在 RID 建立前回 409
+    `NATIVE_MODEL_CONTEXT_EXCEEDED`（`not_dispatched`，帶 `model`），什麼都不執行、不壓縮。沒有量到（例如舊回合沒有 inference
+    紀錄）或新模型沒宣告上限（目前 `gpt-4.1-mini` 的 `model-facts.json` context 為 null）時不擋，仍由 runtime 的
+    `ASSISTANT_CONTEXT_LIMIT` 把關；`model-facts.json` 刻意不改，因為改了會讓既有 `gpt-4.1-mini` 對話的 capture 變動。
+  - **怎麼套用新模型**：只走官方 cold path。`NativeResidentPool.continue_live` 比對這回合的模型與留著的 SDK 啟動時的模型，
+    不同就丟掉（log `RESIDENT_SDK_DISCARDED reason=model_changed`），這回合從已發布的 checkpoint（私有 reasoning 已去除）
+    以 `resume_session(model=新模型, provider.model_id=新模型, model_capabilities=新上限)` 冷啟動，所以舊模型的 live 私有事件
+    不會帶給新模型。不用 SDK 實驗性的 `session.set_model`／`session.model.switchTo`。換模型那一回合會慢一次（重新載入對話、
+    prompt cache 重算）。
+  - **壓縮**：CTX-03 沒有啟用 model-switch compaction；auto profile 原本接受任何非 manual 的 trigger，現在也拒絕 `model_switch`
+    （`SDK_STATE_SOURCE_UNVERIFIED`）。cold resume 不會產生這個 trigger 是**推定**：換模型不呼叫 `switchTo`，
+    但尚未在 runtime 1.0.83 實測。若實際會產生，換模型的回合會在保存前 fail closed（`SDK_STATE_SOURCE_UNVERIFIED`），
+    不會寫出 checkpoint；dev 探測把「換模型回合沒有 `model_switch` compaction、沒有這個錯誤」列為通過條件。
+  - **排程**：排程回合改用對話目前的模型（原本沒帶模型就用專案預設；對話模型和預設不同、又已有完成回合時，每次都在接單前被
+    409 `NATIVE_CAPTURE_CHANGED` 擋下）。這個修正不受開關影響。
+  - **用量**：照舊每回合、每個 deployment 記一筆（`TurnModelUsage`；`record_turn_usage` 依各組自己的模型定價），同一對話混用模型
+    不需要改。
+  - 測試：`test_native_model_switch.py`、`test_native_routine_api.py`
+    「a routine turn runs on its conversation's model」、`test_agent_versions.py`「reports model switching」；
+    工作台見[工作台說明](web_test_console/README.md#model-switch)。真 SDK／真模型尚未驗證，等 dev 探測。
     - 已知未處理（既有行為，本次不改換版接續規則）：被拒後若 Agent 換版、換了 Hosted session，只有被拒回合的對話仍由
       `_continuation_blocker` 回 `NATIVE_ENVIRONMENT_CHECKPOINT_UNAVAILABLE`，要開新對話。
 - **用量**：一開始送出就算一次請求。完整讀完串流、而且拿到合法 usage 才算已量測；錯誤狀態、串流中斷或被放棄，都只算次數、不填 0。

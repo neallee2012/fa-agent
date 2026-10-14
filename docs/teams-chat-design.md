@@ -52,14 +52,14 @@ N1 的比較資料就是 echo 探針本身（它就是被直接發布的 agent�
 | # | 量到的事 |
 |---|---|
 | 1 | 探針 #1 `teams-publish-echo`：照官方 REST 文件自己建 bot（`msaAppId`＝agent 的 `instance_identity.client_id`、SingleTenant、endpoint `https://<acct>.services.ai.azure.com/api/projects/<proj>/agents/<agent>/endpoint/protocols/activityProtocol`、開 Teams 頻道），再用 Microsoft 365 publish API 以 `publishScope: Shared` 發布。Teams 訊息全部被默默丟掉：沒建 Hosted session、沒有容器 log、App Insights 沒有 request；Bot Service 的 Teams 頻道只有早上兩筆「There was an error sending this message to your bot.」，之後的訊息什麼都沒有。 |
-| 2 | 探針 #2 `teams-publish-echo2`（同一個 image）用 Foundry 入口網站一鍵發布（「Just you」）。Foundry 自動建了 bot `teams-publish-echo274900`（S1、SingleTenant、app id 一樣是 agent 的 instance identity），endpoint 是 `.../agents/teams-publish-echo2/endpoint/protocols/activityprotocol?api-version=2025-11-15-preview`。其他 bot 屬性和 #1 相同（沒有 OAuth connection 設定、同 tenant、串流關、schema 1.3）。**#2 能用。** 差別只在 endpoint 有沒有 `api-version`；「少了 `api-version` 造成默默丟訊息」是推論，還沒用改 #1 的方式證明。 |
+| 2 | 探針 #2 `teams-publish-echo2`（同一個 image）用 Foundry 入口網站一鍵發布（「Just you」）。Foundry 自動建了 bot `teams-publish-echo-example`（S1、SingleTenant、app id 一樣是 agent 的 instance identity），endpoint 是 `.../agents/teams-publish-echo2/endpoint/protocols/activityprotocol?api-version=2025-11-15-preview`。其他 bot 屬性和 #1 相同（沒有 OAuth connection 設定、同 tenant、串流關、schema 1.3）。**#2 能用。** 差別只在 endpoint 有沒有 `api-version`；「少了 `api-version` 造成默默丟訊息」是推論，還沒用改 #1 的方式證明。 |
 | 3 | 第一則訊息：平台先顯示「Please wait while I process your request」，接著出「User Sign-in」卡；使用者（admin@contoso）登入一次後，原訊息照常送進容器並得到回覆。 |
 | 4 | 同一個 Teams 對話落在同一個 Hosted session（同一台 VM）、同一個 `conversation` id，請求計數 1→2。`/foundry_new_preview` 由平台處理（回「Conversation reset…」，不進容器）；下一則訊息換新 session，也換新 `conversation`。所以官方路徑是**每個 Teams 對話（每個 caller）一台 VM**。 |
 | 5 | 每個請求都帶 `x-agent-user-id`，值是發話人的 Entra **object id（oid）**：sha256(oid) 前 12 碼相符；同一個人從 Teams 和直接打 API 得到同一個值。沒有 `x-ms-user-identity`。容器收不到 Authorization、token、cookie 類 header，metadata 也沒有像 JWT 的值，所以 relay 沒有 OBO 可用的 token。 |
 | 6 | Request body 欄位：`agent_reference`、`background`、`context_management`、`conversation`、`include`、`input`、`metadata`、`model`、`store`、`stream`。metadata 有 `ActivityId`（每則 Teams 訊息都不同，可當 RID／去重鍵）、`ActivityProtocolConversationId`，以及 `x-ms-telemetry-*`。沒有用 `previous_response_id`，用的是 `conversation`。 |
 | 7 | 長回覆：`sleep 20`／`60`／`120` 都送到。Teams 顯示「Please wait…」加進度條和 Stop 鍵，最後換成答案。`arrivals` 顯示每則訊息正好一個容器請求（HTTP 200，492 ms／20.4 s／60.4 s／120.4 s），沒有重試或重送。沒有串流。Stop 沒有測。 |
 | 8 | 發布後 agent endpoint 的協定是 activity＋responses，`authorization_schemes` 是 Entra＋BotServiceRbac。BotServiceRbac 要求 caller 在 tenant 內、而且對 project 有 Foundry 權限（admin@contoso 有 Foundry User）。 |
-| 9 | 留在 dev 的資源（Neal 同意保留，沒有刪）：agent `teams-publish-echo`、`teams-publish-echo2`；bot `teams-publish-echo-bot`（F0）、`teams-publish-echo274900`（S1；Teams 是標準頻道，不計訊息費）；兩個只有 admin@contoso 看得到的 Teams app。 |
+| 9 | 留在 dev 的資源（Neal 同意保留，沒有刪）：agent `teams-publish-echo`、`teams-publish-echo2`；bot `teams-publish-echo-example-bot`（F0）、`teams-publish-echo-example`（S1；Teams 是標準頻道，不計訊息費）；兩個只有 admin@contoso 看得到的 Teams app。 |
 
 ## N2 設計
 

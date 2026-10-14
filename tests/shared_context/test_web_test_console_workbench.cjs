@@ -4668,6 +4668,174 @@ test("not-dispatched NATIVE_SESSION_CHANGED asks to resend later, not to follow 
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
 });
 
+// Stage release 28: a model picked after a completed turn was refused with NATIVE_CAPTURE_CHANGED and the page said only
+// 「原因見支援明細」 under a 「發生問題」 header. Interim until a conversation can switch models.
+function pinnedChat(){
+  const data=nativeChat("completed");
+  // The default differs from the pinned model, so showing the pinned one is not the default by chance.
+  data.composer.models={...copy(models),default_model:"offline-chat-b"};
+  return data;
+}
+test("after a completed turn the model dropdown shows the conversation's model and a new pick opens a new conversation",async()=>{
+  const ui=await open(pinnedChat()),model=ui.nodes.get("model");
+  assert.equal(model.value,"offline-chat-a");
+  assert.equal(ui.nodes.get("model-lock-note").hidden,true);
+  model.value="offline-chat-b";model.events.change();
+  assert.equal(model.value,"offline-chat-a","the pick goes back to the conversation's model");
+  assert.equal(ui.nodes.get("model-lock-note").hidden,false);
+  assert.equal(ui.text("model-lock-text"),"這段對話固定用 OFFLINE 聊天部署 A；要換模型請開新對話");
+  assert.equal(ui.text("model-lock-new-conversation"),"用 OFFLINE 聊天部署 B 開新對話");
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false,"changing the dropdown writes nothing");
+  ui.render(pinnedChat());
+  assert.equal(model.value,"offline-chat-a","a later read keeps the conversation's model");
+  ui.click("model-lock-new-conversation");await ui.tick();
+  assert.deepEqual(postUrls(ui),["/api/instructions/conversations/new"]);
+  assert.equal(vm.runInContext("modelDrafts.get(scopeKey(OPENING_DRAFT))",ui.context),"offline-chat-b");
+  assert.equal(model.value,"offline-chat-b","the opening conversation starts on the picked model");
+  assert.equal(ui.nodes.get("model-lock-note").hidden,true);
+});
+test("before any completed turn the model stays free to choose",async()=>{
+  for(const data of [nativeChat("unknown"),(()=>{const value=pinnedChat();value.tasks[0].admission=null;return value})()]){
+    data.composer.models={...copy(models),default_model:"offline-chat-a"};
+    const ui=await open(data),model=ui.nodes.get("model");
+    model.value="offline-chat-b";model.events.change();
+    assert.equal(model.value,"offline-chat-b");
+    assert.equal(ui.nodes.get("model-lock-note").hidden,true);
+    assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+  }
+});
+test("a NATIVE_CAPTURE_CHANGED refusal says the conversation keeps its model and nothing ran",async()=>{
+  const data=pinnedChat(),refused=copy(nativeChat("unknown").tasks[0]);
+  Object.assign(refused,{task_id:"capture-refused",submit_request_id:"capture-refused",instruction:"換模型再問",
+    native_receipt:null,admission:null,not_accepted:true,status:{data:{state:"not_accepted"},observed_at:when},
+    submission:{state:"REFUSED",code:"NATIVE_CAPTURE_CHANGED",not_dispatched:true}});
+  data.tasks.push(refused);
+  const ui=await open(data);
+  const said="這段對話固定用 OFFLINE 聊天部署 A，換模型要開新對話；這則訊息沒有執行。";
+  const shown=JSON.stringify(ui.nodes.get("conversation-history").children,(key,value)=>key==="events"?undefined:value);
+  assert.ok(shown.includes(said),"the refused turn says why");
+  assert.doesNotMatch(shown,/支援明細|修改後重新送出/);
+  vm.runInContext('lastError={code:"NATIVE_CAPTURE_CHANGED",not_dispatched:true,request_id:"capture-refused"};render()',ui.context);
+  assert.equal(ui.text("error-message"),said);
+  assert.notEqual(ui.text("chat-presence"),"發生問題");
+  assert.equal(ui.text("chat-presence"),"需要處理");
+  assert.equal(vm.runInContext('friendlyError({code:"NATIVE_CAPTURE_CHANGED",not_dispatched:true})',ui.context),said);
+  // Without not_dispatched it is a changed resend or receipt, not a model pick: the general text and header stay.
+  assert.doesNotMatch(vm.runInContext('friendlyError({code:"NATIVE_CAPTURE_CHANGED"})',ui.context),/沒有執行|換模型/);
+  vm.runInContext('lastError={code:"NATIVE_CAPTURE_CHANGED"};render()',ui.context);
+  assert.equal(ui.text("chat-presence"),"發生問題");
+  // With no known model the sentence leaves the name out.
+  ui.render(nativeChat("unknown"));
+  assert.equal(vm.runInContext('friendlyError({code:"NATIVE_CAPTURE_CHANGED",not_dispatched:true})',ui.context),
+    "這段對話固定用原本的模型，換模型要開新對話；這則訊息沒有執行。");
+});
+
+// FA_NATIVE_MODEL_SWITCH: the API reports the selected Hosted version's flag with the Responses options; the page only
+// follows it. With it on the interim pin above is off, and a switching send says once that its turn is slower.
+function switchingChat(){
+  const data=pinnedChat();
+  data.composer.responses={enabled:true,history_source:"conversation",model_switch:true};
+  Object.assign(data.composer,{request_id:"draft-rid",editable:true,can_submit:true,content:null,observed_at:when});
+  return data;
+}
+test("with model switching on, the dropdown stays free after a completed turn and nothing is pinned",async()=>{
+  const ui=await open(switchingChat()),model=ui.nodes.get("model");
+  assert.equal(vm.runInContext("pinnedConversationModel()",ui.context),null);
+  model.value="offline-chat-b";model.events.change();
+  assert.equal(model.value,"offline-chat-b","the pick stays");
+  assert.equal(ui.nodes.get("model-lock-note").hidden,true);
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false,"changing the dropdown writes nothing");
+  // The API may report the flag while the Hosted session still refuses a model change: the refusal keeps its own
+  // capture-changed sentence (nothing ran, open a new conversation), not the general text.
+  assert.equal(vm.runInContext('friendlyError({code:"NATIVE_CAPTURE_CHANGED",not_dispatched:true})',ui.context),
+    "這段對話固定用原本的模型，換模型要開新對話；這則訊息沒有執行。");
+  // Off (no model_switch from the server): the #821 pin is back.
+  const off=switchingChat();delete off.composer.responses.model_switch;
+  ui.render(off);
+  assert.equal(vm.runInContext("pinnedConversationModel()",ui.context),"offline-chat-a");
+});
+test("a send that switches the model says once that this turn is slower; the same model says nothing",async()=>{
+  const ui=await open(switchingChat()),model=ui.nodes.get("model");
+  const said="已換成 OFFLINE 聊天部署 B；這一回合會比較慢（重新載入對話）。";
+  model.value="offline-chat-b";model.events.change();
+  typeAttachmentText(ui,"換模型後的問題");
+  ui.click("send-instruction");await ui.tick();
+  const post=ui.holder.pendingPosts[0];
+  assert.equal(post.url,"/api/instructions/draft-rid/submit");
+  assert.equal(JSON.parse(ui.calls.find(call=>call.url===post.url).body).model,"offline-chat-b");
+  assert.equal(ui.nodes.get("model-switch-note").hidden,false);
+  assert.equal(ui.text("model-switch-note"),said);
+  const started=copy(ui.holder.current.tasks[0]);
+  Object.assign(started,{task_id:"draft-rid",submit_request_id:"draft-rid",instruction:"換模型後的問題",reply:null,
+    admission:{...started.admission,turn_number:2,model:"offline-chat-b"},submission:{state:"CONFIRMED"},
+    native_receipt:{...started.native_receipt,status:"started"},status:{data:{state:"started"},observed_at:when}});
+  post.resolve({task:started});await ui.tick();await ui.tick();
+  assert.equal(ui.nodes.get("model-switch-note").hidden,false,"shown while that turn runs");
+  const done=switchingChat();
+  done.tasks.push({...copy(started),native_receipt:{...started.native_receipt,status:"completed"},
+    status:{data:{state:"completed"},observed_at:when}});
+  ui.render(done);
+  assert.equal(ui.nodes.get("model-switch-note").hidden,true,"once: gone when the turn ends");
+  // A follow-up starts on the model the conversation last ran on (not the project default), so it says nothing.
+  const again=await open(switchingChat());
+  assert.equal(again.nodes.get("model").value,"offline-chat-a");
+  typeAttachmentText(again,"同一個模型再問");
+  again.click("send-instruction");await again.tick();
+  assert.equal(again.nodes.get("model-switch-note").hidden,true);
+});
+test("a follow-up after a switched turn that ended unknown stays on that turn's model, as the server does",async()=>{
+  // _allocate adopted offline-chat-b for turn 2 whatever its outcome, so the conversation is on B now.
+  const data=switchingChat(),unknown=copy(data.tasks[0]);
+  Object.assign(unknown,{task_id:"switched-unknown",submit_request_id:"switched-unknown",instruction:"換模型",reply:null,
+    admission:{...unknown.admission,turn_number:2,model:"offline-chat-b"},
+    native_receipt:{...unknown.native_receipt,status:"unknown"},status:{data:{state:"unknown"},observed_at:when}});
+  // A send refused before it was allocated (no turn number) did not change the conversation's model.
+  const refused={...copy(unknown),task_id:"refused-a",submit_request_id:"refused-a",
+    admission:{...unknown.admission,turn_number:null,model:"offline-chat-a"},not_accepted:true,
+    status:{data:{state:"not_accepted"},observed_at:when}};
+  data.tasks.push(unknown,refused);
+  const ui=await open(data);
+  assert.equal(ui.nodes.get("model").value,"offline-chat-b");
+  typeAttachmentText(ui,"接著問");
+  ui.click("send-instruction");await ui.tick();
+  assert.equal(JSON.parse(ui.calls.find(call=>call.url==="/api/instructions/draft-rid/submit").body).model,"offline-chat-b");
+  assert.equal(ui.nodes.get("model-switch-note").hidden,true,"no switch, so no notice");
+});
+test("a switch the conversation is too long for names the new model and says nothing ran",async()=>{
+  const data=switchingChat(),refused=copy(nativeChat("unknown").tasks[0]);
+  Object.assign(refused,{task_id:"too-long",submit_request_id:"too-long",instruction:"換小模型",requested_model:"offline-chat-b",
+    native_receipt:null,admission:null,not_accepted:true,status:{data:{state:"not_accepted"},observed_at:when},
+    submission:{state:"REFUSED",code:"NATIVE_MODEL_CONTEXT_EXCEEDED",not_dispatched:true}});
+  data.tasks.push(refused);
+  const ui=await open(data);
+  const said="這段對話太長，OFFLINE 聊天部署 B 放不下；請開新對話或改用原模型。";
+  const shown=JSON.stringify(ui.nodes.get("conversation-history").children,(key,value)=>key==="events"?undefined:value);
+  assert.ok(shown.includes(said),"the refused turn says why");
+  vm.runInContext('lastError={code:"NATIVE_MODEL_CONTEXT_EXCEEDED",not_dispatched:true,request_id:"too-long"};render()',ui.context);
+  assert.equal(ui.text("error-message"),said);
+  assert.equal(ui.text("chat-presence"),"需要處理");
+});
+test("#821 follow-ups: 新對話 passes no model, a failed open takes the pick back, a lock refusal names its own thread",
+  async()=>{
+    const ui=await open(pinnedChat());
+    ui.holder.response={ok:false,status:503,json:async()=>({error:{code:"BACKEND_UNAVAILABLE"}})};
+    vm.runInContext('modelDrafts.set(scopeKey(OPENING_DRAFT),"offline-chat-a")',ui.context);
+    ui.nodes.get("new-conversation").events.click({type:"click"});await ui.tick();await ui.tick();
+    assert.equal(vm.runInContext("modelDrafts.get(scopeKey(OPENING_DRAFT))",ui.context),"offline-chat-a",
+      "a click event is not a model");
+    await vm.runInContext('openNewConversation("offline-chat-b")',ui.context);
+    assert.equal(vm.runInContext("modelDrafts.get(scopeKey(OPENING_DRAFT))",ui.context),"offline-chat-a",
+      "the conversation did not open: the earlier pick is back");
+    // The refused message belongs to another thread whose last completed turn ran on offline-chat-b.
+    const other=copy(ui.holder.current.tasks[0]);
+    Object.assign(other,{task_id:"other-done",thread_id:"other-thread",admission:{...other.admission,model:"offline-chat-b"}});
+    const refused={...copy(other),task_id:"other-refused",admission:null,not_accepted:true,
+      status:{data:{state:"not_accepted"},observed_at:when}};
+    const data=pinnedChat();data.tasks.push(other,refused);ui.render(data);
+    assert.equal(vm.runInContext('friendlyError({code:"NATIVE_CAPTURE_CHANGED",not_dispatched:true,request_id:"other-refused"})',
+      ui.context),"這段對話固定用 OFFLINE 聊天部署 B，換模型要開新對話；這則訊息沒有執行。");
+  });
+
 test("definite native refusal exposes only an explicit original-input retry",async()=>{
   const data=nativeChat("unknown"),task=data.tasks[0];
   task.native_receipt=null;task.not_accepted=true;task.admission=null;
@@ -5262,6 +5430,8 @@ test("新對話 waits while a message is still being sent, so the switch cannot 
 
 test("empty Team attention pages neither redraw the composer nor rewrite the chosen model",async()=>{
   const c=teamAttentionCase(),reads=[];
+  // No known model on the completed turn leaves the choice free (no pin), so a rewrite of the pick would show.
+  c.data.tasks[0].admission.model=null;
   const ui=await open(c.data,{now:Date.parse(when),hitl:async(url)=>{
     if(!url.includes("/attention"))return {ok:true,json:async()=>copy(c.view)};
     reads.push(url);

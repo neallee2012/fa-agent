@@ -2,16 +2,17 @@
 
 這個私有 repo 每次**成功部署到 stage** 之後，會把那一版去識別化，推到一個公開 repo。公開 repo 只會看到已經上過 stage 的版本，看不到開發中的分支或未部署的提交。
 
-目前狀態（2026-10-12）：公開 repo `neallee2012/fa-agent` 已改成 public，最新同步是 release `v2026.10.12-27`。第一次同步（release 24）事後檢查發現的洩漏，已由替換規則與 verify 補上（見下方「保留與替換的資源名稱」）；經過與歷史改寫見「公開紀錄」。
+目前狀態（2026-10-13）：公開 repo `neallee2012/fa-agent` 已改成 public，最新同步是 release `v2026.10.13-28`。第一次同步（release 24）事後檢查發現的洩漏，已由替換規則與 verify 補上（見下方「保留與替換的資源名稱」）；經過與歷史改寫見「公開紀錄」。2026-10-13 第一次完整的 Azure 清單比對發現已公開的 5 個 Azure Bot Service 名稱，替換規則已補上、從下一版起生效，Neal 已決定（2026-10-13）只修以後、不重寫公開歷史（見「清單比對基準」）。
 
 ## 何時同步、同步什麼
 
 1. stage release PR（改 `deploy/stage/release.json`）合併到 `main`，[deploy-staging](../.github/workflows/deploy-staging.yml) 部署 stage。手動觸發的 deploy-staging 也算。
 2. 只有那次 deploy-staging **成功**，[public-sync](../.github/workflows/public-sync.yml) 才會開始；失敗、取消或跳過都不會。
-3. 環境 `public-sync` 只允許 `main`。目前的 GitHub 方案不支援 private repo 的必要審核人，所以不會停下來等人核准；改由公開 repo 先保持 private 當審核關（Neal 2026-10-11 決定），Neal 看過推進去的內容再自己改成 public（審查流程見下方「每一版的兩道人工審查」）。2026-10-12 已改成 public，之後每次同步立刻公開，第一道審查要在 release PR 合併前完成。
+3. 環境 `public-sync` 只允許 `main`。目前的 GitHub 方案不支援 private repo 的必要審核人，所以不會停下來等人核准；改由公開 repo 先保持 private 當審核關（Neal 2026-10-11 決定），Neal 看過推進去的內容再自己改成 public（審查流程見下方「每一版的兩道審查」）。2026-10-12 已改成 public，之後每次同步立刻公開，第一道審查要在 release PR 合併前完成；第二道由 public-sync 最後一步自動比對。
 4. 取出那次部署的**同一個 commit**，只匯出該 commit 追蹤的檔案，套用替換表，再跑下面的 fail-closed 檢查。任何一項沒過就停，什麼都不推。
 5. 讀 `release.json` 的 `version` 與 `milestone`。`milestone` 經同一套替換與檢查後當作 Release 說明。
 6. 用公開 repo 的權杖 clone 公開 repo，把整棵樹換成這次匯出（保留 `.git`），以 `github-actions[bot]` 名義建立**一個** commit `Release <version>`，打 tag `v<version>`，推到公開 repo 的 `main`，再建立同名 GitHub Release。
+7. 最後執行第二道檢查（`gate2_check.py`，唯讀）：公開 tag 的 tree SHA 要等於 release PR 記錄的指紋，公開檔案要通過 verify。只要推送成功就會執行，建立 GitHub Release 失敗也不會略過。失敗時內容已經公開，這一步只負責亮紅燈叫人（見「每一版的兩道審查」）。
 
 要注意的幾點：
 
@@ -36,7 +37,7 @@
 
 ## 替換與 fail-closed 檢查
 
-[`scripts/public_export/`](../scripts/public_export/) 有三支工具：
+[`scripts/public_export/`](../scripts/public_export/) 有下列工具：
 
 - `scrub_export.py`：從指定 checkout 的 HEAD 匯出追蹤檔案。`--plain` 不替換，當作比對基準；不加則依 `mapping.json` 替換 GUID（含無連字號形式與 8 碼前綴）、租戶與人名、Email、資源名稱（含作者環境名稱與 azd 產生的 uniqueString 後綴）、CAE 網域、IP、私有 repo 名稱、GitHub 擁有者與 repo 的數字 ID 等。二進位檔原樣複製。
 - `verify_export.py`：檢查匯出結果，**只要有一項不過就以非 0 結束**：
@@ -48,6 +49,9 @@
 
   `--text <檔案> --text-out <檔案>` 用同一套替換與檢查處理 Release 說明，通過才寫出。輸出會進入 CI log，所以只印 `檔案:行號`，不印完整值：`[2]` 不印原始值的任何字元，只寫規則 ID、GUID 的 placeholder，或前綴／`verify_absent` 字串的序號（例如 `rule <id> absent #1`）；`[3]`、`[4]` 最多印出被標記值的前 4 個字元。
 - `discover.py`：掃描 HEAD 的 GUID，依 `review.json` 的人工判斷重建 `mapping.json`，並把每個 GUID 的判斷與上下文寫到 `candidates.txt`（git 忽略）。已有的 placeholder 編號不變。匯出後仍會留下、但還沒列入 `synthetic_guid_sha256` 的 GUID 會印成 `UNLISTED`（只印前 4 碼）；收錄步驟見下方「發現新的識別資訊時」；只把 sha256 寫進 `review.json`，不存原值。
+- `fingerprint.py`：在記憶體裡做出某個私有 commit 的匯出（用該 commit 的 `mapping.json`），以 git plumbing 在暫存 repo 算出公開 commit 會有的 tree SHA，印成 `public-sync fingerprint: <tree SHA>`。第一道把這行記在 release PR。
+- `gate2_check.py`：第二道。比對公開 tag 的 tree SHA 與第一道的指紋、與部署 commit 的指紋，再對公開檔案重跑 verify；只印 tree SHA、檢查編號與檔案行號。
+- `inventory_scan.py`：第一道的 Azure 清單比對，見「每一版的兩道審查」。只印 `inv-<hash>`、種類與檔案位置，不印名稱。
 
 CI 用的 gitleaks 是 8.30.1 官方 release，下載後先核對 sha256 才使用。
 
@@ -68,7 +72,7 @@ CI 用的 gitleaks 是 8.30.1 官方 release，下載後先核對 sha256 才使�
 
 若日後加了 Required reviewers，想取消時到 Settings → Environments → `public-sync` 取消勾選後儲存。想暫停同步：刪除 `PUBLIC_REPO` 變數即可。
 
-目前狀態（2026-10-12）：`neallee2012/fa-agent`（public）、環境 `public-sync`（限 `main`、無審核人）、secret `PUBLIC_REPO_TOKEN`、變數 `PUBLIC_REPO` 都已設定；最新同步是 release `v2026.10.12-27`（見「公開紀錄」）。
+設定狀態（2026-10-13）：`neallee2012/fa-agent`（public）、環境 `public-sync`（限 `main`、無審核人）、secret `PUBLIC_REPO_TOKEN`、變數 `PUBLIC_REPO` 都已設定；最新同步見文件開頭與「公開紀錄」。
 
 同步用的權杖：
 
@@ -126,22 +130,59 @@ CI 用的 gitleaks 是 8.30.1 官方 release，下載後先核對 sha256 才使�
 - **保留**：產品與程式本身的名稱（`fa-hosted-sandbox-poc`、`ca-fa-*`、`id-fa-*` 等），以及 azd 的環境與資源群組名稱（`rg-<環境名>`）。它們的後綴與網域已替換，指不到真實資源。
 - **縮寫與大小寫變體也要涵蓋**：替換一個真實名稱（租戶、人名、環境、帳戶）時，先在整個 repo 不分大小寫搜尋它的縮寫與前綴（3 個字元以上），每個縮寫各加一條規則；規則與 `[2]` 都要不分大小寫（literal 規則設 `ignore_case: true`，`verify_absent` 另設 `verify_ignore_case: true`）。只寫全名、或只認一種大小寫的規則，會讓變體原樣進入匯出。
 - 理由也記在 `review.json` 的 `_resource_names_policy`。發現新的真實名稱時，在 `review.json` 的 `rules` 加 literal 規則、在 `residual_allow` 用完整主機名放行替換後的主機，再重跑 `discover.py`。
-- **限制**：全新的一般資源名稱（例如新的資源群組或專案名稱，既不是 Azure 主機名、也不是 13 字元的 azd 後綴）不會被自動偵測；verify 只認得 `review.json` 已列的值與 `SWEEPS` 的通用樣式。所以每一版都要經過下面的兩道人工審查。
+- **限制**：全新的一般資源名稱（例如新的資源群組或專案名稱，既不是 Azure 主機名、也不是 13 字元的 azd 後綴）verify 偵測不到；verify 只認得 `review.json` 已列的值與 `SWEEPS` 的通用樣式。第一道的 Azure 清單比對（`inventory_scan.py`）補上已存在於 Azure 的名稱；不在 Azure 的名稱仍靠人工檢查，見下面「每一版的兩道審查」。
 
 `verify_export.py` 本身會被匯出，所以真實名稱不能寫在它裡面（公開副本會被替換成 placeholder，檢查就失效）；真實名稱只放在 `review.json` 的規則，由 `[2]` 檢查不得殘留，`verify_export.py` 只放 `github-id`、`generated-name` 這類通用樣式。測試也照這個做法：真實值從 `review.json` 讀，預期輸出寫 placeholder。
 
-## 每一版的兩道人工審查
+## 每一版的兩道審查
 
-verify 只擋已知的值與通用樣式，所以每一版的人工殘留掃描，在 repo 改成 public 之前與之後都要做。公開之後，每次同步會立刻公開，沒有 private 這道緩衝，所以第一道關要在 release PR 合併前完成。
+verify 只擋已知的值與通用樣式。公開之後，每次同步會立刻公開，沒有 private 這道緩衝，所以**人要看的部分全部放在第一道（release PR 合併前）**；第二道（public-sync 之後）改成自動比對，只有比對不符或 verify 有發現時才需要人（2026-10-13 Neal 核准這個做法）。
 
-**掃描項目**（兩道關相同）：對整棵匯出樹找作者環境與資源名稱、真實主機名、擁有者與租戶 ID、人名、私有 repo 的名稱與連結，以及 verify 偵測不到的新一般資源名稱。
+1. **第一道（release PR 合併前）**：release PR 合併才會觸發 deploy-staging，成功後接著 public-sync，所以在合併前做完。
+   1. **先確認上一次 public-sync（含第二道）是綠燈**；若第二道失敗，先照下面「第二道發現洩漏」處理完，才能做新的 release。
+   2. 在本機把 `main` 與 release 分支合併（不推送），對合併結果照「發現新的識別資訊時」第 3 點跑完整流程：`--plain` 基準匯出、一般替換匯出、帶 gitleaks 的 `verify_export.py --baseline`。
+   3. **Azure 清單比對**（找 verify 不認得的新資源名稱）：用自己的隔離 az 登入，唯讀列出指定訂用帳戶的資源與資源群組名稱、訂用帳戶與租戶名稱、租戶已驗證網域，在記憶體裡做成黑名單，不分大小寫掃**整棵**匯出樹；名稱拆開（`-`、`_`、`.`、`/`、空白）後 5 個字元以上的片段也掃，常見 Azure 字（`storage`、`westus3` 等）略過。比對以完整的字為單位：前後緊接英文字母或數字就不算（`-`、`.`、空白、引號、中文都算分隔），所以片段出現在較長的字裡面不會被標出。
 
-1. **第一道（release PR 合併前）**：release PR 合併才會觸發 deploy-staging，成功後接著 public-sync，所以在合併前審。
-   - 在本機把 `main` 與 release 分支合併（不推送），對合併結果照「發現新的識別資訊時」第 3 點跑完整流程：`--plain` 基準匯出、一般替換匯出、帶 gitleaks 的 `verify_export.py --baseline`。
-   - 再對匯出樹做上面的人工掃描。
-   - 把結果（流程是否通過、掃描範圍、有無發現）記在 release PR。沒通過不合併 release PR。
-   - 若合併前 `main` 又進了新的變更，掃描結果只對檢查當時的內容有效，需重做。
-2. **第二道（public-sync 之後）**：clone 剛發布的公開 commit，對整棵樹重做同樣的人工掃描，確認公開內容與第一道看到的一致、沒有漏網。
+      ```powershell
+      python -X utf8 scripts/public_export/inventory_scan.py --export <空目錄>\export `
+        --azure-config-dir <隔離的 AZURE_CONFIG_DIR> --subscription <訂用帳戶> [--subscription <另一個>]
+      ```
+
+      輸出只有 `HIT inv-<8 碼 hash> <種類> 檔案:行:欄`，不印名稱本身。每個 HIT 打開該行判斷：要替換就照「發現新的識別資訊時」加 `review.json` 規則；確認可以公開就加到 `review.json` 的 `inventory_allow`（`{value, why}`）。一個字只有在 `inventory_allow` 裡（或屬於常見字清單）才不會被標出，「上一版已經公開」不是放行理由；已審過的基準見下面「清單比對基準」。讀不到 Graph 的已驗證網域時會印警告並略過這一類。清單只放在記憶體；要留存請用 `--save-inventory` 寫到 repo 與匯出目錄以外的路徑（放在 repo 內會被拒絕）。清單可能把所有東西都漏掉時直接以 2 結束、不算通過：某個訂用帳戶列出 0 個資源群組或 0 個資源（沒有讀取權限的身分會得到空清單、az 卻回 0）、`--inventory` 不是含 `kind`／`value` 且同時有資源群組與資源的非空清單、或黑名單扣掉略過的字後是空的。
+   4. **人工只看兩件事**：上一步與 verify 標出的項目；以及這一版新增或修改的文字（`git diff <上一版 release 的 commit>..<合併結果>` 的範圍），特別是說明文字裡臨時取的內部代號、人名與連結。不必再整棵樹逐檔看。
+   5. **記錄指紋**：對合併結果算出公開 commit 會有的 tree SHA：
+
+      ```powershell
+      python -X utf8 scripts/public_export/fingerprint.py --src . --rev HEAD
+      ```
+
+      把印出的那一行 `public-sync fingerprint: <tree SHA>` 原樣貼進 release PR 說明，連同 verify、清單比對與人工檢查的結果（是否通過、範圍、有無發現）。沒通過不合併 release PR。
+   6. 若合併前 `main` 又進了新的變更，結果與指紋只對檢查當時的內容有效，需重做。
+2. **第二道（public-sync 之後，自動）**：public-sync 最後一步執行 `gate2_check.py`。只要推送那一步成功就會跑，後面建立 GitHub Release 失敗也一樣：
+   - 從部署的 commit 找到合併它的 PR，讀說明裡的 `public-sync fingerprint:` 那一行，和剛發布的公開 tag 的 tree SHA 比對。只認合併當時的說明：PR 說明在合併之後又被編輯過，就不採用；
+   - 也比對部署的 commit 匯出後的 tree SHA（用該 commit 自己的 `mapping.json`，和 public-sync 當時一樣），分得出「第一道之後 `main` 又變了」與「公開 repo 的內容不是這次匯出」；
+   - 對公開 tag 的檔案（不帶權杖的淺 clone，唯讀，不推送）重跑 `verify_export.py` 的 [0]–[4]，含 gitleaks；clone 裡沒有該 tag 就直接失敗，不會拿 clone 的 HEAD 代替。
+
+   全部通過，第二道就結束，不需要人。任何一項不符或有發現，這一步失敗、public-sync 顯示紅燈，總協調依下面「第二道發現洩漏」處理。PR 說明沒有可用的指紋也算失敗，改由人工對公開 commit 做第二道審查；workflow 會用註記分開說明原因：沒有合併的 PR（例如手動觸發的 deploy-staging）、對到不只一個 PR、說明在合併後被編輯過、或讀 GitHub API 失敗。總協調要在本機重跑時（`--no-gitleaks` 只給本機重跑用，用了要在報告寫明 [1] 沒跑；workflow 一律帶 gitleaks）：
+
+   ```powershell
+   python -X utf8 scripts/public_export/gate2_check.py --tag v<version> --src . --rev <部署的 commit> `
+     --mapping scripts/public_export/mapping.json --expected <第一道記錄的 tree SHA> `
+     --public-repo neallee2012/fa-agent --gitleaks <gitleaks 路徑>
+   ```
+
+   tree SHA 只和檔案路徑、內容與執行位元有關，所以本機合併、GitHub 的合併 commit 與 squash 合併只要內容相同，指紋就相同；release 27、28 的私有 commit 重算出的 tree SHA 與公開 commit `a493fefc`、`ba9adcb6` 的 tree 完全一致。比對只用 git 的 tree SHA，verify 讀的公開檔案也直接取自 git 物件、不讀 clone 的工作目錄，所以 Windows 上 `core.autocrlf` 把換行改成 CRLF 的 clone 不會造成假差異（release 28 人工第二道曾因此要重新 clone）。自己手動逐位元組比對公開檔案時，clone 要加 `-c core.autocrlf=false`。
+
+**接受的剩餘風險**：既不在 Azure 清單、也不在既有規則裡的全新名稱（例如說明文字裡臨時取的內部代號、外部服務帳號名稱），工具認不出來，仍靠第一道對這一版新增與修改文字的人工檢查，和過去一樣。
+
+### 清單比對基準
+
+`inventory_allow` 是逐一審過、可以公開的清單字；其他清單字出現在匯出裡一律標出。基準建立於 2026-10-13：
+
+- 清單來源：以隔離的 az 登入唯讀讀取這個登入可見的全部 3 個訂用帳戶（含 dev 與 stage 的資源），共 608 個名稱（資源 539、資源群組 56、訂用帳戶 3、租戶網域 6、租戶名稱 4；Graph 已驗證網域可讀）；每個訂用帳戶的資源群組與資源都不是 0。
+- 掃描對象：`main` `903f7809`（release 28，與公開 `v2026.10.13-28` 同一棵樹）的完整匯出，不用 `--previous`、以完整的字比對：1,361 個文字檔、黑名單 728 個字，標出 158 個不同的字。
+- 審查結果：150 個加入 `inventory_allow`，各附理由：資源名稱裡的一般英文字或公開產品字 101 個、只在資源群組範圍內唯一的 FA 產品資源名稱 33 個（Container Apps、job、身分、Log Analytics、Application Insights、private endpoint、DNS 連結，依「保留與替換的資源名稱」保留）、Azure 平台與 privatelink 名稱 11 個、一般的測試／示範標籤 5 個。另外 8 個是 5 個 Azure Bot Service 名稱與其中 3 個數字片段：Bot Service 名稱全域唯一，和 Web PubSub 一樣改成替換（`review.json` 規則 `bot-*`）。補上規則與 `inventory_allow` 後，同一份清單對同一 commit 的匯出 0 個 HIT。
+- **已公開的洩漏**：這 5 個 Bot Service 名稱已在公開的 `v2026.10.13-28` 裡（`v2026.10.12-27` 也有同樣的 9 處；更早的 `v2026.10.11-26` 未核對），5 個檔案共 9 處（`deploy/teams/personal.example.json:10`、`docs/progress.md:110`、`:166`、`:5438`、`docs/teams-chat-design.md:55`、`:62`（兩個名稱）、`infra/teams/personal-bot.bicep:6`、`src/fa-shared-context-poc/shared_context/teams_deployment.py:76`）。以新的 `mapping.json` 對公開 `v2026.10.13-28` 重跑第二道：[A]、[B] 相符，[C] 的 [2] 標出這 9 處而失敗。新規則從下一版起替換。**Neal 2026-10-13 決定：只修以後、不重寫公開歷史**；下一版（第 29 版）整棵取代，舊版 tag 與 Release 保留，不刪除也不改寫。理由：Bot Service 名稱是全球唯一的資源名稱，但不是秘密，要發訊息仍需 App ID 與憑證。
 
 **第二道發現洩漏、而 repo 已是 public**：
 
@@ -175,6 +216,8 @@ verify 只擋已知的值與通用樣式，所以每一版的人工殘留掃描�
 - **release 26（10-11）**：第二道審查通過（內容樹 `b8654bda`）。Neal 核准把公開 repo 的歷史改寫成單一乾淨的 root commit `d6f6a976`（內容就是 release 26 的樹），並刪除 v25 的 tag 與 Release；腳本由 Neal 自己執行。
 - **2026-10-12**：Neal 把 `fa-agent` 改成 **public**。
 - **release 27（10-12）**：接在 `d6f6a976` 之後的 commit `a493fefc`，9 個檔案，都是文件。第二道審查通過：gitleaks 掃描目錄 143 個發現、掃描 git 歷史 144 個，全部對上已知誤判清單；183 個連結都能解析。
+- **release 28（10-13）**：commit `ba9adcb6`（tree `7c07241d`）。
+- **2026-10-13 第一次完整清單比對**：發現公開 `v2026.10.13-28` 裡有 5 個 Azure Bot Service 名稱（見「清單比對基準」），已加替換規則，從下一版起生效；已公開的歷史依 Neal 的決定保留（只修以後、不重寫），下一版整棵取代。
 - **限制**：GitHub 可能仍保留沒有任何引用的 v25 commit 物件，要請 GitHub Support 清除才會消失；這是擁有者向 GitHub 提出的要求，agent 不代做。
 
 ## Verified against
@@ -185,5 +228,7 @@ verify 只擋已知的值與通用樣式，所以每一版的人工殘留掃描�
 - 第三輪 review 後（本段所在 commit）：已知誤報必須有 `count` 且至少 1，少了就 `[1]` 失敗；替換規則用具名群組保留的文字仍做 hash 檢查；`tests/public_export` 43 個與 `tests/context_eval/test_progress_b1_b2.py` 17 個通過。乾淨 detached checkout 加真 gitleaks 8.30.1：1,343 個檔案、gitleaks 144 個發現全部對上清單、原值 287 種模式零殘留、hash 未改動、殘留掃描無未審項目，PASS；公開副本內 `test_progress_b1_b2.py` 16 個通過。
 - 第一次同步後的補強（分支 `neallee2012-public-export-resource-names`，rebase 到含 #785 的 `origin/main`）：`tests/public_export` 81 個通過。乾淨匯出（HEAD 追蹤檔）加真 gitleaks 8.30.1：1,360 個檔案、gitleaks 144 個發現全部對上清單、原值 296 種模式零殘留、hash 未改動、殘留掃描 1,423 處無未審項目，PASS；匯出中作者環境名稱長短兩種寫法、擁有者數字 ID、私有 repo 純文字名稱、被引用的私有 commit、#785 的兩個 azd 後綴都是 0 處。公開副本另跑受影響的測試（`test_progress_b1_b2.py`、`test_context_target_eval.py`、`test_diagnostic_image.py`、`test_private_controller.py`、`test_vnet_template.py`、`test_private_collection.py`、`test_agent_setup.py`、`test_azd_hooks.py`、`test_auth.py`、`test_teams_deployment.py`、`test_stage_ci_deploy_feed.py`、`tests/public_export`）：314 個通過，失敗的兩個是上面記載的 workflow 測試與 ledger 指紋測試（後者在補強之前的匯出也失敗）。
 - OIDC 擁有者與文件補充（分支 `neallee2012-public-export-followup`，從含 #786 的 `origin/main` 開出）：`tests/public_export` 83 個通過。HEAD 追蹤檔的 plain／scrub 匯出加真 gitleaks 8.30.1：1,361 個檔案、gitleaks 144 個發現全部對上清單、原值 297 種模式零殘留、hash 未改動、殘留掃描 1,421 處無未審項目，PASS；匯出中 `名稱@全 0 ID` 只剩 `example-owner` 與 `foundry-agents` 兩個 placeholder，擁有者名稱以 `名稱@` 形式 0 處。五條同理由的主機放行合併成一條前後，verify 對同一份匯出的輸出逐行相同。ledger 內容被替換的 run 是 4 個（`sha256` 與基準相同）。
+- 第二道自動化與 Azure 清單比對（分支 `neallee2012-public-sync-gate2-auto`，從 `origin/main` `2c2ad24d` 開出，2026-10-13）：`tests/public_export` 116 個通過（新增 20 個；Azure 與 gitleaks 都用替身，含 clone 工作目錄是 CRLF 的情況）。真實重現：`fingerprint.py --rev 8417951c`（release 27）與 `--rev 903f7809`（release 28）算出的 tree SHA，與公開 commit `a493fefc`、`ba9adcb6` 的 tree（GitHub API 讀回）完全相同；`gate2_check.py` 對公開 tag `v2026.10.12-27`（用預設 `core.autocrlf` 的 Windows clone）與 `v2026.10.13-28` 加真 gitleaks 8.30.1：指紋相符、部署 commit 相符、verify PASS。`inventory_scan.py` 以隔離的 az 登入唯讀讀 3 個訂用帳戶（608 個名稱，Graph 網域可讀），對 `2c2ad24d` 的匯出：不加 `--previous` 有 161 個不同的字被標出（多半是資源名稱裡的一般英文字，另有一些已公開的產品與測試資源名稱）；加 `--previous`（公開 release 27）後 0 個。GitHub 上的新 workflow 步驟**未實際執行**，要等下一次 public-sync。上面「verify PASS」是當時的 `mapping.json`；加上 `bot-*` 規則後，同一指令的 [C] 會因已公開的 Bot Service 名稱失敗（見下一項）。
+- 第二道自動化 review 第 1 輪修正（同分支，2026-10-13）：`tests/public_export` 139 個通過（Azure、gitleaks、GitHub API 都用替身；workflow 內嵌的 PR 說明選取程式直接執行測試）。清單比對改成完整的字、移除 `--previous`，清單為空或格式不對以 2 結束；完整比對與審查結果見「清單比對基準」。分支 HEAD 的 plain／scrub 匯出加真 gitleaks 8.30.1：1,367 個檔案、gitleaks 144 個發現全部對上清單、原值 305 種模式零殘留、hash 未改動、殘留掃描 1,423 處無未審項目，PASS；同一份匯出的清單比對 0 個 HIT。新的 GraphQL 查詢以 `gh` 唯讀對 `903f7809`（PR 817）核對過欄位；workflow 仍**未在 GitHub 上執行**。
 - 「Commit, tag and push」這一步的 shell 另在本機以 bare repo 代替公開 repo 模擬：空 repo 首次推送、同內容重跑不推、同版號不同內容失敗、新版號接在既有 `main` 之後，皆符合預期。
 - 證據與限制：GitHub 上的 workflow **未實際執行**（公開 repo、PAT、環境與變數都尚未設定）；權杖經 credential helper 傳遞、只開 Contents 的 PAT 推送、gitleaks 下載與 `gh release create` 只做過靜態檢查。

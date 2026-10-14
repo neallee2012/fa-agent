@@ -33,10 +33,13 @@ class NativeResidentPool:
         self._holders[sdk_session_id] = holder
         return holder
 
-    async def continue_live(self, holder, previous, *, checkpoint_profile, model_provider, needed_bytes=0):
+    async def continue_live(self, holder, previous, *, checkpoint_profile, model_provider, model, needed_bytes=0):
         """The live files this turn continues on, or None after stopping a kept SDK that no longer matches.
 
-        ``needed_bytes`` is room this turn reserves up front (its attached images' base64)."""
+        ``model`` is this turn's deployment: a kept SDK runs only the model it was started with, and its live files
+        keep that model's private events, so a model switch restores the published checkpoint cold instead
+        (never the SDK's experimental ``set_model``). ``needed_bytes`` is room this turn reserves up front (its
+        attached images' base64)."""
         live = holder.live
         if live is None:
             self._evict(holder, room=1)
@@ -52,6 +55,8 @@ class NativeResidentPool:
             log.warning("RESIDENT_FILES_MOVED released=%s", live.released_sha256[:12])
         elif (files.checkpoint_profile, files.model_provider) != (checkpoint_profile, model_provider):
             reason = "settings_changed"
+        elif live.model != model:
+            reason = "model_changed"
         elif (size := sum(len(text.encode("utf-8")) for text in files.files.values())) > MAX_BACKUP_BYTES // 2 or (
                 size + needed_bytes + LARGE_RESULT_RESERVE_BYTES > MAX_BACKUP_BYTES):
             # Live files keep the private events a checkpoint drops; a large state restores the smaller copy.

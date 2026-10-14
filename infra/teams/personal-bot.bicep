@@ -3,7 +3,7 @@ targetScope = 'resourceGroup'
 @description('Deploy only through the reviewed operator command in rg-faexample.')
 @minLength(2)
 @maxLength(64)
-param botName string = 'fa-teams-personal-poc'
+param botName string = 'fa-teams-personal-example'
 
 @allowed(['id-facontext-api'])
 param existingIdentityName string = 'id-facontext-api'

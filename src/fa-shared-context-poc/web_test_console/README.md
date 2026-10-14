@@ -2320,6 +2320,49 @@ stage A 新對話選 `gpt-6-luna`，Azure 在輸出前回 400 `unsupported_param
 「native model refusal names the model and the provider's sanitized reason from the public step」
 （含同一則步驟在一般 unknown 回合仍顯示「結果未知」）；全檔 605 項通過。未更新現場 8765。
 
+<a id="model-lock"></a>
+**2026-10-13 已有完成回合的對話固定模型（過渡做法，LOCAL，未部署）：**
+stage 第 28 版，Neal 在已有完成回合的對話把模型選單換成 `gpt-5.4-mini`，之後每次送出都被 Hosted 在接單前回 409
+`NATIVE_CAPTURE_CHANGED`（`not_dispatched`，什麼都沒執行）；畫面只寫「原因見支援明細」，頁首是「發生問題」。
+開關關閉時規則不變：對話的 capture 固定模型，只有還沒有任何 completed 回合時能換（見[後端說明](../README.md#vm-直連-responsesadr-0006-5-t4b預設關閉)）。
+這是開關關閉時的做法；伺服器回報可換模型（`responses.model_switch`，見下方[對話中換模型](#model-switch)）時，
+`pinnedConversationModel` 一律回 null，下列固定與提示都不出現；被拒訊息的句子照舊顯示（API 讀到開關、回話的 Hosted session
+仍可能沒打開，這時換模型照樣被拒，一般錯誤字樣只會叫人看支援明細）。
+開關在所有環境打開並穩定後，可以刪掉 `pinnedConversationModel` 及其呼叫點（選單 `change`、`renderModelLockNotice`）。
+- **模型選單**：目前對話（native 或 Responses）有一個回合的狀態是 `completed`，就用該回合 `admission.model` 當作固定模型，
+  選單一律顯示它（蓋過草稿裡記的模型）。換成別的模型時，選單退回固定模型，輸入框下方顯示
+  「這段對話固定用 <模型>；要換模型請開新對話」和按鈕「用 <新模型> 開新對話」；按下就以新模型開新對話（原對話草稿留在原對話）。
+  只改本頁狀態，不寫設定、不多打 API。新對話、還沒有完成回合的對話、完成回合讀不到模型、或固定模型已不在清單時照舊自由選擇。
+- **被拒的訊息**：`NATIVE_CAPTURE_CHANGED` 且帶 `not_dispatched` 時，回覆位置與輸入框上方都顯示
+  「這段對話固定用 <原模型>，換模型要開新對話；這則訊息沒有執行。」（讀不到原模型時寫「原本的模型」），
+  頁首是「需要處理」而不是「發生問題」。沒有 `not_dispatched` 的同一 code（重送內容不同、回條比對不符）仍是一般錯誤字樣。
+  request ID 規則不變：這則沒有送出，換回原模型後照原流程再送。
+- 測試：`test_web_test_console_workbench.cjs` 的「after a completed turn the model dropdown shows the conversation's model…」、
+  「before any completed turn the model stays free to choose」、「a NATIVE_CAPTURE_CHANGED refusal says the conversation keeps its model…」，
+  在原 `index.html` 上都 FAIL；全檔 641 項通過。未更新現場 8765 或 stage。
+- **#821 review 補修（2026-10-13）**：「新對話」按鈕不再把 click 事件當成模型傳進 `openNewConversation`；
+  「用 <新模型> 開新對話」沒開成時，開新對話草稿的模型退回原本的值；固定模型的被拒句子用被拒那則訊息自己對話的模型，
+  不是目前畫面上對話的模型。
+
+<a id="model-switch"></a>
+**2026-10-13 對話中換模型（`FA_NATIVE_MODEL_SWITCH`，預設關；LOCAL，未部署）：**
+開關只在 Hosted definition 上（見[後端說明](../README.md#native-model-switch)）；API 讀所選版本的值，放在 composer 的
+`responses.model_switch`，頁面只照它走，不自己決定。目前只有 Responses lane 的 template options 帶這個值；
+沒讀到（例如 Invocations lane，或工作台重啟後還沒讀過 options 的既有對話）時當作關閉，照上面的固定做法。
+- **模型選單**：打開時任何對話都能自由選；追問的新草稿預設是這段對話目前的模型，不會悄悄換成專案預設。
+  「目前的模型」和伺服器一致：最後一個已佔用回合號（`admission.turn_number`）的回合的模型，不論它最後是 completed 還是 unknown
+  （`_allocate` 佔用回合時就採用新模型）；接單前被拒（`not_accepted`）或忙碌未執行（`busy_refused`）的不算（`threadModel`）。
+  所以換模型那一回合結束成 unknown 後，追問仍預設新模型，不會悄悄換回舊模型。
+- **換模型的提示**：送出的模型和這段對話目前的模型不同時，輸入框上方顯示一次
+  「已換成 <新模型>；這一回合會比較慢（重新載入對話）。」，那一回合結束、被拒、換對話或再送下一則時消失。
+- **放不下**：`NATIVE_MODEL_CONTEXT_EXCEEDED` 且帶 `not_dispatched` 時，回覆位置與錯誤列顯示
+  「這段對話太長，<新模型> 放不下；請開新對話或改用原模型。」，模型名取自被拒訊息自己的 `requested_model`
+  （bridge 的 task 新欄位，只用來顯示，讀不到時寫「所選的模型」），頁首是「需要處理」。這則沒有送出，request ID 規則不變。
+- 測試：`test_web_test_console_workbench.cjs` 的「with model switching on, the dropdown stays free…」、
+  「a send that switches the model says once…」、「a switch the conversation is too long for…」、「#821 follow-ups…」，
+  在原 `index.html` 上都 FAIL；review round 1 加的「a follow-up after a switched turn that ended unknown…」在修正前也 FAIL；
+  全檔 646 項通過。`test_web_test_console_native_environment.py` 驗 `requested_model`。
+
 原生CID的文字檔設定沿Agent原template；附件選單經N2讀原CID的已保存template，
 再沿既有Team來源目錄讀metadata，提交仍重核完整來源graph。
 原附件／檔案下載不需要虛構舊Session或claim。

@@ -16,6 +16,9 @@ from .errors import Problem
 
 TARGETS = frozenset({"model.model_call_success", "model.messages_snapshot"})
 COMPACTION_EVENTS = ("session.compaction_start", "session.compaction_complete")
+# Triggers the auto profile never accepts as the runtime's own threshold compaction. ``model_switch`` comes only from the
+# experimental ``session.model.switchTo`` preflight, which FA never calls; CTX-03 does not enable model-switch compaction.
+NOT_AUTOMATIC_TRIGGERS = ("", "manual", "model_switch")
 ENVELOPE = frozenset({"type", "id", "timestamp", "parentId", "data"})
 CALL_KEYS = frozenset({
     "kind", "turn", "modelCallDurationMs", "ttftMs", "outputTtftMs", "interTokenLatencyMs",
@@ -285,7 +288,7 @@ def automatic_pairs(events):
     for start, complete in zip(found[::2], found[1::2]):
         for event in (start, complete):
             envelope(event)
-            if not isinstance(event["data"].get("trigger"), str) or event["data"]["trigger"] in ("", "manual"):
+            if not isinstance(event["data"].get("trigger"), str) or event["data"]["trigger"] in NOT_AUTOMATIC_TRIGGERS:
                 unverified()
             if event["data"].get("customInstructions") not in (None, ""):
                 raise Problem(409, "SDK_STATE_PRIVATE_MATERIAL", "custom compaction instructions are not supported")

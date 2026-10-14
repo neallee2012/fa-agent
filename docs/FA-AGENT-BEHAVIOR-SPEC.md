@@ -226,6 +226,9 @@ Neal：「請嚴格依照hosted agent官方和grok bot的方式，詳細審視FA
   `stop_started` 在平台接受 FA 的 `stop_session` 之後才寫；沒有這個紀錄就變 inactive 的來源當成被回收，不讀檔、不搬檔
   （ADR-0009 §10 窄例外）。舊版 `fa-chat-…` 對話在 admission 只讀 metadata，SID 不是 `active` 就回 409
   `CONVERSATION_SESSION_UNAVAILABLE`，照既有規則明確 reset 或開新對話（reset 用 `stop_session`，不 invoke）。
+- （2026-10-13，ADR-0009 phase 1）API 在 Context Table 為每個 Agent 記一列綁定列（目前 SID、建立時的版本、實際版本、
+  漂移旗標與通知位、之前的 SID），只記錄、不改任何回合結果；平台在同一 session 換了版本時，主人本人的回應帶
+  `environment_notice`，phase 1 不清除（顯示在 phase 2）。詳見 [共用 README](../src/fa-shared-context-poc/README.md#binding-row)。
 - 只在已知會變時重查：本程序的環境操作開始與結束時（操作期間的讀取不會喚醒正要停止的舊 session）；Hosted／平台回 `NATIVE_SESSION_CHANGED`、`AGENT_VERSION_FOLLOWING`、
   binding 不符或 404（重查一次並重做同一個讀取）；其他平台失敗（下一個請求重查）；同一綁定 1 天未用。
 - Hosted 的紀錄讀取先讀一次 Agent 紀錄，已有更新版本接手就 409 `NATIVE_SESSION_CHANGED`、不讀紀錄；
@@ -3421,7 +3424,10 @@ context。個別 input/output 超過已宣告 total、bool／非整數／零／�
 
 Hosted 沿固定 SDK `ModelCapabilitiesOverride/ModelLimitsOverride` 的正式 create／resume
 參數提供當輪 snapshot；provider 配置只映射正式支持的已知 input/output。換模型的新回合
-取得新 snapshot，不帶前一個 model 的容量。完全未知時 SDK override 的數值集合為空，
+取得新 snapshot，不帶前一個 model 的容量。Native 對話在已有完成回合後換模型只在 Hosted
+`FA_NATIVE_MODEL_SWITCH=1`（預設關）時接受：以新模型從已發布 checkpoint cold resume（丟掉留著的 SDK，不用實驗性
+`set_model`），新模型宣告的輸入上限小於上一回合量到的 SDK context 時在接單前回 `NATIVE_MODEL_CONTEXT_EXCEEDED`，
+不壓縮（2026-10-13，[產品說明](../src/fa-shared-context-poc/README.md#native-model-switch)）。完全未知時 SDK override 的數值集合為空，
 保留 runtime 自己的行為；不能把 runtime default 又冒稱為已知 server fact。
 原 user bytes、session、cost/once/unknown、checkpoint/no-SDK/原話 reader 邊界保持。
 

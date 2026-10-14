@@ -18,6 +18,7 @@ from .behavior_native_turn_wire import (
     NativeEnvironmentCommand, NativeEnvironmentRetargetCommand, material_digest,
 )
 from .errors import Problem
+from .native_binding import binding_store
 
 
 class _RetiredSession(Problem):
@@ -105,7 +106,8 @@ def _active_session(client):
             and session.version_indicator.agent_version == client.target.agent_version)
 
 
-def _source_session_status(client, phase):
+def _source_session_status(client, phase, observe=None):
+    """``observe(session)``: the metadata this read already has (ADR-0009 §2 claim); it reads nothing more."""
     session = _session_metadata(client)
     if session is None or not isinstance(session.status, str) or session.status not in {
             "active", "idle", "creating", "updating", "deleting", "failed", "deleted", "expired"}:
@@ -115,6 +117,8 @@ def _source_session_status(client, phase):
         logging.getLogger(__name__).warning(
             "NATIVE_ENVIRONMENT_SOURCE_VERSION_CHANGED phase=%s session_id=%s recorded_version=%s observed_version=%s",
             phase, client.target.session_id, client.target.agent_version, observed_version)
+    if observe is not None:
+        observe(session)
     return session.status
 
 
@@ -297,6 +301,40 @@ class NativeSessions:
                 yield
             finally:
                 self.forget()
+
+    def _binding(self, operation, call):
+        """ADR-0009 phase 1 only records, so a Table failure never changes the request's outcome; the next
+        observation writes the same CAS again."""
+        try:
+            return call(binding_store(self.composition))
+        except Exception as error:  # recording only; see the docstring
+            code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
+            logging.getLogger(__name__).warning("NATIVE_BINDING_UNRECORDED operation=%s code=%s", operation, code)
+            return None
+
+    def observed_binding(self, client, *, version=None, claimed_version=None, created_at=None):
+        """Claim ``client``'s SID if unclaimed, then record ``version``. Only facts already in hand, so nothing here
+        calls a session: ``version`` the VM accepted as expected or reported (``vm``); ``claimed_version`` platform
+        metadata a claim read (``claim``: no VM confirms it)."""
+        target = client.target
+
+        def observing(store):
+            row = store.claim(target.agent_id, hosted_session_id=target.session_id,
+                              created_agent_version=target.agent_version,
+                              observed_version=claimed_version or version,
+                              source="claim" if claimed_version else "vm", created_at=created_at)
+            if version is None or row is None or row.observed.agent_version == version:
+                return row
+            return store.record_observed(target.agent_id, hosted_session_id=target.session_id,
+                                         agent_version=version, source="vm")
+
+        return self._binding("observe", observing)
+
+    def _switched(self, client, value):
+        """A rerun's same ``ready`` result writes too, repairing a crash after the commit (ADR-0009 §7a (j))."""
+        if value.state == "ready":
+            self._binding("switch", lambda store: store.record_switch(client.target.agent_id, value))
+        return value
 
     def candidate(self, client, *, version=None):
         client_id = self.composition.config.identity.managed_identity_client_id
@@ -519,7 +557,7 @@ class NativeSessions:
         if state.environment != value or state.hosted_session_id != value.hosted_session_id:
             raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original environment result did not read back")
         self._remember_state(client, state)
-        return value
+        return self._switched(client, value)
 
     def observe_environment(self, client, command):
         reader = self.candidate(client, version=command.expected_agent_version)
@@ -651,7 +689,8 @@ class NativeSessions:
                     and existing.state == "ready" and (command.expected_session_id is None
                     or existing.previous_hosted_session_id == command.expected_session_id)):
                 self._remember_state(destination, state)
-                return existing
+                # A rerun after a crash between the commit and the binding write completes that write.
+                return self._switched(destination, existing)
             current = self._current_environment(destination, state, command)
             if current is not None:
                 return current
@@ -707,7 +746,11 @@ class NativeSessions:
             before_send()
             phase = "source_status"
             try:
-                status = _source_session_status(source, phase)
+                # The source is the Agent's current SID until this follow commits; an unclaimed Agent claims it
+                # with the version this metadata read already shows (ADR-0009 §2), outside any owner request.
+                status = _source_session_status(source, phase, observe=lambda session: self.observed_binding(
+                    source, claimed_version=session.version_indicator.agent_version,
+                    created_at=getattr(session, "created_at", None)))
                 # ADR-0009 §10: stop only an active source. Idle or terminal has no compute to stop; creating,
                 # updating or deleting is left alone and reported below as `source_active` for a later retry.
                 if status == "active":

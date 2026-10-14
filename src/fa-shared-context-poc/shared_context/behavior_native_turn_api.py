@@ -592,7 +592,7 @@ class NativeTurnGateway:
         return value, response
 
     def submit(self, principal, command, *, state_profile=NATIVE_STATE_PROFILE, original=None, response=None,
-               defer=None):
+               defer=None, owner_notice=False):
         """Owner submit: entry check once, then Hosted's ``rid:<RID>`` create-or-read is the only dedup.
 
         A first attempt does not pre-read the RID. Only when Hosted reports that the RID already names other
@@ -600,6 +600,9 @@ class NativeTurnGateway:
         caller (reconcile) already read in this request. ``defer`` is only passed by the Responses ``/submit`` route.
         A definite refusal of a first attempt before ``rid:<RID>`` exists carries ``not_dispatched`` with the RID,
         so the client may send the same RID and body again unchanged.
+
+        ``owner_notice``: this is the owner's own response (workbench or Teams owner reply), which carries the Agent's
+        pending drift notice (ADR-0009 §4 end); other callers (group start, reconcile) never carry it.
         """
         command = InstructionSubmit.model_validate_json(command.model_dump_json())
         rid = command.request_id
@@ -674,8 +677,13 @@ class NativeTurnGateway:
                             self.composition, client, command, capture, conversation=previous, defer=defer)
                     if command.conversation_id is None:
                         self._keep_admitted(client, submitted[0])
-                    return self._accounted(control, submitted)
+                    return self._bound(sessions, client, self._accounted(control, submitted), owner_notice)
                 except Problem as conflict:
+                    actual = conflict.body["error"].get("actual_version")
+                    if conflict.body["error"]["code"] == "NATIVE_SESSION_CHANGED" and actual is not None:
+                        # A newer image reported the VM's own version: record it (drift only records; ADR-0009 §4
+                        # step 6). The refusal itself continues below unchanged.
+                        sessions.observed_binding(client, version=actual)
                     if conflict.body["error"]["code"] != "NATIVE_RID_CONFLICT":
                         # Not resent here; the client's retry of this same RID reads the binding again.
                         sessions.moved(conflict)
@@ -693,7 +701,19 @@ class NativeTurnGateway:
                     original, response = self._existing(client, rid)
                     if original is None:
                         raise
-        return self._retained(control, client, command, original, state_profile, response=response, defer=defer)
+        return self._bound(sessions, client, self._retained(
+            control, client, command, original, state_profile, response=response, defer=defer), owner_notice)
+
+    @staticmethod
+    def _bound(sessions, client, result, owner_notice):
+        """Hosted answered, so the VM accepted ``client.target.agent_version``: record it. Only an owner response
+        carries a pending notice; nothing clears the bit before the phase 2 display (ADR-0009 §4 end)."""
+        value, upstream = result
+        row = sessions.observed_binding(client, version=client.target.agent_version)
+        notice = None if row is None or row.hosted_session_id != client.target.session_id else row.notice()
+        if owner_notice and notice is not None and isinstance(value, NativeReceipt):
+            value = value.model_copy(update={"environment_notice": notice})
+        return value, upstream
 
     def _prepared_before(self, sessions, reader):
         """The selected version's existing session (version reader, else the legacy one) names a preparation.
@@ -1028,7 +1048,7 @@ def install_native_turn_routes(app, composition, *, enabled):
     @app.post(PREFIX + "/submit")
     async def submit(request: Request, principal=Depends(identity)):
         command = await _body(request, InstructionSubmit, max_body_bytes=MAX_SUBMIT_BODY_BYTES)
-        return await reply(lambda: gateway.submit(principal, command))
+        return await reply(lambda: gateway.submit(principal, command, owner_notice=True))
 
     @app.post(PREFIX + "/prewarm")
     async def prewarm(request: Request, principal=Depends(identity)):
@@ -1103,7 +1123,7 @@ def install_native_turn_routes(app, composition, *, enabled):
         command = await _body(request, InstructionSubmit, max_body_bytes=MAX_SUBMIT_BODY_BYTES)
         after_reply = BackgroundTasks()
         response = await reply(lambda: gateway.submit(
-            principal, command, state_profile=NATIVE_RESPONSES_PROFILE, defer=after_reply.add_task))
+            principal, command, state_profile=NATIVE_RESPONSES_PROFILE, defer=after_reply.add_task, owner_notice=True))
         if after_reply.tasks:
             response.background = after_reply
         return response

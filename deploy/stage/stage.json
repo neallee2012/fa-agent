@@ -38,7 +38,8 @@
         "FA_NATIVE_GROUPS_ENABLED": "1",
         "FA_RESPONSES_ENABLED": "1",
         "FA_NATIVE_ROUTINES_ENABLED": "1",
-        "FA_NATIVE_ROUTINE_PROPOSALS": "1"
+        "FA_NATIVE_ROUTINE_PROPOSALS": "1",
+        "FA_NATIVE_MODEL_SWITCH": "1"
       }
     },
     {
@@ -53,7 +54,8 @@
         "FA_NATIVE_GROUPS_ENABLED": "1",
         "FA_RESPONSES_ENABLED": "1",
         "FA_NATIVE_ROUTINES_ENABLED": "1",
-        "FA_NATIVE_ROUTINE_PROPOSALS": "1"
+        "FA_NATIVE_ROUTINE_PROPOSALS": "1",
+        "FA_NATIVE_MODEL_SWITCH": "1"
       }
     },
     {

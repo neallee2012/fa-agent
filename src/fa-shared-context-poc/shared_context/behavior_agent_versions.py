@@ -127,6 +127,7 @@ def _of_definition(items, build, definition_hash):
 class _SelectedVersion:
     version: str
     responses_enabled: bool
+    model_switch: bool = False
 
     def require(self, responses):
         if responses and not self.responses_enabled:
@@ -147,12 +148,26 @@ def _responses_enabled(definition):
                 for item in protocols))
 
 
+def _model_switch(definition):
+    """The selected Hosted definition switches models mid-conversation (FA_NATIVE_MODEL_SWITCH=1); display only."""
+    from .behavior_native_turn_wire import MODEL_SWITCH_ENV
+
+    environment = definition.get("environment_variables") if isinstance(definition, dict) else None
+    return isinstance(environment, dict) and environment.get(MODEL_SWITCH_ENV) == "1"
+
+
 class HostedVersions:
     """API-side, read only: the concrete version every new Hosted session of an Agent is pinned to."""
 
     def __init__(self, foundry_for, *, build=None):
         self._foundry_for = foundry_for
         self.build = code_sha256() if build is None else build
+        # The last selection read per Agent, so a caller that just checked a version can show its flags without
+        # another Foundry read. Never an authority: the Hosted session enforces its own ENV.
+        self._observed = {}
+
+    def observed(self, target):
+        return self._observed.get((target.project_endpoint, target.agent_name))
 
     def current(self, target, *, require_responses=False):
         try:
@@ -173,7 +188,10 @@ class HostedVersions:
                 or observed["definition"].get("kind") != "hosted"):
             log.warning("agent endpoint version is incompatible agent=%s version=%s", target.agent_name, version)
             raise Problem(503, FOLLOWING, "the endpoint's selected version is not ready for this API build")
-        return _SelectedVersion(version, _responses_enabled(observed.get("definition"))).require(require_responses)
+        selected = _SelectedVersion(version, _responses_enabled(observed.get("definition")),
+                                    _model_switch(observed.get("definition")))
+        self._observed[(target.project_endpoint, target.agent_name)] = selected
+        return selected.require(require_responses)
 
 
 def endpoint_version(foundry, name):
@@ -211,6 +229,13 @@ def current_hosted_version(runtime, target, *, require_responses=False):
             return None
         return target.agent_version
     return resolver.current(target, require_responses=True) if require_responses else resolver.current(target)
+
+
+def hosted_model_switch(runtime, target):
+    """Whether the version ``current_hosted_version`` last read for ``target`` switches models; False when unread."""
+    resolver = _resolver(runtime)
+    selected = None if resolver is None or target is None else resolver.observed(target)
+    return selected is not None and selected.model_switch
 
 
 def _resolver(runtime):
@@ -331,6 +356,8 @@ _ENVIRONMENT_FLAGS = frozenset({
     "FA_SDK_TELEMETRY",
     # Native routines (README#native-routines-stage): scheduled turns and propose_routine; "0" turns them off.
     "FA_NATIVE_ROUTINES_ENABLED", "FA_NATIVE_ROUTINE_PROPOSALS",
+    # Mid-conversation model switch (README#native-model-switch); unset or "0" keeps a conversation on its model.
+    "FA_NATIVE_MODEL_SWITCH",
 })
 
 

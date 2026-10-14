@@ -1454,6 +1454,11 @@ class NativeInstructionControl:
         for action in ("submit", "fetch", "acknowledge", "reconcile",
                        "submit-retry", "read-context", "read-delegation"):
             allowed.setdefault(action, False)
+        # The model this message asked for, also when it was refused before any receipt (a model switch the
+        # conversation could not take); only for naming it, never a selection.
+        requested = getattr(command, "model", None)
+        if not requested and value is None:
+            requested = (self.store.command(rid) or {}).get("model")
         return {
             "state_profile": self.profile(thread_id), "task_id": rid, "submit_request_id": rid, "thread_id": thread_id,
             "label": (user_text or agent_text or routine_text or rid)[:60], "description": "原生回合；狀態以 Agent 保存的回條為準。",
@@ -1468,6 +1473,7 @@ class NativeInstructionControl:
             "source": None if source is None else source.model_dump(mode="json"),
             "admission": None if value is None else {"conversation_id": value.conversation_id,
                 "turn_number": value.turn_number, "model": value.capture.model.id},
+            **({"requested_model": requested} if requested else {}),
             "status": {"data": {"state": status}, "observed_at": self.observed.get(thread_id)},
             "native_receipt": None if value is None else {"status": value.status,
                 "cancel_requested": value.cancel_requested, "delivered": value.delivered,

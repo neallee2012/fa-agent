@@ -244,6 +244,9 @@ class TemplateCapabilityOption(WireModel):
 class TemplateResponsesOptions(WireModel):
     enabled: bool = False
     history_source: Literal["conversation", "response"] | None = None
+    # The selected Hosted definition lets a conversation change model after completed turns
+    # (FA_NATIVE_MODEL_SWITCH). Display only; omitted when off, so the response bytes stay as before.
+    model_switch: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 class TemplateOptions(WireModel):

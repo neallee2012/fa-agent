@@ -313,7 +313,8 @@ class SdkSessionFiles(SessionFsProvider):
         if self.automatic:
             # The runtime's own threshold compaction: strictly start then complete; verified again at snapshot.
             expected = "session.compaction_complete" if self._auto_open else "session.compaction_start"
-            if kind != expected or not isinstance(data.get("trigger"), str) or data["trigger"] in ("", "manual"):
+            from .behavior_sdk_compaction import NOT_AUTOMATIC_TRIGGERS
+            if kind != expected or not isinstance(data.get("trigger"), str) or data["trigger"] in NOT_AUTOMATIC_TRIGGERS:
                 self.checkpoint_error = "SDK_STATE_SOURCE_UNVERIFIED"
             if data.get("customInstructions") not in (None, ""):
                 self.checkpoint_error = "SDK_STATE_PRIVATE_MATERIAL"

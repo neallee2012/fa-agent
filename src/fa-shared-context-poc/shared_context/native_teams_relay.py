@@ -22,7 +22,9 @@ from .behavior_assistant_wire import InstructionSubmit
 from .behavior_auth import BehaviorPrincipal
 from .behavior_native_responses_api import reconcile
 from .behavior_native_turn_api import NativeTurnGateway, _BeforeAdmission, configured_native_turns
-from .behavior_native_turn_wire import RELAY_PREFIX, NativeRead, NativeResult, NativeTurnStatusRead
+from .behavior_native_turn_wire import (
+    RELAY_PREFIX, NativeEnvironmentNotice, NativeRead, NativeResult, NativeTurnStatusRead,
+)
 from .behavior_team_registry import resolve_agent_scope
 from .behavior_wire import WireModel
 from .errors import Problem
@@ -83,6 +85,8 @@ class RelayDecision(WireModel):
 class RelayReply(WireModel):
     state: Literal["done", "running", "needs_approval", "busy", "refused", "failed"]
     text: str
+    # ADR-0009 §4 end: the owner's reply carries the Agent's pending drift notice; the relay shows it from phase 2.
+    environment_notice: NativeEnvironmentNotice | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def teams_relay_agents(environ) -> dict[str, str] | None:
@@ -147,7 +151,10 @@ class TeamsRelay:
         if original.command.conversation_id is None and original.status != "busy_refused":
             # Also repairs a crash between admission and this write: the receipt keeps the CID it opened.
             chat.remember(original.conversation_id)
-        return self._reply(gateway, owner, original)
+        reply = self._reply(gateway, owner, original)
+        if original.environment_notice is not None:
+            reply = reply.model_copy(update={"environment_notice": original.environment_notice})
+        return reply
 
     @staticmethod
     def _submit(gateway, owner, rid, conversation_id, text):
@@ -156,7 +163,7 @@ class TeamsRelay:
         except ValidationError:
             raise Problem(422, "NATIVE_REQUEST_INVALID", "the Teams message is not one bounded text turn") from None
         try:
-            original, _ = gateway.submit(owner, command, state_profile=NATIVE_RESPONSES_PROFILE)
+            original, _ = gateway.submit(owner, command, state_profile=NATIVE_RESPONSES_PROFILE, owner_notice=True)
         except _BeforeAdmission as error:
             # Nothing was admitted; the relay's next poll sends the same RID and body again.
             if error.status >= 500 or error.server_following:

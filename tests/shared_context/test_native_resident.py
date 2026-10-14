@@ -307,14 +307,14 @@ def test_an_image_turn_that_would_not_fit_the_live_files_restores_the_smaller_ch
     files = SimpleNamespace(files={"events.jsonl": "x" * (MAX_BACKUP_BYTES // 4)}, checkpoint_profile=None,
                             model_provider=None, continue_from=lambda state: None)
     live = SimpleNamespace(files=files, released_sha256="a" * 64, alive=lambda: True, reusable=lambda: True,
-                           stop=stop, turn=None)
+                           stop=stop, turn=None, model="OFFLINE-model")
 
     async def continued(needed):
         pool = NativeResidentPool()
         holder = pool.holder("sid")
         holder.live = live
         found = await pool.continue_live(holder, SimpleNamespace(sha256="a" * 64), checkpoint_profile=None,
-                                         model_provider=None, needed_bytes=needed)
+                                         model_provider=None, model="OFFLINE-model", needed_bytes=needed)
         return found, holder.live
 
     assert asyncio.run(continued(0)) == (files, live) and not stopped

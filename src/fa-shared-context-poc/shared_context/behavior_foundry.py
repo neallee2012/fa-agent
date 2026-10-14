@@ -421,10 +421,15 @@ class FoundryHttpClient:
                             # Only Hosted's submit marks a definite refusal before ``rid:<RID>`` exists.
                             not_dispatched = (native_operation == "submit" and error.get("not_dispatched") is True
                                               and (400 <= response.status_code < 500 or code == "AGENT_VERSION_FOLLOWING"))
+                            # ADR-0009 §4 step 6: a newer image names the VM's own version in its version refusal.
+                            actual_version = error.get("actual_version")
+                            reported = (code == "NATIVE_SESSION_CHANGED" and isinstance(actual_version, str)
+                                        and re.fullmatch(r"[1-9][0-9]{0,15}", actual_version) is not None)
                             raise Problem(response.status_code, code,
                                           "the native agent refused this original command; no automatic retry",
                                           automatic_retry=False, **({} if files_check is None else {"files_check": files_check}),
-                                          **({"not_dispatched": True} if not_dispatched else {}))
+                                          **({"not_dispatched": True} if not_dispatched else {}),
+                                          **({"actual_version": actual_version} if reported else {}))
                         raise Problem(503, "FOUNDRY_INVOCATION_UNKNOWN",
                                       "native invocation outcome is unknown; reconcile the original request",
                                       upstream_status=response.status_code)

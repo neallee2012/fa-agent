@@ -598,6 +598,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 </div></div>
 <div class="composer-status" id="composer-status">
 <p id="cancellation-note" class="reason" role="status" hidden></p>
+<p id="model-switch-note" class="reason" role="status" hidden></p>
+<p id="model-lock-note" class="reason" role="status" hidden><span id="model-lock-text"></span> <button id="model-lock-new-conversation" type="button"></button></p>
 <div class="composer-meta"><p id="instruction-reason" role="status">連線後即可聊天</p><span class="composer-shortcut">Enter 送出 · Shift + Enter 換行</span><p id="input-capacity" hidden></p></div>
 </div>
 </div></div>
@@ -1038,6 +1040,26 @@ function resultText(task,result){
   return result.work_state==="failed"?"工作失敗，不能當作已完成。失敗原因與原始內容保留於明細。":
     "結果內容不是目前可整理的格式；請查看原始內容，不推算或填入答案。";
 }
+// A send refused before it ran because this conversation keeps its model (NATIVE_CAPTURE_CHANGED with not_dispatched).
+// Without not_dispatched the same code is a changed resend or receipt, not a model choice, and keeps the general text.
+// Also where the API reports model switching (modelSwitchEnabled): the Hosted session that answered may still refuse it.
+function modelLockRefusal(error){return error?.code==="NATIVE_CAPTURE_CHANGED"&&error.not_dispatched===true}
+// The refused message's own task (by its request ID), so the sentence names that conversation's model, not the one shown.
+function refusedTask(error){
+  return typeof error?.request_id==="string"?(state?.tasks||[]).find(task=>task.task_id===error.request_id)??null:null;
+}
+function modelLockRefusalText(error){
+  const task=refusedTask(error),model=task?threadModel(task.thread_id):pinnedConversationModel();
+  return `這段對話固定用${model?` ${modelDisplayName(model)}`:"原本的模型"}，換模型要開新對話；這則訊息沒有執行。`;
+}
+// A model switch refused before it ran: the conversation, as last measured, is longer than the new model holds.
+function modelContextRefusal(error){return error?.code==="NATIVE_MODEL_CONTEXT_EXCEEDED"&&error.not_dispatched===true}
+function modelContextRefusalText(error){
+  const model=refusedTask(error)?.requested_model;
+  return `這段對話太長，${model?modelDisplayName(model):"所選的模型"} 放不下；請開新對話或改用原模型。`;
+}
+function modelChoiceRefusal(error){return modelLockRefusal(error)||modelContextRefusal(error)}
+function modelChoiceRefusalText(error){return modelLockRefusal(error)?modelLockRefusalText(error):modelContextRefusalText(error)}
 function friendlyError(error){
   if(error?.server_following===true&&SERVER_FOLLOWING_CODES.has(error.code))
     return error.request_id&&versionResends.has(scopeKey(error.request_id))?
@@ -1058,6 +1080,7 @@ function friendlyError(error){
     NATIVE_ENVIRONMENT_CONFLICT:"助理換版暫時沒有完成，訊息沒有送出，請稍後再送。",
     FOUNDRY_INVOCATION_UNKNOWN:"助理換版暫時沒有完成，訊息沒有送出，請稍後再送。",
   };
+  if(modelChoiceRefusal(error))return modelChoiceRefusalText(error);
   if(error?.not_dispatched===true&&Object.hasOwn(notDispatchedMessages,error.code))
     return error.phase!=="acknowledge"?notDispatchedMessages[error.code]:error.code==="WORK_POLICY_REVOKED"?
       "你目前沒有確認收到的權限，確認收到沒有送出。":"確認收到沒有送出，請稍後再按一次。";
@@ -5272,6 +5295,53 @@ function openingView(){
   return opening&&(!agentMode||opening.agent===selectedAgent)&&
     (!opening.thread||state?.composer?.thread_id!==opening.thread)?opening:null;
 }
+// The selected Agent's Hosted version lets a conversation change model after completed turns (FA_NATIVE_MODEL_SWITCH,
+// reported by the API with the Responses options). Read from the server only; the page never decides it.
+function modelSwitchEnabled(composer=state?.composer){return composer?.responses?.model_switch===true}
+// The thread's model as the server holds it: that of its last allocated turn (admission.turn_number set), whatever the
+// turn's outcome, since native_turns._allocate adopts a turn's model when it takes the turn. A send refused before
+// allocation (not_accepted, busy_refused) changed nothing. `conversationId` narrows it to one conversation. Or null.
+function threadModel(threadId,conversationId=null){
+  return (state?.tasks||[]).findLast(task=>task.thread_id===threadId&&task.admission?.turn_number!=null&&
+    (conversationId===null||task.admission.conversation_id===conversationId)&&task.not_accepted!==true&&
+    !["not_accepted","busy_refused"].includes(task.status?.data?.state)&&task.native_receipt?.status!=="busy_refused"&&
+    typeof task.admission.model==="string"&&task.admission.model)?.admission.model??null;
+}
+// Once one of its turns completed, a conversation's capture pins its model unless the server switches models; then
+// any other one is refused with NATIVE_CAPTURE_CHANGED (native_turns._capture_fits). Returns that model (threadModel),
+// or null while the choice is free, including whenever modelSwitchEnabled().
+function pinnedConversationModel(composer=state?.composer){
+  const cid=composer?.conversation_id??composer?.conversation?.conversation_id;
+  if(modelSwitchEnabled(composer))return null;
+  if(!cid||openingView()||!nativeProfile(composer.state_profile)||composer.append_target)return null;
+  const completed=(state.tasks||[]).some(task=>task.thread_id===composer.thread_id&&
+    task.admission?.conversation_id===cid&&task.status?.data?.state==="completed");
+  return completed?threadModel(composer.thread_id,cid):null;
+}
+// Shown once after a send that changed the conversation's model: that turn reloads the conversation, so it is slower.
+let modelSwitchNotice=null;
+function renderModelSwitchNotice(){
+  const notice=modelSwitchNotice,task=notice&&(state?.tasks||[]).find(value=>value.task_id===notice.request_id);
+  const shown=Boolean(notice&&notice.agent===selectedAgent&&notice.thread===state?.composer?.thread_id&&
+    task?.not_accepted!==true&&!["completed","unknown","busy_refused"].includes(task?.status?.data?.state));
+  el("model-switch-note").hidden=!shown;
+  if(shown)text("model-switch-note",`已換成 ${modelDisplayName(notice.model)}；這一回合會比較慢（重新載入對話）。`);
+}
+function modelDisplayName(id){
+  return (state?.composer?.models?.models||[]).find(model=>model.id===id)?.display_name||id;
+}
+// The model picked in a pinned conversation: the dropdown goes back to the pinned model and offers a new conversation.
+let modelLockNotice=null;
+function renderModelLockNotice(pinned){
+  const notice=pinned&&modelLockNotice?.agent===selectedAgent&&modelLockNotice.thread===state.composer?.thread_id&&
+    modelLockNotice.wanted!==pinned?
+    modelLockNotice:null;
+  el("model-lock-note").hidden=!notice;
+  if(!notice)return;
+  text("model-lock-text",`這段對話固定用 ${modelDisplayName(pinned)}；要換模型請開新對話`);
+  text("model-lock-new-conversation",`用 ${modelDisplayName(notice.wanted)} 開新對話`);
+  el("model-lock-new-conversation").disabled=el("new-conversation").disabled;
+}
 // The created conversation is shown: what was typed (and a model explicitly chosen) while it opened becomes its draft.
 function adoptOpeningDraft(composer){
   const from=scopeKey(OPENING_DRAFT),to=scopeKey(composer.request_id);
@@ -5338,8 +5408,13 @@ function renderComposer(){
     ?`本對話綁定 Hosted session：${composer.hosted_session_id}；追問沿用同一個環境。`
     :"送出第一則訊息時建立 Hosted session；不會因追問自動換新。");
   const models=composer?.models?.models||[];
-  const chosen=(changedDraft?modelDrafts.get(scopeKey(draftId)):previousModel)||(opening?null:composer?.model)||
-    composer?.models?.default_model;
+  // A pinned model no longer offered is not forced (the server answers that send); the dropdown then stays as before.
+  const pinnedModel=pinnedConversationModel(composer),pinned=models.some(model=>model.id===pinnedModel)?pinnedModel:null;
+  // Where models switch, a follow-up starts on the conversation's current model (threadModel), never silently on the
+  // default.
+  const conversationModel=!opening&&modelSwitchEnabled(composer)?threadModel(composer?.thread_id):null;
+  const chosen=pinned||(changedDraft?modelDrafts.get(scopeKey(draftId)):previousModel)||conversationModel||
+    (opening?null:composer?.model)||composer?.models?.default_model;
   // Rebuild the options only when the list changes, so a page of background reads does not rewrite the choice.
   const optionsKey=JSON.stringify(models.map(model=>[model.id,model.display_name]));
   if(optionsKey!==modelOptionsKey){
@@ -5366,6 +5441,8 @@ function renderComposer(){
     (selectedModel.reasoning_summary_available?"模型可能提供公開推理摘要，仍以實際回傳為準。":"此部署未宣告可提供公開推理摘要。"):
     "模型清單尚未可用；不放入未部署的選項，也不會自行建立模型。");
   if(appendTarget)text("model-capacity","追加沿原回合的模型與設定；不更換模型，也不是另一筆交辦。");
+  renderModelLockNotice(pinned);
+  renderModelSwitchNotice();
   el("instruction").disabled=opening?!scopeAvailable()||state.authentication!=="AVAILABLE":
     busy||messageBusy||appendBusy||threadLoading||!canCompose;
   renderAttachmentPicker();
@@ -5501,11 +5578,13 @@ function renderPresence(blocked=false){
   const composer=state.composer,task=(state.tasks||[]).find(value=>value.task_id===selected);
   const signedIn=state.authentication==="AVAILABLE";
   // Before sign-in the Agent directory is still empty, so an unavailable scope is not a problem yet.
-  const problem=Boolean(state.reason)||signedIn&&!scopeAvailable()||
-    Boolean(lastError||threadErrors.get(scopeKey(selectedThread))||task?.error);
+  // A send refused because the conversation keeps its model is the owner's next step (switch back or open a new
+  // conversation), not a fault.
+  const shownError=lastError||threadErrors.get(scopeKey(selectedThread))||task?.error,modelLocked=modelChoiceRefusal(shownError);
+  const problem=Boolean(state.reason)||signedIn&&!scopeAvailable()||Boolean(shownError&&!modelLocked);
   const attention=currentAttention().some(entry=>(!entry.team&&entry.thread_id===selectedThread||attentionTurn(entry))&&
     !hitlSettled(entry));
-  const needs=!signedIn||attention||blocked||
+  const needs=!signedIn||attention||blocked||modelLocked||
     Boolean(composer?.archived||composer?.conversation?.archived);
   const value=problem?"problem":needs?"attention":"ready";
   text("chat-presence",{problem:"發生問題",attention:"需要處理",ready:"可以聊天"}[value]);
@@ -6429,6 +6508,7 @@ function renderConversation(tasks){
         (task.submission.not_dispatched===true&&task.submission.code==="NATIVE_SESSION_CHANGED"?
           "助理的新版本還沒準備好，這則訊息沒有送出。請稍後按「以原內容重送」。":
           "助理正在換版，這則訊息還沒送達。稍後可以按「以原內容重送」。"):
+      task.not_accepted===true&&modelChoiceRefusal(task.submission)?modelChoiceRefusalText({...task.submission,request_id:task.task_id}):
       task.not_accepted===true&&state.authentication==="AVAILABLE"?
         `這則訊息沒有送達，助理沒有執行${task.submission.not_dispatched===true?
           `（${errorHeadline(friendlyError({code:task.submission.code,not_dispatched:true})).replace(/。$/,"")}）`:""}`+
@@ -6753,7 +6833,8 @@ function render(){
   const errorText=error?friendlyError(error):"",errorRequest=error?errorRequestId(error,t):null;
   shownErrorRequest=errorRequest;
   el("error").hidden=!error;
-  text("error-message",errorHeadline(errorText));
+  // The model-lock sentence is short and its second half (nothing ran) is the point, so it is shown whole.
+  text("error-message",modelChoiceRefusal(error)?errorText:errorHeadline(errorText));
   el("copy-error-request").hidden=!errorRequest;
   el("error-details").hidden=!error;
   text("error-full",errorText);
@@ -7293,8 +7374,11 @@ function openDiagnostics(){
 async function sendChat(){
   if(el("send-instruction").disabled||composing||!state?.composer)return;
   if(state.composer.can_append&&state.composer.append_target)return sendAppend();
+  modelLockNotice=null;modelSwitchNotice=null;
   const composer=state.composer,originThread=selectedThread,originalId=composer.request_id;
   const native=nativeProfile(composer.state_profile);
+  // The conversation's current model (threadModel); a different pick here is a switch (only where the server allows one).
+  const switchedFrom=native&&modelSwitchEnabled(composer)?threadModel(originThread):null;
   const originAgent=selectedAgent,scope=agentRevision;
   const content=el("instruction").value,model=el("model").value,csrf=state.csrf;
   const attachments=JSON.parse(JSON.stringify(selectedAttachments())),originalAttachmentKey=attachmentDraftKey(composer);
@@ -7357,6 +7441,9 @@ async function sendChat(){
       throw {code:"INSTRUCTION_CHANGED"};
     if(native&&
         !state.composer.models?.models?.some(candidate=>candidate.id===model))throw {code:"INSTRUCTION_CHANGED"};
+    if(switchedFrom&&switchedFrom!==model){
+      modelSwitchNotice={agent:originAgent,thread:originThread,request_id:requestId,model};renderModelSwitchNotice();
+    }
     const value=await post(`/api/instructions/${encodeURIComponent(requestId)}/submit`,{
       content,model,...(attachments.length?{attachments}:{}),...(files.length?{files}:{}),...(images.length?{images}:{}),
     });
@@ -8225,7 +8312,19 @@ el("instruction").addEventListener("keydown",event=>{
     event.preventDefault();sendChat();
   }
 });
-el("model").addEventListener("change",()=>{modelDrafts.set(scopeKey(draftId),el("model").value);renderComposer()});
+el("model").addEventListener("change",()=>{
+  // Interim: a pinned conversation keeps its model; the pick is offered as a new conversation instead.
+  const pinned=pinnedConversationModel();
+  if(pinned&&el("model").value!==pinned&&state.composer.models?.models?.some(model=>model.id===pinned)){
+    modelLockNotice={agent:selectedAgent,thread:state.composer.thread_id,wanted:el("model").value};
+    el("model").value=pinned;renderComposer();return;
+  }
+  modelLockNotice=null;modelDrafts.set(scopeKey(draftId),el("model").value);renderComposer();
+});
+el("model-lock-new-conversation").addEventListener("click",()=>{
+  const wanted=modelLockNotice?.wanted;
+  if(!el("model-lock-new-conversation").disabled&&wanted)openNewConversation(wanted);
+});
 el("refresh-models").addEventListener("click",async()=>{
   if(el("refresh-models").disabled)return;
   const revision=++stateRevision;
@@ -8446,13 +8545,24 @@ el("new-instruction").addEventListener("click",()=>{
   if(!el("new-instruction").disabled&&selectedThread)
     run(`/api/instructions/${encodeURIComponent(selectedThread)}/next`,{},state.composer.request_id);
 });
-el("new-conversation").addEventListener("click",openNewConversation);
-async function openNewConversation(){
+el("new-conversation").addEventListener("click",()=>openNewConversation());
+// `model`: the new conversation's first model, picked in a conversation that keeps its own (model-lock note).
+async function openNewConversation(model){
   if(el("new-conversation").disabled||busy||threadLoading||!state||openingView())return;
+  const draftKey=scopeKey(OPENING_DRAFT),picked=typeof model==="string"&&model?model:null;
+  const hadDraft=modelDrafts.has(draftKey),earlierDraft=modelDrafts.get(draftKey);
+  if(picked)modelDrafts.set(draftKey,picked);
   const opening={agent:selectedAgent,thread:null};
-  conversationOpening=opening;
-  try{await run("/api/instructions/conversations/new")}
-  finally{if(conversationOpening===opening){conversationOpening=null;render()}}
+  conversationOpening=opening;modelLockNotice=null;modelSwitchNotice=null;
+  let created=null;
+  try{created=await run("/api/instructions/conversations/new")}
+  finally{
+    // A conversation that did not open leaves no picked model behind for the next plain 新對話.
+    if(picked&&!created?.composer?.thread_id&&modelDrafts.get(draftKey)===picked){
+      if(hadDraft)modelDrafts.set(draftKey,earlierDraft);else modelDrafts.delete(draftKey);
+    }
+    if(conversationOpening===opening){conversationOpening=null;render()}
+  }
 }
 el("refresh-progress").addEventListener("click",()=>{
   if(el("refresh-progress").disabled)return;

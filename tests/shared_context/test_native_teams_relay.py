@@ -137,6 +137,21 @@ def test_owner_message_runs_one_turn_and_returns_its_reply(relay):
     assert len(submits(relay.env)) == 1 and len(relay.env.conversations) == 1
 
 
+def test_owner_reply_carries_a_pending_drift_notice(relay, monkeypatch):
+    from shared_context import native_binding
+
+    repository, target = InMemoryRepository(), relay.env.case.remote.target
+    monkeypatch.setattr(native_binding, "TableRepository", lambda _client: repository)
+    # The same session was created on the target's version and the platform ran it on 40 (ADR-0009 §4 end).
+    native_binding.binding_store(relay.env.case.composition).claim(
+        target.agent_id, hosted_session_id=target.session_id, created_agent_version=target.agent_version,
+        observed_version="40")
+    first = relay.post()
+    assert first.status_code == 200, first.text
+    assert first.json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。", "environment_notice": {
+        "kind": "platform_version_changed", "from_version": target.agent_version, "to_version": "40"}}
+
+
 def test_same_activity_resent_reads_the_original_turn_and_never_submits_again(relay):
     for _ in range(3):
         assert relay.post().json()["state"] == "running"

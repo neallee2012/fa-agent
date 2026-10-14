@@ -295,18 +295,21 @@ def check_residual(files: dict[str, str], mapping: dict) -> bool:
     return not unreviewed
 
 
-def verify(root: Path, files: dict[str, str], baseline: dict[str, str], mapping: dict, gitleaks: str) -> bool:
+def verify(root: Path, files: dict[str, str], baseline: dict[str, str], mapping: dict, gitleaks: str | None) -> bool:
+    """gitleaks None skips check [1]; only gate2_check.py --no-gitleaks does that, the CLI here never does."""
     checks = original_patterns(mapping)
     # A partial scan fails too: gitleaks must report at least half the text bytes checked here.
     min_bytes = sum(len(t.encode("utf-8")) for t in files.values()) // 2
-    results = [check_gitleaks(root, mapping["gitleaks_known_false_positives"], gitleaks, min_bytes),
+    if gitleaks is None:
+        print("[1] gitleaks: SKIPPED by the caller")
+    results = [gitleaks is None or check_gitleaks(root, mapping["gitleaks_known_false_positives"], gitleaks, min_bytes),
                check_originals(files, checks),
                check_hashes(files, baseline, checks, dropping_rules(mapping)),
                check_residual(files, mapping)]
     return all(results)
 
 
-def verify_tree(out: Path, base: Path, mapping: dict, gitleaks: str) -> bool:
+def verify_tree(out: Path, base: Path, mapping: dict, gitleaks: str | None) -> bool:
     if not out.is_dir() or not base.is_dir():
         print("FAIL: --out and --baseline must be existing directories")
         return False

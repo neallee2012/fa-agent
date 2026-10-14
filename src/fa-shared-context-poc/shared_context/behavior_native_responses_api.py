@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from pydantic import TypeAdapter
 
-from .behavior_agent_versions import current_hosted_version
+from .behavior_agent_versions import current_hosted_version, hosted_model_switch
 from .behavior_foundry_responses import ConversationMode, FoundryResponsesClient, HistoryKind
 from .behavior_native_turn_wire import (
     NativeAgentReceive, NativeRoutineSubmit, NativeContinuationSubmit, NativeConversationRead, NativeRead, NativeSubmit,
@@ -74,7 +74,8 @@ def template_responses_options(composition, principal):
         if error.status != 409 or error.body["error"]["code"] != "NATIVE_TURNS_DISABLED":
             raise
         return options
-    return TemplateResponsesOptions(enabled=True, history_source=options.history_source)
+    return TemplateResponsesOptions(enabled=True, history_source=options.history_source,
+                                    model_switch=hosted_model_switch(composition.runtime, client.target))
 
 
 def _original_after_dispatch(client, expected):

@@ -496,7 +496,7 @@ class NativeSdkExecutor:
         files = await self.resident.continue_live(
             self.resident.holder(scope.sdk_session_id), previous,
             checkpoint_profile=instruction.checkpoint_profile, model_provider=scope.model_provider,
-            needed_bytes=image_bytes)
+            model=instruction.model, needed_bytes=image_bytes)
         if files is None:
             files = SdkSessionFiles(
                 scope.sdk_session_id, previous, checkpoint_profile=instruction.checkpoint_profile,

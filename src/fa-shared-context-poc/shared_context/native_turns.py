@@ -37,7 +37,7 @@ from .behavior_native_turn_wire import (
     NATIVE_REQUEST, NATIVE_STATE_PROFILE, NATIVE_TURN_HEADER,
     NativeTurnCapture, TurnNumber, canonical_bytes, material_digest,
     NativeSessionRead, NativeSessionPrepare, NativeSessionPreparation, NativeSessionState, NativeCandidateRead,
-    NativeEnvironmentView, NativeSessionFollow, NativeSessionRetarget,
+    NativeEnvironmentView, NativeSessionFollow, NativeSessionRetarget, native_model_switch_enabled,
 )
 from .behavior_sdk_state import (
     NativeCheckpointRef, NativeCheckpointScope, NativeCheckpointTurn, NativeCompactionExecution, SdkState,
@@ -1030,6 +1030,8 @@ class NativeTurnRuntime:
                 raise Problem(409, "NATIVE_STATE_SCOPE", "the original conversation must retain its state profile")
             if not await self._capture_fits(meta, request.capture):
                 raise Problem(409, "NATIVE_CAPTURE_CHANGED", "continue with the original conversation capture")
+            # Only here, before rid:<RID> exists, so a refusal leaves no receipt (not_dispatched).
+            await self._switch_fits(meta, request.capture)
             blocker = await self._continuation_blocker(meta, self.identity.session_id)
             if blocker is not None:
                 raise Problem(409, blocker, "the original conversation has no completed checkpoint to restore")
@@ -1221,10 +1223,13 @@ class NativeTurnRuntime:
         )
 
     async def _capture_fits(self, meta, capture):
-        """The conversation keeps its capture; only its model may change, and only before any saved SDK state.
+        """The conversation keeps its capture; only its model may change. _allocate then adopts the new model.
 
-        With no completed turn (e.g. the first one was refused by its model) the next turn starts an empty SDK
-        session, so nothing produced by the old model is resumed. _allocate then adopts the new model.
+        By default only before any saved SDK state: with no completed turn (e.g. the first one was refused by its
+        model) the next turn starts an empty SDK session, so nothing produced by the old model is resumed.
+        With ``FA_NATIVE_MODEL_SWITCH=1`` also after completed turns: the turn restores the published checkpoint
+        (reasoning already stripped) cold with the new model; a kept SDK on the old model is discarded
+        (NativeResidentPool.continue_live). Each RID keeps its own capture.
         """
         if not _connector_ids(capture) <= _connector_ids(meta.capture):
             return False
@@ -1232,8 +1237,39 @@ class NativeTurnRuntime:
             return True
         if _conversation_capture(meta.capture, include_model=False) != _conversation_capture(capture, include_model=False):
             return False
+        if native_model_switch_enabled():
+            return True
         return meta.base_ckpt is None and (
             meta.rid is None or (await self._rid(meta.rid)).value.receipt.status != "completed")
+
+    async def _switch_fits(self, meta, capture):
+        """A new model must hold the conversation as FA last measured it; otherwise nothing is admitted.
+
+        The measure is the last completed turn's own SDK context-window snapshot (``session.usage_info``
+        ``current_tokens``, PA-16 B ``sdk_context``); the limit is the new model's declared ``max_prompt_tokens``
+        (else its context window). When the conversation's last turn did not complete, the turn restores
+        ``meta.base_ckpt`` instead, so the turn that saved it (its lineage) is measured. Nothing is compacted here.
+        An unmeasured turn or an undeclared limit is not a refusal: unknown is not over, and the runtime's own
+        context-limit failure still applies."""
+        if meta.capture.model.id == capture.model.id or meta.rid is None or capture.model_capacity is None:
+            return
+        limits = capture.model_capacity.limits
+        limit = limits.max_prompt_tokens or limits.context_window_tokens
+        if limit is None:
+            return
+        last = (await self._rid(meta.rid)).value.receipt
+        if last.status != "completed":
+            lineage = None if meta.base_ckpt is None else meta.base_ckpt.lineage
+            last = None if lineage is None else (await self._rid(lineage.request_id)).value.receipt
+        inference = (None if last is None or last.status != "completed" or last.assembly is None
+                     else last.assembly.inference)
+        measured = None if inference is None else next(
+            (snapshot.current_tokens for snapshot in reversed(inference.sdk_context)
+             if snapshot.current_tokens is not None), None)
+        if measured is not None and measured > limit:
+            raise Problem(409, "NATIVE_MODEL_CONTEXT_EXCEEDED",
+                          "the conversation is longer than the selected model can hold; nothing was run",
+                          model=capture.model.id)
 
     def _checkpoint_turn(self, receipt, meta):
         return NativeCheckpointTurn(
@@ -1292,10 +1328,14 @@ class NativeTurnRuntime:
                 previous = await self.read(meta.rid)
                 if previous.status == "completed":
                     checkpoint = (await self._turn(store, previous)).checkpoints[0]
-            # A capture that still differs here differs only in its model, before any saved state (_capture_fits).
+            # A capture that still differs here differs only in its model (_capture_fits): the conversation takes it
+            # from this turn on, under the meta ETag; earlier RIDs keep their own captures.
+            # meta.capture.connectors stays the ceiling: _capture_fits refuses a connector outside it, and the API's
+            # team_connector_narrowing.resolve_connectors gives each turn only those the Team still grants. A model
+            # adopted on a turn with fewer connectors therefore does not shrink what a re-enabled one may bring back.
             adopted = _conversation_capture(meta.capture) != _conversation_capture(receipt.capture)
-            allocated = _changed(meta, n=meta.n + 1, rid=receipt.request_id, base_ckpt=checkpoint,
-                                 **({"capture": receipt.capture} if adopted else {}))
+            allocated = _changed(meta, n=meta.n + 1, rid=receipt.request_id, base_ckpt=checkpoint, **(
+                {"capture": _changed(receipt.capture, connectors=meta.capture.connectors)} if adopted else {}))
             try:
                 await store.set_item("meta", _json(allocated), if_match=item.etag)
             except _UNCERTAIN:

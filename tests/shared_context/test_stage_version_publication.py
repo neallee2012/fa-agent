@@ -36,8 +36,10 @@ def test_stage_a_b_and_api_enable_the_approved_hitl_groups_and_reader_catalog():
     for agent in stage["agents"]:
         if agent["name"] in {"fa-stage-a", "fa-stage-b"}:
             # README#native-routines-stage: A and B offer propose_routine; the API owns the clock and the approvals.
+            # README#native-model-switch: Neal 2026-10-14 turned mid-conversation model switching on for stage A and B.
             assert agent["hosted_environment"] == {**wanted, "FA_RESPONSES_ENABLED": "1",
-                                                   "FA_NATIVE_ROUTINES_ENABLED": "1", "FA_NATIVE_ROUTINE_PROPOSALS": "1"}
+                                                   "FA_NATIVE_ROUTINES_ENABLED": "1", "FA_NATIVE_ROUTINE_PROPOSALS": "1",
+                                                   "FA_NATIVE_MODEL_SWITCH": "1"}
         else:
             assert not agent.get("hosted_environment")
     builtins = stage["api_environment"]["FA_CAPABILITY_BUILTINS"].split(",")

@@ -1,5 +1,14 @@
 # FA 雲端授權與 USD150 成本 preflight
 
+<a id="dev-cap-800-1013"></a>
+## 2026-10-13 dev 上限 USD650 → USD800（Neal 授權）
+
+- **Neal 10-13 下午選了選項**：「上限 800，停損 780」。
+- **上限**：dev 共用上限由 USD650 提高到 **USD800**，停損 **USD780**，到停損就先停下來回報。
+- **起因**：每日固定開銷約 USD15～30，照這個速度約 10-15 會碰到原停損 USD630；接下來還有 dev 測試要跑（release 29，含換模型；G phase 2；phase 3／3b），每次約 USD5～10。
+- **決定前實查**：約 **USD572**（`rg-faexample` USD550.63＋`ME_cae-facontext-private` USD21.13；報表約晚一天）。之後再查 RG 一次回 429，沒有拿到更新的數字。
+- 其他規則不變：不清帳；`budget_enforced=false`，這仍是記錄用的上限，沒有建立 Azure Budget；stage 照舊另列每月 USD200；每次 dev 部署照舊逐次批准。
+
 <a id="dev-cap-650-1013"></a>
 ## 2026-10-13 dev 部署批准（上限 USD650／停損 USD630 維持）
 

@@ -239,6 +239,28 @@ def test_responses_lane_rechecks_the_published_definition_without_a_write():
     assert not foundry.creates() and not foundry.routes
 
 
+@pytest.mark.parametrize("flag,expected", [("1", True), ("0", False), (None, False), (True, False)])
+def test_the_selected_definition_reports_model_switching_without_another_read(flag, expected):
+    from shared_context.behavior_agent_template import TemplateResponsesOptions
+
+    foundry = Foundry(R)
+    environment = {"FA_NATIVE_TURNS": "foundry-native-v1", "FA_RESPONSES_ENABLED": "1",
+                   **({} if flag is None else {"FA_NATIVE_MODEL_SWITCH": flag})}
+    foundry.add(R.agent_name, 4, "new", definition={
+        "kind": "hosted", "protocol_versions": [{"protocol": "responses", "version": "2.0.0"}],
+        "environment_variables": environment})
+    resolver = HostedVersions(lambda endpoint: foundry, build="new")
+    runtime = SimpleNamespace(agent_message_composition=SimpleNamespace(hosted_versions=resolver))
+    assert versions.hosted_model_switch(runtime, R) is False, "nothing read yet"
+    assert resolver.current(R, require_responses=True) == "4"
+    calls = len(foundry.calls)
+    assert versions.hosted_model_switch(runtime, R) is expected
+    assert len(foundry.calls) == calls
+    # Display only, and omitted when off so the options bytes stay as before.
+    shown = TemplateResponsesOptions(enabled=True, model_switch=expected).model_dump(mode="json")
+    assert ("model_switch" in shown) is expected
+
+
 @pytest.mark.parametrize("protocols,environment", [
     ([], {"FA_RESPONSES_ENABLED": "1"}),
     ([{"protocol": "invocations", "version": "2.0.0"}], {"FA_RESPONSES_ENABLED": "1"}),

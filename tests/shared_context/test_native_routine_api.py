@@ -344,6 +344,42 @@ def test_official_continuation_keeps_routine_attribution_and_the_original_unknow
 
 
 @pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
+def test_a_routine_turn_runs_on_its_conversations_model_not_the_project_default(routine_api, monkeypatch):
+    """The seed ran on gpt-4.1-mini; the project default is now another model. Without the conversation's model the
+    routine's capture took the default, a model-only change the Hosted refuses with NATIVE_CAPTURE_CHANGED."""
+    from shared_context.behavior_native_turn_wire import NATIVE_REQUEST
+    from shared_context.native_turns import _conversation_capture
+
+    case = routine_api
+
+    def hosted(request):
+        # Like the Hosted with model switching off (_capture_fits): after a completed turn the conversation capture,
+        # model included, must match, or the routine is refused before any receipt.
+        command = NATIVE_REQUEST.validate_json(request.content)
+        if command.operation == "routine_receive" and any(
+                record.conversation_id == command.command.conversation_id and record.status == "completed"
+                and _conversation_capture(record.capture) != _conversation_capture(command.capture)
+                for record in case.remote.records.values()):
+            return httpx.Response(409, json={"error": {
+                "code": "NATIVE_CAPTURE_CHANGED", "message": "private", "not_dispatched": True}})
+        return case.remote(request)
+
+    monkeypatch.setattr(case.foundry.http, "_transport", httpx.MockTransport(hosted))
+    seeded = case.remote.records["human-seed"].capture.model.id
+    assert seeded == "gpt-4.1-mini"
+    case.c.control.models.default = "configured-second-model"
+    due = case.c.h.time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    definition = daily_definition(enabled=True, schedule={
+        "kind": "daily", "time_zone": "UTC", "local_time": due.strftime("%H:%M")})
+    assert case.client.post(case.routine_prefix + "/definitions", json=definition, headers=case.headers).status_code == 200
+    case.c.h.time = due + timedelta(seconds=2)
+    result = case.trigger({"routine_id": "daily-summary", "scheduled_for": due.isoformat()})
+    assert result.status_code == 202, result.text
+    original = case.remote.records[result.json()["request_id"]]
+    assert original.command.model == seeded and original.capture.model.id == seeded
+
+
+@pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
 def test_saved_definitions_and_occurrence_intents_survive_the_existing_startup_reader(routine_api):
     from test_conversation_transfer_startup import read_startup
 

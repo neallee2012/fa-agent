@@ -4,6 +4,16 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="adr0009-idle-upgrade-final-1013"></a>
+## 2026-10-13：ADR-0009 閒置升級機制設計定稿（Neal 同日要求；M 項已核准；未實作）
+
+- Neal 10-13 要求「開始處理，解決未解的問題，設計定稿」，並訂最高原則「不要影響使用者體驗，轉換過程與體驗必須絲滑，使用者近似無感」。[ADR-0009](adr/0009-version-model-g-actual-version-idle-upgrade.md) 的原 9 個未解問題與生命週期表「未定」格子都已解決：Hosted 的 `agent` 紀錄當唯一柵欄（接單與切換都是對它的 CAS），不建立 API 派送意圖紀錄、租約與每個對話的通知標記；新 session 先在背景建好、健康檢查、還原工作檔，真正的切換只是一次以 ETag 為條件的短 CAS；crash-loop 用官方 `entry_mode="recovered"` 加 FA 的優雅延後標記判斷。
+- 對已確認部分與 Neal 決定的修訂：Neal 同日核准 M1（含 M2 不拒絕）、M3～M10 採 A（M1 子選項不設固定期限、遷移期間放寬決定 6；M6 取代決定 7、M9 修訂決定 8、M10 修訂決定 2 時點；原 M2 併入 M1）。最重要的是 M1：Neal 同日決定不相容的來源**一律不可拒絕**，所以 v1→v2 改成先擴充（Hosted 暫時同時接受 v1 與 v2，放寬 Neal 決定 6，已核准）、背景以目的端短切換逐一搬移、確認沒有舊 image 後才收斂；這讓 phase 2 依賴 phase 3 與 phase 4 的一部分。
+- 審查第 1 輪（同日）修正：已接單回條開始執行的四條路原本不經 `agent` 紀錄柵欄，改成都要 CAS 並遵守切換用法的 `pending`；孤兒規則收窄；開放 RID 集合改為開旗標前必要；請求內等候改由 Hosted 回應推動、`cut_deadline` 短於等候、API 主動撤回為必要；對話 profile 比對改比通道；新增 M9（新 SID 接手從沒開始的回條）與 M10（快照時點）。
+- 審查第 2 輪（同日）修正：帶 digest 的存檔項目照送出時的 profile 寫、只有 `_Meta` 改標（否則已存回條解不開）；phase 2 命名對齊 #824（2a～2c 是 v1 時代的一般部署），M1 的 A 改成 2d-i 擴充／2d-ii 收斂、從 2d-i 前一版起凍結 v1 wire；停用 follow 後的退路（遺留 `pending` 由背景收拾、404 來源請求內切換）與閘門清單；M1 子選項改成不設期限（每個 Agent 有過一個回合或 session 已被平台刪除才收斂），工作檔不再因等不及而丟。
+- 審查第 3 輪（同日，配合 #825）：2d-i 之前的所有版本相關拒絕改成只觀察與記 log（零呼叫強制與請求內切換一起在 2d-i 開；§8「不相容」「舊環境仍在運作」兩句不再顯示）；第 7a 點補 (r)（沒有已完成回合的對話在新 session 不帶 checkpoint 開始，CTX-03 只在應有 checkpoint 時拒絕）與 (s)（被之前 SID 占住的 Responses slot 由新 session 釋放），(g) 的決定改存綁定列；M1 加唯讀 `get_session` 巡查、卡住的共用 store 有界等待後走棄用路徑、閘門補 2a～2c 已部署、(r)(s) 已實作與全掃描門檻。紀錄改成「設計定稿（Neal 要求）；M 項已核准」，機制細節沒有逐項另經 Neal 核准，phase 4～6 實作 PR 照常審查。
+- 只改文件；未跑程式測試，沒有雲端呼叫。
+
 <a id="adr0009-phase0-merged-1013"></a>
 ## 2026-10-12～13：G phase 0 合併、dev 部署批准（已合併；dev 部署測試中）
 
@@ -107,7 +117,7 @@
   | 14:09～14:10 | 8415：不帶格式提示送出（#774；同一工作階段代 Neal 執行；Neal 在對話中同意只發這一則，「允許這次」由該工作階段代按） | PASS。批准卡顯示目標路徑與完整 jsonBody（`body` 只有 `content`＋`contentType: text`，沒有 `@odata.type`）；只呼叫一次 `create_entity`，第一次就用對格式、沒有重試；頻道讀回 06:10:43Z 恰好 1 則，寄件人 Microsoft Administrator |
   - 觀察（未查）：按允許後內建瀏覽器多開一個 Teams 登入分頁，推論是對話裡的頻道連結被開啟；沒有登入、已關閉。
   - Work IQ 租戶寫入政策 10-10 晚開啟；10-11 11:07 那次允許送出成功，據此推論當時已生效。
-- **在 Teams 用按鈕批准（A 方案）被平台擋下**：只宣告 `activity` 協定的 hosted agent（`teams-card-echo`，image `sha256:6f76172f…`，`azure-ai-agentserver-activity==1.0.0b3`）一鍵發布成功、bot Teams 頻道 Healthy，但 Foundry 對直接呼叫回「Agent teams-card-echo with version 1 is not in Running state yet」，一小時後仍是，session 0、App Insights 0 筆；同一 image 在本機 Docker 啟動正常、`/readiness` 200。CLI 的 `agent start/status/logs` 對新 agent 模型都回 404。結論：dev 目前無法用 activity-only agent 收 Teams 訊息（推論為平台限制）。Neal 同意改走 B 方案（文字指令批准）。探針資源（`teams-card-echo`、bot `teams-card-echo82746`、Teams app）保留待 Neal 決定。
+- **在 Teams 用按鈕批准（A 方案）被平台擋下**：只宣告 `activity` 協定的 hosted agent（`teams-card-echo`，image `sha256:6f76172f…`，`azure-ai-agentserver-activity==1.0.0b3`）一鍵發布成功、bot Teams 頻道 Healthy，但 Foundry 對直接呼叫回「Agent teams-card-echo with version 1 is not in Running state yet」，一小時後仍是，session 0、App Insights 0 筆；同一 image 在本機 Docker 啟動正常、`/readiness` 200。CLI 的 `agent start/status/logs` 對新 agent 模型都回 404。結論：dev 目前無法用 activity-only agent 收 Teams 訊息（推論為平台限制）。Neal 同意改走 B 方案（文字指令批准）。探針資源（`teams-card-echo`、bot `teams-card-echo-example`、Teams app）保留待 Neal 決定。
 - **連線卡修正**：#778 已合併、尚未部署：Agent 間、排程、Teams relay（含其自動接續）回合不再開 Connect 卡、不等待；同一對話按過「先不用」後不再開卡。
 
 <a id="dev-test-8415-1011"></a>
@@ -163,7 +173,7 @@
 - **雲端寫入（dev）**：
   - relay image `fa-teams-relay@sha256:44e81aae…`（ACR run `dsbw`，來源 `9e6b967e`；之後到 `4bb59ac4` relay 程式沒變）。
   - relay agent `fa-teams-relay-a` v1（不叫模型，閒置 300 秒），env 只有 `BEHAVIOR_API_URL`、`BEHAVIOR_API_AUDIENCE`。
-  - 入口網站一鍵發布「只有你」：Foundry 自建 bot `fa-teams-relay-a11081`，relay endpoint 加上 `activity` 與 `BotServiceRbac`。
+  - 入口網站一鍵發布「只有你」：Foundry 自建 bot `fa-teams-relay-example`，relay endpoint 加上 `activity` 與 `BotServiceRbac`。
   - API `ca-fa-behavior-poc--4bb5-v135-1010`（main `4bb59ac4`，image `sha256:60634467…`，core `bec28c8d`），100%、Healthy。ENV 29→31：`FA_TEAMS_RELAY_ENABLED=1`、`FA_TEAMS_RELAY_AGENTS`（relay 身分只對 A）。PATCH 回應為空，依規則先讀回，沒有重送。
   - Hosted：Hosted image `sha256:43b228ee…`；sync＋follow 後 A v140、B v96 與另外 4 個 ready，C／D skipped。
   - relay 身分不需要 FA API 的 app role：`verified_claims` 只驗簽章、tenant、audience、oid（`auth.py`）。
@@ -5435,7 +5445,7 @@ Teams 簽章公鑰文件大小修正已在真 Azure image 讀取771,860 bytes／
 
 **後續更新：已獲批准並完成組織發布與個人安裝。** 使用者於09:36批准指定 admin 個人安裝、完成登入後，因個人上傳選項未出現，另明確批准「可以發佈到組織」。已核對登入 UPN，將同一個已核對 package 上傳一次至 Contoso 組織目錄；Teams 顯示 `成功新增!`，並開啟 admin 的 `FA Personal POC` 個人 Bot App。沒有更改租戶政策或新增 Graph／Entra 權限，也沒有傳訊。一次 `FA Teams route enrollment` 設定握手另行詢問批准，尚未取得；signed Connector route 與 provider receipt 仍為 `NOT_RUN`。原件：`.azure\teams-personal-0917\personal-installation-receipt.json`、`installed-personal-ui.yml`。
 
-已建立 F0 `fa-teams-personal-poc` BotService 與 `MsTeamsChannel`，讀回 UAMI、tenant、endpoint、channel 與 host attachment 符合原設定；沒有新增 identity、secret 或 role。原始核對檔為 `.azure\teams-personal-0917\capture-native-prerequisite.json` 與 `bot-metadata-receipt.json`。早前使用者不在時沒有代為批准安裝；之後依上段的明確授權才執行。**目前仍未傳訊，也尚無真 signed Connector route／delivery receipt**。callback 為 minReplicas=0、maxReplicas=1；先前遷移／Recovery revisions 維持停用。
+已建立 F0 `fa-teams-personal-example` BotService 與 `MsTeamsChannel`，讀回 UAMI、tenant、endpoint、channel 與 host attachment 符合原設定；沒有新增 identity、secret 或 role。原始核對檔為 `.azure\teams-personal-0917\capture-native-prerequisite.json` 與 `bot-metadata-receipt.json`。早前使用者不在時沒有代為批准安裝；之後依上段的明確授權才執行。**目前仍未傳訊，也尚無真 signed Connector route／delivery receipt**。callback 為 minReplicas=0、maxReplicas=1；先前遷移／Recovery revisions 維持停用。
 
 以下為當日較早的修正紀錄：
 

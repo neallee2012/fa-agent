@@ -74,15 +74,16 @@ def git(src: Path, *args: str, stdin: bytes | None = None) -> bytes:
                           input=stdin, env=GIT_ENV).stdout
 
 
-def head_files(src: Path) -> dict[str, tuple[str, bytes]]:
-    """{path: (mode, bytes)} for every blob tracked at HEAD and not excluded."""
+def head_files(src: Path, rev: str = "HEAD", exclude: bool = True) -> dict[str, tuple[str, bytes]]:
+    """{path: (mode, bytes)} for every blob tracked at `rev` (HEAD by default) and, unless exclude is False,
+    not excluded. Bytes come from the object store, so core.autocrlf and eol attributes never apply."""
     entries = []
-    for entry in git(src, "ls-tree", "-r", "-z", "--full-tree", "HEAD").decode("utf-8").split("\0"):
+    for entry in git(src, "ls-tree", "-r", "-z", "--full-tree", rev).decode("utf-8").split("\0"):
         if not entry:
             continue
         meta, rel = entry.split("\t", 1)
         mode, kind, sha = meta.split()
-        if kind == "blob" and not is_excluded(rel):
+        if kind == "blob" and not (exclude and is_excluded(rel)):
             entries.append((rel, mode, sha))
     shas = sorted({sha for _, _, sha in entries})
     blobs: dict[str, bytes] = {}
@@ -174,28 +175,36 @@ class Scrubber:
         return text
 
 
+def render(src: Path, mapping: dict, plain: bool, rev: str = "HEAD"
+           ) -> tuple[dict[str, tuple[str, bytes]], Scrubber, list[str]]:
+    """({path: (mode, exported bytes)}, scrubber, binary paths) for the files tracked at `rev`, in memory.
+    export() writes exactly this; fingerprint.py hashes it."""
+    scrubber = Scrubber(mapping)
+    files, binaries = {}, []
+    for rel, (mode, data) in head_files(src, rev).items():
+        text = decode_text(data)
+        if text is None:
+            binaries.append(rel)
+        elif not plain:
+            new = scrubber.scrub(text, rel)
+            if new != text:
+                data = new.encode("utf-8")
+        files[rel] = (mode, data)
+    return files, scrubber, binaries
+
+
 def export(src: Path, out: Path, mapping: dict, plain: bool) -> Scrubber:
     if out.exists() and any(out.iterdir()):
         raise SystemExit(f"--out must be a new or empty directory: {out}")
     out.mkdir(parents=True, exist_ok=True)
-    scrubber = Scrubber(mapping)
-    binaries, text_count = [], 0
-    for rel, (mode, data) in head_files(src).items():
+    files, scrubber, binaries = render(src, mapping, plain)
+    for rel, (mode, data) in files.items():
         dest = out / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        text = decode_text(data)
-        if text is None:
-            binaries.append(rel)
-        else:
-            text_count += 1
-            if not plain:
-                new = scrubber.scrub(text, rel)
-                if new != text:
-                    data = new.encode("utf-8")
         dest.write_bytes(data)
         if mode == "100755":
             dest.chmod(0o755)
-    print(f"{'plain' if plain else 'scrub'}: {text_count} text files, {len(binaries)} binary (copied unchanged)")
+    print(f"{'plain' if plain else 'scrub'}: {len(files) - len(binaries)} text files, {len(binaries)} binary (copied unchanged)")
     if not plain:
         print(f"changed files: {len(scrubber.file_counts)}")
         print("replacements by category:", json.dumps(dict(sorted(scrubber.cat_counts.items()))))

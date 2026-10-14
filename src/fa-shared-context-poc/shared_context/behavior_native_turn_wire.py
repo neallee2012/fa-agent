@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, Field, TypeAdapter, field_validator, model_validator
@@ -45,6 +46,19 @@ AUTOMATIC_ENVIRONMENT_POLICY = "fa-environment-system-policy-20261004"
 
 # The Teams relay's request ids start with this (native_teams_relay): a human turn nobody can press a card in.
 RELAY_PREFIX = "tr-"
+# Hosted ENV (deployment overlay, behavior_agent_versions._ENVIRONMENT_FLAGS). The API reads the same key off the
+# selected Hosted definition, so the workbench offers a switch only where the Hosted session accepts one.
+MODEL_SWITCH_ENV = "FA_NATIVE_MODEL_SWITCH"
+
+
+def native_model_switch_enabled(environ=None):
+    """``FA_NATIVE_MODEL_SWITCH=1`` (default off): a conversation may take another model after completed turns.
+
+    The turn then restores the published checkpoint cold with the new model (README#native-model-switch)."""
+    value = (os.environ if environ is None else environ).get(MODEL_SWITCH_ENV)
+    if value not in (None, "0", "1"):
+        raise Problem(503, "NATIVE_PROFILE_UNSUPPORTED", "FA_NATIVE_MODEL_SWITCH must be 0 or 1")
+    return value == "1"
 
 
 def automatic_omission_id(agent_id, source_sid, target_sid, target_version):
@@ -67,7 +81,7 @@ NATIVE_TURN_ERRORS = SKILL_DRAFT_ERRORS | IMAGE_DELIVERY_ERRORS | USER_IMAGE_ERR
     "NATIVE_TURNS_DISABLED", "NATIVE_ROUTINES_DISABLED", "NATIVE_REQUEST_INVALID", "NATIVE_REQUEST_TOO_LARGE",
     "NATIVE_STATE_STORE_MISSING", "NATIVE_STATE_STORE_TTL", "NATIVE_STATE_STORE_UNKNOWN",
     "NATIVE_STATE_SCOPE", "NATIVE_STATE_INVALID", "NATIVE_RID_MISSING",
-    "NATIVE_RID_CONFLICT", "NATIVE_CONVERSATION_MISSING", "NATIVE_CAPTURE_CHANGED",
+    "NATIVE_RID_CONFLICT", "NATIVE_CONVERSATION_MISSING", "NATIVE_CAPTURE_CHANGED", "NATIVE_MODEL_CONTEXT_EXCEEDED",
     "NATIVE_RESULT_MISSING", "NATIVE_RESULT_INCOMPLETE", "NATIVE_RESULT_TOO_LARGE",
     "NATIVE_DELIVERY_CONFLICT", "NATIVE_TURN_UNKNOWN", "NATIVE_TURN_NOT_STARTED", "NATIVE_TURN_CANCELLED",
     "NATIVE_MODEL_REFUSED",
@@ -795,6 +809,14 @@ NativeRequest = Annotated[
 NATIVE_REQUEST = TypeAdapter(NativeRequest)
 
 
+class NativeEnvironmentNotice(WireModel):
+    """ADR-0009 §8 "平台把助理的執行環境換成了另一個版本（vX→vY）": the platform ran the Agent's same session on
+    another version than it was created on. API-only: Hosted never writes it."""
+    kind: Literal["platform_version_changed"] = "platform_version_changed"
+    from_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")]
+    to_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")]
+
+
 class NativeReceipt(WireModel):
     state_profile: NativeStateProfile = NATIVE_STATE_PROFILE
     agent_id: Identifier
@@ -822,6 +844,8 @@ class NativeReceipt(WireModel):
     assembly: NativeAssembly | None = Field(default=None, exclude_if=lambda value: value is None)
     continuation: NativeContinuation | None = Field(default=None, exclude_if=lambda value: value is None)
     continuation_available: bool = Field(default=False, exclude_if=lambda value: not value)
+    # API only (ADR-0009 §4 end): an owner response carries the Agent's pending drift notice; absent otherwise.
+    environment_notice: NativeEnvironmentNotice | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @property
     def human_origin(self) -> bool:

@@ -73,7 +73,7 @@ class PersonalTeamsConfig(_Model):
     uami_client_id: Guid
     uami_principal_id: Guid
     host_resource_id: Literal[HOST_RESOURCE_ID] = HOST_RESOURCE_ID
-    bot_name: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{1,63}$")] = "fa-teams-personal-poc"
+    bot_name: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{1,63}$")] = "fa-teams-personal-example"
     teams_app_id: Guid = APP_ID
     app_version: Annotated[str, Field(pattern=r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$", max_length=32)] = "1.0.0"
     callback_origin: Annotated[str, Field(min_length=1, max_length=512)]

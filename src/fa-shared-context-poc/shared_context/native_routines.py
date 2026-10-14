@@ -562,8 +562,11 @@ class NativeRoutineService:
             scheduled = _occurrence(definition.schedule, command.scheduled_for, control.runtime._now())
             if scheduled < definition.approved_at:
                 raise Problem(409, "ROUTINE_OCCURRENCE_STALE", "an unregistered occurrence predating approval cannot be backfilled")
+            # The conversation's current model, not the project default: a default that differs from a conversation
+            # with completed turns is a changed capture (NATIVE_CAPTURE_CHANGED) when model switching is off.
             submitted = NativeAgentCommand(
-                request_id=rid, conversation_id=definition.conversation_id, content=definition.content)
+                request_id=rid, conversation_id=definition.conversation_id, content=definition.content,
+                model=conversation.capture.model.id)
             capture = resolve_routine_capture(
                 control, composition.assistant.authority, submitted, conversation=conversation, authorize=current)
             source = routine_origin_for(definition, scheduled)

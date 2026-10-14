@@ -73,6 +73,8 @@ def test_confirmed_pre_admission_refusal_is_not_stored_as_a_transport_unknown(na
     assert task["submission"]["state"] == "REFUSED"
     assert task["submission"]["not_dispatched"] is True
     assert task["not_accepted"] is True
+    # A refusal with no receipt still names the model that message asked for (the workbench's refusal sentence).
+    assert task["requested_model"] == "gpt-4.1-mini"
     assert state["composer"]["follow_up_blocker"] == "NATIVE_SESSION_CHANGED"
     assert not case.api.remote.records and not case.api.remote.calls
 

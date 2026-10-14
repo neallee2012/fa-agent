@@ -7,7 +7,7 @@
   "uami_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000012/resourceGroups/rg-faexample/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-facontext-api",
   "uami_client_id": null,
   "uami_principal_id": null,
-  "bot_name": "fa-teams-personal-poc",
+  "bot_name": "fa-teams-personal-example",
   "callback_origin": null,
   "website_url": null,
   "privacy_url": null,

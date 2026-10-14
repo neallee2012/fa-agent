@@ -520,8 +520,10 @@ class ResidentSdk:
     ask_user and model handlers and unbinds them at idle, so a released SDK can reach no turn's authority.
     """
 
-    def __init__(self, digest, sdk_session_id, files):
+    def __init__(self, digest, sdk_session_id, files, model=None):
         self.digest, self.sdk_session_id, self.files = digest, sdk_session_id, files
+        # The deployment this SDK session was created or resumed with; a kept SDK never changes it.
+        self.model = model
         self.client = self.session = self.process = None
         self.turn = None
         self.span_file = None
@@ -1356,7 +1358,7 @@ async def run_copilot(
             stale, resident.live, from_live_files = resident.live, None, True
             # Its own task: a cancelled turn never leaves the old CLI process running.
             await asyncio.shield(asyncio.ensure_future(stale.stop()))
-        live = resident.live if resident.live is not None else ResidentSdk(digest, sdk_session_id, session_files)
+        live = resident.live if resident.live is not None else ResidentSdk(digest, sdk_session_id, session_files, model)
         live.released_sha256 = live._released_files = None
     sdk_invoke = invoke if live is None else live.invoke
     sdk_permission = permission if live is None else live.permission
