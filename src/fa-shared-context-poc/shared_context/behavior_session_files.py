@@ -36,8 +36,11 @@ class SessionFiles:
         self.client = client
 
     @contextmanager
-    def _project(self):
+    def _project(self, sid):
+        """Every Session Files call names its SID here, so the ADR-0009 §7a zero-call check runs before it."""
         from azure.ai.projects import AIProjectClient
+        from .native_binding import check_session
+        check_session(self.client, sid, operation="session_files")
         try:
             with AIProjectClient(
                     endpoint=self.client.target.project_endpoint, credential=self.client.credential,
@@ -50,7 +53,7 @@ class SessionFiles:
     def download(self, sid, path, entry):
         raw = bytearray()
         deadline = monotonic() + FILE_STEP_SECONDS
-        with self._project() as agents:
+        with self._project(sid) as agents:
             stream = agents.download_session_file(self.client.target.agent_name, sid, path=path)
             for chunk in stream:
                 if (not isinstance(chunk, bytes) or monotonic() > deadline
@@ -63,7 +66,7 @@ class SessionFiles:
 
     def upload(self, sid, path, data):
         # The fixed 2.3.0 synchronous API takes bytes; a missing ACK never authorizes another PUT.
-        with self._project() as agents:
+        with self._project(sid) as agents:
             agents.upload_session_file(self.client.target.agent_name, sid, data, path=path)
 
     def list_page(self, manifest, listing):
@@ -71,7 +74,7 @@ class SessionFiles:
         parent = listing_directories(manifest)[listing.directory]
         path = WORKSPACE_ROOT + ("/" + parent if parent else "")
         paths = []
-        with self._project() as agents:
+        with self._project(manifest.source_session_id) as agents:
             pages = agents.list_session_files(
                 self.client.target.agent_name, manifest.source_session_id, path=path, limit=100
             ).by_page(continuation_token=listing.after)

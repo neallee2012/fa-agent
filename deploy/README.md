@@ -220,6 +220,7 @@ The input also carries three options learned from the 2026-10-07 deployment:
 | D3 | Hosted 仍呼叫舊 API URL／舊 audience | Hosted definition 帶這兩個值，換 API 或 audience 後舊版本不會變 | 流程 10：發布新版本（本次 v2 改 URL、v3 改 audience），route 100%，v1／v2 保留 |
 | D4 | API `CrashLoopBackOff`、`/healthz` timeout，factory 回 `BEHAVIOR_NOT_INITIALIZED`（早期 v18 是 `BEHAVIOR_READ_FAILED`） | Table 從未首次安裝；本機有 runtime 配置不等於已安裝 | 流程 9：`plan` 核全表為空，主人批准精確 plan 後 `apply` 一次 |
 | D5 | `ci_deploy.py guard` 無法用在首次部署 | 它要從既有 ready revision 推導 serving commit | 首次部署走 operator 路徑；有 ready revision 後才用 CI 升級流程 |
+| D5a | `guard` 說 serving commit 不在這個 checkout 的歷史裡 | 正在服務的 revision 來自後來被 rebase 或丟掉的分支 | `azd deploy` 可在那一次加 `FA_ALLOW_ROLLBACK=true`（[azd README](azd/README.md#之後更新)）。**stage CI 不認這個開關**，維持嚴格停止，由 Neal 決定 |
 
 **E. Portal 與首次使用**
 
@@ -779,6 +780,8 @@ Public IP／NAT modules 並把 subnet 設 `defaultOutboundAccess=false`；
 `--core` identifies the installed Python code: use the **lowercase 64-hex**
 value returned by `shared_context.behavior_code_identity.code_sha256()` in the
 matching API/Hosted images, also printed as `FA_DEPLOYED_CORE` by the API build.
+`ci_deploy.py build api` reads it from the built image (`docker run --entrypoint python`),
+not from the build log: a Docker layer reused from the cache prints no such line.
 Do not strip `@sha256:` from an image reference and pass that digest as core.
 The two values have the same shape but different meanings; `fa_build` must be
 the code identity for `HostedVersions.current` to accept the served version.
@@ -859,6 +862,88 @@ the API template keeps `minReplicas=1` in generated profiles.
 The staging GitHub workflow does not change its behavior; it uses the default
 stage profile. A different workflow or operator run can pass `--config` to
 the same commands without copying or editing Python scripts.
+
+<a id="compat-gate"></a>
+## 部署前相容閘門（ADR-0009 phase 3b）
+
+依 [ADR-0009](../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md) 第 7 點與 M1（先擴充、再收斂）：
+API 只有在**沒有任何綁定列還記著舊 profile、也沒有 session 還跑舊 image** 時，才可以不再說舊 wire。閘門就是這個收斂的檢查。
+
+- **在哪裡跑：** `ci_deploy.py gate <api-ref>`。stage workflow 排在「Build and push API image」之後、其他 image build
+  與 sync／API 更新／console／follow 之前（在它之前只有 ACR push，不寫環境）；azd 的 `upgrade()` 排在 `check` 之後、WebIQ／Memory
+  Store／sync 之前。它以**新的 API image** 啟動一次 sync job（API identity；GitHub 部署身份沒有 Table 與 Foundry
+  資料面權限），所以「新 API 的支援集合」就是那個 image 裡的 `native_binding.SUPPORTED_STATE_PROFILES`，沒有第二份。
+  第一次安裝（azd 首次 `deploy`）還沒有綁定列，不跑。
+- **讀什麼：** 只讀這個 Team 的全部綁定列（`NativeBindingStore.rows()`，分頁讀到底）和這些列引用的版本 definition
+  （`get_version`）。**零 session 呼叫**：不 list／get／invoke／stop session、不讀 Session Files、不寫任何東西
+  （`shared_context/native_deploy_gate.py`；測試以只答 `get_version` 的替身確認）。
+- **什麼算不相容：** 每個服務中的 Agent，(a) 綁定列的 `state_profile` 不在新 API 的支援集合；或 (b) 紀錄的實際版本
+  （`observed.agent_version`）的 definition 宣告的 `FA_NATIVE_TURNS` 不在支援集合；或 (c) 讀不到 definition、
+  讀不到綁定列。(c) 證明不了收斂條件，所以閘門打開時一律算拒絕（fail closed）。已不在服務清單的 Agent 留下的列只檢查 (a)。
+  退回較舊的 API image 也算：例如 phase 2c 之前的 image 讀不了還帶著未送出 `switch_notice` 的列，打開時就以 `rows_unread`
+  拒絕（[共用 README](../src/fa-shared-context-poc/README.md#g-phase2c-clear)）。
+- **還沒有綁定列的 Agent（`unclaimed`）只報告、不拒絕：** ADR 第 7 點檢查的是綁定列**紀錄的** profile，沒有列就沒有
+  紀錄可查（剛 onboarding 的 Agent、stage C／D 這類還沒被 API 觀察過的 Agent）；否則每次打開後的部署都會被它們擋住。
+  它們第一次被觀察時才認領綁定列（`NativeBindingStore.claim`）。閘門不能判斷它的 session 是不是所選版本推導出的
+  第 0 代 SID（`behavior_native_sessions.native_session_id` 也推導不帶版本的 SID，要分辨得讀 `get_session`，閘門不呼叫
+  session），所以 2d-ii 打開前，[ADR-0009 M1 閘門清單](../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md)
+  要先把報告的 `unclaimed` 認領或退役。
+- **報告：** job log 一行 `DEPLOY_COMPAT_GATE {...}`（Log Analytics），含每個 Agent 的判定、`decision`
+  （`pass`／`observe`／`refuse`／`override`）與保護清單（見下節）。CI 只看得到 job 成功或失敗（ARM 的 execution 沒有 exit code 或輸出），
+  step summary 只寫狀態能證明的判定與這一行的位置；拒絕筆數與詳細原因讀這一行。
+- **時間：** 閘門有自己的等待上限 `GATE_POLL_ATTEMPTS`（18 次 × 10 秒＝**3 分鐘**），不沿用 sync 的 30 分鐘（sync job
+  的 `replicaTimeout` 最長可到 3600 秒）。超過就對該 execution 送 Jobs - Stop Execution
+  （`POST .../jobs/{job}/executions/{name}/stop`），不打開時只留 `::warning::`、部署照常；打開時算拒絕。ARM 回應是空的或
+  格式不對（`None`、缺欄位、不是 JSON）同樣處理：不打開時是 warning，打開時是拒絕。
+- **每次部署多花的時間（估計，未量測）：** 離線量不到，以下是依 job 規格推估：Consumption、0.25 vCPU／0.5 GiB 的 sync job
+  冷啟動並**拉一次新的 API image**（python 3.11 slim＋behavior 相依套件，約數百 MB；sync 之後仍可能在別的節點再拉一次，
+  不保證有快取）約 30～90 秒，Python 匯入與 `build_server` 約 10～30 秒，讀綁定列與每個 Agent 數次 `get_version` 幾秒，
+  加上 10 秒輪詢的粒度。一般約 **1～2 分鐘**，最多約 3 分鐘再加一次 stop 請求。第一次 dev 部署後以 job execution 的
+  開始／結束時間核對，再改成量測值。
+
+**預設不打開（unarmed）：** ADR 第 7 點要求閘門在 v1→v2 遷移完成後才接上，否則第一次 v2 部署一定被擋。所以閘門
+每次都會跑、報告「如果打開會拒絕什麼」（`decision=observe`），但 job 結果不影響部署（失敗只留 `::warning::`）。
+2d-i 本身也不受影響（2d-i 的 API 仍支援 v1）。
+
+**打開（arming）：** 部署 profile 加 `"compatibility_gate_armed": true`（stage 是 `deploy/stage/stage.json`；azd 環境
+`azd env set FA_COMPAT_GATE_ARMED true`）。時點是觀察報告已經沒有 v1 的列之後、2d-ii 之前，由 2d-ii 的 release PR
+（或它之前的 PR）一併改，經 PR 審查留紀錄。打開之後，拒絕或讀不到都讓部署在任何環境寫入之前停下。
+
+**一次性例外（override）：** 打開後真的必須先部署（例如要退役的 Agent 還綁在舊版本），在該環境的 release 檔
+（stage 是 `deploy/stage/release.json`）加：
+
+```json
+"compatibility_gate_override": {"release": "<這次的 version>", "approved_by": "Neal", "approved_at": "<時間>", "reason": "<原因>"}
+```
+
+- 只對 `release` 等於這次 `version` 的那一個 release 有效；下一個 release 還留著就在 `meta`（任何 build 之前）停下，
+  要求拿掉，所以不會悄悄延續。沒有 release 檔的環境（`release()` 是 `none`）不能用 override，只能改回不打開。
+- 批准：stage 的 release PR 由 Neal 決定合併，override 隨它一起經批准；其他環境照該環境的批准規則。
+- 紀錄：git 歷史、run 的 `::warning::` 與 step summary（`compatibility gate: OVERRIDE (...)`）、job log 的
+  `decision=override` 與 override 內容。閘門仍照常讀一次，把被放行的 Agent 寫進報告。
+
+**給 2d-i 的交接：** 綁定列的 `state_profile` 目前一律寫 API 自己的常數（v1）：建立 `NativeBindingRow` 時都沒有給
+`state_profile`，用的是欄位預設值。2d-ii 的 API 只支援 v2，所以 2d-i 起下面每個寫入點都要寫該 session 版本實際宣告的
+profile，否則已搬到 H2d 的 Agent 也會被 (a) 擋下：
+
+- `NativeBindingStore.claim()`（`shared_context/native_binding.py` 約 246 行）：第一次認領列（寫被認領 SID 的版本宣告的 profile）。
+- 換環境的 commit `NativeBindingStore.record_switch()`（約 318 行）：寫目的 session 版本宣告的 profile。
+- 另有第三處：`NativeBindingStore.decide_abandon()`（約 360 行）在沒有列時連同棄用決定一起認領，同樣用預設值。
+
+<a id="version-retention"></a>
+## 綁定列引用的版本與 image 不刪（ADR-0009 phase 3b）
+
+- **規則：** 每個綁定列的目前 SID 建立時的版本、紀錄的實際版本，以及之前 SID 清單最後一個（前一個 SID）的版本，
+  連同這些版本 definition 裡的 ACR image（以 digest 比對），不刪、不讓保留政策清掉。刪除任何版本、image 或 session
+  仍需另外批准。
+- **保護清單：** 閘門報告的 `protected`（`versions`、`images`）每次部署都會算一次。任何清除清單都要先經
+  `native_deploy_gate.retention_candidates(candidates, protected)`，被引用的一律留在 `kept`。
+- **現況（2026-10-14 核對）：** repo 沒有任何刪除 Agent 版本或 ACR image 的腳本（測試掃描 `deploy`、`scripts`、
+  `infra`、`.github` 與 `src/fa-shared-context-poc` 確認），所以目前沒有要加守門的清除腳本；之後新增的要走上面的函式。
+  `infra/shared-context/foundation.bicep` 的 registry 是 `retentionPolicyStatus: 'disabled'`（測試鎖住）。唯讀
+  `az acr` 讀回：dev `crfacontextpocdemo`、stage `crfacontextstagedemo` 都是 Basic、retention `disabled`、沒有
+  ACR task（也就沒有排程的 `acr purge`）。不需要改 infra。
+- `azd down` 刪的是整個環境（含 Table 裡的綁定列本身），不在這條規則內；它另有確認步驟與批准。
 
 ## AVM and local infrastructure checks
 

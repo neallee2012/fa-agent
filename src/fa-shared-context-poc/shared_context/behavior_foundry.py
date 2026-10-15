@@ -171,6 +171,9 @@ class FoundryHttpClient:
             raise Problem(422, "FOUNDRY_TIMEOUT_INVALID", "native timeout must be finite and at most 120 seconds")
         self.credential = credential
         self._session_requests = {}
+        # ADR-0009 §7a zero-call guard, installed by the composition's native sessions and shared with every client
+        # derived through ``for_target`` (see ``native_binding.check_session``).
+        self._session_guard = [None]
         self.http = httpx.Client(
             transport=transport or httpx.HTTPTransport(retries=0, verify=ssl.create_default_context()),
             timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 10)),
@@ -187,6 +190,7 @@ class FoundryHttpClient:
         selected.credential=self.credential
         selected.http=self.http
         selected._session_requests=self._session_requests
+        selected._session_guard=getattr(self,"_session_guard",[None])
         return selected
 
     def last_session_request(self):
@@ -243,6 +247,8 @@ class FoundryHttpClient:
         """True when this stop was accepted; False when the platform says the session was already stopped."""
         from azure.ai.projects import AIProjectClient
         from azure.core.exceptions import AzureError
+        from .native_binding import check_session
+        check_session(self,operation="stop_session")
         phase="client_init"
         try:
             with AIProjectClient(endpoint=self.target.project_endpoint,credential=self.credential,
@@ -362,6 +368,10 @@ class FoundryHttpClient:
             from .behavior_native_turn_wire import NATIVE_EXPECTED_VERSION_HEADER, NATIVE_STATE_PROFILE, NATIVE_TURN_HEADER
             headers[NATIVE_TURN_HEADER] = NATIVE_STATE_PROFILE
             headers[NATIVE_EXPECTED_VERSION_HEADER] = target.agent_version
+            if getattr(self, "_binding_row", None) is not None:
+                # ADR-0009 §2 phase 3: only a row-located call asks Hosted for the stricter ``replaced()``.
+                from .behavior_native_turn_wire import NATIVE_LOCATOR_BINDING_ROW, NATIVE_LOCATOR_HEADER
+                headers[NATIVE_LOCATOR_HEADER] = NATIVE_LOCATOR_BINDING_ROW
         else:
             headers[INVOCATION_ID_HEADER] = invocation_id
         if probe_id is not None:
@@ -401,7 +411,7 @@ class FoundryHttpClient:
                     if response.status_code not in (200, 202):
                         phase = "response_status"
                         from .behavior_api import _nonfinite, _unique
-                        from .behavior_native_turn_wire import NATIVE_TURN_ERRORS
+                        from .behavior_native_turn_wire import NATIVE_TURN_ERRORS, PRE_DISPATCH_REASONS
                         try:
                             error = json.loads(raw, object_pairs_hook=_unique, parse_constant=_nonfinite)["error"]
                             code = error["code"]
@@ -418,17 +428,22 @@ class FoundryHttpClient:
                                     files_check = NativeFilesCheckDetail.model_validate(error["files_check"]).model_dump(exclude_none=True)
                                 except ValueError:
                                     raise Problem(502, "NATIVE_STATE_INVALID", "the original file check detail is invalid") from None
-                            # Only Hosted's submit marks a definite refusal before ``rid:<RID>`` exists.
+                            # Only Hosted's submit marks a definite refusal before ``rid:<RID>`` exists; a refusal
+                            # before dispatch (ADR-0009 §4) also names why (``reason``), which the phase 3 send flow
+                            # uses to tell a same-SID version drift from a moved Agent record.
                             not_dispatched = (native_operation == "submit" and error.get("not_dispatched") is True
                                               and (400 <= response.status_code < 500 or code == "AGENT_VERSION_FOLLOWING"))
+                            reason = error.get("reason") if error.get("reason") in PRE_DISPATCH_REASONS else None
                             # ADR-0009 §4 step 6: a newer image names the VM's own version in its version refusal.
                             actual_version = error.get("actual_version")
-                            reported = (code == "NATIVE_SESSION_CHANGED" and isinstance(actual_version, str)
+                            reported = (code in {"NATIVE_SESSION_CHANGED", "NATIVE_TURNS_DISABLED"}
+                                        and isinstance(actual_version, str)
                                         and re.fullmatch(r"[1-9][0-9]{0,15}", actual_version) is not None)
                             raise Problem(response.status_code, code,
                                           "the native agent refused this original command; no automatic retry",
                                           automatic_retry=False, **({} if files_check is None else {"files_check": files_check}),
                                           **({"not_dispatched": True} if not_dispatched else {}),
+                                          **({"reason": reason} if reason is not None else {}),
                                           **({"actual_version": actual_version} if reported else {}))
                         raise Problem(503, "FOUNDRY_INVOCATION_UNKNOWN",
                                       "native invocation outcome is unknown; reconcile the original request",
@@ -483,6 +498,10 @@ class FoundryHttpClient:
     def invoke_native(self, command, *, before_send=None) -> NativeResponse:
         """All N1 reads and writes use the fixed invocation protocol; no launch, claim or invented call ID."""
         from .behavior_native_turn_wire import NATIVE_REQUEST, canonical_bytes
+        from .native_binding import check_session
+        operation = getattr(command, "operation", None)
+        # ADR-0009 §7a zero-call check: before anything about the command is used, so every operation is covered.
+        check_session(self, operation=operation if isinstance(operation, str) else "unknown")
         try:
             checked = NATIVE_REQUEST.validate_json(command.model_dump_json())
         except (AttributeError, ValueError):

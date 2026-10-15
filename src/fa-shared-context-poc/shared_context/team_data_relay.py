@@ -5,6 +5,7 @@ container path or artifact namespace. Records use the existing team-partitioned
 TableRepository (create-only, or replace with the original ETag); objects use the
 existing create-only BlobArtifactStore and its receipts. There is no delete, list
 or published-content write. Existing rows and blobs are not moved or rewritten.
+``turn-complete`` records are readable here but written only in process by the turn receipt API.
 """
 from __future__ import annotations
 
@@ -28,6 +29,9 @@ PREFIX = "/team-data/v1"
 SCHEMA = "fa-team-data-record-v1"
 # kind -> whether an existing record may be replaced with its ETag.
 RECORD_KINDS = {"turn-complete": False, "checkpoint": True, "result": True, "memory": True}
+# turn-complete is written only in process by the turn receipt API (behavior_turn_receipts.complete), which also
+# checks the original starter; an early HTTP write would wedge that turn's create-only record.
+HTTP_WRITABLE_RECORD_KINDS = frozenset({"checkpoint", "result", "memory"})
 OBJECT_KINDS = frozenset({"checkpoint", "result", "memory"})
 MAX_RECORD_BODY_BYTES = MAX_PAYLOAD_BYTES
 _identifier = TypeAdapter(Identifier)
@@ -182,6 +186,8 @@ def install_team_data_routes(app, relay: TeamDataRelay, verifier):
     async def write_record(request: Request, kind: str, key: str,
                            principal: BehaviorPrincipal = Depends(identity)):
         relay.team(principal)
+        if kind in RECORD_KINDS and kind not in HTTP_WRITABLE_RECORD_KINDS:
+            raise Problem(403, "TEAM_DATA_KIND_READ_ONLY", "this record kind is written only by the turn receipt API")
         create, match = _single(request, "if-none-match"), _single(request, "if-match")
         if (create is None) == (match is None) or create not in (None, "*") or match is not None and (
                 not match.strip() or match == "*"):

@@ -31,7 +31,7 @@ Neal於 **2026-10-04 10:22:31（台灣時間）**問：
 
 這是UX／操作政策改變，**不是工作檔延續已完成**。自動不搬檔仍須顯示
 「已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。」
-（工作台已不顯示，見下方測試清單的 P06 註記與 [ADR-0009 §8 待辦](0009-version-model-g-actual-version-idle-upgrade.md#8-使用者看到的通知)。）
+（P06（2026-10-06）起工作台一度不顯示；ADR-0009 phase 2c（#830）起由 API 通知槽送來，工作台在輸入框下方狀態列顯示一次，見 [ADR-0009 §8](0009-version-model-g-actual-version-idle-upgrade.md#8-使用者看到的通知)。）
 正常保檔的候選先搬／selector最後切方案仍分開驗證；t4平台探針降優先，尚未執行。
 新流程實作及離線範圍見[Shared README](../../src/fa-shared-context-poc/README.md#automatic-environment-policy)。
 
@@ -343,7 +343,7 @@ Hosted的`FA_NATIVE_HTTP`已記VM自己的`agent_version`，可與上表對照�
 - 非真人：交辦收件、routine、relay各一案，通知記在收件回合；④在漂移替換後仍回`NATIVE_CONTINUATION_WORKSPACE_REQUIRED`。
 - checkpoint：新session載入最後合法CTX-03 checkpoint；壞checkpoint照原碼拒絕，不以空歷史接續。
 - 工作台：頁尾與狀態顯示Neal原句一次，一般換版仍顯示原句。
-  （已由 P06 取代：`f56020a5`（2026-10-06）起工作台不再顯示此句；API 仍記 `files_migrated=false`／`files_omission_reason`，補回顯示列在 [ADR-0009 §8 待辦](0009-version-model-g-actual-version-idle-upgrade.md#8-使用者看到的通知)。）
+  （P06 `f56020a5`（2026-10-06）拿掉了這個顯示；ADR-0009 phase 2c（#830）補回：換環境 commit 在 API 通知槽記下這句，隨主人的送出回應送到工作台、在輸入框下方狀態列顯示一次（每個 Agent 一次，不是每個對話），見 [ADR-0009 §8](0009-version-model-g-actual-version-idle-upgrade.md#8-使用者看到的通知)。）
 
 ### 10. 平台上仍不知道的事，以及平台改變時FA怎麼保持安全
 

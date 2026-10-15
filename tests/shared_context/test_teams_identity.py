@@ -196,3 +196,52 @@ def test_routes_over_existing_operation_url_limit_are_rejected_not_truncated():
         TeamsSettings(tenant_id=TENANT, bot_app_id=BOT, team_id="team", routes=(large,))
     assert error.value.body["error"]["code"] == "TEAMS_ROUTE_LIMIT"
     assert len(large.conversation_id) == 2100
+
+
+def test_connector_keys_are_cached_and_an_unknown_kid_forces_at_most_one_download_per_window():
+    import uuid
+    keys, fetches, now = {"offline-key": KEY}, [], [NOW]
+
+    def provider(request):
+        fetches.append(str(request.url))
+        published = []
+        for kid, key in keys.items():
+            jwk = jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True)
+            jwk.update(kid=kid, use="sig", alg="RS256", endorsements=["msteams"])
+            published.append(jwk)
+        return httpx.Response(200, json={"keys": published})
+
+    def bearer(key=KEY, kid="offline-key"):
+        claims = jwt.decode(token(exp=int((NOW + timedelta(hours=1)).timestamp())),
+                            options={"verify_signature": False})
+        return "Bearer " + jwt.encode(claims, key, algorithm="RS256", headers={"kid": kid})
+
+    transport = httpx.MockTransport(provider)
+
+    def fresh():
+        # teams_personal builds a new ConnectorIdentity for every request; the cache must outlive it.
+        return ConnectorIdentity(identity().settings, clock=lambda: now[0], jwks_transport=transport)
+
+    for _ in range(25):
+        assert fresh().verify(bearer(), activity()).principal.oid == HUMAN
+    assert len(fetches) == 1, "one download serves every request until the cached set expires"
+    for _ in range(25):
+        with pytest.raises(Problem) as error:
+            fresh().verify(bearer(kid=uuid.uuid4().hex), activity())
+        assert error.value.body["error"]["code"] == "TEAMS_SERVICE_AUTH_DENIED"
+    assert len(fetches) == 2, "one forced refresh per window, however many unknown kids arrive"
+    fresh().verify(bearer(), activity())
+    assert len(fetches) == 2
+
+    rotated = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    keys["rotated-key"] = rotated
+    now[0] += timedelta(seconds=30)
+    with pytest.raises(Problem):
+        fresh().verify(bearer(rotated, "rotated-key"), activity())
+    assert len(fetches) == 2
+    now[0] += timedelta(seconds=31)
+    assert fresh().verify(bearer(rotated, "rotated-key"), activity()).principal.oid == HUMAN
+    assert len(fetches) == 3, "a rotated key is picked up after the window"
+    now[0] += timedelta(seconds=301)
+    fresh().verify(bearer(), activity())
+    assert len(fetches) == 4, "the cached set expires after its TTL"

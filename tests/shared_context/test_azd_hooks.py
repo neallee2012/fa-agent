@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -638,9 +639,9 @@ def test_a_stopped_first_install_resumes_without_creating_again(hooks, tmp_path,
 def test_a_later_deploy_is_the_stage_ci_upgrade(hooks, tmp_path, monkeypatch):
     steps, _ = deploy_case(hooks, tmp_path, monkeypatch, api_exists=True, FA_SESSIONS_PREPARED="true")
     # WebIQ before the API update, so enabling it later never advertises a toolbox that does not exist (F6).
-    # Upgrades never touch the owner's new-conversation selection.
-    assert steps == ["profile", "images", "profile", "ci:check", "webiq", "memory_store", "ci:guard", "ci:sync",
-                     "ci:api", "ci:console", "ci:follow", "summary"]
+    # Upgrades never touch the owner's new-conversation selection. The ADR-0009 phase 3b gate runs before any write.
+    assert steps == ["profile", "images", "profile", "ci:check", "ci:gate", "webiq", "memory_store", "ci:guard",
+                     "ci:sync", "ci:api", "ci:console", "ci:follow", "summary"]
 
 
 def test_default_selection_runs_once_as_the_owner_without_an_initial_template(hooks, tmp_path):
@@ -874,3 +875,106 @@ def test_the_memory_store_is_made_with_the_chosen_chat_model(hooks, tmp_path):
     hooks.memory_store(ctx)
     call = next(call for call in ctx.run.calls if "new_memory_store.py" in " ".join(call))
     assert call[call.index("--chat-model") + 1] == "gpt-5.4-mini"
+
+
+REGISTRY = "crdev.azurecr.io"
+BUILT = {kind: f"{REGISTRY}/fa-{kind}@sha256:{letter * 64}" for kind, letter in (("api", "a"), ("hosted", "b"),
+                                                                                    ("console", "c"))}
+
+
+def image_case(hooks, tmp_path, porcelain, **values):
+    def build(args):
+        kind = args[args.index("build") + 1]
+        return SimpleNamespace(code=0, stdout=f"pushing\n{BUILT[kind]}\n", stderr="")
+    routes = {" status --porcelain ": SimpleNamespace(code=0, stdout=porcelain, stderr=""),
+              "ci_deploy.py": build, "azd env set": ok()}
+    return context(hooks, tmp_path, routes, FA_REGISTRY=REGISTRY, FA_DEPLOY_RUN="1", **values)
+
+
+def builds(ctx):
+    return [call for call in ctx.run.calls if "ci_deploy.py" in " ".join(call)]
+
+
+CACHED = {"FA_IMAGES_CORE": "e" * 64, "FA_IMAGES_COMMIT": "f" * 40,
+          **{f"FA_{kind.upper()}_IMAGE": ref for kind, ref in BUILT.items()}}
+
+
+def test_images_stop_on_uncommitted_build_inputs(hooks, tmp_path):
+    ctx = image_case(hooks, tmp_path, " M src/fa-shared-context-poc/shared_context/api.py\n?? src/fa-shared-context-poc/new.py\n",
+                     **CACHED)
+    with pytest.raises(hooks.Stop, match="2 uncommitted change.*shared_context/api.py.*FA_ALLOW_DIRTY_BUILD"):
+        hooks.images(ctx, "f" * 40, "e" * 64)
+    assert builds(ctx) == []  # neither built nor reused
+    status = next(call for call in ctx.run.calls if "status" in call)
+    assert "--untracked-files=all" in status
+    assert "src/fa-shared-context-poc/shared_context" in status and "src/fa-shared-context-poc/README.md" not in status
+
+
+def test_build_inputs_are_the_dockerfiles_and_what_they_copy(hooks):
+    paths = hooks.build_input_paths()
+    assert {"shared_context", "tool_catalog", "web_test_console", "behavior_server_main.py", "model-catalog.json",
+            "requirements-behavior.txt", "tools/playwright-mcp/package.json", "Dockerfile.web-console"} <= set(paths)
+    assert not {"README.md", "tests", "docs", "feed_mcp", "hosted_main.py"} & set(paths)
+    assert not any(path.startswith(("/", "--")) or path.endswith("/") for path in paths)  # no flags, targets or slashes
+
+
+def test_only_files_an_image_copies_count_as_uncommitted_build_inputs(hooks, tmp_path, monkeypatch):
+    """Real git: a doc-only edit under src/fa-shared-context-poc does not block; a copied file or a new one does."""
+    root = tmp_path / "repo"
+    app = root / "src" / "fa-shared-context-poc"
+    for folder in ("shared_context", "web_test_console", "tool_catalog", "tools/playwright-mcp"):
+        (app / folder).mkdir(parents=True)
+    for name in hooks.IMAGE_DOCKERFILES:
+        (app / name).write_text((hooks.APP / name).read_text(encoding="utf-8"), encoding="utf-8")
+    for path in hooks.build_input_paths():
+        if not (app / path).exists():
+            (app / path).write_text("x", encoding="utf-8")
+    for folder in ("shared_context", "web_test_console", "tool_catalog"):
+        (app / folder / "a.py").write_text("x", encoding="utf-8")
+    (app / "README.md").write_text("doc", encoding="utf-8")
+    identity = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+
+    def repo_git(*args):
+        return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True)
+    repo_git("init", "-q")
+    repo_git(*identity, "add", "-A")
+    repo_git(*identity, "commit", "-q", "-m", "base")
+    monkeypatch.setattr(hooks, "ROOT", root)
+    monkeypatch.setattr(hooks, "APP", app)
+
+    def real_run(args, **kwargs):
+        done = subprocess.run(args, capture_output=True, text=True, check=False)
+        return SimpleNamespace(code=done.returncode, stdout=done.stdout, stderr=done.stderr)
+    ctx = context(hooks, tmp_path, {})
+    ctx.run = real_run
+
+    (app / "README.md").write_text("edited doc", encoding="utf-8")
+    (app / "notes.md").write_text("new untracked doc", encoding="utf-8")
+    assert hooks.build_input_changes(ctx) == []
+    (app / "shared_context" / "a.py").write_text("edited", encoding="utf-8")
+    (app / "tool_catalog" / "new.json").write_text("{}", encoding="utf-8")
+    assert sorted(hooks.build_input_changes(ctx)) == ["src/fa-shared-context-poc/shared_context/a.py",
+                                                      "src/fa-shared-context-poc/tool_catalog/new.json"]
+
+
+def test_rollback_override_reaches_ci_deploy_only_when_exactly_true(hooks, tmp_path):
+    for value, passed in (("true", True), ("false", False), ("1", False), (None, False)):
+        extra = {} if value is None else {"FA_ALLOW_ROLLBACK": value}
+        env = hooks.build_env(context(hooks, tmp_path, {}, FA_DEPLOY_RUN="1", **extra), "f" * 40)
+        assert ("FA_ALLOW_ROLLBACK" in env) is passed
+
+
+def test_images_of_a_clean_checkout_are_reused_for_the_same_commit_and_core(hooks, tmp_path):
+    ctx = image_case(hooks, tmp_path, "", **CACHED)
+    assert hooks.images(ctx, "f" * 40, "e" * 64) == BUILT and builds(ctx) == []
+
+
+def test_an_allowed_dirty_build_is_built_and_never_reused(hooks, tmp_path):
+    ctx = image_case(hooks, tmp_path, " M src/fa-shared-context-poc/shared_context/x.py\n",
+                     FA_ALLOW_DIRTY_BUILD="true", **CACHED)
+    assert hooks.images(ctx, "f" * 40, "e" * 64) == BUILT
+    assert len(builds(ctx)) == 3 and ctx.values["FA_IMAGES_COMMIT"] == "f" * 40 + "+dirty"
+    # The next clean run of the same commit builds again instead of reusing the working-tree images.
+    clean = image_case(hooks, tmp_path, "", **{**CACHED, "FA_IMAGES_COMMIT": ctx.values["FA_IMAGES_COMMIT"]})
+    hooks.images(clean, "f" * 40, "e" * 64)
+    assert len(builds(clean)) == 3 and clean.values["FA_IMAGES_COMMIT"] == "f" * 40

@@ -152,6 +152,21 @@ def test_preparation_reconcile_reads_the_original_receipt_without_repeating_prep
     assert [command.operation for _, command in case.remote.calls] == ["session_read"]
 
 
+def test_preparation_reconcile_does_not_forward_the_vms_version_to_a_strict_client(native_api):
+    """A newer image names its own version in the session state; a workbench older than that field decodes this
+    reply with ``extra="forbid"`` (agent_onboarding), so the API leaves it out and the reply stays as it was."""
+    case = native_api
+    case.remote.actual_version = case.remote.target.agent_version
+    response = case.client.post(PREFIX + "/prepare/reconcile", headers=case.headers,
+                                json={"request_id": case.remote.preparation.request_id})
+    assert response.status_code == 200, response.text
+    assert "actual_version" not in response.json()
+    case.remote.actual_version = None
+    unchanged = case.client.post(PREFIX + "/prepare/reconcile", headers=case.headers,
+                                 json={"request_id": case.remote.preparation.request_id})
+    assert unchanged.json() == response.json()
+
+
 def test_pre_admission_version_refusal_is_distinct_from_a_receipt_read_failure(native_api, monkeypatch):
     from test_native_turn_api import submit
 

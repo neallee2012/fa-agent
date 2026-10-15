@@ -55,10 +55,22 @@ class NativeTransport:
         self.session_etag = "original-agent-etag"
         self.environment = None
         self.following = None
+        self.actual_version = None  # a newer image names its own version in the session state (ADR-0009 §1)
+        # ADR-0009 §4: the version this VM runs. When set, a request expecting another version is refused before
+        # anything is read, as Hosted's ``require_expected_version`` does: a newer image names ``not_dispatched``,
+        # ``reason`` and ``actual_version``; ``old_image`` refuses with the bare code.
+        self.vm_version = None
+        self.old_image = False
 
     def __call__(self, request):
         command = NATIVE_REQUEST.validate_json(request.content)
         self.calls.append((request, command))
+        expected = request.headers.get("x-client-fa-expected-version")
+        if self.vm_version is not None and expected != self.vm_version:
+            body = {"code": "NATIVE_SESSION_CHANGED", "message": "private"}
+            if not self.old_image:
+                body.update(not_dispatched=True, reason="version", actual_version=self.vm_version)
+            return httpx.Response(409, json={"error": body})
         assert request.method == "POST" and request.url.path.endswith("/endpoint/protocols/invocations")
         assert dict(request.url.params) == {"api-version": "v1", "agent_session_id": self.target.session_id}
         assert request.headers[NATIVE_TURN_HEADER] == NATIVE_STATE_PROFILE
@@ -72,7 +84,8 @@ class NativeTransport:
         elif command.operation == "session_read":
             value = NativeSessionState(agent_id=self.target.agent_id, hosted_session_id=self.session_binding,
                                        etag=self.session_etag, preparation=self.preparation,
-                                       environment=self.environment, following=self.following)
+                                       environment=self.environment, following=self.following,
+                                       actual_version=self.actual_version)
         elif command.operation == "session_prepare":
             if self.preparation is None:
                 assert (command.expected_session_id, command.expected_etag) == (self.session_binding, self.session_etag)

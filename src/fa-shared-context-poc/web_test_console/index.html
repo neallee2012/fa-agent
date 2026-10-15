@@ -599,6 +599,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <div class="composer-status" id="composer-status">
 <p id="cancellation-note" class="reason" role="status" hidden></p>
 <p id="model-switch-note" class="reason" role="status" hidden></p>
+<p id="environment-note" class="reason" role="status" hidden></p>
 <p id="model-lock-note" class="reason" role="status" hidden><span id="model-lock-text"></span> <button id="model-lock-new-conversation" type="button"></button></p>
 <div class="composer-meta"><p id="instruction-reason" role="status">連線後即可聊天</p><span class="composer-shortcut">Enter 送出 · Shift + Enter 換行</span><p id="input-capacity" hidden></p></div>
 </div>
@@ -734,6 +735,18 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 "use strict";
 let state=null,selected="",selectedThread=null,busy=false,lastError=null,draftId=null,progressTimer=null,progressBusy=false,progressPaused=false,stateRevision=0,threadLoading=false;
 let progressRetryMs=1000;
+// Audit #13 round 2 (2026-10-14): while a delegated reply is awaited, reads that changed nothing (not counting
+// observed_at) keep the usual 1 s pace for 30 s, then double up to 5 s (push open or not). Backing off from the first
+// unchanged read showed the reply up to 8 s late (release 30 dev test). A change, push hint or visible tab resets it.
+let lastProgressSignature=null,progressSameSince=0;
+// Audit round 1 (2026-10-14): a pending progress timer keeps its due time (progressDueAt), so the renders that every
+// 60 s team read, auth refresh or push reconnect triggers no longer restart a long error backoff. A tab that becomes
+// visible reads at the usual pace at once (progressKick).
+let progressDueAt=null,progressArmedMs=null,progressKick=false;
+const PROGRESS_NO_PUSH_MAX_MS=5000,PROGRESS_SAME_GRACE_MS=30000;
+function progressSignature(value){
+  return JSON.stringify([value.authentication,value.tasks,value.composer],(key,item)=>key==="observed_at"?undefined:item);
+}
 // The request ID shown with the current error notification (copied by 複製 request ID).
 let shownErrorRequest=null,skillDraftRenderKey=null;
 let authenticationTimer=null,authenticationBusy=false,authenticationStopped=false;
@@ -773,6 +786,9 @@ const nextDraftReads=new Map(),nextDraftStopped=new Set(),nextDraftOrigins=new M
 // Messages held by the server while it follows the Agent version; the page only retries the same RID.
 const SERVER_FOLLOWING_CODES=new Set(["AGENT_VERSION_FOLLOWING","NATIVE_SESSION_CHANGED"]);
 const SERVER_FOLLOWING_DELAY_MS=3000,SERVER_FOLLOWING_TIMEOUT_MS=600000;
+// ADR-0009 M4.4: a short environment change is not announced; the "換版中" text appears only this long after the
+// automatic same-RID resend starts.
+const SERVER_FOLLOWING_QUIET_MS=30000;
 const versionResends=new Set(),serverFollowingWaiters=new Map();
 const chatSends=new Map();
 const turnContexts=new Map(),contextErrors=new Map(),contextReads=new Set();
@@ -3551,7 +3567,7 @@ async function refreshAgentDirectory(){
 }
 function clearAgentObservations(){
   clearGroupPanel();
-  stateRevision++;progressBusy=false;progressPaused=false;progressRetryMs=1000;
+  stateRevision++;progressBusy=false;progressPaused=false;progressRetryMs=1000;lastProgressSignature=null;
   if(progressTimer!==null){clearTimeout(progressTimer);progressTimer=null}
   clearAttachmentObservation();clearUserFileObservation();clearTurnContexts();clearDelegationViews();
   clearTemplateObservation();clearSystemPromptObservation();clearCancellationObservations();clearAnswerDownloads();
@@ -3972,9 +3988,13 @@ async function downloadUserFile(task,file){
     if(live()){userFileDownloads.delete(key);render()}
   }
 }
+// Hosted saves a stopped native turn as unknown with NATIVE_TURN_CANCELLED; tools may have run before the stop.
+const STOPPED_TURN_TEXT="已停止。停止前可能已經做了部分動作。";
+const stoppedTurn=task=>task?.native_receipt?.failure_code==="NATIVE_TURN_CANCELLED";
 function cancellationMessage(task){
   if(pendingCancellations.has(scopeKey(task?.task_id)))return "正在送出停止請求…";
   if(nativeProfile(task?.state_profile)){
+    if(stoppedTurn(task))return STOPPED_TURN_TEXT;
     if(task.native_receipt?.cancel_requested)return "已要求停止這次回覆。";
     if(task.cancellation?.state==="CONFIRMED"&&task.cancellation.receipt?.result)
       return cancellationReceiptMessage(task,task.cancellation.receipt.result);
@@ -4320,7 +4340,7 @@ function realtimeReadProgress(){
   // A hint is also a way back from a paused page (coordinator, stage v15 12:40): it reads once; a message being sent
   // still reads nothing.
   if(messagePending(state.composer?.request_id))return;
-  progressPaused=false;realtime.progressDue=true;
+  progressPaused=false;realtime.progressDue=true;progressRetryMs=1000;lastProgressSignature=null;
   if(!busy&&!progressBusy&&!threadLoading&&!document.hidden){
     if(progressTimer!==null){clearTimeout(progressTimer);progressTimer=null}
     updateProgress();
@@ -5327,6 +5347,34 @@ function renderModelSwitchNotice(){
   el("model-switch-note").hidden=!shown;
   if(shown)text("model-switch-note",`已換成 ${modelDisplayName(notice.model)}；這一回合會比較慢（重新載入對話）。`);
 }
+// ADR-0009 §8 / M4: the per-Agent notice the API delivers once with an owner's submit answer (then clears). Shown as
+// one quiet status line under the composer for that Agent, never as an error, until its next accepted message. A kind
+// this page does not know (an API released after it) is ignored. Sentences exactly as in ADR-0009 §8.
+const ENVIRONMENT_NOTICES={
+  environment_updated:"助理已更新到新版本，工作檔也一起帶過來了。",
+  environment_switched_without_files:"已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。",
+  environment_source_retired:"已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。",
+};
+const environmentNotices=new Map();
+function environmentNoticeText(notice){
+  if(notice?.kind==="platform_version_changed"){
+    const version=value=>typeof value==="string"&&/^[1-9][0-9]{0,15}$/.test(value);
+    return version(notice.from_version)&&version(notice.to_version)?
+      `平台把助理的執行環境換成了另一個版本（v${notice.from_version}→v${notice.to_version}）；FA 已記錄，相容就照常執行。`:null;
+  }
+  return Object.hasOwn(ENVIRONMENT_NOTICES,notice?.kind||"")?ENVIRONMENT_NOTICES[notice.kind]:null;
+}
+// One accepted submit answer of ``agent``: its notice replaces the shown one; an answer without one ends it.
+function noteEnvironment(task,agent){
+  const shown=environmentNoticeText(task?.native_receipt?.environment_notice);
+  if(shown)environmentNotices.set(agent,shown);else environmentNotices.delete(agent);
+  renderEnvironmentNotice();
+}
+function renderEnvironmentNotice(){
+  const shown=environmentNotices.get(selectedAgent);
+  el("environment-note").hidden=!shown;
+  if(shown)text("environment-note",shown);
+}
 function modelDisplayName(id){
   return (state?.composer?.models?.models||[]).find(model=>model.id===id)?.display_name||id;
 }
@@ -5443,6 +5491,7 @@ function renderComposer(){
   if(appendTarget)text("model-capacity","追加沿原回合的模型與設定；不更換模型，也不是另一筆交辦。");
   renderModelLockNotice(pinned);
   renderModelSwitchNotice();
+  renderEnvironmentNotice();
   el("instruction").disabled=opening?!scopeAvailable()||state.authentication!=="AVAILABLE":
     busy||messageBusy||appendBusy||threadLoading||!canCompose;
   renderAttachmentPicker();
@@ -5775,6 +5824,10 @@ function processingPanel(task){
     if(!value&&!phase)return null;
     const notStarted=phase==="unknown"&&value?.failure_code==="NATIVE_TURN_NOT_STARTED";
     const refused=phase==="unknown"&&value?.failure_code==="NATIVE_MODEL_REFUSED";
+    // ADR-0009 §7a (e): the API reads a message an earlier version accepted and left as final (polling ends here),
+    // or one Hosted marked after its progress stopped (its own failure code, with the same notice).
+    const earlier=phase==="unknown"&&(value?.failure_code==="NATIVE_EARLIER_VERSION_UNFINISHED"||
+      value?.environment_notice?.kind==="earlier_version_unfinished");
     // Right after a send the API answers once Hosted has accepted, before the Responses POST (API #668); until the
     // first reconcile starts (or the send reported an error) that is ordinary processing, not a handoff in doubt.
     const pendingResponse=task.state_profile==="foundry-responses-v1"&&phase==="accepted"&&!value?.response_id&&
@@ -5782,7 +5835,8 @@ function processingPanel(task){
     const node=document.createElement("details"),summary=document.createElement("summary"),note=document.createElement("p");
     const opened=scopeKey(task.task_id);
     node.className="turn-processing";
-    node.open=deliveryStopped||Boolean(value?.notification_error)||notStarted||refused||pendingResponse||progressOpened.has(opened);
+    node.open=deliveryStopped||Boolean(value?.notification_error)||notStarted||earlier||refused||pendingResponse||
+      progressOpened.has(opened);
     // Only the owner's click counts (Enter/Space on a summary also clicks it); opening it from code fires "toggle" too.
     summary.addEventListener("click",()=>{
       const opening=!node.open;
@@ -5790,7 +5844,10 @@ function processingPanel(task){
       if(opening&&!task.progress&&task.actions?.["read-progress"]?.enabled)readNativeProgress(task);
     });
     summary.textContent=deliveryStopped?(delivery.status==="not_delivered"?"交辦沒有送達":"還不確定交辦有沒有送達"):
-      pendingResponse?"正在等助理接手":notStarted?"這次沒有開始執行":refused?"模型拒絕了這次請求":
+      pendingResponse?"正在等助理接手":notStarted?"這次沒有開始執行":earlier?"較早的版本接下的訊息":
+      refused?"模型拒絕了這次請求":
+      // A stopped turn whose collaboration is unconfirmed says both; the note below explains the collaboration.
+      phase==="unknown"&&stoppedTurn(task)?(value?.notification_error?"已停止；和另一位助理的協作還沒確認":"已停止"):
       value?.notification_error?"和另一位助理的協作還沒確認":
       ["accepted","started"].includes(phase)?(phase==="accepted"&&processingActivity(task,[])==="正在回覆"?
         "正在準備":processingActivity(task,[])):
@@ -5803,13 +5860,14 @@ function processingPanel(task){
       pendingResponse?(task.response_reconciliation?.state==="stopped"?
       "助理一直沒有接手；可以停止這次回覆。":"訊息已送到，正在等助理接手。"):
       notStarted?"請重新送出這則訊息。":
+      earlier?"這則訊息是較早的版本接下的，目前環境無法接續；請用新訊息再送一次。":
       refused?modelRefusalText(task):
       task.not_accepted===true?"這則訊息沒有送達。":
       value?.notification_error?"結果或通知還沒送到另一位助理；請從選單更新，不要重新交辦。":"";
     if(!publicProcessingEvents(task.progress?.data?.progress).length){
       node.append(summary);if(note.textContent)node.append(note);return node;
     }
-    nativeNote=deliveryStopped||pendingResponse||notStarted||refused||value?.notification_error?note.textContent:"";
+    nativeNote=deliveryStopped||pendingResponse||notStarted||earlier||refused||value?.notification_error?note.textContent:"";
   }
   const turn=state.composer?.conversation?.turns?.find(value=>value.request_id===task.submit_request_id);
   const snapshot=turn?.progress||task.progress?.data?.progress;
@@ -5838,7 +5896,9 @@ function processingPanel(task){
   const count=Math.max(calls.size,completed.length);
   const label=running?(active?processingActivity(task,events):"正在等候更新"):status==="failed"?"沒有完成":
     status==="cancelled"?"已停止":modelRefusalText(task)?"模型拒絕了這次請求":
-    status==="unknown"?"結果不確定":["succeeded","completed"].includes(status)?"已完成":
+    // Same wording as the no-steps summary above: Hosted saves a stopped native turn as unknown.
+    status==="unknown"?(stoppedTurn(task)?(task.native_receipt?.notification_error?
+      "已停止；和另一位助理的協作還沒確認":"已停止"):"結果不確定"):["succeeded","completed"].includes(status)?"已完成":
     status==="busy_refused"?"助理忙碌，這次沒有執行":"";
   panel.summary.textContent=[label,count?`用了 ${count} 個工具`:"",seconds===null?"":`${seconds} 秒`]
     .filter(Boolean).join("・");
@@ -6520,7 +6580,7 @@ function renderConversation(tasks){
       task.submission.state==="NOT_SENT"&&!task.admission?"這則訊息還沒送出。":
       state.authentication!=="AVAILABLE"?"連線後載入這則回覆。":
       (progress?.state||task.status?.data?.state)==="unknown"?
-        (modelRefusalText(task)||"這次回覆的結果還不確定。"):
+        (modelRefusalText(task)||(stoppedTurn(task)?STOPPED_TURN_TEXT:"這次回覆的結果還不確定。")):
       (progress?.state||task.status?.data?.state)==="busy_refused"?"助理忙碌，這次未執行；可明確送出新的請求。":
       ["failed","cancelled"].includes(progress?.state||task.status?.data?.state)?"這次沒有完成回覆。可從訊息下方查看詳細狀態。":
       progress?.stream?.durable===false&&progress.stream.text?{stream:progress.stream.text}:
@@ -6613,7 +6673,9 @@ function renderConversation(tasks){
       status.textContent=({
         accepted:"已收到，助理會接著處理。",
         sending:"正在交給助理。",
-        applied:appended.delivery==="queued"?"助理會在這段對話的下一輪處理。":"助理已收到。",
+        // queued (enqueue, copilot_steering.py): the original turn's current SDK round finishes, then the queued message
+        // runs as the next SDK round inside the same FA turn (not a later FA turn).
+        applied:appended.delivery==="queued"?"助理已收到，在這次回覆中接著處理。":"助理已收到。",
         not_applied:"沒有送達：這一回合已經結束。原文保留，不會自動再送。",
         unknown:"還不確定有沒有送達，可以按這則訊息下方「⋯」裡的「核對追加」。",
       })[appended.status]||"還不確定有沒有送達。";
@@ -6687,7 +6749,7 @@ function renderConversation(tasks){
     const handoff=agentMessagePanel(task);
     if(handoff)turn.append(handoff);
     const cancellation=cancellationMessage(task);
-    if(cancellation){const note=document.createElement("p");note.className="reason";note.textContent=cancellation;turn.append(note)}
+    if(cancellation&&cancellation!==content){const note=document.createElement("p");note.className="reason";note.textContent=cancellation;turn.append(note)}
     const readError=cancellationReadErrors.get(task.task_id);
     if(readError||cancellationReads.has(task.task_id)){
       const note=document.createElement("p");note.className="reason";
@@ -7018,30 +7080,44 @@ async function refreshAuthentication(){
   }finally{authenticationBusy=false;render()}
 }
 function scheduleProgress(){
-  if(progressTimer!==null){clearTimeout(progressTimer);progressTimer=null}
+  const delay=progressDelay();
+  if(delay===null){
+    if(progressTimer!==null){clearTimeout(progressTimer);progressTimer=null}
+    return;
+  }
+  // A pending timer armed for the same wait stays: scheduleProgress runs on every render and must not restart a
+  // wait that is part way through. A different wait (backoff reset, push opened or dropped) is armed afresh.
+  if(progressTimer!==null){
+    if(progressDueAt!==null&&progressArmedMs===delay)return;
+    clearTimeout(progressTimer);
+  }
+  progressArmedMs=delay;progressDueAt=Date.now()+delay;
+  progressTimer=setTimeout(updateProgress,delay);
+}
+// Milliseconds until the next progress read, or null when none is due to be scheduled.
+function progressDelay(){
   if(realtime.progressDue&&!busy&&!threadLoading&&!progressBusy&&!document.hidden&&state?.authentication==="AVAILABLE"&&
-      !progressPaused&&!messagePending(state.composer?.request_id)){
-    progressTimer=setTimeout(updateProgress,0);return;
-  }
-  if(openingTurn()&&!busy&&!threadLoading&&!progressBusy&&!document.hidden&&!messagePending(state.composer.request_id)){
-    progressTimer=setTimeout(updateProgress,progressRetryMs>1000?progressRetryMs:0);return;
-  }
+      !progressPaused&&!messagePending(state.composer?.request_id))return 0;
+  // Without push nothing announces a finished reply, so the backoff stays short.
+  const retryMs=realtime.phase==="open"?progressRetryMs:Math.min(progressRetryMs,PROGRESS_NO_PUSH_MAX_MS);
+  if(openingTurn()&&!busy&&!threadLoading&&!progressBusy&&!document.hidden&&!messagePending(state.composer.request_id))
+    return retryMs>1000?retryMs:0;
   if(!state?.composer?.progress_available||busy||threadLoading||messagePending(state.composer.request_id)||
-    progressBusy||progressPaused||document.hidden)return;
+    progressBusy||progressPaused||document.hidden)return null;
   const messages=state.tasks.filter(task=>(typeof task.instruction==="string"||nativeProfile(task.state_profile))&&
     (!selectedThread||task.thread_id===selectedThread));
   const latest=messages.at(-1);
   if(latest?.not_accepted===true&&latest.native_receipt==null&&latest.status?.data?.state==="not_accepted"&&
     !messages.some(task=>["accepted","started","queued","starting","running","capacity_uncertain","waiting_dependency"]
-      .includes(task.status?.data?.state)))return;
+      .includes(task.status?.data?.state)))return null;
   const conversation=state.composer.conversation,last=conversation?.turns?.at(-1);
   if(last&&latest&&state.composer.awaiting_agent_reply!==true&&last.request_id===latest.submit_request_id&&
     ((latest.state_profile==="foundry-responses-v1"&&last.state==="completed")||
-     ((conversation.can_follow_up||state.composer.editable)&&latest.reply)||["failed","cancelled","unknown","busy_refused"].includes(last.state)))return;
+     ((conversation.can_follow_up||state.composer.editable)&&latest.reply)||["failed","cancelled","unknown","busy_refused"].includes(last.state)))return null;
   // With push open a running turn and a delegation waiting for its reply are read every 3 seconds instead of every
-  // second; their end event reads them at once.
+  // second; their end event reads them at once. A tab that just became visible reads at the usual pace first.
   const pushed=realtime.phase==="open"&&(runningOwnTurn()||state.composer.awaiting_agent_reply===true);
-  progressTimer=setTimeout(updateProgress,pushed?Math.max(progressRetryMs,REALTIME_STATUS_MS):progressRetryMs);
+  return pushed&&!progressKick?Math.max(retryMs,REALTIME_STATUS_MS):retryMs;
 }
 // The owner's own native turn that is still running in this conversation. While it runs, only that turn is read
 // (its receipt, progress and, at the end, its reply), like charter-agent's single in-flight request, instead of the
@@ -7171,7 +7247,7 @@ function openingTurn(){
 // page stops waiting for it after this long and reads again with the usual backoff; a late answer is ignored.
 const PROGRESS_READ_TIMEOUT_MS=45000;
 async function updateProgress(refreshChildren=false){
-  progressTimer=null;
+  progressTimer=null;progressKick=false;
   if(busy||progressBusy||document.hidden){scheduleProgress();return}
   progressBusy=true;
   const opening=runningOwnTurn()?null:openingTurn(),turn=runningOwnTurn()||opening;
@@ -7201,13 +7277,18 @@ async function updateProgress(refreshChildren=false){
       const retrying=!readConflict&&readRetryable(value.error);
       const transient=readConflict||retrying;
       progressPaused=!transient;
-      progressRetryMs=readConflict?1000:Math.min(progressRetryMs*2,30000);
+      progressRetryMs=readConflict?1000:Math.min(progressRetryMs*2,30000);lastProgressSignature=null;
       // A read conflict keeps the original pace and is not re-read here; a retryable read waits for its backoff.
       if(opening&&retrying)openReads.delete(scopeKey(opening.task_id));
       if(!readConflict)lastError={...(value.error||{code:"LOCAL_OFFLINE"}),phase:"progress",...(retrying?{retrying:true}:{})};
       else if(lastError?.phase==="progress")lastError=null;
     }else{
-      state=value;progressPaused=false;progressRetryMs=1000;
+      const signature=value.composer?.awaiting_agent_reply===true?progressSignature(value):null;
+      if(signature===null||signature!==lastProgressSignature)progressSameSince=Date.now();
+      const same=signature!==null&&Date.now()-progressSameSince>=PROGRESS_SAME_GRACE_MS;
+      lastProgressSignature=signature;
+      state=value;progressPaused=false;
+      progressRetryMs=same?Math.min(progressRetryMs*2,PROGRESS_NO_PUSH_MAX_MS):1000;
       if(lastError?.phase==="progress")lastError=null;
       render();refreshDelegations(refreshChildren);
       // A turn that ended any other way than completed with its reply (unknown and continued by Hosted, failed,
@@ -7230,7 +7311,7 @@ async function updateProgress(refreshChildren=false){
   }catch(error){
     if(revision===stateRevision){
       realtime.progressDue=false;
-      progressPaused=false;progressRetryMs=Math.min(progressRetryMs*2,30000);
+      progressPaused=false;progressRetryMs=Math.min(progressRetryMs*2,30000);lastProgressSignature=null;
       if(opening)openReads.delete(scopeKey(opening.task_id));
       lastError={code:"LOCAL_OFFLINE",message:error.message,phase:"progress",retrying:true};
     }
@@ -7241,7 +7322,7 @@ async function updateProgress(refreshChildren=false){
     progressBusy=false;render();
     if(fullRead&&revision===stateRevision){
       if(progressTimer!==null)clearTimeout(progressTimer);
-      progressTimer=setTimeout(updateProgress,0);
+      progressArmedMs=0;progressDueAt=Date.now();progressTimer=setTimeout(updateProgress,0);
     }
   }}
 }
@@ -7449,6 +7530,7 @@ async function sendChat(){
     });
     if(value.task?.task_id!==requestId||value.task.submission?.state!=="CONFIRMED")
       throw {code:"RECONCILE_REQUIRED",message:"尚未取得接單確認，保留原訊息，不會重送。"};
+    if(native)noteEnvironment(value.task,originAgent);
     // Show the accepted turn from the submit reply at once; the full state is read afterwards.
     if(live()&&selectedThread===originThread&&Array.isArray(state.tasks)&&value.task.thread_id===originThread){
       state.tasks=[...state.tasks.filter(task=>task.task_id!==requestId),value.task];render();
@@ -7530,8 +7612,12 @@ async function resendWhileServerFollows({thread,request,agent,sendToken,post,liv
   const show=problem=>{const shown=problem?.server_following===true?{...problem,request_id:request}:problem;
     threadErrors.set(scopeKey(thread,agent),shown);if(agent===selectedAgent&&selectedThread===thread)lastError=shown;render()};
   let reason=refusal;
+  // The same-RID resend text stays hidden for SERVER_FOLLOWING_QUIET_MS (the message still shows as sending).
+  const following=problem=>{if(Date.now()-started>=SERVER_FOLLOWING_QUIET_MS)show(problem)};
   pendingMessages.add(key);chatSends.set(key,sendToken);versionResends.add(key);
-  show(refusal);
+  following(refusal);
+  // Still waiting when the quiet period ends: say so then, without waiting for the next resend's answer.
+  const quiet=setTimeout(()=>{if(current())show(reason)},SERVER_FOLLOWING_QUIET_MS);
   const waitNext=()=>new Promise(resolve=>{
     let done=false,timer=null;
     const finish=()=>{if(done)return;done=true;if(timer!==null)clearTimeout(timer);serverFollowingWaiters.delete(key);resolve()};
@@ -7553,6 +7639,8 @@ async function resendWhileServerFollows({thread,request,agent,sendToken,post,liv
         if(value.task.submission?.state==="CONFIRMED"){
           if(Array.isArray(state.tasks)&&value.task.thread_id===thread)
             state.tasks=[...state.tasks.filter(task=>task.task_id!==request),value.task];
+          // After the server moved the Agent, this answer is the one that carries the switch notice.
+          noteEnvironment(value.task,agent);
           clearSentDraft(thread,request,agent);lastError=null;threadErrors.delete(scopeKey(thread,agent));render();
         }
         return;
@@ -7560,13 +7648,13 @@ async function resendWhileServerFollows({thread,request,agent,sendToken,post,liv
         reason=sendProblem(error);
         if(!current())return;
         if(reason.server_following===true&&SERVER_FOLLOWING_CODES.has(reason.code)){
-          show(reason);continue;
+          following(reason);continue;
         }
         show(reason);return;
       }
     }
   }finally{
-    serverFollowingWaiters.delete(key);versionResends.delete(key);
+    clearTimeout(quiet);serverFollowingWaiters.delete(key);versionResends.delete(key);
   }
 }
 async function sendAppend(){
@@ -7633,6 +7721,8 @@ async function retryOriginalTurn(task){
     if(value.task?.task_id===request&&value.task.submission?.state==="CONFIRMED"){
       if(Array.isArray(state.tasks)&&value.task.thread_id===thread)
         state.tasks=[...state.tasks.filter(item=>item.task_id!==request),value.task];
+      // A retry of an older message shows a notice it carries but never ends the one shown.
+      if(environmentNoticeText(value.task.native_receipt?.environment_notice))noteEnvironment(value.task,agent);
       clearSentDraft(thread,request,agent);
     }
   }catch(error){
@@ -8216,7 +8306,7 @@ async function switchThread(thread){
   clearServerFollowingState();
   clearNativeHitlObservation();
   realtime.progressDue=false;
-  selectedThread=thread;selected="";lastError=null;progressPaused=false;progressRetryMs=1000;
+  selectedThread=thread;selected="";lastError=null;progressPaused=false;progressRetryMs=1000;lastProgressSignature=null;
   conversationRenderKey=null;
   const scope=agentRevision,revision=stateRevision+1;
   threadLoading=true;el("send-instruction").disabled=true;el("instruction").disabled=true;
@@ -8292,6 +8382,8 @@ el("hitl-rule-behavior").addEventListener("change",()=>{
   hitlDraft().behavior=el("hitl-rule-behavior").value;hitlEditing();renderNativeHitlRules();
 });
 document.addEventListener("visibilitychange",()=>{
+  // A hidden tab stopped its reads; coming back reads at the usual pace, not at the backoff it had reached.
+  if(!document.hidden){progressRetryMs=1000;lastProgressSignature=null;progressKick=true}
   if(state&&!document.hidden)render();
   else{scheduleProgress();scheduleAuthentication();scheduleTeamAttention()}
 });
@@ -8566,7 +8658,7 @@ async function openNewConversation(model){
 }
 el("refresh-progress").addEventListener("click",()=>{
   if(el("refresh-progress").disabled)return;
-  progressPaused=false;progressRetryMs=1000;
+  progressPaused=false;progressRetryMs=1000;lastProgressSignature=null;
   if(progressTimer!==null){clearTimeout(progressTimer);progressTimer=null}
   // A finished turn whose saved reply did not load is read again (its own /status) once it is on screen.
   olderTurnDone.clear();conversationRenderKey=null;

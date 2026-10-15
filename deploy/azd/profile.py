@@ -166,6 +166,9 @@ def build(values: Mapping[str, str], *, require_runtime: bool = True,
             "backups_container": _get(values, "FA_BACKUP_CONTAINER"),
         },
     }
+    if _flag(values, "FA_COMPAT_GATE_ARMED"):
+        # ADR-0009 phase 3b (deploy/README.md#compat-gate): armed by the operator once no v1 binding row remains.
+        profile["compatibility_gate_armed"] = True
     api_url = values.get("FA_API_URL")
     if api_url:
         profile["api_url"] = api_url

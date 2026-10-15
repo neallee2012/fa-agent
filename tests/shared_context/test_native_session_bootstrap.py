@@ -87,7 +87,8 @@ def test_empty_native_bootstrap_does_not_probe_or_stop_its_active_legacy_source(
     runtime = NativeTurnRuntime(new_identity, sdk, bootstrap_source_inactive=verified)
     with TestClient(create_host(SimpleNamespace(identity=new_identity), native_runtime=runtime)) as host:
         h = Harness(runtime, sdk, host)
-        assert host.portal.call(runtime.session_state) == original
+        # Another VM: the Agent record is the same, only the VM's own version differs (ADR-0009 §1).
+        assert host.portal.call(runtime.session_state).model_copy(update={"actual_version": IDENTITY.agent_version}) == original
         prepared = prepare(h)
         assert prepared.status_code == 200, prepared.text
         assert prepared.json()["previous_hosted_session_id"] == IDENTITY.session_id
@@ -130,7 +131,10 @@ def test_active_legacy_bootstrap_correction_cannot_replace_any_native_work(local
         assert response.status_code == 409, response.text
         assert response.json()["error"]["code"] == (
             "NATIVE_SESSION_CHANGED" if retained == "preparation" else "NATIVE_BOOTSTRAP_HAS_WORK")
-        assert host.portal.call(current.session_state) == original
+        # Another VM: the Agent record is unchanged; only the VM's own version differs (ADR-0009 §1).
+        state = host.portal.call(current.session_state)
+        assert state.actual_version == "2"
+        assert state.model_copy(update={"actual_version": IDENTITY.agent_version}) == original
         assert not old.executor.calls and not current.executor.calls
 
 

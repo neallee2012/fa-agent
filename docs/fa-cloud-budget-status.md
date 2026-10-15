@@ -1,5 +1,11 @@
 # FA 雲端授權與 USD150 成本 preflight
 
+<a id="dev-v30-test-1014"></a>
+## 2026-10-14 第 30 版候選 dev 測試前後實查（上限 USD800／停損 USD780 維持）
+
+- **測試**：main `1c2be0b4` 的 dev 測試，結果見 [progress](progress.md#dev-test-v30-1014)。
+- **實查**（Cost Management `ActualCost`，報表會延遲）：測試前約 **USD600.44**（`rg-faexample` 578.42＋`ME_cae-facontext-private` 22.03；分項四捨五入，相加為 600.45），測試後約 **USD609.91**（587.76＋22.15），兩次差約 USD9.47。查詢時間與報表日期未記；因報表延遲，這個差額不等於測試本身的花費。
+- **上限**：不變，仍是 [USD800／停損 USD780](#dev-cap-800-1013)；距停損約 USD170。其他規則不變（`budget_enforced=false`、不清帳、stage 另列每月 USD200）。
 <a id="dev-cap-800-1013"></a>
 ## 2026-10-13 dev 上限 USD650 → USD800（Neal 授權）
 

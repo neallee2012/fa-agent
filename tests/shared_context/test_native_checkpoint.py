@@ -217,3 +217,135 @@ def test_a_corrupt_or_stale_hot_copy_falls_back_to_the_store(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         assert run(native.save_checkpoint(store, SCOPE, state(tool_output="third"), cache_root=blocked)).segments == 1
     assert "status=write_failed" in caplog.text
+
+
+class Overlapping(Counting):
+    """Counts how many segment writes and reads are in flight at once."""
+
+    def __init__(self, store):
+        super().__init__(store)
+        self.active = self.most_writes = self.most_reads = 0
+
+    async def create_item(self, key, value):
+        self.active += 1
+        self.most_writes = max(self.most_writes, self.active)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().create_item(key, value)
+        finally:
+            self.active -= 1
+
+    async def get_item(self, key):
+        self.active += 1
+        self.most_reads = max(self.most_reads, self.active)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().get_item(key)
+        finally:
+            self.active -= 1
+
+
+def test_segments_are_written_and_read_back_concurrently_but_bounded():
+    """Audit finding 17: segments went one at a time; a 6-segment checkpoint now takes about two round trips."""
+    big = state(tool_output="x" * (NATIVE_SEGMENT_BYTES * 5 + 10))
+    store = run(opened())
+    overlapping = Overlapping(store)
+    ref = run(native.save_checkpoint(overlapping, SCOPE, big))
+    assert ref.segments == 6 and overlapping.reads == 6
+    assert 1 < overlapping.most_writes <= 4 and 1 < overlapping.most_reads <= 4
+    assert run(native.verify_checkpoint(Overlapping(store), SCOPE, ref)) == big
+
+
+def test_a_concurrent_readback_still_refuses_an_altered_segment():
+    store = run(opened())
+    big = state(tool_output="y" * (NATIVE_SEGMENT_BYTES * 3 + 10))
+    ref = run(native.save_checkpoint(store, SCOPE, big))
+    middle = native.segment_key(ref.sha256, 2)
+    value = run(store.get_item(middle)).value
+    run(store.set_item(middle, {**value, "data": base64.b64encode(b"z" * 10).decode()}))
+    assert problem(native.verify_checkpoint(store, SCOPE, ref)) == (409, "SDK_STATE_INCOMPLETE")
+    assert problem(native.save_checkpoint(store, SCOPE, big)) == (409, "SDK_STATE_INCOMPLETE")
+
+
+def test_the_hot_copy_keeps_only_the_most_recently_used_conversations(tmp_path, monkeypatch):
+    """Audit finding 18: the hot copy pruned only inside a conversation folder, so $HOME grew with every conversation."""
+    import os
+
+    monkeypatch.setenv("FA_NATIVE_CHECKPOINT_CACHE_CONVERSATIONS", "2")
+    cache = tmp_path / "home" / "native-checkpoints"
+    unrelated = cache / "not-a-conversation"
+    unrelated.mkdir(parents=True)
+    store = run(opened())
+    refs = {}
+    for age, cid in enumerate(("cid-a", "cid-b", "cid-c", "cid-d")):
+        scope = SCOPE.model_copy(update={"conversation_id": cid})
+        refs[cid] = (scope, run(native.save_checkpoint(store, scope, state(tool_output=cid), cache_root=cache)))
+        if cid in {"cid-a", "cid-b"}:
+            os.utime(native._cache_path(cache, refs[cid][1]).parent, (1_000_000 + age, 1_000_000 + age))
+    kept = {path.name for path in cache.iterdir()}
+    assert kept == {native._cache_path(cache, refs[cid][1]).parent.name for cid in ("cid-c", "cid-d")} | {unrelated.name}
+    # A cache hit marks its folder as recently used; a pruned conversation is only a store read away.
+    folder = native._cache_path(cache, refs["cid-c"][1]).parent
+    os.utime(folder, (1_000_000, 1_000_000))
+    scope, ref = refs["cid-c"]
+    counted = Counting(store)
+    assert run(native.load_checkpoint(counted, scope, ref, cache_root=cache)) == state(tool_output="cid-c")
+    assert counted.reads == 0 and folder.stat().st_mtime > 1_000_000
+    scope, ref = refs["cid-a"]
+    assert run(native.load_checkpoint(counted, scope, ref, cache_root=cache)) == state(tool_output="cid-a")
+    assert counted.reads == ref.segments
+
+
+def test_a_hot_copy_folder_removed_meanwhile_is_skipped_and_the_prune_goes_on(tmp_path, monkeypatch, caplog):
+    """A folder that vanishes between the listing's ``is_dir`` and its ``stat`` is not a write failure, and the
+    other folders over the bound are still pruned."""
+    import errno
+    import os
+    from pathlib import Path
+
+    monkeypatch.setenv("FA_NATIVE_CHECKPOINT_CACHE_CONVERSATIONS", "2")
+    cache = tmp_path / "home" / "native-checkpoints"
+    store = run(opened())
+    folders = {}
+    for age, cid in enumerate(("cid-a", "cid-b")):
+        scope = SCOPE.model_copy(update={"conversation_id": cid})
+        folders[cid] = native._cache_path(cache, run(native.save_checkpoint(
+            store, scope, state(tool_output=cid), cache_root=cache))).parent
+        os.utime(folders[cid], (1_000_000 + age, 1_000_000 + age))
+    ghost = cache / ("f" * 32)
+    ghost.mkdir()
+    real_stat, seen = Path.stat, []
+
+    def racing(path, *, follow_symlinks=True):
+        if path.name == ghost.name and follow_symlinks:
+            seen.append(path)
+            if len(seen) > 1:  # is_dir saw it; it is gone by the time its mtime is read
+                raise FileNotFoundError(errno.ENOENT, "OFFLINE removed meanwhile", str(path))
+        return real_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", racing)
+    scope = SCOPE.model_copy(update={"conversation_id": "cid-c"})
+    with caplog.at_level(logging.WARNING):
+        ref = run(native.save_checkpoint(store, scope, state(tool_output="cid-c"), cache_root=cache))
+    assert len(seen) >= 2 and "status=write_failed" not in caplog.text
+    assert {path.name for path in cache.iterdir()} == {
+        folders["cid-b"].name, native._cache_path(cache, ref).parent.name, ghost.name}
+
+
+def test_a_hot_copy_backlog_is_pruned_a_bounded_number_per_write_oldest_first(tmp_path, monkeypatch):
+    """The first write after an upgrade may find many folders; each write removes at most a few, oldest first."""
+    import os
+
+    monkeypatch.setenv("FA_NATIVE_CHECKPOINT_CACHE_CONVERSATIONS", "2")
+    monkeypatch.setattr(native, "CACHE_PRUNE_PER_WRITE", 3)
+    cache = tmp_path / "home" / "native-checkpoints"
+    backlog = [cache / f"{index:032x}" for index in range(6)]
+    for age, folder in enumerate(backlog):
+        folder.mkdir(parents=True)
+        (folder / "old.json").write_bytes(b"{}")
+        os.utime(folder, (1_000_000 + age, 1_000_000 + age))
+    store = run(opened())
+    run(native.save_checkpoint(store, SCOPE, state(), cache_root=cache))
+    assert sorted(folder.name for folder in backlog if folder.exists()) == [folder.name for folder in backlog[3:]]
+    run(native.save_checkpoint(store, SCOPE, state(tool_output="second"), cache_root=cache))
+    assert [folder.name for folder in backlog if folder.exists()] == [backlog[5].name]

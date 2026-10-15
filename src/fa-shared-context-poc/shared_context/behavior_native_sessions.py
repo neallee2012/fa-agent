@@ -1,6 +1,8 @@
 """Explicit API-MI bootstrap; normal turn traffic never creates or changes a session."""
 
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
+from contextvars import copy_context
 import hashlib
 import json
 import logging
@@ -14,11 +16,12 @@ from .behavior_agent_versions import SelectorUnreadable
 from .behavior_foundry import PLATFORM_READ_RETRY, FoundryTarget
 from .behavior_native_turn_wire import (
     NATIVE_STATE_PROFILE, NativeEnvironmentMetadata, NativeEnvironmentReplacementPreview, NativeEnvironmentView, NativeSessionMetadata,
-    NativeSessionFollow, NativeSessionRead, NativeSessionPrepare, NativeSessionRetarget, NativeSessionFilesOmission,
+    NativeSessionAbandon, NativeSessionFollow, NativeSessionRead, NativeSessionPrepare, NativeSessionRetarget,
+    NativeSessionFilesOmission, NativeUnfinishedRead,
     NativeEnvironmentCommand, NativeEnvironmentRetargetCommand, material_digest,
 )
 from .errors import Problem
-from .native_binding import binding_store
+from .native_binding import SUPPORTED_STATE_PROFILES, SessionGuard, binding_store, session_guard_enforced
 
 
 class _RetiredSession(Problem):
@@ -39,6 +42,37 @@ SELECTOR_CHECK_SECONDS = 10
 SELECTOR_STALE_READ_SECONDS = 120
 # Refusals meaning the cached binding moved: the platform is read once more (reads are idempotent).
 _MOVED = frozenset({"NATIVE_SESSION_CHANGED", "AGENT_VERSION_FOLLOWING", "FOUNDRY_NATIVE_BINDING_MISMATCH"})
+# ADR-0009 §7a (m): a compatible source must read retired twice, at least this far apart (across follow attempts,
+# never by sleeping in a request), before it is abandoned. Kept in memory: a restart starts the pair again.
+RETIRED_CONFIRM_SECONDS = 5
+# ...and at most this far apart: an older first read starts a new pair (two reads minutes apart are not a confirmation).
+RETIRED_PAIR_SECONDS = 60
+_RETIRED = frozenset({"failed", "deleted", "expired", "missing"})
+# Follow results that wait only on work left on the source (ADR-0009 §7a applicability (iii)).
+_WORK_WAITS = frozenset({"accepted_or_started", "admission_pending", "task_active", "task_unconfirmed", "task_access_denied"})
+_WORK_WAIT_CHECKS = frozenset({"active_waiting", "admission_pending", "execution_active", "task_active",
+                               "task_unconfirmed", "task_access_denied"})
+# The platform's documented idle timeout range ends at one hour; an unreadable setting assumes it.
+_IDLE_TIMEOUT_FALLBACK_SECONDS = 3600
+# ADR-0009 phase 3: a row-located call reads the selector alongside the row SID's platform metadata (both were already
+# on main's path, one after the other); only a call that needs both uses a worker. Sized above anyio's default 40
+# worker threads (FastAPI's sync endpoints; nothing here sets another limiter) plus the background callers, so a
+# request never queues behind another request's selector read.
+_LOCATE = ThreadPoolExecutor(max_workers=64, thread_name_prefix="fa-native-locate")
+
+
+def _without_settled(command):
+    """``command`` without ``settled_session_ids`` (the same object when it carries none)."""
+    if isinstance(command, NativeSessionFollow) and command.settled_session_ids:
+        return command.model_copy(update={"settled_session_ids": ()})
+    if isinstance(command, NativeSessionFilesOmission) and command.follow.settled_session_ids:
+        return command.model_copy(update={"follow": command.follow.model_copy(update={"settled_session_ids": ()})})
+    return command
+
+
+def abandon_request_id(agent_id, source_session_id, session_id):
+    return material_digest({"kind": "fa-abandon-source-v1", "agent": agent_id, "source": source_session_id,
+                            "target": session_id})
 
 
 def _scope(target):
@@ -53,6 +87,21 @@ def native_session_id(target, client_id, *, version=None):
         if not isinstance(version, str) or re.fullmatch(r"[1-9][0-9]{0,15}", version) is None:
             raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "one concrete version is required")
         material = ["fa-native-version-session-v1", *material[1:], version]
+    return "fa-native-" + hashlib.sha256(json.dumps(material, separators=(",", ":")).encode()).hexdigest()[:48]
+
+
+def fresh_session_id(target, client_id, *, current_session_id, version, attempt=0):
+    """ADR-0009 M5 (phase 3): a new SID derived from the Agent's current SID, the target version and an attempt
+    number, so the same version can get a fresh session. The same ``fa-native-`` prefix and length as generation 0
+    (``native_session_id``), which stays valid: the binding row, not the SID's shape, locates the Agent's session."""
+    if not isinstance(client_id, str) or not client_id:
+        raise Problem(503, "NATIVE_BOOTSTRAP_SOURCE_UNAVAILABLE", "the original API managed identity is required")
+    if not isinstance(version, str) or re.fullmatch(r"[1-9][0-9]{0,15}", version) is None:
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "one concrete version is required")
+    if not isinstance(current_session_id, str) or not current_session_id or type(attempt) is not int or attempt < 0:
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the current SID and an attempt number are required")
+    material = ["fa-native-session-v2", target.project_endpoint, target.agent_id, client_id, current_session_id,
+                version, attempt]
     return "fa-native-" + hashlib.sha256(json.dumps(material, separators=(",", ":")).encode()).hexdigest()[:48]
 
 
@@ -122,7 +171,9 @@ def _source_session_status(client, phase, observe=None):
     return session.status
 
 
-def _require_native_version(client):
+def _native_profile(client):
+    """The native state profile ``client``'s version definition enables (None when it enables none). One
+    ``get_version`` read: no session is called (ADR-0009 §3)."""
     from azure.ai.projects import AIProjectClient
     try:
         with AIProjectClient(endpoint=client.target.project_endpoint, credential=client.credential,
@@ -136,13 +187,22 @@ def _require_native_version(client):
     definition = version.definition
     environment = definition.get("environment_variables") if definition is not None else None
     if (version.name != client.target.agent_name or version.version != client.target.agent_version
-            or definition is None or definition.get("kind") != "hosted"
-            or not isinstance(environment, dict) or environment.get("FA_NATIVE_TURNS") != NATIVE_STATE_PROFILE):
+            or definition is None or definition.get("kind") != "hosted" or not isinstance(environment, dict)):
+        return None
+    profile = environment.get("FA_NATIVE_TURNS")
+    return profile if isinstance(profile, str) else None
+
+
+def _require_native_version(client):
+    if _native_profile(client) != NATIVE_STATE_PROFILE:
         raise Problem(409, "NATIVE_TURNS_DISABLED", "the selected build version must explicitly enable native turns")
 
 
 def _latest_version_reader(client, client_id, selected):
     """This API identity's active or idle version session: ``selected``'s when listed, else any other version's.
+
+    Generation 0 only (version-derived SIDs): it locates an Agent that has no binding row yet. With a row, the row
+    locates the session (ADR-0009 phase 3), so fresh (M5) SIDs never need to be listed.
 
     Versions are not ordered (neither the listing nor the version numbers say which is current), so another
     version's session only says that one exists. Listing invokes no session; a caller invokes the result only
@@ -250,6 +310,24 @@ class NativeSessions:
         self._selector = None
         self._reader_generation = 0
         self._reader_lock = Lock()
+        # ADR-0009 phase 3: the last binding row read (scope, usable row or None, monotonic start). The row locates the
+        # Agent's session; None (no row, unreadable, unsupported profile) keeps the legacy selector locator.
+        self._bound_row = None
+        # (scope, SID, monotonic) of the row's SID that platform metadata last confirmed active or idle, refreshed on
+        # each use: like main's kept reader, a cold process or a day unused reads the metadata again (ADR-0009 §9).
+        self._row_checked = None
+        # ADR-0009 §7a: first retired read per compatible source (m); first active read and the overdue log per
+        # incompatible source (l). Both are in-process observations only, never a decision.
+        self._retired_seen, self._active_seen, self._overdue_logged = {}, {}, set()
+        self._deciding_abandon = False
+        # Destination SIDs whose image rejected ``settled_session_ids`` (``_follow_invoke``).
+        self._settled_unsupported = set()
+        # The zero-call guard every Foundry client of this composition (and each one derived from it) checks.
+        self.guard = SessionGuard(lambda: binding_store(composition), enforce=session_guard_enforced())
+        for client in getattr(composition, "clients", ()) or ():
+            slot = getattr(client, "_session_guard", None)
+            if isinstance(slot, list) and len(slot) == 1:
+                slot[0] = self.guard
 
     def forget(self):
         """The next read selects the version and session from the platform again."""
@@ -257,14 +335,79 @@ class NativeSessions:
             self._reader_generation += 1
             self._reader = None
             self._selector = None
+            self._bound_row = None
+            self._row_checked = None
 
     def reader_cached(self):
-        return self._reader is not None
+        return self._reader is not None or self._bound_row is not None and self._bound_row[1] is not None
+
+    def bound_row(self, client, checked_since=None, *, fresh=False):
+        """ADR-0009 §2/§4 step 1: the Agent's binding row, the locator of its session (no session is called).
+
+        Read from the Table unless a read that started at or after ``checked_since`` (default
+        ``SELECTOR_CHECK_SECONDS`` ago, which only reads may use) is kept; a submit passes its own start, so the row it
+        sends by was read in that request. None when there is no row, it can not be read (logged; the legacy selector
+        locator stands in, never a refusal) or its recorded profile is not supported (ADR-0009 §9 phase 3: logged,
+        and the request goes the legacy way). ``fresh``: always read (ADR-0009 §4 steps 5-6 read the row again)."""
+        scope = _scope(client.target)
+        started = monotonic()
+        if checked_since is None:
+            checked_since = started - SELECTOR_CHECK_SECONDS
+        with self._reader_lock:
+            kept, generation = self._bound_row, self._reader_generation
+        if not fresh and kept is not None and kept[0] == scope and kept[2] >= checked_since:
+            return kept[1]
+        row = self._binding("locate", lambda store: store.read(client.target.agent_id))
+        if row is not None and (row.agent_id != client.target.agent_id or not row.supported()):
+            if row.agent_id == client.target.agent_id:
+                self.guard.mark_incompatible(row.agent_id, row.hosted_session_id)
+                logging.getLogger(__name__).warning(
+                    "NATIVE_SESSION_CALL_INCOMPATIBLE operation=locate session_id=%s enforced=False",
+                    row.hosted_session_id)
+            row = None
+        elif row is not None and (row.agent_id, row.hosted_session_id) in self.guard.refused:
+            # A SID this process found incompatible (e.g. the source of an abandon whose row write was lost) is
+            # never the locator: the legacy locator stands in, as before phase 3 (ADR-0009 §7a zero-call need).
+            logging.getLogger(__name__).warning("NATIVE_BINDING_LOCATOR_INCOMPATIBLE session_id=%s",
+                                                row.hosted_session_id)
+            row = None
+        with self._reader_lock:
+            kept = self._bound_row
+            if self._reader_generation == generation and (kept is None or kept[0] != scope or started >= kept[2]):
+                self._bound_row = (scope, row, started)
+        return row
+
+    def _keep_row(self, client, row):
+        """A row this process just wrote (drift record, repaired switch) is the next locator."""
+        with self._reader_lock:
+            self._bound_row = (_scope(client.target), row, monotonic())
+
+    def _bound_client(self, client, row, *, version=None):
+        """``client`` aimed at the binding row's current SID, expecting its recorded actual version (V_rec)."""
+        located = client.for_target(_target(client.target, session_id=row.hosted_session_id,
+                                            agent_version=version or row.observed.agent_version))
+        located._binding_row = row
+        return located
 
     def cached_reader(self, client):
         """The kept reader for ``client``'s Agent without any platform read; None when none is kept or the selector
-        was not read within ``SELECTOR_CHECK_SECONDS`` naming the kept reader's version."""
+        was not read within ``SELECTOR_CHECK_SECONDS`` naming the kept reader's version. With a binding row, the row's
+        SID is the kept reader only while the same checks hold for it (ADR-0009 §10 phase 0 guarantee): a row read and
+        a selector read within that window, the selector naming the version the SID was created on, no abandon
+        decision, and platform metadata that confirmed the SID within ``READER_IDLE_SECONDS``. A bound Agent never
+        falls back to a kept legacy reader."""
         scope = _scope(client.target)
+        with self._reader_lock:
+            kept, selector, checked, now = self._bound_row, self._selector, self._row_checked, monotonic()
+        if kept is not None and kept[0] == scope and kept[1] is not None:
+            row = kept[1]
+            if (now - kept[2] < SELECTOR_CHECK_SECONDS and row.abandon is None
+                    and selector is not None and selector[0] == scope and now - selector[2] < SELECTOR_CHECK_SECONDS
+                    and selector[1] == row.created_agent_version
+                    and checked is not None and checked[:2] == (scope, row.hosted_session_id)
+                    and now - checked[2] < READER_IDLE_SECONDS):
+                return self._bound_client(client, row)
+            return None
         with self._reader_lock:
             cached, selector, now = self._reader, self._selector, monotonic()
             if (cached is not None and cached[0] == scope and now - cached[2] < READER_IDLE_SECONDS
@@ -336,12 +479,72 @@ class NativeSessions:
             self._binding("switch", lambda store: store.record_switch(client.target.agent_id, value))
         return value
 
-    def candidate(self, client, *, version=None):
+    def _switched_and_checked(self, client, value):
+        """``_switched``, then, on an Agent's first switch, the one read-back of unfinished receipts (§7a (f))."""
+        if value.state == "ready":
+            row = self._binding("switch", lambda store: store.record_switch(client.target.agent_id, value))
+            if row is not None and row.hosted_session_id == value.hosted_session_id and row.unfinished_checked is None:
+                self._binding("unfinished", lambda store: self._backfill_unfinished(store, client, value))
+        return value
+
+    @staticmethod
+    def _backfill_unfinished(store, client, value):
+        """One bounded read through the new session (it reads the same ``fa/v1/turns``; no idle session is called).
+        An image without the read, or a failed read, is recorded as unverified."""
+        from .behavior_native_turn_api import NativeTurnGateway
+        try:
+            found, _ = NativeTurnGateway._invoke(client, NativeUnfinishedRead())
+            sessions, complete = found.session_ids, found.complete and found.hosted_session_id == value.hosted_session_id
+        except Problem as error:
+            logging.getLogger(__name__).warning("NATIVE_BINDING_UNFINISHED_UNREAD code=%s", error.body["error"]["code"])
+            sessions, complete = (), False
+        return store.record_unfinished(client.target.agent_id, hosted_session_id=value.hosted_session_id,
+                                       session_ids=sessions, complete=complete)
+
+    def candidate(self, client, *, version=None, row=None, located=False):
+        """The session for ``version``: with no version, the legacy identity session; otherwise
+        ``destination_session``'s SID (the binding row's ``row``, read when not given; ``located=True`` means the
+        caller already read it, None included). A destination other than the row's current SID carries ``_fresh`` =
+        (row, attempt): a fresh (M5) SID, or generation 0 as attempt 0."""
         client_id = self.composition.config.identity.managed_identity_client_id
-        changes = {"session_id": native_session_id(client.target, client_id, version=version)}
-        if version is not None:
-            changes["agent_version"] = version
-        return client.for_target(_target(client.target, **changes))
+        if version is None:
+            return client.for_target(_target(client.target, session_id=native_session_id(client.target, client_id)))
+        if not located:
+            row = self.bound_row(client)
+        sid, attempt = self.destination_session(client, version, row)
+        selected = client.for_target(_target(client.target, session_id=sid, agent_version=version))
+        selected._binding_row = row
+        if attempt is None and row is not None and sid != row.hosted_session_id:
+            # Generation 0 as the row's attempt 0 (``destination_session``): unusable, it raises the attempt too.
+            attempt = 0
+        if attempt is not None:
+            selected._fresh = (row, attempt)
+        return selected
+
+    def destination_session(self, client, version, row):
+        """(SID, attempt) of ``version``'s session for this Agent; attempt is None unless the SID is fresh (M5).
+
+        The one destination function every locator and follow step uses, so they never disagree (ADR-0009 M5):
+        - no binding row: generation 0, derived from the version (``native_session_id``), as before;
+        - the row's current SID was created on ``version`` and is not being abandoned: that SID;
+        - generation 0 of ``version`` is neither the current nor a previous SID and no attempt was raised for
+          ``version``: generation 0 (a first visit to a version keeps its old SID, so existing sessions and follows
+          read the same);
+        - otherwise a fresh SID from the current SID, ``version`` and the row's attempt (``fresh_session_id``): the
+          same version gets a new session (the drifted, retired or incompatible SID of the selected version)."""
+        client_id = self.composition.config.identity.managed_identity_client_id
+        generation0 = native_session_id(client.target, client_id, version=version)
+        if row is None:
+            return generation0, None
+        if version == row.created_agent_version and row.abandon is None:
+            return row.hosted_session_id, None
+        if generation0 != row.hosted_session_id and not row.earlier(generation0) and row.attempt(version) == 0:
+            # Attempt 0 of this version: a generation 0 that reads back retired (a previous SID the row trimmed or
+            # never recorded) raises the attempt, and the next destination is fresh (``candidate`` marks it).
+            return generation0, None
+        attempt = row.attempt(version)
+        return fresh_session_id(client.target, client_id, current_session_id=row.hosted_session_id,
+                                version=version, attempt=attempt), attempt
 
     def selected_version(self, client):
         from .behavior_agent_versions import current_hosted_version
@@ -379,14 +582,21 @@ class NativeSessions:
                 self._selector = (scope, version, started)
         return version
 
-    def _scoped(self, client, target):
+    def _scoped(self, client, target, *, row=None):
+        """``target`` is one of this API identity's sessions of ``client``'s Agent: a generation 0 SID (legacy or
+        version-derived), or, ADR-0009 phase 3, a SID the binding row names (current, previous, or the destination
+        it derives). The row is read only when the SID is not generation 0."""
         fields = ("project_endpoint", "agent_id", "agent_name", "agent_oid", "executor_id")
         client_id = self.composition.config.identity.managed_identity_client_id
-        if (any(getattr(client.target, name) != getattr(target, name) for name in fields)
-                or target.session_id not in {
-                    native_session_id(client.target, client_id),
-                    native_session_id(client.target, client_id, version=target.agent_version),
-                }):
+        if any(getattr(client.target, name) != getattr(target, name) for name in fields):
+            raise Problem(409, "NATIVE_SESSION_CHANGED", "the native locator is outside the original server scope")
+        if target.session_id in {native_session_id(client.target, client_id),
+                                 native_session_id(client.target, client_id, version=target.agent_version)}:
+            return client.for_target(target)
+        if row is None:
+            row = self.bound_row(client)
+        if row is None or not (target.session_id == row.hosted_session_id or row.earlier(target.session_id)
+                               or target.session_id == self.destination_session(client, target.agent_version, row)[0]):
             raise Problem(409, "NATIVE_SESSION_CHANGED", "the native locator is outside the original server scope")
         return client.for_target(target)
 
@@ -430,6 +640,9 @@ class NativeSessions:
             return self._current(client, checked_since)
 
     def _current(self, client, checked_since=None):
+        row = self.bound_row(client, checked_since if checked_since is not None else monotonic())
+        if row is not None:
+            return self._current_bound(client, checked_since, row)
         retry = self.reader_cached()
         while True:
             reader = self.reader(client, checked_since=checked_since)
@@ -452,6 +665,209 @@ class NativeSessions:
             self.following_candidate = reader.target
             raise Problem(409, "NATIVE_SESSION_CHANGED",
                           "the published version has not become the Agent's current environment")
+
+    def _selected_or_none(self, client, checked_since, stale_read=False):
+        """The selected version, or None when the selector is unreadable or names a version this API build does not
+        serve: with a binding row the send goes on by the row (ADR-0009 §1: the selector only picks the next new
+        session's version), so neither refuses it."""
+        try:
+            return self._checked_version(client, checked_since, stale_read=stale_read)
+        except Problem as error:
+            if error.body["error"]["code"] != "AGENT_VERSION_FOLLOWING":
+                raise
+            logging.getLogger(__name__).warning("NATIVE_SELECTOR_UNSERVED_BOUND code=%s", error.body["error"]["code"])
+            return None
+
+    def _located(self, client, row, checked_since, *, stale_read=False):
+        """(selected version or None, usable) before anything calls the row's SID; this invokes no session.
+
+        ADR-0009 §10 phase 0 guarantee: a SID the selector no longer picks is never called before the follow decides,
+        and a non-active one (404, failed, deleted, expired) never at all. The selector read and, on a cold process or
+        after ``READER_IDLE_SECONDS`` unused, the SID's platform metadata (``get_session``) run in parallel, so the
+        session call after them waits no longer than on main, where they ran one after the other. ``usable``: the row
+        has no abandon decision, the selector (when this build serves it) names the version the SID was created on,
+        and the metadata says active or idle; a 401/403/5xx metadata read is raised as on main."""
+        scope, sid = _scope(client.target), row.hosted_session_id
+        with self._reader_lock:
+            checked = self._row_checked
+        if checked is not None and checked[:2] == (scope, sid) and monotonic() - checked[2] < READER_IDLE_SECONDS:
+            selected, live = self._selected_or_none(client, checked_since, stale_read), True
+        else:
+            selecting = _LOCATE.submit(copy_context().run, self._selected_or_none, client, checked_since, stale_read)
+            try:
+                live = _read_platform_session(self._bound_client(client, row)) is not None
+            except _RetiredSession:
+                live = False
+            except BaseException:
+                wait([selecting])
+                raise
+            selected = selecting.result()
+        usable = live and row.abandon is None and (selected is None or selected == row.created_agent_version)
+        with self._reader_lock:
+            if live:
+                self._row_checked = (scope, sid, monotonic())
+            elif checked is not None and checked[:2] == (scope, sid):
+                self._row_checked = None
+        if not live:
+            logging.getLogger(__name__).warning("NATIVE_BINDING_SESSION_RETIRED session_id=%s invoked=False", sid)
+        return selected, usable
+
+    def _current_bound(self, client, checked_since, row):
+        """ADR-0009 §4 steps 1 and 3: the binding row names the Agent's current SID and its recorded actual version
+        V_rec; the session is called with expected = V_rec, never the selector's version. Before that call,
+        ``_located`` decides whether the retained submit-time follow (``_follow_before_admission``) runs instead,
+        without calling the SID: the selector names another version than the SID was created on, an abandon decision
+        is pending, or platform metadata says the SID is retired or gone. A compatible drift found on the session read
+        records the version and goes on (§4 step 6); a row behind Hosted's own record is repaired silently (M3)."""
+        selected, usable = self._located(client, row, checked_since)
+        if not usable:
+            self.following_candidate = self.candidate(
+                client, version=selected or row.created_agent_version, row=row, located=True).target
+            raise Problem(409, "NATIVE_SESSION_CHANGED",
+                          "the selected version is not yet the Agent's current environment; nothing was called")
+        try:
+            reader, state, row = self._bound_state(client, self._bound_client(client, row), row)
+        except Problem as failure:
+            if self.binding_moved(failure) and failure.body["error"]["code"] != "NATIVE_SESSION_CHANGED":
+                raise Problem(409, "NATIVE_SESSION_CHANGED",
+                              "the Agent's recorded session did not answer as its environment") from None
+            raise
+        self._remember_state(reader, state)
+        self.following_candidate = None
+        self.binding = reader.target
+        return reader
+
+    def _bound_state(self, client, reader, row):
+        """One session read by the row, with ADR-0009 §4's drift and divergence handling (no RID is involved, so
+        nothing can run twice): returns (client, state, row)."""
+        try:
+            state = self._state(reader)
+        except Problem as error:
+            drifted = self._drifted(reader, error, row)
+            if drifted is None:
+                raise
+            reader, row, source = drifted
+            state = self._state(reader)
+            if source == "metadata-active":
+                # The VM just accepted expected = V_obs: only now is the metadata's version a fact (§4 step 6).
+                row = self._observe_drift(reader, row, source)
+        if state.hosted_session_id != reader.target.session_id:
+            repaired = self._repair(reader, state, row)
+            if repaired is None:
+                raise Problem(409, "NATIVE_SESSION_CHANGED", "the Agent record names another session")
+            reader, row = repaired
+            state = self._state(reader)
+            if state.hosted_session_id != reader.target.session_id:
+                raise Problem(409, "NATIVE_SESSION_CHANGED", "the Agent record names another session")
+        return reader, state, row
+
+    def _observe_drift(self, reader, row, source):
+        """The drift CAS of ADR-0009 §4 step 6 for ``reader``'s SID and version; the written row (or ``row``)."""
+        target = reader.target
+        written = self._binding("observe", lambda store: store.record_observed(
+            target.agent_id, hosted_session_id=target.session_id, agent_version=target.agent_version, source=source))
+        if written is None or written.hosted_session_id != target.session_id:
+            return row
+        self._keep_row(reader, written)
+        reader._binding_row = written
+        return written
+
+    def _version_supported(self, client, version):
+        """ADR-0009 §3: ``version``'s definition enables a supported profile (one ``get_version`` read, only on the
+        drift path). An unreadable definition decides nothing, so it counts as supported."""
+        try:
+            profile = _native_profile(client.for_target(_target(client.target, agent_version=version)))
+        except Exception as error:  # noqa: BLE001 - an unreadable definition decides nothing
+            code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
+            logging.getLogger(__name__).warning("NATIVE_VERSION_PROFILE_UNREAD code=%s", code)
+            return True
+        return profile in SUPPORTED_STATE_PROFILES
+
+    def observed_version(self, reader, error):
+        """(V_obs, source) behind a ``NATIVE_SESSION_CHANGED`` from ``reader``'s SID, or None when it is not a version
+        refusal. A newer image names it (``actual_version``, a VM fact); an older one only lets the API read the
+        session's metadata (it just answered, so it is active), a guess until the VM accepts it as expected."""
+        detail = error.body["error"]
+        if error.status != 409 or detail["code"] != "NATIVE_SESSION_CHANGED" or detail.get("reason") == "replaced":
+            return None
+        actual = detail.get("actual_version")
+        if actual is not None:
+            return actual, "vm"
+        if detail.get("not_dispatched") is True and detail.get("reason") is None:
+            # Hosted's admission check (its Agent record names another SID), not a version refusal.
+            return reader.target.agent_version, "vm"
+        try:
+            metadata = _session_metadata(reader)
+        except Exception as unread:  # noqa: BLE001 - an unread version is "not known", never a new failure
+            code = unread.body["error"]["code"] if isinstance(unread, Problem) else type(unread).__name__
+            logging.getLogger(__name__).warning("NATIVE_VERSION_METADATA_UNREAD code=%s", code)
+            return None
+        if metadata is None or metadata.status != "active":
+            return None
+        return metadata.version_indicator.agent_version, "metadata-active"
+
+    def _drifted(self, reader, error, row):
+        """(client at V_obs, row, source) when ``error`` is a compatible same-SID drift; None otherwise. A VM-reported
+        version is recorded now; a metadata guess only after the VM accepts it (the caller's next call). An
+        incompatible one is logged and marked (ADR-0009 §9 phase 3: no refusal is added; the caller's follow handles
+        it) and gives None."""
+        observed = self.observed_version(reader, error)
+        if observed is None or observed[0] == reader.target.agent_version:
+            return None
+        version, source = observed
+        moved = reader.for_target(_target(reader.target, agent_version=version))
+        moved._binding_row = row
+        if source == "vm":
+            row = self._observe_drift(moved, row, source)
+        if not self._version_supported(reader, version):
+            self.guard.mark_incompatible(reader.target.agent_id, reader.target.session_id)
+            logging.getLogger(__name__).warning(
+                "NATIVE_SESSION_CALL_INCOMPATIBLE operation=drift session_id=%s version=%s enforced=False",
+                reader.target.session_id, version)
+            return None
+        return moved, row, source
+
+    def _repair(self, reader, state, row):
+        """ADR-0009 §4 step 6 "inconsistent" / M3: Hosted's Agent record already names another SID with a committed
+        (``ready``) environment the binding row has not caught up with. ``record_switch`` (idempotent) writes it, with
+        the switch notice of phase 2c (§8), and the new SID becomes the locator: (client, row), the row being the
+        post-switch row the response's notice comes from, or None when the state confirms no committed switch."""
+        environment = state.environment
+        if (environment is None or environment.state != "ready"
+                or environment.hosted_session_id != state.hosted_session_id
+                or environment.agent_id != reader.target.agent_id):
+            return None
+        logging.getLogger(__name__).warning("NATIVE_BINDING_DIVERGED session_id=%s binding_session_id=%s repaired=True",
+                                            environment.hosted_session_id, reader.target.session_id)
+        written = self._binding("switch", lambda store: store.record_switch(reader.target.agent_id, environment))
+        if written is None or written.hosted_session_id != environment.hosted_session_id:
+            return None
+        self._keep_row(reader, written)
+        return self._bound_client(reader, written), written
+
+    def relocate(self, client, error):
+        """After a refusal from the row's SID: the client to send the same command to once, or None. A compatible
+        drift goes to V_obs; a stale row (``replaced``, or V_obs = V_rec) is repaired from that SID's own session state
+        (``session_read`` is not a record read, so a replaced session still answers it; it is active, it just
+        answered). Never raises: the original refusal stands when nothing is confirmed."""
+        row = getattr(client, "_binding_row", None)
+        if row is None:
+            return None
+        try:
+            drifted = self._drifted(client, error, row)
+            if drifted is not None:
+                return drifted[0]
+            observed = self.observed_version(client, error)
+            detail = error.body["error"]
+            if not (error.status == 409 and detail["code"] == "NATIVE_SESSION_CHANGED"
+                    and (detail.get("reason") == "replaced" or observed is not None
+                         and observed[0] == client.target.agent_version)):
+                return None
+            repaired = self._repair(client, self._state(client), row)
+            return None if repaired is None else repaired[0]
+        except Problem as unconfirmed:
+            logging.getLogger(__name__).warning("NATIVE_RELOCATE_UNCONFIRMED code=%s", unconfirmed.body["error"]["code"])
+            return None
 
     def turn_session(self, client):
         """The session the Agent record last named, while platform metadata says it is active; else None.
@@ -499,7 +915,21 @@ class NativeSessions:
         started after ``checked_since`` (default ``SELECTOR_CHECK_SECONDS`` ago, which only reads may use; work
         delivery passes its own start). A kept reader of another version is dropped before anything is invoked.
         ``stale_read`` (reads only): while the selector cannot be read, a version it confirmed within
-        ``SELECTOR_STALE_READ_SECONDS`` is kept; otherwise ``SelectorUnreadable`` is raised and the reader stays."""
+        ``SELECTOR_STALE_READ_SECONDS`` is kept; otherwise ``SelectorUnreadable`` is raised and the reader stays.
+
+        ADR-0009 phase 3: with a binding row the row is the locator (its current SID at V_rec), read at most once per
+        ``SELECTOR_CHECK_SECONDS`` for reads and in-request for ``checked_since``, under the same selector and metadata
+        checks as main's reader (``_located``, ADR-0009 §10). When the selector moved or an abandon decision is
+        pending, the selected version's destination is read only if it exists, as on main; the row's SID never is."""
+        row = self.bound_row(client, checked_since)
+        if row is not None:
+            selected, usable = self._located(client, row, checked_since, stale_read=stale_read)
+            if usable:
+                return self._bound_client(client, row)
+            if row.abandon is None and selected in {None, row.created_agent_version}:
+                raise Problem(409, "NATIVE_SESSION_CHANGED",
+                              "the Agent's recorded session is retired; this read invokes no session")
+            return self._platform_reader(client, version=selected or row.created_agent_version)
         scope = _scope(client.target)
         with self._reader_lock:
             cached, generation = self._reader, self._reader_generation
@@ -538,17 +968,21 @@ class NativeSessions:
 
     def environment_view(self, client):
         version = self.selected_version(client)
-        destination = self.candidate(client, version=version)
+        row = self.bound_row(client, monotonic())
+        destination = self.candidate(client, version=version, row=row, located=True)
         observed, truncated = _metadata_sessions(client)
         actual = _session_metadata(destination)
         observed.pop(destination.target.session_id, None)
         item = None if actual is None else _metadata_record(actual)
         if item is not None:
             observed[item.hosted_session_id] = item
+        # ADR-0009 §1: the row's current SID created on the selected version needs no follow when it woke on another
+        # version (a runtime fact the send records and runs on); only its status matters.
+        current = row is not None and destination.target.session_id == row.hosted_session_id
         return NativeEnvironmentMetadata(
             agent_id=client.target.agent_id, hosted_session_id=destination.target.session_id,
             hosted_agent_version=version, observed_sessions=tuple(observed.values()), truncated=truncated,
-            state="unverified" if item is not None and item.hosted_agent_version == version
+            state="unverified" if item is not None and (current or item.hosted_agent_version == version)
             and item.status in {"active", "idle"} else "needs_follow",
         )
 
@@ -557,7 +991,7 @@ class NativeSessions:
         if state.environment != value or state.hosted_session_id != value.hosted_session_id:
             raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original environment result did not read back")
         self._remember_state(client, state)
-        return self._switched(client, value)
+        return self._switched_and_checked(client, value)
 
     def observe_environment(self, client, command):
         reader = self.candidate(client, version=command.expected_agent_version)
@@ -628,7 +1062,12 @@ class NativeSessions:
         if version != expected_version:
             raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the server-selected version changed")
         destination = self.candidate(client, version=version)
-        actual = _read_platform_session(destination)
+        fresh = getattr(destination, "_fresh", None)
+        try:
+            actual = _read_platform_session(destination)
+        except _RetiredSession:
+            self._raise_attempt(destination, fresh)
+            raise
         if actual is None:
             _require_native_version(destination)
             if destination.target.session_id in self.environment_creates:
@@ -653,10 +1092,26 @@ class NativeSessions:
                 actual = _read_platform_session(destination)
         if actual is None:
             raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original version session create has no confirmed readback")
-        if actual.agent_version != version:
+        row = getattr(destination, "_binding_row", None)
+        if actual.agent_version != version and not (row is not None and row.hosted_session_id == actual.session_id):
+            # The Agent's own current SID may have woken on another version (a runtime fact, ADR-0009 §1); any other
+            # destination must be the version it was created on. A fresh one that is not gets the next attempt.
+            self._raise_attempt(destination, fresh)
             raise Problem(409, "NATIVE_SESSION_CHANGED", "the original version session did not read back")
         self.following_candidate = destination.target
         return destination
+
+    def _raise_attempt(self, destination, fresh):
+        """ADR-0009 M5: a fresh destination that is retired or woke on another version is never reused; the next
+        destination for this version takes the next attempt (the row's ``fresh``, CAS)."""
+        if fresh is None:
+            return
+        row, attempt = fresh
+        target = destination.target
+        self._binding("fresh", lambda store: store.raise_attempt(
+            target.agent_id, hosted_session_id=row.hosted_session_id, agent_version=target.agent_version,
+            attempt=attempt))
+        self.forget()
 
     def retarget(self, client, command, *, before_send):
         from .behavior_native_turn_api import NativeTurnGateway
@@ -677,6 +1132,8 @@ class NativeSessions:
             return self.follow(client, command, before_send=before_send)
 
     def follow(self, client, command, *, before_send):
+        """Only the automatic ``advance`` (``_deciding_abandon``, set under ``self.lock``) may decide an ADR-0009 §7a
+        abandon-source switch from metadata; every other caller only carries out a decision already written."""
         from .behavior_native_turn_api import NativeTurnGateway
         from .behavior_session_files import FollowFiles
         from .native_files_wire import FILES_PROFILE
@@ -690,10 +1147,16 @@ class NativeSessions:
                     or existing.previous_hosted_session_id == command.expected_session_id)):
                 self._remember_state(destination, state)
                 # A rerun after a crash between the commit and the binding write completes that write.
-                return self._switched(destination, existing)
+                return self._switched_and_checked(destination, existing)
             current = self._current_environment(destination, state, command)
             if current is not None:
                 return current
+            found = self._binding_row(client.target.agent_id)
+            switched = self._abandon_source(client, command, destination, state, before_send,
+                                            decide=self._deciding_abandon,
+                                            found=found)
+            if switched is not None:
+                return switched
             omitted = state.following
             confirmed_omission = (omitted is not None and omitted.request_id == command.request_id
                                   and omitted.hosted_session_id == destination.target.session_id
@@ -704,9 +1167,10 @@ class NativeSessions:
             internal = NativeSessionFollow(
                 request_id=command.request_id,
                 expected_session_id=command.expected_session_id or state.hosted_session_id,
-                expected_etag=state.etag, stage="prepare", idle_only=command.idle_only, files_required=True)
+                expected_etag=state.etag, stage="prepare", idle_only=command.idle_only, files_required=True,
+                settled_session_ids=self._settled(found, destination))
             try:
-                value, _ = NativeTurnGateway._invoke(destination, internal)
+                value, _ = self._follow_invoke(destination, internal)
             except Problem as error:
                 if (not command.idle_only or error.status != 409
                         or error.body["error"]["code"] != "NATIVE_ENVIRONMENT_CONFLICT"
@@ -722,13 +1186,13 @@ class NativeSessions:
                     raise
                 before_send()
                 internal = internal.model_copy(update={"expected_etag": observed.etag})
-                value, _ = NativeTurnGateway._invoke(destination, internal)
+                value, _ = self._follow_invoke(destination, internal)
             if value.state == "ready":
                 return self._confirm_environment(destination, value)
             if value.reason == "files_pending":
                 FollowFiles(destination, value, before_send).copy_step()
                 before_send()
-                value, _ = NativeTurnGateway._invoke(destination, internal)
+                value, _ = self._follow_invoke(destination, internal)
             if value.reason != "source_stop_required":
                 return value
             skip_files = value.files_migrated is False and value.files_skip_request_id is not None
@@ -781,7 +1245,7 @@ class NativeSessions:
             if files is not None and not files.stopped_step():
                 return value.model_copy(update={"reason": "files_pending"})
             before_send()
-            value, _ = NativeTurnGateway._invoke(destination, internal.model_copy(update={"stage": "commit"}))
+            value, _ = self._follow_invoke(destination, internal.model_copy(update={"stage": "commit"}))
             if value.state == "ready":
                 return self._confirm_environment(destination, value)
             return value
@@ -810,11 +1274,220 @@ class NativeSessions:
             confirmation="do-not-transfer-workspace-files")
 
     def advance(self, client, command, *, before_send):
+        """The automatic follow (deploy-time ``follow_all`` and the submit-time follow). A source that can not be
+        reached is abandoned up front (ADR-0009 §7a (i)/(ii)); a drifted idle source is abandoned only once the follow
+        is left waiting on its own unfinished work (§7a (iii))."""
+        with self._changing():
+            current = self._same_version_decision(client, command)
+            if current is not None:
+                return current
+            try:
+                value = self._advance(client, command, before_send=before_send)
+            except Problem as error:
+                detail = error.body["error"]
+                if (detail.get("files_check") or {}).get("category") not in _WORK_WAIT_CHECKS:
+                    raise
+                switched = self._abandon_waiting(client, command, before_send)
+                if switched is None:
+                    raise
+                return switched
+            if isinstance(value, NativeEnvironmentView) and value.state == "pending" and value.reason in _WORK_WAITS:
+                switched = self._abandon_waiting(client, command, before_send)
+                if switched is not None:
+                    return switched
+            return value
+
+    def _same_version_decision(self, client, command):
+        """ADR-0009 M5 with §7a (i)/(ii): the binding row's current SID was created on the selected version, so no
+        follow is due, but the SID itself may be unusable (retired, or incompatible and idle). The abandon decision is
+        made from metadata (``get_session``, no invocation) *before* any destination exists; once written, the
+        destination is a fresh SID of the same version (``destination_session``) and ``follow`` carries it out
+        (None: go on). Without a decision there is nothing to follow, and the ``current`` view is returned without
+        calling any session: the Agent's own SID is the selected version's session (calling it as a "destination"
+        could wake, or recreate, a retired SID)."""
+        found = self._binding_row(client.target.agent_id)
+        row = None if found is None else found[1]
+        if (row is None or row.abandon is not None or row.created_agent_version != command.expected_agent_version
+                or command.expected_session_id not in {None, row.hosted_session_id}):
+            return None
+        source = client.for_target(_target(client.target, session_id=row.hosted_session_id,
+                                           agent_version=row.observed.agent_version))
+        if self._abandon_decision(found[0], row, source, waiting=False) is not None:
+            self.forget()
+            return None
+        return NativeEnvironmentView(
+            agent_id=client.target.agent_id, request_id=command.request_id,
+            previous_hosted_session_id=row.hosted_session_id, previous_agent_version=row.created_agent_version,
+            hosted_session_id=row.hosted_session_id, hosted_agent_version=row.created_agent_version, state="current")
+
+    def _abandon_waiting(self, client, command, before_send):
+        destination = self._destination(client, command.expected_agent_version, before_send)
+        state = self._state(destination)
+        return self._abandon_source(client, command, destination, state, before_send, decide=True, waiting=True,
+                                    found=self._binding_row(client.target.agent_id))
+
+    def _follow_invoke(self, destination, command):
+        """A follow (or files-omission) invocation. ``settled_session_ids`` (ADR-0009 §7a (i)) is new: an older
+        destination image rejects the unknown field (422 ``NATIVE_REQUEST_INVALID``, before it reads or writes
+        anything), so the command is sent once more without it and the field is left out for that destination from
+        then on; that image then waits for those receipts, as it always did."""
+        from .behavior_native_turn_api import NativeTurnGateway
+
+        sid = destination.target.session_id
+        plain = _without_settled(command)
+        if plain is command or sid in self._settled_unsupported:
+            return NativeTurnGateway._invoke(destination, plain)
+        try:
+            return NativeTurnGateway._invoke(destination, command)
+        except Problem as error:
+            if error.status != 422 or error.body["error"]["code"] != "NATIVE_REQUEST_INVALID":
+                raise
+        self._settled_unsupported.add(sid)
+        logging.getLogger(__name__).warning("NATIVE_ENVIRONMENT_SETTLED_UNSUPPORTED session_id=%s", sid)
+        return NativeTurnGateway._invoke(destination, plain)
+
+    @staticmethod
+    def _settled(found, destination):
+        """ADR-0009 §7a (i): the binding row's previous SIDs; a follow never waits for their unfinished receipts."""
+        row = None if found is None else found[1]
+        if row is None:
+            return ()
+        return tuple(item.hosted_session_id for item in row.previous_sessions
+                     if item.hosted_session_id != destination.target.session_id)
+
+    def _binding_row(self, agent_id):
+        """(store, row) for the abandon decision; None when the Table can not be read (nothing is decided then)."""
+        try:
+            store = binding_store(self.composition)
+            return store, store.read(agent_id)
+        except Exception as error:  # noqa: BLE001 - an unreadable row only means no abandon decision
+            code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
+            logging.getLogger(__name__).warning("NATIVE_BINDING_UNRECORDED operation=abandon code=%s", code)
+            return None
+
+    def _source_supported(self, source, row):
+        """ADR-0009 §3 before any call: the binding row's recorded profile and the source version's definition
+        (``get_version``, no session call). An unreadable definition says nothing: only the row decides then."""
+        if row is not None and row.hosted_session_id == source.target.session_id and not row.supported():
+            self.guard.mark_incompatible(source.target.agent_id, source.target.session_id)
+            return False
+        try:
+            profile = _native_profile(source)
+        except Exception as error:  # noqa: BLE001 - an unreadable definition decides nothing
+            code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
+            logging.getLogger(__name__).warning("NATIVE_ENVIRONMENT_SOURCE_PROFILE_UNREAD code=%s", code)
+            return True
+        if profile in SUPPORTED_STATE_PROFILES:
+            return True
+        self.guard.mark_incompatible(source.target.agent_id, source.target.session_id)
+        return False
+
+    def _idle_timeout(self, source):
+        try:
+            return source.session_idle_timeout()
+        except Exception:  # noqa: BLE001 - the documented maximum stands in for an unreadable setting
+            return _IDLE_TIMEOUT_FALLBACK_SECONDS
+
+    def _observe_active(self, source, status, now):
+        """ADR-0009 §7a (h)/(l), observation and logging only (Neal 2026-10-13): an active incompatible source never
+        causes a user-visible refusal, and the ADR revision makes it impossible by deploy ordering (expand/contract).
+        Nothing is decided or refused here; the existing follow goes on. This is the integration point if that
+        revision ever needs more: past the version's idle timeout the dedicated log names the source once."""
+        sid = source.target.session_id
+        logging.getLogger(__name__).warning(
+            "NATIVE_ENVIRONMENT_SOURCE_INCOMPATIBLE_ACTIVE session_id=%s version=%s status=%s",
+            sid, source.target.agent_version, status)
+        first = self._active_seen.setdefault(sid, now)
+        if sid not in self._overdue_logged and now - first > self._idle_timeout(source):
+            self._overdue_logged.add(sid)
+            logging.getLogger(__name__).warning(
+                "NATIVE_ENVIRONMENT_SOURCE_ACTIVE_OVERDUE session_id=%s version=%s waited_seconds=%d",
+                sid, source.target.agent_version, now - first)
+
+    def _abandon_decision(self, store, row, source, *, waiting):
+        """ADR-0009 §7a applicability from platform metadata (``get_session``, never an invocation). Returns the
+        written decision, or None (the existing follow goes on)."""
+        sid, agent_id = source.target.session_id, source.target.agent_id
+        try:
+            metadata = _session_metadata(source)
+        except Problem as error:
+            # 5xx, timeout, 401/403 or an invalid record: not 404 or retired (ADR-0009 §9); nothing is decided.
+            logging.getLogger(__name__).warning("NATIVE_ENVIRONMENT_SOURCE_UNREAD code=%s", error.body["error"]["code"])
+            return None
+        status = "missing" if metadata is None else metadata.status
+        now = monotonic()
+        if status not in _RETIRED:
+            self._retired_seen.pop(sid, None)
+        if status != "active":
+            self._active_seen.pop(sid, None)
+        if not self._source_supported(source, row):
+            if status not in _RETIRED and status != "idle":
+                self._observe_active(source, status, now)
+                return None
+            basis = "incompatible"
+        elif status in _RETIRED:
+            first = self._retired_seen.setdefault(sid, now)
+            if now - first > RETIRED_PAIR_SECONDS:
+                self._retired_seen[sid] = first = now
+            if now - first < RETIRED_CONFIRM_SECONDS:
+                logging.getLogger(__name__).warning(
+                    "NATIVE_ENVIRONMENT_SOURCE_RETIRED_UNCONFIRMED session_id=%s status=%s", sid, status)
+                return None
+            basis = "retired"
+        elif (waiting and status == "idle" and row is not None and row.hosted_session_id == sid and row.drift):
+            basis = "drifted"
+        else:
+            return None
+        return store.decide_abandon(agent_id, hosted_session_id=sid, basis=basis, source_status=status,
+                                    created_agent_version=source.target.agent_version)
+
+    def _abandon_source(self, client, command, destination, state, before_send, *, decide, found, waiting=False):
+        """ADR-0009 §7a: switch to ``destination`` without invoking, reading from or stopping the Agent's current
+        session. A decision already in the binding row is carried out by any caller; a new one only when ``decide``.
+        ``found``: ``_binding_row``'s (store, row). None: the existing follow goes on."""
+        from .behavior_native_turn_api import NativeTurnGateway
+
+        sid = state.hosted_session_id
+        if sid == destination.target.session_id or command.expected_session_id not in {None, sid}:
+            return None
+        environment = state.environment
+        if environment is not None:
+            version = environment.previous_agent_version if environment.state == "pending" else environment.hosted_agent_version
+        elif state.preparation is not None:
+            version = state.preparation.hosted_agent_version
+        else:
+            return None
+        source = client.for_target(_target(client.target, session_id=sid, agent_version=version))
+        if found is None:
+            return None
+        store, row = found
+        decision = row.abandon if row is not None and row.abandon is not None and row.hosted_session_id == sid else None
+        if decision is None:
+            if not decide:
+                return None
+            decision = self._abandon_decision(store, row, source, waiting=waiting)
+            if decision is None:
+                return None
+        if decision.basis == "incompatible":
+            self.guard.mark_incompatible(client.target.agent_id, sid)
+        before_send()
+        value, _ = NativeTurnGateway._invoke(destination, NativeSessionAbandon(
+            request_id=abandon_request_id(client.target.agent_id, sid, destination.target.session_id),
+            expected_session_id=sid, expected_etag=state.etag, source_status=decision.source_status))
+        if value.state != "ready":
+            raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original abandon-source switch did not commit")
+        return self._confirm_environment(destination, value)
+
+    def _advance(self, client, command, *, before_send):
         from .native_files_wire import FILES_ERRORS
 
         with self._changing():
+            deciding, self._deciding_abandon = self._deciding_abandon, True
             try:
-                return self.follow(client, command, before_send=before_send)
+                try:
+                    return self.follow(client, command, before_send=before_send)
+                finally:
+                    self._deciding_abandon = deciding
             except Problem as error:
                 code = error.body["error"]["code"]
                 if code not in FILES_ERRORS | {"NATIVE_SESSION_CHANGED", "NATIVE_ENVIRONMENT_CONFLICT"}:
@@ -1019,7 +1692,8 @@ class NativeSessions:
                 request_id=command.request_id,
                 follow=NativeSessionFollow(
                     request_id=follow.request_id, expected_session_id=source_sid, expected_etag=state.etag,
-                    stage="prepare", idle_only=follow.idle_only, files_required=True),
+                    stage="prepare", idle_only=follow.idle_only, files_required=True,
+                    settled_session_ids=self._settled(self._binding_row(client.target.agent_id), destination)),
                 stage="read" if reconcile or already_ready else "check" if preview else "activate" if resume else "confirm",
                 missing=missing,
                 pending_request_id=pending_request_id, pending_session_id=pending_session_id,
@@ -1033,14 +1707,14 @@ class NativeSessions:
                 return internal.model_copy(update={"missing": reason})
 
             if internal.stage == "activate":
-                observed, _ = NativeTurnGateway._invoke(
+                observed, _ = self._follow_invoke(
                     destination, internal.model_copy(update={"stage": "read", "missing": None}))
                 if observed.files_migrated is False and observed.files_skip_request_id == command.request_id:
                     return self.follow(client, follow, before_send=before_send)
                 internal = original_reason(observed)
             if internal.stage == "confirm":
                 try:
-                    checked, _ = NativeTurnGateway._invoke(destination, internal.model_copy(update={"stage": "check"}))
+                    checked, _ = self._follow_invoke(destination, internal.model_copy(update={"stage": "check"}))
                     if checked.files_migrated is False and checked.files_skip_request_id == command.request_id:
                         return self.follow(client, follow, before_send=before_send)
                     if checked.reason == "scan_pending":
@@ -1061,7 +1735,7 @@ class NativeSessions:
                                                      files_check=error.body["error"].get("files_check")) from None
                     raise
                 before_send()
-            value, _ = NativeTurnGateway._invoke(destination, internal)
+            value, _ = self._follow_invoke(destination, internal)
             if observe_only:
                 return value
             if reconcile:
@@ -1085,6 +1759,11 @@ class NativeSessions:
             version = self.selected_version(client)
             selected = self.candidate(client)
             if self.prepared is not None:
+                self.current(client)
+                return self.prepared
+            if self.bound_row(client) is not None:
+                # ADR-0009 phase 3: an Agent with a binding row was prepared; the row locates its session, never
+                # the version listing (``_latest_version_reader``).
                 self.current(client)
                 return self.prepared
             version_reader = self.candidate(client, version=version)

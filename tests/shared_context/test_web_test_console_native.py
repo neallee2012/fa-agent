@@ -1247,6 +1247,60 @@ def test_the_read_that_sees_the_end_closes_this_turn_cards_once(native_console, 
     assert reads == []
 
 
+def _journal_writes(c, monkeypatch):
+    journal, writes, commits = c.ui.console.journal, [], []
+    for name in ("begin", "finish"):
+        original = getattr(journal, name)
+        monkeypatch.setattr(journal, name, lambda task, phase, *a, _o=original, _n=name, **k: (
+            writes.append((_n, task, phase)), _o(task, phase, *a, **k))[1])
+    # In remote mode each journal commit uploads every journal to Blob (remote.py _keep).
+    monkeypatch.setattr(Journal, "after_commit", lambda path: commits.append(path))
+    return writes, commits
+
+
+# Audit #3 (2026-10-14): every /status poll (1 s, 3 s with push) rewrote the same native-read row; in remote mode each
+# write re-packed and uploaded all journals, and a failed upload stops the replica mid-turn.
+def test_polling_an_unchanged_receipt_writes_and_uploads_nothing(native_console, monkeypatch):
+    c = native_console
+    draft = first(c)
+    assert send(c, draft).status_code == 200
+    rid = draft["request_id"]
+    status = lambda: c.ui.client.get("/api/instructions/" + rid + "/status")
+    assert status().status_code == 200
+    kept = c.ui.console.journal.get(rid, "native-read")
+    writes, commits = _journal_writes(c, monkeypatch)
+    for _ in range(3):
+        assert status().status_code == 200
+    assert writes == [] and commits == []
+    assert c.ui.console.journal.get(rid, "native-read") == kept
+    c.api.remote.completed(rid)
+    assert status().status_code == 200
+    assert [w for w in writes if w[2] == "native-read"] == [("finish", rid, "native-read")]
+    assert c.ui.console.journal.get(rid, "native-read")["native_receipt"]["status"] == "completed"
+
+
+# Audit #12 (2026-10-14): each poll re-read every message of the conversation from the journal (up to four SQLite reads
+# and JSON parses per message) although the receipts were already held in memory.
+def test_a_second_poll_reads_no_journal_rows_for_messages_already_held(native_console, monkeypatch):
+    c = native_console
+    draft = first(c)
+    assert send(c, draft).status_code == 200
+    rid, thread = draft["request_id"], draft["thread_id"]
+    c.api.remote.completed(rid)
+    before = progress(c, thread)
+    assert before.status_code == 200, before.text
+    native, journal = c.ui.console.native_instructions, c.ui.console.journal
+    held = (dict(native.receipts), dict(native.request_threads))
+    reads, original = [], journal.get
+    monkeypatch.setattr(journal, "get", lambda task, phase: (reads.append((task, phase)), original(task, phase))[1])
+    native._saved(thread)
+    assert reads == []
+    assert (native.receipts, native.request_threads) == held
+    after = progress(c, thread)
+    assert after.status_code == 200, after.text
+    assert after.json()["tasks"] == before.json()["tasks"] and after.json()["composer"] == before.json()["composer"]
+
+
 def _single_page(c, rid):
     remote = c.api.remote
     remote.completed(rid)
@@ -1699,3 +1753,120 @@ def test_closed_finished_turn_approvals_are_not_reread(native_console, monkeypat
     read.clear()
     hitl.refresh("t", "token", only="running")
     assert read == ["running"]
+
+
+def with_notice(notice):
+    """The API's answers (a submit's receipt, a receipt read, a status read) as an API that adds ``notice`` sends them."""
+
+    def mutate(request, response):
+        path = request.url.path
+        if response.status_code >= 300 or not (path.endswith("/submit") or "/requests/" in path):
+            return response
+        response.read()
+        body = json.loads(response.content)
+        receipt = body.get("receipt") if path.endswith("/status") else body
+        if not isinstance(receipt, dict) or "submit_digest" not in receipt:
+            return response
+        receipt["environment_notice"] = notice
+        headers = {key: value for key, value in response.headers.items() if key.lower() != "content-length"}
+        return httpx.Response(response.status_code, headers=headers, content=json.dumps(body).encode("utf-8"))
+
+    return mutate
+
+
+def test_a_section_8_notice_on_the_submit_answer_is_projected_for_the_page(native_console):
+    c = native_console
+    draft = first(c)
+    c.mutate[0] = with_notice({"kind": "environment_switched_without_files"})
+    accepted = send(c, draft)
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["task"]["native_receipt"]["environment_notice"] == {
+        "kind": "environment_switched_without_files"}
+
+
+@pytest.mark.parametrize("notice", [
+    {"kind": "environment_rolled_back", "to_version": "39"},  # a kind an API released after this workbench adds
+    {"kind": "platform_version_changed", "from_version": "41", "to_version": "40", "reason": "later field"},
+])
+def test_a_notice_this_workbench_does_not_know_is_ignored_and_never_breaks_the_turn(native_console, notice):
+    c = native_console
+    draft = first(c)
+    c.mutate[0] = with_notice(notice)
+    accepted = send(c, draft)
+    assert accepted.status_code == 200, accepted.text  # not 502 NATIVE_STATE_INVALID
+    assert "environment_notice" not in accepted.json()["task"]["native_receipt"]
+    c.api.remote.completed(draft["request_id"])
+    update = progress(c, draft["thread_id"])  # receipt and status reads carry it too
+    assert update.status_code == 200, update.text
+    task = next(item for item in update.json()["tasks"] if item["task_id"] == draft["request_id"])
+    assert task["native_receipt"]["status"] == "completed" and "environment_notice" not in task["native_receipt"]
+    assert task["reply"]["data"]["text"] == c.api.remote.text
+
+
+def test_a_receipt_whose_own_material_is_wrong_is_still_refused(native_console):
+    c = native_console
+    draft = first(c)
+
+    def broken(request, response):
+        if not request.url.path.endswith("/submit") or response.status_code >= 300:
+            return response
+        response.read()
+        body = json.loads(response.content)
+        body["environment_notice"] = {"kind": "environment_rolled_back"}
+        body["unexpected"] = True  # tolerance covers the notice only; the receipt stays strict
+        return httpx.Response(response.status_code, content=json.dumps(body).encode("utf-8"),
+                              headers={"content-type": "application/json"})
+
+    c.mutate[0] = broken
+    refused = send(c, draft)
+    assert refused.status_code == 502 and refused.json()["error"]["code"] == "NATIVE_STATE_INVALID"
+
+
+
+def switched(c, monkeypatch):
+    """The API's binding row holds an undelivered "moved without its work files" notice for the Agent (ADR-0009 §8)."""
+    from conftest import InMemoryRepository
+    from shared_context import native_binding
+    from shared_context.behavior_native_turn_wire import NativeEnvironmentView
+
+    repository, target = InMemoryRepository(), c.api.remote.target
+    monkeypatch.setattr(native_binding, "TableRepository", lambda _client: repository)
+    store = native_binding.binding_store(c.api.composition)
+    store.record_switch(target.agent_id, NativeEnvironmentView(
+        agent_id=target.agent_id, request_id="follow-switch", state="ready", previous_hosted_session_id="older",
+        previous_agent_version="40", hosted_session_id=target.session_id, hosted_agent_version=target.agent_version,
+        files_migrated=False, files_skip_request_id="skip"))
+    return lambda: store.read(target.agent_id).switch_notice
+
+
+def test_this_bridge_says_it_knows_the_new_notice_kinds_and_gets_the_switch_notice_once(native_console, monkeypatch):
+    c = native_console
+    pending = switched(c, monkeypatch)
+    seen = []
+    c.before[0] = lambda request: seen.append(request.headers.get("X-FA-Notice-Kinds"))
+    draft = first(c)
+    accepted = send(c, draft)
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["task"]["native_receipt"]["environment_notice"] == {
+        "kind": "environment_switched_without_files"}
+    assert seen and set(seen) == {"2"}  # on every API request of this bridge
+    assert pending() is None  # shown once: the API cleared it after the answer was written
+
+
+def test_a_bridge_deployed_before_the_new_kinds_never_gets_them_and_nothing_is_cleared(native_console, monkeypatch):
+    """A deploy updates the API before the console: the older bridge sends no header and decodes strictly."""
+    from web_test_console import native
+
+    c = native_console
+    pending = switched(c, monkeypatch)
+    monkeypatch.setattr(native, "_without_unknown_notice", lambda _receipt: False)  # the older, strict decode
+
+    def older(request):
+        del request.headers["X-FA-Notice-Kinds"]
+
+    c.before[0] = older
+    draft = first(c)
+    accepted = send(c, draft)
+    assert accepted.status_code == 200, accepted.text  # not 502 NATIVE_STATE_INVALID
+    assert "environment_notice" not in accepted.json()["task"]["native_receipt"]
+    assert pending() == "without_files"  # still pending for the updated console's next answer

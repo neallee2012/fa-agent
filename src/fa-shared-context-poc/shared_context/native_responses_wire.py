@@ -10,6 +10,16 @@ from .behavior_wire import Digest, Identifier, WireModel
 NATIVE_STATE_PROFILE = "foundry-native-v1"
 NATIVE_RESPONSES_PROFILE = "foundry-responses-v1"
 NativeStateProfile = Literal["foundry-native-v1", "foundry-responses-v1"]
+# ADR-0009 §3: the one profile whose material may be unlabeled. It is fixed, not ``NATIVE_STATE_PROFILE``: a v1 digest
+# (``submit_digest``) is over the unlabeled form, so v1 stays byte-identical, while a later profile always labels its own.
+UNLABELED_STATE_PROFILE = "foundry-native-v1"
+
+
+def unlabeled_profile(value) -> bool:
+    """``exclude_if`` of a digest-bearing ``state_profile``: only the v1-era profile is left out."""
+    return value == UNLABELED_STATE_PROFILE
+
+
 NativeResponseId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")]
 NATIVE_RESPONSE_RID_HEADER = "x-client-fa-rid"
 NATIVE_RESPONSE_CID_HEADER = "x-client-fa-cid"

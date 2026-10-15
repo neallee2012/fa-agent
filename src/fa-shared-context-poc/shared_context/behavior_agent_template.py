@@ -20,7 +20,7 @@ from .behavior_wire import Digest, Identifier, SdkStartProfile, WireModel, Worke
 from .errors import Problem
 from .m3_models import VersionId
 from .m3_skills import PurposeSkillCatalog, SkillSelection, validate_selection
-from .native_responses_wire import NATIVE_STATE_PROFILE, NativeStateProfile
+from .native_responses_wire import NATIVE_STATE_PROFILE, NativeStateProfile, unlabeled_profile
 
 if TYPE_CHECKING:
     from .behavior_assistant import AssistantAuthority
@@ -67,7 +67,7 @@ class TemplateSettings(WireModel):
     worker_profile: WorkerProfile | None = Field(default=None, exclude_if=lambda value: value is None)
     capabilities: tuple[CapabilityRef, ...] = Field(default=(), exclude_if=lambda value: not value)
     state_profile: NativeStateProfile = Field(
-        default=NATIVE_STATE_PROFILE, exclude_if=lambda value: value == NATIVE_STATE_PROFILE)
+        default=NATIVE_STATE_PROFILE, exclude_if=unlabeled_profile)
 
     _capabilities = field_validator("capabilities")(validate_refs)
 

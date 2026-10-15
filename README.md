@@ -165,7 +165,7 @@ cd .\src\fa-shared-context-poc
 下面的功能已經有程式，但還沒在每個環境驗收，`azd up` 也不會替你打開。
 
 - **Microsoft Teams connector（經 Work IQ MCP）。** 助理能讀 Teams 的聊天和頻道訊息，也能代你發訊息；發訊息預設每次都要你在批准卡上按允許。已在作者的測試環境用真人走過，`azd up` 建的環境預設關閉。步驟見 [開啟 Teams connector](docs/extending.md#開啟-teams-connector)，驗收到哪裡見 [驗收紀錄](docs/extending.md#connector-acceptance)。
-- **在 Teams 裡和助理對話（Teams relay）。** 在 Teams 直接傳訊息給助理，助理在自己的 VM 跑回合並把回覆送回 Teams；需要批准時回覆「允許 代碼」或「拒絕 代碼」，輸入 `/foundry_new_preview` 開新對話，都已在作者的測試環境從 Teams 實測。預備環境沒開，也還沒有部署腳本；設計、限制和步驟見 [Teams 對話設計](docs/teams-chat-design.md) 與 [relay 說明](src/fa-teams-relay/README.md)，實測紀錄見 [progress](docs/progress.md#teams-relay-observed-1011)。
+- **在 Teams 裡和助理對話（Teams relay）。** 在 Teams 直接傳訊息給助理，助理在自己的 VM 跑回合並把回覆送回 Teams；需要批准時回覆「允許 代碼」或「拒絕 代碼」，輸入 `/foundry_new_preview` 開新對話，都已在作者的測試環境從 Teams 實測。超過約 110 秒才完成的回覆，會附在你下一則訊息的回覆裡（「先前的回覆（剛完成）：」，開了新對話也一樣），通常只附一次；萬一無法確認 relay 收到，寧可之後再附一次也不遺失。這部分只有程式與離線測試，還沒部署。預備環境沒開，也還沒有部署腳本；設計、限制和步驟見 [Teams 對話設計](docs/teams-chat-design.md) 與 [relay 說明](src/fa-teams-relay/README.md)，實測紀錄見 [progress](docs/progress.md#teams-relay-observed-1011)。
 - **GitHub connector。** 還在設計，程式裡沒有。見 [connector 設計](docs/connector-design.md#分階段)。
 
 ## 文件

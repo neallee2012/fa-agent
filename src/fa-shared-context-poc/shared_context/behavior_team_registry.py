@@ -460,13 +460,23 @@ def resolve_team_recipient(store, config, recipient_agent_id, *, sender_oid, tea
     return same_team_recipient(scope, sender_oid=sender_oid, team_id=team_id)
 
 
+def _ready_display_name(store, config, agent_id, scope):
+    """The display name when this resolved recipient is ready, else None: an onboarded Agent must be ready."""
+    from .behavior_agent_onboarding import agent_onboarding
+    if any(target.agent_id == agent_id for target in config.targets):
+        return scope.target.agent_name
+    onboarding = agent_onboarding(store, config, agent_id)
+    if onboarding is None:
+        return scope.target.agent_name
+    return onboarding.display_name if onboarding.state == "ready" else None
+
+
 def team_recipient_ids(store, config, *, sender_oid, team_id):
     """Ready same-Team recipients as (agent_id, display_name), configured first then registered.
 
     Ready means the original A, or an Agent whose runtime scope is registered; an onboarded Agent must
     also have reached ready. Reads are bounded by the Team size: the roster, one snapshot of scope rows,
-    then per registered Agent its target row and onboarding record."""
-    from .behavior_agent_onboarding import agent_onboarding
+    then per registered Agent its target row and onboarding record. One recipient: team_recipient_ready."""
     from .behavior_agent_registry import registry_key
     configured = tuple(target.agent_id for target in config.targets)
     candidates = configured + tuple(agent_id for agent_id in registered_agent_ids(store, config)
@@ -484,12 +494,26 @@ def team_recipient_ids(store, config, *, sender_oid, team_id):
             if error.body["error"]["code"] != "AGENT_MESSAGE_ROUTE_DENIED":
                 raise
             continue
-        display_name = scope.target.agent_name
-        if agent_id not in configured:
-            onboarding = agent_onboarding(store, config, agent_id)
-            if onboarding is not None:
-                if onboarding.state != "ready":
-                    continue
-                display_name = onboarding.display_name
-        ready.append((agent_id, display_name))
+        display_name = _ready_display_name(store, config, agent_id, scope)
+        if display_name is not None:
+            ready.append((agent_id, display_name))
     return tuple(ready)
+
+
+def team_recipient_ready(store, config, agent_id, *, sender_oid, team_id):
+    """One model-chosen recipient's scope when ``team_recipient_ids`` would list it, read for that Agent only.
+
+    Same rule and errors as resolving then checking membership in the full list: an unknown, other-Team or
+    self recipient is 403 AGENT_MESSAGE_ROUTE_DENIED; a resolved one that is not ready is 409
+    AGENT_MESSAGE_RECIPIENT_NOT_READY. Reads: its target row, the roster for a registered Agent, its scope
+    row and its onboarding record, never the rest of the Team."""
+    from .behavior_agent_registry import registry_key
+    scope = resolve_team_recipient(store, config, agent_id, sender_oid=sender_oid, team_id=team_id)
+    configured = tuple(target.agent_id for target in config.targets)
+    ready = agent_id in configured or agent_id in registered_agent_ids(store, config)
+    if ready and agent_id != configured[0]:
+        key = registry_key(config.table.scope.authority_domain, agent_id)
+        ready = store.read_snapshot((key,))[key] is not None
+    if not ready or _ready_display_name(store, config, agent_id, scope) is None:
+        raise Problem(409, "AGENT_MESSAGE_RECIPIENT_NOT_READY", "the resolved receiver is not ready")
+    return scope

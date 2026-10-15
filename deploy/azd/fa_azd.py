@@ -560,8 +560,11 @@ def code_identity() -> str:
 def build_env(ctx: Context, commit: str) -> dict[str, str]:
     """ci_deploy.py names image tags and revision suffixes from the CI's commit and run counters; azd supplies the
     same values (the commit and a per-environment run counter) so guard() can read the serving commit back."""
-    return {"GITHUB_SHA": commit, "GITHUB_RUN_NUMBER": ctx.need("FA_DEPLOY_RUN"), "GITHUB_RUN_ATTEMPT": "1",
-            "FA_DEPLOY_CONFIG": str(ctx.profile)}
+    values = {"GITHUB_SHA": commit, "GITHUB_RUN_NUMBER": ctx.need("FA_DEPLOY_RUN"), "GITHUB_RUN_ATTEMPT": "1",
+              "FA_DEPLOY_CONFIG": str(ctx.profile)}
+    if ctx.get("FA_ALLOW_ROLLBACK") == "true":  # one run only: guard() warns instead of stopping (see the README)
+        values["FA_ALLOW_ROLLBACK"] = "true"
+    return values
 
 
 def write_profile(ctx: Context, *, require_runtime: bool) -> Path:
@@ -571,8 +574,46 @@ def write_profile(ctx: Context, *, require_runtime: bool) -> Path:
     return path
 
 
+# The three images azd builds (ci_deploy.IMAGES: api, hosted, console), each from APP as the Docker context.
+IMAGE_DOCKERFILES = ("Dockerfile.behavior-api", "Dockerfile.behavior-assistant-desktop", "Dockerfile.web-console")
+
+
+def build_input_paths() -> list[str]:
+    """Paths under APP (relative, POSIX) that end up in an image: each Dockerfile, .dockerignore and every COPY
+    source from the build context (`COPY --from=` copies from another stage, not from the working tree)."""
+    paths = {".dockerignore", *IMAGE_DOCKERFILES}
+    for name in IMAGE_DOCKERFILES:
+        for line in (APP / name).read_text(encoding="utf-8").splitlines():
+            words = line.split()
+            if not words or words[0].upper() != "COPY" or any(word.startswith("--from") for word in words):
+                continue
+            sources = [word for word in words[1:] if not word.startswith("--")][:-1]  # the last word is the target
+            paths.update(source.rstrip("/") for source in sources)
+    return sorted(paths)
+
+
+def build_input_changes(ctx: Context) -> list[str]:
+    """Uncommitted (incl. untracked) files among the image build inputs: every image is built from APP's working
+    tree, while the image cache, tags and revision suffix are named after the commit. Other files under APP (docs,
+    READMEs) never reach an image, so editing them does not block a deploy."""
+    prefix = APP.relative_to(ROOT).as_posix()
+    result = ctx.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=all", "--",
+                      *(f"{prefix}/{path}" for path in build_input_paths())])
+    if result.code != 0:
+        raise Stop(f"git status failed: {result.stderr.strip()[:300]}")
+    return [line[3:] for line in result.stdout.splitlines() if line.strip()]
+
+
 def images(ctx: Context, commit: str, core: str) -> dict[str, str]:
-    if ctx.get("FA_IMAGES_CORE") == core and ctx.get("FA_IMAGES_COMMIT") == commit:
+    changes = build_input_changes(ctx)
+    if changes and ctx.get("FA_ALLOW_DIRTY_BUILD") != "true":
+        raise Stop(f"{len(changes)} uncommitted change(s) in the image build inputs (first: {changes[0]}): the images "
+                   f"would be built from the working tree but recorded as commit {commit[:12]}. Commit them, or "
+                   "set FA_ALLOW_DIRTY_BUILD=true for this run to build the working tree as is (never reused later)")
+    if changes:
+        print(f"FA: FA_ALLOW_DIRTY_BUILD=true: building {len(changes)} uncommitted change(s); these images are not "
+              "reused by a later deploy", flush=True)
+    elif ctx.get("FA_IMAGES_CORE") == core and ctx.get("FA_IMAGES_COMMIT") == commit:
         found = {kind: ctx.get(f"FA_{kind.upper()}_IMAGE") for kind in ("api", "hosted", "console")}
         if all(found.values()):
             return found  # type: ignore[return-value]
@@ -587,7 +628,8 @@ def images(ctx: Context, commit: str, core: str) -> dict[str, str]:
         result[kind] = reference
         ctx.set(f"FA_{kind.upper()}_IMAGE", reference)
     ctx.set("FA_IMAGES_CORE", core)
-    ctx.set("FA_IMAGES_COMMIT", commit)
+    # A working-tree build is recorded with a marker, so a later clean run of the same commit never reuses it.
+    ctx.set("FA_IMAGES_COMMIT", f"{commit}+dirty" if changes else commit)
     return result
 
 
@@ -888,8 +930,10 @@ def ci_step(ctx: Context, commit: str, *args: str) -> None:
 
 def upgrade(ctx: Context, built: dict[str, str], commit: str) -> None:
     """A later `azd deploy`: the stage CI's steps (deploy-staging.yml) against this profile. WebIQ first, so turning
-    FA_ENABLE_WEBIQ on later never leaves the API offering a toolbox that does not exist (F6)."""
+    FA_ENABLE_WEBIQ on later never leaves the API offering a toolbox that does not exist (F6). The ADR-0009 phase 3b
+    compatibility gate runs before any write (deploy/README.md#compat-gate); a first install has no binding rows yet."""
     ci_step(ctx, commit, "check")
+    ci_step(ctx, commit, "gate", built["api"])
     webiq(ctx)
     memory_store(ctx)
     ci_step(ctx, commit, "guard")

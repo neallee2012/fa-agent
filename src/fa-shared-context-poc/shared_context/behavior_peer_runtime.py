@@ -92,20 +92,26 @@ def build_peer(owner, policy, *, credential, native_transports, assistant_transp
         raise
 
 
-def _binding_agent(owner, binding_id):
+def _agent_bindings(owner, agent_id):
+    """One peer's binding IDs (its template and every admission), or None before its registry row exists."""
     from .behavior_agent_registry import read_agent_registry, registry_key
     from .behavior_work_registry import read_registry
+    store = owner.runtime.store
+    key = registry_key(owner.config.table.scope.authority_domain, agent_id)
+    if store.read_snapshot((key,))[key] is None:
+        return None
+    policy = read_agent_registry(store, owner.config, agent_id).policy
+    index = read_registry(store, policy)
+    return frozenset((policy.template.binding_id,
+                      *(work_policy_key("binding", admission) for admission in index.entries)))
+
+
+def _binding_agent(owner, binding_id):
+    """Scan the served Team's peers for the one holding ``binding_id``; A's own bindings stay with A."""
     if binding_id in owner.runtime.bindings:
         return None
-    domain, store = owner.config.table.scope.authority_domain, owner.runtime.store
     for agent_id in _peer_agent_ids(owner):
-        key = registry_key(domain, agent_id)
-        if store.read_snapshot((key,))[key] is None:
-            continue
-        policy = read_agent_registry(store, owner.config, agent_id).policy
-        index = read_registry(store, policy)
-        if binding_id == policy.template.binding_id or any(
-                binding_id == work_policy_key("binding", admission) for admission in index.entries):
+        if binding_id in (_agent_bindings(owner, agent_id) or ()):
             return agent_id
     return None
 
@@ -123,6 +129,9 @@ class _PeerRouting:
         self.app, self.owner, self.factory, self.error_handler = app, owner, factory, error_handler
         self.identity = _principal_dependency(owner.verifier)
         self.apps = {}
+        # binding ID -> peer agent ID, filled at prepare() and on a scan; only peers of this owner's Team.
+        # The peer's own binding check still runs on every request; an entry it does not confirm is dropped.
+        self.binding_agents = {}
         self.lock = asyncio.Lock()
         owner._peer_router = self
 
@@ -150,12 +159,25 @@ class _PeerRouting:
                 if rows[key] is not None:
                     peer = await run_in_threadpool(self.owner.for_agent, agent_id)
                     await self.application_for(peer)
+                    bindings = await run_in_threadpool(_agent_bindings, self.owner, agent_id)
+                    self.binding_agents.update(dict.fromkeys(bindings or (), agent_id))
             except Problem as error:
                 logging.getLogger(__name__).error("AGENT_RUNTIME_UNAVAILABLE agent_id=%s code=%s",
                     agent_id, error.body["error"]["code"])
             except Exception as error:
                 logging.getLogger(__name__).error("AGENT_RUNTIME_UNAVAILABLE agent_id=%s exception_type=%s",
                     agent_id, type(error).__name__)
+
+    async def _binding_agent(self, binding_id):
+        """A human binding path's peer: the map first, else one registry scan (as before the map)."""
+        if binding_id in self.owner.runtime.bindings:
+            return None
+        agent_id = self.binding_agents.get(binding_id)
+        if agent_id is None:
+            agent_id = await run_in_threadpool(_binding_agent, self.owner, binding_id)
+            if agent_id is not None:
+                self.binding_agents[binding_id] = agent_id
+        return agent_id
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -189,7 +211,7 @@ class _PeerRouting:
                         raise Problem(403, "BEHAVIOR_BINDING_DENIED", "agent credential has no registered target")
                     agent_id = registered.target.agent_id
             else:
-                agent_id = await run_in_threadpool(_binding_agent, self.owner, binding.group(1))
+                agent_id = await self._binding_agent(binding.group(1))
             if agent_id is None or agent_id == self.owner.config.targets[0].agent_id:
                 selected = self.app
             else:
@@ -197,6 +219,8 @@ class _PeerRouting:
                 if binding is not None:
                     await run_in_threadpool(peer.runtime.refresh_bindings, binding.group(1))
                     assigned = peer.runtime.bindings.get(binding.group(1))
+                    if assigned is None and self.binding_agents.get(binding.group(1)) == agent_id:
+                        del self.binding_agents[binding.group(1)]  # the next request scans the registry again
                     if (assigned is None or principal.oid != (
                             assigned.agent_oid if principal.kind == "agent" else assigned.human_oid)):
                         raise Problem(403, "BEHAVIOR_BINDING_DENIED", "credential and original binding path differ")

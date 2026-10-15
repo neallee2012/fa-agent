@@ -1,9 +1,33 @@
 # FA 進度與交接狀態
 
-更新日期：2026-10-13。
+更新日期：2026-10-15。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="dev-test-v30-1014"></a>
+## 2026-10-14：第 30 版候選 dev 測試（main `1c2be0b4`，部署線）
+
+- **範圍**：部署線在 dev 測試第 30 版候選 main `1c2be0b4`；Neal 本人登入工作台，按鈕經 Neal 授權。本節的數字與結論來自部署線回報，原始 log 與畫面不在 repo；沒有第 29 版的基準，下面的秒數不判斷快慢。費用見[預算檔](fa-cloud-budget-status.md#dev-v30-test-1014)。
+- **部署讀回**：
+  - API revision `…1c2b-v143-1014` Healthy、100%、healthz 200；core `98f81d4d`；ENV 31 不變。
+  - 3b 閘門（#829）在新 revision 內跑一次（dev 沒有 job，排在 API 更新後、sync 前），未武裝：rc=0、decision=pass、refused 0、5.5 秒（不含 job 冷啟動與拉 image）；unclaimed 6（C、D、4 個 test agent，只報告）。
+  - sync（defer-follow，A／B overlay 每次帶）8 個 Agent ok；A v151、B v109 帶 `FA_NATIVE_MODEL_SWITCH=1`；C／D v75。follow：A v150→v151 ready 236 秒、B v108→v109 ready 76 秒（第 29 版為 224／71 秒），`files_migrated=false`、reason=source；C skipped。
+  - 舊 SID 部署前後最後存取時間相同；部署後 invoke 只打新 SID。
+- **#836 open-rids**：外部身分讀 `fa/v1/turns` 回 404（state store 依 Agent 身分隔開），所以沒有加權限。這次是第一次換到有 open-rids 的 image，照設計全掃描補齊（B follow 35 次 invoke，第 29 版為 34）；「讀取變少」要下一次換版才看得到。
+- **換環境通知 PASS（A、B）**：部署後舊對話第一則完成後出現一次「已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。」，下一則消失；助理記得第 29 版時說過的事實。
+- **送出路徑**：回合都完成；第一個字時間 B 舊對話 10.5／7.0 秒、A 新對話 8.05 秒、A 換模型 8.6 秒；沒有第 29 版基準，未判定快慢。B 新對話先出 Teams 連線卡，按「先不用」後完成。
+- **交辦 A→B**：結果不需重新整理就出現；B 結束到畫面顯示 12.9／12.7 秒。其中工作台輪詢的 4～8 秒是 #833 退避造成的回歸，#837 修正（前 30 秒每秒讀、之後 2／4／5 秒）；其餘是 Hosted 交回 A 的時間（既有）。
+- **中途取消**：Hosted abort 約 1.2 秒；`api_cancel` 3.4 秒（原因未查明）。畫面顯示「不確定」是第 29 版就有的舊問題（`NATIVE_TURN_CANCELLED` 沒被工作台讀），#837 改為「已停止。停止前可能已經做了部分動作。」
+- **中途追加 PASS**：只出現一次、沒有重送。回合後狀態字「下一輪處理」是舊文字，#837 改為「助理已收到，在這次回覆中接著處理。」
+- **換模型回歸 PASS**：gpt-5.4-mini→gpt-4.1-mini 記得前文，第一個字 8.6 對 8.05 秒。
+- **log**：API 沒有 `STATE_INVALID`、fence、Traceback。金鑰下載次數 dev 沒有 log／遙測，未量測；Hosted App Insights 只有 SDK span，看不到 FA 的 log 行。
+- **未測**：棄用來源（沒有自然發生）；Teams 補送（relay 未重建；stage relay 關閉，需 Neal 另批准）。
+- **工作台複測**（main `b47c3cb1`，含 #837）：進行中，等 Neal 登入；結果出來前不寫 PASS。
+
+<a id="stage-smoke-v29-1014"></a>
+## 2026-10-14：stage 第 29 版（2026.10.14-29）部署與冒煙
+
+- 第 29 版 10-14 部署到 stage（#828），冒煙 PASS。細節見部署線報告，未入 repo。
 <a id="adr0009-idle-upgrade-final-1013"></a>
 ## 2026-10-13：ADR-0009 閒置升級機制設計定稿（Neal 同日要求；M 項已核准；未實作）
 

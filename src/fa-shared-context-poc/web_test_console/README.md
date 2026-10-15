@@ -1,5 +1,35 @@
 # FA 本機工作台
 
+## Release 30 dev 測試：停止與追加的文字（2026-10-14，CODE/offline，未部署）
+
+- **停止後寫「已停止」**（原本就有的問題）：Hosted 把停下的原生回合存成 `status=unknown`、`failure_code=NATIVE_TURN_CANCELLED`，
+  頁面原本把它和其他 unknown 一樣寫「這次回覆的結果還不確定。」，停止提示停在「已要求停止這次回覆。」。
+  現在回覆泡泡與停止提示（`cancellationMessage`，含輸入框下方）都寫「已停止。停止前可能已經做了部分動作。」
+  （停止前可能已經用過工具，所以不說什麼都沒做），處理摘要寫「已停止」（協作還沒確認時寫「已停止；和另一位助理的協作還沒確認」，不蓋掉協作狀態）；同一則裡只出現一次。按「更新回覆」讀到後一樣顯示。
+  有處理步驟時，同一則下的摘要列原本仍寫「結果不確定・用了 1 個工具・20 秒」，現在寫「已停止・用了 1 個工具・20 秒」
+  （協作還沒確認時是「已停止；和另一位助理的協作還沒確認・…」），工具數和秒數不變。
+  其他 `failure_code` 的 unknown 照舊寫「結果還不確定」。
+- **追加 `delivery=queued` 的說法**（原本就有的問題，89fa95c5）：queued 是 enqueue：原回合這一輪 SDK 回合先做完，SDK 再把追加當下一輪 SDK 回合，在同一個 FA 回合裡處理，
+  原本寫「助理會在這段對話的下一輪處理。」，現在寫「助理已收到，在這次回覆中接著處理。」。其他追加狀態的文字沒有說成下一輪，不變。
+
+## 等待其他助理回覆時的讀取節奏與原生讀取少寫入（審查 #13 與修正第 1 輪，2026-10-14，CODE/offline，未部署）
+
+- **沒變化的讀取先照常讀 30 秒再退避**（release 30 dev 測試與修正第 2 輪，2026-10-14）：等其他助理回覆時，整段讀取
+  （不含 `observed_at`）沒變化，前 30 秒照常每 1 秒讀（推送開著時 3 秒），之後才加倍：2→4→5 秒，最多 5 秒，推送開不開都一樣。
+  原本第一次沒變化就加倍，交辦的回覆晚 4–8 秒才出現；拿掉退避又讓每個可見分頁在整段等待中每秒打 3+N 個 API GET，
+  而等待沒有上限（另一位助理可能停在批准卡上）。有任何變化、推送提示（`realtimeReadProgress`）、分頁回到前景、
+  切換對話、按「更新回覆」都回到 1 秒並重新計 30 秒。
+- **退避不再被重畫打斷**：讀取失敗的退避（2→4→8…最多 30 秒）由 `scheduleProgress` 記下到期時間（`progressDueAt`），
+  同一段等待不因 `render()`（60 秒 Team 讀取、登入刷新、推送重連）重新計時。
+- **分頁回到前景**：`visibilitychange` 轉為可見時把間隔重設為 1 秒，不必等完隱藏前累積的退避。
+- **沒有推送就不退太久**：`realtime.phase` 不是 `open` 時，退避上限 5 秒（沒有事件會通知回覆已完成）；推送開著時只有讀取失敗的退避會到 30 秒。
+- **讀取失敗後重新計**：失敗把間隔加倍；下一次成功的讀取從 1 秒重新開始，沒變化的 30 秒也重新計。
+- **原生讀取少寫入**：`native.py` 只在回條有變化時才寫 `native-read` 列，並略過記憶體已有的訊息的 journal 重讀；
+  輪詢每秒讀同一份回條時不再每次 commit（遠端模式不再每次上傳 journal）。沒有新增 API、權限或保存格式。
+- 驗證：DOM 測試 render 不推遲到期讀取、可見後 1 秒內讀取、無推送 ≤5 秒、錯誤後從 1 秒重算（長等待改由讀取失敗造成）；
+  節奏測試：沒推送時 30 秒內每 1 秒，之後 2、4、5、5 秒；推送開著時 3 秒，之後 4、5、5 秒；有變化或推送提示回到原節奏。
+  在 173b14fe（每次都 1 秒）FAIL。
+
 ## 回合結束、等批准與停止不再要手動更新（stage／dev 2026-10-10～12 現場，CODE/offline，未部署）
 
 現場：回覆寫完後一直顯示「回覆中，尚未確認保存。」「正在準備」「停止這次回覆」，按「更新回覆」沒用，只有「詳細 → 更新工作狀態」才變「已完成」；
@@ -952,7 +982,7 @@ sqlite `disk I/O error` 與 `ERR_INSUFFICIENT_RESOURCES` 是否消失要 dev 部
   `index.html` `scheduleProgress`／`updateProgress`／`refreshNativeProgress`／`autoLoadCompletedReply`；
   公開進度事件格式 `shared_context/behavior_assistant_wire.py` `PublicProgressEvent`（`tool_start_seq` 對應開始與結束）。
 - DOM：609 PASS。新增 8 案（兩 lane 回合中只讀 status、不另讀這一則的進度；結束那次 status 直接帶回覆、不讀 `reply`；
-  以 unknown／failed 結束後做一次整段讀取；兩 lane bridge 重啟後舊對話只讀一次 status 就可續問；等待其他助理回覆時仍整段讀取）。
+  以 unknown／failed 結束後做一次整段讀取；兩 lane bridge 重啟後舊對話只讀一次 status 就可續問；等待其他助理回覆時仍整段讀取，節奏見「等待其他助理回覆時的讀取節奏與原生讀取少寫入」條目）。
   除最後一案（保留原行為）外，在修正前都 FAIL；重啟兩案另以「讓重啟判斷失效」的突變確認會 FAIL。
   測試替身讓 `/{RID}/status` 和整段 progress 回同樣形狀的狀態。
 - Python：新增 6 案（status 路由只讀這一則、結束時帶回覆且可接續、不讀 history；批准／提問只在工具執行中或進度停住時讀；
@@ -1362,9 +1392,33 @@ DOM完整545 PASS。五個相關Python模組118 PASS／3 FAIL；三案都是既�
 官方用法沿[toolbox authentication](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/tool-authentication)，
 FA不自行實作credential injection；connection分類是原薄API的選項／寫入檢查。
 
+<a id="environment-notices"></a>
+## 換環境與版本通知（ADR-0009 phase 2c，CODE/offline）
+
+2026-10-06（P06）起工作台不顯示任何 [ADR-0009 §8](../../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#8-使用者看到的通知)
+通知；phase 2c 補回，原則是幾乎無感、少而誠實、不當成錯誤：
+
+- **來源：** API 綁定列的通知槽（每個 Agent 一個，M4），隨主人自己的送出回應（`/submit`、換版後的同 RID 重送
+  `submit-retry`）帶 `environment_notice`；API 在回應寫出後才清掉（[共用 README](../README.md#g-phase2c-clear)），所以同一則通知只來一次。
+  bridge 把它投影到 task 的 `native_receipt.environment_notice`（讀取路徑上的「較早的版本接下的……」也一樣投影，之前沒投影）。
+- **顯示：** 輸入框下方 `#environment-note`（`role="status"`，與「已換成某模型」同一排），不是錯誤區、不進聊天泡泡；
+  顯示到這位助理下一則被接下、且沒帶通知的訊息為止（重新整理後不再顯示：API 已清掉，這是「看到一次」）。句子照 ADR §8 原文：
+  `environment_updated`「助理已更新到新版本，工作檔也一起帶過來了。」；`environment_switched_without_files`
+  「已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。」；`environment_source_retired`「已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。」；
+  `platform_version_changed`「平台把助理的執行環境換成了另一個版本（vX→vY）；FA 已記錄，相容就照常執行。」（後兩句與 M4
+  退回句仍待 Neal 確認）。「較早的版本接下的……」照舊在那則訊息的處理狀態裡顯示。
+- **換版中：** 同 RID 自動重送期間，「助理正在換到新版本……完成後會自動送出」在自動重送開始 30 秒後
+  （`SERVER_FOLLOWING_QUIET_MS`，ADR-0009 M4 的 A 第 4 項）才出現；短暫換版只看到訊息照常送出。
+- **版本差異：** 沒有部署順序要求。bridge 的每個 API 請求帶 `X-FA-Notice-Kinds: 2`（`adapter.py`），API 只對帶這個
+  header 的主人 submit 送三種換環境通知並清除；部署中 API 已更新、工作台還是舊 bridge 時，舊 bridge 不帶 header，
+  只會拿到它認得的漂移通知，不會 502，通知也不清（[共用 README](../README.md#g-phase2c-clear)）。另外 bridge 解回條時，
+  不認識的通知（更新的 API 的新種類或新欄位）直接略過，不回 502 `NATIVE_STATE_INVALID`；回條其他內容照舊嚴格核對。
+  頁面也只顯示認識的種類。
+
 ## 環境自動接續（Neal 2026-10-04確認，CODE/offline）
 
-> **已由 P06 取代（通知部分）：** 第 16 版 P06（`f56020a5`，2026-10-06）起，工作台不再顯示下方 ready 後的「已換到新版環境…」通知；API 仍在回條記 `files_migrated=false`／`files_omission_reason`，補回顯示列在 [ADR-0009 §8 待辦](../../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#8-使用者看到的通知)。
+> **通知部分：** 第 16 版 P06（`f56020a5`，2026-10-06）起不再顯示下方 ready 後的通知；phase 2c 起改由 API 通知槽送來、
+> 在輸入框下方狀態列顯示（[換環境與版本通知](#environment-notices)），下方 ready 流程本身仍是歷史設計。
 
 Neal **10:22:31（台灣）**問「這兩個功能應該是FA應該要幫user處理的? 使用者不需要處理?」，
 於 **10:24:05** 回覆「對」。正常native畫面不再要求使用者核對環境或同意不搬檔；
@@ -1436,7 +1490,7 @@ ready後通知原句：「已換到新版環境；這次沒有搬工作檔，舊
 <a id="no-files-ready-note"></a>
 ## 不搬檔 ready 的完成提示（CODE/offline）
 
-> **已由 P06 取代：** 第 16 版 P06（`f56020a5`，2026-10-06）起，工作台不再顯示這個 ready 完成提示；API 仍在回條記 `files_migrated=false`／`files_omission_reason`，補回顯示列在 [ADR-0009 §8 待辦](../../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#8-使用者看到的通知)。以下是當時設計的歷史紀錄。
+> **通知已補回（phase 2c）：** 第 16 版 P06（`f56020a5`，2026-10-06）拿掉了這個 ready 完成提示；phase 2c 起「這次沒有搬工作檔」由 API 通知槽隨主人的送出回應送來、在輸入框下方狀態列顯示一次，見[換環境與版本通知](#environment-notices)。以下是當時設計的歷史紀錄。
 
 原控制POST收到ready後，仍要等尾端GET composer完成才記通知，所以畫面會繼續顯示檢查中。
 現在核對原Agent／thread／目標後，先記已確認的ready，立即顯示「這次沒有搬工作檔」；
@@ -2091,7 +2145,7 @@ template export／`new_conversation_template` 及原 `select_profile`；fresh si
   原submit／command／capture不改，UNKNOWN原件另保留，讀回結果存獨立observation。
 - `GET /api/instructions/{rid}/appends`只讀後端原控制清單。原進度更新對accepted／sending追加
   另做純GET；unknown可手動「核對追加」，沒有自動POST。重開controller可沿journal找回原ID。
-- 追加顯示在原回合內，區分已保存、尚未確認套用、SDK已套用、後續SDK輪、未套用及unknown；
+- 追加顯示在原回合內，區分已保存、尚未確認套用、SDK已套用、同一回合中接著處理（queued）、未套用及unknown；
   不拿message ID當完成，也不把queued說成另一筆普通交辦。未套用只由真人按「帶回輸入框」，
   不自動再送、不覆蓋已輸入的其他草稿；unknown只有查讀。
 - 已POST的原文與未送草稿分開記住：同版原文在結果未核清前，不因回合完成或重新登入

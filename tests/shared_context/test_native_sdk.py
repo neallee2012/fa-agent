@@ -66,6 +66,38 @@ def test_native_factory_reuses_one_managed_identity_credential(local_env, monkey
     assert scopes == [native_sdk.SCOPE, native_sdk.SCOPE, "api://OFFLINE/.default"]
 
 
+def test_production_wires_a_waiting_responses_message_to_the_api_send(local_env, monkeypatch, tmp_path):
+    """Review round 4 (P3): ADR-0009 §7a (s) — the production runtime asks the API to send a waiting Responses message
+    through the same Agent-identity relay as its continuations (``NativeAgentRelayClient.dispatch_waiting``); without
+    this wiring ``on_slot_taken`` is None and the message waits at ``needs_response`` for the API's next touch."""
+    from shared_context.native_agent_tools import NativeAgentRelayClient
+
+    class Credential:
+        def __init__(self, client_id=None):
+            pass
+
+        async def get_token(self, scope):
+            return SimpleNamespace(token="OFFLINE-token")
+
+    monkeypatch.setattr("azure.identity.aio.ManagedIdentityCredential", Credential)
+    runtime_path = tmp_path / "OFFLINE-not-executed"
+    runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
+    hosted = SimpleNamespace(
+        identity=IDENTITY, supervisor=AssistantSupervisor(tmp_path / ".fa-assistant-v12", runtime_path=runtime_path),
+        api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
+    )
+    with monkeypatch.context() as environment:
+        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+        environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
+        environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
+        environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
+        environment.setenv("FOUNDRY_PROJECT_ENDPOINT", MODEL_ROOT.removesuffix("/openai/v1"))
+        runtime = native_sdk.native_runtime_from_environment(hosted)
+    relay = runtime.on_continuation.__self__
+    assert isinstance(relay, NativeAgentRelayClient) and relay.runtime is runtime
+    assert runtime.on_slot_taken == relay.dispatch_waiting
+
+
 @pytest.mark.parametrize("lane", ["foundry-native-v1", "foundry-responses-v1"])
 def test_original_role_text_precedes_native_origin_guidance_without_changing_capture(
         responses, monkeypatch, tmp_path, lane):

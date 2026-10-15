@@ -12,6 +12,12 @@ from .behavior_wire import Digest, Identifier, WireModel
 from .errors import Problem
 from .native_append_wire import NativeAppend, NativeAppendReceipt, NativeAppends, check_append_status
 
+# This process's own claims in ``NativeTurnControl.sent_appends``: append ID -> (send token, outcome). The outcome is
+# UNSENT from before the claim write until the SDK send starts, ATTEMPTED from then on (also when the send raised), then
+# the SDK message ID, or None when the channel took nothing. Only memory: a restart forgets them (the entry stays
+# ``sending`` and ends ``unknown``; it is never sent again).
+UNSENT, ATTEMPTED = object(), object()
+
 
 class _Entry(WireModel):
     command: NativeAppend
@@ -135,6 +141,7 @@ async def append(runtime, command):
         return replacement
 
     state = await _update(runtime, target, accept)
+    runtime._wake_control(command.request_id)  # a running turn here delivers it now, not at its next poll
     return _receipt(state, next(item for item in state.entries if item.command.append_id == command.append_id), target)
 
 
@@ -170,48 +177,75 @@ def _observed(entry, channel, *, finished=False, cancelled=False):
     return entry
 
 
+def _remembered(entry, control, *, finished=False):
+    """The outcome of this process's own claim of an entry: the SDK message ID, or ``not_applied`` when the channel took
+    nothing or the turn ended before the send started. Applied again on every settle, so a ``remember`` write that was
+    unconfirmed is retried."""
+    from .native_turns import _changed
+
+    claim = control.sent_appends.get(entry.command.append_id)
+    if claim is None or entry.status != "sending" or entry.send_token != claim[0] or entry.sdk_message_id is not None:
+        return entry
+    outcome = claim[1]
+    if outcome is None or (outcome is UNSENT and finished):
+        return _changed(entry, status="not_applied", reason="cancelled" if control.cancelled else "turn_finished")
+    if isinstance(outcome, str):
+        return _changed(entry, sdk_message_id=outcome)
+    return entry  # UNSENT while the turn runs (sent next); ATTEMPTED (never sent again)
+
+
+def _unsent(entry, control):
+    """Claimed by this process (its claim write may have been unconfirmed) and not handed to the SDK yet."""
+    claim = control.sent_appends.get(entry.command.append_id)
+    return entry.status == "sending" and claim is not None and claim[0] == entry.send_token and claim[1] is UNSENT
+
+
 async def settle_appends(runtime, target, control, *, finished=False):
     from .native_turns import _changed
 
     def settle(state):
         return _changed(state, entries=tuple(_observed(
-            entry, control.steering, finished=finished, cancelled=control.cancelled) for entry in state.entries))
+            _remembered(entry, control, finished=finished), control.steering, finished=finished,
+            cancelled=control.cancelled) for entry in state.entries))
 
     return await _update(runtime, target, settle)
 
 
 async def deliver_appends(runtime, target, control):
+    """Hand the next append to the SDK, in order; True when one was handed over (look for the next at once).
+
+    The next one is the first ``accepted`` entry or, before it, an entry this process claimed and has not sent: a claim
+    write that landed although its ``_update`` was unconfirmed. A ``sending`` entry under another token (another
+    process, or this one before a restart) or whose send has started is never sent again."""
     from .native_turns import _changed
 
     channel = control.steering
     if channel is None or not channel.ready or channel.closed or control.stop_requested():
         return
     state = await settle_appends(runtime, target, control)
-    pending = next((entry for entry in state.entries if entry.status == "accepted"), None)
+    pending = next((entry for entry in state.entries if entry.status == "accepted" or _unsent(entry, control)), None)
     if pending is None:
         return
-    token = uuid4().hex
+    append_id = pending.command.append_id
+    if pending.status == "accepted":
+        # Recorded before the claim write, so a write that lands unconfirmed is still sent (and only once); an
+        # unconfirmed claim is written again under the same token.
+        previous = control.sent_appends.get(append_id)
+        token = previous[0] if previous is not None and previous[1] is UNSENT else uuid4().hex
+        control.sent_appends[append_id] = (token, UNSENT)
 
-    def claim(current):
-        return _changed(current, entries=tuple(
-            _changed(entry, status="sending", send_token=token)
-            if entry.command.append_id == pending.command.append_id and entry.status == "accepted" else entry
-            for entry in current.entries))
+        def claim(current):
+            return _changed(current, entries=tuple(
+                _changed(entry, status="sending", send_token=token)
+                if entry.command.append_id == append_id and entry.status == "accepted" else entry
+                for entry in current.entries))
 
-    state = await _update(runtime, target, claim)
-    claimed = next(entry for entry in state.entries if entry.command.append_id == pending.command.append_id)
-    if claimed.send_token != token:
-        return
-    identifier = await channel.send(claimed.command.content)
-
-    def remember(current):
-        entries = []
-        for entry in current.entries:
-            if entry.command.append_id == claimed.command.append_id and entry.send_token == token:
-                entry = (_changed(entry, status="not_applied",
-                                  reason="cancelled" if control.cancelled else "turn_finished")
-                         if identifier is None else _observed(_changed(entry, sdk_message_id=identifier), channel))
-            entries.append(entry)
-        return _changed(current, entries=tuple(entries))
-
-    await _update(runtime, target, remember)
+        state = await _update(runtime, target, claim)
+        pending = next(entry for entry in state.entries if entry.command.append_id == append_id)
+        if pending.send_token != token:
+            return True
+    control.sent_appends[append_id] = (pending.send_token, ATTEMPTED)  # from here a resend could deliver it twice
+    identifier = await channel.send(pending.command.content)
+    control.sent_appends[append_id] = (pending.send_token, identifier)
+    await settle_appends(runtime, target, control)  # writes it through ``_remembered``
+    return True

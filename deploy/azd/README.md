@@ -142,6 +142,10 @@ Responses 通道、伺服器提供的全部能力（桌面、技能、Shell、�
 （`ci_deploy.py check` → WebIQ（有開才做；連線已存在就只讀回，不需終端機）→ `guard → sync → api → console → follow`），只改映像與 profile 宣告的 ENV；
 已安裝的 runtime 設定不會被改。
 
+- 映像由 `src/fa-shared-context-poc` 的工作目錄 build，卻以 commit 命名、同一 commit 與 core 再跑時直接沿用。所以這個目錄有**未提交的變更**（含未追蹤檔）時，`azd deploy` 會停下並列出第一個檔案：先 commit。確定要部署工作目錄原樣時，這一次加 `FA_ALLOW_DIRTY_BUILD=true`（例如 `azd env set FA_ALLOW_DIRTY_BUILD true`，用完 `azd env set FA_ALLOW_DIRTY_BUILD false`）；這樣 build 的映像不會被之後的部署沿用。
+- 上面的檢查只看會進映像的檔案：三個 Dockerfile（api、hosted、console）、`.dockerignore`，以及它們 `COPY` 自 build context 的路徑。`src/fa-shared-context-poc` 底下只改文件（README 等）不會擋住 `azd deploy`。
+- `guard` 要求這次的 commit 包含正在服務的 API revision 記錄的 commit（不能用較舊或另一條分支的 commit 蓋過去，要部署就先合併）；revision 名稱不是部署腳本取的，只警告、不停。
+- 正在服務的 revision 記錄的 commit 已不在這個 checkout 的歷史裡（部署過的 feature branch 被 rebase 或丟掉）時，`guard` 也會停下，之後每次 `azd deploy` 都一樣。確定要部署時，這一次加 `FA_ALLOW_ROLLBACK=true`（例如 `azd env set FA_ALLOW_ROLLBACK true`，用完 `azd env set FA_ALLOW_ROLLBACK false`）：停止改成一行 `::warning::`，並略過回退檢查與變更報告，只在這一次執行生效。commit 還在歷史裡、只是這次的 commit 不包含它時，仍然停下，這個開關不放行。stage CI（deploy-staging）**不認也不設** `FA_ALLOW_ROLLBACK`，維持嚴格；stage 上遇到這種停止，由 Neal 決定怎麼處理，不靠 workflow 繞過。
 ## 刪除
 
 ```bash

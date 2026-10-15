@@ -3546,6 +3546,106 @@ test("a completed Responses handoff keeps observing until the peer reply appears
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
 });
 
+// Audit #13 round 2 (2026-10-14): a full read while a delegated reply is awaited costs 3+N API reads and the wait has
+// no limit, but backing off from the first unchanged read showed the reply 4-8 s late (release 30 dev test). Unchanged
+// reads keep the usual pace for 30 s, then double up to 5 s whether push is open or not.
+const UNAVAILABLE_READ=()=>({ok:false,status:503,json:async()=>({error:{code:"NATIVE_BOOTSTRAP_UNKNOWN",automatic_retry:true}})});
+async function awaitingReplyUi(options={}){
+  const data=nativeChat("started");data.composer.awaiting_agent_reply=true;
+  const ui=await open(data,{now:Date.parse(when),...options});await ui.tick();
+  if(options.realtime)await connectPush(ui);
+  const fire=async()=>{
+    const id=vm.runInContext("progressTimer",ui.context),fn=ui.timers.get(id);
+    assert.ok(fn,"the progress timer is scheduled");
+    ui.timers.delete(id);ui.timerDelays.delete(id);await fn();await ui.tick();await ui.tick();
+  };
+  ui.holder.progressResponse=()=>({ok:true,json:async()=>copy(data)});
+  const delay=()=>ui.timerDelays.get(vm.runInContext("progressTimer",ui.context));
+  return {ui,data,fire,delay};
+}
+test("waiting for a delegated reply reads unchanged conversations every second for 30 s, then backs off to 5 s",async()=>{
+  for(const realtime of [false,true]){
+    const {ui,data,fire,delay}=await awaitingReplyUi({realtime});
+    let clock=Date.parse(when),reply=copy(data),i=0;
+    ui.holder.now=clock;
+    ui.holder.progressResponse=()=>({ok:true,json:async()=>copy(reply)});
+    const run=async count=>{
+      const delays=[];
+      for(let n=0;n<count;n++){
+        // A read's own timestamps are not a change.
+        reply=copy(reply);reply.composer.observed_at=reply.tasks[0].status.observed_at=new Date(clock).toISOString();
+        clock+=delay();ui.holder.now=clock;i++;
+        await fire();delays.push(delay());
+      }
+      return delays;
+    };
+    const usual=realtime?3000:1000,within=realtime?11:30;
+    const backoff=realtime?[4000,5000,5000]:[2000,4000,5000,5000];
+    assert.deepEqual(await run(within+backoff.length),[...Array(within).fill(usual),...backoff],"push open: "+realtime);
+    reply=copy(reply);reply.tasks[0].progress={recorded:true,finished:false,truncated:false,byte_length:1,data:{state:"started"}};
+    assert.deepEqual(await run(1),[usual],"a change reads at the usual pace again");
+    assert.deepEqual(await run(2),[usual,usual],"and the 30 s start over");
+    await run(within+backoff.length);
+    assert.equal(delay(),5000);
+    // A push hint reads at once and starts the 30 s over.
+    vm.runInContext("realtimeReadProgress()",ui.context);await ui.tick();await ui.tick();
+    assert.equal(delay(),usual);
+    assert.deepEqual(await run(1),[usual]);
+    assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+  }
+});
+
+// Audit round 1 (2026-10-14): a long (error) wait must not restart on every render, and must be short without push.
+test("a render in the middle of a long wait does not push the next progress read further out",async()=>{
+  const {ui,fire,delay}=await awaitingReplyUi({realtime:true});
+  let clock=Date.parse(when);
+  const tick=ms=>{clock+=ms;ui.holder.now=clock};
+  ui.holder.now=clock;
+  ui.holder.progressResponse=UNAVAILABLE_READ;
+  for(let i=0;i<8;i++)await fire();
+  assert.equal(delay(),30000,"the wait reached 30 s");
+  const timer=vm.runInContext("progressTimer",ui.context);
+  tick(29000);
+  vm.runInContext("render()",ui.context);
+  assert.equal(vm.runInContext("progressTimer",ui.context),timer,"the render keeps the timer that is already due in 1 s");
+  assert.equal(ui.timers.has(timer),true);
+  tick(1000);
+  const before=ui.calls.length;
+  await fire();
+  assert.ok(ui.calls.length>before,"the read goes out at the original 30 s");
+});
+test("a tab that becomes visible reads within 1 s instead of waiting out the backoff",async()=>{
+  for(const realtime of [false,true]){
+    const {ui,fire,delay}=await awaitingReplyUi({realtime});
+    ui.holder.progressResponse=UNAVAILABLE_READ;
+    for(let i=0;i<8;i++)await fire();
+    assert.ok(delay()>=(realtime?30000:5000));
+    ui.context.document.hidden=true;ui.documentEvents.visibilitychange();
+    assert.equal(vm.runInContext("progressTimer",ui.context),null,"nothing is read while hidden");
+    ui.context.document.hidden=false;ui.documentEvents.visibilitychange();await ui.tick();
+    assert.ok(delay()<=1000,"visible again, push open: "+realtime);
+    assert.equal(vm.runInContext("progressRetryMs",ui.context),1000);
+  }
+});
+test("without push a waiting conversation is read at least every 5 s",async()=>{
+  const {ui,fire,delay}=await awaitingReplyUi();
+  ui.holder.progressResponse=UNAVAILABLE_READ;
+  const delays=[];
+  for(let i=0;i<8;i++){await fire();delays.push(delay())}
+  assert.equal(Math.max(...delays),5000,JSON.stringify(delays));
+});
+test("the first good read after a failed one starts the backoff over from 1 s",async()=>{
+  const {ui,data,fire}=await awaitingReplyUi({realtime:true});
+  ui.holder.progressResponse=UNAVAILABLE_READ;
+  for(let i=0;i<4;i++)await fire();
+  assert.ok(vm.runInContext("progressRetryMs",ui.context)>=16000,"the error raised the wait");
+  ui.holder.progressResponse=()=>({ok:true,json:async()=>copy(data)});
+  await fire();
+  assert.equal(vm.runInContext("progressRetryMs",ui.context),1000);
+  await fire();
+  assert.equal(vm.runInContext("progressRetryMs",ui.context),1000);
+});
+
 function receivedChat(){
   // Agent two's own read-only copy of the conversation agent one opened in it (stage 14, 2026-10-05).
   const data=nativeChat("completed"),scope=agentChat("agent-two"),task=data.tasks[0],composer=data.composer;
@@ -3812,7 +3912,8 @@ test("native append readback shows SDK queued delivery without another send",asy
   ui.holder.current=done;
   await vm.runInContext("readAppends(state.tasks[0])",ui.context);
   const content=JSON.stringify(ui.nodes.get("conversation-history").children,(key,value)=>key==="events"?undefined:value);
-  assert.match(content,/這段對話的下一輪處理/);
+  assert.match(content,/助理已收到，在這次回覆中接著處理。/);
+  assert.doesNotMatch(content,/下一輪/);
   assert.doesNotMatch(content,/SDK/);
   assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
   assert.equal(ui.calls.filter(call=>call.url.endsWith("/appends")).length,1);
@@ -4475,6 +4576,9 @@ for(const code of ["AGENT_VERSION_FOLLOWING","NATIVE_SESSION_CHANGED"]){
     await ui.tick();await ui.tick();
     assert.deepEqual(postUrls(ui,before),[`/api/instructions/${c.rid}/submit`]);
     assert.equal([...ui.timerDelays.values()].includes(3000),true);
+    // ADR-0009 M4: a short change says nothing; the "換版中" text appears only 30 s after the automatic resend starts (M4.4).
+    assert.doesNotMatch(ui.text("instruction-reason")+ui.text("error-message"),/助理正在換到新版本|訊息已保留/);
+    await fireDelay(ui,30000);
     assert.match(ui.text("instruction-reason")+ui.text("error-message"),/助理正在換到新版本|訊息已保留/);
     await fireDelay(ui,3000);
     assert.deepEqual(postUrls(ui,before),[`/api/instructions/${c.rid}/submit`,`/api/tasks/${c.rid}/submit-retry`]);
@@ -4571,7 +4675,7 @@ test("leaving a server_following wait removes the automatic-send promise",async(
   ui.holder.templateResponses={[`/api/instructions/${c.rid}/submit`]:c.rejection,
     [`/api/tasks/${c.rid}/submit-retry`]:{ok:false,status:503,json:async()=>({error:{code:"AGENT_VERSION_FOLLOWING",not_dispatched:true,server_following:true,request_id:c.rid}})}};
   typeAttachmentText(ui,"換版也只送一次");ui.holder.current=copy(c.refused);ui.click("send-instruction");
-  await ui.tick();await ui.tick();
+  await ui.tick();await ui.tick();await fireDelay(ui,30000);
   assert.match(ui.text("error-message"),/完成後會自動送出/);
   vm.runInContext("clearServerFollowingState();render()",ui.context);
   assert.equal([...ui.timerDelays.values()].includes(3000),false,"leaving the wait clears the retry timer");
@@ -4604,8 +4708,9 @@ test("manual same-RID retry joins server_following loop instead of only saying a
   const before=ui.calls.length;
   button.events.click();await ui.tick();await ui.tick();
   assert.deepEqual(postUrls(ui,before),[`/api/tasks/${c.rid}/submit-retry`]);
-  assert.match(ui.text("error-message"),/完成後會自動送出/);
   assert.equal([...ui.timerDelays.values()].includes(3000),true);
+  await fireDelay(ui,30000);
+  assert.match(ui.text("error-message"),/完成後會自動送出/);
   await fireDelay(ui,3000);
   assert.deepEqual(postUrls(ui,before),[`/api/tasks/${c.rid}/submit-retry`,`/api/tasks/${c.rid}/submit-retry`]);
   assert.equal(ui.nodes.get("instruction").value,"");
@@ -4958,6 +5063,27 @@ test("native unstarted unknown explains a new explicit submission without replay
   const ordinary=nativeChat("unknown");ui.render(ordinary);
   assert.equal(inlineProcessing(ui).children[0].textContent,"結果不確定");
   assert.equal(inlineProcessing(ui).children.length,1);
+});
+
+test("native message an earlier version left reads as final and asks for a new message",async()=>{
+  const data=nativeChat("unknown");
+  data.tasks[0].native_receipt.failure_code="NATIVE_EARLIER_VERSION_UNFINISHED";
+  const ui=await open(data),panel=inlineProcessing(ui);
+  assert.equal(panel.open,true);
+  assert.match(panel.children[0].textContent,/較早的版本接下的訊息/);
+  assert.equal(panel.children[1].textContent,"這則訊息是較早的版本接下的，目前環境無法接續；請用新訊息再送一次。");
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
+
+test("native message an earlier version left and Hosted marked stalled reads with the same notice",async()=>{
+  const data=nativeChat("unknown");
+  data.tasks[0].native_receipt.failure_code="NATIVE_SOURCE_STALLED";
+  data.tasks[0].native_receipt.environment_notice={kind:"earlier_version_unfinished"};
+  const ui=await open(data),panel=inlineProcessing(ui);
+  assert.equal(panel.open,true);
+  assert.match(panel.children[0].textContent,/較早的版本接下的訊息/);
+  assert.equal(panel.children[1].textContent,"這則訊息是較早的版本接下的，目前環境無法接續；請用新訊息再送一次。");
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
 });
 
 test("native model refusal explains that nothing ran and another model may be asked",async()=>{
@@ -7348,6 +7474,54 @@ test("native model refusal names the model and the provider's sanitized reason f
   assert.equal(turnNode(ui).children[3].textContent,"這次回覆的結果還不確定。");
   assert.match(ui.text("processing-detail"),/NATIVE_TURN_UNKNOWN/);
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
+
+// Release 30 dev test (2026-10-14): Hosted saves a stopped turn as unknown with NATIVE_TURN_CANCELLED; the page said
+// 「這次回覆的結果還不確定」 under 「已要求停止這次回覆」. Tools may have run before the stop, so it says so.
+test("a stopped native turn says it stopped and may have acted, also after 更新回覆",async()=>{
+  const data=nativeChat("started"),stopped=copy(data);
+  data.tasks[0].native_receipt.cancel_requested=true;data.tasks[0].actions.cancel=action(false);
+  const task=stopped.tasks[0];
+  task.native_receipt={...task.native_receipt,status:"unknown",cancel_requested:true,failure_code:"NATIVE_TURN_CANCELLED"};
+  task.status.data.state=stopped.composer.conversation.turns[0].state="unknown";task.actions.cancel=action(false);
+  const ui=await open(data);
+  const text="已停止。停止前可能已經做了部分動作。";
+  const shown=()=>JSON.stringify(turnNode(ui),(key,value)=>key==="events"?undefined:value);
+  assert.match(shown(),/已要求停止這次回覆/);
+  assert.equal(ui.nodes.get("refresh-progress").disabled,false);
+  ui.holder.progressResponse=()=>({ok:true,json:async()=>copy(stopped)});
+  ui.click("refresh-progress");for(let i=0;i<4;i++)await ui.tick();
+  assert.equal(turnNode(ui).children[3].textContent,text);
+  assert.equal(shown().split(text).length-1,1,"said once in the turn");
+  assert.doesNotMatch(shown(),/結果還不確定|已要求停止/);
+  assert.match(inlineProcessing(ui).children[0].textContent,/^已停止/);
+  assert.equal(vm.runInContext("cancellationMessage(state.tasks[0])",ui.context),text);
+  // A stopped turn whose collaboration is unconfirmed keeps saying so in the summary.
+  const unconfirmed=copy(stopped);unconfirmed.tasks[0].native_receipt.notification_error="NATIVE_TURN_BUSY";ui.render(unconfirmed);
+  assert.equal(inlineProcessing(ui).children[0].textContent,"已停止；和另一位助理的協作還沒確認");
+  assert.match(inlineProcessing(ui).children[1].textContent,/不要重新交辦/);
+  // Any other unknown keeps the uncertain wording.
+  const other=copy(stopped);other.tasks[0].native_receipt.failure_code="NATIVE_TURN_UNKNOWN";ui.render(other);
+  assert.equal(turnNode(ui).children[3].textContent,"這次回覆的結果還不確定。");
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
+
+test("a stopped native turn with tool steps says 已停止 in the summary row, not 結果不確定",async()=>{
+  const stopped=nativeChat("unknown"),task=stopped.tasks[0];
+  task.native_receipt.failure_code="NATIVE_TURN_CANCELLED";task.native_receipt.cancel_requested=true;
+  delete stopped.composer.conversation.turns[0].progress;
+  task.progress={data:{state:"unknown",progress:{events:[
+    {seq:1,at:progressAt(0),kind:"tool_started",tool_name:"read_skill",status:"started"},
+    {seq:2,at:progressAt(20),kind:"tool_completed",tool_name:"read_skill",tool_start_seq:1,status:"succeeded"}]}},
+    recorded:true,finished:true,truncated:false,byte_length:400};
+  const ui=await open(stopped),row=()=>inlineProcessing(ui).children[0].textContent;
+  assert.equal(row(),"已停止・用了 1 個工具・20 秒");
+  const unconfirmed=copy(stopped);unconfirmed.tasks[0].native_receipt.notification_error="NATIVE_TURN_BUSY";ui.render(unconfirmed);
+  assert.equal(row(),"已停止；和另一位助理的協作還沒確認・用了 1 個工具・20 秒");
+  assert.match(inlineProcessing(ui).children[2].textContent,/不要重新交辦/);
+  // Any other unknown keeps the uncertain wording.
+  const other=copy(stopped);other.tasks[0].native_receipt.failure_code="NATIVE_TURN_UNKNOWN";ui.render(other);
+  assert.equal(row(),"結果不確定・用了 1 個工具・20 秒");
 });
 
 for(const lane of ["foundry-native-v1","foundry-responses-v1"]){
@@ -10964,4 +11138,95 @@ for(const row of confirmGatedActions){
 test("the confirm-gated action table has one row per action",()=>{
   assert.equal(confirmGatedActions.length,25);
   assert.equal(new Set(confirmGatedActions.map(row=>row.name)).size,confirmGatedActions.length);
+});
+
+// ADR-0009 §8 / M4 (phase 2c): the per-Agent notice the API delivers once with an owner's submit answer.
+const ENVIRONMENT_NOTICE_SENTENCES=[
+  [{kind:"environment_updated"},"助理已更新到新版本，工作檔也一起帶過來了。"],
+  [{kind:"environment_switched_without_files"},"已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。"],
+  [{kind:"environment_source_retired"},
+    "已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。"],
+  [{kind:"platform_version_changed",from_version:"41",to_version:"40"},
+    "平台把助理的執行環境換成了另一個版本（v41→v40）；FA 已記錄，相容就照常執行。"],
+];
+async function sendWithNotice(notice,{content="換版後的問題"}={}){
+  const ui=await open(switchingChat());
+  typeAttachmentText(ui,content);
+  ui.click("send-instruction");await ui.tick();
+  const post=ui.holder.pendingPosts.at(-1),started=copy(ui.holder.current.tasks[0]);
+  Object.assign(started,{task_id:"draft-rid",submit_request_id:"draft-rid",instruction:content,reply:null,
+    admission:{...started.admission,turn_number:2},submission:{state:"CONFIRMED"},
+    native_receipt:{...started.native_receipt,status:"started",...(notice?{environment_notice:notice}:{})},
+    status:{data:{state:"started"},observed_at:when}});
+  post.resolve({task:started});await ui.tick();await ui.tick();
+  return {ui,started};
+}
+const occurrences=(ui,sentence)=>[...ui.nodes.values()].filter(node=>node.textContent===sentence).length;
+for(const [notice,sentence] of ENVIRONMENT_NOTICE_SENTENCES){
+  test(`the ${notice.kind} notice shows once as a quiet status line, never as an error`,async()=>{
+    const {ui}=await sendWithNotice(notice);
+    const note=ui.nodes.get("environment-note");
+    assert.equal(note.hidden,false);
+    assert.equal(ui.text("environment-note"),sentence);
+    assert.match(html,/<p id="environment-note" class="reason" role="status" hidden><\/p>/,"a status line, not role=alert");
+    assert.equal(occurrences(ui,sentence),1,"one place only: the status line, not the chat bubbles");
+    assert.equal(ui.nodes.get("error").hidden,true);
+    assert.doesNotMatch(ui.text("error-message"),new RegExp(sentence.slice(0,8)));
+    assert.equal(vm.runInContext("lastError",ui.context),null);
+    // A later full state read (the receipt read again, without the one-time notice) keeps the line until the next send.
+    ui.render(ui.holder.current);
+    assert.equal(ui.nodes.get("environment-note").hidden,false);
+  });
+}
+test("the notice ends with the Agent's next accepted message, which carries none",async()=>{
+  const {ui}=await sendWithNotice({kind:"environment_switched_without_files"});
+  assert.equal(ui.nodes.get("environment-note").hidden,false);
+  const later=copy(ui.holder.current);
+  Object.assign(later.composer,{request_id:"draft-rid-2",editable:true,can_submit:true,content:null});
+  ui.render(later);
+  typeAttachmentText(ui,"下一則");
+  ui.click("send-instruction");await ui.tick();
+  const post=ui.holder.pendingPosts.at(-1),next=copy(later.tasks[0]);
+  Object.assign(next,{task_id:"draft-rid-2",submit_request_id:"draft-rid-2",submission:{state:"CONFIRMED"},
+    native_receipt:{...next.native_receipt,status:"started"},status:{data:{state:"started"},observed_at:when}});
+  delete next.native_receipt.environment_notice;
+  post.resolve({task:next});await ui.tick();await ui.tick();
+  assert.equal(ui.nodes.get("environment-note").hidden,true);
+});
+test("a notice kind this page does not know is ignored, never an error",async()=>{
+  const {ui}=await sendWithNotice({kind:"environment_rolled_back",to_version:"39"});
+  assert.equal(ui.nodes.get("environment-note").hidden,true);
+  assert.equal(ui.nodes.get("error").hidden,true);
+  assert.equal(vm.runInContext("lastError",ui.context),null);
+  assert.equal(vm.runInContext('environmentNoticeText({kind:"platform_version_changed",from_version:"x",to_version:"40"})',
+    ui.context),null,"a drift notice without its two versions says nothing");
+});
+test("after a server-side switch the same-RID resend's answer carries the switch notice",async()=>{
+  const c=serverFollowingCase(),ui=await open(c.data,{now:0});
+  const accepted=copy(c.accepted.tasks[0]);
+  accepted.native_receipt={...(nativeChat("unknown",true).tasks[0].native_receipt),status:"accepted",
+    environment_notice:{kind:"environment_switched_without_files"}};
+  ui.holder.templateResponses={[`/api/instructions/${c.rid}/submit`]:c.rejection,
+    [`/api/tasks/${c.rid}/submit-retry`]:{ok:true,json:async()=>{ui.holder.current=copy(c.accepted);return {task:accepted}}}};
+  typeAttachmentText(ui,"換版也只送一次");ui.holder.current=copy(c.refused);ui.click("send-instruction");
+  await ui.tick();await ui.tick();await fireDelay(ui,3000);
+  assert.equal(ui.text("environment-note"),"已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。");
+  assert.equal(ui.nodes.get("environment-note").hidden,false);
+  assert.equal(vm.runInContext("lastError",ui.context),null);
+});
+test("a manual retry of the original turn answered without a notice keeps the shown one",async()=>{
+  const c=serverFollowingCase(),ui=await open(c.refused,{now:0});
+  const sentence="已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。";
+  // The Agent's notice came with an earlier answer and is on screen.
+  vm.runInContext(`environmentNotices.set(selectedAgent,${JSON.stringify(sentence)});renderEnvironmentNotice()`,ui.context);
+  assert.equal(ui.nodes.get("environment-note").hidden,false);
+  ui.holder.templateResponses={[`/api/tasks/${c.rid}/submit-retry`]:{ok:true,json:async()=>{
+    ui.holder.current=copy(c.accepted);return {task:c.accepted.tasks[0]}}}};
+  const button=turnNode(ui).children.at(-1).children.find(node=>node.textContent==="以原內容重送");
+  assert.ok(button);
+  button.events.click();await ui.tick();await ui.tick();await ui.tick();
+  assert.equal(c.accepted.tasks[0].submission.state,"CONFIRMED");
+  // That answer carried no notice: the retry of an older message does not end the one shown.
+  assert.equal(ui.nodes.get("environment-note").hidden,false);
+  assert.equal(ui.text("environment-note"),sentence);
 });

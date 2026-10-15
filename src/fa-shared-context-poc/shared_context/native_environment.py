@@ -286,10 +286,22 @@ async def _check_store(runtime, name, key_category, *, progress=None):
 
 
 async def _drain_pages(runtime, after, source_sid, task_id, *, responses=False, idle_only=False, require_complete=False,
-                       progress=None, single_page=False, restart_changed_page=False):
+                       progress=None, single_page=False, restart_changed_page=False, settled=frozenset()):
     progress = (_ScanProgress(after=after, cursor_source="none" if after is None else "page_last_id")
                 if progress is None else progress)
     progress.responses = responses
+    if not require_complete:
+        # The omission check reads every completed receipt's checkpoint by design, so it always scans every key.
+        from .native_open_rids import read as read_open
+        open_set = await read_open(runtime)
+        if open_set is not None and open_set.complete_for == source_sid:
+            try:
+                async with asyncio.timeout(_SCAN_SECONDS):
+                    return await _scan_open(runtime, open_set, source_sid, task_id, responses=responses,
+                                            idle_only=idle_only, progress=progress, settled=settled)
+            except TimeoutError:
+                logging.getLogger(__name__).warning("FA_NATIVE_FOLLOW_SCAN_PENDING reason=read_deadline")
+                return "scan_pending", None, progress.responses
     try:
         # Omission checks stop between complete receipts; every constituent read has its own short deadline.
         deadline = monotonic() + _SCAN_SECONDS if require_complete else None
@@ -301,6 +313,8 @@ async def _drain_pages(runtime, after, source_sid, task_id, *, responses=False, 
                     options["deadline"] = deadline
                 if single_page:
                     options["page_limit"] = _CHECK_PAGE_KEYS
+                if settled:
+                    options["settled"] = settled
                 reason, after, responses = await _scan_page(
                     runtime, after, source_sid, task_id, responses=responses, progress=progress, **options)
                 if single_page or reason != "scan_pending" or deadline is not None and monotonic() >= deadline:
@@ -323,7 +337,9 @@ async def _drain_pages(runtime, after, source_sid, task_id, *, responses=False, 
 
 
 async def _scan_page(runtime, after, source_sid, task_id, *, responses=False, idle_only=False, require_complete=False,
-                     progress=None, deadline=None, page_limit=16):
+                     progress=None, deadline=None, page_limit=16, settled=frozenset()):
+    """``settled``: SIDs the API lists as previous (ADR-0009 §7a (i)); their unfinished receipts are not waited for
+    and stay unchanged."""
     from .native_turns import TURNS_STORE
 
     manager = (_check_store(runtime, TURNS_STORE, "receipt", progress=progress)
@@ -353,13 +369,18 @@ async def _scan_page(runtime, after, source_sid, task_id, *, responses=False, id
                 item = (await _check_read(receipt_read, "receipt", progress=progress)
                         if require_complete else await receipt_read)
                 original = runtime._check_rid(item, key.key[4:])
-                if original.value.receipt.state_profile == NATIVE_RESPONSES_PROFILE:
-                    blocker = responses_environment_blocker()
-                    if blocker is not None:
-                        raise Problem(503, blocker, "Responses environment continuation has not been selected")
-                    responses = True
+                if _settled_open(original, settled):
+                    # It stays open: keep it in the open-RID set, so a later follow reading only the set still sees it.
+                    from .native_open_rids import add as add_open
+                    await add_open(runtime, (original.value.receipt.request_id,))
                     if progress is not None:
-                        progress.responses = True
+                        if not key.id:
+                            raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original receipt cursor is missing")
+                        progress.page_offset = index + 1
+                        progress.page_digest = page_digest
+                    continue
+                if original.value.receipt.state_profile == NATIVE_RESPONSES_PROFILE:
+                    responses = _responses_seen(progress)
                 receipt = (original.value.receipt if idle_only else
                            await runtime.close_suspended_start(original, source_sid, task_id))
                 if progress is not None:
@@ -410,6 +431,55 @@ async def _scan_page(runtime, after, source_sid, task_id, *, responses=False, id
             progress.after = page.last_id
             progress.cursor_source = "page_last_id"
         return "scan_pending", page.last_id, responses
+
+
+def _settled_open(original, settled):
+    """An unfinished receipt on a SID the API lists as previous (ADR-0009 §7a (i)): not waited for, left unchanged."""
+    return original.value.receipt.hosted_session_id in settled and original.value.receipt.status in {"accepted", "started"}
+
+
+def _responses_seen(progress):
+    blocker = responses_environment_blocker()
+    if blocker is not None:
+        raise Problem(503, blocker, "Responses environment continuation has not been selected")
+    if progress is not None:
+        progress.responses = True
+    return True
+
+
+async def _scan_open(runtime, open_set, source_sid, task_id, *, responses, idle_only, progress, settled):
+    """Only the receipts the open-RID set lists, when it is complete for the source (``native_open_rids``): the same
+    decisions as ``_scan_page``, at a cost that follows the open work instead of every receipt ever written."""
+    from .native_open_rids import remove as remove_open
+    from .native_turns import TURNS_STORE
+
+    progress.after, progress.page_offset, progress.page_digest, progress.cursor_source = None, 0, None, "none"
+    if open_set.responses:
+        responses = _responses_seen(progress)
+    async with runtime._store(TURNS_STORE) as store:
+        for rid in sorted(open_set.rids):
+            progress.request_id_prefix, progress.conversation_id_prefix = rid[:8], None
+            item = await store.get_item("rid:" + rid)
+            if item is None:
+                # Added while its receipt is being created: that admission still holds ``admitting``, which the caller
+                # checked before this scan, and a later mark changes the ETag the caller's next Agent CAS compares.
+                logging.getLogger(__name__).info("FA_NATIVE_OPEN_RID_UNWRITTEN request_id_prefix=%s", rid[:8])
+                continue
+            original = runtime._check_rid(item, rid)
+            if _settled_open(original, settled):
+                continue
+            if original.value.receipt.state_profile == NATIVE_RESPONSES_PROFILE:
+                responses = _responses_seen(progress)
+            receipt = (original.value.receipt if idle_only else
+                       await runtime.close_suspended_start(original, source_sid, task_id))
+            progress.request_id_prefix = receipt.request_id[:8]
+            progress.conversation_id_prefix = receipt.conversation_id[:8]
+            if receipt.status in {"accepted", "started"}:
+                progress.waiting_request_id = receipt.request_id
+                return "accepted_or_started", None, responses
+            # Terminal, still listed: its own removal failed or never ran (a crash in between, an older writer).
+            await remove_open(runtime, rid)
+    return None, None, responses
 
 
 async def _save_agent(runtime, original, etag, replacement):
@@ -590,6 +660,10 @@ async def follow_session(runtime, command):
     ) == (runtime.identity.session_id, runtime.identity.agent_version, command.expected_session_id)
     if same and existing.state == "ready":
         return existing
+    if existing is None or existing.state == "ready":
+        # The last point where the record names how the source became the Agent's: a pending view replaces it below.
+        from .native_open_rids import check_hold
+        await check_hold(runtime, current.hosted_session_id, None if existing is None else existing.request_id)
     following_key = await _selected_following_key(runtime, current)
     record, record_etag = await _read(runtime, key=following_key)
     if record is not None and (
@@ -663,7 +737,8 @@ async def follow_session(runtime, command):
         reason, after, responses = await _drain_pages(
             runtime, record.after, existing.previous_hosted_session_id, current.task_id,
             responses=record.responses, idle_only=record.idle_only or record.files_required or omitted is not None,
-            require_complete=omitted is not None, progress=progress, restart_changed_page=record.idle_only)
+            require_complete=omitted is not None, progress=progress, restart_changed_page=record.idle_only,
+            settled=frozenset(command.settled_session_ids))
         record = _changed(record, responses=responses, page_offset=progress.page_offset, page_digest=progress.page_digest,
                           waiting_request_id=progress.waiting_request_id)
         if reason is not None:
@@ -713,7 +788,8 @@ async def follow_session(runtime, command):
         runtime, progress.after,
         existing.previous_hosted_session_id, current.task_id, responses=record.responses,
         idle_only=record.idle_only or record.files_required or omitted is not None,
-        require_complete=omitted is not None, progress=progress, restart_changed_page=record.idle_only)
+        require_complete=omitted is not None, progress=progress, restart_changed_page=record.idle_only,
+        settled=frozenset(command.settled_session_ids))
     if reason is not None:
         pending = _changed(record, phase="confirming", after=after, view=_changed(existing, reason=reason),
                            responses=responses, page_offset=progress.page_offset, page_digest=progress.page_digest,
@@ -743,4 +819,8 @@ async def follow_session(runtime, command):
     await _save_agent(runtime, current, etag, _changed(
         current, hosted_session_id=runtime.identity.session_id, environment=ready, following_supported=True,
         chain_task_id=binding_task_id(runtime.identity.agent_id, runtime.identity.session_id)))
+    if current.admission_started:
+        # The final scan above saw every open receipt; from this commit only this session admits, and adds each RID.
+        from .native_open_rids import mark_complete
+        await mark_complete(runtime, runtime.identity.session_id, ready.request_id, responses=bool(record.responses))
     return ready

@@ -229,9 +229,38 @@ Neal：「請嚴格依照hosted agent官方和grok bot的方式，詳細審視FA
 - （2026-10-13，ADR-0009 phase 1）API 在 Context Table 為每個 Agent 記一列綁定列（目前 SID、建立時的版本、實際版本、
   漂移旗標與通知位、之前的 SID），只記錄、不改任何回合結果；平台在同一 session 換了版本時，主人本人的回應帶
   `environment_notice`，phase 1 不清除（顯示在 phase 2）。詳見 [共用 README](../src/fa-shared-context-poc/README.md#binding-row)。
+  （2026-10-14，phase 2c）通知槽另記換環境通知；主人的工作台回應或 Teams 最終回覆寫出後，API 以 CAS 清除（至少一次），
+  工作台在輸入框下方狀態列顯示一次、不當錯誤；同一 SID 漂移只在工作台狀態欄位，Teams 不帶不清（M4）。詳見 [共用 README](../src/fa-shared-context-poc/README.md#g-phase2c-clear)。
+- （2026-10-13，ADR-0009 phase 2a，仍是 `foundry-native-v1`）Hosted 在 dispatch 前的拒絕（403 `NATIVE_TURNS_DISABLED`、
+  409 `NATIVE_SESSION_CHANGED`）多帶 `not_dispatched`、`reason`、`actual_version`，碼不變；`NativeSessionState` 多選填
+  `actual_version`；`replaced()` 不再拒絕 `pending` 的 follow 目標 SID（收緊的另一半延到 phase 3）；對話 `meta` 寫明 profile；v1 schema 快照測試。API 在 2a 不依新欄位改變任何
+  回合結果，只把 `actual_version` 記進綁定列。詳見 [共用 README](../src/fa-shared-context-poc/README.md#g-phase2a)。
+- （2026-10-13，ADR-0009 §7a phase 2b，CODE/offline）來源碰不到（不相容且閒置或已失效、相容但兩次讀到已失效、漂移過的
+  閒置 SID 只剩自己的工作在等）時，自動換環境走另一條「棄用來源換新環境」路徑：不 invoke、不讀檔、不 stop 來源，
+  來源上的回條不擋切換，不搬檔；來源從沒開始的回條由新 session 接手執行（M9：同一 RID 與請求，不請主人重送；來源已退役也一樣），已開始的
+  原樣保留；讀到之前 SID 上不可能再完成的回條（來源已退役，或停滯後被標記）以 `unknown`＋「較早的版本接下的」通知回報
+  （回條不改寫），可能還會完成的照一般進行中。切換後沒有對話卡住：沒有已完成回合的對話在新的、不同名的 SDK session
+  不帶 checkpoint 開始；被留下的 `started` 回條占住的對話，新訊息照常接單、依序排在它後面（不占 Agent 的其他對話、不需要
+  外部輪詢），等它結束，或進度停止 10 分鐘後先把它標成 `unknown` 再執行；輪到的 Responses 訊息由 Hosted 以 Agent 身分請 API
+  送出一次，呼叫端（例如 Teams relay）不再輪詢也一樣。接手後還沒送出的 Responses 訊息後面，下一則照常排隊、不拒絕。
+  來源不相容但仍 `active` 只觀察與記 log，不拒絕。詳見 [共用 README](../src/fa-shared-context-poc/README.md#abandon-source)。
+- （2026-10-14，ADR-0009 phase 3，CODE/offline）有綁定列的 Agent，送出、讀取與換環境改由綁定列定位，expected-version＝
+  紀錄的實際版本（V_rec），不再是 selector 的版本；selector 只決定新 session 的版本與要不要先跑保留的送出時 follow。
+  平台把同一 session 叫醒在另一個相容版本：記錄後照跑，同一 RID 只再送一次（可能已接單時先核原回條）；綁定列的 SID 已換：
+  沒派送才改送新 SID，否則先經新 SID 讀這個 RID，舊 SID 上已開始的不改送；Hosted 已切換、綁定列沒跟上：從該 SID 自己的
+  session 讀取補寫綁定列後改送，不記漂移；同一 SID 回 403 `NATIVE_TURNS_DISABLED`：不由 FA 拒絕，跑保留的 follow，
+  follow 還在進行或已換 SID 才回 `server_following` 讓工作台同 RID 自動重送，否則照現行回應。主人看不到版本拒絕。
+  呼叫綁定列的 SID 前先確認 selector 仍選它建立時的版本、沒有棄用決定、metadata 是 `active`／`idle`（冷程序或 1 天未用才讀，
+  與 selector 並行）；不成立就不呼叫它，改跑 follow（ADR-0009 §10 phase 0 保證）。Hosted 的 `replaced()` 收緊只對 API 經
+  綁定列定位的呼叫（`x-client-fa-locator`）：既不是目前 SID、也不是 `pending` 目標的 SID 一律 409（API 只經目前 SID 讀，
+  碰到時補寫綁定列）；其他呼叫照 2a 的版本比較。M5：新 SID 由目前 SID＋目標版本＋attempt 算出，
+  同一版本也能另建 session（退役或不相容且閒置的目前 SID 正是 selector 版本時）。詳見
+  [共用 README](../src/fa-shared-context-poc/README.md#g-phase3)。
 - 只在已知會變時重查：本程序的環境操作開始與結束時（操作期間的讀取不會喚醒正要停止的舊 session）；Hosted／平台回 `NATIVE_SESSION_CHANGED`、`AGENT_VERSION_FOLLOWING`、
   binding 不符或 404（重查一次並重做同一個讀取）；其他平台失敗（下一個請求重查）；同一綁定 1 天未用。
-- Hosted 的紀錄讀取先讀一次 Agent 紀錄，已有更新版本接手就 409 `NATIVE_SESSION_CHANGED`、不讀紀錄；
+- Hosted 的紀錄讀取先讀一次 Agent 紀錄，已有更新版本接手就 409
+  `NATIVE_SESSION_CHANGED`、不讀紀錄；`pending` 的 follow 目標 SID 例外，照常讀（2026-10-13，ADR-0009 §2 phase 2a）；
+  phase 3 起經綁定列定位的呼叫不論版本，凡不是目前 SID、也不是 `pending` 目標的 SID 都拒絕；
   expected-version 前置條件保留。送出仍先核一次 Agent 紀錄；接單前被拒只清快取，工作台用同一個 RID 重送，UNKNOWN 不重送。
 
 實作、量測與部署注意見[API 讀取直接用已知的 session](../src/fa-shared-context-poc/README.md#api-reader-cache)。

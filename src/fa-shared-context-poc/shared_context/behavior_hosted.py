@@ -836,6 +836,17 @@ def create_host(runtime: HostedRuntime, *, native_runtime=None, responses_handle
                     await native_runtime.recover_owned()
                     yield
             finally:
+                # Background open-RID removals (``NativeTurnRuntime._cas``) get a short bound; any cut stays stale.
+                close_runtime = getattr(native_runtime, "aclose", None)
+
+                async def drain_removals():
+                    if close_runtime is not None:
+                        try:
+                            await close_runtime()
+                        except Exception:
+                            logging.getLogger(__name__).warning("NATIVE_RUNTIME_SHUTDOWN_UNCONFIRMED")
+
+                await drain_removals()
                 # ADR-0005: kept SDKs stop with the VM, best effort; their checkpoints are already published.
                 close = getattr(getattr(native_runtime, "executor", None), "aclose", None)
                 if close is not None:
@@ -843,6 +854,8 @@ def create_host(runtime: HostedRuntime, *, native_runtime=None, responses_handle
                         await close()
                     except Exception:
                         logging.getLogger(__name__).warning("RESIDENT_SDK_SHUTDOWN_UNCONFIRMED")
+                    # A turn the executor stopped writes its terminal receipt and starts a removal; drain once more.
+                    await drain_removals()
 
         app.router.lifespan_context = native_lifespan
 

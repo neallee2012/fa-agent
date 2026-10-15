@@ -188,6 +188,11 @@ class NativeResponsesHandler:
                         await context.exit_for_recovery()
                     original = await self.runtime._rid(rid)
                     receipt = original.value.receipt
+                    if receipt.hosted_session_id != self.runtime.identity.session_id:
+                        # ADR-0009 M9: the session the Agent switched to adopted it; it runs there, untouched here.
+                        yield stream.emit_failed(code="NATIVE_SESSION_CHANGED",
+                                                 message="The original RID now belongs to another Hosted session.")
+                        return
                     if receipt.status != "accepted":
                         receipt = await self.runtime._reenter(
                             original, failure_code="NATIVE_TURN_UNKNOWN" if (
@@ -240,6 +245,8 @@ class NativeResponsesHandler:
                                     if not running.done():
                                         running.cancel()
                                     await asyncio.gather(running, return_exceptions=True)
+                            elif original.value.receipt.hosted_session_id != self.runtime.identity.session_id:
+                                receipt = original.value.receipt
                             else:
                                 receipt = await self.runtime._reenter(original)
                         signals(control)

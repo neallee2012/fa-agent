@@ -1,11 +1,38 @@
 # Shared Context POC
 
+## 換版只讀還開著的回條（審計第 8 項，2026-10-14，CODE/offline，未部署）
+
+**問題：** 換版（`session_follow`）在 `pending` 期間要確認舊 session 沒有工作。原本 `_drain_pages`／`_scan_page`
+把 `fa/v1/turns` 的每個鍵列出來、每張 `rid:*` 回條都讀一次，而且 prepare 與 commit 各做一次；回條永不刪除（CTX-03），
+`pending` 期間新工作一律 503 `AGENT_VERSION_FOLLOWING`，所以每次部署的停擺時間跟著歷史一直變長。
+
+**做法（ADR-0009 §5「開放 RID 集合的現行實作」）：** `native_open_rids.py` 在 `fa/v1/turns` 的 `open-rids`
+項目只記還開著（`accepted`／`started`）的 RID（最終形狀，2026-10-14 修訂：不放進 `agent` 紀錄，開始執行也不寫它）。
+新 RID 接單時，集合與 `agent` 紀錄、`rid:`、對話 meta 一起並行讀，加入是對讀到的 ETag 做一次 CAS、與建立回條並行；
+失敗則在清 `admitting` 前再加，仍失敗就不清 `admitting`、送出回 503；同 RID 重送時補加並清除，回合才執行一次（follow 只等 `admitting` 清掉）。
+回條寫成終態後在背景移除（失敗只留多餘的一筆，下次掃描讀到已終態就移除；關機時短時限等它做完）。
+follow 只有在集合的 `complete_for` 等於這次來源 SID 時才只讀集合；否則照舊全掃描（第一次就是一次性補齊），
+commit 成功後才把 `complete_for` 設成新 SID、`complete_since` 設成這次 follow。follow 開始時若來源的環境不是
+`complete_since` 那一次（同一 SID 經棄用來源換新環境又拿回 Agent），先清掉標記再全掃描；棄用本身不讀寫集合。
+沒有改 `agent` 紀錄的形狀（舊 image 與退版仍讀得懂，ADR-0009 M1）。
+
+**影響：** 補齊之後每次換版讀 1 次 `open-rids`，加上集合裡的開著回條（通常 0～幾張），兩次掃描都一樣，與歷史數量無關。
+每個 Agent 第一次從舊 image 換到這版、棄用來源換新環境或退版之後的下一次換版，會再全掃描一次。
+送出路徑一般不多來回（集合和其他接單讀取並行讀，加入的 CAS 與建立回條並行）；回合結束的移除在背景，
+不延後同一 chain 的下一個回合。`fa/v1/n6-probe` 的合成回條在另一個 store，不受影響。
+省略檔案的檢查（`require_complete`）仍全掃描。
+
+**Verified against：** `test_native_open_rids.py`（補齊一次後只讀開著的回條、讀取計數；列出的開著回條仍擋住換版；
+標記不是這個來源就全掃描；送出時集合在接單標記前讀好、加入只寫一次；接單加入、終態移除；移除在背景、不卡下一個回合、
+關機時等它；同一 SID 經真正的棄用路徑拿回 Agent 時棄用不碰集合、下一次換版全掃描；終態寫入與移除之間崩潰不藏也不卡；
+兩次加入都失敗時回 503、`admitting` 留著讓 follow 等，同 RID 重送才補加、清除並只執行一次），以及原有 follow／abandon／turns 測試。
+
 <a id="teams-relay"></a>
 ## Teams 聊天轉送路由（N2 T1，2026-10-10，預設關閉；已在作者的測試環境部署並實測，預備環境沒開）
 
 設計見 [teams-chat-design.md](../../docs/teams-chat-design.md#n2-設計)；relay 本身見 [fa-teams-relay](../fa-teams-relay/README.md)。
-程式在 `shared_context/native_teams_relay.py`，只有 `FA_TEAMS_RELAY_ENABLED=1` 才裝 `POST /teams-relay/v1/turns` 和 `POST /teams-relay/v1/decisions`
-（root API；旗標開但缺 Team data Table 或 native work policy 時啟動失敗）。
+程式在 `shared_context/native_teams_relay.py`，只有 `FA_TEAMS_RELAY_ENABLED=1` 才裝 `POST /teams-relay/v1/turns`、`POST /teams-relay/v1/decisions`
+和 `POST /teams-relay/v1/acks`（root API；旗標開但缺 Team data Table 或 native work policy 時啟動失敗）。
 
 - **設定。** `FA_TEAMS_RELAY_AGENTS`＝JSON `{"<relay instance identity oid>": "<agent_id>"}`；oid 須是標準 GUID，
   一個 relay 對一個 Agent，不可重複。
@@ -19,13 +46,41 @@
   回 409 `NATIVE_RID_CONFLICT` 時，改讀原回條（文字相同才算），回它的狀態。
 - **TeamsChat。** key＝`tc-`＋sha256(relay oid|platform conversation) 前 40 碼，存在 Team data Table
   （`TableRepository.create` 只建一次，partition `teams-chat-v1-<tenant>-<team>`）。沒有就以新對話送出，回合被接下後建立；
-  兩者之間當掉時，同一則訊息再打會從原回條讀出 CID 補寫。
+  兩者之間當掉時，同一則訊息再打會從原回條讀出 CID 補寫。建立後不改，欄位固定四個（舊版 API 也照樣讀得到）。
+- **補上先前的回覆（2026-10-14）。** relay 等 110 秒就結束，之後完成的回覆原本只在工作台。只有請求帶 header
+  `X-FA-Relay-Ack: 1`（會 ack 的 relay，且只在一對一對話帶它，見 [relay README](../fa-teams-relay/README.md)）時才做下面這些；沒有這個 header 時不記錄、不附加，回覆和之前完全一樣
+  （舊 relay 永遠不 ack，記了只會每則一直重附）。API 回某個回合 `running`（或 `needs_approval`、或拒絕後回合仍在跑）時，
+  把它的 RID 記在 `TeamsPending`：同一個 partition 的另一列，key＝`tp-`＋sha256(relay oid|agent_id|主人 oid) 前 40 碼，
+  `{schema, key, agent_id, pending}`，`pending` 是 `{rid, to, at}` 依記錄順序，最多 8 筆，滿了丟最舊的一筆並記 log，那則仍在工作台；上限調低後，讀到較長的舊列也只留最新的幾筆（不回 502）；`at` 超過 24 小時（`PENDING_MAX_AGE`，例如 relay 退版又升級留下的）的也丟掉並記 log，不再當「剛完成」附上。
+  第一次記錄時 `create`，之後只用 ETag CAS（`replace`；412 `ETAG_CONFLICT` 或 409 `ALREADY_EXISTS` 就重讀重做，最多 4 次，
+  之後回 503 `TEAMS_CHAT_BUSY`），清空時留下空的 `pending`。以主人為範圍而不是以平台對話為範圍，所以 `/foundry_new_preview`
+  開的新對話也拿得到；核對過是主人才會讀寫（v1 只有一對一對話）。running 文字改成「這一輪還在跑；完成後，回覆會附在你下一則訊息的
+  回覆前面，也可以先到工作台看。」，relay 逾時就顯示這句。主人經同一個 relay 的下一則訊息（含批准指令）回最終狀態時，
+  API 依序讀 `pending` 裡的回合：`completed` 附上原回覆；`unknown`／`busy_refused` 附一句固定文字；等批准、提問或 Connect 卡的
+  在「先前的訊息還在等你處理：」下附上它的批准文字（含代碼），不列入 `confirm`，處理前每次都會出現；還在跑的留著。
+  文字是「先前的回覆（剛完成）：」、每則「「原訊息前 30 字」」加回覆、`——`，最後是這則的回覆；批准指令的結果和
+  `needs_approval` 回覆則放最前面、`——` 之後才是先前的回覆；代碼查不到、重複、已處理、過期等固定回答原樣回。
+  合計以 UTF-16 計不超過 24,000 bytes（保守預設；Teams 官方公布最低的訊息上限是 incoming webhook 的 28 KB），
+  單則太長就截斷並附「……（太長，完整內容在工作台）」，放不下的留到下一則並加一句說明。
+  附上的 RID（含這則自己，若它被記過）以 CAS 標成交給這則訊息（`to`＝這則的 `tr-` ID、`at`＝現在），回覆帶 `confirm`
+  列出它們。relay 收到最終回覆後、交給平台前打 `POST /teams-relay/v1/acks`（`RelayAck`：`chat_id`、`user_oid`、
+  `request_ids`；身分白名單與主人核對同 `/turns`，非主人 403），API 才以 CAS 刪掉這些 RID；不在列上的 RID 不受影響。
+  交給某則訊息的 RID 120 秒內不會再交給別則（relay 最多等 110 秒），所以同時兩則訊息不會各附一次；同一則訊息重打
+  （回應遺失）拿到同樣內容。所以通常只附一次；**交付未知時保留**：ack 沒送到（逾時、5xx）時紀錄不刪，120 秒後下一則訊息
+  會再附一次，寧可罕見地重複，也不遺失。N2 拿不到 Teams 的送達回條，所以「relay 已收到最終回覆」是最接近的證明；relay 交給平台之後
+  平台若沒送到 Teams，這和今天每一則一般回覆的風險相同。附加過程讀不到某個回合或 CAS 用完時，這則訊息照常只回自己的回覆，
+  先前的留到下一則；記錄寫不進去時（Table 錯誤或 503 `TEAMS_CHAT_BUSY`）只記 log，這則的回覆照常回，`running` 時回原本的
+  「這一輪還在跑，完成後結果在工作台。」而不承諾下一則（之後可能補不到它，結果仍在工作台）。新舊版本混用時任一邊先部署都可以：舊 API 忽略 header、`TeamsChat` 從不改形狀，退回舊 API 也照常讀。
 - **回覆。** `completed`→`done`＋回合最後回覆（多頁時讀完並核 hash）；`busy_refused`→`busy`；`unknown`→`failed`
   「這一輪沒有完成，請到工作台查看。」；`accepted`／`started` 時，這個回合在 HITL 有未處理的批准卡、提問或 Connect 卡
   →`needs_approval`（沒有設定工作台網址，所以只回文字；批准卡、提問、Connect 卡各有一句，依序取第一個），否則 `running`。Teams 回合是 `human_origin`，批准照 #751 一直等。
-- **批准指令（2026-10-11，Neal 核准方案 B）。** 批准卡的文字對每張開著的卡附 6 位代碼（`approval_code`＝sha256(pending_id) 取十進位後六碼），請主人回覆「允許 代碼」或「拒絕 代碼」；提問、Connect 卡和排程（routine）批准卡仍只回工作台文字。relay 認出指令就打 `POST /teams-relay/v1/decisions`（`RelayDecision`：`chat_id`、`activity_id`、`user_oid`、`choice`＝`allow_once`／`deny`、`code`；欄位嚴格，別的選擇或多餘欄位回 422），指令不進模型。身分白名單與主人核對和 `/turns` 相同；由 TeamsChat 找 CID，`find_approval_ids`（`native_hitl_attention.py`，只讀掃描，含已決定的卡）依代碼找卡，再比對 agent＋CID：沒有對話、沒有符合、多於一張各有固定文字。剛好一張就以主人身分（多一個 `approve`）送既有 `NativeHitlDecision`（`allow_once`／`deny`，`request_id`＝`td-`＋sha256(pending_id|choice|規則版本|ETag) 前 40 碼）；已存同一個選擇就直接回同一個成功，相反選擇「這個項目已處理過。」，過期「這個項目已過期。」，送出時輸給並行決定也改讀卡片已存狀態。成功後讀原回合回條，沿用 `/turns` 的狀態→文字對照；拒絕且回合還在跑回「已拒絕，這一步沒有執行。」。此路由不經 `/native-hitl/v1/decisions` 的實時推播。
+- **批准指令（2026-10-11，Neal 核准方案 B）。** 批准卡的文字對每張開著的卡附 6 位代碼（`approval_code`＝sha256(pending_id) 取十進位後六碼），請主人回覆「允許 代碼」或「拒絕 代碼」；提問、Connect 卡和排程（routine）批准卡仍只回工作台文字。relay 認出指令就打 `POST /teams-relay/v1/decisions`（`RelayDecision`：`chat_id`、`activity_id`、`user_oid`、`choice`＝`allow_once`／`deny`、`code`；欄位嚴格，別的選擇或多餘欄位回 422），指令不進模型。身分白名單與主人核對和 `/turns` 相同；由 TeamsChat 找 CID，`find_approval_ids`（`native_hitl_attention.py`，只讀掃描，含已決定的卡）依代碼找卡，再比對 agent，且卡屬於這個 CID 或屬於 `TeamsPending` 記著的回合（只限帶 `X-FA-Relay-Ack: 1` 的請求；附到新對話的代碼在那裡也能用，新對話第一則就打代碼也一樣）：沒有 CID 也沒有記著的回合、沒有符合、多於一張各有固定文字。剛好一張就以主人身分（多一個 `approve`）送既有 `NativeHitlDecision`（`allow_once`／`deny`，`request_id`＝`td-`＋sha256(pending_id|choice|規則版本|ETag) 前 40 碼）；已存同一個選擇就直接回同一個成功，相反選擇「這個項目已處理過。」，過期「這個項目已過期。」，送出時輸給並行決定也改讀卡片已存狀態。成功後讀原回合回條，沿用 `/turns` 的狀態→文字對照；拒絕且回合還在跑回「已拒絕，這一步沒有執行。」。此路由不經 `/native-hitl/v1/decisions` 的實時推播。
 - **測試。** `tests/shared_context/test_native_teams_relay.py`（沿用 `responses_api` fixture，只換掉 Hosted／平台 HTTP；
-  HITL 以替身回答）；`test_native_teams_relay_decide.py` 用真的 `NativeHitlService`（假 Table）測代碼查找與決定。
+  HITL 以替身回答）；`test_native_teams_relay_decide.py` 用真的 `NativeHitlService`（假 Table）測代碼查找與決定；
+  `test_native_teams_relay_catch_up.py` 測補上先前的回覆（沒有 header 的舊 relay 回覆不變也不記錄、ack 後不再附、依序、
+  還在跑的留著、未 ack 保留並在 120 秒後再附、新對話也拿得到而別的 relay 或非主人清不掉、`TeamsChat` 位元組不變、
+  清除與記錄的 CAS 競爭、別則訊息先拿走就不重複、長回覆截斷、等批准的先前訊息附上代碼、批准結果與代碼放最前面、
+  附到新對話的代碼在那裡能用（含新對話第一則）、上限調低只留最新的、超過 24 小時的紀錄不附、記錄寫入失敗不影響這則回覆）。
 
 <a id="typing-prewarm"></a>
 ## 打字時先叫醒 VM（冷回合預熱，2026-10-07，dev 已量測；預設關閉，stage 自第 22 版開啟）
@@ -875,7 +930,7 @@ dev 2026-10-12：呼叫 idle（compute 已回收）的舊 session，平台會在
 
 [ADR-0009 §2](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#2-agent-綁定列只記位置與實際版本)：
 API 在既有 Context Table 為每個 Agent 記一列「目前的 SID 在哪、它實際跑哪一版」。phase 1 **只記錄**：不改任何回合的
-結果，送出、讀取與換環境仍照現行程式定位（`_scoped`、`_latest_version_reader`、`_metadata_sessions` 到 phase 3 才改查這一列）。
+結果（phase 3 起送出、讀取與換環境改由這一列定位，見 [phase 3](#g-phase3)）。
 
 - **位置與寫法：** `shared_context/native_binding.py`。PartitionKey `native-binding:<sha256(tenant, team)>`（不與舊的
   authority 分割區共用），RowKey `agent:<agent_id>`；經 `TableRepository` 的 get／create／replace，寫入一律帶剛讀到的
@@ -883,29 +938,311 @@ API 在既有 Context Table 為每個 Agent 記一列「目前的 SID 在哪、�
   不經 Files、不 stop）。FA 不刪這一列。
 - **欄位：** 目前 SID、這個 SID 建立時綁的版本、同一 SID 漂移旗標、漂移通知待送位與通知的 vY（`notice_to_version`：設定
   旗標時觀察到的版本，與旗標同一次寫入；紀錄的實際版本之後還會變）、紀錄的實際版本（含觀察時間與來源：`vm`＝VM 接受為
-  expected 或自報，`claim`＝認領時讀到、沒有 VM 確認的 metadata；`metadata-active` 是 ADR 的標籤，phase 1 不寫）、最近一次讀到的 `get_session` `created_at`（只在既有流程本來就讀時順便記，可能是空的）、
-  協定 profile、之前的 SID 清單（各附版本，最多 64 個）、最近一次換環境的理由與 `files_migrated`。
+  expected 或自報，`claim`＝認領時讀到、沒有 VM 確認的 metadata；`metadata-active`＝phase 3 起舊 image 漂移時 metadata 的版本，VM 接受為 expected 後才寫）、
+M5 新 SID 的 attempt（`fresh`，phase 3；只在新 SID 讀回不能用時才寫）、最近一次讀到的 `get_session` `created_at`（只在既有流程本來就讀時順便記，可能是空的）、
+  協定 profile、之前的 SID 清單（各附版本，最多 64 個）、最近一次換環境的理由與 `files_migrated`；phase 2c 起另有通知槽的
+  換環境通知 `switch_notice`（`updated`／`without_files`／`source_retired`，沒有時不寫出，既有列位元組不變）。
 - **寫入時點：** ① 認領（Insert Entity，已存在就讀回、不覆寫）：主人送出成功後、或 follow 停止來源前讀來源 metadata 時；
   讀到的版本不同於建立時的版本，同一次寫入設定漂移旗標與通知位。② 觀察到不同版本：較新 image 的 409
   `NATIVE_SESSION_CHANGED` 帶 `actual_version`（來源 `vm`）；舊 image 只在 VM 接受了 expected＝這個版本（送出成功）之後寫
   （來源 `vm`），被拒絕時什麼都不寫。旗標只從「未設定」變「設定」那次一起設通知位；漂移後漂回也不清旗標。
   ③ 換環境 commit 後（follow／retarget 的 `ready` 結果，含重跑回傳的同一個 `ready`）：目前 SID＝新 SID、建立時的版本＝
   commit 結果的 `hosted_agent_version`、清旗標與通知位、來源 SID 加進之前的 SID 清單；commit 的之前 SID 不是這一列的目前
-  SID 時，兩個都加。已寫過就不再寫，所以 commit 後、寫入前崩潰由下一次 follow 補寫。
-- **通知：** 通知位是「待送」時，主人本人的回應帶結構化欄位 `environment_notice`
-  （`{"kind":"platform_version_changed","from_version":"vX","to_version":"vY"}`；vX＝SID 建立時的版本、vY＝`notice_to_version`）：工作台的 `/native-turns/submit`、
-  `/responses-turns/submit` 回條，以及 Teams 主人回覆的 `RelayReply`。群組啟動、routine、Agent 間交辦、HITL 等非主人
-  路徑不帶也不清。**phase 1 不清除**：清除與工作台、Teams 的顯示一起在 phase 2 實作（ADR-0009 §4 末段、
-  §8 待辦），現在清了就沒人看到；所以在 phase 2 之前每個主人回應都會再帶一次。
+  SID 時，兩個都加。已寫過就不再寫，所以 commit 後、寫入前崩潰由下一次 follow 補寫。同一次寫入設 `switch_notice`：
+  `files_migrated=true`→`updated`；`false` 或沒有值（image 沒有工作檔功能，實際上沒搬任何檔）→`without_files`（只有確認搬了
+  工作檔才說「已更新、工作檔也帶過來」）；棄用來源（7a）依決定時的 `source_status`：`idle`→`without_files`、
+  `failed`／`deleted`／`expired`／404→`source_retired`。還沒送出的較嚴重通知不被後來的換環境蓋掉（M4：沒帶工作檔的說明不會被「已更新」蓋掉）。
+- **通知（通知槽，ADR-0009 §4 末段、§8、M4）：** 槽裡有待送的通知時，主人本人的回應帶結構化欄位 `environment_notice`：
+  換環境通知（`environment_updated`／`environment_switched_without_files`／`environment_source_retired`）優先，否則漂移通知
+  （`{"kind":"platform_version_changed","from_version":"vX","to_version":"vY"}`；vX＝SID 建立時的版本、vY＝`notice_to_version`）。
+  帶的地方：工作台的 `/native-turns/submit`、`/responses-turns/submit` 回條，以及 Teams 主人的**最終**回覆 `RelayReply`
+  （讀取路徑也帶，不只第一次 submit 輪詢；`running` 回覆不帶；§8 句子另接在 `text` 最後一段，relay 只轉 `text`，不必改 relay）。
+  Teams 只帶換環境通知：同一 SID 相容漂移只在工作台狀態欄位顯示、不進聊天文字（ADR-0009 M4 的 A 第 2 項），所以 Teams
+  回覆不帶也不清，留給工作台。
+  群組啟動、routine、Agent 間交辦、HITL、reconcile 與一般讀取不帶也不清。<a id="g-phase2c-clear"></a>**清除（phase 2c）：**
+  回應完整寫出後（工作台 HTTP 回應、Teams relay 路由的回應；Starlette background task，body 送完才跑）以 CAS 清除
+  （`NativeBindingStore.clear_notice`）；衝突就重讀，槽裡仍是同一則通知才清，換成別則（例如更新、更嚴重的）就放著。
+  寫出前崩潰或寫出失敗不清；清除失敗只留 `NATIVE_BINDING_UNRECORDED operation=clear`，下一個主人回應再帶（至少一次，偶爾重複
+  一次可接受；回應寫出後在網路上遺失則漏掉，界線 7）。清除成功留 `NATIVE_ENVIRONMENT_NOTICE_CLEARED`。通知槽每個 Agent
+  一個，由第一個主人回應清掉，其他對話不再顯示（M4）。**版本差異：** 新的 `switch_notice` 欄位與通知種類只往前相容：
+  2b 以前的 API 讀到帶 `switch_notice` 的列會得到 `NATIVE_BINDING_INVALID`（照 phase 1 規則只記 log、回合不受影響）。
+  這個欄位刻意維持嚴格（不讓舊 reader 略過）。**退版注意：** 部署前相容閘門以要部署的 API image 讀綁定列，退回 2c 之前的
+  image 時，只要還有一列的 `switch_notice` 沒送出，那個 image 的 `NativeBindingStore.rows()` 就是 `NATIVE_BINDING_INVALID`，
+  閘門打開（armed）時以 `rows_unread` 拒絕部署（[deploy README](../../deploy/README.md#compat-gate)）；通知送出、清除後欄位不寫出，
+  列又讀得到。stage 目前沒打開閘門，只會報告 `observe`。
+  部署先更新 API、後更新工作台，舊 bridge 解到不認識的通知種類會回 502，所以用能力訊號（同 `X-FA-Relay-Ack` 的做法）：
+  新 bridge 的每個 API 請求帶 header `X-FA-Notice-Kinds: 2`；主人的 submit 只在有這個 header 時才帶三種換環境通知、
+  回應寫出後才清除。沒有這個 header 時和 phase 2c 之前完全一樣：只帶漂移通知（槽裡有換環境通知也不帶，因為舊 bridge
+  解不了），任何通知都不清，留給更新後的工作台第一個回應。沒有部署順序要求。Teams 路由不看這個 header：relay 只轉 `text`
+  （見[工作台 README](web_test_console/README.md#environment-notices)）。
 - **失敗不影響回合：** 這一列讀寫失敗只留 `NATIVE_BINDING_UNRECORDED` log，回合照原結果回（讀失敗時這次不帶通知）；
   下一次觀察再寫同一個 CAS。送出成功後多一次 Table 點讀（約 10–30 ms，未量測；沒有與送出並行）。
   其他 log：`NATIVE_BINDING_CLAIMED`、`NATIVE_VERSION_OBSERVED`、`NATIVE_BINDING_DIVERGED`（觀察到的 SID 不是這一列的
   目前 SID：不一致，不記漂移）。
-- **限制：** 現行 image 的 409 沒有 `actual_version`，而現行讀取器在 metadata 版本不同時就不送（`_platform_reader`），
-  所以 phase 1 在舊 image 上實際寫得到的漂移只有「認領時已漂移、之後又漂回」；漂移重送與核回條屬 phase 3。
+- **限制：** 2a 之前的 image 的 409 沒有 `actual_version`（2a 起帶，見 [phase 2a](#g-phase2a)），而現行讀取器在
+  metadata 版本不同時就不送（`_platform_reader`），所以 phase 1 在舊 image 上實際寫得到的漂移只有「認領時已漂移、之後又
+  漂回」；漂移重送與核回條屬 phase 3。
 
 **Verified against：** `tests/shared_context/test_native_binding.py`（離線替身，`InMemoryRepository` 代 Table）。
 未部署、未在 Azure Table 或雲端驗證。
+
+<a id="g-phase2a"></a>
+### ADR-0009 phase 2a：協定欄位與 profile 快照（CODE/offline，未部署）
+
+ADR-0009 phase 2 拆成四個 PR：**2a** 協定欄位，仍是 `foundry-native-v1`、與 v1 完全相容（本節）；**2b** v1→v2 遷移的
+必要範圍（§7 三項、§7a）；**2c** 工作台與 Teams 顯示第 8 點通知、通知位清除；**2d** profile 換成 `foundry-native-v2`
+與支援集合判斷，拆成 2d-i（擴充）與 2d-ii（收斂），排在 phase 3 之後（ADR-0009 M1）。2a～2c 是 v1 時代的一般部署。2a 對使用者沒有任何可見改變：不多錯誤、不多訊息、送出路徑不多呼叫。
+
+- **Hosted 在 dispatch 前的拒絕：** 403 `NATIVE_TURNS_DISABLED`（profile 不同）、409 `NATIVE_SESSION_CHANGED`
+  （expected-version 不同；或這個 SID 已被取代、不讀紀錄）的本文多帶 `not_dispatched: true`、`reason`
+  （`profile`／`runtime`〔Hosted 沒有 native runtime〕／`version`／`replaced`）與 `actual_version`（VM 的 `FOUNDRY_AGENT_VERSION`）；碼不變。
+  `behavior_native_turn_wire.before_dispatch` 是唯一的寫法。
+- **API 在 2a 不依這些欄位改變行為：** 帶 `reason` 的 `not_dispatched` 不轉成「接單前拒絕」（否則送出路徑會多跑一次
+  follow、工作台的狀態與文案也會變），回應與先前相同；`actual_version` 只進綁定列（version 409，來源 `vm`，
+  [綁定列](#binding-row)）。phase 3 的送出流程才使用它們（[phase 3](#g-phase3)）。
+- **`NativeSessionState.actual_version`：** 選填，沒有就不輸出，所以舊 image 的 state 照常解碼。API 的
+  `/prepare/reconcile` 回應不轉出這個欄位：較舊的工作台以 `extra="forbid"` 解碼（`agent_onboarding.py`）。
+- **`replaced()` 只放寬、不收緊：** 目前 SID 與 `environment.state="pending"` 的目標 SID 一律不算被取代，所以
+  follow 進行中，目標 SID 即使版本比來源低（平台漂移讓版本不單調）也照常服務 `_RECORD_READS`。ADR §2 的另一半
+  （其他 SID 不論版本一律 409）**延到 phase 3**：phase 3 之前 API 仍依 selector 選讀取者，follow 卡在 `pending`、
+  selector 又前進時，經 retarget 候選 SID 讀 RID 會從「讀到」變 409，使用者看得到；所以其他 SID 在 2a 仍照版本比較，
+  等 API 改由綁定列定位再收緊（phase 3 已收緊，見 [phase 3](#g-phase3)）。
+- **state store 項目寫明 profile：** 對話 `meta`（`_Meta`）一律寫 `state_profile`。`NativeSubmit`、`NativeAgentReceive`、
+  `NativeRoutineSubmit`、`NativeRelayAcceptance` 與 `AgentTemplate` 的 `state_profile` 在 digest 裡（例如回條的
+  `submit_digest` 驗證 `original.sha256`），所以只省略固定的 `foundry-native-v1`（`unlabeled_profile`）：v1 的位元組
+  不變，存著的回條照驗、同 RID 重送照對；換 profile 後新的值一定寫出。沒標 profile 的項目照舊當 v1 讀。
+- **profile 快照：** `tests/shared_context/test_native_profile_snapshot.py`＋`fixtures/native_profile_snapshot.json`
+  記下 (a) wire DTO 與 (b) state store 項目（`behavior_wire`、`behavior_native_*_wire`、`behavior_sdk_state` 與所有
+  `native_*` 模組定義的 model）的 JSON schema、(c) `requirements-hosted.txt` 的 `github-copilot-sdk`／
+  `azure-ai-agentserver-*` 固定版本與 checkpoint 的 SDK／runtime 版本、(d) native checkpoint codec 與 checkpoint
+  profile 名稱；profile 沒換卻改了任何一項就失敗。v1 依 ADR §3 本來就永遠不相容，2b、2c 若改形狀就在 v1 下以
+  `FA_REGENERATE_PROFILE_SNAPSHOT=1` 只跑 `test_profile_snapshot_matches_the_current_profile` 這一個測試重產；2d-i 換
+  profile 時同樣重產。快照檔是在 `NativeSessionState.actual_version` 加入之後才產生的，所以釘住的是 2a 之後的 v1 形狀，
+  不是 2a 之前的 v1；v1 相容性由「選填欄位舊 image 照常解碼」與「v1 digest 位元組不變」兩組測試證明。JSON schema 看不到 `exclude_if`，由同一檔的 profile
+  標記測試補。
+- **混合版本：** 舊 API 不會呼叫新 image（`HostedVersions.current` 要求選定版本的 `fa_build` 與 API 完全相等，2a 不動）；
+  新 API 呼叫舊 image 時這些欄位都不存在，行為同現在。stage 的順序是 sync→API→工作台→follow，新 image 的 session 要到
+  follow 才有，所以新欄位不會遇到舊工作台；`/prepare/reconcile` 另外不轉出，保險。
+
+**Verified against：** `test_native_version_guard.py`、`test_native_binding.py`、`test_native_environment_metadata.py`、
+`test_native_profile_snapshot.py`（離線替身）。未部署、未在雲端驗證。
+
+<a id="g-phase3"></a>
+### ADR-0009 phase 3：送出改由綁定列定位、照 V_rec 送（CODE/offline，未部署）
+
+[ADR-0009 §4](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#4-送出一個回合怎麼處理實際版本與漂移)：
+有綁定列的 Agent，送出、讀取與換環境都以這一列定位：目前 SID、`x-client-fa-expected-version`＝紀錄的實際版本 V_rec，
+不再是 selector 的版本。selector 只決定下一個新 session 綁哪一版，以及要不要先跑保留的送出時 follow
+（`_follow_before_admission`，它與部署時 `follow_all` 都保留到 2d-i）。沒有綁定列（還沒認領）、讀不到（記
+`NATIVE_BINDING_UNRECORDED operation=locate`）、紀錄的 profile 不在支援集合，或這個 SID 已被本程序判定不相容時，
+照 phase 2 以前的 selector 定位，不拒絕。
+
+- **呼叫綁定列的 SID 之前（ADR-0009 §10 phase 0 保證，`_located`）：** selector 讀取與（冷程序或同一 SID 1 天未用時）
+  這個 SID 的 `get_session` metadata 並行讀，兩者都確認後才呼叫它：selector 指向的正是這個 SID 建立時的版本（selector
+  指向本 build 不服務的版本時照綁定列走）、沒有棄用決定、metadata 是 `active`／`idle`。任一不成立就不呼叫這個 SID：
+  送出改跑保留的 follow；讀取只在 selector 版本的目的 SID 存在時讀它（同 main 的讀取者），404／退役的不讀；預取的
+  `cached_reader` 同樣檢查，有綁定列時不退回舊的 selector 讀取者。metadata 讀取 401／403／5xx 照 main 回報。
+  留 `NATIVE_BINDING_SESSION_RETIRED invoked=False`。
+- **送出路徑不多延遲：** 綁定列在送出前讀一次（同一請求內預取與 `current()` 共用）；selector 與 metadata 並行，main 是
+  先後讀，所以呼叫 session 前的等待不比 main 長；只需 selector 時不佔 worker（`_LOCATE` 64 個，大於 anyio 預設 40 個
+  worker thread）。送出成功後，若 VM 接受的正是這一列記的 SID 與版本就不再讀 Table。
+- **漂移照跑：** session 讀取或送出被 409 `NATIVE_SESSION_CHANGED` 拒絕、SID 沒變、V_obs≠V_rec（較新 image 用
+  `actual_version`，立刻記 `vm`；舊 image 讀 `get_session` metadata，VM 接受 expected＝V_obs 後才記 `metadata-active`）：
+  以 V_obs 的版本定義（`get_version`，只在漂移時讀）判斷相容；相容就以同 RID、同 body、expected＝V_obs 再送**一次**
+  （拒絕沒有 `not_dispatched` 時先經同一 SID 讀這個 RID，`NATIVE_RID_MISSING` 才送）。不相容只記
+  `NATIVE_SESSION_CALL_INCOMPATIBLE`，交給保留的 follow，回 `server_following`（工作台同 RID 自動重送）。
+- **綁定列的 SID 已換：** 先重讀綁定列；沒派送就同 RID 改送新 SID，否則先經新 SID 讀 RID：終態照原回條；從沒開始的由
+  Hosted 在讀取時接手（M9）；舊 SID 上已開始的照原樣回報，不改送。
+- **不一致（V_obs＝V_rec，M3）：** Hosted 的 `agent` 紀錄已指向別的 SID、綁定列沒跟上：讀這個 SID 自己的
+  `session_read`（不是紀錄讀取，被取代的 session 照常回答），依其 `ready` 環境以 `record_switch` 補寫綁定列，再同 RID
+  改送新 SID；留 `NATIVE_BINDING_DIVERGED`，不記漂移。session 讀取時就發現的不一致同樣補寫後改用新 SID。
+  補寫走 `record_switch`，所以也照 phase 2c 寫下這次換環境的通知（`switch_notice`）；同一請求的回應就以切換後的綁定列
+  帶出它（`_bound` 用回答的那個 client 的綁定列），工作台送了 `X-FA-Notice-Kinds: 2` 才顯示。
+- **403 `NATIVE_TURNS_DISABLED`、SID 沒變（§9）：** 確定沒派送（profile 檢查在讀 body 前）。記漂移（若帶
+  `actual_version`）、標記這個 SID、記 log，跑一次保留的 follow，回 503 `AGENT_VERSION_FOLLOWING`＋`not_dispatched`；follow 還在 `pending` 或已把 Agent 移出
+  這個 SID 才加 `server_following`（工作台以同 RID 自動重送），否則照現行回應（`refused_session_id`）。其他沒能解開的
+  確定拒絕也一樣。2d-i 之前沒有請求內切換，`active` 的不相容 VM 要等它閒置後由第 7a 點換走；
+  計畫內不會出現（API 與所有 image 都是 v1）。
+- **讀取：** 讀取者也由綁定列定位（快取最多 `SELECTOR_CHECK_SECONDS`），經上面 `_located` 的同樣檢查。讀取遇到漂移或 `replaced` 時同樣改用 V_obs 或補寫綁定列後重讀一次。
+- **`replaced()` 收緊（Hosted）：** 經綁定列定位的呼叫，API 帶 `x-client-fa-locator: binding-row`；這種呼叫遇到既不是
+  `agent` 紀錄的目前 SID、也不是 `pending` 目標的 SID，不論版本一律回 409 `replaced`。API 只經目前 SID 讀，所以只有
+  「commit 了、綁定列沒寫成」時會碰到，並由上一條補寫，使用者看不到。沒帶這個 header 的呼叫（沒有可用綁定列、仍經
+  selector 候選 SID 讀的 Agent，或 phase 3 之前的 API）照 2a 的規則：只有紀錄指向較新版本才算被取代，retarget 進行中或
+  滾動部署時的讀取不會碰到這個 409。
+- **`_scoped` 與對話：** 綁定列的目前 SID、之前的 SID 與它算出的目的 SID 都在範圍內；對話的執行 SID 在之前的 SID 清單、
+  讀取用的是目前 SID 時，交給 Hosted 自己的接續規則（`_continuation_blocker`），不在 API 回 409。回條維持嚴格。
+- **M5 新 SID：** `fresh_session_id`＝`"fa-native-"`＋`sha256(["fa-native-session-v2", project_endpoint, agent_id,
+  API identity, 目前 SID, 目標版本, attempt])` 前 48 碼。目的 SID 一律由 `destination_session` 算：沒有綁定列→世代 0
+  （由版本算出，`native_session_id`）；目前 SID 就是這個版本建立的、沒有棄用決定→目前 SID；這個版本的世代 0 既不是
+  目前也不是之前的 SID、這個版本也還沒加過 attempt→世代 0（第一次到這個版本照舊；它讀回已退役或醒在別的版本時也把
+  attempt 加一）；否則→新 SID。所以同一版本也能另建 session：部署時 `follow_all`
+  或送出時 follow 遇到「目前 SID 就是 selector 版本」時，先只讀 metadata 判斷棄用（退役兩次讀取、不相容且閒置），
+  寫下決定後才建立新 SID 並照第 7a 點切換；沒有決定就回 `current`、不呼叫任何 session。新 SID 讀回已退役或醒在別的
+  版本時，綁定列的 `fresh.attempt` 以 CAS 加一，下次換一個 SID。世代 0 的既有 SID 照常有效。
+
+**Verified against：** `test_native_send_path.py`、`test_native_binding.py`、`test_native_version_guard.py`
+（離線替身；M5 一案用真的來源與目的 Hosted runtime）。未部署、未在雲端驗證。
+
+<a id="abandon-source"></a>
+## 棄用來源換新環境（ADR-0009 §7a，phase 2b，CODE/offline，未部署）
+
+[ADR-0009 §7a](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#7a-棄用來源換新環境)：來源碰不到時，
+換環境不再等來源上的東西結束，而是另一條路徑直接換到新的 session。**另寫路徑**，不在 `follow_session` 裡加例外。
+
+- **入口與判斷（API，`behavior_native_sessions.py`）：** 只有自動換環境（部署時 `follow_all` 與送出時的 follow，都經
+  `advance`）會做新決定；判斷只讀平台 metadata（`get_session`）、版本定義（`get_version` 的 `FA_NATIVE_TURNS`）與綁定列，
+  **不 invoke、不經 Files、不 stop 來源**。適用：(i) 來源不相容（綁定列紀錄的 profile 或版本定義的 profile 不在支援集合）
+  且 `idle`／`failed`／`deleted`／`expired`／404，一次就算；(ii) 相容的來源讀到 404 或 `failed`／`deleted`／`expired`，
+  隔至少 `RETIRED_CONFIRM_SECONDS`（5 秒，跨 follow 嘗試、不在請求裡睡）再讀一次仍是，才算（只記在記憶體，API 重啟就重數；
+  5xx／逾時／401／403 一律不算）；(iii) 綁定列這個 SID 的漂移旗標已設定、metadata `idle`，而且一般 follow 只剩工作在等
+  （`accepted_or_started`、`admission_pending`、`task_active`、`task_unconfirmed`、`task_access_denied`）。
+  來源若正是 selector 版本算出的 SID，沒有另一個 SID 可換，照現行等待（ADR 第 9 點的限制）。
+- **決定先寫進綁定列（`abandon`：SID、理由、metadata 狀態、時間），再送切換。** 之後任何呼叫路徑（`advance`、明確的
+  `/environment` follow、不搬檔路徑）、任何 `idle_only` 都照這筆決定做，不再看 metadata，所以不會翻轉，也不會碰到
+  `_Following.idle_only` 不同的 409。
+- **切換（Hosted，`native_environment_abandon.py`，新指令 `session_abandon`）：** 新 session 只核 Agent 紀錄的目前 SID 與
+  ETag，寫不可變的 `environment:` 紀錄，CAS 成 `ready`：目前 SID＝自己、`admitting` 清空、新的 chain task
+  （`binding_task_id(agent, 新 SID)`）、`files_migrated=false`（`files_omission_reason=source_not_migratable`、
+  `source_invocation_refused`）。切換本身不看 task、不讀來源狀態；來源上的 `admitting`、chain task、steering 輸入都不
+  接續、不複製、不等。留 content-free log `NATIVE_ENVIRONMENT_SOURCE_WORK_LEFT`（task ID、狀態、lease、筆數）與
+  `NATIVE_ENVIRONMENT_SOURCE_ABANDONED`。**commit 之後（同在 admission lock 裡，新 session 還沒接任何新訊息）接手來源
+  從沒開始的回條**（M9，見下節）；其他留下的回條逐位元組不變，直到下節的停滯規則標記。重跑（commit 後、綁定列寫入前
+  崩潰）讀回同一個 `ready`、再接手一次漏掉的，API 依它補寫綁定列，不建立第二個 session。對話從共用的歷史與 checkpoint
+  接續。
+- **綁定列：** commit 後照 phase 1 的換環境寫法（目前 SID、建立時版本、清漂移旗標與通知位、來源進之前的 SID 清單），
+  `last_switch` 記 `abandon_source`、理由與 `source_status`（`idle` 對應 §8 不搬檔原句；其他對應「舊環境已失效」句；
+  顯示屬 phase 2c 工作台）。每個 Agent 第一次換環境後，經新 session 做一次有界的唯讀讀回（`session_unfinished`，3 秒）：
+  非目前 SID 的未完成回條，其 SID 補進之前的 SID 清單（版本不明）；讀不完或讀不到記 `unverified`。
+- **之後的 follow（§7a (i)）：** API 把之前的 SID 清單放進 `NativeSessionFollow.settled_session_ids`，Hosted 掃描回條時不等
+  這些 SID 的未完成回條（不改它們）；目前 SID 的未完成回條照舊等待。
+- **讀到未完成回條（§7a (e)，審查第 2 輪改）：** 只有**不可能再完成**的才請主人重送。`GET /requests/{rid}` 與狀態輪詢（含
+  Teams relay）讀到 `hosted_session_id` 在之前的 SID 清單的回條時：
+  - 來源在切換時已退役（綁定列這個之前 SID 記著 `retired`，來自 API 的棄用決定）上的 `accepted`／`started`：回讀取時的檢視
+    `status: "unknown"`、`failure_code: "NATIVE_EARLIER_VERSION_UNFINISHED"`、`environment_notice:
+    {"kind":"earlier_version_unfinished"}`（§8「這則訊息是較早的版本接下的……」），不帶 `dispatch`／`preview`；
+  - Hosted 因進度停止 N 分鐘標成 `unknown`（`NATIVE_SOURCE_STALLED`）的：保留自己的 `unknown` 與錯誤碼，加上同一個
+    `environment_notice`；
+  - 其他（來源 `idle` 或狀態不明，例如回填的 SID）：照實回報，不加通知。從沒開始的在這次讀取裡就被新 session 接手（M9），
+    回來時已是目前 SID 的；`started` 的可能還會寫完，照一般進行中（界線 7：不叫主人重送可能還會完成的工作），寫完就是
+    正常答案，停滯被標記後才是上一種。
+  回條本身不改寫、RID 不變；`unknown` 是工作台（和其他輪詢者）本來就當成終態的狀態，所以不會一直輪詢成「執行中」，也不會
+  被 reconcile 送去已離開的 session；工作台看 `failure_code` 或 `environment_notice.kind`，顯示「較早的版本接下的訊息」與
+  §8 原句。不在清單、也不是目前 SID 的照一般未決。只在回條的 SID 不是讀取用的 SID 時才讀綁定列，一般輪詢不多讀 Table。
+- **來源不相容但仍 `active`（§7a (h)(l)）：只觀察、記 log，不拒絕任何請求**（Neal 2026-10-13：絕不讓使用者看到拒絕）。
+  留 `NATIVE_ENVIRONMENT_SOURCE_INCOMPATIBLE_ACTIVE`，超過該版本的 `idle_timeout_seconds` 留一次
+  `NATIVE_ENVIRONMENT_SOURCE_ACTIVE_OVERDUE`；現行 follow 照常進行。
+- **零呼叫檢查點（§7a (k)）：** `FoundryHttpClient.invoke_native`（所有 `NativeTurnGateway._invoke`）、`SessionFiles` 每個 Files
+  呼叫、`FoundryResponsesClient` 帶 `agent_session_id` 的呼叫、`stop_session`，送出前都經 `native_binding.SessionGuard`。
+  **預設只觀察**：只對 follow 已判定不相容的 SID 留 `NATIVE_SESSION_CALL_INCOMPATIBLE`，不讀 Table、不拒絕。強制模式由
+  API 設定 `FA_NATIVE_SESSION_GUARD_ENFORCE=1` 打開（預設關；`0`／未設是關，其他值也當關並記 log）：讀綁定列，目前 SID
+  的 profile 不在支援集合就回 503 `AGENT_VERSION_FOLLOWING`＋`not_dispatched`，什麼都不送。依 ADR §7a，**2d-i 與請求內
+  切換一起打開**；在那之前擋下呼叫只剩拒絕，所以維持觀察。
+- **舊 Hosted image 的相容（`settled_session_ids`）：** 之前的 SID 清單只在非空時放進 follow 指令；目的 session 的 image
+  比本 PR 舊時，它以 422 `NATIVE_REQUEST_INVALID` 拒絕這個未知欄位（還沒讀寫任何東西），API 就不帶這個欄位重送一次，
+  之後對這個目的 SID 一律不帶（`NATIVE_ENVIRONMENT_SETTLED_UNSUPPORTED`）；那個 image 照舊等之前 SID 的回條。
+- **相容來源的兩次讀取（§7a (m)）：** 兩次讀到已失效要相隔至少 `RETIRED_CONFIRM_SECONDS`（5 秒），而且不超過
+  `RETIRED_PAIR_SECONDS`（60 秒）；第一次讀取太舊就重新起算，幾分鐘前的一次 404 不算確認。
+
+<a id="abandon-left-receipts"></a>
+### 切換後留下的回條：(r)(s) 與競爭規則（ADR-0009 §7a「(r)(s) 的競爭」）
+
+切換後沒有對話會卡住，也不會分叉、重複或同時跑兩個回合。新 session 只在留下的回條（另一個、較早的 SID 接下、仍
+`accepted`／`started`）**不可能再完成**時才往下走（`native_left_receipts.py`）：
+
+- **從沒開始的（`accepted`、沒有 `run_token`），來源退役與否都一樣：新 session 接手（M9，Neal 2026-10-13 核准；退役來源上的
+  也接手，審查第 3 輪總協調決定：平台跑不了它，接手只有好處）。** 對它的
+  `rid:` 項目做一次 CAS：`hosted_session_id` 改成新 SID、記下 `adopted_from`（原來的 SID），RID、原始請求（`command`、
+  `capture`、`submit_digest`）都不變；之後在新 session 照一般路徑跑一次，排在同一對話較新的訊息前面。時點：切換 commit 後
+  立刻有界地讀一遍 `fa/v1/turns`（`adopt_left`，3 秒，依建立時間），漏掉的在 API 讀到它時接手（`observe_left`），Responses
+  slot 的持有者在新訊息排到它時接手（接手後保有 slot；還沒送出時，下一則訊息照常接單、排在它後面，不回 `busy_refused`，
+  審查第 3 輪）。每個接手的回條都有自己的等待 task（Responses 的由它請 API 送出，見下面〈等待的 Responses 訊息由 Hosted 請 API
+  送出〉）。**來源晚到的開始被擋下：** 接手的 CAS 換了 ETag。
+  第 28 版 `_cas` 的寫入（Invocations 的 `started`、`_save_turn`）先帶接單時的舊 ETag 送出，被換過的 ETag 擋下，什麼都沒寫；
+  而 `adopted_from` 是本 PR 之前的 image 不認得的欄位（`extra="forbid"`），所以舊 image 每次**讀**這個項目都以
+  `NATIVE_STATE_INVALID` 失敗：execution slot 等待時每 0.1 秒的 `_observe_control`、slot 後的重讀、寫入被擋後的讀回
+  （「讀不了」只說讀；寫入是被 ETag 擋下）。所以它卡在 slot 裡的回合結束時不會開始、不會把新 session 已開始的回條標成
+  `unknown`；本 image 的來源則看到回條屬於另一個 SID（slot 後與 watcher 都核 SID；Responses 處理器 slot 後的重讀與
+  `started` CAS 被擋後的讀回也核，審查第 4 輪補上兩個情境的測試）。
+- **可以直接往下：** 已是終態；或來源在切換時已退役（API 的決定看到 `failed`／`deleted`／`expired`／404，`session_abandon`
+  帶 `source_status`，Hosted 在 commit 前寫不可變的 `retired:<sha256(SID)>`；平台跑不了它）上已開始的。退役來源上從沒開始的
+  照上一項接手，所以 (e) 的「較早的版本接下的」只對退役來源上已開始的、與停滯標記的回條發（接手還沒確認的 `accepted` 照實回報，
+  下一次讀取再接手）。
+- **`started`、來源 `idle`：排在它後面，不拒絕。** 只看共用 store 裡會變的東西：留下回條的 ETag，與它的公開進度快照
+  `progress:<sha256(RID)>` 的 ETag。第一次看到就把兩個 ETag 與 Hosted 牆上時鐘寫進 `stall:<sha256(RID)>`（同在
+  `fa/v1/turns`，VM 重啟後讀回，不重算）；任一個變了就重寫、重新計時；連續 `STALL_SECONDS`（N，預設 600 秒）都沒變，
+  **先**以 CAS 把回條寫成 `unknown`（`NATIVE_SOURCE_STALLED`），**再**往下。標記失敗或 503 不回給任何人：重讀，已終態就
+  往下，仍是 `started` 就當成「有變化」、重新計時、繼續等。標記之後來源晚到的保存被回條自己的 `run_token`／ETag 擋下
+  （`_save_turn` 的 CAS），只留下沒人引用的 `turn:{n}`。API 讀這種回條時也跑一次同樣的規則（不睡），所以只有輪詢、沒有
+  新訊息時，標記一樣會發生、讀起來帶 §8 通知。
+- **要等的訊息不占 Agent 的 chain、不被拒絕、依序（審查第 2 輪）：** 它維持 `accepted`，加進對話的 `left-queue`（對話
+  store 的一個項目，依接單順序），由它自己的 SDK task `fa-native-left-wait-v1`（durable，VM 重啟後由 SDK 接回）每
+  `POLL_SECONDS`（5 秒）看一次，每次看都會推進上面的停滯規則，**不需要任何外部輪詢**。只有佇列最前面的可以往下，所以同一
+  對話較早的訊息一定先跑，不管送的人是誰（工作台、Teams relay、其他 Agent）；已開始或已結束的由下一個讀者移出佇列。
+  輪到時 Invocations 放回 chain，Responses 取得 slot。這段等待不在 chain 裡，所以同一 Agent 的其他對話照常進行。
+- **(r) Invocations：** `_continuation_blocker` 在「`base_ckpt` 空、最後回條不是 `completed`」時不再回
+  `NATIVE_ENVIRONMENT_CHECKPOINT_UNAVAILABLE`：checkpoint 只在回合完成時保存，這等於對話沒有任何已完成的回合，沒有
+  checkpoint 欠著。新訊息照常 202 接單、進 chain 佇列；輪到它時（execution slot 之前）要等就照上一項離開 chain，回條維持
+  `accepted`，工作台看到的就是一般排隊中的訊息、沒有 `server_following`。最後回條是另一個 SID 的、又沒有 checkpoint 時，
+  `_allocate` 給這個對話**新的、不同名的 SDK session**（`resume=False`，不當成恢復），回合編號接續；之後這個對話從新
+  session 自己的 checkpoint 接續。有已完成回合的對話照常帶 checkpoint 接續，checkpoint 讀不到時照 CTX-03 拒絕（回合以那個
+  錯誤碼結束）。**等多久沒有固定上限（審查第 5 輪）：** 前面的回合只要還在進行（回條或公開進度在 N 之內有變），就一直等到
+  它結束，不論回合多長；只有停滯規則（N 分鐘沒變）會判定它跑不完。等待 task 的 SDK 逾時 `WAIT_TIMEOUT_SECONDS`（3600 秒，
+  審查第 4 輪起，之前是 SDK 預設的 1 天）只是單一 task 的長度，不是回合或等待的上限：逾時（或 VM 重啟後 SDK 接回時預算已過、
+  立刻觸發）時這個 task 啟動下一個 task（ID 由自己的 ID 推出，重跑同一個 task 不會多開）後結束，訊息照樣 `accepted`、留在
+  佇列。交接、讀回條或取消時遇到暫時錯誤（5xx、連線錯誤）不讓 task 失敗，隔 `POLL_SECONDS` 再做一次（審查第 6 輪；之前
+  task 會就此失敗，訊息停在佇列最前面、沒有 task 在看）。取消時回條寫成 `unknown`（`NATIVE_TURN_CANCELLED`）。
+- **(s) Responses：** slot（`_Meta.inflight_rid`）被留下的回條占住時，可以往下就以一次 meta CAS 把 slot 改成新 RID（回條
+  不動）；要等時新訊息照樣接單（`accepted`、`dispatch: not_taken`，人送的也不回 `busy_refused`）、照上一項排隊。取得
+  slot 後是 `needs_response`，由下面一項送出；主人的下一則訊息也會推進它（那則排在後面、`not_taken`，API 的
+  `_advance_inflight` 送出 slot 持有者）。佇列裡還有較早的訊息時，新訊息不搶 slot：slot 空著就先交給佇列最前面的，新訊息回
+  `not_taken`、`inflight_request_id` 指向它。slot 屬於目前 SID、**已送出**的持有者，佇列又是空的，照舊「一次一則」
+  （`busy_refused`）；接手後還沒送出的持有者不算（審查第 3 輪）。API 的 `_advance_inflight` 不推進別的 SID 的 slot 持有者（不回
+  409 `NATIVE_SESSION_CHANGED`，所以工作台不會重送迴圈）。
+- **等待的 Responses 訊息由 Hosted 請 API 送出（審查第 3 輪）：** Responses 請求只能由 API 送（Hosted 不能自己送給自己）。
+  之前取得 slot 的訊息要等 API 下一次碰到這個對話才送出，而 Teams relay 輪詢 110 秒就停（遠小於 N），會停在
+  `needs_response`。現在等待 task（含接手的 slot 持有者自己的）取得 slot 後，以 Agent 自己的身分（`NativeAgentRelayClient`，
+  與 T5 交辦、用量回報同一條 Hosted→API 路徑）呼叫 `POST /work-policy/v1/native-agent-messages/waiting-dispatch`
+  （`{conversation_id, request_id}`）。API（`NativeAgentRelayGateway.dispatch_waiting`）只接受 Agent 身分，經目前 session 讀這個
+  RID：必須是這個 Agent、這個對話的 Responses 回條、屬於目前 SID，而且 Hosted 回 `needs_response` 才以 owner reconcile 同一個
+  `_send_response` 送出（同 RID、原始位元組）；其他情況（已送出、已開始、已結束）照讀到的回傳、什麼都不送。送出前（以及
+  POST 前一刻的 `before_send`）跟每條主人送出路徑一樣重讀這個 Agent 主人的 work policy（審查第 4 輪）：已撤銷、停用或不能讀
+  就回 403 `WORK_POLICY_REVOKED`、什麼都不送。跟主人在同一個 policy 下送出被拒一樣，回條不動（`accepted`、`needs_response`、
+  保有 slot，審查第 5 輪；第 4 輪曾寫成 `unknown`），等待 task 記 log 後結束；policy 恢復後，API 下一次碰到這個對話（主人的下
+  一則訊息，`_advance_inflight`）或主人 reconcile 同一個 RID 時送出一次。在那之前，同一個對話排在它後面的訊息照樣每
+  `POLL_SECONDS` 看一次、繼續等（審查第 6 輪）：等待來自主人自己撤銷 policy，可以接受。等待 task 一直看到
+  它開始（Responses 處理器的 `started` CAS）才結束；兩次請求至少相隔 `RESEND_SECONDS`（30 秒），送出途中的請求不會被再送一次；
+  就算送了兩次，Hosted 一個 RID 也只接一次（`responses_queued` 與 `started` CAS，`native_responses.py` 159–160、212–215）。
+  409 `NATIVE_SESSION_CHANGED`（API 還沒跟上剛完成的切換，什麼都沒送）退避後再請（審查第 6 輪；之前每 5 秒一次、沒有上限）：
+  先下一次看（`POLL_SECONDS`，5 秒），再 `RESEND_SECONDS`（30 秒），之後加倍到 `EARLY_MAX_SECONDS`（5 分鐘）為止；不算失敗、
+  不會因此結束，直到成功、另一個 session 接手這則（task 在迴圈開頭看到就結束）。404（比本 PR 舊的 API 沒有這條路由，什麼都沒送）與 5xx、
+  連線錯誤一樣 30 秒後再請（審查第 4 輪；之前 404 就停）；其他 4xx 才停，回到舊行為（API 下一次碰到這個對話時送出）。一直送不成
+  時以**次數**為界、不看 task 逾時（審查第 5 輪）：一個等待 task 裡 404、5xx、連線錯誤合計 `SEND_ATTEMPTS`（60 次，間隔至少
+  30 秒）後回條寫成 `unknown`（`NATIVE_TURN_TIMEOUT`）並送出結束通知，主人看得到失敗，不會無聲停在 `needs_response`。
+  次數是每次執行各自算的（審查第 6 輪更正）：接手的下一個 task、或 VM 重啟後接回的同一個 task，都從 0 重算。一直失敗時
+  60 次約 30 分鐘、短於一個 task 的 1 小時，所以持續的故障在開始時的那個 task 用完，或（開始時那個 task 已接近逾時）在接手
+  的下一個 task 用完：沒有 VM 重啟時，合計最多約 2 × `SEND_ATTEMPTS` 次。沒有新的背景迴圈、不需要列舉對話。**部署順序：API 先於 Hosted**（新 Hosted 遇到舊 API
+  時只是 404 後再請，不會掉訊息；API 先上才不會等到 30 秒一次的重請）。
+  **Teams：** relay 在 110 秒時回「這一輪還在跑，完成後結果在工作台。」後就不再讀；訊息照樣送出一次、跑完，回覆在工作台。
+  N2 沒有主動送訊，所以這則回覆不會出現在 Teams（[Teams 設計](../../docs/teams-chat-design.md#n2-設計) 第 134 行的既有限制，所有超過
+  110 秒的回合都一樣）；同一則 Teams 訊息的 body 再送進 relay 路由會讀到 `done` 與回覆，但 relay 不會再送。
+- **配號圍欄（`_allocate`，meta CAS 之前）：** (1) Hosted `agent` 紀錄的目前 SID 仍是這個 session，否則不配號；(2) 最後配號
+  的回條若是另一個 SID 的、而且還可能完成，也不配號。兩者都讓晚到的回合以 `NATIVE_TURN_UNKNOWN` 結束、不進 SDK。同一
+  SID 的順序照舊交給 chain（不在這裡擋，免得卡在 `unknown` 沒寫成的回條後面）。這個圍欄只在跑本 PR 以後 image 的來源上。
+- **第 28 版（本 PR 之前的 image）來源有什麼（已核 `daa822dd`）：** 開始前 `_require_original_session`；Invocations 在
+  execution slot 後重讀回條（不是 `accepted` 就不開始），`started` CAS 用 task input 裡接單時的 ETag；Responses 在 slot 後
+  核 `meta.inflight_rid`，`started` CAS 用重讀的 ETag；執行中每 0.1 秒重讀回條（`_observe_control`），狀態或 `run_token` 變了
+  就停；`_save_turn` 以原 ETag CAS。它**沒有**配號圍欄。從沒開始的回條由上面的 M9 接手擋住（舊 image 讀不了）；已開始的
+  照停滯規則等或標記。剩下的窗口：切換那一刻剛做完 `started` CAS、還沒配號的第 28 版回合，可能在新 session 的回合之後才
+  配號（v28 `_allocate` 不核 SID），於是比較晚才跑；它是 `started`、來源 `idle`，讀起來照一般進行中，不會請主人重送，所以
+  不會重複，只是順序在後（窗口是那次 CAS 到配號之間的幾次 store 讀寫）。
+
+**Verified against：** `tests/shared_context/test_native_abandon_source.py`（真 API、真 follow 與兩個真 Hosted runtime 共用
+同一個 state store；平台 metadata、版本定義與 Session Files 是離線替身，綁定列用 `InMemoryRepository`）。phase 2d 換
+profile 之前沒有真的不相容版本，測試以版本定義的 `FA_NATIVE_TURNS` 或直接寫入的綁定列 profile 製造不相容。(r)(s) 的
+等待以替身時鐘（`native_left_receipts.clock`）與縮短的輪詢間隔驗證，來源晚到的保存用來源自己的 runtime 寫；卡在 execution
+slot 的來源回合同時以本 image 與第 28 版的 `native_turns.py`（測試從 `git show daa822dd` 載入；checkout 裡沒有那個 commit
+時這一例略過，另有一例以第 28 版的 `rid:` 欄位驗證讀不了）跑；工作台的顯示由 `test_web_test_console_workbench.cjs` 驗證。
+未部署、未在 dev／Azure 驗證。
 
 <a id="automatic-environment-policy"></a>
 ## FA自動核對與不搬檔接續（CODE/offline）
@@ -5783,8 +6120,24 @@ completed＋結果引用＋digest＋checkpoint sha＋usage。答案每段原始�
 整體沿既有8 MiB保存上限，超過則明報 `NATIVE_RESULT_TOO_LARGE`，不截成32 KiB或掉資料。
 每個 item 寫入前按固定 SDK 的實際 JSON escaping 計算1 MB上限。
 結果頁的單段 hash 和完整文字的 byte count／sha 都可核對，不回 SDK events／私有推理。
+答案分段與 checkpoint 分段都以內容定址，最多 4 段同時寫入、讀回（`bounded`，錯誤仍照段序回報第一個）；
+保存時每段由 `_immutable` 逐位元組讀回一次，不再整份重讀（`_verify_result` 只留給重新進入）。
 
 取消指定 CID＋RID；`ctx.cancel` 因 steering 被設起不等於取消。
+執行中的回合每 1 秒讀一次自己的回條（`_observe_control`），只在等 execution slot 時每 2 秒一次（鎖一放開立刻開始）；
+官方 cancel／timeout／shutdown 訊號仍每 0.1 秒看、不讀 store，本程序存下的取消會立刻叫醒這次讀取。
+只有確定的答案才停下 SDK：讀到狀態、`run_token` 或 SID 變了，或 4xx（不存在、別的範圍、內容不合法）；
+store 結果不明（5xx）不算答案，記一次 `FA_NATIVE_CONTROL_READ_UNCONFIRMED`、退避（最多 5 秒）後再讀，
+保存時的 ETag CAS 仍是最後的圍欄。執行中的回合連續 `CONTROL_UNCONFIRMED_FENCE_SECONDS`（`STALL_SECONDS / 2`＝300 秒，
+ADR-0009 §7a 的 N 的一半）沒有一次確定的讀取，就記 `FA_NATIVE_CONTROL_UNCONFIRMED_FENCE` 並停下 SDK，
+不會跑到新 session 可能把它當成遺失的時候；只等 slot 的回合不套這個上限。
+追加（append）交給 SDK 也跟著同一個輪詢：steering 就緒後每 1 秒看一次 `appends:`，本程序存下的追加立刻叫醒，
+送出一則後立刻看下一則，其他程序存下的在一個輪詢內送出。交付的 4xx 才停下回合；5xx 記一次
+`FA_NATIVE_APPEND_DELIVERY_UNCONFIRMED`、同樣退避後再試。只有 `accepted` 的追加會被認領（`sending`＋token）再送，
+所以重試不會重送。本程序的認領記在 `NativeTurnControl.sent_appends`：認領寫入前記「未送」，`channel.send` 前改成
+「已開始送」，之後記 SDK message ID（寫入不明時下一次再寫）。認領已寫入、但回 5xx 的追加仍由本程序送一次，
+而且排在之後的追加前面；回合先結束就讀到 `not_applied`。已開始送的不再送（結果不明時以 `unknown`／`sdk_unconfirmed`
+結束，之後的追加照送）；程序重啟後這份紀錄就沒了，留在 `sending` 的追加不再送，以 `unknown` 結束。
 真正 `cancel_requested` 或官方 timeout 才停止此 SDK 回合；shutdown 用
 `ctx.exit_for_recovery()`，不假造終態。真人入口的`SteeringQueueFull`仍保存busy_refused；
 Agent receive則保留accepted，只有queue已滿才交官方`@task`按原RID延後進同一chain。
@@ -6119,6 +6472,9 @@ WIP02 的 N0 fixture 未設 SDK 平台 session 環境及 tokenizer cache 缺件�
   - store 結果不明時回 503 `SDK_STATE_UPLOAD_UNKNOWN`，呼叫端不能把它當成已保存，也不能換路徑重存。
 - **讀取**：`load_checkpoint` 可以先使用 `$HOME` 熱副本，但必須符合以下條件：不是 symlink，長度和 sha 都相符。
   - 熱副本不相符時改讀 store；讀成功後重寫副本，每個對話只保留最新一份。
+  - 跨對話最多保留最近用過的 50 個對話資料夾（依資料夾 mtime，讀到副本也算用過；
+    `FA_NATIVE_CHECKPOINT_CACHE_CONVERSATIONS` 可改）；被清掉的對話下次只多一次 store 讀取。
+    每次寫入最多清掉 8 個最舊的（`CACHE_PRUNE_PER_WRITE`），升級後第一次遇到的大量舊資料夾由之後的寫入接著清。
   - 寫入副本失敗只記 `FA_NATIVE_CHECKPOINT_CACHE status=write_failed`。
 - **核對**：`verify_checkpoint` 一定逐段讀 store、不讀熱副本，供 N1 在重新進入、補 `completed` 前使用。
   - 缺段、內容不同、身分或版本不符時，回 409 `SDK_STATE_INCOMPLETE`。
@@ -6952,6 +7308,8 @@ Hosted target 分開。C1 檢查保留，checksum 的原 C1/C4 路徑不變，�
   peer endpoint；peer 仍核 path 的原 binding、JWT 和 private ticket。錯配拒絕，不 fallback A。
   人工 operator 可用 `/agents/{agent_id}/...` 指定已註冊 scope；path 是選擇，不是授權，
   不接受 body 自称的 agent_id 作為 authority。A 原 URI 和預設 scope 保持不變。
+  人工帶 binding path 時，`_PeerRouting.binding_agents` 記 binding→Agent（`prepare()` 時填、掃描找到時補），
+  不再每個請求掃整個 Team 的 registry；peer 仍照常核 binding 與身份，核不到就拒絕並移除該筆，下一個請求重掃。
 - **故障隔離：**B runtime 依賴／初始化失敗會記 `AGENT_RUNTIME_UNAVAILABLE`，B 明確回不可用；
   A 仍可開機和使用。初始化失敗已關閉的 peer，下次請求會在原鎖內移除並重建接點，
   沿用原工作與帳本，不重派工作。共同 authority 的原件／receipt 若已損壞，原完整 reader 仍拒絕整份
@@ -9543,7 +9901,9 @@ toolbox `fa-connector-{team}-{connector}`，不占上面 Team MCP 的 8 個名�
 `2025-04-01-preview` PUT 建 `OAuth2` connection（client ID 讀 `FA_CONNECTOR_TEAMS_CLIENT_ID`）；secret 不進回應、
 metadata、摘要或 log。防重送、`expected_version`、錯誤碼與 Team MCP 相同；另有 422
 `TEAM_CONNECTOR_SECRET_REQUIRED` 與 409 `TEAM_CONNECTOR_TOOLBOX_TAKEN`（這個 toolbox 的現行版本不是 FA 為這個 Team 與
-connector 寫的，不覆寫）。
+connector 寫的，不覆寫）。所有本地拒絕都在寫 connection 之前；這個 request ID 的新 secret 已寫進 connection、
+Foundry 卻拒絕建版本時，回 503 `TEAM_MCP_OUTCOME_UNKNOWN`（工作台顯示「用原編號重送」），不當成單純拒絕；
+同一 request ID 重送不再寫 secret，只重建版本；這次重送的版本若又被明確拒絕，回明確的 422 `TEAM_MCP_REFUSED`（或 403 `TEAM_MCP_FORBIDDEN`），不再回 503——只有在同一次呼叫裡寫了 secret 才回 503。
 
 <a id="agent-connector-narrowing"></a>
 **Connector capture 與 per-Agent 關閉（C2，已實作／未部署）**：Team connector 不是手動 capability，不在
@@ -11692,7 +12052,8 @@ API開機不列舉它們。只用原create/If-Match，回應不明先讀同item�
 雜湊涵蓋原command／source，不把首次接收前可重解的receiver model/capture當作訊息內容；
 接收成功後仍沿B自己保存的完整capture與digest。
 
-**公開接點：** `/work-policy/v1/native-agent-messages/{send,result,outcome,read-result}`；
+**公開接點：** `/work-policy/v1/native-agent-messages/{send,result,outcome,read-result}`（另有 Agent 自己的
+`waiting-dispatch`，見[切換後留下的回條](#abandon-left-receipts)）；
 `GET .../recipients`供工具enum（Hosted同一對話最多5分鐘讀一次、交辦失敗重讀，見[只在需要時讀](#hosted-group-roster-slimming)）。Agent專用入口不借N2 human-owner Gateway，
 只共用設定讀取／Foundry傳送與嚴格回覆驗證；API不假造human或RuntimeBinding。
 已驗sender／recipient後，只使用#338已明示prepare的API-MI session client；
@@ -16284,6 +16645,8 @@ M4更新僅寫`artifact_text`，保留權威`progress`；resume沿用SDK session
 
 - Hosted A/B 各以自己的 `ManagedIdentityCredential` 取得 Context API access token；不使用 shared secret。
 - API 驗證 RS256、tenant JWKS、精確 `iss`／`aud`、`exp`、`tid`、`oid`。只由設定的 oid allowlist 決定 actor、team 與角色指令。沒有匿名、測試 header 或 `DefaultAzureCredential` fallback。
+- token 的 `kid` 不在快取的 JWKS 時，整個程序每 60 秒最多強制重新下載一次（`ThrottledJWKClient`）；窗口內仍不認得的 `kid` 直接 401，不再等 10 秒的下載。輪換的新金鑰最晚在窗口過後的第一個請求生效。
+- Teams Connector（Bot Framework）的簽章金鑰同樣處理：`ConnectorIdentity` 原本每個請求都在驗簽前下載 `login.botframework.com` 金鑰（5 秒逾時、不快取），現在整個程序快取 300 秒；不認得的 `kid` 每 60 秒最多強制重新下載一次（與上一條共用 `ForcedRefreshWindow`，但窗口各自獨立），窗口內直接 401 `TEAMS_SERVICE_AUTH_DENIED`。
 - **只有 API MI** 有新建專用 Table 的資料權限，以及指定 Foundry project 的 Foundry User、Cognitive Services OpenAI User；Hosted A/B 不得有 Table 資料權限。
   - 原本 Hosted 也不得有 Memory 資料權限。ADR-0007 §6 對此有一項例外：Neal 於 2026-10-01 選擇 (b)，Hosted agent identity 可以取得 project 範圍的同兩個角色，但只能用於[私人記憶直連](#agent-私人記憶直連adr-0007-6預設關閉)。
   - `workstate` 由 ARM 建立，Table Data Contributor 僅授予該 Table；API 啟動時不建立或列出 service-level tables。
@@ -17771,7 +18134,7 @@ Neal 於 2026-10-01 選擇方案 C：儲存帳戶、網路與 IAM 都不變；Ho
   CAP-06 PR3 擴大 Agent 對照後，介面不變。
 - **記錄**（既有 Table，partition `team-data-v1-<tenant>-<team>`，RowKey `<kind>:<key>`）：
   `GET`／`PUT /team-data/v1/records/{kind}/{key}`。PUT 必須帶 `If-None-Match: *`（只能新建，已存在回 409）
-  或 `If-Match: <etag>`（ETag 不符回 412；空值或 `*` 回 422）。`turn-complete` 只能建立一次，不能取代；其他種類為 `checkpoint`、`result`、`memory`。
+  或 `If-Match: <etag>`（ETag 不符回 412；空值或 `*` 回 422）。HTTP 只能寫 `checkpoint`、`result`、`memory`；`turn-complete` 經 HTTP 只能讀，寫入一律 403 `TEAM_DATA_KIND_READ_ONLY`，只由 turn 回條 API 在程序內建立一次（同時核原開始者），不能取代。
   記錄連同 server 欄位上限 48 KiB（與 Table 儲存層相同）；超過時 API 先回 413，不送到儲存層。
 - **物件**（既有 M3 artifact container，沿用 `BlobArtifactStore` 的 create-only PUT 與回條）：
   `PUT /team-data/v1/objects/{kind}/{object_id}/versions/{32-hex}`（octet-stream，需 `x-fa-content-sha256`，上限 512 KiB）、
@@ -17779,8 +18142,8 @@ Neal 於 2026-10-01 選擇方案 C：儲存帳戶、網路與 IAM 都不變；Ho
 - **不提供**刪除、列舉或已發布內容寫入；舊列與舊 blob 不搬移、不改寫。Memory Store 仍走原 API 路徑。
 - 錯誤回應沿用 behavior API 的通用碼；細部原因只寫在 `BEHAVIOR_REQUEST_FAILED` log。
 
-**離線驗證**：`tests/shared_context/test_team_data_relay.py` 共 11 項，涵蓋同團隊共用、另一團隊同名讀寫只落在自己的
-partition、非 Agent 在碰儲存前就被拒、新建衝突回 409、ETag 不符回 412 且不覆寫、空 ETag 回 422、超過 48 KiB 在 API 端回 413、turn-complete 不可改、無刪除路由、server 固定 kind 與 key、Agent 寫已發布內容被拒、
+**離線驗證**：`tests/shared_context/test_team_data_relay.py` 共 12 項，涵蓋同團隊共用、另一團隊同名讀寫只落在自己的
+partition、非 Agent 在碰儲存前就被拒、新建衝突回 409、ETag 不符回 412 且不覆寫、空 ETag 回 422、超過 48 KiB 在 API 端回 413、turn-complete 經 HTTP 不可寫、程序內也不可改、無刪除路由、server 固定 kind 與 key、Agent 寫已發布內容被拒、
 正式組裝把 relay 接到原 Table 與 container，以及現場探針的預期值。只用替身與本機 SDK，不是 Azure 驗收。
 
 **現場探針**（部署後由部署線執行，只輸出狀態碼）：

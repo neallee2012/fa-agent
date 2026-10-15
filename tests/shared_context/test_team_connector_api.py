@@ -18,6 +18,7 @@ from shared_context.behavior_auth import BehaviorAuthSettings, BehaviorJwtVerifi
 from shared_context.behavior_capabilities import runtime_grants
 from shared_context.behavior_store import BehaviorStore
 from shared_context.behavior_team_registry import TeamRegistry
+from shared_context.errors import Problem
 from shared_context.team_connector import current_team_connector_grants
 from shared_context.team_connector_api import PREFIX, install_team_connector_routes
 from shared_context.team_connector_wire import TEAM_CONNECTORS_ENABLED_ENV, TeamConnectorChange
@@ -225,6 +226,59 @@ def test_the_first_enable_needs_the_secret_and_the_environments_app(connectors):
     no_app = post(c, change(c, "1" * 32))
     assert no_app.status_code == 422 and code(no_app) == "TEAM_MCP_CONNECTION_CREATE_UNAVAILABLE"
     assert c.foundry.puts == [] and c.foundry.created == []
+
+
+@pytest.mark.parametrize("status", [400, 403])
+def test_a_version_refused_after_this_requests_secret_is_saved_asks_for_the_same_request_again(connectors, status):
+    c = connectors
+    c.foundry.fail["create_before"] = status
+    body = change(c, "4a" * 16)
+    refused = post(c, body)
+    assert refused.status_code == 503 and code(refused) == "TEAM_MCP_OUTCOME_UNKNOWN"
+    assert refused.json()["error"]["upstream_status"] == status
+    assert (len(c.foundry.puts), len(c.foundry.created)) == (1, 0)
+    assert c.foundry.arm[CONNECTION]["fa_request_id"] == "4a" * 16
+    applied = post(c, body)
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["toolbox_version"] == "v1"
+    assert (len(c.foundry.puts), len(c.foundry.created)) == (1, 1), "the resend never writes the secret again"
+
+
+@pytest.mark.parametrize("status,expected", [(400, (422, "TEAM_MCP_REFUSED")), (403, (403, "TEAM_MCP_FORBIDDEN"))])
+def test_a_resend_whose_version_is_refused_again_gets_the_definite_answer(connectors, status, expected):
+    c = connectors
+    body = change(c, "4e" * 16)
+    c.foundry.fail["create_before"] = status
+    first = post(c, body)
+    assert first.status_code == 503 and code(first) == "TEAM_MCP_OUTCOME_UNKNOWN"
+    c.foundry.fail["create_before"] = status
+    again = post(c, body)
+    assert (again.status_code, code(again)) == expected, "the secret was written by the first send, not this one"
+    assert (len(c.foundry.puts), len(c.foundry.created)) == (1, 0)
+    assert c.foundry.arm[CONNECTION]["fa_request_id"] == "4e" * 16
+    applied = post(c, body)
+    assert applied.status_code == 200 and applied.json()["toolbox_version"] == "v1"
+    assert len(c.foundry.puts) == 1, "the same request_id writes the secret once"
+
+
+def test_a_version_refused_without_a_secret_write_in_this_request_stays_a_refusal(connectors):
+    c = connectors
+    assert post(c, change(c, "4b" * 16)).status_code == 200
+    c.foundry.fail["create_before"] = 400
+    refused = post(c, change(c, "4c" * 16, enabled=False, secret=None))
+    assert refused.status_code == 422 and code(refused) == "TEAM_MCP_REFUSED"
+    assert (len(c.foundry.puts), len(c.foundry.created)) == (1, 1)
+    assert c.foundry.arm[CONNECTION]["fa_request_id"] == "4b" * 16
+
+
+def test_the_version_is_built_before_the_connection_write(monkeypatch, connectors):
+    c = connectors
+
+    def refuse(*_args):
+        raise Problem(422, "TEAM_CONNECTOR_INVALID", "synthetic local refusal")
+    monkeypatch.setattr("shared_context.team_connector.connector_tools", refuse)
+    assert post(c, change(c, "4d" * 16)).status_code == 422
+    assert c.foundry.puts == [] and CONNECTION not in c.foundry.arm and c.foundry.created == []
 
 
 def test_a_stale_read_is_refused_before_any_write(connectors):

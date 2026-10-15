@@ -177,3 +177,64 @@ def test_production_startup_uses_uami_and_never_creates_or_lists_tables(monkeypa
         assert project.method_calls == []
         assert credential.method_calls == []
     assert [call[0] for call in table.method_calls] == ["close"]
+
+
+class _CountingKeys:
+    """The production key client with its network fetch replaced by a local key set that counts downloads."""
+
+    def __init__(self, monkeypatch, keys, clock):
+        from shared_context.auth import tenant_key_client
+        self.fetches, self.keys = 0, keys
+        self.client = tenant_key_client(TENANT)
+        self.client._clock = clock
+        monkeypatch.setattr(self.client, "fetch_data", self._fetch)
+
+    def _fetch(self):
+        self.fetches += 1
+        data = {"keys": [{**jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True),
+                          "kid": kid, "alg": "RS256", "use": "sig"} for kid, key in self.keys.items()]}
+        self.client.jwk_set_cache.put(data)
+        return data
+
+
+@pytest.fixture
+def clock():
+    from shared_context.auth import _reset_forced_refresh_window
+    _reset_forced_refresh_window()
+    now = SimpleNamespace(value=1000.0)
+    yield now
+    _reset_forced_refresh_window()
+
+
+def test_unknown_kids_force_at_most_one_key_download_per_window(system, auth, private_key, monkeypatch, clock):
+    import uuid
+    keys = _CountingKeys(monkeypatch, {"test-key": private_key}, lambda: clock.value)
+    client = TestClient(create_app(system[0], JwtVerifier(auth, keys.client)))
+    route = "/teams/team-one/works/auth-test"
+    assert client.post(route, json={"goal": "synthetic"},
+                       headers={"Authorization": "Bearer " + signed(private_key)}).status_code == 201
+    assert keys.fetches == 1  # the cold fill
+    for _ in range(25):
+        forged = signed(private_key, headers={"kid": uuid.uuid4().hex})
+        response = client.get(route, headers={"Authorization": "Bearer " + forged})
+        assert response.status_code == 401 and response.json()["error"]["code"] == "UNAUTHENTICATED"
+    assert keys.fetches == 2, "one forced refresh per window, however many unknown kids arrive"
+    assert client.get(route, headers={"Authorization": "Bearer " + signed(private_key)}).status_code == 200
+    assert keys.fetches == 2
+
+    rotated = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    keys.keys["rotated-key"] = rotated
+    new = {"Authorization": "Bearer " + signed(rotated, headers={"kid": "rotated-key"})}
+    clock.value += 30
+    assert client.get(route, headers=new).status_code == 401 and keys.fetches == 2
+    clock.value += 31
+    assert client.get(route, headers=new).status_code == 200, "a rotated key is picked up after the window"
+    assert keys.fetches == 3
+
+
+def test_the_forced_refresh_window_is_shared_by_every_verifier_in_the_process(private_key, monkeypatch, clock):
+    first, second = (_CountingKeys(monkeypatch, {"test-key": private_key}, lambda: clock.value) for _ in range(2))
+    for keys in (first, second):
+        with pytest.raises(jwt.PyJWKClientError):
+            keys.client.get_signing_key("unknown-kid")
+    assert (first.fetches, second.fetches) == (2, 1), "the second client's miss does not force another download"

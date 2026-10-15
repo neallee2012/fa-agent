@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_foundry import MAX_NATIVE_TURN_HTTP_BYTES
 from shared_context.behavior_native_turn_wire import (
-    NATIVE_STATE_PROFILE, NATIVE_TURN_ERRORS, NativeCancel, NativeConversation, NativeDelivered,
+    NATIVE_STATE_PROFILE, NATIVE_TURN_ERRORS, NativeCancel, NativeConversation, NativeDelivered, NativeEnvironmentNotice,
     NativeHistoryPage, NativeReceipt, NativeResultPage, NativeAdmissionObservation, NativeReceivedPage,
     NativeTurnStatus, check_continuation_link,
 )
@@ -159,9 +159,25 @@ def _whole_reply(raw, reference):
     return len(raw) == reference.text_bytes and sha(raw) == reference.text_sha256
 
 
+def _without_unknown_notice(receipt):
+    """ADR-0009 §8 notices are API-only display hints: one this page does not know (an API released after it, e.g. a
+    new notice kind) is dropped, never a reason to refuse the receipt; the receipt's own material is still strict."""
+    if not isinstance(receipt, dict) or "environment_notice" not in receipt:
+        return False
+    try:
+        NativeEnvironmentNotice.model_validate_json(canonical(receipt["environment_notice"]))
+        return False
+    except (ValueError, TypeError):
+        del receipt["environment_notice"]
+        return True
+
+
 def _decode(model, raw):
     try:
-        strict_json(raw)
+        value = strict_json(raw)
+        if model is NativeReceipt and _without_unknown_notice(value) or model is NativeTurnStatus and isinstance(
+                value, dict) and _without_unknown_notice(value.get("receipt")):
+            raw = canonical(value)
         return model.model_validate_json(raw)
     except (ValueError, TypeError):
         raise ConsoleError("NATIVE_STATE_INVALID", 502) from None
@@ -592,6 +608,10 @@ class NativeInstructionControl:
 
     def _saved(self, thread_id):
         for local in self.store.all(thread_id):
+            # Already held in memory (_remember sets request_threads and receipts together); every poll calls this, so
+            # re-reading the journal for each known message cost up to four SQLite reads per message per poll.
+            if local["request_id"] in self.receipts:
+                continue
             item = (self.journal.get(local["request_id"], "submit")
                     or self.journal.get(local["request_id"], "group-observation")
                     or self.journal.get(local["request_id"], RECEIVED_PHASE))
@@ -638,16 +658,21 @@ class NativeInstructionControl:
                     "observed_at": self.clock().isoformat(),
                 })
             else:
-                if self.journal.get(value.request_id, "native-read") is None:
+                # A progress poll reads the same receipt every second; rewriting an unchanged row would commit (and in
+                # remote mode upload every journal) on each poll. Only a receipt that changed is written.
+                receipt = value.model_dump(mode="json")
+                observed = self.journal.get(value.request_id, "native-read")
+                if observed is None:
                     self.journal.begin(value.request_id, "native-read", {
                         "state_profile": profile, "thread_id": thread_id,
                         "method": "GET", "path": PREFIX + "/requests/" + value.request_id,
                         "created_at": self.clock().isoformat(),
                     })
-                self.journal.finish(value.request_id, "native-read", {
-                    "state": "VERIFIED", "native_receipt": value.model_dump(mode="json"),
-                    "observed_at": self.clock().isoformat(),
-                })
+                if observed is None or observed.get("native_receipt") != receipt:
+                    self.journal.finish(value.request_id, "native-read", {
+                        "state": "VERIFIED", "native_receipt": receipt,
+                        "observed_at": self.clock().isoformat(),
+                    })
         return value
 
     def _cid(self, thread_id):
@@ -1483,7 +1508,11 @@ class NativeInstructionControl:
                 # Tool sources this turn ran without (their tool list could not be read); shown on the reply.
                 **({"unavailable_sources": [item.model_dump(mode="json") for item in value.assembly.unavailable_sources]}
                    if value.assembly is not None and value.assembly.unavailable_sources else {}),
-                "dispatch": None if value.dispatch is None else value.dispatch.model_dump(mode="json")},
+                "dispatch": None if value.dispatch is None else value.dispatch.model_dump(mode="json"),
+                # ADR-0009 §8: the API's notice on this answer (a submit's per-Agent slot notice, or a read's
+                # earlier-version view); the page shows it as a status line, never as an error.
+                **({"environment_notice": value.environment_notice.model_dump(mode="json")}
+                   if value.environment_notice is not None else {})},
             "not_accepted": not_accepted,
             "progress": (None if rid not in self.progress_snapshots else {
                 "data": {"state": status, "progress": self.progress_snapshots[rid].progress.model_dump(mode="json")},

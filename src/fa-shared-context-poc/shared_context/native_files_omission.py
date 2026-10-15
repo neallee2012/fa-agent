@@ -252,7 +252,8 @@ async def _idle(runtime, current, record, command, agent_etag):
             reason, after, responses = await _drain_pages(
                 runtime, scan.after, view.previous_hosted_session_id, current.task_id, responses=scan.responses,
                 idle_only=True, require_complete=True, progress=progress, single_page=True,
-                restart_changed_page=command.decision_basis == "system_policy")
+                restart_changed_page=command.decision_basis == "system_policy",
+                settled=frozenset(command.follow.settled_session_ids))
         except Problem as error:
             detail = error.body["error"].get("files_check", {})
             if command.decision_basis == "system_policy" and detail.get("category") == "active_waiting":

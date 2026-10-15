@@ -171,6 +171,8 @@ def test_pending_work_prevents_switching_the_operation_pointer(pending_retarget,
     assert after["hosted_session_id"] == case.before["hosted_session_id"]
     assert case.client.portal.call(case.pending.session_state).following.model_dump(mode="json") == case.old_view
     if case.receipt is not None:
+        # ADR-0009 §2: a call not located by a binding row (this one sends no locator header) keeps phase 2a's rule,
+        # so this retarget candidate on the record's version still serves record reads.
         assert invoke(case.client, case.identity, NativeRead(request_id="rid-1")).json() == case.receipt.model_dump(mode="json")
     assert not case.current.executor.calls
 

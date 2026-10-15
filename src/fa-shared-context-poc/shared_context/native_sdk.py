@@ -1087,5 +1087,6 @@ def native_runtime_from_environment(hosted):
     executor.reader = runtime
     relay.runtime = runtime
     runtime.on_continuation = relay.continue_original
+    runtime.on_slot_taken = relay.dispatch_waiting
     runtime.on_recover_queued = lambda original: relay.recover_queued(runtime, original)
     return runtime

@@ -9,6 +9,7 @@ from .behavior_assistant_wire import InstructionSubmit
 from .behavior_wire import Digest, Identifier, WireModel
 from .native_responses_wire import (
     NATIVE_STATE_PROFILE, NativeResponseDispatch, NativeResponseId, NativeStateProfile, check_response_state,
+    unlabeled_profile,
 )
 
 NATIVE_AGENT_PREFIX = "/work-policy/v1/native-agent-messages"
@@ -49,7 +50,7 @@ class NativeRelayAcceptance(WireModel):
     source_conversation_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
     source_request_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
     state_profile: NativeStateProfile = Field(
-        default=NATIVE_STATE_PROFILE, exclude_if=lambda value: value == NATIVE_STATE_PROFILE)
+        default=NATIVE_STATE_PROFILE, exclude_if=unlabeled_profile)
     response_id: NativeResponseId | None = Field(default=None, exclude_if=lambda value: value is None)
     dispatch: NativeResponseDispatch | None = Field(default=None, exclude_if=lambda value: value is None)
 

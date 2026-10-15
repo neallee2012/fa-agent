@@ -6,13 +6,14 @@
 
 ## 何時同步、同步什麼
 
-1. stage release PR（改 `deploy/stage/release.json`）合併到 `main`，[deploy-staging](../.github/workflows/deploy-staging.yml) 部署 stage。手動觸發的 deploy-staging 也算。
+1. stage release PR（改 `deploy/stage/release.json`）合併到 `main`，[deploy-staging](../.github/workflows/deploy-staging.yml) 部署 stage。手動觸發的 deploy-staging 也會啟動 public-sync，但部署的 commit 沒有帶指紋的 release PR 時，第 7 步會停下、什麼都不推（見下面「release 部署失敗後手動部署」）。
 2. 只有那次 deploy-staging **成功**，[public-sync](../.github/workflows/public-sync.yml) 才會開始；失敗、取消或跳過都不會。
 3. 環境 `public-sync` 只允許 `main`。目前的 GitHub 方案不支援 private repo 的必要審核人，所以不會停下來等人核准；改由公開 repo 先保持 private 當審核關（Neal 2026-10-11 決定），Neal 看過推進去的內容再自己改成 public（審查流程見下方「每一版的兩道審查」）。2026-10-12 已改成 public，之後每次同步立刻公開，第一道審查要在 release PR 合併前完成；第二道由 public-sync 最後一步自動比對。
 4. 取出那次部署的**同一個 commit**，只匯出該 commit 追蹤的檔案，套用替換表，再跑下面的 fail-closed 檢查。任何一項沒過就停，什麼都不推。
 5. 讀 `release.json` 的 `version` 與 `milestone`。`milestone` 經同一套替換與檢查後當作 Release 說明。
-6. 用公開 repo 的權杖 clone 公開 repo，把整棵樹換成這次匯出（保留 `.git`），以 `github-actions[bot]` 名義建立**一個** commit `Release <version>`，打 tag `v<version>`，推到公開 repo 的 `main`，再建立同名 GitHub Release。
-7. 最後執行第二道檢查（`gate2_check.py`，唯讀）：公開 tag 的 tree SHA 要等於 release PR 記錄的指紋，公開檔案要通過 verify。只要推送成功就會執行，建立 GitHub Release 失敗也不會略過。失敗時內容已經公開，這一步只負責亮紅燈叫人（見「每一版的兩道審查」）。
+6. 推送之前先讀合併成部署 commit 的 release PR 說明（只認合併當時的說明），取出第一道記錄的 `public-sync fingerprint:`。指紋是對 release PR 開出當時的 `main` 算的；合併前 `main` 又前進（有新的合併進來），指紋就過期，這次 release 照樣部署 stage，但**什麼都不會公開**（第 7 步比對不符就停）。復原方式是重做第一道、升 `release.json` 的版本，再開新的 release PR 記錄新指紋（那是另一次要核准的 stage 部署）；重跑這次的 public-sync 沒有用，也不要重跑。
+7. 用公開 repo 的權杖 clone 公開 repo，把整棵樹換成這次匯出（保留 `.git`），`git add -A` 後以 `git write-tree` 算出將要發布的 tree SHA，交給 `prepush_check.py` 和第 6 步的指紋比對。**沒有可用的指紋或不相符，就停下、什麼都不推**（沒有 commit、tag、Release），註記會說明原因。相符才以 `github-actions[bot]` 名義建立**一個** commit `Release <version>`，打 tag `v<version>`，推到公開 repo 的 `main`，再建立同名 GitHub Release。
+8. 最後執行第二道檢查（`gate2_check.py`，唯讀）：公開 tag 的 tree SHA 要等於 release PR 記錄的指紋與部署 commit 的匯出，公開檔案要通過 verify。只要推送成功就會執行，建立 GitHub Release 失敗也不會略過。推送前已比對過指紋，這一步主要是再核一次已發布的內容與 verify；失敗時內容已經公開，只負責亮紅燈叫人（見「每一版的兩道審查」）。
 
 要注意的幾點：
 
@@ -21,7 +22,8 @@
 - 同一版重跑時，若內容與既有 tag 相同，就直接結束（Release 不存在時才補建）。若 `version` 沒變但內容不同（例如手動重新部署了較新的 `main`），會**失敗並且不推**；請先升 `release.json` 的 `version`。
 - **排隊只留一個**：`concurrency` 不取消執行中的同步，但同一時間只保留一個等待中的執行。若前一次同步還在執行，期間又有兩次 release 部署成功，中間那次會被較新的取代、不會單獨發布。內容不會遺失，因為下一次發布帶的是完整的樹；只是公開 repo 會少那一版的 tag 與 Release。
 - **不要重跑舊的 public-sync**：在 Actions 重跑一個舊的 public-sync 時，若它的 tag 在公開 repo 還不存在，會把**較舊的樹**疊在公開 `main` 最上面。沒有審核人會擋下這種重跑，所以不要手動重跑舊的 public-sync；要補發請改用新的 release。
-- **release 部署失敗後手動部署**：release 部署失敗、再手動觸發 deploy-staging 成功時，公開 repo 會收到當時部署的 `main` HEAD，版號用 `release.json` 的 `version`。這是可接受的：那個 commit 確實已部署到 stage。
+- **release 部署失敗後手動部署**：release 部署失敗、再手動觸發 deploy-staging 成功時，只有部署的 commit 就是 release PR 合併的那一個（中間 `main` 沒有新的合併）、而且推送前比對指紋相符，公開 repo 才會收到它。部署的是較新的 `main` HEAD（沒有對應的 release PR，或內容已不是第一道審過的樹）時，public-sync 停在推送之前、什麼都不推（本規則從推送前比對的 PR 合併起生效；之前會直接公開沒經第一道審查的內容）。要公開那一版，請對它重做第一道、開新的 release PR 記錄指紋。
+- **指紋因 `main` 前進而過期**：第一道算出指紋後、release PR 合併前，只要 `main` 多了別的合併，部署 commit 的匯出樹就不是第一道審過的那棵。release 仍會部署，但 public-sync 停在推送之前，這一版什麼都不公開。復原：對新的 `main` 重做第一道，升版本，開新的 release PR（又是一次要 Neal 核准的 stage 部署）；不是重跑 public-sync。合併 release PR 前先確認 `main` 沒有動。
 
 ## 不會同步的檔案
 
@@ -50,6 +52,7 @@
   `--text <檔案> --text-out <檔案>` 用同一套替換與檢查處理 Release 說明，通過才寫出。輸出會進入 CI log，所以只印 `檔案:行號`，不印完整值：`[2]` 不印原始值的任何字元，只寫規則 ID、GUID 的 placeholder，或前綴／`verify_absent` 字串的序號（例如 `rule <id> absent #1`）；`[3]`、`[4]` 最多印出被標記值的前 4 個字元。
 - `discover.py`：掃描 HEAD 的 GUID，依 `review.json` 的人工判斷重建 `mapping.json`，並把每個 GUID 的判斷與上下文寫到 `candidates.txt`（git 忽略）。已有的 placeholder 編號不變。匯出後仍會留下、但還沒列入 `synthetic_guid_sha256` 的 GUID 會印成 `UNLISTED`（只印前 4 碼）；收錄步驟見下方「發現新的識別資訊時」；只把 sha256 寫進 `review.json`，不存原值。
 - `fingerprint.py`：在記憶體裡做出某個私有 commit 的匯出（用該 commit 的 `mapping.json`），以 git plumbing 在暫存 repo 算出公開 commit 會有的 tree SHA，印成 `public-sync fingerprint: <tree SHA>`。第一道把這行記在 release PR。
+- `prepush_check.py`：public-sync 推送前的比對。將要發布的 tree SHA 必須等於 release PR 說明裡唯一的 `public-sync fingerprint:`；沒有、不只一個或不相符都以 1 結束，什麼都不推。只印 tree SHA。
 - `gate2_check.py`：第二道。比對公開 tag 的 tree SHA 與第一道的指紋、與部署 commit 的指紋，再對公開檔案重跑 verify；只印 tree SHA、檢查編號與檔案行號。
 - `inventory_scan.py`：第一道的 Azure 清單比對，見「每一版的兩道審查」。只印 `inv-<hash>`、種類與檔案位置，不印名稱。
 
@@ -156,14 +159,14 @@ verify 只擋已知的值與通用樣式。公開之後，每次同步會立刻�
       python -X utf8 scripts/public_export/fingerprint.py --src . --rev HEAD
       ```
 
-      把印出的那一行 `public-sync fingerprint: <tree SHA>` 原樣貼進 release PR 說明，連同 verify、清單比對與人工檢查的結果（是否通過、範圍、有無發現）。沒通過不合併 release PR。
+      把印出的那一行 `public-sync fingerprint: <tree SHA>` 原樣貼進 release PR 說明，連同 verify、清單比對與人工檢查的結果（是否通過、範圍、有無發現）。沒通過不合併 release PR。public-sync 推送前會比對這一行：沒有這一行、合併後又編輯過說明、或部署的內容已不是這棵樹，就不會公開。
    6. 若合併前 `main` 又進了新的變更，結果與指紋只對檢查當時的內容有效，需重做。
 2. **第二道（public-sync 之後，自動）**：public-sync 最後一步執行 `gate2_check.py`。只要推送那一步成功就會跑，後面建立 GitHub Release 失敗也一樣：
-   - 從部署的 commit 找到合併它的 PR，讀說明裡的 `public-sync fingerprint:` 那一行，和剛發布的公開 tag 的 tree SHA 比對。只認合併當時的說明：PR 說明在合併之後又被編輯過，就不採用；
+   - 用推送前讀到的同一份 release PR 說明（合併它的 PR；只認合併當時的說明，合併後又編輯過就不採用），把 `public-sync fingerprint:` 那一行和剛發布的公開 tag 的 tree SHA 比對；推送前已比對過，這裡不符代表推上去的不是比對過的樹；
    - 也比對部署的 commit 匯出後的 tree SHA（用該 commit 自己的 `mapping.json`，和 public-sync 當時一樣），分得出「第一道之後 `main` 又變了」與「公開 repo 的內容不是這次匯出」；
    - 對公開 tag 的檔案（不帶權杖的淺 clone，唯讀，不推送）重跑 `verify_export.py` 的 [0]–[4]，含 gitleaks；clone 裡沒有該 tag 就直接失敗，不會拿 clone 的 HEAD 代替。
 
-   全部通過，第二道就結束，不需要人。任何一項不符或有發現，這一步失敗、public-sync 顯示紅燈，總協調依下面「第二道發現洩漏」處理。PR 說明沒有可用的指紋也算失敗，改由人工對公開 commit 做第二道審查；workflow 會用註記分開說明原因：沒有合併的 PR（例如手動觸發的 deploy-staging）、對到不只一個 PR、說明在合併後被編輯過、或讀 GitHub API 失敗。總協調要在本機重跑時（`--no-gitleaks` 只給本機重跑用，用了要在報告寫明 [1] 沒跑；workflow 一律帶 gitleaks）：
+   全部通過，第二道就結束，不需要人。任何一項不符或有發現，這一步失敗、public-sync 顯示紅燈，總協調依下面「第二道發現洩漏」處理。PR 說明沒有可用的指紋時，推送前的比對就已停下、不會公開；workflow 會用註記（`release PR:`）分開說明原因：沒有合併的 PR（例如手動觸發的 deploy-staging）、對到不只一個 PR、說明在合併後被編輯過、或讀 GitHub API 失敗。總協調要在本機重跑時（`--no-gitleaks` 只給本機重跑用，用了要在報告寫明 [1] 沒跑；workflow 一律帶 gitleaks）：
 
    ```powershell
    python -X utf8 scripts/public_export/gate2_check.py --tag v<version> --src . --rev <部署的 commit> `
@@ -217,6 +220,7 @@ verify 只擋已知的值與通用樣式。公開之後，每次同步會立刻�
 - **2026-10-12**：Neal 把 `fa-agent` 改成 **public**。
 - **release 27（10-12）**：接在 `d6f6a976` 之後的 commit `a493fefc`，9 個檔案，都是文件。第二道審查通過：gitleaks 掃描目錄 143 個發現、掃描 git 歷史 144 個，全部對上已知誤判清單；183 個連結都能解析。
 - **release 28（10-13）**：commit `ba9adcb6`（tree `7c07241d`）。
+- **release 29（10-14）**：stage 第 29 版部署後的 public-sync；第二道 `gate2_check.py` 第一次自動執行，通過。公開 commit、tag 與 tree 在這裡未記，要引用請讀 public-sync 的 run 與公開 repo。
 - **2026-10-13 第一次完整清單比對**：發現公開 `v2026.10.13-28` 裡有 5 個 Azure Bot Service 名稱（見「清單比對基準」），已加替換規則，從下一版起生效；已公開的歷史依 Neal 的決定保留（只修以後、不重寫），下一版整棵取代。
 - **限制**：GitHub 可能仍保留沒有任何引用的 v25 commit 物件，要請 GitHub Support 清除才會消失；這是擁有者向 GitHub 提出的要求，agent 不代做。
 
@@ -230,5 +234,6 @@ verify 只擋已知的值與通用樣式。公開之後，每次同步會立刻�
 - OIDC 擁有者與文件補充（分支 `neallee2012-public-export-followup`，從含 #786 的 `origin/main` 開出）：`tests/public_export` 83 個通過。HEAD 追蹤檔的 plain／scrub 匯出加真 gitleaks 8.30.1：1,361 個檔案、gitleaks 144 個發現全部對上清單、原值 297 種模式零殘留、hash 未改動、殘留掃描 1,421 處無未審項目，PASS；匯出中 `名稱@全 0 ID` 只剩 `example-owner` 與 `foundry-agents` 兩個 placeholder，擁有者名稱以 `名稱@` 形式 0 處。五條同理由的主機放行合併成一條前後，verify 對同一份匯出的輸出逐行相同。ledger 內容被替換的 run 是 4 個（`sha256` 與基準相同）。
 - 第二道自動化與 Azure 清單比對（分支 `neallee2012-public-sync-gate2-auto`，從 `origin/main` `2c2ad24d` 開出，2026-10-13）：`tests/public_export` 116 個通過（新增 20 個；Azure 與 gitleaks 都用替身，含 clone 工作目錄是 CRLF 的情況）。真實重現：`fingerprint.py --rev 8417951c`（release 27）與 `--rev 903f7809`（release 28）算出的 tree SHA，與公開 commit `a493fefc`、`ba9adcb6` 的 tree（GitHub API 讀回）完全相同；`gate2_check.py` 對公開 tag `v2026.10.12-27`（用預設 `core.autocrlf` 的 Windows clone）與 `v2026.10.13-28` 加真 gitleaks 8.30.1：指紋相符、部署 commit 相符、verify PASS。`inventory_scan.py` 以隔離的 az 登入唯讀讀 3 個訂用帳戶（608 個名稱，Graph 網域可讀），對 `2c2ad24d` 的匯出：不加 `--previous` 有 161 個不同的字被標出（多半是資源名稱裡的一般英文字，另有一些已公開的產品與測試資源名稱）；加 `--previous`（公開 release 27）後 0 個。GitHub 上的新 workflow 步驟**未實際執行**，要等下一次 public-sync。上面「verify PASS」是當時的 `mapping.json`；加上 `bot-*` 規則後，同一指令的 [C] 會因已公開的 Bot Service 名稱失敗（見下一項）。
 - 第二道自動化 review 第 1 輪修正（同分支，2026-10-13）：`tests/public_export` 139 個通過（Azure、gitleaks、GitHub API 都用替身；workflow 內嵌的 PR 說明選取程式直接執行測試）。清單比對改成完整的字、移除 `--previous`，清單為空或格式不對以 2 結束；完整比對與審查結果見「清單比對基準」。分支 HEAD 的 plain／scrub 匯出加真 gitleaks 8.30.1：1,367 個檔案、gitleaks 144 個發現全部對上清單、原值 305 種模式零殘留、hash 未改動、殘留掃描 1,423 處無未審項目，PASS；同一份匯出的清單比對 0 個 HIT。新的 GraphQL 查詢以 `gh` 唯讀對 `903f7809`（PR 817）核對過欄位；workflow 仍**未在 GitHub 上執行**。
+- 推送前比對指紋（分支 `neallee2012-audit-deploy-fixes`，2026-10-14，Neal 核准修正稽核發現）：`tests/public_export` 147 個通過（Windows）；同一組部署測試在 Linux（WSL Ubuntu 24.04）404 個通過。新增的 `prepush_check.py` 以假的 release PR 說明與真的 `git write-tree` 測試，workflow 結構測試確認比對在 `git commit`／`git tag`／`git push` 之前。GitHub 上的新步驟**未實際執行**，要等下一次 public-sync。
 - 「Commit, tag and push」這一步的 shell 另在本機以 bare repo 代替公開 repo 模擬：空 repo 首次推送、同內容重跑不推、同版號不同內容失敗、新版號接在既有 `main` 之後，皆符合預期。
 - 證據與限制：GitHub 上的 workflow **未實際執行**（公開 repo、PAT、環境與變數都尚未設定）；權杖經 credential helper 傳遞、只開 Contents 的 PAT 推送、gitleaks 下載與 `gh release create` 只做過靜態檢查。

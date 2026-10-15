@@ -13,7 +13,7 @@ from azure.core.paging import ItemPaged
 from starlette.testclient import TestClient
 
 from shared_context.behavior_foundry import FoundryHttpClient
-from shared_context.behavior_native_sessions import NativeSessions, native_session_id
+from shared_context.behavior_native_sessions import NativeSessions, fresh_session_id, native_session_id
 from shared_context.behavior_native_turn_wire import NativeRead, NativeSessionRead
 from shared_context.behavior_wire import HostedIdentity
 from shared_context.native_files_wire import WORKSPACE_ROOT
@@ -229,9 +229,12 @@ def file_api(local_env, file_loops, native_api, monkeypatch, tmp_path, request):
 
             harness.call(retained)
             assert recovered.executor.calls == []
-    destination = source.model_copy(update={
-        "session_id": native_session_id(source, case.composition.config.identity.managed_identity_client_id, version=target_version),
-        "agent_version": target_version})
+    client_id = case.composition.config.identity.managed_identity_client_id
+    # ``fresh``: ADR-0009 M5, the destination is a fresh SID derived from the source's (same version allowed).
+    destination_sid = (fresh_session_id(source, client_id, current_session_id=source.session_id,
+                                        version=target_version) if options.get("fresh") else
+                       native_session_id(source, client_id, version=target_version))
+    destination = source.model_copy(update={"session_id": destination_sid, "agent_version": target_version})
     new_identity = identity.model_copy(update={"session_id": destination.session_id, "agent_version": target_version})
     monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", new_identity.session_id)
     target_workspace = NativeWorkspaceFiles(tmp_path / "target")

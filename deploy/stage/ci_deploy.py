@@ -1,11 +1,13 @@
-"""Environment deploy steps for GitHub Actions (ADR-0008). Standard library only; shells out to `az` and `docker`.
+"""Environment deploy steps for GitHub Actions (ADR-0008). Standard library only; shells out to `az` and
+`docker`.
 
-One build = one commit: the API and Hosted images come from the same checkout and the API image must print the
-same FA_DEPLOYED_CORE as the checkout's shared_context. Every step stops on the first error; nothing is rolled back
+One build = one commit: the API and Hosted images come from the same checkout and the code identity installed
+in the built API image (code_sha256(), read by running the image) must equal the checkout's core. Every step
+stops on the first error (only a read inside a wait loop is retried, at most 3 times); nothing is rolled back
 (forward-fix policy). Writes are limited to the selected registry, sync job and Container Apps. The installed
 configuration (the selected profile's runtime/config.json, set as the API's BEHAVIOR_SERVER_CONFIG_JSON at W7)
-is never changed here: the API update stops if the deployed configuration differs. The other API ENV values come
-from the selected profile (api_environment), so an ENV change is a normal PR that this deploy applies.
+is never changed here: the API update stops if the deployed configuration differs. The other API ENV values
+come from the selected profile (api_environment), so an ENV change is a normal PR that this deploy applies.
 
   python3 deploy/stage/ci_deploy.py meta            -> key=value lines for $GITHUB_OUTPUT (incl. the release version);
                                                        also stops on a Hosted overlay Agent sync would refuse, a
@@ -13,12 +15,20 @@ from the selected profile (api_environment), so an ENV change is a normal PR tha
                                                        API routine flags the API would refuse at startup, and on
                                                        a malformed feed_app/feed_environment/api_secret_environment
   python3 deploy/stage/ci_deploy.py check           -> the same profile checks as meta, without the CI outputs
-  python3 deploy/stage/ci_deploy.py guard           -> reports changed inputs; sync verifies the full definition;
+  python3 deploy/stage/ci_deploy.py guard           -> stops unless this commit contains the serving API revision's
+                                                       commit (no rollback by re-running an old deploy; a revision
+                                                       named elsewhere only warns); reports changed inputs; sync
+                                                       verifies the full definition;
                                                        read-only warning if the one-time Web PubSub resource/role
                                                        is missing (never stops: hints are optional); stops if a
                                                        declared API secret or the named feed app does not exist,
                                                        or the API routine clock is on with minReplicas < 1
   python3 deploy/stage/ci_deploy.py build <kind>    -> builds and pushes one image, prints its digest reference
+  python3 deploy/stage/ci_deploy.py gate <api-ref>  -> ADR-0009 phase 3b compatibility gate, before sync: the new API
+                                                       image (sync job, API identity) reads every binding row and the
+                                                       version definitions they name, never a session; stops only
+                                                       when the profile arms it (compatibility_gate_armed) and no
+                                                       approved release override applies (deploy/README.md#compat-gate)
   python3 deploy/stage/ci_deploy.py sync <api-ref> <hosted-ref>
   python3 deploy/stage/ci_deploy.py api <api-ref>
   python3 deploy/stage/ci_deploy.py follow <api-ref> <hosted-ref>  -> verify versions, then finish all Agent follows
@@ -100,6 +110,7 @@ def check():
     feed_config()
     api_secrets()
     console_overlay(STAGE.get("console_environment") or {})
+    gate_settings()
 
 
 def meta():
@@ -151,15 +162,47 @@ def _require_secrets(app, properties, secrets):
         raise SystemExit(f"{app}: secrets {missing} are not on the app yet; an operator adds them first")
 
 
+def _release_file():
+    return Path(STAGE["release_file"]) if STAGE.get("release_file") else CONFIG.parent / "release.json"
+
+
 def release():
-    """The selected profile's release version, for the run summary only."""
-    path = Path(STAGE["release_file"]) if STAGE.get("release_file") else CONFIG.parent / "release.json"
+    """The selected profile's release version, for the run summary and the gate override's binding."""
+    path = _release_file()
     if not path.exists():
         return "none"
     version = json.loads(path.read_text(encoding="utf-8")).get("version")
     if not isinstance(version, str) or re.fullmatch(r"[0-9A-Za-z._-]{1,40}", version) is None:
         raise SystemExit(f"{path} needs a short version string")
     return version
+
+
+# ADR-0009 phase 3b compatibility gate (deploy/README.md#compat-gate). Arming is a reviewed profile change; the
+# override is a reviewed release-file change bound to that one release (a stage release PR is Neal's decision), so
+# both are logged in git, and the override again in the run summary and the gate's job log.
+OVERRIDE_KEYS = {"release", "approved_by", "approved_at", "reason"}
+# The gate's own wait (18 polls x 10 s = 3 min), not the sync job's 30 min: a hung gate execution is stopped, and
+# then is a warning unarmed and a refusal armed (deploy/README.md#compat-gate, "時間").
+GATE_POLL_ATTEMPTS = 18
+
+
+def gate_settings():
+    """(armed, override or None), checked in meta before any build: a stale or malformed override stops the run."""
+    armed = STAGE.get("compatibility_gate_armed", False)
+    if type(armed) is not bool:
+        raise SystemExit("compatibility_gate_armed must be true or false")
+    path = _release_file()
+    override = (json.loads(path.read_text(encoding="utf-8")).get("compatibility_gate_override")
+                if path.exists() else None)
+    if override is None:
+        return armed, None
+    if (not isinstance(override, dict) or set(override) != OVERRIDE_KEYS
+            or not all(isinstance(value, str) and value.strip() and len(value) <= 400 for value in override.values())):
+        raise SystemExit(f"{path}: compatibility_gate_override needs exactly {sorted(OVERRIDE_KEYS)} as short text")
+    if override["release"] != release():
+        raise SystemExit(f"{path}: compatibility_gate_override names release {override['release']!r}, not this "
+                         f"release {release()!r}; an override is for one release only, remove it")
+    return armed, override
 
 
 # Web PubSub hints (v16; shared_context/realtime_push.py). Same formats the API checks at startup.
@@ -230,6 +273,48 @@ HOSTED_INPUTS = ("Dockerfile.behavior-assistant-desktop", "requirements-hosted.t
                  "runtime_probe.py")
 
 
+# The revision suffix _suffix() writes: <commit[:7]>-r<run number>-<run attempt>.
+OWN_SUFFIX = re.compile(r"([0-9a-f]{7,40})-r[0-9]+-[0-9]+")
+
+
+def serving_commit(revision):
+    """The serving commit named by an API revision this script created, or None (with a warning) for any other name.
+
+    A revision named elsewhere (portal, `az containerapp update`) says nothing about its code, so it only warns: it
+    must not block every later deploy. A commit this script named must be an ancestor of the deploying HEAD, so a
+    re-run of an old deploy run never puts an older commit over a newer one (forward-fix only). A named commit that
+    is no longer in the history at all (a rebased or dropped branch) stops too, unless an operator sets
+    FA_ALLOW_ROLLBACK=true for that one run (azd deploy only; the stage workflow never sets it): then it warns."""
+    match = OWN_SUFFIX.fullmatch(revision.removeprefix(STAGE["api_app"] + "--"))
+    if match is None:
+        print(f"::warning::revision {revision!r} was not named by this deploy script, so the serving commit is unknown; "
+              "the rollback check and the change report are skipped")
+        return None
+    found = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "--quiet", f"{match[1]}^{{commit}}"],
+                           check=False, text=True, capture_output=True)
+    if found.returncode != 0:
+        message = (f"serving commit {match[1]} (revision {revision!r}) is not in this checkout's history, so "
+                   "this deploy cannot be shown to be newer")
+        if os.environ.get("FA_ALLOW_ROLLBACK") != "true":
+            raise SystemExit(f"{message}; an operator decides this deploy: set FA_ALLOW_ROLLBACK=true for that one "
+                             "run to deploy anyway (the stage workflow never sets it)")
+        print(f"::warning::{message}; FA_ALLOW_ROLLBACK=true: the rollback check and the change report are skipped "
+              "for this run")
+        return None
+    base = found.stdout.strip()
+    # Exit 0: base is HEAD or an ancestor of it; 1: it is not (an older or unrelated commit is being deployed).
+    ancestor = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", base, "HEAD"],
+                              check=False, text=True, capture_output=True)
+    if ancestor.returncode == 1:
+        raise SystemExit(f"this deploy's commit does not contain the serving commit {base[:12]} (revision "
+                         f"{revision!r}): a re-run of an older deploy would roll the environment back. Deploy a "
+                         "newer main commit instead (forward-fix); nothing was changed")
+    if ancestor.returncode != 0:
+        sys.stderr.write((ancestor.stderr or "")[-2000:])
+        raise SystemExit(f"cannot compare the serving commit {base[:12]} with this deploy's commit")
+    return base
+
+
 def guard():
     """Compare against the serving commit; full Hosted-definition equality is enforced by sync, not core identity."""
     properties = rest("GET", f"{_resource('containerApps', STAGE['api_app'])}?{APPS_API}")["properties"]
@@ -242,12 +327,10 @@ def guard():
     if feed_config() is not None:
         rest("GET", f"{_resource('containerApps', feed_config()[0])}?{APPS_API}")
     revision = properties.get("latestReadyRevisionName") or ""
-    prefix = revision.removeprefix(STAGE["api_app"] + "--").split("-")[0]
-    found = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "--quiet", f"{prefix}^{{commit}}"],
-                           check=False, text=True, capture_output=True)
-    if not re.fullmatch(r"[0-9a-f]{4,40}", prefix) or found.returncode != 0:
-        raise SystemExit(f"cannot tell the serving commit from revision {revision!r}; an operator decides this deploy")
-    base = found.stdout.strip()
+    base = serving_commit(revision)
+    if base is None:
+        realtime_ready()
+        return
 
     def changed(*paths):
         return run("git", "-C", str(ROOT), "diff", "--name-only", base, "HEAD", "--", *paths).split()
@@ -275,14 +358,28 @@ def build(kind):
         sys.stderr.write(log[-8000:])
         raise SystemExit(f"{kind} image build failed")
     if kind == "api":
-        expected = f"FA_DEPLOYED_CORE={core()}"
-        if expected not in log:
-            raise SystemExit("API image core differs from this checkout; refusing to push")
+        built, expected = image_core(tag), core()
+        if built != expected:
+            raise SystemExit(f"API image core {built} differs from this checkout's {expected}; refusing to push")
     _push(tag)
     digest = run("docker", "inspect", "--format", "{{index .RepoDigests 0}}", tag).strip()
     if "@sha256:" not in digest:
         raise SystemExit("no pushed digest")
     print(digest)
+
+
+def image_core(tag):
+    """The code identity installed in the built image, read from the image itself: the build log's FA_DEPLOYED_CORE
+    line is missing when Docker reuses that layer from its cache (an azd rerun). No network, nothing written."""
+    result = subprocess.run(["docker", "run", "--rm", "--network", "none", "--platform", "linux/amd64",
+                             "--entrypoint", "python", tag, "-B", "-c",
+                             "from shared_context.behavior_code_identity import code_sha256; print(code_sha256())"],
+                            check=False, text=True, capture_output=True)
+    value = (result.stdout or "").strip()
+    if result.returncode != 0 or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        sys.stderr.write((result.stderr or "")[-2000:])
+        raise SystemExit("cannot read the code identity from the built API image; refusing to push")
+    return value
 
 
 # Waits before each retry of a failed push (2026-10-03: the registry refused TCP connections mid-push twice).
@@ -443,10 +540,121 @@ def rest(method, path, body=None):
     return json.loads(out) if out.strip() else None
 
 
+# Waits before each retry of a failed read inside a wait loop: one transient `az` error (token refresh, throttling,
+# a dropped connection) must not stop a run halfway, after the API was already updated. Reads only, never a write.
+READ_RETRY_SECONDS = (5, 15, 30)
+
+
+def _poll(path):
+    """GET for a wait loop; a failed read is retried at most len(READ_RETRY_SECONDS) times, then stops the run."""
+    for attempt, wait in enumerate((*READ_RETRY_SECONDS, None), start=1):
+        try:
+            return rest("GET", path)
+        except SystemExit as error:
+            if wait is None:
+                raise SystemExit(f"{error} (read {attempt} times; read back before any rerun)") from None
+            print(f"read failed (attempt {attempt}): {error}; retrying in {wait}s", file=sys.stderr, flush=True)
+            time.sleep(wait)
+
+
 def sync(api_ref, hosted_ref, *, follow=False):
     if not hosted_ref.startswith(STAGE["registry"] + "/fa-behavior-assistant-desktop@sha256:"):
         raise SystemExit("hosted image must be a digest reference from the selected registry")
-    script = _sync_script(hosted_ref, follow=follow)
+    status, name = _run_job(api_ref, _sync_script(hosted_ref, follow=follow))
+    if status != "Succeeded":
+        raise SystemExit(f"sync {name} {status}; read the job log in Log Analytics, do not rerun blindly")
+    print(f"sync {name} Succeeded")
+
+
+def _gate_script(armed, override):
+    """The gate from the new API image: its SUPPORTED_STATE_PROFILES is the new API's set (no second source)."""
+    raw = _config_bytes()
+    blob = base64.b64encode(zlib.compress(raw, 9)).decode()
+    runtime_root = f"/tmp/fa-{TOKEN}-runtime"
+    argv = ["--config", f"{runtime_root}/config.json"]
+    if armed:
+        argv.append("--armed")
+    if override is not None:
+        argv += ["--override", json.dumps(override, sort_keys=True, ensure_ascii=False)]
+    return "\n".join([
+        "import base64,hashlib,logging,zlib",
+        "from pathlib import Path",
+        "from shared_context.behavior_code_identity import code_sha256",
+        f"assert code_sha256()=={core()!r}",
+        f"raw=zlib.decompress(base64.b64decode({blob!r}))",
+        f"assert hashlib.sha256(raw).hexdigest()=={hashlib.sha256(raw).hexdigest()!r}",
+        f"root=Path({runtime_root!r}); root.mkdir(mode=0o700,exist_ok=True)",
+        "(root/'config.json').write_bytes(raw)",
+        "logging.basicConfig(level=logging.INFO)",
+        "from shared_context.native_deploy_gate import main",
+        f"raise SystemExit(main({argv!r}))",
+    ])
+
+
+def gate(api_ref):
+    """ADR-0009 phase 3b, before sync, the API update and follow: nothing is written to the environment if it stops.
+    Unarmed it only reports (a failed run is a warning); armed, a refusal or an unreadable row/definition stops."""
+    if not api_ref.startswith(STAGE["registry"] + "/fa-behavior-api@sha256:"):
+        raise SystemExit("api image must be a digest reference from the selected registry")
+    armed, override = gate_settings()
+    if override is not None:
+        note = (f"compatibility gate override for release {override['release']} approved by {override['approved_by']} "
+                f"at {override['approved_at']}: {override['reason']}")
+        print(f"::warning::{note}")
+        _gate_summary(f"OVERRIDE ({note})")
+    try:
+        status, name = _run_job(api_ref, _gate_script(armed, override), attempts=GATE_POLL_ATTEMPTS,
+                                stop_on_timeout=True)
+    except (Exception, SystemExit) as error:
+        _gate_summary(f"did not run to the end (armed={armed}): {type(error).__name__}: {error}")
+        if armed:
+            if isinstance(error, SystemExit):
+                raise
+            raise SystemExit(f"compatibility gate could not run ({type(error).__name__}: {error}); nothing was "
+                             "deployed. Read the sync job history before any rerun") from error
+        # ADR-0009 §7: the unarmed gate never blocks a deploy, not even when its job cannot start or finish, or an
+        # ARM read comes back empty or malformed (TypeError/KeyError/JSONDecodeError out of _run_job).
+        print(f"::warning::compatibility gate did not run to the end while not armed "
+              f"({type(error).__name__}: {error}); the deploy goes on")
+        return
+    where = f"read DEPLOY_COMPAT_GATE in the {STAGE['sync_job']} execution {name} log (Log Analytics)"
+    decision = _gate_decision(status, armed, override)
+    _gate_summary(f"job {name} {status} (armed={armed}, override={override is not None}); decision: {decision}; "
+                  f"refusal count and per-Agent verdicts: {where}")
+    if status == "Succeeded":
+        # "finished", not "passed": unarmed, a Succeeded job may still carry decision=observe with refusals.
+        print(f"compatibility gate {name} finished (armed={armed}, override={override is not None}); "
+              f"decision: {decision}; report: {where}")
+        return
+    if not armed:
+        print(f"::warning::compatibility gate {name} {status} while not armed; the deploy goes on. {where}")
+        return
+    raise SystemExit(f"compatibility gate {name} {status}: a binding row records a profile this API does not support, "
+                     f"or the rows/definitions could not be read; nothing was deployed. {where}. Move those Agents "
+                     "first, or merge an approved one-release override (deploy/README.md#compat-gate)")
+
+
+def _gate_decision(status, armed, override):
+    """What the job status proves about the gate's decision. An ARM job execution carries only a status (no exit
+    code, no output), so the refusal count is in the job log alone; main() exits 1 only for an armed refusal."""
+    if status != "Succeeded":
+        return "refuse, or the rows/definitions could not be read" if armed else f"unknown (job {status})"
+    if not armed:
+        return "pass or observe (refusals, if any, are only reported)"
+    return "pass or override (refusals, if any, passed by the override)" if override else "pass (0 refusals)"
+
+
+def _gate_summary(text):
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as stream:
+            stream.write(f"- compatibility gate: {text}\n")
+
+
+def _run_job(api_ref, script, *, attempts=180, stop_on_timeout=False):
+    """Start the sync job once with ``script`` on ``api_ref`` and wait up to ``attempts`` polls 10 s apart;
+    (final status, execution name). ``stop_on_timeout`` stops an execution that outlives the wait (the gate: the
+    job's own replicaTimeout is up to 3600 s, which no deploy should wait for)."""
     job = _resource("jobs", STAGE["sync_job"])
     container = rest("GET", f"{job}?{APPS_API}")["properties"]["template"]["containers"][0]
     # The deploy-time follow publishes its "agent.environment" hint as the API identity (same UAMI as the job).
@@ -458,16 +666,21 @@ def sync(api_ref, hosted_ref, *, follow=False):
         "name": container["name"], "image": api_ref, "command": ["python"], "args": ["-B", "-c", script],
         "env": env, "resources": container["resources"]}]})
     name = started["name"]
-    for _ in range(180):
-        execution = rest("GET", f"{job}/executions/{name}?{APPS_API}")
+    for _ in range(attempts):
+        execution = _poll(f"{job}/executions/{name}?{APPS_API}")
         status = execution["properties"]["status"]
-        if status == "Succeeded":
-            print(f"sync {name} Succeeded")
-            return
-        if status in {"Failed", "Stopped", "Degraded"}:
-            raise SystemExit(f"sync {name} {status}; read the job log in Log Analytics, do not rerun blindly")
+        if status in {"Succeeded", "Failed", "Stopped", "Degraded"}:
+            return status, name
         time.sleep(10)
-    raise SystemExit(f"sync {name} did not finish; read back before any rerun")
+    if not stop_on_timeout:
+        raise SystemExit(f"job execution {name} did not finish; read back before any rerun")
+    try:
+        # Jobs - Stop Execution (Microsoft.App 2025-01-01): POST .../jobs/{job}/executions/{name}/stop, 200 or 202.
+        rest("POST", f"{job}/executions/{name}/stop?{APPS_API}")
+        stopped = "stop requested"
+    except (Exception, SystemExit) as error:  # the timeout is the verdict; a failed stop is only reported
+        stopped = f"stop failed ({type(error).__name__}), stop it by hand"
+    raise SystemExit(f"job execution {name} did not finish within {attempts * 10} s; {stopped}")
 
 
 def console_overlay(environment):
@@ -534,7 +747,7 @@ def _update_container(kind, name, image, suffix, guarded=None, environment=None,
     # The PATCH is a long-running operation (202): wait for this run's own revision, never read back the old one.
     expected = f"{name}--{suffix}"
     for _ in range(60):
-        properties = rest("GET", f"{path}?{APPS_API}")["properties"]
+        properties = _poll(f"{path}?{APPS_API}")["properties"]
         if properties.get("latestRevisionName") == expected:
             return expected
         if properties.get("provisioningState") == "Failed":
@@ -593,7 +806,7 @@ def feed(feed_ref):
 
 def _wait_revision(app, revision):
     for _ in range(90):
-        value = rest("GET", f"{_resource('containerApps', app)}/revisions/{revision}?{APPS_API}")
+        value = _poll(f"{_resource('containerApps', app)}/revisions/{revision}?{APPS_API}")
         state = value["properties"].get("runningState")
         if state in {"Running", "RunningAtMaxScale"} and value["properties"].get("healthState") == "Healthy":
             return
@@ -620,7 +833,8 @@ def main():
     parser.add_argument("--config", help="environment profile; defaults to FA_DEPLOY_CONFIG or the checked-in stage profile")
     parser.add_argument("--runtime-dir", type=Path,
                         help="generated runtime directory; defaults to <config>/runtime")
-    parser.add_argument("command", choices=("meta", "check", "guard", "build", "sync", "api", "console", "feed", "follow"))
+    parser.add_argument("command", choices=("meta", "check", "guard", "build", "gate", "sync", "api", "console", "feed",
+                                            "follow"))
     parser.add_argument("args", nargs="*")
     parsed = parser.parse_args()
     global CONFIG, RUNTIME, STAGE, TOKEN
@@ -633,7 +847,7 @@ def main():
     else:
         RUNTIME = config_path(parsed.config).parent / "runtime"
     command, args = parsed.command, parsed.args
-    {"meta": meta, "check": check, "guard": guard, "build": build, "sync": sync, "api": api, "console": console, "feed": feed,
+    {"meta": meta, "check": check, "guard": guard, "build": build, "gate": gate, "sync": sync, "api": api, "console": console, "feed": feed,
      "follow": lambda api_ref, hosted_ref: sync(api_ref, hosted_ref, follow=True)}[command](*args)
 
 

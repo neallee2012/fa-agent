@@ -26,7 +26,7 @@ from .behavior_native_turn_wire import (
     NativeAgentCommand, NativeAgentReceive, NativeConversationRead, NativeRead, NativeReceipt, NativeResult,
 )
 from .behavior_server_config import ServerAgentScope
-from .behavior_team_registry import resolve_agent_scope, resolve_team_recipient, team_recipient_ids
+from .behavior_team_registry import resolve_agent_scope, team_recipient_ids, team_recipient_ready
 from .behavior_work_target import selected_targets
 from .errors import Problem
 from .native_agent_relay import (
@@ -117,12 +117,9 @@ class NativeAgentRelayGateway:
                 raise Problem(403, "AGENT_MESSAGE_ROOT_DENIED", "the wake must retain its original request and result")
 
     def _recipient(self, principal, agent_id):
-        store, config = self.owner.runtime.store, self.owner.config
-        scope = resolve_team_recipient(store, config, agent_id, sender_oid=principal.oid, team_id=principal.team)
-        ready = team_recipient_ids(store, config, sender_oid=principal.oid, team_id=principal.team)
-        if agent_id not in {identifier for identifier, _name in ready}:
-            raise Problem(409, "AGENT_MESSAGE_RECIPIENT_NOT_READY", "the resolved receiver is not ready")
-        return scope
+        # Only this recipient's rows: the whole Team is read for directory(), never per message.
+        return team_recipient_ready(self.owner.runtime.store, self.owner.config, agent_id,
+                                    sender_oid=principal.oid, team_id=principal.team)
 
     def directory(self, principal):
         self._sender_scope(principal)
@@ -473,6 +470,47 @@ class NativeAgentRelayGateway:
             raise Problem(409, "NATIVE_RESULT_INCOMPLETE", "the original received result reference changed")
         return page
 
+    def dispatch_waiting(self, principal: BehaviorPrincipal, command: NativeRelayResult):
+        """ADR-0009 §7a (s), review round 3: the Agent's own Hosted session asks for the Responses request of one of
+        its accepted messages that just took its conversation slot in Hosted (one that waited behind a left receipt,
+        or an adopted one). Hosted can not send a Responses request to itself, and a caller such as the Teams relay
+        stops polling after 110 s, so without this the message would wait at ``needs_response`` until the next touch.
+
+        Sent exactly as the owner's reconcile sends it: the same RID and original bytes, through the same
+        ``_send_response``, only while Hosted reports ``needs_response`` for this Agent's current session; anything
+        else (already sent, started, ended, another session) is returned as read, with nothing sent.
+
+        Review round 4: like every owner send (``NativeTurnGateway._context(..., "submit")``), the Agent's current
+        owner work policy is read again before the billable POST (and once more right before it); a revoked or
+        inactive policy is 403 ``WORK_POLICY_REVOKED`` with nothing sent; Hosted leaves the message ``accepted``
+        (review round 5), as an owner send under that policy does, and it is sent once the policy is restored."""
+        from .behavior_native_responses_api import _send_response, platform_client
+        from .native_responses_wire import NATIVE_RESPONSES_PROFILE
+
+        command = NativeRelayResult.model_validate_json(command.model_dump_json())
+        scope = self._sender_scope(principal)
+        composition, client = self._client(scope)
+        control = composition.runtime.work_policy
+
+        def current():
+            self._sender_scope(principal)
+            policy = control.installed()
+            if policy != control.policy or not policy.active or not policy.read_enabled:
+                raise Problem(403, "WORK_POLICY_REVOKED", "the original Agent policy is no longer active")
+
+        original, _ = NativeTurnGateway._invoke(client, NativeRead(request_id=command.request_id))
+        if (original.agent_id != scope.target.agent_id or original.conversation_id != command.conversation_id
+                or original.state_profile != NATIVE_RESPONSES_PROFILE):
+            raise Problem(409, "NATIVE_STATE_SCOPE", "only this Agent's own waiting Responses message is sent")
+        NativeTurnGateway._same_session(client, original)
+        if original.status != "accepted" or original.dispatch is None or original.dispatch.state != "needs_response":
+            return original
+        current()
+        observed, _ = _send_response(client, platform_client(composition, client), original, before_send=current)
+        logging.getLogger(__name__).warning("NATIVE_WAITING_RESPONSE_SENT rid_prefix=%s status=%s",
+                                            original.request_id[:8], observed.status)
+        return NativeTurnGateway._accounted(composition.runtime.work_policy, (observed, None))[0]
+
 
 def install_native_agent_routes(app, composition, *, enabled, repository=None):
     from .realtime_push import agent_id_of, realtime_publisher
@@ -591,3 +629,20 @@ def install_native_agent_routes(app, composition, *, enabled, repository=None):
     async def read_result(request: Request, principal=Depends(identity)):
         command = await _body(request, NativeRelayReadResult)
         return await reply(lambda: gateway.read_result(principal, command))
+
+    @app.post(PREFIX + "/waiting-dispatch")
+    async def waiting_dispatch(request: Request, principal=Depends(identity)):
+        command = await _body(request, NativeRelayResult, max_body_bytes=1024)
+        try:
+            return await reply(lambda: gateway.dispatch_waiting(principal, command))
+        except Problem as error:
+            code = error.body["error"]["code"]
+            if (error.status, code) not in {(409, "NATIVE_SESSION_CHANGED"), (409, "NATIVE_STATE_SCOPE"),
+                                            (403, "WORK_POLICY_REVOKED")}:
+                raise
+            # Named, so Hosted can tell "not caught up with the switch yet" (ask again) and "the owner's work policy
+            # is revoked" (the message ends with that code, review round 4) from a refusal; nothing was sent.
+            _log_request_failure(request, code)
+            return JSONResponse(status_code=error.status, headers={"Cache-Control": "no-store"}, content={"error": {
+                "code": code, "message": "Nothing was sent for the original message.", "automatic_retry": False,
+            }})

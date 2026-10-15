@@ -108,6 +108,10 @@ class FoundryResponsesClient:
     def _request(self, method, suffix, *, body=None, params=None, headers=None, before_send=None, sse_ack=False):
         unknown_code = ("NATIVE_RESPONSE_UNCONFIRMED" if method == "POST" and suffix == "/responses"
                         else "NATIVE_TURN_UNKNOWN")
+        if isinstance(body, dict) and isinstance(body.get("agent_session_id"), str):
+            # A Responses call that names a session reaches it as an invocation does (ADR-0009 §7a zero-call need).
+            from .native_binding import check_session
+            check_session(self.native, body["agent_session_id"], operation="responses")
         token = self._token()
         encoded = None if body is None else json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
         if encoded is not None and len(encoded) > MAX_NATIVE_TURN_HTTP_BYTES:

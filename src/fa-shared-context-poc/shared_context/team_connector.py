@@ -84,7 +84,8 @@ class TeamConnectorService:
         return TeamConnectorsView(team_id=principal.team, connectors=tuple(
             self._read_state(foundry, principal.team, ref) for ref in CONNECTORS.values()))
 
-    def _ensure_connection(self, foundry, principal, ref: ConnectorRef, name: str, command: TeamConnectorChange):
+    def _ensure_connection(self, foundry, principal, ref: ConnectorRef, name: str, command: TeamConnectorChange) -> bool:
+        """True only when this call wrote the request's client secret; an earlier send's write returns False."""
         try:
             existing = foundry.connection(name, api_version=OAUTH2_CONNECTION_API_VERSION)
         except Exception as error:
@@ -94,9 +95,9 @@ class TeamConnectorService:
         if command.client_secret is None:
             if existing is None:
                 raise Problem(422, "TEAM_CONNECTOR_SECRET_REQUIRED", "the first enable needs the app's client secret")
-            return
+            return False
         if existing is not None and existing.get("fa_request_id") == command.request_id:
-            return  # this request already wrote it; a lost reply is never a second write
+            return False  # an earlier send of this request wrote it; a lost reply is never a second write
         client_id = self.app_settings.get(ref.authentication.app_setting) or ""
         if _CLIENT_ID.fullmatch(client_id) is None:
             raise Problem(422, "TEAM_MCP_CONNECTION_CREATE_UNAVAILABLE",
@@ -111,6 +112,7 @@ class TeamConnectorService:
         except Exception as error:
             _log.warning("TEAM_CONNECTOR_CONNECTION_WRITE_FAILED status=%s", _status(error))
             raise _write_failure(error, "connection") from None
+        return True
 
     def _finish(self, foundry, principal, ref: ConnectorRef, command: TeamConnectorChange, version: str):
         toolbox, _ = self._names(principal.team, ref)
@@ -142,13 +144,22 @@ class TeamConnectorService:
             if default is not None and owner != (principal.team, ref.id):
                 # A default version FA did not write for this Team and connector; never write over its versions.
                 raise Problem(409, "TEAM_CONNECTOR_TOOLBOX_TAKEN", "this connector toolbox holds another owner's tools")
-            self._ensure_connection(foundry, principal, ref, connection, command)
+            # Every local refusal comes before the connection write (as in Team MCP): the version is built first.
+            tools = connector_tools(ref, connection, command)
+            metadata = connector_metadata(principal.team, ref, connection, command, material)
+            secret_written = self._ensure_connection(foundry, principal, ref, connection, command)
             try:
-                version = foundry.create_version(
-                    toolbox, tools=connector_tools(ref, connection, command),
-                    metadata=connector_metadata(principal.team, ref, connection, command, material))
+                version = foundry.create_version(toolbox, tools=tools, metadata=metadata)
             except Exception as error:
-                raise _write_failure(error, "toolbox version") from None
+                failure = _write_failure(error, "toolbox version")
+                if secret_written:
+                    # This call just made the new secret live; a plain refusal would hide that. The same request_id
+                    # skips the connection write and only creates the version again, so a resend refused again
+                    # (secret_written False) gets the definite answer instead of 503 forever.
+                    failure = Problem(503, "TEAM_MCP_OUTCOME_UNKNOWN",
+                                      "the new client secret is saved; resend the same request_id",
+                                      upstream_status=_status(error))
+                raise failure from None
             return self._finish(foundry, principal, ref, command, version)
 
     def forget(self, tenant: str, team: str) -> None:

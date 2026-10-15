@@ -22,6 +22,8 @@ from shared_context import behavior_wire as wire
 from shared_context.behavior_assistant_wire import AssistantSubmit
 from shared_context.behavior_delivery import _Payload
 from shared_context.behavior_inbox import INBOX_CHANNEL_ID, INBOX_VERSION
+# This bridge decodes the ADR-0009 phase 2c notice kinds; the API adds them (and clears the slot) only when told.
+from shared_context.behavior_native_turn_wire import NOTICE_KINDS_HEADER, NOTICE_KINDS_VERSION
 from shared_context.behavior_operations import control_key
 
 
@@ -441,7 +443,8 @@ class PullAdapter:
             start = time.monotonic()
             with self.client.stream(method, url, params=params, content=None if body is None else canonical(body),
                 headers={"Authorization": "Bearer "+token, "Content-Type": "application/json",
-                         "Accept-Encoding": "identity", **({} if if_match is None else {"If-Match": if_match})},
+                         "Accept-Encoding": "identity", NOTICE_KINDS_HEADER: NOTICE_KINDS_VERSION,
+                         **({} if if_match is None else {"If-Match": if_match})},
                 follow_redirects=False) as response:
                 data = bytearray()
                 for chunk in response.iter_bytes():

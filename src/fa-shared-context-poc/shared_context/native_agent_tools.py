@@ -448,6 +448,11 @@ class NativeAgentRelayClient:
                         from .native_continuation_wire import CONTINUATION_STOP_STATUS
                         if suffix.startswith("/environment") and isinstance(upstream, str) and upstream in NATIVE_TURN_ERRORS:
                             code = upstream
+                        elif suffix == "/waiting-dispatch" and (response.status_code, upstream) in {
+                                (409, "NATIVE_SESSION_CHANGED"), (403, "WORK_POLICY_REVOKED")}:
+                            # Refused before anything was sent: the API has not caught up with a switch yet (asked
+                            # again), or the owner's work policy is revoked (the message keeps waiting, logged).
+                            code = upstream
                         elif (suffix == "/continue" and isinstance(upstream, str)
                                 and response.status_code == CONTINUATION_STOP_STATUS.get(upstream)):
                             code = upstream
@@ -463,7 +468,7 @@ class NativeAgentRelayClient:
                                     else "NATIVE_RELAY_OUTCOME_UNKNOWN")
                         route = suffix if suffix in {
                             "/send", "/environment", "/environment/observe", "/continue", "/result", "/outcome",
-                            "/read-result", "/recipients"} else "unclassified"
+                            "/read-result", "/recipients", "/waiting-dispatch"} else "unclassified"
                         logging.getLogger(__name__).warning(
                             "NATIVE_RELAY_REQUEST_FAILED route=%s status=%s code=%s",
                             route, response.status_code, code)
@@ -493,6 +498,14 @@ class NativeAgentRelayClient:
         from .behavior_native_turn_wire import NativeReceipt
         return await self._request("/continue", NativeReceipt, NativeRelayResult(
             conversation_id=view.conversation_id, request_id=view.original_request_id))
+
+    async def dispatch_waiting(self, receipt):
+        """ADR-0009 §7a (s): ask the API to send this session's own accepted Responses message that just took its
+        conversation slot in Hosted (``native_left_receipts.wait_turn``); the API sends it only while Hosted still
+        reports ``needs_response`` (``NativeAgentRelayGateway.dispatch_waiting``)."""
+        from .behavior_native_turn_wire import NativeReceipt
+        return await self._request("/waiting-dispatch", NativeReceipt, NativeRelayResult(
+            conversation_id=receipt.conversation_id, request_id=receipt.request_id))
 
     async def send(self, receipt, call_id, message, *, on_queued=None):
         try:

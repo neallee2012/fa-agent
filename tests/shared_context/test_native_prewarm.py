@@ -228,7 +228,7 @@ def test_a_prewarm_while_the_agents_turn_runs_answers_at_once_and_the_turn_is_un
 def test_a_replaced_session_is_not_warmed(harness):
     warmed = []
     harness.runtime.executor.prewarm = lambda toolboxes: warmed.append(toolboxes) or len(toolboxes)
-    harness.runtime.replaced = lambda current: True
+    harness.runtime.replaced = lambda current, **_: True
     response = harness.invoke(NativePrewarm(toolboxes=(ORG,)))
     assert response.status_code == 409 and response.json()["error"]["code"] == "NATIVE_SESSION_CHANGED"
     assert warmed == []

@@ -856,3 +856,55 @@ def test_a_continuation_reads_the_sender_selector_and_never_invokes_its_kept_old
             conversation_id=case.sender.conversation_id, request_id=case.sender.request_id))
     assert (refused.value.status, refused.value.body["error"]["code"]) == (409, "NATIVE_SESSION_CHANGED")
     assert len(case.remotes[0].calls) == before
+
+
+@pytest.mark.parametrize("misrouted", [False, True], ids=["unknown-to-the-caller", "read-through-the-caller"])
+def test_another_agent_can_not_have_a_waiting_responses_message_sent(relay_case, monkeypatch, misrouted):
+    """Review round 4 (P3), ADR-0009 §7a (s): ``/waiting-dispatch`` with a registered teammate's (B's) identity for
+    A's waiting Responses message reads through B's own session: the RID is unknown there, or (were B's session to
+    show A's receipt) the transport refuses another Agent's receipt; refused either way, nothing sent. A's own
+    identity sends it once."""
+    from shared_context import behavior_native_responses_api
+    from shared_context.behavior_native_agent_wire import NativeRelayResult
+    from shared_context.native_agent_api import NativeAgentRelayGateway
+    from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NativeResponseDispatch
+
+    case = relay_case
+    a, b = case.base.a, case.base.b
+    command = InstructionSubmit(request_id="waits-here", content="Send only for its own Agent.")
+    capture = resolve_capture(a.runtime.work_policy, a.assistant.authority, case.base.c.human, command)
+    request = NativeSubmit(command=command, capture=capture, state_profile=NATIVE_RESPONSES_PROFILE,
+                           new_conversation_id="responses-waits-here")
+    waiting = NativeReceipt(
+        state_profile=NATIVE_RESPONSES_PROFILE, agent_id=case.sender.agent_id,
+        hosted_session_id=case.clients[0].target.session_id, request_id=command.request_id,
+        conversation_id="responses-waits-here", command=command, capture=capture, submit_digest=request.sha256,
+        capture_digest=capture.sha256, status="accepted",
+        dispatch=NativeResponseDispatch(state="needs_response", inflight_request_id=command.request_id))
+    case.remotes[0].records[waiting.request_id] = waiting
+    if misrouted:
+        case.remotes[1].records[waiting.request_id] = waiting
+    sent = []
+
+    class Recording:
+        mode = "conversation"
+
+        def start(self, headers, _content, *, before_send=None, **_values):
+            if before_send is not None:
+                before_send()
+            sent.append(headers.request_id)
+
+    monkeypatch.setattr(behavior_native_responses_api, "platform_client", lambda *_: Recording())
+    scope = a.config.agent_scope(b.runtime.dep.native_launches.targets[0].agent_id)
+    teammate = BehaviorPrincipal(str(scope.tenant_id), str(scope.identity.oid), scope.team_id, "agent",
+                                 scope.identity.actor, frozenset({"read", "submit", "execute"}))
+    assert teammate.oid != case.principal.oid and teammate.team == case.principal.team
+    gateway = NativeAgentRelayGateway(a, enabled=True, repository=case.repository)
+    body = NativeRelayResult(conversation_id=waiting.conversation_id, request_id=waiting.request_id)
+    with pytest.raises(Problem) as refused:
+        gateway.dispatch_waiting(teammate, body)
+    assert (refused.value.status, refused.value.body["error"]["code"]) == (
+        (502, "NATIVE_STATE_SCOPE") if misrouted else (404, "NATIVE_RID_MISSING"))
+    assert sent == []
+    gateway.dispatch_waiting(case.principal, body)
+    assert sent == ["waits-here"]

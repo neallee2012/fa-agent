@@ -61,6 +61,21 @@ def _register_scope(case):
     return operate(case.a, "register", case.target.agent_id, case.authorization, request_id="routing-registry-v1")
 
 
+def register_more_agents(case, count):
+    """Register and activate ``count`` more Agents in the served Team; returns their agent IDs."""
+    from shared_context.behavior_agent_registry_operator import operate
+    transports = next(cell.cell_contents for cell in case.a._peer_factory.__closure__
+                      if isinstance(cell.cell_contents, dict) and case.config.targets[0].executor_id in cell.cell_contents)
+    added = []
+    for n in range(2, 2 + count):
+        target = _target(n, f"{n:08d}-abab-abab-abab-abababababab")
+        case.teams.register_agent(case.c.human, f"routing-agent-{n}", target.agent_id, target)
+        transports[target.executor_id] = transports[case.config.targets[0].executor_id]
+        operate(case.a, "register", target.agent_id, case.authorization, request_id=f"routing-registry-{n}")
+        added.append(target.agent_id)
+    return added
+
+
 def _entry(case, agent_id):
     return next(entry for entry in public_agents(case.a, case.c.human).agents if entry.agent_id == agent_id)
 
@@ -235,3 +250,63 @@ def test_registered_agent_scope_passes_the_real_startup_readers_and_a_missing_ta
     with pytest.raises(Problem) as refused:
         validate_agent_registry_history(missing, config)
     assert refused.value.status == 409
+
+
+def test_a_binding_path_finds_its_peer_without_rescanning_the_team(team_agent, signing_key, monkeypatch):
+    case = team_agent
+    _register_scope(case)
+    agent_id = case.target.agent_id
+    binding = case.a.for_agent(agent_id).runtime.work_policy.policy.template.binding_id
+
+    def factory(composition):
+        async def where(request):
+            return JSONResponse({"agent_id": composition.agent_id})
+        return Starlette(routes=[Route("/{path:path}", where)])
+
+    async def problem(request, error):
+        return JSONResponse(error.body, status_code=error.status)
+
+    app = Starlette(routes=[Route("/{path:path}", lambda request: JSONResponse({"agent_id": None}))],
+                    exception_handlers={Problem: problem})
+    install_peer_routing(app, case.a, factory)
+    # The middleware (and its router) is built on the first request.
+    store, calls = case.a.runtime.store, []
+    for name in ("read_record", "read_snapshot"):
+        original = getattr(store, name)
+
+        def counted(*args, _original=original, _name=name, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(store, name, counted)
+    human = case.c.h.headers(signing_key, "Behavior.Read Behavior.Approve")
+    flat = f"/behavior/v1/bindings/{binding}/probe"
+
+    with TestClient(app, backend_options={"loop_factory": lambda: case.loop}) as client:
+        def reads(path):
+            del calls[:]
+            response = client.get(path, headers=human)
+            return response, len(calls)
+
+        first, _ = reads(flat)
+        router = case.a._peer_router
+        assert first.json() == {"agent_id": agent_id} and router.binding_agents == {binding: agent_id}
+        added = register_more_agents(case, 5)
+        last = case.a.for_agent(added[-1]).runtime.work_policy.policy.template.binding_id
+        assert reads(f"/behavior/v1/bindings/{last}/probe")[0].json() == {"agent_id": added[-1]}
+        _, front = reads(flat)
+        routed, back = reads(f"/behavior/v1/bindings/{last}/probe")
+        assert routed.json() == {"agent_id": added[-1]}
+        assert back == front, "the last of 7 Agents is routed with the same reads as the first; no Team scan"
+        assert router.binding_agents == {binding: agent_id, last: added[-1]}
+
+        # A binding no peer of this Team holds still falls to A's own routes, which refuse it; nothing is cached.
+        unknown = client.get("/behavior/v1/bindings/not-a-team-binding/probe", headers=human)
+        assert unknown.json() == {"agent_id": None} and set(router.binding_agents) == {binding, last}
+
+        # A map entry the peer does not confirm is refused and dropped; the next request scans again.
+        router.binding_agents[binding] = added[0]
+        stale = client.get(flat, headers=human)
+        assert stale.status_code == 403 and stale.json()["error"]["code"] == "BEHAVIOR_BINDING_DENIED"
+        assert binding not in router.binding_agents
+        assert client.get(flat, headers=human).json() == {"agent_id": agent_id}
+        assert router.binding_agents[binding] == agent_id

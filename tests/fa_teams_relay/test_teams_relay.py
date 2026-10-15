@@ -29,10 +29,11 @@ class FakeApi:
     """The FA API route: answers each POST with the next scripted reply (the last one repeats); None drops it."""
 
     def __init__(self, *replies):
-        self.replies, self.posts, self.paths = list(replies), [], []
+        self.replies, self.posts, self.paths, self.acks = list(replies), [], [], []
 
     def __call__(self, request):
         self.paths.append(request.url.path)
+        self.acks.append(request.headers.get_list("x-fa-relay-ack"))
         self.posts.append((request.headers["authorization"], json.loads(request.content)))
         reply = self.replies[0] if len(self.replies) == 1 else self.replies.pop(0)
         if reply is None:
@@ -52,6 +53,10 @@ class Clock:
         self.now += seconds
 
 
+# An API older than catch-up answers this; the relay shows it as it is and promises nothing more.
+STILL_RUNNING = "這一輪還在跑，完成後結果在工作台。"
+
+
 def running():
     return 200, {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。"}
 
@@ -67,10 +72,10 @@ def chat(tmp_path, monkeypatch):
         client = TestClient(relay_main.build_app(api, clock=clock, sleep=clock.sleep)).__enter__()
         clients.append(client)
 
-        def say(content="今天的待辦？", *, activity="act-1", user=OWNER):
+        def say(content="今天的待辦？", *, activity="act-1", user=OWNER, protocol="a:teams-chat"):
+            metadata = {"ActivityId": activity, **({} if protocol is None else {"ActivityProtocolConversationId": protocol})}
             response = client.post("/responses", json={
-                "input": content, "stream": False, "conversation": "conv_teams_a",
-                "metadata": {"ActivityId": activity, "ActivityProtocolConversationId": "a:teams-chat"},
+                "input": content, "stream": False, "conversation": "conv_teams_a", "metadata": metadata,
             }, headers={} if user is None else {"x-agent-user-id": user})
             assert response.status_code == 200, response.text
             return response.json()["output"][0]["content"][0]["text"]
@@ -113,7 +118,7 @@ def test_missing_caller_header_is_refused_without_calling_the_api(chat):
 
 def test_stops_waiting_at_110_seconds_with_the_fixed_text(chat):
     case = chat(running())
-    assert case.say() == "這一輪還在跑，完成後結果在工作台。"
+    assert case.say() == STILL_RUNNING
     assert case.clock.now - 1000.0 <= 110 and sum(case.clock.sleeps) == 108
     assert len(case.fake.posts) == 37
 
@@ -127,7 +132,7 @@ def test_an_api_that_never_answered_2xx_says_receipt_is_unconfirmed_at_110_secon
 
 def test_api_errors_after_a_running_reply_still_say_running_at_110_seconds(chat):
     case = chat(running(), (503, {"error": {"code": "TABLE_UNAVAILABLE"}}))
-    assert case.say() == "這一輪還在跑，完成後結果在工作台。"
+    assert case.say() == STILL_RUNNING
     assert sum(case.clock.sleeps) == 108 and len(case.fake.posts) == 37
 
 
@@ -179,7 +184,7 @@ def test_a_decision_polls_the_same_body_every_three_seconds_until_the_turn_ends(
 
 def test_a_decision_whose_turn_keeps_running_stops_at_110_seconds_with_the_fixed_text(chat):
     case = chat(running())
-    assert case.say("允許 123456") == "這一輪還在跑，完成後結果在工作台。"
+    assert case.say("允許 123456") == STILL_RUNNING
     assert sum(case.clock.sleeps) == 108 and len(case.fake.posts) == 37
 
 
@@ -195,3 +200,68 @@ def test_a_decision_the_api_never_answered_says_unconfirmed(chat):
 def test_the_apis_fixed_decision_texts_are_returned_as_they_are(chat, text):
     case = chat((200, {"state": "failed", "text": text}))
     assert case.say("允許 123456") == text and len(case.fake.posts) == 1
+
+
+CAUGHT_UP = "先前的回覆（剛完成）：\n「今天的待辦？」\n三件事。\n\n——\n好。"
+RIDS = ["tr-" + "2" * 40, "tr-" + "1" * 40]
+
+
+def test_a_reply_carrying_earlier_replies_is_acknowledged_before_it_is_returned(chat):
+    case = chat(running(), (200, {"state": "done", "text": CAUGHT_UP, "confirm": RIDS}), (200, {"cleared": 2}))
+    assert case.say("下一步？", activity="act-2") == CAUGHT_UP
+    assert case.fake.paths == ["/teams-relay/v1/turns"] * 2 + ["/teams-relay/v1/acks"]
+    assert case.fake.posts[-1] == ("Bearer synthetic-relay-token", {
+        "chat_id": "conv_teams_a", "user_oid": OWNER, "request_ids": RIDS})
+
+
+@pytest.mark.parametrize("failure", [None, (503, {"error": {"code": "TABLE_UNAVAILABLE"}}),
+                                     (403, {"error": {"code": "TEAMS_RELAY_NOT_OWNER"}})])
+def test_a_failed_acknowledgement_never_holds_back_the_reply(chat, failure):
+    case = chat((200, {"state": "done", "text": CAUGHT_UP, "confirm": RIDS}), failure)
+    assert case.say() == CAUGHT_UP
+    assert case.fake.paths == ["/teams-relay/v1/turns", "/teams-relay/v1/acks"] and case.clock.sleeps == []
+
+
+def test_a_decision_reply_that_carries_earlier_replies_is_acknowledged_too(chat):
+    case = chat((200, {"state": "done", "text": CAUGHT_UP, "confirm": RIDS}), (200, {"cleared": 2}))
+    assert case.say("允許 123456") == CAUGHT_UP
+    assert case.fake.paths == ["/teams-relay/v1/decisions", "/teams-relay/v1/acks"]
+
+
+def test_no_acknowledgement_without_confirm_or_after_the_wait_ends(chat):
+    case = chat((200, {"state": "done", "text": "三件事。"}))
+    assert case.say() == "三件事。" and case.fake.paths == ["/teams-relay/v1/turns"]
+    timeout = chat(running())
+    assert timeout.say() == STILL_RUNNING
+    assert set(timeout.fake.paths) == {"/teams-relay/v1/turns"}
+
+
+def test_every_turn_and_decision_says_the_relay_acknowledges(chat):
+    case = chat(running(), (200, {"state": "done", "text": CAUGHT_UP, "confirm": RIDS}), (200, {"cleared": 2}))
+    case.say()
+    decision = chat((200, {"state": "failed", "text": "這個項目已過期。"}))
+    decision.say("允許 123456")
+    assert case.fake.acks == [["1"]] * 3 and decision.fake.acks == [["1"]]
+
+
+def test_at_the_wait_bound_the_relay_shows_the_apis_own_running_text(chat):
+    # Only an API that records late replies for this relay promises the next message; the relay adds no promise.
+    promise = "這一輪還在跑；完成後，回覆會附在你下一則訊息的回覆前面，也可以先到工作台看。"
+    assert chat((200, {"state": "running", "text": promise})).say() == promise
+    assert chat(running()).say("允許 123456") == "這一輪還在跑，完成後結果在工作台。"
+
+
+# Group chat and channel conversation IDs (built in parts: the public export scans for literal Teams IDs).
+GROUP = "19:" + "0" * 32 + "@thread" + ".v2"
+CHANNEL = "19:" + "0" * 32 + "@thread" + ".tacv2"
+
+
+@pytest.mark.parametrize("protocol", [GROUP, CHANNEL, None, "", "A:teams-chat"],
+                         ids=["group", "channel", "missing", "empty", "upper"])
+def test_only_a_one_to_one_chat_says_the_relay_acknowledges(chat, protocol):
+    # Without the header the API records and adds nothing, so a group or channel never carries the owner's other replies.
+    case = chat(running(), (200, {"state": "done", "text": "好。"}))
+    assert case.say(protocol=protocol) == "好。"
+    decision = chat((200, {"state": "failed", "text": "這個項目已過期。"}))
+    decision.say("允許 123456", protocol=protocol)
+    assert case.fake.acks == [[], []] and decision.fake.acks == [[]]

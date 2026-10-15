@@ -815,3 +815,569 @@ def test_official_reentry_after_completed_before_envelope_recovers_one_original_
     harness.call(run)
     assert len(harness.sdk.calls) == 1
     assert envelopes and all(envelope == envelopes[0] for envelope in envelopes)
+
+
+def flaky_reads(monkeypatch, key):
+    """``mode``: None reads the store; "unknown" raises a transport error; "missing" returns no item once."""
+    get = FoundryStateStore.get_item
+    state = SimpleNamespace(mode=None, hits=0, reads=0)
+
+    async def read(store, item_key, **kwargs):
+        state.reads += item_key == key
+        if item_key == key and state.mode is not None:
+            state.hits += 1
+            if state.mode == "missing":
+                state.mode = None
+                return None
+            raise ServiceResponseError("OFFLINE store read outcome unknown")
+        return await get(store, item_key, **kwargs)
+
+    monkeypatch.setattr(FoundryStateStore, "get_item", read)
+    return state
+
+
+def until(condition, seconds=10):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail("OFFLINE condition was not reached")
+        time.sleep(0.01)
+
+
+@pytest.fixture
+def quick_control(monkeypatch):
+    from shared_context import native_turns
+    monkeypatch.setattr(native_turns, "CONTROL_POLL_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(native_turns, "SLOT_WAIT_POLL_SECONDS", 0.05, raising=False)
+
+
+def test_an_unconfirmed_control_read_keeps_the_running_turn(harness, monkeypatch, quick_control):
+    """A 503 from one RID read is not an answer: the turn keeps running and saves (audit finding 4)."""
+    harness.sdk.block = True
+    harness.invoke(submit())
+    harness.wait("rid-1", "started")
+    flaky = flaky_reads(monkeypatch, "rid:rid-1")
+    flaky.mode = "unknown"
+    until(lambda: flaky.hits >= 2)
+    flaky.mode = None
+    assert not harness.sdk.controls["rid-1"].stop_requested()
+    harness.sdk.block = False
+    assert harness.wait("rid-1", "completed").result is not None
+    assert len(harness.sdk.calls) == 1
+
+
+def test_an_unconfirmed_control_read_keeps_a_turn_waiting_for_the_slot(harness, monkeypatch, quick_control):
+    """The execution-slot waiter shares the observer: a 503 keeps it waiting instead of failing the RID."""
+    accepted = accept_without_chain(harness)
+    flaky = flaky_reads(monkeypatch, "rid:rid-1")
+
+    async def run():
+        lock = harness.runtime.execution_lock
+        await lock.acquire()
+        task = asyncio.create_task(harness.runtime.handle_turn(task_context(accepted, entry_mode="fresh")))
+        try:
+            async with asyncio.timeout(10):
+                await asyncio.sleep(0.3)
+                flaky.mode = "unknown"
+                while flaky.hits < 2:
+                    await asyncio.sleep(0.01)
+                flaky.mode = None
+                assert not task.done()
+        finally:
+            lock.release()
+        async with asyncio.timeout(10):
+            return await task
+
+    receipt = harness.call(run)
+    assert receipt.status == "completed" and receipt.result is not None
+    assert [call[0] for call in harness.sdk.calls] == ["rid-1"]
+
+
+def test_a_changed_run_token_still_fences_the_running_turn(harness, quick_control):
+    harness.sdk.block = True
+    harness.invoke(submit())
+    harness.wait("rid-1", "started")
+    current = harness.call(harness.runtime._rid, "rid-1")
+    harness.call(harness.runtime._cas, current, _changed(current.value, run_token="OFFLINE-other-run"))
+    until(lambda: harness.sdk.controls["rid-1"].fenced)
+    harness.sdk.block = False
+    assert harness.call(harness.runtime.read, "rid-1").result is None
+
+
+def test_a_missing_rid_is_a_definite_answer_and_fences_the_turn(harness, monkeypatch, quick_control):
+    harness.sdk.block = True
+    harness.invoke(submit())
+    harness.wait("rid-1", "started")
+    flaky = flaky_reads(monkeypatch, "rid:rid-1")
+    flaky.mode = "missing"
+    until(lambda: harness.sdk.controls["rid-1"].fenced)
+    harness.sdk.block = False
+    stopped = harness.wait("rid-1", "unknown")
+    assert stopped.failure_code == "NATIVE_TURN_UNKNOWN" and stopped.result is None
+
+
+def test_a_running_turn_reads_its_rid_about_once_a_second(harness, monkeypatch):
+    """Audit finding 14: the control observer read the RID every 0.1 s (10 reads/s per turn)."""
+    harness.sdk.block = True
+    harness.invoke(submit())
+    harness.wait("rid-1", "started")
+    counted = flaky_reads(monkeypatch, "rid:rid-1")
+    time.sleep(2.2)
+    reads = counted.reads
+    harness.sdk.block = False
+    harness.wait("rid-1", "completed")
+    assert 1 <= reads <= 4, reads
+
+
+def test_a_turn_waiting_for_the_slot_reads_its_rid_at_most_every_two_seconds(harness, monkeypatch):
+    accepted = accept_without_chain(harness)
+    counted = flaky_reads(monkeypatch, "rid:rid-1")
+
+    async def run():
+        lock = harness.runtime.execution_lock
+        await lock.acquire()
+        task = asyncio.create_task(harness.runtime.handle_turn(task_context(accepted, entry_mode="fresh")))
+        try:
+            await asyncio.sleep(0.5)
+            before = counted.reads
+            await asyncio.sleep(2.2)
+            during = counted.reads - before
+            assert not task.done()
+        finally:
+            released = time.monotonic()
+            lock.release()
+        async with asyncio.timeout(10):
+            while not harness.sdk.calls:
+                await asyncio.sleep(0.01)
+            wake = time.monotonic() - released
+            return during, wake, await task
+
+    during, wake, receipt = harness.call(run)
+    assert receipt.status == "completed" and 1 <= during <= 2, during
+    # The released lock wakes the waiter at once; it does not wait for its next RID read.
+    assert wake < 1.5, wake
+
+
+def running_observer_reads(harness, monkeypatch):
+    """``cancel_requested`` as each RID read of the running turn's control observer returned it (not the slot
+    waiter's reads, nor the test's own)."""
+    from contextvars import ContextVar
+
+    running, reads = ContextVar("running_observer", default=False), []
+    observe, read = harness.runtime._observe_control, harness.runtime._rid
+
+    async def observing(*args, waiting=False, **kwargs):
+        running.set(not waiting)  # the observer's own task context
+        return await observe(*args, waiting=waiting, **kwargs)
+
+    async def reading(rid):
+        value = await read(rid)
+        if running.get():
+            reads.append(value.value.receipt.cancel_requested)
+        return value
+
+    monkeypatch.setattr(harness.runtime, "_observe_control", observing)
+    monkeypatch.setattr(harness.runtime, "_rid", reading)
+    return reads
+
+
+def test_a_cancel_saved_here_wakes_the_control_read_at_once(harness, monkeypatch):
+    """The poll is the fallback; a cancel this process saved is seen without waiting for it. The observer's first read
+    has returned before the cancel and its next poll is an hour away, so the read that sees the cancel is the wake's."""
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "CONTROL_POLL_SECONDS", 3600.0)
+    reads = running_observer_reads(harness, monkeypatch)
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    until(lambda: reads)
+    assert reads == [False]
+    cancel = harness.invoke(NativeCancel(conversation_id=active.conversation_id, request_id="rid-1"))
+    assert cancel.status_code == 200 and cancel.json()["cancel_requested"], cancel.text
+    until(lambda: harness.sdk.controls["rid-1"].cancelled)
+    assert reads == [False, True]
+    assert harness.wait("rid-1", "unknown").failure_code == "NATIVE_TURN_CANCELLED"
+
+
+class OfflineSteering:
+    """The SDK session behind a steering channel: every send is enqueued and its delivery event observed at once."""
+
+    def __init__(self):
+        self.sent = []
+        self.channel = None
+
+    async def send(self, content, mode):
+        self.sent.append((content, mode))
+        identifier = f"OFFLINE-sdk-message-{len(self.sent)}"
+        self.channel.delivered[identifier] = "queued"
+        return identifier
+
+
+def steer(harness, rid="rid-1"):
+    """Open the running turn's steering channel, as the SDK executor does once its session is ready."""
+    from shared_context.copilot_steering import SdkSteeringChannel
+
+    control, session = harness.sdk.controls[rid], OfflineSteering()
+
+    async def open_channel():
+        session.channel = SdkSteeringChannel(control.stop_requested)
+        session.channel.open(session)
+        control.steering = session.channel
+
+    harness.call(open_channel)
+    return session
+
+
+def append_command(active, append_id="append-1", content="OFFLINE appended text"):
+    from shared_context.native_append_wire import NativeAppend
+
+    return NativeAppend(request_id=active.request_id, conversation_id=active.conversation_id, append_id=append_id,
+                        expected_submit_digest=active.submit_digest, content=content)
+
+
+def read_append(harness, active, append_id="append-1"):
+    from shared_context.native_append_wire import NativeAppendRead
+    from shared_context.native_appends import read_append
+
+    return harness.call(read_append, harness.runtime, NativeAppendRead(
+        request_id=active.request_id, conversation_id=active.conversation_id, append_id=append_id))
+
+
+def appends_key(rid="rid-1"):
+    from shared_context.native_appends import _key
+
+    return _key(rid)
+
+
+def test_a_running_turn_with_steering_reads_its_appends_about_once_a_second(harness, monkeypatch):
+    """Audit finding 14, second half: append delivery read ``appends:`` every 0.1 s while steering was ready."""
+    harness.sdk.block = True
+    harness.invoke(submit())
+    harness.wait("rid-1", "started")
+    steer(harness)
+    counted = flaky_reads(monkeypatch, appends_key())
+    time.sleep(2.2)
+    reads = counted.reads
+    harness.sdk.block = False
+    harness.wait("rid-1", "completed")
+    assert 1 <= reads <= 4, reads
+
+
+def test_an_append_saved_here_is_delivered_at_once(harness, monkeypatch):
+    """The poll is the fallback; an append this process saved wakes the delivery without waiting for it."""
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "CONTROL_POLL_SECONDS", 30.0)
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    session = steer(harness)
+    time.sleep(0.3)
+    started = time.monotonic()
+    assert harness.invoke(append_command(active)).status_code == 202
+    until(lambda: session.sent, seconds=5)
+    assert time.monotonic() - started < 2
+    harness.sdk.block = False
+    harness.wait("rid-1", "completed")
+    assert session.sent == [("OFFLINE appended text", "enqueue")]
+    assert read_append(harness, active).status == "applied"
+
+
+def test_an_append_saved_by_another_process_is_delivered_within_the_poll(harness, monkeypatch):
+    """No wake reaches this process for another process's append; the 1 s poll still finds it."""
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    session = steer(harness)
+    time.sleep(0.3)
+    monkeypatch.setattr(harness.runtime, "_wake_control", lambda rid: None)
+    started = time.monotonic()
+    assert harness.invoke(append_command(active)).status_code == 202
+    until(lambda: session.sent, seconds=5)
+    assert time.monotonic() - started < 1.8
+    harness.sdk.block = False
+    harness.wait("rid-1", "completed")
+    assert len(session.sent) == 1 and read_append(harness, active).status == "applied"
+
+
+def test_appends_saved_together_are_delivered_one_after_another_without_waiting_for_the_poll(harness, monkeypatch):
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "CONTROL_POLL_SECONDS", 30.0)
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    time.sleep(0.3)
+    for index in range(3):
+        assert harness.invoke(append_command(active, f"append-{index}", f"OFFLINE text {index}")).status_code == 202
+    session = steer(harness)
+    until(lambda: len(session.sent) == 3, seconds=5)
+    harness.sdk.block = False
+    harness.wait("rid-1", "completed")
+    assert [content for content, _ in session.sent] == [f"OFFLINE text {index}" for index in range(3)]
+
+
+def test_the_save_reads_each_result_part_back_once_and_writes_them_concurrently(harness, monkeypatch):
+    """Audit finding 17: ``_immutable`` already reads every part back; the second full read is gone."""
+    create, get = FoundryStateStore.create_item, FoundryStateStore.get_item
+    seen = SimpleNamespace(reads=0, active=0, most=0)
+
+    async def counted_create(store, key, value, **kwargs):
+        if not key.startswith("text:"):
+            return await create(store, key, value, **kwargs)
+        seen.active += 1
+        seen.most = max(seen.most, seen.active)
+        try:
+            await asyncio.sleep(0.02)
+            return await create(store, key, value, **kwargs)
+        finally:
+            seen.active -= 1
+
+    async def counted_get(store, key, **kwargs):
+        seen.reads += key.startswith("text:")
+        return await get(store, key, **kwargs)
+
+    monkeypatch.setattr(FoundryStateStore, "create_item", counted_create)
+    monkeypatch.setattr(FoundryStateStore, "get_item", counted_get)
+    harness.sdk.text = "完整答案🎯\n" * 60_000
+    harness.invoke(submit())
+    receipt = harness.wait("rid-1", "completed")
+    assert receipt.result.text_parts > 4
+    assert seen.reads == receipt.result.text_parts
+    assert 1 < seen.most <= 4
+
+
+def test_a_result_part_that_reads_back_different_is_never_completed(harness, monkeypatch):
+    get = FoundryStateStore.get_item
+
+    async def altered(store, key, **kwargs):
+        item = await get(store, key, **kwargs)
+        if key.startswith("text:") and key.endswith(":1") and item is not None:
+            return SimpleNamespace(key=item.key, etag=item.etag, value={**item.value, "text": item.value["text"] + "!"})
+        return item
+
+    monkeypatch.setattr(FoundryStateStore, "get_item", altered)
+    harness.sdk.text = "完整答案🎯\n" * 20_000
+    harness.invoke(submit())
+    receipt = harness.wait("rid-1", "unknown")
+    assert receipt.failure_code == "NATIVE_STATE_INVALID" and receipt.result is None
+    assert len(harness.sdk.calls) == 1
+
+
+def test_an_unconfirmed_append_remember_write_is_retried_and_the_append_sent_once(harness, monkeypatch):
+    """A 503 from append delivery is no answer: the turn keeps running. The entry was claimed (``sending`` + token)
+    before the SDK send, so the retry never sends it again; it writes the unconfirmed SDK message ID once more."""
+    set_item = FoundryStateStore.set_item
+    lost = []
+
+    async def unconfirmed(store, key, value, **kwargs):
+        if (key == appends_key() and not lost
+                and any(entry.get("sdk_message_id") for entry in value.get("entries", ()))):
+            lost.append(key)
+            raise ServiceResponseError("OFFLINE append remember write outcome unknown")
+        return await set_item(store, key, value, **kwargs)
+
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    session = steer(harness)
+    monkeypatch.setattr(FoundryStateStore, "set_item", unconfirmed)
+    assert harness.invoke(append_command(active)).status_code == 202
+    until(lambda: lost and read_append(harness, active).status == "applied")
+    assert not harness.sdk.controls["rid-1"].stop_requested()
+    harness.sdk.block = False
+    assert harness.wait("rid-1", "completed").result is not None
+    assert len(session.sent) == 1 and len(harness.sdk.calls) == 1
+    applied = read_append(harness, active)
+    assert applied.status == "applied" and applied.sdk_message_id == "OFFLINE-sdk-message-1"
+
+
+def test_an_unconfirmed_sdk_handoff_keeps_the_turn_and_never_resends_the_append(harness):
+    """The SDK send itself raised (503 ``NATIVE_APPEND_UNKNOWN``): the turn goes on; the claimed entry is not sent
+    again and ends ``unknown`` (``sdk_unconfirmed``), so the owner reads it instead of getting a duplicate."""
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    session = steer(harness)
+    attempts = []
+
+    async def failing(content, mode):
+        attempts.append(content)
+        raise ConnectionError("OFFLINE SDK handoff outcome unknown")
+
+    session.send = failing
+    assert harness.invoke(append_command(active)).status_code == 202
+    until(lambda: attempts)
+    time.sleep(2.5)  # past the first retry
+    assert not harness.sdk.controls["rid-1"].stop_requested()
+    harness.sdk.block = False
+    assert harness.wait("rid-1", "completed").result is not None
+    assert len(attempts) == 1
+    ended = read_append(harness, active)
+    assert ended.status == "unknown" and ended.reason == "sdk_unconfirmed"
+
+
+def test_a_running_turn_with_no_confirmed_control_read_for_the_bound_is_fenced(harness, monkeypatch, quick_control):
+    """Audit finding 4's outer bound: a VM whose RID reads stay 5xx no longer runs its turn up to the SDK's 1-day
+    timeout, past N (ADR-0009 §7a) when a new session may count it lost; it stops after half of N without one
+    confirmed read and ends ``unknown`` once the store answers again."""
+    from shared_context import native_turns
+    from shared_context.native_left_receipts import STALL_SECONDS
+
+    assert native_turns.CONTROL_UNCONFIRMED_FENCE_SECONDS < STALL_SECONDS
+    offset = SimpleNamespace(seconds=0.0)
+    monkeypatch.setattr(native_turns, "monotonic", lambda: time.monotonic() + offset.seconds)
+    get = FoundryStateStore.get_item
+    outage = SimpleNamespace(on=False, hits=0)
+
+    async def read(store, key, **kwargs):
+        if key == "rid:rid-1" and outage.on and not harness.sdk.controls["rid-1"].fenced:
+            outage.hits += 1
+            raise ServiceResponseError("OFFLINE store read outcome unknown")
+        return await get(store, key, **kwargs)
+
+    harness.sdk.block = True
+    harness.invoke(submit())
+    harness.wait("rid-1", "started")
+    monkeypatch.setattr(FoundryStateStore, "get_item", read)
+    outage.on = True
+    until(lambda: outage.hits >= 2)
+    offset.seconds = native_turns.CONTROL_UNCONFIRMED_FENCE_SECONDS - 30
+    until(lambda: outage.hits >= 3)
+    assert not harness.sdk.controls["rid-1"].stop_requested()
+    offset.seconds = native_turns.CONTROL_UNCONFIRMED_FENCE_SECONDS + 1
+    until(lambda: harness.sdk.controls["rid-1"].fenced)
+    stopped = harness.wait("rid-1", "unknown")
+    assert stopped.failure_code == "NATIVE_TURN_UNKNOWN" and stopped.result is None
+    assert len(harness.sdk.calls) == 1
+
+
+
+def skewed_clock(monkeypatch):
+    """``native_turns.monotonic`` plus an offset the test moves forward (the observer's fence clock)."""
+    from shared_context import native_turns
+
+    offset = SimpleNamespace(seconds=0.0)
+    monkeypatch.setattr(native_turns, "monotonic", lambda: time.monotonic() + offset.seconds)
+    return offset
+
+
+def test_reads_that_keep_succeeding_past_the_bound_never_fence_the_turn(harness, monkeypatch, quick_control):
+    """The bound counts from the last confirmed read, not from the start: a turn whose reads keep succeeding runs on
+    past it, and one later unconfirmed read is still no answer."""
+    from shared_context import native_turns
+
+    offset = skewed_clock(monkeypatch)
+    harness.sdk.block = True
+    harness.invoke(submit())
+    harness.wait("rid-1", "started")
+    flaky = flaky_reads(monkeypatch, "rid:rid-1")
+    offset.seconds = native_turns.CONTROL_UNCONFIRMED_FENCE_SECONDS + 1
+    reads = flaky.reads
+    until(lambda: flaky.reads >= reads + 2)  # a read that started after the jump has been confirmed
+    flaky.mode = "unknown"
+    until(lambda: flaky.hits >= 2)
+    flaky.mode = None
+    assert not harness.sdk.controls["rid-1"].stop_requested()
+    harness.sdk.block = False
+    assert harness.wait("rid-1", "completed").result is not None
+    assert len(harness.sdk.calls) == 1
+
+
+def test_a_turn_waiting_for_the_slot_past_the_bound_is_not_fenced_and_runs_once(harness, monkeypatch, quick_control):
+    """The slot waiter has started nothing: unconfirmed reads past the bound keep it waiting, and it runs once."""
+    from shared_context import native_turns
+
+    offset = skewed_clock(monkeypatch)
+    accepted = accept_without_chain(harness)
+    flaky = flaky_reads(monkeypatch, "rid:rid-1")
+
+    async def run():
+        lock = harness.runtime.execution_lock
+        await lock.acquire()
+        task = asyncio.create_task(harness.runtime.handle_turn(task_context(accepted, entry_mode="fresh")))
+        try:
+            async with asyncio.timeout(10):
+                await asyncio.sleep(0.3)
+                offset.seconds = native_turns.CONTROL_UNCONFIRMED_FENCE_SECONDS + 1
+                flaky.mode = "unknown"
+                while flaky.hits < 2:
+                    await asyncio.sleep(0.01)
+                flaky.mode = None
+                assert not task.done()
+        finally:
+            lock.release()
+        async with asyncio.timeout(10):
+            return await task
+
+    receipt = harness.call(run)
+    assert receipt.status == "completed" and receipt.result is not None
+    assert [call[0] for call in harness.sdk.calls] == ["rid-1"]
+
+def lose_the_claim_reply(monkeypatch, append_id="append-0", landed=None):
+    """The claim write of ``append_id`` lands, but its reply and the read-back fail: ``_update`` answers 503 although
+    the stored entry is ``sending`` under this process's token. ``landed`` runs once the write is in the store."""
+    set_item, get_item = FoundryStateStore.set_item, FoundryStateStore.get_item
+    state = SimpleNamespace(lost=False, reread=False)
+
+    async def write(store, key, value, **kwargs):
+        result = await set_item(store, key, value, **kwargs)
+        if key == appends_key() and not state.lost and any(
+                entry["command"]["append_id"] == append_id and entry["status"] == "sending"
+                for entry in value.get("entries", ())):
+            state.lost = state.reread = True
+            if landed is not None:
+                landed()
+            raise ServiceResponseError("OFFLINE append claim reply lost")
+        return result
+
+    async def read(store, key, **kwargs):
+        if key == appends_key() and state.reread:
+            state.reread = False
+            raise ServiceResponseError("OFFLINE append read outcome unknown")
+        return await get_item(store, key, **kwargs)
+
+    monkeypatch.setattr(FoundryStateStore, "set_item", write)
+    monkeypatch.setattr(FoundryStateStore, "get_item", read)
+    return state
+
+
+def test_an_append_whose_claim_landed_unconfirmed_is_sent_once_and_before_later_appends(
+        harness, monkeypatch, quick_control):
+    """The claim write landed but ``_update`` answered 503: the entry is ``sending`` under a token this process still
+    holds as unsent. It is sent once, before the append saved after it (the model never sees #2 without #1)."""
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    for index in range(2):
+        assert harness.invoke(append_command(active, f"append-{index}", f"OFFLINE text {index}")).status_code == 202
+    lost = lose_the_claim_reply(monkeypatch)
+    session = steer(harness)
+    until(lambda: read_append(harness, active, "append-1").status == "applied")
+    assert lost.lost and not harness.sdk.controls["rid-1"].stop_requested()
+    harness.sdk.block = False
+    assert harness.wait("rid-1", "completed").result is not None
+    assert [content for content, _ in session.sent] == ["OFFLINE text 0", "OFFLINE text 1"]
+    assert [read_append(harness, active, f"append-{index}").status for index in range(2)] == ["applied", "applied"]
+    assert len(harness.sdk.calls) == 1
+
+
+def test_an_append_claimed_here_but_never_sent_reads_not_applied_when_the_turn_ends(harness, monkeypatch):
+    """The SDK turn ends right after a claim whose ``_update`` answered 503: this process never handed the append to the
+    SDK, so it reads ``not_applied`` (the owner may send it again), not ``unknown``."""
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    session = steer(harness)
+
+    def turn_ends():
+        session.channel.close()
+        harness.sdk.block = False
+
+    lost = lose_the_claim_reply(monkeypatch, "append-1", landed=turn_ends)
+    assert harness.invoke(append_command(active)).status_code == 202
+    assert harness.wait("rid-1", "completed").result is not None
+    assert lost.lost and session.sent == []
+    ended = read_append(harness, active)
+    assert (ended.status, ended.reason) == ("not_applied", "turn_finished")

@@ -8,12 +8,13 @@ import httpx
 import pytest
 
 from conftest import InMemoryRepository
+from shared_context import native_binding
 from shared_context.behavior_native_turn_wire import NATIVE_REQUEST, NativeReceipt, NativeResultReference, NativeSubmit
 from shared_context.errors import Problem
 from shared_context.native_hitl_attention import approval_code
 from shared_context.native_hitl_wire import NativeHitlDecision
 from shared_context.native_teams_relay import (
-    AGENTS_ENV, DECISIONS_PATH, ENABLED_ENV, PATH, install_teams_relay_routes,
+    ACKS_PATH, AGENTS_ENV, DECISIONS_PATH, ENABLED_ENV, PATH, install_teams_relay_routes,
 )
 from test_m3_auth import token
 from test_native_responses_api import responses_api  # noqa: F401
@@ -82,13 +83,16 @@ def relay(responses_api, signing_key, monkeypatch):
     monkeypatch.setattr("shared_context.native_teams_relay.find_approval_ids", lambda service, principal, code: [
         pid for pid in service.cards if service.collide or approval_code(pid) == code])
     environ = {ENABLED_ENV: "1", AGENTS_ENV: json.dumps({RELAY: env.case.remote.target.agent_id})}
-    install_teams_relay_routes(env.case.client.app, env.case.composition, environ=environ, records=records)
+    now = [1_800_000_000]
+    install_teams_relay_routes(env.case.client.app, env.case.composition, environ=environ, records=records,
+                               clock=lambda: now[0])
     owner = env.case.composition.config.identity.human_oid
 
     def sign(body, path, oid, delegated):
         signed = (token(signing_key, {"oid": oid, "scp": "Behavior.Read"}) if delegated else
                   token(signing_key, {"oid": oid, "idtyp": "app"}, remove=("scp", "appid")))
-        headers = {"Authorization": "Bearer " + signed}
+        # A relay older than catch-up sends no acknowledgement header (this module's default); see the catch-up tests.
+        headers = {"Authorization": "Bearer " + signed, **({"X-FA-Relay-Ack": "1"} if fixture.acks else {})}
         return env.case.client.post(path, json=body, headers=headers)
 
     def post(activity="act-1", text="今天的待辦？", *, chat="conv_teams_a", user=owner, oid=RELAY, delegated=False):
@@ -101,8 +105,13 @@ def relay(responses_api, signing_key, monkeypatch):
                 **({} if user is None else {"user_oid": user})}
         return sign(body, DECISIONS_PATH, oid, delegated)
 
-    return SimpleNamespace(env=env, records=records, post=post, decide=decide, owner=owner, waits=waits, seen=seen,
-                           hitl=hitl)
+    def ack(request_ids, *, chat="conv_teams_a", user=owner, oid=RELAY):
+        body = {"chat_id": chat, "request_ids": list(request_ids), **({} if user is None else {"user_oid": user})}
+        return sign(body, ACKS_PATH, oid, False)
+
+    fixture = SimpleNamespace(env=env, records=records, post=post, decide=decide, ack=ack, owner=owner, waits=waits,
+                              seen=seen, hitl=hitl, now=now, acks=False)
+    return fixture
 
 
 def submits(env):
@@ -137,19 +146,76 @@ def test_owner_message_runs_one_turn_and_returns_its_reply(relay):
     assert len(submits(relay.env)) == 1 and len(relay.env.conversations) == 1
 
 
-def test_owner_reply_carries_a_pending_drift_notice(relay, monkeypatch):
-    from shared_context import native_binding
+def drifted(relay, monkeypatch):
+    repository, target = InMemoryRepository(), relay.env.case.remote.target
+    monkeypatch.setattr(native_binding, "TableRepository", lambda _client: repository)
+    store = native_binding.binding_store(relay.env.case.composition)
+    # The same session was created on the target's version and the platform ran it on 40 (ADR-0009 §4 end).
+    store.claim(target.agent_id, hosted_session_id=target.session_id, created_agent_version=target.agent_version,
+                observed_version="40")
+    return store, target
+
+
+def switched(relay, monkeypatch):
+    """The Agent moved to the target's session without its work files; that §8 notice is still undelivered."""
+    from shared_context.behavior_native_turn_wire import NativeEnvironmentView
 
     repository, target = InMemoryRepository(), relay.env.case.remote.target
     monkeypatch.setattr(native_binding, "TableRepository", lambda _client: repository)
-    # The same session was created on the target's version and the platform ran it on 40 (ADR-0009 §4 end).
-    native_binding.binding_store(relay.env.case.composition).claim(
-        target.agent_id, hosted_session_id=target.session_id, created_agent_version=target.agent_version,
-        observed_version="40")
+    store = native_binding.binding_store(relay.env.case.composition)
+    store.record_switch(target.agent_id, NativeEnvironmentView(
+        agent_id=target.agent_id, request_id="follow-switch", state="ready", previous_hosted_session_id="older",
+        previous_agent_version="40", hosted_session_id=target.session_id, hosted_agent_version=target.agent_version,
+        files_migrated=False, files_skip_request_id="skip"))
+    return store, target
+
+
+WITHOUT_FILES = "已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。"
+
+
+def test_the_final_reply_on_the_read_path_neither_shows_nor_clears_the_drift_notice(relay, monkeypatch):
+    """ADR-0009 M4.2: a compatible same-session drift is shown only in the workbench status field, never in chat."""
+    store, target = drifted(relay, monkeypatch)
+    assert relay.post().json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。"}
+    complete(relay.env, rid("act-1"), "三件事。")
+    done = relay.post()  # the same message read again: gateway.read, not the submit
+    assert done.json() == {"state": "done", "text": "三件事。"}
+    # Left for the workbench, which shows it in its status field and clears it there.
+    assert store.read(target.agent_id).notice_pending is True
+    assert len(submits(relay.env)) == 1
+
+
+def test_the_final_reply_on_the_read_path_carries_the_switch_notice_and_clears_it(relay, monkeypatch):
+    store, target = switched(relay, monkeypatch)
     first = relay.post()
-    assert first.status_code == 200, first.text
-    assert first.json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。", "environment_notice": {
-        "kind": "platform_version_changed", "from_version": target.agent_version, "to_version": "40"}}
+    # A running poll's text is not what Teams shows, so it carries nothing and clears nothing.
+    assert first.json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。"}
+    assert store.read(target.agent_id).switch_notice == "without_files"
+    complete(relay.env, rid("act-1"), "三件事。")
+    done = relay.post()  # the same message read again: gateway.read, not the submit
+    assert done.json() == {"state": "done", "text": "三件事。\n\n" + WITHOUT_FILES,
+                           "environment_notice": {"kind": "environment_switched_without_files"}}
+    # Cleared only after that reply was written to the relay; the next final reply carries nothing.
+    assert store.read(target.agent_id).switch_notice is None
+    assert relay.post().json() == {"state": "done", "text": "三件事。"}
+    assert len(submits(relay.env)) == 1
+
+
+def test_a_teams_reply_whose_clear_failed_shows_the_notice_again(relay, monkeypatch):
+    store, target = switched(relay, monkeypatch)
+    relay.post()
+    complete(relay.env, rid("act-1"), "三件事。")
+    original = native_binding.NativeBindingStore.clear_notice
+
+    def failing(*_args, **_kwargs):
+        raise Problem(503, "TABLE_UNAVAILABLE", "synthetic Table outage")
+
+    monkeypatch.setattr(native_binding.NativeBindingStore, "clear_notice", failing)
+    assert relay.post().json()["text"].endswith(WITHOUT_FILES)
+    assert store.read(target.agent_id).switch_notice == "without_files"  # at least once: the next final reply
+    monkeypatch.setattr(native_binding.NativeBindingStore, "clear_notice", original)
+    assert relay.post().json()["text"].endswith(WITHOUT_FILES)
+    assert store.read(target.agent_id).switch_notice is None
 
 
 def test_same_activity_resent_reads_the_original_turn_and_never_submits_again(relay):
@@ -512,3 +578,34 @@ def test_malformed_relay_settings_fail_startup(responses_api, value):
         install_teams_relay_routes(responses_api.case.client.app, responses_api.case.composition,
                                    environ={ENABLED_ENV: "1", AGENTS_ENV: value}, records=InMemoryRepository())
 
+
+
+def test_an_earlier_version_unfinished_turn_says_why_in_teams():
+    from shared_context.behavior_native_turn_wire import NativeEnvironmentNotice
+    from shared_context.native_teams_relay import TeamsRelay
+
+    service = TeamsRelay.__new__(TeamsRelay)
+    left = SimpleNamespace(status="unknown", environment_notice=NativeEnvironmentNotice(kind="earlier_version_unfinished"))
+    reply = service._reply(None, None, left)
+    assert (reply.state, reply.text) == ("failed", "這則訊息是較早的版本接下的，目前環境無法接續；請用新訊息再送一次。")
+    plain = service._reply(None, None, SimpleNamespace(status="unknown", environment_notice=None))
+    assert (plain.state, plain.text) == ("failed", "這一輪沒有完成，請到工作台查看。")
+
+
+def test_section_8_sentences_are_the_adr_literals_in_the_api_and_the_workbench():
+    """One source of truth: every ADR-0009 §8 sentence the API (Teams text) or the page shows is the ADR's own text."""
+    from pathlib import Path
+
+    from shared_context.behavior_native_turn_wire import NativeEnvironmentNotice
+    from shared_context.native_teams_relay import NOTICE_TEXT, notice_text
+
+    root = Path(__file__).resolve().parents[2]
+    adr = (root / "docs" / "adr" / "0009-version-model-g-actual-version-idle-upgrade.md").read_text(encoding="utf-8")
+    page = (root / "src" / "fa-shared-context-poc" / "web_test_console" / "index.html").read_text(encoding="utf-8")
+    for sentence in NOTICE_TEXT.values():
+        assert "「" + sentence + "」" in adr and '"' + sentence + '"' in page, sentence
+    # The drift sentence is the workbench status field's only (M4.2): Teams has none, the page has the ADR's text.
+    assert notice_text(NativeEnvironmentNotice(from_version="41", to_version="40")) is None
+    head, tail = "平台把助理的執行環境換成了另一個版本（", "）；FA 已記錄，相容就照常執行。"
+    assert "「" + head + "vX→vY" + tail + "」" in adr
+    assert head + "v${notice.from_version}→v${notice.to_version}" + tail in page

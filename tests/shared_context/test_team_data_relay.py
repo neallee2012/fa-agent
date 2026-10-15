@@ -105,20 +105,38 @@ def test_writes_keep_create_only_etag_and_no_delete(relay_app, caplog):
     assert second.status_code == 200 and client.get(record, headers=headers(A.oid)).json()["data"] == {"v": 2}
     assert client.put(record, json={"data": {"v": 3}}, headers=headers(A.oid)).status_code == 422
 
-    done = PREFIX + "/records/turn-complete/rid-1"
-    original = client.put(done, json={"data": {"state": "succeeded"}}, headers=headers(A.oid, **{"If-None-Match": "*"}))
-    assert client.put(done, json={"data": {"state": "failed"}},
-                      headers=headers(A.oid, **{"If-Match": original.json()["etag"]})).status_code == 409
-    assert client.get(done, headers=headers(B.oid)).json()["data"] == {"state": "succeeded"}
+    done = PREFIX + "/records/memory/kept"
+    assert client.put(done, json={"data": {"v": 1}}, headers=headers(A.oid, **{"If-None-Match": "*"})).status_code == 201
 
     obj = PREFIX + "/objects/result/out/versions/" + VERSION
     receipt = client.put(obj, content=b"one", headers=headers(A.oid, **_octets(b"one"))).json()
     assert client.put(obj, content=b"one", headers=headers(A.oid, **_octets(b"one"))).status_code == 409
     assert client.get(obj + "/receipt", headers=headers(A.oid)).json() == receipt
-    assert _reasons(caplog) == ["ALREADY_EXISTS", "ETAG_CONFLICT", "TEAM_DATA_IMMUTABLE", "ARTIFACT_VERSION_EXISTS"]
+    assert _reasons(caplog) == ["ALREADY_EXISTS", "ETAG_CONFLICT", "ARTIFACT_VERSION_EXISTS"]
     for path in (record, done, obj):
         assert client.delete(path, headers=headers(A.oid)).status_code == 405
     assert client.get(record, headers=headers(A.oid)).json()["data"] == {"v": 2}
+
+
+def test_turn_complete_is_read_only_over_http_and_stays_immutable_in_process(relay_app, caplog):
+    from shared_context.behavior_auth import BehaviorPrincipal
+    client, headers, records, _ = relay_app
+    caplog.set_level(logging.WARNING)
+    done = PREFIX + "/records/turn-complete/rid-1"
+    for precondition in ({"If-None-Match": "*"}, {"If-Match": 'W/"any"'}):
+        refused = client.put(done, json={"data": {"state": "succeeded"}}, headers=headers(A.oid, **precondition))
+        assert refused.status_code == 403
+    assert _reasons(caplog) == ["TEAM_DATA_KIND_READ_ONLY"] * 2
+    assert not records.data
+
+    # The turn receipt API writes it in process; the HTTP read still sees it and it cannot be replaced.
+    relay = TeamDataRelay(records, None, TENANT)
+    agent = BehaviorPrincipal(TENANT, A.oid, A.team, "agent", A.actor, frozenset({"read", "submit"}))
+    saved = relay.write_record(agent, "turn-complete", "rid-1", {"state": "succeeded"})
+    assert client.get(done, headers=headers(B.oid)).json()["data"] == {"state": "succeeded"}
+    with pytest.raises(Exception) as immutable:
+        relay.write_record(agent, "turn-complete", "rid-1", {"state": "failed"}, etag=saved.etag)
+    assert immutable.value.body["error"]["code"] == "TEAM_DATA_IMMUTABLE"
 
 
 @pytest.mark.parametrize("path", [

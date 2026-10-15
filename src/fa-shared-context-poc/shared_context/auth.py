@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
 from typing import Mapping
 from uuid import UUID
@@ -72,13 +74,71 @@ class AuthSettings:
         return cls(tenant, os.environ["CONTEXT_API_AUDIENCE"], tuple(issuers), actors)
 
 
+# An unknown ``kid`` arrives before any signature check, so anyone can send one. The pinned PyJWT 2.13.0
+# ``PyJWKClient.get_signing_key`` re-downloads the key set on every miss (10 s timeout); here one forced
+# refresh runs at most once per window for the whole process, and a kid still unknown is refused at once.
+FORCED_JWKS_REFRESH_SECONDS = 60.0
+
+
+class ForcedRefreshWindow:
+    """At most one forced key-set download per window for everything sharing this instance."""
+
+    def __init__(self, seconds: float = FORCED_JWKS_REFRESH_SECONDS):
+        self.seconds = seconds
+        self._lock = threading.Lock()
+        self._at: float | None = None
+
+    def claim(self, now: float) -> bool:
+        """True for the one caller allowed to download now; claimed before the fetch, so concurrent misses never
+        queue a second download. A clock that went backwards counts as a new window."""
+        with self._lock:
+            if self._at is not None and 0 <= now - self._at < self.seconds:
+                return False
+            self._at = now
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._at = None
+
+
+_tenant_forced_refresh = ForcedRefreshWindow()
+
+
+def _reset_forced_refresh_window() -> None:
+    """Test seam: forget the last forced refresh."""
+    _tenant_forced_refresh.reset()
+
+
+class ThrottledJWKClient(jwt.PyJWKClient):
+    """PyJWKClient whose unknown-kid refresh is bounded process-wide; the cached set's TTL is unchanged."""
+
+    def __init__(self, uri: str, *, clock=time.monotonic, **kwargs):
+        super().__init__(uri, **kwargs)
+        self._clock = clock
+
+    def get_signing_key(self, kid: str) -> jwt.PyJWK:
+        key = self.match_kid(self.get_signing_keys(), kid)
+        if key is not None:
+            return key
+        if _tenant_forced_refresh.claim(self._clock()):
+            key = self.match_kid(self.get_signing_keys(refresh=True), kid)
+            if key is not None:
+                return key
+        raise jwt.PyJWKClientError("no tenant signing key matches the token kid")
+
+
+def tenant_key_client(tenant_id: str) -> ThrottledJWKClient:
+    return ThrottledJWKClient(
+        f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys",
+        cache_jwk_set=True, lifespan=300, timeout=10,
+    )
+
+
 class JwtVerifier:
     def __init__(self, settings: AuthSettings, key_client=None):
         self.settings = settings
-        self.keys = key_client or jwt.PyJWKClient(
-            f"https://login.microsoftonline.com/{settings.tenant_id}/discovery/v2.0/keys",
-            cache_jwk_set=True, lifespan=300, timeout=10,
-        )
+        self.keys = key_client or tenant_key_client(settings.tenant_id)
 
     def verified_claims(self, request: Request) -> dict:
         """Validate the access token without selecting a route-specific principal."""

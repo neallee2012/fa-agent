@@ -26,6 +26,7 @@ import hashlib
 import logging
 import os
 from pathlib import Path
+import re
 
 from .behavior_sdk_state import (
     DIAG_CODECS, NATIVE_CODECS, NATIVE_SEGMENT_BYTES, NativeCheckpointRef, NativeCheckpointScope,
@@ -34,6 +35,14 @@ from .behavior_sdk_state import (
 from .errors import Problem
 
 SEGMENT_KIND = "fa-native-checkpoint-segment-v1"
+# Segment (and result part) writes and reads in flight at once; keys are content-addressed, so order does not matter.
+SEGMENT_CONCURRENCY = 4
+# The $HOME hot copy keeps this many most recently used conversation folders (FA_NATIVE_CHECKPOINT_CACHE_CONVERSATIONS).
+CACHE_CONVERSATIONS = 50
+# Folders over that bound removed per write, oldest first: the first write after an upgrade may find a large backlog,
+# and the prune runs synchronously on the event loop, so later writes go on with the rest.
+CACHE_PRUNE_PER_WRITE = 8
+_CACHE_FOLDER = re.compile(r"[0-9a-f]{32}")
 
 
 def conversation_store_name(conversation_id: str) -> str:
@@ -85,6 +94,23 @@ async def _close(store):
         await store.aclose()
 
 
+async def bounded(calls, limit=SEGMENT_CONCURRENCY):
+    """Run zero-argument coroutine functions at most ``limit`` at a time and return their results in order. Every call
+    finishes before the first failure in list order is raised, so a serial loop's error wins and nothing keeps writing
+    after the caller saw the failure."""
+    gate = asyncio.Semaphore(limit)
+
+    async def one(call):
+        async with gate:
+            return await call()
+
+    results = await asyncio.gather(*(one(call) for call in calls), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
+
+
 def _chunks(raw: bytes):
     return [raw[offset:offset + NATIVE_SEGMENT_BYTES] for offset in range(0, len(raw), NATIVE_SEGMENT_BYTES)]
 
@@ -114,8 +140,7 @@ def _state_from(raw: bytes, ref: NativeCheckpointRef) -> SdkState:
 
 
 async def _read_segments(store, ref: NativeCheckpointRef, *, unknown="NATIVE_STATE_STORE_UNKNOWN", read_timeout=None) -> bytes:
-    chunks = []
-    for index in range(ref.segments):
+    async def read(index):
         try:
             async with asyncio.timeout(read_timeout):
                 item = await store.get_item(segment_key(ref.sha256, index))
@@ -131,8 +156,9 @@ async def _read_segments(store, ref: NativeCheckpointRef, *, unknown="NATIVE_STA
                 raise ValueError()
         except (AttributeError, KeyError, TypeError, ValueError, binascii.Error):
             raise Problem(409, "SDK_STATE_INCOMPLETE", "a native checkpoint segment is missing or differs") from None
-        chunks.append(chunk)
-    raw = b"".join(chunks)
+        return chunk
+
+    raw = b"".join(await bounded([lambda index=index: read(index) for index in range(ref.segments)]))
     if len(raw) != ref.byte_length or hashlib.sha256(raw).hexdigest() != ref.sha256:
         raise Problem(409, "SDK_STATE_INCOMPLETE", "the complete native checkpoint hash differs")
     return raw
@@ -156,11 +182,48 @@ def _read_cache(cache_root, ref):
         raw = path.read_bytes()
     except OSError:
         return None
-    return raw if hashlib.sha256(raw).hexdigest() == ref.sha256 else None
+    if hashlib.sha256(raw).hexdigest() != ref.sha256:
+        return None
+    try:
+        os.utime(path.parent)  # most recently used: the cross-conversation prune keeps it
+    except OSError:
+        pass
+    return raw
+
+
+def _cache_conversations():
+    try:
+        return max(1, int(os.environ.get("FA_NATIVE_CHECKPOINT_CACHE_CONVERSATIONS", CACHE_CONVERSATIONS)))
+    except ValueError:
+        return CACHE_CONVERSATIONS
+
+
+def _prune_conversations(folder: Path):
+    """Keep ``folder`` and the most recently used other conversation folders, at most N in all (by mtime). Only
+    folders this cache names are touched; one that can not be removed is left for the next write."""
+    # Audit #18 invariant: the hot copy is only touched synchronously on the Hosted process's one event loop (no await
+    # between listing and removal), and $HOME is session-private, so no other writer races it; a folder removed anyway
+    # (platform, operator) is skipped.
+    others = []
+    for other in folder.parent.iterdir():
+        if other != folder and _CACHE_FOLDER.fullmatch(other.name) and not other.is_symlink() and other.is_dir():
+            try:
+                others.append((other.stat().st_mtime, other.name, other))
+            except OSError:
+                continue  # removed meanwhile
+    others.sort(reverse=True)
+    for _, _, other in others[_cache_conversations() - 1:][-CACHE_PRUNE_PER_WRITE:]:
+        try:
+            for item in other.iterdir():
+                item.unlink()
+            other.rmdir()
+        except OSError:
+            continue
 
 
 def _write_cache(cache_root, ref, raw):
-    """Best effort: keep only this conversation's latest verified checkpoint; a failure only costs a store read."""
+    """Best effort: keep only this conversation's latest verified checkpoint, and at most N conversation folders; a
+    failure only costs a store read."""
     path = _cache_path(cache_root, ref)
     if path is None:
         return
@@ -174,6 +237,7 @@ def _write_cache(cache_root, ref, raw):
         for other in path.parent.glob("*.json"):
             if other != path and not other.is_symlink():
                 other.unlink()
+        _prune_conversations(path.parent)
     except OSError:
         logging.getLogger(__name__).warning("FA_NATIVE_CHECKPOINT_CACHE status=write_failed")
 
@@ -253,13 +317,16 @@ async def save_checkpoint(store, scope: NativeCheckpointScope, state: SdkState, 
         sha256=hashlib.sha256(raw).hexdigest(), byte_length=len(raw), segments=len(chunks),
         lineage=None if turn is None else turn.lineage, source=source)
     storage = _storage()
-    for index, chunk in enumerate(chunks):
+
+    async def write(index, chunk):
         try:
             await store.create_item(segment_key(ref.sha256, index), _segment(ref, index, chunk))
         except storage.FoundryStorageConflictError:
             pass  # content-addressed: the read-back below accepts only a byte-identical segment
         except _unconfirmed():
             raise Problem(503, "SDK_STATE_UPLOAD_UNKNOWN", "a native checkpoint segment write is unconfirmed") from None
+
+    await bounded([lambda index=index, chunk=chunk: write(index, chunk) for index, chunk in enumerate(chunks)])
     # A write acknowledgment alone is not a complete, restorable checkpoint.
     await _read_segments(store, ref, unknown="SDK_STATE_UPLOAD_UNKNOWN")
     _write_cache(cache_root, ref, raw)

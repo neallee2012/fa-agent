@@ -73,8 +73,10 @@ def test_defaults_only_use_keys_and_values_the_stage_profile_already_has(azd_pro
         assert set(base[section]) <= set(stage[section]), section
         assert all(stage[section][key] == value for key, value in base[section].items()), section
     assert base["conversation_defaults"] == stage["conversation_defaults"]
+    # A subset, like the sections above: stage may turn on more (FA_NATIVE_MODEL_SWITCH, 00ff5fe1) than a new azd
+    # environment starts with.
     overlay = stage["agents"][0]["hosted_environment"]
-    assert base["assistant_hosted_environment"] == overlay
+    assert base["assistant_hosted_environment"].items() <= overlay.items()
     assert base["hosted_idle_timeout_seconds"] == stage["hosted_idle_timeout_seconds"]
     # No identifier, endpoint or environment name: those come from the azd environment.
     raw = json.dumps(base)
@@ -281,3 +283,11 @@ def test_portal_bundle_chain_runs_offline_from_the_rebuilt_plan(profile_file, tm
     assert CONSOLE_CLIENT in json.dumps(console) and console["human_oid"] == OWNER
     # Rerunning reuses the create-only outputs instead of exporting again.
     assert hooks.console_bundle(ctx, out, plan_path) == files
+
+
+def test_an_azd_environment_arms_the_compatibility_gate_only_when_asked(azd_profile):
+    """ADR-0009 phase 3b (deploy/README.md#compat-gate): unarmed by default; `azd env set FA_COMPAT_GATE_ARMED true`."""
+    assert "compatibility_gate_armed" not in azd_profile.build(values())
+    assert azd_profile.build(values(FA_COMPAT_GATE_ARMED="true"))["compatibility_gate_armed"] is True
+    with pytest.raises(SystemExit, match="FA_COMPAT_GATE_ARMED must be true or false"):
+        azd_profile.build(values(FA_COMPAT_GATE_ARMED="yes"))

@@ -381,7 +381,9 @@ def test_unconfirmed_admission_cannot_be_mistaken_for_an_empty_agent(local_env, 
         assert not runtime.executor.calls
 
 
-def test_follow_preserves_unknown_without_restoring_an_empty_context(local_env, monkeypatch):
+def test_follow_preserves_unknown_and_starts_that_conversation_without_a_checkpoint(local_env, monkeypatch):
+    """ADR-0009 §7a (r): the conversation's only turn ended unknown on the source, so no checkpoint is owed; the new
+    session starts it in a fresh, differently named SDK session (not a resume) and keeps the turn numbering."""
     async def failed(*_args):
         raise RuntimeError("synthetic original SDK outcome is unknown")
 
@@ -409,10 +411,11 @@ def test_follow_preserves_unknown_without_restoring_an_empty_context(local_env, 
         assert invoke(client, identity, command).json()["reason"] == "source_stop_required"
         assert invoke(client, identity, {**command, "stage": "commit"}).json()["state"] == "ready"
         assert invoke(client, identity, NativeRead(request_id="rid-1")).json() == unknown.model_dump(mode="json")
-        refused = invoke(client, identity, submit("new-in-old-cid", unknown.conversation_id))
-        assert refused.status_code == 409
-        assert refused.json()["error"]["code"] == "NATIVE_ENVIRONMENT_CHECKPOINT_UNAVAILABLE"
-        assert not sdk.calls
+        accepted = invoke(client, identity, submit("new-in-old-cid", unknown.conversation_id))
+        assert accepted.status_code == 202, accepted.text
+        assert Harness(runtime, sdk, client).wait("new-in-old-cid", "completed").turn_number == 2
+        assert [(rid, previous) for rid, _cid, previous, _call in sdk.calls] == [("new-in-old-cid", None)]
+        assert invoke(client, identity, NativeRead(request_id="rid-1")).json() == unknown.model_dump(mode="json")
 
 
 def test_pending_follow_fences_new_receipts_but_preserves_already_accepted_work(local_env, monkeypatch):

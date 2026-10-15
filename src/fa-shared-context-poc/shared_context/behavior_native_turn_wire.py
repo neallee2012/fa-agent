@@ -29,7 +29,7 @@ from .native_image_wire import NativeImageRead, NativeImagesRead
 from .behavior_user_images import NativeUserImageUpload, USER_IMAGE_ERRORS
 from .native_responses_wire import (
     NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, NativeResponseDispatch, NativeResponseId,
-    NativeStateProfile, check_response_state,
+    NativeStateProfile, check_response_state, unlabeled_profile,
 )
 from .native_append_wire import NativeAppend, NativeAppendRead
 from .native_progress_wire import NativeProgressRead, NativeProgressSnapshot, NativeTurnStatusRead
@@ -41,7 +41,22 @@ from .team_connector_wire import ConnectorCapture
 
 NATIVE_TURN_HEADER = "x-client-fa-state-profile"
 NATIVE_EXPECTED_VERSION_HEADER = "x-client-fa-expected-version"
+# ADR-0009 §2 phase 3: the API located this session by its binding row, so Hosted's stricter ``replaced()`` applies.
+NATIVE_LOCATOR_HEADER = "x-client-fa-locator"
+NATIVE_LOCATOR_BINDING_ROW = "binding-row"
 AUTOMATIC_ENVIRONMENT_POLICY = "fa-environment-system-policy-20261004"
+# ADR-0009 §4: why Hosted refused before dispatching anything (with ``not_dispatched`` and the VM's ``actual_version``).
+PRE_DISPATCH_REASONS = frozenset({"profile", "runtime", "version", "replaced"})
+
+
+def before_dispatch(refusal: Problem, reason: str, actual_version: str | None) -> Problem:
+    """Hosted's refusal before anything was read or dispatched says so, why, and which version this VM runs. Its code
+    stays; the API keeps today's handling of these refusals until its send flow uses them (ADR-0009 phase 3)."""
+    if reason not in PRE_DISPATCH_REASONS:
+        raise ValueError("an unknown pre-dispatch reason")
+    refusal.body["error"].update(not_dispatched=True, reason=reason,
+                                 **({} if actual_version is None else {"actual_version": actual_version}))
+    return refusal
 
 
 # The Teams relay's request ids start with this (native_teams_relay): a human turn nobody can press a card in.
@@ -209,7 +224,7 @@ class NativeSubmit(WireModel):
     command: InstructionSubmit
     capture: NativeTurnCapture
     state_profile: NativeStateProfile = Field(
-        default=NATIVE_STATE_PROFILE, exclude_if=lambda value: value == NATIVE_STATE_PROFILE)
+        default=NATIVE_STATE_PROFILE, exclude_if=unlabeled_profile)
     new_conversation_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
@@ -411,6 +426,37 @@ class NativeSessionFollow(Command):
     stage: Literal["prepare", "commit"]
     idle_only: bool = Field(default=False, exclude_if=lambda value: not value)
     files_required: bool = Field(default=False, exclude_if=lambda value: not value)
+    # ADR-0009 §7a (i): SIDs the API's binding row lists as previous. Their unfinished receipts will not continue
+    # (the API answers them with the earlier-version notice), so the follow does not wait for them.
+    settled_session_ids: Annotated[tuple[Identifier, ...], Field(max_length=64)] = Field(
+        default=(), exclude_if=lambda value: not value)
+
+
+class NativeSessionAbandon(Command):
+    """ADR-0009 §7a: make this (destination) session the Agent's, abandoning ``expected_session_id`` without invoking,
+    reading or stopping it. The API decided it from platform metadata and its binding row; Hosted only commits."""
+    operation: Literal["session_abandon"] = "session_abandon"
+    expected_session_id: Identifier
+    expected_etag: Annotated[str, Field(min_length=1, max_length=256)]
+    # The source status the API's decision saw. A retired source (the platform can not run it) lets the new session
+    # go on at once past receipts left ``started`` on it (ADR-0009 §7a "(r)(s) 的競爭"); ``idle`` waits for them.
+    source_status: Literal["idle", "failed", "deleted", "expired", "missing"] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
+
+
+class NativeUnfinishedRead(WireModel):
+    """ADR-0009 §7a (f): one bounded read-only scan of this Agent's ``fa/v1/turns`` receipts for unfinished ones
+    accepted by another SID than the current one (the first switch backfills them into the previous-SID list)."""
+    operation: Literal["session_unfinished"] = "session_unfinished"
+
+
+class NativeUnfinishedSessions(WireModel):
+    schema_version: Literal["fa-native-unfinished-sessions-v1"] = "fa-native-unfinished-sessions-v1"
+    agent_id: Identifier
+    hosted_session_id: Identifier
+    session_ids: Annotated[tuple[Identifier, ...], Field(max_length=64)] = ()
+    # False: the bounded scan stopped early (deadline or too many SIDs); the API records the check as unverified.
+    complete: bool
 
 
 NativeFilesOmissionReason = Literal["source", "source_changed", "source_not_migratable", "destination", "original_destination"]
@@ -629,6 +675,10 @@ class NativeSessionState(WireModel):
     files_profile: Literal["fa-workspace-files-v1"] | None = Field(default=None, exclude_if=lambda value: value is None)
     files_omission_profile: Literal["fa-files-omission-v1"] | None = Field(default=None, exclude_if=lambda value: value is None)
     source_invocation_refused: bool = Field(default=False, exclude_if=lambda value: not value)
+    # ADR-0009 §1: the VM's own FOUNDRY_AGENT_VERSION. Optional and omitted when absent, so an older image's state
+    # still decodes; the API never forwards it to a client whose strict decoder predates it (observe_preparation).
+    actual_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def original_binding(self):
@@ -737,7 +787,7 @@ class NativeAgentReceive(WireModel):
     capture: NativeTurnCapture
     source: NativeAgentOrigin
     state_profile: NativeStateProfile = Field(
-        default=NATIVE_STATE_PROFILE, exclude_if=lambda value: value == NATIVE_STATE_PROFILE)
+        default=NATIVE_STATE_PROFILE, exclude_if=unlabeled_profile)
     new_conversation_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
@@ -759,7 +809,7 @@ class NativeRoutineSubmit(WireModel):
     capture: NativeTurnCapture
     routine: NativeRoutineOrigin
     state_profile: NativeStateProfile = Field(
-        default=NATIVE_STATE_PROFILE, exclude_if=lambda value: value == NATIVE_STATE_PROFILE)
+        default=NATIVE_STATE_PROFILE, exclude_if=unlabeled_profile)
 
     @model_validator(mode="after")
     def captured_routine(self):
@@ -801,7 +851,8 @@ NativeRequest = Annotated[
     NativeSubmit | NativeAgentReceive | NativeRoutineSubmit | NativeContinuationSubmit | NativeContinuationRead | NativeContinuationReady |
     NativeAppend | NativeAppendRead | NativeProgressRead | NativeTurnStatusRead | NativeRead | NativeConversationRead | NativeHistory |
     NativeResult | NativeCancel | NativeResponseNotStarted | NativeDelivered | NativeSessionRead | NativeSessionPrepare |
-    NativeSessionFollow | NativeSessionRetarget | NativeSessionFiles | NativeSessionFilesOmission | NativeCandidateRead |
+    NativeSessionFollow | NativeSessionRetarget | NativeSessionAbandon | NativeUnfinishedRead | NativeSessionFiles |
+    NativeSessionFilesOmission | NativeCandidateRead |
     NativeSkillDraftIntentRead | NativeImagesRead | NativeImageRead | NativeUserImageUpload | NativeHitlHistoryRead |
     NativeReceivedRead | NativePrewarm,
     Field(discriminator="operation"),
@@ -809,12 +860,45 @@ NativeRequest = Annotated[
 NATIVE_REQUEST = TypeAdapter(NativeRequest)
 
 
+# ADR-0009 §8 / M4: the kinds the binding row's per-Agent notice slot delivers to the owner once (cleared after the
+# owner response carrying it is written); ``earlier_version_unfinished`` is a read-time view of one receipt instead.
+SLOT_NOTICE_KINDS = frozenset({
+    "platform_version_changed", "environment_updated", "environment_switched_without_files",
+    "environment_source_retired",
+})
+# Capability signal of a workbench bridge that decodes the phase 2c notice kinds (ADR-0009 §8). A deploy updates the API
+# before the console, and an older bridge refuses a receipt with a kind it does not know (502), so the owner's submit
+# carries those kinds, and the API clears the slot, only for a request with this header (a header, not a body field: an
+# older API ignores an unknown header). Without it the answer is exactly as before phase 2c: the drift notice, never
+# cleared.
+NOTICE_KINDS_HEADER = "X-FA-Notice-Kinds"
+NOTICE_KINDS_VERSION = "2"
+
+
 class NativeEnvironmentNotice(WireModel):
-    """ADR-0009 §8 "平台把助理的執行環境換成了另一個版本（vX→vY）": the platform ran the Agent's same session on
-    another version than it was created on. API-only: Hosted never writes it."""
-    kind: Literal["platform_version_changed"] = "platform_version_changed"
-    from_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")]
-    to_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")]
+    """ADR-0009 §8 notices; API-only: Hosted never writes them.
+
+    ``platform_version_changed``: "平台把助理的執行環境換成了另一個版本（vX→vY）", the platform ran the Agent's same
+    session on another version than it was created on. ``environment_updated``: the Agent moved to a new version and
+    its work files came along. ``environment_switched_without_files``: it moved without its work files and the old
+    environment is kept (the 2026-10-04 sentence). ``environment_source_retired``: it moved without its work files
+    because the old environment had failed or been deleted (§7a). ``earlier_version_unfinished`` (§7a (e)): this
+    unfinished request was accepted by a session the Agent has since left, so it will not continue; send it again as
+    a new message (§8 "這則訊息是較早的版本接下的……")."""
+    kind: Literal[
+        "platform_version_changed", "earlier_version_unfinished", "environment_updated",
+        "environment_switched_without_files", "environment_source_retired",
+    ] = "platform_version_changed"
+    from_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
+    to_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def versions(self):
+        if (self.kind == "platform_version_changed") != (self.from_version is not None and self.to_version is not None):
+            raise ValueError("only the platform version change names its two versions")
+        return self
 
 
 class NativeReceipt(WireModel):

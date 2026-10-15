@@ -13,6 +13,8 @@ import ipaddress
 import json
 import math
 import socket
+import threading
+import weakref
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Callable, Literal
@@ -22,6 +24,7 @@ import httpx
 import jwt
 from pydantic import Field, ValidationError, field_validator, model_validator
 
+from .auth import ForcedRefreshWindow
 from .behavior_auth import BehaviorPrincipal
 from .behavior_delivery import _Model, _json, _utc
 from .behavior_ingress import checked_human_text
@@ -34,6 +37,10 @@ BOT_SCOPE = "https://api.botframework.com/.default"
 TEAMS_VERSION = "fa-teams-connector-v1"
 # The shared Microsoft signing catalog is much larger than an individual activity.
 MAX_CONNECTOR_JWKS_BYTES = 2 * 1024 * 1024
+# The key set is fetched before any signature check, so an unauthenticated request must not cause a download:
+# one cached set per key source for the whole process (as the Entra JWKS in auth.py), and a kid it lacks forces
+# at most one refresh per window. teams_personal builds a ConnectorIdentity per request, so this is module state.
+CONNECTOR_JWKS_TTL_SECONDS = 300.0
 Opaque = Annotated[str, Field(min_length=1, max_length=4096)]
 
 
@@ -158,6 +165,43 @@ class VerifiedTeamsActivity:
     disposition: Literal["submit", "silence"]
 
 
+class _ConnectorKeySet:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.keys: list[dict] | None = None
+        self.fetched_at = 0.0
+        self.forced = ForcedRefreshWindow()
+
+
+_key_sets: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_key_sets_lock = threading.Lock()
+_public_key_set = _ConnectorKeySet()
+
+
+def _key_set(transport: httpx.BaseTransport | None) -> _ConnectorKeySet:
+    """Production (no injected transport) shares one set; an offline transport is its own key source."""
+    if transport is None:
+        return _public_key_set
+    with _key_sets_lock:
+        return _key_sets.setdefault(transport, _ConnectorKeySet())
+
+
+def _match(keys: list[dict], kid: str):
+    """The one RS256 Teams signing key for ``kid``; None when the set has no such key."""
+    candidates = [k for k in keys if k.get("kid") == kid and k.get("kty") == "RSA"
+                  and k.get("use", "sig") == "sig" and k.get("alg", "RS256") == "RS256"
+                  and isinstance(k.get("endorsements"), list)
+                  and "msteams" in k.get("endorsements", [])]
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise ValueError
+    key = jwt.PyJWK.from_dict(candidates[0], algorithm="RS256").key
+    if key.key_size < 2048:
+        raise ValueError
+    return key
+
+
 class ConnectorIdentity:
     def __init__(self, settings: TeamsSettings, *, clock: Callable[[], datetime],
                  jwks_transport: httpx.BaseTransport | None = None):
@@ -165,29 +209,38 @@ class ConnectorIdentity:
         self.clock = clock
         self.jwks_transport = jwks_transport
 
-    def _key(self, kid: str):
+    def _fetch_keys(self) -> list[dict]:
         transport = self.jwks_transport or PublicCloudTransport()
-        try:
-            with httpx.Client(transport=transport, follow_redirects=False, trust_env=False, timeout=5) as client:
-                with client.stream("GET", CONNECTOR_JWKS) as response:
-                    if response.status_code != 200:
+        with httpx.Client(transport=transport, follow_redirects=False, trust_env=False, timeout=5) as client:
+            with client.stream("GET", CONNECTOR_JWKS) as response:
+                if response.status_code != 200:
+                    raise ValueError
+                data = bytearray()
+                for chunk in response.iter_bytes():
+                    data.extend(chunk)
+                    if len(data) > MAX_CONNECTOR_JWKS_BYTES:
                         raise ValueError
-                    data = bytearray()
-                    for chunk in response.iter_bytes():
-                        data.extend(chunk)
-                        if len(data) > MAX_CONNECTOR_JWKS_BYTES:
-                            raise ValueError
-            keys = json.loads(data)["keys"]
-            if not isinstance(keys, list) or not all(isinstance(k, dict) for k in keys):
-                raise ValueError
-            candidates = [k for k in keys if k.get("kid") == kid and k.get("kty") == "RSA"
-                          and k.get("use", "sig") == "sig" and k.get("alg", "RS256") == "RS256"
-                          and isinstance(k.get("endorsements"), list)
-                          and "msteams" in k.get("endorsements", [])]
-            if len(candidates) != 1:
-                raise ValueError
-            key = jwt.PyJWK.from_dict(candidates[0], algorithm="RS256").key
-            if key.key_size < 2048:
+        keys = json.loads(data)["keys"]
+        if not isinstance(keys, list) or not all(isinstance(k, dict) for k in keys):
+            raise ValueError
+        return keys
+
+    def _key(self, kid: str):
+        cached = _key_set(self.jwks_transport)
+        try:
+            now = _utc(self.clock()).timestamp()
+            with cached.lock:
+                if cached.keys is None or not 0 <= now - cached.fetched_at < CONNECTOR_JWKS_TTL_SECONDS:
+                    cached.keys, cached.fetched_at = self._fetch_keys(), now
+                keys = cached.keys
+            key = _match(keys, kid)
+            if key is None and cached.forced.claim(now):
+                # Outside the lock: requests with a known kid keep the cached set during this download.
+                keys = self._fetch_keys()
+                with cached.lock:
+                    cached.keys, cached.fetched_at = keys, now
+                key = _match(keys, kid)
+            if key is None:
                 raise ValueError
             return key
         except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError, jwt.PyJWTError):

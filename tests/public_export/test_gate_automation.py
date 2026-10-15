@@ -20,6 +20,7 @@ sys.path.insert(0, str(TOOLS))
 import fingerprint  # noqa: E402
 import gate2_check  # noqa: E402
 import inventory_scan  # noqa: E402
+import prepush_check  # noqa: E402
 import scrub_export  # noqa: E402
 
 SECRET_NAME = "Zephyr" + "Quill"          # an "original" value the export must replace
@@ -437,13 +438,75 @@ def test_workflow_runs_gate2_last_and_read_only():
     assert "x-access-token:" not in step and "@github.com" not in step
     # The public repo is cloned unauthenticated; the write token never reaches this step.
     assert "PUBLIC_REPO_TOKEN" not in step and "credential.helper" not in step
-    # API failures are reported, not swallowed.
     assert "2>/dev/null" not in step and "|| :" not in step
-    assert "::warning::" in step and "::error::" in step and "lastEditedAt" in step
+    # It compares the same release PR body the push step was checked against; it no longer reads it itself.
+    assert 'body="$RUNNER_TEMP/release-pr-body.md"' in step and "gh api" not in step and "GH_TOKEN" not in step
+
+
+def workflow_step(text: str, name: str) -> str:
+    start = text.index(f"- name: {name}")
+    nxt = text.find("\n      - name:", start)
+    return text[start:] if nxt < 0 else text[start:nxt]
+
+
+@pytest.mark.skipif(not WORKFLOW.is_file(), reason="the workflow is not part of the public copy")
+def test_workflow_checks_gate_1_before_anything_is_pushed():
+    """Finding 2 (2026-10-14): the fingerprint was first compared after the public push, so a manual deploy or main
+    moving after gate 1 published unreviewed content. The release PR body is now read before the push step, and
+    the push step compares the tree it is about to commit with it before `git commit`, `git tag` or `git push`."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    read = workflow_step(text, "Read gate 1's fingerprint from the release PR")
+    push = workflow_step(text, "Commit, tag and push")
+    assert text.index("- name: Read gate 1's fingerprint") < text.index("- name: Commit, tag and push")
+    assert "if:" not in read.split("run: |")[0], "it runs on every publish"
+    assert "GH_TOKEN: ${{ github.token }}" in read and "PUBLIC_REPO_TOKEN" not in read
+    assert 'body="$RUNNER_TEMP/release-pr-body.md"' in read and "lastEditedAt" in read
+    # API failures are reported, not swallowed.
+    assert "2>/dev/null" not in read and "|| :" not in read and "::error::" in read and "::warning::" not in read
+    check = push.index("prepush_check.py")
+    assert push.index('tree="$(git write-tree)"') < check
+    assert '--body "$RUNNER_TEMP/release-pr-body.md" --tree "$tree"' in push
+    for later in ("commit -q", 'git tag "$tag"', " push -q"):
+        assert check < push.index(later), later
+    assert "|| true" not in push and "set +e" not in push
+
+
+@pytest.mark.parametrize("body, tree, code, says", [
+    ("notes\npublic-sync fingerprint: " + "a" * 40 + "\n", "a" * 40, 0, "matches"),
+    ("public-sync fingerprint: `" + "A" * 40 + "`", "a" * 40, 0, "matches"),
+    ("public-sync fingerprint: " + "a" * 40, "b" * 40, 1, "fingerprint mismatch"),
+    ("", "a" * 40, 1, "no usable gate 1 fingerprint"),
+    ("release notes without the line", "a" * 40, 1, "no usable gate 1 fingerprint"),
+    ("public-sync fingerprint: " + "a" * 40 + "\npublic-sync fingerprint: " + "b" * 40, "a" * 40, 1,
+     "no usable gate 1 fingerprint"),
+])
+def test_prepush_check_publishes_only_the_fingerprinted_tree(tmp_path: Path, capsys, body, tree, code, says):
+    path = tmp_path / "release-pr-body.md"
+    path.write_text(body, encoding="utf-8")
+    assert prepush_check.main(["--body", str(path), "--tree", tree]) == code
+    out = capsys.readouterr().out
+    assert says in out and out.startswith("::error::" if code else "gate 1")
+    if code:
+        assert "nothing was pushed" in out and "by hand" not in out  # there is no manual bypass to point to
+
+
+def test_prepush_check_fails_closed_on_the_tree_the_workflow_builds(private: Path, tmp_path: Path, capsys):
+    """The same comparison against a real `git write-tree` of the export, as the push step runs it."""
+    (tmp_path / "first").mkdir()
+    (tmp_path / "moved").mkdir()
+    tree = publish(private, tmp_path / "first" / "public", "v1")
+    body = tmp_path / "body.md"
+    body.write_text(f"public-sync fingerprint: {fingerprint.commit_fingerprint(private, 'HEAD')}\n", encoding="utf-8")
+    assert prepush_check.main(["--body", str(body), "--tree", tree]) == 0
+    write(private, "docs/notes.md", "changed after gate 1\n")
+    git(private, "commit", "-qam", "after gate 1")
+    moved = publish(private, tmp_path / "moved" / "public", "v1")
+    assert moved != tree and prepush_check.main(["--body", str(body), "--tree", moved]) == 1
+    assert "fingerprint mismatch" in capsys.readouterr().out
 
 
 def pr_body_selector() -> str:
-    step = WORKFLOW.read_text(encoding="utf-8").split("- name: Gate 2")[1]
+    step = WORKFLOW.read_text(encoding="utf-8").split("- name: Read gate 1's fingerprint")[1]
     code = step.split("<<'PY'\n", 1)[1].split("\n          PY\n", 1)[0]
     return "\n".join(line[10:] for line in code.splitlines())
 
@@ -455,20 +518,20 @@ def pr_body_selector() -> str:
     ([{"number": 7, "mergedAt": "2026-10-13T00:52:07Z", "lastEditedAt": "2026-10-13T00:50:00Z",
        "mergeCommit": {"oid": "c" * 40}, "body": "as merged"}], "as merged", ""),
     ([{"number": 7, "mergedAt": "2026-10-13T00:52:07Z", "lastEditedAt": "2026-10-13T01:00:00Z",
-       "mergeCommit": {"oid": "c" * 40}, "body": "edited later"}], "", "::error::gate 2: release PR #7 was edited"),
+       "mergeCommit": {"oid": "c" * 40}, "body": "edited later"}], "", "::error::release PR: #7 was edited"),
     ([{"number": 8, "mergedAt": None, "lastEditedAt": None, "mergeCommit": None, "body": "open PR"}], "",
-     "::warning::gate 2: no merged PR"),
-    ([], "", "::warning::gate 2: no merged PR"),
+     "::error::release PR: no merged PR"),
+    ([], "", "::error::release PR: no merged PR"),
     ([{"number": 7, "mergedAt": "2026-10-13T00:52:07Z", "lastEditedAt": None, "mergeCommit": {"oid": "d" * 40},
        "body": "x"},
       {"number": 9, "mergedAt": "2026-10-13T00:53:00Z", "lastEditedAt": None, "mergeCommit": {"oid": "e" * 40},
-       "body": "y"}], "", "::error::gate 2: 2 merged PRs"),
+       "body": "y"}], "", "::error::release PR: 2 merged PRs"),
     ([{"number": 7, "mergedAt": "2026-10-13T00:52:07Z", "lastEditedAt": None, "mergeCommit": {"oid": "c" * 40},
        "body": "the merge commit's PR"},
       {"number": 9, "mergedAt": "2026-10-12T00:00:00Z", "lastEditedAt": None, "mergeCommit": {"oid": "e" * 40},
        "body": "an older PR that also holds the commit"}], "the merge commit's PR", ""),
 ])
-def test_gate2_reads_the_release_pr_body_as_merged(tmp_path: Path, nodes, body, annotation):
+def test_the_release_pr_body_is_read_as_merged(tmp_path: Path, nodes, body, annotation):
     answer = tmp_path / "release-pr.json"
     answer.write_text(json.dumps({"data": {"repository": {"object": {"associatedPullRequests": {"nodes": nodes}}}}}),
                       encoding="utf-8")

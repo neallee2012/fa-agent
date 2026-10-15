@@ -141,6 +141,12 @@ def _advance_inflight(client, platform, receipt, *, before_send, confirm=True):
     holder, _ = NativeTurnGateway._invoke(client, NativeRead(request_id=holder_id))
     if holder.conversation_id != receipt.conversation_id or holder.state_profile != NATIVE_RESPONSES_PROFILE:
         raise Problem(409, "NATIVE_STATE_SCOPE", "the in-flight receipt belongs to another conversation")
+    if holder.hosted_session_id != client.target.session_id:
+        # ADR-0009 §7a (s): ``client`` is the session that just admitted this message, so a holder of another SID was
+        # left by an earlier one. It is never sent anywhere (that session is no longer called); this message waits
+        # behind it in Hosted, which releases the slot. Not an error to the owner (no NATIVE_SESSION_CHANGED resend).
+        logging.getLogger(__name__).info("NATIVE_RESPONSE_HOLDER_LEFT conversation_turn_waits=true")
+        return
     NativeTurnGateway._same_session(client, holder)
     _send_response(client, platform, holder, before_send=before_send, confirm=confirm)
 
