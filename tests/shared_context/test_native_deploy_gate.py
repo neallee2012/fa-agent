@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import InMemoryRepository
-from shared_context import behavior_agent_versions, native_deploy_gate as gate
+from shared_context import behavior_agent_versions, behavior_team_registry, native_deploy_gate as gate
 from shared_context.errors import Problem
 from shared_context.native_binding import (
     NativeBindingObservation, NativeBindingRow, NativeBindingSession, NativeBindingStore, binding_store,
@@ -115,6 +115,15 @@ def test_armed_gate_refuses_a_session_whose_recorded_version_declares_an_unsuppo
     assert report["refused"] == [{"agent_id": "agent-b", "reason": "definition_profile_unsupported"}]
 
 
+def test_the_2di_api_reports_v1_and_v2_rows_compatible():
+    # ADR-0009 M1 2d-i: the new API's own supported set (no override) is {v1, v2}.
+    store, _ = store_with(row("agent-a", "sid-a", "141"), row("agent-b", "sid-b", "150", profile=V2))
+    foundry = RecordingFoundry({("fa-stage-a", "141"): definition(V1, "a"), ("fa-stage-b", "150"): definition(V2, "c")})
+    report = gate.evaluate([A, B], store.rows, read_with(foundry), armed=True)
+    assert report["supported"] == [V1, V2] and report["refused"] == [] and report["decision"] == "pass"
+    assert [entry["verdict"] for entry in report["agents"]] == ["compatible", "compatible"]
+
+
 def test_unarmed_gate_reports_what_it_would_refuse_and_passes():
     store, _ = store_with(row("agent-a", "sid-a", "141"))
     foundry = RecordingFoundry({("fa-stage-a", "141"): definition(V1, "a")})
@@ -132,6 +141,20 @@ def test_armed_gate_reports_an_unclaimed_agent_without_refusing_the_deploy():
     assert {"agent_id": "agent-b", "agent_name": "fa-stage-b", "verdict": "unclaimed"} in report["agents"]
     store, _ = store_with()
     assert gate.evaluate([B], store.rows, read_with(foundry), armed=True, supported=frozenset({V2}))["decision"] == "pass"
+
+
+def test_armed_gate_never_refuses_for_a_retired_agents_row_and_keeps_its_versions_protected():
+    # A retired Agent is never invoked again: its v1 row is reported, not a reason to stop the deploy.
+    store, _ = store_with(row("agent-a", "sid-a", "150", profile=V2), row("agent-b", "sid-b", "141"))
+    foundry = RecordingFoundry({("fa-stage-a", "150"): definition(V2, "c")})
+    refused = gate.evaluate([A], store.rows, read_with(foundry), armed=True, supported=frozenset({V2}))
+    assert refused["decision"] == "refuse" and refused["refused"] == [
+        {"agent_id": "agent-b", "reason": "row_profile_unsupported"}]
+    report = gate.evaluate([A], store.rows, read_with(foundry), armed=True, supported=frozenset({V2}),
+                           retired=("agent-b",))
+    assert report["decision"] == "pass" and report["refused"] == [] and report["unserved_rows"] == []
+    assert report["retired_rows"] == [{"agent_id": "agent-b", "row_profile": V1}]
+    assert {"agent_id": "agent-b", "agent_name": None, "version": "141"} in report["protected"]["versions"]
 
 
 def test_armed_gate_fails_closed_on_unread_rows_and_unread_definitions():
@@ -163,10 +186,11 @@ def test_the_gate_reads_binding_rows_and_definitions_only_and_never_a_session(mo
                                        previous=[NativeBindingSession(hosted_session_id="sid-old", agent_version="141")]))
     foundry = RecordingFoundry({("fa-stage-a", v): definition(V1, d) for v, d in (("150", "c"), ("145", "b"),
                                                                                   ("141", "a"))})
-    composition = SimpleNamespace()
     monkeypatch.setattr(behavior_agent_versions, "_agents", lambda value: (A, [(A, "configured")]))
+    monkeypatch.setattr(behavior_team_registry, "retired_agent_ids", lambda store, config: ())
     monkeypatch.setattr(gate, "deploy_binding_store", lambda value: store)
-    report = gate.run_gate(composition, lambda endpoint: foundry, armed=True)
+    report = gate.run_gate(SimpleNamespace(runtime=SimpleNamespace(store=None), config=None),
+                           lambda endpoint: foundry, armed=True)
     assert report["decision"] == "pass"
     assert {call[0] for call in foundry.calls} == {"get_version"}
     assert set(repository.calls) == {"list_prefix"}
@@ -248,7 +272,9 @@ def test_no_registry_retention_policy_sweeps_referenced_images():
 
 
 def test_no_repository_script_deletes_a_version_or_an_image():
-    """There is no cleanup script to guard today; one added later goes through ``retention_candidates``."""
+    """No version or image cleanup script exists; one added later goes through ``retention_candidates``. The only
+    delete is ``behavior_agent_retire`` removing one tombstoned Agent, or one failed onboarding's leftover agent, whole
+    (``agents.delete(force=True)``)."""
     pattern = re.compile(r"delete_version|acr (repository|manifest) delete|acr purge|/versions/[^\"']*\"?,? *\"?DELETE",
                          re.I)
     for folder in ("deploy", "scripts", "infra", ".github", "src/fa-shared-context-poc"):

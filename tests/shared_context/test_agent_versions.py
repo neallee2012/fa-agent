@@ -353,6 +353,24 @@ def test_probe_version_is_not_a_production_lane_even_with_both_runtime_flags(pro
     assert resolver.current(R) == "4" and foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "4")] * 2
 
 
+def test_a_versions_fa_build_is_read_once_with_its_profile_and_only_as_a_code_identity():
+    """ADR-0009 2d-i (2026-10-17): the SDK start pin of a capture sent to a version is that version's fa_build."""
+    core = "0" * 64
+    foundry = Foundry(R)
+    foundry.add(R.agent_name, 41, core)
+    foundry.add(R.agent_name, 42, "not-a-code-identity")
+    resolver = HostedVersions(lambda endpoint: foundry, build="new")
+    assert resolver.build_of(R, "41") == core and resolver.build_of(R, "41") == core
+    assert resolver.build_of(R, "42") is None
+    assert [call for call in foundry.calls if call[0] == "get"] == [("get", R.agent_name, "41"), ("get", R.agent_name, "42")]
+
+    def unreadable(*_args):
+        raise FoundryCallError(503)
+
+    # An unreadable definition gives no build (the API keeps its own pin) and is never cached.
+    assert HostedVersions(lambda endpoint: SimpleNamespace(get_version=unreadable)).build_of(R, "41") is None
+
+
 @pytest.mark.parametrize("changed", [
     {"metadata": {"fa_build": "another-build"}}, {"name": "another-agent"}, {"version": "5"},
     {"agent_guid": "99999999-9999-9999-9999-999999999999"},
@@ -530,8 +548,10 @@ def test_one_agent_failing_never_stops_the_others_and_routes_are_optional(monkey
     assert sync_all(composition, lambda endpoint: foundry, build="new", agent_id="missing")[0]["reason"] == "AGENT_NOT_FOUND"
 
 
-@pytest.mark.parametrize("deferred,follow_state", [(False, "ok"), (True, "ok"), (False, "pending")])
-def test_the_cli_runs_the_same_sync_for_every_agent(monkeypatch, capsys, deferred, follow_state):
+@pytest.mark.parametrize("deferred,follow_state,verify",
+                         [(False, "ok", False), (True, "ok", False), (False, "pending", False), (False, "pending", True)])
+def test_the_cli_runs_the_same_sync_for_every_agent(monkeypatch, capsys, deferred, follow_state, verify):
+    """``verify``: ADR-0009 2d-i P9's verify-only follow; an Agent not moved yet is reported, not a failure."""
     import shared_context.behavior_server as server
     import shared_context.behavior_server_config as server_config
     from shared_context import native_environment_sync
@@ -569,10 +589,13 @@ def test_the_cli_runs_the_same_sync_for_every_agent(monkeypatch, capsys, deferre
     args = ["sync", "--config", "x.json", "--image", "new:image", "--route"]
     if deferred:
         args.append("--defer-follow")
-    assert versions.main(args) == (1 if not deferred and follow_state == "pending" else 0)
+    if verify:
+        args.append("--verify-follow")
+    failed = not deferred and not verify and follow_state == "pending"
+    assert versions.main(args) == (1 if failed else 0)
     assert seen == ["agent-a", "agent-r"]
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    state = "failed" if not deferred and follow_state == "pending" else "ok"
+    state = "failed" if failed else "ok"
     assert [(line["agent_name"], line["state"]) for line in lines] == [("agent-a", state), ("agent-r", state)]
     if state == "failed":
         assert all(line["version_state"] == "ok" and line["reason"] == "NATIVE_ENVIRONMENT_PENDING" for line in lines)
@@ -581,6 +604,7 @@ def test_the_cli_runs_the_same_sync_for_every_agent(monkeypatch, capsys, deferre
     assert len(installations) == (0 if deferred else 1)
     if not deferred:
         assert follows[0]["published"] == {A.agent_id, R.agent_id}
+        assert follows[0].get("verify_only", False) is verify
         assert all(line["environment_follow"]["state"] == follow_state for line in lines)
 
 

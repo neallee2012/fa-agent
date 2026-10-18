@@ -11,8 +11,8 @@ from azure.core.exceptions import AzureError
 from azure.ai.agentserver.core.tasks import Task
 
 from shared_context.behavior_assistant_boundary import AssistantModelBoundary
+from shared_context.behavior_foundry import FoundryHttpClient
 from shared_context.behavior_native_agent_wire import NATIVE_AGENT_PREFIX, NativeRelayAcceptance, NativeRelaySend
-from shared_context.behavior_native_sessions import native_sessions
 from shared_context.behavior_native_turn_wire import NativeSubmit
 from shared_context.m2_copilot import ToolFailure
 from shared_context.native_agent_tools import NativeAgentRelayClient, NativeAgentTools
@@ -108,11 +108,17 @@ def test_once_review_can_finish_with_a_typed_queue_reference_without_an_acceptan
     assert not relay.remotes[1].records
 
 
+def without_transport(relay):
+    # Since 5492dc62 an unprepared recipient (NATIVE_SESSION_CHANGED) answers AGENT_VERSION_FOLLOWING and is queued;
+    # a recipient without a Foundry transport is still refused before send (test_native_agent_api "no-transport").
+    relay.base.b.clients = tuple(client for client in relay.base.b.clients if not isinstance(client, FoundryHttpClient))
+
+
 @pytest.mark.parametrize("ask", [False, True])
-def test_recipient_session_changed_reaches_model_as_not_sent(
+def test_unreachable_recipient_reaches_model_as_not_sent(
         hitl, relay_client_http, tmp_path, monkeypatch, caplog, ask):
     runner, relay, case, tools, requests, packet = relay_with_hitl(hitl, relay_client_http, tmp_path, ask=ask)
-    native_sessions(relay.base.b).prepared = None
+    without_transport(relay)
     hide_receiver_session(relay, monkeypatch)
 
     async def check():
@@ -145,7 +151,7 @@ def test_recipient_session_changed_reaches_model_as_not_sent(
             assert (await case.client.read(pending.approval.pending_id)).status == "interrupted"
 
     runner.run(check())
-    assert "NATIVE_RELAY_RECIPIENT_UNAVAILABLE cause=NATIVE_SESSION_CHANGED" in caplog.text
+    assert "NATIVE_RELAY_RECIPIENT_UNAVAILABLE cause=NATIVE_EXECUTION_UNAVAILABLE" in caplog.text
     assert len([request for request in requests if request.url.path.endswith("/send")]) == 1
     assert not relay.remotes[1].records and not relay.repository.data
     assert not any(command.operation == "agent_receive" for _, command in relay.remotes[1].calls)
@@ -164,7 +170,7 @@ def test_lost_ack_then_unavailable_does_not_erase_an_earlier_delivery(
     assert first.status_code == 503
     relay.remotes[1].lose_submit = False
     saved, quota = copy.deepcopy(relay.remotes[1].records), copy.deepcopy(relay.repository.data)
-    native_sessions(relay.base.b).prepared = None
+    without_transport(relay)
     hide_receiver_session(relay, monkeypatch)
 
     async def check():
@@ -219,20 +225,19 @@ def test_actual_lost_receive_ack_stays_unknown_through_hitl(
 def test_later_attempt_after_pre_send_refusal_can_send_once(
         hitl, relay_client_http, tmp_path, monkeypatch):
     runner, relay, case, tools, requests, packet = relay_with_hitl(hitl, relay_client_http, tmp_path)
-    state = native_sessions(relay.base.b)
-    preparation = state.prepared
+    clients = relay.base.b.clients
 
     async def check():
         spec = next(tool for tool in await tools.prepare() if tool.name == "send_agent_message")
         with monkeypatch.context() as unavailable:
-            state.prepared = None
+            without_transport(relay)
             hide_receiver_session(relay, unavailable)
             assert await permit(case, packet) == (True, None)
             with pytest.raises(ToolFailure) as refused:
                 await guard_native_tool(case.context, spec).handler(packet)
             assert refused.value.public_code == "NATIVE_RELAY_RECIPIENT_UNAVAILABLE"
             assert not relay.remotes[1].records
-        state.prepared = preparation
+        relay.base.b.clients = clients
         later = {**packet, "tool_call_id": "later-explicit-attempt"}
         assert await permit(case, later) == (True, None)
         result = await guard_native_tool(case.context, spec).handler(later)

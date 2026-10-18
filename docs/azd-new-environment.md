@@ -53,7 +53,8 @@ azd 本體的已證實行為（官方文件；第 3 點另外在本機 azd 1.32.
 | `FA_MODEL_CAPACITY_JSON` | 空（用 model catalog 的容量） | 例 `{"gpt-5.4-mini":50}`；只接受 catalog 內名稱 |
 | `FA_MODEL_VERSION_UPGRADE_OPTION` | `NoAutoUpgrade` | 所有模型部署一致 |
 | `FA_API_SUBNET_NAT_EGRESS` | `false` | 同 `prepare_environment.py` |
-| `FA_ENABLE_AGENT_ONBOARDING` | `false` | 「＋」新 Agent 需要的受限 RBAC Admin（#468 的例外）；預設不給 |
+| `FA_DEPLOY_UPGRADE_SNAPSHOTS` | `false` | `true`：另建 ADR-0009 phase 5 工作檔快照專用的儲存帳號（`stsnap<token>`、私有端點、30 天刪除規則、帳號刪除鎖、API 身分在該 container 的備份讀寫自訂角色，不含刪除），API 取得 `FA_UPGRADE_SNAPSHOT_CONTAINER_URL`；與 `no-auto-gc` 備份帳號分開（Neal 2026-10-17）。建帳號與指派角色是雲端與 IAM 寫入，每次部署（含 dev）都要 Neal 批准 |
+| `FA_ENABLE_AGENT_ONBOARDING` | `true` | 「＋」新 Agent 需要的受限 RBAC Admin（#468 的例外，Neal 2026-10-15 改成預設開）與 API 的 `FA_ONBOARDING_*`（同 stage）；設 `false` 就兩者都不給 |
 | `FA_ENABLE_WEBIQ` | `false` | `true` 時 deploy 階段以隱藏輸入要金鑰並建 toolbox |
 | `FA_ENABLE_MEMORY` | `true` | 建 Memory Store 並開私人／Team 記憶旗標（同 stage） |
 | `FA_ENABLE_TEAM_MCP_CONNECTIONS` | `true` | API 身分 project 範圍 Contributor，Team MCP 可新增含金鑰 connection（同 stage） |
@@ -98,7 +99,7 @@ ACR、CAE、API UAMI（名稱／client ID／principal ID）、Table／備份 sto
 - **加減模型。** 之後 `azd env set FA_MODELS …` 再 `azd up`：新增的會建部署並出現在 Portal；拿掉的只會從 Portal 消失，
   Bicep 增量部署不刪既有部署（要刪請在 Foundry 入口網站自己刪）。
 
-功能旗標（HITL、groups、routines、Responses lane、`conversation_defaults` 等）放在
+功能旗標（HITL、groups、routines、Responses lane、對話中換模型 `FA_NATIVE_MODEL_SWITCH`、`conversation_defaults` 等）放在
 [`deploy/azd/profile.defaults.json`](../deploy/azd/profile.defaults.json)。裡面沒有 tenant、訂閱、OID 或資源名稱；
 測試會檢查每個 key 都是 stage profile 已有的 key，避免自己發明旗標。
 
@@ -132,7 +133,8 @@ Neal 2026-10-10 決定：`azd up` 結束就能直接用，預設和 stage 相同
   `conversation_defaults` 算出（Responses、全部能力、已批准技能），不從其他 Agent 匯出；只做一次，之後不覆蓋主人的調整。
 - **私人／Team 記憶**：`new_memory_store.py` 建 `poc-team-memory`（選項同 dev／stage，chat 模型用 `FA_DEFAULT_MODEL`），旗標隨 Agent 第一版發布。
 - **Team MCP 含金鑰 connection**：API 身分 project 範圍 Contributor（`infra/azd/api-project-contributor.bicep`）。
-- **`azd down --purge`＋`postdown`**：連 RG 外的 Entra app 與自訂角色一起清，quota 釋放。
+- **`azd down --purge`＋`postdown`**：連 RG 外的 Entra app 與自訂角色一起清，quota 釋放。確認是 `predown` 的環境名稱（備份鎖還在、
+  沒設 `FA_CONFIRM_DELETE` 時）和 azd 自己的 `y/N`，2026-10-15 實測約 33 分鐘；見 [README 刪除](../deploy/azd/README.md#刪除)。
 
 仍然手動或選用：
 
@@ -140,7 +142,7 @@ Neal 2026-10-10 決定：`azd up` 結束就能直接用，預設和 stage 相同
 |---|---|
 | Portal 真人驗收（原 17） | 要真人登入送訊息，以 receipt `completed` 為準；HTTP 200 不算 |
 | Provider／feature 註冊、quota 申請 | 這些會改訂閱，preflight 只列出缺什麼和指令 |
-| 沒有管理員權限時的 consent | `oauth2PermissionGrant` 要 `DelegatedPermissionGrant.ReadWrite.All`（管理員角色）；hook 寫出 3 個只給主人的 grant body 與指令（`.azure/<env>/fa/admin-consent/`），管理員照做，部署停在第一次 session 前等它。完整的事前準備與分工見 [README 事前準備](../deploy/azd/README.md#prerequisites)，`fa_azd.py prereq` 唯讀檢查 |
+| 沒有管理員權限時的 consent | `oauth2PermissionGrant` 要 `DelegatedPermissionGrant.ReadWrite.All`（管理員角色）。部署者有這類角色時 hook 直接建，不需要這一步；沒有時 hook 寫出 3 個只給主人的 grant body 與指令（`.azure/<env>/fa/admin-consent/`），管理員照做，部署停在第一次 session 前等它。完整的事前準備與分工見 [README 事前準備](../deploy/azd/README.md#prerequisites)，`fa_azd.py prereq` 唯讀檢查 |
 | Feed reader MCP | 需要另一把簽章金鑰；新環境預設不建 |
 | 第二位使用者 | ADR-0006 一 Team 一主人（G1） |
 

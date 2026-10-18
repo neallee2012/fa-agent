@@ -79,19 +79,15 @@ def test_confirmed_follow_resolves_source_from_new_reader_not_from_metadata(nati
 
     command = {"request_id": "metadata-follow-original", "expected_agent_version": "42"}
     followed = case.client.post(PREFIX + "/environment", headers=case.headers, json=command)
-    assert followed.status_code == 200, followed.text
-    receipt = followed.json()
-    assert receipt["state"] == "ready"
-    assert receipt["previous_hosted_session_id"] == source.session_id
-    assert receipt["previous_agent_version"] == original.hosted_agent_version
-    assert receipt["hosted_agent_version"] == "42"
-    assert receipt["request_id"] == command["request_id"]
-    assert receipt["model_started"] is False
+    # d53a0292: the source comes from the reader at its original version, so metadata reporting "42" for that SID is a
+    # proven drift; FollowFiles.require_source_version refuses it before any stop or Files read.
+    assert followed.status_code == 409, followed.text
+    assert followed.json()["error"]["code"] == "NATIVE_FILES_SOURCE_UNAVAILABLE"
     case.composition._native_sessions = NativeSessions(case.composition)
     replay = case.client.post(PREFIX + "/environment", headers=case.headers, json=command)
-    assert replay.status_code == 200 and replay.json() == receipt
+    assert replay.status_code == 409 and replay.json() == followed.json()
     assert case.remote.preparation == original
-    assert calls.count(("stop", source.session_id)) == 1
+    assert not any(action in {"stop", "session_files"} for action, _ in calls)
     assert sum(action == "create" for action, _ in calls) == 1
     assert not any(action == "session_read" and sid == source.session_id for action, sid in calls)
     assert not case.remote.records
@@ -203,17 +199,24 @@ def test_a_cached_old_binding_cannot_receive_a_new_request_after_publication_cha
     monkeypatch.setattr("shared_context.behavior_native_sessions._read_platform_session", sdk_read_session)
     monkeypatch.setattr("shared_context.behavior_native_sessions._latest_version_reader", sdk_latest_reader)
     monkeypatch.setattr("shared_context.behavior_agent_versions.current_hosted_version", lambda *_: "42")
+    from shared_context.behavior_native_turn_wire import NativeEnvironmentView
     advances = []
 
-    monkeypatch.setattr(NativeSessions, "advance", lambda *args, **_kwargs: advances.append(args))
+    def advance(self, client, command, *, before_send):
+        advances.append(command.expected_agent_version)
+        return NativeEnvironmentView(
+            agent_id=old.agent_id, request_id=command.request_id, state="pending", reason="source_active",
+            previous_hosted_session_id=old.session_id, previous_agent_version="41",
+            hosted_session_id="fa-native-destination", hosted_agent_version="42")
+
+    monkeypatch.setattr(NativeSessions, "advance", advance)
     response = submit(case, rid="new-after-publication")
     error = response.json()["error"]
-    # Only the 41 session exists: it is never invoked (invoking it lets the platform bring it back), and the
-    # follow or sync that creates 42's session is not started from a submit. The same RID waits, not dispatched.
-    assert (response.status_code, error["code"]) == (503, "AGENT_VERSION_FOLLOWING"), response.text
-    assert error["not_dispatched"] is True and error["request_id"] == "new-after-publication"
-    assert "server_following" not in error
-    assert advances == []
+    # Only the 41 session exists: it is never invoked (invoking it lets the platform bring it back). 2d-i P7: the
+    # submit follows to 42 instead of README (a)'s refusal, and the same RID is sent again (``server_following``).
+    assert error["not_dispatched"] is True and error["request_id"] == "new-after-publication", response.text
+    assert error["server_following"] is True
+    assert advances == ["42"]
     assert case.remote.calls == []
     assert not case.remote.records
 

@@ -4,8 +4,10 @@ Recording only: no turn result changes, and no session is called for the row. Th
 slot notice (drift, or a switch's §8 notice) and, from phase 2c, the owner's route clears it by CAS after the
 response was written. Platform I/O and Hosted are offline doubles."""
 
+import hashlib
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -334,6 +336,107 @@ def test_rerun_on_a_newer_selector_keeps_both_previous_sids(bound):
     assert (moved.hosted_session_id, moved.created_agent_version) == ("fa-native-43", "43")
     assert [(item.hosted_session_id, item.agent_version) for item in moved.previous_sessions] == [
         (case.sid, "41"), (first, "42")]
+
+
+class DeclaredProfiles:
+    """The ``HostedVersions.profile`` part of the version resolver: what each version's definition declares."""
+
+    def __init__(self, **declared):
+        self.declared, self.reads = declared, []
+
+    def profile(self, target, version):
+        self.reads.append(version)
+        value = self.declared[version]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def declared(case, monkeypatch, **profiles):
+    resolver = DeclaredProfiles(**profiles)
+    monkeypatch.setattr(case.composition.runtime.agent_message_composition, "hosted_versions", resolver, raising=False)
+    return resolver
+
+
+def test_claim_and_switch_rows_record_the_profile_each_version_declares(bound, monkeypatch):
+    """ADR-0009 2d-i: 2d-ii supports only v2, so a row never records the API's own v1 for a v2 session."""
+    case = bound
+    declared(case, monkeypatch, **{"41": "foundry-native-v2", "42": "foundry-native-v2"})
+    sessions = native_sessions(case.composition)
+    client = case.foundry.for_target(case.remote.target)
+    assert sessions.observed_binding(client, version="41").state_profile == "foundry-native-v2"
+    view = NativeEnvironmentView(
+        agent_id=case.agent_id, request_id="follow", state="ready", previous_hosted_session_id=case.sid,
+        previous_agent_version="41", hosted_session_id="fa-native-next", hosted_agent_version="42")
+    sessions._switched(client, view)
+    moved = row(case)
+    assert (moved.hosted_session_id, moved.state_profile) == ("fa-native-next", "foundry-native-v2")
+    assert moved.model_dump(mode="json")["state_profile"] == "foundry-native-v2" and moved.supported()
+
+
+def test_v1_definitions_write_the_same_row_bytes_as_before_2d_i(bound, monkeypatch):
+    """Claim, drift and switch with v1-declaring versions: every Table write equals the digest taken on 8bf86af0."""
+    case = bound
+    declared(case, monkeypatch, **{"41": "foundry-native-v1", "42": "foundry-native-v1"})
+    sessions = native_sessions(case.composition)
+    client = case.foundry.for_target(case.remote.target)
+    sessions.observed_binding(client, version="41")
+    sessions.observed_binding(client, version="40")
+    sessions._switched(client, NativeEnvironmentView(
+        agent_id=case.agent_id, request_id="follow", state="ready", previous_hosted_session_id=case.sid,
+        previous_agent_version="41", hosted_session_id="fa-native-next", hosted_agent_version="42"))
+    written = b"\n".join(json.dumps(payload, sort_keys=True).encode() for _, payload in case.repository.writes)
+    assert len(case.repository.writes) == 3
+    assert hashlib.sha256(written).hexdigest() == "430a603e1d76bfd0604f931dfbf0420e1ef2f486337cd3d66f74b8e6877eeb0e"
+
+
+def test_an_unreadable_definition_writes_no_claim_rather_than_a_wrong_profile(bound, monkeypatch, caplog):
+    case = bound
+    declared(case, monkeypatch, **{"41": Problem(503, "AGENT_VERSION_FOLLOWING", "unreadable")})
+    client = case.foundry.for_target(case.remote.target)
+    assert native_sessions(case.composition).observed_binding(client, version="41") is None
+    assert row(case) is None and case.repository.writes == []
+    assert "NATIVE_BINDING_UNRECORDED operation=observe code=AGENT_VERSION_FOLLOWING" in caplog.text
+
+
+def test_an_existing_row_records_a_drift_without_reading_any_definition(bound, monkeypatch):
+    """The bound drift path already read V_obs's definition (``_version_supported``): a claim reads the profile only
+    when it inserts, so an existing row costs no ``get_version``, and a failing read can not drop the drift."""
+    case = bound
+    claim(case)
+    unreadable = Problem(503, "AGENT_VERSION_FOLLOWING", "unreadable")
+    resolver = declared(case, monkeypatch, **{"40": unreadable, "41": unreadable})
+    moved = case.foundry.for_target(case.remote.target.model_copy(update={"agent_version": "40"}))
+    recorded = native_sessions(case.composition).observed_binding(moved, version="40")
+    assert recorded is not None and recorded == row(case)
+    assert (recorded.observed.agent_version, recorded.drift, recorded.notice_pending) == ("40", True, True)
+    assert resolver.reads == []
+
+
+def test_an_abandon_decision_that_claims_the_row_records_the_sources_declared_profile(bound, monkeypatch):
+    case = bound
+    declared(case, monkeypatch, **{"41": "foundry-native-v0"})
+    monkeypatch.setattr(behavior_native_sessions, "_session_metadata", lambda _client: SimpleNamespace(status="idle"))
+    monkeypatch.setattr(behavior_native_sessions, "_native_profile", lambda _client, **_: "foundry-native-v0")
+    sessions = native_sessions(case.composition)
+    source = case.foundry.for_target(case.remote.target)
+    decided = sessions._abandon_decision(case.store, None, source, waiting=False)
+    assert (decided.basis, decided.source_status) == ("incompatible", "idle")
+    assert row(case).state_profile == "foundry-native-v0" and not row(case).supported()
+
+
+@pytest.mark.parametrize("source_profile", [None, Problem(503, "AGENT_VERSION_FOLLOWING", "unreadable")])
+def test_an_incompatible_source_without_a_known_profile_is_never_recorded_as_supported(bound, monkeypatch,
+                                                                                       source_profile):
+    """An enforcing guard in another process reads only the row: a v1 fallback would let it call the SID again."""
+    case = bound
+    declared(case, monkeypatch, **{"41": source_profile})
+    monkeypatch.setattr(behavior_native_sessions, "_session_metadata", lambda _client: SimpleNamespace(status="idle"))
+    monkeypatch.setattr(behavior_native_sessions, "_native_profile", lambda _client, **_: None)
+    source = case.foundry.for_target(case.remote.target)
+    decided = native_sessions(case.composition)._abandon_decision(case.store, None, source, waiting=False)
+    assert decided.basis == "incompatible"
+    assert row(case).state_profile == native_binding.INCOMPATIBLE_STATE_PROFILE and not row(case).supported()
 
 
 def test_follow_source_status_read_claims_with_the_version_it_shows(bound, monkeypatch):
@@ -680,3 +783,22 @@ def test_an_old_bridge_with_only_a_switch_notice_pending_gets_no_notice(bound):
     accepted = submit(case)
     assert accepted.status_code == 202 and "environment_notice" not in accepted.json()
     assert row(case).switch_notice == "without_files"
+
+
+def test_clearing_a_lost_fence_never_clears_the_newer_one_that_replaced_it():
+    """#858 review P3: ``record_upgrade(upgrade=None, lost=...)`` clears only that lost fence."""
+    from shared_context.native_binding import NativeBindingUpgrade
+
+    store = NativeBindingStore(InMemoryRepository(), tenant_id="tenant", team_id="team", clock=lambda: NOW)
+    store.claim("agent", hosted_session_id="fa-native-source", created_agent_version="41")
+
+    def fence(sid, rid):
+        return NativeBindingUpgrade(hosted_session_id=sid, agent_version="42", request_id=rid,
+                                    started_at=NOW.isoformat())
+
+    lost, newer = fence("fa-native-lost", "rid-lost"), fence("fa-native-newer", "rid-newer")
+    store.record_upgrade("agent", hosted_session_id="fa-native-source", upgrade=newer)
+    store.record_upgrade("agent", hosted_session_id="fa-native-source", upgrade=None, lost=lost)
+    assert store.read("agent").upgrade == newer
+    store.record_upgrade("agent", hosted_session_id="fa-native-source", upgrade=None, lost=newer)
+    assert store.read("agent").upgrade is None

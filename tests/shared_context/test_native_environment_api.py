@@ -179,7 +179,9 @@ def test_owner_explicit_follow_stops_original_and_replays_after_api_restart(nati
     assert sum(action == "create" for action, _ in calls) == 1
 
 
-def test_pending_follow_stops_the_original_sid_even_if_its_observed_version_changed(native_api, monkeypatch):
+def test_pending_follow_refuses_the_original_sid_once_its_observed_version_changed(native_api, monkeypatch):
+    # d53a0292: FollowFiles.require_source_version runs before before_stop; a metadata-proven source drift is refused
+    # with no stop and no Files read (FA-AGENT-BEHAVIOR-SPEC 2026-10-04 "正常Files階段先核source版本").
     case = native_api
     source, calls, sessions, view = environment_at(case, monkeypatch)
     original_preparation = case.remote.preparation
@@ -187,13 +189,9 @@ def test_pending_follow_stops_the_original_sid_even_if_its_observed_version_chan
     response = case.client.post(PREFIX + "/environment", headers=case.headers, json={
         "request_id": "follow-original", "expected_session_id": source.session_id, "expected_agent_version": "42",
     })
-    assert response.status_code == 200 and response.json()["state"] == "ready", response.text
-    result = response.json()
-    assert result["previous_agent_version"] == source.agent_version
-    assert result["hosted_agent_version"] == "42" and result["previous_hosted_session_id"] == source.session_id
-    assert result["hosted_session_id"] != source.session_id
-    assert calls.count(("stop", source.session_id)) == 1
-    assert calls.count(("status", source.session_id)) == 2
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "NATIVE_FILES_SOURCE_UNAVAILABLE"
+    assert not any(action in {"stop", "session_files"} for action, _ in calls)
     assert view[0].previous_agent_version == original_preparation.hosted_agent_version
     assert case.remote.preparation == original_preparation and case.remote.records == {}
     with pytest.raises(Problem) as strict:
@@ -214,9 +212,10 @@ def test_source_drift_tolerance_keeps_identity_version_shape_and_status_checks(n
 
     def get_session(name, sid):
         assert (name, sid) == (source.agent_name, source.session_id)
+        # The source reports its own version: since d53a0292 any other version is a proven drift (refused below).
         return AgentSessionResource({
             "agent_session_id": sid, "status": "active",
-            "version_indicator": {"type": "version_ref", "agent_version": "42"},
+            "version_indicator": {"type": "version_ref", "agent_version": source.agent_version},
             "diagnostic": "PRIVATE-RESPONSE-MUST-NOT-BE-LOGGED", **changed,
         })
 
@@ -224,14 +223,21 @@ def test_source_drift_tolerance_keeps_identity_version_shape_and_status_checks(n
     response = case.client.post(PREFIX + "/environment", headers=case.headers, json={
         "request_id": "follow-original", "expected_session_id": source.session_id, "expected_agent_version": "42",
     })
-    assert response.status_code == 200 and response.json()["state"] == "pending"
-    assert response.json()["reason"] == "source_unavailable" and view[0].state == "pending"
+    if "status" in changed:
+        assert response.status_code == 200 and response.json()["state"] == "pending"
+        assert response.json()["reason"] == "source_unavailable" and view[0].state == "pending"
+        assert "NATIVE_ENVIRONMENT_PENDING stage=source_status" in caplog.text
+    else:
+        # d53a0292: FollowFiles.require_source_version reads the same metadata first; _session_metadata refuses an
+        # identity or concrete-version change before any stop or Files read.
+        assert response.status_code == 409, response.text
+        assert response.json()["error"]["code"] == "NATIVE_SESSION_CHANGED"
     assert not any(action == "stop" for action, _ in calls)
-    assert "NATIVE_ENVIRONMENT_PENDING stage=source_status" in caplog.text
     assert "PRIVATE-RESPONSE" not in caplog.text
 
 
 @pytest.mark.parametrize("phase,status", [
+    ("precheck", 403), ("precheck", 503),
     ("source_status", 403), ("stop_session", 403), ("stop_session", 409), ("source_readback", 403),
 ])
 def test_source_observation_and_stop_failures_remain_pending_with_distinct_phases(
@@ -247,13 +253,14 @@ def test_source_observation_and_stop_failures_remain_pending_with_distinct_phase
 
     def get_session(name, sid):
         assert (name, sid) == (source.agent_name, source.session_id)
-        current_phase = "source_status" if not requests else "source_readback"
+        # d53a0292: FollowFiles.require_source_version reads the source metadata once before the status read.
+        current_phase = "precheck" if not requests else "source_status" if "stop" not in requests else "source_readback"
         requests.append("get")
         if phase == current_phase:
             failure()
         return AgentSessionResource({
             "agent_session_id": sid, "status": "active",
-            "version_indicator": {"type": "version_ref", "agent_version": "42"},
+            "version_indicator": {"type": "version_ref", "agent_version": source.agent_version},
         })
 
     def stop_session(name, sid):
@@ -269,7 +276,7 @@ def test_source_observation_and_stop_failures_remain_pending_with_distinct_phase
     })
     assert response.status_code == 200 and response.json()["state"] == "pending"
     assert response.json()["reason"] == "source_unavailable" and view[0].reason == "source_stop_required"
-    assert requests.count("stop") == (0 if phase == "source_status" else 1)
+    assert requests.count("stop") == (0 if phase in {"precheck", "source_status"} else 1)
     assert f"NATIVE_ENVIRONMENT_PENDING stage={phase}" in caplog.text
     if phase == "stop_session":
         assert f"upstream_status={status}" in caplog.text
@@ -286,7 +293,8 @@ def test_stop_acknowledgment_without_inactive_readback_does_not_complete_follow(
     assert response.status_code == 200 and response.json()["reason"] == "source_active"
     assert response.json()["state"] == view[0].state == "pending"
     assert calls.count(("stop", source.session_id)) == 1
-    assert calls.count(("status", source.session_id)) == 2
+    # d53a0292 added the pre-stop FollowFiles.require_source_version metadata read before status and readback.
+    assert calls.count(("status", source.session_id)) == 3
 
 
 def test_a_new_build_does_not_retarget_the_original_pending_operation(native_api, monkeypatch):

@@ -153,6 +153,7 @@ MESSAGES = {
     "REMOTE_SESSION_CHANGED": "遠端工作台已重新啟動，沒有重送任何操作。頁面沒有自動重新整理時（例如還有未送出的內容），請先複製內容，再重新整理頁面。",
     "REMOTE_STATE_UNAVAILABLE": "遠端工作台暫時無法保存紀錄；沒有自動重送。請重新整理頁面，依原紀錄核對後再操作。",
     "REMOTE_STATE_INVALID": "遠端保存的紀錄格式不符；未載入、未覆寫，也沒有送出新工作。",
+    "REMOTE_STATE_FULL": "遠端保存的紀錄已達容量上限；這次的變更沒有保存到遠端，也不會自動重送，已保存的紀錄不受影響。請交管理者處理後再操作。",
     "REMOTE_CONFIGURATION_INVALID": "遠端工作台的設定與登入者或保存位置不符；未啟動。",
     "LOCAL_FAILURE": "本機處理失敗；結果未確認，請保留 journal 核對，不重送。",
     "WORK_POLICY_UNAVAILABLE": "暫時無法核對這筆工作的權限與預算；不會送出，其他工作與讀取不受此項影響。",
@@ -862,6 +863,13 @@ class Console:
                 self.native_instructions.refresh(thread_id, self.vault.get())
             else:
                 self.instructions.refresh_progress(self.vault.get(), thread_id)
+            if self.instructions.models is None:
+                # The first read failed or never ran (e.g. the API still starting after a redeploy): read it on first need.
+                try:
+                    self.instructions.refresh_models(self.vault.get())
+                    self.native_instructions.refresh_routing(self.vault.get(), thread_id=thread_id)
+                except ConsoleError:
+                    pass  # the composer keeps 「尚無可用模型」 and the next poll reads again
             return self.state(thread_id)
 
     def instruction_received(self, request_id, thread_id=None):

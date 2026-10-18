@@ -365,6 +365,9 @@ class NativeInstructionControl:
             self.server_profile = None
             if self.store.lane(thread_id) != NATIVE_RESPONSES_PROFILE:
                 self.responses_options = None
+            elif self.responses_options is None:
+                # After a console restart nothing has read them yet; the composer shows model_switch from them.
+                self.responses_options = options(self.adapter, token).responses
             self._current(token)
             return
         self.server_profile, self.responses_options = None, None
@@ -451,6 +454,17 @@ class NativeInstructionControl:
                 (rid,),
             ).fetchall()
 
+    def _latest_attempt(self, rid, original):
+        """The answer of the latest same-RID resend (native-refused-retry-N) if any, else the first submit's."""
+        retries = self._refused_attempts(rid)
+        return strict_json(retries[-1][0]) if retries else original
+
+    def _latest_submission(self, rid):
+        """The first submit with the answer of its latest same-RID resend, if any: a refused submit retried
+        successfully reads as CONFIRMED. The intent (its body and send time) stays the first one's."""
+        original = self.journal.get(rid, "submit")
+        return None if original is None else {**self._latest_attempt(rid, original), "intent": original["intent"]}
+
     def _not_accepted(self, rid):
         return self._refusal(rid) is not None
 
@@ -467,8 +481,7 @@ class NativeInstructionControl:
             return original
         if original is None or not self._refused(original):
             return None
-        retries = self._refused_attempts(rid)
-        latest = strict_json(retries[-1][0]) if retries else original
+        latest = self._latest_attempt(rid, original)
         return latest if self._refused(latest) else None
 
     def _retryable(self, rid):
@@ -482,10 +495,8 @@ class NativeInstructionControl:
         """A later send whose answer was lost before Hosted created rid:<RID> reads back as missing. It stays UNKNOWN
         (never resent) and is shown on its own turn; the rest of the conversation is still read. A first message has
         nothing else to read (no CID yet), so its error is raised as before."""
-        saved = self.journal.get(rid, "submit")
-        retries = self._refused_attempts(rid)
         # The latest attempt counts: a version refusal (REFUSED) whose same-RID resend was lost is UNKNOWN too.
-        latest = strict_json(retries[-1][0]) if retries else saved
+        latest = self._latest_attempt(rid, self.journal.get(rid, "submit"))
         if (error.code != "NATIVE_RID_MISSING" or latest is None or latest["state"] != "UNKNOWN"
                 or not any(other != rid and self.request_threads.get(other) == thread for other in self.receipts)):
             return False
@@ -1528,7 +1539,7 @@ class NativeInstructionControl:
                                                   "observed_at": self.observed.get(thread_id)},
             "submission": ({"state": "OBSERVED", "method": "GET"} if continuation is not None or routine is not None
                            or self.journal.get(rid, RECEIVED_PHASE) is not None else
-                           self.journal.get(rid, "submit") or {"state": "CONFIRMED" if turn is not None else "NOT_SENT"}),
+                           self._latest_submission(rid) or {"state": "CONFIRMED" if turn is not None else "NOT_SENT"}),
             "submission_observation": None if observation is None else observation.get("observation"),
             "cancellation": self.journal.get(rid, "cancel"), "acknowledgment": self.journal.get(rid, "acknowledge"),
             "user_files": [] if command is None else [file_reference(item).model_dump(mode="json") for item in command.files],

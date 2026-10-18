@@ -188,6 +188,18 @@ def test_full_onboarding_creates_registers_and_lists_the_agent_ready(team):
     assert onboarding_status(team.a, team.c.human, "onboard-one") == value
 
 
+def test_onboarded_agent_composition_gets_the_upgrade_snapshot_container_url(team):
+    # ADR-0009 phase 5: build_server sets it on the owner; a per-agent composition must carry the same value.
+    from shared_context.behavior_server import ServerComposition
+    assert ServerComposition(None, None, None, None, (), None).upgrade_snapshot_container_url is None
+    url = "https://stsnaptok3n.blob.core.windows.net/upgrade-snapshots"
+    team.a.upgrade_snapshot_container_url = url
+    finished, value = team.run()
+    assert finished
+    peer = team.a.for_agent(value["agent_id"])
+    assert peer is not team.a and peer.upgrade_snapshot_container_url == url
+
+
 def test_same_request_resend_never_creates_twice_or_takes_another_slot(team):
     team.foundry.ready_after = 10**6
     finished, first = team.run(deadline_seconds=3)
@@ -796,6 +808,68 @@ def test_a_catalog_change_after_admission_keeps_the_same_request_as_the_only_way
     finished, value = team.run(selection=(chosen, (SKILL,)))
     assert finished and value["state"] == "ready"
     assert len(team.foundry.creates()) == 1
+
+
+def _team_mcp(team, monkeypatch):
+    """A's Team MCP service as the app build installs it (team_mcp_api.py), offering one ``team-*`` server."""
+    from shared_context.team_mcp_wire import TEAM_MCP_ENABLED_ENV, TeamMcpServer, team_mcp_grant
+    monkeypatch.setenv(TEAM_MCP_ENABLED_ENV, "1")
+    grant = team_mcp_grant(team.config.identity.team_id, TeamMcpServer(
+        server_label="stratechery", server_url="https://mcp.example.test/mcp", allowed_tools=("search",), version="v1"))
+    team.a.runtime.team_mcp = SimpleNamespace(team_grants=lambda tenant, team_id: (grant,))
+    lookup = _grants(team)
+    return (*_refs(lookup, *lookup), CapabilityRef(entry_id=grant.entry_id, entry_sha256=grant.entry_sha256))
+
+
+def test_the_default_choice_with_a_team_mcp_server_reaches_ready_on_the_new_agent(team, monkeypatch):
+    # The page pre-ticks A's selection; S5 checks it on the new Agent's peer runtime, built before any app for it.
+    chosen = _team_mcp(team, monkeypatch)
+    finished, value = team.run(selection=(chosen, ()))
+    assert finished and value["state"] == "ready"
+    assert len(team.foundry.creates()) == 1
+    assert _selected(team, value["agent_id"])[2].capabilities == tuple(sorted(chosen, key=lambda ref: ref.entry_id))
+
+
+def test_a_request_left_stale_by_a_peer_without_team_mcp_resumes_ready_with_the_same_id(team, monkeypatch, caplog):
+    chosen = _team_mcp(team, monkeypatch)
+    real_save = onboarding._save_role
+
+    def peer_without_team_mcp(composition, principal, value, text):
+        real_save(composition, principal, value, text)
+        composition.for_agent(value.target.agent_id).runtime.team_mcp = None  # the build before this fix
+    monkeypatch.setattr(onboarding, "_save_role", peer_without_team_mcp)
+    with caplog.at_level(logging.WARNING, logger=onboarding.__name__), pytest.raises(Problem) as stale:
+        team.run(selection=(chosen, ()))
+    body = stale.value.body["error"]
+    assert (stale.value.status, body["code"], body["cause"]) == (
+        409, "AGENT_ONBOARDING_SELECTION_STALE", "CAPABILITY_SOURCES_CHANGED")
+    logged = [r.getMessage() for r in caplog.records if r.getMessage().startswith("AGENT_ONBOARDING_SELECTION_STALE")]
+    assert logged == ["AGENT_ONBOARDING_SELECTION_STALE request_id=onboard-one cause=CAPABILITY_SOURCES_CHANGED"]
+    assert onboarding_status(team.a, team.c.human, "onboard-one")["state"] == "registered"
+    monkeypatch.setattr(onboarding, "_save_role", real_save)
+    # The fixed build starts with no cached peer runtime (an API restart); the same request ID finishes the job.
+    for peer in list(team.a._peers.values()):
+        peer.close()
+    finished, value = team.run(selection=(chosen, ()))
+    assert finished and value["state"] == "ready"
+    assert len(team.foundry.creates()) == 1
+
+
+def test_a_peer_built_without_its_app_offers_the_teams_mcp_and_connector_grants(team, monkeypatch):
+    # Routines, the Teams relay and agent messages reach a peer through for_agent() only, never through its app.
+    from shared_context.behavior_capabilities import runtime_grants
+    from shared_context.team_connector import current_team_connector_grants
+    chosen = _team_mcp(team, monkeypatch)
+    connector = object()
+    team.a.runtime.team_connectors = SimpleNamespace(team_grants=lambda tenant, team_id: (connector,))
+    finished, value = team.run()
+    assert finished and value["state"] == "ready"
+    for peer in list(team.a._peers.values()):
+        peer.close()
+    peer = team.a.for_agent(value["agent_id"])
+    assert chosen[-1].entry_id in runtime_grants(peer.runtime)
+    assert current_team_connector_grants(peer.runtime) == (connector,)
+
 
 def test_a_with_skill_artifacts_can_seed_a_chosen_agent(team, monkeypatch):
     grants = _grants(team, SKILLS_ENTRY_ID)

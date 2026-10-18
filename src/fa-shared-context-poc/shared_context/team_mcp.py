@@ -53,6 +53,9 @@ _TEAM_LOCKS_GUARD = threading.Lock()
 _REQUEST_LOOKUP_VERSIONS = 100
 # Turn captures read the Team's servers often; Foundry is read again after this, or at once after a change here.
 GRANTS_SECONDS = 30.0
+# A failed read keeps its fallback this long, so during a Foundry outage one capture per window waits for the read
+# timeout instead of every capture.
+FAILED_GRANTS_SECONDS = 10.0
 ARM = "https://management.azure.com"
 ARM_TOKEN_SCOPE = "https://management.azure.com/.default"
 # The version the stage connection script already uses (deploy/stage/new_webiq_connection.py).
@@ -378,6 +381,9 @@ class TeamMcpService:
         self.feed_signing_key = feed_signing_key
         self._grants: dict[tuple[str, str], tuple[float, tuple]] = {}
         self._grants_lock = threading.Lock()
+        # Bumped by forget(): a read that started before a change never stores the grants it read.
+        self._generations: dict[tuple[str, str], int] = {}
+        self._flights: dict[tuple[str, str], threading.Lock] = {}
 
     def _authorize(self, principal, *, write=False):
         authorize_team_owner(self.verifier, principal, write=write)
@@ -536,12 +542,19 @@ class TeamMcpService:
     def forget(self, tenant: str, team: str) -> None:
         with self._grants_lock:
             self._grants.pop((tenant, team), None)
+            self._generations[(tenant, team)] = self._generations.get((tenant, team), 0) + 1
 
     def team_grants(self, tenant: str, team: str) -> tuple:
         """The Team's servers in its current default version, as grants pinned to that version."""
+        with self._grants_lock:
+            flight = self._flights.setdefault((tenant, team), threading.Lock())
+        with flight:  # single-flight: captures arriving during a read wait for it and take what it stored
+            return self._read_grants(tenant, team)
+
+    def _read_grants(self, tenant: str, team: str) -> tuple:
         key, now = (tenant, team), monotonic()
         with self._grants_lock:
-            cached = self._grants.get(key)
+            cached, generation = self._grants.get(key), self._generations.get(key, 0)
         if cached is not None and cached[0] > now:
             return cached[1]
         try:
@@ -549,12 +562,17 @@ class TeamMcpService:
         except Exception as error:
             # Not a refusal: the last read servers stay offered; without one, this turn has no Team MCP tools.
             _log.warning("TEAM_MCP_GRANTS_UNAVAILABLE status=%s cached=%s", _status(error), cached is not None)
-            return () if cached is None else cached[1]
+            value = () if cached is None else cached[1]
+            with self._grants_lock:
+                if self._generations.get(key, 0) == generation:
+                    self._grants[key] = (monotonic() + FAILED_GRANTS_SECONDS, value)
+            return value
         servers = sorted((server for server in (_server(tool, default) for tool in tools) if server is not None),
                          key=lambda item: item.server_label)
         value = tuple(team_mcp_grant(team, server) for server in servers)
         with self._grants_lock:
-            self._grants[key] = (now + GRANTS_SECONDS, value)
+            if self._generations.get(key, 0) == generation:
+                self._grants[key] = (now + GRANTS_SECONDS, value)
         return value
 
 

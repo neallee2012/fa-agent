@@ -63,6 +63,7 @@ gate C, no app role); Artifacts.Approve grants nothing here.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -355,6 +356,8 @@ class ServerComposition:
         self.agent_id = agent_id
         # behavior_agent_versions.HostedVersions in production; None keeps each target's configured version offline.
         self.hosted_versions = None
+        # ADR-0009 phase 5: None keeps it off; build_server sets it and build_peer copies it, so every composition has it.
+        self.upgrade_snapshot_container_url = None
         # A Team-registry peer's resolve_agent_scope-verified actor; never set for configured agents.
         self.registered_actor = None
         self._peer_factory = None
@@ -657,6 +660,8 @@ def build_server(
     """
     from .behavior_server_config import ServerConfigurationDocument, ServerConfigurationV2
     config = ServerConfigurationDocument.model_validate_json(config.model_dump_json())
+    from .upgrade_snapshot_store import snapshot_container_url
+    upgrade_snapshot_container_url = snapshot_container_url(config)  # before any client: a bad value stops startup
     resources = ExitStack()
     try:
         credential = _credential(config.identity, resources, credential)
@@ -770,6 +775,7 @@ def build_server(
             from .behavior_agent_versions import HostedVersions
             hosted_versions = HostedVersions(lambda endpoint: ProjectAgentFoundry(endpoint, credential))
         composition.hosted_versions = hosted_versions
+        composition.upgrade_snapshot_container_url = upgrade_snapshot_container_url
         if config.assistant is not None:
             from .behavior_assistant_server import AssistantServer
 
@@ -795,6 +801,9 @@ def _lifespan(app, composition, validate):
     @asynccontextmanager
     async def lifespan(_app):
         clock = getattr(_app.state, "native_routine_clock", None)
+        # The daily patrol and the upgrade reconciler (ADR-0009 2d-i, phase 6a): each starts only behind its flags.
+        patrols = [task for task in (getattr(_app.state, "native_session_patrol", None),
+                                     getattr(_app.state, "native_upgrade_reconciler", None)) if task is not None]
         try:
             validate()
             if getattr(_app.state,"instruction_runner",False):composition.resume_instructions()
@@ -802,11 +811,18 @@ def _lifespan(app, composition, validate):
                 await composition._peer_router.prepare()
             if clock is not None:
                 clock.start()
+            for patrol in patrols:
+                patrol.start()
             yield
         finally:
+            for patrol in patrols:
+                await patrol.stop()
             if clock is not None:
                 await clock.stop()
             if getattr(_app.state,"instruction_runner",False):await composition.stop_instruction_observers()
+            # ADR-0009 2d-i background cuts: a running files fence is withdrawn before the clients close.
+            from .native_cut import close_cut_drivers
+            await asyncio.to_thread(close_cut_drivers, composition)
             if composition.assistant is not None:
                 await composition.assistant.provider.aclose()
             for peer in composition._peers.values():
@@ -911,6 +927,10 @@ def application(composition: ServerComposition, *, preactivation=False):
             if composition.agent_id is None and composition.runtime.work_policy is not None:
                 from .behavior_peer_runtime import install_peer_routing
                 install_peer_routing(app, composition, application)
+                from .native_session_patrol import NativeSessionPatrol
+                app.state.native_session_patrol = NativeSessionPatrol(composition)
+                from .native_upgrade_reconciler import NativeUpgradeReconciler
+                app.state.native_upgrade_reconciler = NativeUpgradeReconciler(composition)
             return _lifespan(app, composition, lambda: (
                 composition.installation(),
                 composition.catalog.require_activation() if composition.runtime.work_policy is None else None,

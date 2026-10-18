@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -78,6 +79,10 @@ class AuthSettings:
 # ``PyJWKClient.get_signing_key`` re-downloads the key set on every miss (10 s timeout); here one forced
 # refresh runs at most once per window for the whole process, and a kid still unknown is refused at once.
 FORCED_JWKS_REFRESH_SECONDS = 60.0
+# Stale-if-error: when a refresh after the TTL fails, the last downloaded set keeps verifying for up to this long
+# (signing keys rotate over weeks), and the next refresh is tried once per retry window instead of per request.
+STALE_JWKS_SECONDS = 24 * 3600.0
+STALE_JWKS_RETRY_SECONDS = 30.0
 
 
 class ForcedRefreshWindow:
@@ -116,6 +121,26 @@ class ThrottledJWKClient(jwt.PyJWKClient):
     def __init__(self, uri: str, *, clock=time.monotonic, **kwargs):
         super().__init__(uri, **kwargs)
         self._clock = clock
+        self._stale_retry = ForcedRefreshWindow(STALE_JWKS_RETRY_SECONDS)
+
+    def get_jwk_set(self, refresh: bool = False) -> jwt.PyJWKSet:
+        """The cached set; after its TTL, a failed download keeps the last set (bounded) instead of refusing every
+        token. A forced refresh (unknown kid) never falls back: a kid the old set lacks stays unknown."""
+        cache = self.jwk_set_cache
+        held = None if cache is None else cache.jwk_set_with_timestamp
+        stale = (not refresh and held is not None and cache.is_expired()
+                 and 0 <= time.monotonic() - held.get_timestamp() < STALE_JWKS_SECONDS)
+        if stale and not self._stale_retry.claim(self._clock()):
+            return jwt.PyJWKSet.from_dict(held.get_jwk_set())
+        try:
+            return super().get_jwk_set(refresh)
+        except (jwt.PyJWTError, ValueError):  # no connection, or a 200 whose body is not a JSON key set
+            if cache is not None:
+                cache.jwk_set_with_timestamp = held  # fetch_data cached a non-object body before it was refused
+            if not stale:
+                raise
+            logging.getLogger(__name__).warning("AUTH_KEYS_STALE age_seconds=%d", time.monotonic() - held.get_timestamp())
+            return jwt.PyJWKSet.from_dict(held.get_jwk_set())
 
     def get_signing_key(self, kid: str) -> jwt.PyJWK:
         key = self.match_kid(self.get_signing_keys(), kid)

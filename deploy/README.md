@@ -922,13 +922,20 @@ API 只有在**沒有任何綁定列還記著舊 profile、也沒有 session 還
 - 紀錄：git 歷史、run 的 `::warning::` 與 step summary（`compatibility gate: OVERRIDE (...)`）、job log 的
   `decision=override` 與 override 內容。閘門仍照常讀一次，把被放行的 Agent 寫進報告。
 
-**給 2d-i 的交接：** 綁定列的 `state_profile` 目前一律寫 API 自己的常數（v1）：建立 `NativeBindingRow` 時都沒有給
-`state_profile`，用的是欄位預設值。2d-ii 的 API 只支援 v2，所以 2d-i 起下面每個寫入點都要寫該 session 版本實際宣告的
-profile，否則已搬到 H2d 的 Agent 也會被 (a) 擋下：
+**2d-i（P3）起綁定列寫版本宣告的 profile：** 2d-ii 的 API 只支援 v2，所以三個寫入點都寫該 session 版本 definition
+實際宣告的 `FA_NATIVE_TURNS`（`behavior_native_sessions.NativeSessions._row_profile`，經 `HostedVersions.profile` 讀
+`get_version`，每個版本每個 process 只讀一次），否則已搬到 H2d 的 Agent 也會被 (a) 擋下：
 
-- `NativeBindingStore.claim()`（`shared_context/native_binding.py` 約 246 行）：第一次認領列（寫被認領 SID 的版本宣告的 profile）。
-- 換環境的 commit `NativeBindingStore.record_switch()`（約 318 行）：寫目的 session 版本宣告的 profile。
-- 另有第三處：`NativeBindingStore.decide_abandon()`（約 360 行）在沒有列時連同棄用決定一起認領，同樣用預設值。
+- `NativeBindingStore.claim()`：第一次認領列，寫被認領 SID 的版本宣告的 profile。只有真的要新增列時才讀（已有列的觀察，
+  例如送出路徑的 drift 紀錄，不多讀 `get_version`）；讀不到 definition 就不寫（記 `NATIVE_BINDING_UNRECORDED`，下一次觀察
+  再認領）：認領不會覆寫已有的列，寫錯了沒有補救。
+- 換環境的 commit `NativeBindingStore.record_switch()`：寫目的 session 版本宣告的 profile。follow 讀不到就不寫，由重跑補寫；
+  送出路徑的 M3 修補（`_repair`）讀不到則寫 v1 並記 `NATIVE_BINDING_SWITCH_PROFILE_UNREAD`，照 2d-i 以前一樣寫列並重送，
+  不讓一次暫時的 Foundry 失敗變成拒絕；版本實際宣告別的 profile 時由部署閘門報出。
+- `NativeBindingStore.decide_abandon()` 在沒有列時連同棄用決定一起認領：讀得到就寫宣告的 profile；讀不到時，棄用理由是
+  `incompatible` 寫 `incompatible`（`INCOMPATIBLE_STATE_PROFILE`，不在任何支援集合內，其他 process 的強制 guard 不會再呼叫
+  這個 SID），其他理由寫 v1（之後執行棄用的 `record_switch` 會整列換掉）。
+- 離線測試沒有 `HostedVersions`（`hosted_versions=None`）時照舊寫 v1。
 
 <a id="version-retention"></a>
 ## 綁定列引用的版本與 image 不刪（ADR-0009 phase 3b）
@@ -938,12 +945,103 @@ profile，否則已搬到 H2d 的 Agent 也會被 (a) 擋下：
   仍需另外批准。
 - **保護清單：** 閘門報告的 `protected`（`versions`、`images`）每次部署都會算一次。任何清除清單都要先經
   `native_deploy_gate.retention_candidates(candidates, protected)`，被引用的一律留在 `kept`。
-- **現況（2026-10-14 核對）：** repo 沒有任何刪除 Agent 版本或 ACR image 的腳本（測試掃描 `deploy`、`scripts`、
-  `infra`、`.github` 與 `src/fa-shared-context-poc` 確認），所以目前沒有要加守門的清除腳本；之後新增的要走上面的函式。
+- **現況（2026-10-15 核對）：** repo 沒有任何刪除單一 Agent 版本或 ACR image 的腳本（測試掃描 `deploy`、`scripts`、
+  `infra`、`.github` 與 `src/fa-shared-context-poc` 確認），所以目前沒有要加守門的清除清單；之後新增的要走上面的函式。
+  唯一會刪 Foundry 物件的是下面的[退役指令](#retire-agent)：它整個刪掉一位**已退役**的 Agent，或一個 onboarding
+  失敗後留下的 Foundry agent（`force=true`），不是挑版本清除，也不碰其他 Agent。
   `infra/shared-context/foundation.bicep` 的 registry 是 `retentionPolicyStatus: 'disabled'`（測試鎖住）。唯讀
   `az acr` 讀回：dev `crfacontextpocdemo`、stage `crfacontextstagedemo` 都是 Basic、retention `disabled`、沒有
   ACR task（也就沒有排程的 `acr purge`）。不需要改 infra。
 - `azd down` 刪的是整個環境（含 Table 裡的綁定列本身），不在這條規則內；它另有確認步驟與批准。
+
+<a id="retire-agent"></a>
+## 退役一位 Agent（tombstone；Foundry 清除另外選）
+
+用在「＋」建立、之後不要了的 Agent（例如 dev 測試 Agent）。設定檔裡的 Agent（A 與 config targets）不能退役。
+依 ADR-0006 補充「退役是 tombstone，不是刪除」：Team 的 Table 資料一筆都不刪。
+
+1. **寫 tombstone（API 正常寫入路徑）。** `TeamRegistry.retire_agent` 在同一筆 CAS 建立 create-only 的
+   `team_agent_retired` 列（誰、何時、原因、request ID），並把這位 Agent 的身分索引改成停用（原 `deactivation_id`
+   就是這個 request ID）。roster、註冊列、onboarding、綁定列、routine 定義與對話紀錄都原樣保留。之後：
+   工作台目錄不列它（`/work-policy/v1/agents`）、API 啟動不再為它建 peer 或記目錄錯誤、部署的 `agent_versions sync`
+   與 `follow_all` 跳過它、routine 時鐘不觸發它的排程（只記一次 `FA_NATIVE_ROUTINE_CLOCK_RETIRED`）、相容性閘門把它的
+   綁定列列在 `retired_rows`（不擋部署，版本仍列在 `protected`）；任何送給它的訊息（真人或其他 Agent）回 410
+   `AGENT_RETIRED`「這位助理已退役」，什麼都沒送出（API 重啟後它的 binding 路徑也一樣；Teams 轉送改回一句
+   「這個助理已經退役，這則訊息沒有送給它。」，`follow_all` 回 `AGENT_RETIRED`）；群組活動跳過它的回合、只記
+   `NATIVE_GROUP_ACTIVITY_RETIRED_MEMBER`，其他成員的回合照常可讀；它自己的 Agent token 在入口被拒（身分已停用）。
+   重跑（同一或新的 request ID、或 ack 遺失後）回原 tombstone，不寫第二次。
+2. **（選用）刪 Foundry 端。** 加 `--delete-foundry`：刪掉 Foundry agent 本身（`agents.delete(name, force=True)`），
+   以及這位 Agent 自己身分在 onboarding role scope 上的 FA 兩個角色指派（Foundry User、Cognitive Services OpenAI User）。
+   **409 說明：** 不帶 `force` 時，只要有任何版本還有 session，服務就回 409（deletion-blocking sessions）；
+   `force=true` 會連同所有版本與 session 一起刪（2026-10-15 dev 的 `fa-agent-cc96…` 就是這樣刪掉 85 個版本、56 個 session）。
+   目標只取自這位已退役 Agent 的原註冊列（agent name、agent oid），不讀其他 Agent。
+   API 的受控身分依 ADR-0006 §1 的 ABAC 條件**不能刪除角色指派**，所以這一步通常回 `refused status=403`：
+   preview 已列出確切的指派 ID，由有權限的真人刪（`az role assignment delete --ids <id>`），再重跑同一個指令讀回收斂。
+
+**operator token 怎麼取：** 在 operator 自己的電腦上用自己的帳號取，一定要帶 `--subscription`（API 所在 tenant 的訂閱）。
+不帶的話 `az account get-access-token` 可能用預設帳號的另一個 tenant，回 `AADSTS500011`。`<api-audience>` 是該環境的
+`CONTEXT_API_AUDIENCE`（dev 與 stage 不同）。輸出直接進剪貼簿，不顯示在畫面上：
+
+```powershell
+az account get-access-token --subscription <subscription-id> --resource <api-audience> --query accessToken --output tsv | Set-Clipboard
+```
+
+再由 operator 自己把它貼到下面指令的隱藏提示「Original operator bearer token (hidden):」。token 不放在指令參數、檔案、
+聊天或 log 裡，也不經過任何工具或 agent 轉手。
+貼完立刻清掉剪貼簿：`Set-Clipboard -Value $null`；有開 Windows 剪貼簿歷程（Win+V）或雲端剪貼簿同步的，也要從歷程刪掉這一筆。
+
+```powershell
+# 在 API 容器內（受控身分與現行 config）；token 用隱藏輸入或 FA_TEAM_OPERATOR_TOKEN，只有原組織 operator 可以。
+python -m shared_context.behavior_agent_retire preview --config <current-config> --agent-id <agent-id> [--delete-foundry] [--role-scope <scope>] [--stuck-onboarding]
+python -m shared_context.behavior_agent_retire retire --config <current-config> --agent-id <agent-id> `
+  --request-id <retire-id> --reason "<原因>" --confirm <agent-id> [--delete-foundry] [--role-scope <scope>] [--stuck-onboarding]
+```
+
+- `preview` 只讀：tombstone 是否已在、Foundry agent 的版本與 session 清單、會刪的角色指派，以及同一身分其他（不刪的）指派。
+- `retire` 一定要 `--confirm` 再打一次同一個 Agent ID；先寫 tombstone，再刪 Foundry。每一部分都先讀、刪完再讀回：
+  已經不在的回 `already_retired`／`already_deleted`，不是錯誤；還有剩下的回 `state=partial`（exit 1），重跑就接著做完。
+- Foundry 已經手動刪掉的 Agent（2026-10-15 dev 的情況）一樣可以只補 tombstone；加 `--delete-foundry` 會回報
+  `already_deleted`，沒有角色指派就是空清單。
+- tombstone 寫入後還會繼續跑的只有一種：寫入**之前**就已開始的那一輪 instruction observer（連同它自己的 session
+  keepalive），會觀察到那一輪結束或 API 重啟（下一次部署或 revision 重啟）為止。它不接新工作；其他 Agent 對它的
+  keepalive 會跳過（只記一次 `HOSTED_SESSION_KEEPALIVE_PEER_RETIRED`），新的請求立刻回 `AGENT_RETIRED`。
+- `--delete-foundry`（含 preview）遇到 roster 裡另一位 Agent（不論是否已退役）有相同 project endpoint 與 agent name，
+  回 409 `TEAM_AGENT_CONFLICT`，不寫 tombstone、不刪任何東西。
+- **卡在 `registered` 的 onboarding。** 例如選擇時釘住 skill X v1，之後 Team 核准了 X v2：同一個 request ID 每次重試都回
+  `AGENT_ONBOARDING_SELECTION_STALE`（cause `PROFILE_SELECTION_SOURCES_CHANGED`），永遠到不了 `ready`，還占 2 個名額
+  （roster＋`pending`）。這種 Agent 在下面任一條件成立時可以退役：它進入 `registered` 已超過 1 小時
+  （`STUCK_ONBOARDING_SECONDS`，看 onboarding 列的 `registered_at`，和進入 `registered` 同一筆 CAS 寫入；本 PR 之前註冊、
+  沒有這個欄位的舊列改看最後一次 create attempt 的 `claimed_at`），或 operator 明確加 `--stuck-onboarding`。
+  preview 會多列 `stuck_onboarding`（request ID 與狀態）；`retire` 照樣要 `--confirm <agent-id>`。寫 tombstone 的同一筆 CAS
+  把這個 request ID 從 `pending` 名單拿掉（tombstone 記 `onboarding_request_id`），所以還回 1 個名額；roster 名額與顯示
+  名稱照樣不釋出，onboarding 列維持 `registered`、不改寫。之後用同一個 request ID 重送會回 410 `AGENT_RETIRED`。
+  還沒有 tombstone 的 Agent，若進入 `registered` 不到 1 小時又沒加旗標，或還在 `admitted`／`creating`（加旗標也一樣；
+  直接讀 onboarding 列，所以 `register_agent` 已寫、還沒進 `registered` 就中斷的也算），回 409
+  `AGENT_ONBOARDING_IN_PROGRESS`、`pending` 不動；後者由 owner 用同一個 request ID 重送接著完成。
+  **已經有 tombstone 的不一樣**：舊版 CLI 一般退役過（tombstone 沒有 `onboarding_request_id`），onboarding 停在
+  `admitted`、`creating` 或 `registered`。這時重送只會回 410 `AGENT_RETIRED`，不會完成 onboarding，名額會一直被占住。
+  對這種 Agent，preview 與 `retire` 都不再拒絕（不必加旗標、不看 1 小時），回原 tombstone（`already_retired`），
+  preview 列出 `stuck_onboarding`；`retire` 再用一筆獨立 CAS（`team-agent-retire-release`，只寫 `pending`，寫前重核
+  tombstone 與 onboarding 列沒變）把它從 `pending` 拿掉；重跑發現已拿掉就什麼都不寫。onboarding 列維持原狀態、不改寫。
+- **不能退回本 PR 之前的 image。** 卡住退役之後，舊 image 的啟動核對看到 `pending` 少了一筆仍開著的 onboarding，回 409
+  `TEAM_REGISTRY_INVALID`；舊 model 又是 `extra="forbid"`，讀到本 PR 之後進入 `registered` 的 onboarding 列（多了
+  `registered_at`）或卡住退役的 tombstone（`onboarding_request_id`）也會啟動失敗（`MIGRATION_RECORD_INVALID`）。所以用本 PR
+  的 image 註冊過 Agent 或做過卡住退役之後，該環境不能退版到本 PR 之前（依程式判讀，未在舊 image 上實測）。
+- **onboarding 失敗留下的 Foundry agent。** 失敗（例如 `FOUNDRY_VERSION_FAILED`）的 onboarding 沒有註冊 Agent，所以沒有
+  tombstone 可寫，但 Foundry 端可能留著那個 agent。用 `--failed-agent-name <agent-name>`（取代 `--agent-id`）：
+  preview 只讀，列出 Foundry agent 的版本與 session，以及它屬於哪個 onboarding；`retire` 要 `--confirm <agent-name>`，
+  用 `force=true` 刪掉它再讀回，不寫 Team 的 Table（不需要 `--request-id`／`--reason`）；除了 JSON 輸出，另記一行
+  `FA_RETIRE_FAILED_LEFTOVER agent_name=… request_id=… outcome=…`。只接受：每個版本的 metadata 都指向
+  同一個本 Team 的 onboarding、名稱正是那個 request ID 推出來的名稱、該 onboarding 是 `failed`；設定檔或 roster 裡任何
+  Agent 的名稱回 409 `TEAM_AGENT_CONFLICT`，其他不符回 409 `FAILED_ONBOARDING_MISMATCH`／`AGENT_ONBOARDING_NOT_FAILED`。
+  FA 只對 active 的版本指派角色，失敗的 onboarding 沒有角色指派要清。
+
+```powershell
+python -m shared_context.behavior_agent_retire preview --config <current-config> --failed-agent-name <fa-agent-...>
+python -m shared_context.behavior_agent_retire retire --config <current-config> --failed-agent-name <fa-agent-...> --confirm <fa-agent-...>
+```
+
+- 每次執行都是雲端寫入，需要該環境的批准（stage 照 ADR-0008）。退役不釋出 roster 名額，也不釋出顯示名稱。
 
 ## AVM and local infrastructure checks
 

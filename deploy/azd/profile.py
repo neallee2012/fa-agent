@@ -110,14 +110,26 @@ def build(values: Mapping[str, str], *, require_runtime: bool = True,
     if api_environment.get("FA_TEAM_MCP_ENABLED") == "1":
         api_environment["FA_TEAM_MCP_PROJECT_RESOURCE_ID"] = project_id
     api_environment["FA_REALTIME_ENDPOINT"] = realtime
+    # ADR-0009 phase 5: only the Bicep output of the opt-in dedicated snapshot account (empty when not deployed).
+    if values.get("FA_UPGRADE_SNAPSHOT_CONTAINER_URL"):
+        api_environment["FA_UPGRADE_SNAPSHOT_CONTAINER_URL"] = values["FA_UPGRADE_SNAPSHOT_CONTAINER_URL"]
     console_client = values.get("FA_CONSOLE_APP_ID")
     if console_client:
         api_environment["FA_REMOTE_CONSOLE_CLIENT_ID"] = console_client
     elif require_runtime:
         raise SystemExit("FA_CONSOLE_APP_ID is missing; the postprovision hook registers the Portal app")
-    if _flag(values, "FA_AGENT_ONBOARDING"):
+    # The Bicep output, not FA_ENABLE_AGENT_ONBOARDING: the settings follow the delegation provision really created.
+    # A missing output means off: without it nothing proves provision created the delegation, and the settings alone
+    # would make "+" fail on a missing role-assignment permission.
+    if "FA_AGENT_ONBOARDING" not in values:
+        print("FA: warning: the Bicep output FA_AGENT_ONBOARDING is missing, so \"+\" onboarding settings are left out; "
+              "re-run `azd provision`.", file=sys.stderr)
+    if _flag(values, "FA_AGENT_ONBOARDING", "false"):
         api_environment["FA_ONBOARDING_ENDPOINT_PROTOCOLS"] = "true"
         api_environment["FA_ONBOARDING_ROLE_SCOPE"] = project_id
+    if _flag(values, "FA_NATIVE_2DI"):
+        # ADR-0009 2d-i (src README#native-2di-switch): ci_deploy derives the assistants' v2 declaration from this.
+        api_environment["FA_NATIVE_SESSION_GUARD_ENFORCE"] = "1"
     if _flag(values, "FA_ENABLE_WEBIQ"):
         api_environment["FA_CAPABILITY_TOOLBOX_ENTRIES"] = "WebIQ"
     memory = _flag(values, "FA_ENABLE_MEMORY", "true")

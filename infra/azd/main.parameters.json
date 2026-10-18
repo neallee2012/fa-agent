@@ -27,10 +27,13 @@
       "value": "${FA_API_SUBNET_NAT_EGRESS=false}"
     },
     "enableAgentOnboarding": {
-      "value": "${FA_ENABLE_AGENT_ONBOARDING=false}"
+      "value": "${FA_ENABLE_AGENT_ONBOARDING=true}"
     },
     "enableTeamMcpConnections": {
       "value": "${FA_ENABLE_TEAM_MCP_CONNECTIONS=true}"
+    },
+    "deployUpgradeSnapshots": {
+      "value": "${FA_DEPLOY_UPGRADE_SNAPSHOTS=false}"
     }
   }
 }

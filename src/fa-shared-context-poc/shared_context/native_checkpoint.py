@@ -64,13 +64,15 @@ def _unconfirmed():
     return (_storage().FoundryStorageError, AzureError, OSError)
 
 
-async def open_durable_store(name, *, create, credential=None, endpoint=None):
-    """An open store whose items never expire. ``create=False`` only opens an existing store (404 when missing)."""
+async def open_durable_store(name, *, create, credential=None, endpoint=None, item_ttl_seconds=-1):
+    """An open store whose items never expire (or, when given, expire after exactly ``item_ttl_seconds``).
+    ``create=False`` only opens an existing store (404 when missing)."""
     storage = _storage()
     store = None
     try:
         if create:
-            store = await storage.FoundryStateStore.get_or_create(name, credential, endpoint, item_ttl_seconds=-1)
+            store = await storage.FoundryStateStore.get_or_create(
+                name, credential, endpoint, item_ttl_seconds=item_ttl_seconds)
         else:
             store = storage.FoundryStateStore(name, credential, endpoint)
         ttl = (await store.get()).item_ttl_seconds
@@ -83,9 +85,10 @@ async def open_durable_store(name, *, create, credential=None, endpoint=None):
     except asyncio.CancelledError:
         await _close(store)
         raise
-    if ttl != -1:
+    if ttl != item_ttl_seconds:
         await _close(store)
-        raise Problem(409, "NATIVE_STATE_STORE_TTL", "the State store would expire its records; use a new store name")
+        raise Problem(409, "NATIVE_STATE_STORE_TTL", "the State store would expire its records; use a new store name"
+                      if item_ttl_seconds == -1 else "the State store TTL differs from its fixed one; use a new store name")
     return store
 
 

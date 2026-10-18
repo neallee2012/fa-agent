@@ -17,7 +17,7 @@ FILES_ERRORS = frozenset({
     "NATIVE_FILES_UNSUPPORTED", "NATIVE_FILES_UNSAFE", "NATIVE_FILES_LIMIT",
     "NATIVE_FILES_SOURCE_CHANGED", "NATIVE_FILES_CONFLICT", "NATIVE_FILES_UNKNOWN",
     "NATIVE_FILES_UNAVAILABLE", "NATIVE_FILES_ACCESS_DENIED",
-    "NATIVE_FILES_SOURCE_UNAVAILABLE",
+    "NATIVE_FILES_SOURCE_UNAVAILABLE", "NATIVE_FILES_TIMEOUT",
 })
 AgentVersion = Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")]
 
@@ -30,6 +30,20 @@ def relative_path(value: str) -> str:
     if path.is_absolute() or str(path) != value or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError("workspace paths cannot be absolute, aliases or traversals")
     return value
+
+
+def check_tree(entries) -> None:
+    """Unique sorted paths, every parent listed, and the total byte bound; the manifest byte bound is the caller's."""
+    paths = [entry.path for entry in entries]
+    if paths != sorted(set(paths)):
+        raise ValueError("workspace entries must be unique and sorted")
+    directories = {entry.path for entry in entries if entry.kind == "directory"}
+    for entry in entries:
+        parent = str(PurePosixPath(entry.path).parent)
+        if parent != "." and parent not in directories:
+            raise ValueError("every parent directory must be in the manifest")
+    if sum(entry.byte_length for entry in entries) > MAX_TOTAL_BYTES:
+        raise ValueError("the complete workspace exceeds the byte bound")
 
 
 class NativeFileEntry(WireModel):
@@ -87,16 +101,7 @@ class NativeFilesManifest(NativeFilesScope):
 
     @model_validator(mode="after")
     def bounded_tree(self):
-        paths = [entry.path for entry in self.entries]
-        if paths != sorted(set(paths)):
-            raise ValueError("workspace entries must be unique and sorted")
-        directories = {entry.path for entry in self.entries if entry.kind == "directory"}
-        for entry in self.entries:
-            parent = str(PurePosixPath(entry.path).parent)
-            if parent != "." and parent not in directories:
-                raise ValueError("every parent directory must be in the manifest")
-        if sum(entry.byte_length for entry in self.entries) > MAX_TOTAL_BYTES:
-            raise ValueError("the complete workspace exceeds the byte bound")
+        check_tree(self.entries)
         if len(self.encoded()) > MAX_MANIFEST_BYTES:
             raise ValueError("the complete manifest exceeds its byte bound")
         return self

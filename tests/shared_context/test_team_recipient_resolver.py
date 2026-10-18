@@ -104,7 +104,8 @@ def test_one_recipient_is_checked_with_its_own_reads_however_large_the_team(team
     assert {registered, *added} <= {agent_id for agent_id, _name in listed}
     del calls[:]
     assert relay._recipient(sender, registered) == scope
-    assert len(calls) == small <= 5, "a 7-Agent Team costs one /send the same reads as a 2-Agent Team"
+    # 6: the recipient's own rows, including its tombstone read (resolve_agent_scope).
+    assert len(calls) == small <= 6, "a 7-Agent Team costs one /send the same reads as a 2-Agent Team"
     del calls[:]
     team_recipient_ids(store, config, sender_oid=a.agent_oid, team_id=team)
     assert len(calls) > 2 * small, "the full directory still reads every Agent"

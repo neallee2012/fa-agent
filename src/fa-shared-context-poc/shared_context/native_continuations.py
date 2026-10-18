@@ -13,6 +13,7 @@ from .native_continuation_wire import (
     CONTINUATION_STOP_STATUS, MAX_AUTOMATIC_CONTINUATIONS, NativeContinuation, NativeContinuationView,
     NativeContinuationPage, NativeContinuationQuery,
 )
+from .native_responses_wire import channel
 
 log = logging.getLogger(__name__)
 
@@ -449,7 +450,8 @@ async def check_submission(runtime, request):
             or (original.submit_digest, source.value.run_token) != (
                 intent.source_submit_digest, intent.source_run_token)
             or request.command != expected_command or request.source != original.source
-            or request.state_profile != original.state_profile):
+            # ADR-0009 §3: the API copies the conversation's label, which a v1 root in an H2d conversation lacks.
+            or channel(request.state_profile) != channel(original.state_profile)):
         raise Problem(409, "NATIVE_CONTINUATION_CONFLICT", "the continuation cannot rewrite or replace original material")
     try:
         existing = await runtime.read(view.request_id)

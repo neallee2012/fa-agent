@@ -14,9 +14,12 @@ from .adapter import ConsoleError, PullAdapter, parse_config, require, sha, stri
 from .instructions import InstructionConnection
 from .standing import StandingConsoleConfig
 
+DIRECTORY_TTL_SECONDS = 60
+
 MESSAGES = {
     "AGENT_SELECTION_REQUIRED": "請先選擇服務目錄中的助理；不會改送到預設助理。",
     "AGENT_NOT_AVAILABLE": "這位助理目前不可用；原工作與草稿保留，不會改送其他助理。",
+    "AGENT_RETIRED": "這位助理已退役；訊息沒有送出，也不會改送其他助理。",
     "AGENT_DIRECTORY_UNAVAILABLE": "目前無法取得助理目錄；沒有使用舊目錄放行或改送預設助理。",
     "AGENT_DIRECTORY_INVALID": "助理目錄的身份或路由無法核對；沒有切換助理。",
     "AGENT_DEFAULT_MISMATCH": "服務的預設助理與原工作台配置不符；沒有重新歸屬舊紀錄。",
@@ -125,6 +128,7 @@ class AgentConsoles:
         self.consoles = {connections.default_agent_id: console}
         self.loaded, self.failures = {}, {}
         self.directory = None
+        self.directory_read_at = None
         self.error = "AGENT_DIRECTORY_UNAVAILABLE"
         self.lock = RLock()
         self.reader = PullAdapter(console.config, console.backend)
@@ -174,13 +178,19 @@ class AgentConsoles:
                 raise ConsoleError("AGENT_CONFIGURATION_INVALID") from None
 
     def refresh_directory(self):
-        with self.lock:
-            self.error = "AGENT_DIRECTORY_UNAVAILABLE"
+        # The HTTP read runs outside the lock so a slow directory never stalls resolve() or view(); only the checked
+        # result is swapped in under it.
+        try:
             token = self.default.vault.get()
             try:
                 raw, headers = self.reader.send("GET", "/work-policy/v1/agents", None, token, limit=16384)
             except ConsoleError as error:
-                raise ConsoleError(self.error, 503, error.upstream_status) from None
+                raise ConsoleError("AGENT_DIRECTORY_UNAVAILABLE", 503, error.upstream_status) from None
+        except ConsoleError:
+            with self.lock:
+                self.error = "AGENT_DIRECTORY_UNAVAILABLE"
+            raise
+        with self.lock:
             self.error = "AGENT_DIRECTORY_INVALID"
             try:
                 strict_json(raw)
@@ -193,6 +203,7 @@ class AgentConsoles:
                 self.error = "AGENT_DEFAULT_MISMATCH"
                 raise ConsoleError(self.error)
             self.directory, self.error = value, None
+            self.directory_read_at = self.default.clock().timestamp()
             self.loaded, self.failures = {}, {}
             for entry in value.agents:
                 if entry.state != "ready":
@@ -249,7 +260,19 @@ class AgentConsoles:
         return {**value, **self.view(), **self.default.authentication(), "selected_agent_id": identity}
 
     def bootstrap(self, value=None):
-        value = self.default.state() if value is None else value
+        if value is None:
+            # Page load: a directory read more than a minute ago is read again, so an Agent retired or added
+            # meanwhile shows without pressing 「更新助理目錄」. A failed read shows as the directory error.
+            with self.lock:
+                stale = (self.directory_read_at is None
+                         or self.default.clock().timestamp() - self.directory_read_at > DIRECTORY_TTL_SECONDS)
+                due = stale and self.default.authentication()["authentication"] == "AVAILABLE"
+            if due:
+                try:
+                    self.refresh_directory()
+                except ConsoleError:
+                    pass
+            value = self.default.state()
         return self.decorate({**value, "tasks": [], "composer": None, "automatic_polling": False,
             "template_tools_available": False, "template_selections": [], "template_selection_error": None,
             "routines_available": False}, None)
@@ -260,6 +283,13 @@ class AgentConsoles:
             result = self.default.authenticate(automatic=automatic, load_models=False)
             for console in self.consoles.values():
                 console.vault = self.default.vault
-            if not automatic or self.default.vault is not prior:
+            refresh = not automatic or self.default.vault is not prior
+        if refresh:
+            try:
                 self.refresh_directory()
-            return {**result, **self.view()} if automatic else self.bootstrap(result)
+            except ConsoleError:
+                # A silent refresh renewed the sign-in; a failed directory read shows as the directory error (as
+                # on page load), never as an error the page could read as an expired sign-in.
+                if not automatic:
+                    raise
+        return {**result, **self.view()} if automatic else self.bootstrap(result)

@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import sqlite3
+import sys
 import tarfile
 import threading
 from contextlib import closing
@@ -135,6 +136,7 @@ class LeasedArchive:
         self.snapshots: dict[str, bytes] = {}
         self.lease = None
         self.lost = False
+        self.warned = False
         self._stop = threading.Event()
 
     def start(self, *, renew=True):
@@ -205,7 +207,16 @@ class LeasedArchive:
             require(not self.lost, "REMOTE_STATE_UNAVAILABLE", 503)
             try:
                 snapshots = {**self.snapshots, name: read(target)}
-                self.blob.upload_blob(pack(snapshots), overwrite=True, lease=self.lease)
+                raw = pack(snapshots)
+                # Restore refuses an archive over MAX_ARCHIVE_BYTES, so one is never written. The lease is still ours:
+                # this is a local refusal (reads keep working), not a takeover, so the replica is not stopped.
+                require(len(raw) <= MAX_ARCHIVE_BYTES, "REMOTE_STATE_FULL", 503)
+                if len(raw) > MAX_ARCHIVE_BYTES // 2 and not self.warned:
+                    self.warned = True
+                    print(f"REMOTE_STATE_NEAR_LIMIT: archive {len(raw)} of {MAX_ARCHIVE_BYTES} bytes", file=sys.stderr)
+                self.blob.upload_blob(raw, overwrite=True, lease=self.lease)
+            except ConsoleError:
+                raise
             except Exception:
                 self._lose()
                 raise ConsoleError("REMOTE_STATE_UNAVAILABLE", 503) from None

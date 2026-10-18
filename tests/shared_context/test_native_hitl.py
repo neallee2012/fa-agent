@@ -26,8 +26,8 @@ from shared_context.native_hitl import (
 from shared_context.native_hitl_api import ENABLED_ENV, PREFIX, TTL_ENV, install_native_hitl_routes
 from shared_context.native_hitl_wire import INTERACTIVE_TTL_ENV, hitl_settings
 from shared_context.native_hitl_wire import (
-    NativeAttentionItem, NativeHitlAction, NativeHitlCall, NativeHitlClose, NativeHitlDecision,
-    NativeHitlPendingCreate, NativeHitlReadback, NativeHitlReview, NativeHitlRuleChange, NativeHitlRuleInput,
+    NativeAttentionItem, NativeHitlAction, NativeHitlCall, NativeHitlClose, NativeHitlDecision, NativeHitlEnd,
+    NativeHitlTurn, NativeHitlPendingCreate, NativeHitlReadback, NativeHitlReview, NativeHitlRuleChange, NativeHitlRuleInput,
 )
 from shared_context.records import Record
 from shared_context.team_data_relay import TeamDataRelay, install_team_data_routes
@@ -468,6 +468,51 @@ def test_later_explicit_decision_never_backfills_an_older_unknown_command(hitl, 
     error(post(c, "/decisions/reconcile", unknown), 503, "BEHAVIOR_COMMIT_UNKNOWN")
     error(post(c, "/decisions", unknown), 503, "BEHAVIOR_COMMIT_UNKNOWN")
     assert read(c, pending["pending_id"]).json()["decision"] == newer.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("after", [False, True])
+def test_a_lost_end_or_close_apply_reruns_once_under_its_id_and_keeps_the_owner_decision(hitl, monkeypatch, after):
+    c = hitl
+    _, decided = create_pending(c)
+    chosen = decision(c, decided)
+    assert post(c, "/decisions", chosen).status_code == 200
+    _, open_ = create_pending(c, call_id="tool-two", request_id="pending-two")
+    close = NativeHitlClose(request_id="close-two", pending_id=open_["pending_id"],
+                            pending_digest=open_["pending_digest"], status="interrupted")
+    end = NativeHitlEnd(request_id="end-one", turn=NativeHitlTurn(
+        agent_id="native-a", conversation_id="cid-one", request_id="rid-one"))
+    for path, command, field, value in (
+            ("/observations", close, "status", "interrupted"), ("/end", end, "closed", True)):
+        fail_apply(c, monkeypatch, stage=2, after=after)  # the intent commits; its apply is lost (or its ACK is)
+        error(post(c, path, command, c.agent), 503, "BEHAVIOR_COMMIT_UNKNOWN")
+        before = len(c.table.submissions)
+        for _ in range(2):
+            response = post(c, path, command, c.agent)
+            assert response.status_code == 200 and response.json()["result"][field] == value, response.text
+        assert len(c.table.submissions) == before + (0 if after else 1)
+    view = read(c, decided["pending_id"]).json()
+    assert view["status"] == "allow" and view["decision"] == chosen.model_dump(mode="json") and view["turn_closed"]
+    assert read(c, open_["pending_id"]).json()["status"] == "interrupted"
+
+
+@pytest.mark.parametrize("choice", ["deny", "allow_once"])
+def test_a_rerun_close_never_replaces_a_decision_recorded_after_its_lost_apply(hitl, monkeypatch, choice):
+    c = hitl
+    _, pending = create_pending(c)
+    close = NativeHitlClose(request_id="close-lost", pending_id=pending["pending_id"],
+                            pending_digest=pending["pending_digest"], status="interrupted")
+    fail_apply(c, monkeypatch, stage=2, after=False)
+    error(post(c, "/observations", close, c.agent), 503, "BEHAVIOR_COMMIT_UNKNOWN")
+    chosen = decision(c, pending, choice=choice)
+    assert post(c, "/decisions", chosen).status_code == 200
+    rerun = post(c, "/observations", close, c.agent)
+    if choice == "deny":
+        error(rerun, 409, "NATIVE_HITL_STATE_CONFLICT")
+    else:  # the ordinary Close rule closes an unrun allow, as finish_turn does; the decision record stays
+        assert rerun.status_code == 200 and rerun.json()["result"]["status"] == "interrupted", rerun.text
+    view = read(c, pending["pending_id"]).json()
+    assert view["status"] == ("deny" if choice == "deny" else "interrupted")
+    assert view["decision"] == chosen.model_dump(mode="json")
 
 
 def test_pending_and_rule_lost_ack_share_original_readback_contract(hitl, monkeypatch):

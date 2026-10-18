@@ -80,7 +80,7 @@ def _entry(case, agent_id):
     return next(entry for entry in public_agents(case.a, case.c.human).agents if entry.agent_id == agent_id)
 
 
-def test_seam_keeps_configured_agents_at_zero_reads_and_registered_agents_at_one(team_agent):
+def test_seam_keeps_configured_agents_at_zero_reads_and_registered_agents_at_two(team_agent):
     case = team_agent
     store, config = case.a.runtime.store, case.config
     reads = case.c.h.table.requests
@@ -88,7 +88,7 @@ def test_seam_keeps_configured_agents_at_zero_reads_and_registered_agents_at_one
     assert resolve_agent_scope(store, config, config.targets[1].agent_id) == config.agent_scope(config.targets[1].agent_id)
     assert len(reads) == before
     scope = resolve_agent_scope(store, config, case.target.agent_id)
-    assert len(reads) == before + 1
+    assert len(reads) == before + 2, "its target row, then its tombstone"
     assert (scope.target, scope.identity.oid, scope.identity.actor, scope.team_id, scope.legacy_keys) == (
         case.target, AGENT_OID, case.target.agent_id, config.identity.team_id, False)
     assert (scope.configuration_sha256, scope.authority_domain, scope.human_oid) == (

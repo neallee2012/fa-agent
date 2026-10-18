@@ -245,3 +245,39 @@ def test_connector_keys_are_cached_and_an_unknown_kid_forces_at_most_one_downloa
     now[0] += timedelta(seconds=301)
     fresh().verify(bearer(), activity())
     assert len(fetches) == 4, "the cached set expires after its TTL"
+
+
+def test_a_failed_refresh_after_the_ttl_keeps_the_last_keys_for_a_bounded_time():
+    jwk = jwt.algorithms.RSAAlgorithm.to_jwk(KEY.public_key(), as_dict=True)
+    jwk.update(kid="offline-key", use="sig", alg="RS256", endorsements=["msteams"])
+    fetches, down, now = [], [False], [NOW]
+
+    def provider(request):
+        fetches.append(now[0])
+        return httpx.Response(503) if down[0] else httpx.Response(200, json={"keys": [jwk]})
+
+    transport = httpx.MockTransport(provider)
+
+    def verify():
+        claims = jwt.decode(token(), options={"verify_signature": False})
+        claims.update(nbf=int((now[0] - timedelta(minutes=1)).timestamp()),
+                      exp=int((now[0] + timedelta(minutes=5)).timestamp()))
+        bearer = "Bearer " + jwt.encode(claims, KEY, algorithm="RS256", headers={"kid": "offline-key"})
+        return ConnectorIdentity(identity().settings, clock=lambda: now[0], jwks_transport=transport).verify(
+            bearer, activity())
+
+    verify()
+    down[0] = True
+    now[0] += timedelta(seconds=301)
+    for _ in range(5):
+        assert verify().principal.oid == HUMAN, "an outage after the TTL does not refuse every activity"
+    assert len(fetches) == 2, "one refresh attempt per retry window, not one per activity"
+    now[0] += timedelta(seconds=31)
+    verify()
+    assert len(fetches) == 3
+    now[0] = NOW + timedelta(hours=24, seconds=1)
+    with pytest.raises(Problem) as error:
+        verify()
+    assert error.value.body["error"]["code"] == "TEAMS_SERVICE_AUTH_DENIED", "the stale set is bounded"
+    down[0] = False
+    assert verify().principal.oid == HUMAN

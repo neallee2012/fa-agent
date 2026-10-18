@@ -36,6 +36,9 @@ param revisionSuffix string = ''
 @allowed([0, 1])
 param minReplicas int = 1
 
+@description('False on the first deployment of a new app: its sign-in config (module auth) exists only after the app, so until then the console is reachable only inside the environment. azd sets true in the second deployment.')
+param ingressExternal bool = true
+
 @description('Exact console configuration files (file name → content), mounted read-only at /config.')
 @secure()
 param configFiles object
@@ -167,7 +170,7 @@ module app 'br/public:avm/res/app/container-app:0.23.0' = {
       userAssignedResourceIds: [identity.outputs.resourceId]
     }
     registries: [{server: registry.properties.loginServer, identity: identity.outputs.resourceId}]
-    ingressExternal: true
+    ingressExternal: ingressExternal
     ingressAllowInsecure: false
     ingressTransport: 'http'
     ingressTargetPort: 8080

@@ -450,9 +450,19 @@ def test_the_factory_shares_after_private_memory_and_a_failure_never_blocks_the_
 
     async def relayed(self, receipt, result):
         order.append("relay")
+
+    async def settled(*_args):
+        return None
     monkeypatch.setattr(NativePrivateMemory, "completed", remembered)
     monkeypatch.setattr(team.NativeTeamMemory, "_share", shared)
     monkeypatch.setattr(NativeAgentRelayClient, "completed", relayed)
+    monkeypatch.setattr(native_sdk.NativeUsageReporter, "__call__", settled)
+    monkeypatch.setattr(native_sdk.NativeSdkExecutor, "notify_terminal", settled)
+    receipt = SimpleNamespace(status="completed", result=None, request_id="OFFLINE-rid")
+
+    async def finished(current):
+        await current.on_terminal(receipt)  # the peer result goes out ahead of usage and memory
+        await current.on_completed(receipt, None)
     with monkeypatch.context() as environment:
         for name, value in {"FA_NATIVE_TURNS": "foundry-native-v1", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
                             "AGENTSERVER_TASKS_BACKEND": "hosted", "HOME": str(home),
@@ -464,8 +474,8 @@ def test_the_factory_shares_after_private_memory_and_a_failure_never_blocks_the_
         environment.delenv(team.TEAM_ENV)
         off = native_sdk.native_runtime_from_environment(hosted)
     assert isinstance(runtime.executor.team_memory, team.NativeTeamMemory)
-    asyncio.run(runtime.on_completed(SimpleNamespace(), None))
-    assert order == ["private-memory", "team-note", "relay"]
+    asyncio.run(finished(runtime))
+    assert order == ["relay", "private-memory", "team-note"]
     assert off.executor.team_memory is None
-    asyncio.run(off.on_completed(SimpleNamespace(), None))
-    assert order == ["private-memory", "team-note", "relay", "private-memory", "relay"]
+    asyncio.run(finished(off))
+    assert order == ["relay", "private-memory", "team-note", "relay", "private-memory"]

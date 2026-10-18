@@ -89,6 +89,8 @@ Neal 原話（2026-10-02 16:57）：
   - **2026-10-03 起改為「發布版本才部署」**。Neal 23:12 原文：「可否改成不要每一次merge to main都佈署stage，而是每一個milestone or version佈署一次」。
     - 發布方式：開一個小 PR，只改 `deploy/stage/release.json` 的 `version` 和 `milestone`。合併後，CI 部署當下 main 的完整內容。（2026-10-05 起由總協調在 dev 完整測試後開，PR 內附的內容見上面的發布順序。）
     - 其他 merge 都不會觸發部署。另外保留 `workflow_dispatch`，只能在 main 上手動觸發，同樣部署 main HEAD。
+    - 2026-10-16 起 deploy-staging 在 Azure 登入前核對：部署的 commit 必須是 release PR（改了 `deploy/stage/release.json`、帶第一道指紋）的合併 commit（手動觸發要填那個 PR）；main 在 release PR 之後又前進，就要開新的 release PR。見 [stage 部署說明](../../src/fa-shared-context-poc/README.md)「release 門檻」。
+    - 2026-10-16 記錄：「誰合併 release PR」目前沒有、也無法由系統強制。repo 是免費方案的 private repo，branch protection 與 rulesets 的 API 都回 403；repo 沒有 CODEOWNERS；agent 工作階段也用 `neallee2012` 合併，所以檢查 `mergedBy` 永遠會通過，門檻因此不加這項檢查。合併 release PR 由 Neal 決定，目前靠流程遵守。真正強制需要兩件事：agent 改用獨立的 GitHub App 身分合併，以及升級 Pro／Team 方案，在 `staging` environment 設必要審核人。
     - 不用 tag 觸發：federated credential 只信任 main 上的 `staging` environment，改用 tag 就得改雲端 IAM。
   - 範圍只限 stage 資源，包括每次部署的最小 smoke 模型費用。
   - ~~這項長期批准在 stage 資源與 CI 身分依上方「狀態」另外批准、建立之後才生效；建立前不自動部署。~~（2026-10-04 晚間起不再有長期批准，見上面 stage 的「2026-10-04 晚間起」那一條。）
@@ -148,7 +150,7 @@ Neal 原話（2026-10-02 16:57）：
 **不變的部分**
 - dev 的部署方式、資料與批准界線不變；本 ADR 不授權任何 dev 資源變更。
 - `deploy/shared-context/azure.yaml` 寫死 dev 的 endpoint 與 image，是歷史配置；stage 不直接沿用。
-- 同 build、換版接續（#369）、新 Agent 的角色與 endpoint 補設（#306）等部署規則，在 stage 同樣適用。#468 之後，stage 的角色與 endpoint 補設改由「＋」自動完成（見「6. stage 自助新增 Agent」）；dev 照舊手動。
+- 同 build、換版接續（#369）、新 Agent 的角色與 endpoint 補設（#306）等部署規則，在 stage 同樣適用。#468 之後，stage 的角色與 endpoint 補設改由「＋」自動完成（見「6. stage 自助新增 Agent」）；dev 照舊手動。（已被 2026-10-15 修訂取代：Neal 把 #468 延伸到 dev 和 azd 預設，見 [ADR-0006](0006-team-trust-boundary-grokbot-mode.md) 該段修訂。）
 
 **相關工作線**
 - stage project、資源與 CI/CD：「Stage 環境與 CI/CD」工作線（b281）。

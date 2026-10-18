@@ -20,6 +20,15 @@ _CHECK_READ_SECONDS = 5
 _CHECK_PAGE_KEYS = 100
 
 
+class _CutScan(WireModel):
+    """A ``NativeSessionCut`` scan that goes on across calls (ADR-0009 U5): the Agent ETag it started from (E0, kept
+    until the commit or the fence) and its totals so far, for the ``NATIVE_UPGRADE_CUT`` log (gate 7)."""
+    etag: Annotated[str, Field(min_length=1, max_length=256)]
+    calls: Annotated[int, Field(ge=1)]
+    scan_ms: Annotated[int, Field(ge=0)]
+    receipts: Annotated[int, Field(ge=0)]
+
+
 class _Following(WireModel):
     view: NativeEnvironmentView
     phase: Literal["draining", "files", "stopping", "confirming"] = "draining"
@@ -33,6 +42,8 @@ class _Following(WireModel):
     files: NativeFilesProgress | None = Field(default=None, exclude_if=lambda value: value is None)
     retarget_request_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
     waiting_request_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
+    # Only while a cut scans with no ``pending``: the source's H0 file stages read this record during a fence.
+    cut: _CutScan | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def partial_page(self):
@@ -55,6 +66,27 @@ class _Following(WireModel):
         elif self.view.files_manifest_sha256 is not None:
             raise ValueError("a file reference requires its original manifest")
         return self
+
+
+class _EnvironmentBefore(WireModel):
+    """``environment-before:<request ID>`` (immutable): the Agent's environment just before that request wrote
+    ``pending`` over it, so ``NativeSessionWithdraw`` restores it exactly (ADR-0009 lifecycle "pending 切換用法")."""
+    schema_version: Literal["fa-native-environment-before-v1"] = "fa-native-environment-before-v1"
+    hosted_session_id: Identifier
+    environment: NativeEnvironmentView | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+def before_key(request_id):
+    return "environment-before:" + request_id
+
+
+async def save_before(runtime, current, request_id):
+    """Right before ``pending`` replaces a ready (or no) environment. H0 reads only ``rid:`` keys here."""
+    from .native_turns import TURNS_STORE
+
+    async with runtime._store(TURNS_STORE) as store:
+        await runtime._immutable(store, before_key(request_id), _EnvironmentBefore(
+            hosted_session_id=current.hosted_session_id, environment=current.environment))
 
 
 class _Retarget(WireModel):
@@ -218,6 +250,9 @@ class _ScanProgress:
     terminal_unknowns: int = 0
     waiting_request_id: str | None = None
     conversation_heads: dict[str, int] = field(default_factory=dict)
+    # For the cut's log (ADR-0009 gate 7): "set" (only the open-RID set) or "full", and the receipts read.
+    mode: Literal["set", "full"] | None = None
+    receipts: int = 0
 
     @classmethod
     def from_record(cls, record):
@@ -295,6 +330,7 @@ async def _drain_pages(runtime, after, source_sid, task_id, *, responses=False, 
         from .native_open_rids import read as read_open
         open_set = await read_open(runtime)
         if open_set is not None and open_set.complete_for == source_sid:
+            progress.mode = "set"
             try:
                 async with asyncio.timeout(_SCAN_SECONDS):
                     return await _scan_open(runtime, open_set, source_sid, task_id, responses=responses,
@@ -302,6 +338,7 @@ async def _drain_pages(runtime, after, source_sid, task_id, *, responses=False, 
             except TimeoutError:
                 logging.getLogger(__name__).warning("FA_NATIVE_FOLLOW_SCAN_PENDING reason=read_deadline")
                 return "scan_pending", None, progress.responses
+    progress.mode = "full"
     try:
         # Omission checks stop between complete receipts; every constituent read has its own short deadline.
         deadline = monotonic() + _SCAN_SECONDS if require_complete else None
@@ -368,6 +405,8 @@ async def _scan_page(runtime, after, source_sid, task_id, *, responses=False, id
                 receipt_read = store.get_item(key.key)
                 item = (await _check_read(receipt_read, "receipt", progress=progress)
                         if require_complete else await receipt_read)
+                if progress is not None:
+                    progress.receipts += 1
                 original = runtime._check_rid(item, key.key[4:])
                 if _settled_open(original, settled):
                     # It stays open: keep it in the open-RID set, so a later follow reading only the set still sees it.
@@ -460,6 +499,7 @@ async def _scan_open(runtime, open_set, source_sid, task_id, *, responses, idle_
         for rid in sorted(open_set.rids):
             progress.request_id_prefix, progress.conversation_id_prefix = rid[:8], None
             item = await store.get_item("rid:" + rid)
+            progress.receipts += 1
             if item is None:
                 # Added while its receipt is being created: that admission still holds ``admitting``, which the caller
                 # checked before this scan, and a later mark changes the ETag the caller's next Agent CAS compares.
@@ -679,8 +719,8 @@ async def follow_session(runtime, command):
         source = existing if existing is not None else current.preparation
         if source is None:
             raise Problem(409, "NATIVE_ENVIRONMENT_UNAVAILABLE", "the Agent has no original prepared environment")
-        if int(runtime.identity.agent_version) <= int(source.hosted_agent_version):
-            raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "version following requires a newer concrete version")
+        # ADR-0009 4a/M5: the destination SID differs from the current one (checked above); its version is the one the
+        # API named (the expected-version header), so a fresh session of the same version may follow too.
         existing = NativeEnvironmentView(
             agent_id=runtime.identity.agent_id, request_id=command.request_id,
             previous_hosted_session_id=current.hosted_session_id,
@@ -724,6 +764,7 @@ async def follow_session(runtime, command):
                                     files_omission_basis=None, files_omission_reason=None)
                            if omitted is not None else existing)
         if current.following_supported and (current.environment is None or current.environment.state == "ready"):
+            await save_before(runtime, current, existing.request_id)
             await _save_agent(runtime, current, etag, _changed(current, environment=pending_binding))
         if not record.idle_only and not record.files_required and omitted is None:
             await runtime._settle_admission()
@@ -751,6 +792,8 @@ async def follow_session(runtime, command):
             await _progress(runtime, pending, record_etag, key=following_key)
             return pending.view
         # Preserve the original comparison through the final scan, including in-flight admission.
+        if current.environment is None or current.environment.state == "ready":
+            await save_before(runtime, current, existing.request_id)
         await _save_agent(runtime, current, etag, _changed(current, environment=pending_binding))
         need_files = record.files_required and omitted is None
         reason = "files_pending" if need_files else "source_stop_required"
@@ -780,6 +823,11 @@ async def follow_session(runtime, command):
         return _changed(existing, reason="source_active")
     current, etag = await runtime._agent_record()
     _source_matches(current, existing)
+    if (current.environment is None or current.environment.state != "pending"
+            or current.environment.request_id != existing.request_id):
+        # Withdrawn (``NativeSessionWithdraw``): the source took new work again; never commit over it. The commit's
+        # CAS below covers a withdraw after this read.
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original pending transition was withdrawn")
     if current.admitting is not None:
         return _changed(existing, reason="admission_pending")
     progress = (_ScanProgress.from_record(record) if record.phase == "confirming"

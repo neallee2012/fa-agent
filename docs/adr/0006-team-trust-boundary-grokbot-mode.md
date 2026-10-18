@@ -60,7 +60,8 @@ Grokbot 的做法（外部唯讀調查）：入口驗一次身分，之後整個
   - **用途**：stage 用「＋」新增 Agent 時，程式自動補上上面 #306 的兩個角色和 endpoint 協定，不必再由部署線手動補。Neal 同意「＋」自動觸發這兩類寫入。原因是官方 blueprint 不能繼承 Azure RBAC，新 Agent 一律有自己的身分（計畫見 #468）。
   - **剩餘風險**：stage API 身分被盜用時，對方可以把這兩個角色給 stage project 上**任何** service principal，不只 FA 的 Agent；但不能刪除既有指派，也碰不到 dev 或其他 project。這和 #306 是同一類風險。
   - **待辦**：風險與後續新方案記在 #469。方向包括：改由只做指派的獨立身分處理，等官方提供 Agent 預設權限後改用官方做法並移除這筆 IAM，以及指派前先確認目標是本 project 的 Agent 身分。
-  - dev 不在這次範圍內；dev 新增 Agent 的角色仍由部署線手動指派。
+  - dev 不在這次範圍內；dev 新增 Agent 的角色仍由部署線手動指派。（已被下方 2026-10-15 修訂取代：dev 也延伸，不再手動。）
+  - **修訂（Neal 2026-10-15）**：同一筆受限 RBAC Administrator 例外延伸到 dev，也延伸到 azd 新環境並預設開啟（`FA_ENABLE_AGENT_ONBOARDING` 預設 `true`，`infra/azd/main.parameters.json`）；範圍、條件與剩餘風險同上，各環境只限自己的 project。azd 環境可用 `azd env set FA_ENABLE_AGENT_ONBOARDING false` 關掉。#469 的風險追蹤不變。
 
 ### 2. 每個 Agent 一台 VM，取代每個對話一台
 
@@ -319,6 +320,32 @@ CAP-06 PR1～PR5 仍由 1b60 負責，依本 ADR 調整（「團隊管理員」�
 - **Foundry Routines 的反例（dev 探針 P1，10-07 17:18）**：用 API 的 app token 建立 `authorization.identity="creator"` 的 routine，服務回 `creator' requires a human user principal … authenticated with a service principal (app) token`。官方文件寫 creator 可以是「人或服務主體」，實際只收真人委派 token。改用 agent 身分時，Entra 隔離讓它叫不到 API 建立的那台 VM；不帶 session 又會每次開新 VM，違反第 2 節。證據與連結見 [Shared Context README](../../src/fa-shared-context-poc/README.md#native-routine-api-clock)。
 - **信任邊界不變**：時鐘只能送 owner 已批准、目前仍啟用的定義的到期 occurrence；不能自填內容、RID 或授權，也沒有 HTTP 入口。去重沿用固定 RID＋CAS 意圖＋Hosted `rid:<RID>`，重啟或新舊 revision 重疊都不會重送。
 - **必須常駐**：時鐘需要 API `minReplicas=1`。`behavior-api.bicep` 預設是 0，只有 stage 參數檔設 1；dev 目前是 1。若 API 縮到 0 或改成多副本，要重新評估本節。縮到 0 時排程會延後、不會重送；多副本時去重仍成立，只是每個副本各讀一次。
+
+<a id="agent-retirement"></a>
+## 補充：退役 Agent 是 tombstone，不是刪除（2026-10-15）
+
+- **起因**：2026-10-15 經 Neal 批准，dev 一位「＋」測試 Agent（`fa-agent-cc96…`）在 Foundry 端以 `force=true` 刪除
+  （連同 85 個版本、56 個 session），兩筆角色指派也移除；API 端仍保留它的 roster、註冊列與綁定列，工作台列出一位載入失敗的助理。
+- **決定**：退役是在 Team 資料**新增**一筆 create-only 的 `team_agent_retired` 列（誰、何時、原因、request ID），
+  並在同一筆 CAS 停用這位 Agent 的身分索引（沿用 owner 停用的既有欄位）。第 3 節「不提供刪除」不變：roster、註冊列、
+  onboarding、綁定列、routine 定義、對話與回條都不刪、不改寫；roster 名額與顯示名稱也不釋出。tombstone 只由原組織
+  operator 經 operator CLI 寫入（與停用 owner 同一權限），Agent、模型或工作台都寫不了。
+  （2026-10-16 修訂，總協調依 Neal「修 1-20」決定：onboarding 卡在 `registered` 的 Agent，退役 CAS 可一併把它從 `pending`
+  名單拿掉，還回該名額；roster 名額仍不釋出。已經有 tombstone、onboarding 停在 `admitted`／`creating`／`registered` 的
+  Agent（舊 CLI 退役），由獨立的 `team-agent-retire-release` CAS 只把它從 `pending` 拿掉，冪等、限本 Team；沒有 tombstone
+  的 onboarding 永遠不從 `pending` 拿掉。）
+- **效果**：所有即時路徑都以 tombstone 為準：工作台目錄與 API 啟動不列、不建 peer；不 invoke、不 follow、不 sync 版本；
+  routine 到期不觸發（只記 log，定義保留）；部署相容性閘門不因它的綁定列擋部署；送給它的訊息回 410 `AGENT_RETIRED`。
+  歷史讀取（startup inventory）照常解析它的原紀錄，並核對 tombstone 與它的原回條。
+- **「不拒絕」的範圍**：ADR-0009 的 M2「不拒絕主人的訊息」針對版本不相容或來源碰不到——助理還在，訊息可以在請求內換到新
+  session 送達。退役的助理沒有可以換去的環境，照實回「這位助理已退役，訊息沒有送出」才是誠實的結果；若照 M2 回
+  `server_following` 讓工作台同 RID 自動重送，會變成永遠不會成功的重試。所以 M2 不適用於退役。
+- **Foundry 端清除另外決定**：刪 Foundry agent（`force=true`）與它身分的角色指派是 operator CLI 的選用步驟，先唯讀預覽、
+  再明確確認，每次都需要該環境的批准；API 受控身分依第 1 節的 ABAC 條件仍不能刪除角色指派，由有權限的真人依 CLI 列出的
+  確切指派 ID 刪除後重跑讀回。只有 operator CLI 能退役、名額與顯示名稱不釋出、退役同時停用身分、角色指派由真人刪，
+  四項由總協調 2026-10-15 確認。（2026-10-16 修訂，總協調依 Neal「修 1-20」決定：onboarding **失敗**留下的 Foundry agent
+  也由 FA 刪除——只限它自己的那個、operator 預覽後確認，不寫 Team 資料。）做法見
+  [deploy README](../../deploy/README.md#retire-agent)。
 
 ## 官方依據
 

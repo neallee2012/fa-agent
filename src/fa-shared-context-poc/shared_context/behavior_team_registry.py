@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import Field, TypeAdapter, model_validator
+from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
 
 from .behavior_agent_message_wire import MAX_TEAM_AGENTS
 from .behavior_foundry import FoundryTarget
@@ -81,6 +81,23 @@ class TeamAgents(_Model):
         return self
 
 
+class TeamAgentRetired(_Model):
+    """Append-only tombstone of one registered Agent (ADR-0006 amendment): its rows stay, it is no longer served.
+
+    Create-only, never replaced or deleted. Written with the Agent identity's deactivation in one CAS."""
+
+    kind: Literal["team_agent_retired"] = "team_agent_retired"
+    tenant_id: Oid
+    team_id: Identifier
+    agent_id: Identifier
+    operator_oid: Oid
+    request_id: Identifier
+    retired_at: AwareDatetime
+    reason: Annotated[str, Field(min_length=1, max_length=200, pattern=r"^[^\x00-\x1f\x7f]+$")]
+    # Set only when the Agent's onboarding was stuck in 'registered': the same CAS dropped it from the pending list.
+    onboarding_request_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
 def identity_key(tenant_id, oid):
     return control_key("team-identity", tenant_id, oid)
 
@@ -95,6 +112,43 @@ def agent_key(tenant_id, agent_id):
 
 def roster_key(tenant_id, team_id):
     return control_key("team-agents", tenant_id, team_id)
+
+
+def retired_key(tenant_id, agent_id):
+    return control_key("team-agent-retired", tenant_id, agent_id)
+
+
+def _retire_request(value, agent_oid):
+    """Writes the first two keys, plus the pending list (the last key) when it releases a stuck onboarding."""
+    reads = (retired_key(value.tenant_id, value.agent_id), identity_key(value.tenant_id, agent_oid),
+             agent_key(value.tenant_id, value.agent_id), roster_key(value.tenant_id, value.team_id))
+    if value.onboarding_request_id is not None:
+        from .behavior_agent_onboarding import onboarding_key, pending_key
+        reads += (onboarding_key(value.tenant_id, value.team_id, value.onboarding_request_id),
+                  pending_key(value.tenant_id, value.team_id))
+    return ControlRequest(
+        request_id=control_key("team-agent-retire", value.tenant_id, value.request_id),
+        request_digest=digest(value.model_dump(mode="json")), read_set=reads,
+    )
+
+
+def _release_request(retired, onboarding_request_id):
+    """Drops a stuck onboarding from the pending list (the last key) when its tombstone was written without it."""
+    from .behavior_agent_onboarding import onboarding_key, pending_key
+    t, team = retired.tenant_id, retired.team_id
+    return ControlRequest(
+        request_id=control_key("team-agent-retire-release", t, team, onboarding_request_id),
+        request_digest=digest(["team-agent-retire-release", retired.model_dump(mode="json"), onboarding_request_id]),
+        read_set=(retired_key(t, retired.agent_id), onboarding_key(t, team, onboarding_request_id), pending_key(t, team)),
+    )
+
+
+def _release_result(retired, onboarding_request_id):
+    return {"agent_id": retired.agent_id, "released_onboarding_request_id": onboarding_request_id}
+
+
+def _retire_result(value):
+    return {"team_id": value.team_id, "agent_id": value.agent_id, "retired": True}
 
 
 def _agent_request(value):
@@ -293,6 +347,98 @@ class TeamRegistry:
 
         return self.store.transact(request, changes)
 
+    def retire_agent(self, principal, request_id, agent_id, reason, *, now,
+                     onboarding=None) -> tuple[TeamAgentRetired, bool]:
+        """The operator retires one registered Agent: (tombstone, created). Nothing is deleted or reassigned.
+
+        ``onboarding``: the Agent's onboarding row stuck in 'registered' (under an existing tombstone also one left
+        admitted or creating); the same CAS drops its request ID from the pending list (its roster slot stays). Reads first, so a rerun (same or new request ID, or after a lost ack)
+        returns the original tombstone; one written without the onboarding still drops it from the list."""
+        self.require_operator(principal, write=True)
+        try:
+            _IDENTIFIER.validate_python(agent_id, strict=True)
+        except ValueError:
+            raise Problem(422, "TEAM_OPERATOR_COMMAND", "one registered Agent ID is required") from None
+        tkey = retired_key(self.tenant_id, agent_id)
+        existing = self.store.read_record(tkey)
+        row = self.store.read_record(agent_key(self.tenant_id, agent_id))
+        if row is None:
+            raise Problem(404, "TEAM_AGENT_NOT_FOUND", "only a registered (non-configured) Agent can be retired")
+        agent = _parse(row.payload["data"], TeamAgent)
+        # A new tombstone releases only one stuck in 'registered'; an existing one also one left admitted or creating.
+        releasable = {"registered"} if existing is None else {"admitted", "creating", "registered"}
+        if onboarding is not None and (
+                onboarding.request_id != agent.request_id or onboarding.state not in releasable
+                or onboarding.target is not None and onboarding.target.agent_id != agent_id):
+            raise Problem(409, "TEAM_AGENT_CONFLICT", "only the Agent's own unfinished onboarding is released")
+        if existing is not None:
+            retired = _parse(existing.payload["data"], TeamAgentRetired)
+            if onboarding is not None and retired.onboarding_request_id is None:
+                self._release_pending(retired, onboarding)
+            return retired, False
+        try:
+            value = TeamAgentRetired(tenant_id=self.tenant_id, team_id=agent.team_id, agent_id=agent_id,
+                                     operator_oid=principal.oid, request_id=request_id, retired_at=now,
+                                     reason=reason,
+                                     onboarding_request_id=None if onboarding is None else onboarding.request_id)
+        except ValueError:
+            raise Problem(422, "TEAM_OPERATOR_COMMAND", "retain one valid request ID and a short reason") from None
+        request = _retire_request(value, agent.target.agent_oid)
+        _, ikey, akey, rkey = request.read_set[:4]
+
+        def changes(rows):
+            if rows[tkey] is not None:
+                raise Problem(409, "TEAM_AGENT_RETIRED", "the Agent is already retired")
+            current, identity = _row(rows, akey, TeamAgent), _row(rows, ikey, IdentityRegistration)
+            roster = _row(rows, rkey, TeamAgents)
+            if (current != agent or identity != _agent_identity(agent) or agent_id not in roster.agent_ids
+                    or roster.tenant_id != self.tenant_id or roster.team_id != agent.team_id):
+                raise Problem(409, "TEAM_AGENT_CONFLICT", "the original Agent registration differs")
+            writes = [_write(tkey, value, "create"),
+                      _write(ikey, _updated(identity, active=False, deactivation_id=request_id), "replace")]
+            if onboarding is not None:
+                from .behavior_agent_onboarding import TeamAgentOnboarding, TeamAgentPending
+                okey, pkey = request.read_set[4:]
+                pending = _row(rows, pkey, TeamAgentPending)
+                if _row(rows, okey, TeamAgentOnboarding) != onboarding or onboarding.request_id not in pending.request_ids:
+                    # e.g. it reached 'ready' meanwhile: a rerun retires it the ordinary way.
+                    raise Problem(409, "TEAM_AGENT_CONFLICT", "the onboarding changed; read the preview again")
+                writes.append(_write(pkey, pending.model_copy(update={"request_ids": tuple(
+                    rid for rid in pending.request_ids if rid != onboarding.request_id)}), "replace"))
+            return ControlChanges(writes=tuple(writes), result=_retire_result(value))
+
+        try:
+            self.store.transact(request, changes)
+        except Problem as error:
+            if error.body["error"]["code"] not in {"TEAM_AGENT_RETIRED", "BEHAVIOR_CONFLICT"}:
+                raise
+            # A concurrent operator may have retired it first: return that original tombstone, else the conflict.
+            existing = self.store.read_record(tkey)
+            if existing is None:
+                raise
+            return _parse(existing.payload["data"], TeamAgentRetired), False
+        return value, True
+
+    def _release_pending(self, retired, onboarding):
+        """Idempotent: drop the stuck onboarding from the pending list in its own CAS; a rerun finds it gone."""
+        from .behavior_agent_onboarding import TeamAgentOnboarding, TeamAgentPending
+        request = _release_request(retired, onboarding.request_id)
+        tkey, okey, pkey = request.read_set
+        if onboarding.request_id not in _parse(self.store.read_record(pkey).payload["data"],
+                                               TeamAgentPending).request_ids:
+            return
+
+        def changes(rows):
+            pending = _row(rows, pkey, TeamAgentPending)
+            if (_row(rows, tkey, TeamAgentRetired) != retired or _row(rows, okey, TeamAgentOnboarding) != onboarding
+                    or onboarding.request_id not in pending.request_ids):
+                raise Problem(409, "TEAM_AGENT_CONFLICT", "the onboarding changed; read the preview again")
+            return ControlChanges(writes=(_write(pkey, pending.model_copy(update={"request_ids": tuple(
+                rid for rid in pending.request_ids if rid != onboarding.request_id)}), "replace"),),
+                result=_release_result(retired, onboarding.request_id))
+
+        self.store.transact(request, changes)
+
 
 def validate_team_registry_history(inventory, config):
     """Recognize only exact owner/index pairs and their original create/deactivate receipts."""
@@ -353,7 +499,11 @@ def _agent_history(view, inventory, config, classified):
                          and owner.team_id == value.team_id)):
             raise Problem(409, "TEAM_REGISTRY_INVALID", "a retained Agent registration differs from its original scope")
         ikey, rkey = identity_key(value.tenant_id, oid), roster_key(value.tenant_id, value.team_id)
-        if view.row(ikey, IdentityRegistration) != _agent_identity(value) or ikey in classified:
+        tkey, original = retired_key(value.tenant_id, value.agent_id), _agent_identity(value)
+        current = view.row(ikey, IdentityRegistration)
+        retired = view.row(tkey, TeamAgentRetired) if tkey in inventory.rows else None
+        if (current.model_copy(update={"active": True, "deactivation_id": None}) != original
+                or current.active != (retired is None) or ikey in classified):
             raise Problem(409, "TEAM_REGISTRY_INVALID", "retained Agent identity/target pairs must be one-to-one")
         roster = rosters.get(rkey) or view.row(rkey, TeamAgents)
         if (rkey != roster_key(roster.tenant_id, roster.team_id) or roster.team_id != value.team_id
@@ -363,13 +513,26 @@ def _agent_history(view, inventory, config, classified):
         image = TeamAgents(tenant_id=roster.tenant_id, team_id=roster.team_id,
                            agent_ids=roster.agent_ids[:position + 1])
         view.receipt(_agent_request(value), (ikey, key, rkey),
-                     exact={ikey: view.hash(ikey), key: view.hash(key), rkey: view.image_hash(rkey, image)},
+                     exact={ikey: view.image_hash(ikey, original), key: view.hash(key),
+                            rkey: view.image_hash(rkey, image)},
                      result=_agent_result(value))
+        if retired is not None:
+            if ((retired.tenant_id, retired.team_id, retired.agent_id) != (value.tenant_id, value.team_id, value.agent_id)
+                    or retired.operator_oid != identity.human_oid or current.deactivation_id != retired.request_id
+                    or retired.onboarding_request_id not in {None, value.request_id}):
+                raise Problem(409, "TEAM_REGISTRY_INVALID", "a retained Agent tombstone differs from its original scope")
+            request = _retire_request(retired, oid)
+            view.receipt(request, (tkey, ikey, *request.read_set[5:]),
+                         exact={tkey: view.hash(tkey), ikey: view.hash(ikey)}, result=_retire_result(retired))
+            classified[tkey] = retired
         rosters[rkey] = roster
         members.setdefault(rkey, set()).add(value.agent_id)
-        classified.update({key: value, ikey: _agent_identity(value)})
+        classified.update({key: value, ikey: current})
     for key, row in inventory.rows.items():
-        if row.payload["data"].get("kind") != "team_agents":
+        kind = row.payload["data"].get("kind")
+        if kind == "team_agent_retired" and key not in classified:
+            raise Problem(409, "TEAM_REGISTRY_INVALID", "a retained tombstone names no registered Agent")
+        if kind != "team_agents":
             continue
         if key not in rosters or set(rosters[key].agent_ids) != members[key]:
             raise Problem(409, "TEAM_REGISTRY_INVALID", "a retained Team roster lists an unregistered Agent")
@@ -401,15 +564,24 @@ def _registered_key(config, agent_id):
     return agent_key(config.identity.tenant_id, agent_id)
 
 
+def agent_retired():
+    """The honest outcome for anything addressed to a retired Agent: nothing was sent or started."""
+    return Problem(410, "AGENT_RETIRED", "this assistant was retired; nothing was sent to it")
+
+
 def resolve_agent_scope(store, config, agent_id):
-    """Config targets: 0 reads. A registered Agent: one read of its original create-only target row."""
+    """Config targets: 0 reads. A registered Agent: its original create-only target row, then its tombstone
+    (2 reads); a retired Agent is 410 AGENT_RETIRED, so no live path invokes, follows or routes to it."""
     key = _registered_key(config, agent_id)
     if key is None:
         return config.agent_scope(agent_id)
     row = store.read_record(key)
     if row is None:
         raise Problem(403, "AGENT_SCOPE_DENIED", "one configured or registered Agent ID is required")
-    return _scope(config, key, _parse(row.payload["data"], TeamAgent))
+    scope = _scope(config, key, _parse(row.payload["data"], TeamAgent))
+    if store.read_record(retired_key(config.identity.tenant_id, agent_id)) is not None:
+        raise agent_retired()
+    return scope
 
 
 def inventory_agent_scope(inventory, config, agent_id):
@@ -422,16 +594,37 @@ def inventory_agent_scope(inventory, config, agent_id):
     return _scope(config, key, _parse(inventory.rows[key].payload["data"], TeamAgent))
 
 
-def registered_agent_ids(store, config):
-    """The served Team's registered Agents in registration order (one read)."""
-    key = roster_key(config.identity.tenant_id, config.identity.team_id)
-    row = store.read_record(key)
+def _roster_ids(store, config):
+    """Every registered Agent in registration order, retired ones included (one read)."""
+    tenant = config.identity.tenant_id
+    row = store.read_record(roster_key(tenant, config.identity.team_id))
     if row is None:
         return ()
     value = _parse(row.payload["data"], TeamAgents)
-    if (value.tenant_id, value.team_id) != (config.identity.tenant_id, config.identity.team_id):
+    if (value.tenant_id, value.team_id) != (tenant, config.identity.team_id):
         raise Problem(409, "TEAM_REGISTRY_INVALID", "the stored roster is outside its original Team")
     return value.agent_ids
+
+
+def _roster(store, config):
+    """(served, retired) registered Agents in registration order: the roster, then one snapshot of tombstones."""
+    tenant, agent_ids = config.identity.tenant_id, _roster_ids(store, config)
+    if not agent_ids:
+        return (), ()
+    rows = store.read_snapshot(tuple(retired_key(tenant, agent_id) for agent_id in agent_ids))
+    retired = {agent_id for agent_id in agent_ids if rows[retired_key(tenant, agent_id)] is not None}
+    return (tuple(agent_id for agent_id in agent_ids if agent_id not in retired),
+            tuple(agent_id for agent_id in agent_ids if agent_id in retired))
+
+
+def registered_agent_ids(store, config):
+    """The served Team's registered, not retired Agents in registration order (two reads)."""
+    return _roster(store, config)[0]
+
+
+def retired_agent_ids(store, config):
+    """The served Team's retired Agents: still on the roster (never removed), no longer served."""
+    return _roster(store, config)[1]
 
 
 def same_team_recipient(scope, *, sender_oid, team_id):
@@ -510,7 +703,8 @@ def team_recipient_ready(store, config, agent_id, *, sender_oid, team_id):
     from .behavior_agent_registry import registry_key
     scope = resolve_team_recipient(store, config, agent_id, sender_oid=sender_oid, team_id=team_id)
     configured = tuple(target.agent_id for target in config.targets)
-    ready = agent_id in configured or agent_id in registered_agent_ids(store, config)
+    # resolve_team_recipient already refused a retired Agent, so the plain roster answers membership.
+    ready = agent_id in configured or agent_id in _roster_ids(store, config)
     if ready and agent_id != configured[0]:
         key = registry_key(config.table.scope.authority_domain, agent_id)
         ready = store.read_snapshot((key,))[key] is not None

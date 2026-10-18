@@ -899,6 +899,16 @@ function agentFetch(path,options={},agent=selectedAgent){
 //   guard stops a reload loop if the new cookie could not be stored, and an unsent draft or chosen file keeps the page
 //   as is so the user can copy it first (the error message says so).
 const pageLoadedAt=Date.now();
+const DRAFT_INPUT_TYPES=new Set(["textarea","text","password","url","email","tel","number"]);
+// Anything a reload would drop: every text field changed from its markup value, every chosen file, every HITL draft.
+// Search boxes are filters, not drafts.
+function pageHasDraft(){
+  return [...document.querySelectorAll("textarea,input")].some(node=>node.type==="file"?node.files?.length>0:
+    DRAFT_INPUT_TYPES.has(node.type)&&!node.readOnly&&Boolean(node.value?.trim())&&node.value!==(node.defaultValue??""))
+    ||nativeHitlHasDraft()
+    // Attachments live only in these maps (the file inputs are cleared after reading); a reload drops every key.
+    ||[attachmentDrafts,userFileDrafts,userImageDrafts].some(drafts=>[...drafts.values()].some(items=>items?.length));
+}
 function remoteResponse(response){
   if(window.location.protocol!=="https:"||!response||response.ok)return response;
   // Only 401/403 without JSON are the sign-in layer's own refusals (the bridge always answers JSON), so the request
@@ -908,7 +918,7 @@ function remoteResponse(response){
     return new Response(JSON.stringify({error:{code:"PLATFORM_REQUEST_REJECTED",upstream_status:response.status,
       automatic_retry:false}}),{status:response.status,headers:{"Content-Type":"application/json"}});
   if(response.status===403&&Date.now()-pageLoadedAt>10000&&
-    !el("instruction")?.value?.trim()&&!el("user-text-files")?.files?.length&&!nativeHitlHasDraft())
+    !pageHasDraft())
     response.clone().json().then(value=>{if(value?.error?.code==="REMOTE_SESSION_CHANGED")window.location.reload()})
       .catch(()=>{});
   return response;
@@ -1168,6 +1178,7 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     AGENT_NAME_TAKEN:"這個 Team 已有同名助理，請換一個名稱。",
     TEAM_RUNTIME_NOT_SERVED:"這個 Team 目前不能新增助理。",
     AGENT_NOT_AVAILABLE:"這位助理目前不可用；原草稿保留，不會改送其他助理。",
+    AGENT_RETIRED:"這位助理已退役；訊息沒有送出，原草稿保留，不會改送其他助理。",
     AGENT_DIRECTORY_UNAVAILABLE:"無法取得助理目錄；操作已暫停，不使用舊目錄放行。",
     AGENT_DIRECTORY_INVALID:"助理目錄的身份或路由不符；未切換助理。",
     AGENT_DEFAULT_MISMATCH:"服務的預設助理與本機原配置不符；不重新歸屬舊紀錄。",
@@ -1272,6 +1283,7 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     REMOTE_PRINCIPAL_DENIED:"只有已指派的登入帳號可以使用這個遠端工作台；請改用指定帳號重新登入。",
     REMOTE_SESSION_CHANGED:"遠端工作台已重新啟動，沒有重送任何操作。頁面沒有自動重新整理時（例如還有未送出的內容），請先複製內容，再重新整理頁面。",
     REMOTE_STATE_UNAVAILABLE:"遠端工作台暫時無法保存紀錄；沒有自動重送。請重新整理頁面，依原紀錄核對後再操作。",
+    REMOTE_STATE_FULL:"遠端保存的紀錄已達容量上限；這次的變更沒有保存到遠端，也不會自動重送，已保存的紀錄不受影響。請交管理者處理後再操作。",
     PLATFORM_REQUEST_REJECTED:"雲端登入層拒絕了這個請求，沒有送到工作台，也沒有自動重送。請重新整理頁面；仍失敗時請按「重新登入」。",
     TEAM_SKILLS_UNAVAILABLE:"這個 API 版本還沒有 skill 審核入口；不會改走其他入口。",
     TEAM_SKILLS_OWNER_ONLY:"只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能新增、批准、拒絕或停用 skill。",
@@ -1525,7 +1537,7 @@ function renderUserFiles(){
   const panel=el("user-file-selected");panel.replaceChildren();
   for(const item of metadata){
     const row=document.createElement("div"),name=document.createElement("input"),info=document.createElement("p");
-    name.value=item.name;name.disabled=!ready||!editable;
+    name.value=name.defaultValue=item.name;name.disabled=!ready||!editable;
     name.setAttribute("aria-label","文字檔 logical filename");name.setAttribute("maxlength","128");
     const generation=userFileRevision;
     name.addEventListener("change",()=>{
@@ -1641,7 +1653,7 @@ function renderAttachmentPicker(){
   }
   for(const item of selected){
     const row=document.createElement("div"),name=document.createElement("input"),detail=document.createElement("p");
-    name.value=item.name;name.disabled=!ready||!editable;name.setAttribute("aria-label","附件 logical filename");
+    name.value=name.defaultValue=item.name;name.disabled=!ready||!editable;name.setAttribute("aria-label","附件 logical filename");
     name.setAttribute("maxlength","128");name.setAttribute("pattern","[A-Za-z0-9][A-Za-z0-9._-]{0,127}");
     name.addEventListener("change",()=>{
       if(!live()||name.disabled)return;
@@ -2622,7 +2634,7 @@ async function sendTeamMcp(command,message,revision,agent){
 }
 function resetTeamMcpForm(){
   teamMcpEditing=null;teamMcpFormNote="";
-  for(const id of ["team-mcp-label","team-mcp-url","team-mcp-tools","team-mcp-secret"])el(id).value="";
+  for(const id of ["team-mcp-label","team-mcp-url","team-mcp-tools","team-mcp-secret"])el(id).value=el(id).defaultValue="";
   el("team-mcp-header").value="x-apikey";el("team-mcp-connection").value="";el("team-mcp-approval").value="always";
 }
 function teamMcpCommand(operation,label,server,newConnection){
@@ -2666,8 +2678,10 @@ function retryTeamMcp(){
 }
 function editTeamMcp(server){
   teamMcpEditing=server.server_label;teamMcpFormNote="";teamMcpConnectionChoice=server.project_connection_id||"";
-  el("team-mcp-label").value=server.server_label;el("team-mcp-url").value=server.server_url;
-  el("team-mcp-tools").value=server.allowed_tools.join(", ");el("team-mcp-secret").value="";
+  // The saved server is the fields' default, so only an edit counts as an unsent draft (pageHasDraft).
+  el("team-mcp-label").value=el("team-mcp-label").defaultValue=server.server_label;
+  el("team-mcp-url").value=el("team-mcp-url").defaultValue=server.server_url;
+  el("team-mcp-tools").value=el("team-mcp-tools").defaultValue=server.allowed_tools.join(", ");el("team-mcp-secret").value="";
   el("team-mcp-approval").value=server.require_approval==="never"?"never":"always";
   el("team-mcp-form").open=true;renderSettings();
 }
@@ -4101,6 +4115,9 @@ function observeAppendDraft(receipt,agent=selectedAgent,auth=attachmentAuthRevis
   if(!sent||auth!==attachmentAuthRevision||sent.request_id!==receipt.request_id||sent.content!==receipt.content)return;
   if(!["accepted","sending","applied","not_applied"].includes(receipt.status))return;
   sent.confirmed=true;appendUnconfirmed.delete(key);
+  // Definitely never delivered because the turn had already ended: sent once as a new turn (resendUnappliedAppend).
+  // Never unknown, and never cancelled (the owner pressed 停止) or any other reason: those keep 帶回輸入框.
+  if(receipt.status==="not_applied"&&receipt.reason==="turn_finished"&&!sent.resend)sent.resend="waiting";
   const unchanged=(draftEdits.get(sent.draftKey)||0)===sent.editRevision&&inputDrafts.get(sent.draftKey)===sent.content;
   if(!unchanged)return;
   inputDrafts.set(sent.draftKey,"");
@@ -5275,9 +5292,31 @@ function primaryControl(node){
   };
   return find(node,n=>n.getAttribute("data-primary")!==null)||find(node,n=>n.className==="hitl-option");
 }
+// What a drawn node shows and lets the owner press, with its children; not typed text, which a kept node holds.
+function drawnShape(node){
+  if(typeof node!=="object")return String(node);
+  return JSON.stringify([node.tagName,node.className,node.textContent,node.hidden,node.disabled,node.open,node.href,node.title,
+    node.getAttributeNames().map(name=>[name,node.getAttribute(name)]),[...node.children].map(drawnShape)]);
+}
+// A kept card's own editor and read button replace the copy drawn just to compare (render() refocuses hitlEditors').
+function registerHitlControls(node){
+  if(typeof node!=="object")return;
+  const rule=node.getAttribute("data-hitl-rule"),read=node.getAttribute("data-hitl-read");
+  if(rule!==null)hitlEditors.set(rule,node);
+  if(read!==null)hitlReaders.set(read,node);
+  for(const child of node.children)registerHitlControls(child);
+}
 function renderInlineAttention(){
   const items=currentAttention(),records=savedHitlRecords(new Set(items.map(hitlItemKey)));
-  const dock=el("attention-dock");dock.replaceChildren();dockCards.clear();
+  const dock=el("attention-dock"),want=[];
+  // Every render() redraws the cards, but a card whose drawing did not change keeps its node, so focus, typed text and
+  // a click already on its way stay on the card the owner sees. Its handlers hold the entry and scope it was drawn with.
+  const shown=new Map([...dock.children].map(node=>[node.faDockKey,node]));
+  const keep=(node,key)=>{
+    node.faDockKey=key;const old=shown.get(key);
+    if(!old||drawnShape(old)!==drawnShape(node))return node;
+    registerHitlControls(old);return old;
+  };
   // Pending cards of the open conversation live in the dock above the composer; the turn keeps a one-line note.
   // Oldest card first (item.created_at); if any card has a missing or unreadable time, the arrival order is kept.
   const pending=items.filter(entry=>attentionTurn(entry)&&!hitlSettled(entry));
@@ -5285,9 +5324,16 @@ function renderInlineAttention(){
   if(pending.every(entry=>Number.isFinite(born(entry))))pending.sort((a,b)=>born(a)-born(b));
   if(pending.length>1){
     const count=document.createElement("p");count.className="muted";count.setAttribute("data-dock-count","");
-    count.textContent=`有 ${pending.length} 張待處理卡片`;dock.append(count);
+    count.textContent=`有 ${pending.length} 張待處理卡片`;want.push(keep(count,"count"));
   }
-  for(const entry of pending){const card=renderAttentionCard(entry,true);dockCards.set(attentionIdentity(entry),card);dock.append(card)}
+  dockCards.clear();
+  for(const entry of pending){
+    const card=keep(renderAttentionCard(entry,true),JSON.stringify([hitlObservationScope,entry]));
+    dockCards.set(attentionIdentity(entry),card);want.push(card);
+  }
+  // Gone nodes leave first, so a kept node moves only when the order of the cards changed.
+  for(const node of [...dock.children])if(!want.includes(node))dock.removeChild(node);
+  want.forEach((node,at)=>{if(dock.children[at]!==node)dock.insertBefore(node,dock.children[at]||null)});
   dock.hidden=!pending.length;
   for(const [rid,host] of inlineAttentionHosts){
     host.replaceChildren();
@@ -5352,7 +5398,7 @@ function renderModelSwitchNotice(){
 // this page does not know (an API released after it) is ignored. Sentences exactly as in ADR-0009 §8.
 const ENVIRONMENT_NOTICES={
   environment_updated:"助理已更新到新版本，工作檔也一起帶過來了。",
-  environment_switched_without_files:"已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。",
+  environment_switched_without_files:"已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。",
   environment_source_retired:"已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。",
 };
 const environmentNotices=new Map();
@@ -5553,6 +5599,7 @@ function renderComposer(){
   }
   resizeComposer();
   prefetchNextDraft(composer,opening);
+  resendUnappliedAppend(composer,opening);
 }
 // RTT A (dev v17/#706): a follow-up's /next took 220-290 ms between the send click and the submit. The next RID is
 // local and never sent by itself, so it is taken ahead, once per sent RID: when the owner has text in the box after
@@ -6679,8 +6726,10 @@ function renderConversation(tasks){
         not_applied:"沒有送達：這一回合已經結束。原文保留，不會自動再送。",
         unknown:"還不確定有沒有送達，可以按這則訊息下方「⋯」裡的「核對追加」。",
       })[appended.status]||"還不確定有沒有送達。";
+      const resent=appended.status==="not_applied"&&["waiting","sent"].includes(sentAppendDrafts.get(scopeKey(appended.append_id))?.resend);
+      if(resent)status.textContent="這一回合剛好結束，改成新訊息送出。";
       turn.append(label,body,status);
-      if(appended.status==="not_applied"){
+      if(appended.status==="not_applied"&&!resent){
         const restore=document.createElement("button"),agent=selectedAgent,thread=selectedThread,auth=attachmentAuthRevision;
         restore.textContent="帶回輸入框";
         restore.disabled=state.authentication!=="AVAILABLE"||threadLoading||Boolean(el("instruction").value)
@@ -6878,7 +6927,8 @@ function render(){
   }
   renderSettings();
   renderInlineAttention();
-  if(editingHitl&&hitlEditors.has(editingHitl)&&!hitlEditors.get(editingHitl).disabled){
+  // A kept dock card still has its focus; setting the caret again could end an IME composition.
+  if(editingHitl&&hitlEditors.has(editingHitl)&&!hitlEditors.get(editingHitl).disabled&&hitlEditors.get(editingHitl)!==focusedHitl){
     const input=hitlEditors.get(editingHitl);input.focus();input.setSelectionRange?.(...hitlCaret);
   }
   text("progress-mode",!state.composer?"":progressPaused?"進度更新暫停；未重送任何指令。請讀取登入或手動更新狀態後再核對。":
@@ -7060,9 +7110,16 @@ async function refreshAuthentication(){
     const response=await agentFetch("/api/authenticate/refresh",{method:"POST",
       headers:{"Content-Type":"application/json","X-Console-CSRF":state.csrf},
       credentials:"same-origin",cache:"no-store",body:"{}"});
-    const value=await response.json();
+    const value=await response.json().catch(()=>null);
     if(revision!==attachmentAuthRevision)return;
-    if(!response.ok||!["AVAILABLE","LOGIN_REQUIRED","LOGIN_EXPIRED"].includes(value.authentication)||
+    // Only a 401 or a sign-in code (LOGIN_*, a wrong account, the sign-in layer) stops it. Anything else (a 503
+    // directory read, an ingress 5xx) is retried in a minute, so polling and the page (and its drafts) stay.
+    // REMOTE_SESSION_CHANGED is left out: its fix is a reload the draft guard may hold, not the sign-in this would offer.
+    if(!response.ok&&response.status!==401&&
+      !/^LOGIN_|^IDENTITY_MISMATCH$|^PLATFORM_REQUEST_REJECTED$|^REMOTE_PRINCIPAL_DENIED$/.test(value?.error?.code??"")){
+      state.authentication_refresh_at=Date.now()/1000+60;return;
+    }
+    if(!response.ok||!["AVAILABLE","LOGIN_REQUIRED","LOGIN_EXPIRED"].includes(value?.authentication)||
       (value.authentication_refresh_at!==null&&!Number.isFinite(value.authentication_refresh_at)))
       throw new Error("LOGIN_EXPIRED");
     if(agentMode)applyAgentDirectory(value);
@@ -7701,6 +7758,70 @@ async function sendAppend(){
   }
 }
 
+// G plan "no lost message": an append settled not_applied reached the turn after its last SDK round, so the Agent never
+// saw it. Once the turn has ended here (no append target), its text goes out once as the next turn under a new RID; only
+// an unknown outcome must keep its ID (AGENTS.md 7). Only into an empty composer, so the owner's draft and attachments
+// are never sent with it or cleared; otherwise the turn keeps 帶回輸入框.
+function resendUnappliedAppend(composer,opening){
+  const sent=[...sentAppendDrafts.values()].find(entry=>entry.resend==="waiting"&&entry.agent===selectedAgent
+    &&entry.thread_id===composer?.thread_id);
+  if(!sent||opening||!nativeProfile(composer.state_profile)||composer.append_target||busy||threadLoading
+    ||state.authentication!=="AVAILABLE"||!scopeAvailable()||messagePending(composer.request_id)||runningOwnTurn())return;
+  conversationRenderKey=null;
+  // A conversation that takes no next message here (blocker, archive, received thread) keeps the text for a human.
+  if(!(composer.editable?composer.can_submit:composer.can_follow_up)||
+    el("instruction").value||selectedAttachments().length||selectedUserFiles().length||selectedUserImages().length){
+    sent.resend="kept";return;
+  }
+  sent.resend="sent";
+  Promise.resolve().then(()=>resendAppendAsTurn(sent,composer));
+}
+async function resendAppendAsTurn(sent,composer){
+  const {agent,thread_id:thread,content}=sent,origin=composer.request_id,model=el("model").value,csrf=state.csrf;
+  const scope=agentRevision,auth=attachmentAuthRevision,sendToken={};
+  const live=()=>scope===agentRevision&&agent===selectedAgent&&auth===attachmentAuthRevision&&selectedThread===thread
+    &&state.authentication==="AVAILABLE";
+  const post=async(path,body)=>{
+    if(!live())throw {code:"INSTRUCTION_CHANGED"};
+    submitted||=path.endsWith("/submit");
+    return postBridge(path,body,agent,csrf);
+  };
+  const hold=id=>{pendingMessages.add(scopeKey(id,agent));chatSends.set(scopeKey(id,agent),sendToken)};
+  const show=id=>optimisticMessages.set(scopeKey(id,agent),{agent_id:agent,request_id:id,thread_id:thread,text:content,sendToken});
+  let request=origin,optimisticId="pending:"+origin,submitted=false;
+  hold(origin);show(optimisticId);stateRevision++;conversationRenderKey=null;render();
+  try{
+    if(!composer.editable){
+      const next=await nextDraft(thread,origin,agent,post);
+      if(!live()||next.composer?.thread_id!==thread||!next.composer.editable||!next.composer.can_submit
+        ||next.composer.request_id===origin)throw {code:"INSTRUCTION_CHANGED"};
+      request=next.composer.request_id;hold(request);
+      optimisticMessages.delete(scopeKey(optimisticId,agent));optimisticId=request;show(request);
+    }
+    const value=await post(`/api/instructions/${encodeURIComponent(request)}/submit`,{content,model});
+    if(value.task?.task_id!==request||value.task.submission?.state!=="CONFIRMED")
+      throw {code:"RECONCILE_REQUIRED",message:"尚未取得接單確認，保留原訊息，不會重送。"};
+    noteEnvironment(value.task,agent);
+    if(live()&&Array.isArray(state.tasks)&&value.task.thread_id===thread)
+      state.tasks=[...state.tasks.filter(task=>task.task_id!==request),value.task];
+  }catch(error){
+    // Not posted: the text stays on its append with 帶回輸入框. Posted: the new turn shows its own outcome.
+    if(!submitted)sent.resend="kept";
+    if(live()){const shown={...sendProblem(error),request_id:request};threadErrors.set(scopeKey(thread,agent),shown);lastError=shown}
+  }finally{
+    for(const id of new Set([origin,request])){
+      const key=scopeKey(id,agent);
+      if(chatSends.get(key)===sendToken){pendingMessages.delete(key);chatSends.delete(key)}
+    }
+    const key=scopeKey(optimisticId,agent);
+    if(optimisticMessages.get(key)?.sendToken===sendToken)optimisticMessages.delete(key);
+    conversationRenderKey=null;
+    if(live()){
+      try{await readState()}catch(error){lastError=lastError||{code:"LOCAL_OFFLINE",message:error.message}}
+      render();
+    }
+  }
+}
 
 async function retryOriginalTurn(task){
   if(!task?.task_id||messagePending(task.task_id))return;
@@ -8513,6 +8634,21 @@ function onboardingPrepareMessage(v){
   if(p.state==="UNKNOWN")return `${name}建立完成，對話環境的準備結果尚未確認（${why}）；請按「再查一次」，只查詢、不重送。`;
   return `${name}建立完成，但對話環境準備失敗：${why}按「重試準備」會沿用同一個準備編號。`;
 }
+// SELECTION_STALE: the Agent exists and its original choice stays bound to the request ID, so each cause names its own fix.
+const ONBOARDING_STALE_CAUSES={
+  // Only a Team MCP tool (`team-*`) is the Team owner's to restore; an organization catalog tool is the deployment's.
+  CAPABILITY_SOURCES_CHANGED:v=>{
+    const ids=Array.isArray(v.capability_ids)?v.capability_ids:[];
+    let team=ids.some(id=>String(id).startsWith("team-")),org=ids.some(id=>!String(id).startsWith("team-"));
+    if(!team&&!org)team=org=true;
+    return "新助理讀不到其中一個勾選的工具（組織工具目錄或 Team MCP）。"+[
+      team&&"如果是 Team MCP 工具（team- 開頭）被移除或改了設定，請 Team 主人恢復",
+      org&&"如果是組織工具目錄的工具，請部署管理者確認組織目錄",
+      "如果工具都還在，請部署線確認服務端版本"].filter(Boolean).join("；");
+  },
+  PROFILE_SELECTION_SOURCES_CHANGED:"勾選的 skill 已不是 Team 目前批准的版本，請 Team 主人恢復原本批准的版本",
+  SKILL_CATALOG_BUDGET_TOO_SMALL:"模型容量放不下勾選的 skill 數量，這是模型設定的問題，請聯絡部署線",
+};
 function onboardingMessage(v){
   if(!v)return onboarding.error?friendlyError(onboarding.error):"";
   const name=`「${v.display_name}」`;
@@ -8524,7 +8660,11 @@ function onboardingMessage(v){
   if(v.state==="SERVER"&&v.reason==="AGENT_SETUP_PENDING")
     return `${name}已建立，角色補設中：正在補設對話入口與權限，權限剛開通時可能要等一段時間，這是正常的；每 30 秒自動用同一個編號續做，不會另建。`;
   if(v.state==="SERVER")return `${name}建立中（${v.server_state}），會用同一個編號續做。`;
-  if(v.code==="AGENT_ONBOARDING_SELECTION_STALE")return `${name}已建立並登錄，但 Team 已批准目錄在之後變了，原本勾選的工具／skill 無法套用；請先請 Team 主人恢復原目錄，再用原編號 ${v.request_id} 續做，不要另建。`;
+  if(v.code==="AGENT_ONBOARDING_SELECTION_STALE"){
+    const known=ONBOARDING_STALE_CAUSES[v.cause];
+    const why=(typeof known==="function"?known(v):known)||(v.cause?`服務端無法套用原本的選擇（${v.cause}），請聯絡部署線`:"服務端沒有回傳原因，請聯絡部署線");
+    return `${name}已建立並登錄，但原本勾選的工具／skill 沒能套用到新助理：${why}。處理好後用原編號 ${v.request_id} 續做，不要另建。`;
+  }
   return `${name}結果尚未確認（${v.code||"未回應"}）；只會用原編號 ${v.request_id} 續做，不會另建。`;
 }
 function renderOnboarding(){

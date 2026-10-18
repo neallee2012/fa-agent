@@ -224,6 +224,35 @@ def test_one_failing_agent_or_occurrence_does_not_block_the_others(clock_api, mo
     assert "unknown-" not in caplog.text and "NATIVE_ROUTINE_UNCONFIRMED" not in caplog.text
 
 
+def test_a_failed_usage_write_is_retried_by_the_next_tick_before_the_occurrence_settles(clock_api, monkeypatch):
+    import shared_context.behavior_instruction_cost as cost
+    from shared_context.errors import Problem
+    from test_turn_usage_ledger import ledger
+
+    case = clock_api
+    due = due_minute(case)
+    publish(case, due.strftime("%H:%M"))
+    case.c.h.time = due + timedelta(seconds=2)
+    assert case.clock.tick()["triggered"] == 1
+    case.remote.completed(expected_rid(case, due))
+    original, failures = cost.record_agent_turn_usage, [1]
+
+    def outage(control, **kwargs):
+        if failures[0]:
+            failures[0] -= 1
+            raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "synthetic lost ledger reply")
+        return original(control, **kwargs)
+
+    monkeypatch.setattr(cost, "record_agent_turn_usage", outage)
+    before = ledger(case.c)
+    assert case.clock.tick()["triggered"] == 0, "the failure surfaces before the occurrence settles"
+    assert ledger(case.c) == before
+    assert case.clock.tick()["triggered"] == 1, "the next tick reads the same RID and records its usage"
+    recorded = ledger(case.c)
+    assert recorded != before
+    assert case.clock.tick()["triggered"] == 0 and ledger(case.c) == recorded
+
+
 def test_budget_defers_work_to_the_next_tick(clock_api):
     case = clock_api
     due = due_minute(case)

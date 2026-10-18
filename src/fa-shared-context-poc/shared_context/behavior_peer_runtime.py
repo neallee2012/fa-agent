@@ -17,7 +17,7 @@ from .behavior_effects import WorkStateEffectAdapter
 from .behavior_foundry import FoundryExecutor, FoundryHttpClient, NativeJobRoute, NativeLaunchAuthority, native_key
 from .behavior_inbox import InboxRegistration, PullInbox
 from .behavior_operations import ToolBrokerCore
-from .behavior_team_registry import registered_agent_ids, resolve_agent_scope
+from .behavior_team_registry import agent_retired, registered_agent_ids, resolve_agent_scope, retired_agent_ids
 from .behavior_runtime import RuntimeDependencies
 from .behavior_work_policy import attach_standing_policy
 from .behavior_work_policy import work_policy_key
@@ -72,6 +72,7 @@ def build_peer(owner, policy, *, credential, native_transports, assistant_transp
                                  (*owner.clients[:3], *clients), resources, agent_id=policy.agent_id)
         peer._agent_message_owner = owner
         peer.hosted_versions = owner.hosted_versions
+        peer.upgrade_snapshot_container_url = owner.upgrade_snapshot_container_url
         peer.work_cost_reader = owner.runtime.work_policy.cost_reader
         extra_actor = None
         if binding.agent_oid not in config.identity.auth().actors:
@@ -85,6 +86,10 @@ def build_peer(owner, policy, *, credential, native_transports, assistant_transp
         peer.assistant.start()
         runtime.capability_grants = original.capability_grants
         runtime.capability_catalog = original.capability_catalog
+        # Team-scoped services (grants keyed by this peer's own binding Team): onboarding S5 and server-side turns
+        # (routines, Teams relay, agent messages) run before this peer's app build installs its own copies.
+        runtime.team_mcp = getattr(original, "team_mcp", None)
+        runtime.team_connectors = getattr(original, "team_connectors", None)
         attach_standing_policy(peer, agent_id=policy.agent_id)
         return peer
     except BaseException:
@@ -92,15 +97,19 @@ def build_peer(owner, policy, *, credential, native_transports, assistant_transp
         raise
 
 
-def _agent_bindings(owner, agent_id):
+def _agent_bindings(owner, agent_id, *, retired=False):
     """One peer's binding IDs (its template and every admission), or None before its registry row exists."""
-    from .behavior_agent_registry import read_agent_registry, registry_key
+    from .behavior_agent_registry import AgentScopeRegistry, read_agent_registry, registry_key
+    from .behavior_operations import _row
     from .behavior_work_registry import read_registry
     store = owner.runtime.store
     key = registry_key(owner.config.table.scope.authority_domain, agent_id)
-    if store.read_snapshot((key,))[key] is None:
+    rows = store.read_snapshot((key,))
+    if rows[key] is None:
         return None
-    policy = read_agent_registry(store, owner.config, agent_id).policy
+    # A retired Agent's scope is 410 by design; its stored row only names the bindings to answer as retired.
+    policy = (_row(rows, key, AgentScopeRegistry) if retired
+              else read_agent_registry(store, owner.config, agent_id)).policy
     index = read_registry(store, policy)
     return frozenset((policy.template.binding_id,
                       *(work_policy_key("binding", admission) for admission in index.entries)))
@@ -113,6 +122,10 @@ def _binding_agent(owner, binding_id):
     for agent_id in _peer_agent_ids(owner):
         if binding_id in (_agent_bindings(owner, agent_id) or ()):
             return agent_id
+    # After a restart the map is empty: a retired Agent's binding answers as retired, not as A's unknown binding.
+    for agent_id in retired_agent_ids(owner.runtime.store, owner.config):
+        if binding_id in (_agent_bindings(owner, agent_id, retired=True) or ()):
+            raise agent_retired()
     return None
 
 

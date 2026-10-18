@@ -7,7 +7,7 @@ import pytest
 
 from shared_context import native_checkpoint
 from shared_context.behavior_sdk_files import SdkSessionFiles
-from shared_context.behavior_sdk_state import CheckpointProfile, NativeCheckpointScope, NativeCheckpointTurn
+from shared_context.behavior_sdk_state import CheckpointProfile, NativeCheckpointScope, NativeCheckpointTurn, local_platform
 from shared_context.behavior_wire import AssistantSdkStop
 from shared_context.errors import Problem
 from test_native_profiles import controlled_compaction
@@ -21,7 +21,7 @@ from test_sdk_compaction_product import ordinary
 def test_native_manual_publication_preserves_last_legal_state_on_source_or_codec_error(local_env, changed):
     async def check():
         scope = NativeCheckpointScope(agent_id="agent", conversation_id="cid", sdk_session_id="sdk-native")
-        profile = CheckpointProfile(platform="win32-x64")
+        profile = CheckpointProfile(platform=local_platform())  # SdkSessionFiles accepts only this host's
         stop = AssistantSdkStop(pid=123, exit_code=0)
         first = ordinary(scope.sdk_session_id)
         first_turn = NativeCheckpointTurn(

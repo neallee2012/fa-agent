@@ -170,7 +170,7 @@ def switched(relay, monkeypatch):
     return store, target
 
 
-WITHOUT_FILES = "已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。"
+WITHOUT_FILES = "已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。"
 
 
 def test_the_final_reply_on_the_read_path_neither_shows_nor_clears_the_drift_notice(relay, monkeypatch):
@@ -338,8 +338,22 @@ def test_a_message_while_the_selected_version_has_no_session_waits_and_is_sent_w
                         lambda runtime, target, **_: version[0])
     monkeypatch.setattr("shared_context.behavior_native_sessions._latest_version_reader",
                         lambda client, client_id, selected=None: old)
+    from shared_context.behavior_native_sessions import NativeSessions
+    from shared_context.behavior_native_turn_wire import NativeEnvironmentView
+    followed = []
+
+    def advance(self, client, command, *, before_send):
+        # 2d-i P7: the submit follows instead of README (a)'s refusal; the follow itself has its own tests.
+        followed.append(command.expected_agent_version)
+        return NativeEnvironmentView(
+            agent_id=old.agent_id, request_id=command.request_id, state="pending", reason="source_active",
+            previous_hosted_session_id=old.session_id, previous_agent_version=old.agent_version,
+            hosted_session_id="fa-native-destination", hosted_agent_version="42")
+
+    monkeypatch.setattr(NativeSessions, "advance", advance)
     before = len(env.calls)
     waiting = relay.post()
+    assert followed == ["42"]
     # The receipt read and the submit both invoke nothing; the relay's next poll sends the same RID again.
     assert waiting.status_code == 200, waiting.text
     assert waiting.json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。"}

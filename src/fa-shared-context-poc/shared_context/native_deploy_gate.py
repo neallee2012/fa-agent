@@ -62,14 +62,16 @@ class _Unread(str):
 
 def evaluate(agents: Iterable, rows: Callable[[], Iterable[NativeBindingRow]],
              read_definition: Callable[[object, str], dict], *, armed: bool, override: dict | None = None,
-             supported: frozenset[str] = SUPPORTED_STATE_PROFILES) -> dict:
+             supported: frozenset[str] = SUPPORTED_STATE_PROFILES, retired: Iterable[str] = ()) -> dict:
     """The gate's report. ``agents`` are the served targets (``agent_id``, ``agent_name``, ``project_endpoint``);
     ``rows()`` reads every binding row; ``read_definition(target, version)`` is one ``get_version`` read and returns
-    the version's definition. No other I/O happens here."""
+    the version's definition; ``retired`` are tombstoned Agent IDs, whose rows no turn reaches. No other I/O."""
     agents = list(agents)
     by_id = {target.agent_id: target for target in agents}
+    retired = frozenset(retired)
     report = {"gate": GATE_SCHEMA, "armed": armed, "supported": sorted(supported), "agents": [],
-              "unserved_rows": [], "unclaimed": [], "refused": [], "protected": {"versions": [], "images": []}}
+              "unserved_rows": [], "retired_rows": [], "unclaimed": [], "refused": [],
+              "protected": {"versions": [], "images": []}}
     try:
         found = {row.agent_id: row for row in rows()}
     except Exception as error:  # noqa: BLE001 - an unreadable Table proves nothing: refused when armed
@@ -94,7 +96,7 @@ def evaluate(agents: Iterable, rows: Callable[[], Iterable[NativeBindingRow]],
         if row is None:
             # Reported, never refused: ADR §7 checks the profiles binding rows record, and a row-less Agent records
             # none (a newly onboarded Agent, or one no API has observed since phase 1). Its first observation claims
-            # the row with the API's own profile (``NativeBindingStore.claim``). Whether its session is the gen-0
+            # the row with the profile its version declares (``NativeBindingStore.claim``, 2d-i). Whether its session is the gen-0
             # SID the selected version derives cannot be told without ``get_session``, which the gate never calls
             # (``native_session_id`` also derives a version-less SID); the 2d-ii gate list claims or retires these
             # Agents before arming (ADR-0009 M1).
@@ -126,6 +128,13 @@ def evaluate(agents: Iterable, rows: Callable[[], Iterable[NativeBindingRow]],
                 report["protected"]["images"].append(image)
     for agent_id, row in sorted(found.items()):
         if agent_id in by_id:
+            continue
+        if agent_id in retired:
+            # A retired Agent is never invoked again, so its recorded profile cannot block a deploy; its versions
+            # stay protected here (removing them is the separate, approved retire --delete-foundry step).
+            report["retired_rows"].append({"agent_id": agent_id, "row_profile": row.state_profile})
+            for referenced in referenced_versions(row):
+                report["protected"]["versions"].append({"agent_id": agent_id, "agent_name": None, "version": referenced})
             continue
         # A row of an Agent this API no longer serves: no turn reaches its session, so only its recorded profile
         # is checked; its versions stay protected (their definitions are not readable without a served target).
@@ -186,7 +195,9 @@ def deploy_binding_store(composition) -> NativeBindingStore:
 
 def run_gate(composition, foundry_for, *, armed: bool, override: dict | None = None) -> dict:
     from .behavior_agent_versions import _agents
+    from .behavior_team_registry import retired_agent_ids
     _, agents = _agents(composition)
+    retired = retired_agent_ids(composition.runtime.store, composition.config)
     store = deploy_binding_store(composition)
 
     def read_definition(target, version):
@@ -195,7 +206,8 @@ def run_gate(composition, foundry_for, *, armed: bool, override: dict | None = N
             raise Problem(503, "AGENT_VERSION_UNREADABLE", "the version definition could not be read")
         return details.get("definition")
 
-    return evaluate([target for target, _ in agents], store.rows, read_definition, armed=armed, override=override)
+    return evaluate([target for target, _ in agents], store.rows, read_definition, armed=armed, override=override,
+                    retired=retired)
 
 
 def main(argv=None):

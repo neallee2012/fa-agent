@@ -152,8 +152,13 @@ def logs(work, execution):
              % (execution, execution))
     body_file = work / f".query-{os.getpid()}.json"
     body_file.write_text(json.dumps({"query": query, "timespan": "PT6H"}), encoding="utf-8")
+    print("waiting for the job log in Log Analytics (a new workspace can take 5-15 minutes the first time)", flush=True)
+    began = shown = time.monotonic()
     try:
         for _ in range(40):
+            if time.monotonic() - shown >= 60:
+                shown = time.monotonic()
+                print(f"still waiting for the job log ({int(shown - began) // 60} min so far)", flush=True)
             try:
                 result = az("rest", "--method", "post", "--resource", "https://api.loganalytics.io",
                             "--url", f"https://api.loganalytics.io/v1/workspaces/{workspace}/query",

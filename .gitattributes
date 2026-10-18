@@ -1,0 +1,19 @@
+# Keep LF in Windows checkouts too (core.autocrlf=true would write CRLF): the code identity hash
+# (behavior_code_identity, *.py) and the files copied into the images must be byte-identical to the repo blobs.
+*.py text eol=lf
+*.json text eol=lf
+*.js text eol=lf
+*.cjs text eol=lf
+*.html text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.bicep text eol=lf
+src/**/*.md text eol=lf
+# These older docs were committed with CRLF; keep their bytes so `git add --renormalize .` changes nothing.
+docs/FA-POC-Handoff.md -text
+docs/fa-hosted-mount-desktop-evidence.md -text
+docs/fa-platform-evidence.md -text
+docs/grok-box-evidence.md -text
+docs/requirements.md -text
+docs/specification.md -text

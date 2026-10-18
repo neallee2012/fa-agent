@@ -18,7 +18,7 @@
 
 | 項目 | 預設 | 依據 |
 |---|---|---|
-| Team MCP | 開，沒有 server | `deploy/azd/profile.defaults.json:55-56`；`azd env set FA_ENABLE_TEAM_MCP_CONNECTIONS false` 會拿掉（`deploy/azd/profile.py:106-109`），Bicep 也就不給 API 寫 connection 的權限 |
+| Team MCP | 開，沒有 server | `deploy/azd/profile.defaults.json:56-57`；`azd env set FA_ENABLE_TEAM_MCP_CONNECTIONS false` 會拿掉（`deploy/azd/profile.py:106-109`），Bicep 也就不給 API 寫 connection 的權限 |
 | Team connector（Teams 等） | 關 | profile 從不寫 `FA_TEAM_CONNECTORS_ENABLED`、`FA_CONNECTOR_*`（`deploy/azd/profile.defaults.json`、`deploy/azd/profile.py:105-128`；測試 `tests/shared_context/test_azd_profile.py::test_a_new_environment_has_no_team_connector_and_needs_no_teams_or_github_app`） |
 | WebIQ 網頁搜尋 | 關 | 要 `azd env set FA_ENABLE_WEBIQ true` 才建 toolbox `fa-org-tools`（`deploy/azd/fa_azd.py:835-840`、`deploy/azd/profile.py:121-122`） |
 | Feed reader MCP | 不部署 | `deploy/azd/profile.defaults.json:2`；沒有簽章金鑰時，`x-feed-url` 的 Team MCP 會回 `TEAM_MCP_FEED_UNAVAILABLE` |
@@ -64,14 +64,16 @@ connector 關著時，API 不安裝 connector 路由（`shared_context/team_conn
 
 **角色。** 在工作台按「＋」新增助理時填「角色說明」，上限 2048 bytes（`shared_context/behavior_agent_role_prompt.py:22`），存檔就生效，存成一個不會改寫的版本（`shared_context/behavior_agent_role_prompt_versions.py:89-90`）。目前只有新增助理時會寫角色，工作台沒有修改既有助理角色的入口。`azd up` 建的兩位助理沒有角色說明。
 
-「＋」在 azd 環境要先開 `FA_ENABLE_AGENT_ONBOARDING`，預設是 `false`（`infra/azd/main.parameters.json:29-30`、[azd 新環境](azd-new-environment.md)）。沒開時「＋」照樣看得到，也會建出助理、存下角色，但 API 不替新助理打開 endpoint 協定，也不給它 project 上的 Foundry User 和 Cognitive Services OpenAI User 角色（`shared_context/behavior_agent_setup.py:153-184`）。這兩件事原本要人手動補；沒補，新助理的回合預期會失敗（推論，沒有在 azd 環境實測）。要開：
+「＋」在 azd 環境預設就能用：`FA_ENABLE_AGENT_ONBOARDING` 預設 `true`（Neal 2026-10-15 決定；`infra/azd/main.parameters.json:29-30`、[azd 新環境](azd-new-environment.md)）。Bicep 給 API 身分一個受條件限制的 RBAC 管理角色，只能把 project 上的 Foundry User 和 Cognitive Services OpenAI User 指派給 service principal、不能刪除（`infra/azd/main.bicep:252-261`），再輸出 `FA_AGENT_ONBOARDING`；deploy 依這個輸出把 `FA_ONBOARDING_*` 寫進 API（`deploy/azd/profile.py:118-121`）。新增助理時 API 就替它打開 endpoint 協定並補上這兩個角色（`shared_context/behavior_agent_setup.py:153-184`）。這等於讓 API 身分能替同一個 project 上的任何 service principal 加這兩個角色（風險見 [ADR-0006](adr/0006-team-trust-boundary-grokbot-mode.md) 與 #469）。這條路沒有在 azd 環境實跑過。
+
+不要這筆權限就在 `azd up` 前關掉：
 
 ```powershell
-azd env set FA_ENABLE_AGENT_ONBOARDING true
+azd env set FA_ENABLE_AGENT_ONBOARDING false
 azd up
 ```
 
-要跑 `azd up`（或先 `azd provision` 再 `azd deploy`），只重跑 hook 不夠：Bicep 會給 API 身分一個受條件限制的 RBAC 管理角色，只能把上面兩個角色指派給 service principal（`infra/azd/main.bicep:252-260`），再輸出 `FA_AGENT_ONBOARDING`；deploy 依這個輸出把 `FA_ONBOARDING_*` 寫進 API（`deploy/azd/profile.py:118-120`）。這等於讓 API 身分能替同一個 project 上的 service principal 加這兩個角色，開之前先確認可以接受。這條路沒有在 azd 環境實跑過。
+關掉時「＋」照樣看得到，也會建出助理、存下角色，但上面兩件事要人手動補；沒補，新助理的回合預期會失敗（推論，沒有在 azd 環境實測）。已建好、沒設過這個值的環境，下一次 provision（`azd up`，或先 `azd provision` 再 `azd deploy`）就會打開；只跑 `azd deploy` 不會，因為 deploy 沿用上次 provision 寫下的 `FA_AGENT_ONBOARDING=false`。
 
 ## Plugin
 

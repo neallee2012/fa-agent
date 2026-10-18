@@ -190,7 +190,7 @@ def test_an_abandon_back_to_a_marked_session_neither_reads_the_set_nor_trusts_it
                          settled=(GHOST,))
     assert _open_set(V2, monkeypatch).complete_since == "follow-v2"
     # Adoption (M9) is not under test: keep the history's never-started receipt where it is.
-    monkeypatch.setattr(native_left_receipts, "adopt_left", lambda runtime: asyncio.sleep(0))
+    monkeypatch.setattr(native_left_receipts, "adopt_left", lambda runtime, source=None: asyncio.sleep(0))
     _, portal, etag = _abandon(IDENTITY, V2.session_id, etag, monkeypatch, request_id="abandon-to-v1")
 
     async def admitted_without_the_set():

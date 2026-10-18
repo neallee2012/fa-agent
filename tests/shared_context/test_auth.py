@@ -238,3 +238,54 @@ def test_the_forced_refresh_window_is_shared_by_every_verifier_in_the_process(pr
         with pytest.raises(jwt.PyJWKClientError):
             keys.client.get_signing_key("unknown-kid")
     assert (first.fetches, second.fetches) == (2, 1), "the second client's miss does not force another download"
+
+
+def test_a_failed_refresh_after_the_ttl_keeps_the_last_tenant_keys_for_a_bounded_time(private_key, monkeypatch, clock):
+    keys = _CountingKeys(monkeypatch, {"test-key": private_key}, lambda: clock.value)
+    keys.client.get_signing_key("test-key")
+    held = keys.client.jwk_set_cache.jwk_set_with_timestamp
+    attempts = []
+
+    def down():
+        attempts.append(clock.value)
+        raise jwt.PyJWKClientConnectionError("synthetic outage")
+
+    monkeypatch.setattr(keys.client, "fetch_data", down)
+    held.timestamp -= 301
+    for _ in range(5):
+        assert keys.client.get_signing_key("test-key").key_id == "test-key"
+    assert len(attempts) == 1, "one refresh attempt per retry window, not one per request"
+    clock.value += 31
+    keys.client.get_signing_key("test-key")
+    assert len(attempts) == 2
+    with pytest.raises(jwt.PyJWKClientConnectionError):
+        keys.client.get_signing_key("unknown-kid")  # a forced refresh never falls back to the old set
+    held.timestamp -= 24 * 3600
+    clock.value += 31
+    with pytest.raises(jwt.PyJWKClientConnectionError):
+        keys.client.get_signing_key("test-key")  # the stale set is bounded
+
+
+@pytest.mark.parametrize("body", [b"<html>gateway error</html>", b"[]"], ids=["not-json", "not-a-key-set"])
+def test_a_refresh_answered_without_a_key_set_keeps_the_last_tenant_keys(private_key, monkeypatch, clock, body):
+    import io
+    keys = _CountingKeys(monkeypatch, {"test-key": private_key}, lambda: clock.value)
+    keys.client.get_signing_key("test-key")
+    keys.client.jwk_set_cache.jwk_set_with_timestamp.timestamp -= 301
+    # The real download path: a 200 whose body is not a JSON key set.
+    monkeypatch.setattr(keys.client, "fetch_data", type(keys.client).fetch_data.__get__(keys.client))
+    monkeypatch.setattr(jwt.jwks_client.urllib.request, "urlopen", lambda *_args, **_kwargs: io.BytesIO(body))
+    assert keys.client.get_signing_key("test-key").key_id == "test-key"
+    clock.value += 31
+    assert keys.client.get_signing_key("test-key").key_id == "test-key", "the bad reply never replaces the held set"
+
+
+def test_a_forced_refresh_answered_without_a_key_set_never_replaces_the_held_tenant_keys(private_key, monkeypatch, clock):
+    import io
+    keys = _CountingKeys(monkeypatch, {"test-key": private_key}, lambda: clock.value)
+    keys.client.get_signing_key("test-key")
+    monkeypatch.setattr(keys.client, "fetch_data", type(keys.client).fetch_data.__get__(keys.client))
+    monkeypatch.setattr(jwt.jwks_client.urllib.request, "urlopen", lambda *_args, **_kwargs: io.BytesIO(b"[]"))
+    with pytest.raises(jwt.PyJWKClientError):
+        keys.client.get_signing_key("unknown-kid")  # a forced refresh still never falls back
+    assert keys.client.get_signing_key("test-key").key_id == "test-key", "the refused body was not cached"

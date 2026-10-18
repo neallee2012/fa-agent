@@ -14,7 +14,9 @@ from .behavior_native_turn_wire import (
 )
 from .behavior_wire import WireModel
 from .errors import Problem
-from .native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, NativeResponseHeaders, NativeResponseId
+from .native_responses_wire import (
+    NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, NativeResponseHeaders, NativeResponseId, channel,
+)
 
 PREFIX = "/work-policy/v1/responses-turns"
 # D1/D2 select Conversations; each Agent still needs the original build and template eligibility.
@@ -39,10 +41,12 @@ class PlatformHistoryPage(WireModel):
 
 
 def turn_profile(capture, *, original=None, conversation=None):
+    """The profile a turn is sent with. An original keeps its own (it is inside ``submit_digest``); a conversation
+    gives only its channel: ADR-0009 2d-i sends v1 until 2d-ii, also into a conversation an H2d image labelled v2."""
     if original is not None:
         return original.state_profile
     if conversation is not None:
-        return conversation.state_profile
+        return NATIVE_RESPONSES_PROFILE if channel(conversation.state_profile) == "responses" else NATIVE_STATE_PROFILE
     return capture.template.settings.state_profile
 
 
@@ -185,6 +189,10 @@ def submit_native_turn(composition, client, command, capture, *, before_send=Non
         raise Problem(403, "NATIVE_STATE_SCOPE", "the original material belongs to another Agent or conversation")
     if command.conversation_id is not None and original is None and conversation is None:
         raise Problem(409, "NATIVE_CONVERSATION_MISSING", "the original conversation is required before admitting a follow-up")
+    if original is None:
+        from .behavior_native_capture import start_pinned
+        # ADR-0009 2d-i: no receipt holds this capture yet, so it names the image of the SID it goes to now.
+        capture = start_pinned(capture, composition.runtime, client.target)
     profile = turn_profile(capture, original=original, conversation=conversation)
     read_only = original is not None and original.status != "accepted"
     platform = (platform_client(composition, client)

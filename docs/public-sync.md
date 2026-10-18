@@ -6,7 +6,7 @@
 
 ## 何時同步、同步什麼
 
-1. stage release PR（改 `deploy/stage/release.json`）合併到 `main`，[deploy-staging](../.github/workflows/deploy-staging.yml) 部署 stage。手動觸發的 deploy-staging 也會啟動 public-sync，但部署的 commit 沒有帶指紋的 release PR 時，第 7 步會停下、什麼都不推（見下面「release 部署失敗後手動部署」）。
+1. stage release PR（改 `deploy/stage/release.json`）合併到 `main`，[deploy-staging](../.github/workflows/deploy-staging.yml) 部署 stage。手動觸發的 deploy-staging 要填 release PR，而且部署的 commit 必須正好是那個帶指紋的 release PR 合併的 commit，否則 deploy-staging 在登入 Azure 前就停下（2026-10-16 起），public-sync 也不會啟動（見下面「release 部署失敗後手動部署」）。
 2. 只有那次 deploy-staging **成功**，[public-sync](../.github/workflows/public-sync.yml) 才會開始；失敗、取消或跳過都不會。
 3. 環境 `public-sync` 只允許 `main`。目前的 GitHub 方案不支援 private repo 的必要審核人，所以不會停下來等人核准；改由公開 repo 先保持 private 當審核關（Neal 2026-10-11 決定），Neal 看過推進去的內容再自己改成 public（審查流程見下方「每一版的兩道審查」）。2026-10-12 已改成 public，之後每次同步立刻公開，第一道審查要在 release PR 合併前完成；第二道由 public-sync 最後一步自動比對。
 4. 取出那次部署的**同一個 commit**，只匯出該 commit 追蹤的檔案，套用替換表，再跑下面的 fail-closed 檢查。任何一項沒過就停，什麼都不推。
@@ -22,7 +22,7 @@
 - 同一版重跑時，若內容與既有 tag 相同，就直接結束（Release 不存在時才補建）。若 `version` 沒變但內容不同（例如手動重新部署了較新的 `main`），會**失敗並且不推**；請先升 `release.json` 的 `version`。
 - **排隊只留一個**：`concurrency` 不取消執行中的同步，但同一時間只保留一個等待中的執行。若前一次同步還在執行，期間又有兩次 release 部署成功，中間那次會被較新的取代、不會單獨發布。內容不會遺失，因為下一次發布帶的是完整的樹；只是公開 repo 會少那一版的 tag 與 Release。
 - **不要重跑舊的 public-sync**：在 Actions 重跑一個舊的 public-sync 時，若它的 tag 在公開 repo 還不存在，會把**較舊的樹**疊在公開 `main` 最上面。沒有審核人會擋下這種重跑，所以不要手動重跑舊的 public-sync；要補發請改用新的 release。
-- **release 部署失敗後手動部署**：release 部署失敗、再手動觸發 deploy-staging 成功時，只有部署的 commit 就是 release PR 合併的那一個（中間 `main` 沒有新的合併）、而且推送前比對指紋相符，公開 repo 才會收到它。部署的是較新的 `main` HEAD（沒有對應的 release PR，或內容已不是第一道審過的樹）時，public-sync 停在推送之前、什麼都不推（本規則從推送前比對的 PR 合併起生效；之前會直接公開沒經第一道審查的內容）。要公開那一版，請對它重做第一道、開新的 release PR 記錄指紋。
+- **release 部署失敗後手動部署**：release 部署失敗後，手動觸發 deploy-staging 時填那個 release PR；只有部署的 commit 就是它合併的那一個（中間 `main` 沒有新的合併）才會部署，推送前比對指紋相符，公開 repo 才會收到它。`main` 已經有新的合併時，deploy-staging 的 `release-gate` 在登入 Azure 前就停下（2026-10-16 起；之前會部署較新的 `main` HEAD、只是不公開）。要部署並公開那一版，請對它重做第一道、開新的 release PR 記錄指紋。
 - **指紋因 `main` 前進而過期**：第一道算出指紋後、release PR 合併前，只要 `main` 多了別的合併，部署 commit 的匯出樹就不是第一道審過的那棵。release 仍會部署，但 public-sync 停在推送之前，這一版什麼都不公開。復原：對新的 `main` 重做第一道，升版本，開新的 release PR（又是一次要 Neal 核准的 stage 部署）；不是重跑 public-sync。合併 release PR 前先確認 `main` 沒有動。
 
 ## 不會同步的檔案
@@ -221,6 +221,7 @@ verify 只擋已知的值與通用樣式。公開之後，每次同步會立刻�
 - **release 27（10-12）**：接在 `d6f6a976` 之後的 commit `a493fefc`，9 個檔案，都是文件。第二道審查通過：gitleaks 掃描目錄 143 個發現、掃描 git 歷史 144 個，全部對上已知誤判清單；183 個連結都能解析。
 - **release 28（10-13）**：commit `ba9adcb6`（tree `7c07241d`）。
 - **release 29（10-14）**：stage 第 29 版部署後的 public-sync；第二道 `gate2_check.py` 第一次自動執行，通過。公開 commit、tag 與 tree 在這裡未記，要引用請讀 public-sync 的 run 與公開 repo。
+- **release 30（10-15）**：stage 第 30 版部署後的 public-sync（run 38666821029，成功）；第二道 `gate2_check.py` 自動通過：指紋相符、部署 commit 匯出的樹與公開樹相同、公開檔案 verify 通過。公開 tag `v2026.10.15-30`，commit `2725c646`，tree `ff9fef76`（讀自該 run 的 log）。
 - **2026-10-13 第一次完整清單比對**：發現公開 `v2026.10.13-28` 裡有 5 個 Azure Bot Service 名稱（見「清單比對基準」），已加替換規則，從下一版起生效；已公開的歷史依 Neal 的決定保留（只修以後、不重寫），下一版整棵取代。
 - **限制**：GitHub 可能仍保留沒有任何引用的 v25 commit 物件，要請 GitHub Support 清除才會消失；這是擁有者向 GitHub 提出的要求，agent 不代做。
 

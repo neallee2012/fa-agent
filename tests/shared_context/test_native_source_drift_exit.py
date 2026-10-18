@@ -1,4 +1,4 @@
-"""Source reactivation after Session Files GET through the original signed follow API."""
+"""Source reactivation after FA's stop through the original signed follow API."""
 
 import asyncio
 
@@ -8,33 +8,28 @@ import pytest
 from shared_context.behavior_native_sessions import NativeSessions
 from shared_context.behavior_native_turn_wire import canonical_bytes
 from test_native_files_api import (
-    PREFIX, OfflineSessionFiles, file_api, file_loops, follow, instruction_models, jwk_client,
+    PREFIX, file_api, file_loops, follow, instruction_models, jwk_client,
     legacy_source, local_env, native_api, signing_key, synthetic_standing_v1, token,
 )
 from test_native_files_omission import omit
-from test_native_session_prepare_api import project_client
 
 
 @pytest.fixture
 def stopped_source_drift(file_api, monkeypatch):
     fixture = file_api
-    download = OfflineSessionFiles.download_session_file
+    files, inactive = fixture.files, fixture.runtime.bootstrap_source_inactive
 
-    def resume_on_get(transport, name, sid, *, path):
-        if sid == transport.source_sid and sid in transport.stopped:
-            transport.targets[sid] = fixture.source.model_copy(
-                update={"agent_version": fixture.destination.agent_version})
-            transport.stopped.remove(sid)
-        return download(transport, name, sid, path=path)
+    async def woken_before_the_check(sid):
+        # FA no longer reads a stopped source (ADR-0009 §10 check ②): here something else wakes it, on the selected
+        # version, between FA's stop readback and the destination's first stopped step.
+        if sid in files.stopped:
+            files.targets[sid] = fixture.source.model_copy(update={"agent_version": fixture.destination.agent_version})
+            files.stopped.remove(sid)
+        return await inactive(sid)
 
-    files = fixture.files
-    project_client(
-        monkeypatch, get_session=files.get_session, stop_session=files.stop_session,
-        list_sessions=lambda name, **_: iter(files.get_session(name, sid) for sid in files.targets),
-        list_session_files=files.list_session_files,
-        download_session_file=lambda name, sid, *, path: resume_on_get(files, name, sid, path=path),
-        upload_session_file=files.upload_session_file)
+    fixture.runtime.bootstrap_source_inactive = woken_before_the_check
     failed = follow(fixture)
+    fixture.runtime.bootstrap_source_inactive = inactive
     assert failed.status_code == 409, failed.text
     assert failed.json()["error"]["code"] == "NATIVE_FILES_UNAVAILABLE"
     assert fixture.controls[-1][0]["stage"] == "source_stopped"

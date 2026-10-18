@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import re
+import threading
 from email import policy
 from email.parser import BytesParser
 from types import SimpleNamespace
@@ -64,11 +65,12 @@ def conflict(status):
 
 
 class Backing:
-    """One serial fake EGT step; this assumes atomicity, not proves it."""
+    """One fake EGT step; apply holds a lock, so a batch lands atomically like a Table transaction."""
 
     def __init__(self):
         self.rows = {}
         self.sequence = 0
+        self.lock = threading.Lock()
 
     def get(self, table, partition, row):
         value = self.rows.get((table, partition, row))
@@ -79,6 +81,10 @@ class Backing:
         return copy.deepcopy(value)
 
     def apply(self, table, operations):
+        with self.lock:
+            return self._apply(table, operations)
+
+    def _apply(self, table, operations):
         candidate = copy.deepcopy(self.rows)
         sequence, results, seen, partition = self.sequence, [], set(), None
         for operation in operations:

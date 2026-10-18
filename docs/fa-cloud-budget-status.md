@@ -1,5 +1,10 @@
 # FA 雲端授權與 USD150 成本 preflight
 
+<a id="stage-actualcost-1015"></a>
+## 2026-10-15 stage 第 30 版部署當天 ActualCost 實查（stage 月預算 USD200 維持）
+
+- **實查**（Cost Management `ActualCost`，報表會延遲）：stage 查詢區間 2025-10-16～2026-10-15 合計約 **USD68.60**（RG 59.65＋`ME` 8.95）。不含當天部分回合（報表延遲）。查詢區間不是單一月份，沒有拿它和月預算逐月比較。
+- **預算**：stage 每月 USD200 不變（見下方 [stage 環境另編預算](#2026-10-02-stage-環境另編預算adr-0008)）；其他規則不變（`budget_enforced=false`、不清帳）。第 30 版部署見 [progress](progress.md#stage-v30-1015)。
 <a id="dev-v30-test-1014"></a>
 ## 2026-10-14 第 30 版候選 dev 測試前後實查（上限 USD800／停損 USD780 維持）
 

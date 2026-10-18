@@ -29,6 +29,7 @@ from .team_mcp_wire import toolbox_grant
 
 _log = logging.getLogger(__name__)
 GRANTS_SECONDS = 30.0
+FAILED_GRANTS_SECONDS = 10.0  # as Team MCP: one capture per window waits on a Foundry outage, not every capture
 _CLIENT_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _AUTHORITY = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/"
 
@@ -44,6 +45,9 @@ class TeamConnectorService:
         self.project_scope, self.app_settings = project_scope, app_settings
         self._grants: dict[tuple[str, str], tuple[float, tuple]] = {}
         self._grants_lock = threading.Lock()
+        # Bumped by forget(): a read that started before a change never stores the grants it read.
+        self._generations: dict[tuple[str, str], int] = {}
+        self._flights: dict[tuple[str, str], threading.Lock] = {}
 
     def _names(self, team: str, ref: ConnectorRef) -> tuple[str, str]:
         if self.project_scope is None:
@@ -165,14 +169,21 @@ class TeamConnectorService:
     def forget(self, tenant: str, team: str) -> None:
         with self._grants_lock:
             self._grants.pop((tenant, team), None)
+            self._generations[(tenant, team)] = self._generations.get((tenant, team), 0) + 1
 
     def team_grants(self, tenant: str, team: str) -> tuple:
         """The Team's enabled connectors, as grants pinned to each connector toolbox's current default version."""
         if self.project_scope is None:
             return ()
+        with self._grants_lock:
+            flight = self._flights.setdefault((tenant, team), threading.Lock())
+        with flight:  # single-flight, as Team MCP: captures arriving during a read take what it stored
+            return self._read_grants(tenant, team)
+
+    def _read_grants(self, tenant: str, team: str) -> tuple:
         key, now = (tenant, team), monotonic()
         with self._grants_lock:
-            cached = self._grants.get(key)
+            cached, generation = self._grants.get(key), self._generations.get(key, 0)
         if cached is not None and cached[0] > now:
             return cached[1]
         foundry, grants = self.foundry_factory(), []
@@ -184,10 +195,15 @@ class TeamConnectorService:
                                for server in servers]
         except Exception as error:
             _log.warning("TEAM_CONNECTOR_GRANTS_UNAVAILABLE status=%s cached=%s", _status(error), cached is not None)
-            return () if cached is None else cached[1]
+            value = () if cached is None else cached[1]
+            with self._grants_lock:
+                if self._generations.get(key, 0) == generation:
+                    self._grants[key] = (monotonic() + FAILED_GRANTS_SECONDS, value)
+            return value
         value = tuple(grants)
         with self._grants_lock:
-            self._grants[key] = (now + GRANTS_SECONDS, value)
+            if self._generations.get(key, 0) == generation:
+                self._grants[key] = (now + GRANTS_SECONDS, value)
         return value
 
 

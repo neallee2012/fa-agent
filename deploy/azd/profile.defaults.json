@@ -1,5 +1,5 @@
 {
-  "_comment": "Feature flags of a new azd environment (docs/azd-new-environment.md). Every key also exists in deploy/stage/stage.json (tests/shared_context/test_azd_profile.py); identifiers, endpoints and environment names are filled in by deploy/azd/profile.py. memory_environment is added unless FA_ENABLE_MEMORY=false (deploy creates the store). Left out on purpose: FA_ONBOARDING_* and FA_CAPABILITY_TOOLBOX_ENTRIES (opt-in), the feed reader and its signing key secret.",
+  "_comment": "Feature flags of a new azd environment (docs/azd-new-environment.md). Every key also exists in deploy/stage/stage.json (tests/shared_context/test_azd_profile.py); identifiers, endpoints and environment names are filled in by deploy/azd/profile.py. memory_environment is added unless FA_ENABLE_MEMORY=false (deploy creates the store). FA_ONBOARDING_* is added by profile.py with the project ID unless the Bicep output FA_AGENT_ONBOARDING is false (on by default). Left out on purpose: FA_CAPABILITY_TOOLBOX_ENTRIES (opt-in), the feed reader and its signing key secret.",
   "hosted_idle_timeout_seconds": 3600,
   "assistant_environment": {
     "BEHAVIOR_ASSISTANT_PROFILE": "assistant-v1.2",
@@ -12,7 +12,8 @@
     "FA_NATIVE_GROUPS_ENABLED": "1",
     "FA_RESPONSES_ENABLED": "1",
     "FA_NATIVE_ROUTINES_ENABLED": "1",
-    "FA_NATIVE_ROUTINE_PROPOSALS": "1"
+    "FA_NATIVE_ROUTINE_PROPOSALS": "1",
+    "FA_NATIVE_MODEL_SWITCH": "1"
   },
   "conversation_defaults": {
     "prompt_profile": "fa-instruction-v4",
@@ -52,6 +53,8 @@
     "FA_NATIVE_ROUTINES_ENABLED": "1",
     "FA_NATIVE_ROUTINE_CLOCK": "api",
     "FA_NATIVE_ROUTINE_PROPOSALS": "1",
+    "FA_NATIVE_SESSION_GUARD_ENFORCE": "0",
+    "FA_NATIVE_UPGRADE_RECONCILER": "0",
     "FA_TEAM_MCP_ENABLED": "1",
     "FA_TEAM_MCP_SINGLE_TEAM": "1",
     "FA_REALTIME_HUB": "fa"

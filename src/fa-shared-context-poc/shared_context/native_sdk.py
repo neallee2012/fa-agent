@@ -11,6 +11,8 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
+import shutil
 from typing import Annotated, Literal
 from urllib.parse import quote
 
@@ -29,7 +31,7 @@ from .behavior_assistant_boundary import AssistantModelBoundary
 from .behavior_assistant_wire import Empty, InstructionTask
 from .behavior_model_direct import DirectCompletions, DirectResponses
 from .behavior_model_direct_probe import SCOPE
-from .behavior_native_turn_wire import NATIVE_STATE_PROFILE, NativeHistory, NativeResult, TurnNumber, material_digest
+from .behavior_native_turn_wire import NativeHistory, NativeResult, TurnNumber, material_digest
 from .behavior_sdk_files import SdkSessionFiles, TOOL_OUTPUT_READ_GUIDANCE, TOOL_OUTPUT_READ_REFUSAL
 from .behavior_skill_prompt import assemble_prompt
 from .behavior_turn_usage import AGENT_TURN_USAGE_PATH, AgentTurnUsageReport
@@ -164,6 +166,20 @@ _NOTICE_REREAD = "re-read the relevant user turns with read_user_turn or ask the
 _NOTICE_ASK = "ask the user."
 _NOTICE_FILES = (" Files the user attached are kept by FA, not on the computer's disk; read them with read_user_file "
                  "by name and omit turn_number when you do not know it.")
+# After a stop is requested: the SDK's abort call, then the wait for the runtime's idle; past that the turn is cancelled,
+# so run_copilot's own bounded stop path (5 s abort, 15 s stop, 5 s force stop) frees the execution slot.
+ABORT_SECONDS = 5
+ABORT_IDLE_SECONDS = 60
+_TURN_DIR = re.compile(r"[0-9a-f]{64}")  # <native-turns>/<material_digest(cid, rid)>, one per turn
+
+
+def _remove_turn_dir(root, turn_root):
+    """A turn's own files (SDK config, runtime-work, MCP homes, work) and its short MCP TMPDIR beside the job lane's."""
+    from .native_local_capabilities import mcp_temp_path
+    for path in (turn_root, mcp_temp_path(root, turn_root)):
+        shutil.rmtree(path, ignore_errors=True)
+
+
 # The fixed text for a file-name miss; tool failure text otherwise reads as a refusal and stops a correction.
 USER_FILE_NOT_FOUND = "USER_FILE_NOT_FOUND"
 CAPABILITY_TOOL_GUIDANCE[USER_FILE_NOT_FOUND] = (
@@ -224,7 +240,9 @@ class NativeUsageReporter:
     async def __call__(self, receipt):
         if receipt.status not in {"completed", "unknown", "busy_refused"}:
             raise Problem(409, "NATIVE_USAGE_CONFLICT", "only a persisted terminal turn has final usage")
-        report = AgentTurnUsageReport(request_id=receipt.request_id, usage=receipt.usage)
+        if receipt.status == "busy_refused" and receipt.usage is None:
+            return  # never ran a model; the API sees only usage=None and would count an unknown turn
+        report =AgentTurnUsageReport(request_id=receipt.request_id, usage=receipt.usage)
         try:
             token = self.token_provider()
             if inspect.isawaitable(token):
@@ -305,7 +323,7 @@ class NativeSdkExecutor:
             task.add_done_callback(self._prewarming.discard)
         return len(toolboxes)
 
-    def preflight(self, capture):
+    def preflight(self, capture, *, adopted=False):
         settings = capture.template.settings
         selected_providers(capture, self.capability_providers, agent_messages=self.agent_tools is not None)
         if (capture.template.role.profile not in _PROFILES
@@ -315,7 +333,7 @@ class NativeSdkExecutor:
                 409, "NATIVE_PROFILE_UNSUPPORTED",
                 "this captured profile has no implemented native consumer",
             )
-        check_start_capture(capture)
+        check_start_capture(capture, adopted=adopted)
         if settings.checkpoint_profile is not None:
             SdkSessionFiles("native-profile-check", checkpoint_profile=settings.checkpoint_profile,
                             model_provider=settings.model_provider)
@@ -477,7 +495,7 @@ class NativeSdkExecutor:
             raise NativeSdkFailure(code, None, assembly=accounting.snapshot()) from None
 
     async def _execute(self, receipt, scope, previous, control, accounting):
-        self.preflight(receipt.capture)
+        self.preflight(receipt.capture, adopted=control.adopted)
         if receipt.routine is not None:
             from .native_routine_client import NativeRoutineClient
             from .native_routine_wire import native_routines_enabled
@@ -831,7 +849,7 @@ class NativeSdkExecutor:
                 cancel_observation = asyncio.create_task(delegates[0].request_cancel())
             while session is None:
                 await asyncio.sleep(0.05)
-            await session.abort()
+            await asyncio.wait_for(session.abort(), ABORT_SECONDS)
 
         work = root / "work"
         work.mkdir(parents=True, exist_ok=True)
@@ -907,7 +925,10 @@ class NativeSdkExecutor:
             done, _ = await asyncio.wait((running, abort), return_when=asyncio.FIRST_COMPLETED)
             if abort in done:
                 abort.result()
-            outcome = await running
+                # A runtime that never reports idle after the abort must not hold the execution slot forever.
+                outcome = await asyncio.wait_for(running, ABORT_IDLE_SECONDS)
+            else:
+                outcome = await running
             stop = AssistantSdkStop.model_validate(outcome["sdk_stop"])
             released = stop.release is not None
             try:
@@ -946,8 +967,23 @@ class NativeSdkExecutor:
                 running.cancel()
             await asyncio.gather(running, abort, return_exceptions=True)
             await asyncio.gather(*previews, return_exceptions=True)
+            if holder.live is None:
+                # No SDK was kept, so nothing uses this turn's directories. A kept SDK's stay until the next startup
+                # (remove_turn_dirs); one that reused an earlier turn's SDK keeps that turn's.
+                await asyncio.to_thread(_remove_turn_dir, self.root, root)
             if cancel_observation is not None:
                 await cancel_observation
+
+    def remove_turn_dirs(self):
+        """Process start: no SDK of this process exists yet, so every earlier turn's directory is left over. Only
+        ``<64 hex>`` turn directories (and their MCP TMPDIRs) go; ``checkpoint-cache`` and other names stay."""
+        try:
+            entries = list(self.root.iterdir())
+        except OSError:
+            return
+        for path in entries:
+            if _TURN_DIR.fullmatch(path.name) and not path.is_symlink() and path.is_dir():
+                _remove_turn_dir(self.root, path)
 
     async def aclose(self):
         """VM shutdown: stop the kept SDKs best effort; their turns' checkpoints are already published."""
@@ -990,7 +1026,9 @@ def native_capability_providers(api_url, api_token_provider) -> tuple[NativeCapa
 
 def native_runtime_from_environment(hosted):
     from .native_task_observer import NativeTaskObserver
-    if os.environ.get("FA_NATIVE_TURNS") != NATIVE_STATE_PROFILE:
+    from .native_responses_wire import ACCEPTED_STATE_PROFILES
+    state_profile = os.environ.get("FA_NATIVE_TURNS")
+    if state_profile not in ACCEPTED_STATE_PROFILES:
         raise Problem(403, "NATIVE_TURNS_DISABLED", "the native state profile must be explicitly enabled")
     if (not os.environ.get("FOUNDRY_HOSTING_ENVIRONMENT")
             or os.environ.get("AGENTSERVER_TASKS_BACKEND", "").strip().lower() not in {"", "hosted"}):
@@ -1048,12 +1086,25 @@ def native_runtime_from_environment(hosted):
             "disabled" if os.environ.get("FA_TEAM_MEMORY_ENABLED") != "1" else
             "not_configured" if not os.environ.get("FA_PRIVATE_MEMORY_STORE") else "configuration_invalid",
         ))
-    usage = NativeUsageReporter(api_url, hosted.identity.agent_id, api_token)
+    executor.remove_turn_dirs()
+    usage =NativeUsageReporter(api_url, hosted.identity.agent_id, api_token)
 
     async def terminal(receipt):
-        with phase_timing("native_usage_report", job_id=timing_id(receipt.request_id)):
-            await usage(receipt)
-        await executor.notify_terminal(receipt)
+        try:
+            if receipt.status == "completed":
+                # Wake the waiting sender first: /result and the usage report are both idempotent per RID, and the
+                # notification task reruns every step until all succeed, so the order only changes the sender's wait.
+                try:
+                    await relay.completed(receipt, receipt.result)
+                except Exception as error:
+                    # the finally below may raise its own error and replace this one; keep the relay failure visible
+                    logging.getLogger(__name__).warning(
+                        "FA_NATIVE_RESULT_RELAY_PENDING exception_type=%s", type(error).__name__)
+                    raise
+        finally:
+            with phase_timing("native_usage_report", job_id=timing_id(receipt.request_id)):
+                await usage(receipt)
+            await executor.notify_terminal(receipt)
 
     async def completed(receipt, result):
         if executor.private_memory is not None:
@@ -1061,11 +1112,8 @@ def native_runtime_from_environment(hosted):
             await executor.private_memory.completed(receipt, executor.reader)
         if executor.team_memory is not None:
             await executor.team_memory.completed(receipt)  # never raises; claimed once per RID
-        try:
-            await relay.completed(receipt, result)
-        finally:
-            if group_client is not None:
-                await group_client.complete(receipt)
+        if group_client is not None:
+            await group_client.complete(receipt)
 
     async def unconfirmed(receipt):
         try:
@@ -1083,7 +1131,7 @@ def native_runtime_from_environment(hosted):
                                 on_completed=completed, on_unconfirmed=unconfirmed,
                                 bootstrap_source_inactive=NativeBootstrapSource(endpoint, hosted.identity.agent_name, token),
                                 task_observer=NativeTaskObserver(endpoint, hosted.identity, token),
-                                workspace_files=workspace_files)
+                                workspace_files=workspace_files, state_profile=state_profile)
     executor.reader = runtime
     relay.runtime = runtime
     runtime.on_continuation = relay.continue_original

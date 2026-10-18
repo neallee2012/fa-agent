@@ -34,6 +34,8 @@ _APPROVE = (NativeHitlRuleChange, NativeHitlDecision)
 # A question's answer and a Connect card's click are the Team owner's ordinary reply ("submit"), not Behavior.Approve.
 _OWNER = (*_APPROVE, NativeHitlAnswer, ConnectorConsentDecision)
 _WAITS = (NativeHitlPendingCreate, NativeHitlQuestionCreate, ConnectorConsentCreate)
+# The Agent's own idempotent closing writes: re-running a lost apply cannot grant, decide or restart anything.
+_REAPPLY = (NativeHitlEnd, NativeHitlClose)
 
 
 class _Scope(WireModel):
@@ -380,10 +382,20 @@ class NativeHitlService:
         owner = isinstance(command, _OWNER)
         self._authorize(principal, owner=owner, write=True, approve=isinstance(command, _APPROVE))
         key = self._intent_key(principal, command)
+
+        def apply(rows):
+            original = self._original(principal, command, rows[key])
+            return self._changes(principal, original, rows)
+
         existing = self.store.read_record(key)
         if existing is not None:
-            self._original(principal, command, existing)
-            return self.reconcile(principal, command)
+            original = self._original(principal, command, existing)
+            if not isinstance(command, _REAPPLY):
+                return self.reconcile(principal, command)
+            # An End/Close whose apply was lost (412, crash) re-runs under its original receipt ID; a saved receipt is
+            # returned as is. A decision recorded since meets the ordinary Close rule: a deny refuses it (409), an
+            # allow becomes the close's status with the decision record kept, as a fresh close of an unrun allow does.
+            return self.store.transact(original.request, apply)
         request = self._request(principal, command)
         now = self._now()
         intent = _Intent(
@@ -403,11 +415,10 @@ class NativeHitlService:
 
         self.store.transact(reserve, reserve_changes)
         if not fresh:
-            return self.reconcile(principal, command)
-
-        def apply(rows):
-            original = self._original(principal, command, rows[key])
-            return self._changes(principal, original, rows)
+            if not isinstance(command, _REAPPLY):
+                return self.reconcile(principal, command)
+            # Another call saved this intent first: re-run under the request it saved, never one recomputed here.
+            request = self._original(principal, command, self.store.read_record(key)).request
         return self.store.transact(request, apply)
 
     def _version(self, principal, command, rows):

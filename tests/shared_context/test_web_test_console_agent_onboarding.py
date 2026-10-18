@@ -398,7 +398,8 @@ def test_server_choice_change_after_admission_keeps_the_original_request(real_in
         with ui:
             body = {"display_name": "R", "role_prompt": "x", **CHOICE}
             value = ui.post("/api/agents/onboarding", json=body, headers=headers).json()
-            assert (value["state"], value["code"]) == ("UNKNOWN", "AGENT_ONBOARDING_SELECTION_STALE")
+            assert (value["state"], value["code"], value["cause"], value["capability_ids"]) == (
+                "UNKNOWN", "AGENT_ONBOARDING_SELECTION_STALE", "CAPABILITY_SOURCES_CHANGED", ["fa-skills-v1"])
             # Not final: a new request is refused while this one is pending, and resume resends the same request.
             again = ui.post("/api/agents/onboarding", json=body, headers=headers)
             assert again.status_code == 409 and again.json()["error"]["code"] == "AGENT_ONBOARDING_PENDING"

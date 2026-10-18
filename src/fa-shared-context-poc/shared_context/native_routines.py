@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from .behavior_native_turn_api import NativeTurnGateway
-from .behavior_native_capture import resolve_routine_capture
+from .behavior_native_capture import pinned_to, resolve_routine_capture
 from .behavior_native_responses_api import submit_native_turn, turn_profile
 from .behavior_native_turn_wire import (
     NativeAgentCommand, NativeConversationRead, NativeRead, NativeRoutineSubmit, material_digest,
@@ -71,6 +71,15 @@ class NativeRoutineVersion(NativeRoutineRecord):
 class NativeRoutineIntent(NativeRoutineRecord):
     kind: Literal["native_routine_intent"] = "native_routine_intent"
     submission: NativeRoutineSubmit
+
+
+def _same_occurrence(original, submission):
+    """``original`` is the receipt of this intent. The SDK start pin is not part of the occurrence: the intent keeps
+    the pin it was resolved with, and ``submit_native_turn`` fills the receiving SID's version's at dispatch
+    (ADR-0009 2d-i). So the intent is compared with the receipt's pin and every other byte of its submission."""
+    capture = pinned_to(submission.capture, original.capture.sdk_start_code_sha256)
+    return (original.submit_digest == submission.model_copy(update={"capture": capture}).sha256
+            and original.routine == submission.routine)
 
 
 def routine_key(control, kind, identifier):
@@ -443,8 +452,7 @@ class NativeRoutineService:
                 original = self._reminder_receipt(read_turn, definition.routine_id, rid, issues)
                 if original is None:
                     continue
-                if (original.agent_id != agent_id or original.submit_digest != intent.submission.sha256
-                        or original.routine != intent.submission.routine):
+                if original.agent_id != agent_id or not _same_occurrence(original, intent.submission):
                     raise Problem(409, "NATIVE_ROUTINE_CONFLICT", "the scheduled observation differs from its original receipt")
                 observed = self._dispatch(original)
                 if not actionable_only or observed.needs_attention:
@@ -500,6 +508,42 @@ class NativeRoutineService:
 
         return control.store.consistent_read(read)
 
+    @staticmethod
+    def _switched(sessions, raw_client, command, authorize, rid):
+        """ADR-0009 2d-i (``FA_NATIVE_SESSION_GUARD_ENFORCE``): a routine never follows on its own any more (M1 step
+        2; no ``_destination`` and no follow ``pending``). It waits in this request like every send, running the
+        in-request switch of a bound Agent between tries (``advance``, which starts no follow then), and ends this
+        occurrence with 503 ``NATIVE_ROUTINE_UNCONFIRMED`` (same RID) when the Agent's session is not current within
+        the wait; the clock's next tick triggers the same occurrence again."""
+        from .behavior_native_turn_api import wait_in_request
+
+        def located():
+            try:
+                return sessions.current(raw_client, checked_since=monotonic())
+            except Problem as error:
+                if error.body["error"]["code"] not in {"NATIVE_SESSION_CHANGED", "AGENT_VERSION_FOLLOWING"}:
+                    error.routine_own = True  # raised as before the switch (e.g. a revoked policy)
+                    raise
+                # A session read, not a dispatch: nothing was sent.
+                raise Problem(503, "AGENT_VERSION_FOLLOWING", "the Agent is changing environments",
+                              not_dispatched=True) from None
+
+        def switching():
+            # The raw row, as ``advance`` reads it: ``bound_row`` is None for an unsupported profile, whose
+            # incompatible SID is exactly what the in-request switch leaves (§7a (k)).
+            found = sessions._binding_row(raw_client.target.agent_id)
+            if found is not None and found[1] is not None:
+                sessions.advance(raw_client, command, before_send=authorize)
+
+        try:
+            return wait_in_request(located, enforce=True, between=switching)
+        except Problem as error:
+            if getattr(error, "routine_own", False):
+                raise
+            raise Problem(503, "NATIVE_ROUTINE_UNCONFIRMED",
+                          "the original environment is not ready; its routine was not resubmitted",
+                          request_id=rid, environment_code=error.body["error"]["code"]) from None
+
     def trigger(self, clock, agent_id, command):
         from .behavior_team_registry import resolve_agent_scope
         from .behavior_native_sessions import native_sessions
@@ -535,13 +579,16 @@ class NativeRoutineService:
                 self._clock(clock)
                 self._active_definition(control, agent_id, candidate_definition)
 
-            client = sessions._destination(raw_client, version, authorize_environment)
+            if sessions.guard.enforce:
+                client = self._switched(sessions, raw_client, environment_command, authorize_environment, rid)
+                environment_command = None
+            else:
+                client = sessions._destination(raw_client, version, authorize_environment)
         original = self._original(client, rid)
-        if original is not None and (intent is None or original.submit_digest != intent.submission.sha256
-                                      or original.routine != intent.submission.routine):
+        if original is not None and (intent is None or not _same_occurrence(original, intent.submission)):
             raise Problem(409, "NATIVE_ROUTINE_CONFLICT", "the original native receipt has another source")
         if original is not None and original.status != "accepted":
-            NativeTurnGateway._accounted(control, (original, None))
+            NativeTurnGateway._accounted(control, (original, None), composition)
             self._settle(control, original)
             return self._dispatch(original)
         definition = (self._current_definition(control, agent_id, command.routine_id) if intent is None else
@@ -591,15 +638,15 @@ class NativeRoutineService:
                 client, NativeConversationRead(conversation_id=definition.conversation_id))
             NativeTurnGateway._same_session(client, conversation)
             original = self._original(client, rid)
-            if original is not None and (original.submit_digest != submission.sha256 or original.routine != submission.routine):
+            if original is not None and not _same_occurrence(original, submission):
                 raise Problem(409, "NATIVE_ROUTINE_CONFLICT", "the occurrence changed while its environment was being prepared")
             if original is not None and original.status != "accepted":
-                NativeTurnGateway._accounted(control, (original, None))
+                NativeTurnGateway._accounted(control, (original, None), composition)
                 self._settle(control, original)
                 return self._dispatch(original)
         try:
             receipt, _ = submit_native_turn(
-                composition, client, submission.command, submission.capture,
+                composition, client, submission.command, submission.capture if original is None else original.capture,
                 routine=submission.routine, original=original, conversation=conversation, before_send=current)
         except Problem as error:
             if error.status < 500:
@@ -607,7 +654,7 @@ class NativeRoutineService:
             raise Problem(503, "NATIVE_ROUTINE_UNCONFIRMED",
                           "read the original occurrence; do not replace its RID or replay unknown effects",
                           request_id=rid) from None
-        NativeTurnGateway._accounted(control, (receipt, None))
+        NativeTurnGateway._accounted(control, (receipt, None), composition)
         self._settle(control, receipt)
         return self._dispatch(receipt)
 

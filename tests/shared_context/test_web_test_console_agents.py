@@ -10,8 +10,8 @@ import httpx
 import pytest
 
 from web_test_console import __main__ as launcher
-from web_test_console.agent_connections import AgentConnections
-from web_test_console.adapter import canonical, parse_config, sha
+from web_test_console.agent_connections import AgentConnections, AgentConsoles
+from web_test_console.adapter import ConsoleError, canonical, parse_config, sha
 from web_test_console.bridge import create_app
 from web_test_console.instructions import InstructionConnection
 from test_m3_auth import jwk_client, signing_key
@@ -222,6 +222,53 @@ def test_directory_beyond_two_agents_lists_every_usable_entry_without_local_fall
     assert not (tmp_path / "peer.sqlite3").exists()
 
 
+def test_page_load_rereads_a_directory_older_than_a_minute_so_a_retired_agent_disappears(real_interface, tmp_path):
+    from datetime import timedelta
+
+    c = real_interface
+    connections = AgentConnections.model_validate_json(connection_file(c, tmp_path).path.read_bytes())
+    listed = directory_payload()
+    listed["agents"][1].update(state="unavailable", reason="AGENT_SCOPE_MISSING")
+    retired = directory_payload()
+    retired["agents"].pop()
+    served, reads = [listed], []
+
+    def backend(request):
+        if request.url.path == "/work-policy/v1/agents":
+            reads.append(request.method)
+            if served[0] is None:
+                return httpx.Response(503, json={"error": {"code": "BACKEND_UNAVAILABLE"}})
+            return httpx.Response(200, json=served[0], headers={"cache-control": "no-store"})
+        path = request.url.path.removeprefix("/agents/agent-one")
+        return c.backend.send(httpx.Request(request.method, request.url.copy_with(path=path),
+                                           headers=request.headers, content=request.content))
+
+    with httpx.Client(transport=httpx.MockTransport(backend)) as upstream:
+        app = create_app(c.config, c.journal, backend=upstream,
+            token_provider=lambda: c.h.headers()["Authorization"].removeprefix("Bearer "),
+            clock=lambda: c.h.time, port=8873, instruction_connection=c.connection, agent_connections=connections)
+        with TestClient(app, base_url="http://127.0.0.1:8873") as ui:
+            ui.get("/")
+            initial = ui.get("/api/state").json()
+            assert reads == []  # not signed in: nothing is read
+            headers = {"Origin": "http://127.0.0.1:8873", "X-Console-CSRF": initial["csrf"]}
+            assert ui.post("/api/authenticate", json={}, headers=headers).status_code == 200
+            assert reads == ["GET"]
+            assert [agent["id"] for agent in ui.get("/api/state").json()["hidden_agents"]] == ["agent-two"]
+            served[0] = retired
+            assert [agent["id"] for agent in ui.get("/api/state").json()["hidden_agents"]] == ["agent-two"]
+            assert reads == ["GET"]  # read within the last minute: reused
+            c.h.time += timedelta(seconds=61)
+            state = ui.get("/api/state").json()
+            assert reads == ["GET", "GET"]
+            assert state["hidden_agents"] == [] and [agent["id"] for agent in state["agents"]] == ["agent-one"]
+            served[0] = None
+            c.h.time += timedelta(seconds=61)
+            failed = ui.get("/api/state")
+            assert failed.status_code == 200 and failed.json()["agent_directory_error"] == "AGENT_DIRECTORY_UNAVAILABLE"
+            assert reads == ["GET", "GET", "GET"]
+
+
 def test_two_clients_keep_agent_models_drafts_and_fixed_task_ids_in_separate_journals(
     real_interface, tmp_path,
 ):
@@ -379,3 +426,68 @@ def test_a_peer_pointing_at_another_configurations_journal_is_disabled_without_o
             assert result["agents"][1]["enabled"] is False
             assert result["agents"][1]["reason"] == "AGENT_CONFIGURATION_INVALID"
     assert c.journal.read_bytes() == peer_journal.read_bytes() == original
+
+
+def _offline_agents(tmp_path, send):
+    """AgentConsoles around a stand-in default console; only the directory read and sign-in are exercised."""
+    from datetime import datetime, timezone
+
+    first = {"agent_id": "agent-one", "config_path": str(tmp_path / "c.json"), "config_sha256": "a" * 64,
+             "journal_path": str(tmp_path / "j.sqlite3"), "instructions_path": str(tmp_path / "i.json"),
+             "instructions_sha256": "b" * 64}
+    connections = AgentConnections.model_validate_json(json.dumps({"default_agent_id": "agent-one", "agents": [first]}))
+    default = SimpleNamespace(config=None, backend=None, vault=SimpleNamespace(get=lambda: "token"),
+                              clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+    def authenticate(*, automatic, load_models):
+        default.vault = SimpleNamespace(get=lambda: "renewed")
+        return {"authentication": "AVAILABLE", "authentication_refresh_at": None}
+
+    default.authenticate = authenticate
+    agents = AgentConsoles(connections, default, None)
+    agents.reader = SimpleNamespace(send=send)
+    return agents
+
+
+def test_a_silent_sign_in_refresh_answers_ok_when_only_the_directory_read_fails(tmp_path):
+    def send(*args, **kwargs):
+        raise ConsoleError("BACKEND_UNAVAILABLE", 503)
+
+    agents = _offline_agents(tmp_path, send)
+    result = agents.authenticate(automatic=True)
+    assert result["authentication"] == "AVAILABLE"
+    assert result["agent_directory_error"] == "AGENT_DIRECTORY_UNAVAILABLE"
+    with pytest.raises(ConsoleError) as manual:  # a sign-in the user pressed still reports the failed read
+        agents.authenticate(automatic=False)
+    assert (manual.value.code, manual.value.status) == ("AGENT_DIRECTORY_UNAVAILABLE", 503)
+
+def test_a_slow_directory_read_does_not_block_resolving_an_agent(tmp_path):
+    import threading
+
+    from shared_context.behavior_agent_message_wire import PublicAgentDirectory
+
+    listed = directory_payload()
+    listed["agents"].pop()
+    entered, release = threading.Event(), threading.Event()
+
+    def send(*args, **kwargs):
+        entered.set()
+        release.wait(10)
+        return json.dumps(listed).encode(), {"cache-control": "no-store"}
+
+    agents = _offline_agents(tmp_path, send)
+    agents.directory, agents.error = PublicAgentDirectory.model_validate_json(json.dumps(listed)), None
+    agents.loaded = {"agent-one": None}
+    reading = threading.Thread(target=agents.refresh_directory)
+    reading.start()
+    try:
+        assert entered.wait(5)
+        resolved = []
+        resolving = threading.Thread(target=lambda: resolved.append(agents.resolve("agent-one")))
+        resolving.start()
+        resolving.join(2)
+        assert resolved == [agents.default], "resolve() waited for the directory HTTP read"
+    finally:
+        release.set()
+        reading.join(5)
+    assert agents.directory_read_at is not None and agents.error is None

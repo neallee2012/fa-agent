@@ -20,6 +20,9 @@ can no longer complete, so the conversation never forks, repeats work or runs tw
   A failed or unconfirmed CAS is never passed to the owner: the receipt is read again; terminal goes on, still
   ``started`` counts as a change (observe again, keep waiting).
 
+Its cards wait only in the source's memory, so once a left turn can no longer complete (started on a retired source, or
+marked here) its cards close as at a normal turn end (``close_cards``, ADR-0009 gate 6).
+
 A message that has to wait never holds the Agent's chain (other conversations go on) and is never refused: it joins
 its conversation's ``left-queue`` (conversation store) and a ``fa-native-left-wait-v1`` task of its own looks again
 every ``POLL_SECONDS``, driving the stall rule above without any poll from outside; that task's own SDK timeout hands it
@@ -156,15 +159,39 @@ async def can_complete(runtime, original) -> bool:
         return await store.get_item(retired_key(receipt.hosted_session_id)) is None
 
 
+async def close_cards(runtime, receipt):
+    """ADR-0009 gate 6: a left turn that can no longer complete closes its cards as a normal turn end does
+    (``finish_turn``: ``/end``, then each open approval ``interrupted`` / ``effect_unknown``), so the owner never sees a
+    live card whose wait is gone and a routine allow can not write a schedule for it. The IDs are fixed per turn and
+    card, so a repeat replays; a recorded decision or answer stays. Best effort, and only in the background
+    (``_close_cards_later``, once per RID per process): never delays or changes what the caller decides."""
+    from .native_hitl_runtime import NativeHitlRuntime
+    from .native_turns import _TASK_TRANSPORT_ERRORS
+
+    client = getattr(runtime.executor, "hitl_client", None)
+    if client is None:
+        return
+    try:
+        await NativeHitlRuntime.finish_turn(client, runtime, receipt)
+    except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
+        log.info("NATIVE_LEFT_RECEIPT_CARDS_UNCONFIRMED rid_prefix=%s exception_type=%s", receipt.request_id[:8],
+                 type(error).__name__)
+
+
 async def settled(runtime, original) -> bool:
     """True when ``original`` (a ``_Versioned`` receipt) can no longer complete; False: wait behind it.
 
     One pass, never sleeping (the Responses slot runs it on the request path). It may write the ``stall:`` observation
-    and, after N unchanged minutes, the receipt's terminal ``unknown``."""
+    and, after N unchanged minutes, the receipt's terminal ``unknown``; a left turn found unable to complete then has
+    its cards closed (``close_cards``)."""
     from .native_progress import _key as progress_key
     from .native_turns import TURNS_STORE, _UNCERTAIN, _decode, _json
 
-    if not left(runtime, original.value.receipt) or not await can_complete(runtime, original):
+    if not left(runtime, original.value.receipt):
+        return True
+    if not await can_complete(runtime, original):
+        if original.value.receipt.status == "started":  # on a retired source: its wait is gone with the source
+            runtime._close_cards_later(original.value.receipt)
         return True
     rid = original.value.receipt.request_id
     async with runtime._store(TURNS_STORE) as store:
@@ -189,6 +216,14 @@ async def settled(runtime, original) -> bool:
     if current.value.receipt.status not in {"accepted", "started"}:
         log.warning("NATIVE_LEFT_RECEIPT_SETTLED rid_prefix=%s status=%s failure_code=%s", rid[:8],
                     current.value.receipt.status, current.value.receipt.failure_code)
+        # Only our own stall mark: a turn the source completed or ended ``unknown`` itself (a recovery handoff) keeps
+        # its recorded allows for the continuation to read.
+        if current.value.receipt.status == "unknown" and current.value.receipt.failure_code == FAILURE_CODE:
+            # shortcut: a crash between the mark and this close (or a close cut at shutdown, or a transient HITL failure:
+            # no retry, the receipt is terminal so no later pass comes back here) leaves the cards open to their TTL, and
+            # until then a routine-proposal allow can still write a schedule; upgrade to the durable terminal
+            # notification if that gap is ever seen.
+            runtime._close_cards_later(current.value.receipt)
         return True
     async with runtime._store(TURNS_STORE) as store:
         found = await store.get_item(stall_key(rid))
@@ -222,6 +257,10 @@ async def adopt(runtime, original):
         return None
     current, _ = await runtime._agent_record()
     if current.hosted_session_id != me:
+        return None
+    if await runtime._refused(receipt.request_id, fresh=True):
+        # Refused by version (ADR-0009 §9): its owner was told to send it again as a new message; running it here too
+        # would do the work twice. It stays as it is and reads final (``_refused_view``).
         return None
     replacement = _changed(original.value, receipt=_changed(receipt, hosted_session_id=me),
                            adopted_from=receipt.hosted_session_id)
@@ -597,34 +636,43 @@ async def observe_left(runtime, original):
     return True
 
 
-async def adopt_left(runtime):
+async def adopt_left(runtime, source=None, rids=None):
     """Right after an abandon commit, under the admission lock: adopt every never-started receipt other SIDs left,
-    oldest first, before this session admits anything. Bounded like the backfill read."""
+    oldest first, before this session admits anything, then close the cards of every turn that started on ``source``
+    (the SID just abandoned) when it is retired: such a turn can never complete (ADR-0009 gate 6). Bounded like the
+    backfill read; what it misses is adopted or closed when it is read (``observe_left``). ``rids``: the open-RID set
+    when it was complete for ``source`` (every open receipt is listed), read instead of every receipt."""
     from time import monotonic
 
     from .native_turns import TURNS_STORE, _TASK_TRANSPORT_ERRORS
 
-    found, complete, after, deadline = [], True, None, monotonic() + _ADOPT_SCAN_SECONDS
+    found, started, complete, after, deadline = [], [], True, None, monotonic() + _ADOPT_SCAN_SECONDS
     try:
         async with runtime._store(TURNS_STORE) as store:
             while complete:
-                page = await store.list_keys(limit=100, after=after)
-                for key in page.keys:
-                    if not key.key.startswith("rid:"):
+                if rids is not None:
+                    keys, page = ["rid:" + rid for rid in sorted(rids)], None
+                else:
+                    page = await store.list_keys(limit=100, after=after)
+                    keys = [key.key for key in page.keys]
+                for key in keys:
+                    if not key.startswith("rid:"):
                         continue
                     if monotonic() > deadline:
                         complete = False
                         break
-                    item = await store.get_item(key.key)
+                    item = await store.get_item(key)
                     try:
-                        original = runtime._check_rid(item, key.key[4:])
+                        original = runtime._check_rid(item, key[4:])
                     except Problem:
                         continue
                     if original.value.receipt.status == "accepted" and left(runtime, original.value.receipt):
                         created = getattr(item, "created_at", None)
                         found.append((created if isinstance(created, int) and not isinstance(created, bool) else 0,
-                                      key.key, original))
-                if not page.has_more:
+                                      key, original))
+                    elif left(runtime, original.value.receipt) and original.value.receipt.hosted_session_id == source:
+                        started.append(original)
+                if page is None or not page.has_more:
                     break
                 if not page.last_id or page.last_id == after:
                     complete = False
@@ -645,3 +693,9 @@ async def adopt_left(runtime):
             log.warning("NATIVE_LEFT_RECEIPT_ADOPTION_UNCONFIRMED exception_type=%s code=%s", type(error).__name__,
                         error.body["error"]["code"] if isinstance(error, Problem) else None)
     log.warning("NATIVE_LEFT_RECEIPTS_ADOPTED count=%d complete=%s", adopted, complete)
+    for original in started:
+        try:
+            if not await can_complete(runtime, original):
+                runtime._close_cards_later(original.value.receipt)
+        except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
+            log.info("NATIVE_LEFT_RECEIPT_CARDS_UNCONFIRMED exception_type=%s", type(error).__name__)

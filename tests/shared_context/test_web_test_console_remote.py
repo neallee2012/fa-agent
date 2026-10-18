@@ -141,6 +141,32 @@ def test_failed_upload_is_reported_before_the_caller_can_continue(tmp_path):
     assert refused.value.code == "REMOTE_STATE_UNAVAILABLE" and len(lost) == 1
 
 
+def test_archive_warns_at_half_the_cap_and_never_writes_one_restore_would_refuse(tmp_path, monkeypatch, capsys):
+    from web_test_console import remote
+
+    monkeypatch.setattr(remote, "MAX_ARCHIVE_BYTES", 64 * 1024)
+    blob, lost = FakeBlob(), []
+    archive = _replica(blob, tmp_path / "state", lost)
+    journal = tmp_path / "state" / "console.sqlite3"
+    _journal(journal, "x" * 100)
+    archive.persist(journal)
+    assert "REMOTE_STATE_NEAR_LIMIT" not in capsys.readouterr().err
+    for _ in range(2):
+        _journal(journal, "x" * 36 * 1024)
+        archive.persist(journal)
+    assert capsys.readouterr().err.count("REMOTE_STATE_NEAR_LIMIT") == 1
+    saved, uploads = blob.data, blob.uploads
+    _journal(journal, "x" * 80 * 1024)
+    with pytest.raises(ConsoleError) as refused:
+        archive.persist(journal)
+    assert (refused.value.code, refused.value.status) == ("REMOTE_STATE_FULL", 503)
+    assert (blob.data, blob.uploads) == (saved, uploads)
+    assert not archive.lost and lost == []  # a full archive is a local refusal; the replica keeps serving reads
+    restored = _replica(blob, tmp_path / "restored", lost)
+    assert _read(tmp_path / "restored" / "console.sqlite3") == "x" * 36 * 1024
+    restored.release()
+
+
 def test_a_new_agent_connection_file_survives_a_replica_takeover(tmp_path):
     blob, lost = FakeBlob(), []
     old = _replica(blob, tmp_path / "old", lost)
@@ -283,6 +309,29 @@ def test_remote_console_needs_the_platform_principal_and_reads_its_token_per_req
     persisted.clear()
     assert ui.post("/api/instructions/conversations/new", json={}, headers=post).status_code == 200
     assert set(persisted) == {journal.resolve()}
+
+
+def test_remote_console_sends_a_signed_in_owner_without_a_stored_token_to_re_sign_in(
+        real_interface, monkeypatch, tmp_path):
+    # The token-store entry is gone (rotated or cleared) while the sign-in cookie still holds: the page still loads
+    # and answers 401 LOGIN_REQUIRED, which shows 重新登入; only another identity is 403.
+    c = real_interface
+    ui = _remote_ui(c, monkeypatch, [], tmp_path / "remote" / "console.sqlite3")
+    signed_in = {"x-ms-client-principal-id": c.config.human_oid, "x-ms-client-principal-idp": "aad"}
+    assert ui.get("/", headers=signed_in).status_code == 200
+    post = {**signed_in, "Origin": ORIGIN, "X-Console-CSRF": ui.get("/api/state", headers=signed_in).json()["csrf"]}
+    for gone in (signed_in, {**signed_in, "x-ms-token-aad-access-token": ""}):
+        assert ui.get("/", headers=gone).status_code == 200
+        assert ui.get("/api/state", headers=gone).json()["authentication"] == "LOGIN_REQUIRED"
+        again = ui.post("/api/authenticate", json={}, headers={**post, **gone})
+        assert again.status_code == 401 and again.json()["error"]["code"] == "LOGIN_REQUIRED"
+    other = {**post, "x-ms-token-aad-access-token": c.h.headers()["Authorization"][7:],
+             "x-ms-client-principal-id": "ffffffff-ffff-ffff-ffff-ffffffffffff"}
+    for path in ("/", "/api/state"):
+        denied = ui.get(path, headers=other)
+        assert denied.status_code == 403 and denied.json()["error"]["code"] == "REMOTE_PRINCIPAL_DENIED"
+    wrong = ui.post("/api/authenticate", json={}, headers=other)
+    assert wrong.status_code == 403 and wrong.json()["error"]["code"] == "REMOTE_PRINCIPAL_DENIED"
 
 
 def test_remote_console_stops_when_a_commit_cannot_be_kept(real_interface, monkeypatch, tmp_path):

@@ -1,9 +1,58 @@
 # FA 進度與交接狀態
 
-更新日期：2026-10-15。
+更新日期：2026-10-18。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="dev-test-v31-1018"></a>
+## 2026-10-16～18：第 31 版候選 dev 測試（ADR-0009 2d-i，最後在 main `ae3d30e9`，部署線）
+
+- **範圍**：部署線在 dev（`faexample`）測 2d-i；stage 沒有動。10-16、10-17 的部署由 Neal 逐次批准，10-18 依 Neal 10-17 的 dev 部署授權；routine 測試另經 Neal 批准。本節的數字與結論來自部署線回報，原始 log 與畫面不在 repo；SID、RID 與 hash 只寫前綴。
+- **測的開關狀態**：dev 從 10-16 起 `FA_NATIVE_SESSION_GUARD_ENFORCE="1"`（2d-i 打開）。開關關的路徑只在 10-16 `354f` 部署過一次（verify-follow 結束碼 1：C、D 是 executor 回 `AGENT_SCOPE_MISSING`，由 #864 修正），之後沒有再以 `"0"` 部署。
+- **部署紀錄**：
+  - 10-16 `354fa15f`：先以 `"0"` 部署（`354f-v147`，sync 帶 `--refuse-native-v2`），再以 `"1"` 換 API（`354f-v148-2di`）。
+  - 10-17 `f77b8b33`（`f77b-v149`，含 #864～#874），之後加、拿掉故障掛勾各一次（`-v150-fault`、`-v151-nofault`）。
+  - 10-18 `5040efea`（`5040-v152`，含 #880、#875～#888，新增 `FA_NATIVE_UPGRADE_RECONCILER="0"`），故障掛勾加、拿掉各一次（`-v153`、`-v154`）。
+  - 10-18 `ae3d30e9`（含 #892、#893）：`ae3d-v155` → `-v156-fault` → `-v157-nofault`（最後是單一 revision）；8 個 Agent 都 sync 到新 image；verify-follow 結束碼 0，C、D `skipped`，trace 裡 session 呼叫 0 次。
+  - 都沒有跑 Bicep、沒有建新的雲端資源（`upgrade-snapshots.bicep` 沒有部署）。
+- **結果**：
+  - **1 部署 PASS**：全體 verify-follow 結束碼 0；sync trace 的 advance／observe 0 次；`DEPLOY_COMPAT_GATE` pass、refused 空。
+  - **2 部署後 A、B 留在原 SID：部分成立**：部署本身沒有 `server_following`；但工作台一讀到上一個已完成的回條就觸發背景換版，不必等新回合結束。#872 起閒置的來源回 `source_idle`、不換。
+  - **3 背景換版（無檔案）PASS**：probe `quiet` → cut `ready`，scan 70／64 ms，綁定列換成 v2、舊 SID 進 previous，換版提示只出現一次。
+  - **4 背景換版（有檔案）PASS**（`f77b`）：測試檔 hash 前綴 `6bbced90`，新 SID 工作區 hash 相同，`outcome=ready`，部署後對舊來源 0 次呼叫。`354f` 時 FAIL（停掉來源後又讀一次，平台用新版本叫醒它），由 #872 修正；那段期間沒有遺失檔案。
+  - **5 柵欄期間送訊息 PASS**（`ae3d30e9`）：故障掛勾開著，換版柵欄期間送出的訊息一直以 `AGENT_VERSION_FOLLOWING` 等候、同 RID 重送；柵欄 121.4 秒逾時撤回後 1 秒接單，只送出一次。`5040` 時 FAIL（撤回同一毫秒的重送回 409 `NATIVE_ENVIRONMENT_CONFLICT`，使用者要自己重送），由 #893 修正；這次重送沒有剛好撞到那個毫秒級競態，競態由 #893 的單元測試涵蓋。
+  - **6 撤回 PASS**：前半 `outcome=withdrawn reason=fence_overrun`、Hosted `NATIVE_UPGRADE_WITHDRAWN restored=saved`；後半（撤回後下一次換版）`5040` 時 FAIL（drift 過的來源帶檔換版一直被撤回，`NATIVE_FILES_SOURCE_UNAVAILABLE`），#892 修正後 `ae3d30e9` 上 `outcome=ready`（16.8～16.9 秒），新 SID 的檔案 hash 不變；換版後顯示一次「助理已更新到新版本，工作檔也一起帶過來了。」
+  - **7 全掃描時間：暫時 PASS**：只有 2 次 full scan（probe 518／802 ms、cut 495／705 ms，回條 5／8 筆），最大 0.8 秒，門檻 10 秒；樣本不夠估 p95，之後從 stage 的 `NATIVE_UPGRADE_CUT` 紀錄補收。
+  - **8 舊環境被刪 PASS**：舊 SID 一律 `invoked=False`，兩次確認相隔 5.8 秒後判 `basis=retired`，換到同版本的新 SID 回覆正常（工作台提示文字有誤，已派修）。
+  - **9 其他入口 PASS**：交辦（含跨版本：A 交辦給停在舊版的 B）、Teams relay、routine（10-16）都 PASS；群組入口正常（主持模型一人分飾兩角，記為模型行為）。**routine 跨版本這輪沒有重跑**：工作台排程批准卡一直重畫，點不到「允許這次」；routine 本身 10-16 已 PASS。
+  - **10 巡查 PASS**：`patrol --once` agents 8、unbound 5、skipped 3，其他 0；`5040` 上 API 啟動後約 8.6 分鐘自動跑第一次（在 5～60 分鐘內），前後 API 沒有 session 呼叫。
+  - **11 速度 PASS**：暖回合 `bridge_submit` p50 1,839 ms；`api_submit_session` p50 271 → 236 ms、`api_submit` p50 2,255 → 2,240 ms（開關打開前 → 2d-i），沒有變長。
+  - **12 `agent-versions fence` 預覽 PASS**：正確列出綁定列、柵欄與兩個計時器；沒有加 `--clear`。
+  - **P1 修正（#880）PASS**：舊 image 的 SID 在部署換 API 後收訊息，回覆正常、沒有 `SDK_START_GATE_CODE_CHANGED`；讀回確認回合由舊 image 的 SID 執行，之後背景換版 `ready`。
+- **觀察：A 的 `NATIVE_VERSION_OBSERVED` 建立 157、觀察 156（已查明，不用修）**：A 的 v156 確認是 2d-i image（`FA_NATIVE_TURNS=foundry-native-v2`、fa_build `f0ceec5f`，10-16 06:10 建立）；漂移用「相等」判斷、不看大小，往下漂移照常可用，回合結束的換版會讀觀察版本的來源（#892）並把 A 換到 selector 的版本（建立＝觀察＝158），不覆寫檔案、回條或 checkpoint，也不會反覆換（ADR-0009 檢查 ② 已記過 103→97、145→141 這類往下漂移）。
+- **測完之後進 main 的 #894**（`8a8608dd`，只改工作台）：「待你處理」卡片重畫時保留原卡，修的就是上面 routine 跨版本點不到「允許這次」的原因；只有離線測試，沒有在 dev 部署測過。
+- **測試設定已還原**：測試用的 overlay（B 的 HITL TTL、A 的排程提議開關、test agent 的 TTL）已改回正式值（A v160、B v120、M5 v11），定義與測試前的 v155／v113／v4 比對 0 差異。
+- **費用**（dev 資源群組，近一年 ActualCost）：USD612.15（開始前）→ 631.98（10-17 結束）→ 641.76（10-18 結束）。Cost Management 通常晚約一天，10-18 的數字可能還沒算完。
+
+<a id="stage-v30-1015"></a>
+## 2026-10-15：stage 第 30 版（2026.10.15-30）部署與冒煙
+
+- **範圍**：release PR #841，Neal 合併 `fb8941f2`。本節時間皆為 +08；數字與結論來自部署線回報，原始 log 與畫面不在 repo。冒煙時 Neal 核准在 stage 跑回合，並自己登入工作台。費用見[預算檔](fa-cloud-budget-status.md#stage-actualcost-1015)。
+- **部署讀回**：
+  - deploy-staging run 38665375954 成功，09:23:22～09:39:20。API revision `…fb8941f-r118-1` Healthy、100%、healthz 200；core `4d380c99`。
+  - A／B／C／D route v81、fa-agent v29，全部 active、閒置逾時 3600；A／B `FA_NATIVE_MODEL_SWITCH="1"`。
+  - 3b 閘門（#829）09:24:49.6～09:25:37.5（47.9 秒）：armed=False、override=False、decision=pass、refused []，unclaimed 2。
+  - follow 09:38:26：A、B、fa-agent 皆 `files_migrated=false`、reason=source；新 SID 建立於 09:35:14～15。舊 SID（A、B、fa-agent 各 2 個）最後存取時間都早於部署開始；API／sync log 09:23～09:44（415 行）0 次提到舊 SID，同一時段 0 筆 `NATIVE_INVOCATION_FAILURE`、`RID_ABSENT`、`STATE_INVALID`、`Traceback`（備註 a 的逾時發生在 09:49，在這個 log 窗口之後）。
+- **public-sync**：run 38666821029 成功，含自動第二道（指紋比對＋驗證公開副本）。見[公開紀錄](public-sync.md#公開紀錄)。
+- **冒煙 PASS**（時間為第一個字／完成）：
+  - A 新對話（gpt-6.1-sol）13.0／15.4 秒；B 新對話（gpt-5.4-mini）8.7／12.0 秒；A 舊對話 7.8／11.0 秒。沒有第 29 版基準，未判定快慢。
+  - 換環境通知：A 的通知在 Neal 自己的對話已於 09:41:04 顯示並清除，只顯示一次；B 舊對話第一則部署後訊息顯示一次，09:49:27 清除，之後的訊息不再出現。B 這一則是新 session 的第一次使用，第一個字 16.3 秒、完成 22.2 秒。
+  - 交辦 A→B：B 結束 09:52:08.5，A 的畫面 09:52:18.0 顯示 B 的回覆（9.5 秒），不需重新整理；推送連線開著，但登入後重連 4 次（attempt=5）。
+  - WebIQ：天氣問題，WebIQ_web 2 秒、完成 21.6 秒，回覆引用中央氣象署台北預報。
+- **備註**：
+  - (a) 09:49:12 API 讀 B 新 session 時遇到 30 秒 ReadTimeout（冷啟動；`NATIVE_INVOCATION_FAILURE` native_operation=read，`NATIVE_TURN_REFUSED` code=`FOUNDRY_INVOCATION_UNKNOWN`），同時工作台正在讀 B 的待處理項目；B 的下一個回合正常完成。回報未載原因。
+  - (b) 推送連線登入後重連 4 次；回報未載原因。
+- **更正**：release PR #841 寫「部署的 core 等於 dev 的 `98f81d4d`」；stage 的 core 是 `4d380c99`，這是用 git 算出的正確值（`1c2be0b4` 與 `fb8941f2` 都是，兩者之間沒有 `.py` 變動）。dev 的 `98f81d4d` 來自 dev build context 的 CRLF 換行（Windows 且 `core.autocrlf=true` 的 checkout 用 git archive 產生）；程式內容相同，dev 測試結果仍成立；之後 dev 改用 LF 建置。合併後不改 PR 內文，因為第二道會讀它。
 <a id="dev-test-v30-1014"></a>
 ## 2026-10-14：第 30 版候選 dev 測試（main `1c2be0b4`，部署線）
 

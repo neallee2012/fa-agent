@@ -1,6 +1,7 @@
 """Default-off group control records, using the original verified Team entry."""
 
 import hashlib
+import logging
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
@@ -179,12 +180,17 @@ class NativeGroupGateway:
             return root.agent_id == group.orchestrator_agent_id and root.request_id == group_id
 
         for agent_id, rid in targets:
-            gateway = NativeTurnGateway(self.owner.for_agent(agent_id), enabled=configured_native_turns())
             try:
+                gateway = NativeTurnGateway(self.owner.for_agent(agent_id), enabled=configured_native_turns())
                 receipt, _ = gateway.read(principal, NativeRead(request_id=rid))
             except Problem as error:
                 if error.status == 404 and error.body["error"]["code"] == "NATIVE_RID_MISSING":
                     missing.append(rid)
+                    continue
+                # A retired member's turns are no longer served; the live members' turns stay readable. The v1/v2
+                # activity wire has no field for it (ADR-0009 §3 profile snapshot), so it is said in the log only.
+                if error.body["error"]["code"] == "AGENT_RETIRED":
+                    logging.getLogger(__name__).info("NATIVE_GROUP_ACTIVITY_RETIRED_MEMBER agent_id=%s", agent_id)
                     continue
                 raise
             if not belongs(receipt):

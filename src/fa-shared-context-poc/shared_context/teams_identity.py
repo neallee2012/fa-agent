@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import socket
 import threading
@@ -24,7 +25,7 @@ import httpx
 import jwt
 from pydantic import Field, ValidationError, field_validator, model_validator
 
-from .auth import ForcedRefreshWindow
+from .auth import STALE_JWKS_RETRY_SECONDS, STALE_JWKS_SECONDS, ForcedRefreshWindow
 from .behavior_auth import BehaviorPrincipal
 from .behavior_delivery import _Model, _json, _utc
 from .behavior_ingress import checked_human_text
@@ -41,6 +42,8 @@ MAX_CONNECTOR_JWKS_BYTES = 2 * 1024 * 1024
 # one cached set per key source for the whole process (as the Entra JWKS in auth.py), and a kid it lacks forces
 # at most one refresh per window. teams_personal builds a ConnectorIdentity per request, so this is module state.
 CONNECTOR_JWKS_TTL_SECONDS = 300.0
+_FETCH_ERRORS = (httpx.HTTPError, OSError, ValueError, TypeError, KeyError, jwt.PyJWTError)
+_log = logging.getLogger(__name__)
 Opaque = Annotated[str, Field(min_length=1, max_length=4096)]
 
 
@@ -171,6 +174,7 @@ class _ConnectorKeySet:
         self.keys: list[dict] | None = None
         self.fetched_at = 0.0
         self.forced = ForcedRefreshWindow()
+        self.stale_retry = ForcedRefreshWindow(STALE_JWKS_RETRY_SECONDS)
 
 
 _key_sets: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -230,8 +234,18 @@ class ConnectorIdentity:
         try:
             now = _utc(self.clock()).timestamp()
             with cached.lock:
-                if cached.keys is None or not 0 <= now - cached.fetched_at < CONNECTOR_JWKS_TTL_SECONDS:
-                    cached.keys, cached.fetched_at = self._fetch_keys(), now
+                age = now - cached.fetched_at
+                if cached.keys is None or not 0 <= age < CONNECTOR_JWKS_TTL_SECONDS:
+                    # Stale-if-error (as auth.py): Teams does not resend a refused activity, so a failed refresh
+                    # keeps the last set for a bounded time and is retried once per window, not per activity.
+                    stale = cached.keys is not None and 0 <= age < STALE_JWKS_SECONDS
+                    if not stale or cached.stale_retry.claim(now):
+                        try:
+                            cached.keys, cached.fetched_at = self._fetch_keys(), now
+                        except _FETCH_ERRORS:
+                            if not stale:
+                                raise
+                            _log.warning("TEAMS_JWKS_STALE age_seconds=%d", age)
                 keys = cached.keys
             key = _match(keys, kid)
             if key is None and cached.forced.claim(now):
@@ -243,7 +257,7 @@ class ConnectorIdentity:
             if key is None:
                 raise ValueError
             return key
-        except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError, jwt.PyJWTError):
+        except _FETCH_ERRORS:
             raise Problem(401, "TEAMS_SERVICE_AUTH_DENIED", "Connector signing evidence is unavailable or invalid") from None
 
     def verify(self, authorization: str, activity: dict, *, body_digest: str | None = None) -> VerifiedTeamsActivity:

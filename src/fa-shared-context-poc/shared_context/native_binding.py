@@ -18,8 +18,12 @@ from pydantic import Field, model_validator
 from .behavior_native_turn_wire import NATIVE_STATE_PROFILE, NativeEnvironmentNotice, material_digest
 from .behavior_wire import Identifier, WireModel
 from .errors import Problem
+from .native_responses_wire import ACCEPTED_STATE_PROFILES
 from .storage import Repository, TableRepository, serialize
 
+# ADR-0009 2d-i parts this API code carries, read by the deploy's switch check (ci_deploy.API_2DI_SCHEMA, by AST):
+# 1 = P5's background cut; 2 = also P6's in-request wait and verify-only follow. A plain int literal.
+NATIVE_2DI_SCHEMA = 2
 AgentVersion = Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")]
 # Every write is a whole-row replace guarded by the ETag just read; a conflict reads again and recomputes.
 WRITE_ATTEMPTS = 4
@@ -27,11 +31,21 @@ MAX_BINDING_BYTES = 16 * 1024
 MAX_PREVIOUS_SESSIONS = 64
 # One row per Agent of one Team; the deploy gate refuses rather than stopping its read early.
 MAX_BINDING_ROWS = 10000
-# ADR-0009 §3: only the API's own profile is supported (Neal decision 6). A SID whose recorded profile is outside it
-# is never invoked, read through Session Files or stopped by this API (§7a zero-call need, ``SessionGuard``).
-SUPPORTED_STATE_PROFILES = frozenset({NATIVE_STATE_PROFILE})
-SourceStatus = Literal["idle", "failed", "deleted", "expired", "missing"]
-AbandonBasis = Literal["incompatible", "retired", "drifted"]
+# ADR-0009 §3 with the M1 relaxation: from 2d-i the supported set is {v1, v2}, while the API still sends v1 until
+# 2d-ii (then only v2). A SID whose recorded profile is outside it is never invoked, read through Session Files or
+# stopped by this API (§7a zero-call need, ``SessionGuard``).
+SUPPORTED_STATE_PROFILES = ACCEPTED_STATE_PROFILES
+# Recorded for a source found incompatible whose own profile is undeclared or unreadable: in no supported set, so
+# every guard and the deploy gate treat the SID as incompatible.
+INCOMPATIBLE_STATE_PROFILE = "incompatible"
+# ``active``: only a source that still runs when 2d-i abandons it: an ``admitting`` stuck past its bound (ADR-0009 §9
+# last row), or a background cut's fence whose files can not be moved.
+SourceStatus = Literal["idle", "failed", "deleted", "expired", "missing", "active"]
+# ``files_unmovable``/``files_overdue``: a background cut's fence after FA's stop whose files can not be moved (an
+# error no retry clears, or transient errors past their bound); it commits without them.
+AbandonBasis = Literal["incompatible", "retired", "drifted", "stuck_admission", "files_unmovable", "files_overdue"]
+# Source statuses whose environment still exists: an abandon of one carries the ④ notice, not "舊環境已失效".
+_SOURCE_KEPT = frozenset({"idle", "active"})
 SwitchNotice = Literal["updated", "without_files", "source_retired"]
 # M4 severity inside the slot: a later switch never replaces a more severe undelivered one.
 _SWITCH_RANK = {"updated": 0, "without_files": 1, "source_retired": 2}
@@ -94,6 +108,33 @@ class NativeBindingFresh(WireModel):
     attempt: Annotated[int, Field(ge=1, le=1_000_000)]
 
 
+class NativeBindingUpgrade(WireModel):
+    """ADR-0009 M1 2d-i step 2: the background cut's files fence, written before it asks Hosted for ``pending``, so a
+    ``pending`` naming ``hosted_session_id`` is this API's own fence (bounded, withdrawn by the background job), not one
+    an older follow left. ``started_at`` (the store's clock): another replica withdraws a fence without FA's recorded
+    stop only once it is older than the fence bound. ``agent_version``: the destination's, so the fence is driven at
+    its own session whatever the selector names later. ``stop_started``: written before every FA stop of the source
+    the fence sends (``mark_stop``); from then on the fence is never withdrawn, only driven to its commit."""
+    hosted_session_id: Identifier
+    agent_version: AgentVersion
+    request_id: Identifier
+    started_at: Annotated[str, Field(min_length=20, max_length=40)]
+    stop_started: bool = Field(default=False, exclude_if=lambda value: not value)
+
+
+ClockKind = Literal["retired", "admitting", "drive", "unmovable", "fence_broken"]
+
+
+class NativeBindingClock(WireModel):
+    """ADR-0009 2d-i P6: a bound's durable start, so it holds across API replicas and restarts. ``retired``: the first
+    retired read of the current SID (§7a (m)); ``admitting``: the first time ``subject`` (an ``admitting`` RID) was
+    seen stuck; ``drive``/``unmovable``: a fence's (``subject``, its RID) first failed drive and first unmovable read;
+    ``fence_broken``: the first time the fence's destination could not be read. One per kind, for the current SID."""
+    kind: ClockKind
+    subject: Identifier
+    since: Annotated[str, Field(min_length=20, max_length=40)]
+
+
 class NativeBindingRow(WireModel):
     schema_version: Literal["fa-native-binding-v1"] = "fa-native-binding-v1"
     agent_id: Identifier
@@ -127,6 +168,14 @@ class NativeBindingRow(WireModel):
         default=None, exclude_if=lambda value: value is None)
     # ADR-0009 M5: a raised attempt for the next fresh SID; absent (attempt 0) on every row that never needed one.
     fresh: NativeBindingFresh | None = Field(default=None, exclude_if=lambda value: value is None)
+    upgrade: NativeBindingUpgrade | None = Field(default=None, exclude_if=lambda value: value is None)
+    # ``state_profile`` is the repair fallback's v1, not a definition read (``NATIVE_BINDING_SWITCH_PROFILE_UNREAD``);
+    # the next successful read of the version's definition corrects it (``record_profile``).
+    profile_unread: bool = Field(default=False, exclude_if=lambda value: not value)
+    # Written only with FA_NATIVE_SESSION_GUARD_ENFORCE (an older API revision decodes rows strictly); a switch's
+    # ``record_switch`` rebuilds the row without them.
+    clocks: Annotated[tuple[NativeBindingClock, ...], Field(max_length=8)] = Field(
+        default=(), exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def consistent(self):
@@ -142,7 +191,14 @@ class NativeBindingRow(WireModel):
             raise ValueError("only the current SID can be abandoned")
         if self.fresh is not None and self.fresh.hosted_session_id != self.hosted_session_id:
             raise ValueError("a fresh-SID attempt belongs to the current SID")
+        if self.upgrade is not None and self.upgrade.hosted_session_id == self.hosted_session_id:
+            raise ValueError("a files fence names a destination other than the current SID")
+        if len({item.kind for item in self.clocks}) != len(self.clocks):
+            raise ValueError("one durable clock per kind")
         return self
+
+    def clock(self, kind: str) -> NativeBindingClock | None:
+        return next((item for item in self.clocks if item.kind == kind), None)
 
     def attempt(self, agent_version: str) -> int:
         """ADR-0009 M5: the attempt number of the next fresh SID for ``agent_version`` from the current SID."""
@@ -262,10 +318,11 @@ class NativeBindingStore:
 
     def claim(self, agent_id: str, *, hosted_session_id: str, created_agent_version: str,
               observed_version: str | None = None, source: Literal["claim", "vm"] = "claim",
-              created_at=None) -> NativeBindingRow:
+              created_at=None, state_profile: str | Callable[[], str] = NATIVE_STATE_PROFILE) -> NativeBindingRow:
         """Insert once; an existing row is read back, never overwritten. An ``observed_version`` that already differs
         from the creation version sets the drift flag in this insert: otherwise every later observation would equal
-        the recorded drifted version and the flag would never be set (ADR-0009 §2)."""
+        the recorded drifted version and the flag would never be set (ADR-0009 §2). ``state_profile``: what the
+        creation version's definition declares (ADR-0009 2d-i); a callable is read only when this inserts."""
 
         written = []
 
@@ -279,7 +336,8 @@ class NativeBindingStore:
                 agent_id=agent_id, hosted_session_id=hosted_session_id, created_agent_version=created_agent_version,
                 drift=drifted, notice_pending=drifted, notice_to_version=observed if drifted else None,
                 observed=NativeBindingObservation(agent_version=observed, observed_at=self._now(), source=source),
-                created_at=_timestamp(created_at)))
+                created_at=_timestamp(created_at),
+                state_profile=state_profile() if callable(state_profile) else state_profile))
             return written[0]
 
         row = self._update(agent_id, claiming)
@@ -319,10 +377,13 @@ class NativeBindingStore:
                         source, hosted_session_id, row.created_agent_version, agent_version, row.drift)
         return row
 
-    def record_switch(self, agent_id: str, view) -> NativeBindingRow:
+    def record_switch(self, agent_id: str, view, *, state_profile: str = NATIVE_STATE_PROFILE,
+                      profile_unread: bool = False) -> NativeBindingRow:
         """ADR-0009 §7a (f)/(j). Idempotent, so a crash between the commit and this write is repaired by the next
         follow's rerun; when the commit's previous SID is not the row's (the selector moved before the rerun), both
-        are kept as previous SIDs."""
+        are kept as previous SIDs. ``state_profile``: what the new SID's version declares (2d-i); ``profile_unread``:
+        it is the repair fallback's v1, corrected by the next definition read. A row with ``upgrade`` is rebuilt
+        without it: the fence ended in this commit."""
 
         def switching(row):
             if (row is not None and row.hosted_session_id == view.hosted_session_id
@@ -330,7 +391,12 @@ class NativeBindingStore:
                 return None
             previous = list(row.previous_sessions) if row is not None else []
             decision = None if row is None else row.abandon
-            if decision is not None and decision.hosted_session_id != view.previous_hosted_session_id:
+            # The abandon path never moves files (Hosted's ``abandon_session`` commits ``files_migrated=False``), so a
+            # commit with ``files_migrated is True`` was another switch (a fence's drive, a follow) whatever basis the
+            # decision named: its moved files and "updated" notice are the truth, so any basis is dropped, not only
+            # the ``files_*`` ones a failed no-files attempt wrote.
+            if decision is not None and (decision.hosted_session_id != view.previous_hosted_session_id
+                                         or view.files_migrated is True):
                 decision = None
             sources = []
             if row is not None and row.hosted_session_id not in {view.previous_hosted_session_id, view.hosted_session_id}:
@@ -338,7 +404,7 @@ class NativeBindingStore:
                     hosted_session_id=row.hosted_session_id, agent_version=row.created_agent_version))
             sources.append(NativeBindingSession(
                 hosted_session_id=view.previous_hosted_session_id, agent_version=view.previous_agent_version,
-                retired=decision is not None and decision.source_status != "idle"))
+                retired=decision is not None and decision.source_status not in _SOURCE_KEPT))
             for item in sources:
                 if all(kept.hosted_session_id != item.hosted_session_id for kept in previous):
                     previous.append(item)
@@ -350,7 +416,7 @@ class NativeBindingStore:
             # §8 switch notice; an undelivered more severe one stays (M4). Only a confirmed move of the work files is
             # "updated": ``files_migrated=None`` (an image without workspace files) moved none, so it says so honestly.
             if decision is not None:
-                notice = "without_files" if decision.source_status == "idle" else "source_retired"
+                notice = "without_files" if decision.source_status in _SOURCE_KEPT else "source_retired"
             else:
                 notice = "updated" if view.files_migrated is True else "without_files"
             kept = None if row is None else row.switch_notice
@@ -361,8 +427,8 @@ class NativeBindingStore:
                 created_agent_version=view.hosted_agent_version,
                 observed=NativeBindingObservation(
                     agent_version=view.hosted_agent_version, observed_at=self._now(), source="vm"),
-                previous_sessions=tuple(previous), switch_notice=notice,
-                unfinished_checked=None if row is None else row.unfinished_checked,
+                previous_sessions=tuple(previous), switch_notice=notice, state_profile=state_profile,
+                profile_unread=profile_unread, unfinished_checked=None if row is None else row.unfinished_checked,
                 last_switch=NativeBindingSwitch(
                     reason="version_follow", previous_hosted_session_id=view.previous_hosted_session_id,
                     files_migrated=view.files_migrated) if decision is None else NativeBindingSwitch(
@@ -386,6 +452,78 @@ class NativeBindingStore:
         if row is not None and row.attempt(agent_version) == attempt + 1:
             log.warning("NATIVE_BINDING_FRESH_ATTEMPT session_id=%s version=%s attempt=%d",
                         hosted_session_id, agent_version, attempt + 1)
+        return row
+
+    def record_upgrade(self, agent_id: str, *, hosted_session_id: str, upgrade: NativeBindingUpgrade | None,
+                       lost: NativeBindingUpgrade | None = None) -> NativeBindingRow | None:
+        """ADR-0009 M1 2d-i: set (before the files fence's ``pending``) or clear (after its withdraw) the background
+        cut's fence on the row that still names ``hosted_session_id``; another SID's row is left alone. A fence whose
+        stop is marked is never replaced or cleared (its commit's ``record_switch`` ends it), except the ``lost`` one
+        ``_settle`` found gone from Hosted without a commit; the same fence (SID and RID) is never replaced: the
+        returned row's ``started_at`` says which job's fence it is."""
+
+        def recording(row):
+            if row is None or row.hosted_session_id != hosted_session_id or row.upgrade == upgrade:
+                return None
+            kept = row.upgrade
+            if kept is not None and (kept.stop_started and kept != lost or upgrade is not None and (
+                    kept.hosted_session_id, kept.request_id) == (upgrade.hosted_session_id, upgrade.request_id)):
+                return None
+            if lost is not None and kept != lost:
+                return None  # the lost fence was replaced meanwhile: the newer one is not cleared with it
+            return row.model_copy(update={"upgrade": upgrade})
+
+        return self._update(agent_id, recording)
+
+    def mark_stop(self, agent_id: str, *, hosted_session_id: str, upgrade: NativeBindingUpgrade) -> NativeBindingRow | None:
+        """The fence's durable "stop started" marker, written before FA's stop of the source (idempotent); only on the
+        row that still records this fence (same destination SID and RID)."""
+
+        def marking(row):
+            fence = None if row is None else row.upgrade
+            if (fence is None or row.hosted_session_id != hosted_session_id
+                    or (fence.hosted_session_id, fence.request_id) != (upgrade.hosted_session_id, upgrade.request_id)):
+                return None
+            return row.model_copy(update={"upgrade": fence.model_copy(update={"stop_started": True})})
+
+        return self._update(agent_id, marking)
+
+    def record_clock(self, agent_id: str, *, hosted_session_id: str, kind: str, subject: str | None,
+                     since: str | None = None, restart: bool = False) -> NativeBindingRow | None:
+        """Start the durable clock ``kind`` for ``subject`` at ``since`` (kept when it already runs for the same
+        subject, unless ``restart``), or clear it (``subject`` None), on the row that still names
+        ``hosted_session_id``. Returns the row as written or read; its ``clock(kind)`` is the start that holds."""
+
+        def recording(row):
+            if row is None or row.hosted_session_id != hosted_session_id:
+                return None
+            kept = row.clock(kind)
+            if subject is None and kept is None or kept is not None and kept.subject == subject and not restart:
+                return None
+            others = tuple(item for item in row.clocks if item.kind != kind)
+            started = () if subject is None else (NativeBindingClock(kind=kind, subject=subject, since=since),)
+            return row.model_copy(update={"clocks": others + started})
+
+        return self._update(agent_id, recording)
+
+    def record_profile(self, agent_id: str, *, hosted_session_id: str, created_agent_version: str,
+                       state_profile: str) -> NativeBindingRow | None:
+        """A definition read of the current SID's version replaces the repair fallback's profile (``profile_unread``)."""
+
+        written = []
+
+        def correcting(row):
+            written.clear()
+            if (row is None or not row.profile_unread or row.hosted_session_id != hosted_session_id
+                    or row.created_agent_version != created_agent_version):
+                return None
+            written.append(row.model_copy(update={"state_profile": state_profile, "profile_unread": False}))
+            return written[0]
+
+        row = self._update(agent_id, correcting)
+        if written and row == written[0]:
+            log.warning("NATIVE_BINDING_PROFILE_CORRECTED session_id=%s profile=%s", hosted_session_id,
+                        row.state_profile)
         return row
 
     def clear_notice(self, agent_id: str, delivered: NativeEnvironmentNotice) -> NativeBindingRow | None:
@@ -428,14 +566,16 @@ class NativeBindingStore:
         return row
 
     def decide_abandon(self, agent_id: str, *, hosted_session_id: str, basis: str, source_status: str,
-                       created_agent_version: str) -> NativeBindingAbandon | None:
+                       created_agent_version: str, state_profile: str = NATIVE_STATE_PROFILE) -> NativeBindingAbandon | None:
         """ADR-0009 §7a (g): write the decision once for the current SID (claiming an unclaimed Agent in the same
-        insert). An existing decision is returned unchanged, never replaced; None when the row names another SID."""
+        insert, with ``state_profile``). An existing decision is returned unchanged, never replaced; None when the row
+        names another SID."""
 
         def deciding(row):
             if row is None:
                 row = NativeBindingRow(
                     agent_id=agent_id, hosted_session_id=hosted_session_id, created_agent_version=created_agent_version,
+                    state_profile=state_profile,
                     observed=NativeBindingObservation(
                         agent_version=created_agent_version, observed_at=self._now(), source="claim"))
             elif row.hosted_session_id != hosted_session_id or row.abandon is not None:

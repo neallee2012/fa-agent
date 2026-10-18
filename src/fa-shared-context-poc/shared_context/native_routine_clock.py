@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import time
 
-from .behavior_team_registry import registered_agent_ids
+from .behavior_team_registry import registered_agent_ids, retired_agent_ids
 from .errors import Problem
 from .native_routine_auth import NativeRoutineApiClock
 from .native_routine_wire import NativeRoutineTrigger
@@ -64,6 +64,13 @@ class NativeRoutineClock:
         except Exception as error:
             _LOG.warning("FA_NATIVE_ROUTINE_CLOCK_ROSTER exception_type=%s", type(error).__name__)
             agents = tuple(dict.fromkeys(target.agent_id for target in self.owner.config.targets))
+        try:
+            # A retired Agent's routines are kept (nothing is deleted) and never fire; said once, not every minute.
+            for agent_id in retired_agent_ids(self.owner.runtime.store, self.owner.config):
+                self._note(("retired", agent_id), "retired", "FA_NATIVE_ROUTINE_CLOCK_RETIRED agent=%s skipped",
+                           agent_id[:8])
+        except Exception as error:
+            _LOG.warning("FA_NATIVE_ROUTINE_CLOCK_ROSTER exception_type=%s", type(error).__name__)
         for agent_id in agents:
             if self._stopping or self.monotonic() >= deadline:
                 counts["deferred"] += 1

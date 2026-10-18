@@ -104,6 +104,42 @@ def test_real_main_initializes_policy_and_follows_native_but_reports_legacy_skip
     } for identifier in legacy)
 
 
+@pytest.mark.parametrize("failing", [False, True])
+def test_verify_follow_skips_unscoped_executor_agents_like_follow_and_still_fails_a_real_error(
+    fresh_case, monkeypatch, tmp_path, capsys, failing,
+):
+    from types import SimpleNamespace
+
+    case = fresh_case
+    initialize(case)
+    config = tmp_path / "deployment-config.json"
+    config.write_text(case.config.model_dump_json(), encoding="utf-8")
+    monkeypatch.delenv("BEHAVIOR_SERVER_CONFIG_JSON", raising=False)
+    foundry = Foundry(*case.config.targets, ready_after=0)
+    for target in case.config.targets:
+        foundry.add(target.agent_name, 41, "previous-build")
+    monkeypatch.setattr(versions, "current_hosted_version", REAL_CURRENT)
+    monkeypatch.setattr(versions, "_POLL_SECONDS", 0)
+    build = server.build_server
+    monkeypatch.setattr(server, "build_server", lambda configuration: build(
+        configuration, **case.options, hosted_versions=versions.HostedVersions(lambda _endpoint: foundry)))
+    peer = case.config.targets[1].agent_id
+
+    def environment_view(self, client):
+        if failing and client.target.agent_id == peer:
+            raise Problem(503, "NATIVE_METADATA_UNKNOWN", "OFFLINE metadata read failed")
+        return SimpleNamespace(hosted_agent_version="41", state="unverified", model_dump=lambda mode: {})
+
+    monkeypatch.setattr(NativeSessions, "environment_view", environment_view)
+    assert versions.main(["sync", "--config", str(config), "--image", "offline-new:image", "--route",
+                          "--verify-follow", "--follow-wait-seconds", "1"]) == int(failing)
+    by_id = {row["agent_id"]: row for row in map(json.loads, capsys.readouterr().out.splitlines())}
+    assert all(by_id[target.agent_id]["environment_follow"] == {
+        "agent_id": target.agent_id, "state": "skipped", "reason": "AGENT_SCOPE_MISSING"}
+        for target in case.config.targets[2:])
+    assert by_id[peer]["environment_follow"]["state"] == ("failed" if failing else "ok")
+
+
 def test_missing_attached_policy_is_reported_without_a_traceback_or_fabricated_installation(fresh_case):
     initialize(fresh_case)
     assert fresh_case.composition.runtime.work_policy is None

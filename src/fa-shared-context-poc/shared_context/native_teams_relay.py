@@ -74,6 +74,7 @@ CATCH_UP_CUT = "……（太長，完整內容在工作台）"
 
 TEXT = {
     "refused": "這個助理只回應它的主人。",
+    "retired": "這個助理已經退役，這則訊息沒有送給它。",
     "running": "這一輪還在跑，完成後結果在工作台。",
     "running_catch_up": "這一輪還在跑；完成後，回覆會附在你下一則訊息的回覆前面，也可以先到工作台看。",
     "question": "助理有問題要問你，請到工作台回答，結果會在工作台。",
@@ -96,7 +97,7 @@ TEXT = {
 # same literals). The relay forwards only ``text``, so the API adds the sentence to a final reply's text.
 NOTICE_TEXT = {
     "environment_updated": "助理已更新到新版本，工作檔也一起帶過來了。",
-    "environment_switched_without_files": "已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。",
+    "environment_switched_without_files": "已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。",
     "environment_source_retired": "已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。",
     "earlier_version_unfinished": "這則訊息是較早的版本接下的，目前環境無法接續；請用新訊息再送一次。",
 }
@@ -203,9 +204,20 @@ class TeamsRelay:
         self.composition, self.agents, self.records, self.hitl = composition, agents, records, hitl
         self.clock = clock
 
+    def _scope(self, agent_id):
+        """The Agent's scope, or None when it was retired: the relay then answers in words, not with a raw 410."""
+        try:
+            return resolve_agent_scope(self.composition.runtime.store, self.composition.config, agent_id)
+        except Problem as error:
+            if error.body["error"]["code"] != "AGENT_RETIRED":
+                raise
+            return None
+
     def turn(self, relay_oid, turn: RelayTurn, *, catch_up=False) -> RelayReply:
         agent_id = self.agents[relay_oid]
-        scope = resolve_agent_scope(self.composition.runtime.store, self.composition.config, agent_id)
+        scope = self._scope(agent_id)
+        if scope is None:
+            return RelayReply(state="refused", text=TEXT["retired"])
         if turn.user_oid is None or turn.user_oid != scope.human_oid:
             return RelayReply(state="refused", text=TEXT["refused"])
         # The accepted trust edge: the allowlisted relay vouches for the platform oid, which equals the Team owner.
@@ -283,7 +295,9 @@ class TeamsRelay:
     def decision(self, relay_oid, command: RelayDecision, *, catch_up=False) -> RelayReply:
         """Approve or deny one approval card by its code; never reaches the model, never changes rules."""
         agent_id = self.agents[relay_oid]
-        scope = resolve_agent_scope(self.composition.runtime.store, self.composition.config, agent_id)
+        scope = self._scope(agent_id)
+        if scope is None:
+            return RelayReply(state="refused", text=TEXT["retired"])
         if command.user_oid is None or command.user_oid != scope.human_oid:
             return RelayReply(state="refused", text=TEXT["refused"])
         approver = BehaviorPrincipal(str(scope.tenant_id), scope.human_oid, scope.team_id, "human", None,

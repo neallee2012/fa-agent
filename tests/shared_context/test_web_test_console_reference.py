@@ -22,7 +22,7 @@ FIXTURES=Path(__file__).parent/"fixtures"/"web_test_console"
 def test_frozen_long_reply_reference_and_original_ack_client_seam():
     root=Path(os.environ.get("FA_UI_REFERENCE_ART",FIXTURES))
     producer_raw=(root/"producer.json").read_bytes()
-    assert sha(producer_raw)=="661929bbb141d82dae0faa8b51dbf93b61734be1348c2c94e7b7f14ad3986c83"
+    assert sha(producer_raw)=="84b471685cb34d2d8d167aa30318c58c054595a0d07ed6ed023e005fad4ec5d0"
     p=json.loads(producer_raw)
     reply_bytes=p["reply_json_utf8"].encode("utf-8")
     reply=aw.TextReply.model_validate_json(reply_bytes)

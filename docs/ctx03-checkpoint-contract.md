@@ -53,7 +53,7 @@ reader 先認得 Linux profile 再啟用 writer，是避免寫出唯一但不可
 此修正不啟用automatic/model-switch compaction、不增加codec或改寫舊archive。
 **2026-10-13 補註：** 程式原本在 auto profile 接受任何非 `manual` 的 trigger（含 `model_switch`），和上句不一致；
 已依本契約改為 auto profile 也拒絕 `model_switch`（`SDK_STATE_SOURCE_UNVERIFIED`）。對話中換模型
-（`FA_NATIVE_MODEL_SWITCH`，預設關）只走 cold resume：丟掉留著的 SDK，從已發布 checkpoint 以新模型 `resume_session`，
+（`FA_NATIVE_MODEL_SWITCH`，程式預設關（stage A／B 與新 azd 環境打開））只走 cold resume：丟掉留著的 SDK，從已發布 checkpoint 以新模型 `resume_session`，
 不用 `session.model.switchTo`；據此**推定**不會產生 model-switch compaction，但尚未在 runtime 1.0.83 實測。
 若實際會產生，換模型的回合依上述拒絕 fail closed（`SDK_STATE_SOURCE_UNVERIFIED`），不寫出 checkpoint；
 dev 探測把「換模型回合沒有 `model_switch` compaction」列為通過條件。codec、archive 與保存點格式都不變。

@@ -119,11 +119,16 @@ def test_started_response_id_and_run_token_are_one_cas(responses, monkeypatch, a
 
 @pytest.mark.parametrize("checkpoint", ["complete", "missing", "corrupt"])
 def test_started_reentry_only_publishes_a_fully_verified_saved_turn(responses, monkeypatch, checkpoint):
+    import shared_context.native_turns as native_turns
+
     write = FoundryStateStore.set_item
     attempts = []
+    # Every in-turn save attempt (audit #1 retries) and the re-entry after them lose the completed CAS.
+    lost = len(native_turns.SAVE_RETRY_SECONDS) + 2
+    monkeypatch.setattr(native_turns, "SAVE_RETRY_SECONDS", (0.01,) * len(native_turns.SAVE_RETRY_SECONDS))
 
     async def completed_unconfirmed(store, key, value, **options):
-        if key == "rid:rid-1" and value["receipt"]["status"] == "completed" and len(attempts) < 2:
+        if key == "rid:rid-1" and value["receipt"]["status"] == "completed" and len(attempts) < lost:
             attempts.append(value)
             raise ServiceResponseError("OFFLINE terminal CAS was not applied")
         return await write(store, key, value, **options)
@@ -136,7 +141,7 @@ def test_started_reentry_only_publishes_a_fully_verified_saved_turn(responses, m
     assert failure["status"] == "failed" and failure["error"]["code"] == "NATIVE_STATE_STORE_UNKNOWN"
     saved = responses.call(responses.runtime.read, "rid-1")
     assert saved.status == "started" and saved.response_id == created.json()["id"]
-    assert len(attempts) == 2 and len(responses.sdk.calls) == 1
+    assert len(attempts) == lost and len(responses.sdk.calls) == 1
     read = FoundryStateStore.get_item
 
     async def unavailable(store, key):
@@ -200,8 +205,10 @@ def test_fenced_unknown_write_failure_is_explicit_not_a_successful_receipt(
 
 
 @pytest.mark.parametrize("sdk_outcome", ["raises", "returns"])
-def test_cancel_winning_the_unknown_cas_reports_unconfirmed_instead_of_not_taken(
+def test_cancel_winning_the_unknown_cas_is_merged_and_the_rid_ends_unknown_not_started(
         responses, monkeypatch, sdk_outcome):
+    """Audit #3: the unknown write is merged onto the cancel that won its CAS (same run token and SID), so the RID ends
+    ``unknown`` with ``cancel_requested`` kept, instead of staying ``started`` and holding the conversation."""
     write = FoundryStateStore.set_item
     races = []
     unknown_attempts = []
@@ -229,9 +236,9 @@ def test_cancel_winning_the_unknown_cas_reports_unconfirmed_instead_of_not_taken
     response = responses.respond(accepted, stream=True)
     terminal = sse_events(response)[-1]
     assert terminal["type"] == "response.failed"
-    assert terminal["response"]["error"]["code"] == "NATIVE_STATE_STORE_UNKNOWN"
+    assert terminal["response"]["error"]["code"] == "NATIVE_TURN_UNKNOWN"
     retained = responses.call(responses.runtime.read, "rid-1")
-    assert retained.status == "started" and retained.cancel_requested
-    assert retained.failure_code is None and races == [True]
+    assert retained.status == "unknown" and retained.cancel_requested
+    assert retained.failure_code == "NATIVE_TURN_UNKNOWN" and races == [True]
     assert len(responses.sdk.calls) == 1
-    assert len(unknown_attempts) == 1
+    assert len(unknown_attempts) == 2

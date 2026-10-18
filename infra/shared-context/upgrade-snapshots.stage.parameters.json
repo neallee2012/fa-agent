@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "deployUpgradeSnapshots": {
+      "value": false
+    },
+    "location": {
+      "value": "westus3"
+    },
+    "storageName": {
+      "value": "stfasnapstagedemo"
+    },
+    "containerName": {
+      "value": "upgrade-snapshots"
+    },
+    "apiIdentityName": {
+      "value": "id-facontext-api-stage"
+    },
+    "vnetName": {
+      "value": "vnet-facontext-api"
+    },
+    "privateEndpointSubnetName": {
+      "value": "snet-private-endpoints"
+    },
+    "privateEndpointName": {
+      "value": "pe-fa-upgrade-snapshot-blob"
+    },
+    "tags": {
+      "value": {
+        "workload": "hosted-sandbox-poc",
+        "architecture": "shared-context",
+        "dataClassification": "synthetic-only",
+        "environment": "stage"
+      }
+    }
+  }
+}

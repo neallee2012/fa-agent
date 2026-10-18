@@ -353,7 +353,8 @@ def test_old_or_disabled_profile_does_not_gain_memory_terminal_permission(native
         with c.supervisor.journal.connect() as db:
             failure = json.loads(db.execute("SELECT body FROM assistant_failures").fetchone()[0])
         assert failure["code"] == "ASSISTANT_API_UNKNOWN"
-        assert failure.get("upstream_error_code") in {None, "UNCLASSIFIED"}
+        # A diagnostic only since d5532638/468f6d39 put it in the shared acquire allowlist; no-start stays gated above.
+        assert failure.get("upstream_error_code") == "BEHAVIOR_UNSAFE_CONTENT"
 
 
 @pytest.mark.parametrize("fault", ["withdraw-after-capture", "capture-ack-lost"])

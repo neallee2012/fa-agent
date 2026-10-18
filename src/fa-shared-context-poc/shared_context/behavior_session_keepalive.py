@@ -21,6 +21,7 @@ class InstructionSessionKeepalive:
         self.last_attempt = None
         self.peer = None
         self.parent = None
+        self.peer_retired = False
 
     def _current(self):
         c, identity = self.composition, self.binding_id
@@ -76,6 +77,13 @@ class InstructionSessionKeepalive:
                     self.peer.parent = self
                 self.peer._tick()
         except Exception as error:
+            if isinstance(error, Problem) and error.body["error"]["code"] == "AGENT_RETIRED":
+                # A retired peer gets no keepalive; said once per keepalive, not on every tick.
+                if not self.peer_retired:
+                    self.peer_retired = True
+                    logging.getLogger(__name__).info(
+                        "HOSTED_SESSION_KEEPALIVE_PEER_RETIRED binding_id=%s skipped", self.binding_id)
+                return
             logging.getLogger(__name__).warning(
                 "HOSTED_SESSION_KEEPALIVE_UNAVAILABLE binding_id=%s phase=peer_read exception_type=%s",
                 self.binding_id, _exception_type(error))

@@ -298,8 +298,8 @@ def hide_receiver_session(case, monkeypatch):
     # The receiver's selector moved without a reader yet; a newly started API holds no cached binding.
     native_sessions(case.base.b).forget()
     read = behavior_native_sessions._read_platform_session
-    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", lambda client: (
-        None if client.target.agent_id == case.base.b.agent_id else read(client)))
+    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", lambda client, **options: (
+        None if client.target.agent_id == case.base.b.agent_id else read(client, **options)))
 
 
 def test_http_relay_preserves_following_refusal_for_the_official_sender_retry(relay_http):
@@ -334,7 +334,8 @@ def test_original_sender_drives_a_stale_recipient_to_ready_without_a_human_or_po
                         lambda runtime, target, **kwargs: "42" if target.agent_id == case.base.b.agent_id
                         else selected(runtime, target, **kwargs))
     monkeypatch.setattr(behavior_native_sessions, "_read_platform_session",
-                        lambda target: peer_read(target) if target.target.agent_id == case.base.b.agent_id else read(target))
+                        lambda target, **options: peer_read(target, **options)
+                        if target.target.agent_id == case.base.b.agent_id else read(target, **options))
     environment_http = case.clients[1].http._transport
 
     def remote(packet):
@@ -827,8 +828,8 @@ def test_a_relay_send_reads_the_recipient_selector_and_never_invokes_its_kept_ol
     selected, read = behavior_agent_versions.current_hosted_version, behavior_native_sessions._read_platform_session
     monkeypatch.setattr(behavior_agent_versions, "current_hosted_version", lambda runtime, target, **kwargs: (
         "99" if target.agent_id == case.base.b.agent_id else selected(runtime, target, **kwargs)))
-    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", lambda client: (
-        None if client.target.agent_version == "99" else read(client)))
+    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", lambda client, **options: (
+        None if client.target.agent_version == "99" else read(client, **options)))
     before = len(case.remotes[1].calls)
     with pytest.raises(Problem) as refused:
         gateway.send(case.principal, send_command(case))
@@ -848,8 +849,8 @@ def test_a_continuation_reads_the_sender_selector_and_never_invokes_its_kept_old
     selected, read = behavior_agent_versions.current_hosted_version, behavior_native_sessions._read_platform_session
     monkeypatch.setattr(behavior_agent_versions, "current_hosted_version", lambda runtime, target, **kwargs: (
         "99" if target.agent_id == case.sender.agent_id else selected(runtime, target, **kwargs)))
-    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", lambda client: (
-        None if client.target.agent_version == "99" else read(client)))
+    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", lambda client, **options: (
+        None if client.target.agent_version == "99" else read(client, **options)))
     before = len(case.remotes[0].calls)
     with pytest.raises(Problem) as refused:
         gateway.continue_original(case.principal, NativeRelayResult(
@@ -908,3 +909,59 @@ def test_another_agent_can_not_have_a_waiting_responses_message_sent(relay_case,
     assert sent == []
     gateway.dispatch_waiting(case.principal, body)
     assert sent == ["waits-here"]
+
+
+def flaky_usage(monkeypatch):
+    """The first usage write fails as a lost ledger reply; later ones record (and list) their RID."""
+    import shared_context.behavior_instruction_cost as cost
+    original, state = cost.record_agent_turn_usage, {"fail": 1, "recorded": []}
+
+    def record(control, *, rid, usage):
+        if state["fail"]:
+            state["fail"] -= 1
+            raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "synthetic lost ledger reply")
+        state["recorded"].append(rid)
+        return original(control, rid=rid, usage=usage)
+
+    monkeypatch.setattr(cost, "record_agent_turn_usage", record)
+    return state
+
+
+def test_a_relay_resend_of_a_finished_turn_records_the_usage_a_failed_write_left(relay_case, monkeypatch):
+    from shared_context.native_agent_api import NativeAgentRelayGateway
+
+    case = relay_case
+    gateway = NativeAgentRelayGateway(case.base.a, enabled=True, repository=case.repository)
+    accepted = gateway.send(case.principal, send_command(case))
+    case.remotes[1].completed(accepted.message_id)
+    state = flaky_usage(monkeypatch)
+    with pytest.raises(Problem) as failed:
+        gateway.send(case.principal, send_command(case))
+    assert failed.value.body["error"]["code"] == "BEHAVIOR_COMMIT_UNKNOWN", "the failure reaches the sender's retry"
+    assert gateway.send(case.principal, send_command(case)).message_id == accepted.message_id
+    assert state["recorded"] == [accepted.message_id]
+    assert len(case.remotes[1].records) == 1
+
+
+def test_a_resent_peer_result_records_the_usage_a_failed_write_left(relay_case, monkeypatch):
+    from dataclasses import replace
+    from shared_context.native_agent_api import NativeAgentRelayGateway, NativeRelayResult
+
+    case = relay_case
+    gateway = NativeAgentRelayGateway(case.base.a, enabled=True, repository=case.repository)
+    accepted = gateway.send(case.principal, send_command(case))
+    case.remotes[0].completed(case.sender.request_id)
+    case.remotes[1].completed(accepted.message_id)
+    sender = case.remotes[1].records[accepted.message_id]
+    peer_scope = case.base.b.config.agent_scope(case.base.b.agent_id)
+    peer = replace(case.principal, oid=str(peer_scope.identity.oid), actor_id=peer_scope.identity.actor)
+    notify = NativeRelayResult(conversation_id=sender.conversation_id, request_id=sender.request_id)
+    wake = gateway.result(peer, notify)
+    case.remotes[0].completed(wake.message_id)
+    state = flaky_usage(monkeypatch)
+    with pytest.raises(Problem) as failed:
+        gateway.result(peer, notify)
+    assert failed.value.body["error"]["code"] == "BEHAVIOR_COMMIT_UNKNOWN", "the failure reaches the peer's retry"
+    assert gateway.result(peer, notify).message_id == wake.message_id
+    assert state["recorded"] == [wake.message_id]
+    assert len(case.remotes[0].records) == 2

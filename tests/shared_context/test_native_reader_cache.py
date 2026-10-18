@@ -52,7 +52,7 @@ class Platform:
             raise self.selector
         return self.version
 
-    def session(self, client):
+    def session(self, client, **_options):
         self.session_lookups += 1
         if client.target.session_id in self.retired:
             raise behavior_native_sessions._RetiredSession(503, "NATIVE_BOOTSTRAP_UNKNOWN", "retired")
@@ -379,24 +379,56 @@ def test_a_follow_up_after_the_selector_check_expired_still_prefetches_on_the_co
 
 
 def test_a_selected_version_without_a_session_never_invokes_an_older_one_and_the_same_rid_waits(native_api, monkeypatch):
+    from shared_context.behavior_native_sessions import NativeSessions
+
     case = native_api
     platform = Platform(case, monkeypatch)
     assert submit(case).status_code == 202
     source = case.remote.target.session_id
     platform.version = "42"  # Another process moved the selector; nobody created the 42 session yet.
+    # 2d-i P7: the submit follows (not README ⓐ's refusal); the follow itself is ``advance``'s own tests' subject.
+    monkeypatch.setattr(NativeSessions, "advance", lambda self, client, command, *, before_send: NativeEnvironmentView(
+        agent_id=case.remote.target.agent_id, request_id=command.request_id, state="pending", reason="source_active",
+        previous_hosted_session_id=source, previous_agent_version="41",
+        hosted_session_id="fa-native-destination", hosted_agent_version="42"))
     platform.invoked.clear()
     past_selector_check(monkeypatch)
     waiting = submit(case, rid="before-42-session")
     error = waiting.json()["error"]
-    assert (waiting.status_code, error["code"]) == (503, "AGENT_VERSION_FOLLOWING"), waiting.text
-    assert error["not_dispatched"] is True and error["request_id"] == "before-42-session"
-    assert "server_following" not in error
+    assert error["not_dispatched"] is True and error["request_id"] == "before-42-session", waiting.text
+    assert error["server_following"] is True
     assert platform.invoked == []
     destination = platform.follow_elsewhere("42", replace=False)
     accepted = submit(case, rid="before-42-session")
     assert accepted.status_code == 202, accepted.text
     assert source not in {sid for sid, _ in platform.invoked}
     assert destination.records["before-42-session"].hosted_session_id == destination.target.session_id
+
+
+def test_p7_a_rowless_agent_with_only_another_versions_session_follows_from_the_submit(native_api, monkeypatch):
+    from shared_context.behavior_native_sessions import NativeSessions
+
+    case = native_api
+    platform = Platform(case, monkeypatch)
+    assert submit(case).status_code == 202
+    platform.version = "42"  # The selector moved; only the 41 session exists and this Agent has no binding row.
+    followed = []
+
+    def advance(self, client, command, *, before_send):
+        followed.append(command.expected_agent_version)
+        return NativeEnvironmentView(
+            agent_id=case.remote.target.agent_id, request_id=command.request_id, state="pending",
+            reason="source_active", previous_hosted_session_id=case.remote.target.session_id,
+            previous_agent_version=case.remote.target.agent_version, hosted_session_id="fa-native-destination",
+            hosted_agent_version="42")
+
+    monkeypatch.setattr(NativeSessions, "advance", advance)
+    platform.invoked.clear()
+    past_selector_check(monkeypatch)
+    moving = submit(case, rid="p7-moves")
+    error = moving.json()["error"]
+    assert error["not_dispatched"] is True and error.get("server_following") is True, moving.text
+    assert followed == ["42"] and platform.invoked == []
 
 
 def test_a_submit_whose_session_listing_is_unavailable_is_not_called_never_prepared(native_api, monkeypatch):

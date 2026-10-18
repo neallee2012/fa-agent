@@ -73,8 +73,7 @@ def test_defaults_only_use_keys_and_values_the_stage_profile_already_has(azd_pro
         assert set(base[section]) <= set(stage[section]), section
         assert all(stage[section][key] == value for key, value in base[section].items()), section
     assert base["conversation_defaults"] == stage["conversation_defaults"]
-    # A subset, like the sections above: stage may turn on more (FA_NATIVE_MODEL_SWITCH, 00ff5fe1) than a new azd
-    # environment starts with.
+    # A subset, like the sections above: stage may turn on more than a new azd environment starts with.
     overlay = stage["agents"][0]["hosted_environment"]
     assert base["assistant_hosted_environment"].items() <= overlay.items()
     assert base["hosted_idle_timeout_seconds"] == stage["hosted_idle_timeout_seconds"]
@@ -82,7 +81,7 @@ def test_defaults_only_use_keys_and_values_the_stage_profile_already_has(azd_pro
     raw = json.dumps(base)
     assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-", raw)
     assert "https://" not in raw and "stage" not in raw
-    # Off by default: no Memory Store, "+" delegation, toolbox or feed reader exists in a new environment.
+    # No toolbox or feed reader in a new environment; the "+" settings need the project ID, so profile.py adds them.
     for key in ("FA_ONBOARDING_ROLE_SCOPE", "FA_CAPABILITY_TOOLBOX_ENTRIES", "FA_REMOTE_CONSOLE_CLIENT_ID",
                 "FEED_MCP_PUBLIC_KEY"):
         assert key not in raw
@@ -104,6 +103,15 @@ def test_a_new_environment_has_no_team_connector_and_needs_no_teams_or_github_ap
         assert profile["api_environment"]["FA_TEAM_MCP_ENABLED"] == "1"
     stage = json.loads((ROOT / "deploy" / "stage" / "stage.json").read_text(encoding="utf-8"))
     assert stage["api_environment"]["FA_TEAM_CONNECTORS_ENABLED"] == "1"
+
+
+def test_upgrade_snapshot_url_reaches_the_api_only_from_the_opt_in_output(azd_profile):
+    assert "FA_UPGRADE_SNAPSHOT_CONTAINER_URL" not in azd_profile.build(values())["api_environment"]
+    assert "FA_UPGRADE_SNAPSHOT_CONTAINER_URL" not in azd_profile.build(
+        values(FA_UPGRADE_SNAPSHOT_CONTAINER_URL=""))["api_environment"]
+    url = "https://stsnaptok3n.blob.core.windows.net/upgrade-snapshots"
+    on = azd_profile.build(values(FA_UPGRADE_SNAPSHOT_CONTAINER_URL=url))["api_environment"]
+    assert on["FA_UPGRADE_SNAPSHOT_CONTAINER_URL"] == url
 
 
 def test_team_mcp_is_off_when_bicep_does_not_grant_the_api_contributor(azd_profile):
@@ -139,17 +147,39 @@ def test_profile_takes_every_identifier_from_the_azd_environment(azd_profile):
     off = azd_profile.build(values(FA_ENABLE_MEMORY="false"))
     assert "FA_PRIVATE_MEMORY_STORE" not in off["assistant_environment"]
     assert "FA_TEAM_MEMORY_ENABLED" not in off["api_environment"]
-    assert "FA_ONBOARDING_ROLE_SCOPE" not in profile["api_environment"]
     assert "FA_CAPABILITY_TOOLBOX_ENTRIES" not in profile["api_environment"]
+
+
+ONBOARDING = {"FA_ONBOARDING_ENDPOINT_PROTOCOLS": "true", "FA_ONBOARDING_ROLE_SCOPE": PROJECT_ID}
+
+
+def test_plus_onboarding_is_on_by_default_and_follows_the_bicep_output(azd_profile):
+    # Neal 2026-10-15: "+" works right after `azd up`. Provision writes the Bicep output FA_AGENT_ONBOARDING from
+    # the main.parameters.json default; the API settings follow it, so `azd env set ... false` leaves none.
+    parameters = json.loads((ROOT / "infra" / "azd" / "main.parameters.json").read_text(encoding="utf-8"))
+    default = re.fullmatch(r"\$\{FA_ENABLE_AGENT_ONBOARDING=(\w+)\}",
+                           parameters["parameters"]["enableAgentOnboarding"]["value"]).group(1)
+    api = azd_profile.build(values(FA_AGENT_ONBOARDING=default))["api_environment"]
+    assert ONBOARDING.items() <= api.items()
+    off = azd_profile.build(values(FA_AGENT_ONBOARDING="false"))["api_environment"]
+    assert not [key for key in off if key.startswith("FA_ONBOARDING")]
+
+
+def test_a_missing_onboarding_output_means_off_and_says_so(azd_profile, capsys):
+    # No output = nothing shows provision created the delegation; the API must not get settings that would 403.
+    api = azd_profile.build(values())["api_environment"]
+    assert not [key for key in api if key.startswith("FA_ONBOARDING")]
+    assert "FA_AGENT_ONBOARDING is missing" in capsys.readouterr().err
+    stage = json.loads((ROOT / "deploy" / "stage" / "stage.json").read_text(encoding="utf-8"))
+    assert stage["api_environment"]["FA_ONBOARDING_ENDPOINT_PROTOCOLS"] == "true"  # the same settings stage has
+    assert "FA_ONBOARDING_ROLE_SCOPE" in stage["api_environment"]
 
 
 def test_opt_ins_add_only_their_own_settings(azd_profile):
     plain = azd_profile.build(values())["api_environment"]
-    both = azd_profile.build(values(FA_AGENT_ONBOARDING="True", FA_ENABLE_WEBIQ="true",
-                                    FA_TIMEZONE="Asia/Taipei"))
+    both = azd_profile.build(values(FA_ENABLE_WEBIQ="true", FA_TIMEZONE="Asia/Taipei"))
     added = {key: value for key, value in both["api_environment"].items() if key not in plain}
-    assert added == {"FA_ONBOARDING_ENDPOINT_PROTOCOLS": "true", "FA_ONBOARDING_ROLE_SCOPE": PROJECT_ID,
-                     "FA_CAPABILITY_TOOLBOX_ENTRIES": "WebIQ"}
+    assert added == {"FA_CAPABILITY_TOOLBOX_ENTRIES": "WebIQ"}
     assert both["assistant_environment"]["TZ"] == "Asia/Taipei"
 
 
@@ -193,6 +223,8 @@ def test_profile_passes_the_ci_pre_build_checks(profile_file, monkeypatch):
     ci.STAGE = ci.load_config(profile_file)
     overlay = ci.hosted_environment()
     assert set(overlay) == {ci.STAGE["agents"][0]["agent_id"], ci.STAGE["agents"][1]["agent_id"]}
+    # Mid-conversation model switch on for both assistants, like stage A/B since release 29 (coordinator 2026-10-15).
+    assert all(environment["FA_NATIVE_MODEL_SWITCH"] == "1" for environment in overlay.values())
     assert ci.api_routines() is True
     assert ci.realtime() == ("https://wps-tok3n.webpubsub.azure.com", "fa")
     assert ci.console_overlay(ci.STAGE["console_environment"])
@@ -267,6 +299,29 @@ def test_plan_rebuilt_from_the_job_log_has_the_jobs_hash(profile_file, tmp_path,
             fresh.plan_from_log(broken)
 
 
+def test_the_log_wait_says_it_is_waiting_and_keeps_saying_so(profile_file, tmp_path, monkeypatch, capsys):
+    # azd new-user test 2026-10-15 #6: a new workspace took 5-15 min to ingest and the wait printed nothing.
+    monkeypatch.setenv("FA_DEPLOY_CONFIG", str(profile_file))
+    fresh = load("run_fresh_job_wait", ROOT / "deploy" / "stage" / "run_fresh_job.py")
+    clock = [0.0]
+    monkeypatch.setattr(fresh.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(fresh.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    answers = iter([{"customerId": "w"}, *[SystemExit("az failed: SEM0100")] * 4,
+                    {"tables": [{"columns": [{"name": "Log"}], "rows": [["FA_W9_EXIT 0"]]}]}])
+
+    def az(*_args):
+        answer = next(answers)
+        if isinstance(answer, SystemExit):
+            raise answer
+        return answer
+    monkeypatch.setattr(fresh, "az", az)
+    fresh.logs(tmp_path, "exec-1")
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "waiting for the job log in Log Analytics (a new workspace can take 5-15 minutes the first time)"
+    assert out[1:] == ["still waiting for the job log (1 min so far)", "still waiting for the job log (2 min so far)",
+                       "FA_W9_EXIT 0"]
+
+
 def test_portal_bundle_chain_runs_offline_from_the_rebuilt_plan(profile_file, tmp_path, monkeypatch):
     plan, out, _ = planned_case(profile_file, tmp_path, monkeypatch)
     hooks = load("fa_azd_bundle", ROOT / "deploy" / "azd" / "fa_azd.py")
@@ -291,3 +346,9 @@ def test_an_azd_environment_arms_the_compatibility_gate_only_when_asked(azd_prof
     assert azd_profile.build(values(FA_COMPAT_GATE_ARMED="true"))["compatibility_gate_armed"] is True
     with pytest.raises(SystemExit, match="FA_COMPAT_GATE_ARMED must be true or false"):
         azd_profile.build(values(FA_COMPAT_GATE_ARMED="yes"))
+
+
+def test_an_azd_environment_turns_2d_i_on_only_when_asked(azd_profile):
+    """ADR-0009 2d-i (src README#native-2di-switch): off by default; `azd env set FA_NATIVE_2DI true`."""
+    assert azd_profile.build(values())["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] == "0"
+    assert azd_profile.build(values(FA_NATIVE_2DI="true"))["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] == "1"

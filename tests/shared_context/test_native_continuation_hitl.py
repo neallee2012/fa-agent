@@ -162,3 +162,50 @@ def test_handoff_closes_the_original_undecided_card_once_and_keeps_the_owners_ch
     asyncio.run(scenario())
     error(post(hitl, "/decisions", decision(hitl, created["undecided"], request_id="too-late")), 409,
           "NATIVE_HITL_STATE_CONFLICT")
+
+
+def test_handoff_ends_the_original_turn_so_its_question_and_connect_card_close_and_another_turns_stay(
+        hitl, tmp_path, monkeypatch):
+    """ADR-0009 gate 6: the handed-off turn's ``/end`` closes its question and Connect card (a later reply is refused,
+    never saved unread); a recorded answer stays; a card of another turn (the continuation's) is untouched."""
+    from shared_context import native_continuations
+    from shared_context.native_hitl_wire import ConnectorConsent, ConnectorConsentCreate, ConnectorConsentDecision, NativeHitlCall
+    from shared_context.native_sdk import NativeSdkExecutor
+    from test_native_hitl import error, post
+    from test_native_hitl_questions import answer, create_question
+
+    case = setup_gate(hitl, tmp_path)
+    _, open_question = create_question(hitl)
+    _, answered = create_question(hitl, call_id="ask-answered", request_id="question-answered")
+    assert post(hitl, "/answers", answer(answered, request_id="answer-before")).status_code == 200
+    _, other = create_question(hitl, call_id="ask-other", request_id="question-other", rid="resume-rid")
+    consent = ConnectorConsent(
+        call=NativeHitlCall(agent_id="native-a", conversation_id="cid-one", request_id="rid-one",
+                            sdk_session_id="sdk-original", tool_call_id="connect-original"),
+        need="consent", connector_id="teams", toolbox_name="fa-connector-team-one-teams", server_label="teams_read",
+        step="tools/list", consent_urls=("https://consent.example.test/login?state=x",))
+    connect = post(hitl, "/consents", ConnectorConsentCreate(
+        request_id="create-connect", consent=consent, consent_digest=consent.sha256), hitl.agent)
+    assert connect.status_code == 200, connect.text
+
+    async def handed_off(_reader, _receipt):
+        return True
+    monkeypatch.setattr(native_continuations, "has_handoff", handed_off)
+    executor = SimpleNamespace(reader=case.runtime, hitl_client=case.client)
+
+    async def scenario():
+        for _ in range(2):
+            await NativeSdkExecutor.notify_terminal(executor, case.context.receipt)
+        assert [path for _method, path, _body in case.client.observed
+                if path.startswith("/native-hitl/v1/end")] == ["/native-hitl/v1/end"] * 2  # the second replays
+        assert (await case.client.read_question(open_question["question_id"])).turn_closed
+        assert (await case.client.read_question(answered["question_id"])).answer.answer == "blue"
+        assert not (await case.client.read_question(other["question_id"])).turn_closed
+
+    asyncio.run(scenario())
+    error(post(hitl, "/answers", answer(open_question, request_id="answer-late")), 409, "NATIVE_HITL_TURN_CLOSED")
+    error(post(hitl, "/consent-decisions", ConnectorConsentDecision(
+        request_id="click-late", consent_id=connect.json()["result"]["consent_id"],
+        consent_digest=connect.json()["result"]["consent_digest"], choice="resume"), read_only=True),
+        409, "NATIVE_HITL_TURN_CLOSED")
+    assert post(hitl, "/answers", answer(other, request_id="answer-other")).status_code == 200

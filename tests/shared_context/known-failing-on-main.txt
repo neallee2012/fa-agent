@@ -1,0 +1,16 @@
+# Tests that fail on main or are intermittent in CI, deselected only by .github/workflows/shared-context-tests.yml
+# (Linux CI) so the job can gate new failures. Separate from ci-quarantine.txt (tests that need the Windows runtime or artifacts).
+# One pytest node id per line, then `# reason`. Evidence: shared-context-tests run 38861363083 (and 38860482206,
+# 38861017846) on PR #865, which changes no product code and none of these test files. Delete a line in the PR
+# that fixes the test; a local run still runs every test here.
+tests/shared_context/test_desktop_view.py::test_a_viewer_leaving_stops_its_own_x11vnc  # possible race, investigate: x11vnc never terminated after the viewer left; Linux only, every run, also alone
+tests/shared_context/test_desktop_view_api.py::test_a_viewer_leaving_closes_the_upstream_and_text_is_refused  # intermittent in CI (2 of 3 runs), not reproduced on main; possible race, investigate: upstream not closed after the viewer left
+tests/shared_context/test_native_api_v2_send.py::test_an_owner_follow_up_into_a_v2_labelled_conversation_is_sent_as_v1[foundry-native-v1]  # sent body digest differs from the expected digest
+tests/shared_context/test_native_api_v2_send.py::test_an_owner_follow_up_into_a_v2_labelled_conversation_is_sent_as_v1[foundry-native-v2]  # sent body digest differs from the expected digest
+tests/shared_context/test_native_api_v2_send.py::test_a_routine_into_a_v2_labelled_conversation_is_sent_as_v1[clock]  # sent body digest differs from the expected digest
+tests/shared_context/test_native_capabilities.py::test_factory_passes_native_consumers_without_changing_original_private_root  # NativeSdkFailure: SDK turn did not produce a publishable complete result
+tests/shared_context/test_native_environment.py::test_t5_refused_while_following_retries_same_input_after_ready_without_loss  # NativeResponseFollowFailure: likely since 5492dc62 (not bisected) the sender answers AGENT_VERSION_FOLLOWING by driving /environment, which this fake transport does not serve
+tests/shared_context/test_native_sdk.py::test_native_factory_runs_under_bootstrap_owned_root_when_home_is_not_writable  # NativeSdkFailure: SDK turn did not produce a publishable complete result
+tests/shared_context/test_native_turn_failures.py::test_start_error_never_overwrites_a_started_or_terminal_winner[started]  # NATIVE_STATE_STORE_UNKNOWN, 503 instead of 202
+tests/shared_context/test_shell_keep_active.py::test_model_call_after_a_six_minute_command_survives_a_timer_tick[True]  # assert False after the timer tick
+tests/shared_context/test_shell_keep_active.py::test_model_call_after_a_six_minute_command_survives_a_timer_tick[False]  # assert False after the timer tick

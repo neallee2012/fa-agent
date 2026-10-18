@@ -59,6 +59,25 @@ def project_capture(template, selection_id, model, *, head_refs=(), head_selecti
         raise Problem(422, "NATIVE_PROFILE_UNSUPPORTED", "the original settings do not form a supported native capture") from None
 
 
+def start_pinned(capture, runtime, target):
+    """ADR-0009 2d-i: the SDK start pin names the image that will run ``capture`` (``target``'s version's
+    ``fa_build``), not this API's build. Every Hosted image refuses a pin other than its own ``code_sha256()``
+    (``check_start_capture``), and G serves older images until their turn ends. Only ``submit_native_turn`` calls
+    it, for an RID no receipt holds: a saved intent never names the pin, a receipt keeps its own. An unknown build
+    keeps this API's pin."""
+    if capture.sdk_start_code_sha256 is None:
+        return capture
+    from .behavior_agent_versions import hosted_build
+    return pinned_to(capture, hosted_build(runtime, target))
+
+
+def pinned_to(capture, build):
+    """``capture`` with the SDK start pin ``build``; unchanged without a selected gate or a known build."""
+    if capture.sdk_start_code_sha256 is None or build is None or build == capture.sdk_start_code_sha256:
+        return capture
+    return capture.model_copy(update={"sdk_start_code_sha256": build})
+
+
 def _skills(authority, policy, template):
     if not template.skills:
         return

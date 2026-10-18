@@ -66,6 +66,82 @@ def test_native_factory_reuses_one_managed_identity_credential(local_env, monkey
     assert scopes == [native_sdk.SCOPE, native_sdk.SCOPE, "api://OFFLINE/.default"]
 
 
+@pytest.mark.parametrize("failing", ["relay", "usage", "both"])
+def test_peer_result_is_sent_before_usage_and_memory_and_each_lands_once_after_retry(
+        local_env, monkeypatch, tmp_path, caplog, failing):
+    """Delegation latency: the waiting sender wakes on /result, so it goes first; a failure in either step is retried by
+    the notification task and the RID-keyed usage ledger and result receipt each still hold one entry."""
+    from shared_context.native_agent_tools import NativeAgentRelayClient
+    from shared_context.native_turns import NativePostTurnPending
+
+    class Credential:
+        def __init__(self, client_id=None):
+            pass
+
+        async def get_token(self, scope):
+            return SimpleNamespace(token="OFFLINE-token")
+
+    calls, ledger, results, failed = [], {}, {}, set()
+
+    def once(step):
+        calls.append(step)
+        if failing in (step, "both") and step not in failed:
+            failed.add(step)
+            raise Problem(503, "NATIVE_POST_TURN_UNKNOWN", "OFFLINE first attempt is lost")
+
+    async def relay(_client, receipt, result):
+        once("relay")
+        results.setdefault(receipt.request_id, result)
+
+    async def usage(_reporter, receipt):
+        once("usage")
+        if ledger.setdefault(receipt.request_id, receipt.usage) != receipt.usage:
+            raise Problem(409, "NATIVE_USAGE_CONFLICT", "OFFLINE different report")
+
+    async def notified(_executor, _receipt):
+        calls.append("hitl")
+
+    class Memory:
+        async def completed(self, *_args):
+            calls.append("memory")
+
+    monkeypatch.setattr("azure.identity.aio.ManagedIdentityCredential", Credential)
+    monkeypatch.setattr(NativeAgentRelayClient, "completed", relay)
+    monkeypatch.setattr(native_sdk.NativeUsageReporter, "__call__", usage)
+    monkeypatch.setattr(native_sdk.NativeSdkExecutor, "notify_terminal", notified)
+    runtime_path = tmp_path / "OFFLINE-not-executed"
+    runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
+    hosted = SimpleNamespace(
+        identity=IDENTITY, supervisor=AssistantSupervisor(tmp_path / ".fa-assistant-v12", runtime_path=runtime_path),
+        api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
+    )
+    with monkeypatch.context() as environment:
+        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+        environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
+        environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
+        environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
+        environment.setenv("FOUNDRY_PROJECT_ENDPOINT", MODEL_ROOT.removesuffix("/openai/v1"))
+        environment.delenv("FA_NATIVE_GROUPS_ENABLED", raising=False)
+        runtime = native_sdk.native_runtime_from_environment(hosted)
+    runtime.executor.private_memory, runtime.executor.team_memory = Memory(), None
+    receipt = SimpleNamespace(status="completed", request_id="OFFLINE-delegated-rid", result="OFFLINE-result-ref",
+                              usage=None, continuation_available=False, source=None)
+
+    async def deliver():
+        with pytest.raises(NativePostTurnPending):
+            await runtime._deliver_notifications(receipt)
+        await runtime._deliver_notifications(receipt)  # the notification task's retry of the same RID
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(deliver())
+    # The relay failure is logged even when the usage report also fails and replaces its exception.
+    assert ("FA_NATIVE_RESULT_RELAY_PENDING exception_type=Problem" in caplog.text) == (failing != "usage")
+    # A lost /result still reports usage on the same attempt; a lost usage report skips only the HITL close, as before.
+    first = ["relay", "usage", "hitl", "memory"] if failing == "relay" else ["relay", "usage", "memory"]
+    assert calls == first + ["relay", "usage", "hitl", "memory"]
+    assert ledger == {"OFFLINE-delegated-rid": None} and results == {"OFFLINE-delegated-rid": "OFFLINE-result-ref"}
+
+
 def test_production_wires_a_waiting_responses_message_to_the_api_send(local_env, monkeypatch, tmp_path):
     """Review round 4 (P3): ADR-0009 §7a (s) — the production runtime asks the API to send a waiting Responses message
     through the same Agent-identity relay as its continuations (``NativeAgentRelayClient.dispatch_waiting``); without
@@ -422,7 +498,8 @@ def test_native_factory_runs_under_bootstrap_owned_root_when_home_is_not_writabl
     assert runtime.identity == IDENTITY and runtime.executor.reader is runtime
     assert runtime.executor.root == owned / "native-turns"
     assert runtime.cache_root == owned / "native-turns" / "checkpoint-cache"
-    assert len(seen) == 1 and seen[0]["state_dir"].is_dir()
+    # The SDK used its state dir (asserted above); no SDK was kept, so the turn removed it afterwards.
+    assert len(seen) == 1 and not seen[0]["state_dir"].exists()
     cached = list(runtime.cache_root.rglob("*.json"))
     assert len(cached) == 1 and cached[0].name == ref.sha256 + ".json"
     assert cached[0].read_bytes() == outcome.state.encoded()
@@ -464,6 +541,115 @@ def test_original_cancel_reaches_sdk_abort_without_cancelling_agent_chain(local_
         terminal = h.wait("rid-1", "unknown")
         assert terminal.failure_code == "NATIVE_TURN_CANCELLED"
         assert terminal.usage.state == "none" and calls == ["abort"]
+
+
+def test_startup_removes_left_turn_dirs_but_keeps_the_checkpoint_cache(tmp_path):
+    """Audit #9: at process start no SDK exists, so every <64 hex> turn dir and its MCP TMPDIR is left over."""
+    from shared_context.m2_copilot import mcp_temp_dir
+
+    root = tmp_path / "native-turns"
+    left = root / ("a" * 64)
+    temp = mcp_temp_dir(left / "sdk", root.parent)
+    job_temp = root.parent / "tmp" / "job-lane-tmp"
+    kept = [root / "checkpoint-cache" / "c" / "x.json", root / "image-tmp" / "i", root / ("b" * 63) / "f", job_temp / "f"]
+    for path in (left / "sdk" / "runtime-work" / "f", left / "work" / "f", temp / "f", *kept):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("OFFLINE", encoding="utf-8")
+    executor = native_sdk.NativeSdkExecutor(
+        root=root, runtime_path=tmp_path / "OFFLINE-not-executed", api_url="https://api.offline.invalid",
+        model_url=MODEL_ROOT, token_provider=lambda: "OFFLINE")
+    assert left.exists()  # constructing an executor removes nothing
+    executor.remove_turn_dirs()
+    assert not left.exists() and not temp.exists() and all(path.exists() for path in kept)
+    native_sdk.NativeSdkExecutor(root=tmp_path / "missing", runtime_path=tmp_path / "OFFLINE-not-executed",
+                                 api_url="https://api.offline.invalid", model_url=MODEL_ROOT,
+                                 token_provider=lambda: "OFFLINE").remove_turn_dirs()
+
+
+@pytest.mark.parametrize("kept", [False, True])
+def test_a_turn_removes_its_dirs_unless_its_sdk_is_kept(local_env, monkeypatch, tmp_path, kept):
+    """Audit #9: a turn whose SDK stops removes its turn dir and MCP TMPDIR; a kept resident SDK's dir stays."""
+    from shared_context.m2_copilot import mcp_temp_dir
+
+    seen = []
+
+    class Live:
+        turn = None
+
+        async def stop(self):
+            pass
+
+    async def sdk(**options):
+        state_dir = options["state_dir"]
+        temp = mcp_temp_dir(state_dir, tmp_path)
+        for path in (state_dir / "runtime-work" / "f", temp / "f"):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("OFFLINE", encoding="utf-8")
+        seen.append((state_dir.parent, temp))
+        if kept:
+            options["resident"].live = Live()
+        options["session_files"].files.update({
+            "events.jsonl": json.dumps({"type": "session.start", "data": {"sessionId": options["sdk_session_id"]}}) + "\n",
+            "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
+        })
+        return {"final_message": "OFFLINE turn dirs",
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+
+    monkeypatch.setattr(native_sdk, "run_copilot", sdk)
+    executor = native_sdk.NativeSdkExecutor(
+        root=tmp_path / "native-turns", runtime_path=tmp_path / "OFFLINE-not-executed",
+        api_url="https://api.offline.invalid", model_url=MODEL_ROOT, token_provider=lambda: "OFFLINE")
+    runtime = NativeTurnRuntime(IDENTITY, executor, preflight=executor.preflight)
+    executor.reader = runtime
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
+        h = Harness(runtime, SimpleNamespace(controls={}), client)
+        h.invoke(submit())
+        h.wait("rid-1", "completed")
+        (turn_root, temp), = seen
+        assert turn_root.parent == executor.root
+        assert turn_root.exists() is kept and temp.exists() is kept
+
+
+@pytest.mark.parametrize("hang", ["never_idle", "abort_hangs"])
+def test_a_runtime_that_never_goes_idle_after_abort_frees_the_execution_slot(local_env, monkeypatch, tmp_path, hang):
+    """Audit #2: the abort call and the wait for idle after it are bounded; the turn is then cancelled and ends."""
+    ready, calls = asyncio.Event(), []
+
+    class Session:
+        async def abort(self):
+            calls.append("abort")
+            if hang == "abort_hangs":
+                await asyncio.Event().wait()
+
+    async def sdk(**options):
+        options["on_session_ready"](Session())
+        ready.set()
+        await asyncio.Event().wait()  # never idle, until cancelled
+
+    monkeypatch.setattr(native_sdk, "ABORT_SECONDS", 0.2)
+    monkeypatch.setattr(native_sdk, "ABORT_IDLE_SECONDS", 0.2)
+    monkeypatch.setattr(native_sdk, "run_copilot", sdk)
+    executor = native_sdk.NativeSdkExecutor(
+        root=tmp_path, runtime_path=tmp_path / "OFFLINE-not-executed", api_url="https://api.offline.invalid",
+        model_url=MODEL_ROOT, token_provider=lambda: "OFFLINE-token",
+        model_transport=httpx.MockTransport(lambda _: pytest.fail("No model request in this abort-only case")),
+    )
+    runtime = NativeTurnRuntime(IDENTITY, executor, preflight=executor.preflight)
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
+        h = Harness(runtime, SimpleNamespace(controls={}), client)
+        h.invoke(submit())
+        client.portal.call(ready.wait)
+        receipt = h.call(runtime.read, "rid-1")
+        h.invoke(NativeCancel(conversation_id=receipt.conversation_id, request_id="rid-1"))
+        terminal = h.wait("rid-1", "unknown")
+        assert terminal.failure_code == "NATIVE_TURN_CANCELLED" and calls == ["abort"]
+
+        async def released():
+            async with asyncio.timeout(3):
+                while runtime.execution_lock.locked():
+                    await asyncio.sleep(0.02)
+
+        client.portal.call(released)
 
 
 @pytest.mark.parametrize("response_kind", ["saved", "response_lost", "conflict", "wrong_rid"])
@@ -520,6 +706,59 @@ def test_terminal_usage_is_sent_without_user_poll_and_reuses_original_report(loc
         assert all(call == calls[0] for call in calls)
         assert current.notification_error == (None if response_kind == "saved" else "NATIVE_POST_TURN_UNKNOWN")
         assert current.result == receipt.result and current.usage == receipt.usage and len(sdk.calls) == 1
+
+
+def test_usage_is_recorded_once_after_a_ten_minute_api_outage(local_env):
+    """Audit #16: the post-turn notification retries outlast a 10-minute usage API outage (budget_enforced=false still
+    records usage). The default policy runs here 1000x faster; the outage is 0.6 s."""
+    import time
+
+    from azure.ai.agentserver.core.tasks import RetryPolicy
+    from test_native_turns import OfflineSdk
+
+    default = NativeTurnRuntime(IDENTITY, OfflineSdk())._notification_retry
+    delays = [min(default.initial_delay * default.backoff_coefficient ** attempt, default.max_delay)
+              for attempt in range(default.max_attempts - 1)]
+    assert 0.75 * sum(delays) > 600  # the shortest jittered window
+    outage = 0.6
+    recorded, refused, down_until = [], [], None
+
+    def api(request):
+        nonlocal down_until
+        if down_until is None:
+            down_until = time.monotonic() + outage  # the API is down from the first report on
+        if time.monotonic() < down_until:
+            refused.append(bytes(request.content))
+            return httpx.Response(503, json={"error": {"code": "OFFLINE_API_DOWN"}})
+        value = json.loads(request.content)
+        recorded.append(bytes(request.content))
+        return httpx.Response(200, json={"request_id": value["request_id"], "usage_recorded": True,
+                                         "usage_known": True, "metered_microusd": 7, "unmetered_requests": 0})
+
+    async def token():
+        return "OFFLINE-api-MI"
+
+    sdk = OfflineSdk()
+    report = native_sdk.NativeUsageReporter("https://api.offline.invalid", IDENTITY.agent_id, token,
+                                           transport=httpx.MockTransport(api))
+    scaled = RetryPolicy(max_attempts=default.max_attempts, initial_delay=default.initial_delay / 1000,
+                         backoff_coefficient=default.backoff_coefficient, max_delay=default.max_delay / 1000,
+                         retry_on=default.retry_on, jitter=False)
+    runtime = NativeTurnRuntime(IDENTITY, sdk, on_terminal=report, delivery_retry=scaled)
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
+        h = Harness(runtime, sdk, client)
+        h.invoke(submit())
+
+        async def settled():
+            async with asyncio.timeout(15):
+                while not recorded and (await runtime.read("rid-1")).notification_error is None:
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(0.1)  # the status write after the report
+            return await runtime.read("rid-1")
+
+        current = client.portal.call(settled)
+    assert len(recorded) == 1 and refused and all(call == recorded[0] for call in refused)
+    assert current.status == "completed" and current.notification_error is None and len(sdk.calls) == 1
 
 
 def test_native_history_tools_consume_the_actual_runner_invocation_packet(local_env, tmp_path):

@@ -347,6 +347,31 @@ def test_explicit_version_refusal_can_retry_same_input_without_changing_its_hist
     assert following.json()["composer"]["conversation_id"] == received.conversation_id
 
 
+def test_a_refused_send_retried_with_its_rid_reads_as_confirmed_with_the_switch_notice(native_console):
+    """The page shows the notice and clears the sent text only on a CONFIRMED submission; the first submit row stays
+    REFUSED in the journal, so the task reports the resend's answer."""
+    from test_web_test_console_native import send, with_notice
+
+    case = native_console
+    draft = first(case)
+    case.api.remote.error = (503, "AGENT_VERSION_FOLLOWING")
+    assert send(case, draft, "After the source session was deleted").status_code == 503
+    original = case.ui.console.journal.get(draft["request_id"], "submit")
+    assert original["state"] == "REFUSED"
+    case.api.remote.error = None
+    case.mutate[0] = with_notice({"kind": "environment_source_retired"})
+    retried = post(case, "/api/tasks/" + draft["request_id"] + "/submit-retry")
+    assert retried.status_code == 200, retried.text
+    task = retried.json()["task"]
+    assert task["submission"]["state"] == "CONFIRMED"
+    assert task["submission"]["intent"] == original["intent"]
+    assert task["native_receipt"]["environment_notice"] == {"kind": "environment_source_retired"}
+    assert case.ui.console.journal.get(draft["request_id"], "submit") == original
+    state = case.ui.client.get("/api/state?thread_id=" + draft["thread_id"]).json()
+    task = next(item for item in state["tasks"] if item["task_id"] == draft["request_id"])
+    assert task["submission"]["state"] == "CONFIRMED" and task["not_accepted"] is False
+
+
 def test_unknown_manual_retry_cannot_reuse_an_older_definite_refusal(native_console):
     from test_web_test_console_native import send
 

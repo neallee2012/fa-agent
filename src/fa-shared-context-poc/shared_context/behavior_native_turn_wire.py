@@ -29,7 +29,7 @@ from .native_image_wire import NativeImageRead, NativeImagesRead
 from .behavior_user_images import NativeUserImageUpload, USER_IMAGE_ERRORS
 from .native_responses_wire import (
     NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, NativeResponseDispatch, NativeResponseId,
-    NativeStateProfile, check_response_state, unlabeled_profile,
+    NativeStateProfile, channel, check_response_state, unlabeled_profile,
 )
 from .native_append_wire import NativeAppend, NativeAppendRead
 from .native_progress_wire import NativeProgressRead, NativeProgressSnapshot, NativeTurnStatusRead
@@ -104,7 +104,7 @@ NATIVE_TURN_ERRORS = SKILL_DRAFT_ERRORS | IMAGE_DELIVERY_ERRORS | USER_IMAGE_ERR
     "NATIVE_TURN_QUEUED", "NATIVE_TURN_NOT_TAKEN", "NATIVE_RESPONSE_UNCONFIRMED",
     "NATIVE_APPEND_MISSING", "NATIVE_APPEND_UNKNOWN", "NATIVE_PROGRESS_UNCONFIRMED",
     "NATIVE_PROFILE_UNSUPPORTED", "SDK_STATE_INCOMPLETE", "SDK_STATE_UPLOAD_UNKNOWN",
-    "NATIVE_SESSION_CHANGED",
+    "NATIVE_SESSION_CHANGED", "AGENT_RETIRED",
     "NATIVE_BOOTSTRAP_HAS_WORK", "NATIVE_BOOTSTRAP_SOURCE_ACTIVE", "NATIVE_BOOTSTRAP_UNKNOWN",
     "NATIVE_BOOTSTRAP_CONFLICT", "NATIVE_BOOTSTRAP_SOURCE_UNAVAILABLE",
     "AGENT_VERSION_FOLLOWING", "NATIVE_ENVIRONMENT_CONFLICT", "NATIVE_ENVIRONMENT_UNKNOWN",
@@ -431,6 +431,17 @@ class NativeSessionFollow(Command):
     settled_session_ids: Annotated[tuple[Identifier, ...], Field(max_length=64)] = Field(
         default=(), exclude_if=lambda value: not value)
 
+    @model_validator(mode="after")
+    def source_not_settled(self):
+        return _source_not_settled(self)
+
+
+def _source_not_settled(command):
+    # The source's own open receipts are the work a switch waits for; settling them would skip that wait.
+    if command.expected_session_id in command.settled_session_ids:
+        raise ValueError("settled_session_ids can not name the source session")
+    return command
+
 
 class NativeSessionAbandon(Command):
     """ADR-0009 §7a: make this (destination) session the Agent's, abandoning ``expected_session_id`` without invoking,
@@ -444,10 +455,61 @@ class NativeSessionAbandon(Command):
         default=None, exclude_if=lambda value: value is None)
 
 
+class NativeSessionCut(Command):
+    """ADR-0009 M1 2d-i: this (destination) session takes the Agent from ``expected_session_id`` only while the shared
+    store is quiet; when it is not, the Agent record is not written (``state="current"`` with the reason) and the API
+    tries again at the next turn end. Never invokes, reads from or stops the source.
+
+    Two steps: ``mode="probe"`` runs the same busy checks and, when quiet, answers E0 (``quiet_etag``, the Agent ETag
+    the store was quiet at) and commits nothing; the API then lists the source's files and sends ``mode="cut"`` with
+    ``expected_etag=E0``, which is busy if the ETag moved (a turn admitted after the listing started)."""
+    operation: Literal["session_cut"] = "session_cut"
+    expected_session_id: Identifier
+    mode: Literal["probe", "cut"] = Field(default="cut", exclude_if=lambda value: value == "cut")
+    # E0 from the probe: any later write (an admission) makes this attempt busy. Required for a no-files cut, whose
+    # commit is safe only if nothing ran between the API's file listing and the commit.
+    expected_etag: Annotated[str, Field(min_length=1, max_length=256)] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
+    # The API listed workspace files on the active source (``SessionFiles``): they move under an H0-shaped ``pending``
+    # fence through the existing follow file stages. False: a direct commit, no fence.
+    files_required: bool = Field(default=False, exclude_if=lambda value: not value)
+    # As ``NativeSessionFollow``: previous SIDs whose unfinished receipts are not waited for.
+    settled_session_ids: Annotated[tuple[Identifier, ...], Field(max_length=64)] = Field(
+        default=(), exclude_if=lambda value: not value)
+
+    @model_validator(mode="after")
+    def listed_at_e0(self):
+        if self.mode == "cut" and not self.files_required and self.expected_etag is None:
+            raise ValueError("a cut without files requires the probe's expected_etag")
+        return _source_not_settled(self)
+
+
+class NativeSessionWithdraw(Command):
+    """ADR-0009 lifecycle "pending 切換用法": undo the ``pending`` (cut or older follow) named here with one CAS
+    (If-Match ``expected_etag``); a committed switch answers as committed. Runs on an H2d session, not the current one."""
+    operation: Literal["session_withdraw"] = "session_withdraw"
+    expected_etag: Annotated[str, Field(min_length=1, max_length=256)]
+    pending_request_id: Identifier
+    pending_session_id: Identifier
+
+
 class NativeUnfinishedRead(WireModel):
     """ADR-0009 §7a (f): one bounded read-only scan of this Agent's ``fa/v1/turns`` receipts for unfinished ones
     accepted by another SID than the current one (the first switch backfills them into the previous-SID list)."""
     operation: Literal["session_unfinished"] = "session_unfinished"
+
+
+class NativeSessionCheckpointCheck(WireModel):
+    """ADR-0009 phase 4 U3, reserved in the v2 wire (no image runs it yet): the destination session reads back the
+    latest checkpoints of the Agent's recent conversations before a switch. Not in ``_RECORD_READS``: the destination
+    is not yet the current SID. Its fields come later as optional additions (ADR-0009 §3, 2026-10-17)."""
+    operation: Literal["session_checkpoint_check"] = "session_checkpoint_check"
+
+
+class NativeSessionPrerestore(WireModel):
+    """ADR-0009 phase 4 U9, reserved like ``NativeSessionCheckpointCheck``: the destination session restores the
+    latest 1-2 conversations' checkpoints before a switch, reading the shared store only and writing no receipt."""
+    operation: Literal["session_prerestore"] = "session_prerestore"
 
 
 class NativeUnfinishedSessions(WireModel):
@@ -559,6 +621,12 @@ class NativeEnvironmentView(WireModel):
     files_profile: Literal["fa-workspace-files-v1"] | None = Field(default=None, exclude_if=lambda value: value is None)
     source_invocation_refused: bool = Field(default=False, exclude_if=lambda value: not value)
     files_check: NativeFilesCheckDetail | None = Field(default=None, exclude_if=lambda value: value is None)
+    # ADR-0009 M7, reserved for the phase 4 cut ``pending`` (Hosted clock, epoch seconds); never written before 2d-ii,
+    # since H0 decodes ``agent.environment`` strictly.
+    cut_deadline: Annotated[float, Field(ge=0)] | None = Field(default=None, exclude_if=lambda value: value is None)
+    # A quiet ``NativeSessionCut`` probe's answer only (E0), never stored.
+    quiet_etag: Annotated[str, Field(min_length=1, max_length=256)] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
     model_started: Literal[False] = False
     original_work_replayed: Literal[False] = False
     scope: Literal["entire-agent"] = "entire-agent"
@@ -664,6 +732,13 @@ class NativeAdmissionObservation(WireModel):
     retry_allowed: Literal[False] = False
 
 
+class NativeCrash(WireModel):
+    """ADR-0009 §5 crash-loop signal (M7, reserved: phase 4d writes ``crashes:<SID>`` and reports them)."""
+    at: Annotated[float, Field(ge=0)]
+    conversation_id: Identifier
+    request_id: Identifier
+
+
 class NativeSessionState(WireModel):
     agent_id: Identifier
     hosted_session_id: Identifier
@@ -679,6 +754,9 @@ class NativeSessionState(WireModel):
     # still decodes; the API never forwards it to a client whose strict decoder predates it (observe_preparation).
     actual_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")] | None = Field(
         default=None, exclude_if=lambda value: value is None)
+    # ADR-0009 M7, reserved: phase 4d's crash-loop read; never filled before then.
+    recent_crashes: Annotated[tuple[NativeCrash, ...], Field(max_length=8)] = Field(
+        default=(), exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def original_binding(self):
@@ -851,7 +929,8 @@ NativeRequest = Annotated[
     NativeSubmit | NativeAgentReceive | NativeRoutineSubmit | NativeContinuationSubmit | NativeContinuationRead | NativeContinuationReady |
     NativeAppend | NativeAppendRead | NativeProgressRead | NativeTurnStatusRead | NativeRead | NativeConversationRead | NativeHistory |
     NativeResult | NativeCancel | NativeResponseNotStarted | NativeDelivered | NativeSessionRead | NativeSessionPrepare |
-    NativeSessionFollow | NativeSessionRetarget | NativeSessionAbandon | NativeUnfinishedRead | NativeSessionFiles |
+    NativeSessionFollow | NativeSessionRetarget | NativeSessionAbandon | NativeSessionCut | NativeSessionWithdraw |
+    NativeUnfinishedRead | NativeSessionCheckpointCheck | NativeSessionPrerestore | NativeSessionFiles |
     NativeSessionFilesOmission | NativeCandidateRead |
     NativeSkillDraftIntentRead | NativeImagesRead | NativeImageRead | NativeUserImageUpload | NativeHitlHistoryRead |
     NativeReceivedRead | NativePrewarm,
@@ -876,7 +955,8 @@ NOTICE_KINDS_VERSION = "2"
 
 
 class NativeEnvironmentNotice(WireModel):
-    """ADR-0009 §8 notices; API-only: Hosted never writes them.
+    """ADR-0009 §8 notices; never stored: the API sets them, and Hosted only projects ``earlier_version_unfinished``
+    onto its read of a RID it refused by version (``refused:<RID>``, §9).
 
     ``platform_version_changed``: "平台把助理的執行環境換成了另一個版本（vX→vY）", the platform ran the Agent's same
     session on another version than it was created on. ``environment_updated``: the Agent moved to a new version and
@@ -928,7 +1008,8 @@ class NativeReceipt(WireModel):
     assembly: NativeAssembly | None = Field(default=None, exclude_if=lambda value: value is None)
     continuation: NativeContinuation | None = Field(default=None, exclude_if=lambda value: value is None)
     continuation_available: bool = Field(default=False, exclude_if=lambda value: not value)
-    # API only (ADR-0009 §4 end): an owner response carries the Agent's pending drift notice; absent otherwise.
+    # Read-time only (ADR-0009 §4 end): an owner response carries the Agent's pending drift notice, and Hosted's read
+    # of a RID refused by version carries ``earlier_version_unfinished`` (§9); absent otherwise.
     environment_notice: NativeEnvironmentNotice | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @property
@@ -943,7 +1024,7 @@ class NativeReceipt(WireModel):
     @model_validator(mode="after")
     def original_material(self):
         check_response_state(self.state_profile, self.status, self.request_id, self.response_id, self.dispatch)
-        new_cid = (self.conversation_id if self.state_profile == NATIVE_RESPONSES_PROFILE
+        new_cid = (self.conversation_id if channel(self.state_profile) == "responses"
                    and self.command.conversation_id is None else None)
         if self.continuation is not None:
             original = NativeContinuationSubmit(
@@ -1007,7 +1088,7 @@ class NativeConversation(WireModel):
     def captured_digest(self):
         if self.capture_digest != self.capture.sha256:
             raise ValueError("Conversation capture must retain its original digest")
-        if self.state_profile == NATIVE_STATE_PROFILE and (
+        if channel(self.state_profile) == "invocations" and (
                 self.inflight_request_id is not None or self.last_response_id is not None):
             raise ValueError("An Invocations conversation cannot acquire Responses routing state")
         return self

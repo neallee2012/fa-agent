@@ -85,7 +85,8 @@ def test_ci_reads_the_one_hosted_key_list_that_sync_accepts():
 
 def test_ci_and_sync_accept_and_refuse_the_same_hosted_overlays():
     ci = load_ci()
-    values = ["0", "1", "2", "true", "", "api", "foundry-native-v1", "600", "0600", "Asia/Taipei", "a\nb", "x" * 2049]
+    values = ["0", "1", "2", "true", "", "api", "foundry-native-v1", "foundry-native-v2", "foundry-native-v3", "600",
+              "0600", "Asia/Taipei", "a\nb", "x" * 2049]
     cases = [{key: value} for key, value in itertools.product(sorted(versions._ENVIRONMENT_FLAGS), values)]
     cases += [{"AZURE_CLIENT_SECRET": "synthetic"}, {"FA_NATIVE_ROUTINE_CLOCK": "api"}, {}, ["not", "a", "dict"],
               {**HOSTED_ON, "FA_NATIVE_HITL_ENABLED": "1"}, {"FA_NATIVE_ROUTINES_ENABLED": 1}]
@@ -93,6 +94,21 @@ def test_ci_and_sync_accept_and_refuse_the_same_hosted_overlays():
         assert stops(ci._check_hosted, "agent", environment, 3600) == refused(environment), environment
     for idle in (119, 120, 3600, 3601, "3600"):
         assert stops(ci._check_hosted, "agent", {}, idle) == refused({}, idle), idle
+
+
+def test_ci_accepts_a_v2_hosted_definition_and_keeps_the_api_on_v1(ci, monkeypatch):
+    """ADR-0009 2d-i: a Hosted definition may declare v2 (only through the 2d-i switch, P9); the API's own
+    FA_NATIVE_TURNS stays v1 until 2d-ii."""
+    from shared_context.native_responses_wire import ACCEPTED_STATE_PROFILES, NATIVE_STATE_PROFILE
+    assert ci.HOSTED_STATE_PROFILES == ACCEPTED_STATE_PROFILES
+    monkeypatch.setattr(ci, "missing_2di", lambda commit=None: [])
+    ci.STAGE["api_environment"][ci.SESSION_GUARD] = "1"
+    assert ci.hosted_environment()[agent(ci, A)["agent_id"]]["FA_NATIVE_TURNS"] == "foundry-native-v2"
+    ci.STAGE["api_environment"].update({**API_ON, "FA_NATIVE_HITL_ENABLED": "1", "FA_NATIVE_TURNS": "foundry-native-v2"})
+    with pytest.raises(SystemExit):
+        ci.api_routines()
+    ci.STAGE["api_environment"]["FA_NATIVE_TURNS"] = NATIVE_STATE_PROFILE
+    assert ci.api_routines() is True
 
 
 def test_the_enabling_settings_pass_meta_and_reach_sync_api_and_the_workbench(ci, capsys):
@@ -244,3 +260,14 @@ def test_turning_stage_off_sets_every_routine_key_to_zero_and_passes_meta(capsys
                 place[key] = "0"
     ci.meta()
     assert "release=test" in capsys.readouterr().out and ci.api_routines() is False
+
+
+def test_stage_refuses_the_dev_only_cut_fault_hook(capsys):
+    """ADR-0009 gate 2's fault hook holds every files fence to its bound: dev only, refused in meta for stage."""
+    ci = load_ci()
+    ci.release = lambda: "test"
+    ci.STAGE["api_environment"]["FA_NATIVE_CUT_FAULT"] = "after_pending"
+    with pytest.raises(SystemExit, match="FA_NATIVE_CUT_FAULT"):
+        ci.meta()
+    ci.STAGE["environment"] = "dev"
+    ci.api_faults()

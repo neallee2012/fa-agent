@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -149,7 +150,8 @@ class Context:
         result = self.run([*self.az_cmd, *args, "-o", "json"])
         if result.code != 0:
             if missing_ok and any(marker in result.stderr for marker in ("ResourceNotFound", "ResourceGroupNotFound",
-                                                                          "was not found", "could not be found")):
+                                                                          "was not found", "could not be found",
+                                                                          "RoleDefinitionDoesNotExist")):
                 return None
             raise Stop(f"az {' '.join(args[:3])} failed: {_first_error(result.stderr)}")
         return json.loads(result.stdout) if result.stdout.strip() else None
@@ -281,7 +283,9 @@ def pick_models(ctx: Context) -> None:
     for number, row in enumerate(rows, 1):
         state = ("not offered in this region" if not row["offered"] else
                  "no quota entry" if row["free"] is None else
-                 f"quota free {row['free']}, needs {row['needed']}" + ("" if row["fits"] else " (not enough)"))
+                 # Usage above the limit (e.g. after a quota cut) would read as a negative free count.
+                 f"quota free {max(row['free'], 0)}{'' if row['free'] >= 0 else ' (over the limit)'}, "
+                 f"needs {row['needed']}" + ("" if row["fits"] else " (not enough)"))
         print(f"  {number}. {row['name']}: {state}", flush=True)
     suggested = ",".join(str(number) for number, row in enumerate(rows, 1) if row["fits"])
     if not suggested:
@@ -859,8 +863,10 @@ def console_app(ctx: Context, console_image: str, runtime_dir: Path, plan_path: 
         "minReplicas": 1, **files,
     }
     template = INFRA / "web-console" / "web-console.bicep"
+    # Internal ingress until the sign-in config exists: otherwise the console is public for the minutes in between,
+    # and only the sign-in layer keeps clients from sending the principal headers themselves.
     outputs = deploy_bicep(ctx, f"fa-{ctx.env}-console", template,
-                           {**parameters, "revisionSuffix": revision_suffix(ctx, commit, 1)})
+                           {**parameters, "revisionSuffix": revision_suffix(ctx, commit, 1), "ingressExternal": False})
     if outputs.get("publicOrigin") != ctx.need("FA_CONSOLE_URL"):
         raise Stop(f"Portal origin {outputs.get('publicOrigin')} differs from the registered {ctx.need('FA_CONSOLE_URL')}")
     print("FA: Portal federated credential: " + entra.ensure_fic(
@@ -868,8 +874,9 @@ def console_app(ctx: Context, console_image: str, runtime_dir: Path, plan_path: 
         entra.fic_body(FIC_NAME, ctx.need("AZURE_TENANT_ID"), outputs["identityPrincipalId"])), flush=True)
     # The app exists one step before its sign-in config, so its first replica can start without the sign-in sidecar
     # (web_test_console README, 2026-10-02): a second revision starts with it; single-revision mode retires the first.
+    # The sign-in config exists now, so this deployment opens the external ingress.
     deploy_bicep(ctx, f"fa-{ctx.env}-console", template,
-                 {**parameters, "revisionSuffix": revision_suffix(ctx, commit, 2)})
+                 {**parameters, "revisionSuffix": revision_suffix(ctx, commit, 2), "ingressExternal": True})
     ctx.set("FA_CONSOLE_DEPLOYED", "true")
     ctx.set("FA_CONSOLE_IMAGE_DEPLOYED", console_image)
 
@@ -1026,17 +1033,48 @@ def ensure_venv(ctx: Context) -> str:
 USER_INPUTS = frozenset({"FA_TEAM_OWNER_OID", "FA_MODELS", "FA_DEFAULT_MODEL", "FA_MODEL_CAPACITY_JSON",
                          "FA_MODEL_VERSION_UPGRADE_OPTION", "FA_API_SUBNET_NAT_EGRESS", "FA_ENABLE_AGENT_ONBOARDING",
                          "FA_ENABLE_WEBIQ", "FA_TIMEZONE", "FA_HOSTED_IDLE_TIMEOUT_SECONDS", "FA_ENABLE_MEMORY",
-                         "FA_ENABLE_TEAM_MCP_CONNECTIONS"})
+                         "FA_ENABLE_TEAM_MCP_CONNECTIONS", "FA_DEPLOY_UPGRADE_SNAPSHOTS"})
 
 
 BACKUP_LOCK = "m1-backup-account-delete-protection"  # infra/shared-context/backup-foundation.bicep
+BACKUP_ROLE_SEED = "fa-m1-backup-data-read-write-v1"  # infra/shared-context/backup-role.bicep
+BICEP_GUID_NAMESPACE = uuid.UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
+ROLE_API = "api-version=2022-04-01"  # the roleDefinitions version backup-role.bicep deploys with
+
+
+def bicep_guid(*parts: str) -> str:
+    """Bicep's guid(): a version-5 UUID of the parts joined with '-'. Checked against the stage role GUID in
+    infra/shared-context/m3-artifacts.stage.parameters.json."""
+    return str(uuid.uuid5(BICEP_GUID_NAMESPACE, "-".join(parts)))
+
+
+def backup_role(ctx: Context) -> tuple[str, dict[str, Any] | None]:
+    """This environment's backup custom role, read by the exact ID backup-role.bicep gives it,
+    guid(<RG id>, BACKUP_ROLE_SEED), never by name: another environment of the same name (other group or region)
+    has a role named alike. A GET by ID also finds a role whose only assignable scope is the group, which a
+    subscription-scope list can leave out. Returns the ID and the role, or None when it does not exist."""
+    subscription = ctx.need("AZURE_SUBSCRIPTION_ID").lower()  # ARM's subscription().id is lowercase
+    role_id = (f"/subscriptions/{subscription}/providers/Microsoft.Authorization/roleDefinitions/"
+               + bicep_guid(f"/subscriptions/{subscription}/resourceGroups/{ctx.group}", BACKUP_ROLE_SEED))
+    # az rest prefixes a URL that starts with a resource ID with the current cloud's ARM endpoint.
+    return role_id, ctx.az("rest", "--method", "get", "--url", f"{role_id}?{ROLE_API}", missing_ok=True)
 
 
 def predown(ctx: Context) -> None:
     """`azd down` cannot delete the resource group while the M1 backup account keeps its CanNotDelete lock, which
     backup-foundation.bicep sets on purpose. Removing it lets the backups go with the group, so the person types the
     environment name first (or sets FA_CONFIRM_DELETE=<name> for a run without a terminal). Only FA's own lock is
-    removed; any other lock stops here for its owner to decide."""
+    removed; any other lock stops here for its owner to decide. First, read only: what goes outside the group."""
+    account = check_account(ctx)
+    keys = entra.names(ctx.env, account["tenantId"], ctx.need("AZURE_SUBSCRIPTION_ID"), ctx.group)
+    try:  # informational: a failed read must not stop `azd down`
+        role_id, role = backup_role(ctx)
+        found = (f"{role['properties']['roleName']} ({role['name']})" if role
+                 else f"none found ({role_id.rsplit('/', 1)[-1]})")
+    except Stop as error:
+        found = f"could not be read ({error})"
+    print(f"FA: besides {ctx.group}, the postdown hook deletes: Entra apps {keys['console_unique_name']} and "
+          f"{keys['api_unique_name']} (if present; restorable for 30 days); backup custom role: {found}", flush=True)
     locks = ctx.az("lock", "list", "--resource-group", ctx.group, "--subscription", ctx.need("AZURE_SUBSCRIPTION_ID"),
                    missing_ok=True) or []
     if not locks:
@@ -1055,12 +1093,16 @@ def predown(ctx: Context) -> None:
             raise Stop("not confirmed; nothing was removed")
     for lock in locks:
         ctx.az("lock", "delete", "--ids", lock["id"])
-        print(f"FA: removed lock {lock['name']} on the M1 backup account", flush=True)
+        # azd asks its own y/N after this hook; whoever answers no puts the lock back with this command.
+        print(f"FA: removed lock {lock['name']} on the M1 backup account; to restore it if you stop here: "
+              f"az lock create --name {lock['name']} --lock-type {lock.get('level') or 'CanNotDelete'} "
+              f"--resource {lock['id'].rsplit('/providers/', 1)[0]}", flush=True)
 
 
 def postdown(ctx: Context) -> None:
     """After `azd down` removed the resource group: what `azd up` made outside it. Each object is read first and
-    deleted only when it is this environment's own (the uniqueNames and role ID the hooks wrote), so a rerun converges.
+    deleted only when it is this environment's own (the uniqueNames the hooks wrote, the role ID derived from the
+    group), so a rerun converges.
     Deleted Entra apps stay restorable for 30 days. Local records are renamed, never deleted, and the hook-written
     values are cleared so the same environment name starts a fresh install."""
     account = check_account(ctx)
@@ -1073,18 +1115,25 @@ def postdown(ctx: Context) -> None:
             continue
         ctx.graph("DELETE", f"/applications/{app['id']}", None, {})
         print(f"FA: Entra app {unique}: deleted (restorable for 30 days)", flush=True)
-    role = ctx.get("FA_BACKUP_ROLE_ID")
-    if role:
-        ctx.az("role", "definition", "delete", "--name", role.rsplit("/", 1)[-1], "--scope",
-               f"/subscriptions/{ctx.need('AZURE_SUBSCRIPTION_ID')}", missing_ok=True)
-        print("FA: backup custom role: deleted", flush=True)
+    role_id, role = backup_role(ctx)
+    recorded, keep = ctx.get("FA_BACKUP_ROLE_ID"), set()
+    if recorded and recorded.lower() != role_id.lower():  # the group is not the one this role was made for
+        keep.add("FA_BACKUP_ROLE_ID")  # the only pointer to that role stays for whoever checks it
+        print(f"FA: backup custom role: the recorded {recorded} is not {role_id} (from {ctx.group}); "
+              "none deleted, check and delete it yourself", flush=True)
+    elif role:
+        ctx.az("rest", "--method", "delete", "--url", f"{role_id}?{ROLE_API}", missing_ok=True)
+        print(f"FA: backup custom role {role['properties']['roleName']} ({role['name']}): deleted", flush=True)
+    else:
+        print(f"FA: backup custom role {role_id.rsplit('/', 1)[-1]}: already gone", flush=True)
     folder = ctx.state_root / ctx.need("AZURE_ENV_NAME") / "fa"
     if folder.exists():
         kept = folder.with_name(f"fa-down-{ctx.now().strftime('%Y%m%dT%H%M%SZ')}")
         folder.rename(kept)
         print(f"FA: local records kept in {kept}", flush=True)
     # An empty value reads as unset (Context.get); azd 1.32 has no `azd env unset` and exits 0 on the unknown command.
-    for key in sorted(key for key in ctx.values if key.startswith("FA_") and key not in USER_INPUTS and ctx.values[key]):
+    for key in sorted(key for key in ctx.values
+                      if key.startswith("FA_") and key not in USER_INPUTS | keep and ctx.values[key]):
         ctx.set(key, "")
 
 

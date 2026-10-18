@@ -1,6 +1,8 @@
 """Per-request pending/usage estimates in the original USD ledger; no work flat fee."""
 import json
 import logging
+import random
+import time
 from typing import Annotated, Literal
 
 from pydantic import Field
@@ -11,6 +13,7 @@ from .behavior_assistant_wire import ModelDeployment
 from .behavior_turn_usage import TurnModelUsage
 from .behavior_work_policy import CostLedger,Money
 from .behavior_runtime import material
+from .behavior_timing import timing_id
 from .models import Identifier
 from .source_materials import digest
 from .errors import Problem
@@ -75,6 +78,11 @@ def _registered_instruction(control,job_id):
     return record
 
 
+def _ledger_backoff(attempt):
+    """A short jittered pause after a lost CAS race on the shared cost row, so racing writers spread out."""
+    time.sleep(random.uniform(0.02,0.1)*2**attempt)
+
+
 def record_turn_usage(control,*,job_id,rid,usage):
     """Write one turn's reported model usage once, before its completion is consumed (ADR-0006 §5 A2).
 
@@ -124,6 +132,7 @@ def record_turn_usage(control,*,job_id,rid,usage):
             if error.status!=412 or error.body["error"]["code"]!="BEHAVIOR_CONFLICT" or attempt==2:
                 raise
             logging.getLogger(__name__).warning("INSTRUCTION_USAGE_LEDGER_CONFLICT attempt=%s maximum=3",attempt+1)
+            _ledger_backoff(attempt)
 
 
 def replay_turn_usage(view,receipt,ledger,records,ledgerkey):
@@ -259,7 +268,9 @@ def record_agent_turn_usage(control,*,rid,usage):
         except Problem as error:
             if error.status!=412 or error.body["error"]["code"]!="BEHAVIOR_CONFLICT" or attempt==2:
                 raise
-            logging.getLogger(__name__).warning("AGENT_USAGE_LEDGER_CONFLICT attempt=%s maximum=3",attempt+1)
+            logging.getLogger(__name__).warning("AGENT_USAGE_LEDGER_CONFLICT attempt=%s maximum=3 rid=%s",
+                                                attempt+1,timing_id(rid))
+            _ledger_backoff(attempt)
 
 
 def replay_agent_turn_usage(view,receipt,ledger,agent_oid,ledgerkey):

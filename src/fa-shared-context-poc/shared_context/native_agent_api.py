@@ -218,7 +218,19 @@ class NativeAgentRelayGateway:
         self._original_source(principal, sender, client=client)
         return scope, client, sender
 
+    @staticmethod
+    def _waiting(call):
+        """ADR-0009 2d-i (``FA_NATIVE_SESSION_GUARD_ENFORCE``): an Agent-to-Agent delivery that meets the recipient's
+        switch (503 ``AGENT_VERSION_FOLLOWING``/``NATIVE_ADMISSION_PENDING``, nothing accepted) is resent in this
+        request (``wait_in_request``) before the sender is told to retry only the original message."""
+        from .behavior_native_turn_api import wait_in_request
+        from .native_binding import session_guard_enforced
+        return wait_in_request(call, enforce=session_guard_enforced())
+
     def send(self, principal: BehaviorPrincipal, command: NativeRelaySend) -> NativeRelayAcceptance:
+        return self._waiting(lambda: self._send(principal, command))
+
+    def _send(self, principal: BehaviorPrincipal, command: NativeRelaySend) -> NativeRelayAcceptance:
         command = NativeRelaySend.model_validate_json(command.model_dump_json())
         sender_scope, sender_client, sender = self._sender_command(principal, command)
         identifier = message_identifier(principal, sender, command.tool_call_id)
@@ -267,6 +279,8 @@ class NativeAgentRelayGateway:
                 if allowed is None or allowed.payload_sha256 != material:
                     raise Problem(403, "AGENT_MESSAGE_ROOT_DENIED", "the original relay allowance must name this message")
                 if retained.status != "accepted":
+                    # A resend is the retry of a usage write that failed on an earlier send (idempotent per RID).
+                    NativeTurnGateway._accounted(peer.runtime.work_policy, (retained, None), peer)
                     return self._accepted(retained)
             groups = None
             if os.environ.get("FA_NATIVE_GROUPS_ENABLED") == "1":
@@ -288,7 +302,7 @@ class NativeAgentRelayGateway:
                         and self._original(client, identifier) is None):
                     groups.refused_request(message, code)
                 raise
-            NativeTurnGateway._accounted(peer.runtime.work_policy, (received, None))
+            NativeTurnGateway._accounted(peer.runtime.work_policy, (received, None), peer)
             return self._accepted(received)
 
         try:
@@ -337,6 +351,9 @@ class NativeAgentRelayGateway:
         return view
 
     def continue_original(self, principal, command: NativeRelayResult):
+        return self._waiting(lambda: self._continued(principal, command))
+
+    def _continued(self, principal, command: NativeRelayResult):
         from .behavior_native_capture import resolve_continuation_capture
         from .behavior_native_turn_wire import NativeContinuationRead
         from .native_continuation_wire import CONTINUATION_STOP_STATUS
@@ -356,7 +373,7 @@ class NativeAgentRelayGateway:
                           "the original recovery intent does not permit a new input")
         existing = self._original(client, view.request_id)
         if existing is not None and existing.status != "accepted":
-            return NativeTurnGateway._accounted(control, (existing, None))[0]
+            return NativeTurnGateway._accounted(control, (existing, None), composition)[0]
         conversation, _ = NativeTurnGateway._invoke(client, NativeConversationRead(
             conversation_id=source.conversation_id))
         resumed = source.command.model_copy(update={
@@ -380,7 +397,7 @@ class NativeAgentRelayGateway:
             composition, client, resumed, existing.capture if existing is not None else fresh,
             source=source.source, routine=source.routine, continuation=view.continuation,
             original=existing, conversation=conversation,
-            before_send=current))[0]
+            before_send=current), composition)[0]
 
     def result(self, principal: BehaviorPrincipal, command: NativeRelayResult) -> NativeRelayAcceptance:
         return self._return_outcome(principal, command, completed=True)
@@ -389,6 +406,9 @@ class NativeAgentRelayGateway:
         return self._return_outcome(principal, command, completed=False)
 
     def _return_outcome(self, principal, command, *, completed):
+        return self._waiting(lambda: self._returned(principal, command, completed=completed))
+
+    def _returned(self, principal, command, *, completed):
         command = NativeRelayResult.model_validate_json(command.model_dump_json())
         scope = self._sender_scope(principal)
         sender_composition, sender_client = self._client(scope)
@@ -446,9 +466,8 @@ class NativeAgentRelayGateway:
             target, client, message.command, message.capture, source=message.source,
             original=original, conversation=conversation,
             before_send=lambda: principal.require(recipient.team_id, "submit"))
-        if original is not None and original.status != "accepted":
-            return self._accepted(received, source=sender)
-        NativeTurnGateway._accounted(target.runtime.work_policy, (received, None))
+        # Also on a resend of a finished original: it is the retry of a usage write that failed earlier.
+        NativeTurnGateway._accounted(target.runtime.work_policy, (received, None), target)
         return self._accepted(received, source=sender)
 
     def read_result(self, principal: BehaviorPrincipal, command: NativeRelayReadResult):
@@ -509,7 +528,7 @@ class NativeAgentRelayGateway:
         observed, _ = _send_response(client, platform_client(composition, client), original, before_send=current)
         logging.getLogger(__name__).warning("NATIVE_WAITING_RESPONSE_SENT rid_prefix=%s status=%s",
                                             original.request_id[:8], observed.status)
-        return NativeTurnGateway._accounted(composition.runtime.work_policy, (observed, None))[0]
+        return NativeTurnGateway._accounted(composition.runtime.work_policy, (observed, None), composition)[0]
 
 
 def install_native_agent_routes(app, composition, *, enabled, repository=None):

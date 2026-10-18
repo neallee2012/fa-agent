@@ -149,3 +149,29 @@ def test_review_usage_reaches_the_same_agent_rid_ledger_once_with_budget_disable
     assert ledger(c) == recorded and len(reports) == 3 and len(sent) == 3
     assert all(report == reports[0] for report in reports)
     assert c.control.records == {}
+
+
+def test_hosted_sends_no_usage_report_for_a_busy_refused_turn_so_the_api_counts_none(usage_case, signing_key):
+    from shared_context.behavior_turn_usage import AGENT_TURN_USAGE_PATH
+    case, loop = usage_case
+    c = case.c
+    assert submit(case).status_code == 202
+    refused = case.remote.records["native-rid"].model_copy(update={
+        "status": "busy_refused", "failure_code": "NATIVE_TURN_BUSY",
+    })
+    agent = {"Authorization": "Bearer " + token(signing_key, {
+        "oid": c.control.policy.template.agent_oid, "idtyp": "app", "roles": ["Behavior.Agent"],
+    }, remove=("scp",)), "Content-Type": "application/json"}
+    posted = []
+
+    def api(request):
+        posted.append(json.loads(request.content))
+        # The API cannot tell this report from an unknown turn: it only sees the RID and usage=None.
+        response = case.client.post(AGENT_TURN_USAGE_PATH, content=request.content, headers=agent)
+        return httpx.Response(response.status_code, content=response.content, headers=response.headers)
+
+    reporter = NativeUsageReporter("https://api.offline.invalid", refused.agent_id, lambda: "agent-token",
+                                   transport=httpx.MockTransport(api))
+    before = ledger(c)
+    loop.run_until_complete(reporter(refused))
+    assert posted == [] and ledger(c) == before

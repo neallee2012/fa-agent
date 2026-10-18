@@ -34,7 +34,7 @@ from test_native_turns import Harness, OfflineSdk, local_env
 class OfflineSessionFiles:
     def __init__(self, targets, homes, source_sid):
         self.targets, self.homes, self.source_sid = targets, homes, source_sid
-        self.calls, self.stopped = [], set()
+        self.calls, self.stopped, self.woke = [], set(), []
         self.upload_error = None
         self.target_read_error = None
         self.on_stop = None
@@ -58,8 +58,18 @@ class OfflineSessionFiles:
         if self.on_stop:
             self.on_stop()
 
+    def _wake(self, sid):
+        """Dev 2026-10-16 (ADR-0009 §10 check ②): a Files call on a stopped session provisions compute for it again,
+        on the selected version rather than its pinned one."""
+        if sid in self.stopped:
+            self.stopped.discard(sid)
+            target = self.targets[sid]
+            self.targets[sid] = target.model_copy(update={"agent_version": str(int(target.agent_version) + 1)})
+            self.woke.append(sid)
+
     def list_session_files(self, name, sid, *, path, limit):
         assert name == self.targets[sid].agent_name and limit == 100
+        self._wake(sid)
         self.calls.append(("list", sid, path))
         folder = self.homes[sid] / path
         if not folder.is_dir():
@@ -80,6 +90,7 @@ class OfflineSessionFiles:
 
     def download_session_file(self, name, sid, *, path):
         assert name == self.targets[sid].agent_name
+        self._wake(sid)
         self.calls.append(("get", sid, path))
         if sid != self.source_sid and self.target_read_error is not None:
             error = HttpResponseError("OFFLINE target read refused")
@@ -382,8 +393,21 @@ def test_official_recovery_waits_for_real_file_publication_then_continues_once_i
 
 
 @pytest.mark.parametrize("file_api", ["foundry-native-v1", "foundry-responses-v1"], indirect=True)
-def test_two_lanes_follow_publish_files_before_ready_without_replaying_original(file_api):
+def test_two_lanes_follow_publish_files_before_ready_without_replaying_original(file_api, monkeypatch):
+    import azure.ai.projects
+    from shared_context.behavior_foundry import PLATFORM_NO_RETRY, PLATFORM_READ_RETRY
+
     fixture = file_api
+    used, project = [], azure.ai.projects.AIProjectClient
+
+    class Recording(project):
+        def __init__(self, **options):
+            super().__init__(**options)
+            calls = vars(self.agents)
+            self.agents = SimpleNamespace(**{name: (lambda name, call: lambda *a, **k: (
+                used.append((name, options)), call(*a, **k))[1])(name, call) for name, call in calls.items()})
+
+    monkeypatch.setattr("azure.ai.projects.AIProjectClient", Recording)
     result = fixture.case.client.post(PREFIX + "/environment", json=fixture.command, headers=fixture.case.headers)
     assert result.status_code == 200, (result.text, fixture.controls[-2:])
     assert result.json()["state"] == "ready", result.text
@@ -399,7 +423,11 @@ def test_two_lanes_follow_publish_files_before_ready_without_replaying_original(
     assert actions.index("stop") > max(i for i, action in enumerate(actions) if action == "put")
     for _, credential, options in fixture.project_calls:
         assert credential is fixture.case.foundry.credential
-        assert all(options[key] == 0 for key in ("retry_total", "retry_connect", "retry_read", "retry_status"))
+    # 6c2303e2: idempotent platform metadata GETs retry once (PLATFORM_READ_RETRY); every other call keeps zero retries.
+    read = {key: PLATFORM_READ_RETRY[key] for key in PLATFORM_NO_RETRY}
+    observed = [(name, {key: options[key] for key in PLATFORM_NO_RETRY}) for name, options in used]
+    assert observed and all(value == PLATFORM_NO_RETRY or name in {"get_session", "list_sessions"} and value == read
+                            for name, value in observed), observed
     before = list(fixture.files.calls)
     fixture.case.composition._native_sessions = NativeSessions(fixture.case.composition)
     repeated = fixture.case.client.post(PREFIX + "/environment", json=fixture.command, headers=fixture.case.headers)
@@ -468,6 +496,13 @@ def test_source_change_prevents_ready_and_keeps_original_manifest(file_api, when
     else:
         fixture.files.on_stop = change
     result = follow(fixture)
+    if when == "after-stop":
+        # ADR-0009 §10 check ② (dev 2026-10-16): the stopped source is not read again, so a write during its stop is
+        # not seen; the snapshot verified right before the stop is published, the change stays on the source's disk.
+        assert result.status_code == 200 and result.json()["state"] == "ready", result.text
+        assert (fixture.target_workspace.root / "nested" / "draft.txt").read_bytes() == b"uncommitted original\n"
+        assert fixture.files.woke == []
+        return
     assert result.status_code == 409, result.text
     assert not fixture.target_workspace.root.exists() and not fixture.runtime.executor.calls
     if when == "before-stop":
@@ -555,7 +590,9 @@ def test_slow_source_directory_pages_resume_after_restart_without_rescanning_pre
     pages = [call for call in fixture.files.calls if call[0] == "page"]
     for index in range(100):
         path = WORKSPACE_ROOT + f"/dir-{index:03}"
-        assert len([call for call in pages if call[2] == path]) == 2
+        # Once, while the source is active: the stopped listing pages from the manifest (ADR-0009 §10 check ②).
+        assert len([call for call in pages if call[2] == path]) == 1
+    assert fixture.files.woke == []
     assert len([call for call in fixture.files.calls if call[0] == "put"]) == 2
 
 
@@ -596,6 +633,12 @@ def test_new_selector_reads_the_original_files_target_without_creating_a_new_rea
     fixture.case.composition._native_sessions = NativeSessions(fixture.case.composition)
     controls_before, files_before = len(fixture.controls), len(fixture.files.calls)
     result = follow(fixture, reconcile=True)
+    if target_drift:
+        # dcf6e7c8: a reconciliation whose destination version changed is refused without invoking any session.
+        assert result.status_code == 409 and result.json()["error"]["code"] == "NATIVE_SESSION_CHANGED", result.text
+        assert fixture.files.calls[files_before:] == [] and not fixture.runtime.executor.calls
+        assert not any(command.get("operation") == "session_follow" for command, _ in fixture.controls[controls_before:])
+        return
     assert result.status_code == 200 and result.json()["state"] == "pending", result.text
     assert result.json()["hosted_session_id"] == fixture.destination.session_id
     assert result.json()["hosted_agent_version"] == "42"

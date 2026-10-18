@@ -137,22 +137,30 @@ def read_team_attention(service, principal, *, cursor=None, limit=20, resolve_or
         if (data.get("tenant_id"), data.get("team_id")) != (principal.tenant_id, principal.team):
             continue
         kind = data.get("kind")
-        if kind == "native_hitl_question":
-            view = service.read_question(principal, identifier)
-        elif kind == "native_hitl_consent":
-            view = service.read_consent(principal, identifier)
-        elif kind == "native_hitl_pending" or (
-                kind == "native_hitl_packed_record" and data.get("record_kind") == "native_hitl_pending"):
-            view = service.read(principal, identifier)
-        else:
+        try:
+            if kind == "native_hitl_question":
+                view = service.read_question(principal, identifier)
+            elif kind == "native_hitl_consent":
+                view = service.read_consent(principal, identifier)
+            elif kind == "native_hitl_pending" or (
+                    kind == "native_hitl_packed_record" and data.get("record_kind") == "native_hitl_pending"):
+                view = service.read(principal, identifier)
+            else:
+                continue
+            item = view.attention
+            if item is None:
+                continue
+            call = (item.approval if item.type == "approval_required" else
+                    item.question if item.type == "question_required" else item.consent).call
+            scope = service.resolve_agent(call.agent_id)
+        except Problem as error:
+            if error.status >= 500 or error.body["error"]["code"] == "BEHAVIOR_CONFLICT":
+                raise  # an outage or a racing write is not a shorter page
+            # One card that cannot be shown (retired Agent, invalid record) is left out; the rest stay listed.
+            log.warning("NATIVE_HITL_ATTENTION_ITEM_SKIPPED code=%s", error.body["error"]["code"])
             continue
-        item = view.attention
-        if item is None:
-            continue
-        call = (item.approval if item.type == "approval_required" else
-                item.question if item.type == "question_required" else item.consent).call
-        scope = service.resolve_agent(call.agent_id)
         if (str(scope.tenant_id), scope.team_id) != (principal.tenant_id, principal.team):
+            # Outside the skip: a card of another Team in this Team's partition fails the page, never a shorter list.
             raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "this pending call belongs to another Agent Team")
         origin = resolve_origin(call)
         if service._now() < item.expires_at:

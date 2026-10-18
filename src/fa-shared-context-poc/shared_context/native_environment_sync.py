@@ -20,20 +20,30 @@ def automatic_environment_command(target, version):
         expected_agent_version=version, idle_only=True)
 
 
+def _scoped_client(composition, scope, agent_id):
+    """``((peer, client), None)``, or ``(None, skipped)`` for a configured executor Agent (``targets[1:]``) that has no
+    scope: follow and verify share this one rule."""
+    from .native_agent_api import NativeAgentRelayGateway
+
+    try:
+        return NativeAgentRelayGateway(composition, enabled=True)._client(scope, prepared=False), None
+    except Problem as error:
+        if (error.body["error"]["code"] == "AGENT_SCOPE_MISSING"
+                and any(target.agent_id == agent_id for target in composition.config.targets[1:])):
+            return None, {"agent_id": agent_id, "state": "skipped", "reason": "AGENT_SCOPE_MISSING"}
+        raise
+
+
 def follow_agent(composition, agent_id, *, wait_seconds=FOLLOW_WAIT_SECONDS, sleep=time.sleep, clock=time.monotonic):
     from .behavior_team_registry import resolve_agent_scope
-    from .native_agent_api import NativeAgentRelayGateway
 
     if composition.runtime.work_policy is None:
         raise Problem(503, "WORK_POLICY_DISABLED", "the installed standing policy is required for server following")
     scope = resolve_agent_scope(composition.runtime.store, composition.config, agent_id)
-    try:
-        peer, client = NativeAgentRelayGateway(composition, enabled=True)._client(scope, prepared=False)
-    except Problem as error:
-        if (error.body["error"]["code"] == "AGENT_SCOPE_MISSING"
-                and any(target.agent_id == agent_id for target in composition.config.targets[1:])):
-            return {"agent_id": agent_id, "state": "skipped", "reason": "AGENT_SCOPE_MISSING"}
-        raise
+    pair, skipped = _scoped_client(composition, scope, agent_id)
+    if skipped is not None:
+        return skipped
+    peer, client = pair
     control, sessions = peer.runtime.work_policy, native_sessions(peer)
     version = sessions.selected_version(client)
     command = automatic_environment_command(client.target, version)
@@ -108,8 +118,26 @@ def _result(view, state, elapsed):
             "environment": view.model_dump(mode="json"), "elapsed_ms": round(elapsed * 1000)}
 
 
+def verify_agent(composition, agent_id):
+    """ADR-0009 2d-i P9 hook (deploy ``follow_all`` becomes verify-only once the background cut moves each Agent):
+    platform metadata only (``environment_view``: the session listing and the selected version's ``get_session``), no
+    session call, no follow. ``ok`` when the selected version's session (or the binding row's current SID) is
+    usable, else ``pending`` (the Agent moves after its next turn end)."""
+    from .behavior_team_registry import resolve_agent_scope
+
+    scope = resolve_agent_scope(composition.runtime.store, composition.config, agent_id)
+    pair, skipped = _scoped_client(composition, scope, agent_id)
+    if skipped is not None:
+        return skipped
+    peer, client = pair
+    view = native_sessions(peer).environment_view(client)
+    return {"agent_id": agent_id, "version": view.hosted_agent_version, "verify_only": True,
+            "state": "ok" if view.state == "unverified" else "pending", "environment": view.model_dump(mode="json")}
+
+
 def follow_all(composition, *, agent_id=None, published=None, wait_seconds=FOLLOW_WAIT_SECONDS,
-               sleep=time.sleep, clock=time.monotonic):
+               sleep=time.sleep, clock=time.monotonic, verify_only=False):
+    """``verify_only``: the P9 hook; each Agent is only checked (``verify_agent``), never followed."""
     from .behavior_agent_versions import _agents
 
     _, served = _agents(composition)
@@ -117,11 +145,14 @@ def follow_all(composition, *, agent_id=None, published=None, wait_seconds=FOLLO
                                     if (agent_id is None or target.agent_id == agent_id)
                                     and (published is None or target.agent_id in published)))
     if not identifiers:
-        return [{"agent_id": agent_id, "state": "failed", "reason": "AGENT_NOT_FOUND"}]
+        from .behavior_team_registry import retired_agent_ids
+        retired = agent_id is not None and agent_id in retired_agent_ids(composition.runtime.store, composition.config)
+        return [{"agent_id": agent_id, "state": "failed", "reason": "AGENT_RETIRED" if retired else "AGENT_NOT_FOUND"}]
 
     def following(identifier):
         try:
-            result = follow_agent(composition, identifier, wait_seconds=wait_seconds, sleep=sleep, clock=clock)
+            result = (verify_agent(composition, identifier) if verify_only else
+                      follow_agent(composition, identifier, wait_seconds=wait_seconds, sleep=sleep, clock=clock))
         except Problem as error:
             result = {"agent_id": identifier, "state": "failed", "reason": error.body["error"]["code"]}
         (log.info if result["state"] in {"ok", "skipped"} else log.warning)(

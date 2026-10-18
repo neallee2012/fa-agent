@@ -128,9 +128,69 @@ def test_additive_artifacts_keep_parent_storage_and_container_metadata_untouched
     assert set(template["outputs"]) == {"containerId", "roleAssignmentId"}
 
 
+def test_upgrade_snapshots_get_their_own_account_with_the_30_day_rule(compiled):
+    # Neal 2026-10-17: a dedicated account, never the no-auto-gc backup account, so the delete rule is safe there.
+    template = compiled["upgrade-snapshots.bicep"]
+    assert template["variables"]["snapshotPrefix"] == "[format('{0}/fa-upgrade-snapshots/', parameters('containerName'))]"
+    value = settings(template, "fa-upgrade-snapshot-storage")
+    assert value["name"] == "[parameters('storageName')]"
+    assert value["kind"] == "StorageV2" and value["skuName"] == "Standard_LRS"
+    blob = value["blobServices"]
+    assert blob["isVersioningEnabled"] is False
+    assert blob["containers"] == [{"name": "[parameters('containerName')]", "publicAccess": "None"}]
+    # Same delete lock as the backup account; the module (and so the lock) is gated by deployUpgradeSnapshots.
+    assert value["lock"] == {"kind": "CanNotDelete", "name": "upgrade-snapshot-account-delete-protection"}
+    assert deployment(template, "fa-upgrade-snapshot-storage")["condition"] == "[parameters('deployUpgradeSnapshots')]"
+    (rule,) = value["managementPolicyRules"]
+    # The platform matches prefixMatch from the container name on (lifecycle-management-policy-structure): one
+    # entry, rooted at the container, ending in the snapshot root's '/', so only that root's blobs match.
+    assert rule == {"name": "fa-upgrade-snapshots-30d", "enabled": True, "type": "Lifecycle", "definition": {
+        "filters": {"blobTypes": ["blockBlob"], "prefixMatch": ["[variables('snapshotPrefix')]"]},
+        "actions": {"baseBlob": {"delete": {"daysAfterCreationGreaterThan": 30}}}}}
+
+
+def test_upgrade_snapshots_are_opt_in_and_the_default_creates_nothing(compiled):
+    template = compiled["upgrade-snapshots.bicep"]
+    assert template["parameters"]["deployUpgradeSnapshots"]["defaultValue"] is False
+    created = resources(template)
+    assert sorted(item["type"] for item in created) == [
+        "Microsoft.Authorization/roleAssignments", "Microsoft.Resources/deployments", "Microsoft.Resources/deployments"]
+    assert all(item["condition"] == "[parameters('deployUpgradeSnapshots')]" for item in created)
+    assert template["outputs"]["containerUrl"]["value"].startswith("[if(parameters('deployUpgradeSnapshots'), ")
+    stage = json.loads((INFRA / "upgrade-snapshots.stage.parameters.json").read_text(encoding="utf-8"))["parameters"]
+    assert stage["deployUpgradeSnapshots"]["value"] is False
+    assert set(stage) <= set(template["parameters"])
+    backup = json.loads((INFRA / "backup-foundation.stage.parameters.json").read_text(encoding="utf-8"))["parameters"]
+    assert stage["storageName"]["value"] != backup["storageName"]["value"]
+    foundation = json.loads((INFRA / "foundation.stage.parameters.json").read_text(encoding="utf-8"))["parameters"]
+    assert stage["tags"] == foundation["tags"]
+
+
+def test_only_the_api_identity_writes_upgrade_snapshots_on_the_one_container(compiled):
+    template = compiled["upgrade-snapshots.bicep"]
+    (access,) = [item for item in resources(template) if item["type"] == "Microsoft.Authorization/roleAssignments"]
+    container = ("resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageName'), "
+                 "'default', parameters('containerName'))")
+    assert access["scope"] == f"[{container}]"
+    # backup-role.bicep's read/write custom role (no delete: the lifecycle rule deletes), looked up as backup-foundation does.
+    role = ("subscriptionResourceId('Microsoft.Authorization/roleDefinitions', "
+            "guid(resourceGroup().id, 'fa-m1-backup-data-read-write-v1'))")
+    assert access["name"] == (f"[guid({container}, resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', "
+                              f"parameters('apiIdentityName')), {role})]")
+    assert access["properties"] == {
+        "roleDefinitionId": f"[{role}]",
+        "principalId": "[reference('apiIdentity').principalId]", "principalType": "ServicePrincipal"}
+    assert template["resources"]["apiIdentity"]["existing"] is True
+    assert "storageBlobDataContributor" not in template["variables"]
+    role_template = (INFRA / "backup-role.bicep").read_text(encoding="utf-8")
+    assert "guid(backupResourceGroupId, 'fa-m1-backup-data-read-write-v1')" in role_template
+    assert "blobs/delete" not in role_template
+
+
 @pytest.mark.parametrize("filename, module", [
     ("foundation.bicep", "shared-context-state-storage"),
     ("backup-foundation.bicep", "m1-backup-storage"),
+    ("upgrade-snapshots.bicep", "fa-upgrade-snapshot-storage"),
 ])
 def test_avm_storage_keeps_explicit_private_keyless_configuration(compiled, filename, module):
     value = settings(compiled[filename], module)

@@ -1,5 +1,18 @@
 # FA 本機工作台
 
+## 「待你處理」卡片重畫時保留原卡（dev 2026-10-18 現場，CODE/offline，未部署）
+
+- **現場**：每次 `render()` 都把輸入框上方的卡片區（`attention-dock`）整片丟掉重建（每次約 400 個節點）。內建瀏覽器每 6 秒觸發一次
+  `visibilitychange`，按「允許／拒絕」常落在剛被移除的舊卡上，什麼都沒送出（安全，但主人按不到）；一般瀏覽器裡任何重畫
+  （例如進度輪詢）也會讓焦點跑掉、正在輸入的回答或規則文字被重設。沒有資料遺失、沒有重送。
+- **現在**：`renderInlineAttention` 仍每次畫出卡片，但和卡片區裡同一張卡（同一筆待辦與 `hitlObservationScope`）
+  比對畫出來的樣子（標籤、文字、屬性、`disabled`／`hidden`／`open`，不比輸入框內容）；一樣就留下原節點，並把
+  `hitlEditors`／`hitlReaders` 指回原卡的輸入框與讀取鈕（原卡已有焦點時，`render()` 不再重設游標）。新卡加入、消失的卡移除、變了的卡換成新畫的；只有卡片順序改變時才移動原卡。
+  卡片內容、排序規則與送出的內容都不變；卡片區只有這一處重建。
+- 驗證：DOM 測試：同樣的卡重畫後是同一個節點且保留打到一半的字；重畫前綁定的選項鈕仍在卡片區、按下送出一次回答；
+  新增／移除一張卡時其他卡不重建；改了的卡重畫、旁邊沒變的卡保留；留下的批准卡打開的「詳細」重畫後仍開著。在 ae3d30e9 五個都 FAIL，修正後整份 679 個通過。
+  焦點與輸入法在真瀏覽器的行為未另行驗證（DOM 替身沒有 `document.activeElement`）。
+
 ## Release 30 dev 測試：停止與追加的文字（2026-10-14，CODE/offline，未部署）
 
 - **停止後寫「已停止」**（原本就有的問題）：Hosted 把停下的原生回合存成 `status=unknown`、`failure_code=NATIVE_TURN_CANCELLED`，
@@ -1404,7 +1417,7 @@ FA不自行實作credential injection；connection分類是原薄API的選項／
 - **顯示：** 輸入框下方 `#environment-note`（`role="status"`，與「已換成某模型」同一排），不是錯誤區、不進聊天泡泡；
   顯示到這位助理下一則被接下、且沒帶通知的訊息為止（重新整理後不再顯示：API 已清掉，這是「看到一次」）。句子照 ADR §8 原文：
   `environment_updated`「助理已更新到新版本，工作檔也一起帶過來了。」；`environment_switched_without_files`
-  「已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。」；`environment_source_retired`「已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。」；
+  「已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。」；`environment_source_retired`「已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。」；
   `platform_version_changed`「平台把助理的執行環境換成了另一個版本（vX→vY）；FA 已記錄，相容就照常執行。」（後兩句與 M4
   退回句仍待 Neal 確認）。「較早的版本接下的……」照舊在那則訊息的處理狀態裡顯示。
 - **換版中：** 同 RID 自動重送期間，「助理正在換到新版本……完成後會自動送出」在自動重送開始 30 秒後
@@ -1446,7 +1459,7 @@ ready後只有當次真正按送出、且被換版拒絕未接單的那則訊息
 技術入口重入既有CHECKING時，scan／accepted／admission／task的合法等待共用相同原因集合；
 原confirm ID、body、來源／目標與每批10次仍須一致，不把task等待報成環境衝突。
 
-ready後通知原句：「已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。」
+ready後通知原句：「已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。」
 沿#595的同Agent／目標／observer守衛，不讓舊成功蓋掉後來UNKNOWN。舊bridge無policy識別時維持相容UI。
 來源／自動決定與限制見[Shared README](../README.md#automatic-environment-policy)。
 已用原DOM runner覆蓋草稿附件、載入、HITL及批次喚醒；未修改主題、登入/卡片DOM或進行live操作。
@@ -1962,7 +1975,7 @@ stage 網址與部署紀錄見 [progress](../../../docs/progress.md#2026-10-02�
 
 - **登入與連線**：Container Apps 在頁面載入前就完成 Entra 登入。頁面載入後會**自動連線**，不用再按「連線」；左下角顯示「已登入：<帳號>」。自動連線只讀身分、助理目錄與模型清單，不送任何工作。
   - 內建認證的 token store 保存對 FA API 的使用者 token（`Behavior.Read`、`Behavior.Approve`）。連線與自動更新前，頁面先呼叫 `/.auth/refresh`，bridge 再讀當次請求的 `X-MS-TOKEN-AAD-ACCESS-TOKEN`，交給原本的 `Console.authenticate`／`TokenVault`；身分與到期檢查不變，不用 Azure CLI。
-  - 更新失敗或拿不到 token 時，才顯示「登入已失效」與「重新登入」按鈕，按下後導到 `/.auth/login/aad`。
+  - 更新失敗或拿不到 token 時，才顯示「登入已失效」與「重新登入」按鈕，按下後導到 `/.auth/login/aad`。登入 cookie 仍有效、token store 卻沒有這筆（例如被輪替或清掉）時，頁面照常載入，bridge 回 401 `LOGIN_REQUIRED`，同樣走「重新登入」；只有登入身分不是設定的 owner 才回 403 `REMOTE_PRINCIPAL_DENIED`。
 - **同源與 CSRF**：origin 換成 `https://<網址>`；cookie 改名 `__Host-fa_console` 並加 `Secure`；CSP 與桌面 viewer 改用 `wss://`。另有兩點和本機不同：
   - Entra 登入後，瀏覽器是從 login.microsoftonline.com 轉回首頁，這個請求會帶 `Sec-Fetch-Site: cross-site`。所以遠端只有「載入首頁（GET `/`）」不限制來源；所有 API 仍只接受同源。
   - Container Apps 登入層會把「用 cookie 登入、卻沒有 Origin／Referer 的 POST」當成 CSRF 擋下，並回空內容（[官方說明](https://learn.microsoft.com/azure/app-service/overview-authentication-authorization#mitigation-of-cross-site-request-forgery)）。所以遠端改用 `Referrer-Policy: same-origin`（只有送給自己時才帶 Referer），authConfig 的 `allowedExternalRedirectUrls` 也加入自己的網址。
@@ -1972,9 +1985,15 @@ stage 網址與部署紀錄見 [progress](../../../docs/progress.md#2026-10-02�
   - 新的 replica 啟動時，如果 Blob 正被舊 replica 鎖住，會先打斷舊 lease 再還原；舊 replica 下一次寫入會失敗，並自行結束讓平台重啟，不會覆蓋新紀錄。`maxReplicas=1`。
   - 換 revision 時新舊兩個 revision 會短暫並存，各自重啟時會互相打斷 lease，交換幾次後只剩新的那個（stage 實測約 1 分鐘）。這段期間寫入仍一律要持有 lease，所以不會覆蓋或重送；只是操作可能暫時看到 `REMOTE_STATE_UNAVAILABLE`。
   - 被鎖住的 Blob 不能寫入（連「不存在才建立」也會被拒），所以啟動時只在 Blob 不存在時才建立空檔。
+  - 還原只接受 256 MiB 以內的打包檔，所以寫入端也守同一個上限：打包後超過就回 `REMOTE_STATE_FULL`，Blob 維持上一次的內容（重啟仍能還原），replica 不結束、照常可讀。第一次超過一半時，stderr 會寫一行 `REMOTE_STATE_NEAR_LIMIT`，供管理者提早處理。不自動刪舊紀錄：回條與進度列之後還會被讀回，刪了可能讓頁面少了需要的狀態。
+  - 管理者看到 `REMOTE_STATE_FULL` 時：之後**每一次寫入都會被拒**；回 `REMOTE_STATE_FULL` 的那些 commit 只寫進容器本機，沒有進 Blob，replica 一重啟（閒置縮到 0、換 revision、平台重啟）就會遺失，Blob 仍是最後一次成功上傳的內容。處理順序：
+    1. 請使用者先停止送新工作，並且不要手動重啟或重新部署；這時重啟只會丟掉那些本機紀錄，不會讓寫入恢復。
+    2. 恢復寫入只有兩條路，都需要部署批准：放寬上限（改 `remote.py` 的 `MAX_ARCHIVE_BYTES`，打包與還原共用這個常數，改完重新部署）；或在 replica 停止、Blob lease 已打斷後，離線縮小 Blob 裡的打包檔。這兩種做法都還沒實際演練過（未驗證），目前沒有現成的裁切工具。
+    3. 恢復後，遺失的紀錄若屬於已送出的工作，頁面照原 request ID 查原回條，不自動重送；沒送出的那次在回 `REMOTE_STATE_FULL` 時就停在 POST 之前。
+    看到 `REMOTE_STATE_NEAR_LIMIT` 時就先規劃第 2 步，不要等到 `REMOTE_STATE_FULL`。
   - 啟動被拒時，log 會寫出原因的類別與服務代碼，例如 `REMOTE_CONFIGURATION_REJECTED (HttpResponseError 412)`；不寫 URL 或 header。
 - **新增助理（＋）**：和本機相同的流程，不需要重啟或重新部署。細節（Blob 保存、stage 等權限生效）見下方「新增助理」段落。
-- **閒置縮到 0 之後**：重新啟動的 replica 會換新的頁面 cookie。舊分頁的下一次請求會收到 `REMOTE_SESSION_CHANGED`，頁面自動重新整理一次，不會重送任何操作。以下兩種情況不自動重新整理，只顯示訊息：頁面開啟未滿 10 秒（避免無限重整），或輸入框還有未送出的文字、已選了檔案（讓使用者先複製）。
+- **閒置縮到 0 之後**：重新啟動的 replica 會換新的頁面 cookie。舊分頁的下一次請求會收到 `REMOTE_SESSION_CHANGED`，頁面自動重新整理一次，不會重送任何操作。以下兩種情況不自動重新整理，只顯示訊息：頁面開啟未滿 10 秒（避免無限重整），或頁面上任何文字欄位（輸入框、新增 skill、新增助理、Team MCP 等）還有改過且未送出的內容、任何檔案欄位已選了檔案、任何對話還有未送出的附件（圖片、文字檔或目錄；檔案欄位讀完就清空，附件只留在記憶體），或 HITL 還有草稿（讓使用者先複製）。這是逐一掃描頁面上所有欄位，不是固定清單；搜尋框是篩選條件，不算草稿。
 
 **設定組**：用離線指令把部署線審核過的本機 manifest 轉成遠端版本。只改 delegated client（遠端 Entra app）與容器內路徑，SHA 依新 bytes 重算：
 
@@ -1994,16 +2013,17 @@ stage 網址與部署紀錄見 [progress](../../../docs/progress.md#2026-10-02�
 
 Entra app、指派、同意與 federated credential 用 Microsoft Graph 另外建立。CI 每次部署只換成同 build 的 image 與宣告的 ENV（`ci_deploy.py console`，其餘 template 原樣保留）；設定組改變時才重跑 Bicep。
 
-**第一次建立時的注意事項**：app 會比登入設定早一步建立，所以第一個 replica 可能在登入 sidecar 掛上之前就開始執行。這時 journal 是空的，也沒有 token，但仍應盡快換掉。2026-10-02 stage 第一次部署就遇到這種情況：用新的 `revisionSuffix` 重跑 Bicep，再停用（不是刪除）第一個 revision；之後的 revision 都會從一開始就帶 sidecar。部署後請用 `az containerapp replica list` 確認每個 replica 都有 `http-auth`。
+**第一次建立時的注意事項**：app 會比登入設定早一步建立，所以第一個 replica 可能在登入 sidecar 掛上之前就開始執行。這時 journal 是空的，也沒有 token，但仍應盡快換掉。所以 azd（`fa_azd.py console_app`）第一次部署時帶 `ingressExternal=false`，app 只在 Container Apps 環境內可達；登入設定建好後，第二次部署才打開外部 ingress。工作台不以 token header 判斷能否進入：沒有登入層時，這個 header 一樣能偽造，真正的防線是 ingress 的順序與 API 的簽章驗證。手動重跑 Bicep 時參數預設 `true`。2026-10-02 stage 第一次部署就遇到這種情況：用新的 `revisionSuffix` 重跑 Bicep，再停用（不是刪除）第一個 revision；之後的 revision 都會從一開始就帶 sidecar。部署後請用 `az containerapp replica list` 確認每個 replica 都有 `http-auth`。
 
 容器啟動指令是 `python -m web_test_console serve-remote`。除了沿用 `serve` 的設定與 SHA 參數，再加 `--state-root`、`--state-blob-url`、`--public-origin`、`--owner-oid`、`--managed-identity-client-id`。設定的 `human_oid` 必須等於 owner，所有 journal 必須位在 `--state-root` 內，否則不啟動。
 
 ### Verified against（遠端模式）
 
 - 程式基準：見 PR；已讀 `bridge.create_app`／`Journal.connect`／`Console.authenticate`、`desktop.install_desktop_routes`、`__main__`、`agent_connections.read_connection`，以及 index.html 的 `run`／`refreshAuthentication`／桌面 WebSocket。
-- 實際驗證：`test_web_test_console_remote.py`（22 項，含遠端重啟後 cookie 不符回 `REMOTE_SESSION_CHANGED`）。
+- 實際驗證：`test_web_test_console_remote.py`（含遠端重啟後 cookie 不符回 `REMOTE_SESSION_CHANGED`）。
   - lease 交接：測試替身照 Azure 的規則，被鎖住的 Blob 沒帶 lease 的寫入一律 412。新 replica 能接手並還原最新 commit，舊 replica 寫入失敗並只觸發一次結束。這項在修正前會失敗。
   - 上傳失敗時請求被擋下；壓縮檔只接受一般相對路徑檔案。
+  - 容量：打包超過一半時只警告一次；超過上限回 `REMOTE_STATE_FULL`，不上傳、不結束 replica，新 replica 仍能還原上一次的內容。這項在修正前會失敗。
   - 缺 principal 或 principal 錯誤時，頁面、API、noVNC 都回 403。
   - 遠端從 cross-site 轉回首頁可以載入，但 cross-site 的 API 請求仍被擋；`Referrer-Policy` 遠端為 `same-origin`、本機仍為 `no-referrer`；`/api/state` 只有遠端才帶 `remote_user`。
   - 只有帶 token header 才能登入，且 token 能從 middleware 傳到登入流程。
@@ -2146,8 +2166,11 @@ template export／`new_conversation_template` 及原 `select_profile`；fresh si
 - `GET /api/instructions/{rid}/appends`只讀後端原控制清單。原進度更新對accepted／sending追加
   另做純GET；unknown可手動「核對追加」，沒有自動POST。重開controller可沿journal找回原ID。
 - 追加顯示在原回合內，區分已保存、尚未確認套用、SDK已套用、同一回合中接著處理（queued）、未套用及unknown；
-  不拿message ID當完成，也不把queued說成另一筆普通交辦。未套用只由真人按「帶回輸入框」，
-  不自動再送、不覆蓋已輸入的其他草稿；unknown只有查讀。
+  不拿message ID當完成，也不把queued說成另一筆普通交辦。未套用且 `reason=turn_finished`（確定沒有送達，例如回覆已顯示、
+  回合還沒存成 completed 的尾段送出的追加）由本頁在回合結束後自動以新 RID 當下一則送出一次（2026-10-16，G 計畫「不掉訊息」；
+  只有結果未知才不能換 ID），只送那段文字、不帶附件；輸入框或附件已有其他草稿時不送，改留「帶回輸入框」給真人按，
+  不覆蓋已輸入的其他草稿；重新整理後不再自動送。其他原因（例如按「停止」後的 `cancelled`）不自動送，只留「帶回輸入框」。
+  unknown只有查讀。
 - 已POST的原文與未送草稿分開記住：同版原文在結果未核清前，不因回合完成或重新登入
   變成另一筆追加／普通交辦。POST ACK與GET已核回條共用清稿條件，只清未另編輯的原文，
   不清下一筆草稿（包含重新輸入的相同文字）；後端仍回unknown時不清稿、不換ID重送。
@@ -2399,7 +2422,7 @@ stage 第 28 版，Neal 在已有完成回合的對話把模型選單換成 `gpt
   不是目前畫面上對話的模型。
 
 <a id="model-switch"></a>
-**2026-10-13 對話中換模型（`FA_NATIVE_MODEL_SWITCH`，預設關；LOCAL，未部署）：**
+**2026-10-13 對話中換模型（`FA_NATIVE_MODEL_SWITCH`；程式預設關，stage A／B 第 29 版起、dev、新 azd 環境已打開）：**
 開關只在 Hosted definition 上（見[後端說明](../README.md#native-model-switch)）；API 讀所選版本的值，放在 composer 的
 `responses.model_switch`，頁面只照它走，不自己決定。目前只有 Responses lane 的 template options 帶這個值；
 沒讀到（例如 Invocations lane，或工作台重啟後還沒讀過 options 的既有對話）時當作關閉，照上面的固定做法。
@@ -2649,6 +2672,7 @@ python -B -m web_test_console serve `
 不能把另一份配置的journal接到B，也不得換空journal躲過UNKNOWN。B配置缺失、hash或journal不符、
 目錄404／403／不可用、預設映射不符時，對應操作停用；不fallback A，不用舊目錄放行。
 server 目錄可列最多16位（`MAX_TEAM_AGENTS`），本機 manifest 也最多16份連接。server 標為 `ready` 但沒有本機連接的 Agent 顯示 `AGENT_CONFIGURATION_MISSING` 並停用；server 標為 `unavailable` 的不列在左側清單（2026-10-06 起，例如永遠不會被呼叫的 executor 佔位 target），只列在「⋯ → 支援明細 → 目錄中未列出的助理」並附 server 原因（例如 `AGENT_SCOPE_MISSING`），仍不能被選用；預設助理與建立中的（`AGENT_ONBOARDING_IN_PROGRESS`）例外，照舊列出並停用。兩者都不套用其他 Agent 的配置。新增本機連接見下方「新增助理」。
+登入後重新載入頁面時，若 bridge 上次讀目錄已超過 60 秒（`DIRECTORY_TTL_SECONDS`），會先重讀一次，所以剛退役或剛新增的助理不必再按「更新助理目錄」；讀取失敗就顯示目錄錯誤，不沿用舊目錄放行。
 API prefix也涵蓋既有`/behavior/v1/...`的狀態、操作預覽／決定、pull／ACK及圖片。
 原相對command與request ID留在原journal，送出時只經已核對的固定Agent prefix；不搬移或重寫舊意圖。
 
@@ -2723,7 +2747,7 @@ API prefix也涵蓋既有`/behavior/v1/...`的狀態、操作預覽／決定、p
   加入前的檢查和 manifest 項目一樣：tenant、真人、client、audience、Team 都要和預設 Agent 相同，SHA 也要一致。
   - 重啟時，從 onboarding 紀錄中 CONFIRMED 的連線把新 Agent 補回，所以用原本的 manifest 重啟也看得到。紀錄讀不到時不會擋住啟動，只是那位 Agent 顯示為未設定。
   - `agents/manifest-<sha前16字>.json` 照舊用 create-only 寫出，留作紀錄；原 manifest、原 journal、原 config 都不改。
-  - 遠端模式下，新 Agent 的 `config.json`／`instructions.json` 寫好後，要先持有 lease 存進 Blob，才在 journal 記成 CONFIRMED。存不進去就回 `REMOTE_STATE_UNAVAILABLE`，連線不算完成；之後用同一個編號續做。
+  - 遠端模式下，新 Agent 的 `config.json`／`instructions.json` 寫好後，要先持有 lease 存進 Blob，才在 journal 記成 CONFIRMED。存不進去就回 `REMOTE_STATE_UNAVAILABLE`（保存檔已達上限時是 `REMOTE_STATE_FULL`），連線不算完成；之後用同一個編號續做。
 - **stage 等權限生效（2026-10-03，總協調 00:33 決定）。** stage 的 API 會在 ready 前自動指派新 Agent 的兩個 project 角色（#468／#470）；但官方說明 managed identity 的角色可能要數小時才生效。
   - 所以遠端模式下，prepare 回 403 時，每 10 分鐘用同一個 `prepare-…` 編號重送，最多 2 小時（從第一次準備起算），畫面寫「角色已自動指派，正在等權限生效」。403 是沒有副作用的拒絕，伺服器端對同一編號冪等。
   - 本機（dev 沒有自動指派）的 403 照舊不自動重試，顯示「需要部署線補角色」。401 一律請重新登入。
@@ -2747,7 +2771,8 @@ server 端照舊明確拒絕，不會默默過濾。
 能力依 `kind` 分成 MCP（`mcp-api`／`mcp-hosted`）與內建工具（`fa-builtin`）。前端先擋超過12項工具、超過4個 skill、勾了 skill 卻沒勾
 `fa-skills-v1`；目錄讀不到時停用送出並顯示原因。送出時依 `entry_id`／名稱排序，原樣放進 command（`capabilities`、`skills`），
 bridge 只核欄位形狀，是否在目錄內、sha 是否相符一律以 server 為準（拒絕視為 S0 前決定，可換新編號）。若建立後 Team 目錄才變，
-server 回 `AGENT_ONBOARDING_SELECTION_STALE`（不是上面那些 S0 前拒絕碼），8765 不記成終局，保留原編號續做、也不讓另開新編號。onboarding journal 保存的 command
+server 回 `AGENT_ONBOARDING_SELECTION_STALE`（不是上面那些 S0 前拒絕碼），8765 不記成終局，保留原編號續做、也不讓另開新編號；bridge 保留 server 附的 `cause`，畫面依 `cause` 說明該怎麼排除（工具讀不到、skill 版本變了、
+模型容量），其他碼原樣顯示並請部署線處理。onboarding journal 保存的 command
 本來就含整份 body，所以續做沿用同一份選擇；舊紀錄沒有這兩個欄位，照舊續做。建立 body 上限因此調為 16384 bytes。
 
 ### Agent 摘要與新動態
@@ -3877,6 +3902,8 @@ CLI 失敗或 token 不合法時顯示 `LOGIN_EXPIRED`，停止自動重試，�
 晚到的舊畫面狀態不能把這次失敗改回可用。更新時間與失敗標記只留在記憶體，不新增持久儲存。
 此流程不改 API 授權，不刷新工作批准、不清除原結果或 UNKNOWN，也不重送進行中或已送過的
 submit、cancel、fetch、ACK 或其他工作 POST；只恢復之後正常使用 token 的能力。
+
+只有 401 或登入問題的錯誤代碼（`LOGIN_*`、`IDENTITY_MISMATCH`、`PLATFORM_REQUEST_REJECTED`、遠端登入帳號不是指定帳號的 `REMOTE_PRINCIPAL_DENIED`）才停止自動更新。`REMOTE_SESSION_CHANGED` 不停止：它要的是重新整理頁面（有草稿時先複製），不是重新登入。其他失敗（例如助理目錄暫時讀不到的 503、ingress 的 5xx）不停止自動更新，也不導向登入頁，1 分鐘後再試；多助理模式下，自動更新已換到新 token 但助理目錄讀取失敗時，回應仍是成功，目錄錯誤只顯示在 `agent_directory_error`（和頁面載入時相同）。
 
 #### Verified against：既有登入自動更新
 

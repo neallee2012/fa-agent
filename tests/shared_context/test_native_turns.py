@@ -285,6 +285,29 @@ def test_lost_started_ack_with_own_token_may_finish_once(harness, monkeypatch, f
     assert len(harness.sdk.calls) == 1
 
 
+@pytest.mark.parametrize("prefix", ["ckpt:", "text:"])
+def test_one_unconfirmed_save_write_after_the_sdk_is_retried_not_dropped(harness, monkeypatch, prefix):
+    """Audit #1: a 5xx on a checkpoint segment or text part after the SDK finished saves the same reply again."""
+    import shared_context.native_turns as native_turns
+
+    create = FoundryStateStore.create_item
+    failed = []
+
+    async def fail_first(store, key, value, **kwargs):
+        if key.startswith(prefix) and not failed:
+            failed.append(key)
+            raise ServiceResponseError("OFFLINE segment write unconfirmed")
+        return await create(store, key, value, **kwargs)
+
+    monkeypatch.setattr(native_turns, "SAVE_RETRY_SECONDS", (0.01, 0.01))
+    monkeypatch.setattr(FoundryStateStore, "create_item", fail_first)
+    harness.invoke(submit())
+    completed = harness.wait("rid-1", "completed")
+    page = harness.call(harness.runtime.result, NativeResult(conversation_id=completed.conversation_id, request_id="rid-1"))
+    assert failed and page.complete and page.text == "Complete public answer"
+    assert len(harness.sdk.calls) == 1
+
+
 def accept_without_chain(harness):
     chain = harness.runtime.chain
 
@@ -314,6 +337,18 @@ def seed_started(harness):
     current, saved = harness.call(harness.runtime._cas, accepted, started)
     assert saved
     return accepted, current
+
+
+def test_unknown_after_a_concurrent_cancel_write_merges_instead_of_leaving_the_rid_started(harness):
+    """Audit #3: the timeout's ``unknown`` CAS loses to a cancel_requested write; the RID still ours ends ``unknown``."""
+    _, started = seed_started(harness)
+    cancelled = _changed(started.value, receipt=_changed(started.value.receipt, cancel_requested=True))
+    _, saved = harness.call(harness.runtime._cas, started, cancelled)
+    assert saved
+    receipt = harness.call(harness.runtime._unknown, started, "NATIVE_TURN_TIMEOUT")  # the stale ETag
+    current = harness.call(harness.runtime._rid, "rid-1").value
+    assert receipt.status == current.receipt.status == "unknown" and receipt.failure_code == "NATIVE_TURN_TIMEOUT"
+    assert current.receipt.cancel_requested and current.run_token == "OFFLINE-run"
 
 
 def test_accepted_gap_read_is_pure_and_exact_resubmit_requeues_original(harness):

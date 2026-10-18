@@ -54,6 +54,15 @@ def test_active_source_still_copies_files_then_stops_once(file_api):
     assert (fixture.target_workspace.root / "nested" / "draft.txt").read_bytes() == b"uncommitted original\n"
     invoked, read, stopped = source_calls(fixture)
     assert {"session_files"} == set(invoked) and "get" in read and len(stopped) == 1
+    # ADR-0009 §10 check ② (dev 2026-10-16): no Files call reaches the stopped source, so it is never woken.
+    assert not_read_after_the_stop(fixture)
+
+
+def not_read_after_the_stop(fixture):
+    calls = fixture.files.calls
+    stop = max(index for index, call in enumerate(calls) if call[0] == "stop")
+    return fixture.files.woke == [] and not [
+        call for call in calls[stop:] if call[0] in FILE_CALLS and call[1] == fixture.source.session_id]
 
 
 @pytest.mark.parametrize("file_api", ["foundry-native-v1", "foundry-responses-v1"], indirect=True)

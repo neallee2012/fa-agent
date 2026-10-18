@@ -664,3 +664,70 @@ def test_migration_and_rotation_classify_retired_team_mcp_rows():
     assert invalid.value.body["error"]["code"] == "TEAM_MCP_INVALID"
     assert "validate_team_mcp_history" in inspect.getsource(behavior_migration._quiescence)
     assert "validate_team_mcp_history" in inspect.getsource(behavior_runtime_rotation_history.validate_additions)
+
+
+def test_a_failed_grants_read_is_reused_briefly_so_an_outage_waits_once(monkeypatch, team_mcp):
+    c = team_mcp
+    monkeypatch.setenv(TEAM_MCP_ENABLED_ENV, "1")
+    clock = [1000.0]
+    monkeypatch.setattr("shared_context.team_mcp.monotonic", lambda: clock[0])
+    post(c, change(c, "cb" * 16, "add", "Alpha"))
+    c.service.forget(TENANT, A.team)
+    c.foundry.fail["read"] = 503  # one failed read; an uncached second capture would read again and succeed
+    reads = c.foundry.reads
+    assert "team-Alpha" not in runtime_grants(c.runtime)
+    assert "team-Alpha" not in runtime_grants(c.runtime) and c.foundry.reads == reads + 1
+    clock[0] += 11
+    assert "team-Alpha" in runtime_grants(c.runtime) and c.foundry.reads == reads + 2
+
+
+def test_a_grants_read_that_started_before_a_change_never_stores_its_stale_grants(monkeypatch, team_mcp):
+    c = team_mcp
+    monkeypatch.setenv(TEAM_MCP_ENABLED_ENV, "1")
+    post(c, change(c, "cc" * 16, "add", "Alpha"))
+    post(c, change(c, "ce" * 16, "add", "Beta"))  # the last server cannot be disabled
+    original = c.foundry.read_toolbox
+
+    def read_then_disable(name):
+        read = original(name)  # this read still sees Alpha; the owner disables it before the read stores
+        monkeypatch.setattr(c.foundry, "read_toolbox", original)
+        assert post(c, change(c, "cd" * 16, "disable", "Alpha")).status_code == 200
+        return read
+
+    monkeypatch.setattr(c.foundry, "read_toolbox", read_then_disable)
+    assert "team-Alpha" in runtime_grants(c.runtime)
+    assert "team-Alpha" not in runtime_grants(c.runtime), "the disable applies to the next capture, not 30 s later"
+
+
+def concurrent_captures_during_one_slow_failing_read(capture, foundry, method, monkeypatch, callers=3):
+    """``callers`` captures arrive while the first one's Foundry read hangs and then fails: (Foundry reads, results)."""
+    import time
+    entered, release, reads, results = threading.Event(), threading.Event(), [], []
+
+    def outage(*_args):
+        reads.append(1)
+        entered.set()
+        release.wait(5)
+        raise TimeoutError("synthetic Foundry read timeout")
+
+    monkeypatch.setattr(foundry, method, outage)
+    threads = [threading.Thread(target=lambda: results.append(capture())) for _ in range(callers)]
+    threads[0].start()
+    assert entered.wait(5)
+    for thread in threads[1:]:
+        thread.start()
+    time.sleep(0.2)  # the later captures arrive while the first read still hangs
+    release.set()
+    for thread in threads:
+        thread.join(5)
+    return len(reads), results
+
+
+def test_captures_during_a_failing_read_share_that_one_foundry_read(monkeypatch, team_mcp):
+    c = team_mcp
+    monkeypatch.setenv(TEAM_MCP_ENABLED_ENV, "1")
+    post(c, change(c, "cf" * 16, "add", "Alpha"))
+    c.service.forget(TENANT, A.team)
+    reads, results = concurrent_captures_during_one_slow_failing_read(
+        lambda: c.service.team_grants(TENANT, A.team), c.foundry, "read_toolbox", monkeypatch)
+    assert reads == 1 and results == [()] * 3

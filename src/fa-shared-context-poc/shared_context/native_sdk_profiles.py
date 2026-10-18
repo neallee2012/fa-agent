@@ -15,7 +15,11 @@ ORIGIN_ADDENDUM = (
 )
 
 
-def check_start_capture(capture):
+def check_start_capture(capture, *, adopted=False):
+    """``adopted``: the RID record names ``adopted_from`` (ADR-0009 M9, written only by this Hosted's own CAS). Its pin
+    is the build of the image that accepted it: that image's admission refused any other pin before ``rid:<RID>``
+    existed, and only Hosted writes the store. So an adopted receipt keeps its pin, never rewritten, and the rest of
+    this image's preflight decides whether it can run here; a fresh RID still needs this image's own build."""
     settings = capture.template.settings
     if settings.sdk_start_profile is None:
         if capture.sdk_start_code_sha256 is not None:
@@ -23,7 +27,7 @@ def check_start_capture(capture):
         return
     if settings.sdk_start_profile != "fa-sdk-start-gate-v1":
         raise Problem(409, "NATIVE_PROFILE_UNSUPPORTED", "this native path has no consumer for the legacy v2 start profile")
-    if capture.sdk_start_code_sha256 is None or capture.sdk_start_code_sha256 != code_sha256():
+    if capture.sdk_start_code_sha256 is None or (capture.sdk_start_code_sha256 != code_sha256() and not adopted):
         raise Problem(409, "SDK_START_GATE_CODE_CHANGED", "the original API capture and installed Hosted build differ")
     if importlib.metadata.version("github-copilot-sdk") != settings.sdk_version:
         raise Problem(409, "NATIVE_PROFILE_UNSUPPORTED", "the selected SDK release differs")
@@ -44,7 +48,7 @@ class NativeSdkStart:
                 or (self.scope.agent_id, self.scope.conversation_id) != (
                     self.receipt.agent_id, self.receipt.conversation_id)):
             raise Problem(409, "SDK_START_GATE_FENCED", "the original started native turn is required before SDK entry")
-        check_start_capture(self.receipt.capture)
+        check_start_capture(self.receipt.capture, adopted=self.control.adopted)
         self.entered = True
 
 

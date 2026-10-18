@@ -308,6 +308,48 @@ def test_a_follow_up_in_a_pinned_responses_conversation_goes_straight_to_its_sub
     assert c.calls[before][:2] == ("POST", "/work-policy/v1/responses-turns/submit")
 
 
+# azd new-user test 2026-10-15 #10: after a redeploy (console restart) an open Responses conversation showed
+# 「這段對話固定用 …；要換模型請開新對話」 with model_switch on, because nothing read the options for a pinned lane.
+def test_after_a_restart_a_pinned_responses_conversation_reads_its_options_once(request):
+    reopened_loop = asyncio.new_event_loop()
+    request.addfinalizer(lambda: reopened_loop.close()
+                         if not reopened_loop.is_closed() and not reopened_loop.is_running() else None)
+    c, _env = request.getfixturevalue("responses_console")
+    draft = first(c)
+    assert send(c, draft, "The first message picks the lane.").status_code == 200
+    latest = _completed_follow_up(c, draft)
+    assert latest["responses"] is not None
+    before = len(c.calls)
+    # A new bridge process on the same journal; its login reads the models and the current conversation's routing.
+    c.ui = c.open(loop_factory=lambda: reopened_loop)
+    reads = [path for _method, path, _body in c.calls[before:] if "/agent-template" in path]
+    assert reads == ["/work-policy/v1/agent-template/options"]
+    shown = c.ui.client.get("/api/state?thread_id=" + latest["thread_id"]).json()["composer"]
+    assert shown["state_profile"] == RESPONSES_PROFILE and shown["responses"] == latest["responses"]
+    before = len(c.calls)
+    assert progress(c, latest["thread_id"]).status_code == 200
+    assert not any("/agent-template" in path for _method, path, _body in c.calls[before:])
+
+
+def test_a_missing_model_list_is_read_on_the_next_progress_poll(native_console):
+    c = native_console
+    draft = first(c)
+    models = lambda: [path for _method, path, _body in c.calls if path == "/work-policy/v1/models"]
+    c.ui.console.instructions.models = None
+    failing = lambda request, response: (httpx.Response(503, json={"error": {"code": "UNAVAILABLE"}})
+                                         if request.url.path == "/work-policy/v1/models" else response)
+    c.mutate[0] = failing
+    shown = progress(c, draft["thread_id"])
+    assert shown.status_code == 200 and shown.json()["composer"]["models"] is None
+    c.mutate[0] = lambda request, response: response
+    count = len(models())
+    shown = progress(c, draft["thread_id"])
+    assert shown.status_code == 200 and shown.json()["composer"]["models"] is not None
+    assert len(models()) == count + 1
+    assert progress(c, draft["thread_id"]).status_code == 200
+    assert len(models()) == count + 1
+
+
 def test_a_pinned_responses_follow_up_takes_the_server_refusal_as_its_answer(responses_console, monkeypatch):
     """With no read before it, a follow-up the server cannot run now is refused by its own submit (not_dispatched):
     the RID is kept as not sent, it is never sent again, and the owner can write again under a new RID. The options

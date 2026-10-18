@@ -76,11 +76,14 @@ param modelVersionUpgradeOption string = 'NoAutoUpgrade'
 @description('Opt-in NAT egress for snet-api (private-state-network.bicep); keep true once deployed with it.')
 param apiSubnetNatEgress bool = false
 
-@description('Give the API identity the #468 constrained RBAC Administrator on the project so "+" can assign new Agent roles. Off by default.')
-param enableAgentOnboarding bool = false
+@description('Give the API identity the #468 constrained RBAC Administrator on the project so "+" can assign new Agent roles. On by default (Neal 2026-10-15); opt out with `azd env set FA_ENABLE_AGENT_ONBOARDING false`.')
+param enableAgentOnboarding bool = true
 
 @description('Give the API identity project-scope Contributor so Team MCP can create keyed connections (stage has it). On by default.')
 param enableTeamMcpConnections bool = true
+
+@description('ADR-0009 phase 5 (Neal 2026-10-17): a dedicated snapshot storage account, private endpoint and API role. Off by default; creating them is a cloud and IAM write that needs approval from Neal per deploy.')
+param deployUpgradeSnapshots bool = false
 
 var env = toLower(environmentName)
 // Globally unique names (storage, registry, Foundry subdomain, Web PubSub) use a per subscription/env/region token.
@@ -110,6 +113,8 @@ var names = {
   consoleApp: 'ca-console-${env}'
   consoleIdentity: 'id-fa-console-${env}'
   consoleStorage: 'stcon${token}'
+  snapshotStorage: 'stsnap${token}'
+  snapshotPrivateEndpoint: 'pe-${env}-upgrade-snapshot-blob'
 }
 var tableName = 'workstate'
 var backupContainer = 'm1-environment-backups'
@@ -249,6 +254,22 @@ module artifacts '../shared-context/m3-artifacts.bicep' = {
   dependsOn: [backupFoundation]
 }
 
+module upgradeSnapshots '../shared-context/upgrade-snapshots.bicep' = if (deployUpgradeSnapshots) {
+  name: 'fa-${env}-upgrade-snapshots'
+  scope: rg
+  params: {
+    deployUpgradeSnapshots: deployUpgradeSnapshots
+    location: location
+    storageName: names.snapshotStorage
+    apiIdentityName: names.apiIdentity
+    vnetName: names.vnet
+    privateEndpointName: names.snapshotPrivateEndpoint
+    tags: tags
+  }
+  // The private endpoint uses the Blob private DNS zone and VNet link that the backup foundation creates.
+  dependsOn: [backupFoundation]
+}
+
 module onboarding '../shared-context/stage-onboarding-delegation.bicep' = if (enableAgentOnboarding) {
   name: 'fa-${env}-onboarding-delegation'
   scope: rg
@@ -256,6 +277,7 @@ module onboarding '../shared-context/stage-onboarding-delegation.bicep' = if (en
     accountName: names.foundryAccount
     projectName: names.project
     principalId: foundation.outputs.apiIdentityPrincipalId
+    assignmentDescription: 'FA #468: ${env} onboarding may only add Foundry User / OpenAI User for service principals; no deletes'
   }
 }
 
@@ -295,4 +317,5 @@ output FA_CONSOLE_APP string = names.consoleApp
 output FA_CONSOLE_IDENTITY string = names.consoleIdentity
 output FA_CONSOLE_STORAGE string = names.consoleStorage
 output FA_AGENT_ONBOARDING bool = enableAgentOnboarding
+output FA_UPGRADE_SNAPSHOT_CONTAINER_URL string = deployUpgradeSnapshots ? upgradeSnapshots!.outputs.containerUrl : ''
 output FA_BACKUP_ROLE_ID string = backupRole.outputs.backupRoleDefinitionId

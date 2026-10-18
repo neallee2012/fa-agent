@@ -153,8 +153,9 @@ def test_private_home_permission_failure_is_blocked_without_temporary_fallback(p
     def denied(*args, **kwargs):
         raise PermissionError(13, "synthetic platform HOME ownership")
 
-    monkeypatch.setattr(os, "open", denied)
-    with pytest.raises(Problem) as exc:
+    # Scoped: on Linux the fixture's shutil.rmtree also calls os.open, and it runs before monkeypatch undoes.
+    with monkeypatch.context() as patch, pytest.raises(Problem) as exc:
+        patch.setattr(os, "open", denied)
         hosted.dispatch(request("seed", nonce="amber"))
     assert exc.value.status == 503 and exc.value.body["error"]["code"] == "ENVIRONMENT_HOME_NOT_WRITABLE"
     assert external_tools["profiles"] == []

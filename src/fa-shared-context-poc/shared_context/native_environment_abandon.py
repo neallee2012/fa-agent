@@ -108,7 +108,7 @@ async def _abandon_session(runtime, command):
         # adoption read finds only what an interrupted one left.
         if (existing is not None and existing.state == "ready" and existing.hosted_session_id == me
                 and existing.previous_hosted_session_id == command.expected_session_id):
-            await adopt_left(runtime)
+            await adopt_left(runtime, command.expected_session_id)
             return existing
         raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "this session already holds the Agent from another source")
     if (current.hosted_session_id, etag) != (command.expected_session_id, command.expected_etag):
@@ -134,7 +134,7 @@ async def _abandon_session(runtime, command):
         chain_task_id=binding_task_id(runtime.identity.agent_id, me)))
     # After the commit, so the audit read never delays or blocks it.
     await _log_left_work(runtime, current)
-    await adopt_left(runtime)
+    await adopt_left(runtime, command.expected_session_id)
     log.warning("NATIVE_ENVIRONMENT_SOURCE_ABANDONED source_session_id=%s source_version=%s session_id=%s version=%s",
                 ready.previous_hosted_session_id, ready.previous_agent_version, me, ready.hosted_agent_version)
     return ready

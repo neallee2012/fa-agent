@@ -1,5 +1,111 @@
 # Shared Context POC
 
+<a id="native-2di-switch"></a>
+## ADR-0009 2d-i 開關（P9，2026-10-16，CODE/offline；每個環境預設關，未部署）
+
+**一個開關：** 部署 profile 的 `api_environment` `FA_NATIVE_SESSION_GUARD_ENFORCE`。`"1"` 時 `ci_deploy.py`
+同時把每位助理（`kind=assistant`）的 Hosted overlay 設成 `FA_NATIVE_TURNS=foundry-native-v2`（sync 建出宣告 v2 的
+H2d 定義），API 打開 P5～P8 的背景切換、送出路徑與巡查；API 自己的 `FA_NATIVE_TURNS` 仍是 v1（到 2d-ii）。
+`deploy/stage/stage.json` 與 `deploy/azd/profile.defaults.json` 都寫 `"0"`。兩邊不會只開一半：`meta`／`check`
+拒絕開關以外的 v2（`hosted_environment` 或 `assistant_environment` 寫 v2 而開關是 `"0"`；executor 等非助理即使開關
+打開也不能寫 v2，它們不跑 API 搬移的 2d-i 回合）、開關打開時助理 overlay 另寫 v1，以及 `"0"`／`"1"` 以外的值。
+開關關時 sync job 帶 `--refuse-native-v2`：任何 Agent 目前服務的定義已宣告 v2（打開到一半停下的痕跡），該 Agent 以
+`NATIVE_V2_SERVED_SWITCH_OFF` 失敗、什麼都不寫，不會把 v2 帶進開關關的部署。部署時 `follow` 步驟改成只報告（sync 帶
+`--verify-follow`：P6 的 `follow_all(verify_only=True)` 對每個 Agent 呼叫 `verify_agent`，只讀 metadata，不叫醒 VM，
+每個 Agent 回 `ok` 或 `pending`＝下一次回合結束才換，不算失敗；沒有 scope 的 executor 與 `follow` 一樣回 `skipped`）。這份逐 Agent 報告印在 sync job 的輸出裡：在 Log
+Analytics 該 job execution 的 log 看，部署腳本本身只印 `sync <execution> Succeeded`。部署前相容閘門照舊；stage 照舊拒絕
+`FA_NATIVE_CUT_FAULT`。
+
+**打開前提（`guard`、`sync`／`follow`、`api` 每一步寫入前都唯讀檢查一次，不符就停下、這一步什麼都沒寫；dev 部署線
+不跑 `guard` 也一樣擋）：**
+
+- 這個 checkout（也就是由它建的 API image；build 與 sync job 都核 code identity）的 `native_binding.NATIVE_2DI_SCHEMA`
+  至少是 2（P5＋P6；`meta`／`check` 以 AST 讀原始碼核對）。P6（#862）合併後是 2。
+- API 是單一 revision 模式；打開的那一次另要求只有一個 active revision，而且就是 `latestReadyRevisionName`。
+- **打開的那一次**：目前服務中的 revision 由本腳本命名，而且它的 commit 已有 P5＋P6。較舊的副本（例如 release 30）以
+  `extra="forbid"` 解碼 P5 寫的綁定列會回 409 `NATIVE_BINDING_INVALID`，所以先以 `"0"` 部署含 P5＋P6 的 commit，
+  下一次部署才改 `"1"`。這次部署的 sync 先發布宣告 v2 的版本、`api` 步驟才換上開關打開的 revision；中間仍服務的
+  P6 API（開關關）照舊在送出時 follow，可能留下舊式 `pending`，新 API 會撤回它（`NATIVE_UPGRADE_LEGACY_PENDING_WITHDRAWN`，
+  ADR-0009 M1 2d-i 第 2 步的退路），dev 測試時不算故障。
+- **打開後不能關：** 服務中的 API 已是 `"1"`、profile 改回 `"0"` 時 `guard`／`sync`／`api` 都停下。往前修，不退版：API
+  不退回 P6 以下，Hosted 不退回 H2d 以下（宣告 v2 的 image 上新建的對話 `_Meta` 標 v2，H0 解不開，回 409
+  `NATIVE_STATE_INVALID`；ADR-0009 M1 2d-i「不退版到 H2d 以下」）。
+
+**出狀況時：**
+
+- **打開到一半停下**（sync 已發布宣告 v2 的版本，`api` 步驟失敗或沒跑）：保持 `"1"` 再跑一次部署，不要改回 `"0"`。
+  改回 `"0"` 的部署會在 sync 停下（`NATIVE_V2_SERVED_SWITCH_OFF`，訊息會提示改用 `"1"` 重跑）。
+- **某個 Agent 卡住**（搬檔柵欄不結束）：用 P6 的 `agent-versions fence --agent-id <agent-id>` 先看（只讀），確認後
+  `--clear --confirm <agent-id>` 收尾（P6 #862）。不要重部署或關開關來解。
+- **想立刻跑一次 P8 巡檢**（不等 API 啟動後 5～60 分鐘的第一輪）：`agent-versions patrol --once`，規則同每日巡檢（只讀 `get_session` metadata、
+  要 `FA_NATIVE_SESSION_GUARD_ENFORCE=1`、有間隔與時間預算），印出本次統計；開關關時以 `NATIVE_SESSION_GUARD_DISABLED` 結束（exit 1）。
+  已判定放棄的 Agent 不在這個程序內交給背景切換，由 API 下一次巡檢或回合結束處理。
+- **在 portal 直接把 API 的 ENV 改成 `"0"`**：繞過上面「不能關」的檢查，不支援、也沒有退版方式；v2 對話仍在，P5 的
+  綁定列與搬檔狀態沒人處理。發現了就用部署線以 `"1"` 再部署一次。
+
+**怎麼打開：**
+
+- **dev**（`faexample`，部署線用操作者的 profile JSON，`--config`／`FA_DEPLOY_CONFIG`）：先照常部署含 P5＋P6
+  的 commit（`"0"`），再在那份 profile 的 `api_environment` 改 `"FA_NATIVE_SESSION_GUARD_ENFORCE": "1"`，照
+  dev 的部署批准流程再部署一次；dev 測試項見 ADR-0009 閘門清單（第 2 項故障點、第 7 項全掃描時間）與 2d-i 計畫。
+  azd 環境用 `azd env set FA_NATIVE_2DI true`。
+- **stage**：dev 測完後，總協調開 release PR，把 `deploy/stage/stage.json` 的值改成 `"1"`（附 dev 測試報告），由 Neal
+  決定是否合併；合併才部署。閘門 7 沒過不上 stage。
+
+**使用者看到什麼：** 部署本身不換任何 Agent 的環境，也不讓訊息等。每位助理在下一次回合結束後於背景換到新版：來源沒有
+工作檔就直接換、不等；有工作檔時最多約 120 秒的柵欄內搬檔，這段時間送出的訊息在請求內最多等 10 秒，之後顯示同步中，
+工作台以同一個 request ID 自動重送（不是「沒送出」）。換完那一則回覆帶一次通知：「助理已更新到新版本，工作檔也一起帶過來了。」、
+「已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。」或「已換到新的執行環境；舊環境已失效或被平台刪除，
+這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。」閒置的助理照舊不被叫醒，等它下一次被使用。
+
+**Verified against：** `test_stage_ci_native_2di.py`（預設關、打開時兩邊都設且 follow 只報告、只開一半被拒、executor
+不能宣告 v2、`NATIVE_2DI_SCHEMA` 不足的 checkout 與真 checkout 的 AST 讀值、多 revision 或 active 不是 latest ready、
+服務中的 API 太舊或 commit 不明、打開後不能關、`sync`／`follow`／`api` 不經 `guard` 也擋、開關關時 sync job 拒絕已服務
+v2 的 Agent 並提示用 `"1"` 重跑、stage 拒絕故障點）、`test_agent_versions.py`（`--verify-follow` 把 `pending` 當報告）、
+`test_azd_profile.py`。離線替身，不是 dev／stage 驗收。
+
+<a id="agent-retirement"></a>
+## 退役 Agent：只加 tombstone、不刪 Team 資料（2026-10-15，CODE/offline，未部署）
+
+**問題：** dev 的一位「＋」測試 Agent 已在 Foundry 端刪除，API 端的 roster、註冊列與綁定列還在：工作台列出一位載入失敗的
+助理，API 啟動與目錄會為它記錯誤；程式沒有任何退役路徑。依 ADR-0006（[補充](../../docs/adr/0006-team-trust-boundary-grokbot-mode.md#agent-retirement)）不能刪 Team 資料。
+
+**做法：** `TeamRegistry.retire_agent` 由原組織 operator 在一筆 CAS 建立 create-only 的 `TeamAgentRetired`
+（`team_agent_retired`：operator oid、`retired_at`、reason、request ID），並停用該 Agent 的身分索引（`deactivation_id`
+= request ID）。先讀再寫，重跑或 ack 遺失後回原 tombstone。即時路徑的兩個接點：
+
+- `resolve_agent_scope`：registry Agent 讀目標列後再讀一次 tombstone（1 → 2 GET），已退役回 410 `AGENT_RETIRED`。
+  `for_agent`、peer router（`/agents/<id>`）、`team_recipient_ready`、`follow_agent`、routine／HITL／Teams 轉送都經過它。
+- `registered_agent_ids`：roster 之後一次 snapshot 讀 tombstone，只回還在服務的 Agent；`retired_agent_ids` 回已退役的。
+  工作台目錄（`public_agents`）、啟動時的 peer 準備、`agent_versions sync`／`follow_all`、收件人清單都用它。
+
+routine 時鐘略過已退役的 Agent，只記一次 `FA_NATIVE_ROUTINE_CLOCK_RETIRED`；部署相容性閘門把它的綁定列放在
+`retired_rows`，不擋部署。`validate_team_registry_history` 核對 tombstone、停用後的身分列與原退役回條，
+`_quiescence`／`validate_additions` 因此接受它。工作台把 `AGENT_RETIRED` 顯示成「這位助理已退役；訊息沒有送出」。
+API 重啟後 binding 路徑的 registry 掃描也查已退役的 Agent，回 410；Teams 轉送回一句退役說明（`RelayReply` refused），
+不是 raw 410；群組活動跳過退役成員（只記 log，activity wire 沒有欄位，加欄位要換 profile）；session keepalive 跳過退役的
+peer，只記一次。CLI 帶 `--delete-foundry` 時，roster 另一位 Agent（含已退役）同 project＋name 就拒絕。onboarding
+卡在 `registered` 的 Agent（`--stuck-onboarding`，或進入 `registered` 已超過 1 小時，看 onboarding 列的 `registered_at`，
+舊列看 `claimed_at`）可以退役：同一筆 CAS 把它的 request ID 從 `pending` 拿掉（tombstone 記 `onboarding_request_id`，
+退役回條多一筆 pending 寫入，啟動核對兩者），roster 名額不釋出；沒有 tombstone 時，還在 `admitted`／`creating` 的（直接讀 onboarding 列）照樣拒絕。
+舊 CLI 已一般退役的（onboarding 停在 `admitted`／`creating`／`registered`），preview 與退役回 `already_retired`，
+再跑一次會用獨立的 `team-agent-retire-release` CAS 拿掉 `pending`（冪等）。用過之後不能退回本 PR 之前的
+image（見 deploy README）。onboarding 失敗留下的 Foundry agent 用 `--failed-agent-name` 預覽、確認後刪除，不寫 Table，另記一行
+`FA_RETIRE_FAILED_LEFTOVER`。
+
+**Operator 指令：** `python -m shared_context.behavior_agent_retire preview|retire`（用法、`--delete-foundry` 的
+`force=true`／409 說明與角色指派的限制見 [deploy README](../../deploy/README.md#retire-agent)）。
+
+**Verified against：** `test_agent_retire.py`（create-only 與重跑、只有 operator、ack 遺失收斂、身分停用後 token 被拒、
+兩個重啟讀取接受 tombstone 且竄改被擋、工作台目錄不列、不 invoke／sync／follow、送出回 `AGENT_RETIRED`、時鐘略過並只記一次、
+群組活動照常讀其他成員、重啟後 binding 路徑回 410、Teams 轉送回退役說明、keepalive 只記一次）、
+`test_agent_retire_cli.py`（preview 只列確切目標且不寫、要確認、部分刪除後重跑收斂且不碰其他 Agent、Foundry 已刪的 dev 情況、
+同 project＋name 拒絕刪除、`register_agent` 後真的中斷仍在 `creating` 時拒絕且重送可完成、卡在 `registered` 的退役後 pending
+釋出且名額回來、啟動讀取接受、重送回 410、舊方式退役的再跑一次只釋出一次（含退役時仍在 `creating` 的）、
+沒有 tombstone 的 `creating` 不釋出、setup 等超過 1 小時才註冊的不算卡住、
+失敗 onboarding 的殘留只列它自己並只刪它且記一行）、
+`test_native_deploy_gate.py`（退役 Agent 的 v1 綁定列不擋已打開的閘門）。離線替身，不是 dev／stage 驗收。
+
 ## 換版只讀還開著的回條（審計第 8 項，2026-10-14，CODE/offline，未部署）
 
 **問題：** 換版（`session_follow`）在 `pending` 期間要確認舊 session 沒有工作。原本 `_drain_pages`／`_scan_page`
@@ -244,7 +350,7 @@ commit 成功後才把 `complete_for` 設成新 SID、`complete_since` 設成這
   寫入（`create_version`、`update_route`、session 建立／停止）照舊 0 次重試（`PLATFORM_NO_RETRY`），原 create claim／回讀規則不變。
   舊 conversation lane 的 `FoundryHttpClient.verify_session`／`session_status`／`session_idle_timeout` 與 recovery 不在這次範圍，仍不重試。
 - `install_native_turn_routes` 的 21 個 GET 路由改用 `reply_read`：Hosted／平台錯誤碼的 5xx 回 `automatic_retry:true`，
-  預設說明改成「這次讀取沒有完成，再讀一次是安全的」。Table 暫時讀不到（`BEHAVIOR_READ_FAILED`）與讀取時記用量的 commit
+  預設說明改成「這次讀取沒有完成，再讀一次是安全的」。Table 暫時讀不到（`BEHAVIOR_READ_FAILED`）與 commit
   回覆遺失（`BEHAVIOR_COMMIT_UNKNOWN`；`record_agent_turn_usage` 以同 RID 重讀沿用原 commit）也照這樣回，不再落到
   共用錯誤處理的 `false`。例外：`NATIVE_TURNS_DISABLED` 與已結束的平台 session（`_RetiredSession`）再讀也不會好，仍是 `false`；
   其他未列出的錯誤（未預期例外、Table 協定錯誤等）仍走共用錯誤處理、回 `false`。
@@ -387,7 +493,9 @@ Neal 2026-10-05：「請嚴格依照hosted agent官方和grok bot的方式，詳
   或平台 404：重查平台一次並把**同一個讀取**再做一次（讀取不改資料，重做不會重送）；
   selector 暫時讀不到（`SelectorUnreadable`，見下）不算綁定移動，不清快取；
   ③ 其他 `FOUNDRY_*` 失敗：原錯誤照回，下一個請求重查；④ 同一個綁定超過 1 天沒用就重查
-  （平台 30 天無活動才刪 session，所以不會呼叫到已過期的 ID）。
+  （平台 30 天無活動才刪 session）。session 也可能隨時被刪或 `failed`，所以有綁定列時，凡是接著會呼叫這個 SID 的請求
+  （送出、讀取、輪詢、預取）都在請求內讀 metadata，10 秒內共用一次（見下方 phase 3 的 `_located`）；沒有綁定列（舊 selector
+  定位）的這個 1 天快取不變，2d-i P7 認領綁定列後才走那條。
 - **selector 暫時讀不到。** `get_agent`／`get_version` 逾時、無狀態碼、408、429 或 5xx 時，`HostedVersions.current`
   丟 `SelectorUnreadable`（回應仍是 503 `AGENT_VERSION_FOLLOWING`，與「選定版本這個 API build 不能服務」分開）。
   只有**讀取與輪詢**（回條、`status`、對話、歷史、Responses 即時串流的來源…）會沿用 selector 在 `SELECTOR_STALE_READ_SECONDS`（120 秒）內確認過的
@@ -416,19 +524,31 @@ Neal 2026-10-05：「請嚴格依照hosted agent官方和grok bot的方式，詳
     下一個 tick 的 `due()` 再給出同一個固定 RID（由 routine 與排定時間推導）。
   Hosted 在接單前拒絕（換版中、session 不符）時只清掉快取、不在這裡重送；工作台照舊用
   **同一個 RID** 重送。UNKNOWN 不重送的規則不變。
-- **503 `AGENT_VERSION_FOLLOWING` 的情形。** ⓐ 選定版本還沒有 session、只有其他版本的 session：送出回 503 並帶
-  `not_dispatched: true`（同一個 RID 稍後重送；不從送出啟動 follow），`/prepare` 回同樣的 503；由 follow／
-  agent-versions sync 或 ADR-0003 的漂移替換建立選定版本的 session。完全沒有 session（從未 prepare）時照舊回 409
-  `NATIVE_SESSION_CHANGED`。session 列表讀不到，或列到 100 筆的界（一頁，任何狀態、任何身分的 session 都算）還沒看到
-  選定版本時，送出回 503 `NATIVE_ENVIRONMENT_UNAVAILABLE` 並帶 `not_dispatched: true`，不當成「從未 prepare」。ⓑ 送出、寫入、routine 或交辦時 selector 讀不到：503（送出另帶 `not_dispatched: true`）。ⓒ 讀取或輪詢時 selector 讀不到且超過
+- **沒有綁定列、選定版本還沒有 session（ADR-0009 2d-i P7，M2 不拒絕）。** ⓐ 原本的 503 拒絕（3992d892 起：只有其他
+  版本的 session 時送出回 503、等外部 follow）已拿掉。送出用平台 session 列表（只讀 metadata，不呼叫）找到其他版本的
+  session 後：
+  - **沒開 `FA_NATIVE_SESSION_GUARD_ENFORCE`：** 送出自己 follow（`_follow_before_admission`），回 `server_following`、
+    工作台同 RID 自動重送；follow 照現行規則認領綁定列，來源不相容又閒置時照第 7a 點棄用、換到新 SID，從不呼叫它。
+  - **打開時：** 先看那個版本的 definition（`get_version`）。宣告支援的 profile（相容）就在這個請求內認領綁定列
+    （`claim`，記下 definition 宣告的 profile），照綁定列送到那個 session，不 follow（selector 移動不再讓綁定列的
+    SID 失效，換版交給回合結束後的背景切換）；不相容或沒宣告（例如 2026-10-02 之前的 image）就不認領、不呼叫，交給上面的
+    follow 以第 7a 點認領成不相容並換到新 SID。相容底線（ADR-0009 A2d）：版本的 `created_at` 早於 `9aaa0824`
+    （2026-10-02 03:08:16 +08，`COMPATIBILITY_FLOOR`）時，即使宣告 `foundry-native-v1` 也算不相容（那時的 image 沒有
+    `pending` 拒收與接單 CAS）；認領與第 7a 點的來源判斷都用這條，開關開或關都一樣。
+    完全沒有 session（或選定版本的 session 從未 prepare）時，送出照 `/prepare` 的做法替選定版本建立並 prepare
+    （`_bootstrap`，prepare 的 RID 由 Agent 與版本推導），再回 `server_following` 讓同一個 RID 重送；沒開時照舊回 409 `NATIVE_SESSION_CHANGED`。
+  - `/prepare` 本身不變（不是送出路徑）：只有其他版本的 session 時仍回 503 `AGENT_VERSION_FOLLOWING`。
+  - session 列表讀不到，或列到 100 筆的界（一頁，任何狀態、任何身分的 session 都算）還沒看到選定版本時，送出回 503
+    `NATIVE_ENVIRONMENT_UNAVAILABLE` 並帶 `not_dispatched: true`，不當成「從未 prepare」。
+- **503 `AGENT_VERSION_FOLLOWING` 的情形。** ⓑ 送出、寫入、routine 或交辦時 selector 讀不到：503（送出另帶 `not_dispatched: true`）。ⓒ 讀取或輪詢時 selector 讀不到且超過
   120 秒沒確認過。ⓓ 原有的：selector 指向這個 API build 不相容或還沒 active 的版本、Agent 正在換環境。
 - **窗口內的殘餘。** 讀取與輪詢在 10 秒窗口內，仍可能打到另一個程序剛移走版本的舊 SID 一次；送出、寫入、routine、
   交辦與 prewarm 不會。
-- **要靠外部 follow 才會恢復。** 送出不再自己啟動 follow；選定版本的 session 由 follow、agent-versions sync、
-  ADR-0003 的漂移替換，或到期的排程 routine（上面的 `idle_only` 路徑）建立。若部署用 `--defer-follow` 卻沒有接著 follow，
-  或 follow 在選定版本的 session 建好前失敗，這位 Agent 的送出會一直回 503 `AGENT_VERSION_FOLLOWING`（`not_dispatched: true`），
-  圖片上傳、追加與接續回 409；在跑的回合仍可取消（它的 session 是 active），其他取消與送達回條回帶 `not_dispatched` 的拒絕；
-  直到有人重跑 follow。
+- **送出不必等外部 follow。** 部署用 `--defer-follow` 卻沒有接著 follow，或 follow 在選定版本的 session 建好前失敗時，
+  送出照上面「沒有綁定列」一項自己 follow 或認領（2d-i P7），不再一直回 503。圖片上傳、追加與接續不 follow、不建立
+  session：沒開旗標時，選定版本沒有 session、也還沒有綁定列就回 409；打開時和送出一樣認領相容的其他版本 session、照綁定列
+  走（`current()` 的同一處）。在跑的回合仍可取消（它的 session 是 active），其他取消與送達回條回帶 `not_dispatched` 的
+  拒絕；第一則送出之後就照綁定列走。
 - **Hosted 是紀錄層的最後一道防線。** 紀錄讀取（`read`、`turn_status`、`conversation`、`history`、`result`、`progress`、`images`…）
   會先讀一次 Agent 紀錄（VM 內的 State store），若有**更新版本**的環境已接手這個 Agent，回 409
   `NATIVE_SESSION_CHANGED`、不讀任何紀錄。`session_read` 不擋（API 用它找目前環境）；
@@ -741,7 +861,7 @@ B thread 的回合。本 API 不建立本機 thread，也不接單、批准、�
 |---|---|
 | `GET /native-hitl/v1/attention` | 原 Entra owner＋`Behavior.Read`；沿 `FA_NATIVE_HITL_ENABLED`。Team 取已驗身份，Agent token 不能使用，不收 body／任意 Team、Agent、store 或 key。 |
 | `cursor`／`limit` | 可省略的 opaque cursor、預設20／最多20。cursor綁原Team，內容由server包裝SDK續頁值與這一輪的[時間窗](#team-hitl-attention-window)；UI不可解析或自製。limit指**原資料列**頁大小，不保證每頁有卡。 |
-| `NativeHitlTeamAttentionPage` | `schema_version=fa-native-hitl-team-attention-v1`、`team_id/items/next_cursor/observed_at`。空items但有next_cursor時要繼續；null才是這輪完成。跨頁不是原子快照，新一輪仍須從頭發現；失敗不可清成沒有待辦。 |
+| `NativeHitlTeamAttentionPage` | `schema_version=fa-native-hitl-team-attention-v1`、`team_id/items/next_cursor/observed_at`。空items但有next_cursor時要繼續；null才是這輪完成。跨頁不是原子快照，新一輪仍須從頭發現；失敗不可清成沒有待辦。單張卡讀不出（4xx，例如 Agent 已退役 410、紀錄不合 409）只略過那張並記 `NATIVE_HITL_ATTENTION_ITEM_SKIPPED`，其他卡照列；5xx、`BEHAVIOR_CONFLICT`，或卡片的 Agent 屬於別的 Team（403 `NATIVE_HITL_SCOPE_DENIED`）仍讓整頁失敗。 |
 | `NativeHitlTeamAttentionEntry.item` | 直接重用 `NativeAttention` 的 `approval_required`／`question_required`；批准reference及提問正文／choices等保持原DTO，沒有第二套卡片schema。 |
 | `NativeHitlAttentionOrigin` | `{state:"verified"|"unavailable",root:NativeTurnAddress|null,sender:NativeTurnAddress|null}`。已核原receipt、root及sender同Team／原CID/RID與root關聯才verified；直接真人回合root為自身、sender=null。缺原件／reader不在時不猜，保留B卡且來源unavailable。 |
 
@@ -903,7 +1023,7 @@ dev 2026-10-12：呼叫 idle（compute 已回收）的舊 session，平台會在
 - **stop 只送給 `active` 的來源：** idle 或已失效沒有 compute 可停；`creating`／`updating`／`deleting` 不 stop，
   回 `source_active`，下一次再看。
 - **自動接續的 retarget**（保留原 pending、改指新目標，仍要搬檔）只在來源 `active` 時走；不是 active 就直接走不搬檔決定。
-- **來源 `active` 時照舊搬檔：** inspect、複製、核對、stop 與停止後核對都不變。
+- **來源 `active` 時照舊搬檔：** inspect、複製、核對、stop 都不變；停止後只送目的端紀錄、不讀來源（見下方 §10）。
 - **停止後核對只讀 FA 自己 stop 的來源：** `stop_started` 改成在平台接受 FA 的 `stop_session` **之後**才寫
   （以前在送 stop 之前就寫）；平台回 409 `session_already_stopped` 不算 FA 的 stop。FA 的 stop 失敗、之後來源被回收：
   沒有這個紀錄，`before_stop` 不叫醒它、follow 不讀它的檔案，回 409 `NATIVE_FILES_SOURCE_UNAVAILABLE`，自動接續以
@@ -913,11 +1033,18 @@ dev 2026-10-12：呼叫 idle（compute 已回收）的舊 session，平台會在
   `CONVERSATION_SESSION_UNAVAILABLE`，不送回合去叫醒它；工作台顯示既有訊息
   「原 Hosted session 無法使用；未自動替換，請選擇 reset 或 new session。」。代價（§10 接受）：閒置超過逾時的舊對話
   要明確 reset 或開新對話才能繼續；reset 用 `stop_session`，不 invoke。
-- **§10 的窄例外與已接受風險：** ① FA 自己的 stop 被接受並記下之後，`stopped_step` 仍用 Files API 逐檔讀一次停止後的
-  來源，確認 stop 前後檔案沒變（既有「stop 後 Files GET」互鎖，[來源漂移且已有 staging 的出口](#source-drift-staging-exit)）。
-  官方：stop 結束 compute、保留檔案系統；Files 呼叫會不會重新配置 compute，官方沒有寫，列為 dev 驗證項
-  （ADR-0009 §10）。② metadata 讀到 `active` 到實際呼叫之間仍可能轉成 idle（同上方取消與送達回條的已接受風險）；
-  舊版對話 admission 之後到實際送出之間也一樣。
+- **§10 的已接受風險（原窄例外 2026-10-16 取消）：** ① 原本 FA 自己的 stop 被接受並記下之後，`stopped_step` 還用
+  Files API 逐檔讀一次停止後的來源；dev 2026-10-16 證實這會叫醒它，而且醒在 selector 選的版本（ADR-0009 §10 驗證項 ②
+  FAIL）。現在第二次讀取就是 stop **之前**、來源仍 `active` 時 `before_stop` 的容器內 `verify_source`；stop 之後不再對
+  來源發 Files 呼叫或呼叫 helper，只送目的端 `source_stopped`／`list_stopped` 紀錄（`list_stopped` 頁照 manifest 產生，
+  只為滿足 H2d image 的關卡），從已核對的 staging 發布。背景柵欄在 stop 已標記、staging 已核對之後遇到來源又醒著
+  （任何版本），會再 stop 一次、照 staging 發布或等待；出錯後再讀 metadata 看到來源 `active` 時，
+  `NATIVE_FILES_SOURCE_UNAVAILABLE`／`NATIVE_FILES_UNAVAILABLE` 不算永久性錯誤（`NATIVE_UPGRADE_CUT_SOURCE_WOKEN`）；flag-off 的 follow 只改順序，來源版本變了照舊拒絕
+  （[來源漂移且已有 staging 的出口](#source-drift-staging-exit)）。② metadata 讀到 `active` 到實際呼叫之間仍可能轉成
+  idle（同上方取消與送達回條的已接受風險）；舊版對話 admission 之後到實際送出之間也一樣。③ 背景切換柵欄（2d-i P5）在
+  綁定列標了 FA 自己的停止之後，對 `idle`（或醒在別的版本）的來源補記停止紀錄、照 staging 做完搬移，不再讀檔
+  （ADR-0009 §10，見下方「回合結束後的背景切換」）。④ 背景切換遇到 `idle` 的來源回 `source_idle`，不建 session、不碰來源，
+  等下一個真正的回合結束（總協調 2026-10-16）；已存在的目的 session 留下的東西照常收斂。
 
 **Verified against：** `origin/main` `8732d7b7` 的 `FollowFiles`、`NativeSessions.follow/advance`、
 `behavior_work_policy` admission；`test_native_follow_no_wake.py`（idle 來源零 invoke／零 Files／零 stop 並以不搬檔完成、
@@ -1013,13 +1140,13 @@ ADR-0009 phase 2 拆成四個 PR：**2a** 協定欄位，仍是 `foundry-native-
   不變，存著的回條照驗、同 RID 重送照對；換 profile 後新的值一定寫出。沒標 profile 的項目照舊當 v1 讀。
 - **profile 快照：** `tests/shared_context/test_native_profile_snapshot.py`＋`fixtures/native_profile_snapshot.json`
   記下 (a) wire DTO 與 (b) state store 項目（`behavior_wire`、`behavior_native_*_wire`、`behavior_sdk_state` 與所有
-  `native_*` 模組定義的 model）的 JSON schema、(c) `requirements-hosted.txt` 的 `github-copilot-sdk`／
+  `native_*` 模組定義的 model；只有 API 用的 `API_ONLY_MODULES` 除外，總協調 2026-10-17）的 JSON schema、(c) `requirements-hosted.txt` 的 `github-copilot-sdk`／
   `azure-ai-agentserver-*` 固定版本與 checkpoint 的 SDK／runtime 版本、(d) native checkpoint codec 與 checkpoint
   profile 名稱；profile 沒換卻改了任何一項就失敗。v1 依 ADR §3 本來就永遠不相容，2b、2c 若改形狀就在 v1 下以
   `FA_REGENERATE_PROFILE_SNAPSHOT=1` 只跑 `test_profile_snapshot_matches_the_current_profile` 這一個測試重產；2d-i 換
   profile 時同樣重產。快照檔是在 `NativeSessionState.actual_version` 加入之後才產生的，所以釘住的是 2a 之後的 v1 形狀，
   不是 2a 之前的 v1；v1 相容性由「選填欄位舊 image 照常解碼」與「v1 digest 位元組不變」兩組測試證明。JSON schema 看不到 `exclude_if`，由同一檔的 profile
-  標記測試補。
+  標記測試補。stage 第 31 版起 v2 只允許新增預設時不輸出的選填欄位：基準是 `fixtures/native_v2_wire_<commit>.json`（目前 `8a8608dd`，第 31 版的 release PR 重產），`v2_drift` 比 H0 嚴，enum／Literal 加值、新 operation、新 model 都擋；通過的改動只重產上面的快照，不換 profile（ADR-0009 §3「v2 快照規則」）。
 - **混合版本：** 舊 API 不會呼叫新 image（`HostedVersions.current` 要求選定版本的 `fa_build` 與 API 完全相等，2a 不動）；
   新 API 呼叫舊 image 時這些欄位都不存在，行為同現在。stage 的順序是 sync→API→工作台→follow，新 image 的 session 要到
   follow 才有，所以新欄位不會遇到舊工作台；`/prepare/reconcile` 另外不轉出，保險。
@@ -1033,19 +1160,36 @@ ADR-0009 phase 2 拆成四個 PR：**2a** 協定欄位，仍是 `foundry-native-
 [ADR-0009 §4](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#4-送出一個回合怎麼處理實際版本與漂移)：
 有綁定列的 Agent，送出、讀取與換環境都以這一列定位：目前 SID、`x-client-fa-expected-version`＝紀錄的實際版本 V_rec，
 不再是 selector 的版本。selector 只決定下一個新 session 綁哪一版，以及要不要先跑保留的送出時 follow
-（`_follow_before_admission`，它與部署時 `follow_all` 都保留到 2d-i）。沒有綁定列（還沒認領）、讀不到（記
+（`_follow_before_admission`，它與部署時 `follow_all` 都保留到 2d-i；`FA_NATIVE_SESSION_GUARD_ENFORCE` 打開時
+selector 移動已不再讓綁定列的 SID 失效，2d-i P7）。**打開這個開關前必須先合併 P5（#858，回合結束後的背景切換）：**
+否則 selector 已移動的 Agent 會一直留在綁定列的舊 SID 上，永遠不會被換版。開關打開時送出時 follow 已停用（P6，見
+「送出路徑」）。沒有綁定列（還沒認領）、讀不到（記
 `NATIVE_BINDING_UNRECORDED operation=locate`）、紀錄的 profile 不在支援集合，或這個 SID 已被本程序判定不相容時，
 照 phase 2 以前的 selector 定位，不拒絕。
 
-- **呼叫綁定列的 SID 之前（ADR-0009 §10 phase 0 保證，`_located`）：** selector 讀取與（冷程序或同一 SID 1 天未用時）
-  這個 SID 的 `get_session` metadata 並行讀，兩者都確認後才呼叫它：selector 指向的正是這個 SID 建立時的版本（selector
+- **呼叫綁定列的 SID 之前（ADR-0009 §10 phase 0 保證，`_located`）：** selector 讀取與這個 SID 的 `get_session`
+  metadata 並行讀，兩者都確認後才呼叫它。metadata 何時讀：凡是接著會呼叫這個 SID 的請求——送出、寫入、routine、交辦、
+  prewarm，以及對話、歷史、回條與 `status` 輪詢、送出的預取——**每次都在請求內讀**，只沿用 `METADATA_REUSE_SECONDS`
+  （10 秒）內**開始**的那次讀取，讓同一則送出的預取與 `current()`、連發的幾則或工作台每秒一次的輪詢共用一次（每個 SID
+  每 10 秒最多一次 `get_session`；沿用時不會把窗口往後推）。不呼叫 Hosted 的路徑不讀。2026-10-15 以前沿用 1 天：暖程序上
+  1 天內被刪或 `failed` 的 SID 會再被呼叫，平台以同一個 SID 重建空 session、訊息卡住（dev M5 測試）；現在送出讀到 404 會改跑
+  follow，§7a 第二次 404 後換到同版本的新 SID，讀取讀到 404 則不呼叫、回 409 `NATIVE_SESSION_CHANGED`。
+  確認條件：selector 指向的正是這個 SID 建立時的版本（selector
   指向本 build 不服務的版本時照綁定列走）、沒有棄用決定、metadata 是 `active`／`idle`。任一不成立就不呼叫這個 SID：
   送出改跑保留的 follow；讀取只在 selector 版本的目的 SID 存在時讀它（同 main 的讀取者），404／退役的不讀；預取的
-  `cached_reader` 同樣檢查，有綁定列時不退回舊的 selector 讀取者。metadata 讀取 401／403／5xx 照 main 回報。
+  `cached_reader` 同樣檢查（只認 10 秒內 `_located` 留下的那次讀取），有綁定列時不退回舊的 selector 讀取者。
   留 `NATIVE_BINDING_SESSION_RETIRED invoked=False`。
+- **metadata 讀不到時：** 401／403 一律照 main 回報，不呼叫 SID。其他失敗（5xx、429、逾時）或 SID 正在 `creating`／`updating`：
+  **冷程序**（本程序 1 天內沒用過這個 SID，含 `forget()` 之後）照 main 回 503 `NATIVE_BOOTSTRAP_UNKNOWN`，用 main 的讀法
+  （重試一次、連線 5 秒／讀取 10 秒）；**暖程序**（1 天內用過；main 這時根本不讀）只讀一次、不重試，SDK 每次呼叫的
+  `connection_timeout`／`read_timeout` 是 `METADATA_BUDGET_SECONDS`（2 秒），且從這次 selector 讀取開始最多等 2 秒，
+  逾時或失敗就記 `NATIVE_BINDING_METADATA_UNCONFIRMED kept=True`、照 main 呼叫這個 SID，10 秒內不再重讀。
+  代價：暖程序上 metadata 剛好讀不到時，已刪的 SID 仍可能被呼叫一次（與 main 相同）。
 - **送出路徑不多延遲：** 綁定列在送出前讀一次（同一請求內預取與 `current()` 共用）；selector 與 metadata 並行，main 是
-  先後讀，所以呼叫 session 前的等待不比 main 長；只需 selector 時不佔 worker（`_LOCATE` 64 個，大於 anyio 預設 40 個
-  worker thread）。送出成功後，若 VM 接受的正是這一列記的 SID 與版本就不再讀 Table。
+  先後讀，所以呼叫 session 前的等待不比 main 長（串行深度仍是一輪；牆鐘是兩者較慢的那個，metadata 比 selector 慢時才多出差值，
+  `test_a_warm_submits_metadata_read_runs_alongside_its_selector_read` 核兩者同時進行；暖程序上 metadata 最多多等到
+  selector 讀取開始後 2 秒，`test_a_hung_metadata_read_holds_a_warm_submit_no_longer_than_its_budget`）；只需 selector 時
+  不佔 worker（metadata 讀取用 `_LOCATE`，64 個，大於 anyio 預設 40 個 worker thread）。送出成功後，若 VM 接受的正是這一列記的 SID 與版本就不再讀 Table。
 - **漂移照跑：** session 讀取或送出被 409 `NATIVE_SESSION_CHANGED` 拒絕、SID 沒變、V_obs≠V_rec（較新 image 用
   `actual_version`，立刻記 `vm`；舊 image 讀 `get_session` metadata，VM 接受 expected＝V_obs 後才記 `metadata-active`）：
   以 V_obs 的版本定義（`get_version`，只在漂移時讀）判斷相容；相容就以同 RID、同 body、expected＝V_obs 再送**一次**
@@ -1137,11 +1281,123 @@ ADR-0009 phase 2 拆成四個 PR：**2a** 協定欄位，仍是 `foundry-native-
   API 設定 `FA_NATIVE_SESSION_GUARD_ENFORCE=1` 打開（預設關；`0`／未設是關，其他值也當關並記 log）：讀綁定列，目前 SID
   的 profile 不在支援集合就回 503 `AGENT_VERSION_FOLLOWING`＋`not_dispatched`，什麼都不送。依 ADR §7a，**2d-i 與請求內
   切換一起打開**；在那之前擋下呼叫只剩拒絕，所以維持觀察。
+- **回合結束後的背景切換（ADR-0009 M1 2d-i 第 2 步，`native_cut.py`、`NativeSessions.cut`）：** 同一個開關打開後，
+  `NativeTurnGateway._accounted` 看到 `completed`／`unknown` 回條時，只把這個 Agent 交給 lifespan 的背景 worker（同一請求
+  不多讀、不多等；同一 Agent 一次一個；同一 RID 只觸發一次）。worker 在綁定列的 V_rec≠selector 選的版本、目標版本的
+  定義宣告支援的 profile 時：讀目的 session 狀態（處理綁定列 `upgrade` 記的自己柵欄留下的 `pending`、補寫 commit 後
+  沒寫的綁定列；別的 follow 寫的 `pending` 不動）→ `NativeSessionCut` 探查 → 安靜才讀來源 `get_session`、對 `active`
+  的來源列工作檔 → 帶 E0 切換。來源 `idle` 時（讀目的 session 之前與探查之後各看一次）回 `source_idle`、不建立 session、
+  不讀來源，等下一個真正的回合結束（總協調 2026-10-16；讀到舊終態回條觸發也無害）。目的 session 已經存在時（只看 metadata），
+  先照常收斂它留下的東西（舊式 follow 的 `pending`、綁定列漏記的 commit），再回 `source_idle`。沒有工作檔直接 commit（通知 ④）；有工作檔先在綁定列記 `upgrade`（含 `started_at`），
+  Hosted 寫 `pending`，照現行 follow 搬檔、停來源、commit。`CUT_FENCE_SECONDS`（120 秒）只在 FA 停來源**之前**檢查：
+  每次送停止前都要還剩至少 15 秒，並先在綁定列的 `upgrade` 寫下「已開始停止」（`stop_started`，寫不成就不送停止）。
+  之前超過或失敗就撤回；寫下之後絕不撤回，只在柵欄自己的目的 SID 與版本往前推到 commit（ADR「例外才接手」），
+  selector 之後改回舊版或換成更新版都一樣，下一次切換再從那裡走。推進時依來源的平台狀態：`active` 照現行 follow 再停；
+  `idle`（或醒在別的版本）時，停止已被接受但檔案進度沒記下就先補記；之後只送目的端紀錄、照已核對的 staging 發布，
+  不再讀來源（ADR §10 驗證項 ② 2026-10-16 FAIL：停掉的 session 被讀檔會醒，可能醒在別的版本）；`failed`／`deleted`／`expired`／404 的檔案已不在，照 §7a 棄用（兩次相隔讀取確認），不搬檔 commit，通知
+  「舊環境已失效」；其他狀態等下一次。推進出錯時分類（`_drive_failed`）：暫時性（5xx、429、逾時、單一檔案下載超過
+  10 秒的 503 `NATIVE_FILES_TIMEOUT`、`NATIVE_FILES_UNKNOWN`、Session Files 401／403 的 `NATIVE_FILES_ACCESS_DENIED`（權限
+  可以補）、metadata 讀取失敗、ETag 競爭）留著柵欄等下一次觸發；永久性（`_UNMOVABLE`：`NATIVE_FILES_CONFLICT`、`_LIMIT`、
+  `_UNSAFE`、`_SOURCE_CHANGED`、`_SOURCE_UNAVAILABLE`（不是 FA 停的）、`_UNAVAILABLE`、
+  `_UNSUPPORTED`；staging 已核對、而且出錯後再讀一次 metadata 看到來源 `active` 時，`_SOURCE_UNAVAILABLE`／`_UNAVAILABLE`
+  只表示來源又醒著，不算永久、不起算，記 `NATIVE_UPGRADE_CUT_SOURCE_WOKEN`、等下一次再 stop；來源仍 `idle` 就是目的端自己的錯
+  （卡住的 `admitting`（409）照永久性處理；OSError（503）可能會好，照暫時性的 30 分鐘上限）；讀不到 metadata 算暫時性）要在之後的觸發隔至少 5 秒再讀到一次才確認（中間有暫時性錯誤就重算），從第一次失敗起連續失敗超過
+  `CUT_TRANSIENT_SECONDS`（30 分鐘，起點見下「持久的起算點」；只在等待、沒出錯的一輪，例如來源 `creating`／`updating` 或推進到
+  上限，不會重算，只有 commit、棄用，或第一次看到來源醒在別的版本（每個 process 每次叫醒一次；清除的 Table 寫入失敗就不算清過，這一輪不讀目的端、不讀計時，下一輪先再清一次）才清掉；持久的計時超過 60 分鐘
+  還在，表示 30 分鐘之後沒有任何出錯的一輪，是中斷（凍結、部署）而不是連續失敗，下一次出錯重新起算）也算。棄用決定寫下後切換失敗、之後柵欄卻帶著工作檔 commit 時，綁定列記
+  `files_migrated=true`（通知「已更新」），不沿用那個舊決定。確認後在柵欄自己的目的 SID 走 §7a 棄用不搬檔 commit
+  （`_without_moved_files`；綁定列 `files_migrated=false`、`basis=files_unmovable`／`files_overdue`、`source_status`
+  `idle`／`active`，通知 ④ 原句），記 `NATIVE_UPGRADE_CUT_FILES_UNMOVABLE code=… basis=…`。綁定列記著柵欄時，`cut` 與每次送出的 `advance` 都先走同一個收斂步驟
+  （`_converge` → `_settle`；送出只推一步，回 `pending` 帶 `server_following`，工作台同 RID 重送再推下一步），柵欄還在時
+  不走 `without_files` 或 retarget；年輕、沒標停止的柵欄讓送出等到 120 秒上限後撤回。收斂時讀柵欄的檔案進度若回
+  409 `NATIVE_ENVIRONMENT_CONFLICT`，再讀一次柵欄目的端：那個 `pending` 已被背景工作撤回或 commit（dev 2026-10-18，
+  送出那一步正好碰上 120 秒上限的撤回），記 `NATIVE_UPGRADE_CUT_FENCE_SETTLED_MEANWHILE`、照重讀結果收斂，訊息在同一個請求送到目前的 SID 一次，不拒絕；同一個
+  `pending` 還在才照舊回衝突（`test_native_cut.py` 的 `concurrent_withdraw`、`same_pending_stays` 兩項）。
+  超過 120 秒還沒推完會記一次 `NATIVE_UPGRADE_CUT_OVERDUE`，再過 `CUT_DRIVE_SECONDS`（120 秒）或關機就把 `pending`
+  原樣留給下一次（`stopping`）。別的嘗試或副本只撤回超過 120 秒、沒寫下停止的柵欄，撤回前再讀一次綁定列；同一個
+  （目的 SID、RID）的柵欄記錄不會被另一個副本覆蓋，拿回的 `started_at` 不是自己的就回 `fence_live`、只由原來那一個推進；
+  寫了停止的 `upgrade` 只由 commit 清掉；唯一例外在 `_settle`：Hosted 已沒有這個 `pending`、來源仍是目前 SID（沒 commit，
+  照下面的拒絕撤回不該發生），記 `NATIVE_UPGRADE_CUT_FENCE_LOST`、只清掉這筆記錄（回 `fence_lost`），下一次切換重新開始；
+  目的 SID 已是目前 SID 的照 §7a (j) 補寫切換。開關打開時，沒有柵欄、由 `advance` 自己搬檔的 follow 遇到同樣的暫時性
+  檔案錯誤也保留 `pending` 等下一次（同一個 `_drive_failed` 30 分鐘上限）；開關關閉時照現行 follow 不搬檔 commit（main
+  就是如此，當時慢下載報 `NATIVE_FILES_CONFLICT`）。不變式放在權威那一端：Hosted 的 `NativeSessionWithdraw` 看到柵欄的檔案進度已記
+  FA 的停止（`stop_started`）就拒絕撤回（記 `NATIVE_UPGRADE_WITHDRAW_REFUSED`），原樣回 `pending`，API 改成往前推，
+  不管是哪個 API 副本或版本來要。剩下的窗口：平台已接受停止、檔案進度還沒記下的那一下，只靠綁定列的標記。
+  忙碌就等下一次回合結束，不輪詢；`admitting` 卡住超過
+  `STUCK_ADMISSION_SECONDS`（300 秒）改走 §7a 棄用（`stuck_admission`）。等新建的目的 session 就緒（平台一直停在
+  `creating`／`updating`）以 `CUT_DESTINATION_SECONDS`（120 秒）為限，關機也會停：回 `destination_unready`（`fence_overrun`／`shutdown`），已送出的
+  建立不重送，下一次觸發照常讀回。每次一行
+  `NATIVE_UPGRADE_CUT_API outcome=… reason=… fence_ms=…`。`FA_NATIVE_CUT_FAULT=after_pending` 是 dev 的閘門 2 故障點
+  （柵欄不前進直到上限撤回），`ci_deploy.py` 對 stage 拒絕。
+- **持久的起算點（2d-i P6）：** 開關打開時，卡住的 `admitting`（300 秒）、推進的暫時性錯誤（30 分鐘）與永久性錯誤的
+  5 秒確認、已失效 SID 的兩次讀取（§7a (m)），起點都記在綁定列的 `clocks`（`NativeBindingClock`，每種一筆，換 SID 時
+  隨整列重建而清掉），換副本或重啟不重算。開關關閉時照 main 留在 process 記憶體，綁定列不多欄位。
+- **送出路徑（ADR-0009 M1 2d-i，P6；同一個開關）：**
+  - **請求內等候：** 任何送出（工作台送出與 Responses、群組與 Teams 都經 `NativeTurnGateway.submit`；Agent 間交辦與
+    回覆經 `NativeAgentRelayGateway`；routine）碰到切換（柵欄、舊式 follow 的 `pending`、503 `AGENT_VERSION_FOLLOWING`、
+    已失效或不相容的 SID、卡住的 admission），在同一請求內最多等 `IN_REQUEST_WAIT_SECONDS`（10 秒），每 500 毫秒（或
+    回應的 `retry_after_ms`）以同 RID、同 body 重做一次；等不到才回 `server_following`，工作台同 RID 自動重送。不拒絕。
+    沒碰到切換的送出只做一次，呼叫與延遲不變（有測試數）。Agent 間交辦等不到時照舊回 503「只重送原訊息」。
+    代價：等到上限時，任何可重做的拒絕（包括 Hosted 自己 task recovery 的 503，單次嘗試原本不帶 `server_following`）
+    都回 `server_following`：請求內最多 10 秒重做、占住這個請求的 worker thread，之後工作台最多 600 秒同 RID 重送。
+    重做不再預讀對話（只有第一次嘗試做 `_prefetch`）。
+  - **不排在柵欄步驟後面：** 綁定列記著柵欄時，送出不等 sessions lock（背景柵欄每步最多約 10 秒）：拿不到就回
+    `AGENT_VERSION_FOLLOWING`（沒送），由請求內等候重送。
+  - **停用所有 follow 入口：** 綁定的 Agent 不再由送出、routine、Agent 間交辦或 `/environment/advance` 啟動 follow
+    （`advance` → `_advance_bound`）；selector 移動照綁定列的 SID 送。只做 ADR 列的事：已寫的 §7a 決定、metadata
+    現在做的決定（已失效：第二次讀取要在第一次之後至少 5 秒，在請求內等；不相容：立刻）照 §7a 切到選定版本的
+    session（同版本就是新 SID），從不呼叫原 SID；沒有柵欄記錄的 `pending`（舊式 follow 留下的）由 H2d session 撤回
+    （`NATIVE_UPGRADE_LEGACY_PENDING_WITHDRAWN`），檔案進度已記 FA 的停止才接手推到 commit；送出碰到別的 RID 卡住的
+    `admitting`（503 `NATIVE_ADMISSION_PENDING`）時開始或延續 300 秒的持久計時，超過就在請求內走 §7a 棄用。routine
+    不再自己 follow（不建目的 session、不寫 `pending`），等不到就回 503 `NATIVE_ROUTINE_UNCONFIRMED`（同一個 occurrence
+    RID），下一次 tick 重送。沒有綁定列（寫不進）的 Agent 才走舊的自動 follow；那時暫時性檔案錯誤回 `pending` 畫面
+    （送出得到 `server_following`），不回 503 `NATIVE_FILES_TIMEOUT`／`_ACCESS_DENIED`。
+  - **零呼叫強制（§7a (k)）：** 不相容的 SID 在任何入口都不被 invoke、不經 Files、不 stop；送出被檢查點擋下（503
+    `AGENT_VERSION_FOLLOWING`＋`not_dispatched`）就照上面在請求內切換。
+  - **P9 前必須有的界限：** ③ 已標停止的柵欄，來源 metadata 一直是 `creating`／`updating`／`deleting` 或讀不到：同一個
+    30 分鐘持久界限，之後照實不搬檔 commit（來源還在用 ④ 句、`deleting` 用「舊環境已失效」），記
+    `NATIVE_UPGRADE_CUT_SOURCE_UNSETTLED_OVERDUE agent_id=… session_id=… request_id=…`；等待中每次記
+    `NATIVE_UPGRADE_CUT_DRIVE_PENDING code=… session_id=… agent_id=… waited_seconds=…`。④ 柵欄的目的 session 讀不到：
+    送出等待（`server_following`）並記 `NATIVE_UPGRADE_CUT_FENCE_BROKEN … definite=…`（每次多讀一次目的 session 的
+    `get_session`）。只有確定的失敗（4xx、invoke 404、metadata 已失效）才開始持久計時；5xx、逾時等平台中斷清掉計時、
+    一直等。確定失敗從第一次起超過 `FENCE_BROKEN_SECONDS`（300 秒）：沒標停止的柵欄由選定版本的新 SID（先升 M5
+    attempt，絕不是壞掉的那個）撤回，舊 SID 帶著檔案照常接單（`NATIVE_UPGRADE_CUT_FENCE_BROKEN_WITHDRAWN`；撤回失敗記
+    `…_UNWITHDRAWN`，下次再試）；標了停止的（或 Hosted 拒絕撤回）才走 §7a 棄用到新 SID，不搬檔、照實通知。
+  - **操作者路徑（runbook）：** 以 API 的設定與身分執行（`--config`；需要綁定列 Table 讀寫與 Hosted session invoke
+    權限，只檢視時只讀 Table）。`python -m shared_context.behavior_agent_versions fence --agent-id <ID>` 只讀綁定列，列出
+    目前 SID、柵欄（目的 SID、RID、開始時間、停止標記）與持久計時，不呼叫任何 session。看到上面的 log 長時間重複、
+    確認柵欄卡住時才加 `--clear --confirm <ID>`（同一個 ID）：沒標停止的柵欄立刻撤回（舊 SID 照常接單）；標了停止的
+    先推進（最多 `CLEAR_DRIVE_PASSES`＝5 輪、每輪隔 2 秒），還推不完才照實不搬檔 commit；目的 session 壞掉時，沒標停止
+    的由新 SID 撤回，標了停止的只在確定失敗時不搬檔 commit（平台中斷時回 `fence_broken`，平台恢復後再跑）；Hosted 已
+    沒有 `pending` 的只清掉記錄。每次一行 `NATIVE_UPGRADE_FENCE_OPERATOR`。
+  - **部署 hook：** `follow_all(..., verify_only=True)` 只讀 metadata（`environment_view`），不 follow、不呼叫 session；
+    P9 由 `ci_deploy` 打開。
 - **舊 Hosted image 的相容（`settled_session_ids`）：** 之前的 SID 清單只在非空時放進 follow 指令；目的 session 的 image
   比本 PR 舊時，它以 422 `NATIVE_REQUEST_INVALID` 拒絕這個未知欄位（還沒讀寫任何東西），API 就不帶這個欄位重送一次，
   之後對這個目的 SID 一律不帶（`NATIVE_ENVIRONMENT_SETTLED_UNSUPPORTED`）；那個 image 照舊等之前 SID 的回條。
 - **相容來源的兩次讀取（§7a (m)）：** 兩次讀到已失效要相隔至少 `RETIRED_CONFIRM_SECONDS`（5 秒），而且不超過
   `RETIRED_PAIR_SECONDS`（60 秒）；第一次讀取太舊就重新起算，幾分鐘前的一次 404 不算確認。
+- **每日巡查（ADR M1 第 3 步 (b)，`native_session_patrol.py`）：** 同一個 `FA_NATIVE_SESSION_GUARD_ENFORCE=1` 才排程
+  （預設關：不建 task）。API lifespan 背景 task，啟動後隨機 5～60 分鐘跑第一輪（dev 一天重啟多次，先等一整天就永遠
+  跑不到；隨機讓部署時並存的兩個 replica 錯開，撞在一起也只是多一輪 metadata 讀取），之後每天一次加最多 1 小時抖動；同一 process 不重疊。對每個
+  服務中、未退役、綁定列是 v1 且沒有棄用決定的 Agent，只讀目前 SID 的 `get_session`（不 invoke、不碰 Files、不 stop）；
+  404／`failed`／`deleted`／`expired` 隔至少 5 秒、最多 60 秒（與送出路徑同一個窗口）再讀一次仍是，才寫 §7a (g) 棄用決定
+  （basis `retired`），其他什麼都不寫；超過 60 秒就不算確認，下一輪重讀。寫之前再讀一次綁定列，已換 SID 或已有決定就不寫。
+  巡查自己不切：寫下的決定（這一輪的，或之前寫了還沒切的）交給背景切換 worker（P6，ADR M1 第 4 步 (b)「背景工作
+  切走」），由 `NativeSessions.cut` 照回合結束的同一條路切到新 SID，所以主人一直不開口的 Agent 也會離開已失效的 SID、
+  不擋 2d-ii 閘門。`idle`／`active`、讀取失敗、v2 列都不動。
+  每次讀取前間隔 1 秒；一輪超過 30 分鐘，或連續 3 次讀取 429／5xx／逾時，就停下，沒讀到的 Agent 記在 `deferred`，下一輪從那裡開始。
+  每輪一行 `NATIVE_SESSION_PATROL` 計數 log。
+- **升級 reconciler（ADR-0009 第 12 點、phase 6a，`native_upgrade_reconciler.py`）：** `FA_NATIVE_UPGRADE_RECONCILER=1`
+  且 `FA_NATIVE_SESSION_GUARD_ENFORCE=1` 才排程（預設關：不建 task）。回合結束仍是主要觸發；這是備援：每 15 分鐘加最多
+  5 分鐘抖動掃一次服務中 Agent 的綁定列，只做第 12 點的 (a)(b)，都交給同一個背景切換 worker（`CutDriver.turn_ended`）：
+  (a) 綁定列 profile 不相容或已有棄用決定（不讀平台）；(b) 相容、V_rec 不是 selector 選的版本，而且目前 SID 的
+  `get_session` 是 `active`（錯過回合結束，例如 API 在回合途中重啟）。先讀 selector：V_rec＝selector 就沒有要切的，不讀
+  `get_session`；相容且 `idle`／已失效的不動（Neal 決定 5；已失效的由每日巡查決定）。自己只讀 selector 與 `get_session`，
+  不 invoke、不碰 Files、不 stop、不寫綁定列。去重只在 process 內（綁定列的嘗試時間欄位與 (c) 等 phase 4b）：交過的 Agent
+  1 小時內不再交；V_rec＝selector、不動，或選定版本還沒就緒的 Agent，綁定列沒變就 24 小時內不再讀；V_rec＝selector 的 Agent 每天讀一次 selector、
+  不讀 `get_session`，V_rec 不是 selector 的閒置 Agent 到期時每天多讀一次 `get_session`；API 重啟後第一輪全部重讀。不相容但還沒有棄用決定的列，6a 不寫決定，`cut` 回 `unbound`（`cut` 只執行
+  已寫的決定），等 phase 4b（總協調決定）。每輪一行 `NATIVE_UPGRADE_RECONCILER` 計數 log。
 
 <a id="abandon-left-receipts"></a>
 ### 切換後留下的回條：(r)(s) 與競爭規則（ADR-0009 §7a「(r)(s) 的競爭」）
@@ -1174,6 +1430,18 @@ ADR-0009 phase 2 拆成四個 PR：**2a** 協定欄位，仍是 `foundry-native-
   往下，仍是 `started` 就當成「有變化」、重新計時、繼續等。標記之後來源晚到的保存被回條自己的 `run_token`／ETag 擋下
   （`_save_turn` 的 CAS），只留下沒人引用的 `turn:{n}`。API 讀這種回條時也跑一次同樣的規則（不睡），所以只有輪詢、沒有
   新訊息時，標記一樣會發生、讀起來帶 §8 通知。
+- **留下回合的卡片（ADR-0009 閘門 6）：** 批准、提問與 Connect 卡的等待只在原 SID 的記憶體裡，新 session 接不回去。所以
+  新 session 一確定留下的回合不會再完成，就照一般回合結束收卡（`close_cards`→`finish_turn`：寫該 RID 的 `/end`，未決的
+  批准記 `interrupted`、已放行但沒執行的記 `interrupted`／`effect_unknown`；已記的決定與回答不改）：退役來源上已開始的
+  在 commit 後的同一次掃描（`adopt_left`）收、漏掉的在讀到時收；來源 `idle` 的在停滯標記之後收（在那之前來源可能自己
+  寫完，卡片照常有效）。之後主人再按，提問與 Connect 卡回 409 `NATIVE_HITL_TURN_CLOSED`、批准卡回
+  `NATIVE_HITL_STATE_CONFLICT`，routine 提案卡不會寫出排程；卡片從待處理清單消失，沿用既有文字（工作台「這一回合已結束，
+  不能再批准。」／「這次等待已中止。」，Teams relay「這個項目已過期。」）。ID 由回合與卡片算出，重做只回原結果。收卡在背景跑（和 open-RID 移除一起追蹤、關機時一起收尾），接單與讀狀態
+  不多等任何 API 往返；同一個 RID 在同一個 process 只收一次。收卡失敗只記 `NATIVE_LEFT_RECEIPT_CARDS_UNCONFIRMED`，不影響
+  回條與排隊。來源 `idle` 的只在本 session 自己的停滯標記（`unknown`／`NATIVE_SOURCE_STALLED`）之後收：來源自己寫完、或
+  自己寫 `unknown`（recovery 交接）的回合不收，已記的允許留給接續回合讀。已知缺口：標記成功後、收卡前 VM 崩潰（或關機
+  收尾被截斷），或收卡遇到暫時的 HITL 失敗（不重試；回條已終態，之後不會再走到這裡），卡片留到原期限，**這段期間 routine
+  提案卡按「允許」仍可能寫出排程**。
 - **要等的訊息不占 Agent 的 chain、不被拒絕、依序（審查第 2 輪）：** 它維持 `accepted`，加進對話的 `left-queue`（對話
   store 的一個項目，依接單順序），由它自己的 SDK task `fa-native-left-wait-v1`（durable，VM 重啟後由 SDK 接回）每
   `POLL_SECONDS`（5 秒）看一次，每次看都會推進上面的停滯規則，**不需要任何外部輪詢**。只有佇列最前面的可以往下，所以同一
@@ -1387,7 +1655,8 @@ API 內建時鐘下一分鐘的 tick 以同一 occurrence 再送，`trigger` 重
 總協調回報dev `419e044b` t3：selector 35→36後25秒開始正常搬檔，
 09:03（台灣）目的端`session_files/source_stopped`回409 `NATIVE_FILES_UNAVAILABLE`，
 來源metadata之後為36／active。這不是「開始操作前已閒置900秒」才會發生的問題。
-現行順序是**複製／核對 → stop → 來源Files GET → 目的端source_stopped**；
+當時順序是**複製／核對 → stop → 來源Files GET → 目的端source_stopped**（2026-10-16 起改成
+**複製／核對 → stop 前容器內 verify_source → stop → 目的端source_stopped紀錄**，stop 後不再 Files GET；ADR-0009 §10 驗證項 ② FAIL）；
 不是stop後再invoke來源helper。Files GET喚醒是符合時序的候選，未以現有log排除停止未穩定或其他呼叫。
 
 **「核對原新環境」本身不會再碰來源工作檔。** 原API只讀目的端與必要的原staging；
@@ -2599,6 +2868,14 @@ API-only DTO／codec 不匯入 Hosted SDK；正常同 build 配對新版 reader�
   離線 SDK checkpoint 路徑。Windows 沒開 `LongPathsEnabled=1` 時，請改用短的 `--basetemp`（例如 `C:\t`）；
   否則這三則會顯示 SKIPPED（原本是 `WinError 206`），不算通過。Hosted 跑在 Linux，沒有這個限制。
 
+CI（`.github/workflows/shared-context-tests.yml`）只在 Linux 上跳過兩份清單裡的測試，本機照跑：
+`tests/shared_context/ci-quarantine.txt` 是缺上面這類前提（固定 Windows runtime 或原件）的測試，
+`tests/shared_context/known-failing-on-main.txt` 是在 main 上本來就失敗的測試。修好其中一則時，
+請在同一個 PR 刪掉它那一行，讓 CI 重新把關；清單只減不加，新的失敗要修，不要加進清單。
+這個 workflow 只在手動（`workflow_dispatch`）和每週一 01:00 UTC 執行，不隨 PR 或 push 觸發：一次約 130 runner 分鐘
+（8 片），private repo 的免費額度每月只有 2000 分鐘。要每個 PR 都跑，需要付費的分鐘預算；在那之前，每個 PR 的檢查是針對
+變更範圍的本機測試。
+
 ## HITL 原等待讀取競爭修正（CODE/offline）
 
 H1～H3 的已交付原件不改。本片固定 main `9b79df24b579b13ae91f68bdf724562d19f4e851`
@@ -2927,7 +3204,7 @@ H1 API 新增下列路由，仍由原 JWT／Team owner 與 Agent 身分核對，
 |---|---|
 | `POST /turn-pending` | **唯讀** `NativeHitlPendingQuery={turn:{agent_id,conversation_id,request_id},after:0,limit:20}`；回 `NativeHitlPendingPage`，含 `references/attention/next_after/closed`。只有本 Team owner／原 Agent 可讀。 |
 | `POST /authorize`、`/authorize/reconcile` | `NativeHitlAuthorize`；僅原 Agent，綁完整 action／digest、latest review／ETag、原 effect token 與 nullable approval reference。一次 CAS 產生 `NativeHitlAuthorization`；同 key 回條不代表可第二次執行。 |
-| `POST /end`、`/end/reconcile` | `NativeHitlEnd={request_id,turn}`；僅原 Agent 封閉原 RID 的等待，防止晚到 pending／人類點選重新生效。不是 SDK stop／lease 證明。2026-10-05 起，回合中沒有任何審核或提問時，VM 不在回覆保存前同步送 `/end`，改由回合結束通知（`notify_terminal`）送一次，回覆少等兩次 API 往返。 |
+| `POST /end`、`/end/reconcile` | `NativeHitlEnd={request_id,turn}`；僅原 Agent 封閉原 RID 的等待，防止晚到 pending／人類點選重新生效。不是 SDK stop／lease 證明。2026-10-05 起，回合中沒有任何審核或提問時，VM 不在回覆保存前同步送 `/end`，改由回合結束通知（`notify_terminal`）送一次，回覆少等兩次 API 往返。被留下、不可能再完成的回合也送（ADR-0009 閘門 6）：官方 recovery 交給接續回合時（`interrupt_handed_off`，未決的批准另記 `interrupted`、已記的決定保留給接續回合讀），以及換環境後新 session 確定留下的回合不會再完成時（〈[切換後留下的回條](#abandon-left-receipts)〉）。`request_id` 由回合算出，重送只回原結果；原 intent 已存但套用沒寫成（412、API 中斷）時，同 ID 再送 `/end` 或 `/observations` 會把同一筆套用再跑一次（其他指令仍只讀回原結果），這段期間 owner 若已做決定，照一般 `/observations` 規則處理：deny 回 409、不覆蓋；allow 則改記這次收尾的狀態（例如 `interrupted`），已記的決定原樣保留，與第一次就關一張未執行的 allow 卡相同。`finish_turn` 與 `interrupt_handed_off`（重跑時略過已不在 pending 的卡）遇 5xx／`BEHAVIOR_CONFLICT` 往外丟，由回合結束通知重跑；回合內的 `close()` 仍只記錄。 |
 
 索引只在原 Team／Agent／CID／RID 下保存 pending IDs，跟 pending 同 CAS；不是跨 Agent queue。
 工作台重開可由原 RID 分頁取得真 reference，再以原 `GET /pending/{pending_id}` 查完整原件，
@@ -4849,7 +5126,7 @@ setup/SDK/保存未完成時沿原 N1 unknown；不 fallback 舊 lane。
 
 | 原設定 | 真正執行／保存的接點 |
 |---|---|
-| `fa-sdk-start-gate-v1` | API `project_capture` 在每個新 RID 加上本次程式的 `sdk_start_code_sha256`；原 capture/digest 一起保存在 RID。N1 原 accepted→started CAS 擁有唯一執行權；`NativeSdkStart.enter` 在 SDK construction 前核 started／CID／SDK session／原輸入／取消及同 build，runner 再核 SDK 1.0.13／runtime 1.0.83。沒有舊 Job／ExecutorBinding／SQLite gate，也不偽造 no-SDK 終局。拒絕或開始不明沿原 RID，不換 ID。 |
+| `fa-sdk-start-gate-v1` | API `project_capture` 在每個新 RID 加上本次程式的 `sdk_start_code_sha256`（ADR-0009 2d-i，2026-10-17：`submit_native_turn` 對還沒有回條的 RID 以 `start_pinned` 改填實際收到的 SID 版本的 `fa_build`，讓舊 image 照常接單；讀不到時不改、保留 capture 原有的釘選（可能是較早 API build 的）；已有回條的 RID 原樣送回回條的 capture，routine intent 比對時不看這個釘選；M9 接手的回條（`adopted_from`）在新 SID 照原釘選跑，由該 image 其餘 preflight 檢查決定）；原 capture/digest 一起保存在 RID。N1 原 accepted→started CAS 擁有唯一執行權；`NativeSdkStart.enter` 在 SDK construction 前核 started／CID／SDK session／原輸入／取消及同 build，runner 再核 SDK 1.0.13／runtime 1.0.83。沒有舊 Job／ExecutorBinding／SQLite gate，也不偽造 no-SDK 終局。拒絕或開始不明沿原 RID，不換 ID。 |
 | `fa-instruction-context-origin-v1` | `read_context` 以 `NativeInstructionContext` 回原 command、Agent/CID/RID、turn、capture digest 和原 `NativeAgentOrigin`。`authorization=false`，真人與 Agent 的 source_kind 分開；Agent brief 不冒充真人原話，公開進度不把此資料偽裝成 reviewed-source citation。未選此 profile 的舊 `read_context` 拒絕語意不變。 |
 | `manual-no-custom-v1` | 沿官方 `SessionFsProvider` 及 `session.rpc.history.compact(SessionHistoryCompactRequest(trigger=MANUAL))`，不給 custom instructions/token override。第一次保存普通 state；從普通合法點冷恢復時壓縮一次，後續沿同一診斷格式與原 compaction 接續。`NativeCheckpointTurn`／`NativeCompactionExecution`／manifest lineage 保存原 RID/CID/SDK session/capture/前一 hash，沒有 fake job。 |
 
@@ -6622,7 +6899,9 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
   新對話的 lane 也沿用 A：S0 在 onboarding 記錄寫入 A 目前選版的 `state_profile`（只有不是 native 時才寫，例如 Responses），
   S5 建新 Agent 自己的選版時帶入；A 沒切就維持 native。A 有 `skill_artifacts` 時，帶選擇的請求不再受影響。若 S0 到 S5 之間 Team 目錄變了，S5 回 409
     `AGENT_ONBOARDING_SELECTION_STALE`（`cause` 附原選擇拒絕碼；刻意不沿用 S0 前的拒絕碼，以免 client 誤以為沒寫入而換新 rid 再建一個），
-    onboarding 停在 `registered`，需要主人先恢復目錄差異，再用同一 rid 續做。舊紀錄（沒有選擇欄位）照 PR4「複製 A」的規則續做，啟動讀取器同時接受新舊紀錄，不改寫既有列。
+    onboarding 停在 `registered`，依 `cause` 排除差異後用同一 rid 續做；API 對每次 STALE 記一行 `AGENT_ONBOARDING_SELECTION_STALE request_id=… cause=…`。
+    S5 在新 Agent 的 peer runtime 上核對，peer 建立時即沿用 A 的 Team MCP／Team connector 服務（Team 範圍、依 peer 自己 binding 的 Team 讀），
+    不必等它的 app 建好；10-15 前這裡漏了 Team MCP，凡預設勾到 `team-*` 的「＋」都會 STALE（`cause=CAPABILITY_SOURCES_CHANGED`）。舊紀錄（沒有選擇欄位）照 PR4「複製 A」的規則續做，啟動讀取器同時接受新舊紀錄，不改寫既有列。
 - **新 Agent 沿用 A 的來源設定（`turn_origin_profile`）：**S0 讀 A 目前在新對話實際用的值：有真人選定 head 就用 head 模板的值，
   沒有就用 A 的 standing profile。這個值原樣存進 onboarding 紀錄的 `turn_origin_profile`（沒有值時省略），S4 寫進新 Agent 自己的
   standing profile，S5 的選定模板也從這個 profile 取得，所以「複製 A」和「主人勾選」兩種新 Agent 都和 A 一致。之後續做一律用紀錄裡的值，
@@ -6851,7 +7130,14 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
   - `milestone`：一句話說明。
 
   合併後，CI 部署當下 main 的完整內容，run 摘要第一行會列出 `release`。
-- **手動部署**：GitHub Actions 的 deploy-staging 選 Run workflow，分支選 main；或執行 `gh workflow run deploy-staging.yml --ref main`。同樣部署 main HEAD。
+- **第 31 版的 release PR 多一步（ADR-0009 §3「v2 快照規則」，總協調 2026-10-17）**：在這個 PR 要部署的 main commit
+  上，照 `tests/shared_context/test_native_profile_snapshot.py` 檔頭的指令重產 v2 基準
+  `tests/shared_context/fixtures/native_v2_wire_<commit>.json`（`<commit>` 用那個 main commit，pydantic 2.12.5），
+  移除舊的基準檔，改 `V2_BASELINE` 與 `V2_BASELINE_SHA256`，跑過 `test_native_profile_snapshot.py`，和
+  `release.json` 一起放進同一個 release PR。PR 開出後 main 又前進，就照 release 門檻開新的 release PR，並在新的
+  main commit 上重產。
+- **手動部署**：GitHub Actions 的 deploy-staging 選 Run workflow，分支選 main，並填 `release_pr`；或執行 `gh workflow run deploy-staging.yml --ref main -f release_pr=<PR 編號>`。同樣部署 main HEAD。
+- **release 門檻**（job `release-gate`，[`deploy/stage/release_gate.py`](../../deploy/stage/release_gate.py)，在 Azure 登入之前）：部署的 commit 必須正好是一個已合併 PR 的合併 commit，那個 PR 改了 `deploy/stage/release.json`（只讀前 100 個檔案，讀不到就擋下），合併時的說明有唯一一行 `public-sync fingerprint:`（第一道，見 [public-sync](../../docs/public-sync.md)），合併後沒再編輯；手動部署填的 PR 也必須是它。所以 release PR 之後 main 又有新合併時，手動部署會被擋下，要部署較新的 main 請開新的 release PR。門檻只確認「這是 release PR 的合併」，不確認是誰按的合併：免費方案的 private repo 不能設 branch protection／rulesets（API 回 403），沒有 CODEOWNERS，agent 也用 `neallee2012` 合併，檢查 `mergedBy` 永遠會通過（2026-10-16，見 [ADR-0008](../../docs/adr/0008-environment-tiers-staging-cicd.md#2-部署規則)）。
 - **只能在 main 上跑**：job 有 `if: github.ref == 'refs/heads/main'`，federated credential 也只信任 main 上的 `staging` environment。所以不能用 tag 或其他分支觸發。
 - **全部Agent換版接續**：API就緒後的部署尾端自動推進A／B及「＋」Agent的原follow，
   不需打開工作台或按環境按鈕；未ready明確標為未完成，不能以selector已發布冒充（見[伺服器接續](#server-environment-follow)）。
@@ -12025,6 +12311,7 @@ T5沿API relay把result送往原發送者CID，以原request message ID作唯一
 A自己的N1 `create_item`保證同wake只接一筆，執行仍經原accepted→started CAS。
 terminal通知使用官方單次task／RetryPolicy，usage失敗不擋wake，既有chain不等通知完成；
 重入只補同wake，B的SDK及用量不重算。官方task也不冒充外部效果exactly-once，接收端仍核原ID。
+通知task有自己的RetryPolicy：間隔1、3、9…秒、單次上限1小時，十次（core上限）合計約1.9小時，撐過API暫停；
 十次重試耗盡時，在原回條的`notification_error`明示NATIVE_POST_TURN_UNKNOWN，原結果／usage不改。
 若root A的wake排隊耗盡，同時在A原交辦回條保存通知錯誤；N2真人查讀也會純讀核回子請求的通知狀態。
 工作台在原對話展開「協作通知未確認」，不覆蓋原答案，不暗中重送。
@@ -14659,10 +14946,13 @@ API 讀到結束回條後，**先**呼叫 `record_turn_usage(control, job_id=…
       見[工作台說明](web_test_console/README.md#model-lock)）；開關打開時不固定。
 
 <a id="native-model-switch"></a>
-- **對話中換模型（`FA_NATIVE_MODEL_SWITCH`，預設關；LOCAL，未部署）**：Neal 2026-10-13 批准實作，要先在 dev 用真模型探測再打開。
+- **對話中換模型（`FA_NATIVE_MODEL_SWITCH`；程式預設關，stage A／B、dev、新 azd 環境已打開）**：Neal 2026-10-13 批准實作。
+  stage A／B 從第 29 版（2026.10.14-29，#822）打開；dev 由部署 overlay
+  打開；`azd up` 建的新環境兩位助理也預設打開（總協調 2026-10-15 決定）。
   - **設定**：只有一個開關，放在 Hosted definition 的環境變數（部署 overlay，`behavior_agent_versions._ENVIRONMENT_FLAGS`
-    已接受 `"0"`／`"1"`；`deploy/azd/profile.defaults.json` 與 `deploy/stage/stage.json` 都沒有寫，所以 dev／stage 照舊關閉）。
-    要打開時在該環境的 Hosted overlay 加 `"FA_NATIVE_MODEL_SWITCH": "1"`；值不是 `0`／`1` 時 admission 回 503。
+    接受 `"0"`／`"1"`）。程式本身未設或 `"0"` 就是關；`deploy/stage/stage.json` 的 A／B 與
+    `deploy/azd/profile.defaults.json` 的 `assistant_hosted_environment` 都寫 `"1"`。
+    要關時把該環境 overlay 的值改成 `"0"` 再部署；只刪掉 key 不會關，sync 會沿用目前版本 definition 的值。值不是 `0`／`1` 時 admission 回 503。
     API 不另設：它讀所選 Hosted 版本 definition 上的同一個值（和判斷 Responses lane 同一次讀取），放在 template options 的
     `responses.model_switch`（關閉時省略，bytes 不變），工作台只照它顯示。
   - **接單**：`_capture_fits` 在開關打開時接受「只差模型選擇」（`model`、`model_capacity`、`reasoning_summary`）的新 RID，
@@ -14696,7 +14986,8 @@ API 讀到結束回條後，**先**呼叫 `record_turn_usage(control, job_id=…
     不需要改。
   - 測試：`test_native_model_switch.py`、`test_native_routine_api.py`
     「a routine turn runs on its conversation's model」、`test_agent_versions.py`「reports model switching」；
-    工作台見[工作台說明](web_test_console/README.md#model-switch)。真 SDK／真模型尚未驗證，等 dev 探測。
+    工作台見[工作台說明](web_test_console/README.md#model-switch)。dev 第 30 版候選測試換模型回歸 PASS（gpt-5.4-mini→gpt-4.1-mini
+    記得前文，[紀錄](../../docs/progress.md#dev-test-v30-1014)）；上面「壓縮」的 dev 通過條件沒有另外的紀錄。
     - 已知未處理（既有行為，本次不改換版接續規則）：被拒後若 Agent 換版、換了 Hosted session，只有被拒回合的對話仍由
       `_continuation_blocker` 回 `NATIVE_ENVIRONMENT_CHECKPOINT_UNAVAILABLE`，要開新對話。
 - **用量**：一開始送出就算一次請求。完整讀完串流、而且拿到合法 usage 才算已量測；錯誤狀態、串流中斷或被放棄，都只算次數、不填 0。
@@ -14747,6 +15038,10 @@ ADR-0007 的新對話不再建立 Table job 和 WorkRegistration，所以不能�
   - **`usage` 必填**：`null` 明確代表 unknown；缺少這個欄位回 422，不會被當成「沒有送出任何請求」。
   - **N2 補記**：N2 驗過 Agent、讀回 N1 原生回合的終態 `NativeReceipt` 後，可以在 API 內直接呼叫 `record_agent_turn_usage(control, rid=…, usage=…)`。用的是同一個 RID 和同一份 usage，所以只會回原回條。
   - **兩條路互不等待**：VM 斷線或 N2 不再輪詢，任一條成功就已入帳；另一條再送也不會重複入帳。
+  - **入帳失敗照樣回錯**：N2 讀回條時入帳失敗，錯誤照常回給呼叫端（已記了不同用量回 409；commit 回覆遺失等暫時錯誤回 5xx），
+    讓各呼叫端原有的重試（主人再讀、排程下一個 tick、relay 重送已結束的原回合）用同一份用量再記；不吞掉錯誤，用量不會沒人補記。
+    同一張共用成本列的三次 CAS 之間有短暫隨機等待。沒有 usage 的 `busy_refused` 沒跑過模型，不入帳、不算 unknown 回合；
+    VM 也不送這種回合的用量回報（API 只看得到 `usage:null`，分不出它和 unknown；舊版 VM 仍會送）。
   - **固定與否**：進入終態後，`usage` 和原結果都固定，只剩 delivered 旗標能改。
   - **control 的來源**：由 API 自己為該 Agent 解析出 work policy。Agent 取自 `control.policy.template.agent_oid`，不接受 request body 傳來的 agent，也不信 Agent 自稱的身分。
     `NativeReceipt.agent_id` 是平台 Agent GUID，要經 server 原有的對應換成 policy，不能直接當成 oid。
@@ -15140,7 +15435,7 @@ request 格式、`api-version=v1` 和 `Foundry-Features` header，都和 API 端
 - **Native 回合（ADR-0007 C3）**：`native_private_memory.NativePrivateMemory` 沿用同一個 `PrivateMemory` 和同一個開關。
   - **範圍**：只有真人回合（`receipt.source is None`）會使用；其他 Agent 傳來的訊息不查詢、也不更新。
   - **查詢**：在 `NativeSdkExecutor` 啟動 SDK 前執行，使用相同的資料標示和 literal 檔案上限。
-  - **更新**：放在 runtime 的 `on_completed` 中，並在原本的完成轉送之前執行。
+  - **更新**：放在 runtime 的 `on_completed` 中；原本的完成轉送已先在 `on_terminal` 送出，不等記憶。
     - 官方的終局通知 task 會在任一後續動作待定時重試整批，所以更新前要先在 Agent 自己的 `fa/v1/effects` 用 `create_item("fx:<RID>:private-memory-update")` 取得權利；只有成功建立的那次呼叫才會送出更新。
     - 標記已存在時，記 `FA_PRIVATE_MEMORY_UPDATE status=already_claimed`；結果不明或 token 取不到時，記 `status=claim_unknown`。這兩種情況都不會送出，因此一回合最多少記一次萃取，不會重複。
     - 這個 hook 不會丟出例外，也就不會讓其他後續動作因此重試。
@@ -15161,7 +15456,7 @@ request 格式、`api-version=v1` 和 `Foundry-Features` header，都和 API 端
   - 真人 native 回合會先查詢，完成後才更新；通知重試時不會再送一次更新。
   - Agent 來訊和未完成的回合，都不使用記憶。
   - 已有標記，或標記結果不明時，都不送出更新。
-  - factory 會先執行記憶，再執行原本的完成轉送；沒有設定時不啟用。
+  - 原本的完成轉送先在 `on_terminal` 送出，之後 factory 才執行記憶；沒有設定時不啟用。
   - async 和同步兩種 token 都可用。
 - 讓標記永遠成立時，2 案失敗（RED）；拿掉 executor 的查詢時，1 案失敗（RED）。
 
@@ -15178,7 +15473,7 @@ request 格式、`api-version=v1` 和 `Foundry-Features` header，都和 API 端
   - resolver 依目標 Agent 登記的 tenant 和 team 算出 `fat1-<hash>`，放進 `NativeTurnCapture.team_memory`。模型、request body 和 UI 都不能指定。
   - 這個欄位缺值時會省略，舊的 bytes 和 digest 不變。它和 `capabilities` 一樣屬於每回合的部分，不參與同一對話的 capture 比對，所以打開開關後舊對話追問不會被 `NATIVE_CAPTURE_CHANGED` 擋下。
   - 每個 Agent 第一次使用時，在自己的 `fa/v1/effects` 以 `create_item("team-memory-scope")` 記下 scope，只建立一次。之後收到不同的 scope 就不查也不寫，只記 `FA_TEAM_MEMORY_SCOPE status=mismatch`。
-- **寫入**：在原 Agent 真人回合 `completed` 後的 `on_completed` 執行，位置在私人記憶之後、原完成轉送之前。
+- **寫入**：在原 Agent 真人回合 `completed` 後的 `on_completed` 執行，位置在私人記憶之後。原完成轉送（`/result`）已先在 `on_terminal` 開頭送出，早於用量回報；真人回合沒有要回傳的對象，轉送不發請求。
   - 只寫入該 RID 的 `cand:<RID>`，條件是通過原有核對、而且決定是 `candidate`，也就是真人原文中唯一的逐字片段。Agent 來訊、工具輸出和網頁內容都不會成為 note。
   - 先用 `fx:<RID>:team-note` 搶寫入權，只有建立成功的那次呼叫才送一次 create。內容格式是 `[<Agent 名稱>, <UTC 時間到分鐘>] <原話>`（MEM-57c 起；之前的 note 只到日期，不改寫）；`kind` 原本一律是官方範例的 `user_profile`，S2 起依候選的 `reason` 選擇（見下方「S2：Team 層」），FA 不對 Team scope 做萃取或 update。
   - 官方 item API 不接受呼叫端指定 ID，所以標記已存在、標記結果不明，或 create 結果不明時都不再送。最多少一則 note，不會重複；原話仍保存在對話和 `cand:<RID>` 裡。
@@ -16055,7 +16350,7 @@ Verifier：oid 不在 config actors、token 為 app-only（無 `scp`，`idtyp` �
 ### CAP-06 PR3b registry Agent 的解析與路由（LOCAL）
 
 `resolve_agent_scope(store, config, agent_id)` 是唯一解析入口：config target 仍走 `config.agent_scope`（0 GET）；
-其他 agent_id 讀一次 PR3a 的 `agent_key` 目標列，組成 `ServerAgentScope(legacy_keys=False,
+其他 agent_id 讀一次 PR3a 的 `agent_key` 目標列（2026-10-15 起再讀一次 tombstone，見[退役 Agent](#agent-retirement)），組成 `ServerAgentScope(legacy_keys=False,
 identity=AgentIdentity(oid, actor=agent_id))`，其餘欄位沿用 config authority。未登錄、別的 Team、
 oid 撞到 config actor／human，一律 403 `AGENT_SCOPE_DENIED`。history 類讀取改用 `inventory_agent_scope`，
 從同一份 inventory 解析，不讀 live；缺列回 409 `AGENT_SCOPE_INVALID`。
@@ -16647,6 +16942,7 @@ M4更新僅寫`artifact_text`，保留權威`progress`；resume沿用SDK session
 - API 驗證 RS256、tenant JWKS、精確 `iss`／`aud`、`exp`、`tid`、`oid`。只由設定的 oid allowlist 決定 actor、team 與角色指令。沒有匿名、測試 header 或 `DefaultAzureCredential` fallback。
 - token 的 `kid` 不在快取的 JWKS 時，整個程序每 60 秒最多強制重新下載一次（`ThrottledJWKClient`）；窗口內仍不認得的 `kid` 直接 401，不再等 10 秒的下載。輪換的新金鑰最晚在窗口過後的第一個請求生效。
 - Teams Connector（Bot Framework）的簽章金鑰同樣處理：`ConnectorIdentity` 原本每個請求都在驗簽前下載 `login.botframework.com` 金鑰（5 秒逾時、不快取），現在整個程序快取 300 秒；不認得的 `kid` 每 60 秒最多強制重新下載一次（與上一條共用 `ForcedRefreshWindow`，但窗口各自獨立），窗口內直接 401 `TEAMS_SERVICE_AUTH_DENIED`。
+- 兩份金鑰快取在下載失敗時都沿用舊金鑰：300 秒到期後重新下載失敗（連不上，或 200 但內容不是 JSON 金鑰組；後者不會蓋掉快取裡的舊金鑰），24 小時內仍用上次下載的金鑰驗簽（log `AUTH_KEYS_STALE`／`TEAMS_JWKS_STALE`），每 30 秒最多再試一次，不讓每個請求都等逾時。Teams 不重送被拒的 activity，所以金鑰端點短暫故障不再讓訊息遺失。不認得 `kid` 的強制下載失敗時不沿用舊金鑰；超過 24 小時仍下載不到就照舊拒絕。
 - **只有 API MI** 有新建專用 Table 的資料權限，以及指定 Foundry project 的 Foundry User、Cognitive Services OpenAI User；Hosted A/B 不得有 Table 資料權限。
   - 原本 Hosted 也不得有 Memory 資料權限。ADR-0007 §6 對此有一項例外：Neal 於 2026-10-01 選擇 (b)，Hosted agent identity 可以取得 project 範圍的同兩個角色，但只能用於[私人記憶直連](#agent-私人記憶直連adr-0007-6預設關閉)。
   - `workstate` 由 ARM 建立，Table Data Contributor 僅授予該 Table；API 啟動時不建立或列出 service-level tables。

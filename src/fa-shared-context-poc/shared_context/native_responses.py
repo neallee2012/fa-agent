@@ -304,7 +304,7 @@ def native_responses_handler_factory(hosted, native_runtime: NativeTurnRuntime |
     """N6-0 owns host registration; no alternate host, task, session or executor is created here."""
     if native_runtime is None:
         raise Problem(503, "NATIVE_TURNS_DISABLED",
-                      "Responses require FA_NATIVE_TURNS=foundry-native-v1 and this process's original native runtime")
+                      "Responses require FA_NATIVE_TURNS and this process's original native runtime")
     if native_runtime.identity != hosted.identity:
         raise Problem(403, "NATIVE_STATE_SCOPE", "Responses require this process's original native runtime")
     return NativeResponsesHandler(native_runtime).handle

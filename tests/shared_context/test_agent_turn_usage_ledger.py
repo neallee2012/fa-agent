@@ -164,3 +164,28 @@ def test_the_verified_agent_reports_its_own_final_turn_usage_once_over_the_api(a
     missing = h.client.post(AGENT_TURN_USAGE_PATH, json={"request_id": "vm-missing"}, headers=h.headers("agent"))
     assert missing.status_code == 422
     assert ledger(SimpleNamespace(h=h, control=control)).model_unknown_turns == after.model_unknown_turns + 1
+
+
+def test_lost_cas_races_on_the_shared_cost_row_pause_with_jitter_before_retrying(
+        synthetic_standing_v1, monkeypatch, caplog):
+    import shared_context.behavior_instruction_cost as cost
+    from shared_context.behavior_timing import timing_id
+    c = synthetic_standing_v1
+    original, races, pauses = c.control.store.transact, [2], []
+
+    def racing(request, decide):
+        if races[0]:
+            races[0] -= 1
+            raise Problem(412, "BEHAVIOR_CONFLICT", "synthetic lost ETag race")
+        return original(request, decide)
+
+    monkeypatch.setattr(c.control.store, "transact", racing)
+    monkeypatch.setattr(cost.time, "sleep", pauses.append)
+    before = ledger(c)
+    record_agent_turn_usage(c.control, rid="native-race", usage=None)
+    assert ledger(c).model_unknown_turns == before.model_unknown_turns + 1
+    assert len(pauses) == 2 and 0.02 <= pauses[0] <= 0.1 and 0.04 <= pauses[1] <= 0.2
+    # Each lost race names its turn by the 12-character prefix only, never the RID itself.
+    conflicts = [r.getMessage() for r in caplog.records if "AGENT_USAGE_LEDGER_CONFLICT" in r.getMessage()]
+    assert len(conflicts) == 2 and all(m.endswith(" rid=" + timing_id("native-race")) for m in conflicts)
+    assert "native-race" not in caplog.text

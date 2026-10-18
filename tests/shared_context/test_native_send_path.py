@@ -15,6 +15,7 @@ import pytest
 from azure.ai.projects.models import AgentSessionResource
 
 from shared_context import behavior_native_sessions
+from shared_context.behavior_foundry import PLATFORM_NO_RETRY
 from shared_context.behavior_native_sessions import (
     NativeSessions, fresh_session_id, native_session_id, native_sessions,
 )
@@ -22,7 +23,7 @@ from shared_context.behavior_native_turn_wire import (
     NativeEnvironmentNotice, NativeEnvironmentView, NativeReceipt, before_dispatch,
 )
 from shared_context.errors import Problem
-from test_native_binding import CountingRepository, bound, claim, row  # noqa: F401
+from test_native_binding import CountingRepository, bound, claim, declared, row  # noqa: F401
 from test_native_turn_api import PREFIX, NativeTransport, native_api, submit  # noqa: F401
 from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
 from test_instruction_flow import instruction_models  # noqa: F401
@@ -35,6 +36,7 @@ from test_native_files_api import file_api, file_loops, local_env  # noqa: F401
 from test_native_follow_no_wake import source_calls
 
 
+REAL_READ_PLATFORM_SESSION = behavior_native_sessions._read_platform_session
 RECORD_READS = frozenset({"read", "conversation", "history", "result", "turn_status", "progress"})
 
 
@@ -101,7 +103,7 @@ def shared(case, monkeypatch, versions=None):
     monkeypatch.setattr(case.foundry.http, "_transport", httpx.MockTransport(route))
     monkeypatch.setattr(NativeSessions, "selected_version", lambda self, client: "41")
     monkeypatch.setattr(behavior_native_sessions, "_read_platform_session",
-                        lambda client: client.target if client.target.session_id in transports else None)
+                        lambda client, **_: client.target if client.target.session_id in transports else None)
     case.composition._native_sessions = NativeSessions(case.composition)
     return transports, agent
 
@@ -293,6 +295,32 @@ def test_a_409_at_the_recorded_version_repairs_the_row_and_sends_the_same_rid_to
     assert list(case.remote.records) == ["native-rid"]
 
 
+def test_an_unreadable_definition_still_repairs_the_row_as_v1_and_sends_the_same_rid(bound, monkeypatch, caplog):
+    """M2: before 2d-i the repair wrote the row and resent; a transient ``get_version`` failure must not turn that
+    into 409. The row records v1, as before; the deploy gate reports it when the version declared otherwise."""
+    case = bound
+    claim(case)
+    new_sid = native_session_id(case.remote.target, "unused", version="42")
+    transports, agent = shared(case, monkeypatch, {new_sid: "42"})
+    declared(case, monkeypatch, **{"42": Problem(503, "AGENT_VERSION_FOLLOWING", "unreadable")})
+    view = NativeEnvironmentView(
+        agent_id=case.agent_id, request_id="switch", state="ready", previous_hosted_session_id=case.sid,
+        previous_agent_version="41", hosted_session_id=new_sid, hosted_agent_version="42")
+
+    def committed_without_the_row():
+        agent.sid, agent.environment = new_sid, view
+
+    agent.on_submit = committed_without_the_row
+    with caplog.at_level(logging.WARNING):
+        accepted = submit(case)
+    assert accepted.status_code == 202 and accepted.json()["hosted_session_id"] == new_sid, accepted.text
+    repaired = row(case)
+    assert (repaired.hosted_session_id, repaired.state_profile) == (new_sid, "foundry-native-v1")
+    assert "NATIVE_BINDING_SWITCH_PROFILE_UNREAD code=AGENT_VERSION_FOLLOWING" in caplog.text
+    assert operations(case.remote, "submit") == ["41"] and operations(transports[new_sid], "submit") == ["42"]
+    assert list(case.remote.records) == ["native-rid"]
+
+
 def test_a_row_behind_the_agent_record_is_repaired_on_the_session_read(bound, monkeypatch):
     """A same-version switch (M5) committed in Hosted whose row write was lost: the selector still names the version
     the row's SID was created on, so that SID may be read, and its session read names the new SID. (When the
@@ -407,7 +435,7 @@ def test_a_retired_or_deleted_rows_sid_is_never_called_and_the_follow_runs(bound
     claim(case)
     transports, agent = shared(case, monkeypatch)
 
-    def platform(client):
+    def platform(client, **_):
         if status == "missing":
             return None
         raise behavior_native_sessions._RetiredSession(503, "NATIVE_BOOTSTRAP_UNKNOWN", "retired")
@@ -421,6 +449,240 @@ def test_a_retired_or_deleted_rows_sid_is_never_called_and_the_follow_runs(bound
     read = case.client.get(PREFIX + "/requests/native-rid", headers=case.headers)
     assert read.status_code == 409 and read.json()["error"]["code"] == "NATIVE_SESSION_CHANGED", read.text
     assert case.remote.calls == []
+
+
+def _metadata_reads(monkeypatch, deleted=()):
+    """``_read_platform_session`` recording each SID it reads; a SID in ``deleted`` is a 404 (``delete_session``)."""
+    looked = []
+
+    def platform(client, **_):
+        looked.append(client.target.session_id)
+        return None if client.target.session_id in deleted else client.target
+
+    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", platform)
+    return looked
+
+
+def _later(monkeypatch, seconds=behavior_native_sessions.METADATA_REUSE_SECONDS + 1):
+    """Past the work-delivery metadata window, far inside ``READER_IDLE_SECONDS``."""
+    now = behavior_native_sessions.monotonic() + seconds
+    monkeypatch.setattr(behavior_native_sessions, "monotonic", lambda: now)
+
+
+def test_a_warm_process_never_calls_a_row_sid_deleted_since_its_last_use(bound, monkeypatch):
+    """Dev 2026-10-15 M5: the row's SID answered a submit and a status read, then the platform deleted it. The next
+    submit used to skip the metadata for a day and invoke the SID, which the platform re-created empty; a submit reads
+    the metadata in its own request, so the 404 runs the follow instead and the SID is not called (ADR-0009 §10 /
+    phase 3; §7a's second read then abandons it for a fresh SID of 41)."""
+    case = bound
+    claim(case)
+    shared(case, monkeypatch)
+    deleted = set()
+    looked = _metadata_reads(monkeypatch, deleted)
+    assert submit(case).status_code == 202
+    case.remote.completed("native-rid")
+    assert looked == [case.sid]
+    _later(monkeypatch)
+    assert case.client.get(PREFIX + "/requests/native-rid", headers=case.headers).status_code == 200
+    assert looked == [case.sid] * 2  # a read that invokes the SID reads its metadata too, once per window
+    _later(monkeypatch)
+    deleted.add(case.sid)
+    followed = _following(case, monkeypatch)
+    before = len(case.remote.calls)
+    answer = submit(case, rid="native-rid-2", conversation_id="native-cid")
+    error = answer.json()["error"]
+    assert error["not_dispatched"] is True and error["server_following"] is True, answer.text
+    assert followed == ["41"] and looked[1:] and set(looked) == {case.sid}
+    assert case.remote.calls[before:] == []
+
+
+def test_a_burst_of_submits_reads_the_row_sids_metadata_once_per_window(bound, monkeypatch):
+    """One submit (its prefetch and its session read) and a follow-up inside the window share one metadata read;
+    the next submit after the window reads it again."""
+    case = bound
+    claim(case)
+    shared(case, monkeypatch)
+    looked = _metadata_reads(monkeypatch)
+    assert submit(case).status_code == 202
+    case.remote.completed("native-rid")
+    assert submit(case, rid="native-rid-2", conversation_id="native-cid").status_code == 202
+    case.remote.completed("native-rid-2")
+    assert looked == [case.sid]
+    _later(monkeypatch)
+    assert submit(case, rid="native-rid-3", conversation_id="native-cid").status_code == 202
+    assert looked == [case.sid] * 2
+
+
+def test_a_warm_submits_metadata_read_runs_alongside_its_selector_read(bound, monkeypatch):
+    """Latency: the submit's serial platform depth before the session call stays one round trip. Before this read
+    was added a warm submit made only the selector read; now the selector and metadata reads each wait for the other
+    to have started, which only completes when they run at the same time (a serial pair times out and fails)."""
+    from threading import Event
+
+    case = bound
+    claim(case)
+    shared(case, monkeypatch)
+    assert submit(case).status_code == 202
+    case.remote.completed("native-rid")
+    _later(monkeypatch)
+    started, overlapped = {"selector": Event(), "metadata": Event()}, []
+
+    def both(name, other, value):
+        started[name].set()
+        overlapped.append((name, started[other].wait(timeout=5), len(case.remote.calls)))
+        return value
+
+    monkeypatch.setattr(NativeSessions, "selected_version", lambda self, client: both("selector", "metadata", "41"))
+    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session",
+                        lambda client, **_: both("metadata", "selector", client.target))
+    before = len(case.remote.calls)
+    assert submit(case, rid="native-rid-2", conversation_id="native-cid").status_code == 202
+    # One selector read and one metadata read, concurrent, both before the first call to the session.
+    assert sorted(overlapped) == [("metadata", True, before), ("selector", True, before)]
+
+
+def _warm(case, monkeypatch):
+    """A warm process: the row's SID answered a submit, then the metadata window passed (well inside the day)."""
+    claim(case)
+    shared(case, monkeypatch)
+    assert submit(case).status_code == 202
+    case.remote.completed("native-rid")
+    _later(monkeypatch)
+
+
+def _budget():
+    return {**PLATFORM_NO_RETRY, "connection_timeout": behavior_native_sessions.METADATA_BUDGET_SECONDS,
+            "read_timeout": behavior_native_sessions.METADATA_BUDGET_SECONDS}
+
+
+def _failing_platform(monkeypatch, failure):
+    """The real ``_read_platform_session`` over a ``get_session`` that fails as ``failure`` says: an HTTP status, a
+    transport timeout, or a session status. Returns (AIProjectClient constructions, get_session SIDs)."""
+    from azure.core.exceptions import HttpResponseError, ServiceResponseTimeoutError
+    gets = []
+
+    def get_session(name, sid):
+        gets.append(sid)
+        if failure == "timeout":
+            raise ServiceResponseTimeoutError("the platform did not answer")
+        if isinstance(failure, int):
+            error = HttpResponseError("platform")
+            error.status_code = failure
+            raise error
+        return AgentSessionResource({"agent_session_id": sid, "status": failure,
+                                     "version_indicator": {"type": "version_ref", "agent_version": "41"}})
+
+    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", REAL_READ_PLATFORM_SESSION)
+    return project_client(monkeypatch, get_session=get_session), gets
+
+
+@pytest.mark.parametrize("failure", [503, 500, 429, "timeout", "creating", "updating"])
+def test_a_warm_submit_whose_metadata_read_fails_is_sent_as_on_main(bound, monkeypatch, caplog, failure):
+    """Review probe: a warm process (main skipped this read for a day after a use) whose metadata read fails (5xx,
+    429, timeout) or finds the SID creating or updating sends anyway: one read, no retry, one warning (was 503)."""
+    case = bound
+    _warm(case, monkeypatch)
+    constructed, gets = _failing_platform(monkeypatch, failure)
+    with caplog.at_level(logging.WARNING, logger=behavior_native_sessions.__name__):
+        sent = submit(case, rid="native-rid-2", conversation_id="native-cid")
+    assert sent.status_code == 202, sent.text
+    assert gets == [case.sid] and [kwargs for *_, kwargs in constructed] == [_budget()]
+    assert [record.getMessage().split()[0] for record in caplog.records
+            if "METADATA" in record.getMessage()] == ["NATIVE_BINDING_METADATA_UNCONFIRMED"]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_warm_submit_whose_metadata_read_is_denied_calls_nothing(bound, monkeypatch, status):
+    """401/403 stay errors on a warm process too, and the follow-up's prefetch does not fall back on the day-old
+    confirmation: its conversation read never reaches the SID the send could not check."""
+    case = bound
+    _warm(case, monkeypatch)
+    _failing_platform(monkeypatch, status)
+    before = len(case.remote.calls)
+    refused = submit(case, rid="native-rid-2", conversation_id="native-cid")
+    assert refused.status_code == status, refused.text
+    assert case.remote.calls[before:] == []
+
+
+def test_a_cold_submit_whose_metadata_read_fails_is_refused_as_on_main(bound, monkeypatch):
+    """A cold process (here: right after ``forget``) has not used the SID, so a failed read stays 503 as on main,
+    with main's retrying read (no budget), and nothing is called."""
+    case = bound
+    _warm(case, monkeypatch)
+    native_sessions(case.composition).forget()
+    constructed, gets = _failing_platform(monkeypatch, 503)
+    before = len(case.remote.calls)
+    refused = submit(case, rid="native-rid-2", conversation_id="native-cid")
+    assert refused.status_code == 503 and refused.json()["error"]["code"] == "NATIVE_BOOTSTRAP_UNKNOWN", refused.text
+    # The prefetch's read and the session read each ask (a failed read keeps nothing), as on main.
+    assert set(gets) == {case.sid} and all(kwargs["retry_total"] == 1 and kwargs["read_timeout"] == 10
+                                           for *_, kwargs in constructed)
+    assert case.remote.calls[before:] == []
+
+
+def test_a_hung_metadata_read_holds_a_warm_submit_no_longer_than_its_budget(bound, monkeypatch):
+    """Neal: no extra send latency. A metadata read that never answers holds the send for the budget only (the wait
+    stops there; azure-core's transport timeouts end the read itself), and the send goes on."""
+    from threading import Event
+    from time import perf_counter
+
+    case = bound
+    _warm(case, monkeypatch)
+    monkeypatch.setattr(behavior_native_sessions, "METADATA_BUDGET_SECONDS", 0.5)
+    release, options = Event(), []
+
+    def hung(client, **kwargs):
+        options.append(kwargs)
+        release.wait(timeout=10)
+        return client.target
+
+    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", hung)
+    try:
+        started = perf_counter()
+        sent = submit(case, rid="native-rid-2", conversation_id="native-cid")
+        held = perf_counter() - started
+        assert not release.is_set()
+    finally:
+        release.set()
+    assert sent.status_code == 202, sent.text
+    assert held < 0.5 + 2.5, held  # the budget plus the offline submit itself, far below the hung read
+    assert options == [_budget()]
+
+
+def test_a_history_read_never_calls_a_row_sid_deleted_since_its_last_use(bound, monkeypatch):
+    """A read that invokes the SID (history, status) reads its metadata as a send does, so a SID deleted since its
+    last use is not called (and not re-created empty): the read is refused without invoking anything."""
+    case = bound
+    claim(case)
+    shared(case, monkeypatch)
+    deleted = set()
+    looked = _metadata_reads(monkeypatch, deleted)
+    assert submit(case).status_code == 202
+    case.remote.completed("native-rid")
+    deleted.add(case.sid)
+    _later(monkeypatch)
+    before = len(case.remote.calls)
+    history = case.client.get(PREFIX + "/conversations/native-cid", headers=case.headers)
+    status = case.client.get(PREFIX + "/requests/native-rid", headers=case.headers)
+    for read in (history, status):
+        assert read.status_code == 409 and read.json()["error"]["code"] == "NATIVE_SESSION_CHANGED", read.text
+    assert case.remote.calls[before:] == []
+    assert looked == [case.sid] * 3  # a 404 keeps nothing, so each read asks again
+
+
+def test_status_polls_every_second_read_the_row_sids_metadata_once_per_window(bound, monkeypatch):
+    """The workbench polls about once a second: at most one ``get_session`` per SID per ``METADATA_REUSE_SECONDS``."""
+    case = bound
+    claim(case)
+    shared(case, monkeypatch)
+    now = abandon.clock(monkeypatch)
+    looked = _metadata_reads(monkeypatch)
+    assert submit(case).status_code == 202
+    case.remote.completed("native-rid")
+    for _ in range(30):
+        now[0] += 1
+        assert case.client.get(PREFIX + "/requests/native-rid", headers=case.headers).status_code == 200
+    assert looked == [case.sid] * 4  # the submit at 0 s, then polls at 10, 20 and 30 s
 
 
 def test_only_a_row_located_call_asks_hosted_for_the_stricter_replaced_check(bound):
@@ -599,3 +861,43 @@ def test_a_retired_sid_of_the_selected_version_gets_a_fresh_session_of_the_same_
     assert sent.status_code == 202, sent.text
     assert sent.json()["hosted_session_id"] == fixture.destination.session_id
     assert source_calls(fixture) == ([], [], [])
+
+
+@pytest.mark.parametrize("file_api", [{"lane": "foundry-native-v1", "target_version": "41", "fresh": True}],
+                         indirect=True)
+def test_a_warm_process_moves_a_session_deleted_since_its_last_use_to_a_fresh_sid_by_resending(
+        file_api, binding_rows, monkeypatch):
+    """The dev M5 sequence on a warm API process: the owner used the session, the platform deleted it, and the
+    owner sends. The send never reaches the deleted SID: its 404 runs the follow, the workbench's same-RID resend
+    after ``RETIRED_CONFIRM_SECONDS`` reads the second 404, which abandons it for a fresh SID of the same version,
+    and the next resend lands there, continuing the conversation."""
+    fixture = file_api
+    now = abandon.clock(monkeypatch)
+    abandon.claim(fixture)
+    # The fixture's setup kept "no row" on the real clock; the row claimed just now is the locator from here on.
+    native_sessions(fixture.case.composition).forget()
+    status = ["active"]
+    # One platform for both metadata reads: the send path's (``_read_platform_session``) and the follow's.
+    abandon.platform(fixture, monkeypatch, status=lambda: status[0])
+    listed = behavior_native_sessions._read_platform_session
+    monkeypatch.setattr(behavior_native_sessions, "_read_platform_session", lambda client, **options: None if (
+        status[0] == "missing" and client.target.session_id == fixture.source.session_id)
+        else listed(client, **options))
+    assert fixture.case.client.get(PREFIX + "/requests/original-rid", headers=fixture.case.headers).status_code == 200
+    since = (len(fixture.control_versions), len(fixture.files.calls))
+    status[0] = "missing"
+    now[0] += behavior_native_sessions.METADATA_REUSE_SECONDS + 1
+    body = {"request_id": "after-the-delete", "content": "Continue, please",
+            "conversation_id": fixture.saved.conversation_id}
+    for _ in range(2):  # the first 404, then the second at least RETIRED_CONFIRM_SECONDS later: abandoned, switched
+        waiting = fixture.case.client.post(PREFIX + "/submit", headers=fixture.case.headers, json=body)
+        error = waiting.json()["error"]
+        assert error["not_dispatched"] is True and error["server_following"] is True, waiting.text
+        now[0] += behavior_native_sessions.RETIRED_CONFIRM_SECONDS + 1
+    switched = abandon.row(fixture)
+    assert (switched.hosted_session_id, switched.created_agent_version) == (fixture.destination.session_id, "41")
+    assert switched.earlier(fixture.source.session_id) and switched.last_switch.basis == "retired"
+    sent = fixture.case.client.post(PREFIX + "/submit", headers=fixture.case.headers, json=body)
+    assert sent.status_code == 202, sent.text
+    assert sent.json()["hosted_session_id"] == fixture.destination.session_id != fixture.source.session_id
+    assert source_calls(fixture, since=since) == ([], [], [])

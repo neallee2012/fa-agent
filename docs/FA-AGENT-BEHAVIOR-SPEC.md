@@ -649,7 +649,7 @@ Neal原話 **10:22:31（台灣時間）**：
   空白新對話與只有舊ready的首次載入也先純讀目標；`unverified`不等於可換版。
   後來的回覆／目標觀察使舊讀回失效，不能由晚到ready蓋掉新UNKNOWN或已讀原回覆。
 - 正常畫面不顯示兩個人工環境按鈕；未解的真正UNKNOWN才在「環境詳細」保留技術控制。
-  ready後唯一通知為「已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。」
+  ready後唯一通知為「已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。」（Neal 2026-10-15 改句）
   新bridge固定宣告policy識別，舊bridge沒有此契約時仍沿原相容UI，不由新HTML猜server能力。
 - routines先保原occurrence intent，再跟版；environment_pending不是N1接單回條。
   producer每批最多10次，唯讀原進度有變化才續下一批；無變化保留due reference，交既有下一次clock tick，
@@ -3454,7 +3454,7 @@ context。個別 input/output 超過已宣告 total、bool／非整數／零／�
 Hosted 沿固定 SDK `ModelCapabilitiesOverride/ModelLimitsOverride` 的正式 create／resume
 參數提供當輪 snapshot；provider 配置只映射正式支持的已知 input/output。換模型的新回合
 取得新 snapshot，不帶前一個 model 的容量。Native 對話在已有完成回合後換模型只在 Hosted
-`FA_NATIVE_MODEL_SWITCH=1`（預設關）時接受：以新模型從已發布 checkpoint cold resume（丟掉留著的 SDK，不用實驗性
+`FA_NATIVE_MODEL_SWITCH=1`（程式預設關；stage A／B 與新 azd 環境打開）時接受：以新模型從已發布 checkpoint cold resume（丟掉留著的 SDK，不用實驗性
 `set_model`），新模型宣告的輸入上限小於上一回合量到的 SDK context 時在接單前回 `NATIVE_MODEL_CONTEXT_EXCEEDED`，
 不壓縮（2026-10-13，[產品說明](../src/fa-shared-context-poc/README.md#native-model-switch)）。完全未知時 SDK override 的數值集合為空，
 保留 runtime 自己的行為；不能把 runtime default 又冒稱為已知 server fact。

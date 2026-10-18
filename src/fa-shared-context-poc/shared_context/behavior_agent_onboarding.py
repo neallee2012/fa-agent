@@ -28,7 +28,10 @@ from .behavior_operations import _Model, _parse, _row, _write, control_key
 from .behavior_skill_catalog import CatalogBudgetProfile
 from .behavior_store import ControlChanges, ControlRequest
 from .behavior_team_authority import TeamAuthority, team_authority_key
-from .behavior_team_registry import IdentityRegistration, Oid, identity_key, roster_key, TeamAgents
+from .behavior_team_registry import (
+    IdentityRegistration, Oid, TeamAgent, TeamAgentRetired, TeamAgents, _release_request, _release_result,
+    identity_key, roster_key,
+)
 from .behavior_turn_origin import TurnOriginProfile
 from .behavior_wire import Command, Digest
 from .errors import Problem
@@ -118,11 +121,15 @@ class TeamAgentOnboarding(_Model):
     state_profile: Literal["foundry-responses-v1"] | None = Field(default=None, exclude_if=lambda value: value is None)
     # A's new-conversation catalog budget at admission when the owner chose the skills tool (SK-03/SK-04).
     skill_catalog_budget_profile: CatalogBudgetProfile | None = Field(default=None, exclude_if=lambda value: value is None)
+    # When it entered 'registered' (same CAS); absent on onboardings registered before it was kept.
+    registered_at: AwareDatetime | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def exact_state(self):
         if (self.target is not None) != (self.state in {"registered", "ready"}):
             raise ValueError("only a registered onboarding retains its original target")
+        if self.registered_at is not None and self.target is None:
+            raise ValueError("only a registered onboarding retains when it was registered")
         if (self.reason is not None) != (self.state == "failed"):
             raise ValueError("only a failed onboarding retains its reason")
         return self
@@ -540,9 +547,12 @@ def _transact(store, request, decide, attempts=3):
                 raise
 
 
-def _advance(store, current, state, *, target=None, reason=None):
+def _advance(store, current, state, *, target=None, reason=None, registered_at=None):
+    # registered_at is kept out of the step digest (like reason), so a retry with a later clock still replays.
     updated = current.model_copy(update={"state": state, "target": target if state in {"registered", "ready"}
-                                         else None, "reason": reason})
+                                         else None, "reason": reason,
+                                         "registered_at": registered_at if state == "registered"
+                                         else current.registered_at})
     updated = TeamAgentOnboarding.model_validate_json(updated.model_dump_json())
     request = _step_request(updated, state)
     okey = request.read_set[0]
@@ -773,6 +783,8 @@ def _select_tools(composition, principal, value):
         code = error.body["error"]["code"]
         if code not in _SELECTION_CODES:
             raise
+        logging.getLogger(__name__).warning(
+            "AGENT_ONBOARDING_SELECTION_STALE request_id=%s cause=%s", value.request_id, code)
         raise Problem(409, "AGENT_ONBOARDING_SELECTION_STALE",
                       "the original tool and skill choice no longer matches the Team catalog; the agent is registered "
                       "and this request ID stays the only way forward", cause=code) from None
@@ -832,7 +844,7 @@ def onboard(composition, principal, body, *, foundry=None, setup=None, deadline_
                         setup_pending = True
                         break
                     teams.register_agent(principal, current.request_id, detail.agent_id, detail)
-                    _advance(store, current, "registered", target=detail)
+                    _advance(store, current, "registered", target=detail, registered_at=now())
             elif current.state == "registered":
                 _register_runtime(composition, principal, current)
                 _save_role(composition, principal, current, body.role_prompt)
@@ -956,6 +968,8 @@ def validate_onboarding_history(view_, inventory, config, classified):
             image = TeamAgentOnboarding.model_validate_json(json.dumps({
                 **value.model_dump(mode="json"), "state": state,
                 "target": value.model_dump(mode="json").get("target") if state in {"registered", "ready"} else None,
+                "registered_at": value.model_dump(mode="json").get("registered_at")
+                if state in {"registered", "ready"} else None,
                 "reason": value.reason if state == "failed" else None,
             }))
             request = (_admit_request(image, domain) if state == "admitted" else _step_request(image, state))
@@ -974,7 +988,17 @@ def validate_onboarding_history(view_, inventory, config, classified):
         if key != pkey or (value.tenant_id, value.team_id) != (tenant, team):
             invalid("a retained pending list differs from its original Team")
     waiting = set() if pkey not in pendings else set(pendings[pkey].request_ids)
-    open_ = {rid for rid, value in by_rid.items() if value.state not in {"ready", "failed"}}
+    # A stuck 'registered' onboarding left the list in its Agent's retire CAS (checked by the registry history), or,
+    # under a tombstone written without it (also one left admitted or creating), in its own release CAS.
+    retired = {value.agent_id: value for value in classified.values() if isinstance(value, TeamAgentRetired)}
+    agents = {value.request_id: value.agent_id for value in classified.values() if isinstance(value, TeamAgent)}
+    released = {value.onboarding_request_id for value in retired.values()}
+    for rid, value in by_rid.items():
+        tombstone = retired.get(agents.get(rid)) if value.state not in {"ready", "failed"} else None
+        if tombstone is not None and tombstone.onboarding_request_id is None and rid not in waiting:
+            view_.receipt(_release_request(tombstone, rid), (pkey,), result=_release_result(tombstone, rid))
+            released.add(rid)
+    open_ = {rid for rid, value in by_rid.items() if value.state not in {"ready", "failed"} and rid not in released}
     if waiting != open_:
         invalid("the pending onboarding list differs from the open onboardings")
     for key, value in names.items():

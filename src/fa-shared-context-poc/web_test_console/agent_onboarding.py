@@ -202,6 +202,9 @@ class AgentOnboarding:
             for name in ("limit", "max_bytes"):
                 if type(error.get(name)) is int:
                     observed[name] = error[name]
+            # SELECTION_STALE names the inner refusal; the recovery differs per cause.
+            if type(error.get("cause")) is str and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", error["cause"]):
+                observed["cause"] = error["cause"]
             if 400 <= status < 500 and code in _REFUSED:
                 observed["state"] = "REFUSED"
         return observed
@@ -435,7 +438,7 @@ class AgentOnboarding:
         saved = self.journal.get(rid, PHASE)
         require(saved is not None, "AGENT_ONBOARDING_LOCAL_NOT_FOUND", 404)
         shown = {name: saved[name] for name in (
-            "state", "server_state", "reason", "code", "limit", "max_bytes", "agent_id", "manifest_sha256",
+            "state", "server_state", "reason", "code", "cause", "limit", "max_bytes", "agent_id", "manifest_sha256",
             "observed_at", "upstream_status", "link_error") if name in saved}
         prepared = self.journal.get(rid, PREPARE_PHASE)
         if prepared is not None:
@@ -453,7 +456,10 @@ class AgentOnboarding:
             shown["prepare"]["permission_wait"] = waiting
             shown["prepare"]["retry_seconds"] = (PERMISSION_RETRY_INTERVAL_SECONDS if waiting
                                                  else PREPARE_RETRY_INTERVAL_SECONDS)
-        return {"request_id": rid, "display_name": saved["intent"]["command"]["display_name"], **shown,
+        command = saved["intent"]["command"]
+        # The chosen tool IDs only, so the page can name who restores one (Team MCP `team-*` vs. the org catalog).
+        return {"request_id": rid, "display_name": command["display_name"], **shown,
+                "capability_ids": [item["entry_id"] for item in command.get("capabilities") or []],
                 "restart_required": False, "max_team_agents": MAX_TEAM_AGENTS,
                 "ready_to_chat": saved["state"] == "CONFIRMED" and prepared is not None and prepared["state"] == "READY"}
 

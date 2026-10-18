@@ -7,12 +7,20 @@ from pydantic import Field, model_validator
 from .behavior_wire import Digest, Identifier, WireModel
 
 
+# ADR-0009 M1 2d-i: the send profile and every DTO default stay v1 until 2d-ii; v2 is what an H2d runtime may declare.
 NATIVE_STATE_PROFILE = "foundry-native-v1"
+NATIVE_V2_PROFILE = "foundry-native-v2"
 NATIVE_RESPONSES_PROFILE = "foundry-responses-v1"
-NativeStateProfile = Literal["foundry-native-v1", "foundry-responses-v1"]
+ACCEPTED_STATE_PROFILES = frozenset({NATIVE_STATE_PROFILE, NATIVE_V2_PROFILE})
+NativeStateProfile = Literal["foundry-native-v1", "foundry-responses-v1", "foundry-native-v2"]
 # ADR-0009 §3: the one profile whose material may be unlabeled. It is fixed, not ``NATIVE_STATE_PROFILE``: a v1 digest
 # (``submit_digest``) is over the unlabeled form, so v1 stays byte-identical, while a later profile always labels its own.
 UNLABELED_STATE_PROFILE = "foundry-native-v1"
+
+
+def channel(profile) -> Literal["invocations", "responses"]:
+    """ADR-0009 §3: conversations and receipts are compared by channel, never by profile version."""
+    return "responses" if profile == NATIVE_RESPONSES_PROFILE else "invocations"
 
 
 def unlabeled_profile(value) -> bool:
@@ -53,7 +61,7 @@ class NativeResponseDispatch(WireModel):
 
 
 def check_response_state(profile, status, rid, response_id, dispatch):
-    if profile == NATIVE_STATE_PROFILE:
+    if channel(profile) == "invocations":
         if response_id is not None or dispatch is not None:
             raise ValueError("An Invocations receipt cannot acquire Responses transport state")
         return

@@ -17,7 +17,7 @@ without extraction (azure-ai-projects 2.3.0 ``POST /memory_stores/{name}/items``
   words win, then the newer time (PA-14 precedence, coordinator 2026-10-03). FA does not guarantee an older note never
   appears (search returns only the most relevant few), only that it appears dated, never as an instruction or approval.
 - Never an update or delete: corrections are the human's newer words (ADR-0006 provides no deletion). Every failure
-  is logged by status only and the turn and its completion relay continue.
+  is logged by status only and the turn continues (its completion relay was already sent from ``on_terminal``).
 - MEM-05: after a create, the official ``memory_id`` is written back into ``fx:<RID>:team-note`` with its ETag (best
   effort, never raises, never resent), so the RID keeps its lineage to the item.
 - PA-13 (S2): the note's official kind follows the human turn's own C5 ``reason``: a ``stable_preference`` (how the
@@ -179,7 +179,7 @@ class NativeTeamMemory:
         return recalled
 
     async def completed(self, receipt) -> None:
-        """Never raises, so a Team note can never hold back the original completion relay."""
+        """Never raises, so a Team note failure cannot make the notification task retry the whole batch."""
         try:
             await self._share(receipt)
         except Exception as exc:

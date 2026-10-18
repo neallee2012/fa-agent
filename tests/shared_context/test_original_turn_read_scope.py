@@ -64,6 +64,12 @@ def test_cached_original_work_is_never_cached_read_authority(assistant, change):
         current = h.store.read_snapshot((control.registry_key,))[control.registry_key].payload["data"]
         h.mutate(control.registry_key, entries=[item for item in current["entries"] if item != target.admission_id])
     before = h.store._guard()
+    if change == "registry":
+        # 7c66d6a9 (PR #264): an admitted turn keeps its identity after its index row goes; checked at next admission.
+        kept = h.client.get(route, headers=h.headers("read-only"))
+        assert kept.status_code == 200, kept.text
+        assert kept.content == b"Original file bytes." and h.store._guard() == before
+        return
     denied = h.client.get(route, headers=h.headers("read-only"))
     assert denied.status_code in {403, 404, 409}
     assert b"Original file bytes." not in denied.content and h.store._guard() == before

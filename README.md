@@ -25,7 +25,7 @@ B ：（搜尋天氣，把結果回報給 A）
 A ：（被 B 的回報喚醒，在原對話整理天氣和運動建議給你）
 ```
 
-**需要什麼。** 一個 Azure 訂閱，你在上面能建立資源和角色指派（Owner 最簡單）；一個有 Foundry Hosted Agents 的區域，以及你要用的模型 quota；一個 Entra 租用戶：你要能註冊 app，另外需要管理員替 Team 主人建立委派授權（Cloud Application Administrator 以上；你不是管理員也能部署，這一步交給管理員）；Team 主人的 Entra 帳號。助理用的是你在 Foundry 部署的模型（BYOK），所以不需要 GitHub 帳號或 GitHub Copilot 訂閱。完整條件和步驟見下方「部署到你的 Azure」。
+**需要什麼。** 一個 Azure 訂閱，你在上面能建立資源和角色指派（Owner 最簡單）；一個有 Foundry Hosted Agents 的區域，以及你要用的模型 quota；一個 Entra 租用戶：你要能註冊 app，另外要替 Team 主人建立委派授權：你有 Cloud Application Administrator 以上的角色時 hook 直接建，沒有時 hook 寫出檔案交給管理員做（你不是管理員也能部署）；Team 主人的 Entra 帳號。助理用的是你在 Foundry 部署的模型（BYOK），所以不需要 GitHub 帳號或 GitHub Copilot 訂閱。完整條件和步驟見下方「部署到你的 Azure」。
 
 **費用。** 每位助理的 VM 運作時約 US$0.25／小時，閒置回收後不計；常駐的工作台約 US$5.83／月，API 等其他資源另計。作者環境的估算見下方「費用參考」，實際以你的帳單為準。
 
@@ -37,7 +37,7 @@ A ：（被 B 的回報喚醒，在原對話整理天氣和運動建議給你）
 - **真人批准卡。** 需要批准的動作會在對話裡跳出卡片，例如執行 shell 或呼叫 Team MCP。按「允許這次」只放行一次。規則在「Agent Team 設定」裡調整。
 - **網頁搜尋與 Team 工具。** 經 [Foundry Toolbox](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/toolbox) 接 WebIQ 搜尋和你自己的 MCP server。FA 另附一個唯讀的 Feed reader MCP，讓助理讀你私人訂閱的 RSS／Atom feed；feed 網址只存在 Foundry 的連線設定裡，助理看不到。
 - **排程。** 在對話裡請助理定時做事。助理提出排程，你批准後由 API 的時鐘按時觸發。
-- **可換的模型。** 輸入框旁的選單可以切換模型，可選清單在 [`model-catalog.json`](src/fa-shared-context-poc/model-catalog.json)。
+- **可換的模型。** 輸入框旁的選單可以切換模型，可選清單在 [`model-catalog.json`](src/fa-shared-context-poc/model-catalog.json)。`azd up` 建的環境也能在對話中途換（換的那一回合會慢一次）；關法見 [deploy/azd](deploy/azd/README.md#model-switch)。
 - **在工作台新增助理。** 按「＋」填角色說明就能建一位新助理，只能加進自己的 Team。
 
 以上功能都在作者的測試環境（dev）或預備環境（stage）用真模型跑過，只有排程例外。排程已在 stage 開啟，還沒有真人建過第一個。給維護者看的完整驗收紀錄在 [CURRENT-STATE](docs/status/CURRENT-STATE.md) 和 [progress](docs/progress.md)，用了很多內部代號。
@@ -82,7 +82,7 @@ Container App      Container App              每位助理一台 VM
 
 - **你（部署的人）**：azd、Azure CLI、Python 3.11 以上、git 和正在執行的 Docker，Windows 另需 PowerShell 7。`az` 和 `azd` 用同一個使用者帳號登入。建議你就是 Team 主人；不是的話，後半段要由主人登入接手。
 - **訂閱 Owner**：你在訂閱上要有 Owner，或 Contributor 加 User Access Administrator。訂閱要註冊 9 個 resource provider 和 1 個 feature。
-- **Entra 管理員**：允許你註冊 app，並替 Team 主人一人建 3 筆委派授權。你不是管理員也能部署，hook 會把要給管理員的請求寫成檔案，管理員做完後你再接續。
+- **Entra 權限**：允許你註冊 app。Team 主人一人的 3 筆委派授權，你能建（Cloud Application Administrator、Application Administrator 或 Global Administrator）時由 hook 直接建好；不能建時 hook 把請求寫成給管理員的檔案（`.azure/<env>/fa/admin-consent/`），管理員做完後你再接續。
 
 不需要 Microsoft Teams、Work IQ 或 GitHub。`azd up` 完成時 connector 是關的，之後要加工具見 [擴充](#extending)。
 
@@ -99,6 +99,8 @@ azd up
 
 不知道訂閱 ID 或租用戶 ID 時，`az login` 後執行 `az account list --query "[].{name:name, id:id, tenant:tenantId}" -o table`。訂閱在 `azd env new --subscription` 時就固定在該 azd 環境，不使用 az CLI 的預設訂閱；hook 會檢查 az 與 azd 登入的是同一個租用戶，不同就停止。
 
+第一次 `azd up` 約 1.5～2 小時，之後再跑約 15 分鐘。`azd up` 一開始就停在「interactive prompts disabled … missing location」時（例如在 Claude 桌面 app 的終端機分頁裡），先 `$env:AZD_NON_INTERACTIVE = 'false'` 再跑。Windows 上 `az login` 的帳號挑選視窗找不到要用的帳號時，改用 `az login --tenant <your-tenant-id> --use-device-code`。細節見 [第一次部署](deploy/azd/README.md#first-deploy)。
+
 主人的 object ID 用 `az ad user show --id <主人 UPN> --query id -o tsv` 查（主人自己登入時，`az ad signed-in-user show --query id -o tsv` 也行）。沒設 `FA_TEAM_OWNER_OID` 時，部署的人會成為 Team 主人，主人以外的人登入不了工作台，要 `azd down --purge` 才能重來。所以 preprovision 會印出「Team owner = 目前登入的部署者」，在終端機裡要你輸入 `y` 確認，其他回答就停下、什麼都不寫。`azd up` 一開始會再跑同一份檢查，缺東西就在建立任何計費資源前停下。
 
 **中途要你回答的地方。**
@@ -109,7 +111,7 @@ azd up
 
 **還要真人做的事。** 部署最後，hook 以 Team 主人身分替兩位助理選好新對話的模板：走 Responses，開啟伺服器提供的全部能力。之後可以在工作台助理 ⚙ 設定頁調整。剩下的是主人登入 hook 印出的工作台網址，開新對話送一則短訊息；回條 `completed`、`failure_code=null` 才算通過。部署的人不是主人時，第一次 session 準備和模板選擇要由主人登入後跑 `azd hooks run postdeploy`。主人接手從批准計畫雜湊開始；重跑時會重做角色指派和 Bicep，所以主人也要有訂閱 Owner（或 Contributor 加 User Access Administrator）和 Foundry User，並在同一台電腦、用同一個 `.azure/<env>/fa` 資料夾執行。
 
-**中斷或要排錯時。** 每個寫入都先記 intent。照畫面提示讀回，再用 `azd hooks run postprovision` 或 `azd hooks run postdeploy` 接續，不要刪掉重來。逐步排錯的對照是 [新環境標準流程](deploy/README.md#new-environment-standard-flow) 的 17 個關卡，兩邊呼叫同一批腳本。`azd down --purge` 會連同資料表、備份和記憶一起刪除，無法復原。
+**中斷或要排錯時。** 每個寫入都先記 intent。照畫面提示讀回，再用 `azd hooks run postprovision` 或 `azd hooks run postdeploy` 接續，不要刪掉重來。逐步排錯的對照是 [新環境標準流程](deploy/README.md#new-environment-standard-flow) 的 17 個關卡，兩邊呼叫同一批腳本。`azd down --purge` 會連同資料表、備份和記憶一起刪除，無法復原；備份鎖還在且沒設 `FA_CONFIRM_DELETE` 時會先要你輸入環境名稱，azd 自己也會問 `y/N`；約 30 分鐘。
 
 **目前的限制。** 作者在自己的訂閱從頭跑完一次 `azd up`，並在工作台實際使用過。開頭的區域與模型選擇之後也在 eastus2 實跑成功（只選一個模型，部署與設定讀回正確），但那次的工作台驗收還沒做。
 
@@ -154,7 +156,7 @@ cd .\src\fa-shared-context-poc
 完整步驟和程式位置在 [docs/extending.md](docs/extending.md)。
 
 - **MCP server。** 用金鑰（header）驗證的遠端 MCP，由 Team 主人在「Agent Team 設定」→ Team MCP 加入，不用改程式；再到助理 ⚙ →「MCP」打開。要在助理 VM 裡跑本機（stdio）MCP，就在 [`tool_catalog/`](src/fa-shared-context-poc/tool_catalog) 加一個 JSON，把執行檔裝進 Hosted 映像，再 `azd deploy`。
-- **Skills。** 在「Agent Team 設定」→ Team Skills 寫草稿，Team 主人批准指定版本才生效；改內容就寫新版，舊版保留。再到助理 ⚙ →「Skills」選用。工作台沒有寫 SOP 的入口，流程寫成 skill 即可。角色在按「＋」新增助理時填寫；azd 環境要先 `azd env set FA_ENABLE_AGENT_ONBOARDING true` 再 `azd up`，否則新助理缺少執行需要的設定和權限。
+- **Skills。** 在「Agent Team 設定」→ Team Skills 寫草稿，Team 主人批准指定版本才生效；改內容就寫新版，舊版保留。再到助理 ⚙ →「Skills」選用。工作台沒有寫 SOP 的入口，流程寫成 skill 即可。角色在按「＋」新增助理時填寫；azd 新環境預設就會備好「＋」需要的權限；若用 `azd env set FA_ENABLE_AGENT_ONBOARDING false` 關掉，新助理會缺少執行需要的設定和權限。
 - **Plugin。** FA 沒有 plugin 機制。助理 ⚙ 裡的「Plugins」分頁是 FA 內建能力（桌面、shell、交辦等）的開關，不能安裝新的。
 - **Connector 是選用的。** `azd up` 不需要 Teams、Work IQ 或 GitHub，完成時 connector 是關的，Team MCP 是開的。目前只有 Microsoft Teams（經 Work IQ）一種，要自備 Entra app 並在 API 設 `FA_TEAM_CONNECTORS_ENABLED=1`；azd 環境還沒有對應的設定，沒驗證過。
 - **加自己的 connector。** 金鑰驗證的服務直接用 Team MCP。Entra OAuth 的服務要在 [`connector_registry.py`](src/fa-shared-context-poc/shared_context/connector_registry.py) 加一筆 `ConnectorRef`，只改設定不行。這條路還沒有人實際做過。

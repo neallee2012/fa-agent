@@ -95,6 +95,13 @@ async function open(initial=fixture(),responses={}){
     click(){this.clickCount=(this.clickCount||0)+1;this.events.click?.()},
     contains(other){return other===this||this.children.some(child=>child===other||child?.contains?.(other))},
     replaceChildren(){this.children=[]},append(...children){this.children.push(...children)},
+    getAttributeNames(){return Object.keys(this.attributes)},
+    // As in a browser, inserting a child already in this list moves it.
+    insertBefore(child,before){
+      if(this.children.includes(child))this.removeChild(child);
+      const at=before?this.children.indexOf(before):-1;this.children.splice(at<0?this.children.length:at,0,child);return child;
+    },
+    removeChild(child){const at=this.children.indexOf(child);if(at>=0)this.children.splice(at,1);return child},
     addEventListener(name,handler){this.events[name]=handler}
     };
     Object.defineProperty(node,"tagName",{value:String(tag).toUpperCase()});
@@ -104,6 +111,13 @@ async function open(initial=fixture(),responses={}){
   const nodes=new Map([...html.matchAll(/id="([^"]+)"/g)].map(m=>[m[1],element(tags.get(m[1]))]));
   // The dialog starts closed through its markup (`hidden`), not through script.
   nodes.get("page-confirm").hidden=/<div id="page-confirm"[^>]*\shidden>/.test(html);
+  // Form fields carry their markup type and default value, as in a browser.
+  for(const [markup,tag] of html.matchAll(/<(input|textarea)\b[^<>]*>/g)){
+    const node=nodes.get(/\sid="([^"]+)"/.exec(markup)?.[1]);
+    if(!node)continue;
+    node.type=tag==="textarea"?"textarea":/\stype="([^"]+)"/.exec(markup)?.[1]||"text";
+    node.defaultValue=tag==="input"?/\svalue="([^"]*)"/.exec(markup)?.[1]??"":"";
+  }
   const calls=[],holder={current:copy(initial),pending:null,pendingPosts:[],response:null,sockets:[],observers:[],...responses},timers=new Map(),timerDelays=new Map(),documentEvents={};
   let timerId=0;
   const context={console,URLSearchParams,TextEncoder,TextDecoder,Blob,Response,crypto:require("node:crypto").webcrypto,
@@ -120,6 +134,7 @@ async function open(initial=fixture(),responses={}){
     // Browser storage; pass the same responses.storage to a second open() to model a page reload.
     localStorage:responses.storage??memoryStorage(),
     document:{documentElement:{setAttribute(){}},getElementById:id=>nodes.get(id),createElement:element,
+      querySelectorAll:selector=>[...nodes.values()].filter(node=>selector.split(",").includes(node.tagName.toLowerCase())),
       hidden:false,addEventListener(name,fn){documentEvents[name]=fn}},
     // Older turns load their reply as they scroll into view; tests decide which nodes are visible (seeTurn).
     IntersectionObserver:class{constructor(callback){this.callback=callback;this.nodes=new Set();holder.observers.push(this)}
@@ -244,6 +259,21 @@ test("remote empty platform rejection shows a clear message, offers re-sign-in a
   assert.match(ui.text("error-message"),/雲端登入層拒絕/);
   assert.equal(ui.text("auth-state"),"登入已失效");
   assert.equal(ui.nodes.get("login").hidden,false);
+});
+
+test("remote: a missing token-store entry (cookie still valid) answers LOGIN_REQUIRED and offers re-sign-in",async()=>{
+  const data={...fixture(),authentication:"LOGIN_REQUIRED",authentication_refresh_at:null,remote_user:"neal@example.org"};
+  const missing=new Response(JSON.stringify({error:{code:"LOGIN_REQUIRED",message:"no token"}}),
+    {status:401,headers:{"Content-Type":"application/json"}});
+  const ui=await open(data,{location:{protocol:"https:"},response:missing});
+  await ui.tick();await ui.tick();await ui.tick();
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,1);
+  assert.equal(ui.text("auth-state"),"登入已失效");
+  assert.equal(ui.text("login"),"重新登入");
+  assert.equal(ui.nodes.get("login").hidden,false);
+  ui.click("login");
+  assert.equal(ui.context.window.location.href,"/.auth/login/aad?post_login_redirect_uri=%2F");
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,1);
 });
 
 test("remote: a sign-in refusal after connecting offers re-sign-in; an ingress 5xx stays not-confirmed",async()=>{
@@ -705,6 +735,31 @@ for(const automatic of [false,true]){
       [automatic?"/api/authenticate/refresh":"/api/authenticate"]);
   });
 }
+test("a silent sign-in refresh that fails with a 503 keeps the login and retries; only a sign-in failure expires it",async()=>{
+  const now=Date.parse(when),data={...fixture(),authentication_refresh_at:now/1000+5};
+  const ui=await open(data,{now,response:{ok:false,status:503,
+    json:async()=>({error:{code:"AGENT_DIRECTORY_UNAVAILABLE"}})}});
+  await vm.runInContext("refreshAuthentication()",ui.context);
+  assert.equal(vm.runInContext("state.authentication",ui.context),"AVAILABLE");
+  assert.equal(vm.runInContext("authenticationStopped",ui.context),false);
+  assert.equal(vm.runInContext("state.authentication_refresh_at",ui.context),now/1000+60,"retried in a minute, not every second");
+  assert.notEqual(vm.runInContext("lastError?.code",ui.context),"LOGIN_EXPIRED");
+  ui.holder.response={ok:false,status:502,json:async()=>{throw new SyntaxError("ingress HTML")}};
+  await vm.runInContext("refreshAuthentication()",ui.context);
+  assert.equal(vm.runInContext("state.authentication",ui.context),"AVAILABLE","a non-JSON 5xx is not an expired sign-in");
+  ui.holder.response={ok:false,status:401,json:async()=>({error:{code:"PLATFORM_REQUEST_REJECTED"}})};
+  await vm.runInContext("refreshAuthentication()",ui.context);
+  assert.equal(vm.runInContext("state.authentication",ui.context),"LOGIN_EXPIRED");
+  assert.equal(vm.runInContext("authenticationStopped",ui.context),true);
+  const wrong=await open(data,{now,response:{ok:false,status:403,json:async()=>({error:{code:"IDENTITY_MISMATCH"}})}});
+  await vm.runInContext("refreshAuthentication()",wrong.context);
+  assert.equal(vm.runInContext("authenticationStopped",wrong.context),true,"a wrong account still stops, as before");
+  const denied=await open(data,{now,response:{ok:false,status:403,
+    json:async()=>({error:{code:"REMOTE_PRINCIPAL_DENIED"}})}});
+  await vm.runInContext("refreshAuthentication()",denied.context);
+  assert.equal(vm.runInContext("authenticationStopped",denied.context),true,"a remote wrong account stops too");
+  assert.equal(vm.runInContext("state.authentication",denied.context),"LOGIN_EXPIRED");
+});
 function attachmentCatalog(data,entries=[{
   source_id:"source-one",state:"recorded",media_type:"text/plain",
   reference:{source_id:"source-one",version:1,sha256:"a".repeat(64),byte_length:42},
@@ -2256,6 +2311,53 @@ test("native HITL rule drafts prevent a remote-session reload from discarding un
   assert.equal(reloads,0);
   assert.equal(ui.nodes.get("hitl-rule-text").value,"An unsent owner policy");
   ui.nodes.get("hitl-rule-text").value="";ui.nodes.get("hitl-rule-text").events.input();
+  await ui.context.remoteResponse(changed);await ui.tick();
+  assert.equal(reloads,1);
+});
+
+test("any unsent field or chosen file keeps a remote-session reload from discarding it, not just the composer",async()=>{
+  const ui=await open(fixture(),{now:Date.parse(when)});
+  ui.context.window.location.protocol="https:";
+  let reloads=0;ui.context.window.location.reload=()=>{reloads++};
+  ui.holder.now=Date.parse(when)+20000;
+  const changed={status:403,ok:false,headers:{get:()=>"application/json"},
+    clone:()=>({json:async()=>({error:{code:"REMOTE_SESSION_CHANGED"}})})};
+  const body=ui.nodes.get("skill-new-body");
+  body.value="An unsent SKILL.md draft";
+  await ui.context.remoteResponse(changed);await ui.tick();
+  assert.equal(reloads,0);
+  assert.equal(body.value,"An unsent SKILL.md draft");
+  body.value="";
+  ui.nodes.get("template-file").files=[{name:"agent.json"}];
+  await ui.context.remoteResponse(changed);await ui.tick();
+  assert.equal(reloads,0,"a chosen file is a draft too");
+  ui.nodes.get("template-file").files=[];
+  const header=ui.nodes.get("team-mcp-header");
+  header.value=header.defaultValue;  // a markup default the user did not change is not a draft
+  ui.nodes.get("settings-search").value="filter text";  // nor is a search filter
+  await ui.context.remoteResponse(changed);await ui.tick();
+  assert.equal(reloads,1);
+  vm.runInContext('editTeamMcp({server_label:"crm",server_url:"https://mcp.example/crm",allowed_tools:["read"],'+
+    'require_approval:"always"})',ui.context);
+  await ui.context.remoteResponse(changed);await ui.tick();
+  assert.equal(reloads,2,"an opened but unchanged Team MCP edit is not a draft");
+  ui.nodes.get("team-mcp-url").value="https://mcp.example/changed";
+  await ui.context.remoteResponse(changed);await ui.tick();
+  assert.equal(reloads,2,"a changed one is");
+});
+test("an attachment-only draft (nothing typed) keeps a remote-session reload from discarding it",async()=>{
+  const ui=await open(fixture(),{now:Date.parse(when)});
+  ui.context.window.location.protocol="https:";
+  let reloads=0;ui.context.window.location.reload=()=>{reloads++};
+  ui.holder.now=Date.parse(when)+20000;
+  const changed={status:403,ok:false,headers:{get:()=>"application/json"},
+    clone:()=>({json:async()=>({error:{code:"REMOTE_SESSION_CHANGED"}})})};
+  for(const drafts of ["attachmentDrafts","userFileDrafts","userImageDrafts"]){
+    vm.runInContext(`${drafts}.set(attachmentDraftKey(),[{name:"notes.txt"}])`,ui.context);
+    await ui.context.remoteResponse(changed);await ui.tick();
+    assert.equal(reloads,0,`${drafts} is a draft`);
+    vm.runInContext(`${drafts}.set(attachmentDraftKey(),[])`,ui.context);  // removing the last one leaves []
+  }
   await ui.context.remoteResponse(changed);await ui.tick();
   assert.equal(reloads,1);
 });
@@ -3946,6 +4048,92 @@ test("an explicitly unapplied append can return to the composer only by a human 
   assertNothingSent(ui);
 });
 
+// G plan "no lost message": an append made in the turn's tail (reply shown, turn not yet saved as completed) is settled
+// not_applied, a definite "never delivered", so it goes out once as a new turn under a new RID. unknown never does.
+async function appendInTail(status,{draft="",reason=status==="unknown"?"sdk_unconfirmed":"turn_finished"}={}){
+  const data=appendChat(),rid=data.composer.request_id,ui=await open(data),content="回覆後馬上補的一句";
+  ui.nodes.get("instruction").value=content;ui.nodes.get("instruction").events.input();
+  ui.click("send-instruction");await ui.tick();
+  const row={request_id:rid,append_id:"append-offline-a",content,status,delivery:null,reason,receipt_observed:true,
+    ...(status==="unknown"?{submission_state:"UNKNOWN"}:{})};
+  const done=nativeChat("completed");done.tasks[0].appends=[row];done.tasks[0].actions["read-appends"]=action(true);
+  if(!draft){
+    // The append landed after the turn's appends were settled: its own answer is not_applied.
+    ui.holder.current=done;
+    ui.holder.pendingPosts[0].resolve({append:copy(row)});await ui.tick();await ui.tick();await ui.tick();
+    return {ui,done,rid,content};
+  }
+  // Accepted while the turn ran; the owner then types the next message; a later read finds it was never applied.
+  const running=copy(data);running.composer.append_target.append_id="append-offline-b";
+  running.tasks[0].appends=[{...row,status:"accepted"}];ui.holder.current=running;
+  ui.holder.pendingPosts[0].resolve({append:{...row,status:"accepted"}});await ui.tick();await ui.tick();
+  assert.equal(ui.nodes.get("instruction").value,"");
+  ui.nodes.get("instruction").value=draft;ui.nodes.get("instruction").events.input();
+  ui.holder.current=done;
+  ui.holder.appendsResponse={ok:true,json:async()=>({appends:{request_id:rid,appends:[copy(row)]}})};
+  await vm.runInContext("readAppends(state.tasks[0])",ui.context);await ui.tick();
+  return {ui,done,rid,content};
+}
+const historyText=ui=>JSON.stringify(ui.nodes.get("conversation-history").children,(key,value)=>key==="events"?undefined:value);
+test("an append settled not_applied is sent once as a new turn under a new request ID",async()=>{
+  const {ui,done,rid,content}=await appendInTail("not_applied");
+  assert.match(historyText(ui),/改成新訊息送出/);
+  assert.doesNotMatch(historyText(ui),/帶回輸入框|不會自動再送/);
+  const nexts=ui.holder.pendingPosts.filter(post=>post.url.endsWith("/next"));
+  assert.deepEqual(nexts.map(post=>post.url),[`/api/instructions/${done.composer.thread_id}/next`]);
+  assert.match(historyText(ui),new RegExp(content),"the text shows as sending meanwhile");
+  const next=copy(done);
+  Object.assign(next.composer,{request_id:"next-rid",content:null,editable:true,can_submit:true,can_follow_up:false});
+  nexts[0].resolve(next);await ui.tick();await ui.tick();
+  const submits=ui.calls.filter(call=>call.method==="POST"&&call.url.endsWith("/submit"));
+  assert.deepEqual(submits.map(call=>call.url),["/api/instructions/next-rid/submit"]);
+  assert.notEqual("next-rid",rid);
+  const body=JSON.parse(submits[0].body);
+  assert.equal(body.content,content);assert.ok(body.model);
+  assert.deepEqual(Object.keys(body).sort(),["content","model"],"no draft attachments go with it");
+  const sent=copy(done.tasks[0]);
+  Object.assign(sent,{task_id:"next-rid",submit_request_id:"next-rid",instruction:content,reply:null,appends:[],
+    submission:{state:"CONFIRMED"},native_receipt:{...sent.native_receipt,status:"accepted"},
+    status:{data:{state:"accepted"},observed_at:when}});
+  const after=copy(done);after.tasks.push(sent);
+  Object.assign(after.composer,{request_id:"next-rid",content,editable:false,can_follow_up:true});
+  ui.holder.current=after;
+  ui.holder.pendingPosts.find(post=>post.url.endsWith("/submit")).resolve({task:sent});
+  await ui.tick();await ui.tick();await ui.tick();
+  assert.equal(vm.runInContext("lastError",ui.context),null);
+  assert.equal(ui.nodes.get("error").hidden,true);
+  // Later reads of the same not_applied receipt send nothing more.
+  ui.holder.appendsResponse={ok:true,json:async()=>({appends:{request_id:rid,appends:copy(done.tasks[0].appends)}})};
+  await vm.runInContext("readAppends(state.tasks[0])",ui.context);
+  ui.render(after);await ui.tick();await ui.tick();
+  assert.equal(ui.calls.filter(call=>call.method==="POST"&&/\/(next|submit|append)$/.test(call.url)).length,3,
+    "the append, one /next and one /submit");
+  assert.equal(ui.nodes.get("instruction").value,"");
+});
+test("an append whose outcome is unknown is never sent again as a new turn",async()=>{
+  const {ui,content}=await appendInTail("unknown");
+  await ui.tick();ui.render(ui.holder.current);await ui.tick();
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/next")||call.url.endsWith("/submit")),false);
+  assert.doesNotMatch(historyText(ui),/改成新訊息送出/);
+  assert.match(historyText(ui),new RegExp(content));
+});
+test("an append left not_applied by the owner's 停止 is never sent again as a new turn",async()=>{
+  const {ui,content}=await appendInTail("not_applied",{reason:"cancelled"});
+  await ui.tick();ui.render(ui.holder.current);await ui.tick();
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/next")||call.url.endsWith("/submit")),false);
+  assert.equal(vm.runInContext('[...sentAppendDrafts.values()][0].resend',ui.context),undefined);
+  assert.doesNotMatch(historyText(ui),/改成新訊息送出/);
+  assert.match(historyText(ui),/帶回輸入框/);
+  assert.match(historyText(ui),new RegExp(content));
+});
+test("a not_applied append waits out the owner's own draft: nothing is sent and the restore button stays",async()=>{
+  const {ui}=await appendInTail("not_applied",{draft:"我正在打的下一則"});
+  // (A /next may be taken ahead for the typed draft, as for any text left in the box when a turn ends.)
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/submit")),false);
+  assert.equal(vm.runInContext('[...sentAppendDrafts.values()][0].resend',ui.context),"kept");
+  assert.equal(ui.nodes.get("instruction").value,"我正在打的下一則");
+  assert.match(historyText(ui),/帶回輸入框/);
+});
 test("native append ignores the original turn's frozen attachments but preserves unsent drafts",async()=>{
   const data=appendChat();
   data.composer.attachments=[{name:"original.txt",source:{source_id:"original",version:1,sha256:"a".repeat(64),byte_length:4}}];
@@ -8282,6 +8470,40 @@ test("onboarding panel counts role bytes and shows the server quota limit withou
   assert.equal(ui.nodes.get("onboarding-continue").hidden,true);
 });
 
+test("onboarding selection stale shows the inner cause's own recovery and keeps the original request ID",async()=>{
+  const rid="onboard-"+"a".repeat(24);
+  for(const [cause,wording] of [["CAPABILITY_SOURCES_CHANGED",/讀不到其中一個勾選的工具（組織工具目錄或 Team MCP）/],
+    ["PROFILE_SELECTION_SOURCES_CHANGED",/skill 已不是 Team 目前批准的版本/],
+    ["SKILL_CATALOG_BUDGET_TOO_SMALL",/模型容量放不下/],["PROFILE_SELECTION_DENIED",/（PROFILE_SELECTION_DENIED）.*部署線/]]){
+    const server=onboardingServer({posts:[{value:onboardingView({state:"UNKNOWN",code:"AGENT_ONBOARDING_SELECTION_STALE",cause})}]});
+    const ui=await open(agentChat("agent-one"),{onboarding:server.handle});
+    await openOnboarding(ui);
+    fillOnboarding(ui,"研究員","找資料");
+    ui.click("onboarding-submit");await ui.tick();await ui.tick();
+    const status=ui.text("onboarding-status");
+    assert.match(status,wording);
+    assert.match(status,new RegExp(`已建立並登錄.*用原編號 ${rid} 續做，不要另建`));
+    assert.doesNotMatch(status,/恢復原目錄/);
+  }
+});
+
+test("a missing chosen tool names its own owner: Team MCP to the Team owner, the org catalog to the deployment",async()=>{
+  const owner=/請 Team 主人恢復/,deployment=/請部署管理者確認組織目錄/;
+  for(const [capability_ids,team,org] of [[["team-crm"],true,false],[["fa-skills-v1"],false,true],
+    [["fa-skills-v1","team-crm"],true,true]]){
+    const server=onboardingServer({posts:[{value:onboardingView({state:"UNKNOWN",
+      code:"AGENT_ONBOARDING_SELECTION_STALE",cause:"CAPABILITY_SOURCES_CHANGED",capability_ids})}]});
+    const ui=await open(agentChat("agent-one"),{onboarding:server.handle});
+    await openOnboarding(ui);
+    fillOnboarding(ui,"研究員","找資料");
+    ui.click("onboarding-submit");await ui.tick();await ui.tick();
+    const status=ui.text("onboarding-status");
+    (team?assert.match:assert.doesNotMatch)(status,owner);
+    (org?assert.match:assert.doesNotMatch)(status,deployment);
+    assert.match(status,/如果工具都還在，請部署線確認服務端版本/);
+  }
+});
+
 test("onboarding setup still pending continues the same request every 30 seconds, not every 2",async()=>{
   const rid="onboard-"+"a".repeat(24);
   const server=onboardingServer({posts:[
@@ -10951,6 +11173,87 @@ test("HITL dock: two pending cards sit oldest first under a count line, and 查�
   assert.equal(buttons.length,1,"the first button of that card has focus");
 });
 
+// dev 2026-10-18: every render() rebuilt the dock, so a click on 允許／拒絕 could land on a removed card and typed text
+// was reset. A redraw now keeps each card whose drawing did not change.
+function secondQuestion(entry,text="另一個問題"){
+  const later=copy(entry),id="c".repeat(64);
+  later.item.item_id=id;later.item.question.question_id=id;later.item.created_at="2026-01-01T00:01:00Z";later.item.text=text;
+  return later;
+}
+test("HITL dock: a redraw with the same cards keeps the card node and what was typed in it",async()=>{
+  const {data,qid}=inlineQuestionChat("foundry-native-v1");
+  const ui=await open(data,{now:Date.parse(when)});
+  const dock=ui.nodes.get("attention-dock"),card=dock.children[0];
+  const input=hitlNodes(ui,"data-hitl-rule","question:"+qid)[0];
+  input.value="寄給 Ann";
+  ui.render(data);
+  assert.equal(dock.children[0],card,"the same card node");
+  assert.equal(hitlNodes(ui,"data-hitl-rule","question:"+qid)[0],input);
+  assert.equal(input.value,"寄給 Ann");
+});
+
+test("HITL dock: a button bound before a redraw is still in the dock and still answers after it",async()=>{
+  const {data,qid,entry}=inlineQuestionChat("foundry-native-v1");
+  const ui=await open(data,{now:Date.parse(when),hitl:async(url,options)=>({ok:true,json:async()=>answerReply(
+    entry.item,JSON.parse(options.body))})});
+  const choice=hitlNodes(ui,"data-question-choice",qid)[0];
+  ui.render(data);
+  assert.ok(ui.nodes.get("attention-dock").contains(choice),"the button the owner sees is the one in the dock");
+  choice.events.click();await ui.tick();await ui.tick();
+  const sent=ui.calls.filter(call=>call.method==="POST"&&call.url.startsWith("/api/native-hitl/"));
+  assert.equal(sent.length,1);
+  assert.equal(JSON.parse(sent[0].body).answer,"Ann");
+});
+
+test("HITL dock: an added card joins and a removed card leaves without redrawing the others",async()=>{
+  const {data,entry}=inlineQuestionChat("foundry-native-v1");
+  const ui=await open(data,{now:Date.parse(when)});
+  const dock=ui.nodes.get("attention-dock"),first=dock.children[0],later=secondQuestion(entry);
+  data.composer.attention=[entry,later];ui.render(data);
+  assert.equal(dock.children.length,3);
+  assert.equal(dock.children[0].textContent,"有 2 張待處理卡片");
+  assert.equal(dock.children[1],first,"the card already shown keeps its node");
+  assert.equal(dock.children[2].attributes["data-question-card"],later.item.item_id);
+  const second=dock.children[2];
+  data.composer.attention=[later];ui.render(data);
+  assert.equal(dock.children.length,1,"the gone card and the count line leave");
+  assert.equal(dock.children[0],second,"the other card stays");
+  data.composer.attention=[];ui.render(data);
+  assert.equal(dock.children.length,0);assert.equal(dock.hidden,true);
+});
+
+test("HITL dock: a kept approval card still remembers its opened 詳細 across redraws",async()=>{
+  const c=teamAttentionCase("agent-one"),pid=c.reference.pending_id;
+  const ui=await open(c.data,{now:Date.parse(when),hitl:async(url,options)=>({ok:true,
+    json:async()=>copy(url.includes("/attention")?c.page:c.view)})});
+  await ui.tick();await ui.tick();await ui.tick();
+  const dock=ui.nodes.get("attention-dock");
+  ui.render(ui.holder.current);
+  const card=dock.children[0],details=[];
+  assert.equal(card.attributes["data-hitl-card"],pid);
+  walkNodes(card,node=>{if(node.attributes?.["data-hitl-details"]===pid)details.push(node)});
+  assert.equal(details.length,1);
+  details[0].open=true;details[0].events.toggle();
+  ui.render(ui.holder.current);
+  assert.equal(dock.children[0],card,"the kept card's own read button guards its toggle, so it stays");
+  assert.equal(details[0].open,true);
+});
+
+test("HITL dock: a changed card is drawn again and its unchanged neighbour keeps its node",async()=>{
+  const {data,entry}=inlineQuestionChat("foundry-native-v1");
+  data.composer.attention=[entry,secondQuestion(entry)];
+  const ui=await open(data,{now:Date.parse(when)});
+  const dock=ui.nodes.get("attention-dock"),[count,kept,changed]=dock.children;
+  assert.equal(changed.attributes["data-question-card"],"c".repeat(64),"the later card is drawn last");
+  data.composer.attention=[entry,secondQuestion(entry,"改過的問題")];ui.render(data);
+  assert.equal(dock.children[0],count);
+  assert.equal(dock.children[1],kept,"the unchanged card keeps its node");
+  assert.notEqual(dock.children[2],changed,"the changed card is a new node");
+  assert.equal(dock.children[2].attributes["data-question-card"],"c".repeat(64));
+  const asked=[];walkNodes(dock.children[2],node=>{if(node.className==="hitl-question")asked.push(node.textContent)});
+  assert.deepEqual(asked,["改過的問題"]);
+});
+
 // #813: during a deploy window the API may send a stop to no session (not_dispatched). The page says the stop was not
 // sent and can be pressed again, not 「傳送結果尚未確認」 or an unknown stop to check.
 test("a native stop the API sent to no session says it was not sent and stop stays available",async()=>{
@@ -11143,7 +11446,7 @@ test("the confirm-gated action table has one row per action",()=>{
 // ADR-0009 §8 / M4 (phase 2c): the per-Agent notice the API delivers once with an owner's submit answer.
 const ENVIRONMENT_NOTICE_SENTENCES=[
   [{kind:"environment_updated"},"助理已更新到新版本，工作檔也一起帶過來了。"],
-  [{kind:"environment_switched_without_files"},"已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。"],
+  [{kind:"environment_switched_without_files"},"已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。"],
   [{kind:"environment_source_retired"},
     "已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。"],
   [{kind:"platform_version_changed",from_version:"41",to_version:"40"},
@@ -11210,13 +11513,29 @@ test("after a server-side switch the same-RID resend's answer carries the switch
     [`/api/tasks/${c.rid}/submit-retry`]:{ok:true,json:async()=>{ui.holder.current=copy(c.accepted);return {task:accepted}}}};
   typeAttachmentText(ui,"換版也只送一次");ui.holder.current=copy(c.refused);ui.click("send-instruction");
   await ui.tick();await ui.tick();await fireDelay(ui,3000);
-  assert.equal(ui.text("environment-note"),"已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。");
+  assert.equal(ui.text("environment-note"),"已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。");
   assert.equal(ui.nodes.get("environment-note").hidden,false);
+  assert.equal(vm.runInContext("lastError",ui.context),null);
+});
+// The bridge reports a refused-then-resent RID by its resend's answer (CONFIRMED), with the switch notice the API sent.
+test("after the source environment was deleted, the same-RID resend shows source_retired and clears the sent text",async()=>{
+  const c=serverFollowingCase(),ui=await open(c.data,{now:0});
+  const accepted=copy(c.accepted.tasks[0]);
+  accepted.native_receipt={...(nativeChat("unknown",true).tasks[0].native_receipt),status:"accepted",
+    environment_notice:{kind:"environment_source_retired"}};
+  accepted.submission={state:"CONFIRMED",intent:{created_at:when},observed_at:when,automatic_retry:false};
+  ui.holder.templateResponses={[`/api/instructions/${c.rid}/submit`]:c.rejection,
+    [`/api/tasks/${c.rid}/submit-retry`]:{ok:true,json:async()=>{ui.holder.current=copy(c.accepted);return {task:accepted}}}};
+  typeAttachmentText(ui,"換版也只送一次");ui.holder.current=copy(c.refused);ui.click("send-instruction");
+  await ui.tick();await ui.tick();await fireDelay(ui,3000);
+  assert.equal(ui.text("environment-note"),ENVIRONMENT_NOTICE_SENTENCES[2][1]);
+  assert.equal(ui.nodes.get("environment-note").hidden,false);
+  assert.equal(ui.nodes.get("instruction").value,"");
   assert.equal(vm.runInContext("lastError",ui.context),null);
 });
 test("a manual retry of the original turn answered without a notice keeps the shown one",async()=>{
   const c=serverFollowingCase(),ui=await open(c.refused,{now:0});
-  const sentence="已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。";
+  const sentence="已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。";
   // The Agent's notice came with an earlier answer and is on screen.
   vm.runInContext(`environmentNotices.set(selectedAgent,${JSON.stringify(sentence)});renderEnvironmentNotice()`,ui.context);
   assert.equal(ui.nodes.get("environment-note").hidden,false);

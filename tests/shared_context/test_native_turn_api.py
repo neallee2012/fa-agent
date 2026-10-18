@@ -831,6 +831,19 @@ def test_terminal_unknown_is_recorded_once_without_guessing_zero(native_api):
     assert saved(c, "native-rid").usage is None
 
 
+def test_a_busy_refused_turn_without_usage_is_not_counted_as_an_unknown_turn(native_api):
+    from test_turn_usage_ledger import ledger
+    case, c = native_api, native_api.c
+    assert submit(case).status_code == 202
+    case.remote.records["native-rid"] = case.remote.records["native-rid"].model_copy(update={
+        "status": "busy_refused", "failure_code": "NATIVE_TURN_BUSY",
+    })
+    before = ledger(c)
+    response = case.client.get(PREFIX + "/requests/native-rid", headers=case.headers)
+    assert response.status_code == 200 and response.json()["status"] == "busy_refused"
+    assert ledger(c) == before
+
+
 def test_different_terminal_usage_is_refused_without_rewriting_the_original(native_api):
     from shared_context.behavior_instruction_cost import record_agent_turn_usage
     from test_agent_turn_usage_ledger import saved
@@ -868,6 +881,7 @@ def test_unknown_usage_write_is_reconciled_without_another_model_submit(native_a
     monkeypatch.setattr(c.control.store, "transact", acknowledge_lost)
     failed = case.client.get(PREFIX + "/requests/native-rid", headers=case.headers)
     assert failed.status_code == 503 and failed.json()["error"]["code"] == "BEHAVIOR_COMMIT_UNKNOWN"
+    assert failed.json()["error"]["automatic_retry"] is True, "the owner's read is the retry that records it"
     after = ledger(c)
     assert after.model_unknown_turns == before.model_unknown_turns + 1
     retried = case.client.get(PREFIX + "/requests/native-rid", headers=case.headers)
@@ -957,6 +971,40 @@ def test_only_a_read_failure_that_can_clear_invites_another_read(native_api, mon
     assert result.status_code == 503 and result.json()["error"]["code"] == error.body["error"]["code"]
     assert result.json()["error"]["automatic_retry"] is retry and result.json()["error"]["reconcile_original"] is (
         error.body["error"]["code"] in {"NATIVE_BOOTSTRAP_UNKNOWN", "BEHAVIOR_COMMIT_UNKNOWN"})
+
+
+@pytest.mark.parametrize("error,retry", [
+    (Problem(412, "BEHAVIOR_CONFLICT", "usage entry lost its CAS races"), True),
+    (Problem(409, "BEHAVIOR_CONFLICT", "a real conflict"), False),
+    (Problem(409, "AGENT_USAGE_CONFLICT", "this turn's usage is already recorded differently"), False),
+    (Problem(409, "BEHAVIOR_REQUEST_CONFLICT", "the request ID names another body"), False),
+])
+def test_a_receipt_read_that_lost_its_cas_races_invites_another_read_but_a_real_conflict_does_not(
+        native_api, monkeypatch, error, retry):
+    case = native_api
+
+    def refuse(*_args, **_kwargs):
+        raise error
+    monkeypatch.setattr("shared_context.behavior_native_turn_api.NativeTurnGateway.read", refuse)
+    result = case.client.get(PREFIX + "/requests/native-rid", headers=case.headers)
+    assert result.status_code == error.status and result.json()["error"]["automatic_retry"] is retry
+    # The same 412 on a write never invites a resend.
+    monkeypatch.setattr("shared_context.behavior_native_turn_api.NativeTurnGateway.submit", refuse)
+    sent = submit(case)
+    assert sent.status_code == error.status and sent.json()["error"]["automatic_retry"] is False
+
+
+def test_a_refused_native_turn_logs_its_rid_prefix_never_the_rid(native_api, monkeypatch, caplog):
+    from shared_context.behavior_timing import timing_id
+    case = native_api
+
+    def refuse(*_args, **_kwargs):
+        raise Problem(503, "BEHAVIOR_READ_FAILED", "authority read failed")
+    monkeypatch.setattr("shared_context.behavior_native_turn_api.NativeTurnGateway.read", refuse)
+    assert case.client.get(PREFIX + "/requests/native-rid", headers=case.headers).status_code == 503
+    refused = [r.getMessage() for r in caplog.records if "NATIVE_TURN_REFUSED" in r.getMessage()]
+    assert refused == ["NATIVE_TURN_REFUSED code=BEHAVIOR_READ_FAILED rid=" + timing_id("native-rid")]
+    assert "native-rid" not in caplog.text
 
 
 def test_one_rid_status_carries_receipt_and_a_verified_single_page_reply(native_api):
@@ -1210,6 +1258,7 @@ from shared_context.behavior_native_turn_api import NativeTurnGateway
 from shared_context.behavior_native_capture import project_capture
 from shared_context.native_routine_api import install_native_routine_routes
 from shared_context.native_routine_clock import NativeRoutineClock
+from shared_context.native_cut import turn_ended
 print('sdk-independent')
 """
     result = subprocess.run([sys.executable, "-X", "utf8", "-c", script],

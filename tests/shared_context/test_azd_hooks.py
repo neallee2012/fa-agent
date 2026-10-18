@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -673,18 +674,18 @@ def test_postdown_removes_only_this_environments_objects_and_keeps_the_records(h
             return graph.apps[name]
         graph.apps = {name: app for name, app in graph.apps.items() if path != f"/applications/{app['id']}"}
         return None
-    routes = {"account show": ok({"id": SUBSCRIPTION, "tenantId": TENANT}), "role definition delete": ok(),
+    ours = backup_role(hooks)
+    roles = FakeRoles(ours)
+    routes = {"account show": ok({"id": SUBSCRIPTION, "tenantId": TENANT}), "rest --method": roles,
               "azd env set": ok()}
-    ctx = context(hooks, tmp_path, routes, FA_BACKUP_ROLE_ID=f"/subscriptions/{SUBSCRIPTION}/providers/"
-                  "Microsoft.Authorization/roleDefinitions/role-guid", FA_FRESH_INSTALLED="true",
+    ctx = context(hooks, tmp_path, routes, FA_BACKUP_ROLE_ID=ours["id"], FA_FRESH_INSTALLED="true",
                   FA_TEAM_OWNER_OID=OWNER, FA_ENABLE_WEBIQ="false")
     monkeypatch.setattr(ctx, "graph", answer)
     (tmp_path / "dev" / "fa").mkdir(parents=True)
     (tmp_path / "dev" / "fa" / "intent.json").write_text("{}", encoding="utf-8")
     hooks.postdown(ctx)
     assert set(graph.apps) == {"fa-api-other-env"}
-    role = next(call for call in ctx.run.calls if "role" in call)
-    assert role[role.index("--name") + 1] == "role-guid"
+    assert roles.deleted == [ours["id"].lower()]
     kept = [path for path in tmp_path.joinpath("dev").iterdir() if path.name.startswith("fa-down-")]
     assert len(kept) == 1 and (kept[0] / "intent.json").exists() and not (tmp_path / "dev" / "fa").exists()
     # azd 1.32 has no `azd env unset`; an empty value reads as unset.
@@ -695,6 +696,70 @@ def test_postdown_removes_only_this_environments_objects_and_keeps_the_records(h
     graph.calls.clear()
     hooks.postdown(ctx)  # a rerun finds nothing left and deletes nothing
     assert [method for method, _ in graph.calls] == ["GET", "GET"]
+
+
+class FakeRoles:
+    """ARM role definitions by exact ID: GET reads one or answers RoleDefinitionDoesNotExist, DELETE removes it."""
+
+    def __init__(self, *roles):
+        self.roles, self.deleted = {role["id"].lower(): role for role in roles}, []
+
+    def __call__(self, args):
+        role_id = args[args.index("--url") + 1].split("?")[0].lower()
+        if args[args.index("--method") + 1] == "delete":
+            self.deleted.append(role_id)
+            self.roles.pop(role_id, None)
+            return ok()
+        if role_id in self.roles:
+            return ok(self.roles[role_id])
+        return failed("ERROR: Not Found({\"error\":{\"code\":\"RoleDefinitionDoesNotExist\"}})")
+
+
+def backup_role(hooks, group="rg-dev", token="abcdefghijklm"):
+    """The role infra/azd/main.bicep makes for an environment named dev whose resource group is `group`."""
+    guid = hooks.bicep_guid(f"/subscriptions/{SUBSCRIPTION}/resourceGroups/{group}", "fa-m1-backup-data-read-write-v1")
+    return {"id": f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Authorization/roleDefinitions/{guid}",
+            "name": guid, "properties": {"roleName": f"FA M1 Backup Data Read Write (dev-{token})"}}
+
+
+def test_bicep_guid_reproduces_the_stage_backup_role_guid(hooks):
+    # Test vector from the repo: guid(<stage RG id>, 'fa-m1-backup-data-read-write-v1') is the GUID the stage
+    # m3-artifacts parameters carry (src/fa-shared-context-poc/README.md, W4 Blob).
+    stage = json.loads((ROOT / "deploy" / "stage" / "stage.json").read_text(encoding="utf-8"))
+    shared = ROOT / "infra" / "shared-context"
+    group = json.loads((shared / "backup-role.stage.parameters.json").read_text(encoding="utf-8"))
+    artifacts = json.loads((shared / "m3-artifacts.stage.parameters.json").read_text(encoding="utf-8"))
+    rg_id = (f"/subscriptions/{stage['subscription_id']}/resourceGroups/"
+             f"{group['parameters']['backupResourceGroupName']['value']}")
+    assert hooks.bicep_guid(rg_id, hooks.BACKUP_ROLE_SEED) == "00000000-0000-0000-0000-000000000058"
+    assert artifacts["parameters"]["readWriteRoleDefinitionGuid"]["value"] == "00000000-0000-0000-0000-000000000058"
+
+
+# azd new-user test 2026-10-15 #12: without FA_BACKUP_ROLE_ID postdown said nothing about the backup role.
+# The role is found by the exact ID backup-role.bicep derives from the group, never by its name: another environment
+# named dev (another group or region) has a role named alike, and it is never touched.
+@pytest.mark.parametrize("present, recorded, deleted, line", [
+    ("both", None, "ours", "FA M1 Backup Data Read Write (dev-abcdefghijklm) ({guid}): deleted"),
+    ("other", None, None, "FA: backup custom role {guid}: already gone"),
+    ("both", "other", None, "none deleted, check and delete it yourself"),
+])
+def test_postdown_deletes_only_the_backup_role_with_this_groups_id(hooks, tmp_path, monkeypatch, capsys, present,
+                                                                  recorded, deleted, line):
+    ours, other = backup_role(hooks), backup_role(hooks, group="rg-dev-west", token="nopqrstuvwxyz")
+    roles = FakeRoles(*([ours, other] if present == "both" else [other]))
+    routes = {"account show": ok({"id": SUBSCRIPTION, "tenantId": TENANT}), "rest --method": roles,
+              "azd env set": ok()}
+    ctx = context(hooks, tmp_path, routes, **({"FA_BACKUP_ROLE_ID": other["id"]} if recorded else {}))
+
+    def gone(method, path, body, headers):
+        raise LookupError("Request_ResourceNotFound")
+    monkeypatch.setattr(ctx, "graph", gone)
+    hooks.postdown(ctx)
+    assert roles.deleted == ([ours["id"].lower()] if deleted else [])
+    assert other["id"].lower() in roles.roles
+    assert line.format(guid=ours["name"]) in capsys.readouterr().out
+    cleared = {call[3] for call in ctx.run.calls if call[:3] == ["azd", "env", "set"]}
+    assert "FA_BACKUP_ROLE_ID" not in cleared  # a mismatched record stays to point at the role to check
 
 
 def test_only_the_team_owner_prepares_and_selects(hooks, tmp_path):
@@ -756,6 +821,12 @@ LOCK = {"name": "m1-backup-account-delete-protection", "id": "/subscriptions/s/r
         "Microsoft.Storage/storageAccounts/stbk/providers/Microsoft.Authorization/locks/m1-backup-account-delete-protection"}
 
 
+def outside(hooks, roles=None):
+    """What predown reads first (read only) to list what goes outside the resource group."""
+    return {"account show": ok({"id": SUBSCRIPTION, "tenantId": TENANT}),
+            "rest --method": roles or FakeRoles(backup_role(hooks))}
+
+
 @pytest.mark.parametrize("tty, answer, values, removed", [
     (True, "dev", {}, True),                               # the person types the environment name
     (False, None, {"FA_CONFIRM_DELETE": "dev"}, True),     # an explicit confirmation for a run without a terminal
@@ -764,7 +835,7 @@ LOCK = {"name": "m1-backup-account-delete-protection", "id": "/subscriptions/s/r
     (False, None, {"FA_CONFIRM_DELETE": "other"}, False),  # a confirmation for another environment
 ])
 def test_predown_removes_only_the_backup_lock_after_confirmation(hooks, tmp_path, tty, answer, values, removed):
-    ctx = context(hooks, tmp_path, {"lock list": ok([LOCK]), "lock delete": ok()}, **values)
+    ctx = context(hooks, tmp_path, {**outside(hooks), "lock list": ok([LOCK]), "lock delete": ok()}, **values)
     ctx.tty, ctx.prompt = tty, (lambda text: answer)
     if removed:
         hooks.predown(ctx)
@@ -777,12 +848,62 @@ def test_predown_removes_only_the_backup_lock_after_confirmation(hooks, tmp_path
         assert deleted[0][deleted[0].index("--ids") + 1] == LOCK["id"]
 
 
+def test_predown_prints_how_to_put_the_lock_back(hooks, tmp_path, capsys):
+    # azd asks its own y/N after predown; a "no" there leaves the backups without their lock.
+    ctx = context(hooks, tmp_path, {**outside(hooks), "lock list": ok([{**LOCK, "level": "CanNotDelete"}]),
+                                    "lock delete": ok()}, FA_CONFIRM_DELETE="dev")
+    hooks.predown(ctx)
+    assert ("az lock create --name m1-backup-account-delete-protection --lock-type CanNotDelete --resource "
+            "/subscriptions/s/resourcegroups/rg-dev/providers/Microsoft.Storage/storageAccounts/stbk\n"
+            ) in capsys.readouterr().out
+
+
+def test_a_new_console_is_internal_until_its_sign_in_config_exists(hooks, tmp_path, monkeypatch):
+    deployed = []
+    monkeypatch.setattr(hooks, "console_bundle", lambda *args: {})
+    monkeypatch.setattr(hooks, "deploy_bicep", lambda ctx, name, template, parameters: deployed.append(
+        (template, parameters)) or {"publicOrigin": "https://ca-console.example.io", "identityPrincipalId": "p"})
+    monkeypatch.setattr(sys.modules["entra"], "ensure_fic", lambda *args: "created")
+    keys = ("AZURE_LOCATION", "FA_CONTAINER_APPS_ENVIRONMENT", "FA_REGISTRY_NAME", "FA_VNET", "FA_CONSOLE_APP",
+            "FA_CONSOLE_IDENTITY", "FA_CONSOLE_STORAGE", "FA_CONSOLE_APP_ID", "FA_TEAM_OWNER_OID", "FA_API_AUDIENCE",
+            "FA_CONSOLE_APP_OBJECT_ID", "FA_DEPLOY_RUN")
+    ctx = context(hooks, tmp_path, {"azd env set": ok()}, FA_CONSOLE_URL="https://ca-console.example.io",
+                  **{key: "x" for key in keys})
+    hooks.console_app(ctx, "cr/fa-web-console@sha256:" + "a" * 64, tmp_path, tmp_path / "plan.json", "f" * 40)
+    assert [parameters["ingressExternal"] for _, parameters in deployed] == [False, True]
+    # Every name passed is a parameter of the template, so the flag cannot be dropped by a rename.
+    declared = set(re.findall(r"^param (\w+)", deployed[0][0].read_text(encoding="utf-8"), re.MULTILINE))
+    assert set(deployed[0][1]) <= declared and set(deployed[1][1]) <= declared
+
+
 def test_predown_leaves_someone_elses_lock_alone(hooks, tmp_path):
-    ctx = context(hooks, tmp_path, {"lock list": ok([LOCK, {"name": "team-hold", "id": "x"}])},
+    ctx = context(hooks, tmp_path, {**outside(hooks), "lock list": ok([LOCK, {"name": "team-hold", "id": "x"}])},
                   FA_CONFIRM_DELETE="dev")
     with pytest.raises(SystemExit, match="team-hold"):
         hooks.predown(ctx)
     assert not [call for call in ctx.run.calls if "delete" in call]
+
+
+def test_predown_lists_what_goes_outside_the_group_before_it_asks(hooks, tmp_path, capsys):
+    # azd new-user test 2026-10-15 #14: the person confirms without seeing the Entra apps and the backup role.
+    keys = sys.modules["entra"].names("dev", TENANT, SUBSCRIPTION, "rg-dev")
+    ctx = context(hooks, tmp_path, {**outside(hooks), "lock list": ok([LOCK]), "lock delete": ok()})
+    asked = []
+    ctx.prompt = lambda text: asked.append(capsys.readouterr().out) or "dev"
+    hooks.predown(ctx)
+    assert keys["console_unique_name"] in asked[0] and keys["api_unique_name"] in asked[0]
+    assert f"FA M1 Backup Data Read Write (dev-abcdefghijklm) ({backup_role(hooks)['name']})" in asked[0]
+    assert not [call for call in ctx.run.calls if "delete" in call and "rest" in call]  # read only
+
+
+def test_predown_goes_on_when_the_backup_role_cannot_be_read(hooks, tmp_path, capsys):
+    # The role line is information only; a failed read must not stop `azd down`.
+    routes = {**outside(hooks, lambda args: failed("ERROR: (AuthorizationFailed) no read")), "lock list": ok([LOCK]),
+              "lock delete": ok()}
+    ctx = context(hooks, tmp_path, routes, FA_CONFIRM_DELETE="dev")
+    hooks.predown(ctx)
+    assert "backup custom role: could not be read" in capsys.readouterr().out
+    assert [call for call in ctx.run.calls if "lock" in call and "delete" in call]
 
 
 def test_the_model_picker_offers_what_the_region_runs_and_records_one_decision(hooks, tmp_path, capsys):
@@ -801,6 +922,18 @@ def test_the_model_picker_offers_what_the_region_runs_and_records_one_decision(h
     document = json.loads((tmp_path / "dev" / "fa" / "preflight-deployment.json").read_text(encoding="utf-8"))
     assert [item["name"] for item in document["model_deployments"]] == [
         "gpt-4.1-mini", "text-embedding-3-small", "gpt-5.4-mini"]
+
+
+def test_the_model_picker_shows_usage_over_the_limit_as_none_free(hooks, tmp_path, capsys):
+    # azd new-user test 2026-10-15 #4: it printed "quota free -250, needs 500 (not enough)".
+    offer = region(free={"gpt-6-luna": -250})
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True}), offer=offer), FA_TEAM_OWNER_OID=OWNER)
+    answers = iter(["", "2"])
+    ctx.prompt = lambda text: next(answers)
+    hooks.preprovision(ctx)
+    out = capsys.readouterr().out
+    assert "gpt-6-luna: quota free 0 (over the limit), needs 500 (not enough)" in out
+    assert "-250" not in out
 
 
 @pytest.mark.parametrize("answer, message", [("4", "gpt-6.1-sol is not offered"), ("0", "not a list"),

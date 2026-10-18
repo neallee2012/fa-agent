@@ -31,7 +31,11 @@ come from the selected profile (api_environment), so an ENV change is a normal P
                                                        approved release override applies (deploy/README.md#compat-gate)
   python3 deploy/stage/ci_deploy.py sync <api-ref> <hosted-ref>
   python3 deploy/stage/ci_deploy.py api <api-ref>
-  python3 deploy/stage/ci_deploy.py follow <api-ref> <hosted-ref>  -> verify versions, then finish all Agent follows
+  python3 deploy/stage/ci_deploy.py follow <api-ref> <hosted-ref>  -> verify versions, then finish all Agent follows;
+                                                       with the 2d-i switch on (FA_NATIVE_SESSION_GUARD_ENFORCE=1,
+                                                       which guard, sync, api and follow each let on only over one
+                                                       revision already running P5+P6, and never off again) it only
+                                                       reports each Agent's version and environment, never follows
   python3 deploy/stage/ci_deploy.py console <console-ref>
   python3 deploy/stage/ci_deploy.py feed <feed-ref> -> the feed reader MCP app (README "Feed reader MCP"), after
                                                        follow; `build feed` prints no reference until the profile
@@ -66,6 +70,16 @@ TOKEN = re.sub(r"[^a-z0-9-]+", "-", STAGE["environment"].lower()).strip("-") or 
 VERSIONS = APP / "shared_context" / "behavior_agent_versions.py"
 # Overlay keys sync checks by value, not as "0"/"1" switches (behavior_agent_versions._check_environment).
 HOSTED_VALUE_KEYS = frozenset({"FA_NATIVE_TURNS", "FA_NATIVE_HITL_TTL_SECONDS", "FA_PRIVATE_MEMORY_STORE", "TZ"})
+# native_responses_wire.ACCEPTED_STATE_PROFILES (ADR-0009 2d-i), copied: meta cannot import shared_context. The API's
+# own FA_NATIVE_TURNS stays v1 (api_routines) until 2d-ii.
+HOSTED_STATE_PROFILES = frozenset({"foundry-native-v1", "foundry-native-v2"})
+# ADR-0009 2d-i's one switch (src README#native-2di-switch): the API's FA_NATIVE_SESSION_GUARD_ENFORCE="1" also makes
+# every assistant's Hosted definition declare v2; one is never deployed without the other.
+SESSION_GUARD = "FA_NATIVE_SESSION_GUARD_ENFORCE"
+NATIVE_V2 = "foundry-native-v2"
+# The native_binding.NATIVE_2DI_SCHEMA the API must declare before the switch goes on: 2 = P5's background cut plus
+# P6's in-request wait and verify-only follow (read from source by AST: the deploy never imports shared_context).
+API_2DI_SCHEMA = 2
 IMAGES = {
     "api": ("fa-behavior-api", "Dockerfile.behavior-api"),
     "hosted": ("fa-behavior-assistant-desktop", "Dockerfile.behavior-assistant-desktop"),
@@ -106,6 +120,7 @@ def check():
     """The profile checks meta runs before any build; an azd environment (deploy/azd) has no CI identity to print."""
     hosted_environment()
     api_routines()
+    api_faults()
     realtime()
     feed_config()
     api_secrets()
@@ -328,6 +343,7 @@ def guard():
         rest("GET", f"{_resource('containerApps', feed_config()[0])}?{APPS_API}")
     revision = properties.get("latestReadyRevisionName") or ""
     base = serving_commit(revision)
+    switch_preconditions(properties, base)
     if base is None:
         realtime_ready()
         return
@@ -432,7 +448,7 @@ def _check_hosted(name, environment, idle_timeout_seconds):
     switches = flags - HOSTED_VALUE_KEYS
     if (invalid or type(idle_timeout_seconds) is not int or not 120 <= idle_timeout_seconds <= 3600
             or any(key in environment and environment[key] not in {"0", "1"} for key in switches)
-            or environment.get("FA_NATIVE_TURNS", "foundry-native-v1") != "foundry-native-v1"
+            or environment.get("FA_NATIVE_TURNS", "foundry-native-v1") not in HOSTED_STATE_PROFILES
             or "FA_NATIVE_HITL_TTL_SECONDS" in environment
             and re.fullmatch(r"[1-9][0-9]{0,5}", environment["FA_NATIVE_HITL_TTL_SECONDS"]) is None
             or any("\x00" in value or "\r" in value or "\n" in value for value in environment.values())):
@@ -446,9 +462,18 @@ def hosted_environment():
     Obvious combinations stop too: every group turn runs on the Responses lane, so FA_NATIVE_GROUPS_ENABLED=1 must
     also carry FA_RESPONSES_ENABLED=1 (2026-10-04 stage start refused with 409); propose_routine is offered only with
     native routines on (README#native-routines-stage; HITL may come from the served definition, so it is not checked)."""
+    on = native_2di()
     overlay = {}
     for agent in STAGE["agents"]:
-        environment = agent.get("hosted_environment")
+        environment = agent.get("hosted_environment") or {}
+        turns, assistant = environment.get("FA_NATIVE_TURNS"), agent["kind"] == "assistant"
+        # v2 only on assistants and only through the switch: an executor never runs the 2d-i turn the API moves.
+        if turns == NATIVE_V2 and not (on and assistant) or on and assistant and turns not in {None, NATIVE_V2}:
+            raise SystemExit(f"{agent['name']}: FA_NATIVE_TURNS in hosted_environment must match the 2d-i switch "
+                             f"(api_environment {SESSION_GUARD}); leave it out, the switch sets {NATIVE_V2} on "
+                             "assistants only")
+        if on and agent["kind"] == "assistant":
+            environment = {**environment, "FA_NATIVE_TURNS": NATIVE_V2}
         if not environment:
             continue
         _check_hosted(agent["name"], environment, STAGE["hosted_idle_timeout_seconds"])
@@ -489,6 +514,96 @@ def api_routines():
     return clock == "api"
 
 
+def api_faults():
+    """ADR-0009 gate 2's fault hook (FA_NATIVE_CUT_FAULT, behavior_native_sessions.py) is for dev only: a stage API with
+    it would hold every files fence to its bound."""
+    if STAGE["environment"] == "stage" and "FA_NATIVE_CUT_FAULT" in STAGE["api_environment"]:
+        raise SystemExit("api_environment: FA_NATIVE_CUT_FAULT is a dev-only fault hook; stage refuses it")
+
+
+def _api_source(name, commit=None):
+    """One shared_context file of this checkout, or of ``commit`` (the serving API's); None when it does not exist."""
+    if commit is None:
+        path = APP / "shared_context" / name
+        return path.read_text(encoding="utf-8") if path.exists() else None
+    found = subprocess.run(["git", "-C", str(ROOT), "show", f"{commit}:src/fa-shared-context-poc/shared_context/{name}"],
+                           check=False, text=True, encoding="utf-8", errors="replace", capture_output=True)
+    return found.stdout if found.returncode == 0 else None
+
+
+def api_2di_schema(commit=None):
+    """The module-level int ``NATIVE_2DI_SCHEMA`` native_binding.py assigns (this checkout's, or ``commit``'s); 0 when
+    it assigns none or the source does not parse."""
+    try:
+        tree = ast.parse(_api_source("native_binding.py", commit) or "")
+    except SyntaxError:
+        return 0
+    for node in tree.body:
+        names = [getattr(item, "id", None) for item in node.targets] if isinstance(node, ast.Assign) else []
+        if names == ["NATIVE_2DI_SCHEMA"] and isinstance(node.value, ast.Constant) and type(node.value.value) is int:
+            return node.value.value
+    return 0
+
+
+def missing_2di(commit=None):
+    """[] when the API code can run 2d-i (NATIVE_2DI_SCHEMA >= API_2DI_SCHEMA), else what it lacks."""
+    found = api_2di_schema(commit)
+    return [] if found >= API_2DI_SCHEMA else [f"native_binding.NATIVE_2DI_SCHEMA={found}, needs {API_2DI_SCHEMA}"]
+
+
+def native_2di():
+    """True when api_environment switches ADR-0009 2d-i on (src README#native-2di-switch). The Hosted half
+    (assistants declare foundry-native-v2) is derived from it in hosted_environment(), so the two never part."""
+    value = STAGE["api_environment"].get(SESSION_GUARD, "0")
+    if value not in {"0", "1"}:
+        raise SystemExit(f"api_environment: {SESSION_GUARD} accepts only \"0\" or \"1\" (the 2d-i switch)")
+    if value == "0" and STAGE["assistant_environment"].get("FA_NATIVE_TURNS") == NATIVE_V2:
+        raise SystemExit(f"assistant_environment: FA_NATIVE_TURNS={NATIVE_V2} needs the 2d-i switch "
+                         f"(api_environment {SESSION_GUARD}=\"1\"); leave it at foundry-native-v1")
+    missing = missing_2di() if value == "1" else []
+    if missing:
+        raise SystemExit(f"api_environment {SESSION_GUARD}=\"1\" needs an API with ADR-0009 2d-i P5 and P6; this "
+                         f"checkout (= the API image built from it) lacks {missing}")
+    return value == "1"
+
+
+def switch_preconditions(properties=None, base=None):
+    """Read-only, from guard() and again from sync/follow and api (the dev line runs those without guard): 2d-i only
+    goes on over a single serving API revision that already runs P5+P6 (older replicas decode the rows P5 writes as
+    409 NATIVE_BINDING_INVALID), and it never goes off again (roll forward: no API below P6, no Hosted below H2d once
+    v2 conversations exist; ADR-0009 M1 2d-i). Without ``properties`` it reads the API app (and its serving commit)."""
+    read = properties is None
+    app = STAGE["api_app"]
+    if read:
+        properties = rest("GET", f"{_resource('containerApps', app)}?{APPS_API}")["properties"]
+    container = ((properties.get("template") or {}).get("containers") or [{}])[0]
+    deployed = {item.get("name"): item.get("value") for item in container.get("env") or []}.get(SESSION_GUARD)
+    if not native_2di():
+        if deployed == "1":
+            raise SystemExit(f"{app}: 2d-i is on ({SESSION_GUARD}=\"1\") and this profile turns it off; it cannot be "
+                             "turned off (ADR-0009: roll forward only). Keep \"1\" and fix forward")
+        return
+    mode = (properties.get("configuration") or {}).get("activeRevisionsMode")
+    if mode != "Single":
+        raise SystemExit(f"{app}: the 2d-i switch needs single revision mode (mode {mode!r}); an operator sets it "
+                         "first (az containerapp revision set-mode --mode single)")
+    if deployed == "1":
+        return  # already on: a later deploy's old revision may still be deactivating, so only the mode is checked
+    # shortcut: first page only (no nextLink), upgrade if an API app ever keeps more than one page of revisions.
+    revisions = (rest("GET", f"{_resource('containerApps', app)}/revisions?{APPS_API}") or {}).get("value") or []
+    active = [item.get("name") for item in revisions if (item.get("properties") or {}).get("active")]
+    ready = properties.get("latestReadyRevisionName") or ""
+    if active != [ready]:
+        raise SystemExit(f"{app}: turning 2d-i on needs one active revision, the latest ready one ({ready!r}; active "
+                         f"{active}); wait for the old revision to deactivate, or an operator deactivates it")
+    if read:
+        base = serving_commit(ready)
+    missing = ["the serving commit is unknown"] if base is None else missing_2di(base)
+    if missing:
+        raise SystemExit(f"{app}: turning 2d-i on needs the serving API to run P5+P6 already ({missing}); deploy this "
+                         f"commit with {SESSION_GUARD}=\"0\" first, then switch it on")
+
+
 def _sync_script(hosted_ref, *, follow=False):
     """Keep the installed config unchanged; pass deployment-only ENV to definition sync and publish its selector."""
     raw = _config_bytes()
@@ -498,8 +613,15 @@ def _sync_script(hosted_ref, *, follow=False):
     argv = ["sync", "--config", f"{runtime_root}/config.json", "--image", hosted_ref, "--core", core(), "--route",
             "--hosted-environment", f"{runtime_root}/hosted-environment.json",
             "--idle-timeout-seconds", str(STAGE["hosted_idle_timeout_seconds"])]
+    on = native_2di()
+    if not on:
+        # A turn-on that stopped after sync left v2 definitions: carrying them on with the API off is refused.
+        argv.append("--refuse-native-v2")
     if not follow:
         argv.append("--defer-follow")
+    elif on:
+        # 2d-i moves each Agent after its turn end (P5 background cut): the deploy only reports, never follows.
+        argv.append("--verify-follow")
     return "\n".join([
         "import base64,hashlib,sys,zlib",
         "from pathlib import Path",
@@ -560,9 +682,12 @@ def _poll(path):
 def sync(api_ref, hosted_ref, *, follow=False):
     if not hosted_ref.startswith(STAGE["registry"] + "/fa-behavior-assistant-desktop@sha256:"):
         raise SystemExit("hosted image must be a digest reference from the selected registry")
+    switch_preconditions()
     status, name = _run_job(api_ref, _sync_script(hosted_ref, follow=follow))
     if status != "Succeeded":
-        raise SystemExit(f"sync {name} {status}; read the job log in Log Analytics, do not rerun blindly")
+        hint = "" if native_2di() else (f"; an Agent failed with NATIVE_V2_SERVED_SWITCH_OFF already serves "
+                                        f"{NATIVE_V2} (a turn-on stopped after sync): rerun with {SESSION_GUARD}=\"1\"")
+        raise SystemExit(f"sync {name} {status}; read the job log in Log Analytics, do not rerun blindly{hint}")
     print(f"sync {name} Succeeded")
 
 
@@ -766,6 +891,7 @@ def _suffix():
 def api(api_ref):
     # The image and the profile's API ENV change here; the command and the installed
     # configuration (BEHAVIOR_SERVER_CONFIG_JSON) stay as the operator set them at W7.
+    switch_preconditions()
     revision = _update_container("containerApps", STAGE["api_app"], api_ref, _suffix(),
                                  guarded={"BEHAVIOR_SERVER_CONFIG_JSON": _config_bytes().decode("utf-8")},
                                  environment=STAGE["api_environment"],

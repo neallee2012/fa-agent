@@ -143,7 +143,7 @@ def test_an_existing_or_unconfirmed_claim_sends_nothing(local_env, caplog):
     assert "status=already_claimed" in caplog.text and "status=claim_unknown" in caplog.text
 
 
-def test_the_native_factory_runs_private_memory_before_the_original_completion_relay(local_env, monkeypatch, tmp_path):
+def test_the_native_factory_runs_private_memory_after_the_original_completion_relay(local_env, monkeypatch, tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     runtime_path = tmp_path / "OFFLINE-not-executed"
@@ -160,8 +160,18 @@ def test_the_native_factory_runs_private_memory_before_the_original_completion_r
 
     async def relayed(self, receipt, result):
         order.append("relay")
+
+    async def settled(*_args):
+        return None
     monkeypatch.setattr(NativePrivateMemory, "completed", remembered)
     monkeypatch.setattr(NativeAgentRelayClient, "completed", relayed)
+    monkeypatch.setattr(native_sdk.NativeUsageReporter, "__call__", settled)
+    monkeypatch.setattr(native_sdk.NativeSdkExecutor, "notify_terminal", settled)
+    receipt = SimpleNamespace(status="completed", result=None, request_id="OFFLINE-rid")
+
+    async def finished(current):
+        await current.on_terminal(receipt)  # the peer result goes out ahead of usage and memory
+        await current.on_completed(receipt, None)
     with monkeypatch.context() as environment:
         for name, value in {"FA_NATIVE_TURNS": "foundry-native-v1", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
                             "AGENTSERVER_TASKS_BACKEND": "hosted", "HOME": str(home),
@@ -173,11 +183,11 @@ def test_the_native_factory_runs_private_memory_before_the_original_completion_r
         unconfigured = native_sdk.native_runtime_from_environment(hosted)
     assert isinstance(runtime.executor.private_memory, NativePrivateMemory)
     assert runtime.executor.private_memory.memory.scope == memory.scope_for("OFFLINE-agent")
-    asyncio.run(runtime.on_completed(SimpleNamespace(), None))
-    assert order == ["private-memory", "relay"]
+    asyncio.run(finished(runtime))
+    assert order == ["relay", "private-memory"]
     assert unconfigured.executor.private_memory is None
-    asyncio.run(unconfigured.on_completed(SimpleNamespace(), None))
-    assert order == ["private-memory", "relay", "relay"]
+    asyncio.run(finished(unconfigured))
+    assert order == ["relay", "private-memory", "relay"]
 
 
 def test_private_memory_accepts_the_native_async_token_and_still_the_old_sync_one():

@@ -328,7 +328,7 @@ def test_changed_destination_and_client_authority_fields_cannot_select_the_envir
 def test_transferred_compacted_archive_keeps_its_original_compaction_lineage(compacted_transfer_source, monkeypatch):
     from shared_context.behavior_conversation_transfer import prepare, TransferCommand
     from shared_context.behavior_sdk_files import SdkSessionFiles
-    from shared_context.behavior_sdk_state import CheckpointProfile
+    from shared_context.behavior_sdk_state import CheckpointProfile, local_platform
     from test_instruction_flow import check_history
     original = compacted_transfer_source
     state = original.fs.snapshot()
@@ -343,7 +343,7 @@ def test_transferred_compacted_archive_keeps_its_original_compaction_lineage(com
     try:
         restored = following.client.restore()
         assert restored == state
-        fs = SdkSessionFiles(restored.sdk_session_id, restored, checkpoint_profile=CheckpointProfile())
+        fs = SdkSessionFiles(restored.sdk_session_id, restored, checkpoint_profile=CheckpointProfile(platform=local_platform()))
         saved = settle(following, fs.snapshot())
         assert saved.source.execution == reference.source.execution
         assert saved.source.previous_job_id == original.binding.job_id

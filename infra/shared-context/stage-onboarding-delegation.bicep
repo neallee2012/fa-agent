@@ -19,6 +19,8 @@ param accountName string
 param projectName string
 @description('Principal (object) ID of the stage API user-assigned identity.')
 param principalId string
+@description('Role assignment description. The default is the text stage was deployed with, so stage stays unchanged.')
+param assignmentDescription string = 'FA #468: stage onboarding may only add Foundry User / OpenAI User for service principals; no deletes'
 
 var rbacAdministrator = 'f58310d9-a9f6-439a-9e8d-f62e7b41a168'
 var foundryUser = '53ca6127-db72-4b80-b1b0-d745d6d5456d'
@@ -45,7 +47,7 @@ resource delegation 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', rbacAdministrator)
     condition: condition
     conditionVersion: '2.0'
-    description: 'FA #468: stage onboarding may only add Foundry User / OpenAI User for service principals; no deletes'
+    description: assignmentDescription
   }
 }
 

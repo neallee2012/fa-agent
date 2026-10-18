@@ -97,7 +97,8 @@ class Reader:
 
 
 def receipt(content, rid="rid-1"):
-    return SimpleNamespace(source=None, status="completed", request_id=rid, conversation_id="cid-1", turn_number=1,
+    return SimpleNamespace(source=None, human_origin=True, status="completed", request_id=rid, conversation_id="cid-1",
+                           turn_number=1,
                            command=SimpleNamespace(content=content))
 
 

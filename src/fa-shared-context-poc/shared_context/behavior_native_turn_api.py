@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from functools import partial
 from threading import Lock
-from time import monotonic
+from time import monotonic, sleep
 
 from fastapi import Depends, Query, Request
 from fastapi.responses import JSONResponse
@@ -24,6 +24,7 @@ from .behavior_instruction import conversation_key
 from .behavior_native_capture import resolve_capture
 from .behavior_timing import phase_timing, timing_id
 from .behavior_wire import WireModel
+from .native_responses_wire import channel
 from .behavior_native_turn_wire import (
     NATIVE_REQUEST, NATIVE_STATE_PROFILE, NATIVE_TURN_ERRORS, NativeAgentReceive, NativeRoutineSubmit, NativeCancel, NativeConversation, NativeConversationRead,
     NativeDelivered, NativeHistory, NativeHistoryPage, NativeRead, NativeReceipt, NativeResult,
@@ -31,7 +32,8 @@ from .behavior_native_turn_wire import (
     NativeSessionRead, NativeSessionPrepare, NativeSessionPreparation, NativeSessionState, NativeCandidateRead,
     NativeEnvironmentCommand, NativeEnvironmentRetargetCommand, NativeEnvironmentView, NativeSessionFollow,
     NativeSessionRetarget, NativeHitlHistoryRead, MAX_HITL_REVIEW_PAGE,
-    NativeEnvironmentWithoutFiles, NativeSessionAbandon, NativeSessionFilesOmission, NativeTurnStatus,
+    NativeEnvironmentWithoutFiles, NativeSessionAbandon, NativeSessionCut, NativeSessionFilesOmission,
+    NativeSessionWithdraw, NativeTurnStatus,
     NativeEnvironmentNotice, NativeUnfinishedRead, NativeUnfinishedSessions, SLOT_NOTICE_KINDS,
     NOTICE_KINDS_HEADER, NOTICE_KINDS_VERSION,
     MAX_RECEIVED_PAGE, NativeReceivedPage, NativeReceivedRead,
@@ -84,6 +86,60 @@ class _BeforeAdmission(Problem):
         super().__init__(cause.status, cause.body["error"]["code"], str(cause))
         self.body = cause.body
         self.request_id, self.server_following = request_id, server_following
+
+
+# ADR-0009 2d-i 「切換期間送出的訊息」 (FA_NATIVE_SESSION_GUARD_ENFORCE only): a message that meets a switch is resent in
+# its own request at most this long (at least 8 s, longer than one Hosted fence step's 5 s plus a resend), every
+# RESEND_SECONDS or the refusal's ``retry_after_ms``; past it the same RID is resent by the workbench
+# (``server_following``). Never a refusal of the owner's message (M2).
+IN_REQUEST_WAIT_SECONDS = 10
+RESEND_SECONDS = 0.5
+_WAIT_CODES = frozenset({"AGENT_VERSION_FOLLOWING", "NATIVE_SESSION_CHANGED", "NATIVE_ADMISSION_PENDING"})
+_resend_sleep = sleep
+
+
+def _waitable(error):
+    """A refusal that sent nothing while the Agent changes environments: resending the same RID and body is safe."""
+    detail = error.body["error"]
+    code = detail["code"]
+    return code in _WAIT_CODES and (isinstance(error, _BeforeAdmission) or detail.get("not_dispatched") is True
+                                    or error.status == 503 and code != "NATIVE_SESSION_CHANGED")
+
+
+def wait_in_request(call, *, enforce, between=None):
+    """``call()`` (one whole attempt of an entry: the same RID and body each time), resent while it meets a switch
+    (``_waitable``) for at most ``IN_REQUEST_WAIT_SECONDS``; the last refusal is raised then, as ``server_following``
+    when it is a ``_BeforeAdmission``. ``between()``: run after such a refusal (an entry whose attempt moves nothing
+    itself, e.g. a routine, runs the in-request switch there); its waitable refusal only sets the next wait. A send
+    that meets no switch makes exactly one attempt, so its calls and latency are unchanged; without ``enforce``
+    ``call()`` runs once, as before. Cost (ADR-0009 2d-i P6): any waitable ``_BeforeAdmission`` left at the deadline
+    is answered ``server_following``, including a Hosted 503 for its own task recovery that an attempt alone would
+    have answered without it: up to 10 s of resends here, holding this request's worker thread, then the workbench's
+    same-RID resends for up to 600 s."""
+    if not enforce:
+        return call()
+    deadline = monotonic() + IN_REQUEST_WAIT_SECONDS
+    while True:
+        try:
+            return call()
+        except Problem as refused:
+            if not _waitable(refused):
+                raise
+            error = refused
+        if between is not None:
+            try:
+                between()
+            except Problem as moving:
+                if not _waitable(moving):
+                    raise
+                error = moving if moving.body["error"].get("retry_after_ms") else error
+        delay = error.body["error"].get("retry_after_ms")
+        delay = RESEND_SECONDS if not isinstance(delay, int) or delay <= 0 else delay / 1000
+        if monotonic() + delay > deadline:
+            if isinstance(error, _BeforeAdmission):
+                error.server_following = True
+            raise error
+        _resend_sleep(delay)
 
 
 def _not_admitted(error, request_id):
@@ -179,10 +235,26 @@ EARLIER_VERSION_UNFINISHED = "NATIVE_EARLIER_VERSION_UNFINISHED"
 SOURCE_STALLED = "NATIVE_SOURCE_STALLED"
 
 
+def agent_client(composition, control):
+    """The Foundry client of ``control``'s one server-selected Agent (no session located yet)."""
+    policy = control.policy
+    targets = selected_targets(control.store, composition.config, agent_id=policy.agent_id)
+    if len(targets) != 1 or targets[0].agent_oid != policy.template.agent_oid:
+        raise Problem(403, "NATIVE_STATE_SCOPE", "one original server-selected Agent is required")
+    target = targets[0]
+    clients = [client for client in composition.clients
+               if isinstance(client, FoundryHttpClient) and client.target.executor_id == target.executor_id]
+    if len(clients) != 1:
+        raise Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "the original Foundry transport is unavailable")
+    return clients[0].for_target(target)
+
+
 class NativeTurnGateway:
     def __init__(self, composition, *, enabled):
         self.composition, self.enabled = composition, enabled
         self._prewarmed, self._prewarm_lock = None, Lock()
+        # Calls through this gateway carry its composition (the turn-end hook); class-level callers keep the plain form.
+        self._accounted = partial(NativeTurnGateway._accounted, composition=composition)
 
     def prewarm(self, principal):
         """The owner is typing (README#typing-prewarm): one request to this Agent's current session, which wakes its
@@ -226,15 +298,7 @@ class NativeTurnGateway:
             current = control.installed()
             if current != policy or not current.active or not current.read_enabled:
                 raise Problem(403, "WORK_POLICY_REVOKED", "current original submission rights are required")
-        targets = selected_targets(control.store, self.composition.config, agent_id=policy.agent_id)
-        if len(targets) != 1 or targets[0].agent_oid != policy.template.agent_oid:
-            raise Problem(403, "NATIVE_STATE_SCOPE", "one original server-selected Agent is required")
-        target = targets[0]
-        clients = [client for client in self.composition.clients
-                   if isinstance(client, FoundryHttpClient) and client.target.executor_id == target.executor_id]
-        if len(clients) != 1:
-            raise Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "the original Foundry transport is unavailable")
-        client = clients[0].for_target(target)
+        client = agent_client(self.composition, control)
         if prepared:
             # Image upload and append take this path (cancel and delivery go through ``_turn_context``): they deliver
             # to the Agent's current session, so the selector is read in-request.
@@ -317,23 +381,32 @@ class NativeTurnGateway:
         raise Problem(409, "NATIVE_SESSION_CHANGED", "the original native session differs; no replacement was submitted")
 
     @staticmethod
-    def _accounted(control, result):
+    def _accounted(control, result, composition=None):
+        """Usage of a terminal receipt; with ``composition`` (every call through a gateway), the turn end also hands
+        the Agent to the background cut (``native_cut``), which reads nothing in this request."""
         value, _ = result
         receipt = value.receipt if isinstance(value, NativeTurnStatus) else value
         if isinstance(receipt, NativeReceipt) and receipt.status in {"completed", "unknown", "busy_refused"}:
-            from .behavior_instruction_cost import record_agent_turn_usage
-            record_agent_turn_usage(control, rid=receipt.request_id, usage=receipt.usage)
+            # A busy_refused turn without usage never ran a model; it is not an unknown-usage turn.
+            if receipt.status != "busy_refused" or receipt.usage is not None:
+                from .behavior_instruction_cost import record_agent_turn_usage
+                # A failure surfaces, so each caller's own retry (read again, next routine tick, relay resend)
+                # records the same report; a conflict stays a visible 409.
+                record_agent_turn_usage(control, rid=receipt.request_id, usage=receipt.usage)
+            if composition is not None and receipt.status != "busy_refused":
+                from .native_cut import turn_ended
+                turn_ended(composition, control, receipt)
         return result
 
     @staticmethod
     def _invoke(client, command):
         response = client.invoke_native(command)
-        model = (NativeSessionState if isinstance(command, NativeSessionRead) else
+        model = (NativeSessionState if isinstance(command, (NativeSessionRead, NativeSessionWithdraw)) else
                  NativeFilesView if isinstance(command, NativeSessionFiles) else
                  NativeContinuationView if isinstance(command, NativeContinuationRead) else
                  NativeContinuationReadyReceipt if isinstance(command, NativeContinuationReady) else
                  NativeEnvironmentView if isinstance(command, (NativeSessionFollow, NativeSessionRetarget, NativeSessionFilesOmission,
-                                                               NativeSessionAbandon)) else
+                                                               NativeSessionAbandon, NativeSessionCut)) else
                  NativeUnfinishedSessions if isinstance(command, NativeUnfinishedRead) else
                  NativeSessionPreparation if isinstance(command, NativeSessionPrepare) else
                  NativeConversation if isinstance(command, NativeConversationRead) else
@@ -380,7 +453,7 @@ class NativeTurnGateway:
                 or hasattr(command, "conversation_id") and scope.conversation_id != command.conversation_id
                 or not isinstance(command, (
                     NativeSessionPrepare, NativeSessionFollow, NativeContinuationRead, NativeSessionFilesOmission,
-                    NativeSessionAbandon))
+                    NativeSessionAbandon, NativeSessionWithdraw))
                 and hasattr(command, "request_id") and getattr(scope, "request_id", None) != command.request_id):
             raise Problem(502, "NATIVE_STATE_SCOPE", "the native response belongs to another Agent or request")
         if isinstance(command, NativeContinuationRead) and value.original_request_id != command.request_id:
@@ -667,8 +740,24 @@ class NativeTurnGateway:
             raise Problem(409, "NATIVE_RID_CONFLICT", "the original request ID has different retained input")
         return value, response
 
-    def submit(self, principal, command, *, state_profile=NATIVE_STATE_PROFILE, original=None, response=None,
-               defer=None, owner_notice=False, notice_kinds=False):
+    def submit(self, principal, command, *, original=None, **options):
+        """``_submit``; ADR-0009 2d-i (``FA_NATIVE_SESSION_GUARD_ENFORCE``): a first attempt that meets a switch (a
+        fence, an older follow's ``pending``, a retired or incompatible SID, a stuck admission) is resent in this
+        request (``wait_in_request``), then answered ``server_following`` for the workbench's same-RID resend; never
+        a refusal. Every caller (the owner's routes, group start, Teams) goes through here. Only the first attempt
+        prefetches the conversation (a latency gain); a resend reads it in ``_prepare`` once it is admitted."""
+        from .behavior_native_sessions import native_sessions
+        enforce = original is None and native_sessions(self.composition).guard.enforce
+        attempts = []
+
+        def attempt():
+            attempts.append(1)
+            return self._submit(principal, command, original=original, early=len(attempts) == 1, **options)
+
+        return wait_in_request(attempt, enforce=enforce)
+
+    def _submit(self, principal, command, *, state_profile=NATIVE_STATE_PROFILE, original=None, response=None,
+                defer=None, owner_notice=False, notice_kinds=False, early=True):
         """Owner submit: entry check once, then Hosted's ``rid:<RID>`` create-or-read is the only dedup.
 
         A first attempt does not pre-read the RID. Only when Hosted reports that the RID already names other
@@ -701,31 +790,39 @@ class NativeTurnGateway:
                 # A refused after-reply POST forgets the cached reader as a refused synchronous one did.
                 queue(partial(send, refused=sessions.moved))
         prefetch = (self._prefetch(control, sessions, reader, principal, command, checked_since=started)
-                    if original is None and command.conversation_id is not None else None)
+                    if early and original is None and command.conversation_id is not None else None)
         try:
             with phase_timing("api_submit_session", job_id=timed):
                 client = sessions.current(reader, checked_since=started)
         except Problem as error:
             if error.body["error"]["code"] == "NATIVE_SESSION_CHANGED":
-                # A submit never bootstraps: it follows only an Agent prepared earlier, seen either as prepared state
-                # naming the new version's session (``following_candidate``) or as an existing earlier session.
+                # Without FA_NATIVE_SESSION_GUARD_ENFORCE a submit never bootstraps: it follows only an Agent prepared
+                # earlier, seen either as prepared state naming the new version's session (``following_candidate``) or
+                # as an existing earlier session.
                 # A reconcile of an accepted RID is not marked.
                 if original is not None:
                     raise
                 try:
-                    prepared = sessions.following_candidate is not None or self._prepared_before(sessions, reader)
+                    prepared = sessions.following_candidate is not None or self._prepared_before(
+                        sessions, reader, getattr(error, "located", None))
                 except Problem as unconfirmed:
                     code = unconfirmed.body["error"]["code"]
                     if code == "AGENT_VERSION_FOLLOWING" or (
                             unconfirmed.status == 503 and code == "NATIVE_ENVIRONMENT_UNAVAILABLE"):
-                        # Only another version's session exists, or the session listing could not be read (or the
-                        # selected session is past its bounded page): nothing is invoked or followed from here, and
-                        # the same RID and body are sent again later. It is not "never prepared".
+                        # The selector or the session listing could not be read (or the selected session is past
+                        # its bounded page): nothing is invoked or followed from here, and the same RID and body are
+                        # sent again later. It is not "never prepared".
                         raise _BeforeAdmission(unconfirmed, rid) from None
-                    prepared = False
+                    prepared = None
+                if prepared is False and sessions.guard.enforce:
+                    raise self._bootstrap(principal, reader, sessions, error, rid) from None
                 raise (self._follow_before_admission(principal, reader, sessions, error, rid)
                        if prepared else _BeforeAdmission(error, rid)) from None
             if error.body["error"]["code"] == "AGENT_VERSION_FOLLOWING" and original is None:
+                if sessions.guard.enforce and error.body["error"].get("not_dispatched") is True:
+                    # 2d-i: the zero-call guard refused the Agent's incompatible SID, or a fence step is moving it
+                    # (nothing was sent): the in-request switch runs, as for any refused submit.
+                    raise self._follow_before_admission(principal, reader, sessions, error, rid) from None
                 # The selected version is not this API build's (deploy in progress): nothing is sent or followed here.
                 raise _BeforeAdmission(error, rid) from None
             raise
@@ -774,6 +871,13 @@ class NativeTurnGateway:
                             # Nothing was dispatched: the client sends the same RID and body again (no follow).
                             sessions.forget()
                             raise _BeforeAdmission(conflict, rid, server_following=True) from None
+                    if sessions.guard.enforce and (conflict.status, conflict.body["error"]["code"]) == (
+                            503, "NATIVE_ADMISSION_PENDING"):
+                        # 2d-i: another RID's ``admitting`` kept this one out before rid:<RID> (Hosted's admission
+                        # check). The durable stuck-admission bound runs from here, then the same RID is resent.
+                        sessions.admission_stuck(client, before_send=lambda: self._context(
+                            principal, "submit", prepared=False))
+                        raise _BeforeAdmission(conflict, rid, server_following=True) from None
                     if conflict.body["error"]["code"] != "NATIVE_RID_CONFLICT":
                         # Not resent here; the client's retry of this same RID reads the binding again.
                         sessions.moved(conflict)
@@ -942,30 +1046,54 @@ class NativeTurnGateway:
         row = native_sessions(self.composition)._binding("notice", lambda store: store.read(agent_id))
         return None if row is None else row.notice()
 
-    def _prepared_before(self, sessions, reader):
-        """The selected version's existing session (version reader, else the legacy one) names a preparation.
-
-        Platform metadata finds it and one read-only state read confirms it, as /prepare does; nothing is created,
-        so a never-prepared Agent keeps its original refusal even when a deploy-time follow created a session.
-        A session found only on another version is never invoked: 503 ``AGENT_VERSION_FOLLOWING``."""
-        from .behavior_native_sessions import (
-            _latest_version_reader, _read_platform_session, _require_selected_version,
-        )
+    def _prepared_before(self, sessions, reader, listed=None):
+        """Whether the submit may move this Agent: True with a binding row, or when platform metadata lists a session
+        only on another version (never invoked, never refused: ADR-0009 M2, 2d-i P7; the submit's follow claims the
+        row, or decides the §7a abandon of an incompatible source, from metadata alone). For the selected version's
+        own session (version reader, else the legacy one) one read-only state read says whether it names a
+        preparation, as /prepare does. Nothing is created here: False (no session, or never prepared) keeps the
+        original refusal, unless ``FA_NATIVE_SESSION_GUARD_ENFORCE`` bootstraps it (``_bootstrap``). ``listed``: the
+        (selected version, located target) the locate's claim attempt already listed, reused for that version."""
+        from .behavior_native_sessions import _latest_version_reader, _read_platform_session
 
         if sessions.bound_row(reader) is not None:
             # ADR-0009 §7 phase 2 item 2, done here: an Agent with a binding row was prepared (no session is read).
             return True
         client_id = self.composition.config.identity.managed_identity_client_id
         selected = sessions.desired_version or sessions.selected_version(reader)
-        target = _latest_version_reader(reader, client_id, selected)
+        target = (listed[1] if listed is not None and listed[0] == selected
+                  else _latest_version_reader(reader, client_id, selected))
         if target is None or target.agent_version != selected:
             legacy = _read_platform_session(sessions.candidate(reader))
             if legacy is not None and (target is None or legacy.agent_version == selected):
                 target = legacy
         if target is None:
             return False
-        _require_selected_version(target, selected)
+        if target.agent_version != selected:
+            return True
         return sessions._state(reader.for_target(target)).preparation is not None
+
+    def _bootstrap(self, principal, reader, sessions, refusal, request_id):
+        """ADR-0009 2d-i P7 (``FA_NATIVE_SESSION_GUARD_ENFORCE``): a rowless Agent with no prepared session (none
+        listed, or the selected version's never prepared) gets the selected version's session prepared here, as
+        ``/prepare`` does, instead of a refusal; the same RID and body are then sent again (``server_following``).
+        The prepare RID is derived from the Agent and version, so every resend continues the same preparation."""
+        from .behavior_native_turn_wire import material_digest
+        from .behavior_wire import Command
+
+        version = sessions.desired_version or sessions.selected_version(reader)
+        command = Command(request_id="fa-bootstrap-" + material_digest(
+            {"kind": "fa-submit-bootstrap-v1", "agent": reader.target.agent_id, "version": version})[:48])
+        try:
+            with sessions.lock:
+                # No session names this process's kept preparation any more (``_prepared_before`` found none).
+                sessions.prepared = None
+                sessions.prepare(reader, command,
+                                 before_send=lambda: self._context(principal, "submit", prepared=False))
+        except Problem as failure:
+            return _BeforeAdmission(failure, request_id)
+        logging.getLogger(__name__).warning("NATIVE_SESSION_BOOTSTRAPPED_ON_SUBMIT version=%s", version)
+        return _BeforeAdmission(refusal, request_id, server_following=True)
 
     def _follow_before_admission(self, principal, reader, sessions, refusal, request_id, *, refused_session_id=None):
         """The submit itself moves the Agent to its current version (one bounded ``advance``, like the deploy-time
@@ -980,6 +1108,10 @@ class NativeTurnGateway:
             operation = automatic_environment_command(reader.target, sessions.selected_version(reader))
             view = sessions.advance(reader, operation, before_send=lambda: self._context(principal, "submit", prepared=False))
         except Problem as failure:
+            if sessions.guard.enforce and failure.status not in {401, 403} and _waitable(failure):
+                # 2d-i: the in-request switch is still under way (a fence step, a retired SID's second read, an
+                # unconfirmed switch): the same RID is resent, never refused (M2).
+                return _BeforeAdmission(failure, request_id, server_following=True)
             # The system policy raises an unobservable task as a no-files refusal; no person can override it either.
             if (failure.body["error"].get("files_check") or {}).get("category") != "task_access_denied":
                 return _BeforeAdmission(failure, request_id)
@@ -1053,7 +1185,8 @@ class NativeTurnGateway:
                 previous = None if prefetch is None else prefetch.conversation(client)
                 if previous is None:
                     previous, _ = self._invoke(client, NativeConversationRead(conversation_id=command.conversation_id))
-            if previous.state_profile != state_profile:
+            # ADR-0009 §3: by channel; an H2d image labels the conversations it creates v2, this API sends v1.
+            if channel(previous.state_profile) != channel(state_profile):
                 raise Problem(409, "NATIVE_STATE_SCOPE", "the original CID must keep its selected state profile")
             self._same_session(client, previous)
             if previous.continuation_blocker is not None:
@@ -1065,12 +1198,12 @@ class NativeTurnGateway:
             if capture is None:
                 capture = resolve_capture(control, authority, principal, command, conversation=previous)
         from .behavior_native_responses_api import turn_profile
-        if turn_profile(capture, conversation=previous) != state_profile:
+        if channel(turn_profile(capture, conversation=previous)) != channel(state_profile):
             raise Problem(409, "NATIVE_STATE_SCOPE", "the server-selected template uses another state profile")
         return capture, previous
 
     def _retained(self, control, client, command, original, state_profile, *, response=None, defer=None):
-        if original.state_profile != state_profile:
+        if channel(original.state_profile) != channel(state_profile):
             raise Problem(409, "NATIVE_STATE_SCOPE", "the original RID must keep its selected state profile")
         if original.command != command:
             raise Problem(409, "NATIVE_RID_CONFLICT", "the original request ID has different retained input")
@@ -1125,7 +1258,7 @@ def install_native_turn_routes(app, composition, *, enabled):
     gateway = NativeTurnGateway(composition, enabled=enabled)
     identity = _principal_dependency(composition.verifier)
 
-    async def reply(call, *, read=False, owner=False, background=None):
+    async def reply(call, *, read=False, owner=False, background=None, rid=None):
         """``owner``: the owner's own submit route from a bridge that knows the phase 2c notice kinds; a slot notice
         its receipt carries is cleared by a background task, which Starlette runs only after the whole body was sent
         (``background``: the route's own task list). Without that bridge nothing is cleared, as before phase 2c."""
@@ -1142,12 +1275,15 @@ def install_native_turn_routes(app, composition, *, enabled):
             # Reading again is safe: a lost Table read, or a lost commit of this read's RID-keyed usage entry.
             if (code not in NATIVE_TURN_ERRORS | transport_errors and code not in _SAFE_WORK_ERRORS
                     and (read or code not in _ATTACHED_SOURCE_ERRORS) and not isinstance(error, _BeforeAdmission)
-                    and not (read and code in {"BEHAVIOR_READ_FAILED", "BEHAVIOR_COMMIT_UNKNOWN"})):
+                    and not (read and (code in {"BEHAVIOR_READ_FAILED", "BEHAVIOR_COMMIT_UNKNOWN"}
+                                       or (code == "BEHAVIOR_CONFLICT" and error.status == 412)))):
                 raise
-            logging.getLogger(__name__).warning("NATIVE_TURN_REFUSED code=%s", code)
+            logging.getLogger(__name__).warning("NATIVE_TURN_REFUSED code=%s rid=%s", code,
+                                                timing_id(rid) if rid else "-")
             following = isinstance(error, _BeforeAdmission) and error.server_following
-            # A disabled lane or a retired session does not clear by reading again.
-            retry = (read and error.status >= 500 and code != "NATIVE_TURNS_DISABLED"
+            # A disabled lane or a retired session does not clear by reading again. A 412 is a read that lost its
+            # CAS races (the RID-keyed usage entry): the next read finds the winner's commit. A 409 is a real conflict.
+            retry = (read and (error.status >= 500 or error.status == 412) and code != "NATIVE_TURNS_DISABLED"
                      and not isinstance(error, _RetiredSession))
             return JSONResponse(status_code=error.status, headers={"Cache-Control": "no-store"}, content={"error": {
                 "code": code, "message": (
@@ -1182,8 +1318,8 @@ def install_native_turn_routes(app, composition, *, enabled):
             response.background = tasks
         return response
 
-    async def reply_read(call):
-        return await reply(call, read=True)
+    async def reply_read(call, rid=None):
+        return await reply(call, read=True, rid=rid)
 
     @app.post(PREFIX + "/prepare")
     async def prepare(request: Request, principal=Depends(identity)):
@@ -1293,7 +1429,7 @@ def install_native_turn_routes(app, composition, *, enabled):
         command = await _body(request, InstructionSubmit, max_body_bytes=MAX_SUBMIT_BODY_BYTES)
         known = _knows_notice_kinds(request)
         return await reply(lambda: gateway.submit(principal, command, owner_notice=True, notice_kinds=known),
-                           owner=known)
+                           owner=known, rid=command.request_id)
 
     @app.post(PREFIX + "/prewarm")
     async def prewarm(request: Request, principal=Depends(identity)):
@@ -1309,31 +1445,31 @@ def install_native_turn_routes(app, composition, *, enabled):
     @app.post(PREFIX + "/reconcile")
     async def reconcile(request: Request, principal=Depends(identity)):
         command = await _body(request, InstructionSubmit, max_body_bytes=MAX_SUBMIT_BODY_BYTES)
-        return await reply(lambda: gateway.reconcile(principal, command))
+        return await reply(lambda: gateway.reconcile(principal, command), rid=command.request_id)
 
     @app.post(PREFIX + "/append")
     async def append_turn(request: Request, principal=Depends(identity)):
         command = await _body(request, NativeAppend, max_body_bytes=MAX_SUBMIT_BODY_BYTES)
-        return await reply(lambda: gateway.append(principal, command))
+        return await reply(lambda: gateway.append(principal, command), rid=command.request_id)
 
     @app.get(PREFIX + "/conversations/{conversation_id}/requests/{request_id}/appends/{append_id}")
     async def read_append(conversation_id: str, request_id: str, append_id: str, request: Request,
                           principal=Depends(identity)):
         await read_request(request)
         command = NativeAppendRead(conversation_id=conversation_id, request_id=request_id, append_id=append_id)
-        return await reply_read(lambda: gateway.read(principal, command))
+        return await reply_read(lambda: gateway.read(principal, command), request_id)
 
     @app.get(PREFIX + "/conversations/{conversation_id}/requests/{request_id}/appends")
     async def read_appends(conversation_id: str, request_id: str, request: Request, principal=Depends(identity)):
         await read_request(request)
         command = NativeAppendRead(conversation_id=conversation_id, request_id=request_id)
-        return await reply_read(lambda: gateway.read(principal, command))
+        return await reply_read(lambda: gateway.read(principal, command), request_id)
 
     @app.get(PREFIX + "/conversations/{conversation_id}/requests/{request_id}/progress")
     async def read_progress(conversation_id: str, request_id: str, request: Request, principal=Depends(identity)):
         await read_request(request)
         command = NativeProgressRead(conversation_id=conversation_id, request_id=request_id)
-        return await reply_read(lambda: gateway.read(principal, command))
+        return await reply_read(lambda: gateway.read(principal, command), request_id)
 
     @app.get(PREFIX + "/conversations/{conversation_id}/requests/{request_id}/status")
     async def read_status(conversation_id: str, request_id: str, request: Request, principal=Depends(identity)):
@@ -1343,7 +1479,7 @@ def install_native_turn_routes(app, composition, *, enabled):
             command = NativeTurnStatusRead(conversation_id=conversation_id, request_id=request_id)
         except ValueError:
             raise Problem(422, "NATIVE_REQUEST_INVALID", "one original CID and RID are required") from None
-        return await reply_read(lambda: gateway.read(principal, command))
+        return await reply_read(lambda: gateway.read(principal, command), request_id)
 
     @app.get(PREFIX + "/conversations/{conversation_id}/requests/{request_id}/hitl-reviews")
     async def read_hitl_reviews(
@@ -1370,7 +1506,7 @@ def install_native_turn_routes(app, composition, *, enabled):
         known = _knows_notice_kinds(request)
         response = await reply(lambda: gateway.submit(
             principal, command, state_profile=NATIVE_RESPONSES_PROFILE, defer=after_reply.add_task, owner_notice=True,
-            notice_kinds=known), owner=known, background=after_reply)
+            notice_kinds=known), owner=known, background=after_reply, rid=command.request_id)
         if after_reply.tasks:
             response.background = after_reply
         return response
@@ -1378,12 +1514,12 @@ def install_native_turn_routes(app, composition, *, enabled):
     @app.post(RESPONSES_PREFIX + "/reconcile")
     async def reconcile_response_turn(request: Request, principal=Depends(identity)):
         command = await _body(request, InstructionSubmit, max_body_bytes=MAX_SUBMIT_BODY_BYTES)
-        return await reply(lambda: reconcile_response(gateway, principal, command))
+        return await reply(lambda: reconcile_response(gateway, principal, command), rid=command.request_id)
 
     @app.post(RESPONSES_PREFIX + "/cancel")
     async def cancel_response_turn(request: Request, principal=Depends(identity)):
         command = await _body(request, NativeCancel)
-        return await reply(lambda: cancel_response(gateway, principal, command))
+        return await reply(lambda: cancel_response(gateway, principal, command), rid=command.request_id)
 
     @app.get(RESPONSES_PREFIX + "/conversations/{conversation_id}/history")
     async def stored_conversation_history(
@@ -1413,7 +1549,7 @@ def install_native_turn_routes(app, composition, *, enabled):
             command = NativeRead(request_id=request_id)
         except ValueError:
             raise Problem(422, "NATIVE_REQUEST_INVALID", "one original request ID is required") from None
-        return await reply_read(lambda: gateway.read(principal, command))
+        return await reply_read(lambda: gateway.read(principal, command), request_id)
 
     @app.get(PREFIX + "/requests/{request_id}/continuation")
     async def continuation(request_id: str, request: Request, principal=Depends(identity)):

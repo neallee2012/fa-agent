@@ -33,7 +33,7 @@ from shared_context.native_hitl_wire import (
 from shared_context.native_turns import NativeTurnControl
 from test_instruction_tool_feedback import run_callbacks
 from test_m3_auth import jwk_client, signing_key
-from test_native_hitl import hitl, change, decision, error, inventory, post, proposal, read, create_pending
+from test_native_hitl import hitl, change, decision, error, fail_apply, inventory, post, proposal, read, create_pending
 from test_native_capabilities import selected_capture
 from test_native_turn_wire import submit
 from test_native_turns import IDENTITY, local_env
@@ -493,6 +493,75 @@ def test_restart_closes_old_pending_without_restoring_ram_or_a_second_model_requ
         assert retained.status == "interrupted" and retained.turn_closed
         error(post(hitl, "/decisions", decision(hitl, {
             "pending_id": view.approval.pending_id, "pending_digest": view.approval.pending_digest})), 409)
+    asyncio.run(check())
+
+
+def test_a_lost_end_apply_reaches_the_terminal_task_and_its_rerun_closes_the_card(hitl, tmp_path, monkeypatch):
+    case = setup_gate(hitl, tmp_path)
+
+    async def check():
+        waiting = asyncio.create_task(permit(case))
+        view = await pending_view(case)
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        fail_apply(hitl, monkeypatch, stage=2, after=False)  # /end's intent commits; its apply does not
+        with pytest.raises(Problem) as lost:
+            await NativeHitlRuntime.finish_turn(case.client, case.runtime, case.context.receipt)
+        assert lost.value.status == 503
+        assert not (await case.client.read(view.approval.pending_id)).turn_closed
+        fail_apply(hitl, monkeypatch, stage=1, after=False)
+        await case.gate.close()  # the in-turn close stays best effort; the terminal task is the one that retries
+        await NativeHitlRuntime.finish_turn(case.client, case.runtime, case.context.receipt)
+        retained = await case.client.read(view.approval.pending_id)
+        assert retained.status == "interrupted" and retained.turn_closed
+    asyncio.run(check())
+
+
+def test_a_lost_handoff_end_reaches_the_terminal_task_and_its_rerun_closes_the_card(hitl, tmp_path, monkeypatch):
+    case = setup_gate(hitl, tmp_path)
+
+    async def check():
+        waiting = asyncio.create_task(permit(case))
+        view = await pending_view(case)
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        fail_apply(hitl, monkeypatch, stage=2, after=False)  # /end's intent commits; its apply does not
+        with pytest.raises(Problem) as lost:
+            await NativeHitlRuntime.interrupt_handed_off(case.client, case.context.receipt)
+        assert lost.value.status == 503
+        assert not (await case.client.read(view.approval.pending_id)).turn_closed
+        await NativeHitlRuntime.interrupt_handed_off(case.client, case.context.receipt)
+        retained = await case.client.read(view.approval.pending_id)
+        assert retained.status == "interrupted" and retained.turn_closed
+    asyncio.run(check())
+
+
+def test_a_wait_survives_a_few_failed_first_reads_but_not_endless_ones(hitl, tmp_path):
+    retries = 4  # FIRST_READ_RETRIES, written out so an older runtime fails on the behavior, not on an import
+    case = setup_gate(hitl, tmp_path)
+    calls = []
+
+    def reader(failures, status=503):
+        async def read(identifier):
+            calls.append(identifier)
+            if len(calls) <= failures:
+                raise (Problem(412, "BEHAVIOR_CONFLICT", "OFFLINE owner write raced the read") if status == 412 else
+                       Problem(status, "NATIVE_HITL_AUTHORITY_UNAVAILABLE", "OFFLINE API restart"))
+            return "saved reply"
+        return read
+
+    async def outcome(read):
+        calls.clear()
+        try:
+            return await case.gate._owner_reply(read, "qid", lambda view: view, None)
+        except Problem as error:
+            return error.status
+
+    async def check():
+        for status in (503, 412):
+            assert await outcome(reader(retries, status)) == "saved reply" and len(calls) == retries + 1
+        assert await outcome(reader(retries + 1)) == 503 and len(calls) == retries + 1
+        assert await outcome(reader(1, 403)) == 403 and len(calls) == 1
     asyncio.run(check())
 
 

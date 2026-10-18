@@ -22,7 +22,8 @@ UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-
 
 
 @pytest.fixture(scope="module")
-def compiled(tmp_path_factory):
+def workspace(tmp_path_factory):
+    """Every infra/*.bicep (and the catalog main.bicep loads) copied beside a bicepconfig that names the module cache."""
     compiler = os.environ.get("BICEP_CLI") or shutil.which("bicep")
     assert compiler, "Set BICEP_CLI to the local Bicep executable; these checks never install or deploy"
     work = tmp_path_factory.mktemp("azd")
@@ -35,11 +36,27 @@ def compiled(tmp_path_factory):
     shutil.copyfile(CATALOG, catalog)
     cache = Path(os.environ.get("BICEP_MODULE_CACHE", str(work / "cache"))).resolve()
     (work / "bicepconfig.json").write_text(json.dumps({"cacheRootDirectory": str(cache)}), encoding="utf-8")
-    output = work / "main.json"
-    process = subprocess.run([compiler, "build", str(work / "infra" / "azd" / "main.bicep"), "--outfile", str(output)],
+    return compiler, work
+
+
+def build(workspace, template):
+    compiler, work = workspace
+    output = (work / template).with_suffix(".json")
+    process = subprocess.run([compiler, "build", str(work / template), "--outfile", str(output)],
                              capture_output=True, text=True, encoding="utf-8", timeout=600)
     assert process.returncode == 0, f"{process.stdout}\n{process.stderr}"
     return json.loads(output.read_text(encoding="utf-8"))
+
+
+@pytest.fixture(scope="module")
+def compiled(workspace):
+    return build(workspace, "infra/azd/main.bicep")
+
+
+# Templates azd deploys on their own (deploy/azd/fa_azd.py console_app) or kept beside them; main.bicep never builds them.
+@pytest.mark.parametrize("template", ["infra/web-console/web-console.bicep", "infra/feed-mcp/feed-mcp.bicep"])
+def test_standalone_templates_build(workspace, template):
+    assert build(workspace, template)["resources"]
 
 
 def deployments(template):
@@ -90,6 +107,48 @@ def test_modules_keep_the_standard_flow_order(compiled):
     assert "-backup-role'" in by_suffix["backup-foundation"] and "-foundation'" in by_suffix["backup-foundation"]
     assert "fa-m1-backup-data-read-write-v1" in by_suffix["m3-artifacts"]
     assert by_suffix["onboarding-delegation"].count("enableAgentOnboarding") >= 1
+
+
+def test_plus_onboarding_delegation_is_on_by_default_with_an_opt_out(compiled):
+    # Neal 2026-10-15: a new azd environment creates the #468 delegation; `azd env set FA_ENABLE_AGENT_ONBOARDING
+    # false` skips the module, and the output tells deploy whether to give the API the FA_ONBOARDING_* settings.
+    parameters = json.loads((AZD / "main.parameters.json").read_text(encoding="utf-8"))["parameters"]
+    assert parameters["enableAgentOnboarding"]["value"] == "${FA_ENABLE_AGENT_ONBOARDING=true}"
+    assert compiled["parameters"]["enableAgentOnboarding"]["defaultValue"] is True
+    module = next(resource for name, resource in deployments(compiled).items() if "onboarding-delegation" in name)
+    assert module["condition"] == "[parameters('enableAgentOnboarding')]"
+    # The constrained RBAC Administrator: only Foundry User / OpenAI User, only service principals, no deletes.
+    text = json.dumps(module)
+    for role in ("f58310d9-a9f6-439a-9e8d-f62e7b41a168", "53ca6127-db72-4b80-b1b0-d745d6d5456d",
+                 "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd", "ServicePrincipal", "roleAssignments/delete"):
+        assert role in text, role
+    # The module default keeps stage's deployed description; azd names its own environment instead of "stage".
+    stage_text = "FA #468: stage onboarding may only add Foundry User / OpenAI User for service principals; no deletes"
+    assert module["properties"]["template"]["parameters"]["assignmentDescription"]["defaultValue"] == stage_text
+    passed = module["properties"]["parameters"]["assignmentDescription"]["value"]
+    assert "variables('env')" in passed and "stage" not in passed
+    assert compiled["outputs"]["FA_AGENT_ONBOARDING"]["value"] == "[parameters('enableAgentOnboarding')]"
+
+
+def test_upgrade_snapshot_account_is_opt_in_and_off_by_default(compiled):
+    # Neal 2026-10-17: a dedicated account (never the backup one); the default adds no deployment or resource.
+    parameters = json.loads((AZD / "main.parameters.json").read_text(encoding="utf-8"))["parameters"]
+    assert parameters["deployUpgradeSnapshots"]["value"] == "${FA_DEPLOY_UPGRADE_SNAPSHOTS=false}"
+    assert compiled["parameters"]["deployUpgradeSnapshots"]["defaultValue"] is False
+    (name,) = [name for name in deployments(compiled) if "upgrade-snapshots" in name]
+    module = deployments(compiled)[name]
+    assert module["condition"] == "[parameters('deployUpgradeSnapshots')]"
+    passed = module["properties"]["parameters"]
+    assert passed["deployUpgradeSnapshots"]["value"] == "[parameters('deployUpgradeSnapshots')]"
+    assert passed["storageName"]["value"] == "[variables('names').snapshotStorage]"
+    assert compiled["variables"]["names"]["snapshotStorage"] != compiled["variables"]["names"]["backupStorage"]
+    assert "-backup-foundation'" in json.dumps(module["dependsOn"])
+    # The flag gates only this module; every other deployment is unchanged.
+    gated = [key for key, resource in deployments(compiled).items()
+             if "deployUpgradeSnapshots" in str(resource.get("condition", ""))]
+    assert gated == [name]
+    assert compiled["outputs"]["FA_UPGRADE_SNAPSHOT_CONTAINER_URL"]["value"].startswith(
+        "[if(parameters('deployUpgradeSnapshots'), ")
 
 
 def test_no_identifier_or_other_environment_value_in_the_azd_entry():

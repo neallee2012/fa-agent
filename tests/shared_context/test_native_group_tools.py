@@ -174,9 +174,23 @@ def test_group_publication_failure_never_prevents_the_original_peer_notification
     runtime = native_sdk.native_runtime_from_environment(SimpleNamespace(
         identity=IDENTITY, supervisor=AssistantSupervisor(home / ".fa-assistant-v12", runtime_path=runtime_path),
         api=SimpleNamespace(api_url="https://api.invalid", audience="api://OFFLINE")))
-    callback = runtime.on_completed(SimpleNamespace(), None) if outcome == "completed" else runtime.on_unconfirmed(SimpleNamespace())
+    async def settled(*_args):
+        return None
+
+    monkeypatch.setattr(native_sdk.NativeUsageReporter, "__call__", settled)
+    monkeypatch.setattr(native_sdk.NativeSdkExecutor, "notify_terminal", settled)
+    receipt = SimpleNamespace(status="completed", result=None, request_id="OFFLINE-rid")
+
+    async def callback():
+        if outcome == "completed":
+            # The peer result is sent from the terminal hook, ahead of usage; the group step follows in on_completed.
+            await runtime.on_terminal(receipt)
+            await runtime.on_completed(receipt, None)
+        else:
+            await runtime.on_unconfirmed(SimpleNamespace())
+
     with pytest.raises(Problem) as unknown:
-        asyncio.run(callback)
+        asyncio.run(callback())
     assert unknown.value.body["error"]["code"] == "NATIVE_GROUP_UNKNOWN"
     assert order == ["peer", "group"]
 

@@ -13,8 +13,9 @@ from shared_context.errors import Problem
 from shared_context.native_capabilities import guard_native_tool
 from shared_context.native_hitl_api import install_native_hitl_routes
 from shared_context.native_hitl_wire import (
-    NativeHitlAction, NativeHitlAuthorize, NativeHitlCall, NativeHitlDecision, NativeHitlPendingCreate,
-    NativeHitlPendingQuery, NativeHitlReview, NativeHitlRuleInput, native_hitl_failure_feedback,
+    NativeHitlAction, NativeHitlAuthorize, NativeHitlCall, NativeHitlClose, NativeHitlDecision, NativeHitlEnd,
+    NativeHitlPendingCreate, NativeHitlPendingQuery, NativeHitlReview, NativeHitlRuleInput, NativeHitlTurn,
+    native_hitl_failure_feedback,
 )
 from shared_context.m2_copilot import ToolFailure
 from shared_context.native_routine_proposal_tool import propose_routine_tool
@@ -169,12 +170,26 @@ def test_a_lost_decision_after_the_saved_definition_resends_to_the_same_single_d
     assert definitions(case) == saved and attempts == ["owner-decision", "owner-decision"]
 
 
-@pytest.mark.parametrize("outcome", ["deny", "expired", "allow_rule", "changed_digest", "extra_content"])
+@pytest.mark.parametrize("outcome", ["deny", "expired", "allow_rule", "changed_digest", "extra_content",
+                                     "turn_closed", "interrupted"])
 def test_deny_expiry_a_rule_or_a_changed_body_writes_no_schedule(proposals, outcome):
+    """``turn_closed`` / ``interrupted``: the card's turn ended (or was left on an earlier SID, ADR-0009 gate 6) and its
+    cards were closed as at a normal turn end; an allow then writes no schedule nobody will confirm."""
     case = proposals
     pending = proposed(case)
     if outcome == "expired":
         case.c.h.time += timedelta(seconds=601)
+    if outcome in {"turn_closed", "interrupted"}:
+        call = routine_action(case).call
+        end = NativeHitlEnd(request_id="end-human-seed", turn=NativeHitlTurn(
+            agent_id=call.agent_id, conversation_id=call.conversation_id, request_id=call.request_id))
+        closed = case.client.post(HITL + "/end", json=end.model_dump(mode="json"), headers=case.agent_headers)
+        assert closed.status_code == 200, closed.text
+    if outcome == "interrupted":
+        observed = case.client.post(HITL + "/observations", json=NativeHitlClose(
+            request_id="close-human-seed", pending_id=pending["pending_id"], pending_digest=pending["pending_digest"],
+            status="interrupted").model_dump(mode="json"), headers=case.agent_headers)
+        assert observed.status_code == 200, observed.text
     choice = outcome if outcome in {"deny", "allow_rule"} else "allow_once"
     body = decision_body(case, pending, choice)
     if outcome == "changed_digest":
@@ -184,12 +199,13 @@ def test_deny_expiry_a_rule_or_a_changed_body_writes_no_schedule(proposals, outc
     response = decide(case, pending, body=body)
     expected = {"deny": (200, None), "expired": (410, "NATIVE_HITL_EXPIRED"),
                 "allow_rule": (422, "NATIVE_HITL_INVALID_REQUEST"), "changed_digest": (409, "NATIVE_HITL_ACTION_CHANGED"),
-                "extra_content": (422, None)}[outcome]
+                "extra_content": (422, None), "turn_closed": (409, "NATIVE_HITL_TURN_CLOSED"),
+                "interrupted": (409, "NATIVE_HITL_STATE_CONFLICT")}[outcome]
     assert response.status_code == expected[0], response.text
     if expected[1] is not None:
         assert response.json()["error"]["code"] == expected[1]
     assert definitions(case) == []
-    assert card(case, pending)["status"] == ("deny" if outcome == "deny" else "pending")
+    assert card(case, pending)["status"] == {"deny": "deny", "interrupted": "interrupted"}.get(outcome, "pending")
 
 
 @pytest.mark.parametrize("who", ["agent", "read_only_owner"])

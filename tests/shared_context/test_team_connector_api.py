@@ -406,3 +406,44 @@ def test_arm_oauth2_connection_put_matches_the_p0b_readback_shape_and_never_logs
         "refreshUrl": "https://login.microsoftonline.com/t/oauth2/v2.0/token",
         "scopes": ["api://workiq.svc.cloud.microsoft/WorkIQAgent.Ask", "offline_access"],
         "credentials": {"clientId": APP_ID, "clientSecret": SECRET}, "metadata": {"fa_team": A.team}}}
+
+
+def test_a_failed_grants_read_is_reused_briefly_so_an_outage_waits_once(monkeypatch, connectors):
+    c = connectors
+    clock = [1000.0]
+    monkeypatch.setattr("shared_context.team_connector.monotonic", lambda: clock[0])
+    assert post(c, change(c, "f" * 32)).status_code == 200
+    assert team_grants(c) != {}
+    c.foundry.fail["read"] = 503  # one failed read; an uncached second capture would read again and succeed
+    clock[0] += 31
+    reads = c.foundry.reads
+    assert team_grants(c) != {}, "the last read grants stay offered"
+    assert team_grants(c) != {} and c.foundry.reads == reads + 1
+    clock[0] += 11
+    assert team_grants(c) != {} and c.foundry.reads == reads + 2
+
+
+def test_a_grants_read_that_started_before_a_change_never_stores_its_stale_grants(monkeypatch, connectors):
+    c = connectors
+    assert post(c, change(c, "fa" * 16)).status_code == 200
+    original = c.foundry.read_default_version
+
+    def read_then_disable(name):
+        read = original(name)  # this read still sees the enabled connector; the owner disables it before it stores
+        monkeypatch.setattr(c.foundry, "read_default_version", original)
+        assert post(c, change(c, "fb" * 16, enabled=False, secret=None)).status_code == 200
+        return read
+
+    monkeypatch.setattr(c.foundry, "read_default_version", read_then_disable)
+    assert team_grants(c) != {}
+    assert team_grants(c) == {}, "the disable applies to the next capture, not 30 s later"
+
+
+def test_captures_during_a_failing_read_share_that_one_foundry_read(monkeypatch, connectors):
+    from test_team_mcp_api import concurrent_captures_during_one_slow_failing_read
+    c = connectors
+    assert post(c, change(c, "fc" * 16)).status_code == 200
+    c.runtime.team_connectors.forget(TENANT, A.team)
+    reads, results = concurrent_captures_during_one_slow_failing_read(
+        lambda: team_grants(c), c.foundry, "read_default_version", monkeypatch)
+    assert reads == 1 and results == [{}] * 3

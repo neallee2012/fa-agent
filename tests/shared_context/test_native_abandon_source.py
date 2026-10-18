@@ -28,6 +28,7 @@ from test_native_files_api import (
     synthetic_standing_v1, token,
 )
 from test_native_follow_no_wake import source_calls
+from test_native_hitl import hitl  # noqa: F401
 from test_native_session_prepare_api import project_client
 from test_native_turn_wire import submit
 from test_native_turns import Harness, OfflineSdk
@@ -46,9 +47,10 @@ def binding_rows(monkeypatch):
     return repository
 
 
-def platform(fixture, monkeypatch, *, status=None, profile="foundry-native-v1", idle_timeout=3600):
+def platform(fixture, monkeypatch, *, status=None, profile="foundry-native-v1", idle_timeout=3600, created_at=None):
     """The offline platform: ``status`` (a value or a callable) overrides the source's metadata status
-    ("missing" is 404, "unavailable" a 503); ``profile`` is the source version definition's ``FA_NATIVE_TURNS``."""
+    ("missing" is 404, "unavailable" a 503); ``profile`` is the source version definition's ``FA_NATIVE_TURNS`` and
+    ``created_at`` its ``AgentVersionDetails.created_at`` (None: not reported)."""
     files, source = fixture.files, fixture.source
 
     def get_session(name, sid):
@@ -66,7 +68,8 @@ def platform(fixture, monkeypatch, *, status=None, profile="foundry-native-v1", 
         return files.get_session(name, sid)
 
     def get_version(name, version):
-        return SimpleNamespace(name=name, version=version, definition={
+        created = created_at if version == source.agent_version else None
+        return SimpleNamespace(name=name, version=version, created_at=created, definition={
             "kind": "hosted", "session_configuration": {"idle_timeout_seconds": idle_timeout},
             "environment_variables": {
                 "FA_NATIVE_TURNS": profile if version == source.agent_version else "foundry-native-v1"}})
@@ -79,8 +82,13 @@ def platform(fixture, monkeypatch, *, status=None, profile="foundry-native-v1", 
 
 
 def clock(monkeypatch, start=1000.0):
+    """This process's clock and the durable bounds' wall clock (``_wall``, 2d-i P6) move together."""
+    from datetime import datetime, timedelta, timezone
+
     now = [start]
+    epoch = datetime(2026, 10, 16, tzinfo=timezone.utc)
     monkeypatch.setattr(behavior_native_sessions, "monotonic", lambda: now[0])
+    monkeypatch.setattr(behavior_native_sessions, "_wall", lambda _store: epoch + timedelta(seconds=now[0]))
     return now
 
 
@@ -141,8 +149,8 @@ def read_request(fixture, rid):
     return fixture.case.client.get(PREFIX + "/requests/" + rid, headers=fixture.case.headers)
 
 
-def incompatible_idle(fixture, monkeypatch, status="idle"):
-    platform(fixture, monkeypatch, status=status, profile=OLD_PROFILE)
+def incompatible_idle(fixture, monkeypatch, status="idle", **definition):
+    platform(fixture, monkeypatch, status=status, **{"profile": OLD_PROFILE} | definition)
     fixture.files.stopped.add(fixture.source.session_id)
 
 
@@ -469,8 +477,11 @@ def test_k_an_incompatible_sid_gets_zero_calls_at_every_choke_point(file_api, mo
     responses = FoundryResponsesClient(source, team_id="team-one", conversation_mode="conversation")
     refused(lambda: responses._request("POST", "/responses", body={"agent_session_id": sid, "input": "x"}))
     platform(fixture, monkeypatch, status="active", profile=OLD_PROFILE)
-    entry_point = advance(fixture)  # the automatic follow's own Files read and stop are refused the same way
-    assert entry_point.status_code == 503 and entry_point.json()["error"]["code"] == "AGENT_VERSION_FOLLOWING", entry_point.text
+    # 2d-i P6: the automatic follow entry starts no follow; it switches the incompatible SID by the §7a path at once
+    # (M1 "收斂後還剩的情況"), never calling it.
+    entry_point = advance(fixture)
+    assert entry_point.status_code == 200 and entry_point.json()["state"] == "ready", entry_point.text
+    assert entry_point.json()["hosted_session_id"] == fixture.destination.session_id
     assert source_calls(fixture, since=mark) == ([], [], [])
 
 
@@ -844,6 +855,189 @@ def test_r_a_failed_mark_keeps_waiting_and_never_reaches_the_owner(file_api, mon
     assert raw(fixture, "left-running") == kept and status_of(fixture, "queued-behind") == "accepted"
     now[0] += native_left_receipts.STALL_SECONDS + 1
     assert Harness(fixture.runtime, sdk, fixture.hosted).wait("queued-behind", "completed").turn_number == 2
+
+
+@pytest.mark.parametrize("source", ["stalled", "retired"])
+def test_gate6_a_left_turn_that_can_no_longer_complete_closes_its_cards_once(hitl, file_api, monkeypatch, source):
+    # ``hitl`` first: its API client starts before the standing fixture refuses new sockets.
+    """ADR-0009 gate 6: the cards of a left turn close as at a normal turn end once the new session knows the turn can
+    not complete: at the abandon commit when the source is retired, after the stall mark when it is idle (until then
+    the source may still finish it, so its cards stay live). The question and Connect card refuse a later reply, the
+    undecided approval reads ``interrupted``; a card of a turn of the new session is untouched; a repeat writes
+    nothing new."""
+    from shared_context import native_left_receipts
+    from shared_context.native_hitl_wire import (
+        ConnectorConsent, ConnectorConsentCreate, ConnectorConsentDecision, NativeHitlAction, NativeHitlCall,
+        NativeHitlPendingCreate, NativeHitlReview,
+    )
+    from test_native_hitl import decision, error, post
+    from test_native_hitl_h2 import api_client
+    from test_native_hitl_questions import answer, ask
+    from conftest import A, TENANT
+
+    fixture = file_api
+    agent = fixture.source.agent_id
+    original_scope = hitl.config.agent_scope
+    hitl.config.targets += (SimpleNamespace(agent_id=agent),)
+    hitl.config.agent_scope = lambda identifier: (
+        SimpleNamespace(tenant_id=TENANT, team_id=A.team, identity=A) if identifier == agent
+        else original_scope(identifier))
+    client = api_client(hitl)
+    fixture.runtime.executor.hitl_client = client
+    now = wall_clock(monkeypatch)
+    incompatible_idle(fixture, monkeypatch, status="deleted" if source == "retired" else "idle")
+    cid, kept = left_conversation(fixture, "left-running", "started")
+
+    def call(rid, tool_call_id):
+        return NativeHitlCall(agent_id=agent, conversation_id=cid, request_id=rid, sdk_session_id="sdk-left",
+                              tool_call_id=tool_call_id)
+
+    def question(rid, tool_call_id):
+        command = ask(hitl, call_id=tool_call_id, request_id="create-" + tool_call_id)
+        asked = command.question.model_copy(update={"call": call(rid, tool_call_id)})
+        created = post(hitl, "/questions", command.model_copy(
+            update={"question": asked, "question_digest": asked.sha256}), hitl.agent)
+        assert created.status_code == 200, created.text
+        return created.json()["result"]
+
+    left_question, own_question = question("left-running", "ask-left"), question("own-turn", "ask-own")
+    action = NativeHitlAction(call=call("left-running", "tool-left"), category="shell", tool="shell",
+                              target="synthetic-workspace", arguments={"command": "echo synthetic"})
+    approval = post(hitl, "/pending", NativeHitlPendingCreate(
+        request_id="create-tool-left", action=action, action_digest=action.sha256,
+        review=NativeHitlReview(rules_revision=0, source="default", outcome="ask")), hitl.agent)
+    assert approval.status_code == 200, approval.text
+    consent = ConnectorConsent(
+        call=call("left-running", "connect-left"), need="consent", connector_id="teams",
+        toolbox_name="fa-connector-team-one-teams", server_label="teams_read", step="tools/list",
+        consent_urls=("https://consent.example.test/login?state=x",))
+    connect = post(hitl, "/consents", ConnectorConsentCreate(
+        request_id="create-connect-left", consent=consent, consent_digest=consent.sha256), hitl.agent)
+    assert connect.status_code == 200, connect.text
+
+    def closes():
+        return [path for _method, path, _body in client.observed if path.endswith("/observations")]
+
+    assert_abandoned(advance(fixture), fixture)
+    settle = lambda: fixture.hosted.portal.call(native_left_receipts.settled, fixture.runtime, versioned(raw(
+        fixture, "left-running")))
+    if source == "stalled":
+        # The idle source may still finish its turn: nothing is closed at the commit or before N unchanged minutes.
+        assert settle() is False and closes() == []
+        now[0] += native_left_receipts.STALL_SECONDS + 1
+        assert settle() is True
+        marked = raw(fixture, "left-running")[0]["receipt"]
+        assert (marked["status"], marked["failure_code"]) == ("unknown", "NATIVE_SOURCE_STALLED")
+    else:
+        assert raw(fixture, "left-running") == kept  # closed at the commit; the receipt keeps its bytes
+    drain = lambda: fixture.hosted.portal.call(fixture.runtime.drain_open_removals)  # the close runs beside the read
+    drain()
+    assert closes() == ["/native-hitl/v1/observations"]
+    assert settle() is True
+    drain()
+    assert closes() == ["/native-hitl/v1/observations"]
+    pending = approval.json()["result"]
+    view = hitl.client.get("/native-hitl/v1/pending/" + pending["pending_id"], headers=hitl.headers()).json()
+    assert view["status"] == "interrupted" and view["turn_closed"] is True
+    error(post(hitl, "/decisions", decision(hitl, pending, request_id="allow-late")), 409, "NATIVE_HITL_STATE_CONFLICT")
+    error(post(hitl, "/answers", answer(left_question, request_id="answer-late")), 409, "NATIVE_HITL_TURN_CLOSED")
+    error(post(hitl, "/consent-decisions", ConnectorConsentDecision(
+        request_id="click-late", consent_id=connect.json()["result"]["consent_id"],
+        consent_digest=connect.json()["result"]["consent_digest"], choice="resume"), read_only=True),
+        409, "NATIVE_HITL_TURN_CLOSED")
+    assert post(hitl, "/answers", answer(own_question, request_id="answer-own")).status_code == 200
+
+
+class RecordingHitl:
+    """A HITL client that records each write path and lists no open card; a set ``hold`` keeps each write waiting."""
+
+    def __init__(self):
+        self.writes, self.hold = [], None
+
+    async def write(self, path, _body):
+        if self.hold is not None:
+            await self.hold()
+        self.writes.append(path)
+
+    async def pending(self, _query):
+        return SimpleNamespace(references=(), next_after=None)
+
+
+@pytest.mark.parametrize("source", ["stalled", "retired"])
+def test_gate6_closing_a_left_turns_cards_never_delays_admission_or_a_status_read(file_api, monkeypatch, source):
+    """Neal: no extra latency on the send path. The abandon admission and each status read that finds a left turn
+    unable to complete answer while its card close still waits on the API; repeated reads start no second close."""
+    import asyncio
+    import contextlib
+    from shared_context import native_left_receipts
+
+    fixture = file_api
+    now = wall_clock(monkeypatch)
+    incompatible_idle(fixture, monkeypatch, status="deleted" if source == "retired" else "idle")
+    left_conversation(fixture, "left-running", "started")
+    client, release = RecordingHitl(), asyncio.Event()
+
+    async def held():
+        with contextlib.suppress(asyncio.TimeoutError):  # a close awaited inline waits out this bound
+            await asyncio.wait_for(release.wait(), 5)
+
+    async def let_go():
+        release.set()
+
+    client.hold = held
+    fixture.runtime.executor.hitl_client = client
+    assert_abandoned(advance(fixture), fixture)
+    settle = lambda: fixture.hosted.portal.call(native_left_receipts.settled, fixture.runtime, versioned(raw(
+        fixture, "left-running")))
+    if source == "stalled":
+        assert settle() is False
+        now[0] += native_left_receipts.STALL_SECONDS + 1
+    for _ in range(3):
+        assert settle() is True
+    assert client.writes == []  # every read answered while the close still waits
+    fixture.hosted.portal.call(let_go)
+    fixture.hosted.portal.call(fixture.runtime.drain_open_removals)
+    assert client.writes == ["/end"]
+
+
+@pytest.mark.parametrize("source_end", ["completed", "unknown"])
+def test_gate6_a_left_turn_the_source_ends_itself_keeps_its_cards(file_api, monkeypatch, source_end):
+    """ADR-0009 gate 6: only this session's own stall mark (``unknown`` / ``NATIVE_SOURCE_STALLED``) closes the cards.
+    When the source completes its turn, or ends it ``unknown`` itself (a recovery handoff), in the instant before the
+    mark, the read-back is the source's terminal receipt and its recorded allows stay for the continuation."""
+    from shared_context import native_left_receipts
+    from test_native_turns import sdk_result
+
+    fixture = file_api
+    now = wall_clock(monkeypatch)
+    incompatible_idle(fixture, monkeypatch)
+    cid = fixture.saved.conversation_id
+    base = conversation_meta(fixture, cid)
+    _, kept = left_conversation(fixture, "left-running", "started", cid=cid, n=2,
+                                base=turn_checkpoint(fixture, cid, base.n))
+    allocated = conversation_meta(fixture, cid)
+    client = RecordingHitl()
+    fixture.runtime.executor.hitl_client = client
+    assert_abandoned(advance(fixture), fixture)
+    settle = lambda: fixture.hosted.portal.call(native_left_receipts.settled, fixture.runtime, versioned(raw(
+        fixture, "left-running")))
+    assert settle() is False
+    marking = fixture.runtime._unknown
+
+    async def source_ends_first(original, code, **values):
+        if source_end == "completed":
+            await fixture.original._save_turn(
+                versioned(kept), allocated, sdk_result(fixture.original._scope(allocated), "The left answer"))
+        else:
+            await fixture.original._unknown(versioned(kept), "NATIVE_TURN_CANCELLED")
+        return await marking(original, code, **values)
+
+    monkeypatch.setattr(fixture.runtime, "_unknown", source_ends_first)
+    now[0] += native_left_receipts.STALL_SECONDS + 1
+    assert settle() is True
+    fixture.hosted.portal.call(fixture.runtime.drain_open_removals)
+    assert raw(fixture, "left-running")[0]["receipt"]["status"] == source_end
+    assert client.writes == []
 
 
 def test_r_a_left_turn_the_source_finishes_lets_the_queued_message_continue_from_its_checkpoint(file_api, monkeypatch):
@@ -1358,6 +1552,83 @@ def test_m9_a_never_started_receipt_the_adoption_read_missed_is_adopted_when_rea
     assert [rid for rid, *_ in seen] == ["missed-by-the-scan"]
 
 
+def test_9_a_never_started_receipt_refused_by_version_is_not_adopted_and_reads_final(file_api, monkeypatch):
+    """ADR-0009 §9: a RID refused by version (``refused:<RID>``) already reads "請用新訊息再送一次", so the new SID never
+    adopts and runs it as well (M9 would do the work twice); it keeps its SID and reads final."""
+    from shared_context.native_markers import EARLIER_VERSION_UNFINISHED
+
+    fixture = file_api
+    incompatible_idle(fixture, monkeypatch)
+    assert_abandoned(advance(fixture), fixture)
+    sdk, seen = tracked(fixture)
+    seed(fixture, "refused-by-version", "accepted")
+    harness = Harness(fixture.runtime, sdk, fixture.hosted)
+    harness.call(fixture.runtime._mark_refused, SimpleNamespace(request_id="refused-by-version", execution_version="1"))
+    read = read_request(fixture, "refused-by-version").json()
+    assert (read["hosted_session_id"], read["status"], read["failure_code"], read["environment_notice"]) == (
+        fixture.source.session_id, "unknown", EARLIER_VERSION_UNFINISHED, {"kind": "earlier_version_unfinished"}), read
+    stored = harness.call(fixture.runtime._rid, "refused-by-version").value
+    assert (stored.receipt.status, stored.receipt.hosted_session_id, stored.adopted_from) == (
+        "accepted", fixture.source.session_id, None)
+    assert seen == []
+
+
+def test_9_an_adopted_receipt_its_chain_refuses_by_version_reads_final_not_queued_forever(file_api, monkeypatch):
+    """Review P1 on #889: M9 adopts a RID and puts it on the chain, the VM drifts before the chain takes it, and the chain
+    refuses it (``refused:<RID>``, out of its queue). Nothing starts it again, so it must read final like any other
+    refused RID, not ``accepted`` forever."""
+    from azure.ai.agentserver.core.tasks import TaskContext
+
+    from shared_context import native_left_receipts
+
+    async def not_dispatched_yet(_runtime, _adopted):
+        return None
+
+    fixture = file_api
+    monkeypatch.setattr(native_left_receipts, "_dispatch_adopted", not_dispatched_yet)
+    incompatible_idle(fixture, monkeypatch)
+    assert_abandoned(advance(fixture), fixture)
+    sdk, seen = tracked(fixture)
+    seed(fixture, "adopted-then-refused", "accepted")
+    harness = Harness(fixture.runtime, sdk, fixture.hosted)
+    first = read_request(fixture, "adopted-then-refused").json()
+    assert (first["hosted_session_id"], first["status"]) == (fixture.destination.session_id, "accepted"), first
+    adopted = harness.call(fixture.runtime._rid, "adopted-then-refused")
+    assert adopted.value.adopted_from == fixture.source.session_id
+    binding, _ = harness.call(fixture.runtime._agent_record)
+    ctx = TaskContext(task_id=binding.task_id, session_id=fixture.destination.session_id,
+                      input_id="adopted-then-refused", entry_mode="fresh", input=NativeTaskInput(
+                          request_id="adopted-then-refused", accepted_etag=adopted.etag,
+                          call_id=adopted.value.call_id, execution_version="1"))
+    with pytest.raises(Problem) as refused:
+        harness.call(fixture.runtime.handle_turn, ctx)
+    assert refused.value.body["error"]["code"] == "NATIVE_SESSION_CHANGED"
+    earlier_unfinished(read_request(fixture, "adopted-then-refused"))
+    assert harness.call(fixture.runtime._rid, "adopted-then-refused") == adopted and seen == []
+
+
+def test_9_a_markers_store_the_new_session_cached_as_missing_never_lets_it_adopt_a_refused_rid(file_api, monkeypatch):
+    """Review P3 on #889: the new session's health check cached the markers store as missing before the old session
+    wrote its first refusal (the old session's own process creates the store); ``adopt`` looks again instead of
+    trusting that miss, so the refused RID is neither adopted nor run, and reads final."""
+    from shared_context.native_markers import MARKERS_STORE
+
+    fixture = file_api
+    incompatible_idle(fixture, monkeypatch)
+    assert_abandoned(advance(fixture), fixture)
+    sdk, seen = tracked(fixture)
+    seed(fixture, "refused-by-the-old-session", "accepted")
+    harness = Harness(fixture.runtime, sdk, fixture.hosted)
+    assert harness.call(fixture.runtime._recent_crashes) == ()
+    assert MARKERS_STORE in fixture.runtime._clients.missing
+    harness.call(fixture.original._mark_refused,
+                 SimpleNamespace(request_id="refused-by-the-old-session", execution_version="1"))
+    earlier_unfinished(read_request(fixture, "refused-by-the-old-session"))
+    stored = harness.call(fixture.runtime._rid, "refused-by-the-old-session").value
+    assert (stored.receipt.hosted_session_id, stored.adopted_from) == (fixture.source.session_id, None)
+    assert seen == []
+
+
 @pytest.fixture(scope="module")
 def release_28():
     """The native turn runtime of release 28 (``daa822dd``, the last image before phase 2b: what an abandoned v1
@@ -1633,7 +1904,7 @@ def test_s_a_teams_message_is_sent_once_after_the_relay_stops_polling_and_its_re
     # The final reply (read path) also tells the owner the Agent moved without its work files (ADR-0009 §8); this
     # direct call writes no HTTP response, so the slot stays pending for the relay route to clear after writing.
     assert later.state == "done" and later.text == (
-        "Complete public answer\n\n已換到新版環境；這次沒有搬工作檔，舊環境與檔案都保留。"), later
+        "Complete public answer\n\n已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。"), later
     assert later.environment_notice.kind == "environment_switched_without_files"
     assert len(posts_of(fixture, message.text)) == 1
 

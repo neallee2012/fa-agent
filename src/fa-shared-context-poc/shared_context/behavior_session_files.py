@@ -12,7 +12,7 @@ from azure.core.exceptions import AzureError
 from .errors import Problem
 from .native_files_wire import (
     FILES_PROFILE, MAX_FILE_BYTES, WORKSPACE_ROOT,
-    NativeFilesPage, NativeSessionFiles, listing_directories, relative_path, staging_relative_path,
+    NativeFilesPage, NativeSessionFiles, listing_children, listing_directories, relative_path, staging_relative_path,
 )
 
 MAX_FILE_STEPS = 16
@@ -29,6 +29,16 @@ def _failure(error, *, write=False):
     return Problem(status if denied else 503,
                    "NATIVE_FILES_ACCESS_DENIED" if denied else "NATIVE_FILES_UNKNOWN",
                    "the original Session Files operation is unconfirmed; do not upload again")
+
+
+def _manifest_page(manifest, listing):
+    """The next ``list_stopped`` page, from the manifest instead of a Files call on the stopped source. shortcut: only
+    satisfies the H2d image's stopped-listing gate (the active source's ``list_source`` and in-container
+    ``verify_source`` already matched this manifest); drop with the Hosted change that stops requiring it."""
+    left = sorted(listing_children(manifest, listing_directories(manifest)[listing.directory]) - set(listing.seen))
+    paths = tuple(left[:100])
+    return NativeFilesPage(directory=listing.directory, after=listing.after, paths=paths,
+                           next_after="fa-%d" % (len(listing.seen) + len(paths)) if len(left) > 100 else None)
 
 
 class SessionFiles:
@@ -56,8 +66,10 @@ class SessionFiles:
         with self._project(sid) as agents:
             stream = agents.download_session_file(self.client.target.agent_name, sid, path=path)
             for chunk in stream:
-                if (not isinstance(chunk, bytes) or monotonic() > deadline
-                        or len(raw) + len(chunk) > min(entry.byte_length, MAX_FILE_BYTES)):
+                if monotonic() > deadline:
+                    # Slow, not different: a later step downloads it again.
+                    raise Problem(503, "NATIVE_FILES_TIMEOUT", "the original file stream ran past its step deadline")
+                if not isinstance(chunk, bytes) or len(raw) + len(chunk) > min(entry.byte_length, MAX_FILE_BYTES):
                     raise Problem(409, "NATIVE_FILES_CONFLICT", "the original file stream differs or exceeds its bound")
                 raw.extend(chunk)
         if len(raw) != entry.byte_length or hashlib.sha256(raw).hexdigest() != entry.sha256:
@@ -68,6 +80,18 @@ class SessionFiles:
         # The fixed 2.3.0 synchronous API takes bytes; a missing ACK never authorizes another PUT.
         with self._project(sid) as agents:
             agents.upload_session_file(self.client.target.agent_name, sid, data, path=path)
+
+    def has_files(self, sid):
+        """ADR-0009 M1 2d-i step 2: the workspace root of ``sid`` (an active source) lists anything; a missing root
+        has none. Read only, one page."""
+        from azure.core.exceptions import ResourceNotFoundError
+        with self._project(sid) as agents:
+            try:
+                pages = agents.list_session_files(self.client.target.agent_name, sid, path=WORKSPACE_ROOT,
+                                                  limit=100).by_page()
+                return any(True for _ in next(pages, ()))
+            except ResourceNotFoundError:
+                return False
 
     def list_page(self, manifest, listing):
         expected = {entry.path: entry for entry in manifest.entries}
@@ -105,9 +129,12 @@ class SessionFiles:
 
 
 class FollowFiles:
-    def __init__(self, destination, view, before_send):
+    def __init__(self, destination, view, before_send, *, source_version=None):
+        """``source_version``: the version FA recorded for the source SID (its binding row's observed version, so a
+        recorded drift is the same source); the view's own (the version it was created on) by default."""
         from .behavior_native_turn_api import NativeTurnGateway
         self.destination, self.view, self.before_send = destination, view, before_send
+        self.source_version = view.previous_agent_version if source_version is None else source_version
         self.invoke = NativeTurnGateway._invoke
         self.transport = SessionFiles(destination)
         self.scope = dict(
@@ -130,25 +157,25 @@ class FollowFiles:
             raise Problem(409, "NATIVE_FILES_UNSUPPORTED", "the original FA binding has no verified source helper; no source was invoked")
         client = self.destination.for_target(_target(
             self.destination.target, session_id=self.view.previous_hosted_session_id,
-            agent_version=self.view.previous_agent_version))
+            agent_version=self.source_version))
         actual = _session_metadata(client)
         # ADR-0009 §10: only an `active` source may be called. Invoking an `idle` (compute-reclaimed) session makes the
         # platform re-create it, possibly bound to another version, before any FA code runs.
         if actual is None or actual.status != "active":
             raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE",
                           "the original source is not active; it was not woken for a file snapshot")
-        if actual.version_indicator.agent_version != self.view.previous_agent_version:
+        if actual.version_indicator.agent_version != self.source_version:
             raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE", "the source version differs from its FA binding; no source was invoked")
         return client
 
     def require_source_version(self, *, active=True):
-        """Metadata only. ``active=False`` only checks the version; reads still need FA's recorded stop."""
+        """Metadata only. ``active=False`` only checks the version (today's follow outside a fence, before its stop)."""
         from .behavior_native_sessions import _session_metadata, _target
         source = self.destination.for_target(_target(
             self.destination.target, session_id=self.view.previous_hosted_session_id,
-            agent_version=self.view.previous_agent_version))
+            agent_version=self.source_version))
         metadata = _session_metadata(source)
-        if (metadata is None or metadata.version_indicator.agent_version != self.view.previous_agent_version
+        if (metadata is None or metadata.version_indicator.agent_version != self.source_version
                 or active and metadata.status != "active"):
             raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE",
                           "the original source is not active on its version; no source file read or stop was sent")
@@ -208,12 +235,16 @@ class FollowFiles:
             listing = getattr(files, field)
             if listing.complete or monotonic() > deadline:
                 break
-            page = self.transport.list_page(files.manifest, listing)
+            page = (_manifest_page(files.manifest, listing) if stopped
+                    else self.transport.list_page(files.manifest, listing))
             files = self.step("list_stopped" if stopped else "list_source", page=page).progress
         return files
 
     def before_stop(self):
-        """Verify an active source before FA stops it; True when FA's own accepted stop is already recorded."""
+        """Verify an active source before FA stops it; True when FA's own accepted stop is already recorded. This
+        in-container ``verify_source`` (every entry re-hashed against the manifest) is the copy's last read of the
+        source: after the stop no Files call reaches it (dev 2026-10-16, ADR-0009 §10 check ②: a Files GET woke a
+        stopped session, on another version)."""
         files = self.step("read").progress
         if files is None or not files.source_verified:
             raise Problem(409, "NATIVE_FILES_UNAVAILABLE", "the original workspace has not been verified")
@@ -228,12 +259,14 @@ class FollowFiles:
         self.step("stop")
 
     def stopped_step(self):
-        self.require_source_version(active=False)
+        """After FA's recorded stop: only the destination's step records, so it publishes from its verified staging.
+        No Files call, source helper or version check reaches the stopped source; Hosted checks it inactive at each
+        step (a source woken meanwhile refuses with 409 NATIVE_FILES_UNAVAILABLE; a fence's next pass stops it
+        again)."""
         files = self.step("read").progress
         if files is None or not files.source_verified:
             raise Problem(409, "NATIVE_FILES_UNAVAILABLE", "the original transfer has not been verified")
         if not files.stop_started:
-            # ADR-0009 §10 exception: an inactive source's files are read only after FA's own recorded stop.
             raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE",
                           "the original source was not stopped by FA; its files are not read")
         if files.source_stopped_verified:
@@ -242,11 +275,7 @@ class FollowFiles:
         for _ in range(MAX_FILE_STEPS):
             if files.stopped_index == len(files.manifest.entries) or monotonic() > deadline:
                 break
-            index, manifest = files.stopped_index, files.manifest
-            entry = manifest.entries[index]
-            if entry.kind == "file":
-                self.transport.download(manifest.source_session_id, WORKSPACE_ROOT + "/" + entry.path, entry)
-            files = self.step("source_stopped", index=index).progress
+            files = self.step("source_stopped", index=files.stopped_index).progress
         if files.stopped_index != len(files.manifest.entries):
             return False
         files = self._listing(files, stopped=True)

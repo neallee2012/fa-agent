@@ -272,6 +272,46 @@ def test_large_original_card_uses_existing_packed_readback_without_a_second_sche
     assert returned.json()["pending"]["command"]["action"]["arguments"] == action.arguments
 
 
+@pytest.mark.parametrize("failure", [
+    (410, "AGENT_RETIRED", "resolve_agent"), (409, "NATIVE_HITL_RECORD_INVALID", "read"),
+    (503, "BEHAVIOR_READ_FAILED", "read"),
+])
+def test_one_unreadable_card_is_skipped_but_an_outage_still_fails_the_page(attention, monkeypatch, failure):
+    status, code, step = failure
+    c = attention
+    service = c.app.state.native_hitl
+    _bad, bad = pending(c, "native-a", c.agent, "rid-a")
+    _good, good = pending(c, "native-b", c.other_agent, "rid-b")
+    original = getattr(service, step)
+
+    def broken(*args):
+        if args[-1] in {"native-a", bad["pending_id"]}:  # resolve_agent(agent_id) or read(principal, pending_id)
+            raise Problem(status, code, "OFFLINE one bad card")
+        return original(*args)
+    monkeypatch.setattr(service, step, broken)
+    if status >= 500:
+        response = c.client.get(PATH, headers=c.headers())
+        assert response.status_code == 503 and "items" not in response.json()
+    else:
+        assert [entry["item"]["item_id"] for entry in collect(c)] == [good["pending_id"]]
+
+
+def test_a_card_of_another_team_fails_the_page_instead_of_being_skipped(attention, monkeypatch):
+    c = attention
+    service = c.app.state.native_hitl
+    pending(c, "native-a", c.agent, "rid-a")
+    pending(c, "native-b", c.other_agent, "rid-b")
+    original = service.resolve_agent
+
+    def foreign(agent_id):
+        scope = original(agent_id)
+        return SimpleNamespace(tenant_id=scope.tenant_id, team_id="team-other") if agent_id == "native-a" else scope
+    monkeypatch.setattr(service, "resolve_agent", foreign)
+    response = c.client.get(PATH, headers=c.headers())
+    assert response.status_code == 403 and "items" not in response.json()
+    assert response.json()["error"]["code"] == "NATIVE_HITL_SCOPE_DENIED"
+
+
 def test_discovery_failure_is_not_an_empty_success(attention, monkeypatch):
     from azure.core.exceptions import ServiceRequestError
 

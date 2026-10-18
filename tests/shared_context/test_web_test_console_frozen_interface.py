@@ -236,7 +236,7 @@ def test_frozen_http_table_two_turns_cold_archive_original_text_model_and_repeat
 def test_frozen_examples_and_public_progress_dto_match_exact_not_private_shapes():
     root=Path(os.environ.get("FA_UI_INTERFACE_ART",FIXTURES))
     raw=(root/"interface-producer-examples.json").read_bytes()
-    assert sha(raw)=="06435bdcb78e9b51ba75fbd58e7f527aece24d3c53fe76741736a3b2f77a43f7"
+    assert sha(raw)=="e3d361a654c40172fb14cc65b4886083999049abaec016697e77ca675aacdf9f"
     examples=json.loads(raw)
     command=aw.InstructionSubmit.model_validate_json(canonical(examples["first_command"]))
     assert sha(command.model_dump_json().encode())==examples["preflight"]["submit_body_sha256"]

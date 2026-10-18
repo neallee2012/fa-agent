@@ -56,6 +56,8 @@ _REFUSED_BEFORE_EFFECT = {
 _APPROVAL_WRITE_FAILED = frozenset({"BEHAVIOR_CONFLICT", "BEHAVIOR_COMMIT_UNKNOWN"})
 # An interactive wait can last hours; after the first minute the person is away, so read less often.
 SLOW_POLL_AFTER = timedelta(seconds=60)
+# Before a wait's first readback there is no deadline yet: this many doubling retries (0.25 s .. 2 s by default).
+FIRST_READ_RETRIES = 4
 
 _AUTHORITY_WRITE_OPERATIONS = {
     "/rules": "rules_write", "/pending": "pending_create", "/decisions": "decision_write",
@@ -751,16 +753,19 @@ class NativeHitlRuntime:
     async def _owner_reply(self, read, identifier, settled, expires_at):
         """Read one saved wait until ``settled`` returns its value or raises. Only a GET: the owner's own reply can race
         it (412) or a read can fail transiently, so it is read again until the original deadline and a saved reply is
-        never dropped; nothing is resubmitted."""
-        deadline, since = None, self.clock()
+        never dropped; nothing is resubmitted. Before the first view gives the deadline, a few short retries only."""
+        deadline, since, early = None, self.clock(), 0
         while True:
+            delay = self._poll_delay(since)
             try:
                 view = await read(identifier)
             except Problem as error:
                 retry = error.status >= 500 or error.body["error"]["code"] == "BEHAVIOR_CONFLICT"
-                if not retry or deadline is None:
+                if not retry or deadline is None and early >= FIRST_READ_RETRIES:
                     raise
-                if self.clock() >= deadline:
+                if deadline is None:
+                    delay, early = self.poll_seconds * 2 ** early, early + 1
+                elif self.clock() >= deadline:
                     raise Problem(410, "NATIVE_HITL_EXPIRED", "the original wait ended without the owner's reply")
                 view = None
             if view is not None:
@@ -769,7 +774,7 @@ class NativeHitlRuntime:
                     return value
                 deadline = expires_at(view)
             await self._active()
-            await asyncio.sleep(self._poll_delay(since))
+            await asyncio.sleep(delay)
 
     def observe(self, event):
         if (event.get("type") != "tool.execution_complete"
@@ -832,12 +837,21 @@ class NativeHitlRuntime:
             # Nothing was opened for review in this turn, so nothing can be pending. The terminal notification
             # (notify_terminal) still ends the turn once, after the result is saved, off the reply's path.
             return
-        await self.finish_turn(self.client, self.context.runtime, self.context.receipt)
+        try:
+            await self.finish_turn(self.client, self.context.runtime, self.context.receipt)
+        except Problem:
+            pass  # logged in finish_turn; never fails the turn, and notify_terminal ends it again with retries
+
+    @staticmethod
+    def _end(receipt):
+        """The turn's one ``/end``: its ID is fixed per turn, so every later write of it replays the first."""
+        turn = NativeHitlTurn(agent_id=receipt.agent_id, conversation_id=receipt.conversation_id, request_id=receipt.request_id)
+        return turn, NativeHitlEnd(
+            request_id=material_digest({"kind": "hitl-end", "turn": turn.model_dump(mode="json")}), turn=turn)
 
     @staticmethod
     async def finish_turn(client, runtime, receipt):
-        turn = NativeHitlTurn(agent_id=receipt.agent_id, conversation_id=receipt.conversation_id, request_id=receipt.request_id)
-        end = NativeHitlEnd(request_id=material_digest({"kind": "hitl-end", "turn": turn.model_dump(mode="json")}), turn=turn)
+        turn, end = NativeHitlRuntime._end(receipt)
         try:
             await client.write("/end", end)
             after = 0
@@ -867,16 +881,21 @@ class NativeHitlRuntime:
                 after = page.next_after
         except Problem as error:
             _log.warning("NATIVE_HITL_TURN_CLOSE_UNCONFIRMED code=%s", error.body["error"]["code"])
+            if error.status >= 500 or error.body["error"]["code"] == "BEHAVIOR_CONFLICT":
+                raise  # unconfirmed or raced: the terminal notification task reruns it; the fixed IDs re-apply once
 
     @staticmethod
     async def interrupt_handed_off(client, receipt):
         """A continuation took over this turn: its undecided cards can no longer be acted on, so close them.
 
-        Only ``pending`` cards close; a human's recorded choice stays for the continuation to read. The close ID is
-        fixed per card, so a rerun reconciles the same write or skips a card that is already closed.
+        The turn's ``/end`` closes its questions and Connect cards too (a later reply is refused with
+        ``NATIVE_HITL_TURN_CLOSED`` instead of being saved and never read). Only ``pending`` approvals change; a
+        human's recorded choice stays for the continuation to read. The close IDs are fixed per turn and card, so a
+        rerun reconciles the same writes or skips a card that is already closed.
         """
-        turn = NativeHitlTurn(agent_id=receipt.agent_id, conversation_id=receipt.conversation_id, request_id=receipt.request_id)
+        turn, end = NativeHitlRuntime._end(receipt)
         try:
+            await client.write("/end", end)
             after = 0
             while True:
                 page = await client.pending(NativeHitlPendingQuery(turn=turn, after=after))
@@ -893,3 +912,5 @@ class NativeHitlRuntime:
                 after = page.next_after
         except Problem as error:
             _log.warning("NATIVE_HITL_HANDOFF_CLOSE_UNCONFIRMED code=%s", error.body["error"]["code"])
+            if error.status >= 500 or error.body["error"]["code"] == "BEHAVIOR_CONFLICT":
+                raise  # as in finish_turn: the terminal notification reruns it and skips cards no longer pending

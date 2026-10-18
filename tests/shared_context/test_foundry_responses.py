@@ -47,7 +47,7 @@ def test_stored_background_request_keeps_exact_headers_and_body_session(mode, pr
         }
         assert {key: value for key, value in request.headers.items() if key.startswith("x-")} == {
             "x-client-fa-rid": "original-rid", "x-client-fa-cid": "conv-original",
-            "x-client-fa-submit-digest": "a" * 64,
+            "x-client-fa-submit-digest": "a" * 64, "x-client-fa-expected-version": TARGET.agent_version,
         }
         assert request.headers["Authorization"] == "Bearer synthetic-test-token-never-persist"
         assert "extra_body" not in json.loads(request.content)

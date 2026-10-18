@@ -46,7 +46,8 @@ def update_service(sent, *, status=202, body=None):
 
 
 def human(rid="rid-1"):
-    return SimpleNamespace(source=None, status="completed", request_id=rid, command=SimpleNamespace(content="hi"))
+    return SimpleNamespace(source=None, human_origin=True, status="completed", request_id=rid,
+                           command=SimpleNamespace(content="hi"))
 
 
 def private(sent, **kwargs):
@@ -146,8 +147,8 @@ def test_team_notes_are_labeled_historical_and_newest_first(local_env):
         {"memory_id": "old", "content": "[agent-a, 2026-10-01] deploy on Friday", "updated_at": OCT_1},
         {"memory_id": "new", "content": "[agent-b, 2026-10-02] deploy on Monday instead", "updated_at": OCT_2},
     ]), "OFFLINE-agent")
-    receipt = SimpleNamespace(source=None, command=SimpleNamespace(content="when do we deploy"), capture=SimpleNamespace(
-        team_memory=TeamMemoryCapture(scope=team_memory_scope("OFFLINE-tenant", "OFFLINE-team"))))
+    receipt = SimpleNamespace(source=None, human_origin=True, command=SimpleNamespace(content="when do we deploy"),
+                              capture=SimpleNamespace(team_memory=TeamMemoryCapture(scope=team_memory_scope("OFFLINE-tenant", "OFFLINE-team"))))
     recalled = asyncio.run(memories.recall(receipt))
     assert list(recalled) == ["note:new [agent-b, 2026-10-02] deploy on Monday instead",
                               "note:old [agent-a, 2026-10-01] deploy on Friday"]
@@ -169,8 +170,8 @@ def seed_previous_turn(previous_update_id="upd_prev"):
 
 
 def second_turn():
-    return SimpleNamespace(source=None, status="completed", request_id="rid-2", conversation_id="cid-1",
-                           turn_number=2, command=SimpleNamespace(content="更正：其實叫小霧"))
+    return SimpleNamespace(source=None, human_origin=True, status="completed", request_id="rid-2",
+                           conversation_id="cid-1", turn_number=2, command=SimpleNamespace(content="更正：其實叫小霧"))
 
 
 def chain_service(sent, *, chained_status=202):
@@ -249,7 +250,7 @@ def test_the_update_carries_the_saved_final_reply_bounded_and_only_once(local_en
     receipt = SimpleNamespace(**{**vars(human()), "conversation_id": "cid-1"})
     asyncio.run(memories.completed(receipt, reader))
     asyncio.run(memories.completed(receipt, reader))  # a retried post-turn hook reads and sends nothing
-    agent = SimpleNamespace(**{**vars(receipt), "source": object(), "request_id": "rid-2"})
+    agent = SimpleNamespace(**{**vars(receipt), "source": object(), "human_origin": False, "request_id": "rid-2"})
     asyncio.run(memories.completed(agent, reader))
     assert len(sent) == 1 and reader.read == [("cid-1", "rid-1", 0), ("cid-1", "rid-1", 1)]
     items = json.loads(sent[0].content)["items"]
