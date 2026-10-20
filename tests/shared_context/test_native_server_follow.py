@@ -5,13 +5,39 @@ from types import SimpleNamespace
 
 import pytest
 
-from shared_context.native_environment_sync import follow_agent, follow_all
+from shared_context.native_environment_sync import follow_agent, follow_all, verify_agent
 from shared_context.errors import Problem
 from test_native_files_api import (
     file_api, file_loops, follow, instruction_models, jwk_client, legacy_source, local_env,
     native_api, signing_key, synthetic_standing_v1, token,
 )
 from test_native_agent_api import registry_relay_case, team
+
+
+@pytest.mark.parametrize("observed, state", [("42", "ok"), ("41", "drifted")])
+@pytest.mark.parametrize("verify", [False, True])
+def test_follow_and_verify_report_the_platforms_version_of_the_sid_not_the_selector(
+    file_api, monkeypatch, observed, state, verify,
+):
+    """ADR-0009 platform behavior: an idle-resumed SID may run another version; report it, never ok."""
+    from shared_context.behavior_native_sessions import NativeSessions
+    from shared_context.behavior_native_turn_wire import NativeSessionMetadata
+
+    fixture = file_api
+    legacy_source(fixture)
+    composition, agent_id = fixture.case.composition, fixture.source.agent_id
+    first = follow_agent(composition, agent_id)
+    sid = first["environment"]["hosted_session_id"]
+    real = NativeSessions.environment_view
+
+    def environment_view(self, client):
+        view = real(self, client)
+        item = NativeSessionMetadata(hosted_session_id=sid, hosted_agent_version=observed, status="idle")
+        return view.model_copy(update={"observed_sessions": (item,)})
+
+    monkeypatch.setattr(NativeSessions, "environment_view", environment_view)
+    result = (verify_agent if verify else follow_agent)(composition, agent_id)
+    assert (result["state"], result["observed_version"], result["version"]) == (state, observed, "42")
 
 
 @pytest.mark.parametrize("file_api", ["foundry-native-v1", "foundry-responses-v1"], indirect=True)

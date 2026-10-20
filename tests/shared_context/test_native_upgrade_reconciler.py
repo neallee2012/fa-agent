@@ -5,11 +5,13 @@ The patrol's fixture: the real API composition and binding row; only the platfor
 offline doubles. Any platform call other than ``get_session`` fails the test."""
 
 import threading
+from datetime import timedelta
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import pytest
 
+from shared_context.behavior_native_turn_wire import NativeEnvironmentNotice, NativeEnvironmentView
 from shared_context.errors import Problem
 from shared_context.native_upgrade_reconciler import RECONCILE_BACKOFF_SECONDS, RECONCILE_SECONDS, NativeUpgradeReconciler
 from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401  (fixture)
@@ -310,3 +312,194 @@ def test_the_loop_waits_a_jittered_interval_before_every_pass_and_survives_a_fai
     asyncio.run(value._loop())
     assert waits == [600, 600] and passes == [1, 2], "never at the start itself: the interval comes first"
     assert "NATIVE_UPGRADE_RECONCILER_FAILED code=RuntimeError" in caplog.text
+
+
+# --- phase 6a (c): the 6-hour "有新版本" status-line note -------------------------------------------------------------
+
+def defer(case, agent_id=None, sid=None, *, hours, target="42"):
+    """U0 recorded ``target`` as due ``hours`` ago (the store's own clock, moved back for the write)."""
+    store, clock = case.store, case.store.clock
+    store.clock = lambda: clock() - timedelta(hours=hours)
+    try:
+        return store.record_due(agent_id or case.agent_id, hosted_session_id=sid or case.sid, target_version=target)
+    finally:
+        store.clock = clock
+
+
+def table_calls(case, monkeypatch):
+    """Counts the Table reads and writes the binding row sees from now on."""
+    repository, calls = case.store.repository, {"reads": 0, "writes": 0}
+    get, replace = repository.get, repository.replace
+    monkeypatch.setattr(repository, "get", lambda *a, **k: calls.update(reads=calls["reads"] + 1) or get(*a, **k))
+    monkeypatch.setattr(repository, "replace",
+                        lambda *a, **k: calls.update(writes=calls["writes"] + 1) or replace(*a, **k))
+    return calls
+
+
+def test_a_deferral_over_six_hours_sets_the_note_once_and_a_rerun_does_not(patrol, selector, monkeypatch):
+    case = patrol
+    bind(case)
+    case.platform.statuses[case.sid] = "idle"  # due but idle: left alone, as in (b)
+    defer(case, hours=7)
+    value = reconciler(case, notes=True)
+    calls = table_calls(case, monkeypatch)
+    first = run(case, value)
+    row = case.store.read(case.agent_id)
+    assert first["noted"] == 1 and row.idle_upgrade.waiting == "pending"
+    assert row.waiting_version() == "42"
+    assert row.notice() is None, "Teams (and an old bridge) never carry it"
+    assert (case.handed, [sid for sid, _ in case.platform.reads]) == ([], [case.sid]), "no wake, no cut"
+    case.platform.now += value.backoff  # the backoff ends: the row is read and judged again
+    calls.update(reads=0, writes=0)
+    assert run(case, value)["noted"] == 0 and calls["writes"] == 0
+    # The owner's workbench shows it once; a later pass does not make it again for the same target.
+    case.store.clear_waiting(case.agent_id, "42")
+    assert case.store.read(case.agent_id).idle_upgrade.waiting == "shown"
+    case.platform.now += value.backoff
+    calls.update(reads=0, writes=0)
+    assert run(case, value)["noted"] == 0 and calls["writes"] == 0
+    assert case.store.read(case.agent_id).waiting_version() is None
+
+
+def test_a_deferral_under_six_hours_does_nothing(patrol, selector, monkeypatch):
+    case = patrol
+    bind(case)
+    case.platform.statuses[case.sid] = "idle"  # due but idle: left alone, as in (b)
+    defer(case, hours=5)
+    before = case.store.read(case.agent_id)
+    calls = table_calls(case, monkeypatch)
+    assert run(case, reconciler(case, notes=True))["noted"] == 0
+    assert calls["writes"] == 0 and case.store.read(case.agent_id) == before
+
+
+def test_the_note_is_made_when_the_six_hours_pass_inside_the_backoff_of_an_unchanged_row(patrol, selector, monkeypatch):
+    """The Agent was read (and left alone) while under 6 hours; its row did not change, so the backoff alone would skip
+    it for a day: the 6-hour check comes before the backoff."""
+    case = patrol
+    bind(case)
+    case.platform.statuses[case.sid] = "idle"  # due but idle: left alone, as in (b)
+    defer(case, hours=5)
+    value = reconciler(case, notes=True)
+    assert run(case, value)["noted"] == 0 and run(case, value)["recent"] == 1
+    later = case.store.clock() + timedelta(hours=2)
+    monkeypatch.setattr(case.composition.runtime, "_now", lambda: later, raising=False)
+    assert run(case, value)["noted"] == 1
+
+@pytest.mark.parametrize(("reconcile", "guard", "idle", "noted"), [
+    ("1", "1", "1", True),
+    ("1", "1", None, False),  # the reconciler runs, but (c) is the idle upgrade's
+    ("1", "1", "0", False),
+    (None, "1", "1", False),  # the reconciler itself is off: no task
+    ("1", None, None, False)])  # the guard is off: no task
+def test_with_any_flag_off_nothing_is_noted(patrol, selector, monkeypatch, reconcile, guard, idle, noted):
+    case = patrol
+    bind(case)
+    case.platform.statuses[case.sid] = "idle"  # due but idle: left alone, as in (b)
+    defer(case, hours=7)
+    before = case.store.read(case.agent_id)
+    for name, value in (("FA_NATIVE_UPGRADE_RECONCILER", reconcile), ("FA_NATIVE_SESSION_GUARD_ENFORCE", guard),
+                        ("FA_NATIVE_IDLE_UPGRADE", idle)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    value = NativeUpgradeReconciler(case.composition, sleep=case.platform.sleep, clock=lambda: case.platform.now,
+                                    switch=lambda agent_id: case.handed.append(agent_id) or True)
+    assert value.enabled is (reconcile == "1" and guard == "1") and value.notes is (guard == "1" and idle == "1")
+    if value.enabled:
+        assert run(case, value)["noted"] == int(noted)
+    assert (case.store.read(case.agent_id) == before) is (not noted)
+
+
+def test_a_new_target_or_the_switch_ends_the_note(patrol, selector):
+    case = patrol
+    bind(case)
+    case.platform.statuses[case.sid] = "idle"  # due but idle: left alone, as in (b)
+    defer(case, hours=7)
+    run(case, reconciler(case, notes=True))
+    assert case.store.read(case.agent_id).waiting_version() == "42"
+    moved = case.store.record_due(case.agent_id, hosted_session_id=case.sid, target_version="43")
+    assert moved.idle_upgrade.waiting is None and moved.waiting_version() is None, "the target changed"
+    defer(case, hours=7, target="43")  # no-op: the target holds its start
+    run_again = reconciler(case, notes=True)
+    assert run(case, run_again)["noted"] == 0, "the new target started its own 6 hours just now"
+    case.store.record_switch(case.agent_id, NativeEnvironmentView(
+        agent_id=case.agent_id, request_id="follow-switch", state="ready", previous_hosted_session_id=case.sid,
+        previous_agent_version="41", hosted_session_id="fa-native-next", hosted_agent_version="43",
+        files_migrated=False, files_skip_request_id="skip"))
+    row = case.store.read(case.agent_id)
+    assert row.idle_upgrade is None and row.waiting_version() is None and row.notice() == NativeEnvironmentNotice(
+        kind="environment_switched_without_files")
+
+
+@pytest.mark.parametrize("project", [False, True])
+def test_a_vetoed_target_gets_no_waiting_note(patrol, selector, project):
+    """4b-4: after U3's veto "沒有更新" said the Agent stays; a later "有新版本 v42" for that target would contradict
+    it. This Agent's own veto or the project row: U0 never moves the Agent there."""
+    from shared_context.native_version_veto import veto_store
+
+    case = patrol
+    bind(case)
+    case.platform.statuses[case.sid] = "idle"  # due but idle: left alone, as in (b)
+    defer(case, hours=7)
+    value = reconciler(case, notes=True)
+    if project:
+        name = value.source(case.agent_id, case.store.read(case.agent_id)).target.agent_name
+        veto_store(case.composition).veto(name, "42")
+    else:
+        case.store.record_veto(case.agent_id, hosted_session_id=case.sid, agent_version="42", notice=True)
+    before = case.store.read(case.agent_id)
+    assert run(case, value)["noted"] == 0
+    row = case.store.read(case.agent_id)
+    assert row == before and row.idle_upgrade.waiting is None and row.waiting_version() is None
+
+
+def test_a_note_made_before_this_agents_veto_is_not_shown_after_it(patrol, selector):
+    case = patrol
+    bind(case)
+    case.platform.statuses[case.sid] = "idle"  # due but idle: left alone, as in (b)
+    defer(case, hours=7)
+    run(case, reconciler(case, notes=True))
+    assert case.store.read(case.agent_id).waiting_version() == "42"
+    vetoed = case.store.record_veto(case.agent_id, hosted_session_id=case.sid, agent_version="42", notice=True)
+    assert vetoed.idle_upgrade.waiting == "pending" and vetoed.waiting_version() is None
+
+
+def test_a_note_made_before_the_project_veto_is_cleared_by_the_next_pass(patrol, selector):
+    """#912 review P3: the project row is not on the binding row, so ``waiting_version()`` kept answering 42."""
+    from shared_context.native_version_veto import veto_store
+
+    case = patrol
+    bind(case)
+    case.platform.statuses[case.sid] = "idle"  # due but idle: left alone, as in (b)
+    defer(case, hours=7)
+    value = reconciler(case, notes=True)
+    run(case, value)
+    assert case.store.read(case.agent_id).waiting_version() == "42"
+    name = value.source(case.agent_id, case.store.read(case.agent_id)).target.agent_name
+    veto_store(case.composition).veto(name, "42")
+    case.platform.now += value.backoff
+    assert run(case, value)["noted"] == 0
+    row = case.store.read(case.agent_id)
+    assert row.idle_upgrade.waiting == "shown" and row.waiting_version() is None
+
+
+def test_a_pass_reads_one_row_per_agent_and_a_noted_agent_costs_two_more_reads_and_one_write(patrol, selector, monkeypatch):
+    case = patrol
+    value = reconciler(case, notes=True)
+    ids = crowd(case, value, monkeypatch, 3, "idle")
+    for agent_id in ids[:2]:
+        defer(case, agent_id, "sid-" + agent_id, hours=7)
+    calls = table_calls(case, monkeypatch)
+    counts = run(case, value)
+    # Every served Agent has its row read once (the unbound configured ones too); each of the two noted ones has its
+    # project veto row read, is re-read by its CAS and written once. Nothing else is read.
+    agents = counts["agents"]
+    assert counts["noted"] == 2 and agents == counts["unbound"] + 3
+    assert (calls["reads"], calls["writes"]) == (agents + 4, 2)
+    assert len(case.platform.reads) == 3 and case.handed == [], "the same get_session reads as without (c)"
+    case.platform.now += RECONCILE_SECONDS
+    calls.update(reads=0, writes=0)
+    counts = run(case, value)
+    # Each of the two pending notes reads the project veto row once more (a veto since then clears it), writes nothing.
+    assert (counts["noted"], counts["recent"]) == (0, 3) and (calls["reads"], calls["writes"]) == (agents + 2, 0)

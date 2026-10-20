@@ -24,6 +24,12 @@ from .storage import Repository, TableRepository, serialize
 # ADR-0009 2d-i parts this API code carries, read by the deploy's switch check (ci_deploy.API_2DI_SCHEMA, by AST):
 # 1 = P5's background cut; 2 = also P6's in-request wait and verify-only follow. A plain int literal.
 NATIVE_2DI_SCHEMA = 2
+# ADR-0009 phase 4 parts this API code carries, read the same way (ci_deploy.API_IDLE_SCHEMA): 1 = 4b-1's binding row
+# ``idle_upgrade`` sub-object (an API without it answers 409 NATIVE_BINDING_INVALID on such a row); 2 = 6a (c)'s
+# ``idle_upgrade.waiting``; 3 = also 4d's ``rolled_back``/``rolled_back_without_files`` switch notices and the
+# fence's ``rollback`` (the same 409 for an API without them); 4 = also 4b-4's ``vetoed`` slot notice (the same 409).
+# A plain int literal.
+NATIVE_IDLE_SCHEMA = 4
 AgentVersion = Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")]
 # Every write is a whole-row replace guarded by the ETag just read; a conflict reads again and recomputes.
 WRITE_ATTEMPTS = 4
@@ -46,11 +52,22 @@ SourceStatus = Literal["idle", "failed", "deleted", "expired", "missing", "activ
 AbandonBasis = Literal["incompatible", "retired", "drifted", "stuck_admission", "files_unmovable", "files_overdue"]
 # Source statuses whose environment still exists: an abandon of one carries the ④ notice, not "舊環境已失效".
 _SOURCE_KEPT = frozenset({"idle", "active"})
-SwitchNotice = Literal["updated", "without_files", "source_retired"]
-# M4 severity inside the slot: a later switch never replaces a more severe undelivered one.
-_SWITCH_RANK = {"updated": 0, "without_files": 1, "source_retired": 2}
+# ``rolled_back``: ADR-0009 4d's crash-loop rollback (``FA_NATIVE_IDLE_UPGRADE`` only); ``rolled_back_without_files``:
+# that, with an undelivered "沒帶工作檔" (of the rollback or of a switch before or after it), kept visible (M4 #1).
+# ``vetoed``: 4b-4's "助理這次沒有更新" after U3's third failure; not a switch, so written only into an empty slot and
+# replaced by any later switch.
+SwitchNotice = Literal["updated", "without_files", "source_retired", "rolled_back", "rolled_back_without_files",
+                       "vetoed"]
+# M4 severity inside the slot: a later switch never replaces a more severe undelivered one (已退回 outranks all).
+_SWITCH_RANK = {"vetoed": -1, "updated": 0, "without_files": 1, "source_retired": 2, "rolled_back": 3,
+                "rolled_back_without_files": 4}
 _SWITCH_KINDS = {"updated": "environment_updated", "without_files": "environment_switched_without_files",
-                 "source_retired": "environment_source_retired"}
+                 "source_retired": "environment_source_retired", "rolled_back": "environment_rolled_back",
+                 "rolled_back_without_files": "environment_rolled_back", "vetoed": "environment_upgrade_vetoed"}
+_WITHOUT_FILES = frozenset({"without_files", "source_retired"})
+_ROLLED_BACK = frozenset({"rolled_back", "rolled_back_without_files"})
+# ADR-0009 §5 / Neal decision 4: a deferral this long gets the one status-line note, never a forced upgrade.
+DEFERRAL_NOTICE_SECONDS = 6 * 3600
 log = logging.getLogger(__name__)
 
 
@@ -114,12 +131,44 @@ class NativeBindingUpgrade(WireModel):
     an older follow left. ``started_at`` (the store's clock): another replica withdraws a fence without FA's recorded
     stop only once it is older than the fence bound. ``agent_version``: the destination's, so the fence is driven at
     its own session whatever the selector names later. ``stop_started``: written before every FA stop of the source
-    the fence sends (``mark_stop``); from then on the fence is never withdrawn, only driven to its commit."""
+    the fence sends (``mark_stop``); from then on the fence is never withdrawn, only driven to its commit.
+    ``rollback`` (4d, ``FA_NATIVE_IDLE_UPGRADE`` only): the fence is a crash-loop rollback's, so whichever path commits
+    it later (a cut's or a send's ``_converge``) writes 已退回 and opens no crash-loop window."""
     hosted_session_id: Identifier
     agent_version: AgentVersion
     request_id: Identifier
     started_at: Annotated[str, Field(min_length=20, max_length=40)]
     stop_started: bool = Field(default=False, exclude_if=lambda value: not value)
+    rollback: bool = Field(default=False, exclude_if=lambda value: not value)
+
+
+_Timestamp = Annotated[str, Field(min_length=20, max_length=40)]
+
+
+class NativeBindingIdleUpgrade(WireModel):
+    """ADR-0009 phase 4b idle upgrade (``FA_NATIVE_IDLE_UPGRADE`` only; not ``upgrade``, which is 2d-i's files fence).
+    U0 (4b-1) writes ``target_version`` and ``deferred_since`` (the store's clock when that target first became due),
+    and a new target resets both. ``record_switch`` (U8, with the flag) keeps only the vetoes and the switch time
+    (``switched_at``, the start of 4d's crash-loop window); 4d's crash-loop adds a veto. U3 (4b-2) counts the
+    target's failed health checks in ``health_failures`` and vetoes it at the third. The other fields belong to later
+    4b steps and stay at their defaults until then."""
+    target_version: AgentVersion | None = None
+    deferred_since: _Timestamp | None = None
+    last_attempt_at: _Timestamp | None = Field(default=None, exclude_if=lambda value: value is None)
+    health_failures: Annotated[int, Field(ge=0, le=1_000)] = Field(default=0, exclude_if=lambda value: not value)
+    # This Agent's vetoed versions (3 health failures on one target, or 4d's crash-loop); the project-level ones are
+    # native_version_veto's.
+    vetoed_versions: Annotated[tuple[AgentVersion, ...], Field(max_length=16)] = Field(
+        default=(), exclude_if=lambda value: not value)
+    switched_at: _Timestamp | None = Field(default=None, exclude_if=lambda value: value is None)
+    start_failures: Annotated[int, Field(ge=0, le=1_000)] = Field(default=0, exclude_if=lambda value: not value)
+    # Phase 6a (c): the "有新版本 vN，會在助理閒置時更新" status-line note for ``target_version`` once its deferral passed
+    # 6 hours. ``pending`` until an owner workbench response carries it, then ``shown``: it stays, so the note is made
+    # once per target. A new target (``record_due``) or the switch (``record_switch``) rebuilds this object, ending it.
+    waiting: Literal["pending", "shown"] | None = Field(default=None, exclude_if=lambda value: value is None)
+    # 4d (coordinator 2026-10-19): the current version crash-looped and this Agent's own vetoes also name the version a
+    # rollback would go to, so there is none; written once, so no turn end retries it. The switch rebuild ends it.
+    rollback_blocked: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 ClockKind = Literal["retired", "admitting", "drive", "unmovable", "fence_broken"]
@@ -176,6 +225,9 @@ class NativeBindingRow(WireModel):
     # ``record_switch`` rebuilds the row without them.
     clocks: Annotated[tuple[NativeBindingClock, ...], Field(max_length=8)] = Field(
         default=(), exclude_if=lambda value: not value)
+    # Written only with FA_NATIVE_IDLE_UPGRADE, by the same rule as ``clocks``: an API older than this field decodes a
+    # row that has it as 409 NATIVE_BINDING_INVALID, so once it is on the API never rolls back below it.
+    idle_upgrade: NativeBindingIdleUpgrade | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def consistent(self):
@@ -216,15 +268,30 @@ class NativeBindingRow(WireModel):
         """A previous SID the platform had retired when the Agent left it: what it left can never complete."""
         return any(item.hosted_session_id == hosted_session_id and item.retired for item in self.previous_sessions)
 
-    def notice(self, *, switch: bool = True) -> NativeEnvironmentNotice | None:
+    def notice(self, *, switch: bool = True, rolled_back: bool = True,
+               vetoed: bool = True) -> NativeEnvironmentNotice | None:
         """The pending ADR-0009 §8 notice of the slot: the switch notice, else "平台把助理的執行環境換成了另一個版本
         （vX→vY）" while the drift notice is pending. ``switch=False``: the drift notice only (for a client that does
-        not know the switch kinds, as before phase 2c)."""
-        if switch and self.switch_notice is not None:
-            return NativeEnvironmentNotice(kind=_SWITCH_KINDS[self.switch_notice])
+        not know the switch kinds, as before phase 2c); ``rolled_back=False``: the same for a slot holding 已退回 (a
+        client before phase 4d); ``vetoed=False``: the same for 4b-4's "沒有更新" (a client before 4b-4)."""
+        if switch and self.switch_notice is not None and (rolled_back or self.switch_notice not in _ROLLED_BACK) and (
+                vetoed or self.switch_notice != "vetoed"):
+            return NativeEnvironmentNotice(kind=_SWITCH_KINDS[self.switch_notice],
+                                           without_files=self.switch_notice == "rolled_back_without_files")
         if not self.notice_pending:
             return None
         return NativeEnvironmentNotice(from_version=self.created_agent_version, to_version=self.notice_to_version)
+
+    def waiting_version(self) -> str | None:
+        """Phase 6a (c): the target of the 6-hour "有新版本" note while it is pending (not a slot notice: it is the
+        lightest and rides on an owner workbench answer only when no slot notice does). None once the recorded version
+        is the target: ``record_observed`` keeps ``idle_upgrade`` when the platform moves the VM there itself; None
+        once this Agent vetoed the target (4b-4: "沒有更新" said it stays, so no later "有新版本" for it)."""
+        upgrade = self.idle_upgrade
+        if (upgrade is None or upgrade.waiting != "pending" or upgrade.target_version == self.observed.agent_version
+                or upgrade.target_version in upgrade.vetoed_versions):
+            return None
+        return upgrade.target_version
 
 
 def _utc_now() -> datetime:
@@ -378,17 +445,23 @@ class NativeBindingStore:
         return row
 
     def record_switch(self, agent_id: str, view, *, state_profile: str = NATIVE_STATE_PROFILE,
-                      profile_unread: bool = False) -> NativeBindingRow:
+                      profile_unread: bool = False, idle_upgrade: bool = False,
+                      rollback: bool = False) -> NativeBindingRow:
         """ADR-0009 §7a (f)/(j). Idempotent, so a crash between the commit and this write is repaired by the next
         follow's rerun; when the commit's previous SID is not the row's (the selector moved before the rerun), both
         are kept as previous SIDs. ``state_profile``: what the new SID's version declares (2d-i); ``profile_unread``:
         it is the repair fallback's v1, corrected by the next definition read. A row with ``upgrade`` is rebuilt
-        without it: the fence ended in this commit."""
+        without it: the fence ended in this commit. ``idle_upgrade`` (``FA_NATIVE_IDLE_UPGRADE``, U8): the rebuilt row
+        keeps this Agent's vetoes and records the switch time; ``rollback`` (4d), or a rollback's fence this commit
+        ends: the slot says 已退回 and no switch time is recorded, so the rollback's own switch is never judged."""
 
         def switching(row):
             if (row is not None and row.hosted_session_id == view.hosted_session_id
                     and row.created_agent_version == view.hosted_agent_version):
                 return None
+            fence = None if row is None else row.upgrade
+            rolling = rollback or (fence is not None and fence.rollback
+                                   and fence.hosted_session_id == view.hosted_session_id)
             previous = list(row.previous_sessions) if row is not None else []
             decision = None if row is None else row.abandon
             # The abandon path never moves files (Hosted's ``abandon_session`` commits ``files_migrated=False``), so a
@@ -419,9 +492,14 @@ class NativeBindingStore:
                 notice = "without_files" if decision.source_status in _SOURCE_KEPT else "source_retired"
             else:
                 notice = "updated" if view.files_migrated is True else "without_files"
+            if rolling:
+                notice = "rolled_back" if notice == "updated" else "rolled_back_without_files"
             kept = None if row is None else row.switch_notice
-            if kept is not None and (notice is None or _SWITCH_RANK[kept] > _SWITCH_RANK[notice]):
+            fresh = notice
+            if kept is not None and _SWITCH_RANK[kept] > _SWITCH_RANK[notice]:
                 notice = kept
+            if notice == "rolled_back" and (kept in _WITHOUT_FILES or fresh in _WITHOUT_FILES):
+                notice = "rolled_back_without_files"  # M4 #1: 已退回 never hides an undelivered "沒帶工作檔"
             return NativeBindingRow(
                 agent_id=agent_id, hosted_session_id=view.hosted_session_id,
                 created_agent_version=view.hosted_agent_version,
@@ -429,6 +507,9 @@ class NativeBindingStore:
                     agent_version=view.hosted_agent_version, observed_at=self._now(), source="vm"),
                 previous_sessions=tuple(previous), switch_notice=notice, state_profile=state_profile,
                 profile_unread=profile_unread, unfinished_checked=None if row is None else row.unfinished_checked,
+                idle_upgrade=NativeBindingIdleUpgrade(
+                    vetoed_versions=() if row is None or row.idle_upgrade is None else row.idle_upgrade.vetoed_versions,
+                    switched_at=None if rolling else self._now()) if idle_upgrade else None,
                 last_switch=NativeBindingSwitch(
                     reason="version_follow", previous_hosted_session_id=view.previous_hosted_session_id,
                     files_migrated=view.files_migrated) if decision is None else NativeBindingSwitch(
@@ -506,6 +587,95 @@ class NativeBindingStore:
 
         return self._update(agent_id, recording)
 
+    def record_due(self, agent_id: str, *, hosted_session_id: str, target_version: str) -> NativeBindingRow | None:
+        """ADR-0009 U0 (``FA_NATIVE_IDLE_UPGRADE`` only): ``target_version`` is due on the row that still names
+        ``hosted_session_id``. The first time it is due its deferral start is written; the same target again writes
+        nothing, so the start holds; another target (the selector moved) starts again, keeping the later steps' vetoes."""
+
+        def recording(row):
+            if row is None or row.hosted_session_id != hosted_session_id:
+                return None
+            kept = row.idle_upgrade or NativeBindingIdleUpgrade()
+            if kept.target_version == target_version:
+                return None
+            return row.model_copy(update={"idle_upgrade": NativeBindingIdleUpgrade(
+                target_version=target_version, deferred_since=self._now(), vetoed_versions=kept.vetoed_versions,
+                switched_at=kept.switched_at, start_failures=kept.start_failures,
+                rollback_blocked=kept.rollback_blocked)})
+
+        return self._update(agent_id, recording)
+
+    def record_veto(self, agent_id: str, *, hosted_session_id: str, agent_version: str,
+                    notice: bool = False) -> NativeBindingRow | None:
+        """ADR-0009 4d: ``agent_version`` crash-looped on the row that still names ``hosted_session_id``; added once to
+        this Agent's vetoes (the newest 16 are kept). ``notice`` (4b-4: U3's veto): the same write puts "沒有更新" into
+        an empty notice slot, so the veto is never on the row without it (a slot already holding a switch keeps it)."""
+
+        def recording(row):
+            if row is None or row.hosted_session_id != hosted_session_id:
+                return None
+            kept = row.idle_upgrade or NativeBindingIdleUpgrade()
+            if agent_version in kept.vetoed_versions:
+                return None
+            return row.model_copy(update={"idle_upgrade": kept.model_copy(update={
+                "vetoed_versions": (*kept.vetoed_versions, agent_version)[-16:]}), **(
+                {"switch_notice": "vetoed"} if notice and row.switch_notice is None else {})})
+
+        return self._update(agent_id, recording)
+
+    def record_health_failure(self, agent_id: str, *, hosted_session_id: str, target_version: str,
+                              last_attempt_at: str | None, failed: bool = True) -> NativeBindingRow | None:
+        """ADR-0009 U3: one failed health check of ``target_version`` while it is the row's due target; the count is
+        per (Agent, target), so a new target (``record_due``) or the switch (``record_switch``) starts it again. The
+        attempt is the one that read ``last_attempt_at`` (the previous attempt's time, written here): another replica
+        that checked from the same read counts nothing more. ``failed=False``: a check that answered nothing, only its
+        time (so the retry interval applies), no failure."""
+
+        def recording(row):
+            if (row is None or row.hosted_session_id != hosted_session_id or row.idle_upgrade is None
+                    or row.idle_upgrade.target_version != target_version
+                    or row.idle_upgrade.last_attempt_at != last_attempt_at):
+                return None
+            kept = row.idle_upgrade
+            return row.model_copy(update={"idle_upgrade": kept.model_copy(update={
+                "health_failures": min(kept.health_failures + int(failed), 1_000), "last_attempt_at": self._now()})})
+
+        return self._update(agent_id, recording)
+
+    def record_rollback_blocked(self, agent_id: str, *, hosted_session_id: str) -> NativeBindingRow | None:
+        """ADR-0009 4d: the row that still names ``hosted_session_id`` has no version to roll back to."""
+
+        def recording(row):
+            if (row is None or row.hosted_session_id != hosted_session_id or row.idle_upgrade is None
+                    or row.idle_upgrade.rollback_blocked):
+                return None
+            kept = row.idle_upgrade.model_copy(update={"rollback_blocked": True})
+            return row.model_copy(update={"idle_upgrade": kept})
+
+        return self._update(agent_id, recording)
+
+    def overdue(self, row: NativeBindingRow) -> bool:
+        """Phase 6a (c): ``row``'s deferral began more than ``DEFERRAL_NOTICE_SECONDS`` ago by this store's clock and no
+        note was made for that target yet, nor did this Agent veto it. Pure: no read."""
+        upgrade = row.idle_upgrade
+        if (upgrade is None or upgrade.deferred_since is None or upgrade.waiting is not None
+                or upgrade.target_version in upgrade.vetoed_versions):
+            return False
+        began = datetime.fromisoformat(upgrade.deferred_since)
+        return (datetime.fromisoformat(self._now()) - began).total_seconds() > DEFERRAL_NOTICE_SECONDS
+
+    def record_waiting(self, agent_id: str, *, hosted_session_id: str, target_version: str) -> NativeBindingRow | None:
+        """Phase 6a (c): make the status-line note for ``target_version`` once, while the row still names this SID and
+        this target, its deferral is over 6 hours old and no note was made. Metadata only: one row CAS."""
+
+        def recording(row):
+            if (row is None or row.hosted_session_id != hosted_session_id or row.idle_upgrade is None
+                    or row.idle_upgrade.target_version != target_version or not self.overdue(row)):
+                return None
+            return row.model_copy(update={"idle_upgrade": row.idle_upgrade.model_copy(update={"waiting": "pending"})})
+
+        return self._update(agent_id, recording)
+
     def record_profile(self, agent_id: str, *, hosted_session_id: str, created_agent_version: str,
                        state_profile: str) -> NativeBindingRow | None:
         """A definition read of the current SID's version replaces the repair fallback's profile (``profile_unread``)."""
@@ -544,6 +714,17 @@ class NativeBindingStore:
         if written and row == written[0]:
             log.warning("NATIVE_ENVIRONMENT_NOTICE_CLEARED kind=%s session_id=%s", delivered.kind, row.hosted_session_id)
         return row
+
+    def clear_waiting(self, agent_id: str, target_version: str) -> NativeBindingRow | None:
+        """Phase 6a (c): after an owner answer carrying the note for ``target_version`` was written, keep it as ``shown``
+        (never removed: the note is made once per target). A different or no pending note is left as it is."""
+
+        def clearing(row):
+            if row is None or row.waiting_version() != target_version:
+                return None
+            return row.model_copy(update={"idle_upgrade": row.idle_upgrade.model_copy(update={"waiting": "shown"})})
+
+        return self._update(agent_id, clearing)
 
     def record_unfinished(self, agent_id: str, *, hosted_session_id: str, session_ids, complete: bool):
         """ADR-0009 §7a (f), once per Agent: SIDs of unfinished receipts (other than the current one) join the
@@ -604,6 +785,24 @@ def session_guard_enforced(environ=None) -> bool:
     if value not in (None, "", "0", "1"):
         log.warning("NATIVE_SESSION_GUARD_SETTING_INVALID enforced=False")
     return value == "1"
+
+
+IDLE_UPGRADE_ENV = "FA_NATIVE_IDLE_UPGRADE"
+
+
+def idle_upgrade_enabled(environ=None) -> bool:
+    """``FA_NATIVE_IDLE_UPGRADE=1`` (default off): ADR-0009 phase 4's idle upgrade between compatible new images,
+    built on 2d-i's background cut. It needs ``FA_NATIVE_SESSION_GUARD_ENFORCE=1``: the API refuses to start with it
+    alone (``ValueError``). Any other value than ``0``/``1`` keeps it off and is logged."""
+    environ = os.environ if environ is None else environ
+    value = environ.get(IDLE_UPGRADE_ENV)
+    if value not in (None, "", "0", "1"):
+        log.warning("NATIVE_IDLE_UPGRADE_SETTING_INVALID enabled=False")
+    if value != "1":
+        return False
+    if not session_guard_enforced(environ):
+        raise ValueError(f"{IDLE_UPGRADE_ENV}=1 needs {SESSION_GUARD_ENV}=1 (ADR-0009 phase 4 is built on 2d-i)")
+    return True
 
 
 class SessionGuard:

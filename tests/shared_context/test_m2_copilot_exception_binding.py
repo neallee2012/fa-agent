@@ -42,7 +42,7 @@ def adapter(tmp_path, monkeypatch):
     client.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
     client.create_session.return_value = session
     client.resume_session.return_value = session
-    process = SimpleNamespace(pid=4242, returncode=0, poll=lambda: 0)
+    process = SimpleNamespace(pid=4242, returncode=0, poll=lambda: 0, kill=lambda: None)  # #903: FA kills its own PID
     client._cli_process = process
     factory = create_autospec(CopilotClient, return_value=client)
     monkeypatch.setattr(m2_copilot, "CopilotClient", factory)

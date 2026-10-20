@@ -14,6 +14,8 @@ FA（Foundry Agents）是給單一組織使用的代管 AI 助理平台。一個
 
 VM 閒置一段時間後由平台回收，FA 預設是 3600 秒，可以在環境設定調整。對話的歷史與 checkpoint 存在 Foundry State store，下一則訊息進來時，新的 VM 從最後一個合法 checkpoint 接續對話。VM 上的工作檔目前不會跟著搬過去。
 
+**和直接用 Foundry agent 或自架 OpenClaw 差在哪。** 直接在 Foundry 建 agent 時，桌面、私人記憶、交辦和權限邊界都要自己接；FA 替每位助理準備一台自己的 Hosted VM（帶桌面和 Chromium）、私人記憶、批准卡，以及同 Team 助理之間的交辦。自架 OpenClaw 跑在你自己管的機器上；FA 全部用你 Azure 訂閱裡的代管服務，以 Team 為信任邊界：入口用 Entra 核對 Team 主人，資料轉送和交辦都只在同一個 Team 內。VM 被回收或換版後，對話從最後一個合法 checkpoint 接續，不會悄悄換成一段新的對話。「比 OpenClaw 快 10 倍」是專案的目標，目前還沒有量測結果。
+
 你在網頁工作台和助理對話。工作台用 Entra ID 登入，只有 Team 主人進得去。
 
 ```text
@@ -80,13 +82,14 @@ Container App      Container App              每位助理一台 VM
 
 **事前準備，看由誰來做。** 每一項的細節見 [事前準備](deploy/azd/README.md#prerequisites)。
 
-- **你（部署的人）**：azd、Azure CLI、Python 3.11 以上、git 和正在執行的 Docker，Windows 另需 PowerShell 7。`az` 和 `azd` 用同一個使用者帳號登入。建議你就是 Team 主人；不是的話，後半段要由主人登入接手。
+- **你（部署的人）**：azd 1.32.0 以上、Azure CLI、Python 3.11 以上、git 和正在執行的 Docker，Windows 另需 PowerShell 7。`az` 和 `azd` 用同一個使用者帳號登入。建議你就是 Team 主人；不是的話，後半段要由主人登入接手。
 - **訂閱 Owner**：你在訂閱上要有 Owner，或 Contributor 加 User Access Administrator。訂閱要註冊 9 個 resource provider 和 1 個 feature。
 - **Entra 權限**：允許你註冊 app。Team 主人一人的 3 筆委派授權，你能建（Cloud Application Administrator、Application Administrator 或 Global Administrator）時由 hook 直接建好；不能建時 hook 把請求寫成給管理員的檔案（`.azure/<env>/fa/admin-consent/`），管理員做完後你再接續。
 
 不需要 Microsoft Teams、Work IQ 或 GitHub。`azd up` 完成時 connector 是關的，之後要加工具見 [擴充](#extending)。
 
 ```powershell
+git clone https://github.com/neallee2012/fa-agent.git; cd fa-agent   # 要用 git clone，不要下載 ZIP：部署會讀 git commit（git rev-parse HEAD）
 $env:AZURE_CONFIG_DIR = "$HOME\.azure-fa"   # 獨立的 Azure CLI 設定目錄，避免誤用別的訂閱
 $env:PYTHONUTF8 = "1"
 az login --tenant <your-tenant-id>
@@ -96,6 +99,8 @@ azd env set FA_TEAM_OWNER_OID <owner-object-id>   # Team 主人的 object ID（�
 python .\deploy\azd\fa_azd.py prereq     # 唯讀：列出你已具備什麼、還缺什麼、該找誰
 azd up
 ```
+
+`<name>` 是環境名稱，2～20 個小寫字母、數字或連字號，會當資源名稱的前綴。`<region>` 要選有 Foundry Hosted Agents 的區域，清單見[官方文件](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents#region-availability)。還沒決定區域時，拿掉 `--location` 和 `prereq` 那一行，`azd up` 會用選單問你。
 
 不知道訂閱 ID 或租用戶 ID 時，`az login` 後執行 `az account list --query "[].{name:name, id:id, tenant:tenantId}" -o table`。訂閱在 `azd env new --subscription` 時就固定在該 azd 環境，不使用 az CLI 的預設訂閱；hook 會檢查 az 與 azd 登入的是同一個租用戶，不同就停止。
 
@@ -109,13 +114,25 @@ azd up
 - **計畫雜湊。** 首次安裝寫入資料表前，終端機會顯示 plan hash，Team 主人輸入前 12 碼才會寫入。輸入其他內容就停下，什麼都不寫；沒有終端機（程式以 `sys.stdin.isatty()` 判斷，不看 azd 的 `--no-prompt`）時直接停。
 - **WebIQ 金鑰（選用）。** 先 `azd env set FA_ENABLE_WEBIQ true` 才會問。金鑰用隱藏輸入，不寫檔，也不進 azd env。
 
-**還要真人做的事。** 部署最後，hook 以 Team 主人身分替兩位助理選好新對話的模板：走 Responses，開啟伺服器提供的全部能力。之後可以在工作台助理 ⚙ 設定頁調整。剩下的是主人登入 hook 印出的工作台網址，開新對話送一則短訊息；回條 `completed`、`failure_code=null` 才算通過。部署的人不是主人時，第一次 session 準備和模板選擇要由主人登入後跑 `azd hooks run postdeploy`。主人接手從批准計畫雜湊開始；重跑時會重做角色指派和 Bicep，所以主人也要有訂閱 Owner（或 Contributor 加 User Access Administrator）和 Foundry User，並在同一台電腦、用同一個 `.azure/<env>/fa` 資料夾執行。
+**還要真人做的事。** 部署最後，hook 以 Team 主人身分替兩位助理選好新對話的模板：走 Responses，開啟伺服器提供的全部能力。之後可以在工作台助理 ⚙ 設定頁調整。剩下的是主人登入 hook 印出的工作台網址（hook 的訊息裡叫 Portal，就是工作台；之後用 `azd env get-value FA_CONSOLE_URL` 也查得到），開新對話送一則短訊息；回條 `completed`、`failure_code=null` 才算通過，步驟見下方 [前 10 分鐘](#first-10-minutes)。部署的人不是主人時，第一次 session 準備和模板選擇要由主人登入後跑 `azd hooks run postdeploy`。主人接手從批准計畫雜湊開始；重跑時會重做角色指派和 Bicep，所以主人也要有訂閱 Owner（或 Contributor 加 User Access Administrator）和 Foundry User，並在同一台電腦、用同一個 `.azure/<env>/fa` 資料夾執行。
 
 **中斷或要排錯時。** 每個寫入都先記 intent。照畫面提示讀回，再用 `azd hooks run postprovision` 或 `azd hooks run postdeploy` 接續，不要刪掉重來。逐步排錯的對照是 [新環境標準流程](deploy/README.md#new-environment-standard-flow) 的 17 個關卡，兩邊呼叫同一批腳本。`azd down --purge` 會連同資料表、備份和記憶一起刪除，無法復原；備份鎖還在且沒設 `FA_CONFIRM_DELETE` 時會先要你輸入環境名稱，azd 自己也會問 `y/N`；約 30 分鐘。
 
 **目前的限制。** 作者在自己的訂閱從頭跑完一次 `azd up`，並在工作台實際使用過。開頭的區域與模型選擇之後也在 eastus2 實跑成功（只選一個模型，部署與設定讀回正確），但那次的工作台驗收還沒做。
 
 **費用參考。** 這些是作者環境的估算，實際以你的帳單為準。每位助理的 VM 運作時約 US$0.25／小時（2 vCPU、4 GiB），閒置回收後不計。常駐的工作台約 US$5.83／月。記憶功能預設開啟，Memory Store（preview）依用量另計。作者的 stage 環境原本估算每月 US$70～190，2026-10-07 起工作台和 feed app 改成常駐，每月約再多 US$11.66。
+
+<a id="first-10-minutes"></a>
+## 前 10 分鐘
+
+部署完成後，由 Team 主人照下面走一次，確認整條路是通的。
+
+1. 執行 `azd env get-value FA_CONSOLE_URL` 取得工作台網址，用瀏覽器打開，以 Team 主人的 Entra 帳號登入。
+2. 左側助理清單選 `fa-<name>-a`（助理 A）。
+3. 按對話上方的「⋯」→「新對話 · New session」。
+4. 在「傳送訊息…」輸入一則會用到 shell 的訊息，例如「用 shell 執行 `date`，告訴我結果」，按「送出」。
+5. 如果對話裡跳出批准卡，按「允許這次」，助理接著做完並回覆。新部署的 Team 還沒有批准規則，而且自動審查會放行你明確要求的唯讀指令，所以 `date` 這類指令可能不跳卡，助理直接回覆也是正常的，不是部署壞了。想看到批准卡：到助理的 ⚙ 設定頁「批准規則」→「新增一條規則」，內容寫「shell 指令」，「遇到符合的動作時」選「先問我」，按「確認並新增規則」，再送一次訊息。
+6. 按「⋯」→「支援明細」，展開「識別碼、歷史與回條」：`native_receipt` 的 `status` 是 `completed`、`failure_code` 是 `null`，就算通過。有沒有跳批准卡都看這裡；回覆出現但 `status` 不是 `completed`，就不算通過。
 
 ## 快速開始
 

@@ -1,12 +1,13 @@
 # Shared Context POC
 
 <a id="native-2di-switch"></a>
-## ADR-0009 2d-i 開關（P9，2026-10-16，CODE/offline；每個環境預設關，未部署）
+## ADR-0009 2d-i 開關（P9，2026-10-16，CODE/offline；stage 在下一個 release 部署後打開，azd／dev 預設關）
 
 **一個開關：** 部署 profile 的 `api_environment` `FA_NATIVE_SESSION_GUARD_ENFORCE`。`"1"` 時 `ci_deploy.py`
 同時把每位助理（`kind=assistant`）的 Hosted overlay 設成 `FA_NATIVE_TURNS=foundry-native-v2`（sync 建出宣告 v2 的
 H2d 定義），API 打開 P5～P8 的背景切換、送出路徑與巡查；API 自己的 `FA_NATIVE_TURNS` 仍是 v1（到 2d-ii）。
-`deploy/stage/stage.json` 與 `deploy/azd/profile.defaults.json` 都寫 `"0"`。兩邊不會只開一半：`meta`／`check`
+`deploy/azd/profile.defaults.json` 寫 `"0"`；`deploy/stage/stage.json` 寫 `"1"`（合併到 main 不部署 stage，
+下一個 release PR 合併後那次部署才打開）。兩邊不會只開一半：`meta`／`check`
 拒絕開關以外的 v2（`hosted_environment` 或 `assistant_environment` 寫 v2 而開關是 `"0"`；executor 等非助理即使開關
 打開也不能寫 v2，它們不跑 API 搬移的 2d-i 回合）、開關打開時助理 overlay 另寫 v1，以及 `"0"`／`"1"` 以外的值。
 開關關時 sync job 帶 `--refuse-native-v2`：任何 Agent 目前服務的定義已宣告 v2（打開到一半停下的痕跡），該 Agent 以
@@ -49,16 +50,18 @@ Analytics 該 job execution 的 log 看，部署腳本本身只印 `sync <execut
   的 commit（`"0"`），再在那份 profile 的 `api_environment` 改 `"FA_NATIVE_SESSION_GUARD_ENFORCE": "1"`，照
   dev 的部署批准流程再部署一次；dev 測試項見 ADR-0009 閘門清單（第 2 項故障點、第 7 項全掃描時間）與 2d-i 計畫。
   azd 環境用 `azd env set FA_NATIVE_2DI true`。
-- **stage**：dev 測完後，總協調開 release PR，把 `deploy/stage/stage.json` 的值改成 `"1"`（附 dev 測試報告），由 Neal
-  決定是否合併；合併才部署。閘門 7 沒過不上 stage。
+- **stage**：`deploy/stage/stage.json` 已在 main 寫 `"1"`；dev 測完後，總協調開 release PR（附 dev 測試報告），由
+  Neal 決定是否合併；合併才部署、才打開。**這一行合併到 main 之後，下一個 release PR 一律以 GUARD 打開部署**
+  （除非該 PR 把 `stage.json` 改回 `"0"`），而且一旦部署就關不回去（`guard`／`sync`／`api` 拒絕 `"0"`）。所以閘門 7
+  要在那個 release 之前記錄好；目前只有暫時 PASS（2 次 full scan，最大 0.8 秒，之後從 stage 的 `NATIVE_UPGRADE_CUT`
+  補收樣本），記在 [progress 第 31 版候選 dev 測試](../../docs/progress.md#dev-test-v31-1018) 第 7 項。閘門 7 沒過不上 stage。
 
 **使用者看到什麼：** 部署本身不換任何 Agent 的環境，也不讓訊息等。每位助理在下一次回合結束後於背景換到新版：來源沒有
 工作檔就直接換、不等；有工作檔時最多約 120 秒的柵欄內搬檔，這段時間送出的訊息在請求內最多等 10 秒，之後顯示同步中，
 工作台以同一個 request ID 自動重送（不是「沒送出」）。換完那一則回覆帶一次通知：「助理已更新到新版本，工作檔也一起帶過來了。」、
-「已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。」或「已換到新的執行環境；舊環境已失效或被平台刪除，
-這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。」閒置的助理照舊不被叫醒，等它下一次被使用。
+「上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。」或「上次換環境時，舊環境已失效或被平台刪除，沒有搬工作檔；之前 VM 裡的工作檔可能已經不在了。」閒置的助理照舊不被叫醒，等它下一次被使用。
 
-**Verified against：** `test_stage_ci_native_2di.py`（預設關、打開時兩邊都設且 follow 只報告、只開一半被拒、executor
+**Verified against：** `test_stage_ci_native_2di.py`（stage 開、新 azd 環境預設關、真 stage.json 通過打開的離線前提、打開時兩邊都設且 follow 只報告、只開一半被拒、executor
 不能宣告 v2、`NATIVE_2DI_SCHEMA` 不足的 checkout 與真 checkout 的 AST 讀值、多 revision 或 active 不是 latest ready、
 服務中的 API 太舊或 commit 不明、打開後不能關、`sync`／`follow`／`api` 不經 `guard` 也擋、開關關時 sync job 拒絕已服務
 v2 的 Agent 並提示用 `"1"` 重跑、stage 拒絕故障點）、`test_agent_versions.py`（`--verify-follow` 把 `pending` 當報告）、
@@ -542,6 +545,18 @@ Neal 2026-10-05：「請嚴格依照hosted agent官方和grok bot的方式，詳
     `NATIVE_ENVIRONMENT_UNAVAILABLE` 並帶 `not_dispatched: true`，不當成「從未 prepare」。
 - **503 `AGENT_VERSION_FOLLOWING` 的情形。** ⓑ 送出、寫入、routine 或交辦時 selector 讀不到：503（送出另帶 `not_dispatched: true`）。ⓒ 讀取或輪詢時 selector 讀不到且超過
   120 秒沒確認過。ⓓ 原有的：selector 指向這個 API build 不相容或還沒 active 的版本、Agent 正在換環境。
+- **503 `NATIVE_EXECUTION_UNAVAILABLE`（舊 SDK runtime 還沒結束，#903）。** 回合被強制停止後，CLI 在 5 秒內沒結束，
+  Hosted 會自己再 kill 那一個 PID，然後等 2 秒。還活著就記 `NATIVE_CLI_UNKILLABLE`，並對自己送 SIGTERM，所有回合都走
+  `exit_for_recovery()` 離開。這段期間新訊息在 `rid:<RID>` 建立前就被拒（`not_dispatched: true`、`retry_after_ms`），
+  API 回 `server_following`：工作台與 Teams 用同一個 RID 重送，交辦改回 `NATIVE_RELAY_RECIPIENT_UNAVAILABLE`。
+  已接單、排隊中的訊息留在 `accepted`，不啟動 SDK。限制：已被 steering 取出的排隊訊息，重啟後 SDK core 2.2.0 給
+  `ctx.input=None`，不會自動接續（`origin/main` 就有）。
+  常駐 SDK 的 stop 還在跑（例如淘汰閒置 SDK，通常約 2 秒）不算：訊息照常收下（202）。只有同一個對話的回合在開始前等
+  自己 SDK 的 stop 結束；其他對話的 stop 不等，所以淘汰時最多會同時有三個 CLI（上限兩個常駐 SDK，加上一個還在停的；
+  彼此不共用檔案），只擋已登記、停不掉的 CLI。那個 stop 若在新 client 啟動後才發現 CLI 停不掉，重啟會先等正在跑的回合
+  做完並保存（不設上限，回合砍到一半會被重跑），才送 SIGTERM；回合自己的 CLI 停不掉時，也等這個回合自己保存完才送。Teams 的輪詢沒被收下（`not_dispatched`）時，relay 不把它算成「還在跑」；
+  整段 110 秒都沒確認收到，就顯示 relay 既有的「暫時無法確認」。讀不到回條（`NATIVE_RID_MISSING`、版本切換中的
+  `NATIVE_SESSION_CHANGED`）都證明不了先前的輪詢沒被收下，所以不叫人重傳。
 - **窗口內的殘餘。** 讀取與輪詢在 10 秒窗口內，仍可能打到另一個程序剛移走版本的舊 SID 一次；送出、寫入、routine、
   交辦與 prewarm 不會。
 - **送出不必等外部 follow。** 部署用 `--defer-follow` 卻沒有接著 follow，或 follow 在選定版本的 session 建好前失敗時，
@@ -1098,7 +1113,12 @@ M5 新 SID 的 attempt（`fresh`，phase 3；只在新 SID 讀回不能用時才
   閘門打開（armed）時以 `rows_unread` 拒絕部署（[deploy README](../../deploy/README.md#compat-gate)）；通知送出、清除後欄位不寫出，
   列又讀得到。stage 目前沒打開閘門，只會報告 `observe`。
   部署先更新 API、後更新工作台，舊 bridge 解到不認識的通知種類會回 502，所以用能力訊號（同 `X-FA-Relay-Ack` 的做法）：
-  新 bridge 的每個 API 請求帶 header `X-FA-Notice-Kinds: 2`；主人的 submit 只在有這個 header 時才帶三種換環境通知、
+  新 bridge 的每個 API 請求帶 header `X-FA-Notice-Kinds: 2`（值固定是 `2`：phase 2c 的 API 只認這個值；6a (c) 的能力另用
+  `X-FA-Upgrade-Waiting: 1`，見下方升級 reconciler 的 (c)；phase 4d 另帶 `X-FA-Rollback-Notice: 1`：「已退回」
+  `environment_rolled_back`（與它的 `without_files`）只送給也帶這個 header 的請求，沒帶的 bridge 拿不到也不清（槽裡是
+  「已退回」時只帶漂移通知，和沒帶 header 一樣），比 4d 舊的 API 不理會它；phase 4b-4 另帶 `X-FA-Upgrade-Vetoed-Notice: 1`：
+  U3 第 3 次失敗、本 Agent 否決目標時的「沒有更新」`environment_upgrade_vetoed` 規則相同，綁定列槽值 `vetoed`，
+  `NATIVE_IDLE_SCHEMA` 4）；主人的 submit 只在有 `X-FA-Notice-Kinds` 時才帶換環境通知、
   回應寫出後才清除。沒有這個 header 時和 phase 2c 之前完全一樣：只帶漂移通知（槽裡有換環境通知也不帶，因為舊 bridge
   解不了），任何通知都不清，留給更新後的工作台第一個回應。沒有部署順序要求。Teams 路由不看這個 header：relay 只轉 `text`
   （見[工作台 README](web_test_console/README.md#environment-notices)）。
@@ -1201,7 +1221,7 @@ selector 移動已不再讓綁定列的 SID 失效，2d-i P7）。**打開這個
   `session_read`（不是紀錄讀取，被取代的 session 照常回答），依其 `ready` 環境以 `record_switch` 補寫綁定列，再同 RID
   改送新 SID；留 `NATIVE_BINDING_DIVERGED`，不記漂移。session 讀取時就發現的不一致同樣補寫後改用新 SID。
   補寫走 `record_switch`，所以也照 phase 2c 寫下這次換環境的通知（`switch_notice`）；同一請求的回應就以切換後的綁定列
-  帶出它（`_bound` 用回答的那個 client 的綁定列），工作台送了 `X-FA-Notice-Kinds: 2` 才顯示。
+  帶出它（`_bound` 用回答的那個 client 的綁定列），工作台送了 `X-FA-Notice-Kinds: 2` 才顯示（另帶的 `X-FA-Upgrade-Waiting` 不影響這個判斷；「已退回」另要 `X-FA-Rollback-Notice: 1`）。
 - **403 `NATIVE_TURNS_DISABLED`、SID 沒變（§9）：** 確定沒派送（profile 檢查在讀 body 前）。記漂移（若帶
   `actual_version`）、標記這個 SID、記 log，跑一次保留的 follow，回 503 `AGENT_VERSION_FOLLOWING`＋`not_dispatched`；follow 還在 `pending` 或已把 Agent 移出
   這個 SID 才加 `server_following`（工作台以同 RID 自動重送），否則照現行回應（`refused_session_id`）。其他沒能解開的
@@ -1390,14 +1410,44 @@ selector 移動已不再讓綁定列的 SID 失效，2d-i P7）。**打開這個
   每輪一行 `NATIVE_SESSION_PATROL` 計數 log。
 - **升級 reconciler（ADR-0009 第 12 點、phase 6a，`native_upgrade_reconciler.py`）：** `FA_NATIVE_UPGRADE_RECONCILER=1`
   且 `FA_NATIVE_SESSION_GUARD_ENFORCE=1` 才排程（預設關：不建 task）。回合結束仍是主要觸發；這是備援：每 15 分鐘加最多
-  5 分鐘抖動掃一次服務中 Agent 的綁定列，只做第 12 點的 (a)(b)，都交給同一個背景切換 worker（`CutDriver.turn_ended`）：
+  5 分鐘抖動掃一次服務中 Agent 的綁定列，做第 12 點的 (a)(b)，都交給同一個背景切換 worker（`CutDriver.turn_ended`）：
   (a) 綁定列 profile 不相容或已有棄用決定（不讀平台）；(b) 相容、V_rec 不是 selector 選的版本，而且目前 SID 的
   `get_session` 是 `active`（錯過回合結束，例如 API 在回合途中重啟）。先讀 selector：V_rec＝selector 就沒有要切的，不讀
   `get_session`；相容且 `idle`／已失效的不動（Neal 決定 5；已失效的由每日巡查決定）。自己只讀 selector 與 `get_session`，
-  不 invoke、不碰 Files、不 stop、不寫綁定列。去重只在 process 內（綁定列的嘗試時間欄位與 (c) 等 phase 4b）：交過的 Agent
+  不 invoke、不碰 Files、不 stop，不寫綁定列（只有下面 (c) 的單列 CAS 例外）。去重只在 process 內（綁定列的嘗試時間欄位 `idle_upgrade.last_attempt_at` 4b-1 已加、還沒有寫入者；寫入與 (c) 等 phase 4b 之後）：交過的 Agent
   1 小時內不再交；V_rec＝selector、不動，或選定版本還沒就緒的 Agent，綁定列沒變就 24 小時內不再讀；V_rec＝selector 的 Agent 每天讀一次 selector、
   不讀 `get_session`，V_rec 不是 selector 的閒置 Agent 到期時每天多讀一次 `get_session`；API 重啟後第一輪全部重讀。不相容但還沒有棄用決定的列，6a 不寫決定，`cut` 回 `unbound`（`cut` 只執行
-  已寫的決定），等 phase 4b（總協調決定）。每輪一行 `NATIVE_UPGRADE_RECONCILER` 計數 log。
+  已寫的決定），等 phase 4b（總協調決定；(c) 已做，見下）。每輪一行 `NATIVE_UPGRADE_RECONCILER` 計數 log。
+  **(c) 延後超過 6 小時的狀態欄位（phase 6a (c)，Neal 決定 4）：** 只在 `FA_NATIVE_IDLE_UPGRADE=1` 也開時啟動（三個開關都開）。
+  掃到綁定列 `idle_upgrade.deferred_since` 已超過 6 小時、目標 `target_version` 仍不是 V_rec（還沒切）、列相容且沒有棄用決定時，
+  `NativeBindingStore.record_waiting` 以單列 CAS 把 `idle_upgrade.waiting` 設成 `pending`，每個目標只做一次。判斷用這一輪本來就讀到的列，
+  所以沒到期的 Agent 沒有額外讀取，到期的那一次多一次列重讀加一次寫入，排在 24 小時退避之前（列沒變，退避擋不住 6 小時到期）。
+  不切換、不叫醒、不呼叫 session、不讀 selector。目標換了（`record_due`）或切換完成（`record_switch`）會重建 `idle_upgrade`，note 隨之結束。
+  交付：`NativeReceipt.upgrade_waiting_version`（v2 wire 只長一個預設不輸出的選填欄位；不新增通知種類，種類是 v2 凍結的列舉）。
+  只有主人本人的工作台送出回應帶，而且只有在 `X-FA-Notice-Kinds: 2` 之外另帶 `X-FA-Upgrade-Waiting: 1` 的 console 才帶（只帶前者的 2c console 照原樣，這欄位不送、也不清）；
+  槽裡有換環境或漂移通知時不帶（狀態列一次一句，先送較重的）；回應寫出後 `clear_waiting` 把 `pending` 改成 `shown`（留著，所以同一目標不會再做一次）。
+  Teams 不帶（M4 的 A 第 6 項，只在工作台狀態欄位）。`waiting` 只有 reconciler 在三個開關都開時寫（`FA_NATIVE_IDLE_UPGRADE`
+  關時沒有寫入者）。**不能退版：** 沒有 `waiting` 欄位的 API 以 `extra="forbid"` 解碼帶這欄位的列會回 409
+  `NATIVE_BINDING_INVALID`，所以 `native_binding.NATIVE_IDLE_SCHEMA` 從 6a (c) 起是 2，`ci_deploy.API_IDLE_SCHEMA` 也是 2：
+  打開閒置升級的那一次，服務中的 commit 必須已是 2（先以 `"0"` 部署含 6a (c) 的 commit，下一次才改 `"1"`），開過之後 API 不退回
+  6a (c) 以下。2026-10-19（4d 第三輪）起開著時的每一次部署也檢查：服務中的 commit 低於這個 commit 的 schema
+  就拒絕（先以 `"0"` 部署，再改回 `"1"`），所以舊 revision 排空期間不會讀到它解不開的列。
+- **閒置升級開關（ADR-0009 phase 4b-1，`FA_NATIVE_IDLE_UPGRADE`）：** 預設關，`stage.json`／`profile.defaults.json` 都寫
+  `"0"`。只能在 2d-i 開關上面開：`FA_NATIVE_IDLE_UPGRADE=1` 而 `FA_NATIVE_SESSION_GUARD_ENFORCE` 不是 `1` 時 API 啟動就拒絕
+  （`ValueError`），`ci_deploy.py` 的 `meta`／`check` 也拒絕這份 profile；打開的那一次另照 2d-i 打開時的規則要求單一 revision
+  模式、只有一個 active revision 而且是 `latestReadyRevisionName`。API 程序自己看不到 revision，所以這一項由部署檢查；ADR
+  第 12 點其餘啟用條件（新 Hosted image 已是所有 Agent 的目標、開放 RID 集合已補齊、4a 的開始計數已上線）程式不檢查，由
+  打開的人照 ADR 核對。開了之後 `NativeSessions.cut` 在 V_rec≠selector 時多兩個 U0 條件：目標版本在本 Agent 的否決清單
+  （綁定列 `idle_upgrade.vetoed_versions`）或專案層否決列（Context Table 分割區 `native-version-veto`，`native_version_veto.py`，
+  每個（Hosted agent 名稱, 版本）一列，只 Insert、409 讀回）內就回 `vetoed`、什麼都不建；否決列因 Table 讀取失敗（store 包成的
+  `Problem`）讀不到回 `veto_unread`，程式錯誤（例如分割區撞到舊清單）不吞，讓這次 cut 以 `outcome=error` 記錄；相容
+  來源不是 `active` 就不建目的 session（`idle` 照舊 `source_idle`，其他回 `source_unavailable`；目的端已有、綁定列漏記的
+  commit 仍照舊補記）。U0 條件都成立（未否決、相容來源 `active`、目標相容）後，目標第一次到期時才以 CAS 寫綁定列
+  `idle_upgrade` 的 `target_version` 與 `deferred_since`（延後起點，同一目標只寫一次，selector 換目標時重設；來源 `idle` 或目標
+  不相容時什麼都不寫）；換環境的 `record_switch` 重建綁定列時不帶它。其餘欄位（`last_attempt_at`、
+  `health_failures`、`switched_at`、`start_failures`）與否決的寫入者是之後的 4b／4d。**不能退版：** 比 4b-1 舊的 API 以
+  `extra="forbid"` 解碼帶 `idle_upgrade` 的綁定列會回 409 `NATIVE_BINDING_INVALID`（同 `clocks` 的規則），所以開過一次之後 API
+  不退回 4b-1 以下。要先以 `"0"` 部署含 4b-1 的 commit，下一次部署才改 `"1"`（同 2d-i 開關的兩步）：否則新 revision 第一次寫 `idle_upgrade` 時，還在服務的舊 revision 讀那一列會回 409。部署端照 2d-i 的做法以 AST 讀服務中 commit 的 `native_binding.NATIVE_IDLE_SCHEMA`（4b-1 起為 1，6a (c) 起為 2，4d 起為 3，`ci_deploy.API_IDLE_SCHEMA` 要求 3），打開的那一次與開著時的每一次部署，不夠就拒絕（開著時不要求只剩一個 active revision）。開關關時 `cut` 與 2d-i 完全相同。4d（API）：切換時 `record_switch` 寫 `switched_at`（退回本身的切換不寫，所以退回後的版本不再被判定、否決）；之後 30 分鐘內的回合結束背景 `cut` 讀目前 SID 的 `recent_crashes`（只在 `active` 時讀），切換後 3 個不同 CID 與 RID 的崩潰就寫專案層與本 Agent 的否決，再經同一個 `cut` 退回前一個版本（目的 SID 由目前 SID 算出，不叫醒原舊 SID），通知槽寫「已退回」（沒帶工作檔時是 `rolled_back_without_files`，句後接不搬檔那句）。已判定但沒做完的退回（`busy`，或柵欄超時）在之後每次回合結束重試，不受 30 分鐘限制：目前版本在本 Agent 的否決清單就直接退回；柵欄記下 `rollback`，之後由哪條路完成都寫「已退回」。退回不看目標版本的專案層否決，只看本 Agent 的（總協調 2026-10-19）；目標也在本 Agent 的否決清單時沒有可退的版本：記一次 `NATIVE_CRASH_LOOP_NO_ROLLBACK` 與 `idle_upgrade.rollback_blocked`，留在目前版本、不再重試。本 Agent 的否決先寫；沒寫成時這個 process 內每次回合結束都重試（API 重啟時窗口已過就不再判定）。§7a 的 carry-out 不會把 Agent 搬到本 Agent 否決的版本，改用目前版本的新 SID（決定是目前版本不相容時不搬）。U3 健康檢查、U9 stop／預熱／預先還原與 `start_failures` 的寫入還沒做。
 
 <a id="abandon-left-receipts"></a>
 ### 切換後留下的回條：(r)(s) 與競爭規則（ADR-0009 §7a「(r)(s) 的競爭」）
@@ -7137,7 +7187,7 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
   `release.json` 一起放進同一個 release PR。PR 開出後 main 又前進，就照 release 門檻開新的 release PR，並在新的
   main commit 上重產。
 - **手動部署**：GitHub Actions 的 deploy-staging 選 Run workflow，分支選 main，並填 `release_pr`；或執行 `gh workflow run deploy-staging.yml --ref main -f release_pr=<PR 編號>`。同樣部署 main HEAD。
-- **release 門檻**（job `release-gate`，[`deploy/stage/release_gate.py`](../../deploy/stage/release_gate.py)，在 Azure 登入之前）：部署的 commit 必須正好是一個已合併 PR 的合併 commit，那個 PR 改了 `deploy/stage/release.json`（只讀前 100 個檔案，讀不到就擋下），合併時的說明有唯一一行 `public-sync fingerprint:`（第一道，見 [public-sync](../../docs/public-sync.md)），合併後沒再編輯；手動部署填的 PR 也必須是它。所以 release PR 之後 main 又有新合併時，手動部署會被擋下，要部署較新的 main 請開新的 release PR。門檻只確認「這是 release PR 的合併」，不確認是誰按的合併：免費方案的 private repo 不能設 branch protection／rulesets（API 回 403），沒有 CODEOWNERS，agent 也用 `neallee2012` 合併，檢查 `mergedBy` 永遠會通過（2026-10-16，見 [ADR-0008](../../docs/adr/0008-environment-tiers-staging-cicd.md#2-部署規則)）。
+- **release 門檻**（job `release-gate`，[`deploy/stage/release_gate.py`](../../deploy/stage/release_gate.py)，在 Azure 登入之前）：部署的 commit 必須正好是一個已合併 PR 的合併 commit，那個 PR 改了 `deploy/stage/release.json`（而且沒有刪掉它；只讀前 100 個檔案，讀不到就擋下），合併時的說明有唯一一行 `public-sync fingerprint:`（第一道，見 [public-sync](../../docs/public-sync.md)），合併後沒再編輯；手動部署填的 PR 也必須是它。所以 release PR 之後 main 又有新合併時，手動部署會被擋下，要部署較新的 main 請開新的 release PR。門檻只確認「這是 release PR 的合併」，不確認是誰按的合併：免費方案的 private repo 不能設 branch protection／rulesets（API 回 403），沒有 CODEOWNERS，agent 也用 `neallee2012` 合併，檢查 `mergedBy` 永遠會通過（2026-10-16，見 [ADR-0008](../../docs/adr/0008-environment-tiers-staging-cicd.md#2-部署規則)）。
 - **只能在 main 上跑**：job 有 `if: github.ref == 'refs/heads/main'`，federated credential 也只信任 main 上的 `staging` environment。所以不能用 tag 或其他分支觸發。
 - **全部Agent換版接續**：API就緒後的部署尾端自動推進A／B及「＋」Agent的原follow，
   不需打開工作台或按環境按鈕；未ready明確標為未完成，不能以selector已發布冒充（見[伺服器接續](#server-environment-follow)）。

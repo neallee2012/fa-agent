@@ -2,12 +2,13 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 import os
+import random
 import re
 from threading import Event, Lock, RLock
 from time import monotonic, sleep
@@ -23,10 +24,11 @@ from .behavior_native_turn_wire import (
     NativeSessionFilesOmission, NativeUnfinishedRead,
     NativeEnvironmentCommand, NativeEnvironmentRetargetCommand, material_digest,
 )
+from . import upgrade_snapshot_flow
 from .errors import Problem
 from .native_binding import (
     INCOMPATIBLE_STATE_PROFILE, SUPPORTED_STATE_PROFILES, NativeBindingUpgrade, SessionGuard, binding_store,
-    session_guard_enforced,
+    idle_upgrade_enabled, session_guard_enforced,
 )
 
 
@@ -128,6 +130,44 @@ FENCE_BROKEN_SECONDS = 300
 CLEAR_DRIVE_PASSES = 5
 CLEAR_PASS_SECONDS = 2
 _clear_sleep = sleep
+# ADR-0009 §5 / 4d crash-loop (``FA_NATIVE_IDLE_UPGRADE``): this many crashes, of as many distinct CIDs and RIDs, within
+# this long after a switch veto the new version and roll the Agent back.
+CRASH_LOOP_SECONDS = 1800
+CRASH_LOOP_COUNT = 3
+# ADR-0009 U3: the destination reads back this many recent conversations' checkpoints (the wire's bound); this many
+# failed checks of one target veto it for this Agent.
+HEALTH_CHECK_CONVERSATIONS = 5
+HEALTH_VETO_COUNT = 3
+# One conversation per call, newest first, all of U3 within this many seconds (each call gets what is left as its own
+# timeout, so U3 stays under the client's 30 s); no call starts with less than the minimum left: the older ones are
+# then not checked this time. A CID refused with NATIVE_STATE_SCOPE this many times for one target is skipped.
+HEALTH_CHECK_SECONDS = 20
+HEALTH_CALL_MIN_SECONDS = 5
+HEALTH_SCOPE_REPEATS = 2
+# After a failed check the next one waits this long plus a random part of it up to as long again (§5's jitter).
+HEALTH_RETRY_SECONDS = 60
+# ADR-0009 U9: this many recent conversations are restored into the destination before the switch (the wire's bound).
+PRERESTORE_CONVERSATIONS = 2
+# U9's stop (at most 10 s) and prewarm (at most 30 s) after the switch, measured from U9's own start.
+FINISH_SECONDS = 40
+# The version a 4d rollback goes to, set only inside that rollback's own ``cut`` (each background attempt runs in its
+# own context copy, so no send or other Agent sees it): every selector read of that cut names it instead.
+_ROLLBACK = ContextVar("fa_native_rollback", default=None)
+
+
+def _unvetoed(row, version):
+    """The version a §7a carry-out of ``row``'s decision goes to: ``version``, unless this Agent vetoed it (4d: it
+    rolled back from it, so 42 -> 41 -> 42 never happens); then a fresh SID of the current version (M5). When the
+    decision is that the current version is incompatible a fresh SID of it is no better, so ``version`` it is: the Agent
+    keeps serving, and the next rollback from it ends in ``target_incompatible``, recorded once (``rollback_blocked``)."""
+    vetoed = () if row.idle_upgrade is None else row.idle_upgrade.vetoed_versions
+    if version == row.created_agent_version or version not in vetoed:
+        return version
+    if row.abandon is not None and row.abandon.basis == "incompatible":
+        return version
+    logging.getLogger(__name__).warning("NATIVE_ENVIRONMENT_SWITCH_VETOED agent_id=%s version=%s instead=%s",
+                                        row.agent_id, version, row.created_agent_version)
+    return row.created_agent_version
 
 
 def _wall(store):
@@ -160,6 +200,13 @@ class _CutFence:
         if self.mark is None or not self.mark():
             raise _FenceOverrun()  # no confirmed marker: no stop is sent, and the fence is withdrawn
         self.stopped = True
+
+
+def _left(bound, cap=30):
+    """Seconds one background call may take: what is left of the cut's ``bound``, at most ``cap``; ``bound()`` raises
+    ``_FenceOverrun`` past it or on shutdown."""
+    bound()
+    return min(cap, bound.deadline - monotonic())
 
 
 def cut_request_id(agent_id, source_session_id, session_id):
@@ -445,8 +492,23 @@ class NativeSessions:
         self._deciding_abandon = False
         # Destination SIDs whose image rejected ``settled_session_ids`` (``_follow_invoke``).
         self._settled_unsupported = set()
+        # (agent ID, SID, version) crash-loops decided here whose own veto write failed (``_crash_loop``).
+        self._veto_unrecorded = set()
+        self._project_vetoed = set()  # (agent_name, version) whose project veto row was confirmed written
+        # ADR-0009 5b (``upgrade_snapshot_flow``): Agent ID -> (source SID, upgrade ID, (root mode, entries)) of its last
+        # published snapshot, the next one's incremental base and the tree a kept destination may already hold; and
+        # the versions whose image refused the 5b fields (422), not asked again; (Agent ID, target) -> consecutive failed
+        # restore switches; (destination SID, staging path) of restore PUTs whose ACK was lost and not yet read back.
+        self._snapshot_bases, self._snapshot_unsupported, self._restore_failures = {}, set(), {}
+        self._restore_unconfirmed = set()
+        # U3: how often each (agent ID, CID, target) answered 403 NATIVE_STATE_SCOPE; skipped once it repeats
+        # (shortcut: in process memory, so a restarted API asks once more before skipping it; fine for a read-only
+        # check).
+        self._scope_refused = {}
         # The zero-call guard every Foundry client of this composition (and each one derived from it) checks.
         self.guard = SessionGuard(lambda: binding_store(composition), enforce=session_guard_enforced())
+        # ADR-0009 phase 4b (``FA_NATIVE_IDLE_UPGRADE``): U0's conditions in ``cut``.
+        self.idle_upgrade = idle_upgrade_enabled()
         for client in getattr(composition, "clients", ()) or ():
             slot = getattr(client, "_session_guard", None)
             if isinstance(slot, list) and len(slot) == 1:
@@ -504,6 +566,14 @@ class NativeSessions:
         """A row this process just wrote (drift record, repaired switch) is the next locator."""
         with self._reader_lock:
             self._bound_row = (_scope(client.target), row, monotonic())
+
+    def keep_written(self, row):
+        """``_keep_row`` for a write made without a client in hand (``clear_waiting``): the row replaces the kept row
+        of the same Agent, so the next submit does not reuse the old one. An Agent with no kept row keeps nothing."""
+        with self._reader_lock:
+            kept = self._bound_row
+            if kept is not None and kept[1] is not None and kept[1].agent_id == row.agent_id:
+                self._bound_row = (kept[0], row, monotonic())
 
     def _bound_client(self, client, row, *, version=None):
         """``client`` aimed at the binding row's current SID, expecting its recorded actual version (V_rec)."""
@@ -646,7 +716,8 @@ class NativeSessions:
                 profile, unread = NATIVE_STATE_PROFILE, True
             # A new row field only with 2d-i on: an older API revision decodes rows strictly (extra="forbid").
             return store.record_switch(client.target.agent_id, value, state_profile=profile,
-                                       profile_unread=unread and self.guard.enforce)
+                                       profile_unread=unread and self.guard.enforce, idle_upgrade=self.idle_upgrade,
+                                       rollback=_ROLLBACK.get() == value.hosted_agent_version)
 
         return self._binding("switch", switching)
 
@@ -725,6 +796,8 @@ class NativeSessions:
 
     def selected_version(self, client):
         from .behavior_agent_versions import current_hosted_version
+        if _ROLLBACK.get() is not None:
+            return _ROLLBACK.get()
         self.desired_version = current_hosted_version(self.composition.runtime, client.target)
         return self.desired_version
 
@@ -734,6 +807,8 @@ class NativeSessions:
 
         "After" is strict: with a coarse clock (about 16 ms on Windows) an earlier request's read can share the
         tick in which a submit starts. ``stale_read``: see ``reader``."""
+        if _ROLLBACK.get() is not None:
+            return _ROLLBACK.get()  # a rollback's own reads never enter the shared selector cache
         scope = _scope(client.target)
         started = monotonic()
         if checked_since is None:
@@ -1098,11 +1173,20 @@ class NativeSessions:
         """After a refusal from the row's SID: the client to send the same command to once, or None. A compatible
         drift goes to V_obs; a stale row (``replaced``, or V_obs = V_rec) is repaired from that SID's own session state
         (``session_read`` is not a record read, so a replaced session still answers it; it is active, it just
-        answered). Never raises: the original refusal stands when nothing is confirmed."""
+        answered). A refusal naming ``current_hosted_session_id`` is repaired to that SID or to nothing. Never raises:
+        the original refusal stands when nothing is confirmed."""
         row = getattr(client, "_binding_row", None)
         if row is None:
             return None
+        named = error.body["error"].get("current_hosted_session_id")
         try:
+            if named is not None:
+                # ADR-0009 4c-2: a ``replaced`` 409 names the Agent's current SID; the repair must land exactly there.
+                repaired = self._repair(client, self._state(client), row)
+                if repaired is not None and repaired[0].target.session_id == named:
+                    return repaired[0]
+                logging.getLogger(__name__).warning("NATIVE_RELOCATE_NAMED_UNCONFIRMED session_id=%s", named)
+                return None
             drifted = self._drifted(client, error, row)
             if drifted is not None:
                 return drifted[0]
@@ -1692,11 +1776,13 @@ class NativeSessions:
         """The binding row's written §7a decision, carried out by any caller at ``version``'s destination (a fresh SID
         when that is the current SID's own version, M5), never invoking, reading from or stopping the current SID; a
         commit the row missed is recorded (§7a (j)). The switched view, or None when the row holds no decision or
-        Hosted's record names another source."""
+        Hosted's record names another source. ``version`` is one this Agent vetoed (4d: it rolled back from it) only
+        when the current version is incompatible: ``_unvetoed`` names the version."""
         found = self._binding_row(client.target.agent_id)
         row = None if found is None else found[1]
         if row is None or row.abandon is None or row.abandon.hosted_session_id != row.hosted_session_id:
             return None
+        version = _unvetoed(row, version)
         destination = self._destination(client, version, before_send, mark=False, row=row)
         state = self._state(destination)
         existing = state.environment
@@ -2182,7 +2268,7 @@ class NativeSessions:
                 return value
             return self.follow(client, follow, before_send=before_send)
 
-    def cut(self, client, *, stop=None):
+    def cut(self, client, *, stop=None, target=None):
         """ADR-0009 M1 2d-i step 2, run in the background after a turn end (``native_cut``): move the Agent from the
         binding row's SID to the selected version's session while the shared store is quiet. Returns
         (outcome, reason, fence seconds or None) for the ``NATIVE_UPGRADE_CUT_API`` line.
@@ -2196,16 +2282,27 @@ class NativeSessions:
         the source and commit within ``CUT_FENCE_SECONDS``; an overrun or a failure before FA's stop of the source
         withdraws the fence, and after its marker (``stop_started``) the fence is only ever driven forward, at its own
         destination whatever the selector names by then. Busy waits for the next turn end: nothing here loops or polls
-        outside that fence. The source is never invoked. A fence the row records (left by a crash or an ended job) is
+        outside that fence. Only 5b's snapshot (both flags on, an ``active`` source; ``upgrade_snapshot_flow``)
+        invokes the source; with it the files are restored on the destination before a no-fence commit that records
+        them. A fence the row records (left by a crash or an ended job) is
         settled at its own destination before the selector is read (``_converge``, as every send's ``advance`` does
         first), and a commit the row missed is
         recorded (§7a (j)); an ``admitting`` seen for ``STUCK_ADMISSION_SECONDS`` is abandoned (§7a). ``self.lock`` is
         held only by the fence's follow steps, so no send waits behind a probe. Waiting for a new destination to be
-        ready (and the sends after it) ends at ``CUT_DESTINATION_SECONDS`` or on shutdown: ``_FenceOverrun`` is raised."""
+        ready, the sends after it (the probe, 5b's carry, the no-fence switch) end at one ``CUT_DESTINATION_SECONDS``
+        from the cut's start or on shutdown: ``_FenceOverrun`` is raised (5b's carry falls back to the fence instead).
+
+        ``target``: 4d's rollback (``_crash_loop``), the version this cut goes to instead of the selector's."""
         from .behavior_native_turn_api import NativeTurnGateway
         from .behavior_native_turn_wire import NativeSessionCut
         from .behavior_session_files import SessionFiles
 
+        if target is not None:
+            token = _ROLLBACK.set(target)
+            try:
+                return self.cut(client, stop=stop)
+            finally:
+                _ROLLBACK.reset(token)
         agent_id = client.target.agent_id
         found = self._binding_row(agent_id)
         row = None if found is None else found[1]
@@ -2217,6 +2314,10 @@ class NativeSessions:
             settled, row = self._converge(client, row, stop=stop)
             if settled is not None:
                 return settled, None, None
+        if self.idle_upgrade and row.abandon is None and _ROLLBACK.get() is None:
+            rolled = self._crash_loop(client, row, stop)
+            if rolled is not None:
+                return rolled
         selected = self.selected_version(client)
         # The wait for a new destination (``create_session`` polls while it is creating/updating) and any send after
         # it end at the bound or on shutdown: ``_FenceOverrun`` leaves the cut, the next trigger tries again.
@@ -2229,6 +2330,12 @@ class NativeSessions:
             return ("abandoned" if switched is not None else "abandon_pending"), None, None
         if row.observed.agent_version == selected:
             return "current", None, None
+        if self.idle_upgrade:
+            # Before the source and target are read (no extra read without the flag); the deferral start is recorded
+            # only once both pass (U0).
+            refused = self._idle_due(client, row, selected)
+            if refused is not None:
+                return refused
         source_sid = row.hosted_session_id
         source = client.for_target(_target(client.target, session_id=source_sid, agent_version=row.observed.agent_version))
 
@@ -2236,7 +2343,9 @@ class NativeSessions:
             metadata = _session_metadata(source)
             return "missing" if metadata is None else metadata.status
 
-        if source_status() == "idle":
+        status = source_status()
+        # ADR-0009 U0 (Neal decision 5): with the idle upgrade a compatible source moves only while ``active``.
+        if status == "idle" or self.idle_upgrade and status != "active":
             # Coordinator 2026-10-16: an idle source's files can not be copied without waking it, so no session is
             # created and the source is not read; the Agent moves at its next real turn end (a stale receipt read is
             # harmless). What an existing destination holds (a legacy pending, a commit the row missed) still settles.
@@ -2246,13 +2355,18 @@ class NativeSessions:
                 settled = self._settle(client, existing, self._state(existing), row)
                 if settled is not None:
                     return settled, None, None
-            return "source_idle", None, None
+            return ("source_idle", None, None) if status == "idle" else ("source_unavailable", status, None)
         try:
             profile = _native_profile(client.for_target(_target(client.target, agent_version=selected)))
         except Problem as error:
             return "target_unread", error.body["error"]["code"], None
         if profile not in SUPPORTED_STATE_PROFILES:
             return "target_incompatible", profile, None
+        if self.idle_upgrade:
+            self._record_due(row, selected)  # U0 held: target compatible, compatible source active, not vetoed
+            waiting = self._health_wait(row, selected)  # before any destination is created or woken
+            if waiting is not None:
+                return waiting
         destination = self._destination(client, selected, bound, mark=False, row=row)
         sid = destination.target.session_id
         if sid == source_sid:
@@ -2261,6 +2375,8 @@ class NativeSessions:
         state = self._state(destination)
         settled = self._settle(client, destination, state, row)
         if settled is not None:
+            if settled == "repaired" and self.idle_upgrade:
+                self._finish(source, destination, bound=bound)  # U9 for a commit the row missed, once recorded
             return settled, None, None
         if state.admission_request_id is None:
             self._admitting_seen.pop(agent_id, None)
@@ -2272,10 +2388,16 @@ class NativeSessions:
             if status not in {"active", "idle"}:
                 return "source_unavailable", status, None
             return self._abandon_stuck(client, row, status, selected, bound), "stuck_admission", None
+        if self.idle_upgrade:
+            unhealthy = self._health(destination, row, selected, bound)  # U3, before the probe
+            if unhealthy is not None:
+                return unhealthy
+            self._prerestore(destination, row, bound)  # U9's pre-restore: after U3, before U5
         request_id = cut_request_id(agent_id, source_sid, sid)
         settled_ids = self._settled(found, destination)
-        probe, _ = NativeTurnGateway._invoke(destination, NativeSessionCut(
-            request_id=request_id, expected_session_id=source_sid, mode="probe", settled_session_ids=settled_ids))
+        asked = NativeSessionCut(request_id=request_id, expected_session_id=source_sid, mode="probe",
+                                 settled_session_ids=settled_ids)
+        probe, _ = NativeTurnGateway._invoke(destination, asked, timeout=_left(bound))
         if probe.quiet_etag is None:
             return "busy", probe.reason, None
         # Read after the probe (probe, then list): a source that turned active before the quiet point is listed.
@@ -2284,22 +2406,372 @@ class NativeSessions:
             return "source_unavailable", status, None
         if status == "idle":
             return "source_idle", None, None
+        # ADR-0009 5b U1/U4 (flags off: no call): the workspace snapshot and its restore, between E0 and the cut, within
+        # what is left of the cut's ``bound``.
+        carried = upgrade_snapshot_flow.carry(self, client, source, destination, asked, probe.quiet_etag, bound)
+        if isinstance(carried, tuple):
+            return carried
         try:
             # ADR-0009 §10: only an active source is listed; an idle one was reclaimed and is never woken.
-            files = SessionFiles(client).has_files(source_sid)
+            files = carried is None and SessionFiles(client).has_files(source_sid)
         except Problem as error:
             return "files_unknown", error.body["error"]["code"], None
         command = NativeSessionCut(request_id=request_id, expected_session_id=source_sid,
                                    expected_etag=probe.quiet_etag, files_required=files,
-                                   settled_session_ids=settled_ids)
+                                   settled_session_ids=settled_ids, files_restore=carried)
         if files:
-            return self._fenced(client, destination, command, row, selected, stop)
-        value, _ = NativeTurnGateway._invoke(destination, command)
+            fenced = self._fenced(client, destination, command, row, selected, stop)
+            if fenced[0] == "ready":
+                upgrade_snapshot_flow.switched(self, destination, failed=False)
+            if self.idle_upgrade and fenced[0] == "ready":
+                self._finish(None, destination, bound=bound)  # the fence already stopped the source
+            return fenced
+        try:
+            value, _ = NativeTurnGateway._invoke(destination, command, timeout=_left(bound))
+        except Problem as error:
+            if carried is None:
+                raise
+            code = error.body["error"]["code"]
+            if code == "FOUNDRY_INVOCATION_UNKNOWN":
+                # Unknown, not failed (rule 7): read back; a commit the row missed is recorded (§7a (j)), never counted.
+                settled = self._settle(client, destination, self._state(destination), row)
+                if settled == "repaired":
+                    upgrade_snapshot_flow.switched(self, destination, failed=False)
+                    self._finish(source, destination, bound=bound)  # U9, after U8 (carried implies idle_upgrade)
+                return settled or "busy", code, None
+            # The staged restore did not commit (a staged file differs, or the publish is unconfirmed): no switch; the
+            # third such failure in a row for this target sends the next attempt through the fence.
+            upgrade_snapshot_flow.switched(self, destination, failed=True)
+            return "busy", code, None
         if value.state != "ready":
             return "busy", value.reason, None
         self._confirm_environment(destination, value)
         self.forget()
-        return "ready", None, None
+        upgrade_snapshot_flow.switched(self, destination, failed=False)
+        if self.idle_upgrade:
+            self._finish(source, destination, bound=bound)  # U9, after U8
+        return "ready", None if carried is None else "snapshot", None
+
+    def _idle_due(self, client, row, selected):
+        """ADR-0009 U0 (``FA_NATIVE_IDLE_UPGRADE``): ``cut``'s outcome when ``selected`` is vetoed (this Agent's list on
+        the row, or the project-level row, which a 4d rollback does not read) or the veto can not be read; else None.
+        Nothing is written here."""
+        from .native_version_veto import veto_store
+
+        kept = row.idle_upgrade
+        if kept is not None and selected in kept.vetoed_versions:
+            return "vetoed", "agent", None
+        if _ROLLBACK.get() is not None:
+            # Coordinator 2026-10-19: the current version's crash-loop outweighs another Agent's veto of the target.
+            return None
+        store = veto_store(self.composition)  # a misconfigured store raises: the cut fails visibly (outcome=error)
+        try:
+            vetoed = store.read(client.target.agent_name, selected) is not None
+        except Problem as error:  # the Table read (Azure errors wrapped) or an invalid row: the next turn end reads again
+            return "veto_unread", error.body["error"]["code"], None
+        return ("vetoed", "project", None) if vetoed else None
+
+    def _crash_loop(self, client, row, stop):
+        """ADR-0009 §5 / 4d (``FA_NATIVE_IDLE_UPGRADE``): within ``CRASH_LOOP_SECONDS`` of the row's last switch, the
+        current SID's ``recent_crashes`` (Hosted counts a RID once and never a ``deferred:`` exit or a ``suspended``
+        chain) after that switch, plus the post-switch start failures, decide a crash-loop at ``CRASH_LOOP_COUNT``
+        distinct CIDs and RIDs. Then the version is vetoed (the project row, then this Agent's list, neither blocking
+        the other, both before the rollback, so the next turn end's U0 never moves back) and the Agent goes back
+        through ``cut`` to the newest previous version: its destination is derived from the current SID, never a previous one (§10). None: nothing
+        decided. Outside the window nothing is read; inside it, one metadata read and, only while ``active``, one
+        state read. A current version already in this Agent's vetoes is a rollback decided before (busy, or its fence
+        overran): it is retried at every turn end until done, whatever the window. The project veto is not read for
+        this: it also names versions other Agents vetoed, and a healthy Agent on that version is not rolled back (Neal
+        decision 3: 本 Agent 退回). A decision whose own veto was not written is retried the same way while this
+        process runs. A rollback target this Agent vetoed itself, or one ``cut`` finds incompatible, leaves no version
+        to go to (``_rollback_blocked``)."""
+        kept = row.idle_upgrade
+        if kept is None:
+            return None
+        version = row.created_agent_version
+        # A SID backfilled from an unfinished receipt has no known version (``record_unfinished``): never a target.
+        back = next((item.agent_version for item in reversed(row.previous_sessions)
+                     if item.agent_version not in (None, version)), None)
+        if back is None:
+            return None
+        decided = (row.agent_id, row.hosted_session_id, version)
+        if version in kept.vetoed_versions:
+            if kept.rollback_blocked:
+                return None  # recorded once: the Agent stays on this version and the selector still applies
+            # Decided earlier, the rollback busy or overrun: finish it whatever the window, with no reads or judging.
+            self._project_veto(client, version)  # again: the first write may have failed
+            return self._decided(client, row, stop, version, back)
+        if decided not in self._veto_unrecorded and not self._crash_looping(client, row, kept, version, back):
+            return None
+        # First, and on its own: durable even while this Agent's own veto keeps failing, so a restart still keeps other
+        # Agents off ``version``.
+        self._project_veto(client, version)
+        vetoed = self._own_veto(row, version)
+        if vetoed is None:
+            # This Agent's veto is what finishes the rollback after the window, so none starts without it; until it is
+            # written every turn end tries again, whatever the window (shortcut: in process memory, so a restart
+            # after the window leaves the Agent on this version; upgrade once a second durable record exists).
+            self._veto_unrecorded.add(decided)
+            return "crash_loop", "veto_unrecorded", None
+        self._veto_unrecorded.discard(decided)
+        return self._decided(client, vetoed, stop, version, back)
+
+    def _own_veto(self, row, version, notice=False):
+        """This Agent's veto of ``version`` (``record_veto``, with its "沒有更新" notice for ``notice``), read back: the
+        row that holds it, or None when it is not written (a failure only logs)."""
+        vetoed = self._binding("veto", lambda store: store.record_veto(
+            row.agent_id, hosted_session_id=row.hosted_session_id, agent_version=version, notice=notice))
+        held = vetoed is not None and vetoed.idle_upgrade is not None and version in vetoed.idle_upgrade.vetoed_versions
+        return vetoed if held else None
+
+    def _project_veto(self, client, version):
+        """The project row of ``version`` (an Insert, kept as written); a failure only logs, so it never blocks this
+        Agent's own veto or rollback, and the next turn end writes it again. Once written it is not written again
+        (shortcut: in process memory, so a restart writes it once more; fine while an Insert is idempotent)."""
+        from .native_version_veto import veto_store
+
+        key = (client.target.agent_name, version)
+        if key in self._project_vetoed:
+            return
+        store = veto_store(self.composition)
+        if self._binding("project_veto", lambda _binding: store.veto(*key)) is not None:
+            self._project_vetoed.add(key)
+
+    def _decided(self, client, row, stop, version, back):
+        """A crash-loop of ``version`` this Agent's vetoes hold: the rollback to ``back`` unless this Agent vetoed
+        ``back`` too."""
+        if back in row.idle_upgrade.vetoed_versions:
+            return self._rollback_blocked(row, version, back)
+        return self._rollback(client, row, stop, version, back)
+
+    def _rollback_blocked(self, row, version, back, why="vetoed=agent"):
+        """Coordinator 2026-10-19: no usable earlier version. Logged and recorded once (``rollback_blocked``); the
+        Agent keeps serving on ``version`` and ``cut`` goes on to the selector (None)."""
+        logging.getLogger(__name__).warning(
+            "NATIVE_CRASH_LOOP_NO_ROLLBACK agent_id=%s session_id=%s version=%s rollback_to=%s %s",
+            row.agent_id, row.hosted_session_id, version, back, why)
+        self._binding("rollback_blocked", lambda store: store.record_rollback_blocked(
+            row.agent_id, hosted_session_id=row.hosted_session_id))
+        return None
+
+    def _crash_looping(self, client, row, kept, version, back):
+        """The window judgement of ``_crash_loop``: True when the current SID crash-loops (logged)."""
+        if kept.switched_at is None:
+            return False
+        switched = datetime.fromisoformat(kept.switched_at).timestamp()
+        now = binding_store(self.composition).clock()
+        if now is None or now.timestamp() - switched > CRASH_LOOP_SECONDS:
+            return False
+        current = client.for_target(_target(client.target, session_id=row.hosted_session_id,
+                                            agent_version=row.observed.agent_version))
+        try:
+            metadata = _session_metadata(current)
+            if metadata is None or metadata.status != "active":
+                return False  # §10: never woken for this; a later turn end reads it while it runs
+            crashes = [item for item in self._state(current).recent_crashes if item.at > switched]
+        except Problem as error:
+            logging.getLogger(__name__).warning("NATIVE_CRASH_LOOP_UNREAD code=%s session_id=%s",
+                                                error.body["error"]["code"], row.hosted_session_id)
+            return False
+        # shortcut: a start failure has no CID/RID, so each counts as its own; give them IDs once a writer records them.
+        failures = kept.start_failures
+        if min(len({item.conversation_id for item in crashes}),
+               len({item.request_id for item in crashes})) + failures < CRASH_LOOP_COUNT:
+            return False
+        logging.getLogger(__name__).warning(
+            "NATIVE_CRASH_LOOP agent_id=%s session_id=%s version=%s crashes=%d start_failures=%d rollback_to=%s",
+            row.agent_id, row.hosted_session_id, version, len(crashes), failures, back)
+        return True
+
+    def _rollback(self, client, row, stop, version, back):
+        outcome, reason, fence = self.cut(client, stop=stop, target=back)
+        if outcome == "target_incompatible":  # a version's profile never changes: retrying can never move the Agent
+            self._rollback_blocked(row, version, back, f"target_incompatible={reason}")
+        return "crash_loop", outcome if reason is None else f"{outcome}:{reason}", fence
+
+    def _recent_conversations(self, agent_id, limit):
+        """The Agent's most recent conversations this process kept from owner submits, newest first (shortcut: in
+        process memory only, so a restarted API names none and U3 checks no checkpoint; upgrade once a durable
+        recent-conversation list exists)."""
+        from .behavior_native_turn_api import _kept_conversations
+
+        kept, lock = _kept_conversations(self.composition)
+        with lock:
+            return tuple([cid for agent, cid in reversed(kept) if agent == agent_id][:limit])
+
+    def _health_wait(self, row, selected):
+        """ADR-0009 §5 "間隔加隨機抖動": a target whose last check failed or answered nothing is checked again only at
+        a turn end ``HEALTH_RETRY_SECONDS`` plus a random part of it after that attempt (the row's
+        ``last_attempt_at``), so replicas and Agents do not retry in step. Never for a rollback, whose U3 counts
+        nothing."""
+        kept = row.idle_upgrade
+        if (_ROLLBACK.get() is not None or kept is None or kept.target_version != selected
+                or kept.last_attempt_at is None):
+            return None
+        now = binding_store(self.composition).clock()
+        since = datetime.fromisoformat(kept.last_attempt_at).timestamp()
+        if now is not None and now.timestamp() - since < HEALTH_RETRY_SECONDS * (1 + random.random()):
+            return "health_wait", None, None
+        return None
+
+    def _health(self, destination, row, selected, before_send):
+        """ADR-0009 U3 (``FA_NATIVE_IDLE_UPGRADE``): the destination reads back the latest checkpoint of the Agent's
+        recent conversations (``NativeSessionCheckpointCheck``, #906) before the probe. None: healthy, the cut goes
+        on (no conversation known: nothing to check; an image before #906, its G0b refusal: unchecked, as every cut
+        before U3; a rollback cut: logged only). An ``unreadable`` or ``unsupported`` conversation is one failure of
+        this attempt; the third failure of the same target is this Agent's veto (``record_veto``, the one veto writer;
+        the project row stays crash-loop only). Anything else raised (5xx, a timeout, 403 ``NATIVE_STATE_SCOPE``)
+        answered nothing: no failure is counted, only the attempt's time, and a turn end after the retry interval
+        checks again. Either way nothing has moved: the Agent keeps serving on its SID. One conversation per call,
+        newest first, within ``HEALTH_CHECK_SECONDS`` (fewer are checked when time runs out); a CID that repeats
+        NATIVE_STATE_SCOPE for this target is skipped, so it never keeps U3 unanswered. Every conversation is still
+        asked: when every one refuses NATIVE_STATE_SCOPE the image's own scope is wrong, one failure of this attempt;
+        when none answered otherwise, nothing passes (``health_unread``)."""
+        from .behavior_native_turn_api import NativeTurnGateway
+        from .behavior_native_turn_wire import NativeSessionCheckpointCheck
+
+        log = logging.getLogger(__name__)
+        conversations = self._recent_conversations(row.agent_id, HEALTH_CHECK_CONVERSATIONS)
+        sid = destination.target.session_id
+        # Coordinator 2026-10-19: a 4d rollback cut only logs U3 (never counted, never a veto): the version it leaves
+        # crash-loops, which is worse than one conversation's unreadable checkpoint, and Hosted still checks each
+        # conversation's codec when it loads it (CTX-03).
+        rollback = _ROLLBACK.get() is not None
+        before = row.idle_upgrade
+        read = None if before is None or before.target_version != selected else before.last_attempt_at
+
+        def attempt(failed):
+            """This attempt on the row (``record_health_failure``): its time, one failure when ``failed``; the count."""
+            written = self._binding("health", lambda store: store.record_health_failure(
+                row.agent_id, hosted_session_id=row.hosted_session_id, target_version=selected, failed=failed,
+                last_attempt_at=read))
+            kept = None if written is None else written.idle_upgrade
+            return 0 if kept is None or kept.target_version != selected else kept.health_failures
+
+        def unread(code):
+            log.warning("NATIVE_UPGRADE_HEALTH_UNREAD code=%s session_id=%s version=%s rollback=%s", code, sid,
+                        selected, rollback)
+            if rollback:
+                return None
+            attempt(False)  # no failure, but the retry interval and its jitter apply
+            return "health_unread", code, None
+
+        end, failed, checked, refused, unconfirmed = monotonic() + HEALTH_CHECK_SECONDS, [], 0, [], False
+        for cid in conversations:
+            left = end - monotonic()
+            if left < HEALTH_CALL_MIN_SECONDS:
+                log.warning("NATIVE_UPGRADE_HEALTH_PARTIAL checked=%d of=%d session_id=%s", checked,
+                            len(conversations), sid)
+                break
+            try:
+                before_send()
+                value, _ = NativeTurnGateway._invoke(destination, NativeSessionCheckpointCheck(
+                    conversation_ids=(cid,)), timeout=left)
+                found = value.checkpoints or {}
+                if set(found) != {cid}:
+                    raise Problem(502, "NATIVE_STATE_INVALID", "the checkpoint check did not answer its conversation")
+            except Problem as error:
+                code = error.body["error"]["code"]
+                if error.status == 422 and error.body["error"].get("reserved") is True:
+                    # An image older than #906 does not run the check (its G0b refusal only; any other 422 answered
+                    # nothing): unchecked, as every cut before U3.
+                    log.warning("NATIVE_UPGRADE_HEALTH_UNCHECKED code=%s session_id=%s version=%s", code, sid,
+                                selected)
+                    return None
+                if code == "NATIVE_STATE_SCOPE":
+                    key = (row.agent_id, cid, selected)
+                    self._scope_refused[key] = self._scope_refused.get(key, 0) + 1
+                    refused.append(cid)
+                    if self._scope_refused[key] >= HEALTH_SCOPE_REPEATS:
+                        log.warning("NATIVE_UPGRADE_HEALTH_SKIPPED code=%s conversation_id=%s session_id=%s", code,
+                                    cid, sid)
+                    else:
+                        unconfirmed = True  # asked once more before it is skipped
+                    continue
+                return unread(code)
+            checked += 1
+            failed += [cid] if found[cid] != "ok" else []
+        if refused and len(refused) == len(conversations) >= 2:  # one CID (after an API restart) proves no image-wide scope
+            failed = refused  # every recent conversation refused for this target: the image's scope, one failure
+            log.warning("NATIVE_UPGRADE_HEALTH_SCOPE_REFUSED session_id=%s version=%s conversations=%d", sid, selected,
+                        len(refused))
+        elif not failed and (conversations and not checked or unconfirmed):
+            return unread("NATIVE_STATE_SCOPE" if refused else "NATIVE_UPGRADE_HEALTH_PARTIAL")
+        if not failed:
+            return None
+        if rollback:
+            log.warning("NATIVE_UPGRADE_HEALTH_FAILED agent_id=%s session_id=%s version=%s rollback=True failed=%s",
+                        row.agent_id, sid, selected, ",".join(failed))
+            return None
+        count = attempt(True)
+        log.warning("NATIVE_UPGRADE_HEALTH_FAILED agent_id=%s session_id=%s version=%s failures=%d failed=%s",
+                    row.agent_id, sid, selected, count, ",".join(failed))
+        if count < HEALTH_VETO_COUNT:
+            return "health_failed", str(count) if count else "unrecorded", None
+        if self._own_veto(row, selected, notice=True) is None:
+            return "health_failed", "veto_unrecorded", None  # the next failure writes it again
+        log.warning("NATIVE_UPGRADE_HEALTH_VETO agent_id=%s version=%s staying_on=%s", row.agent_id, selected,
+                    row.created_agent_version)
+        return "vetoed", "health", None
+
+    def _prerestore(self, destination, row, bound):
+        """ADR-0009 U9 (``FA_NATIVE_IDLE_UPGRADE``): the destination restores the latest checkpoint of the Agent's 1-2
+        most recent conversations into its hot copy (``NativeSessionPrerestore``, #906), so their first turn after the
+        switch is not a cold restore. Only a speed-up: a failure logs and the cut goes on; past the cut's ``bound`` (or
+        on shutdown) it leaves the cut before the probe, as every other step does."""
+        from .behavior_native_turn_api import NativeTurnGateway
+        from .behavior_native_turn_wire import NativeSessionPrerestore
+
+        conversations = self._recent_conversations(row.agent_id, PRERESTORE_CONVERSATIONS)
+        if not conversations:
+            return
+        try:
+            NativeTurnGateway._invoke(destination, NativeSessionPrerestore(conversation_ids=conversations),
+                                      timeout=_left(bound))
+        except Problem as error:
+            logging.getLogger(__name__).warning("NATIVE_UPGRADE_PRERESTORE_FAILED code=%s session_id=%s",
+                                                error.body["error"]["code"], destination.target.session_id)
+
+    def _finish(self, source, destination, *, bound):
+        """ADR-0009 U9 (``FA_NATIVE_IDLE_UPGRADE``), once the switch is on the binding row (U8, read back: a failed
+        ``record_switch`` only logs): stop the old SID ``source`` (None: already stopped by the files fence) to save
+        its compute (U5-U6 found no turn running there; Learn: stop keeps the file system), then ``prewarm`` the new
+        SID, each within what is left of U9's own ``FINISH_SECONDS`` from its start (the files fence before it may use
+        most of the cut's ``bound``; shutdown still ends it). Neither can undo the commit: any failure (also past that
+        bound or on shutdown) logs, the cut keeps its switch outcome, and an old SID left running is reclaimed at its
+        idle timeout."""
+        from .behavior_native_turn_api import NativeTurnGateway, _prewarm_toolboxes
+        from .behavior_native_turn_wire import NativePrewarm
+
+        log = logging.getLogger(__name__)
+        sid, own = destination.target.session_id, _CutFence(FINISH_SECONDS, bound.stop)
+
+        def logged(step, call):
+            try:
+                return call()
+            except Exception as error:  # noqa: BLE001 - after the commit nothing here may fail the cut
+                code = (error.body["error"]["code"] if isinstance(error, Problem) else
+                        "fence_overrun" if isinstance(error, _FenceOverrun) else type(error).__name__)
+                log.warning("NATIVE_UPGRADE_FINISH_FAILED step=%s code=%s session_id=%s", step, code, sid,
+                            exc_info=True)
+
+        found = self._binding_row(destination.target.agent_id)  # a failed read logs there and returns None
+        if found is None or found[1] is None or found[1].hosted_session_id != sid:
+            reason = "binding_unread" if found is None else "switch_unrecorded"
+            log.warning("NATIVE_UPGRADE_FINISH_SKIPPED reason=%s session_id=%s", reason, sid)
+            return
+        if source is not None:
+            logged("stop", lambda: source.stop_session(timeout=_left(own, 10)))
+        logged("prewarm", lambda: NativeTurnGateway._invoke(destination, NativePrewarm(
+            toolboxes=_prewarm_toolboxes(self.composition.runtime)), timeout=_left(own)))
+
+    def _record_due(self, row, selected):
+        """ADR-0009 U0's write, once every U0 condition held: the deferral start, once per target (a Table failure
+        only logs)."""
+        kept = row.idle_upgrade
+        if kept is None or kept.target_version != selected:
+            self._binding("idle_upgrade", lambda store: store.record_due(
+                row.agent_id, hosted_session_id=row.hosted_session_id, target_version=selected))
 
     def _fenced(self, client, destination, command, row, selected, stop):
         """The files mode of ``cut``: the fence, then today's follow steps (copy, stop the source, commit)."""
@@ -2311,7 +2783,8 @@ class NativeSessions:
 
         def recording(store):
             own.append(NativeBindingUpgrade(hosted_session_id=sid, agent_version=destination.target.agent_version,
-                                            request_id=command.request_id, started_at=store._now()))
+                                            request_id=command.request_id, started_at=store._now(),
+                                            rollback=_ROLLBACK.get() == destination.target.agent_version))
             return store.record_upgrade(agent_id, hosted_session_id=row.hosted_session_id, upgrade=own[-1])
 
         written = self._binding("upgrade", recording)
@@ -2519,9 +2992,10 @@ class NativeSessions:
                                  state_profile=row.state_profile)
             selected = self.selected_version(client)
             decided = store.read(row.agent_id)
-            if decided is not None and self.destination_session(client, selected, decided)[0] == fence.hosted_session_id:
-                store.raise_attempt(row.agent_id, hosted_session_id=row.hosted_session_id, agent_version=selected,
-                                    attempt=decided.attempt(selected))
+            going = None if decided is None else _unvetoed(decided, selected)  # where ``_carry_out`` goes
+            if going is not None and self.destination_session(client, going, decided)[0] == fence.hosted_session_id:
+                store.raise_attempt(row.agent_id, hosted_session_id=row.hosted_session_id, agent_version=going,
+                                    attempt=decided.attempt(going))
             switched = self._carry_out(client, selected, lambda: None)
         except Problem as failed:
             logging.getLogger(__name__).warning("NATIVE_UPGRADE_CUT_FENCE_BROKEN_UNSWITCHED code=%s",

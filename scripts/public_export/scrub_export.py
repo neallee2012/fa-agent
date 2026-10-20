@@ -37,13 +37,14 @@ import subprocess
 
 # The only exclusion list. The scrub files hold original values. Workflows are left out as a whole: pushing
 # anything under .github/workflows/ needs the Workflows permission, which the Contents-only token lacks, and
-# public-sync / deploy-staging only work against the private stage anyway.
+# public-sync / deploy-staging only work against the private stage anyway. deploy/dev/ is the author's dev profile and
+# its installed runtime config: dev identifiers only, never reviewed for scrubbing (Neal 2026-10-19).
 EXCLUDED_PATHS = frozenset({
     "scripts/public_export/mapping.json",
     "scripts/public_export/review.json",
     "scripts/public_export/candidates.txt",
 })
-EXCLUDED_PREFIXES = (".claude/", ".github/workflows/")
+EXCLUDED_PREFIXES = (".claude/", ".github/workflows/", "deploy/dev/")
 
 GUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 GUID_RE = re.compile(rf"(?<![0-9A-Za-z]){GUID}(?![0-9A-Za-z])")

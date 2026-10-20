@@ -61,9 +61,13 @@ def history(tmp_path):
 
 
 def serving(ci, monkeypatch, repo, revision):
+    """The stage API app as stage.json leaves it: 2d-i on (FA_NATIVE_SESSION_GUARD_ENFORCE), single revision mode.
+    The turn-on's own checks are in test_stage_ci_native_2di.py."""
     monkeypatch.setattr(ci, "ROOT", repo)
+    env = [{"name": ci.SESSION_GUARD, "value": "1"}]
     monkeypatch.setattr(ci, "rest", lambda method, path, body=None: {"properties": {
-        "latestReadyRevisionName": f"{ci.STAGE['api_app']}--{revision}", "template": {}, "configuration": {}}})
+        "latestReadyRevisionName": f"{ci.STAGE['api_app']}--{revision}", "template": {"containers": [{"env": env}]},
+        "configuration": {"activeRevisionsMode": "Single"}}})
 
 
 @pytest.mark.parametrize("serving_index", [0, 1])

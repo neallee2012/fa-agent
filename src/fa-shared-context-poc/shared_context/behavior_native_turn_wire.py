@@ -34,7 +34,7 @@ from .native_responses_wire import (
 from .native_append_wire import NativeAppend, NativeAppendRead
 from .native_progress_wire import NativeProgressRead, NativeProgressSnapshot, NativeTurnStatusRead
 from .native_assembly import NativeAssembly
-from .native_files_wire import FILES_ERRORS, NativeSessionFiles
+from .native_files_wire import FILES_ERRORS, MAX_FILE_ENTRIES, NativeFileEntry, NativeFilesManifest, NativeSessionFiles
 from .native_continuation_wire import CONTINUATION_ERRORS, NativeContinuation, NativeContinuationRead, NativeContinuationReady
 from .native_routine_wire import NATIVE_ROUTINE_ERRORS, NativeRoutineOrigin
 from .team_connector_wire import ConnectorCapture
@@ -329,6 +329,10 @@ class NativeCandidateRead(WireModel):
 class NativeSessionRead(WireModel):
     operation: Literal["session_read"] = "session_read"
     environment_request_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
+    # ADR-0009 5b: also answer this session's workspace tree (``workspace_*``), after the Agent ETag (U1 on the source;
+    # on the destination before a fallback to the fence). An image before 5b refuses the field (422): no helper, so
+    # the API keeps its existing files path.
+    workspace: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 # A toolbox version the Hosted process may list ahead of a turn (README#typing-prewarm); the toolbox provider keeps
@@ -357,10 +361,16 @@ class NativePrewarm(WireModel):
 
 
 class NativePrewarmView(WireModel):
-    """Hosted took the prewarm: ``toolboxes`` versions are being listed in the background; nothing was recorded."""
+    """Hosted took the prewarm: ``toolboxes`` versions are being listed in the background; nothing was recorded.
+    Also the answer to ``NativeSessionCheckpointCheck`` / ``NativeSessionPrerestore`` (``toolboxes=0``)."""
     agent_id: Identifier
     hosted_session_id: Identifier
     toolboxes: Annotated[int, Field(ge=0, le=MAX_PREWARM_TOOLBOXES)]
+    # Per named conversation: its latest checkpoint is readable on this image (or none is owed), or explicitly refused
+    # (CTX-03: a missing/different segment is unreadable, an unknown codec, version or shape unsupported). An empty map
+    # checked nothing; it is never a pass for conversations the request did not name.
+    checkpoints: dict[Identifier, Literal["ok", "unreadable", "unsupported"]] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
 
 
 class NativePrewarmResult(WireModel):
@@ -476,11 +486,18 @@ class NativeSessionCut(Command):
     # As ``NativeSessionFollow``: previous SIDs whose unfinished receipts are not waited for.
     settled_session_ids: Annotated[tuple[Identifier, ...], Field(max_length=64)] = Field(
         default=(), exclude_if=lambda value: not value)
+    # ADR-0009 5b U4: the 5b snapshot, restored through this session's staging (``NativeWorkspaceFiles``): a probe
+    # prepares it (refused when the live root holds something else); the cut confirms every staged file, publishes the
+    # tree and commits ``files_migrated`` with its digest. An image before 5b refuses the field (422).
+    files_restore: NativeFilesManifest | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def listed_at_e0(self):
         if self.mode == "cut" and not self.files_required and self.expected_etag is None:
             raise ValueError("a cut without files requires the probe's expected_etag")
+        if self.files_restore is not None and (self.files_required or self.files_restore.source_session_id
+                                               != self.expected_session_id):
+            raise ValueError("a restore replaces the files fence and names this cut's source")
         return _source_not_settled(self)
 
 
@@ -500,16 +517,21 @@ class NativeUnfinishedRead(WireModel):
 
 
 class NativeSessionCheckpointCheck(WireModel):
-    """ADR-0009 phase 4 U3, reserved in the v2 wire (no image runs it yet): the destination session reads back the
-    latest checkpoints of the Agent's recent conversations before a switch. Not in ``_RECORD_READS``: the destination
-    is not yet the current SID. Its fields come later as optional additions (ADR-0009 §3, 2026-10-17)."""
+    """ADR-0009 phase 4 U3 (reserved in the release 31 wire, which refuses it): the destination session reads back
+    from the store the latest checkpoint of each conversation the API names (its recent ones) before a switch. Not in
+    ``_RECORD_READS``: the destination is not yet the current SID. Writes nothing, starts no SDK."""
     operation: Literal["session_checkpoint_check"] = "session_checkpoint_check"
+    conversation_ids: Annotated[tuple[Identifier, ...], Field(max_length=5)] = Field(
+        default=(), exclude_if=lambda value: not value)
 
 
 class NativeSessionPrerestore(WireModel):
     """ADR-0009 phase 4 U9, reserved like ``NativeSessionCheckpointCheck``: the destination session restores the
-    latest 1-2 conversations' checkpoints before a switch, reading the shared store only and writing no receipt."""
+    latest checkpoint of 1-2 named conversations into its local hot copy before a switch, so their next turn there
+    is not a cold restore. Reads the shared store only, writes no receipt, starts no SDK; repeating it is harmless."""
     operation: Literal["session_prerestore"] = "session_prerestore"
+    conversation_ids: Annotated[tuple[Identifier, ...], Field(max_length=2)] = Field(
+        default=(), exclude_if=lambda value: not value)
 
 
 class NativeUnfinishedSessions(WireModel):
@@ -757,9 +779,17 @@ class NativeSessionState(WireModel):
     # ADR-0009 M7, reserved: phase 4d's crash-loop read; never filled before then.
     recent_crashes: Annotated[tuple[NativeCrash, ...], Field(max_length=8)] = Field(
         default=(), exclude_if=lambda value: not value)
+    # ``NativeSessionRead(workspace=True)`` only: the workspace root's mode and entries (``fa-workspace-files-v1``),
+    # enumerated after ``etag`` was read, so a turn admitted meanwhile moves the ETag past it.
+    workspace_root_mode: Annotated[int, Field(ge=0, le=0o777)] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
+    workspace_entries: Annotated[tuple[NativeFileEntry, ...], Field(max_length=MAX_FILE_ENTRIES)] = Field(
+        default=(), exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def original_binding(self):
+        if self.workspace_entries and self.workspace_root_mode is None:
+            raise ValueError("workspace entries come with their root")
         if self.preparation is not None and self.preparation.agent_id != self.agent_id:
             raise ValueError("the original preparation belongs to another Agent")
         if self.environment is not None:
@@ -943,15 +973,29 @@ NATIVE_REQUEST = TypeAdapter(NativeRequest)
 # owner response carrying it is written); ``earlier_version_unfinished`` is a read-time view of one receipt instead.
 SLOT_NOTICE_KINDS = frozenset({
     "platform_version_changed", "environment_updated", "environment_switched_without_files",
-    "environment_source_retired",
+    "environment_source_retired", "environment_rolled_back", "environment_upgrade_vetoed",
 })
 # Capability signal of a workbench bridge that decodes the phase 2c notice kinds (ADR-0009 §8). A deploy updates the API
 # before the console, and an older bridge refuses a receipt with a kind it does not know (502), so the owner's submit
 # carries those kinds, and the API clears the slot, only for a request with this header (a header, not a body field: an
 # older API ignores an unknown header). Without it the answer is exactly as before phase 2c: the drift notice, never
-# cleared.
+# cleared. The value stays "2": a phase 2c API accepts exactly that one, whichever revision goes live first.
 NOTICE_KINDS_HEADER = "X-FA-Notice-Kinds"
 NOTICE_KINDS_VERSION = "2"
+# Phase 6a (c), its own header for the same reason: the bridge decodes ``NativeReceipt.upgrade_waiting_version``.
+# The API carries it only beside NOTICE_KINDS_HEADER; an API before 6a (c) ignores this header, an older bridge never
+# sends it.
+UPGRADE_WAITING_HEADER = "X-FA-Upgrade-Waiting"
+UPGRADE_WAITING_VERSION = "1"
+# Phase 4d, its own header for the same reason: the bridge decodes ``environment_rolled_back`` (and its
+# ``without_files``). The API carries 已退回 only beside NOTICE_KINDS_HEADER; to a bridge without this header it carries
+# the drift notice only and clears nothing, so 已退回 is never cleared unseen. An API before 4d ignores this header.
+ROLLBACK_NOTICE_HEADER = "X-FA-Rollback-Notice"
+ROLLBACK_NOTICE_VERSION = "1"
+# Phase 4b-4, its own header for the same reason: the bridge decodes ``environment_upgrade_vetoed``. Without it the API
+# carries the drift notice only and clears nothing; an API before 4b-4 ignores this header.
+UPGRADE_VETOED_HEADER = "X-FA-Upgrade-Vetoed-Notice"
+UPGRADE_VETOED_VERSION = "1"
 
 
 class NativeEnvironmentNotice(WireModel):
@@ -964,20 +1008,27 @@ class NativeEnvironmentNotice(WireModel):
     environment is kept (the 2026-10-04 sentence). ``environment_source_retired``: it moved without its work files
     because the old environment had failed or been deleted (§7a). ``earlier_version_unfinished`` (§7a (e)): this
     unfinished request was accepted by a session the Agent has since left, so it will not continue; send it again as
-    a new message (§8 "這則訊息是較早的版本接下的……")."""
+    a new message (§8 "這則訊息是較早的版本接下的……"). ``environment_rolled_back`` (phase 4d): the new version
+    crash-looped and the Agent went back to its earlier one (§5, M4 "已退回"); ``without_files``: no work files came
+    along, so the no-files sentence follows it (M4 #1). ``environment_upgrade_vetoed`` (phase 4b-4): the new version
+    failed its health check (U3) a third time, so this Agent vetoed it and stays on its current one (§5, M4 #6)."""
     kind: Literal[
         "platform_version_changed", "earlier_version_unfinished", "environment_updated",
-        "environment_switched_without_files", "environment_source_retired",
+        "environment_switched_without_files", "environment_source_retired", "environment_rolled_back",
+        "environment_upgrade_vetoed",
     ] = "platform_version_changed"
     from_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")] | None = Field(
         default=None, exclude_if=lambda value: value is None)
     to_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")] | None = Field(
         default=None, exclude_if=lambda value: value is None)
+    without_files: bool = Field(default=False, exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def versions(self):
         if (self.kind == "platform_version_changed") != (self.from_version is not None and self.to_version is not None):
             raise ValueError("only the platform version change names its two versions")
+        if self.without_files and self.kind != "environment_rolled_back":
+            raise ValueError("only 已退回 carries the no-files sentence; the other switch kinds name it themselves")
         return self
 
 
@@ -1011,6 +1062,11 @@ class NativeReceipt(WireModel):
     # Read-time only (ADR-0009 §4 end): an owner response carries the Agent's pending drift notice, and Hosted's read
     # of a RID refused by version carries ``earlier_version_unfinished`` (§9); absent otherwise.
     environment_notice: NativeEnvironmentNotice | None = Field(default=None, exclude_if=lambda value: value is None)
+    # Read-time only (ADR-0009 §12 6a (c)): the owner's workbench answer carries the version the Agent has been waiting
+    # on for over 6 hours ("有新版本 vN，會在助理閒置時更新", status line only, once per target). Not a notice kind: the
+    # v2 wire may not grow an enum value, but may grow an optional field a dump leaves out.
+    upgrade_waiting_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
 
     @property
     def human_origin(self) -> bool:

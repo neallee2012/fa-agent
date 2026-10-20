@@ -26,8 +26,28 @@ MAX_FRAME_BYTES = 1024 * 1024
 OPEN_TIMEOUT_SECONDS = 15
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _SENDABLE = {1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014}
+CLEANUP_TIMEOUT_SECONDS = 15  # above the websockets default close_timeout of 10 s
 
 log = logging.getLogger(__name__)
+
+
+async def _finish(cleanup, timeout=CLEANUP_TIMEOUT_SECONDS):
+    """Run ``cleanup`` to the end even if this handler is cancelled, then re-raise the cancel.
+
+    A detached task, because the server's cancel scope (anyio) cancels the handler again at every await.
+    Same as behavior_desktop_view._finish, which the API must not import (it is the Hosted side).
+    """
+    task = asyncio.ensure_future(asyncio.wait_for(cleanup, timeout))
+    cancelled = None
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError as error:
+            cancelled = error
+    if not task.cancelled() and task.exception() is not None:
+        log.warning("DESKTOP_VIEW_CLEANUP_FAILED exception_type=%s", type(task.exception()).__name__)
+    if cancelled is not None:
+        raise cancelled
 
 
 class FoundryDesktopSessions:
@@ -132,6 +152,13 @@ async def relay(websocket, upstream):
                 # Hosted closed first (e.g. 1001 after ~30 min) while the viewer was sending.
                 return _upstream_outcome(upstream)
 
+    async def cleanup():
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await upstream.close()
+
     tasks = [asyncio.ensure_future(to_viewer()), asyncio.ensure_future(to_desktop())]
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -140,11 +167,7 @@ async def relay(websocket, upstream):
         log.warning("DESKTOP_VIEW_RELAY_ENDED exception_type=%s", type(error).__name__)
         outcome = 1011, "DESKTOP_VIEW_FAILED"
     finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        with contextlib.suppress(Exception):
-            await upstream.close()
+        await _finish(cleanup())
     if outcome is not None:
         await _close(websocket, *outcome)
 

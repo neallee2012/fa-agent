@@ -1904,7 +1904,7 @@ def test_s_a_teams_message_is_sent_once_after_the_relay_stops_polling_and_its_re
     # The final reply (read path) also tells the owner the Agent moved without its work files (ADR-0009 §8); this
     # direct call writes no HTTP response, so the slot stays pending for the relay route to clear after writing.
     assert later.state == "done" and later.text == (
-        "Complete public answer\n\n已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。"), later
+        "Complete public answer\n\n上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。"), later
     assert later.environment_notice.kind == "environment_switched_without_files"
     assert len(posts_of(fixture, message.text)) == 1
 

@@ -183,6 +183,12 @@ class NativeResponsesHandler:
 
             if reserved is not None:
                 async with self.runtime.execution_slot(original, control, signals) as acquired:
+                    # As the Invocations chain: before "started", while an earlier turn's CLI still runs this one stays
+                    # accepted (no second SDK) until that CLI exits, the recovery shutdown defers it, or the bound ends
+                    # it resendable (below).
+                    exited = not acquired or await self.runtime._await_runtime_exit(
+                        lambda: context.shutdown.is_set() or cancellation_signal.is_set(), receipt.conversation_id)
+                    signals(control)
                     starting = perf_counter()
                     if context.shutdown.is_set():
                         await context.exit_for_recovery()
@@ -198,6 +204,8 @@ class NativeResponsesHandler:
                             original, failure_code="NATIVE_TURN_UNKNOWN" if (
                                 cancellation_signal.is_set() and not context.client_cancelled) else None,
                             recovered=context.is_recovery and not context.client_cancelled)
+                    elif not exited:
+                        receipt = await self.runtime._close_unstarted(original)
                     elif cancellation_signal.is_set() and not context.client_cancelled:
                         # The public signal does not identify its cause. Keep this unstarted intent retryable.
                         pass

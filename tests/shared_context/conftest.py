@@ -1,14 +1,42 @@
 from __future__ import annotations
 
 import copy
+import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"))
+
+
+def _retry_windows_local_state_replace():
+    """Windows only: the pinned core local State store's ``_write`` (``os.replace``) meets WinError 5
+    when another process (antivirus/indexer) briefly holds the just-replaced file; POSIX never does.
+    Retry only that error, a fixed 20 x 25 ms, then raise the original. Upstream should do this itself."""
+    try:
+        from azure.ai.agentserver.core.storage._local_state import LocalStateStoreBackend
+    except ImportError:
+        return
+    pinned_write = LocalStateStoreBackend._write
+
+    def write(self, document):
+        for attempt in range(20):
+            try:
+                return pinned_write(self, document)
+            except PermissionError as error:
+                if getattr(error, "winerror", None) != 5 or attempt == 19:
+                    raise
+                time.sleep(0.025)
+
+    LocalStateStoreBackend._write = write
+
+
+if os.name == "nt":
+    _retry_windows_local_state_replace()
 
 from shared_context.api import create_app
 from shared_context.auth import Actor, AuthSettings

@@ -216,16 +216,22 @@ def test_t5_refused_while_following_retries_same_input_after_ready_without_loss(
         }
         assert invoke(client, identity, follow).json()["state"] == "pending"
         received = agent_receive("one-original-peer-message")
-        calls, responses = [], []
+        calls, responses, polls = [], [], []
 
         async def relay(packet):
-            calls.append(bytes(packet.content))
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://offline") as hosted:
                 headers = {
                     "x-client-fa-state-profile": "foundry-native-v1",
                     "x-agent-session-id": identity.session_id, "x-agent-invocation-id": "offline-peer",
                     "x-agent-foundry-call-id": "offline-original-peer-caller",
                 }
+                if "/environment" in packet.url.path:
+                    # Since 5492dc62 a refused sender waits on the recipient environment, then resends once ready.
+                    polls.append((packet.url.path, bytes(packet.content)))
+                    ready = await hosted.post("/invocations", json={**follow, "stage": "commit"}, headers=headers)
+                    assert ready.json()["state"] == "ready"
+                    return httpx.Response(200, content=ready.content)
+                calls.append(bytes(packet.content))
                 result = await hosted.post("/invocations", json=received.model_dump(mode="json"), headers=headers)
                 responses.append(result.status_code)
                 if result.status_code == 503:
@@ -233,9 +239,6 @@ def test_t5_refused_while_following_retries_same_input_after_ready_without_loss(
                     absent = await hosted.post("/invocations", json={
                         "operation": "read", "request_id": received.command.request_id}, headers=headers)
                     assert absent.status_code == 404 and not sdk.calls
-                    if len(calls) == 2:
-                        ready = await hosted.post("/invocations", json={**follow, "stage": "commit"}, headers=headers)
-                        assert ready.json()["state"] == "ready"
                     return httpx.Response(503, json=result.json())
                 assert result.status_code == 202
                 receipt = result.json()
@@ -254,7 +257,8 @@ def test_t5_refused_while_following_retries_same_input_after_ready_without_loss(
         message = NativePeerRequest(recipient_agent_id=identity.agent_id, kind="request", content="Original peer input")
         accepted = client.portal.call(sender_client.send, sender, "original-tool-call", message)
         assert accepted.message_id == received.command.request_id
-        assert responses == [503, 503, 202] and calls[0] == calls[1] == calls[2]
+        assert responses == [503, 202] and calls[0] == calls[1]
+        assert len(polls) == 1 and polls[0][0].endswith("/environment") and polls[0][1] == calls[0]
         completed = Harness(runtime, sdk, client).wait(received.command.request_id, "completed")
         assert completed.command == received.command and len(sdk.calls) == 1
 

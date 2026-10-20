@@ -76,10 +76,17 @@ HOSTED_STATE_PROFILES = frozenset({"foundry-native-v1", "foundry-native-v2"})
 # ADR-0009 2d-i's one switch (src README#native-2di-switch): the API's FA_NATIVE_SESSION_GUARD_ENFORCE="1" also makes
 # every assistant's Hosted definition declare v2; one is never deployed without the other.
 SESSION_GUARD = "FA_NATIVE_SESSION_GUARD_ENFORCE"
+# ADR-0009 phase 4 idle upgrade (src README#native-2di-switch): only on top of the 2d-i switch, so its single revision
+# mode and serving-revision checks hold too; the API itself also refuses to start with it alone.
+IDLE_UPGRADE = "FA_NATIVE_IDLE_UPGRADE"
 NATIVE_V2 = "foundry-native-v2"
 # The native_binding.NATIVE_2DI_SCHEMA the API must declare before the switch goes on: 2 = P5's background cut plus
 # P6's in-request wait and verify-only follow (read from source by AST: the deploy never imports shared_context).
 API_2DI_SCHEMA = 2
+# The native_binding.NATIVE_IDLE_SCHEMA the serving API must declare before the idle upgrade goes on: 1 = 4b-1 (it decodes
+# the binding rows' ``idle_upgrade`` the new revision writes); 2 = 6a (c) (``idle_upgrade.waiting``); 3 = 4d (it also
+# decodes the ``rolled_back`` notices and the fence's ``rollback``); 4 = 4b-4 (the ``vetoed`` notice).
+API_IDLE_SCHEMA = 4
 IMAGES = {
     "api": ("fa-behavior-api", "Dockerfile.behavior-api"),
     "hosted": ("fa-behavior-assistant-desktop", "Dockerfile.behavior-assistant-desktop"),
@@ -531,16 +538,16 @@ def _api_source(name, commit=None):
     return found.stdout if found.returncode == 0 else None
 
 
-def api_2di_schema(commit=None):
-    """The module-level int ``NATIVE_2DI_SCHEMA`` native_binding.py assigns (this checkout's, or ``commit``'s); 0 when
-    it assigns none or the source does not parse."""
+def api_2di_schema(commit=None, name="NATIVE_2DI_SCHEMA"):
+    """The module-level int ``name`` native_binding.py assigns (this checkout's, or ``commit``'s); 0 when it assigns
+    none or the source does not parse."""
     try:
         tree = ast.parse(_api_source("native_binding.py", commit) or "")
     except SyntaxError:
         return 0
     for node in tree.body:
         names = [getattr(item, "id", None) for item in node.targets] if isinstance(node, ast.Assign) else []
-        if names == ["NATIVE_2DI_SCHEMA"] and isinstance(node.value, ast.Constant) and type(node.value.value) is int:
+        if names == [name] and isinstance(node.value, ast.Constant) and type(node.value.value) is int:
             return node.value.value
     return 0
 
@@ -551,12 +558,23 @@ def missing_2di(commit=None):
     return [] if found >= API_2DI_SCHEMA else [f"native_binding.NATIVE_2DI_SCHEMA={found}, needs {API_2DI_SCHEMA}"]
 
 
+def missing_idle(commit=None):
+    """[] when the API code decodes the idle upgrade's rows (4b-1, 6a (c), 4d; NATIVE_IDLE_SCHEMA >= API_IDLE_SCHEMA),
+    else what it lacks."""
+    found = api_2di_schema(commit, "NATIVE_IDLE_SCHEMA")
+    return [] if found >= API_IDLE_SCHEMA else [f"native_binding.NATIVE_IDLE_SCHEMA={found}, needs {API_IDLE_SCHEMA}"]
+
+
 def native_2di():
     """True when api_environment switches ADR-0009 2d-i on (src README#native-2di-switch). The Hosted half
     (assistants declare foundry-native-v2) is derived from it in hosted_environment(), so the two never part."""
     value = STAGE["api_environment"].get(SESSION_GUARD, "0")
     if value not in {"0", "1"}:
         raise SystemExit(f"api_environment: {SESSION_GUARD} accepts only \"0\" or \"1\" (the 2d-i switch)")
+    idle = STAGE["api_environment"].get(IDLE_UPGRADE, "0")
+    if idle not in {"0", "1"} or idle == "1" and value != "1":
+        raise SystemExit(f"api_environment: {IDLE_UPGRADE} accepts only \"0\", or \"1\" with the 2d-i switch "
+                         f"({SESSION_GUARD}=\"1\")")
     if value == "0" and STAGE["assistant_environment"].get("FA_NATIVE_TURNS") == NATIVE_V2:
         raise SystemExit(f"assistant_environment: FA_NATIVE_TURNS={NATIVE_V2} needs the 2d-i switch "
                          f"(api_environment {SESSION_GUARD}=\"1\"); leave it at foundry-native-v1")
@@ -571,13 +589,15 @@ def switch_preconditions(properties=None, base=None):
     """Read-only, from guard() and again from sync/follow and api (the dev line runs those without guard): 2d-i only
     goes on over a single serving API revision that already runs P5+P6 (older replicas decode the rows P5 writes as
     409 NATIVE_BINDING_INVALID), and it never goes off again (roll forward: no API below P6, no Hosted below H2d once
-    v2 conversations exist; ADR-0009 M1 2d-i). Without ``properties`` it reads the API app (and its serving commit)."""
+    v2 conversations exist; ADR-0009 M1 2d-i). The idle upgrade goes on the same way, over a serving revision that
+    already runs 4b-1; while it is on, every deploy needs the serving API at this commit's idle schema. Without ``properties`` it reads the API app (and its serving commit)."""
     read = properties is None
     app = STAGE["api_app"]
     if read:
         properties = rest("GET", f"{_resource('containerApps', app)}?{APPS_API}")["properties"]
     container = ((properties.get("template") or {}).get("containers") or [{}])[0]
-    deployed = {item.get("name"): item.get("value") for item in container.get("env") or []}.get(SESSION_GUARD)
+    env = {item.get("name"): item.get("value") for item in container.get("env") or []}
+    deployed = env.get(SESSION_GUARD)
     if not native_2di():
         if deployed == "1":
             raise SystemExit(f"{app}: 2d-i is on ({SESSION_GUARD}=\"1\") and this profile turns it off; it cannot be "
@@ -587,21 +607,36 @@ def switch_preconditions(properties=None, base=None):
     if mode != "Single":
         raise SystemExit(f"{app}: the 2d-i switch needs single revision mode (mode {mode!r}); an operator sets it "
                          "first (az containerapp revision set-mode --mode single)")
-    if deployed == "1":
+    # Turning the idle upgrade on also needs one serving revision (ADR-0009 §12 enable conditions).
+    idle = STAGE["api_environment"].get(IDLE_UPGRADE) == "1"
+    idle_on = idle and env.get(IDLE_UPGRADE) != "1"
+    turning = deployed != "1" or idle_on
+    if not turning and not idle:
         return  # already on: a later deploy's old revision may still be deactivating, so only the mode is checked
-    # shortcut: first page only (no nextLink), upgrade if an API app ever keeps more than one page of revisions.
-    revisions = (rest("GET", f"{_resource('containerApps', app)}/revisions?{APPS_API}") or {}).get("value") or []
-    active = [item.get("name") for item in revisions if (item.get("properties") or {}).get("active")]
     ready = properties.get("latestReadyRevisionName") or ""
-    if active != [ready]:
-        raise SystemExit(f"{app}: turning 2d-i on needs one active revision, the latest ready one ({ready!r}; active "
-                         f"{active}); wait for the old revision to deactivate, or an operator deactivates it")
+    if turning:
+        # shortcut: first page only (no nextLink), upgrade if an API app ever keeps more than one page of revisions.
+        revisions = (rest("GET", f"{_resource('containerApps', app)}/revisions?{APPS_API}") or {}).get("value") or []
+        active = [item.get("name") for item in revisions if (item.get("properties") or {}).get("active")]
+        if active != [ready]:
+            raise SystemExit(f"{app}: turning 2d-i or the idle upgrade on needs one active revision, the latest ready "
+                             f"one ({ready!r}; active {active}); wait for the old revision to deactivate, or an "
+                             "operator deactivates it")
     if read:
         base = serving_commit(ready)
-    missing = ["the serving commit is unknown"] if base is None else missing_2di(base)
+    missing = ["the serving commit is unknown"] if base is None else missing_2di(base) if turning else []
+    # The new revision writes rows of this commit's NATIVE_IDLE_SCHEMA (``idle_upgrade`` from 4b-1 on); a draining
+    # revision below it reads them as 409 NATIVE_BINDING_INVALID on a live send. So every deploy with IDLE on checks
+    # it, not only the one turning IDLE on (a later phase raises the schema while IDLE stays on).
+    missing += missing_idle(base) if idle and base is not None else []
+    if missing and not turning:
+        raise SystemExit(f"{app}: the idle upgrade is on and the serving API lacks this commit's idle schema "
+                         f"({missing}); deploy this commit with {IDLE_UPGRADE}=\"0\" first, then switch it on again")
     if missing:
-        raise SystemExit(f"{app}: turning 2d-i on needs the serving API to run P5+P6 already ({missing}); deploy this "
-                         f"commit with {SESSION_GUARD}=\"0\" first, then switch it on")
+        turning = " and ".join(name for name, on in (("2d-i (P5+P6)", deployed != "1"),
+                                                     ("the idle upgrade (4b-1)", idle_on)) if on)
+        raise SystemExit(f"{app}: turning {turning} on needs the serving API to run that code already ({missing}); "
+                         "deploy this commit with that switch at \"0\" first, then switch it on")
 
 
 def _sync_script(hosted_ref, *, follow=False):

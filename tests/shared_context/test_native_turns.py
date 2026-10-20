@@ -339,16 +339,48 @@ def seed_started(harness):
     return accepted, current
 
 
-def test_unknown_after_a_concurrent_cancel_write_merges_instead_of_leaving_the_rid_started(harness):
-    """Audit #3: the timeout's ``unknown`` CAS loses to a cancel_requested write; the RID still ours ends ``unknown``."""
+@pytest.mark.parametrize(("code", "recorded"), [
+    # Raised only before the SDK starts: the cancel is recorded as one.
+    ("NATIVE_TURN_NOT_STARTED", "NATIVE_TURN_CANCELLED"), ("NATIVE_EXECUTION_UNAVAILABLE", "NATIVE_TURN_CANCELLED"),
+    ("NATIVE_TURN_CANCELLED", "NATIVE_TURN_CANCELLED"),
+    # The SDK may have run: each keeps its own code.
+    *((code, code) for code in (
+        "NATIVE_TURN_TIMEOUT", "NATIVE_TURN_UNKNOWN", "NATIVE_STATE_STORE_UNKNOWN", "NATIVE_RID_CONFLICT",
+        "NATIVE_RESULT_INCOMPLETE", "NATIVE_STATE_INVALID", "ASSISTANT_MODEL_OUTCOME_UNKNOWN",
+        "SDK_STATE_UPLOAD_UNKNOWN", "NATIVE_MODEL_REFUSED", "NATIVE_POST_TURN_UNKNOWN",
+        "NATIVE_RELAY_OUTCOME_UNKNOWN"))])
+def test_unknown_after_a_concurrent_cancel_write_merges_instead_of_leaving_the_rid_started(harness, code, recorded):
+    """Audit #3: the ``unknown`` CAS loses to a cancel_requested write; the RID still ours ends ``unknown``. The cancel
+    becomes ``NATIVE_TURN_CANCELLED`` only for a code raised before the SDK starts; any other code is kept, and
+    ``cancel_requested`` stays on the receipt."""
     _, started = seed_started(harness)
     cancelled = _changed(started.value, receipt=_changed(started.value.receipt, cancel_requested=True))
     _, saved = harness.call(harness.runtime._cas, started, cancelled)
     assert saved
-    receipt = harness.call(harness.runtime._unknown, started, "NATIVE_TURN_TIMEOUT")  # the stale ETag
+    receipt = harness.call(harness.runtime._unknown, started, code)  # the stale ETag
     current = harness.call(harness.runtime._rid, "rid-1").value
-    assert receipt.status == current.receipt.status == "unknown" and receipt.failure_code == "NATIVE_TURN_TIMEOUT"
+    assert receipt.status == current.receipt.status == "unknown" and receipt.failure_code == recorded
     assert current.receipt.cancel_requested and current.run_token == "OFFLINE-run"
+
+
+def test_cancel_landing_during_queued_recovery_keeps_the_unconfirmed_relay_code(harness):
+    """The recovery path only runs for a sender whose tool call already dispatched, so the SDK has run: a cancel that
+    lands after the entry check but before the re-read is kept as ``cancel_requested``, not as a cancelled turn."""
+    _, started = seed_started(harness)
+
+    async def cancel_then_fail(original):
+        cancelled = _changed(original.value, receipt=_changed(original.value.receipt, cancel_requested=True))
+        _, saved = await harness.runtime._cas(original, cancelled)
+        assert saved
+        raise Problem(503, "NATIVE_RELAY_OUTCOME_UNKNOWN", "the original queued send result is unconfirmed")
+
+    harness.runtime.on_recover_queued = cancel_then_fail
+    receipt = harness.call(lambda: harness.runtime._reenter(started, recovered=True))
+    current = harness.call(harness.runtime._rid, "rid-1").value.receipt
+    assert receipt.status == current.status == "unknown"
+    assert receipt.failure_code == current.failure_code == "NATIVE_RELAY_OUTCOME_UNKNOWN"
+    assert current.cancel_requested
+    assert not harness.sdk.calls
 
 
 def test_accepted_gap_read_is_pure_and_exact_resubmit_requeues_original(harness):
@@ -510,6 +542,61 @@ def test_official_cancel_causes_win_over_steering_without_false_shutdown_termina
     assert not harness.sdk.calls
     if cause != "shutdown":
         assert stored.failure_code == ("NATIVE_TURN_CANCELLED" if cause == "cancel" else "NATIVE_TURN_TIMEOUT")
+
+
+def test_a_drained_input_whose_handler_starts_after_shutdown_ends_resendable(harness):
+    """Review P3-2 on #903: core's re-entry of a drained input gets payload.input=None and can never run it, so a
+    drained handler that starts after shutdown settles its unstarted RID before the recovery exit (an undrained one
+    stays accepted for its re-entry, above)."""
+    accepted = accept_without_chain(harness)
+    ctx = task_context(accepted, entry_mode="resumed")
+    ctx.is_steered_turn = True
+    ctx.shutdown.set()
+    harness.call(harness.runtime.handle_turn, ctx)
+    stored = harness.call(harness.runtime.read, "rid-1")
+    assert (stored.status, stored.failure_code) == ("unknown", "NATIVE_TURN_NOT_STARTED")
+    assert not harness.sdk.calls
+
+
+def test_a_turn_waiting_on_a_cli_that_never_exits_ends_resendable_within_the_bound(harness, monkeypatch):
+    """Review P2-1 on #903: the Invocations wait before "started" is bounded too; a CLI that never exits and a
+    recovery restart that never comes end the RID as NATIVE_TURN_NOT_STARTED without any SDK call."""
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "UNEXITED_WAIT_SECONDS", 0.5, raising=False)  # absent before the bound
+    harness.sdk.runtime_unexited = lambda: True
+    harness.invoke(submit())
+    assert harness.wait("rid-1", "unknown").failure_code == "NATIVE_TURN_NOT_STARTED"
+    assert not harness.sdk.calls
+
+
+@pytest.mark.parametrize("status", ["accepted", "started"])
+def test_a_recovered_entry_without_input_reads_the_drained_input_from_the_task_record(harness, monkeypatch, status):
+    """Review P3-1 on #903: core re-enters a drained input with payload.input=None and steering.active_input=<input>.
+    Accepted, that RID can never run again and ends resendable; started, it re-enters as any recovered start."""
+    accepted = accept_without_chain(harness) if status == "accepted" else seed_started(harness)[0]
+    active = task_context(accepted).input.model_dump(mode="json")
+    reentered = []
+
+    async def original(*, task_id=None):
+        assert task_id == IDENTITY.agent_id
+        return {"payload": {"input": None, "steering": {"active_input": active, "drain_in_progress": False}}}
+
+    async def reenter(original, **kwargs):
+        reentered.append(original.value.receipt.request_id)
+        return original.value.receipt
+
+    harness.runtime.task_observer = SimpleNamespace(original=original)
+    monkeypatch.setattr(harness.runtime, "_reenter", reenter)
+    ctx = task_context(accepted)
+    ctx.input = None
+    harness.call(harness.runtime.handle_turn, ctx)
+    stored = harness.call(harness.runtime.read, "rid-1")
+    if status == "accepted":
+        assert (stored.status, stored.failure_code) == ("unknown", "NATIVE_TURN_NOT_STARTED") and not reentered
+    else:
+        assert stored.status == "started" and reentered == ["rid-1"]
+    assert not harness.sdk.calls
 
 
 def test_delivery_binds_the_complete_digest_not_a_human_read_claim(harness):
@@ -1416,3 +1503,89 @@ def test_an_append_claimed_here_but_never_sent_reads_not_applied_when_the_turn_e
     assert lost.lost and session.sent == []
     ended = read_append(harness, active)
     assert (ended.status, ended.reason) == ("not_applied", "turn_finished")
+
+
+def turn_tail(harness):
+    """The turn's tail: its last SDK round is over (the channel closed, the reply shown) while the executor still stops
+    its SDK (``block``) and has not saved."""
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    session = steer(harness)
+    harness.call(session.channel.close)
+    return active, session
+
+
+def test_an_append_one_second_after_the_reply_is_answered_at_once_not_after_the_stop_and_save(harness):
+    active, session = turn_tail(harness)
+    time.sleep(1)
+    response = harness.invoke(append_command(active))
+    assert response.status_code == 202, response.text
+    assert (response.json()["status"], response.json().get("reason")) == ("not_applied", "turn_finished")
+    assert harness.call(harness.runtime.read, "rid-1").status == "started", "answered while the SDK still stops"
+    harness.sdk.block = False
+    harness.wait("rid-1", "completed")
+    ended = read_append(harness, active)
+    assert (ended.status, ended.reason) == ("not_applied", "turn_finished") and session.sent == []
+
+
+def test_an_append_accepted_before_the_close_ends_with_the_one_after_it_and_keeps_its_place(harness):
+    from shared_context.copilot_steering import SdkSteeringChannel
+
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    first = harness.invoke(append_command(active, "append-1", "A1"))
+    assert first.json()["status"] == "accepted", first.text  # no SDK channel yet: kept, never delivered
+    control = harness.sdk.controls["rid-1"]
+
+    async def closed_channel():  # the last SDK round ended before A1 was handed over
+        control.steering = SdkSteeringChannel(control.stop_requested)
+        control.steering.close()
+
+    harness.call(closed_channel)
+    second = harness.invoke(append_command(active, "append-2", "A2"))
+    assert (second.json()["status"], second.json()["sequence"]) == ("not_applied", 2), second.text
+    earlier = read_append(harness, active, "append-1")
+    assert (earlier.status, earlier.reason, earlier.sequence) == ("not_applied", "turn_finished", 1)
+    assert harness.call(harness.runtime.read, "rid-1").status == "started", "both settled before the stop and save"
+    harness.sdk.block = False
+    harness.wait("rid-1", "completed")
+    assert [read_append(harness, active, f"append-{n}").status for n in (1, 2)] == ["not_applied"] * 2
+
+
+def test_a_crash_between_the_reply_and_the_save_keeps_the_append_resendable_and_never_reruns(local_env, monkeypatch):
+    from shared_context import native_appends
+
+    sdk, settle = OfflineSdk(), native_appends.settle_appends
+    first = NativeTurnRuntime(IDENTITY, sdk)
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=first)) as client:
+        active, _ = turn_tail(Harness(first, sdk, client))
+        assert Harness(first, sdk, client).invoke(append_command(active)).status_code == 202
+
+        async def died(*_args, **_kwargs):  # the process dies here: nothing after the reply is written, not this settle
+            return None
+
+        monkeypatch.setattr(native_appends, "settle_appends", died)
+    monkeypatch.setattr(native_appends, "settle_appends", settle)
+    restored_sdk = OfflineSdk()
+    restored = NativeTurnRuntime(IDENTITY, restored_sdk)
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=restored)) as client:
+        again = Harness(restored, restored_sdk, client)
+        resumed = again.wait("rid-1", "unknown")
+        assert resumed.result is None and len(sdk.calls) == 1 and not restored_sdk.calls
+        ended = read_append(again, active)
+        # Final before the crash, so the owner may still send it again as a new turn (never ``unknown``).
+        assert (ended.status, ended.reason) == ("not_applied", "turn_finished")
+
+
+def test_a_new_turn_sent_in_the_tail_is_accepted_at_once_and_runs_after_the_first(harness):
+    active, _ = turn_tail(harness)
+    response = harness.invoke(submit("rid-2", active.conversation_id, text="Next message"))
+    assert response.status_code == 202 and response.json()["status"] == "accepted", response.text
+    assert harness.call(harness.runtime.read, "rid-1").status == "started"
+    harness.sdk.block = False
+    first, second = harness.wait("rid-1", "completed"), harness.wait("rid-2", "completed")
+    assert (first.turn_number, second.turn_number) == (1, 2)
+    assert [call[0] for call in harness.sdk.calls] == ["rid-1", "rid-2"] and harness.sdk.calls[1][2] is not None
+    assert harness.sdk.max_active == 1

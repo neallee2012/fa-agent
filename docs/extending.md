@@ -64,7 +64,7 @@ connector 關著時，API 不安裝 connector 路由（`shared_context/team_conn
 
 **角色。** 在工作台按「＋」新增助理時填「角色說明」，上限 2048 bytes（`shared_context/behavior_agent_role_prompt.py:22`），存檔就生效，存成一個不會改寫的版本（`shared_context/behavior_agent_role_prompt_versions.py:89-90`）。目前只有新增助理時會寫角色，工作台沒有修改既有助理角色的入口。`azd up` 建的兩位助理沒有角色說明。
 
-「＋」在 azd 環境預設就能用：`FA_ENABLE_AGENT_ONBOARDING` 預設 `true`（Neal 2026-10-15 決定；`infra/azd/main.parameters.json:29-30`、[azd 新環境](azd-new-environment.md)）。Bicep 給 API 身分一個受條件限制的 RBAC 管理角色，只能把 project 上的 Foundry User 和 Cognitive Services OpenAI User 指派給 service principal、不能刪除（`infra/azd/main.bicep:252-261`），再輸出 `FA_AGENT_ONBOARDING`；deploy 依這個輸出把 `FA_ONBOARDING_*` 寫進 API（`deploy/azd/profile.py:118-121`）。新增助理時 API 就替它打開 endpoint 協定並補上這兩個角色（`shared_context/behavior_agent_setup.py:153-184`）。這等於讓 API 身分能替同一個 project 上的任何 service principal 加這兩個角色（風險見 [ADR-0006](adr/0006-team-trust-boundary-grokbot-mode.md) 與 #469）。這條路沒有在 azd 環境實跑過。
+「＋」在 azd 環境預設就能用：`FA_ENABLE_AGENT_ONBOARDING` 預設 `true`（`infra/azd/main.parameters.json:29-30`、[azd 新環境](azd-new-environment.md)）。Bicep 給 API 身分一個受條件限制的 RBAC 管理角色，只能把 project 上的 Foundry User 和 Cognitive Services OpenAI User 指派給 service principal、不能刪除（`infra/azd/main.bicep:252-261`），再輸出 `FA_AGENT_ONBOARDING`；deploy 依這個輸出把 `FA_ONBOARDING_*` 寫進 API（`deploy/azd/profile.py:118-121`）。新增助理時 API 就替它打開 endpoint 協定並補上這兩個角色（`shared_context/behavior_agent_setup.py:153-184`）。這等於讓 API 身分能替同一個 project 上的任何 service principal 加這兩個角色（風險見 [ADR-0006](adr/0006-team-trust-boundary-grokbot-mode.md)）。這條路沒有在 azd 環境實跑過。
 
 不要這筆權限就在 `azd up` 前關掉：
 
@@ -100,15 +100,15 @@ connector 是用 Entra OAuth 代 Team 主人登入外部服務的 MCP。每個 T
    - 還沒同意的助理，在工作台由真人送出的回合裡，回合一開始、模型還沒動之前列工具時就會出「需要連線」卡，不管這則訊息要不要用 Teams（`shared_context/native_toolbox.py:680-693`）。回合停在卡上等主人。主人在卡上的連結同意後按「我連好了，繼續」，同一回合接著跑；之後這位助理的對話不再問。
    - 按「先不用」，這個對話之後的回合不再出卡，Teams 工具只回報尚未連線，其他工具照常。這個決定隨對話存在 API 的 `consent-declined` 紀錄裡（Agent、對話、toolbox 為 key），換版本或 VM 重啟後仍有效；同一個對話內不能撤回；主人在其他對話連好 Teams 後，這個對話的 Teams 工具也會變成可用（連線每位 Agent 一份）；若仍未連線，新對話會再出卡。VM 程序內另有 `_DECLINED` 只省一趟來回（`shared_context/native_toolbox.py`）。
    - 已同意的連線被撤銷時，會出同一種卡，要求重新連線（呼叫工具時見 `shared_context/native_toolbox.py:809-818`）。
-   - 助理之間交辦、排程，以及從 Teams 轉來的回合（request ID 以 `tr-` 開頭，含它的自動接續）不出卡、不等待，直接當成尚未連線繼續（`shared_context/native_toolbox.py:539-543,629-647`；#778）。
+   - 助理之間交辦、排程，以及從 Teams 轉來的回合（request ID 以 `tr-` 開頭，含它的自動接續）不出卡、不等待，直接當成尚未連線繼續（`shared_context/native_toolbox.py:539-543,629-647`）。
 
 **azd 環境目前沒有對應的設定。** `.azure/<env>/fa/profile.json` 每次 hook 執行都由 `deploy/azd/profile.defaults.json` 和 azd 環境變數重建（`deploy/azd/fa_azd.py:567-570`），直接改檔會被蓋掉，也沒有 azd 變數對應 `FA_TEAM_CONNECTORS_ENABLED` 和 `FA_CONNECTOR_TEAMS_CLIENT_ID`。要在 azd 環境開，得仿照 `FA_ENABLE_WEBIQ`（`deploy/azd/profile.py:121-122`）擴充 `profile.py`。這條路沒有實作，也沒有在 azd 環境驗證過；Entra app 與 Work IQ 原則的細節見 [connector 設計](connector-design.md)。
 
 <a id="connector-acceptance"></a>
 ### Teams connector 驗收到哪裡
 
-- **測試環境（dev）**：10-10 真人加入 Teams、在 Connect 卡同意，並讀到指定 chat 的最新訊息（[紀錄](progress.md#connector-m1-dev-1010)）。10-11 工作台允許送出與拒絕送出都通過，從 Teams 轉來的回合也通過（[紀錄](progress.md#dev-deploy-8415-1011)）。上面第 4 步「非真人回合不出卡」的修正（#778）在 dev 還沒部署。
-- **預備環境（stage）**：隨第 24 版部署（`deploy/stage/release.json`，#760），這一版已包含 #778。stage 的部署工作流程 10-11 成功；stage 上的真人驗收還沒有紀錄。
+- **測試環境（dev）**：10-10 真人加入 Teams、在 Connect 卡同意，並讀到指定 chat 的最新訊息（[紀錄](progress.md#connector-m1-dev-1010)）。10-11 工作台允許送出與拒絕送出都通過，從 Teams 轉來的回合也通過（[紀錄](progress.md#dev-deploy-8415-1011)）。上面第 4 步「非真人回合不出卡」的修正在 dev 還沒部署。
+- **預備環境（stage）**：隨第 24 版部署（`deploy/stage/release.json`），這一版已包含第 4 步的修正。stage 的部署工作流程 10-11 成功；stage 上的真人驗收還沒有紀錄。
 
 ### 加一種新的 connector
 
@@ -125,6 +125,6 @@ connector 是用 Entra OAuth 代 Team 主人登入外部服務的 MCP。每個 T
 
 - 程式基準：`origin/main` `aeea27c3`，加上本文件所在分支的測試提交。
 - 已讀程式：`deploy/azd/profile.defaults.json`、`profile.py`、`fa_azd.py`、`entra.py`、`azure.yaml`；`shared_context/` 的 `connector_registry.py`、`team_connector.py`、`team_connector_api.py`、`team_connector_wire.py`、`team_connector_narrowing.py`、`team_mcp.py`、`team_mcp_wire.py`、`team_mcp_api.py`、`tool_catalog.py`、`behavior_capabilities.py`、`behavior_agent_template.py`、`behavior_agent_role_prompt.py`、`m3_artifacts.py`、`team_skills_api.py`、`m2_copilot.py`；`web_test_console/index.html`、`team_connectors.py`；`tool_catalog/*.json` 與兩個 Dockerfile。
-- Review round 1 補讀：`shared_context/` 的 `native_toolbox.py`（C3 Connect 卡的開卡條件與 `_DECLINED`，#778 `a935b97a`、`cfd18d92`，已在基準內）、`native_hitl_runtime.py` 的 `connect`、`behavior_native_turn_wire.py` 的 `RELAY_PREFIX`、`behavior_agent_setup.py`、`behavior_agent_onboarding.py` 的 `default_setup`；`infra/azd/main.bicep`、`main.parameters.json`、`infra/shared-context/stage-onboarding-delegation.bicep`；`deploy/stage/release.json`、`stage.json`；`docs/progress.md` 10-10、10-11 的 connector 紀錄。這一輪只改文件，沒有重跑測試。
+- Review round 1 補讀：`shared_context/` 的 `native_toolbox.py`（C3 Connect 卡的開卡條件與 `_DECLINED`，`a935b97a`、`cfd18d92`，已在基準內）、`native_hitl_runtime.py` 的 `connect`、`behavior_native_turn_wire.py` 的 `RELAY_PREFIX`、`behavior_agent_setup.py`、`behavior_agent_onboarding.py` 的 `default_setup`；`infra/azd/main.bicep`、`main.parameters.json`、`infra/shared-context/stage-onboarding-delegation.bicep`；`deploy/stage/release.json`、`stage.json`；`docs/progress.md` 10-10、10-11 的 connector 紀錄。這一輪只改文件，沒有重跑測試。
 - 實際驗證（本機 Windows，離線）：`test_azd_hooks.py`、`test_azd_profile.py`、`test_connector_consent.py`、`test_team_connector_api.py`、`test_team_mcp_api.py`、`test_native_toolbox_unavailable.py` 通過；`test_team_connector_narrowing.py` 7 則在 setup 停在 `the pinned offline tokenizer cache is required`（需要 `TIKTOKEN_CACHE_DIR`，見 [API 與 Hosted 說明](../src/fa-shared-context-poc/README.md)），本次沒有執行。
 - 限制：本文沒有在雲端實跑。`azd up` 不帶 connector 的結論來自程式與離線測試；作者實跑過的 `azd up` 本來就沒有 connector。自訂 connector、在 azd 環境開 Teams connector、新增 stdio MCP 都沒有人實際做過。

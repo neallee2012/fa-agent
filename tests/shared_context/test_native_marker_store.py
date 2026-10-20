@@ -4,11 +4,12 @@ Real core local task/store and host, as in ``test_native_turns``; only SDK/model
 """
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
 from azure.ai.agentserver.core.storage import FoundryStateStore, FoundryStorageNotFoundError
-from azure.ai.agentserver.core.tasks import TaskContext
+from azure.ai.agentserver.core.tasks import TaskConflictError, TaskContext
 from azure.core.exceptions import ServiceResponseError
 from starlette.testclient import TestClient
 
@@ -22,7 +23,7 @@ from shared_context.errors import Problem
 from shared_context.native_checkpoint import open_durable_store
 from shared_context.native_markers import EARLIER_VERSION_UNFINISHED, MARKER_TTL_SECONDS, MARKERS_STORE
 from shared_context.native_turns import TURNS_STORE, NativeTaskInput, NativeTurnRuntime
-from test_native_turn_wire import submit
+from test_native_turn_wire import agent_receive, submit
 from test_native_turns import (  # noqa: F401 - fixtures
     IDENTITY, Harness, OfflineSdk, accept_without_chain, harness, local_env, native_retry_policy, seed_started,
     task_context,
@@ -415,3 +416,165 @@ def test_a_session_that_no_longer_holds_the_receipt_refuses_its_input_without_ma
         accepted.value, receipt=native_turns._changed(accepted.value.receipt, hosted_session_id="OFFLINE-new-sid")))
     refuse(harness, moved, entry)
     assert harness.call(stored, "refused:rid-1") is None and not harness.sdk.calls
+
+
+def accept_peer_without_chain(harness):
+    """``accept_without_chain`` for a peer message: rid-1 is another Agent's request, so its sender waits on it."""
+    chain = harness.runtime.chain
+
+    async def bound_elsewhere(**kwargs):
+        raise TaskConflictError("OFFLINE original chain is bound elsewhere")
+
+    harness.runtime.chain = SimpleNamespace(start=bound_elsewhere)
+    try:
+        assert harness.invoke(agent_receive("rid-1")).status_code == 409
+    finally:
+        harness.runtime.chain = chain
+    return harness.call(harness.runtime._rid, "rid-1")
+
+
+def sender_notices(harness):
+    notices = []
+
+    async def notice(receipt):
+        notices.append((receipt.request_id, receipt.status, receipt.failure_code))
+
+    harness.runtime.on_unconfirmed = notice
+    return notices
+
+
+def settle(notices, count):
+    deadline = time.monotonic() + 5
+    while len(notices) < count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.3)  # a second notification would land here
+    return notices
+
+
+REFUSED_NOTICE = [("rid-1", "unknown", EARLIER_VERSION_UNFINISHED)]
+
+
+@pytest.mark.parametrize("entry", ["handle_turn", "_enqueue_attempt"])
+def test_a_refused_rid_tells_its_peer_sender_on_each_drifted_reentry_and_resend(harness, entry):
+    """#889 P3: the 409 refusal (the chain's, or the enqueue task's) ends the RID for every reader, so the peer sender
+    hears it with the final code. #915: the same drifted input again and a resend of the RID tell it again (the sender
+    dedupes by RID, ``test_unknown_peer_outcome_wakes_a_once_without_claiming_the_sdk_stopped``); the chain's refusal
+    of a current-version input adds nothing."""
+    accepted = accept_peer_without_chain(harness)
+    before = harness.call(rid_item)
+    notices = sender_notices(harness)
+    refuse(harness, accepted, entry)
+    assert settle(notices, 1) == REFUSED_NOTICE
+    refuse(harness, accepted, entry)
+    assert settle(notices, 2) == REFUSED_NOTICE * 2
+    final(harness.invoke(agent_receive("rid-1")))
+    assert settle(notices, 3) == REFUSED_NOTICE * 3
+    refuse(harness, accepted, "handle_turn", version=IDENTITY.agent_version)
+    assert settle(notices, 4) == REFUSED_NOTICE * 3 and not harness.sdk.calls
+    assert harness.call(rid_item) == before  # the receipt keeps its bytes (#889)
+
+
+@pytest.mark.parametrize("loss", ["marker-then-crash", "notification-start-lost"])
+@pytest.mark.parametrize("entry", ["handle_turn", "_enqueue_attempt"])
+def test_a_refused_rid_whose_notice_was_lost_tells_its_sender_on_the_next_reentry_or_resend(harness, entry, loss):
+    """#915 P2: the marker exists but no notice went out (its create landed and the reply was lost, so the retry got
+    409; the process ended right after the write; or the notification task start failed). Nothing sweeps it, so the
+    next drifted re-entry tells the sender, and so does a resend of the RID."""
+    accepted = accept_peer_without_chain(harness)
+    notices = sender_notices(harness)
+    supplied = NativeTaskInput(request_id="rid-1", accepted_etag=accepted.etag, call_id=accepted.value.call_id,
+                               execution_version="2")
+    if loss == "marker-then-crash":
+        assert harness.call(harness.runtime._mark_refused, supplied)
+    else:
+        notifications = harness.runtime.notifications
+
+        async def lost(**kwargs):
+            raise ServiceResponseError("OFFLINE notification start transport failure")
+
+        harness.runtime.notifications = SimpleNamespace(start=lost)
+        try:
+            with pytest.raises(Problem) as pending:
+                harness.call(getattr(harness.runtime, entry), TaskContext(
+                    task_id=IDENTITY.agent_id, session_id=IDENTITY.session_id, input_id="rid-1",
+                    entry_mode="fresh", input=supplied))
+            assert pending.value.body["error"]["code"] == "NATIVE_POST_TURN_UNKNOWN"
+        finally:
+            harness.runtime.notifications = notifications
+    assert harness.call(stored, "refused:rid-1") is not None and settle(notices, 1) == []
+    refuse(harness, accepted, entry)
+    assert settle(notices, 1) == REFUSED_NOTICE
+    final(harness.invoke(agent_receive("rid-1")))
+    assert settle(notices, 2) == REFUSED_NOTICE * 2 and not harness.sdk.calls
+
+
+def test_a_stale_refused_view_of_a_rid_a_resend_started_tells_its_sender_nothing(harness):
+    """#915 P3: the enqueue task reads ``accepted``, a current-version resend starts the RID before the marker is
+    written, then the notification task reads ``started``: not final, so no hook runs (its own end notifies)."""
+    accepted, _ = seed_started(harness)
+    calls = sender_notices(harness)
+
+    async def terminal(receipt):
+        calls.append(("terminal", receipt.status))
+
+    harness.runtime.on_terminal = terminal
+    assert harness.call(harness.runtime._mark_refused, NativeTaskInput(
+        request_id="rid-1", accepted_etag=accepted.etag, call_id=accepted.value.call_id, execution_version="2"))
+    harness.call(harness.runtime._notify_terminal, native_turns._refused_final(accepted.value.receipt))
+    assert settle(calls, 1) == []
+
+
+def test_a_drifted_input_of_a_finished_rid_tells_its_sender_nothing_more(harness):
+    """#889 P3: a finished RID told its sender when it ended; the enqueue task's refusal of its drifted input does not
+    tell it again (``_enqueue_attempt``'s ``_refused_final`` guard)."""
+    notices, completed = sender_notices(harness), []
+
+    async def done(receipt, result):
+        completed.append(receipt.request_id)
+
+    harness.runtime.on_completed = done
+    assert harness.invoke(agent_receive("rid-1")).status_code == 202
+    harness.wait("rid-1", "completed")
+    assert settle(completed, 1) == ["rid-1"]
+    refuse(harness, harness.call(harness.runtime._rid, "rid-1"), "_enqueue_attempt")
+    assert settle(completed, 2) == ["rid-1"] and notices == []
+
+
+def test_a_refused_rids_exhausted_notification_never_rewrites_its_receipt(harness):
+    """#915 P3: the refused RID is final only as a read-time view; when every notification attempt fails, the
+    ``notification_error`` write is skipped, so the stored ``accepted`` receipt keeps its bytes (ADR-0009 §9)."""
+    accepted = accept_peer_without_chain(harness)
+    before = harness.call(rid_item)
+    attempts = []
+
+    async def unavailable(receipt):
+        attempts.append(receipt.request_id)
+        raise Problem(503, "NATIVE_RELAY_UNAVAILABLE", "OFFLINE sender API unavailable")
+
+    harness.runtime.on_unconfirmed = unavailable
+    refuse(harness, accepted, "_enqueue_attempt")
+    assert len(settle(attempts, harness.runtime._notification_retry.max_attempts)) == (
+        harness.runtime._notification_retry.max_attempts)
+    assert harness.call(rid_item) == before
+
+
+def test_a_drifted_input_of_a_receipt_another_session_holds_tells_its_sender_nothing(harness):
+    """That session runs it: a notice here would read "blocked" while the work goes on."""
+    accepted = accept_peer_without_chain(harness)
+    moved, _ = harness.call(harness.runtime._cas, accepted, native_turns._changed(
+        accepted.value, receipt=native_turns._changed(accepted.value.receipt, hosted_session_id="OFFLINE-new-sid")))
+    notices = sender_notices(harness)
+    refuse(harness, moved, "handle_turn")
+    assert settle(notices, 1) == []
+
+
+def test_a_completed_peer_turn_notifies_as_before(harness):
+    notices, completed = sender_notices(harness), []
+
+    async def done(receipt, result):
+        completed.append(receipt.request_id)
+
+    harness.runtime.on_completed = done
+    assert harness.invoke(agent_receive("rid-1")).status_code == 202
+    harness.wait("rid-1", "completed")
+    assert settle(completed, 1) == ["rid-1"] and notices == []

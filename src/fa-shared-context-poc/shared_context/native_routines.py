@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
-from .behavior_native_turn_api import NativeTurnGateway
+from .behavior_native_turn_api import NativeTurnGateway, older_image
 from .behavior_native_capture import pinned_to, resolve_routine_capture
 from .behavior_native_responses_api import submit_native_turn, turn_profile
 from .behavior_native_turn_wire import (
@@ -649,7 +649,7 @@ class NativeRoutineService:
                 composition, client, submission.command, submission.capture if original is None else original.capture,
                 routine=submission.routine, original=original, conversation=conversation, before_send=current)
         except Problem as error:
-            if error.status < 500:
+            if error.status < 500 and not older_image(composition, control, client, error):
                 raise
             raise Problem(503, "NATIVE_ROUTINE_UNCONFIRMED",
                           "read the original occurrence; do not replace its RID or replay unknown effects",

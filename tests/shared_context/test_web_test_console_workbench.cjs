@@ -4110,6 +4110,126 @@ test("an append settled not_applied is sent once as a new turn under a new reque
     "the append, one /next and one /submit");
   assert.equal(ui.nodes.get("instruction").value,"");
 });
+test("an append answered not_applied while its original still stops and saves goes out at once as a new turn",async()=>{
+  // The bridge offers a follow-up while a turn runs (native.py view: can_follow_up does not look at the status).
+  const data=appendChat();data.composer.can_follow_up=true;
+  const rid=data.composer.request_id,ui=await open(data),content="回覆後一秒補的一句";
+  ui.nodes.get("instruction").value=content;ui.nodes.get("instruction").events.input();
+  ui.click("send-instruction");await ui.tick();
+  // Hosted answers at once (2026-10-19): the original's last SDK round is over, but it is still started here.
+  const row={request_id:rid,append_id:"append-offline-a",content,status:"not_applied",delivery:null,
+    reason:"turn_finished",receipt_observed:true};
+  const running=copy(data);running.composer.append_target.append_id="append-offline-b";running.tasks[0].appends=[row];
+  ui.holder.current=running;
+  ui.holder.pendingPosts[0].resolve({append:copy(row)});await ui.tick();await ui.tick();await ui.tick();
+  assert.equal(vm.runInContext("runningOwnTurn()?.task_id",ui.context),rid,"the original still runs");
+  const nexts=ui.holder.pendingPosts.filter(post=>post.url.endsWith("/next"));
+  assert.deepEqual(nexts.map(post=>post.url),[`/api/instructions/${running.composer.thread_id}/next`]);
+  assert.match(historyText(ui),/改成新訊息送出/);
+  const next=copy(running);
+  Object.assign(next.composer,{request_id:"next-rid",content:null,editable:true,can_submit:true,can_follow_up:false,
+    append_target:null});
+  nexts[0].resolve(next);await ui.tick();await ui.tick();
+  const submits=ui.calls.filter(call=>call.method==="POST"&&call.url.endsWith("/submit"));
+  assert.deepEqual(submits.map(call=>call.url),["/api/instructions/next-rid/submit"]);
+  assert.equal(JSON.parse(submits[0].body).content,content);
+  // Turn 1 then completes (saved), with the resent text as its own turn queued behind it.
+  const done=nativeChat("completed");done.tasks[0].appends=[row];done.tasks[0].actions["read-appends"]=action(true);
+  const sent=copy(done.tasks[0]);
+  Object.assign(sent,{task_id:"next-rid",submit_request_id:"next-rid",instruction:content,reply:null,appends:[],
+    submission:{state:"CONFIRMED"},native_receipt:{...sent.native_receipt,status:"accepted"},
+    status:{data:{state:"accepted"},observed_at:when}});
+  const after=copy(done);after.tasks.push(sent);
+  Object.assign(after.composer,{request_id:"next-rid",content,editable:false,can_follow_up:true});
+  ui.holder.current=after;
+  ui.holder.pendingPosts.find(post=>post.url.endsWith("/submit")).resolve({task:sent});
+  await ui.tick();await ui.tick();await ui.tick();
+  ui.render(after);await ui.tick();
+  assert.equal(vm.runInContext("lastError",ui.context),null);
+  assert.equal(vm.runInContext("state.tasks[0].status.data.state",ui.context),"completed");
+  assert.match(historyText(ui),/改成新訊息送出/);
+  assert.doesNotMatch(historyText(ui),/帶回輸入框|不會自動再送/);
+  assert.equal(vm.runInContext("runningOwnTurn()?.task_id",ui.context),"next-rid","the resent text runs as turn 2");
+  assert.equal(ui.calls.filter(call=>call.method==="POST"&&/\/(next|submit|append)$/.test(call.url)).length,3,
+    "the append, one /next and one /submit");
+});
+// Review P1 on #916: Responses has no queue (a human turn sent while the slot holder runs is busy_refused), so there the
+// resend waits for the original to end, as before.
+test("on Responses an append answered not_applied while its original still runs goes out only after it ends",async()=>{
+  const data=appendChat();data.composer.can_follow_up=true;
+  data.tasks[0].state_profile=data.composer.state_profile="foundry-responses-v1";
+  const rid=data.composer.request_id,ui=await open(data),content="回覆後一秒補的一句";
+  ui.nodes.get("instruction").value=content;ui.nodes.get("instruction").events.input();
+  ui.click("send-instruction");await ui.tick();
+  const row={request_id:rid,append_id:"append-offline-a",content,status:"not_applied",delivery:null,
+    reason:"turn_finished",receipt_observed:true};
+  const running=copy(data);running.composer.append_target.append_id="append-offline-b";running.tasks[0].appends=[row];
+  ui.holder.current=running;
+  ui.holder.pendingPosts[0].resolve({append:copy(row)});await ui.tick();await ui.tick();await ui.tick();
+  assert.equal(vm.runInContext("runningOwnTurn()?.task_id",ui.context),rid,"the original still runs");
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/next")||call.url.endsWith("/submit")),false,"not while it runs");
+  assert.match(historyText(ui),/改成新訊息送出/);
+  const done=nativeChat("completed");done.tasks[0].appends=[row];done.tasks[0].actions["read-appends"]=action(true);
+  done.tasks[0].state_profile=done.composer.state_profile="foundry-responses-v1";
+  ui.holder.current=done;ui.render(done);await ui.tick();await ui.tick();
+  const nexts=ui.holder.pendingPosts.filter(post=>post.url.endsWith("/next"));
+  assert.deepEqual(nexts.map(post=>post.url),[`/api/instructions/${done.composer.thread_id}/next`]);
+  const next=copy(done);
+  Object.assign(next.composer,{request_id:"next-rid",content:null,editable:true,can_submit:true,can_follow_up:false});
+  nexts[0].resolve(next);await ui.tick();await ui.tick();
+  const submits=ui.calls.filter(call=>call.method==="POST"&&call.url.endsWith("/submit"));
+  assert.deepEqual(submits.map(call=>call.url),["/api/instructions/next-rid/submit"]);
+  assert.equal(JSON.parse(submits[0].body).content,content);
+});
+// Review P2 on #916: A1 accepted just before the channel closed, A2 answered not_applied after it. A read that still
+// shows A1 unsettled must not let A2 go first; once A1 settles, A1 goes out, then A2.
+test("two tail appends go out as new turns in their append order",async()=>{
+  const data=appendChat();data.composer.can_follow_up=true;
+  const rid=data.composer.request_id,ui=await open(data);
+  const entry=(id,content,status)=>({request_id:rid,append_id:id,content,status,delivery:null,
+    reason:status==="not_applied"?"turn_finished":null,receipt_observed:true});
+  ui.nodes.get("instruction").value="A1";ui.nodes.get("instruction").events.input();
+  ui.click("send-instruction");await ui.tick();
+  const second=copy(data);second.composer.append_target.append_id="append-offline-b";
+  second.tasks[0].appends=[entry("append-offline-a","A1","accepted")];ui.holder.current=second;
+  ui.holder.pendingPosts[0].resolve({append:entry("append-offline-a","A1","accepted")});await ui.tick();await ui.tick();
+  ui.nodes.get("instruction").value="A2";ui.nodes.get("instruction").events.input();
+  ui.click("send-instruction");await ui.tick();
+  const stale=copy(second);stale.composer.append_target.append_id="append-offline-c";
+  stale.tasks[0].appends=[entry("append-offline-a","A1","accepted"),entry("append-offline-b","A2","not_applied")];
+  ui.holder.current=stale;
+  ui.holder.pendingPosts.filter(post=>post.url.endsWith("/append")).at(-1).resolve({append:entry("append-offline-b","A2","not_applied")});
+  await ui.tick();await ui.tick();await ui.tick();
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/next")||call.url.endsWith("/submit")),false,"A2 waits for A1");
+  const settled=copy(stale);
+  settled.tasks[0].appends=[entry("append-offline-a","A1","not_applied"),entry("append-offline-b","A2","not_applied")];
+  ui.holder.current=settled;ui.render(settled);await ui.tick();await ui.tick();
+  const order=()=>ui.calls.filter(call=>call.method==="POST"&&call.url.endsWith("/submit"))
+    .map(call=>JSON.parse(call.body).content);
+  const first=ui.holder.pendingPosts.filter(post=>post.url.endsWith("/next"));
+  assert.equal(first.length,1);
+  const next=copy(settled);
+  Object.assign(next.composer,{request_id:"next-a1",content:null,editable:true,can_submit:true,can_follow_up:false,
+    append_target:null});
+  first[0].resolve(next);await ui.tick();await ui.tick();
+  assert.deepEqual(order(),["A1"],"A1 first");
+  // A1's turn, then A2's: once A1's resend has ended, A2 goes out next.
+  const done=nativeChat("completed");done.tasks[0].appends=copy(settled.tasks[0].appends);
+  done.tasks[0].actions["read-appends"]=action(true);
+  const a1=copy(done.tasks[0]);
+  Object.assign(a1,{task_id:"next-a1",submit_request_id:"next-a1",instruction:"A1",appends:[],submission:{state:"CONFIRMED"}});
+  const after=copy(done);after.tasks.push(a1);
+  Object.assign(after.composer,{request_id:"next-a1",content:"A1",editable:false,can_follow_up:true,append_target:null});
+  ui.holder.current=after;
+  ui.holder.pendingPosts.find(post=>post.url.endsWith("/submit")).resolve({task:a1});
+  await ui.tick();await ui.tick();await ui.tick();
+  ui.render(after);await ui.tick();await ui.tick();
+  const then=ui.holder.pendingPosts.filter(post=>post.url.endsWith("/next")).at(-1);
+  const nextA2=copy(after);
+  Object.assign(nextA2.composer,{request_id:"next-a2",content:null,editable:true,can_submit:true,can_follow_up:false});
+  then.resolve(nextA2);await ui.tick();await ui.tick();
+  assert.deepEqual(order(),["A1","A2"],"then A2");
+});
 test("an append whose outcome is unknown is never sent again as a new turn",async()=>{
   const {ui,content}=await appendInTail("unknown");
   await ui.tick();ui.render(ui.holder.current);await ui.tick();
@@ -11446,11 +11566,17 @@ test("the confirm-gated action table has one row per action",()=>{
 // ADR-0009 §8 / M4 (phase 2c): the per-Agent notice the API delivers once with an owner's submit answer.
 const ENVIRONMENT_NOTICE_SENTENCES=[
   [{kind:"environment_updated"},"助理已更新到新版本，工作檔也一起帶過來了。"],
-  [{kind:"environment_switched_without_files"},"已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。"],
+  [{kind:"environment_switched_without_files"},"上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。"],
   [{kind:"environment_source_retired"},
-    "已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。"],
+    "上次換環境時，舊環境已失效或被平台刪除，沒有搬工作檔；之前 VM 裡的工作檔可能已經不在了。"],
   [{kind:"platform_version_changed",from_version:"41",to_version:"40"},
     "平台把助理的執行環境換成了另一個版本（v41→v40）；FA 已記錄，相容就照常執行。"],
+  // phase 4d (Neal 2026-10-19); without its work files the no-files sentence follows (M4 #1)
+  [{kind:"environment_rolled_back"},"助理已退回先前的版本；剛才中斷的訊息請再送一次。"],
+  [{kind:"environment_rolled_back",without_files:true},
+    "助理已退回先前的版本；剛才中斷的訊息請再送一次。上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。"],
+  // phase 4b-4 (Neal 2026-10-19): U3's third failure vetoed the new version; no version numbers
+  [{kind:"environment_upgrade_vetoed"},"助理這次沒有更新，會繼續使用目前的版本。"],
 ];
 async function sendWithNotice(notice,{content="換版後的問題"}={}){
   const ui=await open(switchingChat());
@@ -11466,7 +11592,7 @@ async function sendWithNotice(notice,{content="換版後的問題"}={}){
 }
 const occurrences=(ui,sentence)=>[...ui.nodes.values()].filter(node=>node.textContent===sentence).length;
 for(const [notice,sentence] of ENVIRONMENT_NOTICE_SENTENCES){
-  test(`the ${notice.kind} notice shows once as a quiet status line, never as an error`,async()=>{
+  test(`the ${notice.kind}${notice.without_files?" (without files)":""} notice shows once as a quiet status line, never as an error`,async()=>{
     const {ui}=await sendWithNotice(notice);
     const note=ui.nodes.get("environment-note");
     assert.equal(note.hidden,false);
@@ -11497,7 +11623,7 @@ test("the notice ends with the Agent's next accepted message, which carries none
   assert.equal(ui.nodes.get("environment-note").hidden,true);
 });
 test("a notice kind this page does not know is ignored, never an error",async()=>{
-  const {ui}=await sendWithNotice({kind:"environment_rolled_back",to_version:"39"});
+  const {ui}=await sendWithNotice({kind:"environment_later_kind",to_version:"39"});
   assert.equal(ui.nodes.get("environment-note").hidden,true);
   assert.equal(ui.nodes.get("error").hidden,true);
   assert.equal(vm.runInContext("lastError",ui.context),null);
@@ -11513,7 +11639,7 @@ test("after a server-side switch the same-RID resend's answer carries the switch
     [`/api/tasks/${c.rid}/submit-retry`]:{ok:true,json:async()=>{ui.holder.current=copy(c.accepted);return {task:accepted}}}};
   typeAttachmentText(ui,"換版也只送一次");ui.holder.current=copy(c.refused);ui.click("send-instruction");
   await ui.tick();await ui.tick();await fireDelay(ui,3000);
-  assert.equal(ui.text("environment-note"),"已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。");
+  assert.equal(ui.text("environment-note"),"上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。");
   assert.equal(ui.nodes.get("environment-note").hidden,false);
   assert.equal(vm.runInContext("lastError",ui.context),null);
 });
@@ -11535,7 +11661,7 @@ test("after the source environment was deleted, the same-RID resend shows source
 });
 test("a manual retry of the original turn answered without a notice keeps the shown one",async()=>{
   const c=serverFollowingCase(),ui=await open(c.refused,{now:0});
-  const sentence="已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。";
+  const sentence="上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。";
   // The Agent's notice came with an earlier answer and is on screen.
   vm.runInContext(`environmentNotices.set(selectedAgent,${JSON.stringify(sentence)});renderEnvironmentNotice()`,ui.context);
   assert.equal(ui.nodes.get("environment-note").hidden,false);

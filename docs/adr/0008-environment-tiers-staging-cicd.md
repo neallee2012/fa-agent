@@ -58,6 +58,7 @@ Neal 原話（2026-10-02 16:57）：
 ### 1. 環境分層
 
 - **dev**：現有的 `faexample` project，維持部署線手動部署。
+  - **2026-10-19（Neal 決定）**：dev 改成可用 `ci_deploy.py --config deploy/dev/dev.json` 部署，見 [Deploying dev](../../deploy/README.md#deploying-dev)；批准規則不變。
 - **stage**：同一個 account（`cog-fasample-memory-demo`）下的新 project。
 - **共用**：account、模型部署、quota、account 層設定。ACR 是否共用，由 stage 計畫決定。
 - **分開**：project、Agent、State store、Conversations、Memory scope、API、Storage、identity、監控。

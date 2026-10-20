@@ -139,6 +139,15 @@ class NativeWorkspaceFiles:
             raise Problem(503, "NATIVE_FILES_UNAVAILABLE", "the original workspace is missing or cannot be read") from None
         return manifest
 
+    def tree(self):
+        """ADR-0009 5b: (root mode, entries) of this session's workspace; (None, ()) without a root. Creates nothing: a
+        restore goes through ``prepare``/``confirm``/``publish``, whose rename needs the root absent."""
+        try:
+            self._guard(self.root)
+            return self._entries(self.root) if self.root.exists() else (None, ())
+        except OSError:
+            raise Problem(503, "NATIVE_FILES_UNAVAILABLE", "the workspace cannot be read") from None
+
     def verify(self, manifest):
         try:
             mode, entries = self._entries(self.root)

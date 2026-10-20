@@ -1,6 +1,6 @@
 """ADR-0009 phase 5a: workspace snapshots for an idle upgrade, kept in the Team's Blob (ADR-0002, ADR-0009 §6 ②).
 
-API-only and not wired into any flow yet (5b wires U1/U4). Layout:
+API-only; ``upgrade_snapshot_flow`` (5b) wires it into U1/U4. Layout:
 ``fa-upgrade-snapshots/<tenant>/<team>/<agent>/<upgrade_id>/files/NNNN`` per regular file, then ``manifest.json``
 written LAST as the publish marker; tenant and Team are also in every blob's metadata and both must match on read. A
 prefix without a manifest is incomplete: it is never restored and never resumed (a retry uses a new ``upgrade_id``).

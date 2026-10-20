@@ -21,6 +21,9 @@ files are never left behind by a no-files commit.
 - Quiet, with files: ``environment-before:<RID>`` is saved and one CAS E0 -> the H0-shaped ``pending`` the follow
   writes, with the same ``following:`` record (phase ``files``); the existing follow file stages move the files and
   ``session_follow`` commits (fence <= ~120 s, as today's follow).
+- Quiet, with a 5b restore (``files_restore``): the probe ``prepare``s its staging (refused when the live root holds
+  another tree); the cut confirms each file the API staged, publishes the tree, then the same CAS commits ``ready``
+  with ``files_migrated`` and the manifest digest, so this record, not the API's row, says the files moved.
 
 Every call logs one ``NATIVE_UPGRADE_CUT`` line (ADR-0009 gate 7): outcome, command mode, scan mode
 (``set``/``full``/``none``), this call's scan time (the receipt reads only) and receipts read, the task check and
@@ -30,6 +33,7 @@ adoption times apart, and the attempt's call count and totals.
 session; H0 has no such command.
 """
 
+import asyncio
 import logging
 from time import perf_counter
 
@@ -81,6 +85,10 @@ async def _cut(runtime, command):
         return record.view
     if current.hosted_session_id != source:
         raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original Agent environment comparison changed")
+    restore = command.files_restore
+    if restore is not None and (restore.agent_id, restore.target_session_id, restore.target_agent_version) != (
+            runtime.identity.agent_id, me, runtime.identity.agent_version):
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the restore names another Agent or destination")
     prepared = existing if existing is not None else current.preparation
     view = NativeEnvironmentView(
         agent_id=runtime.identity.agent_id, request_id=command.request_id,
@@ -99,7 +107,8 @@ async def _cut(runtime, command):
 
     # The last point where the record names how the source became the Agent's.
     await check_hold(runtime, source, None if existing is None else existing.request_id)
-    if command.files_required and (runtime.workspace_files is None or not current.following_supported):
+    if (command.files_required and (runtime.workspace_files is None or not current.following_supported)
+            or restore is not None and runtime.workspace_files is None):
         return done("busy", _changed(view, reason="files_unsupported"))
     if current.admitting is not None or command.expected_etag not in {None, etag}:
         return done("busy", _changed(view, reason="admission_pending"))
@@ -133,6 +142,8 @@ async def _cut(runtime, command):
     if reason is not None:
         return done("busy", _changed(view, reason=reason))
     if command.mode == "probe":
+        if restore is not None:
+            await asyncio.to_thread(runtime.workspace_files.prepare, restore)  # before the API's staging uploads
         # Quiet at E0: the API lists the source's files after this answer and cuts with ``expected_etag=E0``.
         return done("quiet", _changed(view, quiet_etag=etag))
     if command.files_required:
@@ -145,10 +156,15 @@ async def _cut(runtime, command):
         await save_before(runtime, current, command.request_id)
         replacement = _changed(current, environment=fenced)
     else:
-        if runtime.workspace_files is not None:
+        if restore is not None:
+            # Published before the CAS: a lost CAS leaves true files on a destination the Agent never moved to.
+            await asyncio.to_thread(_restore, runtime.workspace_files, restore)
+        elif runtime.workspace_files is not None:
             runtime.workspace_files.initialize()
         fenced = _changed(view, state="ready", reason=None,
-                          files_profile="fa-workspace-files-v1" if runtime.workspace_files is not None else None)
+                          files_profile="fa-workspace-files-v1" if runtime.workspace_files is not None else None,
+                          **({} if restore is None else {"files_migrated": True,
+                                                         "files_manifest_sha256": restore.sha256}))
         async with runtime._store(TURNS_STORE) as store:
             await runtime._immutable(store, "environment:" + material_digest(fenced), fenced)
         replacement = _changed(current, hosted_session_id=me, environment=fenced, following_supported=True,
@@ -172,6 +188,14 @@ async def _cut(runtime, command):
         # The scan above saw every open receipt; from this commit only this session admits, and adds each RID.
         await mark_complete(runtime, me, command.request_id, responses=responses)
     return done("ready", fenced)
+
+
+def _restore(files, manifest):
+    """ADR-0009 5b U4 through the fence's own staging: modes, empty directories and hashes as the manifest says."""
+    files.prepare(manifest)
+    for index in range(len(manifest.entries)):
+        files.confirm(manifest, index)
+    files.publish(manifest)
 
 
 async def withdraw_session(runtime, command):

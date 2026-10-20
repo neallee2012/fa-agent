@@ -33,6 +33,12 @@ BASE_TURN_REQUESTS = "2f1e5f4fb257bbbfd6738b5a5dc4fe2e509dee0f6061bc25466c0e4324
 BASE_ROUTINE = "5205e4875fc242bf2cdbc3683613834a75e3bd5fc5cee1fbf4a1388d479af7e3"
 
 
+@pytest.fixture
+def base_platform(monkeypatch):
+    """The bases were taken on Windows; a new capture's default checkpoint profile names this process's platform."""
+    monkeypatch.setattr("shared_context.behavior_sdk_state.local_platform", lambda: "win32-x64")
+
+
 def conversation(profile, cid="native-cid", **changes):
     kept = capture()
     return NativeConversation(
@@ -85,7 +91,9 @@ def test_a_v2_labelled_conversation_is_sent_the_same_v1_bytes_as_before(monkeypa
     requests = _requests(monkeypatch)
     turns, held = _turns(label)
     for turn in turns:
-        submit_native_turn(None, client, turn.pop("command"), turn.pop("capture"), conversation=held, **turn)
+        # Since 34e4af98 an RID no receipt holds is start-pinned from composition.runtime first.
+        submit_native_turn(SimpleNamespace(runtime=None), client, turn.pop("command"), turn.pop("capture"),
+                           conversation=held, **turn)
     assert [request.state_profile for request in requests] == [NATIVE_STATE_PROFILE] * 3
     assert _digest(requests) == BASE_TURN_REQUESTS
 
@@ -110,6 +118,7 @@ def _owner_requests(case):
             for request, _ in case.remote.calls]
 
 
+@pytest.mark.usefixtures("base_platform")
 @pytest.mark.parametrize("label", [NATIVE_STATE_PROFILE, NATIVE_V2_PROFILE])
 def test_an_owner_follow_up_into_a_v2_labelled_conversation_is_sent_as_v1(native_api, monkeypatch, label):  # noqa: F811
     case = native_api
@@ -128,6 +137,7 @@ def test_an_owner_follow_up_into_a_v2_labelled_conversation_is_sent_as_v1(native
     assert digest == BASE_OWNER_REQUESTS
 
 
+@pytest.mark.usefixtures("base_platform")
 @pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
 def test_a_routine_into_a_v2_labelled_conversation_is_sent_as_v1(routine_api, monkeypatch):  # noqa: F811
     case = routine_api

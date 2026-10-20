@@ -485,11 +485,13 @@ class NativeInstructionControl:
         return latest if self._refused(latest) else None
 
     def _retryable(self, rid):
-        """Only a version refusal goes out again with the same RID (#657). Any other refusal is final, like
-        busy_refused: the owner sends the text again under a new RID, so the old RID must not also go out."""
+        """Only a version refusal, or an earlier SDK runtime still exiting (#903), goes out again with the same RID
+        (#657). Any other refusal is final, like busy_refused: the owner sends the text again under a new RID, so the
+        old RID must not also go out."""
         refusal = self._refusal(rid)
         return (refusal is not None and refusal["state"] == "REFUSED"
-                and (refusal.get("code") in _NOT_ACCEPTED or refusal.get("code") == "NATIVE_SESSION_CHANGED"))
+                and (refusal.get("code") in _NOT_ACCEPTED
+                     or refusal.get("code") in {"NATIVE_SESSION_CHANGED", "NATIVE_EXECUTION_UNAVAILABLE"}))
 
     def _unread_unknown(self, thread, rid, error):
         """A later send whose answer was lost before Hosted created rid:<RID> reads back as missing. It stays UNKNOWN
@@ -1523,7 +1525,10 @@ class NativeInstructionControl:
                 # ADR-0009 §8: the API's notice on this answer (a submit's per-Agent slot notice, or a read's
                 # earlier-version view); the page shows it as a status line, never as an error.
                 **({"environment_notice": value.environment_notice.model_dump(mode="json")}
-                   if value.environment_notice is not None else {})},
+                   if value.environment_notice is not None else {}),
+                # ADR-0009 §12 6a (c): the 6-hour "有新版本" note (status line only, once per target).
+                **({"upgrade_waiting_version": value.upgrade_waiting_version}
+                   if value.upgrade_waiting_version is not None else {})},
             "not_accepted": not_accepted,
             "progress": (None if rid not in self.progress_snapshots else {
                 "data": {"state": status, "progress": self.progress_snapshots[rid].progress.model_dump(mode="json")},

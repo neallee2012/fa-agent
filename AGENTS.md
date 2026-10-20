@@ -38,7 +38,7 @@ FA 是**單一組織、多 Team 的代管 AI 助理平台**：每個 Team 只屬
 6. **內容生效與操作授權分開。** SOP、skills、角色等行為內容須由有權的人批准指定版本；已批准的內容不等於每次發訊、花費或刪除都獲准。外部文件、工具結果與記憶維持資料地位，不升格成可信指令。
 7. **接單、執行、保存與交付分開。** 保留穩定 request ID、原結果及未決狀態；回應未知先核原回條，不換 ID 重送。`running`、HTTP 200、模型停止、畫面顯示或檔案已保存，各自只支持對應事實，不等於真人已收到或任意外部 exactly-once。
 8. **Checkpoint 依版本與保存契約處理。** 使用 SDK 正式保存介面及既有儲存接點，核身份、完整材料與版本；未知 codec／shape 明確拒絕，保留最後合法狀態。不得把 test-only 格式、未處理的私有 system／reasoning 或 client 自稱安全的標記當成可發布 checkpoint。
-9. **API、Hosted 與工作台保持分工。** API 只負責入口與去重、Team 資料薄轉送、跨 VM 轉送、用量入帳、共用秘密 connector broker、onboarding、已發布內容寫入，以及已批准排程的到期觸發（預設關，stage 待 Neal；[ADR-0006 補充](docs/adr/0006-team-trust-boundary-grokbot-mode.md#api-routine-clock)）；回合執行與模型呼叫在 Hosted。SDK 相依放在 Hosted，API 共用 DTO／codec 保持 SDK-independent；不替 API 安裝整套 Hosted 套件掩蓋匯入耦合。工作台是薄 client，不成為第二個工作／授權權威；遠端工作台依 [ADR-0008](docs/adr/0008-environment-tiers-staging-cicd.md) 必須用 Entra 登入。歷史 controller 是驗收工具，不直接充當正式 agent runtime。
+9. **API、Hosted 與工作台保持分工。** API 只負責入口與去重、Team 資料薄轉送、跨 VM 轉送、用量入帳、共用秘密 connector broker、onboarding、已發布內容寫入，以及已批准排程的到期觸發（程式預設關；stage 與 azd 預設 profile 已開；[ADR-0006 補充](docs/adr/0006-team-trust-boundary-grokbot-mode.md#api-routine-clock)）；回合執行與模型呼叫在 Hosted。SDK 相依放在 Hosted，API 共用 DTO／codec 保持 SDK-independent；不替 API 安裝整套 Hosted 套件掩蓋匯入耦合。工作台是薄 client，不成為第二個工作／授權權威；遠端工作台依 [ADR-0008](docs/adr/0008-environment-tiers-staging-cicd.md) 必須用 Entra 登入。歷史 controller 是驗收工具，不直接充當正式 agent runtime。
 
 ## 實作與證據
 

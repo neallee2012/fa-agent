@@ -76,7 +76,8 @@ async def relay(api, turn, *, path=PATH, ack=False, clock=time.monotonic, sleep=
                     if reply.get("confirm"):
                         await acknowledge(api, turn, reply["confirm"])
                     return text
-                running = reply["text"]
+                if reply.get("not_dispatched") is not True:  # a poll that took nothing confirms nothing
+                    running = reply["text"]
             elif 400 <= response.status_code < 500:
                 # Refused before any turn (bad identity, conflict, invalid message); sending it again cannot help.
                 return UNCONFIRMED

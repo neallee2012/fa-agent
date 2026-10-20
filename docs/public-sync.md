@@ -34,6 +34,7 @@
 | `scripts/public_export/mapping.json`、`review.json`、`candidates.txt` | 內含原始識別資訊（替換前的值） |
 | `.github/workflows/`（整個目錄） | 推送 workflow 檔需要 Workflows 權限，只開 Contents 的權杖推不上去；`public-sync.yml`、`deploy-staging.yml` 也只對私有 repo 與 Neal 的 stage 有意義 |
 | `.claude/` | 本機 agent 設定 |
+| `deploy/dev/`（整個目錄） | 作者 dev 環境的部署 profile 與已安裝的 runtime 配置，全是 dev 識別資訊，沒有替換規則（Neal 2026-10-19 決定加 dev profile） |
 
 所以公開 repo **沒有任何 CI workflow**。也因此公開 repo 裡有兩個讀 workflow 檔的測試會失敗：`tests/shared_context/test_stage_ci_deploy_feed.py` 與 `test_stage_version_publication.py` 各一個（讀 `deploy-staging.yml`），目前沒有改。`tests/infra/test_shared_context_avm.py::test_infrastructure_workflow_compiles_without_azure_credentials_or_deployment`（讀 `validate-infrastructure.yml`）在沒有 `.github/workflows/` 目錄時改成跳過並寫明原因；私有 repo 有這個目錄，照常執行。另外 `tests/context_eval/test_context_target_eval.py::test_committed_ledger_preserves_the_historical_strict_failure_and_batch_review` 在公開副本也會失敗（`run content fingerprint differs`）：`docs/context-evaluation-status.json` 目前有 4 個 run 的內容被替換（各自記錄的 `sha256` 原樣保留），重算的指紋對不上；補強替換規則（#786）之前的匯出就已如此。
 
@@ -222,6 +223,7 @@ verify 只擋已知的值與通用樣式。公開之後，每次同步會立刻�
 - **release 28（10-13）**：commit `ba9adcb6`（tree `7c07241d`）。
 - **release 29（10-14）**：stage 第 29 版部署後的 public-sync；第二道 `gate2_check.py` 第一次自動執行，通過。公開 commit、tag 與 tree 在這裡未記，要引用請讀 public-sync 的 run 與公開 repo。
 - **release 30（10-15）**：stage 第 30 版部署後的 public-sync（run 38666821029，成功）；第二道 `gate2_check.py` 自動通過：指紋相符、部署 commit 匯出的樹與公開樹相同、公開檔案 verify 通過。公開 tag `v2026.10.15-30`，commit `2725c646`，tree `ff9fef76`（讀自該 run 的 log）。
+- **release 31（10-18）**：stage 第 31 版部署後的 public-sync（run 39128177206，12:44:18Z 成功）；第一道指紋相符，第二道 `gate2_check.py` 自動通過。公開 tag `v2026.10.18-31`，commit `b1d0e221`，tree `009dbd71`（讀自該 run 的 log）。
 - **2026-10-13 第一次完整清單比對**：發現公開 `v2026.10.13-28` 裡有 5 個 Azure Bot Service 名稱（見「清單比對基準」），已加替換規則，從下一版起生效；已公開的歷史依 Neal 的決定保留（只修以後、不重寫），下一版整棵取代。
 - **限制**：GitHub 可能仍保留沒有任何引用的 v25 commit 物件，要請 GitHub Support 清除才會消失；這是擁有者向 GitHub 提出的要求，agent 不代做。
 

@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import subprocess
+import time
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -23,7 +24,7 @@ from copilot.session_events import AssistantMessageData, SessionIdleData
 
 from shared_context import m2_copilot, native_sdk
 from shared_context.behavior_hosted import create_host
-from shared_context.behavior_native_turn_wire import NativeResult, NativeSubmit, NativeTurnCapture
+from shared_context.behavior_native_turn_wire import NativeCancel, NativeResult, NativeSubmit, NativeTurnCapture
 from shared_context.native_turns import NativeTurnRuntime, timing_id
 from test_native_turn_wire import capture, submit
 from test_native_turns import Harness, IDENTITY, local_env  # noqa: F401
@@ -121,6 +122,8 @@ def offline_runtime(tmp_path, *, hitl_client=None, capability_providers=()):
         model_url=MODEL_ROOT, token_provider=lambda: "OFFLINE",
         model_transport=httpx.MockTransport(lambda _: pytest.fail("this double makes no model request")),
         hitl_client=hitl_client, capability_providers=capability_providers)
+    executor.recoveries = []
+    executor.request_recovery = lambda: executor.recoveries.append("SIGTERM")  # never SIGTERM the test process
     runtime = NativeTurnRuntime(IDENTITY, executor, preflight=executor.preflight)
     executor.reader = runtime
     return executor, runtime
@@ -301,13 +304,13 @@ def test_an_image_turn_that_would_not_fit_the_live_files_restores_the_smaller_ch
 
     stopped = []
 
-    async def stop():
+    async def stop(on_unexited=None):
         stopped.append(True)
 
     files = SimpleNamespace(files={"events.jsonl": "x" * (MAX_BACKUP_BYTES // 4)}, checkpoint_profile=None,
                             model_provider=None, continue_from=lambda state: None)
     live = SimpleNamespace(files=files, released_sha256="a" * 64, alive=lambda: True, reusable=lambda: True,
-                           stop=stop, turn=None, model="OFFLINE-model")
+                           stop=stop, turn=None, model="OFFLINE-model", sdk_session_id="sid")
 
     async def continued(needed):
         pool = NativeResidentPool()
@@ -369,7 +372,7 @@ def test_a_cancelled_discard_still_stops_the_kept_sdk():
 
     started, release, stopped = asyncio.Event(), asyncio.Event(), []
 
-    async def stop():
+    async def stop(on_unexited=None):
         started.set()
         await release.wait()
         stopped.append(True)
@@ -377,7 +380,7 @@ def test_a_cancelled_discard_still_stops_the_kept_sdk():
     async def scenario():
         pool = NativeResidentPool()
         holder = pool.holder("sid")
-        holder.live = SimpleNamespace(stop=stop, turn=None)
+        holder.live = SimpleNamespace(stop=stop, turn=None, sdk_session_id="sid")
         discarding = asyncio.create_task(pool.discard(holder))
         await started.wait()
         discarding.cancel()  # e.g. the Responses stream closed while the next turn discarded a stale SDK
@@ -397,10 +400,10 @@ def test_a_third_conversation_stops_the_oldest_idle_sdk(local_env, monkeypatch, 
     stops = []
     original_stop = m2_copilot.ResidentSdk.stop
 
-    async def observed(self):
+    async def observed(self, on_unexited=None):
         # Turns run one at a time under execution_slot: the evicted SDK serves no turn at this moment.
         stops.append((self.client, self.turn, runtime.execution_owner))
-        await original_stop(self)
+        await original_stop(self, on_unexited)
 
     monkeypatch.setattr(m2_copilot.ResidentSdk, "stop", observed)
     client, h = serve(runtime)
@@ -552,3 +555,615 @@ def test_an_auto_compaction_still_open_at_idle_stops_the_sdk(local_env, monkeypa
     assert "sdk_process_stop" in phases(caplog, "rid-1")
     assert len(sdk.clients) == 2 and sdk.sends[1].resume
     assert "session.compaction_complete" in sdk.sends[1].fs.files["events.jsonl"]
+
+
+def stuck_cli(monkeypatch, *, dies_on_kill):
+    """#874 P3 / #903: the first turn's CLI ignores the abort, stop and force_stop (item 2's bounded path); FA's own
+    kill of its PID either ends it or (an uninterruptible kernel wait) does not."""
+    exited, alive_at_start, kills = Event(), [], []
+
+    async def nothing():
+        return None
+
+    async def hang_first(record):
+        if len(sdk.sends) == 1:
+            record.session.abort.side_effect = nothing  # the runtime never reports idle
+            await asyncio.Event().wait()
+
+    sdk = PinnedSdk(monkeypatch, during_send=hang_first)
+
+    def kill():
+        kills.append(4242)
+        if dies_on_kill:
+            exited.set()
+
+    def client(**connection):
+        alive_at_start.append([made._cli_process.poll() is None for made in sdk.clients])
+        made = sdk.client(**connection)
+        if len(sdk.clients) == 1:
+            made._cli_process = SimpleNamespace(pid=4242, poll=lambda: 0 if exited.is_set() else None,
+                                                returncode=None, kill=kill)
+            made.stop.side_effect = RuntimeError("OFFLINE stop ignored")
+            made.force_stop.side_effect = TimeoutError  # what wait_for(force_stop, 5) raises, without the 5 s
+        return made
+
+    monkeypatch.setattr(m2_copilot, "CopilotClient", create_autospec(CopilotClient, side_effect=client))
+    monkeypatch.setattr(native_sdk, "ABORT_IDLE_SECONDS", 0.2)
+    monkeypatch.setattr(m2_copilot, "EXIT_CONFIRM_SECONDS", 0.2)
+    monkeypatch.setattr(m2_copilot, "KILL_CONFIRM_SECONDS", 0.2, raising=False)  # absent before #903
+    return sdk, exited, alive_at_start, kills
+
+
+def start_and_cancel_first(h, sdk, server):
+    h.invoke(NativeSubmit(command=submit("rid-1").command, capture=capture()))
+    for _ in range(800):
+        if sdk.sends:
+            break
+        server.portal.call(asyncio.sleep, 0.01)
+    cid = h.call(h.runtime.read, "rid-1").conversation_id
+    return cid, lambda: h.invoke(NativeCancel(conversation_id=cid, request_id="rid-1"))
+
+
+def test_a_cli_that_outlives_force_stop_is_killed_again_before_the_next_sdk(local_env, monkeypatch, tmp_path):
+    """#903 P2-1: FA kills the force-stopped CLI's own PID once more; it exits, so the next message runs normally (no
+    503, no recovery restart) and its SDK starts only after the first CLI exited."""
+    sdk, exited, alive_at_start, kills = stuck_cli(monkeypatch, dies_on_kill=True)
+    executor, runtime = offline_runtime(tmp_path)
+    server, h = serve(runtime)
+    with server:
+        cid, cancel = start_and_cancel_first(h, sdk, server)
+        cancel()
+        assert h.wait("rid-1", "unknown").failure_code == "NATIVE_TURN_CANCELLED"
+        assert kills == [4242] and exited.is_set() and executor.recoveries == []
+        assert text(h, turn(h, "rid-2", cid)) == "OFFLINE answer 2"
+    assert alive_at_start == [[], [False]]
+
+
+@pytest.mark.parametrize("ends", ["cli_exits", "recovery_shutdown", "close_unconfirmed"])
+def test_an_unkillable_cli_keeps_queued_work_and_leaves_by_recovery(local_env, monkeypatch, tmp_path, caplog, ends):
+    """#903 P2-1/P2-2/P2-3: the CLI survives FA's own kill too. NATIVE_CLI_UNKILLABLE is logged and a recovery restart
+    requested (once). A message queued meanwhile stays accepted (no second SDK, never unknown); a new one gets a
+    not_dispatched 503 with a retry hint. The queued one then runs once the CLI exits, or the platform shutdown the
+    executor asked for settles it as NATIVE_TURN_NOT_STARTED and leaves by exit_for_recovery. close_unconfirmed
+    (review P3-1): that settle fails, so core's real re-entry (payload.input=None, steering.active_input=rid-2) settles
+    it after the restart."""
+    from azure.ai.agentserver.core.tasks._local_provider import LocalFileTaskProvider
+    from shared_context.errors import Problem
+    from test_native_binding_tasks import observer
+
+    sdk, exited, alive_at_start, kills = stuck_cli(monkeypatch, dies_on_kill=False)
+    executor, runtime = offline_runtime(tmp_path)
+    left = []
+    original_exit, original_close = NativeTurnRuntime._exit_for_recovery, NativeTurnRuntime._close_unstarted
+
+    async def recorded(self, ctx, original=None):
+        left.append(None if original is None else original.value.receipt.request_id)
+        return await original_exit(self, ctx, original)
+
+    async def close(self, original):
+        if self is runtime and ends == "close_unconfirmed":
+            raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "OFFLINE close answer lost")
+        return await original_close(self, original)
+
+    monkeypatch.setattr(NativeTurnRuntime, "_exit_for_recovery", recorded)
+    monkeypatch.setattr(NativeTurnRuntime, "_close_unstarted", close)
+    server, h = serve(runtime)
+    with server:
+        cid, cancel = start_and_cancel_first(h, sdk, server)
+        assert h.invoke(NativeSubmit(command=submit("rid-2").command, capture=capture())).status_code == 202
+        cancel()
+        assert h.wait("rid-1", "unknown").failure_code == "NATIVE_TURN_CANCELLED"
+        recovery_requested(server, executor)  # once rid-1's own execution ended (round 11)
+        assert kills == [4242] and executor.recoveries == ["SIGTERM"]
+        assert "NATIVE_CLI_UNKILLABLE pid=4242" in caplog.text
+        server.portal.call(asyncio.sleep, 1)
+        assert h.call(runtime.read, "rid-2").status == "accepted" and len(sdk.sends) == 1 and len(sdk.clients) == 1
+        refused = h.invoke(NativeSubmit(command=submit("rid-3", cid).command, capture=capture()))
+        assert refused.status_code == 503, refused.text
+        error = refused.json()["error"]
+        assert (error["code"], error["not_dispatched"], error["retry_after_ms"]) == (
+            "NATIVE_EXECUTION_UNAVAILABLE", True, 1000)
+        if ends == "cli_exits":
+            exited.set()
+            assert text(h, h.wait("rid-2", "completed")) == "OFFLINE answer 2"
+            assert len(sdk.clients) == 2 and alive_at_start == [[], [False]]
+    if ends != "cli_exits":
+        assert left == ["rid-2"] and len(sdk.sends) == 1
+        if ends == "close_unconfirmed":
+            assert "FA_NATIVE_UNSTARTED_CLOSE_UNCONFIRMED" in caplog.text  # rid-2 left this lifetime accepted
+        # Review P2: core already dropped the drained input, so a restart could never run rid-2; it is settled
+        # (resendable) before the recovery exit, or by the restart's re-entry, and stays settled.
+        _, restarted = offline_runtime(tmp_path)
+        reads = []
+        restarted.task_observer = observer(IDENTITY, LocalFileTaskProvider(), reads)
+        server, h = serve(restarted)
+        with server:
+            for _ in range(100):
+                settled = h.call(restarted.read, "rid-2")
+                if settled.status != "accepted":
+                    break
+                server.portal.call(asyncio.sleep, 0.1)
+        assert (settled.status, settled.failure_code) == ("unknown", "NATIVE_TURN_NOT_STARTED")
+        assert len(sdk.sends) == 1
+        if ends == "close_unconfirmed":
+            assert reads  # the re-entry read core's task record, as Hosted reads it
+    assert executor.recoveries == ["SIGTERM"]
+
+
+def test_a_turn_whose_own_cli_survives_saves_its_result_before_the_recovery_restart(local_env, monkeypatch, tmp_path):
+    """Review P2 (round 11) on #903: a cancelled turn's own CLI survives stop, force_stop and FA's own kill. The
+    recovery restart it asks for waits for that turn's own execution too: SIGTERM (which sets every active task's
+    shutdown, as core's TaskManager.shutdown does first) comes only after the turn saved its final status, so the
+    restart finds it settled and never re-runs it as a continuation."""
+    from azure.ai.agentserver.core.tasks._manager import get_task_manager
+
+    sdk, _, _, kills = stuck_cli(monkeypatch, dies_on_kill=False)
+    executor, runtime = offline_runtime(tmp_path)
+    in_flight_at_sigterm = []
+
+    def sigterm():
+        in_flight_at_sigterm.append(len(runtime.executing))
+        executor.recoveries.append("SIGTERM")
+        for active in get_task_manager()._active_tasks.values():
+            active.context.shutdown.set()
+
+    executor.request_recovery = sigterm
+    server, h = serve(runtime)
+    with server:
+        _, cancel = start_and_cancel_first(h, sdk, server)
+        cancel()
+        assert h.wait("rid-1", "unknown").failure_code == "NATIVE_TURN_CANCELLED"
+        recovery_requested(server, executor)
+        assert kills == [4242] and executor.recoveries == ["SIGTERM"] and in_flight_at_sigterm == [0]
+    _, restarted = offline_runtime(tmp_path)
+    server, h = serve(restarted)
+    with server:
+        server.portal.call(asyncio.sleep, 0.5)  # core re-enters any task left active
+        settled = h.call(restarted.read, "rid-1")
+    assert (settled.status, settled.failure_code) == ("unknown", "NATIVE_TURN_CANCELLED")
+    assert len(sdk.sends) == 1 and len(sdk.clients) == 1
+
+
+@pytest.mark.parametrize("dies_on_kill", [True, False])
+def test_an_idle_resident_stop_kills_a_cli_that_outlives_force_stop(monkeypatch, caplog, dies_on_kill):
+    """#903 P3: an evicted (idle) SDK whose CLI ignores stop and force_stop is killed by its own PID too; one that
+    survives that is logged, never raised (no turn and no slot: no recovery restart from here), and the pool registers
+    it as unexited (review P3), so no SDK starts beside it."""
+    from shared_context.native_resident import NativeResidentPool
+
+    exited, kills, unexited = Event(), [], []
+
+    def kill():
+        kills.append(4243)
+        if dies_on_kill:
+            exited.set()
+
+    def stop():
+        raise RuntimeError("OFFLINE stop ignored")
+
+    async def ignored():
+        return None
+
+    live = m2_copilot.ResidentSdk("OFFLINE-digest", "OFFLINE-sdk-session", None)
+    live.client = SimpleNamespace(stop=stop, force_stop=ignored)
+    live.process = SimpleNamespace(pid=4243, poll=lambda: 0 if exited.is_set() else None, kill=kill)
+    monkeypatch.setattr(m2_copilot, "EXIT_CONFIRM_SECONDS", 0.1)
+    monkeypatch.setattr(m2_copilot, "KILL_CONFIRM_SECONDS", 0.1, raising=False)  # absent before #903
+    pool = NativeResidentPool(on_unexited=unexited.append)
+    pool.holder("OFFLINE-sdk-session").live = live
+    asyncio.run(pool.discard(pool.holder("OFFLINE-sdk-session")))
+    assert kills == [4243]
+    assert ("NATIVE_CLI_UNKILLABLE pid=4243 path=resident" in caplog.text) is not dies_on_kill
+    assert unexited == ([] if dies_on_kill else [live.process])
+
+
+def test_an_evicted_idle_sdk_whose_cli_survives_requests_the_recovery_restart(local_env, monkeypatch, tmp_path):
+    """Review P2-1 on #903: an idle SDK evicted from the pool whose CLI survives stop, force_stop and FA's own kill is
+    registered on the executor and asks for the same recovery restart a turn's survivor does (once), so the 503s it
+    causes end with that restart instead of lasting until the CLI exits."""
+    from shared_context.errors import Problem
+
+    executor, _ = offline_runtime(tmp_path)
+    kills = []
+
+    def stop():
+        raise RuntimeError("OFFLINE stop ignored")
+
+    async def ignored():
+        return None
+
+    live = m2_copilot.ResidentSdk("OFFLINE-digest", "OFFLINE-evicted", None)
+    live.client = SimpleNamespace(stop=stop, force_stop=ignored)
+    live.process = SimpleNamespace(pid=4245, poll=lambda: None, kill=lambda: kills.append(4245))
+    monkeypatch.setattr(m2_copilot, "EXIT_CONFIRM_SECONDS", 0.1)
+    monkeypatch.setattr(m2_copilot, "KILL_CONFIRM_SECONDS", 0.1)
+    pool = executor.resident
+    pool.limit = 1
+
+    async def evict():
+        pool.holder("OFFLINE-evicted").live = live
+        assert await pool.continue_live(pool.holder("OFFLINE-next"), None, checkpoint_profile=None,
+                                        model_provider=None, model="OFFLINE-model") is None
+        await asyncio.gather(*pool._stopping)
+
+    asyncio.run(evict())
+    assert kills == [4245] and executor.recoveries == ["SIGTERM"] and executor.runtime_unexited()
+    with pytest.raises(Problem) as refused:
+        executor.preflight(capture())
+    assert refused.value.body["error"]["code"] == "NATIVE_EXECUTION_UNAVAILABLE"
+
+
+def recovery_requested(server, executor):
+    """The recovery restart a registration asked for, once any other started turn's execution ended (round 9)."""
+    for _ in range(500):
+        if executor.recoveries:
+            return
+        server.portal.call(asyncio.sleep, 0.01)
+
+
+@pytest.mark.parametrize("force_stop", ["returns", "times_out"])
+def test_a_replaced_kept_sdk_whose_cli_outlives_its_stop_starts_no_second_sdk(local_env, monkeypatch, tmp_path,
+                                                                             force_stop):
+    """Review P3 on #903: a kept SDK replaced for changed settings whose CLI survives stop, force_stop and FA's own
+    kill is registered as unexited; the turn starts no second SDK beside it and asks for the recovery restart."""
+    sdk, kills = PinnedSdk(monkeypatch), []
+
+    def client(**connection):
+        made = sdk.client(**connection)
+        if len(sdk.clients) == 1:
+            made._cli_process = SimpleNamespace(pid=4244, poll=lambda: None, returncode=None,
+                                                kill=lambda: kills.append(4244))
+            made.stop.side_effect = RuntimeError("OFFLINE stop ignored")
+            # times_out: what wait_for(force_stop, 5) raises, without the 5 s
+            made.force_stop.side_effect = TimeoutError if force_stop == "times_out" else None
+        return made
+
+    monkeypatch.setattr(m2_copilot, "CopilotClient", create_autospec(CopilotClient, side_effect=client))
+    monkeypatch.setattr(m2_copilot, "EXIT_CONFIRM_SECONDS", 0.1)
+    monkeypatch.setattr(m2_copilot, "KILL_CONFIRM_SECONDS", 0.1)
+    # The second turn's settings differ from the kept SDK's, so run_copilot replaces it.
+    monkeypatch.setattr(m2_copilot, "_resident_digest", lambda **_: f"OFFLINE-digest-{len(sdk.sends)}")
+    executor, runtime = offline_runtime(tmp_path)
+    server, h = serve(runtime)
+    with server:
+        first = turn(h, "rid-1")
+        h.invoke(NativeSubmit(command=submit("rid-2", first.conversation_id).command, capture=capture()))
+        h.wait("rid-2", "unknown")
+        recovery_requested(server, executor)  # the stale stop's registration waits for rid-2's own execution
+        assert kills == [4244] and executor.runtime_unexited() and executor.recoveries == ["SIGTERM"]
+    assert len(sdk.clients) == 1 and len(sdk.sends) == 1
+
+
+def test_a_turn_cancelled_while_its_replaced_sdk_stops_still_registers_the_surviving_cli(local_env, monkeypatch,
+                                                                                         tmp_path):
+    """Review P2-2 on #903: the turn's run_copilot is cancelled (e.g. its Responses stream closed) while the replaced
+    kept SDK's shielded stop is still running; that stop finds the CLI alive after FA's own kill later, in the
+    background, and registers it itself, so no second SDK starts beside it and the recovery restart is requested
+    once."""
+    entered, release, kills = Event(), Event(), []
+
+    async def held_disconnect(options, fs):
+        entered.set()
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+
+    def client(**connection):
+        made = sdk.client(**connection)
+        if len(sdk.clients) == 1:
+            made._cli_process = SimpleNamespace(pid=4246, poll=lambda: None, returncode=None,
+                                                kill=lambda: kills.append(4246))
+            made.stop.side_effect = RuntimeError("OFFLINE stop ignored")
+        return made
+
+    sdk = PinnedSdk(monkeypatch, on_disconnect=held_disconnect)  # the stale stop's disconnect is held
+
+    monkeypatch.setattr(m2_copilot, "CopilotClient", create_autospec(CopilotClient, side_effect=client))
+    monkeypatch.setattr(native_sdk, "ABORT_IDLE_SECONDS", 0.2)
+    monkeypatch.setattr(m2_copilot, "EXIT_CONFIRM_SECONDS", 0.1)
+    monkeypatch.setattr(m2_copilot, "KILL_CONFIRM_SECONDS", 0.1)
+    monkeypatch.setattr(m2_copilot, "_resident_digest", lambda **_: f"OFFLINE-digest-{len(sdk.sends)}")
+    runs, original_run = [], native_sdk.run_copilot
+
+    async def tracked(**options):
+        runs.append(asyncio.current_task())
+        return await original_run(**options)
+
+    monkeypatch.setattr(native_sdk, "run_copilot", tracked)
+    executor, runtime = offline_runtime(tmp_path)
+    server, h = serve(runtime)
+    with server:
+        first = turn(h, "rid-1")
+        h.invoke(NativeSubmit(command=submit("rid-2", first.conversation_id).command, capture=capture()))
+        for _ in range(500):
+            if entered.is_set():
+                break
+            server.portal.call(asyncio.sleep, 0.01)
+        assert entered.is_set() and len(runs) == 2
+        server.portal.call(runs[1].cancel)
+        server.portal.call(asyncio.sleep, 0.3)
+        assert runs[1].done() and executor.recoveries == [] and not kills  # the stop is still running
+        release.set()
+        for _ in range(500):
+            if executor.recoveries:
+                break
+            server.portal.call(asyncio.sleep, 0.01)
+        assert kills == [4246] and executor.recoveries == ["SIGTERM"] and executor.runtime_unexited()
+        refused = h.invoke(NativeSubmit(command=submit("rid-3", first.conversation_id).command, capture=capture()))
+        assert refused.status_code == 503 and refused.json()["error"]["code"] == "NATIVE_EXECUTION_UNAVAILABLE"
+    assert len(sdk.clients) == 1 and len(sdk.sends) == 1
+
+
+def test_a_message_sent_while_a_cancelled_turns_replaced_sdk_still_stops_starts_no_second_sdk(local_env, monkeypatch,
+                                                                                               tmp_path):
+    """Review P2 (round 5) on #903: the turn's run_copilot is cancelled (as in the P2-2 test) while its replaced kept
+    SDK's shielded stop is still running. Until that stop ends no SDK starts. Round 6: a new RID is taken (202, no
+    resend) and waits accepted; it runs once after the stop ends, its SDK starting only after the first CLI exited."""
+    entered, release, alive_at_start = Event(), Event(), []
+
+    async def held_disconnect(options, fs):
+        entered.set()
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+
+    def client(**connection):
+        alive_at_start.append([made._cli_process.poll() is None for made in sdk.clients])
+        return sdk.client(**connection)
+
+    sdk = PinnedSdk(monkeypatch, on_disconnect=held_disconnect)  # the stale stop's disconnect is held
+    monkeypatch.setattr(m2_copilot, "CopilotClient", create_autospec(CopilotClient, side_effect=client))
+    monkeypatch.setattr(native_sdk, "ABORT_IDLE_SECONDS", 0.2)
+    monkeypatch.setattr(m2_copilot, "_resident_digest", lambda **_: f"OFFLINE-digest-{len(sdk.sends)}")
+    runs, original_run = [], native_sdk.run_copilot
+
+    async def tracked(**options):
+        runs.append(asyncio.current_task())
+        return await original_run(**options)
+
+    monkeypatch.setattr(native_sdk, "run_copilot", tracked)
+    executor, runtime = offline_runtime(tmp_path)
+    server, h = serve(runtime)
+    with server:
+        cid = turn(h, "rid-1").conversation_id
+        h.invoke(NativeSubmit(command=submit("rid-2", cid).command, capture=capture()))
+        for _ in range(500):
+            if entered.is_set():
+                break
+            server.portal.call(asyncio.sleep, 0.01)
+        assert entered.is_set() and len(runs) == 2
+        server.portal.call(runs[1].cancel)
+        for _ in range(500):
+            if runs[1].done():
+                break
+            server.portal.call(asyncio.sleep, 0.01)
+        assert runs[1].done() and not release.is_set()  # the stop is still running
+        taken = h.invoke(NativeSubmit(command=submit("rid-3", cid).command, capture=capture()))
+        assert taken.status_code == 202, taken.text
+        server.portal.call(asyncio.sleep, 0.3)
+        assert h.call(h.runtime.read, "rid-3").status == "accepted" and len(sdk.clients) == 1
+        release.set()
+        assert text(h, h.wait("rid-3", "completed")) == "OFFLINE answer 2"
+    assert executor.recoveries == [] and len(sdk.clients) == 2 and alive_at_start == [[], [False]]
+
+
+def _held_stops(monkeypatch):
+    """A PinnedSdk whose stops hold in disconnect while ``hold`` is set, until ``release``; ``alive_at_start`` lists,
+    for each new client, whether every earlier client's CLI was still running."""
+    hold, release, alive_at_start = Event(), Event(), []
+
+    async def held_disconnect(options, fs):
+        while hold.is_set() and not release.is_set():
+            await asyncio.sleep(0.01)
+
+    def client(**connection):
+        alive_at_start.append([made._cli_process.poll() is None for made in sdk.clients])
+        return sdk.client(**connection)
+
+    sdk = PinnedSdk(monkeypatch, on_disconnect=held_disconnect)
+    monkeypatch.setattr(m2_copilot, "CopilotClient", create_autospec(CopilotClient, side_effect=client))
+    return sdk, hold, release, alive_at_start
+
+
+def _evict_idle(server, pool):
+    """As ``_evict`` does for the least recently used idle kept SDK over the limit: its stop runs in the background,
+    no turn waiting."""
+    holder = next(iter(pool._holders.values()))
+    assert holder.live is not None and holder.live.turn is None
+
+    async def evict():
+        pool._stop_later(holder)
+
+    server.portal.call(evict)
+    assert pool.stopping()
+
+
+def test_messages_sent_while_an_idle_eviction_stops_are_taken_and_answered_in_send_order(local_env, monkeypatch,
+                                                                                        tmp_path):
+    """Review P2 (round 6) on #903: an ordinary idle eviction's stop no longer refuses a send (it was a 503 that the
+    workbench resent 3 s later, so B, sent after A, ran first). A, sent while the stop runs, and B, sent after it,
+    are both taken; A waits accepted only until the stop ends, starts no client beside the old CLI, and the replies
+    come back in send order."""
+    sdk, hold, release, alive_at_start = _held_stops(monkeypatch)
+    executor, runtime = offline_runtime(tmp_path)
+    server, h = serve(runtime)
+    with server:
+        cid = turn(h, "rid-1").conversation_id
+        hold.set()
+        _evict_idle(server, executor.resident)
+        first = h.invoke(NativeSubmit(command=submit("rid-a", cid).command, capture=capture()))
+        server.portal.call(asyncio.sleep, 0.2)
+        second = h.invoke(NativeSubmit(command=submit("rid-b", cid).command, capture=capture()))
+        assert (first.status_code, second.status_code) == (202, 202), (first.text, second.text)
+        server.portal.call(asyncio.sleep, 0.3)
+        assert h.call(h.runtime.read, "rid-a").status == "accepted" and len(sdk.clients) == 1
+        released = time.monotonic()
+        release.set()
+        a = h.wait("rid-a", "completed")
+        waited = time.monotonic() - released
+        b = h.wait("rid-b", "completed")
+        assert (text(h, a), text(h, b)) == ("OFFLINE answer 2", "OFFLINE answer 3")
+    # After the stop ends A waits at most one 0.1 s poll; the bound only absorbs a loaded test machine.
+    assert waited < 2, waited
+    assert executor.recoveries == [] and len(sdk.clients) == 2 and alive_at_start == [[], [False]]
+
+
+def test_a_conversation_continuing_its_own_kept_sdk_is_not_held_by_another_conversations_stop(local_env, monkeypatch,
+                                                                                             tmp_path):
+    """Review P3 (round 6) on #903: while conversation X's evicted SDK still stops, conversation Y continues on its own
+    live kept SDK and starts no client, so it neither waits for nor is refused by X's stop."""
+    sdk, hold, release, _ = _held_stops(monkeypatch)
+    executor, runtime = offline_runtime(tmp_path)
+    server, h = serve(runtime)
+    with server:
+        x = turn(h, "rid-x1").conversation_id
+        y = turn(h, "rid-y1").conversation_id
+        hold.set()
+        _evict_idle(server, executor.resident)  # X: the least recently used
+        assert text(h, turn(h, "rid-y2", y)) == "OFFLINE answer 3"
+        assert executor.resident.stopping() and not release.is_set() and len(sdk.clients) == 2
+        release.set()
+    assert executor.recoveries == []
+
+
+def test_a_cold_turn_that_evicts_another_conversations_idle_sdk_starts_at_once(local_env, monkeypatch, tmp_path):
+    """Review P2 (round 7) on #903: with the pool full, a new conversation's turn evicts another conversation's idle
+    kept SDK in continue_live. That stop shares nothing with the new client (ADR-0005 keeps two CLIs alive), so the
+    turn starts and completes while the evicted CLI is still stopping, with no wait."""
+    sdk, hold, release, alive_at_start = _held_stops(monkeypatch)
+    executor, runtime = offline_runtime(tmp_path)
+    executor.resident.limit = 1
+    server, h = serve(runtime)
+    with server:
+        turn(h, "rid-1")
+        hold.set()
+        assert text(h, turn(h, "rid-2")) == "OFFLINE answer 2"
+        assert executor.resident.stopping() and not release.is_set()  # completed while that stop is still held
+        release.set()
+    assert executor.recoveries == [] and alive_at_start == [[], [True]]
+
+
+def test_a_cold_turn_whose_eviction_leaves_an_unkillable_cli_finishes_once_before_the_recovery_restart(
+        local_env, monkeypatch, tmp_path):
+    """Review P3 (round 6) / P2 (round 9) on #903, in the real order: a new conversation's turn B evicts conversation
+    A's idle kept SDK in continue_live. settle does not wait for another conversation's stop (round 7), so B's client
+    starts while A's stop still runs; only then is A's CLI found to survive stop, force_stop and FA's own kill, and
+    registered. The recovery restart it asks for waits for B, which is in flight: B finishes and is saved once (never
+    cut, so never re-run as a continuation), and then the restart is requested once. The recovery here does what the
+    platform's SIGTERM does first: it sets every active task's shutdown."""
+    from azure.ai.agentserver.core.tasks._manager import get_task_manager
+
+    kills, registered_at_b_start = [], []
+
+    async def b_until_a_is_registered(record):
+        if len(sdk.sends) == 2:
+            registered_at_b_start.append(list(executor._unexited))
+            for _ in range(500):
+                if executor._unexited:
+                    break
+                await asyncio.sleep(0.01)
+
+    sdk = PinnedSdk(monkeypatch, during_send=b_until_a_is_registered)
+    alive_at_start = []
+
+    def client(**connection):
+        alive_at_start.append([made._cli_process.poll() is None for made in sdk.clients])
+        made = sdk.client(**connection)
+        if len(sdk.clients) == 1:
+            made._cli_process = SimpleNamespace(pid=4247, poll=lambda: None, returncode=None,
+                                                kill=lambda: kills.append(4247))
+            made.stop.side_effect = RuntimeError("OFFLINE stop ignored")
+        return made
+
+    monkeypatch.setattr(m2_copilot, "CopilotClient", create_autospec(CopilotClient, side_effect=client))
+    # A's stop finds its CLI alive about 1 s after the eviction, well after B's client started.
+    monkeypatch.setattr(m2_copilot, "EXIT_CONFIRM_SECONDS", 0.5)
+    monkeypatch.setattr(m2_copilot, "KILL_CONFIRM_SECONDS", 0.5)
+    executor, runtime = offline_runtime(tmp_path)
+    executor.resident.limit = 1
+
+    def sigterm():
+        executor.recoveries.append("SIGTERM")
+        for active in get_task_manager()._active_tasks.values():
+            active.context.shutdown.set()
+
+    executor.request_recovery = sigterm
+    server, h = serve(runtime)
+    with server:
+        turn(h, "rid-1")
+        h.invoke(NativeSubmit(command=submit("rid-2").command, capture=capture()))
+        assert text(h, h.wait("rid-2", "completed")) == "OFFLINE answer 2"
+        recovery_requested(server, executor)
+        assert kills == [4247] and executor.runtime_unexited() and executor.recoveries == ["SIGTERM"]
+    # B's client started before A's CLI was registered (the documented window), beside it; B ran once.
+    assert registered_at_b_start == [[]] and alive_at_start == [[], [True]]
+    assert len(sdk.clients) == 2 and len(sdk.sends) == 2
+
+
+def test_a_recovery_restart_sends_sigterm_only_after_another_started_turn_finishes(monkeypatch, caplog):
+    """Review P1 (round 10) on #903: a CLI registered from outside a started turn asks for the recovery restart only
+    after that turn's execution ends, however long it runs (a cut turn would re-run as a continuation); with no turn
+    in flight it asks at once. Round 11: one registered from the turn itself returns at once (the turn never waits
+    for itself) and asks once that turn's own execution ended, or not at all when the CLI exited meanwhile."""
+    from shared_context import native_turns
+
+    executor, runtime = offline_runtime(Path("OFFLINE-unused"))
+    monkeypatch.setattr(native_turns, "UNEXITED_WAIT_SECONDS", 0.2)  # a short bound would fire within the test
+    alive = SimpleNamespace(poll=lambda: None, pid=4247)
+    seen = []
+
+    def own_turn(process, exits):
+        async def run_started(original, control, signals):
+            executor._register_unexited(process)  # returns at once: no wait on this turn itself
+            await asyncio.sleep(0.3)
+            seen.append(list(executor.recoveries))  # still in flight: no SIGTERM yet
+            exits()
+            return "OFFLINE saved"
+        runtime._run_started = run_started
+        return runtime._execute_started(None, None, None)
+
+    async def scenario():
+        exited = []
+        assert await asyncio.wait_for(own_turn(SimpleNamespace(poll=lambda: None, pid=4248), lambda: None), 2) == (
+            "OFFLINE saved")
+        await asyncio.sleep(0.05)
+        assert seen == [[]] and executor.recoveries == ["SIGTERM"]  # after the turn's own end
+        executor.recoveries.clear()
+        executor._unexited.clear()
+        gone = SimpleNamespace(poll=lambda: 0 if exited else None, pid=4249)
+        await asyncio.wait_for(own_turn(gone, lambda: exited.append(True)), 2)
+        await asyncio.sleep(0.05)
+        assert seen == [[], []] and executor.recoveries == []  # its CLI exited meanwhile: no restart
+        executor._unexited.clear()
+        executor._register_unexited(SimpleNamespace(poll=lambda: None, pid=4246))
+        assert executor.recoveries == ["SIGTERM"]  # nothing else in flight
+        executor.recoveries.clear()
+        executor._unexited.clear()
+        running = asyncio.get_running_loop().create_future()
+        runtime.executing[running] = None  # another started turn, longer than any bound
+        executor._register_unexited(alive)
+        await asyncio.sleep(0.5)
+        assert executor.recoveries == [] and executor.runtime_unexited()
+        running.set_result(None)  # its execution ended (saved)
+        await asyncio.sleep(0.05)
+        assert executor.recoveries == ["SIGTERM"]
+
+    asyncio.run(scenario())
+    assert "NATIVE_RECOVERY_WAIT_ENDED pid=4248 cli_exited=False" in caplog.text
+    assert "NATIVE_RECOVERY_WAIT_ENDED pid=4249 cli_exited=True" in caplog.text
+
+
+def test_a_vm_serving_many_conversations_keeps_their_sdk_session_ids_only_while_needed():
+    """Review P3 (round 9) on #903: a conversation's SDK session ID is kept while its holder or a stop of its SDK is,
+    so 1000 conversations leave only those, and an evicted conversation whose stop still runs is still found."""
+    from shared_context.native_resident import NativeResidentPool
+
+    pool = NativeResidentPool(limit=1)
+    for n in range(1000):
+        pool.holder(f"OFFLINE-sdk-{n}", f"OFFLINE-cid-{n}")
+    assert len(pool._conversations) == 1
+    running = create_autospec(asyncio.Task, instance=True)
+    running.done.return_value = False
+    pool._stopping[running] = "OFFLINE-sdk-1000"  # its stop still runs
+    pool.holder("OFFLINE-sdk-1000", "OFFLINE-cid-1000")
+    pool.holder("OFFLINE-sdk-1001", "OFFLINE-cid-1001")
+    assert set(pool._conversations) == {"OFFLINE-cid-1000", "OFFLINE-cid-1001"}
+    assert pool.stopping("OFFLINE-cid-1000") and not pool.stopping("OFFLINE-cid-1001")

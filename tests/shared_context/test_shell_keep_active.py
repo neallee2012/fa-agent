@@ -111,7 +111,7 @@ def test_model_call_after_a_six_minute_command_survives_a_timer_tick(observer_ca
     start_time = c.h.time
     sent, observations = [], []
     active_source_thread, injected, before_request, calling = [None], [False], [None], [None]
-    entry, consistent_read = c.authority.model_session, store.consistent_read
+    entry, read_record = c.authority.model_session, store.read_record
 
     def timer_tick(activity=None):
         before = workers.inspect(opened.binding.job_id)
@@ -139,20 +139,17 @@ def test_model_call_after_a_six_minute_command_survives_a_timer_tick(observer_ca
         finally:
             active_source_thread[0] = None
 
-    def overlap(callback, **options):
-        if get_ident() != active_source_thread[0] or injected[0]:
-            return consistent_read(callback, **options)
-
-        def read_then_observe():
-            value = callback()
+    def overlap(row_key):
+        # Since 2093b072 an admitted turn's model_session reads its session row once with read_record.
+        value = read_record(row_key)
+        if get_ident() == active_source_thread[0] and not injected[0]:
             injected[0] = True
             with ThreadPoolExecutor(max_workers=1) as observer:
                 observer.submit(timer_tick, before_request[0]).result(timeout=30)
-            return value
-        return consistent_read(read_then_observe, **options)
+        return value
 
     monkeypatch.setattr(c.authority, "model_session", current_entry)
-    monkeypatch.setattr(store, "consistent_read", overlap)
+    monkeypatch.setattr(store, "read_record", overlap)
 
     async def send(body, **options):
         sent.append(body)

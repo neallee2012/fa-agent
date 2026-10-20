@@ -26,9 +26,9 @@ def reply(*prs):
 
 
 def pr(number=900, merge=SHA, body=BODY, merged="2026-10-16T01:00:00Z", edited=None,
-       files=("deploy/stage/release.json",), total=None):
+       files=("deploy/stage/release.json",), total=None, change="MODIFIED"):
     return {"number": number, "mergedAt": merged, "lastEditedAt": edited, "mergeCommit": {"oid": merge}, "body": body,
-            "files": {"totalCount": len(files) if total is None else total, "nodes": [{"path": p} for p in files]}}
+            "files": {"totalCount": len(files) if total is None else total, "nodes": [{"path": p, "changeType": change} for p in files]}}
 
 
 def test_the_merge_of_a_fingerprinted_release_pr_passes(gate):
@@ -50,6 +50,8 @@ def test_the_merge_of_a_fingerprinted_release_pr_passes(gate):
     # A docs PR that quotes a release fingerprint is not a release PR: it did not change release.json.
     (reply(pr(files=("docs/progress.md",))), "", "did not change deploy/stage/release.json"),
     (reply(pr(files=())), "", "did not change deploy/stage/release.json"),
+    (reply(pr(change="DELETED")), "", "did not leave deploy/stage/release.json in place"),  # release.json removed
+    (reply(pr(change=None)), "", "did not leave deploy/stage/release.json in place"),       # unknown: fail closed
     (reply(pr(files=("docs/progress.md",), total=150)), "", "only its first 1 of 150 files were read"),
     ({"data": {"repository": {"object": None}}}, "", "not the merge commit of any PR"),
 ])
@@ -77,5 +79,5 @@ def test_the_workflow_runs_the_gate_before_the_azure_login():
     gate_job = text[text.index("\n  release-gate:\n"):text.index("\n  deploy:\n")]
     assert "id-token" not in gate_job and "pull-requests: read" in gate_job
     assert 'release_gate.py "$RUNNER_TEMP/release-pr.json" "$GITHUB_SHA"' in gate_job
-    assert "files(first:100){totalCount nodes{path}}" in gate_job
+    assert "files(first:100){totalCount nodes{path changeType}}" in gate_job
     assert "release_pr:" in text and "required: true" in text

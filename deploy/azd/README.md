@@ -4,16 +4,17 @@
 這是新環境的**唯一**標準流程；[deploy/README.md 的 17 步](../README.md#new-environment-standard-flow)
 保留為逐步排錯對照，兩邊呼叫同一批腳本。
 
-> 狀態（2026-10-11）：`azd up -e fazd1011`（Neal 的訂閱，westus3）從頭一次跑完，Neal 在 Portal 實際使用回報通過。
-> 區域與模型選擇（下方「區域與模型」）在 `azd up -e fazd1012`（eastus2，只選 gpt-6-luna）實跑到 `SUCCESS`；
-> 部署與設定讀回符合選擇，**Portal 尚未驗收**；該環境已依 Neal 10-11 決定刪除（[紀錄](../../docs/progress.md#azd-eastus2-1011)）。
+> 狀態（2026-10-11）：作者在自己的訂閱（westus3）從頭跑完一次 `azd up`，並在工作台實際使用過。
+> 區域與模型選擇（下方「區域與模型」）也在 eastus2（只選 gpt-6-luna）實跑到 `SUCCESS`，
+> 部署與設定讀回符合選擇，**那次的工作台驗收還沒做**。
 
 <a id="prerequisites"></a>
 ## 事前準備（不是 Entra 管理員的人請先看）
 
-先跑唯讀檢查，它會列出你已具備什麼、還缺什麼、該找誰：
+先跑唯讀檢查，它會列出你已具備什麼、還缺什麼、該找誰（本頁的指令都在 repo 根目錄執行）：
 
 ```bash
+git clone https://github.com/neallee2012/fa-agent.git && cd fa-agent   # 要用 git clone，不要下載 ZIP：部署會讀 git rev-parse HEAD
 azd env new <name> --subscription <subscription-id> --location <region>
 python deploy/azd/fa_azd.py prereq
 ```
@@ -52,16 +53,17 @@ python deploy/azd/fa_azd.py prereq
 |---|---|---|
 | 允許你註冊應用程式：租用戶預設允許；若關閉，給你 **Application Developer** | Privileged Role Administrator 指派 | `azd up` 前（否則 preprovision 停下） |
 | 租用戶裡要有 Azure CLI 的 service principal（大多已存在）：`az ad sp create --id 04b07795-8ddb-461a-bbee-02f9e1bf7b46` | Cloud Application Administrator 以上 | `azd up` 前；`prereq` 會顯示是否缺 |
-| 替 **Team 主人一人** 建 3 筆 delegated grant（Azure CLI→FA API、Portal→FA API、Portal→登入範圍） | Cloud Application Administrator、Application Administrator 或 Global Administrator | `azd provision` 之後。部署的人自己能建 grant（有左欄任一角色）時，hook 直接建好，不需要找管理員；不能建時，hook 才把 3 個請求 body 與指令寫到 `.azure/<name>/fa/admin-consent/`（只有 object ID，沒有秘密），交給管理員照 `README.txt` 執行即可，不需要 repo 或 azd |
+| 替 **Team 主人一人** 建 3 筆 delegated grant（Azure CLI→FA API、FA Portal→FA API、FA Portal→登入範圍；`FA Portal` 是工作台的 Entra app） | Cloud Application Administrator、Application Administrator 或 Global Administrator | `azd provision` 之後。部署的人自己能建 grant（有左欄任一角色）時，hook 直接建好，不需要找管理員；不能建時，hook 才把 3 個請求 body 與指令寫到 `.azure/<name>/fa/admin-consent/`（只有 object ID，沒有秘密），交給管理員照 `README.txt` 執行即可，不需要 repo 或 azd |
 
 grant 只給主人一人（`consentType=Principal`），不是全租用戶同意；FA API 也只接受該主人。
-要走管理員檔案、而管理員還沒做 C 的第 3 項時，`azd up` 仍會把資源、Agent、API 與 Portal 部署完，停在第一次 session 準備前；
+要走管理員檔案、而管理員還沒做 C 的第 3 項時，`azd up` 仍會把資源、Agent、API 與工作台部署完，停在第一次 session 準備前；
 管理員做完後，你再跑 `azd hooks run postdeploy` 接續。
 
 <a id="first-deploy"></a>
 ## 第一次部署
 
 ```bash
+git clone https://github.com/neallee2012/fa-agent.git && cd fa-agent   # 已經 clone 就跳過；不要用 ZIP
 export AZURE_CONFIG_DIR="$HOME/.azure-fa"   # 每個 shell 都設；PowerShell 用 $env:AZURE_CONFIG_DIR = "$HOME\.azure-fa"
 export AZD_NON_INTERACTIVE=false            # 見下方；PowerShell 用 $env:AZD_NON_INTERACTIVE = 'false'
 az login --tenant <tenant-id>
@@ -109,49 +111,49 @@ FA: catalog chat models in eastus2 (GlobalStandard; ...)
 Models to deploy (numbers separated by commas) [1,2]:
 ```
 
-- 選好的值存成 `FA_MODELS`／`FA_DEFAULT_MODEL`，之後的 `azd up` 不再問；Portal 只列這些模型。
+- 選好的值存成 `FA_MODELS`／`FA_DEFAULT_MODEL`，之後的 `azd up` 不再問；工作台只列這些模型。
 - 沒有終端機（程式以 `sys.stdin.isatty()` 判斷，不看 azd 的 `--no-prompt`，例如 CI）時預設 catalog 全部模型；要指定就先 `azd env set FA_MODELS gpt-5.4-mini,gpt-6-luna`。
 - azd 1.32 以上偵測到 CI 或 AI agent 環境（環境變數如 `CLAUDE_CODE_ENTRYPOINT`、`AI_AGENT`）時，會自動開啟 no-prompt 模式，
   略過 azd 自己的區域選單並以「missing required inputs」失敗；要照常互動就設 `AZD_NON_INTERACTIVE=false`
   （來源：azd 文件 `cli/azd/docs/environment-variables.md`，tag azure-dev-cli_1.32.0，2026-10-11 查證）。
 - 記憶庫用你選的預設模型，另外只會多部署 `text-embedding-3-small`（記憶需要）。沒有任何模型是固定必裝的。
-- 之後要加模型：`azd env set FA_MODELS …` 再 `azd up`。拿掉的模型只會從 Portal 消失，部署本身不刪；
+- 之後要加模型：`azd env set FA_MODELS …` 再 `azd up`。拿掉的模型只會從工作台消失，部署本身不刪；
   記憶庫建立時用的模型要留在清單裡。
 
 - 選用設定（`azd env set`，在 `azd up` 前）：
 
 | 名稱 | 預設 | 說明 |
 |---|---|---|
-| `FA_MODELS` | 終端機：依區域選；否則 catalog 全部 | 要部署、Portal 要列的 chat 模型，逗號分隔 |
+| `FA_MODELS` | 終端機：依區域選；否則 catalog 全部 | 要部署、工作台要列的 chat 模型，逗號分隔 |
 | `FA_DEFAULT_MODEL` | `gpt-6.1-sol`（有選時），否則清單第一個 | 新對話預設模型；第一次建記憶庫也用它 |
 | `FA_MODEL_CAPACITY_JSON` | catalog 容量 | 例 `{"gpt-6-luna":50,"gpt-6.1-sol":50}` |
 | `FA_MODEL_VERSION_UPGRADE_OPTION` | `NoAutoUpgrade` | |
 | `FA_ENABLE_WEBIQ` | `false` | `true`：connection 還不存在時，deploy 以隱藏輸入詢問 WebIQ 金鑰（需終端機）並建 connection 與 toolbox `fa-org-tools`；已存在就只讀回（要換過期的金鑰時，在終端機執行 `python deploy/stage/new_webiq_connection.py --config .azure/<env>/fa/profile.json --rotate`；連線必須已存在，不存在就停下且不寫入。要用 azd 環境的 profile，不加 `--config` 會用 `FA_DEPLOY_CONFIG` 或 `deploy/stage/stage.json`（也就是 stage）。腳本需要 `httpx` 和 `azure-identity`：用 deploy 建好的 `.azure/<env>/fa/venv`（Windows 是 `Scripts\python.exe`，其他是 `bin/python`），或在自己的 venv 執行 `pip install -r src/fa-shared-context-poc/requirements.txt`；見 [deploy/README.md](../README.md#new-environment-standard-flow) 第 16 關） |
-| `FA_ENABLE_AGENT_ONBOARDING` | `true` | 「＋」新 Agent 自動補角色：API 身分取得受限 RBAC Admin（只能把 Foundry User／OpenAI User 指派給 service principal、不能刪除，#468），API 開 `FA_ONBOARDING_*`（stage 同）。不要就在 `azd up` 前 `azd env set FA_ENABLE_AGENT_ONBOARDING false`。已建好、沒設過這個值的環境，下一次 provision（`azd up`，或 `azd provision` 再 `azd deploy`）就會打開；只跑 `azd deploy` 不會，因為它沿用上次 provision 的輸出 |
-| `FA_ENABLE_MEMORY` | `true` | 私人記憶與 Team 記憶：deploy 建 Memory Store `poc-team-memory`（`FA_DEFAULT_MODEL`＋text-embedding-3-small，preview，依用量計費）並開旗標；同 stage（#306 例外）。要關請在第一次 `azd up` 前設 `false`：旗標隨 Agent 第一版發布 |
+| `FA_ENABLE_AGENT_ONBOARDING` | `true` | 「＋」新 Agent 自動補角色：API 身分取得受限 RBAC Admin（只能把 Foundry User／OpenAI User 指派給 service principal、不能刪除；風險見 [ADR-0006](../../docs/adr/0006-team-trust-boundary-grokbot-mode.md)），API 開 `FA_ONBOARDING_*`（stage 同）。不要就在 `azd up` 前 `azd env set FA_ENABLE_AGENT_ONBOARDING false`。已建好、沒設過這個值的環境，下一次 provision（`azd up`，或 `azd provision` 再 `azd deploy`）就會打開；只跑 `azd deploy` 不會，因為它沿用上次 provision 的輸出 |
+| `FA_ENABLE_MEMORY` | `true` | 私人記憶與 Team 記憶：deploy 建 Memory Store `poc-team-memory`（`FA_DEFAULT_MODEL`＋text-embedding-3-small，preview，依用量計費）並開旗標；同 stage。私人記憶與 Team note 都由助理 VM 直接讀寫自己 Team 的 Memory Store scope，是 [ADR-0006](../../docs/adr/0006-team-trust-boundary-grokbot-mode.md) 記錄的 Team 隔離已知例外。要關請在第一次 `azd up` 前設 `false`：旗標隨 Agent 第一版發布 |
 | `FA_ENABLE_TEAM_MCP_CONNECTIONS` | `true` | 給 API 身分 project 範圍的 Contributor，Team MCP 設定頁才能新增含金鑰的 connection（stage 同） |
 | `FA_TIMEZONE` | `UTC` | Hosted 的 `TZ` |
 | `FA_HOSTED_IDLE_TIMEOUT_SECONDS` | `3600` | 120–3600 |
 | `FA_API_SUBNET_NAT_EGRESS` | `false` | 同 `prepare_environment.py` |
-| `FA_DEPLOY_UPGRADE_SNAPSHOTS` | `false` | `true`：另建 ADR-0009 phase 5 工作檔快照專用的儲存帳號（`stsnap<token>`、私有端點、30 天刪除規則、帳號刪除鎖、API 身分在該 container 的備份讀寫自訂角色，不含刪除），API 取得 `FA_UPGRADE_SNAPSHOT_CONTAINER_URL`；與 `no-auto-gc` 備份帳號分開（Neal 2026-10-17）。建帳號與指派角色是雲端與 IAM 寫入，每次部署（含 dev）都要 Neal 批准 |
+| `FA_DEPLOY_UPGRADE_SNAPSHOTS` | `false` | `true`：另建 ADR-0009 phase 5 工作檔快照專用的儲存帳號（`stsnap<token>`、私有端點、30 天刪除規則、帳號刪除鎖、API 身分在該 container 的備份讀寫自訂角色，不含刪除），API 取得 `FA_UPGRADE_SNAPSHOT_CONTAINER_URL`；與 `no-auto-gc` 備份帳號分開。打開會多建一個儲存帳號並指派角色，會產生費用；預設關，不需要就維持 `false` |
 | `FA_NATIVE_2DI` | `false` | `true`：打開 ADR-0009 2d-i（API `FA_NATIVE_SESSION_GUARD_ENFORCE=1`，兩位助理的定義同時宣告 `foundry-native-v2`）；打開後不能關、不能退版，前提與使用者看到什麼見 [2d-i 開關](../../src/fa-shared-context-poc/README.md#native-2di-switch) |
 
 ## 跑完就能用
 
-首次安裝最後一步，hook 以 Team 主人身分替兩位助理做「新對話選版」（Neal 2026-10-10 決定）：
+首次安裝最後一步，hook 以 Team 主人身分替兩位助理做「新對話選版」：
 Responses 通道、伺服器提供的全部能力（桌面、技能、Shell、瀏覽器、交辦、協作、圖片等，WebIQ-MCP 除外），
 以及 Team 已批准的技能（最多 4 個）。模板由 `select_all_capabilities.py` 依伺服器自己的選項算出，不從別的 Agent 複製；
-之後的 `azd deploy` 不會改它，主人在 Portal 助理 ⚙ 設定頁的調整都保留。
+之後的 `azd deploy` 不會改它，主人在工作台助理 ⚙ 設定頁的調整都保留。
 
 <a id="model-switch"></a>
 兩位助理也打開**對話中換模型**（已有完成回合的對話也能改用另一個模型，換的那一回合會慢一次）：Hosted overlay
-`FA_NATIVE_MODEL_SWITCH=1`，和 stage A／B 第 29 版起相同（總協調 2026-10-15 決定）。它寫在
+`FA_NATIVE_MODEL_SWITCH=1`，和 stage 相同。它寫在
 [`profile.defaults.json`](profile.defaults.json) 的 `assistant_hosted_environment`，每次 `azd deploy` 都重新帶上。
 要關：把那裡的值改成 `"0"` 再 `azd deploy`。不要只刪掉這個 key：sync 會沿用目前版本的值，等於沒關。
 更早用 azd 建的環境，下一次 `azd deploy` 起也會打開。
 
-剩下一件只有真人能做的事：主人登入 hook 印出的網址、開新對話、送一則短訊息；以 receipt
-`completed`、`failure_code=null` 為準。
+剩下一件只有真人能做的事：主人登入 hook 印出的工作台網址（之後用 `azd env get-value FA_CONSOLE_URL` 也查得到）、開新對話、送一則短訊息；以 receipt
+`completed`、`failure_code=null` 為準。逐步操作見根目錄 README 的[「前 10 分鐘」](../../README.md#first-10-minutes)。
 
 <a id="hosted-agents"></a>
 ### 4 個 Hosted Agent
@@ -188,7 +190,7 @@ Responses 通道、伺服器提供的全部能力（桌面、技能、Shell、�
 - 映像由 `src/fa-shared-context-poc` 的工作目錄 build，卻以 commit 命名、同一 commit 與 core 再跑時直接沿用。所以這個目錄有**未提交的變更**（含未追蹤檔）時，`azd deploy` 會停下並列出第一個檔案：先 commit。確定要部署工作目錄原樣時，這一次加 `FA_ALLOW_DIRTY_BUILD=true`（例如 `azd env set FA_ALLOW_DIRTY_BUILD true`，用完 `azd env set FA_ALLOW_DIRTY_BUILD false`）；這樣 build 的映像不會被之後的部署沿用。
 - 上面的檢查只看會進映像的檔案：三個 Dockerfile（api、hosted、console）、`.dockerignore`，以及它們 `COPY` 自 build context 的路徑。`src/fa-shared-context-poc` 底下只改文件（README 等）不會擋住 `azd deploy`。
 - `guard` 要求這次的 commit 包含正在服務的 API revision 記錄的 commit（不能用較舊或另一條分支的 commit 蓋過去，要部署就先合併）；revision 名稱不是部署腳本取的，只警告、不停。
-- 正在服務的 revision 記錄的 commit 已不在這個 checkout 的歷史裡（部署過的 feature branch 被 rebase 或丟掉）時，`guard` 也會停下，之後每次 `azd deploy` 都一樣。確定要部署時，這一次加 `FA_ALLOW_ROLLBACK=true`（例如 `azd env set FA_ALLOW_ROLLBACK true`，用完 `azd env set FA_ALLOW_ROLLBACK false`）：停止改成一行 `::warning::`，並略過回退檢查與變更報告，只在這一次執行生效。commit 還在歷史裡、只是這次的 commit 不包含它時，仍然停下，這個開關不放行。stage CI（deploy-staging）**不認也不設** `FA_ALLOW_ROLLBACK`，維持嚴格；stage 上遇到這種停止，由 Neal 決定怎麼處理，不靠 workflow 繞過。
+- 正在服務的 revision 記錄的 commit 已不在這個 checkout 的歷史裡（部署過的 feature branch 被 rebase 或丟掉）時，`guard` 也會停下，之後每次 `azd deploy` 都一樣。確定要部署時，這一次加 `FA_ALLOW_ROLLBACK=true`（例如 `azd env set FA_ALLOW_ROLLBACK true`，用完 `azd env set FA_ALLOW_ROLLBACK false`）：停止改成一行 `::warning::`，並略過回退檢查與變更報告，只在這一次執行生效。commit 還在歷史裡、只是這次的 commit 不包含它時，仍然停下，這個開關不放行。stage CI（deploy-staging）**不認也不設** `FA_ALLOW_ROLLBACK`，維持嚴格；stage 上遇到這種停止，由維護者決定怎麼處理，不靠 workflow 繞過。
 ## 刪除
 
 ```bash
@@ -204,8 +206,7 @@ azd down --purge
   （`guid(<RG id>, 'fa-m1-backup-data-read-write-v1')`，和 `backup-role.bicep` 相同），不比對名稱，所以不會碰到
   別的同名環境的角色；讀不到時印 `could not be read`，`azd down` 照常繼續。
 - `postdown` 對備份角色印其中一行：`<角色名稱> (<GUID>): deleted`、`<GUID>: already gone`；azd 環境記的
-  `FA_BACKUP_ROLE_ID` 和算出的 ID 不同時什麼都不刪、保留這個值，請你自己核對
-  （以上自 #847 起）。
+  `FA_BACKUP_ROLE_ID` 和算出的 ID 不同時什麼都不刪、保留這個值，請你自己核對。
 - 約 30 分鐘（2026-10-15 實測 33 分 30 秒）。
 - `predown` hook 先移除 FA 給 M1 備份帳號加的刪除鎖（`m1-backup-account-delete-protection`），要先輸入環境名稱確認；
   沒有終端機時用 `FA_CONFIRM_DELETE=<環境名稱>`。資源群組裡有別人加的鎖就停下，不替你移除。

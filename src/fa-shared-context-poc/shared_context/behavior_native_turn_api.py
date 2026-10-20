@@ -35,9 +35,11 @@ from .behavior_native_turn_wire import (
     NativeEnvironmentWithoutFiles, NativeSessionAbandon, NativeSessionCut, NativeSessionFilesOmission,
     NativeSessionWithdraw, NativeTurnStatus,
     NativeEnvironmentNotice, NativeUnfinishedRead, NativeUnfinishedSessions, SLOT_NOTICE_KINDS,
-    NOTICE_KINDS_HEADER, NOTICE_KINDS_VERSION,
+    NOTICE_KINDS_HEADER, NOTICE_KINDS_VERSION, UPGRADE_WAITING_HEADER, UPGRADE_WAITING_VERSION, ROLLBACK_NOTICE_HEADER,
+    ROLLBACK_NOTICE_VERSION, UPGRADE_VETOED_HEADER, UPGRADE_VETOED_VERSION,
     MAX_RECEIVED_PAGE, NativeReceivedPage, NativeReceivedRead,
     NativePrewarm, NativePrewarmResult, NativePrewarmToolbox, NativePrewarmView, MAX_PREWARM_TOOLBOXES,
+    NativeSessionCheckpointCheck, NativeSessionPrerestore,
 )
 from .memory_candidate_wire import NativeCandidateView
 from .behavior_work_target import selected_targets
@@ -146,6 +148,9 @@ def _not_admitted(error, request_id):
     """Mark a definite refusal before ``rid:<RID>`` exists (4xx, or the whole-Agent version follow); an unknown
     outcome or a taken RID stays as is. It means only that this attempt sent nothing: resend the same RID and body."""
     code = error.body["error"]["code"]
+    if code == "NATIVE_EXECUTION_UNAVAILABLE" and error.body["error"].get("not_dispatched") is True:
+        # Hosted waits for an earlier SDK runtime to exit (or restarts): the client resends the same RID.
+        return _BeforeAdmission(error, request_id, server_following=True)
     if (400 <= error.status < 500 or code == "AGENT_VERSION_FOLLOWING") and code != "NATIVE_RID_CONFLICT":
         return _BeforeAdmission(error, request_id)
     return error
@@ -229,10 +234,47 @@ def _prewarm_toolboxes(runtime):
 
 # ADR-0009 §4 steps 5-6: refusals of a row-located submit resolved in the request (never shown as version refusals).
 _BOUND_REFUSALS = frozenset({(409, "NATIVE_SESSION_CHANGED"), (403, "NATIVE_TURNS_DISABLED")})
+# ADR-0009 §3 P1: an older image's pre-admission refusals of a capture it can not run (``older_image``).
+_OLDER_IMAGE_REFUSALS = frozenset({"NATIVE_CAPTURE_CHANGED", "NATIVE_PROFILE_UNSUPPORTED"})
 # ADR-0009 §7a (e): the read-time status of an unfinished receipt an earlier (previous) SID accepted.
 EARLIER_VERSION_UNFINISHED = "NATIVE_EARLIER_VERSION_UNFINISHED"
 # Hosted's mark of a left ``started`` receipt whose progress stopped for N minutes (``native_left_receipts``).
 SOURCE_STALLED = "NATIVE_SOURCE_STALLED"
+
+
+def older_image(composition, control, client, conflict, checked_since=None, *, cut=True):
+    """ADR-0009 §3 P1 (2026-10-18, ``FA_NATIVE_SESSION_GUARD_ENFORCE``): the row's SID runs an older image than the
+    selected version and refused this new RID before admission because it lacks the capture's prompt or profile
+    (``preflight``). Nothing ran there, so the background cut moves the Agent (files copied when the source has
+    them; ``CutDriver`` runs one attempt per Agent at a time) and the same RID is resent. ``cut``: hand the Agent to
+    the cut (the owner's submit does on the first attempt of each request). On the selected version's own SID the
+    same codes stay refusals. ``checked_since``: the caller's selector read (None: one within
+    ``SELECTOR_CHECK_SECONDS``)."""
+    from .behavior_native_sessions import native_sessions
+
+    detail = conflict.body["error"]
+    sessions = native_sessions(composition)
+    if not (sessions.guard.enforce and getattr(client, "_binding_row", None) is not None
+            and detail["code"] in _OLDER_IMAGE_REFUSALS and detail.get("not_dispatched") is True):
+        return False
+    selected = sessions._selected_or_none(client, checked_since)
+    if selected is None or selected == client.target.agent_version:
+        return False
+    logging.getLogger(__name__).warning("NATIVE_SEND_OLDER_IMAGE code=%s session_id=%s selected_version=%s",
+                                        detail["code"], client.target.session_id, selected)
+    if cut:
+        from .native_cut import send_refused
+        send_refused(composition, control, client.target.agent_id)
+    return True
+
+
+def follow_older_image(composition, control, client, error):
+    """``older_image`` for a send that has no owner wait of its own (Agent relays, routines): 503
+    ``AGENT_VERSION_FOLLOWING`` (``not_dispatched``), so a relay is resent through ``_waiting`` and Hosted's
+    ``NativeRecipientFollowing``, and a routine's next tick resends its occurrence RID."""
+    if older_image(composition, control, client, error):
+        raise Problem(503, "AGENT_VERSION_FOLLOWING", "the Agent is moving to its selected version; nothing was sent",
+                      not_dispatched=True) from None
 
 
 def agent_client(composition, control):
@@ -399,8 +441,8 @@ class NativeTurnGateway:
         return result
 
     @staticmethod
-    def _invoke(client, command):
-        response = client.invoke_native(command)
+    def _invoke(client, command, timeout=None):
+        response = client.invoke_native(command, **({} if timeout is None else {"timeout": timeout}))
         model = (NativeSessionState if isinstance(command, (NativeSessionRead, NativeSessionWithdraw)) else
                  NativeFilesView if isinstance(command, NativeSessionFiles) else
                  NativeContinuationView if isinstance(command, NativeContinuationRead) else
@@ -422,7 +464,8 @@ class NativeTurnGateway:
                  NativeAppendReceipt if isinstance(command, (NativeAppend, NativeAppendRead)) else
                  NativeUserImageStored if isinstance(command, NativeUserImageUpload) else
                  NativeSkillDraftProof if isinstance(command, NativeSkillDraftIntentRead) else
-                 NativePrewarmView if isinstance(command, NativePrewarm) else
+                 NativePrewarmView if isinstance(command, (NativePrewarm, NativeSessionCheckpointCheck,
+                                                           NativeSessionPrerestore)) else
                  NativeCandidateView if isinstance(command, NativeCandidateRead) else NativeReceipt)
         try:
             json.loads(response.body, object_pairs_hook=_unique, parse_constant=_nonfinite)
@@ -757,7 +800,8 @@ class NativeTurnGateway:
         return wait_in_request(attempt, enforce=enforce)
 
     def _submit(self, principal, command, *, state_profile=NATIVE_STATE_PROFILE, original=None, response=None,
-                defer=None, owner_notice=False, notice_kinds=False, early=True):
+                defer=None, owner_notice=False, notice_kinds=0, rollback_notice=False, vetoed_notice=False,
+                early=True):
         """Owner submit: entry check once, then Hosted's ``rid:<RID>`` create-or-read is the only dedup.
 
         A first attempt does not pre-read the RID. Only when Hosted reports that the RID already names other
@@ -768,7 +812,9 @@ class NativeTurnGateway:
 
         ``owner_notice``: this is the owner's own workbench response, which carries the Agent's pending slot notice
         (ADR-0009 §4 end); other callers (group start, reconcile) never carry it. ``notice_kinds``: the bridge sent
-        ``NOTICE_KINDS_HEADER``; without it only the drift notice is carried, as before phase 2c.
+        notice headers at this level (``_notice_level``): 2 decodes the switch kinds, 3 also the 6-hour waiting note;
+        without them only the drift notice is carried, as before phase 2c. ``rollback_notice``: it also sent
+        ``ROLLBACK_NOTICE_HEADER`` (phase 4d's 已退回); ``vetoed_notice``: ``UPGRADE_VETOED_HEADER`` (4b-4's 沒有更新).
         """
         command = InstructionSubmit.model_validate_json(command.model_dump_json())
         rid = command.request_id
@@ -852,7 +898,7 @@ class NativeTurnGateway:
                     if command.conversation_id is None:
                         self._keep_admitted(client, submitted[0])
                     return self._bound(sessions, client, self._accounted(control, submitted), owner_notice,
-                                       notice_kinds)
+                                       notice_kinds, rollback_notice, vetoed_notice)
                 except Problem as conflict:
                     if getattr(client, "_binding_row", None) is not None and (
                             conflict.status, conflict.body["error"]["code"]) in _BOUND_REFUSALS:
@@ -860,7 +906,8 @@ class NativeTurnGateway:
                         sent, result = self._after_refusal(
                             control, principal, reader, sessions, client, command, capture, previous, conflict,
                             state_profile=state_profile, defer=defer)
-                        return self._bound(sessions, sent, result, owner_notice, notice_kinds)
+                        return self._bound(sessions, sent, result, owner_notice, notice_kinds, rollback_notice,
+                                           vetoed_notice)
                     actual = conflict.body["error"].get("actual_version")
                     if conflict.body["error"]["code"] == "NATIVE_SESSION_CHANGED" and actual is not None:
                         # A newer image reported the VM's own version: record it (ADR-0009 §4 step 6). This also
@@ -890,6 +937,10 @@ class NativeTurnGateway:
                                     principal, reader, sessions, conflict, rid,
                                     refused_session_id=(client.target.session_id
                                                         if code == "AGENT_VERSION_FOLLOWING" else None)) from None
+                            if older_image(self.composition, control, client, conflict, started, cut=early):
+                                raise _BeforeAdmission(Problem(
+                                    503, "AGENT_VERSION_FOLLOWING", "the Agent is moving to its selected version; "
+                                    "nothing was sent", not_dispatched=True), rid, server_following=True) from None
                             raise _not_admitted(conflict, rid) from None
                         raise
                     original, response = self._existing(client, rid)
@@ -897,7 +948,7 @@ class NativeTurnGateway:
                         raise
         return self._bound(sessions, client, self._retained(
             control, client, command, original, state_profile, response=response, defer=defer), owner_notice,
-            notice_kinds)
+            notice_kinds, rollback_notice, vetoed_notice)
 
     def _after_refusal(self, control, principal, reader, sessions, client, command, capture, previous, conflict, *,
                        state_profile, defer):
@@ -905,6 +956,8 @@ class NativeTurnGateway:
         refusal the client resends unchanged (``server_following``), or, when nothing proves the RID was not taken,
         the original refusal (boundary 7: never resent blind). The binding row is read again first.
 
+        - A ``replaced`` 409 names the current SID (``current_hosted_session_id``, nothing dispatched): the row is
+          repaired to it and the same RID goes there once (4c-2).
         - The row names another SID now: the same RID and body go there once if nothing was dispatched; otherwise
           the RID is read through the new SID first (its original answers; a never-started one Hosted adopts; one
           left ``accepted`` on the old SID is reported, never resent).
@@ -928,11 +981,18 @@ class NativeTurnGateway:
             return self._follow_before_admission(principal, reader, sessions, refusal, rid,
                                                  refused_session_id=client.target.session_id)
 
+        send = partial(self._send_once, control, principal, reader, sessions, command, capture, previous,
+                       definite=definite, state_profile=state_profile, defer=defer)
+        if definite and detail.get("current_hosted_session_id") is not None:
+            # ADR-0009 4c-2: Hosted named the Agent's current SID; the row is repaired to it (M3) and the same RID
+            # goes straight there once, without reading the row again.
+            relocated = sessions.relocate(client, conflict)
+            if relocated is None:
+                raise resend_later(conflict) from None
+            return send(relocated)
         row = sessions.bound_row(client, fresh=True)
         if row is None:
             raise resend_later(conflict) from None
-        send = partial(self._send_once, control, principal, reader, sessions, command, capture, previous,
-                       definite=definite, state_profile=state_profile, defer=defer)
         if row.hosted_session_id != client.target.session_id:
             return send(sessions._bound_client(client, row))
         if conflict.status == 403:
@@ -1004,7 +1064,7 @@ class NativeTurnGateway:
         return client, self._accounted(control, submitted)
 
     @staticmethod
-    def _bound(sessions, client, result, owner_notice, notice_kinds=False):
+    def _bound(sessions, client, result, owner_notice, notice_kinds=0, rollback_notice=False, vetoed_notice=False):
         """Hosted answered, so the VM accepted ``client.target.agent_version``: record it. Only an owner response
         carries the pending slot notice (the drift notice only, unless the bridge knows the phase 2c kinds); the
         owner's HTTP route clears it after the response is written (``clear_delivered_notice``, ADR-0009 §4 end),
@@ -1018,10 +1078,14 @@ class NativeTurnGateway:
             row = located
         else:
             row = sessions.observed_binding(client, version=client.target.agent_version)
-        notice = (None if row is None or row.hosted_session_id != client.target.session_id
-                  else row.notice(switch=notice_kinds))
+        row = None if row is None or row.hosted_session_id != client.target.session_id else row
+        notice = None if row is None else row.notice(switch=notice_kinds >= 2, rolled_back=rollback_notice,
+                                                     vetoed=vetoed_notice)
         if owner_notice and notice is not None and isinstance(value, NativeReceipt):
             value = value.model_copy(update={"environment_notice": notice})
+        elif owner_notice and notice_kinds >= 3 and row is not None and isinstance(value, NativeReceipt):
+            # 6a (c): the lightest note, only when no slot notice takes the one status line.
+            value = value.model_copy(update={"upgrade_waiting_version": row.waiting_version()})
         return value, upstream
 
     def clear_delivered_notice(self, value):
@@ -1031,13 +1095,24 @@ class NativeTurnGateway:
         notice = getattr(value, "environment_notice", None)
         if isinstance(value, NativeReceipt) and notice is not None:
             self.clear_notice(value.agent_id, notice)
+        elif isinstance(value, NativeReceipt) and value.upgrade_waiting_version is not None:
+            from .behavior_native_sessions import native_sessions
+            sessions = native_sessions(self.composition)
+            written = sessions._binding(
+                "clear", lambda store: store.clear_waiting(value.agent_id, value.upgrade_waiting_version))
+            if written is not None:
+                # The kept row still says "pending"; a tied monotonic() tick (Windows, 15.6 ms) would send it again.
+                sessions.keep_written(written)
 
     def clear_notice(self, agent_id, notice):
         """``clear_delivered_notice`` for an owner reply that is not a receipt (a Teams final reply)."""
         if notice.kind not in SLOT_NOTICE_KINDS:
             return
         from .behavior_native_sessions import native_sessions
-        native_sessions(self.composition)._binding("clear", lambda store: store.clear_notice(agent_id, notice))
+        sessions = native_sessions(self.composition)
+        written = sessions._binding("clear", lambda store: store.clear_notice(agent_id, notice))
+        if written is not None:
+            sessions.keep_written(written)  # as above: a tied monotonic() tick must not reuse the stale row
 
     def owner_notice(self, agent_id):
         """The binding row's pending slot notice for a final owner reply that did not come from a submit (Teams'
@@ -1249,9 +1324,22 @@ class NativeTurnGateway:
         return self._invoke(client, command)
 
 
-def _knows_notice_kinds(request) -> bool:
-    """The workbench bridge decodes the phase 2c notice kinds (``NOTICE_KINDS_HEADER``, ADR-0009 §8)."""
-    return request.headers.getlist(NOTICE_KINDS_HEADER) == [NOTICE_KINDS_VERSION]
+def _notice_level(request) -> int:
+    """What the workbench bridge decodes (ADR-0009 §8): 2 = the phase 2c notice kinds (``NOTICE_KINDS_HEADER``), 3 =
+    also the 6-hour waiting note (``UPGRADE_WAITING_HEADER`` beside it); 0 otherwise (the answer is as before 2c)."""
+    if request.headers.getlist(NOTICE_KINDS_HEADER) != [NOTICE_KINDS_VERSION]:
+        return 0
+    return 3 if request.headers.getlist(UPGRADE_WAITING_HEADER) == [UPGRADE_WAITING_VERSION] else 2
+
+
+def _knows_rollback_notice(request) -> bool:
+    """It also decodes phase 4d's 已退回 (``ROLLBACK_NOTICE_HEADER``, beside ``NOTICE_KINDS_HEADER``)."""
+    return request.headers.getlist(ROLLBACK_NOTICE_HEADER) == [ROLLBACK_NOTICE_VERSION]
+
+
+def _knows_vetoed_notice(request) -> bool:
+    """It also decodes phase 4b-4's 沒有更新 (``UPGRADE_VETOED_HEADER``, beside ``NOTICE_KINDS_HEADER``)."""
+    return request.headers.getlist(UPGRADE_VETOED_HEADER) == [UPGRADE_VETOED_VERSION]
 
 
 def install_native_turn_routes(app, composition, *, enabled):
@@ -1312,7 +1400,8 @@ def install_native_turn_routes(app, composition, *, enabled):
         if upstream is not None:
             response.headers["x-agent-invocation-id"] = upstream.invocation_id
         notice = getattr(value, "environment_notice", None)
-        if owner and isinstance(value, NativeReceipt) and notice is not None and notice.kind in SLOT_NOTICE_KINDS:
+        if owner and isinstance(value, NativeReceipt) and (
+                notice is not None and notice.kind in SLOT_NOTICE_KINDS or value.upgrade_waiting_version is not None):
             tasks = background if background is not None else BackgroundTasks()
             tasks.add_task(gateway.clear_delivered_notice, value)
             response.background = tasks
@@ -1427,9 +1516,10 @@ def install_native_turn_routes(app, composition, *, enabled):
     @app.post(PREFIX + "/submit")
     async def submit(request: Request, principal=Depends(identity)):
         command = await _body(request, InstructionSubmit, max_body_bytes=MAX_SUBMIT_BODY_BYTES)
-        known = _knows_notice_kinds(request)
-        return await reply(lambda: gateway.submit(principal, command, owner_notice=True, notice_kinds=known),
-                           owner=known, rid=command.request_id)
+        level, rolled, vetoed = _notice_level(request), _knows_rollback_notice(request), _knows_vetoed_notice(request)
+        return await reply(lambda: gateway.submit(principal, command, owner_notice=True, notice_kinds=level,
+                                                  rollback_notice=rolled, vetoed_notice=vetoed),
+                           owner=level >= 2, rid=command.request_id)
 
     @app.post(PREFIX + "/prewarm")
     async def prewarm(request: Request, principal=Depends(identity)):
@@ -1503,10 +1593,11 @@ def install_native_turn_routes(app, composition, *, enabled):
     async def submit_response(request: Request, principal=Depends(identity)):
         command = await _body(request, InstructionSubmit, max_body_bytes=MAX_SUBMIT_BODY_BYTES)
         after_reply = BackgroundTasks()
-        known = _knows_notice_kinds(request)
+        level, rolled, vetoed = _notice_level(request), _knows_rollback_notice(request), _knows_vetoed_notice(request)
         response = await reply(lambda: gateway.submit(
             principal, command, state_profile=NATIVE_RESPONSES_PROFILE, defer=after_reply.add_task, owner_notice=True,
-            notice_kinds=known), owner=known, background=after_reply, rid=command.request_id)
+            notice_kinds=level, rollback_notice=rolled, vetoed_notice=vetoed), owner=level >= 2, background=after_reply,
+            rid=command.request_id)
         if after_reply.tasks:
             response.background = after_reply
         return response

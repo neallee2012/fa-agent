@@ -23,7 +23,9 @@ from shared_context.behavior_assistant_wire import AssistantSubmit
 from shared_context.behavior_delivery import _Payload
 from shared_context.behavior_inbox import INBOX_CHANNEL_ID, INBOX_VERSION
 # This bridge decodes the ADR-0009 phase 2c notice kinds; the API adds them (and clears the slot) only when told.
-from shared_context.behavior_native_turn_wire import NOTICE_KINDS_HEADER, NOTICE_KINDS_VERSION
+from shared_context.behavior_native_turn_wire import (
+    NOTICE_KINDS_HEADER, NOTICE_KINDS_VERSION, ROLLBACK_NOTICE_HEADER, ROLLBACK_NOTICE_VERSION, UPGRADE_VETOED_HEADER,
+    UPGRADE_VETOED_VERSION, UPGRADE_WAITING_HEADER, UPGRADE_WAITING_VERSION)
 from shared_context.behavior_operations import control_key
 
 
@@ -444,6 +446,8 @@ class PullAdapter:
             with self.client.stream(method, url, params=params, content=None if body is None else canonical(body),
                 headers={"Authorization": "Bearer "+token, "Content-Type": "application/json",
                          "Accept-Encoding": "identity", NOTICE_KINDS_HEADER: NOTICE_KINDS_VERSION,
+                         UPGRADE_WAITING_HEADER: UPGRADE_WAITING_VERSION,
+                         ROLLBACK_NOTICE_HEADER: ROLLBACK_NOTICE_VERSION, UPGRADE_VETOED_HEADER: UPGRADE_VETOED_VERSION,
                          **({} if if_match is None else {"If-Match": if_match})},
                 follow_redirects=False) as response:
                 data = bytearray()
@@ -543,7 +547,8 @@ class PullAdapter:
                                 and error.get("request_id") == body.get("request_id"))
                             server_following = (not_dispatched and error.get("server_following") is True
                                 and (response.status_code, code) in {
-                                    (409, "NATIVE_SESSION_CHANGED"), (503, "AGENT_VERSION_FOLLOWING")})
+                                    (409, "NATIVE_SESSION_CHANGED"), (503, "AGENT_VERSION_FOLLOWING"),
+                                    (503, "NATIVE_EXECUTION_UNAVAILABLE")})
                             if not_dispatched or type(code) is str and code in NATIVE_TURN_ERRORS | {
                                 "FOUNDRY_INVOCATION_UNKNOWN", "FOUNDRY_RESPONSE_INVALID",
                                 "FOUNDRY_NATIVE_BINDING_MISMATCH", "BEHAVIOR_COMMIT_UNKNOWN",

@@ -422,3 +422,57 @@ def test_a_precondition_failure_after_our_own_write_is_read_back_not_redone(resp
     assert applied == ["agent", "meta"] and current.admitting is None
     # The mark read back its own record (no re-mark); the slot was read again and found this RID already in it.
     assert "FA_NATIVE_ADMISSION_MARK_REREAD" not in caplog.text and "FA_NATIVE_SLOT_REREAD" in caplog.text
+
+
+def test_an_accepted_response_waits_for_an_earlier_unexited_cli_before_it_starts(responses):
+    """Review P3 on #903: as on the Invocations chain, a Responses turn whose slot opens while an earlier turn's CLI
+    still runs stays accepted (no SDK call, so no NATIVE_EXECUTION_UNAVAILABLE after started) and runs once it exits."""
+    unexited = [True]
+    responses.sdk.runtime_unexited = lambda: unexited[0]
+    assert responses.invoke(response_submit()).status_code == 202
+    accepted = responses.call(responses.runtime.read, "rid-1")
+    assert responses.respond(accepted).status_code == 200
+    time.sleep(0.5)
+    assert responses.call(responses.runtime.read, "rid-1").status == "accepted" and not responses.sdk.calls
+    unexited[0] = False
+    assert responses.wait("rid-1", "completed").result is not None
+    assert len(responses.sdk.calls) == 1
+
+
+def test_a_tail_append_on_responses_is_resent_after_the_original_ends_and_runs(responses):
+    """Review P1 on #916: Responses refuses a human turn while the slot holder runs (no queue), so the workbench resends
+    a turn_finished append only after the original ends; that resend then runs."""
+    from test_native_turns import append_command, read_append, steer
+
+    responses.sdk.block = True
+    assert responses.invoke(response_submit()).status_code == 202
+    assert responses.respond(responses.call(responses.runtime.read, "rid-1")).status_code == 200
+    active = responses.wait("rid-1", "started")
+    responses.call(steer(responses).channel.close)  # the reply is shown; the SDK still stops and saves
+    answer = responses.invoke(append_command(active))
+    assert (answer.json()["status"], answer.json().get("reason")) == ("not_applied", "turn_finished"), answer.text
+    assert responses.invoke(response_submit("too-early", active.conversation_id)).status_code == 202
+    early = responses.call(responses.runtime.read, "too-early")
+    assert (early.status, early.failure_code) == ("busy_refused", "NATIVE_TURN_BUSY"), "why the workbench waits here"
+    responses.sdk.block = False
+    responses.wait("rid-1", "completed")
+    assert responses.invoke(response_submit("resent", active.conversation_id, "OFFLINE appended text")).status_code == 202
+    resent = responses.call(responses.runtime.read, "resent")
+    assert responses.respond(resent).status_code == 200
+    assert responses.wait("resent", "completed").result is not None
+    assert [call[0] for call in responses.sdk.calls] == ["rid-1", "resent"] and responses.sdk.calls[1][2] is not None
+    assert read_append(responses, active).status == "not_applied"
+
+
+def test_a_response_waiting_on_a_cli_that_never_exits_ends_resendable_within_the_bound(responses, monkeypatch):
+    """Review P2-1 on #903: the wait is bounded in every case. A CLI that never exits and a recovery restart that never
+    comes end the accepted Responses turn as NATIVE_TURN_NOT_STARTED (resendable) without any SDK call."""
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "UNEXITED_WAIT_SECONDS", 0.5, raising=False)  # absent before the bound
+    responses.sdk.runtime_unexited = lambda: True
+    assert responses.invoke(response_submit()).status_code == 202
+    accepted = responses.call(responses.runtime.read, "rid-1")
+    assert responses.respond(accepted).status_code == 200
+    settled = responses.wait("rid-1", "unknown")
+    assert settled.failure_code == "NATIVE_TURN_NOT_STARTED" and not responses.sdk.calls

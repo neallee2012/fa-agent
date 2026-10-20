@@ -850,6 +850,8 @@ def application(composition: ServerComposition, *, preactivation=False):
             if composition.runtime.work_policy is None:
                 composition.catalog.require_activation()
             composition.runtime.validate_startup()
+            from .native_binding import idle_upgrade_enabled
+            idle_upgrade_enabled()  # refuses FA_NATIVE_IDLE_UPGRADE=1 without the 2d-i switch
             identity = _principal_dependency(composition.verifier)
 
             def current_native_evidence(request: Request, _principal=Depends(identity)):

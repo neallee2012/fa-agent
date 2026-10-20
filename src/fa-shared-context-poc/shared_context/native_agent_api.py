@@ -19,7 +19,7 @@ from .behavior_native_agent_wire import (
     NATIVE_AGENT_PREFIX as PREFIX, NativePeerDirectory, NativeRelayAcceptance,
     NativeRelayReadResult, NativeRelayResult, NativeRelaySend, relay_acceptance_scope,
 )
-from .behavior_native_turn_api import NativeTurnGateway
+from .behavior_native_turn_api import NativeTurnGateway, follow_older_image
 from .behavior_native_responses_api import submit_native_turn
 from .behavior_native_sessions import native_sessions
 from .behavior_native_turn_wire import (
@@ -301,6 +301,12 @@ class NativeAgentRelayGateway:
                              and error.body["error"].get("automatic_retry") is False)
                         and self._original(client, identifier) is None):
                     groups.refused_request(message, code)
+                if code == "NATIVE_EXECUTION_UNAVAILABLE" and error.body["error"].get("not_dispatched") is True:
+                    # The recipient waits for an earlier SDK runtime to exit: the sender waits and resends this message.
+                    logging.getLogger(__name__).warning("NATIVE_RELAY_RECIPIENT_UNAVAILABLE cause=%s", code)
+                    raise Problem(503, "NATIVE_RELAY_RECIPIENT_UNAVAILABLE",
+                                  "the recipient cannot currently receive; this attempt added no delivery") from None
+                follow_older_image(peer, peer.runtime.work_policy, client, error)
                 raise
             NativeTurnGateway._accounted(peer.runtime.work_policy, (received, None), peer)
             return self._accepted(received)
@@ -393,11 +399,15 @@ class NativeAgentRelayGateway:
                     request_id=source.routine.request_id, conversation_id=source.conversation_id,
                     definition_sha256=source.routine.occurrence.definition_sha256))
 
-        return NativeTurnGateway._accounted(control, submit_native_turn(
-            composition, client, resumed, existing.capture if existing is not None else fresh,
-            source=source.source, routine=source.routine, continuation=view.continuation,
-            original=existing, conversation=conversation,
-            before_send=current), composition)[0]
+        try:
+            submitted = submit_native_turn(
+                composition, client, resumed, existing.capture if existing is not None else fresh,
+                source=source.source, routine=source.routine, continuation=view.continuation,
+                original=existing, conversation=conversation, before_send=current)
+        except Problem as error:
+            follow_older_image(composition, control, client, error)
+            raise
+        return NativeTurnGateway._accounted(control, submitted, composition)[0]
 
     def result(self, principal: BehaviorPrincipal, command: NativeRelayResult) -> NativeRelayAcceptance:
         return self._return_outcome(principal, command, completed=True)
@@ -462,10 +472,14 @@ class NativeAgentRelayGateway:
                                      page.text if page.complete else None, request=request)
         else:
             message = prepare_outcome(principal, scope, sender, recipient, capture, request=request)
-        received, _ = submit_native_turn(
-            target, client, message.command, message.capture, source=message.source,
-            original=original, conversation=conversation,
-            before_send=lambda: principal.require(recipient.team_id, "submit"))
+        try:
+            received, _ = submit_native_turn(
+                target, client, message.command, message.capture, source=message.source,
+                original=original, conversation=conversation,
+                before_send=lambda: principal.require(recipient.team_id, "submit"))
+        except Problem as error:
+            follow_older_image(target, target.runtime.work_policy, client, error)
+            raise
         # Also on a resend of a finished original: it is the retry of a usage write that failed earlier.
         NativeTurnGateway._accounted(target.runtime.work_policy, (received, None), target)
         return self._accepted(received, source=sender)

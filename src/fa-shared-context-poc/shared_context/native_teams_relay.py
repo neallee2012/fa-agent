@@ -97,8 +97,9 @@ TEXT = {
 # same literals). The relay forwards only ``text``, so the API adds the sentence to a final reply's text.
 NOTICE_TEXT = {
     "environment_updated": "助理已更新到新版本，工作檔也一起帶過來了。",
-    "environment_switched_without_files": "已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。",
-    "environment_source_retired": "已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。",
+    "environment_switched_without_files": "上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。",
+    "environment_source_retired": "上次換環境時，舊環境已失效或被平台刪除，沒有搬工作檔；之前 VM 裡的工作檔可能已經不在了。",
+    "environment_rolled_back": "助理已退回先前的版本；剛才中斷的訊息請再送一次。",  # Neal 2026-10-19
     "earlier_version_unfinished": "這則訊息是較早的版本接下的，目前環境無法接續；請用新訊息再送一次。",
 }
 log = logging.getLogger(__name__)
@@ -107,9 +108,13 @@ _IDENTIFIER = re.compile(ID_PATTERN)
 
 def notice_text(notice):
     """The §8 sentence Teams shows for ``notice``, or None. A compatible same-session drift
-    (``platform_version_changed``) has none: ADR-0009 M4.2 shows it only in the workbench status field, never in chat
-    text, so Teams neither shows nor clears it."""
-    return NOTICE_TEXT.get(notice.kind)
+    (``platform_version_changed``) and U3's veto (``environment_upgrade_vetoed``) have none: ADR-0009 M4.2/M4.6 show
+    them only in the workbench status field, never in chat text (a Teams user never knew an update was pending), so
+    Teams neither shows nor clears them. 已退回 without its work files adds the no-files sentence (M4 #1)."""
+    sentence = NOTICE_TEXT.get(notice.kind)
+    if sentence is not None and notice.without_files:
+        sentence += NOTICE_TEXT["environment_switched_without_files"]
+    return sentence
 
 
 class RelayTurn(WireModel):
@@ -155,6 +160,9 @@ class RelayReply(WireModel):
     # line of ``text``, which is all the relay forwards); the route clears it after this reply is written. Never the
     # drift notice: M4.2 shows that only in the workbench status field.
     environment_notice: NativeEnvironmentNotice | None = Field(default=None, exclude_if=lambda value: value is None)
+    # This poll took nothing (a ``_BeforeAdmission``), so the relay never counts it as running: no poll's answer proves
+    # an earlier poll's send was not taken, so a message no poll confirmed ends unconfirmed. An older relay ignores it.
+    not_dispatched: Literal[True] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def teams_relay_agents(environ) -> dict[str, str] | None:
@@ -227,7 +235,7 @@ class TeamsRelay:
         chat = Chat(self.records, scope, agent_id, _id("tc-", relay_oid, turn.chat_id))
         rid = _id(RELAY_PREFIX, relay_oid, turn.chat_id, turn.activity_id)
         try:
-            original, _ = gateway.read(owner, NativeRead(request_id=rid))
+            original, _ = self._read(gateway, owner, rid)
         except Problem as error:
             # NATIVE_SESSION_CHANGED: the selected version has no session yet, so nothing was read. The submit of the
             # same deterministic RID answers it (503 not_dispatched: the relay polls and sends it again).
@@ -235,7 +243,10 @@ class TeamsRelay:
                 raise
             original = self._submit(gateway, owner, rid, chat.conversation_id(), turn.text)
             if original is None:
-                return RelayReply(state="running", text=TEXT["running"])
+                # Nothing taken now; "running" keeps the relay resending this RID. Neither code proves no earlier poll's
+                # send was taken (NATIVE_RID_MISSING "does not prove nonacceptance"; a moved session hides the RID), so
+                # Teams never says to resend here (rule 7).
+                return RelayReply(state="running", text=TEXT["running"], not_dispatched=True)
         else:
             if original.command.content != turn.text:
                 raise Problem(409, "NATIVE_RID_CONFLICT", "the Teams message differs from its original turn")
@@ -249,6 +260,18 @@ class TeamsRelay:
         reply = self._settle(gateway, owner, _pending(self.records, scope, relay_oid, agent_id, self.clock), rid, reply,
                              original.request_id, original.status in TERMINAL, catch_up=catch_up)
         return self._noticed(gateway, agent_id, reply)
+
+    @staticmethod
+    def _read(gateway, owner, rid):
+        """The original receipt. A read that lost its CAS race (412, which the API marks ``automatic_retry``; its RID-keyed
+        usage entry) is read again with the same RID: the next read finds the winner's commit. A 409 is a real conflict,
+        and other errors are not retried here (the relay polls a 5xx again itself)."""
+        for attempt in range(CAS_ATTEMPTS):
+            try:
+                return gateway.read(owner, NativeRead(request_id=rid))
+            except Problem as error:
+                if error.status != 412 or error.body["error"]["code"] != "BEHAVIOR_CONFLICT" or attempt == CAS_ATTEMPTS - 1:
+                    raise
 
     @staticmethod
     def _noticed(gateway, agent_id, reply):

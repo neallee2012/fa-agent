@@ -18,7 +18,7 @@ from shared_context.behavior_native_turn_wire import (
 )
 from shared_context.behavior_sdk_state import NativeCheckpointScope
 from shared_context.errors import Problem
-from shared_context.native_turns import NativeTurnControl, NativeTurnRuntime
+from shared_context.native_turns import TURNS_STORE, NativeTurnControl, NativeTurnRuntime, _json, _Rid
 from test_native_turn_wire import capture, submit
 from test_m2_copilot import runtime_path  # noqa: F401
 from test_native_turns import Harness, IDENTITY, local_env
@@ -487,6 +487,10 @@ def test_native_factory_runs_under_bootstrap_owned_root_when_home_is_not_writabl
     )
 
     async def execute_and_save():
+        # Since ee8ef6b7 the factory's executor fences effects on the stored original RID.
+        await runtime.initialize()
+        async with runtime._store(TURNS_STORE) as turns:
+            await turns.create_item("rid:" + receipt.request_id, _json(_Rid(receipt=receipt, call_id="OFFLINE-seed", run_token="OFFLINE-run")))
         outcome = await runtime.executor(receipt, scope, None, NativeTurnControl())
         async with await native_checkpoint.open_durable_store(
                 native_checkpoint.conversation_store_name(scope.conversation_id), create=True) as store:
@@ -576,7 +580,7 @@ def test_a_turn_removes_its_dirs_unless_its_sdk_is_kept(local_env, monkeypatch, 
     class Live:
         turn = None
 
-        async def stop(self):
+        async def stop(self, on_unexited=None):
             pass
 
     async def sdk(**options):

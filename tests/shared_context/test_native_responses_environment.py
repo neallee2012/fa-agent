@@ -351,9 +351,10 @@ def test_response_fence_never_overwrites_a_start_or_retries_with_a_new_etag(orig
             "expected_session_id": IDENTITY.session_id, "expected_etag": source.state["etag"], "stage": "prepare",
         }
         response = invoke(client, identity, command)
-        assert response.status_code == (503 if fault == "started-wins" else 200), response.text
+        assert response.status_code == 200, response.text
         if fault == "started-wins":
-            assert response.json()["error"]["code"] == "NATIVE_STATE_STORE_UNKNOWN"
+            # The started winner is kept (not closed as not-started) and the follow waits for it.
+            assert response.json()["state"] == "pending" and response.json()["reason"] == "accepted_or_started"
         observed = invoke(client, identity, NativeRead(request_id=source.receipt.request_id)).json()
         assert observed["status"] == ("started" if fault == "started-wins" else "unknown")
         if fault == "started-wins":

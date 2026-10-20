@@ -115,8 +115,9 @@ def test_hosted_only_changes_do_not_require_a_fake_core_code_change(monkeypatch)
     monkeypatch.setattr(module, "rest", lambda *_a, **_k: {
         "properties": {"latestReadyRevisionName": module.STAGE["api_app"] + "--aaaaaaa-r1-1",
                        # Stage API read back min 1 on 2026-10-08 (README#native-routines-stage guard).
-                       "template": {"scale": {"minReplicas": 1}},
-                       "configuration": {"secrets": secrets}}})
+                       "template": {"scale": {"minReplicas": 1}, "containers": [{"env": [
+                           {"name": "FA_NATIVE_SESSION_GUARD_ENFORCE", "value": "1"}]}]},  # stage.json: 2d-i on
+                       "configuration": {"secrets": secrets, "activeRevisionsMode": "Single"}}})
     monkeypatch.setattr(module.subprocess, "run", lambda *_a, **_k: SimpleNamespace(
         returncode=0, stdout="a" * 40, stderr=""))
     monkeypatch.setattr(module, "run", lambda *args: "" if any(":(glob)" in str(arg) for arg in args)
@@ -209,6 +210,9 @@ def test_follow_job_runs_with_the_api_realtime_settings_and_keeps_its_other_env(
             return {"name": "execution"}
         if "/executions/" in path:
             return {"properties": {"status": "Succeeded"}}
+        if "/containerApps/" in path:  # the API app sync's switch check reads: stage.json has 2d-i on
+            return {"properties": {"configuration": {"activeRevisionsMode": "Single"}, "template": {"containers": [
+                {"env": [{"name": "FA_NATIVE_SESSION_GUARD_ENFORCE", "value": "1"}]}]}}}
         return {"properties": {"template": {"containers": [{"name": "sync", "resources": {}, "env": [
             {"name": "FA_REALTIME_ENDPOINT", "value": "stale"}, {"name": "KEEP", "secretRef": "kept"}]}]}}}
     monkeypatch.setattr(module, "rest", rest)

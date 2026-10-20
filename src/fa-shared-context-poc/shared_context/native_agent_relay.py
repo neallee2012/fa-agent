@@ -13,6 +13,7 @@ from .behavior_native_turn_wire import (
 from .behavior_server_config import ServerAgentScope
 from .behavior_team_registry import same_team_recipient
 from .errors import Problem
+from .native_markers import EARLIER_VERSION_UNFINISHED
 from .native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE
 
 def _sender(principal: BehaviorPrincipal, scope: ServerAgentScope, receipt: NativeReceipt, *, status: str | None):
@@ -169,6 +170,13 @@ def prepare_outcome(
             or original.conversation_id != sender.conversation_id or origin.sender.agent_id != recipient.target.agent_id):
         raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "the original peer request is required")
     outcome = outcome_reference(sender)
+    if outcome.failure_code == EARLIER_VERSION_UNFINISHED:
+        # ADR-0009 §8 (總協調 2026-10-19): ``refused:<RID>`` guarantees it never ran, so the owner's meaning holds.
+        content = (f"對方沒有執行這次交辦（{outcome.failure_code}）：它是對方較早的版本接下的，目前環境無法接續；"
+                   "可以用新的交辦再送一次。")
+    else:
+        content = (f"對方的原回合結果未確認（{outcome.failure_code}）。這不表示對方已停止或沒有外部效果；"
+                   "請勿重新交辦原工作。")
     source = NativeAgentOrigin(
         kind="agent_notice", message_kind="blocked", message_id=origin.message_id,
         sender=_address(sender), recipient_agent_id=recipient.target.agent_id, root_id=origin.root_id,
@@ -177,6 +185,5 @@ def prepare_outcome(
     return NativeAgentReceive(
         command=NativeAgentCommand(
             request_id=origin.message_id, conversation_id=origin.sender.conversation_id, model=capture.model.id,
-            content=f"對方的原回合結果未確認（{outcome.failure_code}）。這不表示對方已停止或沒有外部效果；"
-                    "請勿重新交辦原工作。"),
+            content=content),
         capture=capture, source=source)

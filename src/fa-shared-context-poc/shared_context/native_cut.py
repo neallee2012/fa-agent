@@ -101,6 +101,13 @@ def turn_ended(composition, control, receipt):
         log.warning("NATIVE_UPGRADE_CUT_HOOK_FAILED code=%s agent_id=%s", type(error).__name__, receipt.agent_id)
 
 
+def send_refused(composition, control, agent_id):
+    """ADR-0009 §3 P1 (2026-10-18): an older image refused a new RID before admission (a prompt or profile it lacks),
+    so no turn end comes to trigger the cut. Each refused request hands the Agent over once; the key is unique, so the
+    same RID resent by a later request tries again while no attempt runs."""
+    native_cut_driver(composition).turn_ended(control, agent_id, object())
+
+
 def fence_command(composition, agent_id, *, clear=False):
     """Operator CLI (``agent-versions fence``, ADR-0009 2d-i P9 gate): one Agent's binding row as the fence policy sees
     it: its current SID, the files fence it records (``upgrade``: destination, RID, start, FA's stop marker) and the

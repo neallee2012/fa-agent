@@ -346,7 +346,7 @@ async def verify_checkpoint(store, scope: NativeCheckpointScope, ref: NativeChec
 
 
 async def load_checkpoint(store, scope: NativeCheckpointScope, ref: NativeCheckpointRef, *, cache_root=None,
-                          checkpoint_profile=None) -> SdkState:
+                          checkpoint_profile=None, read_timeout=None) -> SdkState:
     ref = _reference(ref)
     _require_scope(scope, ref)
     _require_profile(ref, checkpoint_profile)
@@ -356,7 +356,7 @@ async def load_checkpoint(store, scope: NativeCheckpointScope, ref: NativeCheckp
             return _state_from(raw, ref)
         except Problem:
             pass  # a hot copy is never an authority; read the store instead
-    raw = await _read_segments(store, ref)
+    raw = await _read_segments(store, ref, read_timeout=read_timeout)
     state = _state_from(raw, ref)
     _write_cache(cache_root, ref, raw)
     return state

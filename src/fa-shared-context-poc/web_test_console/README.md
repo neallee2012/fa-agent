@@ -1,5 +1,7 @@
 # FA 本機工作台
 
+第一次用工作台：部署後怎麼打開、送第一則訊息、看批准卡和回條，見根目錄 README 的 [前 10 分鐘](../../../README.md#first-10-minutes)。本頁下面是逐次變更紀錄。
+
 ## 「待你處理」卡片重畫時保留原卡（dev 2026-10-18 現場，CODE/offline，未部署）
 
 - **現場**：每次 `render()` 都把輸入框上方的卡片區（`attention-dock`）整片丟掉重建（每次約 400 個節點）。內建瀏覽器每 6 秒觸發一次
@@ -754,7 +756,7 @@ dev 第 15 版（fdbb，09:20）：bridge 重啟後打開已完成的新對話�
 
 **保留（防重送與明顯錯誤）：**
 - 送出過的 RID 不再送：bridge `submit` 的 `RECONCILE_REQUIRED`。送出過的文字（結果 UNKNOWN、或同 RID 重送的結果 UNKNOWN／已接單）離開輸入框、留在它自己的回合裡（`renderComposer`），不會再按一下就用新 RID 送出同一段話；改寫成不同的文字就是新訊息。只有伺服器說「沒接單」（換版拒絕等同 RID 重送；其他拒絕是終態）或 `busy_refused`（終態沒執行）時文字才留著。
-- 同 RID 自動重送只給 `server_following: true` 的換版拒絕（409 `NATIVE_SESSION_CHANGED`／503 `AGENT_VERSION_FOLLOWING`），每 3 秒同 RID `submit-retry`、最多 10 分鐘；放棄後回合上仍有「以原內容重送」。其他 `not_dispatched` 拒絕是終態，像 `busy_refused`：bridge 拒絕同 RID 重送（403），回合上沒有重送鍵，可修改後用新 RID 再送（目前草稿的文字留在輸入框）。
+- 同 RID 自動重送只給 `server_following: true` 的換版拒絕（409 `NATIVE_SESSION_CHANGED`／503 `AGENT_VERSION_FOLLOWING`），以及 Hosted 等舊 SDK runtime 結束時的 503 `NATIVE_EXECUTION_UNAVAILABLE`（#903），每 3 秒同 RID `submit-retry`、最多 10 分鐘；放棄後回合上仍有「以原內容重送」。其他 `not_dispatched` 拒絕是終態，像 `busy_refused`：bridge 拒絕同 RID 重送（403），回合上沒有重送鍵，可修改後用新 RID 再送（目前草稿的文字留在輸入框）。
 - 送出（或換版的同 RID 重送）結果 UNKNOWN、而 Hosted 讀回說沒有這個 RID（`NATIVE_RID_MISSING`，回應在建立前就遺失）：這筆維持 UNKNOWN、不重送，錯誤顯示在它自己的回合上，整段讀取照常讀完其餘部分。
 - 伺服器已經回報的 `continuation_blocker`（整段讀取時讀到）照樣顯示並擋住輸入框：這是伺服器的回答，不是工作台自己猜。
 - 伺服器說 `not_dispatched: true` 且 `request_id` 相符（API #680，同一次發布；只在確定沒送出、沒建立 `rid:<RID>` 時才帶，4xx 或「不確定的是換版動作」的 5xx 都可能）時，保留伺服器的原碼、記成「未接單」，整段讀取不再去讀這個 RID。本機還沒有句子的碼先用通用句。不帶這個欄位的 5xx 或不確定回應照舊記 UNKNOWN、不重送。
@@ -1417,14 +1419,22 @@ FA不自行實作credential injection；connection分類是原薄API的選項／
 - **顯示：** 輸入框下方 `#environment-note`（`role="status"`，與「已換成某模型」同一排），不是錯誤區、不進聊天泡泡；
   顯示到這位助理下一則被接下、且沒帶通知的訊息為止（重新整理後不再顯示：API 已清掉，這是「看到一次」）。句子照 ADR §8 原文：
   `environment_updated`「助理已更新到新版本，工作檔也一起帶過來了。」；`environment_switched_without_files`
-  「已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。」；`environment_source_retired`「已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。」；
-  `platform_version_changed`「平台把助理的執行環境換成了另一個版本（vX→vY）；FA 已記錄，相容就照常執行。」（後兩句與 M4
-  退回句仍待 Neal 確認）。「較早的版本接下的……」照舊在那則訊息的處理狀態裡顯示。
+  「上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。」；`environment_source_retired`「上次換環境時，舊環境已失效或被平台刪除，沒有搬工作檔；之前 VM 裡的工作檔可能已經不在了。」；
+  `platform_version_changed`「平台把助理的執行環境換成了另一個版本（vX→vY）；FA 已記錄，相容就照常執行。」；
+  `environment_rolled_back`（phase 4d crash-loop 退回）「助理已退回先前的版本；剛才中斷的訊息請再送一次。」（Neal 2026-10-19
+  決定）；帶 `without_files: true` 時（退回沒帶工作檔，M4 的 A 第 1 項）句後接不搬檔那句；
+  `environment_upgrade_vetoed`（phase 4b-4，新版本 3 次沒通過健康檢查）「助理這次沒有更新，會繼續使用目前的版本。」（Neal 2026-10-19 決定，不帶版本號）
+  （`platform_version_changed` 與「舊環境已失效」兩句仍待 Neal 確認）。「較早的版本接下的……」照舊在那則訊息的處理狀態裡顯示。
+  **「有新版本 vN，會在助理閒置時更新。」**（phase 6a (c)，延後超過 6 小時；不是通知種類）：API 在回應的 `native_receipt.upgrade_waiting_version`
+  帶版本號，bridge 原樣投影，同一個 `#environment-note` 顯示；console 的 API 請求在 `X-FA-Notice-Kinds: 2` 之外另帶 `X-FA-Upgrade-Waiting: 1`，沒有後者的舊 console 收不到也不會讓 API 清掉。
+  槽裡有上面的通知時先送通知，這句留到下一則回應。
 - **換版中：** 同 RID 自動重送期間，「助理正在換到新版本……完成後會自動送出」在自動重送開始 30 秒後
   （`SERVER_FOLLOWING_QUIET_MS`，ADR-0009 M4 的 A 第 4 項）才出現；短暫換版只看到訊息照常送出。
-- **版本差異：** 沒有部署順序要求。bridge 的每個 API 請求帶 `X-FA-Notice-Kinds: 2`（`adapter.py`），API 只對帶這個
-  header 的主人 submit 送三種換環境通知並清除；部署中 API 已更新、工作台還是舊 bridge 時，舊 bridge 不帶 header，
-  只會拿到它認得的漂移通知，不會 502，通知也不清（[共用 README](../README.md#g-phase2c-clear)）。另外 bridge 解回條時，
+- **版本差異：** 沒有部署順序要求。bridge 的每個 API 請求帶 `X-FA-Notice-Kinds: 2`、`X-FA-Upgrade-Waiting: 1`、phase 4d 的
+  `X-FA-Rollback-Notice: 1` 與 phase 4b-4 的 `X-FA-Upgrade-Vetoed-Notice: 1`（`adapter.py`），API 只對帶第一個的主人 submit 送換環境通知並清除，另帶第二個才送並清除 6 小時的「有新版本」，
+  另帶第三個才送並清除「已退回」，另帶第四個才送並清除「沒有更新」；部署中 API 已更新、工作台還是舊 bridge 時，舊 bridge 不帶 header（或少帶後兩個），只會拿到它認得的通知，
+  不會 502，它收不到的也不清（[共用 README](../README.md#g-phase2c-clear)）。工作台先上線、API 還是舊版時，舊 API 照樣認得
+  `X-FA-Notice-Kinds: 2`、不理會另外三個 header，換環境通知照常顯示並清除。另外 bridge 解回條時，
   不認識的通知（更新的 API 的新種類或新欄位）直接略過，不回 502 `NATIVE_STATE_INVALID`；回條其他內容照舊嚴格核對。
   頁面也只顯示認識的種類。
 
@@ -1459,7 +1469,7 @@ ready後只有當次真正按送出、且被換版拒絕未接單的那則訊息
 技術入口重入既有CHECKING時，scan／accepted／admission／task的合法等待共用相同原因集合；
 原confirm ID、body、來源／目標與每批10次仍須一致，不把task等待報成環境衝突。
 
-ready後通知原句：「已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。」
+ready後通知原句：「上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。」
 沿#595的同Agent／目標／observer守衛，不讓舊成功蓋掉後來UNKNOWN。舊bridge無policy識別時維持相容UI。
 來源／自動決定與限制見[Shared README](../README.md#automatic-environment-policy)。
 已用原DOM runner覆蓋草稿附件、載入、HITL及批次喚醒；未修改主題、登入/卡片DOM或進行live操作。
@@ -2167,7 +2177,9 @@ template export／`new_conversation_template` 及原 `select_profile`；fresh si
   另做純GET；unknown可手動「核對追加」，沒有自動POST。重開controller可沿journal找回原ID。
 - 追加顯示在原回合內，區分已保存、尚未確認套用、SDK已套用、同一回合中接著處理（queued）、未套用及unknown；
   不拿message ID當完成，也不把queued說成另一筆普通交辦。未套用且 `reason=turn_finished`（確定沒有送達，例如回覆已顯示、
-  回合還沒存成 completed 的尾段送出的追加）由本頁在回合結束後自動以新 RID 當下一則送出一次（2026-10-16，G 計畫「不掉訊息」；
+  回合還沒存成 completed 的尾段送出的追加）由本頁自動以新 RID 當下一則送出一次（2026-10-16，G 計畫「不掉訊息」；
+  2026-10-19 起 Hosted 在最後一輪 SDK 結束時就回這個結果；`foundry-native-v1` 上本頁不再等原回合結束，Hosted 把新回合排在原回合之後，
+  Responses 沒有佇列（原回合未結束時會 `busy_refused`），照舊等原回合結束才送；多則追加照追加順序送；
   只有結果未知才不能換 ID），只送那段文字、不帶附件；輸入框或附件已有其他草稿時不送，改留「帶回輸入框」給真人按，
   不覆蓋已輸入的其他草稿；重新整理後不再自動送。其他原因（例如按「停止」後的 `cancelled`）不自動送，只留「帶回輸入框」。
   unknown只有查讀。

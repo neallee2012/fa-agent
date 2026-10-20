@@ -71,7 +71,11 @@ def test_defaults_only_use_keys_and_values_the_stage_profile_already_has(azd_pro
     base = azd_profile.defaults()
     for section in ("api_environment", "assistant_environment", "console_environment"):
         assert set(base[section]) <= set(stage[section]), section
-        assert all(stage[section][key] == value for key, value in base[section].items()), section
+        assert all(stage[section][key] == value for key, value in base[section].items()
+                   if key != "FA_NATIVE_SESSION_GUARD_ENFORCE"), section
+    # The one exception: stage has 2d-i on, a new environment starts off (FA_NATIVE_2DI opts in, tested below).
+    assert (base["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"],
+            stage["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"]) == ("0", "1")
     assert base["conversation_defaults"] == stage["conversation_defaults"]
     # A subset, like the sections above: stage may turn on more than a new azd environment starts with.
     overlay = stage["agents"][0]["hosted_environment"]

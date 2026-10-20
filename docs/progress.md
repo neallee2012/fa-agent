@@ -4,6 +4,62 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="stage-v31-1018"></a>
+## 2026-10-18：stage 第 31 版（2026.10.18-31）部署與冒煙
+
+- **範圍**：release PR #895，合併 commit `ede25cbc`（20:22:45）。合併由總協調代為執行，總協調回報已取得 Neal 授權；這項授權在 repo 裡查不到。這一版在 stage 走開關關閉的路徑（`FA_NATIVE_SESSION_GUARD_ENFORCE="0"`）：2d-i 隨版本帶上，但沒有啟用。
+- **時間與證據**：本節時間皆為 +08。數字與結論來自部署線回報，原始 log 與畫面不在 repo；SID 只寫前綴。冒煙範圍由 Neal 核准，工作台由 Neal 自己登入（部署完成後才登入）。這次沒有讀費用。
+- **部署讀回**：
+  - deploy-staging run 39127030150 成功，時間 20:22:47～20:39:09。API revision `…ede25cb-r119-1` 在 20:34:15 ready，狀態 Healthy、流量 100%。core 是 `3372b304`。
+  - Agent 定義：A／B／C／D 都到 v82，fa-agent 到 v30，全部指向新 Hosted image `f4395182`。A 實際跑的版本見下方「未解決」。
+  - A、B 的回合仍是 `foundry-native-v1`，`FA_NATIVE_MODEL_SWITCH="1"`。API 設定是 `FA_NATIVE_SESSION_GUARD_ENFORCE="0"`、`FA_NATIVE_UPGRADE_RECONCILER="0"`。
+  - 相容性閘門 20:25:28：armed=False、override=False，結果是「decision: pass or observe」。
+  - follow 20:38:16：
+    - A 81→82：回報 ready，164.1 秒。
+    - B 81→82：ready，61.0 秒。
+    - fa-agent 29→30：ready，16.5 秒。
+    - 以上三個都是 `files_migrated=false`、reason=source、`model_started=false`。
+    - C、D（executor）skipped，原因是 `AGENT_SCOPE_MISSING`。
+- **7 沒有建立新資源 PASS**：
+  - 部署 log 裡沒有任何 Bicep 或 deployment create。API 沒有 snapshot 容器的環境變數。stage 的 `upgrade-snapshots.stage.parameters.json` 是 `deployUpgradeSnapshots=false`。
+  - 20:20～20:46 的 Activity Log：stage 資源群組只有 3 次 `containerApps/write` 和 3 次 `jobs/start`。部署步驟依序更新 API、工作台、feed，和這 3 次 write 對得上。`rg-faexample` 沒有任何紀錄。
+- **6 public-sync PASS**：run 39128177206 成功（20:44:18）。公開 tag 是 `v2026.10.18-31`，第一道指紋相符，第二道 PASS（公開樹 `009dbd71`）。[公開紀錄](public-sync.md#公開紀錄)這次還沒補，本行依 run log。
+- **冒煙**（時間為第一個字／完成，共 9 則）：
+  - **1 換環境**：B PASS；A 部分（新 SID 實際是 v81）。
+    - 部署後第一則：A 舊對話 14.9／18.0 秒，B 舊對話 10.8／13.0 秒。
+    - 兩邊都只在第一則顯示一次 #850 的新文字「已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。」。
+    - 第二則不再出現：A 8.5 秒，B 8.5／11.3 秒。
+    - API log 有兩筆 `NATIVE_ENVIRONMENT_NOTICE_CLEARED`：21:48:02（A）、21:49:50（B）。
+    - A 這次的提示，內容和實際版本不符（見「未解決」）。
+  - **2 #880 部分（自然觀察）**：
+    - 預定的做法是部署前先讓一個 Agent 保持執行中，沒有做到，因為那時工作台還沒登入。所以沒有觀察到「部署當下正在跑」的 session。
+    - 實際看到的：A 的 v81 SID 跑舊 image，建立於 20:35:35，也就是新 API ready 之後。它在新 API 下跑了 6 個回合，畫面上都完成；其中 2 則有 `NATIVE_STREAM_NOT_STARTED`（見備註）。新 API 的 log 裡沒有任何 `SDK_START_GATE_CODE_CHANGED`。
+  - **3 #878 PASS**：follow 沒有回任何 403。
+  - **4 #889**：未觀察到「請用新訊息再送一次」。
+  - **5 #894 拒絕 PASS，允許未測**：
+    - A 新對話的排程提議卡在 21:54:27 出現。
+    - 觀察 20 秒，卡片是同一個 DOM 節點。手動觸發 3 次 `visibilitychange` 後，卡片和「拒絕」按鈕仍是原本的元素。
+    - 按「拒絕」一次就生效，助理回覆「每日台灣時間 23:59 回覆「stage31 測試」的排程提案已被拒絕，未建立排程，也不會重送。」
+    - 「允許這次」沒有按：在 stage 按下去會建立排程；這次能出卡的只有排程提議。
+  - **其他**：
+    - B 新對話：`run_command` 8 秒完成，用瀏覽器開網頁 8 秒完成；兩者都依 Team 規則自動允許，沒有出批准卡。
+    - A→B 交辦：A 16.8 秒完成，B 的回覆在 A 完成後 19.6 秒自動出現，不用重新整理。
+    - WebIQ 查天氣：14.8／20.4 秒，回覆引用中央氣象署。
+  - **送出 RTT**（n=9，樣本少，只供參考；沒有第 30 版基準，不判斷快慢）：
+    - `api_submit`：p50 2,065 ms，p95 2,594 ms。
+    - `api_submit_session`：p50 275 ms，p95 553 ms。
+    - `api_submit_context`：p50 144 ms，p95 203 ms。
+  - **備註**：
+    - 新 API 有 3 次 `NATIVE_TURN_REFUSED code=NATIVE_STREAM_NOT_STARTED`。串流沒開成，工作台改用讀取，這 3 個回合畫面上都完成了。
+    - 21:47:23 工作台讀 A 的已收訊息時，回 409 `NATIVE_SESSION_CHANGED`（`NATIVE_INVOCATION_FAILURE` native_operation=received）。這是一次讀取，不是送出的回合。
+- **A 部署後的新 SID 跑在 v81**（原因：平台閒置恢復時版本漂移（見 [ADR-0009 平台實際行為 2026-10-18](adr/0009-version-model-g-actual-version-idle-upgrade.md)），補救靠第 32 版在 stage 打開 GUARD 後的背景換版）：
+  - follow 回報 A 在 v82 ready，新 SID 是 `fa-native-8efce15e…`。但平台讀回這個 SID：active、`version_indicator` v81，建立時間 20:35:35。
+  - 21:47:23 有一筆 `NATIVE_VERSION_OBSERVED created_version=82 observed_version=81 drift=True`。
+  - 對照組：A、B 的 selector 都是 82（FixedRatio 100%）。B 的新 SID `ad2abcf2` 是 v82。
+  - stage 的開關是關的，沒有回合結束後的背景換版，所以 A 停在 v81，直到第 32 版開 GUARD。
+  - 和 [dev 的 157→156](#dev-test-v31-1018) 比：兩次觀察到的版本都比建立版本少 1。dev 開著 2d-i，回合結束的換版會把它換到 selector 的版本；stage 沒有這一步。兩次看起來同類，但 dev 那次沒有逐項核對。
+  - 總協調決定先維持原狀：A 服務正常；現在重建可能又建出 v81。之後若要替 A 重建 session，需要 Neal 核准。部署線沒有更動 stage。
+
 <a id="dev-test-v31-1018"></a>
 ## 2026-10-16～18：第 31 版候選 dev 測試（ADR-0009 2d-i，最後在 main `ae3d30e9`，部署線）
 

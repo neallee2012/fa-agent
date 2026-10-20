@@ -649,7 +649,7 @@ Neal原話 **10:22:31（台灣時間）**：
   空白新對話與只有舊ready的首次載入也先純讀目標；`unverified`不等於可換版。
   後來的回覆／目標觀察使舊讀回失效，不能由晚到ready蓋掉新UNKNOWN或已讀原回覆。
 - 正常畫面不顯示兩個人工環境按鈕；未解的真正UNKNOWN才在「環境詳細」保留技術控制。
-  ready後唯一通知為「已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。」（Neal 2026-10-15 改句）
+  ready後唯一通知為「上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。」（Neal 2026-10-15 改句）
   新bridge固定宣告policy識別，舊bridge沒有此契約時仍沿原相容UI，不由新HTML猜server能力。
 - routines先保原occurrence intent，再跟版；environment_pending不是N1接單回條。
   producer每批最多10次，唯讀原進度有變化才續下一批；無變化保留due reference，交既有下一次clock tick，
@@ -1576,6 +1576,10 @@ unknown/started/queued與舊lane不重送。follow登錄失ACK仍保留B已確�
 SDK send只回message ID，不代表已套用；須以原`user.message`事件的messageId／delivery核對。
 一次send-token CAS後不盲送第二次；SDK或保存結果不明只查原追加ID。
 尚未送入SDK且原回合已結束時明示未套用；已嘗試但缺可核回執則保留unknown，不冒稱未執行。
+（2026-10-19 總協調決定：「原回合已結束」也包括本程序執行該RID、SDK追加通道已關（最後一輪SDK已結束）的時候；
+追加當下就回`not_applied`／`turn_finished`，不等SDK停止與checkpoint保存，同一筆寫入也把更早、通道沒收到的`accepted`追加依序判為未套用；
+回合仍照原順序保存後才標completed。工作台依追加順序以新RID送出：`foundry-native-v1`隨即送出（Hosted排在原回合之後），
+Responses沒有佇列（原回合未結束時人的新回合會`busy_refused`），所以等原回合結束才送。）
 取消仍獨立受理、優先停止，不等待追加RPC或模型槽；原RID與控制紀錄皆保留。
 舊Table lane不受此片影響。
 

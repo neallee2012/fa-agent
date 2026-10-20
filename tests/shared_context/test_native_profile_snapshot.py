@@ -75,7 +75,7 @@ WIRE_MODULES = ("behavior_wire", "behavior_native_turn_wire", "behavior_native_a
 # fastapi, which requirements-hosted.txt does not install; native_cut is the API's turn-end trigger.
 API_ONLY_MODULES = frozenset({"native_binding", "native_cut", "native_deploy_gate", "native_session_patrol",
                               "native_relay_quota", "native_groups", "native_hitl", "native_hitl_material",
-                              "native_routines", "native_teams_relay"})
+                              "native_routines", "native_teams_relay", "native_version_veto"})
 PINNED_PACKAGES = re.compile(r"^(github-copilot-sdk|azure-ai-agentserver-[a-z]+)==\S+$")
 # What an H2d runtime declares (``FA_NATIVE_TURNS``) and labels ``_Meta`` with; ``_Meta``'s default stays v1 (unlabeled
 # items read as v1), so the label is written explicitly by the runtime.
@@ -259,8 +259,28 @@ V2_BASELINE = Path(__file__).parent / "fixtures" / "native_v2_wire_8a8608dd.json
 # _digest of the whole fixture; moves only with v2_baseline_text (module docstring)
 V2_BASELINE_SHA256 = "9bf0627d7b4af50c6f74f96739dad0d95900ce502bdb208cb5a30bcbf3eb6e09"
 # The only exception to "nothing may be added under v2": an exact ``... added`` problem of v2_drift for a value release
-# 31 images provably never receive, each with that proof in a comment. Empty: nothing has needed it.
-V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE = frozenset()
+# 31 images provably never receive, each with that proof in a comment.
+V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE = frozenset({
+    # ADR-0009 4d's 已退回 notice kind. No Hosted image ever receives or stores it: (a) no NATIVE_REQUEST variant
+    # carries a receipt or a notice (this change leaves the snapshot's ``native_request`` part unchanged); (b) Hosted
+    # builds NativeEnvironmentNotice only as ``earlier_version_unfinished``, on a read-time view (``native_turns``
+    # ``_refused_view``), never into a stored ``_Rid``; (c) the API sets the slot kinds only on its own response copy
+    # (``NativeTurnGateway._bound``'s ``model_copy``, the Teams ``RelayReply``), never into a session command.
+    "behavior_native_turn_wire.NativeEnvironmentNotice.kind: enum value 'environment_rolled_back' added",
+    "behavior_native_turn_wire.NativeReceipt.environment_notice<NativeEnvironmentNotice>.kind: enum value 'environment_rolled_back' added",
+    "behavior_native_turn_wire.NativeTurnStatus.receipt<NativeReceipt>.environment_notice<NativeEnvironmentNotice>.kind: enum value 'environment_rolled_back' added",
+    "native_group_wire.NativeGroupActivity.turns.items<NativeReceipt>.environment_notice<NativeEnvironmentNotice>.kind: enum value 'environment_rolled_back' added",
+    "native_group_wire.NativeGroupStarted.receipt<NativeReceipt>.environment_notice<NativeEnvironmentNotice>.kind: enum value 'environment_rolled_back' added",
+    "native_turns._Rid.receipt<NativeReceipt>.environment_notice<NativeEnvironmentNotice>.kind: enum value 'environment_rolled_back' added",
+    # ADR-0009 4b-4's 沒有更新 notice kind, by the same proof (a)-(c): it is another slot kind the API sets only on its
+    # own response copy (``_bound``, the Teams ``RelayReply``); the snapshot's ``native_request`` part is unchanged.
+    "behavior_native_turn_wire.NativeEnvironmentNotice.kind: enum value 'environment_upgrade_vetoed' added",
+    "behavior_native_turn_wire.NativeReceipt.environment_notice<NativeEnvironmentNotice>.kind: enum value 'environment_upgrade_vetoed' added",
+    "behavior_native_turn_wire.NativeTurnStatus.receipt<NativeReceipt>.environment_notice<NativeEnvironmentNotice>.kind: enum value 'environment_upgrade_vetoed' added",
+    "native_group_wire.NativeGroupActivity.turns.items<NativeReceipt>.environment_notice<NativeEnvironmentNotice>.kind: enum value 'environment_upgrade_vetoed' added",
+    "native_group_wire.NativeGroupStarted.receipt<NativeReceipt>.environment_notice<NativeEnvironmentNotice>.kind: enum value 'environment_upgrade_vetoed' added",
+    "native_turns._Rid.receipt<NativeReceipt>.environment_notice<NativeEnvironmentNotice>.kind: enum value 'environment_upgrade_vetoed' added",
+})
 V1_ITEMS = {  # how a stored v1 item is decoded again; its canonical bytes must not move
     "submit": lambda text: NATIVE_REQUEST.validate_json(text),
     "agent_receive": lambda text: NATIVE_REQUEST.validate_json(text),
@@ -385,11 +405,12 @@ def _v2_baseline():
     return json.loads(V2_BASELINE.read_text(encoding="utf-8"))
 
 
-def wire_drift(h0, schema, classes, root_fields, root, may_grow=True):
+def wire_drift(h0, schema, classes, root_fields, root, may_grow=True, prefix=""):
     """How ``schema`` (current, with its own ``$defs``) is not additive over the H0 schema ``root``.
 
     ``may_grow``: whether an enum / Literal may gain values and a union of models (the request) may gain models. H0:
-    yes (M1). v2: no, a release 31 image rejects the value it does not know (literal_error / union_tag_invalid)."""
+    yes (M1). v2: no, a release 31 image rejects the value it does not know (literal_error / union_tag_invalid).
+    ``prefix``: what the caller puts before each problem, so a listed value is recognised inside a union too."""
     new_defs = schema.get("$defs", {})
 
     def enum(node):  # a one-value Literal is ``const``; widening it turns it into ``enum``
@@ -418,10 +439,12 @@ def wire_drift(h0, schema, classes, root_fields, root, may_grow=True):
                                             for candidate in new_variants or [new]), key=len)]
             # a union of models only (the request/command level) may gain models; any other new variant H0 must read
             models = all("$ref" in variant for variant in old_variants)
+            # A candidate whose only differences are listed added values is the old variant, not a new one.
             return problems + [f"{where}: new union variant {json.dumps(candidate, sort_keys=True)} H0 cannot read"
                                for candidate in new_variants or [new]
                                if not (may_grow and models and "$ref" in candidate)
-                               and all(walk(variant, candidate, where, owner, path) for variant in old_variants)]
+                               and all(_unlisted([prefix + problem for problem in walk(
+                                   variant, candidate, where, owner, path)]) for variant in old_variants)]
         kinds = root_fields if owner is None else h0["def_fields"].get(owner, {})
         live = classes.get(owner)
         now = {name: _kind(field) for name, field in live.model_fields.items()} if live else {}
@@ -469,11 +492,15 @@ def v1_drift():
     return _drift(_h0())
 
 
+def _unlisted(problems):
+    return [problem for problem in problems
+            if not (problem.endswith(" added") and problem in V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE)]
+
+
 def v2_drift():
     """Every way the code imported now is not additive over the v2 baseline (2026-10-17 rule): H0's comparator, but no
     enum / Literal value, request variant or model may be added either; a new optional field left out by default may."""
-    return [problem for problem in _drift(_v2_baseline(), may_grow=False)
-            if not (problem.endswith(" added") and problem in V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE)]
+    return _unlisted(_drift(_v2_baseline(), may_grow=False))
 
 
 def _drift(baseline, may_grow=True):
@@ -493,9 +520,10 @@ def _drift(baseline, may_grow=True):
             if schema not in seen:
                 seen.append(schema)
                 problems += [key + problem for problem in
-                             wire_drift(baseline, schema, classes, entry["fields"], entry["schema"], may_grow)]
+                             wire_drift(baseline, schema, classes, entry["fields"], entry["schema"], may_grow, key)]
     problems += ["NATIVE_REQUEST" + problem for problem in wire_drift(
-        baseline, _shape(NATIVE_REQUEST.json_schema()), _request_classes(), {}, baseline["native_request"], may_grow)]
+        baseline, _shape(NATIVE_REQUEST.json_schema()), _request_classes(), {}, baseline["native_request"], may_grow,
+        "NATIVE_REQUEST")]
     snapshot = _pins_and_codecs()
     problems += [f"{part} changed: {baseline[part]} -> {snapshot[part]}" for part in ("sdk", "checkpoint")
                  if snapshot[part] != baseline[part]]
@@ -657,8 +685,21 @@ def test_an_added_v2_literal_value_fails_unless_listed(monkeypatch):
         status=(typing.Literal["unknown", "busy_refused", "superseded"], ...)))
     added = "behavior_native_turn_wire.NativeOutcomeReference.status: enum value 'superseded' added"
     assert v2_drift() == [added]
-    monkeypatch.setitem(globals(), "V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE", frozenset({added}))
+    monkeypatch.setitem(globals(), "V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE",
+                        V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE | {added})
     assert v2_drift() == []
+
+
+def test_a_listed_value_inside_an_optional_model_is_not_a_new_union_variant(monkeypatch):
+    # ``NativeReceipt.environment_notice: NativeEnvironmentNotice | None`` gained 4d's listed kind: unlisted, the changed
+    # model also reads as a new variant of that union; listed, the old variant still accepts it and nothing is left
+    listed = V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE
+    assert v2_drift() == []
+    monkeypatch.setitem(globals(), "V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE", frozenset())
+    unlisted = v2_drift()
+    assert listed <= set(unlisted)
+    assert any(problem.startswith("behavior_native_turn_wire.NativeReceipt.environment_notice: new union variant")
+               for problem in set(unlisted) - listed)
 
 
 def test_a_new_v2_request_variant_or_model_fails(monkeypatch):

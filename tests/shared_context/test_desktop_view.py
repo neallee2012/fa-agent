@@ -14,6 +14,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from shared_context import behavior_desktop_capability as capability
 from shared_context import behavior_desktop_view as view
+from shared_context import behavior_desktop_view_api as broker
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_wire import HostedIdentity
 from test_behavior_desktop import ALLOWED_ENV
@@ -142,6 +143,26 @@ def test_text_frames_are_refused_because_rfb_is_binary():
         socket.send_text("hello")
         assert closed(socket) == (1003, "RFB_BINARY_ONLY")
     assert vnc.signals[:1] == ["terminate"] and vnc.input.empty()
+
+
+@pytest.mark.parametrize("finish", [view._finish, broker._finish], ids=["hosted", "api"])
+def test_a_cancelled_handler_still_finishes_its_cleanup_and_stays_cancelled(finish):
+    steps = []
+
+    async def cleanup():
+        for step in range(3):
+            await asyncio.sleep(0)
+            steps.append(step)
+
+    async def main():
+        handler = asyncio.ensure_future(finish(cleanup()))
+        for _ in range(3):  # cancelled again at every await, as the server's anyio cancel scope does
+            await asyncio.sleep(0)
+            handler.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await handler
+    asyncio.run(main())
+    assert steps == [0, 1, 2]
 
 
 def test_x11vnc_runs_on_the_owned_display_over_one_duplex_socket(monkeypatch):

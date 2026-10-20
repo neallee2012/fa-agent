@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "public
 from fingerprint import parse_fingerprint  # noqa: E402
 
 RELEASE_FILE = "deploy/stage/release.json"
+LIVE_CHANGES = {"ADDED", "MODIFIED", "RENAMED", "COPIED", "CHANGED"}  # GraphQL PatchStatus minus DELETED
 
 
 def refusal(data: dict, sha: str, named: str = "") -> str | None:
@@ -39,12 +40,17 @@ def refusal(data: dict, sha: str, named: str = "") -> str | None:
     if pr.get("lastEditedAt") and pr["lastEditedAt"] > pr["mergedAt"]:
         return f"#{pr['number']} was edited after it was merged; its body as merged cannot be confirmed"
     files = pr.get("files") or {}
-    paths = [n.get("path") for n in files.get("nodes") or []]
+    nodes = files.get("nodes") or []
+    paths = [n.get("path") for n in nodes]
     if RELEASE_FILE not in paths:
-        # Fail closed past the first page; a release PR changes only release.json.
+        # Fail closed past the first page; a release PR changes release.json, usually with other files.
         unread = files.get("totalCount", 0) > len(paths)
         return (f"#{pr['number']} is not a release PR: it did not change {RELEASE_FILE}"
                 + (f" (only its first {len(paths)} of {files['totalCount']} files were read)" if unread else ""))
+    # A deleted release.json still lists its path; only a known non-delete changeType counts (fail closed).
+    if not any(n.get("path") == RELEASE_FILE and n.get("changeType") in LIVE_CHANGES for n in nodes):
+        return (f"#{pr['number']} is not a release PR: it did not leave {RELEASE_FILE} in place "
+                "(deleted, or its change type is unknown)")
     if parse_fingerprint(pr.get("body") or "") is None:
         return (f"#{pr['number']} is not a release PR: its body has no single `public-sync fingerprint:` line "
                 "(gate 1, docs/public-sync.md)")

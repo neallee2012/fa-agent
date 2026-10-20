@@ -14,14 +14,14 @@ import pytest
 from azure.ai.projects.models import AgentSessionResource
 
 from conftest import InMemoryRepository
-from shared_context import behavior_native_sessions, native_binding
+from shared_context import behavior_native_sessions, behavior_native_turn_api, native_binding
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_foundry import FoundryHttpClient
 from shared_context.behavior_native_sessions import NativeSessions, native_session_id, native_sessions
 from shared_context.behavior_native_turn_api import NativeTurnGateway
 from shared_context.behavior_native_turn_wire import (
-    NOTICE_KINDS_HEADER, NOTICE_KINDS_VERSION, NativeEnvironmentNotice, NativeEnvironmentView, NativeReceipt,
-    before_dispatch,
+    NOTICE_KINDS_HEADER, NOTICE_KINDS_VERSION, UPGRADE_WAITING_HEADER, UPGRADE_WAITING_VERSION, NativeEnvironmentNotice,
+    NativeEnvironmentView, NativeReceipt, before_dispatch,
 )
 from shared_context.errors import Problem
 from shared_context.native_binding import NativeBindingStore, binding_store
@@ -68,6 +68,10 @@ class CountingRepository(InMemoryRepository):
                            lambda: super(CountingRepository, self).replace(team, row, payload, etag))
 
 
+# What this workbench bridge sends on every API request (`web_test_console/adapter.py`).
+CONSOLE = {NOTICE_KINDS_HEADER: NOTICE_KINDS_VERSION, UPGRADE_WAITING_HEADER: UPGRADE_WAITING_VERSION}
+
+
 @pytest.fixture
 def bound(native_api, monkeypatch):
     case = native_api
@@ -75,14 +79,20 @@ def bound(native_api, monkeypatch):
     monkeypatch.setattr(native_binding, "TableRepository", lambda _client: case.repository)
     case.store = binding_store(case.composition)
     case.agent_id, case.sid = case.remote.target.agent_id, case.remote.target.session_id
-    # A workbench bridge that decodes the phase 2c notice kinds; ``old_bridge`` removes the header again.
-    case.headers = {**case.headers, NOTICE_KINDS_HEADER: NOTICE_KINDS_VERSION}
+    # A workbench bridge that decodes the phase 2c notice kinds and the 6a (c) note; ``old_bridge`` removes them again.
+    case.headers = {**case.headers, **CONSOLE}
     return case
 
 
 def old_bridge(case):
     """A bridge deployed before phase 2c (a deploy updates the API first): no notice-kinds header."""
-    case.headers = {key: value for key, value in case.headers.items() if key != NOTICE_KINDS_HEADER}
+    case.headers = {key: value for key, value in case.headers.items() if key not in CONSOLE}
+
+
+def phase_2c_bridge(case):
+    """A bridge deployed before phase 6a (c): the phase 2c header only."""
+    case.headers = {key: value for key, value in case.headers.items() if key != UPGRADE_WAITING_HEADER}
+    case.headers[NOTICE_KINDS_HEADER] = "2"
 
 
 def row(case):
@@ -287,6 +297,8 @@ def test_non_owner_callers_never_carry_or_clear(bound):
 def test_follow_commit_moves_the_row_to_the_new_sid(bound, monkeypatch):
     case = bound
     source, calls, sessions, view = environment_at(case, monkeypatch)
+    # The source SID (created on 41) drifted to 40 and the row recorded it: the platform says 40 too (#892).
+    sessions[source.session_id] = source.model_copy(update={"agent_version": "40"})
     claim(case, observed="40")
     command = {"request_id": "follow-original", "expected_session_id": source.session_id, "expected_agent_version": "42"}
     ready = case.client.post(PREFIX + "/environment", json=command, headers=case.headers)
@@ -638,6 +650,21 @@ def test_owner_submit_carries_the_switch_notice_once_and_clears_it_after_writing
     assert again.status_code == 202 and "environment_notice" not in again.json()
 
 
+def test_the_switch_notice_is_not_sent_again_when_the_clock_does_not_tick_between_two_submits(bound, monkeypatch):
+    """#912 review P3: ``clear_notice`` must refresh the kept row as ``clear_waiting`` does; a tied monotonic() tick
+    (Windows, 15.6 ms) otherwise reuses the stale row that still holds the notice."""
+    case = bound
+    for module in (behavior_native_sessions, behavior_native_turn_api):  # the submit's start and the kept row's tick
+        monkeypatch.setattr(module, "monotonic", lambda: 1000.0)
+    case.store.record_switch(case.agent_id, switch_view(case, files_migrated=False, to=case.sid, version="41",
+                                                        previous="older"))
+    accepted = submit(case)
+    assert accepted.json()["environment_notice"] == {"kind": "environment_switched_without_files"}
+    case.remote.completed("native-rid")
+    again = submit(case, rid="native-rid-2", conversation_id="native-cid")
+    assert again.status_code == 202 and "environment_notice" not in again.json()
+
+
 def asgi_submit(case, events, send_fails=False):
     """POST /submit straight through the ASGI app; ``events`` records each message sent, in time order."""
     body = json.dumps(InstructionSubmit(request_id="native-rid", content="Original user text").model_dump(
@@ -768,7 +795,7 @@ def test_an_old_bridge_gets_todays_drift_notice_only_and_nothing_is_cleared(boun
         "kind": "platform_version_changed", "from_version": "41", "to_version": "40"}
     assert row(case).switch_notice == "without_files" and row(case).notice_pending is True
     case.remote.completed("native-rid")
-    case.headers = {**case.headers, NOTICE_KINDS_HEADER: NOTICE_KINDS_VERSION}  # the console is updated
+    case.headers = {**case.headers, **CONSOLE}  # the console is updated
     again = submit(case, rid="native-rid-2", conversation_id="native-cid")
     assert again.json()["environment_notice"] == {"kind": "environment_switched_without_files"}
     assert row(case).switch_notice is None and row(case).notice_pending is False
@@ -783,6 +810,61 @@ def test_an_old_bridge_with_only_a_switch_notice_pending_gets_no_notice(bound):
     accepted = submit(case)
     assert accepted.status_code == 202 and "environment_notice" not in accepted.json()
     assert row(case).switch_notice == "without_files"
+
+
+def pend_waiting(case):
+    """Phase 6a (c): U0's target 42 deferred over 6 hours, the reconciler's note pending in the slot."""
+    from shared_context.native_binding import NativeBindingIdleUpgrade
+
+    current, etag = case.store._read(case.agent_id)
+    waiting = NativeBindingIdleUpgrade(target_version="42", deferred_since="2026-10-13T00:00:00+00:00", waiting="pending")
+    case.repository.replace(case.store.partition_key, case.store.row_key(case.agent_id),
+                            current.model_copy(update={"idle_upgrade": waiting}).model_dump(mode="json"), etag)
+
+
+def test_the_waiting_note_reaches_only_a_6a_c_bridge_once_and_never_teams(bound):
+    case = bound
+    claim(case)
+    pend_waiting(case)
+    assert row(case).notice() is None, "Teams' owner read carries no waiting note"
+    phase_2c_bridge(case)
+    first = submit(case)
+    assert first.status_code == 202 and "upgrade_waiting_version" not in first.json()
+    assert row(case).idle_upgrade.waiting == "pending", "nothing it could not show was cleared"
+    case.remote.completed("native-rid")
+    case.headers = {**case.headers, **CONSOLE}
+    second = submit(case, rid="native-rid-2", conversation_id="native-cid")
+    assert second.json()["upgrade_waiting_version"] == "42" and "environment_notice" not in second.json()
+    assert row(case).idle_upgrade.waiting == "shown" and row(case).waiting_version() is None
+    case.remote.completed("native-rid-2")
+    third = submit(case, rid="native-rid-3", conversation_id="native-cid")
+    assert "upgrade_waiting_version" not in third.json()
+
+
+def test_no_waiting_note_once_the_platform_already_runs_the_target(bound):
+    """#908 review P3: ``record_observed`` keeps ``idle_upgrade`` when the platform moves the VM to v42 itself, so the
+    page must not say "有新版本 v42" while the Agent already runs v42."""
+    case = bound
+    claim(case)
+    pend_waiting(case)
+    assert row(case).waiting_version() == "42"
+    case.store.record_observed(case.agent_id, hosted_session_id=case.sid, agent_version="42", source="vm")
+    assert row(case).idle_upgrade.waiting == "pending" and row(case).waiting_version() is None
+
+
+def test_a_slot_notice_takes_the_status_line_before_the_waiting_note_and_a_2c_bridge_still_gets_it(bound):
+    case = bound
+    case.store.record_switch(case.agent_id, switch_view(case, files_migrated=False, to=case.sid, version="41",
+                                                        previous="older"))
+    pend_waiting(case)
+    phase_2c_bridge(case)
+    first = submit(case)
+    assert first.json()["environment_notice"] == {"kind": "environment_switched_without_files"}
+    assert "upgrade_waiting_version" not in first.json() and row(case).idle_upgrade.waiting == "pending"
+    case.remote.completed("native-rid")
+    case.headers = {**case.headers, **CONSOLE}
+    second = submit(case, rid="native-rid-2", conversation_id="native-cid")
+    assert second.json()["upgrade_waiting_version"] == "42" and row(case).idle_upgrade.waiting == "shown"
 
 
 def test_clearing_a_lost_fence_never_clears_the_newer_one_that_replaced_it():

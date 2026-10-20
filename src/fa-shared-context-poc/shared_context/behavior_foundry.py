@@ -88,6 +88,9 @@ _START_CODES = frozenset({
     "BEHAVIOR_CONFLICT", "BEHAVIOR_COMMIT_UNKNOWN",
     "CONVERSATION_SESSION_UNAVAILABLE", "CONVERSATION_SESSION_VERSION_CHANGED",
 })
+# The native operations Hosted admits a new RID through (``_submit_locked``) and the refusals it raises only before it.
+_ADMISSION_OPERATIONS = frozenset({"submit", "agent_receive", "routine_receive", "continue"})
+_PREFLIGHT_REFUSALS = frozenset({"NATIVE_CAPTURE_CHANGED", "NATIVE_PROFILE_UNSUPPORTED"})
 
 
 def _upstream_status(error):
@@ -243,16 +246,18 @@ class FoundryHttpClient:
         except AzureError as error:
             raise _session_failure(error,phase) from None
 
-    def stop_session(self):
-        """True when this stop was accepted; False when the platform says the session was already stopped."""
+    def stop_session(self,*,timeout=None):
+        """True when this stop was accepted; False when the platform says the session was already stopped.
+        ``timeout``: the transport's connection/read seconds (a background step's own bound) instead of azure-core's."""
         from azure.ai.projects import AIProjectClient
         from azure.core.exceptions import AzureError
         from .native_binding import check_session
         check_session(self,operation="stop_session")
         phase="client_init"
+        bounded={} if timeout is None else {"connection_timeout":min(timeout,5),"read_timeout":timeout}
         try:
             with AIProjectClient(endpoint=self.target.project_endpoint,credential=self.credential,
-                                 retry_total=0,retry_connect=0,retry_read=0,retry_status=0) as project:
+                                 retry_total=0,retry_connect=0,retry_read=0,retry_status=0,**bounded) as project:
                 phase="stop_session"
                 project.agents.stop_session(self.target.agent_name,self.target.session_id)
                 phase="client_close"
@@ -330,7 +335,7 @@ class FoundryHttpClient:
         action: Literal["start", "observe", "cancel", "turn"], body: bytes | None = None,
         probe_id: str | None = None, launch_permit: SecretStr | None = None, before_send=None,
         keepalive_launch_id: str | None = None,
-        native_operation: str | None = None, native_stage: str | None = None,
+        native_operation: str | None = None, native_stage: str | None = None, timeout: float | None = None,
     ) -> NativeResponse:
         native_turn = action == "turn"
         if native_turn:
@@ -391,7 +396,8 @@ class FoundryHttpClient:
         upstream_code = None
         files_check = None
         try:
-            with self.http.stream(method, url, params=params, headers=headers, content=body) as response:
+            with self.http.stream(method, url, params=params, headers=headers, content=body, **(
+                    {} if timeout is None else {"timeout": httpx.Timeout(timeout, connect=min(timeout, 10))})) as response:
                 phase = "response_status"
                 if response.status_code not in (200, 202) and not native_turn:
                     raise Problem(
@@ -431,20 +437,47 @@ class FoundryHttpClient:
                             # Only Hosted's submit marks a definite refusal before ``rid:<RID>`` exists; a refusal
                             # before dispatch (ADR-0009 §4) also names why (``reason``), which the phase 3 send flow
                             # uses to tell a same-SID version drift from a moved Agent record.
-                            not_dispatched = (native_operation == "submit" and error.get("not_dispatched") is True
-                                              and (400 <= response.status_code < 500 or code == "AGENT_VERSION_FOLLOWING"))
+                            # An earlier SDK runtime still exiting (#903) refuses an Agent message's receive the same way.
+                            not_dispatched = (error.get("not_dispatched") is True and (
+                                native_operation == "submit" and (400 <= response.status_code < 500
+                                                                  or code == "AGENT_VERSION_FOLLOWING")
+                                or native_operation in {"submit", "agent_receive"}
+                                and code == "NATIVE_EXECUTION_UNAVAILABLE")
+                                # ADR-0009 §3 P1: every image since the 9aaa0824 floor raises these
+                                # two only before rid:<RID> (preflight, conversation capture check),
+                                # also those before 580c980e that never set the field.
+                                or native_operation in _ADMISSION_OPERATIONS
+                                and response.status_code == 409 and code in _PREFLIGHT_REFUSALS)
                             reason = error.get("reason") if error.get("reason") in PRE_DISPATCH_REASONS else None
                             # ADR-0009 §4 step 6: a newer image names the VM's own version in its version refusal.
                             actual_version = error.get("actual_version")
                             reported = (code in {"NATIVE_SESSION_CHANGED", "NATIVE_TURNS_DISABLED"}
                                         and isinstance(actual_version, str)
                                         and re.fullmatch(r"[1-9][0-9]{0,15}", actual_version) is not None)
+                            # ADR-0009 4c-2: a replaced session names the Agent's current SID (error body only).
+                            current = error.get("current_hosted_session_id")
+                            named = (code == "NATIVE_SESSION_CHANGED" and isinstance(current, str)
+                                     and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", current) is not None)
+                            # ADR-0009 U3/U9: an image before #906 refuses the G0b-reserved commands with exactly this
+                            # message; any other NATIVE_REQUEST_INVALID is a refused request, not an older image.
+                            reserved = (code == "NATIVE_REQUEST_INVALID"
+                                        and native_operation in {"session_checkpoint_check", "session_prerestore"}
+                                        and error.get("message")
+                                        == f"{native_operation} is reserved; this image does not run it")
+                            # ADR-0009 5b: an image before it refuses a body with ``workspace``/``files_restore`` (its
+                            # wire forbids unknown fields) with exactly this message, after this API validated it.
+                            untyped = (code == "NATIVE_REQUEST_INVALID" and response.status_code == 422
+                                       and native_operation in {"session_read", "session_cut"}
+                                       and error.get("message") == "only the typed native request is accepted")
                             raise Problem(response.status_code, code,
                                           "the native agent refused this original command; no automatic retry",
                                           automatic_retry=False, **({} if files_check is None else {"files_check": files_check}),
                                           **({"not_dispatched": True} if not_dispatched else {}),
                                           **({"reason": reason} if reason is not None else {}),
-                                          **({"actual_version": actual_version} if reported else {}))
+                                          **({"actual_version": actual_version} if reported else {}),
+                                          **({"current_hosted_session_id": current} if named else {}),
+                                          **({"reserved": True} if reserved else {}),
+                                          **({"untyped": True} if untyped else {}))
                         raise Problem(503, "FOUNDRY_INVOCATION_UNKNOWN",
                                       "native invocation outcome is unknown; reconcile the original request",
                                       upstream_status=response.status_code)
@@ -495,8 +528,9 @@ class FoundryHttpClient:
                 raise
             raise Problem(503, "FOUNDRY_INVOCATION_UNKNOWN", "native transport outcome is unknown; do not resend") from None
 
-    def invoke_native(self, command, *, before_send=None) -> NativeResponse:
-        """All N1 reads and writes use the fixed invocation protocol; no launch, claim or invented call ID."""
+    def invoke_native(self, command, *, before_send=None, timeout=None) -> NativeResponse:
+        """All N1 reads and writes use the fixed invocation protocol; no launch, claim or invented call ID.
+        ``timeout``: seconds for this call instead of the client's (a background step's own bound)."""
         from .behavior_native_turn_wire import NATIVE_REQUEST, canonical_bytes
         from .native_binding import check_session
         operation = getattr(command, "operation", None)
@@ -510,7 +544,8 @@ class FoundryHttpClient:
         if len(body) > MAX_NATIVE_TURN_HTTP_BYTES:
             raise Problem(413, "NATIVE_REQUEST_TOO_LARGE", "the complete native command exceeds its transport bound")
         return self._request("POST", None, action="turn", body=body, before_send=before_send,
-                             native_operation=checked.operation, native_stage=getattr(checked, "stage", None))
+                             native_operation=checked.operation, native_stage=getattr(checked, "stage", None),
+                             timeout=timeout)
 
     def start(self, invocation_id: str, launch_id: str, binding_id: str, launch_permit: SecretStr, *, before_send=None) -> NativeResponse:
         if any(

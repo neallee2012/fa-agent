@@ -170,7 +170,7 @@ def switched(relay, monkeypatch):
     return store, target
 
 
-WITHOUT_FILES = "已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。"
+WITHOUT_FILES = "上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。"
 
 
 def test_the_final_reply_on_the_read_path_neither_shows_nor_clears_the_drift_notice(relay, monkeypatch):
@@ -182,6 +182,18 @@ def test_the_final_reply_on_the_read_path_neither_shows_nor_clears_the_drift_not
     assert done.json() == {"state": "done", "text": "三件事。"}
     # Left for the workbench, which shows it in its status field and clears it there.
     assert store.read(target.agent_id).notice_pending is True
+    assert len(submits(relay.env)) == 1
+
+
+def test_the_final_reply_on_the_read_path_neither_shows_nor_clears_the_vetoed_notice(relay, monkeypatch):
+    """ADR-0009 M4.6: U3's veto "沒有更新" is the workbench status field's only; a Teams user never knew an update waited."""
+    store, target = drifted(relay, monkeypatch)
+    store.record_veto(target.agent_id, hosted_session_id=target.session_id, agent_version="42", notice=True)
+    assert store.read(target.agent_id).switch_notice == "vetoed"
+    assert relay.post().json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。"}
+    complete(relay.env, rid("act-1"), "三件事。")
+    assert relay.post().json() == {"state": "done", "text": "三件事。"}  # no sentence, no environment_notice
+    assert store.read(target.agent_id).switch_notice == "vetoed"  # left for the workbench
     assert len(submits(relay.env)) == 1
 
 
@@ -223,6 +235,38 @@ def test_same_activity_resent_reads_the_original_turn_and_never_submits_again(re
         assert relay.post().json()["state"] == "running"
     assert len(submits(relay.env)) == 1
     assert list(relay.env.case.remote.records) == [rid("act-1")]
+
+
+def lose_reads(monkeypatch, errors):
+    """The receipt read raises each of ``errors`` in turn, then answers; returns the RIDs it was asked for."""
+    from shared_context.native_teams_relay import NativeTurnGateway
+    read, queue, asked = NativeTurnGateway.read, list(errors), []
+
+    def flaky(self, principal, command):
+        asked.append(command.request_id)
+        if queue:
+            raise queue.pop(0)
+        return read(self, principal, command)
+
+    monkeypatch.setattr(NativeTurnGateway, "read", flaky)
+    return asked
+
+
+def test_a_receipt_read_that_lost_its_cas_race_is_read_again_with_the_same_rid(relay, monkeypatch):
+    assert relay.post().json()["state"] == "running"
+    asked = lose_reads(monkeypatch, [Problem(412, "BEHAVIOR_CONFLICT", "synthetic: lost the usage write")] * 2)
+    complete(relay.env, rid("act-1"), "三件事。")
+    assert relay.post().json() == {"state": "done", "text": "三件事。"}
+    assert asked[:3] == [rid("act-1")] * 3 and len(submits(relay.env)) == 1  # then the reply text is read
+
+
+def test_a_receipt_read_that_keeps_losing_stops_after_a_bound_and_a_409_is_not_read_again(relay, monkeypatch):
+    assert relay.post().json()["state"] == "running"
+    asked = lose_reads(monkeypatch, [Problem(412, "BEHAVIOR_CONFLICT", "synthetic")] * 9)
+    assert relay.post().status_code == 412 and len(asked) == 4
+    asked = lose_reads(monkeypatch, [Problem(409, "BEHAVIOR_CONFLICT", "synthetic: a real conflict")])
+    assert relay.post().status_code == 409 and len(asked) == 1
+    assert len(submits(relay.env)) == 1
 
 
 def test_the_same_activity_id_in_another_chat_is_its_own_turn(relay):
@@ -354,14 +398,37 @@ def test_a_message_while_the_selected_version_has_no_session_waits_and_is_sent_w
     before = len(env.calls)
     waiting = relay.post()
     assert followed == ["42"]
-    # The receipt read and the submit both invoke nothing; the relay's next poll sends the same RID again.
+    # The receipt read and the submit both invoke nothing; the relay's next poll sends the same RID again. Nothing
+    # ran, so the relay never counts this as running: on every poll for 110 s it ends unconfirmed (#903 round 9).
     assert waiting.status_code == 200, waiting.text
-    assert waiting.json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。"}
+    assert waiting.json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。", "not_dispatched": True}
     assert [call for call in env.calls[before:] if call.url.path.endswith("/invocations")] == []
     assert rid("act-1") not in env.case.remote.records
     version[0] = old.agent_version
     assert relay.post().json()["state"] == "running"
     assert len(submits(env)) == 1 and list(env.case.remote.records) == [rid("act-1")]
+
+
+def test_a_message_whose_rid_is_missing_and_whose_send_was_not_dispatched_is_never_told_to_resend(relay,
+                                                                                                  monkeypatch):
+    from shared_context.behavior_native_turn_api import NativeTurnGateway, _BeforeAdmission
+
+    submit = NativeTurnGateway.submit
+    refusals = [_BeforeAdmission(Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "an earlier SDK runtime is exiting",
+                                         not_dispatched=True), rid("act-1"), server_following=True)]
+
+    def refused_once(self, *args, **kwargs):
+        if refusals:
+            raise refusals.pop()
+        return submit(self, *args, **kwargs)
+
+    monkeypatch.setattr(NativeTurnGateway, "submit", refused_once)
+    # NATIVE_RID_MISSING does not prove nonacceptance (an earlier poll's send may still be taken), so this never says
+    # to resend; the relay shows it unconfirmed if no later poll confirms the RID (#903 round 9).
+    assert relay.post().json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。", "not_dispatched": True}
+    assert rid("act-1") not in relay.env.case.remote.records
+    assert relay.post().json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。"}
+    assert list(relay.env.case.remote.records) == [rid("act-1")]
 
 
 WORKBENCH = "這一步需要你批准，請到工作台處理，批准後結果會在工作台。"
@@ -618,8 +685,24 @@ def test_section_8_sentences_are_the_adr_literals_in_the_api_and_the_workbench()
     page = (root / "src" / "fa-shared-context-poc" / "web_test_console" / "index.html").read_text(encoding="utf-8")
     for sentence in NOTICE_TEXT.values():
         assert "「" + sentence + "」" in adr and '"' + sentence + '"' in page, sentence
-    # The drift sentence is the workbench status field's only (M4.2): Teams has none, the page has the ADR's text.
+    # The drift and veto sentences are the workbench status field's only (M4.2, M4.6): Teams has none, the page has the ADR's text.
     assert notice_text(NativeEnvironmentNotice(from_version="41", to_version="40")) is None
+    vetoed = "助理這次沒有更新，會繼續使用目前的版本。"
+    assert notice_text(NativeEnvironmentNotice(kind="environment_upgrade_vetoed")) is None
+    assert "「" + vetoed + "」" in adr and '"' + vetoed + '"' in page
     head, tail = "平台把助理的執行環境換成了另一個版本（", "）；FA 已記錄，相容就照常執行。"
     assert "「" + head + "vX→vY" + tail + "」" in adr
     assert head + "v${notice.from_version}→v${notice.to_version}" + tail in page
+
+
+def test_a_submit_refused_while_an_earlier_sdk_runtime_exits_is_polled_again():
+    """#903 P2-2: the API's server_following 503 NATIVE_EXECUTION_UNAVAILABLE admitted nothing, so the relay answers
+    "running" and its next poll sends the same deterministic RID again."""
+    from shared_context.behavior_native_turn_api import _BeforeAdmission
+    from shared_context.native_teams_relay import TeamsRelay
+
+    def refused(*_args, **_kwargs):
+        raise _BeforeAdmission(Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "OFFLINE", not_dispatched=True),
+                               "teams-rid", server_following=True)
+
+    assert TeamsRelay._submit(SimpleNamespace(submit=refused), None, "teams-rid", None, "OFFLINE text") is None

@@ -94,6 +94,7 @@ RelayReply                     # FA API → relay
   state    done | running | needs_approval | busy | refused | failed
   text     顯示在 Teams 的文字；done 是回合最後的回覆，其他是固定文字；最終狀態可附上先前的回覆
   confirm  選填：這段文字帶到的已記錄 RID，relay 收到後 ack
+  not_dispatched  選填 true：這次輪詢什麼都沒收下（running＋「還在跑」文字）；relay 不把它算成收到。讀不到回條證明不了先前的輪詢沒被收下，所以從不叫人重傳；舊 relay 忽略這個欄位
 
 RelayAck                       # relay → FA API，POST /teams-relay/v1/acks
   chat_id、user_oid、request_ids（＝confirm）
@@ -141,7 +142,7 @@ sequenceDiagram
 
 ### 長回合、批准、停止
 
-- **等待上限（預設，Neal 可改）。** relay 最多等 110 秒（已實測 120 秒仍送得到）。超過時顯示 API 最後一次回的 `running` 文字並結束這次請求：會記錄先前回覆的 API 回「這一輪還在跑；完成後，回覆會附在你下一則訊息的回覆前面，也可以先到工作台看。」，較舊的 API 回「這一輪還在跑，完成後結果在工作台。」（relay 自己不另外承諾）。如果這段時間 API 從沒回過 2xx（一直 5xx 或連不上），或回了 4xx，改回「暫時無法確認助理有沒有收到；請先到工作台查看，再決定要不要重傳。」，不自動重送。回合本身照常跑完。N2 沒有主動送訊，所以結果不會自己出現在 Teams；它會附在下一則訊息的回覆裡（見下一項）。T2 會用 echo 探針量平台真正的上限，再決定要不要拉長。
+- **等待上限（預設，Neal 可改）。** relay 最多等 110 秒（已實測 120 秒仍送得到）。超過時顯示 API 最後一次回的 `running` 文字並結束這次請求：會記錄先前回覆的 API 回「這一輪還在跑；完成後，回覆會附在你下一則訊息的回覆前面，也可以先到工作台看。」，較舊的 API 回「這一輪還在跑，完成後結果在工作台。」（relay 自己不另外承諾）。回 `not_dispatched` 的輪詢不算收到。如果這段時間 API 從沒回過 2xx（一直 5xx 或連不上；`not_dispatched` 不算收到），或回了 4xx，改回「暫時無法確認助理有沒有收到；請先到工作台查看，再決定要不要重傳。」，不自動重送。回合本身照常跑完。N2 沒有主動送訊，所以結果不會自己出現在 Teams；它會附在下一則訊息的回覆裡（見下一項）。T2 會用 echo 探針量平台真正的上限，再決定要不要拉長。
 - **補上先前的回覆（2026-10-14，總協調依 Neal「使用者幾乎感覺不到；不掉、不重送、不拒絕」決定，CODE／offline，未部署）。** 不用新的 Teams API 或憑證，relay 仍不存東西：
   - **只對會 ack 的 relay，只在一對一對話。** relay 只在一對一對話（`metadata.ActivityProtocolConversationId` 以 `a:` 開頭，Microsoft 範例中 Teams 個人對話的格式；群組與頻道是 `19:…@thread…`，其他值或沒有都算不是）的 `/turns` 和 `/decisions` 帶 header `X-FA-Relay-Ack: 1`（用 header 不用 body 欄位：API 的 body 嚴格，舊 API 會拒絕新欄位，但會忽略不認得的 header）。沒有這個 header 時 API 不記錄、不附加，回覆和補上功能之前完全一樣。
   - **記錄。** API 回某個回合 `running`（或等批准、或拒絕後回合仍在跑）時，把它的 RID 記在 `TeamsPending`（依記錄順序，最多 8 筆；滿了丟最舊的一筆，它仍在工作台；上限調低後讀到較長的舊列也一樣只留最新的幾筆，不拒絕；記錄或上次附上已超過 24 小時的也丟掉，它不再算「剛完成」，例如 relay 退回舊版一段時間後再升級時留下的紀錄。退版不到 24 小時又升級時，舊紀錄仍可能以「剛完成」附上一次，這是刻意接受的取捨：寧可多附一次，不掉）。這是和 `TeamsChat` 分開的一列，`TeamsChat` 的內容永遠不變。記錄只用 ETag CAS，不碰回合本身，RID 與原回條照邊界 7 不變。記錄寫不進去時只記 log，這則照常回覆；`running` 時改回「這一輪還在跑，完成後結果在工作台。」，不承諾下一則。

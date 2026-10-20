@@ -136,6 +136,24 @@ def test_api_errors_after_a_running_reply_still_say_running_at_110_seconds(chat)
     assert sum(case.clock.sleeps) == 108 and len(case.fake.posts) == 37
 
 
+NOT_DISPATCHED = 200, {"state": "running", "text": STILL_RUNNING, "not_dispatched": True}
+UNCONFIRMED = "暫時無法確認助理有沒有收到；請先到工作台查看，再決定要不要重傳。"
+
+
+def test_a_message_no_poll_confirmed_is_unconfirmed_never_running(chat):
+    # #903 round 9: a poll that sent nothing confirms nothing, and no reply proves an earlier poll's send was not taken.
+    case = chat(NOT_DISPATCHED)
+    assert case.say() == UNCONFIRMED
+    assert sum(case.clock.sleeps) == 108 and len(case.fake.posts) == 37
+
+
+@pytest.mark.parametrize("failure", [(503, {"error": {"code": "TABLE_UNAVAILABLE"}}), None])
+def test_a_message_taken_once_still_says_running_whatever_later_polls_answer(chat, failure):
+    assert chat(NOT_DISPATCHED, failure).say() == UNCONFIRMED
+    assert chat(NOT_DISPATCHED, running(), failure).say() == STILL_RUNNING
+    assert chat(running(), NOT_DISPATCHED).say() == STILL_RUNNING
+
+
 def test_a_refusal_before_any_turn_is_not_retried(chat):
     case = chat((403, {"error": {"code": "BEHAVIOR_ACCESS_DENIED"}}))
     assert case.say() == "暫時無法確認助理有沒有收到；請先到工作台查看，再決定要不要重傳。"

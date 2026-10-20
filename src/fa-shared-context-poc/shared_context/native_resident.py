@@ -8,29 +8,41 @@ under ``execution_slot``, on the agent server's single event loop.
 """
 from collections import OrderedDict
 import asyncio
+import functools
 import logging
 
 from .backup_models import MAX_BACKUP_BYTES
 from .behavior_sdk_files import LARGE_RESULT_RESERVE_BYTES
 from .errors import Problem
-from .m2_copilot import ResidentHolder
+from .m2_copilot import ResidentHolder, SdkRuntimeStillRunning
 
 log = logging.getLogger(__name__)
 LIVE_LIMIT = 2
 
 
 class NativeResidentPool:
-    def __init__(self, limit=LIVE_LIMIT):
+    def __init__(self, limit=LIVE_LIMIT, on_unexited=None, survivor=lambda: None):
         self.limit = limit
+        # The executor's registration of a CLI that outlived its stop (evicted, discarded or replaced SDKs alike).
+        self.on_unexited = on_unexited
+        # The executor's registered CLI that is still running, or None.
+        self.survivor = survivor
         self._holders = OrderedDict()  # sdk_session_id -> ResidentHolder, least recently used first
-        self._stopping = set()
+        # conversation_id -> its sdk_session_id, which never changes; kept while its holder or a stop of its SDK is.
+        self._conversations = {}
+        self._stopping = {}  # stop task -> sdk_session_id of the SDK it stops
 
-    def holder(self, sdk_session_id):
+    def holder(self, sdk_session_id, conversation_id=None):
         """This conversation's slot, now the most recently used; slots without a live SDK are dropped."""
-        holder = self._holders.pop(sdk_session_id, None) or ResidentHolder()
+        holder = self._holders.pop(sdk_session_id, None) or ResidentHolder(
+            on_unexited=self.on_unexited, track=self._track, settle=functools.partial(self.settle, sdk_session_id))
         for key in [key for key, value in self._holders.items() if value.live is None]:
             del self._holders[key]
         self._holders[sdk_session_id] = holder
+        if conversation_id is not None:
+            self._conversations[conversation_id] = sdk_session_id
+        needed = {*self._holders, *self._stopping.values()}
+        self._conversations = {cid: sid for cid, sid in self._conversations.items() if sid in needed}
         return holder
 
     async def continue_live(self, holder, previous, *, checkpoint_profile, model_provider, model, needed_bytes=0):
@@ -95,19 +107,37 @@ class NativeResidentPool:
         log.warning("RESIDENT_SDK_EVICTED")
         return self._track(live)
 
+    def stopping(self, conversation_id=None):
+        """A stop of this conversation's SDK (of any SDK when None) still runs, so its next new client waits (settle)."""
+        sdk_session_id = self._conversations.get(conversation_id)
+        return any(not task.done() and (conversation_id is None or sid == sdk_session_id)
+                   for task, sid in self._stopping.items())
+
+    async def settle(self, sdk_session_id):
+        """Before a new SDK client starts: this SDK session's own stops have ended, and no CLI is left running.
+
+        Another conversation's stop shares nothing with the new client (stdio, its own config and session files), so
+        the client starts beside it (LIVE_LIMIT kept CLIs plus the one still stopping); a CLI that outlived its stop is
+        registered and refused here. ``asyncio.wait`` never cancels the stops, so a cancelled turn leaves them running
+        and registering. Window: that stop may find its CLI unkillable only after this client started; the recovery
+        restart it asks for then waits, with no bound, for this turn to finish (``NativeSdkExecutor._register_unexited``)."""
+        while pending := [task for task, sid in self._stopping.items() if sid == sdk_session_id and not task.done()]:
+            await asyncio.wait(pending)
+        if (process := self.survivor()) is not None:
+            raise SdkRuntimeStillRunning(process)
+
     def _track(self, live):
         """The stop runs as its own task, so a cancelled caller never leaves the CLI process running."""
         task = asyncio.ensure_future(self._stop(live))
-        self._stopping.add(task)
-        task.add_done_callback(self._stopping.discard)
+        self._stopping[task] = live.sdk_session_id
+        task.add_done_callback(lambda done: self._stopping.pop(done, None))
         return task
 
-    @staticmethod
-    async def _stop(live):
+    async def _stop(self, live):
         from .behavior_timing import phase_timing
         try:
             with phase_timing("resident_sdk_stop"):
-                await live.stop()
+                await live.stop(self.on_unexited)
         except Exception:
             log.warning("RESIDENT_SDK_STOP_UNCONFIRMED")
 

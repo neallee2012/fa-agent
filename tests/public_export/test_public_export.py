@@ -50,7 +50,8 @@ REVIEW = TOOLS / "review.json"
 needs_review = pytest.mark.skipif(not REVIEW.is_file(), reason="review.json is not part of the public copy")
 EXCLUDED = ["scripts/public_export/mapping.json", "scripts/public_export/review.json",
             ".github/workflows/public-sync.yml", ".github/workflows/deploy-staging.yml",
-            ".github/workflows/validate-infrastructure.yml", ".claude/settings.json"]
+            ".github/workflows/validate-infrastructure.yml", ".claude/settings.json", "deploy/dev/dev.json",
+            "deploy/dev/runtime/config.json"]
 
 
 def git(repo: Path, *args: str) -> None:

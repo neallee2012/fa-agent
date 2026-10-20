@@ -659,8 +659,9 @@ def main(argv=None):
             or args.verify_follow and (args.defer_follow or not args.route)):
         parser.error("--defer-follow and --verify-follow require --route and exclude each other; "
                      "--follow-wait-seconds must be positive")
-    # verify-only: an Agent still on its earlier session is "pending" (it moves after its next turn end), not a failure.
-    settled = {"ok", "skipped", "pending"} if args.verify_follow else {"ok", "skipped"}
+    # "drifted" is reported, never a failure (follow and verify). Verify-only also accepts "pending": an Agent still on
+    # its earlier session moves after its next turn end.
+    settled = {"ok", "skipped", "drifted"} | ({"pending"} if args.verify_follow else set())
     core = code_sha256()
     if args.core is not None and (re.fullmatch(r"[0-9a-f]{64}", args.core) is None or args.core != core):
         parser.error("--core must be the 64-hex code identity from this image's code_sha256(), not its image digest")

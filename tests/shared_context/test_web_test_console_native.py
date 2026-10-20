@@ -991,6 +991,7 @@ def test_a_not_dispatched_refusal_keeps_its_own_code_even_outside_the_native_lis
 @pytest.mark.parametrize("status,code,flag,expected", [
     (503, "AGENT_VERSION_FOLLOWING", True, True),
     (409, "NATIVE_SESSION_CHANGED", True, True),
+    (503, "NATIVE_EXECUTION_UNAVAILABLE", True, True),  # #903: an earlier SDK runtime still exiting
     (503, "AGENT_VERSION_FOLLOWING", False, False),
     (503, "NATIVE_FILES_UNKNOWN", True, False),
 ])
@@ -1017,19 +1018,20 @@ def test_server_following_is_exposed_only_for_proven_version_refusals(native_con
     assert "server_following" not in saved
 
 
-def test_server_following_same_rid_retry_uses_the_original_body(native_console):
+@pytest.mark.parametrize("code", ["AGENT_VERSION_FOLLOWING", "NATIVE_EXECUTION_UNAVAILABLE"])  # #903: CLI still exiting
+def test_server_following_same_rid_retry_uses_the_original_body(native_console, code):
     c = native_console
     draft = first(c)
 
     def refused_once(request, response):
         if request.url.path.endswith("/native-turns/submit") and response.status_code == 503:
-            return httpx.Response(503, json={"error": {"code": "AGENT_VERSION_FOLLOWING",
+            return httpx.Response(503, json={"error": {"code": code,
                 "automatic_retry": False, "not_dispatched": True, "server_following": True,
                 "request_id": draft["request_id"]}})
         return response
 
     c.mutate[0] = refused_once
-    c.api.remote.error = (503, "AGENT_VERSION_FOLLOWING")
+    c.api.remote.error = (503, code)
     refused = send(c, draft, text="Original body for retry")
     assert refused.status_code == 503 and refused.json()["error"].get("server_following") is True
     c.api.remote.error, c.mutate[0] = None, (lambda request, response: response)
@@ -1785,7 +1787,7 @@ def test_a_section_8_notice_on_the_submit_answer_is_projected_for_the_page(nativ
 
 
 @pytest.mark.parametrize("notice", [
-    {"kind": "environment_rolled_back", "to_version": "39"},  # a kind an API released after this workbench adds
+    {"kind": "environment_later_kind", "to_version": "39"},  # a kind an API released after this workbench adds
     {"kind": "platform_version_changed", "from_version": "41", "to_version": "40", "reason": "later field"},
 ])
 def test_a_notice_this_workbench_does_not_know_is_ignored_and_never_breaks_the_turn(native_console, notice):
@@ -1823,8 +1825,9 @@ def test_a_receipt_whose_own_material_is_wrong_is_still_refused(native_console):
 
 
 
-def switched(c, monkeypatch):
-    """The API's binding row holds an undelivered "moved without its work files" notice for the Agent (ADR-0009 §8)."""
+def switched(c, monkeypatch, *, rollback=False):
+    """The API's binding row holds an undelivered "moved without its work files" notice for the Agent (ADR-0009 §8);
+    ``rollback``: that switch was phase 4d's rollback (已退回, without its work files)."""
     from conftest import InMemoryRepository
     from shared_context import native_binding
     from shared_context.behavior_native_turn_wire import NativeEnvironmentView
@@ -1835,7 +1838,7 @@ def switched(c, monkeypatch):
     store.record_switch(target.agent_id, NativeEnvironmentView(
         agent_id=target.agent_id, request_id="follow-switch", state="ready", previous_hosted_session_id="older",
         previous_agent_version="40", hosted_session_id=target.session_id, hosted_agent_version=target.agent_version,
-        files_migrated=False, files_skip_request_id="skip"))
+        files_migrated=False, files_skip_request_id="skip"), rollback=rollback)
     return lambda: store.read(target.agent_id).switch_notice
 
 
@@ -1843,13 +1846,17 @@ def test_this_bridge_says_it_knows_the_new_notice_kinds_and_gets_the_switch_noti
     c = native_console
     pending = switched(c, monkeypatch)
     seen = []
-    c.before[0] = lambda request: seen.append(request.headers.get("X-FA-Notice-Kinds"))
+    c.before[0] = lambda request: seen.append(
+        (request.headers.get("X-FA-Notice-Kinds"), request.headers.get("X-FA-Upgrade-Waiting"),
+         request.headers.get("X-FA-Rollback-Notice"), request.headers.get("X-FA-Upgrade-Vetoed-Notice")))
     draft = first(c)
     accepted = send(c, draft)
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["task"]["native_receipt"]["environment_notice"] == {
         "kind": "environment_switched_without_files"}
-    assert seen and set(seen) == {"2"}  # on every API request of this bridge
+    # On every API request of this bridge: the phase 2c value an older API knows, and 6a (c)'s, 4d's and 4b-4's own
+    # headers.
+    assert seen and set(seen) == {("2", "1", "1", "1")}
     assert pending() is None  # shown once: the API cleared it after the answer was written
 
 
@@ -1863,6 +1870,9 @@ def test_a_bridge_deployed_before_the_new_kinds_never_gets_them_and_nothing_is_c
 
     def older(request):
         del request.headers["X-FA-Notice-Kinds"]
+        del request.headers["X-FA-Upgrade-Waiting"]
+        del request.headers["X-FA-Rollback-Notice"]
+        del request.headers["X-FA-Upgrade-Vetoed-Notice"]
 
     c.before[0] = older
     draft = first(c)
@@ -1870,3 +1880,153 @@ def test_a_bridge_deployed_before_the_new_kinds_never_gets_them_and_nothing_is_c
     assert accepted.status_code == 200, accepted.text  # not 502 NATIVE_STATE_INVALID
     assert "environment_notice" not in accepted.json()["task"]["native_receipt"]
     assert pending() == "without_files"  # still pending for the updated console's next answer
+
+
+def vetoed(c, monkeypatch):
+    """The API's binding row holds an undelivered 4b-4 "沒有更新" notice: U3's third failure vetoed 42 for this Agent."""
+    pending = switched(c, monkeypatch)
+    from shared_context import native_binding
+
+    store, target = native_binding.binding_store(c.api.composition), c.api.remote.target
+    store.clear_notice(target.agent_id, store.read(target.agent_id).notice())
+    store.record_veto(target.agent_id, hosted_session_id=target.session_id, agent_version="42", notice=True)
+    assert pending() == "vetoed"
+    return pending
+
+
+def test_this_bridge_passes_the_vetoed_notice_to_the_page_once(native_console, monkeypatch):
+    c = native_console
+    pending = vetoed(c, monkeypatch)
+    accepted = send(c, first(c))
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["task"]["native_receipt"]["environment_notice"] == {"kind": "environment_upgrade_vetoed"}
+    assert pending() is None  # shown once: the API cleared it after the answer was written
+
+
+def test_a_bridge_before_4b4_on_this_api_never_gets_the_vetoed_notice_and_nothing_is_cleared(native_console, monkeypatch):
+    """The API may go live before the console: a bridge before 4b-4 sends no ``X-FA-Upgrade-Vetoed-Notice`` and has no
+    sentence for 沒有更新, so it is not sent (the drift notice only, none pending here) and stays for the next console."""
+    c = native_console
+    pending = vetoed(c, monkeypatch)
+
+    def before_4b4(request):  # a 4d bridge
+        del request.headers["X-FA-Upgrade-Vetoed-Notice"]
+
+    c.before[0] = before_4b4
+    accepted = send(c, first(c))
+    assert accepted.status_code == 200, accepted.text
+    assert "environment_notice" not in accepted.json()["task"]["native_receipt"]
+    assert pending() == "vetoed"
+
+
+def test_this_bridge_on_an_api_before_4b4_still_gets_and_clears_the_switch_notice(native_console, monkeypatch):
+    """The console may go live before the API. That API ignores the 4b-4 header (it never writes 沒有更新), so the
+    switch notice is shown and cleared as in phase 2c."""
+    from shared_context import behavior_native_turn_api as api
+
+    c = native_console
+    pending = switched(c, monkeypatch)
+    monkeypatch.setattr(api, "_knows_vetoed_notice", lambda request: False)  # no such check before 4b-4
+    accepted = send(c, first(c))
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["task"]["native_receipt"]["environment_notice"] == {
+        "kind": "environment_switched_without_files"}
+    assert pending() is None
+
+
+def test_this_bridge_passes_the_rollback_notice_to_the_page_once(native_console, monkeypatch):
+    c = native_console
+    pending = switched(c, monkeypatch, rollback=True)
+    assert pending() == "rolled_back_without_files"
+    accepted = send(c, first(c))
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["task"]["native_receipt"]["environment_notice"] == {
+        "kind": "environment_rolled_back", "without_files": True}
+    assert pending() is None  # shown once: the API cleared it after the answer was written
+
+
+def test_a_bridge_before_4d_on_this_api_never_gets_the_rollback_notice_and_nothing_is_cleared(native_console, monkeypatch):
+    """The API may go live before the console: a bridge before 4d sends no ``X-FA-Rollback-Notice`` and has no
+    sentence for 已退回, so it is not sent (the drift notice only, none pending here) and stays for the next console."""
+    c = native_console
+    pending = switched(c, monkeypatch, rollback=True)
+
+    def before_4d(request):  # a phase 2c or 6a (c) bridge
+        del request.headers["X-FA-Rollback-Notice"]
+
+    c.before[0] = before_4d
+    accepted = send(c, first(c))
+    assert accepted.status_code == 200, accepted.text
+    assert "environment_notice" not in accepted.json()["task"]["native_receipt"]
+    assert pending() == "rolled_back_without_files"
+
+
+def test_this_bridge_on_an_api_before_4d_still_gets_and_clears_the_switch_notice(native_console, monkeypatch):
+    """The console may go live before the API. That API knows exactly ``X-FA-Notice-Kinds: 2`` and ignores the 4d
+    header (it never writes 已退回), so the switch notice is shown and cleared as in phase 2c."""
+    from shared_context import behavior_native_turn_api as api
+
+    c = native_console
+    pending = switched(c, monkeypatch)
+    monkeypatch.setattr(api, "_knows_rollback_notice", lambda request: False)  # no such check before 4d
+    monkeypatch.setattr(api, "_notice_level", lambda request: 2 if request.headers.getlist(
+        "X-FA-Notice-Kinds") == ["2"] else 0)  # the phase 2c API's exact check
+    accepted = send(c, first(c))
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["task"]["native_receipt"]["environment_notice"] == {
+        "kind": "environment_switched_without_files"}
+    assert pending() is None
+
+
+def test_this_bridge_on_an_api_before_6a_c_still_gets_and_clears_the_switch_notice(native_console, monkeypatch):
+    """#908 review P2: the console may go live before the API. That API knows exactly ``X-FA-Notice-Kinds: 2`` and
+    ignores the 6a (c) header, so the switch notice is shown and cleared as in phase 2c."""
+    from shared_context import behavior_native_turn_api as api
+
+    c = native_console
+    pending = switched(c, monkeypatch)
+    monkeypatch.setattr(api, "_notice_level", lambda request: 2 if request.headers.getlist(
+        "X-FA-Notice-Kinds") == ["2"] else 0)  # the phase 2c API's exact check
+    accepted = send(c, first(c))
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["task"]["native_receipt"]["environment_notice"] == {
+        "kind": "environment_switched_without_files"}
+    assert pending() is None
+
+
+def waiting(c, monkeypatch):
+    """Phase 6a (c): the API's binding row holds the pending "有新版本 v42" note and no slot notice."""
+    from shared_context import native_binding
+    from shared_context.native_binding import NativeBindingIdleUpgrade
+
+    switched(c, monkeypatch)
+    store, agent_id = native_binding.binding_store(c.api.composition), c.api.remote.target.agent_id
+    note = NativeBindingIdleUpgrade(target_version="42", deferred_since="2026-10-13T00:00:00+00:00", waiting="pending")
+    store._update(agent_id, lambda row: row.model_copy(update={"switch_notice": None, "idle_upgrade": note}))
+    return lambda: store.read(agent_id).idle_upgrade.waiting
+
+
+def test_this_bridge_passes_the_waiting_note_to_the_page_once(native_console, monkeypatch):
+    c = native_console
+    state = waiting(c, monkeypatch)
+    accepted = send(c, first(c))
+    assert accepted.status_code == 200, accepted.text
+    receipt = accepted.json()["task"]["native_receipt"]
+    assert receipt["upgrade_waiting_version"] == "42" and "environment_notice" not in receipt
+    assert state() == "shown"
+
+
+def test_a_phase_2c_bridge_on_this_api_never_gets_the_waiting_note_and_nothing_is_cleared(native_console, monkeypatch):
+    """#908 review P2: the API may go live before the console. A phase 2c bridge sends ``X-FA-Notice-Kinds: 2`` only
+    and decodes the receipt strictly, so the note is not sent to it and stays pending."""
+    c = native_console
+    state = waiting(c, monkeypatch)
+
+    def phase_2c(request):
+        del request.headers["X-FA-Upgrade-Waiting"]
+
+    c.before[0] = phase_2c
+    accepted = send(c, first(c))
+    assert accepted.status_code == 200, accepted.text
+    assert "upgrade_waiting_version" not in accepted.json()["task"]["native_receipt"]
+    assert state() == "pending"

@@ -313,9 +313,9 @@ CAP-06 PR1～PR5 仍由 1b60 負責，依本 ADR 調整（「團隊管理員」�
 每支都跑兩軸審查，只改 UI 的跑 Standards。reviewer prompt 要原文附上「實作原則」兩條，只有會造成資料損失、重送或明顯錯誤的問題才列 P1／P2。清零且 GitHub 顯示 CLEAN 就合併。
 
 <a id="api-routine-clock"></a>
-## 補充：API 兼任已批准排程的時鐘（2026-10-07，總協調決定方案 C；上 stage 前由 Neal 決定）
+## 補充：API 兼任已批准排程的時鐘（2026-10-07，總協調決定方案 C；stage 自 2026-10-08 起已開）
 
-- **新增職責**：「要修改的既有界線」第 9 條的 API 分工，加上「已批准排程的到期觸發」。API 常駐單副本（dev／stage 都是 min=max=1），由 lifespan 的背景 task 每分鐘沿用 #581 的 `due`／`trigger` 送出到期的 occurrence。不建 Container Apps Job、專用 MI、app role、AcrPull 或 Foundry routine；回合仍在 Hosted 執行，API 不跑模型。旗標 `FA_NATIVE_ROUTINE_CLOCK=api`，預設關閉。
+- **新增職責**：「要修改的既有界線」第 9 條的 API 分工，加上「已批准排程的到期觸發」。API 常駐單副本（dev／stage 都是 min=max=1），由 lifespan 的背景 task 每分鐘沿用 #581 的 `due`／`trigger` 送出到期的 occurrence。不建 Container Apps Job、專用 MI、app role、AcrPull 或 Foundry routine；回合仍在 Hosted 執行，API 不跑模型。旗標 `FA_NATIVE_ROUTINE_CLOCK=api`：程式預設關閉；`deploy/stage/stage.json` 自 2026-10-08 起設為 `api`（stage release 31 帶著它），`deploy/azd/profile.defaults.json` 也設為 `api`。
 - **理由**：Neal 10-07 16:41 問「為什麼需要新的雲端資源呢?」。Hosted Agent 只在有請求時讓 session 的 VM 醒著，閒置逾時後收回運算（[Hosted agents](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents)，10-07 查閱）；固定版 `github-copilot-sdk==1.0.13` 也沒有排程或定時喚醒 API（[PyPI 1.0.13 說明](https://pypi.org/project/github-copilot-sdk/1.0.13/)，10-07 查閱）。所以一定要有外部時鐘；而 API 本來就常駐，是不用新資源的最小選擇。
 - **Foundry Routines 的反例（dev 探針 P1，10-07 17:18）**：用 API 的 app token 建立 `authorization.identity="creator"` 的 routine，服務回 `creator' requires a human user principal … authenticated with a service principal (app) token`。官方文件寫 creator 可以是「人或服務主體」，實際只收真人委派 token。改用 agent 身分時，Entra 隔離讓它叫不到 API 建立的那台 VM；不帶 session 又會每次開新 VM，違反第 2 節。證據與連結見 [Shared Context README](../../src/fa-shared-context-poc/README.md#native-routine-api-clock)。
 - **信任邊界不變**：時鐘只能送 owner 已批准、目前仍啟用的定義的到期 occurrence；不能自填內容、RID 或授權，也沒有 HTTP 入口。去重沿用固定 RID＋CAS 意圖＋Hosted `rid:<RID>`，重啟或新舊 revision 重疊都不會重送。

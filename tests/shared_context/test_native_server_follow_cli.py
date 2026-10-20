@@ -1,12 +1,13 @@
 """Deployment main builds a fresh API composition; only platform/Storage I/O is synthetic."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from shared_context import behavior_agent_versions as versions, behavior_server as server
 from shared_context.behavior_native_sessions import NativeSessions
-from shared_context.behavior_native_turn_wire import NativeEnvironmentView
+from shared_context.behavior_native_turn_wire import NativeEnvironmentView, NativeSessionMetadata
 from shared_context.errors import Problem
 from shared_context.native_environment_sync import follow_all
 from test_agent_versions import Foundry, REAL_CURRENT
@@ -128,7 +129,8 @@ def test_verify_follow_skips_unscoped_executor_agents_like_follow_and_still_fail
     def environment_view(self, client):
         if failing and client.target.agent_id == peer:
             raise Problem(503, "NATIVE_METADATA_UNKNOWN", "OFFLINE metadata read failed")
-        return SimpleNamespace(hosted_agent_version="41", state="unverified", model_dump=lambda mode: {})
+        return SimpleNamespace(hosted_agent_version="41", state="unverified", hosted_session_id="s", observed_sessions=(),
+                               model_dump=lambda mode: {})
 
     monkeypatch.setattr(NativeSessions, "environment_view", environment_view)
     assert versions.main(["sync", "--config", str(config), "--image", "offline-new:image", "--route",
@@ -149,3 +151,48 @@ def test_missing_attached_policy_is_reported_without_a_traceback_or_fabricated_i
     assert all(row["state"] == "failed" and row["reason"] == "WORK_POLICY_DISABLED" for row in results)
     assert fresh_case.composition.runtime.work_policy is None and not fresh_case.calls
     assert writes(fresh_case) == before
+
+
+@pytest.mark.parametrize("read, state", [("drifted", "drifted"), ("fails", "ok")])
+def test_follow_never_fails_the_deploy_on_drift_and_a_failed_metadata_read_leaves_the_result_unchanged(
+    fresh_case, monkeypatch, tmp_path, capsys, read, state,
+):
+    """ADR-0009: observed_version is report-only. A drifted follow exits 0 (GUARD 0 deploys use the real follow)."""
+    case = fresh_case
+    initialize(case)
+    config = tmp_path / "deployment-config.json"
+    config.write_text(case.config.model_dump_json(), encoding="utf-8")
+    monkeypatch.delenv("BEHAVIOR_SERVER_CONFIG_JSON", raising=False)
+    foundry = Foundry(*case.config.targets, ready_after=0)
+    for target in case.config.targets:
+        foundry.add(target.agent_name, 41, "previous-build")
+    monkeypatch.setattr(versions, "current_hosted_version", REAL_CURRENT)
+    monkeypatch.setattr(versions, "_POLL_SECONDS", 0)
+    build = server.build_server
+    monkeypatch.setattr(server, "build_server", lambda configuration: build(
+        configuration, **case.options, hosted_versions=versions.HostedVersions(lambda _endpoint: foundry)))
+
+    def ready(self, client, command, *, before_send):
+        before_send()
+        return NativeEnvironmentView(
+            agent_id=client.target.agent_id, request_id=command.request_id,
+            previous_hosted_session_id=client.target.session_id, previous_agent_version=client.target.agent_version,
+            hosted_session_id="OFFLINE-session-" + client.target.agent_id,
+            hosted_agent_version=command.expected_agent_version, state="ready")
+
+    def environment_view(self, client):
+        if read == "fails":
+            raise Problem(503, "NATIVE_METADATA_UNKNOWN", "OFFLINE metadata read failed")
+        item = NativeSessionMetadata(hosted_session_id="OFFLINE-session-" + client.target.agent_id,
+                                     hosted_agent_version="1", status="idle")
+        return SimpleNamespace(observed_sessions=(item,))
+
+    monkeypatch.setattr(NativeSessions, "advance", ready)
+    monkeypatch.setattr(NativeSessions, "observe_automatic", ready)
+    monkeypatch.setattr(NativeSessions, "environment_view", environment_view)
+    assert versions.main(["sync", "--config", str(config), "--image", "offline-new:image", "--route",
+                          "--follow-wait-seconds", "1"]) == 0
+    rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    followed = [row["environment_follow"] for row in rows if row["environment_follow"]["state"] != "skipped"]
+    assert followed and {item["state"] for item in followed} == {state}
+    assert all(row["state"] == "ok" for row in rows)

@@ -15,7 +15,7 @@ from shared_context.behavior_native_turn_wire import NativeResult, NativeSubmit,
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_wire import WireModel
 from shared_context.m2_copilot import ToolOutput, ToolSpec
-from shared_context.native_turns import NativeTurnRuntime
+from shared_context.native_turns import TURNS_STORE, NativeTurnRuntime, _json, _Rid
 from test_native_turn_wire import capture, submit
 from test_native_turns import Harness, IDENTITY, local_env
 
@@ -177,7 +177,7 @@ def test_only_actual_selected_tools_are_bound_and_misconfigured_consumers_never_
     assert len(entered) == len(closed) == (0 if selection in {"unselected", "unsupported"} else 1)
 
 
-def test_factory_passes_native_consumers_without_changing_original_private_root(monkeypatch, tmp_path):
+def test_factory_passes_native_consumers_without_changing_original_private_root(local_env, monkeypatch, tmp_path):
     from shared_context.behavior_native_turn_wire import NativeReceipt
     from shared_context.behavior_sdk_state import NativeCheckpointScope
     from shared_context.native_capabilities import NativeCapabilityBinding, NativeCapabilityProvider
@@ -204,17 +204,19 @@ def test_factory_passes_native_consumers_without_changing_original_private_root(
 
     provider = NativeCapabilityProvider(accepts=lambda grant: grant.entry_id == "fa-shell-v1", bind=bind)
     monkeypatch.setattr(native_sdk, "native_capability_providers", lambda *_: (provider,))
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
-    monkeypatch.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-hosted-config-only")
-    monkeypatch.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
-    monkeypatch.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
-    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT",
-                       "https://offline-fixture.services.ai.azure.com/api/projects/offline")
     hosted = SimpleNamespace(
         identity=IDENTITY, supervisor=SimpleNamespace(journal=SimpleNamespace(root=owned)),
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
     )
-    runtime = native_sdk.native_runtime_from_environment(hosted)
+    # Hosted settings for the factory only; the turn then uses local_env's offline state store (ee8ef6b7 reads it).
+    with monkeypatch.context() as environment:
+        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+        environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-hosted-config-only")
+        environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
+        environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
+        environment.setenv("FOUNDRY_PROJECT_ENDPOINT",
+                           "https://offline-fixture.services.ai.azure.com/api/projects/offline")
+        runtime = native_sdk.native_runtime_from_environment(hosted)
     request = NativeSubmit(command=submit().command, capture=selected_capture("fa-shell-v1"))
     receipt = NativeReceipt(
         agent_id=IDENTITY.agent_id, hosted_session_id=IDENTITY.session_id,
@@ -237,7 +239,14 @@ def test_factory_passes_native_consumers_without_changing_original_private_root(
                 "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
-    result = asyncio.run(runtime.executor(receipt, scope, None, NativeTurnControl()))
+    async def execute():
+        # Since ee8ef6b7 the factory's executor fences effects on the stored original RID.
+        await runtime.initialize()
+        async with runtime._store(TURNS_STORE) as turns:
+            await turns.create_item("rid:" + receipt.request_id, _json(_Rid(receipt=receipt, call_id="OFFLINE-seed", run_token="OFFLINE-run")))
+        return await runtime.executor(receipt, scope, None, NativeTurnControl())
+
+    result = asyncio.run(execute())
     assert result.text == "OFFLINE factory" and len(seen) == 1
     assert runtime.cache_root == owned / "native-turns" / "checkpoint-cache"
 

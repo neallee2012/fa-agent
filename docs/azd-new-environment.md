@@ -1,7 +1,7 @@
 # 新環境 `azd up` 設計（2026-10-10）
 
 > 範圍：用 `azd up` 把 FA 部署到使用者自己的 Azure 訂閱。本文是設計與實作說明，**不是部署批准**，
-> 也不代表已在雲端跑通。公開版只在包含這條路徑的 stage release 之後同步出去。
+> 也不代表已在雲端跑通。公開版只在包含這條路徑的 stage release 之後同步出去（stage 是作者自己維運、正式使用的環境）。
 > 操作步驟見 [deploy/azd/README.md](../deploy/azd/README.md)；舊的手動 17 步保留為逐步排錯用的對照
 > （[deploy/README.md](../deploy/README.md#new-environment-standard-flow)）。
 
@@ -46,17 +46,17 @@ azd 本體的已證實行為（官方文件；第 3 點另外在本機 azd 1.32.
 | 名稱 | 預設 | 用途 |
 |---|---|---|
 | `AZURE_ENV_NAME`、`AZURE_LOCATION`、`AZURE_SUBSCRIPTION_ID` | azd 詢問 | 名稱前綴、區域、訂閱；區域選單只列 Hosted Agents 區域（見下方「模型與區域」） |
-| `FA_MODELS` | 終端機：hook 依區域列出可用模型讓人選；沒有終端機：catalog 全部 4 個 chat 模型 | 要部署、Portal 要列的 chat 模型（逗號分隔，只接受 catalog 內名稱） |
+| `FA_MODELS` | 終端機：hook 依區域列出可用模型讓人選；沒有終端機：catalog 全部 4 個 chat 模型 | 要部署、工作台要列的 chat 模型（逗號分隔，只接受 catalog 內名稱） |
 | `FA_DEFAULT_MODEL` | `gpt-6.1-sol`（有選時），否則 `FA_MODELS` 第一個 | 新對話預設模型；也是第一次建記憶庫用的 chat 模型 |
 | `AZURE_RESOURCE_GROUP` | `rg-<env>` | 唯一的 RG（Foundry 與 FA 資源放一起） |
 | `FA_TEAM_OWNER_OID` | 執行者自己的 OID（Graph `/me`） | Team 主人；Easy Auth allowlist、consent、runtime `human_oid` |
 | `FA_MODEL_CAPACITY_JSON` | 空（用 model catalog 的容量） | 例 `{"gpt-5.4-mini":50}`；只接受 catalog 內名稱 |
 | `FA_MODEL_VERSION_UPGRADE_OPTION` | `NoAutoUpgrade` | 所有模型部署一致 |
 | `FA_API_SUBNET_NAT_EGRESS` | `false` | 同 `prepare_environment.py` |
-| `FA_DEPLOY_UPGRADE_SNAPSHOTS` | `false` | `true`：另建 ADR-0009 phase 5 工作檔快照專用的儲存帳號（`stsnap<token>`、私有端點、30 天刪除規則、帳號刪除鎖、API 身分在該 container 的備份讀寫自訂角色，不含刪除），API 取得 `FA_UPGRADE_SNAPSHOT_CONTAINER_URL`；與 `no-auto-gc` 備份帳號分開（Neal 2026-10-17）。建帳號與指派角色是雲端與 IAM 寫入，每次部署（含 dev）都要 Neal 批准 |
-| `FA_ENABLE_AGENT_ONBOARDING` | `true` | 「＋」新 Agent 需要的受限 RBAC Admin（#468 的例外，Neal 2026-10-15 改成預設開）與 API 的 `FA_ONBOARDING_*`（同 stage）；設 `false` 就兩者都不給 |
+| `FA_DEPLOY_UPGRADE_SNAPSHOTS` | `false` | `true`：另建 ADR-0009 phase 5 工作檔快照專用的儲存帳號（`stsnap<token>`、私有端點、30 天刪除規則、帳號刪除鎖、API 身分在該 container 的備份讀寫自訂角色，不含刪除），API 取得 `FA_UPGRADE_SNAPSHOT_CONTAINER_URL`；與 `no-auto-gc` 備份帳號分開。打開會多建一個儲存帳號並指派角色，會產生費用；預設關，不需要就維持 `false` |
+| `FA_ENABLE_AGENT_ONBOARDING` | `true` | 「＋」新 Agent 需要的受限 RBAC Admin（Team 隔離的已知例外，風險見 [ADR-0006](adr/0006-team-trust-boundary-grokbot-mode.md)；預設開）與 API 的 `FA_ONBOARDING_*`（同 stage）；設 `false` 就兩者都不給 |
 | `FA_ENABLE_WEBIQ` | `false` | `true` 時 deploy 階段以隱藏輸入要金鑰並建 toolbox |
-| `FA_ENABLE_MEMORY` | `true` | 建 Memory Store 並開私人／Team 記憶旗標（同 stage） |
+| `FA_ENABLE_MEMORY` | `true` | 建 Memory Store 並開私人／Team 記憶旗標（同 stage）；私人記憶與 Team note 由助理 VM 直接讀寫（[ADR-0006](adr/0006-team-trust-boundary-grokbot-mode.md) 的已知例外） |
 | `FA_ENABLE_TEAM_MCP_CONNECTIONS` | `true` | API 身分 project 範圍 Contributor，Team MCP 可新增含金鑰 connection（同 stage） |
 | `FA_HOSTED_IDLE_TIMEOUT_SECONDS` | `3600` | 同 stage |
 
@@ -72,7 +72,7 @@ ACR、CAE、API UAMI（名稱／client ID／principal ID）、Table／備份 sto
 所有 intent、plan、批准檔、image ref 都放 `.azure/<env>/fa/`（私有、不進 Git）。
 
 <a id="models-and-region"></a>
-**模型與區域（Neal 2026-10-11：不是每個人都能用 westus3 與 gpt-6.1-sol）**
+**模型與區域（不是每個人都能用 westus3 與 gpt-6.1-sol）**
 
 - **區域由 azd 自己問。** azd 1.32 在 preprovision hook 之前就解析 `location`（本機探針：沒有
   `AZURE_LOCATION` 時停在「Initialize bicep provider」、hook 沒跑），所以選單放在 Bicep：`location` 參數的
@@ -86,7 +86,7 @@ ACR、CAE、API UAMI（名稱／client ID／principal ID）、Table／備份 sto
   需要多少，建議「有提供且 quota 夠」的那些；選了沒提供的模型就停，什麼都不改。之後再跑只驗證，不再問。
   沒有終端機時預設 catalog 全部，quota 不夠由既有 preflight 擋下。
 - **一個決定，三處一致。** `deploy/azd/models.py` 把選擇變成 `FA_MODEL_DEPLOYMENTS`（Bicep 只建這些）、
-  API 的 `FA_INSTRUCTION_MODELS`／`FA_INSTRUCTION_DEFAULT_MODEL`（Portal 只列這些，選其他模型回 422），
+  API 的 `FA_INSTRUCTION_MODELS`／`FA_INSTRUCTION_DEFAULT_MODEL`（工作台只列這些，選其他模型回 422），
   以及記憶庫的 chat 模型。`FA_INSTRUCTION_MODELS` 是 API 新增的選用 ENV：沒設時照舊列整份 catalog，stage 不受影響。
   azd 1.32 在每個 hook 後重新載入 env，`provision` 的部署階段才重新解析參數，所以同一次 `azd up` 就讀得到 hook 寫的值。
 - **不再強制 gpt-4.1-mini。** 依 [Foundry 記憶文件](https://learn.microsoft.com/azure/foundry/agents/how-to/memory-usage)，
@@ -95,8 +95,8 @@ ACR、CAE、API UAMI（名稱／client ID／principal ID）、Table／備份 sto
   讀回比對），所以 `FA_MEMORY_CHAT_MODEL` 第一次寫入後固定，且必須留在 `FA_MODELS`；這個選擇之前就 provision 過的環境（有 Bicep output、沒有 `FA_MODEL_DEPLOYMENTS`）不再詢問，沿用全部模型與 gpt-4.1-mini 記憶庫。
   程式裡仍綁 gpt-4.1-mini 的只有歷史驗收工具：固定內容的 standing 任務（`AssistantSubmit`，runtime 設定
   `AssistantSettings.model`）與 M2／M3／M4 harness；一般聊天、委派、技能與記憶回憶都用對話選的模型。
-  沒部署 gpt-4.1-mini 的環境不能跑那個 standing 任務，Portal 一般使用不受影響。
-- **加減模型。** 之後 `azd env set FA_MODELS …` 再 `azd up`：新增的會建部署並出現在 Portal；拿掉的只會從 Portal 消失，
+  沒部署 gpt-4.1-mini 的環境不能跑那個 standing 任務，工作台一般使用不受影響。
+- **加減模型。** 之後 `azd env set FA_MODELS …` 再 `azd up`：新增的會建部署並出現在工作台；拿掉的只會從工作台消失，
   Bicep 增量部署不刪既有部署（要刪請在 Foundry 入口網站自己刪）。
 
 功能旗標（HITL、groups、routines、Responses lane、對話中換模型 `FA_NATIVE_MODEL_SWITCH`、`conversation_defaults` 等）放在
@@ -127,7 +127,7 @@ ACR、CAE、API UAMI（名稱／client ID／principal ID）、Table／備份 sto
 
 ## 5. 「跑完就能用」與仍然手動的部分
 
-Neal 2026-10-10 決定：`azd up` 結束就能直接用，預設和 stage 相同。
+專案規則：`azd up` 結束就能直接用，預設和作者自己維運的 stage 環境相同。
 
 - **新對話選版改為自動**（原 14、F3）：首次安裝最後由主人身分執行 `select_all_capabilities.py`，模板依伺服器選項與
   `conversation_defaults` 算出（Responses、全部能力、已批准技能），不從其他 Agent 匯出；只做一次，之後不覆蓋主人的調整。
@@ -140,7 +140,7 @@ Neal 2026-10-10 決定：`azd up` 結束就能直接用，預設和 stage 相同
 
 | 項目 | 原因 |
 |---|---|
-| Portal 真人驗收（原 17） | 要真人登入送訊息，以 receipt `completed` 為準；HTTP 200 不算 |
+| 工作台真人驗收（原 17） | 要真人登入送訊息，以 receipt `completed` 為準；HTTP 200 不算 |
 | Provider／feature 註冊、quota 申請 | 這些會改訂閱，preflight 只列出缺什麼和指令 |
 | 沒有管理員權限時的 consent | `oauth2PermissionGrant` 要 `DelegatedPermissionGrant.ReadWrite.All`（管理員角色）。部署者有這類角色時 hook 直接建，不需要這一步；沒有時 hook 寫出 3 個只給主人的 grant body 與指令（`.azure/<env>/fa/admin-consent/`），管理員照做，部署停在第一次 session 前等它。完整的事前準備與分工見 [README 事前準備](../deploy/azd/README.md#prerequisites)，`fa_azd.py prereq` 唯讀檢查 |
 | Feed reader MCP | 需要另一把簽章金鑰；新環境預設不建 |
@@ -174,5 +174,5 @@ Neal 2026-10-10 決定：`azd up` 結束就能直接用，預設和 stage 相同
   `bicep_provider.go` 的 `plan()` 在部署時重新 `ensureParameters`。
 - 本機：azd 1.32.0 探針（無 service 時 `postdeploy` 仍執行；`pwsh` hook 的非零 exit 會讓 azd 失敗；沒有 `AZURE_LOCATION`
   時在 hook 之前就停在 provider 初始化）；唯讀 `az cognitiveservices model list -l westus3`（catalog 5 個模型都有
-  GlobalStandard；gpt-4.1-mini 標 `Legacy`）。離線測試見 PR #766。
-- 雲端：2026-10-10 `azd up -e fazd1010` 實跑（[progress](progress.md#azd-new-environment-1010)）；10-11 `fazd1011`（westus3）從頭跑完，含新對話選版，Neal 在 Portal 實際使用回報通過（[progress](progress.md#azd-region-models-1011)）；10-11 `fazd1012`（eastus2，區域與模型選擇，只選 gpt-6-luna）`azd up` SUCCESS、部署與設定讀回符合，Portal 未驗收（[progress](progress.md#azd-eastus2-1011)）。三組都已依 Neal 10-11 決定刪除。
+  GlobalStandard；gpt-4.1-mini 標 `Legacy`）。離線測試在 `tests/shared_context/test_azd_hooks.py` 與 `test_azd_profile.py`。
+- 雲端：2026-10-10 在作者的訂閱用 `azd up` 建新環境實跑（[progress](progress.md#azd-new-environment-1010)）；10-11 第二個新環境（westus3）從頭跑完，含新對話選版，作者在工作台實際使用回報通過（[progress](progress.md#azd-region-models-1011)）；10-11 第三個新環境（eastus2，區域與模型選擇，只選 gpt-6-luna）`azd up` SUCCESS、部署與設定讀回符合，工作台未驗收（[progress](progress.md#azd-eastus2-1011)）。三組事後都已刪除。

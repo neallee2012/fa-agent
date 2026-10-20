@@ -1615,6 +1615,28 @@ def test_limit_4_past_its_bound_a_marked_fence_is_left_without_files_for_a_fresh
     assert carried and carried[0][0] == fixture.destination.agent_version and carried[0][1] != broken_sid
 
 
+def test_limit_4_raises_the_attempt_of_the_version_the_carry_out_goes_to_never_a_vetoed_one(file_api, monkeypatch):
+    from shared_context.native_binding import NativeBindingIdleUpgrade
+
+    fixture = ready(file_api, monkeypatch)
+    _crash_after_fas_stop(fixture, monkeypatch)
+    enforcing(fixture, monkeypatch)
+    _broken_destination(fixture, monkeypatch)
+    store, row = abandon.store(fixture), abandon.row(fixture)
+    record = store.repository.get(store.partition_key, store.row_key(row.agent_id))
+    store.repository.replace(store.partition_key, store.row_key(row.agent_id), row.model_copy(update={
+        "idle_upgrade": NativeBindingIdleUpgrade(vetoed_versions=("42",))}).model_dump(mode="json"), record.etag)
+    now = abandon.clock(monkeypatch)
+    assert cut(fixture) == ("fence_broken", None, None)
+    now[0] += behavior_native_sessions.FENCE_BROKEN_SECONDS
+    monkeypatch.setattr(NativeSessions, "_carry_out", lambda *_args: "switched")
+    assert cut(fixture) == ("abandoned", None, None)
+    decided = abandon.row(fixture)
+    # This Agent vetoed the selector's 42, so the carry-out goes to a fresh 41 SID, never the broken 42 one.
+    assert behavior_native_sessions._unvetoed(decided, "42") == "41"
+    assert (decided.attempt("42"), decided.attempt("41")) == (0, 0)
+
+
 def test_limit_4_a_platform_5xx_outage_never_counts_toward_the_bound(file_api, monkeypatch):
     fixture = ready(file_api, monkeypatch)
     _crash_after_fas_stop(fixture, monkeypatch)
@@ -1837,3 +1859,160 @@ def test_the_cut_stops_waiting_for_a_destination_left_updating(file_api, monkeyp
     assert polls == [fixture.destination.session_id] * (2 if ending == "deadline" else 1)
     assert "NATIVE_UPGRADE_CUT_API outcome=destination_unready reason=" + (
         "fence_overrun" if ending == "deadline" else "shutdown") in caplog.text
+
+
+# --- ADR-0009 phase 4b-1: U0 conditions with FA_NATIVE_IDLE_UPGRADE ------------------------------------------------
+
+def _agent_name(fixture):
+    return agent_client(fixture.case.composition, control(fixture)).target.agent_name
+
+
+def _vetoed(fixture, where):
+    """Version 42 (the selector's) vetoed for this Agent on its row, or project-wide by the veto row."""
+    from shared_context.native_binding import NativeBindingIdleUpgrade
+    from shared_context.native_version_veto import veto_store
+
+    if where == "project":
+        veto_store(fixture.case.composition).veto(_agent_name(fixture), "42")
+        return
+    store, row = abandon.store(fixture), abandon.row(fixture)
+    record = store.repository.get(store.partition_key, store.row_key(row.agent_id))
+    store.repository.replace(store.partition_key, store.row_key(row.agent_id), row.model_copy(update={
+        "idle_upgrade": NativeBindingIdleUpgrade(vetoed_versions=("42",))}).model_dump(mode="json"), record.etag)
+
+
+def _switched_at_only(fixture):
+    kept = abandon.row(fixture).idle_upgrade
+    assert kept.switched_at is not None and kept.target_version is None and kept.deferred_since is None
+
+
+@pytest.mark.parametrize("where", ["agent", "project"])
+def test_without_the_idle_flag_a_vetoed_target_still_cuts_as_before(file_api, monkeypatch, where):
+    """FA_NATIVE_IDLE_UPGRADE=0 (the default): 2d-i's cut is unchanged, vetoes are not read and nothing is recorded."""
+    fixture = ready(file_api, monkeypatch)
+    _vetoed(fixture, where)
+    assert sessions(fixture).idle_upgrade is False
+    outcome, reason, fence = cut(fixture)
+    assert (outcome, reason) == ("ready", None) and fence is not None
+    _moved_with_files(fixture)
+    assert abandon.row(fixture).idle_upgrade is None
+
+
+def test_without_the_idle_flag_a_failed_source_is_still_probed_first(file_api, monkeypatch):
+    fixture = ready(file_api, monkeypatch)
+    abandon.platform(fixture, monkeypatch, status="failed")
+    start = len(fixture.controls)
+    assert cut(fixture) == ("source_unavailable", "failed", None)
+    assert ("session_cut", "probe") in operations(fixture, start)
+    assert abandon.row(fixture).idle_upgrade is None
+
+
+@pytest.mark.parametrize("where", ["agent", "project"])
+def test_with_the_idle_flag_a_vetoed_target_is_never_cut(file_api, monkeypatch, where):
+    fixture = ready(file_api, monkeypatch)
+    _vetoed(fixture, where)
+    sessions(fixture).idle_upgrade = True
+    before, start, calls = abandon.row(fixture), len(fixture.controls), len(fixture.files.calls)
+    assert cut(fixture) == ("vetoed", where, None)
+    assert len(fixture.controls) == start and fixture.files.calls[calls:] == []
+    assert fixture.destination.session_id not in fixture.files.targets
+    assert abandon.row(fixture) == before, "a vetoed target is not due: no deferral start"
+    assert state(fixture)["hosted_session_id"] == fixture.source.session_id
+
+
+def test_with_the_idle_flag_a_compatible_idle_source_is_left_and_records_nothing(file_api, monkeypatch):
+    """U0: the deferral start is written only once every condition holds; an idle source is not one."""
+    fixture = ready(file_api, monkeypatch, idle=True)
+    sessions(fixture).idle_upgrade = True
+    before, start, calls = abandon.row(fixture), len(fixture.controls), len(fixture.files.calls)
+    assert cut(fixture) == ("source_idle", None, None)
+    assert len(fixture.controls) == start and fixture.files.calls[calls:] == []
+    assert fixture.destination.session_id not in fixture.files.targets
+    assert abandon.row(fixture) == before and before.idle_upgrade is None
+    fixture.files.stopped.discard(fixture.source.session_id)  # the next turn resumed it
+    assert cut(fixture)[:2] == ("ready", None)
+    _moved_with_files(fixture)
+    _switched_at_only(fixture)  # U8: the switch rebuilt the row with its switch time
+
+
+def test_with_the_idle_flag_an_incompatible_target_records_nothing(file_api, monkeypatch):
+    fixture = ready(file_api, monkeypatch)
+    sessions(fixture).idle_upgrade = True
+    monkeypatch.setattr(behavior_native_sessions, "_native_profile", lambda client: "fa-native-unknown")
+    before = abandon.row(fixture)
+    assert cut(fixture) == ("target_incompatible", "fa-native-unknown", None)
+    assert abandon.row(fixture) == before and before.idle_upgrade is None
+
+
+def test_with_the_idle_flag_the_deferral_starts_once_when_u0_holds(file_api, monkeypatch):
+    """A compatible target over an active source that is busy: the deferral start is written once for that target."""
+    fixture = ready(file_api, monkeypatch, files=False)
+    sessions(fixture).idle_upgrade = True
+    quiet = [False]
+
+    async def task_quiet(sid, *, task_id=None, include_responses=False):
+        return quiet[0]
+
+    fixture.runtime.task_observer = SimpleNamespace(quiet=task_quiet)
+    assert cut(fixture)[0] == "busy"
+    first = abandon.row(fixture)
+    assert first.hosted_session_id == fixture.source.session_id
+    assert first.idle_upgrade.target_version == "42" and first.idle_upgrade.deferred_since is not None
+    store = abandon.store(fixture)
+    etag = store.repository.get(store.partition_key, store.row_key(first.agent_id)).etag
+    assert cut(fixture)[0] == "busy"
+    assert store.repository.get(store.partition_key, store.row_key(first.agent_id)).etag == etag, "written once"
+    quiet[0] = True
+    assert cut(fixture)[:2] == ("ready", None)
+    assert state(fixture)["hosted_session_id"] == fixture.destination.session_id
+    _switched_at_only(fixture)  # U8: the switch rebuilt the row with its switch time
+
+
+def test_with_the_idle_flag_an_unread_veto_row_never_cuts(file_api, monkeypatch):
+    """A Table read failure (the store wraps Azure errors as 502 UPSTREAM_ERROR) is fail-closed: veto_unread."""
+    from shared_context.errors import Problem
+    from shared_context.native_version_veto import NativeVersionVetoStore
+
+    fixture = ready(file_api, monkeypatch)
+    sessions(fixture).idle_upgrade = True
+
+    def unavailable(self, agent_name, agent_version):
+        raise Problem(502, "UPSTREAM_ERROR", "table timeout", service="table")
+
+    monkeypatch.setattr(NativeVersionVetoStore, "read", unavailable)
+    before, start = abandon.row(fixture), len(fixture.controls)
+    assert cut(fixture) == ("veto_unread", "UPSTREAM_ERROR", None)
+    assert len(fixture.controls) == start and fixture.destination.session_id not in fixture.files.targets
+    assert abandon.row(fixture) == before
+
+
+@pytest.mark.parametrize("where", ["read", "partition"])
+def test_with_the_idle_flag_a_code_bug_in_the_veto_read_is_not_a_silent_veto(file_api, monkeypatch, where):
+    """A programming error (or a misconfigured store, the partition collision) leaves ``cut``: the driver logs
+    outcome=error, never a permanent veto_unread."""
+    from shared_context import native_version_veto
+    from shared_context.errors import Problem
+
+    fixture = ready(file_api, monkeypatch)
+    sessions(fixture).idle_upgrade = True
+    if where == "read":
+        def broken(*_args, **_kw):
+            raise TypeError("a bug")
+
+        monkeypatch.setattr(native_version_veto.NativeVersionVetoStore, "read", broken)
+    else:
+        legacy = fixture.case.composition.config.table.scope.partition_key
+        monkeypatch.setattr(native_version_veto, "VETO_PARTITION", legacy)
+    before, start = abandon.row(fixture), len(fixture.controls)
+    with pytest.raises(TypeError if where == "read" else Problem, match="a bug" if where == "read" else "legacy"):
+        cut(fixture)
+    assert len(fixture.controls) == start and abandon.row(fixture) == before
+
+
+def test_with_the_idle_flag_a_source_that_is_not_active_creates_no_destination(file_api, monkeypatch):
+    fixture = ready(file_api, monkeypatch)
+    abandon.platform(fixture, monkeypatch, status="failed")
+    sessions(fixture).idle_upgrade = True
+    start = len(fixture.controls)
+    assert cut(fixture) == ("source_unavailable", "failed", None)
+    assert operations(fixture, start) == [] and fixture.destination.session_id not in fixture.files.targets

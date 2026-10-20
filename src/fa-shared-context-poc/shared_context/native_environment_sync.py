@@ -72,7 +72,7 @@ def follow_agent(composition, agent_id, *, wait_seconds=FOLLOW_WAIT_SECONDS, sle
             log.warning("FA_REALTIME_PUBLISH_FAILED type=agent.environment reason=configuration")
         if publisher is not None:
             publisher.notify(scope.team_id, "agent.environment", agent_id=agent_id, version=view.hosted_agent_version)
-        return _result(view, "ok", clock() - started)
+        return _result(view, "ok", clock() - started, _observed(sessions, client, view.hosted_session_id))
 
     deadline, batch, baseline, waiting = clock() + wait_seconds, 0, None, False
     started = clock()
@@ -113,16 +113,34 @@ def follow_agent(composition, agent_id, *, wait_seconds=FOLLOW_WAIT_SECONDS, sle
         sleep(FOLLOW_DELAY_SECONDS)
 
 
-def _result(view, state, elapsed):
+def _observed(sessions, client, session_id):
+    """The platform's version for ``session_id`` (one metadata read), or None when it cannot be read: a failed read
+    leaves the result as it was. ADR-0009 "平台實際行為": an idle-resumed SID can run another version than it was
+    created on."""
+    try:
+        view = sessions.environment_view(client)
+    except Problem as error:
+        log.warning("NATIVE_OBSERVED_VERSION_UNKNOWN code=%s", error.body["error"]["code"])
+        return None
+    return next((item.hosted_agent_version for item in view.observed_sessions
+                 if item.hosted_session_id == session_id), None)
+
+
+def _result(view, state, elapsed, observed=None):
+    """Report only: a SID the platform runs on another version than expected is ``drifted``, never ``ok``."""
+    if state == "ok" and observed not in {None, view.hosted_agent_version}:
+        state = "drifted"
     return {"agent_id": view.agent_id, "version": view.hosted_agent_version, "state": state,
-            "environment": view.model_dump(mode="json"), "elapsed_ms": round(elapsed * 1000)}
+            "observed_version": observed, "environment": view.model_dump(mode="json"),
+            "elapsed_ms": round(elapsed * 1000)}
 
 
 def verify_agent(composition, agent_id):
     """ADR-0009 2d-i P9 hook (deploy ``follow_all`` becomes verify-only once the background cut moves each Agent):
     platform metadata only (``environment_view``: the session listing and the selected version's ``get_session``), no
     session call, no follow. ``ok`` when the selected version's session (or the binding row's current SID) is
-    usable, else ``pending`` (the Agent moves after its next turn end)."""
+    usable, else ``pending`` (the Agent moves after its next turn end); ``drifted`` when that SID's observed version
+    is not the selected one."""
     from .behavior_team_registry import resolve_agent_scope
 
     scope = resolve_agent_scope(composition.runtime.store, composition.config, agent_id)
@@ -131,8 +149,13 @@ def verify_agent(composition, agent_id):
         return skipped
     peer, client = pair
     view = native_sessions(peer).environment_view(client)
-    return {"agent_id": agent_id, "version": view.hosted_agent_version, "verify_only": True,
-            "state": "ok" if view.state == "unverified" else "pending", "environment": view.model_dump(mode="json")}
+    observed = next((item.hosted_agent_version for item in view.observed_sessions
+                     if item.hosted_session_id == view.hosted_session_id), None)
+    state = "ok" if view.state == "unverified" else "pending"
+    if observed not in {None, view.hosted_agent_version}:
+        state = "drifted"  # report only: the platform runs this SID on another version than the selected one
+    return {"agent_id": agent_id, "version": view.hosted_agent_version, "verify_only": True, "state": state,
+            "observed_version": observed, "environment": view.model_dump(mode="json")}
 
 
 def follow_all(composition, *, agent_id=None, published=None, wait_seconds=FOLLOW_WAIT_SECONDS,

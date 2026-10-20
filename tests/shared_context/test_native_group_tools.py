@@ -195,6 +195,58 @@ def test_group_publication_failure_never_prevents_the_original_peer_notification
     assert order == ["peer", "group"]
 
 
+def test_a_refused_peer_rids_notice_also_posts_its_group_completion(tmp_path, monkeypatch):
+    """#915: every notification of a RID refused by version (``refused:<RID>``) runs ``on_unconfirmed``, so it also
+    posts the group ``/complete`` for that RID after the peer notice (the API publishes once per RID)."""
+    from shared_context import native_sdk
+    from shared_context.behavior_assistant_hosted import AssistantSupervisor
+    from shared_context.behavior_private_memory import STORE_ENV
+    from shared_context.native_agent_tools import NativeAgentRelayClient
+    from shared_context.native_group_tools import NativeGroupClient
+    from shared_context.native_group_wire import NativeGroupCompletion
+    from shared_context.native_markers import EARLIER_VERSION_UNFINISHED
+    from shared_context.native_team_memory import TEAM_ENV
+    from test_native_turn_wire import agent_receive
+    from test_native_turns import IDENTITY
+
+    home = tmp_path / "home"
+    home.mkdir()
+    runtime_path = tmp_path / "OFFLINE-not-executed"
+    runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
+    order = []
+
+    async def peer(_client, receipt):
+        order.append(("peer", receipt.request_id))
+
+    async def group(_client, path, _model, command=None):
+        order.append((path, command.request_id))
+        return NativeGroupCompletion(reason="no_group")
+
+    monkeypatch.setattr(NativeAgentRelayClient, "unconfirmed", peer)
+    monkeypatch.setattr(NativeGroupClient, "request", group)
+    monkeypatch.delenv(STORE_ENV, raising=False)
+    monkeypatch.delenv(TEAM_ENV, raising=False)
+    monkeypatch.delenv("FA_NATIVE_HITL_ENABLED", raising=False)
+    for name, value in {
+        "FA_NATIVE_TURNS": "foundry-native-v1", "FA_NATIVE_GROUPS_ENABLED": "1",
+        "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform", "AGENTSERVER_TASKS_BACKEND": "hosted",
+        "HOME": str(home), "BEHAVIOR_ASSISTANT_RUNTIME_PATH": str(runtime_path),
+        "FOUNDRY_PROJECT_ENDPOINT": "https://offline.services.ai.azure.com/api/projects/offline",
+        "FOUNDRY_AGENT_NAME": "OFFLINE-agent",
+    }.items():
+        monkeypatch.setenv(name, value)
+    runtime = native_sdk.native_runtime_from_environment(SimpleNamespace(
+        identity=IDENTITY, supervisor=AssistantSupervisor(home / ".fa-assistant-v12", runtime_path=runtime_path),
+        api=SimpleNamespace(api_url="https://api.invalid", audience="api://OFFLINE")))
+    _, _, _, _, root = sender_case()
+    # The read-time view the notification task hands over (``_refused_final``; its shape is pinned in
+    # ``test_native_marker_store``).
+    refused = root.model_copy(update={"status": "unknown", "failure_code": EARLIER_VERSION_UNFINISHED,
+                                      "source": agent_receive().source})
+    asyncio.run(runtime.on_unconfirmed(refused))
+    assert order == [("peer", root.request_id), ("/complete", root.request_id)]
+
+
 def test_group_tools_only_expose_original_context_and_fyi_never_starts_a_peer():
     from shared_context.native_group_tools import NativeGroupClient, NativeGroupTools
 

@@ -18,6 +18,8 @@ Each assistant gets its own VM on [Microsoft Foundry Hosted Agents](https://lear
 
 The platform reclaims an idle VM after a timeout. FA sets 3600 seconds by default, and you can change it in the environment settings. Conversation history and checkpoints live in the Foundry State store. When the next message arrives, a new VM resumes the conversation from the last valid checkpoint. Work files on the VM do not move to the new VM yet.
 
+**How it differs from a plain Foundry agent or a self-hosted OpenClaw.** When you build an agent directly in Foundry, you wire up the desktop, private memory, hand-offs, and permission boundaries yourself; FA gives each assistant its own Hosted VM (with a desktop and Chromium), private memory, approval cards, and hand-offs between assistants in the same Team. A self-hosted OpenClaw runs on a machine you manage; FA runs entirely on managed services in your Azure subscription, with the Team as the trust boundary: the entry point checks the Team owner with Entra, and data relay and hand-offs stay inside one Team. After a VM is reclaimed or upgraded, the conversation resumes from the last valid checkpoint instead of silently starting a new one. "10 times faster than OpenClaw" is the project's goal; it has not been measured yet.
+
 You talk to the assistants in a web workbench. The workbench signs you in with Entra ID, and only the Team owner can get in.
 
 ```text
@@ -85,13 +87,14 @@ Use `azd up` to deploy to your own subscription. Bicep creates every resource, a
 
 **Prerequisites, by who does what.** See [prerequisites](deploy/azd/README.md#prerequisites) for the details of each item.
 
-- **You (the person who deploys):** azd, the Azure CLI, Python 3.11 or later, git, and a running Docker. On Windows you also need PowerShell 7. Sign in to `az` and `azd` with the same user account. You should be the Team owner. If you are not, the owner signs in and takes over the second half.
+- **You (the person who deploys):** azd 1.32.0 or later, the Azure CLI, Python 3.11 or later, git, and a running Docker. On Windows you also need PowerShell 7. Sign in to `az` and `azd` with the same user account. You should be the Team owner. If you are not, the owner signs in and takes over the second half.
 - **Subscription Owner:** you need Owner on the subscription, or Contributor plus User Access Administrator. The subscription needs 9 resource providers and 1 feature registered.
 - **Entra permissions:** you must be allowed to register apps. The 3 delegated grants for the Team owner only are created by the hook when you can grant them (Cloud Application Administrator, Application Administrator, or Global Administrator). When you cannot, the hook writes the requests to admin-consent files (`.azure/<env>/fa/admin-consent/`), and you continue after an administrator applies them.
 
 You do not need Microsoft Teams, Work IQ or GitHub. Connectors are off when `azd up` finishes. To add tools later, see [Extending](#extending).
 
 ```powershell
+git clone https://github.com/neallee2012/fa-agent.git; cd fa-agent   # use git clone, not a ZIP download: the deploy reads the git commit (git rev-parse HEAD)
 $env:AZURE_CONFIG_DIR = "$HOME\.azure-fa"   # separate Azure CLI config folder, so you do not use the wrong subscription
 $env:PYTHONUTF8 = "1"
 az login --tenant <your-tenant-id>
@@ -101,6 +104,8 @@ azd env set FA_TEAM_OWNER_OID <owner-object-id>   # the Team owner's object ID (
 python .\deploy\azd\fa_azd.py prereq     # read-only: lists what you have, what is missing, and who to ask
 azd up
 ```
+
+`<name>` is the environment name: 2 to 20 lowercase letters, digits or hyphens, used as the prefix of resource names. For `<region>`, pick a region that has Foundry Hosted Agents; the list is in the [official docs](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents#region-availability). If you have not decided yet, drop `--location` and the `prereq` line, and `azd up` asks you with a menu.
 
 If you do not know the subscription ID or tenant ID, run `az account list --query "[].{name:name, id:id, tenant:tenantId}" -o table` after `az login`. The subscription is fixed per azd environment by `azd env new --subscription`; the az CLI default subscription is not used, and the hooks stop if az and azd are signed in to different tenants.
 
@@ -114,13 +119,25 @@ Get the owner's object ID with `az ad user show --id <owner UPN> --query id -o t
 - **Plan hash.** Before the first install writes to the table, the terminal shows a plan hash. It writes only after the Team owner types the first 12 characters. Anything else stops it and nothing is written. Without a terminal (the code checks `sys.stdin.isatty()`, not azd's `--no-prompt`) it stops.
 - **WebIQ key (optional).** It asks only after `azd env set FA_ENABLE_WEBIQ true`. The key is a hidden prompt. It is not written to a file or to the azd env.
 
-**What still needs a human.** At the end, the hook picks the new-conversation template for both assistants as the Team owner: the Responses lane, with every capability the server offers. You can change it later on the assistant's ⚙ settings page in the workbench. What remains is for the owner to sign in at the workbench URL the hook prints, open a new conversation, and send a short message. It passes only when the receipt is `completed` with `failure_code=null`. If the person who deploys is not the owner, the owner signs in and runs `azd hooks run postdeploy` for the first session preparation and the template choice. The owner's takeover starts at the plan-hash approval. A rerun redoes the role assignments and Bicep, so the owner also needs subscription Owner (or Contributor plus User Access Administrator) and Foundry User, and must run it on the same machine with the same `.azure/<env>/fa` folder.
+**What still needs a human.** At the end, the hook picks the new-conversation template for both assistants as the Team owner: the Responses lane, with every capability the server offers. You can change it later on the assistant's ⚙ settings page in the workbench. What remains is for the owner to sign in at the workbench URL the hook prints (its messages call the workbench "Portal"; later, `azd env get-value FA_CONSOLE_URL` also shows it), open a new conversation, and send a short message. It passes only when the receipt is `completed` with `failure_code=null`. The steps are in [The first 10 minutes](#first-10-minutes) below. If the person who deploys is not the owner, the owner signs in and runs `azd hooks run postdeploy` for the first session preparation and the template choice. The owner's takeover starts at the plan-hash approval. A rerun redoes the role assignments and Bicep, so the owner also needs subscription Owner (or Contributor plus User Access Administrator) and Foundry User, and must run it on the same machine with the same `.azure/<env>/fa` folder.
 
 **When it stops or you need to troubleshoot.** Every write records an intent first. Read back as the screen tells you, then continue with `azd hooks run postprovision` or `azd hooks run postdeploy`. Do not delete the intents and start over. The step-by-step troubleshooting reference is the 17 gates of the [new environment standard flow](deploy/README.md#new-environment-standard-flow), in Traditional Chinese, and both paths call the same scripts. `azd down --purge` deletes the tables, backups, and memory with everything else, and cannot be undone. While the backup lock is still there and `FA_CONFIRM_DELETE` is not set, it first asks you to type the environment name; azd also asks its own `y/N`. It takes about 30 minutes.
 
 **Current limits.** The author ran `azd up` from scratch once in their own subscription and used the workbench for real. The region and model choice at the start, added afterwards, also ran successfully in eastus2 (one model chosen, deployments and settings read back correctly), but the workbench check for that run has not been done yet.
 
 **Cost reference.** These are estimates from the author's environment. Your bill is what counts. Each assistant's VM costs about US$0.25 per hour while it runs (2 vCPU, 4 GiB), and nothing after it is reclaimed. The always-on workbench costs about US$5.83 per month. Memory is on by default, and the Memory Store (preview) is billed by usage on top. The author's stage environment was estimated at US$70 to 190 per month. Since 2026-10-07 the workbench and the feed app stay on, which adds about US$11.66 per month.
+
+<a id="first-10-minutes"></a>
+## The first 10 minutes
+
+After the deploy finishes, the Team owner walks through this once to check that the whole path works. The UI labels are in Traditional Chinese, shown in 「」.
+
+1. Run `azd env get-value FA_CONSOLE_URL` to get the workbench URL, open it in a browser, and sign in with the Team owner's Entra account.
+2. In the assistant list on the left, pick `fa-<name>-a` (assistant A).
+3. Press "⋯" above the conversation → 「新對話 · New session」.
+4. In the message box (「傳送訊息…」), type a message that needs the shell, for example "use the shell to run `date` and tell me the result", and press Send (「送出」).
+5. If an approval card appears in the conversation, press "Allow this time" (「允許這次」); the assistant finishes and replies. A freshly deployed Team has no approval rules, and Auto Review lets a read-only command you asked for run without asking, so a command like `date` may show no card; the assistant simply replying is normal and does not mean the deploy is broken. To see a card, open the assistant's ⚙ settings page → 「批准規則」 → 「新增一條規則」, write "shell commands" as the rule, choose 「先問我」 under 「遇到符合的動作時」, press 「確認並新增規則」, and send the message again.
+6. Press "⋯" → support details (「支援明細」) and expand 「識別碼、歷史與回條」. It passes when `native_receipt` has `status` `completed` and `failure_code` `null`. Check this whether or not a card appeared; a reply with a `status` other than `completed` does not pass.
 
 ## Quick start
 

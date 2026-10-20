@@ -5,6 +5,98 @@ subscription, resource group, or endpoint in each script. The checked-in
 `deploy/stage/stage.json` remains the default, while another environment can be
 selected with `--config` or `FA_DEPLOY_CONFIG`.
 
+<a id="deploying-dev"></a>
+## Deploying dev
+
+Neal 2026-10-19 決定：dev（`faexample`，RG `rg-faexample`）改走
+`deploy/stage/ci_deploy.py` 加 `deploy/dev/dev.json`，用同一套檢查，取代部署線的 Git 外工具。
+**每一個命令都要帶 `--config deploy/dev/dev.json`**：不帶時用 `FA_DEPLOY_CONFIG`，再沒有就是
+`deploy/stage/stage.json`，也就是對 stage 寫入。`deploy/dev/` 不進公開匯出（[public-sync](../docs/public-sync.md#不會同步的檔案)），
+所以這裡的 `deploy/dev/...` 路徑只寫成文字，不做連結。
+
+**一次性轉換（W1、W2）先做完才能跑 `guard` 以後的步驟**（Neal 2026-10-19 批准，只限 dev）。共同設定：
+`$env:AZURE_CONFIG_DIR = "$HOME\.azure-foundry-agents"`。這份隔離設定的預設帳號在另一個 tenant，所以
+**每條 `az` 都要帶 `--subscription <dev 訂用帳戶>`、`-g rg-faexample` 和資源的 `-n`**（`az rest` 打 ARM 時，
+訂用帳戶寫在 URL 路徑裡）。Foundry 資料面 token 也要 `az account get-access-token --resource https://ai.azure.com --subscription <dev 訂用帳戶>`：
+不帶時拿到預設帳號另一個 tenant 的 token，`GET /agents/...` 回 404 `WorkspaceNotFound`；改帶 `--tenant` 會得到 AADSTS90072。
+
+- **W1：建 sync Job `job-fa-agent-sync-dev`。** 只部署
+  [`behavior-job.bicep`](../infra/shared-context/behavior-job.bicep) 這一個模板到 `rg-faexample`
+  （`az deployment group create -g rg-faexample -n <部署紀錄名稱> --template-file infra/shared-context/behavior-job.bicep --parameters @<私密參數檔> --subscription <dev 訂用帳戶>`），
+  不跑 `foundation.bicep`／`behavior-api.bicep`。參數檔放在 repo 外。stage 的
+  `behavior-job.stage.parameters.json` 沒有 `commandArguments`、`environmentVariables`、`imageSha256`，不能直接照抄；
+  dev 要給的是下面這些（全是資源名稱或讀回值，沒有秘密）：
+
+  | 參數 | dev 的值與來源 |
+  |---|---|
+  | `jobName` | `job-fa-agent-sync-dev`（和 profile 的 `sync_job` 相同） |
+  | `environmentName` | `cae-facontext-private`（profile 的 `container_apps_environment`，也是模板預設） |
+  | `identityName` | `id-facontext-api`（profile 的 `api_identity`，也是模板預設） |
+  | `registryName` | `crfacontextpocdemo`（profile 的 `registry_name`，也是模板預設） |
+  | `imageRepository` | `fa-behavior-api` |
+  | `imageSha256` | 目前 dev API image 的 64 位 digest：`az containerapp show -g rg-faexample -n ca-fa-behavior-poc --subscription <dev 訂用帳戶> --query properties.template.containers[0].image` 讀回，取 `@sha256:` 後面那段 |
+  | `commandArguments` | `["-B","-c","print('job-fa-agent-sync-dev placeholder', flush=True)"]`（佔位；`ci_deploy` 每次 start 都會換掉 image、args 和 env） |
+  | `environmentVariables` | `[{"name":"PYTHONUTF8","value":"1"},{"name":"PYTHONDONTWRITEBYTECODE","value":"1"}]`（和 stage 讀回相同） |
+  | `timeoutSeconds` | `1800` |
+  | `containerResources` | `{"cpu":"0.5","memory":"1Gi"}` |
+  | `tags` | `{"workload":"hosted-sandbox-poc","environment":"dev"}` |
+
+  寫入前先確認 `az containerapp job show -g rg-faexample -n job-fa-agent-sync-dev --subscription <dev 訂用帳戶>` 是 NotFound，
+  再 `az deployment group what-if`（同樣的 `-g`、模板與參數檔），只能有 1 筆 Create；寫入後用同一條 `job show` 讀回
+  （Manual、1800、retry 0、UAMI 只有 `id-facontext-api`、`Consumption`），不 start。
+  不需要新的 IAM（Job 用 API 的 UAMI，它已有 AcrPull）。
+  **退回**：Job 是新建的，閒置不計費，所以預設是留著。真要退，只刪這一個新建的 Job
+  （`az containerapp job delete`，要 Neal 先批准刪除），而且 Job 重新存在之前**不能再用 `ci_deploy` 部署 dev**：
+  `sync_job` 是 profile 必填欄位（[`deployment_config.py`](shared-context/deployment_config.py)），把它從 profile 拿掉，
+  每個命令連 profile 都載入失敗。
+- **W2：dev API `ca-fa-behavior-poc` 改用 `serve` 啟動。**
+  **W2-0 先決條件**（任何一項不成立就不寫入）：(1) `az containerapp revision list -g rg-faexample -n ca-fa-behavior-poc --subscription <dev 訂用帳戶> --all`
+  只有 `ca-fa-behavior-poc--ae3d-v157-nofault` 是 active；(2) 沒有回合在跑，挑安靜的時段（先看工作台和 routine 的時間）；
+  (3) PATCH 前的完整 GET JSON 已存到 repo 外（`az rest --method get --url https://management.azure.com/subscriptions/<dev 訂用帳戶>/resourceGroups/rg-faexample/providers/Microsoft.App/containerApps/ca-fa-behavior-poc?api-version=2025-01-01`）。
+  image 不換，只把 GET 回來的 template 改成
+  `command ["python"]`、`args ["-B","-m","shared_context.behavior_server","serve"]`，加一項
+  `BEHAVIOR_SERVER_CONFIG_JSON`＝`deploy/dev/runtime/config.json` 的內容（和原內嵌配置逐位元組相同），
+  拿掉 `imageType`、`ephemeralStorage`，`revisionSuffix` 用**正在服務的 commit** 前 7 碼加 `-r0-1`
+  （目前是 `ae3d30e-r0-1`；不是 checkout 的 HEAD，這樣 `guard` 讀得出服務中的 commit），再對同一個 URL `az rest --method patch`。
+  寫入後讀回 revision Healthy、traffic 100%、`/healthz` 200、ENV 等於 `runtime/config.json`。
+  **退回**：`az containerapp revision activate -g rg-faexample -n ca-fa-behavior-poc --subscription <dev 訂用帳戶> --revision ca-fa-behavior-poc--ae3d-v157-nofault`；流量沒回去時用
+  `az containerapp revision copy -g rg-faexample -n ca-fa-behavior-poc --subscription <dev 訂用帳戶> --from-revision ca-fa-behavior-poc--ae3d-v157-nofault --revision-suffix <新後綴>`（舊 image 留在 ACR）。
+  **切換後的行為差異**：原啟動腳本另帶的成本觀測檔（`FA_WORK_COST_OBSERVATION_FILE`）不再存在，所以舊的 job-based
+  指令 lane（沒有 VM ticket）回 403 `WORK_POLICY_COST_OBSERVATION_SCOPE`，「失敗回合移到新環境」回 403
+  `CONVERSATION_TRANSFER_BUDGET`。這和 stage 相同，是總協調 2026-10-19 的決定；native（VM 內）回合、follow 不受影響。
+
+**`gate`／`sync` 之前的人工檢查**（`ci_deploy` 不檢查 Job 是否存在或是否正在跑，Job 不存在時 `build` 已經把 image 推上 ACR 才會失敗）：
+`az containerapp job show -g rg-faexample -n job-fa-agent-sync-dev --subscription <dev 訂用帳戶>` 要讀得到，
+`az containerapp job execution list -g rg-faexample -n job-fa-agent-sync-dev --subscription <dev 訂用帳戶>` 不能有 `Running` 的 execution。
+這是文件步驟，沒有加進 `ci_deploy`（`guard` 也是 stage CI 在用，多一次讀取要另外評估）。
+
+就緒後的順序（PowerShell，完整 checkout 的根目錄；dev 部署照 [ADR-0008](../docs/adr/0008-environment-tiers-staging-cicd.md) 的 dev 規則批准）：
+
+```powershell
+$env:AZURE_CONFIG_DIR = "$HOME\.azure-foundry-agents"; $env:PYTHONUTF8 = '1'
+# 本機沒有 GitHub 的這三個值：tag 與 revision 名稱 <commit>-r<run>-<attempt> 由它們組成，run 每次要不同
+$env:GITHUB_SHA = git rev-parse HEAD; $env:GITHUB_RUN_NUMBER = '<這次的編號>'; $env:GITHUB_RUN_ATTEMPT = '1'
+$cfg = 'deploy/dev/dev.json'
+python -X utf8 deploy/stage/ci_deploy.py --config $cfg check
+python -X utf8 deploy/stage/ci_deploy.py --config $cfg guard
+$api    = python -X utf8 deploy/stage/ci_deploy.py --config $cfg build api    | Select-Object -Last 1
+$hosted = python -X utf8 deploy/stage/ci_deploy.py --config $cfg build hosted | Select-Object -Last 1
+python -X utf8 deploy/stage/ci_deploy.py --config $cfg gate $api
+python -X utf8 deploy/stage/ci_deploy.py --config $cfg sync $api $hosted
+python -X utf8 deploy/stage/ci_deploy.py --config $cfg api $api
+python -X utf8 deploy/stage/ci_deploy.py --config $cfg follow $api $hosted
+```
+
+- `build` 用本機 Docker（`linux/amd64`）build 後 push，不是部署線的 `az acr build`。
+- `--verify-follow` 不用自己加：profile 的 `FA_NATIVE_SESSION_GUARD_ENFORCE` 是 `"1"`，`sync` 自動帶
+  `--defer-follow`，`follow` 自動帶 `--verify-follow`（只回報各 Agent 版本與環境，不 follow）。
+- Teams relay（`src/fa-teams-relay`）**不在** `ci_deploy` 裡（`build` 只有 api／hosted／console／feed），照
+  [relay README](../src/fa-teams-relay/README.md) 另外做。
+- dev 沒有遠端工作台（`console_app` 是 `null`），不跑 `console`；`feed` 視需要在 `follow` 之後跑。
+- 最後重啟本機 8765 工作台：停掉原 bridge，用**原本的**配置、journal 與 SHA 重開
+  （[`serve` 用法](../src/fa-shared-context-poc/web_test_console/README.md#多-agent-配置與交接codeoffline)，
+  多 Agent 時加原 `--agents` manifest），再按「連線」。
+
 ## Prepare a new environment
 
 **New subscription or new environment: use `azd up`** ([deploy/azd/README.md](azd/README.md),

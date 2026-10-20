@@ -123,6 +123,11 @@ async def append(runtime, command):
         raise Problem(409, "NATIVE_RID_CONFLICT", "the append must name the original turn version")
     if target.status in {"accepted", "started"}:
         await runtime._require_original_session(receipt=target)
+    # This process runs the turn and its SDK channel is closed (the last SDK round is over; it never reopens and the RID
+    # never runs the SDK again), so the append is final now, not after the SDK stop and save (G plan, 2026-10-19).
+    control = runtime.running_controls.get(command.request_id)
+    closed = control is not None and control.steering is not None and control.steering.closed
+    cancelled = target.cancel_requested or closed and control.cancelled
 
     def accept(state):
         for entry in state.entries:
@@ -130,10 +135,16 @@ async def append(runtime, command):
                 if entry.command != command:
                     raise Problem(409, "NATIVE_RID_CONFLICT", "this append ID already retains different content")
                 return state
-        ended = target.status not in {"accepted", "started"} or target.cancel_requested
-        entry = _Entry(command=command, status="not_applied" if ended else "accepted",
-                       reason=("cancelled" if target.cancel_requested else "turn_finished") if ended else None)
-        replacement = _changed(state, entries=(*state.entries, entry))
+        ended = target.status not in {"accepted", "started"} or cancelled or closed
+        reason = ("cancelled" if cancelled else "turn_finished") if ended else None
+        entries = state.entries
+        if closed:
+            # Earlier appends the closed channel never took end in this same write, so they never settle after this
+            # one (the owner's resend keeps append order). An attempted send is left to the turn's own settle.
+            entries = tuple(_changed(item, status="not_applied", reason=reason)
+                            if item.status == "accepted" or _unsent(item, control) else item for item in entries)
+        entry = _Entry(command=command, status="not_applied" if ended else "accepted", reason=reason)
+        replacement = _changed(state, entries=(*entries, entry))
         # Leave room for escaped SDK IDs and completion metadata before promising acceptance.
         reserved = 2048 * sum(item.status in {"accepted", "sending"} for item in replacement.entries)
         if len(json.dumps(_json(replacement), allow_nan=False).encode("utf-8")) + reserved > MAX_ITEM_BYTES:

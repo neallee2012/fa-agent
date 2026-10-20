@@ -485,6 +485,39 @@ class SdkUserCancelled(RuntimeError):
     pass
 
 
+# After force_stop (which SIGKILLs the owned CLI without waiting), how long its exit may take to show; then FA kills
+# that PID once more itself (force_stop already dropped the SDK's handle) and waits KILL_CONFIRM_SECONDS.
+EXIT_CONFIRM_SECONDS = 5
+KILL_CONFIRM_SECONDS = 2
+
+
+class SdkRuntimeStillRunning(RuntimeError):
+    """The owned CLI outlived force_stop and FA's own kill; ``process`` is its handle, so no other SDK starts beside it."""
+
+    def __init__(self, process):
+        super().__init__("Assistant runtime shutdown is unverified")
+        self.process = process
+
+
+async def _confirm_exit(process):
+    # shortcut: only the CLI itself is checked and killed; the SDK's Popen shares Hosted's process group (no
+    # start_new_session), so killpg would stop Hosted and children the CLI left are not tracked. Upgrade if the SDK
+    # exposes a group.
+    async def exited(seconds):
+        deadline = asyncio.get_running_loop().time() + seconds
+        while process.poll() is None:
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+        return True
+
+    if process is None or await exited(EXIT_CONFIRM_SECONDS):
+        return
+    process.kill()  # Popen.kill: SIGKILL / TerminateProcess on this one PID
+    if not await exited(KILL_CONFIRM_SECONDS):
+        raise SdkRuntimeStillRunning(process) from None
+
+
 @dataclasses.dataclass
 class _TurnCallbacks:
     invoke: Callable
@@ -527,6 +560,8 @@ class ResidentSdk:
         self.client = self.session = self.process = None
         self.turn = None
         self.span_file = None
+        # The CLI that outlived stop (SdkRuntimeStillRunning); whoever stopped it keeps any SDK from starting beside it.
+        self.unexited = None
         # Set by the owner only after the released turn's checkpoint and reply are both saved.
         self.released_sha256 = None
         self._released_files = None
@@ -585,8 +620,11 @@ class ResidentSdk:
             raise RuntimeError("User input has no bound turn")
         return await turn.user_input(request, invocation)
 
-    async def stop(self):
-        """Discard: the released job's evidence is already sealed, so nothing is reported for this exit."""
+    async def stop(self, on_unexited=None):
+        """Discard: the released job's evidence is already sealed, so nothing is reported for this exit.
+
+        ``on_unexited(process)``: called from this stop itself for a CLI that outlives it, so a cancelled caller
+        never skips the registration."""
         self.turn, self.released_sha256, self._released_files = None, None, None
         client, session, self.client, self.session = self.client, self.session, None, None
         try:
@@ -596,8 +634,17 @@ class ResidentSdk:
                 await asyncio.wait_for(client.stop(), timeout=15)
         except Exception:
             logging.getLogger(__name__).warning("RESIDENT_WORKER_STOP_FORCED")
-            if client is not None:
-                await asyncio.wait_for(client.force_stop(), timeout=5)
+            try:
+                if client is not None:
+                    await asyncio.wait_for(client.force_stop(), timeout=5)
+            finally:
+                try:
+                    await _confirm_exit(self.process)
+                except SdkRuntimeStillRunning:
+                    logging.getLogger(__name__).error("NATIVE_CLI_UNKILLABLE pid=%s path=resident", self.process.pid)
+                    self.unexited = self.process
+                    if on_unexited is not None:
+                        on_unexited(self.process)
         finally:
             from . import sdk_telemetry
             span_file, self.span_file = self.span_file, None
@@ -608,6 +655,12 @@ class ResidentSdk:
 class ResidentHolder:
     """The owner's per-conversation slot; ``run_copilot`` replaces or clears ``live``."""
     live: ResidentSdk | None = None
+    # The owner's registration of a CLI that outlives a stop of ``live`` (ResidentSdk.stop).
+    on_unexited: Callable | None = None
+    # The owner's tracked stop task for a replaced ``live``: while it runs, this conversation starts no SDK.
+    track: Callable | None = None
+    # Awaited before a new SDK client starts: this slot's tracked stops have ended, and no CLI outlived a stop.
+    settle: Callable | None = None
 
 
 def _resident_digest(**values):
@@ -1356,10 +1409,20 @@ async def run_copilot(
             logging.getLogger(__name__).warning("RESIDENT_SDK_RESTARTED reason=%s",
                                                 "settings_changed" if resident.live.alive() else "exited")
             stale, resident.live, from_live_files = resident.live, None, True
-            # Its own task: a cancelled turn never leaves the old CLI process running.
-            await asyncio.shield(asyncio.ensure_future(stale.stop()))
+            # Its own task, which registers a surviving CLI itself: a cancelled turn never leaves it unregistered.
+            stopping = (resident.track(stale) if resident.track is not None
+                        else asyncio.ensure_future(stale.stop(resident.on_unexited)))
+            try:
+                await asyncio.shield(stopping)
+            finally:
+                if stale.unexited is not None:
+                    # No second SDK beside a live CLI (also when force_stop timed out).
+                    raise SdkRuntimeStillRunning(stale.unexited) from None
         live = resident.live if resident.live is not None else ResidentSdk(digest, sdk_session_id, session_files, model)
         live.released_sha256 = live._released_files = None
+        if live.session is None and resident.settle is not None:
+            # A new client: never beside this session's stopping CLI, nor beside any CLI that outlived its stop.
+            await resident.settle()
     sdk_invoke = invoke if live is None else live.invoke
     sdk_permission = permission if live is None else live.permission
     sdk_emit = emit if live is None else live.emit
@@ -1693,7 +1756,11 @@ async def run_copilot(
                 except Exception as error:
                     if behavior_boundary is not None:
                         behavior_boundary.record_failure(error, phase="sdk_shutdown")
-                    await asyncio.wait_for(client.force_stop(), timeout=5)
+                    try:
+                        await asyncio.wait_for(client.force_stop(), timeout=5)
+                    finally:
+                        # Also after a force_stop timeout: the caller frees its execution slot only on a confirmed exit.
+                        await _confirm_exit(owned_process)
                     if behavior_boundary is not None:
                         raise RuntimeError("Assistant runtime shutdown is unverified") from None
                 finally:

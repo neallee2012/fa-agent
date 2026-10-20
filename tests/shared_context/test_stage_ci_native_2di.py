@@ -18,6 +18,7 @@ from test_stage_ci_routines import load_ci
 ROOT = Path(__file__).resolve().parents[2]
 V1, V2 = "foundry-native-v1", "foundry-native-v2"
 GUARD = "FA_NATIVE_SESSION_GUARD_ENFORCE"
+IDLE = "FA_NATIVE_IDLE_UPGRADE"
 
 
 @pytest.fixture
@@ -32,21 +33,61 @@ def switch_on(ci):
     ci.STAGE["api_environment"][GUARD] = "1"
 
 
+def guard_off_profile(ci):
+    """A profile with the switch off (a new azd environment, or dev before its turn-on): the off branch's rules.
+    stage.json itself is on and never goes off again."""
+    ci.STAGE["api_environment"][GUARD] = "0"
+
+
 def assistants(ci):
     return [item for item in ci.STAGE["agents"] if item["kind"] == "assistant"]
 
 
-def test_default_off_everywhere(ci):
-    for path in (ROOT / "deploy" / "stage" / "stage.json", ROOT / "deploy" / "azd" / "profile.defaults.json"):
+def test_stage_is_on_and_a_new_azd_environment_starts_off(ci):
+    for path, guard in ((ROOT / "deploy" / "stage" / "stage.json", "1"),
+                        (ROOT / "deploy" / "azd" / "profile.defaults.json", "0")):
         profile = json.loads(path.read_text(encoding="utf-8"))
-        assert profile["api_environment"][GUARD] == "0"
+        assert profile["api_environment"][GUARD] == guard and profile["api_environment"][IDLE] == "0", path
+        # The files keep v1: ci_deploy derives the assistants' v2 from the switch, never from the profile.
         assert profile["assistant_environment"]["FA_NATIVE_TURNS"] == V1
         assert all("FA_NATIVE_TURNS" not in (agent.get("hosted_environment") or {})
                    for agent in profile.get("agents", []))
         assert "FA_NATIVE_TURNS" not in profile.get("assistant_hosted_environment", {})
+    assert ci.native_2di() is True
+
+
+def test_a_profile_with_the_switch_off_declares_no_v2_and_the_follow_still_follows(ci):
+    """The off profile (a new azd environment, dev before its turn-on): not on, no assistant (or any Agent) declares
+    v2, and the sync's follow step has no --verify-follow."""
+    guard_off_profile(ci)
     assert ci.native_2di() is False
     assert all(environment.get("FA_NATIVE_TURNS") != V2 for environment in ci.hosted_environment().values())
     assert "--verify-follow" not in ci._sync_script("registry/hosted@sha256:" + "a" * 64, follow=True)
+
+
+def test_the_real_stage_profile_passes_every_offline_turn_on_precondition(monkeypatch):
+    """The real stage.json and this checkout, with ARM, ``serving_commit``, ``run``, ``realtime_ready`` and ``release``
+    replaced and nothing else (``missing_2di`` is the real one): meta's checks pass, only 2d-i is on (IDLE, the
+    reconciler and the upgrade snapshots stay off), and guard lets the first turn-on through over one serving revision
+    whose commit (this checkout) declares NATIVE_2DI_SCHEMA 2."""
+    ci = load_ci()
+    ci.release = lambda: "test"
+    api = ci.STAGE["api_environment"]
+    assert ci.native_2di() is True and ci.missing_2di() == []
+    assert api[IDLE] == "0" and api["FA_NATIVE_UPGRADE_RECONCILER"] == "0" and api["FA_NATIVE_TURNS"] == V1
+    assert "FA_UPGRADE_SNAPSHOT_CONTAINER_URL" not in api
+    ci.check()
+    overlay = ci.hosted_environment()
+    for agent in ci.STAGE["agents"]:
+        environment = overlay.get(agent["agent_id"]) or {}
+        assert (environment.get("FA_NATIVE_TURNS") == V2) is (agent["kind"] == "assistant"), agent["name"]
+        if environment:
+            assert versions._check_environment(environment, ci.STAGE["hosted_idle_timeout_seconds"]) == environment
+    assert "'--verify-follow'" in ci._sync_script("registry/hosted@sha256:" + "a" * 64, follow=True)
+    for deployed in (None, "0", "1"):  # the first turn-on (stage serves "0" or no key), then every later deploy
+        api_app(ci, monkeypatch, deployed=deployed)
+        monkeypatch.setattr(ci, "serving_commit", lambda revision: "HEAD")
+        ci.guard()
 
 
 def test_switch_on_sets_both_and_the_follow_only_reports(ci):
@@ -69,8 +110,10 @@ def test_switch_on_sets_both_and_the_follow_only_reports(ci):
 def test_one_without_the_other_is_refused(ci, case):
     a = assistants(ci)[0]
     if case == "v2_hosted_without_switch":
+        guard_off_profile(ci)
         a["hosted_environment"]["FA_NATIVE_TURNS"] = V2
     elif case == "v2_seed_without_switch":
+        guard_off_profile(ci)
         ci.STAGE["assistant_environment"]["FA_NATIVE_TURNS"] = V2
     elif case == "v1_hosted_with_switch":
         switch_on(ci)
@@ -102,9 +145,10 @@ def test_switch_on_refuses_a_checkout_without_p5_and_p6(monkeypatch):
             ci.check()
 
 
-def api_app(ci, monkeypatch, *, deployed=None, mode="Single", active=1, revision=None, ready_active=True):
+def api_app(ci, monkeypatch, *, deployed=None, mode="Single", active=1, revision=None, ready_active=True, idle=None):
     """The API app guard/sync/api read; ``ready_active`` False: the one active revision is not the latest ready."""
     env = [{"name": "PYTHONUTF8", "value": "1"}] + ([{"name": GUARD, "value": deployed}] if deployed else [])
+    env += [{"name": IDLE, "value": idle}] if idle else []
     ready = revision or f"{ci.STAGE['api_app']}--abcdef1-r1-1"
     names = [ready, "r1", "r2"] if ready_active else ["r1", ready, "r2"]
     revisions = {"value": [{"name": name, "properties": {"active": index < active}}
@@ -124,7 +168,12 @@ def served(ci, monkeypatch):
     monkeypatch.setattr(ci, "serving_commit", lambda revision: None if "--portal" in revision else "base")
     old = []
     monkeypatch.setattr(ci, "missing_2di", lambda commit=None: ["IN_REQUEST_WAIT_SECONDS"] if commit in old else [])
+    monkeypatch.setattr(ci, "missing_idle", lambda commit=None: ["NATIVE_IDLE_SCHEMA"] if commit == PRE_4B1 else [],
+                        raising=False)
     return old
+
+
+PRE_4B1 = "serving-without-4b-1"
 
 
 def test_turning_on_passes_over_one_revision_already_on_p6(ci, monkeypatch, served):
@@ -148,6 +197,74 @@ def test_turning_on_refuses_more_than_one_revision(ci, monkeypatch, served, mode
         ci.guard()
 
 
+@pytest.mark.parametrize("guard,idle", [("0", "1"), ("1", "yes")])
+def test_the_idle_upgrade_needs_the_2di_switch(ci, guard, idle):
+    ci.STAGE["api_environment"].update({GUARD: guard, IDLE: idle})
+    with pytest.raises(SystemExit, match=f"{IDLE} accepts only"):
+        ci.check()
+
+
+def test_turning_the_idle_upgrade_on_needs_one_serving_revision(ci, monkeypatch, served):
+    """ADR-0009 §12: 2d-i is already on; turning the idle upgrade on checks the revisions as turning 2d-i on does."""
+    switch_on(ci)
+    ci.STAGE["api_environment"][IDLE] = "1"
+    ci.check()
+    api_app(ci, monkeypatch, deployed="1", active=2)
+    with pytest.raises(SystemExit, match="idle upgrade on needs one active revision"):
+        ci.guard()
+    api_app(ci, monkeypatch, deployed="1")
+    ci.guard()
+    api_app(ci, monkeypatch, deployed="1", active=2, idle="1")
+    ci.guard()  # already on: only the mode is checked
+    api_app(ci, monkeypatch, deployed="1", mode="Multiple", idle="1")
+    with pytest.raises(SystemExit, match="single revision mode"):
+        ci.guard()
+
+
+@pytest.mark.parametrize("deployed", ["1", None])
+def test_turning_the_idle_upgrade_on_needs_a_serving_api_with_4b1(ci, monkeypatch, served, deployed):
+    """IDLE=1 in the deploy that first ships 4b-1: the draining revision would read the new revision's ``idle_upgrade``
+    rows as 409 NATIVE_BINDING_INVALID, so the serving commit must already declare NATIVE_IDLE_SCHEMA."""
+    switch_on(ci)
+    ci.STAGE["api_environment"][IDLE] = "1"
+    api_app(ci, monkeypatch, deployed=deployed)
+    monkeypatch.setattr(ci, "serving_commit", lambda revision: PRE_4B1)
+    with pytest.raises(SystemExit, match="the idle upgrade \\(4b-1\\) on needs .*NATIVE_IDLE_SCHEMA"):
+        ci.guard()
+    monkeypatch.setattr(ci, "serving_commit", lambda revision: "base")
+    ci.guard()
+
+def test_every_deploy_with_the_idle_upgrade_on_needs_a_serving_api_at_its_schema(ci, monkeypatch, served):
+    """IDLE already on: a later phase raises NATIVE_IDLE_SCHEMA (6a (c) 2, 4d 3, 4b-4 4) while it stays on, so the draining
+    revision must decode the new rows too; an old revision still deactivating is not refused for that."""
+    switch_on(ci)
+    ci.STAGE["api_environment"][IDLE] = "1"
+    monkeypatch.setattr(ci, "serving_commit", lambda revision: PRE_4B1)
+    api_app(ci, monkeypatch, deployed="1", idle="1")
+    with pytest.raises(SystemExit, match="the idle upgrade is on and the serving API lacks .*NATIVE_IDLE_SCHEMA.*"
+                                         f"{IDLE}=\"0\" first"):
+        ci.guard()
+    monkeypatch.setattr(ci, "serving_commit", lambda revision: None)
+    with pytest.raises(SystemExit, match="the serving commit is unknown"):
+        ci.guard()
+    monkeypatch.setattr(ci, "serving_commit", lambda revision: "base")
+    api_app(ci, monkeypatch, deployed="1", idle="1", active=2)
+    ci.guard()  # at the schema: the one-active-revision check is for turning on only
+    ci.STAGE["api_environment"][IDLE] = "0"
+    monkeypatch.setattr(ci, "serving_commit", lambda revision: PRE_4B1)
+    ci.guard()  # the first step of the two: this commit with IDLE "0"
+
+
+@pytest.mark.parametrize("deployed", ["1", None])
+def test_with_the_idle_upgrade_off_the_serving_4b1_is_never_checked(ci, monkeypatch, served, deployed):
+    switch_on(ci)
+    monkeypatch.setattr(ci, "serving_commit", lambda revision: PRE_4B1)
+    monkeypatch.setattr(ci, "missing_idle", lambda commit=None: pytest.fail("IDLE=0 reads no 4b-1 schema"),
+                        raising=False)
+    api_app(ci, monkeypatch, deployed=deployed)
+    ci.guard()
+
+
 HOSTED = "/fa-behavior-assistant-desktop@sha256:" + "a" * 64
 
 
@@ -161,6 +278,7 @@ def test_sync_follow_and_api_check_the_switch_too(ci, monkeypatch, served):
     hosted = ci.STAGE["registry"] + HOSTED
     steps = (lambda: ci.sync("api:ref", hosted), lambda: ci.sync("api:ref", hosted, follow=True),
              lambda: ci.api("api:ref"))
+    guard_off_profile(ci)
     api_app(ci, monkeypatch, deployed="1")  # on, and this profile turns it off
     for step in steps:
         with pytest.raises(SystemExit, match="cannot be turned off"):
@@ -169,7 +287,7 @@ def test_sync_follow_and_api_check_the_switch_too(ci, monkeypatch, served):
     served.append("base")  # turning on over a serving API without P6
     api_app(ci, monkeypatch)
     for step in steps:
-        with pytest.raises(SystemExit, match="P5\\+P6 already"):
+        with pytest.raises(SystemExit, match="2d-i \\(P5\\+P6\\) on needs"):
             step()
     served.clear()
     api_app(ci, monkeypatch, active=2)
@@ -186,6 +304,7 @@ def test_sync_follow_and_api_check_the_switch_too(ci, monkeypatch, served):
 def test_sync_with_the_switch_off_refuses_a_served_v2_and_says_rerun_with_1(ci, monkeypatch, served):
     """A turn-on that stopped after sync (v2 published, API PATCH failed), then a profile back to "0": the sync job
     gets --refuse-native-v2, and its failure says to rerun with "1"."""
+    guard_off_profile(ci)
     api_app(ci, monkeypatch)
     scripts = []
     monkeypatch.setattr(ci, "_run_job", lambda api_ref, script, **kw: scripts.append(script) or ("Failed", "x"))
@@ -221,7 +340,7 @@ def test_turning_on_refuses_an_old_serving_api(ci, monkeypatch, served):
     switch_on(ci)
     served.append("base")
     api_app(ci, monkeypatch)
-    with pytest.raises(SystemExit, match="P5\\+P6 already"):
+    with pytest.raises(SystemExit, match="2d-i \\(P5\\+P6\\) on needs"):
         ci.guard()
     api_app(ci, monkeypatch, deployed="1")  # already on: later deploys roll from P6+ to newer
     ci.guard()
@@ -235,6 +354,7 @@ def test_turning_on_refuses_an_unknown_serving_commit(ci, monkeypatch, served):
 
 
 def test_it_never_goes_off_again(ci, monkeypatch, served):
+    guard_off_profile(ci)
     api_app(ci, monkeypatch, deployed="1")
     with pytest.raises(SystemExit, match="cannot be turned off"):
         ci.guard()
@@ -258,6 +378,11 @@ def test_the_schema_check_reads_the_real_checkout():
     assert "verify_only" in inspect.signature(native_environment_sync.follow_all).parameters
     assert real.missing_2di() == []
     assert real.missing_2di("0" * 40) == ["native_binding.NATIVE_2DI_SCHEMA=0, needs 2"]  # no such commit
+    # 2 = 6a (c) (``idle_upgrade.waiting``); 3 = 4d (the rolled-back slot values and the fence's ``rollback``); 4 = 4b-4
+    # (the ``vetoed`` slot value): an API that decodes them must serve before the idle upgrade goes on.
+    assert real.api_2di_schema(name="NATIVE_IDLE_SCHEMA") == native_binding.NATIVE_IDLE_SCHEMA == 4
+    assert real.missing_idle() == []
+    assert real.missing_idle("0" * 40) == ["native_binding.NATIVE_IDLE_SCHEMA=0, needs 4"]
 
 
 def test_verify_follow_excludes_defer_follow(capsys):

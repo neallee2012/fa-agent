@@ -486,6 +486,32 @@ def test_every_wait_answer_advanced_the_follow_and_the_same_rid_is_accepted_once
             if command.operation == "submit"] == ["sent-during-follow"]
 
 
+def test_a_hosted_sdk_runtime_still_exiting_is_resent_with_the_same_rid(native_api, monkeypatch):
+    """#903 P2-2: Hosted refuses before rid:<RID> while an earlier SDK runtime has not exited (503
+    NATIVE_EXECUTION_UNAVAILABLE, not_dispatched). The API answers server_following with the RID, the shape the
+    workbench resends unchanged and Teams' relay polls again; the same RID is then accepted once."""
+    case = native_api
+    refusing = [True]
+
+    def hosted(request):
+        if refusing[0] and NATIVE_REQUEST.validate_json(request.content).operation == "submit":
+            return httpx.Response(503, json={"error": {"code": "NATIVE_EXECUTION_UNAVAILABLE", "message": "OFFLINE",
+                                                       "not_dispatched": True, "retry_after_ms": 1000}})
+        return case.remote(request)
+
+    monkeypatch.setattr(case.foundry.http, "_transport", httpx.MockTransport(hosted))
+    refused = submit(case, rid="while-cli-exits")
+    error = refused.json()["error"]
+    assert (refused.status_code, error["code"]) == (503, "NATIVE_EXECUTION_UNAVAILABLE"), refused.text
+    assert error["not_dispatched"] is True and error["request_id"] == "while-cli-exits"
+    assert error["server_following"] is True and error["reconcile_original"] is False
+    refusing[0] = False
+    accepted = submit(case, rid="while-cli-exits")
+    assert accepted.status_code == 202, accepted.text
+    assert [command.command.request_id for _, command in case.remote.calls
+            if command.operation == "submit"] == ["while-cli-exits"]
+
+
 @pytest.mark.parametrize("after", ["recovery-same-session", "follow-finished-new-session"])
 def test_hosted_task_recovery_is_not_a_follow_to_wait_for(native_api, monkeypatch, after):
     """Hosted's 503 during its own task recovery: the follow has nothing to move, so no server_following loop.

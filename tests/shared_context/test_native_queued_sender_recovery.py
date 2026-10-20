@@ -522,8 +522,9 @@ def test_legacy_sender_and_queue_recover_together_before_delivering_once(
         result = second.wait("rid-1", "unknown")
         assert result.delegation == (accepted if ending == "ready" else None)
         if ending != "ready":
-            assert result.failure_code == (
-                "NATIVE_TURN_CANCELLED" if ending == "cancel" else "NATIVE_RELAY_OUTCOME_UNKNOWN")
+            # The original send had dispatched: a cancel is kept as cancel_requested, not a confirmed cancellation.
+            assert result.failure_code == "NATIVE_RELAY_OUTCOME_UNKNOWN"
+            assert result.cancel_requested == (ending == "cancel")
         assert result.result is None, "A recovered send is not a fabricated sender checkpoint"
         assert result.submit_digest == retained.submit_digest and result.capture_digest == retained.capture_digest
     assert not second_sdk.calls

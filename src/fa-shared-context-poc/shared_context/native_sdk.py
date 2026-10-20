@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 from typing import Annotated, Literal
 from urllib.parse import quote
 
@@ -39,7 +40,7 @@ from .behavior_user_turn import TurnNumber as UserTurn, UserTurnNumber
 from .behavior_wire import AssistantSdkStop, Identifier, WireModel
 from .errors import Problem
 from .m3_models import Filename
-from .m2_copilot import ToolFailure, ToolOutput, ToolSpec, run_copilot
+from .m2_copilot import SdkRuntimeStillRunning, ToolFailure, ToolOutput, ToolSpec, run_copilot
 from .native_turns import NativeSdkFailure, NativeSdkResult, NativeTurnRuntime, timing_id
 from .behavior_timing import phase_timing
 from .native_capabilities import (
@@ -307,9 +308,14 @@ class NativeSdkExecutor:
         self.reader: NativeTurnRuntime | None = None
         from .native_resident import NativeResidentPool
         # ADR-0005: released SDKs this VM keeps between turns; turns run one at a time on one event loop.
-        self.resident = NativeResidentPool()
+        # CLIs that outlived force_stop (SdkRuntimeStillRunning); no SDK starts on this VM while one still runs.
+        self._unexited = []
+        self.resident = NativeResidentPool(on_unexited=self._register_unexited, survivor=self._survivor)
         # Prewarm listings still running (README#typing-prewarm); kept so the loop never drops them mid-flight.
         self._prewarming: set[asyncio.Task] = set()
+        self._recovering: set[asyncio.Task] = set()  # recovery restarts waiting for started turns (_register_unexited)
+        # SIGTERM to this process: agentserver's own handler sets every task's ctx.shutdown. Tests replace it.
+        self.request_recovery = lambda: signal.raise_signal(signal.SIGTERM)
 
     def prewarm(self, toolboxes) -> int:
         """The owner is typing: each provider with ``warm`` fills its kept lists in the background, outside any turn.
@@ -323,7 +329,53 @@ class NativeSdkExecutor:
             task.add_done_callback(self._prewarming.discard)
         return len(toolboxes)
 
+    def _survivor(self):
+        self._unexited = [process for process in self._unexited if process.poll() is None]
+        return next(iter(self._unexited), None)
+
+    def runtime_unexited(self):
+        """A registered CLI still runs. A stop still running is not one: admission takes the RID (runtime_stopping)."""
+        return self._survivor() is not None
+
+    def runtime_stopping(self, conversation_id=None):
+        """A stop of this conversation's own resident SDK still runs, so its turn waits before "started"; another
+        conversation's stop does not hold it (run_copilot settles any new client too)."""
+        return self.resident.stopping(conversation_id)
+
+    def _register_unexited(self, process):
+        """A CLI that outlived its stop on any path (turn, replaced, evicted or discarded SDK): no SDK starts beside
+        it, and this VM restarts once through the platform's graceful shutdown, whose handlers leave by
+        exit_for_recovery (ADR-0009 §5). Once per process: a replaced SDK's stop and its turn both report it."""
+        if any(known is process for known in self._unexited):
+            return
+        self._unexited.append(process)
+        # Every started turn, the registering one included, finishes and saves first: the restart's shutdown would cut
+        # it, and its recovery re-run it as a continuation. The wait runs in its own task, so a turn registering its own
+        # CLI never waits for itself. No new turn starts meanwhile (preflight and _await_runtime_exit see this CLI).
+        executing = list(getattr(self.reader, "executing", {}))
+        if not executing:
+            self.request_recovery()
+            return
+        task = asyncio.ensure_future(self._recover_after(executing, process))
+        self._recovering.add(task)
+        task.add_done_callback(self._recovering.discard)
+
+    async def _recover_after(self, executing, process):
+        # No bound: a cut started turn stays started and re-runs as a continuation (its tool calls may repeat), while
+        # a queued turn that times out is only resendable. Each future ends in _execute_started's finally.
+        log = logging.getLogger(__name__)
+        log.warning("NATIVE_RECOVERY_WAIT_STARTED pid=%s turns=%s", process.pid, len(executing))
+        await asyncio.wait(executing)
+        exited = process.poll() is not None
+        log.warning("NATIVE_RECOVERY_WAIT_ENDED pid=%s cli_exited=%s", process.pid, exited)
+        if not exited:  # exited meanwhile: no restart needed, and a turn may have started since
+            self.request_recovery()
+
     def preflight(self, capture, *, adopted=False):
+        if self.runtime_unexited():
+            # Admission runs this before rid:<RID> exists: nothing was taken, so the same RID is resent.
+            raise Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "an earlier SDK runtime has not exited; retry later",
+                          not_dispatched=True, retry_after_ms=1000)
         settings = capture.template.settings
         selected_providers(capture, self.capability_providers, agent_messages=self.agent_tools is not None)
         if (capture.template.role.profile not in _PROFILES
@@ -512,7 +564,7 @@ class NativeSdkExecutor:
         # The images' base64 the SDK keeps in its files; checked again on the exact files before the model call.
         image_bytes = sum(4 * -(-image.byte_length // 3) for image in getattr(receipt.command, "images", ()))
         files = await self.resident.continue_live(
-            self.resident.holder(scope.sdk_session_id), previous,
+            self.resident.holder(scope.sdk_session_id, scope.conversation_id), previous,
             checkpoint_profile=instruction.checkpoint_profile, model_provider=scope.model_provider,
             model=instruction.model, needed_bytes=image_bytes)
         if files is None:
@@ -965,7 +1017,11 @@ class NativeSdkExecutor:
                 cancel_observation = asyncio.create_task(delegates[0].request_cancel())
             if not running.done():
                 running.cancel()
-            await asyncio.gather(running, abort, return_exceptions=True)
+            stopped, _ = await asyncio.gather(running, abort, return_exceptions=True)
+            if isinstance(stopped, SdkRuntimeStillRunning):
+                # Killed twice and still alive (e.g. an uninterruptible kernel wait).
+                logging.getLogger(__name__).error("NATIVE_CLI_UNKILLABLE pid=%s", stopped.process.pid)
+                self._register_unexited(stopped.process)
             await asyncio.gather(*previews, return_exceptions=True)
             if holder.live is None:
                 # No SDK was kept, so nothing uses this turn's directories. A kept SDK's stay until the next startup
@@ -1087,7 +1143,7 @@ def native_runtime_from_environment(hosted):
             "not_configured" if not os.environ.get("FA_PRIVATE_MEMORY_STORE") else "configuration_invalid",
         ))
     executor.remove_turn_dirs()
-    usage =NativeUsageReporter(api_url, hosted.identity.agent_id, api_token)
+    usage = NativeUsageReporter(api_url, hosted.identity.agent_id, api_token)
 
     async def terminal(receipt):
         try:

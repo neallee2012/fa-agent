@@ -36,6 +36,9 @@ class AgentTransport(NativeTransport):
         if command.operation != "agent_receive":
             return super().__call__(request)
         self.calls.append((request, command))
+        if getattr(self, "refuse_receive", None) is not None:
+            status, body = self.refuse_receive
+            return httpx.Response(status, json=body)
         original = self.records.get(command.command.request_id)
         if original is not None and original.submit_digest != command.sha256:
             return httpx.Response(409, json={"error": {"code": "NATIVE_RID_CONFLICT"}})
@@ -384,6 +387,25 @@ def test_lost_receive_response_keeps_original_id_and_only_one_quota_entry(relay_
     assert gateway._quota(case.principal).read(original.source.root_id).messages[0].message_id == received.message_id
 
 
+def test_a_recipient_whose_earlier_cli_has_not_exited_has_the_sender_resend_the_same_message(relay_case):
+    """#903 P2-2: Hosted's not_dispatched 503 NATIVE_EXECUTION_UNAVAILABLE (an earlier SDK runtime still exiting) is
+    NATIVE_RELAY_RECIPIENT_UNAVAILABLE, the code the sender's relay waits on and resends; the resend is accepted once."""
+    from shared_context.native_agent_api import NativeAgentRelayGateway
+
+    case = relay_case
+    gateway = NativeAgentRelayGateway(case.base.a, enabled=True, repository=case.repository)
+    command = send_command(case)
+    case.remotes[1].refuse_receive = (503, {"error": {
+        "code": "NATIVE_EXECUTION_UNAVAILABLE", "message": "OFFLINE", "not_dispatched": True, "retry_after_ms": 1000}})
+    with pytest.raises(Problem) as refused:
+        gateway.send(case.principal, command)
+    assert (refused.value.status, refused.value.body["error"]["code"]) == (503, "NATIVE_RELAY_RECIPIENT_UNAVAILABLE")
+    assert not case.remotes[1].records
+    case.remotes[1].refuse_receive = None
+    received = gateway.send(case.principal, command)
+    assert list(case.remotes[1].records) == [received.message_id] and received.status == "accepted"
+
+
 @pytest.mark.parametrize("side", [0, 1], ids=["sender", "recipient"])
 @pytest.mark.parametrize("previous", [False, True], ids=["first-attempt", "retry-after-lost-ack"])
 def test_native_preflight_distinguishes_recipient_from_sender_and_preserves_prior_delivery(relay_case, side, previous):
@@ -681,7 +703,11 @@ def test_native_recipient_feedback_survives_the_real_api_error_handler(relay_cli
         assert len(case.remotes[1].records) == len(case.repository.data) == 1
 
 
-def test_unknown_peer_outcome_wakes_a_once_without_claiming_the_sdk_stopped(relay_case):
+@pytest.mark.parametrize("code", ["NATIVE_TURN_TIMEOUT", "NATIVE_EARLIER_VERSION_UNFINISHED"])
+def test_unknown_peer_outcome_wakes_a_once_without_claiming_the_sdk_stopped(relay_case, code):
+    """NATIVE_EARLIER_VERSION_UNFINISHED: the stub stores the shape Hosted's read-time view of a ``refused:<RID>``
+    receipt answers. Hosted may notify a refused RID more than once (#915); the second /outcome is the same RID at A,
+    so A gets one notice and one usage record."""
     from dataclasses import replace
     from shared_context.native_agent_api import NativeAgentRelayGateway, NativeRelayResult
 
@@ -691,19 +717,26 @@ def test_unknown_peer_outcome_wakes_a_once_without_claiming_the_sdk_stopped(rela
     case.remotes[0].completed(case.sender.request_id)
     original = case.remotes[1].records[accepted.message_id]
     unknown = NativeReceipt.model_validate({
-        **original.model_dump(), "status": "unknown", "turn_number": 1, "failure_code": "NATIVE_TURN_TIMEOUT"})
+        **original.model_dump(), "status": "unknown", "turn_number": 1, "failure_code": code})
     case.remotes[1].records[unknown.request_id] = unknown
     peer_scope = case.base.b.config.agent_scope(case.base.b.agent_id)
     peer = replace(case.principal, oid=str(peer_scope.identity.oid), actor_id=peer_scope.identity.actor)
     query = NativeRelayResult(conversation_id=unknown.conversation_id, request_id=unknown.request_id)
     notified = gateway.outcome(peer, query)
     stored = case.remotes[0].records[notified.message_id]
+    usage = dict(case.base.a.runtime.work_policy.records)
     assert notified.conversation_id == case.sender.conversation_id and notified.message_id == accepted.message_id
-    assert stored.source.kind == "agent_notice" and stored.source.outcome.failure_code == "NATIVE_TURN_TIMEOUT"
-    assert stored.source.result is None and "未確認" in stored.command.content
-    assert "不表示" in stored.command.content and "停止" in stored.command.content
+    assert stored.source.kind == "agent_notice" and stored.source.outcome.failure_code == code
+    assert stored.source.result is None
+    if code == "NATIVE_TURN_TIMEOUT":
+        assert "未確認" in stored.command.content and "請勿重新交辦" in stored.command.content
+        assert "不表示" in stored.command.content and "停止" in stored.command.content
+    else:  # ADR-0009 §8 (總協調 2026-10-19): it never ran, so a new delegation is safe
+        assert "沒有執行" in stored.command.content and "可以用新的交辦再送一次" in stored.command.content
+        assert "請勿重新交辦" not in stored.command.content and "不表示" not in stored.command.content
     assert gateway.outcome(peer, query) == notified
     assert len(case.remotes[0].records) == 2 and case.remotes[1].records[unknown.request_id] == unknown
+    assert case.remotes[0].records[notified.message_id] == stored and case.base.a.runtime.work_policy.records == usage
 
 
 def test_human_read_of_original_a_surfaces_child_notification_exhaustion_without_rewriting_it(relay_case):

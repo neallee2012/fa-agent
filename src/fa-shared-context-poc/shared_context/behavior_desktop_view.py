@@ -28,8 +28,27 @@ CLOSE_UNAVAILABLE = 4503
 # shape under the viewer's own mouse and the desktop pointer the Agent moves stays invisible. Drawing the pointer
 # into the framebuffer makes it visible to every viewer (x11vnc(1) -cursor, -nocursorshape, -cursorpos).
 COMMAND = ("x11vnc", "-inetd", "-q", "-nopw", "-norc", "-nocmds", "-noremote", "-nocursorshape")
+CLEANUP_TIMEOUT_SECONDS = 5  # _stop waits 2 s for terminate, then kills
 
 log = logging.getLogger(__name__)
+
+
+async def _finish(cleanup, timeout=CLEANUP_TIMEOUT_SECONDS):
+    """Run ``cleanup`` to the end even if this handler is cancelled, then re-raise the cancel.
+
+    A detached task, because the server's cancel scope (anyio) cancels the handler again at every await.
+    """
+    task = asyncio.ensure_future(asyncio.wait_for(cleanup, timeout))
+    cancelled = None
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError as error:
+            cancelled = error
+    if not task.cancelled() and task.exception() is not None:
+        log.warning("DESKTOP_VIEW_CLEANUP_FAILED exception_type=%s", type(task.exception()).__name__)
+    if cancelled is not None:
+        raise cancelled
 
 
 @dataclass(frozen=True)
@@ -111,6 +130,13 @@ async def view_desktop(websocket: WebSocket, *, capability=DESKTOP_CAPABILITY, s
             except (BrokenPipeError, ConnectionResetError):
                 return 1000, "DESKTOP_CLOSED"
 
+    async def cleanup():
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        vnc.writer.close()
+        await _stop(vnc.process)
+
     tasks = [asyncio.ensure_future(to_viewer()), asyncio.ensure_future(to_desktop())]
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -119,11 +145,7 @@ async def view_desktop(websocket: WebSocket, *, capability=DESKTOP_CAPABILITY, s
         log.warning("DESKTOP_VIEW_RELAY_ENDED exception_type=%s", type(error).__name__)
         outcome = 1011, "DESKTOP_VIEW_FAILED"
     finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        vnc.writer.close()
-        await _stop(vnc.process)
+        await _finish(cleanup())
     if outcome is not None:
         await _close(websocket, *outcome)
 

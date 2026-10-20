@@ -784,7 +784,7 @@ const optimisticMessages=new Map();
 // unsent text, model and attachments move to the conversation's next editable composer.
 const nextDraftReads=new Map(),nextDraftStopped=new Set(),nextDraftOrigins=new Map();
 // Messages held by the server while it follows the Agent version; the page only retries the same RID.
-const SERVER_FOLLOWING_CODES=new Set(["AGENT_VERSION_FOLLOWING","NATIVE_SESSION_CHANGED"]);
+const SERVER_FOLLOWING_CODES=new Set(["AGENT_VERSION_FOLLOWING","NATIVE_SESSION_CHANGED","NATIVE_EXECUTION_UNAVAILABLE"]);
 const SERVER_FOLLOWING_DELAY_MS=3000,SERVER_FOLLOWING_TIMEOUT_MS=600000;
 // ADR-0009 M4.4: a short environment change is not announced; the "換版中" text appears only this long after the
 // automatic same-RID resend starts.
@@ -1087,6 +1087,8 @@ function modelContextRefusalText(error){
 function modelChoiceRefusal(error){return modelLockRefusal(error)||modelContextRefusal(error)}
 function modelChoiceRefusalText(error){return modelLockRefusal(error)?modelLockRefusalText(error):modelContextRefusalText(error)}
 function friendlyError(error){
+  if(error?.server_following===true&&error.code==="NATIVE_EXECUTION_UNAVAILABLE")
+    return "助理的執行環境正在重新啟動，訊息已保留，完成後會自動送出。";
   if(error?.server_following===true&&SERVER_FOLLOWING_CODES.has(error.code))
     return error.request_id&&versionResends.has(scopeKey(error.request_id))?
       "助理正在換到新版本，訊息已保留，完成後會自動送出。":
@@ -4113,6 +4115,7 @@ function clearServerFollowingState(){
 function observeAppendDraft(receipt,agent=selectedAgent,auth=attachmentAuthRevision){
   const key=scopeKey(receipt?.append_id,agent),sent=sentAppendDrafts.get(key);
   if(!sent||auth!==attachmentAuthRevision||sent.request_id!==receipt.request_id||sent.content!==receipt.content)return;
+  sent.status=receipt.status;  // resendUnappliedAppend keeps append order on it
   if(!["accepted","sending","applied","not_applied"].includes(receipt.status))return;
   sent.confirmed=true;appendUnconfirmed.delete(key);
   // Definitely never delivered because the turn had already ended: sent once as a new turn (resendUnappliedAppend).
@@ -5398,8 +5401,10 @@ function renderModelSwitchNotice(){
 // this page does not know (an API released after it) is ignored. Sentences exactly as in ADR-0009 §8.
 const ENVIRONMENT_NOTICES={
   environment_updated:"助理已更新到新版本，工作檔也一起帶過來了。",
-  environment_switched_without_files:"已換到新版環境；這次沒有搬工作檔，舊環境的檔案不會出現在新環境。",
-  environment_source_retired:"已換到新的執行環境；舊環境已失效或被平台刪除，這次沒有搬工作檔，之前 VM 裡的工作檔可能已經不在了。",
+  environment_switched_without_files:"上次換環境時沒有搬工作檔，當時舊環境的檔案不會出現在現在的環境。",
+  environment_source_retired:"上次換環境時，舊環境已失效或被平台刪除，沒有搬工作檔；之前 VM 裡的工作檔可能已經不在了。",
+  environment_rolled_back:"助理已退回先前的版本；剛才中斷的訊息請再送一次。",
+  environment_upgrade_vetoed:"助理這次沒有更新，會繼續使用目前的版本。",
 };
 const environmentNotices=new Map();
 function environmentNoticeText(notice){
@@ -5408,11 +5413,21 @@ function environmentNoticeText(notice){
     return version(notice.from_version)&&version(notice.to_version)?
       `平台把助理的執行環境換成了另一個版本（v${notice.from_version}→v${notice.to_version}）；FA 已記錄，相容就照常執行。`:null;
   }
-  return Object.hasOwn(ENVIRONMENT_NOTICES,notice?.kind||"")?ENVIRONMENT_NOTICES[notice.kind]:null;
+  if(!Object.hasOwn(ENVIRONMENT_NOTICES,notice?.kind||""))return null;
+  // M4 #1: 已退回 without its work files keeps the no-files sentence.
+  return ENVIRONMENT_NOTICES[notice.kind]+(notice.kind==="environment_rolled_back"&&notice.without_files===true?
+    ENVIRONMENT_NOTICES.environment_switched_without_files:"");
+}
+// ADR-0009 §12 6a (c): the 6-hour deferral note rides on the receipt as ``upgrade_waiting_version`` (the API sends it
+// only when no slot notice does, and only to a console that says it decodes it); status line only, never an error.
+function receiptNoticeText(receipt){
+  const waiting=receipt?.upgrade_waiting_version;
+  return environmentNoticeText(receipt?.environment_notice)||
+    (typeof waiting==="string"&&/^[1-9][0-9]{0,15}$/.test(waiting)?`有新版本 v${waiting}，會在助理閒置時更新。`:null);
 }
 // One accepted submit answer of ``agent``: its notice replaces the shown one; an answer without one ends it.
 function noteEnvironment(task,agent){
-  const shown=environmentNoticeText(task?.native_receipt?.environment_notice);
+  const shown=receiptNoticeText(task?.native_receipt);
   if(shown)environmentNotices.set(agent,shown);else environmentNotices.delete(agent);
   renderEnvironmentNotice();
 }
@@ -6727,7 +6742,7 @@ function renderConversation(tasks){
         unknown:"還不確定有沒有送達，可以按這則訊息下方「⋯」裡的「核對追加」。",
       })[appended.status]||"還不確定有沒有送達。";
       const resent=appended.status==="not_applied"&&["waiting","sent"].includes(sentAppendDrafts.get(scopeKey(appended.append_id))?.resend);
-      if(resent)status.textContent="這一回合剛好結束，改成新訊息送出。";
+      if(resent)status.textContent="沒趕上這一回合，會改成新訊息送出。";
       turn.append(label,body,status);
       if(appended.status==="not_applied"&&!resent){
         const restore=document.createElement("button"),agent=selectedAgent,thread=selectedThread,auth=attachmentAuthRevision;
@@ -7759,14 +7774,22 @@ async function sendAppend(){
 }
 
 // G plan "no lost message": an append settled not_applied reached the turn after its last SDK round, so the Agent never
-// saw it. Once the turn has ended here (no append target), its text goes out once as the next turn under a new RID; only
-// an unknown outcome must keep its ID (AGENTS.md 7). Only into an empty composer, so the owner's draft and attachments
-// are never sent with it or cleared; otherwise the turn keeps 帶回輸入框.
+// saw it. Its text goes out once as the next turn under a new RID; only an unknown outcome must keep its ID (AGENTS.md
+// 7). Hosted answers not_applied as soon as that round is over, while the original still stops its SDK and saves
+// (2026-10-19). Only foundry-native-v1 queues a new turn behind a running one, so only there it goes out while the
+// original still runs; Responses refuses it (busy_refused NATIVE_TURN_BUSY), so there the original ends first. Any other
+// running turn or append target waits, and so does a later append while an earlier one of the same turn is unsettled
+// (append order). Only into an empty composer, so the owner's draft and attachments are never sent with it or cleared;
+// otherwise the turn keeps 帶回輸入框.
 function resendUnappliedAppend(composer,opening){
-  const sent=[...sentAppendDrafts.values()].find(entry=>entry.resend==="waiting"&&entry.agent===selectedAgent
-    &&entry.thread_id===composer?.thread_id);
-  if(!sent||opening||!nativeProfile(composer.state_profile)||composer.append_target||busy||threadLoading
-    ||state.authentication!=="AVAILABLE"||!scopeAvailable()||messagePending(composer.request_id)||runningOwnTurn())return;
+  const sends=[...sentAppendDrafts.values()].filter(entry=>entry.agent===selectedAgent&&entry.thread_id===composer?.thread_id);
+  const at=sends.findIndex(entry=>entry.resend==="waiting"),sent=sends[at];
+  if(!sent||sends.slice(0,at).some(entry=>entry.request_id===sent.request_id&&["accepted","sending"].includes(entry.status)))
+    return;
+  const queues=composer?.state_profile==="foundry-native-v1",other=id=>!queues||id!==sent.request_id,running=runningOwnTurn();
+  if(opening||!nativeProfile(composer.state_profile)||composer.append_target&&other(composer.append_target.request_id)
+    ||busy||threadLoading||state.authentication!=="AVAILABLE"||!scopeAvailable()||messagePending(composer.request_id)
+    ||running&&other(running.task_id))return;
   conversationRenderKey=null;
   // A conversation that takes no next message here (blocker, archive, received thread) keeps the text for a human.
   if(!(composer.editable?composer.can_submit:composer.can_follow_up)||
@@ -7843,7 +7866,7 @@ async function retryOriginalTurn(task){
       if(Array.isArray(state.tasks)&&value.task.thread_id===thread)
         state.tasks=[...state.tasks.filter(item=>item.task_id!==request),value.task];
       // A retry of an older message shows a notice it carries but never ends the one shown.
-      if(environmentNoticeText(value.task.native_receipt?.environment_notice))noteEnvironment(value.task,agent);
+      if(receiptNoticeText(value.task.native_receipt))noteEnvironment(value.task,agent);
       clearSentDraft(thread,request,agent);
     }
   }catch(error){
