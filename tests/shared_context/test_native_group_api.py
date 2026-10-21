@@ -113,7 +113,7 @@ def test_original_t5_group_request_publishes_once_and_keeps_its_original_root_qu
     assert view.deliveries[0].status == "awaiting" and view.deliveries[0].round == 1
 
 
-@pytest.mark.parametrize("outcome", ["completed", "unknown", "stopped-continuation"])
+@pytest.mark.parametrize("outcome", ["completed", "unknown", "refused", "stopped-continuation"])
 @pytest.mark.parametrize("finish_before_publication", [False, True])
 def test_pending_group_reply_keeps_its_round_and_slot_until_the_original_result_is_saved(
     responses_relay, monkeypatch, outcome, finish_before_publication,
@@ -161,7 +161,8 @@ def test_pending_group_reply_keeps_its_round_and_slot_until_the_original_result_
     completed = env.case.remotes[1].records[handed.message_id]
     if outcome != "completed":
         completed = NativeReceipt.model_validate_json(completed.model_copy(update={
-            "status": "unknown", "result": None, "failure_code": "NATIVE_TURN_CANCELLED",
+            "status": "unknown", "result": None,
+            "failure_code": "NATIVE_EARLIER_VERSION_UNFINISHED" if outcome == "refused" else "NATIVE_TURN_CANCELLED",
             "continuation_available": outcome == "stopped-continuation",
         }).model_dump_json())
         env.case.remotes[1].records[handed.message_id] = completed
@@ -249,6 +250,12 @@ def test_pending_group_reply_keeps_its_round_and_slot_until_the_original_result_
     posted = groups.complete(actor, command)
     assert posted.reason == "published" and posted.post.round == 1
     assert posted.post.kind == ("result" if outcome == "completed" else "blocked")
+    content = groups.read_post(env.case.base.c.human, group.group_id, posted.post.post_id).content
+    if outcome == "refused":  # the marker proves it never ran: say so, as the sender's notice does
+        assert "沒有執行" in content and "可以用新的交辦再送一次" in content
+        assert "不表示已停止" not in content
+    elif outcome == "unknown":  # a truly unknown outcome keeps the conservative text
+        assert "不表示已停止或可以重新交辦" in content
     groups.advance(env.case.principal, group.group_id,
                    NativeGroupAdvance(request_id="next-after-result", expected_round=1))
     assert groups.complete(actor, command) == posted

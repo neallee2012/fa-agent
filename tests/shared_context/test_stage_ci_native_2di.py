@@ -389,3 +389,72 @@ def test_verify_follow_excludes_defer_follow(capsys):
     with pytest.raises(SystemExit):
         versions.main(["sync", "--config", "x.json", "--route", "--defer-follow", "--verify-follow"])
     assert "exclude each other" in capsys.readouterr().err
+
+
+# ----- registered (onboarded) Agents: not in STAGE["agents"], so sync itself gives the assistants v2 ----------------
+
+SERVED = {"KEEP": "1", "FA_NATIVE_TURNS": V1, "FA_NATIVE_HITL_ENABLED": "1", "TZ": "Asia/Taipei"}
+
+
+def _sync_registered(monkeypatch, served, **options):
+    """One configured and one registered Agent, both serving ``served``; the definition sync creates for each."""
+    from test_agent_versions import A, Clock, Foundry, R
+    foundry = Foundry(A, R)
+    for target in (A, R):
+        foundry.add(target.agent_name, 1, "old", definition={
+            "kind": "hosted", "image": "old:image", "environment_variables": dict(served)})
+    monkeypatch.setattr(versions, "_agents", lambda _: (A, [(A, "configured"), (R, "registered")]))
+    clock = Clock()
+    results = versions.sync_all(SimpleNamespace(), lambda _: foundry, image="new:image", build="new", set_route=True,
+                                sleep=clock.sleep, clock=clock, **options)
+    assert [item["state"] for item in results] == ["ok", "ok"]
+    return foundry, R, {target.agent_name: foundry.creates(target.agent_name)[0][2] for target in (A, R)}
+
+
+def test_with_the_switch_on_a_registered_assistant_declares_v2_and_keeps_its_other_env(monkeypatch):
+    _, _, created = _sync_registered(monkeypatch, SERVED, native_v2_registered=True)
+    assert created["agent-r"]["environment_variables"] == {**SERVED, "FA_NATIVE_TURNS": V2}
+    # Configured Agents get v2 only from ci_deploy's overlay (hosted_environment()), not from this path.
+    assert created["agent-a"]["environment_variables"] == SERVED
+
+
+@pytest.mark.parametrize("options", [{}, {"refuse_native_v2": True}])
+def test_with_the_switch_off_a_registered_agent_keeps_v1(monkeypatch, options):
+    _, _, created = _sync_registered(monkeypatch, SERVED, **options)
+    assert created["agent-r"]["environment_variables"] == created["agent-a"]["environment_variables"] == SERVED
+
+
+def test_a_registered_agent_declaring_no_native_profile_is_untouched(monkeypatch):
+    """Not an assistant (an executor's definition declares no FA_NATIVE_TURNS, seed_agents._env): no v2 is added."""
+    served = {key: value for key, value in SERVED.items() if key != "FA_NATIVE_TURNS"}
+    _, _, created = _sync_registered(monkeypatch, served, native_v2_registered=True)
+    assert created["agent-r"]["environment_variables"] == served
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_after_the_release_the_2dii_gate_no_longer_lists_the_registered_agent_as_v1(monkeypatch, on):
+    """2d-ii supports v2 only. The 2d-i cut binds the Agent to the version sync published and records the profile
+    that version declares (``record_switch``); with the switch's v2 the gate finds no v1 row."""
+    from shared_context import native_deploy_gate as gate
+    from test_native_deploy_gate import read_with, row, store_with
+    foundry, registered, created = _sync_registered(monkeypatch, SERVED, native_v2_registered=on)
+    version = foundry.selectors[registered.agent_name]
+    store, _ = store_with(row(registered.agent_id, "sid-r", version,
+                              profile=gate.definition_profile(created[registered.agent_name])))
+    report = gate.evaluate([registered], store.rows, read_with(foundry), armed=True, supported=frozenset({V2}))
+    if on:
+        assert (report["decision"], report["refused"]) == ("pass", [])
+    else:
+        assert report["refused"] == [{"agent_id": registered.agent_id, "reason": "row_profile_unsupported"}]
+
+
+def test_the_sync_job_gets_the_registered_v2_flag_only_with_the_switch_on(ci, capsys):
+    switch_on(ci)
+    for follow in (False, True):
+        assert "'--native-v2-registered'" in ci._sync_script("registry/hosted@sha256:" + "a" * 64, follow=follow)
+    guard_off_profile(ci)
+    script = ci._sync_script("registry/hosted@sha256:" + "a" * 64, follow=True)
+    assert "--native-v2-registered" not in script and "'--refuse-native-v2'" in script
+    with pytest.raises(SystemExit):
+        versions.main(["sync", "--config", "x.json", "--native-v2-registered", "--refuse-native-v2"])
+    assert "exclude each other" in capsys.readouterr().err

@@ -998,9 +998,11 @@ class NativeTurnGateway:
         if conflict.status == 403:
             actual = detail.get("actual_version")
             if isinstance(actual, str) and actual != client.target.agent_version:
-                # A newer image names the version it woke on: a VM fact, recorded as drift (§4 step 6).
-                sessions._observe_drift(client.for_target(client.target.model_copy(update={"agent_version": actual})),
-                                        row, "vm")
+                # A newer image names the version it woke on: a VM fact, recorded as drift (§4 step 6), with the
+                # profile that version declares in the same CAS, as ``_drifted`` does.
+                moved = client.for_target(client.target.model_copy(update={"agent_version": actual}))
+                moved._drift_profile = sessions._version_profile(client, actual)
+                sessions._observe_drift(moved, row, "vm")
             sessions.guard.mark_incompatible(client.target.agent_id, client.target.session_id)
             logging.getLogger(__name__).warning(
                 "NATIVE_SESSION_CALL_INCOMPATIBLE operation=submit session_id=%s reason=%s enforced=False",

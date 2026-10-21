@@ -2,9 +2,10 @@
 
 The gate runs from the **new** API image before that image serves anything (deploy/stage/ci_deploy.py ``gate``, in
 the sync job, so it uses the API identity's Table and Foundry access). ``SUPPORTED_STATE_PROFILES`` imported here is
-therefore exactly the new API's supported set. It reads two things only: every binding row of the Team (the Table)
+therefore exactly the new API's supported set. Its verdict reads two things only: every binding row of the Team (the Table)
 and the version definitions those rows name (``get_version``). It never lists, reads, invokes, wakes or stops a
-session, and it writes nothing.
+session, and it writes nothing. For the operator only (ADR-0009 4d, Neal 2026-10-20), it also lists the project
+vetoes in the same Table (``DEPLOY_VERSION_VETOED``: consider moving the selector back); they never refuse a deploy.
 
 M1 (expand/contract): the API may stop speaking an old wire only when no binding row still records an old profile.
 So a row is refused when its recorded profile, or the profile its recorded actual version's definition declares, is
@@ -27,8 +28,10 @@ from typing import Callable, Iterable
 
 from .errors import Problem
 from .native_binding import SUPPORTED_STATE_PROFILES, NativeBindingRow, NativeBindingStore
+from .native_version_veto import NativeVersionVetoStore
 
-GATE_SCHEMA = "fa-deploy-compat-gate-v1"
+# v2: the report also lists the project vetoes (``vetoed_versions``).
+GATE_SCHEMA = "fa-deploy-compat-gate-v2"
 log = logging.getLogger(__name__)
 
 
@@ -62,16 +65,24 @@ class _Unread(str):
 
 def evaluate(agents: Iterable, rows: Callable[[], Iterable[NativeBindingRow]],
              read_definition: Callable[[object, str], dict], *, armed: bool, override: dict | None = None,
-             supported: frozenset[str] = SUPPORTED_STATE_PROFILES, retired: Iterable[str] = ()) -> dict:
+             supported: frozenset[str] = SUPPORTED_STATE_PROFILES, retired: Iterable[str] = (),
+             vetoes: Callable[[], Iterable] = tuple) -> dict:
     """The gate's report. ``agents`` are the served targets (``agent_id``, ``agent_name``, ``project_endpoint``);
     ``rows()`` reads every binding row; ``read_definition(target, version)`` is one ``get_version`` read and returns
-    the version's definition; ``retired`` are tombstoned Agent IDs, whose rows no turn reaches. No other I/O."""
+    the version's definition; ``retired`` are tombstoned Agent IDs, whose rows no turn reaches; ``vetoes()`` reads
+    every project veto (ADR-0009 4d), listed for the operator and never a refusal. No other I/O."""
     agents = list(agents)
     by_id = {target.agent_id: target for target in agents}
     retired = frozenset(retired)
     report = {"gate": GATE_SCHEMA, "armed": armed, "supported": sorted(supported), "agents": [],
               "unserved_rows": [], "retired_rows": [], "unclaimed": [], "refused": [],
-              "protected": {"versions": [], "images": []}}
+              "protected": {"versions": [], "images": []}, "vetoed_versions": []}
+    try:
+        report["vetoed_versions"] = [{"agent_name": item.agent_name, "version": item.agent_version,
+                                      "vetoed_at": item.vetoed_at} for item in vetoes()]
+    except Exception as error:  # noqa: BLE001 - an operator hint only: reported, never a refusal
+        code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
+        report["vetoed_versions_unread"] = code
     try:
         found = {row.agent_id: row for row in rows()}
     except Exception as error:  # noqa: BLE001 - an unreadable Table proves nothing: refused when armed
@@ -207,7 +218,7 @@ def run_gate(composition, foundry_for, *, armed: bool, override: dict | None = N
         return details.get("definition")
 
     return evaluate([target for target, _ in agents], store.rows, read_definition, armed=armed, override=override,
-                    retired=retired)
+                    retired=retired, vetoes=NativeVersionVetoStore(store.repository).rows)
 
 
 def main(argv=None):
@@ -236,6 +247,11 @@ def main(argv=None):
     line = json.dumps(report, sort_keys=True, ensure_ascii=False)
     (log.warning if report["decision"] in {"refuse", "override"} else log.info)("DEPLOY_COMPAT_GATE %s", line)
     print(f"DEPLOY_COMPAT_GATE {line}")
+    for item in report.get("vetoed_versions", ()):
+        hint = (f"DEPLOY_VERSION_VETOED agent={item['agent_name']} version={item['version']} "
+                f"vetoed_at={item['vetoed_at']} suggest=selector_rollback: consider moving the selector back")
+        log.warning(hint)
+        print(hint)
     return 1 if report["decision"] == "refuse" else 0
 
 

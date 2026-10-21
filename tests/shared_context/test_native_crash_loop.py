@@ -15,7 +15,7 @@ import pytest
 from shared_context import behavior_native_sessions
 from shared_context.behavior_native_sessions import native_session_id
 from shared_context.behavior_native_turn_api import agent_client
-from shared_context.native_binding import NativeBindingIdleUpgrade, NativeBindingSession
+from shared_context.native_binding import NativeBindingIdleUpgrade, NativeBindingObservation, NativeBindingSession
 from shared_context.native_version_veto import veto_store
 import test_native_abandon_source as abandon
 from test_native_abandon_source import binding_rows  # noqa: F401
@@ -513,3 +513,104 @@ def test_a_failed_project_veto_write_is_retried_at_the_next_turn_end_then_never_
     monkeypatch.setattr(behavior_native_sessions, "_native_profile", profile)
     rolled_back(fixture, cut(fixture))
     assert len(writes) == 2
+
+
+# ----- an in-place drift (Neal 2026-10-20) ---------------------------------------------------------------------------
+
+
+def drifted(fixture, monkeypatch, *, minutes_ago=1, at=None, created="41", switch=False, to="42"):
+    """The platform resumed the current SID (created on ``created``) on 42 in place: the drift ``record_observed``
+    writes, observed ``minutes_ago`` (or ``at``) by the store's clock. No FA switch window and no previous SID, unless
+    ``switch`` keeps ``switched``'s (an FA switch onto ``created`` shortly before the drift). ``to``: the version the
+    drift first moved to (``notice_to_version``); another one with ``created="42"`` is a drift there and back."""
+    old, metadata = switched(fixture, monkeypatch)
+    store, row = abandon.store(fixture), abandon.row(fixture)
+    at = at or store.clock() - timedelta(minutes=minutes_ago)
+    update = {"created_agent_version": created, "drift": True, "notice_pending": True, "notice_to_version": to,
+              "observed": NativeBindingObservation(agent_version="42", observed_at=at.isoformat(), source="vm")}
+    if not switch:
+        update |= {"previous_sessions": (), "idle_upgrade": None}
+    record = store.repository.get(store.partition_key, store.row_key(row.agent_id))
+    store.repository.replace(store.partition_key, store.row_key(row.agent_id),
+                             row.model_copy(update=update).model_dump(mode="json"), record.etag)
+    return old, metadata
+
+
+def in_place(fixture, before, metadata, outcome):
+    """The project veto of 42 and nothing else: the row as it was, no session created, only the current SID read."""
+    assert outcome == ("crash_loop", "in_place_veto", None)
+    assert veto(fixture).reason == "crash_loop"
+    assert abandon.row(fixture) == before and before.hosted_session_id == fixture.source.session_id
+    assert set(metadata) == {fixture.source.session_id}
+    assert not [call for call in fixture.files.calls if call[0] == "create"]
+
+
+def test_an_in_place_drift_that_crash_loops_is_vetoed_project_wide_and_never_rolled_back(file_api, monkeypatch,
+                                                                                          caplog):
+    fixture = file_api
+    _, metadata = drifted(fixture, monkeypatch)
+    for n in (1, 2, 3):
+        crash(fixture, f"rid-{n}", f"cid-{n}")
+    before = abandon.row(fixture)
+    with caplog.at_level("WARNING"):
+        in_place(fixture, before, metadata, cut(fixture))
+    lines = [item.message for item in caplog.records if "NATIVE_CRASH_LOOP" in item.message]
+    # One line, never #909's "rollback_to=None" one before it (it reads as a failed rollback).
+    assert len(lines) == 1 and lines[0].startswith("NATIVE_CRASH_LOOP_IN_PLACE ")
+    assert "version=42 crashes=3 start_failures=0 action=project_veto suggest=selector_rollback" in lines[0]
+    assert before.idle_upgrade is None and before.notice() is not None  # no own veto; the drift notice as it was
+    # The next turn end: written, so nothing is read again and the cut goes on to the selector's 42.
+    reads = len(metadata)
+    assert cut(fixture) == ("current", None, None)
+    assert len(metadata) == reads and abandon.row(fixture) == before
+
+
+def test_an_in_place_drift_after_an_fa_switch_vetoes_the_drifted_version_and_does_not_roll_back(file_api, monkeypatch):
+    # #909 alone judged the creation version 40 in the switch's window and rolled back to the previous SID's 41.
+    fixture = file_api
+    _, metadata = drifted(fixture, monkeypatch, created="40", switch=True)
+    for n in (1, 2, 3):
+        crash(fixture, f"rid-{n}", f"cid-{n}")
+    before = abandon.row(fixture)
+    in_place(fixture, before, metadata, cut(fixture))
+    assert veto(fixture, "40") is None and before.idle_upgrade.vetoed_versions == ()
+
+
+def test_crashes_outside_an_in_place_drifts_window_do_nothing(file_api, monkeypatch):
+    fixture = file_api
+    _, metadata = drifted(fixture, monkeypatch, minutes_ago=31)
+    for n in (1, 2, 3):
+        crash(fixture, f"rid-{n}", f"cid-{n}")
+    before, calls = abandon.row(fixture), len(fixture.control_versions)
+    assert cut(fixture) == ("current", None, None)
+    assert metadata == [] and len(fixture.control_versions) == calls  # past the window: nothing read
+    untouched(fixture, before)
+    drifted(fixture, monkeypatch, at=datetime.now(timezone.utc))  # all three crashed before the drift
+    before = abandon.row(fixture)
+    assert cut(fixture) == ("current", None, None)
+    untouched(fixture, before)
+    _, metadata = drifted(fixture, monkeypatch, minutes_ago=29)
+    in_place(fixture, abandon.row(fixture), metadata, cut(fixture))
+
+
+def test_crashes_on_the_version_drifted_to_never_count_against_the_one_drifted_back_to(file_api, monkeypatch):
+    # FA switched to 42, the SID drifted in place to 43, crashed three times there, then drifted back to 42 inside
+    # the switch's window. The crashes carry no version: counted from the switch, 42 was vetoed and rolled back.
+    fixture = file_api
+    switched(fixture, monkeypatch)
+    for n in (1, 2, 3):
+        crash(fixture, f"rid-{n}", f"cid-{n}")
+    drifted(fixture, monkeypatch, at=datetime.now(timezone.utc), created="42", to="43", switch=True)
+    before = abandon.row(fixture)
+    assert cut(fixture) == ("current", None, None)
+    untouched(fixture, before)
+
+
+def test_a_drift_back_that_crash_loops_rolls_back_as_an_fa_switch_does(file_api, monkeypatch):
+    # The routing guard: observed == created after a drift is #909's case, not the in-place one, so routing on the
+    # drift flag alone (a project veto only) fails here.
+    fixture = file_api
+    drifted(fixture, monkeypatch, created="42", to="43", switch=True)
+    for n in (1, 2, 3):
+        crash(fixture, f"rid-{n}", f"cid-{n}")
+    rolled_back(fixture, cut(fixture))

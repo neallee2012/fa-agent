@@ -1118,7 +1118,9 @@ def test_a_recovery_restart_sends_sigterm_only_after_another_started_turn_finish
             exits()
             return "OFFLINE saved"
         runtime._run_started = run_started
-        return runtime._execute_started(None, None, None)
+        # _execute_started keys the run's control by the RID (#916); every product caller passes a CAS-read receipt.
+        original = SimpleNamespace(value=SimpleNamespace(receipt=SimpleNamespace(request_id="OFFLINE-rid")))
+        return runtime._execute_started(original, None, None)
 
     async def scenario():
         exited = []

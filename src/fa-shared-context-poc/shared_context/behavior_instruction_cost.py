@@ -131,7 +131,8 @@ def record_turn_usage(control,*,job_id,rid,usage):
         except Problem as error:
             if error.status!=412 or error.body["error"]["code"]!="BEHAVIOR_CONFLICT" or attempt==2:
                 raise
-            logging.getLogger(__name__).warning("INSTRUCTION_USAGE_LEDGER_CONFLICT attempt=%s maximum=3",attempt+1)
+            logging.getLogger(__name__).warning("INSTRUCTION_USAGE_LEDGER_CONFLICT attempt=%s maximum=3 rid=%s",
+                                                attempt+1,timing_id(rid))
             _ledger_backoff(attempt)
 
 

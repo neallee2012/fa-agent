@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from shared_context import behavior_native_sessions, native_cut
+from shared_context import behavior_native_sessions, behavior_native_turn_api, native_cut
 from shared_context.behavior_foundry import FoundryHttpClient
 from shared_context.behavior_native_sessions import NativeSessions, native_sessions
 from shared_context.behavior_native_turn_api import agent_client
@@ -614,6 +614,10 @@ def test_a_send_after_a_lost_stop_record_drives_the_fence_and_the_files_arrive(f
 def test_a_resend_after_a_capped_drive_with_the_selector_rolled_back_commits(file_api, monkeypatch):
     fixture = ready(file_api, monkeypatch)
     now = abandon.clock(monkeypatch)
+    # The API dates its submit's reads (checked_since) by the same clock as the kept reads; on the real clock a host
+    # up for less than the fake time (a fresh CI runner) kept the first send's stale reads for the resend.
+    monkeypatch.setattr(behavior_native_turn_api, "monotonic", lambda: now[0])
+    monkeypatch.setattr(behavior_native_turn_api, "_resend_sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
     late = behavior_native_sessions.CUT_FENCE_SECONDS + behavior_native_sessions.CUT_DRIVE_SECONDS // 2
     fixture.files.on_stop = lambda: now.__setitem__(0, now[0] + late)
     status = behavior_native_sessions._source_session_status
@@ -1255,10 +1259,11 @@ def test_a_send_whose_fence_pass_meets_a_concurrent_withdraw_is_delivered_once_t
     assert [op for op in operations(fixture, start) if op[0] == "submit"] == [("submit", None)]
     assert abandon.row(fixture).upgrade is None
     again = submit_on_source(fixture, "during-the-withdraw")
-    # The same receipt (it has started meanwhile), not a second turn.
-    assert again.status_code == 202 and again.json()["status"] == "started", again.text
-    assert {key: value for key, value in again.json().items() if key not in {"status", "turn_number"}} == {
-        key: value for key, value in accepted.json().items() if key not in {"status", "turn_number"}}
+    # The same receipt, not a second turn: the offline turn has started or, on a fast host, already completed meanwhile.
+    assert again.status_code == 202 and again.json()["status"] in {"started", "completed"}, again.text
+    advancing = {"status", "turn_number", "result", "usage"}
+    assert {key: value for key, value in again.json().items() if key not in advancing} == {
+        key: value for key, value in accepted.json().items() if key not in advancing}
     assert [record for record in caplog.messages if "NATIVE_TURN_REFUSED" in record] == []
     assert "NATIVE_UPGRADE_CUT_FENCE_SETTLED_MEANWHILE" in caplog.text
 

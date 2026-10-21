@@ -7,6 +7,7 @@ Offline: the Table and Foundry are recording doubles; ci_deploy is loaded from i
 """
 
 import copy
+from datetime import datetime, timezone
 import importlib.util
 import json
 import os
@@ -22,6 +23,7 @@ from shared_context.errors import Problem
 from shared_context.native_binding import (
     NativeBindingObservation, NativeBindingRow, NativeBindingSession, NativeBindingStore, binding_store,
 )
+from shared_context.native_version_veto import VETO_PARTITION, NativeVersionVetoStore
 
 ROOT = Path(__file__).resolve().parents[2]
 V1, V2 = "foundry-native-v1", "foundry-native-v2"
@@ -196,6 +198,51 @@ def test_the_gate_reads_binding_rows_and_definitions_only_and_never_a_session(mo
     assert set(repository.calls) == {"list_prefix"}
 
 
+def test_the_gate_report_lists_project_vetoed_versions_and_never_refuses_for_them(monkeypatch, capsys):
+    # ADR-0009 4d (Neal 2026-10-20): an in-place drift's crash-loop only vetoes the version; the operator reads it here.
+    store, repository = store_with(row("agent-a", "sid-a", "150", profile=V1))
+    vetoes = NativeVersionVetoStore(repository, clock=lambda: datetime(2026, 10, 20, 1, tzinfo=timezone.utc))
+    vetoes.veto("fa-stage-a", "151")
+    # One malformed row (listed before 151) is skipped and logged; it never hides the others.
+    repository.create(VETO_PARTITION, "version:fa-stage-a:150", {"schema_version": "fa-native-version-veto-v0"})
+    repository.calls.clear()
+    foundry = RecordingFoundry({("fa-stage-a", "150"): definition(V1, "c")})
+    monkeypatch.setattr(behavior_agent_versions, "_agents", lambda value: (A, [(A, "configured")]))
+    monkeypatch.setattr(behavior_team_registry, "retired_agent_ids", lambda store, config: ())
+    monkeypatch.setattr(gate, "deploy_binding_store", lambda value: store)
+    report = gate.run_gate(SimpleNamespace(runtime=SimpleNamespace(store=None), config=None),
+                           lambda endpoint: foundry, armed=True)
+    assert report["decision"] == "pass" and report["refused"] == [] and set(repository.calls) == {"list_prefix"}
+    assert report["vetoed_versions"] == [
+        {"agent_name": "fa-stage-a", "version": "151", "vetoed_at": "2026-10-20T01:00:00+00:00"}]
+    assert "vetoed_versions_unread" not in report
+
+    def unreadable():
+        raise Problem(503, "TABLE_UNAVAILABLE", "synthetic outage")
+    unread = gate.evaluate([A], store.rows, read_with(foundry), armed=True, vetoes=unreadable)
+    assert unread["decision"] == "pass" and unread["vetoed_versions_unread"] == "TABLE_UNAVAILABLE"
+
+    import shared_context.behavior_server as server
+    import shared_context.behavior_server_config as server_config
+
+    class Composition:
+        hosted_versions = SimpleNamespace(_foundry_for=lambda endpoint: None)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(server_config, "load_configuration", lambda path: path)
+    monkeypatch.setattr(server, "build_server", lambda config: Composition())
+    monkeypatch.setattr(gate, "run_gate", lambda *args, **kwargs: report)
+    assert gate.main(["--config", "c.json", "--armed"]) == 0
+    hints = [line for line in capsys.readouterr().out.splitlines() if line.startswith("DEPLOY_VERSION_VETOED ")]
+    assert hints == ["DEPLOY_VERSION_VETOED agent=fa-stage-a version=151 vetoed_at=2026-10-20T01:00:00+00:00 "
+                     "suggest=selector_rollback: consider moving the selector back"]
+
+
 def test_main_exits_nonzero_only_for_an_armed_refusal(monkeypatch, capsys):
     import shared_context.behavior_server as server
     import shared_context.behavior_server_config as server_config
@@ -347,6 +394,7 @@ def test_a_succeeded_gate_job_says_finished_and_puts_what_it_proves_in_the_step_
     assert "finished" in out and "passed" not in out
     text = summary.read_text(encoding="utf-8")
     assert "decision: pass or observe" in text and "DEPLOY_COMPAT_GATE" in text and "job-execution-1" in text
+    assert "DEPLOY_VERSION_VETOED" in text and "consider moving the selector back" in out
     ci.STAGE["compatibility_gate_armed"] = True
     ci.gate(api_ref(ci))
     assert "decision: pass (0 refusals)" in summary.read_text(encoding="utf-8")

@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import logging
 import os
+import re
 from threading import Lock
 from time import monotonic
 from typing import Annotated, Callable, Literal
@@ -44,6 +45,16 @@ SUPPORTED_STATE_PROFILES = ACCEPTED_STATE_PROFILES
 # Recorded for a source found incompatible whose own profile is undeclared or unreadable: in no supported set, so
 # every guard and the deploy gate treat the SID as incompatible.
 INCOMPATIBLE_STATE_PROFILE = "incompatible"
+
+
+def _storable(profile):
+    """A declared profile outside the row field's pattern is recorded as incompatible: ``model_copy`` skips the
+    pattern, and a stored bad value fails every later read."""
+    if profile is not None and not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", profile):
+        return INCOMPATIBLE_STATE_PROFILE
+    return profile
+
+
 # ``active``: only a source that still runs when 2d-i abandons it: an ``admitting`` stuck past its bound (ADR-0009 §9
 # last row), or a background cut's fence whose files can not be moved.
 SourceStatus = Literal["idle", "failed", "deleted", "expired", "missing", "active"]
@@ -414,10 +425,14 @@ class NativeBindingStore:
         return row
 
     def record_observed(self, agent_id: str, *, hosted_session_id: str, agent_version: str,
-                        source: Literal["vm", "metadata-active"]) -> NativeBindingRow | None:
+                        source: Literal["vm", "metadata-active"],
+                        state_profile: str | None = None) -> NativeBindingRow | None:
         """ADR-0009 §4 step 6 drift CAS. Another SID is a binding divergence, not drift. Once the flag is set, later
-        versions (a drift back included) change only the recorded version: version numbers are not monotonic."""
+        versions (a drift back included) change only the recorded version: version numbers are not monotonic.
+        ``state_profile``: what ``agent_version``'s definition declares, written in the same CAS so the row's profile
+        follows the version the SID now runs (a same-SID drift onto another image); None (not read) keeps it."""
         moved, written = [], []
+        state_profile = _storable(state_profile)
 
         def recording(row):
             moved.clear()
@@ -430,18 +445,20 @@ class NativeBindingStore:
             if row.observed.agent_version == agent_version:
                 return None
             first = not row.drift and agent_version != row.created_agent_version
+            profile = {} if state_profile is None else {"state_profile": state_profile, "profile_unread": False}
             written.append(row.model_copy(update={
                 "observed": NativeBindingObservation(agent_version=agent_version, observed_at=self._now(), source=source),
                 "drift": row.drift or first, "notice_pending": row.notice_pending or first,
-                "notice_to_version": agent_version if first else row.notice_to_version}))
+                "notice_to_version": agent_version if first else row.notice_to_version, **profile}))
             return written[0]
 
         row = self._update(agent_id, recording)
         if moved:
             log.warning("NATIVE_BINDING_DIVERGED session_id=%s binding_session_id=%s", hosted_session_id, moved[-1])
         elif written and row == written[0]:
-            log.warning("NATIVE_VERSION_OBSERVED source=%s session_id=%s created_version=%s observed_version=%s drift=%s",
-                        source, hosted_session_id, row.created_agent_version, agent_version, row.drift)
+            log.warning("NATIVE_VERSION_OBSERVED source=%s session_id=%s created_version=%s observed_version=%s drift=%s "
+                        "profile=%s", source, hosted_session_id, row.created_agent_version, agent_version, row.drift,
+                        row.state_profile)
         return row
 
     def record_switch(self, agent_id: str, view, *, state_profile: str = NATIVE_STATE_PROFILE,
@@ -676,24 +693,28 @@ class NativeBindingStore:
 
         return self._update(agent_id, recording)
 
-    def record_profile(self, agent_id: str, *, hosted_session_id: str, created_agent_version: str,
+    def record_profile(self, agent_id: str, *, hosted_session_id: str, agent_version: str,
                        state_profile: str) -> NativeBindingRow | None:
-        """A definition read of the current SID's version replaces the repair fallback's profile (``profile_unread``)."""
-
+        """A definition read of the version the current SID runs (``observed``) replaces the repair fallback's profile
+        (``profile_unread``), or the stale one of a row that drifted before the drift CAS recorded the profile: such a
+        row's V_rec already equals what the VM runs, so no drift CAS comes again. Only while the SID and the recorded
+        version are still those; a row that is neither, or already says so, is not written."""
+        state_profile = _storable(state_profile)
         written = []
 
         def correcting(row):
             written.clear()
-            if (row is None or not row.profile_unread or row.hosted_session_id != hosted_session_id
-                    or row.created_agent_version != created_agent_version):
+            if (row is None or row.hosted_session_id != hosted_session_id or row.observed.agent_version != agent_version
+                    or not (row.profile_unread or row.drift and row.state_profile != state_profile)):
                 return None
-            written.append(row.model_copy(update={"state_profile": state_profile, "profile_unread": False}))
+            written.extend((row.model_copy(update={"state_profile": state_profile, "profile_unread": False}),
+                            row.state_profile))
             return written[0]
 
         row = self._update(agent_id, correcting)
         if written and row == written[0]:
-            log.warning("NATIVE_BINDING_PROFILE_CORRECTED session_id=%s profile=%s", hosted_session_id,
-                        row.state_profile)
+            log.warning("NATIVE_BINDING_PROFILE_CORRECTED session_id=%s version=%s from=%s profile=%s",
+                        hosted_session_id, agent_version, written[1], row.state_profile)
         return row
 
     def clear_notice(self, agent_id: str, delivered: NativeEnvironmentNotice) -> NativeBindingRow | None:

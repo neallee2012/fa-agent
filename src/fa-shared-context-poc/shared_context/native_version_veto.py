@@ -6,6 +6,7 @@ deleted: a veto blocks that one version, so a newer selected version is a new ta
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 from typing import Annotated, Callable, Literal
 
 from pydantic import Field
@@ -52,6 +53,25 @@ class NativeVersionVetoStore:
         except (ValueError, TypeError):
             raise Problem(409, "NATIVE_VERSION_VETO_INVALID", "the veto row differs from its fixed schema") from None
         return veto
+
+    def rows(self, *, page: int = 100) -> tuple[NativeVersionVeto, ...]:
+        """Every project veto, read page by page to the end (the deploy gate's operator report; read only). A row
+        that differs from its fixed schema is logged and skipped, so it never hides the others."""
+        found, after = [], None
+        while True:
+            items, more = self.repository.list_prefix(VETO_PARTITION, "version:", page, after=after)
+            for key, record in items:
+                try:
+                    veto = NativeVersionVeto.model_validate_json(serialize(record.payload))
+                    if self.row_key(veto.agent_name, veto.agent_version) != key:
+                        raise ValueError("another version's veto row")
+                except (ValueError, TypeError):
+                    logging.getLogger(__name__).warning("NATIVE_VERSION_VETO_INVALID key=%s skipped", key)
+                    continue
+                found.append(veto)
+            if not more or not items:
+                return tuple(found)
+            after = items[-1][0]
 
     def veto(self, agent_name: str, agent_version: str, *, reason: str = "crash_loop") -> NativeVersionVeto:
         """Insert once; an existing veto (409) is read back and returned unchanged, never overwritten."""

@@ -699,8 +699,9 @@ def test_concurrent_same_accepted_etag_starts_the_model_only_once(harness):
 
     async def raced():
         first_task = asyncio.create_task(harness.runtime.handle_turn(first))
-        while "rid-1" not in harness.sdk.controls:
-            await asyncio.sleep(0.01)
+        async with asyncio.timeout(8):  # a store error otherwise leaves this waiting forever
+            while "rid-1" not in harness.sdk.controls:
+                await asyncio.sleep(0.01)
         second = await harness.runtime.handle_turn(duplicate)
         harness.sdk.block = False
         return await first_task, second

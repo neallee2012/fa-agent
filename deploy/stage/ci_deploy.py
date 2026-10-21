@@ -652,6 +652,9 @@ def _sync_script(hosted_ref, *, follow=False):
     if not on:
         # A turn-on that stopped after sync left v2 definitions: carrying them on with the API off is refused.
         argv.append("--refuse-native-v2")
+    else:
+        # Onboarded Agents are not in STAGE["agents"]: sync gives the registered assistants the same v2 (2d-ii drops v1).
+        argv.append("--native-v2-registered")
     if not follow:
         argv.append("--defer-follow")
     elif on:
@@ -777,7 +780,9 @@ def gate(api_ref):
         print(f"::warning::compatibility gate did not run to the end while not armed "
               f"({type(error).__name__}: {error}); the deploy goes on")
         return
-    where = f"read DEPLOY_COMPAT_GATE in the {STAGE['sync_job']} execution {name} log (Log Analytics)"
+    # The job's status carries no output: the project-vetoed versions (ADR-0009 4d) are in the same log.
+    where = (f"read DEPLOY_COMPAT_GATE in the {STAGE['sync_job']} execution {name} log (Log Analytics); "
+             "each DEPLOY_VERSION_VETOED line there is a project-vetoed version: consider moving the selector back")
     decision = _gate_decision(status, armed, override)
     _gate_summary(f"job {name} {status} (armed={armed}, override={override is not None}); decision: {decision}; "
                   f"refusal count and per-Agent verdicts: {where}")

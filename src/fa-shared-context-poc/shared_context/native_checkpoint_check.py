@@ -7,8 +7,9 @@ read receipts without claiming them, never write a receipt or the Agent record, 
 prerestore leaves a conversation whose turn is queued or running alone and answers ``ok``), and
 answer each conversation ``ok`` (also when no checkpoint is owed, ADR-0009 §7a (r)), ``unreadable`` or ``unsupported``
 (rule 8: an unknown codec, version or shape is refused explicitly). Results are per conversation: a missing or
-different checkpoint (also one of another scope) is that conversation's ``unreadable``, never the whole command's
-failure. An unconfirmed read (5xx) is raised, not counted.
+different checkpoint is that conversation's ``unreadable``, not the whole command's failure. Two cases do fail the
+whole command: an unconfirmed read (5xx) and ``NATIVE_STATE_SCOPE`` (the API named another Agent's conversation) are
+raised, not counted.
 """
 
 from .errors import Problem

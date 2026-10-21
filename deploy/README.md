@@ -982,7 +982,9 @@ API 只有在**沒有任何綁定列還記著舊 profile、也沒有 session 還
   要先把報告的 `unclaimed` 認領或退役。
 - **報告：** job log 一行 `DEPLOY_COMPAT_GATE {...}`（Log Analytics），含每個 Agent 的判定、`decision`
   （`pass`／`observe`／`refuse`／`override`）與保護清單（見下節）。CI 只看得到 job 成功或失敗（ARM 的 execution 沒有 exit code 或輸出），
-  step summary 只寫狀態能證明的判定與這一行的位置；拒絕筆數與詳細原因讀這一行。
+  step summary 只寫狀態能證明的判定與這一行的位置；拒絕筆數與詳細原因讀這一行。報告也列出專案層否決的版本
+  （`vetoed_versions`，每個另有一行 `DEPLOY_VERSION_VETOED … suggest=selector_rollback`，ADR-0009 4d，Neal 2026-10-20）：
+  只提示考慮把 selector 移回，不影響判定。
 - **時間：** 閘門有自己的等待上限 `GATE_POLL_ATTEMPTS`（18 次 × 10 秒＝**3 分鐘**），不沿用 sync 的 30 分鐘（sync job
   的 `replicaTimeout` 最長可到 3600 秒）。超過就對該 execution 送 Jobs - Stop Execution
   （`POST .../jobs/{job}/executions/{name}/stop`），不打開時只留 `::warning::`、部署照常；打開時算拒絕。ARM 回應是空的或

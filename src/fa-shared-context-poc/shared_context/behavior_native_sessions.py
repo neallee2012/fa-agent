@@ -27,8 +27,8 @@ from .behavior_native_turn_wire import (
 from . import upgrade_snapshot_flow
 from .errors import Problem
 from .native_binding import (
-    INCOMPATIBLE_STATE_PROFILE, SUPPORTED_STATE_PROFILES, NativeBindingUpgrade, SessionGuard, binding_store,
-    idle_upgrade_enabled, session_guard_enforced,
+    INCOMPATIBLE_STATE_PROFILE, SUPPORTED_STATE_PROFILES, NativeBindingUpgrade, SessionGuard, _storable,
+    binding_store, idle_upgrade_enabled, session_guard_enforced,
 )
 
 
@@ -485,6 +485,8 @@ class NativeSessions:
         self._retired_seen, self._active_seen, self._overdue_logged = {}, {}, set()
         # Agent ID -> (admitting RID, first seen) for the background cut's stuck-admission bound.
         self._admitting_seen = {}
+        # (Agent ID, version) whose definition declares no profile, logged once (``_correct_profile``).
+        self._profile_undeclared = set()
         # Fence RID -> [first failed drive, first unmovable read or None] (``_drive_failed``); in memory, as above.
         self._drive_failing = {}
         # (fence RID, version) pairs whose wake already cleared the drive clocks in this process (``_drive``).
@@ -674,17 +676,30 @@ class NativeSessions:
         metadata a claim read (``claim``: no VM confirms it)."""
         target = client.target
 
+        def claim_profile():
+            # A drift the VM reported records that image's profile; unconfirmed metadata (``claimed_version``), or
+            # a reported version whose definition is unreadable or undeclared, keeps the creation version's.
+            if claimed_version is None and version not in (None, target.agent_version):
+                try:
+                    return self._row_profile(target, version)
+                except Exception:  # noqa: BLE001 - the claim falls back as before; the turn end's heal reads again
+                    pass
+            return self._row_profile(target, target.agent_version)
+
         def observing(store):
             row = store.claim(target.agent_id, hosted_session_id=target.session_id,
                               created_agent_version=target.agent_version,
                               observed_version=claimed_version or version,
                               source="claim" if claimed_version else "vm", created_at=created_at,
                               # Read only to insert: an existing row (every bound send) costs no get_version.
-                              state_profile=lambda: self._row_profile(target, target.agent_version))
+                              state_profile=claim_profile)
             if version is None or row is None or row.observed.agent_version == version:
                 return row
+            # A drift no bound path recorded (a reported version, a legacy-located send): its profile too, as
+            # ``_drifted``'s CAS does (one ``get_version``, only when this CAS is about to write).
+            profile = self._version_profile(client, version) if row.hosted_session_id == target.session_id else None
             return store.record_observed(target.agent_id, hosted_session_id=target.session_id,
-                                         agent_version=version, source="vm")
+                                         agent_version=version, source="vm", state_profile=profile)
 
         return self._binding("observe", observing)
 
@@ -1088,24 +1103,27 @@ class NativeSessions:
     def _observe_drift(self, reader, row, source):
         """The drift CAS of ADR-0009 §4 step 6 for ``reader``'s SID and version; the written row (or ``row``)."""
         target = reader.target
+        # The profile ``_drifted`` (or the 403 path) read for this version, carried on ``reader`` to the CAS.
         written = self._binding("observe", lambda store: store.record_observed(
-            target.agent_id, hosted_session_id=target.session_id, agent_version=target.agent_version, source=source))
+            target.agent_id, hosted_session_id=target.session_id, agent_version=target.agent_version, source=source,
+            state_profile=getattr(reader, "_drift_profile", None)))
         if written is None or written.hosted_session_id != target.session_id:
             return row
         self._keep_row(reader, written)
         reader._binding_row = written
         return written
 
-    def _version_supported(self, client, version):
-        """ADR-0009 §3: ``version``'s definition enables a supported profile (one ``get_version`` read, only on the
-        drift path). An unreadable definition decides nothing, so it counts as supported."""
+    def _version_profile(self, client, version):
+        """ADR-0009 §3: the profile ``version``'s definition enables (one ``get_version`` read, only on the drift
+        path), ``INCOMPATIBLE_STATE_PROFILE`` when it enables none. None: unreadable, which decides nothing (counted
+        as supported, and the row keeps its profile)."""
         try:
             profile = _native_profile(client.for_target(_target(client.target, agent_version=version)))
         except Exception as error:  # noqa: BLE001 - an unreadable definition decides nothing
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
-            logging.getLogger(__name__).warning("NATIVE_VERSION_PROFILE_UNREAD code=%s", code)
-            return True
-        return profile in SUPPORTED_STATE_PROFILES
+            logging.getLogger(__name__).warning("NATIVE_VERSION_PROFILE_UNREAD code=%s version=%s", code, version)
+            return None
+        return INCOMPATIBLE_STATE_PROFILE if profile is None else profile
 
     def observed_version(self, reader, error):
         """(V_obs, source) behind a ``NATIVE_SESSION_CHANGED`` from ``reader``'s SID, or None when it is not a version
@@ -1134,16 +1152,18 @@ class NativeSessions:
         """(client at V_obs, row, source) when ``error`` is a compatible same-SID drift; None otherwise. A VM-reported
         version is recorded now; a metadata guess only after the VM accepts it (the caller's next call). An
         incompatible one is logged and marked (ADR-0009 §9 phase 3: no refusal is added; the caller's follow handles
-        it) and gives None."""
+        it) and gives None. The drift CAS also records the profile V_obs declares: the SID now runs that image, so the
+        row's profile no longer says what it was created on (an unreadable definition keeps the row's)."""
         observed = self.observed_version(reader, error)
         if observed is None or observed[0] == reader.target.agent_version:
             return None
         version, source = observed
+        profile = self._version_profile(reader, version)
         moved = reader.for_target(_target(reader.target, agent_version=version))
-        moved._binding_row = row
+        moved._binding_row, moved._drift_profile = row, profile
         if source == "vm":
             row = self._observe_drift(moved, row, source)
-        if not self._version_supported(reader, version):
+        if profile is not None and profile not in SUPPORTED_STATE_PROFILES:
             self.guard.mark_incompatible(reader.target.agent_id, reader.target.session_id)
             logging.getLogger(__name__).warning(
                 "NATIVE_SESSION_CALL_INCOMPATIBLE operation=drift session_id=%s version=%s enforced=False",
@@ -2306,14 +2326,16 @@ class NativeSessions:
         agent_id = client.target.agent_id
         found = self._binding_row(agent_id)
         row = None if found is None else found[1]
-        if row is not None and row.profile_unread:
-            row = self._correct_profile(client, row)
-        if row is None or not row.supported() and row.abandon is None:
-            return "unbound", None, None
-        if row.upgrade is not None:
+        # A recorded fence settles first, as every send's ``advance`` does: a heal that finds V_rec unsupported (the
+        # row then ``unbound``) must not leave it unsettled.
+        if row is not None and row.upgrade is not None:
             settled, row = self._converge(client, row, stop=stop)
             if settled is not None:
                 return settled, None, None
+        if row is not None and (row.profile_unread or row.drift):
+            row = self._correct_profile(client, row)
+        if row is None or not row.supported() and row.abandon is None:
+            return "unbound", None, None
         if self.idle_upgrade and row.abandon is None and _ROLLBACK.get() is None:
             rolled = self._crash_loop(client, row, stop)
             if rolled is not None:
@@ -2484,8 +2506,12 @@ class NativeSessions:
         this: it also names versions other Agents vetoed, and a healthy Agent on that version is not rolled back (Neal
         decision 3: 本 Agent 退回). A decision whose own veto was not written is retried the same way while this
         process runs. A rollback target this Agent vetoed itself, or one ``cut`` finds incompatible, leaves no version
-        to go to (``_rollback_blocked``)."""
+        to go to (``_rollback_blocked``). A same-SID drift onto another version goes to ``_in_place_crash_loop`` instead
+        (a drift back to the creation version is judged here, its window opening at the later of the switch and the
+        drift back)."""
         kept = row.idle_upgrade
+        if row.drift and row.observed.agent_version != row.created_agent_version:
+            return self._in_place_crash_loop(client, row, kept)
         if kept is None:
             return None
         version = row.created_agent_version
@@ -2501,7 +2527,12 @@ class NativeSessions:
             # Decided earlier, the rollback busy or overrun: finish it whatever the window, with no reads or judging.
             self._project_veto(client, version)  # again: the first write may have failed
             return self._decided(client, row, stop, version, back)
-        if decided not in self._veto_unrecorded and not self._crash_looping(client, row, kept, version, back):
+        # A drift back to the creation version: crashes before it were another version's (``NativeCrash`` has none).
+        since = None
+        if row.drift and kept.switched_at is not None:
+            since = max(kept.switched_at, row.observed.observed_at, key=datetime.fromisoformat)
+        if decided not in self._veto_unrecorded and not self._crash_looping(client, row, kept, version, back,
+                                                                            since=since):
             return None
         # First, and on its own: durable even while this Agent's own veto keeps failing, so a restart still keeps other
         # Agents off ``version``.
@@ -2515,6 +2546,33 @@ class NativeSessions:
             return "crash_loop", "veto_unrecorded", None
         self._veto_unrecorded.discard(decided)
         return self._decided(client, vetoed, stop, version, back)
+
+    def _in_place_crash_loop(self, client, row, kept):
+        """Neal 2026-10-20 (ADR-0009 4d): the platform resumed the current SID on another version (the drift
+        ``record_observed`` wrote), so FA's ``switched_at`` and ``previous_sessions`` say nothing about it. The window
+        opens at the recorded version's ``observed_at`` (rewritten at each in-place move, so each move opens one for
+        the version now observed) and the same counters judge it. A crash-loop writes only the project veto, so U0 and
+        the cut move no other Agent onto that version; there is no rollback (the platform does not reliably honour a
+        new SID pinned to the old version) and no own veto. The operator reads the warning and the deploy gate's
+        ``vetoed_versions``; the owner's notices are unchanged. A drift onto a version this API cannot speak never gets
+        here: ``cut`` returns ``unbound`` first (#927 records the drift's profile) and §7a's follow handles that SID; its
+        state is not readable on this wire, and ``cut`` never moves an Agent onto an incompatible version anyway. shortcut: a restart inside the window judges again
+        and logs the same decision once more (the Insert reads the row back); read the project veto first if the repeat
+        line misleads operators."""
+        version = row.observed.agent_version
+        if (client.target.agent_name, version) in self._project_vetoed:
+            return None  # decided and written: nothing is read again, the cut goes on to the selector
+        decided = (row.agent_id, row.hosted_session_id, version)
+        if decided not in self._veto_unrecorded and not self._crash_looping(client, row, kept, version, None,
+                                                                            since=row.observed.observed_at):
+            return None
+        self._project_veto(client, version)
+        if (client.target.agent_name, version) in self._project_vetoed:
+            self._veto_unrecorded.discard(decided)
+            return "crash_loop", "in_place_veto", None
+        # Written at the next turn end, whatever the window (same in-process shortcut as the own veto above).
+        self._veto_unrecorded.add(decided)
+        return "crash_loop", "veto_unrecorded", None
 
     def _own_veto(self, row, version, notice=False):
         """This Agent's veto of ``version`` (``record_veto``, with its "沒有更新" notice for ``notice``), read back: the
@@ -2554,11 +2612,13 @@ class NativeSessions:
             row.agent_id, hosted_session_id=row.hosted_session_id))
         return None
 
-    def _crash_looping(self, client, row, kept, version, back):
-        """The window judgement of ``_crash_loop``: True when the current SID crash-loops (logged)."""
-        if kept.switched_at is None:
+    def _crash_looping(self, client, row, kept, version, back, *, since=None):
+        """The window judgement of ``_crash_loop``: True when the current SID crash-loops (logged). The window opens
+        at ``since`` (an in-place drift's time), else at the row's last switch."""
+        since = since or (kept.switched_at if kept is not None else None)
+        if since is None:
             return False
-        switched = datetime.fromisoformat(kept.switched_at).timestamp()
+        switched = datetime.fromisoformat(since).timestamp()
         now = binding_store(self.composition).clock()
         if now is None or now.timestamp() - switched > CRASH_LOOP_SECONDS:
             return False
@@ -2574,10 +2634,18 @@ class NativeSessions:
                                                 error.body["error"]["code"], row.hosted_session_id)
             return False
         # shortcut: a start failure has no CID/RID, so each counts as its own; give them IDs once a writer records them.
-        failures = kept.start_failures
+        # shortcut: nor a time, so an in-place window also counts ones from an earlier switch of this SID; fine while
+        # nothing writes them.
+        failures = kept.start_failures if kept is not None else 0
         if min(len({item.conversation_id for item in crashes}),
                len({item.request_id for item in crashes})) + failures < CRASH_LOOP_COUNT:
             return False
+        if back is None:  # in place (``_in_place_crash_loop``): one line, as no rollback follows
+            logging.getLogger(__name__).warning(
+                "NATIVE_CRASH_LOOP_IN_PLACE agent=%s agent_id=%s session_id=%s version=%s crashes=%d start_failures=%d "
+                "action=project_veto suggest=selector_rollback", client.target.agent_name, row.agent_id,
+                row.hosted_session_id, version, len(crashes), failures)
+            return True
         logging.getLogger(__name__).warning(
             "NATIVE_CRASH_LOOP agent_id=%s session_id=%s version=%s crashes=%d start_failures=%d rollback_to=%s",
             row.agent_id, row.hosted_session_id, version, len(crashes), failures, back)
@@ -3377,16 +3445,33 @@ class NativeSessions:
         return monotonic() - seen[1]
 
     def _correct_profile(self, client, row):
-        """The repair fallback's v1 (``profile_unread``) is replaced by what the version's definition declares."""
+        """The row's profile is what the version its SID runs (V_rec) declares: this replaces the repair fallback's v1
+        (``profile_unread``) and the stale profile of a row that drifted before the drift CAS recorded it (its V_rec
+        already equals what the VM runs, so no 409 comes to record it). ``HostedVersions.profile`` keeps each
+        version's profile, so this is one ``get_version`` per version and process; no session is called. Unreadable
+        or undeclared: the row is kept; an unreadable one is read and logged again next time, an undeclared one
+        (kept by ``HostedVersions``: a definition never changes) is logged once per Agent, version and process."""
+        from .behavior_agent_versions import _resolver
+        resolver = _resolver(self.composition.runtime)
+        if resolver is None:
+            return row  # an offline harness: ``_row_profile``'s v1 stand-in is no definition read
+        version = row.observed.agent_version
         try:
-            profile = self._row_profile(client.target, row.created_agent_version)
+            profile = resolver.profile(client.target, version)
         except Exception as error:  # noqa: BLE001 - still unreadable: the next attempt reads again
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
-            logging.getLogger(__name__).warning("NATIVE_BINDING_PROFILE_UNREAD code=%s", code)
+            logging.getLogger(__name__).warning("NATIVE_BINDING_PROFILE_UNREAD code=%s version=%s", code, version)
             return row
+        if profile is None:
+            if (row.agent_id, version) not in self._profile_undeclared:
+                self._profile_undeclared.add((row.agent_id, version))
+                logging.getLogger(__name__).warning(
+                    "NATIVE_BINDING_PROFILE_UNREAD code=NATIVE_TURNS_DISABLED version=%s", version)
+            return row
+        if not row.profile_unread and _storable(profile) == row.state_profile:
+            return row  # already right (as stored: a bad pattern is kept as incompatible): no Table call
         corrected = self._binding("profile", lambda store: store.record_profile(
-            row.agent_id, hosted_session_id=row.hosted_session_id, created_agent_version=row.created_agent_version,
-            state_profile=profile))
+            row.agent_id, hosted_session_id=row.hosted_session_id, agent_version=version, state_profile=profile))
         return corrected or row
 
     def admission_stuck(self, client, *, before_send):

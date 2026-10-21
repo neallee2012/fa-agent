@@ -72,6 +72,13 @@ class Backing:
         self.sequence = 0
         self.lock = threading.Lock()
 
+    # SQLiteBacking (test_behavior_workers) pickles the rows between processes; a lock is per process, so it is rebuilt.
+    def __getstate__(self):
+        return {key: value for key, value in self.__dict__.items() if key != "lock"}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state, lock=threading.Lock())
+
     def get(self, table, partition, row):
         value = self.rows.get((table, partition, row))
         if value is None:

@@ -6,6 +6,8 @@
 **一個開關：** 部署 profile 的 `api_environment` `FA_NATIVE_SESSION_GUARD_ENFORCE`。`"1"` 時 `ci_deploy.py`
 同時把每位助理（`kind=assistant`）的 Hosted overlay 設成 `FA_NATIVE_TURNS=foundry-native-v2`（sync 建出宣告 v2 的
 H2d 定義），API 打開 P5～P8 的背景切換、送出路徑與巡查；API 自己的 `FA_NATIVE_TURNS` 仍是 v1（到 2d-ii）。
+onboarding 加的 Agent 不在 profile 的 `agents` 裡：開關打開時 sync 另帶 `--native-v2-registered`，已登記、服務中
+定義宣告 native profile 的 Agent（助理）只把 `FA_NATIVE_TURNS` 改成 v2，其他 ENV 照舊（ADR-0009 M1，2026-10-20）。
 `deploy/azd/profile.defaults.json` 寫 `"0"`；`deploy/stage/stage.json` 寫 `"1"`（合併到 main 不部署 stage，
 下一個 release PR 合併後那次部署才打開）。兩邊不會只開一半：`meta`／`check`
 拒絕開關以外的 v2（`hosted_environment` 或 `assistant_environment` 寫 v2 而開關是 `"0"`；executor 等非助理即使開關

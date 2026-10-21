@@ -207,8 +207,9 @@ def test_follow_close_cas_preserves_a_winning_started_or_terminal_record(stalled
     })
     assert won
     if winner == "started":
-        assert response.status_code == 503, response.text
-        assert response.json()["error"]["code"] == "NATIVE_STATE_STORE_UNKNOWN"
+        # The read-back started winner is confirmed (#905), so the follow waits for it instead of reporting unknown.
+        assert response.status_code == 200, response.text
+        assert response.json()["state"] == "pending" and response.json()["reason"] == "accepted_or_started"
     else:
         assert response.status_code == 200 and response.json()["reason"] == "source_stop_required", response.text
     assert invoke(case.client, case.identity, NativeRead(request_id="stalled-rid")).json() == won[0]["receipt"]

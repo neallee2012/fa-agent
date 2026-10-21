@@ -27,6 +27,7 @@ from .native_group_wire import (
     NativeGroupTranscript, groups_enabled,
 )
 from .native_groups import NativeGroupStore, group_post_id
+from .native_markers import EARLIER_VERSION_UNFINISHED
 from .native_responses_wire import NATIVE_RESPONSES_PROFILE
 from .source_materials import digest
 from .storage import TableRepository
@@ -292,6 +293,10 @@ class NativeGroupGateway:
             if (len(content.encode("utf-8")) != original.result.text_bytes
                     or hashlib.sha256(content.encode("utf-8")).hexdigest() != original.result.text_sha256):
                 raise Problem(409, "NATIVE_RESULT_INCOMPLETE", "the complete group result differs from its saved digest")
+        elif original.failure_code == EARLIER_VERSION_UNFINISHED:
+            # same meaning as the sender's notice (native_agent_relay): ``refused:<RID>`` proves it never ran
+            content = (f"原成員沒有執行這次交辦（{original.failure_code}）：它是較早的版本接下的，目前環境無法接續；"
+                       "可以用新的交辦再送一次。")
         else:
             content = ("原成員回合未能確認完成（" + (original.failure_code or "NATIVE_TURN_UNKNOWN")
                        + "）。保留原回條，不表示已停止或可以重新交辦。")
