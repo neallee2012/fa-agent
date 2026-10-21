@@ -18,6 +18,9 @@ def stage_module(filename="ci_deploy.py"):
     spec = importlib.util.spec_from_file_location("offline_stage_publication", ROOT / "deploy" / "stage" / filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if filename == "ci_deploy.py":  # ADR-0009 2d-ii deploys only with the 2d-i switch on
+        module.STAGE["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] = "1"
+        module.switch_preconditions = lambda *args, **kwargs: None  # its own tests: test_stage_ci_native_2di.py
     return module
 
 
@@ -281,6 +284,20 @@ def test_a_bad_console_flag_stops_the_run_before_any_build_or_write(monkeypatch,
     with pytest.raises(SystemExit) as stopped:
         module.meta()
     assert "console overlay" in str(stopped.value) and capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("guard", ["0", None])
+def test_a_profile_with_the_2di_switch_off_stops_the_run_before_any_build_or_write(monkeypatch, capsys, guard):
+    """ADR-0009 2d-ii: the API sends and supports only foundry-native-v2, so the switch cannot be off (or left out)."""
+    module = stage_module()
+    environment = {key: value for key, value in module.STAGE["api_environment"].items()
+                   if key != "FA_NATIVE_SESSION_GUARD_ENFORCE"}
+    monkeypatch.setitem(module.STAGE, "api_environment",
+                        environment if guard is None else {**environment, "FA_NATIVE_SESSION_GUARD_ENFORCE": guard})
+    with pytest.raises(SystemExit) as stopped:
+        module.meta()
+    assert 'FA_NATIVE_SESSION_GUARD_ENFORCE="1" is required from ADR-0009 2d-ii' in str(stopped.value)
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize("status", [404, 403, 503])

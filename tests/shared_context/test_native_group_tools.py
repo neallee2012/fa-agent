@@ -309,7 +309,7 @@ def test_pinned_sdk_consumes_group_tools_without_a_second_loop_or_peer_wake(tmp_
     values["template"]["settings"]["model_provider"] = None
     captured = NativeTurnCapture.model_validate_json(json.dumps(values))
     request = NativeSubmit(command=request.command, capture=captured)
-    receipt = NativeReceipt(agent_id="group-agent-a", hosted_session_id="group-hosted-sid",
+    receipt = NativeReceipt(state_profile=request.state_profile, agent_id="group-agent-a", hosted_session_id="group-hosted-sid",
         request_id=request.command.request_id, conversation_id="group-cid", command=request.command,
         capture=captured, capture_digest=captured.sha256, submit_digest=request.sha256, status="started", turn_number=1)
     store = NativeGroupStore(InMemoryRepository(), tenant_id="tenant", team_id="team")

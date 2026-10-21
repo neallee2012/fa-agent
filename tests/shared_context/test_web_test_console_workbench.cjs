@@ -3729,6 +3729,33 @@ test("a tab that becomes visible reads within 1 s instead of waiting out the bac
     assert.equal(vm.runInContext("progressRetryMs",ui.context),1000);
   }
 });
+// Spec 2026-10-01 「等待到期」: past the bridge's review deadline the owner learns the reply is unconfirmed, and it is
+// still read (every 30 s, at once when asked or the tab returns) so a late reply shows; nothing is sent.
+test("a delegated reply past its review deadline says it is unconfirmed and is still read every 30 s",async()=>{
+  for(const realtime of [false,true]){
+    const {ui,fire,delay}=await awaitingReplyUi({realtime});
+    assert.equal(ui.nodes.get("peer-wait-note").hidden,true);
+    const overdue=nativeChat("completed");
+    overdue.composer.awaiting_agent_reply=overdue.composer.peer_reply_overdue=true;
+    ui.holder.progressResponse=()=>({ok:true,json:async()=>copy(overdue)});
+    await fire();
+    assert.equal(ui.nodes.get("peer-wait-note").hidden,false);
+    assert.match(ui.nodes.get("peer-wait-note").textContent,/已接收交辦.*結果尚未確認.*不要重新交辦/);
+    assert.equal(delay(),30000,"push open: "+realtime);
+    await fire();
+    assert.equal(delay(),30000,"still read, push open: "+realtime);
+    ui.context.document.hidden=true;ui.documentEvents.visibilitychange();
+    ui.context.document.hidden=false;ui.documentEvents.visibilitychange();await ui.tick();
+    assert.ok(delay()<=1000,"a visible tab reads at once");
+    // A new turn the owner sends meanwhile is read at its usual pace.
+    const sent=nativeChat("started");
+    sent.composer.awaiting_agent_reply=sent.composer.peer_reply_overdue=true;
+    ui.holder.progressResponse=()=>({ok:true,json:async()=>copy(sent)});
+    await fire();
+    assert.ok(delay()<=(realtime?3000:1000),"a running turn keeps its pace, push open: "+realtime);
+    assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+  }
+});
 test("without push a waiting conversation is read at least every 5 s",async()=>{
   const {ui,fire,delay}=await awaitingReplyUi();
   ui.holder.progressResponse=UNAVAILABLE_READ;

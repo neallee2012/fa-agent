@@ -29,11 +29,11 @@ from shared_context.behavior_work_policy import derive_work
 
 from .adapter import ConsoleError, canonical, parse_config, require, sha, strict_json
 from .agent_connections import AgentConnection, AgentConnections
-from .instructions import InstructionConnection
+from .instructions import NATIVE_LANE, InstructionConnection
 
 # New Agents start new conversations on the native lane like A and B (fresh_export); a template that selects
 # Responses still takes precedence (NativeInstructionControl.profile). Existing Agents keep their files.
-NEW_AGENT_STATE_PROFILE = "foundry-native-v1"
+NEW_AGENT_STATE_PROFILE = NATIVE_LANE
 
 PHASE = "agent-onboarding"
 # After the local link: one native prepare per new Agent, with one fixed request ID (server prepare is idempotent).

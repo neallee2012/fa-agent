@@ -46,7 +46,8 @@ class AgentTransport(NativeTransport):
             agent_id=self.target.agent_id, hosted_session_id=self.target.session_id,
             request_id=command.command.request_id, conversation_id=command.command.conversation_id or "peer-native-cid",
             command=command.command, capture=command.capture, source=command.source,
-            submit_digest=command.sha256, capture_digest=command.capture.sha256, status="accepted")
+            submit_digest=command.sha256, capture_digest=command.capture.sha256, status="accepted",
+            state_profile=command.state_profile)
         self.records[value.request_id] = value
         if self.lose_submit:
             raise httpx.ReadTimeout("synthetic accepted response lost", request=request)
@@ -84,7 +85,7 @@ def relay_transports(case, monkeypatch, *, select_receiver):
     original_command = InstructionSubmit(request_id="original-sender-rid", content="Ask the peer to check the sample.")
     request = NativeSubmit(command=original_command, capture=resolve_capture(
         case.a.runtime.work_policy, case.a.assistant.authority, case.c.human, original_command))
-    record = NativeReceipt(
+    record = NativeReceipt(state_profile=request.state_profile,
         agent_id=source.target.agent_id, hosted_session_id=clients[0].target.session_id,
         request_id=request.command.request_id, conversation_id="original-sender-cid",
         command=request.command, capture=request.capture,

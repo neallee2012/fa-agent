@@ -469,17 +469,17 @@ def hosted_environment():
     Obvious combinations stop too: every group turn runs on the Responses lane, so FA_NATIVE_GROUPS_ENABLED=1 must
     also carry FA_RESPONSES_ENABLED=1 (2026-10-04 stage start refused with 409); propose_routine is offered only with
     native routines on (README#native-routines-stage; HITL may come from the served definition, so it is not checked)."""
-    on = native_2di()
+    native_2di()
     overlay = {}
     for agent in STAGE["agents"]:
         environment = agent.get("hosted_environment") or {}
         turns, assistant = environment.get("FA_NATIVE_TURNS"), agent["kind"] == "assistant"
         # v2 only on assistants and only through the switch: an executor never runs the 2d-i turn the API moves.
-        if turns == NATIVE_V2 and not (on and assistant) or on and assistant and turns not in {None, NATIVE_V2}:
+        if turns == NATIVE_V2 and not assistant or assistant and turns not in {None, NATIVE_V2}:
             raise SystemExit(f"{agent['name']}: FA_NATIVE_TURNS in hosted_environment must match the 2d-i switch "
                              f"(api_environment {SESSION_GUARD}); leave it out, the switch sets {NATIVE_V2} on "
                              "assistants only")
-        if on and agent["kind"] == "assistant":
+        if assistant:
             environment = {**environment, "FA_NATIVE_TURNS": NATIVE_V2}
         if not environment:
             continue
@@ -566,23 +566,25 @@ def missing_idle(commit=None):
 
 
 def native_2di():
-    """True when api_environment switches ADR-0009 2d-i on (src README#native-2di-switch). The Hosted half
-    (assistants declare foundry-native-v2) is derived from it in hosted_environment(), so the two never part."""
-    value = STAGE["api_environment"].get(SESSION_GUARD, "0")
-    if value not in {"0", "1"}:
-        raise SystemExit(f"api_environment: {SESSION_GUARD} accepts only \"0\" or \"1\" (the 2d-i switch)")
-    idle = STAGE["api_environment"].get(IDLE_UPGRADE, "0")
-    if idle not in {"0", "1"} or idle == "1" and value != "1":
-        raise SystemExit(f"api_environment: {IDLE_UPGRADE} accepts only \"0\", or \"1\" with the 2d-i switch "
-                         f"({SESSION_GUARD}=\"1\")")
-    if value == "0" and STAGE["assistant_environment"].get("FA_NATIVE_TURNS") == NATIVE_V2:
-        raise SystemExit(f"assistant_environment: FA_NATIVE_TURNS={NATIVE_V2} needs the 2d-i switch "
-                         f"(api_environment {SESSION_GUARD}=\"1\"); leave it at foundry-native-v1")
-    missing = missing_2di() if value == "1" else []
+    """True, or stops: from ADR-0009 2d-ii api_environment must switch 2d-i on (src README#native-2di-switch), since
+    the API sends and supports foundry-native-v2 only. The Hosted half (assistants declare foundry-native-v2) is
+    derived from it in hosted_environment(), so the two never part."""
+    if STAGE["api_environment"].get(SESSION_GUARD, "0") != "1":
+        raise SystemExit(f"api_environment {SESSION_GUARD}=\"1\" is required from ADR-0009 2d-ii (this API sends "
+                         f"{NATIVE_V2} only); the 2d-i switch cannot be off")
+    if STAGE["api_environment"].get(IDLE_UPGRADE, "0") not in {"0", "1"}:
+        raise SystemExit(f"api_environment: {IDLE_UPGRADE} accepts only \"0\" or \"1\"")
+    missing = missing_2di()
     if missing:
         raise SystemExit(f"api_environment {SESSION_GUARD}=\"1\" needs an API with ADR-0009 2d-i P5 and P6; this "
                          f"checkout (= the API image built from it) lacks {missing}")
-    return value == "1"
+    return True
+
+
+def _active_revisions(app):
+    # shortcut: first page only (no nextLink), upgrade if an API app ever keeps more than one page of revisions.
+    revisions = (rest("GET", f"{_resource('containerApps', app)}/revisions?{APPS_API}") or {}).get("value") or []
+    return [item.get("name") for item in revisions if (item.get("properties") or {}).get("active")]
 
 
 def switch_preconditions(properties=None, base=None):
@@ -590,19 +592,25 @@ def switch_preconditions(properties=None, base=None):
     goes on over a single serving API revision that already runs P5+P6 (older replicas decode the rows P5 writes as
     409 NATIVE_BINDING_INVALID), and it never goes off again (roll forward: no API below P6, no Hosted below H2d once
     v2 conversations exist; ADR-0009 M1 2d-i). The idle upgrade goes on the same way, over a serving revision that
-    already runs 4b-1; while it is on, every deploy needs the serving API at this commit's idle schema. Without ``properties`` it reads the API app (and its serving commit)."""
+    already runs 4b-1; while it is on, every deploy needs the serving API at this commit's idle schema. Without ``properties`` it reads the API app (and its serving commit).
+    A first install (no API app yet, or no revision ever ready and none active) passes: no API served, so nothing old
+    converges."""
+    native_2di()  # from 2d-ii a profile with the switch off stops here, whatever the API serves now
     read = properties is None
     app = STAGE["api_app"]
     if read:
-        properties = rest("GET", f"{_resource('containerApps', app)}?{APPS_API}")["properties"]
+        try:
+            properties = rest("GET", f"{_resource('containerApps', app)}?{APPS_API}")["properties"]
+        except SystemExit:
+            if _exists(app):
+                raise
+            return  # a first install (fa_azd creates the API after sync): no API serves, nothing old to converge
+    ready = properties.get("latestReadyRevisionName") or ""
+    if not ready and not _active_revisions(app):
+        return  # no revision ever got ready and none is active (a first install stopped midway): nothing to converge
     container = ((properties.get("template") or {}).get("containers") or [{}])[0]
     env = {item.get("name"): item.get("value") for item in container.get("env") or []}
     deployed = env.get(SESSION_GUARD)
-    if not native_2di():
-        if deployed == "1":
-            raise SystemExit(f"{app}: 2d-i is on ({SESSION_GUARD}=\"1\") and this profile turns it off; it cannot be "
-                             "turned off (ADR-0009: roll forward only). Keep \"1\" and fix forward")
-        return
     mode = (properties.get("configuration") or {}).get("activeRevisionsMode")
     if mode != "Single":
         raise SystemExit(f"{app}: the 2d-i switch needs single revision mode (mode {mode!r}); an operator sets it "
@@ -613,11 +621,8 @@ def switch_preconditions(properties=None, base=None):
     turning = deployed != "1" or idle_on
     if not turning and not idle:
         return  # already on: a later deploy's old revision may still be deactivating, so only the mode is checked
-    ready = properties.get("latestReadyRevisionName") or ""
     if turning:
-        # shortcut: first page only (no nextLink), upgrade if an API app ever keeps more than one page of revisions.
-        revisions = (rest("GET", f"{_resource('containerApps', app)}/revisions?{APPS_API}") or {}).get("value") or []
-        active = [item.get("name") for item in revisions if (item.get("properties") or {}).get("active")]
+        active = _active_revisions(app)
         if active != [ready]:
             raise SystemExit(f"{app}: turning 2d-i or the idle upgrade on needs one active revision, the latest ready "
                              f"one ({ready!r}; active {active}); wait for the old revision to deactivate, or an "
@@ -635,8 +640,10 @@ def switch_preconditions(properties=None, base=None):
     if missing:
         turning = " and ".join(name for name, on in (("2d-i (P5+P6)", deployed != "1"),
                                                      ("the idle upgrade (4b-1)", idle_on)) if on)
+        # 2d-ii refuses "0" for 2d-i, so its P5+P6 come from an earlier (2d-i era) commit deployed first.
         raise SystemExit(f"{app}: turning {turning} on needs the serving API to run that code already ({missing}); "
-                         "deploy this commit with that switch at \"0\" first, then switch it on")
+                         "deploy a commit that has it with that switch at \"0\" first (for 2d-i: one before "
+                         "ADR-0009 2d-ii), then switch it on")
 
 
 def _sync_script(hosted_ref, *, follow=False):
@@ -647,17 +654,13 @@ def _sync_script(hosted_ref, *, follow=False):
     runtime_root = f"/tmp/fa-{TOKEN}-runtime"
     argv = ["sync", "--config", f"{runtime_root}/config.json", "--image", hosted_ref, "--core", core(), "--route",
             "--hosted-environment", f"{runtime_root}/hosted-environment.json",
-            "--idle-timeout-seconds", str(STAGE["hosted_idle_timeout_seconds"])]
-    on = native_2di()
-    if not on:
-        # A turn-on that stopped after sync left v2 definitions: carrying them on with the API off is refused.
-        argv.append("--refuse-native-v2")
-    else:
-        # Onboarded Agents are not in STAGE["agents"]: sync gives the registered assistants the same v2 (2d-ii drops v1).
-        argv.append("--native-v2-registered")
+            "--idle-timeout-seconds", str(STAGE["hosted_idle_timeout_seconds"]),
+            # Onboarded Agents are not in STAGE["agents"]: sync gives the registered assistants the same v2 (2d-ii
+            # drops v1); hosted_environment() above already stopped a profile with the 2d-i switch off.
+            "--native-v2-registered"]
     if not follow:
         argv.append("--defer-follow")
-    elif on:
+    else:
         # 2d-i moves each Agent after its turn end (P5 background cut): the deploy only reports, never follows.
         argv.append("--verify-follow")
     return "\n".join([
@@ -723,9 +726,7 @@ def sync(api_ref, hosted_ref, *, follow=False):
     switch_preconditions()
     status, name = _run_job(api_ref, _sync_script(hosted_ref, follow=follow))
     if status != "Succeeded":
-        hint = "" if native_2di() else (f"; an Agent failed with NATIVE_V2_SERVED_SWITCH_OFF already serves "
-                                        f"{NATIVE_V2} (a turn-on stopped after sync): rerun with {SESSION_GUARD}=\"1\"")
-        raise SystemExit(f"sync {name} {status}; read the job log in Log Analytics, do not rerun blindly{hint}")
+        raise SystemExit(f"sync {name} {status}; read the job log in Log Analytics, do not rerun blindly")
     print(f"sync {name} Succeeded")
 
 
@@ -941,17 +942,24 @@ def api(api_ref):
     print(f"api {revision} ready")
 
 
+def _exists(app):
+    """False only when ARM says the container app does not exist (``ResourceNotFound``); any other failure stops."""
+    found = subprocess.run([*AZ, "resource", "show", "--ids", _resource("containerApps", app), "--query", "id",
+                            "-o", "tsv"], check=False, text=True, encoding="utf-8", errors="replace",
+                           capture_output=True)
+    if found.returncode == 0:
+        return True
+    if "ResourceNotFound" in (found.stderr or ""):
+        return False
+    sys.stderr.write((found.stderr or "")[-2000:])
+    raise SystemExit(f"{app} lookup failed")
+
+
 def console(console_ref):
     # The remote console app is created by its own work line (3ef6, Z5); until then there is nothing to update.
-    exists = subprocess.run([*AZ, "resource", "show", "--ids", _resource("containerApps", STAGE["console_app"]),
-                             "--query", "id", "-o", "tsv"], check=False, text=True, encoding="utf-8",
-                            errors="replace", capture_output=True)
-    if exists.returncode != 0:
-        if "ResourceNotFound" in (exists.stderr or ""):
-            print(f"console app {STAGE['console_app']} not created yet; skipped")
-            return
-        sys.stderr.write((exists.stderr or "")[-2000:])
-        raise SystemExit("console app lookup failed")
+    if not _exists(STAGE["console_app"]):
+        print(f"console app {STAGE['console_app']} not created yet; skipped")
+        return
     # A new suffix every run (3ef6); a revision that never gets ready stops the run, nothing is retried.
     revision = _update_container("containerApps", STAGE["console_app"], console_ref, _suffix(),
                                  environment_overrides=STAGE["console_environment"])

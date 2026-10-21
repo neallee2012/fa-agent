@@ -1,8 +1,64 @@
 # FA 進度與交接狀態
 
-更新日期：2026-10-18。
+更新日期：2026-10-21。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="stage-v33-1021"></a>
+## 2026-10-21：stage 第 33 版（2026.10.20-33）部署後驗證
+
+- **範圍**：release PR #931，合併 commit `5970923e`。內容是 onboarding 助理宣告 v2（#926）、漂移紀錄寫入 profile（#927）、原地漂移的 crash-loop 否決（#928），沒有新開關。
+- **證據**：以下結果來自部署線回報，原始 log 與畫面不在 repo；SID 只寫前綴。沒有讀費用。
+- **結果**：
+  - A、B 與 `stage-test-e` 都在原 SID 上原地漂移（A、B：v82→v84；`stage-test-e`：v30→v32）。
+  - 漂移紀錄寫入 profile v2（#927）；#926 讓 `stage-test-e` 有了 v2 版本。這兩項是 2d-ii 的前提；dev 沒有 v1 列（見[第 33 版 dev 測試](#dev-test-v33-1020)），所以這是 stage 上的結果。
+  - `stage-test-e` 畫面上的「上次換環境時沒有搬工作檔」，是它 10-18 那次換環境（v29→v30，`files_migrated=false`）留下的待送通知，不是這次部署造成的。沒有遺失檔案。
+  - 沒有 Traceback，也沒有 5xx。
+- **待辦**：
+  - A 重複出現的 404（原回報寫 `NATIVE_RID_MISSING`；log 實際代碼是 `NATIVE_RID_ABSENT`）已查明，不是錯誤：00:52:32～00:55:54Z 共 11 筆，約每 9 秒一筆，來自工作台 bridge 輪詢 B 對 A 在 00:52:19 送出的交辦的回覆（`web_test_console/native.py` 1122～1131）。這是設計好的「回覆還沒到」行為，回覆在 00:55:59Z 到達後就停止；沒有使用者影響，回合畫面正確顯示執行中。
+  - 仍未決：(1) 對方一直不回時，這個等待有沒有上限；(2) 預期的 404 WARNING 要不要降級（工作台 README 1180 行寫明該層級是刻意的）。
+  - 工作台儲存體 400 `InvalidAuthenticationInfo` 來自 Azure 內建登入層（easyauth-tokens），自 10-03 起時有時無，使用者看不到。
+  - C、D：Neal 10-21 決定維持現狀（不退役）。它們是 executor（定義沒有 `FA_NATIVE_TURNS`），從不認領綁定列，閘門只回報成 `unclaimed`、不擋部署，所以 2d-ii 可以武裝閘門。
+  - 2d-ii 前的檢查（A、B、`fa-agent` 各用一次、閘門報告沒有 v1 `row_profile`）見 [CURRENT-STATE](status/CURRENT-STATE.md)。
+
+<a id="dev-test-v33-1020"></a>
+## 2026-10-20：第 33 版候選 dev 測試（main `82fd9975`，部署線）
+
+- **範圍與授權**：只動 dev（`a392919a..82fd9975`），stage 沒動。多跑了一次唯讀 gate 取得送出後的列。工作台 8765 只按「連線」，送了 4 則；bridge 留在 `a392919a`，#922 只改文案所以沒重啟。證據來自部署線的 dev 報告，原始資料不在 repo。
+- **部署**：API `…82fd997-r2-1`（`3d474dd3`）唯一 active、Healthy，ENV 0 差異；Hosted `49423594`。sync 8 個都 ok；follow：pending 6、skipped 2、drifted 0。
+- **結論**：部署成功；#926、#927、#928、2d-ii 預覽通過；smoke 部分通過（一次 503，見觀察 1）。
+
+| 項目 | 結果 | 說明 |
+|---|---|---|
+| 1 #926 | PASS | `caf2`、`319b`、`396d` 只有 `FA_NATIVE_TURNS` 從 v1 變 v2；`00c9` 本來就是 v2；A、B 的 ENV 0 差異 |
+| 2 #927 | PASS（看 log） | Table 被擋。A、B、M5、test agent 2 都在原 SID 上漂移，每一筆紀錄都帶 `profile=v2`，沒有換新 SID |
+| 3 #928 | PASS | `vetoed_versions []` |
+| 4 smoke | 部分 | 4 則都完成，Traceback／`*_INVALID` 為 0；一次 503。p50 2481／p95 9520 ms（n=4） |
+| 5 2d-ii 預覽 | PASS | 送出前 v1 只有 retired `00000000`；送出後 4 個有列的都是 v2 |
+
+- **觀察**：
+  1. B 回完之後，背景讀取 30 秒 ReadTimeout，API 回 503 `FOUNDRY_INVOCATION_UNKNOWN`（`progress`）；下一次是 200。列入待辦。
+  2. M5 的「沒搬檔」提示：SID 沒變，是舊通知。
+  3. test agent 2 第一次認領時，submit 要 9.5 秒。
+- **dev 沒有驗證到的**：#927 修正 v1 列（dev 沒有 v1 列）；#928 的偵測本身；`00000000`、`39da93ed` 沒有送。
+- **費用**：USD705.12 → 705.12（讀數有延遲）。
+- **Neal**：不需要決定；要顯示新文案，由 Neal 重啟 bridge。
+
+<a id="stage-v32-1020"></a>
+## 2026-10-20：stage 第 32 版（2026.10.20-32）部署後驗證與冒煙
+
+- **範圍**：release PR #924，部署的 commit 是 `90e3a892`；這版在 stage 打開 2d-i（`FA_NATIVE_SESSION_GUARD_ENFORCE="1"`）。IDLE、RECONCILER 仍是 `"0"`，快照 URL 沒設。
+- **證據**：部署讀回是唯讀（時間為 UTC，04:05～04:25）。Table 從這台筆電讀被儲存體網路規則擋住，依規則停下、沒有繞過，所以部署後的綁定列與柵欄狀態讀不到。冒煙結果來自總協調回報，原始畫面不在 repo。SID 只寫前綴。
+- **部署讀回**：
+  - deploy run 39366362203 成功（03:50～04:04）。API revision `…90e3a89-r120-1` 是唯一 active、Healthy、流量 100%。API 與 Hosted 的 core 相同，都是 `4e2c486d`。
+  - A／B／C／D 到 v83，`fa-agent` 到 v31，都是 latest、active；A／B v83 的 `FA_NATIVE_TURNS` 是 `foundry-native-v2`。
+  - gate 03:52Z：armed=False、decision=pass、refused 與 retired 都是空。A（`8efce15e…`）、B（`ad2abcf2…`）、`fa-agent`（`1944ae1b…`）的列都是 compatible。4 次 Table 404 是 C／D 未認領的列。
+  - verify-follow 04:03Z：A、B、`fa-agent` 是 `pending`（`verify_only`、`model_started=false`），這是 GUARD 打開後的預期結果；C、D 是 `AGENT_SCOPE_MISSING` skipped；沒有 drifted。
+  - 3 個 job 沒有 Traceback、ERROR 或 WARNING。部署後讀回時 API log 還沒有任何回合。
+- **冒煙**：
+  - A 回覆 6 秒、B 回覆 2 秒，沒有錯誤。
+  - 平台在原 SID 上把 A 與 B 從 v82 恢復到 v83，`$HOME` 保留。FA 的 `cut` 回 `current`，所以沒有執行 FA 自己的換版。這是 [ADR-0009 前提複核](adr/0009-version-model-g-actual-version-idle-upgrade.md#platform-in-place-resume-2026-10-20)記的「原地恢復」在 stage 的觀察。
+  - 沒有出現批准卡，因為 auto-review 放行了唯讀的 navigate。
 
 <a id="stage-v31-1018"></a>
 ## 2026-10-18：stage 第 31 版（2026.10.18-31）部署與冒煙

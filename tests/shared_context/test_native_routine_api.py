@@ -328,7 +328,7 @@ def test_official_continuation_keeps_routine_attribution_and_the_original_unknow
                 agent_id=source.agent_id, hosted_session_id=source.hosted_session_id, request_id=rid,
                 conversation_id=source.conversation_id, command=command.command, capture=command.capture,
                 capture_digest=command.capture.sha256, submit_digest=command.sha256, status="accepted",
-                source=command.source, routine=command.routine, continuation=command.continuation)
+                state_profile=command.state_profile, source=command.source, routine=command.routine, continuation=command.continuation)
             case.remote.records[rid] = retained
             return httpx.Response(202, content=retained.model_dump_json().encode(), headers=headers)
         return case.remote(request)

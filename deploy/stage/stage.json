@@ -17,6 +17,7 @@
   "sync_job": "job-fa-agent-sync-stage",
   "console_app": "ca-fa-console-stage",
   "hosted_idle_timeout_seconds": 3600,
+  "compatibility_gate_armed": true,
   "assistant_environment": {
     "BEHAVIOR_ASSISTANT_PROFILE": "assistant-v1.2",
     "BEHAVIOR_ASSISTANT_RUNTIME_PATH": "/opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime",

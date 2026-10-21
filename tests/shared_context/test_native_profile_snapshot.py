@@ -5,14 +5,15 @@
 ``_Meta`` with (``RUNTIME_PROFILE``): a profile bump (ADR-0009 phase 2d) regenerates it by running only
 ``test_profile_snapshot_matches_the_current_profile`` with ``FA_REGENERATE_PROFILE_SNAPSHOT=1``, then reviews the diff.
 
-Until 2d-ii ``NATIVE_STATE_PROFILE`` (the send profile) and the DTO defaults built from it
-(``default=NATIVE_STATE_PROFILE, exclude_if=unlabeled_profile``) stay at the unlabeled v1 profile, so v1 bytes do not
-move; 2d-i moves only ``_Meta``'s label, and with it this snapshot's key, to v2.
+From 2d-ii ``NATIVE_STATE_PROFILE`` (the send profile) is v2, while every DTO default
+(``default=UNLABELED_STATE_PROFILE, exclude_if=unlabeled_profile``) stays the unlabeled v1 profile, so stored v1 and
+unlabeled items still read as v1 and keep their bytes; 2d-i moved ``_Meta``'s label, and this snapshot's key, to v2.
 
 JSON schema does not see ``exclude_if`` (which fields a dump leaves out); the profile-label tests below pin that part.
 
 ADR-0009 M1 "v1 wire 凍結": ``fixtures/native_v1_wire_h0.json`` is the H0 baseline (stage release 30, ``fb8941f2``)
-the v1 wire may only grow from until 2d-ii: full schemas (prose dropped as above), how each field is written, the
+the v1 wire may only grow from while Hosted accepts the v1 alias (2d-ii still resends v1 originals; it retires with the
+alias, the first Hosted image after convergence): full schemas (prose dropped as above), how each field is written, the
 NATIVE_REQUEST union, the SDK/runtime pins, the codec list and the canonical bytes of v1 items. Nothing in pytest
 writes it and ``FA_REGENERATE_PROFILE_SNAPSHOT`` does not touch it. It was produced once from H0 code with this file
 copied into ``git archive fb8941f2 src/fa-shared-context-poc tests/shared_context``, run there with
@@ -220,8 +221,8 @@ def test_a_v1_submit_digest_does_not_follow_the_profile_constant(monkeypatch):
     byte-identical (stored receipts still validate, same-RID resends still match) and labels only its own.
 
     The DTO defaults were built from the constant at import, so patching it here cannot reach them: the models are
-    checked directly. Until 2d-ii every ``exclude_if=unlabeled_profile`` default is the unlabeled profile and the H0
-    v1 items keep their bytes (module docstring)."""
+    checked directly. Every ``exclude_if=unlabeled_profile`` default is the unlabeled profile, also after 2d-ii flips
+    the constant, and the H0 v1 items keep their bytes (module docstring)."""
     from shared_context import behavior_agent_template  # noqa: F401  TemplateSettings carries such a default too
 
     def subclasses(cls):
@@ -247,7 +248,8 @@ def test_a_v1_submit_digest_does_not_follow_the_profile_constant(monkeypatch):
     assert not unlabeled_profile("foundry-responses-v1")
 
 
-# ADR-0009 M1 "v1 wire 凍結": additive-only over the H0 fixture. Allowed: new models, new request/command variants
+# ADR-0009 M1 "v1 wire 凍結": additive-only over the H0 fixture while Hosted keeps the v1 alias (2d-ii still resends
+# v1 originals, ``turn_profile``); the fixture retires with the alias. Allowed: new models, new request/command variants
 # (a discriminated union or a union of models only), wider enums (the v2 profile value), new optional fields a dump
 # leaves out by default. Refused: anything else that differs, a field widened into a union or gaining a variant H0
 # cannot read, and a new default for a field a dump leaves out.
@@ -558,6 +560,15 @@ def _widened(model, name=None, **fields):
 
 def _request(*variants):
     return TypeAdapter(typing.Annotated[typing.Union[variants], Field(discriminator="operation")])
+
+
+def test_v1_and_unlabeled_items_still_read():
+    """ADR-0009 2d-ii: every stored v1 or unlabeled item still decodes as v1 with its canonical bytes unchanged, so
+    stored digests still validate and a same-RID resend of v1 material still matches."""
+    for name, text in sorted(_h0()["v1_items"].items()):
+        item = V1_ITEMS[name](text)
+        assert item.state_profile == UNLABELED_STATE_PROFILE != NATIVE_STATE_PROFILE, name
+        assert canonical_bytes(item).decode("utf-8") == text, name
 
 
 def test_v1_wire_is_additive_over_h0(monkeypatch):

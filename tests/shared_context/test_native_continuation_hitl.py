@@ -45,7 +45,7 @@ def test_unstarted_continuation_requires_new_review_and_owner_once_without_trans
         submitted = NativeContinuationSubmit(
             command=original.command.model_copy(update={"request_id": rid, "conversation_id": original.conversation_id}),
             capture=original.capture, continuation=ref)
-        receipt = NativeReceipt(
+        receipt = NativeReceipt(state_profile=submitted.state_profile,
             agent_id=original.agent_id, conversation_id=original.conversation_id,
             hosted_session_id=original.hosted_session_id, request_id=rid,
             command=submitted.command, capture=submitted.capture, continuation=ref,

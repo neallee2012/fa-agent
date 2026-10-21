@@ -43,7 +43,7 @@ def test_original_unknown_and_related_attempt_stay_distinct_and_refresh_never_re
         turn_number=3, turn_key="turn:3", result_digest="d" * 64,
         text_sha256=hashlib.sha256(text.encode()).hexdigest(), text_bytes=3, text_parts=1,
         checkpoint_sha256="e" * 64)
-    child = NativeReceipt(
+    child = NativeReceipt(state_profile=request.state_profile,
         agent_id=source.agent_id, hosted_session_id=source.hosted_session_id,
         conversation_id=source.conversation_id, request_id=rid, command=request.command, capture=request.capture,
         submit_digest=request.sha256, capture_digest=request.capture.sha256, continuation=ref,

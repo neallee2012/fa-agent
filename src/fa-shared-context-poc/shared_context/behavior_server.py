@@ -801,9 +801,8 @@ def _lifespan(app, composition, validate):
     @asynccontextmanager
     async def lifespan(_app):
         clock = getattr(_app.state, "native_routine_clock", None)
-        # The daily patrol and the upgrade reconciler (ADR-0009 2d-i, phase 6a): each starts only behind its flags.
-        patrols = [task for task in (getattr(_app.state, "native_session_patrol", None),
-                                     getattr(_app.state, "native_upgrade_reconciler", None)) if task is not None]
+        # The upgrade reconciler (ADR-0009 phase 6a) starts only behind its flags; the daily patrol is off from 2d-ii.
+        patrols = [task for task in (getattr(_app.state, "native_upgrade_reconciler", None),) if task is not None]
         try:
             validate()
             if getattr(_app.state,"instruction_runner",False):composition.resume_instructions()
@@ -929,8 +928,8 @@ def application(composition: ServerComposition, *, preactivation=False):
             if composition.agent_id is None and composition.runtime.work_policy is not None:
                 from .behavior_peer_runtime import install_peer_routing
                 install_peer_routing(app, composition, application)
-                from .native_session_patrol import NativeSessionPatrol
-                app.state.native_session_patrol = NativeSessionPatrol(composition)
+                # ADR-0009 M1 step 3 (b): the daily patrol is off from 2d-ii (no v1 row is left to find); the
+                # operator one-shot ``agent-versions patrol --once`` stays.
                 from .native_upgrade_reconciler import NativeUpgradeReconciler
                 app.state.native_upgrade_reconciler = NativeUpgradeReconciler(composition)
             return _lifespan(app, composition, lambda: (

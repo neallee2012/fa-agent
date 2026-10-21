@@ -456,7 +456,7 @@ def test_real_image_filter_reports_existing_omissions_without_request_or_image_c
     from test_user_images_native import encoded
 
     request = submit()
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=request.state_profile,
         agent_id="offline-agent", hosted_session_id="offline-host", request_id=request.command.request_id,
         conversation_id="offline-cid", command=request.command, capture=request.capture,
         capture_digest=request.capture.sha256, submit_digest=request.sha256, status="started",
@@ -588,7 +588,7 @@ def test_real_runner_projects_assembly_before_its_existing_public_event_boundary
     from shared_context.native_assembly import NativeAssemblyCollector
     from test_instruction_tool_feedback import run_callbacks
     request = submit()
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=request.state_profile,
         agent_id="offline-agent", hosted_session_id="offline-host", request_id=request.command.request_id,
         conversation_id="offline-cid", command=request.command, capture=request.capture,
         capture_digest=request.capture.sha256, submit_digest=request.sha256, status="started",

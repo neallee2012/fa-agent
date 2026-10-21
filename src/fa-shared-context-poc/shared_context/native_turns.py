@@ -213,7 +213,7 @@ class _Meta(WireModel):
     rid: Identifier | None = None
     base_ckpt: NativeCheckpointRef | None = None
     # ADR-0009 §3: written explicitly from 2a on (no digest covers it); an unlabeled item is v1-era and reads as v1.
-    state_profile: NativeStateProfile = NATIVE_STATE_PROFILE
+    state_profile: NativeStateProfile = UNLABELED_STATE_PROFILE
     inflight_rid: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")

@@ -74,10 +74,12 @@ _ATTACHED_SOURCE_ERRORS = {
 
 
 def configured_native_turns():
+    # ADR-0009 2d-ii: the API's own FA_NATIVE_TURNS only switches native on; the profile it sends is the constant.
+    from .native_responses_wire import ACCEPTED_STATE_PROFILES
     value = os.environ.get("FA_NATIVE_TURNS")
-    if value not in (None, NATIVE_STATE_PROFILE):
+    if value not in (None, *ACCEPTED_STATE_PROFILES):
         raise Problem(503, "NATIVE_TURNS_DISABLED", "FA_NATIVE_TURNS must name the supported state profile")
-    return value == NATIVE_STATE_PROFILE
+    return value is not None
 
 
 class _BeforeAdmission(Problem):

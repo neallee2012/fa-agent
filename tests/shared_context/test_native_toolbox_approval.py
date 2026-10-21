@@ -68,7 +68,7 @@ def setup(c, tmp_path, approval, *, hitl_on=True, rid="rid-one", toolbox=None, p
     else:
         source, command = None, submit(rid, text="Please search for the quarterly numbers.").command
         submitted = NativeSubmit(command=command, capture=capture)
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=submitted.state_profile,
         agent_id="native-a", hosted_session_id="hosted-one", conversation_id="cid-one", request_id=rid,
         command=command, capture=capture, submit_digest=submitted.sha256, source=source,
         capture_digest=capture.sha256, status="started", turn_number=1)

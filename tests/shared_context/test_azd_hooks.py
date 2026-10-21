@@ -637,6 +637,28 @@ def test_a_stopped_first_install_resumes_without_creating_again(hooks, tmp_path,
     assert steps[-4:] == ["ci:sync", "prepare_sessions", "select_defaults", "summary"]
 
 
+def test_a_resumed_install_over_a_serving_api_runs_the_gate_before_any_switch(hooks, tmp_path, monkeypatch):
+    """ADR-0009 2d-ii: an API already serves, so its binding rows may be v1 from an older release; a first install
+    (no API app, test_first_install_runs_the_standard_flow_order) has no rows and runs no gate."""
+    steps, _ = deploy_case(hooks, tmp_path, monkeypatch, api_exists=True, FA_CONSOLE_DEPLOYED="true", **SEEDED)
+    assert steps.count("ci:gate") == 1 and steps.index("ci:check") < steps.index("ci:gate") < steps.index("runtime")
+    assert steps.index("ci:gate") < min(steps.index(step) for step in ("fresh_install", "ci:sync", "ci:api"))
+
+
+def test_an_armed_gate_refusal_tells_the_operator_what_to_do_with_each_agent(hooks, monkeypatch):
+    steps = []
+
+    def refused(ctx, commit, command, *args):
+        steps.append(command)
+        if command == "gate":
+            raise hooks.Stop("ci_deploy.py --config failed (exit 1); its output says what to read back")
+
+    monkeypatch.setattr(hooks, "ci_step", refused)
+    with pytest.raises(hooks.Stop, match=r"git checkout v2026\.10\.20-33.*FA_NATIVE_2DI true.*azd deploy.*retire the Agent.*#upgrade-2dii"):
+        hooks.upgrade(None, {"api": "a", "hosted": "h", "console": "c"}, "f" * 40)
+    assert steps == ["check", "gate"]  # nothing after the refusal
+
+
 def test_a_later_deploy_is_the_stage_ci_upgrade(hooks, tmp_path, monkeypatch):
     steps, _ = deploy_case(hooks, tmp_path, monkeypatch, api_exists=True, FA_SESSIONS_PREPARED="true")
     # WebIQ before the API update, so enabling it later never advertises a toolbox that does not exist (F6).

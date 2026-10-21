@@ -38,7 +38,7 @@ def test_native_routine_round_trip_is_original_scheduled_data_not_a_human_or_app
         request_id=origin.request_id, conversation_id=origin.conversation_id, content="Read the original work.")
     request = NativeRoutineSubmit(command=command, capture=capture(), routine=origin)
     assert NATIVE_REQUEST.validate_json(request.model_dump_json()) == request
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=request.state_profile,
         agent_id=origin.agent_id, hosted_session_id="hosted-session", request_id=command.request_id,
         conversation_id=origin.conversation_id, submit_digest=request.sha256,
         capture_digest=request.capture.sha256, command=command, capture=request.capture, routine=origin,

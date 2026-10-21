@@ -22,7 +22,7 @@ def routine_gate(hitl, tmp_path):
     command = NativeAgentCommand(
         request_id=source.request_id, conversation_id=source.conversation_id, content=original.command.content)
     submitted = NativeRoutineSubmit(command=command, capture=original.capture, routine=source)
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=submitted.state_profile,
         agent_id=original.agent_id, hosted_session_id=original.hosted_session_id, request_id=source.request_id,
         conversation_id=source.conversation_id, command=command, capture=original.capture, routine=source,
         submit_digest=submitted.sha256, capture_digest=original.capture_digest, status="started", turn_number=1)

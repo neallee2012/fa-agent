@@ -21,7 +21,7 @@ def sender_case():
         str(sender_scope.tenant_id), str(sender_scope.identity.oid), sender_scope.team_id,
         "agent", sender_scope.identity.actor, frozenset({"read", "submit", "execute"}))
     original = submit("sender-rid", text="Ask another Agent to inspect the public sample.")
-    sender = NativeReceipt(
+    sender = NativeReceipt(state_profile=original.state_profile,
         agent_id=sender_scope.target.agent_id, hosted_session_id="original-host-session",
         request_id=original.command.request_id, conversation_id="original-human-cid",
         submit_digest=original.sha256, capture_digest=original.capture.sha256,
@@ -123,7 +123,7 @@ def test_completed_peer_result_wakes_the_original_cid_with_the_original_request_
         turn_number=1, turn_key="turn:1", result_digest="a" * 64,
         text_sha256=hashlib.sha256(text.encode()).hexdigest(), text_bytes=len(text.encode()),
         text_parts=1, checkpoint_sha256="b" * 64)
-    completed = NativeReceipt(
+    completed = NativeReceipt(state_profile=request.state_profile,
         agent_id=recipient.target.agent_id, hosted_session_id="peer-host-session",
         request_id=request.command.request_id, conversation_id="peer-cid",
         submit_digest=request.sha256, capture_digest=request.capture.sha256,
@@ -160,7 +160,7 @@ def test_repeated_wake_enters_one_new_turn_in_the_original_a_conversation(harnes
         turn_number=1, turn_key="turn:1", result_digest="c" * 64,
         text_sha256=hashlib.sha256(text.encode()).hexdigest(), text_bytes=len(text.encode()),
         text_parts=1, checkpoint_sha256="d" * 64)
-    completed = NativeReceipt(
+    completed = NativeReceipt(state_profile=sent.state_profile,
         agent_id=recipient.target.agent_id, hosted_session_id="peer-host-session",
         request_id=sent.command.request_id, conversation_id="peer-conversation",
         command=sent.command, capture=sent.capture, source=sent.source,
@@ -191,7 +191,7 @@ def test_native_relay_keeps_the_original_root_without_a_two_hop_limit():
     values = agent_receive("inherited-message", recipient=scope.target.agent_id).model_dump(mode="json")
     values["source"]["hop"] = 2
     inherited = NativeAgentReceive.model_validate_json(json.dumps(values))
-    sender = NativeReceipt(
+    sender = NativeReceipt(state_profile=inherited.state_profile,
         agent_id=scope.target.agent_id, hosted_session_id="own-native-session",
         request_id=inherited.command.request_id, conversation_id="receiving-cid",
         command=inherited.command, capture=inherited.capture, source=inherited.source,

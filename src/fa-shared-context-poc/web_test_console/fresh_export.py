@@ -14,7 +14,7 @@ from shared_context.errors import Problem
 from .adapter import ConsoleError, FixedTask, canonical, sha
 from .agent_connections import AgentConnection, AgentConnections
 from .agent_onboarding import _create_only
-from .instructions import InstructionConnection
+from .instructions import NATIVE_LANE, InstructionConnection
 from .standing import StandingConsoleConfig
 
 
@@ -43,7 +43,7 @@ def export_connections(config, plan, *, backend_origin, client_id, output_direct
         )
         instructions = InstructionConnection(
             schema_version="fa-console-instructions-connection-v1", configuration_sha256=connection.sha256,
-            backend_core_sha256=plan.code_sha256, state_profile="foundry-native-v1",
+            backend_core_sha256=plan.code_sha256, state_profile=NATIVE_LANE,
         )
         directory = root / target.agent_id
         config_path, instructions_path = directory / "config.json", directory / "instructions.json"

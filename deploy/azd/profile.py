@@ -127,9 +127,6 @@ def build(values: Mapping[str, str], *, require_runtime: bool = True,
     if _flag(values, "FA_AGENT_ONBOARDING", "false"):
         api_environment["FA_ONBOARDING_ENDPOINT_PROTOCOLS"] = "true"
         api_environment["FA_ONBOARDING_ROLE_SCOPE"] = project_id
-    if _flag(values, "FA_NATIVE_2DI"):
-        # ADR-0009 2d-i (src README#native-2di-switch): ci_deploy derives the assistants' v2 declaration from this.
-        api_environment["FA_NATIVE_SESSION_GUARD_ENFORCE"] = "1"
     if _flag(values, "FA_ENABLE_WEBIQ"):
         api_environment["FA_CAPABILITY_TOOLBOX_ENTRIES"] = "WebIQ"
     memory = _flag(values, "FA_ENABLE_MEMORY", "true")
@@ -177,10 +174,10 @@ def build(values: Mapping[str, str], *, require_runtime: bool = True,
             "sources_container": _get(values, "FA_ARTIFACTS_CONTAINER"),
             "backups_container": _get(values, "FA_BACKUP_CONTAINER"),
         },
+        # ADR-0009 2d-ii (deploy/README.md#compat-gate): the API serves v2 only, so a v1 binding row stops a deploy
+        # over a serving API; a first install has no rows and runs no gate.
+        "compatibility_gate_armed": True,
     }
-    if _flag(values, "FA_COMPAT_GATE_ARMED"):
-        # ADR-0009 phase 3b (deploy/README.md#compat-gate): armed by the operator once no v1 binding row remains.
-        profile["compatibility_gate_armed"] = True
     api_url = values.get("FA_API_URL")
     if api_url:
         profile["api_url"] = api_url

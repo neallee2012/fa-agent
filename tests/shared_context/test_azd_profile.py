@@ -71,11 +71,9 @@ def test_defaults_only_use_keys_and_values_the_stage_profile_already_has(azd_pro
     base = azd_profile.defaults()
     for section in ("api_environment", "assistant_environment", "console_environment"):
         assert set(base[section]) <= set(stage[section]), section
-        assert all(stage[section][key] == value for key, value in base[section].items()
-                   if key != "FA_NATIVE_SESSION_GUARD_ENFORCE"), section
-    # The one exception: stage has 2d-i on, a new environment starts off (FA_NATIVE_2DI opts in, tested below).
-    assert (base["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"],
-            stage["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"]) == ("0", "1")
+        assert all(stage[section][key] == value for key, value in base[section].items()), section
+    # ADR-0009 2d-ii: like stage, a new environment starts with 2d-i on (the API sends foundry-native-v2 only).
+    assert base["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] == "1"
     assert base["conversation_defaults"] == stage["conversation_defaults"]
     # A subset, like the sections above: stage may turn on more than a new azd environment starts with.
     overlay = stage["agents"][0]["hosted_environment"]
@@ -244,6 +242,45 @@ def test_profile_passes_the_ci_pre_build_checks(profile_file, monkeypatch):
     load("ci_deploy_azd_early", ROOT / "deploy" / "stage" / "ci_deploy.py")
 
 
+def test_a_first_install_passes_the_2di_turn_on_checks_and_a_serving_api_without_p6_does_not(profile_file,
+                                                                                            monkeypatch):
+    """ADR-0009 2d-ii: a new azd environment starts with 2d-i on. Its first install runs sync before fa_azd creates
+    the API app, so no API serves and nothing old converges: switch_preconditions passes with no app, or with an app
+    whose revision never got ready. An environment that already serves an API without P5+P6 is still refused."""
+    monkeypatch.setenv("FA_DEPLOY_CONFIG", str(profile_file))
+    ci = load("ci_deploy_azd_first", ROOT / "deploy" / "stage" / "ci_deploy.py")
+    ci.STAGE = ci.load_config(profile_file)
+    assert ci.STAGE["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] == "1"
+    ci.check()
+
+    def missing(*args, **kwargs):
+        raise SystemExit("command failed (3): az rest --method GET")
+    monkeypatch.setattr(ci, "rest", missing)
+    # ARM's own answer for the app (az resource show), so the test pins the behaviour, not a helper's name.
+    lookup = {"stderr": "(ResourceNotFound) The Resource was not found."}
+    monkeypatch.setattr(ci, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
+        returncode=0 if not lookup["stderr"] else 3, stdout="", stderr=lookup["stderr"])))
+    ci.switch_preconditions()  # no API app yet
+    lookup["stderr"] = ""
+    with pytest.raises(SystemExit, match="az rest"):  # the app exists: an unreadable one still stops
+        ci.switch_preconditions()
+
+    ready = f"{ci.STAGE['api_app']}--abcdef1-r1-1"
+    app = {"properties": {"configuration": {"activeRevisionsMode": "Single"},
+                          "template": {"containers": [{"env": [{"name": "PYTHONUTF8", "value": "1"}]}]}}}
+    revisions = {"value": [{"name": ready, "properties": {"active": False}}]}
+    monkeypatch.setattr(ci, "rest", lambda method, path, body=None: revisions if "/revisions?" in path else app)
+    ci.switch_preconditions()  # an app whose revision never got ready and none is active
+    revisions["value"][0]["properties"]["active"] = True  # no ready name, but a revision serves: not a first install
+    with pytest.raises(SystemExit, match="needs one active revision, the latest ready one"):
+        ci.switch_preconditions()
+    app["properties"]["latestReadyRevisionName"] = ready  # an API serves, without the switch and without P5+P6
+    monkeypatch.setattr(ci, "serving_commit", lambda revision: "base")
+    monkeypatch.setattr(ci, "missing_2di", lambda commit=None: ["NATIVE_2DI_SCHEMA"] if commit == "base" else [])
+    with pytest.raises(SystemExit, match="2d-i \\(P5\\+P6\\) on needs"):
+        ci.switch_preconditions()
+
+
 def runtime(profile_file, tmp_path, monkeypatch):
     monkeypatch.setenv("FA_DEPLOY_CONFIG", str(profile_file))
     make_runtime = load("make_runtime_azd", ROOT / "deploy" / "stage" / "make_runtime.py")
@@ -344,15 +381,13 @@ def test_portal_bundle_chain_runs_offline_from_the_rebuilt_plan(profile_file, tm
     assert hooks.console_bundle(ctx, out, plan_path) == files
 
 
-def test_an_azd_environment_arms_the_compatibility_gate_only_when_asked(azd_profile):
-    """ADR-0009 phase 3b (deploy/README.md#compat-gate): unarmed by default; `azd env set FA_COMPAT_GATE_ARMED true`."""
-    assert "compatibility_gate_armed" not in azd_profile.build(values())
-    assert azd_profile.build(values(FA_COMPAT_GATE_ARMED="true"))["compatibility_gate_armed"] is True
-    with pytest.raises(SystemExit, match="FA_COMPAT_GATE_ARMED must be true or false"):
-        azd_profile.build(values(FA_COMPAT_GATE_ARMED="yes"))
+def test_an_azd_environment_always_arms_the_compatibility_gate(azd_profile):
+    """ADR-0009 2d-ii (deploy/README.md#compat-gate): the API serves v2 only, so the gate is armed with no setting."""
+    for extra in ({}, {"FA_COMPAT_GATE_ARMED": "false"}):  # the former opt-in is ignored
+        assert azd_profile.build(values(**extra))["compatibility_gate_armed"] is True
 
 
-def test_an_azd_environment_turns_2d_i_on_only_when_asked(azd_profile):
-    """ADR-0009 2d-i (src README#native-2di-switch): off by default; `azd env set FA_NATIVE_2DI true`."""
-    assert azd_profile.build(values())["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] == "0"
-    assert azd_profile.build(values(FA_NATIVE_2DI="true"))["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] == "1"
+def test_an_azd_environment_always_has_2d_i_on(azd_profile):
+    """ADR-0009 2d-ii (src README#native-2di-switch): on from the first install; there is no setting to turn it off."""
+    for extra in ({}, {"FA_NATIVE_2DI": "false"}):  # the former opt-in is ignored
+        assert azd_profile.build(values(**extra))["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] == "1"

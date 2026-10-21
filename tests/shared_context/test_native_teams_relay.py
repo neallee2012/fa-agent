@@ -409,6 +409,27 @@ def test_a_message_while_the_selected_version_has_no_session_waits_and_is_sent_w
     assert len(submits(env)) == 1 and list(env.case.remote.records) == [rid("act-1")]
 
 
+def test_a_read_that_meets_a_following_version_answers_503_and_the_next_poll_sends_the_same_rid(relay, monkeypatch):
+    """#891: the 2d-ii heal raises 503 AGENT_VERSION_FOLLOWING from bound_row on reads too. The relay re-polls any 5xx
+    with the same body (fa-teams-relay main.relay; only a 4xx ends unconfirmed), so the owner sees no error."""
+    from shared_context.behavior_native_turn_api import NativeTurnGateway
+
+    read = NativeTurnGateway.read
+    following = [Problem(503, "AGENT_VERSION_FOLLOWING", "this Agent's session version could not be confirmed yet")]
+
+    def following_once(self, *args, **kwargs):
+        if following:
+            raise following.pop()
+        return read(self, *args, **kwargs)
+
+    monkeypatch.setattr(NativeTurnGateway, "read", following_once)
+    waiting = relay.post()
+    assert waiting.status_code == 503  # the route's own 5xx code; any 5xx is re-polled
+    assert submits(relay.env) == [] and rid("act-1") not in relay.env.case.remote.records
+    assert relay.post().json()["state"] == "running"
+    assert len(submits(relay.env)) == 1 and list(relay.env.case.remote.records) == [rid("act-1")]
+
+
 def test_a_message_whose_rid_is_missing_and_whose_send_was_not_dispatched_is_never_told_to_resend(relay,
                                                                                                   monkeypatch):
     from shared_context.behavior_native_turn_api import NativeTurnGateway, _BeforeAdmission

@@ -6,10 +6,18 @@ from pydantic import Field
 
 from .adapter import ConsoleError, canonical, require, strict_json
 from shared_context import behavior_wire as wire
-from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE
+from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, UNLABELED_STATE_PROFILE, channel
 
 INSTRUCTION_QUOTED_UTF8_LIMIT = 8192
-STATE_PROFILES = (None, NATIVE_STATE_PROFILE, NATIVE_RESPONSES_PROFILE)
+# The local label of the Invocations lane (instructions.json, instruction_lanes, journal intents): it names the channel,
+# not the profile the API sends (v2 from ADR-0009 2d-ii), so existing files and databases keep their value.
+NATIVE_LANE = UNLABELED_STATE_PROFILE
+STATE_PROFILES = (None, NATIVE_LANE, NATIVE_RESPONSES_PROFILE)
+
+
+def lane_of(profile):
+    """The local lane of a profile a receipt carries (v1 or v2 both run on the Invocations lane)."""
+    return NATIVE_RESPONSES_PROFILE if channel(profile) == "responses" else NATIVE_LANE
 
 
 class InstructionConnection(wire.WireModel):
@@ -180,14 +188,14 @@ class InstructionStore:
             row = db.execute("SELECT thread_id,content FROM instructions WHERE request_id=?",
                              (receipt.request_id,)).fetchone()
             if row is not None:
-                require(row[1] == receipt.command.content and self._lane(db, row[0], None) == receipt.state_profile,
+                require(row[1] == receipt.command.content and self._lane(db, row[0], None) == lane_of(receipt.state_profile),
                         "INSTRUCTION_ROUTE_CHANGED")
                 return row[0]
             thread = receipt.request_id
             db.execute("INSERT INTO instructions VALUES (?,?,?,?)",
                        (receipt.request_id, receipt.command.content, self.clock().isoformat(), thread))
             db.execute("INSERT INTO instruction_threads VALUES (?,?)", (thread, receipt.request_id))
-            db.execute("INSERT INTO instruction_lanes VALUES (?,?)", (thread, receipt.state_profile))
+            db.execute("INSERT INTO instruction_lanes VALUES (?,?)", (thread, lane_of(receipt.state_profile)))
         return thread
 
     def lane(self, thread_id, *, preferred=None):

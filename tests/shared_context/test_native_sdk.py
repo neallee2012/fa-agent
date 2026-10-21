@@ -475,7 +475,7 @@ def test_native_factory_runs_under_bootstrap_owned_root_when_home_is_not_writabl
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     request = submit()
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=request.state_profile,
         agent_id=IDENTITY.agent_id, hosted_session_id=IDENTITY.session_id,
         request_id=request.command.request_id, conversation_id="OFFLINE-factory-cid",
         submit_digest=request.sha256, capture_digest=request.capture.sha256,

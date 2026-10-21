@@ -59,6 +59,7 @@ def test_signed_continuation_uses_the_retained_intent_and_never_accepts_owner_su
                     request_id=rid, conversation_id=source.conversation_id, command=command.command,
                     capture=command.capture, capture_digest=command.capture.sha256,
                     submit_digest=command.sha256, status="accepted", source=command.source,
+                    state_profile=command.state_profile,
                     continuation=command.continuation)
                 case.remotes[0].records[rid] = retained
             return httpx.Response(202, content=retained.model_dump_json().encode(), headers=headers)
@@ -143,7 +144,7 @@ def test_a_continued_peer_result_returns_under_the_original_message_without_anot
         turn_number=2, turn_key="turn:2", result_digest="b" * 64,
         text_sha256=hashlib.sha256(text.encode()).hexdigest(), text_bytes=3, text_parts=2,
         checkpoint_sha256="c" * 64)
-    derived = NativeReceipt(
+    derived = NativeReceipt(state_profile=request.state_profile,
         agent_id=source.agent_id, hosted_session_id=source.hosted_session_id,
         request_id=derived_id, conversation_id=source.conversation_id, command=request.command,
         capture=request.capture, submit_digest=request.sha256, capture_digest=request.capture.sha256,

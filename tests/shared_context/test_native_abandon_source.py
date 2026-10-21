@@ -47,7 +47,7 @@ def binding_rows(monkeypatch):
     return repository
 
 
-def platform(fixture, monkeypatch, *, status=None, profile="foundry-native-v1", idle_timeout=3600, created_at=None):
+def platform(fixture, monkeypatch, *, status=None, profile="foundry-native-v2", idle_timeout=3600, created_at=None):
     """The offline platform: ``status`` (a value or a callable) overrides the source's metadata status
     ("missing" is 404, "unavailable" a 503); ``profile`` is the source version definition's ``FA_NATIVE_TURNS`` and
     ``created_at`` its ``AgentVersionDetails.created_at`` (None: not reported)."""
@@ -72,7 +72,8 @@ def platform(fixture, monkeypatch, *, status=None, profile="foundry-native-v1", 
         return SimpleNamespace(name=name, version=version, created_at=created, definition={
             "kind": "hosted", "session_configuration": {"idle_timeout_seconds": idle_timeout},
             "environment_variables": {
-                "FA_NATIVE_TURNS": profile if version == source.agent_version else "foundry-native-v1"}})
+                # ADR-0009 2d-ii: the selected version declares v2 (the only supported profile)
+                "FA_NATIVE_TURNS": profile if version == source.agent_version else "foundry-native-v2"}})
 
     project_client(
         monkeypatch, get_session=get_session, get_version=get_version, stop_session=files.stop_session,
@@ -99,7 +100,7 @@ def seed(fixture, rid, status, *, session_id=None, cid=None, turn_number=None):
     from shared_context.native_turns import _Rid
 
     command = submit(rid, cid, text="An unfinished message " + rid)
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=command.state_profile,
         agent_id=fixture.source.agent_id, hosted_session_id=session_id or fixture.source.session_id, request_id=rid,
         conversation_id=cid or "native-" + rid, command=command.command, capture=command.capture,
         submit_digest=command.sha256, capture_digest=command.capture.sha256, status=status, turn_number=turn_number)
@@ -1651,6 +1652,8 @@ def release_28():
         module.__package__ = "shared_context"
         sys.modules[name] = module
         exec(compile(source, "release-28/native_turns.py", "exec"), module.__dict__)
+        # Its imports resolve to this package, whose send constant is v2 from ADR-0009 2d-ii; release 28 had v1.
+        module.NATIVE_STATE_PROFILE = "foundry-native-v1"
     return sys.modules[name]
 
 

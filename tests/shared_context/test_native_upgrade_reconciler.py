@@ -17,8 +17,19 @@ from shared_context.native_upgrade_reconciler import RECONCILE_BACKOFF_SECONDS, 
 from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401  (fixture)
 from test_instruction_flow import instruction_models  # noqa: F401  (fixture)
 from test_m3_auth import jwk_client, signing_key  # noqa: F401  (fixtures)
-from test_native_session_patrol import bind, own_loop, patrol, roster  # noqa: F401  (fixtures)
+from test_native_session_patrol import own_loop, patrol  # noqa: F401  (fixtures)
+from test_native_session_patrol import bind as bind_row, roster as roster_rows
 from test_native_turn_api import native_api  # noqa: F401  (fixture)
+
+V2 = "foundry-native-v2"  # ADR-0009 2d-ii: the one supported profile, so a "compatible" row is v2 (v1 is incompatible)
+
+
+def bind(case, profile=V2):
+    return bind_row(case, profile=profile)
+
+
+def roster(case, monkeypatch, n, status):
+    return roster_rows(case, monkeypatch, n, status, profile=V2)
 
 
 def reconciler(case, **options):

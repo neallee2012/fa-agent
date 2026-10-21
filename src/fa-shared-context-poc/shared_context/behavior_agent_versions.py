@@ -214,9 +214,8 @@ class HostedVersions:
         return self._builds.get((target.project_endpoint, target.agent_name, version))
 
     def current(self, target, *, require_responses=False):
-        """The selected version, when this API can follow to it (ADR-0009 2d-i). A v1 definition must be this API
-        build's (``fa_build`` equal): the v1 string never pinned a schema (§3). A v2 definition of any build passes:
-        v2 has its snapshot test, and every v2 runtime accepts the frozen v1 wire this API sends until 2d-ii."""
+        """The selected version, when this API can follow to it: from ADR-0009 2d-ii only a v2 definition (of any
+        build; v2 has its snapshot test). A v1 definition is incompatible, whatever its build."""
         try:
             foundry = self._foundry_for(target.project_endpoint)
             version = endpoint_version(foundry, target.agent_name)
@@ -231,7 +230,7 @@ class HostedVersions:
             raise refusal(503, FOLLOWING, "this Agent's Hosted version for the deployed build is not readable yet") from None
         if (not isinstance(observed, dict) or observed.get("name") != target.agent_name or observed.get("version") != version
                 or not _same_identity(observed, target)
-                or not (_of_build([observed], self.build) or _declared_profile(observed) == NATIVE_V2_PROFILE)
+                or _declared_profile(observed) != NATIVE_V2_PROFILE
                 or observed.get("status") != "active" or not isinstance(observed.get("definition"), dict)
                 or observed["definition"].get("kind") != "hosted"):
             log.warning("agent endpoint version is incompatible agent=%s version=%s", target.agent_name, version)
@@ -548,11 +547,9 @@ def _agents(composition):
 
 
 def sync_all(composition, foundry_for, *, image=None, agent_id=None, set_route=False, build=None,
-             hosted_environment=None, idle_timeout_seconds=900, refuse_native_v2=False, native_v2_registered=False,
+             hosted_environment=None, idle_timeout_seconds=900, native_v2_registered=False,
              sleep=time.sleep, clock=time.monotonic, wait_seconds=SYNC_WAIT_SECONDS):
-    """One result per Agent; each is independent and a failure only logs. ``refuse_native_v2`` (the ADR-0009 2d-i
-    switch is off): an Agent whose served definition declares v2 fails before any write instead of carrying v2 on.
-    ``native_v2_registered`` (the switch is on): a registered Agent whose served definition declares a native profile
+    """One result per Agent; each is independent and a failure only logs. ``native_v2_registered`` (the switch is on): a registered Agent whose served definition declares a native profile
     (an assistant: onboarding copies A's definition; executors declare none) also declares v2, the overlay ci_deploy
     gives the configured assistants; its other ENV carries over unchanged."""
     build = code_sha256() if build is None else build
@@ -573,11 +570,7 @@ def sync_all(composition, foundry_for, *, image=None, agent_id=None, set_route=F
         try:
             published = endpoint_version(foundry, target.agent_name)
             upgrade = native_v2_registered and kind == "registered"
-            details = (foundry.get_version(target.agent_name, published)
-                       if set_route or refuse_native_v2 or upgrade else None)
-            if refuse_native_v2 and _declared_profile(details) == NATIVE_V2_PROFILE:
-                raise Problem(409, "NATIVE_V2_SERVED_SWITCH_OFF",
-                              "the served definition declares foundry-native-v2 and the 2d-i switch is off")
+            details = foundry.get_version(target.agent_name, published) if set_route or upgrade else None
             if set_route:
                 if details.get("status") != "active" or not _same_identity(details, target):
                     raise Problem(409, "SOURCE_VERSION_MISSING", "the served source version is not confirmed")
@@ -622,8 +615,6 @@ def main(argv=None):
                       help="publish only; use solely before the matching API image is ready")
     sync.add_argument("--verify-follow", action="store_true",
                       help="ADR-0009 2d-i: report each Agent's environment (metadata only), never follow")
-    sync.add_argument("--refuse-native-v2", action="store_true",
-                      help="ADR-0009 2d-i switch off: an Agent serving foundry-native-v2 fails, nothing written")
     sync.add_argument("--native-v2-registered", action="store_true",
                       help="ADR-0009 2d-i switch on: registered assistants also declare foundry-native-v2")
     sync.add_argument("--follow-wait-seconds", type=int, default=1200,
@@ -669,8 +660,6 @@ def main(argv=None):
             or args.verify_follow and (args.defer_follow or not args.route)):
         parser.error("--defer-follow and --verify-follow require --route and exclude each other; "
                      "--follow-wait-seconds must be positive")
-    if args.native_v2_registered and args.refuse_native_v2:
-        parser.error("--native-v2-registered (2d-i switch on) and --refuse-native-v2 (off) exclude each other")
     # "drifted" is reported, never a failure (follow and verify). Verify-only also accepts "pending": an Agent still on
     # its earlier session moves after its next turn end.
     settled = {"ok", "skipped", "drifted"} | ({"pending"} if args.verify_follow else set())
@@ -690,7 +679,6 @@ def main(argv=None):
             results = sync_all(composition, composition.hosted_versions._foundry_for,
                                image=args.image, agent_id=args.agent_id, set_route=args.route, build=core,
                                hosted_environment=environment, idle_timeout_seconds=args.idle_timeout_seconds,
-                               refuse_native_v2=args.refuse_native_v2,
                                native_v2_registered=args.native_v2_registered)
             if args.route and not args.defer_follow:
                 from .native_environment_sync import follow_all

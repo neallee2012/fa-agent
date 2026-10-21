@@ -28,7 +28,7 @@ from .assistant_image_wire import IMAGE_DELIVERY_ERRORS
 from .native_image_wire import NativeImageRead, NativeImagesRead
 from .behavior_user_images import NativeUserImageUpload, USER_IMAGE_ERRORS
 from .native_responses_wire import (
-    NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, NativeResponseDispatch, NativeResponseId,
+    NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, UNLABELED_STATE_PROFILE, NativeResponseDispatch, NativeResponseId,
     NativeStateProfile, channel, check_response_state, unlabeled_profile,
 )
 from .native_append_wire import NativeAppend, NativeAppendRead
@@ -224,7 +224,7 @@ class NativeSubmit(WireModel):
     command: InstructionSubmit
     capture: NativeTurnCapture
     state_profile: NativeStateProfile = Field(
-        default=NATIVE_STATE_PROFILE, exclude_if=unlabeled_profile)
+        default=UNLABELED_STATE_PROFILE, exclude_if=unlabeled_profile)
     new_conversation_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
@@ -895,7 +895,7 @@ class NativeAgentReceive(WireModel):
     capture: NativeTurnCapture
     source: NativeAgentOrigin
     state_profile: NativeStateProfile = Field(
-        default=NATIVE_STATE_PROFILE, exclude_if=unlabeled_profile)
+        default=UNLABELED_STATE_PROFILE, exclude_if=unlabeled_profile)
     new_conversation_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
@@ -917,7 +917,7 @@ class NativeRoutineSubmit(WireModel):
     capture: NativeTurnCapture
     routine: NativeRoutineOrigin
     state_profile: NativeStateProfile = Field(
-        default=NATIVE_STATE_PROFILE, exclude_if=unlabeled_profile)
+        default=UNLABELED_STATE_PROFILE, exclude_if=unlabeled_profile)
 
     @model_validator(mode="after")
     def captured_routine(self):
@@ -937,7 +937,7 @@ class NativeContinuationSubmit(WireModel):
     source: NativeAgentOrigin | None = Field(default=None, exclude_if=lambda value: value is None)
     routine: NativeRoutineOrigin | None = Field(default=None, exclude_if=lambda value: value is None)
     continuation: NativeContinuation
-    state_profile: NativeStateProfile = NATIVE_STATE_PROFILE
+    state_profile: NativeStateProfile = UNLABELED_STATE_PROFILE
 
     @model_validator(mode="after")
     def captured_continuation(self):
@@ -1033,7 +1033,7 @@ class NativeEnvironmentNotice(WireModel):
 
 
 class NativeReceipt(WireModel):
-    state_profile: NativeStateProfile = NATIVE_STATE_PROFILE
+    state_profile: NativeStateProfile = UNLABELED_STATE_PROFILE
     agent_id: Identifier
     hosted_session_id: Identifier
     request_id: Identifier
@@ -1127,7 +1127,7 @@ class NativeReceipt(WireModel):
 
 
 class NativeConversation(WireModel):
-    state_profile: NativeStateProfile = NATIVE_STATE_PROFILE
+    state_profile: NativeStateProfile = UNLABELED_STATE_PROFILE
     agent_id: Identifier
     hosted_session_id: Identifier
     execution_hosted_session_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -1206,7 +1206,7 @@ class NativeTurnOrigin(WireModel):
 
 class NativeInstructionContext(WireModel):
     schema_version: Literal["fa-instruction-context-origin-v1"] = "fa-instruction-context-origin-v1"
-    state_profile: NativeStateProfile = NATIVE_STATE_PROFILE
+    state_profile: NativeStateProfile = UNLABELED_STATE_PROFILE
     content: str
     turn_origin: NativeTurnOrigin
 

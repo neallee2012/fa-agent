@@ -7,15 +7,17 @@ from pydantic import Field, model_validator
 from .behavior_wire import Digest, Identifier, WireModel
 
 
-# ADR-0009 M1 2d-i: the send profile and every DTO default stay v1 until 2d-ii; v2 is what an H2d runtime may declare.
-NATIVE_STATE_PROFILE = "foundry-native-v1"
-NATIVE_V2_PROFILE = "foundry-native-v2"
-NATIVE_RESPONSES_PROFILE = "foundry-responses-v1"
-ACCEPTED_STATE_PROFILES = frozenset({NATIVE_STATE_PROFILE, NATIVE_V2_PROFILE})
-NativeStateProfile = Literal["foundry-native-v1", "foundry-responses-v1", "foundry-native-v2"]
 # ADR-0009 §3: the one profile whose material may be unlabeled. It is fixed, not ``NATIVE_STATE_PROFILE``: a v1 digest
 # (``submit_digest``) is over the unlabeled form, so v1 stays byte-identical, while a later profile always labels its own.
+# Every DTO default is this profile, so an unlabeled stored item keeps reading as v1 after 2d-ii.
 UNLABELED_STATE_PROFILE = "foundry-native-v1"
+NATIVE_V2_PROFILE = "foundry-native-v2"
+# ADR-0009 M1 2d-ii: the profile the API sends (and labels new v2 material with) is v2.
+NATIVE_STATE_PROFILE = NATIVE_V2_PROFILE
+NATIVE_RESPONSES_PROFILE = "foundry-responses-v1"
+# What a Hosted runtime may declare (FA_NATIVE_TURNS): H2d images keep the v1 alias until the first image after 2d-ii.
+ACCEPTED_STATE_PROFILES = frozenset({UNLABELED_STATE_PROFILE, NATIVE_V2_PROFILE})
+NativeStateProfile = Literal["foundry-native-v1", "foundry-responses-v1", "foundry-native-v2"]
 
 
 def channel(profile) -> Literal["invocations", "responses"]:

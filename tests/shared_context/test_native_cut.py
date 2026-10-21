@@ -1766,7 +1766,8 @@ def test_a_repair_fallback_profile_is_corrected_by_the_next_definition_read(boun
         "request_id": "switch-2", "previous_hosted_session_id": "fa-native-next", "hosted_session_id": "fa-native-third"}),
         repairing=True)
     written = case.store.read(case.agent_id)
-    assert (written.state_profile, written.profile_unread) == ("foundry-native-v1", True)
+    # the fallback is the API's send profile (v2 from ADR-0009 2d-ii), marked unread until a definition read
+    assert (written.state_profile, written.profile_unread) == ("foundry-native-v2", True)
     declared(case, monkeypatch, **{"42": "foundry-native-v2"})
     monkeypatch.setattr(NativeSessions, "selected_version", lambda self, client: "42")
     assert sessions_.cut(client) == ("current", None, None)

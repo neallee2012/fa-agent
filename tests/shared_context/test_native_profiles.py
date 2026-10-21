@@ -215,7 +215,7 @@ def test_native_start_rechecks_exact_build_input_and_original_entry(monkeypatch,
     from shared_context.native_turns import NativeTurnControl
 
     request = NativeSubmit(command=submit().command, capture=profile_capture())
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=request.state_profile,
         agent_id=IDENTITY.agent_id, hosted_session_id=IDENTITY.session_id, request_id="rid-1",
         conversation_id="cid", capture=request.capture, capture_digest=request.capture.sha256,
         submit_digest=request.sha256, command=request.command, status="started", turn_number=1,
@@ -259,7 +259,7 @@ def test_agent_origin_is_not_human_and_legacy_context_reader_stays_separate():
     from test_native_turn_wire import agent_receive
 
     request = agent_receive()
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=request.state_profile,
         agent_id=IDENTITY.agent_id, hosted_session_id=IDENTITY.session_id, request_id=request.command.request_id,
         conversation_id="cid", capture=request.capture, capture_digest=request.capture.sha256,
         submit_digest=request.sha256, command=request.command, source=request.source, status="started", turn_number=2,

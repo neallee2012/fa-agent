@@ -72,7 +72,7 @@ def test_exact_original_command_capture_and_rid_round_trip():
     assert restored == original
     assert restored.sha256 == original.sha256
     assert submit(text="Different").sha256 != original.sha256
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=original.state_profile,
         agent_id="OFFLINE-agent", hosted_session_id="OFFLINE-host-session",
         request_id=original.command.request_id, conversation_id="native-cid-1",
         submit_digest=original.sha256, capture_digest=original.capture.sha256,

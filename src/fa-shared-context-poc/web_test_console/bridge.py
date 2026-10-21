@@ -24,7 +24,7 @@ from .adapter import (
 from .standing import StandingConsoleConfig, StandingWorkObservation
 from .work_policy import checked_observation
 from .pull_continuation import PullContinuationSidecar
-from .instructions import InstructionConnection
+from .instructions import NATIVE_LANE, InstructionConnection
 from .agent_connections import AgentConnections, AgentConsoles, MESSAGES as AGENT_MESSAGES, read_messages, validate_default
 from .agent_onboarding import AgentOnboarding, MESSAGES as ONBOARDING_MESSAGES, parse_input as onboarding_input
 from .native import NativeInstructionControl, MESSAGES as NATIVE_MESSAGES
@@ -1228,7 +1228,7 @@ class Console:
         if self.native_request(task_id) is not None:
             value = self.native_instructions.receipts.get(task_id)
             acknowledgment = self.journal.get(task_id, "acknowledge")
-            return {"task_id": task_id, "state_profile": "foundry-native-v1",
+            return {"task_id": task_id, "state_profile": NATIVE_LANE,
                     "conversation_id": None if value is None else value.conversation_id,
                     "result_digest": None if value is None or value.result is None else value.result.result_digest,
                     "acknowledgment": acknowledgment, "not_current_live_result": True,

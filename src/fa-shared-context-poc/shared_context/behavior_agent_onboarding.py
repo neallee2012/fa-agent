@@ -381,10 +381,10 @@ def _effective_turn_origin(composition, original):
 def _effective_state_profile(composition, original):
     """A's lane for new conversations when it differs from the native default (its current human selection)."""
     from .behavior_profile_selection import current_selection
-    from .native_responses_wire import NATIVE_STATE_PROFILE
+    from .native_responses_wire import UNLABELED_STATE_PROFILE
     head = current_selection(composition.runtime.store, original)
-    value = NATIVE_STATE_PROFILE if head is None else head.command.template.settings.state_profile
-    return None if value == NATIVE_STATE_PROFILE else value
+    value = UNLABELED_STATE_PROFILE if head is None else head.command.template.settings.state_profile
+    return None if value == UNLABELED_STATE_PROFILE else value
 
 
 def _effective_catalog_budget(composition, original, selection):

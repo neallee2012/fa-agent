@@ -12,7 +12,8 @@ from fastapi.testclient import TestClient
 
 from shared_context.behavior_assistant import _LocalHttp
 from shared_context.behavior_inbox import INBOX_VERSION
-from shared_context.behavior_native_turn_wire import NATIVE_STATE_PROFILE, NativeReceipt
+from shared_context.behavior_native_turn_wire import NativeReceipt
+from web_test_console.instructions import NATIVE_LANE as NATIVE_STATE_PROFILE  # the lane label
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from web_test_console.adapter import ConsoleError, canonical, parse_config, sha
 from web_test_console.bridge import Journal, create_app
@@ -228,6 +229,35 @@ def test_a_finished_sender_remains_editable_while_queued_delivery_is_observed(na
     assert all(method == "GET" for method, _path, _body in c.calls[before:])
 
 
+def test_a_delegated_reply_past_its_review_deadline_is_marked_unconfirmed_and_still_awaited(native_console):
+    """Spec 2026-10-01 「等待到期」: a peer that never answers ends in 「結果尚未確認」, not an endless silent wait."""
+    from datetime import timedelta
+    from shared_context.behavior_native_agent_wire import NativeRelayAcceptance
+    from web_test_console.native import PEER_REPLY_REVIEW
+
+    c, draft = native_console, first(native_console)
+    assert send(c, draft).status_code == 200
+    c.api.remote.completed(draft["request_id"])
+    original = c.api.remote.records[draft["request_id"]]
+    c.api.remote.records[original.request_id] = original.model_copy(update={"delegation": NativeRelayAcceptance(
+        message_id="peer-reply-never", recipient_agent_id="peer", conversation_id="peer-cid",
+        submit_digest="b" * 64, status="accepted")})
+    waiting = progress(c, draft["thread_id"])
+    assert waiting.status_code == 200, waiting.text
+    assert waiting.json()["composer"]["awaiting_agent_reply"] is True
+    assert waiting.json()["composer"]["peer_reply_overdue"] is False
+    c.c.h.time += PEER_REPLY_REVIEW - timedelta(seconds=1)
+    assert progress(c, draft["thread_id"]).json()["composer"]["peer_reply_overdue"] is False
+    c.c.h.time += timedelta(seconds=1)
+    before = len(c.calls)
+    overdue = progress(c, draft["thread_id"])
+    assert overdue.status_code == 200, overdue.text
+    assert overdue.json()["composer"]["awaiting_agent_reply"] is True, "the reply is still read when it comes"
+    assert overdue.json()["composer"]["peer_reply_overdue"] is True
+    assert any(path.endswith("/requests/peer-reply-never") for _method, path, _body in c.calls[before:])
+    assert all(method == "GET" for method, _path, _body in c.calls[before:])
+
+
 def test_native_draft_read_and_download_retain_the_original_m3_bytes_without_a_write(native_console):
     from shared_context.m3_models import NativeArtifactSource, SkillPurpose
     from shared_context.native_skill_draft_wire import NativeSkillDraftReceipt, NativeSkillDraftView
@@ -408,7 +438,7 @@ def test_b_lists_and_reads_a_conversation_another_agent_opened_without_sending(n
 
     def received(rid):
         message = agent_receive(rid=rid, recipient=target.agent_id)
-        c.api.remote.records[rid] = NativeReceipt(
+        c.api.remote.records[rid] = NativeReceipt(state_profile=message.state_profile,
             agent_id=target.agent_id, hosted_session_id=target.session_id, request_id=rid,
             conversation_id="received-cid-" + rid, command=message.command, capture=message.capture,
             source=message.source, submit_digest=message.sha256, capture_digest=message.capture.sha256,
@@ -600,7 +630,7 @@ def test_agent_history_is_not_human_text_and_no_local_fake_request_is_created(na
         "source": receive.source.model_copy(update={"recipient_agent_id": original.agent_id}),
     })
     reference = original.result.model_copy(update={"turn_number": 2, "turn_key": "turn:2"})
-    value = NativeReceipt(
+    value = NativeReceipt(state_profile=receive.state_profile,
         agent_id=original.agent_id, hosted_session_id=original.hosted_session_id,
         conversation_id=original.conversation_id, request_id=receive.command.request_id,
         command=receive.command, capture=receive.capture, source=receive.source,
@@ -609,7 +639,7 @@ def test_agent_history_is_not_human_text_and_no_local_fake_request_is_created(na
     )
     c.api.remote.records[value.request_id] = value
     other_input = agent_receive(rid="agent-later", cid=original.conversation_id, recipient=original.agent_id)
-    later = NativeReceipt(agent_id=original.agent_id, hosted_session_id=original.hosted_session_id,
+    later = NativeReceipt(state_profile=other_input.state_profile, agent_id=original.agent_id, hosted_session_id=original.hosted_session_id,
         conversation_id=original.conversation_id, request_id=other_input.command.request_id,
         command=other_input.command, capture=other_input.capture, source=other_input.source,
         submit_digest=other_input.sha256, capture_digest=other_input.capture.sha256,

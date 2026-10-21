@@ -935,12 +935,25 @@ def ci_step(ctx: Context, commit: str, *args: str) -> None:
                str(ctx.work / "runtime"), *args, env=build_env(ctx, commit))
 
 
+def gate(ctx: Context, commit: str, api_ref: str) -> None:
+    """ADR-0009 phase 3b, armed (profile.py): before any switch of an API that already serves. From 2d-ii the new API
+    serves v2 only, so a binding row still at v1 would meet it with a new SID and no files, or 503s."""
+    try:
+        ci_step(ctx, commit, "gate", api_ref)
+    except Stop as error:
+        raise Stop(f"{error}. The compatibility gate stopped this deploy before the API switch: a binding row still "
+                   "records a profile the new API does not serve (v1), or the rows could not be read (the "
+                   "DEPLOY_COMPAT_GATE line in the sync job log names them). To go on: git checkout v2026.10.20-33, "
+                   "azd env set FA_NATIVE_2DI true, azd deploy, message each named Agent once, then check out this "
+                   "release again and azd deploy; or retire the Agent (deploy/azd/README.md#upgrade-2dii)") from None
+
+
 def upgrade(ctx: Context, built: dict[str, str], commit: str) -> None:
     """A later `azd deploy`: the stage CI's steps (deploy-staging.yml) against this profile. WebIQ first, so turning
     FA_ENABLE_WEBIQ on later never leaves the API offering a toolbox that does not exist (F6). The ADR-0009 phase 3b
     compatibility gate runs before any write (deploy/README.md#compat-gate); a first install has no binding rows yet."""
     ci_step(ctx, commit, "check")
-    ci_step(ctx, commit, "gate", built["api"])
+    gate(ctx, commit, built["api"])
     webiq(ctx)
     memory_store(ctx)
     ci_step(ctx, commit, "guard")
@@ -982,6 +995,8 @@ def deploy(ctx: Context) -> None:
     agent_roles(ctx)
     write_profile(ctx, require_runtime=True)
     ci_step(ctx, commit, "check")
+    if existing is not None:
+        gate(ctx, commit, built["api"])  # a resumed install over a serving API: its rows may be from an older release
     runtime_dir = runtime(ctx)
     sync_job(ctx, built["api"])
     plan_path = fresh_install(ctx, built["api"], runtime_dir)

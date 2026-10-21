@@ -20,6 +20,7 @@ from shared_context.native_progress_wire import NativeProgressSnapshot
 from shared_context.native_continuation_wire import NativeContinuationView, MAX_AUTOMATIC_CONTINUATIONS
 from shared_context.errors import Problem
 from .adapter import ConsoleError, PullAdapter, canonical, require, sha, strict_json
+from .instructions import NATIVE_LANE, lane_of
 
 PREFIX = "/work-policy/v1/native-turns"
 _NOT_ACCEPTED = frozenset({"AGENT_VERSION_FOLLOWING", "NATIVE_ADMISSION_PENDING"})
@@ -27,7 +28,13 @@ _FETCH = object()
 # A conversation another Agent opened here: its thread is its first RID, read back from this Agent's receipts.
 RECEIVED_PHASE = "agent-received"
 RECEIVED_SECONDS = 15
-MESSAGES = {code: "原生請求未完成；保留原對話與請求，不會換環境或自動重送。" for code in NATIVE_TURN_ERRORS}
+# Spec 2026-10-01 (「等待到期」→「訊息已接收，B 的結果尚未確認」): a delegated reply not back after this is shown as
+# unconfirmed and read more slowly; the wait itself stays open. B's own terminal notice retries for ~1.9 h
+# (native_turns ``_notification_retry``). shortcut: counted from the last change this bridge saw in the delegating
+# turn's receipt (its ``native-read`` row; a read-time notice coming or going restarts it), not from B's acceptance;
+# move it to the receipt if Hosted ever stamps one.
+PEER_REPLY_REVIEW = timedelta(hours=2)
+MESSAGES ={code: "原生請求未完成；保留原對話與請求，不會換環境或自動重送。" for code in NATIVE_TURN_ERRORS}
 MESSAGES.update({
     "AGENT_CONVERSATION_READ_ONLY": "這是其他助理交辦給這位助理的對話，只能檢視；回覆已自動送回原交辦對話。",
     "INSTRUCTION_ROUTE_CHANGED": "這段對話已固定原本的路徑；不能換後端或補造送出意圖。",
@@ -533,7 +540,7 @@ class NativeInstructionControl:
 
     def handles(self, thread_id=None):
         current = self.store.current(thread_id)
-        return self.profile(current["thread_id"]) in {NATIVE_STATE_PROFILE, NATIVE_RESPONSES_PROFILE}
+        return self.profile(current["thread_id"]) in {NATIVE_LANE, NATIVE_RESPONSES_PROFILE}
 
     def thread_for(self, rid):
         if rid in self.request_threads:
@@ -561,7 +568,7 @@ class NativeInstructionControl:
             require(thread == rid, "INSTRUCTION_ROUTE_CHANGED")
             if self.journal.get(rid, RECEIVED_PHASE) is None:
                 self.journal.begin(rid, RECEIVED_PHASE, {
-                    "state_profile": receipt.state_profile, "sender_agent_id": source.sender.agent_id,
+                    "state_profile": lane_of(receipt.state_profile), "sender_agent_id": source.sender.agent_id,
                     "method": "GET", "path": PREFIX + "/requests/" + rid, "created_at": self.clock().isoformat()})
             self.journal.finish(rid, RECEIVED_PHASE, {
                 "state": "VERIFIED", "native_receipt": receipt.model_dump(mode="json"),
@@ -628,7 +635,7 @@ class NativeInstructionControl:
             item = (self.journal.get(local["request_id"], "submit")
                     or self.journal.get(local["request_id"], "group-observation")
                     or self.journal.get(local["request_id"], RECEIVED_PHASE))
-            if item is not None and item["intent"].get("state_profile") in {NATIVE_STATE_PROFILE, NATIVE_RESPONSES_PROFILE}:
+            if item is not None and item["intent"].get("state_profile") in {NATIVE_LANE, NATIVE_RESPONSES_PROFILE}:
                 self.request_threads[local["request_id"]] = thread_id
                 observed = self.journal.get(local["request_id"], "native-read")
                 retained = observed if observed is not None and observed.get("native_receipt") is not None else item
@@ -637,7 +644,7 @@ class NativeInstructionControl:
 
     def _remember(self, thread_id, value, *, persist=True, submit_result=False):
         profile = self.profile(thread_id)
-        require(value.state_profile == profile, "INSTRUCTION_ROUTE_CHANGED", 502)
+        require(lane_of(value.state_profile) == profile, "INSTRUCTION_ROUTE_CHANGED", 502)
         for previous in (v for rid, v in self.receipts.items() if self.request_threads.get(rid) == thread_id):
             require(previous.agent_id == value.agent_id and (
                 previous.status == "busy_refused" or value.status == "busy_refused"
@@ -1119,6 +1126,15 @@ class NativeInstructionControl:
                      (source.continuation.agent_id, source.continuation.conversation_id, source.continuation.request_id)
                      == (original.agent_id, original.conversation_id, original.request_id)))
 
+    def _peer_waiting(self, original):
+        returned = self.receipts.get(original.delegation.message_id)
+        return not self._peer_return_matches(original, returned) or returned.status in {"accepted", "started"}
+
+    def _peer_overdue(self, original):
+        seen = self.journal.get(original.request_id, "native-read")
+        at = None if seen is None else seen.get("observed_at")
+        return type(at) is str and self.clock() - datetime.fromisoformat(at) >= PEER_REPLY_REVIEW
+
     def _refresh_peer_replies(self, thread, token):
         for original in self._peer_requests(thread):
             rid = original.delegation.message_id
@@ -1266,7 +1282,7 @@ class NativeInstructionControl:
             count = db.execute("SELECT COUNT(*) FROM intents WHERE task_id=? AND phase LIKE 'native-resume-%'",
                                (rid,)).fetchone()[0]
         phase = "native-resume-" + str(count + 1)
-        self.journal.begin(rid, phase, {"state_profile": NATIVE_STATE_PROFILE, "body": command.model_dump(mode="json"),
+        self.journal.begin(rid, phase, {"state_profile": NATIVE_LANE, "body": command.model_dump(mode="json"),
                                       "created_at": self.clock().isoformat()})
         result = self.adapter.submit(command, token)
         self._current(token)
@@ -1627,12 +1643,11 @@ class NativeInstructionControl:
                 "read_only": True},
             "received_error": None if self.received_error is None else {"code": self.received_error},
             "progress_available": authenticated and (prior is not None or cid is not None),
-            "awaiting_agent_reply": any(
-                not self._peer_return_matches(original, self.receipts.get(original.delegation.message_id))
-                or self.receipts[original.delegation.message_id].status in {"accepted", "started"}
-                for original in self._peer_requests(thread)) or any(
+            "awaiting_agent_reply": any(self._peer_waiting(original) for original in self._peer_requests(thread)) or any(
                     value.queued_relay is not None and value.queued_relay.status == "queued"
                     for rid, value in self.receipts.items() if self.request_threads.get(rid) == thread),
+            "peer_reply_overdue": any(self._peer_waiting(original) and self._peer_overdue(original)
+                                      for original in self._peer_requests(thread)),
             "observed_at": self.observed.get(thread), "follow_up_blocker": blocker,
             "model": command.get("model") if command else None if models is None else models.default_model,
             "models": None if models is None else models.model_dump(mode="json"),

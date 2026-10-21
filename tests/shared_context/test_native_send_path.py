@@ -128,7 +128,7 @@ def metadata(monkeypatch, versions, status="active"):
 
     def get_version(name, version):
         return SimpleNamespace(name=name, version=version, definition={
-            "kind": "hosted", "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v1"}})
+            "kind": "hosted", "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2"}})
 
     project_client(monkeypatch, get_session=get_session, get_version=get_version)
 
@@ -295,7 +295,7 @@ def test_a_409_at_the_recorded_version_repairs_the_row_and_sends_the_same_rid_to
     assert list(case.remote.records) == ["native-rid"]
 
 
-def test_an_unreadable_definition_still_repairs_the_row_as_v1_and_sends_the_same_rid(bound, monkeypatch, caplog):
+def test_an_unreadable_definition_still_repairs_the_row_with_the_send_profile_and_sends_the_same_rid(bound, monkeypatch, caplog):
     """M2: before 2d-i the repair wrote the row and resent; a transient ``get_version`` failure must not turn that
     into 409. The row records v1, as before; the deploy gate reports it when the version declared otherwise."""
     case = bound
@@ -315,7 +315,7 @@ def test_an_unreadable_definition_still_repairs_the_row_as_v1_and_sends_the_same
         accepted = submit(case)
     assert accepted.status_code == 202 and accepted.json()["hosted_session_id"] == new_sid, accepted.text
     repaired = row(case)
-    assert (repaired.hosted_session_id, repaired.state_profile) == (new_sid, "foundry-native-v1")
+    assert (repaired.hosted_session_id, repaired.state_profile) == (new_sid, "foundry-native-v2")  # the send profile
     assert "NATIVE_BINDING_SWITCH_PROFILE_UNREAD code=AGENT_VERSION_FOLLOWING" in caplog.text
     assert operations(case.remote, "submit") == ["41"] and operations(transports[new_sid], "submit") == ["42"]
     assert list(case.remote.records) == ["native-rid"]

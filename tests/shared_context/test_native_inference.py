@@ -207,7 +207,7 @@ def test_real_runner_usage_projection_is_separate_from_public_progress(tmp_path,
     from shared_context.behavior_native_turn_wire import NativeReceipt
     from test_instruction_tool_feedback import run_callbacks
     request = submit()
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=request.state_profile,
         agent_id="agent-one", hosted_session_id="host-one", request_id="rid-1", conversation_id="cid-one",
         command=request.command, capture=request.capture, capture_digest=request.capture.sha256,
         submit_digest=request.sha256, status="started")

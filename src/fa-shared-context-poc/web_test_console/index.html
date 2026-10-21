@@ -600,6 +600,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <p id="cancellation-note" class="reason" role="status" hidden></p>
 <p id="model-switch-note" class="reason" role="status" hidden></p>
 <p id="environment-note" class="reason" role="status" hidden></p>
+<p id="peer-wait-note" class="reason" role="status" hidden></p>
 <p id="model-lock-note" class="reason" role="status" hidden><span id="model-lock-text"></span> <button id="model-lock-new-conversation" type="button"></button></p>
 <div class="composer-meta"><p id="instruction-reason" role="status">連線後即可聊天</p><span class="composer-shortcut">Enter 送出 · Shift + Enter 換行</span><p id="input-capacity" hidden></p></div>
 </div>
@@ -744,6 +745,8 @@ let lastProgressSignature=null,progressSameSince=0;
 // visible reads at the usual pace at once (progressKick).
 let progressDueAt=null,progressArmedMs=null,progressKick=false;
 const PROGRESS_NO_PUSH_MAX_MS=5000,PROGRESS_SAME_GRACE_MS=30000;
+// Past the bridge's review deadline (composer.peer_reply_overdue) a delegated reply is read at the read-failure ceiling.
+const PEER_OVERDUE_READ_MS=30000;
 function progressSignature(value){
   return JSON.stringify([value.authentication,value.tasks,value.composer],(key,item)=>key==="observed_at"?undefined:item);
 }
@@ -3640,7 +3643,7 @@ async function switchAgent(identity,targetThread=null){
   finally{if(revision===agentRevision){threadLoading=false;realtime.progressDue=!lastError;render()}}
 }
 function nativeProfile(value){
-  return value==="foundry-native-v1"||value==="foundry-responses-v1";
+  return value==="foundry-native-v1"||value==="foundry-native-v2"||value==="foundry-responses-v1";
 }
 function clearGroupPanel(){
   groupRevision++;groupOptions=null;groupView=null;groupList=null;groupPending=null;groupBusy=false;
@@ -5580,6 +5583,10 @@ function renderComposer(){
     ||!cancelTask?.actions?.cancel?.enabled;
   text("cancel-instruction",cancelling?"停止請求送出中":"停止這次回覆");
   text("cancellation-note",cancellation);el("cancellation-note").hidden=!cancellation||Boolean(opening);
+  // Spec 2026-10-01 「等待到期」: the bridge's review deadline passed; the reply is still read and shown when it comes.
+  const peerOverdue=composer?.awaiting_agent_reply===true&&composer.peer_reply_overdue===true;
+  text("peer-wait-note",peerOverdue?"另一位助理已接收交辦，超過 2 小時還沒有回覆；結果尚未確認。回覆送到後會出現在這段對話，不要重新交辦。":"");
+  el("peer-wait-note").hidden=!peerOverdue;
   const openingKept=!opening&&Boolean(inputDrafts.get(scopeKey(OPENING_DRAFT))?.trim());
   const reason=state.reason?"尚未連接可用的工作環境":state.authentication!=="AVAILABLE"?"先按左下方「連線」，即可開始聊天":
     !scopeAvailable()?friendlyError({code:state.agent_directory_error||
@@ -7189,7 +7196,10 @@ function progressDelay(){
   // With push open a running turn and a delegation waiting for its reply are read every 3 seconds instead of every
   // second; their end event reads them at once. A tab that just became visible reads at the usual pace first.
   const pushed=realtime.phase==="open"&&(runningOwnTurn()||state.composer.awaiting_agent_reply===true);
-  return pushed&&!progressKick?Math.max(retryMs,REALTIME_STATUS_MS):retryMs;
+  // A turn the owner started meanwhile keeps its own pace (runningOwnTurn is null while a reply is awaited).
+  const floor=state.composer.peer_reply_overdue===true&&!["accepted","started"].includes(latest?.native_receipt?.status)?
+    PEER_OVERDUE_READ_MS:pushed?REALTIME_STATUS_MS:0;
+  return progressKick?retryMs:Math.max(retryMs,floor);
 }
 // The owner's own native turn that is still running in this conversation. While it runs, only that turn is read
 // (its receipt, progress and, at the end, its reply), like charter-agent's single in-flight request, instead of the

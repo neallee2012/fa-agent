@@ -87,8 +87,10 @@ def test_sync_does_not_revalidate_an_unrelated_recorded_definition():
 @pytest.mark.parametrize("selector", ["5", "@latest"])
 def test_selector_controls_the_version_and_is_read_again_after_publication(selector):
     foundry = Foundry(R)
-    foundry.add(R.agent_name, 4, "same-build")
-    foundry.add(R.agent_name, 5, "same-build")
+    for version in (4, 5):  # from ADR-0009 2d-ii only a v2 definition is followed, whatever its build
+        foundry.add(R.agent_name, version, "same-build", definition={
+            "kind": "hosted", "image": f"{R.agent_name}:same-build",
+            "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2"}})
     route = {"version": selector, "latest": "5"}
 
     def get_agent(name):

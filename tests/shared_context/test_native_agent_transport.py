@@ -29,7 +29,7 @@ def test_agent_receive_never_accepts_an_unrelated_self_consistent_receipt(native
     else:
         sid = "another-session"
     other = NativeAgentReceive.model_validate_json(json.dumps(values))
-    response = NativeReceipt(
+    response = NativeReceipt(state_profile=other.state_profile,
         agent_id=case.foundry.target.agent_id, hosted_session_id=sid,
         request_id=other.command.request_id, conversation_id=other.command.conversation_id,
         command=other.command, capture=other.capture, source=other.source,

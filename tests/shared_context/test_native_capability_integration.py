@@ -425,7 +425,7 @@ def original_native_console(h, tmp_path, signing_key):
     config = parse_config(json.dumps(configuration(wrapper, h.case.control, ids=("C6-unused-bookmark",))).encode())
     connection = InstructionConnection(
         schema_version="fa-console-instructions-connection-v1", configuration_sha256=config.sha256,
-        backend_core_sha256=config.backend_core_sha256, state_profile=NATIVE_STATE_PROFILE)
+        backend_core_sha256=config.backend_core_sha256, state_profile="foundry-native-v1")  # the workbench lane
     calls, transform = [], [lambda _request, response: response]
     with TestClient(api_application(h.case.h.composition)) as api:
         local = _LocalHttp(api)
@@ -1466,7 +1466,7 @@ def test_native_console_reads_real_skill_draft_bytes_and_refuses_a_replaced_sour
     config = parse_config(json.dumps(configuration(wrapper, h.case.control, ids=("C6-unused-bookmark",))).encode())
     connection = InstructionConnection(
         schema_version="fa-console-instructions-connection-v1", configuration_sha256=config.sha256,
-        backend_core_sha256=config.backend_core_sha256, state_profile=NATIVE_STATE_PROFILE)
+        backend_core_sha256=config.backend_core_sha256, state_profile="foundry-native-v1")  # the workbench lane
     calls, substitute = [], [False]
     with TestClient(api_application(h.case.h.composition)) as api:
         local = _LocalHttp(api)

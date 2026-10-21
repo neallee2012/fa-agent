@@ -19,7 +19,7 @@ from pydantic import Field, model_validator
 from .behavior_native_turn_wire import NATIVE_STATE_PROFILE, NativeEnvironmentNotice, material_digest
 from .behavior_wire import Identifier, WireModel
 from .errors import Problem
-from .native_responses_wire import ACCEPTED_STATE_PROFILES
+from .native_responses_wire import NATIVE_V2_PROFILE, UNLABELED_STATE_PROFILE
 from .storage import Repository, TableRepository, serialize
 
 # ADR-0009 2d-i parts this API code carries, read by the deploy's switch check (ci_deploy.API_2DI_SCHEMA, by AST):
@@ -38,10 +38,10 @@ MAX_BINDING_BYTES = 16 * 1024
 MAX_PREVIOUS_SESSIONS = 64
 # One row per Agent of one Team; the deploy gate refuses rather than stopping its read early.
 MAX_BINDING_ROWS = 10000
-# ADR-0009 §3 with the M1 relaxation: from 2d-i the supported set is {v1, v2}, while the API still sends v1 until
-# 2d-ii (then only v2). A SID whose recorded profile is outside it is never invoked, read through Session Files or
+# ADR-0009 §3: from 2d-ii the supported set is only v2 (2d-i's M1 relaxation accepted {v1, v2} while the API sent
+# v1). A SID whose recorded profile is outside it is never invoked, read through Session Files or
 # stopped by this API (§7a zero-call need, ``SessionGuard``).
-SUPPORTED_STATE_PROFILES = ACCEPTED_STATE_PROFILES
+SUPPORTED_STATE_PROFILES = frozenset({NATIVE_V2_PROFILE})
 # Recorded for a source found incompatible whose own profile is undeclared or unreadable: in no supported set, so
 # every guard and the deploy gate treat the SID as incompatible.
 INCOMPATIBLE_STATE_PROFILE = "incompatible"
@@ -219,7 +219,7 @@ class NativeBindingRow(WireModel):
     observed: NativeBindingObservation
     # Only from ``get_session`` (never ``list_sessions``) and only when an existing flow already read it.
     created_at: Annotated[str, Field(max_length=40)] | None = None
-    state_profile: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")] = NATIVE_STATE_PROFILE
+    state_profile: Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")] = UNLABELED_STATE_PROFILE
     previous_sessions: Annotated[tuple[NativeBindingSession, ...], Field(max_length=MAX_PREVIOUS_SESSIONS)] = ()
     last_switch: NativeBindingSwitch | None = None
     abandon: NativeBindingAbandon | None = Field(default=None, exclude_if=lambda value: value is None)

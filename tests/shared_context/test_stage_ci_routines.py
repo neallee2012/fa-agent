@@ -27,6 +27,9 @@ def load_ci():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.STAGE = copy.deepcopy(module.STAGE)
+    # ADR-0009 2d-ii deploys only with the 2d-i switch on (2d-ii merges after stage has it on); a test of the off
+    # profile sets "0" itself.
+    module.STAGE["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] = "1"
     return module
 
 
@@ -97,9 +100,9 @@ def test_ci_and_sync_accept_and_refuse_the_same_hosted_overlays():
 
 
 def test_ci_accepts_a_v2_hosted_definition_and_keeps_the_api_on_v1(ci, monkeypatch):
-    """ADR-0009 2d-i: a Hosted definition may declare v2 (only through the 2d-i switch, P9); the API's own
-    FA_NATIVE_TURNS stays v1 until 2d-ii."""
-    from shared_context.native_responses_wire import ACCEPTED_STATE_PROFILES, NATIVE_STATE_PROFILE
+    """ADR-0009 2d-i: a Hosted definition may declare v2 (only through the 2d-i switch, P9). The API's own
+    FA_NATIVE_TURNS only switches native on, so it stays the v1 string also after 2d-ii (the API then sends v2)."""
+    from shared_context.native_responses_wire import ACCEPTED_STATE_PROFILES, UNLABELED_STATE_PROFILE
     assert ci.HOSTED_STATE_PROFILES == ACCEPTED_STATE_PROFILES
     monkeypatch.setattr(ci, "missing_2di", lambda commit=None: [])
     ci.STAGE["api_environment"][ci.SESSION_GUARD] = "1"
@@ -107,7 +110,7 @@ def test_ci_accepts_a_v2_hosted_definition_and_keeps_the_api_on_v1(ci, monkeypat
     ci.STAGE["api_environment"].update({**API_ON, "FA_NATIVE_HITL_ENABLED": "1", "FA_NATIVE_TURNS": "foundry-native-v2"})
     with pytest.raises(SystemExit):
         ci.api_routines()
-    ci.STAGE["api_environment"]["FA_NATIVE_TURNS"] = NATIVE_STATE_PROFILE
+    ci.STAGE["api_environment"]["FA_NATIVE_TURNS"] = UNLABELED_STATE_PROFILE
     assert ci.api_routines() is True
 
 

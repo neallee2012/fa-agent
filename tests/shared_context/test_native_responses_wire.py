@@ -65,7 +65,7 @@ def test_server_selected_new_cid_does_not_rewrite_the_original_command():
 
 def test_legacy_public_wire_bytes_keep_the_recorded_baseline_hashes():
     request = submit("rid-original", "cid-original")
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=request.state_profile,
         agent_id="OFFLINE-agent", hosted_session_id="OFFLINE-session",
         request_id="rid-original", conversation_id="cid-original",
         command=request.command, capture=request.capture,

@@ -15,7 +15,8 @@ from .behavior_native_turn_wire import (
 from .behavior_wire import WireModel
 from .errors import Problem
 from .native_responses_wire import (
-    NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, NativeResponseHeaders, NativeResponseId, channel,
+    NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, UNLABELED_STATE_PROFILE, NativeResponseHeaders, NativeResponseId,
+    channel,
 )
 
 PREFIX = "/work-policy/v1/responses-turns"
@@ -42,12 +43,11 @@ class PlatformHistoryPage(WireModel):
 
 def turn_profile(capture, *, original=None, conversation=None):
     """The profile a turn is sent with. An original keeps its own (it is inside ``submit_digest``); a conversation
-    gives only its channel: ADR-0009 2d-i sends v1 until 2d-ii, also into a conversation an H2d image labelled v2."""
+    gives only its channel, as the template does: ADR-0009 2d-ii sends v2 also into a v1 or unlabeled conversation."""
     if original is not None:
         return original.state_profile
-    if conversation is not None:
-        return NATIVE_RESPONSES_PROFILE if channel(conversation.state_profile) == "responses" else NATIVE_STATE_PROFILE
-    return capture.template.settings.state_profile
+    lane = capture.template.settings.state_profile if conversation is None else conversation.state_profile
+    return NATIVE_RESPONSES_PROFILE if channel(lane) == "responses" else NATIVE_STATE_PROFILE
 
 
 def platform_client(composition, client):
@@ -202,21 +202,40 @@ def submit_native_turn(composition, client, command, capture, *, before_send=Non
         new_cid = (original.conversation_id if original is not None else
                    platform.create_conversation(before_send=before_send) if platform.mode == "conversation"
                    else "native-rsp-" + uuid4().hex)
-    values = {"command": command, "capture": capture, "state_profile": profile, "new_conversation_id": new_cid}
-    request = (NativeContinuationSubmit(
-        command=command, capture=capture, state_profile=profile, source=source, routine=routine, continuation=continuation)
-        if continuation is not None else
-        NativeRoutineSubmit(command=command, capture=capture, state_profile=profile, routine=routine)
-        if routine is not None else
-        NativeSubmit(**values) if source is None else NativeAgentReceive(**values, source=source))
+    def build(state_profile):
+        values = {"command": command, "capture": capture, "state_profile": state_profile, "new_conversation_id": new_cid}
+        return (NativeContinuationSubmit(command=command, capture=capture, state_profile=state_profile, source=source,
+                                         routine=routine, continuation=continuation)
+                if continuation is not None else
+                NativeRoutineSubmit(command=command, capture=capture, state_profile=state_profile, routine=routine)
+                if routine is not None else
+                NativeSubmit(**values) if source is None else NativeAgentReceive(**values, source=source))
+
+    request = build(profile)
     if original is not None and request.sha256 != original.submit_digest:
         raise Problem(409, "NATIVE_RID_CONFLICT", "the original request retains different material or a different lane")
     if read_only:
         return original, None
     if before_send is not None:
         before_send()
-    admitted, upstream = NativeTurnGateway._invoke(client, request)
-    if profile == NATIVE_STATE_PROFILE:
+    try:
+        admitted, upstream = NativeTurnGateway._invoke(client, request)
+    except Problem as conflict:
+        if (original is not None or profile != NATIVE_STATE_PROFILE
+                or conflict.body["error"]["code"] != "NATIVE_RID_CONFLICT"):
+            raise
+        # ADR-0009 2d-ii: a Hosted that crashed after its admission mark (`admitting`) but before `rid:<RID>` keeps
+        # the digest of the v1 send before 2d-ii, so the same RID with the same material labelled v1 (the alias
+        # Hosted still accepts) re-admits under it, once. Different material still conflicts: that answer stands.
+        # shortcut: only while Hosted accepts the v1 alias; remove with it (the first image after convergence).
+        try:
+            admitted, upstream = NativeTurnGateway._invoke(client, build(UNLABELED_STATE_PROFILE))
+        except Problem as second:
+            # Only a second conflict confirms "not accepted"; a timeout or 503 stays unknown for a same-RID readback.
+            if second.body["error"]["code"] == "NATIVE_RID_CONFLICT":
+                raise conflict from None
+            raise
+    if channel(profile) == "invocations":
         return admitted, upstream
     if source is not None and original is None and continuation is None:
         # The existing durable T5 follow owns subsequent attempts, including their finite error budget.

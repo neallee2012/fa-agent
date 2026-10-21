@@ -545,6 +545,11 @@ class NativeSessions:
         if not fresh and kept is not None and kept[0] == scope and kept[2] >= checked_since:
             return kept[1]
         row = self._binding("locate", lambda store: store.read(client.target.agent_id))
+        if (row is not None and row.agent_id == client.target.agent_id and not row.supported()
+                and (row.drift or row.profile_unread)):
+            # 2d-ii: a row that drifted in place onto v2 before #927 recorded it is healed here, not sent the
+            # incompatible way (a new SID without its files). A supported row never gets here.
+            row = self._correct_profile(client, row, send=True)
         if row is not None and (row.agent_id != client.target.agent_id or not row.supported()):
             if row.agent_id == client.target.agent_id:
                 self.guard.mark_incompatible(row.agent_id, row.hosted_session_id)
@@ -717,7 +722,7 @@ class NativeSessions:
         return profile
 
     def _record_switch(self, client, value, *, repairing=False):
-        """``repairing`` (M3, a send waits on it): an unreadable profile writes v1, as before 2d-i, rather than leave
+        """``repairing`` (M3, a send waits on it): an unreadable profile writes the send profile rather than leave
         the send refused, marked ``profile_unread`` so the background cut's next definition read corrects it; the
         deploy gate reports the row meanwhile. A follow writes nothing then, and its rerun reads the definition again."""
         def switching(store):
@@ -3444,23 +3449,30 @@ class NativeSessions:
             self._admitting_seen[agent_id] = seen = (request_id, monotonic())
         return monotonic() - seen[1]
 
-    def _correct_profile(self, client, row):
+    def _correct_profile(self, client, row, *, send=False):
         """The row's profile is what the version its SID runs (V_rec) declares: this replaces the repair fallback's v1
         (``profile_unread``) and the stale profile of a row that drifted before the drift CAS recorded it (its V_rec
         already equals what the VM runs, so no 409 comes to record it). ``HostedVersions.profile`` keeps each
         version's profile, so this is one ``get_version`` per version and process; no session is called. Unreadable
         or undeclared: the row is kept; an unreadable one is read and logged again next time, an undeclared one
-        (kept by ``HostedVersions``: a definition never changes) is logged once per Agent, version and process."""
+        (kept by ``HostedVersions``: a definition never changes) is logged once per Agent, version and process.
+        ``send`` (the locate before a send, 2d-ii): unreadable, or a correction not written, is a 503 the client
+        resends with the same RID, never the incompatible path (``guard.refused`` would keep the SID for good). It is
+        the version-follow 503 without ``not_dispatched``: the submit answers it as sent nowhere and resends it in
+        the request, then ``server_following`` (the workbench's same-RID resend), and never starts a switch for it."""
+        unhealed = Problem(503, "AGENT_VERSION_FOLLOWING", "this Agent's session version could not be confirmed yet")
         from .behavior_agent_versions import _resolver
         resolver = _resolver(self.composition.runtime)
         if resolver is None:
-            return row  # an offline harness: ``_row_profile``'s v1 stand-in is no definition read
+            return row  # an offline harness: ``_row_profile``'s send-profile stand-in is no definition read
         version = row.observed.agent_version
         try:
             profile = resolver.profile(client.target, version)
         except Exception as error:  # noqa: BLE001 - still unreadable: the next attempt reads again
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
             logging.getLogger(__name__).warning("NATIVE_BINDING_PROFILE_UNREAD code=%s version=%s", code, version)
+            if send:
+                raise unhealed from None
             return row
         if profile is None:
             if (row.agent_id, version) not in self._profile_undeclared:
@@ -3472,6 +3484,8 @@ class NativeSessions:
             return row  # already right (as stored: a bad pattern is kept as incompatible): no Table call
         corrected = self._binding("profile", lambda store: store.record_profile(
             row.agent_id, hosted_session_id=row.hosted_session_id, agent_version=version, state_profile=profile))
+        if corrected is None and send:
+            raise unhealed
         return corrected or row
 
     def admission_stuck(self, client, *, before_send):

@@ -965,7 +965,7 @@ API 只有在**沒有任何綁定列還記著舊 profile、也沒有 session 還
   與 sync／API 更新／console／follow 之前（在它之前只有 ACR push，不寫環境）；azd 的 `upgrade()` 排在 `check` 之後、WebIQ／Memory
   Store／sync 之前。它以**新的 API image** 啟動一次 sync job（API identity；GitHub 部署身份沒有 Table 與 Foundry
   資料面權限），所以「新 API 的支援集合」就是那個 image 裡的 `native_binding.SUPPORTED_STATE_PROFILES`，沒有第二份。
-  第一次安裝（azd 首次 `deploy`）還沒有綁定列，不跑。
+  第一次安裝（azd 首次 `deploy`）還沒有綁定列，不跑；中途停下、API app 已經存在的續跑，在 `check` 之後、sync 之前跑。
 - **讀什麼：** 只讀這個 Team 的全部綁定列（`NativeBindingStore.rows()`，分頁讀到底）和這些列引用的版本 definition
   （`get_version`）。**零 session 呼叫**：不 list／get／invoke／stop session、不讀 Session Files、不寫任何東西
   （`shared_context/native_deploy_gate.py`；測試以只答 `get_version` 的替身確認）。
@@ -979,7 +979,11 @@ API 只有在**沒有任何綁定列還記著舊 profile、也沒有 session 還
   它們第一次被觀察時才認領綁定列（`NativeBindingStore.claim`）。閘門不能判斷它的 session 是不是所選版本推導出的
   第 0 代 SID（`behavior_native_sessions.native_session_id` 也推導不帶版本的 SID，要分辨得讀 `get_session`，閘門不呼叫
   session），所以 2d-ii 打開前，[ADR-0009 M1 閘門清單](../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md)
-  要先把報告的 `unclaimed` 認領或退役。
+  要先把報告裡**宣告 native profile** 的 `unclaimed` 認領或退役。定義沒有宣告 native profile（沒有 `FA_NATIVE_TURNS`）的
+  executor 從不認領綁定列，維持 `unclaimed`、免處理：stage C、D 就是這種，Neal 2026-10-21 決定維持現狀、不退役。報告本身
+  分辨不出 executor（`unclaimed` 沒有列可引用版本），由 release PR 對照 profile 的 `kind`。
+- **還沒退役、已不服務的 Agent 留下的列（`unserved_rows`）：** 只檢查紀錄的 profile，打開時 v1 一樣拒絕；退役的列
+  （`retired_rows`）只報告，不擋。
 - **報告：** job log 一行 `DEPLOY_COMPAT_GATE {...}`（Log Analytics），含每個 Agent 的判定、`decision`
   （`pass`／`observe`／`refuse`／`override`）與保護清單（見下節）。CI 只看得到 job 成功或失敗（ARM 的 execution 沒有 exit code 或輸出），
   step summary 只寫狀態能證明的判定與這一行的位置；拒絕筆數與詳細原因讀這一行。報告也列出專案層否決的版本
@@ -1000,8 +1004,9 @@ API 只有在**沒有任何綁定列還記著舊 profile、也沒有 session 還
 2d-i 本身也不受影響（2d-i 的 API 仍支援 v1）。
 
 **打開（arming）：** 部署 profile 加 `"compatibility_gate_armed": true`（stage 是 `deploy/stage/stage.json`；azd 環境
-`azd env set FA_COMPAT_GATE_ARMED true`）。時點是觀察報告已經沒有 v1 的列之後、2d-ii 之前，由 2d-ii 的 release PR
-（或它之前的 PR）一併改，經 PR 審查留紀錄。打開之後，拒絕或讀不到都讓部署在任何環境寫入之前停下。
+自 2d-ii 起一律打開，`FA_COMPAT_GATE_ARMED` 不再讀取，見 [azd README](azd/README.md)）。時點是觀察報告已經沒有 v1 的列之後、2d-ii 之前，由 2d-ii 的 release PR
+（或它之前的 PR）一併改，經 PR 審查留紀錄。打開之後，拒絕或讀不到都讓部署在任何環境寫入之前停下。**stage：** 2d-ii 的
+PR（#891）在 `stage.json` 打開，合併到 main 不部署，帶 2d-ii 的 release 部署時就是武裝的。**dev：** 協調者 2026-10-21 決定 dev 比照 stage，`deploy/dev/dev.json` 也已打開（路徑只寫成文字，因為 `deploy/dev/` 不進公開匯出）。
 
 **一次性例外（override）：** 打開後真的必須先部署（例如要退役的 Agent 還綁在舊版本），在該環境的 release 檔
 （stage 是 `deploy/stage/release.json`）加：

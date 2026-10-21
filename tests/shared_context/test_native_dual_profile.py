@@ -17,14 +17,14 @@ from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import NATIVE_TURN_HEADER, NativeReceipt, canonical_bytes
 from shared_context.errors import Problem
 from shared_context.native_checkpoint import conversation_store_name, open_durable_store
-from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, NATIVE_V2_PROFILE
+from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_V2_PROFILE, UNLABELED_STATE_PROFILE
 from shared_context.native_turns import TURNS_STORE, NativeTurnRuntime
 from test_native_profile_snapshot import H0_FIXTURE
 from test_native_responses import ResponsesHarness, build_responses_host, response_submit
 from test_native_turn_wire import submit
 from test_native_turns import Harness, IDENTITY, OfflineSdk, local_env, native_retry_policy  # noqa: F401
 
-V1, V2 = NATIVE_STATE_PROFILE, NATIVE_V2_PROFILE
+V1, V2 = UNLABELED_STATE_PROFILE, NATIVE_V2_PROFILE
 
 
 @pytest.fixture

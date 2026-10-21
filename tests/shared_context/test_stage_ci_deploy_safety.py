@@ -31,6 +31,9 @@ def ci(monkeypatch):
     module = load_ci()
     for key in ("feed_app", "feed_environment", "api_secret_environment"):
         module.STAGE.pop(key, None)
+    # ADR-0009 2d-ii deploys only with the 2d-i switch on; its own preconditions have their own tests.
+    module.STAGE["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] = "1"
+    monkeypatch.setattr(module, "switch_preconditions", lambda *args, **kwargs: None)
     monkeypatch.setattr(module, "api_routines", lambda: False)  # guard's replica check has its own tests
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(module, "realtime_ready", lambda: None)

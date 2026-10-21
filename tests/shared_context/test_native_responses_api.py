@@ -592,7 +592,8 @@ def test_existing_invocations_cid_is_not_moved_by_a_new_responses_template(nativ
     assert refused.status_code == 409 and refused.json()["error"]["code"] == "NATIVE_STATE_SCOPE", refused.text
     continued = case.client.post(NATIVE_PREFIX + "/submit", headers=case.headers,
                                 json={**body, "request_id": "native-follow"})
-    assert continued.status_code == 202 and continued.json()["state_profile"] == "foundry-native-v1"
+    # ADR-0009 2d-ii: the v1 Invocations conversation continues, sent (and so received) as v2
+    assert continued.status_code == 202 and continued.json()["state_profile"] == "foundry-native-v2"
     assert case.remote.records["native-original"] == original
 
 
@@ -699,7 +700,7 @@ def options_version(options_api, monkeypatch):
     foundry = Foundry(target)
     foundry.add(target.agent_name, target.agent_version, "options-build", definition={
         "kind": "hosted", "protocol_versions": [{"protocol": "responses", "version": "2.0.0"}],
-        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v1", "FA_RESPONSES_ENABLED": "1"},
+        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_RESPONSES_ENABLED": "1"},
     })
     monkeypatch.setattr(case.composition, "hosted_versions",
                         HostedVersions(lambda _: foundry, build="options-build"), raising=False)
@@ -752,6 +753,9 @@ def test_template_options_keep_history_source_when_new_responses_are_disabled(op
     else:
         definition["environment_variables"]["FA_N6_RESPONSES_PROBE"] = "1"
     response = case.client.get("/work-policy/v1/agent-template/options", headers=case.headers)
+    if disabled == "native":  # ADR-0009 2d-ii: a version that declares no v2 is not followed at all
+        assert (response.status_code, response.json()["error"]["code"]) == (503, "AGENT_VERSION_FOLLOWING"), response.text
+        return
     assert response.status_code == 200, response.text
     assert response.json()["responses"] == {"enabled": False, "history_source": "conversation"}
     expected = [] if disabled == "api" else [("agent", target.agent_name), ("get", target.agent_name, target.agent_version)]

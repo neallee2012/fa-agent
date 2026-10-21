@@ -39,7 +39,7 @@ class Foundry:
         self.versions[name].append({
             "name": name, "version": str(version), "status": status, "metadata": {"fa_build": build},
             "definition": definition or {"kind": "hosted", "image": f"{name}:{build}",
-                                         "environment_variables": {"KEEP": "1"}},
+                                         "environment_variables": {"KEEP": "1", **V2_TURNS}},
             "agent_guid": guid or own_guid, "instance_identity": {"principal_id": principal}})
 
     def list_versions(self, name):
@@ -92,6 +92,16 @@ class Foundry:
         return [call for call in self.calls if call[0] == "create" and name in (None, call[1])]
 
 
+# ADR-0009 2d-ii: the API follows only a definition that declares foundry-native-v2 (of any build).
+V2_TURNS = {"FA_NATIVE_TURNS": "foundry-native-v2"}
+
+
+def v1_definition(name, build):
+    """A definition this API can no longer serve, whatever its build (it declares v1)."""
+    return {"kind": "hosted", "image": f"{name}:{build}",
+            "environment_variables": {"KEEP": "1", "FA_NATIVE_TURNS": "foundry-native-v1"}}
+
+
 class Clock:
     def __init__(self):
         self.now = 0.0
@@ -106,7 +116,7 @@ class Clock:
 def _sync(foundry, target, build, source=None, **kw):
     clock = Clock()
     source = source or (lambda: ({"kind": "hosted", "image": f"{target.agent_name}:{build}",
-                                "environment_variables": {"KEEP": "1"}}, "src:1"))
+                                "environment_variables": {"KEEP": "1", **V2_TURNS}}, "src:1"))
     return sync_agent_version(foundry, target, build=build, source=source, sleep=clock.sleep, clock=clock, **kw)
 
 
@@ -116,7 +126,7 @@ def _code(raised):
 
 def test_a_new_build_gets_its_own_version_and_the_selection_follows_it():
     foundry = Foundry(R)
-    foundry.add(R.agent_name, 3, "old")
+    foundry.add(R.agent_name, 3, "old", definition=v1_definition(R.agent_name, "old"))
     new = HostedVersions(lambda endpoint: foundry, build="new")
     with pytest.raises(Problem) as following:
         new.current(R)
@@ -129,7 +139,8 @@ def test_a_new_build_gets_its_own_version_and_the_selection_follows_it():
     assert len(created[0][3]["fa_definition_sha256"]) == 64
     assert new.current(R) == "4"
     foundry.selectors[R.agent_name] = "3"
-    assert HostedVersions(lambda endpoint: foundry, build="old").current(R) == "3"
+    with pytest.raises(Problem):  # 2d-ii: a v1 definition is not served even by its own build
+        HostedVersions(lambda endpoint: foundry, build="old").current(R)
     assert _sync(foundry, R, "new") == result and len(foundry.creates()) == 1
 
 
@@ -229,7 +240,7 @@ def test_responses_lane_rechecks_the_published_definition_without_a_write():
         "kind": "hosted",
         "protocol_versions": [{"protocol": "invocations", "version": "2.0.0"},
                               {"protocol": "responses", "version": "2.0.0"}],
-        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v1", "FA_RESPONSES_ENABLED": "1"},
+        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_RESPONSES_ENABLED": "1"},
     })
     resolver = HostedVersions(lambda endpoint: foundry, build="new")
     assert resolver.current(R) == "4"
@@ -244,7 +255,7 @@ def test_the_selected_definition_reports_model_switching_without_another_read(fl
     from shared_context.behavior_agent_template import TemplateResponsesOptions
 
     foundry = Foundry(R)
-    environment = {"FA_NATIVE_TURNS": "foundry-native-v1", "FA_RESPONSES_ENABLED": "1",
+    environment = {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_RESPONSES_ENABLED": "1",
                    **({} if flag is None else {"FA_NATIVE_MODEL_SWITCH": flag})}
     foundry.add(R.agent_name, 4, "new", definition={
         "kind": "hosted", "protocol_versions": [{"protocol": "responses", "version": "2.0.0"}],
@@ -275,11 +286,11 @@ def test_responses_requires_both_real_enabling_conditions_on_the_selected_versio
     foundry = Foundry(R)
     foundry.add(R.agent_name, 4, "new", definition={
         "kind": "hosted", "protocol_versions": protocols,
-        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v1", **environment},
+        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2", **environment},
     })
     # Neither a later matching build nor another build may silently replace the chosen version.
     enabled = {"kind": "hosted", "protocol_versions": [{"protocol": "responses", "version": "2.0.0"}],
-               "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v1", "FA_RESPONSES_ENABLED": "1"}}
+               "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_RESPONSES_ENABLED": "1"}}
     foundry.add(R.agent_name, 5, "new", definition=enabled)
     foundry.add(R.agent_name, 6, "other-build", definition=enabled)
     foundry.selectors[R.agent_name] = "4"
@@ -297,13 +308,13 @@ def test_responses_gate_checks_the_definition_returned_by_the_existing_active_ge
     foundry = Foundry(R)
     foundry.add(R.agent_name, 4, "new", definition={
         "kind": "hosted", "protocol_versions": [{"protocol": "responses", "version": "2.0.0"}],
-        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v1", "FA_RESPONSES_ENABLED": "1"},
+        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_RESPONSES_ENABLED": "1"},
     })
     get = foundry.get_version
 
     def actual(name, version):
         value = get(name, version)
-        value["definition"]["environment_variables"] = {"FA_NATIVE_TURNS": "foundry-native-v1", "FA_N6_PROBE": "1"}
+        value["definition"]["environment_variables"] = {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_N6_PROBE": "1"}
         return value
 
     monkeypatch.setattr(foundry, "get_version", actual)
@@ -333,7 +344,8 @@ def test_responses_flag_cannot_implicitly_enable_the_native_runtime(native_profi
     })
     with pytest.raises(Problem) as disabled:
         HostedVersions(lambda endpoint: foundry, build="new").current(R, require_responses=True)
-    assert _code(disabled) == (409, "NATIVE_TURNS_DISABLED")
+    # 2d-ii: a definition that declares no v2 is not followed at all, before the Responses check
+    assert _code(disabled) == (503, FOLLOWING)
     assert foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "4")]
 
 
@@ -343,7 +355,7 @@ def test_probe_version_is_not_a_production_lane_even_with_both_runtime_flags(pro
     foundry.add(R.agent_name, 4, "new", definition={
         "kind": "hosted", "protocol_versions": [{"protocol": "responses", "version": "2.0.0"}],
         "environment_variables": {
-            "FA_NATIVE_TURNS": "foundry-native-v1", "FA_RESPONSES_ENABLED": "1", probe: "probe-only",
+            "FA_NATIVE_TURNS": "foundry-native-v2", "FA_RESPONSES_ENABLED": "1", probe: "probe-only",
         },
     })
     resolver = HostedVersions(lambda endpoint: foundry, build="new")
@@ -371,8 +383,8 @@ def test_a_versions_fa_build_is_read_once_with_its_profile_and_only_as_a_code_id
     assert HostedVersions(lambda endpoint: SimpleNamespace(get_version=unreadable)).build_of(R, "41") is None
 
 
-@pytest.mark.parametrize("changed", [
-    {"metadata": {"fa_build": "another-build"}}, {"name": "another-agent"}, {"version": "5"},
+@pytest.mark.parametrize("changed", [  # 2d-ii: a v2 definition of another build is followed, so no build case
+    {"name": "another-agent"}, {"version": "5"},
     {"agent_guid": "99999999-9999-9999-9999-999999999999"},
     {"instance_identity": {"principal_id": "99999999-9999-9999-9999-999999999999"}},
 ])
@@ -380,7 +392,7 @@ def test_responses_eligibility_keeps_the_selected_get_build_and_identity(monkeyp
     foundry = Foundry(R)
     foundry.add(R.agent_name, 4, "new", definition={
         "kind": "hosted", "protocol_versions": [{"protocol": "responses", "version": "2.0.0"}],
-        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v1", "FA_RESPONSES_ENABLED": "1"},
+        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_RESPONSES_ENABLED": "1"},
     })
     get = foundry.get_version
     monkeypatch.setattr(foundry, "get_version", lambda name, version: {**get(name, version), **changed})
@@ -446,7 +458,7 @@ def test_sources_copy_a_build_version_with_only_the_original_formal_flag(monkeyp
         "FA_N6_RESPONSES_PROBE": "fa-foundry-responses-n6-v1",
         "FA_N6_RESPONSES_INTERRUPT_SESSION_ID": "n6-synthetic-session",
     })
-    expected = {"KEEP": "1"}
+    expected = {"KEEP": "1", **V2_TURNS}
     if responses is not None:
         foundry.versions[A.agent_name][0]["definition"]["environment_variables"]["FA_RESPONSES_ENABLED"] = responses
         expected["FA_RESPONSES_ENABLED"] = responses
@@ -636,7 +648,7 @@ def test_sync_cli_replaces_image_digest_metadata_with_a_new_code_compatible_vers
         "kind": "hosted", "container_configuration": {"image": image}, "container_protocol_versions": [],
         "protocol_versions": [{"protocol": name, "version": "2.0.0"} for name in
                               ("invocations", "invocations_ws", "responses")],
-        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v1", "FA_RESPONSES_ENABLED": "1"},
+        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_RESPONSES_ENABLED": "1"},
         "session_configuration": {"idle_timeout_seconds": 3600}})
     original = copy.deepcopy(foundry.versions[R.agent_name][0])
     composition = _composition(monkeypatch, (R, "configured"))
@@ -652,9 +664,7 @@ def test_sync_cli_replaces_image_digest_metadata_with_a_new_code_compatible_vers
     monkeypatch.setattr(server_config, "load_configuration", lambda path: path)
     monkeypatch.setattr(server, "build_server", lambda config: Built())
     monkeypatch.setattr(versions, "_POLL_SECONDS", 0)
-    with pytest.raises(Problem) as incompatible:
-        composition.hosted_versions.current(R)
-    assert _code(incompatible) == (503, FOLLOWING)
+    assert composition.hosted_versions.current(R) == "1"  # 2d-ii: a v2 definition of any build is followed
     args = ["sync", "--config", "offline.json", "--image", image, "--core", core, "--route", "--defer-follow"]
     for _ in range(2):
         assert versions.main(args) == 0
@@ -673,7 +683,7 @@ def test_a_conversation_pins_the_build_version_ignores_the_environment_and_the_d
     a, config = c.h.composition, c.h.config
     original = config.targets[0]
     foundry = Foundry(original)
-    foundry.add(original.agent_name, 41, "old")
+    foundry.add(original.agent_name, 41, "old", definition=v1_definition(original.agent_name, "old"))
     a.hosted_versions = HostedVersions(lambda endpoint: foundry, build="new")
     monkeypatch.setenv("FA_INSTRUCTION_HOSTED_VERSION", "41")
     monkeypatch.setenv("FA_INSTRUCTION_HOSTED_VERSIONS", json.dumps({original.agent_id: "41"}))
@@ -708,7 +718,7 @@ def test_an_unreadable_selector_is_told_apart_from_a_confirmed_selection(status,
 
 def test_a_selected_version_this_build_cannot_serve_is_not_an_unreadable_selector():
     foundry = Foundry(R)
-    foundry.add(R.agent_name, 3, "old")
+    foundry.add(R.agent_name, 3, "old", definition=v1_definition(R.agent_name, "old"))
     with pytest.raises(Problem) as incompatible:
         HostedVersions(lambda endpoint: foundry, build="new").current(R)
     assert _code(incompatible) == (503, FOLLOWING)

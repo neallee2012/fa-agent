@@ -447,7 +447,7 @@ def test_selected_version_uses_fixed_projects_sdk_model_and_original_credential(
     value = AgentVersionDetails({
         "name": TARGET.agent_name, "version": TARGET.agent_version,
         "definition": {"kind": "hosted", "environment_variables": {
-            "FA_NATIVE_TURNS": "foundry-native-v1"} if enabled else {}},
+            "FA_NATIVE_TURNS": "foundry-native-v2"} if enabled else {}},
     })
     def get_version(name, version):
         assert (name, version) == (TARGET.agent_name, TARGET.agent_version)

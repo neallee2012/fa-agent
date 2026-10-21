@@ -112,7 +112,7 @@ class NativeTransport:
                 request_id=command.command.request_id,
                 conversation_id=command.command.conversation_id or "native-cid",
                 command=command.command, capture=command.capture, submit_digest=command.sha256,
-                capture_digest=command.capture.sha256, status="accepted",
+                capture_digest=command.capture.sha256, status="accepted", state_profile=command.state_profile,
                 routine=getattr(command, "routine", None),
             )
             self.records[value.request_id] = value
@@ -278,15 +278,16 @@ def test_restart_reads_original_capture_and_completed_submit_never_restarts(nati
     before = len(case.remote.calls)
     retained, _ = gateway.submit(case.c.human, original.command)
     assert retained.capture == original.capture
+    # The second submit is the one same-material v1 resend a conflict gets (ADR-0009 2d-ii, a crashed v1 admission).
     assert [command.operation for _, command in case.remote.calls[before:]
-            if command.operation != "session_read"] == ["submit", "read", "submit"]
+            if command.operation != "session_read"] == ["submit", "submit", "read", "submit"]
     assert case.remote.calls[-1][1].capture == original.capture
     case.remote.completed("native-rid")
     before = len(case.remote.calls)
     completed, _ = NativeTurnGateway(case.composition, enabled=True).submit(case.c.human, original.command)
     assert completed.status == "completed"
     assert [command.operation for _, command in case.remote.calls[before:]
-            if command.operation != "session_read"] == ["submit", "read"]
+            if command.operation != "session_read"] == ["submit", "submit", "read"]
     conflict = case.client.post(PREFIX + "/submit", headers=case.headers,
                                json={"request_id": "native-rid", "content": "Changed original"})
     assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "NATIVE_RID_CONFLICT"
@@ -931,7 +932,7 @@ def test_agent_history_keeps_its_source_and_cannot_be_replayed_as_human(native_a
     receive = NativeAgentReceive(command=NativeAgentCommand(
         request_id=source.message_id, conversation_id="native-cid", content="Original Agent brief"),
         capture=seed.capture, source=source)
-    case.remote.records[source.message_id] = NativeReceipt(
+    case.remote.records[source.message_id] = NativeReceipt(state_profile=receive.state_profile,
         agent_id=case.remote.target.agent_id, hosted_session_id=case.remote.target.session_id,
         request_id=source.message_id, conversation_id="native-cid", command=receive.command,
         capture=receive.capture, source=source, submit_digest=receive.sha256,
@@ -1199,7 +1200,8 @@ def test_wrong_response_is_not_a_native_receipt(native_api, changed):
         from shared_context.behavior_native_turn_wire import NativeSubmit
         value = NativeReceipt.model_validate({
             **original.model_dump(), "request_id": other.request_id, "command": other,
-            "submit_digest": NativeSubmit(command=other, capture=original.capture).sha256,
+            "submit_digest": NativeSubmit(command=other, capture=original.capture,
+                                          state_profile=original.state_profile).sha256,
         })
     else:
         value = SimpleNamespace(model_dump_json=lambda: json.dumps({
@@ -1240,7 +1242,7 @@ def test_registered_agent_uses_its_real_prefix_owner_and_native_client(team_agen
         agent_id=target.agent_id, request_id="fixture-peer-prepared", previous_hosted_session_id=None,
         hosted_session_id=target.session_id, hosted_agent_version=target.agent_version)
     command = original_submit()
-    remote.records[command.command.request_id] = NativeReceipt(
+    remote.records[command.command.request_id] = NativeReceipt(state_profile=command.state_profile,
         agent_id=target.agent_id, hosted_session_id=target.session_id,
         request_id=command.command.request_id, conversation_id="native-peer-cid",
         command=command.command, capture=command.capture, submit_digest=command.sha256,

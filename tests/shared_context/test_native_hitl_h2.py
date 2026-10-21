@@ -143,7 +143,7 @@ def setup_gate(c, tmp_path, answers=(None,), *, entries=("fa-shell-v1",), respon
     else:
         capture = selected_capture(*entries)
     submitted = NativeSubmit(command=command, capture=capture)
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=submitted.state_profile,
         agent_id="native-a", hosted_session_id="hosted-one", conversation_id="cid-one", request_id="rid-one",
         command=command, capture=capture, submit_digest=submitted.sha256, capture_digest=capture.sha256,
         status="started", turn_number=1)

@@ -136,6 +136,6 @@ def test_real_native_chain_console_two_turns_and_cold_client_readback(official_c
     reread = restarted.instruction_progress(draft["thread_id"])
     assert reread["composer"]["hosted_session_id"] == saved.hosted_session_id
     assert all(task["reply"]["data"]["text"] == official.sdk.text
-               for task in reread["tasks"] if task.get("state_profile") == NATIVE_STATE_PROFILE)
+               for task in reread["tasks"] if task.get("state_profile") == "foundry-native-v1")  # the workbench lane
     assert len(official.sdk.calls) == 2 and c.c.control.records == {}
     read_startup(c.c)

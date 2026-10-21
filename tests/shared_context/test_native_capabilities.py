@@ -218,7 +218,7 @@ def test_factory_passes_native_consumers_without_changing_original_private_root(
                            "https://offline-fixture.services.ai.azure.com/api/projects/offline")
         runtime = native_sdk.native_runtime_from_environment(hosted)
     request = NativeSubmit(command=submit().command, capture=selected_capture("fa-shell-v1"))
-    receipt = NativeReceipt(
+    receipt = NativeReceipt(state_profile=request.state_profile,
         agent_id=IDENTITY.agent_id, hosted_session_id=IDENTITY.session_id,
         conversation_id="OFFLINE-cid", request_id="rid-1", submit_digest=request.sha256,
         capture_digest=request.capture.sha256, command=request.command, capture=request.capture,
@@ -359,7 +359,7 @@ def test_native_abort_does_not_wait_for_delegation_cancel_observation(monkeypatc
             capability_providers=(NativeCapabilityProvider(accepts=lambda grant: grant.entry_id == "fa-delegate-v1",
                                                            bind=bind),))
         request = NativeSubmit(command=submit().command, capture=selected_capture("fa-delegate-v1"))
-        receipt = NativeReceipt(
+        receipt = NativeReceipt(state_profile=request.state_profile,
             agent_id=IDENTITY.agent_id, hosted_session_id=IDENTITY.session_id, request_id="rid-1",
             conversation_id="OFFLINE-cid", command=request.command, capture=request.capture,
             submit_digest=request.sha256, capture_digest=request.capture.sha256, status="started", turn_number=1,

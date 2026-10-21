@@ -20,7 +20,7 @@ from .behavior_wire import Digest, Identifier, SdkStartProfile, WireModel, Worke
 from .errors import Problem
 from .m3_models import VersionId
 from .m3_skills import PurposeSkillCatalog, SkillSelection, validate_selection
-from .native_responses_wire import NATIVE_STATE_PROFILE, NativeStateProfile, unlabeled_profile
+from .native_responses_wire import UNLABELED_STATE_PROFILE, NativeStateProfile, unlabeled_profile
 
 if TYPE_CHECKING:
     from .behavior_assistant import AssistantAuthority
@@ -67,7 +67,7 @@ class TemplateSettings(WireModel):
     worker_profile: WorkerProfile | None = Field(default=None, exclude_if=lambda value: value is None)
     capabilities: tuple[CapabilityRef, ...] = Field(default=(), exclude_if=lambda value: not value)
     state_profile: NativeStateProfile = Field(
-        default=NATIVE_STATE_PROFILE, exclude_if=unlabeled_profile)
+        default=UNLABELED_STATE_PROFILE, exclude_if=unlabeled_profile)
 
     _capabilities = field_validator("capabilities")(validate_refs)
 
@@ -148,7 +148,7 @@ def export_template(
             raise Problem(409, "AGENT_TEMPLATE_PROFILE_UNSUPPORTED", "export requires an explicit versioned instruction profile")
         return read_profile_template(
             authority, policy, profile, prompt_profile,
-            state_profile=NATIVE_STATE_PROFILE if selection is None else selection.command.template.settings.state_profile)
+            state_profile=UNLABELED_STATE_PROFILE if selection is None else selection.command.template.settings.state_profile)
 
     from .behavior_assistant import _read_conflicts
     return _read_conflicts(
@@ -168,7 +168,7 @@ def with_native_default_checkpoint(template):
     return AgentTemplate.model_validate_json(json.dumps(values))
 
 
-def read_profile_template(authority, policy, profile, prompt_profile, *, state_profile=NATIVE_STATE_PROFILE):
+def read_profile_template(authority, policy, profile, prompt_profile, *, state_profile=UNLABELED_STATE_PROFILE):
     """The caller owns the read scope; this reader neither opens one nor derives work."""
     binding = policy.template
     actor = authority.actors.get(binding.agent_oid)

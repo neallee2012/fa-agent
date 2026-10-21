@@ -89,12 +89,12 @@ def bind(case, profile="foundry-native-v1"):
                             state_profile=profile)
 
 
-def roster(case, monkeypatch, n, status="deleted"):
+def roster(case, monkeypatch, n, status="deleted", profile="foundry-native-v1"):
     """``n`` registered Agents, each bound to its own SID; their source is A's client naming that SID."""
     ids = tuple(f"agent-{index:03d}" for index in range(n))
     for agent_id in ids:
         case.store.claim(agent_id, hosted_session_id="sid-" + agent_id, created_agent_version="41",
-                         state_profile="foundry-native-v1")
+                         state_profile=profile)
         case.platform.statuses["sid-" + agent_id] = status
     monkeypatch.setattr("shared_context.behavior_team_registry.registered_agent_ids", lambda _store, _config: ids)
     source = case.patrol.source
@@ -327,8 +327,8 @@ def test_the_first_pass_runs_within_an_hour_of_a_start_then_daily(own_loop, monk
 
 
 @pytest.mark.parametrize("enforced", ["1", None])
-def test_the_work_policy_application_registers_the_patrol_and_its_lifespan_runs_it(
-        own_loop, native_api, monkeypatch, enforced):
+def test_the_work_policy_application_no_longer_schedules_the_patrol(own_loop, native_api, monkeypatch, enforced):
+    """ADR-0009 M1 step 3 (b): the daily patrol is off from 2d-ii; ``agent-versions patrol --once`` stays."""
     from shared_context.behavior_server import application
 
     if enforced is None:
@@ -340,14 +340,13 @@ def test_the_work_policy_application_registers_the_patrol_and_its_lifespan_runs_
     # The fixture's synthetic Team has no approved installation history; startup validation is not under test here.
     monkeypatch.setattr(composition, "installation", lambda: None)
     monkeypatch.setattr(composition.runtime, "validate_startup", lambda: None)
+    started = []
+    monkeypatch.setattr(NativeSessionPatrol, "start", lambda self: started.append(self))
     app = application(composition)
-    patrol = app.state.native_session_patrol
-    assert isinstance(patrol, NativeSessionPatrol) and patrol.composition is composition
-    assert patrol.enabled is (enforced == "1")
+    assert getattr(app.state, "native_session_patrol", None) is None
     with TestClient(app, backend_options={"loop_factory": lambda: own_loop}):
-        assert (patrol._task is not None) is patrol.enabled
-        assert (patrol._executor is not None) is patrol.enabled
-    assert patrol._task is None and patrol._executor is None
+        pass
+    assert [item for item in started if type(item) is NativeSessionPatrol] == []  # the 6a reconciler is its own task
 
 
 def test_an_overlapping_run_is_prevented(patrol):

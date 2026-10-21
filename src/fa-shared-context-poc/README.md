@@ -1,19 +1,18 @@
 # Shared Context POC
 
 <a id="native-2di-switch"></a>
-## ADR-0009 2d-i 開關（P9，2026-10-16，CODE/offline；stage 在下一個 release 部署後打開，azd／dev 預設關）
+## ADR-0009 2d-i 開關（P9，2026-10-16；stage 第 32 版起打開；2d-ii 起一律打開）
 
 **一個開關：** 部署 profile 的 `api_environment` `FA_NATIVE_SESSION_GUARD_ENFORCE`。`"1"` 時 `ci_deploy.py`
 同時把每位助理（`kind=assistant`）的 Hosted overlay 設成 `FA_NATIVE_TURNS=foundry-native-v2`（sync 建出宣告 v2 的
-H2d 定義），API 打開 P5～P8 的背景切換、送出路徑與巡查；API 自己的 `FA_NATIVE_TURNS` 仍是 v1（到 2d-ii）。
-onboarding 加的 Agent 不在 profile 的 `agents` 裡：開關打開時 sync 另帶 `--native-v2-registered`，已登記、服務中
+H2d 定義），API 打開 P5～P7 的背景切換與送出路徑。**2d-ii（#891）起 API 只送、只支援 v2，開關必須是 `"1"`：**
+`"0"`、沒寫或其他值在 `meta`／`check` 就停下，什麼都沒建、沒寫；P8 的每日巡查不再排程（只剩下面的單次指令）。
+API 自己的 `FA_NATIVE_TURNS` 只當 native 的開關，送出的 profile 是程式常數 v2。
+onboarding 加的 Agent 不在 profile 的 `agents` 裡：sync 一律帶 `--native-v2-registered`，已登記、服務中
 定義宣告 native profile 的 Agent（助理）只把 `FA_NATIVE_TURNS` 改成 v2，其他 ENV 照舊（ADR-0009 M1，2026-10-20）。
-`deploy/azd/profile.defaults.json` 寫 `"0"`；`deploy/stage/stage.json` 寫 `"1"`（合併到 main 不部署 stage，
-下一個 release PR 合併後那次部署才打開）。兩邊不會只開一半：`meta`／`check`
-拒絕開關以外的 v2（`hosted_environment` 或 `assistant_environment` 寫 v2 而開關是 `"0"`；executor 等非助理即使開關
-打開也不能寫 v2，它們不跑 API 搬移的 2d-i 回合）、開關打開時助理 overlay 另寫 v1，以及 `"0"`／`"1"` 以外的值。
-開關關時 sync job 帶 `--refuse-native-v2`：任何 Agent 目前服務的定義已宣告 v2（打開到一半停下的痕跡），該 Agent 以
-`NATIVE_V2_SERVED_SWITCH_OFF` 失敗、什麼都不寫，不會把 v2 帶進開關關的部署。部署時 `follow` 步驟改成只報告（sync 帶
+`deploy/stage/stage.json` 與 `deploy/azd/profile.defaults.json` 都寫 `"1"`（azd 以前的 `FA_NATIVE_2DI` 已不讀）。
+`meta`／`check` 也拒絕開關以外的 v2：executor 等非助理不能寫 v2（它們不跑 API 搬移的 2d-i 回合），助理 overlay
+也不能另寫 v1。部署時 `follow` 步驟改成只報告（sync 帶
 `--verify-follow`：P6 的 `follow_all(verify_only=True)` 對每個 Agent 呼叫 `verify_agent`，只讀 metadata，不叫醒 VM，
 每個 Agent 回 `ok` 或 `pending`＝下一次回合結束才換，不算失敗；沒有 scope 的 executor 與 `follow` 一樣回 `skipped`）。這份逐 Agent 報告印在 sync job 的輸出裡：在 Log
 Analytics 該 job execution 的 log 看，部署腳本本身只印 `sync <execution> Succeeded`。部署前相容閘門照舊；stage 照舊拒絕
@@ -26,37 +25,37 @@ Analytics 該 job execution 的 log 看，部署腳本本身只印 `sync <execut
   至少是 2（P5＋P6；`meta`／`check` 以 AST 讀原始碼核對）。P6（#862）合併後是 2。
 - API 是單一 revision 模式；打開的那一次另要求只有一個 active revision，而且就是 `latestReadyRevisionName`。
 - **打開的那一次**：目前服務中的 revision 由本腳本命名，而且它的 commit 已有 P5＋P6。較舊的副本（例如 release 30）以
-  `extra="forbid"` 解碼 P5 寫的綁定列會回 409 `NATIVE_BINDING_INVALID`，所以先以 `"0"` 部署含 P5＋P6 的 commit，
-  下一次部署才改 `"1"`。這次部署的 sync 先發布宣告 v2 的版本、`api` 步驟才換上開關打開的 revision；中間仍服務的
-  P6 API（開關關）照舊在送出時 follow，可能留下舊式 `pending`，新 API 會撤回它（`NATIVE_UPGRADE_LEGACY_PENDING_WITHDRAWN`，
-  ADR-0009 M1 2d-i 第 2 步的退路），dev 測試時不算故障。
-- **打開後不能關：** 服務中的 API 已是 `"1"`、profile 改回 `"0"` 時 `guard`／`sync`／`api` 都停下。往前修，不退版：API
+  `extra="forbid"` 解碼 P5 寫的綁定列會回 409 `NATIVE_BINDING_INVALID`，所以服務中的 API 還沒有 P5＋P6 時，要先以
+  `"0"` 部署一個 2d-ii 之前、含 P5＋P6 的 commit（2d-ii 本身不接受 `"0"`），下一次才部署 2d-ii。這次部署的 sync 先發布
+  宣告 v2 的版本、`api` 步驟才換上開關打開的 revision；中間仍服務的 P6 API（開關關）照舊在送出時 follow，可能留下
+  舊式 `pending`，新 API 會撤回它（`NATIVE_UPGRADE_LEGACY_PENDING_WITHDRAWN`，ADR-0009 M1 2d-i 第 2 步的退路）。
+- **第一次安裝**（azd 首次 `deploy`：sync 在 API app 建立之前跑）：還沒有 API 在服務，沒有舊版本要收斂，上面兩項不適用；
+  API app 存在但從沒有 revision ready（第一次安裝中途停下）也一樣。API app 存在但讀不到時照舊停下。
+- **打開後不能關：** profile 改回 `"0"` 時每一步都停下。往前修，不退版：API
   不退回 P6 以下，Hosted 不退回 H2d 以下（宣告 v2 的 image 上新建的對話 `_Meta` 標 v2，H0 解不開，回 409
   `NATIVE_STATE_INVALID`；ADR-0009 M1 2d-i「不退版到 H2d 以下」）。
 
 **出狀況時：**
 
-- **打開到一半停下**（sync 已發布宣告 v2 的版本，`api` 步驟失敗或沒跑）：保持 `"1"` 再跑一次部署，不要改回 `"0"`。
-  改回 `"0"` 的部署會在 sync 停下（`NATIVE_V2_SERVED_SWITCH_OFF`，訊息會提示改用 `"1"` 重跑）。
+- **打開到一半停下**（sync 已發布宣告 v2 的版本，`api` 步驟失敗或沒跑）：保持 `"1"` 再跑一次部署（2d-ii 起 `"0"` 在
+  `check` 就停下）。
 - **某個 Agent 卡住**（搬檔柵欄不結束）：用 P6 的 `agent-versions fence --agent-id <agent-id>` 先看（只讀），確認後
   `--clear --confirm <agent-id>` 收尾（P6 #862）。不要重部署或關開關來解。
-- **想立刻跑一次 P8 巡檢**（不等 API 啟動後 5～60 分鐘的第一輪）：`agent-versions patrol --once`，規則同每日巡檢（只讀 `get_session` metadata、
+- **想跑一次 P8 巡檢**（2d-ii 起 API 不再排程每日巡檢）：`agent-versions patrol --once`，規則同原本的每日巡檢（只讀 `get_session` metadata、
   要 `FA_NATIVE_SESSION_GUARD_ENFORCE=1`、有間隔與時間預算），印出本次統計；開關關時以 `NATIVE_SESSION_GUARD_DISABLED` 結束（exit 1）。
-  已判定放棄的 Agent 不在這個程序內交給背景切換，由 API 下一次巡檢或回合結束處理。
+  已判定放棄的 Agent 不在這個程序內交給背景切換，由下一次回合結束處理。
 - **在 portal 直接把 API 的 ENV 改成 `"0"`**：繞過上面「不能關」的檢查，不支援、也沒有退版方式；v2 對話仍在，P5 的
   綁定列與搬檔狀態沒人處理。發現了就用部署線以 `"1"` 再部署一次。
 
 **怎麼打開：**
 
-- **dev**（`faexample`，部署線用操作者的 profile JSON，`--config`／`FA_DEPLOY_CONFIG`）：先照常部署含 P5＋P6
-  的 commit（`"0"`），再在那份 profile 的 `api_environment` 改 `"FA_NATIVE_SESSION_GUARD_ENFORCE": "1"`，照
-  dev 的部署批准流程再部署一次；dev 測試項見 ADR-0009 閘門清單（第 2 項故障點、第 7 項全掃描時間）與 2d-i 計畫。
-  azd 環境用 `azd env set FA_NATIVE_2DI true`。
-- **stage**：`deploy/stage/stage.json` 已在 main 寫 `"1"`；dev 測完後，總協調開 release PR（附 dev 測試報告），由
-  Neal 決定是否合併；合併才部署、才打開。**這一行合併到 main 之後，下一個 release PR 一律以 GUARD 打開部署**
-  （除非該 PR 把 `stage.json` 改回 `"0"`），而且一旦部署就關不回去（`guard`／`sync`／`api` 拒絕 `"0"`）。所以閘門 7
-  要在那個 release 之前記錄好；目前只有暫時 PASS（2 次 full scan，最大 0.8 秒，之後從 stage 的 `NATIVE_UPGRADE_CUT`
-  補收樣本），記在 [progress 第 31 版候選 dev 測試](../../docs/progress.md#dev-test-v31-1018) 第 7 項。閘門 7 沒過不上 stage。
+- **dev**（`faexample`，部署線用操作者的 profile JSON，`--config`／`FA_DEPLOY_CONFIG`）：10-16 起已是 `"1"`；
+  dev 測試項見 ADR-0009 閘門清單（第 2 項故障點、第 7 項全掃描時間）與 2d-i 計畫。
+- **azd 環境**：新環境從第一次安裝就打開（`profile.defaults.json` 寫 `"1"`）。2d-ii（#891）合併前建、還是 `"0"` 的環境，
+  下一次 `azd deploy` 在這裡打開，前提同上（服務中的 API 已有 P5＋P6、只有一個 active revision）。
+- **stage**：第 32 版（[progress](../../docs/progress.md#stage-v32-1020)）起打開，關不回去。閘門 7 暫時 PASS（2 次
+  full scan，最大 0.8 秒，之後從 stage 的 `NATIVE_UPGRADE_CUT` 補收樣本），記在
+  [progress 第 31 版候選 dev 測試](../../docs/progress.md#dev-test-v31-1018) 第 7 項。
 
 **使用者看到什麼：** 部署本身不換任何 Agent 的環境，也不讓訊息等。每位助理在下一次回合結束後於背景換到新版：來源沒有
 工作檔就直接換、不等；有工作檔時最多約 120 秒的柵欄內搬檔，這段時間送出的訊息在請求內最多等 10 秒，之後顯示同步中，
@@ -1399,8 +1398,9 @@ selector 移動已不再讓綁定列的 SID 失效，2d-i P7）。**打開這個
   之後對這個目的 SID 一律不帶（`NATIVE_ENVIRONMENT_SETTLED_UNSUPPORTED`）；那個 image 照舊等之前 SID 的回條。
 - **相容來源的兩次讀取（§7a (m)）：** 兩次讀到已失效要相隔至少 `RETIRED_CONFIRM_SECONDS`（5 秒），而且不超過
   `RETIRED_PAIR_SECONDS`（60 秒）；第一次讀取太舊就重新起算，幾分鐘前的一次 404 不算確認。
-- **每日巡查（ADR M1 第 3 步 (b)，`native_session_patrol.py`）：** 同一個 `FA_NATIVE_SESSION_GUARD_ENFORCE=1` 才排程
-  （預設關：不建 task）。API lifespan 背景 task，啟動後隨機 5～60 分鐘跑第一輪（dev 一天重啟多次，先等一整天就永遠
+- **每日巡查（ADR M1 第 3 步 (b)，`native_session_patrol.py`）：** **2d-ii（#891）起不再排程**（ADR 定的「2d-ii 部署後關」：
+  不再有 v1 列可找），只剩操作者的 `agent-versions patrol --once`；以下是 2d-i 期間的行為。同一個
+  `FA_NATIVE_SESSION_GUARD_ENFORCE=1` 才排程（預設關：不建 task）。API lifespan 背景 task，啟動後隨機 5～60 分鐘跑第一輪（dev 一天重啟多次，先等一整天就永遠
   跑不到；隨機讓部署時並存的兩個 replica 錯開，撞在一起也只是多一輪 metadata 讀取），之後每天一次加最多 1 小時抖動；同一 process 不重疊。對每個
   服務中、未退役、綁定列是 v1 且沒有棄用決定的 Agent，只讀目前 SID 的 `get_session`（不 invoke、不碰 Files、不 stop）；
   404／`failed`／`deleted`／`expired` 隔至少 5 秒、最多 60 秒（與送出路徑同一個窗口）再讀一次仍是，才寫 §7a (g) 棄用決定

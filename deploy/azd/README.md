@@ -136,7 +136,30 @@ Models to deploy (numbers separated by commas) [1,2]:
 | `FA_HOSTED_IDLE_TIMEOUT_SECONDS` | `3600` | 120–3600 |
 | `FA_API_SUBNET_NAT_EGRESS` | `false` | 同 `prepare_environment.py` |
 | `FA_DEPLOY_UPGRADE_SNAPSHOTS` | `false` | `true`：另建 ADR-0009 phase 5 工作檔快照專用的儲存帳號（`stsnap<token>`、私有端點、30 天刪除規則、帳號刪除鎖、API 身分在該 container 的備份讀寫自訂角色，不含刪除），API 取得 `FA_UPGRADE_SNAPSHOT_CONTAINER_URL`；與 `no-auto-gc` 備份帳號分開。打開會多建一個儲存帳號並指派角色，會產生費用；預設關，不需要就維持 `false` |
-| `FA_NATIVE_2DI` | `false` | `true`：打開 ADR-0009 2d-i（API `FA_NATIVE_SESSION_GUARD_ENFORCE=1`，兩位助理的定義同時宣告 `foundry-native-v2`）；打開後不能關、不能退版，前提與使用者看到什麼見 [2d-i 開關](../../src/fa-shared-context-poc/README.md#native-2di-switch) |
+
+ADR-0009 2d-i 一律打開，不是選用設定：`profile.defaults.json` 寫 `FA_NATIVE_SESSION_GUARD_ENFORCE="1"`，部署時兩位助理的定義宣告
+`foundry-native-v2`。2d-ii 起 API 只送 v2，所以開關不能關、不能退版；以前的 `FA_NATIVE_2DI` 已不再讀取。第一次安裝還沒有 API
+在服務，沒有舊版本要收斂，所以打開的前提（服務中的 API 已有 P5＋P6）不適用；之後的 `azd deploy` 照 stage 的規則檢查
+（見 [2d-i 開關](../../src/fa-shared-context-poc/README.md#native-2di-switch)）。2d-ii（#891）合併前用 azd 建、開關還是 `"0"` 的環境，
+只有在還沒有任何綁定列（從沒用過助理）時，下一次 `azd deploy` 才會一併打開 2d-i（服務中的 API 要已有 P5＋P6，而且只有一個 active revision）；已經有 v1 列的環境會被下面的相容閘門擋下，照[升級路徑](#upgrade-2dii)走。
+
+**相容閘門一律武裝。** 2d-ii 的 API 只服務 v2，還記著 v1 的綁定列遇到它會換新 SID、丟工作檔，或一直回 503。所以 azd 的
+profile 一律寫 `compatibility_gate_armed: true`（`FA_COMPAT_GATE_ARMED` 不再讀取）。已經有 API 在服務時（之後的 `azd deploy`，
+或 API app 已建好、中途停下的首次安裝續跑），hook 在 `check` 之後、sync 和 API 更新之前跑閘門；只要有 v1 列，部署就停下，
+訊息指向下面的[升級路徑](#upgrade-2dii)。azd 環境沒有 release 檔；手寫 `.azure/<env>/fa/release.json` 可以讓 `gate_settings` 通過，
+但不受支援，要離開閘門請照升級路徑，或退役那位 Agent。第一次安裝還沒有綁定列，不跑閘門
+（[相容閘門](../README.md#compat-gate)）。
+
+<a id="upgrade-2dii"></a>
+**已用過助理的公開 azd 使用者，升級到 2d-ii 的路徑。** 一直沒用過任何 Agent（沒有綁定列）的人可以直接升級，不會碰到閘門；
+萬一閘門還是擋下來，照下面做：
+
+1. `git checkout v2026.10.20-33`（公開 repo `neallee2012/fa-agent` 的第 33 版，最後一版仍會讀 `FA_NATIVE_2DI`）。
+2. `azd env set FA_NATIVE_2DI true`
+3. `azd deploy`
+4. 對閘門訊息列出的每個 Agent 傳一則訊息，等它回覆；它的綁定列就會記成 `foundry-native-v2`。
+5. 換回 2d-ii 的 release（`git checkout main`，或其後的版本 tag），再跑 `azd deploy`。
+6. 閘門若還是點名某位 Agent，就再傳訊息給它，或[退役它](../README.md#retire-agent)。
 
 ## 跑完就能用
 
