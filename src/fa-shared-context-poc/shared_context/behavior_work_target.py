@@ -58,9 +58,10 @@ def _check(command, config):
             "only a new version/session of the same original agent/API identity is supported")
 
 
-def selection_record(store, config):
+def selection_record(store, config, rows=None):
+    """``rows``: a ``read_snapshot`` of this store that already holds the selection key (one guarded read)."""
     key = target_key(config.table.scope.authority_domain)
-    row = store.read_snapshot((key,))[key]
+    row = (store.read_snapshot((key,)) if rows is None else rows)[key]
     if row is None:
         return None
     value = _parse(row.payload["data"], StandingTarget)
@@ -79,11 +80,11 @@ def selection_record(store, config):
     return value
 
 
-def selected_targets(store, config, *, agent_id=None):
+def selected_targets(store, config, *, agent_id=None, rows=None):
     if agent_id is not None and agent_id != config.targets[0].agent_id:
         from .behavior_agent_registry import read_agent_registry
         return (read_agent_registry(store, config, agent_id).scopes[1].target,)
-    record = selection_record(store, config)
+    record = selection_record(store, config, rows)
     return config.active_targets if record is None else (record.command.target,)
 
 

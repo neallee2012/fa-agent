@@ -36,6 +36,7 @@ _TRANSIENT_STATUSES = frozenset({408, 429})
 _SETTLED = frozenset({"active", "failed", "deleting", "deleted"})
 SYNC_WAIT_SECONDS = 900
 _POLL_SECONDS = 5
+KEPT_DEFINITIONS = 64  # selected version definitions kept per API process (Agents x versions stay far below it)
 
 
 class SelectorUnreadable(Problem):
@@ -182,6 +183,14 @@ class HostedVersions:
         # (endpoint, agent, version) -> the profile its definition declares, and its ``fa_build``; both immutable.
         self._profiles = {}
         self._builds = {}
+        # (endpoint, agent, version) -> the snapshot of a selected version's definition that passed every check in
+        # ``current``. FA assumes a published version's definition does not change (not verified against official
+        # docs), so each selection reads only the selector and checks the snapshot again; a version not yet active
+        # is read again every time, and a snapshot failing any check is dropped so the next selection reads it again.
+        # Oldest dropped past ``KEPT_DEFINITIONS``. Writes hold ``_definitions_lock``: selections can run in parallel
+        # threads, and the eviction's iteration raises if another thread changes the dict meanwhile.
+        self._definitions = {}
+        self._definitions_lock = threading.Lock()
 
     def observed(self, target):
         return self._observed.get((target.project_endpoint, target.agent_name))
@@ -219,7 +228,10 @@ class HostedVersions:
         try:
             foundry = self._foundry_for(target.project_endpoint)
             version = endpoint_version(foundry, target.agent_name)
-            observed = foundry.get_version(target.agent_name, version)
+            key = (target.project_endpoint, target.agent_name, version)
+            observed = self._definitions.get(key)
+            if observed is None:
+                observed = foundry.get_version(target.agent_name, version)
         except FoundryCallError as error:
             log.warning("agent version lookup unknown agent=%s status=%s", target.agent_name, error.status)
             if require_responses and error.status in {401, 403}:
@@ -234,11 +246,18 @@ class HostedVersions:
                 or observed.get("status") != "active" or not isinstance(observed.get("definition"), dict)
                 or observed["definition"].get("kind") != "hosted"):
             log.warning("agent endpoint version is incompatible agent=%s version=%s", target.agent_name, version)
+            with self._definitions_lock:
+                self._definitions.pop(key, None)  # e.g. the Agent re-created under the same name and version number
             raise Problem(503, FOLLOWING, "the endpoint's selected version is not ready for this API build")
         selected = _SelectedVersion(version, _responses_enabled(observed.get("definition")),
                                     _model_switch(observed.get("definition")))
         self._observed[(target.project_endpoint, target.agent_name)] = selected
-        self._keep((target.project_endpoint, target.agent_name, version), observed)
+        self._keep(key, observed)
+        with self._definitions_lock:
+            if key not in self._definitions:
+                if len(self._definitions) >= KEPT_DEFINITIONS:
+                    self._definitions.pop(next(iter(self._definitions), None), None)
+                self._definitions[key] = observed
         return selected.require(require_responses)
 
 
@@ -576,8 +595,12 @@ def sync_all(composition, foundry_for, *, image=None, agent_id=None, set_route=F
                     raise Problem(409, "SOURCE_VERSION_MISSING", "the served source version is not confirmed")
                 route(foundry, target.agent_name, published)
             overlay = hosted_environment.get(target.agent_id)
-            if upgrade and _declared_profile(details) in ACCEPTED_STATE_PROFILES:
+            declared = _declared_profile(details) if upgrade else None
+            if upgrade and declared in ACCEPTED_STATE_PROFILES:
                 overlay = {**(overlay or {}), "FA_NATIVE_TURNS": NATIVE_V2_PROFILE}
+            elif upgrade:  # no accepted profile (an executor declares none): its ENV carries over, no v2
+                log.info("agent version sync %s: registered, served FA_NATIVE_TURNS=%s is no native profile; "
+                         "v2 not added", target.agent_id, declared)
             source = desired_source(image_source(foundry, target, image), overlay,
                                     idle_timeout_seconds=idle_timeout_seconds)
             result = sync_agent_version(foundry, target, build=build, source=source, sleep=sleep, clock=clock,

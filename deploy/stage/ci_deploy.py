@@ -44,7 +44,9 @@ come from the selected profile (api_environment), so an ENV change is a normal P
 import argparse
 import ast
 import base64
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -80,6 +82,8 @@ SESSION_GUARD = "FA_NATIVE_SESSION_GUARD_ENFORCE"
 # mode and serving-revision checks hold too; the API itself also refuses to start with it alone.
 IDLE_UPGRADE = "FA_NATIVE_IDLE_UPGRADE"
 NATIVE_V2 = "foundry-native-v2"
+# The installed behavior configuration: the operator sets it at W7; a CI image update only checks it (api).
+API_CONFIG_ENV = "BEHAVIOR_SERVER_CONFIG_JSON"
 # The native_binding.NATIVE_2DI_SCHEMA the API must declare before the switch goes on: 2 = P5's background cut plus
 # P6's in-request wait and verify-only follow (read from source by AST: the deploy never imports shared_context).
 API_2DI_SCHEMA = 2
@@ -182,6 +186,13 @@ def _require_secrets(app, properties, secrets):
     missing = sorted(set(secrets.values()) - defined)
     if missing:
         raise SystemExit(f"{app}: secrets {missing} are not on the app yet; an operator adds them first")
+
+
+def _require_known_env(app, deployed, known):
+    """The repo decides the ENV; a deployed name the repo does not know is never dropped silently."""
+    unknown = sorted(set(deployed) - set(known))
+    if unknown:
+        raise SystemExit(f"{app}: deployed ENV {unknown} is not in the deployment profile; add it first")
 
 
 def _release_file():
@@ -341,7 +352,12 @@ def guard():
     """Compare against the serving commit; full Hosted-definition equality is enforced by sync, not core identity."""
     properties = rest("GET", f"{_resource('containerApps', STAGE['api_app'])}?{APPS_API}")["properties"]
     # Read-only, before any build or write: a declared API secret or the feed app missing stops here.
-    _require_secrets(STAGE["api_app"], properties, api_secrets())
+    secrets = api_secrets()
+    _require_secrets(STAGE["api_app"], properties, secrets)
+    # The same refusal as api's update, before sync publishes Hosted (no half deploy; stage CI just stops earlier).
+    container = (((properties.get("template") or {}).get("containers")) or [{}])[0]
+    _require_known_env(STAGE["api_app"], [item.get("name") for item in container.get("env") or []],
+                       {*STAGE["api_environment"], API_CONFIG_ENV, *secrets})
     # The routine clock runs inside the API process (README#native-routine-api-clock): it needs one resident replica.
     if api_routines() and (((properties.get("template") or {}).get("scale") or {}).get("minReplicas") or 0) < 1:
         raise SystemExit(f"{STAGE['api_app']}: FA_NATIVE_ROUTINE_CLOCK=api needs minReplicas >= 1; "
@@ -599,12 +615,21 @@ def switch_preconditions(properties=None, base=None):
     read = properties is None
     app = STAGE["api_app"]
     if read:
+        # az's "ERROR: Not Found" is expected on a first install, so it is hidden only when ARM confirms no app.
+        failed = io.StringIO()
         try:
-            properties = rest("GET", f"{_resource('containerApps', app)}?{APPS_API}")["properties"]
+            with contextlib.redirect_stderr(failed):
+                properties = rest("GET", f"{_resource('containerApps', app)}?{APPS_API}")["properties"]
         except SystemExit:
-            if _exists(app):
+            try:
+                missing = not _exists(app)
+            except BaseException:
+                sys.stderr.write(failed.getvalue())
                 raise
-            return  # a first install (fa_azd creates the API after sync): no API serves, nothing old to converge
+            if missing:
+                return  # a first install (fa_azd creates the API after sync): no API serves, nothing old to converge
+            sys.stderr.write(failed.getvalue())
+            raise
     ready = properties.get("latestReadyRevisionName") or ""
     if not ready and not _active_revisions(app):
         return  # no revision ever got ready and none is active (a first install stopped midway): nothing to converge
@@ -846,6 +871,12 @@ def _run_job(api_ref, script, *, attempts=180, stop_on_timeout=False):
         stopped = "stop requested"
     except (Exception, SystemExit) as error:  # the timeout is the verdict; a failed stop is only reported
         stopped = f"stop failed ({type(error).__name__}), stop it by hand"
+        try:  # a lost stop reply may still have stopped it: read the execution once before saying so
+            status = rest("GET", f"{job}/executions/{name}?{APPS_API}")["properties"]["status"]
+            if status in {"Succeeded", "Failed", "Stopped", "Degraded"}:
+                stopped = f"stop reply failed ({type(error).__name__}), execution reads back {status}"
+        except (Exception, SystemExit):
+            pass
     raise SystemExit(f"job execution {name} did not finish within {attempts * 10} s; {stopped}")
 
 
@@ -892,10 +923,7 @@ def _update_container(kind, name, image, suffix, guarded=None, environment=None,
             raise SystemExit(f"{name}: a secret ENV needs a complete plain ENV and a distinct name")
         _require_secrets(name, properties, secrets)
     if environment is not None:
-        # The repo decides the ENV; a deployed name the repo does not know is never dropped silently.
-        unknown = sorted(set(current) - set(environment) - set(guarded or {}) - set(secrets))
-        if unknown:
-            raise SystemExit(f"{name}: deployed ENV {unknown} is not in the deployment profile; add it first")
+        _require_known_env(name, current, {*environment, *(guarded or {}), *secrets})
         container["env"] = ([current[key] for key in guarded or {}]
                             + [{"name": key, "value": value} for key, value in environment.items()]
                             + [{"name": key, "secretRef": ref} for key, ref in secrets.items()])
@@ -934,7 +962,7 @@ def api(api_ref):
     # configuration (BEHAVIOR_SERVER_CONFIG_JSON) stay as the operator set them at W7.
     switch_preconditions()
     revision = _update_container("containerApps", STAGE["api_app"], api_ref, _suffix(),
-                                 guarded={"BEHAVIOR_SERVER_CONFIG_JSON": _config_bytes().decode("utf-8")},
+                                 guarded={API_CONFIG_ENV: _config_bytes().decode("utf-8")},
                                  environment=STAGE["api_environment"],
                                  secret_environment=api_secrets())
     _wait_revision(STAGE["api_app"], revision)

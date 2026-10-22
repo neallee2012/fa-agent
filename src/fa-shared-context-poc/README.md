@@ -8,7 +8,7 @@
 H2d 定義），API 打開 P5～P7 的背景切換與送出路徑。**2d-ii（#891）起 API 只送、只支援 v2，開關必須是 `"1"`：**
 `"0"`、沒寫或其他值在 `meta`／`check` 就停下，什麼都沒建、沒寫；P8 的每日巡查不再排程（只剩下面的單次指令）。
 API 自己的 `FA_NATIVE_TURNS` 只當 native 的開關，送出的 profile 是程式常數 v2。
-onboarding 加的 Agent 不在 profile 的 `agents` 裡：sync 一律帶 `--native-v2-registered`，已登記、服務中
+onboarding 加的 Agent 不在 profile 的 `agents` 裡：sync 一律帶 `--native-v2-registered`（fresh initialization 例外，見 `run_fresh_job.py` 註解），已登記、服務中
 定義宣告 native profile 的 Agent（助理）只把 `FA_NATIVE_TURNS` 改成 v2，其他 ENV 照舊（ADR-0009 M1，2026-10-20）。
 `deploy/stage/stage.json` 與 `deploy/azd/profile.defaults.json` 都寫 `"1"`（azd 以前的 `FA_NATIVE_2DI` 已不讀）。
 `meta`／`check` 也拒絕開關以外的 v2：executor 等非助理不能寫 v2（它們不跑 API 搬移的 2d-i 回合），助理 overlay
@@ -489,7 +489,7 @@ Neal 2026-10-05：「請嚴格依照hosted agent官方和grok bot的方式，詳
   [換環境不叫醒已回收的來源](#follow-no-wake)。
 - **何時重查。** ⓪ **selector 檢查窗口**：每次用 reader 前先拿 selector 目前選定的版本。讀取與輪詢沿用
   `SELECTOR_CHECK_SECONDS`（10 秒）內**開始**的那次 selector 讀取（從讀取開始前計時，窗口不含讀取本身的時間；
-  比較用嚴格的「之後」），超過就重讀一次（`get_agent`＋`get_version`）。版本相同才用記住的 session；
+  比較用嚴格的「之後」），超過就重讀一次（`get_agent`；選定版本的 `get_version` 每個程序只讀一次，見下方「沒有改的」）。版本相同才用記住的 session；
   不同就丟掉它（記 `NATIVE_READER_VERSION_MOVED`），改讀選定版本的 session。
   ① 本程序做環境操作（prepare／follow／advance／retarget／不搬檔／自動接續觀察）時，開始與結束各清一次
   （操作期間的讀取改走平台選定的新 session，不會喚醒正要停止的舊 session）；
@@ -498,15 +498,15 @@ Neal 2026-10-05：「請嚴格依照hosted agent官方和grok bot的方式，詳
   selector 暫時讀不到（`SelectorUnreadable`，見下）不算綁定移動，不清快取；
   ③ 其他 `FOUNDRY_*` 失敗：原錯誤照回，下一個請求重查；④ 同一個綁定超過 1 天沒用就重查
   （平台 30 天無活動才刪 session）。session 也可能隨時被刪或 `failed`，所以有綁定列時，凡是接著會呼叫這個 SID 的請求
-  （送出、讀取、輪詢、預取）都在請求內讀 metadata，10 秒內共用一次（見下方 phase 3 的 `_located`）；沒有綁定列（舊 selector
+  （送出、讀取、輪詢）都在請求內讀 metadata，10 秒內共用一次（見下方 phase 3 的 `_located`）；沒有綁定列（舊 selector
   定位）的這個 1 天快取不變，2d-i P7 認領綁定列後才走那條。
 - **selector 暫時讀不到。** `get_agent`／`get_version` 逾時、無狀態碼、408、429 或 5xx 時，`HostedVersions.current`
   丟 `SelectorUnreadable`（回應仍是 503 `AGENT_VERSION_FOLLOWING`，與「選定版本這個 API build 不能服務」分開）。
   只有**讀取與輪詢**（回條、`status`、對話、歷史、Responses 即時串流的來源…）會沿用 selector 在 `SELECTOR_STALE_READ_SECONDS`（120 秒）內確認過的
   reader 繼續回答，並保留快取；超過 120 秒回 503 `AGENT_VERSION_FOLLOWING`，快取仍保留，selector 恢復後照常。
   送出、寫入、排程 routine、Agent 間交辦與 prewarm 不沿用，一定要這次讀到 selector。
-- **送出與寫入。** 每次送出都在請求內讀一次 selector（`current(checked_since=<請求開始>)`；後續訊息的對話預讀與
-  `current()` 共用這一次），版本相同才在記住的 session 做一次 `session_read`，Agent 紀錄指向別的 session 就重查平台一次。
+- **送出與寫入。** 每次送出都在請求內讀一次 selector（`current(checked_since=<請求開始>)`；2026-10-22 起不再預讀對話，
+  見[接續回合送出預讀](#rtt-a-submit-prefetch)），版本相同才在記住的 session 做一次 `session_read`，Agent 紀錄指向別的 session 就重查平台一次。
   群組開場與 Teams relay 走同一個送出（Teams relay 的回條讀取遇到選定版本沒有 session 的 409 `NATIVE_SESSION_CHANGED`
   時，照「還沒有這則」處理、改走同一個 RID 的送出，由送出回 503 `not_dispatched`，relay 下一次輪詢再送）。
   其他把工作或寫入送到 session 的路徑也都在請求內讀 selector：owner 的圖片上傳與追加（`_context(prepared=True)`）、
@@ -570,7 +570,20 @@ Neal 2026-10-05：「請嚴格依照hosted agent官方和grok bot的方式，詳
   `NATIVE_SESSION_CHANGED`、不讀任何紀錄。`session_read` 不擋（API 用它找目前環境）；
   `x-client-fa-expected-version` 版本前置條件照舊。只認版本號較大的接手者，bootstrap 前的舊 session 不受影響。
   這道防線只管紀錄：它在 VM 內執行，舊 SID 被呼叫時平台已先重建 session，所以上面的「不呼叫舊 SID」仍由 API 負責。
-- **沒有改的。** 環境畫面（`GET /environment`）與所有換版操作仍每次讀 selector；版本解析器本身不快取。
+- **沒有改的。** 環境畫面（`GET /environment`）與所有換版操作仍每次讀 selector；版本解析器不快取 selector。
+  2026-10-22 起，`HostedVersions.current` 把**通過全部檢查**（`active`、Agent GUID／OID、v2 profile、`kind=hosted`）的
+  選定版本 definition 依（endpoint、Agent、版本）留在程序內（最多 `KEPT_DEFINITIONS`＝64 個，先進先出；寫入與淘汰在同一把鎖內），
+  之後同一版本只讀 `get_agent`。這是 FA 的**假設**：已發布版本的 definition 不會再改（未經官方文件核對；
+  [Manage hosted agents](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/manage-hosted-agent#create-a-new-version)
+  只說要改 image、資源或環境變數時建立新版本，沒有寫版本建立後不能修改；2026-10-22 讀，頁面更新 2026-10-20）。
+  留下的是**當時通過檢查的快照**：之後每次的狀態與身份檢查都是對這份快照重做，不是重新讀平台，直到程序重啟、這筆被淘汰、
+  selector 改指別的版本，或快照對這次的 Agent 檢查不過（例如同名 Agent 以同一版本號重建、GUID 不同：這次回 503，
+  這筆被丟掉，下一次重讀）。尚未 `active` 或檢查不過的版本不留，每次重讀
+  （`test_agent_versions.py::test_each_selection_reads_the_selector_and_only_a_newly_selected_versions_definition`、
+  `::test_a_kept_definition_failing_a_check_is_dropped_so_the_next_selection_reads_it_again`、
+  `::test_a_kept_definition_dropped_by_another_thread_never_breaks_an_eviction`）。
+  每次平台讀取各自建一個 `AIProjectClient` 的做法不改：固定版 azure-core 1.41.0 的 `RequestsTransport` docstring 寫明
+  不應視為 thread-safe，而這些讀取會在請求執行緒與 `_LOCATE` 執行緒池裡同時發生。
 
 **量測（本機離線替身計呼叫次數；暫時測試未提交）。** main 每次讀取與每次送出都是 Foundry 控制面 3 次
 （`get_agent`、`get_version`、`get_session`）；本分支命中快取後 0 次，Hosted 呼叫次數不變（讀取 1、送出 2）。
@@ -877,7 +890,7 @@ B thread 的回合。本 API 不建立本機 thread，也不接單、批准、�
 |---|---|
 | `GET /native-hitl/v1/attention` | 原 Entra owner＋`Behavior.Read`；沿 `FA_NATIVE_HITL_ENABLED`。Team 取已驗身份，Agent token 不能使用，不收 body／任意 Team、Agent、store 或 key。 |
 | `cursor`／`limit` | 可省略的 opaque cursor、預設20／最多20。cursor綁原Team，內容由server包裝SDK續頁值與這一輪的[時間窗](#team-hitl-attention-window)；UI不可解析或自製。limit指**原資料列**頁大小，不保證每頁有卡。 |
-| `NativeHitlTeamAttentionPage` | `schema_version=fa-native-hitl-team-attention-v1`、`team_id/items/next_cursor/observed_at`。空items但有next_cursor時要繼續；null才是這輪完成。跨頁不是原子快照，新一輪仍須從頭發現；失敗不可清成沒有待辦。單張卡讀不出（4xx，例如 Agent 已退役 410、紀錄不合 409）只略過那張並記 `NATIVE_HITL_ATTENTION_ITEM_SKIPPED`，其他卡照列；5xx、`BEHAVIOR_CONFLICT`，或卡片的 Agent 屬於別的 Team（403 `NATIVE_HITL_SCOPE_DENIED`）仍讓整頁失敗。 |
+| `NativeHitlTeamAttentionPage` | `schema_version=fa-native-hitl-team-attention-v1`、`team_id/items/next_cursor/observed_at`。空items但有next_cursor時要繼續；null才是這輪完成。跨頁不是原子快照，新一輪仍須從頭發現；失敗不可清成沒有待辦。單張卡讀不出（4xx，例如 Agent 已退役 410、紀錄不合 409）只略過那張並記 `NATIVE_HITL_ATTENTION_ITEM_SKIPPED`，其他卡照列；5xx、`BEHAVIOR_CONFLICT`，或卡片的 Agent、保存的卡片紀錄屬於別的 Team（403 `NATIVE_HITL_SCOPE_DENIED`）仍讓整頁失敗。 |
 | `NativeHitlTeamAttentionEntry.item` | 直接重用 `NativeAttention` 的 `approval_required`／`question_required`；批准reference及提問正文／choices等保持原DTO，沒有第二套卡片schema。 |
 | `NativeHitlAttentionOrigin` | `{state:"verified"|"unavailable",root:NativeTurnAddress|null,sender:NativeTurnAddress|null}`。已核原receipt、root及sender同Team／原CID/RID與root關聯才verified；直接真人回合root為自身、sender=null。缺原件／reader不在時不猜，保留B卡且來源unavailable。 |
 
@@ -1190,15 +1203,17 @@ selector 移動已不再讓綁定列的 SID 失效，2d-i P7）。**打開這個
 
 - **呼叫綁定列的 SID 之前（ADR-0009 §10 phase 0 保證，`_located`）：** selector 讀取與這個 SID 的 `get_session`
   metadata 並行讀，兩者都確認後才呼叫它。metadata 何時讀：凡是接著會呼叫這個 SID 的請求——送出、寫入、routine、交辦、
-  prewarm，以及對話、歷史、回條與 `status` 輪詢、送出的預取——**每次都在請求內讀**，只沿用 `METADATA_REUSE_SECONDS`
-  （10 秒）內**開始**的那次讀取，讓同一則送出的預取與 `current()`、連發的幾則或工作台每秒一次的輪詢共用一次（每個 SID
+  prewarm，以及對話、歷史、回條與 `status` 輪詢——**每次都在請求內讀**，只沿用 `METADATA_REUSE_SECONDS`
+  （10 秒）內**開始**的那次讀取，讓連發的幾則或工作台每秒一次的輪詢共用一次（每個 SID
   每 10 秒最多一次 `get_session`；沿用時不會把窗口往後推）。不呼叫 Hosted 的路徑不讀。2026-10-15 以前沿用 1 天：暖程序上
   1 天內被刪或 `failed` 的 SID 會再被呼叫，平台以同一個 SID 重建空 session、訊息卡住（dev M5 測試）；現在送出讀到 404 會改跑
   follow，§7a 第二次 404 後換到同版本的新 SID，讀取讀到 404 則不呼叫、回 409 `NATIVE_SESSION_CHANGED`。
   確認條件：selector 指向的正是這個 SID 建立時的版本（selector
   指向本 build 不服務的版本時照綁定列走）、沒有棄用決定、metadata 是 `active`／`idle`。任一不成立就不呼叫這個 SID：
-  送出改跑保留的 follow；讀取只在 selector 版本的目的 SID 存在時讀它（同 main 的讀取者），404／退役的不讀；預取的
-  `cached_reader` 同樣檢查（只認 10 秒內 `_located` 留下的那次讀取），有綁定列時不退回舊的 selector 讀取者。
+  送出改跑保留的 follow；讀取只在 selector 版本的目的 SID 存在時讀它（同 main 的讀取者），404／退役的不讀；
+  2d-i 開啟（`FA_NATIVE_SESSION_GUARD_ENFORCE=1`）時，`_located` 不管 selector 指向哪一版都會呼叫這個 SID。
+  （歷史：#942 曾讓送出的對話預讀 `cached_reader` 照同一規則、柵欄或棄用時不預讀；2026-10-22 同日拿掉對話預讀，
+  `cached_reader` 一併刪除，原因見[接續回合送出預讀](#rtt-a-submit-prefetch)。）
   留 `NATIVE_BINDING_SESSION_RETIRED invoked=False`。
 - **metadata 讀不到時：** 401／403 一律照 main 回報，不呼叫 SID。其他失敗（5xx、429、逾時）或 SID 正在 `creating`／`updating`：
   **冷程序**（本程序 1 天內沒用過這個 SID，含 `forget()` 之後）照 main 回 503 `NATIVE_BOOTSTRAP_UNKNOWN`，用 main 的讀法
@@ -1206,7 +1221,7 @@ selector 移動已不再讓綁定列的 SID 失效，2d-i P7）。**打開這個
   `connection_timeout`／`read_timeout` 是 `METADATA_BUDGET_SECONDS`（2 秒），且從這次 selector 讀取開始最多等 2 秒，
   逾時或失敗就記 `NATIVE_BINDING_METADATA_UNCONFIRMED kept=True`、照 main 呼叫這個 SID，10 秒內不再重讀。
   代價：暖程序上 metadata 剛好讀不到時，已刪的 SID 仍可能被呼叫一次（與 main 相同）。
-- **送出路徑不多延遲：** 綁定列在送出前讀一次（同一請求內預取與 `current()` 共用）；selector 與 metadata 並行，main 是
+- **送出路徑不多延遲：** 綁定列在送出前讀一次（由 `current()` 讀；2d-i 開啟時在拿 lock 前讀、lock 內沿用）；selector 與 metadata 並行，main 是
   先後讀，所以呼叫 session 前的等待不比 main 長（串行深度仍是一輪；牆鐘是兩者較慢的那個，metadata 比 selector 慢時才多出差值，
   `test_a_warm_submits_metadata_read_runs_alongside_its_selector_read` 核兩者同時進行；暖程序上 metadata 最多多等到
   selector 讀取開始後 2 秒，`test_a_hung_metadata_read_holds_a_warm_submit_no_longer_than_its_budget`）；只需 selector 時
@@ -1361,7 +1376,7 @@ selector 移動已不再讓綁定列的 SID 失效，2d-i P7）。**打開這個
     沒碰到切換的送出只做一次，呼叫與延遲不變（有測試數）。Agent 間交辦等不到時照舊回 503「只重送原訊息」。
     代價：等到上限時，任何可重做的拒絕（包括 Hosted 自己 task recovery 的 503，單次嘗試原本不帶 `server_following`）
     都回 `server_following`：請求內最多 10 秒重做、占住這個請求的 worker thread，之後工作台最多 600 秒同 RID 重送。
-    重做不再預讀對話（只有第一次嘗試做 `_prefetch`）。
+    重做不再預讀 capture（只有第一次嘗試做 `_prefetch`；對話 2026-10-22 起一律不預讀）。
   - **不排在柵欄步驟後面：** 綁定列記著柵欄時，送出不等 sessions lock（背景柵欄每步最多約 10 秒）：拿不到就回
     `AGENT_VERSION_FOLLOWING`（沒送），由請求內等候重送。
   - **停用所有 follow 入口：** 綁定的 Agent 不再由送出、routine、Agent 間交辦或 `/environment/advance` 啟動 follow
@@ -2919,6 +2934,11 @@ API-only DTO／codec 不匯入 Hosted SDK；正常同 build 配對新版 reader�
 - **Windows 長路徑**：`test_behavior_assistant.py` 的三則 cold-resume 測試，會在測試目錄下建立約 200 字元的
   離線 SDK checkpoint 路徑。Windows 沒開 `LongPathsEnabled=1` 時，請改用短的 `--basetemp`（例如 `C:\t`）；
   否則這三則會顯示 SKIPPED（原本是 `WinError 206`），不算通過。Hosted 跑在 Linux，沒有這個限制。
+  長 `--basetemp` 也可能讓 `test_native_cut.py`、`test_native_turns.py`、`test_native_abandon_source.py` 等用本機
+  Hosted State store 的測試大量出現 setup ERROR：`NATIVE_STATE_STORE_UNKNOWN`（`the State store could not be confirmed`）。
+  先換短路徑重跑；短路徑仍失敗才當產品問題：SDK 本機 State store 把每個 store 寫成 `state_stores/<編碼後名稱>.json`，路徑太長的
+  `OSError` 被 `native_checkpoint.open_durable_store` 回報成這個碼。請用很短的專用路徑，例如 `--basetemp C:\t\pt`。
+  （#880 在本機看過這批錯誤，基準版本同樣出現；「長路徑造成」是由程式路徑推得，尚未在同一台機器以長、短路徑對照重現。）
 
 CI（`.github/workflows/shared-context-tests.yml`）只在 Linux 上跳過兩份清單裡的測試，本機照跑：
 `tests/shared_context/ci-quarantine.txt` 是缺上面這類前提（固定 Windows runtime 或原件）的測試，
@@ -4155,8 +4175,9 @@ N0用同endpoint但操作者身分、probe handler和專用store；不能替這�
 | `NATIVE_RID_ABSENT` | 欄位與上一列相同；只用在 `read` 回 404 `NATIVE_RID_MISSING`（原件不存在，常見於送出前的先讀），不是呼叫失敗。2026-10-07 起由上一列分出，行為不變。 |
 | `FA_HOSTED_DISPATCH` | 已啟native的host（或帶native標記的請求）確實進到應用分流；只記選到probe／native／legacy、標記數量、server身份及有界invocation ID。legacy可指出native標記缺失，但不是權限證明。 |
 | `FA_NATIVE_HTTP` | native handler進入、回覆已建立或例外交回SDK；只記固定operation／status／code、耗時和原RID的SHA-256，不記原command。`raised`仍重新拋出，不改官方錯誤處理。 |
+| `NATIVE_STAGE` | 2026-10-22 起，`session_follow`／`session_files_omission` 每個已回應的stage記一行INFO：operation、stage、status、耗時與Agent／SID，不記body；其他native指令不記。失敗仍走 `NATIVE_INVOCATION_FAILURE`。 |
 
-這三類使用原module logger的WARNING，不依賴被關閉的access log或成功INFO；
+上面前四類（`NATIVE_STAGE` 除外）使用原module logger的WARNING，不依賴被關閉的access log或成功INFO；
 不全面打開SDK DEBUG。**不記原body、完整headers、token、cookie、caller call_id、
 capture、模型原文／私人推理或例外訊息**，也不產生新的執行識別來重送。
 缺少入口log仍須核對實際image與log收集，不直接當成「請求未到」。
@@ -6258,7 +6279,7 @@ store 一律不重建：寫入遇到 not found 時再讀一次 store 確認，�
 （從進入 sender 起算，含取得 Hosted 模型 token，到收到第一段串流；429 重送算同一個 request）與 `model_request`（到串流讀完）；沒收到任何資料就結束的 request，
 `model_first_byte` 記 `outcome=failed`。兩者都只有 phase、ID、毫秒與 outcome，不記內容、token 或 header。
 HITL runtime 只是建物件、沒有網路，不另計。平台把 submit 轉進 handler 的時間在 FA 之外，看既有
-`FA_NATIVE_HTTP` 的 `entered` 與平台 span。
+`FA_NATIVE_HTTP` 的 `entered` 與平台 span。Hosted 端的這些行也會送進專案 App Insights 的 `AppTraces`（讀回查詢見 [FA 自己的 Hosted log](#hosted-fa-logs)）。
 
 <a id="rtt-a-timing"></a>
 **送出路徑與通知鏈的分段（2026-10-06，RTT A，只加計時、不改行為）。** v17 dev 實測時，API 收到 submit 到
@@ -6267,7 +6288,8 @@ Hosted 收單前約 0.8 秒、Hosted 收單內部約 1.1 秒，都沒有計時�
   `/work-policy/v1/native-turns/`、`/responses-turns/`、`/native-capabilities/`、`/turn-usage` 與 `/agent-template`
   底下的路由（含 `/agents/{agent_id}` 前綴）。名稱是路由樣板最後一個固定段，例如 `/requests/{request_id}/status`
   記 `api_status`、`/requests/{request_id}` 記 `api_requests`、`/turn-usage` 記 `api_turn-usage`。路徑有 `request_id`
-  時以同一個 RID 雜湊當 ID；舊 Table 對話路由（例如 `/conversations/{conversation_id}`）照舊不計。
+  時以同一個 RID 雜湊當 ID（2026-10-22 起，路徑沒有時用 body 已驗證的 `request_id`，見
+  [入口讀取](#native-capability-gate-reads)）；舊 Table 對話路由（例如 `/conversations/{conversation_id}`）照舊不計。
 - **API submit**（`NativeTurnGateway.submit`，同一個 RID 雜湊）：`api_submit_context`（入口 Entra＝Team 主人、
   政策與 Agent 選定、舊 Table 對話檢查）、`api_submit_session`（讀 Agent 目前的 Hosted session）、
   `api_submit_conversation`（接續回合讀原對話）、`api_submit_capture`（`resolve_capture`：設定、skills、附件）、
@@ -6306,6 +6328,35 @@ Hosted 收單前約 0.8 秒、Hosted 收單內部約 1.1 秒，都沒有計時�
 - 離線計數（暫時腳本，未提交）：Hosted 一次接續回合（Responses）收單 17 次依序 State store 呼叫（agent 紀錄讀 5、寫 2；
   `rid:` 讀 4、建 1；meta 讀 3、寫 1）；當時另計到的 3 次（前一回合的 `rid:`、`turn`、`text`）是上一回合 Responses
   處理器在背景讀結果，不屬於收單。未部署。
+
+<a id="send-latency-reminders-overlap"></a>
+**送出路徑延遲（2026-10-22）。** 三項修改：工作提醒與 bind 重疊（本段）、2d-i 開啟時預取對話（上面 2d-i 一節）、
+選定版本 definition 每程序只讀一次（上面「沒有改的」一項）。其中「2d-i 開啟時預取對話」同日在 dev 量到會讓同一個 SID
+同時收到兩個 invocation、被平台扣約 2 秒，已連同整個對話預讀拿掉（見[接續回合送出預讀](#rtt-a-submit-prefetch)）；
+下面的量測與推論保留當時的內容。
+- **量測值（stage Log Analytics `log-fa-stage` 最近 8 天，2026-10-22 讀；當時 stage 程式約在 main `4ca5a92b`，不是本分支的基準 `19803b94`）：** `native_reminders` p50 0.73 秒、p90 1.28 秒；`api_submit_conversation`
+  p50 235 ms、p90 400 ms。這些是改前的分段時間，不是本分支的結果。
+- **推論（未量測）：** 提醒與預取兩項各自最多省下重疊兩段中較短的那段；definition 只讀一次省掉的是每次選定版本的一次
+  `get_version` 往返，這次沒有它的量測值。實際省多少要等 dev 跑過才知道；`native_bind_capabilities` 在這次讀取裡沒有
+  對應數字，所以提醒這項的上限也還沒有數字。
+- **讀計時注意：** 改後 `native_reminders` 與 `native_bind_capabilities` 同時進行，兩段不能相加當成回合的實際時間。
+
+**工作提醒與 bind 重疊。** stage 的 `native_reminders`（`POST /routine/reminders`）
+排在 `native_bind_capabilities` 之後，但它只用這回合的 CID。現在 `_run` 在召回旁邊就啟動它，結果與失敗仍在原位置取用：
+讀不到（非 `NATIVE_ROUTINE_SCOPE` 的 `Problem`）照舊記 unknown 並在提示寫「could not be read」、回合繼續；
+`NATIVE_ROUTINE_SCOPE`（含另一個 CID 或另一位 Agent 的提醒）照舊讓回合失敗；bind 先失敗時未取用的讀取被取消並等它結束。
+API 端這條路由只讀（讀 Hosted 對話與 routine 紀錄，不寫），先失敗的回合多做的只是一次唯讀查詢。`native_reminders` 仍量 POST 本身。
+
+#### Verified against：送出路徑延遲
+
+- 程式基準：分支基準 `19803b94` 之上的本分支提交；已讀 `native_sdk._run`、`native_routine_client.NativeRoutineClient.reminders`、
+  `native_routine_api` 的 `/routine/reminders`、`native_routines.NativeRoutineService.agent_reminders`、
+  `behavior_agent_versions.HostedVersions.current`、`behavior_native_sessions.NativeSessions.cached_reader`／`_located`／`_has_fence`
+  與 `behavior_native_turn_api.NativeTurnGateway._prefetch`（`cached_reader` 已於 2026-10-22 刪除）。
+- 測試：`test_native_assembly.py::test_reminders_overlap_capability_binding_and_keep_their_failure_handling`
+  （bind 等提醒讀取開始才放行；找到、503、另一個 CID 三種回覆各自維持原結果）、
+  `::test_an_early_reminders_read_stops_with_a_failed_bind_and_its_own_failure_still_fails_the_turn`（bind 先失敗時讀取被取消並等它結束；
+  非 `Problem` 的讀取失敗照舊讓回合失敗）；`HostedVersions` 的測試見上面；`cached_reader` 的兩個測試已隨它刪除。未部署。
 
 <a id="rtt-a-admission-reuse"></a>
 **收單重用剛讀到／寫入的紀錄（2026-10-06，RTT A 第 4 項）。** 同一個收單鎖內，Hosted 原本會把 agent 紀錄讀 5 次、
@@ -6372,10 +6423,11 @@ CAS，紀錄被改動就重讀再標記，見[收單開頭讀取並行](#rtt-a-a
   標記讀回自己的紀錄、槽位重讀後發現已是本 RID）。未部署。
 
 <a id="rtt-a-submit-prefetch"></a>
-**接續回合送出時並行預讀（2026-10-07，RTT A 第三批）。** #707 在 dev 量到接續回合的 API 送出依序做
+**接續回合送出時並行預讀（2026-10-07，RTT A 第三批；對話那一半 2026-10-22 拿掉，見本段最後）。** #707 在 dev 量到接續回合的 API 送出依序做
 `api_submit_session`（約 295 ms，平台 `session_read`）、`api_submit_conversation`（約 465 ms，Hosted 讀對話）與
 `api_submit_capture`（約 263 ms，Table 讀設定、skills、角色），總協調轉來的量測報告原件在部署線工作區、未存入 repo。
-現在 `NativeTurnGateway.submit` 在 `sessions.current` 確認 Agent session 的同時，於背景執行緒先做兩件唯讀的事：
+當時（2026-10-07）`NativeTurnGateway.submit` 在 `sessions.current` 確認 Agent session 的同時，於背景執行緒先做兩件唯讀的事
+（對話那一半 2026-10-22 已取消）：
 - 用已保留的 reader（#673，`NativeSessions.cached_reader`，不做任何平台讀取）讀這個對話；只有當它讀的 session 與版本
   正好等於 `sessions.current` 確認的那一個時才採用，否則照原順序在確認的 session 上重讀。
 - 用這個對話的依據（新對話收單後回傳的 receipt，或上次送出時讀到的對話；同一程序內、依 Agent 與 CID 保留最多 256 個；
@@ -6383,8 +6435,39 @@ CAS，紀錄被改動就重讀再標記，見[收單開頭讀取並行](#rtt-a-a
   否則照原順序重算（`resolve_capture` 只讀對話的 CID 與 capture，docstring 已註明）。`resolve_capture` 每次都讀當下的設定、批准與撤銷狀態，所以先跑的結果和照順序跑的一樣。
 每次都要讀的：`continuation_blocker`、執行中的 session、狀態設定檔與 `_same_session` 照舊用這次讀到的對話檢查；
 預讀失敗或不符時一律照原順序重讀，不採用任何保留值做授權。沒有提早送出或寫入任何東西；Hosted `rid:<RID>`
-create-or-read 仍是唯一去重。新對話沒有對話可讀，不受影響。預估接續回合省約 0.5 秒（三段由相加變成取最長）；
+create-or-read 仍是唯一去重。新對話沒有對話可讀，不受影響。當時預估接續回合省約 0.5 秒（三段由相加變成取最長；對話那一半
+2026-10-22 已取消）；
 實際看 dev 的 `api_submit_session`／`api_submit_conversation`／`api_submit_capture`（後兩者變成等待預讀結果的時間）。
+
+**2026-10-22 起不再預讀對話，只預讀 capture。** dev（API revision `48c061d`，以及更早的 `1c8bf3a8`）上，接續回合送出時
+`sessions.current` 的 `session_read` 與對話預讀（`NativeConversationRead`）在 2–32 ms 內先後打到同一個 SID：
+- **量測（dev Log Analytics `log-fa-dev` 的 agentsv2 `invoke_agent`，2026-10-22 讀）：** 07:10Z 之後的 4 次 warm 送出
+  （07:11:29、07:44:36、07:46:26、07:47:40）全部有一個請求被平台扣住：
+  `hosted_agent.latency.platform_preprocessing_ms` 2,064–2,123 ms，同組另一個 60–110 ms 放行；被扣的那個 container 處理
+  時間正常（`container_response_ms` 89–318）。被扣的有時是對話讀取、有時是 `session_read`，與誰先送無關。同時段依序送出的
+  請求有幾百筆，沒有一筆被扣；早上 05:50–05:52 同樣同時發出的三組沒被扣（57–120 ms）。被扣的 3 次 warm 送出在 API log 上
+  （FA_TIMING，[量測]）：`20ec4d` `api_submit_session` 169／`api_submit_conversation` **2,246** ms、`719429` 252／**2,195** ms、
+  `b249a5` **2,269**／0 ms（預讀命中）。依序的對照：換版後的 `9dc2f4` 第二次送出沒有預讀，`session_read` 結束約 22 ms 後
+  才送對話讀取，兩者都沒被扣，API `api_submit_session` 287 ms、`api_submit_conversation` 516 ms。也就是 session＋conversation
+  被扣時是 2,269–2,447 ms，依序是 803 ms，早上同時發出而沒被扣的 `836f02` 是 314＋323 ms。
+- **推論：** 平台對同一個 session 同時進來的第二個請求像是要等一個約 2 秒的間隔；為什麼 07:10（那時這個 session 有一次
+  `start_type=resume`）之後才開始，log 裡沒有答案（**未解釋**）。對話預讀平常最多省約 0.1–0.3 秒，碰到扣住時每次 warm 送出
+  多付約 1.9 秒，所以拿掉。等預讀加 timeout、超時改同步讀的做法不採用：那會變成三個 invocation，而且照樣同時。
+- **現在：** `_prefetch` 只在背景跑 `resolve_capture`（只讀 Table：`control.store.consistent_read`，不呼叫 Hosted 或平台）；
+  `_prepare` 在 `sessions.current` 確認 session 之後，於確認的 session 上照順序讀對話。送出時同一個 SID 一次只有一個
+  invocation 在途。`NativeSessions.cached_reader`（#673，以及 #942 的 2d-i 規則）沒有其他呼叫者，一併刪除；
+  `_prefetch` 原本先在 lock 外做的 selector／metadata 讀取也回到 `current()` 內（`_located` 仍讓兩者並行）。
+- **未驗證：** 修改後 dev 的 warm 送出還沒重跑。確認方法：查 agentsv2 `invoke_agent` 的
+  `platform_preprocessing_ms`，送出前那段不該再有約 2 秒的值，`api_submit_session`＋`api_submit_conversation` 應接近上面依序
+  的 287＋516 ms。頁面載入時的同時讀取（`api_requests` 與 `api_images`）在 07:41:35 也被扣過一次（2,416 ms），不在送出路徑上，
+  這次不處理。
+- **stage（量測，`log-fa-stage` 唯讀查詢，2026-10-22 讀，範圍 10-15 到 10-21Z 共 7 天）：** 1,864 筆有 latency 屬性的
+  `invoke_agent` 中，`platform_preprocessing_ms` 在 1.8–2.4 秒的是 0 筆（另有 2 筆約 5.5 秒，是 VM `resume` 時被扣住，跟這裡
+  無關）。同一個 SID 在 100 ms 內同時進來的請求有 155 組，其中最大的 `platform_preprocessing_ms` 是 148 ms，沒有一組被扣。release 34 的 5 次 warm 送出都是照順序讀：
+  對話讀取緊接在 `session_read` 結束後才送出（逐筆約 13–22 ms），`api_submit_session`＋`api_submit_conversation` 555–813 ms，沒有一次走到
+  對話預讀（這些 SID 的建立版本不等於 selector；這點是用 span 的 `gen_ai.agent.version` 推估，沒有讀 Table 核對）。
+- **stage 的限制（推論）：** stage 在送出時從來沒有對同一個 SID 同時發過兩個請求，所以這份資料只說明 stage 使用者目前沒有多付
+  這約 2 秒，不能證明 stage 的平台不會扣住。
 
 #### Verified against：接續回合送出預讀
 
@@ -6397,6 +6480,44 @@ create-or-read 仍是唯一去重。新對話沒有對話可讀，不受影響�
   （session、版本、capture 不符或預讀失敗時不採用）、
   `test_native_turn_api.py::test_a_prefetch_from_another_version_is_read_again_on_the_confirmed_session`（預讀讀到別的版本時，
   送出流程在確認的 session 上重讀）。未部署。
+- 2026-10-22 修改的程式基準：根因調查讀的是 main `fa6b2943`；本 PR 的基準是 main `c2d18002`（`fa6b2943..c2d18002` 只動
+  `test_native_send_path.py`（#948 讓測試時鐘固定），沒有動程式）。
+- 2026-10-22 已讀程式（`shared_context/behavior_native_turn_api.py`）：新的 `NativeTurnGateway._prefetch`（只在背景跑
+  `resolve_capture`，依據是 `_kept_conversations` 保留的對話）、`_SubmitPrefetch.capture`（CID 與 capture 都相同才採用）、
+  `_prepare`（在確認的 session 上以 `api_submit_conversation` 照順序讀對話，再取 capture）、`submit`（只有第一次嘗試
+  `early=True` 才預讀）與 `_submit`（`sessions.current` 之後才進 `_prepare`）；`behavior_native_sessions.py` 刪掉的
+  `NativeSessions.cached_reader`（沒有其他呼叫者）與 `_located` 的 docstring（呼叫者不再包括預讀）。
+- 2026-10-22 測試，舊名 → 新名（或刪除）：
+  - `test_native_turn_api.py`：`test_a_follow_up_reads_its_conversation_and_capture_while_the_session_is_confirmed` →
+    `test_a_follow_up_invokes_its_session_one_call_at_a_time_and_prefetches_only_its_capture`（每個 Hosted invocation 在替身裡
+    停 50 ms、依 SID 計同時在途數：兩次接續送出都是 `session_read`→`conversation`→`submit`、同一個 SID 最多 1 個；capture 仍在
+    預讀執行緒算，且與 `session_read` 同時進行）；`test_a_prefetched_read_is_used_only_when_it_equals_the_ordinary_read` →
+    `test_a_prefetched_capture_is_used_only_when_it_equals_the_ordinary_read`（只剩 capture 部分）；
+    `test_a_prefetch_from_another_version_is_read_again_on_the_confirmed_session` → 刪除（隨 `cached_reader`）。
+  - `test_native_send_path.py`：`test_with_2di_on_a_follow_up_reads_its_conversation_while_the_rows_session_is_read` →
+    `test_with_2di_on_a_follow_up_reads_its_conversation_only_after_the_rows_session_read`（2d-i 綁定列，selector 41／42，
+    同樣的順序與同時在途數）；`test_with_2di_on_the_prefetch_never_reads_a_fenced_abandoned_or_unconfirmed_rows_sid` → 刪除
+    （隨 `cached_reader`）；新增 `test_with_2di_on_a_follow_up_resent_in_its_request_after_a_switch_invokes_its_sid_one_call_at_a_time`
+    （第一次嘗試遇到 `AGENT_VERSION_FOLLOWING`、跑完請求內切換後同一個 RID 重送：`session_read`→`read`→`session_read`→
+    `conversation`→`submit`，同一個 SID 最多 1 個）。
+  - `test_native_reader_cache.py`：`test_a_follow_up_prefetch_never_reads_the_conversation_on_the_kept_old_session` →
+    `test_a_follow_up_never_reads_the_conversation_on_the_kept_old_session`；
+    `test_a_follow_up_after_the_selector_check_expired_still_prefetches_on_the_confirmed_reader` →
+    `test_a_follow_up_after_the_selector_check_expired_reads_its_conversation_on_the_confirmed_reader`（同樣計同時在途數，
+    最多 1 個）。
+  - `test_native_send_wait.py`：`test_only_the_first_attempt_prefetches_the_conversation` →
+    `test_only_the_first_attempt_prefetches_the_capture`。
+- 2026-10-22 實際驗證（本機離線替身，沒有真模型、Hosted 或 Azure）：
+  - 本輪（PR 第 1 輪審查修正，測試提交 `fd3192d9`）`test_native_send_path`、`test_native_reader_cache`、`test_native_send_wait`、
+    `test_native_turn_api`、`test_native_responses_api` 五個檔合跑 276 passed（46／54／17／110／49）。
+  - 上一個提交 `c9a24cb1`（rebase 到 `c2d18002` 後）：總協調以 `test_native_send_path`、`test_native_reader_cache`、
+    `test_native_send_wait`、`test_native_turn_api`、`test_native_binding` 五個檔合跑 314 passed（組合和本輪不同：
+    本輪以 `test_native_responses_api` 取代 `test_native_binding`）；審查者逐檔 `test_native_send_path` 45、
+    `test_native_reader_cache` 54、`test_native_send_wait` 17、`test_native_turn_api` 110。
+  - 反向檢查：把 `behavior_native_turn_api.py`／`behavior_native_sessions.py` 換回 `c2d18002` 版（工作樹外的副本），上面兩個
+    計同時在途數的 reader_cache／send_path 新測試都失敗在同一個 SID 同時 2 個。重送那個測試在舊版是第一次嘗試的對話預讀
+    跟 `session_read` 撞在一起；舊版的重送本身（`early=False`）原本就不預讀。
+- 證據與限制：dev／stage 的數字來自唯讀 Log Analytics 查詢的去敏摘要，原件不在 repo。未部署；修改後 dev 的 warm 送出還沒重跑。
 
 #### Verified against：Hosted 用戶端重用
 
@@ -7050,7 +7171,7 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
 - 旗標設成 `0`，或沒有 `APPLICATIONINSIGHTS_CONNECTION_STRING`（專案沒開監控）時：不設 `TelemetryConfig`、不帶 header，行為與原本相同。
 - exporter 在第一次轉送時才於背景建立；建不起來就記 `FA_SDK_TELEMETRY_INACTIVE reason=exporter_unavailable`，span 檔照樣刪除、不送。此時 header 仍會帶，只影響服務端 span 的分組，不影響回合。
 - 讀檔與送出都在背景執行緒，回合不等它；失敗只記 `FA_SDK_TELEMETRY_DROPPED`，不重試、不改回合結果。exporter 關閉離線重送暫存（`disable_offline_storage`），不在磁碟累積。ingestion 端點連不上、exporter 建不起來兩種情況，真 runtime 回合都照常完成、span 檔都會清掉（見測試）。
-- 不動 `configure_observability=None`：Python log 不會送進 App Insights。送出／丟棄筆數等少量 SDKStats 指標會送到同一個 App Insights。
+- 不動 `configure_observability=None`：一般 Python log 不會送進 App Insights；只有下方 [FA 自己的 Hosted log](#hosted-fa-logs) 那兩種前綴會送。送出／丟棄筆數等少量 SDKStats 指標會送到同一個 App Insights。
 - `APPLICATIONINSIGHTS_STATSBEAT_DISABLED_ALL` **維持不設**（Neal 2026-10-05 決定），與平台預設一致：exporter 自己的 statsbeat（送到 Microsoft 擁有的端點，只有筆數與 metadata、不含內容）照 exporter 預設開啟，與官方 distro 相同。程式不在執行中改程序環境變數。
 
 **已知現象與限制**
@@ -7063,11 +7184,40 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
   dependencies | where cloud_RoleName == "fa-stage-a" and name == "invoke_agent" | distinct operation_Id
   ```
 
+<a id="hosted-fa-logs"></a>
+**FA 自己的 Hosted log（`FA_TIMING`、`RESIDENT_SDK_*`；2026-10-22，未部署）**
+
+- 為什麼：冷回合比暖回合慢（依總協調轉來的 stage 送訊延遲調查，p50 約 6.7 秒對 2.5 秒；原始查詢未存入 repo），要先知道慢在 `sdk_process_start`、`sdk_session_resume`、`native_bind_*` 哪一段、常駐 SDK 為什麼被丟掉（`RESIDENT_SDK_DISCARDED reason=…`），再設計修正。這些行原本只在 Hosted stderr（`azd ai agent monitor` 看得到），Log Analytics 查不到。
+- 做法：Hosted 入口（`behavior_assistant_main.main`）在背景執行緒呼叫 `sdk_telemetry.attach_log_export()`，用官方 exporter 範例的接法（私有 `LoggerProvider`＋`BatchLogRecordProcessor`＋`AzureMonitorLogExporter`＋`LoggingHandler`），送到與 SDK span 相同、平台注入連線字串的 App Insights，`AppRoleName` 一樣是 `FOUNDRY_AGENT_NAME`。開關與 tracing 相同：`FA_SDK_TELEMETRY=0` 或沒有連線字串就不送；建不起來記 `FA_SDK_TELEMETRY_INACTIVE reason=log_exporter_unavailable`，不影響啟動。背景建立是為了不讓約 0.9 秒的 exporter 匯入（本機 Windows 量測）算進容器啟動；啟動後最前面約 1 秒內的行只在 stderr。
+- 只送哪些：handler 只掛在 `shared_context.behavior_timing`、`behavior_hosted`、`m2_copilot`、`native_resident`、`native_sdk` 五個 logger（不掛 root，也避免 exporter 自己的 azure-core log 迴圈），而且只放行**格式字串**以 `FA_TIMING ` 或 `RESIDENT_SDK_` 開頭、沒有例外資訊的行。`FA_TIMING` 只有 phase、雜湊過的回合 ID 或 binding ID、毫秒、outcome 與 Table 讀取次數；`RESIDENT_SDK_*` 只有固定原因碼或 hash 前 12 碼；都沒有對話內容、token 或個資。同一批 logger 的其他行（例如可能帶 runtime 錯誤文字的 `FA_MCP_SERVER_STATUS`、`FA_HOSTED_DISPATCH`）不送。這五個 logger 改成 INFO 等級，`RESIDENT_SDK_CONTINUED`（INFO，沿用常駐 SDK）才會送。
+- stderr 不變：logger 一旦有 handler，Python 就不再用 `logging.lastResort` 印到 stderr，所以同時把 `logging.lastResort` 本身掛上這五個 logger（只在 root 沒有 handler 時，也就是 Hosted 入口現況）；stderr 照舊只印 WARNING 以上。
+- 讀回（`log-fa-stage`／`log-fa-dev` 的 Log Analytics；換成要查的 Agent 名稱）：
+
+  ```kusto
+  AppTraces
+  | where AppRoleName == "fa-stage-a" and Message startswith "FA_TIMING "
+  | extend t = parse_json(substring(Message, 10))
+  | project TimeGenerated, OperationId, phase = tostring(t.phase), job_id = tostring(t.job_id),
+            elapsed_ms = todouble(t.elapsed_ms), outcome = tostring(t.outcome)
+  | where phase startswith "sdk_" or phase startswith "native_bind_" or phase in ("native_executor", "resident_restore")
+  | summarize p50 = percentile(elapsed_ms, 50), p90 = percentile(elapsed_ms, 90), n = count() by phase
+
+  AppTraces
+  | where AppRoleName == "fa-stage-a" and Message startswith "RESIDENT_SDK_"
+  | summarize n = count() by Message
+  ```
+
+  同一回合用 `job_id` 串起（native 回合是 RID sha256 前 12 碼）。API 的 `api_*` 行在部署
+  [入口讀取](#native-capability-gate-reads) 那次變更之後（最早 2026-10-22），路徑沒有 RID 時也帶 body RID 的同一種雜湊；之前的資料照舊是
+  null。只在 body 帶 RID、而且那個 RID 不是回合 RID 的路由（環境指令 `/environment/*`、`/prepare`），`job_id` 是那個指令的 RID，
+  對不上 Hosted 回合。在回合 trace context 內記的行預期帶該回合的 `OperationId`，可以和 SDK span 對上；未在雲端實測。
+- 官方來源（2026-10-22 查閱）：[Azure Monitor OpenTelemetry exporter for Python（1.0.0b58）](https://learn.microsoft.com/python/api/overview/azure/monitor-opentelemetry-exporter-readme)：log 範例用 `opentelemetry.instrumentation.logging.handler.LoggingHandler`、建議掛在具名 logger 而非 root；log 訊號仍標 experimental。[Configure OpenTelemetry in Application Insights](https://learn.microsoft.com/azure/azure-monitor/app/opentelemetry-configuration?tabs=python) 的 `configure_azure_monitor(logger_name=…)` 屬於 distro，FA 沒有用 distro，不適用。
+
 **未採用的選項**
 
 - 容器內 OpenTelemetry Collector＋`azuremonitorexporter`：Microsoft 官方 FAQ 寫明這個 exporter 是社群貢獻、「不受 Microsoft 支援」，還要多放大型執行檔、多管一個程序。
 - Azure Monitor OTLP 直收：要新建 DCR、Entra 權限等雲端資源，列為備案、不實作。
-- 打開 agentserver 內建 distro：只涵蓋 Python 程序，收不到 runtime 子程序的回合 span，還會把 Python log 一併送出。
+- 打開 agentserver 內建 distro：只涵蓋 Python 程序，收不到 runtime 子程序的回合 span，還會把 Python log 一併送出（FA 只送上面過濾過的兩種前綴）。
 
 **部署與驗收**
 
@@ -7090,9 +7240,10 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
 
 - 程式基準：#641（merge `fdaa9963`）＋本片預設打開 PR（以 main `840e7dec` 為基準）。程式：`shared_context/sdk_telemetry.py`（`enabled()` 預設打開）；`m2_copilot.run_copilot`（建立 CopilotClient、回合結束轉送）、`_ModelGateway.send_request`（每個模型回應的原始推理檢查）與 `ResidentSdk.stop`；`behavior_model_direct.DirectResponses`（header）；`native_sdk.NativeSdkExecutor.__call__`；`native_turns._submit_locked`；`behavior_agent_versions._ENVIRONMENT_FLAGS`（overlay 接受 `FA_SDK_TELEMETRY` 0／1）、`desired_source`／`copy_source`／`original_source`（sync 與「＋」不加這個旗標）；`deploy/stage/stage.json`、`seed_agents.py`、`ci_deploy.hosted_environment`（沒有設定這個旗標）。
 - 套件原始碼（本機驗證所用版本）：agentserver-core 2.2.0 `_base.py`／`_tracing.py`／`tasks/_manager.py`、copilot SDK 1.0.13 `client.py`／`_telemetry.py`（兩者在 `requirements-hosted.txt` 固定）；azure-monitor-opentelemetry-exporter 1.0.0b57、opentelemetry-sdk 1.44.0 由 agentserver-core 經 microsoft-opentelemetry 間接帶入，**manifest 沒有直接固定**。重建映像時這兩個版本可能變動；`tracer_provider=`、`disable_offline_storage=` 參數或 `ReadableSpan` 建構方式若改變，tracing 只會停用或丟 span（有 log），不影響回合。
-- 測試（本機，真 SDK 1.0.13＋runtime 1.0.83＋離線模型替身＋本機假 ingestion 端點，沒有雲端呼叫）：`python -X utf8 -m pytest .\tests\shared_context\test_sdk_telemetry.py -q`，19 passed。涵蓋：預設（不設旗標）就打開、明確 `0`／沒有連線字串／讀不懂的值都不送且前兩者不記 warning；不設旗標又沒有連線字串時真 runtime 回合照常完成、不帶 header、不產生 span 檔；ingestion 連不上與 exporter 建不起來時真 runtime 回合照常完成、span 檔清掉；真 runtime 經正式 `DirectResponses` 送模型（每個請求帶回合 traceparent）、Responses 線路帶／不帶原始 `reasoning_text`、gateway 自己的 HTTP 路徑（同舊 assistant 經 API 的路徑）帶／不帶原始推理、`watch_model_response` 各種回應（串流、已讀、壓縮、旗標關閉）、native 路徑（請求帶的 traceparent → 收單記住 → 背景回合 → SDK context 與模型 sender）、沒有 OpenTelemetry 的程序。
+- 測試（本機，真 SDK 1.0.13＋runtime 1.0.83＋離線模型替身＋本機假 ingestion 端點，沒有雲端呼叫）：`python -X utf8 -m pytest .\tests\shared_context\test_sdk_telemetry.py -q`，19 passed（10-04 當時的數字；之後另加 3 個 log export 測試，見下方 Hosted log 那一項）。涵蓋：預設（不設旗標）就打開、明確 `0`／沒有連線字串／讀不懂的值都不送且前兩者不記 warning；不設旗標又沒有連線字串時真 runtime 回合照常完成、不帶 header、不產生 span 檔；ingestion 連不上與 exporter 建不起來時真 runtime 回合照常完成、span 檔清掉；真 runtime 經正式 `DirectResponses` 送模型（每個請求帶回合 traceparent）、Responses 線路帶／不帶原始 `reasoning_text`、gateway 自己的 HTTP 路徑（同舊 assistant 經 API 的路徑）帶／不帶原始推理、`watch_model_response` 各種回應（串流、已讀、壓縮、旗標關閉）、native 路徑（請求帶的 traceparent → 收單記住 → 背景回合 → SDK context 與模型 sender）、沒有 OpenTelemetry 的程序。
 - sync／onboarding ENV：`python -X utf8 -m pytest .\tests\shared_context\test_endpoint_versions.py -q -k tracing`，5 passed（sync 與「＋」複製都不加旗標、明確 `0` 會保留、overlay 可設 `0`／`1`、其他值在寫入前拒絕）。
 - 唯讀查詢 `appi-fa-stage`（10-04）與一次使用者身分的極小 Responses 呼叫（見上）。未部署、未在 Hosted 實測。
+- [FA 自己的 Hosted log](#hosted-fa-logs)（以 main `1bb3da33` 為基準）：`sdk_telemetry.attach_log_export`／`export_logs`／`_exportable`、`behavior_assistant_main.main`；log 行來源 `behavior_timing.elapsed_timing`、`native_resident`、`m2_copilot`、`native_sdk`、`behavior_hosted`。本機套件 azure-monitor-opentelemetry-exporter 1.0.0b58、opentelemetry-sdk 1.45.0、opentelemetry-instrumentation-logging 0.66b0（經 agentserver-core → microsoft-opentelemetry 間接帶入，manifest 沒有直接固定；舊版沒有新 handler 時改用 SDK 內建的）。測試：`python -X utf8 -B -m pytest tests/shared_context/test_sdk_telemetry.py -q -k log_export`，3 passed（本機假 ingestion 端點：只收到 `FA_TIMING` 與 `RESIDENT_SDK_CONTINUED`、內容 canary 不出現、handler 只在五個 logger；exporter 建不起來時回 None、記 warning、不掛任何 handler；另一個乾淨子程序確認開與關時 stderr 的 FA 行相同）。部署後把映像實際解析到的這三個套件版本讀回記進驗收紀錄。未部署、未在 Hosted 實測。
 
 ## stage 環境與 CI/CD（ADR-0008）
 
@@ -10541,7 +10692,8 @@ Neal 決策：「工具列不出來時，這一回合少那個工具照常跑，
 - **仍拒絕整個回合**：toolbox 自己的明確 HTTP 4xx（401／403／404…，是平台對這個 Agent 或設定的答覆）、對請求或設定的明確
   JSON-RPC 答覆（`-32700`、`-32600`、`-32601`、`-32602`，以及不帶撤銷文字的 `-32007` INVALID_CONFIGURATION）、列到了但少 capture 的工具
   （`captured_tool_missing`）、`always` 沒 HITL、`approval_unknown`、`default_version_unread`、重複工具名、schema 無效、
-  沒有 project endpoint。skills 與 mcp-api provider 不在這次範圍，行為不變。
+  沒有 project endpoint。mcp-api grant 列不出工具時同樣只少那個 grant（2026-10-22 起，見下方
+  [mcp-api grant 列不出工具](#mcp-api-list-unavailable)）；skills provider 行為不變。
 - **Connect 卡只給真的能連的**：`_connection_needed` 對 `-32006` 只在有 consent 連結、且訊息帶逐來源 `errors` 時其中有
   `CONSENT_REQUIRED` 才當成要連線；其餘 `-32006` 是列不出工具。撤銷（`-32007`／`-32602`＋撤銷文字）不變。
 - **綁定（`toolbox_provider.bind`）**：列不出的 toolbox，其 capture 工具照樣綁上（`bind_capabilities` 要求工具集合等於 capture；
@@ -10600,6 +10752,73 @@ Neal 決策：「工具列不出來時，這一回合少那個工具照常跑，
   592 passed。另在約 10 次執行中，走真 executor＋responses 路由的既有案例偶發失敗兩次（`...completes_without_it...[synthetic]`、
   `...still_refuses_the_turn[refused-...]`），重跑即過；rebase 後同一檔在分支連跑 10 次、在 main `722cbf09` 連跑 6 次都全過，沒有重現，原因未查明。
   已知限制：同一版本有多個 grant 時，再列只發生在較晚的 grant；較早的 grant 已用舊清單綁好，所以再列失敗時只拿掉較晚的那個。
+
+<a id="mcp-api-list-unavailable"></a>
+#### mcp-api grant 列不出工具：同樣只少那個 grant（dev 2026-10-22，CODE/offline，未部署）
+
+**起因（dev，2026-10-22 04:38Z 讀 log）**：上游 WebIQ 拒收 key，API `capability_list_tools` 回 `Problem(503, CAPABILITY_NEEDS_AUTH)`；
+Hosted `NativeCapabilityClient._post` 把不在明確清單的 503 記成 `NATIVE_CAPABILITY_UNKNOWN`，`mcp_api_provider.bind` 沒有逐 grant 的退路，
+`bind_capabilities` 遇到第一個失敗就取消其他 provider，回合在模型開始前結束（receipt unknown、failure_code `NATIVE_CAPABILITY_UNKNOWN`）。
+
+- **API（`behavior_capability_calls.list_grant_tools`，只有 native 路由 `native_capability_api.capability_catalog` 傳 `degrade=True`）**：
+  逐 grant 列，只有 `list_tools` 本身回這兩種時算「列不出」：`CAPABILITY_NEEDS_AUTH`（金鑰缺少或上游 401／403）→`upstream_auth`、
+  `CAPABILITY_UNAVAILABLE`（`mcp_client._problem`：連線、逾時、上游其他錯誤）→`service_error`。那個 grant 記進
+  `CapabilityCatalogResult.unavailable`（`entry_id`、`reason`），其他 grant 照常列；API log
+  `FA_CAPABILITY_LIST_UNAVAILABLE entry=<entry_id> code=<code>`（不含上游原文或秘密）。
+- **仍拒絕整個回合**：路由自己的身分／Team／scope 拒絕（403 等，Hosted 記 `NATIVE_CAPABILITY_REFUSED`）、Hosted 到 API 本身沒回應或 5xx
+  （`NATIVE_CAPABILITY_UNKNOWN`，沒有逐 grant 的答覆）、catalog 已沒有這個 entry、整條路由的時間上限用完、列到了但少 allowlist 工具
+  （`CAPABILITY_TOOL_UNAVAILABLE`）、schema 無效（`CAPABILITY_SCHEMA_INVALID`）、`CAPABILITY_EXECUTION_DENIED`，以及 Hosted 端
+  entry／工具與 capture 不同。舊的 hosted 路由（`behavior_assistant_api` 的 `capability-catalog`）不降級，行為不變。
+- **Hosted（`native_capability_tools.mcp_api_provider.bind`）**：與 toolbox 相同：那個 grant 的 capture 工具照樣綁上，描述
+  `Unavailable this turn: <entry_id> could not list its tools. Calling it only reports that.`，呼叫只回 `NATIVE_TOOLBOX_UNAVAILABLE`
+  （同一段模型說明）、不送 API；HITL 開著時設成 `never`。組裝紀錄沿用 `unavailable_sources`（`source`＝`entry_id`、
+  `code="TOOLBOX_LIST_FAILED"`），Hosted log 同一行 `FA_NATIVE_TOOL_SOURCE_UNAVAILABLE`，工作台照現有規則在回覆下方講明。
+  沒有新的回條欄位或代碼值，所以已出版 #758 的 API／工作台讀得懂這種回條。
+- **不重試、不記住失敗**：有 grant 列不出的那份 catalog 不放進 Hosted 的 kept catalog（`CATALOG_SECONDS`），下一回合重新列；
+  工具呼叫（`/call`）的失敗處理不變。
+- **已知限制**：有兩個以上 mcp-api grant 時，前一個逾時會記 `service_error`，但它用掉了整條路由的時間上限，後面的 grant 會因上限用完而
+  拒絕整個回合。同一個上游同時是 toolbox 與 mcp-api 時（dev 的 WebIQ：toolbox `WebIQ`、mcp-api `WebIQ-MCP`；後者 2026-10-22 已移除），來源名稱不同，畫面會各有一行。
+- **混版注意**：`unavailable` 沒有內容時不輸出，列得出的 catalog 與舊版逐字相同。新 API＋舊 Hosted：降級那一次舊 Hosted 會拒收
+  （`extra=forbid`）而記 `NATIVE_CAPABILITY_UNKNOWN`，和現在一樣（只是 log 變成 `stage=response_decode … model_invalid`，不是
+  `response_status … 503`）；舊 API＋新 Hosted：API 仍回 503，和現在一樣。兩邊都出版才會降級。
+- **Verified against**：base origin/main `19803b94`＋分支 `neallee2012-mcp-api-degrade`。本機 Windows、同一 `TIKTOKEN_CACHE_DIR`：
+  `test_native_capability_tools.py`（新增：真 gateway 回 `CAPABILITY_NEEDS_AUTH` → read_skill 照常、WebIQ 工具只回代碼且沒有 `/call`、
+  組裝紀錄 `upstream_auth`、兩行 log、下一回合重新列；`CAPABILITY_EXECUTION_DENIED`／`CAPABILITY_TOOL_UNAVAILABLE`／
+  `CAPABILITY_SCHEMA_INVALID` 與路由 403 仍拒絕）、`test_capability_calls.py`（新增：兩個 entry 一個列不出時另一個照列、
+  `service_error`、完整清單沒有 `unavailable`、明確答覆與舊路由仍拒絕），連同 `test_native_capability_api.py`、
+  `test_native_bind_parallel.py`、`test_native_toolbox_unavailable.py`、`test_native_toolbox.py` 一起 111 passed。降級案在拿掉 API 端
+  `degrade=True` 或拿掉 Hosted 端分支時各自失敗；拒絕案是護欄，修改前也通過。未部署、未跑 dev、未用真 WebIQ 重現。
+
+<a id="native-capability-gate-reads"></a>
+#### native capability 路由的入口讀取：一次 snapshot（2026-10-22，CODE/offline，未部署）
+
+**起因（dev 2026-10-22 量測；量測來源是總協調轉來的延遲報告，原始查詢未存入 repo）**：`api_catalog` 每回合 667–1,014 ms、
+13 次 Table GET；Hosted `native_bind_mcp_api` 0.72–1.07 s 跟它重疊（推論：只看時間重疊，兩邊 job_id 當時沒有對上）。dev 的
+WebIQ 每回合都列不出，依上節那份 catalog 不保留，所以接續回合也每次呼叫 `/catalog`。
+
+**適用範圍**：依 review 說明（#944 撰寫時尚未合併，本 PR 未核對），#944 退場 WebIQ-MCP 之後，一般助理沒有 mcp-api grant，`mcp_api` 不會 bind，也不會呼叫
+`/catalog`（本 PR 未核對 #944）。所以本變更主要幫到仍持有 mcp-api grant 的助理，以及共用 `current_turn` 的 call、skill 與
+skill draft 路由。
+
+- **合併讀取（`NativeCapabilityGateway.current_turn`，catalog、call、skill 與 skill draft 路由共用）**：第一個設定 target 的
+  選定列（`selection_record`）和舊 Table 對話列（`_legacy`）原本各一次 guard／installation 包住的單列 snapshot，現在放進同一次
+  `read_snapshot`，再交給原本的檢查；檢查順序不變（target 不符仍先 403，再輪到舊對話 409），結果相同。註冊的 peer Agent
+  照舊讀取。離線：10 次 GET／10 輪 → 6 次 GET／5 輪。選定列存在時 `store.reconcile` 另讀 3 次（推論就是 dev 的 13），不變。
+- **`api_*` 的 job_id**：路徑沒有 `request_id` 的路由（`api_catalog`、`api_submit` 等）改用 `_body` 已驗證的 body
+  `request_id`，以同一個 `timing_id` 雜湊，可以跟 Hosted 的 `native_bind_*` 對上；路徑的 `binding_id`／`request_id` 仍優先。
+- 未部署、未在 dev 量測；省下的時間要部署後用同樣的 `api_catalog` 計時比對。
+
+##### Verified against（入口讀取）
+
+- 程式基準：`1c8bf3a8`（#943 合併）加本分支 `24055615`、`352d17fd`、`80e2986a` 與 review 修正 `9e0b72ce`。
+- 已讀程式：`native_capability_api.NativeCapabilityGateway._rows`／`current_turn`；`native_agent_api` 的 `_client` 與
+  `behavior_work_target.selection_record`；`behavior_native_turn_api.NativeTurnGateway._legacy`；
+  `behavior_timing.RouteTiming`；`behavior_api._body`（`behavior_request_id`）。
+- 實際驗證（本機離線，`InMemoryRepository` 代 Table）：第一輪在 16 個相關檔 313 passed、1 skipped，另 5 個檔 188 passed，
+  4 個核心檔 31 passed。review 修正後跑 `test_native_capability_catalog_reads.py`、`test_timing_table_counts.py`、
+  `test_native_capability_api.py`、`test_native_agent_api.py`：72 passed（含新增的 `_rows` 不讀取案）。
+- 證據與限制：29 個測試未跑（本機沒有 pinned runtime 1.0.83，fixture 階段即停）。`test_native_send_path` 的 `[abandoned]`
+  偶發失敗，未確認原因、也未在 base 重現，另案處理。未部署、未在 dev 或真 Azure Table 量測。
 
 ### 平行 toolbox 呼叫失敗與重試（CODE/offline，未部署）
 
@@ -10891,7 +11110,7 @@ catalog 不區分唯讀或寫入工具；可用哪些工具，由 catalog 的 `t
     - 瀏覽器啟動失敗時，error 會去掉 `<launching>` 後面那串很長的啟動參數；browser 自己的 `[pid=…]` 行（例如 `[err]` 與 `<process did exit …>`）另外放進 `browser_log` 欄位，最多 600 字元。沒有這些行時不會出現這個欄位。
     - 成功的呼叫不寫。這行只用於診斷：原本錯誤文字只存在 SDK archive 的工具結果中，API 讀不到。
   - typed route 發生非預期錯誤時，先寫一行 `ASSISTANT_DEPENDENCY_FAILED`，只記錄 action 與例外類別，再回 503。
-- **secret**：`${secret:NAME}` 由 API 從環境變數 `FA_CAPABILITY_SECRET_<NAME>` 讀取；NAME 轉大寫，`-` 改成 `_`，例如 `webiq-api-key` 對應 `FA_CAPABILITY_SECRET_WEBIQ_API_KEY`。
+- **secret**：`${secret:NAME}` 由 API 從環境變數 `FA_CAPABILITY_SECRET_<NAME>` 讀取；NAME 轉大寫，`-` 改成 `_`，例如 `webiq-api-key` 對應 `FA_CAPABILITY_SECRET_WEBIQ_API_KEY`（2026-10-22 起出貨的 catalog 沒有用 secret 的 entry，這個例子已退場）。
   值由部署線從 Container App secret 對應進來，不進 Hosted、prompt、結果或 log。
 - **Gateway 放行（H10）**：API 依原回合捕獲的 grants 帶入 `capability_tools`／`allow_images`，不看 request。
   只有 grant 需要看圖時，model request body 上限才放寬為 6 MiB＋64 KiB。
@@ -10924,7 +11143,8 @@ catalog 不區分唯讀或寫入工具；可用哪些工具，由 catalog 的 `t
     - 工具只開放 `browser_navigate`、`browser_snapshot`、`browser_click`、`browser_type`、`browser_fill_form`、`browser_select_option`、`browser_wait_for`、`browser_navigate_back`。
     - **不含** `browser_file_upload`；也不列入執行任意程式碼、安裝、PDF 與截圖的工具。
     - 不開 `--allow-unrestricted-file-access`，所以 Playwright MCP 預設阻擋 `file://`，並把檔案存取限制在 workspace root。
-  - `webiq.json`：http entry，`https://api.microsoft.ai/v3/mcp`，header `x-apikey: ${secret:webiq-api-key}`，工具為 `web`、`browse`。
+  - `webiq.json`（**2026-10-22 已移除，不再隨 image 出貨**）：當時是 http entry，`https://api.microsoft.ai/v3/mcp`，
+    header `x-apikey: ${secret:webiq-api-key}`，工具為 `web`、`browse`。現在 WebIQ 只走 toolbox（`webiq-toolbox.json`），見 [WebIQ 只剩 toolbox](#webiq-toolbox-only)。
 - **Hosted image**：沿用 `Dockerfile.behavior-assistant-desktop`，桌面（CAP-05）與瀏覽器（CAP-03）共用同一個 image。
   - 版本都已發佈 7 天以上：`@playwright/mcp@0.0.82`（`tools/playwright-mcp/package-lock.json`，3 個套件，各有 sha512），以及 Node 22.23.2。
   - Build 時以 `npm ci --ignore-scripts` 安裝，並安裝這版 Playwright 配對的 Chromium（revision 1246，也就是 catalog 的 `--browser chromium` 所對應的 `chrome-for-testing` channel）到 `/opt/fa-tools/ms-playwright`，系統函式庫由 `install-deps` 補齊。**執行時不下載任何東西**。
@@ -15151,7 +15371,7 @@ ADR-0007 的原生回合沒有 job 或 assignment ticket，所以舊的 `read-sk
   - 沒有新增 Toolbox 雲端設定，也沒有重做 broker。
 - **VM 端**：`native_capability_tools.py` 提供兩個 C0 provider，已登記在 `native_sdk.native_capability_providers`。
   - `approved_skills_provider()`：只接受 `fa-skills-v1` grant，`approved_skills=True`。有選 skill 時，先向 API 讀本回合的 catalog，核對它和 capture 的 `template.skills` 一致，不一致就 409 `SKILL_SOURCE_CHANGED`，不綁工具（2026-10-06 RTT A 起，同一組精確版本的目錄在 Hosted 程序內沿用，見 [bind 工具清單快取](#bind-tool-list-cache)）。沒有選 skill 時，不呼叫 API，綁一個 catalog 為空的 `read_skill`，和舊 job 路徑相同；任何名稱都在本機拒絕。
-  - `mcp_api_provider()`：只接受 `kind == "mcp-api"` 的 grant，工具名稱和 schema 必須和 API catalog 及 `grant.tools` 完全相同。同一組 capture grant 的 catalog 在 Hosted 程序內保留 5 分鐘，見 [bind 工具清單快取](#bind-tool-list-cache)。
+  - `mcp_api_provider()`：只接受 `kind == "mcp-api"` 的 grant，工具名稱和 schema 必須和 API catalog 及 `grant.tools` 完全相同。同一組 capture grant 的 catalog 在 Hosted 程序內保留 5 分鐘，見 [bind 工具清單快取](#bind-tool-list-cache)。2026-10-22 起，API 回報某個 grant 列不出時只少那個 grant、那份 catalog 不保留，見 [mcp-api grant 列不出工具](#mcp-api-list-unavailable)。
   - 兩者都用 C0 交來的 `api_url` 和 `api_token_provider`（VM 自己的 Agent token），沒有 token 就 503，不建工具。結果 schema 交給 C0 的 `result_schemas`。
   - 每次工具呼叫都經 C0 的共用 guard：本回合仍有效、`session_id` 是原 SDK session、有 `tool_call_id`。API 明確拒絕時回 `NATIVE_CAPABILITY_REFUSED`；5xx 或連線中斷時回 `NATIVE_CAPABILITY_UNKNOWN`，不當成成功，也不重送。
   - native preflight 因此放行 `fa-skills-v1`、mcp-api 和非空的 `template.skills`；其他沒有 provider 的 grant 仍明拒。
@@ -15175,7 +15395,21 @@ ADR-0007 的原生回合沒有 job 或 assignment ticket，所以舊的 `read-sk
 
 ### N5：組織 connector 改走 Foundry toolbox（LOCAL，預設關閉）
 
-依 ADR-0007 §6／§7 N5，組織共用的 connector 改由官方 [toolbox](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/toolbox) 提供。key 只存在 project connection，VM 和 API 都拿不到（[tool-authentication](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/tool-authentication)：「The agent never sees the secret」）。舊對話仍沿用 API broker（`mcp-api`），等全部結束後才另外申請移除。
+依 ADR-0007 §6／§7 N5，組織共用的 connector 改由官方 [toolbox](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/toolbox) 提供。key 只存在 project connection，VM 和 API 都拿不到（[tool-authentication](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/tool-authentication)：「The agent never sees the secret」）。
+
+<a id="webiq-toolbox-only"></a>
+**2026-10-22 起 WebIQ 只剩這條路**（Neal 選「只留 toolbox」；原寫「舊對話仍沿用 API broker（`mcp-api`），等全部結束後才另外申請移除」）：
+舊的 `WebIQ-MCP`（`tool_catalog/webiq.json`，API 從 Container App secret `webiq-api-key` 讀 key）已從 catalog 拿掉，dev profile 也不再把
+`FA_CAPABILITY_SECRET_WEBIQ_API_KEY` 掛給 API。通用的 `mcp-api` broker 留著給之後的其他 entry。
+- 還選著 `WebIQ-MCP` 的新對話設定或舊對話：capture 是「原選擇 ∩ 目前 head ∩ 目前 catalog」，所以下一回合起不帶這組工具，回合照常跑，
+  不用遷移。設定頁那一列顯示「目前環境未提供，只能關閉。」；沒關掉就儲存其他改動，API 回 409 `CAPABILITY_SOURCES_CHANGED`
+  （畫面：「選定的能力已不在目前的組織清單」）。要繼續用 WebIQ，在設定頁打開 `WebIQ`（工具 `WebIQ-web`／`WebIQ-browse`）。
+- 唯一的例外：新 API 換上之前就已建立 capture、換上之後才列工具的那一回合，`/catalog` 找不到 entry，回 503 `CAPABILITY_UNAVAILABLE`，
+  整個回合在模型開始前停下（#943 的降級只涵蓋列不出工具，不涵蓋 entry 已不在 catalog）。在沒有回合排隊時部署就不會遇到。
+- 測項：`tests/shared_context/test_capability_capture.py::test_a_saved_webiq_mcp_selection_runs_without_it_once_the_committed_catalog_drops_it`
+  （用 commit 進來的 catalog）；`test_capability_catalog_files.py` 檢查出貨 catalog 只有 `WebIQ`、`playwright`，而且沒有任何 secret 參考。
+  其他 mcp-api 測項改用虛構的 `WebSearch-MCP` 夾具。
+- 換 key 的指令（每個環境一條 connection、一個指令）見 [deploy/README.md 第 16 關](../../deploy/README.md#webiq-key-rotation)。
 
 - **catalog**：`tool_catalog/webiq-toolbox.json` 是 `type: "toolbox"`，`toolbox` 指 project 的 toolbox 名稱，`server_label` 指其中的 MCP 工具；檔案裡沒有任何秘密。
   - 解析成 `execution="foundry-toolbox"`，grant 的 kind 是 `mcp-toolbox`，並在 capture 中帶 `toolbox`。
@@ -15193,7 +15427,7 @@ ADR-0007 的原生回合沒有 job 或 assignment ticket，所以舊的 `read-sk
     - HITL 沒開時 `always` 的工具照舊在綁定時拒用（log `reason=approval_required`）；值不是 `always`／`never` 也拒用（`reason=approval_unknown`）。官方原文：「Use `require_approval: never` unless your runtime can pause the pending tool call, collect the user's decision, and resume or reject that exact call.」
     - 沒釘版本的 toolbox 若這一回合讀不到 `default_version`，fail-closed：HITL 開著時該 toolbox 的工具一律當 `always`；HITL 沒開時這一回合在綁定工具時就被拒絕（`CAPABILITY_UNAVAILABLE`，`reason=default_version_unread`；和 HITL 沒開時遇到 `always` 一樣，是整個回合拒絕，不是只拿掉這些工具）。細節見 [bind 工具清單快取](#bind-tool-list-cache)。
     - 接點仍是固定版 Copilot SDK 1.0.13 的 permission callback（`NativeHitlRuntime.permission`／`invoke`）；官方 Copilot SDK 段落說 toolbox 由應用程式自建 bridge，SDK 沒有內建批准。官方的 `mcp_approval_request`／`mcp_approval_response` 是 prompt agent 由 Foundry 執行 MCP 時的流程，不適用 Hosted。
-    - 照舊用 Team 規則（Auto Review）的工具：shell（`run_command`）、桌面（`desktop_act` 等）、交辦 `task`、`send_agent_message`、經 API 轉送的 `mcp-api`（例如 WebIQ-MCP）、SDK 直連的 MCP（Playwright）。
+    - 照舊用 Team 規則（Auto Review）的工具：shell（`run_command`）、桌面（`desktop_act` 等）、交辦 `task`、`send_agent_message`、經 API 轉送的 `mcp-api`（原本的例子 WebIQ-MCP 已於 2026-10-22 移除，見 [WebIQ 只剩 toolbox](#webiq-toolbox-only)）、SDK 直連的 MCP（Playwright）。
   - 2026-10-06 起，每個 toolbox 版本的 `tools/list` 結果與 MCP session 在 Hosted 程序內沿用；沒釘版本時 bind 每回合只讀一次目前的 `default_version`，見 [bind 工具清單快取](#bind-tool-list-cache)。
   - 同一個（SDK session、RID、`tool_call_id`）在 VM 程序內最多執行一次。重複呼叫時回原結果；內容不同就拒絕。被拒或結果不明的呼叫不會重送（session 404 的例外見 [bind 工具清單快取](#bind-tool-list-cache)）。
   - HTTP 4xx 或 JSON-RPC 參數／協定錯誤回 `NATIVE_CAPABILITY_REFUSED`；5xx、逾時、斷線或回應無效回 `NATIVE_CAPABILITY_UNKNOWN`。工具回 `isError` 時，當作資料交給模型。
@@ -15219,6 +15453,10 @@ ADR-0007 的原生回合沒有 job 或 assignment ticket，所以舊的 `read-sk
 
 #### Verified against（N5）
 
+- 2026-10-22 WebIQ 只剩 toolbox：程式基準 origin/main `1c8bf3a8`＋分支 `neallee2012-webiq-toolbox-only`；已讀
+  `behavior_capabilities.capture`／`check_selectable`、`behavior_native_capture._resolve_capture`、
+  `behavior_capability_calls._entry`／`list_grant_tools`、`web_test_console/index.html` 設定頁的能力列與草稿；本機離線測項見上方
+  「WebIQ 只剩這條路」。需要固定 runtime 1.0.83（`M2_TEST_RUNTIME`）的 native 測項本機沒有 runtime，未執行。
 - `tests/shared_context/test_native_toolbox.py`（offline MockTransport 模擬 toolbox）：
   - catalog 解析與拒絕：秘密、名稱不合規、grant 形狀。
   - `FA_CAPABILITY_TOOLBOX_ENTRIES` 沒設時不載入；名稱未知或重複時拒絕。

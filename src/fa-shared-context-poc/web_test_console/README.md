@@ -165,7 +165,8 @@ Neal 2026-10-10：「工具列不出來時，這一回合少那個工具照常�
   「這次沒用到 {來源}：工具清單讀不到（{原因}），其他功能照常。」原因對照：`upstream_auth` 上游驗證失敗、`source_error`
   工具來源回報錯誤、`service_error` 工具服務暫時無法使用、`network` 連線逾時或中斷、`response_invalid` 回應無法讀取、
   `identity_unavailable` 助理身分暫時取不到，其他值顯示「原因不明」。主行不放代碼；`TOOLBOX_LIST_FAILED` 與原因分類照舊
-  在「詳細 → 支援明細」的 `native_receipt` 裡。回覆本身不改、不送任何請求。
+  在「詳細 → 支援明細」的 `native_receipt` 裡。回覆本身不改、不送任何請求。2026-10-22 起來源也可能是 mcp-api grant
+  的名稱（例如 `WebIQ-MCP`，原因只會是 `upstream_auth` 或 `service_error`），畫面與程式不用改。
 
 ### Verified against（回覆下方講明沒用到的工具）
 
@@ -695,6 +696,12 @@ API 線（#688，已合併為 `3260086c`）讓讀取路徑有限重試；GET 讀
 **bridge**：只對 GET 把 API 的 `error.automatic_retry: true` 原樣轉給頁面（`adapter.py` `PullAdapter.send`、`bridge.py` 錯誤處理）；頁面發的 POST 一律 `automatic_retry: false`（即使 bridge 在寫入前先讀了一次）。
 
 **和 API #688 同一次發布**：#688 之前的 API 對 stage v15 那種 503 `NATIVE_BOOTSTRAP_UNKNOWN` 回 `automatic_retry: false`，這時輪詢仍會停下，只有 Web PubSub 提示會再讀一次。寫入規則不變：UNKNOWN 只核對原件、不重送。
+
+**r33 dev（H15，2026-10-22 核對）**：讀進度時 API 對 Hosted 的讀取 30 秒逾時，回 503 `FOUNDRY_INVOCATION_UNKNOWN`，下一次讀取就是 200。
+這個碼在讀取路由也帶 `automatic_retry: true`（`behavior_native_turn_api.py` 的 `reply(read=True)`：它在 transport_errors 裡，讀取的 5xx 除
+`NATIVE_TURNS_DISABLED` 與已結束的 session 外都標可重讀；「不要重送」那句只對寫入），所以照上面的規則退避再讀、只顯示那一行，不算回合失敗、
+不重送。只有進度那一段讀不到時，bridge 的 `/status` 改讀回條、回 200 並把錯誤記在 `progress_error`，頁面照每秒的節奏讀、不顯示錯誤。
+DOM 與 bridge 測試各加這個碼一案，另加 200＋`progress_error` 一案。
 
 ### Verified against（讀取重試）
 
@@ -2190,6 +2197,19 @@ template export／`new_conversation_template` 及原 `select_profile`；fresh si
   只有結果未知才不能換 ID），只送那段文字、不帶附件；輸入框或附件已有其他草稿時不送，改留「帶回輸入框」給真人按，
   不覆蓋已輸入的其他草稿；重新整理後不再自動送。其他原因（例如按「停止」後的 `cancelled`）不自動送，只留「帶回輸入框」。
   unknown只有查讀。
+- 已自動改送的追加（#871 G9），本頁在送出新 RID 前把「追加 ID → 新 RID」記在這個瀏覽器的 `localStorage`
+  （`fa-resent-appends`，只留最近 100 筆，寫入前先併入其他分頁記下的連結，讀寫失敗就略過）。重新整理後只要 bridge
+  列出那個 RID 已送出、且內容就是這則追加的原文，就顯示「沒趕上這一回合，已改用新訊息送出。」、不再出現「帶回輸入框」；
+  同一頁裡新 RID 的 `/submit` 已發出後也用這句；在那之前（排隊等送、或 `/next` 還在取新 RID）顯示
+  「沒趕上這一回合，會改成新訊息送出。」，`/next` 失敗就回到「帶回輸入框」；兩句都不代表已送達。
+  這只是顯示，不是工作狀態，不送伺服器，也不會因此自動送任何東西。
+- 回合已結束、但還有 accepted／sending 的追加時（#916 H9），進度更新讀它的結果期間「送出」先停用，說明
+  「正在確認剛才追加的文字有沒有送達，確認後就能送出。」，免得新訊息排到這則追加前面。回合還在跑時的例行讀取不停用。
+  只在這次讀取進行中；讀取失敗、逾時（45 秒，同進度讀取）或讀回仍是 accepted 都會放開，不把輸入框卡住；
+  輸入框照常可打字（已有文字時追加改留「帶回輸入框」）。逾時、連不上、沒有錯誤內容或可重試的讀取失敗，和進度讀取一樣顯示
+  「暫時讀不到進度，正在重試。訊息不會重送。」，並照進度讀取的退避（2→4→…→30 秒）只用 GET 再讀這個回合的追加，
+  每個回合同時只排一次；讀到成功（追加或進度）就消失、不再排。追加已不是 accepted／sending、已有進度讀取要跑、
+  或切換對話／Agent 時不再讀。帶其他錯誤碼的失敗照該錯誤碼顯示，不自動再讀。
 - 已POST的原文與未送草稿分開記住：同版原文在結果未核清前，不因回合完成或重新登入
   變成另一筆追加／普通交辦。POST ACK與GET已核回條共用清稿條件，只清未另編輯的原文，
   不清下一筆草稿（包含重新輸入的相同文字）；後端仍回unknown時不清稿、不換ID重送。

@@ -175,7 +175,7 @@ def test_at_w_a_hosted_task_recovery_refusal_is_answered_server_following_too(mo
     assert len(attempts) == 2 + wait / resend and sum(slept) == wait
 
 
-def test_only_the_first_attempt_prefetches_the_conversation(file_api, monkeypatch):
+def test_only_the_first_attempt_prefetches_the_capture(file_api, monkeypatch):
     fixture = ready(file_api, monkeypatch)
     crashed_fence(fixture, monkeypatch)
     enforcing(fixture, monkeypatch)

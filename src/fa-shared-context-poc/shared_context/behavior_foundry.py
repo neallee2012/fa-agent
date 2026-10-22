@@ -501,6 +501,14 @@ class FoundryHttpClient:
                             raise Problem(502, "FOUNDRY_RESPONSE_INVALID", "native control response exceeds its bound")
                         raw.extend(chunk)
                 self._session_requests[target] = sent_at
+                if native_turn and native_stage is not None:
+                    # Each answered follow/files-omission stage, so a fence's order can be rebuilt from the log;
+                    # a failed stage is in NATIVE_INVOCATION_FAILURE below.
+                    logging.getLogger(__name__).info("NATIVE_STAGE %s", json.dumps({
+                        "native_operation": native_operation, "native_stage": native_stage,
+                        "status": response.status_code, "elapsed_ms": round((monotonic() - sent_at) * 1000),
+                        "agent_id": target.agent_id, "agent_name": target.agent_name,
+                        "session_id": target.session_id}, sort_keys=True))
                 phase = "response_close"
                 return NativeResponse(response.status_code, actual_id, actual_session, bytes(raw))
         except (Problem, httpx.HTTPError) as error:

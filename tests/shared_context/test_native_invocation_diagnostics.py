@@ -137,6 +137,31 @@ def test_successful_native_transport_does_not_emit_failure_or_private_material(c
     assert not any("NATIVE_INVOCATION_FAILURE" in record.getMessage() for record in caplog.records)
 
 
+def test_each_answered_fence_stage_is_logged_in_order_and_other_commands_are_not(caplog):
+    """F12: follow and files-omission stages log one NATIVE_STAGE line each, so the fence order can be rebuilt."""
+    from shared_context.behavior_native_turn_wire import NativeSessionFilesOmission, NativeSessionFollow
+    caplog.set_level("INFO", logger="shared_context.behavior_foundry")
+    follow = NativeSessionFollow(request_id="original-follow", expected_session_id="original-source",
+                                 expected_etag="original-etag", stage="prepare")
+    commands = [follow, NativeSessionFilesOmission(request_id="original-confirmation", stage="check",
+                                                   missing="source", follow=follow),
+                NativeRead(request_id="original")]
+    client = FoundryHttpClient(TARGET, Credential(), transport=httpx.MockTransport(lambda _request: httpx.Response(
+        200, json={"private": "answer body"}, headers={
+            "x-agent-session-id": TARGET.session_id, "x-agent-invocation-id": "platform-generated"})))
+    try:
+        for command in commands:
+            client.invoke_native(command)
+    finally:
+        client.close()
+    events = [json.loads(record.getMessage().removeprefix("NATIVE_STAGE ")) for record in caplog.records
+              if record.getMessage().startswith("NATIVE_STAGE ")]
+    assert [(event["native_operation"], event["native_stage"], event["status"]) for event in events] == [
+        ("session_follow", "prepare", 200), ("session_files_omission", "check", 200)]
+    assert all(event["session_id"] == TARGET.session_id for event in events)
+    assert "private" not in json.dumps(events)
+
+
 @pytest.mark.parametrize("code,logged", [
     ("NATIVE_SESSION_CHANGED", "NATIVE_SESSION_CHANGED"),
     ("AgentSessionVersionMismatch", "AgentSessionVersionMismatch"),

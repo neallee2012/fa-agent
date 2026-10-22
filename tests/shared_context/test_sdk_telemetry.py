@@ -7,9 +7,12 @@ import asyncio
 import gzip
 import json
 import logging
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -483,3 +486,84 @@ def test_native_turn_carries_the_admitting_trace_to_the_sdk_and_its_model_sender
     assert accepted.status_code == 202, accepted.text
     responses.wait(request.command.request_id, "completed")
     assert seen == [(admitting, admitting)]
+
+
+LOG_CANARY = "USER_CONTENT_CANARY"
+
+
+def test_hosted_log_export_sends_only_timing_and_resident_lines_of_the_listed_loggers(telemetry):
+    from shared_context.behavior_timing import elapsed_timing
+
+    loggers = [logging.getLogger(name) for name in sdk_telemetry.LOG_LOGGERS]
+    saved = [(logger, list(logger.handlers), logger.level) for logger in loggers]
+    provider = sdk_telemetry.attach_log_export()
+    try:
+        assert provider is not None
+        attached = {name for name, logger in [("", logging.getLogger()), *logging.root.manager.loggerDict.items()]
+                    if isinstance(logger, logging.Logger)
+                    and any(sdk_telemetry._exportable in handler.filters for handler in logger.handlers)}
+        assert attached == set(sdk_telemetry.LOG_LOGGERS)
+
+        elapsed_timing("sdk_process_start", time.perf_counter(), job_id="0123456789ab")
+        logging.getLogger("shared_context.native_resident").info("RESIDENT_SDK_CONTINUED released=%s", "abcdef012345")
+        sdk = logging.getLogger("shared_context.m2_copilot")
+        sdk.warning("FA_MCP_SERVER_STATUS %s", LOG_CANARY)  # same logger, a line that may carry runtime text
+        sdk.warning("%s", "RESIDENT_SDK_STOPPED " + LOG_CANARY)  # an argument cannot pass the prefix check
+        sdk.warning("RESIDENT_SDK_STOPPED reason=%s", "cancelled", exc_info=ValueError(LOG_CANARY))
+        logging.getLogger("shared_context.native_turns").warning("FA_TIMING %s", LOG_CANARY)  # not a listed logger
+        assert provider.force_flush(10000)
+    finally:
+        provider and provider.shutdown()
+        for logger, handlers, level in saved:
+            logger.handlers[:] = handlers
+            logger.setLevel(level)
+
+    logs = [item for item in telemetry.items if item["data"]["baseType"] == "MessageData"]
+    messages = [item["data"]["baseData"]["message"] for item in logs]
+    assert len(messages) == 2, messages
+    timing = json.loads(messages[0].removeprefix("FA_TIMING "))
+    assert (timing["phase"], timing["job_id"], timing["outcome"]) == ("sdk_process_start", "0123456789ab", "returned")
+    assert messages[1] == "RESIDENT_SDK_CONTINUED released=abcdef012345"
+    assert {item["tags"]["ai.cloud.role"] for item in logs} == {"fa-test-agent"}
+    assert LOG_CANARY not in json.dumps(telemetry.items)
+
+
+def test_hosted_log_export_that_cannot_be_built_attaches_nothing(telemetry, monkeypatch, caplog):
+    import azure.monitor.opentelemetry.exporter as exporter
+
+    def broken(**_options):
+        raise RuntimeError("synthetic exporter construction failure")
+    monkeypatch.setattr(exporter, "AzureMonitorLogExporter", broken)
+    loggers = [logging.getLogger(name) for name in sdk_telemetry.LOG_LOGGERS]
+    before = [(list(logger.handlers), logger.level) for logger in loggers]
+    with caplog.at_level(logging.WARNING):
+        assert sdk_telemetry.attach_log_export() is None
+    assert "FA_SDK_TELEMETRY_INACTIVE reason=log_exporter_unavailable exception_type=RuntimeError" in caplog.text
+    assert [(list(logger.handlers), logger.level) for logger in loggers] == before
+
+
+def test_hosted_log_export_keeps_hosted_stderr_and_respects_the_flag(telemetry, monkeypatch):
+    # A fresh process: the Hosted entry's root logger has no handlers (pytest adds its own to this one).
+    script = (
+        "import logging, sys\n"
+        "from shared_context import sdk_telemetry\n"
+        "from shared_context.behavior_timing import elapsed_timing\n"
+        "attached = sdk_telemetry.attach_log_export() if sdk_telemetry.enabled() else None\n"
+        "print('attached' if attached else 'off')\n"
+        "elapsed_timing('sdk_process_start', 0.0)\n"
+        "logging.getLogger('shared_context.native_resident').info('RESIDENT_SDK_CONTINUED released=abc')\n"
+        "logging.getLogger('shared_context.native_resident').warning('RESIDENT_SDK_DISCARDED reason=exited')\n"
+    )
+    source = Path(sdk_telemetry.__file__).resolve().parents[1]
+    outputs = {}
+    for flag in ("1", "0"):
+        monkeypatch.setenv(sdk_telemetry.FLAG, flag)
+        result = subprocess.run([sys.executable, "-X", "utf8", "-c", script], cwd=source, capture_output=True,
+                                encoding="utf-8", timeout=60)
+        assert result.returncode == 0, result.stderr
+        fa_lines = [line for line in result.stderr.splitlines() if line.startswith(("FA_TIMING", "RESIDENT_SDK_"))]
+        outputs[flag] = (result.stdout.strip(), [line.split(" ", 1)[0] for line in fa_lines])
+    # Same stderr lines with and without export: WARNING lines print, INFO lines do not, as before.
+    assert outputs == {"1": ("attached", ["FA_TIMING", "RESIDENT_SDK_DISCARDED"]),
+                       "0": ("off", ["FA_TIMING", "RESIDENT_SDK_DISCARDED"])}
+    assert any(item["data"]["baseType"] == "MessageData" for item in telemetry.items)  # shutdown flushed at exit

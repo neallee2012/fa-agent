@@ -1,8 +1,79 @@
 # FA 進度與交接狀態
 
-更新日期：2026-10-21。
+更新日期：2026-10-22。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="dev-test-v35-1022"></a>
+## 2026-10-22：第 35 版候選 dev 測試（main `42173ca7`，總協調）
+
+- **範圍與授權**：只動 dev，stage 沒動。dev 部署 4 次（3501～3504，`19803b94`→`1c8bf3a8`→`48c061dd`→`42173ca7`），最後一次就是 release 基準，main 上沒有未在 dev 測過的 commit。dev 部署依 Neal 10-17 的常設批准；WebIQ 整併三步與探針清理依 Neal 10-22 批准。工作台 8765 只按「連線」，bridge 留在 `a392919a`、沒重啟。證據是總協調的本機報告，原始資料不在 repo，ID 只寫前綴。
+- **部署**：4 次都成功，閘門 armed、pass、0 拒絕。3504：API `…42173ca-r3504-1` 唯一 revision、Healthy、100%；GUARD="1"、RECONCILER="0"、IDLE 未設；API 沒有 WebIQ ENV，app secret 只剩 feed 簽章金鑰。Agent a=167、b=127、c=88、d=88，四個的 core 都是 `af14a040…`，與 release 分支 `ci_deploy.py meta` 相同。
+- **結論**：通過。#942 的「提醒與 bind 並行」與 #941 工作台沒在 dev 驗到（見下）。
+
+| 項目 | 結果 | 說明 |
+|---|---|---|
+| 1 部署＋閘門 | PASS | 4 次都 pass、0 拒絕 |
+| 2 #943 降級 | PASS（有條件） | WebIQ 列不出工具時回合照常完成並註明；log 對到 6 個回合（口述 8 則） |
+| 3 #944 WebIQ 整併＋換 key | PASS（口述） | dev 換選擇、拿掉 ENV、刪 secret；換 key 後搜尋回合約 6 秒，log 對到 1 次 WebIQ 工具呼叫成功（結果正確是口述） |
+| 4 #940 遙測 | PASS | 部署前 `FA_TIMING` 0 筆，之後每輪都讀得到 |
+| 5 #942 | 部分 | 快取沒有單獨量測；dev 的 A 沒開排程，提醒並行沒跑到 |
+| 6 #945 | PASS | `native_bind_mcp_api` 與 `api_catalog` 不再出現；route 層 `api_*` 帶 `job_id` |
+| 7 #949 | PASS（n=3） | 送出時同一個 SID 的請求一個接一個，平台不再扣住 |
+| 8 #948 | 只有測試 | 不進 image |
+
+- **延遲（唯讀，`fa-context-a`，小樣本）**：第 2 輪（3503）→ 第 3 輪（3504，#949）：warm 的 session＋conversation 2,195～2,269 → 781～883 ms；API 同步 3,360～3,460 → 1,671～1,845；API 開始→first preview p50 7,950 → 6,266；送出窗口的 `platform_preprocessing_ms` 最大 162 ms（第 2 輪被扣約 2 秒）。照順序讀比早上同時讀約慢 0.2～0.35 秒（推論：拿掉預讀的代價）。根因：送出時對同一個 SID 同時發 session 與對話兩個讀取，平台在 VM 恢復後把其中一個扣住約 2 秒。
+- **觀察**：
+  1. 換版後第一次 toolbox listing 約 18～20 秒（4 個樣本，含同 SID 原地換版 v166→v167），是剩下最大的單點；memory recall 仍擋在模型前 0.3～0.9 秒。
+  2. 換版當下一筆 409 `NATIVE_SESSION_CHANGED`，之後原 SID 漂移到新版（推論：換版偵測的預期路徑）。
+  3. Teams connector toolbox 的 `tools/list` 一次 500，4 秒後重試成功；單一事件。
+  4. 只拿掉 ENV 的 revision 卡在 Activating 超過 3 分鐘，依規則停止，原因沒查；下一次部署正常。
+  5. dev A、B 的閒置逾時是 3540／3520，C、D 與 `dev.json` 是 900，是否原本就如此未查。
+- **dev 沒有驗證到的**：Teams；IDLE 旗標；#942 提醒並行（stage 的 A／B 才第一次跑）與快取收益；#941（bridge 沒重啟）；#945 的 Table GET 次數；#939 的 G7b／B3；#936 的 `y/N`；3503 的 b／c／d 版本號。
+- **探針清理**：dev 刪了 Work IQ 探針的 toolbox、兩個 connection、一個 Entra credential，Key Vault 只 soft-delete（預定 10-29 purge）。stage 沒動。
+- **費用**：3501、3502 前後 USD729.86（有延遲）；3503 之後未讀。
+- **Neal**：決定是否合併第 35 版（合併＝部署，避開排隊中的回合與每天約 10:00Z 的排程）。
+
+<a id="webiq-toolbox-only-1022"></a>
+## 2026-10-22：WebIQ 只留官方 toolbox（Neal 決定；CODE/offline，未部署）
+
+- **決策**：Neal 在金鑰盤點後選「只留 toolbox（建議）」，與 #412、README N5 原計畫一致。分支 `neallee2012-webiq-toolbox-only`（base `1c8bf3a8`）：
+  拿掉 `tool_catalog/webiq.json`（`WebIQ-MCP`）、`dev.json` 不再把 `FA_CAPABILITY_SECRET_WEBIQ_API_KEY` 掛給 API、`dev.json` 設
+  `webiq_connection: webiq-key`；`new_webiq_connection.py` 第一次建立前先讀 toolbox，已用另一條連線就停下。
+- **影響**：還選著 `WebIQ-MCP` 的模板與對話下一回合起不帶它（[README](../src/fa-shared-context-poc/README.md#webiq-toolbox-only)）。
+  雲端步驟（換選擇、拿掉 ENV、刪 secret `webiq-api-key`）另由總協調處理，每步要批准：[dev 一次性步驟](../deploy/README.md#dev-webiq-env-removal)、
+  [換 key 指令](../deploy/README.md#webiq-key-rotation)。
+
+<a id="azd-e2e-public-1021"></a>
+## 2026-10-21～22：從公開 repo 全新跑 azd 端到端（第 34 版 `v2026.10.21-34`，westus3）
+
+- **範圍**：公開 repo fa-agent 的 tag `v2026.10.21-34`，全新 clone；區域 westus3；模型 gpt-5.4-mini＋text-embedding-3-small（westus3 的 gpt-6 quota 是 0）。azd 1.32.0，Windows＋pwsh，另設一個 `AZURE_CONFIG_DIR`。
+- **Git Bash 路徑（README 註記的來源）**：2026-10-21：在 Git Bash 裡用 `$HOME` 組出 `AZURE_CONFIG_DIR`，結果多出一個 `C:\c\Users\<user>\.azure-fa` 資料夾（只在總協調的電腦上觀察到一次，原因沒有再查，不保證每台都會發生）。README 因此建議用 PowerShell，或改用 `C:/Users/<你>/.azure-fa` 這種 Windows 形式的路徑。
+- **流程**：
+  - `prereq` 全部 ok；開頭的 Team 主人確認輸入 `y`。
+  - provision 約 10 分鐘，其中 Container Apps 環境 3 分 11 秒。api、hosted、console 三個映像建好；Memory Store 建立；4 個 Hosted Agent（a～d）v1 建立。
+  - 第一個 fresh-install plan Job 成功；等它的 log 出現在新的 Log Analytics workspace 花了 8 分鐘。批准後的 apply 與 reconcile 兩個 Job 又各等約 6 分鐘，首次安裝等 log 合計約 20 分鐘。
+  - 停在 plan hash 批准提示時，hook 以 `EOFError` 結束：提示還在等時 azd 已經結束（原因未確認，最可能是在終端機按了 Ctrl+C）。沒有寫入任何東西。在新的終端機重設 `AZURE_CONFIG_DIR` 後執行 `azd hooks run postdeploy` 接續：沿用已存的 plan（hash 相同），主人批准，部署完成。
+  - 首次安裝時印出一行原始的 `ERROR: Not Found ... ca-api-<env>`（無害）。
+- **前 10 分鐘驗收：PASS**。助理 A 用 shell 執行 `date`，6 秒回覆、1 次工具呼叫；native_receipt `completed`、`failure_code` null，Hosted agent version 2，gpt-5.4-mini。支援明細顯示「最近進度：undefined」。C、D 列為 `AGENT_SCOPE_MISSING`（設計如此）。
+- **修正**：EOF 中斷改成停下並印出接續指令、批准改成 `y/N`、首次安裝不再印 `ERROR: Not Found`、「最近進度」不再顯示 undefined、文件補 Job log 等待與新終端機接續，都在 #936（10-22 合併，`4ca5a92b`）。新的 `y/N` 批准還沒在雲端跑過。
+- **拆除**（10-22，主人在終端機執行 `azd down --purge`，輸入環境名稱與 `y`）：27 分 9 秒完成。Log Analytics 與 Foundry 都已 purge；兩個 Entra app 已刪（30 天內可還原）；備份自訂角色回報 already gone（postdown 讀取時已不存在，原因未確認）。唯讀複查：`rg-fa-e2e-1021` 與 `ME_cae-fa-e2e-1021` 都不存在，soft-deleted 清單沒有這個 Foundry，沒有殘留的自訂角色或 Entra app。這次只留下 3 筆訂閱層級的部署歷史紀錄（不計費；沒查 azd 是否本來就不刪）。
+- **費用**：10-22 讀 Cost Management（10-21～22），`rg-fa-e2e-1021` USD0.23 加 `ME_cae-fa-e2e-1021` USD0.26，約 USD0.49。費用資料會延遲，這是初估，待複讀；上限 USD10。
+
+<a id="stage-v34-1021"></a>
+## 2026-10-21：stage 第 34 版（2026.10.21-34，2d-ii）部署後驗證
+
+- **範圍**：release PR #935，合併 commit `39d198e3`。內容是 2d-ii（#891），API 與 Hosted 只服務 `foundry-native-v2`，閘門武裝。部署 run 在 09:01～09:16Z 跑完，結果 success。
+- **證據**：總協調在 10:00～10:10Z 做唯讀讀回（Log Analytics `log-fa-stage`），之後送了三則訊息。原始輸出不在 repo，ID 只寫前綴。沒有讀費用。
+- **結果**：
+  - **API**：只剩一個 revision `…39d198e-r122-1`，Healthy，承接 100% 流量。GUARD 是 "1"，IDLE 和 RECONCILER 都是 "0"。
+  - **Hosted**：A／B 是 v85，`stage-test-e` 是 v33，三者都是 `foundry-native-v2`。C／D 是 executor，沒有設 `FA_NATIVE_TURNS`。
+  - **閘門**：armed，decision pass，`refused`／`retired_rows`／`unserved_rows`／`vetoed` 都是空的，C／D 是 `unclaimed`。sync 5 位都 ok。follow 沒有 drifted。
+  - **三則訊息**：A、B（新對話）、`stage-test-e` 各送一則，都在原 SID 上原地漂移，換版步驟每次都回 `current`。log 的 `NATIVE_VERSION_OBSERVED` 寫的是 A／B 82→85、E 30→33；起點和第 33 版那次一樣，可能是列上記的版本沒有隨上次漂移更新（原因沒查）。列本來就是 v2，所以送出前的更正沒有東西要改。
+  - **錯誤**：沒有 Traceback、5xx、`AGENT_VERSION_FOLLOWING` 或 `NATIVE_RID_CONFLICT`。看到的 409 都是預期中的：漂移偵測，以及第一次開串流被拒。
+- **觀察（未查）**：
+  - api_submit 是 3.0～4.4 秒。從 submit 結束到 Hosted 第一條 trace 是 5～9 秒。Hosted 回合本身只要 1.9～4.0 秒。
+  - API 自己的 `FA_NATIVE_TURNS` 仍是 `foundry-native-v1`，目前只是觀察。
 
 <a id="stage-v33-1021"></a>
 ## 2026-10-21：stage 第 33 版（2026.10.20-33）部署後驗證
@@ -19,7 +90,7 @@
   - 仍未決：(1) 對方一直不回時，這個等待有沒有上限；(2) 預期的 404 WARNING 要不要降級（工作台 README 1180 行寫明該層級是刻意的）。
   - 工作台儲存體 400 `InvalidAuthenticationInfo` 來自 Azure 內建登入層（easyauth-tokens），自 10-03 起時有時無，使用者看不到。
   - C、D：Neal 10-21 決定維持現狀（不退役）。它們是 executor（定義沒有 `FA_NATIVE_TURNS`），從不認領綁定列，閘門只回報成 `unclaimed`、不擋部署，所以 2d-ii 可以武裝閘門。
-  - 2d-ii 前的檢查（A、B、`fa-agent` 各用一次、閘門報告沒有 v1 `row_profile`）見 [CURRENT-STATE](status/CURRENT-STATE.md)。
+  - 2d-ii 部署時的閘門結果見 [第 34 版驗證](#stage-v34-1021)。
 
 <a id="dev-test-v33-1020"></a>
 ## 2026-10-20：第 33 版候選 dev 測試（main `82fd9975`，部署線）
@@ -266,6 +337,7 @@
 - **實跑發現**：
   - azd 1.32 偵測到 AI agent 環境（`CLAUDE_CODE_ENTRYPOINT`、`AI_AGENT`）就自動不互動，區域選單不出現、直接回「missing required inputs」（但列出的允許值正是 31 個 Hosted Agents 區域）；設 `AZD_NON_INTERACTIVE=false` 才出現。在 Claude Code 的終端機面板裡，選單只顯示預設值（Australia East），按 Enter 就選了它；改用 `azd env set AZURE_LOCATION eastus2` 後重跑。一般使用者在自己的終端機看到的是可選清單（azd 官方行為，這裡沒實測）。
   - eastus2 的 quota 在 purge fazd1011（westus3）前後，gpt-6-luna／gpt-6.1-sol 從 0 變成 500、gpt-4.1-mini 多 500、gpt-5.4-mini 多 100，正好是 fazd1011 的容量；推論這個訂閱的 GlobalStandard quota 跨區域共用（未查文件）。
+    - 2026-10-22 補註：官方 [Foundry 模型 quota](https://learn.microsoft.com/azure/foundry/openai/how-to/quota) 說明 quota 依訂閱、區域、模型與部署類型分開計算，與上面「跨區域共用」的推論不同。這次的 eastus2 數字變化原因沒有再查，上面的推論未經證實，不要當成事實引用；README 以官方文件的說法為準。
 - **已刪除（Neal 10-11 決定）**：Neal 決定刪掉三組 fazd 實測資源，在本工作階段確認刪 fazd1012 後，08:06Z 執行 `azd down -e fazd1012 --purge`（36 分 39 秒）。過程：predown 移除備份鎖，purge Log Analytics，刪除 `rg-fazd1012`，purge Foundry account `cog-example000002`；postdown 刪 2 個 Entra app，本機紀錄改名保留。讀回結果：
   - `rg-fazd1010`／`rg-fazd1011`／`rg-fazd1012`／`ME_cae-fazd1012` 都不存在。
   - 軟刪除的 Cognitive Services 帳號只剩 v18 的 `cog-fa-agent-v18-demo`（不在範圍）。

@@ -1210,26 +1210,42 @@ def test_a_blocker_the_server_reported_for_the_conversation_is_shown_and_holds_t
     assert shown["follow_up_blocker"] == "NATIVE_ENVIRONMENT_CHECKPOINT_UNAVAILABLE"
 
 
-def test_a_read_the_api_marks_retryable_is_passed_to_the_page_but_a_write_never_is(native_console):
+# r33 dev (H15): a progress read timed out at 30 s on the API side, which answered 503 FOUNDRY_INVOCATION_UNKNOWN with
+# `automatic_retry: true` (behavior_native_turn_api.py reply(read=True)); the next read was 200.
+@pytest.mark.parametrize("code", ["NATIVE_BOOTSTRAP_UNKNOWN", "FOUNDRY_INVOCATION_UNKNOWN"])
+def test_a_read_the_api_marks_retryable_is_passed_to_the_page_but_a_write_never_is(native_console, code):
     """stage v15 12:40: a transient 503 on a read stopped the page's polling. The API marks such a read
     `automatic_retry: true`; the bridge passes that on for GETs only, so an unknown write is still never resent."""
     c = native_console
     draft = first(c)
     assert send(c, draft).status_code == 200
     rid = draft["request_id"]
+    posts = []
 
     def transient(request, response):
+        if request.method == "POST":
+            posts.append(request.url.path)
         if request.method == "GET" and "/requests/" in request.url.path:
-            return httpx.Response(503, json={"error": {"code": "NATIVE_BOOTSTRAP_UNKNOWN", "message": "fixed",
+            return httpx.Response(503, json={"error": {"code": code, "message": "fixed",
                                                        "automatic_retry": True}})
         if request.method == "POST" and request.url.path.endswith("/native-turns/submit"):
-            return httpx.Response(503, json={"error": {"code": "NATIVE_BOOTSTRAP_UNKNOWN", "message": "fixed",
+            return httpx.Response(503, json={"error": {"code": code, "message": "fixed",
                                                        "automatic_retry": True}})
         return response
 
     c.mutate[0] = transient
-    read = c.ui.client.get("/api/instructions/" + rid + "/status")
-    assert read.status_code == 503 and read.json()["error"]["automatic_retry"] is True
+    # The page's two polls: a running turn's /status and the whole conversation's progress.
+    for path in ("/api/instructions/" + rid + "/status", "/api/instructions/progress?thread_id=" + draft["thread_id"]):
+        read = c.ui.client.get(path)
+        error = read.json()["error"]
+        assert read.status_code == 503 and (error["code"], error["upstream_status"], error["automatic_retry"]) == (
+            code, 503, True)
+    assert posts == [], "a failed read sends nothing"
+    c.mutate[0] = lambda request, response: response
+    task = next(task for task in c.ui.client.get("/api/instructions/" + rid + "/status").json()["tasks"]
+                if task["task_id"] == rid)
+    assert task["error"] is None and task["submission"]["state"] == "CONFIRMED", "the turn is not marked failed"
+    c.mutate[0] = transient
     second = post(c, "/api/instructions/" + draft["thread_id"] + "/next").json()["composer"]
     write = send(c, second, text="A write the API calls retryable")
     c.mutate[0] = lambda request, response: response

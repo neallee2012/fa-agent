@@ -46,7 +46,7 @@ def test_a_toolbox_entry_names_its_project_toolbox_and_label_but_no_credential()
     assert GRANT.kind == "mcp-toolbox" and GRANT.toolbox == TOOLBOX.config and GRANT.launch is None
     assert (GRANT.toolbox.toolbox, GRANT.toolbox.server_label) == ("fa-org-tools", "WebIQ")
     shipped = load_catalog(CATALOG_DIR)
-    assert shipped.entry("WebIQ") == TOOLBOX and shipped.entry("WebIQ-MCP").execution == "api-client"
+    assert shipped.entry("WebIQ") == TOOLBOX and shipped.entry("WebIQ-MCP") is None
     for bad in ({"toolbox": "../x"}, {"server_label": "a.b"}, {"headers": {"x-apikey": "${secret:k}"}},
                 {"toolbox": None}):
         config = {"type": "toolbox", "toolbox": "fa-org-tools", "server_label": "WebIQ", "tools": ["web"], **bad}
@@ -66,11 +66,11 @@ def test_toolbox_entries_stay_unloaded_until_the_deployment_names_them(monkeypat
     monkeypatch.delenv("FA_CAPABILITY_BUILTINS", raising=False)
     monkeypatch.delenv("FA_CAPABILITY_TOOLBOX_ENTRIES", raising=False)
     off = load_runtime_grants()
-    assert "WebIQ" not in off and off["WebIQ-MCP"].kind == "mcp-api" and "playwright" in off
+    assert sorted(off) == ["playwright"]
     monkeypatch.setenv("FA_CAPABILITY_TOOLBOX_ENTRIES", "WebIQ")
     on = load_runtime_grants()
-    assert on["WebIQ"] == GRANT and on["WebIQ-MCP"] == off["WebIQ-MCP"]
-    for names in ("WebIQ-MCP", "Missing", "WebIQ,WebIQ"):
+    assert on["WebIQ"] == GRANT and on["playwright"] == off["playwright"] and "WebIQ-MCP" not in on
+    for names in ("WebIQ-MCP", "playwright", "Missing", "WebIQ,WebIQ"):
         monkeypatch.setenv("FA_CAPABILITY_TOOLBOX_ENTRIES", names)
         with pytest.raises(Problem) as error:
             load_runtime_grants()
@@ -320,11 +320,11 @@ def test_the_registered_toolbox_provider_is_the_single_consumer_of_a_toolbox_gra
     selected = CapabilityCapture(head_selection_id=None, grants=(GRANT, WEBIQ_GRANT))
     capture = SimpleNamespace(capabilities=selected, tools=selected, template=SimpleNamespace(skills=()))
     chosen = {grant.entry_id: provider for provider, grants in selected_providers(capture, providers) for grant in grants}
-    assert chosen["WebIQ"] is not chosen["WebIQ-MCP"]
+    assert chosen["WebIQ"] is not chosen["WebSearch-MCP"]
     assert [provider.accepts(GRANT) for provider in providers].count(True) == 1
 
 
-WEBIQ_GRANT = available_grants(build_catalog([WEBIQ]))["WebIQ-MCP"]
+WEBIQ_GRANT = available_grants(build_catalog([WEBIQ]))["WebSearch-MCP"]
 
 
 CANARY = "CANARY-BODY-7f3e"

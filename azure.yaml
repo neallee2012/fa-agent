@@ -7,7 +7,7 @@
 # - preprovision  (read only) sign-in, Team owner, model settings, subscription preflight
 # - provision     infra/azd/main.bicep: Foundry, monitoring, foundation, Web PubSub, backup, artifacts
 # - postprovision (read only) ACA platform gate; then the Entra API/Portal apps and the owner's consent
-# - postdeploy    images, Hosted Agents, first install (the owner types the plan hash), API, Portal, first session;
+# - postdeploy    images, Hosted Agents, first install (the owner answers y to the plan), API, Portal, first session;
 #                 a later `azd deploy` runs the stage CI's upgrade steps instead
 # Resume a stopped hook with `azd hooks run <hook>`; every write reads back its own intent first.
 name: foundry-agents

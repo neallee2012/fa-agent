@@ -47,12 +47,12 @@ def test_delegation_composes_with_desktop_and_both_mcp_kinds_without_giving_chil
     capture = CapabilityCapture(head_selection_id="head", grants=tuple(grants[name] for name in sorted(grants)))
     needs = session_needs(capture)
     assert needs.builtin_tools == ("task",)
-    assert "desktop_act" in needs.custom_tools and "WebIQ-MCP-web" in needs.custom_tools
+    assert "desktop_act" in needs.custom_tools and "WebSearch-MCP-web" in needs.custom_tools
     assert "playwright-browser_navigate" in needs.mcp_tools and "playwright" in needs.mcp_servers
     assert needs.vision and "desktop_observe" in needs.image_tools
     assert needs.custom_agents[0]["tools"] == [] and needs.custom_agents[0]["mcp_servers"] == {}
     value = assemble_capabilities("fa-instruction-history-skill-draft-v1", capture)
-    assert {"task", "save_skill_draft", "execute_operation", "desktop_act", "WebIQ-MCP-web",
+    assert {"task", "save_skill_draft", "execute_operation", "desktop_act", "WebSearch-MCP-web",
             "playwright-browser_navigate"} <= set(value.record.declared_capabilities)
 
 

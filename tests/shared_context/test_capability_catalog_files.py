@@ -6,7 +6,7 @@ from pathlib import Path
 from shared_context.behavior_capabilities import available_grants
 from shared_context.behavior_capability_prompt import session_needs
 from shared_context.behavior_capabilities import CapabilityCapture
-from shared_context.tool_catalog import HttpEntry, StdioEntry, ToolboxEntry, load_catalog
+from shared_context.tool_catalog import StdioEntry, ToolboxEntry, load_catalog
 
 SOURCE = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
 PLAYWRIGHT_TOOLS = ("browser_navigate", "browser_snapshot", "browser_take_screenshot", "browser_click", "browser_type",
@@ -15,24 +15,24 @@ PLAYWRIGHT_TOOLS = ("browser_navigate", "browser_snapshot", "browser_take_screen
 
 def test_committed_catalog_loads_with_the_approved_tools_only():
     catalog = load_catalog(SOURCE / "tool_catalog")
-    assert sorted(entry.entry_id for entry in catalog.entries) == ["WebIQ", "WebIQ-MCP", "playwright"]
+    # WebIQ only through the official toolbox: the API-brokered WebIQ-MCP and its API secret are retired (2026-10-22).
+    assert sorted(entry.entry_id for entry in catalog.entries) == ["WebIQ", "playwright"]
+    assert not any(entry.secret_names for entry in catalog.entries)
     toolbox = catalog.entry("WebIQ")
     assert toolbox.execution == "foundry-toolbox" and isinstance(toolbox.config, ToolboxEntry)
     assert (toolbox.config.toolbox, toolbox.config.server_label, toolbox.tools) == (
         "fa-org-tools", "WebIQ", ("web", "browse"))
     catalog = catalog.model_copy(update={"entries": tuple(item for item in catalog.entries if item.entry_id != "WebIQ")})
-    playwright, webiq = catalog.entry("playwright"), catalog.entry("WebIQ-MCP")
+    playwright = catalog.entry("playwright")
     assert playwright.execution == "hosted-stdio" and isinstance(playwright.config, StdioEntry)
     assert playwright.tools == PLAYWRIGHT_TOOLS and "browser_file_upload" not in playwright.tools
     assert playwright.config.command == "/opt/fa-tools/bin/playwright-mcp"
     assert "--allow-unrestricted-file-access" not in playwright.config.args
     assert dict(playwright.config.env) == {"PLAYWRIGHT_BROWSERS_PATH": "/opt/fa-tools/ms-playwright"}
-    assert webiq.execution == "api-client" and isinstance(webiq.config, HttpEntry)
-    assert webiq.tools == ("web", "browse") and dict(webiq.config.headers) == {"x-apikey": "${secret:webiq-api-key}"}
     grants = available_grants(catalog)
     needs = session_needs(CapabilityCapture(head_selection_id=None, grants=tuple(grants[name] for name in sorted(grants))))
     assert needs.mcp_tools == tuple("playwright-" + name for name in PLAYWRIGHT_TOOLS)
-    assert needs.custom_tools == ("WebIQ-MCP-web", "WebIQ-MCP-browse") and not needs.vision
+    assert needs.custom_tools == () and not needs.vision
 
 
 def test_image_pins_the_playwright_mcp_package_and_its_launcher_path():

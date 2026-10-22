@@ -873,10 +873,27 @@ const consentViews=new Map();let consentCommands=[];
 const hitlChosen=new Map();
 let composing=false,conversationRenderKey=null;
 const processingPanels=new Map();
-const appendSends=new Set(),appendReads=new Set(),appendUnconfirmed=new Map();
+const appendSends=new Set(),appendReads=new Set(),appendUnconfirmed=new Map(),appendRetryTimers=new Map();
 const nativeProgressReads=new Map();
 const draftEdits=new Map();
 const sentAppendDrafts=new Map();
+// #871 G9: append ID -> the RID its text was resent under (resendAppendAsTurn), kept in this browser so that after a
+// reload the append shows as resent instead of offering 帶回輸入框 again. Display only: nothing is sent from it, and the
+// bridge journal stays the record. shortcut: keeps the last 100 links; raise it if one browser resends more.
+const RESENT_APPENDS_KEY="fa-resent-appends",resentAppends=new Map();
+function loadResentAppends(){
+  try{
+    for(const [id,rid] of Object.entries(JSON.parse(localStorage.getItem(RESENT_APPENDS_KEY)||"{}")))
+      if(typeof rid==="string"&&!resentAppends.has(id))resentAppends.set(id,rid);
+  }catch{}
+}
+loadResentAppends();
+function linkResentAppend(id,rid){
+  loadResentAppends();  // another tab may have written links since this page loaded
+  resentAppends.delete(id);if(rid!==null)resentAppends.set(id,rid);
+  while(resentAppends.size>100)resentAppends.delete(resentAppends.keys().next().value);
+  try{localStorage.setItem(RESENT_APPENDS_KEY,JSON.stringify(Object.fromEntries(resentAppends)))}catch{}
+}
 let processingScope=null;
 const el=id=>document.getElementById(id);
 function scopeKey(id,agent=selectedAgent){return agentMode?JSON.stringify([agent,id]):id}
@@ -3588,7 +3605,7 @@ function clearAgentObservations(){
   clearGroupPanel();
   stateRevision++;progressBusy=false;progressPaused=false;progressRetryMs=1000;lastProgressSignature=null;
   if(progressTimer!==null){clearTimeout(progressTimer);progressTimer=null}
-  clearAttachmentObservation();clearUserFileObservation();clearTurnContexts();clearDelegationViews();
+  clearAppendRetries();clearAttachmentObservation();clearUserFileObservation();clearTurnContexts();clearDelegationViews();
   clearTemplateObservation();clearSystemPromptObservation();clearCancellationObservations();clearAnswerDownloads();
   clearAgentMessages();
   clearServerFollowingState();processingPanels.clear();processingScope=null;conversationRenderKey=null;
@@ -5503,6 +5520,12 @@ function renderComposer(){
     sentTask.native_receipt?.status!=="busy_refused";
   if(sentOnce&&el("instruction").value===composer.content)clearSentDraft(composer.thread_id,composer.request_id,selectedAgent);
   const unresolvedSentDraft=pendingAppendDraft();
+  // #916 H9: while an unsettled append of a turn that has ended is being read, a new message waits, so it cannot go
+  // out ahead of an append the read finds not_applied and resends. Only while that read runs: an append that stays
+  // accepted, or a failed read, never keeps the composer shut. A running turn's reads (every poll) never shut it.
+  const appendChecking=(state.tasks||[]).some(task=>task.thread_id===composer?.thread_id&&appendReads.has(scopeKey(task.task_id))
+    &&!["accepted","started"].includes(task.native_receipt?.status)
+    &&(task.appends||[]).some(entry=>["accepted","sending"].includes(entry.status)));
   const threads=composer?.threads||[];
   el("conversation-picker").hidden=!threads.length;
   el("conversation").replaceChildren();
@@ -5565,7 +5588,7 @@ function renderComposer(){
   renderAttention();
   const appendHasFiles=Boolean(appendTarget&&[attachmentDrafts,userFileDrafts,userImageDrafts].some(
     drafts=>(drafts.get(attachmentDraftKey(composer))||[]).length));
-  el("send-instruction").disabled=Boolean(opening)||!canCompose||busy||messageBusy||appendBusy||appendUnknown||Boolean(unresolvedSentDraft)||threadLoading
+  el("send-instruction").disabled=Boolean(opening)||!canCompose||busy||messageBusy||appendBusy||appendUnknown||Boolean(unresolvedSentDraft)||appendChecking||threadLoading
     ||!(composer?.can_submit||composer?.can_follow_up||composer?.can_append)
     ||(!appendTarget&&!selectedModel)||!instructionValid(el("instruction").value,maximum)
     ||(appendTarget?appendHasFiles:Boolean(attachmentIssue())||Boolean(userFileIssue())||Boolean(userImageIssue()));
@@ -5595,6 +5618,7 @@ function renderComposer(){
     composer?.command_incomplete?friendlyError({code:"INSTRUCTION_INCOMPLETE"}):
     cancelling?"正在送出停止請求…":appendUnknown||unresolvedSentDraft?
       "這份文字已送出但結果尚未核清；請按這則訊息下方「⋯」裡的「核對追加」，不會換編號重送。":
+    appendChecking?"正在確認剛才追加的文字有沒有送達，確認後就能送出。":
     appendHasFiles?"這次只能追加文字；附件保留在草稿，請移除或等回合結束後送出。":
     appendBusy?"追加傳送中…":messageBusy?"正在送出…":composer?.archived||composer?.conversation?.archived?(blockedMessage||"這段對話已封存。"):
     canCompose?"":waiting?"助理處理中，完成後即可接著聊":blockedMessage?blockedMessage:composer?.follow_up_blocker?followUpMessage(composer):
@@ -6748,8 +6772,14 @@ function renderConversation(tasks){
         not_applied:"沒有送達：這一回合已經結束。原文保留，不會自動再送。",
         unknown:"還不確定有沒有送達，可以按這則訊息下方「⋯」裡的「核對追加」。",
       })[appended.status]||"還不確定有沒有送達。";
-      const resent=appended.status==="not_applied"&&["waiting","sent"].includes(sentAppendDrafts.get(scopeKey(appended.append_id))?.resend);
-      if(resent)status.textContent="沒趕上這一回合，會改成新訊息送出。";
+      // After a reload only the kept link says so, and only once the bridge lists that RID as sent with this text.
+      const link=resentAppends.get(appended.append_id),resend=sentAppendDrafts.get(scopeKey(appended.append_id))?.resend;
+      const resent=appended.status==="not_applied"&&(["waiting","resending","sent"].includes(resend)
+        ||Boolean(link)&&(state.tasks||[]).some(entry=>entry.task_id===link&&entry.submission?.state!=="NOT_SENT"
+          &&entry.instruction===appended.content));
+      // Future until its /submit is out; then past tense, never "delivered" (the new turn says).
+      if(resent)status.textContent=["waiting","resending"].includes(resend)?
+        "沒趕上這一回合，會改成新訊息送出。":"沒趕上這一回合，已改用新訊息送出。";
       turn.append(label,body,status);
       if(appended.status==="not_applied"&&!resent){
         const restore=document.createElement("button"),agent=selectedAgent,thread=selectedThread,auth=attachmentAuthRevision;
@@ -7032,8 +7062,8 @@ function render(){
   el("reconcile-panel").hidden=!(t?.mode==="original_failure"&&ack?.state==="UNKNOWN"&&!reconciled);
   el("ack-state").className=confirmed?"success":"";
   text("observed",r?.verified_bytes===true?"處理狀態依本次已核對結果顯示；不是持續更新的執行狀態。":
-    t?.progress?`最近進度：${t.progress.observed_at}。由服務純讀取得，不是模擬的執行狀態。`:
-    t?.status?`觀察時間：${t.status.observed_at}。這是最近一次觀察，不是目前即時狀態。`:
+    t?.progress?`最近進度：${t.progress.observed_at||"未提供"}。由服務純讀取得，不是模擬的執行狀態。`:
+    t?.status?`觀察時間：${t.status.observed_at||"未提供"}。這是最近一次觀察，不是目前即時狀態。`:
     "尚未更新處理狀態；更新不會再次交辦或啟動工作。");
   renderTurnContext(t);
   el("empty").hidden=Boolean(r||reply);el("verified").hidden=!(r||reply);
@@ -7806,7 +7836,7 @@ function resendUnappliedAppend(composer,opening){
     el("instruction").value||selectedAttachments().length||selectedUserFiles().length||selectedUserImages().length){
     sent.resend="kept";return;
   }
-  sent.resend="sent";
+  sent.resend="resending";
   Promise.resolve().then(()=>resendAppendAsTurn(sent,composer));
 }
 async function resendAppendAsTurn(sent,composer){
@@ -7816,8 +7846,12 @@ async function resendAppendAsTurn(sent,composer){
     &&state.authentication==="AVAILABLE";
   const post=async(path,body)=>{
     if(!live())throw {code:"INSTRUCTION_CHANGED"};
-    submitted||=path.endsWith("/submit");
-    return postBridge(path,body,agent,csrf);
+    if(!path.endsWith("/submit"))return postBridge(path,body,agent,csrf);
+    const answer=postBridge(path,body,agent,csrf);
+    // Handed over only once /submit is out (a /next only takes a new RID); the append then reads in the past tense.
+    // agentFetch refuses an unavailable Agent (scopeAvailable) before any request, so that /submit never went out.
+    if(scopeAvailable()){submitted=true;sent.resend="sent";conversationRenderKey=null;render()}
+    return answer;
   };
   const hold=id=>{pendingMessages.add(scopeKey(id,agent));chatSends.set(scopeKey(id,agent),sendToken)};
   const show=id=>optimisticMessages.set(scopeKey(id,agent),{agent_id:agent,request_id:id,thread_id:thread,text:content,sendToken});
@@ -7831,6 +7865,7 @@ async function resendAppendAsTurn(sent,composer){
       request=next.composer.request_id;hold(request);
       optimisticMessages.delete(scopeKey(optimisticId,agent));optimisticId=request;show(request);
     }
+    linkResentAppend(sent.append_id,request);
     const value=await post(`/api/instructions/${encodeURIComponent(request)}/submit`,{content,model});
     if(value.task?.task_id!==request||value.task.submission?.state!=="CONFIRMED")
       throw {code:"RECONCILE_REQUIRED",message:"尚未取得接單確認，保留原訊息，不會重送。"};
@@ -7839,7 +7874,7 @@ async function resendAppendAsTurn(sent,composer){
       state.tasks=[...state.tasks.filter(task=>task.task_id!==request),value.task];
   }catch(error){
     // Not posted: the text stays on its append with 帶回輸入框. Posted: the new turn shows its own outcome.
-    if(!submitted)sent.resend="kept";
+    if(!submitted){sent.resend="kept";linkResentAppend(sent.append_id,null)}
     if(live()){const shown={...sendProblem(error),request_id:request};threadErrors.set(scopeKey(thread,agent),shown);lastError=shown}
   }finally{
     for(const id of new Set([origin,request])){
@@ -7894,22 +7929,63 @@ async function retryOriginalTurn(task){
     }
   }
 }
+// After its turn ended no progress read is due (progressDelay is null), so an append read that failed retryably is read
+// again here on the progress backoff (2→4→…→30 s), one timer per turn. It only GETs; nothing is resent.
+function clearAppendRetries(){for(const timer of appendRetryTimers.values())clearTimeout(timer);appendRetryTimers.clear()}
+function retryAppendRead(id,key,live){
+  clearTimeout(appendRetryTimers.get(key));
+  progressRetryMs=Math.min(progressRetryMs*2,30000);
+  appendRetryTimers.set(key,setTimeout(()=>{
+    appendRetryTimers.delete(key);
+    // A progress read due or under way reads the same appends; an append settled meanwhile needs no read.
+    const task=(state.tasks||[]).find(item=>item.task_id===id);
+    if(!live())return;
+    if(task?.appends?.some(entry=>["accepted","sending"].includes(entry.status))){
+      if(progressTimer===null&&!progressBusy)readAppends(task);
+    }else if(lastError?.phase==="progress"&&lastError.retrying){
+      // Settled another way (a push or state read): nothing is retrying any more, so the banner must not say so.
+      lastError=null;progressRetryMs=1000;conversationRenderKey=null;render();
+    }
+  },progressRetryMs));
+}
 async function readAppends(task){
   const originAgent=selectedAgent,auth=attachmentAuthRevision,scope=agentRevision,thread=selectedThread;
   const key=scopeKey(task.task_id,originAgent);
   if(appendReads.has(key)||state.authentication!=="AVAILABLE"||threadLoading)return;
+  clearTimeout(appendRetryTimers.get(key));appendRetryTimers.delete(key);
+  const live=()=>auth===attachmentAuthRevision&&scope===agentRevision&&originAgent===selectedAgent&&thread===selectedThread
+    &&state.authentication==="AVAILABLE";
   appendReads.add(key);conversationRenderKey=null;render();
+  let readTimer=null;
   try{
-    const response=await agentFetch(`/api/instructions/${encodeURIComponent(task.task_id)}/appends`,
-      {cache:"no-store",credentials:"same-origin"},originAgent);
-    const value=await response.json();
-    if(!response.ok)throw value.error||{code:"LOCAL_FAILURE"};
+    // A GET that never answers would keep 送出 shut (H9) and hold progressBusy; like the progress read, stop waiting
+    // and treat it as a failed read. A late answer is ignored.
+    const read=(async()=>{
+      const response=await agentFetch(`/api/instructions/${encodeURIComponent(task.task_id)}/appends`,
+        {cache:"no-store",credentials:"same-origin"},originAgent);
+      return {response,value:await response.json()};
+    })();
+    const timeout=new Promise((_,reject)=>{
+      readTimer=setTimeout(()=>reject(new Error("追加核對逾時")),PROGRESS_READ_TIMEOUT_MS);
+    });
+    const {response,value}=await Promise.race([read,timeout]).finally(()=>clearTimeout(readTimer));
+    // A failure with no error body is unreadable, like a progress read that throws: read again, never resend.
+    if(!response.ok)throw value.error||new Error(`HTTP ${response.status}`);
     if(auth!==attachmentAuthRevision||scope!==agentRevision||originAgent!==selectedAgent||thread!==selectedThread)return;
     if(value.appends?.request_id!==task.task_id||!Array.isArray(value.appends.appends))throw {code:"NATIVE_STATE_INVALID"};
     for(const receipt of value.appends.appends)observeAppendDraft(receipt,originAgent,auth);
+    if(lastError?.phase==="progress")lastError=null;
+    progressRetryMs=1000;  // a good read ends the backoff it may have stretched, as a good progress read does
     await readState();
   }catch(error){
-    if(auth===attachmentAuthRevision&&scope===agentRevision)lastError=error?.code?error:{code:"LOCAL_OFFLINE",message:error.message};
+    // Like a progress read: a timeout, offline or retryable read says so, is read again, and the next good read
+    // clears it; any other code keeps its own meaning.
+    const value=error?.code?error:{code:"LOCAL_OFFLINE",message:error.message};
+    const retrying=!error?.code||readRetryable(error);
+    if(auth===attachmentAuthRevision&&scope===agentRevision){
+      lastError=retrying?{...value,phase:"progress",retrying:true}:value;
+      if(retrying&&live())retryAppendRead(task.task_id,key,live);
+    }
   }finally{
     appendReads.delete(key);
     if(auth===attachmentAuthRevision&&scope===agentRevision){conversationRenderKey=null;render()}
@@ -8459,6 +8535,7 @@ async function switchThread(thread){
   clearDelegationViews();
   clearServerFollowingState();
   clearNativeHitlObservation();
+  clearAppendRetries();
   realtime.progressDue=false;
   selectedThread=thread;selected="";lastError=null;progressPaused=false;progressRetryMs=1000;lastProgressSignature=null;
   conversationRenderKey=null;

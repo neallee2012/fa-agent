@@ -158,6 +158,32 @@ def test_guard_only_warns_on_a_revision_this_script_did_not_name(ci, monkeypatch
     assert out.startswith("::warning::") and "not named by this deploy script" in out
 
 
+def test_guard_refuses_a_live_only_env_before_anything_else_runs(ci, monkeypatch):
+    """The same refusal as api's update, before build/sync publish Hosted (2026-10-22: dev's retired WebIQ ENV)."""
+    calls = []
+    env = [{"name": ci.SESSION_GUARD, "value": "1"}, {"name": ci.API_CONFIG_ENV, "value": "{}"},
+           {"name": "FA_CAPABILITY_SECRET_WEBIQ_API_KEY", "secretRef": "webiq-api-key"}]
+    monkeypatch.setattr(ci, "rest", lambda method, path, body=None: calls.append((method, path)) or {"properties": {
+        "latestReadyRevisionName": f"{ci.STAGE['api_app']}--1234567-r9-1", "template": {"containers": [{"env": env}]}}})
+    for later in ("api_routines", "feed_config", "serving_commit", "switch_preconditions", "realtime_ready"):
+        monkeypatch.setattr(ci, later, lambda *args, **kwargs: pytest.fail("ran after the refusal"))
+    with pytest.raises(SystemExit) as stopped:
+        ci.guard()
+    assert str(stopped.value) == (f"{ci.STAGE['api_app']}: deployed ENV ['FA_CAPABILITY_SECRET_WEBIQ_API_KEY'] is not "
+                                  "in the deployment profile; add it first")
+    assert [method for method, _ in calls] == ["GET"]
+    # A declared secret ENV and the installed configuration are known names: guard goes on to its next check.
+    ci.STAGE["api_secret_environment"] = {"FA_CAPABILITY_SECRET_WEBIQ_API_KEY": "webiq-api-key"}
+    monkeypatch.setattr(ci, "_require_secrets", lambda *args: None)
+
+    def next_check():
+        raise SystemExit("next check")
+
+    monkeypatch.setattr(ci, "api_routines", next_check)
+    with pytest.raises(SystemExit, match="^next check$"):
+        ci.guard()
+
+
 # --- wait loops: a failed read is retried, a write never is ------------------------------------------------------
 
 

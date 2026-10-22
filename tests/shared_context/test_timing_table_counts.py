@@ -137,7 +137,36 @@ def test_route_timing_names_native_turn_routes_by_their_fixed_segment_and_hashes
         assert client.get("/work-policy/v1/agent-template/options").json()
         assert client.get("/work-policy/v1/conversations/secret-legacy").json()
     hashed = timing_id("secret-rid")
+    # These fake routes never call ``_body``, so no body RID is recorded and the path-less ones keep job_id None.
     assert [(timing["phase"], timing["job_id"]) for timing in _timings(caplog)] == [
         ("api_status", hashed), ("api_requests", hashed), ("api_submit", None), ("api_skill-catalog", None),
         ("api_turn-usage", None), ("api_options", None)]
+    assert "secret" not in caplog.text
+
+
+def test_route_timing_hashes_the_rid_of_a_body_only_route(caplog):
+    """api_catalog had job_id=null: its RID is in the body, so it could not be joined to the Hosted turn."""
+    from fastapi import FastAPI, Request
+    from fastapi.testclient import TestClient
+    from shared_context.behavior_api import _body
+    from shared_context.behavior_native_capability_wire import NativeTurnScope
+    from shared_context.behavior_timing import RouteTiming, timing_id
+    app = FastAPI()
+    app.add_middleware(RouteTiming)
+
+    @app.post("/work-policy/v1/native-capabilities/catalog")
+    async def catalog(request: Request):
+        await _body(request, NativeTurnScope)
+        return {"ok": True}
+
+    @app.post("/work-policy/v1/native-capabilities/call")
+    async def unparsed():
+        return {"ok": True}
+
+    with caplog.at_level(logging.WARNING), TestClient(app) as client:
+        assert client.post("/work-policy/v1/native-capabilities/catalog",
+                           json={"conversation_id": "secret-cid", "request_id": "secret-rid"}).json()
+        assert client.post("/work-policy/v1/native-capabilities/call").json()
+    assert [(timing["phase"], timing["job_id"]) for timing in _timings(caplog)] == [
+        ("api_catalog", timing_id("secret-rid")), ("api_call", None)]
     assert "secret" not in caplog.text

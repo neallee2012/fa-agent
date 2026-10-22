@@ -5,6 +5,7 @@ principal; grants are the owner's only; the hooks stop on a failed read-only gat
 initialization or ask for a key without the owner at a terminal; the WebIQ key goes only into one PUT body.
 """
 
+import dataclasses
 from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
@@ -393,7 +394,7 @@ def plan_value():
                            sha256="abcdef0123456789" + "0" * 48, empty_table_observed_at=observed)
 
 
-def approval_context(hooks, tmp_path, me=OWNER, answer="abcdef012345", tty=True):
+def approval_context(hooks, tmp_path, me=OWNER, answer="y", tty=True):
     ctx = context(hooks, tmp_path, {"graph.microsoft.com/v1.0/me": ok({"id": me})}, FA_TEAM_OWNER_OID=OWNER)
     ctx.tty, ctx.prompt = tty, (lambda text: answer)
     ctx.now = lambda: datetime(2026, 10, 10, 9, 0, tzinfo=timezone.utc)
@@ -417,11 +418,20 @@ def test_an_authorization_for_another_plan_is_never_reused(hooks, tmp_path, monk
     assert "FA_DEPLOY_CONFIG" not in os.environ  # set only for run_fresh_job's import
 
 
-def test_the_owner_approves_the_exact_plan_in_a_terminal(hooks, tmp_path):
+@pytest.mark.parametrize("answer", ["y", "yes", " Y ", "YES"])
+def test_the_owner_approves_the_exact_plan_in_a_terminal(hooks, tmp_path, capsys, answer):
     path = tmp_path / "authorization.json"
-    hooks.authorize(approval_context(hooks, tmp_path), plan_value(), path)
+    asked = []
+    ctx = approval_context(hooks, tmp_path, answer=answer)
+    ctx.prompt = lambda text: asked.append(text) or answer
+    hooks.authorize(ctx, plan_value(), path)
+    assert asked == ["Approve this initialization of the plan above? [y/N]: "]
+    shown = capsys.readouterr().out
+    assert all(item in shown for item in ("request dev-fresh-001", "installation dev-native-v1", "c" * 64,
+                                          plan_value().sha256))
     value = json.loads(path.read_text(encoding="utf-8"))
     assert value["authorizing_human_oid"] == OWNER and value["plan_sha256"] == plan_value().sha256
+    assert value["configuration_sha256"] == "c" * 64
     window = (datetime.fromisoformat(value["expires_at"].replace("Z", "+00:00"))
               - datetime.fromisoformat(value["not_before"].replace("Z", "+00:00")))
     assert timedelta(0) < window <= timedelta(minutes=15)
@@ -432,13 +442,65 @@ def test_the_owner_approves_the_exact_plan_in_a_terminal(hooks, tmp_path):
 @pytest.mark.parametrize("kwargs, message", [
     ({"tty": False}, "interactive terminal"),
     ({"me": OTHER}, "only the Team owner"),
-    ({"answer": "yes"}, "not approved"),
+    ({"answer": "abcdef012345"}, "not approved"),  # the old 12-character hash answer no longer approves
+    ({"answer": ""}, "not approved"),
+    ({"answer": "n"}, "not approved"),
+    ({"answer": "yep"}, "not approved"),
 ])
 def test_nobody_else_and_nothing_automatic_approves_the_initialization(hooks, tmp_path, kwargs, message):
     path = tmp_path / "authorization.json"
     with pytest.raises(SystemExit, match=message):
         hooks.authorize(approval_context(hooks, tmp_path, **kwargs), plan_value(), path)
     assert not path.exists()
+
+
+@pytest.mark.parametrize("cut", [EOFError, KeyboardInterrupt])
+def test_a_closed_or_interrupted_prompt_stops_and_writes_nothing(hooks, tmp_path, cut):
+    """azd exiting or Ctrl+C while a question waits: a Stop, not a traceback, and nothing recorded. The 2026-10-21
+    azd e2e run saw EOFError inside input() after azd had exited; Ctrl+C is the likely cause, not confirmed."""
+    def gone(text):
+        raise cut
+    path = tmp_path / "authorization.json"
+    ctx = approval_context(hooks, tmp_path)
+    ctx.prompt, ctx.resume = gone, "azd hooks run postdeploy"
+    with pytest.raises(hooks.Stop, match="no answer was read.*`azd hooks run postdeploy`"):
+        hooks.authorize(ctx, plan_value(), path)
+    assert not path.exists()
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True})))
+    ctx.prompt = gone
+    with pytest.raises(hooks.Stop, match="no answer was read"):
+        hooks.preprovision(ctx)
+    assert "FA_TEAM_OWNER_OID" not in ctx.values
+    assert not any("azd env set" in " ".join(call) for call in ctx.run.calls)
+
+
+@pytest.mark.parametrize("phase, resume", [("preprovision", "azd up"), ("deploy", "azd hooks run postdeploy"),
+                                           ("predown", "azd down")])
+def test_a_cut_prompt_names_the_command_that_asks_again(hooks, tmp_path, monkeypatch, capsys, phase, resume):
+    """main() picks the rerun command per phase; the model choice, the approval and the backup-lock confirmation
+    each print it. Only the runner and prompt of main()'s own Context are replaced."""
+    def gone(text):
+        raise EOFError
+    path = tmp_path / "authorization.json"
+    site, routes = {
+        "preprovision": (hooks.pick_models, region()),
+        "deploy": (lambda ctx: hooks.authorize(ctx, plan_value(), path),
+                   {"graph.microsoft.com/v1.0/me": ok({"id": OWNER})}),
+        "predown": (hooks.predown, {**outside(hooks), "lock list": ok([LOCK])}),
+    }[phase]
+    runner = Runner(routes)
+    monkeypatch.setitem(hooks.PHASES, phase, lambda ctx: site(dataclasses.replace(
+        ctx, run=runner, prompt=gone, tty=True, state_root=tmp_path, az_cmd=["az"])))
+    for key, value in {"AZURE_ENV_NAME": "dev", "AZURE_SUBSCRIPTION_ID": SUBSCRIPTION, "AZURE_LOCATION": "westus3",
+                       "AZURE_TENANT_ID": TENANT, "FA_TEAM_OWNER_OID": OWNER, "FA_AZD_VENV": "1"}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("FA_MODELS", raising=False)
+    monkeypatch.delenv("FA_CONFIRM_DELETE", raising=False)
+    assert hooks.main([phase]) == 1
+    assert f"no answer was read (input closed or interrupted): nothing was approved and no answer was saved. " \
+           f"Run `{resume}`" in capsys.readouterr().err
+    assert not path.exists()
+    assert not any("azd env set" in " ".join(call) or "delete" in call for call in runner.calls)
 
 
 def test_a_started_fresh_action_with_unknown_outcome_is_never_started_again(hooks, tmp_path):
@@ -500,7 +562,7 @@ def test_webiq_key_goes_only_into_one_put_and_is_never_asked_twice(tmp_path, cap
     secret = "synthetic-key-value"
     client = FakeHttp(exists=False)
     outcome, value = script.ensure(client, {"Authorization": "Bearer t"}, profile,
-                                   lambda: asked.append(1) or secret)
+                                   lambda: asked.append(1) or secret, toolbox=set)
     puts = [item for item in client.requests if item[0] == "PUT"]
     assert outcome == "created" and len(puts) == 1 and len(asked) == 1
     assert json.loads(puts[0][2])["properties"]["credentials"]["keys"]["x-apikey"] == secret
@@ -509,11 +571,11 @@ def test_webiq_key_goes_only_into_one_put_and_is_never_asked_twice(tmp_path, cap
     assert not list(tmp_path.iterdir())
     unread = UnreadAfterPut()
     with pytest.raises(SystemExit, match="did not read back"):
-        script.ensure(unread, {}, profile, lambda: secret)
+        script.ensure(unread, {}, profile, lambda: secret, toolbox=set)
     assert [item[0] for item in unread.requests].count("PUT") == 1
     monkeypatch.setattr(script.sys.stdin, "isatty", lambda: False)
     with pytest.raises(SystemExit, match="interactive terminal"):
-        script.ensure(FakeHttp(exists=False), {}, profile, script.ask_key)
+        script.ensure(FakeHttp(exists=False), {}, profile, script.ask_key, toolbox=set)
     again = FakeHttp(exists=True)
     assert script.ensure(again, {}, profile, lambda: pytest.fail("asked for the key again"))[0] == "already"
     assert [item[0] for item in again.requests] == ["GET"]
@@ -538,9 +600,10 @@ def test_webiq_rotate_puts_a_new_key_even_when_the_connection_exists(capsys, mon
 
     class UnreadAfterRotate(FakeHttp):
         def get(self, url, headers):
+            if not any(item[0] == "PUT" for item in self.requests):
+                return super().get(url, headers)
             self.requests.append(("GET", url, None))
-            return SimpleNamespace(status_code=503 if any(item[0] == "PUT" for item in self.requests) else 200,
-                                   json=lambda: {})
+            return SimpleNamespace(status_code=503, json=lambda: {})
 
     with pytest.raises(SystemExit, match="rotate again"):
         script.ensure(UnreadAfterRotate(exists=True), {}, profile, lambda: secret, rotate=True)
@@ -552,6 +615,68 @@ def test_webiq_rotate_puts_a_new_key_even_when_the_connection_exists(capsys, mon
     assert script.ensure(FakeHttp(exists=True), {}, profile, lambda: pytest.fail("asked"))[0] == "already"
 
 
+@pytest.mark.parametrize("properties", [{"category": "RemoteTool", "target": "https://other.example/mcp"},
+                                        {"category": "ApiKey", "target": "https://api.microsoft.ai/v3/mcp"}, {}])
+def test_webiq_rotate_never_overwrites_a_connection_that_is_not_webiq(properties):
+    script = load("new_webiq_connection_other", ROOT / "deploy" / "stage" / "new_webiq_connection.py")
+    profile = {"environment": "dev", "subscription_id": SUBSCRIPTION, "resource_group": "rg-dev",
+               "foundry_account": "cog-tok3n", "project": "fa-dev", "webiq_connection": "some-other-connection"}
+
+    class Other(FakeHttp):
+        def get(self, url, headers):
+            self.requests.append(("GET", url, None))
+            return SimpleNamespace(status_code=200, json=lambda: {"name": "some-other-connection",
+                                                                  "properties": properties})
+
+    client = Other(exists=True)
+    with pytest.raises(SystemExit, match="is not the WebIQ connection .*; nothing was written"):
+        script.ensure(client, {}, profile, lambda: pytest.fail("asked for a key"), rotate=True)
+    assert [item[0] for item in client.requests] == ["GET"]
+
+
+class ClientHttp(FakeHttp):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.mark.parametrize("exists, rotate, outcome", [(True, False, "already"), (True, True, "rotated"),
+                                                     (False, False, "created")])
+def test_webiq_main_gets_the_data_plane_token_only_to_create(monkeypatch, capsys, exists, rotate, outcome):
+    script = load("new_webiq_connection_tokens", ROOT / "deploy" / "stage" / "new_webiq_connection.py")
+    profile = {"environment": "dev", "subscription_id": SUBSCRIPTION, "resource_group": "rg-dev",
+               "foundry_account": "cog-tok3n", "project": "fa-dev",
+               "project_endpoint": "https://cog-tok3n.services.ai.azure.com/api/projects/fa-dev"}
+    scopes, client = [], ClientHttp(exists=exists)
+
+    class Credential:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get_token(self, scope):
+            scopes.append(scope)
+            return SimpleNamespace(token="synthetic-token")
+
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(Client=lambda **kwargs: client))
+    monkeypatch.setitem(sys.modules, "azure.identity", SimpleNamespace(AzureCliCredential=Credential))
+    monkeypatch.setattr(script, "load_config", lambda config, require_runtime: profile)
+    monkeypatch.setattr(script.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(script.getpass, "getpass", lambda prompt: "synthetic-main-key")
+    script.main(["--rotate"] if rotate else [])
+    out = capsys.readouterr().out
+    assert [json.loads(line)["connection"] for line in out.splitlines() if line.startswith("{")] == [outcome]
+    assert "synthetic-main-key" not in out and "synthetic-token" not in out
+    assert scopes == ([script.ARM_SCOPE, script.DATA_SCOPE] if outcome == "created" else [script.ARM_SCOPE])
+
+
 @pytest.mark.parametrize("exists, rotate", [(False, False), (True, True)])
 def test_webiq_names_the_connection_and_project_before_asking_for_the_key(capsys, exists, rotate):
     script = load("new_webiq_connection_where", ROOT / "deploy" / "stage" / "new_webiq_connection.py")
@@ -559,9 +684,53 @@ def test_webiq_names_the_connection_and_project_before_asking_for_the_key(capsys
                "foundry_account": "cog-tok3n", "project": "fa-dev"}
     shown, secret = [], "synthetic-where-key"
     script.ensure(FakeHttp(exists=exists), {}, profile, lambda: shown.append(capsys.readouterr().out) or secret,
-                  rotate=rotate)
+                  rotate=rotate, toolbox=set)
     assert shown == ["WebIQ connection dev-webiq-key in cog-tok3n/fa-dev\n"]
     assert secret not in capsys.readouterr().out
+
+
+class FakeVersions:
+    def __init__(self, status, versions=()):
+        self.status, self.versions, self.requests = status, versions, []
+
+    def get(self, url, headers):
+        self.requests.append(url)
+        return SimpleNamespace(status_code=self.status, json=lambda: {"data": list(self.versions)})
+
+
+def test_webiq_never_adds_a_second_connection_beside_the_one_the_toolbox_uses():
+    """2026-10-22: dev's connection is webiq-key (made before the naming rule), not the computed dev-webiq-key."""
+    script = load("new_webiq_connection_second", ROOT / "deploy" / "stage" / "new_webiq_connection.py")
+    profile = {"environment": "dev", "subscription_id": SUBSCRIPTION, "resource_group": "rg-dev",
+               "foundry_account": "cog-tok3n", "project": "fa-dev",
+               "project_endpoint": "https://cog-tok3n.services.ai.azure.com/api/projects/fa-dev"}
+    client = FakeHttp(exists=False)
+    with pytest.raises(SystemExit, match="already uses connection webiq-key, not dev-webiq-key; nothing was written"):
+        script.ensure(client, {}, profile, lambda: pytest.fail("asked for a key"), toolbox=lambda: {"webiq-key"})
+    assert [item[0] for item in client.requests] == ["GET"]
+    with pytest.raises(SystemExit, match="toolbox read-back"):
+        script.ensure(FakeHttp(exists=False), {}, profile, lambda: pytest.fail("asked for a key"))
+    # Named in the profile, the same commands reach the real connection.
+    named = {**profile, "webiq_connection": "webiq-key"}
+    rotated = FakeHttp(exists=True)
+    assert script.ensure(rotated, {}, named, lambda: "synthetic-rotated-key", rotate=True)[0] == "rotated"
+    assert [url for _, url, _ in rotated.requests] == [script.connection_url(named, "webiq-key")] * 3
+    assert "/connections/webiq-key?" in rotated.requests[0][1]
+    # A first install (no toolbox yet) or a toolbox that already uses this name still creates.
+    for used in (set(), {"dev-webiq-key"}):
+        assert script.ensure(FakeHttp(exists=False), {}, profile, lambda: "synthetic-key", toolbox=lambda: used)[0] == "created"
+    with pytest.raises(SystemExit, match="not a connection name"):
+        script.connection_name({**profile, "webiq_connection": "../other"})
+    toolbox = load("new_toolbox_named", ROOT / "deploy" / "stage" / "new_toolbox.py")
+    assert toolbox.definition(named)[0] == "webiq-key" and toolbox.definition(profile)[0] == "dev-webiq-key"
+
+    versions = FakeVersions(200, [{"tools": [{"project_connection_id": "webiq-key"}]},
+                                  {"tools": [{"type": "mcp", "project_connection_id": "other-key"}, {"type": "x"}]}])
+    assert script.toolbox_connections(versions, {}, profile) == {"webiq-key", "other-key"}
+    assert versions.requests == [profile["project_endpoint"] + "/toolboxes/fa-org-tools/versions?api-version=v1"]
+    assert script.toolbox_connections(FakeVersions(404), {}, profile) == set()
+    with pytest.raises(SystemExit, match="cannot read toolbox fa-org-tools"):
+        script.toolbox_connections(FakeVersions(403), {}, profile)
 
 
 def test_stage_keeps_its_original_webiq_names(monkeypatch):
@@ -576,6 +745,11 @@ def test_stage_keeps_its_original_webiq_names(monkeypatch):
     script = load("new_webiq_connection_stage", ROOT / "deploy" / "stage" / "new_webiq_connection.py")
     assert script.connection_name(stage) == "stage-webiq-key"
     assert "/resourceGroups/rg-faexample/" in script.connection_url(stage, "stage-webiq-key")
+    # dev names its #412 connection; its API no longer holds a WebIQ key (WebIQ-MCP retired 2026-10-22).
+    dev = json.loads((ROOT / "deploy" / "dev" / "dev.json").read_text(encoding="utf-8"))
+    assert script.connection_name(dev) == toolbox.definition(dev)[0] == "webiq-key"
+    for profile in (stage, dev):
+        assert set(profile.get("api_secret_environment") or {}) == {"FA_FEED_MCP_SIGNING_KEY"}
 
 
 def deploy_case(hooks, tmp_path, monkeypatch, api_exists, keep_select=False, **values):

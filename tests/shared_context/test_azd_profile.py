@@ -243,27 +243,40 @@ def test_profile_passes_the_ci_pre_build_checks(profile_file, monkeypatch):
 
 
 def test_a_first_install_passes_the_2di_turn_on_checks_and_a_serving_api_without_p6_does_not(profile_file,
-                                                                                            monkeypatch):
+                                                                                            monkeypatch, capsys):
     """ADR-0009 2d-ii: a new azd environment starts with 2d-i on. Its first install runs sync before fa_azd creates
     the API app, so no API serves and nothing old converges: switch_preconditions passes with no app, or with an app
-    whose revision never got ready. An environment that already serves an API without P5+P6 is still refused."""
+    whose revision never got ready. An environment that already serves an API without P5+P6 is still refused.
+    The expected not-found prints nothing (the azd e2e run 2026-10-21 showed az's raw "ERROR: Not Found" line); a
+    failed read of an app that exists still shows az's error."""
     monkeypatch.setenv("FA_DEPLOY_CONFIG", str(profile_file))
     ci = load("ci_deploy_azd_first", ROOT / "deploy" / "stage" / "ci_deploy.py")
     ci.STAGE = ci.load_config(profile_file)
     assert ci.STAGE["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] == "1"
     ci.check()
 
-    def missing(*args, **kwargs):
-        raise SystemExit("command failed (3): az rest --method GET")
-    monkeypatch.setattr(ci, "rest", missing)
-    # ARM's own answer for the app (az resource show), so the test pins the behaviour, not a helper's name.
+    # Only the az processes are stubbed: the GET goes through the real rest() and run(), so what the test sees is
+    # run()'s own copy of az's stderr. The app lookup (az resource show) answers with ARM's own text.
     lookup = {"stderr": "(ResourceNotFound) The Resource was not found."}
-    monkeypatch.setattr(ci, "subprocess", SimpleNamespace(run=lambda *a, **k: SimpleNamespace(
-        returncode=0 if not lookup["stderr"] else 3, stdout="", stderr=lookup["stderr"])))
+
+    def az(command, **kwargs):
+        if "rest" in command:
+            return SimpleNamespace(returncode=3, stdout="",
+                                   stderr='ERROR: Not Found({"error":{"code":"ResourceNotFound"}})\n')
+        return SimpleNamespace(returncode=0 if not lookup["stderr"] else 3, stdout="", stderr=lookup["stderr"])
+    monkeypatch.setattr(ci, "subprocess", SimpleNamespace(run=az))
+    capsys.readouterr()
     ci.switch_preconditions()  # no API app yet
+    assert capsys.readouterr().err == ""
     lookup["stderr"] = ""
     with pytest.raises(SystemExit, match="az rest"):  # the app exists: an unreadable one still stops
         ci.switch_preconditions()
+    assert "ERROR: Not Found" in capsys.readouterr().err
+    lookup["stderr"] = "AuthorizationFailed"  # the lookup fails too: both az errors are shown
+    with pytest.raises(SystemExit, match="lookup failed"):
+        ci.switch_preconditions()
+    shown = capsys.readouterr().err
+    assert "ERROR: Not Found" in shown and "AuthorizationFailed" in shown
 
     ready = f"{ci.STAGE['api_app']}--abcdef1-r1-1"
     app = {"properties": {"configuration": {"activeRevisionsMode": "Single"},

@@ -501,6 +501,25 @@ def test_a_hung_gate_execution_is_stopped_after_its_own_short_budget(ci_arm, cap
     assert ("POST", "stop") not in ci_arm.arm_calls
 
 
+def test_a_stop_whose_reply_fails_is_read_back_once_before_it_is_reported(ci_arm):
+    """The stop reached ARM but its reply was lost: one read of the execution says it stopped, not "stop failed"."""
+    job = f"/jobs/{ci_arm.STAGE['sync_job']}"
+    execution = ("GET", "/executions/job-execution-1")
+
+    def stop_then_lose_the_reply():
+        ci_arm.arm_responses[execution] = {"properties": {"status": "Stopped"}}
+        raise SystemExit("ARM 504 gateway timeout")
+    ci_arm.arm_responses.update({
+        ("GET", job): JOB, ("POST", "/start"): {"name": "job-execution-1"},
+        execution: {"properties": {"status": "Running"}},
+        ("POST", "/executions/job-execution-1/stop"): stop_then_lose_the_reply})
+    ci_arm.STAGE["compatibility_gate_armed"] = True
+    with pytest.raises(SystemExit, match="did not finish within 180 s") as caught:
+        ci_arm.gate(api_ref(ci_arm))
+    assert "execution reads back Stopped" in str(caught.value) and "stop failed" not in str(caught.value)
+    assert ci_arm.arm_calls[-2:] == [("POST", "stop"), ("GET", "job-execution-1")]
+
+
 def test_ci_override_is_bound_to_this_release_and_logged(ci, monkeypatch, tmp_path, capsys):
     ci.STAGE["compatibility_gate_armed"] = True
     override = {"release": "2026.10.20-31", "approved_by": "Neal", "approved_at": "2026-10-20T01:00:00+08:00",

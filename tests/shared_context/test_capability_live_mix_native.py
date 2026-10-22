@@ -31,6 +31,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.m2_copilot import ToolFailure, ToolSpec
 from shared_context.tool_catalog import StdioEntry, build_catalog, load_catalog
 from test_behavior_assistant import assistant
+from test_capability_calls import WEBIQ
 from test_capability_proxy_native import KEY, served
 from test_conversation_profile_selection import configured, select, template
 from test_instruction_flow import check_history, instruction_models
@@ -43,8 +44,12 @@ FAKE_PLAYWRIGHT = Path(__file__).with_name("fake_playwright_stdio_server.py")
 
 
 def live_like_catalog():
-    """The committed catalog as deployed (N5 toolbox entries off); only the Playwright command is swapped."""
+    """The committed catalog as deployed (N5 toolbox entries off); only the Playwright command is swapped.
+
+    The committed catalog has no mcp-api entry since WebIQ-MCP was retired (2026-10-22), so the fictional
+    WebSearch-MCP fixture stands in for the API-brokered kind."""
     committed = enabled_toolboxes(load_catalog(SOURCE), ())
+    committed = build_catalog([*committed.entries, WEBIQ])
     env = {name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP", "PATH") if name in os.environ}
     entries = []
     for entry in committed.entries:
@@ -73,7 +78,7 @@ def test_live_capability_mix_calls_every_kind(assistant, monkeypatch, caplog, de
     name = control.models.default
     control.models.models[name] = control.models.models[name].model_copy(update={"supports_image_input": True})
     monkeypatch.setitem(hosted.CAPABILITY_HANDLERS, "fa-desktop-v1", refusing_desktop)
-    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBIQ_API_KEY", KEY)
+    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBSEARCH_API_KEY", KEY)
     service_calls = []
     monkeypatch.setattr(mcp_client, "list_tools", served(mcp_client.list_tools, service_calls))
     monkeypatch.setattr(mcp_client, "call_tool", served(mcp_client.call_tool, service_calls))
@@ -91,7 +96,7 @@ def test_live_capability_mix_calls_every_kind(assistant, monkeypatch, caplog, de
         return await create(instance, **kwargs)
     monkeypatch.setattr(CopilotClient, "create_session", created)
     script = [
-        ("call-webiq", "WebIQ-MCP-web", {"query": "foundry agents"}),
+        ("call-webiq", "WebSearch-MCP-web", {"query": "foundry agents"}),
         ("call-browser", "playwright-browser_navigate", {"url": "http://127.0.0.1:9/"}),
         ("call-desktop", "desktop_read_file", {"name": "notes.txt"}),
     ]
@@ -143,7 +148,7 @@ def test_live_capability_mix_calls_every_kind(assistant, monkeypatch, caplog, de
                                 if r.getMessage().startswith(("FA_CAPABILITY_CALL", "FA_MCP_SERVER_STATUS",
                                                               "ASSISTANT_DEPENDENCY_FAILED"))])
         assert completed.state == "succeeded" and completed.result_forwarded
-    expected = sorted({*HISTORY_CAPABILITIES, "WebIQ-MCP-web", "WebIQ-MCP-browse",
+    expected = sorted({*HISTORY_CAPABILITIES, "WebSearch-MCP-web", "WebSearch-MCP-browse",
                        *(tool.name for tool in DESKTOP_TOOLS),
                        *("playwright-" + name for name in catalog.entry("playwright").tools),
                        *(("task",) if delegate else ())})
@@ -156,7 +161,7 @@ def test_live_capability_mix_calls_every_kind(assistant, monkeypatch, caplog, de
     assert "navigated:http://127.0.0.1:9/" in json.dumps(tool_messages[2])
     tool_events = [(p["kind"], p["tool_name"], p["status"]) for p in public if p["tool_name"]]
     assert tool_events == [
-        ("tool_started", "WebIQ_MCP_web", "started"), ("tool_completed", "WebIQ_MCP_web", "succeeded"),
+        ("tool_started", "WebSearch_MCP_web", "started"), ("tool_completed", "WebSearch_MCP_web", "succeeded"),
         ("tool_started", "playwright_browser_navigate", "started"),
         ("tool_completed", "playwright_browser_navigate", "succeeded"),
         ("tool_started", "desktop_read_file", "started"), ("tool_completed", "desktop_read_file", "failed")]

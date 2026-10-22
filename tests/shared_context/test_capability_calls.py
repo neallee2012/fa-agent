@@ -14,7 +14,7 @@ from shared_context.behavior_capabilities import (
     secret_environment_name,
 )
 from shared_context.behavior_capability_calls import (
-    CapabilityCall, _Once, capability_call, capability_catalog, gateway_options,
+    CapabilityCall, _Once, capability_call, capability_catalog, gateway_options, list_grant_tools,
 )
 from shared_context.errors import Problem
 from shared_context.tool_catalog import build_catalog, parse_entry_file
@@ -23,9 +23,10 @@ from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 
 KEY = "Zx9Qm2Lp7Rt4Vw8Ky3Nb6Hc1Jd5Fg0Sa"
-WEBIQ = parse_entry_file("webiq.json", json.dumps({"mcpServers": {"WebIQ-MCP": {
-    "type": "http", "url": "https://api.microsoft.ai/v3/mcp",
-    "headers": {"x-apikey": "${secret:webiq-api-key}"}, "tools": ["web", "browse"]}}}).encode())
+# A fictional mcp-api entry: the generic broker's coverage never depends on a shipped catalog file.
+WEBIQ = parse_entry_file("websearch.json", json.dumps({"mcpServers": {"WebSearch-MCP": {
+    "type": "http", "url": "https://websearch.example.test/v3/mcp",
+    "headers": {"x-apikey": "${secret:websearch-api-key}"}, "tools": ["web", "browse"]}}}).encode())
 CATALOG = build_catalog([WEBIQ])
 GRANTS = available_grants(CATALOG, ("fa-desktop-v1",))
 
@@ -46,26 +47,26 @@ def authority(catalog=CATALOG, denied=False):
 
 def listed():
     schema = {"type": "object", "properties": {"query": {"type": "string"}}}
-    return McpToolList(entry_id="WebIQ-MCP", entry_sha256=WEBIQ.entry_sha256, tools=tuple(
+    return McpToolList(entry_id="WebSearch-MCP", entry_sha256=WEBIQ.entry_sha256, tools=tuple(
         McpToolSchema(name=name, description=name, input_schema=schema, input_schema_sha256="1" * 64)
         for name in ("web", "browse")))
 
 
 def result(text="found"):
-    return McpToolResult(entry_id="WebIQ-MCP", entry_sha256=WEBIQ.entry_sha256, tool="web",
+    return McpToolResult(entry_id="WebSearch-MCP", entry_sha256=WEBIQ.entry_sha256, tool="web",
                          is_error=False, text=text, truncated=False)
 
 
-def call(tool_call_id="call-1", tool="WebIQ-MCP-web", **extra):
+def call(tool_call_id="call-1", tool="WebSearch-MCP-web", **extra):
     return CapabilityCall(request_id="capability-call", tool_call_id=tool_call_id, tool=tool,
                           arguments={"query": "fa"}, input_schema_sha256="1" * 64, **extra)
 
 
 def test_gateway_options_come_only_from_captured_grants():
     assert gateway_options(session()) == ({}, False)
-    options, images = gateway_options(session("WebIQ-MCP"))
-    assert options == {"capability_tools": frozenset({"WebIQ-MCP-web", "WebIQ-MCP-browse"})} and images is False
-    options, images = gateway_options(session("WebIQ-MCP", "fa-desktop-v1"))
+    options, images = gateway_options(session("WebSearch-MCP"))
+    assert options == {"capability_tools": frozenset({"WebSearch-MCP-web", "WebSearch-MCP-browse"})} and images is False
+    options, images = gateway_options(session("WebSearch-MCP", "fa-desktop-v1"))
     assert options["allow_images"] is True and images is True and "desktop_observe" in options["capability_tools"]
     legacy = SimpleNamespace(assignment=SimpleNamespace(task=SimpleNamespace(instruction=None)))
     assert gateway_options(legacy) == ({}, False)
@@ -79,14 +80,14 @@ def test_catalog_lists_only_current_api_grants(monkeypatch):
         assert lookup is environment_secret
         return listed()
     monkeypatch.setattr(mcp_client, "list_tools", fake_list)
-    out = capability_catalog(authority(), session("WebIQ-MCP", "fa-desktop-v1"), None, None)
-    assert [item.entry_id for item in out.entries] == ["WebIQ-MCP"] and seen == ["WebIQ-MCP"]
+    out = capability_catalog(authority(), session("WebSearch-MCP", "fa-desktop-v1"), None, None)
+    assert [item.entry_id for item in out.entries] == ["WebSearch-MCP"] and seen == ["WebSearch-MCP"]
     assert capability_catalog(authority(), session("fa-desktop-v1"), None, None).entries == ()
     with pytest.raises(Problem) as error:
-        capability_catalog(authority(catalog=build_catalog([])), session("WebIQ-MCP"), None, None)
+        capability_catalog(authority(catalog=build_catalog([])), session("WebSearch-MCP"), None, None)
     assert error.value.body["error"]["code"] == "CAPABILITY_UNAVAILABLE"
     with pytest.raises(Problem):
-        capability_catalog(authority(denied=True), session("WebIQ-MCP"), None, None)
+        capability_catalog(authority(denied=True), session("WebSearch-MCP"), None, None)
 
 
 def test_call_is_limited_to_the_grant_and_deduplicated_per_tool_call(monkeypatch, caplog):
@@ -98,26 +99,26 @@ def test_call_is_limited_to_the_grant_and_deduplicated_per_tool_call(monkeypatch
     monkeypatch.setattr(mcp_client, "call_tool", fake_call)
     once = _Once()
     with caplog.at_level(logging.INFO, logger="shared_context.behavior_capability_calls"):
-        first = capability_call(authority(), session("WebIQ-MCP"), call(), None, once=once)
-        again = capability_call(authority(), session("WebIQ-MCP"), call(), None, once=once)
+        first = capability_call(authority(), session("WebSearch-MCP"), call(), None, once=once)
+        again = capability_call(authority(), session("WebSearch-MCP"), call(), None, once=once)
     assert first == again == result() and calls == [("web", {"query": "fa"}, "1" * 64)]
-    capability_call(authority(), session("WebIQ-MCP"), call("call-2"), None, once=once)
-    capability_call(authority(), session("WebIQ-MCP", sid="b" * 64), call(), None, once=once)
+    capability_call(authority(), session("WebSearch-MCP"), call("call-2"), None, once=once)
+    capability_call(authority(), session("WebSearch-MCP", sid="b" * 64), call(), None, once=once)
     assert len(calls) == 3
     logged = [r for r in caplog.records if "FA_CAPABILITY_CALL" in r.getMessage()]
     assert logged and all(r.levelno == logging.WARNING for r in logged)
     records = [json.loads(r.getMessage().split(" ", 1)[1]) for r in logged]
-    assert records[0] == {"capability": "WebIQ-MCP", "counts_against_shared_budget": False, "job_id": "job-1",
+    assert records[0] == {"capability": "WebSearch-MCP", "counts_against_shared_budget": False, "job_id": "job-1",
                           "outcome": "ok", "session_id": "a" * 64, "tool": "web", "tool_call_id": "call-1"}
     assert KEY not in caplog.text
 
-    for tool, code in (("desktop_observe", "CAPABILITY_TOOL_DENIED"), ("WebIQ-MCP-images", "CAPABILITY_TOOL_DENIED")):
+    for tool, code in (("desktop_observe", "CAPABILITY_TOOL_DENIED"), ("WebSearch-MCP-images", "CAPABILITY_TOOL_DENIED")):
         with pytest.raises(Problem) as error:
-            capability_call(authority(), session("WebIQ-MCP", "fa-desktop-v1"), call("x", tool=tool), None, once=once)
+            capability_call(authority(), session("WebSearch-MCP", "fa-desktop-v1"), call("x", tool=tool), None, once=once)
         assert error.value.body["error"]["code"] == code
     with pytest.raises(Problem) as error:
-        capability_call(authority(), session("WebIQ-MCP"), CapabilityCall(
-            request_id="capability-call", tool_call_id="big", tool="WebIQ-MCP-web",
+        capability_call(authority(), session("WebSearch-MCP"), CapabilityCall(
+            request_id="capability-call", tool_call_id="big", tool="WebSearch-MCP-web",
             arguments={"query": "x" * 20000}, input_schema_sha256="1" * 64), None, once=once)
     assert error.value.body["error"]["code"] == "CAPABILITY_ARGUMENTS"
     assert len(calls) == 3
@@ -136,7 +137,7 @@ def test_concurrent_duplicates_call_the_service_once_and_share_errors(monkeypatc
 
     def worker():
         try:
-            capability_call(authority(), session("WebIQ-MCP"), call("dup"), None, once=once)
+            capability_call(authority(), session("WebSearch-MCP"), call("dup"), None, once=once)
         except Problem as error:
             errors.append(error.body["error"]["code"])
     threads = [threading.Thread(target=worker) for _ in range(3)]
@@ -167,13 +168,13 @@ def test_inflight_tool_keeps_original_id_when_other_calls_fill_the_cache(monkeyp
     once = _Once()
     original = call("original-id").model_copy(update={"arguments": {"query": "original-running"}})
     with ThreadPoolExecutor(max_workers=2) as clients:
-        first = clients.submit(capability_call, authority(), session("WebIQ-MCP"), original, None, once=once)
+        first = clients.submit(capability_call, authority(), session("WebSearch-MCP"), original, None, once=once)
         try:
             assert entered.wait(5)
             for identity in ("other-1", "other-2"):
                 command = call(identity).model_copy(update={"arguments": {"query": identity}})
-                capability_call(authority(), session("WebIQ-MCP"), command, None, once=once)
-            repeated = clients.submit(capability_call, authority(), session("WebIQ-MCP"), original, None, once=once)
+                capability_call(authority(), session("WebSearch-MCP"), command, None, once=once)
+            repeated = clients.submit(capability_call, authority(), session("WebSearch-MCP"), original, None, once=once)
         finally:
             release.set()
         assert first.result(timeout=5) == repeated.result(timeout=5) == result("original-running")
@@ -195,15 +196,15 @@ def test_full_inflight_cache_refuses_new_call_without_losing_original_unknown(mo
     monkeypatch.setattr(mcp_client, "call_tool", lost_reply)
     once = _Once()
     with ThreadPoolExecutor(max_workers=1) as clients:
-        original = clients.submit(capability_call, authority(), session("WebIQ-MCP"), call(), None, once=once)
+        original = clients.submit(capability_call, authority(), session("WebSearch-MCP"), call(), None, once=once)
         try:
             assert entered.wait(5)
             with pytest.raises(Problem) as refused:
-                capability_call(authority(), session("WebIQ-MCP"), call("new-call"), None, once=once)
+                capability_call(authority(), session("WebSearch-MCP"), call("new-call"), None, once=once)
             assert refused.value.body["error"]["code"] == "CAPABILITY_UNAVAILABLE"
             assert invoked == [{"query": "fa"}]
             with pytest.raises(Problem) as changed:
-                capability_call(authority(), session("WebIQ-MCP"),
+                capability_call(authority(), session("WebSearch-MCP"),
                     call().model_copy(update={"arguments": {"query": "different"}}), None, once=once)
             assert changed.value.body["error"]["code"] == "CAPABILITY_CALL_CONFLICT"
         finally:
@@ -211,7 +212,7 @@ def test_full_inflight_cache_refuses_new_call_without_losing_original_unknown(mo
         with pytest.raises(Problem) as lost:
             original.result(timeout=5)
     with pytest.raises(Problem) as replayed:
-        capability_call(authority(), session("WebIQ-MCP"), call(), None, once=once)
+        capability_call(authority(), session("WebSearch-MCP"), call(), None, once=once)
     assert replayed.value is lost.value
     assert invoked == [{"query": "fa"}]
 
@@ -221,23 +222,23 @@ def test_unexpected_failures_are_unknown_and_results_must_match_the_entry(monkey
         raise RuntimeError("socket details " + KEY)
     monkeypatch.setattr(mcp_client, "call_tool", boom)
     with pytest.raises(Problem) as error:
-        capability_call(authority(), session("WebIQ-MCP"), call("boom"), None, once=_Once())
+        capability_call(authority(), session("WebSearch-MCP"), call("boom"), None, once=_Once())
     assert error.value.body["error"]["code"] == "CAPABILITY_UNAVAILABLE" and KEY not in json.dumps(error.value.body)
 
     async def other(*args, **kwargs):
         return result().model_copy(update={"entry_sha256": "2" * 64})
     monkeypatch.setattr(mcp_client, "call_tool", other)
     with pytest.raises(Problem) as error:
-        capability_call(authority(), session("WebIQ-MCP"), call("other"), None, once=_Once())
+        capability_call(authority(), session("WebSearch-MCP"), call("other"), None, once=_Once())
     assert error.value.body["error"]["code"] == "CAPABILITY_RESULT_INVALID"
 
 
 def test_secret_lookup_uses_the_deploy_line_environment_name(monkeypatch):
-    assert secret_environment_name("webiq-api-key") == "FA_CAPABILITY_SECRET_WEBIQ_API_KEY"
-    monkeypatch.delenv("FA_CAPABILITY_SECRET_WEBIQ_API_KEY", raising=False)
-    assert environment_secret("webiq-api-key") is None
-    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBIQ_API_KEY", KEY)
-    assert environment_secret("webiq-api-key") == KEY
+    assert secret_environment_name("websearch-api-key") == "FA_CAPABILITY_SECRET_WEBSEARCH_API_KEY"
+    monkeypatch.delenv("FA_CAPABILITY_SECRET_WEBSEARCH_API_KEY", raising=False)
+    assert environment_secret("websearch-api-key") is None
+    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBSEARCH_API_KEY", KEY)
+    assert environment_secret("websearch-api-key") == KEY
 
 
 def test_same_tool_call_id_with_different_content_is_refused_not_resent(monkeypatch):
@@ -248,16 +249,16 @@ def test_same_tool_call_id_with_different_content_is_refused_not_resent(monkeypa
         return result()
     monkeypatch.setattr(mcp_client, "call_tool", fake_call)
     once = _Once()
-    capability_call(authority(), session("WebIQ-MCP"), call("same-id"), None, once=once)
-    for changed in (CapabilityCall(request_id="capability-call", tool_call_id="same-id", tool="WebIQ-MCP-web",
+    capability_call(authority(), session("WebSearch-MCP"), call("same-id"), None, once=once)
+    for changed in (CapabilityCall(request_id="capability-call", tool_call_id="same-id", tool="WebSearch-MCP-web",
                                    arguments={"query": "other"}, input_schema_sha256="1" * 64),
-                    call("same-id", tool="WebIQ-MCP-browse"),
-                    CapabilityCall(request_id="capability-call", tool_call_id="same-id", tool="WebIQ-MCP-web",
+                    call("same-id", tool="WebSearch-MCP-browse"),
+                    CapabilityCall(request_id="capability-call", tool_call_id="same-id", tool="WebSearch-MCP-web",
                                    arguments={"query": "fa"}, input_schema_sha256="2" * 64)):
         with pytest.raises(Problem) as error:
-            capability_call(authority(), session("WebIQ-MCP"), changed, None, once=once)
+            capability_call(authority(), session("WebSearch-MCP"), changed, None, once=once)
         assert error.value.status == 409 and error.value.body["error"]["code"] == "CAPABILITY_CALL_CONFLICT"
-    assert capability_call(authority(), session("WebIQ-MCP"), call("same-id"), None, once=once) == result()
+    assert capability_call(authority(), session("WebSearch-MCP"), call("same-id"), None, once=once) == result()
     assert calls == [{"query": "fa"}]
 
 
@@ -279,7 +280,7 @@ def test_hosted_proxy_reaches_the_api_route_once_per_tool_call_and_keeps_refusal
     original, seen = hosted.run_copilot, []
 
     async def call_then_reply(**options):
-        tool = next(spec for spec in options["tools"] if spec.name == "WebIQ-MCP-web")
+        tool = next(spec for spec in options["tools"] if spec.name == "WebSearch-MCP-web")
         packet = {"session_id": options["sdk_session_id"], "tool_call_id": "proxy-call", "arguments": {"query": "fa"}}
         seen.append((await tool.handler(packet)).text)
         seen.append((await tool.handler(packet)).text)
@@ -288,7 +289,7 @@ def test_hosted_proxy_reaches_the_api_route_once_per_tool_call_and_keeps_refusal
         seen.append(refused.value.public_code)
         return await original(**options)
     monkeypatch.setattr(hosted, "run_copilot", call_then_reply)
-    choice, _ = choose(h, "choose-web", ("WebIQ-MCP",))
+    choice, _ = choose(h, "choose-web", ("WebSearch-MCP",))
     assert choice.status_code == 200, choice.text
     turn(h, control, "proxy-call")
     assert calls == [("web", {"query": "fa"}), ("web", {"query": "no-key"})]
@@ -392,7 +393,7 @@ def test_hosted_waits_longer_than_the_api_route_bound_so_completed_calls_are_not
         seen.append((action, options["timeout"]))
     owner = SimpleNamespace(_post=post)
     hosted.AssistantClient.capability_catalog(owner)
-    hosted.AssistantClient.call_capability(owner, "call-1", "WebIQ-MCP-web", {"query": "fa"}, "1" * 64)
+    hosted.AssistantClient.call_capability(owner, "call-1", "WebSearch-MCP-web", {"query": "fa"}, "1" * 64)
     assert [action for action, _ in seen] == ["capability-catalog", "capability-call"]
     assert all(timeout.read == CAPABILITY_CLIENT_SECONDS > CAPABILITY_ROUTE_SECONDS for _, timeout in seen)
 
@@ -400,7 +401,7 @@ def test_hosted_waits_longer_than_the_api_route_bound_so_completed_calls_are_not
         timeouts.append(timeout)
         return result()
     monkeypatch.setattr(mcp_client, "call_tool", fake_call)
-    capability_call(authority(), session("WebIQ-MCP"), call("bounded"), None, once=_Once())
+    capability_call(authority(), session("WebSearch-MCP"), call("bounded"), None, once=_Once())
     assert timeouts == [CAPABILITY_ROUTE_SECONDS]
 
 
@@ -427,6 +428,41 @@ def test_catalog_reads_share_one_route_bound(monkeypatch):
     with pytest.raises(Problem) as error:
         capability_catalog(authority(catalog=catalog), both, None, None, seconds=10.0)
     assert error.value.body["error"]["code"] == "CAPABILITY_UNAVAILABLE" and budgets == [10.0]
+
+
+def test_the_native_listing_names_a_grant_that_cannot_list_and_still_lists_the_others(monkeypatch, caplog):
+    second = parse_entry_file("other.json", json.dumps({"mcpServers": {"Other-MCP": {
+        "type": "http", "url": "https://other.test/mcp", "headers": {"x-apikey": "${secret:other-key}"},
+        "tools": ["find"]}}}).encode())
+    runtime = SimpleNamespace(capability_catalog=build_catalog([WEBIQ, second]))
+    grants = available_grants(runtime.capability_catalog)
+    both = tuple(grants[name] for name in sorted(grants))
+    failure = {"WebSearch-MCP": ("CAPABILITY_NEEDS_AUTH", 503)}
+
+    async def fake_list(entry, lookup, **_):
+        if entry.entry_id in failure:
+            code, status = failure[entry.entry_id]
+            raise Problem(status, code, f"rejected {KEY}", capability=entry.entry_id)
+        return McpToolList(entry_id=entry.entry_id, entry_sha256=entry.entry_sha256, tools=())
+    monkeypatch.setattr(mcp_client, "list_tools", fake_list)
+    caplog.set_level(logging.WARNING)
+    out = list_grant_tools(runtime, both, degrade=True)
+    assert [item.entry_id for item in out.entries] == ["Other-MCP"]
+    assert [item.model_dump() for item in out.unavailable] == [{"entry_id": "WebSearch-MCP", "reason": "upstream_auth"}]
+    assert KEY not in caplog.text and KEY not in out.model_dump_json()
+    failure["WebSearch-MCP"] = ("CAPABILITY_UNAVAILABLE", 503)
+    assert list_grant_tools(runtime, both, degrade=True).unavailable[0].reason == "service_error"
+    # A full listing is the same wire as before, so an older Hosted still reads it.
+    failure.clear()
+    assert '"unavailable"' not in list_grant_tools(runtime, both, degrade=True).model_dump_json()
+    # A definite answer still refuses, and the legacy route never degrades.
+    for code, status, kwargs in (("CAPABILITY_TOOL_UNAVAILABLE", 503, {"degrade": True}),
+                                 ("CAPABILITY_EXECUTION_DENIED", 403, {"degrade": True}),
+                                 ("CAPABILITY_NEEDS_AUTH", 503, {})):
+        failure["WebSearch-MCP"] = (code, status)
+        with pytest.raises(Problem) as refused:
+            list_grant_tools(runtime, both, **kwargs)
+        assert refused.value.body["error"]["code"] == code
 
 
 def test_a_browser_grant_on_an_image_without_its_command_is_refused_before_the_sdk_starts(assistant, monkeypatch):
@@ -476,14 +512,14 @@ def test_an_unexpected_route_failure_logs_its_action_and_exception_type_only(ass
     original, codes = hosted.run_copilot, []
 
     async def call_then_reply(**options):
-        tool = next(spec for spec in options["tools"] if spec.name == "WebIQ-MCP-web")
+        tool = next(spec for spec in options["tools"] if spec.name == "WebSearch-MCP-web")
         with pytest.raises(ToolFailure) as refused:
             await tool.handler({"session_id": options["sdk_session_id"], "tool_call_id": "broken-call",
                                 "arguments": {"query": "fa"}})
         codes.append(refused.value.public_code)
         return await original(**options)
     monkeypatch.setattr(hosted, "run_copilot", call_then_reply)
-    choice, _ = choose(h, "choose-web", ("WebIQ-MCP",))
+    choice, _ = choose(h, "choose-web", ("WebSearch-MCP",))
     assert choice.status_code == 200, choice.text
     with caplog.at_level(logging.WARNING, logger="shared_context.behavior_assistant_api"):
         turn(h, control, "broken-route")

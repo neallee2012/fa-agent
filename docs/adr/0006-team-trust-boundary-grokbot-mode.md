@@ -194,6 +194,7 @@ Grokbot 的做法（外部唯讀調查）：入口驗一次身分，之後整個
 
 - **秘密不發給 VM**：秘密一旦進了 VM，就可能被 prompt injection 誘導送出去；被複製走的金鑰在團隊以外也能用，會打破團隊隔離。Foundry Toolbox 的存取權是 project 層級，無法區分團隊，所以也不用它來做團隊控制（[toolbox](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/toolbox)）。
 - **撤權**：下一回合入口重新擷取能力清單時生效。
+- **WebIQ 改走官方 toolbox（2026-10-22 註記）**：上表「有共用秘密的 connector」一列的 WebIQ 例子已被 [ADR-0007 N5](0007-foundry-hosted-native-first.md) 取代。Neal 2026-10-22 決定「只留 toolbox」：WebIQ 的 key 只放 Foundry project connection，由 toolbox `fa-org-tools` 使用，API 和 VM 都拿不到；API broker 路徑 `WebIQ-MCP` 和 API 的 secret 已退場（[README](../../src/fa-shared-context-poc/README.md#webiq-toolbox-only)）。toolbox 是 project 層級、沒有 Team ACL，這點對**組織共用**的 WebIQ 不構成問題。其他有共用秘密、沒有官方 toolbox 的 connector 仍走 API broker（通用的 `mcp-api` 保留）。
 
 #### B. 跨 VM 傳話：收件匣模式（T5，fcd 負責；Neal 2026-10-01 15:35 決定）
 

@@ -1,7 +1,6 @@
 """The API keeps an Agent's known reader binding; Hosted or an environment change says when to read it again."""
 
 import json
-from threading import Event
 
 import httpx
 import pytest
@@ -17,7 +16,7 @@ from shared_context.behavior_native_turn_wire import NativeEnvironmentView, Nati
 from shared_context.native_turns import _RECORD_READS
 from test_native_routine_api import routine_api
 from test_native_responses_api import PREFIX as RESPONSES_PREFIX, responses_api
-from test_native_turn_api import PREFIX, NativeTransport, native_api, submit
+from test_native_turn_api import PREFIX, NativeTransport, in_flight, native_api, submit
 from test_conversation_transfer_startup import synthetic_standing_v1
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
@@ -233,7 +232,7 @@ def test_a_new_conversation_after_the_selector_moved_never_invokes_the_kept_old_
     assert platform.version_lookups == 2
 
 
-def test_a_follow_up_prefetch_never_reads_the_conversation_on_the_kept_old_session(native_api, monkeypatch):
+def test_a_follow_up_never_reads_the_conversation_on_the_kept_old_session(native_api, monkeypatch):
     case = native_api
     platform = Platform(case, monkeypatch)
     assert submit(case).status_code == 202
@@ -351,31 +350,20 @@ def test_the_version_locator_keeps_its_bounded_page_when_only_other_versions_are
     assert locate(*["40"] * 99, "42", status="deleted").agent_version == "42"
 
 
-def test_a_follow_up_after_the_selector_check_expired_still_prefetches_on_the_confirmed_reader(native_api, monkeypatch):
+def test_a_follow_up_after_the_selector_check_expired_reads_its_conversation_on_the_confirmed_reader(
+        native_api, monkeypatch):
     case = native_api
     platform = Platform(case, monkeypatch)
     assert submit(case).status_code == 202
     case.remote.completed("native-rid")
     source = case.remote.target.session_id
-    hosted, conversation_started, overlapped = case.remote, Event(), []
-
-    def route(request):
-        operation = json.loads(request.content)["operation"]
-        if operation == "conversation":
-            conversation_started.set()
-        elif operation == "session_read":
-            # The prefetched conversation read is already running while the session is confirmed; a read that
-            # only starts after the confirmation never arrives here in time.
-            overlapped.append(conversation_started.wait(timeout=5))
-        return hosted(request)
-
-    platform.hosted[source] = route
     past_selector_check(monkeypatch)
     platform.invoked.clear()
+    most = in_flight(monkeypatch)
     assert submit(case, rid="native-rid-2", conversation_id="native-cid").status_code == 202
-    assert overlapped == [True]
-    assert [operation for _, operation in platform.invoked].count("conversation") == 1
-    assert {sid for sid, _ in platform.invoked} == {source}
+    # The conversation is read once, after the session read (never alongside it: README#rtt-a-submit-prefetch).
+    assert most == {source: 1}
+    assert platform.invoked == [(source, "session_read"), (source, "conversation"), (source, "submit")]
 
 
 def test_a_selected_version_without_a_session_never_invokes_an_older_one_and_the_same_rid_waits(native_api, monkeypatch):

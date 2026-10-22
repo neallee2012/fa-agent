@@ -407,11 +407,15 @@ def test_without_the_registered_flag_a_registered_agent_keeps_v1(monkeypatch):
     assert created["agent-r"]["environment_variables"] == created["agent-a"]["environment_variables"] == SERVED
 
 
-def test_a_registered_agent_declaring_no_native_profile_is_untouched(monkeypatch):
-    """Not an assistant (an executor's definition declares no FA_NATIVE_TURNS, seed_agents._env): no v2 is added."""
+def test_a_registered_agent_declaring_no_native_profile_is_untouched(monkeypatch, caplog):
+    """Not an assistant (an executor's definition declares no FA_NATIVE_TURNS, seed_agents._env): no v2 is added,
+    and the skip is logged, not silent."""
+    caplog.set_level("INFO", logger=versions.__name__)
     served = {key: value for key, value in SERVED.items() if key != "FA_NATIVE_TURNS"}
-    _, _, created = _sync_registered(monkeypatch, served, native_v2_registered=True)
+    _, registered, created = _sync_registered(monkeypatch, served, native_v2_registered=True)
     assert created["agent-r"]["environment_variables"] == served
+    skipped = [record.getMessage() for record in caplog.records if "v2 not added" in record.getMessage()]
+    assert len(skipped) == 1 and registered.agent_id in skipped[0] and "FA_NATIVE_TURNS=None" in skipped[0]
 
 
 @pytest.mark.parametrize("on", [True, False])

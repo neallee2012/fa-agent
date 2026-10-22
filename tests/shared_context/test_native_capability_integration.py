@@ -50,12 +50,13 @@ from shared_context.behavior_capabilities import (
 from shared_context.errors import Problem
 from shared_context.m3_auth import HumanApprover
 from shared_context.m3_models import ApprovalInput, CreateArtifact, VersionInput
-from shared_context.tool_catalog import load_catalog
+from shared_context.tool_catalog import build_catalog, load_catalog
 from hosted_versions_stub import deployed_versions
 from sdk_checkpoint_local import sse
 from test_agent_runtime import peer_runtime  # noqa: F401
 from test_agent_runtime_routing import agent_headers
 from test_approved_skill_api import BODY as SKILL_BODY
+from test_capability_calls import WEBIQ
 from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
 from test_instruction_flow import instruction_models  # noqa: F401
 from test_instruction_responses_native import response_bytes
@@ -78,8 +79,9 @@ CATALOG_ROOT = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-
 
 
 def deployed_catalog():
-    """The committed catalog as the API loads it by default: N5 toolbox entries stay off."""
-    return enabled_toolboxes(load_catalog(CATALOG_ROOT), ())
+    """The committed catalog as the API loads it by default: N5 toolbox entries stay off. It has no mcp-api entry
+    since WebIQ-MCP was retired (2026-10-22), so the fictional WebSearch-MCP fixture keeps that kind in the mix."""
+    return build_catalog([*enabled_toolboxes(load_catalog(CATALOG_ROOT), ()).entries, WEBIQ])
 
 
 def api_application(composition):
@@ -473,7 +475,7 @@ def test_a_subset_preserves_full_template_and_original_result_with_real_consumer
         else:
             assert {"read_context", "read_skill", "stage_memory_candidate", "task"} <= names
             assert not ({"run_command", "desktop_observe", "save_skill_draft", "deliver_image",
-                         "send_agent_message", "WebIQ-MCP-web", "playwright-browser_navigate"} & names)
+                         "send_agent_message", "WebSearch-MCP-web", "playwright-browser_navigate"} & names)
         tool, arguments, text = None, None, None
         if count == 1:
             assert TEXT in json.dumps(body["input"]).replace("\\n", "\n")
@@ -557,7 +559,7 @@ def test_b_v1_completions_does_not_inherit_optional_capabilities_from_the_team_c
         assert {"read_context", "execute_operation"} <= names
         assert not {"task", "read_skill", "run_command", "stage_memory_candidate", "save_skill_draft",
                     "deliver_image", "send_agent_message"} & names
-        assert not any(name.startswith(("WebIQ-MCP-", "playwright-", "desktop_")) for name in names)
+        assert not any(name.startswith(("WebSearch-MCP-", "playwright-", "desktop_")) for name in names)
         return sse(request, {"content": "B kept its own Completions configuration."}, 1)
 
     h.runtime.executor.model_transport = httpx.MockTransport(model)
@@ -853,7 +855,7 @@ def test_a_all_ten_capabilities_share_original_ui_turn_and_image_readback(
     monkeypatch.setattr(behavior_desktop, "SubprocessRunner", lambda: desktop)
     monkeypatch.setattr(behavior_desktop_capability, "is_dumpable", lambda: False)
     monkeypatch.setattr(behavior_desktop_tools, "is_dumpable", lambda: False)
-    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBIQ_API_KEY", KEY)
+    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBSEARCH_API_KEY", KEY)
     web_calls, shell_calls, shell_closed = [], [], []
     monkeypatch.setattr(mcp_client, "list_tools", served(mcp_client.list_tools, web_calls))
     monkeypatch.setattr(mcp_client, "call_tool", served(mcp_client.call_tool, web_calls))
@@ -907,13 +909,13 @@ def test_a_all_ten_capabilities_share_original_ui_turn_and_image_readback(
         if count == 12:
             assert names == set()
         else:
-            assert {"WebIQ-MCP-web", "WebIQ-MCP-browse", "run_command", "desktop_open_file", "desktop_act",
+            assert {"WebSearch-MCP-web", "WebSearch-MCP-browse", "run_command", "desktop_open_file", "desktop_act",
                     "desktop_read_file", "playwright-browser_navigate", "playwright-browser_snapshot",
                     "read_skill", "stage_memory_candidate", "task", "deliver_image", "save_skill_draft",
                     "send_agent_message", "read_context"} <= names
         tool, arguments, text = None, None, None
         if count == 1:
-            tool, arguments = "WebIQ-MCP-web", {"query": "C6 public sample"}
+            tool, arguments = "WebSearch-MCP-web", {"query": "C6 public sample"}
         elif count == 2:
             result = tool_result(body, "call_1")
             assert result["tool"] == "web" and result["is_error"] is False

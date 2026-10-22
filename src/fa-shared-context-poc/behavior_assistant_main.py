@@ -11,6 +11,7 @@ from shared_context.behavior_assistant_hosted import AssistantHostedRuntime
 from shared_context.behavior_desktop_view import install_desktop_view
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_process_hardening import disable_dumpable
+from shared_context import sdk_telemetry
 
 
 def create_assistant_host():
@@ -25,6 +26,7 @@ def create_assistant_host():
 def main():
     # Same-UID desktop or tool children must not read this process's environment or memory.
     disable_dumpable()
+    sdk_telemetry.export_logs()
     app = create_assistant_host()
     install_desktop_view(app)
     app.run()

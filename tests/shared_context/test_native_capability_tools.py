@@ -4,6 +4,7 @@ Offline transport only: no SDK, model, network or MCP server runs.
 """
 
 import json
+import logging
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -12,8 +13,9 @@ import pytest
 
 from shared_context import behavior_capability_calls, mcp_client
 from shared_context.behavior_capabilities import (
-    BUILTIN_CAPABILITIES, CAPABILITY_TOOL_GUIDANCE, McpToolResult, _grant,
+    BUILTIN_CAPABILITIES, CAPABILITY_TOOL_GUIDANCE, TOOLBOX_UNAVAILABLE, McpToolResult, _grant,
 )
+from shared_context.native_assembly import NativeAssemblyCollector
 from shared_context.behavior_native_capability_wire import NativeCapabilityCall, NativeSkillRead, NativeTurnScope
 from shared_context.behavior_sdk_state import NativeCheckpointScope
 from shared_context.errors import Problem
@@ -95,7 +97,7 @@ def offline_mcp(monkeypatch):
     upstream = []
 
     async def fake_list(entry, lookup, **_):
-        assert lookup("webiq-api-key") == KEY
+        assert lookup("websearch-api-key") == KEY
         return listed()
 
     async def fake_call(entry, lookup, tool, arguments, *, expected_schema_sha256=None, **_):
@@ -109,7 +111,7 @@ def offline_mcp(monkeypatch):
         except StopIteration as done:
             return done.value
         raise AssertionError("the offline MCP fake must not await")
-    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBIQ_API_KEY", KEY)
+    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBSEARCH_API_KEY", KEY)
     monkeypatch.setattr(mcp_client, "list_tools", fake_list)
     monkeypatch.setattr(mcp_client, "call_tool", fake_call)
     monkeypatch.setattr(behavior_capability_calls, "_run", run_without_loop)
@@ -224,7 +226,7 @@ def test_unserved_and_unreadable_api_answers_log_a_fixed_reason(skilled_http, of
     assert unserved.value.body["error"]["code"] == UNKNOWN
     assert (f"NATIVE_CAPABILITY_FAILED route=/catalog stage=response_status code={UNKNOWN} reason=http_status=503"
             in caplog.text)
-    assert f"FA_NATIVE_CAPABILITY_BIND_FAILED entries=WebIQ-MCP code={UNKNOWN} exception_type=Problem" in caplog.text
+    assert f"FA_NATIVE_CAPABILITY_BIND_FAILED entries=WebSearch-MCP code={UNKNOWN} exception_type=Problem" in caplog.text
     caplog.clear()
     upstream.status = None
     upstream.transport = httpx.MockTransport(lambda request: httpx.Response(200, text="CANARY-NOT-JSON"))
@@ -308,3 +310,70 @@ def test_a_kept_skill_catalog_skips_the_bind_read_only_for_the_same_still_approv
     with pytest.raises(Problem) as changed:
         bind_turn("skills-3")
     assert changed.value.body["error"]["code"] == REFUSED and reads() == 2
+
+
+def failing_list(monkeypatch, status, code):
+    async def failed(entry, lookup, **_):
+        raise Problem(status, code, "the capability service did not list its tools", capability=entry.entry_id)
+    monkeypatch.setattr(mcp_client, "list_tools", failed)
+
+
+def test_an_mcp_api_grant_that_cannot_list_leaves_only_itself_out_of_the_turn(
+        skilled_http, offline_mcp, monkeypatch, caplog):
+    # dev 2026-10-22: WebIQ rejected the key, the API answered 503 CAPABILITY_NEEDS_AUTH and every turn was refused.
+    (case, refs), (loop, _) = skilled_http
+    caplog.set_level(logging.WARNING)
+    failing_list(monkeypatch, 503, "CAPABILITY_NEEDS_AUTH")
+    upstream = Upstream(case)
+    context = context_for(case, started(case, (SKILLS, WEB), skills=refs, rid="needs-auth-rid"))
+    context.assembly = NativeAssemblyCollector(context.receipt)
+    tools = bind(loop, context, upstream)
+    assert set(tools) == {"read_skill", *WEB.tools}
+    read = loop.run_until_complete(tools["read_skill"][0].handler(packet("read_skill", {"name": "receipt-guide"}, "s")))
+    assert PurposeSkillReadResult.model_validate_json(read.text).text == BODY
+    web = tools[WEB.tools[0]][0]
+    assert web.description == ("Unavailable this turn: WebSearch-MCP could not list its tools. "
+                               "Calling it only reports that.")
+    with pytest.raises(ToolFailure) as unavailable:
+        loop.run_until_complete(web.handler(packet(web.name, {"query": "fa"}, "web-1")))
+    assert unavailable.value.public_code == TOOLBOX_UNAVAILABLE
+    assert offline_mcp == [] and not any(suffix == "/call" for suffix, _, _ in upstream.calls)
+    assert [item.model_dump() for item in context.assembly.unavailable_sources.values()] == [{
+        "entry_id": "WebSearch-MCP", "source": "WebSearch-MCP", "code": "TOOLBOX_LIST_FAILED", "reason": "upstream_auth"}]
+    lines = [record.getMessage() for record in caplog.records]
+    assert "FA_CAPABILITY_LIST_UNAVAILABLE entry=WebSearch-MCP code=CAPABILITY_NEEDS_AUTH" in lines
+    assert (f"FA_NATIVE_TOOL_SOURCE_UNAVAILABLE agent_id={context.receipt.agent_id} request_id=needs-auth-rid "
+            "entry=WebSearch-MCP code=TOOLBOX_LIST_FAILED reason=upstream_auth") in lines
+    assert not any(line.startswith("FA_NATIVE_CAPABILITY_BIND_FAILED") for line in lines), lines
+    assert KEY not in caplog.text
+    # Nothing is kept: the next turn lists the grant again and binds it as listed.
+    async def listed_again(entry, lookup, **_):
+        return listed()
+    monkeypatch.setattr(mcp_client, "list_tools", listed_again)
+    again = bind(loop, context_for(case, started(case, (WEB,), rid="listed-again-rid")), upstream)
+    assert sum(suffix == "/catalog" for suffix, _, _ in upstream.calls) == 2
+    assert again[WEB.tools[0]][0].description != web.description
+
+
+@pytest.mark.parametrize("status,code,refused", [
+    (403, "CAPABILITY_EXECUTION_DENIED", REFUSED),
+    (503, "CAPABILITY_TOOL_UNAVAILABLE", UNKNOWN),
+    (502, "CAPABILITY_SCHEMA_INVALID", UNKNOWN),
+])
+def test_a_definite_mcp_api_listing_refusal_still_refuses_the_turn(
+        skilled_http, offline_mcp, monkeypatch, status, code, refused):
+    (case, refs), (loop, _) = skilled_http
+    failing_list(monkeypatch, status, code)
+    with pytest.raises(Problem) as failed:
+        bind(loop, context_for(case, started(case, (SKILLS, WEB), skills=refs, rid="refused-rid")), Upstream(case))
+    assert failed.value.body["error"]["code"] == refused
+
+
+def test_an_mcp_api_scope_refusal_still_refuses_the_turn(skilled_http, offline_mcp):
+    # The route's own 403 (team boundary, scope) is not a listing that merely failed.
+    (case, _), (loop, _) = skilled_http
+    upstream = Upstream(case)
+    upstream.status = 403
+    with pytest.raises(Problem) as failed:
+        bind(loop, context_for(case, started(case, (WEB,), rid="scope-rid")), upstream)
+    assert failed.value.body["error"]["code"] == REFUSED

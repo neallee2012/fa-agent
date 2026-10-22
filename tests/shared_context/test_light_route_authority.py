@@ -209,7 +209,7 @@ def test_pre_sdk_catalogs_run_together_but_report_the_first_failure_in_original_
     monkeypatch.setattr(hosted, "CAPABILITY_HANDLERS", {})
     monkeypatch.setattr(hosted, "run_copilot", lambda **_: pytest.fail("the SDK must not start"))
     catalogs = _Catalogs("attached", fast)
-    captured = None if capture is None else CapabilityCapture(head_selection_id=None, grants=(GRANTS["WebIQ-MCP"],))
+    captured = None if capture is None else CapabilityCapture(head_selection_id=None, grants=(GRANTS["WebSearch-MCP"],))
     session = hosted.AssistantSession(_client(profile, catalogs, capture=captured),
                                       root=tmp_path, runtime_path=tmp_path / "not-started")
     with pytest.raises(Problem) as error:

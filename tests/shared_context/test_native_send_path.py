@@ -8,13 +8,14 @@ real source and destination Hosted runtimes behind the real API (``file_api``)."
 
 import json
 import logging
+import time
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from azure.ai.projects.models import AgentSessionResource
 
-from shared_context import behavior_native_sessions
+from shared_context import behavior_native_sessions, behavior_native_turn_api
 from shared_context.behavior_foundry import PLATFORM_NO_RETRY
 from shared_context.behavior_native_sessions import (
     NativeSessions, fresh_session_id, native_session_id, native_sessions,
@@ -131,6 +132,20 @@ def metadata(monkeypatch, versions, status="active"):
             "kind": "hosted", "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2"}})
 
     project_client(monkeypatch, get_session=get_session, get_version=get_version)
+
+
+def next_tick(monkeypatch):
+    """The next request starts on a later ``monotonic()`` tick than the last one's binding row read, as on Linux.
+
+    Windows ticks every 15.6 ms, so two back-to-back submits can share a tick and the second reuses the first's row
+    read (``bound_row`` keeps a read started at or after the submit's start), missing a row written between them.
+    One second later stays far inside ``SELECTOR_CHECK_SECONDS`` and ``METADATA_REUSE_SECONDS``; the clock still runs,
+    so the in-request wait ends."""
+    real = time.monotonic
+    # Both modules: shifting only the sessions clock would date the kept read after every submit start, so it would
+    # always be reused. One fixed shift covers one more submit; a third submit in the same test needs another tick.
+    for module in (behavior_native_sessions, behavior_native_turn_api):  # the kept row's tick and the submit's start
+        monkeypatch.setattr(module, "monotonic", lambda: real() + 1)
 
 
 # --- §4 step 6, phase 3 test column: a different compatible version -------------------------------------------------
@@ -410,7 +425,7 @@ def _following(case, monkeypatch, state="pending", hosted_session_id="fa-native-
 
 def test_a_moved_selector_never_calls_the_rows_sid_before_the_follow(bound, monkeypatch):
     """Review probe: the row's SID (created on 41, idle) is not the version the selector now picks (42). The
-    follow-up's prefetch and the session read both used to reach it first (``conversation``, ``session_read``),
+    follow-up's conversation prefetch (removed 2026-10-22) and the session read both used to reach it first,
     which wakes an idle source on the platform; the retained follow decides now, and nothing reaches that SID."""
     case = bound
     assert submit(case).status_code == 202  # claims the row at the fixture's SID
@@ -425,6 +440,66 @@ def test_a_moved_selector_never_calls_the_rows_sid_before_the_follow(bound, monk
     assert error["not_dispatched"] is True and error["server_following"] is True, answer.text
     assert followed == ["42"]
     assert [json.loads(request.content)["operation"] for request, _ in case.remote.calls[before:]] == []
+
+
+@pytest.mark.parametrize("selected", ["41", "42"])
+def test_with_2di_on_a_follow_up_reads_its_conversation_only_after_the_rows_session_read(bound, monkeypatch, selected):
+    """Dev 2026-10-22: with FA_NATIVE_SESSION_GUARD_ENFORCE the submit's conversation prefetch (#942) and the session
+    read reached the row's SID within 2-32 ms, and the platform held one of them ~2 s (agentsv2
+    ``platform_preprocessing_ms`` 2,064-2,123) on every warm submit after 07:10Z; sequential reads were never held.
+    The conversation is now read after the session read, whatever version the selector names (2d-i P7)."""
+    from test_native_turn_api import in_flight
+
+    case = bound
+    monkeypatch.setenv("FA_NATIVE_SESSION_GUARD_ENFORCE", "1")
+    claim(case)
+    shared(case, monkeypatch)
+    monkeypatch.setattr(NativeSessions, "selected_version", lambda self, client: selected)
+    assert submit(case).status_code == 202
+    case.remote.completed("native-rid")
+    most = in_flight(monkeypatch)
+    before = len(case.remote.calls)
+    answer = submit(case, rid="native-rid-2", conversation_id="native-cid")
+    assert answer.status_code == 202, answer.text
+    operations = [json.loads(request.content)["operation"] for request, _ in case.remote.calls[before:]]
+    assert operations == ["session_read", "conversation", "submit"]
+    assert {request.url.params["agent_session_id"] for request, _ in case.remote.calls} == {case.sid}
+    assert most == {case.sid: 1}
+
+
+def test_with_2di_on_a_follow_up_resent_in_its_request_after_a_switch_invokes_its_sid_one_call_at_a_time(
+        bound, monkeypatch):
+    """The first attempt meets AGENT_VERSION_FOLLOWING (the in-request switch runs); the same RID resent in this
+    request (``wait_in_request``) also reads its session and then its conversation, never two calls at once."""
+    from test_native_turn_api import environment_view, in_flight
+
+    case = bound
+    monkeypatch.setenv("FA_NATIVE_SESSION_GUARD_ENFORCE", "1")
+    claim(case)
+    shared(case, monkeypatch)
+    monkeypatch.setattr(NativeSessions, "selected_version", lambda self, client: "41")
+    assert submit(case).status_code == 202
+    case.remote.completed("native-rid")
+    admission, switched = NativeSessions.admission, []
+
+    def following_once(sessions, client, **options):
+        if not switched:
+            raise Problem(503, "AGENT_VERSION_FOLLOWING", "OFFLINE the Agent is changing environments")
+        return admission(sessions, client, **options)
+
+    monkeypatch.setattr(NativeSessions, "admission", following_once)
+    monkeypatch.setattr(NativeSessions, "advance", lambda _s, client, command, **_: switched.append(1) or
+                        environment_view(client, command, state="ready", hosted_session_id=case.sid))
+    monkeypatch.setattr(behavior_native_turn_api.NativeTurnGateway, "_ready_handoffs", lambda *_: None)
+    monkeypatch.setattr(behavior_native_turn_api, "_resend_sleep", lambda _seconds: None)
+    most = in_flight(monkeypatch)
+    before = len(case.remote.calls)
+    answer = submit(case, rid="native-rid-2", conversation_id="native-cid")
+    assert answer.status_code == 202, answer.text
+    operations = [json.loads(request.content)["operation"] for request, _ in case.remote.calls[before:]]
+    assert most == {case.sid: 1}
+    # First attempt: session read, the RID's read (not taken), the switch; then the resend.
+    assert switched == [1] and operations == ["session_read", "read", "session_read", "conversation", "submit"]
 
 
 @pytest.mark.parametrize("status", ["failed", "deleted", "expired", "missing"])
@@ -497,7 +572,7 @@ def test_a_warm_process_never_calls_a_row_sid_deleted_since_its_last_use(bound, 
 
 
 def test_a_burst_of_submits_reads_the_row_sids_metadata_once_per_window(bound, monkeypatch):
-    """One submit (its prefetch and its session read) and a follow-up inside the window share one metadata read;
+    """One submit and a follow-up inside the window share one metadata read;
     the next submit after the window reads it again."""
     case = bound
     claim(case)
@@ -593,8 +668,8 @@ def test_a_warm_submit_whose_metadata_read_fails_is_sent_as_on_main(bound, monke
 
 @pytest.mark.parametrize("status", [401, 403])
 def test_a_warm_submit_whose_metadata_read_is_denied_calls_nothing(bound, monkeypatch, status):
-    """401/403 stay errors on a warm process too, and the follow-up's prefetch does not fall back on the day-old
-    confirmation: its conversation read never reaches the SID the send could not check."""
+    """401/403 stay errors on a warm process too: the follow-up's conversation read never reaches the SID the send
+    could not check."""
     case = bound
     _warm(case, monkeypatch)
     _failing_platform(monkeypatch, status)
@@ -614,8 +689,8 @@ def test_a_cold_submit_whose_metadata_read_fails_is_refused_as_on_main(bound, mo
     before = len(case.remote.calls)
     refused = submit(case, rid="native-rid-2", conversation_id="native-cid")
     assert refused.status_code == 503 and refused.json()["error"]["code"] == "NATIVE_BOOTSTRAP_UNKNOWN", refused.text
-    # The prefetch's read and the session read each ask (a failed read keeps nothing), as on main.
-    assert set(gets) == {case.sid} and all(kwargs["retry_total"] == 1 and kwargs["read_timeout"] == 10
+    # Only the session read asks (main's retrying read), and nothing is called.
+    assert gets == [case.sid] and all(kwargs["retry_total"] == 1 and kwargs["read_timeout"] == 10
                                            for *_, kwargs in constructed)
     assert case.remote.calls[before:] == []
 
@@ -685,13 +760,14 @@ def test_status_polls_every_second_read_the_row_sids_metadata_once_per_window(bo
     assert looked == [case.sid] * 4  # the submit at 0 s, then polls at 10, 20 and 30 s
 
 
-def test_only_a_row_located_call_asks_hosted_for_the_stricter_replaced_check(bound):
+def test_only_a_row_located_call_asks_hosted_for_the_stricter_replaced_check(bound, monkeypatch):
     """An Agent without a usable row is still read through the selector's candidate SID, which may be neither the
     current SID nor the pending target during a retarget or a rolling deploy: Hosted keeps phase 2a's rule for it."""
     case = bound
     assert submit(case).status_code == 202  # no row yet: the legacy locator, which claims the row
     first = len(case.remote.calls)
     case.remote.completed("native-rid")
+    next_tick(monkeypatch)  # else a tied tick reuses the first submit's "no row" read, from before its claim
     assert submit(case, rid="native-rid-2", conversation_id="native-cid").status_code == 202
     locators = [request.headers.get("x-client-fa-locator") for request, _ in case.remote.calls]
     assert set(locators[:first]) == {None}

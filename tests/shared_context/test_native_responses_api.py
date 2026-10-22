@@ -736,7 +736,9 @@ def test_template_options_use_the_endpoint_selected_version_for_enabled_response
         assert response.status_code == 200, response.text
         assert response.json()["responses"] == {"enabled": True, "history_source": source}
         assert response.json()["authorization"] is False and response.json()["activated"] is False
-    assert foundry.calls == [("agent", target.agent_name), ("get", target.agent_name, target.agent_version)] * 2
+    # The selector is read every time; the selected version's definition once per process.
+    assert foundry.calls == [("agent", target.agent_name), ("get", target.agent_name, target.agent_version),
+                             ("agent", target.agent_name)]
     assert not case.remote.calls and not case.remote.records
 
 

@@ -76,6 +76,7 @@ Container App      Container App              每位助理一台 VM
 
 主要固定版本有 `github-copilot-sdk==1.0.13`、Copilot runtime 1.0.83（SDK 在 VM 裡啟動的執行檔，建映像時下載並固定）、`azure-ai-agentserver-core==2.2.0` 和 `azure-ai-projects==2.3.0`。Hosted 的版本在 [`requirements-hosted.txt`](src/fa-shared-context-poc/requirements-hosted.txt)，API 的版本在 [`requirements.txt`](src/fa-shared-context-poc/requirements.txt)。
 
+<a id="deploy-to-your-azure"></a>
 ## 部署到你的 Azure
 
 用 `azd up` 部署到你自己的訂閱。Bicep 建立全部資源，hook 呼叫的是作者 stage CI 同一批腳本；之後再跑 `azd deploy`，就是同一套升級步驟。完整說明在 [deploy/azd/README.md](deploy/azd/README.md)，設計取捨在 [docs/azd-new-environment.md](docs/azd-new-environment.md)。
@@ -100,25 +101,27 @@ python .\deploy\azd\fa_azd.py prereq     # 唯讀：列出你已具備什麼、�
 azd up
 ```
 
-`<name>` 是環境名稱，2～20 個小寫字母、數字或連字號，會當資源名稱的前綴。`<region>` 要選有 Foundry Hosted Agents 的區域，清單見[官方文件](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents#region-availability)。還沒決定區域時，拿掉 `--location` 和 `prereq` 那一行，`azd up` 會用選單問你。
+這組步驟的完整版本（含 bash 寫法與選用項目）只有一份，在 [deploy/azd/README.md](deploy/azd/README.md#first-deploy)。上面是 PowerShell 寫法；若在 Windows 的 Git Bash 裡設 `AZURE_CONFIG_DIR`，曾觀察到 `$HOME/.azure-fa` 這類路徑被改寫、多出一個 `C:\c\Users\<你>\.azure-fa` 資料夾（不保證每台都會發生）。建議用 PowerShell；一定要用 Git Bash 時，改用 Windows 形式的路徑，例如 `C:/Users/<你>/.azure-fa`。
+
+`<name>` 是環境名稱，2～20 個小寫字母、數字或連字號，會當資源名稱的前綴。`<region>` 要選有 Foundry Hosted Agents 的區域，清單見[官方文件](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents#region-availability)。還沒決定區域時，可以拿掉 `--location`，`azd up` 會用選單問你；`prereq` 不讀區域，有沒有 `--location` 都能跑，不想跑它才拿掉那一行。
 
 不知道訂閱 ID 或租用戶 ID 時，`az login` 後執行 `az account list --query "[].{name:name, id:id, tenant:tenantId}" -o table`。訂閱在 `azd env new --subscription` 時就固定在該 azd 環境，不使用 az CLI 的預設訂閱；hook 會檢查 az 與 azd 登入的是同一個租用戶，不同就停止。
 
-第一次 `azd up` 約 1.5～2 小時，之後再跑約 15 分鐘。`azd up` 一開始就停在「interactive prompts disabled … missing location」時（例如在 Claude 桌面 app 的終端機分頁裡），先 `$env:AZD_NON_INTERACTIVE = 'false'` 再跑。Windows 上 `az login` 的帳號挑選視窗找不到要用的帳號時，改用 `az login --tenant <your-tenant-id> --use-device-code`。細節見 [第一次部署](deploy/azd/README.md#first-deploy)。
+要多久依區域與當時平台狀況而定：2026-10-15 那次第一次 `azd up` 約 1.5～2 小時、之後再跑約 15 分鐘；2026-10-21 用第 34 版從頭跑，provision 約 10 分鐘，首次安裝另外等了三次 Job log、合計約 20 分鐘（整體總時間沒量）。`azd up` 一開始就停在「interactive prompts disabled … missing location」時（例如在 Claude 桌面 app 的終端機分頁裡），先 `$env:AZD_NON_INTERACTIVE = 'false'` 再跑。Windows 上 `az login` 的帳號挑選視窗找不到要用的帳號時，改用 `az login --tenant <your-tenant-id> --use-device-code`。細節見 [第一次部署](deploy/azd/README.md#first-deploy)。
 
 主人的 object ID 用 `az ad user show --id <主人 UPN> --query id -o tsv` 查（主人自己登入時，`az ad signed-in-user show --query id -o tsv` 也行）。沒設 `FA_TEAM_OWNER_OID` 時，部署的人會成為 Team 主人，主人以外的人登入不了工作台，要 `azd down --purge` 才能重來。所以 preprovision 會印出「Team owner = 目前登入的部署者」，在終端機裡要你輸入 `y` 確認，其他回答就停下、什麼都不寫。`azd up` 一開始會再跑同一份檢查，缺東西就在建立任何計費資源前停下。
 
 **中途要你回答的地方。**
 
-- **區域與模型。** 區域由 azd 的選單問，只列有 Foundry Hosted Agents 的區域；上面用 `--location` 指定過就不再問。作者使用 `westus3`。模型由 hook 列出這個區域有沒有提供、quota 夠不夠，你輸入編號，再選新對話的預設模型。沒有固定必裝的模型。
-- **計畫雜湊。** 首次安裝寫入資料表前，終端機會顯示 plan hash，Team 主人輸入前 12 碼才會寫入。輸入其他內容就停下，什麼都不寫；沒有終端機（程式以 `sys.stdin.isatty()` 判斷，不看 azd 的 `--no-prompt`）時直接停。
+- **區域與模型。** 區域由 azd 的選單問，只列有 Foundry Hosted Agents 的區域；上面用 `--location` 指定過就不再問。作者使用 `westus3`。模型由 hook 列出這個區域有沒有提供、quota 夠不夠，你輸入編號，再選新對話的預設模型。沒有固定必裝的模型。有的區域某些模型的 quota 是 0（作者在 westus3 遇過 gpt-6 系列），建議 `azd up` 前先查 quota，或用 `azd env set FA_MODELS …`、`FA_DEFAULT_MODEL …` 預先選好，查法見 [deploy/azd 的「區域與模型」](deploy/azd/README.md#region-and-models)。
+- **首次安裝批准。** 首次安裝寫入資料表前，終端機會顯示 request、installation、configuration 與 plan hash，Team 主人輸入 `y`（或 `yes`）才會寫入，批准檔綁定 configuration 與 plan 這兩個 hash、10 分鐘內有效。輸入其他內容就停下，什麼都不寫；沒有終端機（程式以 `sys.stdin.isatty()` 判斷，不看 azd 的 `--no-prompt`）時直接停。
 - **WebIQ 金鑰（選用）。** 先 `azd env set FA_ENABLE_WEBIQ true` 才會問。金鑰用隱藏輸入，不寫檔，也不進 azd env。
 
-**還要真人做的事。** 部署最後，hook 以 Team 主人身分替兩位助理選好新對話的模板：走 Responses，開啟伺服器提供的全部能力。之後可以在工作台助理 ⚙ 設定頁調整。剩下的是主人登入 hook 印出的工作台網址（hook 的訊息裡叫 Portal，就是工作台；之後用 `azd env get-value FA_CONSOLE_URL` 也查得到），開新對話送一則短訊息；回條 `completed`、`failure_code=null` 才算通過，步驟見下方 [前 10 分鐘](#first-10-minutes)。部署的人不是主人時，第一次 session 準備和模板選擇要由主人登入後跑 `azd hooks run postdeploy`。主人接手從批准計畫雜湊開始；重跑時會重做角色指派和 Bicep，所以主人也要有訂閱 Owner（或 Contributor 加 User Access Administrator）和 Foundry User，並在同一台電腦、用同一個 `.azure/<env>/fa` 資料夾執行。
+**還要真人做的事。** 部署最後，hook 以 Team 主人身分替兩位助理選好新對話的模板：走 Responses，開啟伺服器提供的全部能力。之後可以在工作台助理 ⚙ 設定頁調整。剩下的是主人登入 hook 印出的工作台網址（hook 的訊息裡叫 Portal，就是工作台；之後用 `azd env get-value FA_CONSOLE_URL` 也查得到），開新對話送一則短訊息；回條 `completed`、`failure_code=null` 才算通過，步驟見下方 [前 10 分鐘](#first-10-minutes)。部署的人不是主人時，第一次 session 準備和模板選擇要由主人登入後跑 `azd hooks run postdeploy`。主人接手從批准首次安裝開始；重跑時會重做角色指派和 Bicep，所以主人也要有訂閱 Owner（或 Contributor 加 User Access Administrator）和 Foundry User，並在同一台電腦、用同一個 `.azure/<env>/fa` 資料夾執行。
 
-**中斷或要排錯時。** 每個寫入都先記 intent。照畫面提示讀回，再用 `azd hooks run postprovision` 或 `azd hooks run postdeploy` 接續，不要刪掉重來。逐步排錯的對照是 [新環境標準流程](deploy/README.md#new-environment-standard-flow) 的 17 個關卡，兩邊呼叫同一批腳本。`azd down --purge` 會連同資料表、備份和記憶一起刪除，無法復原；備份鎖還在且沒設 `FA_CONFIRM_DELETE` 時會先要你輸入環境名稱，azd 自己也會問 `y/N`；約 30 分鐘。
+**中斷或要排錯時。** 每個寫入都先記 intent。照畫面提示讀回，再用 `azd hooks run postprovision` 或 `azd hooks run postdeploy` 接續，不要刪掉重來；在新的終端機接續時，先設同一個 `AZURE_CONFIG_DIR` 並 `cd` 到 repo 根目錄，見 [中斷後接續](deploy/azd/README.md#resume)。逐步排錯的對照是 [新環境標準流程](deploy/README.md#new-environment-standard-flow) 的 17 個關卡，兩邊呼叫同一批腳本。`azd down --purge` 會連同資料表、備份和記憶一起刪除，無法復原；備份鎖還在且沒設 `FA_CONFIRM_DELETE` 時會先要你輸入環境名稱，azd 自己也會問 `y/N`；約 30 分鐘。
 
-**目前的限制。** 作者在自己的訂閱從頭跑完一次 `azd up`，並在工作台實際使用過。開頭的區域與模型選擇之後也在 eastus2 實跑成功（只選一個模型，部署與設定讀回正確），但那次的工作台驗收還沒做。
+**目前的限制。** 作者在自己的訂閱從頭跑完一次 `azd up`，並在工作台實際使用過。開頭的區域與模型選擇之後也在 eastus2 實跑成功（只選一個模型，部署與設定讀回正確），但那次的工作台驗收還沒做。2026-10-21 又用公開 repo 第 34 版在 westus3 從頭跑一次，前 10 分鐘驗收通過。
 
 **費用參考。** 這些是作者環境的估算，實際以你的帳單為準。每位助理的 VM 運作時約 US$0.25／小時（2 vCPU、4 GiB），閒置回收後不計。常駐的工作台約 US$5.83／月。記憶功能預設開啟，Memory Store（preview）依用量另計。作者的 stage 環境原本估算每月 US$70～190，2026-10-07 起工作台和 feed app 改成常駐，每月約再多 US$11.66。
 

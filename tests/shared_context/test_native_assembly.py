@@ -712,3 +712,115 @@ def test_memory_recall_overlaps_capability_binding_and_stops_with_a_turn_that_en
         run_turn(responses, request)
         assert "RECALL_TEXT_CANARY" in prompts[0]
     assert events.index("recall") < events.index("bound")
+
+
+@pytest.mark.parametrize("reply", ["found", "unavailable", "other_conversation"])
+def test_reminders_overlap_capability_binding_and_keep_their_failure_handling(responses, monkeypatch, tmp_path, reply):
+    """Stage: the reminders POST (p50 0.7 s, p90 1.3 s) waited for the bindings though it needs only the CID. A binding
+    that waits for the reminders read to have started only finishes when both run together. The answer is still
+    taken where it was: a 503 is reported in the prompt and the turn goes on; another CID's reminder fails the turn."""
+    from shared_context.m2_copilot import ToolSpec
+    from shared_context.native_capabilities import NativeCapabilityBinding, NativeCapabilityProvider
+    from shared_context.native_routine_client import NativeRoutineClient
+
+    monkeypatch.setenv("FA_NATIVE_ROUTINES_ENABLED", "1")
+    request, _, _ = skill_request(submit())
+    reading, events, prompts = asyncio.Event(), [], []
+
+    async def api(incoming):
+        assert incoming.url.path.endswith("/routine/reminders")
+        events.append("reminders")
+        reading.set()
+        if reply == "unavailable":
+            return httpx.Response(503, json={"error": {"code": "OFFLINE_UNAVAILABLE"}})
+        cid = json.loads(incoming.content)["conversation_id"] + ("-other" if reply == "other_conversation" else "")
+        return httpx.Response(200, json={
+            "purpose": "attention-only-not-turn-dispatch", "reminders": [], "next_after": None, "routine_turns": [{
+                "routine_id": "offline-routine", "scheduled_for": "2026-10-04T01:00:00Z",
+                "request_id": "earlier-routine-rid", "conversation_id": cid, "status": "unknown",
+                "failure_code": "NATIVE_TURN_UNKNOWN", "authorization": False,
+                "purpose": "original-native-routine-receipt"}]})
+
+    async def bind(context, grants):
+        await asyncio.wait_for(reading.wait(), 5)
+        events.append("bound")
+        names = {name for grant in grants for name in grant.tools}
+        return NativeCapabilityBinding(
+            tools=tuple(ToolSpec(name, "OFFLINE probe", {"type": "object"}, lambda packet: None) for name in names),
+            result_schemas={name: PurposeSkillReadResult for name in names})
+
+    async def sdk(**options):
+        prompts.append(options["system_message"])
+        return await offline_sdk(**options)
+
+    client = NativeRoutineClient("https://api.offline.invalid", lambda: "OFFLINE-agent",
+                                 transport=httpx.MockTransport(api))
+    probe = NativeCapabilityProvider(accepts=lambda grant: True, bind=bind, approved_skills=True, name="probe")
+    install_executor(responses, monkeypatch, tmp_path, sdk, routine_client=client, capability_providers=(probe,))
+    if reply == "other_conversation":
+        assert responses.invoke(request).status_code == 202
+        refused = responses.wait(request.command.request_id, "unknown")
+        assert refused.failure_code == "NATIVE_ROUTINE_SCOPE" and prompts == []
+    else:
+        receipt = run_turn(responses, request)
+        part = next(part for part in receipt.assembly.parts if part.name == "reminders")
+        if reply == "found":
+            assert part.state == "configured" and "earlier-routine-rid" in prompts[0]
+        else:
+            assert part.reason == "unavailable" and "Original work reminders could not be read" in prompts[0]
+    assert events == ["reminders", "bound"]
+
+
+@pytest.mark.parametrize("failing", ["bind", "reminders"])
+def test_an_early_reminders_read_stops_with_a_failed_bind_and_its_own_failure_still_fails_the_turn(
+        responses, monkeypatch, tmp_path, failing):
+    """#942 review: a bind that fails first cancels the reminders read still in flight and waits for it to end (so
+    nothing outlives the turn or leaves "Task exception was never retrieved"); a reminders failure that is not a
+    ``Problem`` still fails the turn, as when the read ran after the bindings."""
+    import time
+    from shared_context.errors import Problem
+    from shared_context.m2_copilot import ToolSpec
+    from shared_context.native_capabilities import NativeCapabilityBinding, NativeCapabilityProvider
+    from shared_context.native_routine_client import NativeRoutineClient
+
+    monkeypatch.setenv("FA_NATIVE_ROUTINES_ENABLED", "1")
+    request, _, _ = skill_request(submit())
+    reading, events, prompts = asyncio.Event(), [], []
+
+    async def api(incoming):
+        events.append("reminders")
+        reading.set()
+        if failing == "reminders":
+            raise RuntimeError("OFFLINE reminders transport broke")
+        try:
+            await asyncio.sleep(30)  # longer than the harness wait: only a cancelled read ends this turn in time
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+
+    async def bind(context, grants):
+        await asyncio.wait_for(reading.wait(), 5)
+        events.append("bound")
+        if failing == "bind":
+            raise Problem(503, "CAPABILITY_UNAVAILABLE", "OFFLINE refused binding")
+        names = {name for grant in grants for name in grant.tools}
+        return NativeCapabilityBinding(
+            tools=tuple(ToolSpec(name, "OFFLINE probe", {"type": "object"}, lambda packet: None) for name in names),
+            result_schemas={name: PurposeSkillReadResult for name in names})
+
+    async def sdk(**options):
+        prompts.append(options["system_message"])
+        return await offline_sdk(**options)
+
+    client = NativeRoutineClient("https://api.offline.invalid", lambda: "OFFLINE-agent",
+                                 transport=httpx.MockTransport(api))
+    probe = NativeCapabilityProvider(accepts=lambda grant: True, bind=bind, approved_skills=True, name="probe")
+    install_executor(responses, monkeypatch, tmp_path, sdk, routine_client=client, capability_providers=(probe,))
+    started = time.monotonic()
+    assert responses.invoke(request).status_code == 202
+    refused = responses.wait(request.command.request_id, "unknown")
+    assert time.monotonic() - started < 8 and prompts == []
+    if failing == "bind":
+        assert refused.failure_code == "CAPABILITY_UNAVAILABLE" and events == ["reminders", "bound", "cancelled"]
+    else:
+        assert refused.failure_code == "NATIVE_TURN_UNKNOWN" and events == ["reminders", "bound"]

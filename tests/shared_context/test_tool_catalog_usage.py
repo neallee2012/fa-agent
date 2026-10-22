@@ -51,7 +51,7 @@ def test_usage_facts_report_tokens_cache_and_tool_calls_without_raising():
 def test_disabled_capability_tools_are_refused_by_gateway_and_capability_call(assistant, monkeypatch):
     h, control = enabled(assistant, monkeypatch, tools=(*HISTORY_CAPABILITIES, *WEB_TOOLS))
     service_calls = fake_services(monkeypatch)
-    first_choice, _ = choose(h, "choose-web", ("WebIQ-MCP",))
+    first_choice, _ = choose(h, "choose-web", ("WebSearch-MCP",))
     assert first_choice.status_code == 200, first_choice.text
     sessions, registered, refusals = [], [], {}
     # The real API model route; its upstream fails the test if a refused request ever reaches it.
@@ -71,7 +71,7 @@ def test_disabled_capability_tools_are_refused_by_gateway_and_capability_call(as
             client = sessions[-1].client
             body = {"model": client.assignment.task.instruction.model, "stream": True,
                     "messages": [{"role": "user", "content": "Search again."}],
-                    "tools": [{"type": "function", "function": {"name": "WebIQ-MCP-web", "parameters": {}}}]}
+                    "tools": [{"type": "function", "function": {"name": "WebSearch-MCP-web", "parameters": {}}}]}
             digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
                                                ensure_ascii=False).encode()).hexdigest()
             path = (f"/behavior/v1/bindings/{client.assignment.binding_id}/assistant"
@@ -84,7 +84,7 @@ def test_disabled_capability_tools_are_refused_by_gateway_and_capability_call(as
             response = await asyncio.to_thread(old_model_request)
             refusals["gateway"] = (response.status_code, response.headers.get("x-behavior-model-upstream-error-code"))
             try:
-                await asyncio.to_thread(client.call_capability, "old-call", "WebIQ-MCP-web", {"query": "fa"}, "1" * 64)
+                await asyncio.to_thread(client.call_capability, "old-call", "WebSearch-MCP-web", {"query": "fa"}, "1" * 64)
             except Problem as error:
                 refusals["capability_call"] = (error.status, error.body["error"]["code"])
         return await original(**options)

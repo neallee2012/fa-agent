@@ -1,5 +1,30 @@
 # FA Agent 行為控制規格 v1.2
 
+## 2026-10-22 WebIQ 只走官方 toolbox（Neal 決定「只留 toolbox」；CODE/offline，未部署）
+
+- 出貨的組織 catalog 拿掉 API broker entry `WebIQ-MCP`；WebIQ 只剩 toolbox entry `WebIQ`（`fa-org-tools`，批准照它的
+  `require_approval=never`）。key 只在 Foundry project connection，API 與 VM 都拿不到。通用的 `mcp-api` broker 不變。
+- 還選著 `WebIQ-MCP` 的模板或對話不需遷移：capture 照原規則取「原選擇 ∩ 目前 head ∩ 目前 catalog」，下一回合起不帶它；
+  再次儲存含它的選擇回 409 `CAPABILITY_SOURCES_CHANGED`。部署前已建立 capture、部署後才列工具的回合回 503
+  `CAPABILITY_UNAVAILABLE`（下面 mcp-api 降級不涵蓋 entry 不在 catalog）。細節與測項見
+  [README](../src/fa-shared-context-poc/README.md#webiq-toolbox-only)。
+
+## 2026-10-22 mcp-api 列不出工具：同樣只少那個 grant 照常跑（總協調決定，比照 2026-10-10；CODE/offline，未部署）
+
+起因是 dev 上游 WebIQ 拒收 key：API 列 `WebIQ-MCP` 工具時回 503 `CAPABILITY_NEEDS_AUTH`，Hosted 記成
+`NATIVE_CAPABILITY_UNKNOWN`，整個回合在模型開始前結束。
+
+- **只拿掉那個 grant**：mcp-api grant 列不出工具（`CAPABILITY_NEEDS_AUTH`：金鑰缺少或上游 401／403；`CAPABILITY_UNAVAILABLE`：
+  連線失敗、逾時或上游其他錯誤）時，這一回合照常跑，做法與下方 toolbox 條目相同：capture 工具仍綁著、呼叫只回
+  `NATIVE_TOOLBOX_UNAVAILABLE` 不送請求；組裝紀錄與畫面沿用 `unavailable_sources`（`TOOLBOX_LIST_FAILED`，原因 `upstream_auth`
+  或 `service_error`），沒有新代碼。
+- **仍然拒絕**：路由本身的身分／Team／scope 拒絕、Hosted 連不到 API、catalog 已沒有這個 entry、路由時間上限用完、
+  少 allowlist 工具、schema 無效、`CAPABILITY_EXECUTION_DENIED`。
+- **契約**：API `capability-catalog` 回應新增選填 `unavailable`（`entry_id`、`reason`），只有在有 grant 列不出時才輸出；
+  舊版 Hosted 收到會拒收（結果與改前相同），所以 API 與 Hosted 要一起出版才生效。不重試、不記住失敗。
+
+實作、限制與 `Verified against` 見 [README mcp-api 列不出工具](../src/fa-shared-context-poc/README.md#mcp-api-list-unavailable)。
+
 ## 2026-10-10 toolbox 列不出工具：這一回合少那個 toolbox 照常跑（Neal 決策；CODE/offline，未部署）
 
 Neal 2026-10-10：「工具列不出來時，這一回合少那個工具照常跑，並在畫面上講明」。起因是 stage 的 `fa-org-tools`
@@ -11,7 +36,7 @@ Neal 2026-10-10：「工具列不出來時，這一回合少那個工具照常�
   仍綁著，呼叫只回 `NATIVE_TOOLBOX_UNAVAILABLE`、不送任何請求；模型被告知這不是權限拒絕、照常回答並告訴使用者這次沒用到。其他 toolbox 與能力照常。
 - **仍然拒絕**：toolbox 本身對這個 Agent 的明確 HTTP 4xx、對請求或設定的明確 JSON-RPC 答覆（`-32700`、`-32600`、
   `-32601`、`-32602`、不帶撤銷文字的 `-32007`）、清單裡少了 capture 的工具、批准設定（`always` 沒 HITL、
-  不明值、讀不到 default version）、重複或無效 schema、沒有 project endpoint；skills／mcp-api 的授權與版本檢查不變。
+  不明值、讀不到 default version）、重複或無效 schema、沒有 project endpoint；skills 的授權與版本檢查不變（mcp-api 列不出工具見上方 2026-10-22）。
 - **不連 Connect 卡**：`-32006` 只有帶 consent 連結、且（有逐來源清單時）其中有 `CONSENT_REQUIRED` 才出 Connect 卡；
   上游失敗同樣用 `-32006` 回時當作列不出工具。
 - **記錄與畫面**：回合的組裝紀錄（`NativeAssembly.unavailable_sources`）存 `entry_id`、來源名稱、`TOOLBOX_LIST_FAILED`
@@ -85,6 +110,8 @@ Neal 2026-10-06 23:3x：「在不違反以下原則的情況下，依照評估�
 - **接續回合送出預讀**（RTT A 第三批）：API 確認 session 的同時，用已保留的 reader 先讀對話、用該對話固定的 template
   與 selection 先解析 capture；只有與照順序讀到的完全相同才採用，否則照原順序重讀。只讀不寫，去重仍只在 Hosted。
   細節見 [README 接續回合送出預讀](../src/fa-shared-context-poc/README.md#rtt-a-submit-prefetch)。
+  （2026-10-22 起取消對話預讀：dev 上同一個 SID 同時進來的兩個請求被平台扣約 2 秒；現在只預讀 capture，對話在確認 session
+  之後才照順序讀。見同一段 [README](../src/fa-shared-context-poc/README.md#rtt-a-submit-prefetch)。）
 - **收單開頭讀取並行**（RTT A 第三批）：Hosted 收單開頭的 agent 紀錄、`rid:<RID>` 與對話 meta 一起讀；標記收單意圖與
   Responses 槽位直接用剛讀到的 ETag 做 CAS，被改動就重讀再做，不蓋掉別人的改動。去重、意圖的標記與清除不變。
   細節見 [README 收單開頭讀取並行](../src/fa-shared-context-poc/README.md#rtt-a-admission-parallel)。

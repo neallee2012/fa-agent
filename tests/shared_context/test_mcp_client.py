@@ -17,11 +17,11 @@ from shared_context.mcp_client import MAX_RESULT_CHARS, call_tool, list_tools
 from shared_context.tool_catalog import parse_entry_file
 
 KEY = "Zx9Qm2Lp7Rt4Vw8Ky3Nb6Hc1Jd5Fg0Sa"
-ENTRY = parse_entry_file("webiq.json", json.dumps({"mcpServers": {"WebIQ-MCP": {
+ENTRY = parse_entry_file("websearch.json", json.dumps({"mcpServers": {"WebSearch-MCP": {
     "url": "https://webiq.test/mcp", "type": "http",
-    "headers": {"x-apikey": "${secret:webiq-api-key}"}, "tools": ["web", "browse"],
+    "headers": {"x-apikey": "${secret:websearch-api-key}"}, "tools": ["web", "browse"],
 }}}).encode("utf-8"))
-SECRETS = {"webiq-api-key": KEY}
+SECRETS = {"websearch-api-key": KEY}
 
 
 class Recording(httpx.AsyncBaseTransport):
@@ -117,7 +117,7 @@ def test_missing_secret_or_rejected_key_is_needs_auth_without_leaking_the_key():
     server, transport = fake_server()
     denied("CAPABILITY_NEEDS_AUTH", lambda: list_tools(ENTRY, lambda name: None, transport=transport))
     assert transport.requests == []
-    wrong = {"webiq-api-key": "Wr0ngKeyValue9876543210abcdefXYZ"}
+    wrong = {"websearch-api-key":"Wr0ngKeyValue9876543210abcdefXYZ"}
     error = denied("CAPABILITY_NEEDS_AUTH", lambda: list_tools(ENTRY, wrong.get, transport=transport), server)
     assert "Wr0ngKeyValue" not in json.dumps(error.body)
 

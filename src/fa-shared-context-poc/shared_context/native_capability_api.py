@@ -21,6 +21,8 @@ from .behavior_api import _body, _principal_dependency, _response
 from .behavior_capability_calls import call_grant_tool, checked_result, list_grant_tools
 from .behavior_capability_prompt import skill_access
 from .behavior_capabilities import skill_resources_granted
+from .behavior_instruction import conversation_key
+from .behavior_work_target import target_key
 from .behavior_native_capability_wire import (
     NATIVE_CAPABILITY_PREFIX as PREFIX, NativeCapabilityCall, NativeSkillRead, NativeSkillResourceRead, NativeTurnScope,
 )
@@ -39,11 +41,28 @@ class NativeCapabilityGateway:
         composition, _client, receipt = self.current_turn(principal, command)
         return composition, receipt
 
+    def _rows(self, scope, cid):
+        """The target selection and legacy-CID rows in one guarded snapshot; the checks still run in their order.
+
+        Only for the first configured target, where ``for_agent`` returns the owner composition without a registry
+        read. No CID, or any other target (a registered peer), returns None before any read, and the checks read
+        their rows as before."""
+        owner = self.relay.owner
+        if cid is None or scope.target.agent_id != owner.config.targets[0].agent_id:
+            return None
+        composition = owner.for_agent(scope.target.agent_id)
+        config = composition.config
+        if scope.target.agent_id != config.targets[0].agent_id:
+            return None
+        return composition.runtime.work_policy.store.read_snapshot(
+            (target_key(config.table.scope.authority_domain), conversation_key(cid)))
+
     def current_turn(self, principal, command):
         scope = self.relay._sender_scope(principal)
         principal.require(scope.team_id, "execute")
-        composition, client = self.relay._client(scope)
-        NativeTurnGateway._legacy(composition.runtime.work_policy, command.conversation_id)
+        rows = self._rows(scope, command.conversation_id)
+        composition, client = self.relay._client(scope, rows=rows)
+        NativeTurnGateway._legacy(composition.runtime.work_policy, command.conversation_id, rows)
         receipt = self.relay._original(client, command.request_id)
         if (receipt is None or receipt.conversation_id != command.conversation_id
                 or receipt.status != "started" or receipt.cancel_requested):
@@ -124,7 +143,7 @@ class NativeCapabilityGateway:
     def capability_catalog(self, principal, command: NativeTurnScope):
         command = NativeTurnScope.model_validate_json(command.model_dump_json())
         composition, receipt = self._turn(principal, command)
-        return list_grant_tools(composition.runtime, self._grants(receipt))
+        return list_grant_tools(composition.runtime, self._grants(receipt), degrade=True)
 
     def capability_call(self, principal, command: NativeCapabilityCall):
         command = NativeCapabilityCall.model_validate_json(command.model_dump_json())

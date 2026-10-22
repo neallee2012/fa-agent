@@ -16,7 +16,8 @@ Every model request of one turn carries that turn's W3C ``traceparent`` so Found
 ``invoke_agent``/``chat`` spans join the same trace. Content capture follows this flag; only the
 Responses wire keeps the runtime's reasoning parts (the provider's public summary), and a provider stream
 with raw reasoning text stops message export for the process. Telemetry failures are logged and never
-fail, delay or retry a turn.
+fail, delay or retry a turn. Under the same flag, the Hosted entry also exports FA's own content-free
+``FA_TIMING`` and ``RESIDENT_SDK_*`` log lines (``export_logs``); Hosted stderr output stays as it was.
 """
 from __future__ import annotations
 
@@ -357,6 +358,15 @@ def _processor():
         return _processor_state or None
 
 
+def _exporter_options(connection: str) -> dict:
+    options = {"connection_string": connection, "disable_offline_storage": True}
+    # Same rule as azure-ai-agentserver-core's own distro setup.
+    if os.environ.get("APPLICATIONINSIGHTS_AUTH_MODE", "").strip().lower() == "entra":
+        from azure.identity import ManagedIdentityCredential
+        options["credential"] = ManagedIdentityCredential()
+    return options
+
+
 def _build_processor():
     connection = os.environ.get(CONNECTION_ENV)
     if not connection:
@@ -369,15 +379,64 @@ def _build_processor():
 
         # Not installed globally: it only names this exporter's resource (the platform's
         # protocol-runtime observability stays as the host configured it).
-        options = {"connection_string": connection, "disable_offline_storage": True,
-                   "tracer_provider": TracerProvider(resource=_resource())}
-        # Same rule as azure-ai-agentserver-core's own distro setup.
-        if os.environ.get("APPLICATIONINSIGHTS_AUTH_MODE", "").strip().lower() == "entra":
-            from azure.identity import ManagedIdentityCredential
-            options["credential"] = ManagedIdentityCredential()
-        processor = BatchSpanProcessor(AzureMonitorTraceExporter(**options))
+        processor = BatchSpanProcessor(AzureMonitorTraceExporter(
+            **_exporter_options(connection), tracer_provider=TracerProvider(resource=_resource())))
     except Exception as error:
         log.warning("FA_SDK_TELEMETRY_INACTIVE reason=exporter_unavailable exception_type=%s", type(error).__name__)
         return None
     atexit.register(processor.shutdown)
     return processor
+
+
+# FA's own Hosted latency lines, sent to the same Application Insights. Only these loggers and these fixed
+# prefixes: FA_TIMING carries phase, hashed turn or binding ID, milliseconds and outcome; RESIDENT_SDK_* carries a
+# fixed reason code or a hash prefix. Other lines of the same loggers (FA_MCP_SERVER_STATUS error text, ...) stay out.
+LOG_LOGGERS = ("shared_context.behavior_timing", "shared_context.behavior_hosted", "shared_context.m2_copilot",
+               "shared_context.native_resident", "shared_context.native_sdk")
+# Lines with these prefixes leave the container: their arguments must stay fixed codes, hashes or numbers, never text.
+LOG_PREFIXES = ("FA_TIMING ", "RESIDENT_SDK_")
+
+
+def _exportable(record: logging.LogRecord) -> bool:
+    # The format string, not the rendered line, so no argument can make a line exportable; no exception text.
+    return isinstance(record.msg, str) and record.msg.startswith(LOG_PREFIXES) and not record.exc_info
+
+
+def export_logs() -> None:
+    """Hosted startup: attach the filtered log export in the background, so the import never delays startup."""
+    if enabled():
+        threading.Thread(target=attach_log_export, name="fa-log-export", daemon=True).start()
+
+
+def attach_log_export():
+    """The LoggerProvider now exporting ``LOG_PREFIXES`` lines of ``LOG_LOGGERS``; None when it cannot be built."""
+    try:
+        from azure.monitor.opentelemetry.exporter import AzureMonitorLogExporter
+        from opentelemetry.sdk._logs import LoggerProvider
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+        try:
+            from opentelemetry.instrumentation.logging.handler import LoggingHandler
+        except ImportError:  # an older resolved opentelemetry-instrumentation-logging; the SDK still has one
+            from opentelemetry.sdk._logs import LoggingHandler
+
+        # Private, like the span exporter: the process's global OpenTelemetry providers stay untouched.
+        provider = LoggerProvider(resource=_resource())
+        provider.add_log_record_processor(BatchLogRecordProcessor(
+            AzureMonitorLogExporter(**_exporter_options(os.environ[CONNECTION_ENV]))))
+        handler = LoggingHandler(level=logging.INFO, logger_provider=provider)
+    except Exception as error:
+        log.warning("FA_SDK_TELEMETRY_INACTIVE reason=log_exporter_unavailable exception_type=%s",
+                    type(error).__name__)
+        return None
+    handler.addFilter(_exportable)
+    atexit.register(provider.shutdown)
+    # Any handler on a logger stops logging.lastResort, which prints these WARNING lines to Hosted stderr today.
+    # Decided once: the Hosted entry never gives root a handler (a later root handler would print them twice).
+    keep_stderr = logging.lastResort is not None and not logging.getLogger().handlers
+    for name in LOG_LOGGERS:
+        logger = logging.getLogger(name)
+        if keep_stderr:  # first, so no WARNING line slips between the two additions
+            logger.addHandler(logging.lastResort)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)  # RESIDENT_SDK_CONTINUED (a kept SDK reused) is INFO
+    return provider

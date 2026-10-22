@@ -273,7 +273,8 @@ class NativeUsageReporter:
 
 
 async def _settle_recall(recall):
-    """An early memory recall the turn did not reach: stop it and take its outcome so it never outlives the turn."""
+    """An early read (memory recall, reminders) the turn did not reach: stop it and take its outcome so it never
+    outlives the turn."""
     if not recall.done():
         recall.cancel()
     await asyncio.gather(recall, return_exceptions=True)
@@ -684,29 +685,39 @@ class NativeSdkExecutor:
                 (memory.recall(receipt, first_turn=first_turn) if memory is not None else asyncio.sleep(0, ()))
                 for memory in (self.private_memory, self.team_memory)))
             stack.push_async_callback(_settle_recall, recall)
+        from .native_routine_wire import native_routines_enabled
+        routines, reminder_read = native_routines_enabled(), None
+        if routines:
+            from .native_routine_client import NativeRoutineClient
+            client = self.routine_client
+            if client is None and self.api_token_provider is not None:
+                client = NativeRoutineClient(self.api_url, self.api_token_provider)
+            if client is not None:
+                # A read of this turn's CID only (stage p50 0.7 s), so it overlaps the bindings below like the recall;
+                # its result or failure is taken at the same point as before.
+                async def read_reminders():
+                    with phase_timing("native_reminders", job_id=timed):
+                        return await client.reminders(receipt.conversation_id)
+
+                reminder_read = asyncio.ensure_future(read_reminders())
+                stack.push_async_callback(_settle_recall, reminder_read)
         with phase_timing("native_bind_capabilities", job_id=timed):
             bindings = await bind_capabilities(
                 context, self.capability_providers, stack, agent_messages=self.agent_tools is not None)
         tools.append(guard_native_tool(context, tool_output_reader(files, control)))
         capability_results = {"read_tool_output": NativeToolOutputPage}
-        from .native_routine_wire import native_routines_enabled
-        if native_routines_enabled():
-            from .native_routine_client import NativeRoutineClient
+        if routines:
             from .native_work_context import NativeWorkContext, NativeWritingStyle, work_context_tool, writing_style_tool
             related = set()
             if receipt.routine is not None and receipt.routine.related_request_id is not None:
                 related.add(receipt.routine.related_request_id)
             if receipt.continuation is not None:
                 related.update((receipt.continuation.root_request_id, receipt.continuation.continuation_of))
-            client = self.routine_client
-            if client is None and self.api_token_provider is not None:
-                client = NativeRoutineClient(self.api_url, self.api_token_provider)
-            if client is None:
+            if reminder_read is None:
                 accounting.absent("reminders", "not_configured")
             else:
                 try:
-                    with phase_timing("native_reminders", job_id=timed):
-                        reminders = await client.reminders(receipt.conversation_id)
+                    reminders = await reminder_read
                 except Problem as error:
                     if error.body["error"]["code"] == "NATIVE_ROUTINE_SCOPE":
                         raise

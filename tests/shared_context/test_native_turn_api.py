@@ -1313,47 +1313,72 @@ def test_owner_uploads_one_png_to_its_agent_and_a_changed_reply_is_refused(nativ
     assert changed.status_code == 502 and changed.json()["error"]["code"] == "NATIVE_STATE_INVALID"
 
 
-def test_a_follow_up_reads_its_conversation_and_capture_while_the_session_is_confirmed(native_api, monkeypatch):
-    """#707 dev: session (~295 ms), conversation (~465 ms) and capture (~263 ms) ran one after another."""
+def in_flight(monkeypatch, transport=None):
+    """Wraps each Hosted invocation; returns the most invocations of one SID seen at once. Each one is held briefly
+    so two sent together always meet."""
+    import threading
+    import time
+
+    transport = NativeTransport if transport is None else transport
+    lock, live, most, handle = threading.Lock(), {}, {}, transport.__call__
+
+    def counted(self, request):
+        sid = request.url.params["agent_session_id"]
+        with lock:
+            live[sid] = live.get(sid, 0) + 1
+            most[sid] = max(most.get(sid, 0), live[sid])
+        try:
+            time.sleep(0.05)
+            return handle(self, request)
+        finally:
+            with lock:
+                live[sid] -= 1
+
+    monkeypatch.setattr(transport, "__call__", counted)
+    return most
+
+
+def test_a_follow_up_invokes_its_session_one_call_at_a_time_and_prefetches_only_its_capture(native_api, monkeypatch):
+    """#707 dev: session (~295 ms), conversation (~465 ms) and capture (~263 ms) ran one after another; the capture
+    (Table only) is computed while the session is confirmed. Dev 2026-10-22: the conversation read overlapping the
+    session read on one SID was held ~2 s by the platform, so the conversation is read after the session read."""
     import threading
     from shared_context import behavior_native_turn_api
 
     case = native_api
     assert submit(case).status_code == 202
     case.remote.completed("native-rid")
-    started, overlapped = threading.Event(), []
-    handle = NativeTransport.__call__
+    confirming, overlapped, handle = threading.Event(), [], NativeTransport.__call__
 
     def gated(self, request):
-        operation = NATIVE_REQUEST.validate_json(request.content).operation
-        if operation == "conversation":
-            started.set()
-        elif operation == "session_read":
-            overlapped.append(started.wait(2))
+        if NATIVE_REQUEST.validate_json(request.content).operation == "session_read":
+            confirming.set()
         return handle(self, request)
 
     computed, resolve = [], behavior_native_turn_api.resolve_capture
 
     def counted(*args, **kwargs):
         computed.append(threading.current_thread().name.startswith("fa-submit-prefetch"))
+        overlapped.append(confirming.wait(2))
         return resolve(*args, **kwargs)
 
     monkeypatch.setattr(NativeTransport, "__call__", gated)
+    most = in_flight(monkeypatch)
     monkeypatch.setattr(behavior_native_turn_api, "resolve_capture", counted)
     for number in (2, 3):
-        started.clear()
+        confirming.clear()
         before = len(case.remote.calls)
         assert submit(case, rid=f"native-rid-{number}", conversation_id="native-cid").status_code == 202
         operations = [command.operation for _, command in case.remote.calls[before:]]
-        assert operations.count("conversation") == 1 and operations.count("submit") == 1
+        assert operations == ["session_read", "conversation", "submit"]
         case.remote.completed(f"native-rid-{number}")
-    # Both follow-ups read the conversation while the session was confirmed and had their capture computed once,
-    # from the template the new conversation's admitted receipt (then the previous read) kept.
-    assert overlapped == [True, True]
-    assert computed == [True, True]
+    # Never two invocations of the SID at once; both follow-ups had their capture computed once, on the prefetch
+    # thread while the session was read, from the template the admitted receipt (then the previous read) kept.
+    assert most == {case.remote.target.session_id: 1}
+    assert computed == [True, True] and overlapped == [True, True]
 
 
-def test_a_prefetched_read_is_used_only_when_it_equals_the_ordinary_read():
+def test_a_prefetched_capture_is_used_only_when_it_equals_the_ordinary_read():
     from concurrent.futures import Future
     from shared_context.behavior_native_turn_api import _SubmitPrefetch
 
@@ -1362,37 +1387,8 @@ def test_a_prefetched_read_is_used_only_when_it_equals_the_ordinary_read():
         future.set_result(value) if not isinstance(value, Exception) else future.set_exception(value)
         return future
 
-    target = SimpleNamespace(session_id="session-a", agent_version="41")
-    client = SimpleNamespace(target=target)
     conversation = SimpleNamespace(conversation_id="cid-a", capture=SimpleNamespace(template="template-a"))
-    assert _SubmitPrefetch(done(conversation), target=target).conversation(client) is conversation
-    for other in (SimpleNamespace(session_id="session-b", agent_version="41"),
-                  SimpleNamespace(session_id="session-a", agent_version="40"), None):
-        assert _SubmitPrefetch(done(conversation), target=other).conversation(client) is None
-    assert _SubmitPrefetch(done(Problem(503, "FOUNDRY_INVOCATION_UNKNOWN", "x")), target=target).conversation(
-        client) is None
-    assert _SubmitPrefetch(capture=done("captured"), basis=conversation).capture(conversation) == "captured"
+    assert _SubmitPrefetch(done("captured"), conversation).capture(conversation) == "captured"
     changed = SimpleNamespace(conversation_id="cid-a", capture=SimpleNamespace(template="template-b"))
-    assert _SubmitPrefetch(capture=done("captured"), basis=conversation).capture(changed) is None
-    assert _SubmitPrefetch(capture=done(Problem(403, "WORK_POLICY_REVOKED", "x")), basis=conversation).capture(
-        conversation) is None
-
-
-def test_a_prefetch_from_another_version_is_read_again_on_the_confirmed_session(native_api, monkeypatch):
-    from shared_context.behavior_native_sessions import NativeSessions
-
-    case = native_api
-    assert submit(case).status_code == 202
-    case.remote.completed("native-rid")
-    kept = NativeSessions.cached_reader
-
-    def older(self, client):
-        reader = kept(self, client)
-        return None if reader is None else reader.for_target(reader.target.model_copy(update={"agent_version": "40"}))
-
-    monkeypatch.setattr(NativeSessions, "cached_reader", older)
-    before = len(case.remote.calls)
-    assert submit(case, rid="native-rid-2", conversation_id="native-cid").status_code == 202
-    operations = [command.operation for _, command in case.remote.calls[before:]]
-    # The prefetched read named version 40; the confirmed session is version 41, so it was read there again.
-    assert operations.count("conversation") == 2 and operations.count("submit") == 1
+    assert _SubmitPrefetch(done("captured"), conversation).capture(changed) is None
+    assert _SubmitPrefetch(done(Problem(403, "WORK_POLICY_REVOKED", "x")), conversation).capture(conversation) is None

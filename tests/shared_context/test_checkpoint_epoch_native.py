@@ -80,7 +80,7 @@ def test_paused_compaction_preserves_followup_and_refreshes_next_prefix(
         preset = CheckpointProfile(platform=preset.platform, provider=provider_name)
     chosen, _ = select(h, request_id="epoch-selection", value=template(
         HISTORY_PROFILE, checkpoint_profile=preset, model_provider=provider_name,
-        user_text_file_profile=FILES, capabilities=refs("WebIQ-MCP"),
+        user_text_file_profile=FILES, capabilities=refs("WebSearch-MCP"),
     ))
     assert chosen.status_code == 200, chosen.text
     selection_id = chosen.json()["result"]["selection_id"]

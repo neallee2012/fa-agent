@@ -81,11 +81,11 @@ def served(operation, calls):
 def test_pinned_runtime_calls_a_captured_api_capability_through_the_fa_proxy(assistant, monkeypatch):
     h, control, _ = configured(assistant)
     h.runtime.capability_grants, h.runtime.capability_catalog = GRANTS, CATALOG
-    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBIQ_API_KEY", KEY)
+    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBSEARCH_API_KEY", KEY)
     service_calls = []
     monkeypatch.setattr(mcp_client, "list_tools", served(mcp_client.list_tools, service_calls))
     monkeypatch.setattr(mcp_client, "call_tool", served(mcp_client.call_tool, service_calls))
-    chosen, _ = choose(h, "choose-webiq", ("WebIQ-MCP",))
+    chosen, _ = choose(h, "choose-webiq", ("WebSearch-MCP",))
     assert chosen.status_code == 200, chosen.text
 
     bridges, options, requests, results = [], [], [], []
@@ -110,7 +110,7 @@ def test_pinned_runtime_calls_a_captured_api_capability_through_the_fa_proxy(ass
         requests.append({"number": number, "system": system})
         if number == 1:
             delta = {"tool_calls": [{"index": 0, "id": "call-webiq", "type": "function", "function": {
-                "name": "WebIQ-MCP-web", "arguments": json.dumps({"query": "foundry agents"})}}]}
+                "name": "WebSearch-MCP-web", "arguments": json.dumps({"query": "foundry agents"})}}]}
         else:
             tool = [item for item in body["messages"] if item["role"] == "tool"][-1]
             text = tool["content"] if isinstance(tool["content"], str) else "".join(
@@ -141,7 +141,7 @@ def test_pinned_runtime_calls_a_captured_api_capability_through_the_fa_proxy(ass
     result = results[0]
     assert not result.is_error and "FA result for foundry agents" in result.text and KEY not in result.text
     task = control.records[accepted["binding_id"]].profile.instruction
-    assert [grant.entry_id for grant in task.capabilities.grants] == ["WebIQ-MCP"]
+    assert [grant.entry_id for grant in task.capabilities.grants] == ["WebSearch-MCP"]
     combined = assemble_capabilities(task.prompt_profile, task.capabilities)
     assert combined.system_message in requests[0]["system"]
     assert sorted(options[0]["available_tools"].to_list()) == sorted(

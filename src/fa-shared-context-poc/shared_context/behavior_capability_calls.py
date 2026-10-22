@@ -35,9 +35,17 @@ MAX_REMEMBERED_CALLS = 1024
 logger = logging.getLogger(__name__)
 
 
+class CapabilityUnavailable(WireModel):
+    """A grant whose tools could not be listed this turn, so the native turn runs without it
+    (README#mcp-api-list-unavailable). Its entry and a fixed reason class only; never the service's error text."""
+    entry_id: str
+    reason: Literal["upstream_auth", "service_error"]
+
+
 class CapabilityCatalogResult(WireModel):
     schema_version: Literal["fa-capability-catalog-v1"] = "fa-capability-catalog-v1"
     entries: tuple[McpToolList, ...]
+    unavailable: tuple[CapabilityUnavailable, ...] = Field(default=(), exclude_if=lambda value: not value)
 
 
 class CapabilityCurrent(WireModel):
@@ -93,19 +101,36 @@ def _run(async_call):
     return anyio.run(async_call)
 
 
-def list_grant_tools(runtime, grants, *, seconds=CAPABILITY_ROUTE_SECONDS):
-    """Current allowlisted schemas of already-scoped mcp-api grants; the caller owns the scope check."""
+# A listing the service could not answer: its credential is missing or rejected, or it failed or timed out
+# (mcp_client._problem). A missing allowlisted tool, an invalid schema or a denied execution still refuses.
+_LIST_UNAVAILABLE = {"CAPABILITY_NEEDS_AUTH": "upstream_auth", "CAPABILITY_UNAVAILABLE": "service_error"}
+
+
+def list_grant_tools(runtime, grants, *, seconds=CAPABILITY_ROUTE_SECONDS, degrade=False):
+    """Current allowlisted schemas of already-scoped mcp-api grants; the caller owns the scope check.
+
+    With ``degrade`` (the native route), a grant whose listing failed is named in ``unavailable`` and the others
+    are still listed, so the turn runs without only that grant (README#mcp-api-list-unavailable).
+    """
     from .mcp_client import list_tools
-    deadline, lists = time.monotonic() + seconds, []
+    deadline, lists, unavailable = time.monotonic() + seconds, [], []
     for grant in grants:
         entry = _entry(runtime, grant)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise Problem(503, "CAPABILITY_UNAVAILABLE", "capability schemas were not read within the route bound",
                           capability=grant.entry_id)
-        with phase_timing("capability_list_tools"):
-            lists.append(_run(lambda: list_tools(entry, environment_secret, timeout=remaining)))
-    return CapabilityCatalogResult(entries=tuple(lists))
+        try:
+            with phase_timing("capability_list_tools"):
+                lists.append(_run(lambda: list_tools(entry, environment_secret, timeout=remaining)))
+        except Problem as error:
+            code = error.body["error"]["code"]
+            if not degrade or code not in _LIST_UNAVAILABLE:
+                raise
+            # Entry and code only; never the service's answer or the secret.
+            logger.warning("FA_CAPABILITY_LIST_UNAVAILABLE entry=%s code=%s", grant.entry_id, code)
+            unavailable.append(CapabilityUnavailable(entry_id=grant.entry_id, reason=_LIST_UNAVAILABLE[code]))
+    return CapabilityCatalogResult(entries=tuple(lists), unavailable=tuple(unavailable))
 
 
 def capability_catalog(authority, session, command, principal, *, seconds=CAPABILITY_ROUTE_SECONDS):

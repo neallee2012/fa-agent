@@ -10,7 +10,8 @@ new conversations (`applies_to=new-conversations-only`).
 What "all" means is in deploy/stage/stage.json `conversation_defaults`: the prompt profile (fa-instruction-v4 from
 2026-10-04, README "SP v4") and settings (the dev A/B values, plus the Responses state profile chosen on the template
 page, `state_profile: foundry-responses-v1`, which a rerun must keep), plus capabilities left out on purpose
-(`WebIQ-MCP` is the API secret broker; stage uses the WebIQ toolbox, #415 Q9). Capabilities and skills come from the
+(`WebIQ-MCP` was the API secret broker, retired 2026-10-22; the exclusion stays for API images that still offer it;
+stage uses the WebIQ toolbox, #415 Q9). Capabilities and skills come from the
 server's own options: every offered capability except the excluded ones and those the prompt profile cannot compose
 (the server's own `base_supports` rule; for example `fa-delegate-reader-v1` needs a profile that declares
 `read_user_file`, which fa-instruction-v3/v4 do not, so the API would refuse the whole selection with 422

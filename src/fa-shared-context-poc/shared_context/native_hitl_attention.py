@@ -154,8 +154,10 @@ def read_team_attention(service, principal, *, cursor=None, limit=20, resolve_or
                     item.question if item.type == "question_required" else item.consent).call
             scope = service.resolve_agent(call.agent_id)
         except Problem as error:
-            if error.status >= 500 or error.body["error"]["code"] == "BEHAVIOR_CONFLICT":
-                raise  # an outage or a racing write is not a shorter page
+            if error.status >= 500 or error.body["error"]["code"] in {"BEHAVIOR_CONFLICT", "NATIVE_HITL_SCOPE_DENIED"}:
+                # An outage or a racing write is not a shorter page; nor is a saved card naming another Team
+                # inside this Team's partition (read/read_question/read_consent, owner principal).
+                raise
             # One card that cannot be shown (retired Agent, invalid record) is left out; the rest stay listed.
             log.warning("NATIVE_HITL_ATTENTION_ITEM_SKIPPED code=%s", error.body["error"]["code"])
             continue

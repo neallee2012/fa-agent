@@ -79,6 +79,8 @@ def script(action, files, hosted_image=None):
                  "print('FA_W9_PLAN_SCALARS '+json.dumps({k:p[k] for k in ('empty_table_observed_at','code_sha256','job_input_sha256')}),flush=True)\n")
     elif action == "sync":
         module = "shared_context.behavior_agent_versions"
+        # No --native-v2-registered (ci_deploy._sync_script): fresh initialization starts from an empty table
+        # (plan's empty_table_observed_at), so no onboarded (registered) Agent exists yet for it to match.
         argv = ["sync", "--config", "/tmp/fa-w9/config.json", "--image", hosted_image, "--route", "--defer-follow",
                 "--idle-timeout-seconds", str(STAGE["hosted_idle_timeout_seconds"])]
         after = ""

@@ -42,7 +42,7 @@ def test_seven_capabilities_declare_only_the_executable_task_contract(assistant,
     model = control.models.default
     control.models.models[model] = control.models.models[model].model_copy(update={"supports_image_input": True})
     monkeypatch.setitem(hosted.CAPABILITY_HANDLERS, "fa-desktop-v1", refusing_desktop)
-    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBIQ_API_KEY", KEY)
+    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBSEARCH_API_KEY", KEY)
     mcp_calls = []
     monkeypatch.setattr(mcp_client, "list_tools", served(mcp_client.list_tools, mcp_calls))
     monkeypatch.setattr(mcp_client, "call_tool", served(mcp_client.call_tool, mcp_calls))
@@ -68,7 +68,7 @@ def test_seven_capabilities_declare_only_the_executable_task_contract(assistant,
         number = len(requests)
         if number == 1:
             assert {"task", "read_skill", "save_skill_draft", "stage_memory_candidate",
-                    "desktop_act", "WebIQ-MCP-web", "playwright-browser_navigate"} <= set(tools)
+                    "desktop_act", "WebSearch-MCP-web", "playwright-browser_navigate"} <= set(tools)
             schema = tools["task"]["parameters"]
             assert schema == DelegationTask.model_json_schema()
             arguments = {"name": "one-child", "description": "Synthetic HTTP comparison",

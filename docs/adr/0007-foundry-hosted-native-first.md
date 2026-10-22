@@ -253,7 +253,7 @@ steering 只用來排隊。官方說明 `ctx.cancel` 可能有多種原因，要
 | N3 | checkpoint 分段放進 State store，並用 `$HOME` 熱恢復（介面見下方） | 83d4；N0 確認前不合併 |
 | 私人記憶直連 | Hosted 用自己的 agent identity 查詢和更新私人 memory scope | 83d4，#315 已合併、預設關閉；部署前由 fdbb 指派角色 |
 | N4 | 官方時鐘＋原N1 occurrence入口；不在FA內建timer／agent loop | N1；§9⑥已重新核准S1／S3和S2 code/offline，預設關。Job／MI／app role／pull權限、部署與live仍須Neal另批。**2026-10-07 起改由 API 兼任時鐘（#728，dev PASS），Job 路徑已移除，不需要新 MI／app role／pull；見 [ADR-0006 補充](0006-team-trust-boundary-grokbot-mode.md#api-routine-clock)** |
-| N5 | 用 Toolbox 取代組織共用 connector broker | 第 9 節 ②已允許；排在 N1～N3 之後 |
+| N5 | 用 Toolbox 取代組織共用 connector broker | 第 9 節 ②已允許；排在 N1～N3 之後。**2026-10-22**：WebIQ 收斂到只走 toolbox（Neal「只留 toolbox」），舊的 API broker entry `WebIQ-MCP` 與 API secret 退場，見 [README](../../src/fa-shared-context-poc/README.md#webiq-toolbox-only) |
 | N6 | 改用 Responses：Foundry 代管歷史、stored background 和重入；T5 內部仍走 relay，由 N6-4 改用 Responses。對外 A2A（N6-6）不做（Neal 2026-10-02 15:08，#396） | Neal 2026-10-02 08:16 決定實作，總協調 08:57 核准設計。切片 N6-0～N6-6 與 owner 見 [N6 設計 §8](../n6-responses-migration-design.md#8-切片依賴owner工作量)；N6-0 先合併，其他片才能合併 |
 
 **N1／N3 checkpoint 介面**（71c7 已同意，N1 的 turn DTO 直接引用，不另定分片格式）

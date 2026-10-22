@@ -1,6 +1,5 @@
 """N2 owner-checked forwarding. Native records stay in the Agent, never in an API index."""
 
-import contextlib
 import json
 import hashlib
 import logging
@@ -168,38 +167,28 @@ class _NotCurrentReader(Problem):
     """The reader's session read names another environment; only a cached reader is read again."""
 
 
-# Reads an owner follow-up submit starts while ``sessions.current`` confirms the Agent's session (RTT A): the
-# conversation on the kept reader, and the capture from the fixed template and selection this conversation had at
-# its last read. Each is used only when it equals what the ordinary order reads; any other outcome (another session,
-# another template, a failure) is read again in order. Reads only: nothing is sent to Hosted or written early.
+# The read an owner follow-up submit starts while ``sessions.current`` confirms the Agent's session (RTT A): the
+# capture from the fixed template and selection this conversation had at its last read (Table only). It is used only
+# when it equals what the ordinary order reads; any other outcome (another template, a failure) is read again in
+# order. The conversation is not prefetched (2026-10-22): two invocations of one SID at once were held ~2 s by the
+# platform on dev (README#rtt-a-submit-prefetch). Reads only: nothing is sent to Hosted or written early.
 _PREFETCH = ThreadPoolExecutor(max_workers=16, thread_name_prefix="fa-submit-prefetch")
 KEPT_CONVERSATIONS = 256
 
 
 class _SubmitPrefetch:
-    def __init__(self, conversation=None, capture=None, basis=None, *, target=None):
-        self._conversation, self._capture, self._basis, self._target = conversation, capture, basis, target
-
-    @staticmethod
-    def _result(future):
-        try:
-            return None if future is None else future.result()
-        except Exception:
-            return None
-
-    def conversation(self, client):
-        target = self._target
-        if target is None or (target.session_id, target.agent_version) != (
-                client.target.session_id, client.target.agent_version):
-            return None
-        return self._result(self._conversation)
+    def __init__(self, capture, basis):
+        self._capture, self._basis = capture, basis
 
     def capture(self, conversation):
         # ``resolve_capture`` reads only the conversation's ID and capture, so equal ones give an equal result.
         basis = self._basis
-        if basis is None or (basis.conversation_id, basis.capture) != (conversation.conversation_id, conversation.capture):
+        if (basis.conversation_id, basis.capture) != (conversation.conversation_id, conversation.capture):
             return None
-        return self._result(self._capture)
+        try:
+            return self._capture.result()
+        except Exception:
+            return None
 
 
 def _kept_conversations(composition):
@@ -401,10 +390,11 @@ class NativeTurnGateway:
                 retry = False
 
     @staticmethod
-    def _legacy(control, cid):
+    def _legacy(control, cid, rows=None):
+        """``rows``: an already read snapshot of ``control.store`` holding this CID's conversation key."""
         if cid is not None:
             key = conversation_key(cid)
-            if control.store.read_snapshot((key,))[key] is not None:
+            if (control.store.read_snapshot((key,)) if rows is None else rows)[key] is not None:
                 raise Problem(409, "NATIVE_STATE_SCOPE", "an existing Table conversation must keep its original route")
 
     @staticmethod
@@ -790,7 +780,7 @@ class NativeTurnGateway:
         fence, an older follow's ``pending``, a retired or incompatible SID, a stuck admission) is resent in this
         request (``wait_in_request``), then answered ``server_following`` for the workbench's same-RID resend; never
         a refusal. Every caller (the owner's routes, group start, Teams) goes through here. Only the first attempt
-        prefetches the conversation (a latency gain); a resend reads it in ``_prepare`` once it is admitted."""
+        prefetches the capture (a latency gain); a resend resolves it in ``_prepare`` once it is admitted."""
         from .behavior_native_sessions import native_sessions
         enforce = original is None and native_sessions(self.composition).guard.enforce
         attempts = []
@@ -821,7 +811,7 @@ class NativeTurnGateway:
         command = InstructionSubmit.model_validate_json(command.model_dump_json())
         rid = command.request_id
         timed = timing_id(rid)
-        # The selected version comes from a selector read made in this request (once, shared with the prefetch).
+        # The selected version comes from a selector read made in this request (once).
         started = monotonic()
         try:
             with phase_timing("api_submit_context", job_id=timed):
@@ -837,7 +827,7 @@ class NativeTurnGateway:
             def defer(send):
                 # A refused after-reply POST forgets the cached reader as a refused synchronous one did.
                 queue(partial(send, refused=sessions.moved))
-        prefetch = (self._prefetch(control, sessions, reader, principal, command, checked_since=started)
+        prefetch = (self._prefetch(control, reader, principal, command)
                     if early and original is None and command.conversation_id is not None else None)
         try:
             with phase_timing("api_submit_session", job_id=timed):
@@ -1214,27 +1204,16 @@ class NativeTurnGateway:
                 return None, None
             raise
 
-    def _prefetch(self, control, sessions, reader, principal, command, *, checked_since):
-        """Start the follow-up's conversation read and capture while ``sessions.current`` confirms the session."""
-        # The submit's selector read, taken without the session lock so the conversation read starts early;
-        # ``sessions.current`` reuses it and raises any refusal.
-        with contextlib.suppress(Problem):
-            sessions.reader(reader, checked_since=checked_since)
-        kept_reader = sessions.cached_reader(reader)
-        conversation = None
-        if kept_reader is not None:
-            read = NativeConversationRead(conversation_id=command.conversation_id)
-            conversation = _PREFETCH.submit(copy_context().run, lambda: self._invoke(kept_reader, read)[0])
+    def _prefetch(self, control, reader, principal, command):
+        """Start the follow-up's capture (Table reads only) while ``sessions.current`` confirms the session."""
         kept, lock = _kept_conversations(self.composition)
         with lock:
             basis = kept.get((reader.target.agent_id, command.conversation_id))
-        capture = None
-        if basis is not None:
-            authority = getattr(getattr(self.composition, "assistant", None), "authority", None)
-            capture = _PREFETCH.submit(copy_context().run, resolve_capture, control, authority, principal, command,
-                                       conversation=basis)
-        return _SubmitPrefetch(conversation, capture, basis,
-                               target=None if kept_reader is None else kept_reader.target)
+        if basis is None:
+            return None
+        authority = getattr(getattr(self.composition, "assistant", None), "authority", None)
+        return _SubmitPrefetch(_PREFETCH.submit(copy_context().run, resolve_capture, control, authority, principal,
+                                                command, conversation=basis), basis)
 
     def _keep_admitted(self, client, value):
         """A new conversation's admitted receipt names its CID and the capture it keeps, the next submit's basis."""
@@ -1261,9 +1240,7 @@ class NativeTurnGateway:
         previous = None
         if command.conversation_id is not None:
             with phase_timing("api_submit_conversation", job_id=timed):
-                previous = None if prefetch is None else prefetch.conversation(client)
-                if previous is None:
-                    previous, _ = self._invoke(client, NativeConversationRead(conversation_id=command.conversation_id))
+                previous, _ = self._invoke(client, NativeConversationRead(conversation_id=command.conversation_id))
             # ADR-0009 §3: by channel; an H2d image labels the conversations it creates v2, this API sends v1.
             if channel(previous.state_profile) != channel(state_profile):
                 raise Problem(409, "NATIVE_STATE_SCOPE", "the original CID must keep its selected state profile")

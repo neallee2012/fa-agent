@@ -93,6 +93,21 @@ python -X utf8 deploy/stage/ci_deploy.py --config $cfg follow $api $hosted
 - Teams relay（`src/fa-teams-relay`）**不在** `ci_deploy` 裡（`build` 只有 api／hosted／console／feed），照
   [relay README](../src/fa-teams-relay/README.md) 另外做。
 - dev 沒有遠端工作台（`console_app` 是 `null`），不跑 `console`；`feed` 視需要在 `follow` 之後跑。
+- <a id="dev-webiq-env-removal"></a>**2026-10-22 起的一次性步驟（WebIQ 只剩 toolbox）**：`dev.json` 不再有
+  `FA_CAPABILITY_SECRET_WEBIQ_API_KEY`，但 live 的 `ca-fa-behavior-poc` 還掛著它，`ci_deploy` 沒有「退場 ENV」的機制。
+  2026-10-22 起 `guard` 就會停在 `deployed ENV ['FA_CAPABILITY_SECRET_WEBIQ_API_KEY'] is not in the deployment profile`
+  （在 `build`／`sync` 之前，什麼都沒發布；之前要到 `api` 才停，`sync` 已經發布 Hosted 新版本，留下半套）。
+  **下一次 dev 部署之前**（每一步都要批准）：
+  1. 在 8765 把還選著 `WebIQ-MCP` 的助理新對話設定換成 `WebIQ`（關掉 `WebIQ-MCP`、打開 `WebIQ`，見
+     [WebIQ 只剩 toolbox](../src/fa-shared-context-poc/README.md#webiq-toolbox-only)）。
+  2. 先讀回 dev 正在服務的 image 已含 #943（mcp-api 列工具失敗時降級）；2026-10-22 dev 部署讀回 API revision `…1c8bf3a-r3502-1`（`1c8bf3a8` 已含 #943），之後仍以當下讀回為準。
+     拿掉 ENV 到下一次部署之間，服務中的舊 image 還有 `WebIQ-MCP`，它列工具會失敗；有 #943 時回合只降級、不會失敗。沒含 #943 就先別做這步。
+     沒有回合在跑或排隊時，拿掉這個 ENV（同一個 image，只產生一個新 revision；後綴沿用服務中的 commit，`guard` 才讀得出來）：
+     `az containerapp update -g rg-faexample -n ca-fa-behavior-poc --subscription <dev 訂用帳戶> --remove-env-vars FA_CAPABILITY_SECRET_WEBIQ_API_KEY --revision-suffix <服務中 commit 前 7 碼>-r0-<沒用過的號碼>`，
+     讀回新 revision Healthy、traffic 100%、`/healthz` 200、ENV 裡沒有這一項。換 revision 的期間，進行中的請求可能拿到 503，
+     列工具和 `/call` 都一樣。之後照上面的順序部署；跳過這步時 `guard` 會先停下。
+  3. 舊 revision 都停用後，刪 app secret：`az containerapp secret remove -g rg-faexample -n ca-fa-behavior-poc --subscription <dev 訂用帳戶> --secret-names webiq-api-key`
+     （刪除，要 Neal 另外批准；[官方](https://learn.microsoft.com/azure/container-apps/manage-secrets)：先部署不再引用它的 revision 再刪）。
 - 最後重啟本機 8765 工作台：停掉原 bridge，用**原本的**配置、journal 與 SHA 重開
   （[`serve` 用法](../src/fa-shared-context-poc/web_test_console/README.md#多-agent-配置與交接codeoffline)，
   多 Agent 時加原 `--agents` manifest），再按「連線」。
@@ -227,14 +242,24 @@ The input also carries three options learned from the 2026-10-07 deployment:
     Team 主人、UAMI FIC（沒有 client secret）、UAMI 只有 `AcrPull` 和 `journal`／
     `easyauth-tokens` containers 的 Blob Data Contributor、API 加
     `FA_REMOTE_CONSOLE_CLIENT_ID`。讀回匿名瀏覽器 request 302 到目標 tenant 登入（E1）。
-16. **WebIQ toolbox（選用，批准）**：`new_webiq_connection.py`（2026-10-10 取代同格式的
+16. <a id="webiq-key-rotation"></a>**WebIQ toolbox（選用，批准）**：`new_webiq_connection.py`（2026-10-10 取代同格式的
     `new-webiq-connection.ps1`）＋`new_toolbox.py`，兩支都接受 `--config`；
-    金鑰由 Neal 隱藏輸入。連線已存在時只讀回、不再問金鑰；要換過期或外洩的金鑰，
-    在終端機執行 `python deploy/stage/new_webiq_connection.py --rotate`（azd 環境加
-    `--config .azure/<env>/fa/profile.json`；不加 `--config` 會用 `FA_DEPLOY_CONFIG` 或 `deploy/stage/stage.json`，也就是 stage；
-    需要 `httpx` 與 `azure-identity`，可用 deploy 建好的 `.azure/<env>/fa/venv`，或 `pip install -r src/fa-shared-context-poc/requirements.txt`）：
-    先唯讀確認連線已存在（不存在就停下、什麼都不寫；第一次建立走不加 `--rotate` 的正常流程），
-    再隱藏輸入新金鑰、對同一條連線做一次 PUT、讀回要 200。同一條連線的 PUT 是冪等的，結果不明時重跑 `--rotate` 是安全的。project 沒有 `fa-org-tools` 時，不要讓 Agent 選 WebIQ toolbox（F6）。
+    金鑰由 Neal 隱藏輸入。連線已存在時只讀回、不再問金鑰。第一次建立前，腳本先讀 toolbox `fa-org-tools`：
+    它已經用另一條連線時就停下、不問金鑰（2026-10-22 起，避免同一把 key 多一份）。project 沒有 `fa-org-tools` 時，不要讓 Agent 選 WebIQ toolbox（F6）。
+
+    **換 key**（2026-10-22 起每個環境只有一份 WebIQ key，就是下表那條 project connection；API 和 VM 都沒有）：
+    先在同一個終端機設好登入目錄（dev／stage：`$env:AZURE_CONFIG_DIR = "$HOME\.azure-foundry-agents"`），從 repo 根目錄執行：
+
+    | 環境 | connection | 指令（互動式終端機） |
+    |---|---|---|
+    | stage | `stage-webiq-key` | `python deploy/stage/new_webiq_connection.py --config deploy/stage/stage.json --rotate` |
+    | dev | `webiq-key`（profile 的 `webiq_connection`） | `python deploy/stage/new_webiq_connection.py --config deploy/dev/dev.json --rotate` |
+    | azd 環境 | `<env>-webiq-key` | `python deploy/stage/new_webiq_connection.py --config .azure/<env>/fa/profile.json --rotate` |
+
+    一定帶 `--config`（不帶時用 `FA_DEPLOY_CONFIG`，再沒有就是 stage）。需要 `httpx` 與 `azure-identity`，可用 deploy 建好的
+    `.azure/<env>/fa/venv`，或 `pip install -r src/fa-shared-context-poc/requirements.txt`。`--rotate` 先唯讀確認連線已存在
+    且 target 是 WebIQ（不存在或不是就停下、什麼都不寫），再隱藏輸入新金鑰、對同一條連線做一次 PUT、讀回要 200。同一條連線的 PUT 是冪等的，結果不明時重跑
+    `--rotate` 是安全的。FA 的 image 與 profile 都沒有這把 key，所以換完不用重新部署 FA。Foundry 端在每次呼叫時讀取連線的行為待 live 換 key 後確認。
 17. **Portal 驗收**：真人登入、開新對話、送短訊息；以 receipt `completed`、
     `failure_code=null`、用量已計量為準。HTTP 200、「執行中」或畫面有字都不算。
 

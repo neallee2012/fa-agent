@@ -150,7 +150,7 @@ ACR、CAE、API UAMI（名稱／client ID／principal ID）、Table／備份 sto
 
 - `azd up` 本身就是使用者對自己環境的部署動作；對 FA 自己的 dev／stage 仍照 AGENTS.md 每次批准。
   azd 路徑**不碰** `deploy/stage/*.json` 的任何值，stage CI 不變。
-- 兩個寫入點在 hook 裡要 owner 當場輸入確認：首次安裝 apply（plan hash 前 12 碼）與 WebIQ 金鑰。
+- 兩個寫入點在 hook 裡要 owner 當場輸入確認：首次安裝 apply（看過 plan 摘要後輸入 `y`，批准檔綁定 plan 與 configuration hash）與 WebIQ 金鑰。
   非互動（CI、`--no-prompt`）時直接停，不自動批准。
 - 每個雲端寫入都先寫 intent（`open("x")`）；有 intent 只讀回，不重送；結果不明就停。
 - WebIQ 金鑰只在記憶體，PUT 一次後丟棄；不寫檔、不印、不放命令列或 azd env。

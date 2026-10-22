@@ -10,9 +10,9 @@ from shared_context.tool_catalog import (
     CatalogError, HttpEntry, StdioEntry, build_catalog, load_catalog, parse_entry_file, resolve_headers,
 )
 
-WEBIQ = {"mcpServers": {"WebIQ-MCP": {
-    "url": "https://api.microsoft.ai/v3/mcp", "type": "http",
-    "headers": {"x-apikey": "${secret:webiq-api-key}"}, "tools": ["web", "browse"],
+WEBIQ = {"mcpServers": {"WebSearch-MCP": {
+    "url": "https://websearch.example.test/v3/mcp", "type": "http",
+    "headers": {"x-apikey": "${secret:websearch-api-key}"}, "tools": ["web", "browse"],
 }}}
 PLAYWRIGHT = {"mcpServers": {"playwright": {
     "type": "local", "command": "/opt/fa-tools/bin/playwright-mcp",
@@ -42,11 +42,11 @@ def rejected(document, code, filename="entry.json"):
 
 
 def test_secret_http_entry_is_an_api_client_and_stdio_entry_runs_in_hosted():
-    webiq = parse_entry_file("webiq.json", raw(WEBIQ))
+    webiq = parse_entry_file("websearch.json", raw(WEBIQ))
     assert webiq.execution == "api-client" and isinstance(webiq.config, HttpEntry)
-    assert webiq.tool_names == ("WebIQ-MCP-web", "WebIQ-MCP-browse")
-    assert webiq.secret_names == ("webiq-api-key",)
-    assert webiq.config.headers == (("x-apikey", "${secret:webiq-api-key}"),)
+    assert webiq.tool_names == ("WebSearch-MCP-web", "WebSearch-MCP-browse")
+    assert webiq.secret_names == ("websearch-api-key",)
+    assert webiq.config.headers == (("x-apikey", "${secret:websearch-api-key}"),)
 
     playwright = parse_entry_file("playwright.json", raw(PLAYWRIGHT))
     assert playwright.execution == "hosted-stdio" and isinstance(playwright.config, StdioEntry)
@@ -56,7 +56,7 @@ def test_secret_http_entry_is_an_api_client_and_stdio_entry_runs_in_hosted():
 
 def test_entry_digest_ignores_json_layout_but_not_content():
     compact = parse_entry_file("a.json", raw(WEBIQ)).entry_sha256
-    pretty = json.dumps({"mcpServers": {"WebIQ-MCP": dict(reversed(list(WEBIQ["mcpServers"]["WebIQ-MCP"].items())))}},
+    pretty = json.dumps({"mcpServers": {"WebSearch-MCP": dict(reversed(list(WEBIQ["mcpServers"]["WebSearch-MCP"].items())))}},
                         indent=4).encode("utf-8")
     assert parse_entry_file("b.json", pretty).entry_sha256 == compact
     assert parse_entry_file("c.json", raw(variant(WEBIQ, tools=["web"]))).entry_sha256 != compact
@@ -66,18 +66,18 @@ def test_entry_digest_ignores_json_layout_but_not_content():
     {"x-apikey": PLAINTEXT_KEY},
     {"Authorization": "Bearer abc"},
     {"x-trace": PLAINTEXT_KEY},
-    {"x-apikey": "prefix-${secret:webiq-api-key}"},
+    {"x-apikey": "prefix-${secret:websearch-api-key}"},
 ])
 def test_plaintext_or_embedded_credentials_reject_the_whole_file_without_echoing_values(headers):
-    message = rejected(variant(WEBIQ, headers=headers), "CATALOG_PLAINTEXT_SECRET", "webiq.json")
-    assert message.startswith("webiq.json: ")
+    message = rejected(variant(WEBIQ, headers=headers), "CATALOG_PLAINTEXT_SECRET", "websearch.json")
+    assert message.startswith("websearch.json: ")
     assert all(value not in message for value in headers.values())
 
 
 def test_secret_in_url_query_or_url_is_rejected():
     rejected(variant(WEBIQ, url="https://api.example.test/mcp?api_key=" + PLAINTEXT_KEY), "CATALOG_PLAINTEXT_SECRET")
     rejected(variant(WEBIQ, url="https://api.example.test/mcp/" + PLAINTEXT_KEY), "CATALOG_PLAINTEXT_SECRET")
-    rejected(variant(WEBIQ, url="https://api.example.test/${secret:webiq-api-key}"), "CATALOG_PLAINTEXT_SECRET")
+    rejected(variant(WEBIQ, url="https://api.example.test/${secret:websearch-api-key}"), "CATALOG_PLAINTEXT_SECRET")
     message = rejected(variant(WEBIQ, url="https://admin:" + PLAINTEXT_KEY + "@api.example.test/mcp"), "CATALOG_FORMAT")
     assert "without credentials" in message and PLAINTEXT_KEY not in message
     rejected(variant(WEBIQ, url="http://api.example.test/mcp"), "CATALOG_FORMAT")
@@ -108,8 +108,8 @@ def test_http_entry_without_secret_is_pending_and_not_loaded():
     ({"command": "bin/playwright-mcp"}, "CATALOG_UNPINNED_COMMAND"),
     ({"command": "/opt/fa-tools/../usr/bin/bash"}, "CATALOG_UNPINNED_COMMAND"),
     ({"args": ["--package=@playwright/mcp@latest"]}, "CATALOG_UNPINNED_COMMAND"),
-    ({"env": {"API_TOKEN": "${secret:webiq-api-key}"}}, "CATALOG_UNSUPPORTED_ENTRY"),
-    ({"args": ["--token=${secret:webiq-api-key}"]}, "CATALOG_UNSUPPORTED_ENTRY"),
+    ({"env": {"API_TOKEN": "${secret:websearch-api-key}"}}, "CATALOG_UNSUPPORTED_ENTRY"),
+    ({"args": ["--token=${secret:websearch-api-key}"]}, "CATALOG_UNSUPPORTED_ENTRY"),
     ({"env": {"API_TOKEN": "literal"}}, "CATALOG_PLAINTEXT_SECRET"),
     ({"args": ["--token=" + PLAINTEXT_KEY]}, "CATALOG_PLAINTEXT_SECRET"),
     ({"args": [PLAINTEXT_KEY]}, "CATALOG_PLAINTEXT_SECRET"),
@@ -120,10 +120,10 @@ def test_stdio_entries_must_be_preinstalled_pinned_and_secret_free(changes, code
 
 
 @pytest.mark.parametrize("document", [
-    {"servers": {"WebIQ-MCP": WEBIQ["mcpServers"]["WebIQ-MCP"]}},
+    {"servers": {"WebSearch-MCP": WEBIQ["mcpServers"]["WebSearch-MCP"]}},
     {"mcpServers": {}},
     {"mcpServers": {**WEBIQ["mcpServers"], **PLAYWRIGHT["mcpServers"]}},
-    {"mcpServers": {"WebIQ-MCP": WEBIQ["mcpServers"]["WebIQ-MCP"]}, "inputs": []},
+    {"mcpServers": {"WebSearch-MCP": WEBIQ["mcpServers"]["WebSearch-MCP"]}, "inputs": []},
     variant(WEBIQ, tools=None),
     variant(WEBIQ, tools=["*"]),
     variant(WEBIQ, tools=[]),
@@ -131,8 +131,8 @@ def test_stdio_entries_must_be_preinstalled_pinned_and_secret_free(changes, code
     variant(WEBIQ, oauth={"clientId": "x"}),
     variant(WEBIQ, timeout="30"),
     variant(PLAYWRIGHT, cwd="/tmp"),
-    {"mcpServers": {"bad name": WEBIQ["mcpServers"]["WebIQ-MCP"]}},
-    {"mcpServers": {"x" * 20: {**WEBIQ["mcpServers"]["WebIQ-MCP"], "tools": ["t" * 45]}}},
+    {"mcpServers": {"bad name": WEBIQ["mcpServers"]["WebSearch-MCP"]}},
+    {"mcpServers": {"x" * 20: {**WEBIQ["mcpServers"]["WebSearch-MCP"], "tools": ["t" * 45]}}},
 ])
 def test_non_native_or_open_ended_entries_are_rejected(document):
     rejected(document, "CATALOG_FORMAT")
@@ -147,12 +147,12 @@ def test_unsupported_transport_types_and_bad_bytes_are_rejected():
 
 
 def test_directory_load_is_deterministic_and_fails_closed(tmp_path):
-    (tmp_path / "b-webiq.json").write_bytes(raw(WEBIQ))
+    (tmp_path / "b-websearch.json").write_bytes(raw(WEBIQ))
     (tmp_path / "a-playwright.json").write_bytes(raw(PLAYWRIGHT))
     (tmp_path / "README.md").write_text("ignored", encoding="utf-8")
     catalog = load_catalog(tmp_path)
-    assert [item.entry_id for item in catalog.entries] == ["WebIQ-MCP", "playwright"]
-    assert catalog.entry("WebIQ-MCP").execution == "api-client" and catalog.entry("missing") is None
+    assert [item.entry_id for item in catalog.entries] == ["WebSearch-MCP", "playwright"]
+    assert catalog.entry("WebSearch-MCP").execution == "api-client" and catalog.entry("missing") is None
     assert catalog.catalog_sha256 == build_catalog(list(reversed(catalog.entries))).catalog_sha256
 
     (tmp_path / "c-bad.json").write_bytes(raw(variant(WEBIQ, headers={"x-apikey": PLAINTEXT_KEY})))
@@ -182,8 +182,8 @@ def test_directory_load_rejects_links(tmp_path):
 
 
 def test_secret_resolution_is_api_side_and_missing_secret_is_needs_auth():
-    webiq = parse_entry_file("webiq.json", raw(WEBIQ))
-    assert resolve_headers(webiq, {"webiq-api-key": "resolved-value"}.get) == {"x-apikey": "resolved-value"}
+    webiq = parse_entry_file("websearch.json", raw(WEBIQ))
+    assert resolve_headers(webiq, {"websearch-api-key": "resolved-value"}.get) == {"x-apikey": "resolved-value"}
     with pytest.raises(Problem) as missing:
         resolve_headers(webiq, lambda name: None)
     assert missing.value.body["error"]["code"] == "CAPABILITY_NEEDS_AUTH"

@@ -47,7 +47,7 @@ READER_IDLE_SECONDS = 24 * 3600
 # A session can also be deleted or fail at any time, and invoking a deleted SID makes the platform re-create it empty
 # (dev 2026-10-15). So anything that invokes the row's SID (sends and reads alike) reads its platform metadata in its
 # own request, alongside its selector read (no added serial step); a read started at most this long ago is reused, so
-# one submit's prefetch and session read, a burst of sends, or 1 s status polls share one read.
+# a burst of sends or 1 s status polls share one read.
 METADATA_REUSE_SECONDS = 10
 # A warm process's metadata read holds a request at most this long after the request's own selector read started, with
 # no retry (azure-core per-call transport timeouts end the read itself); past it the SID is kept as on main.
@@ -589,33 +589,6 @@ class NativeSessions:
         located._binding_row = row
         return located
 
-    def cached_reader(self, client):
-        """The kept reader for ``client``'s Agent without any platform read; None when none is kept or the selector
-        was not read within ``SELECTOR_CHECK_SECONDS`` naming the kept reader's version. With a binding row, the row's
-        SID is the kept reader only while the same checks hold for it (ADR-0009 §10 phase 0 guarantee): a row read and
-        a selector read within that window, the selector naming the version the SID was created on, no abandon
-        decision, and a metadata read of the SID kept by ``_located`` within ``METADATA_REUSE_SECONDS`` (an older one,
-        or a read that raised, keeps nothing). A bound Agent never falls back to a kept legacy reader."""
-        scope = _scope(client.target)
-        with self._reader_lock:
-            kept, selector, checked, now = self._bound_row, self._selector, self._row_checked, monotonic()
-        if kept is not None and kept[0] == scope and kept[1] is not None:
-            row = kept[1]
-            if (now - kept[2] < SELECTOR_CHECK_SECONDS and row.abandon is None
-                    and selector is not None and selector[0] == scope and now - selector[2] < SELECTOR_CHECK_SECONDS
-                    and selector[1] == row.created_agent_version
-                    and checked is not None and checked[:2] == (scope, row.hosted_session_id)
-                    and now - checked[2] < METADATA_REUSE_SECONDS):
-                return self._bound_client(client, row)
-            return None
-        with self._reader_lock:
-            cached, selector, now = self._reader, self._selector, monotonic()
-            if (cached is not None and cached[0] == scope and now - cached[2] < READER_IDLE_SECONDS
-                    and selector is not None and selector[0] == scope and now - selector[2] < SELECTOR_CHECK_SECONDS
-                    and selector[1] == cached[1].agent_version):
-                return client.for_target(cached[1])
-        return None
-
     @staticmethod
     def binding_moved(error):
         """True when the refusal says the Agent's binding moved (reads nothing and forgets nothing).
@@ -1009,7 +982,7 @@ class NativeSessions:
         (with ``FA_NATIVE_SESSION_GUARD_ENFORCE`` it is, and the background cut moves it after a turn end: 2d-i P7),
         and a non-active one (404, failed, deleted, expired) never at all. The selector read and the SID's platform
         metadata (``get_session``) run in parallel, so the session call after them waits no longer than on main, where
-        they ran one after the other. Every caller (each invokes the SID next: send, read, poll, prefetch) reads the
+        they ran one after the other. Every caller (each invokes the SID next: send, read, poll) reads the
         metadata unless a read started within ``METADATA_REUSE_SECONDS``. ``usable``: the row has no abandon decision,
         the selector (when this build serves it) names the version the SID was created on (with the flag: any
         version), and the metadata says active or idle. A 401/403 is raised. Otherwise a failed read (5xx, 429,

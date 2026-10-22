@@ -372,6 +372,8 @@ I/W同一批交付：N1先保存RID再排隊、SDK成功terminal tool讓A結束�
   - 使用使用者提供的**專用 key**；官方說明 API key 等同整個帳號權限，所以不與個人開發工具共用。
   - 透過 **WebIQ MCP**（SaaS 的 `/v3/mcp` endpoint）存取，不另設資料處理或保存區域要求。
   - WebIQ 費用不計入共用上限（§9.1），呼叫次數與用量另外記錄。
+- **2026-10-22 註記**：下面這個 API 持 key 的架構已由 ADR-0007 N5 取代並退場；WebIQ 改走官方 toolbox，key 只在 Foundry project
+  connection（[README](../src/fa-shared-context-poc/README.md#webiq-toolbox-only)）。以下保留原設計紀錄。
 - **架構**：catalog 以 §9.1 的格式提供一份 `http` entry（`WebIQ-MCP`，header 為 `${secret:webiq-api-key}`）。
   因為它帶 secret，由 **FA API 端擔任 WebIQ MCP 的 client 並持有 key**。
   Hosted SDK 只看到與 entry 同名的 FA 受控工具（例如 `WebIQ-MCP-web`、`WebIQ-MCP-browse`），沿用既有的 ticket 路徑；key、帳號與 endpoint 由伺服器選定。

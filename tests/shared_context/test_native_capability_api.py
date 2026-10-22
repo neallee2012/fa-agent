@@ -32,7 +32,7 @@ from test_native_agent_api import relay_case  # noqa: F401
 
 BODY = "APPROVED_NATIVE_SKILL_CANARY: verify the receipt; guidance never grants an operation.\n"
 SKILLS = available_grants(None, ("fa-skills-v1",))["fa-skills-v1"]
-WEB = available_grants(CATALOG)["WebIQ-MCP"]
+WEB = available_grants(CATALOG)["WebSearch-MCP"]
 
 
 class ApprovedSkills:
@@ -150,7 +150,7 @@ def test_skills_need_the_captured_grant_and_the_original_running_turn(skilled):
         assert code(denied) == "NATIVE_CAPABILITY_SCOPE"
 
 
-def call(scope, tool_call_id="call-1", tool="WebIQ-MCP-web", query="fa"):
+def call(scope, tool_call_id="call-1", tool="WebSearch-MCP-web", query="fa"):
     return NativeCapabilityCall(**scope.model_dump(), tool_call_id=tool_call_id, tool=tool,
                                 arguments={"query": query}, input_schema_sha256="1" * 64)
 
@@ -161,7 +161,7 @@ def test_native_mcp_api_uses_the_existing_broker_once_per_agent_rid_and_tool_cal
     calls, lookups = [], []
 
     async def fake_list(entry, lookup, **_):
-        lookups.append(lookup("webiq-api-key"))
+        lookups.append(lookup("websearch-api-key"))
         return listed()
 
     async def fake_call(entry, lookup, tool, arguments, *, expected_schema_sha256=None, **_):
@@ -178,11 +178,11 @@ def test_native_mcp_api_uses_the_existing_broker_once_per_agent_rid_and_tool_cal
         raise AssertionError("the offline MCP fake must not await")
     from shared_context import behavior_capability_calls
     monkeypatch.setattr(behavior_capability_calls, "_run", run_without_loop)
-    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBIQ_API_KEY", KEY)
+    monkeypatch.setenv("FA_CAPABILITY_SECRET_WEBSEARCH_API_KEY", KEY)
     monkeypatch.setattr(mcp_client, "list_tools", fake_list)
     monkeypatch.setattr(mcp_client, "call_tool", fake_call)
     scope = started(case, (WEB, SKILLS))
-    assert [item.entry_id for item in native.capability_catalog(case.principal, scope).entries] == ["WebIQ-MCP"]
+    assert [item.entry_id for item in native.capability_catalog(case.principal, scope).entries] == ["WebSearch-MCP"]
     assert lookups == [KEY]
     with caplog.at_level(logging.WARNING, logger="shared_context.behavior_capability_calls"):
         first = native.capability_call(case.principal, call(scope))
@@ -195,7 +195,7 @@ def test_native_mcp_api_uses_the_existing_broker_once_per_agent_rid_and_tool_cal
     native.capability_call(case.principal, call(other))
     assert len(calls) == 2
     with pytest.raises(Problem) as denied:
-        native.capability_call(case.principal, call(scope, "call-2", tool="WebIQ-MCP-images"))
+        native.capability_call(case.principal, call(scope, "call-2", tool="WebSearch-MCP-images"))
     assert code(denied) == "CAPABILITY_TOOL_DENIED"
     without = started(case, (SKILLS,), rid="no-web-grant")
     assert native.capability_catalog(case.principal, without).entries == ()
@@ -206,7 +206,7 @@ def test_native_mcp_api_uses_the_existing_broker_once_per_agent_rid_and_tool_cal
         native.capability_call(case.principal, call(started(case, (WEB,), rid="cancelled-web", cancel=True)))
     assert code(stopped) == "NATIVE_CAPABILITY_SCOPE" and len(calls) == 2
     logged = [json.loads(r.getMessage().split(" ", 1)[1]) for r in caplog.records if "FA_CAPABILITY_CALL" in r.getMessage()]
-    assert logged[0] == {"agent_id": case.sender.agent_id, "capability": "WebIQ-MCP",
+    assert logged[0] == {"agent_id": case.sender.agent_id, "capability": "WebSearch-MCP",
                          "counts_against_shared_budget": False, "outcome": "ok", "request_id": scope.request_id,
                          "tool": "web", "tool_call_id": "call-1"}
     assert KEY not in caplog.text and KEY not in first.model_dump_json()

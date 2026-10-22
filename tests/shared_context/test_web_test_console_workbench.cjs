@@ -1394,6 +1394,9 @@ test("a push hint reads once even while progress is paused, and a good answer re
 // progress read, and the page stopped polling on the error though the turn had finished; later reads all worked.
 for(const [label,failure] of [
   ["a 503 the API marks retryable",{ok:false,status:503,json:async()=>({error:{code:"NATIVE_BOOTSTRAP_UNKNOWN",automatic_retry:true}})}],
+  // r33 dev (H15): a 30 s read timeout on the API side, answered 503 FOUNDRY_INVOCATION_UNKNOWN; the next read was 200.
+  ["a 503 FOUNDRY_INVOCATION_UNKNOWN on a read",{ok:false,status:503,json:async()=>({error:{code:"FOUNDRY_INVOCATION_UNKNOWN",
+    upstream_status:503,automatic_retry:true}})}],
   ["an upstream 5xx the bridge reports as BACKEND_UNAVAILABLE",{ok:false,status:409,json:async()=>({error:{code:"BACKEND_UNAVAILABLE",upstream_status:500,automatic_retry:false}})}],
 ]){
   test(`a running turn's read that fails with ${label} is read again with backoff and the reply then shows`,async()=>{
@@ -1403,6 +1406,7 @@ for(const [label,failure] of [
     assert.deepEqual(await fireProgress(ui),[`/api/instructions/${rid}/status`]);
     assert.equal(vm.runInContext("progressPaused",ui.context),false,"polling goes on");
     assert.match(ui.text("error-message"),/暫時讀不到進度，正在重試/);
+    assert.equal(ui.text("error-full"),"暫時讀不到進度，正在重試。訊息不會重送。","a read, never a send outcome");
     const retry=[...ui.timers.entries()].find(([id])=>ui.timerDelays.get(id)===2000);
     assert.ok(retry,"the next read waits 2 s (1→2→4…30)");
     const done=nativeChat("completed");done.tasks[0].reply={data:{text:"重試後的回覆"},sha256:"a".repeat(64),byte_length:18,observed_at:when};
@@ -1413,6 +1417,20 @@ for(const [label,failure] of [
     assert.equal(ui.calls.some(call=>call.method==="POST"),false);
   });
 }
+// H15, the other shape: the bridge's /status falls back to the receipt read and keeps only the progress read's
+// failure on the turn (native.py turn_status), so the page gets a 200 with progress_error.
+test("a running turn whose progress read failed upstream keeps polling at its pace with no error and no send",async()=>{
+  const data=nativeChat("started"),rid=data.tasks[0].task_id;
+  const ui=await open(data);await ui.tick();
+  const failed=copy(data);failed.tasks[0].progress_error="FOUNDRY_INVOCATION_UNKNOWN";
+  ui.holder.progressResponse={ok:true,json:async()=>copy(failed)};
+  assert.deepEqual(await fireProgress(ui),[`/api/instructions/${rid}/status`]);
+  assert.equal(vm.runInContext("progressPaused",ui.context),false);
+  assert.equal(ui.nodes.get("error").hidden,true,"no banner for a read the next poll retries");
+  assert.ok([...ui.timers.keys()].some(id=>ui.timerDelays.get(id)===1000),"the next read keeps the 1 s pace");
+  assert.doesNotMatch(historyText(ui),/沒有完成|結果不確定|傳送結果尚未確認/);
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
 
 test("a read conflict on the opening /status is not re-read in a tight loop",async()=>{
   // #686 review: a 409 RESULT_UNKNOWN/412 reset the backoff to 1 s and the opening read re-armed at 0 ms.
@@ -4077,13 +4095,16 @@ test("an explicitly unapplied append can return to the composer only by a human 
 
 // G plan "no lost message": an append made in the turn's tail (reply shown, turn not yet saved as completed) is settled
 // not_applied, a definite "never delivered", so it goes out once as a new turn under a new RID. unknown never does.
-async function appendInTail(status,{draft="",reason=status==="unknown"?"sdk_unconfirmed":"turn_finished"}={}){
-  const data=appendChat(),rid=data.composer.request_id,ui=await open(data),content="回覆後馬上補的一句";
+const withAgentScope=data=>Object.assign(data,Object.fromEntries(Object.entries(agentChat("agent-one")).filter(([key])=>
+  ["agent_mode","default_agent_id","selected_agent_id","agent_directory_error","agents"].includes(key))));
+async function appendInTail(status,{draft="",reason=status==="unknown"?"sdk_unconfirmed":"turn_finished",agents=false}={}){
+  const scoped=data=>agents?withAgentScope(data):data;
+  const data=scoped(appendChat()),rid=data.composer.request_id,ui=await open(data),content="回覆後馬上補的一句";
   ui.nodes.get("instruction").value=content;ui.nodes.get("instruction").events.input();
   ui.click("send-instruction");await ui.tick();
   const row={request_id:rid,append_id:"append-offline-a",content,status,delivery:null,reason,receipt_observed:true,
     ...(status==="unknown"?{submission_state:"UNKNOWN"}:{})};
-  const done=nativeChat("completed");done.tasks[0].appends=[row];done.tasks[0].actions["read-appends"]=action(true);
+  const done=scoped(nativeChat("completed"));done.tasks[0].appends=[row];done.tasks[0].actions["read-appends"]=action(true);
   if(!draft){
     // The append landed after the turn's appends were settled: its own answer is not_applied.
     ui.holder.current=done;
@@ -4104,8 +4125,8 @@ async function appendInTail(status,{draft="",reason=status==="unknown"?"sdk_unco
 const historyText=ui=>JSON.stringify(ui.nodes.get("conversation-history").children,(key,value)=>key==="events"?undefined:value);
 test("an append settled not_applied is sent once as a new turn under a new request ID",async()=>{
   const {ui,done,rid,content}=await appendInTail("not_applied");
-  assert.match(historyText(ui),/改成新訊息送出/);
-  assert.doesNotMatch(historyText(ui),/帶回輸入框|不會自動再送/);
+  assert.match(historyText(ui),/"沒趕上這一回合，會改成新訊息送出。"/,"only a /next is out, so future tense");
+  assert.doesNotMatch(historyText(ui),/已改用新訊息送出|帶回輸入框|不會自動再送/);
   const nexts=ui.holder.pendingPosts.filter(post=>post.url.endsWith("/next"));
   assert.deepEqual(nexts.map(post=>post.url),[`/api/instructions/${done.composer.thread_id}/next`]);
   assert.match(historyText(ui),new RegExp(content),"the text shows as sending meanwhile");
@@ -4114,6 +4135,7 @@ test("an append settled not_applied is sent once as a new turn under a new reque
   nexts[0].resolve(next);await ui.tick();await ui.tick();
   const submits=ui.calls.filter(call=>call.method==="POST"&&call.url.endsWith("/submit"));
   assert.deepEqual(submits.map(call=>call.url),["/api/instructions/next-rid/submit"]);
+  assert.match(historyText(ui),/"沒趕上這一回合，已改用新訊息送出。"/,"/submit is out, so past tense");
   assert.notEqual("next-rid",rid);
   const body=JSON.parse(submits[0].body);
   assert.equal(body.content,content);assert.ok(body.model);
@@ -4137,6 +4159,321 @@ test("an append settled not_applied is sent once as a new turn under a new reque
     "the append, one /next and one /submit");
   assert.equal(ui.nodes.get("instruction").value,"");
 });
+// #871 G9: the page that resent an append is reloaded. The resend lived only in memory, so the append offered
+// 帶回輸入框 again, one click from sending the same text twice. The append ID -> RID link is kept in this browser.
+async function resentThenReloaded(){
+  const {ui,done,content}=await appendInTail("not_applied");
+  const next=copy(done);
+  Object.assign(next.composer,{request_id:"next-rid",content:null,editable:true,can_submit:true,can_follow_up:false});
+  ui.holder.pendingPosts.find(post=>post.url.endsWith("/next")).resolve(next);await ui.tick();await ui.tick();
+  const sent=copy(done.tasks[0]);
+  Object.assign(sent,{task_id:"next-rid",submit_request_id:"next-rid",instruction:content,reply:null,appends:[],
+    submission:{state:"CONFIRMED"},native_receipt:{...sent.native_receipt,status:"accepted"},
+    status:{data:{state:"accepted"},observed_at:when}});
+  const after=copy(done);after.tasks.push(sent);
+  Object.assign(after.composer,{request_id:"next-rid",content,editable:false,can_follow_up:true});
+  ui.holder.current=after;
+  ui.holder.pendingPosts.find(post=>post.url.endsWith("/submit")).resolve({task:sent});
+  for(let i=0;i<3;i++)await ui.tick();
+  return {storage:ui.context.localStorage,done,after};
+}
+const sendsOrAppends=ui=>ui.calls.filter(call=>call.method==="POST"&&/\/(next|submit|append)$/.test(call.url)).length;
+test("after a reload an append that was resent shows as resent and offers nothing to send again",async()=>{
+  const {storage,after}=await resentThenReloaded();
+  assert.equal(JSON.parse(storage.getItem("fa-resent-appends"))["append-offline-a"],"next-rid");
+  const ui=await open(after,{storage});for(let i=0;i<4;i++)await ui.tick();
+  assert.match(historyText(ui),/"沒趕上這一回合，已改用新訊息送出。"/);
+  assert.doesNotMatch(historyText(ui),/會改成新訊息送出|已送達/,"already sent, and not claimed delivered");
+  assert.doesNotMatch(historyText(ui),/帶回輸入框/);
+  assert.equal(vm.runInContext("sentAppendDrafts.size",ui.context),0,"a reload never queues a resend");
+  assert.equal(sendsOrAppends(ui),0,"nothing is sent on reload");
+});
+test("after a reload a kept link whose RID the bridge does not list as sent offers 帶回輸入框 again",async()=>{
+  const {storage,done}=await resentThenReloaded();
+  const ui=await open(done,{storage});for(let i=0;i<4;i++)await ui.tick();
+  assert.match(historyText(ui),/"帶回輸入框"/);
+  assert.equal(sendsOrAppends(ui),0);
+});
+test("after a reload a kept link whose RID carried other text offers 帶回輸入框 again",async()=>{
+  const {storage,after}=await resentThenReloaded();
+  after.tasks.find(task=>task.task_id==="next-rid").instruction="別的訊息";
+  const ui=await open(after,{storage});for(let i=0;i<4;i++)await ui.tick();
+  assert.match(historyText(ui),/"帶回輸入框"/);
+  assert.doesNotMatch(historyText(ui),/沒趕上這一回合/);
+  assert.equal(sendsOrAppends(ui),0);
+});
+// Review round 2 on #941: the past tense waits for /submit, so a /next that fails never claimed a handover.
+test("a resend whose /next fails never said it was sent and offers 帶回輸入框 again",async()=>{
+  const {ui}=await appendInTail("not_applied");
+  assert.match(historyText(ui),/"沒趕上這一回合，會改成新訊息送出。"/);
+  ui.holder.pendingPosts.find(post=>post.url.endsWith("/next")).resolve({});for(let i=0;i<3;i++)await ui.tick();
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/submit")),false);
+  assert.match(historyText(ui),/"帶回輸入框"/);
+  assert.doesNotMatch(historyText(ui),/沒趕上這一回合/);
+});
+test("a resend whose submit never went out keeps no link",async()=>{
+  const {ui,done}=await appendInTail("not_applied");
+  // Synthetic window: the owner switches conversations right after the link is written, so /submit never goes out
+  // (post() refuses before posting). The link must then be removed again, or a reload would hide 帶回輸入框.
+  vm.runInContext(`(()=>{
+    const real=linkResentAppend;globalThis.linkSeen=[];
+    linkResentAppend=(id,rid)=>{
+      real(id,rid);linkSeen.push(JSON.parse(localStorage.getItem("fa-resent-appends")||"{}")[id]??null);
+      if(rid!==null)agentRevision++;
+    };
+  })()`,ui.context);
+  const next=copy(done);
+  Object.assign(next.composer,{request_id:"next-rid",content:null,editable:true,can_submit:true,can_follow_up:false});
+  ui.holder.pendingPosts.find(post=>post.url.endsWith("/next")).resolve(next);for(let i=0;i<3;i++)await ui.tick();
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/submit")),false);
+  assert.deepEqual(JSON.parse(vm.runInContext("JSON.stringify(linkSeen)",ui.context)),["next-rid",null],
+    "written, then removed");
+  assert.equal(JSON.parse(ui.context.localStorage.getItem("fa-resent-appends")||"{}")["append-offline-a"],undefined);
+});
+// Review round 3 on #941: agentFetch refuses an unavailable Agent before any request, so that /submit never went out:
+// no "sent", no link, and the append keeps 帶回輸入框.
+test("a resend refused before its submit goes out keeps 帶回輸入框 and no link",async()=>{
+  const {ui,done}=await appendInTail("not_applied",{agents:true});
+  vm.runInContext(`(()=>{
+    const real=linkResentAppend;globalThis.resendSeen=[];
+    linkResentAppend=(id,rid)=>{
+      real(id,rid);
+      if(rid!==null)state.agents=state.agents.map(agent=>({...agent,enabled:false,reason:"AGENT_DISABLED"}));
+    };
+    const show=render;render=()=>{show();const sent=[...sentAppendDrafts.values()][0];if(sent)resendSeen.push(sent.resend)};
+  })()`,ui.context);
+  const next=copy(done);
+  Object.assign(next.composer,{request_id:"next-rid",content:null,editable:true,can_submit:true,can_follow_up:false});
+  ui.holder.pendingPosts.find(post=>post.url.endsWith("/next")).resolve(next);for(let i=0;i<3;i++)await ui.tick();
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/submit")),false);
+  assert.equal(vm.runInContext("resendSeen.includes('sent')",ui.context),false,"never said it was sent");
+  assert.equal(vm.runInContext("[...sentAppendDrafts.values()][0].resend",ui.context),"kept");
+  assert.equal(vm.runInContext("lastError.code",ui.context),"AGENT_DISABLED");
+  assert.equal(JSON.parse(ui.context.localStorage.getItem("fa-resent-appends")||"{}")["append-offline-a"],undefined);
+  ui.render(done);
+  assert.match(historyText(ui),/"帶回輸入框"/);
+});
+test("a resend link written in one tab keeps the links another tab wrote meanwhile",async()=>{
+  const ui=await open(nativeChat("completed")),storage=ui.context.localStorage;
+  storage.setItem("fa-resent-appends",JSON.stringify({"append-other-tab":"other-rid"}));
+  vm.runInContext('linkResentAppend("append-this-tab","this-rid")',ui.context);
+  assert.deepEqual(JSON.parse(storage.getItem("fa-resent-appends")),
+    {"append-other-tab":"other-rid","append-this-tab":"this-rid"});
+});
+test("blocked browser storage leaves an unapplied append with 帶回輸入框",async()=>{
+  const blocked=()=>{throw new Error("storage blocked")};
+  const data=nativeChat("completed");
+  data.tasks[0].appends=[{request_id:data.tasks[0].task_id,append_id:"append-offline-a",content:"補一句",status:"not_applied",
+    delivery:null,reason:"turn_finished",receipt_observed:true}];
+  const ui=await open(data,{storage:{getItem:blocked,setItem:blocked,removeItem:blocked}});await ui.tick();
+  assert.match(historyText(ui),/"帶回輸入框"/);
+});
+// #916 H9: turn 1 ends with A1 still accepted. The poll that sees the end reads A1's outcome; until that read is back a
+// new message must not go out, or it would run ahead of A1's resend.
+async function appendEndsUnread(){
+  const data=appendChat(),rid=data.composer.request_id,ui=await open(data),content="回合結束前補的一句";
+  ui.nodes.get("instruction").value=content;ui.nodes.get("instruction").events.input();
+  ui.click("send-instruction");await ui.tick();
+  const row={request_id:rid,append_id:"append-offline-a",content,status:"accepted",delivery:"steering",reason:null,
+    receipt_observed:true};
+  const running=copy(data);running.composer.append_target.append_id="append-offline-b";running.tasks[0].appends=[row];
+  ui.holder.current=running;
+  ui.holder.pendingPosts[0].resolve({append:copy(row)});await ui.tick();await ui.tick();
+  const done=nativeChat("completed");done.tasks[0].appends=[copy(row)];done.tasks[0].actions["read-appends"]=action(true);
+  ui.holder.progressResponse={ok:true,json:async()=>copy(done)};
+  let release,fail;
+  ui.holder.appendsResponse={ok:true,json:()=>new Promise((resolve,reject)=>{release=resolve;fail=reject})};
+  const timer=[...ui.timers.entries()].find(([id])=>ui.timerDelays.get(id)===1000);
+  assert.ok(timer,"the progress timer is scheduled");
+  ui.timers.delete(timer[0]);timer[1]();for(let i=0;i<4;i++)await ui.tick();
+  assert.ok(ui.calls.some(call=>call.url===`/api/instructions/${rid}/appends`),"the end read checks A1");
+  const settled={...row,status:"not_applied",delivery:null,reason:"turn_finished"};
+  const after=copy(done);after.tasks[0].appends=[settled];
+  return {ui,rid,content,after,settled,release:()=>{ui.holder.current=after;release({appends:{request_id:rid,appends:[copy(settled)]}})},
+    fail:()=>fail(new Error("offline"))};
+}
+// Only a submit sends; a /next taken ahead for typed text is a local RID (prefetchNextDraft), never a send.
+const sendPosts=ui=>ui.calls.filter(call=>call.method==="POST"&&call.url.endsWith("/submit")).map(call=>call.url);
+test("a message typed while a finished turn's append is still being read waits for that read",async()=>{
+  const {ui,release}=await appendEndsUnread();
+  ui.nodes.get("instruction").value="下一則新訊息";ui.nodes.get("instruction").events.input();
+  assert.equal(ui.nodes.get("send-instruction").disabled,true);
+  assert.equal(ui.text("instruction-reason"),"正在確認剛才追加的文字有沒有送達，確認後就能送出。");
+  ui.click("send-instruction");await vm.runInContext("sendChat()",ui.context);await ui.tick();
+  assert.deepEqual(sendPosts(ui),[],"nothing goes out ahead of A1");
+  release();for(let i=0;i<4;i++)await ui.tick();
+  // The box held the owner's text, so A1 is kept for the owner (never sent with or instead of it).
+  assert.match(historyText(ui),/"帶回輸入框"/);
+  assert.deepEqual(sendPosts(ui),[]);
+  assert.equal(ui.nodes.get("instruction").value,"下一則新訊息");
+  assert.equal(ui.nodes.get("send-instruction").disabled,false,"the owner sends next, in the order they choose");
+});
+test("an empty composer stays shut while the append read runs, then the append goes out first",async()=>{
+  const {ui,release}=await appendEndsUnread();
+  assert.equal(ui.text("instruction-reason"),"正在確認剛才追加的文字有沒有送達，確認後就能送出。");
+  release();for(let i=0;i<4;i++)await ui.tick();
+  assert.match(historyText(ui),/"沒趕上這一回合，會改成新訊息送出。"/,"its /next is still out");
+  assert.equal(ui.holder.pendingPosts.filter(post=>post.url.endsWith("/next")).length,1,"A1 goes out as the next turn");
+});
+test("a failed append read never keeps the composer shut",async()=>{
+  const {ui,fail}=await appendEndsUnread();
+  fail();for(let i=0;i<4;i++)await ui.tick();
+  ui.nodes.get("instruction").value="下一則新訊息";ui.nodes.get("instruction").events.input();
+  assert.equal(ui.nodes.get("send-instruction").disabled,false);
+  assert.notEqual(ui.text("instruction-reason"),"正在確認剛才追加的文字有沒有送達，確認後就能送出。");
+  assert.deepEqual(sendPosts(ui),[]);
+});
+test("an append read that never answers stops waiting and frees the composer",async()=>{
+  const {ui}=await appendEndsUnread();
+  assert.equal(ui.nodes.get("send-instruction").disabled,true);
+  assert.equal(vm.runInContext("progressBusy",ui.context),true,"the poll waits on the append read");
+  const timer=[...ui.timers.entries()].filter(([id])=>ui.timerDelays.get(id)===45000).at(-1);
+  assert.ok(timer,"the append read has a client timeout");
+  ui.timers.delete(timer[0]);timer[1]();for(let i=0;i<4;i++)await ui.tick();
+  ui.nodes.get("instruction").value="下一則新訊息";ui.nodes.get("instruction").events.input();
+  assert.equal(ui.nodes.get("send-instruction").disabled,false);
+  assert.notEqual(ui.text("instruction-reason"),"正在確認剛才追加的文字有沒有送達，確認後就能送出。");
+  assert.equal(vm.runInContext("appendReads.size",ui.context),0);
+  assert.equal(vm.runInContext("progressBusy",ui.context),false);
+  assert.deepEqual(sendPosts(ui),[]);
+});
+// Review round 2 on #941: one slow append read is a read to retry, not "the workbench did not answer", and the next good
+// poll clears it.
+test("an append read timeout shows the progress retry notice and the next good poll clears it",async()=>{
+  const {ui,after,settled}=await appendEndsUnread();
+  const timer=[...ui.timers.entries()].filter(([id])=>ui.timerDelays.get(id)===45000).at(-1);
+  ui.timers.delete(timer[0]);timer[1]();for(let i=0;i<4;i++)await ui.tick();
+  assert.equal(ui.text("error-full"),"暫時讀不到進度，正在重試。訊息不會重送。");
+  assert.equal(vm.runInContext("lastError.phase",ui.context),"progress");
+  const applied=copy(after);applied.tasks[0].appends=[{...settled,status:"applied",delivery:"steering",reason:null}];
+  ui.holder.progressResponse={ok:true,json:async()=>copy(applied)};
+  await vm.runInContext("updateProgress()",ui.context);await ui.tick();
+  assert.equal(vm.runInContext("lastError",ui.context),null);
+  assert.deepEqual(sendPosts(ui),[]);
+});
+// Review round 3 on #941: once its turn ended no progress read is due, so a failed append read reads itself again
+// (GET only) on the progress backoff, one timer per turn.
+const appendRetryTimer=ui=>{
+  const id=vm.runInContext("[...appendRetryTimers.values()][0]??null",ui.context);
+  return id===null?null:{id,fire:ui.timers.get(id),delay:ui.timerDelays.get(id)};
+};
+async function appendReadTimesOut(){
+  const run=await appendEndsUnread(),{ui}=run;
+  const timer=[...ui.timers.entries()].filter(([id])=>ui.timerDelays.get(id)===45000).at(-1);
+  ui.timers.delete(timer[0]);timer[1]();for(let i=0;i<4;i++)await ui.tick();
+  const reads=()=>ui.calls.filter(call=>call.url===`/api/instructions/${run.rid}/appends`);
+  return {...run,reads};
+}
+test("an append read timeout after its turn ended reads the appends again with backoff until it answers",async()=>{
+  const {ui,rid,after,settled,reads}=await appendReadTimesOut();
+  assert.equal(vm.runInContext("progressTimer",ui.context),null,"no progress read is due once the turn ended");
+  const first=appendRetryTimer(ui);
+  assert.equal(first.delay,2000);
+  const before=reads().length,appendPosts=()=>ui.calls.filter(call=>call.method==="POST"&&call.url.endsWith("/append")).length;
+  const posted=appendPosts();
+  ui.holder.appendsResponse={ok:false,status:503,json:async()=>({error:{code:"BACKEND_OFFLINE"}})};
+  ui.timers.delete(first.id);first.fire();for(let i=0;i<4;i++)await ui.tick();
+  assert.equal(reads().length,before+1,"exactly one GET /appends");
+  assert.ok(reads().every(call=>call.method===undefined));
+  assert.equal(vm.runInContext("appendRetryTimers.size",ui.context),1,"one pending timer per turn");
+  const second=appendRetryTimer(ui);
+  assert.equal(second.delay,4000);
+  assert.equal(ui.text("error-full"),"暫時讀不到進度，正在重試。訊息不會重送。");
+  const applied=copy(after);applied.tasks[0].appends=[{...settled,status:"applied",delivery:"steering",reason:null}];
+  ui.holder.current=applied;
+  ui.holder.appendsResponse={ok:true,json:async()=>({appends:{request_id:rid,appends:[copy(applied.tasks[0].appends[0])]}})};
+  ui.timers.delete(second.id);second.fire();for(let i=0;i<4;i++)await ui.tick();
+  assert.equal(reads().length,before+2);
+  assert.equal(vm.runInContext("lastError",ui.context),null,"a good re-read clears the notice");
+  assert.equal(vm.runInContext("progressRetryMs",ui.context),1000,"and ends the backoff the next turn would inherit");
+  assert.equal(vm.runInContext("appendRetryTimers.size",ui.context),0,"and schedules nothing more");
+  assert.equal(appendPosts(),posted,"the append is never posted again");
+  assert.deepEqual(sendPosts(ui),[]);
+});
+test("a pending append re-read does nothing once the append settled",async()=>{
+  const {ui,after,settled,reads}=await appendReadTimesOut();
+  const applied=copy(after);applied.tasks[0].appends=[{...settled,status:"applied",delivery:"steering",reason:null}];
+  ui.render(applied);
+  const timer=appendRetryTimer(ui),before=reads().length;
+  assert.equal(vm.runInContext("lastError?.retrying",ui.context),true);
+  ui.timers.delete(timer.id);timer.fire();for(let i=0;i<4;i++)await ui.tick();
+  assert.equal(reads().length,before);
+  assert.equal(vm.runInContext("appendRetryTimers.size",ui.context),0);
+  assert.equal(vm.runInContext("lastError",ui.context),null,"nothing retries any more, so the banner does not say so");
+  assert.notEqual(ui.text("error-full"),"暫時讀不到進度，正在重試。訊息不會重送。");
+});
+const otherThread=data=>{const other=copy(data);other.composer.thread_id="other-thread";other.tasks=[];return other};
+test("switching conversation cancels a pending append re-read",async()=>{
+  const {ui,after}=await appendReadTimesOut();
+  const timer=appendRetryTimer(ui);
+  assert.ok(timer);
+  ui.holder.current=otherThread(after);
+  await ui.context.switchThread("other-thread");await ui.tick();
+  assert.equal(vm.runInContext("selectedThread",ui.context),"other-thread");
+  assert.equal(ui.timers.has(timer.id),false);
+  assert.equal(vm.runInContext("appendRetryTimers.size",ui.context),0);
+});
+test("an append read that fails after a conversation switch schedules no re-read",async()=>{
+  const {ui,after,fail}=await appendEndsUnread();
+  ui.holder.current=otherThread(after);
+  await ui.context.switchThread("other-thread");await ui.tick();
+  assert.equal(vm.runInContext("selectedThread",ui.context),"other-thread");
+  fail();for(let i=0;i<4;i++)await ui.tick();
+  assert.equal(vm.runInContext("appendRetryTimers.size",ui.context),0);
+});
+test("an append read refused with its own code keeps that code's meaning",async()=>{
+  const data=appendChat(),rid=data.composer.request_id;
+  data.tasks[0].appends=[{request_id:rid,append_id:"append-old",content:"已保存的追加",status:"accepted",delivery:null}];
+  const ui=await open(data,{appendsResponse:{ok:false,status:403,json:async()=>({error:{code:"NATIVE_STATE_INVALID"}})}});
+  await vm.runInContext("readAppends(state.tasks[0])",ui.context);
+  assert.equal(vm.runInContext("lastError.code",ui.context),"NATIVE_STATE_INVALID");
+  assert.equal(vm.runInContext("lastError.phase",ui.context),undefined);
+});
+// Review round 3 on #941: a failed append read without an error body is unreadable, like a progress read that throws,
+// so it is a read to retry rather than a fixed LOCAL_FAILURE.
+test("an append read failing without an error body shows the progress retry notice",async()=>{
+  const data=appendChat(),rid=data.composer.request_id;
+  data.tasks[0].appends=[{request_id:rid,append_id:"append-old",content:"已保存的追加",status:"accepted",delivery:null}];
+  const ui=await open(data,{appendsResponse:{ok:false,status:502,json:async()=>({})}});
+  await vm.runInContext("readAppends(state.tasks[0])",ui.context);
+  assert.equal(vm.runInContext("lastError.code",ui.context),"LOCAL_OFFLINE");
+  assert.equal(vm.runInContext("lastError.retrying",ui.context),true);
+  assert.equal(ui.text("error-full"),"暫時讀不到進度，正在重試。訊息不會重送。");
+});
+// Review round 3 on #941: a coded error the read marks retryable (readRetryable) is a read to retry, not that code's
+// own fixed meaning.
+for(const error of [{code:"BACKEND_OFFLINE"},{code:"NATIVE_BOOTSTRAP_UNKNOWN",automatic_retry:true}]){
+  test(`an append read answering ${error.code} shows the progress retry notice`,async()=>{
+    const data=appendChat(),rid=data.composer.request_id;
+    data.tasks[0].appends=[{request_id:rid,append_id:"append-old",content:"已保存的追加",status:"accepted",delivery:null}];
+    const ui=await open(data,{appendsResponse:{ok:false,status:503,json:async()=>({error:copy(error)})}});
+    await vm.runInContext("readAppends(state.tasks[0])",ui.context);
+    assert.equal(vm.runInContext("lastError.code",ui.context),error.code);
+    assert.equal(vm.runInContext("lastError.phase",ui.context),"progress");
+    assert.equal(vm.runInContext("lastError.retrying",ui.context),true);
+    assert.equal(ui.text("error-full"),"暫時讀不到進度，正在重試。訊息不會重送。");
+  });
+}
+// Review on #941: every progress poll of a running turn reads its accepted appends; that read must not shut 送出 for
+// a second append typed meanwhile. Only a turn that has ended holds the next message.
+test("an append read while its turn still runs leaves 送出 open for the next append",async()=>{
+  const data=appendChat(),rid=data.composer.request_id,ui=await open(data),content="第一句";
+  ui.nodes.get("instruction").value=content;ui.nodes.get("instruction").events.input();
+  ui.click("send-instruction");await ui.tick();
+  const row={request_id:rid,append_id:"append-offline-a",content,status:"accepted",delivery:"steering",reason:null,
+    receipt_observed:true};
+  const running=copy(data);running.composer.append_target.append_id="append-offline-b";running.tasks[0].appends=[row];
+  ui.holder.current=running;
+  ui.holder.pendingPosts[0].resolve({append:copy(row)});await ui.tick();await ui.tick();
+  ui.nodes.get("instruction").value="第二句";ui.nodes.get("instruction").events.input();
+  ui.holder.progressResponse={ok:true,json:async()=>copy(running)};
+  ui.holder.appendsResponse={ok:true,json:()=>new Promise(()=>{})};
+  const timer=[...ui.timers.entries()].find(([id])=>ui.timerDelays.get(id)===1000);
+  ui.timers.delete(timer[0]);timer[1]();for(let i=0;i<4;i++)await ui.tick();
+  assert.ok(ui.calls.some(call=>call.url===`/api/instructions/${rid}/appends`),"the poll reads A1 while the turn runs");
+  assert.equal(ui.nodes.get("send-instruction").disabled,false);
+  assert.notEqual(ui.text("instruction-reason"),"正在確認剛才追加的文字有沒有送達，確認後就能送出。");
+});
 test("an append answered not_applied while its original still stops and saves goes out at once as a new turn",async()=>{
   // The bridge offers a follow-up while a turn runs (native.py view: can_follow_up does not look at the status).
   const data=appendChat();data.composer.can_follow_up=true;
@@ -4152,7 +4489,7 @@ test("an append answered not_applied while its original still stops and saves go
   assert.equal(vm.runInContext("runningOwnTurn()?.task_id",ui.context),rid,"the original still runs");
   const nexts=ui.holder.pendingPosts.filter(post=>post.url.endsWith("/next"));
   assert.deepEqual(nexts.map(post=>post.url),[`/api/instructions/${running.composer.thread_id}/next`]);
-  assert.match(historyText(ui),/改成新訊息送出/);
+  assert.match(historyText(ui),/"沒趕上這一回合，會改成新訊息送出。"/);
   const next=copy(running);
   Object.assign(next.composer,{request_id:"next-rid",content:null,editable:true,can_submit:true,can_follow_up:false,
     append_target:null});
@@ -4174,7 +4511,7 @@ test("an append answered not_applied while its original still stops and saves go
   ui.render(after);await ui.tick();
   assert.equal(vm.runInContext("lastError",ui.context),null);
   assert.equal(vm.runInContext("state.tasks[0].status.data.state",ui.context),"completed");
-  assert.match(historyText(ui),/改成新訊息送出/);
+  assert.match(historyText(ui),/"沒趕上這一回合，已改用新訊息送出。"/);
   assert.doesNotMatch(historyText(ui),/帶回輸入框|不會自動再送/);
   assert.equal(vm.runInContext("runningOwnTurn()?.task_id",ui.context),"next-rid","the resent text runs as turn 2");
   assert.equal(ui.calls.filter(call=>call.method==="POST"&&/\/(next|submit|append)$/.test(call.url)).length,3,
@@ -4195,7 +4532,7 @@ test("on Responses an append answered not_applied while its original still runs 
   ui.holder.pendingPosts[0].resolve({append:copy(row)});await ui.tick();await ui.tick();await ui.tick();
   assert.equal(vm.runInContext("runningOwnTurn()?.task_id",ui.context),rid,"the original still runs");
   assert.equal(ui.calls.some(call=>call.url.endsWith("/next")||call.url.endsWith("/submit")),false,"not while it runs");
-  assert.match(historyText(ui),/改成新訊息送出/);
+  assert.match(historyText(ui),/"沒趕上這一回合，會改成新訊息送出。"/,"still waiting, so future tense");
   const done=nativeChat("completed");done.tasks[0].appends=[row];done.tasks[0].actions["read-appends"]=action(true);
   done.tasks[0].state_profile=done.composer.state_profile="foundry-responses-v1";
   ui.holder.current=done;ui.render(done);await ui.tick();await ui.tick();
@@ -4261,7 +4598,7 @@ test("an append whose outcome is unknown is never sent again as a new turn",asyn
   const {ui,content}=await appendInTail("unknown");
   await ui.tick();ui.render(ui.holder.current);await ui.tick();
   assert.equal(ui.calls.some(call=>call.url.endsWith("/next")||call.url.endsWith("/submit")),false);
-  assert.doesNotMatch(historyText(ui),/改成新訊息送出/);
+  assert.doesNotMatch(historyText(ui),/沒趕上這一回合/);
   assert.match(historyText(ui),new RegExp(content));
 });
 test("an append left not_applied by the owner's 停止 is never sent again as a new turn",async()=>{
@@ -4269,7 +4606,7 @@ test("an append left not_applied by the owner's 停止 is never sent again as a 
   await ui.tick();ui.render(ui.holder.current);await ui.tick();
   assert.equal(ui.calls.some(call=>call.url.endsWith("/next")||call.url.endsWith("/submit")),false);
   assert.equal(vm.runInContext('[...sentAppendDrafts.values()][0].resend',ui.context),undefined);
-  assert.doesNotMatch(historyText(ui),/改成新訊息送出/);
+  assert.doesNotMatch(historyText(ui),/沒趕上這一回合/);
   assert.match(historyText(ui),/帶回輸入框/);
   assert.match(historyText(ui),new RegExp(content));
 });
@@ -7723,6 +8060,24 @@ test("selected deployment is sent unchanged and unknown capacities are not infin
   ui.holder.current={...data,composer:{...data.composer,editable:false,can_submit:false}};
   ui.holder.pending();await ui.tick();await ui.tick();
   assert.doesNotMatch(ui.text("model-capacity"),/gpt-5|o3|無限 tokens/);
+});
+
+test("a native progress snapshot without observed_at never shows undefined in the support details",async()=>{
+  // native.py builds progress without observed_at (azd e2e run 2026-10-21 showed 「最近進度：undefined」).
+  const data=fixture(),t=data.tasks[0];
+  t.result=null;
+  t.progress={data:{state:"succeeded",progress:{events:[]}},recorded:1,finished:true,truncated:false,
+    unconfirmed:false,byte_length:2};
+  const ui=await open(data);
+  assert.equal(ui.text("observed"),"最近進度：未提供。由服務純讀取得，不是模擬的執行狀態。");
+});
+
+test("a status snapshot without observed_at never shows undefined in the support details",async()=>{
+  const data=fixture(),t=data.tasks[0];
+  t.result=null;t.progress=null;
+  t.status={data:{state:"accepted"}};
+  const ui=await open(data);
+  assert.equal(ui.text("observed"),"觀察時間：未提供。這是最近一次觀察，不是目前即時狀態。");
 });
 
 test("process snapshot shows only public step and tool projection, never private reasoning",async()=>{

@@ -312,6 +312,24 @@ def test_a_card_of_another_team_fails_the_page_instead_of_being_skipped(attentio
     assert response.json()["error"]["code"] == "NATIVE_HITL_SCOPE_DENIED"
 
 
+def test_a_saved_card_naming_another_team_fails_the_page_instead_of_being_skipped(attention, monkeypatch):
+    """The row is in this Team's partition but the saved record names another Team (read raises SCOPE_DENIED)."""
+    c = attention
+    service = c.app.state.native_hitl
+    _bad, bad = pending(c, "native-a", c.agent, "rid-a")
+    pending(c, "native-b", c.other_agent, "rid-b")
+    original = service.read
+
+    def foreign(principal, pending_id):
+        if pending_id == bad["pending_id"]:
+            raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "the pending call belongs to another Team")
+        return original(principal, pending_id)
+    monkeypatch.setattr(service, "read", foreign)
+    response = c.client.get(PATH, headers=c.headers())
+    assert response.status_code == 403 and "items" not in response.json()
+    assert response.json()["error"]["code"] == "NATIVE_HITL_SCOPE_DENIED"
+
+
 def test_discovery_failure_is_not_an_empty_success(attention, monkeypatch):
     from azure.core.exceptions import ServiceRequestError
 

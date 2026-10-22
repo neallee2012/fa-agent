@@ -79,7 +79,8 @@ def _route_name(template):
 
 
 class RouteTiming:
-    """ASGI timing for Hosted->API and native turn calls: route template, binding or hashed turn ID, counts only."""
+    """ASGI timing for Hosted->API and native turn calls: route template, binding or hashed turn ID (from the path,
+    else the body's validated ``request_id``), counts only."""
 
     def __init__(self, app):
         self.app = app
@@ -96,7 +97,8 @@ class RouteTiming:
         finally:
             _table_counts.reset(token)
             params = scope.get("path_params") or {}
-            rid = params.get("request_id")
+            # A body-only route (native capabilities, submit): the RID ``_body`` validated, hashed like a path RID.
+            rid = params.get("request_id") or (scope.get("state") or {}).get("behavior_request_id")
             elapsed_timing("api_" + _route_name(getattr(scope.get("route"), "path", None)), started,
                            job_id=params.get("binding_id") or (timing_id(rid) if isinstance(rid, str) else None),
                            outcome=outcome, table=table)

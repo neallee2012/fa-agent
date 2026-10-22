@@ -2,8 +2,8 @@
 
 Operator tool, run once with the project-specific AZURE_CONFIG_DIR login. The official prerequisite for the identity
 that creates toolbox versions is Foundry User on the project (W1 gave the operator that role). The WebIQ key lives
-only in the project connection `<environment>-webiq-key` (deploy/stage/new_webiq_connection.py; stage keeps
-`stage-webiq-key`); nothing here reads it. --config selects the profile (default FA_DEPLOY_CONFIG, else stage.json),
+only in the project connection `<environment>-webiq-key` or the profile's `webiq_connection` (dev: `webiq-key`)
+(deploy/stage/new_webiq_connection.py; stage keeps `stage-webiq-key`); nothing here reads it. --config selects the profile (default FA_DEPLOY_CONFIG, else stage.json),
 so azd environments (deploy/azd) use the same script.
 
 Safety (no blind resend): the create writes an intent file first (open mode "x"); an existing intent or an existing
@@ -32,7 +32,7 @@ NAME = "fa-org-tools"
 
 def definition(profile):
     """(connection, tools, body) of one profile; for stage exactly the original stage-webiq-key definition."""
-    connection = f"{profile['environment']}-webiq-key"
+    connection = profile.get("webiq_connection") or f"{profile['environment']}-webiq-key"  # as new_webiq_connection.py
     tools = [{"type": "mcp", "server_label": "WebIQ", "server_url": "https://api.microsoft.ai/v3/mcp",
               "require_approval": "never", "project_connection_id": connection, "allowed_tools": ["web", "browse"]}]
     return connection, tools, {"description": f"FA org tools (N5): WebIQ via project connection {connection}",
@@ -47,6 +47,7 @@ TOOLBOX_FEATURES = "Toolboxes=V1Preview"
 
 
 def _versions(client, headers):
+    # shortcut: reads only the first page of versions; follow the paging link once fa-org-tools has more than one page.
     response = client.get(f"{STAGE['project_endpoint']}/toolboxes/{NAME}/versions", params={"api-version": "v1"},
                           headers=headers)
     if response.status_code == 404:

@@ -17,7 +17,8 @@ Safety, as in the manual flow:
 - the scripts write an intent before each create/start and only read back when one exists; the hook's own ARM and
   Graph writes are idempotent (deployments by name, Graph upserts by alternate key, reads before creates); an unknown
   outcome stops the hook. Rerun with `azd hooks run <hook>` after reading back, never with another request ID;
-- the empty-Table initialization needs the Team owner to type the plan hash in this terminal (no CI, no --no-prompt);
+- the empty-Table initialization needs the Team owner to answer y in this terminal (no CI, no --no-prompt); the
+  written approval binds the printed plan and configuration hashes;
 - the WebIQ key is typed in a hidden prompt by new_webiq_connection.py and never reaches the azd environment;
 - private files (profile, runtime config, intents, plan, authorization, logs) stay in .azure/<env>/fa (git-ignored).
 """
@@ -104,6 +105,18 @@ class Context:
     az_cmd: list[str] = field(default_factory=az_prefix)
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     state_root: Path = ROOT / ".azure"  # azd's own git-ignored environment folder
+    resume: str = "the same azd command"  # main() names the command that asks the question again
+
+    def ask(self, question: str) -> str:
+        """Every question goes through here: no answer (stdin closed, or Ctrl+C) is a stop, never a traceback. The
+        2026-10-21 azd e2e run saw EOFError while input() waited and azd had already exited; Ctrl+C in that terminal
+        is the likely cause, not confirmed. Each caller asks before it writes anything."""
+        try:
+            return self.prompt(question)
+        except (EOFError, KeyboardInterrupt):
+            print(flush=True)  # end the unanswered prompt's line
+            raise Stop(f"no answer was read (input closed or interrupted): nothing was approved and no answer was "
+                       f"saved. Run `{self.resume}` in a terminal to answer it again") from None
 
     # ---- azd environment -------------------------------------------------------------------------------------
     def get(self, key: str, default: str | None = None) -> str | None:
@@ -292,7 +305,7 @@ def pick_models(ctx: Context) -> None:
         raise Stop(f"no catalog chat model fits {ctx.need('AZURE_LOCATION')} with this subscription's quota; lower "
                    "the capacity with FA_MODEL_CAPACITY_JSON, ask for quota, or create the environment in another "
                    "region")
-    answer = ctx.prompt(f"Models to deploy (numbers separated by commas) [{suggested}]: ").strip() or suggested
+    answer = ctx.ask(f"Models to deploy (numbers separated by commas) [{suggested}]: ").strip() or suggested
     parts = [part.strip() for part in answer.split(",") if part.strip()]
     if not parts or not all(part.isdigit() and 1 <= int(part) <= len(rows) for part in parts):
         raise Stop(f"'{answer}' is not a list of the numbers above; nothing was changed")
@@ -304,8 +317,8 @@ def pick_models(ctx: Context) -> None:
     default = models.default_for(tuple(chosen))
     if len(chosen) > 1:
         listed = ", ".join(f"{number}. {name}" for number, name in enumerate(chosen, 1))
-        answer = ctx.prompt(f"Default model for new conversations ({listed}) "
-                            f"[{chosen.index(default) + 1}]: ").strip()
+        answer = ctx.ask(f"Default model for new conversations ({listed}) "
+                         f"[{chosen.index(default) + 1}]: ").strip()
         if answer:
             if not answer.isdigit() or not 1 <= int(answer) <= len(chosen):
                 raise Stop(f"'{answer}' is not one of the numbers above; nothing was changed")
@@ -430,7 +443,7 @@ def preprovision(ctx: Context) -> None:
         owner = me["oid"]
         print(f"FA: Team owner = the signed-in deployer {me['upn']} ({me['oid']})", flush=True)
         if ctx.tty:
-            answer = ctx.prompt(f"Is {me['upn']} the Team owner who will sign in to the Portal? [y/N]: ").strip().lower()
+            answer = ctx.ask(f"Is {me['upn']} the Team owner who will sign in to the Portal? [y/N]: ").strip().lower()
             if answer not in ("y", "yes"):
                 raise Stop("the Team owner is not the signed-in deployer. Run `azd env set FA_TEAM_OWNER_OID "
                            "<owner object ID>` and rerun; nothing was written")
@@ -745,8 +758,8 @@ def authorize(ctx: Context, plan: Any, path: Path) -> None:
           f"  request {plan.request_id}, installation {plan.installation_id}\n"
           f"  configuration {plan.configuration_sha256}\n  plan {plan.sha256}\n"
           f"  empty Table observed at {plan.empty_table_observed_at.isoformat()}\n", flush=True)
-    answer = ctx.prompt("Type the first 12 characters of the plan hash to approve (anything else stops): ").strip()
-    if answer.lower() != plan.sha256[:12]:
+    answer = ctx.ask("Approve this initialization of the plan above? [y/N]: ").strip().lower()
+    if answer not in ("y", "yes"):
         raise Stop("not approved; nothing was written. Rerun `azd hooks run postdeploy` to decide again")
     not_before = max(ctx.now(), plan.empty_table_observed_at)
     _write_x(path, {
@@ -1102,8 +1115,8 @@ def predown(ctx: Context) -> None:
         if not ctx.tty:
             raise Stop(f"deleting {ctx.group} also deletes its M1 backups; set FA_CONFIRM_DELETE={name} for this run "
                        "or run `azd down` in a terminal")
-        answer = ctx.prompt(f"Deleting {ctx.group} deletes its Table data and M1 backups for good. "
-                            f"Type the environment name ({name}) to remove the backup lock: ").strip()
+        answer = ctx.ask(f"Deleting {ctx.group} deletes its Table data and M1 backups for good. "
+                         f"Type the environment name ({name}) to remove the backup lock: ").strip()
         if answer != name:
             raise Stop("not confirmed; nothing was removed")
     for lock in locks:
@@ -1171,12 +1184,16 @@ def azd_values(run: Runner = default_runner) -> dict[str, str]:
     """Outside a hook (prereq, consent): the selected azd environment's values, as a hook would see them."""
     result = run(["azd", "env", "get-values", "--output", "json"])
     if result.code != 0:
-        raise Stop("no azd environment is selected: `azd env new <name> --subscription <id> --location <region>`")
+        raise Stop("no azd environment is selected: `azd env new <name> --subscription <id>` (add "
+                   "`--location <region>` to skip azd's region menu later)")
     return {key: str(value) for key, value in json.loads(result.stdout).items()}
 
 
 PHASES = {"preprovision": preprovision, "postprovision": postprovision, "deploy": deploy, "consent": consent_only,
           "prereq": prereq, "predown": predown, "postdown": postdown}
+# The command that asks a phase's question again: rerunning only preprovision would not provision, and predown's
+# question belongs to `azd down`.
+RESUME = {"preprovision": "azd up", "deploy": "azd hooks run postdeploy", "predown": "azd down"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1189,7 +1206,7 @@ def main(argv: list[str] | None = None) -> int:
     except Stop as error:
         print(f"FA: stopped: {error}", file=sys.stderr, flush=True)
         return 1
-    ctx = Context(values=values)
+    ctx = Context(values=values, resume=RESUME.get(argv[0], f"azd hooks run {argv[0]}"))
     if argv[0] == "deploy" and os.environ.get("FA_AZD_VENV") != "1":
         python = ensure_venv(ctx)
         return subprocess.run([python, "-X", "utf8", str(Path(__file__).resolve()), "deploy"],

@@ -7,14 +7,16 @@
 > 狀態（2026-10-11）：作者在自己的訂閱（westus3）從頭跑完一次 `azd up`，並在工作台實際使用過。
 > 區域與模型選擇（下方「區域與模型」）也在 eastus2（只選 gpt-6-luna）實跑到 `SUCCESS`，
 > 部署與設定讀回符合選擇，**那次的工作台驗收還沒做**。
+> 2026-10-21 又用公開 repo 第 34 版在 westus3 從頭跑一次，前 10 分鐘驗收通過（[紀錄](../../docs/progress.md#azd-e2e-public-1021)）。
 
 <a id="prerequisites"></a>
 ## 事前準備（不是 Entra 管理員的人請先看）
 
-先跑唯讀檢查，它會列出你已具備什麼、還缺什麼、該找誰（本頁的指令都在 repo 根目錄執行）：
+先跑唯讀檢查，它會列出你已具備什麼、還缺什麼、該找誰（本頁的指令都在 repo 根目錄執行）。
+**步驟順序只有一份**，在下方[「第一次部署」](#first-deploy)的指令區塊：先照它 clone 到 repo 根目錄、設好
+`AZURE_CONFIG_DIR`、完成 `az login` 與 `azd auth login`（`prereq` 要用同一個 `AZURE_CONFIG_DIR` 和登入），再跑：
 
 ```bash
-git clone https://github.com/neallee2012/fa-agent.git && cd fa-agent   # 要用 git clone，不要下載 ZIP：部署會讀 git rev-parse HEAD
 azd env new <name> --subscription <subscription-id> --location <region>
 python deploy/azd/fa_azd.py prereq
 ```
@@ -23,10 +25,10 @@ python deploy/azd/fa_azd.py prereq
 
 兩條路擇一，檢查內容相同：
 
-- **先檢查再部署（上面）**：`prereq` 單獨執行時不經過 azd 的區域選單，所以 `azd env new` 要先帶 `--location`；
-  區域已經存在環境裡，之後的 `azd up` 就不再出區域選單。
-- **直接部署（下方[「第一次部署」](#first-deploy)）**：`azd env new` 不帶 `--location`，`azd up` 會出區域選單；
-  它的 preprovision 會跑同一份 `prereq` 檢查。
+- **先檢查再部署（上面）**：`prereq` 單獨執行，只需要已選好的 azd 環境和訂閱 ID，不讀區域，所以 `azd env new`
+  有沒有 `--location` 都能跑。帶了 `--location`，區域就存在環境裡，之後的 `azd up` 不再出區域選單；沒帶，`azd up` 才出選單。
+- **直接部署（下方[「第一次部署」](#first-deploy)）**：不另外跑 `prereq` 指令，直接 `azd up`；沒帶 `--location` 時會出區域選單，
+  它的 preprovision 會跑同一份檢查。
 
 標 `blocked` 的項目會在**任何計費資源建立前**停下。
 
@@ -44,7 +46,7 @@ python deploy/azd/fa_azd.py prereq
 |---|---|
 | 你在訂閱上有 **Owner**，或 **Contributor＋User Access Administrator** | Bicep 會建角色指派（包括給 API 身分的 Contributor 與受條件限制的 RBAC Administrator，兩者都是特權管理角色；你的 Owner／User Access Administrator 指派若帶有排除特權角色的條件，provision 預期會失敗（推論，未實測）），還會在訂閱層建一個自訂備份角色（需要 `roleDefinitions/write`，RBAC Administrator 不夠） |
 | 已註冊 feature `Microsoft.Network/AllowBringYourOwnPublicIpAddress` 與 9 個 resource provider（[清單](../README.md#new-environment-provider-precheck)） | 少了 feature，Container Apps 環境會「成功」但沒有平台網路（B1）；preprovision 會唯讀檢查並列出指令 |
-| 區域有你要的模型與 quota（azd 選區域、hook 選模型時都會顯示；可用 `FA_MODEL_CAPACITY_JSON` 調小容量） | 同訂閱同區域的帳號共用 quota |
+| 區域有你要的模型與 quota（azd 選區域、hook 選模型時都會顯示；可用 `FA_MODEL_CAPACITY_JSON` 調小容量；`azd up` 前怎麼先查見[「區域與模型」](#region-and-models)） | 同訂閱同區域的帳號共用 quota |
 | 區域支援 Foundry Hosted Agents（azd 的區域選單只列這些）與 Container Apps workload profiles | |
 
 **C. Entra 管理員（一次性；你若是管理員可跳過）**
@@ -64,31 +66,47 @@ grant 只給主人一人（`consentType=Principal`），不是全租用戶同意
 
 ```bash
 git clone https://github.com/neallee2012/fa-agent.git && cd fa-agent   # 已經 clone 就跳過；不要用 ZIP
-export AZURE_CONFIG_DIR="$HOME/.azure-fa"   # 每個 shell 都設；PowerShell 用 $env:AZURE_CONFIG_DIR = "$HOME\.azure-fa"
-export AZD_NON_INTERACTIVE=false            # 見下方；PowerShell 用 $env:AZD_NON_INTERACTIVE = 'false'
+export AZURE_CONFIG_DIR="$HOME/.azure-fa"   # 每個 shell 都設；PowerShell 用 $env:AZURE_CONFIG_DIR = "$HOME\.azure-fa"；Git Bash 見下方
+export PYTHONUTF8=1                         # Windows 的預防設定（預設編碼 cp1252 曾造成 UnicodeEncodeError，見 deploy/README.md H2）；PowerShell 用 $env:PYTHONUTF8 = "1"
+export AZD_NON_INTERACTIVE=false            # 選用：只有 azd 自動進入 no-prompt 的終端機才需要（見下方）；PowerShell 用 $env:AZD_NON_INTERACTIVE = 'false'
 az login --tenant <tenant-id>
 azd auth login --tenant-id <tenant-id>
-azd env new <name> --subscription <subscription-id>
+azd env new <name> --subscription <subscription-id>   # 已知區域就加 --location <region>，azd up 就不再出區域選單
+azd env set FA_TEAM_OWNER_OID <owner-object-id>       # Team 主人不是你時才需要（見下方）
+python deploy/azd/fa_azd.py prereq                    # 選用、唯讀；不讀區域，上面的 azd env new 有沒有 --location 都能跑
 azd up
 ```
 
+這是新環境唯一的一組步驟；根目錄 [README](../../README.md#deploy-to-your-azure) 的 PowerShell 版是同一個順序（它預設帶
+`--location`、`FA_TEAM_OWNER_OID` 和 `prereq`），[docs/azd-new-environment.md](../../docs/azd-new-environment.md) 只講設計、不列指令。
 訂閱與租用戶 ID 的查法見上方[「事前準備」](#prerequisites)；訂閱固定在這個 azd 環境，不使用 az CLI 的預設訂閱。
 
-- **要多久**：第一次 `azd up` 約 1.5～2 小時（光 Container Apps 環境就約 20 分鐘；首次安裝的 Job log
-  第一次寫進新的 Log Analytics 可能要 5～15 分鐘）。之後的 `azd up` 約 15 分鐘（例如加一個模型那次 13 分 25 秒）。
-  數字來自 2026-10-15 的新使用者實測（`fa-azdtest-1015`），依區域與當時平台狀況而異。
+- **要多久**：依區域與當時平台狀況差很多。2026-10-21 的新使用者實測（第 34 版 2026.10.21-34）：provision 約 10 分鐘
+  （其中 Container Apps 環境約 3 分鐘），另外還要等首次安裝的 Job log（見下一點）；整體總時間那次沒量。2026-10-15 那次
+  （`fa-azdtest-1015`）第一次 `azd up` 約 1.5～2 小時（光 Container Apps 環境就約 20 分鐘）。
+  之後的 `azd up` 約 15 分鐘（例如加一個模型那次 13 分 25 秒）。
+- **等 Job log 是正常的**：首次安裝的 Job log 第一次寫進新的 Log Analytics workspace 要 5～15 分鐘
+  （2026-10-21 實測 8 分鐘）；批准後的 apply 與 reconcile 兩個 Job 還會各等一次（那次各約 6 分鐘，合計約 20 分鐘）。
+  這段時間終端機看起來像停住。不要中斷它；真的中斷了，照[「中斷後接續」](#resume)重跑即可。
 - **`AZD_NON_INTERACTIVE=false`**：有些終端機（例如 Claude 桌面 app 裡的終端機分頁）會讓 azd 自動進入
   no-prompt 模式，`azd up` 一開始就停在「Provision cannot continue (interactive prompts disabled) … missing location」。
   設成 `false` 才會照常出區域選單與確認；一般終端機設了也無妨。azd 何時自動開 no-prompt 見下方[「區域與模型」](#region-and-models)。
 - **Windows 登入挑不到帳號**：換了新的 `AZURE_CONFIG_DIR` 後，`az login` 會用 Windows 的帳號挑選視窗（WAM），
   裡面可能沒有你要用的帳號。先 `az config set core.enable_broker_on_windows=false` 再 `az login --tenant <tenant-id>`
   （改用瀏覽器登入；這個設定只寫在目前的 `AZURE_CONFIG_DIR`），或直接 `az login --tenant <tenant-id> --use-device-code`。
+- **Git Bash 的路徑（曾觀察到，不保證每台都會發生）**：在 Windows 的 Git Bash 裡設 `export AZURE_CONFIG_DIR=$HOME/.azure-fa`
+  這類路徑時，曾被 MSYS 的路徑轉換改寫，結果多出一個 `C:\c\Users\<你>\.azure-fa` 資料夾，登入沒有寫進預期的目錄。
+  建議照文件用 PowerShell；一定要用 Git Bash 時，改用 Windows 形式的路徑，例如
+  `export AZURE_CONFIG_DIR=C:/Users/<你>/.azure-fa`，設完先 `echo $AZURE_CONFIG_DIR` 確認是預期的路徑再 `az login`。
 - `<name>`：2–20 個小寫英數字或 `-`，是資源名稱前綴，RG 預設 `rg-<name>`。
-- 區域與模型：見下一節。已知區域時也可以 `azd env new … --location <region>` 跳過選單（同「事前準備」那條路）。
+- 區域與模型：見下一節。跳過區域選單的 `--location` 見上方 `azd env new` 那行。
 - 沒設 `FA_TEAM_OWNER_OID` 時部署的人就是 Team 主人，終端機會要你輸入 `y` 確認。主人不是自己時，先
   `azd env set FA_TEAM_OWNER_OID <object-id>`（查法：`az ad user show --id <主人 UPN> --query id -o tsv`，主人自己登入時 `az ad signed-in-user show --query id -o tsv` 也行）；首次安裝的批准與 session 準備都要由主人本人登入執行。
-- 中途會停下來要你做一件事：**首次安裝批准**。終端機會顯示 plan hash，主人輸入前 12 碼才寫入
-  Table；輸入其他內容就停，什麼都不寫。
+- 中途會停下來要你做一件事：**首次安裝批准**。終端機會顯示這次的 request、installation、configuration 與 plan hash，
+  再問 `[y/N]`；主人輸入 `y`（或 `yes`）才寫入 Table，批准檔綁定 configuration 與 plan 這兩個 hash、10 分鐘內有效。輸入其他內容（包括直接按
+  Enter）就停，什麼都不寫。
+- 部署完後，工作台「支援明細」的「目錄中未列出的助理」會列出 c、d 並標 `AGENT_SCOPE_MISSING`：這是預期的，
+  見[「4 個 Hosted Agent」](#hosted-agents)。
 <a id="region-and-models"></a>
 ### 區域與模型
 
@@ -111,12 +129,41 @@ FA: catalog chat models in eastus2 (GlobalStandard; ...)
 Models to deploy (numbers separated by commas) [1,2]:
 ```
 
+**先查 quota，必要時預先選好模型。** 同訂閱同區域的帳號共用 quota，各區域、各模型分開算。2026-10-21 在 westus3 就遇過訂閱的
+gpt-6 系列（`gpt-6-luna`、`gpt-6.1-sol`）quota 是 0，要改選 `gpt-5.4-mini` 這類有 quota 的模型。
+
+- **查法（唯讀）**：用 [`az cognitiveservices usage list`](https://learn.microsoft.com/cli/azure/cognitiveservices/usage#az-cognitiveservices-usage-list)
+  列出該區域每個 quota 的已用量與上限（查 quota 需要訂閱層的 Cognitive Services Usages Reader 或 Reader 角色，見官方
+  [Foundry 模型 quota](https://learn.microsoft.com/azure/foundry/openai/how-to/quota)），或在 Foundry 入口網站的 **Management > Quota** 看：
+
+  ```bash
+  az cognitiveservices usage list --location <region> --subscription <subscription-id> \
+    --query "[?contains(name.value, 'GlobalStandard')].{name:name.value, used:currentValue, limit:limit}" -o table
+  ```
+
+  FA 部署用 GlobalStandard，名稱是 `OpenAI.GlobalStandard.<模型>`（`gpt-` 開頭的模型 hook 兩種寫法都試，例如 `gpt-4.1-mini` 的 quota 名稱是 `gpt4.1-mini`）。剩餘量是 `limit` 減 `used`，
+  單位與 [`model-catalog.json`](../../src/fa-shared-context-poc/model-catalog.json) 的 `capacity` 相同（官方範例的說明是 Tokens Per Minute (thousands)）。
+  每個模型需要的量：`gpt-4.1-mini` 500、`gpt-5.4-mini` 100、`gpt-6-luna` 500、`gpt-6.1-sol` 500，記憶開啟時另需 `text-embedding-3-small` 10。
+  上面的「選單」用的是同一份 `limit` 減 `used` 與同一份需要量，但只列 chat 模型，也不扣掉環境裡已有的同名部署；
+  之後的訂閱預檢（`model-quota`）則會扣掉同名、同模型、同 SKU 的現有部署已佔的量，並把 `text-embedding-3-small` 的 10 一起算（記憶開啟時）。
+  所以選單的數字是估計；先查是為了在 `azd up` 前就知道要選哪個區域和模型。
+- **quota 是 0 或不夠時 hook 的行為**：選單會把該模型標成 `quota free 0, needs 500 (not enough)`，預設建議的編號只包含「有提供且夠」的模型；
+  一個都不夠就停下（`no catalog chat model fits …`），什麼都不改。手動輸入一個標了 `(not enough)` 的編號，選單不會擋，
+  但 preprovision 接著的訂閱預檢（`model-quota`）會在建立任何計費資源前停下。`FA_MODEL_CAPACITY_JSON` 通常用來調小需要量（程式接受任何正整數），剩餘是 0 時沒有用。
+- **預先選好**：`azd env set FA_MODELS gpt-5.4-mini`，要多個就逗號分隔；`azd env set FA_DEFAULT_MODEL gpt-5.4-mini`（必須在 `FA_MODELS` 裡；
+  沒設時有 `gpt-6.1-sol` 就用它，否則用清單第一個）。已設 `FA_MODELS` 時 hook 不再出選單，也不再列 quota，只做上面那個預檢。
+  預設模型也會影響記憶庫，見下方「選好之後」。
+- **都不夠時**：換一個有 quota 的區域（`azd env new` 時改 `--location`），或向 Azure 申請提高 quota（官方[申請表單](https://aka.ms/oai/stuquotarequest)，申請會改訂閱，由有權限的人送）。
+
+**選好之後**（選單選的或預先設的都一樣）：
+
 - 選好的值存成 `FA_MODELS`／`FA_DEFAULT_MODEL`，之後的 `azd up` 不再問；工作台只列這些模型。
 - 沒有終端機（程式以 `sys.stdin.isatty()` 判斷，不看 azd 的 `--no-prompt`，例如 CI）時預設 catalog 全部模型；要指定就先 `azd env set FA_MODELS gpt-5.4-mini,gpt-6-luna`。
 - azd 1.32 以上偵測到 CI 或 AI agent 環境（環境變數如 `CLAUDE_CODE_ENTRYPOINT`、`AI_AGENT`）時，會自動開啟 no-prompt 模式，
   略過 azd 自己的區域選單並以「missing required inputs」失敗；要照常互動就設 `AZD_NON_INTERACTIVE=false`
   （來源：azd 文件 `cli/azd/docs/environment-variables.md`，tag azure-dev-cli_1.32.0，2026-10-11 查證）。
-- 記憶庫用你選的預設模型，另外只會多部署 `text-embedding-3-small`（記憶需要）。沒有任何模型是固定必裝的。
+- 記憶開啟時（預設），新環境第一次建記憶庫用你選的預設模型（`FA_MEMORY_CHAT_MODEL` 可另外指定，但也必須在 `FA_MODELS` 裡），之後固定，
+  所以預設模型要選你會一直留著的；另外只會多部署 `text-embedding-3-small`（記憶需要）。`FA_ENABLE_MEMORY=false` 則不建記憶庫、也不部署它。沒有任何模型是固定必裝的。
 - 之後要加模型：`azd env set FA_MODELS …` 再 `azd up`。拿掉的模型只會從工作台消失，部署本身不刪；
   記憶庫建立時用的模型要留在清單裡。
 
@@ -128,7 +175,7 @@ Models to deploy (numbers separated by commas) [1,2]:
 | `FA_DEFAULT_MODEL` | `gpt-6.1-sol`（有選時），否則清單第一個 | 新對話預設模型；第一次建記憶庫也用它 |
 | `FA_MODEL_CAPACITY_JSON` | catalog 容量 | 例 `{"gpt-6-luna":50,"gpt-6.1-sol":50}` |
 | `FA_MODEL_VERSION_UPGRADE_OPTION` | `NoAutoUpgrade` | |
-| `FA_ENABLE_WEBIQ` | `false` | `true`：connection 還不存在時，deploy 以隱藏輸入詢問 WebIQ 金鑰（需終端機）並建 connection 與 toolbox `fa-org-tools`；已存在就只讀回（要換過期的金鑰時，在終端機執行 `python deploy/stage/new_webiq_connection.py --config .azure/<env>/fa/profile.json --rotate`；連線必須已存在，不存在就停下且不寫入。要用 azd 環境的 profile，不加 `--config` 會用 `FA_DEPLOY_CONFIG` 或 `deploy/stage/stage.json`（也就是 stage）。腳本需要 `httpx` 和 `azure-identity`：用 deploy 建好的 `.azure/<env>/fa/venv`（Windows 是 `Scripts\python.exe`，其他是 `bin/python`），或在自己的 venv 執行 `pip install -r src/fa-shared-context-poc/requirements.txt`；見 [deploy/README.md](../README.md#new-environment-standard-flow) 第 16 關） |
+| `FA_ENABLE_WEBIQ` | `false` | `true`：connection 還不存在時，deploy 以隱藏輸入詢問 WebIQ 金鑰（需終端機）並建 connection 與 toolbox `fa-org-tools`；已存在就只讀回（要換過期的金鑰時，在終端機執行 `python deploy/stage/new_webiq_connection.py --config .azure/<env>/fa/profile.json --rotate`；連線必須已存在，不存在就停下且不寫入。要用 azd 環境的 profile，不加 `--config` 會用 `FA_DEPLOY_CONFIG` 或 `deploy/stage/stage.json`（也就是 stage）。腳本需要 `httpx` 和 `azure-identity`：用 deploy 建好的 `.azure/<env>/fa/venv`（Windows 是 `Scripts\python.exe`，其他是 `bin/python`），或在自己的 venv 執行 `pip install -r src/fa-shared-context-poc/requirements.txt`；見 [deploy/README.md 第 16 關](../README.md#webiq-key-rotation)）。這條 connection 是這個環境唯一的 WebIQ key（2026-10-22 起 API 不再有 WebIQ secret）。 |
 | `FA_ENABLE_AGENT_ONBOARDING` | `true` | 「＋」新 Agent 自動補角色：API 身分取得受限 RBAC Admin（只能把 Foundry User／OpenAI User 指派給 service principal、不能刪除；風險見 [ADR-0006](../../docs/adr/0006-team-trust-boundary-grokbot-mode.md)），API 開 `FA_ONBOARDING_*`（stage 同）。不要就在 `azd up` 前 `azd env set FA_ENABLE_AGENT_ONBOARDING false`。已建好、沒設過這個值的環境，下一次 provision（`azd up`，或 `azd provision` 再 `azd deploy`）就會打開；只跑 `azd deploy` 不會，因為它沿用上次 provision 的輸出 |
 | `FA_ENABLE_MEMORY` | `true` | 私人記憶與 Team 記憶：deploy 建 Memory Store `poc-team-memory`（`FA_DEFAULT_MODEL`＋text-embedding-3-small，preview，依用量計費）並開旗標；同 stage。私人記憶與 Team note 都由助理 VM 直接讀寫自己 Team 的 Memory Store scope，是 [ADR-0006](../../docs/adr/0006-team-trust-boundary-grokbot-mode.md) 記錄的 Team 隔離已知例外。要關請在第一次 `azd up` 前設 `false`：旗標隨 Agent 第一版發布 |
 | `FA_ENABLE_TEAM_MCP_CONNECTIONS` | `true` | 給 API 身分 project 範圍的 Contributor，Team MCP 設定頁才能新增含金鑰的 connection（stage 同） |
@@ -164,7 +211,7 @@ profile 一律寫 `compatibility_gate_armed: true`（`FA_COMPAT_GATE_ARMED` 不�
 ## 跑完就能用
 
 首次安裝最後一步，hook 以 Team 主人身分替兩位助理做「新對話選版」：
-Responses 通道、伺服器提供的全部能力（桌面、技能、Shell、瀏覽器、交辦、協作、圖片等，WebIQ-MCP 除外），
+Responses 通道、伺服器提供的全部能力（桌面、技能、Shell、瀏覽器、交辦、協作、圖片等；`WebIQ-MCP` 已於 2026-10-22 退場，排除設定留著給還提供它的舊 API image），
 以及 Team 已批准的技能（最多 4 個）。模板由 `select_all_capabilities.py` 依伺服器自己的選項算出，不從別的 Agent 複製；
 之後的 `azd deploy` 不會改它，主人在工作台助理 ⚙ 設定頁的調整都保留。
 
@@ -186,7 +233,7 @@ Responses 通道、伺服器提供的全部能力（桌面、技能、Shell、�
 | Agent | 是什麼 | 工作台看得到嗎 |
 |---|---|---|
 | `fa-<name>-a`、`fa-<name>-b` | 兩位助理（kind `assistant`），聊天、交辦都在這兩位 | 看得到，就是左側的助理清單 |
-| `fa-<name>-c`、`fa-<name>-d` | 伺服器設定固定要 4 個 target，這兩個只為補滿（kind `executor`，描述寫明「never invoked」）；不會被呼叫，也沒有在 Team 登錄 | 不在助理清單，只列在支援資訊的隱藏清單 |
+| `fa-<name>-c`、`fa-<name>-d` | 伺服器設定固定要 4 個 target，這兩個只為補滿（kind `executor`，描述寫明「never invoked」）；不會被呼叫，也沒有在 Team 登錄 | 不在助理清單，只列在「支援明細」的「目錄中未列出的助理」 |
 
 - **費用**：Hosted Agent 的運算依 active session 的 CPU 與記憶體計費（[官方說明](https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/hosted-agents)，
   見 [ADR-0005](../../docs/adr/0005-long-running-conversation-worker.md)）。c、d 從不被呼叫，首次 session 準備也只做 a、b（`prepare_native_sessions.py`），所以 c、d 不會有 session；
@@ -194,10 +241,20 @@ Responses 通道、伺服器提供的全部能力（桌面、技能、Shell、�
 - **啟動時 c、d 的 `AGENT_SCOPE_MISSING` 是預期的**：它們沒有 Team 登錄，sync 會以這個原因略過（`skipped`），
   助理目錄也把它們標成 `unavailable`。只有 a 或 b 出現這個錯誤才需要處理。
 
+<a id="resume"></a>
 ## 中斷後接續
 
 - 每個寫入都有 intent 檔（`.azure/<name>/fa/`，不進 Git）。停下來時先照訊息讀回，再
   `azd hooks run postprovision` 或 `azd hooks run postdeploy` 接續；不要刪 intent 重來。
+- **在新的終端機接續**：先設同一個 `AZURE_CONFIG_DIR`（[第一次部署](#first-deploy)那行；沒設會用到別的 az 登入），
+  再 `cd` 到 repo 根目錄（azd 從目前目錄找 `azure.yaml` 與 `.azure/<name>`），然後才 `azd hooks run postdeploy`：
+  ```bash
+  export AZURE_CONFIG_DIR="$HOME/.azure-fa"   # PowerShell：$env:AZURE_CONFIG_DIR = "$HOME\.azure-fa"；Git Bash 的路徑寫法見「第一次部署」
+  cd <repo 路徑>
+  azd hooks run postdeploy
+  ```
+- 等你回答問題時 azd 結束或按了 Ctrl+C，hook 會停下並印出 `no answer was read`：沒有批准任何東西，
+  這個回答也沒有保存；照它印的指令（例如 `azd hooks run postdeploy`）重跑再回答。
 - 首次安裝的批准檔有 10 分鐘窗口；過期但 apply 還沒開始時，hook 會停下，請自己把那份檔案移到旁邊保存，
   再重跑一次批准。
 - `azd provision --preview` 可以先看 what-if（重跑既有環境前建議先看，B5）。

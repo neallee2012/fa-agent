@@ -231,7 +231,87 @@ def test_a_listed_active_version_is_not_used_by_the_api_until_get_says_active():
         assert _code(following) == (503, FOLLOWING)
     assert resolver.current(R) == "4"
     foundry.calls.clear()
-    assert resolver.current(R) == "4" and foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "4")]
+    # Not active was read again each time; the active definition is kept, so only the selector is read now.
+    assert resolver.current(R) == "4" and foundry.calls == [("agent", R.agent_name)]
+
+
+def test_each_selection_reads_the_selector_and_only_a_newly_selected_versions_definition(monkeypatch):
+    """Stage: every send's selector read was get_agent then get_version, one after the other; FA assumes a published
+    version's definition does not change, so it is read once per process. Bounded; a failing check is never kept."""
+    foundry = Foundry(R)
+    foundry.add(R.agent_name, 4, "new")
+    resolver = HostedVersions(lambda endpoint: foundry, build="new")
+    assert [resolver.current(R) for _ in range(3)] == ["4"] * 3
+    assert foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "4"), ("agent", R.agent_name),
+                             ("agent", R.agent_name)]
+    foundry.add(R.agent_name, 5, "new", definition=v1_definition(R.agent_name, "new"))
+    foundry.calls.clear()
+    for _ in range(2):
+        with pytest.raises(Problem) as incompatible:
+            resolver.current(R)
+        assert _code(incompatible) == (503, FOLLOWING)
+    assert foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "5")] * 2
+    monkeypatch.setattr(versions, "KEPT_DEFINITIONS", 1)
+    foundry.add(R.agent_name, 6, "new")
+    assert resolver.current(R) == "6" and list(resolver._definitions) == [(R.project_endpoint, R.agent_name, "6")]
+
+
+def test_a_kept_definition_failing_a_check_is_dropped_so_the_next_selection_reads_it_again():
+    """#942 review: an Agent re-created under the same name and version number (another GUID) failed the identity
+    check against the kept snapshot on every selection until the process restarted."""
+    foundry = Foundry(R)
+    foundry.add(R.agent_name, 4, "new")
+    resolver = HostedVersions(lambda endpoint: foundry, build="new")
+    assert resolver.current(R) == "4"
+    recreated = _target(3, OTHER_AGENT_OID, agent_name=R.agent_name)
+    foundry.versions[R.agent_name][0]["agent_guid"] = recreated.agent_id.upper()
+    foundry.calls.clear()
+    with pytest.raises(Problem) as kept:
+        resolver.current(recreated)
+    assert _code(kept) == (503, FOLLOWING) and foundry.calls == [("agent", R.agent_name)]
+    assert resolver.current(recreated) == "4"
+    assert foundry.calls == [("agent", R.agent_name)] * 2 + [("get", R.agent_name, "4")]
+
+
+def test_a_kept_definition_dropped_by_another_thread_never_breaks_an_eviction(monkeypatch):
+    """#942 review: selections can run in parallel threads. One thread evicting the oldest snapshot while another
+    drops a failing one could change the dict between ``iter`` and ``next`` (forced here): RuntimeError, a 500."""
+    import threading
+
+    foundry = Foundry(A, R)
+    foundry.add(R.agent_name, 4, "new")
+    foundry.add(A.agent_name, 4, "new")
+    resolver = HostedVersions(lambda endpoint: foundry, build="new")
+    monkeypatch.setattr(versions, "KEPT_DEFINITIONS", 2)
+    assert resolver.current(R) == "4" and resolver.current(A) == "4"
+    evicting, dropped, outcome = threading.Event(), threading.Event(), []
+
+    class Paused(dict):
+        def __iter__(self):
+            keys = super().__iter__()
+            if threading.current_thread() is not threading.main_thread():
+                evicting.set()
+                dropped.wait(0.5)  # held off by the lock, the drop never comes; without it, it lands here
+            return keys
+
+    def evict():
+        try:
+            outcome.append(resolver.current(A))
+        except Exception as error:  # noqa: BLE001 - the failure under test
+            outcome.append(error)
+
+    resolver._definitions = Paused(resolver._definitions)
+    foundry.add(A.agent_name, 5, "new")
+    foundry.versions[R.agent_name][0]["agent_guid"] = _target(3, OTHER_AGENT_OID).agent_id.upper()
+    selection = threading.Thread(target=evict)
+    selection.start()
+    assert evicting.wait(5)
+    with pytest.raises(Problem) as failing:
+        resolver.current(_target(3, OTHER_AGENT_OID, agent_name=R.agent_name))
+    dropped.set()
+    selection.join(5)
+    assert _code(failing) == (503, FOLLOWING) and outcome == ["5"]
+    assert list(resolver._definitions) == [(A.project_endpoint, A.agent_name, "4"), (A.project_endpoint, A.agent_name, "5")]
 
 
 def test_responses_lane_rechecks_the_published_definition_without_a_write():
@@ -246,7 +326,8 @@ def test_responses_lane_rechecks_the_published_definition_without_a_write():
     assert resolver.current(R) == "4"
     assert resolver.current(R, require_responses=True) == "4"
     assert resolver.current(R, require_responses=True) == "4"
-    assert foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "4")] * 3
+    # The kept definition is checked again on every call (one get_version per version and process).
+    assert foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "4")] + [("agent", R.agent_name)] * 2
     assert not foundry.creates() and not foundry.routes
 
 
@@ -300,7 +381,8 @@ def test_responses_requires_both_real_enabling_conditions_on_the_selected_versio
             resolver.current(R, require_responses=True)
         assert _code(disabled) == (409, "NATIVE_TURNS_DISABLED")
     assert resolver.current(R) == "4"
-    assert foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "4")] * 3
+    # A definition without the Responses lane is still a valid one: read once, refused from it each time.
+    assert foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "4")] + [("agent", R.agent_name)] * 2
     assert not foundry.creates() and not foundry.routes
 
 
@@ -362,7 +444,8 @@ def test_probe_version_is_not_a_production_lane_even_with_both_runtime_flags(pro
     with pytest.raises(Problem) as disabled:
         resolver.current(R, require_responses=True)
     assert _code(disabled) == (409, "NATIVE_TURNS_DISABLED")
-    assert resolver.current(R) == "4" and foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "4")] * 2
+    assert resolver.current(R) == "4" and foundry.calls == [("agent", R.agent_name), ("get", R.agent_name, "4"),
+                                                            ("agent", R.agent_name)]
 
 
 def test_a_versions_fa_build_is_read_once_with_its_profile_and_only_as_a_code_identity():

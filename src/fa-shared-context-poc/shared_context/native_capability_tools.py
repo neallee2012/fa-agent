@@ -22,8 +22,8 @@ from azure.core.exceptions import AzureError
 from .behavior_agent_template import TemplateSkill
 from .behavior_assistant_wire import SkillName, SkillResourceName
 from .behavior_capabilities import (
-    CAPABILITY_CLIENT_SECONDS, CAPABILITY_TOOL_GUIDANCE, SKILLS_ENTRY_ID, SKILL_RESOURCES_ENTRY_ID, McpToolResult,
-    skill_resources_granted,
+    CAPABILITY_CLIENT_SECONDS, CAPABILITY_TOOL_GUIDANCE, SKILLS_ENTRY_ID, SKILL_RESOURCES_ENTRY_ID,
+    TOOLBOX_FAILURE_GUIDANCE, TOOLBOX_UNAVAILABLE, McpToolResult, skill_resources_granted,
 )
 from .behavior_capability_calls import CapabilityCatalogResult
 from .behavior_skill_catalog import (
@@ -371,10 +371,31 @@ def mcp_api_provider(*, transport=None) -> NativeCapabilityProvider:
         key = tuple((grant.entry_id, grant.entry_sha256, grant.tools) for grant in grants)
         kept = catalogs.pop(key, None)
         fresh = kept is None or monotonic() - kept[0] > CATALOG_SECONDS
-        listed = ({item.entry_id: item for item in (await client.capability_catalog(scope)).entries}
-                  if fresh else kept[1])
+        catalog = await client.capability_catalog(scope) if fresh else None
+        listed = {item.entry_id: item for item in catalog.entries} if fresh else kept[1]
+        unavailable = {} if catalog is None else {item.entry_id: item.reason for item in catalog.unavailable}
         specs, schemas = [], {}
         for grant in grants:
+            if (reason := unavailable.get(grant.entry_id)) is not None:
+                # As a toolbox that cannot list (native_toolbox.toolbox_provider): this turn runs without this grant.
+                # Its tools stay bound, as bind_capabilities expects, and only report that; nothing is sent.
+                source = grant.entry_id
+                if context.assembly is None or context.assembly.source_unavailable(grant.entry_id, source, reason):
+                    logging.getLogger(__name__).warning(
+                        "FA_NATIVE_TOOL_SOURCE_UNAVAILABLE agent_id=%s request_id=%s entry=%s "
+                        "code=TOOLBOX_LIST_FAILED reason=%s", context.receipt.agent_id, context.receipt.request_id,
+                        grant.entry_id, reason)
+
+                async def unavailable_tool(packet):
+                    raise ToolFailure(TOOLBOX_FAILURE_GUIDANCE[TOOLBOX_UNAVAILABLE], public_code=TOOLBOX_UNAVAILABLE)
+                for name in grant.tools:
+                    if context.hitl is not None:
+                        context.hitl.set_toolbox_approval(name, "never")
+                    specs.append(ToolSpec(
+                        name, f"Unavailable this turn: {source} could not list its tools. "
+                        "Calling it only reports that.", {"type": "object", "properties": {}}, unavailable_tool))
+                    schemas[name] = McpToolResult
+                continue
             current = listed.get(grant.entry_id)
             prefix = grant.entry_id + "-"
             if (current is None or current.entry_sha256 != grant.entry_sha256
@@ -402,6 +423,9 @@ def mcp_api_provider(*, transport=None) -> NativeCapabilityProvider:
                     return ToolOutput(result.model_dump_json())
                 specs.append(ToolSpec(name, (item.description or name)[:1024], item.input_schema, handle))
                 schemas[name] = McpToolResult
+        if unavailable:
+            # Nothing is kept from a listing that left a grant out: the next turn lists it again.
+            return NativeCapabilityBinding(tools=tuple(specs), result_schemas=schemas)
         while len(catalogs) >= MAX_CATALOGS:
             catalogs.popitem(last=False)
         catalogs[key] = (monotonic(), listed) if fresh else kept
