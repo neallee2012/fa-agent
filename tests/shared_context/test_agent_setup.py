@@ -106,6 +106,42 @@ def test_both_roles_are_put_under_fixed_names_with_principal_type_and_an_arm_tok
     assert setup.ROLES == ("53ca6127-db72-4b80-b1b0-d745d6d5456d", "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd")
 
 
+ACCOUNT = SCOPE.rsplit("/projects/", 1)[0]
+
+
+def test_cosmos_memory_also_puts_openai_user_on_the_account_after_the_project_roles():
+    # ADR-0006 (Neal 2026-10-24): Cosmos memory embeds at the account root (#971), so one more PUT on the account.
+    seen = []
+    transport = arm([(201, granted(setup.FOUNDRY_USER)), (201, granted(setup.OPENAI_USER)),
+                     (201, granted(setup.OPENAI_USER, scope=ACCOUNT))], seen)
+    assert setup.roles_pending(Credential(), SCOPE, PRINCIPAL, account=True, transport=transport) is None
+    name = setup.assignment_name(ACCOUNT, PRINCIPAL, setup.OPENAI_USER)
+    assert [(method, url) for method, url, *_ in seen][2] == ("PUT", (
+        f"https://management.azure.com{ACCOUNT}/providers/Microsoft.Authorization/roleAssignments/{name}"
+        "?api-version=2022-04-01"))
+    assert seen[2][2] == {"properties": {
+        "roleDefinitionId": f"/subscriptions/{SUB}/providers/Microsoft.Authorization/roleDefinitions/{setup.OPENAI_USER}",
+        "principalId": PRINCIPAL, "principalType": "ServicePrincipal"}}
+    assert name != setup.assignment_name(SCOPE, PRINCIPAL, setup.OPENAI_USER)
+    # Repeating is the same three assignments.
+    again = []
+    assert setup.roles_pending(Credential(), SCOPE, PRINCIPAL, account=True, transport=arm(
+        [(200, granted(setup.FOUNDRY_USER)), (200, granted(setup.OPENAI_USER)),
+         (200, granted(setup.OPENAI_USER, scope=ACCOUNT))], again)) is None
+    assert [url for _, url, *_ in again] == [url for _, url, *_ in seen]
+
+
+def test_the_account_role_counts_only_on_the_account_and_says_where_it_failed():
+    project_only = arm([(201, granted(setup.FOUNDRY_USER)), (201, granted(setup.OPENAI_USER)),
+                        (201, granted(setup.OPENAI_USER))], [])
+    assert setup.roles_pending(Credential(), SCOPE, PRINCIPAL, account=True, transport=project_only) == (
+        f"reason=response_invalid role={setup.OPENAI_USER}@account")
+    refused = arm([(201, granted(setup.FOUNDRY_USER)), (201, granted(setup.OPENAI_USER)),
+                   (403, {"error": {"code": "AuthorizationFailed"}})], [])
+    assert setup.roles_pending(Credential(), SCOPE, PRINCIPAL, account=True, transport=refused) == (
+        f"reason=refused role={setup.OPENAI_USER}@account status=403 code=AuthorizationFailed")
+
+
 def test_an_existing_assignment_under_another_name_is_confirmed_by_reading_it_back():
     seen = []
     exists = (409, {"error": {"code": "RoleAssignmentExists", "message": TOKEN}})
@@ -139,7 +175,20 @@ def test_environment_enables_each_step_separately_and_refuses_a_scope_of_another
     endpoint_only = setup.NewAgentSetup.from_environment(ENDPOINT, credential, environ={setup.ENDPOINT_ENV: "true"})
     assert (endpoint_only.endpoint, endpoint_only.role_scope) == (True, None)
     roles_only = setup.NewAgentSetup.from_environment(ENDPOINT, credential, environ={setup.ROLE_SCOPE_ENV: SCOPE})
-    assert (roles_only.endpoint, roles_only.role_scope) == (False, SCOPE)
+    assert (roles_only.endpoint, roles_only.role_scope, roles_only.account_role) == (False, SCOPE, False)
+    # Only profile.py's FA_ONBOARDING_ACCOUNT_ROLE (from the Bicep output) turns the account PUT on: an older private
+    # environment has FA_MEMORY_BACKEND=cosmos but no account delegation, and that PUT would 403.
+    for extra, account in (({"FA_MEMORY_BACKEND": "cosmos"}, False), ({setup.ACCOUNT_ROLE_ENV: "false"}, False),
+                           ({setup.ACCOUNT_ROLE_ENV: "true"}, True),
+                           ({setup.ACCOUNT_ROLE_ENV: "true", "FA_MEMORY_BACKEND": "cosmos"}, True)):
+        chosen = setup.NewAgentSetup.from_environment(
+            ENDPOINT, credential, environ={setup.ROLE_SCOPE_ENV: SCOPE, **extra})
+        assert (chosen.role_scope, chosen.account_role) == (SCOPE, account)
+        sent = []
+        chosen.transport = arm([(201, granted(setup.FOUNDRY_USER)), (201, granted(setup.OPENAI_USER)),
+                                (201, granted(setup.OPENAI_USER, scope=ACCOUNT))], sent)
+        assert chosen.pending(Endpoints({"responses": {}}), "fa-agent-1", PRINCIPAL) is None
+        assert len(sent) == (3 if account else 2)
     with caplog.at_level(logging.WARNING):
         other = setup.NewAgentSetup.from_environment(
             ENDPOINT, credential, environ={setup.ROLE_SCOPE_ENV: SCOPE.replace("faexample-stage", "other"),
@@ -158,6 +207,14 @@ def test_pending_runs_endpoint_then_roles_and_off_does_nothing():
     assert both.pending(agent, "fa-agent-1", PRINCIPAL) == (
         f"step=roles reason=refused role={setup.FOUNDRY_USER} status=403 code=AuthorizationFailed")
     assert len(agent.patches) == 1
+    # Public (no account_role) sends only the two project PUTs; cosmos sends the third on the account.
+    for account_role, count in ((False, 2), (True, 3)):
+        sent = []
+        ok = setup.NewAgentSetup(role_scope=SCOPE, account_role=account_role, credential=Credential(), transport=arm(
+            [(201, granted(setup.FOUNDRY_USER)), (201, granted(setup.OPENAI_USER)),
+             (201, granted(setup.OPENAI_USER, scope=ACCOUNT))], sent))
+        assert ok.pending(agent, "fa-agent-1", PRINCIPAL) is None and len(sent) == count
+        assert (ACCOUNT + "/providers/" in sent[-1][1]) is account_role
     blocked = setup.NewAgentSetup(endpoint=True, role_scope=SCOPE, credential=Credential(), transport=arm([], []))
     assert blocked.pending(Endpoints({"responses": {}}, refuse=403), "fa-agent-1", PRINCIPAL) == (
         "step=endpoint reason=patch_refused status=403")

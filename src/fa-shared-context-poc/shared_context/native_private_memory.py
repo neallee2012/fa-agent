@@ -29,6 +29,11 @@ the native lifecycle differs:
   (``memory_redaction``; fixed rules, no model judgment). Existing memories are neither moved nor deleted.
 - MEM-02 (2026-10-03, plan 009cccbf): the prefix adds that a one-conversation rule or a temporary state is not a
   lasting preference, and that an episode records what happened then, not necessarily what is true now.
+- ADR-0011 (``cosmos``): no chaining; the update gets the turn's completion time (``created_at`` of ``turn:<n>`` in
+  the conversation store). FA extracts with its own model call, so after that call the claim receipt keeps the
+  usage with the ``update_id`` and status, and then the usage is reported once as ``source="memory"`` under the
+  turn's RID. An unconfirmed report is only logged (``FA_PRIVATE_MEMORY_USAGE_UNREPORTED``) and the usage stays in
+  the claim; raising would rerun the notification task and hold a version change for up to its whole retry window.
 """
 
 from __future__ import annotations
@@ -118,13 +123,15 @@ async def record_receipt(key, claimed: Claimed, receipt: dict, credential_factor
 
 
 class NativePrivateMemory:
-    def __init__(self, memory: PrivateMemory, credential_factory=None):
-        self.memory, self.credential_factory = memory, credential_factory
+    def __init__(self, memory: PrivateMemory, credential_factory=None, usage_reporter=None):
+        """``usage_reporter(request_id, usage)`` is ``NativeUsageReporter.report``; only an extraction FA ran uses it."""
+        self.memory, self.credential_factory, self.usage_reporter = memory, credential_factory, usage_reporter
 
     @classmethod
-    def from_environment(cls, token_provider, credential_factory=None, *, environ=None, transport=None):
-        memory = PrivateMemory.from_environment(token_provider, environ=environ, transport=transport)
-        return None if memory is None else cls(memory, credential_factory)
+    def from_environment(cls, token_provider, credential_factory=None, *, environ=None, transport=None, api=None,
+                         usage_reporter=None):
+        memory = PrivateMemory.from_environment(token_provider, environ=environ, transport=transport, api=api)
+        return None if memory is None else cls(memory, credential_factory, usage_reporter)
 
     async def recall(self, receipt, *, first_turn: bool = False) -> tuple[str, ...]:
         if not receipt.human_origin:
@@ -133,6 +140,13 @@ class NativePrivateMemory:
             return await self.memory.recall_tiers(receipt.command.content, first_turn=first_turn)
 
     async def completed(self, receipt, reader=None) -> None:
+        """Never raises, so a private memory failure cannot make the notification task retry the whole batch."""
+        try:
+            await self._remember(receipt, reader)
+        except Exception as exc:
+            log.warning("FA_PRIVATE_MEMORY_UPDATE status=not_sent exception_type=%s", type(exc).__name__)
+
+    async def _remember(self, receipt, reader) -> None:
         if not receipt.human_origin or receipt.status != "completed":
             return
         if opted_out(receipt.command.content):
@@ -142,7 +156,9 @@ class NativePrivateMemory:
         claimed = await self._claim(receipt.request_id)
         if claimed is None:
             return
-        previous = await self._previous_update_id(receipt)
+        chained = getattr(self.memory, "chains_updates", True)
+        previous = await self._previous_update_id(receipt) if chained else None
+        completed_at = None if chained else await self._completed_at(receipt)
         reply = await self._reply(receipt, reader)
         text, hidden = redact_secrets(receipt.command.content)
         if reply is not None:
@@ -151,12 +167,51 @@ class NativePrivateMemory:
         if hidden:
             log.warning("FA_PRIVATE_MEMORY_UPDATE redacted=%d", hidden)
         with phase_timing("private_memory_update"):
-            status, update_id = await self.memory.update_chained(text, previous, reply=reply)
-        if update_id is not None:
+            updated = await self.memory.update_chained(
+                text, previous, reply=reply, request_id=receipt.request_id,
+                **({} if chained else {"completed_at": completed_at}))
+        status, update_id = updated
+        usage = getattr(updated, "usage", None)
+        if update_id is not None or usage is not None:
             await record_receipt(claim_key(receipt.request_id), claimed, {
-                "update_id": update_id, "accepted_status": status}, self.credential_factory, "FA_PRIVATE_MEMORY_UPDATE")
+                "accepted_status": status, **({"update_id": update_id} if update_id is not None else {}),
+                **({"usage": usage.model_dump(mode="json")} if usage is not None else {})},
+                self.credential_factory, "FA_PRIVATE_MEMORY_UPDATE")
         else:
             log.warning("FA_PRIVATE_MEMORY_UPDATE receipt=not_recorded reason=no_id")
+        if usage is not None:
+            await self._report_usage(receipt.request_id, usage)
+
+    async def _report_usage(self, request_id, usage) -> None:
+        """Send the extraction's usage once; an unconfirmed report is only logged and stays in the claim receipt."""
+        from .errors import Problem
+
+        reason = "no_reporter"
+        if self.usage_reporter is not None:
+            try:
+                await self.usage_reporter(request_id, usage)
+                return
+            except Problem as error:
+                reason = error.body["error"]["code"]
+            except Exception as error:
+                reason = type(error).__name__
+        log.warning("FA_PRIVATE_MEMORY_USAGE_UNREPORTED rid_prefix=%s reason=%s", request_id[:8], reason)
+
+    async def _completed_at(self, receipt) -> int | None:
+        """When the official State store created this turn's ``turn:<n>`` item (unix seconds); never raises."""
+        number = getattr(receipt, "turn_number", None)
+        if type(number) is not int:
+            return None
+        from .native_checkpoint import conversation_store_name
+        from .native_turns import _created_at
+
+        try:
+            async with agent_store(conversation_store_name(receipt.conversation_id), self.credential_factory) as store:
+                created = _created_at(await store.get_item(f"turn:{number}"))
+            return None if created is None else int(created.timestamp())
+        except Exception as exc:
+            log.warning("FA_PRIVATE_MEMORY_UPDATE completed_at=unavailable exception_type=%s", type(exc).__name__)
+            return None
 
     @staticmethod
     async def _reply(receipt, reader) -> str | None:

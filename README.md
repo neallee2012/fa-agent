@@ -79,12 +79,12 @@ Container App      Container App              每位助理一台 VM
 <a id="deploy-to-your-azure"></a>
 ## 部署到你的 Azure
 
-用 `azd up` 部署到你自己的訂閱。Bicep 建立全部資源，hook 呼叫的是作者 stage CI 同一批腳本；之後再跑 `azd deploy`，就是同一套升級步驟。完整說明在 [deploy/azd/README.md](deploy/azd/README.md)，設計取捨在 [docs/azd-new-environment.md](docs/azd-new-environment.md)。
+用 `azd up` 部署到你自己的訂閱。Bicep 建立全部資源，hook 呼叫的是作者 stage CI 同一批腳本；之後再跑 `azd deploy`，就是同一套升級步驟。完整說明在 [deploy/azd/README.md](deploy/azd/README.md)，設計取捨在 [docs/azd-new-environment.md](docs/azd-new-environment.md)。網路預設是 `public`；要讓 Foundry 資料面不經公網，見下方[私有化部署](#private-deployment)。
 
 **事前準備，看由誰來做。** 每一項的細節見 [事前準備](deploy/azd/README.md#prerequisites)。
 
 - **你（部署的人）**：azd 1.32.0 以上、Azure CLI、Python 3.11 以上、git 和正在執行的 Docker，Windows 另需 PowerShell 7。`az` 和 `azd` 用同一個使用者帳號登入。建議你就是 Team 主人；不是的話，後半段要由主人登入接手。
-- **訂閱 Owner**：你在訂閱上要有 Owner，或 Contributor 加 User Access Administrator。訂閱要註冊 9 個 resource provider 和 1 個 feature。
+- **訂閱 Owner**：你在訂閱上要有 Owner，或 Contributor 加 User Access Administrator。訂閱要註冊 9 個 resource provider 和 1 個 feature（名稱與 `az` 指令見 [deploy/azd/README.md](deploy/azd/README.md#register-providers)）；preprovision hook 只檢查、不會替你註冊。
 - **Entra 權限**：允許你註冊 app。Team 主人一人的 3 筆委派授權，你能建（Cloud Application Administrator、Application Administrator 或 Global Administrator）時由 hook 直接建好；不能建時 hook 把請求寫成給管理員的檔案（`.azure/<env>/fa/admin-consent/`），管理員做完後你再接續。
 
 不需要 Microsoft Teams、Work IQ 或 GitHub。`azd up` 完成時 connector 是關的，之後要加工具見 [擴充](#extending)。
@@ -113,17 +113,62 @@ azd up
 
 **中途要你回答的地方。**
 
-- **區域與模型。** 區域由 azd 的選單問，只列有 Foundry Hosted Agents 的區域；上面用 `--location` 指定過就不再問。作者使用 `westus3`。模型由 hook 列出這個區域有沒有提供、quota 夠不夠，你輸入編號，再選新對話的預設模型。沒有固定必裝的模型。有的區域某些模型的 quota 是 0（作者在 westus3 遇過 gpt-6 系列），建議 `azd up` 前先查 quota，或用 `azd env set FA_MODELS …`、`FA_DEFAULT_MODEL …` 預先選好，查法見 [deploy/azd 的「區域與模型」](deploy/azd/README.md#region-and-models)。
+- **區域與模型。** 區域由 azd 的選單問，只列有 Foundry Hosted Agents 的區域；上面用 `--location` 指定過就不再問。作者使用 `westus3`；2026-10-21 在那裡因為 gpt-6 系列 quota 是 0，改選 `gpt-5.4-mini` 跑完第一次部署並通過「前 10 分鐘」檢查。模型由 hook 列出這個區域有沒有提供、quota 夠不夠，你輸入編號，再選新對話的預設模型。沒有固定必裝的模型。有的區域某些模型的 quota 是 0，建議 `azd up` 前先查 quota，或用 `azd env set FA_MODELS …`、`FA_DEFAULT_MODEL …` 預先選好，查法見 [deploy/azd 的「區域與模型」](deploy/azd/README.md#region-and-models)。
 - **首次安裝批准。** 首次安裝寫入資料表前，終端機會顯示 request、installation、configuration 與 plan hash，Team 主人輸入 `y`（或 `yes`）才會寫入，批准檔綁定 configuration 與 plan 這兩個 hash、10 分鐘內有效。輸入其他內容就停下，什麼都不寫；沒有終端機（程式以 `sys.stdin.isatty()` 判斷，不看 azd 的 `--no-prompt`）時直接停。
 - **WebIQ 金鑰（選用）。** 先 `azd env set FA_ENABLE_WEBIQ true` 才會問。金鑰用隱藏輸入，不寫檔，也不進 azd env。
 
 **還要真人做的事。** 部署最後，hook 以 Team 主人身分替兩位助理選好新對話的模板：走 Responses，開啟伺服器提供的全部能力。之後可以在工作台助理 ⚙ 設定頁調整。剩下的是主人登入 hook 印出的工作台網址（hook 的訊息裡叫 Portal，就是工作台；之後用 `azd env get-value FA_CONSOLE_URL` 也查得到），開新對話送一則短訊息；回條 `completed`、`failure_code=null` 才算通過，步驟見下方 [前 10 分鐘](#first-10-minutes)。部署的人不是主人時，第一次 session 準備和模板選擇要由主人登入後跑 `azd hooks run postdeploy`。主人接手從批准首次安裝開始；重跑時會重做角色指派和 Bicep，所以主人也要有訂閱 Owner（或 Contributor 加 User Access Administrator）和 Foundry User，並在同一台電腦、用同一個 `.azure/<env>/fa` 資料夾執行。
 
-**中斷或要排錯時。** 每個寫入都先記 intent。照畫面提示讀回，再用 `azd hooks run postprovision` 或 `azd hooks run postdeploy` 接續，不要刪掉重來；在新的終端機接續時，先設同一個 `AZURE_CONFIG_DIR` 並 `cd` 到 repo 根目錄，見 [中斷後接續](deploy/azd/README.md#resume)。逐步排錯的對照是 [新環境標準流程](deploy/README.md#new-environment-standard-flow) 的 17 個關卡，兩邊呼叫同一批腳本。`azd down --purge` 會連同資料表、備份和記憶一起刪除，無法復原；備份鎖還在且沒設 `FA_CONFIRM_DELETE` 時會先要你輸入環境名稱，azd 自己也會問 `y/N`；約 30 分鐘。
+**中斷或要排錯時。** 每個寫入都先記 intent。照畫面提示讀回，再用 `azd hooks run postprovision` 或 `azd hooks run postdeploy` 接續，不要刪掉重來；在新的終端機接續時，先設同一個 `AZURE_CONFIG_DIR` 並 `cd` 到 repo 根目錄，見 [中斷後接續](deploy/azd/README.md#resume)。逐步排錯的對照是 [新環境標準流程](deploy/README.md#new-environment-standard-flow) 的 17 個關卡，兩邊呼叫同一批腳本。
 
 **目前的限制。** 作者在自己的訂閱從頭跑完一次 `azd up`，並在工作台實際使用過。開頭的區域與模型選擇之後也在 eastus2 實跑成功（只選一個模型，部署與設定讀回正確），但那次的工作台驗收還沒做。2026-10-21 又用公開 repo 第 34 版在 westus3 從頭跑一次，前 10 分鐘驗收通過。
 
 **費用參考。** 這些是作者環境的估算，實際以你的帳單為準。每位助理的 VM 運作時約 US$0.25／小時（2 vCPU、4 GiB），閒置回收後不計。常駐的工作台約 US$5.83／月。記憶功能預設開啟，Memory Store（preview）依用量另計。作者的 stage 環境原本估算每月 US$70～190，2026-10-07 起工作台和 feed app 改成常駐，每月約再多 US$11.66。
+
+**不用了怎麼拆。** `azd down --purge` 會刪掉整個資源群組（連同資料表、備份和記憶，無法復原）和這個環境建的 Entra app，約 30 分鐘。備份鎖還在且沒設 `FA_CONFIRM_DELETE` 時，會先要你輸入環境名稱；確認步驟、沒有終端機時的做法見 [deploy/azd 的「刪除」](deploy/azd/README.md#刪除)。
+
+<a id="private-deployment"></a>
+## 私有化部署（`FA_NETWORK_MODE=private`）
+
+`private` 比較適合有高資安、金融監理（金管）或其他法遵要求的企業用戶，例如需要 Foundry 的資料面（模型與 agent endpoint）不經公網、要自己控管網路出入的組織。一般使用或試用請維持預設的 `public`。`private` 提供的是網路隔離的基礎元件，不會讓你因此就符合任何法規；是否合規，仍取決於組織自己的控管與評估。
+
+**做到什麼。** 第一次 `azd up` 前設 `FA_NETWORK_MODE=private`：
+
+- Foundry 帳號關閉公網，帳號、project 的資料面與 agent endpoint 只能從你的 VNet 經 private endpoint 進入。
+- Hosted Agent 注入你控管的 subnet，可以自己加 NSG、route table 或防火牆。
+- 工作狀態與成果（Storage Table、Blob）和 `public` 一樣照舊只走 private endpoint；長期記憶（Cosmos DB serverless）也只走 private endpoint。
+- 部署時有幾個步驟要從你的電腦呼叫 Foundry 資料面，hook 會暫時開一個只允許你這台電腦 IP 的窗口，做完自動關閉並讀回確認。
+- 選用：帶入既有 VNet（`FA_VNET_RESOURCE_ID` 加三個 subnet 名稱）；DNS 可以由 FA 建（`FA_DNS_MODE=azd`，預設），或由你的 hub 管（`existing`）。
+
+**做不到什麼。** `private` 不是全內網：
+
+- 工作台和 FA API 的入口仍在公網，靠 Entra 登入保護。
+- Hosted Agent 到 FA API 的 Team 資料（含記憶）走公網，以 TLS＋Entra 保護：azd 建的 VNet 經它建的 NAT 出站；帶入既有 VNet 時經你的 NAT 或防火牆。
+- azd 建的 VNet 沒有出站過濾：經 NAT 出站，來源 IP 固定，目的地不限；要限制請自己加 NSG 或防火牆。帶入既有 VNet 時，來源 IP 和過濾由你的 NAT 或防火牆決定。
+- ACR（Basic）、Web PubSub，以及送到 Log Analytics／Application Insights 的資料擷取仍在公網（背景見 [ADR-0010](docs/adr/0010-azd-private-network-option.md)）。
+- 部署時的暫時窗口只允許你這台電腦的公網 IP；你的電腦若在公司、校園或 VPN 共用的出口 IP 後面，窗口開著的這段時間，同一出口的所有人都連得到這個帳號的資料面（仍要 Entra 身分與 Foundry 角色）。開了 WebIQ（`FA_ENABLE_WEBIQ=true`）時，之後每次升級都會再開一次窗口。見[部署期間的暫時窗口](deploy/azd/README.md#private-deploy-window)。
+- 不能用 Foundry Memory Store，長期記憶改用 FA 自建的 Cosmos DB 記憶。
+- 不支援 Work IQ，也不支援入口網站的 Teams 一鍵發布。
+- 只能在建立環境時選，之後不能切換；要換就另建一個環境。主人也不能再從公網用 Foundry 入口網站看 Agent 與資料。
+- 全私有（`isolated`）是之後的工作：工作台與 API 也進內網，並改用私有 ACR 與 AMPLS（Azure Monitor Private Link Scope）。
+
+**怎麼開。** 在上面 `azd env new` 之後、`azd up` 之前：
+
+```powershell
+azd env set FA_NETWORK_MODE private
+# 選用：帶入既有 VNet（要放在另一個 resource group；subnet 名稱和預設不同時才設，另有 FA_API_SUBNET_NAME、FA_PRIVATE_ENDPOINT_SUBNET_NAME）
+azd env set FA_VNET_RESOURCE_ID /subscriptions/<subscription-id>/resourceGroups/<network-rg>/providers/Microsoft.Network/virtualNetworks/<vnet>
+azd env set FA_AGENT_SUBNET_NAME <agent-subnet>
+azd up
+```
+
+訂閱要另外註冊 `Microsoft.ContainerService`；記憶開啟時（預設）也要註冊 `Microsoft.DocumentDB`。區域要在 Agent Service 的區域表裡。preprovision 只讀檢查這些和 VNet 的大部分條件，不符就停下、什麼都不寫；但帶入的 subnet 沒有 NAT 或 route table 只會警告，VNet 已連的同名 DNS zone 和 peer VNet 的位址重疊不會檢查，要你自己確認。帶入的 VNet 要事先準備的 subnet、出站與權限，以及 DNS 的兩種做法，見 [deploy/azd 的「網路模式」](deploy/azd/README.md#network-mode)與[「帶入既有 VNet」](deploy/azd/README.md#byo-vnet)；設計與取捨見 [ADR-0010](docs/adr/0010-azd-private-network-option.md) 和 [ADR-0011](docs/adr/0011-private-mode-cosmos-memory.md)。
+
+**費用。** 比 `public` 多一筆固定月費。以下是 ADR 依牌價做的估算，實際金額還沒從帳單核對：NAT Gateway、它的公網 IP、Foundry 的 private endpoint 與 DNS zone 每月約 US$50，再加資料處理費（[ADR-0010](docs/adr/0010-azd-private-network-option.md#waf-五大支柱)）；Cosmos DB 記憶的 private endpoint 與 DNS zone 每月約 US$8；Cosmos 本身的 RU 與儲存估計每月不到 US$1，儲存隨資料逐月累加（[ADR-0011](docs/adr/0011-private-mode-cosmos-memory.md)）。記憶抽取的模型費用依回合數計，但不是 `private` 才有：`public` 的 Memory Store 也用模型抽取。帶入既有 VNet 時，出站（NAT 或防火牆）由你自己提供。
+
+**驗證到哪裡。** 2026-10-24 在作者的測試訂閱雲端驗收核心流程：azd 建的 VNet，以及帶入既有 VNet 搭配 `FA_DNS_MODE=azd`，都跑完 `azd up`、[前 10 分鐘](#first-10-minutes)、長期記憶的寫入和新對話回想，以及 `azd down`（紀錄：[第一輪](docs/progress.md#private-e2e-1024)、[兩輪重跑](docs/progress.md#private-reruns-1024)）。三次部署（`fa-priv-1024`、`fa-priv2-1024`、`fa-byo-1024`）的部署窗口都有開關，hook 每次都印出 "closed again (read back: publicNetworkAccess Disabled, no IP rule)"（重跑兩輪的讀回記在作者的執行紀錄，見[兩輪重跑](docs/progress.md#private-reruns-1024)）。帶入既有 VNet 的 `azd down` exit 0，拆除後客戶 VNet 三個 subnet 都在、兩個委派 subnet 的委派仍在，不留 FA 的 service association link 或 private endpoint。帶入既有 VNet 只測過一種網路拓撲；`FA_DNS_MODE=existing` 還沒在雲端測過。
+
+**要多久。** 測試中第一次 `private` 的 `azd up` 約 1.3～1.5 小時（10-24 兩輪重跑；最早那一輪含首次安裝的等待，約 1.9 小時）。帶入既有 VNet 那次，Foundry 帳號與 project 的建立比 azd 建的 VNet 慢很多（各約 20 分鐘，另一輪約 4～6 分鐘）；只觀察到一次，原因未知。刪除要照順序，10-24 的三次測試中，從開始拆除算起約 50～60 分鐘（其中 azd 自己印出的時間約 24～31 分，不含 predown 刪 Foundry 帳號等它消失的那段；`fa-priv-1024` 第一次停在傳播延遲的競態、重跑才完成）；刪帳號時遇到「project 還列著」的傳播延遲，hook 會自動等一段時間再送一次。見 [`private` 的刪除](deploy/azd/README.md#private-down)。
 
 <a id="first-10-minutes"></a>
 ## 前 10 分鐘

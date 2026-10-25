@@ -486,6 +486,149 @@ def test_b_lists_and_reads_a_conversation_another_agent_opened_without_sending(n
                    for _, command in c.api.remote.calls)
 
 
+def routine_run(c, capture, day):
+    """A completed run of routine_origin()'s routine ``day`` days later, opened in its own conversation (2026-10-23)."""
+    from datetime import timedelta
+    from shared_context.behavior_native_turn_wire import NativeAgentCommand, NativeRoutineSubmit
+    from test_native_routine_wire import routine_origin
+
+    target, origin = c.api.remote.target, routine_origin()
+    source = origin.model_copy(update={
+        "agent_id": target.agent_id, "conversation_id": f"run-cid-{day}", "occurrence": origin.occurrence.model_copy(
+            update={"scheduled_for": origin.occurrence.scheduled_for + timedelta(days=day)})})
+    run = NativeRoutineSubmit(command=NativeAgentCommand(
+        request_id=source.request_id, content="Read the original work."), capture=capture, routine=source)
+    c.api.remote.records[source.request_id] = NativeReceipt(
+        state_profile=run.state_profile, agent_id=target.agent_id, hosted_session_id=target.session_id,
+        request_id=source.request_id, conversation_id=source.conversation_id, command=run.command,
+        capture=run.capture, routine=source, submit_digest=run.sha256, capture_digest=run.capture.sha256,
+        status="accepted")
+    c.api.remote.completed(source.request_id)
+    return source.request_id
+
+
+def test_owner_finds_each_routine_run_as_its_own_dated_conversation_and_can_follow_up(native_console):
+    """2026-10-23 (Neal: 不需要接續前一天): each run opens its own conversation; the owner's list names it by the
+    routine's local scheduled time, and it is the owner's own conversation, so a follow-up goes there."""
+    c = native_console
+    own = first(c)
+    assert send(c, own).status_code == 200
+    # The capture this API resolves for the Team's new conversations, as the routine clock would.
+    resolved = c.api.remote.records[own["request_id"]].capture
+    rids = [routine_run(c, resolved, day) for day in (0, 1)]
+    listed = c.ui.client.get("/api/instructions/models?thread_id=" + own["thread_id"])
+    assert listed.status_code == 200, listed.text
+    threads = {thread["thread_id"]: thread for thread in listed.json()["composer"]["threads"]}
+    # routine_origin() is scheduled 2026-10-04 01:00 UTC in Asia/Taipei.
+    assert [threads[rid]["label"] for rid in rids] == [
+        "排程 10-04 09:00：Read the original work.", "排程 10-05 09:00：Read the original work."]
+    assert all("sender_agent_id" not in threads[rid] for rid in rids)
+
+    opened = progress(c, rids[1])
+    assert opened.status_code == 200, opened.text
+    composer = opened.json()["composer"]
+    assert composer["agent_conversation"] is None and composer["conversation_id"] == "run-cid-1"
+    assert (composer["can_submit"], composer["can_follow_up"]) == (False, True)
+    task = next(task for task in opened.json()["tasks"] if task["task_id"] == rids[1])
+    assert task["routine"]["conversation_id"] == "run-cid-1" and task["submission"]["state"] == "OBSERVED"
+    assert task["reply"]["data"]["text"] == c.api.remote.text
+    following = post(c, "/api/instructions/" + rids[1] + "/next").json()["composer"]
+    sent = send(c, following, text="Explain the second item")
+    assert sent.status_code == 200, sent.text
+    assert c.api.remote.records[following["request_id"]].conversation_id == "run-cid-1"
+    assert not any(command.operation == "routine_receive" for _, command in c.api.remote.calls)
+
+
+def test_received_import_follows_pages_to_a_known_run_and_lists_the_newest_30_runs(native_console):
+    """Review 2026-10-23: a daily run adds a conversation a day, so the first 50-key received page is not enough. The
+    import reads on until a page holds a run it already has; the list shows the newest 30 runs (and the open one)."""
+    from datetime import timedelta
+    from web_test_console.native import RECEIVED_SECONDS
+
+    c = native_console
+    own = first(c)
+    assert send(c, own).status_code == 200
+    resolved = c.api.remote.records[own["request_id"]].capture
+    # Saved first, so last in Hosted's newest-first listing: on its second page, behind 55 newer keys.
+    latest, last_year = routine_run(c, resolved, 60), routine_run(c, resolved, -365)
+    for day in range(55):
+        routine_run(c, resolved, day)
+
+    def received():
+        return sum(path.endswith("/native-turns/received") for _, path, _ in c.calls)
+
+    before = received()
+    listed = c.ui.client.get("/api/instructions/models?thread_id=" + own["thread_id"])
+    assert listed.status_code == 200, listed.text
+    assert received() - before == 2, (received() - before, listed.json()["composer"]["received_error"])
+    threads = listed.json()["composer"]["threads"]
+    runs = [thread for thread in threads if "routine" in thread]
+    assert threads[0]["thread_id"] == own["thread_id"] and len(runs) == 30
+    # routine_origin() is 2026-10-04 01:00 UTC in Asia/Taipei; the run 60 days later is on 12-03.
+    assert runs[0]["thread_id"] == latest and runs[0]["label"] == "排程 12-03 09:00：Read the original work."
+    assert [run["routine"]["scheduled_for"] for run in runs] == sorted(
+        (run["routine"]["scheduled_for"] for run in runs), reverse=True)
+    assert last_year not in {run["thread_id"] for run in runs}
+
+    # The next listing stops at the first page: it already holds imported runs.
+    newer = routine_run(c, resolved, 61)
+    c.c.h.time += timedelta(seconds=RECEIVED_SECONDS + 1)
+    before = received()
+    again = c.ui.client.get("/api/instructions/models?thread_id=" + own["thread_id"])
+    assert again.status_code == 200 and received() - before == 1
+    assert next(thread for thread in again.json()["composer"]["threads"] if "routine" in thread)["thread_id"] == newer
+
+    # An older run still opens by its RID and stays listed while it is the open one, with its year.
+    opened = progress(c, last_year)
+    assert opened.status_code == 200, opened.text
+    shown = [thread for thread in opened.json()["composer"]["threads"] if "routine" in thread]
+    assert len(shown) == 31 and shown[-1]["thread_id"] == last_year
+    assert shown[-1]["label"] == "排程 2025-10-04 09:00：Read the original work."
+
+
+def test_received_import_reads_one_page_for_an_agent_without_received_conversations(native_console):
+    """Review 2026-10-23 (P3-6): own turns fill the first page and none opened here, so nothing behind it is read."""
+    from datetime import timedelta
+    from web_test_console.native import RECEIVED_SECONDS
+
+    c = native_console
+    own = first(c)
+    assert send(c, own).status_code == 200
+    original = c.api.remote.records[own["request_id"]]
+    for index in range(60):  # More than one 50-key page of this Agent's own first messages.
+        rid = f"own-request-{index:02d}"
+        c.api.remote.records[rid] = original.model_copy(update={"request_id": rid})
+    c.c.h.time += timedelta(seconds=RECEIVED_SECONDS + 1)
+    before = sum(path.endswith("/native-turns/received") for _, path, _ in c.calls)
+    listed = c.ui.client.get("/api/instructions/models?thread_id=" + own["thread_id"])
+    assert listed.status_code == 200, listed.text
+    assert sum(path.endswith("/native-turns/received") for _, path, _ in c.calls) - before == 1
+    assert listed.json()["composer"]["received_error"] is None
+
+
+def test_received_import_imports_again_a_run_whose_finish_was_lost(native_console):
+    """Review 2026-10-23 (P3-2): a row begun but never finished (no ``native_receipt``) is not imported yet."""
+    from datetime import timedelta
+    from web_test_console.native import RECEIVED_PHASE, RECEIVED_SECONDS
+
+    c = native_console
+    own = first(c)
+    assert send(c, own).status_code == 200
+    rid = routine_run(c, c.api.remote.records[own["request_id"]].capture, 0)
+    assert c.ui.client.get("/api/instructions/models?thread_id=" + own["thread_id"]).status_code == 200
+    journal = c.ui.console.journal
+    assert "native_receipt" in journal.get(rid, RECEIVED_PHASE)
+    with journal.connect() as db:
+        db.execute("UPDATE intents SET outcome=? WHERE task_id=? AND phase=?", (canonical(
+            {"state": "UNKNOWN", "code": "RECONCILE_REQUIRED", "observed_at": c.c.h.time.isoformat()}).decode(),
+            rid, RECEIVED_PHASE))
+    c.c.h.time += timedelta(seconds=RECEIVED_SECONDS + 1)
+    listed = c.ui.client.get("/api/instructions/models?thread_id=" + own["thread_id"])
+    assert listed.status_code == 200, listed.text
+    assert journal.get(rid, RECEIVED_PHASE)["native_receipt"]["request_id"] == rid
+    assert any(thread["thread_id"] == rid for thread in listed.json()["composer"]["threads"])
+
+
 def test_an_api_without_the_received_page_never_blocks_the_owner_conversation(native_console):
     c = native_console
     own = first(c)

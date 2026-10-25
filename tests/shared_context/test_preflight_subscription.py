@@ -67,15 +67,59 @@ class FakeAz:
         return 0, json.dumps(value), ""
 
 
-def run(tmp_path, mode, fake):
+def run(tmp_path, mode, fake, **extra):
     module = load()
     path = tmp_path / "deployment.json"
-    path.write_text(json.dumps(profile()), encoding="utf-8")
+    path.write_text(json.dumps({**profile(), **extra}), encoding="utf-8")
     return module.main([mode, "--deployment", str(path)], run=fake)
 
 
 def report(capsys):
     return json.loads(capsys.readouterr().out)
+
+
+PRIVATE_ONLY = {"Microsoft.ContainerService", "Microsoft.DocumentDB"}
+
+
+@pytest.mark.parametrize("extra", [
+    {}, {"network_mode": "public"}, {"network_mode": "public", "memory_backend": "cosmos"}])
+def test_public_mode_never_reads_the_private_mode_providers(tmp_path, capsys, extra):
+    fake = FakeAz()
+    assert run(tmp_path, "subscription", fake, **extra) == 0
+    providers = next(item for item in report(capsys)["checks"] if item["name"] == "providers")["detail"]
+    assert not PRIVATE_ONLY & set(providers)
+    assert not any(PRIVATE_ONLY & set(args) for args in fake.calls)
+
+
+def test_private_mode_checks_but_never_registers_its_providers(tmp_path, capsys):
+    states = {"Microsoft.ContainerService": "NotRegistered", "Microsoft.DocumentDB": "NotRegistered"}
+    fake = FakeAz(**{"provider show": lambda args: {"registrationState": states.get(args[3], "Registered")}})
+    cosmos = {"network_mode": "private", "memory_backend": "cosmos"}
+    assert run(tmp_path, "subscription", fake, **cosmos) == 1
+    value = report(capsys)
+    providers = next(item for item in value["checks"] if item["name"] == "providers")
+    assert providers["ok"] is False and {key: providers["detail"][key] for key in PRIVATE_ONLY} == states
+    warnings = [item for item in value["warnings"] if "FA_NETWORK_MODE=private" in item]
+    for provider, warning in zip(sorted(PRIVATE_ONLY), warnings, strict=True):
+        assert f"az provider register --namespace {provider} --subscription {SUB}" in warning
+    assert "with memory on" in warnings[1] and "with memory on" not in warnings[0]
+    assert not any(word in args for args in fake.calls for word in ("register", "create", "update", "delete"))
+    states["Microsoft.ContainerService"] = "Registered"
+    assert run(tmp_path, "subscription", fake, **cosmos) == 1  # DocumentDB alone still stops it
+    capsys.readouterr()
+    states["Microsoft.DocumentDB"] = "Registered"
+    assert run(tmp_path, "subscription", fake, **cosmos) == 0
+
+
+@pytest.mark.parametrize("extra", [{}, {"memory_backend": "foundry"}])
+def test_private_without_cosmos_memory_never_reads_the_cosmos_provider(tmp_path, capsys, extra):
+    # FA_ENABLE_MEMORY=false on private: no Cosmos DB account, so an unregistered DocumentDB must not stop it.
+    fake = FakeAz(**{"provider show": lambda args: {
+        "registrationState": "NotRegistered" if args[3] == "Microsoft.DocumentDB" else "Registered"}})
+    assert run(tmp_path, "subscription", fake, network_mode="private", **extra) == 0
+    providers = next(item for item in report(capsys)["checks"] if item["name"] == "providers")["detail"]
+    assert "Microsoft.ContainerService" in providers and "Microsoft.DocumentDB" not in providers
+    assert not any("Microsoft.DocumentDB" in args for args in fake.calls)
 
 
 def test_subscription_passes_and_matches_the_gpt41_quota_name(tmp_path, capsys):

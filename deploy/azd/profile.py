@@ -127,12 +127,29 @@ def build(values: Mapping[str, str], *, require_runtime: bool = True,
     if _flag(values, "FA_AGENT_ONBOARDING", "false"):
         api_environment["FA_ONBOARDING_ENDPOINT_PROTOCOLS"] = "true"
         api_environment["FA_ONBOARDING_ROLE_SCOPE"] = project_id
+        # The same rule for the account-scope delegation (ADR-0006 2026-10-24): an older private environment that
+        # only runs `azd deploy` has no output, so "+" leaves out the account PUT instead of stopping on a 403.
+        if _flag(values, "FA_AGENT_ONBOARDING_ACCOUNT_ROLE", "false"):
+            api_environment["FA_ONBOARDING_ACCOUNT_ROLE"] = "true"
     if _flag(values, "FA_ENABLE_WEBIQ"):
         api_environment["FA_CAPABILITY_TOOLBOX_ENTRIES"] = "WebIQ"
     memory = _flag(values, "FA_ENABLE_MEMORY", "true")
+    assistant_memory = dict(base["memory_environment"]["assistant"]) if memory else {}
     if memory:
         api_environment.update(base["memory_environment"]["api"])
     choice = models.parse(values, models.catalog())
+    if models.memory_backend(values) == "cosmos":
+        # ADR-0011: no Memory Store. Hosted extracts with the chosen memory model; the API relays to Cosmos DB.
+        del assistant_memory["FA_PRIVATE_MEMORY_STORE"]
+        assistant_memory.update(FA_MEMORY_BACKEND="cosmos", FA_MEMORY_EXTRACTION_MODEL=choice.memory_chat_model)
+        api_environment.update(FA_MEMORY_BACKEND="cosmos", FA_COSMOS_ENDPOINT=_get(values, "FA_COSMOS_ENDPOINT"))
+        if _flag(values, "FA_AGENT_ONBOARDING", "false") and "FA_AGENT_ONBOARDING_ACCOUNT_ROLE" not in values:
+            print("FA: warning: the Bicep output FA_AGENT_ONBOARDING_ACCOUNT_ROLE is missing, so Agents added with "
+                  "\"+\" get no account-scope OpenAI User and their memory fails; re-run `azd provision`.",
+                  file=sys.stderr)
+    if values.get("FA_NETWORK_MODE") == "private":
+        # ADR-0010: the API refuses adding Work IQ. Only private sets it, so a public profile keeps its bytes.
+        api_environment["FA_NETWORK_MODE"] = "private"
     api_environment["FA_INSTRUCTION_MODELS"] = ",".join(choice.models)  # the Portal offers only deployed models
     api_environment["FA_INSTRUCTION_DEFAULT_MODEL"] = choice.default
 
@@ -157,8 +174,7 @@ def build(values: Mapping[str, str], *, require_runtime: bool = True,
         "console_app": _get(values, "FA_CONSOLE_APP"),
         "log_analytics_workspace": _get(values, "FA_LOG_ANALYTICS"),
         "hosted_idle_timeout_seconds": int(idle),
-        "assistant_environment": {**base["assistant_environment"], "TZ": timezone,
-                                  **(base["memory_environment"]["assistant"] if memory else {})},
+        "assistant_environment": {**base["assistant_environment"], "TZ": timezone, **assistant_memory},
         "agents": agents(values, base, require_runtime=require_runtime),
         "conversation_defaults": base["conversation_defaults"],
         "api_environment": api_environment,

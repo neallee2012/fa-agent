@@ -53,6 +53,7 @@ azd 本體的已證實行為（官方文件；第 3 點另外在本機 azd 1.32.
 | `FA_MODEL_CAPACITY_JSON` | 空（用 model catalog 的容量） | 例 `{"gpt-5.4-mini":50}`；只接受 catalog 內名稱 |
 | `FA_MODEL_VERSION_UPGRADE_OPTION` | `NoAutoUpgrade` | 所有模型部署一致 |
 | `FA_API_SUBNET_NAT_EGRESS` | `false` | 同 `prepare_environment.py` |
+| `FA_NETWORK_MODE` | `public` | [ADR-0010](adr/0010-azd-private-network-option.md)：`private` 把 Hosted Agent 注入 VNet、Foundry 關公網；只能在建立環境時選。可由 azd 建 VNet，或用 `FA_VNET_RESOURCE_ID` 等帶入既有 VNet（`FA_DNS_MODE=existing` 尚未在雲端測過）；設定與拆除見 [deploy/azd/README.md「網路模式」](../deploy/azd/README.md#network-mode) |
 | `FA_DEPLOY_UPGRADE_SNAPSHOTS` | `false` | `true`：另建 ADR-0009 phase 5 工作檔快照專用的儲存帳號（`stsnap<token>`、私有端點、30 天刪除規則、帳號刪除鎖、API 身分在該 container 的備份讀寫自訂角色，不含刪除），API 取得 `FA_UPGRADE_SNAPSHOT_CONTAINER_URL`；與 `no-auto-gc` 備份帳號分開。打開會多建一個儲存帳號並指派角色，會產生費用；預設關，不需要就維持 `false` |
 | `FA_ENABLE_AGENT_ONBOARDING` | `true` | 「＋」新 Agent 需要的受限 RBAC Admin（Team 隔離的已知例外，風險見 [ADR-0006](adr/0006-team-trust-boundary-grokbot-mode.md)；預設開）與 API 的 `FA_ONBOARDING_*`（同 stage）；設 `false` 就兩者都不給 |
 | `FA_ENABLE_WEBIQ` | `false` | `true` 時 deploy 階段以隱藏輸入要金鑰並建 toolbox |
@@ -117,7 +118,7 @@ ACR、CAE、API UAMI（名稱／client ID／principal ID）、Table／備份 sto
 | 11 Seed Hosted | `postdeploy` | `seed_agents.py`（intent 不重送） |
 | 12 Agent project 角色 | `postdeploy` | 每個 Agent 部署 `project-service-access.bicep` |
 | 9 Profile | `postdeploy` | `profile.py` 以讀回值組 profile，沒有 placeholder |
-| 10 首次安裝 | `postdeploy` | `make_runtime.py`→部署 Job→`run_fresh_job.py plan`→本機重建 plan 並核 hash→**owner 在終端機打字批准**→`apply`→`reconcile` |
+| 10 首次安裝 | `postdeploy` | `make_runtime.py`→部署 Job→`run_fresh_job.py plan`→本機重建 plan 並核 hash→**owner 在終端機打字批准**（或事先設 `FA_APPROVE_INITIALIZATION`，見 §6）→`apply`→`reconcile` |
 | 8 API | `postdeploy` | `behavior-api.bicep`（首次安裝後才建，避免 D4 的 crash loop） |
 | 11 Sync／route（首次不 follow） | `postdeploy` | `ci_deploy.py sync`；首次安裝**不跑 follow**：從沒準備過的 Agent 沒有舊環境可跟，伺服器回 `NATIVE_FILES_CONFIRMATION_REQUIRED`（10-10 實跑）。第一次 session 準備直接綁定已路由的版本；之後的 `azd deploy` 才 follow |
 | 15 Portal app | `postdeploy` | `fresh_export`→`remote-bundle`→`web-console.bicep`→補 redirect URI 與 FIC→consent |
@@ -152,6 +153,12 @@ ACR、CAE、API UAMI（名稱／client ID／principal ID）、Table／備份 sto
   azd 路徑**不碰** `deploy/stage/*.json` 的任何值，stage CI 不變。
 - 兩個寫入點在 hook 裡要 owner 當場輸入確認：首次安裝 apply（看過 plan 摘要後輸入 `y`，批准檔綁定 plan 與 configuration hash）與 WebIQ 金鑰。
   非互動（CI、`--no-prompt`）時直接停，不自動批准。
+- 例外（Neal 2026-10-24 同意：「好」）：首次安裝這一題可由主人預先批准，`FA_APPROVE_INITIALIZATION=<azd 環境名稱>`，
+  與 `FA_CONFIRM_DELETE=<環境名稱>` 同一種形式。不用 plan hash：plan hash 要等 plan Job 跑完才知道，無法事先設定。
+  值與 `AZURE_ENV_NAME` 完全相同時不讀 stdin（有無終端機皆同）；登入者必須是 `FA_TEAM_OWNER_OID`、照樣印 plan 摘要、
+  批准檔欄位不變。批准檔 schema 禁止額外欄位且 `approval_source` 固定，所以以 `decision_id` 的
+  `-fresh-preapproved-` 標示這是預先批准，apply／reconcile Job 照舊驗證。值不符就停、不寫入；沒設時行為不變。
+  取捨：少了當場打字確認，但仍需主人本人身分，加上明確寫出環境名稱的選擇。WebIQ 金鑰仍要當場輸入。
 - 每個雲端寫入都先寫 intent（`open("x")`）；有 intent 只讀回，不重送；結果不明就停。
 - WebIQ 金鑰只在記憶體，PUT 一次後丟棄；不寫檔、不印、不放命令列或 azd env。
 

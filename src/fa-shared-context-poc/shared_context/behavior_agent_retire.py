@@ -4,7 +4,8 @@
    API's own write path). Nothing in the Team's Table is deleted; a rerun returns the original tombstone.
 2. ``--delete-foundry`` deletes the Foundry agent with ``force=true`` (without it the service answers 409 while any
    version has sessions; with it every version and session is deleted with the agent) and the FA role assignments
-   of that agent's own instance identity at the onboarding role scope. ``preview`` lists exactly these targets and
+   of that agent's own instance identity at the onboarding role scope (with ``FA_ONBOARDING_ACCOUNT_ROLE=true`` also
+   its OpenAI User on the project's account). ``preview`` lists exactly these targets and
    writes nothing; ``retire`` needs ``--confirm <agent-id>``. Every target comes from the tombstoned Agent's original
    registration, never another Agent's. Each part is read before and after, so a rerun reports what is already
    gone and finishes the rest.
@@ -33,7 +34,10 @@ from .behavior_agent_onboarding import (
     _METADATA_RID, _METADATA_TEAM, FoundryCallError, ProjectAgentFoundry, _latest_attempt, _read, derived_names,
     onboarding_key, onboarding_not_ready,
 )
-from .behavior_agent_setup import ARM, ARM_API_VERSION, ARM_TOKEN_SCOPE, ROLE_SCOPE_ENV, ROLES, NewAgentSetup, _arm_code
+from .behavior_agent_setup import (
+    ACCOUNT_ROLE_ENV, ARM, ARM_API_VERSION, ARM_TOKEN_SCOPE, OPENAI_USER, ROLE_SCOPE_ENV, ROLES, NewAgentSetup,
+    _arm_code,
+)
 from .behavior_operations import _parse
 from .behavior_team_registry import TeamAgent, TeamAgentRetired, _roster_ids, agent_key, retired_key
 from .errors import Problem
@@ -58,10 +62,12 @@ class RetiringFoundry(ProjectAgentFoundry):
 
 
 class AgentRoleAssignments:
-    """One principal's ARM role assignments at the onboarding role scope (what ``behavior_agent_setup`` assigns)."""
+    """One principal's ARM role assignments at the onboarding role scope (what ``behavior_agent_setup`` assigns), and
+    with ``account`` also its OpenAI User on the project's account (the account role of Cosmos memory)."""
 
-    def __init__(self, credential, scope, *, transport=None):
+    def __init__(self, credential, scope, *, account=False, transport=None):
         self.credential, self.scope, self.transport = credential, scope, transport
+        self.account = scope.rsplit("/projects/", 1)[0].lower() if account else None
 
     def _send(self, method, path, **params):
         try:
@@ -76,7 +82,9 @@ class AgentRoleAssignments:
 
     def list(self, principal_id):
         """(targets, kept): FA's roles exactly at the scope are targets; the principal's other assignments are kept."""
-        # shortcut: one page (no nextLink); an Agent identity has the 2 FA roles, upgrade if one ever holds 100+.
+        # ARM lists the assignments above the scope too, so the account-scope one is in this same page.
+        # shortcut: one page (no nextLink); an Agent identity has the 2 FA roles (3 with the account role), upgrade if
+        # one ever holds 100+.
         response = self._send("GET", self.scope + "/providers/Microsoft.Authorization/roleAssignments",
                               **{"$filter": f"principalId eq '{principal_id}'"})
         try:
@@ -93,8 +101,9 @@ class AgentRoleAssignments:
                 continue
             role = str(properties.get("roleDefinitionId", "")).rsplit("/", 1)[-1].lower()
             entry = {"id": item.get("id"), "role": role, "scope": properties.get("scope")}
-            exact = str(entry["scope"]).lower() == self.scope.lower() and isinstance(entry["id"], str)
-            (targets if exact and role in ROLES else kept).append(entry)
+            scope = str(entry["scope"]).lower()
+            fa_role = (scope == self.scope.lower() and role in ROLES) or (scope == self.account and role == OPENAI_USER)
+            (targets if fa_role and isinstance(entry["id"], str) else kept).append(entry)
         return targets, kept
 
     def delete(self, assignment_id):
@@ -288,11 +297,12 @@ def _cleanup(composition, agent_id, role_scope, *, stuck=False):
     agent, _ = _registered(composition, agent_id, deleting=True, stuck=stuck)
     credential = composition.clients[0].credential
     scope = role_scope or os.environ.get(ROLE_SCOPE_ENV)
-    checked = NewAgentSetup.from_environment(agent.target.project_endpoint, credential,
-                                             environ={ROLE_SCOPE_ENV: scope or ""}).role_scope
-    if checked is None:
+    checked = NewAgentSetup.from_environment(agent.target.project_endpoint, credential, environ={
+        ROLE_SCOPE_ENV: scope or "", ACCOUNT_ROLE_ENV: os.environ.get(ACCOUNT_ROLE_ENV, "")})
+    if checked.role_scope is None:
         raise Problem(422, "ROLE_SCOPE_INVALID", f"--role-scope (or {ROLE_SCOPE_ENV}) must name the Agent's project")
-    return RetiringFoundry(agent.target.project_endpoint, credential), AgentRoleAssignments(credential, checked)
+    return RetiringFoundry(agent.target.project_endpoint, credential), AgentRoleAssignments(
+        credential, checked.role_scope, account=checked.account_role)
 
 
 def main(argv=None):

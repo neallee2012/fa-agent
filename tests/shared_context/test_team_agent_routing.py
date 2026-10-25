@@ -310,3 +310,26 @@ def test_a_binding_path_finds_its_peer_without_rescanning_the_team(team_agent, s
         assert binding not in router.binding_agents
         assert client.get(flat, headers=human).json() == {"agent_id": agent_id}
         assert router.binding_agents[binding] == agent_id
+
+
+def test_the_memory_relay_derives_the_private_scope_hosted_uses(team_agent, monkeypatch):
+    # ADR-0011 §4: the API's scope_for(target.agent_name) equals Hosted's scope_for(FOUNDRY_AGENT_NAME).
+    from shared_context import memory_relay
+    from shared_context.behavior_auth import BehaviorPrincipal
+    from shared_context.behavior_private_memory import scope_for
+    monkeypatch.setattr(memory_relay, "_AGENT_NAMES", {})
+    case = team_agent
+    store, config, ids = case.a.runtime.store, case.config, case.config.identity
+    relay = memory_relay.MemoryRelay(None, targets=config.targets, environ={},
+                                     resolve_agent=lambda agent_id: resolve_agent_scope(store, config, agent_id))
+    actions = frozenset({"read", "submit", "execute", "consume"})
+    configured = config.targets[1]
+    actor = next(agent.actor for agent in ids.agents if agent.oid == configured.agent_oid)
+    cases = ((BehaviorPrincipal(str(ids.tenant_id), configured.agent_oid, ids.team_id, "agent", actor, actions),
+              configured.agent_name),
+             (BehaviorPrincipal(str(ids.tenant_id), AGENT_OID, ids.team_id, "agent", case.target.agent_id, actions),
+              case.target.agent_name))
+    for principal, foundry_agent_name in cases:
+        assert relay.agent_name(principal) == foundry_agent_name
+        assert relay.allowed(principal, scope_for(foundry_agent_name)) == scope_for(foundry_agent_name)
+    assert scope_for(configured.agent_name) != scope_for(case.target.agent_name)

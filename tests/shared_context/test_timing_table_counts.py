@@ -123,6 +123,10 @@ def test_route_timing_names_native_turn_routes_by_their_fixed_segment_and_hashes
     def options():
         return {"ok": True}
 
+    @app.post("/agents/{agent_id}/team-data/v1/memory/search")
+    def memory_search(agent_id: str):
+        return {"ok": True}
+
     @app.get("/work-policy/v1/conversations/{conversation_id}")
     def legacy(conversation_id: str):
         return {"ok": True}
@@ -135,12 +139,13 @@ def test_route_timing_names_native_turn_routes_by_their_fixed_segment_and_hashes
         assert client.post("/work-policy/v1/native-capabilities/skill-catalog").json()
         assert client.post("/agents/secret-agent/work-policy/v1/turn-usage").json()
         assert client.get("/work-policy/v1/agent-template/options").json()
+        assert client.post("/agents/secret-agent/team-data/v1/memory/search").json()
         assert client.get("/work-policy/v1/conversations/secret-legacy").json()
     hashed = timing_id("secret-rid")
     # These fake routes never call ``_body``, so no body RID is recorded and the path-less ones keep job_id None.
     assert [(timing["phase"], timing["job_id"]) for timing in _timings(caplog)] == [
         ("api_status", hashed), ("api_requests", hashed), ("api_submit", None), ("api_skill-catalog", None),
-        ("api_turn-usage", None), ("api_options", None)]
+        ("api_turn-usage", None), ("api_options", None), ("api_search", None)]
     assert "secret" not in caplog.text
 
 
@@ -151,6 +156,7 @@ def test_route_timing_hashes_the_rid_of_a_body_only_route(caplog):
     from shared_context.behavior_api import _body
     from shared_context.behavior_native_capability_wire import NativeTurnScope
     from shared_context.behavior_timing import RouteTiming, timing_id
+    from shared_context.memory_relay import WRITE_BODY_BYTES, MemoryWrite
     app = FastAPI()
     app.add_middleware(RouteTiming)
 
@@ -163,10 +169,19 @@ def test_route_timing_hashes_the_rid_of_a_body_only_route(caplog):
     async def unparsed():
         return {"ok": True}
 
+    @app.post("/agents/{agent_id}/team-data/v1/memory/items")
+    async def memory_items(agent_id: str, request: Request):
+        await _body(request, MemoryWrite, max_body_bytes=WRITE_BODY_BYTES)
+        return {"ok": True}
+
+    write = {"scope": "fap1-" + "0" * 48, "source_request_id": "secret-turn-rid", "items": [
+        {"slot": "p0", "kind": "user_profile", "content": "x", "embedding": [0.0] * 1536, "updated_at": 0}]}
     with caplog.at_level(logging.WARNING), TestClient(app) as client:
         assert client.post("/work-policy/v1/native-capabilities/catalog",
                            json={"conversation_id": "secret-cid", "request_id": "secret-rid"}).json()
         assert client.post("/work-policy/v1/native-capabilities/call").json()
+        assert client.post("/agents/secret-agent/team-data/v1/memory/items", json=write).json()
+    # A memory write carries its turn's RID as source_request_id.
     assert [(timing["phase"], timing["job_id"]) for timing in _timings(caplog)] == [
-        ("api_catalog", timing_id("secret-rid")), ("api_call", None)]
+        ("api_catalog", timing_id("secret-rid")), ("api_call", None), ("api_items", timing_id("secret-turn-rid"))]
     assert "secret" not in caplog.text

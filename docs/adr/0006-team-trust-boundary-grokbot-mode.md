@@ -62,6 +62,7 @@ Grokbot 的做法（外部唯讀調查）：入口驗一次身分，之後整個
   - **待辦**：風險與後續新方案記在 #469。方向包括：改由只做指派的獨立身分處理，等官方提供 Agent 預設權限後改用官方做法並移除這筆 IAM，以及指派前先確認目標是本 project 的 Agent 身分。
   - dev 不在這次範圍內；dev 新增 Agent 的角色仍由部署線手動指派。（已被下方 2026-10-15 修訂取代：dev 也延伸，不再手動。）
   - **修訂（Neal 2026-10-15）**：同一筆受限 RBAC Administrator 例外延伸到 dev，也延伸到 azd 新環境並預設開啟（`FA_ENABLE_AGENT_ONBOARDING` 預設 `true`，`infra/azd/main.parameters.json`）；範圍、條件與剩餘風險同上，各環境只限自己的 project。azd 環境可用 `azd env set FA_ENABLE_AGENT_ONBOARDING false` 關掉。#469 的風險追蹤不變。
+  - **修訂（Neal 2026-10-24，總協調工作階段問「＋」新增的 Agent 怎麼處理時回答，原文：「委派延伸到帳號層，只限這一個角色」）**：azd 的 `private` 模式且記憶用 Cosmos（`FA_MEMORY_BACKEND=cosmos`，[ADR-0011](0011-private-mode-cosmos-memory.md)）時，Embedding 必須打 Foundry **account** 根路徑（#971，project 路徑會 404），只有 project 角色的 Agent 身分無法 embed，記憶的讀寫都會失敗。因此 API 身分在該環境的 Foundry account 上**另取得一筆** Role Based Access Control Administrator（`infra/shared-context/account-onboarding-delegation.bicep`），ABAC 條件與上面 project 那筆同一格式，但只允許新增 **Cognitive Services OpenAI User** 一個角色、只能給 ServicePrincipal、一律不能刪除。「＋」在兩個 project 角色之後，再把這個角色指派在 account 上（`behavior_agent_setup.roles_pending`）。`public`、記憶關閉或 `FA_ENABLE_AGENT_ONBOARDING=false` 都不建這筆委派，也不送這個請求。剩餘風險：API 身分被盜用時，對方可以把 OpenAI User 給該 account 上任何 service principal，能用 account 上所有已部署的模型，也能讀該 account 下各 project 的 OpenAI 資料（上傳的檔案、保存的 responses 等；azd 每個 account 只有一個 project）；但每個 azd 環境有自己的 account，碰不到 dev、stage 或共用 account，也不能刪除既有指派。#469 的風險追蹤不變。
 
 ### 2. 每個 Agent 一台 VM，取代每個對話一台
 

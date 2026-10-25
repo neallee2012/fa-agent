@@ -11,7 +11,7 @@ import shared_context.behavior_agent_onboarding as onboarding
 from shared_context.behavior_agent_message_api import public_agents
 from shared_context.behavior_agent_onboarding import FoundryCallError, derived_names, onboarding_status, pending_key
 from shared_context.behavior_agent_retire import (
-    STUCK_ONBOARDING_SECONDS, AgentRoleAssignments, preview, preview_failed, retire, retire_failed,
+    STUCK_ONBOARDING_SECONDS, AgentRoleAssignments, _cleanup, preview, preview_failed, retire, retire_failed,
 )
 from shared_context.behavior_agent_setup import FOUNDRY_USER, OPENAI_USER
 from shared_context.behavior_migration import MigrationStore, _quiescence, installed_origin
@@ -165,6 +165,43 @@ def test_an_agent_already_gone_on_foundry_gets_its_tombstone(team_agent):
                             reason="dev test agent deleted on Foundry 2026-10-15", confirm=case.target.agent_id)
     assert tombstone_only == {"agent_id": case.target.agent_id, "state": "ok",
                               "tombstone": {**result["tombstone"], "outcome": "already_retired"}}
+
+
+def test_the_account_scope_openai_user_is_removed_only_with_the_account_role(team_agent, monkeypatch):
+    # ADR-0006 2026-10-24: "+" with FA_ONBOARDING_ACCOUNT_ROLE=true also assigned OpenAI User on the account; retire
+    # removes exactly that one (this principal, that role, the account), never another role or principal there.
+    case = team_agent
+    composition = _operator(case)
+    account_scope = SCOPE.rsplit("/projects/", 1)[0]
+    items = _arm_items() + [_assignment("fa-openai-account", AGENT_OID, OPENAI_USER, scope=account_scope),
+                            _assignment("account-foundry-user", AGENT_OID, FOUNDRY_USER, scope=account_scope),
+                            _assignment("other-account", OTHER_AGENT_OID, OPENAI_USER, scope=account_scope)]
+    credential = SimpleNamespace(get_token=lambda scope: SimpleNamespace(token="arm-token"))
+
+    def ids(entries):
+        return sorted(item["id"].rsplit("/", 1)[-1] for item in entries)
+
+    off = AgentRoleAssignments(credential, SCOPE, transport=httpx.MockTransport(FakeArm(items)))
+    targets, kept = off.list(AGENT_OID)
+    assert ids(targets) == ["fa-openai", "fa-user"]
+    assert ids(kept) == ["account-foundry-user", "fa-openai-account", "parent", "reader"]
+    arm = FakeArm(items)
+    roles = AgentRoleAssignments(credential, SCOPE, account=True, transport=httpx.MockTransport(arm))
+    result = retire(composition, case.c.human, agent_id=case.target.agent_id, request_id="retire-account",
+                    reason="dev test agent", confirm=case.target.agent_id, foundry=FakeFoundry(), roles=roles,
+                    now=lambda: NOW)
+    assert result["state"] == "ok"
+    assert [(item["id"].rsplit("/", 1)[-1], item["outcome"]) for item in result["role_assignments"]] == [
+        ("fa-user", "deleted"), ("fa-openai", "deleted"), ("fa-openai-account", "deleted")]
+    assert ids(result["kept_role_assignments"]) == ["account-foundry-user", "parent", "reader"]
+    assert ids(arm.items) == ["account-foundry-user", "other-account", "other-agent", "parent", "reader"]
+    # The CLI turns it on from the API's own FA_ONBOARDING_ACCOUNT_ROLE, like the onboarding PUT.
+    endpoint_scope = SCOPE.replace("/accounts/fa-account/", "/accounts/synthetic/")
+    cli = SimpleNamespace(**vars(composition), clients=[SimpleNamespace(credential=credential)])
+    for value, account in (("", None), ("true", endpoint_scope.rsplit("/projects/", 1)[0].lower())):
+        monkeypatch.setenv("FA_ONBOARDING_ACCOUNT_ROLE", value)
+        _, chosen = _cleanup(cli, case.target.agent_id, endpoint_scope)
+        assert (chosen.scope, chosen.account) == (endpoint_scope, account)
 
 
 def test_foundry_cleanup_is_refused_when_another_roster_agent_has_the_same_project_and_name(team_agent):

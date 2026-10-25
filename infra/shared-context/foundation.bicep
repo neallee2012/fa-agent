@@ -24,6 +24,17 @@ param foundryDeploymentPrefix string = 'shared-context'
 param registryConnectionName string = 'poc-container-registry'
 @description('Opt-in NAT egress for snet-api (see private-state-network.bicep); keep true where it was deployed.')
 param apiSubnetNatEgress bool = false
+@description('false: the VNet (private-state-network.bicep) was deployed before this template, as infra/azd/main.bicep does to create it before the Foundry account (ADR-0010). The default deploys it here, as the manual flow and stage always have.')
+param createNetwork bool = true
+@allowed(['public', 'private'])
+@description('ADR-0010 FA_NETWORK_MODE of the VNet this template deploys (createNetwork). Run alone on an azd private environment it must be private, or this VNet update drops snet-agents and 192.168.97.0/24.')
+param networkMode string = 'public'
+@description('ADR-0010 phase 2b (an existing VNet, infra/azd/main.bicep): the subnet IDs and the VNet ID to use instead of vnetName. Empty keeps vnetName and the FA subnet names.')
+param apiSubnetResourceId string = ''
+param privateEndpointSubnetResourceId string = ''
+param vnetResourceId string = ''
+@description('false (FA_DNS_MODE=existing): no Table private DNS zone, VNet link or zone group; the user serves the name.')
+param privateDnsZones bool = true
 
 resource foundry 'Microsoft.CognitiveServices/accounts@2025-06-01' existing = {
   scope: resourceGroup(foundryResourceGroupName)
@@ -54,7 +65,7 @@ module apiEnvironment 'br/public:avm/res/app/managed-environment:0.16.0' = {
     enableTelemetry: false
     publicNetworkAccess: 'Enabled'
     zoneRedundant: false
-    infrastructureSubnetResourceId: privateStateNetwork.outputs.apiSubnetId
+    infrastructureSubnetResourceId: apiSubnetResourceId == '' ? resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'snet-api') : apiSubnetResourceId
     // Keyless Azure Monitor route: the legacy 'log-analytics' destination ingests with the workspace shared key
     // (HTTP Data Collector API, support ended 2026-09-14), which a workspace with local auth disabled rejects.
     // https://learn.microsoft.com/azure/container-apps/migrate-logs-azure-monitor
@@ -81,6 +92,9 @@ module apiEnvironment 'br/public:avm/res/app/managed-environment:0.16.0' = {
       }
     ]
   }
+  dependsOn: [
+    privateStateNetwork
+  ]
 }
 
 module storage 'br/public:avm/res/storage/storage-account:0.33.0' = {
@@ -123,14 +137,64 @@ module storage 'br/public:avm/res/storage/storage-account:0.33.0' = {
   }
 }
 
-module privateStateNetwork './private-state-network.bicep' = {
+module privateStateNetwork './private-state-network.bicep' = if (createNetwork) {
   name: 'shared-context-private-state-network'
   params: {
     location: location
     tags: tags
-    storageResourceId: storage.outputs.resourceId
     vnetName: vnetName
     apiSubnetNatEgress: apiSubnetNatEgress
+    networkMode: networkMode
+  }
+}
+
+module tableDns 'br/public:avm/res/network/private-dns-zone:0.8.1' = if (privateDnsZones) {
+  name: 'shared-context-table-dns'
+  params: {
+    name: 'privatelink.table.${environment().suffixes.storage}'
+    tags: tags
+    enableTelemetry: false
+    virtualNetworkLinks: [
+      {
+        name: 'facontext-api-link'
+        virtualNetworkResourceId: vnetResourceId == '' ? resourceId('Microsoft.Network/virtualNetworks', vnetName) : vnetResourceId
+        registrationEnabled: false
+      }
+    ]
+  }
+  dependsOn: [
+    privateStateNetwork
+  ]
+}
+
+module tableEndpoint 'br/public:avm/res/network/private-endpoint:0.12.1' = {
+  name: 'shared-context-table-private-endpoint'
+  params: {
+    name: 'pe-facontext-table'
+    location: location
+    tags: tags
+    enableTelemetry: false
+    subnetResourceId: privateEndpointSubnetResourceId == '' ? resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'snet-private-endpoints') : privateEndpointSubnetResourceId
+    privateLinkServiceConnections: [
+      {
+        name: 'facontext-table'
+        properties: {
+          privateLinkServiceId: storage.outputs.resourceId
+          groupIds: [
+            'table'
+          ]
+        }
+      }
+    ]
+    privateDnsZoneGroup: privateDnsZones ? {
+      name: 'default'
+      privateDnsZoneGroupConfigs: [
+        {
+          name: 'table'
+          privateDnsZoneResourceId: tableDns!.outputs.resourceId
+        }
+      ]
+    } : null
   }
 }
 

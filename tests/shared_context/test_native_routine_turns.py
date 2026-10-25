@@ -1,8 +1,18 @@
-"""Real official local admission; only SDK/model I/O is synthetic."""
+"""Real official local admission; only SDK/model I/O is synthetic.
+
+Since 2026-10-23 a run carries no command CID and names its own conversation in ``routine.conversation_id``. An image
+before that change cannot receive it: its ``NativeRoutineOrigin.check_command`` requires the command CID to equal the
+origin's, so it refuses the run (422) and the API clock sends the same RID again next minute. That is why API and Hosted
+change together, and why the change is one-way (the README's native-routine-fresh-conversation section).
+"""
+
+from datetime import timedelta
 
 import pytest
 
-from shared_context.behavior_native_turn_wire import NativeAgentCommand, NativeHistory, NativeRoutineSubmit
+from shared_context.behavior_native_turn_wire import (
+    NativeAgentCommand, NativeHistory, NativeReceivedPage, NativeReceivedRead, NativeRoutineSubmit,
+)
 from shared_context.errors import Problem
 from test_native_routine_wire import routine_origin
 from test_native_turn_wire import capture, submit
@@ -66,3 +76,40 @@ def test_routine_text_is_not_recalled_or_saved_as_the_humans_private_memory(harn
     assert recalled.observation.reason == "scope_not_applicable"
     harness.call(memory.completed, scheduled, harness.runtime)
     assert sent == []
+
+
+def fresh_run(cid, day):
+    """A run since 2026-10-23: no command CID; its origin names the conversation the API opened for it."""
+    origin = routine_origin()
+    source = origin.model_copy(update={
+        "agent_id": IDENTITY.agent_id, "conversation_id": cid,
+        "occurrence": origin.occurrence.model_copy(update={
+            "scheduled_for": origin.occurrence.scheduled_for + timedelta(days=day)})})
+    return NativeRoutineSubmit(
+        command=NativeAgentCommand(request_id=source.request_id, content="Read the original work."),
+        capture=capture(), routine=source)
+
+
+def test_each_run_opens_its_own_conversation_and_starts_without_the_previous_runs_history(harness, monkeypatch):
+    monkeypatch.setenv("FA_NATIVE_ROUTINES_ENABLED", "1")
+    runs = (fresh_run("run-cid-1", 0), fresh_run("run-cid-2", 1))
+    for request in runs:
+        assert harness.invoke(request).status_code == 202
+        done = harness.wait(request.command.request_id, "completed")
+        assert (done.conversation_id, done.turn_number, done.routine) == (
+            request.routine.conversation_id, 1, request.routine)
+    # Run 2's SDK turn started with no checkpoint: none of run 1's history reached its first model call.
+    assert [call[:3] for call in harness.sdk.calls] == [
+        (runs[0].command.request_id, "run-cid-1", None), (runs[1].command.request_id, "run-cid-2", None)]
+    page = harness.call(harness.runtime.history, NativeHistory(conversation_id="run-cid-2"))
+    assert [turn.request_id for turn in page.turns] == [runs[1].command.request_id]
+    # A retried dispatch of the same run reads its original; no second conversation or SDK turn.
+    again = harness.invoke(runs[1])
+    assert again.json()["conversation_id"] == "run-cid-2" and len(harness.sdk.calls) == 2
+    # The owner's workbench finds each run as its own conversation in the received listing.
+    listed = NativeReceivedPage.model_validate_json(harness.invoke(NativeReceivedRead()).content)
+    assert listed.items == ()
+    assert sorted((item.request_id, item.conversation_id, item.routine_id, item.scheduled_for, item.status)
+                  for item in listed.routine_runs) == sorted(
+        (run.command.request_id, run.routine.conversation_id, "daily-summary", run.routine.occurrence.scheduled_for,
+         "completed") for run in runs)

@@ -1,8 +1,8 @@
 """A toolbox that cannot list its tools leaves only itself out of the turn (Neal 2026-10-10).
 
 「工具列不出來時，這一回合少那個工具照常跑，並在畫面上講明」: the turn runs, that toolbox's captured tools only report
-``NATIVE_TOOLBOX_UNAVAILABLE`` and send nothing, the turn's assembly record names the source for the workbench, and the
-next turn lists it again. A toolbox's own definite refusal and the capture checks after a list still refuse the turn.
+``NATIVE_TOOLBOX_UNAVAILABLE`` and send nothing, the turn's assembly record names the source for the workbench, and a
+turn within the backoff reuses that failure (README#toolbox-list-backoff) before one lists it again. A toolbox's own definite refusal and the capture checks after a list still refuse the turn.
 
 Offline: the real native executor, Hosted routes and State store doubles from the existing harness; the toolbox is an
 httpx MockTransport and the SDK an offline double. ``STAGE_WEBIQ_401`` is the -32006 message a read-only stage
@@ -12,6 +12,7 @@ toolbox tools/list returned on 2026-10-10 (ids redacted); ``UPSTREAM_401`` is a 
 import asyncio
 import json
 import logging
+from contextlib import AsyncExitStack
 
 import httpx
 import pytest
@@ -20,7 +21,9 @@ from shared_context import native_toolbox
 from shared_context.behavior_capabilities import CapabilityCapture, available_grants
 from shared_context.errors import Problem
 from shared_context.native_assembly import NativeAssemblyCollector
-from shared_context.behavior_native_turn_wire import NativeSubmit
+from shared_context.native_capabilities import bind_capabilities
+from shared_context.behavior_native_turn_wire import NativePrewarmToolbox, NativeSubmit
+from shared_context.behavior_timing import timing_id
 from shared_context.m2_copilot import ToolFailure
 from test_m3_auth import jwk_client, signing_key  # noqa: F401
 from test_native_assembly import install_executor, offline_sdk, run_turn
@@ -28,11 +31,13 @@ from test_native_hitl import hitl  # noqa: F401
 from test_native_hitl_attention import attention  # noqa: F401
 from test_native_responses import response_submit, responses  # noqa: F401
 from shared_context.tool_catalog import build_catalog, parse_entry_file
-from test_native_toolbox import ENDPOINT, GRANT, TOOLBOX, Toolbox, bind_on, call, context, methods
+from test_native_toolbox import (CONSENT_URL, ENDPOINT, GRANT, OTHER_GRANT, TOOLBOX, Toolbox, bind_on, call,
+                                 consent_error, context, methods, unconnected)
 from test_native_toolbox_approval import packet, permit, setup
 from test_native_toolbox_parallel import boundary
 from test_native_turns import local_env  # noqa: F401
-from test_connector_consent import page
+from test_connector_consent import card, click, not_connected, page
+from test_native_prewarm import Gated
 
 UPSTREAM_TEXT = "auth_invalid_api_key UPSTREAM-CANARY-5d1"
 # One failed source, an upstream 401, and a link that is not a consent link.
@@ -156,21 +161,346 @@ def test_a_toolbox_refusal_or_a_capture_mismatch_still_refuses_the_turn(response
     assert refused.assembly.unavailable_sources == ()
 
 
-def test_a_failed_listing_is_not_kept_and_the_next_turn_lists_the_toolbox_again():
+class Clock:
+    """A fake monotonic clock for the listing backoff (README#toolbox-list-backoff); no sleeps."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def recorded(rid):
+    ctx = context(rid=rid)
+    ctx.receipt.capture_digest = "0" * 64
+    ctx.assembly = NativeAssemblyCollector(ctx.receipt)
+    return ctx
+
+
+def backoff_skips(caplog):
+    return [json.loads(record.getMessage().removeprefix("FA_TIMING ")) for record in caplog.records
+            if record.getMessage().startswith("FA_TIMING ") and "native_bind_toolbox_list_backoff" in record.getMessage()]
+
+
+def test_a_failed_listing_is_remembered_for_the_backoff_and_listed_again_after_it(caplog):
+    caplog.set_level(logging.WARNING)
+    clock, backoff = Clock(), native_toolbox.LIST_FAILURE_BACKOFF_SECONDS
+    assert backoff == 60.0
     toolbox = answering(Toolbox(), "tools/list", lambda body: httpx.Response(503))
-    provider = native_toolbox.toolbox_provider(transport=toolbox.transport)
-    first = bind_on(provider, context())
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    turns = [recorded("rid-1")]
+    first = bind_on(provider, turns[0])
     with pytest.raises(ToolFailure) as left_out:
         call(first["WebIQ-web"], {"search_query": "fa"}, "first-turn")
+    # The first failing turn is unchanged: one listing, left out, named, and nothing skipped.
     assert left_out.value.public_code == "NATIVE_TOOLBOX_UNAVAILABLE"
-    # One listing only in the failed turn: no retry loop.
+    assert methods(toolbox).count("tools/list") == 1 and backoff_skips(caplog) == []
+    clock.now += backoff - 1
+    turns.append(recorded("rid-2"))
+    second = bind_on(provider, turns[1])
+    # Inside the backoff: no listing, the same degradation, the same reason, and an exported FA_TIMING marker.
     assert methods(toolbox).count("tools/list") == 1
+    assert {name: spec.description for name, spec in second.items()} == {
+        "WebIQ-web": UNAVAILABLE_DESCRIPTION, "WebIQ-browse": UNAVAILABLE_DESCRIPTION}
+    with pytest.raises(ToolFailure) as left_out:
+        call(second["WebIQ-web"], {"search_query": "fa"}, "second-turn")
+    assert left_out.value.public_code == "NATIVE_TOOLBOX_UNAVAILABLE" and toolbox.calls == []
+    assert [[item.model_dump(mode="json") for item in ctx.assembly.snapshot().unavailable_sources] for ctx in turns] \
+        == [[{"entry_id": "WebIQ", "source": "WebIQ", "code": "TOOLBOX_LIST_FAILED", "reason": "service_error"}]] * 2
+    assert left_out_lines(caplog) == [
+        f"FA_NATIVE_TOOL_SOURCE_UNAVAILABLE agent_id=fa-agent-1 request_id={rid} entry=WebIQ "
+        "code=TOOLBOX_LIST_FAILED reason=service_error" for rid in ("rid-1", "rid-2")]
+    skips = backoff_skips(caplog)
+    assert len(skips) == 1 and skips[0]["outcome"] == "returned" and skips[0]["job_id"] == timing_id("rid-2")
+    # Once the backoff ends, the next turn lists again and the toolbox is back without a restart.
+    clock.now += 1
     toolbox.broken = False
-    second = bind_on(provider, context(rid="rid-2"))
-    assert second["WebIQ-web"].description == "Search the web"
-    assert json.loads(call(second["WebIQ-web"], {"search_query": "fa"}, "second-turn").text)["text"] == "found\ncited"
+    third = bind_on(provider, context(rid="rid-3"))
+    assert third["WebIQ-web"].description == "Search the web"
+    assert json.loads(call(third["WebIQ-web"], {"search_query": "fa"}, "third-turn").text)["text"] == "found\ncited"
     assert methods(toolbox).count("tools/list") == 2
-    assert toolbox.calls == [{"name": "WebIQ___web", "arguments": {"search_query": "fa"}}]
+    # Listed again, the version binds from its kept list: a later broken toolbox is not consulted.
+    toolbox.broken = True
+    assert bind_on(provider, context(rid="rid-4"))["WebIQ-web"].description == "Search the web"
+    assert methods(toolbox).count("tools/list") == 2 and len(backoff_skips(caplog)) == 1
+
+
+def test_a_prewarm_inside_the_backoff_still_lists_and_its_success_ends_the_backoff():
+    clock = Clock()
+    toolbox = answering(Toolbox(), "tools/list", lambda body: httpx.Response(503))
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    bind_on(provider, context())
+    toolbox.broken = False
+    clock.now += 1
+    # The owner types: the prewarm lists off the turn's path even inside the backoff, and recovers the toolbox.
+    asyncio.run(provider.warm(lambda: "agent-token", (NativePrewarmToolbox(toolbox="fa-org-tools"),)))
+    assert methods(toolbox).count("tools/list") == 2
+    tools = bind_on(provider, context(rid="rid-2"))
+    assert tools["WebIQ-web"].description == "Search the web" and methods(toolbox).count("tools/list") == 2
+
+
+def test_a_failed_prewarm_does_not_start_a_backoff():
+    clock = Clock()
+    toolbox = answering(Toolbox(), "tools/list", lambda body: httpx.Response(503))
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    asyncio.run(provider.warm(lambda: "agent-token", (NativePrewarmToolbox(toolbox="fa-org-tools"),)))
+    toolbox.broken = False
+    # Only a turn's own failed listing starts one: the first turn after a failed prewarm lists as before.
+    assert bind_on(provider, context())["WebIQ-web"].description == "Search the web"
+    assert methods(toolbox).count("tools/list") == 2
+
+
+def test_a_connection_need_is_remembered_for_the_backoff_too(caplog):
+    caplog.set_level(logging.WARNING)
+    clock = Clock()
+    toolbox = unconnected(Toolbox(), "tools/list", consent_error)
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    for rid in ("rid-1", "rid-2"):
+        tools = bind_on(provider, context(rid=rid))
+        with pytest.raises(ToolFailure) as failed:
+            call(tools["WebIQ-web"], {}, "call-" + rid)
+        assert failed.value.public_code == "NATIVE_CONNECTOR_NOT_CONNECTED"
+        assert tools["WebIQ-web"].description.startswith("Not connected for this assistant: WebIQ.")
+        clock.now += 1
+    assert methods(toolbox).count("tools/list") == 1 and len(backoff_skips(caplog)) == 1
+    assert CONSENT_URL not in caplog.text and toolbox.calls == []
+
+
+def test_the_backoff_never_reaches_another_toolbox_or_another_agent():
+    clock = Clock()
+    toolbox = unconnected(Toolbox(), "tools/list", lambda body: httpx.Response(503))
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    assert bind_on(provider, context())["WebIQ-web"].description == UNAVAILABLE_DESCRIPTION
+    # Another toolbox in the same process (the same Agent) lists as usual inside the window.
+    assert bind_on(provider, context(grants=(OTHER_GRANT,), rid="rid-2"))["Other-web"].description == "Another source"
+    assert methods(toolbox).count("tools/list") == 2
+    # Another Agent is another Hosted process, so another provider: it lists the toolbox itself.
+    healthy = Toolbox()
+    other_agent = native_toolbox.toolbox_provider(transport=healthy.transport, clock=clock)
+    assert bind_on(other_agent, context(rid="rid-3"))["WebIQ-web"].description == "Search the web"
+    assert methods(healthy).count("tools/list") == 1
+
+
+def switchable(reply):
+    """``answering`` with a reply the test can swap between turns."""
+    replies = [reply]
+    return answering(Toolbox(), "tools/list", lambda body: replies[0](body)), replies
+
+
+def connect_turn(hitl, tmp_path, provider, toolbox, before_click):
+    """One owner turn on ``fa-org-tools`` whose Connect card is answered 「我連好了，繼續」 once; returns its tools or its
+    refusal."""
+    case = setup(hitl, tmp_path, "never", toolbox=toolbox, provider=provider)
+
+    async def check():
+        binding = asyncio.create_task(case.bind())
+        item = (await card(case)).json()["attention"][0]
+        before_click()
+        assert click(hitl, item).status_code == 200
+        try:
+            return await binding
+        except Problem as refused:
+            return refused
+        finally:
+            await case.gate.close()
+    return asyncio.run(check())
+
+
+def test_a_connect_success_clears_every_remembered_connection_need_in_the_provider(hitl, tmp_path):
+    clock = Clock()
+    toolbox, _ = switchable(not_connected)
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    # A turn nobody can answer (relay, Agent, routine) remembers both toolboxes' connection need.
+    both = bind_on(provider, context(grants=(OTHER_GRANT, GRANT)))
+    assert both["WebIQ-web"].description.startswith("Not connected")
+    assert both["Other-web"].description.startswith("Not connected") and methods(toolbox).count("tools/list") == 2
+    clock.now += 1
+    # The owner connects in another conversation's card for fa-org-tools; its re-list never reads the backoff.
+    tools = connect_turn(hitl, tmp_path, provider, toolbox, lambda: setattr(toolbox, "broken", False))
+    assert tools["WebIQ-web"].description == "Search the web" and methods(toolbox).count("tools/list") == 3
+    clock.now += 1
+    # Inside the window the next turn binds both: fa-org-tools from its kept list, fa-other-tools listed again.
+    both = bind_on(provider, context(grants=(OTHER_GRANT, GRANT), rid="rid-3"))
+    assert both["WebIQ-web"].description == "Search the web" and both["Other-web"].description == "Another source"
+    assert methods(toolbox).count("tools/list") == 4
+
+
+def test_a_cleared_need_on_a_toolbox_still_unconnected_is_listed_once_and_remembered_again(hitl, tmp_path):
+    clock = Clock()
+    # fa-other-tools stays unconnected; fa-org-tools is unconnected only until the owner's click.
+    toolbox = unconnected(Toolbox(), "tools/list", not_connected, name="fa-other-tools")
+    toolbox.handle = toolbox.transport.handler
+    toolbox = answering(toolbox, "tools/list", not_connected)
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+
+    def other_lists():
+        return sum(body["method"] == "tools/list" and "/fa-other-tools/" in request.url.path
+                   for request, body in toolbox.requests)
+    bind_on(provider, context(grants=(OTHER_GRANT, GRANT)))
+    assert other_lists() == 1
+    clock.now += 1
+    # The owner connects fa-org-tools only; its success also clears fa-other-tools' remembered need.
+    tools = connect_turn(hitl, tmp_path, provider, toolbox, lambda: setattr(toolbox, "broken", False))
+    assert tools["WebIQ-web"].description == "Search the web" and other_lists() == 1
+    for rid in ("rid-3", "rid-4"):
+        clock.now += 1
+        # rid-3 lists fa-other-tools once and remembers its need again; rid-4, inside that window, does not list it.
+        both = bind_on(provider, context(grants=(OTHER_GRANT, GRANT), rid=rid))
+        assert both["Other-web"].description.startswith("Not connected for this assistant: Other.")
+        assert both["WebIQ-web"].description == "Search the web" and other_lists() == 2
+
+
+def test_an_explicit_refusal_of_the_connect_relist_drops_the_remembered_need(hitl, tmp_path):
+    clock = Clock()
+    toolbox, replies = switchable(not_connected)
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    bind_on(provider, context())
+    clock.now += 1
+    # The card turn reuses the remembered need, then its re-list gets the toolbox's own 403: the turn is refused.
+    refused = connect_turn(hitl, tmp_path, provider, toolbox,
+                           lambda: replies.__setitem__(0, lambda body: httpx.Response(403)))
+    assert isinstance(refused, Problem) and methods(toolbox).count("tools/list") == 2
+    clock.now += 1
+    toolbox.broken = False
+    # Nothing is remembered from a refusal: the next turn inside the window lists again.
+    assert bind_on(provider, context(rid="rid-3"))["WebIQ-web"].description == "Search the web"
+    assert methods(toolbox).count("tools/list") == 3
+
+
+def test_a_connect_relist_that_cannot_list_is_remembered_like_a_turn_listing(hitl, tmp_path):
+    clock = Clock()
+    toolbox, replies = switchable(not_connected)
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    bind_on(provider, context())
+    clock.now += 1
+    tools = connect_turn(hitl, tmp_path, provider, toolbox,
+                         lambda: replies.__setitem__(0, lambda body: httpx.Response(503)))
+    assert tools["WebIQ-web"].description == UNAVAILABLE_DESCRIPTION and methods(toolbox).count("tools/list") == 2
+    clock.now += 1
+    ctx = recorded("rid-3")
+    # The next turn reuses the re-list's service_error without listing, so without another card.
+    assert bind_on(provider, ctx)["WebIQ-web"].description == UNAVAILABLE_DESCRIPTION
+    assert methods(toolbox).count("tools/list") == 2
+    assert [item.reason for item in ctx.assembly.snapshot().unavailable_sources] == ["service_error"]
+
+
+def test_an_identity_token_failure_is_not_remembered(caplog):
+    caplog.set_level(logging.WARNING)
+    clock = Clock()
+    toolbox = Toolbox()
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    # The default version is read with a token; only the listing's token is invalid, as in a blip.
+    tokens = iter(["agent-token-0"])
+    ctx = recorded("rid-1")
+    ctx.model_token_provider = lambda: next(tokens, "")
+    assert bind_on(provider, ctx)["WebIQ-web"].description == UNAVAILABLE_DESCRIPTION
+    assert [item.reason for item in ctx.assembly.snapshot().unavailable_sources] == ["identity_unavailable"]
+    assert methods(toolbox).count("tools/list") == 0
+    clock.now += 1
+    # This VM's token, not the toolbox: the next turn inside the window lists as usual.
+    assert bind_on(provider, context(rid="rid-2"))["WebIQ-web"].description == "Search the web"
+    assert methods(toolbox).count("tools/list") == 1 and backoff_skips(caplog) == []
+
+
+def prewarm_waits(monkeypatch):
+    """Set when a turn starts waiting for the prewarm in flight: a deterministic point for the test, no sleep."""
+    waiting = asyncio.Event()
+
+    class Asyncio:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        @staticmethod
+        async def wait(fs, **kwargs):
+            waiting.set()
+            return await asyncio.wait(fs, **kwargs)
+    monkeypatch.setattr(native_toolbox, "asyncio", Asyncio())
+    return waiting
+
+
+def warm_org(provider):
+    return asyncio.ensure_future(provider.warm(lambda: "agent-token", (NativePrewarmToolbox(toolbox="fa-org-tools"),)))
+
+
+def test_a_turn_waits_for_an_inflight_prewarm_before_the_backoff_and_its_success_wins(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    clock = Clock()
+    toolbox = Toolbox()
+    gated = Gated(toolbox)
+    gated.refuse = 1
+    provider = native_toolbox.toolbox_provider(transport=gated, clock=clock)
+    waiting = prewarm_waits(monkeypatch)
+
+    async def run():
+        gated.listing, gated.release = asyncio.Event(), asyncio.Event()
+        gated.release.set()
+        async with AsyncExitStack() as stack:
+            # The turn's own listing gets a 503: remembered for the backoff.
+            await bind_capabilities(context(), (provider,), stack)
+        clock.now += 1
+        gated.listing.clear()
+        gated.release.clear()
+        warming = warm_org(provider)
+        await gated.listing.wait()
+        async with AsyncExitStack() as stack:
+            binding = asyncio.ensure_future(bind_capabilities(context(rid="rid-2"), (provider,), stack))
+            await waiting.wait()
+            # Inside the backoff, the turn still waits for the prewarm in flight.
+            assert not binding.done()
+            gated.release.set()
+            bindings = await binding
+        await warming
+        return {spec.name: spec.description for item in bindings for spec in item.tools}
+    assert asyncio.run(run()) == {"WebIQ-web": "Search the web", "WebIQ-browse": "Browse a page"}
+    assert methods(toolbox).count("tools/list") == 2 and backoff_skips(caplog) == []
+
+
+class TimingOut(Gated):
+    """``Gated``, whose every ``tools/list`` times out once released: the slow failure a timeout leaves."""
+
+    async def handle_async_request(self, request):
+        await request.aread()
+        if request.method == "POST" and json.loads(request.content)["method"] == "tools/list":
+            self.toolbox.requests.append((request, json.loads(request.content)))
+            self.listing.set()
+            await self.release.wait()
+            raise httpx.ReadTimeout("tools/list timed out", request=request)
+        return self.toolbox.handle(request)
+
+
+def test_a_turn_started_inside_the_backoff_reuses_it_when_the_window_ends_during_a_failed_prewarm(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    clock, toolbox = Clock(), Toolbox()
+    slow = TimingOut(toolbox)
+    provider = native_toolbox.toolbox_provider(transport=slow, clock=clock)
+    waiting = prewarm_waits(monkeypatch)
+    turns = [recorded("rid-1"), recorded("rid-2")]
+
+    async def run():
+        slow.listing, slow.release = asyncio.Event(), asyncio.Event()
+        slow.release.set()
+        async with AsyncExitStack() as stack:
+            # The turn's own listing times out: remembered as network for the backoff.
+            await bind_capabilities(turns[0], (provider,), stack)
+        clock.now += 1
+        slow.listing.clear()
+        slow.release.clear()
+        warming = warm_org(provider)
+        await slow.listing.wait()
+        async with AsyncExitStack() as stack:
+            binding = asyncio.ensure_future(bind_capabilities(turns[1], (provider,), stack))
+            await waiting.wait()
+            # The window ends while the turn waits for the slow prewarm, which then times out too.
+            clock.now += native_toolbox.LIST_FAILURE_BACKOFF_SECONDS
+            slow.release.set()
+            bindings = await binding
+        await warming
+        return {spec.name: spec.description for item in bindings for spec in item.tools}
+    assert asyncio.run(run()) == {"WebIQ-web": UNAVAILABLE_DESCRIPTION, "WebIQ-browse": UNAVAILABLE_DESCRIPTION}
+    # The first turn's listing and the prewarm's only: after the wait the turn reused the failure instead of listing.
+    assert methods(toolbox).count("tools/list") == 2 and len(backoff_skips(caplog)) == 1
+    assert [[item.reason for item in ctx.assembly.snapshot().unavailable_sources] for ctx in turns] == [["network"]] * 2
 
 
 @pytest.mark.parametrize("failure", sorted(SOURCE_FAILURES))

@@ -55,6 +55,8 @@ class ConnectorRef(WireModel):
     write: ConnectorEntry
     revoke_url: str
     disclosure: str
+    # False: FA_NETWORK_MODE=private refuses adding or re-enabling it (ADR-0010).
+    private_network: bool = True
 
     @model_validator(mode="after")
     def distinct_entries(self):
@@ -95,6 +97,8 @@ TEAMS = ConnectorRef(
     revoke_url="https://entra.microsoft.com",
     disclosure=("Microsoft Teams 經 Work IQ 連線。Agent 能讀取的不只 Teams，也可能包含你的 Microsoft 365 "
                 "郵件與檔案。"),
+    # Work IQ is not supported in a network-isolated project (ADR-0010, toolbox network isolation docs).
+    private_network=False,
 )
 
 CONNECTORS = MappingProxyType({ref.id: ref for ref in (TEAMS,)})

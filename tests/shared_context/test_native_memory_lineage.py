@@ -1,5 +1,8 @@
 """MEM-05/07 (MEM-57a): native memory keeps the official receipt per RID and recalls bounded, dated, newest-first data.
 
+Newest-first recall and the Team note's memory_id run per backend in test_memory_backend_contract.py (ADR-0011 §8);
+this file keeps the private update receipt and chaining, which are Foundry's.
+
 Offline: official local store, named memory-service doubles; no network, model or token service.
 """
 
@@ -13,11 +16,10 @@ import pytest
 
 from shared_context import behavior_private_memory as memory
 from shared_context import native_team_memory as team
-from shared_context.behavior_native_turn_wire import TeamMemoryCapture, team_memory_scope
 from shared_context.native_checkpoint import open_durable_store
 from shared_context.native_private_memory import Claimed, NativePrivateMemory, claim_key, record_receipt
 from shared_context.native_turns import EFFECTS_STORE
-from test_native_team_memory import ENV, bodies, run_turn, token
+from test_native_team_memory import ENV, token
 from test_native_turns import local_env
 
 OCT_1 = 1790812800  # 2026-10-01T00:00:00Z
@@ -95,65 +97,6 @@ def test_a_failed_receipt_write_never_raises_or_overwrites_a_changed_claim(local
                                    "FA_PRIVATE_MEMORY_UPDATE"))
     assert effects_item(key).value["other"] == "kept" and "update_id" not in effects_item(key).value
     assert "receipt=not_recorded exception_type=" in caplog.text and "receipt=not_recorded reason=no_etag" in caplog.text
-
-
-def test_a_shared_team_note_keeps_its_official_memory_id(local_env, monkeypatch, tmp_path):
-    sent = []
-    run_turn(monkeypatch, tmp_path, sent)
-    assert len(bodies(sent, "/items")) == 1
-    item = effects_item(team.claim_key("rid-1"))
-    assert item.value["memory_id"] == "m1" and item.value["kind"] == "fa-team-note-claim-v1"
-
-
-def search_service(sent, memories):
-    def handle(request):
-        sent.append(request)
-        return httpx.Response(200, json={"search_id": "s1", "usage": {"embedding_tokens": 2}, "memories": [
-            {"memory_item": item} for item in memories]})
-    return httpx.MockTransport(handle)
-
-
-def configured(sent, memories):
-    return memory.PrivateMemory.from_environment(token, environ=ENV, transport=search_service(sent, memories))
-
-
-def test_recall_is_newest_first_dated_and_names_what_the_bound_left_out(caplog):
-    sent = []
-    found = [
-        {"memory_id": "a", "content": "The release window is Thursday", "updated_at": OCT_1},
-        {"memory_id": "b", "content": "undated item keeps its search order", "updated_at": "not-unix"},
-        {"memory_id": "c", "content": "The release window is Friday", "updated_at": OCT_2},
-        {"memory_id": "d", "content": "x" * memory.MAX_MEMORY_CHARS, "updated_at": OCT_1 - 86400},
-    ]
-    with caplog.at_level(logging.WARNING):
-        recalled = asyncio.run(configured(sent, found).search("scope-1", "when", event="FA_PRIVATE_MEMORY_SEARCH",
-                                                              max_memories=5, max_recall_chars=160))
-    assert list(recalled) == ["[2026-10-02 00:00 UTC] The release window is Friday",
-                              "[2026-10-01 00:00 UTC] The release window is Thursday",
-                              "undated item keeps its search order"]
-    assert recalled.omitted == 1
-    assert 'omitted={"bound_chars": 1}' in caplog.text
-    prompt = memory.with_recalled("Q", recalled)
-    assert prompt.splitlines()[0] == memory.PREFIX
-    assert "(1 more found but omitted to stay within the size limit.)" in prompt and prompt.endswith("\n\nQ")
-    undated = asyncio.run(configured(sent, found[:1]).search("scope-1", "when", event="E", dated=False))
-    assert list(undated) == ["The release window is Thursday"] and undated.omitted == 0
-
-
-def test_team_notes_are_labeled_historical_and_newest_first(local_env):
-    create_effects_store()
-    sent = []
-    memories = team.NativeTeamMemory(configured(sent, [
-        {"memory_id": "old", "content": "[agent-a, 2026-10-01] deploy on Friday", "updated_at": OCT_1},
-        {"memory_id": "new", "content": "[agent-b, 2026-10-02] deploy on Monday instead", "updated_at": OCT_2},
-    ]), "OFFLINE-agent")
-    receipt = SimpleNamespace(source=None, human_origin=True, command=SimpleNamespace(content="when do we deploy"),
-                              capture=SimpleNamespace(team_memory=TeamMemoryCapture(scope=team_memory_scope("OFFLINE-tenant", "OFFLINE-team"))))
-    recalled = asyncio.run(memories.recall(receipt))
-    assert list(recalled) == ["note:new [agent-b, 2026-10-02] deploy on Monday instead",
-                              "note:old [agent-a, 2026-10-01] deploy on Friday"]
-    assert "may be outdated" in team.PREFIX and "newer time wins" in team.PREFIX
-    assert json.loads(sent[0].content)["options"] == {"max_memories": team.MAX_TEAM_MEMORIES}
 
 
 def seed_previous_turn(previous_update_id="upd_prev"):

@@ -175,6 +175,12 @@ def _send_after_reply(client, platform, admitted, *, advance, before_send, refus
             refused(error)
 
 
+def open_conversation(platform, *, before_send):
+    """A new Responses conversation's server-selected CID; it is part of the receipt and its digest."""
+    return (platform.create_conversation(before_send=before_send) if platform.mode == "conversation"
+            else "native-rsp-" + uuid4().hex)
+
+
 def submit_native_turn(composition, client, command, capture, *, before_send=None, source=None, original=None,
                        conversation=None, continuation=None, routine=None, defer=None):
     """One admitted original command, one CID slot, at most one Responses POST; no wait or new queue.
@@ -199,9 +205,10 @@ def submit_native_turn(composition, client, command, capture, *, before_send=Non
                 if profile == NATIVE_RESPONSES_PROFILE and not read_only else None)
     new_cid = None
     if profile == NATIVE_RESPONSES_PROFILE and command.conversation_id is None:
+        # A routine run's own conversation was opened before its intent was saved (native_routines.trigger).
         new_cid = (original.conversation_id if original is not None else
-                   platform.create_conversation(before_send=before_send) if platform.mode == "conversation"
-                   else "native-rsp-" + uuid4().hex)
+                   routine.conversation_id if routine is not None else
+                   open_conversation(platform, before_send=before_send))
     def build(state_profile):
         values = {"command": command, "capture": capture, "state_profile": state_profile, "new_conversation_id": new_cid}
         return (NativeContinuationSubmit(command=command, capture=capture, state_profile=state_profile, source=source,

@@ -1,8 +1,213 @@
 # FA 進度與交接狀態
 
-更新日期：2026-10-22。
+更新日期：2026-10-25。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="dev-test-v36-1025"></a>
+## 2026-10-25：第 36 版候選 dev 測試（main `d4d64fb9`，總協調）
+
+- **範圍與授權**：只動 dev，stage 沒動。程式碼是 `c0c30add`（#951～#980）；`git diff --stat c0c30add d4d64fb9` 只有 `deploy/dev/dev.json` 和 2 份文件（#981～#984）。dev 部署依 Neal 10-17 的常設批准。為了在 dev 先跑 #957 與 #969，總協調讓 dev B 的 Hosted 打開排程與排程提案（#983），A、B 打開群組（#983、#984）；這些旗標的值和 `stage.json` 的 A／B 相同（#983 review 逐項比對），A 的排程維持關閉。工作台 8765 只按「連線」，bridge 留在 10-20 的程式、沒重啟。證據是總協調的本機讀回，原始資料不在 repo，ID 只寫前綴。
+- **部署**：
+  - 3601（10-25 上午，`c0c30add`）：gate armed、pass、0 拒絕，八步都成功，API `…c0c30ad-r3601-1`。
+  - 3602、3603：只換 API（#981／#982 的時鐘來回，兩次都帶 3601 的 API digest）。
+  - 3604（`d4d64fb9`，沿用 3601 映像）：gate armed、pass、0 拒絕。sync、follow Succeeded。API `…d4d64fb-r3604-1` ready。Hosted 讀回 A v173、B v133，`FA_NATIVE_HITL_ENABLED`、`FA_RESPONSES_ENABLED` 沿用線上值，`FA_NATIVE_GROUPS_ENABLED=1`，B 的排程與提案為 `1`。第一次執行停在第一步 `check`（群組需要寫明 Responses，#984 補上），還沒進到 gate、sync 等寫入步驟。
+- **結論**：通過。#957 與 #969 在 dev 跑到；工作台那一側要等 stage 的 console 一起換版才看得到（見下）。
+
+| 項目 | 結果 | 說明 |
+|---|---|---|
+| 1 部署＋閘門 | PASS | 3601、3604 都 pass、0 拒絕 |
+| 2 #957 排程開新對話 | PASS | B 在對話裡提案、主人按「允許這次」，排程存為每日 20:40（Asia/Taipei），批准對話 `conv_0f64dd6ee7b…`。12:40:07Z API `FA_NATIVE_ROUTINE_CLOCK_DISPATCH … status=accepted`，12:41:03Z `completed`。這次執行在 `conv_082cc32a64bb…`，與批准對話不同；Hosted 有 `sdk_session_create`。測完由 API 停用（寫入停用的新版本，讀回 `enabled=False`），dev 不會每天執行 |
+| 3 #964／#955／#973 記憶 | PASS（有錯字） | A 記住測試代號，12:31:39Z `FA_PRIVATE_MEMORY_UPDATE status=202`。新對話回想時，私人與 Team 記憶搜尋都回 200（0.65～1.0 秒），答出代號，但其中一個字錯了（「藍鯨」答成「藍鰾」）。三種記憶事件都進了 Application Insights（#973） |
+| 4 #969 群組先貼 | PASS | A 主持、B 參與，3 則、已收尾。A 的回合 12:45:40Z 存檔，B 的群組回合 12:45:41Z 送出，A 的私人記憶寫入在 12:45:43Z；依時間推論是先貼群組、再寫記憶（Team 筆記沒有時間紀錄可比） |
+| 5 私有模式的改動 | 程式有開關，沒跑到 | stage.json 沒有 `FA_ONBOARDING_ACCOUNT_ROLE`、`FA_MEMORY_BACKEND`、`FA_NETWORK_MODE`，所以 #975 的委派、Cosmos 記憶、#970 的 Work IQ 防護在 stage 都不會開。私有部署的驗收見 [兩輪重跑](#private-reruns-1024) |
+| 6 錯誤 | PASS | API（12:29～12:50Z）沒有 Traceback、ERROR、5xx；Hosted 沒有 exception，也沒有 warning 以上的紀錄 |
+
+- **送出 RTT**（A、B 回合的 API 那一段，毫秒，樣本少只供參考）：`api_submit` n=9，p50 2,022、p95 3,570（最大值是 3604 後第一個回合）；`api_submit_session` n=10，p50 370、p95 799；`api_submit_context` n=10，p50 160、p95 197；`api_submit_hosted` n=10，p50 630、p95 1,894（群組那一回合的 `api_submit` 總計沒有在讀到的 log 裡）。第 31 版 n=9 是 p50 2,065、p95 2,594。
+- **觀察**：
+  1. 記憶回想錯了一個字，還沒查是存進去時就錯，還是模型回答時錯。
+  2. B 的 `FA_PRIVATE_MEMORY_UPDATE` 一次 `status=404 chained=True`、`chain=refused`，同一秒改用不串接的寫入，回 202。
+  3. `NATIVE_TURN_REFUSED code=NATIVE_STREAM_NOT_STARTED` 6 次（12:49:00～12:50:10Z，第 31 版也記過），時間對上 6 則量測訊息；這 6 則在工作台畫面上都顯示「已完成」。
+  4. 群組的兩個回合都有 `RESIDENT_SDK_EVICTED`（A 12:45:25Z、B 12:45:46Z，都在回合配置之後），`resident_sdk_stop` 約 2.3 秒、`native_peer_tools` 約 2.1 秒。
+  5. API 每次部署新 revision 要約 5～6 分鐘才開好 port（[費用紀錄](fa-cloud-budget-status.md#dev-api-scale-zero-1025)），原因未查。
+  6. 舊工作台：排程批准卡仍寫「在這個對話執行」；在 B 按「新對話」、更新模型清單後，那則訊息送進了 B 的舊對話。
+- **dev 沒有驗證到的**：#957 的工作台部分（排程對話清單、批准對話裡的提醒；bridge 是 10-20 的程式，stage 的 console 會隨 release 一起換版）；#956 的 toolbox 失敗退避（沒有遇到失敗）；Teams；IDLE 旗標。
+- **費用**：測試前約 USD760.5（`rg-faexample` 730.57＋`ME_cae-facontext-private` 29.96；10-25 只有部分資料）。測試後的讀數要等報表更新。上限 USD900／停損 USD880。
+- **下一步**：總協調開第 36 版 release PR（附這份報告），由 Neal 決定是否合併（合併＝部署 stage）。#957 是單向的：API、Hosted、console 要一起換，不能只退其中一個（[說明](../src/fa-shared-context-poc/README.md#native-routine-fresh-conversation)）。
+
+<a id="private-reruns-1024"></a>
+## 2026-10-24：azd `private` 兩輪乾淨重跑（azd 建的 VNet、帶入既有 VNet；兩輪都通過）
+
+- **範圍**：接續同日的[第一輪驗收](#private-e2e-1024)。Neal 10-24 批准兩輪（「兩輪都跑，一輪接一輪」），依序跑完。兩輪都用 dev 訂閱、westus3，模型 gpt-5.4-mini＋text-embedding-3-small，`FA_MEMORY_CHAT_MODEL=gpt-5.4-mini`。
+- **第 1 輪（azd 建的 VNet）**：環境 `fa-priv2-1024`，main `c8501365`（#976 之後）。
+  - `azd up`：exit 0，共 1 小時 17 分 45 秒（provision 27 分 25 秒、deploy 50 分 20 秒）。唯一的手動步驟是 Neal 在初始化提示輸入 `y`（當時 #978 還沒合併）。
+  - 讀回：seed Agent 的 4 筆帳號範圍 Cognitive Services OpenAI User（#972）；API 身分有一筆帳號範圍、帶條件的 "Role Based Access Control Administrator"（#975 的委派）。
+  - 前 10 分鐘：PASS，助理 A 用 shell 執行 `date`，6 秒。
+  - 記憶：`FA_MEMORY_RELAY_WRITE status=201`，private items=1／2、team items=1，沒有手動補角色；API items 19–38 ms。
+  - 「＋」Agent `rerun1-e`：建立時 API 經委派建了第 5 筆帳號範圍 OpenAI User；記憶寫入 201、private items=2；新對話回想答「記得，你偏好會議紀錄先寫決議，再寫討論。」
+  - 拆除：`azd down --purge` exit 0，29 分 7 秒，第一次就完成。predown 撞到 `CannotDeleteResource`（project 仍在清單上），依 #974 重送一次，回 GatewayTimeout，之後只輪詢不再送；帳號從 Deleting 到消失。唯讀複查：`rg-fa-priv2-1024` 與 `ME_cae-fa-priv2-1024` 都不存在，沒有 soft-deleted 的 Foundry 帳號。
+- **第 2 輪（帶入既有 VNet，ADR-0010 第 2b 階段）**：
+  - 客戶 VNet：總協調事先在另一個 RG `rg-fa-byovnet-1024` 建 `vnet-fa-byo-1024`（10.60.0.0/16）：`snet-customer-api` 10.60.0.0/24 與 `snet-customer-agents` 10.60.1.0/24 都委派給 `Microsoft.App/environments` 並掛 NAT gateway；`snet-customer-pe` 10.60.2.0/27。
+  - 環境 `fa-byo-1024`，main `21d6d972`（#978 之後）。設定 `FA_VNET_RESOURCE_ID`（`/subscriptions/<sub>/resourceGroups/rg-fa-byovnet-1024/…`）與三個 subnet 名稱、`FA_DNS_MODE` azd（預設）、`FA_APPROVE_INITIALIZATION=fa-byo-1024`。
+  - 第一次嘗試停在 preprovision、還沒建立任何計費資源：缺 "Docker engine running"（筆電的 Docker Desktop 停了）。重開 Docker 後重跑。
+  - BYO preflight 通過（只讀）。
+  - `azd up`：exit 0，共 1 小時 27 分 47 秒（provision 41 分 58 秒、deploy 45 分 48 秒），**沒有手動步驟**。初始化由 `FA_APPROVE_INITIALIZATION=fa-byo-1024` 事先批准（沒有輸入回答），批准紀錄的 `decision_id` 含 `-fresh-preapproved-`。
+  - 略過網路模組沒有在 ARM 失敗：network／DNS 部署成功，Foundry 的 DNS zone 連到客戶 VNet。
+  - **觀察**：Foundry 帳號花 20 分 16 秒、project 花 21 分 27 秒，第 1 輪約 4–6 分鐘。原因未知。這兩個時間是 azd 印出的 ARM 逐資源時間（`(✓) Done: Foundry … (20m15.927s)`、`Foundry project … (21m26.566s)`），兩段重疊（project 要等帳號），不能相加。
+  - 部署後的客戶 RG：FA 沒有在裡面建資源。FA 掛上去的只有：Foundry 注入 `snet-customer-agents`（`useMicrosoftManagedNetwork` false）、Container Apps 環境在 `snet-customer-api`（各一個 service association link），以及 `snet-customer-pe` 的 5 個 private endpoint。
+  - 該 RG 另外出現三個 NSG `vnet-fa-byo-1024-snet-customer-*-nsg-westus3`。建立者是租用戶內解析不到的 service principal，不是 FA 的身分也不是部署者，時間點有訂閱 Policy 評估在跑。推論：訂閱的治理 Policy 會替 subnet 掛 NSG。這次預設規則沒有擋到任何流量。
+  - 前 10 分鐘：PASS，shell `date` 6 秒。
+  - 記憶：private／team 寫入 201。
+  - 「＋」Agent `rerun2-e`：建立成功，記憶寫入 201，新對話回想答「記得，你的出差申請一律寫成三點：目的、日期、預算。」
+  - 部署窗口：兩輪都在建立 Hosted Agent 後關回，hook 印出 "closed again (read back: publicNetworkAccess Disabled, no IP rule)"。
+- 拆除：`azd down --purge` 一次就 exit 0（從 predown 起算 50.6 分；azd 自己的段落 23 分 59 秒）。predown 一樣碰到 `CannotDeleteResource`→依 #974 重送→GatewayTimeout→只輪詢，帳號 Deleting 約 19 分後消失並 purge；predown 唯讀確認 `snet-customer-agents` 沒有 service association link 才讓 azd 刪 RG；2 個 Entra app 已刪（30 天內可還原）。唯讀複查：`rg-fa-byo-1024`、`ME_cae-fa-byo-1024` 都不存在、soft-deleted 清單沒有這個 Foundry；客戶 VNet 三個 subnet 都在、兩個委派 subnet 的委派還在、service association link 與 private endpoint 都是 0，FA 沒有刪改客戶網路的任何資源（Policy 掛的 3 個 NSG 也還在）。客戶 VNet 的 RG `rg-fa-byovnet-1024` 是總協調為測試建的，另行刪除。
+- **這兩輪驗證了**：#972、#975、#976（帶入既有 VNet，DNS azd 模式）、#978 的事先批准，以及 #974 在實際拆除中的重送。#973（記憶 log 匯出）有部署，沒有特別測。
+- **仍未驗證**：
+  - `FA_DNS_MODE=existing`；
+  - 超過 1,000 筆的向量查詢；
+  - Cosmos 429；
+  - 延遲及格線（未判定）；
+  - Cosmos 防火牆層證據（Neal：不用補）；
+  - Work IQ 防護的實際觸發（Connectors 預設關）；
+  - 費用：24–48 小時後讀 Cost Management 的 `rg-fa-priv2-1024`／`ME_cae-fa-priv2-1024`／`rg-fa-byo-1024`／`ME_cae-fa-byo-1024`／`rg-fa-byovnet-1024`。
+- 本條只記結果，不是其他雲端寫入的批准。
+
+<a id="private-e2e-1024"></a>
+## 2026-10-24：azd `private` 模式端到端（ADR-0010 第 3 階段、ADR-0011 第 5 階段；核心流程通過）
+
+- **範圍**：環境 `fa-priv-1024`，westus3，dev 訂閱新 RG `rg-fa-priv-1024`。模型 gpt-5.4-mini＋text-embedding-3-small，`FA_MEMORY_CHAT_MODEL=gpt-5.4-mini`。程式基準 `34d07a86`（#970 之後），之後以 `2358d87a`（#971）重新部署。
+- **azd up**：exit 0，共 1 小時 51 分 45 秒（provision 26 分 56 秒、deploy 1 小時 24 分 49 秒，含首次安裝等 Log Analytics 約 10＋2＋4 分鐘）。
+  - Team 主人（Neal）在終端機輸入初始化批准。
+  - 部署窗口打開（資料面先回約 2 分鐘的 403 "Public access is disabled"，之後才回應），建立 Hosted Agent v1 a～d，再關閉窗口：讀回 `publicNetworkAccess` `Disabled`、沒有 IP 規則。
+- **前 10 分鐘：PASS**。助理 A 用 shell 執行 `date`，6 秒、1 次工具呼叫。路徑：工作台 → API（公網入口＋Entra）；API → Foundry agent endpoint 經 VNet integration（`snet-api`）與 private endpoint（`privatelink.services.ai` 的 A 紀錄 192.168.96.70）；Foundry 注入 `snet-agents`（`useMicrosoftManagedNetwork` false）。
+- **記憶（[ADR-0011](adr/0011-private-mode-cosmos-memory.md)）**：
+  - 一開始什麼都沒寫進去：API log 只有靜態搜尋，Hosted 的 `private_memory_update` 約 28–41 ms。兩個根因：
+    1. embedding 用 project 路徑 `/api/projects/<p>/openai/v1/embeddings` 回 404，#971 改用帳號根路徑；
+    2. agent 身分只有 project 範圍的角色。總協調經 Neal 批准（只限這個測試環境），手動在帳號範圍給 4 個 agent Cognitive Services OpenAI User；#972、#975 把它寫進部署。
+  - 修正後：
+    - API `FA_MEMORY_RELAY_WRITE status=201 scope_kind=private items=2`，Hosted 抽取 2.3 秒；
+    - Team note `status=201 scope_kind=team items=1`；
+    - 新對話回想 PASS（「條列式、週五下午」）；
+    - 更正 PASS（「改成每週一早上寄出，格式維持條列式」）；
+    - 助理 B 讀到 A 更正後的 Team note。
+- **延遲（只記錄，未判定及格線）**：API items 35–56 ms、API search 37–89 ms、Hosted 私人回想 313–648 ms、`native_allocate` 約 607 ms。
+- **Cosmos 讀回**：`publicNetworkAccess` `Disabled`、關閉 local auth、serverless＋`EnableNoSQLVectorSearch`；自訂角色「FA memory data without delete」正好 5 個 dataActions，只有一筆指派給 API 身分，範圍 `/dbs/fa-memory/colls/memories`。
+- **防火牆證據**：
+  - Foundry：筆電回 403 "Public access is disabled"。
+  - Cosmos：筆電在沒有資料角色時回 RBAC 403，這不是防火牆層的證據。要證明防火牆層需要暫時的資料讀取角色，這個授予被工作階段的權限分類器擋下；Neal 決定「防火牆證據不用補」。
+- **可觀測性缺口**：Hosted 的記憶 WARNING 沒有進 App Insights，`private` 又從外部擋住 logstream。#973 修正（已合併，未在雲端跑）。
+- **拆除**：第一次 `azd down` 停下：project 讀回已刪，帳號刪除卻回 `CannotDeleteResource`，訊息仍指向該 project（傳播延遲）。重跑成功，31 分 13 秒。唯讀複查：`rg-fa-priv-1024` 與 `ME_cae-fa-priv-1024` 都不存在，沒有 soft-deleted 的 Foundry 帳號；兩個 Entra app 已刪（30 天內可還原）；備份自訂角色回報 already gone。這個競態由 #974 處理（已合併，未在雲端跑）。
+- **費用**：還沒讀。估計 USD 3–10；24–48 小時後讀 Cost Management 的 `rg-fa-priv-1024`／`ME_cae-fa-priv-1024`。
+- **同日合併的後續**：
+  - #971：embedding 改用帳號根路徑；
+  - #972：seed Agent 的帳號範圍角色；
+  - #973：匯出記憶 log；
+  - #974：強化（predown 只在自己 project 的 `CannotDeleteResource` 時重送、deploy 檢查網路模式、`TimeoutExpired` → 停下、GroupGone 的 try、拒收 Work IQ secret）；
+  - #975：「＋」新增的 Agent 經帳號範圍、帶條件的委派取得帳號角色（Neal：「委派延伸到帳號層，只限這一個角色」）；
+  - #976：第 2b 階段帶入既有 VNet（Neal：「要排進去」，隨下一個 stage release）。
+- **雲端仍未驗證**：#972～#976 都在 #971 之後合併，這次環境沒跑過，包括上面的 #973（記憶 log）與 #974（刪除競態等強化）：已合併，還沒在雲端跑；帶入既有 VNet 的部署；超過 1,000 筆的向量查詢；Cosmos 429 行為。（見 [#private-reruns-1024](#private-reruns-1024)）
+- **Neal 目標（10-24）**：下一個 staging release 出貨完整的私有部署，含帶入既有 VNet。Neal 已批准兩輪乾淨重跑（10-24），進行中：先 azd 建的 VNet、再帶入既有 VNet，依序跑；第 1 輪 `fa-priv2-1024`（main `c8501365`）。
+- 本條只記結果，不是其他雲端寫入的批准。
+
+<a id="adr-0011-phase0c-1023"></a>
+## 2026-10-23：ADR-0011 第 0c 階段探針完成（Cosmos 記憶後端的核心假設成立，延遲及格線未判定）
+
+- **結果**（[ADR-0011 第 0c 階段結果](adr/0011-private-mode-cosmos-memory.md#第-0c-階段結果2026-10-23)）：dev 訂閱新 RG `rg-fa-netprobe0c-1023`（tag `workload=fa-netprobe0c-1023`），RG 已刪、Foundry 帳號已 purge，資源存在約 77 分鐘；費用為探針回報／估計（未保留計算依據）USD 0.3–2.5，實際金額約 24–48 小時後用 tag 查。呼叫者是 VNet 內的 Container Apps Job，不是 Hosted，也不是 API app。
+- **通過**：
+  - private endpoint 與 DNS：Job 內 Cosmos 與 Foundry 都解析到私有位址；`azure-cosmos` 4.17.1 只有 Gateway，連線全是 443。
+  - container 範圍的自訂無刪除角色可用；刪除與 upsert 被拒，被刪的那筆讀回仍在。
+  - transactional batch：3 個 create 全成；ID 重複時整批 409（`[424, 409, 424]`），完整 rollback。
+  - 帶前置條件的 patch：成立 200，不成立／已被取代／種類不對 412（子狀態 1110），舊條不存在 404。
+  - 向量查詢與寫入的 RU 已量測（寫一條 23.99 RU；向量 `TOP 5` 在 10／100／約 1,000 筆為 4.3／10.2／約 68 RU）。
+  - 向量 capability 與帶向量政策的 container 同一次部署成功（第一次 795 秒，重新部署 130 秒）。
+- **改了設計**：
+  - 角色擬改為 5 個 dataActions（`readMetadata`、`items/create`、`items/read`、`items/replace`、`executeQuery`），去掉 `readChangeFeed`：探針用 6 項角色驗證，尚未用 5 項角色驗證；探針證明 `items/replace` 必要，`readChangeFeed` 是否可去掉未驗證。
+  - patch 需要 `items/replace`，而它也允許整份取代，無法用權限分開，所以 API 程式只能呼叫 patch。
+  - `filter_predicate` 只收字串；字串裡留未繫結的 `@n` 不報錯，而是靜默回 412。所以整數必須驗證後內嵌，並加「條件字串不含 `@`」的測試。
+  - 服務自動把 `/embedding/*` 加進 `excludedPaths`，探針項 4b 不適用。
+  - 證明 `publicNetworkAccess: Disabled` 要用持有資料角色的身分（Cosmos 先檢查 RBAC，沒有角色時看到的是 RBAC 拒絕，不是防火牆）。
+- **確認（設計沒變）**：模型自己編 `kind`（`preference`、`travel_plan`），而 schema 本來就沒有 `kind`；`kind` 由程式決定，多餘鍵忽略，不觸發 `response_invalid`。
+- **延遲：未判定**：Job 內 embedding＋向量查詢 30 次 p50 281 ms、p95 446 ms（embedding 約 88%，p50）。這不含 Hosted→API 經公網入口，也沒有量 `native_allocate`，所以第 9 節的及格線（p50 ≤ 約 0.45 秒、p95 ≤ 1 秒）不能判定；那一段還有約 170 ms（p50）／550 ms（p95）的餘裕。第一次請求要付約 1 秒（token、client、container metadata）加 Job 內 embedding 首次 0.5 秒（Hosted 內未測），API 要行程共用 client 並暖機。
+- **要注意**：批次寫入時有 11 與 22 筆失敗且沒有記下原因（原因未知；以約 1.8k RU/s 計，低於 serverless 上限，429 算術上不太像；SDK 預設 429 重試未驗證），大量寫入要限制並行並處理 429；重新部署的 what-if 有伺服器補欄位的雜訊；超過 1,000 筆的向量查詢沒有測，若不降成本，線性外推 3 萬筆約 2,000 RU／次（推論）。
+- **揭露**：探針在探針 RG 內給營運者 Cosmos 唯讀資料角色與 Foundry 的 Cognitive Services OpenAI User（隨 RG 刪除），經 Graph 讀了營運者自己的 object ID（唯讀；探針回報，未保留證據）；`Microsoft.DocumentDB` 資源提供者經 Neal 批准後註冊，這是訂閱層級狀態，不隨 RG 刪除。
+- **仍未測**：Hosted→API 延遲與 `native_allocate`、Hosted 內 embedding、`gpt-4.1-mini` 在 `private` 帳號的可部署性與速度、`snet-api` 的 NSG、選項 (a)、`fa/v1/effects` 的 claim、`quantizedFlat` 超過 1,000 筆、429 行為與 SDK 預設重試、5 項角色回歸、單一操作移除檢查、Foundry 筆電防火牆層證據、容錯移轉與可用性區域、真正的 `azd provision` 冪等、中文召回品質；除 `snet-api` 的 NSG 設計在第 4 階段寫進 Bicep 外，都在第 5 階段收。
+- **下一步**：第 1 階段（一般 PR）；Hosted→API 延遲在第 5 階段於 Hosted 內量；第 5 階段 azd 端到端驗收仍待 Neal 批准。
+- 本條只記結果，不是其他雲端寫入的批准。
+
+<a id="adr-0010-phase0b-1023"></a>
+## 2026-10-23：ADR-0010 第 0b 階段探針完成（Hosted 模型、平台對話接續通過）
+
+- **結果**（[ADR-0010 第 0b 階段結果](adr/0010-azd-private-network-option.md#第-0b-階段結果2026-10-23)）：dev 訂閱新 RG `rg-fa-netprobe0b-1023`（tag `workload=fa-netprobe0b-1023`），RG 已刪，費用估計 USD 1–2（實際金額約 8–24 小時後用 tag 與 RG 名稱查，待補）。各項都有保留的原始 log（在總協調的本機，不進 repo）。
+- **通過**：
+  - Hosted 內呼叫模型：模型主機解析到 private endpoint，回 200（部署者 IP 窗口內與 `Disabled` 都成功）。
+  - 多輪對話接續：測的是平台 Responses 對話儲存加 `get_history()`，不是 FA checkpoint（有效結果是 T2 重試與 ASCII t7c；T2 第一次嘗試與 t7b 因中文經 `az rest` 遺失而無效）。
+  - 換版後接續：有條件通過，要明確建立新版 session（`POST /agents/{name}/endpoint/sessions` 帶 `version_ref`）並帶 `agent_session_id`；只切換 endpoint 的版本選擇器時 session 仍在舊版 container，回應的 `agent_reference` 卻顯示新版。換版成本：建立新版 session 約 4.0 秒，其首回合約 8.1 秒（對 G 方案有影響）。
+  - agent endpoint 從公網呼叫（`/responses`、`/invocations`）回 403，有保留證據。
+  - Hosted → FA dev API 公網 `/healthz` 可達（回 200，19–54 ms；「經 NAT」是推論，log 的出站 IP 已去敏）；`login.microsoftonline.com` 回 200（50–292 ms）；約 14 次觀察。
+  - App Insights：結論限於網路與 ingestion 可達；app 用環境變數中的連線字串（推定為平台注入）直接 POST，12 筆 trace 全部數秒內到達，此路徑不需要 AMPLS。
+- **修正**：`*.identity.azure.net` 不適用，Hosted 的 token 來自平台提供的 IP 端點（HTTP）；探針基礎設施部署約 5–7 分鐘，不含 FA 應用與 azd hook（原寫帳號約 3–4 分鐘）。
+- **營運新事實**：對話與 session 依 Entra 呼叫者隔離，營運人員用自己的身分看不到 API 建立的對話；每個新 agent 得到新的 instance identity，需要 project 範圍的 Foundry User 與 Cognitive Services OpenAI User（探針已授予；ARM 寫入不受 PNA 影響是推論；兩者是否都必要未測）。
+- **拆除**：依第 0 階段順序共 50 分鐘（帳號約 22 分鐘，RG 約 26 分鐘）；CLI 刪帳號回 `GatewayTimeout` 時帳號其實已在 `Deleting`，要讀狀態與輪詢，不要重送。force 刪 agent 後，3 個 instance identity 與 3 個 blueprint principal 的 Graph 讀取都回 404，推定自動清除，但刪除前是否讀得到未確認。
+- **仍未測**：WebIQ MCP 出站、toolbox 經 private endpoint、重跑 `azd provision`、FA API app 本身呼叫 agent、FA desktop 完整啟動、帶身分驗證的 Hosted→API 呼叫、FA checkpoint 經 API 保存與恢復（`private` 下；儲存路徑與 public 相同，只有 Hosted→API 改經 NAT，推論不受影響）、兩個角色是否都必要、first-token 延遲、idle 停止的 session 在版本選擇器切換後喚醒用哪一版。建議併入第 1 階段測試與第 3 階段驗收，是否另開探針由 Neal 決定。
+- 本條只記結果，不是其他雲端寫入的批准。
+
+<a id="adr-0010-probe-results-1023"></a>
+## 2026-10-23：ADR-0010 第 0 階段探針完成，`private` 長期記憶採記憶選項 B
+
+- **結果**（[ADR-0010 第 0 階段結果](adr/0010-azd-private-network-option.md#第-0-階段結果2026-10-23)）：dev 訂閱新 RG，RG 已刪、兩個 Foundry 帳號已 purge，費用估計 USD 1–3（實際金額待查）。部署走暫開部署者 IPv4（PATCH 只送 `publicNetworkAccess` 與 `networkAcls`，讀回 `Disabled`），Job 備案也可行；不建 project capability host，帳號建立約 3–4 分鐘；`Disabled` 時 agent endpoint 公網呼叫回 403；模型經 private endpoint 可用（Job 實測；Hosted 內未測）；刪除要 `force=true` 刪 agent、先刪 project、輪詢帳號 `provisioningState`，`azd down` 預期 45 分鐘以上。
+- **記憶**：Foundry Memory Store 在任何 `defaultAction: Deny` 的帳號上都壞（含只開特定 IP），只有 `Allow` 正常。Neal 決定：「長期記憶是一個重要的元素，不能沒有。」「私有化的部署方案可以直接選 B。預設的部署方案維持不變」。意思是 `private` 用記憶選項 B（FA 自建），`public` 維持 Memory Store。B 原本寫的是 Azure AI Search＋private endpoint；總協調比較之後，Neal 同日改選：「用Cosmos DB serverless」，設計見 [ADR-0011](adr/0011-private-mode-cosmos-memory.md)（proposed）。
+- **沒測**：Hosted 內呼叫模型（最重要的缺口，0b 第一項）、Hosted→FA API 經 NAT、App Insights 擷取、WebIQ MCP 出站、`*.identity.azure.net`、注入帳號 `Allow` 下的記憶、重跑 `azd provision`。下一個測試是上述項目加短期記憶（多輪對話接續、換版後 checkpoint 還原），需 Neal 批准。部分結論只有探針回報、原始 log 未全數保留（見 ADR 的證據範圍）。
+- **可能殘留**：平台建 Hosted 版本時自動建的 Entra agent 身分（instance identity、blueprint），刪除後是否清除未驗證（探針沒有 Graph 權限）。
+- 本條只記結果與決定，不是其他雲端寫入的批准。
+
+<a id="adr-0010-private-network-1023"></a>
+## 2026-10-23：ADR-0010 azd 私有網路選項方向已接受
+
+- Neal 接受 [ADR-0010](adr/0010-azd-private-network-option.md) 的方向與範圍（原文：「可以接受，先照這個範圍做」），並批准第 0 階段探針（dev 訂閱新 RG，預估 USD 5–10）。審查補充：agent endpoint 在 preview 期間可能仍公開（第 8 題實測）；長期記憶待探針結果。本條只記方向與批准，不是其他雲端寫入的批准。
+
+<a id="stage-v35-1022"></a>
+## 2026-10-22：stage 第 35 版部署後驗證
+
+- **範圍**：release PR #950，13:42Z 合併，merge commit `f54f0fa1`，內容基準就是[第 35 版候選 dev 測試](#dev-test-v35-1022)的 `42173ca7`。deploy-staging run `39789216449` 成功，deploy job 13 分 01 秒。
+- **證據**：部署後讀回（13:59Z～14:08Z）、冒煙 log 核對（14:23Z～14:26Z，查到 14:37Z）、routine `unknown` 根因調查（約 14:30Z）都是唯讀，原始輸出不在 repo，ID 只寫前綴。冒煙訊息由總協調在 stage 工作台送出（Neal 指示「你來送訊息」）。沒有讀費用，也沒有讀 Table、journal、receipt 或對話內容。
+- **閘門**：armed=True、decision pass、0 拒絕；`unserved_rows`、`vetoed_versions`、`retired_rows` 都是空的，C／D 是 `unclaimed`。3 次 job execution 的 Traceback、ERROR、WARNING、drift 都是 0。
+- **讀回**：
+  - **API**：`ca-fa-behavior-stage` 只剩一個 active revision `…f54f0fa-r123-1`，Healthy，100% 流量，1 個 replica。GUARD 是 "1"，IDLE 和 RECONCILER 都是 "0"。console、feed 也是同一個 revision，Healthy。`/healthz` 回 200。
+  - **Hosted**：A／B／C／D 都是 v86，`stage-test-e`（E；E = `stage-test-e` 是推定）是 v34，endpoint 100% 指向最新版；5 個的 `fa_build` 都是 `af14a040…`。A／B／E 的 `FA_NATIVE_TURNS` 是 `foundry-native-v2`，C／D 沒設。
+  - **follow**：A／B／E 是 `pending`／`needs_follow`（verify-only），在下一個回合結束時切版，不是 drift；C／D 是 `skipped`（`AGENT_SCOPE_MISSING`，executor，預期內）。
+- **公開 repo**：public-sync run `39791346393` 通過，Gate 2 通過。公開 tag `v2026.10.22-35` 的 tree `6b196219…`，和 release PR 的 fingerprint 相同。
+- **冒煙**（stage 工作台，依序三則）：
+
+  | # | 對話 | 內容 | 結果 | UI 顯示 |
+  |---|---|---|---|---|
+  | 1 | A 既有對話 | 「只回覆 OK」 | OK | 3 秒 |
+  | 2 | A 同一對話 | WebIQ 搜尋 | 答案正確，2 個工具，UI 顯示「已完成・用了 2 個工具・14 秒」，UI 上沒有「這次沒用到 WebIQ」註記 | 14 秒 |
+  | 3 | B 新對話 | 「只回覆 OK」 | OK | 2 秒 |
+
+- **log 核對**（14:00Z 起）：
+  - **版本跟進**：A、B **PASS**。開頁讀取先收到 409 `NATIVE_SESSION_CHANGED`，接著記 `NATIVE_VERSION_OBSERVED … 82→86`（409 時預期 85），SID 不變（A `8efce15e…`、B `ad2abcf2…`），之後全是 v86，`NATIVE_UPGRADE_CUT_API` 一律 `outcome=current`，0 次 cut。**E 沒驗到**：這段時間 E 沒有回合，要等它下一個回合。
+  - **#940**：PASS。AppTraces 有 `FA_TIMING ` 115 行（A 77、B 38）和 1 行 `RESIDENT_SDK_CONTINUED`。這是這類 log 第一次進 AppTraces。
+  - **#949**：送出路徑 PASS。3 則的 invoke_agent 都是一個接一個，`platform_preprocessing_ms` 67～89；session＋conversation 是 762／1,213／700 ms（第 3 則是新對話，只讀 session）。
+  - **#942**：PASS。3 則的 `native_reminders` 都和 `native_bind_capabilities` 重疊；`NATIVE_ROUTINE_SCOPE` 是 0。
+  - **WebIQ**：toolbox 正常。`fa-org-tools:1` 的 `tools/list` 成功，`tools/call WebIQ___web` 成功（600 ms）；新版本第一次列 toolbox 是 prewarm（約 1.3 秒），第 1 則的 `native_bind_toolbox` 只花 71 ms。
+  - **錯誤**：API、console、feed、Hosted 的 Traceback、5xx 都是 0；`NATIVE_SESSION_CALL_INCOMPATIBLE`、`NATIVE_RID_CONFLICT`、`NATIVE_CAPABILITY_UNKNOWN` 也是 0。看到的 409 是漂移偵測和第一次開串流被拒，都是預期內。
+- **send RTT**：發布清單要求 p50／p95，但 n=3，**樣本太小，不報 p95**，直接列三個值（毫秒）。p50（中位數）：API 開始 → first preview 12,490 ms、API 同步段 1,825 ms。
+
+  | # | API 開始 → first preview | API 同步段 | 備註 |
+  |---|---|---|---|
+  | 1 | 12,490 | 1,795 | 換版後第一個回合，SDK process 重啟 |
+  | 2 | 18,652 | 2,075 | warm，含 WebIQ（2 個工具、3 次 model_request） |
+  | 3 | 9,702 | 1,825 | B 新對話，SDK process 重啟 |
+
+- **新觀察**：
+  - **(a) 開頁讀取被平台扣住**：送出窗口**外**有 6 筆（A 5 筆、B 1 筆，各自同一 SID）的讀取被平台扣住 2.1～4.1 秒（最長 4,111 ms），出現在開頁，或回合中的 status／stream 輪詢。都不在送出關鍵路徑上，first preview 是在它們之後才出現。使用者看到的換版代價在開頁：A 開頁的 `api_received` 花 8.6 秒（含 6.5 秒的 409）。dev 當時看到同時的開頁讀取沒被扣，stage 這次有。
+  - **(b) A 的「超過 2 小時還沒有回覆」橫幅疑似誤報**：10-21 00:00Z 起的 log 中唯一一筆 A→B 交辦是 `beee189b`，B 約 00:55:50Z 完成，A 在 00:56Z 讀了結果；B 從 10-21 09:56Z 到今天 14:26Z 沒有任何模型呼叫，14:25 對 B 的請求全是讀取。橫幅來自 bridge 的 `peer_reply_overdue`，推論是 console 的回條或 journal 狀態沒跟上。B 側欄的「新回覆」同理（推論）：是 console 重新登入後把舊回覆標成新的。是哪一筆 original 觸發，要讀 Table／journal 才能確認，這次沒讀。
+  - **(c) 今天的 routine 回合 `status=unknown`**：A 的每日排程 `77d3e869`，10:00:20Z 送出，回合跑約 77 秒中斷，10:02:05Z 記成 `unknown`；前 7 天都是 `completed`（跑 11～13 分鐘）。這是**真的失敗**：第 11 次呼叫 `gpt-6.1-sol` 時撞到 500K TPM（Foundry 帳號 `cog-fasample-memory-demo`，dev 與 stage 共用），Copilot runtime 重試 5 次（共 4.57 秒）仍失敗。前 10 次呼叫都成功，沒有任何 `deliver_*`，成果沒有送出；`unknown` 是最終狀態，不會補跑。
+    - **趨勢**：這個 routine 每天接在同一個對話後面，第一次呼叫的 input tokens 從 10-15 的 189K 長到今天的 306K；runtime 自己估的只有約 177K，低於 272K 的壓縮門檻，所以一直沒觸發壓縮。
+    - **明天（10-23 約 10:00Z）**：release 35 沒有改變根因（沒改模型、額度、重試、時鐘），失敗回合不存檔，所以會從 10-21 的存檔接續，風險和今天相同（程式推論，沒實測），對話每成功一天會更大。
+    - **觀測缺口**：`FA_NATIVE_TURN_UNKNOWN`、`FA_MODEL_DIRECT_*` 只印在 Hosted stderr，沒進 Log Analytics，拿不到確切 `failure_code`。
+    - **選項待 Neal**：(1) 調高 `gpt-6.1-sol` 的 TPM（雲端設定寫入，dev／stage 共用，需批准）；(2) 小改動讓 `sdk_telemetry.py` 匯出這兩類 log；(3) 另案決定 routine 改為每次新對話，或讓壓縮用 provider 實際 token 數（牽涉 routine 設計與 checkpoint 契約）。不建議調 FA 的 429 重試常數。
+- **限制**：E 的切版、server 端 follow 從 `pending` 變 `ok`、A 橫幅的實際觸發來源都沒驗到；#941 工作台 UI（追加確認說明、最近進度）與「沒有搬檔提示」沒有驗；dev 也沒驗；Hosted stdout 的 `NATIVE_TOOLBOX_*` 等沒進 Log Analytics，相關結論是推論。
 
 <a id="dev-test-v35-1022"></a>
 ## 2026-10-22：第 35 版候選 dev 測試（main `42173ca7`，總協調）
@@ -548,7 +753,7 @@
 - **dev 依據**：
   - #738：本機 8765 換成 `a9986178`，S1～S5 與手機寬度全部 PASS（session `6b93d609` 的 `s738-dev-verify.md`）。
   - 排程：見 [routine-same-tools-1008](#routine-same-tools-1008)、[routine-from-chat-1007](#routine-from-chat-1007)、[routine-api-clock-1007](#routine-api-clock-1007)。
-- **還沒做**：Neal 在 stage 實際建第一個排程（例如每天 18:00 文章整理）。要關排程時見 [README](../src/fa-shared-context-poc/README.md#native-routines-stage)；開啟期間用「＋」新建的助理會帶排程旗標。
+- **還沒做**：Neal 在 stage 實際建第一個排程（例如每天 18:00 文章整理）（10-22 更新：A 每日 routine 自 10-15 起已在跑）。要關排程時見 [README](../src/fa-shared-context-poc/README.md#native-routines-stage)；開啟期間用「＋」新建的助理會帶排程旗標。
 
 <a id="pr721-p2-local-1008"></a>
 ## 2026-10-08：PR #721 四項 P2 根因修正（CODE/offline；未部署）

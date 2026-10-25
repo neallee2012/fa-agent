@@ -1087,3 +1087,37 @@ def test_typed_agent_or_approval_markers_in_human_text_stay_the_humans_own_data(
 def test_turn_text_keeps_every_rounds_answer_and_the_handoff(parts, handoffs, expected):
     """Stage A 2026-10-04: no round's answer, the model's words beside the handoff, or the handoff text is lost."""
     assert native_sdk.turn_text(parts, handoffs) == expected
+
+
+MEMORY_USAGE = {"schema_version": "fa-turn-model-usage-v1", "usage": [{
+    "model": "gpt-4.1-mini", "wire_api": "responses", "requests": 1, "measured_requests": 1,
+    "input_tokens": 300, "output_tokens": 20, "reasoning_tokens": None}]}
+
+
+@pytest.mark.parametrize("status", [200, 409, 422, 503])
+def test_a_memory_usage_report_names_its_source_and_a_turn_report_keeps_its_bytes(status):
+    """ADR-0011 §2: the extraction's usage goes under the turn's own RID with ``source="memory"``, sent once; a turn
+    report has no ``source`` key, so its bytes are unchanged for an API that does not know ``source``."""
+    from shared_context.behavior_turn_usage import AgentTurnUsageReport, TurnModelUsage
+
+    usage = TurnModelUsage.model_validate_json(json.dumps(MEMORY_USAGE))
+    assert AgentTurnUsageReport(request_id="rid-1", usage=None).model_dump_json() == '{"request_id":"rid-1","usage":null}'
+    sent = []
+
+    def api(request):
+        sent.append(request)
+        return httpx.Response(status, json={"request_id": "rid-1", "usage_recorded": True, "usage_known": True,
+                                            "metered_microusd": 0, "unmetered_requests": 1})
+    reporter = native_sdk.NativeUsageReporter("https://api.offline.invalid", IDENTITY.agent_id,
+                                             lambda: "OFFLINE-api-MI", transport=httpx.MockTransport(api))
+    if status == 200:
+        asyncio.run(reporter.report("rid-1", usage))
+    else:
+        with pytest.raises(Problem) as refused:
+            asyncio.run(reporter.report("rid-1", usage))
+        assert refused.value.body["error"]["code"] == (
+            "NATIVE_USAGE_CONFLICT" if status == 409 else "NATIVE_POST_TURN_UNKNOWN")
+    assert len(sent) == 1
+    assert str(sent[0].url) == f"https://api.offline.invalid/agents/{IDENTITY.agent_id}/work-policy/v1/turn-usage"
+    assert sent[0].headers["authorization"] == "Bearer OFFLINE-api-MI"
+    assert json.loads(sent[0].content) == {"request_id": "rid-1", "usage": MEMORY_USAGE, "source": "memory"}

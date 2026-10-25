@@ -1,6 +1,7 @@
 """Native conversation client. Local records pin routing and requests, never execution authority."""
 
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_foundry import MAX_NATIVE_TURN_HTTP_BYTES
 from shared_context.behavior_native_turn_wire import (
@@ -25,9 +26,17 @@ from .instructions import NATIVE_LANE, lane_of
 PREFIX = "/work-policy/v1/native-turns"
 _NOT_ACCEPTED = frozenset({"AGENT_VERSION_FOLLOWING", "NATIVE_ADMISSION_PENDING"})
 _FETCH = object()
-# A conversation another Agent opened here: its thread is its first RID, read back from this Agent's receipts.
+# A conversation another Agent or a routine run (2026-10-23) opened here: its thread is its first RID, read back from
+# this Agent's receipts.
 RECEIVED_PHASE = "agent-received"
 RECEIVED_SECONDS = 15
+# Pages of the received listing read per refresh, newest first (a daily routine run adds a key a day, past the first
+# page's 50 keys). It stops at the first page holding an imported RID, and after a first page holding no received
+# conversation (an Agent without them reads one page). shortcut: unimported runs behind either of those, or past this
+# many pages, stay out of the list; they still open by RID (reminder link, push hint, progress ?thread_id=).
+RECEIVED_PAGES = 10
+# Routine-run conversations shown in the list, newest first; older ones open the same way.
+ROUTINE_THREADS = 30
 # Spec 2026-10-01 (「等待到期」→「訊息已接收，B 的結果尚未確認」): a delegated reply not back after this is shown as
 # unconfirmed and read more slowly; the wait itself stays open. B's own terminal notice retries for ~1.9 h
 # (native_turns ``_notification_retry``). shortcut: counted from the last change this bridge saw in the delegating
@@ -247,8 +256,8 @@ class NativeAdapter(PullAdapter):
         require(value.conversation_id == cid, "NATIVE_STATE_SCOPE", 502)
         return value
 
-    def received(self, token):
-        return self._read("/received", NativeReceivedPage, token)
+    def received(self, token, *, after=None):
+        return self._read("/received", NativeReceivedPage, token, params=None if after is None else {"after": after})
 
     def history(self, cid, token, *, after_turn=0):
         after, turns, seen, original = after_turn, [], set(), None
@@ -551,24 +560,37 @@ class NativeInstructionControl:
             return None
         return local["thread_id"] if self.handles(local["thread_id"]) else None
 
-    def received_thread(self, thread_id):
-        """A conversation another Agent opened in this Agent; read-only here, its reply already went back."""
+    def imported_thread(self, thread_id):
+        """A conversation opened here by its first receipt, not by this page: another Agent's request or a routine run."""
         return thread_id is not None and self.journal.get(thread_id, RECEIVED_PHASE) is not None
+
+    def received_thread(self, thread_id):
+        """A conversation another Agent opened in this Agent; read-only here, its reply already went back.
+        A routine run's conversation is the owner's own: follow-ups and appends go there as in any other."""
+        saved = None if thread_id is None else self.journal.get(thread_id, RECEIVED_PHASE)
+        return saved is not None and saved["intent"]["sender_agent_id"] is not None
 
     def _import_received(self, rid, token, item=None):
         receipt = self._receipt(rid, token)
-        source = receipt.source
-        require(source is not None and source.kind == "agent_request" and receipt.continuation is None
+        source, routine = receipt.source, receipt.routine
+        agent = source is not None and source.kind == "agent_request"
+        require((agent or source is None and routine is not None) and receipt.continuation is None
                 and receipt.command.conversation_id is None
-                and receipt.request_id == rid and (item is None or (item.conversation_id, item.sender_agent_id)
-                                                   == (receipt.conversation_id, source.sender.agent_id)),
+                and receipt.request_id == rid and (item is None or (
+                    item.conversation_id, getattr(item, "sender_agent_id", None), getattr(item, "routine_id", None)) == (
+                    receipt.conversation_id, source.sender.agent_id if agent else None,
+                    None if agent else routine.occurrence.routine_id)),
                 "NATIVE_STATE_SCOPE", 502)
         with self.console.message_lock(RECEIVED_PHASE):
             thread = self.store.observe_native(receipt)
             require(thread == rid, "INSTRUCTION_ROUTE_CHANGED")
             if self.journal.get(rid, RECEIVED_PHASE) is None:
                 self.journal.begin(rid, RECEIVED_PHASE, {
-                    "state_profile": lane_of(receipt.state_profile), "sender_agent_id": source.sender.agent_id,
+                    "state_profile": lane_of(receipt.state_profile),
+                    "sender_agent_id": source.sender.agent_id if agent else None,
+                    **({} if agent else {"routine": {"routine_id": routine.occurrence.routine_id,
+                                                     "scheduled_for": routine.occurrence.scheduled_for.isoformat(),
+                                                     "time_zone": routine.occurrence.time_zone}}),
                     "method": "GET", "path": PREFIX + "/requests/" + rid, "created_at": self.clock().isoformat()})
             self.journal.finish(rid, RECEIVED_PHASE, {
                 "state": "VERIFIED", "native_receipt": receipt.model_dump(mode="json"),
@@ -607,24 +629,61 @@ class NativeInstructionControl:
             return
         self.received_checked = now
         try:
-            page = self.adapter.received(token)
-            self._current(token)
-            for item in reversed(page.items):
-                if self.journal.get(item.request_id, RECEIVED_PHASE) is None:
-                    self._import_received(item.request_id, token, item)
+            after = None
+            for _ in range(RECEIVED_PAGES):
+                page = self.adapter.received(token, after=after)
+                self._current(token)
+                known = False
+                for item in (*reversed(page.items), *reversed(page.routine_runs)):
+                    saved = self.journal.get(item.request_id, RECEIVED_PHASE)
+                    if saved is None or "native_receipt" not in saved:  # never imported, or its finish was lost
+                        self._import_received(item.request_id, token, item)
+                    else:
+                        known = True
+                if known or page.next_after is None or after is None and not (page.items or page.routine_runs):
+                    break
+                require(page.next_after != after, "NATIVE_STATE_INVALID", 502)
+                after = page.next_after
             self.received_error = None
         except ConsoleError as error:
             if error.status == 401:
                 raise
             self.received_error = error.code
 
-    def threads(self):
-        values = self.store.threads()
+    def routine_runs(self, values=None):
+        """Imported routine-run conversations by thread ID (the run's RID): label and local scheduled time."""
+        runs, now = {}, self.clock()
+        for value in self.store.threads() if values is None else values:
+            saved = self.journal.get(value["thread_id"], RECEIVED_PHASE)
+            if saved is None or saved["intent"]["sender_agent_id"] is not None:
+                continue
+            routine = saved["intent"]["routine"]
+            zone = ZoneInfo(routine["time_zone"])
+            when = datetime.fromisoformat(routine["scheduled_for"]).astimezone(zone)
+            local = f"{when:%m-%d %H:%M}" if when.year == now.astimezone(zone).year else f"{when:%Y-%m-%d %H:%M}"
+            runs[value["thread_id"]] = {
+                "scheduled_for": routine["scheduled_for"], "local_time": local, "label": f"排程 {local}：{value['label']}"}
+        return runs
+
+    def threads(self, selected=None, values=None):
+        """Own and other Agents' conversations in list order, then routine runs newest first: the latest
+        ROUTINE_THREADS and ``selected`` (the page groups them under 「排程」). ``values``: ``store.threads()``."""
+        values = self.store.threads() if values is None else values
+        runs = self.routine_runs(values)
         for value in values:
+            run = runs.get(value["thread_id"])
+            if run is not None:
+                # Each routine run is its own conversation; the list names it by its scheduled local time.
+                value["label"] = run["label"]
+                value["routine"] = {"scheduled_for": run["scheduled_for"]}
+                continue
             saved = self.journal.get(value["thread_id"], RECEIVED_PHASE)
             if saved is not None:
                 value["sender_agent_id"] = saved["intent"]["sender_agent_id"]
-        return values
+        newest = sorted((value for value in values if value["thread_id"] in runs),
+                        key=lambda value: datetime.fromisoformat(value["routine"]["scheduled_for"]), reverse=True)
+        shown = [value for index, value in enumerate(newest) if index < ROUTINE_THREADS or value["thread_id"] == selected]
+        return [value for value in values if value["thread_id"] not in runs] + shown
 
     def _saved(self, thread_id):
         for local in self.store.all(thread_id):
@@ -770,7 +829,7 @@ class NativeInstructionControl:
             self.consents.refresh(thread_id, token)
             return
         self._saved(thread_id)
-        if self.received_thread(thread_id):
+        if self.imported_thread(thread_id):
             root = self.receipts.get(thread_id)
             if root is None or root.status in {"accepted", "started", "unknown"}:
                 self._remember(thread_id, self._receipt(thread_id, token))
@@ -1595,7 +1654,8 @@ class NativeInstructionControl:
         command = self.store.command(draft["request_id"])
         prior = self.journal.get(draft["request_id"], "submit")
         received = self.received_thread(thread)
-        imported = self.journal.get(draft["request_id"], "group-observation") is not None or received
+        imported = (self.journal.get(draft["request_id"], "group-observation") is not None
+                    or self.journal.get(draft["request_id"], RECEIVED_PHASE) is not None)
         known = [item for rid, item in self.receipts.items() if self.request_threads.get(rid) == thread]
         cid = current.conversation_id if current is not None else next(
             (item.conversation_id for item in known if item.status != "busy_refused"), None)
@@ -1622,6 +1682,8 @@ class NativeInstructionControl:
         append_target = (self.appends.proposal(append_original) if authenticated
                          and thread in self.observed and append_original is not None else None)
         models = self.legacy.models
+        values = self.store.threads()
+        runs = self.routine_runs(values)
         return {
             **draft, "state_profile": profile, "editable": authenticated and draft["content"] is None,
             "can_append": append_target is not None and not append_target["pending"],
@@ -1637,7 +1699,7 @@ class NativeInstructionControl:
                           for task in tasks],
             },
             "hosted_session_id": running_session(current, known),
-            "hosted_agent_version": None, "threads": self.threads(),
+            "hosted_agent_version": None, "threads": self.threads(thread, values),
             "agent_conversation": None if not received else {
                 "sender_agent_id": self.journal.get(thread, RECEIVED_PHASE)["intent"]["sender_agent_id"],
                 "read_only": True},
@@ -1663,7 +1725,7 @@ class NativeInstructionControl:
             "connection_metadata_is_not_live_attestation": True,
             "attention": self.routines.attention([*self.hitl.attention(), *self.questions.attention(),
                                                    *self.consents.attention()]),
-            **({"routines": self.routines.view(thread)} if self.routines.enabled else {}),
+            **({"routines": self.routines.view(thread, runs)} if self.routines.enabled else {}),
             **({"native_hitl": self.hitl.view(thread), "native_questions": self.questions.view(thread),
                 "native_consents": self.consents.view(thread)}
                if self.hitl.enabled else {}),

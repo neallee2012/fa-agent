@@ -434,6 +434,10 @@ class PullAdapter:
                          and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", params["after"]))
                     and ("limit" not in params or type(params["limit"]) is int and 1 <= params["limit"] <= 100),
                     "ORIGIN_DENIED", 403)
+            elif path == "/work-policy/v1/native-turns/received":
+                # The official State store cursor of the previous page (StateStoreCursor), passed back unchanged.
+                require(method == "GET" and body is None and set(params) == {"after"} and type(params["after"]) is str
+                        and 0 < len(params["after"]) <= 2048 and params["after"].isprintable(), "ORIGIN_DENIED", 403)
             else:
                 names = {"after_turn", "limit"} if path.endswith("/history") else {"part"} if path.endswith("/result") else set()
                 require(native and method == "GET" and body is None and set(params) <= names

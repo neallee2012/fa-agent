@@ -5,6 +5,7 @@ principal; grants are the owner's only; the hooks stop on a failed read-only gat
 initialization or ask for a key without the owner at a terminal; the WebIQ key goes only into one PUT body.
 """
 
+import contextlib
 import dataclasses
 from datetime import datetime, timedelta, timezone
 import importlib.util
@@ -12,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -179,7 +181,7 @@ def context(hooks, tmp_path, routes, **values):
     base = {"AZURE_ENV_NAME": "dev", "AZURE_SUBSCRIPTION_ID": SUBSCRIPTION, "AZURE_LOCATION": "westus3",
             "AZURE_TENANT_ID": TENANT}
     return hooks.Context(values={**base, **values}, run=Runner(routes), state_root=tmp_path, az_cmd=["az"],
-                         python="python", tty=True,
+                         python="python", tty=True, sleep=lambda seconds: None,
                          prompt=lambda text: "y" if "Team owner" in text else "")
 
 
@@ -204,10 +206,15 @@ def region(missing=(), free=None):
     return {"cognitiveservices model list": ok(offered), "cognitiveservices usage list": ok(usage)}
 
 
+NO_ACCOUNT = failed("Not Found({\"error\":{\"code\":\"ResourceNotFound\"}})")
+
+
 def preprovision_routes(preflight, me=OWNER, tenant=TENANT, roles=("Owner",), directory=(), create_apps=True,
-                        cli_sp=True, offer=None):
-    """Order matters: the first matching key answers (the /me/... reads before /me)."""
-    return {**(offer or region()), "account show": ok({"id": SUBSCRIPTION, "tenantId": tenant}),
+                        cli_sp=True, offer=None, foundry=NO_ACCOUNT):
+    """Order matters: the first matching key answers (the /me/... reads before /me). `foundry` answers the ARM read
+    of the environment's Foundry account (FA_NETWORK_MODE immutability); by default it does not exist yet."""
+    return {**(offer or region()), "providers/Microsoft.CognitiveServices/accounts/": foundry,
+            "account show": ok({"id": SUBSCRIPTION, "tenantId": tenant}),
             "docker info": ok(),
             "role assignment list": ok(list(roles)),
             "transitiveMemberOf": ok({"value": [{"roleTemplateId": role} for role in directory]}),
@@ -363,6 +370,145 @@ def test_preprovision_stops_on_each_gate(hooks, tmp_path, change, message):
         hooks.preprovision(ctx)
 
 
+def test_bicep_unique_string_matches_bicep_console(hooks):
+    # Expected values printed by `bicep console` (Bicep 0.48.1) for the same uniqueString() arguments.
+    assert hooks.bicep_unique_string("abc") == "cgtzqvhu4i23s"
+    assert hooks.bicep_unique_string("abcdefg-hijk") == "bjmntbnflvbu2"
+    assert hooks.bicep_unique_string("/subscriptions/00000000-0000-0000-0000-000000000000", "dev",
+                                     "westus3") == "if6f5ucvkvxxu"
+    assert hooks.bicep_unique_string(f"/subscriptions/{SUBSCRIPTION}", "dev", "westus3") == "k5daenmuhikji"
+
+
+ACCOUNT = "cog-example000000"  # main.bicep's names.foundryAccount for SUBSCRIPTION, dev, westus3
+
+
+def test_the_account_name_is_main_biceps_naming_rule(hooks, tmp_path):
+    # foundry_account_name() repeats main.bicep's names.foundryAccount; this pins the Bicep side of the copy.
+    lines = {line.strip() for line in (ROOT / "infra" / "azd" / "main.bicep").read_text(encoding="utf-8").splitlines()}
+    assert {"var env = toLower(environmentName)", "var token = toLower(uniqueString(subscription().id, env, location))",
+            "foundryAccount: 'cog-${token}'"} <= lines
+    # ARM's subscription().id is lowercase and env is lowered; the location is hashed as given.
+    ctx = context(hooks, tmp_path, {}, AZURE_ENV_NAME="Dev", AZURE_SUBSCRIPTION_ID=SUBSCRIPTION.upper())
+    assert hooks.foundry_account_name(ctx) == ACCOUNT == "cog-" + hooks.bicep_unique_string(
+        f"/subscriptions/{SUBSCRIPTION}", "dev", "westus3")
+
+
+def test_a_recorded_account_other_than_the_bicep_name_stops_before_any_write(hooks, tmp_path):
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True})), FA_FOUNDRY_ACCOUNT="cog-other")
+    with pytest.raises(hooks.Stop, match=f"FA_FOUNDRY_ACCOUNT is cog-other, but main.bicep's naming rule gives "
+                                         f"{ACCOUNT}.*nothing was changed"):
+        hooks.preprovision(ctx)
+    assert writes_nothing(ctx) and not any("Microsoft.CognitiveServices/accounts/" in " ".join(call)
+                                           for call in ctx.run.calls)
+
+
+def foundry_account(injected):
+    """The ARM GET of an existing Foundry account, with or without the private-mode network injection."""
+    injections = [{"scenario": "agent", "subnetArmId": f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-dev/providers/"
+                                                       "Microsoft.Network/virtualNetworks/vnet-dev/subnets/snet-agents",
+                   "useMicrosoftManagedNetwork": False}] if injected else None
+    return ok({"name": ACCOUNT, "properties": {"networkInjections": injections}})
+
+
+def writes_nothing(ctx):
+    calls = [" ".join(map(str, call)) for call in ctx.run.calls]
+    return not any(word in call for call in calls
+                   for word in ("azd env set", "preflight_subscription.py", "--method put", "--method PATCH",
+                                "deployment group create", "register"))
+
+
+PRIVATE = {"FA_NETWORK_MODE": "private", "FA_ENABLE_MEMORY": "false"}
+
+
+@pytest.mark.parametrize("values, foundry, message", [
+    ({"FA_NETWORK_MODE": "isolated"}, NO_ACCOUNT, "must be public or private"),
+    ({**PRIVATE, "AZURE_LOCATION": "ukwest"}, NO_ACCOUNT, "ukwest is not in it.*one of: australiaeast, .*, westus3;"),
+    ({**PRIVATE, "AZURE_LOCATION": "UKWest "}, NO_ACCOUNT, "ukwest is not in it"),
+    ({}, foundry_account(injected=True), f"{ACCOUNT} already exists in rg-dev as FA_NETWORK_MODE=private"),
+    (PRIVATE, foundry_account(injected=False), "as FA_NETWORK_MODE=public"),
+])
+def test_preprovision_refuses_each_network_mode_conflict_before_any_write(hooks, tmp_path, values, foundry, message):
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True}), foundry=foundry), **values)
+    with pytest.raises(hooks.Stop, match=message):
+        hooks.preprovision(ctx)
+    assert writes_nothing(ctx) and "FA_TEAM_OWNER_OID" not in ctx.values
+
+
+READ_FAILURES = {
+    "AuthorizationFailed": failed("Forbidden({\"error\":{\"code\":\"AuthorizationFailed\",\"message\":\"no read\"}})"),
+    "MissingSubscriptionRegistration": failed(
+        "Bad Request({\"error\":{\"code\":\"MissingSubscriptionRegistration\",\"message\":\"The subscription is not "
+        "registered to use namespace 'Microsoft.CognitiveServices'\"}})"),
+    "BadGateway": failed("Bad Gateway({\"error\":{\"code\":\"BadGateway\"}})"),
+}
+
+
+@pytest.mark.parametrize("code, stops", [("AuthorizationFailed", True), ("MissingSubscriptionRegistration", False),
+                                         ("BadGateway", True)])
+def test_an_unreadable_foundry_account_stops_unless_its_provider_is_unregistered(hooks, tmp_path, code, stops):
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True}), foundry=READ_FAILURES[code]))
+    if stops:
+        with pytest.raises(hooks.Stop, match=f"Cannot confirm whether Foundry account {ACCOUNT} exists, so "
+                                             f"FA_NETWORK_MODE cannot be checked.*az sign-in and permissions.*"
+                                             f"nothing was changed.*{code}"):
+            hooks.preprovision(ctx)
+        assert writes_nothing(ctx) and "FA_TEAM_OWNER_OID" not in ctx.values
+    else:
+        # No account can exist without the provider; the subscription preflight that follows names it.
+        hooks.preprovision(ctx)
+        assert any("preflight_subscription.py" in " ".join(call) for call in ctx.run.calls)
+        read = next(index for index, call in enumerate(ctx.run.calls)
+                    if "Microsoft.CognitiveServices/accounts/" in " ".join(call))
+        assert writes_nothing(SimpleNamespace(run=SimpleNamespace(calls=ctx.run.calls[:read + 1])))
+
+
+@pytest.mark.parametrize("values, backend", [
+    ({}, "foundry"), ({"FA_ENABLE_MEMORY": "false"}, "foundry"), ({"FA_NETWORK_MODE": "private"}, "cosmos"),
+    (PRIVATE, "foundry"),  # private without memory: no store and no Cosmos DB
+])
+def test_preprovision_writes_the_memory_backend_bicep_reads(hooks, tmp_path, values, backend):
+    # ADR-0011: private keeps memory on (memory is on unless FA_ENABLE_MEMORY=false), in Cosmos DB, not refused.
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True})), **values)
+    hooks.preprovision(ctx)
+    assert ctx.values["FA_MEMORY_BACKEND"] == backend
+    assert ["azd", "env", "set", "FA_MEMORY_BACKEND", backend] in ctx.run.calls
+
+
+@pytest.mark.parametrize("values, injected", [({}, False), (PRIVATE, True)])
+def test_an_existing_account_of_the_same_mode_passes(hooks, tmp_path, values, injected):
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True}), foundry=foundry_account(injected)), **values)
+    hooks.preprovision(ctx)
+    (read,) = [call for call in ctx.run.calls if "Microsoft.CognitiveServices/accounts/" in " ".join(call)]
+    assert read[:4] == ["az", "rest", "--method", "get"]
+    assert read[5] == (f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-dev/providers/Microsoft.CognitiveServices/"
+                       f"accounts/{ACCOUNT}?api-version=2025-06-01")
+
+
+@pytest.mark.parametrize("values", [{"AZURE_LOCATION": "WestUS3"}, {"FA_ENABLE_MEMORY": " False "}])
+def test_private_reads_the_region_and_memory_flag_in_any_case(hooks, tmp_path, values):
+    # Same as models.memory_on and profile._flag: surrounding spaces and case do not matter.
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True})), **{**PRIVATE, **values})
+    hooks.preprovision(ctx)
+
+
+@pytest.mark.parametrize("values, backend", [(PRIVATE, "foundry"), ({"FA_NETWORK_MODE": "private"}, "cosmos")])
+def test_a_new_private_environment_passes_and_asks_the_preflight_for_its_providers(hooks, tmp_path, values, backend):
+    # The preflight checks Microsoft.DocumentDB only for the Cosmos DB memory (memory on), not for every private.
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True})), **values)
+    hooks.preprovision(ctx)
+    document = json.loads((tmp_path / "dev" / "fa" / "preflight-deployment.json").read_text(encoding="utf-8"))
+    assert document["network_mode"] == "private" and document["memory_backend"] == backend
+
+
+def test_public_keeps_every_region_main_bicep_allows(hooks, tmp_path):
+    # ukwest is a pre-existing inconsistency (allowed by main.bicep, absent from the Agent Service table): only
+    # private refuses it, public behaves as before.
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True})), AZURE_LOCATION="ukwest")
+    hooks.preprovision(ctx)
+    document = json.loads((tmp_path / "dev" / "fa" / "preflight-deployment.json").read_text(encoding="utf-8"))
+    assert document["network_mode"] == "public" and document["location"] == "ukwest"
+
+
 def test_postprovision_stops_before_entra_when_the_aca_platform_is_not_ready(hooks, tmp_path):
     ctx = context(hooks, tmp_path, {"account show": ok({"id": SUBSCRIPTION, "tenantId": TENANT}), "azd env set": ok(),
                                     "preflight_subscription.py": failed(stdout='{"ok": false}')},
@@ -394,8 +540,8 @@ def plan_value():
                            sha256="abcdef0123456789" + "0" * 48, empty_table_observed_at=observed)
 
 
-def approval_context(hooks, tmp_path, me=OWNER, answer="y", tty=True):
-    ctx = context(hooks, tmp_path, {"graph.microsoft.com/v1.0/me": ok({"id": me})}, FA_TEAM_OWNER_OID=OWNER)
+def approval_context(hooks, tmp_path, me=OWNER, answer="y", tty=True, **values):
+    ctx = context(hooks, tmp_path, {"graph.microsoft.com/v1.0/me": ok({"id": me})}, FA_TEAM_OWNER_OID=OWNER, **values)
     ctx.tty, ctx.prompt = tty, (lambda text: answer)
     ctx.now = lambda: datetime(2026, 10, 10, 9, 0, tzinfo=timezone.utc)
     return ctx
@@ -454,6 +600,65 @@ def test_nobody_else_and_nothing_automatic_approves_the_initialization(hooks, tm
     assert not path.exists()
 
 
+def no_prompt(text):
+    raise AssertionError(f"asked {text!r}")
+
+
+@pytest.mark.parametrize("tty", [True, False])
+def test_the_owner_can_approve_the_initialization_ahead_by_env_name(hooks, tmp_path, capsys, tty):
+    """Neal 2026-10-24: FA_APPROVE_INITIALIZATION=<azd env name> replaces the typed y, never the owner check."""
+    from shared_context.behavior_fresh_installation import FreshInstallationAuthorization
+    path = tmp_path / "authorization.json"
+    ctx = approval_context(hooks, tmp_path, tty=tty, FA_APPROVE_INITIALIZATION="dev")
+    ctx.prompt = no_prompt
+    hooks.authorize(ctx, plan_value(), path)
+    shown = capsys.readouterr().out
+    assert all(item in shown for item in ("request dev-fresh-001", "c" * 64, plan_value().sha256,
+                                          "FA_APPROVE_INITIALIZATION=dev (no typed answer)"))
+    value = json.loads(path.read_text(encoding="utf-8"))
+    assert value["decision_id"] == "dev-fresh-preapproved-20261010T090000Z"
+    assert value["authorizing_human_oid"] == OWNER and value["plan_sha256"] == plan_value().sha256
+    assert value["approval_source"] == "operator-approved-file"
+    FreshInstallationAuthorization.model_validate_json(path.read_text(encoding="utf-8"))  # the Jobs' own schema
+
+
+def test_a_typed_approval_keeps_the_plain_decision_id(hooks, tmp_path):
+    from shared_context.behavior_fresh_installation import FreshInstallationAuthorization
+    path = tmp_path / "authorization.json"
+    hooks.authorize(approval_context(hooks, tmp_path), plan_value(), path)
+    assert json.loads(path.read_text(encoding="utf-8"))["decision_id"] == "dev-fresh-20261010T090000Z"
+    FreshInstallationAuthorization.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("tty", [True, False])
+@pytest.mark.parametrize("me, value, message", [
+    (OTHER, "dev", "only the Team owner"),
+    (OWNER, "prod", "not this environment's name"),
+    (OWNER, "Dev", "not this environment's name"),  # exact match, as FA_CONFIRM_DELETE
+    (OWNER, "de", "not this environment's name"),   # a prefix of the name
+    (OWNER, "dev-2", "not this environment's name"),  # the name is a prefix of it
+])
+def test_a_pre_approval_never_skips_the_owner_or_names_another_env(hooks, tmp_path, tty, me, value, message):
+    path = tmp_path / "authorization.json"
+    ctx = approval_context(hooks, tmp_path, me=me, tty=tty, FA_APPROVE_INITIALIZATION=value)
+    ctx.prompt = no_prompt
+    with pytest.raises(SystemExit, match=message):
+        hooks.authorize(ctx, plan_value(), path)
+    assert not path.exists()
+
+
+def test_without_a_pre_approval_a_terminal_still_asks(hooks, tmp_path):
+    asked = []
+    ctx = approval_context(hooks, tmp_path, FA_APPROVE_INITIALIZATION="")  # empty reads as unset
+    ctx.prompt = lambda text: asked.append(text) or "n"
+    with pytest.raises(SystemExit, match="not approved"):
+        hooks.authorize(ctx, plan_value(), tmp_path / "authorization.json")
+    assert asked == ["Approve this initialization of the plan above? [y/N]: "]
+    with pytest.raises(SystemExit, match="interactive terminal.*FA_APPROVE_INITIALIZATION=dev"):
+        hooks.authorize(approval_context(hooks, tmp_path, tty=False), plan_value(), tmp_path / "authorization.json")
+    assert not (tmp_path / "authorization.json").exists()
+
+
 @pytest.mark.parametrize("cut", [EOFError, KeyboardInterrupt])
 def test_a_closed_or_interrupted_prompt_stops_and_writes_nothing(hooks, tmp_path, cut):
     """azd exiting or Ctrl+C while a question waits: a Stop, not a traceback, and nothing recorded. The 2026-10-21
@@ -496,6 +701,7 @@ def test_a_cut_prompt_names_the_command_that_asks_again(hooks, tmp_path, monkeyp
         monkeypatch.setenv(key, value)
     monkeypatch.delenv("FA_MODELS", raising=False)
     monkeypatch.delenv("FA_CONFIRM_DELETE", raising=False)
+    monkeypatch.delenv("FA_APPROVE_INITIALIZATION", raising=False)
     assert hooks.main([phase]) == 1
     assert f"no answer was read (input closed or interrupted): nothing was approved and no answer was saved. " \
            f"Run `{resume}`" in capsys.readouterr().err
@@ -752,8 +958,9 @@ def test_stage_keeps_its_original_webiq_names(monkeypatch):
         assert set(profile.get("api_secret_environment") or {}) == {"FA_FEED_MCP_SIGNING_KEY"}
 
 
-def deploy_case(hooks, tmp_path, monkeypatch, api_exists, keep_select=False, **values):
-    steps = []
+def deploy_case(hooks, tmp_path, monkeypatch, api_exists, keep_select=False, routes=None, steps=None, tty=True,
+                **values):
+    steps = [] if steps is None else steps
     record = lambda name, result=None: (lambda *args, **kwargs: steps.append(name) or result)  # noqa: E731
     built = {"api": "a", "hosted": "h", "console": "c"}
     monkeypatch.setattr(hooks, "git_commit", lambda: "f" * 40)
@@ -768,9 +975,13 @@ def deploy_case(hooks, tmp_path, monkeypatch, api_exists, keep_select=False, **v
     monkeypatch.setattr(hooks, "fresh_install", record("fresh_install", tmp_path / "plan.json"))
     monkeypatch.setattr(hooks, "ci_step", lambda ctx, commit, command, *args: steps.append(f"ci:{command}"))
     show = ok({"name": "ca-api-dev"}) if api_exists else failed("ResourceNotFound")
-    ctx = context(hooks, tmp_path, {"containerapp show": show, "azd env set": ok()},
+    # The FA_NETWORK_MODE check reads the account (a public one by default); a test's own account route answers instead.
+    ctx = context(hooks, tmp_path, {"Microsoft.CognitiveServices/accounts/": foundry_account(injected=False),
+                                    **(routes or {}),
+                                    "containerapp show": show, "azd env set": ok()},
                   FA_PROJECT_ENDPOINT="https://p", FA_API_URL="https://a", FA_API_AUDIENCE="api://x",
                   FA_CONSOLE_APP_ID="c", FA_API_APP="ca-api-dev", **values)
+    ctx.tty = tty
     hooks.deploy(ctx)
     return steps, ctx
 
@@ -783,6 +994,18 @@ def test_first_install_runs_the_standard_flow_order(hooks, tmp_path, monkeypatch
                      "sync_job", "fresh_install", "ci:sync", "api_app", "console_app", "prepare_sessions",
                      "select_defaults", "summary"]
     assert ctx.values["FA_SESSIONS_PREPARED"] == "true" and ctx.values["FA_DEPLOY_RUN"] == "1"
+
+
+@pytest.mark.parametrize("answer", [NO_ACCOUNT, READ_FAILURES["MissingSubscriptionRegistration"]])
+def test_deploy_stops_before_any_build_or_write_without_the_provisioned_account(hooks, tmp_path, monkeypatch, answer):
+    # A changed AZURE_LOCATION derives another name: preprovision's "new environment" is not one for deploy.
+    steps = []
+    with pytest.raises(hooks.Stop, match=f"Foundry account {ACCOUNT} was not found in rg-dev, and azd deploy needs "
+                                         r"the provisioned account.*AZURE_LOCATION.*`azd provision` first; nothing "
+                                         "was changed"):
+        deploy_case(hooks, tmp_path, monkeypatch, api_exists=True, steps=steps,
+                    routes={"Microsoft.CognitiveServices/accounts/": answer})
+    assert steps == []
 
 
 def test_a_failed_default_selection_is_retried_on_the_first_install_path(hooks, tmp_path, monkeypatch):
@@ -875,7 +1098,7 @@ def test_postdown_removes_only_this_environments_objects_and_keeps_the_records(h
     routes = {"account show": ok({"id": SUBSCRIPTION, "tenantId": TENANT}), "rest --method": roles,
               "azd env set": ok()}
     ctx = context(hooks, tmp_path, routes, FA_BACKUP_ROLE_ID=ours["id"], FA_FRESH_INSTALLED="true",
-                  FA_TEAM_OWNER_OID=OWNER, FA_ENABLE_WEBIQ="false")
+                  FA_TEAM_OWNER_OID=OWNER, FA_ENABLE_WEBIQ="false", FA_NETWORK_MODE="private")
     monkeypatch.setattr(ctx, "graph", answer)
     (tmp_path / "dev" / "fa").mkdir(parents=True)
     (tmp_path / "dev" / "fa" / "intent.json").write_text("{}", encoding="utf-8")
@@ -887,7 +1110,7 @@ def test_postdown_removes_only_this_environments_objects_and_keeps_the_records(h
     # azd 1.32 has no `azd env unset`; an empty value reads as unset.
     cleared = {call[3] for call in ctx.run.calls if call[:3] == ["azd", "env", "set"] and call[4] == ""}
     assert "FA_FRESH_INSTALLED" in cleared and "FA_BACKUP_ROLE_ID" in cleared
-    assert not cleared & {"FA_TEAM_OWNER_OID", "FA_ENABLE_WEBIQ"}
+    assert not cleared & {"FA_TEAM_OWNER_OID", "FA_ENABLE_WEBIQ", "FA_NETWORK_MODE"}  # the next azd up keeps the mode
     assert not [call for call in ctx.run.calls if "unset" in call]
     graph.calls.clear()
     hooks.postdown(ctx)  # a rerun finds nothing left and deletes nothing
@@ -1072,6 +1295,33 @@ def test_a_new_console_is_internal_until_its_sign_in_config_exists(hooks, tmp_pa
     assert set(deployed[0][1]) <= declared and set(deployed[1][1]) <= declared
 
 
+@pytest.mark.parametrize("values, account", [
+    ({"FA_NETWORK_MODE": "private"}, True),  # Cosmos memory embeds at the account root
+    ({"FA_NETWORK_MODE": "private", "FA_ENABLE_MEMORY": "false"}, False),
+    ({"FA_NETWORK_MODE": "public"}, False),
+    ({}, False),
+])
+def test_agent_roles_add_account_openai_user_only_for_cosmos_memory(hooks, tmp_path, monkeypatch, values, account):
+    # fa-priv-1024 (2026-10-24): with project roles only, every account-root embedding failed and nothing was written.
+    deployed = []
+    monkeypatch.setattr(hooks, "deploy_bicep", lambda ctx, name, template, parameters: deployed.append(
+        (name, template, parameters)) or {})
+    keys = [key for key, _, _ in hooks.fa_profile.agent_names({"FA_ENVIRONMENT": "dev"})]
+    oids = {f"FA_AGENT_{key}_OID": f"oid-{key}" for key in keys}
+    ctx = context(hooks, tmp_path, {}, FA_FOUNDRY_ACCOUNT="acct", FA_PROJECT="proj", **oids, **values)
+    hooks.agent_roles(ctx)
+    first = list(deployed)
+    hooks.agent_roles(ctx)
+    assert deployed == first + first  # a rerun sends the same deployments; the Bicep guid() names keep one each
+    granted = [(name, parameters) for name, template, parameters in first if template.name == "account-access.bicep"]
+    assert granted == ([(f"fa-dev-account-access-{key.lower()}", {
+        "accountName": "acct", "principalId": f"oid-{key}", "roleId": "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"})
+        for key in keys] if account else [])
+    assert len(first) - len(granted) == len(keys)  # the project roles stay as they were
+    for _, template, parameters in first:
+        assert set(parameters) <= set(re.findall(r"^param (\w+)", template.read_text(encoding="utf-8"), re.MULTILINE))
+
+
 def test_predown_leaves_someone_elses_lock_alone(hooks, tmp_path):
     ctx = context(hooks, tmp_path, {**outside(hooks), "lock list": ok([LOCK, {"name": "team-hold", "id": "x"}])},
                   FA_CONFIRM_DELETE="dev")
@@ -1152,7 +1402,7 @@ def test_a_region_where_no_model_fits_stops_before_billing(hooks, tmp_path):
 
 
 def test_an_environment_provisioned_before_the_choice_is_not_asked_and_keeps_its_models(hooks, tmp_path):
-    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True}), offer={}), FA_FOUNDRY_ACCOUNT="cog-x",
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True}), offer={}), FA_FOUNDRY_ACCOUNT=ACCOUNT,
                   FA_TEAM_OWNER_OID=OWNER)
     ctx.prompt = lambda text: pytest.fail("asked an installed environment to choose")
     hooks.preprovision(ctx)
@@ -1194,6 +1444,12 @@ def test_one_choice_names_the_default_the_memory_model_and_the_deployments(value
 def test_a_choice_that_cannot_serve_stops(hooks, values, message):
     with pytest.raises(SystemExit, match=message):
         sys.modules["models"].parse(values, CATALOG)
+
+
+def test_the_cosmos_memory_creates_no_memory_store(hooks, tmp_path):
+    ctx = context(hooks, tmp_path, {}, FA_NETWORK_MODE="private", FA_MODELS="gpt-5.4-mini")
+    hooks.memory_store(ctx)  # the Runner raises on any command: none is run
+    assert ctx.run.calls == []
 
 
 def test_the_memory_store_is_made_with_the_chosen_chat_model(hooks, tmp_path):
@@ -1307,3 +1563,1053 @@ def test_an_allowed_dirty_build_is_built_and_never_reused(hooks, tmp_path):
     clean = image_case(hooks, tmp_path, "", **{**CACHED, "FA_IMAGES_COMMIT": ctx.values["FA_IMAGES_COMMIT"]})
     hooks.images(clean, "f" * 40, "e" * 64)
     assert len(builds(clean)) == 3 and clean.values["FA_IMAGES_COMMIT"] == "f" * 40
+
+
+# ---- ADR-0010 section 5: the deploy window of FA_NETWORK_MODE=private ----------------------------------------------
+
+IP = "198.51.100.7"
+OPEN_BODY = {"properties": {"publicNetworkAccess": "Enabled", "networkAcls": {
+    "defaultAction": "Deny", "bypass": "AzureServices", "ipRules": [{"value": IP}]}}}
+CLOSE_BODY = {"properties": {"publicNetworkAccess": "Disabled", "networkAcls": {
+    "defaultAction": "Deny", "bypass": "AzureServices", "ipRules": []}}}
+PRIVATE_DEPLOY = {**PRIVATE, "FA_FOUNDRY_ACCOUNT": ACCOUNT}
+
+
+class FakeAccount:
+    """The private environment's Foundry account: PATCH bodies change it, GETs read it back, and its data plane
+    answers only while public network access is on. `close` = "refused" (the PATCH fails) or "ignored" (it answers
+    200 but nothing changes) breaks the closing PATCH only."""
+
+    def __init__(self, open_to=None, close=None, data_plane=True, log=None):
+        self.properties = {"provisioningState": "Succeeded", "networkInjections": [{"scenario": "agent"}],
+                           **json.loads(json.dumps((OPEN_BODY if open_to else CLOSE_BODY)["properties"]))}
+        if open_to:
+            self.properties["networkAcls"]["ipRules"] = [{"value": open_to}]
+        self.close, self.data_plane_on, self.patches = close, data_plane, []
+        self.log = [] if log is None else log
+
+    def __call__(self, args):
+        if args[args.index("--method") + 1] == "patch":
+            body = json.loads(Path(args[args.index("--body") + 1][1:]).read_text(encoding="utf-8"))
+            self.patches.append(body)
+            opening = body["properties"]["publicNetworkAccess"] == "Enabled"
+            self.log.append("window:open" if opening else "window:close")
+            if not opening and self.close == "refused":
+                return failed("ERROR: (AuthorizationFailed) no write")
+            if opening or self.close != "ignored":
+                self.properties.update(json.loads(json.dumps(body["properties"])))
+            return ok({})
+        return ok({"name": ACCOUNT, "properties": json.loads(json.dumps(self.properties))})
+
+    def data_plane(self, args):
+        if self.data_plane_on and self.properties["publicNetworkAccess"] == "Enabled":
+            return ok({"data": []})
+        return failed("ERROR: Forbidden({\"error\":{\"message\":\"Public access is disabled.\"}})")
+
+    def routes(self):
+        return {"/agents?api-version=v1": self.data_plane, "Microsoft.CognitiveServices/accounts/": self}
+
+
+@pytest.fixture
+def deployer(hooks, monkeypatch):
+    """The echo service's answer; a test that must not reach it replaces this with a failure."""
+    monkeypatch.setattr(hooks, "deployer_ipv4", lambda: IP)
+
+
+def private_deploy(hooks, tmp_path, monkeypatch, account, api_exists=False, **values):
+    return deploy_case(hooks, tmp_path, monkeypatch, api_exists, routes=account.routes(), steps=account.log,
+                       **{**PRIVATE_DEPLOY, "FA_CONFIRM_DEPLOY_WINDOW": IP, **values})
+
+
+def window_context(hooks, tmp_path, account, **values):
+    return context(hooks, tmp_path, account.routes(), **PRIVATE_DEPLOY, FA_PROJECT_ENDPOINT="https://p", **values)
+
+
+def test_private_deploy_opens_the_window_only_around_the_data_plane_steps(hooks, tmp_path, monkeypatch, deployer,
+                                                                          capsys):
+    account = FakeAccount()
+    steps, ctx = private_deploy(hooks, tmp_path, monkeypatch, account)
+    assert steps[:8] == ["profile", "images", "window:open", "webiq", "memory_store", "seed", "window:close",
+                         "agent_roles"]
+    # Only the two properties are written, never networkInjections; the account reads back closed.
+    assert account.patches == [OPEN_BODY, CLOSE_BODY]
+    assert account.properties["networkInjections"] == [{"scenario": "agent"}]
+    assert hooks.window_closed({"properties": account.properties})
+    probes = [call for call in ctx.run.calls if "/agents?api-version=v1" in " ".join(call)]
+    assert probes and all(call[call.index("--resource") + 1] == "https://ai.azure.com" for call in probes)
+    out = capsys.readouterr().out
+    assert f"opens it to {IP} alone" in out and "shared NAT" in out and "closed again (read back" in out
+    question = out.split("FA: Foundry account")[0]  # what the person reads before confirming
+    assert "up to about 10 min" in question and "stays open until you answer" in question
+    assert "data plane" not in question
+
+
+def test_a_private_upgrade_wraps_webiq_and_skips_the_window_without_data_plane_steps(hooks, tmp_path, monkeypatch,
+                                                                                      deployer):
+    account = FakeAccount()
+    steps, _ = private_deploy(hooks, tmp_path, monkeypatch, account, api_exists=True, FA_SESSIONS_PREPARED="true",
+                              FA_ENABLE_WEBIQ="true")
+    assert steps[steps.index("ci:gate"):steps.index("ci:guard")] == ["ci:gate", "window:open", "webiq",
+                                                                     "memory_store", "window:close"]
+    monkeypatch.setattr(hooks, "deployer_ipv4", lambda: pytest.fail("no data-plane step, so no IP is read"))
+    account = FakeAccount()
+    steps, _ = private_deploy(hooks, tmp_path, monkeypatch, account, api_exists=True, FA_SESSIONS_PREPARED="true")
+    assert account.patches == [] and "window:open" not in steps
+    # Private memory is Cosmos DB (ADR-0011): no memory store on the Foundry data plane, so no window for it either.
+    account = FakeAccount()
+    steps, _ = private_deploy(hooks, tmp_path, monkeypatch, account, api_exists=True, FA_SESSIONS_PREPARED="true",
+                              FA_ENABLE_MEMORY="true")
+    assert account.patches == [] and "window:open" not in steps
+
+
+def test_the_window_keeps_every_other_network_acl_field(hooks, tmp_path, deployer):
+    # Bicep sets virtualNetworkRules: [] today; phase 2b may add rules, and the PATCH replaces networkAcls whole.
+    account = FakeAccount()
+    account.properties["networkAcls"]["virtualNetworkRules"] = [{"id": "/subscriptions/x/.../subnets/snet-api"}]
+    ctx = window_context(hooks, tmp_path, account, FA_CONFIRM_DEPLOY_WINDOW=IP)
+    with hooks.data_plane_window(ctx, hooks.window_ip(ctx, seeding=True)):
+        pass
+    rules = [{"id": "/subscriptions/x/.../subnets/snet-api"}]
+    assert [patch["properties"]["networkAcls"].pop("virtualNetworkRules") for patch in account.patches] == [rules] * 2
+    assert account.patches == [OPEN_BODY, CLOSE_BODY]
+    assert account.properties["networkAcls"]["virtualNetworkRules"] == rules
+
+
+@pytest.mark.parametrize("close", ["refused", "ignored"])
+def test_a_failed_close_is_loud_names_the_command_and_stops(hooks, tmp_path, monkeypatch, deployer, capsys, close):
+    account = FakeAccount(close=close)
+    with pytest.raises(hooks.Stop, match=f"Foundry account {ACCOUNT} could not be closed again"):
+        private_deploy(hooks, tmp_path, monkeypatch, account)
+    assert "agent_roles" not in account.log  # nothing after the window runs
+    err = capsys.readouterr().err
+    assert f"WARNING: Foundry account {ACCOUNT} may still be open" in err
+    close_file = tmp_path / "dev" / "fa" / "foundry-window-close.json"
+    assert (f"az rest --method patch --url \"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-dev/providers/"
+            f"Microsoft.CognitiveServices/accounts/{ACCOUNT}?api-version=2025-06-01\" --body @{close_file} "
+            "--headers Content-Type=application/json") in err
+    assert json.loads(close_file.read_text(encoding="utf-8")) == CLOSE_BODY
+
+
+def test_a_failed_step_and_a_failed_close_report_both(hooks, tmp_path, deployer, capsys):
+    account = FakeAccount(close="refused")
+    ctx = window_context(hooks, tmp_path, account, FA_CONFIRM_DEPLOY_WINDOW=IP)
+    with pytest.raises(hooks.Stop, match="could not be closed again"):
+        with hooks.data_plane_window(ctx, hooks.window_ip(ctx, seeding=True)):
+            raise hooks.Stop("seed went wrong")
+    assert "the steps stopped: seed went wrong" in capsys.readouterr().err  # not lost behind the close failure
+
+
+def interrupting(account, when):
+    """The account's routes, recording the SIGINT handler at each ARM call and raising KeyboardInterrupt (a Ctrl+C)
+    at the first call `when(args)` picks."""
+    handlers, routes = [], account.routes()
+
+    def call(args):
+        handlers.append(signal.getsignal(signal.SIGINT))
+        if when(args):
+            raise KeyboardInterrupt
+        return account(args)
+
+    return {**routes, "Microsoft.CognitiveServices/accounts/": call}, handlers
+
+
+def test_ctrl_c_in_the_window_steps_still_closes_it_with_ctrl_c_deferred(hooks, tmp_path, deployer, capsys):
+    account = FakeAccount()
+    routes, handlers = interrupting(account, lambda args: False)
+    ctx = context(hooks, tmp_path, routes, **PRIVATE_DEPLOY, FA_PROJECT_ENDPOINT="https://p",
+                  FA_CONFIRM_DEPLOY_WINDOW=IP)
+    before = signal.getsignal(signal.SIGINT)
+    with pytest.raises(KeyboardInterrupt):
+        with hooks.data_plane_window(ctx, hooks.window_ip(ctx, seeding=True)):
+            raise KeyboardInterrupt
+    assert account.patches == [OPEN_BODY, CLOSE_BODY] and hooks.window_closed({"properties": account.properties})
+    # The open (read, PATCH) ran with the usual handler; the close and its read-back with Ctrl+C ignored.
+    assert handlers[0] == before and len(handlers) > 3 and set(handlers[2:]) == {signal.SIG_IGN}
+    assert signal.getsignal(signal.SIGINT) == before
+    assert "closed again (read back: publicNetworkAccess Disabled, no IP rule); the steps stopped: KeyboardInterrupt" \
+        in capsys.readouterr().out
+
+
+def test_ctrl_c_during_the_close_is_loud_and_goes_on(hooks, tmp_path, deployer, capsys):
+    account = FakeAccount()
+    closing = lambda args: "patch" in args and "foundry-window-close.json" in " ".join(args)  # noqa: E731
+    routes, _ = interrupting(account, closing)
+    ctx = context(hooks, tmp_path, routes, **PRIVATE_DEPLOY, FA_PROJECT_ENDPOINT="https://p",
+                  FA_CONFIRM_DEPLOY_WINDOW=IP)
+    with pytest.raises(KeyboardInterrupt):
+        with hooks.data_plane_window(ctx, hooks.window_ip(ctx, seeding=True)):
+            pass
+    out, err = capsys.readouterr()
+    assert "Ctrl+C is ignored until it reads back closed" in out and "press it again afterwards" in out
+    assert f"WARNING: Foundry account {ACCOUNT} may still be open" in err and "failed: KeyboardInterrupt" in err
+    assert "az rest --method patch --url" in err and "foundry-window-close.json" in err
+
+
+def test_the_windows_console_handler_is_restored_also_when_the_body_raises(hooks, monkeypatch):
+    calls = []
+    kernel32 = SimpleNamespace(SetConsoleCtrlHandler=lambda handler, add: calls.append((handler, add)))
+    monkeypatch.setattr(hooks, "ctypes", SimpleNamespace(windll=SimpleNamespace(kernel32=kernel32)))
+    monkeypatch.setattr(hooks.os, "name", "nt")
+    with hooks.interrupt_deferred():
+        assert calls == [(None, True)]
+    with pytest.raises(RuntimeError):
+        with hooks.interrupt_deferred():
+            raise RuntimeError("the close failed")
+    assert calls == [(None, True), (None, False)] * 2
+
+
+@pytest.mark.parametrize("hang", [False, True])
+def test_every_window_az_call_is_bounded_and_a_hung_close_prints_the_command(hooks, tmp_path, deployer, capsys, hang):
+    # The close ignores Ctrl+C, so an az that never answers must time out, not hang the deploy.
+    account = FakeAccount()
+    ctx = window_context(hooks, tmp_path, account, FA_CONFIRM_DEPLOY_WINDOW=IP)
+    fake, timeouts = ctx.run, []
+
+    def run(args, **kwargs):
+        if "Microsoft.CognitiveServices/accounts/" in " ".join(args):
+            timeouts.append(kwargs.get("timeout"))
+            if hang and "foundry-window-close.json" in " ".join(args):
+                raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+        return fake(args, **kwargs)
+
+    ctx.run = run
+    expected = (pytest.raises(hooks.Stop, match=f"{ACCOUNT} could not be closed again") if hang
+                else contextlib.nullcontext())
+    with expected:
+        with hooks.data_plane_window(ctx, hooks.window_ip(ctx, seeding=True)):
+            pass
+    assert len(timeouts) >= 4 and set(timeouts) == {90}  # open GET+PATCH, close GET+PATCH, and each read-back
+    err = capsys.readouterr().err
+    if hang:
+        assert f"WARNING: Foundry account {ACCOUNT} may still be open" in err and "timed out after 90" in err
+        assert "az rest --method patch --url" in err and "foundry-window-close.json" in err
+    else:
+        assert err == "" and hooks.window_closed({"properties": account.properties})
+
+
+class FakeChild:
+    """A Popen whose first wait() is cut by Ctrl+C."""
+
+    def __init__(self):
+        self.waits = 0
+
+    def wait(self):
+        self.waits += 1
+        if self.waits == 1:
+            raise KeyboardInterrupt
+        return 7
+
+    def kill(self):
+        pytest.fail("the child is never killed: its finally closes the window")
+
+    terminate = kill
+
+
+def test_the_parent_keeps_waiting_through_ctrl_c_and_returns_the_childs_code(hooks, capsys):
+    child = FakeChild()
+    assert hooks.wait_child(child) == 7 and child.waits == 2
+    assert "waiting for the deploy to stop" in capsys.readouterr().err
+
+
+def test_the_main_entry_exits_non_zero_when_the_window_does_not_close(hooks, tmp_path, monkeypatch, deployer, capsys):
+    account = FakeAccount(close="refused")
+
+    def deploy(ctx):  # main()'s own Context is replaced by one with the fake account
+        window = window_context(hooks, tmp_path, account, FA_CONFIRM_DEPLOY_WINDOW=IP)
+        with hooks.data_plane_window(window, hooks.window_ip(window, True)):
+            pass
+
+    monkeypatch.setitem(hooks.PHASES, "deploy", deploy)
+    for key, value in {"AZURE_ENV_NAME": "dev", "FA_AZD_VENV": "1"}.items():
+        monkeypatch.setenv(key, value)
+    assert hooks.main(["deploy"]) == 1
+    assert "FA: stopped: Foundry account" in capsys.readouterr().err
+
+
+def test_a_hung_opening_call_is_a_readable_stop_and_still_closes(hooks, tmp_path, monkeypatch, deployer, capsys):
+    account = FakeAccount()
+    window = window_context(hooks, tmp_path, account, FA_CONFIRM_DEPLOY_WINDOW=IP)
+    fake = window.run
+
+    def run(args, **kwargs):
+        if "foundry-window-open.json" in " ".join(args):
+            raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+        return fake(args, **kwargs)
+
+    def deploy(ctx):
+        window.run = run
+        with hooks.data_plane_window(window, hooks.window_ip(window, True)):
+            pytest.fail("the steps never run")
+
+    monkeypatch.setitem(hooks.PHASES, "deploy", deploy)
+    for key, value in {"AZURE_ENV_NAME": "dev", "FA_AZD_VENV": "1"}.items():
+        monkeypatch.setenv(key, value)
+    assert hooks.main(["deploy"]) == 1
+    out, err = capsys.readouterr()
+    assert "FA: stopped: Command" in err and "timed out after 90 seconds" in err and "Traceback" not in err
+    assert "closed again (read back" in out and account.patches == [CLOSE_BODY]
+
+
+@pytest.mark.parametrize("api_exists, values, patches", [
+    (False, {}, [CLOSE_BODY, OPEN_BODY, CLOSE_BODY]),        # first install: closed first, then its own window
+    (True, {"FA_SESSIONS_PREPARED": "true"}, [CLOSE_BODY]),  # an upgrade without data-plane steps still closes it
+])
+def test_a_window_left_open_by_an_interrupted_run_is_closed_first(hooks, tmp_path, monkeypatch, deployer, capsys,
+                                                                  api_exists, values, patches):
+    account = FakeAccount(open_to="192.0.2.44")
+    steps, _ = private_deploy(hooks, tmp_path, monkeypatch, account, api_exists=api_exists, **values)
+    assert account.patches == patches and steps[:2] == ["window:close", "profile"]
+    assert "192.0.2.44" in capsys.readouterr().out
+    assert hooks.window_closed({"properties": account.properties})
+
+
+@pytest.mark.parametrize("tty, confirmation", [(False, ""), (False, "192.0.2.1"), (True, "")])
+@pytest.mark.parametrize("api_exists, values", [(False, {}),
+                                                (True, {"FA_SESSIONS_PREPARED": "true", "FA_ENABLE_WEBIQ": "true"})])
+def test_the_window_is_confirmed_before_the_image_build(hooks, tmp_path, monkeypatch, deployer, tty, confirmation,
+                                                        api_exists, values):
+    # The terminal's answer is "" (context()'s prompt), FA_CONFIRM_DEPLOY_WINDOW is unset or for another IP.
+    account = FakeAccount()
+    with pytest.raises(hooks.Stop, match="nothing was changed"):
+        private_deploy(hooks, tmp_path, monkeypatch, account, api_exists=api_exists, tty=tty,
+                       FA_CONFIRM_DEPLOY_WINDOW=confirmation, **values)
+    assert account.log == [] and account.patches == []  # no profile, no build, no window
+
+
+def test_an_ip_changed_during_the_build_opens_nothing(hooks, tmp_path, monkeypatch):
+    answers = iter([IP, "203.0.113.9"])
+    monkeypatch.setattr(hooks, "deployer_ipv4", lambda: next(answers))
+    account = FakeAccount()
+    with pytest.raises(hooks.Stop, match=f"is now 203.0.113.9, not the {IP} confirmed before the image build; "
+                                         "nothing was opened"):
+        private_deploy(hooks, tmp_path, monkeypatch, account)
+    assert account.log == ["profile", "images"] and account.patches == []
+
+
+def make_public(account):
+    """What a public account reads: no network injection, public network access on, no IP rule."""
+    account.properties.update(networkInjections=None, publicNetworkAccess="Enabled")
+    return account
+
+
+@pytest.mark.parametrize("api_exists, values", [(False, {}), (True, {"FA_SESSIONS_PREPARED": "true"})])
+def test_a_mis_set_private_mode_never_touches_a_public_account(hooks, tmp_path, monkeypatch, deployer, api_exists,
+                                                               values):
+    # A public account is "open" by window_closed(): without the check the leftover close would PATCH it Disabled.
+    account = make_public(FakeAccount())
+    with pytest.raises(hooks.Stop, match=f"{ACCOUNT} already exists in rg-dev as FA_NETWORK_MODE=public.*nothing "
+                                         "was changed"):
+        private_deploy(hooks, tmp_path, monkeypatch, account, api_exists=api_exists, **values)
+    assert account.patches == [] and account.log == []  # stopped before the profile, the build and any window
+
+
+@pytest.mark.parametrize("tty, answer, values", [
+    (True, "y", {}),                                           # a y/N habit is not the IP
+    (True, "198.51.100.8", {}),                                # another IP
+    (False, None, {}),                                         # no terminal, no confirmation
+    (False, None, {"FA_CONFIRM_DEPLOY_WINDOW": "192.0.2.1"}),  # a confirmation made on another network
+])
+def test_the_window_opens_only_for_the_confirmed_ip(hooks, tmp_path, deployer, tty, answer, values):
+    account = FakeAccount()
+    ctx = window_context(hooks, tmp_path, account, **values)
+    ctx.tty, ctx.prompt = tty, (lambda text: answer)
+    with pytest.raises(hooks.Stop, match="nothing was changed"):
+        hooks.window_ip(ctx, seeding=True)
+    assert account.patches == [] and ctx.run.calls == []
+
+
+def test_a_typed_ip_opens_and_closes_the_window(hooks, tmp_path, deployer):
+    account = FakeAccount()
+    ctx = window_context(hooks, tmp_path, account)
+    asked = []
+    ctx.prompt = lambda text: asked.append(text) or IP
+    with hooks.data_plane_window(ctx, hooks.window_ip(ctx, seeding=True)):
+        assert account.properties["publicNetworkAccess"] == "Enabled"
+    assert asked == [f"Type the IP ({IP}) to allow it for these steps: "]
+    assert account.patches == [OPEN_BODY, CLOSE_BODY]
+
+
+def test_a_data_plane_that_never_answers_stops_and_still_closes(hooks, tmp_path, deployer):
+    account = FakeAccount(data_plane=False)
+    ctx = window_context(hooks, tmp_path, account, FA_CONFIRM_DEPLOY_WINDOW=IP)
+    ran = []
+    with pytest.raises(hooks.Stop, match="the Foundry data plane to answer .*not reached within 3 min"):
+        with hooks.data_plane_window(ctx, hooks.window_ip(ctx, seeding=True)):
+            ran.append("step")
+    assert ran == [] and account.patches == [OPEN_BODY, CLOSE_BODY]
+
+
+def test_public_deploy_only_reads_the_foundry_account_and_never_opens_it(hooks, tmp_path, monkeypatch):
+    # One GET for the FA_NETWORK_MODE check; any PATCH would fail the test.
+    monkeypatch.setattr(hooks, "deployer_ipv4", lambda: pytest.fail("public mode reads no IP"))
+    for values in ({}, {"FA_NETWORK_MODE": "public"}):
+        account = make_public(FakeAccount())
+        steps, ctx = deploy_case(hooks, tmp_path, monkeypatch, api_exists=False, routes=account.routes(),
+                                 FA_ENABLE_WEBIQ="true", FA_CONFIRM_DEPLOY_WINDOW=IP, FA_FOUNDRY_ACCOUNT=ACCOUNT,
+                                 **values)
+        assert steps[:6] == ["profile", "images", "webiq", "memory_store", "seed", "agent_roles"]
+        assert [call[call.index("--method") + 1] for call in ctx.run.calls if "rest" in call] == ["get"]
+        assert account.patches == []
+    steps, ctx = deploy_case(hooks, tmp_path, monkeypatch, api_exists=True, FA_SESSIONS_PREPARED="true",
+                             FA_ENABLE_WEBIQ="true")
+    assert "webiq" in steps and [call[call.index("--method") + 1] for call in ctx.run.calls if "rest" in call] == [
+        "get"]
+
+
+@pytest.mark.parametrize("values, account, stop", [
+    ({"FA_NETWORK_MODE": "isolated"}, None, "must be public or private, not 'isolated'"),  # mistyped
+    ({}, FakeAccount(), f"{ACCOUNT} already exists in rg-dev as FA_NETWORK_MODE=private"),  # cleared on a private one
+])
+def test_deploy_alone_checks_the_network_mode_before_anything(hooks, tmp_path, monkeypatch, values, account, stop):
+    # `azd deploy` without provision: a wrong mode would drop FA_NETWORK_MODE (the Work IQ guard) from the API.
+    monkeypatch.setattr(hooks, "deployer_ipv4", lambda: pytest.fail("stopped before the IP"))
+    steps = []
+    with pytest.raises(hooks.Stop, match=stop):
+        deploy_case(hooks, tmp_path, monkeypatch, api_exists=True, steps=steps,
+                    routes=account.routes() if account else None, FA_FOUNDRY_ACCOUNT=ACCOUNT, **values)
+    assert steps == [] and (account is None or account.patches == [])
+
+
+class FakeEcho:
+    def __init__(self, body):
+        self.body = body
+
+    def __call__(self, url, timeout):
+        assert url == "https://api.ipify.org" and timeout == 15
+        if isinstance(self.body, Exception):
+            raise self.body
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, size):
+        return self.body
+
+
+@pytest.mark.parametrize("body, stop", [
+    (b"8.8.4.4\n", None),
+    (OSError("timed out"), r"cannot read this computer's public IPv4 from https://api\.ipify\.org \(timed out\)"),
+    (b"2001:4860:4860::8888", "cannot read this computer's public IPv4"),  # IPv6 or junk is not an IPv4
+    (b"10.1.2.3", r"10\.1\.2\.3, which is not a public IPv4"),
+    (b"224.0.0.1", r"224\.0\.0\.1, which is not a public IPv4"),  # multicast reads as global
+])
+def test_the_deployer_ip_is_one_public_ipv4_or_a_stop(hooks, monkeypatch, body, stop):
+    monkeypatch.setattr(hooks.urllib.request, "urlopen", FakeEcho(body))
+    if stop is None:
+        assert hooks.deployer_ipv4() == "8.8.4.4"
+    else:
+        with pytest.raises(hooks.Stop, match=stop):
+            hooks.deployer_ipv4()
+
+
+# ---- ADR-0010 section 7: predown of FA_NETWORK_MODE=private --------------------------------------------------------
+
+NOT_FOUND = failed("ERROR: Not Found({\"error\":{\"code\":\"ResourceNotFound\"}})")
+GATEWAY_TIMEOUT = failed("ERROR: (GatewayTimeout) The gateway did not receive a response")
+def nested(*ids):
+    """The account DELETE's CannotDeleteResource, in the shape Azure answers (live run 2026-10-24)."""
+    listed = ", ".join(f"'Microsoft.CognitiveServices/accounts/{ACCOUNT}/{item}'" for item in ids)
+    return failed("ERROR: (CannotDeleteResource) Cannot delete resource while nested resources exist. Some existing "
+                  f"nested resource IDs include: {listed}.\nCode: CannotDeleteResource")
+
+
+STALE_PROJECT = nested("projects/fa-dev")  # the same text whether the project is deleted or still there
+
+
+class FakeFoundry(FakeAccount):
+    """A private environment being taken down. The account goes Deleting on its DELETE (refused while the project
+    exists) and disappears after `deleting_polls` reads, leaving a soft-deleted copy; the purge removes it after one
+    read; snet-agents loses one service association link per read. `delete_answer` replaces the DELETE's answer
+    (the state change happens anyway, as when the CLI times out). `project` is True, False or "Deleting" (gone after
+    one read). `stale_project`: how many account DELETEs are still refused for the deleted project. `faults`:
+    "no-start" (the account DELETE changes nothing), "project-timeout" (the project DELETE answers GatewayTimeout
+    but goes on), "sticky-agents" (agent DELETEs answer 200, the agents stay), "agents-404" (agent DELETEs answer
+    404 and the agents go), "purge-fails" (the purge is refused and the copy stays), "project-refused" (the project
+    DELETE answers STALE_PROJECT and the project stays). `refuse_delete`: the answer of every account DELETE."""
+
+    def __init__(self, account="Succeeded", project=True, agents=("fa-dev-a", "fa-dev-b"), soft_deleted=False,
+                 links=1, deleting_polls=2, delete_answer=None, refuse_delete=False, open_to=None, faults=(),
+                 stale_project=0):
+        super().__init__(open_to=open_to)
+        self.account, self.project, self.agents, self.soft_deleted = account, project, list(agents), soft_deleted
+        self.links, self.deleting_polls, self.delete_answer = links, deleting_polls, delete_answer
+        self.stale_project = stale_project
+        self.refuse_delete, self.purging, self.faults = refuse_delete, False, set(faults)
+
+    def __call__(self, args):
+        text, method = " ".join(args), args[args.index("--method") + 1]
+        if "subnets/snet-agents" in text:
+            links, self.links = self.links, max(0, self.links - 1)
+            return ok({"properties": {"serviceAssociationLinks": [{"name": "legionservicelink"}] * links}})
+        if "deletedAccounts/" in text:
+            if method == "delete":
+                self.log.append("purge")
+                if "purge-fails" in self.faults:
+                    return failed("ERROR: (Conflict) the purge was refused")
+                self.purging = True
+                return ok()
+            if self.purging:
+                self.soft_deleted, self.purging = False, False
+                return ok({"name": ACCOUNT})
+            return ok({"name": ACCOUNT}) if self.soft_deleted else NOT_FOUND
+        if "/projects/" in text:
+            if method == "delete":
+                self.log.append("project:delete")
+                if "project-refused" in self.faults:
+                    return STALE_PROJECT
+                self.project = False
+                return GATEWAY_TIMEOUT if "project-timeout" in self.faults else ok()
+            if not self.project:
+                return NOT_FOUND
+            state, self.project = ("Deleting", False) if self.project == "Deleting" else ("Succeeded", True)
+            return ok({"name": f"{ACCOUNT}/fa-dev", "properties": {"provisioningState": state}})
+        if method == "patch":
+            return super().__call__(args)
+        if method == "delete":
+            self.log.append("account:delete")
+            if self.refuse_delete:
+                return self.refuse_delete
+            if self.project:
+                return STALE_PROJECT
+            if self.stale_project:
+                self.stale_project -= 1
+                return STALE_PROJECT
+            if "no-start" not in self.faults:
+                self.account = "Deleting"
+            return self.delete_answer or ok()
+        if self.account == "Deleting":
+            self.deleting_polls -= 1
+            if self.deleting_polls < 0:
+                self.account, self.soft_deleted = None, True
+        if self.account is None:
+            return NOT_FOUND
+        return ok({"name": ACCOUNT, "properties": {**json.loads(json.dumps(self.properties)),
+                                                   "provisioningState": self.account}})
+
+    def data_plane(self, args):
+        if self.properties["publicNetworkAccess"] != "Enabled":
+            return failed("ERROR: Forbidden({\"error\":{\"message\":\"Public access is disabled.\"}})")
+        if args[args.index("--method") + 1] == "delete":
+            url = args[args.index("--url") + 1]
+            assert url.endswith("?force=true&api-version=v1")
+            name = url.split("/agents/")[1].split("?")[0]
+            self.log.append(f"agent:{name}")
+            if "sticky-agents" not in self.faults:
+                self.agents.remove(name)
+            return NOT_FOUND if "agents-404" in self.faults else ok()
+        return ok({"data": [{"name": name} for name in self.agents]})
+
+    def routes(self):
+        return {"/agents": self.data_plane, "snet-agents": self, "Microsoft.CognitiveServices/": self}
+
+
+def private_down(hooks, tmp_path, foundry, locks=(LOCK,), tty=True, answers=("dev",), **values):
+    def lock_delete(args):
+        foundry.log.append("lock:delete")
+        return ok()
+
+    routes = {**foundry.routes(), **outside(hooks), "lock list": ok(list(locks)), "lock delete": lock_delete}
+    ctx = context(hooks, tmp_path, routes, **{**PRIVATE, **values})
+    asked = []
+    ctx.tty, ctx.prompt = tty, lambda text: asked.append(text) or answers[len(asked) - 1]
+    return ctx, asked
+
+
+def writes(ctx):
+    return [call for call in ctx.run.calls
+            if "--method" in call and call[call.index("--method") + 1] in ("patch", "delete", "put")
+            or "lock" in call and "delete" in call]
+
+
+def test_private_predown_asks_once_and_deletes_in_the_verified_order(hooks, tmp_path, deployer, capsys):
+    foundry = FakeFoundry(links=3)
+    ctx, asked = private_down(hooks, tmp_path, foundry)
+    hooks.predown(ctx)
+    assert asked == [f"Type the environment name (dev) to permanently delete and purge Foundry account {ACCOUNT} and "
+                     "remove the backup lock: "]
+    assert foundry.log == ["window:open", "agent:fa-dev-a", "agent:fa-dev-b", "window:close", "project:delete",
+                           "account:delete", "purge", "lock:delete"]
+    assert foundry.account is None and not foundry.soft_deleted and foundry.links == 0
+    assert foundry.patches == [OPEN_BODY, CLOSE_BODY]
+    out = capsys.readouterr().out
+    assert (f"permanently deletes the Foundry account {ACCOUNT} with its models and Hosted Agents" in out
+            and f"opens the account to {IP} alone" in out and "azd asks its own y/N for the rest" in out
+            and "waiting for Foundry account" in out and "snet-agents has no service association link" in out)
+    # Short lines, one point each, before the question.
+    explanation = out.split("FA: FA_NETWORK_MODE=private: before")[1].split("FA: Foundry account")[0]
+    assert len(explanation.splitlines()) >= 5 and max(map(len, explanation.splitlines())) < 120
+
+
+@pytest.mark.parametrize("tty, answers, values, locks", [
+    (True, ("yes",), {}, (LOCK,)),                         # anything but the name
+    (True, ("Dev",), {}, ()),                              # private asks even without the backup lock
+    (False, (), {}, ()),                                   # no terminal, no confirmation
+    (False, (), {"FA_CONFIRM_DELETE": "other"}, (LOCK,)),  # a confirmation for another environment
+])
+def test_private_predown_without_the_name_writes_nothing(hooks, tmp_path, deployer, tty, answers, values, locks):
+    foundry = FakeFoundry()
+    ctx, asked = private_down(hooks, tmp_path, foundry, locks=locks, tty=tty, answers=answers, **values)
+    with pytest.raises(hooks.Stop, match="nothing was removed"):
+        hooks.predown(ctx)
+    assert writes(ctx) == [] and foundry.log == [] and len(asked) == (1 if tty else 0)
+
+
+@pytest.mark.parametrize("tty, answers, values, ip", [
+    (True, ("yes",), {}, IP),                       # the wrong name
+    (False, (), {}, IP),                            # no terminal, no confirmation
+    (True, ("dev",), {}, None),                     # the IP read fails
+])
+def test_private_predown_closes_a_leftover_window_before_it_asks(hooks, tmp_path, monkeypatch, capsys, tty, answers,
+                                                                 values, ip):
+    def echo():
+        if ip is None:
+            raise hooks.Stop("cannot read this computer's public IPv4")
+        return ip
+
+    monkeypatch.setattr(hooks, "deployer_ipv4", echo)
+    foundry = FakeFoundry(open_to="192.0.2.44")
+    ctx, asked = private_down(hooks, tmp_path, foundry, tty=tty, answers=answers, **values)
+    with pytest.raises(hooks.Stop):
+        hooks.predown(ctx)
+    assert foundry.log == ["window:close"] and foundry.patches == [CLOSE_BODY]
+    assert hooks.window_closed({"properties": foundry.properties})
+    out = capsys.readouterr().out
+    assert f"Foundry account {ACCOUNT} is open (publicNetworkAccess Enabled, IP rules ['192.0.2.44']" in out
+    assert "closed again (read back" in out
+
+
+@pytest.mark.parametrize("project", [True, False])
+def test_a_mis_set_private_predown_never_deletes_a_public_account(hooks, tmp_path, monkeypatch, project):
+    monkeypatch.setattr(hooks, "deployer_ipv4", lambda: pytest.fail("refused before the IP"))
+    foundry = make_public(FakeFoundry(project=project))
+    ctx, asked = private_down(hooks, tmp_path, foundry, FA_CONFIRM_DELETE="dev")
+    with pytest.raises(hooks.Stop, match="as FA_NETWORK_MODE=public.*nothing was changed"):
+        hooks.predown(ctx)
+    assert writes(ctx) == [] and foundry.log == [] and asked == []
+
+
+def test_private_predown_without_a_terminal_runs_on_the_name_alone(hooks, tmp_path, deployer, capsys):
+    foundry = FakeFoundry(agents=())
+    ctx, asked = private_down(hooks, tmp_path, foundry, locks=(), tty=False, FA_CONFIRM_DELETE="dev")
+    hooks.predown(ctx)
+    assert asked == [] and foundry.log == ["window:open", "window:close", "project:delete", "account:delete",
+                                           "purge"]
+    assert "Hosted Agents: none left" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("state, log", [
+    # the project is gone (and its agents with it): no window, no IP
+    ({"project": False}, ["account:delete", "purge"]),
+    # the account is Deleting already: the delete is not sent again
+    ({"project": False, "account": "Deleting"}, ["purge"]),
+    # the account is gone and soft-deleted
+    ({"project": False, "account": None, "soft_deleted": True}, ["purge"]),
+    # gone and purged; only the subnet link is still there
+    ({"project": False, "account": None, "links": 2}, []),
+    # the project is Deleting from an earlier run: polled, never deleted again, no window
+    ({"project": "Deleting"}, ["account:delete", "purge"]),
+])
+def test_private_predown_continues_from_each_state(hooks, tmp_path, monkeypatch, state, log):
+    monkeypatch.setattr(hooks, "deployer_ipv4", lambda: pytest.fail("no project, so no window and no IP"))
+    foundry = FakeFoundry(**state)
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    hooks.predown(ctx)
+    assert foundry.log == log and foundry.patches == []
+    assert foundry.account is None and not foundry.soft_deleted and foundry.links == 0
+
+
+def test_a_gateway_timeout_on_the_account_delete_is_polled_never_resent(hooks, tmp_path, capsys):
+    foundry = FakeFoundry(project=False, deleting_polls=4, delete_answer=GATEWAY_TIMEOUT)
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    hooks.predown(ctx)
+    assert foundry.log.count("account:delete") == 1 and foundry.log == ["account:delete", "purge"]
+    assert "reading its state instead of sending it again" in capsys.readouterr().out
+
+
+def test_a_gateway_timeout_without_a_start_stops_after_about_90_s(hooks, tmp_path, capsys):
+    foundry = FakeFoundry(project=False, delete_answer=GATEWAY_TIMEOUT, faults={"no-start"})
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    with pytest.raises(hooks.Stop, match=f"Foundry account {ACCOUNT} to start deleting after the GatewayTimeout: not "
+                                         r"reached within 2 min \(last: Succeeded\); nothing more was sent.*The delete "
+                                         "did not start; the rerun reads the state again"):
+        hooks.predown(ctx)
+    assert foundry.log == ["account:delete"] and foundry.account == "Succeeded"  # sent once, no purge
+
+
+def test_a_gateway_timeout_on_the_project_delete_is_polled_never_resent(hooks, tmp_path, deployer, capsys):
+    foundry = FakeFoundry(agents=(), faults={"project-timeout"})
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    hooks.predown(ctx)
+    assert foundry.log == ["window:open", "window:close", "project:delete", "account:delete", "purge"]
+    assert "the delete of project fa-dev answered: ERROR: (GatewayTimeout)" in capsys.readouterr().out
+
+
+def test_an_agent_delete_answering_404_counts_as_deleted(hooks, tmp_path, deployer, capsys):
+    foundry = FakeFoundry(agents=("fa-dev-a",), faults={"agents-404"})
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    hooks.predown(ctx)
+    assert foundry.log[:4] == ["window:open", "agent:fa-dev-a", "window:close", "project:delete"]
+    assert "Hosted Agent fa-dev-a: already deleted (404)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("state, message, log", [
+    ({"faults": {"sticky-agents"}, "agents": ("fa-dev-a",)}, "still listed after three rounds",
+     ["window:open"] + ["agent:fa-dev-a"] * 3 + ["window:close"]),
+    ({"project": False, "account": None, "soft_deleted": True, "faults": {"purge-fails"}},
+     f"soft-deleted Foundry account {ACCOUNT} to be purged: not reached within 10 min", ["purge"]),
+    ({"project": False, "account": None, "links": 10_000},
+     "snet-agents to drop its service association link: not reached within 20 min", []),
+])
+def test_each_teardown_step_that_never_finishes_stops_with_the_backups_locked(hooks, tmp_path, deployer, state,
+                                                                              message, log):
+    foundry = FakeFoundry(**state)
+    ctx, _ = private_down(hooks, tmp_path, foundry)
+    with pytest.raises(hooks.Stop, match=message):
+        hooks.predown(ctx)
+    assert foundry.log == log and "lock:delete" not in foundry.log
+    assert hooks.window_closed({"properties": foundry.properties})
+
+
+@pytest.mark.parametrize("ids", [
+    ("projects/fa-dev/connections/webiq-key",),       # deeper than the project
+    ("capabilityHosts/agents",),                      # another kind of nested resource
+    ("projects/fa-dev2",),                            # another project, the name a prefix of it
+    ("projects/fa-dev", "projects/fa-dev/connections/webiq-key"),  # the project and more
+    (),                                               # no nested ID listed at all
+])
+def test_an_account_delete_refused_for_more_than_its_own_project_stops_at_once(hooks, tmp_path, ids):
+    foundry = FakeFoundry(project=False, refuse_delete=nested(*ids))
+    ctx, _ = private_down(hooks, tmp_path, foundry)
+    sleeps = []
+    ctx.sleep = sleeps.append
+    with pytest.raises(hooks.Stop, match="CannotDeleteResource.*it is still Succeeded. Read it back"):
+        hooks.predown(ctx)
+    assert foundry.log == ["account:delete"] and sleeps == []  # no wait, no purge, and the backup lock stays
+
+
+def test_a_refused_project_delete_is_never_resent(hooks, tmp_path, deployer):
+    foundry = FakeFoundry(agents=(), faults={"project-refused"})
+    ctx, _ = private_down(hooks, tmp_path, foundry)
+    with pytest.raises(hooks.Stop, match="deleting project fa-dev failed.*CannotDeleteResource"):
+        hooks.predown(ctx)
+    assert foundry.log == ["window:open", "window:close", "project:delete"]
+
+
+def test_a_deleted_project_still_blocking_the_account_delete_is_resent_until_it_starts(hooks, tmp_path, deployer,
+                                                                                      capsys):
+    foundry = FakeFoundry(agents=(), stale_project=2)
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    hooks.predown(ctx)
+    assert foundry.log == ["window:open", "window:close", "project:delete"] + ["account:delete"] * 3 + ["purge"]
+    assert "still listed (CannotDeleteResource); sending it again every 15 s for at most 5 min" in capsys.readouterr().out
+
+
+def test_a_deleted_project_blocking_past_the_bound_stops_with_the_account_still_there(hooks, tmp_path):
+    foundry = FakeFoundry(project=False, stale_project=10_000)
+    ctx, _ = private_down(hooks, tmp_path, foundry)
+    sleeps = []
+    ctx.sleep = sleeps.append
+    with pytest.raises(hooks.Stop, match="CannotDeleteResource.*it is still Succeeded. Read it back"):
+        hooks.predown(ctx)
+    assert foundry.log == ["account:delete"] * 21  # the first and 20 resends; no purge, the lock stays
+    assert sleeps == [15] * 20
+
+
+def test_a_gateway_timeout_after_a_resent_delete_is_polled_never_resent(hooks, tmp_path):
+    foundry = FakeFoundry(project=False, stale_project=1, deleting_polls=4, delete_answer=GATEWAY_TIMEOUT)
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    hooks.predown(ctx)
+    assert foundry.log == ["account:delete", "account:delete", "purge"]
+
+
+def test_an_account_that_never_goes_stops_after_the_bounded_wait(hooks, tmp_path):
+    foundry = FakeFoundry(project=False, account="Deleting", deleting_polls=10_000)
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    with pytest.raises(hooks.Stop, match="to be deleted: not reached within 45 min.*nothing more was sent"):
+        hooks.predown(ctx)
+    assert writes(ctx) == []
+
+
+@pytest.mark.parametrize("answer, outcome", [
+    (NOT_FOUND, None),
+    (failed("ERROR: Not Found({\"error\":{\"code\":\"DeletedAccountNotFound\"}})"), None),  # any 404 of the resource
+    (failed("ERROR: Not Found({\"error\":{\"code\":\"SubscriptionNotFound\"}})"), "subscription .* was not found"),
+    (failed("ERROR: Not Found({\"error\":{\"code\":\"ResourceGroupNotFound\"}})"), "resource group rg-dev was not"),
+    (failed("ERROR: (AuthorizationFailed) no read"), "az rest get .* failed: ERROR: \\(AuthorizationFailed\\)"),
+])
+def test_only_a_404_of_the_resource_itself_reads_as_gone(hooks, tmp_path, answer, outcome):
+    ctx = context(hooks, tmp_path, {"rest --method get": answer})
+    if outcome is None:
+        assert hooks._arm_get(ctx, "/subscriptions/x/resourceGroups/rg-dev/providers/y?api-version=1") is None
+    else:
+        with pytest.raises(hooks.Stop, match=outcome):
+            hooks._arm_get(ctx, "/subscriptions/x/resourceGroups/rg-dev/providers/y?api-version=1")
+
+
+@pytest.mark.parametrize("copy, line", [
+    (NOT_FOUND, None),                                                      # purged already: nothing to say
+    (ok({"name": ACCOUNT}), "is still soft-deleted; to purge it yourself"),
+    (failed("ERROR: (AuthorizationFailed) no read"), "may still be soft-deleted (the read failed"),
+])
+def test_private_predown_of_a_deleted_group_says_so_and_removes_nothing(hooks, tmp_path, monkeypatch, capsys, copy,
+                                                                        line):
+    monkeypatch.setattr(hooks, "deployer_ipv4", lambda: pytest.fail("nothing to delete, so no IP"))
+    gone = failed("ERROR: Not Found({\"error\":{\"code\":\"ResourceGroupNotFound\"}})")
+    ctx = context(hooks, tmp_path, {"deletedAccounts/": copy, "Microsoft.CognitiveServices/": gone, **outside(hooks),
+                                    "lock list": ok([])}, **PRIVATE)
+    ctx.prompt = lambda text: pytest.fail("nothing to confirm")
+    hooks.predown(ctx)  # never stops: postdown still has the Entra apps to delete
+    assert writes(ctx) == []
+    out = capsys.readouterr().out
+    assert f"resource group rg-dev does not exist, so Foundry account {ACCOUNT}" in out
+    if line is None:
+        assert "soft-deleted" not in out
+    else:
+        assert (f"Foundry account {ACCOUNT} {line}" in out and f"az rest --method delete --url \"/subscriptions/"
+                f"{SUBSCRIPTION}/providers/Microsoft.CognitiveServices/locations/westus3/resourceGroups/rg-dev/"
+                f"deletedAccounts/{ACCOUNT}?api-version=2025-06-01\"" in out)
+
+
+def test_private_predown_of_a_deleted_group_without_a_region_still_goes_on(hooks, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(hooks, "deployer_ipv4", lambda: pytest.fail("nothing to delete, so no IP"))
+    gone = failed("ERROR: Not Found({\"error\":{\"code\":\"ResourceGroupNotFound\"}})")
+    ctx = context(hooks, tmp_path, {"Microsoft.CognitiveServices/": gone, **outside(hooks), "lock list": ok([])},
+                  **PRIVATE, FA_FOUNDRY_ACCOUNT=ACCOUNT, AZURE_LOCATION="")
+    ctx.prompt = lambda text: pytest.fail("nothing to confirm")
+    hooks.predown(ctx)  # the soft-deleted copy's URL needs the region; its read is informational, so no stop
+    assert writes(ctx) == []
+    out = capsys.readouterr().out
+    assert (f"Foundry account {ACCOUNT} may still be soft-deleted (the read failed: azd environment value "
+            "AZURE_LOCATION is missing" in out and "to purge it yourself" not in out)
+
+
+def test_public_predown_never_touches_foundry(hooks, tmp_path, monkeypatch):
+    # Public behaves as before: no lock means no question and no write; FA's routes answer no Foundry call.
+    monkeypatch.setattr(hooks, "deployer_ipv4", lambda: pytest.fail("public mode reads no IP"))
+    for values in ({}, {"FA_NETWORK_MODE": "public"}):
+        ctx = context(hooks, tmp_path, {**outside(hooks), "lock list": ok([])}, **values)
+        ctx.prompt = lambda text: pytest.fail("no question without the lock")
+        hooks.predown(ctx)
+        assert not any("Microsoft.CognitiveServices" in " ".join(call) for call in ctx.run.calls)
+        ctx = context(hooks, tmp_path, {**outside(hooks), "lock list": ok([LOCK]), "lock delete": ok()}, **values)
+        asked = []
+        ctx.prompt = lambda text: asked.append(text) or "dev"
+        hooks.predown(ctx)
+        assert asked == ["Deleting rg-dev deletes its Table data and M1 backups for good. Type the environment name "
+                         "(dev) to remove the backup lock: "]
+        assert not any("Microsoft.CognitiveServices" in " ".join(call) for call in ctx.run.calls)
+
+
+# ---- ADR-0010 phase 2b: an existing VNet --------------------------------------------------------------------------
+
+USER_VNET = (f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-net/providers/Microsoft.Network/virtualNetworks/"
+             "vnet-hub")
+BYO = {**PRIVATE, "FA_VNET_RESOURCE_ID": USER_VNET}
+NO_RESOURCE = failed("Not Found({\"error\":{\"code\":\"ResourceNotFound\"}})")
+DELEGATED = [{"name": "aca", "properties": {"serviceName": "Microsoft.App/environments"}}]
+
+
+def app_subnet(prefix, links=0, delegations=DELEGATED, egress=True):
+    return {"properties": {"addressPrefix": prefix, "delegations": delegations,
+                           "serviceAssociationLinks": [{"name": "legionservicelink"}] * links,
+                           **({"natGateway": {"id": "nat"}} if egress else {})}}
+
+
+def user_vnet(location="westus3", dns=(), space=("10.20.0.0/16",), **subnets):
+    """ARM GETs of the user's VNet and its subnets (None: the subnet does not exist); anything but a GET fails."""
+    found = {"snet-api": app_subnet("10.20.0.0/27"), "snet-agents": app_subnet("10.20.1.0/24"),
+             "snet-private-endpoints": {"properties": {"addressPrefix": "10.20.2.0/27"}}, **subnets}
+
+    def read(args):
+        assert args[args.index("--method") + 1] == "get", args
+        path = args[args.index("--url") + 1].split("?")[0]
+        if path == USER_VNET:
+            return ok({"location": location, "properties": {"dhcpOptions": {"dnsServers": list(dns)},
+                                                             "addressSpace": {"addressPrefixes": list(space)}}})
+        subnet = found.get(path.rsplit("/", 1)[-1])
+        return NO_RESOURCE if subnet is None else ok(subnet)
+    return read
+
+
+def byo_context(hooks, tmp_path, vnet=None, foundry=NO_ACCOUNT, cae=NO_RESOURCE, **values):
+    routes = {"Microsoft.Network/virtualNetworks/": vnet or user_vnet(), "Microsoft.App/managedEnvironments/": cae,
+              **preprovision_routes(ok({"ok": True}), foundry=foundry)}
+    return context(hooks, tmp_path, routes, **{**BYO, **values})
+
+
+def injected_into(subnet):
+    return ok({"name": ACCOUNT, "properties": {"networkInjections": [
+        {"scenario": "agent", "subnetArmId": subnet, "useMicrosoftManagedNetwork": False}]}})
+
+
+def test_an_existing_vnet_that_fits_passes_with_reads_only(hooks, tmp_path, capsys):
+    ctx = byo_context(hooks, tmp_path)
+    hooks.preprovision(ctx)
+    network = [call for call in ctx.run.calls if "Microsoft.Network/" in " ".join(call)]
+    assert len(network) == 4 and all(call[:4] == ["az", "rest", "--method", "get"] for call in network)
+    assert [call[5].split("?")[0] for call in network] == [USER_VNET] + [
+        f"{USER_VNET}/subnets/{name}" for name in ("snet-api", "snet-agents", "snet-private-endpoints")]
+    out = capsys.readouterr().out
+    assert ("FA: existing VNet vnet-hub in rg-net (read only): snet-api and snet-agents delegated to "
+            "Microsoft.App/environments, private endpoints in snet-private-endpoints; DNS azd") in out
+    assert "warning" not in out
+    assert any("preflight_subscription.py" in " ".join(call) for call in ctx.run.calls)
+
+
+def test_an_existing_vnet_takes_the_users_subnet_names(hooks, tmp_path):
+    vnet = user_vnet(app=app_subnet("10.20.0.0/26"), agents=app_subnet("10.20.4.0/23"),
+                     pe={"properties": {"addressPrefix": "10.20.2.0/28"}})
+    ctx = byo_context(hooks, tmp_path, vnet, FA_API_SUBNET_NAME="app", FA_AGENT_SUBNET_NAME="agents",
+                      FA_PRIVATE_ENDPOINT_SUBNET_NAME="pe")
+    hooks.preprovision(ctx)
+
+
+def test_a_rerun_accepts_the_links_of_this_environments_own_account_and_environment(hooks, tmp_path):
+    vnet = user_vnet(**{"snet-api": app_subnet("10.20.0.0/27", links=1),
+                        "snet-agents": app_subnet("10.20.1.0/24", links=1)})
+    cae = ok({"properties": {"vnetConfiguration": {"infrastructureSubnetId": f"{USER_VNET}/subnets/snet-api"}}})
+    ctx = byo_context(hooks, tmp_path, vnet, foundry=injected_into(f"{USER_VNET.upper()}/subnets/snet-agents"),
+                      cae=cae)
+    hooks.preprovision(ctx)
+    (read,) = [call for call in ctx.run.calls if "managedEnvironments/" in " ".join(call)]
+    assert read[5].startswith(f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-dev/providers/Microsoft.App/"
+                              "managedEnvironments/cae-dev?")
+
+
+def test_existing_dns_takes_a_vnet_with_its_own_dns_servers(hooks, tmp_path):
+    ctx = byo_context(hooks, tmp_path, user_vnet(dns=["10.0.0.4"]), FA_DNS_MODE="existing")
+    hooks.preprovision(ctx)
+
+
+def test_missing_egress_and_a_small_agent_subnet_only_warn(hooks, tmp_path, capsys):
+    # FA adds no egress; a Virtual WAN hub can route a subnet without a route table, so this cannot be judged here.
+    vnet = user_vnet(**{"snet-agents": app_subnet("10.20.1.0/26", egress=False)})
+    hooks.preprovision(byo_context(hooks, tmp_path, vnet))
+    out = capsys.readouterr().out
+    assert "warning: subnet snet-agents has no NAT gateway or route table. FA adds no egress" in out
+    assert "warning: subnet snet-agents is 10.20.1.0/26; Foundry recommends /24" in out
+
+
+@pytest.mark.parametrize("vnet, values, foundry, cae, message", [
+    (user_vnet(location="eastus"), {}, NO_ACCOUNT, NO_RESOURCE, "vnet-hub is in eastus.*use a VNet in westus3"),
+    (user_vnet(**{"snet-agents": app_subnet("10.20.1.0/24", delegations=[])}), {}, NO_ACCOUNT, NO_RESOURCE,
+     "subnet snet-agents must be delegated to Microsoft.App/environments"),
+    (user_vnet(**{"snet-agents": app_subnet("10.20.1.0/24", links=1)}), {}, NO_ACCOUNT, NO_RESOURCE,
+     "snet-agents already has a service association link, so another Foundry account uses it"),
+    (user_vnet(**{"snet-private-endpoints": None}), {}, NO_ACCOUNT, NO_RESOURCE,
+     "vnet-hub has no subnet snet-private-endpoints"),
+    (None, {"FA_NETWORK_MODE": "public"}, NO_ACCOUNT, NO_RESOURCE, "needs FA_NETWORK_MODE=private"),
+    (None, {"FA_VNET_RESOURCE_ID": USER_VNET.replace("rg-net", "rg-dev")}, NO_ACCOUNT, NO_RESOURCE,
+     "is in rg-dev, the resource group `azd down` deletes"),
+    (None, {"FA_VNET_RESOURCE_ID": USER_VNET.replace(SUBSCRIPTION, OTHER[:36])}, NO_ACCOUNT, NO_RESOURCE,
+     "not this environment's"),
+    (None, {"FA_VNET_RESOURCE_ID": USER_VNET + "/"}, NO_ACCOUNT, NO_RESOURCE, "must be a VNet resource ID"),
+    (None, {"FA_API_SUBNET_NAT_EGRESS": "true"}, NO_ACCOUNT, NO_RESOURCE, "FA_API_SUBNET_NAT_EGRESS creates FA's own"),
+    (None, {"FA_AGENT_SUBNET_NAME": "snet-api"}, NO_ACCOUNT, NO_RESOURCE, "three different subnets"),
+    (None, {"FA_AGENT_SUBNET_NAME": "a" * 64}, NO_ACCOUNT, NO_RESOURCE, "at most 63 bytes"),
+    (None, {"FA_DNS_MODE": "hub"}, NO_ACCOUNT, NO_RESOURCE, "FA_DNS_MODE must be azd or existing"),
+    (lambda args: NO_RESOURCE, {}, NO_ACCOUNT, NO_RESOURCE, "was not found; check FA_VNET_RESOURCE_ID"),
+    (user_vnet(dns=["10.0.0.4"]), {}, NO_ACCOUNT, NO_RESOURCE, "uses its own DNS servers.*FA_DNS_MODE existing"),
+    (user_vnet(**{"snet-agents": app_subnet("10.20.1.0/28")}), {}, NO_ACCOUNT, NO_RESOURCE, "/27 or larger"),
+    (user_vnet(**{"snet-agents": app_subnet("100.64.1.0/24")}), {}, NO_ACCOUNT, NO_RESOURCE, "RFC 1918"),
+    (user_vnet(**{"snet-api": app_subnet("172.30.0.0/27")}), {}, NO_ACCOUNT, NO_RESOURCE,
+     "subnet snet-api .172.30.0.0/27. overlaps a range Container Apps and Foundry reserve"),
+    (user_vnet(**{"snet-api": app_subnet("100.100.130.0/27")}), {}, NO_ACCOUNT, NO_RESOURCE,
+     "subnet snet-api .100.100.130.0/27. overlaps a range Container Apps and Foundry reserve"),
+    (user_vnet(space=["10.20.0.0/16", "100.100.224.0/20"]), {}, NO_ACCOUNT, NO_RESOURCE,
+     "VNet vnet-hub address space 100.100.224.0/20 overlaps a range Container Apps and Foundry reserve"),
+    (user_vnet(**{"snet-api": app_subnet("10.20.0.0/27", links=1)}), {}, NO_ACCOUNT, NO_RESOURCE,
+     "another Container Apps environment does"),
+    (user_vnet(**{"snet-private-endpoints": app_subnet("10.20.2.0/27")}), {}, NO_ACCOUNT, NO_RESOURCE,
+     "private endpoints cannot use a delegated subnet"),
+    (user_vnet(**{"snet-private-endpoints": {"properties": {"addressPrefix": "10.20.2.0/29"}}}), {}, NO_ACCOUNT,
+     NO_RESOURCE, "/28 or larger"),
+    (None, {}, injected_into("/subscriptions/x/resourceGroups/rg-old/providers/Microsoft.Network/virtualNetworks/v/"
+                             "subnets/snet-agents"), NO_RESOURCE, "injection cannot change"),
+])
+def test_an_existing_vnet_that_does_not_fit_stops_before_any_write(hooks, tmp_path, vnet, values, foundry, cae,
+                                                                    message):
+    ctx = byo_context(hooks, tmp_path, vnet, foundry=foundry, cae=cae, **values)
+    with pytest.raises(hooks.Stop, match=message):
+        hooks.preprovision(ctx)
+    assert writes_nothing(ctx) and "FA_TEAM_OWNER_OID" not in ctx.values
+    assert all(call[:4] == ["az", "rest", "--method", "get"] for call in ctx.run.calls
+               if "Microsoft.Network/" in " ".join(call))
+
+
+@pytest.mark.parametrize("values", [{"FA_DNS_MODE": "existing"}, {"FA_AGENT_SUBNET_NAME": "agents"},
+                                    {"FA_NETWORK_MODE": "public", "FA_API_SUBNET_NAME": "app"}])
+def test_existing_vnet_inputs_without_the_vnet_stop(hooks, tmp_path, values):
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True})), **{**PRIVATE, **values})
+    with pytest.raises(hooks.Stop, match="only apply with an existing VNet .FA_VNET_RESOURCE_ID."):
+        hooks.preprovision(ctx)
+    assert writes_nothing(ctx)
+
+
+def test_clearing_the_vnet_of_an_account_injected_into_it_stops_before_any_write(hooks, tmp_path):
+    # Injection cannot change, so dropping FA_VNET_RESOURCE_ID would fail mid-deploy on the account PUT.
+    ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True}),
+                                                       foundry=injected_into(f"{USER_VNET}/subnets/snet-agents")),
+                  **PRIVATE)
+    with pytest.raises(hooks.Stop, match=f"{ACCOUNT} was created injected into {USER_VNET}/subnets/snet-agents, "
+                                         "not FA's own vnet-dev, and injection cannot change"):
+        hooks.preprovision(ctx)
+    assert writes_nothing(ctx) and "FA_TEAM_OWNER_OID" not in ctx.values
+
+
+ENDPOINTS = ok([{"name": "pe-table", "customDnsConfigs": [
+    {"fqdn": "stx.table.core.windows.net", "ipAddresses": ["10.20.2.4"]}]}, {"name": "pe-cog", "customDnsConfigs": [
+        {"fqdn": "cog-x.cognitiveservices.azure.com", "ipAddresses": ["10.20.2.5"]},
+        {"fqdn": "cog-x.services.ai.azure.com", "ipAddresses": ["10.20.2.5"]}]}])
+
+
+def test_existing_dns_prints_the_records_and_holds_the_deploy_until_they_are_served(hooks, tmp_path, capsys):
+    ctx = context(hooks, tmp_path, {"private-endpoint list": ENDPOINTS}, **BYO, FA_DNS_MODE="existing")
+    with pytest.raises(hooks.Stop, match="azd env set FA_DNS_RECORDS_READY true"):
+        hooks.require_dns_records(ctx)
+    out = capsys.readouterr().out
+    assert ("FA:   stx.table.core.windows.net -> 10.20.2.4\nFA:   cog-x.cognitiveservices.azure.com -> 10.20.2.5\n"
+            "FA:   cog-x.services.ai.azure.com -> 10.20.2.5") in out
+    assert ctx.run.calls == [["az", "network", "private-endpoint", "list", "--resource-group", "rg-dev",
+                              "--subscription", SUBSCRIPTION, "-o", "json"]]
+    ctx.values["FA_DNS_RECORDS_READY"] = "true"
+    hooks.require_dns_records(ctx)  # served: the deploy goes on
+    assert "FA_DNS_RECORDS_READY" not in hooks.USER_INPUTS  # postdown clears it; a new install has new IPs
+    assert "FA_APPROVE_INITIALIZATION" not in hooks.USER_INPUTS  # postdown clears it; a rebuilt env opts in again
+
+
+@pytest.mark.parametrize("values", [{}, PRIVATE, BYO])
+def test_fa_managed_dns_reads_no_private_endpoint(hooks, tmp_path, values):
+    hooks.require_dns_records(context(hooks, tmp_path, {}, **values))  # no route: any call would fail
+
+
+def test_the_portal_endpoint_goes_into_the_users_subnet(hooks, tmp_path, monkeypatch):
+    deployed = []
+    monkeypatch.setattr(hooks, "console_bundle", lambda *args: {})
+    monkeypatch.setattr(hooks, "deploy_bicep", lambda ctx, name, template, parameters: deployed.append(
+        (template, parameters)) or {"publicOrigin": "https://ca-console.example.io", "identityPrincipalId": "p"})
+    monkeypatch.setattr(sys.modules["entra"], "ensure_fic", lambda *args: "created")
+    keys = ("FA_CONTAINER_APPS_ENVIRONMENT", "FA_REGISTRY_NAME", "FA_VNET", "FA_CONSOLE_APP", "FA_CONSOLE_IDENTITY",
+            "FA_CONSOLE_STORAGE", "FA_CONSOLE_APP_ID", "FA_TEAM_OWNER_OID", "FA_API_AUDIENCE",
+            "FA_CONSOLE_APP_OBJECT_ID", "FA_DEPLOY_RUN")
+    ctx = context(hooks, tmp_path, {"azd env set": ok()}, FA_CONSOLE_URL="https://ca-console.example.io",
+                  **{key: "x" for key in keys}, **BYO, FA_DNS_MODE="existing", FA_PRIVATE_ENDPOINT_SUBNET_NAME="pe")
+    hooks.console_app(ctx, "cr/fa-web-console@sha256:" + "a" * 64, tmp_path, tmp_path / "plan.json", "f" * 40)
+    declared = set(re.findall(r"^param (\w+)", deployed[0][0].read_text(encoding="utf-8"), re.MULTILINE))
+    for _, parameters in deployed:
+        assert parameters["privateEndpointSubnetResourceId"] == f"{USER_VNET}/subnets/pe"
+        assert parameters["privateDnsZones"] is False and set(parameters) <= declared
+
+
+def test_private_predown_waits_on_the_users_agent_subnet_and_never_writes_it(hooks, tmp_path, deployer, capsys):
+    foundry = FakeFoundry(links=2)
+    ctx, _ = private_down(hooks, tmp_path, foundry, FA_VNET_RESOURCE_ID=USER_VNET)
+    hooks.predown(ctx)
+    reads = [call[5] for call in ctx.run.calls if "subnets/" in " ".join(call)]
+    assert reads and all(url.startswith(f"{USER_VNET}/subnets/snet-agents?") for url in reads)
+    assert not [call for call in writes(ctx) if "rg-net" in " ".join(call) or "Microsoft.Network" in " ".join(call)]
+    assert foundry.links == 0 and "snet-agents has no service association link" in capsys.readouterr().out

@@ -6,7 +6,8 @@
   python deploy/azd/fa_azd.py consent         only the owner's delegated grants (an admin with this azd environment;
                                               without one, the admin applies .azure/<env>/fa/admin-consent)
   python deploy/azd/fa_azd.py prereq          read only, before `azd up`: what this account still needs
-  python deploy/azd/fa_azd.py predown         before `azd down`: the confirmed removal of FA's backup lock
+  python deploy/azd/fa_azd.py predown         before `azd down`: the confirmed removal of FA's backup lock; with
+                                              FA_NETWORK_MODE=private, first the Foundry account in order
   python deploy/azd/fa_azd.py postdown        after `azd down`: this environment's Entra apps and backup role
 
 The hooks orchestrate; the work is done by the existing scripts (preflight_subscription.py, ci_deploy.py,
@@ -25,15 +26,21 @@ Safety, as in the manual flow:
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -46,6 +53,7 @@ APP = ROOT / "src" / "fa-shared-context-poc"
 STAGE_DIR = ROOT / "deploy" / "stage"
 SHARED_DIR = ROOT / "deploy" / "shared-context"
 INFRA = ROOT / "infra"
+OPENAI_USER_ROLE = "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"  # Cognitive Services OpenAI User
 REQUIREMENTS = APP / "requirements-behavior.txt"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(SHARED_DIR))
@@ -104,6 +112,7 @@ class Context:
     python: str = sys.executable
     az_cmd: list[str] = field(default_factory=az_prefix)
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+    sleep: Callable[[float], None] = time.sleep  # every bounded poll waits through here
     state_root: Path = ROOT / ".azure"  # azd's own git-ignored environment folder
     resume: str = "the same azd command"  # main() names the command that asks the question again
 
@@ -159,8 +168,8 @@ class Context:
         return self.get("AZURE_RESOURCE_GROUP") or f"rg-{self.env}"
 
     # ---- tools -----------------------------------------------------------------------------------------------
-    def az(self, *args: str, missing_ok: bool = False) -> Any:
-        result = self.run([*self.az_cmd, *args, "-o", "json"])
+    def az(self, *args: str, missing_ok: bool = False, timeout: int | None = None) -> Any:
+        result = self.run([*self.az_cmd, *args, "-o", "json"], timeout=timeout)
         if result.code != 0:
             if missing_ok and any(marker in result.stderr for marker in ("ResourceNotFound", "ResourceGroupNotFound",
                                                                           "was not found", "could not be found",
@@ -337,8 +346,9 @@ def choose_models(ctx: Context) -> models.Choice:
         raise Stop(str(error)) from None
     for key, value in choice.environment().items():
         ctx.set(key, value)
+    memory = "memory extraction model" if models.memory_backend(ctx.values) == "cosmos" else "memory store chat model"
     print(f"FA: models {', '.join(choice.models)}; default {choice.default}"
-          + (f"; memory store chat model {choice.memory_chat_model}" if choice.memory_chat_model else ""), flush=True)
+          + (f"; {memory} {choice.memory_chat_model}" if choice.memory_chat_model else ""), flush=True)
     return choice
 
 
@@ -350,7 +360,8 @@ def preflight_document(ctx: Context, tenant: str, deployments: list[dict[str, An
         "location": ctx.need("AZURE_LOCATION"), "resource_group": ctx.group, "foundry_resource_group": ctx.group,
         "names": {"foundry_account": ctx.get("FA_FOUNDRY_ACCOUNT", "not-yet-provisioned"),
                   "container_apps_environment": ctx.get("FA_CONTAINER_APPS_ENVIRONMENT", f"cae-{ctx.env}")},
-        "model_deployments": deployments,
+        "model_deployments": deployments, "network_mode": ctx.get("FA_NETWORK_MODE", "public"),
+        "memory_backend": ctx.get("FA_MEMORY_BACKEND", "foundry"),  # preprovision sets it first
     }
     path = ctx.work / "preflight-deployment.json"
     _write_json(path, document)
@@ -428,6 +439,305 @@ def prerequisites(ctx: Context, me: dict[str, str]) -> list[dict[str, str]]:
     return rows
 
 
+# ADR-0010: FA_NETWORK_MODE, chosen when the environment is created.
+NETWORK_MODES = ("public", "private")
+# main.bicep's region list without ukwest, which is in that list but not in the Agent Service region table
+# (https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents). Only private checks it; public keeps
+# the list as it is (a pre-existing inconsistency, ADR-0010 section 1).
+PRIVATE_REGIONS = frozenset({
+    "australiaeast", "brazilsouth", "canadacentral", "canadaeast", "centralus", "eastus", "eastus2", "francecentral",
+    "germanywestcentral", "italynorth", "japaneast", "japanwest", "koreacentral", "northcentralus", "norwayeast",
+    "polandcentral", "southafricanorth", "southcentralus", "southindia", "southeastasia", "spaincentral",
+    "swedencentral", "switzerlandnorth", "switzerlandwest", "uaenorth", "uksouth", "westcentralus", "westeurope",
+    "westus", "westus3"})
+ACCOUNT_API = "api-version=2025-06-01"  # the version AVM cognitive-services/account 0.19.0 deploys the account with
+
+
+def bicep_unique_string(*parts: str) -> str:
+    """ARM's uniqueString(): MurmurHash64 of the parts joined with '-', as 13 base32 characters. Checked against
+    `bicep console` (tests/shared_context/test_azd_hooks.py)."""
+    def rotl(value: int, bits: int) -> int:
+        return ((value << bits) | (value >> (32 - bits))) & 0xFFFFFFFF
+
+    def fmix(value: int) -> int:
+        value = ((value ^ (value >> 16)) * 0x85EBCA6B) & 0xFFFFFFFF
+        value = ((value ^ (value >> 13)) * 0xC2B2AE35) & 0xFFFFFFFF
+        return value ^ (value >> 16)
+
+    data, c1, c2 = "-".join(parts).encode("utf-8"), 0x239B961B, 0xAB0E9789
+    h1 = h2 = 0
+    end = len(data) - len(data) % 8
+    for index in range(0, end, 8):
+        k1 = rotl(int.from_bytes(data[index:index + 4], "little") * c1 & 0xFFFFFFFF, 15) * c2 & 0xFFFFFFFF
+        h1 = (rotl(h1 ^ k1, 19) + h2) * 5 + 0x561CCD1B & 0xFFFFFFFF
+        k2 = rotl(int.from_bytes(data[index + 4:index + 8], "little") * c2 & 0xFFFFFFFF, 17) * c1 & 0xFFFFFFFF
+        h2 = (rotl(h2 ^ k2, 13) + h1) * 5 + 0x0BCAA747 & 0xFFFFFFFF
+    tail = data[end:]
+    if tail:
+        h1 ^= rotl(int.from_bytes(tail[:4], "little") * c1 & 0xFFFFFFFF, 15) * c2 & 0xFFFFFFFF
+        if len(tail) > 4:
+            h2 ^= rotl(int.from_bytes(tail[4:], "little") * c2 & 0xFFFFFFFF, 17) * c1 & 0xFFFFFFFF
+    h1, h2 = h1 ^ len(data), h2 ^ len(data)
+    h1 = h1 + h2 & 0xFFFFFFFF
+    h2 = h2 + h1 & 0xFFFFFFFF
+    h1, h2 = fmix(h1), fmix(h2)
+    h1 = h1 + h2 & 0xFFFFFFFF
+    h2 = h2 + h1 & 0xFFFFFFFF
+    value, text = h2 << 32 | h1, ""
+    for _ in range(13):  # 65 bits: the last character takes the low 4 bits and a zero
+        text += "abcdefghijklmnopqrstuvwxyz234567"[value >> 59]
+        value = value << 5 & 0xFFFFFFFFFFFFFFFF
+    return text
+
+
+def foundry_account_name(ctx: Context) -> str:
+    """main.bicep's names.foundryAccount: cog-<toLower(uniqueString(subscription().id, env, location))>. It is known
+    before the first provision, and stays right when a failed provision created the account but wrote no outputs."""
+    subscription = ctx.need("AZURE_SUBSCRIPTION_ID").lower()  # ARM's subscription().id is lowercase
+    return "cog-" + bicep_unique_string(f"/subscriptions/{subscription}", ctx.env, ctx.need("AZURE_LOCATION")).lower()
+
+
+def account_url(ctx: Context, name: str, child: str = "") -> str:
+    """ARM URL of the environment's Foundry account (or a child such as /projects/<name>); az rest adds the host."""
+    return (f"/subscriptions/{ctx.need('AZURE_SUBSCRIPTION_ID')}/resourceGroups/{ctx.group}/providers/"
+            f"Microsoft.CognitiveServices/accounts/{name}{child}?{ACCOUNT_API}")
+
+
+def network_mode(ctx: Context) -> str:
+    """FA_NETWORK_MODE and what private needs, checked before any read or write."""
+    mode = ctx.get("FA_NETWORK_MODE", "public")
+    if mode not in NETWORK_MODES:
+        raise Stop(f"FA_NETWORK_MODE must be public or private, not '{mode}'; nothing was changed")
+    if mode == "private":
+        region = ctx.need("AZURE_LOCATION").strip().lower()
+        if region not in PRIVATE_REGIONS:
+            raise Stop(f"FA_NETWORK_MODE=private needs a region in the Foundry Agent Service region table; {region} "
+                       f"is not in it. Create the environment in one of: {', '.join(sorted(PRIVATE_REGIONS))}; "
+                       "nothing was changed")
+    return mode
+
+
+def check_network_mode(ctx: Context, mode: str, provisioned: bool = False) -> dict[str, Any] | None:
+    """Read only: network injection is fixed when the Foundry account is created, so an existing account's
+    networkInjections decides the mode. Read by the Bicep name, not FA_FOUNDRY_ACCOUNT (unset before the first
+    provision, or after one that failed late), which must equal it when set. No account yet: a new environment,
+    nothing to compare, unless `provisioned` (deploy), where it must exist. Returns the account read (None when there
+    is none)."""
+    name = foundry_account_name(ctx)
+    recorded = ctx.get("FA_FOUNDRY_ACCOUNT")
+    if recorded and recorded.lower() != name:
+        raise Stop(f"FA_FOUNDRY_ACCOUNT is {recorded}, but main.bicep's naming rule gives {name} for this "
+                   "subscription, environment name and region, so FA_NETWORK_MODE cannot be checked against the "
+                   "right account. Check AZURE_SUBSCRIPTION_ID, AZURE_ENV_NAME and AZURE_LOCATION; nothing was changed")
+    try:
+        account = ctx.az("rest", "--method", "get", "--url", account_url(ctx, name), missing_ok=True)
+    except Stop as error:
+        if "MissingSubscriptionRegistration" not in str(error):
+            raise Stop(f"Cannot confirm whether Foundry account {name} exists, so FA_NETWORK_MODE cannot be checked. "
+                       f"Check the az sign-in and permissions, then rerun; nothing was changed ({error})") from None
+        account = None  # no account can exist yet; preprovision's subscription preflight explains the provider
+    if account is None and provisioned:
+        raise Stop(f"Foundry account {name} was not found in {ctx.group}, and azd deploy needs the provisioned "
+                   "account. The name comes from AZURE_SUBSCRIPTION_ID, AZURE_ENV_NAME and AZURE_LOCATION: check them "
+                   "(a changed AZURE_LOCATION gives another name), or run `azd provision` first; nothing was changed")
+    require_mode(ctx, name, account, mode)
+    return account
+
+
+def require_mode(ctx: Context, name: str, account: dict[str, Any] | None, mode: str) -> None:
+    """An existing account's networkInjections, fixed at creation, must match FA_NETWORK_MODE. The private hooks
+    check it too before any window or delete, so a mis-set FA_NETWORK_MODE=private never touches a public account."""
+    if account is None:
+        return
+    injections = (account.get("properties") or {}).get("networkInjections") or []
+    existing = "private" if any(item.get("scenario") == "agent" for item in injections) else "public"
+    if existing != mode:
+        raise Stop(f"Foundry account {name} already exists in {ctx.group} as FA_NETWORK_MODE={existing}, and network "
+                   f"injection cannot be added or removed after creation. Run `azd env set FA_NETWORK_MODE "
+                   f"{existing}` to keep this environment, or create a new environment for {mode}; nothing was changed")
+
+
+# ---- ADR-0010 phase 2b: an existing VNet (FA_VNET_RESOURCE_ID) ---------------------------------------------------
+
+SUBNET_INPUTS = {"FA_API_SUBNET_NAME": "snet-api", "FA_AGENT_SUBNET_NAME": "snet-agents",
+                 "FA_PRIVATE_ENDPOINT_SUBNET_NAME": "snet-private-endpoints"}  # main.bicep's parameter defaults
+DNS_MODES = ("azd", "existing")
+VNET_ID = re.compile(r"/subscriptions/([0-9a-fA-F-]{36})/resourceGroups/([^/]+)/providers/Microsoft\.Network/"
+                     r"virtualNetworks/([^/]+)", re.IGNORECASE)
+APP_DELEGATION = "Microsoft.App/environments"
+# The Foundry agent subnet takes RFC 1918 only (agents-networking-deep-dive). APP_RESERVED is what Container Apps
+# workload profiles reserve on its subnets (container-apps/custom-virtual-networks; the agent subnet is delegated the
+# same way) plus the extra ranges Foundry forbids in the whole VNet address space (agents/how-to/virtual-networks).
+RFC1918 = tuple(map(ipaddress.ip_network, ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")))
+APP_RESERVED = tuple(map(ipaddress.ip_network, (
+    "169.254.0.0/16", "172.30.0.0/16", "172.31.0.0/16", "192.0.2.0/24", "100.100.0.0/17", "100.100.128.0/19",
+    "100.100.160.0/19", "100.100.192.0/19", "100.100.224.0/19", "0.0.0.0/8", "127.0.0.0/8")))
+APP_API = "api-version=2024-03-01"  # Microsoft.App/managedEnvironments read
+
+
+def subnet_id(ctx: Context, key: str) -> str:
+    """main.bicep's byoSubnets: the user's VNet ID (taken as given; preprovision checked its form) and a subnet name.
+    Only called when FA_VNET_RESOURCE_ID is set (a user input, so not an output the infra tests could find)."""
+    return f"{ctx.get('FA_VNET_RESOURCE_ID')}/subnets/{ctx.get(key, SUBNET_INPUTS[key])}"
+
+
+def existing_dns(ctx: Context) -> bool:
+    """FA_DNS_MODE=existing: the user's DNS serves the private endpoint names (FA made no zone)."""
+    return bool(ctx.get("FA_VNET_RESOURCE_ID")) and ctx.get("FA_DNS_MODE", "azd") == "existing"
+
+
+def _properties(resource: Any) -> dict[str, Any]:
+    return (resource or {}).get("properties") or {}
+
+
+def _prefix(subnet: dict[str, Any]) -> Any:
+    properties = _properties(subnet)
+    # shortcut: only the first of several prefixes is checked; check all if a multi-prefix subnet ever shows up.
+    return ipaddress.ip_network((properties.get("addressPrefixes") or [properties.get("addressPrefix")])[0])
+
+
+def check_existing_vnet(ctx: Context, mode: str, account: dict[str, Any] | None) -> None:
+    """Read only (ADR-0010 phase 2b): the user's VNet and its three subnets meet what the Foundry injection, the
+    Container Apps environment and the private endpoints need, and nothing else uses them. Never writes the VNet;
+    egress (NAT or a route to a firewall) is the user's, so its absence only warns."""
+    dns = ctx.get("FA_DNS_MODE", "azd")
+    if dns not in DNS_MODES:
+        raise Stop(f"FA_DNS_MODE must be azd or existing, not '{dns}'; nothing was changed")
+    injected = [item.get("subnetArmId") or "" for item in _properties(account).get("networkInjections") or []
+                if item.get("scenario") == "agent"]
+    vnet_id = ctx.get("FA_VNET_RESOURCE_ID")
+    if vnet_id is None:
+        extra = [key for key in SUBNET_INPUTS if ctx.get(key)] + (["FA_DNS_MODE=existing"] if dns == "existing" else [])
+        if extra:
+            raise Stop(f"{', '.join(extra)} only apply with an existing VNet (FA_VNET_RESOURCE_ID); FA's own VNet has "
+                       "fixed subnet names and its own DNS zones. Set FA_VNET_RESOURCE_ID or clear them; nothing was "
+                       "changed")
+        own = (f"/subscriptions/{ctx.need('AZURE_SUBSCRIPTION_ID')}/resourceGroups/{ctx.group}/providers/"
+               f"Microsoft.Network/virtualNetworks/vnet-{ctx.env}/subnets/snet-agents")
+        if injected and own.lower() not in (item.lower() for item in injected):
+            raise Stop(f"Foundry account {account.get('name')} was created injected into {', '.join(injected)}, not "
+                       f"FA's own vnet-{ctx.env}, and injection cannot change: set FA_VNET_RESOURCE_ID (and the subnet "
+                       "names) back to that VNet; nothing was changed")
+        return
+    if mode != "private":
+        raise Stop("FA_VNET_RESOURCE_ID needs FA_NETWORK_MODE=private (an existing VNet is for the injected Foundry "
+                   "account); nothing was changed")
+    if ctx.get("FA_API_SUBNET_NAT_EGRESS", "false").strip().lower() == "true":
+        raise Stop("FA_API_SUBNET_NAT_EGRESS creates FA's own NAT, which an existing VNet does not get: give your "
+                   "subnets egress yourself and set FA_API_SUBNET_NAT_EGRESS false; nothing was changed")
+    match = VNET_ID.fullmatch(vnet_id)
+    if match is None:
+        raise Stop(f"FA_VNET_RESOURCE_ID must be a VNet resource ID, /subscriptions/<id>/resourceGroups/<group>/"
+                   f"providers/Microsoft.Network/virtualNetworks/<name>, not '{vnet_id}'; nothing was changed")
+    subscription, group, name = match.groups()
+    if subscription.lower() != ctx.need("AZURE_SUBSCRIPTION_ID").lower():
+        raise Stop(f"VNet {name} is in subscription {subscription}, not this environment's "
+                   f"{ctx.need('AZURE_SUBSCRIPTION_ID')}; use a VNet in the same subscription; nothing was changed")
+    if group.lower() == ctx.group.lower():
+        raise Stop(f"VNet {name} is in {ctx.group}, the resource group `azd down` deletes with everything in it. Use "
+                   "a VNet in another resource group; nothing was changed")
+    names = {key: ctx.get(key, default) for key, default in SUBNET_INPUTS.items()}
+    if len({value.lower() for value in names.values()}) != len(names):
+        raise Stop(f"the API, agent and private endpoint subnets must be three different subnets "
+                   f"({', '.join(names.values())}): the agent subnet serves one Foundry account only and Container "
+                   "Apps needs its own; nothing was changed")
+    if len(names["FA_AGENT_SUBNET_NAME"].encode("utf-8")) > 63:
+        raise Stop("FA_AGENT_SUBNET_NAME must be at most 63 bytes (Foundry Agent Service limit); nothing was changed")
+    vnet = ctx.az("rest", "--method", "get", "--url", f"{vnet_id}?{NETWORK_API}", missing_ok=True)
+    if vnet is None:
+        raise Stop(f"VNet {vnet_id} was not found; check FA_VNET_RESOURCE_ID; nothing was changed")
+    region = ctx.need("AZURE_LOCATION").strip().lower()
+    if (vnet.get("location") or "").lower() != region:
+        raise Stop(f"VNet {name} is in {vnet.get('location')}, but the Foundry account must be in the VNet's region "
+                   f"({region}); use a VNet in {region}; nothing was changed")
+    for prefix in (_properties(vnet).get("addressSpace") or {}).get("addressPrefixes") or []:
+        if any(ipaddress.ip_network(prefix).overlaps(reserved) for reserved in APP_RESERVED):
+            raise Stop(f"VNet {name} address space {prefix} overlaps a range Container Apps and Foundry reserve "
+                       f"({', '.join(map(str, APP_RESERVED))}); nothing was changed")
+    if dns == "azd" and (_properties(vnet).get("dhcpOptions") or {}).get("dnsServers"):
+        raise Stop(f"VNet {name} uses its own DNS servers, which do not query the private DNS zones FA would link to "
+                   "it. Set FA_DNS_MODE existing and serve the names yourself (deploy/azd/README.md); nothing was "
+                   "changed")
+    subnets = {}
+    for key, value in names.items():
+        subnets[key] = ctx.az("rest", "--method", "get", "--url", f"{vnet_id}/subnets/{value}?{NETWORK_API}",
+                              missing_ok=True)
+        if subnets[key] is None:
+            raise Stop(f"VNet {name} has no subnet {value} ({key}); create it or name another; nothing was changed")
+    for key in ("FA_API_SUBNET_NAME", "FA_AGENT_SUBNET_NAME"):
+        subnet, value = subnets[key], names[key]
+        network = _prefix(subnet)
+        services = [_properties(item).get("serviceName") for item in _properties(subnet).get("delegations") or []]
+        if APP_DELEGATION not in services:
+            raise Stop(f"subnet {value} must be delegated to {APP_DELEGATION}; nothing was changed")
+        if network.version != 4 or network.prefixlen > 27:
+            raise Stop(f"subnet {value} ({network}) must be an IPv4 /27 or larger; nothing was changed")
+        if any(network.overlaps(reserved) for reserved in APP_RESERVED):
+            raise Stop(f"subnet {value} ({network}) overlaps a range Container Apps and Foundry reserve "
+                       f"({', '.join(map(str, APP_RESERVED))}); nothing was changed")
+        if not _properties(subnet).get("natGateway") and not _properties(subnet).get("routeTable"):
+            print(f"FA: warning: subnet {value} has no NAT gateway or route table. FA adds no egress to your VNet: "
+                  "make sure it reaches the internet (the FA API, Entra ID, ACR, App Insights), e.g. through a "
+                  "Virtual WAN hub", flush=True)
+    agents = names["FA_AGENT_SUBNET_NAME"]
+    network = _prefix(subnets["FA_AGENT_SUBNET_NAME"])
+    if not any(network.subnet_of(private) for private in RFC1918):
+        raise Stop(f"subnet {agents} ({network}) must be in an RFC 1918 range (10/8, 172.16/12, 192.168/16) for "
+                   "Foundry Agent Service; nothing was changed")
+    if network.prefixlen > 24:
+        print(f"FA: warning: subnet {agents} is {network}; Foundry recommends /24 or larger for production (each "
+              "Hosted session takes one IP)", flush=True)
+    wanted = f"{vnet_id}/subnets/{agents}"
+    if account is not None and wanted.lower() not in (item.lower() for item in injected):
+        raise Stop(f"Foundry account {account.get('name')} was created injected into "
+                   f"{', '.join(injected) or 'no subnet'}, and injection cannot change: FA_VNET_RESOURCE_ID and "
+                   "FA_AGENT_SUBNET_NAME must name that subnet; nothing was changed")
+    if account is None and _properties(subnets["FA_AGENT_SUBNET_NAME"]).get("serviceAssociationLinks"):
+        raise Stop(f"subnet {agents} already has a service association link, so another Foundry account uses it (or "
+                   "one is still being deleted); a subnet serves one account only. Name a free subnet; nothing was "
+                   "changed")
+    api = names["FA_API_SUBNET_NAME"]
+    if _properties(subnets["FA_API_SUBNET_NAME"]).get("serviceAssociationLinks"):
+        environment = ctx.get("FA_CONTAINER_APPS_ENVIRONMENT", f"cae-{ctx.env}")
+        cae = ctx.az("rest", "--method", "get", "--url",
+                     f"/subscriptions/{subscription}/resourceGroups/{ctx.group}/providers/Microsoft.App/"
+                     f"managedEnvironments/{environment}?{APP_API}", missing_ok=True)
+        used = (_properties(cae).get("vnetConfiguration") or {}).get("infrastructureSubnetId") or ""
+        if used.lower() != f"{vnet_id}/subnets/{api}".lower():
+            raise Stop(f"subnet {api} already has a service association link and this environment's {environment} "
+                       "does not use it, so another Container Apps environment does; name a free subnet; nothing was "
+                       "changed")
+    endpoints = names["FA_PRIVATE_ENDPOINT_SUBNET_NAME"]
+    if _properties(subnets["FA_PRIVATE_ENDPOINT_SUBNET_NAME"]).get("delegations"):
+        raise Stop(f"subnet {endpoints} is delegated, and private endpoints cannot use a delegated subnet; nothing was "
+                   "changed")
+    if _prefix(subnets["FA_PRIVATE_ENDPOINT_SUBNET_NAME"]).prefixlen > 28:
+        raise Stop(f"subnet {endpoints} must be /28 or larger (FA uses up to about 10 private endpoint IPs); nothing "
+                   "was changed")
+    print(f"FA: existing VNet {name} in {group} (read only): {api} and {agents} delegated to {APP_DELEGATION}, "
+          f"private endpoints in {endpoints}; DNS {dns}. FA creates no VNet, subnet, NSG or NAT in it", flush=True)
+
+
+def print_dns_records(ctx: Context) -> None:
+    """FA_DNS_MODE=existing: each private endpoint's names and IPs in this group, read back, for the user's DNS."""
+    endpoints = ctx.az("network", "private-endpoint", "list", "--resource-group", ctx.group, "--subscription",
+                       ctx.need("AZURE_SUBSCRIPTION_ID")) or []
+    lines = [f"FA:   {config.get('fqdn')} -> {', '.join(config.get('ipAddresses') or [])}"
+             for item in endpoints for config in item.get("customDnsConfigs") or []]
+    print("\n".join(["FA: FA_DNS_MODE=existing: your DNS must resolve these names, inside the VNet, to these private "
+                     "endpoint IPs (deploy/azd/README.md):", *lines]), flush=True)
+
+
+def require_dns_records(ctx: Context) -> None:
+    """Before deploy: with FA_DNS_MODE=existing the sync job cannot reach the Table until the user's DNS has it."""
+    if not existing_dns(ctx):
+        return
+    print_dns_records(ctx)
+    if ctx.get("FA_DNS_RECORDS_READY", "false").strip().lower() != "true":
+        raise Stop("FA_DNS_MODE=existing: serve the names above in your DNS (or let your Azure Policy add the zone "
+                   "groups), then `azd env set FA_DNS_RECORDS_READY true` and rerun `azd up`")
+
+
 def preprovision(ctx: Context) -> None:
     if sys.version_info < (3, 11):
         raise Stop("Python 3.11 or newer is required")
@@ -436,7 +746,9 @@ def preprovision(ctx: Context) -> None:
         if ctx.get(key) is None:
             raise Stop(f"{key} is not set; create the environment with "
                        "`azd env new <name> --subscription <id> --location <region>` (or `azd env set`) first")
+    mode = network_mode(ctx)
     account = check_account(ctx)
+    check_existing_vnet(ctx, mode, check_network_mode(ctx, mode))
     me = signed_in_user(ctx)
     owner = ctx.get("FA_TEAM_OWNER_OID")
     if owner is None:
@@ -459,6 +771,8 @@ def preprovision(ctx: Context) -> None:
         raise Stop("prerequisites missing before anything is billed: " + "; ".join(blocked)
                    + ". See deploy/azd/README.md 事前準備")
     choose_models(ctx)
+    # main.bicep's memoryBackend: private keeps its memory in Cosmos DB (ADR-0011), public in the Memory Store.
+    ctx.set("FA_MEMORY_BACKEND", models.memory_backend(ctx.values))
     deployments = model_deployments(ctx)
     document = preflight_document(ctx, account["tenantId"], deployments)
     result = ctx.script(SHARED_DIR / "preflight_subscription.py", "subscription", "--deployment", str(document),
@@ -552,10 +866,215 @@ def admin_consent_files(ctx: Context, owner: str, grants: Any) -> Path:
 
 def postprovision(ctx: Context) -> None:
     account = check_account(ctx)
+    require_dns_records(ctx)
     ctx.set("AZURE_TENANT_ID", account["tenantId"])  # profile, consent and the Portal credential use it
     domain = aca_ready(ctx, account["tenantId"])
     entra_apps(ctx, account["tenantId"], domain)
     consent(ctx)
+
+
+# ---- private network: the deploy window (ADR-0010 section 5) ---------------------------------------------------
+
+IPV4_ECHO = "https://api.ipify.org"  # answers with the caller's public IPv4 only (api6/api64 are the IPv6 hosts)
+AI_RESOURCE = "https://ai.azure.com"  # token audience of the Foundry data plane
+WINDOW_AZ_TIMEOUT = 90  # seconds per window az call: the close ignores Ctrl+C, so a hung az must not hang the deploy
+
+
+def private(ctx: Context) -> bool:
+    return ctx.get("FA_NETWORK_MODE", "public") == "private"
+
+
+def deployer_ipv4() -> str:
+    """This computer's public IPv4 as Azure sees it: the one address the window allows."""
+    try:
+        with urllib.request.urlopen(IPV4_ECHO, timeout=15) as response:
+            address = ipaddress.IPv4Address(response.read(64).decode("ascii").strip())
+    except (OSError, ValueError) as error:
+        raise Stop(f"cannot read this computer's public IPv4 from {IPV4_ECHO} ({error}), so the private Foundry "
+                   "account cannot be opened to it; nothing was changed. Check the network and rerun") from None
+    if not address.is_global or address.is_multicast:  # 224.0.0.1.is_global is True
+        raise Stop(f"{IPV4_ECHO} answered {address}, which is not a public IPv4; nothing was changed")
+    return str(address)
+
+
+def wait_until(ctx: Context, what: str, check: Callable[[], tuple[bool, str]], attempts: int, every: int) -> None:
+    """Bounded poll, check() -> (done, state), with a progress line about once a minute. It never sends a write."""
+    for attempt in range(attempts):
+        done, state = check()
+        if done:
+            return
+        if attempt == attempts - 1:
+            break
+        if attempt % max(1, 60 // every) == 0:
+            print(f"FA: waiting for {what}: {state} ({attempt * every // 60} of at most {attempts * every // 60} min)",
+                  flush=True)
+        ctx.sleep(every)
+    raise Stop(f"{what}: not reached within {attempts * every // 60} min (last: {state}); nothing more was sent. "
+               f"Read it back, then rerun `{ctx.resume}`")
+
+
+def window_closed(account: dict[str, Any] | None) -> bool:
+    properties = (account or {}).get("properties") or {}
+    return (properties.get("publicNetworkAccess") == "Disabled"
+            and not (properties.get("networkAcls") or {}).get("ipRules"))
+
+
+def _window_state(account: dict[str, Any] | None) -> str:
+    properties = (account or {}).get("properties") or {}
+    rules = [rule.get("value") for rule in (properties.get("networkAcls") or {}).get("ipRules") or []]
+    return (f"publicNetworkAccess {properties.get('publicNetworkAccess')}, IP rules {rules or 'none'}, "
+            f"{properties.get('provisioningState')}")
+
+
+def patch_window(ctx: Context, name: str, ip: str | None) -> Path:
+    """The window's only write: publicNetworkAccess and networkAcls' defaultAction, bypass and ipRules. Every other
+    networkAcls field (virtualNetworkRules, ...) goes back as read, since the PATCH replaces networkAcls whole, and
+    networkInjections stays as it was created. The bodies are files, as in graph(): the opening call writes the close
+    body too, so the close command printed on a failure has its file even when the close could not read the account."""
+    current = ctx.az("rest", "--method", "get", "--url", account_url(ctx, name), timeout=WINDOW_AZ_TIMEOUT)
+    acls = ((current or {}).get("properties") or {}).get("networkAcls") or {}
+
+    def body(allow: str | None) -> dict[str, Any]:
+        return {"properties": {"publicNetworkAccess": "Enabled" if allow else "Disabled",
+                               "networkAcls": {**acls, "defaultAction": "Deny", "bypass": "AzureServices",
+                                               "ipRules": [{"value": allow}] if allow else []}}}
+
+    path = ctx.work / "foundry-window-close.json"
+    _write_json(path, body(None))
+    if ip:
+        path = ctx.work / "foundry-window-open.json"
+        _write_json(path, body(ip))
+    ctx.az("rest", "--method", "patch", "--url", account_url(ctx, name), "--body", f"@{path}",
+           "--headers", "Content-Type=application/json", timeout=WINDOW_AZ_TIMEOUT)
+    return path
+
+
+@contextlib.contextmanager
+def interrupt_deferred():
+    """Ctrl+C is ignored, not deferred, until the window is closed and read back: a press in here is dropped. SIGINT
+    is ignored here and by the az children too (an ignored SIGINT is inherited on POSIX; on Windows
+    SetConsoleCtrlHandler(NULL, TRUE) is, per its documentation). A recording handler would not be inherited."""
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    console = ctypes.windll.kernel32 if os.name == "nt" else None
+    if console:
+        console.SetConsoleCtrlHandler(None, True)
+    try:
+        yield
+    finally:
+        if console:
+            console.SetConsoleCtrlHandler(None, False)
+        signal.signal(signal.SIGINT, previous)
+
+
+def close_window(ctx: Context, name: str, why: str) -> None:
+    """PATCH back to Disabled with no IP rule and read it back. A failure is loud and stops the hook (non-zero); an
+    interruption or any other error is loud too and goes on as itself."""
+    url = account_url(ctx, name)
+
+    def closed() -> tuple[bool, str]:
+        account = ctx.az("rest", "--method", "get", "--url", url, timeout=WINDOW_AZ_TIMEOUT)
+        state = ((account or {}).get("properties") or {}).get("provisioningState")
+        return window_closed(account) and state == "Succeeded", _window_state(account)
+
+    print(f"FA: closing Foundry account {name} again; Ctrl+C is ignored until it reads back closed (each az call "
+          f"at most {WINDOW_AZ_TIMEOUT} s), so press it again afterwards to stop", flush=True)
+    try:
+        with interrupt_deferred():
+            patch_window(ctx, name, None)
+            wait_until(ctx, f"Foundry account {name} to read back closed", closed, attempts=24, every=5)
+    except BaseException as error:
+        line = "!" * 100
+        print(f"\n{line}\nFA: WARNING: Foundry account {name} may still be open to the IP allowed for this run "
+              f"({why}). Closing it failed: {str(error) or type(error).__name__}\nClose it yourself now, then read it "
+              f"back:\n  az rest --method patch --url \"{url}\" --body @{ctx.work / 'foundry-window-close.json'} "
+              "--headers Content-Type=application/json\n"
+              f"  az rest --method get --url \"{url}\" --query \"properties.[publicNetworkAccess, networkAcls]\"\n"
+              f"{line}\n", file=sys.stderr, flush=True)
+        if isinstance(error, (Stop, subprocess.TimeoutExpired)):
+            raise Stop(f"Foundry account {name} could not be closed again; run the command printed above") from None
+        raise
+    print(f"FA: Foundry account {name} closed again (read back: publicNetworkAccess Disabled, no IP rule); {why}",
+          flush=True)
+
+
+def close_left_open_window(ctx: Context, name: str, account: dict[str, Any] | None) -> None:
+    """A run stopped between opening and closing (killed, closed terminal) left the account open. A Deleting account
+    is left alone: its PATCH would fail, and the delete takes the window with it."""
+    if account is None or window_closed(account) or _provisioning(account) == "Deleting":
+        return
+    print(f"FA: Foundry account {name} is open ({_window_state(account)}), most likely left by an interrupted run; "
+          "closing it first", flush=True)
+    close_window(ctx, name, "left open by an earlier run")
+
+
+def confirm_window(ctx: Context, name: str, ip: str, steps: str) -> None:
+    """The person allows this exact IP before any write; FA_CONFIRM_DEPLOY_WINDOW=<ip> for a run without a terminal."""
+    print(f"FA: FA_NETWORK_MODE=private keeps Foundry account {name} closed to the internet.\n"
+          f"FA: To {steps} from this computer, the hook opens it to {ip} alone (this computer's public IPv4, read "
+          f"from {IPV4_ECHO}).\n"
+          "FA: It opens after the image build and only for these steps: usually minutes, up to about 10 min for each "
+          "Hosted Agent version while it starts. Then it closes again and is read back.\n"
+          "FA: If WebIQ asks for its key, the account stays open until you answer.\n"
+          "FA: Behind a shared NAT (office, campus, VPN egress) everyone using that IP is let in too while it is open.",
+          flush=True)
+    if ctx.get("FA_CONFIRM_DEPLOY_WINDOW") == ip:
+        return
+    if not ctx.tty:
+        raise Stop(f"opening Foundry account {name} to {ip} needs a confirmation: set FA_CONFIRM_DEPLOY_WINDOW={ip} "
+                   f"for this run or run `{ctx.resume}` in a terminal; nothing was changed")
+    if ctx.ask(f"Type the IP ({ip}) to allow it for these steps: ").strip() != ip:
+        raise Stop("not confirmed; nothing was changed")
+
+
+@contextlib.contextmanager
+def foundry_window(ctx: Context, name: str, endpoint: str, ip: str):
+    """Open the account to `ip` alone, wait until its data plane answers (about 4 s after the PATCH applied, ADR-0010
+    phase 0), run the body, and always close and read back, also when the body or the opening failed."""
+    def answers() -> tuple[bool, str]:
+        result = ctx.run([*ctx.az_cmd, "rest", "--method", "get", "--url", f"{endpoint}/agents?api-version=v1&limit=1",
+                          "--resource", AI_RESOURCE, "-o", "json"])
+        return result.code == 0, _first_error(result.stderr) or "answered"
+
+    try:
+        patch_window(ctx, name, ip)
+        print(f"FA: Foundry account {name} is open to {ip} alone; waiting for its data plane", flush=True)
+        wait_until(ctx, f"the Foundry data plane to answer {ip} (or the signed-in account lacks Foundry User)",
+                   answers, attempts=36, every=5)
+        yield
+    finally:
+        pending = sys.exc_info()[1]
+        close_window(ctx, name, f"the steps stopped: {str(pending) or type(pending).__name__}" if pending
+                     else "the steps finished")
+
+
+def window_ip(ctx: Context, seeding: bool) -> str | None:
+    """The IP the window will allow, read and confirmed at the start of the deploy, before the long image build, so a
+    missing confirmation stops before it; None when no window is needed. Private only, and only when a step calls
+    the Foundry data plane from this computer: the WebIQ connection and toolbox, the Hosted Agent versions (private
+    memory is Cosmos DB, ADR-0011, so no memory store is created). Everything else in deploy is ARM, the Container
+    Apps Jobs inside the VNet, or the FA API's public ingress."""
+    if not private(ctx):
+        return None
+    steps = [text for on, text in ((ctx.get("FA_ENABLE_WEBIQ", "false").lower() == "true",
+                                    "set up the WebIQ connection and toolbox"),
+                                   (seeding, "create the Hosted Agent versions")) if on]
+    if not steps:
+        return None
+    ip = deployer_ipv4()
+    confirm_window(ctx, ctx.need("FA_FOUNDRY_ACCOUNT"), ip, " and ".join(steps))
+    return ip
+
+
+def data_plane_window(ctx: Context, ip: str | None) -> Any:
+    """The window around the data-plane steps, opened just before them to the IP window_ip() confirmed. That must
+    still be this computer's IP: the image build in between is long enough to change networks."""
+    if ip is None:
+        return contextlib.nullcontext()
+    now = deployer_ipv4()
+    if now != ip:
+        raise Stop(f"this computer's public IPv4 is now {now}, not the {ip} confirmed before the image build; nothing "
+                   f"was opened. Rerun `{ctx.resume}` to confirm the new one")
+    return foundry_window(ctx, ctx.need("FA_FOUNDRY_ACCOUNT"), ctx.need("FA_PROJECT_ENDPOINT"), ip)
 
 
 # ---- deploy ------------------------------------------------------------------------------------------------------
@@ -684,6 +1203,12 @@ def agent_roles(ctx: Context) -> None:
         deploy_bicep(ctx, f"fa-{ctx.env}-access-{name[-1]}", INFRA / "shared-context" / "project-service-access.bicep",
                      {"accountName": ctx.need("FA_FOUNDRY_ACCOUNT"), "projectName": ctx.need("FA_PROJECT"),
                       "principalId": ctx.need(f"FA_AGENT_{key}_OID")})
+        if models.memory_backend(ctx.values) == "cosmos":
+            # ADR-0011: Cosmos memory embeds at the account root (/openai/v1/embeddings, #971); project roles miss it.
+            deploy_bicep(ctx, f"fa-{ctx.env}-account-access-{name[-1]}",
+                         INFRA / "shared-context" / "account-access.bicep",
+                         {"accountName": ctx.need("FA_FOUNDRY_ACCOUNT"), "principalId": ctx.need(f"FA_AGENT_{key}_OID"),
+                          "roleId": OPENAI_USER_ROLE})
 
 
 def runtime(ctx: Context) -> Path:
@@ -746,11 +1271,18 @@ def _result_line(lines: list[str]) -> dict[str, Any]:
 
 
 def authorize(ctx: Context, plan: Any, path: Path) -> None:
-    """The owner's approval of this exact plan, typed in this terminal. Never in CI or without a terminal."""
+    """The owner's approval of this exact plan, typed in this terminal, or given ahead with
+    FA_APPROVE_INITIALIZATION=<azd env name> (Neal 2026-10-24). Either way only the signed-in Team owner approves."""
     owner = ctx.need("FA_TEAM_OWNER_OID")
-    if not ctx.tty:
+    name = ctx.need("AZURE_ENV_NAME")
+    preapproved = ctx.get("FA_APPROVE_INITIALIZATION")
+    if preapproved is not None and preapproved != name:
+        raise Stop(f"FA_APPROVE_INITIALIZATION is {preapproved!r}, not this environment's name {name!r}; nothing was "
+                   f"written. Set it to {name} to approve ahead, or clear it to approve in a terminal")
+    if not ctx.tty and preapproved is None:
         raise Stop("the empty-Table initialization needs the Team owner's typed approval; run "
-                   "`azd hooks run postdeploy` in an interactive terminal")
+                   "`azd hooks run postdeploy` in an interactive terminal, or as the owner set "
+                   f"FA_APPROVE_INITIALIZATION={name} first")
     if signed_in_user(ctx)["oid"].lower() != owner.lower():
         raise Stop("only the Team owner approves the initialization: the owner signs in to az and runs "
                    "`azd hooks run postdeploy`")
@@ -758,14 +1290,20 @@ def authorize(ctx: Context, plan: Any, path: Path) -> None:
           f"  request {plan.request_id}, installation {plan.installation_id}\n"
           f"  configuration {plan.configuration_sha256}\n  plan {plan.sha256}\n"
           f"  empty Table observed at {plan.empty_table_observed_at.isoformat()}\n", flush=True)
-    answer = ctx.ask("Approve this initialization of the plan above? [y/N]: ").strip().lower()
-    if answer not in ("y", "yes"):
-        raise Stop("not approved; nothing was written. Rerun `azd hooks run postdeploy` to decide again")
+    if preapproved:
+        print(f"FA: approved ahead by FA_APPROVE_INITIALIZATION={name} (no typed answer); the record's decision_id "
+              "says -fresh-preapproved-", flush=True)
+    else:
+        answer = ctx.ask("Approve this initialization of the plan above? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes"):
+            raise Stop("not approved; nothing was written. Rerun `azd hooks run postdeploy` to decide again")
     not_before = max(ctx.now(), plan.empty_table_observed_at)
+    # The Jobs' schema forbids extra fields and fixes approval_source, so decision_id carries the marker.
+    kind = "fresh-preapproved" if preapproved else "fresh"
     _write_x(path, {
         "schema_version": "fa-fresh-installation-authorization-v1",
         "purpose": "initialize-empty-native-authority", "approval_source": "operator-approved-file",
-        "decision_id": f"{ctx.env}-fresh-{not_before.strftime('%Y%m%dT%H%M%SZ')}",
+        "decision_id": f"{ctx.env}-{kind}-{not_before.strftime('%Y%m%dT%H%M%SZ')}",
         "authorizing_human_oid": owner, "configuration_sha256": plan.configuration_sha256,
         "plan_sha256": plan.sha256,
         "not_before": not_before.isoformat().replace("+00:00", "Z"),
@@ -875,6 +1413,9 @@ def console_app(ctx: Context, console_image: str, runtime_dir: Path, plan_path: 
         "apiAudience": ctx.need("FA_API_AUDIENCE"), "imageSha256": digest_of(console_image),
         "minReplicas": 1, **files,
     }
+    if ctx.get("FA_VNET_RESOURCE_ID"):  # ADR-0010 phase 2b: the Portal's blob private endpoint in the user's subnet
+        parameters |= {"privateEndpointSubnetResourceId": subnet_id(ctx, "FA_PRIVATE_ENDPOINT_SUBNET_NAME"),
+                       "privateDnsZones": not existing_dns(ctx)}
     template = INFRA / "web-console" / "web-console.bicep"
     # Internal ingress until the sign-in config exists: otherwise the console is public for the minutes in between,
     # and only the sign-in layer keeps clients from sending the principal headers themselves.
@@ -903,8 +1444,9 @@ def webiq(ctx: Context) -> None:
 
 
 def memory_store(ctx: Context) -> None:
-    """Private and Team memory (on unless FA_ENABLE_MEMORY=false): the store exists before any Agent version uses it."""
-    if ctx.get("FA_ENABLE_MEMORY", "true").lower() == "false":
+    """Private and Team memory (on unless FA_ENABLE_MEMORY=false): the store exists before any Agent version uses it.
+    The Cosmos DB memory (ADR-0011) has no store: provision created its account and container."""
+    if not models.memory_on(ctx.values) or models.memory_backend(ctx.values) == "cosmos":
         return
     try:
         chat_model = models.parse(ctx.values, models.catalog()).memory_chat_model
@@ -961,14 +1503,15 @@ def gate(ctx: Context, commit: str, api_ref: str) -> None:
                    "release again and azd deploy; or retire the Agent (deploy/azd/README.md#upgrade-2dii)") from None
 
 
-def upgrade(ctx: Context, built: dict[str, str], commit: str) -> None:
+def upgrade(ctx: Context, built: dict[str, str], commit: str, ip: str | None = None) -> None:
     """A later `azd deploy`: the stage CI's steps (deploy-staging.yml) against this profile. WebIQ first, so turning
     FA_ENABLE_WEBIQ on later never leaves the API offering a toolbox that does not exist (F6). The ADR-0009 phase 3b
     compatibility gate runs before any write (deploy/README.md#compat-gate); a first install has no binding rows yet."""
     ci_step(ctx, commit, "check")
     gate(ctx, commit, built["api"])
-    webiq(ctx)
-    memory_store(ctx)
+    with data_plane_window(ctx, ip):
+        webiq(ctx)
+        memory_store(ctx)
     ci_step(ctx, commit, "guard")
     ci_step(ctx, commit, "sync", built["api"], built["hosted"])
     ci_step(ctx, commit, "api", built["api"])
@@ -984,27 +1527,40 @@ capability; change them per assistant on the Portal's settings page (only new co
 Sign in at {ctx.get('FA_CONSOLE_URL', '<Portal URL>')} as the Team owner, open a new conversation and send a short
 message; it counts only when its receipt is completed with failure_code=null. Profile: {profile}
 """, flush=True)
+    if existing_dns(ctx):  # the Portal's private endpoint is new since postprovision printed the list
+        print_dns_records(ctx)
 
 
 def deploy(ctx: Context) -> None:
     for key in ("FA_PROJECT_ENDPOINT", "FA_API_URL", "FA_API_AUDIENCE", "FA_CONSOLE_APP_ID"):
         ctx.need(key)
+    # As preprovision, before any window write: `azd deploy` alone after a mistyped or cleared FA_NETWORK_MODE would
+    # otherwise drop it from the API environment, and with it the Work IQ guard.
+    mode = network_mode(ctx)
+    account = check_network_mode(ctx, mode, provisioned=True)
+    if mode == "private":
+        close_left_open_window(ctx, foundry_account_name(ctx), account)
+    existing = ctx.az("containerapp", "show", "--resource-group", ctx.group, "--name", ctx.need("FA_API_APP"),
+                      "--subscription", ctx.need("AZURE_SUBSCRIPTION_ID"), missing_ok=True)
+    # Upgrade only once a first install finished; a stopped first install resumes below (every step reads back).
+    upgrading = existing is not None and ctx.get("FA_SESSIONS_PREPARED") == "true"
+    seeding = not upgrading and not all(ctx.get(f"FA_AGENT_{key}_OID")
+                                        for key, _, _ in fa_profile.agent_names({"FA_ENVIRONMENT": ctx.env}))
+    ip = window_ip(ctx, seeding)
     commit, core = git_commit(), code_identity()
     ctx.set("FA_DEPLOY_RUN", str(int(ctx.get("FA_DEPLOY_RUN", "0")) + 1))
     write_profile(ctx, require_runtime=False)
     built = images(ctx, commit, core)
-    existing = ctx.az("containerapp", "show", "--resource-group", ctx.group, "--name", ctx.need("FA_API_APP"),
-                      "--subscription", ctx.need("AZURE_SUBSCRIPTION_ID"), missing_ok=True)
-    # Upgrade only once a first install finished; a stopped first install resumes below (every step reads back).
-    if existing is not None and ctx.get("FA_SESSIONS_PREPARED") == "true":
+    if upgrading:
         write_profile(ctx, require_runtime=True)
-        upgrade(ctx, built, commit)
+        upgrade(ctx, built, commit, ip)
         summary(ctx)
         return
-    webiq(ctx)
-    memory_store(ctx)
-    if not all(ctx.get(f"FA_AGENT_{key}_OID") for key, _, _ in fa_profile.agent_names({"FA_ENVIRONMENT": ctx.env})):
-        seed(ctx, built["hosted"], core)
+    with data_plane_window(ctx, ip):
+        webiq(ctx)
+        memory_store(ctx)
+        if seeding:
+            seed(ctx, built["hosted"], core)
     agent_roles(ctx)
     write_profile(ctx, require_runtime=True)
     ci_step(ctx, commit, "check")
@@ -1061,7 +1617,9 @@ def ensure_venv(ctx: Context) -> str:
 USER_INPUTS = frozenset({"FA_TEAM_OWNER_OID", "FA_MODELS", "FA_DEFAULT_MODEL", "FA_MODEL_CAPACITY_JSON",
                          "FA_MODEL_VERSION_UPGRADE_OPTION", "FA_API_SUBNET_NAT_EGRESS", "FA_ENABLE_AGENT_ONBOARDING",
                          "FA_ENABLE_WEBIQ", "FA_TIMEZONE", "FA_HOSTED_IDLE_TIMEOUT_SECONDS", "FA_ENABLE_MEMORY",
-                         "FA_ENABLE_TEAM_MCP_CONNECTIONS", "FA_DEPLOY_UPGRADE_SNAPSHOTS"})
+                         "FA_ENABLE_TEAM_MCP_CONNECTIONS", "FA_DEPLOY_UPGRADE_SNAPSHOTS", "FA_NETWORK_MODE",
+                         "FA_VNET_RESOURCE_ID", *SUBNET_INPUTS, "FA_DNS_MODE"})
+# FA_DNS_RECORDS_READY is set by the user too, but postdown clears it: a new install gets new private endpoint IPs.
 
 
 BACKUP_LOCK = "m1-backup-account-delete-protection"  # infra/shared-context/backup-foundation.bicep
@@ -1088,11 +1646,218 @@ def backup_role(ctx: Context) -> tuple[str, dict[str, Any] | None]:
     return role_id, ctx.az("rest", "--method", "get", "--url", f"{role_id}?{ROLE_API}", missing_ok=True)
 
 
+# ---- private network: the Foundry teardown before `azd down` (ADR-0010 section 7) -------------------------------
+
+NETWORK_API = "api-version=2024-05-01"  # the virtualNetworks/subnets version infra/ reads subnets with
+
+
+class GroupGone(Stop):
+    """The resource group itself does not exist (ResourceGroupNotFound)."""
+
+
+def _arm_get(ctx: Context, url: str) -> Any:
+    """GET that reads a 404 of the resource itself (ResourceNotFound, or a deleted account's own code) as None. A
+    missing subscription or resource group is not "this resource is gone": both stop, the group as GroupGone."""
+    result = ctx.run([*ctx.az_cmd, "rest", "--method", "get", "--url", url, "-o", "json"])
+    if result.code != 0:
+        path = url.split("?")[0]
+        if "SubscriptionNotFound" in result.stderr:
+            raise Stop(f"subscription {ctx.need('AZURE_SUBSCRIPTION_ID')} was not found reading {path}: check "
+                       "AZURE_SUBSCRIPTION_ID and the az sign-in; nothing was changed")
+        if "ResourceGroupNotFound" in result.stderr:
+            raise GroupGone(f"resource group {ctx.group} was not found reading {path}")
+        if "Not Found" in result.stderr or "ResourceNotFound" in result.stderr:  # az rest prints 404 as "Not Found("
+            return None
+        raise Stop(f"az rest get {path} failed: {_first_error(result.stderr)}")
+    return json.loads(result.stdout) if result.stdout.strip() else None
+
+
+def _provisioning(resource: Any) -> str | None:
+    return ((resource or {}).get("properties") or {}).get("provisioningState")
+
+
+def deleted_account_url(ctx: Context, name: str) -> str:
+    return (f"/subscriptions/{ctx.need('AZURE_SUBSCRIPTION_ID')}/providers/Microsoft.CognitiveServices/locations/"
+            f"{ctx.need('AZURE_LOCATION').strip().lower()}/resourceGroups/{ctx.group}/deletedAccounts/{name}?"
+            f"{ACCOUNT_API}")
+
+
+def project_name(ctx: Context) -> str:
+    return ctx.get("FA_PROJECT") or f"fa-{ctx.env}"  # main.bicep names.project
+
+
+def foundry_state(ctx: Context, name: str) -> dict[str, Any]:
+    """Read only, before the question, so a rerun continues where the last one stopped: the account and its project
+    (each present, Deleting or gone). The agents are read later, inside the window, which opens only while the
+    project is there and not Deleting yet (a Deleting project is polled, as the earlier run deleted its agents)."""
+    account = _arm_get(ctx, account_url(ctx, name))
+    require_mode(ctx, name, account, "private")  # before any window, delete or purge
+    project = project_name(ctx)
+    found = (None if account is None or _provisioning(account) == "Deleting"
+             else _arm_get(ctx, account_url(ctx, name, f"/projects/{project}")))
+    return {"account": account, "project": project if found else None, "project_state": _provisioning(found),
+            "window": bool(found) and _provisioning(found) != "Deleting"}
+
+
+def delete_agents(ctx: Context, endpoint: str) -> None:
+    """Every Hosted Agent of the project, with force=true: without it the service answers 409 while a session
+    exists, and the account delete is refused while they exist (ADR-0010 phase 0, Q10)."""
+    for _ in range(3):  # a later round catches a page the first list did not return
+        listed = ctx.az("rest", "--method", "get", "--url", f"{endpoint}/agents?api-version=v1",
+                        "--resource", AI_RESOURCE) or {}
+        names = [item["name"] for item in listed.get("data") or [] if item.get("name")]
+        if not names:
+            print("FA: Hosted Agents: none left", flush=True)
+            return
+        for agent in names:
+            result = ctx.run([*ctx.az_cmd, "rest", "--method", "delete", "--url",
+                              f"{endpoint}/agents/{agent}?force=true&api-version=v1", "--resource", AI_RESOURCE,
+                              "-o", "json"])
+            if result.code != 0 and "Not Found" not in result.stderr:  # a 404 is an agent already deleted
+                raise Stop(f"deleting Hosted Agent {agent} failed: {_first_error(result.stderr)}; read the agents "
+                           f"back, then rerun `{ctx.resume}`")
+            print(f"FA: Hosted Agent {agent}: " + ("deleted with force=true (its sessions end with it)"
+                                                   if result.code == 0 else "already deleted (404)"), flush=True)
+        ctx.sleep(5)  # let the list catch up before reading it again
+    raise Stop(f"Hosted Agents are still listed after three rounds of deletes; read them back, then rerun "
+               f"`{ctx.resume}`")
+
+
+NESTED_RESENDS, NESTED_EVERY = 20, 15  # a deleted project still blocking the account delete: 5 min at most
+
+
+def only_nested(stderr: str, nested_id: str | None) -> bool:
+    """A CannotDeleteResource whose nested resource IDs are all `nested_id` exactly (no deeper path, no other one)."""
+    found = re.findall(r"Microsoft\.CognitiveServices/accounts/[^'\",\s]+", stderr, re.IGNORECASE)
+    return (nested_id is not None and "CannotDeleteResource" in stderr and bool(found)
+            and all(item.lower() == nested_id.lower() for item in found))
+
+
+def delete_once(ctx: Context, what: str, url: str, state: str | None, resend_for: str | None = None) -> None:
+    """Send the DELETE once, unless `state` is Deleting already; only a CannotDeleteResource whose nested resource is
+    `resend_for` alone (the account's own project, read back gone), which accepted nothing, is sent again (bounded).
+    Any other failed answer, GatewayTimeout above all, often means it is Deleting already (phase 0b): read its
+    state, never send the delete again. After a GatewayTimeout the delete has about 90 s to show (Deleting or gone);
+    if it does not, it did not start, and a rerun reads again."""
+    if state == "Deleting":
+        return
+    for attempt in range(NESTED_RESENDS + 1):
+        result = ctx.run([*ctx.az_cmd, "rest", "--method", "delete", "--url", url, "-o", "json"])
+        # The project reads back gone before the account sees it (live run 2026-10-24): that Conflict accepted
+        # nothing, so only it is sent again. Any other answer, GatewayTimeout above all, goes on below.
+        if result.code == 0 or attempt == NESTED_RESENDS or not only_nested(result.stderr, resend_for):
+            break
+        if attempt % 4 == 0:
+            print(f"FA: the delete of {what} was refused while its deleted project is still listed "
+                  f"(CannotDeleteResource); sending it again every {NESTED_EVERY} s for at most "
+                  f"{NESTED_RESENDS * NESTED_EVERY // 60} min", flush=True)
+        ctx.sleep(NESTED_EVERY)
+    if result.code == 0:
+        return
+    error = _first_error(result.stderr)
+    print(f"FA: the delete of {what} answered: {error}; reading its state instead of sending it again", flush=True)
+
+    def started() -> tuple[bool, str]:
+        current = _provisioning(_arm_get(ctx, url)) or "gone"
+        return current in ("Deleting", "gone"), current
+
+    if "GatewayTimeout" in result.stderr:
+        try:
+            wait_until(ctx, f"{what} to start deleting after the GatewayTimeout", started, attempts=4, every=30)
+        except Stop as stop:
+            raise Stop(f"{stop}. The delete did not start; the rerun reads the state again before it sends one "
+                       "delete") from None
+        return
+    done, current = started()
+    if not done:
+        raise Stop(f"deleting {what} failed ({error}); it is still {current}. Read it back, then rerun `{ctx.resume}`")
+
+
+def delete_account(ctx: Context, name: str, account: Any) -> None:
+    """Delete once (delete_once), then poll until the account is gone (about 22 min when injected)."""
+    url = account_url(ctx, name)
+    if account is None:
+        print(f"FA: Foundry account {name}: already deleted", flush=True)
+        return
+    # Only the account resends, and only for its own project (predown read it back gone first).
+    delete_once(ctx, f"Foundry account {name}", url, _provisioning(account),
+                resend_for=f"Microsoft.CognitiveServices/accounts/{name}/projects/{project_name(ctx)}")
+    print(f"FA: Foundry account {name}: deleting; an injected account takes about 22 min", flush=True)
+
+    def gone() -> tuple[bool, str]:
+        current = _arm_get(ctx, url)
+        return current is None, f"provisioningState {_provisioning(current)}"
+
+    wait_until(ctx, f"Foundry account {name} to be deleted", gone, attempts=90, every=30)
+    print(f"FA: Foundry account {name}: deleted (read back)", flush=True)
+
+
+def purge_account(ctx: Context, name: str) -> None:
+    """Only once the account is gone: while it is Deleting the purge does not return (phase 0)."""
+    url = deleted_account_url(ctx, name)
+    if _arm_get(ctx, url) is None:
+        print(f"FA: Foundry account {name}: no soft-deleted copy (already purged)", flush=True)
+        return
+    result = ctx.run([*ctx.az_cmd, "rest", "--method", "delete", "--url", url, "-o", "json"])
+    if result.code != 0:
+        print(f"FA: the purge of Foundry account {name} answered: {_first_error(result.stderr)}; reading it back "
+              "instead of sending it again", flush=True)
+    wait_until(ctx, f"the soft-deleted Foundry account {name} to be purged",
+               lambda: (_arm_get(ctx, url) is None, "still soft-deleted"), attempts=20, every=30)
+    print(f"FA: Foundry account {name}: purged (read back)", flush=True)
+
+
+def wait_agent_subnet_released(ctx: Context) -> None:
+    """azd cannot delete the VNet while snet-agents keeps a service association link. With an existing VNet
+    (ADR-0010 phase 2b) the subnet is the user's, outside the group: it is read, never deleted, and freed this way."""
+    if ctx.get("FA_VNET_RESOURCE_ID"):
+        subnet = subnet_id(ctx, "FA_AGENT_SUBNET_NAME")
+    else:
+        subnet = (f"/subscriptions/{ctx.need('AZURE_SUBSCRIPTION_ID')}/resourceGroups/{ctx.group}/providers/"
+                  f"Microsoft.Network/virtualNetworks/{ctx.get('FA_VNET') or f'vnet-{ctx.env}'}/subnets/snet-agents")
+    url, label = f"{subnet}?{NETWORK_API}", subnet.rsplit("/", 1)[-1]
+
+    def released() -> tuple[bool, str]:
+        links = ((_arm_get(ctx, url) or {}).get("properties") or {}).get("serviceAssociationLinks") or []
+        return not links, f"{len(links)} service association link(s)"
+
+    wait_until(ctx, f"{label} to drop its service association link", released, attempts=40, every=30)
+    print(f"FA: {label} has no service association link (read back); azd can delete the resource group",
+          flush=True)
+
+
+def delete_private_foundry(ctx: Context, name: str, state: dict[str, Any], ip: str | None) -> None:
+    """The order the probes verified: agents (force), project, account, wait until gone, purge, the subnet link.
+    Deleting the project with agents still in it was never tried, so the agents go first, through the window."""
+    project = state["project"]
+    if project:
+        if state["window"]:
+            endpoint = f"https://{name}.services.ai.azure.com/api/projects/{project}"  # foundry.bicep projectEndpoint
+            with foundry_window(ctx, name, endpoint, ip):  # predown read ip because the project exists
+                delete_agents(ctx, endpoint)
+        else:
+            print(f"FA: project {project}: Deleting already (an earlier run); polling it, no window", flush=True)
+        url = account_url(ctx, name, f"/projects/{project}")
+        # Before the account, or it is CannotDeleteResource.
+        delete_once(ctx, f"project {project}", url, state["project_state"])
+        wait_until(ctx, f"project {project} to be deleted", lambda: (_arm_get(ctx, url) is None, "still there"),
+                   attempts=40, every=15)
+        print(f"FA: project {project}: deleted (read back)", flush=True)
+    else:
+        print("FA: project: already deleted, and its Hosted Agents with it", flush=True)
+    delete_account(ctx, name, state["account"])
+    purge_account(ctx, name)
+    wait_agent_subnet_released(ctx)
+
+
 def predown(ctx: Context) -> None:
     """`azd down` cannot delete the resource group while the M1 backup account keeps its CanNotDelete lock, which
     backup-foundation.bicep sets on purpose. Removing it lets the backups go with the group, so the person types the
     environment name first (or sets FA_CONFIRM_DELETE=<name> for a run without a terminal). Only FA's own lock is
-    removed; any other lock stops here for its owner to decide. First, read only: what goes outside the group."""
+    removed; any other lock stops here for its owner to decide. First, read only: what goes outside the group.
+    FA_NETWORK_MODE=private always asks, lock or not, in that same one question: the hook then deletes the injected
+    Foundry account in the order azd's own delete does not follow (delete_private_foundry, ADR-0010 section 7),
+    before the lock, so a stop on the way keeps the backups locked."""
     account = check_account(ctx)
     keys = entra.names(ctx.env, account["tenantId"], ctx.need("AZURE_SUBSCRIPTION_ID"), ctx.group)
     try:  # informational: a failed read must not stop `azd down`
@@ -1105,20 +1870,66 @@ def predown(ctx: Context) -> None:
           f"{keys['api_unique_name']} (if present; restorable for 30 days); backup custom role: {found}", flush=True)
     locks = ctx.az("lock", "list", "--resource-group", ctx.group, "--subscription", ctx.need("AZURE_SUBSCRIPTION_ID"),
                    missing_ok=True) or []
-    if not locks:
+    private_mode = private(ctx)
+    if not locks and not private_mode:
         return
     foreign = [lock.get("name") for lock in locks if lock.get("name") != BACKUP_LOCK]
     if foreign:
         raise Stop(f"{ctx.group} has locks FA did not create ({', '.join(map(str, foreign))}); remove them yourself first")
     name = ctx.need("AZURE_ENV_NAME")
+    if private_mode:
+        foundry = ctx.get("FA_FOUNDRY_ACCOUNT") or foundry_account_name(ctx)
+        try:
+            state = foundry_state(ctx, foundry)
+        except GroupGone:
+            print(f"FA: resource group {ctx.group} does not exist, so Foundry account {foundry} and everything else "
+                  "in it are already deleted; nothing was removed", flush=True)
+            # The soft-deleted copy is subscription scoped and outlives the group. Read only: this branch asked nothing,
+            # so the purge is printed, not sent; a failed read must not stop `azd down` (postdown still runs).
+            url = None
+            try:
+                url = deleted_account_url(ctx, foundry)  # needs AZURE_LOCATION
+                copy = "is still soft-deleted" if _arm_get(ctx, url) else None
+            except Stop as error:
+                copy = f"may still be soft-deleted (the read failed: {error})"
+            if copy:
+                print(f"FA: Foundry account {foundry} {copy}" + (f"; to purge it yourself: az rest --method delete "
+                                                                 f"--url \"{url}\"" if url else ""), flush=True)
+            return
+        close_left_open_window(ctx, foundry, state["account"])  # back to the Bicep state, so no question first
+        ip = deployer_ipv4() if state["window"] else None  # the agents are deleted through the window
+        lines = [f"FA_NETWORK_MODE=private: before azd deletes {ctx.group}, this hook:",
+                 f"  permanently deletes the Foundry account {foundry} with its models and Hosted Agents,",
+                 "  and purges it (about 25 min, with progress);"]
+        if ip:
+            lines += [f"  to delete the Hosted Agents, first opens the account to {ip} alone and closes it again",
+                      f"  ({ip} is this computer's public IPv4, read from {IPV4_ECHO});",
+                      "  behind a shared NAT everyone using that IP is let in too while it is open;"]
+        if locks:
+            lines.append(f"  removes the backup lock, so {ctx.group}'s Table data and M1 backups go for good with the "
+                         "group.")
+        lines += ["After this hook azd asks its own y/N for the rest.",
+                  "Answering N there leaves the Foundry account deleted and everything else in place."]
+        print("\n".join(f"FA: {line}" for line in lines), flush=True)
+        refusal = (f"FA_NETWORK_MODE=private: deleting {ctx.group} first deletes Foundry account {foundry}"
+                   f"{' and the M1 backups' if locks else ''}; set FA_CONFIRM_DELETE={name} for this run"
+                   f"{f' (it also allows the window to {ip})' if ip else ''} or run `azd down` in a terminal; nothing "
+                   "was removed")
+        question = (f"Type the environment name ({name}) to permanently delete and purge Foundry account {foundry}"
+                    f"{' and remove the backup lock' if locks else ''}: ")
+    else:
+        refusal = (f"deleting {ctx.group} also deletes its M1 backups; set FA_CONFIRM_DELETE={name} for this run "
+                   "or run `azd down` in a terminal")
+        question = (f"Deleting {ctx.group} deletes its Table data and M1 backups for good. "
+                    f"Type the environment name ({name}) to remove the backup lock: ")
     if ctx.get("FA_CONFIRM_DELETE") != name:
         if not ctx.tty:
-            raise Stop(f"deleting {ctx.group} also deletes its M1 backups; set FA_CONFIRM_DELETE={name} for this run "
-                       "or run `azd down` in a terminal")
-        answer = ctx.ask(f"Deleting {ctx.group} deletes its Table data and M1 backups for good. "
-                         f"Type the environment name ({name}) to remove the backup lock: ").strip()
+            raise Stop(refusal)
+        answer = ctx.ask(question).strip()
         if answer != name:
             raise Stop("not confirmed; nothing was removed")
+    if private_mode:
+        delete_private_foundry(ctx, foundry, state, ip)
     for lock in locks:
         ctx.az("lock", "delete", "--ids", lock["id"])
         # azd asks its own y/N after this hook; whoever answers no puts the lock back with this command.
@@ -1196,6 +2007,16 @@ PHASES = {"preprovision": preprovision, "postprovision": postprovision, "deploy"
 RESUME = {"preprovision": "azd up", "deploy": "azd hooks run postdeploy", "predown": "azd down"}
 
 
+def wait_child(process: Any) -> int:
+    """The venv child's exit code. Ctrl+C reaches the child too (same console), and its finally closes the Foundry
+    window; subprocess.run would kill it 0.25 s after the Ctrl+C, before that close, so this keeps waiting."""
+    while True:
+        try:
+            return process.wait()
+        except KeyboardInterrupt:
+            print("FA: Ctrl+C: waiting for the deploy to stop and close what it opened", file=sys.stderr, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) != 1 or argv[0] not in PHASES:
@@ -1209,11 +2030,11 @@ def main(argv: list[str] | None = None) -> int:
     ctx = Context(values=values, resume=RESUME.get(argv[0], f"azd hooks run {argv[0]}"))
     if argv[0] == "deploy" and os.environ.get("FA_AZD_VENV") != "1":
         python = ensure_venv(ctx)
-        return subprocess.run([python, "-X", "utf8", str(Path(__file__).resolve()), "deploy"],
-                              env={**os.environ, "FA_AZD_VENV": "1", "PYTHONUTF8": "1"}, check=False).returncode
+        return wait_child(subprocess.Popen([python, "-X", "utf8", str(Path(__file__).resolve()), "deploy"],
+                                           env={**os.environ, "FA_AZD_VENV": "1", "PYTHONUTF8": "1"}))
     try:
         PHASES[argv[0]](ctx)
-    except Stop as error:
+    except (Stop, subprocess.TimeoutExpired) as error:  # a bounded az call (the window's open GET/PATCH) that hung
         print(f"FA: stopped: {error}", file=sys.stderr, flush=True)
         return 1
     except entra.GraphForbidden as error:

@@ -680,7 +680,11 @@ def test_memory_recall_overlaps_capability_binding_and_stops_with_a_turn_that_en
         events.append("recall")
         searching.set()
         if bind_fails:
-            await asyncio.sleep(30)  # longer than the harness wait: only a cancelled recall ends this turn in time
+            try:
+                await asyncio.sleep(30)  # longer than the harness wait: only a cancelled recall ends this turn in time
+            except asyncio.CancelledError:
+                events.append("cancelled")
+                raise
         return httpx.Response(200, json={"memories": [{"memory_item": {
             "memory_id": "memory-1", "content": "RECALL_TEXT_CANARY", "updated_at": 1_700_000_000}}]})
 
@@ -704,14 +708,126 @@ def test_memory_recall_overlaps_capability_binding_and_stops_with_a_turn_that_en
     probe = NativeCapabilityProvider(accepts=lambda grant: True, bind=bind, approved_skills=True, name="probe")
     install_executor(responses, monkeypatch, tmp_path, sdk, private_memory=memory, capability_providers=(probe,))
     if bind_fails:
+        unknown = responses.runtime._unknown
+
+        async def recorded_unknown(*args, **kwargs):
+            events.append("unknown")
+            return await unknown(*args, **kwargs)
+
+        monkeypatch.setattr(responses.runtime, "_unknown", recorded_unknown)
         started = time.monotonic()
         assert responses.invoke(request).status_code == 202
         refused = responses.wait(request.command.request_id, "unknown")
         assert refused.failure_code == "CAPABILITY_UNAVAILABLE" and time.monotonic() - started < 8 and prompts == []
+        # The recall started before allocation stops with the SDK turn, before the turn records unknown.
+        assert events[-3:] == ["cancelled", "cancelled", "unknown"]
     else:
         run_turn(responses, request)
         assert "RECALL_TEXT_CANARY" in prompts[0]
     assert events.index("recall") < events.index("bound")
+
+
+TEAM_SCOPE = "fat1-" + "1" * 48
+
+
+def early_memory(kind, service):
+    """One configured memory (private, or Team with a fresh scope pin) and the submit that reaches it."""
+    from shared_context.behavior_native_turn_wire import TeamMemoryCapture
+    from shared_context.native_team_memory import NativeTeamMemory
+
+    store = PrivateMemory(
+        "https://offline-fixture.services.ai.azure.com/api/projects/offline", "offline-memory", "offline-agent",
+        lambda: "OFFLINE-memory-token", transport=httpx.MockTransport(service))
+    if kind == "private":
+        memory = NativePrivateMemory(store)
+        return memory, {"private_memory": memory}, submit
+
+    def team_submit(*args):
+        data = submit(*args).model_dump(mode="json")
+        data["capture"]["team_memory"] = TeamMemoryCapture(scope=TEAM_SCOPE).model_dump(mode="json")
+        return NativeSubmit.model_validate_json(json.dumps(data))
+
+    memory = NativeTeamMemory(store, "offline-agent")
+    return memory, {"team_memory": memory}, team_submit
+
+
+def recall_timings(caplog, kind):
+    """(job_id, outcome) of each FA_TIMING line for this memory's recall."""
+    lines = (json.loads(record.getMessage().removeprefix("FA_TIMING ")) for record in caplog.records
+             if record.getMessage().startswith("FA_TIMING "))
+    return [(line["job_id"], line["outcome"]) for line in lines if line["phase"] == kind + "_memory_recall"]
+
+
+@pytest.mark.parametrize("kind", ["private", "team"])
+@pytest.mark.parametrize("case", ["new", "follow_up", "follow_up_without_history", "search_fails"])
+def test_memory_recall_starts_before_allocation_and_keeps_its_tiers_and_failure_handling(
+        responses, monkeypatch, tmp_path, caplog, case, kind):
+    """Dev 10-22 (r2/r3): on warm turns recall still held the model 0.3-0.9 s after operations start, though it
+    needs only the receipt. Allocation here waits for a search to have started, so a turn only completes when recall
+    starts before allocation. The static profile is still read exactly when the turn has no SDK history (a follow-up
+    after a failed first turn drops the guessed recall and reads it), and a failed search still degrades the prompt.
+    A Team turn's first use pins the captured scope from the early recall; FA_TIMING keeps this turn's ID."""
+    import logging
+    from shared_context.behavior_timing import timing_id
+
+    caplog.set_level(logging.WARNING, logger="shared_context.behavior_timing")
+    events, prompts, searching, failing = [], [], asyncio.Event(), [case == "follow_up_without_history"]
+
+    async def service(incoming):
+        events.append("contextual" if "items" in json.loads(incoming.content) else "static")
+        searching.set()
+        if case == "search_fails":
+            return httpx.Response(500)
+        return httpx.Response(200, json={"memories": [{"memory_item": {
+            "memory_id": "memory-1", "content": "RECALL_TEXT_CANARY", "updated_at": 1_700_000_000}}]})
+
+    allocate = responses.runtime._allocate_timed
+
+    async def allocate_after_recall(original):
+        await asyncio.wait_for(searching.wait(), 5)
+        events.append("allocated")
+        return await allocate(original)
+
+    async def sdk(**options):
+        prompts.append(options["prompt"])
+        if failing.pop(0):
+            raise RuntimeError("OFFLINE first turn fails after allocation")
+        return await offline_sdk(**options)
+
+    memory, configured, make = early_memory(kind, service)
+    install_executor(responses, monkeypatch, tmp_path, sdk, **configured)
+    monkeypatch.setattr(responses.runtime, "_allocate_timed", allocate_after_recall)
+    request = make()
+    if case.startswith("follow_up"):
+        failing.append(False)
+        if case == "follow_up":
+            first = run_turn(responses, request)
+        else:
+            assert responses.invoke(request).status_code == 202
+            first = responses.wait(request.command.request_id, "unknown")
+        events.clear()
+        searching.clear()
+        caplog.clear()
+        request = make("rid-2", first.conversation_id)
+    receipt = run_turn(responses, request)
+    part = next(part for part in receipt.assembly.parts if part.name == kind + "_memory")
+    timings = recall_timings(caplog, kind)
+    assert {job for job, _ in timings} == {timing_id(request.command.request_id)}
+    assert "failed" not in {outcome for _, outcome in timings}
+    if kind == "team":
+        assert memory._scope == TEAM_SCOPE  # pinned once, create-only, with the server-given value
+    if case == "follow_up":
+        assert events == ["contextual", "allocated"]
+    elif case == "follow_up_without_history":
+        assert events[:2] == ["contextual", "allocated"] and sorted(events[2:]) == ["contextual", "static"]
+    else:
+        assert events.index("allocated") > 0 and sorted(set(events) - {"allocated"}) == ["contextual", "static"]
+        assert len(events) == 3
+    if case == "search_fails":
+        assert part.state == "unknown" and "could not be read" in prompts[-1]
+        assert "RECALL_TEXT_CANARY" not in prompts[-1]
+    else:
+        assert part.state == "included" and prompts[-1].count("RECALL_TEXT_CANARY") == 1
 
 
 @pytest.mark.parametrize("reply", ["found", "unavailable", "other_conversation"])
@@ -824,3 +940,91 @@ def test_an_early_reminders_read_stops_with_a_failed_bind_and_its_own_failure_st
         assert refused.failure_code == "CAPABILITY_UNAVAILABLE" and events == ["reminders", "bound", "cancelled"]
     else:
         assert refused.failure_code == "NATIVE_TURN_UNKNOWN" and events == ["reminders", "bound"]
+
+
+@pytest.mark.parametrize("kind", ["private", "team"])
+def test_a_recall_started_before_allocation_stops_with_a_refused_allocation(
+        responses, monkeypatch, tmp_path, caplog, kind):
+    """The recall now starts before allocation, outside the SDK turn's exit stack: a refused allocation still cancels
+    it and the turn ends without waiting for the search. Its FA_TIMING line says cancelled under this turn's ID; a
+    Team turn's first use has already pinned the captured scope (create-only, the same value)."""
+    import logging
+    import time
+    from shared_context.behavior_timing import timing_id
+    from shared_context.errors import Problem
+
+    caplog.set_level(logging.WARNING, logger="shared_context.behavior_timing")
+    events, searching = [], asyncio.Event()
+
+    async def service(incoming):
+        searching.set()
+        try:
+            await asyncio.sleep(30)  # longer than the harness wait: only a cancelled recall ends this turn in time
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+        return httpx.Response(200, json={"memories": []})
+
+    async def refuse(original):
+        await asyncio.wait_for(searching.wait(), 5)
+        raise Problem(409, "NATIVE_TURN_NOT_TAKEN", "OFFLINE refused allocation")
+
+    memory, configured, make = early_memory(kind, service)
+    install_executor(responses, monkeypatch, tmp_path, **configured)
+    monkeypatch.setattr(responses.runtime, "_allocate_timed", refuse)
+    request = make()
+    started = time.monotonic()
+    assert responses.invoke(request).status_code == 202
+    refused = responses.wait(request.command.request_id, "unknown")
+    assert refused.failure_code == "NATIVE_TURN_NOT_TAKEN" and time.monotonic() - started < 8
+    while not recall_timings(caplog, kind) and time.monotonic() - started < 8:
+        time.sleep(0.01)  # the runtime's finally cancels the recall after it records unknown
+    assert events == ["cancelled", "cancelled"]  # a new conversation: the static and the contextual search
+    assert recall_timings(caplog, kind) == [(timing_id(request.command.request_id), "cancelled")]
+    if kind == "team":
+        assert memory._scope == TEAM_SCOPE
+
+
+@pytest.mark.parametrize("kind", ["private", "team"])
+def test_a_wrong_first_turn_guess_logs_its_dropped_recall_as_cancelled_under_the_turns_id(
+        responses, monkeypatch, tmp_path, caplog, kind):
+    """A follow-up after a failed first turn has no SDK history, so the recall guessed from its CID (contextual only)
+    is dropped while still searching and recalled again with the static profile. Dev latency reports must read that
+    as one cancelled and one returned recall under this turn's ID, never as a failed one."""
+    import logging
+    from shared_context.behavior_timing import timing_id
+
+    caplog.set_level(logging.WARNING, logger="shared_context.behavior_timing")
+    held, failing, searching = [False], [True, False], asyncio.Event()
+
+    async def service(incoming):
+        searching.set()
+        if held[0]:
+            held[0] = False
+            await asyncio.sleep(30)  # the guessed search: only a cancelled recall ends this turn in time
+        return httpx.Response(200, json={"memories": []})
+
+    async def sdk(**options):
+        if failing.pop(0):
+            raise RuntimeError("OFFLINE first turn fails after allocation")
+        return await offline_sdk(**options)
+
+    allocate = responses.runtime._allocate_timed
+
+    async def allocate_after_recall(original):
+        await asyncio.wait_for(searching.wait(), 5)
+        return await allocate(original)
+
+    memory, configured, make = early_memory(kind, service)
+    install_executor(responses, monkeypatch, tmp_path, sdk, **configured)
+    first = make()
+    assert responses.invoke(first).status_code == 202
+    first = responses.wait(first.command.request_id, "unknown")
+    monkeypatch.setattr(responses.runtime, "_allocate_timed", allocate_after_recall)
+    held[0] = True
+    searching.clear()
+    caplog.clear()
+    follow = make("rid-2", first.conversation_id)
+    run_turn(responses, follow)
+    turn = timing_id(follow.command.request_id)
+    assert sorted(recall_timings(caplog, kind)) == [(turn, "cancelled"), (turn, "returned")]

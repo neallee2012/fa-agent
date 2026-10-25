@@ -10,7 +10,7 @@ from pydantic import Field
 from .behavior_operations import _Model,_row,_write,_updated,control_key
 from .behavior_store import ControlRequest,ControlChanges
 from .behavior_assistant_wire import ModelDeployment
-from .behavior_turn_usage import TurnModelUsage
+from .behavior_turn_usage import AgentUsageSource, TurnModelUsage
 from .behavior_work_policy import CostLedger,Money
 from .behavior_runtime import material
 from .behavior_timing import timing_id
@@ -163,9 +163,8 @@ def replay_turn_usage(view,receipt,ledger,records,ledgerkey):
 
 
 # ADR-0007 native turns: no Table job or WorkRegistration exists, so usage is keyed by the server-resolved
-# Agent and the original request ID. "memory" (#315 private-memory service usage) will be a second source
-# with its own usage type; it is not accepted yet.
-AgentUsageSource = Literal["model"]
+# Agent and the original request ID. ADR-0011: "memory" (the private-memory extraction call) is a second source
+# with the same TurnModelUsage type, keyed beside the turn's own "model" usage of the same RID.
 
 
 def agent_turn_usage_key(agent_oid,rid,source="model"):
@@ -186,6 +185,11 @@ class AgentTurnUsageRecord(_Model):
     prices:tuple[TurnUsagePrice,...]
     metered_microusd:Money
     unmetered_requests:Annotated[int,Field(ge=0)]
+
+
+def _unknown_turn(source,usage):
+    # An unknown memory report is still recorded as unknown, but it is not a turn.
+    return int(source=="model" and usage is None)
 
 
 def _agent_usage_cost(usage,prices):
@@ -217,11 +221,11 @@ def agent_usage_scope(control,principal):
     principal.require(template.team_id,"execute")
 
 
-def record_agent_turn_usage(control,*,rid,usage):
+def record_agent_turn_usage(control,*,rid,usage,source="model"):
     """Write one native turn's final usage once into the original CostLedger (ADR-0007).
 
     ``control`` is the API's own work policy for the Agent whose original receipt this is; the Agent is
-    never taken from a request body. Call it only after the turn is final: the same report for the same
+    never taken from a request body. Call it only after the turn is final: the same report for the same source and
     (Agent, RID) replays its original receipt, and a different report is refused with 409. A catalog read
     failure raises before any write. Any other failure (for example a lost commit acknowledgement) may
     leave the result unknown: the write may already exist, so reconcile only by calling again with the
@@ -230,7 +234,6 @@ def record_agent_turn_usage(control,*,rid,usage):
     if usage is not None and not isinstance(usage,TurnModelUsage):
         raise Problem(422,"AGENT_USAGE_INVALID","a typed turn usage report or an explicit unknown is required")
     agent_oid=control.policy.template.agent_oid
-    source="model"
     prices=[]
     for group in () if usage is None else usage.usage:
         try:
@@ -261,7 +264,7 @@ def record_agent_turn_usage(control,*,rid,usage):
         return ControlChanges(writes=(_write(key,record,"create"),_write(control.cost_key,_updated(ledger,
             model_metered_microusd=ledger.model_metered_microusd+metered,
             model_unmetered_requests=ledger.model_unmetered_requests+unmetered,
-            model_unknown_turns=ledger.model_unknown_turns+(usage is None)),"replace")),result=result)
+            model_unknown_turns=ledger.model_unknown_turns+_unknown_turn(source,usage)),"replace")),result=result)
     for attempt in range(3):
         try:
             # The store replays the original receipt for the same request; another digest is a conflict.
@@ -294,7 +297,7 @@ def replay_agent_turn_usage(view,receipt,ledger,agent_oid,ledgerkey):
         (key,ledgerkey),exact={key:view.hash(key)},result=_agent_usage_result(final.usage,metered,unmetered))
     return _updated(ledger,model_metered_microusd=ledger.model_metered_microusd+metered,
                     model_unmetered_requests=ledger.model_unmetered_requests+unmetered,
-                    model_unknown_turns=ledger.model_unknown_turns+(final.usage is None))
+                    model_unknown_turns=ledger.model_unknown_turns+_unknown_turn(final.source,final.usage))
 
 class ModelCost(_Model):
     kind:Literal["instruction_model_cost"]="instruction_model_cost"

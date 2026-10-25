@@ -71,7 +71,8 @@ RUNTIME = ROOT / "deploy" / "stage" / "runtime"
 TOKEN = re.sub(r"[^a-z0-9-]+", "-", STAGE["environment"].lower()).strip("-") or "environment"
 VERSIONS = APP / "shared_context" / "behavior_agent_versions.py"
 # Overlay keys sync checks by value, not as "0"/"1" switches (behavior_agent_versions._check_environment).
-HOSTED_VALUE_KEYS = frozenset({"FA_NATIVE_TURNS", "FA_NATIVE_HITL_TTL_SECONDS", "FA_PRIVATE_MEMORY_STORE", "TZ"})
+HOSTED_VALUE_KEYS = frozenset({"FA_NATIVE_TURNS", "FA_NATIVE_HITL_TTL_SECONDS", "FA_PRIVATE_MEMORY_STORE", "TZ",
+                               "FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL"})
 # native_responses_wire.ACCEPTED_STATE_PROFILES (ADR-0009 2d-i), copied: meta cannot import shared_context. The API's
 # own FA_NATIVE_TURNS stays v1 (api_routines) until 2d-ii.
 HOSTED_STATE_PROFILES = frozenset({"foundry-native-v1", "foundry-native-v2"})
@@ -472,6 +473,7 @@ def _check_hosted(name, environment, idle_timeout_seconds):
     if (invalid or type(idle_timeout_seconds) is not int or not 120 <= idle_timeout_seconds <= 3600
             or any(key in environment and environment[key] not in {"0", "1"} for key in switches)
             or environment.get("FA_NATIVE_TURNS", "foundry-native-v1") not in HOSTED_STATE_PROFILES
+            or environment.get("FA_MEMORY_BACKEND", "foundry") not in {"foundry", "cosmos"}
             or "FA_NATIVE_HITL_TTL_SECONDS" in environment
             and re.fullmatch(r"[1-9][0-9]{0,5}", environment["FA_NATIVE_HITL_TTL_SECONDS"]) is None
             or any("\x00" in value or "\r" in value or "\n" in value for value in environment.values())):

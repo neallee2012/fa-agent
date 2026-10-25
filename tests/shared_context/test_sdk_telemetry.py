@@ -491,7 +491,7 @@ def test_native_turn_carries_the_admitting_trace_to_the_sdk_and_its_model_sender
 LOG_CANARY = "USER_CONTENT_CANARY"
 
 
-def test_hosted_log_export_sends_only_timing_and_resident_lines_of_the_listed_loggers(telemetry):
+def test_hosted_log_export_sends_only_the_listed_prefixes_of_the_listed_loggers(telemetry):
     from shared_context.behavior_timing import elapsed_timing
 
     loggers = [logging.getLogger(name) for name in sdk_telemetry.LOG_LOGGERS]
@@ -510,7 +510,41 @@ def test_hosted_log_export_sends_only_timing_and_resident_lines_of_the_listed_lo
         sdk.warning("FA_MCP_SERVER_STATUS %s", LOG_CANARY)  # same logger, a line that may carry runtime text
         sdk.warning("%s", "RESIDENT_SDK_STOPPED " + LOG_CANARY)  # an argument cannot pass the prefix check
         sdk.warning("RESIDENT_SDK_STOPPED reason=%s", "cancelled", exc_info=ValueError(LOG_CANARY))
-        logging.getLogger("shared_context.native_turns").warning("FA_TIMING %s", LOG_CANARY)  # not a listed logger
+        # The lines that explain a turn's unknown failure and an upgrade cut, as their modules format them.
+        turns = logging.getLogger("shared_context.native_turns")
+        turns.warning("FA_NATIVE_TURN_UNKNOWN code=%s exception_type=%s", "NATIVE_TURN_UNKNOWN", "NativeSdkFailure")
+        direct = logging.getLogger("shared_context.behavior_model_direct")
+        direct.warning("FA_MODEL_DIRECT_RETRY status=429 attempt=%s wait_ms=%s source=%s", 1, 1500, "retry-after-ms")
+        direct.warning("FA_MODEL_DIRECT_HTTP_FAILURE status=%s wire_api=%s model=%s %s %s attempts=%s "
+                       "before_output=%s", 429, "responses", "gpt-test",
+                       "error_code=rate_limit_exceeded error_type=none error_param=none inner_code=none",
+                       "items=3 tools=2 images=0 keys=input,model", 3, False)
+        cut = logging.getLogger("shared_context.native_environment_cut")
+        cut.warning("NATIVE_UPGRADE_CUT outcome=%s reason=%s scan_ms=%d", "ready", "none", 518)
+        turns.warning("FA_NATIVE_HTTP %s", json.dumps({"canary": LOG_CANARY}))  # same logger, an unlisted prefix
+        turns.info("FA_NATIVE_ENQUEUE_RETAINED rid=%s", LOG_CANARY)  # INFO is on now; unlisted INFO lines stay out
+        turns.warning("FA_NATIVE_POST_TURN_UNKNOWN exception_type=%s", LOG_CANARY)  # the prefix ends with its space
+        cut.warning("NATIVE_UPGRADE_WITHDRAWN request_id_prefix=%s", LOG_CANARY)
+        logging.getLogger("shared_context.behavior_model_direct_probe").warning(
+            "FA_MODEL_DIRECT_PROBE status=%s", LOG_CANARY)  # a listed prefix on an unlisted logger
+        logging.getLogger("shared_context.behavior_native_sessions").warning("FA_TIMING %s", LOG_CANARY)
+        # Memory status lines, as their modules format them: most name the event as the first argument.
+        cosmos = logging.getLogger("shared_context.cosmos_private_memory")
+        cosmos.warning("%s status=%s stage=embedding", "FA_PRIVATE_MEMORY_UPDATE", 401)
+        cosmos.warning("%s status=skipped reason=embedding_unavailable", "FA_TEAM_MEMORY_CREATE")
+        private = logging.getLogger("shared_context.behavior_private_memory")
+        private.warning("%s status=%s mode=%s", "FA_TEAM_MEMORY_SEARCH", 404, "contextual")
+        private.warning("FA_PRIVATE_MEMORY_INACTIVE reason=%s", "api_unavailable")
+        native = logging.getLogger("shared_context.native_private_memory")
+        native.warning("FA_PRIVATE_MEMORY_USAGE_UNREPORTED rid_prefix=%s reason=%s", "0123abcd", "no_reporter")
+        team = logging.getLogger("shared_context.native_team_memory")
+        team.warning("FA_TEAM_MEMORY_INACTIVE reason=store_unavailable")
+        private.warning("%s status=skipped_size", "FA_PRIVATE_MEMORY_SEARCH " + LOG_CANARY)  # not an exact event name
+        private.warning("%s status=unavailable mode=%s", LOG_CANARY, "static")
+        private.warning("%s", "FA_PRIVATE_MEMORY_SEARCH")  # the event alone with no fixed text after it
+        private.warning("FA_NATIVE_ASSEMBLY_PARTIAL reason=observer_failed exception_type=%s", LOG_CANARY)
+        cosmos.warning("%s status=transport_error", "FA_PRIVATE_MEMORY_UPDATE", exc_info=ValueError(LOG_CANARY))
+        logging.getLogger("shared_context.memory_relay").warning("FA_PRIVATE_MEMORY_UPDATE %s", LOG_CANARY)  # API side
         assert provider.force_flush(10000)
     finally:
         provider and provider.shutdown()
@@ -520,10 +554,23 @@ def test_hosted_log_export_sends_only_timing_and_resident_lines_of_the_listed_lo
 
     logs = [item for item in telemetry.items if item["data"]["baseType"] == "MessageData"]
     messages = [item["data"]["baseData"]["message"] for item in logs]
-    assert len(messages) == 2, messages
+    assert len(messages) == 12, messages
     timing = json.loads(messages[0].removeprefix("FA_TIMING "))
     assert (timing["phase"], timing["job_id"], timing["outcome"]) == ("sdk_process_start", "0123456789ab", "returned")
-    assert messages[1] == "RESIDENT_SDK_CONTINUED released=abcdef012345"
+    assert messages[1:] == [
+        "RESIDENT_SDK_CONTINUED released=abcdef012345",
+        "FA_NATIVE_TURN_UNKNOWN code=NATIVE_TURN_UNKNOWN exception_type=NativeSdkFailure",
+        "FA_MODEL_DIRECT_RETRY status=429 attempt=1 wait_ms=1500 source=retry-after-ms",
+        "FA_MODEL_DIRECT_HTTP_FAILURE status=429 wire_api=responses model=gpt-test error_code=rate_limit_exceeded "
+        "error_type=none error_param=none inner_code=none items=3 tools=2 images=0 keys=input,model attempts=3 "
+        "before_output=False",
+        "NATIVE_UPGRADE_CUT outcome=ready reason=none scan_ms=518",
+        "FA_PRIVATE_MEMORY_UPDATE status=401 stage=embedding",
+        "FA_TEAM_MEMORY_CREATE status=skipped reason=embedding_unavailable",
+        "FA_TEAM_MEMORY_SEARCH status=404 mode=contextual",
+        "FA_PRIVATE_MEMORY_INACTIVE reason=api_unavailable",
+        "FA_PRIVATE_MEMORY_USAGE_UNREPORTED rid_prefix=0123abcd reason=no_reporter",
+        "FA_TEAM_MEMORY_INACTIVE reason=store_unavailable"]
     assert {item["tags"]["ai.cloud.role"] for item in logs} == {"fa-test-agent"}
     assert LOG_CANARY not in json.dumps(telemetry.items)
 

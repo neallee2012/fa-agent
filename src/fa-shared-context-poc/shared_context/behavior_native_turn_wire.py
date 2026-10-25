@@ -36,7 +36,7 @@ from .native_progress_wire import NativeProgressRead, NativeProgressSnapshot, Na
 from .native_assembly import NativeAssembly
 from .native_files_wire import FILES_ERRORS, MAX_FILE_ENTRIES, NativeFileEntry, NativeFilesManifest, NativeSessionFiles
 from .native_continuation_wire import CONTINUATION_ERRORS, NativeContinuation, NativeContinuationRead, NativeContinuationReady
-from .native_routine_wire import NATIVE_ROUTINE_ERRORS, NativeRoutineOrigin
+from .native_routine_wire import NATIVE_ROUTINE_ERRORS, NativeRoutineDispatch, NativeRoutineOrigin
 from .team_connector_wire import ConnectorCapture
 
 NATIVE_TURN_HEADER = "x-client-fa-state-profile"
@@ -283,7 +283,8 @@ MAX_RECEIVED_PAGE = 50
 
 
 class NativeReceivedRead(WireModel):
-    """One page of this Agent's own original receipts, newest first; only requests another Agent sent are kept."""
+    """One page of this Agent's own original receipts, newest first; only those that opened their own conversation
+    here are kept: requests another Agent sent (``items``) and routine runs since 2026-10-23 (``routine_runs``)."""
     operation: Literal["received"] = "received"
     after: StateStoreCursor | None = None
     limit: Annotated[int, Field(ge=1, le=MAX_RECEIVED_PAGE)] = MAX_RECEIVED_PAGE
@@ -1271,6 +1272,10 @@ class NativeReceivedPage(WireModel):
     agent_id: Identifier
     items: Annotated[tuple[NativeReceivedItem, ...], Field(max_length=MAX_RECEIVED_PAGE)]
     next_after: StateStoreCursor | None
+    # 2026-10-23: each routine run opens its own conversation; listed from the same receipt page as its original
+    # receipt view. Left out when there are none, so a page without them keeps its bytes (ADR-0009 §3 additive rule).
+    routine_runs: Annotated[tuple[NativeRoutineDispatch, ...], Field(max_length=MAX_RECEIVED_PAGE)] = Field(
+        default=(), exclude_if=lambda value: not value)
 
 
 class NativeResultPage(WireModel):

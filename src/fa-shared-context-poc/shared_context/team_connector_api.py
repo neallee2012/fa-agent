@@ -16,7 +16,8 @@ from .team_mcp_api import (
 )
 
 PREFIX = "/team-connectors/v1"
-TEAM_CONNECTOR_ERRORS = TEAM_MCP_ERRORS | {"TEAM_CONNECTOR_SECRET_REQUIRED", "TEAM_CONNECTOR_TOOLBOX_TAKEN"}
+TEAM_CONNECTOR_ERRORS = TEAM_MCP_ERRORS | {"TEAM_CONNECTOR_SECRET_REQUIRED", "TEAM_CONNECTOR_TOOLBOX_TAKEN",
+                                           "TEAM_CONNECTOR_PRIVATE_NETWORK"}
 
 
 def install_team_connector_routes(app, composition, *, environ=None, foundry_factory=None) -> None:

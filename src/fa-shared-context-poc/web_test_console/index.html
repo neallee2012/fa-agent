@@ -1345,6 +1345,7 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     TEAM_CONNECTOR_CONNECTION_CREATE_UNAVAILABLE:"這個環境沒有設定這個 connector 的 Entra 應用程式，還不能加入；沒有送出，請通知部署線。",
     TEAM_CONNECTOR_SECRET_REQUIRED:"第一次加入需要 Entra 應用程式的用戶端密碼；沒有送出。",
     TEAM_CONNECTOR_TOOLBOX_TAKEN:"這個 connector 的 toolbox 裡是別處寫的設定；這裡不覆寫，請通知部署線。",
+    TEAM_CONNECTOR_PRIVATE_NETWORK:"這個環境是私有網路（FA_NETWORK_MODE=private），不支援 Work IQ，不能加入或重新啟用這個 connector；只能停用。沒有送出。",
     TEAM_CONNECTOR_RESPONSE_INVALID:"Connector 設定的回應格式不符；不當成完成。已重新讀取，可按「用原編號重送」核對。",
     AGENT_CONNECTORS_OWNER_ONLY:"只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能開關這位助理的 connector。",
     AGENT_CONNECTORS_CHANGED:"這位助理的 connector 設定剛被改過，這次沒有套用。已重新讀取，請確認後再改。",
@@ -4430,8 +4431,12 @@ function realtimeEvent(raw){
     agentUnread.add(event.agent_id);renderAgents();return;
   }
   // A turn of this Agent that this page did not send: a scheduled one, a delegated one or another conversation's. The
-  // hint names only its RID, so the open conversation is read once (de-duplicated above).
-  if(event.type==="turn.finished"){realtimeReadProgress();return}
+  // hint names only its RID, so the open conversation is read once (de-duplicated above). A routine run opens its own
+  // conversation (2026-10-23) and its RID is that conversation's thread, so the same RID is also imported (one receipt
+  // read, skipped once listed) and the new 「排程」 conversation is listed without a switch or refresh.
+  if(event.type==="turn.finished"){
+    realtimeReadProgress();if(typeof event.request_id==="string")readReceivedConversation(event.request_id);return;
+  }
   if(event.type==="agent.received"&&typeof event.request_id==="string")readReceivedConversation(event.request_id);
 }
 function dropTeamCards(event){
@@ -4447,7 +4452,8 @@ function dropTeamCards(event){
   });
   if(items.length!==teamHitlView.items.length){teamHitlView={...teamHitlView,items};render()}
 }
-// Another Agent opened a conversation with this one: import that RID once so it is listed, keeping the open one.
+// Another Agent or a routine run opened a conversation with this one: import that RID once so it is listed, keeping the
+// open one.
 async function readReceivedConversation(rid){
   const agent=selectedAgent,thread=selectedThread,key=scopeKey(rid);
   if(realtime.receivedReads.has(key)||(state.composer?.threads||[]).some(item=>item.thread_id===rid))return;
@@ -4681,12 +4687,13 @@ function hitlRuleSuggestion(action){
 }
 // A routine card (propose_routine) shows the exact daily draft an allow saves; only the owner's click schedules it.
 const ROUTINE_CARD_REASON="排程一律要你在這張卡上按「允許這次」；助理說的話或你在對話裡的回覆都不算批准。"+
-  "批准後每天到點在這個對話自動執行，每次執行時的操作仍照一般批准規則；要停用請到「助理清單右側的 ⚙ → 排程」。";
+  "批准後每天到點自動開一個新對話執行（不帶這段或前幾天的對話內容），結果會在對話選單的『排程』分組；"+
+  "每次執行時的操作仍照一般批准規則；要停用請到「助理清單右側的 ⚙ → 排程」。";
 function routineDraft(value){
   return typeof value?.local_time==="string"&&typeof value.time_zone==="string"&&typeof value.content==="string"?
     {local_time:value.local_time,time_zone:value.time_zone,content:value.content}:null;
 }
-function routineText(draft){return `每天 ${draft.local_time}（${draft.time_zone}）在這個對話執行：「${draft.content}」`}
+function routineText(draft){return `每天 ${draft.local_time}（${draft.time_zone}）開新對話執行：「${draft.content}」`}
 function hitlReason(review,rules){
   // A Foundry toolbox tool's own require_approval=always asks for every call; no Team rule is involved.
   if(review.source==="toolbox")
@@ -5225,6 +5232,9 @@ function validRoutineReminder(value,call=null){
     &&["accepted","started","unknown"].includes(value.status)
     &&(!call||["agent_id","conversation_id","request_id"].every(key=>call[key]===value[key]));
 }
+function validRoutineRun(value){
+  return typeof value?.thread_id==="string"&&typeof value.local_time==="string"&&typeof value.label==="string";
+}
 function renderAttention(){
   syncNativeHitl();renderNativeHitlRules();
   const items=currentAttention();
@@ -5283,6 +5293,17 @@ function renderAttention(){
       card.append(note);
     }
     list.append(card);
+  }
+  // 2026-10-23: each routine run opens its own conversation. The one it was approved in names every run still needing
+  // attention (an approval card, a question or no final state yet) and opens the run's conversation.
+  for(const run of (routineState?.runs||[]).filter(validRoutineRun)){
+    const note=document.createElement("p"),open=document.createElement("button");
+    note.setAttribute("data-routine-run",run.thread_id);
+    // accepted/started: running, or waiting on its card or question; unknown has no final state yet.
+    note.textContent=`排程（${run.local_time}）${["accepted","started"].includes(run.status)?"執行中或等你處理":"需要處理"}，在『${run.label}』對話`;
+    open.textContent="打開這個對話";open.setAttribute("data-routine-run-open",run.thread_id);
+    open.addEventListener("click",()=>{if(run.thread_id!==selectedThread)switchThread(run.thread_id)});
+    note.append(open);list.append(note);
   }
   el("attention-panel").hidden=!list.children.length&&!reminders.length&&!routineIssues.length&&!routineError&&!teamShown;
   el("hitl-history-panel").hidden=!history.length;
@@ -5529,11 +5550,14 @@ function renderComposer(){
   const threads=composer?.threads||[];
   el("conversation-picker").hidden=!threads.length;
   el("conversation").replaceChildren();
+  // Routine runs (one conversation each, 2026-10-23) sit in their own group; the server sends the newest 30 first.
+  const routineGroup=document.createElement("optgroup");routineGroup.label="排程";
   for(const thread of threads){
     const option=document.createElement("option");option.value=thread.thread_id;
     option.textContent=thread.sender_agent_id?`來自 ${groupName(thread.sender_agent_id)} 的交辦：${thread.label}`:thread.label;
-    el("conversation").append(option);
+    (thread.routine?routineGroup:el("conversation")).append(option);
   }
+  if(routineGroup.children.length)el("conversation").append(routineGroup);
   el("conversation").value=selectedThread||"";
   el("conversation").disabled=Boolean(opening);
   el("new-conversation").disabled=!scopeAvailable()||busy||Boolean(opening)||messageBusy||appendBusy||!composer?.can_new_conversation;

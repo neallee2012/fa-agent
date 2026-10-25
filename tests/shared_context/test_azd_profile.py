@@ -150,6 +150,39 @@ def test_profile_takes_every_identifier_from_the_azd_environment(azd_profile):
     assert "FA_PRIVATE_MEMORY_STORE" not in off["assistant_environment"]
     assert "FA_TEAM_MEMORY_ENABLED" not in off["api_environment"]
     assert "FA_CAPABILITY_TOOLBOX_ENTRIES" not in profile["api_environment"]
+    assert not [key for key in json.dumps(profile).split('"') if key.startswith(("FA_MEMORY_BACKEND", "FA_COSMOS"))]
+
+
+COSMOS = "https://cosmos-tok3n.documents.azure.com:443/"
+
+
+def test_private_memory_is_cosmos_db_through_the_api(azd_profile):
+    # ADR-0011: no Memory Store name; both sides name the backend; only the API gets the Bicep endpoint output.
+    profile = azd_profile.build(values(FA_NETWORK_MODE="private", FA_COSMOS_ENDPOINT=COSMOS,
+                                       FA_MODELS="gpt-5.4-mini", FA_MEMORY_CHAT_MODEL="gpt-5.4-mini"))
+    assistant, api = profile["assistant_environment"], profile["api_environment"]
+    assert "FA_PRIVATE_MEMORY_STORE" not in assistant
+    assert {key: assistant[key] for key in ("FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL",
+                                            "FA_TEAM_MEMORY_ENABLED")} == {
+        "FA_MEMORY_BACKEND": "cosmos", "FA_MEMORY_EXTRACTION_MODEL": "gpt-5.4-mini", "FA_TEAM_MEMORY_ENABLED": "1"}
+    assert {key: api[key] for key in ("FA_MEMORY_BACKEND", "FA_COSMOS_ENDPOINT", "FA_TEAM_MEMORY_ENABLED")} == {
+        "FA_MEMORY_BACKEND": "cosmos", "FA_COSMOS_ENDPOINT": COSMOS, "FA_TEAM_MEMORY_ENABLED": "1"}
+    assert "FA_COSMOS_ENDPOINT" not in assistant  # Hosted never connects to Cosmos DB
+    with pytest.raises(SystemExit, match="FA_COSMOS_ENDPOINT is missing"):
+        azd_profile.build(values(FA_NETWORK_MODE="private", FA_COSMOS_ENDPOINT=""))
+    off = azd_profile.build(values(FA_NETWORK_MODE="private", FA_ENABLE_MEMORY="false"))
+    keys = json.dumps(off).split('"')
+    assert not [key for key in keys if key.startswith(("FA_MEMORY_", "FA_COSMOS", "FA_PRIVATE_MEMORY"))]
+
+
+def test_only_private_network_mode_reaches_the_api(azd_profile):
+    # ADR-0010: the API refuses adding Work IQ in private; public and unset leave the API environment unchanged.
+    private = azd_profile.build(values(FA_NETWORK_MODE="private", FA_ENABLE_MEMORY="false"))
+    assert private["api_environment"]["FA_NETWORK_MODE"] == "private"
+    assert "FA_NETWORK_MODE" not in private["assistant_environment"]
+    for mode in ({}, {"FA_NETWORK_MODE": "public"}):
+        assert azd_profile.build(values(**mode)) == azd_profile.build(values())
+        assert "FA_NETWORK_MODE" not in json.dumps(azd_profile.build(values(**mode)))
 
 
 ONBOARDING = {"FA_ONBOARDING_ENDPOINT_PROTOCOLS": "true", "FA_ONBOARDING_ROLE_SCOPE": PROJECT_ID}
@@ -175,6 +208,28 @@ def test_a_missing_onboarding_output_means_off_and_says_so(azd_profile, capsys):
     stage = json.loads((ROOT / "deploy" / "stage" / "stage.json").read_text(encoding="utf-8"))
     assert stage["api_environment"]["FA_ONBOARDING_ENDPOINT_PROTOCOLS"] == "true"  # the same settings stage has
     assert "FA_ONBOARDING_ROLE_SCOPE" in stage["api_environment"]
+
+
+def test_the_account_role_of_plus_follows_only_its_bicep_output(azd_profile, capsys):
+    # ADR-0006 (Neal 2026-10-24): an older private+cosmos environment that only runs `azd deploy` has no account-scope
+    # delegation (and no output), so the API must not send the account PUT that would 403 and stop "+" at creating.
+    private = dict(FA_NETWORK_MODE="private", FA_COSMOS_ENDPOINT=COSMOS, FA_AGENT_ONBOARDING="true")
+    older = azd_profile.build(values(**private))["api_environment"]
+    assert older["FA_MEMORY_BACKEND"] == "cosmos" and ONBOARDING.items() <= older.items()
+    assert "FA_ONBOARDING_ACCOUNT_ROLE" not in older
+    assert "FA_AGENT_ONBOARDING_ACCOUNT_ROLE is missing" in capsys.readouterr().err
+    assert "FA_ONBOARDING_ACCOUNT_ROLE" not in azd_profile.build(values(
+        **private, FA_AGENT_ONBOARDING_ACCOUNT_ROLE="false"))["api_environment"]
+    on = azd_profile.build(values(**private, FA_AGENT_ONBOARDING_ACCOUNT_ROLE="true"))["api_environment"]
+    assert on["FA_ONBOARDING_ACCOUNT_ROLE"] == "true" and ONBOARDING.items() <= on.items()
+    assert capsys.readouterr().err == ""
+    # Onboarding off leaves every "+" setting out, the account one too; public provisions the output as false.
+    off = azd_profile.build(values(**{**private, "FA_AGENT_ONBOARDING": "false"},
+                                   FA_AGENT_ONBOARDING_ACCOUNT_ROLE="true"))
+    assert not [key for key in off["api_environment"] if key.startswith("FA_ONBOARDING")]
+    public = azd_profile.build(values(FA_AGENT_ONBOARDING="true", FA_AGENT_ONBOARDING_ACCOUNT_ROLE="false"))
+    assert public == azd_profile.build(values(FA_AGENT_ONBOARDING="true"))
+    assert "FA_AGENT_ONBOARDING_ACCOUNT_ROLE is missing" not in capsys.readouterr().err
 
 
 def test_opt_ins_add_only_their_own_settings(azd_profile):

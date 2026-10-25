@@ -10,6 +10,10 @@ match the current user message before the model runs, and update the store after
 
 - Off unless ``FA_PRIVATE_MEMORY_STORE`` names an existing store; the platform sets ``FOUNDRY_PROJECT_ENDPOINT`` and
   ``FOUNDRY_AGENT_NAME``. The scope is derived from the agent name only: one private scope per Agent.
+- ADR-0011 seam: ``FA_MEMORY_BACKEND`` picks the backend, fixed when the environment is created (azd derives it from
+  ``FA_NETWORK_MODE``); unset or ``foundry`` is this Memory Store, unchanged. ``cosmos`` (``private`` mode) is
+  ``cosmos_private_memory.CosmosPrivateMemory``: it needs the native lane's API connection and
+  ``FA_MEMORY_EXTRACTION_MODEL``, so the old lane has no memory there; any other value is invalid.
 - Only a human instruction turn takes part, and only the user's own text is sent; tool output, files and replies are
   not (old lane). The native lane may add the completed turn's saved final reply (S1b, below). Recalled memories are
   prefixed to the prompt as data, never instructions or approval.
@@ -50,6 +54,8 @@ from .memory_redaction import opted_out, redact_secrets
 from .native_assembly import MemoryRecall, MemorySearch, MemorySource
 
 STORE_ENV = "FA_PRIVATE_MEMORY_STORE"
+BACKEND_ENV = "FA_MEMORY_BACKEND"
+EXTRACTION_MODEL_ENV = "FA_MEMORY_EXTRACTION_MODEL"
 ENDPOINT_ENV = "FOUNDRY_PROJECT_ENDPOINT"
 AGENT_ENV = "FOUNDRY_AGENT_NAME"
 # The identity token may only be sent to a Foundry project's own endpoint.
@@ -123,6 +129,13 @@ def _merge_observations(first, second, indexes):
         return MemoryRecall(state="unknown", reason="observer_failed")
 
 
+def unavailable_reason(environ=None) -> str:
+    """Why ``PrivateMemory.from_environment`` gave None, as the assembly record names it (ADR-0011: per backend)."""
+    environ = os.environ if environ is None else environ
+    needed = {"foundry": STORE_ENV, "cosmos": EXTRACTION_MODEL_ENV}.get(environ.get(BACKEND_ENV) or "foundry")
+    return "not_configured" if needed is not None and not environ.get(needed) else "configuration_invalid"
+
+
 def scope_for(agent_name: str) -> str:
     # The asynchronous extractor accepts only [A-Za-z0-9_-] in a scope.
     return "fap1-" + hashlib.sha256(("fa-private-memory-v1\0" + agent_name).encode("utf-8")).hexdigest()[:48]
@@ -154,6 +167,14 @@ def with_recalled(prompt: str, memories: tuple[str, ...], files=(), *, prefix: s
             logging.getLogger(__name__).warning("%s status=skipped_size", event)
             return prompt
     return recalled
+
+
+async def _token(provider) -> str:
+    # The native runtime's managed-identity provider is async; the old AssistantSession one is sync.
+    token = await provider() if inspect.iscoroutinefunction(provider) else await hosted_sync(provider)
+    if not isinstance(token, str) or not token:
+        raise ValueError("no token")
+    return token
 
 
 def _message(text: str):
@@ -214,7 +235,9 @@ def _memories(response: httpx.Response, max_memories=MAX_MEMORIES, max_recall_ch
             continue
         found.append(text)
         ids.append(memory_id)
-        kinds[kind or "unknown"] = kinds.get(kind or "unknown", 0) + 1
+        # Only official kind names reach the log line (exported to Application Insights); anything else is "unknown".
+        counted = kind if kind in KIND_LABELS else "unknown"
+        kinds[counted] = kinds.get(counted, 0) + 1
         total += len(text)
         sources.append((item, updated))
     usage = value.get("usage")
@@ -265,6 +288,9 @@ def _official_id(response: httpx.Response, field: str) -> str | None:
 
 
 class PrivateMemory:
+    # Foundry chains each update to the conversation's previous one (``previous_update_id``).
+    chains_updates = True
+
     def __init__(self, endpoint, store, agent_name, token_provider, *, transport=None):
         if (not isinstance(endpoint, str) or _ENDPOINT.fullmatch(endpoint) is None
                 or not isinstance(store, str) or _STORE.fullmatch(store) is None
@@ -274,8 +300,28 @@ class PrivateMemory:
         self.scope = scope_for(agent_name)
 
     @classmethod
-    def from_environment(cls, token_provider, *, environ=None, transport=None):
+    def from_environment(cls, token_provider, *, environ=None, transport=None, api=None):
+        """This Agent's memory for the configured backend, or None when it is off or unusable.
+
+        ``api`` is the native lane's ``(api_url, api_token_provider)``: Foundry ignores it; ``cosmos`` reaches
+        memory only through the FA API, so the old lane, which passes none, has no memory there.
+        """
         environ = os.environ if environ is None else environ
+        backend = environ.get(BACKEND_ENV) or "foundry"
+        if backend != "foundry":
+            if backend != "cosmos" or api is None:
+                logging.getLogger(__name__).warning("FA_PRIVATE_MEMORY_INACTIVE reason=%s",
+                                                    "config_invalid" if backend != "cosmos" else "api_unavailable")
+                return None
+            if not environ.get(EXTRACTION_MODEL_ENV):
+                return None
+            from .cosmos_private_memory import CosmosPrivateMemory
+            try:
+                return CosmosPrivateMemory((environ.get(ENDPOINT_ENV) or "").rstrip("/"), environ.get(AGENT_ENV),
+                                           environ[EXTRACTION_MODEL_ENV], token_provider, api, transport=transport)
+            except ValueError:
+                logging.getLogger(__name__).warning("FA_PRIVATE_MEMORY_INACTIVE reason=config_invalid")
+                return None
         if not environ.get(STORE_ENV):
             return None
         try:
@@ -288,11 +334,7 @@ class PrivateMemory:
     async def _post(self, path, body, event, *, on_failure=None):
         log = logging.getLogger(__name__)
         try:
-            # The native runtime's managed-identity provider is async; the old AssistantSession one is sync.
-            token = (await self.token_provider() if inspect.iscoroutinefunction(self.token_provider)
-                     else await hosted_sync(self.token_provider))
-            if not isinstance(token, str) or not token:
-                raise ValueError("no token")
+            token = await _token(self.token_provider)
         except Exception as error:
             log.warning("%s status=token_unavailable exception_type=%s", event, _exception_type(error))
             if on_failure is not None:
@@ -385,15 +427,16 @@ class PrivateMemory:
         """Send this user message for extraction exactly once; the status and the official ``update_id`` if any."""
         return await self._update(text, None)
 
-    async def update_chained(self, text: str, previous_update_id: str | None, *,
-                             reply: str | None = None) -> tuple[str, str | None]:
+    async def update_chained(self, text: str, previous_update_id: str | None, *, reply: str | None = None,
+                             request_id: str | None = None, completed_at: int | None = None) -> tuple[str, str | None]:
         """Like ``update``, chained to the conversation's previous update (official incremental update).
 
         Official guidance: "update after each turn and chain updates using the previous update operation ID"
         (https://learn.microsoft.com/azure/foundry/agents/how-to/memory-usage), so a correction is extracted with the
         turn it corrects. A definite 4xx refusal of the chained request created nothing, so it is sent once unchained;
         an unknown or 5xx outcome is never resent. ``reply`` (S1b) is the turn's saved final reply, sent in the same
-        request after the user's words.
+        request after the user's words. ``request_id`` (ADR-0011) is the source RID a backend may derive its IDs
+        from, and ``completed_at`` the turn's completion time (unix seconds); Foundry ignores both.
         """
         status, update_id = await self._update(text, previous_update_id, reply)
         if previous_update_id is not None and status in {"400", "404", "409", "422"}:
@@ -417,10 +460,12 @@ class PrivateMemory:
                                             bool(reply))
         return str(response.status_code), update_id
 
-    async def create(self, scope: str, content: str, kind: str, *, event: str) -> tuple[str, str | None]:
+    async def create(self, scope: str, content: str, kind: str, *, event: str,
+                     request_id: str | None = None) -> tuple[str, str | None]:
         """Create one verbatim memory item (official item API, no extraction) exactly once.
 
         Returns the status and the official ``memory_id`` if any; the outcome is otherwise only logged.
+        ``request_id`` is as in ``update_chained``; Foundry ignores it.
         """
         response = await self._post("/items", {"scope": scope, "content": content, "kind": kind}, event)
         if response is None:

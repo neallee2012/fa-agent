@@ -10,6 +10,10 @@ param workloadProfileName string = 'Consumption'
 param registryName string = 'crfacontextstagedemo'
 param vnetName string = 'vnet-facontext-api'
 param privateEndpointSubnetName string = 'snet-private-endpoints'
+@description('ADR-0010 phase 2b (an existing VNet in another resource group): the private endpoint subnet ID. Empty uses vnetName and privateEndpointSubnetName here.')
+param privateEndpointSubnetResourceId string = ''
+@description('false (FA_DNS_MODE=existing): the private endpoint gets no DNS zone group; the user serves the name.')
+param privateDnsZones bool = true
 param appName string = 'ca-fa-console-stage'
 param identityName string = 'id-fa-console-stage'
 @minLength(3)
@@ -131,14 +135,14 @@ module storage 'br/public:avm/res/storage/storage-account:0.33.0' = {
     privateEndpoints: [
       {
         service: 'blob'
-        subnetResourceId: peSubnet.id
-        privateDnsZoneGroup: {
+        subnetResourceId: privateEndpointSubnetResourceId == '' ? peSubnet.id : privateEndpointSubnetResourceId
+        privateDnsZoneGroup: privateDnsZones ? {
           privateDnsZoneGroupConfigs: [
             {
               privateDnsZoneResourceId: blobDns.id
             }
           ]
-        }
+        } : null
       }
     ]
   }

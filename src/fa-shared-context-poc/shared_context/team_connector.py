@@ -32,6 +32,7 @@ GRANTS_SECONDS = 30.0
 FAILED_GRANTS_SECONDS = 10.0  # as Team MCP: one capture per window waits on a Foundry outage, not every capture
 _CLIENT_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _AUTHORITY = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/"
+NETWORK_MODE_ENV = "FA_NETWORK_MODE"  # ADR-0010; unset or anything but "private" is public
 
 
 def connector_connection_name(project_scope: str, team_id: str, connector_id: str) -> str:
@@ -128,6 +129,13 @@ class TeamConnectorService:
     def submit(self, principal, command: TeamConnectorChange) -> TeamConnectorChangeResult:
         authorize_team_owner(self.verifier, principal, write=True)
         ref = command.ref
+        if ((command.enabled or command.client_secret is not None) and not ref.private_network
+                and self.app_settings.get(NETWORK_MODE_ENV) == "private"):
+            # Before any Foundry read or write; disabling an existing connector still works (nothing is deleted).
+            # A secret, even with enabled=false, would write the OAuth2 connection.
+            _log.warning("TEAM_CONNECTOR_PRIVATE_NETWORK_REFUSED connector=%s", ref.id)
+            raise Problem(422, "TEAM_CONNECTOR_PRIVATE_NETWORK", "FA_NETWORK_MODE=private does not support this "
+                          "connector; it can only be disabled, without a client secret")
         toolbox, connection = self._names(principal.team, ref)
         material = digest([principal.tenant_id, principal.team, principal.oid, command.material()])
         foundry = self.foundry_factory()

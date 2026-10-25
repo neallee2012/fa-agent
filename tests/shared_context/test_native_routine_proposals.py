@@ -137,7 +137,9 @@ def test_owner_allow_writes_only_the_card_draft_once_and_the_api_clock_runs_it(p
     dispatched = case.trigger(body)
     assert dispatched.status_code == 202, dispatched.text
     original = case.remote.records[dispatched.json()["request_id"]]
-    assert original.command.content == CONTENT and original.conversation_id == "native-cid"
+    # Each run opens its own conversation (2026-10-23); the card's conversation keeps only the definition.
+    assert original.command.content == CONTENT and original.command.conversation_id is None
+    assert original.conversation_id == original.routine.conversation_id != "native-cid"
     assert original.routine.owner_oid == case.c.human.oid
     assert original.routine.occurrence.approved_version == saved["request_id"]
     case.remote.completed(original.request_id)

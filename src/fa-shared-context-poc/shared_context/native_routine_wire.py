@@ -76,7 +76,8 @@ class NativeRoutineOrigin(WireModel):
             self.tenant_id, self.team_id, self.agent_id, self.occurrence.routine_id, self.occurrence.scheduled_for)
 
     def check_command(self, command, *, continuation=False):
-        if (command.conversation_id != self.conversation_id
+        # No command CID: this run opens its own conversation, named by ``conversation_id`` (2026-10-23).
+        if (command.conversation_id not in (None, self.conversation_id)
                 or not continuation and command.request_id != self.request_id
                 or hashlib.sha256(command.content.encode("utf-8")).hexdigest() != self.content_sha256):
             raise ValueError("a routine must keep its original conversation, occurrence and content")
@@ -271,12 +272,13 @@ class NativeRoutineCurrent(NativeRoutineCheck):
     authorization: Literal[False] = False
 
 
-def routine_origin_for(definition, scheduled_for):
+def routine_origin_for(definition, scheduled_for, *, conversation_id):
+    """``conversation_id`` is this run's own conversation; a run saved before 2026-10-23 names the definition's."""
     if definition.kind != "routine":
         raise Problem(403, "NATIVE_ROUTINE_ATTENTION_ONLY", "a reminder cannot dispatch another Agent turn")
     return NativeRoutineOrigin(
         tenant_id=definition.tenant_id, team_id=definition.team_id, owner_oid=definition.owner_oid,
-        agent_id=definition.agent_id, conversation_id=definition.conversation_id,
+        agent_id=definition.agent_id, conversation_id=conversation_id,
         occurrence=RoutineOccurrence(
             routine_id=definition.routine_id, approved_version=definition.request_id,
             time_zone=definition.schedule.time_zone, scheduled_for=scheduled_for, definition_sha256=definition.sha256),
@@ -331,7 +333,8 @@ class NativeRoutineProposal(WireModel):
         description="IANA time zone the user means, e.g. Asia/Taipei.")]
     content: Annotated[str, Field(
         min_length=1,
-        description="The complete instruction to run every day in this conversation, written from the user's request.")]
+        description="The complete instruction to run every day, written from the user's request. Each run starts a "
+                    "new conversation without this one's history, so say everything the run needs.")]
 
     @field_validator("time_zone")
     @classmethod

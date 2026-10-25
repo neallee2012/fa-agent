@@ -1,5 +1,8 @@
 """ADR-0007 §6: the Hosted agent's own private Foundry memory (search before, update after a human turn).
 
+Backend-agnostic recall and write behavior runs per backend in test_memory_backend_contract.py (ADR-0011 §8); this
+file keeps the Foundry configuration, its request shapes and the old (AssistantSession) lane.
+
 Offline: the credential, memory service and API are local doubles; no network, runtime process or model call.
 """
 
@@ -73,7 +76,52 @@ def test_off_unless_a_store_is_configured_and_only_to_the_project_endpoint(caplo
     assert configured.scope.startswith("fap1-") and configured.scope.replace("-", "").isalnum()
 
 
-def test_recall_sends_the_user_text_and_bounds_what_it_returns(caplog):
+def test_the_backend_is_foundry_unless_set_and_cosmos_needs_the_api_and_its_extraction_model(caplog):
+    """ADR-0011: ``cosmos`` reaches memory only through the native lane's API connection with an extraction model."""
+    from shared_context.cosmos_private_memory import CosmosPrivateMemory
+
+    api = ("https://api.offline.invalid", lambda: "OFFLINE")
+    explicit = memory.PrivateMemory.from_environment(lambda: TOKEN, environ={**ENV, memory.BACKEND_ENV: "foundry"},
+                                                     api=api)
+    assert explicit.scope == memory.scope_for(AGENT) and explicit.store == STORE and explicit.chains_updates
+    model = {memory.EXTRACTION_MODEL_ENV: "gpt-4.1-mini"}
+    cosmos = memory.PrivateMemory.from_environment(
+        lambda: TOKEN, environ={**ENV, memory.BACKEND_ENV: "cosmos", **model}, api=api)
+    assert type(cosmos) is CosmosPrivateMemory and not cosmos.chains_updates
+    assert (cosmos.scope, cosmos.store, cosmos.model, cosmos.api_url) == (
+        memory.scope_for(AGENT), None, "gpt-4.1-mini", "https://api.offline.invalid")
+    with caplog.at_level(logging.WARNING):
+        for backend, api_value, extra, reason in (
+                ("cosmos", None, model, "api_unavailable"), ("azure-search", None, model, "config_invalid"),
+                ("cosmos", api, {memory.EXTRACTION_MODEL_ENV: "bad model"}, "config_invalid"),
+                ("cosmos", api, {**model, memory.ENDPOINT_ENV: "https://example.com"}, "config_invalid"),
+                ("cosmos", api, {}, None)):
+            caplog.clear()
+            assert memory.PrivateMemory.from_environment(
+                lambda: TOKEN, environ={**ENV, memory.BACKEND_ENV: backend, **extra}, api=api_value) is None
+            assert caplog.text.count("FA_PRIVATE_MEMORY_INACTIVE reason=") == (reason is not None)
+            assert reason is None or f"FA_PRIVATE_MEMORY_INACTIVE reason={reason}" in caplog.text
+    assert [memory.unavailable_reason(environ) for environ in (
+        {}, {memory.STORE_ENV: STORE}, {memory.BACKEND_ENV: "foundry"},
+        {memory.BACKEND_ENV: "cosmos", memory.STORE_ENV: STORE}, {memory.BACKEND_ENV: "cosmos", **model},
+        {memory.BACKEND_ENV: "azure-search", **model})] == [
+        "not_configured", "configuration_invalid", "not_configured",
+        "not_configured", "configuration_invalid", "configuration_invalid"]
+
+
+def test_the_source_request_id_never_reaches_a_foundry_request():
+    sent = []
+    configured = private(sent)
+    assert asyncio.run(configured.update_chained("I am vegetarian", None, request_id="rid-1")) == ("202", "u1")
+    asyncio.run(configured.create("fat1-scope", "note", "chat_summary", event="E", request_id="rid-1"))
+    assert [json.loads(request.content) for request in sent] == [
+        {"scope": memory.scope_for(AGENT), "update_delay": 0, "items": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "I am vegetarian"}]}]},
+        {"scope": "fat1-scope", "content": "note", "kind": "chat_summary"}]
+    assert "rid-1" not in str(sent[0].url) + str(sent[1].url)
+
+
+def test_a_recall_is_the_official_search_request_and_logs_its_usage(caplog):
     sent = []
     with caplog.at_level(logging.WARNING):
         found = asyncio.run(private(sent).recall("What do I prefer?"))
@@ -88,22 +136,6 @@ def test_recall_sends_the_user_text_and_bounds_what_it_returns(caplog):
     assert '"embedding_tokens": 7' in caplog.text and TOKEN not in caplog.text
     # Hosted keeps only WARNING and above: the success line and its usage must survive that filter.
     assert "FA_PRIVATE_MEMORY_SEARCH status=200 memories=2" in caplog.text
-    many = {"memories": [{"memory_item": {"content": "x" * 900}}] * 9}
-    bounded = asyncio.run(private([], search=many).recall("q"))
-    assert len(bounded) == 3 and all(len(item) == memory.MAX_MEMORY_CHARS for item in bounded)
-
-
-@pytest.mark.parametrize("kwargs, logged", [
-    ({"status": 401}, "status=401"), ({"status": 403}, "status=403"), ({"status": 500}, "status=500"),
-    ({"search": {"memories": [{"memory_item": {"content": 3}}]}}, "status=response_invalid"),
-    ({"search": {"unexpected": True}}, "status=response_invalid"),
-    ({"error": httpx.ConnectError("offline")}, "status=transport_error"),
-])
-def test_a_failed_recall_continues_without_memory(kwargs, logged, caplog):
-    sent = []
-    with caplog.at_level(logging.WARNING):
-        assert asyncio.run(private(sent, **kwargs).recall("q")) == ()
-    assert len(sent) == 1 and logged in caplog.text and TOKEN not in caplog.text
 
 
 def test_without_a_token_nothing_is_sent(caplog):
@@ -132,24 +164,6 @@ def test_remember_is_sent_once_and_never_retried(kwargs, outcome, caplog):
     assert json.loads(request.content) == {
         "scope": memory.scope_for(AGENT), "update_delay": 0,
         "items": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "I am vegetarian"}]}]}
-
-
-def test_recalled_memories_are_labeled_data_before_the_unchanged_prompt():
-    assert memory.with_recalled("hello", ()) == "hello"
-    assert memory.with_recalled("hello", ("a", "b")) == memory.PREFIX + "\n- a\n- b\n\nhello"
-
-
-def test_memories_that_would_push_literal_files_past_their_bound_are_left_out(caplog):
-    from shared_context.behavior_text_files import UserTextFile, validate_user_files
-    # A Chinese note near the original bound still fits alone, as the API already checked.
-    files = (UserTextFile(name="note.txt", text="記" * 2400),)
-    validate_user_files("hello", files)
-    memories = ("偏好" * 290,) * 3
-    with caplog.at_level(logging.WARNING):
-        assert memory.with_recalled("hello", memories, files) == "hello"
-    assert "status=skipped_size" in caplog.text
-    small = (UserTextFile(name="note.txt", text="short"),)
-    assert memory.with_recalled("hello", memories, small).endswith("\n\nhello")
 
 
 def _turn(tmp_path, monkeypatch, *, outcome="succeeded", peer=False, configured=True, files=(), search=None,
@@ -221,6 +235,15 @@ def test_a_peer_turn_and_an_unconfigured_agent_use_no_private_memory(tmp_path, m
     assert prompt.startswith("Task brief from another Agent") and events == ["sdk", "save"]
     prompt, events, _ = _turn(tmp_path, monkeypatch, configured=False)
     assert prompt == "ORIGINAL" and events == ["sdk", "save"]
+
+
+def test_the_old_lane_has_no_memory_with_the_cosmos_backend(tmp_path, monkeypatch, caplog):
+    """ADR-0011: the old lane passes no API connection, so ``cosmos`` leaves it without long-term memory."""
+    monkeypatch.setenv(memory.BACKEND_ENV, "cosmos")
+    with caplog.at_level(logging.WARNING):
+        prompt, events, sent = _turn(tmp_path, monkeypatch)
+    assert prompt == "ORIGINAL" and events == ["sdk", "save"] and sent == []
+    assert "FA_PRIVATE_MEMORY_INACTIVE reason=api_unavailable" in caplog.text
 
 
 def test_a_turn_with_a_large_literal_file_keeps_its_original_prompt(tmp_path, monkeypatch):

@@ -27,10 +27,12 @@ PINS = {
     "network/private-endpoint": "0.12.1",
     "network/private-dns-zone": "0.8.1",
     "network/private-dns-zone/virtual-network-link": "0.1.0",
+    "network/network-security-group": "0.5.3",
     "operational-insights/workspace": "0.16.1",
     "insights/component": "0.8.0",
     "signal-r-service/web-pub-sub": "0.7.2",
     "cognitive-services/account": "0.19.0",
+    "document-db/database-account": "0.21.1",
 }
 
 
@@ -100,9 +102,13 @@ def test_backup_dns_link_is_an_avm_child_without_a_parent_zone_put(compiled):
         "location": "global",
         "tags": "[variables('tags')]",
         "registrationEnabled": False,
-        "virtualNetworkResourceId": "[resourceId('Microsoft.Network/virtualNetworks', parameters('vnetName'))]",
+        # ADR-0010 phase 2b: an existing VNet's ID when given, else the original same-group VNet.
+        "virtualNetworkResourceId": "[if(equals(parameters('vnetResourceId'), ''), createObject('value', resourceId("
+                                    "'Microsoft.Network/virtualNetworks', parameters('vnetName'))), "
+                                    "createObject('value', parameters('vnetResourceId')))]",
         "enableTelemetry": False,
     }
+    assert template["parameters"]["vnetResourceId"]["defaultValue"] == ""
     child = link["properties"]["template"]
     assert [item["type"] for item in resources(child) if item["type"] != "Microsoft.Resources/deployments"] == [
         "Microsoft.Network/privateDnsZones/virtualNetworkLinks"]
@@ -239,7 +245,9 @@ def test_avm_network_registry_and_monitoring_keep_existing_explicit_settings(com
     assert registry["acrSku"] == "Basic" and registry["acrAdminUserEnabled"] is False
     assert registry["anonymousPullEnabled"] is False and registry["roleAssignmentMode"] == "LegacyRegistryPermissions"
     network = settings(compiled["private-state-network.bicep"], "shared-context-vnet")
-    assert network["addressPrefixes"] == ["192.168.96.0/24"]
+    assert network["addressPrefixes"] == (  # 192.168.97.0/24 only for snet-agents (FA_NETWORK_MODE=private)
+        "[if(variables('isPrivate'), createObject('value', createArray('192.168.96.0/24', '192.168.97.0/24')), "
+        "createObject('value', createArray('192.168.96.0/24')))]")
     workspace = settings(compiled["stage-monitoring.bicep"], "stage-log-analytics")
     assert workspace["dataRetention"] == 30 and workspace["dailyQuotaGb"] == "[parameters('dailyQuotaGb')]"
     realtime = settings(compiled["realtime.bicep"], "fa-realtime-webpubsub")
@@ -250,10 +258,16 @@ def test_api_subnet_nat_egress_is_opt_in_and_default_keeps_the_original_subnets(
     template = compiled["private-state-network.bicep"]
     assert template["parameters"]["apiSubnetNatEgress"] == {
         "type": "bool", "defaultValue": False, "metadata": template["parameters"]["apiSubnetNatEgress"]["metadata"]}
+    # The public branch is the original expression; private (tests/infra/test_network_mode.py) adds snet-agents.
     assert deployment(template, "shared-context-vnet")["properties"]["parameters"]["subnets"] == (
-        "[if(parameters('apiSubnetNatEgress'), createObject('value', variables('natEgressSubnets')), "
-        "createObject('value', variables('baseSubnets')))]")
+        "[if(variables('isPrivate'), createObject('value', concat(variables('natEgressSubnets'), "
+        "createArray(variables('agentSubnet')))), "
+        "if(parameters('apiSubnetNatEgress'), createObject('value', variables('natEgressSubnets')), "
+        "createObject('value', variables('baseSubnets'))))]")
     variables = template["variables"]
+    assert template["parameters"]["networkMode"]["defaultValue"] == "public"
+    assert variables["isPrivate"] == "[equals(parameters('networkMode'), 'private')]"
+    assert variables["natEgress"] == "[or(parameters('apiSubnetNatEgress'), variables('isPrivate'))]"
     assert variables["baseSubnets"] == [
         {"name": "snet-api", "addressPrefix": "192.168.96.0/26", "delegation": "Microsoft.App/environments"},
         {"name": "snet-private-endpoints", "addressPrefix": "192.168.96.64/27", "privateEndpointNetworkPolicies": "Disabled"},
@@ -273,8 +287,10 @@ def test_api_subnet_nat_egress_is_opt_in_and_default_keeps_the_original_subnets(
             "defaultOutboundAccess": False,
         },
     ]
+    # Never on an existing VNet (ADR-0010 phase 2b: its egress is the user's).
+    assert variables["byoVnet"] == "[not(equals(parameters('vnetResourceId'), ''))]"
     for name in ("shared-context-outbound-public-ip", "shared-context-outbound-nat"):
-        assert deployment(template, name)["condition"] == "[parameters('apiSubnetNatEgress')]"
+        assert deployment(template, name)["condition"] == "[and(variables('natEgress'), not(variables('byoVnet')))]"
     public_ip = settings(template, "shared-context-outbound-public-ip")
     assert public_ip["skuName"] == "Standard" and public_ip["publicIPAllocationMethod"] == "Static"
     nat = settings(template, "shared-context-outbound-nat")
@@ -285,6 +301,16 @@ def test_api_subnet_nat_egress_is_opt_in_and_default_keeps_the_original_subnets(
     assert foundation["parameters"]["apiSubnetNatEgress"]["defaultValue"] is False
     assert settings(foundation, "shared-context-private-state-network")["apiSubnetNatEgress"] == (
         "[parameters('apiSubnetNatEgress')]")
+
+
+def test_foundation_deploys_the_network_unless_told_otherwise(compiled):
+    # Stage and the manual flow run foundation.bicep without createNetwork; only infra/azd/main.bicep passes false.
+    foundation = compiled["foundation.bicep"]
+    assert foundation["parameters"]["createNetwork"]["defaultValue"] is True
+    assert deployment(foundation, "shared-context-private-state-network")["condition"] == (
+        "[parameters('createNetwork')]")
+    assert foundation["parameters"]["networkMode"]["defaultValue"] == "public"
+    assert settings(foundation, "shared-context-private-state-network")["networkMode"] == "[parameters('networkMode')]"
 
 
 def test_model_deployments_are_a_parameter_whose_default_keeps_the_original_two(compiled):

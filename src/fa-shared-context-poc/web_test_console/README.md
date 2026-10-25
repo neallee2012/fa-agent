@@ -236,7 +236,8 @@ API、bridge、權限與請求內容都沒變。設定頁還是同一頁（`#set
 
 設計、官方依據與 API／Hosted 的界線見 [Shared Context README](../README.md#native-routine-proposals)；這裡只記工作台的部分。
 
-- **批准卡**：助理呼叫 `propose_routine` 時，既有批准卡的類別是 `routine`。摘要寫「要排程：每天 HH:MM（時區）在這個對話執行：「…」」，
+- **批准卡**：助理呼叫 `propose_routine` 時，既有批准卡的類別是 `routine`。摘要寫「要排程：每天 HH:MM（時區）在這個對話執行：「…」」
+  （10-23 起改成「開新對話執行」，見[下方 10-23](#routine-fresh-conversation-workbench)），
   理由寫明只有主人在卡上按「允許這次」才算、助理的話或對話裡的回覆都不算，並指到「助理清單右側的 ⚙ → 排程」（10-08 前是「設定 → 排程」）。沒有「以後允許這類」
   （和 Toolbox 的 always 一樣），按一下就送，不另跳確認。按完卡片變成紀錄「助理要排程：…／你允許了這次」；
   bridge 把同一份白話（`display.routine`：時間、時區、內容，各截 500 字）存在決定旁邊，重新整理後一樣顯示，不進 command。
@@ -253,6 +254,25 @@ API、bridge、權限與請求內容都沒變。設定頁還是同一頁（`#set
 - **讀到排程回合（10-08）**：排程回合不是這頁送的回合，原本對話一安靜就不再讀，切回 t3 要按「更新回覆」才看得到（dev #732 P4）。
   現在 `switchThread`／`switchAgent` 讀完本機狀態後，標記讀一次整段對話（`/api/instructions/progress`）；第一次打開的對話仍先快速讀最新回合，
   之後才整段讀一次。有推送時，這位助理的 `turn.finished` 若不是這頁送的回合（例如排程回合），也讀一次目前對話；別的助理只標未讀，照舊。
+
+<a id="routine-fresh-conversation-workbench"></a>
+- **每次執行一個對話（10-23）**：排程不再接在批准它的對話，而是每次開新對話（見 [Shared Context README](../README.md#native-routine-fresh-conversation)）。
+  - **匯入**：沿用匯入「其他助理開的對話」的同一條路（`received` 清單的 `routine_runs`、thread＝第一個 RID）。
+    打開或切換助理時，`received` 依 `next_after` 往下讀，讀到含已匯入 RID 的那一頁就停，最多 10 頁（`RECEIVED_PAGES`）；第一頁沒有任何匯入對象（其他助理開的對話或排程執行）就只讀這一頁。
+    所以排在已匯入 RID 或這種第一頁後面、還沒匯入的較舊執行不會進清單，要用提醒按鈕或 `progress?thread_id=<RID>` 打開；
+    adapter 只放行這條路徑的 `after`（官方 State store 游標，原樣帶回）。
+  - **推送**：這位助理的 `turn.finished` 若不是這頁送的回合，除了讀一次目前對話，也用既有 `readReceivedConversation(RID)` 匯入那個 RID；
+    已在清單就不讀，所以新的「排程」對話不用切換或重新整理就出現。其他對話的追問 RID 會多一次被拒的回條讀取（bridge 回 `INSTRUCTION_SCOPE`，頁面忽略）。
+  - **對話選單**：排程對話放在 `<optgroup label="排程">`，新的在前，只列最近 30 個（`ROUTINE_THREADS`）和目前打開的那個；
+    標籤「排程 MM-DD HH:MM：內容」（排程時區），不是今年的加年份「排程 YYYY-MM-DD HH:MM：…」。
+    更舊的仍可打開：需要處理的那次由批准對話的提醒按鈕打開；其他的用 bridge 既有的 `GET /api/instructions/progress?thread_id=<RID>`
+    （或 `/api/instructions/received?request_id=<RID>`），它會先依 RID 讀回條匯入；RID 可從 API 的 due／reminders 或 Hosted 回條取得。
+  - **批准對話的提醒**：仍需要處理（批准卡、提問或還沒有最終狀態）的那次，API 也列在批准排程的對話（`routine_turns`，CID 是那次自己的）。
+    bridge 核對它的回條（Agent、CID、`routine_id`）並當作那次自己的對話匯入，不掛到批准對話；`composer.routines.runs` 給頁面，
+    「需要處理」顯示「排程（MM-DD HH:MM）執行中或等你處理，在『排程 …』對話」（`accepted`／`started`：可能還在跑，也可能在等批准卡或提問）
+    或「排程（MM-DD HH:MM）需要處理，在『排程 …』對話」（`unknown`），和「打開這個對話」。不標第幾次：這台工作台只算得到自己匯入過的執行。
+  - 和其他助理開的對話不同，它不是唯讀：主人可以追問、追加。卡片文字改成「每天 HH:MM（時區）開新對話執行：「…」」，
+    理由多一句「結果會在對話選單的『排程』分組」。
 
 ### Verified against（從對話建立排程：工作台）
 

@@ -1,12 +1,14 @@
 """TN-1 Team note sharing: a human's own verbatim suggestion is created once in the Team memory scope; Team Agents
 recall Team notes on human turns. Off by default.
 
+The scope, pin, reference-check, ``_shown`` and no-resend tests run per backend in test_memory_backend_contract.py
+(ADR-0011 §8); this file keeps the capture, factory and Foundry-only wiring.
+
 Offline: official local chain/store, named SDK and memory-service doubles; no network, model or token service.
 """
 
 import asyncio
 import json
-import logging
 import time
 from types import SimpleNamespace
 
@@ -91,9 +93,13 @@ def fresh_turn_refs():
 
 
 def run_turn(monkeypatch, tmp_path, sent, *, decision="candidate", scope=SCOPE, memories=None, reason="durable_fact",
-             supersedes=None):
-    """One human native turn with the C5 candidate tool; the SDK double stages ``decision``."""
+             supersedes=None, created=None):
+    """One human native turn with the C5 candidate tool; the SDK double stages ``decision``.
+
+    ``created`` lists the creates sent so far (default: Foundry ``/items`` bodies in ``sent``).
+    """
     memories = team_memory(sent) if memories is None else memories
+    created = (lambda: bodies(sent, "/items")) if created is None else created
     prompts, failures = [], []
 
     async def sdk(**options):
@@ -128,7 +134,7 @@ def run_turn(monkeypatch, tmp_path, sent, *, decision="candidate", scope=SCOPE, 
         assert harness.invoke(request).status_code == 202
         receipt = harness.wait("rid-1", "completed")
         deadline = time.monotonic() + 8
-        while decision == "candidate" and not failures and not bodies(sent, "/items") and time.monotonic() < deadline:
+        while decision == "candidate" and not failures and not created() and time.monotonic() < deadline:
             time.sleep(0.01)
         harness.call(memories.completed, receipt)  # the official terminal task may retry every post-turn action
     return SimpleNamespace(prompts=prompts, receipt=receipt, failures=failures)
@@ -149,206 +155,28 @@ def test_the_api_captures_the_team_scope_only_when_enabled_and_old_bytes_stay_un
         TeamMemoryCapture(scope="fap1-" + "0" * 48)
 
 
-def test_a_human_suggestion_is_shared_once_verbatim_and_recalled_as_labeled_data(local_env, monkeypatch, tmp_path):
-    sent = []
-    turn = run_turn(monkeypatch, tmp_path, sent)
-    searches, creates = bodies(sent, ":search_memories"), bodies(sent, "/items")
-    # First turn: the official static read (no items) plus the message search, both in the captured Team scope.
-    assert [body["scope"] for body in searches] == [SCOPE, SCOPE]
-    assert sorted("items" in body for body in searches) == [False, True]
-    assert next(body for body in searches if "items" in body)["items"][0]["content"][0]["text"] == TEXT
-    # One item both searches return is listed once, with its short reference.
-    assert turn.prompts == [team.PREFIX + "\n- note:t1 [OFFLINE-peer, 2026-10-01] Use repo X\n\n" + TEXT]
-    # One verbatim item in the captured Team scope, even though the completion hook ran twice.
-    assert len(creates) == 1 and creates[0]["scope"] == SCOPE and creates[0]["kind"] == "chat_summary"
-    assert creates[0]["content"].startswith("[OFFLINE-agent, ") and creates[0]["content"].endswith(
-        ", src rid-1] " + QUOTE)
-    assert all(request.headers["authorization"] == "Bearer " + TOKEN for request in sent)
-    assert all(request.headers["foundry-features"] == "MemoryStores=V1Preview" for request in sent)
-    assert not bodies(sent, ":update_memories")
-
-
-@pytest.mark.parametrize("reason, kind", [("stable_preference", "user_profile"), ("durable_fact", "chat_summary")])
-def test_a_preference_note_is_a_user_profile_item_and_a_fact_is_a_chat_summary(local_env, monkeypatch, tmp_path,
-                                                                                 reason, kind):
-    sent = []
-    run_turn(monkeypatch, tmp_path, sent, reason=reason)
-    assert [body["kind"] for body in bodies(sent, "/items")] == [kind]
-    description = candidates.bind(SimpleNamespace(receipt=SimpleNamespace(source=None)), ())
-    description = asyncio.run(description).tools[0].description
-    assert "stable_preference" in description and "durable_fact" in description
-    assert "must share, review" not in description
-
-
-@pytest.mark.parametrize("decision", ["no_candidate"])
-def test_a_skip_shares_nothing(local_env, monkeypatch, tmp_path, decision):
-    sent = []
-    run_turn(monkeypatch, tmp_path, sent, decision=decision)
-    assert bodies(sent, "/items") == [] and len(bodies(sent, ":search_memories")) == 2
-
-
-def test_a_failed_team_search_is_named_unavailable_and_the_turn_continues(local_env, monkeypatch, tmp_path):
-    sent = []
-    turn = run_turn(monkeypatch, tmp_path, sent, memories=team_memory(sent, search_status=503))
-    assert turn.prompts == [f"({team.UNAVAILABLE})\n\n" + TEXT]
-    assert turn.receipt.status == "completed" and len(bodies(sent, "/items")) == 1
-
-
-OCT_1 = 1790812800  # 2026-10-01T00:00:00Z
-OCT_2 = OCT_1 + 86400
-PREFERENCE = {"memory_id": "n1", "kind": "user_profile", "content": "[agent-a, 2026-10-01 00:00 UTC] conclusion first",
-              "updated_at": OCT_1}
-FACT = {"memory_id": "n2", "kind": "chat_summary", "content": "[agent-b, 2026-10-02 00:00 UTC] Lyra uses Postgres",
-        "updated_at": OCT_2}
-
-
-def test_the_first_turn_reads_the_teams_preferences_and_later_turns_only_relevant_notes(local_env):
-    create_effects_store()
-    sent = []
-
-    def handle(request):
-        sent.append(json.loads(request.content))
-        found = [PREFERENCE] if "items" not in sent[-1] else [PREFERENCE, FACT]
-        return httpx.Response(200, json={"search_id": "s1", "memories": [{"memory_item": item} for item in found]})
-    memories = team.NativeTeamMemory(memory.PrivateMemory.from_environment(
-        token, environ=ENV, transport=httpx.MockTransport(handle)), "OFFLINE-agent")
-    receipt = memory_receipt("what database")
-    preference = "note:n1 [preference] " + PREFERENCE["content"]
-    fact = "note:n2 [team note] " + FACT["content"]
-    assert list(asyncio.run(memories.recall(receipt, first_turn=True))) == [preference, fact]
-    assert list(asyncio.run(memories.recall(receipt))) == [fact, preference]
-    assert ["items" in body for body in sent] == [False, True, True] or ["items" in body for body in sent] == [
-        True, False, True]
-    # The static read asks for more preference notes than it shows; message searches ask for the shown bound.
-    assert sorted(body["options"]["max_memories"] for body in sent) == [
-        team.MAX_TEAM_MEMORIES, team.MAX_TEAM_MEMORIES, team.MAX_TEAM_STATIC_FETCH]
-    assert next(body for body in sent if "items" not in body)["options"] == {"max_memories": team.MAX_TEAM_STATIC_FETCH}
-
-
-def test_the_static_read_keeps_the_newest_preferences_so_a_newer_correction_is_not_left_out(local_env):
-    """S3 (2026-10-03): with more preference notes than shown, the newest three by updated_at are kept."""
-    create_effects_store()
-    notes = [{"memory_id": f"p{index}", "kind": "user_profile", "updated_at": OCT_1 + index * 60,
-              "content": f"[agent-a, 2026-10-01 00:{index:02d} UTC] preference {index}"} for index in range(6)]
-
-    def handle(request):
-        body = json.loads(request.content)
-        # Which items the service returns past the limit is unspecified: this double honors the limit, oldest first.
-        found = notes[:body["options"]["max_memories"]] if "items" not in body else []
-        return httpx.Response(200, json={"search_id": "s1", "memories": [{"memory_item": item} for item in found]})
-    memories = team.NativeTeamMemory(memory.PrivateMemory.from_environment(
-        token, environ=ENV, transport=httpx.MockTransport(handle)), "OFFLINE-agent")
-    receipt = memory_receipt("hello")
-    recalled = asyncio.run(memories.recall(receipt, first_turn=True))
-    assert list(recalled) == [f"note:p{index} [preference] " + notes[index]["content"] for index in (5, 4, 3)]
-    assert recalled.omitted == 3
-
-
 def test_the_candidate_tool_says_a_changed_way_of_working_is_a_stable_preference():
     description = asyncio.run(candidates.bind(SimpleNamespace(receipt=SimpleNamespace(source=None)), ()))
     assert "changes or corrects how they want work done, that is also a stable_preference" in (
         description.tools[0].description)
 
 
-def test_a_correction_names_its_source_and_a_note_this_turn_showed_and_never_updates_or_deletes(
-        local_env, monkeypatch, tmp_path):
-    """MEM-02: the new note names its source RID and the exact earlier note it corrects; the old note is untouched."""
-    sent = []
-    turn = run_turn(monkeypatch, tmp_path, sent, reason="stable_preference", supersedes="note:t1")
-    creates = bodies(sent, "/items")
-    assert turn.failures == [] and turn.receipt.status == "completed"
-    assert len(creates) == 1 and creates[0]["kind"] == "user_profile"
-    assert creates[0]["content"].endswith(", src rid-1, corrects t1] " + QUOTE)
-    assert all(request.method == "POST" and request.url.path.endswith(("/items", ":search_memories"))
-               for request in sent)
-    tool = asyncio.run(candidates.bind(SimpleNamespace(receipt=SimpleNamespace(source=None)), ())).tools[0]
-    assert "never invent a reference" in tool.description
-
-
-def test_an_invented_reference_saves_nothing(local_env, monkeypatch, tmp_path, caplog):
-    sent = []
-    with caplog.at_level(logging.WARNING):
-        turn = run_turn(monkeypatch, tmp_path, sent, supersedes="note:zz")
-    assert turn.failures == ["CAPABILITY_ARGUMENTS"] and turn.receipt.status == "completed"
-    assert bodies(sent, "/items") == []
-    assert "FA_TEAM_MEMORY_CREATE status=not_sent reason=supersedes_unknown" in caplog.text
-
-
-@pytest.mark.parametrize("supersedes", ["t1", "note:", "note:" + "t" * 9, "note:t1]"])
-def test_a_malformed_reference_saves_nothing(local_env, monkeypatch, tmp_path, supersedes):
-    sent = []
-    turn = run_turn(monkeypatch, tmp_path, sent, supersedes=supersedes)
-    assert turn.failures == ["CAPABILITY_ARGUMENTS"] and bodies(sent, "/items") == []
-
-
-def test_a_reference_shown_only_to_another_request_saves_nothing(local_env, monkeypatch, tmp_path, caplog):
-    team._remember_refs("rid-0", memory.Recalled(("note",), ids=("t1",)))
-    sent = []
-    with caplog.at_level(logging.WARNING):
-        turn = run_turn(monkeypatch, tmp_path, sent, supersedes="note:t1",
-                        memories=team.NativeTeamMemory.from_environment(token, environ=ENV, transport=service(
-                            sent, found=[{"memory_id": "t2", "content": "[OFFLINE-peer, 2026-10-01] Use repo Y"}])))
-    assert turn.failures == ["CAPABILITY_ARGUMENTS"] and bodies(sent, "/items") == []
-    assert "FA_TEAM_MEMORY_CREATE status=not_sent reason=supersedes_unknown" in caplog.text
-
-
-def test_a_reference_under_another_team_scope_saves_nothing(local_env, monkeypatch, tmp_path, caplog):
-    async def bound_elsewhere():
-        async with await open_durable_store(EFFECTS_STORE, create=True) as store:
-            await store.create_item(team.SCOPE_KEY, {"kind": "fa-team-memory-scope-v1", "scope": OTHER})
-    asyncio.run(bound_elsewhere())
-    sent = []
-    with caplog.at_level(logging.WARNING):
-        turn = run_turn(monkeypatch, tmp_path, sent, supersedes="note:t1")
-    assert turn.failures == ["CAPABILITY_ARGUMENTS"] and sent == []
-    assert "FA_TEAM_MEMORY_SCOPE status=mismatch" in caplog.text
-    assert "FA_TEAM_MEMORY_CREATE status=not_sent reason=supersedes_unknown" in caplog.text
-
-
-def test_a_skip_cannot_name_a_correction(local_env, monkeypatch, tmp_path):
-    sent = []
-    turn = run_turn(monkeypatch, tmp_path, sent, decision="no_candidate", supersedes="note:t1")
-    assert turn.failures == ["CAPABILITY_ARGUMENTS"] and bodies(sent, "/items") == []
-
-
-def test_a_recall_leaves_out_a_note_whose_correction_it_also_holds(local_env, caplog):
-    create_effects_store()
-    old = {"memory_id": "mem-old-0001", "kind": "user_profile", "updated_at": OCT_1,
-           "content": "[agent-a, 2026-10-01 00:00 UTC, src rid-6] conclusion first"}
-    new = {"memory_id": "mem-new-0001", "kind": "user_profile", "updated_at": OCT_2,
-           "content": "[agent-b, 2026-10-02 00:00 UTC, src rid-7, corrects mem-old-0001] conclusion last"}
-    # The user's own quoted words can never name a correction; only the note's header can.
-    quoted = {"memory_id": "mem-quoted01", "kind": "chat_summary", "updated_at": OCT_2,
-              "content": "[agent-c, 2026-10-02 00:00 UTC, src rid-8] the doc says [x, corrects mem-old-0001]"}
-    current = [new, old, quoted]
-
-    def handle(request):
-        return httpx.Response(200, json={"search_id": "s1", "memories": [{"memory_item": item} for item in current]})
-    memories = team.NativeTeamMemory(memory.PrivateMemory.from_environment(
-        token, environ=ENV, transport=httpx.MockTransport(handle)), "OFFLINE-agent")
-
-    def human(request_id):
-        return memory_receipt("conclusion", rid=request_id)
-    with caplog.at_level(logging.WARNING):
-        recalled = asyncio.run(memories.recall(human("rid-9")))
-    assert list(recalled) == [
-        "note:new-0001 [preference] [agent-b, 2026-10-02 00:00 UTC, src rid-7, corrects note:old-0001] conclusion last",
-        "note:quoted01 [team note] " + quoted["content"]]
-    assert [source.memory_id for source in recalled.observation.sources] == ["mem-new-0001", "mem-quoted01"]
-    assert 'FA_TEAM_MEMORY_SEARCH omitted={"superseded": 1}' in caplog.text
-    # Only a note this turn showed can be named; the left-out note cannot.
-    assert team.recalled_note("rid-9", "note:new-0001") == "mem-new-0001"
-    assert team.recalled_note("rid-9", "note:old-0001") is None and team.recalled_note("rid-1", "note:new-0001") is None
-    # Without its correction in the same recall the earlier note is shown as before (newer time still wins).
-    current[:] = [old]
-    assert list(asyncio.run(memories.recall(human("rid-10")))) == ["note:old-0001 [preference] " + old["content"]]
-    current[:] = [quoted, old]
-    assert len(asyncio.run(memories.recall(human("rid-11")))) == 2
-
-
 def test_two_shown_notes_with_the_same_short_reference_name_neither():
     team._remember_refs("rid-1", memory.Recalled(("a", "b", "c"), ids=("x-ref00001", "y-ref00001", None)))
     assert team.recalled_note("rid-1", "note:ref00001") is None
+
+
+def test_a_note_names_its_source_request_for_the_backend(local_env, monkeypatch, tmp_path):
+    seen = []
+    original = memory.PrivateMemory.create
+
+    async def create(self, *args, **kwargs):
+        seen.append(kwargs.get("request_id"))
+        return await original(self, *args, **kwargs)
+    monkeypatch.setattr(memory.PrivateMemory, "create", create)
+    sent = []
+    run_turn(monkeypatch, tmp_path, sent)
+    assert seen == ["rid-1"] and len(bodies(sent, "/items")) == 1
 
 
 def test_without_the_api_scope_nothing_is_searched_or_written(local_env, monkeypatch, tmp_path):
@@ -362,45 +190,6 @@ def create_effects_store():
         async with await open_durable_store(EFFECTS_STORE, create=True):
             pass
     asyncio.run(effects())
-
-
-def test_agent_messages_and_unfinished_turns_neither_read_nor_write(local_env):
-    create_effects_store()  # a usable Team binding, so only the human-turn rule keeps an Agent message out
-    sent = []
-    memories = team_memory(sent)
-    receipt = memory_receipt("human", status="completed")
-    agent = memory_receipt("human", status="completed", agent=True)
-    unknown = memory_receipt("human", status="unknown")
-    assert asyncio.run(memories.recall(agent)) == ()
-    asyncio.run(memories.completed(agent))
-    asyncio.run(memories.completed(unknown))
-    assert sent == []
-    assert asyncio.run(memories.recall(receipt)) != ()  # the same human receipt does search
-
-
-def test_a_different_later_team_scope_is_never_searched_or_written(local_env, caplog):
-    create_effects_store()
-    sent = []
-    memories = team_memory(sent)
-    human = memory_receipt()
-    assert asyncio.run(memories.recall(human)) != ()
-    # A new process re-reads the create-only binding; configuration drift cannot reach another Team.
-    later = team_memory(sent)
-    drifted = memory_receipt(scope=OTHER)
-    with caplog.at_level(logging.WARNING):
-        assert asyncio.run(later.recall(drifted)) == ()
-        asyncio.run(later.completed(memory_receipt(scope=OTHER, rid="rid-9", cid="cid-9", status="completed")))
-    assert [body["scope"] for body in bodies(sent, ":search_memories")] == [SCOPE]
-    assert bodies(sent, "/items") == []
-    assert "FA_TEAM_MEMORY_SCOPE status=mismatch" in caplog.text
-
-
-def test_an_unknown_create_is_not_resent(local_env, monkeypatch, tmp_path, caplog):
-    sent = []
-    with caplog.at_level(logging.WARNING):
-        run_turn(monkeypatch, tmp_path, sent, memories=team_memory(sent, create_status=500))
-    assert len(bodies(sent, "/items")) == 1
-    assert "FA_TEAM_MEMORY_CREATE status=500" in caplog.text and "status=already_claimed" in caplog.text
 
 
 def test_a_follow_up_with_the_scope_newly_enabled_continues_the_original_conversation(local_env, monkeypatch, tmp_path):
@@ -430,7 +219,7 @@ def test_a_follow_up_with_the_scope_newly_enabled_continues_the_original_convers
     assert [body["scope"] for body in bodies(sent, ":search_memories")] == [SCOPE]
 
 
-def test_the_factory_shares_after_private_memory_and_a_failure_never_blocks_the_relay(local_env, monkeypatch, tmp_path):
+def test_the_factory_shares_before_private_memory_and_a_failure_never_blocks_the_relay(local_env, monkeypatch, tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     runtime_path = tmp_path / "OFFLINE-not-executed"
@@ -475,7 +264,55 @@ def test_the_factory_shares_after_private_memory_and_a_failure_never_blocks_the_
         off = native_sdk.native_runtime_from_environment(hosted)
     assert isinstance(runtime.executor.team_memory, team.NativeTeamMemory)
     asyncio.run(finished(runtime))
-    assert order == ["relay", "private-memory", "team-note"]
+    # ADR-0011: the one Team note before the slower private update; a Team failure still lets the private one run.
+    assert order == ["relay", "team-note", "private-memory"]
     assert off.executor.team_memory is None
     asyncio.run(finished(off))
-    assert order == ["relay", "private-memory", "team-note", "relay", "private-memory"]
+    assert order == ["relay", "team-note", "private-memory", "relay", "private-memory"]
+
+
+@pytest.mark.parametrize("group_fails", [False, True])
+def test_the_group_post_goes_first_then_the_team_note_then_private_memory(local_env, monkeypatch, tmp_path,
+                                                                         group_fails):
+    """ADR-0011 phase 1 (also in public mode): the user-visible group post is not delayed by memory; memory still
+    runs when it fails, and its failure still reaches the notification task so the group post is retried."""
+    from shared_context.native_group_tools import NativeGroupClient
+    home = tmp_path / "home"
+    home.mkdir()
+    runtime_path = tmp_path / "OFFLINE-not-executed"
+    runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
+    hosted = SimpleNamespace(
+        identity=IDENTITY, supervisor=AssistantSupervisor(home / ".fa-assistant-v12", runtime_path=runtime_path),
+        api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
+    )
+    order = []
+
+    async def posted(self, receipt):
+        order.append("group")
+        if group_fails:
+            raise OSError("OFFLINE group transport")
+
+    async def shared(self, receipt):
+        order.append("team-note")
+
+    async def remembered(self, receipt, reader=None):
+        order.append("private-memory")
+    monkeypatch.setattr(NativeGroupClient, "complete", posted)
+    monkeypatch.setattr(team.NativeTeamMemory, "completed", shared)
+    monkeypatch.setattr(NativePrivateMemory, "completed", remembered)
+    monkeypatch.delenv("FA_NATIVE_HITL_ENABLED", raising=False)
+    with monkeypatch.context() as environment:
+        for name, value in {"FA_NATIVE_TURNS": "foundry-native-v1", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
+                            "AGENTSERVER_TASKS_BACKEND": "hosted", "HOME": str(home),
+                            "BEHAVIOR_ASSISTANT_RUNTIME_PATH": str(runtime_path), "FOUNDRY_PROJECT_ENDPOINT": ENDPOINT,
+                            "FOUNDRY_AGENT_NAME": "OFFLINE-agent", memory.STORE_ENV: "fa-memory-store",
+                            team.TEAM_ENV: "1", "FA_NATIVE_GROUPS_ENABLED": "1"}.items():
+            environment.setenv(name, value)
+        runtime = native_sdk.native_runtime_from_environment(hosted)
+    receipt = SimpleNamespace(status="completed", result=None, request_id="OFFLINE-rid")
+    if group_fails:
+        with pytest.raises(OSError):
+            asyncio.run(runtime.on_completed(receipt, None))
+    else:
+        asyncio.run(runtime.on_completed(receipt, None))
+    assert order == ["group", "team-note", "private-memory"]

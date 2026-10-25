@@ -39,10 +39,14 @@ other toolboxes and tools are bound as usual. The links go to the card's private
 log.
 
 A toolbox whose tool list cannot be read at turn start (its source failed upstream, a 5xx, a timeout, an unreadable
-answer) is left out of that turn only (Neal 2026-10-10): its tools report ``NATIVE_TOOLBOX_UNAVAILABLE``, the turn's
-assembly record names the source for the workbench, and the next turn lists it again. The toolbox's own definite
-HTTP or JSON-RPC answer about the request or its configuration (-32700, -32600, -32601, -32602, -32007) and every
-capture check after a list (a missing tool, an approval setting, a schema) still refuse.
+answer) is left out of that turn only (Neal 2026-10-10): its tools report ``NATIVE_TOOLBOX_UNAVAILABLE`` and the turn's
+assembly record names the source for the workbench. That failure (not this VM's identity token), or a connection
+need, is remembered for its kept version for ``LIST_FAILURE_BACKOFF_SECONDS``: a later turn in that window first waits
+for a prewarm in flight, then degrades the same way without listing, and lists again after it
+(README#toolbox-list-backoff). Any successful listing clears it; a successful Connect re-list clears every remembered
+connection need. The toolbox's own definite HTTP or JSON-RPC answer about the request or its configuration (-32700,
+-32600, -32601, -32602, -32007) and every capture check after a list (a missing tool, an approval setting, a schema)
+still refuse.
 """
 
 from __future__ import annotations
@@ -55,6 +59,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import OrderedDict
 from urllib.parse import quote, urlsplit
 
@@ -86,6 +91,8 @@ _MAX_SCHEMA_BYTES = 16 * 1024
 _MAX_LIST_PAGES = 8
 _LIST_SECONDS = 60.0
 _CALL_SECONDS = 120.0
+# A kept version whose listing failed is not listed again by a turn for this long (README#toolbox-list-backoff).
+LIST_FAILURE_BACKOFF_SECONDS = 60.0
 # A request the proxy rejected before running anything; any other error leaves the outcome unknown.
 _DEFINITE_HTTP = frozenset({400, 401, 403, 404, 405, 406, 409, 413, 415, 422})
 _DEFINITE_RPC = frozenset({-32700, -32600, -32601, -32602, -32006})
@@ -271,6 +278,8 @@ class _Toolbox:
         self._lock, self._loop = None, None
         # A prewarm's listing of this version while it runs; a bind waits for it instead of listing again.
         self.warming: asyncio.Task | None = None
+        # (monotonic deadline, failure) of a turn's listing that left this version out or needed a connection.
+        self.failed: tuple[float, Problem] | None = None
 
     def opening(self) -> asyncio.Lock:
         """Serializes opening the shared session, so parallel tool calls never overwrite each other's session."""
@@ -464,6 +473,7 @@ class ToolboxClient:
             async with box.opening():
                 session = await self.initialize()
             box.listed, self.fresh = await self.list_tools(session), True
+            box.failed = None
         return box.listed
 
     async def list_tools(self, session=None):
@@ -606,9 +616,17 @@ def _toolbox_url(endpoint, name):
     return f"{endpoint}/toolboxes/{quote(name, safe='')}?api-version=v1"
 
 
-def toolbox_provider(*, transport=None) -> NativeCapabilityProvider:
+def toolbox_provider(*, transport=None, clock=time.monotonic) -> NativeCapabilityProvider:
     """The single native consumer of captured ``mcp-toolbox`` grants; one instance per Hosted process."""
     toolboxes = _Toolboxes()
+
+    def remember(box, error):
+        # Only a failure that leaves the toolbox out or asks for a connection; a definite refusal still refuses each turn
+        # and drops an earlier one (e.g. the Connect card's relist was refused). This VM's own token blip is not the
+        # toolbox's failure, so it is not remembered either.
+        reason = getattr(error, "unavailable", None)
+        degraded = isinstance(error, _ConnectionNeeded) or reason not in (None, _UNAVAILABLE_STAGES["token"])
+        box.failed = (clock() + LIST_FAILURE_BACKOFF_SECONDS, error) if degraded else None
 
     async def bind(context, grants):
         endpoint = project_endpoint()
@@ -647,16 +665,25 @@ def toolbox_provider(*, transport=None) -> NativeCapabilityProvider:
             return True
 
         async def list_failure(client):
-            warming = client.toolbox.warming
-            if (client.toolbox.listed is None and warming is not None and not warming.done()
+            box, warming = client.toolbox, client.toolbox.warming
+            # Read before any wait: a failure in its window when the turn started is still reused if the window ends
+            # while the turn waits for a prewarm, so a failed slow prewarm is never followed by this turn's own listing.
+            started = box.failed if box.failed is not None and clock() < box.failed[0] else None
+            if (box.listed is None and warming is not None and not warming.done()
                     and warming.get_loop() is asyncio.get_running_loop()):
                 # A prewarm is listing this exact version now: wait for its list rather than listing it a second time.
-                # Waiting never cancels it; if it fails, this turn lists the version itself below.
+                # Waited for before the backoff, so its success wins; waiting never cancels it.
                 with phase_timing("native_bind_toolbox_prewarm_wait", job_id=timing_id(receipt.request_id)):
                     await asyncio.wait((warming,))
+            failed = box.failed
+            if box.listed is None and failed is not None and (failed is started or clock() < failed[0]):
+                # Still unlisted inside the backoff: this turn reuses the last failure instead of listing.
+                with phase_timing("native_bind_toolbox_list_backoff", job_id=timing_id(receipt.request_id)):
+                    return failed[1]
             try:
                 await client.tools()
             except Problem as error:
+                remember(box, error)
                 return error
             return None
 
@@ -688,9 +715,16 @@ def toolbox_provider(*, transport=None) -> NativeCapabilityProvider:
                 if not await connected(first[cache_key], needed):
                     return needed
                 try:
+                    # A refresh never reads the backoff: the owner's click lists now.
                     await clients[cache_key].tools(refresh=True)
                 except Problem as error:
+                    remember(clients[cache_key].toolbox, error)
                     return error
+                # The owner just connected: any other kept version waiting out a connection need lists on its next turn
+                # (another conversation, a relay, Agent or routine turn) instead of saying "not connected".
+                for box in toolboxes.items.values():
+                    if box.failed is not None and isinstance(box.failed[1], _ConnectionNeeded):
+                        box.failed = None
                 return None
             failures.update(zip(unconnected, await asyncio.gather(
                 *(relist(cache_key, needed) for cache_key, needed in unconnected.items()))))
@@ -732,8 +766,8 @@ def toolbox_provider(*, transport=None) -> NativeCapabilityProvider:
                     # A definite refusal is reported at its first grant, as when the grants were listed one by one.
                     raise failures[cache_key]
                 # Its tool list could not be read: this turn runs without this toolbox (Neal 2026-10-10). Its tools stay
-                # bound, as the capture and the resident SDK expect, and only report that; nothing is kept for the next
-                # turn, which lists it again.
+                # bound, as the capture and the resident SDK expect, and only report that; list_failure remembered the
+                # failure for its kept version, so a turn within the backoff gets this same reason without listing.
                 by_source = getattr(failures[cache_key], "unavailable_by_source", None)
                 if by_source is not None:
                     # The toolbox named which sources failed: a source it did not name is left out only alongside them,
@@ -846,7 +880,9 @@ def toolbox_provider(*, transport=None) -> NativeCapabilityProvider:
         """Prewarm while the owner types (README#typing-prewarm): list each named version into the kept lists, as the
         official startup listing does (.NET ``AddFoundryToolboxes`` lists ``tools/list`` once at startup). It runs
         outside any turn, so it sends no call id (official: never reuse a call id across requests), registers no
-        approval and calls no tool. A failure is only logged: the next turn's bind lists that version itself."""
+        approval and calls no tool. A bind that arrives while it lists waits for it, and its success clears a remembered
+        failure (README#toolbox-list-backoff). A failure is only logged and starts no backoff: a turn with nothing
+        remembered lists that version itself."""
         counts = dict.fromkeys(("listed", "kept", "listing", "failed"), 0)
 
         async def one(entry, endpoint):

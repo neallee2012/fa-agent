@@ -2,7 +2,8 @@ targetScope = 'subscription'
 
 // `azd provision` entry for a new FA environment (docs/azd-new-environment.md). It only composes the reviewed
 // infra/shared-context modules in the order of the manual standard flow (deploy/README.md#new-environment-standard-flow):
-// Foundry -> monitoring -> foundation -> Web PubSub -> backup role/storage -> M3 artifacts. The monitoring workspace is
+// network -> Foundry -> monitoring -> foundation -> Web PubSub -> backup role/storage -> M3 artifacts (and, for private
+// with memory, the Cosmos DB memory of ADR-0011). The monitoring workspace is
 // passed to the foundation as an output, so ARM orders and verifies it instead of a manual readback.
 // Apps, the sync Job, the Portal and Hosted Agents need images and the Entra app; the postdeploy hook creates them.
 // Nothing here names a tenant, subscription, principal or another environment's resource.
@@ -85,6 +86,34 @@ param enableTeamMcpConnections bool = true
 @description('ADR-0009 phase 5 (Neal 2026-10-17): a dedicated snapshot storage account, private endpoint and API role. Off by default; creating them is a cloud and IAM write that needs approval from Neal per deploy.')
 param deployUpgradeSnapshots bool = false
 
+// ADR-0010: chosen only when the environment is created (Foundry network injection cannot be added or removed later;
+// the preprovision hook reads the account and refuses a change). `public` deploys exactly what it did before.
+@allowed(['public', 'private'])
+@description('FA_NETWORK_MODE. private: the Foundry account is injected into snet-agents, public network access off, private endpoint and DNS in the VNet.')
+param networkMode string = 'public'
+
+// ADR-0011: written by the preprovision hook (cosmos only for private with memory on), never set by hand. The network
+// mode is fixed, so the backend changes only with the memory switch; no memory moves between the two.
+@allowed(['foundry', 'cosmos'])
+@description('FA_MEMORY_BACKEND. cosmos (private only): the long-term memory is a serverless Cosmos DB account behind a private endpoint instead of the Foundry Memory Store.')
+param memoryBackend string = 'foundry'
+
+// ADR-0010 phase 2b: bring your own VNet (private only; the preprovision hook reads it and its subnets first and
+// refuses one in this environment's resource group, which `azd down` deletes). FA then creates no VNet, subnet, NSG
+// or NAT and never writes that VNet: the Container Apps environment, the injection and every private endpoint name
+// the subnets by ID. Empty keeps FA's own vnet-<env>.
+@description('FA_VNET_RESOURCE_ID: an existing VNet in this subscription and region, in another resource group.')
+param vnetResourceId string = ''
+@description('FA_API_SUBNET_NAME (with vnetResourceId): the Container Apps subnet, delegated to Microsoft.App/environments.')
+param apiSubnetName string = 'snet-api'
+@description('FA_AGENT_SUBNET_NAME (with vnetResourceId): the Foundry agent subnet, delegated to Microsoft.App/environments.')
+param agentSubnetName string = 'snet-agents'
+@description('FA_PRIVATE_ENDPOINT_SUBNET_NAME (with vnetResourceId): the subnet of every private endpoint.')
+param privateEndpointSubnetName string = 'snet-private-endpoints'
+@allowed(['azd', 'existing'])
+@description('FA_DNS_MODE. existing (with vnetResourceId only): the user serves the private DNS names, so FA creates no private DNS zone, VNet link or zone group.')
+param dnsMode string = 'azd'
+
 var env = toLower(environmentName)
 // Globally unique names (storage, registry, Foundry subdomain, Web PubSub) use a per subscription/env/region token.
 var token = toLower(uniqueString(subscription().id, env, location))
@@ -115,7 +144,19 @@ var names = {
   consoleStorage: 'stcon${token}'
   snapshotStorage: 'stsnap${token}'
   snapshotPrivateEndpoint: 'pe-${env}-upgrade-snapshot-blob'
+  memoryCosmos: 'cosmos-${token}'
 }
+// ADR-0011: private with memory on; preprovision writes cosmos only then, and the condition repeats the mode anyway.
+var cosmosMemory = networkMode == 'private' && memoryBackend == 'cosmos'
+// Every module gets '' for these unless the VNet is the user's, so its default expressions stay as they were.
+var byoVnet = networkMode == 'private' && vnetResourceId != ''
+var byoSubnets = {
+  api: '${vnetResourceId}/subnets/${apiSubnetName}'
+  agents: '${vnetResourceId}/subnets/${agentSubnetName}'
+  privateEndpoints: '${vnetResourceId}/subnets/${privateEndpointSubnetName}'
+}
+// FA's own VNet always has FA's zones; only a user VNet can leave DNS to the user.
+var privateDnsZones = !byoVnet || dnsMode == 'azd'
 var tableName = 'workstate'
 var backupContainer = 'm1-environment-backups'
 var artifactsContainer = 'm3-artifacts'
@@ -147,6 +188,21 @@ resource rg 'Microsoft.Resources/resourceGroups@2025-04-01' = {
   tags: tags
 }
 
+// The VNet first: a Foundry account can only be injected into a subnet that exists when it is created (ADR-0010).
+module network '../shared-context/private-state-network.bicep' = {
+  name: 'fa-${env}-network'
+  scope: rg
+  params: {
+    location: location
+    tags: tags
+    vnetName: names.vnet
+    apiSubnetNatEgress: apiSubnetNatEgress
+    networkMode: networkMode
+    vnetResourceId: byoVnet ? vnetResourceId : ''
+    privateDnsZones: privateDnsZones
+  }
+}
+
 module foundry '../shared-context/foundry.bicep' = {
   name: 'fa-${env}-foundry'
   scope: rg
@@ -156,6 +212,11 @@ module foundry '../shared-context/foundry.bicep' = {
     projectName: names.project
     operatorObjectId: principalId
     modelDeployments: modelDeployments
+    networkMode: networkMode
+    agentSubnetResourceId: byoVnet ? byoSubnets.agents : network.outputs.agentSubnetResourceId
+    privateEndpointSubnetResourceId: byoVnet ? byoSubnets.privateEndpoints : network.outputs.privateEndpointSubnetResourceId
+    privateDnsZoneResourceIds: network.outputs.foundryDnsZoneResourceIds
+    privateDnsZones: privateDnsZones
   }
 }
 
@@ -195,9 +256,14 @@ module foundation '../shared-context/foundation.bicep' = {
     registryConnectionName: '${env}-container-registry'
     vnetName: names.vnet
     apiSubnetNatEgress: apiSubnetNatEgress
+    createNetwork: false
+    apiSubnetResourceId: byoVnet ? byoSubnets.api : ''
+    privateEndpointSubnetResourceId: byoVnet ? byoSubnets.privateEndpoints : ''
+    vnetResourceId: byoVnet ? vnetResourceId : ''
+    privateDnsZones: privateDnsZones
     tags: tags
   }
-  dependsOn: [foundry]
+  dependsOn: [foundry, network]
 }
 
 module realtime '../shared-context/realtime.bicep' = {
@@ -234,9 +300,12 @@ module backupFoundation '../shared-context/backup-foundation.bicep' = {
     vnetName: names.vnet
     privateEndpointSubnetName: 'snet-private-endpoints'
     privateEndpointName: names.backupPrivateEndpoint
-    createBlobPrivateDnsZone: true
-    createBlobDnsVnetLink: true
+    createBlobPrivateDnsZone: privateDnsZones
+    createBlobDnsVnetLink: privateDnsZones
     blobDnsVnetLinkName: '${env}-link'
+    vnetResourceId: byoVnet ? vnetResourceId : ''
+    privateEndpointSubnetResourceId: byoVnet ? byoSubnets.privateEndpoints : ''
+    privateDnsZones: privateDnsZones
   }
   dependsOn: [backupRole, foundation]
 }
@@ -264,10 +333,28 @@ module upgradeSnapshots '../shared-context/upgrade-snapshots.bicep' = if (deploy
     apiIdentityName: names.apiIdentity
     vnetName: names.vnet
     privateEndpointName: names.snapshotPrivateEndpoint
+    privateEndpointSubnetResourceId: byoVnet ? byoSubnets.privateEndpoints : ''
+    privateDnsZones: privateDnsZones
     tags: tags
   }
   // The private endpoint uses the Blob private DNS zone and VNet link that the backup foundation creates.
   dependsOn: [backupFoundation]
+}
+
+// ADR-0011 section 5: private only (cosmosMemory names networkMode too, so public can never deploy it).
+module memoryCosmos '../shared-context/memory-cosmos.bicep' = if (cosmosMemory) {
+  name: 'fa-${env}-memory-cosmos'
+  scope: rg
+  params: {
+    location: location
+    tags: tags
+    accountName: names.memoryCosmos
+    vnetName: names.vnet
+    privateEndpointSubnetResourceId: byoVnet ? byoSubnets.privateEndpoints : network.outputs.privateEndpointSubnetResourceId
+    vnetResourceId: byoVnet ? vnetResourceId : ''
+    privateDnsZones: privateDnsZones
+    apiPrincipalId: foundation.outputs.apiIdentityPrincipalId
+  }
 }
 
 module onboarding '../shared-context/stage-onboarding-delegation.bicep' = if (enableAgentOnboarding) {
@@ -278,6 +365,18 @@ module onboarding '../shared-context/stage-onboarding-delegation.bicep' = if (en
     projectName: names.project
     principalId: foundation.outputs.apiIdentityPrincipalId
     assignmentDescription: 'FA #468: ${env} onboarding may only add Foundry User / OpenAI User for service principals; no deletes'
+  }
+}
+
+// ADR-0006 (Neal 2026-10-24): Cosmos memory embeds at the account root, so "+" also gives the new Agent identity
+// OpenAI User on the account; this delegation allows only that role (public never deploys it).
+module onboardingAccountRole '../shared-context/account-onboarding-delegation.bicep' = if (enableAgentOnboarding && cosmosMemory) {
+  name: 'fa-${env}-onboarding-account-role'
+  scope: rg
+  params: {
+    accountName: names.foundryAccount
+    principalId: foundation.outputs.apiIdentityPrincipalId
+    assignmentDescription: 'FA ADR-0006: ${env} onboarding may only add OpenAI User on the account for service principals; no deletes'
   }
 }
 
@@ -308,7 +407,7 @@ output FA_TABLE_NAME string = foundation.outputs.tableName
 output FA_BACKUP_STORAGE string = names.backupStorage
 output FA_BACKUP_CONTAINER string = backupContainer
 output FA_ARTIFACTS_CONTAINER string = artifactsContainer
-output FA_VNET string = names.vnet
+output FA_VNET string = byoVnet ? last(split(vnetResourceId, '/')) : names.vnet
 output FA_REALTIME_ENDPOINT string = realtime.outputs.endpoint
 output FA_LOG_ANALYTICS string = names.logAnalytics
 output FA_API_APP string = names.apiApp
@@ -317,5 +416,11 @@ output FA_CONSOLE_APP string = names.consoleApp
 output FA_CONSOLE_IDENTITY string = names.consoleIdentity
 output FA_CONSOLE_STORAGE string = names.consoleStorage
 output FA_AGENT_ONBOARDING bool = enableAgentOnboarding
+// ADR-0006 (Neal 2026-10-24): true only when provision created the account-scope delegation, so profile.py turns the
+// account PUT of "+" on only then (an older private environment re-provisions first); false on public.
+output FA_AGENT_ONBOARDING_ACCOUNT_ROLE bool = enableAgentOnboarding && cosmosMemory
 output FA_UPGRADE_SNAPSHOT_CONTAINER_URL string = deployUpgradeSnapshots ? upgradeSnapshots!.outputs.containerUrl : ''
 output FA_BACKUP_ROLE_ID string = backupRole.outputs.backupRoleDefinitionId
+// ADR-0011: the account's documentEndpoint for the API's memory relay (deploy/azd/profile.py); empty unless
+// cosmosMemory. The database and container names are fixed (fa-memory/memories, shared_context/memory_relay.py).
+output FA_COSMOS_ENDPOINT string = cosmosMemory ? memoryCosmos!.outputs.endpoint : ''

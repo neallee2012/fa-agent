@@ -1,5 +1,50 @@
 # Shared Context POC
 
+<a id="cosmos-memory-relay"></a>
+## `private` 長期記憶的 API 轉送（ADR-0011 第 3 階段，2026-10-24，CODE/offline，未部署）
+
+契約見 [ADR-0011](../../docs/adr/0011-private-mode-cosmos-memory.md) 第 4 節。程式在 `shared_context/memory_relay.py`，
+由 `behavior_server.application()` 安裝（每個 peer app 都有）。
+
+- **開關**：只有 `FA_MEMORY_BACKEND=cosmos`，而且 `FA_COSMOS_ENDPOINT` 是 `https://<帳號>.documents.azure.com[:443]/`
+  時才安裝路由；其他情況路由不存在（404），設定不合法時記 `FA_MEMORY_RELAY_INACTIVE reason=config_invalid`。
+  `public` 不設這些變數，行為不變。`FA_MEMORY_EPISODE_DAYS`（選填，1–9999，預設 90）是 episode 的查詢年齡。
+- **身分與 scope**：只收 Agent token。API 依呼叫者的 `oid` 找出 Agent（設定檔的 target 用 `agent_oid` 比對，
+  登記的 Agent 用 `resolve_agent_scope`），以 `oid` 快取 Agent 名；允許的 scope 只有 `scope_for(agent_name)`，
+  以及 `FA_TEAM_MEMORY_ENABLED=1` 時的 `team_memory_scope(tenant, team)`。body 的 `scope` 不符回 403
+  `MEMORY_SCOPE_DENIED`（log 只記 `agent_id` 與 `reason=scope_mismatch`）。item `id` 與 `update_id` 由 API 算。
+- **路由**（沒有刪除）：
+  - `POST /team-data/v1/memory/search`：`{"scope", "mode": "static"|"contextual", "vector"?: [1536 個有限數], "top": 1-10}`；
+    contextual 必須帶 `vector`，static 不能帶。回 `{"memories": [{"memory_item": {"memory_id", "kind", "content",
+    "updated_at"}}]}`（與 Memory Store 同形，沒有 `usage`）。私人 scope 的 contextual 查詢排除 `updated_at` 早於
+    現在減 episode 天數的 `chat_summary`；Team scope 不加這個條件。查詢都帶 partition key，不投影 `c.embedding`。
+  - `POST /team-data/v1/memory/items`：`{"scope", "source_request_id", "items": [{"slot", "kind", "content",
+    "embedding", "updated_at", "supersedes"?}]}`，1–4 條。私人 scope 的 slot 是 `p0`–`p2`（`user_profile`，可帶
+    `supersedes`）與 `e0`（`chat_summary`），content ≤600 字；Team scope 只能一條 `note`、不能帶 `supersedes`。
+    新條在一個 transactional batch 裡 create；batch 之後每條更正送一個帶前置條件的 patch（條件字串內嵌驗證過的
+    整數，沒有 `@` 參數）。回 200 `{"update_id": "fau1-…"|null, "items": [{"slot", "id", "status": 201|409}],
+    "corrections": [{"slot", "supersedes", "result": "superseded"|"skipped"}]}`；`409` 表示這個 RID 已寫過（整批
+    rollback，不送 patch）。
+- **失敗**：Cosmos 回 429／5xx 或沒回應時回 503 `MEMORY_BACKEND_UNAVAILABLE`，不重試；SDK（4.17.1）在 429、408、5xx
+  或連線中斷後也不重送資料操作：throttle 重試（`ConnectionPolicy.RetryOptions` 設 0）、pipeline 的連線與讀取重試
+  （`retry_total=0`）、endpoint discovery 的換區重試（503 的寫入也會重送一次；`EnableEndpointDiscovery=False`）都關掉，
+  寫入重試預設就是關的（不傳 `retry_write`）。SDK 仍會在 410（partition split）或 container RID 過期時重讀路由
+  （兩者都是服務端先拒絕、沒有執行）、狀態碼是舊式 OS socket 錯誤碼的讀取會重送，以及建 client 時重試帳號讀取。
+  更正 patch 的 412／404／不明只記 `FA_MEMORY_RELAY_SUPERSEDE status=skipped reason=…`，新條照留。
+- **Client**：整個行程一個 `CosmosClient`（用 API 的 managed identity，Gateway mode／443），owner app 啟動時暖機、
+  關閉時一併關閉（`FA_MEMORY_RELAY_WARMUP status=ready|failed|pending`；啟動最多等一個連線逾時 5 秒，之後暖機在
+  背景繼續）。建 client 要讀帳號，後端掛掉時 SDK 會重試到約一分鐘；建置進行中或上次失敗不到 30 秒時，請求不排隊
+  也不重建，直接回 503（`FA_MEMORY_RELAY_FAILED stage=connect reason=build_in_progress|recent_failure`；建置本身
+  失敗記 `stage=connect status=… exception_type=…`）。Cosmos 包裝層只有 batch create、
+  query、patch 與 metadata 讀取，沒有 replace、upsert、delete。`azure-cosmos==4.17.1` 只在 `requirements-behavior.txt`
+  （API 與 web console 映像），只在建 client 時匯入。
+- **用量**：`POST /work-policy/v1/turn-usage` 收 `source: "memory"`（抽取的模型用量，用回合本身的 RID），
+  key 是（Agent, RID, `"memory"`）；不發 `turn.finished`，`usage=null` 不算未知回合。`source="model"` 不序列化，
+  回合報告的位元組不變。
+- 驗證（本機 Windows，離線替身，沒有 Azure）：`test_memory_relay.py`（Cosmos 替身照 `azure-cosmos` 4.17.1 的介面與
+  第 0c 階段探針的狀態碼）、`test_team_agent_routing.py`、`test_fresh_installation.py`、`test_agent_turn_usage_ledger.py`、
+  `test_realtime_push.py`。真 Cosmos、5 項資料角色、延遲與 429 留給第 5 階段。
+
 <a id="native-2di-switch"></a>
 ## ADR-0009 2d-i 開關（P9，2026-10-16；stage 第 32 版起打開；2d-ii 起一律打開）
 
@@ -2018,6 +2063,7 @@ Neal 原本在對話裡說「你可以用cli去建立cronjob，每天幫我檢�
 2. 這個工具在 HITL 是新類別 `routine`，目標 `conversation:<CID>`。**一律出既有批准卡問主人**：不跑 Auto Review、不套 Team 規則；
    API 也拒絕非 default／ask 的審查、格式不對的草稿，且沒有主人放行就不給 `/authorize`。
 3. 卡片顯示「要排程：每天 HH:MM（時區）在這個對話執行：「…」」，只有「允許這次／拒絕」（`allow_rule` 422）。
+   10-23 起每次執行改開新對話，卡片與工具說明一起改，見[下方 10-23](#native-routine-fresh-conversation)。
    助理說的話、使用者在對話裡打「好」都不算批准（AGENTS 第 6 條）。
 4. 主人按「允許這次」→ 同一個 `/native-hitl/v1/decisions` 請求裡，API **先**以主人身分（`Behavior.Approve`）呼叫既有
    `NativeRoutineService.publish` 寫 definition，**再**記錄決定。內容只取卡片保存的草稿；`routine_id`／版本 ID 由卡片 `pending_id` 決定，
@@ -2134,6 +2180,48 @@ Neal 10:33 在 stage 請 A「每天晚上6點自動幫我整理 Stratechery 和�
     - `guard` 在 min 0、沒設定或 `null` 時停下。
   - 反向 10 項（sync 清單少旗標、工作台清單少旗標、`meta` 不跑 sync 規則、`meta` 不檢查 API、時鐘沒開 `ROUTINES` 也放行、Hosted 組合不檢查、`guard` 不看副本數、Hosted 開 API 沒開不擋、工作台開 API 沒開不擋、`minReplicas: null` 會當掉）各自 RED，還原後 GREEN。
   - 既有 stage CI、版本發布、Agent sync、「＋」相關測試 148 passed；`meta` 在沒有 pydantic 的一般 python 跑得起來，現在的 `stage.json` 照常通過。
+
+<a id="native-routine-fresh-conversation"></a>
+**2026-10-23 每次執行開一個新對話（Neal 10-23：不需要接續前一天；CODE/offline，未部署）：**
+stage A 的每日 routine 原本每天接在同一個對話後面，第一次呼叫模型的 input 從 10-15 的 189K tokens 長到 10-22 的 306K。
+runtime 自己估的只有約 177K，沒到壓縮門檻（宣告上限 272K 的 80%），所以一直沒壓縮；10-22 撞到 `gpt-6.1-sol` 的 500K TPM，停在 `unknown`
+（[根因](../../docs/progress.md#stage-v35-1022)）。改成每次執行都開新對話，context 不再逐日變大；不改 SDK、壓縮設定或 checkpoint 契約。
+
+- **資料形狀**：
+  - routine＝`routine_id`。head 列指到目前版本；definition 的 `conversation_id` 是主人批准它的那個對話。
+  - 一次執行＝固定 RID（tenant／Team／Agent／routine／排定 UTC，公式不變），加上同 RID 的 CAS 意圖列（`native-routine-intent`）。
+  - 這次執行的對話＝意圖裡的 `routine.conversation_id`，也是 Hosted 回條的 `conversation_id`。
+- **怎麼開新對話**：沿用既有「新對話」路徑，`command.conversation_id` 留空。API 在存意圖**之前**先決定這次的 CID：
+  Responses conversation 模式用平台 `POST /conversations`（和主人開新對話同一個 `open_conversation`），Invocations 用 `native-<uuid>`。
+  CID 寫進 `routine.conversation_id`，Hosted 用它建立對話。
+- **設定沿用批准排程的對話**：模型、role、skills、能力、connector 與通道都和 10-23 之前一樣，從主人批准排程的那個對話解析
+  （`resolve_routine_capture(..., conversation=批准對話)`），**不是** Team 目前的新對話模板；主人之後改模板，不會不經批准就改到排程。
+  只有對話 ID 是新的，新對話不帶任何歷史。
+- **去重**：CID 存在意圖裡，所以同一 RID 的重試（接單回應遺失、接單前被拒、下一分鐘再送）都讀回同一份意圖，送出同一 CID、同一 digest。
+  兩個重疊的時鐘各開一個對話時，保存意圖那筆交易的請求 digest 不含 CID，後到的會讀回先存的那份，所以仍只有一個對話、一個回合。
+  代價：Responses 模式下輸掉的那次（或存意圖前程序中斷）會留下一個沒有人讀的空平台對話；程序還在時記一行
+  `FA_NATIVE_ROUTINE_CONVERSATION_UNUSED rid=<前 12 碼> conversation=<前 12 碼>`。
+- **主人怎麼找到結果**：Hosted 的 `received` 清單（原本只列其他助理開的對話）多一個欄位 `routine_runs`，列出排程開的對話
+  （沿用既有的 `NativeRoutineDispatch` 回條摘要；沒有時不輸出，所以 v2 wire 只是加欄位，`test_native_profile_snapshot` 通過）。
+  工作台打開這位助理時依 `next_after` 往下讀到已匯入的那一頁（最多 10 頁），這位助理的 `turn.finished` 推送也匯入那個 RID；
+  對話選單的「排程」分組列最近 30 個，標「排程 MM-DD HH:MM：<排程內容>」（排程時區，不是今年加年份）。
+  更舊的仍可用 bridge 既有的 `GET /api/instructions/progress?thread_id=<RID>` 依 RID 匯入打開（細節見[工作台 README](web_test_console/README.md#routine-fresh-conversation-workbench)）。
+  這是主人自己的對話，可以追問、追加；HITL 批准卡、提問與提醒都照原 RID 出現在這個對話。
+- **提醒的範圍**：已接單的執行在它自己的對話列出；還沒有回條的那次（`NATIVE_RID_MISSING`）沒有對話可讀，仍列在批准排程的那個對話。
+  仍需要處理（批准卡、提問或沒有最終狀態）的那次，主人的 reminders 也在**批准排程的對話**列出（`routine_turns`，CID 是那次自己的），
+  工作台顯示「排程（MM-DD HH:MM）執行中或等你處理，在『排程 …』對話」（`accepted`／`started`）或「排程（MM-DD HH:MM）需要處理，在『排程 …』對話」（`unknown`）並連過去；Agent 的 reminders（進 prompt 的那份）只列被問的那個對話。
+- **核對**：意圖的 `command.conversation_id` 只能是空的（新）或 definition 的 CID（10-23 前存的），回條 CID 必須等於意圖的
+  `routine.conversation_id`；不符時 reminders、Agent 的 routine check 與 startup 讀取都回 409，不會默默略過。
+- **不變**：「不補跑」（只補最近一次、晚於批准）、RID 公式、`_settle`、回條與 `unknown` 為最終狀態的契約。
+- **舊的長對話**：不搬、不刪。10-23 之前已存的意圖（例如還沒完成的那一次）照原樣接在原對話；之後的每一次都開新對話。
+- **換版順序**：舊 Hosted 會拒收 `command.conversation_id` 為空的排程（422，API 時鐘記 `_REFUSED`，同一 RID 下一分鐘再送）；
+  新 Hosted 回的 `received` 頁若含 `routine_runs`，舊 API／舊工作台會整頁讀不到（只影響「其他助理開的對話」清單）；
+  新 API 在批准對話列出別的 CID 的 `routine_turns`，舊工作台會把那個對話的提醒標成 `NATIVE_STATE_SCOPE`。API、Hosted、工作台要一起換版；stage release 本來就一起。
+- **單向**：換版後新存的意圖（`command.conversation_id` 空、`routine.conversation_id` 是新 CID）與新回條，舊 API／舊 Hosted 讀不懂：
+  舊 API 的 startup／rotation 讀取（`validate_native_routine_history`）與 `check` 用舊的 `routine_origin_for(definition)` 比對，
+  會對新意圖回 409 `NATIVE_ROUTINE_INVALID`；舊 Hosted 的 `check_command` 不收沒有 CID 的排程（讀已存的新回條是否也被拒，未逐一驗證）。
+  所以這次 release 之後不能只把 API 或 Hosted 換回舊 image；要退回得一起退，而且新存的意圖要先處理（release notes 要寫）。
+- 提案工具與批准卡的說明改成「每天開新對話執行」，並請模型把內容寫成不靠這段對話也看得懂。
 
 （10-04 原寫的 Job 用法——`python -m shared_context.native_routine_tick`、`FA_ROUTINE_*` 與專用 MI——已隨 Job 路徑於 10-07 移除，見上方。）
 
@@ -6271,7 +6359,11 @@ store 一律不重建：寫入遇到 not found 時再讀一次 store 確認，�
 （其中每個 provider 另記 `native_bind_<名稱>`，見 [bind 工具清單快取](#bind-tool-list-cache)；2026-10-07 起各 provider
 一起執行，見[冷回合 bind 並行](#rtt-cold-bind)）、
 `native_reminders`、`native_operations_start`（含接續回合的 `prior_operations`）、`native_executor`（整段 SDK 回合；
-其中的 `private_memory_recall`／`team_memory_recall`／`sdk_process_start` 也帶同一個 ID）與 `native_save_turn`。
+其中的 `sdk_process_start` 也帶同一個 ID）與 `native_save_turn`。`private_memory_recall`／`team_memory_recall` 也帶同一個 ID，
+但 2026-10-22 起在配號前啟動、不在 `native_executor` 這段裡（見[配號前召回](#recall-before-allocate)），所以
+`native_executor` 的 `table_gets` 不再含召回的讀取。取消傳進某段時，這段記 `outcome=cancelled`，不記 `failed`：呼叫端停下（例如這回合已不需要的提早讀取）、
+同一批裡另一項失敗、deadline／timeout，或 event loop 收尾都算。所以舊的 timeout 路徑（`behavior_assistant_hosted` 的 `SDK_TURN_SECONDS`、
+`m2_assistant` 的 240 秒）逾時時，當下開著的段現在記 `cancelled`。`RouteTiming`（`behavior_timing.py`）不變：外層被取消的 route 仍記 `failed`。
 `native_executor` 內的 SDK 回合再分段（2026-10-06，只加計時、不改行為；同一個 ID）：`sdk_process_start`（`client.start()`，
 熱路徑沒有）、`sdk_session_create`／`sdk_session_resume`（建立或接續 SDK session；接續含 SessionFs 還原 callbacks）、
 `sdk_compact`（只有執行 checkpoint compaction 時才有）、`sdk_send_until_idle`（送出到 session idle，含模型與工具迴圈）、
@@ -6312,7 +6404,42 @@ Hosted 收單前約 0.8 秒、Hosted 收單內部約 1.1 秒，都沒有計時�
 放進提示的方式不變；召回失敗照舊（記為 unknown，或整個回合失敗，與原本相同），不重送。bind、提醒或 operations 先失敗時，
 未取用的召回會被取消並等它結束，不會比回合活得久。差別只有：這種先失敗的回合多做了一次唯讀搜尋（Team 記憶第一次使用時
 固定的 scope 本來就由伺服器決定，提早寫入不改內容）。預估每個暖回合省 0.6～0.7 秒；實際看 dev 的 `private_memory_recall`、
-`team_memory_recall` 與 `native_bind_capabilities` 是否重疊。
+`team_memory_recall` 與 `native_bind_capabilities` 是否重疊。（2026-10-22 起改在配號前啟動，見[下一段](#recall-before-allocate)。）
+
+<a id="recall-before-allocate"></a>
+**記憶召回在配號前啟動（2026-10-22，G plan）。**
+- **dev 讀值（10-22，未存檔）：** 依 r2／r3 延遲報告（不在 repo 內），binding 縮到約 0.15 秒後，召回（平台 `search_memory` 470～1,228 ms）在
+  `native_operations_start` 結束後還要再等 301～981 ms（r2）、336～864 ms（r3）模型才開始。暖回合 `native_peer_tools` 只有 1 ms，
+  所以只把啟動點移到 peer_tools 前面幾乎省不到；前面夠長、能蓋住它的只有 admit→allocate（0.62～0.93 秒）。
+- **依賴：** 召回只讀 receipt 的原文、`human_origin` 與 capture 的 Team scope（Team 記憶第一次使用時以 create-or-read 固定 scope）；
+  不需要 SID、peer_tools、bind 或 operations。唯一要配號後才知道的是 `first_turn`（還原的 SDK 狀態是否為空），它只決定要不要多讀
+  static profile。
+- **做法：** `native_turns._run_started` 在 `_allocate` 之前呼叫 executor 的 `start_recall`，以「沒有 CID 的新對話＝第一回合」猜
+  `first_turn`；`native_sdk._run` 拿到 `previous` 後若猜錯（例如第一回合失敗後的接續），取消猜的那次、照正確值重新召回。結果、
+  失敗與 unavailable 的處理、放進提示的位置都不變。進了 `_run` 後，召回（猜對的那次也一樣）跟著 `_execute` 的 exit stack
+  結束，所以 bind 等步驟先失敗時，它在 `_run_started` 記 unknown 之前就被取消；配號被拒，或在 `_execute` 裡更早失敗（preflight、
+  routine 檢查、`continue_live`、peer／group tools）時，則在記下 unknown 之後才由 `_run_started` 的 `finally` 取消並等它結束。`FA_TIMING` 仍帶這回合的 job_id，被取消的召回記 `outcome=cancelled`；召回的 log 也掛在這回合的 trace
+  （`turn_context`，與 executor 相同；行程重啟後沒記住收單 trace 時，兩邊各自開新 trace）。
+- **限制：** `native_start`（槽位、`rid:` 讀取、`started` CAS）仍在召回之前，再提早要同時改 Responses 與 Invocations 兩個入口。
+  `private_memory_recall`／`team_memory_recall` 現在跟 `native_allocate` 重疊，兩段不能相加；`native_executor` 的 `table_gets`
+  也不再含召回的讀取。猜錯時，每個啟用的記憶最多重跑一次 contextual 搜尋（猜的那次被取消，再連同 static 重新召回）。
+  配號被拒或更早失敗的回合，現在會做一次 base 不會做的召回（唯讀搜尋）；Team 記憶第一次使用時，這次召回也可能先固定 Team scope
+  （create-only，值與之後正常回合會寫的相同）。
+- **推論（未量測）：** 省下的時間以 `native_allocate` 本身的長度為上限，這段長度還沒有單獨量過；暖回合最多可蓋掉這麼長的召回等待
+  （0.3～0.9 秒中的一部分）。實際要看 dev 的召回結束是否落在 `native_operations_start` 結束之前。
+
+#### Verified against：記憶召回在配號前啟動
+
+- 程式基準：main `f54f0fa1`；已讀 `native_responses.NativeResponsesHandler.handle`、`native_turns._execute_started`／`_run_started`／
+  `_allocate`、`native_sdk.__call__`／`_execute`／`_run`、`native_private_memory.recall`、`behavior_private_memory.recall_tiers`、
+  `native_team_memory.recall`／`_bound`、`behavior_timing.work_timing`／`phase_timing`、`sdk_telemetry.turn_context`／`remember`。
+- 測試：`test_native_assembly.py::test_memory_recall_starts_before_allocation_and_keeps_its_tiers_and_failure_handling`（配號要等搜尋
+  開始才放行；新對話、接續、沒有 SDK 歷史的接續、搜尋 500 四種）、`::test_a_recall_started_before_allocation_stops_with_a_refused_allocation`
+  （配號被拒時卡住的搜尋被取消）。改回舊順序時前者四種都失敗；拿掉 `finally` 的取消時後者失敗。未部署。
+- 第 1 輪修正（PR #955）：上面兩個測試都加上私人／Team 記憶兩種（Team 含第一次使用時固定 scope），並檢查召回的 `FA_TIMING`
+  帶這回合的 job_id；配號被拒時記 `cancelled`。新增 `::test_a_wrong_first_turn_guess_logs_its_dropped_recall_as_cancelled_under_the_turns_id`
+  （猜錯時一筆 `cancelled`、一筆 `returned`，沒有 `failed`）；`::test_memory_recall_overlaps_capability_binding_and_stops_with_a_turn_that_ends_first[True]`
+  另檢查召回在記 unknown 之前就被取消。修正前這三組新檢查都失敗（猜對的召回不在 exit stack 上、取消記成 `failed`）。
 
 #### Verified against：RTT A 分段計時與記憶召回重疊
 
@@ -7047,6 +7174,10 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
     需要 #468 的新 IAM（stage API UAMI 在 project 範圍的 RBAC Administrator，ABAC 條件只允許新增這兩個角色給 ServicePrincipal；
     Neal 2026-10-03 00:12 已同意這項 IAM 與「＋」自動寫入）。剩餘風險：API 身分若被盜用，可把這兩個角色給同一 project 上任何
     service principal（不能刪除）；風險說明與後續新方案記在待辦 #469。
+    API 另有 `FA_ONBOARDING_ACCOUNT_ROLE=true`（azd `private` 開記憶，且 Bicep 輸出 `FA_AGENT_ONBOARDING_ACCOUNT_ROLE=true`
+    才由 `deploy/azd/profile.py` 設）時，兩個 project 角色之後再把 OpenAI User 指派在這個 project
+    所屬的 Foundry account 上（Cosmos 記憶的 embedding 走 account 根路徑，#971）；失敗原因寫成 `role=5e0bd9bd-…@account`。
+    需要 account 範圍、只允許這一個角色的受限委派（`infra/shared-context/account-onboarding-delegation.bicep`，ADR-0006 Neal 2026-10-24）。
     官方三條「建立時繼承」的路（blueprint、project 預設身分、Entra 群組）都不適用，見 #468。
   - 任一項還沒讀回成功：停在 `creating`，記 `FA_AGENT_SETUP_PENDING request_id=… step=endpoint|roles reason=…`（只含固定 reason、狀態碼與
     ARM 錯誤碼，不含 token 或 body），202 回應的 `reason` 是 `AGENT_SETUP_PENDING`（只在回應裡，不寫入紀錄）。同一 rid 續做時重做同一步；
@@ -7171,7 +7302,7 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
 - 旗標設成 `0`，或沒有 `APPLICATIONINSIGHTS_CONNECTION_STRING`（專案沒開監控）時：不設 `TelemetryConfig`、不帶 header，行為與原本相同。
 - exporter 在第一次轉送時才於背景建立；建不起來就記 `FA_SDK_TELEMETRY_INACTIVE reason=exporter_unavailable`，span 檔照樣刪除、不送。此時 header 仍會帶，只影響服務端 span 的分組，不影響回合。
 - 讀檔與送出都在背景執行緒，回合不等它；失敗只記 `FA_SDK_TELEMETRY_DROPPED`，不重試、不改回合結果。exporter 關閉離線重送暫存（`disable_offline_storage`），不在磁碟累積。ingestion 端點連不上、exporter 建不起來兩種情況，真 runtime 回合都照常完成、span 檔都會清掉（見測試）。
-- 不動 `configure_observability=None`：一般 Python log 不會送進 App Insights；只有下方 [FA 自己的 Hosted log](#hosted-fa-logs) 那兩種前綴會送。送出／丟棄筆數等少量 SDKStats 指標會送到同一個 App Insights。
+- 不動 `configure_observability=None`：一般 Python log 不會送進 App Insights；只有下方 [FA 自己的 Hosted log](#hosted-fa-logs) 列出的幾種前綴會送。送出／丟棄筆數等少量 SDKStats 指標會送到同一個 App Insights。
 - `APPLICATIONINSIGHTS_STATSBEAT_DISABLED_ALL` **維持不設**（Neal 2026-10-05 決定），與平台預設一致：exporter 自己的 statsbeat（送到 Microsoft 擁有的端點，只有筆數與 metadata、不含內容）照 exporter 預設開啟，與官方 distro 相同。程式不在執行中改程序環境變數。
 
 **已知現象與限制**
@@ -7185,12 +7316,14 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
   ```
 
 <a id="hosted-fa-logs"></a>
-**FA 自己的 Hosted log（`FA_TIMING`、`RESIDENT_SDK_*`；2026-10-22，未部署）**
+**FA 自己的 Hosted log（`FA_TIMING`、`RESIDENT_SDK_*`、`FA_NATIVE_TURN_UNKNOWN`、`FA_MODEL_DIRECT_*`、`NATIVE_UPGRADE_CUT`、`FA_PRIVATE_MEMORY_*`、`FA_TEAM_MEMORY_*`；2026-10-22，記憶行 2026-10-24，未部署）**
 
 - 為什麼：冷回合比暖回合慢（依總協調轉來的 stage 送訊延遲調查，p50 約 6.7 秒對 2.5 秒；原始查詢未存入 repo），要先知道慢在 `sdk_process_start`、`sdk_session_resume`、`native_bind_*` 哪一段、常駐 SDK 為什麼被丟掉（`RESIDENT_SDK_DISCARDED reason=…`），再設計修正。這些行原本只在 Hosted stderr（`azd ai agent monitor` 看得到），Log Analytics 查不到。
+- 後加的三種（2026-10-22）：stage 每日 routine（RID `77d3e869…`）回合中途被 `gpt-6.1-sol` 限流後記成 `unknown`，但 Hosted 的 `FA_NATIVE_TURN_UNKNOWN code=…`、`FA_MODEL_DIRECT_RETRY`／`HTTP_FAILURE` 只在 stderr，查不到確切 failure code，也看不出 FA 自己的 429 重試有沒有參與；`NATIVE_UPGRADE_CUT` 的 `scan_ms` 要從 stage 補收（gate 7）。API 端的 `NATIVE_UPGRADE_CUT_API` 等行本來就在 API console log，不在這裡。
+- 後加的記憶行（2026-10-24）：`private` 模式 e2e（`fa-priv-1024`）的 `AppTraces` 只有 `FA_TIMING`、少數 `RESIDENT_SDK_CONTINUED` 與 SDK 事件，看不到 `FA_PRIVATE_MEMORY_UPDATE status=401 stage=embedding`、`status=skipped reason=embedding_unavailable`、`FA_PRIVATE_MEMORY_USAGE_UNREPORTED`、`FA_PRIVATE_MEMORY_INACTIVE` 與 Team 記憶的同類行，embedding 的 404／401 只能從 `FA_TIMING` 的耗時推測。`private` 模式從 VNet 外讀不到 Hosted logstream，所以這些行也要送。API 端的 `FA_MEMORY_RELAY_*`（`memory_relay`）本來就在 API console log，不在這裡。
 - 做法：Hosted 入口（`behavior_assistant_main.main`）在背景執行緒呼叫 `sdk_telemetry.attach_log_export()`，用官方 exporter 範例的接法（私有 `LoggerProvider`＋`BatchLogRecordProcessor`＋`AzureMonitorLogExporter`＋`LoggingHandler`），送到與 SDK span 相同、平台注入連線字串的 App Insights，`AppRoleName` 一樣是 `FOUNDRY_AGENT_NAME`。開關與 tracing 相同：`FA_SDK_TELEMETRY=0` 或沒有連線字串就不送；建不起來記 `FA_SDK_TELEMETRY_INACTIVE reason=log_exporter_unavailable`，不影響啟動。背景建立是為了不讓約 0.9 秒的 exporter 匯入（本機 Windows 量測）算進容器啟動；啟動後最前面約 1 秒內的行只在 stderr。
-- 只送哪些：handler 只掛在 `shared_context.behavior_timing`、`behavior_hosted`、`m2_copilot`、`native_resident`、`native_sdk` 五個 logger（不掛 root，也避免 exporter 自己的 azure-core log 迴圈），而且只放行**格式字串**以 `FA_TIMING ` 或 `RESIDENT_SDK_` 開頭、沒有例外資訊的行。`FA_TIMING` 只有 phase、雜湊過的回合 ID 或 binding ID、毫秒、outcome 與 Table 讀取次數；`RESIDENT_SDK_*` 只有固定原因碼或 hash 前 12 碼；都沒有對話內容、token 或個資。同一批 logger 的其他行（例如可能帶 runtime 錯誤文字的 `FA_MCP_SERVER_STATUS`、`FA_HOSTED_DISPATCH`）不送。這五個 logger 改成 INFO 等級，`RESIDENT_SDK_CONTINUED`（INFO，沿用常駐 SDK）才會送。
-- stderr 不變：logger 一旦有 handler，Python 就不再用 `logging.lastResort` 印到 stderr，所以同時把 `logging.lastResort` 本身掛上這五個 logger（只在 root 沒有 handler 時，也就是 Hosted 入口現況）；stderr 照舊只印 WARNING 以上。
+- 只送哪些：handler 只掛在 `shared_context.behavior_timing`、`behavior_hosted`、`m2_copilot`、`native_resident`、`native_sdk`、`native_turns`、`behavior_model_direct`、`native_environment_cut`、`behavior_private_memory`、`cosmos_private_memory`、`native_private_memory`、`native_team_memory`、`native_memory_candidate` 十三個 logger（不掛 root，也避免 exporter 自己的 azure-core log 迴圈），而且只放行**格式字串**以 `FA_TIMING `、`RESIDENT_SDK_`、`FA_NATIVE_TURN_UNKNOWN `、`FA_MODEL_DIRECT_`、`NATIVE_UPGRADE_CUT `、`FA_PRIVATE_MEMORY_` 或 `FA_TEAM_MEMORY_` 開頭、沒有例外資訊的行。記憶模組多數行寫成 `"%s status=…"`、事件名稱放在第一個參數，所以另外放行以 `%s ` 開頭、第一個參數**完全等於** `FA_PRIVATE_MEMORY_SEARCH`、`FA_PRIVATE_MEMORY_UPDATE`、`FA_TEAM_MEMORY_SEARCH`、`FA_TEAM_MEMORY_CREATE` 之一的行（`sdk_telemetry.LOG_EVENTS`；只是以事件名稱開頭的參數不算）。`FA_TIMING` 只有 phase、雜湊過的回合 ID 或 binding ID、毫秒、outcome 與 Table 讀取次數；`RESIDENT_SDK_*` 只有固定原因碼或 hash 前 12 碼；`FA_NATIVE_TURN_UNKNOWN` 只有固定 failure code 與例外類型名稱；`FA_MODEL_DIRECT_*`（`RETRY`、`HTTP_FAILURE`、`INACTIVE`）只有狀態碼、通過識別字檢查的 provider 代碼與 deployment 名稱、次數、等待毫秒與 request 的項目數；`NATIVE_UPGRADE_CUT`（ADR-0009 gate 7）只有固定代碼、次數、毫秒、RID 前 8 碼與 Hosted session ID；`FA_PRIVATE_MEMORY_*`／`FA_TEAM_MEMORY_*` 只有 HTTP 狀態碼、固定的 status／stage／reason／mode 代碼、例外類型名稱（`_exception_type` 的固定對照或類別名稱）、筆數與 token 數、官方 kind 名稱的計數（其他 kind 記成 `unknown`）、通過 `_OFFICIAL_ID` 檢查的 `update_id`／`memory_id`，以及 RID 前 8 碼；都沒有對話內容、記憶內容、scope、token 或個資。同一批 logger 的其他行（例如可能帶 runtime 錯誤文字的 `FA_MCP_SERVER_STATUS`、`FA_HOSTED_DISPATCH`、`FA_NATIVE_HTTP`，以及記憶 logger 上的 `FA_NATIVE_ASSEMBLY_PARTIAL`）不送。這十三個 logger 改成 INFO 等級，`RESIDENT_SDK_CONTINUED`（INFO，沿用常駐 SDK）才會送。
+- stderr 不變：logger 一旦有 handler，Python 就不再用 `logging.lastResort` 印到 stderr，所以同時把 `logging.lastResort` 本身掛上這十三個 logger（只在 root 沒有 handler 時，也就是 Hosted 入口現況）；stderr 照舊只印 WARNING 以上。
 - 讀回（`log-fa-stage`／`log-fa-dev` 的 Log Analytics；換成要查的 Agent 名稱）：
 
   ```kusto
@@ -7205,6 +7338,13 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
   AppTraces
   | where AppRoleName == "fa-stage-a" and Message startswith "RESIDENT_SDK_"
   | summarize n = count() by Message
+
+  AppTraces
+  | where AppRoleName == "fa-stage-a"
+      and (Message startswith "FA_PRIVATE_MEMORY_" or Message startswith "FA_TEAM_MEMORY_")
+  | extend event = tostring(split(Message, " ")[0]), status = extract(@"status=(\S+)", 1, Message),
+           stage = extract(@"stage=(\S+)", 1, Message), reason = extract(@"reason=(\S+)", 1, Message)
+  | summarize n = count(), last = max(TimeGenerated) by event, status, stage, reason
   ```
 
   同一回合用 `job_id` 串起（native 回合是 RID sha256 前 12 碼）。API 的 `api_*` 行在部署
@@ -7217,7 +7357,7 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
 
 - 容器內 OpenTelemetry Collector＋`azuremonitorexporter`：Microsoft 官方 FAQ 寫明這個 exporter 是社群貢獻、「不受 Microsoft 支援」，還要多放大型執行檔、多管一個程序。
 - Azure Monitor OTLP 直收：要新建 DCR、Entra 權限等雲端資源，列為備案、不實作。
-- 打開 agentserver 內建 distro：只涵蓋 Python 程序，收不到 runtime 子程序的回合 span，還會把 Python log 一併送出（FA 只送上面過濾過的兩種前綴）。
+- 打開 agentserver 內建 distro：只涵蓋 Python 程序，收不到 runtime 子程序的回合 span，還會把 Python log 一併送出（FA 只送上面過濾過的幾種前綴）。
 
 **部署與驗收**
 
@@ -7243,7 +7383,7 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
 - 測試（本機，真 SDK 1.0.13＋runtime 1.0.83＋離線模型替身＋本機假 ingestion 端點，沒有雲端呼叫）：`python -X utf8 -m pytest .\tests\shared_context\test_sdk_telemetry.py -q`，19 passed（10-04 當時的數字；之後另加 3 個 log export 測試，見下方 Hosted log 那一項）。涵蓋：預設（不設旗標）就打開、明確 `0`／沒有連線字串／讀不懂的值都不送且前兩者不記 warning；不設旗標又沒有連線字串時真 runtime 回合照常完成、不帶 header、不產生 span 檔；ingestion 連不上與 exporter 建不起來時真 runtime 回合照常完成、span 檔清掉；真 runtime 經正式 `DirectResponses` 送模型（每個請求帶回合 traceparent）、Responses 線路帶／不帶原始 `reasoning_text`、gateway 自己的 HTTP 路徑（同舊 assistant 經 API 的路徑）帶／不帶原始推理、`watch_model_response` 各種回應（串流、已讀、壓縮、旗標關閉）、native 路徑（請求帶的 traceparent → 收單記住 → 背景回合 → SDK context 與模型 sender）、沒有 OpenTelemetry 的程序。
 - sync／onboarding ENV：`python -X utf8 -m pytest .\tests\shared_context\test_endpoint_versions.py -q -k tracing`，5 passed（sync 與「＋」複製都不加旗標、明確 `0` 會保留、overlay 可設 `0`／`1`、其他值在寫入前拒絕）。
 - 唯讀查詢 `appi-fa-stage`（10-04）與一次使用者身分的極小 Responses 呼叫（見上）。未部署、未在 Hosted 實測。
-- [FA 自己的 Hosted log](#hosted-fa-logs)（以 main `1bb3da33` 為基準）：`sdk_telemetry.attach_log_export`／`export_logs`／`_exportable`、`behavior_assistant_main.main`；log 行來源 `behavior_timing.elapsed_timing`、`native_resident`、`m2_copilot`、`native_sdk`、`behavior_hosted`。本機套件 azure-monitor-opentelemetry-exporter 1.0.0b58、opentelemetry-sdk 1.45.0、opentelemetry-instrumentation-logging 0.66b0（經 agentserver-core → microsoft-opentelemetry 間接帶入，manifest 沒有直接固定；舊版沒有新 handler 時改用 SDK 內建的）。測試：`python -X utf8 -B -m pytest tests/shared_context/test_sdk_telemetry.py -q -k log_export`，3 passed（本機假 ingestion 端點：只收到 `FA_TIMING` 與 `RESIDENT_SDK_CONTINUED`、內容 canary 不出現、handler 只在五個 logger；exporter 建不起來時回 None、記 warning、不掛任何 handler；另一個乾淨子程序確認開與關時 stderr 的 FA 行相同）。部署後把映像實際解析到的這三個套件版本讀回記進驗收紀錄。未部署、未在 Hosted 實測。
+- [FA 自己的 Hosted log](#hosted-fa-logs)（以 main `1bb3da33` 為基準）：`sdk_telemetry.attach_log_export`／`export_logs`／`_exportable`、`behavior_assistant_main.main`；log 行來源 `behavior_timing.elapsed_timing`、`native_resident`、`m2_copilot`、`native_sdk`、`behavior_hosted`、`native_turns._run_started`、`behavior_model_direct.DirectResponses`、`native_environment_cut`；記憶行（以 main `2358d87a` 為基準）`behavior_private_memory.PrivateMemory`、`cosmos_private_memory.CosmosPrivateMemory`、`native_private_memory`、`native_team_memory.NativeTeamMemory`、`native_memory_candidate`。本機套件 azure-monitor-opentelemetry-exporter 1.0.0b58、opentelemetry-sdk 1.45.0、opentelemetry-instrumentation-logging 0.66b0（經 agentserver-core → microsoft-opentelemetry 間接帶入，manifest 沒有直接固定；舊版沒有新 handler 時改用 SDK 內建的）。測試：`python -X utf8 -B -m pytest tests/shared_context/test_sdk_telemetry.py -q -k log_export`，3 passed（本機假 ingestion 端點：只收到 `FA_TIMING`、`RESIDENT_SDK_CONTINUED`、`FA_NATIVE_TURN_UNKNOWN`、`FA_MODEL_DIRECT_RETRY`／`HTTP_FAILURE`、`NATIVE_UPGRADE_CUT`，以及 6 行記憶狀態（`FA_PRIVATE_MEMORY_UPDATE status=401 stage=embedding`、Team 的 `embedding_unavailable` 與 404、`INACTIVE`、`USAGE_UNREPORTED`），同 logger 的其他前綴、INFO 行、未列 logger 的同名前綴、第一個參數不完全等於事件名稱的 `%s` 行、帶例外資訊的記憶行與 API 端 `memory_relay` logger 都不送、內容 canary 不出現、handler 只在十三個 logger；把「完全等於」改成「以事件名稱開頭」時這個測試會失敗（2026-10-24 突變檢查）；exporter 建不起來時回 None、記 warning、不掛任何 handler；另一個乾淨子程序確認開與關時 stderr 的 FA 行相同）。部署後把映像實際解析到的這三個套件版本讀回記進驗收紀錄。未部署、未在 Hosted 實測。
 
 ## stage 環境與 CI/CD（ADR-0008）
 
@@ -10390,7 +10530,9 @@ toolbox `fa-connector-{team}-{connector}`，不占上面 Team MCP 的 8 個名�
 `2025-04-01-preview` PUT 建 `OAuth2` connection（client ID 讀 `FA_CONNECTOR_TEAMS_CLIENT_ID`）；secret 不進回應、
 metadata、摘要或 log。防重送、`expected_version`、錯誤碼與 Team MCP 相同；另有 422
 `TEAM_CONNECTOR_SECRET_REQUIRED` 與 409 `TEAM_CONNECTOR_TOOLBOX_TAKEN`（這個 toolbox 的現行版本不是 FA 為這個 Team 與
-connector 寫的，不覆寫）。所有本地拒絕都在寫 connection 之前；這個 request ID 的新 secret 已寫進 connection、
+connector 寫的，不覆寫），以及 422 `TEAM_CONNECTOR_PRIVATE_NETWORK`：`FA_NETWORK_MODE=private`（ADR-0010；沒設或其他值
+都當 `public`）時，registry 標 `private_network=False` 的 connector（Work IQ）不能加入或以 `enabled=true` 變更，停用仍可，
+在任何 Foundry 讀寫之前拒絕。所有本地拒絕都在寫 connection 之前；這個 request ID 的新 secret 已寫進 connection、
 Foundry 卻拒絕建版本時，回 503 `TEAM_MCP_OUTCOME_UNKNOWN`（工作台顯示「用原編號重送」），不當成單純拒絕；
 同一 request ID 重送不再寫 secret，只重建版本；這次重送的版本若又被明確拒絕，回明確的 422 `TEAM_MCP_REFUSED`（或 403 `TEAM_MCP_FORBIDDEN`），不再回 503——只有在同一次呼叫裡寫了 secret 才回 503。
 
@@ -10712,9 +10854,41 @@ Neal 決策：「工具列不出來時，這一回合少那個工具照常跑，
   `errors[].name` 對 grant 的 server label），清單裡的來源依自己那筆的錯誤文字記 `upstream_auth` 或 `source_error`；同一個 toolbox
   裡不在清單的來源只是跟著一起列不出，記中性的 `source_error`（工作台：「工具來源回報錯誤」），不沿用別的來源的「上游驗證失敗」。
   沒有逐來源清單時維持整個 toolbox 一個分類。
-- **不重試、不記住失敗**：每回合只列一次；沿用既有的「少工具再列一次」（kept 清單少了 capture 的工具時）若那次再列失敗，
+- **不重試**：每回合只列一次；沿用既有的「少工具再列一次」（kept 清單少了 capture 的工具時）若那次再列失敗，
   依同一條規則處理（列不出 → 只少這個 toolbox；明確拒絕 → 拒絕回合）；再列成功但仍少工具，照舊 `captured_tool_missing` 拒絕。
-  失敗不寫進 `_Toolbox.listed`，下一回合重新列。
+  失敗不寫進 `_Toolbox.listed`；失敗後短暫不重列見下一項。
+- <a id="toolbox-list-backoff"></a>**列失敗後 60 秒內不重列（2026-10-23，CODE/offline，未部署）**：dev r4 量測 fa-context-b 每個 warm
+  回合都重列 `fa-connector-team-one-teams:2`、每次回 500／`-32006`（1,095–1,301 ms），`native_bind_capabilities` 從約 120 ms 變成
+  1,505–1,655 ms。改法：
+  - 資料形狀：`_Toolbox.failed = (monotonic 到期時間, 那次的失敗物件)`，跟 `listed` 放在同一份 kept 清單（key `(project endpoint, toolbox, 實際版本)`，
+    最多 32 個）。隔離靠「每個 Hosted 程序一個 provider＝一位 Agent 的身份」，不是靠 toolbox 名稱（`fa-org-tools` 沒有 Team），
+    所以不跨 Agent、也就不跨 Team；讀不到 `default_version` 的回合本來就不保留任何東西，也不記失敗。到期時間＝`LIST_FAILURE_BACKOFF_SECONDS`（60 秒）。
+  - 只記兩種：列不出（有 `unavailable` 分類）與要連線（`_ConnectionNeeded`，consent 或撤銷）。明確拒絕照舊每回合拒絕、不記，
+    而且會清掉先前記住的（例如 Connect 卡的重列被明確拒絕，下一回合會重新列）。這台 VM 自己的 token 拿不到
+    （`_UNAVAILABLE_STAGES["token"]`＝`identity_unavailable`）不是 toolbox 的問題，也不記：一次短暫的 MI token 失敗不會讓工具消失 60 秒。
+  - 第一次失敗的回合跟以前一樣（列一次、降級、記 log）。之後 60 秒內的回合：若有進行中的預熱，先等它（預熱成功就照常綁工具）；
+    沒有預熱或預熱也失敗，就不列、直接用記住的失敗：工具描述、`unavailable_sources` 的 `reason`、
+    `FA_NATIVE_TOOL_SOURCE_UNAVAILABLE` 那行都跟第一次相同。是否在 60 秒內，看回合開始（等預熱之前）那一刻：等的時候
+    剛好過期，也不再自己列（Connect 重列成功在等的時候清掉了它則照常列）。到期後下一回合重新列；任何一次列成功（含預熱）就清掉。
+  - 要連線的照舊走 Connect 卡。60 秒內出的卡沿用記住的那次失敗，所以卡上的連結最多是 60 秒前拿到的；按「我連好了，繼續」
+    一定重新列、不看 backoff。重列成功時，清掉同一個 provider 裡所有記住的「要連線」（其他 toolbox、其他版本），所以同一位 Agent
+    的其他對話與沒有卡的回合（Teams relay、Agent 對 Agent、routine）下一回合就重新列，不會再顯示「未連線」最多 60 秒。
+    重列列不出（例如 503）照同一規則記住；重列被明確拒絕則拒絕回合、不記。
+  - 預熱不受 backoff 影響，照舊在使用者打字時列（不在回合的關鍵路徑上），成功就恢復；預熱失敗不開始 backoff，所以預熱失敗後、
+    沒有記住失敗的第一個回合仍自己列一次。
+  - 60 秒的理由：r4 回合間隔 18–37 秒，60 秒蓋得住連續對話；恢復最多等 60 秒（打字預熱或 Connect 卡更快），不用重啟。
+    最壞情況每 60 秒付一次失敗的列表；60 秒內的回合最多只等完那次進行中預熱剩下的時間，不會等完再自己列一次。
+  - SDK-first：固定版 Copilot SDK 1.0.13 不經手 toolbox 列表；Hosted 沒裝 `azure-ai-projects`；FA 的 httpx transport 是 `retries=0`。
+    都沒有「列表失敗後退避」可用，所以加在既有的 kept 清單上。
+  - 觀測：跳過列表時記 `FA_TIMING native_bind_toolbox_list_backoff`（同一個回合 ID）。`FA_TIMING ` 在 #953 的 `LOG_PREFIXES`、
+    `shared_context.behavior_timing` 在 `LOG_LOGGERS`，所以會送到 App Insights；`FA_NATIVE_TOOL_SOURCE_UNAVAILABLE`／
+    `NATIVE_TOOLBOX_FAILED`（`shared_context.native_toolbox` logger）仍不匯出。
+  - 測試：`tests/shared_context/test_native_toolbox_unavailable.py`（假時鐘、不 sleep）：60 秒內第二回合不送 `tools/list`、
+    原因相同；常數是 60 秒；到期重列；預熱在 backoff 內仍列且成功即恢復；回合在 backoff 內仍等進行中的預熱、預熱成功就綁工具；
+    等慢的預熱時 backoff 過期、預熱也逾時，回合沿用記住的 `network`、不再列；預熱失敗不開始 backoff；要連線也記；
+    Connect 重列成功清掉兩個 toolbox 記住的要連線；Connect 清掉、但仍未連線的 toolbox 下一回合列一次又記住、再下一回合不列；重列被明確拒絕（403）不記、下一回合重列；
+    重列 503 記成 `service_error`、下一回合不列；token 失敗不記；別的 toolbox、別的 provider（別的 Agent）不受影響。
+  - 沒改：kept 清單少了 capture 工具時的「再列一次」若一直失敗，仍每回合付一次（不在本項範圍）。
 - **工作台**：見 [工作台 README](web_test_console/README.md#tool-source-unavailable)。
 - **混版注意**：降級回合的 receipt 帶 `unavailable_sources`；舊版 API／工作台（`WireModel` `extra=forbid`、schema
   `fa-native-assembly-v1`）會拒收那則回條，所以 Hosted、API、工作台要一起出版。沒有降級的回合不輸出這個欄位，回條與舊版相同。
@@ -16126,6 +16300,32 @@ Team note 沒有產生，skill 草稿是乾淨的。這三筆**保留當證據�
 - live 探針 L1～L5 併入下一包 dev 探針（第 10 節 G-M），部署後由 fdbb 執行；L5（暫時狀態）的 H 由總協調判讀。因為上面兩處和計畫不同，判讀依以下字串：
   - L2：用 GET item 讀新 note，內容含 `corrects <L1 的完整 memory_id>`，L1 的 note 內容不變；
   - L3：同次讀到兩則時，log 有 `FA_TEAM_MEMORY_SEARCH omitted={"superseded": 1}`。
+
+### `private` 模式的 Cosmos 記憶：Hosted 端（ADR-0011 第 2 階段，CODE/offline，未部署）
+
+[ADR-0011](../../docs/adr/0011-private-mode-cosmos-memory.md) 第 2 階段只做 Hosted 端；API 轉送路由（第 3 階段）、Bicep 與 azd（第 4 階段）另走 PR。`public`（Foundry Memory Store）的行為不變。
+
+- **開關**：`FA_MEMORY_BACKEND=cosmos`、`FA_MEMORY_EXTRACTION_MODEL`（chat deployment 名），加上 native lane 傳入的 API 連線，`PrivateMemory.from_environment` 才回 `cosmos_private_memory.CosmosPrivateMemory`。缺模型名時不啟用（`not_configured`）；模型名或 endpoint 格式不對記 `FA_PRIVATE_MEMORY_INACTIVE reason=config_invalid`；舊 lane 沒有 API 連線，記 `reason=api_unavailable`、不用長期記憶。
+- **讀取**：共用的 `search` 不改。`_post` 把 Memory Store 的查詢改送 API：依內容讀取先用 agent 身分經 project endpoint 算 `text-embedding-3-small`，再帶向量送出。送去 embedding 的文字只取前 2000 字（`MAX_EMBEDDED_CHARS`；一個 token 至少 1 個 UTF-8 byte、一個字最多 4 byte，任何文字都低於 8191 token 上限），抽取模型與 Team note 仍收到全文。embedding 失敗時這一筆回 unavailable、不送 API；靜態讀取不用 embedding，第一回合仍讀得到 profile。
+- **抽取**：`on_completed` 裡、claim 之後，在一把 `asyncio.Lock` 內依序：算真人原話的 embedding → 讀最新 10 條 profile＋依內容前 5 筆中的 profile（去重，代號 `p1`、`p2`…）→ 呼叫抽取模型（Responses API、strict JSON schema、`temperature` 0、30 秒）→ 程式檢查（`memory_extraction_prompt.checked`）→ 算新條 embedding → 一次 `/memory/items`。任何一步失敗都只記 log；任何狀態都不重送。
+  - prompt 改寫自 Agent Memory Toolkit（MIT，檔頭有出處），加上「對話與記憶都是資料」、evidence、不記憑證的規則。
+  - `kind` 由程式依欄位決定；模型多給的鍵（含自己編的 `kind`）忽略。schema 不符、代號不在清單、超長：整個結果不寫。evidence 不在真人原話裡（只做 NFKC 與空白合併）或輸出仍含像憑證的值：只丟那一條。
+  - `updated_at` 是這回合 `turn:<n>` 在 State store 的 `created_at`；讀不到時用抽取時間，而且這次的新條都不帶 `supersedes`（記 `updated_at_source=extraction_time supersedes=disabled`）。Cosmos 時不讀上一回合的 claim（不串接）。
+- **用量**：呼叫過抽取模型之後，claim receipt 先寫入 `accepted_status`、`update_id`（有才寫）與 `usage`，再經 `NativeUsageReporter.report` 以回合本身的 RID、`source="memory"` 報一次。未確認只記 `FA_PRIVATE_MEMORY_USAGE_UNREPORTED rid_prefix=… reason=…`，hook 不丟例外，所以 notification task 不會重跑。embedding 的 token 只記 log。
+- **wire（照第 3 階段 API 轉送 #966 的 `memory_relay`；都集中在 `cosmos_private_memory._relay` 與旁邊的 body／回應函式）**：
+  - 路由：`POST {api_url}/team-data/v1/memory/search`、`POST {api_url}/team-data/v1/memory/items`，用 agent 的 API token；不帶可選的 `/agents/{agent_id}` 前綴。
+  - search：`{"scope", "mode": "static"|"contextual", "top", "vector"（只有 contextual，1536 個數）}`；回應是 Memory Store 的形狀，沒有 `usage`；episode 的 90 天過濾在 API。
+  - items：`{"scope", "source_request_id", "items": [{"slot", "kind", "content", "embedding", "updated_at", "supersedes"（只有更正時，值是舊條的 memory_id）}]}`；私人 slot 是 `p0`～`p2`（`user_profile`）與 `e0`（`chat_summary`），Team note 是一條 `note`、`updated_at` 是寫入當下。
+  - items 回應：HTTP 200，`{"update_id"（Team note 為 null）, "items": [{"slot", "id", "status": 201|409}], "corrections": [{"slot", "supersedes", "result": "superseded"|"skipped"}]}`；整批 409 表示這個 RID 已寫過，狀態記 `409`。
+  - 503 `MEMORY_BACKEND_UNAVAILABLE` 當成回應遺失：讀取記 `http_error`（unavailable，ADR-0011 §7；`transport_error` 只用於連線失敗與逾時），寫入記 `unsent_or_unknown`；其他 HTTP 狀態：讀取是 `http_error`；寫入的 4xx（例如 403、422）是確定拒收，照原值記下，5xx（入口的 502／504、沒有 `MEMORY_BACKEND_UNAVAILABLE` 的 503）或形狀不對的 200 可能已寫入，記 `unsent_or_unknown`。都不重送。
+- **部署順序**：`AgentTurnUsageReport.source` 在 `"model"` 時不序列化，回合報告的位元組不變；送 `source="memory"` 的 Hosted 要在認得 `source` 的 API（第 3 階段）之後部署，而只有 `cosmos` 會送，`cosmos` 本來就要第 3 階段的路由。
+
+#### Verified against：ADR-0011 第 2 階段
+
+- `test_cosmos_private_memory.py`：抽取輸出檢查、wire 的 literal JSON（search、items、Team note、模型與 embedding 請求、兩種 token 分開）、一把鎖（兩個抽取同時開始時第二個讀得到第一個寫的條）、回合完成時間與讀不到時的行為、讀 profile 或 embedding 失敗時不呼叫模型也不報用量、模型呼叫後沒寫入仍存並報用量、用量報告未確認（409／422／503／逾時）只送一次並留在 claim、寫入任何回應都只送一次。
+- `test_memory_backend_contract.py`：契約測試加跑 `cosmos`（API 轉送＋embedding＋抽取模型替身），兩個後端各 41 項。
+- `test_native_sdk.py`：`source="model"` 的報告 JSON 不含 `source`；`report()` 送 `source="memory"`，409／422／503 照 `__call__` 的規則拒收。
+- 只有離線替身；沒有真模型、真 API、真 Cosmos。
 
 ### 由真人選擇新環境接續原對話
 

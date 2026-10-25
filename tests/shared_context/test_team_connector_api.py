@@ -228,6 +228,48 @@ def test_the_first_enable_needs_the_secret_and_the_environments_app(connectors):
     assert c.foundry.puts == [] and c.foundry.created == []
 
 
+@pytest.mark.parametrize("mode", [None, "public"])
+def test_public_or_unset_network_mode_still_adds_work_iq(connectors, mode):
+    c = connectors
+    if mode is not None:
+        c.environ["FA_NETWORK_MODE"] = mode
+    applied = post(c, change(c, "71" * 16))
+    assert applied.status_code == 200, applied.text
+    assert (len(c.foundry.puts), len(c.foundry.created)) == (1, 1)
+
+
+def test_private_network_mode_refuses_adding_or_reenabling_work_iq_but_still_disables(connectors, caplog):
+    # ADR-0010: Work IQ is not supported in a network-isolated project. An existing grant is never deleted.
+    c = connectors
+    assert post(c, change(c, "72" * 16)).status_code == 200
+    c.environ["FA_NETWORK_MODE"] = "private"
+    before = (len(c.foundry.puts), len(c.foundry.created))
+    with caplog.at_level(logging.WARNING, logger="shared_context.team_connector"):
+        for body in (change(c, "73" * 16), change(c, "74" * 16, read="always", secret=None)):
+            refused = post(c, body)
+            assert refused.status_code == 422 and code(refused) == "TEAM_CONNECTOR_PRIVATE_NETWORK"
+            assert refused.headers["cache-control"] == "no-store"
+    assert "TEAM_CONNECTOR_PRIVATE_NETWORK_REFUSED connector=teams" in caplog.text and SECRET not in caplog.text
+    assert (len(c.foundry.puts), len(c.foundry.created)) == before
+    disabled = post(c, change(c, "75" * 16, enabled=False, secret=None))
+    assert disabled.status_code == 200 and disabled.json()["connector"]["settings"]["enabled"] is False
+    reenable = post(c, change(c, "76" * 16, secret=None))
+    assert reenable.status_code == 422 and code(reenable) == "TEAM_CONNECTOR_PRIVATE_NETWORK"
+    assert c.foundry.toolboxes[TOOLBOX]["versions"][-1]["version"] == "v2"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_private_network_mode_refuses_a_work_iq_secret_before_any_foundry_read(connectors, monkeypatch, enabled):
+    # A first-ever enabled=false with a secret would otherwise write the OAuth2 connection.
+    c = connectors
+    c.environ["FA_NETWORK_MODE"] = "private"
+    for name in ("request_version", "read_default_version", "read_toolbox", "connection"):
+        monkeypatch.setattr(c.foundry, name, lambda *args, **kwargs: pytest.fail("no Foundry read before the guard"))
+    refused = post(c, change(c, "77" * 16, enabled=enabled, expected=None))
+    assert refused.status_code == 422 and code(refused) == "TEAM_CONNECTOR_PRIVATE_NETWORK"
+    assert (c.foundry.reads, c.foundry.puts, c.foundry.created, c.foundry.arm) == (0, [], [], {})
+
+
 @pytest.mark.parametrize("status", [400, 403])
 def test_a_version_refused_after_this_requests_secret_is_saved_asks_for_the_same_request_again(connectors, status):
     c = connectors

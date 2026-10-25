@@ -292,6 +292,8 @@ class NativeTurnControl:
     sent_appends: dict[str, tuple[str, object]] = field(default_factory=dict)
     # ADR-0009 M9: the RID record names ``adopted_from``; its SDK start pin is the accepting image's (check_start_capture).
     adopted: bool = False
+    # (guessed first_turn, running recall) the runtime started before allocation (executor ``start_recall``).
+    recall: tuple[bool, asyncio.Future] | None = None
 
     def stop_requested(self):
         return self.cancelled or self.timeout or self.shutdown or self.fenced
@@ -1474,7 +1476,10 @@ class NativeTurnRuntime:
                 if (400 <= refusal.status < 500 or code == "AGENT_VERSION_FOLLOWING") and code != "NATIVE_RID_CONFLICT":
                     refusal.body["error"]["not_dispatched"] = True
                 raise
-            cid = request.command.conversation_id or request.new_conversation_id or "native-" + uuid4().hex
+            # A routine run opens the conversation its origin names (the API chose it before saving the intent).
+            cid = (request.command.conversation_id or (
+                request.routine.conversation_id if isinstance(request, NativeRoutineSubmit) else request.new_conversation_id)
+                or "native-" + uuid4().hex)
             receipt = NativeReceipt(
                 state_profile=request.state_profile,
                 agent_id=self.identity.agent_id, hosted_session_id=self.identity.session_id,
@@ -2369,12 +2374,22 @@ class NativeTurnRuntime:
                 from .native_continuations import stop_requested
                 if await stop_requested(self, original.value.receipt):
                     return await self._unknown(original, "NATIVE_TURN_CANCELLED")
+            start_recall = getattr(self.executor, "start_recall", None)
+            if start_recall is not None:
+                # Memory recall needs only this receipt, so it overlaps allocation. Whether the static profile is owed
+                # (no SDK history) is known only after it: a new CID has none, a follow-up almost always has some.
+                # shortcut: native_start (slot, RID read, "started" CAS) still runs before it; earlier means both entry paths.
+                from .sdk_telemetry import turn_context
+                guess = original.value.receipt.command.conversation_id is None
+                with turn_context(rid):  # its tasks join this turn's trace, as the executor's own phases do
+                    recall = start_recall(original.value.receipt, first_turn=guess)
+                control.recall = None if recall is None else (guess, recall)
             original, meta, previous = await self._allocate_timed(original)
             control.adopted = original.value.adopted_from is not None
             control.checkpoint_turn = self._checkpoint_turn(original.value.receipt, meta)
             control.retain_delegation = lambda accepted, bound=original: self._retain_delegation(bound, accepted)
             watcher = asyncio.create_task(self._observe_control(signals, original, control))
-            # Phases recorded inside the SDK turn (memory recall, sdk_process_start) inherit this turn's timing ID.
+            # Phases recorded inside the SDK turn (sdk_process_start) inherit this turn's timing ID; start_recall sets its own.
             with work_timing(timing_id(rid)), phase_timing("native_executor"):
                 outcome = await self.executor(original.value.receipt, self._scope(meta), previous, control)
             if watcher.done():
@@ -2439,6 +2454,9 @@ class NativeTurnRuntime:
                                            delegation=delegation, assembly=assembly)
             return await self._unknown(current, code, usage=usage, delegation=delegation, assembly=assembly)
         finally:
+            if control.recall is not None:  # every path; a no-op once _run settled it, the stop for turns that ended earlier
+                control.recall[1].cancel()
+                await asyncio.gather(control.recall[1], return_exceptions=True)
             if watcher is not None:
                 watcher.cancel()
                 await asyncio.gather(watcher, return_exceptions=True)

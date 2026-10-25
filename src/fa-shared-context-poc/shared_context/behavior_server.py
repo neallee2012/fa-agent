@@ -803,8 +803,12 @@ def _lifespan(app, composition, validate):
         clock = getattr(_app.state, "native_routine_clock", None)
         # The upgrade reconciler (ADR-0009 phase 6a) starts only behind its flags; the daily patrol is off from 2d-ii.
         patrols = [task for task in (getattr(_app.state, "native_upgrade_reconciler", None),) if task is not None]
+        # ADR-0011: the process-wide Cosmos memory client, warmed before the first turn; peers share it.
+        memory = getattr(_app.state, "memory_cosmos", None)
         try:
             validate()
+            if memory is not None:
+                await asyncio.to_thread(memory.warm)
             if getattr(_app.state,"instruction_runner",False):composition.resume_instructions()
             if composition._peer_router is not None:
                 await composition._peer_router.prepare()
@@ -827,6 +831,8 @@ def _lifespan(app, composition, validate):
             for peer in composition._peers.values():
                 if peer.assistant is not None:
                     await peer.assistant.provider.aclose()
+            if memory is not None:
+                await asyncio.to_thread(memory.close)
             composition.close()
     app.router.lifespan_context = lifespan
     app.state.composition = composition
@@ -912,6 +918,8 @@ def application(composition: ServerComposition, *, preactivation=False):
             _health(app, preactivation=False)
             from .native_hitl_api import install_native_hitl_routes
             install_native_hitl_routes(app, composition)
+            from .memory_relay import install_memory_relay_routes
+            install_memory_relay_routes(app, composition)
             from .team_skills_api import install_team_skills_routes
             install_team_skills_routes(app, composition)
             from .team_mcp_api import install_team_mcp_routes

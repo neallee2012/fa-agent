@@ -363,6 +363,37 @@ def test_fresh_startup_and_signed_a_b_routes_do_not_require_a_fake_bundle(fresh_
     assert h.source.requests == h.backup.requests == []
 
 
+def test_cosmos_memory_routes_reach_peers_and_share_one_warmed_client(fresh_case, signing_key, monkeypatch, caplog):
+    # ADR-0011 phase 3: installed in every app built by application(); one client, warmed and closed by the owner.
+    from shared_context import memory_relay
+    from test_memory_relay import FakeContainer
+    h = fresh_case
+    initialize(h)
+    import shared_context.behavior_server as server
+    from test_native_session_prepare_api import project_client
+    project_client(monkeypatch, get_session=lambda *_a: None, list_sessions=lambda *_a, **_k: iter(()))
+    monkeypatch.setattr(server, "load_configuration", lambda: h.config)
+    monkeypatch.setattr(server, "build_server", lambda config: build_server(config, **h.options))
+    monkeypatch.setenv("FA_MEMORY_BACKEND", "cosmos")
+    monkeypatch.setenv("FA_COSMOS_ENDPOINT", "https://fa-memory-test.documents.azure.com:443/")
+    monkeypatch.setattr(memory_relay, "_SHARED", {})
+    fake, built, closed = FakeContainer(), [], []
+    monkeypatch.setattr(memory_relay.SharedCosmos, "container",
+                        lambda self: built.append(self) or memory_relay.CosmosMemoryContainer(fake))
+    monkeypatch.setattr(memory_relay.SharedCosmos, "close", lambda self: closed.append(self))
+    app = server.create_production_app()
+    with TestClient(app) as client:
+        assert fake.calls == [("read",)] and "FA_MEMORY_RELAY_WARMUP status=ready" in caplog.text
+        headers = h.headers(signing_key)
+        for prefix in ("", "/agents/" + h.inputs.peer_agent_id):
+            # A human token reaches the route (not 404) and is refused before any read.
+            human = client.post(prefix + memory_relay.PREFIX + "/search", headers=headers,
+                                json={"scope": "fap1-" + "0" * 48, "mode": "static", "top": 5})
+            assert human.status_code == 403 and human.json()["error"]["code"] == "MEMORY_AGENT_ONLY", human.text
+    assert fake.calls == [("read",)]
+    assert len(memory_relay._SHARED) == 1 and set(built) == set(closed) == set(memory_relay._SHARED.values())
+
+
 def test_missing_standing_policy_and_legacy_bootstrap_do_not_bypass_startup(fresh_case):
     h = fresh_case
     initialize(h)

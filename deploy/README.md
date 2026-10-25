@@ -798,6 +798,9 @@ external／PNA、監控與現有設定；若 what-if 要修改其他資源或不
 先停下重新確認。**目前沒有獨立的 reconcile 腳本／entrypoint**；
 不得把重跑 `foundation.bicep` 冒充 environment-only 修復，因它還會寫
 Storage、ACR、VNet、RBAC 與 Foundry connection。
+在 azd 建的 `FA_NETWORK_MODE=private` 環境單獨重跑 `foundation.bicep` 時，必須傳
+`networkMode=private`（及原本的 `apiSubnetNatEgress`），否則這次 VNet 更新會拿掉
+`snet-agents` 與 192.168.97.0/24（[ADR-0010](../docs/adr/0010-azd-private-network-option.md)）。
 單純更新 tag 或 no-op PUT 能否觸發平台恢復未經驗證，不把它寫成保證有效的修復。
 
 本次實際使用 `az deployment group export` 匯出
@@ -1095,7 +1098,7 @@ PR（#891）在 `stage.json` 打開，合併到 main 不部署，帶 2d-ii 的 r
    `NATIVE_GROUP_ACTIVITY_RETIRED_MEMBER`，其他成員的回合照常可讀；它自己的 Agent token 在入口被拒（身分已停用）。
    重跑（同一或新的 request ID、或 ack 遺失後）回原 tombstone，不寫第二次。
 2. **（選用）刪 Foundry 端。** 加 `--delete-foundry`：刪掉 Foundry agent 本身（`agents.delete(name, force=True)`），
-   以及這位 Agent 自己身分在 onboarding role scope 上的 FA 兩個角色指派（Foundry User、Cognitive Services OpenAI User）。
+   以及這位 Agent 自己身分在 onboarding role scope 上的 FA 兩個角色指派（Foundry User、Cognitive Services OpenAI User）；`FA_ONBOARDING_ACCOUNT_ROLE=true`（azd `private`＋Cosmos）時另含 Foundry 帳號範圍的那一筆 Cognitive Services OpenAI User。在 API 容器內用 API 身分跑時，帳號那筆的刪除會被委派條件拒絕（403，回報 `partial`），由真人用 `az role assignment delete --ids` 刪；在自己電腦上跑時要設同一個 `FA_ONBOARDING_ACCOUNT_ROLE`，帳號那筆才會列為目標。
    **409 說明：** 不帶 `force` 時，只要有任何版本還有 session，服務就回 409（deletion-blocking sessions）；
    `force=true` 會連同所有版本與 session 一起刪（2026-10-15 dev 的 `fa-agent-cc96…` 就是這樣刪掉 85 個版本、56 個 session）。
    目標只取自這位已退役 Agent 的原註冊列（agent name、agent oid），不讀其他 Agent。

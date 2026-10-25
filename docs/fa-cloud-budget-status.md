@@ -1,5 +1,18 @@
 # FA 雲端授權與 USD150 成本 preflight
 
+<a id="dev-api-scale-zero-1025"></a>
+## 2026-10-25 dev 上限 USD800 → USD900（Neal 決定；先試過 API 縮到 0，不可行）
+
+- **結論**：dev 共用上限改為 **USD900**、停損 **USD880**（Neal 10-25 選「改成提高上限」，金額選「USD900／停損 880」）。API 維持最少 1 份、2 vCPU／4Gi；排程時鐘與提案改回 `api`／`1`（`deploy/dev/dev.json` 回到 `c0c30add` 的值），合併後部署 dev，讀回記在下一份 dev 測試報告。其他規則不變（`budget_enforced=false`、不清帳、stage 另列每月 USD200）。
+- **起因**（Cost Management `ActualCost`，報表會延遲）：到 10-24 約 **USD758.39**，距原停損 USD780 約 USD22；7 天平均約 USD13.75／天，沒有測試時約 USD8.1／天。Neal 先選「維持上限，先降低 dev 常駐費用」，省錢項目只選「A1 API 空閒縮到 0」（推論可省約 USD3.1／天）；刪除殘留資源與縮小 API 規格都沒有選。
+- **A1 的實際操作與結果**（#981 先把時鐘與提案改 `0`，因為時鐘為 `api` 時 `ci_deploy.py` 要求最少副本至少 1）：
+  - 只換 API（`ci_deploy.py --config deploy/dev/dev.json api`，沿用 `c0c30add` 的 API 映像；`c0c30add..1e34c3ec` 只改了 `dev.json` 和文件）：`ca-fa-behavior-poc--1e34c3e-r3602-1` ready，讀回時鐘 `0`、提案 `0`。
+  - 最少副本改 0（直接用 `az containerapp update --min-replicas 0`，不經 `ci_deploy.py`；revision `…r3602-2`）：`runningState=ActivationFailed`。03:52:30Z 建立後啟動探針一路失敗（探針每 5 秒一次、可失敗 120 次，約 10 分鐘），03:57:31Z KEDA 把它從 1 縮到 0，從沒 ready。期間流量權重寫在 r3602-2，但 r3602-1 仍有 1 份副本、`/healthz` 回 200（沒有確認是哪個 revision 回的）。
+  - 原因：API 每次部署新 revision 都要約 5～6 分鐘才開好 port（兩次實測，含平台建立時間：r3602-1 建立後啟動探針至少失敗 64 次；改回最少 1 份的 r3602-3 從送出到 ready 6.3 分）。縮到 0 那次，還沒啟動完就被收掉（推論：模板沒設 `cooldownPeriod`，預設 300 秒，與建立到縮回相隔 301 秒相符；不是探針次數用完）。
+  - 沒有量過「縮到 0 之後被訊息叫醒」要多久；推論和部署時差不多，閒置後第一則訊息要等數分鐘，所以不改收回時間。
+  - 還原：`az containerapp update --min-replicas 1`，`…r3602-3` Healthy、100% 流量、`/healthz` 200；r3602-1 讀到時在 `Deprovisioning`。A1 沒有省到錢。
+- **待查**：API 啟動要 5～6 分鐘，表示每次部署或平台重啟，API 都要這麼久才恢復；原因還沒查。
+
 <a id="stage-actualcost-1015"></a>
 ## 2026-10-15 stage 第 30 版部署當天 ActualCost 實查（stage 月預算 USD200 維持）
 
@@ -11,6 +24,7 @@
 - **測試**：main `1c2be0b4` 的 dev 測試，結果見 [progress](progress.md#dev-test-v30-1014)。
 - **實查**（Cost Management `ActualCost`，報表會延遲）：測試前約 **USD600.44**（`rg-faexample` 578.42＋`ME_cae-facontext-private` 22.03；分項四捨五入，相加為 600.45），測試後約 **USD609.91**（587.76＋22.15），兩次差約 USD9.47。查詢時間與報表日期未記；因報表延遲，這個差額不等於測試本身的花費。
 - **上限**：不變，仍是 [USD800／停損 USD780](#dev-cap-800-1013)；距停損約 USD170。其他規則不變（`budget_enforced=false`、不清帳、stage 另列每月 USD200）。
+- **10-21 讀數**：第 34 版測試期間 dev 讀數 USD715.18→716.58（報表有延遲；原記在 CURRENT-STATE 費用列，2026-10-23 移到這裡）。
 <a id="dev-cap-800-1013"></a>
 ## 2026-10-13 dev 上限 USD650 → USD800（Neal 授權）
 

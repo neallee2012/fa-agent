@@ -42,7 +42,8 @@ Neal 2026-10-10：「工具列不出來時，這一回合少那個工具照常�
 - **記錄與畫面**：回合的組裝紀錄（`NativeAssembly.unavailable_sources`）存 `entry_id`、來源名稱、`TOOLBOX_LIST_FAILED`
   與固定原因分類；Hosted 記一行 `FA_NATIVE_TOOL_SOURCE_UNAVAILABLE`，同一回合同一來源只記一次。工作台在那則回覆下方顯示
   「這次沒用到 WebIQ：工具清單讀不到（上游驗證失敗），其他功能照常。」，代碼只在支援明細。
-- **不重試、不記住失敗**：每回合照舊只列一次；下一回合重新列。
+- **不重試；失敗記 60 秒**：每回合最多列一次。列不出或要連線時，同一個 Agent 之後 60 秒內的回合自己不列：有預熱正在列就等它、預熱成功就恢復工具，否則沿用記住的結果；
+  按「我連好了，繼續」一定重新列，成功就清掉這個 Agent 所有記住的「要連線」；VM 自己的 token 失敗不記。見 [README 列失敗後 60 秒內不重列](../src/fa-shared-context-poc/README.md#toolbox-list-backoff)。
 
 實作、測試與 `Verified against` 見 [README toolbox 列不出工具](../src/fa-shared-context-poc/README.md#toolbox-list-unavailable)。
 降級回合的 receipt 多了 `unavailable_sources`，舊版 API／工作台會拒收，Hosted、API、工作台要一起出版。
@@ -103,6 +104,8 @@ Neal 2026-10-06 23:3x：「在不違反以下原則的情況下，依照評估�
   送出後、開始前才改版的回合，bind 不再擋，模型看得到舊目錄但讀不到本文。
 - **記憶召回提前並行**：私人／Team 記憶召回不依賴 bind、提醒與 operations 的結果，改在 bind 之前啟動、在原位置取用；
   失敗照舊處理、不重送；回合先失敗時取消未取用的召回。
+  （2026-10-22 起改在配號（`_allocate`）前啟動：召回只需要 receipt，`first_turn` 先以「新對話」猜、配號後猜錯就重新召回；
+  配號被拒時取消。見 [README](../src/fa-shared-context-poc/README.md#recall-before-allocate)。）
 - **收單重用剛讀到／寫入的紀錄**（RTT A 第二批）：同一個收單鎖內，不再重讀剛讀到或剛以 CAS 寫入的 agent 紀錄、`rid:<RID>`
   與對話 meta；標記收單意圖前的重讀與 CAS、`rid:<RID>` create-or-read 去重、寫入確認遺失時讀回都保留；清除意圖的 CAS
   失敗就退回重讀。細節見 [README 收單重用](../src/fa-shared-context-poc/README.md#rtt-a-admission-reuse)。
@@ -937,6 +940,19 @@ metadata-only GET、原active／HITL／question及Files未知阻擋不變，沒�
   細節與證據見 [README](../src/fa-shared-context-poc/README.md#native-routine-proposals)、[工作台 README](../src/fa-shared-context-poc/web_test_console/README.md#routine-from-chat)。
 - 10-08 修正：真人與排程回合給同一份工具清單（固定 runtime 1.0.83 對前面用過、後來移除的工具會告訴模型「不可用」，加回時不會說已恢復）；
   非真人回合呼叫 `propose_routine` 在出卡前就拒絕。見 [README](../src/fa-shared-context-poc/README.md#native-routine-same-tools)。
+
+## 2026-10-23 排程每次執行開新對話（CODE/offline，未部署）
+
+Neal 10-23 決定：每日排程不需要接續前一天。本節取代「排程回合接在批准它的對話」的做法；10-07 兩節的時鐘、提案與批准規則不變。
+
+- 原因：stage A 的每日 routine 每天接在同一個對話，第一次模型呼叫的 input 從 189K 長到 306K tokens，runtime 估的數字沒到壓縮門檻；10-22 撞 `gpt-6.1-sol` 500K TPM 停在 `unknown`。
+- 每次執行開一個新對話：`command.conversation_id` 留空，`routine.conversation_id` 是這次的 CID。API 在保存派送意圖前決定 CID（Responses 先建平台對話），
+  CID 隨意圖保存，同一 RID 的重試與重疊的時鐘都送同一 CID；RID 公式、「不補跑」、回條與 `unknown` 契約不變。
+- 設定照舊取自批准排程的那個對話（模型、role、skills、能力、connector、通道），不取 Team 目前的新對話模板；只有對話 ID 是新的、不帶歷史。
+- 主人在工作台對話選單的「排程」分組看到「排程 MM-DD HH:MM：內容」（最近 30 個），可在那個對話追問；HITL 卡與提醒照原 RID 出現在那裡。
+  仍需要處理的那次，批准排程的對話也顯示「排程（MM-DD HH:MM）執行中或等你處理，在『排程 …』對話」（已接單、還沒結束）或「排程（MM-DD HH:MM）需要處理，在『排程 …』對話」（`unknown`）並連過去（只給主人，不進 Agent prompt）。
+- 單向：新意圖與新回條，舊 API／Hosted 讀不懂（舊 startup 讀取回 409），release 後不能只退其中一個 image。
+- 已存的舊意圖照原樣接原對話；舊長對話不搬、不刪。細節見 [README](../src/fa-shared-context-poc/README.md#native-routine-fresh-conversation)。
 
 ## 2026-10-04 不搬檔預檢：歷史 UNKNOWN 與分頁進度分開（CODE/offline）
 

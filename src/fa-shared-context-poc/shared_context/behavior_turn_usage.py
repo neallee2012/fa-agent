@@ -74,6 +74,8 @@ class TurnModelUsage(WireModel):
 
 
 AGENT_TURN_USAGE_PATH = "/work-policy/v1/turn-usage"
+# ADR-0011: "memory" is the Hosted private-memory extraction's own model call, reported once with the turn's RID.
+AgentUsageSource = Literal["model", "memory"]
 
 
 class AgentTurnUsageReport(WireModel):
@@ -85,3 +87,5 @@ class AgentTurnUsageReport(WireModel):
     """
     request_id: Identifier
     usage: TurnModelUsage | None
+    # Not serialized when "model", so a turn report keeps its original bytes and an older API still accepts it.
+    source: AgentUsageSource = Field(default="model", exclude_if=lambda value: value == "model")

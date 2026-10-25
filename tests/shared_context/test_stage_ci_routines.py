@@ -89,7 +89,7 @@ def test_ci_reads_the_one_hosted_key_list_that_sync_accepts():
 def test_ci_and_sync_accept_and_refuse_the_same_hosted_overlays():
     ci = load_ci()
     values = ["0", "1", "2", "true", "", "api", "foundry-native-v1", "foundry-native-v2", "foundry-native-v3", "600",
-              "0600", "Asia/Taipei", "a\nb", "x" * 2049]
+              "0600", "Asia/Taipei", "a\nb", "x" * 2049, "foundry", "cosmos", "gpt-5.4-mini"]
     cases = [{key: value} for key, value in itertools.product(sorted(versions._ENVIRONMENT_FLAGS), values)]
     cases += [{"AZURE_CLIENT_SECRET": "synthetic"}, {"FA_NATIVE_ROUTINE_CLOCK": "api"}, {}, ["not", "a", "dict"],
               {**HOSTED_ON, "FA_NATIVE_HITL_ENABLED": "1"}, {"FA_NATIVE_ROUTINES_ENABLED": 1}]
@@ -97,6 +97,17 @@ def test_ci_and_sync_accept_and_refuse_the_same_hosted_overlays():
         assert stops(ci._check_hosted, "agent", environment, 3600) == refused(environment), environment
     for idle in (119, 120, 3600, 3601, "3600"):
         assert stops(ci._check_hosted, "agent", {}, idle) == refused({}, idle), idle
+
+
+def test_ci_and_sync_accept_the_cosmos_memory_overlay_azd_writes():
+    # ADR-0011 (deploy/azd/profile.py): private with memory on gives every assistant these two values.
+    ci = load_ci()
+    memory = {"FA_MEMORY_BACKEND": "cosmos", "FA_MEMORY_EXTRACTION_MODEL": "gpt-5.4-mini", "FA_TEAM_MEMORY_ENABLED": "1"}
+    assert versions._check_environment(memory, 3600) == memory
+    assert not stops(ci._check_hosted, "agent", memory, 3600)
+    for bad in ({**memory, "FA_MEMORY_BACKEND": "Cosmos"}, {**memory, "FA_MEMORY_BACKEND": "1"},
+                {**memory, "FA_MEMORY_EXTRACTION_MODEL": ""}, {**memory, "FA_MEMORY_EXTRACTION_MODEL": "a\nb"}):
+        assert refused(bad) and stops(ci._check_hosted, "agent", bad, 3600), bad
 
 
 def test_ci_accepts_a_v2_hosted_definition_and_keeps_the_api_on_v1(ci, monkeypatch):

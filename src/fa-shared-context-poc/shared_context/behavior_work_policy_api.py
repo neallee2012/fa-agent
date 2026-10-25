@@ -289,9 +289,10 @@ def install_work_policy_routes(app,composition,*,start_work=None,wake_work=None)
             from .behavior_instruction_cost import agent_usage_scope,record_agent_turn_usage
             control=controller(refresh=False)
             agent_usage_scope(control,principal)
-            receipt=record_agent_turn_usage(control,rid=report.request_id,usage=report.usage)
-            if publisher is not None:
-                # The VM reports only after its terminal receipt is saved, so the hint follows the final state.
+            receipt=record_agent_turn_usage(control,rid=report.request_id,usage=report.usage,source=report.source)
+            if publisher is not None and report.source=="model":
+                # The VM reports only after its terminal receipt is saved, so the hint follows the final state;
+                # a memory extraction's report (ADR-0011) is not the end of a turn.
                 publisher.notify(control.policy.template.team_id,"turn.finished",
                                  agent_id=agent_id_of(composition,principal),request_id=report.request_id)
             return {"request_id":report.request_id,**receipt.payload["result"]}

@@ -1,4 +1,5 @@
 """Content-free phase timings; elapsed intervals never imply business success."""
+from asyncio import CancelledError
 from contextlib import contextmanager
 from contextvars import ContextVar
 import hashlib
@@ -10,10 +11,10 @@ from time import perf_counter
 _timing_work = ContextVar("behavior_timing_work", default=None)
 _table_counts = ContextVar("behavior_timing_table_counts", default=())
 # Routes RouteTiming logs: the original Hosted->API job routes, plus the native turn routes an owner turn crosses
-# (submit, reads, skill catalog, usage report) so API, Hosted and platform times line up per turn.
+# (submit, reads, skill catalog, usage report, memory relay) so API, Hosted and platform times line up per turn.
 TIMED_ROUTES = ("/assistant/", "/hosted/", "/work-policy/v1/native-turns/", "/work-policy/v1/responses-turns/",
                 "/work-policy/v1/native-capabilities/", "/work-policy/v1/turn-usage",
-                "/work-policy/v1/agent-template")
+                "/work-policy/v1/agent-template", "/team-data/v1/memory/")
 
 
 def timing_id(rid):
@@ -67,6 +68,9 @@ def phase_timing(phase, *, job_id=None):
     try:
         yield
         outcome = "returned"
+    except CancelledError:
+        outcome = "cancelled"  # stopped by its caller (e.g. an early read the turn no longer needs), not a failure
+        raise
     finally:
         _table_counts.reset(token)
         elapsed_timing(phase,started,job_id=job_id,outcome=outcome,table=table)

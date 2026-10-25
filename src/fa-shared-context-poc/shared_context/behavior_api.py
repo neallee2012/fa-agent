@@ -100,7 +100,9 @@ async def _body(request: Request, model, *, max_body_bytes=MAX_BODY_BYTES):
         raise Problem(422, "BEHAVIOR_INVALID_REQUEST", "invalid fields, duplicate keys, types or lengths") from None
     original = getattr(command, "root", command)
     original = getattr(original, "mapping", original)
-    request.state.behavior_request_id = _diagnostic_request_id(getattr(original, "request_id", None))
+    # A memory write names its turn by source_request_id (the same Identifier), so its timing joins that turn.
+    request.state.behavior_request_id = _diagnostic_request_id(
+        getattr(original, "request_id", None) or getattr(original, "source_request_id", None))
     return command
 
 

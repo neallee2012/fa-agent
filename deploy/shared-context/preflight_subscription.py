@@ -9,7 +9,10 @@ prepare_environment.py. It checks:
   created, and the environment had to be rebuilt;
 - the resource providers behind every namespace the shared-context Bicep deploys are Registered
   (``Microsoft.Insights`` for Application Insights and diagnostic settings; ``Microsoft.SignalRService``
-  for Web PubSub, which was still NotRegistered in the 2026-10-07 subscription);
+  for Web PubSub, which was still NotRegistered in the 2026-10-07 subscription); with
+  ``"network_mode": "private"`` (azd FA_NETWORK_MODE, ADR-0010) also ``Microsoft.ContainerService``
+  (Hosted Agent network injection), and with ``"memory_backend": "cosmos"`` too ``Microsoft.DocumentDB``
+  (the Cosmos DB long-term memory, ADR-0011);
 - ``Microsoft.AlertsManagement`` is Registered (a warning only: Application Insights creates its
   "Failure Anomalies" smart detector alert rule through it; on 2026-10-07 that side step failed with
   ``MissingSubscriptionRegistration`` while the FA deployment itself succeeded);
@@ -51,6 +54,8 @@ PROVIDERS = (
     "Microsoft.Insights",
     "Microsoft.SignalRService",
 )
+PRIVATE_PROVIDERS = ("Microsoft.ContainerService",)
+COSMOS_PROVIDERS = ("Microsoft.DocumentDB",)  # ADR-0011 Cosmos memory: private with "memory_backend": "cosmos"
 ADVISORY_PROVIDERS = ("Microsoft.AlertsManagement",)
 NOT_FOUND = ("ResourceNotFound", "ResourceGroupNotFound", "was not found", "could not be found")
 
@@ -120,10 +125,18 @@ def check_subscription(profile: dict[str, Any], run: Runner) -> Report:
     report.check(f"feature:{namespace}/{name}", state == "Registered", {"state": state})
 
     states = {}
-    for provider in PROVIDERS:
+    private = PRIVATE_PROVIDERS if profile.get("network_mode") == "private" else ()
+    private += COSMOS_PROVIDERS if private and profile.get("memory_backend") == "cosmos" else ()
+    for provider in PROVIDERS + private:
         value = _json(run, ["provider", "show", "--namespace", provider, *scope], missing_ok=True)
         states[provider] = (value or {}).get("registrationState", "NotRegistered")
     report.check("providers", all(value == "Registered" for value in states.values()), states)
+    for provider in private:
+        if states[provider] != "Registered":
+            memory = " with memory on" if provider in COSMOS_PROVIDERS else ""
+            report.warn(f"{provider} is {states[provider]}: FA_NETWORK_MODE=private{memory} needs it. Someone "
+                        f"allowed to change the subscription registers it (this check never does): "
+                        f"az provider register --namespace {provider} --subscription {subscription}")
     for provider in ADVISORY_PROVIDERS:
         value = _json(run, ["provider", "show", "--namespace", provider, *scope], missing_ok=True)
         state = (value or {}).get("registrationState", "NotRegistered")

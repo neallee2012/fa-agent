@@ -11009,7 +11009,7 @@ test("HITL 10-07: question options are one list the keyboard can walk with the a
 // Routine from chat (10-07): the assistant drafts a daily schedule; only the owner's click on its card saves it, and
 // the 排程 settings tab lists this Agent's schedules and disables one against the exact version shown.
 const ROUTINE_DRAFT={local_time:"09:00",time_zone:"Asia/Taipei",content:"檢查 Foundry 有沒有新文章"};
-const ROUTINE_TEXT="每天 09:00（Asia/Taipei）在這個對話執行：「檢查 Foundry 有沒有新文章」";
+const ROUTINE_TEXT="每天 09:00（Asia/Taipei）開新對話執行：「檢查 Foundry 有沒有新文章」";
 test("routine from chat: a schedule card shows the exact draft, says only the owner's click counts, and has no rule choice",async()=>{
   const data=hitlAgent("agent-one"),view=hitlRead(data),pid=view.readback.approval.pending_id,posts=[];
   const action=view.readback.pending.command.action;
@@ -11026,6 +11026,7 @@ test("routine from chat: a schedule card shows the exact draft, says only the ow
   assert.equal(hitlNodes(ui,"data-hitl-summary",pid)[0].textContent,"要排程："+ROUTINE_TEXT);
   assert.match(hitlNodes(ui,"data-hitl-reason",pid)[0].textContent,/助理說的話或你在對話裡的回覆都不算批准/);
   assert.match(hitlNodes(ui,"data-hitl-reason",pid)[0].textContent,/要停用請到「助理清單右側的 ⚙ → 排程」/);
+  assert.match(hitlNodes(ui,"data-hitl-reason",pid)[0].textContent,/結果會在對話選單的『排程』分組/);
   assert.equal(hitlNodes(ui,"data-hitl-choice","allow_rule").length,0,"a schedule never becomes a Team rule");
   hitlNodes(ui,"data-hitl-choice","allow_once")[0].events.click();await ui.tick();await ui.tick();
   assert.equal(ui.nodes.get("page-confirm").hidden,true,"the card already shows the exact schedule");
@@ -11116,7 +11117,7 @@ test("routine settings: the owner disables one schedule against the version show
   const path="/api/routines/r1/versions/v-r1/disable";
   ui.holder.templateResponses[path]={ok:false,json:async()=>({error:{code:"LOCAL_OFFLINE"}})};
   routineRows(ui)[0].children[3].children[0].events.click();ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
-  assert.match(ui.holder.confirmation,/停用這個排程？\n每天 09:00（Asia\/Taipei）在這個對話執行：「檢查 Foundry 有沒有新文章」/);
+  assert.match(ui.holder.confirmation,/停用這個排程？\n每天 09:00（Asia\/Taipei）開新對話執行：「檢查 Foundry 有沒有新文章」/);
   assert.equal(routinePosts(ui).length,1);
   assert.equal(routinePosts(ui)[0].url,path);assert.equal(routinePosts(ui)[0].body,"{}");
   assert.match(ui.text("routines-note"),/沒有回應/);
@@ -11213,6 +11214,55 @@ test("scheduled turn: this Agent's push for a turn this page did not send reads 
   for(let i=0;i<4;i++)await ui.tick();
   assert.equal(reads(),before+1);
   assert.equal(scheduledShown(ui),true);
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
+// 2026-10-23: each routine run opens its own conversation; its RID is that conversation's thread.
+const ROUTINE_RUN={thread_id:"scheduled-rid",label:"排程 10-23 09:00：整理文章",
+  routine:{scheduled_for:"2026-10-23T01:00:00+00:00"}};
+test("routine run 10-23: this Agent's push for a turn not sent here imports that RID, so its 排程 conversation is listed",async()=>{
+  const data=nativeChat("completed"),scope=agentChat("agent-one");
+  for(const key of ["agent_mode","default_agent_id","selected_agent_id","agent_directory_error","agents"])data[key]=scope[key];
+  data.composer.observed_at=when;data.composer.threads=[{thread_id:data.composer.thread_id,label:"你好"}];
+  const listed=copy(data);listed.composer.threads=[...listed.composer.threads,ROUTINE_RUN];
+  const path=`/api/instructions/received?request_id=scheduled-rid&thread_id=${encodeURIComponent(data.composer.thread_id)}`;
+  const ui=await open(data,{realtime:true,progressResponse:{ok:true,json:async()=>copy(listed)},
+    templateResponses:{[path]:{ok:true,json:async()=>copy(listed)}}});
+  const socket=await connectPush(ui);
+  for(let i=0;i<4;i++)await ui.tick();
+  const imports=()=>ui.calls.filter(call=>call.url.startsWith("/api/instructions/received")).map(call=>call.url);
+  pushEvent(socket,{type:"turn.finished",agent_id:"agent-one",request_id:"scheduled-rid"});
+  for(let i=0;i<4;i++)await ui.tick();
+  assert.deepEqual(imports(),[path]);
+  const picker=ui.nodes.get("conversation").children,group=picker.find(child=>child.tagName==="OPTGROUP");
+  assert.equal(group.label,"排程");
+  assert.deepEqual(group.children.map(option=>[option.value,option.textContent]),[["scheduled-rid",ROUTINE_RUN.label]]);
+  assert.equal(picker.filter(child=>child.tagName==="OPTION").length,listed.composer.threads.length-1);
+  assert.equal(vm.runInContext("selectedThread",ui.context),data.composer.thread_id,"the open conversation stays");
+  // Once listed, a later push for the same RID reads no receipt again.
+  pushEvent(socket,{type:"turn.finished",agent_id:"agent-one",request_id:"scheduled-rid"});
+  for(let i=0;i<4;i++)await ui.tick();
+  assert.deepEqual(imports(),[path]);
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
+const routineRunNote=async status=>{
+  const data=nativeChat("completed");
+  data.composer.routines={enabled:true,reminders:[],issues:[],error:null,runs:[{thread_id:"scheduled-rid",
+    status,scheduled_for:"2026-10-23T01:00:00+00:00",local_time:"10-23 09:00",label:ROUTINE_RUN.label}]};
+  const ui=await open(data);
+  await ui.tick();await ui.tick();
+  assert.equal(ui.nodes.get("attention-panel").hidden,false);
+  return [ui,ui.nodes.get("attention-items").children.find(node=>node.getAttribute("data-routine-run")==="scheduled-rid")];
+};
+test("routine run 10-23: the approval conversation names a run needing attention and opens its conversation",async()=>{
+  // Review 2026-10-23 (P3-1): accepted/started may simply still be running; only unknown says it needs handling.
+  for(const status of ["accepted","unknown"])assert.equal((await routineRunNote(status))[1].textContent,
+    `排程（10-23 09:00）${status==="accepted"?"執行中或等你處理":"需要處理"}，在『排程 10-23 09:00：整理文章』對話`);
+  const [ui,note]=await routineRunNote("started");
+  assert.equal(note.textContent,"排程（10-23 09:00）執行中或等你處理，在『排程 10-23 09:00：整理文章』對話");
+  assert.equal(note.children[0].textContent,"打開這個對話");
+  const before=ui.calls.length;
+  note.children[0].events.click();await ui.tick();await ui.tick();
+  assert.ok(ui.calls.slice(before).some(call=>call.url.includes("thread_id=scheduled-rid")),"reads the run's conversation");
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
 });
 for(const failure of ["503","throw"]){

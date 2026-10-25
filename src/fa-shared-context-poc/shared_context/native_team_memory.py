@@ -144,11 +144,11 @@ class NativeTeamMemory:
         self._scope = None
 
     @classmethod
-    def from_environment(cls, token_provider, credential_factory=None, *, environ=None, transport=None):
+    def from_environment(cls, token_provider, credential_factory=None, *, environ=None, transport=None, api=None):
         environ = os.environ if environ is None else environ
         if environ.get(TEAM_ENV) != "1":
             return None
-        memory = PrivateMemory.from_environment(token_provider, environ=environ, transport=transport)
+        memory = PrivateMemory.from_environment(token_provider, environ=environ, transport=transport, api=api)
         if memory is None:
             log.warning("FA_TEAM_MEMORY_INACTIVE reason=store_unavailable")
             return None
@@ -211,7 +211,7 @@ class NativeTeamMemory:
             _, memory_id = await self.memory.create(
                 team.scope, note_content(self.agent_name, quote, datetime.datetime.now(datetime.timezone.utc),
                                          receipt.request_id, supersedes),
-                NOTE_KINDS[reason], event="FA_TEAM_MEMORY_CREATE")
+                NOTE_KINDS[reason], event="FA_TEAM_MEMORY_CREATE", request_id=receipt.request_id)
         if memory_id is not None:
             await record_receipt(claim_key(receipt.request_id), claimed, {"memory_id": memory_id},
                                  self.credential_factory, "FA_TEAM_MEMORY_CREATE")

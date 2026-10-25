@@ -243,7 +243,15 @@ class NativeUsageReporter:
             raise Problem(409, "NATIVE_USAGE_CONFLICT", "only a persisted terminal turn has final usage")
         if receipt.status == "busy_refused" and receipt.usage is None:
             return  # never ran a model; the API sees only usage=None and would count an unknown turn
-        report =AgentTurnUsageReport(request_id=receipt.request_id, usage=receipt.usage)
+        await self._send(AgentTurnUsageReport(request_id=receipt.request_id, usage=receipt.usage))
+
+    async def report(self, request_id, usage, *, source="memory"):
+        """ADR-0011 §2: usage of a model call made for a turn but outside it, under the turn's own RID.
+
+        Raises like ``__call__``; the caller sends it once and keeps the usage in its own claim receipt."""
+        await self._send(AgentTurnUsageReport(request_id=request_id, usage=usage, source=source))
+
+    async def _send(self, report):
         try:
             token = self.token_provider()
             if inspect.isawaitable(token):
@@ -396,6 +404,21 @@ class NativeSdkExecutor:
             raise Problem(409, "NATIVE_CAPTURE_CHANGED", "the captured prompt version differs from this runtime")
         if importlib.metadata.version("github-copilot-sdk") != "1.0.13":
             raise Problem(409, "NATIVE_PROFILE_UNSUPPORTED", "the captured SDK version is required")
+
+    def start_recall(self, receipt, *, first_turn):
+        """This turn's private and Team memory recall, already running; None when neither is configured.
+
+        It reads only the turn's own text, origin and captured Team scope (Team memory may pin that server-given scope
+        once), so the runtime starts it before allocation. Dev 10-22 measured warm turns still waiting 0.3-0.9 s for
+        it after operations start; how much of that this start point saves is inferred, not yet measured.
+        """
+        if self.private_memory is None and self.team_memory is None:
+            return None
+        from .behavior_timing import work_timing
+        with work_timing(timing_id(receipt.request_id)):  # the tasks copy it: FA_TIMING keeps this turn's ID
+            return asyncio.gather(*(
+                (memory.recall(receipt, first_turn=first_turn) if memory is not None else asyncio.sleep(0, ()))
+                for memory in (self.private_memory, self.team_memory)))
 
     def _instruction(self, receipt):
         capture = receipt.capture
@@ -675,15 +698,17 @@ class NativeSdkExecutor:
         if context.hitl is not None or receipt.routine is not None:
             tools = [guard_native_tool(context, spec) for spec in tools]
         timed = timing_id(receipt.request_id)
-        recall = None
-        if self.private_memory is not None or self.team_memory is not None:
-            # Independent of the bindings, reminders and operations below (it reads this turn's own text; Team
-            # memory may pin its server-given scope once), so it overlaps them. Its result or failure is taken
-            # at the same point as before; a turn that stops earlier cancels it.
-            first_turn = previous is None  # No SDK history yet: when the official static profile read happens.
-            recall = asyncio.gather(*(
-                (memory.recall(receipt, first_turn=first_turn) if memory is not None else asyncio.sleep(0, ()))
-                for memory in (self.private_memory, self.team_memory)))
+        # Independent of everything this turn builds, so the runtime started it before allocation (start_recall),
+        # guessing first_turn; a wrong guess is dropped and recalled again here. Its result or failure is taken at the
+        # same point as before; a turn that stops earlier cancels it.
+        first_turn = previous is None  # No SDK history yet: when the official static profile read happens.
+        guessed, recall = control.recall or (None, None)
+        if recall is not None and guessed != first_turn:
+            await _settle_recall(recall)
+            recall = None
+        if recall is None:
+            recall = self.start_recall(receipt, first_turn=first_turn)
+        if recall is not None:  # the early one too: it stops with this stack, before the runtime records unknown
             stack.push_async_callback(_settle_recall, recall)
         from .native_routine_wire import native_routines_enabled
         routines, reminder_read = native_routines_enabled(), None
@@ -1130,9 +1155,14 @@ def native_runtime_from_environment(hosted):
     from .native_agent_tools import NativeAgentRelayClient, NativeAgentTools
     from .native_private_memory import NativePrivateMemory
     from .native_team_memory import NativeTeamMemory
+    from .behavior_private_memory import unavailable_reason
     relay = NativeAgentRelayClient(api_url, api_token)
-    private_memory = NativePrivateMemory.from_environment(token, credential)
-    team_memory = NativeTeamMemory.from_environment(token, credential)
+    usage = NativeUsageReporter(api_url, hosted.identity.agent_id, api_token)
+    # ADR-0011: the API connection a non-Foundry memory backend reaches memory through; Foundry ignores it. Only an
+    # extraction FA runs itself (cosmos) reports usage, as source="memory".
+    private_memory = NativePrivateMemory.from_environment(token, credential, api=(api_url, api_token),
+                                                          usage_reporter=usage.report)
+    team_memory = NativeTeamMemory.from_environment(token, credential, api=(api_url, api_token))
     from .native_hitl_wire import hitl_settings
     hitl_client = None
     if hitl_settings()[0]:
@@ -1149,12 +1179,10 @@ def native_runtime_from_environment(hosted):
         agent_tools=lambda receipt, control: NativeAgentTools(relay, receipt, control), private_memory=private_memory,
         team_memory=team_memory, hitl_client=hitl_client, group_client=group_client,
         memory_unavailable_reasons=(
-            "not_configured" if not os.environ.get("FA_PRIVATE_MEMORY_STORE") else "configuration_invalid",
-            "disabled" if os.environ.get("FA_TEAM_MEMORY_ENABLED") != "1" else
-            "not_configured" if not os.environ.get("FA_PRIVATE_MEMORY_STORE") else "configuration_invalid",
+            unavailable_reason(),
+            "disabled" if os.environ.get("FA_TEAM_MEMORY_ENABLED") != "1" else unavailable_reason(),
         ))
     executor.remove_turn_dirs()
-    usage = NativeUsageReporter(api_url, hosted.identity.agent_id, api_token)
 
     async def terminal(receipt):
         try:
@@ -1174,13 +1202,17 @@ def native_runtime_from_environment(hosted):
             await executor.notify_terminal(receipt)
 
     async def completed(receipt, result):
-        if executor.private_memory is not None:
-            # never raises; claimed once per RID; reads the saved final reply through the original runtime (S1b)
-            await executor.private_memory.completed(receipt, executor.reader)
-        if executor.team_memory is not None:
-            await executor.team_memory.completed(receipt)  # never raises; claimed once per RID
-        if group_client is not None:
-            await group_client.complete(receipt)
+        # ADR-0011: the user-visible group post goes first, then the one Team note, then the slowest private update.
+        # The memory hooks never raise, so a group failure still reaches the task, whose rerun finds both claims.
+        try:
+            if group_client is not None:
+                await group_client.complete(receipt)
+        finally:
+            if executor.team_memory is not None:
+                await executor.team_memory.completed(receipt)  # never raises; claimed once per RID
+            if executor.private_memory is not None:
+                # never raises; claimed once per RID; reads the saved final reply through the original runtime (S1b)
+                await executor.private_memory.completed(receipt, executor.reader)
 
     async def unconfirmed(receipt):
         try:

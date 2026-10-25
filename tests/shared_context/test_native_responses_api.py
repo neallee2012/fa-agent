@@ -8,7 +8,7 @@ import pytest
 
 from shared_context.behavior_native_turn_wire import (
     NATIVE_REQUEST, NativeAgentCommand, NativeAgentReceive, NativeCancel, NativeConversation,
-    NativeReceipt, NativeResponseNotStarted, NativeSubmit,
+    NativeReceipt, NativeResponseNotStarted, NativeRoutineSubmit, NativeSubmit,
 )
 from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NativeResponseDispatch
 from shared_context.errors import Problem
@@ -113,8 +113,11 @@ def responses_api(native_api, monkeypatch, signing_key):
                                   "fa_team_id": case.c.control.policy.template.team_id} if metadata is None else metadata)})
             raise AssertionError("Unexpected platform operation")
         command = NATIVE_REQUEST.validate_json(request.content)
-        if isinstance(command, (NativeSubmit, NativeAgentReceive)) and command.state_profile == NATIVE_RESPONSES_PROFILE:
-            cid = command.command.conversation_id or command.new_conversation_id
+        if (isinstance(command, (NativeSubmit, NativeAgentReceive, NativeRoutineSubmit))
+                and command.state_profile == NATIVE_RESPONSES_PROFILE):
+            # Like Hosted: a routine run opens the conversation its origin names.
+            cid = command.command.conversation_id or (
+                command.routine.conversation_id if isinstance(command, NativeRoutineSubmit) else command.new_conversation_id)
             holder = state["holder"]
             busy = holder is not None and holder != command.command.request_id
             status = "busy_refused" if busy and isinstance(command, NativeSubmit) else "accepted"
@@ -125,7 +128,7 @@ def responses_api(native_api, monkeypatch, signing_key):
                     hosted_session_id=case.remote.target.session_id, conversation_id=cid,
                     request_id=command.command.request_id, command=command.command, capture=command.capture,
                     submit_digest=command.sha256, capture_digest=command.capture.sha256, status=status,
-                    source=getattr(command, "source", None),
+                    source=getattr(command, "source", None), routine=getattr(command, "routine", None),
                     failure_code="NATIVE_TURN_BUSY" if status == "busy_refused" else None,
                     dispatch=(NativeResponseDispatch(state="not_taken" if busy else
                                                       "already_queued" if state["queued"] else "needs_response",
@@ -133,6 +136,8 @@ def responses_api(native_api, monkeypatch, signing_key):
                               if status == "accepted" else None),
                 )
                 case.remote.records[receipt.request_id] = receipt
+            if isinstance(command, NativeRoutineSubmit) and state.pop("lose_routine", False):
+                raise httpx.ReadTimeout("OFFLINE lost admission ACK", request=request)
             return reply(receipt, 202)
         if command.operation == "conversation":
             original = next(value for value in case.remote.records.values()
@@ -784,3 +789,82 @@ def test_template_options_do_not_read_responses_eligibility_after_scope_revocati
     response = case.client.get("/work-policy/v1/agent-template/options", headers=case.headers)
     assert response.status_code == 403 and response.json()["error"]["code"] == "WORK_POLICY_REVOKED"
     assert foundry.calls == [] and not case.remote.calls
+
+
+@pytest.fixture
+def routine_flags(monkeypatch):
+    """Set before the app is built, which installs the routine routes only when the flags are on."""
+    monkeypatch.setenv("FA_NATIVE_ROUTINES_ENABLED", "1")
+    monkeypatch.setenv("FA_NATIVE_ROUTINE_CLOCK", "api")
+
+
+def test_a_routine_run_opens_one_platform_conversation_and_its_retry_reuses_it(routine_flags, responses_api, signing_key):
+    """Stage's lane (2026-10-23): each run's CID is a platform conversation the API creates once, before its intent."""
+    from datetime import timedelta
+    from test_native_routine_api import clock_call, daily_definition
+
+    env = responses_api
+    case = env.case
+    seed = case.client.post(PREFIX + "/submit", headers=case.headers, json={"request_id": "seed", "content": "原始問題"})
+    assert seed.status_code == 202, seed.text
+    home = seed.json()["conversation_id"]
+    due = case.c.h.time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    saved = case.client.post(
+        "/native-routines/v1/agents/" + case.foundry.target.agent_id + "/definitions",
+        headers=case.c.h.headers(signing_key, "Behavior.Read Behavior.Approve"),
+        json=daily_definition(enabled=True, conversation_id=home, schedule={
+            "kind": "daily", "time_zone": "UTC", "local_time": due.strftime("%H:%M")}))
+    assert saved.status_code == 200, saved.text
+
+    def trigger(when):
+        case.c.h.time = when + timedelta(seconds=2)
+        return clock_call(case.composition, case.foundry.target.agent_id, "trigger",
+                          {"routine_id": "daily-summary", "scheduled_for": when.isoformat()})
+
+    env.state["lose_routine"] = True
+    lost = trigger(due)
+    assert lost.status_code == 503 and lost.json()["error"]["code"] == "NATIVE_ROUTINE_UNCONFIRMED", lost.text
+    assert len(env.conversations) == 2  # the seed's and this run's
+    first = trigger(due)
+    assert first.status_code == 202, first.text
+    assert len(env.conversations) == 2 and first.json()["conversation_id"] in env.conversations
+    assert first.json()["conversation_id"] != home
+    second = trigger(due + timedelta(days=1))
+    assert second.status_code == 202, second.text
+    assert len(env.conversations) == 3
+    assert len({home, first.json()["conversation_id"], second.json()["conversation_id"]}) == 3
+    posted = [json.loads(call.content)["conversation"] for call in env.calls
+              if call.method == "POST" and call.url.path.endswith("/responses")]
+    assert posted[-2:] == [first.json()["conversation_id"], second.json()["conversation_id"]]
+
+def test_a_platform_conversation_left_unused_by_a_failed_intent_save_is_logged(
+        routine_flags, responses_api, signing_key, monkeypatch, caplog):
+    """Review 2026-10-23: POST /conversations succeeded but the run's intent was not saved; one log line names it."""
+    from datetime import timedelta
+    from shared_context.native_routines import NativeRoutineService
+    from test_native_routine_api import clock_call, daily_definition
+
+    env = responses_api
+    case = env.case
+    seed = case.client.post(PREFIX + "/submit", headers=case.headers, json={"request_id": "seed", "content": "原始問題"})
+    assert seed.status_code == 202, seed.text
+    due = case.c.h.time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    saved = case.client.post(
+        "/native-routines/v1/agents/" + case.foundry.target.agent_id + "/definitions",
+        headers=case.c.h.headers(signing_key, "Behavior.Read Behavior.Approve"),
+        json=daily_definition(enabled=True, conversation_id=seed.json()["conversation_id"], schedule={
+            "kind": "daily", "time_zone": "UTC", "local_time": due.strftime("%H:%M")}))
+    assert saved.status_code == 200, saved.text
+
+    def unsaved(*_args, **_kwargs):
+        raise Problem(503, "NATIVE_ROUTINE_UNCONFIRMED", "OFFLINE intent save lost")
+
+    monkeypatch.setattr(NativeRoutineService, "_reserve", unsaved)
+    case.c.h.time = due + timedelta(seconds=2)
+    lost = clock_call(case.composition, case.foundry.target.agent_id, "trigger",
+                      {"routine_id": "daily-summary", "scheduled_for": due.isoformat()})
+    assert lost.status_code == 503, lost.text
+    created = [cid for cid in env.conversations if cid != seed.json()["conversation_id"]]
+    assert len(created) == 1
+    lines = [record.getMessage() for record in caplog.records if "FA_NATIVE_ROUTINE_CONVERSATION_UNUSED" in record.getMessage()]
+    assert len(lines) == 1 and f"conversation={created[0][:12]}" in lines[0] and len(lines[0].split("rid=")[1].split()[0]) == 12

@@ -9,6 +9,10 @@
   feature grants them at creation, so the API assigns them under an ABAC-constrained delegation (#468). Each
   assignment has a fixed name, so the same PUT repeated is the same assignment; ``principalType`` avoids the new
   principal's replication delay (https://learn.microsoft.com/azure/role-based-access-control/role-assignments-rest).
+- Account role (``FA_ONBOARDING_ACCOUNT_ROLE=true``, set by deploy/azd/profile.py only when the Bicep output says the
+  account-scope delegation exists; ADR-0011 Cosmos memory): Cosmos memory embeds at the account root
+  (``/openai/v1/embeddings``, #971), so OpenAI User is also assigned on the Foundry account that owns the project,
+  under the account-scope delegation (ADR-0006, Neal 2026-10-24).
 
 Nothing here deletes. Logs carry fixed reasons, statuses and ARM error codes only, never a token or body.
 """
@@ -26,6 +30,7 @@ from .behavior_http_diagnostics import _exception_type
 
 ENDPOINT_ENV = "FA_ONBOARDING_ENDPOINT_PROTOCOLS"
 ROLE_SCOPE_ENV = "FA_ONBOARDING_ROLE_SCOPE"
+ACCOUNT_ROLE_ENV = "FA_ONBOARDING_ACCOUNT_ROLE"
 PROTOCOLS = ("responses", "invocations", "invocations_ws")
 FOUNDRY_USER = "53ca6127-db72-4b80-b1b0-d745d6d5456d"
 OPENAI_USER = "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"
@@ -103,21 +108,25 @@ def assignment_name(scope, principal_id, role):
     return str(uuid.uuid5(_NAMESPACE, f"{scope.lower()}|{principal_id}|{role}"))
 
 
-def roles_pending(credential, scope, principal_id, *, transport=None):
-    """None once both roles are confirmed for the agent identity; otherwise a fixed reason. Never deletes."""
+def roles_pending(credential, scope, principal_id, *, account=False, transport=None):
+    """None once both project roles (and with ``account`` OpenAI User on the project's account) are confirmed for the
+    agent identity; otherwise a fixed reason. Never deletes."""
     principal_id = principal_id.lower()
     if _PRINCIPAL.fullmatch(principal_id) is None:
         return "reason=principal_invalid"
     subscription = _SCOPE.fullmatch(scope).group(1)
+    targets = [(scope, role, role) for role in ROLES]
+    if account:  # the account that owns the project; its reasons say role=<id>@account
+        targets.append((scope.rsplit("/projects/", 1)[0], OPENAI_USER, OPENAI_USER + "@account"))
     try:
         token = credential.get_token(ARM_TOKEN_SCOPE).token
     except Exception as error:
         return f"reason=token_unavailable exception_type={_exception_type(error)}"
     headers = {"Authorization": "Bearer " + token}
-    base = ARM + scope + "/providers/Microsoft.Authorization/roleAssignments"
     with httpx.Client(transport=transport or httpx.HTTPTransport(retries=0), trust_env=False,
                       follow_redirects=False, timeout=httpx.Timeout(30, connect=5)) as client:
-        for role in ROLES:
+        for scope, role, label in targets:
+            base = ARM + scope + "/providers/Microsoft.Authorization/roleAssignments"
             body = {"properties": {
                 "roleDefinitionId": f"/subscriptions/{subscription}/providers/Microsoft.Authorization/roleDefinitions/{role}",
                 "principalId": principal_id, "principalType": "ServicePrincipal"}}
@@ -131,10 +140,10 @@ def roles_pending(credential, scope, principal_id, *, transport=None):
                         confirmed = False
                     if confirmed:
                         continue
-                    return f"reason=response_invalid role={role}"
+                    return f"reason=response_invalid role={label}"
                 code = _arm_code(response)
                 if response.status_code != 409 or code != "RoleAssignmentExists":
-                    return f"reason=refused role={role} status={response.status_code} code={code}"
+                    return f"reason=refused role={label} status={response.status_code} code={code}"
                 # The same role is already on this principal under another name: read it back instead.
                 existing = client.get(base, params={"api-version": ARM_API_VERSION,
                                                     "$filter": f"principalId eq '{principal_id}'"}, headers=headers)
@@ -144,17 +153,18 @@ def roles_pending(credential, scope, principal_id, *, transport=None):
                 except (ValueError, AttributeError):
                     found = False
                 if not found:
-                    return f"reason=exists_unconfirmed role={role} status={existing.status_code}"
+                    return f"reason=exists_unconfirmed role={label} status={existing.status_code}"
             except httpx.HTTPError as error:
-                return f"reason=transport role={role} exception_type={_exception_type(error)}"
+                return f"reason=transport role={label} exception_type={_exception_type(error)}"
     return None
 
 
 class NewAgentSetup:
     """The configured steps; ``pending`` returns None only after every enabled step is read back done."""
 
-    def __init__(self, *, endpoint=False, role_scope=None, credential=None, transport=None):
+    def __init__(self, *, endpoint=False, role_scope=None, account_role=False, credential=None, transport=None):
         self.endpoint, self.role_scope, self.credential, self.transport = endpoint, role_scope, credential, transport
+        self.account_role = account_role
 
     @classmethod
     def from_environment(cls, project_endpoint, credential, *, environ=None, transport=None):
@@ -171,7 +181,8 @@ class NewAgentSetup:
                     or matched.group(3).lower() != project.group(2).lower()):
                 log.warning("FA_AGENT_SETUP_INACTIVE step=roles reason=config_invalid")
                 scope = None
-        return cls(endpoint=endpoint == "true", role_scope=scope, credential=credential, transport=transport)
+        return cls(endpoint=endpoint == "true", role_scope=scope,
+                   account_role=environ.get(ACCOUNT_ROLE_ENV) == "true", credential=credential, transport=transport)
 
     def pending(self, foundry, agent_name, principal_id):
         if self.endpoint:
@@ -179,7 +190,8 @@ class NewAgentSetup:
             if reason is not None:
                 return "step=endpoint " + reason
         if self.role_scope is not None:
-            reason = roles_pending(self.credential, self.role_scope, principal_id, transport=self.transport)
+            reason = roles_pending(self.credential, self.role_scope, principal_id, account=self.account_role,
+                                   transport=self.transport)
             if reason is not None:
                 return "step=roles " + reason
         return None

@@ -125,7 +125,9 @@ def test_api_clock_admits_the_original_occurrence_without_becoming_the_owner(rou
     assert original.routine.owner_oid == case.c.human.oid
     assert original.routine.occurrence.approved_version == "definition-1"
     assert original.routine.occurrence.definition_sha256 == saved.json()["definition_sha256"]
-    assert original.conversation_id == "native-cid"
+    # 2026-10-23 (Neal: 不需要接續前一天): the run opens its own conversation, named in its origin and reply.
+    assert original.command.conversation_id is None
+    assert original.conversation_id == original.routine.conversation_id == reply["conversation_id"] != "native-cid"
     assert "capture" not in reply and "content" not in reply
     case.remote.completed(original.request_id)
     before = len([1 for _, command in case.remote.calls if command.operation == "routine_receive"])
@@ -227,6 +229,52 @@ def test_lost_admission_response_remains_due_under_the_same_rid_after_the_next_d
     assert case.trigger(body).status_code == 200
     remaining = case.due().json()["occurrences"]
     assert len(remaining) == 1 and remaining[0]["request_id"] != original.request_id
+
+
+@pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
+def test_each_run_opens_its_own_conversation_and_a_retried_dispatch_reuses_it(routine_api, monkeypatch):
+    """Neal 2026-10-23 「不需要接續前一天」: stage's daily run on A appended to one conversation and its first model input
+    grew 189K -> 306K tokens until gpt-6.1-sol's TPM refused it. Each run now opens its own conversation; the CID is
+    fixed in the run's intent, so a retry of the same RID keeps it."""
+    from shared_context.behavior_native_turn_wire import NATIVE_REQUEST, NativeRoutineSubmit
+
+    case = routine_api
+    due = case.c.h.time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    definition = daily_definition(enabled=True, schedule={
+        "kind": "daily", "time_zone": "UTC", "local_time": due.strftime("%H:%M")})
+    assert case.client.post(case.routine_prefix + "/definitions", json=definition, headers=case.headers).status_code == 200
+    sent, refuse = [], [True]
+
+    def hosted(request):
+        command = NATIVE_REQUEST.validate_json(request.content)
+        if isinstance(command, NativeRoutineSubmit):
+            sent.append(command)
+            if refuse[0]:
+                # Refused before admission: no receipt, so only the API's own intent holds this run's CID.
+                return httpx.Response(409, json={"error": {"code": "AGENT_VERSION_FOLLOWING", "not_dispatched": True}})
+        return case.remote(request)
+
+    monkeypatch.setattr(case.foundry.http, "_transport", httpx.MockTransport(hosted))
+    body = {"routine_id": "daily-summary", "scheduled_for": due.isoformat()}
+    case.c.h.time = due + timedelta(seconds=2)
+    assert case.trigger(body).status_code == 409 and sent[0].command.request_id not in case.remote.records
+    refuse[0] = False
+    first = case.trigger(body)
+    assert first.status_code == 202, first.text
+    assert sent[1] == sent[0] and first.json()["conversation_id"] == sent[0].routine.conversation_id
+    rid = first.json()["request_id"]
+    # The next tick sends the still-accepted original again: same RID, same bytes, same conversation.
+    again = case.trigger(body)
+    assert again.json()["conversation_id"] == first.json()["conversation_id"] and sent[2] == sent[0]
+    case.remote.completed(rid)
+    tomorrow = due + timedelta(days=1)
+    case.c.h.time = tomorrow + timedelta(seconds=2)
+    second = case.trigger({"routine_id": "daily-summary", "scheduled_for": tomorrow.isoformat()})
+    assert second.status_code == 202, second.text
+    runs = [case.remote.records[value.json()["request_id"]] for value in (first, second)]
+    assert [run.command.conversation_id for run in runs] == [None, None]
+    assert len({"native-cid", *(run.conversation_id for run in runs)}) == 3
+    assert [run.conversation_id for run in runs] == [run.routine.conversation_id for run in runs]
 
 
 @pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
@@ -380,6 +428,34 @@ def test_a_routine_turn_runs_on_its_conversations_model_not_the_project_default(
 
 
 @pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
+def test_a_run_keeps_the_approval_conversations_settings_after_the_team_template_changes(routine_api):
+    """Review 2026-10-23: a run opens a new conversation, but it must not take the Team's current new-conversation
+    template, or role, skills, capabilities, connectors or channel would change without the owner approving again."""
+    from shared_context.behavior_agent_template import AgentTemplate, TemplateSettings, export_template
+    from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
+
+    case, c = routine_api, routine_api.c
+    due = case.c.h.time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    definition = daily_definition(enabled=True, schedule={
+        "kind": "daily", "time_zone": "UTC", "local_time": due.strftime("%H:%M")})
+    assert case.client.post(case.routine_prefix + "/definitions", json=definition, headers=case.headers).status_code == 200
+    approved = case.remote.records["human-seed"].capture
+    current = export_template(c.control, c.authority, c.human)
+    changed = AgentTemplate.model_validate({**current.model_dump(), "settings": TemplateSettings(**{
+        **current.settings.model_dump(), "user_text_file_profile": "fa-user-text-files-v1"})})
+    assert changed != approved.template
+    select_profile(c.control, c.authority, c.human, SelectConversationProfile(
+        request_id="changed-after-approval", expected_selection_id=None, template=changed))
+    case.c.h.time = due + timedelta(seconds=2)
+    result = case.trigger({"routine_id": "daily-summary", "scheduled_for": due.isoformat()})
+    assert result.status_code == 202, result.text
+    run = case.remote.records[result.json()["request_id"]]
+    assert run.conversation_id != "native-cid" and run.command.conversation_id is None
+    assert (run.capture.template, run.capture.profile_selection_id) == (approved.template, approved.profile_selection_id)
+    assert run.capture.model_copy(update={"sdk_start_code_sha256": approved.sdk_start_code_sha256}) == approved
+
+
+@pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
 def test_saved_definitions_and_occurrence_intents_survive_the_existing_startup_reader(routine_api):
     from test_conversation_transfer_startup import read_startup
 
@@ -408,11 +484,97 @@ def test_owner_can_observe_a_scheduled_original_before_it_has_completed_history(
         "routine_id": "daily-summary", "scheduled_for": due.isoformat()}).json()
     before = dict(case.remote.records)
     observed = case.client.post(case.routine_prefix + "/reminders", headers=case.read_headers,
-                                json={"conversation_id": "native-cid"})
+                                json={"conversation_id": admitted["conversation_id"]})
     assert observed.status_code == 200, observed.text
     assert observed.json()["routine_turns"] == [admitted]
     assert observed.json()["reminders"] == []
+    # The owner's approval conversation keeps an entry naming the run's own conversation while it needs attention;
+    # the Agent's prompt there does not get another conversation's run.
+    home = case.client.post(case.routine_prefix + "/reminders", headers=case.read_headers,
+                            json={"conversation_id": "native-cid"})
+    assert home.status_code == 200 and home.json()["routine_turns"] == [admitted]
+    assert admitted["conversation_id"] != "native-cid"
+    agent = case.client.post("/work-policy/v1/native-capabilities/routine/reminders", headers=case.agent_headers,
+                             json={"conversation_id": "native-cid"})
+    assert agent.status_code == 200 and agent.json().get("routine_turns", []) == [], agent.text
     assert case.remote.records == before
+    case.remote.completed(admitted["request_id"])
+    done = case.client.post(case.routine_prefix + "/reminders", headers=case.read_headers,
+                            json={"conversation_id": "native-cid"})
+    assert done.status_code == 200 and done.json().get("routine_turns", []) == []
+
+
+def reserve_continuing(case, scheduled_for, conversation_id="native-cid"):
+    """An intent as saved before 2026-10-23: the run continues ``conversation_id`` (command CID = origin CID)."""
+    from shared_context.behavior_native_responses_api import turn_profile
+    from shared_context.behavior_native_turn_wire import NativeAgentCommand, NativeRoutineSubmit
+    from shared_context.native_routine_wire import routine_origin_for
+    from shared_context.native_routines import NativeRoutineService
+
+    agent_id = case.foundry.target.agent_id
+    service, control = NativeRoutineService(case.composition, enabled=True), case.c.control
+    definition = service._current_definition(control, agent_id, "daily-summary")
+    origin = routine_origin_for(definition, scheduled_for, conversation_id=conversation_id)
+    capture = case.remote.records["human-seed"].capture
+    command = NativeAgentCommand(request_id=origin.request_id, conversation_id=conversation_id,
+                                 content=definition.content, model=capture.model.id)
+    return service._reserve(control, agent_id, definition, NativeRoutineSubmit(
+        command=command, capture=capture, routine=origin, state_profile=turn_profile(capture))).submission
+
+
+@pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
+def test_an_intent_saved_before_the_change_still_continues_its_original_conversation(routine_api):
+    """An occurrence reserved before 2026-10-23 (e.g. stage's unfinished run) is sent as it was saved: into the
+    routine's conversation, after the same-session check that guards every follow-up there."""
+    case = routine_api
+    due = case.c.h.time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    definition = daily_definition(enabled=True, schedule={
+        "kind": "daily", "time_zone": "UTC", "local_time": due.strftime("%H:%M")})
+    assert case.client.post(case.routine_prefix + "/definitions", json=definition, headers=case.headers).status_code == 200
+    case.c.h.time = due + timedelta(seconds=2)
+    legacy = reserve_continuing(case, due)
+    rid, body = legacy.command.request_id, {"routine_id": "daily-summary", "scheduled_for": due.isoformat()}
+    seed = case.remote.records["human-seed"]
+    case.remote.records["human-seed"] = seed.model_copy(update={"hosted_session_id": "old-native-session"})
+    moved = case.trigger(body)
+    assert moved.status_code == 409 and moved.json()["error"]["code"] == "NATIVE_SESSION_CHANGED", moved.text
+    assert rid not in case.remote.records
+    case.remote.records["human-seed"] = seed
+    sent = case.trigger(body)
+    assert sent.status_code == 202, sent.text
+    run = case.remote.records[rid]
+    assert run.command == legacy.command and run.routine == legacy.routine
+    assert (run.command.conversation_id, run.conversation_id) == ("native-cid", "native-cid")
+
+
+@pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
+def test_a_run_naming_another_conversation_is_refused_not_skipped(routine_api):
+    """Review 2026-10-23: a run's command CID is empty or its definition's; anything else is a 409, as before, not a
+    reference silently left out."""
+    from test_conversation_transfer_startup import read_startup
+
+    case = routine_api
+    due = case.c.h.time.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    definition = daily_definition(enabled=True, schedule={
+        "kind": "daily", "time_zone": "UTC", "local_time": due.strftime("%H:%M")})
+    assert case.client.post(case.routine_prefix + "/definitions", json=definition, headers=case.headers).status_code == 200
+    case.c.h.time = due + timedelta(seconds=2)
+    admitted = case.trigger({"routine_id": "daily-summary", "scheduled_for": due.isoformat()})
+    assert admitted.status_code == 202, admitted.text
+    # A receipt outside its run's conversation does not even decode (NativeReceipt.original_material); _reminders keeps
+    # its own 409 for it as well.
+    case.remote.completed(admitted.json()["request_id"])
+
+    other = reserve_continuing(case, due + timedelta(days=1), conversation_id="another-cid")
+    listed = case.client.post(case.routine_prefix + "/reminders", headers=case.read_headers,
+                              json={"conversation_id": "native-cid"})
+    assert listed.status_code == 409 and listed.json()["error"]["code"] == "NATIVE_ROUTINE_INVALID", listed.text
+    checked = case.client.post("/work-policy/v1/native-capabilities/routine/check", headers=case.agent_headers, json={
+        "request_id": other.command.request_id, "conversation_id": "another-cid",
+        "definition_sha256": other.routine.occurrence.definition_sha256})
+    assert checked.status_code == 409 and checked.json()["error"]["code"] == "NATIVE_ROUTINE_INVALID", checked.text
+    with pytest.raises(Exception, match="NATIVE_ROUTINE_INVALID|retained routine metadata"):
+        read_startup(case.c)
 
 
 def test_native_routine_routes_are_absent_by_default(request, monkeypatch):
@@ -560,7 +722,7 @@ def test_cancelled_routine_is_owner_history_not_an_agent_unfinished_work_reminde
         "routine_id": "daily-summary", "scheduled_for": due.isoformat()}).json()
     rid = admitted["request_id"]
     NativeTurnGateway(case.composition, enabled=True).change(
-        case.c.human, NativeCancel(request_id=rid, conversation_id="native-cid"))
+        case.c.human, NativeCancel(request_id=rid, conversation_id=admitted["conversation_id"]))
     original = NativeReceipt.model_validate_json(case.remote.records[rid].model_copy(update={
         "status": "unknown", "failure_code": "NATIVE_TURN_CANCELLED"}).model_dump_json())
     case.remote.records[rid] = original
@@ -568,11 +730,11 @@ def test_cancelled_routine_is_owner_history_not_an_agent_unfinished_work_reminde
     assert case.client.post(case.routine_prefix + "/definitions", json=disabled, headers=case.headers).status_code == 200
     case.c.h.time += timedelta(days=3)
     owner = case.client.post(case.routine_prefix + "/reminders", headers=case.read_headers,
-                             json={"conversation_id": "native-cid"})
+                             json={"conversation_id": admitted["conversation_id"]})
     assert owner.status_code == 200, owner.text
     assert owner.json()["routine_turns"][0]["cancel_requested"] is True
     agent = case.client.post("/work-policy/v1/native-capabilities/routine/reminders", headers=case.agent_headers,
-                             json={"conversation_id": "native-cid"})
+                             json={"conversation_id": admitted["conversation_id"]})
     assert agent.status_code == 200, agent.text
     assert agent.json().get("routine_turns", []) == [] and agent.json()["reminders"] == []
     assert case.remote.records[rid] == original
@@ -598,7 +760,7 @@ def test_closed_observations_do_not_fill_the_first_agent_reminder_page(routine_a
         if rid != active:
             case.remote.completed(rid)
     observed = case.client.post("/work-policy/v1/native-capabilities/routine/reminders", headers=case.agent_headers,
-                                json={"conversation_id": "native-cid"})
+                                json={"conversation_id": case.remote.records[active].conversation_id})
     assert observed.status_code == 200, observed.text
     assert [item["request_id"] for item in observed.json()["routine_turns"]] == [active]
     assert observed.json()["next_after"] is None

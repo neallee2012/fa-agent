@@ -1,7 +1,7 @@
 # CURRENT-STATE — FA 開工摘要
 
 > **非權威快照**；先讀 AGENTS 與本檔，再按需讀來源。[維護規範](../CONVENTIONS.md#8-current-state)：60行／UTF-8 8KiB內。
-> 2026-10-22（+08）；核對origin/main `42173ca7`；stage仍是第34版（2026.10.21-34，2d-ii，#935）：API與Hosted只服務v2、閘門武裝，GUARD="1"（不能關、不退版）。**第35版（2026.10.22-35）release PR待Neal決定，main凍結。**
+> 2026-10-24（+08）；核對origin/main `21d6d972`；stage是第35版（2026.10.22-35，#950，[部署後驗證](../progress.md#stage-v35-1022)）：API與Hosted只服務v2（2d-ii，#935）、閘門武裝，GUARD="1"（不能關、不退版）。
 > 本文不是操作批准；原資料、回條、unknown與費用上限保持，部署與帳本細節以來源為準。
 
 ## 現在在哪
@@ -26,29 +26,30 @@
 
 | 批次 | 結果 |
 |---|---|
-| stage第34版（10-21） | 閘門armed＋pass、0拒絕；A／B v85、`stage-test-e` v33都是v2，三則訊息都在原SID上，無錯誤（[驗證](../progress.md#stage-v34-1021)）。未查：submit到Hosted第一條trace 5～9秒；API自己的`FA_NATIVE_TURNS`仍v1（觀察）。 |
-| 第35版候選dev測試（10-22，`42173ca7`＝release基準） | dev部署4次、閘門0拒絕，core與release相同；#943降級、#944 WebIQ整併、#945、#949 PASS；#942提醒並行與#941 UI沒驗到（[紀錄](../progress.md#dev-test-v35-1022)）。 |
+| stage第35版（10-22） | 閘門armed＋pass、0拒絕；A／B／C／D v86、`stage-test-e` v34；公開tag `v2026.10.22-35`；三則冒煙OK，A／B原SID換版無cut，#940／#942 PASS，#949送出路徑PASS，#941 UI未驗；E換版未驗（[驗證](../progress.md#stage-v35-1022)）。 |
 
 ## 下一步
 
-1. **送出延遲**：#949拿掉warm送出約2秒的平台等待（dev API同步3.4→1.7秒）；剩下換版後第一次toolbox listing（約18秒）與memory recall。
-2. **azd端到端**（10-21～22，公開repo `v2026.10.21-34`，westus3，[紀錄](../progress.md#azd-e2e-public-1021)）：前10分鐘PASS，已拆除、無計費殘留；費用初估USD0.49（有延遲，待複讀）。修正#936已合併，`y/N`批准未重跑。
-3. **再來**：4a需要的一半、6b；5c、開IDLE延後；待補Teams relay runbook（dev relay沒有文件化的建置程序）。
+1. **送出延遲**：#949、#955、#956已在dev（warm A約1.3秒，未上stage）；剩換版後首次listing、開頁被扣2～4秒（[觀察](../progress.md#stage-v35-1022)）。
+2. **azd端到端**（10-21～22，公開repo `v2026.10.21-34`，[紀錄](../progress.md#azd-e2e-public-1021)）：前10分鐘PASS、已拆除無殘留；費用初估USD0.49待複讀；#936的`y/N`未重跑。
+3. **azd私有網路**（[ADR-0010](../adr/0010-azd-private-network-option.md)、[ADR-0011](../adr/0011-private-mode-cosmos-memory.md)）：10-24 `fa-priv-1024`核心流程PASS（[紀錄](../progress.md#private-e2e-1024)）；兩輪乾淨重跑PASS（azd建的VNet、BYO VNet＋DNS azd；前10分鐘、記憶含「＋」Agent，[紀錄](../progress.md#private-reruns-1024)）。未收：DNS existing、>1000筆向量查詢、429、延遲及格線、費用、Work IQ防護未觸發、0c其餘未逐項核。第36版dev測試10-25通過（[紀錄](../progress.md#dev-test-v36-1025)），release PR待Neal。
+4. **再來**：4a需要的一半、6b；5c、開IDLE延後；待補Teams relay runbook。
 
 ## 待核對但不作繁瑣部署gate
 
 | 項目 | 界線／來源 |
 |---|---|
-| 待Neal | stage加Teams與relay、Entra redirect-URI租用戶寫入、Teams登入、PG稿`5055d28c`送否。Teams批准只收allow_once／deny，以主人oid為依據。排程時鐘在API、stage已開，Neal尚未建第一個排程。stage A重建session要Neal核准。 |
+| 待Neal | stage加Teams與relay、Entra redirect-URI租用戶寫入、Teams登入、PG稿`5055d28c`送否。Teams批准只收allow_once／deny，以主人oid為依據。排程時鐘在API、stage已開，A每日routine已在跑。stage A重建session要Neal核准。 |
 | WebIQ只留toolbox | dev三步都做完（[步驟](../../deploy/README.md#dev-webiq-env-removal)）；stage沒有這些步驟。 |
 | 接手必知（未修） | `native_turns.py`回合尾巴：Hosted存檔後才標completed（manual／diag／委派等回合會先停SDK，上限約15秒，auto不停）；#916已合併但dev沒碰到競態，completed時間不變。 |
-| 開放項目 | A重複404是bridge輪詢交辦回覆（設計行為），預期的404 WARNING要不要降級待決；stage `desktop_act`卡住；azd eastus2那次（[10-11](../progress.md#azd-eastus2-1011)）的Portal未驗收，10-21 westus3已PASS（[紀錄](../progress.md#azd-e2e-public-1021)）；ADR-0009 §8其餘文案待Neal確認；每次發布要在progress記send RTT p50／p95。 |
+| 每日routine `unknown`（10-22，待Neal） | A的排程回合撞`gpt-6.1-sol` 500K TPM（dev／stage共用），中斷、未交付、不補跑；對話context逐日增大（189K→306K）。10-23 Neal：不需接續，改每次開新對話（#957已合併，待stage release）；另可調TPM、匯出`FA_NATIVE_TURN_UNKNOWN`（[根因](../progress.md#stage-v35-1022)）。 |
+| 開放項目 | A「超過2小時」橫幅疑似誤報（B已於10-21回覆）；E換版未驗；A重複404是bridge輪詢交辦回覆（設計行為），預期的404 WARNING要不要降級待決；stage `desktop_act`卡住；azd eastus2（[10-11](../progress.md#azd-eastus2-1011)）Portal未驗收；ADR-0009 §8其餘文案待Neal確認；每次發布要在progress記send RTT p50／p95。 |
 | stage「＋」IAM | #468：Neal本人實測「＋」仍待。風險#469，見[ADR-0008 §6](../adr/0008-environment-tiers-staging-cicd.md)。 |
 | ADR-0007／0006 | [Hosted原生優先](../adr/0007-foundry-hosted-native-first.md)：N0～N3與用量已合，live PASS；#306記憶風險例外不變；#284仍draft。ADR-0006 T1～T5已部署；T6a／T6b已實作未部署，私人記憶用量未入帳是已知缺口。 |
 | 退役Agent | #867已合併，未完成onboarding由`team-agent-retire-release`釋出（[deploy](../../deploy/README.md#retire-agent)）。只有operator CLI能退役，名額與顯示名稱不釋出。dev `fa-agent-cc96…`補tombstone需批准。 |
 | SP v2／v3／role | 都不升全域SP acceptance（v2：6 PASS、第3則FAIL；v3：①FAIL；role-v2 9 PASS／3 FAIL，role v3 3則PASS）。 |
 | README移出的限制 | 4項皆未開始：桌面UI驗收、connector stage真人驗收＋GitHub、Team隔離評估、工作檔跨VM延續；見[POC計畫](../POC-ANALYSIS-AND-PLAN.md#從-readme-移來的已知限制neal-2026-10-11)。 |
-| 費用 | dev上限**USD800／停損780**（10-13，[紀錄](../fa-cloud-budget-status.md#dev-cap-800-1013)）；10-21第34版測試dev讀數USD715.18→716.58（有延遲）；stage月USD200另列。 |
+| 費用 | dev上限**USD900／停損880**（10-25，[紀錄](../fa-cloud-budget-status.md#dev-api-scale-zero-1025)）；stage月USD200另列。 |
 
 ## 來源入口
 

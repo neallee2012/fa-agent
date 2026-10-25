@@ -34,6 +34,16 @@ param modelDeployments array = [
   }
 ]
 
+@allowed(['public', 'private'])
+@description('ADR-0010 FA_NETWORK_MODE. private: Hosted Agents injected into agentSubnetResourceId, public network access Disabled (Deny, AzureServices bypass), and a private endpoint in privateEndpointSubnetResourceId with the given DNS zones. Injection can only be set when the account is created.')
+param networkMode string = 'public'
+param agentSubnetResourceId string = ''
+param privateEndpointSubnetResourceId string = ''
+param privateDnsZoneResourceIds array = []
+@description('false (ADR-0010 phase 2b FA_DNS_MODE=existing): the private endpoint gets no DNS zone group; the user serves the three names.')
+param privateDnsZones bool = true
+
+var isPrivate = networkMode == 'private'
 var foundryUserRoleId = '53ca6127-db72-4b80-b1b0-d745d6d5456d'
 var openAiUserRoleId = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd'
 
@@ -47,14 +57,33 @@ module foundryAccount 'br/public:avm/res/cognitive-services/account:0.19.0' = {
     allowProjectManagement: true
     customSubDomainName: accountName
     disableLocalAuth: true
-    publicNetworkAccess: 'Enabled'
+    publicNetworkAccess: isPrivate ? 'Disabled' : 'Enabled'
     restrictOutboundNetworkAccess: false
     dynamicThrottlingEnabled: false
-    networkAcls: {
+    networkAcls: isPrivate ? {
+      defaultAction: 'Deny'
+      bypass: 'AzureServices'
+      ipRules: []
+      virtualNetworkRules: []
+    } : {
       defaultAction: 'Allow'
       ipRules: []
       virtualNetworkRules: []
     }
+    // No project capability host: the platform creates the account one (ADR-0010 phase 0, Q3).
+    networkInjections: isPrivate ? {
+      scenario: 'agent'
+      subnetResourceId: agentSubnetResourceId
+      useMicrosoftManagedNetwork: false
+    } : null
+    privateEndpoints: isPrivate ? [
+      {
+        subnetResourceId: privateEndpointSubnetResourceId
+        privateDnsZoneGroup: privateDnsZones ? {
+          privateDnsZoneGroupConfigs: map(privateDnsZoneResourceIds, id => { privateDnsZoneResourceId: id })
+        } : null
+      }
+    ] : null
     managedIdentities: {
       systemAssigned: true
     }

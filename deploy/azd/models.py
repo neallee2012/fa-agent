@@ -3,7 +3,8 @@
 One choice drives the Foundry deployments (Bicep), the Portal menu and default (the API's FA_INSTRUCTION_MODELS and
 FA_INSTRUCTION_DEFAULT_MODEL) and the memory store: FA_MODELS lists chat deployments from
 src/fa-shared-context-poc/model-catalog.json and FA_DEFAULT_MODEL is one of them. The memory store uses a chosen chat
-model too, so no model is required beyond the choice, except the embedding deployment memory needs.
+model too, so no model is required beyond the choice, except the embedding deployment memory needs. With the Cosmos DB
+memory (FA_NETWORK_MODE=private, ADR-0011) the same chat model is the Hosted extraction model.
 
 Pure and offline; fa_azd.py asks the person and reads the region's offer and quota.
 """
@@ -50,6 +51,13 @@ def before_choice(values: Mapping[str, str]) -> bool:
 
 def memory_on(values: Mapping[str, str]) -> bool:
     return (values.get("FA_ENABLE_MEMORY") or "true").strip().lower() != "false"
+
+
+def memory_backend(values: Mapping[str, str]) -> str:
+    """FA_MEMORY_BACKEND (ADR-0011): cosmos for FA_NETWORK_MODE=private with memory on, where the Foundry Memory Store
+    fails; foundry otherwise (the Memory Store, or memory off). The network mode is fixed, so the backend changes only
+    with the memory switch; no memory moves between the two."""
+    return "cosmos" if values.get("FA_NETWORK_MODE") == "private" and memory_on(values) else "foundry"
 
 
 @dataclass(frozen=True)

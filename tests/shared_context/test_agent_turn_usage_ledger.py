@@ -86,6 +86,41 @@ def test_native_and_job_usage_with_the_same_rid_stay_separate_and_job_path_is_un
     read_startup(c)
 
 
+def test_memory_usage_sits_beside_the_turn_of_the_same_rid_and_is_never_an_unknown_turn(synthetic_standing_v1):
+    # ADR-0011: the extraction call reports with the turn's own RID under source "memory".
+    c = synthetic_standing_v1
+    agent = c.control.policy.template.agent_oid
+    before = ledger(c)
+    turn = record_agent_turn_usage(c.control, rid="native-both", usage=report(group()))
+    memory = record_agent_turn_usage(c.control, rid="native-both", usage=report(group()), source="memory")
+    assert memory.payload["result"] == turn.payload["result"] == {
+        "usage_recorded": True, "usage_known": True, "metered_microusd": METERED, "unmetered_requests": 1}
+    assert agent_turn_usage_key(agent, "native-both", "memory") != agent_turn_usage_key(agent, "native-both")
+    stored = _row(c.h.runtime.store.read_snapshot((agent_turn_usage_key(agent, "native-both", "memory"),)),
+                  agent_turn_usage_key(agent, "native-both", "memory"), AgentTurnUsageRecord)
+    assert (stored.rid, stored.source) == ("native-both", "memory")
+    assert saved(c, "native-both").source == "model"
+    after = ledger(c)
+    assert after.model_metered_microusd == before.model_metered_microusd + 2 * METERED
+    # An unknown memory report is recorded as unknown but is not counted as an unknown turn.
+    unknown = record_agent_turn_usage(c.control, rid="native-memory-unknown", usage=None, source="memory")
+    assert unknown.payload["result"] == {"usage_recorded": True, "usage_known": False, "metered_microusd": 0,
+                                         "unmetered_requests": 0}
+    assert ledger(c).model_unknown_turns == before.model_unknown_turns
+    # Startup replays both records with the same rule (a different count would refuse startup).
+    read_startup(c)
+
+
+def test_a_model_report_keeps_its_original_bytes_and_memory_names_its_source():
+    from shared_context.behavior_turn_usage import AgentTurnUsageReport
+    assert AgentTurnUsageReport(request_id="vm-turn", usage=None).model_dump_json() == (
+        '{"request_id":"vm-turn","usage":null}')
+    memory = AgentTurnUsageReport(request_id="vm-turn", usage=None, source="memory")
+    assert memory.model_dump_json() == '{"request_id":"vm-turn","usage":null,"source":"memory"}'
+    assert AgentTurnUsageReport.model_validate_json(memory.model_dump_json()) == memory
+    assert AgentTurnUsageReport.model_validate_json('{"request_id":"vm-turn","usage":null}').source == "model"
+
+
 def test_a_native_turn_finishing_after_revocation_still_records_and_starts(synthetic_standing_v1):
     c = synthetic_standing_v1
     c.control.revoke(c.human, "revoke-while-native-turn-runs")
@@ -163,6 +198,10 @@ def test_the_verified_agent_reports_its_own_final_turn_usage_once_over_the_api(a
     assert unknown.status_code == 200 and unknown.json()["usage_known"] is False
     missing = h.client.post(AGENT_TURN_USAGE_PATH, json={"request_id": "vm-missing"}, headers=h.headers("agent"))
     assert missing.status_code == 422
+    memory = h.client.post(AGENT_TURN_USAGE_PATH, json=dict(body, source="memory"), headers=h.headers("agent"))
+    assert memory.status_code == 200 and memory.json() == expected
+    other = h.client.post(AGENT_TURN_USAGE_PATH, json=dict(body, source="embedding"), headers=h.headers("agent"))
+    assert other.status_code == 422
     assert ledger(SimpleNamespace(h=h, control=control)).model_unknown_turns == after.model_unknown_turns + 1
 
 

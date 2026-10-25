@@ -34,6 +34,27 @@
     },
     "deployUpgradeSnapshots": {
       "value": "${FA_DEPLOY_UPGRADE_SNAPSHOTS=false}"
+    },
+    "networkMode": {
+      "value": "${FA_NETWORK_MODE=public}"
+    },
+    "memoryBackend": {
+      "value": "${FA_MEMORY_BACKEND=foundry}"
+    },
+    "vnetResourceId": {
+      "value": "${FA_VNET_RESOURCE_ID}"
+    },
+    "apiSubnetName": {
+      "value": "${FA_API_SUBNET_NAME=snet-api}"
+    },
+    "agentSubnetName": {
+      "value": "${FA_AGENT_SUBNET_NAME=snet-agents}"
+    },
+    "privateEndpointSubnetName": {
+      "value": "${FA_PRIVATE_ENDPOINT_SUBNET_NAME=snet-private-endpoints}"
+    },
+    "dnsMode": {
+      "value": "${FA_DNS_MODE=azd}"
     }
   }
 }

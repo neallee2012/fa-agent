@@ -26,7 +26,8 @@ MAX_READ_BYTES = 64 * 1024
 MAX_CHANGE_BYTES = 8 * 1024
 _REQUEST_ID = re.compile(r"[a-f0-9]{32}")
 # The connector API reuses the Team MCP owner, version and Foundry failure codes; the page names them per connector.
-API_ERRORS = TEAM_MCP_ERRORS | {"TEAM_CONNECTOR_SECRET_REQUIRED", "TEAM_CONNECTOR_TOOLBOX_TAKEN"}
+API_ERRORS = TEAM_MCP_ERRORS | {"TEAM_CONNECTOR_SECRET_REQUIRED", "TEAM_CONNECTOR_TOOLBOX_TAKEN",
+                                "TEAM_CONNECTOR_PRIVATE_NETWORK"}
 AGENT_API_ERRORS = frozenset({
     "AGENT_CONNECTORS_CHANGED", "AGENT_CONNECTORS_CONFLICT", "AGENT_CONNECTOR_UNKNOWN", "AGENT_CONNECTORS_INVALID",
     "WORK_POLICY_HUMAN_REQUIRED", "BEHAVIOR_ACCESS_DENIED",
@@ -45,6 +46,7 @@ MESSAGES = {
     "TEAM_CONNECTOR_CONNECTION_CREATE_UNAVAILABLE": "這個環境沒有設定這個 connector 的 Entra 應用程式，還不能加入；沒有送出，請通知部署線。",
     "TEAM_CONNECTOR_SECRET_REQUIRED": "第一次加入需要 Entra 應用程式的用戶端密碼；沒有送出。",
     "TEAM_CONNECTOR_TOOLBOX_TAKEN": "這個 connector 的 toolbox 裡是別處寫的設定；這裡不覆寫，請通知部署線。",
+    "TEAM_CONNECTOR_PRIVATE_NETWORK": "這個環境是私有網路（FA_NETWORK_MODE=private），不支援 Work IQ，不能加入或重新啟用這個 connector；只能停用。沒有送出。",
     "TEAM_CONNECTOR_RESPONSE_INVALID": "Connector 設定的回應格式不符；不當成完成，請重新讀取。",
     "AGENT_CONNECTORS_UNAVAILABLE": "這個環境還沒開放 Connectors。",
     "AGENT_CONNECTORS_OWNER_ONLY": "只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能開關這位助理的 connector。",

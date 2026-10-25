@@ -433,6 +433,8 @@ _ENVIRONMENT_FLAGS = frozenset({
     "FA_NATIVE_ROUTINES_ENABLED", "FA_NATIVE_ROUTINE_PROPOSALS",
     # Mid-conversation model switch (README#native-model-switch); unset or "0" keeps a conversation on its model.
     "FA_NATIVE_MODEL_SWITCH",
+    # ADR-0011 long-term memory backend (behavior_private_memory.BACKEND_ENV) and its extraction chat deployment.
+    "FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL",
 })
 
 
@@ -446,9 +448,11 @@ def _check_environment(environment, idle_timeout_seconds):
         invalid = True
     if invalid or type(idle_timeout_seconds) is not int or not 120 <= idle_timeout_seconds <= 3600:
         raise Problem(409, "HOSTED_ENVIRONMENT_INVALID", "only bounded non-secret deployment settings are accepted")
-    switches = _ENVIRONMENT_FLAGS - {"FA_NATIVE_TURNS", "FA_NATIVE_HITL_TTL_SECONDS", "FA_PRIVATE_MEMORY_STORE", "TZ"}
+    switches = _ENVIRONMENT_FLAGS - {"FA_NATIVE_TURNS", "FA_NATIVE_HITL_TTL_SECONDS", "FA_PRIVATE_MEMORY_STORE", "TZ",
+                                     "FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL"}
     if (any(key in environment and environment[key] not in {"0", "1"} for key in switches)
             or "FA_NATIVE_TURNS" in environment and environment["FA_NATIVE_TURNS"] not in ACCEPTED_STATE_PROFILES
+            or environment.get("FA_MEMORY_BACKEND", "foundry") not in {"foundry", "cosmos"}
             or "FA_NATIVE_HITL_TTL_SECONDS" in environment
             and re.fullmatch(r"[1-9][0-9]{0,5}", environment["FA_NATIVE_HITL_TTL_SECONDS"]) is None
             or any("\x00" in value or "\r" in value or "\n" in value for value in environment.values())):

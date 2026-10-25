@@ -95,12 +95,20 @@ def test_modules_keep_the_standard_flow_order(compiled):
     resources = deployments(compiled)
     by_suffix = {}
     for name, resource in resources.items():
-        match = re.search(r"-(foundry|monitoring|foundation|realtime|backup-role|backup-foundation|m3-artifacts|"
-                          r"onboarding-delegation)'", name)
+        match = re.search(r"-(network|foundry|monitoring|foundation|realtime|backup-role|backup-foundation|"
+                          r"m3-artifacts|onboarding-delegation)'", name)
         if match:
             by_suffix[match.group(1)] = json.dumps(resource)
-    assert set(by_suffix) == {"foundry", "monitoring", "foundation", "realtime", "backup-role", "backup-foundation",
-                              "m3-artifacts", "onboarding-delegation"}
+    assert set(by_suffix) == {"network", "foundry", "monitoring", "foundation", "realtime", "backup-role",
+                              "backup-foundation", "m3-artifacts", "onboarding-delegation"}
+    # ADR-0010 section 2: the VNet exists before the Foundry account (injection needs the subnet at creation), so
+    # azd deploys it on its own and the foundation does not deploy it a second time.
+    foundry, foundation = (json.loads(by_suffix[key]) for key in ("foundry", "foundation"))
+    assert any("-network'" in item for item in foundry["dependsOn"])
+    assert any("-network'" in item for item in foundation["dependsOn"])
+    assert foundation["properties"]["parameters"]["createNetwork"] == {"value": False}
+    nested = foundation["properties"]["template"]["resources"]["privateStateNetwork"]
+    assert nested["condition"] == "[parameters('createNetwork')]"
     # The foundation reads the monitoring workspace from its output (ARM orders and verifies it).
     assert "-monitoring', variables('env'))), '2025-04-01').outputs.workspaceResourceId" in by_suffix["foundation"]
     assert "-foundry'" in by_suffix["monitoring"]
@@ -128,6 +136,42 @@ def test_plus_onboarding_delegation_is_on_by_default_with_an_opt_out(compiled):
     passed = module["properties"]["parameters"]["assignmentDescription"]["value"]
     assert "variables('env')" in passed and "stage" not in passed
     assert compiled["outputs"]["FA_AGENT_ONBOARDING"]["value"] == "[parameters('enableAgentOnboarding')]"
+
+
+def rendered(template):
+    """The ABAC condition text ARM builds from a compiled delegation module's format('...', variables(...))."""
+    variables = template["variables"]
+    match = re.fullmatch(r"\[format\('(.*)', (.*)\)\]", variables["condition"])
+    names = re.findall(r"variables\('(\w+)'\)", match.group(2))
+    return re.sub(r"\{\{|\}\}|\{(\d+)\}", lambda found: variables[names[int(found.group(1))]] if found.group(1)
+                  else found.group(0)[0], match.group(1).replace("''", "'"))
+
+
+def test_cosmos_onboarding_may_add_only_openai_user_on_the_account(compiled):
+    # ADR-0006 (Neal 2026-10-24): Cosmos memory embeds at the account root, so "+" also needs the account-scope role.
+    resources = deployments(compiled)
+    (name,) = [name for name in resources if "onboarding-account-role" in name]
+    module = resources[name]
+    assert module["condition"] == "[and(parameters('enableAgentOnboarding'), variables('cosmosMemory'))]"
+    # deploy/azd/profile.py turns the account PUT on from this output, not from FA_MEMORY_BACKEND.
+    assert compiled["outputs"]["FA_AGENT_ONBOARDING_ACCOUNT_ROLE"] == {"type": "bool", "value": module["condition"]}
+    inner = module["properties"]["template"]
+    (assignment,) = [item for item in deployments(inner).values() if not item.get("existing")]
+    assert assignment["type"] == "Microsoft.Authorization/roleAssignments"
+    assert assignment["scope"] == "[resourceId('Microsoft.CognitiveServices/accounts', parameters('accountName'))]"
+    properties = assignment["properties"]
+    assert inner["variables"]["rbacAdministrator"] == "f58310d9-a9f6-439a-9e8d-f62e7b41a168"
+    assert properties["roleDefinitionId"] == (
+        "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('rbacAdministrator'))]")
+    assert properties["principalType"] == "ServicePrincipal" and properties["conditionVersion"] == "2.0"
+    # The project delegation's exact condition with its write set cut to OpenAI User; deletes stay refused.
+    project = next(resource for name, resource in resources.items() if "onboarding-delegation" in name)
+    expected = rendered(project["properties"]["template"]).replace("53ca6127-db72-4b80-b1b0-d745d6d5456d, ", "")
+    assert rendered(inner) == expected
+    assert "GuidEquals {5e0bd9bd-7b93-4f28-af87-19fc36ad61bd} AND" in expected and "53ca6127" not in expected
+    # Literally: the write clause names only OpenAI User; the delete clause only the all-zero GUID.
+    assert re.findall(r"GuidEquals \{([^}]*)\}", rendered(inner)) == [
+        "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd", "00000000-0000-0000-0000-000000000000"]
 
 
 def test_upgrade_snapshot_account_is_opt_in_and_off_by_default(compiled):
@@ -167,7 +211,25 @@ def test_parameters_file_maps_every_required_parameter_to_azd_values(compiled):
     assert required <= set(parameters)
     assert set(parameters) <= set(compiled["parameters"])
     for name, item in parameters.items():
-        assert re.fullmatch(r"\$\{(AZURE|FA)_[A-Z_]+(=[A-Za-z]+)?\}", item["value"]), name
+        assert re.fullmatch(r"\$\{(AZURE|FA)_[A-Z_]+(=[A-Za-z][A-Za-z-]*)?\}", item["value"]), name
+
+
+def test_network_mode_is_an_azd_input_that_defaults_to_public(compiled):
+    # ADR-0010 section 1: one option, two values; an unset FA_NETWORK_MODE keeps today's public deployment.
+    parameters = json.loads((AZD / "main.parameters.json").read_text(encoding="utf-8"))["parameters"]
+    assert parameters["networkMode"]["value"] == "${FA_NETWORK_MODE=public}"
+    spec = compiled["parameters"]["networkMode"]
+    assert spec["defaultValue"] == "public" and spec["allowedValues"] == ["public", "private"]
+    assert "FA_NETWORK_MODE" in HOOKS.read_text(encoding="utf-8").split("USER_INPUTS = ", 1)[1].split(")", 1)[0]
+
+
+def test_private_regions_are_main_bicep_regions_without_ukwest(compiled):
+    # ADR-0010 section 1: ukwest is offered by main.bicep but absent from the Agent Service region table.
+    spec = importlib.util.spec_from_file_location("fa_azd_regions", HOOKS)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["fa_azd_regions"] = module
+    spec.loader.exec_module(module)
+    assert module.PRIVATE_REGIONS == set(compiled["parameters"]["location"]["allowedValues"]) - {"ukwest"}
 
 
 def test_every_value_the_hooks_read_is_an_output_or_written_by_a_hook(compiled):

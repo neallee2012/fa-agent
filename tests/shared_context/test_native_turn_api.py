@@ -110,7 +110,9 @@ class NativeTransport:
             value = existing or NativeReceipt(
                 agent_id=self.target.agent_id, hosted_session_id=self.target.session_id,
                 request_id=command.command.request_id,
-                conversation_id=command.command.conversation_id or "native-cid",
+                # Like Hosted: a routine run without a command CID opens the one its origin names.
+                conversation_id=command.command.conversation_id or (
+                    command.routine.conversation_id if command.operation == "routine_receive" else "native-cid"),
                 command=command.command, capture=command.capture, submit_digest=command.sha256,
                 capture_digest=command.capture.sha256, status="accepted", state_profile=command.state_profile,
                 routine=getattr(command, "routine", None),
@@ -161,13 +163,24 @@ class NativeTransport:
                 finished_at=self.finished_at if done else None)
         elif command.operation == "received":
             from shared_context.behavior_native_turn_wire import NativeReceivedItem, NativeReceivedPage
-            value = NativeReceivedPage(agent_id=self.target.agent_id, next_after=None, items=tuple(
-                NativeReceivedItem(request_id=item.request_id, conversation_id=item.conversation_id,
-                                   state_profile=item.state_profile, status=item.status,
-                                   sender_agent_id=item.source.sender.agent_id, message_kind=item.source.message_kind)
-                for item in reversed(list(self.records.values()))
-                if item.source is not None and item.source.kind == "agent_request" and item.continuation is None
-                and item.command.conversation_id is None and item.status != "busy_refused")[:command.limit])
+            from shared_context.native_routine_wire import NativeRoutineDispatch
+            # Like Hosted's official list_keys page: newest first, ``after`` is the previous page's last key.
+            keys = list(reversed(list(self.records)))
+            start = 0 if command.after is None else keys.index(command.after) + 1
+            page = keys[start:start + command.limit]
+            opened = [item for item in (self.records[key] for key in page) if item.continuation is None
+                      and item.command.conversation_id is None and item.status != "busy_refused"]
+            value = NativeReceivedPage(
+                agent_id=self.target.agent_id, next_after=page[-1] if start + command.limit < len(keys) else None,
+                items=tuple(
+                    NativeReceivedItem(request_id=item.request_id, conversation_id=item.conversation_id,
+                                       state_profile=item.state_profile, status=item.status,
+                                       sender_agent_id=item.source.sender.agent_id, message_kind=item.source.message_kind)
+                    for item in opened if item.source is not None and item.source.kind == "agent_request"),
+                routine_runs=tuple(NativeRoutineDispatch(
+                    routine_id=item.routine.occurrence.routine_id, scheduled_for=item.routine.occurrence.scheduled_for,
+                    request_id=item.request_id, conversation_id=item.conversation_id, status=item.status)
+                    for item in opened if item.routine is not None))
         else:
             original = self.records[command.request_id]
             field = "cancel_requested" if command.operation == "cancel" else "delivered"

@@ -107,6 +107,15 @@ def test_a_stale_version_or_a_missing_first_secret_is_refused_before_any_write(c
     assert len(connectors.foundry.created) == 1
 
 
+def test_a_private_network_refusal_reaches_the_page_with_its_own_code(connectors):
+    connectors.environ["FA_NETWORK_MODE"] = "private"
+    owner, _ = console_for(connectors)
+    with pytest.raises(ConsoleError) as refused:
+        owner.change(command("8" * 32, None, secret=SECRET))
+    assert (refused.value.code, refused.value.status) == ("TEAM_CONNECTOR_PRIVATE_NETWORK", 422)
+    assert connectors.foundry.created == [] and connectors.foundry.puts == []
+
+
 def test_a_read_only_login_sees_the_card_but_cannot_change_and_a_non_owner_sees_nothing(connectors):
     reader, sent = console_for(connectors, "read_only")
     assert reader.connectors() == {"schema_version": "fa-console-team-connectors-v1", "can_manage": False,

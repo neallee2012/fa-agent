@@ -234,6 +234,9 @@ def test_turn_end_hint_follows_the_recorded_usage_and_negotiate_is_owner_only(re
     assert h.client.post(AGENT_TURN_USAGE_PATH, json=body, headers=h.headers("agent")).status_code == 200
     different = dict(body, usage=report(group(requests=4)).model_dump(mode="json"))
     assert h.client.post(AGENT_TURN_USAGE_PATH, json=different, headers=h.headers("agent")).status_code == 409
+    # ADR-0011: an extraction's memory usage is not the end of a turn, so it sends no hint.
+    assert h.client.post(AGENT_TURN_USAGE_PATH, json=dict(body, source="memory"),
+                         headers=h.headers("agent")).status_code == 200
     assert h.client.post(AGENT_TURN_USAGE_PATH, json=body, headers=h.headers()).status_code == 403
     assert realtime.messages() == [{"schema_version": "fa-realtime-event-v1", "type": "turn.finished",
                                     "team_id": team, "agent_id": agent.actor_id, "request_id": "vm-turn"}]

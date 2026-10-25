@@ -16,8 +16,8 @@ DESCRIPTION = (
     "(for example: check a site for new articles every morning at 9). Use this instead of cron, shell timers or "
     "sleeping in the sandbox: this environment sleeps when idle and cannot keep its own timers. The owner must "
     "approve the exact draft on an approval card; until then nothing is scheduled, and neither your words nor a "
-    "chat reply count as approval. Once approved it runs every day in this conversation, and each run's tool calls "
-    "still follow the normal approval rules. One call proposes one routine; to change one, the owner disables it "
+    "chat reply count as approval. Once approved it runs every day, each time in a new conversation that has none "
+    "of this or earlier runs' history, and each run's tool calls still follow the normal approval rules. One call proposes one routine; to change one, the owner disables it "
     "in settings and you propose a new one.")
 
 

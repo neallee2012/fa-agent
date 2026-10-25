@@ -18,6 +18,10 @@ param vnetName string
 param privateEndpointSubnetName string = 'snet-private-endpoints'
 param privateEndpointName string
 param tags object = {}
+@description('ADR-0010 phase 2b (an existing VNet): the private endpoint subnet ID. Empty uses vnetName and privateEndpointSubnetName in this resource group.')
+param privateEndpointSubnetResourceId string = ''
+@description('false (FA_DNS_MODE=existing): the private endpoint gets no DNS zone group; the user serves the name.')
+param privateDnsZones bool = true
 
 // prefixMatch starts with the container name (lifecycle-management-policy-structure); the root is SNAPSHOT_ROOT
 // in shared_context/upgrade_snapshot_store.py.
@@ -152,7 +156,7 @@ module blobEndpoint 'br/public:avm/res/network/private-endpoint:0.12.1' = if (de
     location: location
     tags: tags
     enableTelemetry: false
-    subnetResourceId: subnet.id
+    subnetResourceId: privateEndpointSubnetResourceId == '' ? subnet.id : privateEndpointSubnetResourceId
     privateLinkServiceConnections: [
       {
         name: 'fa-upgrade-snapshot-blob'
@@ -164,7 +168,7 @@ module blobEndpoint 'br/public:avm/res/network/private-endpoint:0.12.1' = if (de
         }
       }
     ]
-    privateDnsZoneGroup: {
+    privateDnsZoneGroup: privateDnsZones ? {
       name: 'default'
       privateDnsZoneGroupConfigs: [
         {
@@ -172,7 +176,7 @@ module blobEndpoint 'br/public:avm/res/network/private-endpoint:0.12.1' = if (de
           privateDnsZoneResourceId: blobDns.id
         }
       ]
-    }
+    } : null
   }
   dependsOn: [
     storage

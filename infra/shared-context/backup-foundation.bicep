@@ -17,6 +17,12 @@ param createBlobPrivateDnsZone bool = true
 param createBlobDnsVnetLink bool = true
 param blobDnsVnetLinkName string = 'facontext-api-link'
 
+@description('ADR-0010 phase 2b (an existing VNet in another resource group): its ID and the private endpoint subnet ID. Empty uses vnetName and privateEndpointSubnetName in this resource group.')
+param vnetResourceId string = ''
+param privateEndpointSubnetResourceId string = ''
+@description('false (FA_DNS_MODE=existing): the private endpoint gets no DNS zone group; the user serves the name.')
+param privateDnsZones bool = true
+
 var tags = {
   workload: 'hosted-sandbox-poc'
   architecture: 'm1-private-environment-backup'
@@ -137,7 +143,7 @@ module blobDnsLink 'br/public:avm/res/network/private-dns-zone/virtual-network-l
     tags: tags
     enableTelemetry: false
     registrationEnabled: false
-    virtualNetworkResourceId: vnet.id
+    virtualNetworkResourceId: vnetResourceId == '' ? vnet.id : vnetResourceId
   }
   dependsOn: [
     blobDns
@@ -151,7 +157,7 @@ module blobEndpoint 'br/public:avm/res/network/private-endpoint:0.12.1' = {
     location: location
     tags: tags
     enableTelemetry: false
-    subnetResourceId: subnet.id
+    subnetResourceId: privateEndpointSubnetResourceId == '' ? subnet.id : privateEndpointSubnetResourceId
     privateLinkServiceConnections: [
       {
         name: 'm1-backup-blob'
@@ -163,7 +169,7 @@ module blobEndpoint 'br/public:avm/res/network/private-endpoint:0.12.1' = {
         }
       }
     ]
-    privateDnsZoneGroup: {
+    privateDnsZoneGroup: privateDnsZones ? {
       name: 'default'
       privateDnsZoneGroupConfigs: [
         {
@@ -171,7 +177,7 @@ module blobEndpoint 'br/public:avm/res/network/private-endpoint:0.12.1' = {
           privateDnsZoneResourceId: existingBlobDns.id
         }
       ]
-    }
+    } : null
   }
   dependsOn: [
     blobDns
