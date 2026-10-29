@@ -228,7 +228,7 @@ gpt-6 系列（`gpt-6-luna`、`gpt-6.1-sol`）quota 是 0，要改選 `gpt-5.4-m
 - VNet 多一段 192.168.97.0/24 的 `snet-agents`：委派給 `Microsoft.App/environments`，只給 Foundry Hosted Agent 用；有自己的 NSG（只有預設規則，要限制出站時自己加規則）；
 - NAT Gateway 與它的固定公網 IP：`snet-api` 和 `snet-agents` 都經它出站（不論 `FA_API_SUBNET_NAT_EGRESS`）；
 - Foundry 帳號：Hosted Agent 注入 `snet-agents`；關閉公網（`publicNetworkAccess: Disabled`，`networkAcls` 為 `Deny`＋`AzureServices`）；private endpoint 放在 `snet-private-endpoints`；三個 private DNS zone（`privatelink.cognitiveservices.azure.com`、`privatelink.openai.azure.com`、`privatelink.services.ai.azure.com`）連到 VNet；
-- 不建 project capability host（平台會自動建帳號層級的，ADR-0010 第 0 階段實測）；
+- project capability host `caphostproj`（2026-10-28 起；Basic、不帶 BYO connection）：WebIQ 等 Foundry 外的 MCP、OpenAPI、A2A 工具經 VNet 呼叫時官方要求要有它，只有帳號層級的不夠（[toolbox network isolation](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/tools/toolbox-network-isolation)）。帳號層級的由平台隨注入自動建（ADR-0010 第 0 階段實測），FA 不另建。官方範本寫注入帳號上建 capability host 可能要約 30–35 分鐘，所以第一次 `private` provision 可能多這麼久，不要以為卡住而中斷（未實測）。這版之前建的 `private` 環境，下一次 `azd provision` 會補建。還沒在雲端測過。**建立失敗（`Failed`）時重跑 `azd provision` 修不好**：官方寫「Updating capability hosts is not supported」，只能刪掉重建（[Capability hosts](https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/capability-hosts)）。這時 preprovision 會停下、什麼都不改，並印出完整指令；由你自己決定刪除（hook 不自動刪）：`az rest --method delete --url "/subscriptions/<訂閱>/resourceGroups/<RG>/providers/Microsoft.CognitiveServices/accounts/<帳號>/projects/<project>/capabilityHosts/caphostproj?api-version=2025-06-01"`，再用同一個 URL `--method get` 讀回直到 404，然後重跑 `azd provision`。官方清理工具把刪除回 409 解讀為它可能處於失敗狀態（[文件]，未實測），遇到時先讀回狀態再決定是否再刪一次；
 - 記憶開啟時（預設）：Cosmos DB for NoSQL serverless 帳號 `cosmos-<token>`（`EnableNoSQLVectorSearch`、關閉金鑰驗證與公網），`Sql` private endpoint 放在 `snet-private-endpoints`，private DNS zone `privatelink.documents.azure.com` 連到 VNet；資料庫 `fa-memory`、container `memories`（partition key `/scope`，1536 維 cosine `quantizedFlat`）；只有 API 身分有一個自訂資料角色（5 個 dataActions，不能刪除），範圍是這個 container（[ADR-0011](../../docs/adr/0011-private-mode-cosmos-memory.md) 第 5 節）。每個 Agent 身分除了 project 的 Foundry User／OpenAI User，另給 Foundry 帳號範圍的 Cognitive Services OpenAI User（embedding 走帳號根路徑；隨 RG 刪除）：seed Agent 由 postdeploy 指派；用「＋」新增的 Agent 由 API 指派，為此 API 身分在帳號上另有一筆受限 RBAC Admin，只能把這一個角色指派給 service principal、不能刪除（`FA_ENABLE_AGENT_ONBOARDING=false` 時不建，[ADR-0006](../../docs/adr/0006-team-trust-boundary-grokbot-mode.md)）。API 只在 Bicep 輸出 `FA_AGENT_ONBOARDING_ACCOUNT_ROLE=true`（provision 真的建了這筆委派）時才送 account 那筆指派（`FA_ONBOARDING_ACCOUNT_ROLE`）。這版之前建立的 `private` 環境要先重跑 `azd provision`；沒重跑、只跑 `azd deploy` 時，deploy 會印警告，「＋」照樣完成（只有兩個 project 角色），但新 Agent 的記憶不能用（抽取會略過、什麼都不寫）。重跑後新增的 Agent 才有這個角色，之前新增的要手動補。不建 Memory Store。Cosmos 是 `private` 部署裡最慢的一段（探針第一次約 11 分鐘）。記憶抽取用 `FA_MEMORY_CHAT_MODEL`（沒設時是預設模型）：預設模型較大時，建議在第一次 `azd up` 前把 `FA_MEMORY_CHAT_MODEL` 設成 `FA_MODELS` 裡的小模型（例如 `gpt-5.4-mini` 或 `gpt-4.1-mini`），抽取的延遲與費用較低。
 
 azd 先單獨部署 VNet 再建 Foundry 帳號，所以傳給 `foundation.bicep` 的 `createNetwork` 是 `false`。在 `private` 環境手動單獨重跑 `foundation.bicep` 時必須傳 `networkMode=private`，否則 VNet 會被更新成沒有 `snet-agents`（見 [deploy/README.md](../README.md)「先嘗試原地 reconcile」）。
@@ -253,7 +253,7 @@ Foundry 帳號關閉公網後，postdeploy 從你的電腦呼叫 Foundry 資料�
 1. 在建 image 之前就決定要不要開窗口，要的話向 `https://api.ipify.org` 讀你這台電腦目前的公網 IPv4。讀不到或不是公網 IPv4（含 multicast）就停下，什麼都不寫。
 2. 印出要允許的 IP 和窗口會開多久，請你在終端機輸入同一個 IP 確認。沒有終端機時設 `FA_CONFIRM_DEPLOY_WINDOW=<IP>`（必須等於這次讀到的 IP，換了網路就要重設）。不符就停下，什麼都不寫；因為在建 image 之前問，不會白等一次建置。
 3. 建完 image、要跑這幾步之前才開窗口：先再讀一次 IP，和確認的不同（建置期間換了網路）就停下、不開。再用 ARM PATCH 只改 `publicNetworkAccess: Enabled` 和 `networkAcls` 的三個欄位（`defaultAction: Deny`、`bypass: AzureServices`、`ipRules` 只有你的 IP）；`networkAcls` 的其他欄位（例如 `virtualNetworkRules`）照讀到的原樣送回，`networkInjections` 等其他屬性都不送。等資料面回應（實測約 4 秒，最多等 3 分鐘）。
-4. 跑完這幾步（不論成功、失敗或按 Ctrl+C），一定 PATCH 回 `publicNetworkAccess: Disabled`、`ipRules` 清空，並讀回確認（輪詢最多 2 分鐘；每次 `az` 呼叫最多等 90 秒，逾時視為關不回去）；關的這段時間 Ctrl+C 會被忽略。關不回去時印出大段警告與要你自己執行的 `az rest --method patch …` 指令（body 檔在 `.azure/<env>/fa/foundry-window-close.json`），hook 以非零結束。
+4. 跑完這幾步（不論成功、失敗或按 Ctrl+C），一定 PATCH 回 `publicNetworkAccess: Disabled`、`ipRules` 清空，並讀回確認（最多讀 24 次、間隔 5 秒；每次 `az` 呼叫最多等 90 秒；PATCH 或讀回逾時視為關不回去，逾時的讀取不會再讀）；關的這段時間 Ctrl+C 會被忽略。因為下面說的暫時性錯誤會再讀，最壞要等約 23 分鐘再加上各次 `az` 呼叫的時間，不是 2 分鐘。關不回去時印出大段警告，寫明帳號可能還對哪個 IP 開著，以及要你自己執行的 `az rest --method patch …` 關閉指令（body 檔在 `.azure/<env>/fa/foundry-window-close.json`）和讀回指令，hook 以非零結束。2026-10-28 起，關窗口的讀取（PATCH 前讀帳號、PATCH 後讀回）遇到暫時性錯誤（`Service Unavailable`、`Bad Gateway`、`Gateway Timeout`、`Too Many Requests`，或回 HTML 錯誤頁）會在 5、15、30 秒後再讀，最多讀 4 次；PATCH 本身只送一次。PATCH 前那次讀取 4 次都失敗或逾時時，改用這次開窗口時讀到的帳號組出關閉 body，PATCH 一樣只送一次（這是第一次送，不是重送），再讀回確認。代價：窗口開著的這幾分鐘內若有人改了 `networkAcls`（例如 `virtualNetworkRules`），這個 body 會把它改回開窗口時的樣子；先確保窗口關上比較安全。上次中斷留下的窗口（第 5 點）直接用一開始讀到的帳號組 body，不再多讀一次。那天的拆除就是 PATCH 前那次讀取回 HTML 503，PATCH 沒送出，帳號對部署者 IP 開了約 2 分鐘，靠手動重跑才關上。
 5. 上次執行在窗口打開時被中斷（關掉終端機等），下一次 `azd deploy`／`azd hooks run postdeploy` 一開始會讀帳號，發現還開著就先關、讀回，再繼續；`azd down` 的 `predown` 也會在問問題之前先關。`azd provision` 也會照 Bicep 把它設回 `Disabled`。
 
 注意：
@@ -428,6 +428,15 @@ Responses 通道、伺服器提供的全部能力（桌面、技能、Shell、�
 - 上面的檢查只看會進映像的檔案：三個 Dockerfile（api、hosted、console）、`.dockerignore`，以及它們 `COPY` 自 build context 的路徑。`src/fa-shared-context-poc` 底下只改文件（README 等）不會擋住 `azd deploy`。
 - `guard` 要求這次的 commit 包含正在服務的 API revision 記錄的 commit（不能用較舊或另一條分支的 commit 蓋過去，要部署就先合併）；revision 名稱不是部署腳本取的，只警告、不停。
 - 正在服務的 revision 記錄的 commit 已不在這個 checkout 的歷史裡（部署過的 feature branch 被 rebase 或丟掉）時，`guard` 也會停下，之後每次 `azd deploy` 都一樣。確定要部署時，這一次加 `FA_ALLOW_ROLLBACK=true`（例如 `azd env set FA_ALLOW_ROLLBACK true`，用完 `azd env set FA_ALLOW_ROLLBACK false`）：停止改成一行 `::warning::`，並略過回退檢查與變更報告，只在這一次執行生效。commit 還在歷史裡、只是這次的 commit 不包含它時，仍然停下，這個開關不放行。stage CI（deploy-staging）**不認也不設** `FA_ALLOW_ROLLBACK`，維持嚴格；stage 上遇到這種停止，由維護者決定怎麼處理，不靠 workflow 繞過。
+
+<a id="stage-shaped-profile"></a>
+### 給 stage CI 用的 profile（ADR-0010 [stage 改成 private](../../docs/adr/0010-azd-private-network-option.md#stage-private-1026)）
+
+`python deploy/azd/stage_profile.py`（在 repo 根目錄、選好 azd 環境後跑）寫出 `.azure/<env>/fa/stage/stage.json` 與 `runtime/`，和 `deploy/stage/` 同樣的擺法，
+讓 `ci_deploy.py --config .azure/<env>/fa/stage/stage.json` 照 deploy-staging 的步驟跑。內容就是上面的 azd profile，只多 azd 不寫的三項，各自在 azd 環境有設時才加：
+`FA_DEPLOY_CLIENT_ID` → `deploy_client_id`（只有 `meta` 要；筆電跑 `check`，不設）；`FA_FEED_APP`＋`FA_FEED_PUBLIC_KEY`（一起設）→ `feed_app`、`feed_environment`，
+並宣告 API secret `fa-feed-mcp-signing-key`（`FA_FEED_SIGNING_SECRET` 可改名；這個 secret 要先存在 API app 上，否則 `ci_deploy.py api` 會停下）。`runtime/` 每次整份換成 azd 已部署的那份（不合併、不重產）：`api` 步驟要求部署中的
+`BEHAVIOR_SERVER_CONFIG_JSON` 和它一模一樣。
 ## 刪除
 
 ```bash
@@ -459,16 +468,17 @@ azd down --purge
 注入 VNet 的 Foundry 帳號要照順序刪，azd 自己刪 RG 時不會照這個順序，所以 `FA_NETWORK_MODE=private` 的 `predown` 先把它刪完，再交給 azd。上面 `public` 的行為不變。
 
 - **一律問一次環境名稱**，不論備份鎖在不在；和備份鎖的確認合併成同一次詢問，問句本身就寫「permanently delete and purge」（永久刪除並 purge）。沒有終端機時設 `FA_CONFIRM_DELETE=<環境名稱>`；**這個值也同意替這次讀到的 IP 開窗口刪 Agent**（說明裡會印出那個 IP）。輸入不符就停下，什麼都不刪。
-- 問之前先唯讀讀出目前狀態：帳號不是注入 VNet 的帳號（`FA_NETWORK_MODE=private` 設錯）就停下，什麼都不刪；資源群組已經不在就說明一切都已刪除，直接結束（soft-delete 的帳號不隨群組消失：還讀得到就印出 purge 指令讓你自己執行，因為這條路沒有問過確認）；上次部署中斷留下的窗口先關掉並讀回（這是回到 Bicep 的狀態，不需要確認，所以就算之後輸入不符、沒有終端機或讀 IP 失敗也會先關）。接著用短短幾行說明：Foundry 帳號（模型、Hosted Agent）會被**永久刪除並 purge**；要刪 Agent 時會暫時對哪個 IP 開窗口；確認後 azd 還會問自己的 `y/N` 處理其餘資源。**在 azd 的 `y/N` 答 N 時，Foundry 帳號已經刪了、其他資源還在**；之後再跑 `azd up` 會建一個新的注入帳號。
+- 問之前先唯讀讀出目前狀態：帳號不是注入 VNet 的帳號（`FA_NETWORK_MODE=private` 設錯）就停下，什麼都不刪；資源群組已經不在就說明一切都已刪除，直接結束（soft-delete 的帳號不隨群組消失：還讀得到就印出 purge 指令讓你自己執行，因為這條路沒有問過確認）；上次部署中斷留下的窗口先關掉並讀回（這是回到 Bicep 的狀態，不需要確認，所以就算之後輸入不符、沒有終端機或讀 IP 失敗也會先關）。接著用短短幾行說明：Foundry 帳號（模型、Hosted Agent）會被**永久刪除並 purge**（有 project capability host 時先刪它，光這一步最多可能等 30 分鐘）；要刪 Agent 時會暫時對哪個 IP 開窗口；確認後 azd 還會問自己的 `y/N` 處理其餘資源。**在 azd 的 `y/N` 答 N 時，Foundry 帳號已經刪了、其他資源還在**；之後再跑 `azd up` 會建一個新的注入帳號。
 - 確認後依序執行（第 0／0b 階段實測的順序）：
   1. project 還在時：開[部署窗口](#private-deploy-window)（同一個 IP，由上面那一次確認涵蓋，不再另外問），用 `force=true` 刪掉所有 Hosted Agent（有 session 時不加 `force` 會回 409；回 404 視為已刪），關窗口並讀回。project 已不在就略過，Agent 已隨 project 刪除；project 已在 `Deleting`（上次執行刪到一半）就只輪詢，不再開窗口。
-  2. 刪 project（要先刪 project，帳號才刪得掉，否則回 `CannotDeleteResource`），只送一次（沒有下一步的例外），讀回直到不見；CLI 回錯誤時和帳號一樣先讀狀態。
-  3. 刪 Foundry 帳號，只送一次。CLI 回錯誤（特別是 `GatewayTimeout`）時，帳號常常其實已經在 `Deleting`：hook 讀狀態並輪詢，**不重送**。唯一例外：project 剛讀回不見，帳號那邊還列著它，刪帳號回 `CannotDeleteResource` 且列出的巢狀資源只有這個 project（實測 2026-10-24），表示什麼都沒被接受，hook 每 15 秒重送一次、最多 5 分鐘，到上限仍被拒就停下、帳號還在；列到更深的資源（例如 project 底下的 connections）、帳號的 `capabilityHosts` 或別的 project 時不重送，讀一次狀態後停下。`GatewayTimeout` 後約 90 秒內還讀到 `Succeeded`，就表示刪除沒有開始，hook 停下說明；重跑 `azd down` 會先讀狀態再送一次。
-  4. 輪詢帳號直到消失（實測約 22 分鐘，最多等 45 分鐘，約每分鐘印一行進度）。
-  5. 帳號消失後才 purge（`Deleting` 時 purge 不會結束），讀回直到 soft-delete 的帳號也不見。
-  6. 讀回 `snet-agents`（[帶入既有 VNet](#byo-vnet) 時是你的 agent subnet，只讀不刪）的 service association link 直到清空（最多等 20 分鐘）。
-  7. 最後移除備份鎖（印出放回去的指令），交給 azd 刪 RG（實測約 27 分鐘，卡在 Container Apps 環境）。10-24 的三次測試中，從開始拆除算起約 50～60 分鐘（`fa-priv-1024` 第一次停在傳播延遲的競態、重跑才完成；`fa-priv2-1024` 61 分，azd 印 29 分 7 秒；`fa-byo-1024` 51 分，azd 印 23 分 59 秒）。
-- **可以重跑。** 每一步都先讀目前狀態再接著做：Agent 還在？project 還在？帳號還在、已在 `Deleting`、已 soft-delete、已 purge？SAL 還在？中途停下（等太久、網路斷）就再跑一次 `azd down`。
+  2. 刪 project 的 capability host（2026-10-28 起；列出 project 底下全部的 capability host 逐一刪，和官方清理工具一樣，所以不只 `caphostproj`，別的名字或舊環境留下的也會刪）。[文件] 官方清理順序先刪 project 層級的，帳號層級的才刪得掉（範本 11 README）；FA 不單獨刪帳號層級的，靠第 6 步的 purge 觸發它的刪除，agent subnet 的 service association link 在那之後才釋放（範本 11 README；REST 規格裡 `customerSubnet` 只在帳號層級的 capability host 上）。每個只送一次，CLI 回錯誤（含 `GatewayTimeout`）時先讀狀態、輪詢、不重送，讀回直到不見（每個最多等 30 分鐘）。它是 ARM 呼叫，不開窗口；已在 `Deleting` 就只輪詢；之前建的環境沒有它（清單空的或回 404）就略過；讀清單回其他錯誤時在問確認之前停下，什麼都不刪。project 已在 `Deleting`（上次刪到一半）就不再列：[推論] 上次已先刪完它才刪 project。這一步的時間還沒實測，`azd down` 可能因此變長。
+  3. 刪 project（要先刪 project，帳號才刪得掉，否則回 `CannotDeleteResource`），只送一次（沒有下一步的例外），讀回直到不見；CLI 回錯誤時和帳號一樣先讀狀態。
+  4. 刪 Foundry 帳號，只送一次（帳號層級 capability host 不單獨刪，靠之後的 purge）。CLI 回錯誤（特別是 `GatewayTimeout`）時，帳號常常其實已經在 `Deleting`：hook 讀狀態並輪詢，**不重送**。唯一例外：project 剛讀回不見，帳號那邊還列著它，刪帳號回 `CannotDeleteResource` 且列出的巢狀資源只有這個 project（實測 2026-10-24），表示什麼都沒被接受，hook 每 15 秒重送一次、最多 5 分鐘，到上限仍被拒就停下、帳號還在；列到更深的資源（例如 project 底下的 connections）、帳號的 `capabilityHosts` 或別的 project 時不重送，讀一次狀態後停下。`GatewayTimeout` 後約 90 秒內還讀到 `Succeeded`，就表示刪除沒有開始，hook 停下說明；重跑 `azd down` 會先讀狀態再送一次。
+  5. 輪詢帳號直到消失（實測約 22 分鐘，最多等 45 分鐘，約每分鐘印一行進度）。
+  6. 帳號消失後才 purge（`Deleting` 時 purge 不會結束），讀回直到 soft-delete 的帳號也不見。
+  7. 讀回 `snet-agents`（[帶入既有 VNet](#byo-vnet) 時是你的 agent subnet，只讀不刪）的 service association link 直到清空（最多等 20 分鐘）。
+  8. 最後移除備份鎖（印出放回去的指令），交給 azd 刪 RG（實測約 27 分鐘，卡在 Container Apps 環境）。10-24 的三次測試中，從開始拆除算起約 50～60 分鐘（`fa-priv-1024` 第一次停在傳播延遲的競態、重跑才完成；`fa-priv2-1024` 61 分，azd 印 29 分 7 秒；`fa-byo-1024` 51 分，azd 印 23 分 59 秒）。
+- **可以重跑。** 每一步都先讀目前狀態再接著做：Agent 還在？project capability host 還在、已在 `Deleting`？project 還在？帳號還在、已在 `Deleting`、已 soft-delete、已 purge？SAL 還在？中途停下（等太久、網路斷）就再跑一次 `azd down`。2026-10-28 起，`predown` 與各輪詢的唯讀 ARM GET 遇到上面同一組暫時性錯誤會在 5、15、30 秒後再讀，最多讀 4 次，都失敗才停下並說明（那天兩次停下都發生在唯讀 GET，activity log 顯示每個 DELETE 都只送了一次）；DELETE 照舊只送一次，不因此重送。
 - 為什麼刪 Agent 要開窗口：Agent 只能從 Foundry 資料面刪，`Disabled` 時筆電連不到。直接刪 project 會不會連帶刪掉 Agent 沒有實測，第 0 階段是先 force 刪 Agent 才刪得掉帳號，所以照實測的順序做。
 - 拆除後的檢查項：建立 Hosted 版本時，平台會自動建 Entra agent 身分（instance identity 與 blueprint）。第 0b 階段 force 刪 Agent 後讀回 404，推定由平台自動清除，但沒有證明「無殘留」；有 Graph 讀取權限的人可以再查一次。
 - `azd down --purge` 照常可用：帳號已由 hook purge，azd 不會再找到它。2026-10-24 已在 azd 建的 VNet 上驗證（`fa-priv2-1024`：exit 0、29 分 7 秒，途中跑過 #974 的帳號刪除重送，[紀錄](../../docs/progress.md#private-reruns-1024)）；帶入既有 VNet 也已驗證（`fa-byo-1024`：exit 0，拆除後客戶 VNet 不留 FA 的 service association link 或 private endpoint）。

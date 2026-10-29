@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import jwt
 import pytest
@@ -14,7 +12,6 @@ from conftest import A, AUDIENCE, TENANT
 from shared_context.api import create_app
 from shared_context.auth import AuthSettings, JwtVerifier
 from shared_context.config import validate_api_audience
-from shared_context.production import create_production_app
 
 
 @pytest.fixture(scope="module")
@@ -106,14 +103,6 @@ def test_jwks_outage_fails_closed(system, auth, private_key):
     assert response.json()["error"]["code"] == "AUTH_KEYS_UNAVAILABLE"
 
 
-def test_production_cannot_start_without_allowlist(monkeypatch):
-    monkeypatch.setenv("CONTEXT_TENANT_ID", TENANT)
-    monkeypatch.setenv("CONTEXT_API_AUDIENCE", AUDIENCE)
-    monkeypatch.setenv("CONTEXT_ACTORS_JSON", "{}")
-    with pytest.raises(ValueError, match="nonempty actor allowlist"):
-        create_production_app()
-
-
 def test_no_arbitrary_issuer_configuration(auth):
     with pytest.raises(ValueError, match="exact tenant-specific"):
         AuthSettings(TENANT, AUDIENCE, ("https://evil.example/",), auth.actors)
@@ -144,39 +133,6 @@ def test_resource_uri_audience_is_matched_exactly(system, auth, private_key):
 def test_resource_uri_configuration_is_bounded(audience):
     with pytest.raises(ValueError):
         validate_api_audience(audience)
-
-
-def test_production_startup_uses_uami_and_never_creates_or_lists_tables(monkeypatch):
-    import shared_context.production as production
-
-    values = {
-        "CONTEXT_TENANT_ID": TENANT,
-        "CONTEXT_API_AUDIENCE": "api://00000000-0000-0000-0000-000000000013/fa-context-poc-api",
-        "CONTEXT_ISSUERS_JSON": json.dumps([f"https://sts.windows.net/{TENANT}/"]),
-        "CONTEXT_ACTORS_JSON": json.dumps({A.oid: {"actor": A.actor, "team": A.team}}),
-        "CONTEXT_TABLE_ENDPOINT": "https://stfacontextpocdemo.table.core.windows.net",
-        "CONTEXT_TABLE_NAME": "workstate",
-        "CONTEXT_MEMORY_ENDPOINT": "https://cog-fasample-memory-demo.services.ai.azure.com/api/projects/faexample",
-        "CONTEXT_MEMORY_STORE": "poc-team-memory",
-        "AZURE_CLIENT_ID": "dddddddd-dddd-dddd-dddd-dddddddddddd",
-    }
-    for key, value in values.items():
-        monkeypatch.setenv(key, value)
-    credential, table, project = Mock(), Mock(), Mock()
-    credential_factory, table_factory, project_factory = Mock(return_value=credential), Mock(return_value=table), Mock(return_value=project)
-    monkeypatch.setattr(production, "ManagedIdentityCredential", credential_factory)
-    monkeypatch.setattr(production, "TableClient", table_factory)
-    monkeypatch.setattr(production, "AIProjectClient", project_factory)
-    app = production.create_production_app()
-    credential_factory.assert_called_once_with(client_id=values["AZURE_CLIENT_ID"])
-    assert table_factory.call_args.kwargs["table_name"] == "workstate"
-    assert table_factory.call_args.kwargs["credential"] is credential
-    with TestClient(app) as client:
-        assert client.get("/healthz").status_code == 200
-        assert table.method_calls == []
-        assert project.method_calls == []
-        assert credential.method_calls == []
-    assert [call[0] for call in table.method_calls] == ["close"]
 
 
 class _CountingKeys:

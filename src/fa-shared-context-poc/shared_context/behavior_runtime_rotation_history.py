@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import timedelta
-from typing import Literal
+from typing import Literal, get_args, get_origin
 
 from . import behavior_delivery as d, behavior_foundry as n, behavior_inbox as inbox
 from . import behavior_migration as m, behavior_operations as op, behavior_workers as w
@@ -1314,6 +1314,35 @@ def validate_retirement(inventory, config):
     }
 
 
+def _row_shape(model):
+    """(required keys, allowed keys, kind Literal or None), or None when a validator or alias could rewrite input."""
+    fields = model.model_fields
+    try:  # private in pinned pydantic 2.12.5 (_internal/_decorators.py:415 DecoratorInfos): any other shape is slow path
+        decorators = model.__pydantic_decorators__
+        rewrites = bool(decorators.validators or decorators.root_validators
+                        or any(item.info.mode != "after" for item in (*decorators.model_validators.values(),
+                                                                       *decorators.field_validators.values())))
+    except (AttributeError, TypeError):
+        return None
+    if (model.model_config.get("extra") != "forbid" or getattr(model, "__pydantic_root_model__", False) or rewrites
+            or any(field.alias not in (None, name) or field.validation_alias is not None
+                   for name, field in fields.items())):
+        return None
+    kind = fields.get("kind")
+    kinds = (get_args(kind.annotation) if kind is not None and not kind.metadata
+             and get_origin(kind.annotation) is Literal else None)
+    return frozenset(name for name, field in fields.items() if field.is_required()), frozenset(fields), kinds
+
+
+def _refused(shape, data):
+    """True only where pydantic must refuse the row (a missing or extra key, or a kind outside the Literal)."""
+    if shape is None:
+        return False
+    required, allowed, kinds = shape
+    return (not required <= data.keys() <= allowed
+            or kinds is not None and "kind" in data and data["kind"] not in kinds)
+
+
 def validate_additions(inventory, config, previous, retained, metadata, *, bindings_override=None, extra_models=(),
                        max_inventory_entities=m.DEFAULT_INVENTORY_MAX_ENTITIES):
     """Startup admits typed current work, not a renewed predecessor capability."""
@@ -1341,6 +1370,8 @@ def validate_additions(inventory, config, previous, retained, metadata, *, bindi
         d.VerifiedDeliveryReceipt, m.HostedReportBody, m._NativePostIntent, m._WorkerAdmission,
         NoteProposalRecord, MemoryCandidateRecord, NoteSynthesisRecord,
     ) + tuple(extra_models)
+    # Skipping a model only where it must fail leaves each row's matches, and so every message, unchanged.
+    shapes = tuple((model, _row_shape(model)) for model in models)
     selected = config.bindings if bindings_override is None else bindings_override
     bindings = {binding.binding_id: binding for binding in selected}
     jobs = {binding.job_id for binding in selected}
@@ -1423,7 +1454,9 @@ def validate_additions(inventory, config, previous, retained, metadata, *, bindi
             value = m._parsed(data, model)
         else:
             matches = []
-            for model in models:
+            for model, shape in shapes:
+                if _refused(shape, data):
+                    continue
                 try:
                     matches.append(model.model_validate_json(canonical(data)))
                 except (ValueError, TypeError):

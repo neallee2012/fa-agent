@@ -1075,3 +1075,17 @@ def test_the_adapter_maps_a_live_refusal_by_its_string_code_or_its_status(
     finally:
         client.close()
     assert (refused.value.code, refused.value.automatic_retry) == (expected, retry)
+
+
+def test_the_adapter_maps_a_live_refusal_too_deep_to_parse_by_its_status(responses_console):
+    # Within the 8 KB it reads, but deeper than the JSON parser's recursion limit.
+    c, _env = responses_console
+    draft = first(c)
+    assert send(c, draft, "Stream the reply.").status_code == 200
+    adapter, client, cid = _live_adapter(c, draft, lambda request: httpx.Response(404, content=b"[" * 8192))
+    try:
+        with pytest.raises(ConsoleError) as refused:
+            adapter.live_text(cid, draft["request_id"], c.ui.console.vault.get())
+    finally:
+        client.close()
+    assert (refused.value.code, refused.value.status, refused.value.automatic_retry) == ("NO_RESULT", 409, False)

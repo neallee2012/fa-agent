@@ -41,6 +41,14 @@ COMMON_REQUIRED = (
 )
 
 
+def write_x(path: Path, value: Any) -> None:
+    """Create `path` with indent-1 JSON and fsync it; an existing file raises FileExistsError, never replaced."""
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump(value, stream, indent=1)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def config_path(value: str | os.PathLike[str] | None = None) -> Path:
     """Resolve an explicit path, the environment override, or the stage default."""
     selected = value or os.environ.get(CONFIG_ENV)

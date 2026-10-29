@@ -512,6 +512,70 @@ def test_stopped_continuation_returns_one_original_outcome_without_rewriting_unk
         assert all(reply == expected for reply in replies)
 
 
+def test_a_continuation_stopped_after_it_started_but_before_it_ran_never_runs_the_sdk(local_env, monkeypatch):
+    """The owner stops the root after its continuation is marked started but before that run begins: the run reads
+    the stop first, ends the continuation unknown NATIVE_TURN_CANCELLED and never starts the SDK."""
+    from azure.ai.agentserver.core.tasks import RetryPolicy
+    from shared_context.behavior_native_turn_wire import NativeCancel, NativeContinuationSubmit
+    from shared_context.native_effects import NativeEffects
+    from shared_context.native_turns import NativePostTurnPending
+
+    first_sdk = OfflineSdk()
+    first_runtime = NativeTurnRuntime(IDENTITY, first_sdk)
+
+    async def tracked(receipt, scope, previous, control):
+        await NativeEffects(first_runtime, receipt, control).start_operations()
+        return await first_sdk(receipt, scope, previous, control)
+
+    async def unexpected(_view):
+        raise AssertionError("No continuation is dispatched before official recovery")
+
+    first_runtime.executor = tracked
+    first_runtime.on_continuation = unexpected
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=first_runtime)) as client:
+        first = Harness(first_runtime, first_sdk, client)
+        first.invoke(submit("stop-base"))
+        base = first.wait("stop-base", "completed")
+        first_sdk.block = True
+        first.invoke(submit("stop-root", base.conversation_id))
+        source = first.wait("stop-root", "started")
+    sdk = OfflineSdk()
+    runtime = NativeTurnRuntime(IDENTITY, sdk, delivery_retry=RetryPolicy(
+        max_attempts=3, initial_delay=0.01, max_delay=0.01, jitter=False, retry_on=(NativePostTurnPending,)))
+    children, stopped = [], []
+
+    async def deliver(view):
+        original = await runtime.read(view.original_request_id)
+        children.append(view.request_id)
+        return await runtime.continue_turn(NativeContinuationSubmit(
+            command=original.command.model_copy(update={
+                "request_id": view.request_id, "conversation_id": original.conversation_id}),
+            capture=original.capture, continuation=view.continuation))
+
+    run_started = runtime._run_started
+
+    async def stop_first(original, control, signals):
+        if original.value.receipt.continuation is not None:
+            stopped.append(await runtime.cancel(NativeCancel(
+                conversation_id=source.conversation_id, request_id=source.request_id)))
+        return await run_started(original, control, signals)
+
+    runtime.on_continuation = deliver
+    monkeypatch.setattr(runtime, "_run_started", stop_first)
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
+        current = Harness(runtime, sdk, client)
+
+        async def child_ran():
+            while not stopped:
+                await asyncio.sleep(0.01)
+
+        current.call(asyncio.wait_for, child_ran(), 8)
+        child = current.wait(children[0], "unknown")
+        assert child.failure_code == "NATIVE_TURN_CANCELLED"
+        assert child.continuation is not None and sdk.calls == []
+        assert [receipt.request_id for receipt in stopped] == [source.request_id]
+
+
 @pytest.mark.parametrize("applied", [False, True])
 def test_recovery_intent_response_loss_keeps_one_child_and_the_original_unknown(local_env, monkeypatch, applied):
     from azure.ai.agentserver.core.storage import FoundryStateStore

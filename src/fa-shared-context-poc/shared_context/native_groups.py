@@ -30,6 +30,114 @@ def group_post_id(group_id, speaker_agent_id, request_id):
                    "speaker_agent_id": speaker_agent_id, "request_id": request_id})
 
 
+def _unconfirmed(error):
+    """A conflicting or failed write may still have landed, so its outcome is read back."""
+    return error.status in {409, 412} or error.status >= 500
+
+
+def _find_post(posts, post_id):
+    return next((post for post in posts if post.post_id == post_id), None)
+
+
+def _check_speaker(view, speaker_agent_id, command):
+    if speaker_agent_id not in view.member_agent_ids:
+        raise Problem(403, "NATIVE_GROUP_MEMBER_REQUIRED", "only an original group member may publish")
+    if command.recipient_agent_id is not None and command.recipient_agent_id not in view.member_agent_ids:
+        raise Problem(403, "NATIVE_GROUP_MEMBER_REQUIRED", "the published addressee must be a group member")
+    if ((command.turn is None) != (command.result is None) and command.kind != "blocked"
+            or command.turn is not None and command.turn.agent_id != speaker_agent_id):
+        raise Problem(409, "NATIVE_GROUP_CONFLICT", "a saved result must retain its original speaking Agent")
+
+
+def _check_open_round(view, speaker_agent_id, command):
+    if view.state != "open":
+        raise Problem(409, "NATIVE_GROUP_CLOSED", "the original group is already closed")
+    if command.round != view.round:
+        raise Problem(409, "NATIVE_GROUP_ROUND_CHANGED", "read the original group's current round")
+    if command.kind == "final" and speaker_agent_id != view.orchestrator_agent_id:
+        raise Problem(403, "NATIVE_GROUP_ORCHESTRATOR_REQUIRED", "only the original orchestrator may conclude")
+
+
+def _settle(pending, settles, speaker_agent_id, command):
+    """Remove and return the awaiting delivery this post answers, if it names one."""
+    if settles is None:
+        return None
+    completed = next((item for item in pending if item.message_id == settles), None)
+    if (completed is None or completed.recipient_agent_id != speaker_agent_id
+            or command.kind not in {"result", "blocked"} or command.round != completed.round):
+        raise Problem(409, "NATIVE_GROUP_CONFLICT", "the result must settle its original reserved message")
+    pending.remove(completed)
+    return completed
+
+
+def _deferred(final, pending, command):
+    deferred = final and bool(pending)
+    if deferred and (command.turn is None or command.result is None):
+        raise Problem(409, "NATIVE_GROUP_ORIGINAL_RESULT_REQUIRED", "only a verified saved final can wait for results")
+    return deferred
+
+
+def _reserve(view, delivery, speaker_agent_id, command):
+    if delivery is None:
+        return None
+    delivery = NativeGroupDelivery.model_validate_json(delivery.model_dump_json())
+    if (delivery.sender_agent_id != speaker_agent_id or delivery.round != command.round
+            or delivery.recipient_agent_id != command.recipient_agent_id
+            or delivery.recipient_agent_id == speaker_agent_id
+            or delivery.status != "awaiting" or command.kind not in {"request", "handoff"}
+            or any(item.message_id == delivery.message_id for item in view.deliveries)):
+        raise Problem(409, "NATIVE_GROUP_CONFLICT", "one original request must reserve one original result")
+    return delivery
+
+
+def _round_count(view, pending, agent_id):
+    """Published posts plus awaiting results that hold this member's slots in the current round."""
+    return (sum(post.speaker_agent_id == agent_id and post.round == view.round for post in view.posts)
+            + sum(item.recipient_agent_id == agent_id and item.round == view.round for item in pending))
+
+
+def _check_allowance(view, pending, speaker_agent_id, final, delivery):
+    member_limit = MAX_MEMBER_ROUND_POSTS - int(
+        speaker_agent_id == view.orchestrator_agent_id and not final)
+    if (len(view.posts) + len(pending) >= MAX_GROUP_POSTS - int(not final)
+            or _round_count(view, pending, speaker_agent_id) >= member_limit):
+        raise Problem(409, "NATIVE_GROUP_ALLOWANCE", "the original publication allowance is exhausted")
+    if delivery is not None:
+        recipient = delivery.recipient_agent_id
+        if _round_count(view, pending, recipient) > MAX_MEMBER_ROUND_POSTS - int(recipient == view.orchestrator_agent_id):
+            raise Problem(409, "NATIVE_GROUP_ALLOWANCE", "the recipient has no result publication slot")
+
+
+def _reference(post_id, speaker_agent_id, command):
+    return NativeGroupPostReference(
+        post_id=post_id, speaker_agent_id=speaker_agent_id, round=command.round, kind=command.kind,
+        recipient_agent_id=command.recipient_agent_id,
+        turn=command.turn, result=command.result,
+        content_sha256=hashlib.sha256(command.content.encode("utf-8")).hexdigest())
+
+
+def _settled_deliveries(view, completed_delivery, kind, delivery):
+    deliveries = tuple(item.model_copy(update={"status": "blocked" if kind == "blocked" else "completed"})
+                       if item == completed_delivery else item for item in view.deliveries)
+    return deliveries if delivery is None else (*deliveries, delivery)
+
+
+def _published(group, command, reference, completed_delivery, delivery, pending, final):
+    """The root after this post; the last settled result also publishes a waiting final and closes."""
+    view = group.view
+    publications = (*view.posts, reference)
+    finish_deferred = group.deferred_final is not None and not pending and completed_delivery is not None
+    if finish_deferred:
+        publications = (*publications, group.deferred_final)
+    closed = final or finish_deferred
+    updated_view = NativeGroupView.model_validate_json(view.model_copy(update={
+        "posts": publications,
+        "deliveries": _settled_deliveries(view, completed_delivery, command.kind, delivery),
+        "state": "closed" if closed else "open", "awaiting_final": not closed,
+    }).model_dump_json())
+    return group.model_copy(update={"view": updated_view, "deferred_final": None if closed else group.deferred_final})
+
+
 class _Group(WireModel):
     kind: Literal["fa-native-group-state-v1"] = "fa-native-group-state-v1"
     tenant_id: Identifier
@@ -176,69 +284,35 @@ class NativeGroupStore:
         command = NativeGroupPost.model_validate_json(command.model_dump_json())
         group, record = self._read(group_id)
         view = group.view
-        if speaker_agent_id not in view.member_agent_ids:
-            raise Problem(403, "NATIVE_GROUP_MEMBER_REQUIRED", "only an original group member may publish")
-        if command.recipient_agent_id is not None and command.recipient_agent_id not in view.member_agent_ids:
-            raise Problem(403, "NATIVE_GROUP_MEMBER_REQUIRED", "the published addressee must be a group member")
-        if ((command.turn is None) != (command.result is None) and command.kind != "blocked"
-                or command.turn is not None and command.turn.agent_id != speaker_agent_id):
-            raise Problem(409, "NATIVE_GROUP_CONFLICT", "a saved result must retain its original speaking Agent")
+        _check_speaker(view, speaker_agent_id, command)
         post_id = group_post_id(group_id, speaker_agent_id, command.request_id)
         candidate = _Post(group_id=group_id, speaker_agent_id=speaker_agent_id, command=command)
-        previous = next((post for post in view.posts if post.post_id == post_id), None)
+        previous = _find_post(view.posts, post_id)
         if previous is not None:
             self._post_original(post_id, candidate)
             return previous
-        if view.state != "open":
-            raise Problem(409, "NATIVE_GROUP_CLOSED", "the original group is already closed")
-        if command.round != view.round:
-            raise Problem(409, "NATIVE_GROUP_ROUND_CHANGED", "read the original group's current round")
+        _check_open_round(view, speaker_agent_id, command)
         final = command.kind == "final"
-        if final and speaker_agent_id != view.orchestrator_agent_id:
-            raise Problem(403, "NATIVE_GROUP_ORCHESTRATOR_REQUIRED", "only the original orchestrator may conclude")
         pending = [item for item in view.deliveries if item.status == "awaiting"]
-        completed_delivery = None
-        if settles is not None:
-            completed_delivery = next((item for item in pending if item.message_id == settles), None)
-            if (completed_delivery is None or completed_delivery.recipient_agent_id != speaker_agent_id
-                    or command.kind not in {"result", "blocked"} or command.round != completed_delivery.round):
-                raise Problem(409, "NATIVE_GROUP_CONFLICT", "the result must settle its original reserved message")
-            pending.remove(completed_delivery)
-        deferred = final and bool(pending)
-        if deferred and (command.turn is None or command.result is None):
-            raise Problem(409, "NATIVE_GROUP_ORIGINAL_RESULT_REQUIRED", "only a verified saved final can wait for results")
+        completed_delivery = _settle(pending, settles, speaker_agent_id, command)
+        deferred = _deferred(final, pending, command)
+        delivery = _reserve(view, delivery, speaker_agent_id, command)
         if delivery is not None:
-            delivery = NativeGroupDelivery.model_validate_json(delivery.model_dump_json())
-            if (delivery.sender_agent_id != speaker_agent_id or delivery.round != command.round
-                    or delivery.recipient_agent_id != command.recipient_agent_id
-                    or delivery.recipient_agent_id == speaker_agent_id
-                    or delivery.status != "awaiting" or command.kind not in {"request", "handoff"}
-                    or any(item.message_id == delivery.message_id for item in view.deliveries)):
-                raise Problem(409, "NATIVE_GROUP_CONFLICT", "one original request must reserve one original result")
             pending.append(delivery)
-        count = sum(post.speaker_agent_id == speaker_agent_id and post.round == view.round for post in view.posts)
-        count += sum(item.recipient_agent_id == speaker_agent_id and item.round == view.round for item in pending)
-        member_limit = MAX_MEMBER_ROUND_POSTS - int(
-            speaker_agent_id == view.orchestrator_agent_id and not final)
-        if len(view.posts) + len(pending) >= MAX_GROUP_POSTS - int(not final) or count >= member_limit:
-            raise Problem(409, "NATIVE_GROUP_ALLOWANCE", "the original publication allowance is exhausted")
-        if delivery is not None:
-            recipient_count = sum(post.speaker_agent_id == delivery.recipient_agent_id and post.round == view.round
-                                  for post in view.posts)
-            recipient_count += sum(item.recipient_agent_id == delivery.recipient_agent_id and item.round == view.round
-                                   for item in pending)
-            if recipient_count > MAX_MEMBER_ROUND_POSTS - int(delivery.recipient_agent_id == view.orchestrator_agent_id):
-                raise Problem(409, "NATIVE_GROUP_ALLOWANCE", "the recipient has no result publication slot")
-        reference = NativeGroupPostReference(
-            post_id=post_id, speaker_agent_id=speaker_agent_id, round=command.round, kind=command.kind,
-            recipient_agent_id=command.recipient_agent_id,
-            turn=command.turn, result=command.result,
-            content_sha256=hashlib.sha256(command.content.encode("utf-8")).hexdigest())
+        _check_allowance(view, pending, speaker_agent_id, final, delivery)
+        reference = _reference(post_id, speaker_agent_id, command)
         # Immutable content is prepared first; only the root CAS publishes its reference and consumes quota.
+        self._save_post_content(post_id, candidate)
+        if deferred:
+            self._defer_final(group, record, group_id, reference)
+        updated = _published(group, command, reference, completed_delivery, delivery, pending, final)
+        return self._publish(group_id, record, updated, reference, candidate)
+
+    def _save_post_content(self, post_id, candidate):
         try:
             self.repository.create(self.partition_key, "post:" + post_id, candidate.model_dump(mode="json"))
         except Problem as error:
-            if error.status not in {409, 412} and error.status < 500:
+            if not _unconfirmed(error):
                 raise
             try:
                 self._post_original(post_id, candidate)
@@ -246,51 +320,39 @@ class NativeGroupStore:
                 if read_error.status == 404:
                     raise Problem(503, "NATIVE_GROUP_UNKNOWN", "the original post content remains unconfirmed") from None
                 raise
-        if deferred:
-            previous_final = group.deferred_final
-            if previous_final is not None and (
-                    previous_final == reference
-                    or previous_final.result.turn_number > reference.result.turn_number):
-                raise Problem(409, "NATIVE_GROUP_PENDING", "the saved final still awaits original member results")
-            updated = group.model_copy(update={"deferred_final": reference})
-            try:
-                self.repository.replace(
-                    self.partition_key, "group:" + group_id, updated.model_dump(mode="json"), record.etag)
-            except Problem as error:
-                if error.status not in {409, 412} and error.status < 500:
-                    raise
-                observed, _ = self._read(group_id)
-                if observed.deferred_final != reference and reference not in observed.view.posts:
-                    raise Problem(503 if error.status >= 500 else 409, "NATIVE_GROUP_UNKNOWN",
-                                  "the original deferred final is unconfirmed") from None
-            raise Problem(409, "NATIVE_GROUP_PENDING", "the saved final awaits the original member result publications")
-        deliveries = tuple(item.model_copy(update={"status": "blocked" if command.kind == "blocked" else "completed"})
-                           if item == completed_delivery else item for item in view.deliveries)
-        if delivery is not None:
-            deliveries = (*deliveries, delivery)
-        publications = (*view.posts, reference)
-        finish_deferred = group.deferred_final is not None and not pending and completed_delivery is not None
-        if finish_deferred:
-            publications = (*publications, group.deferred_final)
-        closed = final or finish_deferred
-        updated_view = NativeGroupView.model_validate_json(view.model_copy(update={
-            "posts": publications,
-            "deliveries": deliveries,
-            "state": "closed" if closed else "open", "awaiting_final": not closed,
-        }).model_dump_json())
-        updated = group.model_copy(update={"view": updated_view, "deferred_final": None if closed else group.deferred_final})
+
+    def _defer_final(self, group, record, group_id, reference):
+        previous_final = group.deferred_final
+        if previous_final is not None and (
+                previous_final == reference
+                or previous_final.result.turn_number > reference.result.turn_number):
+            raise Problem(409, "NATIVE_GROUP_PENDING", "the saved final still awaits original member results")
+        updated = group.model_copy(update={"deferred_final": reference})
         try:
             self.repository.replace(
                 self.partition_key, "group:" + group_id, updated.model_dump(mode="json"), record.etag)
         except Problem as error:
-            if error.status not in {409, 412} and error.status < 500:
+            if not _unconfirmed(error):
                 raise
             observed, _ = self._read(group_id)
-            saved = next((post for post in observed.view.posts if post.post_id == post_id), None)
+            if observed.deferred_final != reference and reference not in observed.view.posts:
+                raise Problem(503 if error.status >= 500 else 409, "NATIVE_GROUP_UNKNOWN",
+                              "the original deferred final is unconfirmed") from None
+        raise Problem(409, "NATIVE_GROUP_PENDING", "the saved final awaits the original member result publications")
+
+    def _publish(self, group_id, record, updated, reference, candidate):
+        try:
+            self.repository.replace(
+                self.partition_key, "group:" + group_id, updated.model_dump(mode="json"), record.etag)
+        except Problem as error:
+            if not _unconfirmed(error):
+                raise
+            observed, _ = self._read(group_id)
+            saved = _find_post(observed.view.posts, reference.post_id)
             if saved is not None:
                 if saved != reference:
                     raise Problem(409, "NATIVE_GROUP_STATE_INVALID", "the published post reference differs") from None
-                self._post_original(post_id, candidate)
+                self._post_original(reference.post_id, candidate)
                 return saved
             raise Problem(503 if error.status >= 500 else 409, "NATIVE_GROUP_UNKNOWN",
                           "the original post publication is unconfirmed; read the same post ID") from None

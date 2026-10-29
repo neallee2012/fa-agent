@@ -1,8 +1,160 @@
 # FA 進度與交接狀態
 
-更新日期：2026-10-25。
+更新日期：2026-10-28。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="startup-private-1028"></a>
+## 2026-10-28：dev API 啟動修正的讀回，與 private 模式 project capability host 的雲端驗收（main `25a1f970`，總協調）
+
+- **範圍與授權**：A 在 dev（Neal 常設批准）；B 是 Neal 另外批准的計費測試，環境 `fa-privcap-1028`、RG `rg-fa-privcap-1028`、westus3、dev 訂閱，用完已拆除。證據是總協調的本機讀回加唯讀的 Container App console／system log，原始資料不在 repo。
+
+### A. dev API 啟動修正（#1021、#1026、#1028、#1029）
+
+- **部署**：dev run 3703，main `25a1f970`，API revision `…25a1f97-r3703-1`，Healthy、100% 流量、`/healthz` 200；gate armed、pass、0 拒絕。
+- **啟動時間線**（唯讀 console／system log，UTC）：
+  - container 啟動 08:56:03.6。
+  - 一次 `BEHAVIOR_INVENTORY_READ`，08:56:16.8：entities 32727、bytes 88,246,699，是 256 MiB 上限的 32.87%。
+  - `Started server process` 08:57:58.85（建 app 約 115 秒）。
+  - 第一筆 `INSTRUCTION_OBSERVATION_*` 08:58:13.68。
+  - port 開在 08:58:25.39（lifespan 約 26.5 秒）。
+  - 合計約 142 秒。
+- **和前兩次比**：
+
+  | run | 讀取次數 | 開 port 前合計 | 建 app | lifespan |
+  |---|---|---|---|---|
+  | 3701 | 2 | 374 秒 | — | — |
+  | 3702 | 1 | 282 秒 | 約 161 秒 | 約 121 秒 |
+  | 3703 | 1 | 約 142 秒 | 約 115 秒 | 約 26.5 秒 |
+
+- **每則請求**：在工作台對 A 送一回合（「r4 OK」，2 秒）後，r3703 console 最後 300 行有 0 筆 `BEHAVIOR_INVENTORY_READ`。這和「每則請求不再做完整掃描」一致，但只涵蓋那 300 行，不是全部請求。
+- **啟動探針**：失敗 28 次，都在 port 開之前。console 最後 300 行沒有 ERROR 或 Traceback。
+- **費用**：Cost Management `ActualCost`，2026-10-01～10-28 月累計 USD652.09（632.60＋19.49）。
+- **還沒解決的**：
+  - 開機讀取上限仍是 256 MiB；依 #1029 的文件註記，記憶體可能在回 413 之前就先用完。
+  - 真正的解法（有記憶體上限或串流的核對）是後續項目。
+  - draft PR #1024（ADR-0012 增量設計）暫放，沒動。
+
+### B. private 模式 project capability host（#1025、#1027、#1030）
+
+對應 [ADR-0010 第 9 節第 8 點](adr/0010-azd-private-network-option.md#stage-private-1026) 的八項核對：
+
+| 項目 | 結果 | 說明 |
+|---|---|---|
+| 1 帳號層級 host | PASS | `…@aml_aiagentservice` 存在，customerSubnet 是 `snet-agents`；project 層級只有 `caphostproj` 一個 |
+| 2 PUT 與建立時間 | PASS | 帶 `capabilityHostKind` 的 PUT 被接受，讀回 `Agents`；建立 48.7 秒，沒有 409 或 `Failed`（文件原先寫 30～35 分） |
+| 3 第二次 provision | PASS | 15.9 秒完成，清單仍只有 `caphostproj` |
+| 4 WebIQ MCP | PASS | Hosted 的 A 在 `private` 環境用 WebIQ：`tools/list` 750 ms、`tools/call WebIQ___web` 506 ms，都 Success；回條 `completed`、`failure_code=null`，約 23 秒；沒有 `name or host unknown`。這只證明功能可用，不證明流量走哪條路 |
+| 5 0b 回歸 | PASS | 4 次模型呼叫都回 200；同對話第 2 回合用 `previous_response_id`，9.5 秒；Hosted A 的 App Insights sev≥3 為 0、exceptions 為 0；記憶 relay 寫入回 201。換版後的接續沒有測 |
+| 6 不存在的 host | PASS | REST GET 回 404，訊息是「CapabilityHost '…' not found in workspace …」；#1027 已讓 hook 把它當不存在 |
+| 7 `azd down` | PASS（跑了三次） | host DELETE 回 202，32 秒後 Succeeded，hook 讀成已刪（#1027 在雲端有效）。帳號：`CannotDeleteResource`，依 #974 重送，再 `GatewayTimeout`，之後只輪詢；purge 讀回。最後讀回：兩個 RG 都不在、deletedAccounts 0、SAL 已清、2 個 Entra app 已刪（30 天內可還原） |
+| 8 `public` what-if | 略過 | 離線 `test_network_mode.py` 通過 22 項 |
+
+- **拆除跑了三次**：暫時性的 HTML 503 讓 hook 在唯讀 GET 上停了兩次。第一次停下時，帳號對部署者 IP 開著約 2 分鐘，到重跑才關。#1030 已修：唯讀 GET 遇暫時性錯誤會重試，關閉視窗失敗時改用開啟時記下的內容。
+- **其他**：
+  - WebIQ 金鑰是 Neal 在隱藏提示輸入的。
+  - API 的 log 只在 container console，不在 App Insights；這是觀察，沒有查原因。
+  - Neal 問過（已在對話回答）：Hosted Agent 的算力在客戶訂閱看不到，只看得到 `snet-agents` 對 `Microsoft.App/environments` 的委派和 service association link。官方說「平台把 agent 算力接到這個 subnet」；算力屬於 Microsoft 是推論。
+- **沒有驗證到的**：換版後的接續；public 模式的雲端 what-if；WebIQ 流量實際走的路徑。
+
+<a id="dev-test-r2-1028"></a>
+## 2026-10-28：品質整理第二輪與 4 個既有 bug 修正的 dev 測試（main `57e43d8c` → `0ca6769e`，總協調）
+
+- **範圍與授權**：只動 dev，stage 沒動。Neal 10-28 說「好」，加上 dev 常設批准。第二輪是 #1002～#1017；bug 修正是 #1019（恢復後取消）、#1020（adapter 錯誤本文，共用的 `strict_json` 修正）、#1021（API 啟動時只核對一次已安裝來源）。#1018 只有重現測試與說明（agentserver 的 GET 會把狀態改成 cancelled），沒有程式修正；#1022 是 ADR-0010 的註記。8765 工作台由總協調在 Neal 批准後用原設定、journal 與 SHA 重啟，先跑 `57e43d8c`，再跑 `0ca6769e`。證據是總協調的本機讀回加唯讀的 Container App log，原始資料不在 repo，ID 只寫前綴。
+- **部署**：
+  - 3701（`57e43d8c`）：八步都成功，gate armed、pass、0 拒絕，API `…57e43d8-r3701-1`，Hosted A v174、B v134。
+  - 3702（`0ca6769e`）：八步都成功，gate armed、pass、0 拒絕，API `…0ca6769-r3702-1` Healthy、100% 流量、`/healthz` 200，Hosted A v175、B v135，`FA_NATIVE_HITL_ENABLED=1`、`FA_NATIVE_GROUPS_ENABLED=1`。回退點是 `…57e43d8-r3701-1`。
+- **結論**：通過。未決項目見下面的觀察與沒有驗證到的。
+
+第一輪（`57e43d8c`）：
+
+| 項目 | 結果 | 說明 |
+|---|---|---|
+| 1 新對話送出 | PASS | 3 秒 |
+| 2 同對話記住暗號 | PASS | 1 秒 |
+| 3 回合中停止 | PASS | 已停止・11 秒。API 00:40:04Z 收到 `api_cancel`（3,395 ms） |
+| 4 桌面移游標 | PASS | 2 個工具・14 秒。沒出批准卡（HITL 開著，這個動作依規則放行），所以 HITL 批准卡這段沒測到 |
+| 5 WebIQ 搜尋 | PASS | 2 個工具・10 秒 |
+| 6 群組 A 主持、B 參與 | PASS（第二次） | 第一次題目寫了「不要使用任何工具」，A 沒交辦 B，自己代答，只有 1 則（log：A 的 peer／group 工具有綁上，B 沒有任何回合，沒有貼文被拒；#1003 的拒絕與驗證條件與舊版逐條相同）。改題目重跑：A 交辦、B 貼文、A 收尾，共 3 則，已收尾。B 用自己的 agent ID 當名字（模型行為） |
+| 7 B 單獨一句 | PASS | 先出 Teams 連線卡（B 從沒連過 Teams；列工具時 `rpc_code=-32006;need=consent`，設計自 `099874ba`；「先不用」只存在 VM 記憶體，換版重開後會再出），按「先不用」後 2 秒完成 |
+
+第二輪（`0ca6769e`）：
+- R1 新對話：PASS，5 秒。
+- R2 停止：PASS，已停止・7 秒。
+- R3 B 單獨一句：PASS，換版後連線卡再出一次，按「先不用」後 2 秒。
+
+- **API 啟動（#1021）**：
+  - 3702：container 02:18:54.7Z 啟動；只有 1 次 `BEHAVIOR_INVENTORY_READ`（entities=32693，02:19:08Z）；`Started server process` 02:21:35.8Z；Uvicorn 開 8080 在 02:23:36.6Z。從 container 啟動到開 port 約 282 秒。
+  - 3701 讀了 2 次、用了 374 秒，所以修正省了約 92 秒。
+  - `Started server process` 到啟動完成（lifespan）之間仍花約 121 秒，原因還沒分析。
+  - 先前預估省 2.5～3.5 分，實際省約 92 秒；啟動總長約 4.7 分。
+- **送出 RTT**（第一輪，`57e43d8c`；毫秒，nearest-rank，算法同第 36 版；樣本少只供參考）：
+
+  | 指標 | n | p50 | p95 |
+  |---|---|---|---|
+  | `api_submit` | 7（群組回合缺） | 2,240 | 2,923 |
+  | `api_submit_session` | 8 | 358 | 402 |
+  | `api_submit_context` | 8 | 155 | 234 |
+  | `api_submit_hosted` | 8 | 741 | 1,953 |
+
+  第 36 版的 `api_submit` 是 p50 2,022、p95 3,570。第二輪沒有量。
+- **錯誤**（第一輪視窗 00:36～00:50Z）：
+  - API：沒有 Traceback、ERROR、5xx。`NATIVE_TURN_REFUSED NATIVE_STREAM_NOT_STARTED` 7 次，與第 36 版同類；`NATIVE_CONTINUATION_MISSING` 404 共 5 次，都來自被停止的那個回合；`NATIVE_RID_ABSENT` 1 次；409 `NATIVE_SESSION_CHANGED` 2 次，是換版後預期的接續；`AGENT_SCOPE_MISSING` 4 次，都是 C／D（C、D 沒有 agent scope）。
+  - Hosted：B 開機時有一段 `psutil.AccessDenied` 的 traceback；00:42:11Z 有一次 `FA_CUSTOM_TOOL_FAILED TOOL_ARGUMENTS_INVALID WebIQ-web`（該回合仍完成）。
+  - 3702：console 沒有 ERROR 或 Traceback。
+- **觀察**：
+  1. API 啟動仍要約 282 秒。其中剩下的那一次 inventory 掃描近一半時間（約 150 秒，隨歷史資料線性變長），其餘是 lifespan（約 121 秒），原因未知。增量核對的設計寫在 #1021 的後續項目。
+  2. #1021 review 發現：每則 Teams 進站訊息（`teams_metrics.py:519`）和成果內容 GET（`:592`）都會經 `require_current_native_evidence()` 做一次完整 inventory 掃描，每則約 150 秒。這在 #1021 之前就存在；接了 Teams 的環境每則訊息都要付這筆。要和第 1 點一起修。
+  3. B 的 Teams 連線卡在每次 VM 重開後都會再出，因為「先不用」只存在記憶體。
+  4. #1018：平台訊號已設時，agentserver 2.2.0 的 GET 會寫入 cancelled，FA 的終態被蓋掉。目前沒有支援的修法。上游 issue 還沒開，要開需 Neal 同意。
+  5. private 模式：WebIQ 可能需要專案層級的 capability host，見 [ADR-0010 第 9 節第 8 點](adr/0010-azd-private-network-option.md#stage-private-1026)（#1022）。未測。
+- **dev 沒有驗證到的**：HITL 批准卡路徑（#1009 的 `_changes`）；#1019 恢復後的取消（要 VM 恢復才會觸發，dev 沒觸發，只有離線測試）；#1020 的格式錯誤本文（只有離線測試）；第二輪的 RTT。
+- **費用**：Cost Management `ActualCost`，2026-10-01～10-28 月累計約 USD649.8（分項四捨五入；`rg-faexample` 630.62＋`ME_cae-facontext-private` 19.22），3701 與 3702 之前各讀一次。查詢區間和 10-25 記的約 USD760 不同，兩個數字不能直接比較。上限 USD900／停損 USD880。
+- **下一步**：下一次 stage release 會重建 API 與 Hosted；開 release PR 前把這份報告附上，是否合併由 Neal 決定。
+
+<a id="stage-v36-1026"></a>
+## 2026-10-25～26：stage 第 36 版部署後驗證
+
+- **範圍**：release PR #986，Neal 10-25 選「你幫我合併」後由總協調 14:15:21Z 合併（合併前讀 `log-fa-stage` 30 分鐘內沒有回合），merge commit `893a8462`。內容基準是[第 36 版候選 dev 測試](#dev-test-v36-1025)，加上 #987 的一列文件。證據是總協調的唯讀讀回，原始輸出不在 repo，ID 只寫前綴。
+- **部署**：deploy-staging run `40201376091` 成功，deploy job 12 分 31 秒。閘門 `armed=True, override=False; decision: pass (0 refusals)`；sync 與 follow 兩個 job Succeeded；API `…893a846-r124-1`、console、feed `…893a846-r124-1` ready。
+- **讀回**：API 唯一 active revision `…893a846-r124-1`，Healthy、100%；GUARD="1"、IDLE="0"、RECONCILER="0"、`FA_NATIVE_ROUTINE_CLOCK=api`。A、B、C、D 都是 v87，`fa_build` `c6d539d4`（與 `ci_deploy.py meta` 的 core 相同）。`stage-test-e` 沒有讀（不在 `stage.json`）。
+- **public-sync**：run `40202436421` 成功，Gate 2 通過；公開 tag `v2026.10.25-36`（14:32:30Z）的 tree 等於 release PR 的指紋 `b8704105…`；公開 README 有「私有化部署」段落。
+- **冒煙（10-26 08:56Z，總協調在 stage console 各開新對話送「只回覆 OK」，沒有碰主人原有的對話）**：
+  - A、B 都回 OK，回合 2 秒；畫面從送出到完成約 15 秒（部署後第一則）；沒有搬檔提示。
+  - A、B 都留在原 SID（`8efce15e…`、`ad2abcf2…`），`NATIVE_VERSION_OBSERVED` v82→v87 原地漂移；開頁各一筆 409（`received`／`read`），是漂移偵測；`NATIVE_UPGRADE_CUT_API` 全是 `outcome=current`。
+  - API 沒有 Traceback、ERROR、5xx，也沒有 `NATIVE_SESSION_CALL_INCOMPATIBLE`、`NATIVE_RID_CONFLICT`、`NATIVE_CAPABILITY_UNKNOWN`；2 次 `NATIVE_TURN_REFUSED code=NATIVE_STREAM_NOT_STARTED`（畫面都顯示完成）。
+  - 記憶事件進了 `log-fa-stage` 的 AppTraces（#973）：A、B 的私人與 Team 記憶搜尋 200、更新 202。
+  - 送出 RTT（樣本少）：`api_submit` 2,654 ms、3,052 ms（都是部署後第一則）。
+- **每日排程（#957 在 stage 第一次跑，10-26 10:00Z）**：`FA_NATIVE_ROUTINE_CLOCK_DISPATCH agent=00000000 … status=started`（10:00:12）→ `completed`（10:11:03）。Hosted 建了新的 SDK session（`sdk_session_create`），前幾次 `model_first_byte` 1.5～1.8 秒；10-22～25 連續四天停在 `unknown`（第 36 版 release PR 準備時讀 `log-fa-stage` 得到），這是改版後第一次完成。整個回合 646 秒：10:00:38 之後約 10 分鐘沒有任何紀錄，10:10:40 出現 `gen_ai.client.operation.exception`，之後又有模型呼叫並完成（推論是卡住的那次呼叫逾時、SDK 重試；原因未查，未驗證的假設之一是 `gpt-6.1-sol` 的 500K TPM 由 dev 與 stage 共用）。
+- **沒有驗證到的**：stage console 的「排程」對話分組（沒有打開工作台看）、`stage-test-e` 的版本；記憶「記住後新對話回想」沒在 stage 做（避免把測試資料寫進主人的長期記憶；dev 已驗）。
+
+<a id="stage-private-rehearsal-1026"></a>
+## 2026-10-26：stage 改 private 的 dev 演練（ADR-0010 第 9 節，總協調）
+
+- **範圍與授權**：Neal 10-26 批准 dev 演練（新資源與費用）與拆除，並選定 gpt-5.4-mini、azd 自建 VNet、留 WebIQ 與 feed reader（[ADR-0010 第 8 節](adr/0010-azd-private-network-option.md#stage-private-1026)）。環境 `fa-stgpriv-1026`，dev 訂閱、westus3，main `4ddd28fe`；當天拆除。證據是總協調的本機讀回，原始資料不在 repo，ID 只寫前綴。stage 沒動。
+- **建立**：`azd up` exit 0，76.6 分（provision 27 分 56 秒、deploy 48 分 27 秒）。初始化由 `FA_APPROVE_INITIALIZATION` 預先核准，沒有人輸入；A、B 兩個 Agent、session 準備 http_200。結束後讀回帳號 `Disabled`、沒有 IP rule。WebIQ 先不開（Neal 用 Remote Control，無法在本機隱藏提示輸入金鑰）。演練腳本第一次因腳本自己的兩個檢查寫錯（把 `azd env get-value` 的「找不到」訊息當成有值；JMESPath 引號在 PowerShell 傳給 `az.cmd` 時被拆壞）而在寫入前停下，修好後重跑。
+- **stage 形狀 profile**：#994 的 `deploy/azd/stage_profile.py` 轉出，`ci_deploy.py check` 通過，runtime 與已部署版逐位元組相同。feed reader 依 README 步驟部署（API secret 讀回存在）。
+- **CI 部署步驟（A2 的實證）**：帳號前後都讀回 `Disabled`、沒有 IP rule，從筆電依 deploy-staging 的順序跑完全部步驟，約 10 分鐘：
+
+  | 步驟 | 結果 |
+  |---|---|
+  | check、guard | 通過（serving `4ddd28fe`） |
+  | build api／hosted／console／feed | 4 個映像 |
+  | gate | armed、pass、0 拒絕 |
+  | sync | Succeeded，4.8 分 |
+  | api | `…4ddd28f-r101-1` ready，約 1 分 |
+  | console、follow、feed | 成功 |
+
+- **執行期（新工作台，Entra 自動登入）**：
+  - A 記住三件事：回合完成，Cosmos 寫入 `FA_PRIVATE_MEMORY_UPDATE status=201 items=4`。新對話回想：代號「海燕」、會議紀錄先寫決議（答「決策」）、週五下午不開會，意思都對（字面上「決議」答成「決策」）。
+  - 寫入 1,200 筆合成資料（sync job 內呼叫 relay 寫入程式，22.3 秒，全部 201）後，1,207 筆的搜尋 n=50：p50 40.7 ms、p95 43.0 ms、約 82.5 RU（0c 約 1,000 筆時約 68 RU）。之後再回想，三件事仍都答對（同樣答「決策」）。
+  - 壓測 32 執行緒 × 800 批（18.8 秒）：201 共 291、503 共 509；429 有 140 次（`FA_MEMORY_RELAY_THROTTLED stage=batch`）；503 全是 `FA_MEMORY_RELAY_FAILED stage=connect reason=build_in_progress`（Cosmos client 還在建立時直接拒絕，見 ADR-0010 第 9 節第 7 點）。
+  - 排程：A 提案、主人允許（新工作台的卡片寫「開新對話執行」），15:37（台北）`FA_NATIVE_ROUTINE_CLOCK_DISPATCH … status=started`，約 1 分鐘後 `completed`。
+  - 延遲（App Insights，樣本少）：`native_allocate` n=5 p50 342 ms、p95 481 ms；`private_memory_recall` n=4 p50 382 ms、p95 809 ms；`private_memory_update` n=4 p50 1,965 ms、p95 3,461 ms（回合結束後在背景做）。
+- **觀察**：回合完成後工作台畫面沒有自動更新，要按「更新回覆」；A 的對話出現「上次換環境時沒有搬工作檔」，推論是 CI 的 follow 換了版本，預期內。
+- **拆除**：`azd down --purge --force` exit 0，52.7 分（帳號刪除等了約 17 分、purge 讀回；RG、Log Analytics、兩個 Entra app 都刪除）。讀回 RG 不存在、soft-deleted 帳號 0、名稱含 `stgpriv` 的 RG 0 個。腳本最後一行的檢查讀了不存在的 azd 值而以 2 結束，不影響拆除結果。
+- **沒有驗證到的**：WebIQ（經 NAT 出站、toolbox 經 private endpoint）；從 GitHub runner 實跑（這次在筆電跑同樣的步驟）；費用（Cost Management 要 24～48 小時後依 RG 名稱讀）。
+- **下一步**：處理 ADR-0010 第 9 節的 7 點，切換時再測 WebIQ；切換的每一項建立與刪除仍要 Neal 批准。
 
 <a id="dev-test-v36-1025"></a>
 ## 2026-10-25：第 36 版候選 dev 測試（main `d4d64fb9`，總協調）

@@ -657,10 +657,7 @@ async def retarget_session(runtime, command):
     if (record is None or record.view.request_id != target.request_id
             or record.view.hosted_session_id != target.hosted_session_id):
         raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the new environment is reserved by another operation")
-    if record.responses is None:
-        record = _changed(record, phase="draining", after=None, responses=False, page_offset=0, page_digest=None)
-    if record.cursor_profile is None:
-        record = _changed(record, after=None, cursor_profile="page-last-id-v1", page_offset=0, page_digest=None)
+    record = _with_cursor(record)
     if current.admitting is not None:
         reason, after, responses = "admission_pending", record.after, record.responses
     else:
@@ -689,128 +686,196 @@ async def retarget_session(runtime, command):
     return target
 
 
-async def follow_session(runtime, command):
-    from .native_turns import TURNS_STORE, _changed, binding_task_id
+@dataclass
+class _FollowState:
+    """One follow call's working state: the Agent item and the following record, each with the ETag it was read at."""
+    key: str
+    current: object
+    etag: str
+    record: _Following
+    record_etag: str
+    omitted: object = None
+    pending_binding: NativeEnvironmentView | None = None
 
-    current, etag = await runtime._agent_record()
-    existing = current.environment
-    same = existing is not None and (
-        existing.hosted_session_id, existing.hosted_agent_version,
-        existing.previous_hosted_session_id,
-    ) == (runtime.identity.session_id, runtime.identity.agent_version, command.expected_session_id)
-    if same and existing.state == "ready":
-        return existing
-    if existing is None or existing.state == "ready":
-        # The last point where the record names how the source became the Agent's: a pending view replaces it below.
-        from .native_open_rids import check_hold
-        await check_hold(runtime, current.hosted_session_id, None if existing is None else existing.request_id)
-    following_key = await _selected_following_key(runtime, current)
-    record, record_etag = await _read(runtime, key=following_key)
+
+def _check_following_scope(runtime, command, record):
     if record is not None and (
             record.view.previous_hosted_session_id != command.expected_session_id
             or record.view.hosted_agent_version != runtime.identity.agent_version
             or record.idle_only != command.idle_only):
         raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the named environment has another original operation")
+
+
+def _follow_source(runtime, command, current, etag, existing):
+    """What a first call still compares, then the original environment the new follow starts from."""
+    if (existing is not None and existing.state == "pending"
+            or (current.hosted_session_id, etag) != (command.expected_session_id, command.expected_etag)
+            or current.hosted_session_id == runtime.identity.session_id or command.stage != "prepare"):
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original Agent environment comparison changed")
+    source = existing if existing is not None else current.preparation
+    if source is None:
+        raise Problem(409, "NATIVE_ENVIRONMENT_UNAVAILABLE", "the Agent has no original prepared environment")
+    return source
+
+
+async def _start_following(runtime, command, current, etag, existing, key):
+    source = _follow_source(runtime, command, current, etag, existing)
+    # ADR-0009 4a/M5: the destination SID differs from the current one (checked above); its version is the one the
+    # API named (the expected-version header), so a fresh session of the same version may follow too.
+    view = NativeEnvironmentView(
+        agent_id=runtime.identity.agent_id, request_id=command.request_id,
+        previous_hosted_session_id=current.hosted_session_id,
+        previous_agent_version=source.hosted_agent_version,
+        previous_files_profile=source.files_profile,
+        hosted_session_id=runtime.identity.session_id, hosted_agent_version=runtime.identity.agent_version,
+        state="pending", reason="source_stop_required",
+    )
+    record = _Following(view=view, responses=False, idle_only=command.idle_only,
+                        files_required=command.files_required or runtime.workspace_files is not None)
+    await _progress(runtime, record, None, key=key)
+    return await _read(runtime, key=key)
+
+
+async def _open_following(runtime, command, current, etag, existing, same):
+    """The following record this call works on, started on a first call, with the owner's recorded file omission."""
+    from .native_turns import _changed
+    from .native_files_omission import omission_for, omission_view
+
+    if existing is None or existing.state == "ready":
+        # The last point where the record names how the source became the Agent's: a pending view replaces it below.
+        from .native_open_rids import check_hold
+        await check_hold(runtime, current.hosted_session_id, None if existing is None else existing.request_id)
+    key = await _selected_following_key(runtime, current)
+    record, record_etag = await _read(runtime, key=key)
+    _check_following_scope(runtime, command, record)
     if not same and record is None:
-        if (existing is not None and existing.state == "pending"
-                or (current.hosted_session_id, etag) != (command.expected_session_id, command.expected_etag)
-                or current.hosted_session_id == runtime.identity.session_id or command.stage != "prepare"):
-            raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original Agent environment comparison changed")
-        source = existing if existing is not None else current.preparation
-        if source is None:
-            raise Problem(409, "NATIVE_ENVIRONMENT_UNAVAILABLE", "the Agent has no original prepared environment")
-        # ADR-0009 4a/M5: the destination SID differs from the current one (checked above); its version is the one the
-        # API named (the expected-version header), so a fresh session of the same version may follow too.
-        existing = NativeEnvironmentView(
-            agent_id=runtime.identity.agent_id, request_id=command.request_id,
-            previous_hosted_session_id=current.hosted_session_id,
-            previous_agent_version=source.hosted_agent_version,
-            previous_files_profile=source.files_profile,
-            hosted_session_id=runtime.identity.session_id, hosted_agent_version=runtime.identity.agent_version,
-            state="pending", reason="source_stop_required",
-        )
-        record = _Following(view=existing, responses=False, idle_only=command.idle_only,
-                            files_required=command.files_required or runtime.workspace_files is not None)
-        await _progress(runtime, record, None, key=following_key)
-        record, record_etag = await _read(runtime, key=following_key)
+        record, record_etag = await _start_following(runtime, command, current, etag, existing, key)
     if record is None:
         raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original environment operation is missing")
     if record.retarget_request_id is not None:
         raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original file operation is handing off to an explicit retarget")
-    from .native_files_omission import omission_for, omission_view
     omitted = await omission_for(runtime, record)
     if omitted is not None:
         record = _changed(record, view=omission_view(record.view, omitted))
-    if omitted is None and ((command.files_required or runtime.workspace_files is not None) and not record.files_required
-                            or record.files_required and runtime.workspace_files is None):
-        return _changed(record.view, reason="files_unsupported")
+    return _FollowState(key=key, current=current, etag=etag, record=record, record_etag=record_etag, omitted=omitted)
+
+
+def _files_unsupported(runtime, command, record, omitted):
+    return omitted is None and ((command.files_required or runtime.workspace_files is not None) and not record.files_required
+                                or record.files_required and runtime.workspace_files is None)
+
+
+def _with_cursor(record):
+    from .native_turns import _changed
+
     if record.responses is None:
         record = _changed(record, phase="draining", after=None, responses=False, page_offset=0, page_digest=None)
     if record.cursor_profile is None:
         record = _changed(record, after=None, cursor_profile="page-last-id-v1", page_offset=0, page_digest=None)
+    return record
+
+
+def _with_source_refusal(current, record):
+    from .native_turns import _changed
+
     existing = record.view
     if (current.environment is not None and current.environment.request_id == existing.request_id
             and current.environment.source_invocation_refused):
-        existing = _changed(existing, source_invocation_refused=True)
-        record = _changed(record, view=existing)
+        record = _changed(record, view=_changed(existing, source_invocation_refused=True))
+    return record
+
+
+def _check_follow_binding(current, command, existing):
     if current.hosted_session_id != command.expected_session_id:
         raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original execution binding changed")
     if current.environment is not None and current.environment.state == "pending" and (
             current.environment.hosted_session_id != existing.hosted_session_id
             or current.environment.request_id != existing.request_id):
         raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "another original version transition is pending")
-    if record.phase == "draining":
-        pending_binding = (_changed(existing, files_migrated=None, files_skip_request_id=None,
-                                    files_omission_basis=None, files_omission_reason=None)
-                           if omitted is not None else existing)
-        if current.following_supported and (current.environment is None or current.environment.state == "ready"):
-            await save_before(runtime, current, existing.request_id)
-            await _save_agent(runtime, current, etag, _changed(current, environment=pending_binding))
-        if not record.idle_only and not record.files_required and omitted is None:
-            await runtime._settle_admission()
-        current, etag = await runtime._agent_record()
-        _source_matches(current, existing)
-        if current.admitting is not None:
-            pending = _changed(record, view=_changed(existing, reason="admission_pending"))
-            await _progress(runtime, pending, record_etag, key=following_key)
-            return pending.view
-        progress = _ScanProgress.from_record(record)
-        reason, after, responses = await _drain_pages(
-            runtime, record.after, existing.previous_hosted_session_id, current.task_id,
-            responses=record.responses, idle_only=record.idle_only or record.files_required or omitted is not None,
-            require_complete=omitted is not None, progress=progress, restart_changed_page=record.idle_only,
-            settled=frozenset(command.settled_session_ids))
-        record = _changed(record, responses=responses, page_offset=progress.page_offset, page_digest=progress.page_digest,
-                          waiting_request_id=progress.waiting_request_id)
-        if reason is not None:
-            pending = _changed(record, view=_changed(existing, reason=reason), after=after)
-            await _progress(runtime, pending, record_etag, key=following_key)
-            return pending.view
-        reason = await _tasks_pending(runtime, current, existing.previous_hosted_session_id, responses=record.responses)
-        if reason is not None:
-            pending = _changed(record, view=_changed(existing, reason=reason))
-            await _progress(runtime, pending, record_etag, key=following_key)
-            return pending.view
-        # Preserve the original comparison through the final scan, including in-flight admission.
-        if current.environment is None or current.environment.state == "ready":
-            await save_before(runtime, current, existing.request_id)
-        await _save_agent(runtime, current, etag, _changed(current, environment=pending_binding))
-        need_files = record.files_required and omitted is None
-        reason = "files_pending" if need_files else "source_stop_required"
-        record = _changed(record, phase="files" if need_files else "stopping",
-                          after=None, view=_changed(existing, reason=reason))
-        await _progress(runtime, record, record_etag, key=following_key)
-        record, record_etag = await _read(runtime, key=following_key)
-        existing = record.view
-        current, etag = await runtime._agent_record()
-        _source_matches(current, existing)
-    if record.phase == "files":
-        if omitted is None and (record.files is None or not record.files.source_verified):
-            return _changed(existing, reason="files_pending")
-        record = _changed(record, phase="stopping", view=_changed(existing, reason="source_stop_required"))
-        await _progress(runtime, record, record_etag, key=following_key)
-        record, record_etag = await _read(runtime, key=following_key)
-        existing = record.view
+
+
+async def _fence_source(runtime, state):
+    """Bind the pending view (without the omission's decision) and settle admission, then re-read the Agent."""
+    from .native_turns import _changed
+
+    existing = state.record.view
+    state.pending_binding = (_changed(existing, files_migrated=None, files_skip_request_id=None,
+                                      files_omission_basis=None, files_omission_reason=None)
+                             if state.omitted is not None else existing)
+    current = state.current
+    if current.following_supported and (current.environment is None or current.environment.state == "ready"):
+        await save_before(runtime, current, existing.request_id)
+        await _save_agent(runtime, current, state.etag, _changed(current, environment=state.pending_binding))
+    if not state.record.idle_only and not state.record.files_required and state.omitted is None:
+        await runtime._settle_admission()
+    state.current, state.etag = await runtime._agent_record()
+    _source_matches(state.current, existing)
+
+
+async def _scan_for_stop(runtime, command, state):
+    """The draining scan: the view that holds the follow back (already saved), or None with the scanned record."""
+    from .native_turns import _changed
+
+    record, current, existing = state.record, state.current, state.record.view
+    if current.admitting is not None:
+        pending = _changed(record, view=_changed(existing, reason="admission_pending"))
+        await _progress(runtime, pending, state.record_etag, key=state.key)
+        return pending.view
+    progress = _ScanProgress.from_record(record)
+    reason, after, responses = await _drain_pages(
+        runtime, record.after, existing.previous_hosted_session_id, current.task_id,
+        responses=record.responses, idle_only=record.idle_only or record.files_required or state.omitted is not None,
+        require_complete=state.omitted is not None, progress=progress, restart_changed_page=record.idle_only,
+        settled=frozenset(command.settled_session_ids))
+    record = state.record = _changed(
+        record, responses=responses, page_offset=progress.page_offset, page_digest=progress.page_digest,
+        waiting_request_id=progress.waiting_request_id)
+    if reason is not None:
+        pending = _changed(record, view=_changed(existing, reason=reason), after=after)
+        await _progress(runtime, pending, state.record_etag, key=state.key)
+        return pending.view
+    reason = await _tasks_pending(runtime, current, existing.previous_hosted_session_id, responses=record.responses)
+    if reason is not None:
+        pending = _changed(record, view=_changed(existing, reason=reason))
+        await _progress(runtime, pending, state.record_etag, key=state.key)
+        return pending.view
+    return None
+
+
+async def _end_draining(runtime, state):
+    from .native_turns import _changed
+
+    current, existing = state.current, state.record.view
+    # Preserve the original comparison through the final scan, including in-flight admission.
+    if current.environment is None or current.environment.state == "ready":
+        await save_before(runtime, current, existing.request_id)
+    await _save_agent(runtime, current, state.etag, _changed(current, environment=state.pending_binding))
+    need_files = state.record.files_required and state.omitted is None
+    reason = "files_pending" if need_files else "source_stop_required"
+    record = _changed(state.record, phase="files" if need_files else "stopping",
+                      after=None, view=_changed(existing, reason=reason))
+    await _progress(runtime, record, state.record_etag, key=state.key)
+    state.record, state.record_etag = await _read(runtime, key=state.key)
+    state.current, state.etag = await runtime._agent_record()
+    _source_matches(state.current, state.record.view)
+
+
+async def _follow_files(runtime, state):
+    from .native_turns import _changed
+
+    existing = state.record.view
+    if state.omitted is None and (state.record.files is None or not state.record.files.source_verified):
+        return _changed(existing, reason="files_pending")
+    record = _changed(state.record, phase="stopping", view=_changed(existing, reason="source_stop_required"))
+    await _progress(runtime, record, state.record_etag, key=state.key)
+    state.record, state.record_etag = await _read(runtime, key=state.key)
+    return None
+
+
+async def _source_hold(runtime, command, existing):
+    """The view that keeps a prepare, or a commit before the source's compute is inactive, from going on; else None."""
+    from .native_turns import _changed
+
     if command.stage == "prepare":
         return _changed(existing, reason="source_stop_required")
     if runtime.bootstrap_source_inactive is None:
@@ -819,9 +884,16 @@ async def follow_session(runtime, command):
         inactive = await runtime.bootstrap_source_inactive(existing.previous_hosted_session_id)
     except Problem:
         return _changed(existing, reason="source_unavailable")
-    if not inactive:
-        return _changed(existing, reason="source_active")
-    current, etag = await runtime._agent_record()
+    return None if inactive else _changed(existing, reason="source_active")
+
+
+async def _confirm_stopped(runtime, command, state):
+    """The final scan after the source stopped: a view that holds the commit back, or None."""
+    from .native_turns import _changed
+
+    record, existing = state.record, state.record.view
+    current, state.etag = await runtime._agent_record()
+    state.current = current
     _source_matches(current, existing)
     if (current.environment is None or current.environment.state != "pending"
             or current.environment.request_id != existing.request_id):
@@ -835,36 +907,44 @@ async def follow_session(runtime, command):
     reason, after, responses = await _drain_pages(
         runtime, progress.after,
         existing.previous_hosted_session_id, current.task_id, responses=record.responses,
-        idle_only=record.idle_only or record.files_required or omitted is not None,
-        require_complete=omitted is not None, progress=progress, restart_changed_page=record.idle_only,
+        idle_only=record.idle_only or record.files_required or state.omitted is not None,
+        require_complete=state.omitted is not None, progress=progress, restart_changed_page=record.idle_only,
         settled=frozenset(command.settled_session_ids))
     if reason is not None:
         pending = _changed(record, phase="confirming", after=after, view=_changed(existing, reason=reason),
                            responses=responses, page_offset=progress.page_offset, page_digest=progress.page_digest,
                            waiting_request_id=progress.waiting_request_id)
-        await _progress(runtime, pending, record_etag, key=following_key)
+        await _progress(runtime, pending, state.record_etag, key=state.key)
         return pending.view
-    record = _changed(record, responses=responses, page_offset=0, page_digest=None, waiting_request_id=None)
+    record = state.record = _changed(record, responses=responses, page_offset=0, page_digest=None, waiting_request_id=None)
     reason = await _tasks_pending(runtime, current, existing.previous_hosted_session_id, responses=record.responses)
     if reason is not None:
         pending = _changed(record, phase="confirming", after=None, view=_changed(existing, reason=reason))
-        await _progress(runtime, pending, record_etag, key=following_key)
+        await _progress(runtime, pending, state.record_etag, key=state.key)
         return pending.view
-    if record.files_required and omitted is None:
+    return None
+
+
+async def _commit_ready(runtime, state):
+    """Publish the files a follow carries, then make the destination the Agent's: the ready view, or files_pending."""
+    from .native_turns import TURNS_STORE, _changed, binding_task_id
+
+    record, current = state.record, state.current
+    need_files = record.files_required and state.omitted is None
+    if need_files:
         from .native_environment_files import publish_files
         if record.files is None or not record.files.source_stopped_verified:
-            return _changed(existing, reason="files_pending")
-        record = await publish_files(runtime, record, record_etag, following_key)
-        existing = record.view
-    if omitted is not None and runtime.workspace_files is not None:
+            return _changed(record.view, reason="files_pending")
+        record = await publish_files(runtime, record, state.record_etag, state.key)
+    if state.omitted is not None and runtime.workspace_files is not None:
         runtime.workspace_files.initialize()
-    ready = _changed(existing, state="ready", reason=None,
-                     files_profile="fa-workspace-files-v1" if runtime.workspace_files is not None else None, **(
-        {"files_migrated": True} if record.files_required and omitted is None else {}))
+    ready = _changed(record.view, state="ready", reason=None,
+                     files_profile="fa-workspace-files-v1" if runtime.workspace_files is not None else None,
+                     **({"files_migrated": True} if need_files else {}))
     identifier = "environment:" + material_digest(ready)
     async with runtime._store(TURNS_STORE) as store:
         await runtime._immutable(store, identifier, ready)
-    await _save_agent(runtime, current, etag, _changed(
+    await _save_agent(runtime, current, state.etag, _changed(
         current, hosted_session_id=runtime.identity.session_id, environment=ready, following_supported=True,
         chain_task_id=binding_task_id(runtime.identity.agent_id, runtime.identity.session_id)))
     if current.admission_started:
@@ -872,3 +952,38 @@ async def follow_session(runtime, command):
         from .native_open_rids import mark_complete
         await mark_complete(runtime, runtime.identity.session_id, ready.request_id, responses=bool(record.responses))
     return ready
+
+
+async def follow_session(runtime, command):
+    from .native_turns import _changed
+
+    current, etag = await runtime._agent_record()
+    existing = current.environment
+    same = existing is not None and (
+        existing.hosted_session_id, existing.hosted_agent_version,
+        existing.previous_hosted_session_id,
+    ) == (runtime.identity.session_id, runtime.identity.agent_version, command.expected_session_id)
+    if same and existing.state == "ready":
+        return existing
+    state = await _open_following(runtime, command, current, etag, existing, same)
+    if _files_unsupported(runtime, command, state.record, state.omitted):
+        return _changed(state.record.view, reason="files_unsupported")
+    state.record = _with_source_refusal(current, _with_cursor(state.record))
+    _check_follow_binding(current, command, state.record.view)
+    if state.record.phase == "draining":
+        await _fence_source(runtime, state)
+        view = await _scan_for_stop(runtime, command, state)
+        if view is not None:
+            return view
+        await _end_draining(runtime, state)
+    if state.record.phase == "files":
+        view = await _follow_files(runtime, state)
+        if view is not None:
+            return view
+    view = await _source_hold(runtime, command, state.record.view)
+    if view is not None:
+        return view
+    view = await _confirm_stopped(runtime, command, state)
+    if view is not None:
+        return view
+    return await _commit_ready(runtime, state)

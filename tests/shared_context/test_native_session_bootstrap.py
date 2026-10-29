@@ -13,7 +13,7 @@ from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import NativeSessionPrepare, NativeSessionRead
 from shared_context.errors import Problem
 from shared_context.native_sdk import NativeBootstrapSource
-from shared_context.native_turns import NativeTurnRuntime, TURNS_STORE, EFFECTS_STORE
+from shared_context.native_turns import NativeTurnRuntime, TURNS_STORE, EFFECTS_STORE, _changed, _json
 from test_native_turns import IDENTITY, OfflineSdk, Harness, harness, local_env, native_retry_policy, accept_without_chain
 from test_native_turn_wire import submit
 
@@ -214,3 +214,151 @@ def test_missing_or_refused_old_session_is_not_assumed_inactive(status):
         asyncio.run(reader("original"))
     assert refusal.value.body["error"]["code"] == "NATIVE_BOOTSTRAP_SOURCE_UNAVAILABLE"
     assert len(calls) == 1
+
+
+def admission(rid, digest):
+    """The two fields the admission mark reads from a submitted request."""
+    return SimpleNamespace(command=SimpleNamespace(request_id=rid), sha256=digest)
+
+
+def refusal(problem):
+    return problem.value.status, problem.value.body["error"]["code"], problem.value.body["error"]["message"]
+
+
+def test_the_original_session_is_unavailable_before_the_state_stores_open(local_env):
+    with pytest.raises(Problem) as unavailable:
+        asyncio.run(NativeTurnRuntime(IDENTITY, OfflineSdk())._require_original_session(admitting=True))
+    assert refusal(unavailable) == (503, "NATIVE_EXECUTION_UNAVAILABLE", "native State stores have not initialized")
+
+
+def test_a_held_admission_refuses_other_material_and_other_rids_without_writing(harness):
+    """The record retains one admission intent: the same RID with another digest is 409, another RID waits (503)."""
+    runtime = harness.runtime
+    held = admission("held-rid", "a" * 64)
+    harness.call(lambda: runtime._original_session(admitting=True, request=held))
+    before = harness.call(runtime._agent_record)
+    assert (before[0].admitting.request_id, before[0].admitting.submit_digest) == ("held-rid", "a" * 64)
+    with pytest.raises(Problem) as conflict:
+        harness.call(lambda: runtime._original_session(admitting=True, request=admission("held-rid", "b" * 64)))
+    assert refusal(conflict) == (409, "NATIVE_RID_CONFLICT", "the original admission retains different submitted material")
+    with pytest.raises(Problem) as pending:
+        harness.call(lambda: runtime._original_session(admitting=True, request=admission("other-rid", "b" * 64)))
+    assert refusal(pending) == (503, "NATIVE_ADMISSION_PENDING", "the original admission must be reconciled first")
+    # The retained intent itself is admitted again as it is: no second mark.
+    assert harness.call(lambda: runtime._original_session(admitting=True, request=held)) == before
+    assert harness.call(runtime._agent_record) == before and not harness.sdk.calls
+
+
+@pytest.mark.parametrize("failure,known", [
+    ("lost", False), ("lost", True), ("precondition", False), ("applied", False), ("vanished", False),
+], ids=["unapplied-uncertain", "unapplied-uncertain-known", "unapplied-conflict", "applied-uncertain",
+        "unapplied-uncertain-vanished"])
+def test_an_uncertain_admission_mark_is_read_back_before_it_is_trusted(harness, monkeypatch, failure, known):
+    """A mark write with no answer is read back: our own mark is kept with the ETag read; anything else is 503 unless
+    a conflict on a ``known`` record (the reread path); a plain transport loss never takes that path."""
+    from azure.ai.agentserver.core.storage import FoundryStoragePreconditionError
+
+    runtime, original, failed = harness.runtime, FoundryStateStore.set_item, []
+    before = harness.call(runtime._agent_record)
+
+    async def uncertain(store, key, value, **kwargs):
+        if key != "agent" or failed:
+            return await original(store, key, value, **kwargs)
+        failed.append(key)
+        if failure == "applied":
+            await original(store, key, value, **kwargs)
+        if failure == "precondition":
+            raise FoundryStoragePreconditionError("OFFLINE refused mark", status_code=412)
+        raise ServiceResponseError("synthetic lost acknowledgement")
+
+    monkeypatch.setattr(FoundryStateStore, "set_item", uncertain)
+    if failure == "vanished":  # the read-back finds no record at all
+        read, gone = FoundryStateStore.get_item, []
+
+        async def vanished(store, key, *args, **kwargs):
+            if key == "agent" and failed and not gone:
+                gone.append(key)
+                return None
+            return await read(store, key, *args, **kwargs)
+        monkeypatch.setattr(FoundryStateStore, "get_item", vanished)
+    mark = lambda: runtime._original_session(admitting=True, known=before if known else None)
+    if failure == "applied":
+        current, etag = harness.call(mark)
+        assert current.admission_started and (current, etag) == harness.call(runtime._agent_record) and etag
+        assert failed and runtime._agent_session == current
+        return
+    with pytest.raises(Problem) as unknown:
+        harness.call(mark)
+    assert refusal(unknown) == (503, "NATIVE_BOOTSTRAP_UNKNOWN", "original admission binding is unconfirmed")
+    assert unknown.value.__suppress_context__ and failed == ["agent"]
+    assert harness.call(runtime._agent_record) == before and not before[0].admission_started
+
+
+def change_agent(runtime, record, etag):
+    """Write another field of the Agent record behind ``record`` (as an environment write would)."""
+    changed = _changed(record, following_supported=not record.following_supported)
+
+    async def write():
+        async with runtime._store(TURNS_STORE) as store:
+            await store.set_item("agent", _json(changed), if_match=etag)
+    return changed, write
+
+
+def test_a_known_record_is_used_as_is_unless_the_mark_needs_the_etag_it_lacks(harness):
+    """``known`` saves the read for a check that writes nothing; a mark without its ETag reads the record again, so a
+    change written since is kept, never overwritten by an unconditional write."""
+    runtime = harness.runtime
+    stale, etag = harness.call(runtime._agent_record)
+    changed, write = change_agent(runtime, stale, etag)
+    harness.call(write)
+    assert harness.call(lambda: runtime._original_session(known=(stale, None))) == (stale, None)
+    marked = harness.call(lambda: runtime._original_session(admitting=True, known=(stale, None)))
+    assert marked[0] == _changed(changed, admission_started=True) and marked == harness.call(runtime._agent_record)
+
+
+def test_a_known_record_changed_before_the_mark_is_read_again_and_marked(harness, caplog):
+    """The mark's CAS on a stale ``known`` ETag conflicts: the record is read again and marked from that read."""
+    import logging
+
+    runtime = harness.runtime
+    stale = harness.call(runtime._agent_record)
+    changed, write = change_agent(runtime, *stale)
+    harness.call(write)
+    caplog.set_level(logging.INFO, logger="shared_context.native_turns")
+    marked = harness.call(lambda: runtime._original_session(admitting=True, known=stale))
+    assert marked[0] == _changed(changed, admission_started=True) and marked == harness.call(runtime._agent_record)
+    assert caplog.text.count("FA_NATIVE_ADMISSION_MARK_REREAD") == 1
+
+
+@pytest.mark.parametrize("cause", ["recovery", "environment"])
+def test_new_work_waits_while_the_agent_follows_but_a_receipt_goes_on(harness, monkeypatch, cause):
+    """Both refusals are 503 for new work only: a receipt's own work goes on; a retained admission intent goes on
+    through an environment change but not past an unconfirmed owned task."""
+    from shared_context.behavior_native_turn_wire import NativeEnvironmentView
+    from shared_context.native_turns import _Admission
+
+    runtime = harness.runtime
+    record, etag = harness.call(runtime._agent_record)
+    held = admission("held-rid", "a" * 64)
+    record = record.model_copy(update={"admitting": _Admission(request_id="held-rid", submit_digest="a" * 64)})
+    if cause == "recovery":
+        monkeypatch.setattr(runtime, "_recovery_error", Problem(503, "OFFLINE_RECOVERY", "unconfirmed"))
+        message = "the original owned task is not yet confirmed"
+    else:
+        record = record.model_copy(update={"environment": NativeEnvironmentView(
+            agent_id=record.agent_id, request_id="OFFLINE-follow", previous_hosted_session_id=record.hosted_session_id,
+            previous_agent_version="1", hosted_session_id="OFFLINE-next-session", hosted_agent_version="2",
+            state="pending")})
+        message = "this Agent is changing environments; no new work was accepted"
+    known = (record, etag)
+    with pytest.raises(Problem) as following:
+        harness.call(lambda: runtime._original_session(known=known))
+    assert refusal(following) == (503, "AGENT_VERSION_FOLLOWING", message)
+    own = SimpleNamespace(hosted_session_id=IDENTITY.session_id)
+    assert harness.call(lambda: runtime._original_session(receipt=own, known=known)) == known
+    if cause == "recovery":
+        with pytest.raises(Problem) as retained:
+            harness.call(lambda: runtime._original_session(request=held, known=known))
+        assert refusal(retained) == (503, "AGENT_VERSION_FOLLOWING", message)
+    else:
+        assert harness.call(lambda: runtime._original_session(request=held, known=known)) == known

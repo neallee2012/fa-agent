@@ -616,267 +616,319 @@ def _toolbox_url(endpoint, name):
     return f"{endpoint}/toolboxes/{quote(name, safe='')}?api-version=v1"
 
 
-def toolbox_provider(*, transport=None, clock=time.monotonic) -> NativeCapabilityProvider:
-    """The single native consumer of captured ``mcp-toolbox`` grants; one instance per Hosted process."""
-    toolboxes = _Toolboxes()
+def _connection_code(needed) -> str:
+    return CONNECTOR_RECONNECT if needed.need == "reconnect" else CONNECTOR_NOT_CONNECTED
 
-    def remember(box, error):
-        # Only a failure that leaves the toolbox out or asks for a connection; a definite refusal still refuses each turn
-        # and drops an earlier one (e.g. the Connect card's relist was refused). This VM's own token blip is not the
-        # toolbox's failure, so it is not remembered either.
-        reason = getattr(error, "unavailable", None)
-        degraded = isinstance(error, _ConnectionNeeded) or reason not in (None, _UNAVAILABLE_STAGES["token"])
-        box.failed = (clock() + LIST_FAILURE_BACKOFF_SECONDS, error) if degraded else None
 
-    async def bind(context, grants):
-        endpoint = project_endpoint()
-        platform = _platform_headers()
-        clients, specs, schemas = {}, [], {}
-        receipt = context.receipt
+def _approval(configured, unread, hitl) -> tuple[str, str | None]:
+    """A listed tool's require_approval for this turn, and why it is not offered (None when it is)."""
+    approval = "never" if configured is None else configured
+    if unread and approval in ("always", "never"):
+        # Fail closed: another version may be promoted mid-turn behind the consumer endpoint, so every
+        # call asks the owner first; without native HITL the tool is not offered this turn.
+        approval = "always"
+    # The toolbox never blocks tools/call: an `always` tool needs this runtime's own per-call human
+    # approval (native HITL); without it, or with an unknown setting, the tool is not offered at all.
+    if approval not in ("always", "never"):
+        return approval, "approval_unknown"
+    if approval == "always" and not hitl:
+        return approval, "default_version_unread" if unread else "approval_required"
+    return approval, None
 
-        def client_for(name, version, toolbox=None):
-            return ToolboxClient(_mcp_url(endpoint, name, version), context.model_token_provider, transport=transport,
-                                 platform_headers=platform, toolbox=toolbox)
 
-        async def read_default(name):
-            try:
-                return await client_for(name, None).default_version(_toolbox_url(endpoint, name))
-            except Problem:
-                return None
+def _call_failure_codes(error: Problem, read_only) -> tuple[str, str]:
+    """The logged REFUSED/UNKNOWN code of a failed call, and the code the model is told."""
+    code = error.body["error"]["code"]
+    code = code if code in (REFUSED, UNKNOWN) else UNKNOWN
+    # A read-only tool can be called again whatever happened; otherwise only a call that ran
+    # nothing (REFUSED) says so, and an unknown outcome is never resent: the user decides.
+    return code, (TOOLBOX_READ_FAILED if read_only else TOOLBOX_NOT_RUN if code == REFUSED else TOOLBOX_OUTCOME_UNKNOWN)
 
-        async def connected(grant, needed, tool_call_id=None, call_digest=None):
-            """C3: the owner's Connect card for this Agent's connection; True only on its one 「我連好了，繼續」."""
-            entry = grant.toolbox
-            asked = (receipt.agent_id, receipt.conversation_id, entry.toolbox)
-            # No card where nobody can press it: no HITL, a non-human origin (Agent or schedule), a Teams relay turn
-            # (request ids "tr-", see native_teams_relay), or a connector the owner declined in this conversation.
-            if context.hitl is None or not receipt.human_origin or _relay_turn(receipt) or asked in _DECLINED:
-                return False
-            try:
-                await context.hitl.connect(ConnectorConsent(
-                    call=context.hitl.consent_call(tool_call_id), need=needed.need,
-                    connector_id=connector_of(grant.entry_id), toolbox_name=entry.toolbox,
-                    server_label=entry.server_label, step="tools/list" if tool_call_id is None else "tools/call",
-                    original_call_digest=call_digest, consent_urls=needed.links))
-            except Problem as error:
-                if error.body["error"]["code"] == "NATIVE_HITL_HUMAN_DENIED":
-                    _DECLINED.add(asked)
-                return False
-            return True
 
-        async def list_failure(client):
-            box, warming = client.toolbox, client.toolbox.warming
-            # Read before any wait: a failure in its window when the turn started is still reused if the window ends
-            # while the turn waits for a prewarm, so a failed slow prewarm is never followed by this turn's own listing.
-            started = box.failed if box.failed is not None and clock() < box.failed[0] else None
-            if (box.listed is None and warming is not None and not warming.done()
-                    and warming.get_loop() is asyncio.get_running_loop()):
-                # A prewarm is listing this exact version now: wait for its list rather than listing it a second time.
-                # Waited for before the backoff, so its success wins; waiting never cancels it.
-                with phase_timing("native_bind_toolbox_prewarm_wait", job_id=timing_id(receipt.request_id)):
-                    await asyncio.wait((warming,))
-            failed = box.failed
-            if box.listed is None and failed is not None and (failed is started or clock() < failed[0]):
-                # Still unlisted inside the backoff: this turn reuses the last failure instead of listing.
-                with phase_timing("native_bind_toolbox_list_backoff", job_id=timing_id(receipt.request_id)):
-                    return failed[1]
-            try:
-                await client.tools()
-            except Problem as error:
-                remember(box, error)
-                return error
+def _call_failed(key, digest, receipt, tool_call_id, code, public_code, read_only) -> ToolFailure:
+    _CALLS.settle(key, digest, public_code)
+    _log.warning("NATIVE_TOOLBOX_CALL_FAILED agent_id=%s request_id=%s tool_call_id=%s code=%s read_only=%s",
+                 receipt.agent_id, receipt.request_id, tool_call_id, code, str(read_only).lower())
+    return ToolFailure(TOOLBOX_FAILURE_GUIDANCE[public_code], public_code=public_code)
+
+
+async def _connected(context, grant, needed, tool_call_id=None, call_digest=None):
+    """C3: the owner's Connect card for this Agent's connection; True only on its one 「我連好了，繼續」."""
+    receipt, entry = context.receipt, grant.toolbox
+    asked = (receipt.agent_id, receipt.conversation_id, entry.toolbox)
+    # No card where nobody can press it: no HITL, a non-human origin (Agent or schedule), a Teams relay turn
+    # (request ids "tr-", see native_teams_relay), or a connector the owner declined in this conversation.
+    if context.hitl is None or not receipt.human_origin or _relay_turn(receipt) or asked in _DECLINED:
+        return False
+    try:
+        await context.hitl.connect(ConnectorConsent(
+            call=context.hitl.consent_call(tool_call_id), need=needed.need,
+            connector_id=connector_of(grant.entry_id), toolbox_name=entry.toolbox,
+            server_label=entry.server_label, step="tools/list" if tool_call_id is None else "tools/call",
+            original_call_digest=call_digest, consent_urls=needed.links))
+    except Problem as error:
+        if error.body["error"]["code"] == "NATIVE_HITL_HUMAN_DENIED":
+            _DECLINED.add(asked)
+        return False
+    return True
+
+
+async def _call_tool(context, client, grant, listed, raw, timeout, read_only, packet):
+    """One model call of a listed toolbox tool: sent at most once per call id, resent only after a Connect click."""
+    arguments = packet["arguments"]
+    if not isinstance(arguments, dict):
+        raise ToolFailure("Tool arguments must be a JSON object.", public_code=REFUSED)
+    receipt, call_id = context.receipt, packet["tool_call_id"]
+    key = (context.scope.sdk_session_id, receipt.request_id, call_id)
+    digest = hashlib.sha256(json.dumps([grant.entry_id, raw, arguments], sort_keys=True,
+                                       ensure_ascii=False).encode("utf-8")).hexdigest()
+    remembered = _CALLS.claim(key, digest)
+    if remembered is not None:
+        return ToolOutput(remembered)
+    resent = False
+    while True:
+        try:
+            result = await client.call_tool(listed, arguments, timeout=timeout)
+            break
+        except _ConnectionNeeded as needed:
+            if resent or not await _connected(context, grant, needed, call_id, digest):
+                code = _connection_code(needed)
+                raise _call_failed(key, digest, receipt, call_id, code, code, read_only) from None
+            # The owner's one 「我連好了，繼續」: the same call id and arguments, sent once more.
+            resent = True
+        except Problem as error:
+            code, public_code = _call_failure_codes(error, read_only)
+            raise _call_failed(key, digest, receipt, call_id, code, public_code, read_only) from None
+    text = _text(result)
+    output = McpToolResult(entry_id=grant.entry_id, entry_sha256=grant.entry_sha256, tool=raw,
+                           is_error=bool(result.get("isError")), text=text[:MAX_TOOL_RESULT_CHARS],
+                           truncated=len(text) > MAX_TOOL_RESULT_CHARS).model_dump_json()
+    _CALLS.settle(key, digest, output)
+    return ToolOutput(output)
+
+
+def _report_only(context, grant, description, code, specs, schemas):
+    """Bind each of the grant's tools to only report ``code``: it sends nothing and asks no approval."""
+    async def report(packet):
+        raise ToolFailure(TOOLBOX_FAILURE_GUIDANCE[code], public_code=code)
+    for name in grant.tools:
+        if context.hitl is not None:
+            context.hitl.set_toolbox_approval(name, "never")
+        specs.append(ToolSpec(name, description, {"type": "object", "properties": {}}, report))
+        schemas[name] = McpToolResult
+
+
+def _bind_unavailable(context, grant, failure, specs, schemas):
+    # Its tool list could not be read: this turn runs without this toolbox (Neal 2026-10-10). Its tools stay
+    # bound, as the capture and the resident SDK expect, and only report that; list_failure remembered the
+    # failure for its kept version, so a turn within the backoff gets this same reason without listing.
+    receipt, reason = context.receipt, failure.unavailable
+    by_source = getattr(failure, "unavailable_by_source", None)
+    if by_source is not None:
+        # The toolbox named which sources failed: a source it did not name is left out only alongside them,
+        # so it gets the neutral reason rather than theirs (stage 10-10: WebIQ's 401).
+        reason = by_source.get(grant.toolbox.server_label, "source_error")
+    source = _source_name(grant)
+    # Several grants can share one source: the turn's record decides that it is named, and logged, once.
+    if context.assembly is None or context.assembly.source_unavailable(grant.entry_id, source, reason):
+        _log.warning("FA_NATIVE_TOOL_SOURCE_UNAVAILABLE agent_id=%s request_id=%s entry=%s "
+                     "code=TOOLBOX_LIST_FAILED reason=%s", receipt.agent_id, receipt.request_id,
+                     grant.entry_id, reason)
+    _report_only(context, grant, f"Unavailable this turn: {source} could not list its tools. "
+                 "Calling it only reports that.", TOOLBOX_UNAVAILABLE, specs, schemas)
+
+
+def _tool_spec(context, grant, unread, client, name, raw, tool) -> ToolSpec:
+    """A listed, captured tool bound for this turn with its approval registered; refused when it cannot be offered."""
+    configuration = (tool.get("_meta") or {}).get("tool_configuration") or {}
+    approval, refused = _approval(configuration.get("require_approval"), unread, context.hitl is not None)
+    if refused is not None:
+        _log.warning("NATIVE_TOOLBOX_FAILED method=bind stage=tool_list code=CAPABILITY_UNAVAILABLE "
+                     "reason=%s", refused)
+        raise Problem(503, "CAPABILITY_UNAVAILABLE",
+                      "the toolbox default version could not be read, so its tools need per-call approval"
+                      if refused == "default_version_unread" else "a captured toolbox tool requires approval",
+                      capability=grant.entry_id, reason=refused)
+    if context.hitl is not None:
+        context.hitl.set_toolbox_approval(name, approval)
+    entry = grant.toolbox
+    timeout = _CALL_SECONDS if entry.timeout_ms is None else entry.timeout_ms / 1000
+    # Only decides the failure text, never what is allowed.
+    read_only = _read_only(grant, tool)
+
+    async def handle(packet, listed=tool["name"]):
+        return await _call_tool(context, client, grant, listed, raw, timeout, read_only, packet)
+
+    description = tool.get("description") if isinstance(tool.get("description"), str) else name
+    note = _tool_note(grant, raw)
+    note = "" if note is None else "\n" + note
+    return ToolSpec(name, description[:MAX_TOOL_DESCRIPTION_CHARS - len(note)] + note, _schema(tool, grant), handle)
+
+
+def _bind_listed(context, grant, unread, client, raws, listed, offered, specs, schemas):
+    for name in grant.tools:
+        tool = offered.get(raws[name])
+        if tool is None:
+            # Counts only: which listed names were seen is configuration, but stays out of the log.
+            _log.warning("NATIVE_TOOLBOX_FAILED method=bind stage=tool_list code=CAPABILITY_UNAVAILABLE "
+                         "reason=captured_tool_missing;listed=%s;label_matches=%s",
+                         len(listed), len(offered))
+            raise Problem(503, "CAPABILITY_UNAVAILABLE", "the toolbox no longer offers a captured tool",
+                          capability=grant.entry_id)
+        specs.append(_tool_spec(context, grant, unread, client, name, raws[name], tool))
+        schemas[name] = McpToolResult
+
+
+def _prewarm_listing(box) -> bool:
+    """A prewarm on this event loop is listing this still-unlisted version now."""
+    warming = box.warming
+    return (box.listed is None and warming is not None and not warming.done()
+            and warming.get_loop() is asyncio.get_running_loop())
+
+
+class _ToolboxTurn:
+    """One turn's bind: each grant's version read, listed once per version, then its tools bound in grant order."""
+
+    def __init__(self, provider, context):
+        self.provider, self.context, self.receipt = provider, context, context.receipt
+        self.endpoint = project_endpoint()
+        self.platform = _platform_headers()
+        self.clients, self.specs, self.schemas = {}, [], {}
+
+    def client_for(self, name, version, toolbox=None):
+        return ToolboxClient(_mcp_url(self.endpoint, name, version), self.context.model_token_provider,
+                             transport=self.provider.transport, platform_headers=self.platform, toolbox=toolbox)
+
+    async def read_default(self, name):
+        try:
+            return await self.client_for(name, None).default_version(_toolbox_url(self.endpoint, name))
+        except Problem:
             return None
 
+    async def list_failure(self, client):
+        box, clock = client.toolbox, self.provider.clock
+        # Read before any wait: a failure in its window when the turn started is still reused if the window ends
+        # while the turn waits for a prewarm, so a failed slow prewarm is never followed by this turn's own listing.
+        started = box.failed if box.failed is not None and clock() < box.failed[0] else None
+        if _prewarm_listing(box):
+            # A prewarm is listing this exact version now: wait for its list rather than listing it a second time.
+            # Waited for before the backoff, so its success wins; waiting never cancels it.
+            with phase_timing("native_bind_toolbox_prewarm_wait", job_id=timing_id(self.receipt.request_id)):
+                await asyncio.wait((box.warming,))
+        failed = box.failed
+        if box.listed is None and failed is not None and (failed is started or clock() < failed[0]):
+            # Still unlisted inside the backoff: this turn reuses the last failure instead of listing.
+            with phase_timing("native_bind_toolbox_list_backoff", job_id=timing_id(self.receipt.request_id)):
+                return failed[1]
+        try:
+            await client.tools()
+        except Problem as error:
+            self.provider.remember(box, error)
+            return error
+        return None
+
+    async def relist(self, grant, cache_key, needed):
+        # Before the model starts: after the owner's one click the same toolbox is listed once more.
+        if not await _connected(self.context, grant, needed):
+            return needed
+        try:
+            # A refresh never reads the backoff: the owner's click lists now.
+            await self.clients[cache_key].tools(refresh=True)
+        except Problem as error:
+            self.provider.remember(self.clients[cache_key].toolbox, error)
+            return error
+        # The owner just connected: any other kept version waiting out a connection need lists on its next turn
+        # (another conversation, a relay, Agent or routine turn) instead of saying "not connected".
+        for box in self.provider.toolboxes.items.values():
+            if box.failed is not None and isinstance(box.failed[1], _ConnectionNeeded):
+                box.failed = None
+        return None
+
+    async def place(self, grants):
+        """Each grant with whether its default version went unread and its version's key; one client per version."""
         # The default version can be promoted at any time and decides require_approval: read it every turn. Distinct
         # toolboxes are read, then listed, together.
         unpinned = list(dict.fromkeys(grant.toolbox.toolbox for grant in grants if grant.toolbox.version is None))
-        current = dict(zip(unpinned, await asyncio.gather(*(read_default(name) for name in unpinned))))
+        current = dict(zip(unpinned, await asyncio.gather(*(self.read_default(name) for name in unpinned))))
         placed = []
         for grant in grants:
             entry = grant.toolbox
             version = entry.version if entry.version is not None else current[entry.toolbox]
             # Unread default: the version serving this turn's calls is unknown, so no listed setting is trusted.
-            cache_key = (endpoint, entry.toolbox, version)
-            if cache_key not in clients:
+            cache_key = (self.endpoint, entry.toolbox, version)
+            if cache_key not in self.clients:
                 # An immutable version (official toolbox versioning) keeps its list and require_approval; an unread
                 # default lists the consumer endpoint for this turn only and keeps nothing for later turns.
-                kept = None if version is None else toolboxes.get(cache_key)
-                clients[cache_key] = client_for(entry.toolbox, version, kept)
+                kept = None if version is None else self.provider.toolboxes.get(cache_key)
+                self.clients[cache_key] = self.client_for(entry.toolbox, version, kept)
             placed.append((grant, version is None, cache_key))
-        failures = dict(zip(clients, await asyncio.gather(*(list_failure(client) for client in clients.values()))))
+        return placed
+
+    async def bind(self, grants):
+        placed = await self.place(grants)
+        failures = dict(zip(self.clients, await asyncio.gather(
+            *(self.list_failure(client) for client in self.clients.values()))))
         unconnected = {key: failure for key, failure in failures.items() if isinstance(failure, _ConnectionNeeded)}
         if unconnected:
             first = {}
             for grant, _, cache_key in placed:
                 first.setdefault(cache_key, grant)
-
-            async def relist(cache_key, needed):
-                # Before the model starts: after the owner's one click the same toolbox is listed once more.
-                if not await connected(first[cache_key], needed):
-                    return needed
-                try:
-                    # A refresh never reads the backoff: the owner's click lists now.
-                    await clients[cache_key].tools(refresh=True)
-                except Problem as error:
-                    remember(clients[cache_key].toolbox, error)
-                    return error
-                # The owner just connected: any other kept version waiting out a connection need lists on its next turn
-                # (another conversation, a relay, Agent or routine turn) instead of saying "not connected".
-                for box in toolboxes.items.values():
-                    if box.failed is not None and isinstance(box.failed[1], _ConnectionNeeded):
-                        box.failed = None
-                return None
             failures.update(zip(unconnected, await asyncio.gather(
-                *(relist(cache_key, needed) for cache_key, needed in unconnected.items()))))
+                *(self.relist(first[cache_key], cache_key, needed) for cache_key, needed in unconnected.items()))))
         for grant, unread, cache_key in placed:
-            entry, client = grant.toolbox, clients[cache_key]
-            prefix = grant.entry_id + "-"
-            raws = {name: name[len(prefix):] if name.startswith(prefix) else None for name in grant.tools}
-            if isinstance(failures[cache_key], _ConnectionNeeded):
-                # Still not connected: its tools only say so and send nothing; every other tool binds as usual.
-                code = CONNECTOR_RECONNECT if failures[cache_key].need == "reconnect" else CONNECTOR_NOT_CONNECTED
+            await self.bind_grant(grant, unread, cache_key, failures)
+        return NativeCapabilityBinding(tools=tuple(self.specs), result_schemas=self.schemas)
 
-                async def unconnected_tool(packet, code=code):
-                    raise ToolFailure(TOOLBOX_FAILURE_GUIDANCE[code], public_code=code)
-                for name in grant.tools:
-                    if context.hitl is not None:
-                        context.hitl.set_toolbox_approval(name, "never")
-                    specs.append(ToolSpec(
-                        name, f"Not connected for this assistant: {_source_name(grant)}. Calling it only reports that. "
-                        + CONNECT_ONLY_ON_THE_CARD,
-                        {"type": "object", "properties": {}}, unconnected_tool))
-                    schemas[name] = McpToolResult
-                continue
-            if failures[cache_key] is None:
-                # The version's shared list, including a refresh an earlier grant on it made; no request when listed.
-                listed = await client.tools()
-                offered = _offered(listed, entry.server_label)
-                if not client.fresh and not set(raws.values()) <= offered.keys():
-                    # A version can list nothing briefly after creation (official troubleshooting); list once more.
-                    try:
-                        listed = await client.tools(refresh=True)
-                    except Problem as error:
-                        # Fails like a first listing would: left out, or the turn refused, by the same rule below.
-                        failures[cache_key] = error
-                    else:
-                        offered = _offered(listed, entry.server_label)
-            if failures[cache_key] is not None:
-                reason = getattr(failures[cache_key], "unavailable", None)
-                if reason is None:
-                    # A definite refusal is reported at its first grant, as when the grants were listed one by one.
-                    raise failures[cache_key]
-                # Its tool list could not be read: this turn runs without this toolbox (Neal 2026-10-10). Its tools stay
-                # bound, as the capture and the resident SDK expect, and only report that; list_failure remembered the
-                # failure for its kept version, so a turn within the backoff gets this same reason without listing.
-                by_source = getattr(failures[cache_key], "unavailable_by_source", None)
-                if by_source is not None:
-                    # The toolbox named which sources failed: a source it did not name is left out only alongside them,
-                    # so it gets the neutral reason rather than theirs (stage 10-10: WebIQ's 401).
-                    reason = by_source.get(entry.server_label, "source_error")
-                source = _source_name(grant)
-                # Several grants can share one source: the turn's record decides that it is named, and logged, once.
-                if context.assembly is None or context.assembly.source_unavailable(grant.entry_id, source, reason):
-                    _log.warning("FA_NATIVE_TOOL_SOURCE_UNAVAILABLE agent_id=%s request_id=%s entry=%s "
-                                 "code=TOOLBOX_LIST_FAILED reason=%s", receipt.agent_id, receipt.request_id,
-                                 grant.entry_id, reason)
+    async def bind_grant(self, grant, unread, cache_key, failures):
+        client, failure = self.clients[cache_key], failures[cache_key]
+        prefix = grant.entry_id + "-"
+        raws = {name: name[len(prefix):] if name.startswith(prefix) else None for name in grant.tools}
+        if isinstance(failure, _ConnectionNeeded):
+            # Still not connected: its tools only say so and send nothing; every other tool binds as usual.
+            _report_only(self.context, grant, f"Not connected for this assistant: {_source_name(grant)}. Calling it "
+                         "only reports that. " + CONNECT_ONLY_ON_THE_CARD, _connection_code(failure),
+                         self.specs, self.schemas)
+            return
+        if failure is None:
+            # The version's shared list, including a refresh an earlier grant on it made; no request when listed.
+            listed = await client.tools()
+            offered = _offered(listed, grant.toolbox.server_label)
+            if not client.fresh and not set(raws.values()) <= offered.keys():
+                # A version can list nothing briefly after creation (official troubleshooting); list once more.
+                try:
+                    listed = await client.tools(refresh=True)
+                except Problem as error:
+                    # Fails like a first listing would: left out, or the turn refused, by the same rule below.
+                    failures[cache_key] = failure = error
+                else:
+                    offered = _offered(listed, grant.toolbox.server_label)
+        if failure is None:
+            _bind_listed(self.context, grant, unread, client, raws, listed, offered, self.specs, self.schemas)
+        elif getattr(failure, "unavailable", None) is None:
+            # A definite refusal is reported at its first grant, as when the grants were listed one by one.
+            raise failure
+        else:
+            _bind_unavailable(self.context, grant, failure, self.specs, self.schemas)
 
-                async def unavailable_tool(packet):
-                    raise ToolFailure(TOOLBOX_FAILURE_GUIDANCE[TOOLBOX_UNAVAILABLE], public_code=TOOLBOX_UNAVAILABLE)
-                for name in grant.tools:
-                    if context.hitl is not None:
-                        context.hitl.set_toolbox_approval(name, "never")
-                    specs.append(ToolSpec(
-                        name, f"Unavailable this turn: {source} could not list its tools. "
-                        "Calling it only reports that.", {"type": "object", "properties": {}}, unavailable_tool))
-                    schemas[name] = McpToolResult
-                continue
-            for name in grant.tools:
-                raw = raws[name]
-                tool = offered.get(raw)
-                if tool is None:
-                    # Counts only: which listed names were seen is configuration, but stays out of the log.
-                    _log.warning("NATIVE_TOOLBOX_FAILED method=bind stage=tool_list code=CAPABILITY_UNAVAILABLE "
-                                 "reason=captured_tool_missing;listed=%s;label_matches=%s",
-                                 len(listed), len(offered))
-                    raise Problem(503, "CAPABILITY_UNAVAILABLE", "the toolbox no longer offers a captured tool",
-                                  capability=grant.entry_id)
-                configuration = (tool.get("_meta") or {}).get("tool_configuration") or {}
-                approval = configuration.get("require_approval")
-                approval = "never" if approval is None else approval
-                if unread and approval in ("always", "never"):
-                    # Fail closed: another version may be promoted mid-turn behind the consumer endpoint, so every
-                    # call asks the owner first; without native HITL the tool is not offered this turn.
-                    approval = "always"
-                if approval not in ("always", "never") or approval == "always" and context.hitl is None:
-                    # The toolbox never blocks tools/call: an `always` tool needs this runtime's own per-call human
-                    # approval (native HITL); without it, or with an unknown setting, the tool is not offered at all.
-                    reason = ("approval_unknown" if approval not in ("always", "never") else
-                              "default_version_unread" if unread else "approval_required")
-                    _log.warning("NATIVE_TOOLBOX_FAILED method=bind stage=tool_list code=CAPABILITY_UNAVAILABLE "
-                                 "reason=%s", reason)
-                    raise Problem(503, "CAPABILITY_UNAVAILABLE",
-                                  "the toolbox default version could not be read, so its tools need per-call approval"
-                                  if reason == "default_version_unread" else "a captured toolbox tool requires approval",
-                                  capability=grant.entry_id, reason=reason)
-                if context.hitl is not None:
-                    context.hitl.set_toolbox_approval(name, approval)
-                timeout = _CALL_SECONDS if entry.timeout_ms is None else entry.timeout_ms / 1000
-                # Only decides the failure text, never what is allowed.
-                read_only = _read_only(grant, tool)
 
-                async def handle(packet, client=client, listed=tool["name"], raw=raw, grant=grant, timeout=timeout,
-                                 read_only=read_only):
-                    arguments = packet["arguments"]
-                    if not isinstance(arguments, dict):
-                        raise ToolFailure("Tool arguments must be a JSON object.", public_code=REFUSED)
-                    key = (context.scope.sdk_session_id, receipt.request_id, packet["tool_call_id"])
-                    digest = hashlib.sha256(json.dumps([grant.entry_id, raw, arguments], sort_keys=True,
-                                                       ensure_ascii=False).encode("utf-8")).hexdigest()
-                    remembered = _CALLS.claim(key, digest)
-                    if remembered is not None:
-                        return ToolOutput(remembered)
-                    resent = False
-                    while True:
-                        try:
-                            result = await client.call_tool(listed, arguments, timeout=timeout)
-                            break
-                        except _ConnectionNeeded as needed:
-                            if resent or not await connected(grant, needed, packet["tool_call_id"], digest):
-                                code = CONNECTOR_RECONNECT if needed.need == "reconnect" else CONNECTOR_NOT_CONNECTED
-                                _CALLS.settle(key, digest, code)
-                                _log.warning("NATIVE_TOOLBOX_CALL_FAILED agent_id=%s request_id=%s tool_call_id=%s "
-                                             "code=%s read_only=%s", receipt.agent_id, receipt.request_id,
-                                             packet["tool_call_id"], code, str(read_only).lower())
-                                raise ToolFailure(TOOLBOX_FAILURE_GUIDANCE[code], public_code=code) from None
-                            # The owner's one 「我連好了，繼續」: the same call id and arguments, sent once more.
-                            resent = True
-                        except Problem as error:
-                            code = error.body["error"]["code"]
-                            code = code if code in (REFUSED, UNKNOWN) else UNKNOWN
-                            # A read-only tool can be called again whatever happened; otherwise only a call that ran
-                            # nothing (REFUSED) says so, and an unknown outcome is never resent: the user decides.
-                            public_code = (TOOLBOX_READ_FAILED if read_only else TOOLBOX_NOT_RUN if code == REFUSED
-                                           else TOOLBOX_OUTCOME_UNKNOWN)
-                            _CALLS.settle(key, digest, public_code)
-                            _log.warning("NATIVE_TOOLBOX_CALL_FAILED agent_id=%s request_id=%s tool_call_id=%s code=%s "
-                                         "read_only=%s", receipt.agent_id, receipt.request_id, packet["tool_call_id"],
-                                         code, str(read_only).lower())
-                            raise ToolFailure(TOOLBOX_FAILURE_GUIDANCE[public_code], public_code=public_code) from None
-                    text = _text(result)
-                    output = McpToolResult(entry_id=grant.entry_id, entry_sha256=grant.entry_sha256, tool=raw,
-                                           is_error=bool(result.get("isError")), text=text[:MAX_TOOL_RESULT_CHARS],
-                                           truncated=len(text) > MAX_TOOL_RESULT_CHARS).model_dump_json()
-                    _CALLS.settle(key, digest, output)
-                    return ToolOutput(output)
+class _ToolboxProvider:
+    """One Hosted process's toolbox consumer: the kept version lists and their listing backoff."""
 
-                description = tool.get("description") if isinstance(tool.get("description"), str) else name
-                note = _tool_note(grant, raw)
-                note = "" if note is None else "\n" + note
-                specs.append(ToolSpec(name, description[:MAX_TOOL_DESCRIPTION_CHARS - len(note)] + note,
-                                      _schema(tool, grant), handle))
-                schemas[name] = McpToolResult
-        return NativeCapabilityBinding(tools=tuple(specs), result_schemas=schemas)
-    async def warm(token_provider, entries):
+    def __init__(self, transport, clock):
+        self.transport, self.clock, self.toolboxes = transport, clock, _Toolboxes()
+
+    def remember(self, box, error):
+        # Only a failure that leaves the toolbox out or asks for a connection; a definite refusal still refuses each turn
+        # and drops an earlier one (e.g. the Connect card's relist was refused). This VM's own token blip is not the
+        # toolbox's failure, so it is not remembered either.
+        reason = getattr(error, "unavailable", None)
+        degraded = isinstance(error, _ConnectionNeeded) or reason not in (None, _UNAVAILABLE_STAGES["token"])
+        box.failed = (self.clock() + LIST_FAILURE_BACKOFF_SECONDS, error) if degraded else None
+
+    async def bind(self, context, grants):
+        return await _ToolboxTurn(self, context).bind(grants)
+
+    async def warm(self, token_provider, entries):
         """Prewarm while the owner types (README#typing-prewarm): list each named version into the kept lists, as the
         official startup listing does (.NET ``AddFoundryToolboxes`` lists ``tools/list`` once at startup). It runs
         outside any turn, so it sends no call id (official: never reuse a call id across requests), registers no
@@ -884,28 +936,11 @@ def toolbox_provider(*, transport=None, clock=time.monotonic) -> NativeCapabilit
         failure (README#toolbox-list-backoff). A failure is only logged and starts no backoff: a turn with nothing
         remembered lists that version itself."""
         counts = dict.fromkeys(("listed", "kept", "listing", "failed"), 0)
-
-        async def one(entry, endpoint):
-            version = entry.version
-            if version is None:
-                # Like a turn: the current default version, read now; its list is kept under that exact version.
-                version = await ToolboxClient(_mcp_url(endpoint, entry.toolbox, None), token_provider,
-                                              transport=transport).default_version(_toolbox_url(endpoint, entry.toolbox))
-            box = toolboxes.get((endpoint, entry.toolbox, version))
-            if box.listed is not None:
-                return "kept"
-            if box.warming is not None and not box.warming.done():
-                return "listing"
-            client = ToolboxClient(_mcp_url(endpoint, entry.toolbox, version), token_provider, transport=transport,
-                                   toolbox=box)
-            box.warming = asyncio.ensure_future(client.tools())
-            await box.warming
-            return "listed"
-
         with phase_timing("native_prewarm_toolbox"):
             try:
                 endpoint = project_endpoint()
-                outcomes = await asyncio.gather(*(one(entry, endpoint) for entry in entries), return_exceptions=True)
+                outcomes = await asyncio.gather(*(self.warm_one(token_provider, entry, endpoint) for entry in entries),
+                                                return_exceptions=True)
             except Problem:
                 outcomes = ["failed"] * len(entries)
             for outcome in outcomes:
@@ -916,5 +951,26 @@ def toolbox_provider(*, transport=None, clock=time.monotonic) -> NativeCapabilit
         _log.warning("FA_NATIVE_PREWARM toolboxes=%s listed=%s kept=%s listing=%s failed=%s", len(entries),
                      counts["listed"], counts["kept"], counts["listing"], counts["failed"])
 
-    return NativeCapabilityProvider(accepts=lambda grant: grant.kind == "mcp-toolbox", bind=bind, name="toolbox",
-                                    warm=warm)
+    async def warm_one(self, token_provider, entry, endpoint):
+        version = entry.version
+        if version is None:
+            # Like a turn: the current default version, read now; its list is kept under that exact version.
+            version = await ToolboxClient(_mcp_url(endpoint, entry.toolbox, None), token_provider,
+                                          transport=self.transport).default_version(_toolbox_url(endpoint, entry.toolbox))
+        box = self.toolboxes.get((endpoint, entry.toolbox, version))
+        if box.listed is not None:
+            return "kept"
+        if box.warming is not None and not box.warming.done():
+            return "listing"
+        client = ToolboxClient(_mcp_url(endpoint, entry.toolbox, version), token_provider, transport=self.transport,
+                               toolbox=box)
+        box.warming = asyncio.ensure_future(client.tools())
+        await box.warming
+        return "listed"
+
+
+def toolbox_provider(*, transport=None, clock=time.monotonic) -> NativeCapabilityProvider:
+    """The single native consumer of captured ``mcp-toolbox`` grants; one instance per Hosted process."""
+    provider = _ToolboxProvider(transport, clock)
+    return NativeCapabilityProvider(accepts=lambda grant: grant.kind == "mcp-toolbox", bind=provider.bind,
+                                    name="toolbox", warm=provider.warm)

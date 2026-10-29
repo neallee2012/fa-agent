@@ -395,46 +395,6 @@ def test_original_stop_ackloss_and_restart_never_resend(original_teams_gap, monk
         monkeypatch.setattr(c.transport, "send", transport)
 
 
-def test_signed_operator_and_expiry_do_not_expand_original_scope(original_teams_gap):
-    from shared_context.behavior_recovery_api import create_recovery_app
-    from test_m3_auth import token
-    c = original_teams_gap
-    service, stops = service_for(c)
-    api = TestClient(create_recovery_app(c.parent, service.scope, stop=service._platform_stop))
-    prefix = "/operator/v1/sdk-recovery"
-    identity = c.config.identity
-    claims = {"tid": identity.tenant_id, "iss": f"https://sts.windows.net/{identity.tenant_id}/",
-              "aud": identity.audience, "oid": identity.human_oid, "appid": identity.admin_client_id,
-              "scp": "Behavior.Read"}
-    reader = {"Authorization": "Bearer "+token(c.h.c.signing_key, claims)}
-    denied = api.post(prefix+"/plan", json={}, headers=reader)
-    assert denied.status_code == 403
-    for changed in ({"oid": "00000000-0000-0000-0000-000000000001"},
-                    {"appid": "00000000-0000-0000-0000-000000000002"},
-                    {"tid": "00000000-0000-0000-0000-000000000003"}):
-        forbidden = {"Authorization": "Bearer "+token(c.h.c.signing_key, {
-            **claims, "scp": "Behavior.Read Behavior.Approve", **changed})}
-        assert api.post(prefix+"/plan", json={}, headers=forbidden).status_code in (401, 403)
-    planned = api.post(prefix+"/plan", json={}, headers=c.headers)
-    assert planned.status_code == 200, planned.text
-    granted = api.post(prefix+"/authorize", json={"plan": planned.json(), "decision_id": "offline-jwt-original"},
-                       headers=c.headers)
-    assert granted.status_code == 200, granted.text
-    assert granted.json()["schema_version"] == "fa-teams-pre-acquire-recovery-authorization-v1"
-    assert api.post(prefix+"/execute", json={**granted.json(), "sdk_stop": {"graceful": True}},
-                    headers=c.headers).status_code == 422
-    done = api.post(prefix+"/execute", json=granted.json(), headers=c.headers)
-    assert done.status_code == 200, done.text
-    assert done.json()["model_outcome"] == "not_requested" and not done.json()["sdk_graceful_exit_claim"]
-    c.clock[0] = c.config.channels.valid_until
-    for phase in ("execute", "finish", "deliver"):
-        refused = api.post(prefix+"/"+phase, json=granted.json(), headers=c.headers)
-        assert refused.status_code == 403, (phase, refused.text)
-    observed = api.post(prefix+"/reconcile", json=granted.json(), headers=reader)
-    assert observed.status_code == 200 and observed.json()["stop_resent"] is False
-    assert len(stops) == 1 and c.sends == []
-
-
 def test_unknown_stop_and_tampered_terminal_history_remain_unresolved(original_teams_gap):
     from test_behavior_settlement import write
     from shared_context.behavior_recovery import recovery_key

@@ -61,6 +61,7 @@ sys.path.insert(0, str(SHARED_DIR))
 import entra  # noqa: E402
 import models  # noqa: E402
 import profile as fa_profile  # noqa: E402
+from deployment_config import write_x as _write_x  # noqa: E402
 
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 DIGEST_REF = re.compile(r"[a-z0-9.-]+\.azurecr\.io/[a-z0-9-]+@sha256:[0-9a-f]{64}")
@@ -168,8 +169,10 @@ class Context:
         return self.get("AZURE_RESOURCE_GROUP") or f"rg-{self.env}"
 
     # ---- tools -----------------------------------------------------------------------------------------------
-    def az(self, *args: str, missing_ok: bool = False, timeout: int | None = None) -> Any:
-        result = self.run([*self.az_cmd, *args, "-o", "json"], timeout=timeout)
+    def az(self, *args: str, missing_ok: bool = False, timeout: int | None = None, read_again: bool = False) -> Any:
+        """`read_again` only for a GET (read_retrying); a write is always sent once."""
+        command = [*self.az_cmd, *args, "-o", "json"]
+        result = read_retrying(self, command, timeout) if read_again else self.run(command, timeout=timeout)
         if result.code != 0:
             if missing_ok and any(marker in result.stderr for marker in ("ResourceNotFound", "ResourceGroupNotFound",
                                                                           "was not found", "could not be found",
@@ -225,16 +228,39 @@ def _first_error(stderr: str) -> str:
     return next((line.strip() for line in stderr.splitlines() if line.strip() and "WARNING" not in line), "")[:300]
 
 
+# az rest prints no status code, only the reason phrase and the body (azure-cli-core 2.89.1 util.send_raw_request:
+# reason + "({})".format(text)): "ERROR: Service Unavailable(<!DOCTYPE html ..." on 2026-10-28, "ERROR: Gateway
+# Timeout({...})". Any other answer whose body is an HTML page instead of ARM's JSON counts too, except a 404, which
+# _arm_get reads as before.
+TRANSIENT_READ = re.compile(r"ERROR: (Bad Gateway|Service Unavailable|Gateway Timeout|Too Many Requests)\(|"
+                            r"ERROR: (?!Not Found\()([A-Za-z][A-Za-z ]*)\(\s*<(?:!DOCTYPE|html)", re.IGNORECASE)
+READ_AGAIN_AFTER = (5, 15, 30)  # seconds; on 2026-10-28 the account read fine again 11 s after its 503
+
+
+def read_retrying(ctx: Context, args: list[str], timeout: int | None = None) -> Result:
+    """Run a read-only az rest GET, never a write, and read again after a transient answer, a bounded number of times.
+    One that persists stops here, so no caller reads an error page's text as "gone". A hung az (TimeoutExpired) is
+    not read again: four timeouts per read would stretch the close, which ignores Ctrl+C, by minutes per read."""
+    if args[args.index("--method") + 1] != "get":
+        raise Stop("a write is sent once, never through read_retrying")
+    path = args[args.index("--url") + 1].split("?")[0]
+    for wait in (*READ_AGAIN_AFTER, None):
+        result = ctx.run(args, timeout=timeout)
+        transient = TRANSIENT_READ.search(result.stderr) if result.code != 0 else None
+        if transient is None:
+            return result
+        reason = transient.group(1) or transient.group(2)
+        if wait is None:
+            raise Stop(f"az rest get {path} kept answering {reason} {len(READ_AGAIN_AFTER) + 1} times over about "
+                       f"{sum(READ_AGAIN_AFTER)} s (a transient Azure error); nothing more was sent. Read it back, "
+                       f"then rerun `{ctx.resume}`")
+        print(f"FA: az rest get {path} answered {reason} (transient); reading it again in {wait} s", flush=True)
+        ctx.sleep(wait)
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def _write_x(path: Path, value: Any) -> None:
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=1)
-        stream.flush()
-        os.fsync(stream.fileno())
 
 
 # ---- preprovision ------------------------------------------------------------------------------------------------
@@ -738,6 +764,25 @@ def require_dns_records(ctx: Context) -> None:
                    "groups), then `azd env set FA_DNS_RECORDS_READY true` and rerun `azd up`")
 
 
+def stop_on_a_failed_capability_host(ctx: Context) -> None:
+    """Read only. [文件] Learn capability-hosts: "Updating capability hosts is not supported", so the Bicep PUT cannot
+    repair a Failed project capability host. Deleting it stays the operator's step: this prints the command. A failed
+    read only warns, so provision goes on as before."""
+    name, project = foundry_account_name(ctx), project_name(ctx)
+    try:
+        hosts = project_capability_hosts(ctx, name, project)
+    except Stop as error:
+        print(f"FA: warning: could not read project {project}'s capability hosts ({error}); going on", flush=True)
+        return
+    for host, state in hosts.items():
+        if state == "Failed":
+            url = capability_host_url(ctx, name, project, host)
+            raise Stop(f"project capability host {host} of Foundry account {name} is Failed, and a capability host "
+                       "cannot be updated, so `azd provision` cannot repair it. Delete it yourself with "
+                       f"`az rest --method delete --url \"{url}\"`, read it back with `az rest --method get --url "
+                       f"\"{url}\"` until it is not found, then rerun `azd provision`; nothing was changed")
+
+
 def preprovision(ctx: Context) -> None:
     if sys.version_info < (3, 11):
         raise Stop("Python 3.11 or newer is required")
@@ -748,7 +793,10 @@ def preprovision(ctx: Context) -> None:
                        "`azd env new <name> --subscription <id> --location <region>` (or `azd env set`) first")
     mode = network_mode(ctx)
     account = check_account(ctx)
-    check_existing_vnet(ctx, mode, check_network_mode(ctx, mode))
+    foundry = check_network_mode(ctx, mode)
+    check_existing_vnet(ctx, mode, foundry)
+    if mode == "private" and foundry is not None and _provisioning(foundry) != "Deleting":
+        stop_on_a_failed_capability_host(ctx)
     me = signed_in_user(ctx)
     owner = ctx.get("FA_TEAM_OWNER_OID")
     if owner is None:
@@ -898,7 +946,9 @@ def deployer_ipv4() -> str:
 
 
 def wait_until(ctx: Context, what: str, check: Callable[[], tuple[bool, str]], attempts: int, every: int) -> None:
-    """Bounded poll, check() -> (done, state), with a progress line about once a minute. It never sends a write."""
+    """Bounded poll, check() -> (done, state), with a progress line about once a minute. It never sends a write. The
+    line says the minutes that passed: a check's own re-reads (read_retrying) make them more than reads x every."""
+    start = ctx.now()
     for attempt in range(attempts):
         done, state = check()
         if done:
@@ -906,8 +956,8 @@ def wait_until(ctx: Context, what: str, check: Callable[[], tuple[bool, str]], a
         if attempt == attempts - 1:
             break
         if attempt % max(1, 60 // every) == 0:
-            print(f"FA: waiting for {what}: {state} ({attempt * every // 60} of at most {attempts * every // 60} min)",
-                  flush=True)
+            print(f"FA: waiting for {what}: {state} ({int((ctx.now() - start).total_seconds()) // 60} min so far, "
+                  f"read {attempt + 1} of {attempts})", flush=True)
         ctx.sleep(every)
     raise Stop(f"{what}: not reached within {attempts * every // 60} min (last: {state}); nothing more was sent. "
                f"Read it back, then rerun `{ctx.resume}`")
@@ -926,12 +976,12 @@ def _window_state(account: dict[str, Any] | None) -> str:
             f"{properties.get('provisioningState')}")
 
 
-def patch_window(ctx: Context, name: str, ip: str | None) -> Path:
+def patch_window(ctx: Context, name: str, ip: str | None, current: Any) -> Path:
     """The window's only write: publicNetworkAccess and networkAcls' defaultAction, bypass and ipRules. Every other
-    networkAcls field (virtualNetworkRules, ...) goes back as read, since the PATCH replaces networkAcls whole, and
-    networkInjections stays as it was created. The bodies are files, as in graph(): the opening call writes the close
-    body too, so the close command printed on a failure has its file even when the close could not read the account."""
-    current = ctx.az("rest", "--method", "get", "--url", account_url(ctx, name), timeout=WINDOW_AZ_TIMEOUT)
+    networkAcls field (virtualNetworkRules, ...) goes back as `current` (the account as read) has it, since the PATCH
+    replaces networkAcls whole, and networkInjections stays as it was created. The bodies are files, as in graph(): the
+    opening call writes the close body too, so the close command printed on a failure has its file even when the close
+    could not read the account."""
     acls = ((current or {}).get("properties") or {}).get("networkAcls") or {}
 
     def body(allow: str | None) -> dict[str, Any]:
@@ -966,26 +1016,43 @@ def interrupt_deferred():
         signal.signal(signal.SIGINT, previous)
 
 
-def close_window(ctx: Context, name: str, why: str) -> None:
-    """PATCH back to Disabled with no IP rule and read it back. A failure is loud and stops the hook (non-zero); an
-    interruption or any other error is loud too and goes on as itself."""
+def close_window(ctx: Context, name: str, why: str, ip: str, account: Any = None, opened_from: Any = None) -> None:
+    """PATCH back to Disabled with no IP rule and read it back; its reads are read again after a transient answer
+    (read_retrying), the PATCH is sent once. `account` is a fresh read, so none is made before the PATCH; when that
+    read fails, the body is built from `opened_from`, the read the opening made in this run. A failure is loud and
+    stops the hook (non-zero); an interruption or any other error is loud too and goes on as itself."""
     url = account_url(ctx, name)
 
     def closed() -> tuple[bool, str]:
-        account = ctx.az("rest", "--method", "get", "--url", url, timeout=WINDOW_AZ_TIMEOUT)
+        account = ctx.az("rest", "--method", "get", "--url", url, timeout=WINDOW_AZ_TIMEOUT, read_again=True)
         state = ((account or {}).get("properties") or {}).get("provisioningState")
         return window_closed(account) and state == "Succeeded", _window_state(account)
 
-    print(f"FA: closing Foundry account {name} again; Ctrl+C is ignored until it reads back closed (each az call "
-          f"at most {WINDOW_AZ_TIMEOUT} s), so press it again afterwards to stop", flush=True)
+    # The waits at worst: the read before the PATCH and each of the 24 read-backs re-read 3 times, plus 23 polls of 5 s.
+    worst = (sum(READ_AGAIN_AFTER) * 25 + 23 * 5 + 59) // 60
+    print(f"FA: closing Foundry account {name} again; Ctrl+C is ignored until it reads back closed: up to 24 "
+          f"reads 5 s apart, each read again after {', '.join(map(str, READ_AGAIN_AFTER))} s when it "
+          f"answers a transient error, so at worst about {worst} min of waiting plus the az calls (each at most "
+          f"{WINDOW_AZ_TIMEOUT} s), so press it again afterwards to stop", flush=True)
     try:
         with interrupt_deferred():
-            patch_window(ctx, name, None)
+            if account is None:
+                try:
+                    account = ctx.az("rest", "--method", "get", "--url", url, timeout=WINDOW_AZ_TIMEOUT,
+                                     read_again=True)
+                except (Stop, subprocess.TimeoutExpired) as error:
+                    if opened_from is None:
+                        raise
+                    # A networkAcls change made while the window was open is undone; a closed window is safer.
+                    print(f"FA: the read before the close PATCH failed: {error}\nFA: closing anyway: sending the "
+                          "close body built from the read when the window opened", flush=True)
+                    account = opened_from
+            patch_window(ctx, name, None, account)
             wait_until(ctx, f"Foundry account {name} to read back closed", closed, attempts=24, every=5)
     except BaseException as error:
         line = "!" * 100
-        print(f"\n{line}\nFA: WARNING: Foundry account {name} may still be open to the IP allowed for this run "
-              f"({why}). Closing it failed: {str(error) or type(error).__name__}\nClose it yourself now, then read it "
+        print(f"\n{line}\nFA: WARNING: Foundry account {name} may still be open to {ip} ({why}). "
+              f"Closing it failed: {str(error) or type(error).__name__}\nClose it yourself now, then read it "
               f"back:\n  az rest --method patch --url \"{url}\" --body @{ctx.work / 'foundry-window-close.json'} "
               "--headers Content-Type=application/json\n"
               f"  az rest --method get --url \"{url}\" --query \"properties.[publicNetworkAccess, networkAcls]\"\n"
@@ -1004,7 +1071,8 @@ def close_left_open_window(ctx: Context, name: str, account: dict[str, Any] | No
         return
     print(f"FA: Foundry account {name} is open ({_window_state(account)}), most likely left by an interrupted run; "
           "closing it first", flush=True)
-    close_window(ctx, name, "left open by an earlier run")
+    rules = [str(rule.get("value")) for rule in (_properties(account).get("networkAcls") or {}).get("ipRules") or []]
+    close_window(ctx, name, "left open by an earlier run", ", ".join(rules) or "what its network rules allow", account)
 
 
 def confirm_window(ctx: Context, name: str, ip: str, steps: str) -> None:
@@ -1035,8 +1103,11 @@ def foundry_window(ctx: Context, name: str, endpoint: str, ip: str):
                           "--resource", AI_RESOURCE, "-o", "json"])
         return result.code == 0, _first_error(result.stderr) or "answered"
 
+    opened_from = None
     try:
-        patch_window(ctx, name, ip)
+        opened_from = ctx.az("rest", "--method", "get", "--url", account_url(ctx, name), timeout=WINDOW_AZ_TIMEOUT,
+                             read_again=True)
+        patch_window(ctx, name, ip, opened_from)
         print(f"FA: Foundry account {name} is open to {ip} alone; waiting for its data plane", flush=True)
         wait_until(ctx, f"the Foundry data plane to answer {ip} (or the signed-in account lacks Foundry User)",
                    answers, attempts=36, every=5)
@@ -1044,7 +1115,7 @@ def foundry_window(ctx: Context, name: str, endpoint: str, ip: str):
     finally:
         pending = sys.exc_info()[1]
         close_window(ctx, name, f"the steps stopped: {str(pending) or type(pending).__name__}" if pending
-                     else "the steps finished")
+                     else "the steps finished", ip, opened_from=opened_from)
 
 
 def window_ip(ctx: Context, seeding: bool) -> str | None:
@@ -1651,6 +1722,9 @@ def backup_role(ctx: Context) -> tuple[str, dict[str, Any] | None]:
 NETWORK_API = "api-version=2024-05-01"  # the virtualNetworks/subnets version infra/ reads subnets with
 
 
+CAPABILITY_HOST_404 = re.compile(r"CapabilityHost '[^']+' not found in workspace '")
+
+
 class GroupGone(Stop):
     """The resource group itself does not exist (ResourceGroupNotFound)."""
 
@@ -1658,7 +1732,7 @@ class GroupGone(Stop):
 def _arm_get(ctx: Context, url: str) -> Any:
     """GET that reads a 404 of the resource itself (ResourceNotFound, or a deleted account's own code) as None. A
     missing subscription or resource group is not "this resource is gone": both stop, the group as GroupGone."""
-    result = ctx.run([*ctx.az_cmd, "rest", "--method", "get", "--url", url, "-o", "json"])
+    result = read_retrying(ctx, [*ctx.az_cmd, "rest", "--method", "get", "--url", url, "-o", "json"])
     if result.code != 0:
         path = url.split("?")[0]
         if "SubscriptionNotFound" in result.stderr:
@@ -1666,7 +1740,11 @@ def _arm_get(ctx: Context, url: str) -> Any:
                        "AZURE_SUBSCRIPTION_ID and the az sign-in; nothing was changed")
         if "ResourceGroupNotFound" in result.stderr:
             raise GroupGone(f"resource group {ctx.group} was not found reading {path}")
-        if "Not Found" in result.stderr or "ResourceNotFound" in result.stderr:  # az rest prints 404 as "Not Found("
+        # az rest prints no status code, only the 404's reason phrase: "Not Found(", or a project capability host's
+        # own "CapabilityHost '<name>' not found in workspace '...'" with InnerError NotFoundError (live run
+        # 2026-10-28). Anchored on the host: the same front-end says "Connection 'x' not found in workspace" too.
+        if ("Not Found" in result.stderr or "ResourceNotFound" in result.stderr
+                or (CAPABILITY_HOST_404.search(result.stderr) and '"NotFoundError"' in result.stderr)):
             return None
         raise Stop(f"az rest get {path} failed: {_first_error(result.stderr)}")
     return json.loads(result.stdout) if result.stdout.strip() else None
@@ -1686,17 +1764,32 @@ def project_name(ctx: Context) -> str:
     return ctx.get("FA_PROJECT") or f"fa-{ctx.env}"  # main.bicep names.project
 
 
+def project_capability_hosts(ctx: Context, name: str, project: str) -> dict[str, str | None]:
+    """Name -> provisioningState of the project's capability hosts, listed as the official cleanup tool does, so any
+    name is found (foundry.bicep names its one caphostproj; one per scope). A 404 reads as none, like an empty list."""
+    listed = (_arm_get(ctx, account_url(ctx, name, f"/projects/{project}/capabilityHosts")) or {}).get("value") or []
+    # A listed child's name may carry its parents' names (the cleanup tool splits the projects' names).
+    return {str(item["name"]).rsplit("/", 1)[-1]: _provisioning(item) for item in listed}
+
+
+def capability_host_url(ctx: Context, name: str, project: str, host: str) -> str:
+    return account_url(ctx, name, f"/projects/{project}/capabilityHosts/{host}")
+
+
 def foundry_state(ctx: Context, name: str) -> dict[str, Any]:
-    """Read only, before the question, so a rerun continues where the last one stopped: the account and its project
-    (each present, Deleting or gone). The agents are read later, inside the window, which opens only while the
-    project is there and not Deleting yet (a Deleting project is polled, as the earlier run deleted its agents)."""
+    """Read only, before the question, so a rerun continues where the last one stopped: the account, its project
+    and the project's capability hosts (each present, Deleting or gone; an environment provisioned before 2026-10-28
+    has none). The agents are read later, inside the window, which opens only while the project is there and not
+    Deleting yet. A Deleting project is polled, its hosts not listed: [推論] the earlier run deleted its agents, then
+    its capability hosts (read back gone), before it sent the project's DELETE."""
     account = _arm_get(ctx, account_url(ctx, name))
     require_mode(ctx, name, account, "private")  # before any window, delete or purge
     project = project_name(ctx)
     found = (None if account is None or _provisioning(account) == "Deleting"
              else _arm_get(ctx, account_url(ctx, name, f"/projects/{project}")))
+    window = bool(found) and _provisioning(found) != "Deleting"
     return {"account": account, "project": project if found else None, "project_state": _provisioning(found),
-            "window": bool(found) and _provisioning(found) != "Deleting"}
+            "window": window, "capability_hosts": project_capability_hosts(ctx, name, project) if window else {}}
 
 
 def delete_agents(ctx: Context, endpoint: str) -> None:
@@ -1765,12 +1858,22 @@ def delete_once(ctx: Context, what: str, url: str, state: str | None, resend_for
         try:
             wait_until(ctx, f"{what} to start deleting after the GatewayTimeout", started, attempts=4, every=30)
         except Stop as stop:
+            if not str(stop).startswith(f"{what} to start deleting"):
+                raise  # a read that failed keeps its own message: the delete may have started
             raise Stop(f"{stop}. The delete did not start; the rerun reads the state again before it sends one "
                        "delete") from None
         return
     done, current = started()
     if not done:
         raise Stop(f"deleting {what} failed ({error}); it is still {current}. Read it back, then rerun `{ctx.resume}`")
+
+
+def delete_and_wait(ctx: Context, what: str, url: str, state: str | None, attempts: int, every: int) -> None:
+    """delete_once, then poll until it reads back gone (a project or a project capability host)."""
+    delete_once(ctx, what, url, state)
+    wait_until(ctx, f"{what} to be deleted", lambda: (_arm_get(ctx, url) is None, "still there"),
+               attempts=attempts, every=every)
+    print(f"FA: {what}: deleted (read back)", flush=True)
 
 
 def delete_account(ctx: Context, name: str, account: Any) -> None:
@@ -1827,8 +1930,12 @@ def wait_agent_subnet_released(ctx: Context) -> None:
 
 
 def delete_private_foundry(ctx: Context, name: str, state: dict[str, Any], ip: str | None) -> None:
-    """The order the probes verified: agents (force), project, account, wait until gone, purge, the subnet link.
-    Deleting the project with agents still in it was never tried, so the agents go first, through the window."""
+    """[探針] The probes verified this order: agents (force), project, account, wait until gone, purge, subnet link.
+    Deleting the project with agents still in it was never tried, so the agents go first, through the window.
+    [文件] The project capability hosts go after them, before the project: the official cleanup order (no probe has
+    seen it), where the project's host goes first so the account's can be deleted (template 11 README). FA leaves
+    the account host to the purge, which triggers its deletion and so frees the subnet's service association link.
+    The hosts are ARM, so outside the window."""
     project = state["project"]
     if project:
         if state["window"]:
@@ -1837,12 +1944,12 @@ def delete_private_foundry(ctx: Context, name: str, state: dict[str, Any], ip: s
                 delete_agents(ctx, endpoint)
         else:
             print(f"FA: project {project}: Deleting already (an earlier run); polling it, no window", flush=True)
-        url = account_url(ctx, name, f"/projects/{project}")
+        for host, host_state in state["capability_hosts"].items():  # the official cleanup waits up to 30 min
+            delete_and_wait(ctx, f"project capability host {host}", capability_host_url(ctx, name, project, host),
+                            host_state, attempts=60, every=30)
         # Before the account, or it is CannotDeleteResource.
-        delete_once(ctx, f"project {project}", url, state["project_state"])
-        wait_until(ctx, f"project {project} to be deleted", lambda: (_arm_get(ctx, url) is None, "still there"),
-                   attempts=40, every=15)
-        print(f"FA: project {project}: deleted (read back)", flush=True)
+        delete_and_wait(ctx, f"project {project}", account_url(ctx, name, f"/projects/{project}"),
+                        state["project_state"], attempts=40, every=15)
     else:
         print("FA: project: already deleted, and its Hosted Agents with it", flush=True)
     delete_account(ctx, name, state["account"])
@@ -1899,8 +2006,11 @@ def predown(ctx: Context) -> None:
         close_left_open_window(ctx, foundry, state["account"])  # back to the Bicep state, so no question first
         ip = deployer_ipv4() if state["window"] else None  # the agents are deleted through the window
         lines = [f"FA_NETWORK_MODE=private: before azd deletes {ctx.group}, this hook:",
-                 f"  permanently deletes the Foundry account {foundry} with its models and Hosted Agents,",
-                 "  and purges it (about 25 min, with progress);"]
+                 f"  permanently deletes the Foundry account {foundry} with its models and Hosted Agents,"]
+        if state["capability_hosts"]:
+            lines.append(f"  first deleting its project capability host {', '.join(state['capability_hosts'])} "
+                         "(that alone can wait up to 30 min),")
+        lines.append("  and purges it (about 25 min, with progress);")
         if ip:
             lines += [f"  to delete the Hosted Agents, first opens the account to {ip} alone and closes it again",
                       f"  ({ip} is this computer's public IPv4, read from {IPV4_ECHO});",

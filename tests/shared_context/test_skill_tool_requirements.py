@@ -129,36 +129,3 @@ def test_client_transports_the_complete_tool_manifest_without_changing_old_empty
         VersionInput(**old.model_dump(), skill_tools=tools)
 
 
-def test_cli_preview_names_the_declared_tool_without_implying_authorization(m3, signing_key, jwk_client, monkeypatch, capsys):
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock, patch
-    from shared_context.m3_cli import main
-
-    service, _, _ = m3
-    http, agent, human = signed_m3(service, signing_key, jwk_client)
-    _, response = upload(http, agent, tools=requirements())
-    assert response.status_code == 200, response.text
-    version = response.json()["versions"][0]
-    credential = MagicMock()
-    credential.__enter__.return_value = credential
-    credential.get_token.return_value = SimpleNamespace(token=human["Authorization"].removeprefix("Bearer "))
-    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    previews = []
-
-    def confirm(_):
-        previews.append(capsys.readouterr().out)
-        return "approve"
-
-    with patch("shared_context.m3_cli.InteractiveBrowserCredential", return_value=credential), \
-            patch("shared_context.m3_cli.httpx.Client", return_value=http), \
-            patch("builtins.input", side_effect=confirm):
-        result = main([
-            "--api", "https://poc.example.westus3.azurecontainerapps.io",
-            "--tenant", service.context.auth.tenant_id, "--audience", service.context.auth.audience,
-            "--client-id", service.approval.client_id, "--team", A.team, "approve", "tool-guide",
-            "--version", V1, "--sha256", version["sha256"], "--decision-id", V1,
-            "--metadata-sha256", version["metadata_sha256"],
-        ])
-    assert result == 0 and len(previews) == 1
-    assert '"skill_tools"' in previews[0] and '"authorization": false' in previews[0]
-    assert "fa-delegate-v1" in previews[0] and version["metadata_sha256"] in previews[0]

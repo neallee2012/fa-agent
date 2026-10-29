@@ -478,8 +478,12 @@ def test_preprovision_writes_the_memory_backend_bicep_reads(hooks, tmp_path, val
 def test_an_existing_account_of_the_same_mode_passes(hooks, tmp_path, values, injected):
     ctx = context(hooks, tmp_path, preprovision_routes(ok({"ok": True}), foundry=foundry_account(injected)), **values)
     hooks.preprovision(ctx)
-    (read,) = [call for call in ctx.run.calls if "Microsoft.CognitiveServices/accounts/" in " ".join(call)]
+    read, *hosts = [call for call in ctx.run.calls if "Microsoft.CognitiveServices/accounts/" in " ".join(call)]
     assert read[:4] == ["az", "rest", "--method", "get"]
+    # private also lists the project's capability hosts, read only (a Failed one would stop provision)
+    assert [call[:4] + [call[5].split(ACCOUNT)[1]] for call in hosts] == (
+        [["az", "rest", "--method", "get", "/projects/fa-dev/capabilityHosts?api-version=2025-06-01"]] if injected
+        else [])
     assert read[5] == (f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-dev/providers/Microsoft.CognitiveServices/"
                        f"accounts/{ACCOUNT}?api-version=2025-06-01")
 
@@ -1568,6 +1572,10 @@ def test_an_allowed_dirty_build_is_built_and_never_reused(hooks, tmp_path):
 # ---- ADR-0010 section 5: the deploy window of FA_NETWORK_MODE=private ----------------------------------------------
 
 IP = "198.51.100.7"
+# A read answering ARM's HTML 503 page (live teardown 2026-10-28, shortened): az rest prints the reason phrase and body.
+SERVICE_UNAVAILABLE = failed("ERROR: Service Unavailable(<!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.0 Transitional//EN' "
+                             "'http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd'><html><head><title>Service "
+                             "Unavailable</title></head><body>The service is unavailable.</body></html>)")
 OPEN_BODY = {"properties": {"publicNetworkAccess": "Enabled", "networkAcls": {
     "defaultAction": "Deny", "bypass": "AzureServices", "ipRules": [{"value": IP}]}}}
 CLOSE_BODY = {"properties": {"publicNetworkAccess": "Disabled", "networkAcls": {
@@ -1578,15 +1586,24 @@ PRIVATE_DEPLOY = {**PRIVATE, "FA_FOUNDRY_ACCOUNT": ACCOUNT}
 class FakeAccount:
     """The private environment's Foundry account: PATCH bodies change it, GETs read it back, and its data plane
     answers only while public network access is on. `close` = "refused" (the PATCH fails) or "ignored" (it answers
-    200 but nothing changes) breaks the closing PATCH only."""
+    200 but nothing changes) breaks the closing PATCH only. `unavailable` = (patches, count): once that many PATCHes
+    were sent, the next `count` account GETs answer SERVICE_UNAVAILABLE (1: the close's own read before its PATCH,
+    as on 2026-10-28; 2: its read-back)."""
 
-    def __init__(self, open_to=None, close=None, data_plane=True, log=None):
+    def __init__(self, open_to=None, close=None, data_plane=True, log=None, unavailable=(0, 0)):
         self.properties = {"provisioningState": "Succeeded", "networkInjections": [{"scenario": "agent"}],
                            **json.loads(json.dumps((OPEN_BODY if open_to else CLOSE_BODY)["properties"]))}
         if open_to:
             self.properties["networkAcls"]["ipRules"] = [{"value": open_to}]
         self.close, self.data_plane_on, self.patches = close, data_plane, []
         self.log = [] if log is None else log
+        self.unavailable_after, self.unavailable = unavailable
+
+    def answers_unavailable(self):
+        if self.unavailable and len(self.patches) >= self.unavailable_after:
+            self.unavailable -= 1
+            return True
+        return False
 
     def __call__(self, args):
         if args[args.index("--method") + 1] == "patch":
@@ -1599,6 +1616,8 @@ class FakeAccount:
             if opening or self.close != "ignored":
                 self.properties.update(json.loads(json.dumps(body["properties"])))
             return ok({})
+        if self.answers_unavailable():
+            return SERVICE_UNAVAILABLE
         return ok({"name": ACCOUNT, "properties": json.loads(json.dumps(self.properties))})
 
     def data_plane(self, args):
@@ -1699,6 +1718,52 @@ def test_a_failed_step_and_a_failed_close_report_both(hooks, tmp_path, deployer,
     assert "the steps stopped: seed went wrong" in capsys.readouterr().err  # not lost behind the close failure
 
 
+@pytest.mark.parametrize("after", [1, 2])  # the close's read before its PATCH (2026-10-28), then its read-back
+def test_a_transient_503_on_a_close_read_is_read_again_and_the_deploy_goes_on(hooks, tmp_path, monkeypatch, deployer,
+                                                                             capsys, after):
+    account = FakeAccount(unavailable=(after, 2))
+    steps, _ = private_deploy(hooks, tmp_path, monkeypatch, account)
+    assert steps[:8] == ["profile", "images", "window:open", "webiq", "memory_store", "seed", "window:close",
+                         "agent_roles"]
+    assert account.patches == [OPEN_BODY, CLOSE_BODY] and hooks.window_closed({"properties": account.properties})
+    out, err = capsys.readouterr()
+    assert out.count("answered Service Unavailable (transient); reading it again in") == 2 and err == ""
+    assert "closed again (read back: publicNetworkAccess Disabled, no IP rule)" in out
+
+
+def test_a_close_pre_read_that_keeps_failing_sends_the_open_time_close_body_once(hooks, tmp_path, monkeypatch,
+                                                                                    deployer, capsys):
+    account = FakeAccount(unavailable=(1, 4))  # the close's read before its PATCH fails all 4 times; the read-back is fine
+    account.properties["networkAcls"]["virtualNetworkRules"] = [{"id": "snet-api"}]
+    steps, _ = private_deploy(hooks, tmp_path, monkeypatch, account)
+    assert steps[:8] == ["profile", "images", "window:open", "webiq", "memory_store", "seed", "window:close",
+                         "agent_roles"]
+    assert [patch["properties"]["networkAcls"].pop("virtualNetworkRules") for patch in account.patches] == [
+        [{"id": "snet-api"}]] * 2  # the fallback body is the one built from the open's read
+    assert account.patches == [OPEN_BODY, CLOSE_BODY] and hooks.window_closed({"properties": account.properties})
+    out = capsys.readouterr().out
+    assert out.count("answered Service Unavailable (transient); reading it again in") == 3
+    assert "closing anyway: sending the close body built from the read when the window opened" in out
+    assert "closed again (read back: publicNetworkAccess Disabled, no IP rule)" in out
+
+
+@pytest.mark.parametrize("after", [1, 2])  # 1: the pre-read fails too, so the open-time close body is sent once
+def test_a_close_read_that_keeps_failing_warns_with_the_ip_and_both_commands(hooks, tmp_path, monkeypatch, deployer,
+                                                                            capsys, after):
+    account = FakeAccount(unavailable=(after, 10_000))
+    with pytest.raises(hooks.Stop, match=f"Foundry account {ACCOUNT} could not be closed again"):
+        private_deploy(hooks, tmp_path, monkeypatch, account)
+    # the close PATCH is sent once, never twice, and nothing after the window runs
+    assert account.patches == [OPEN_BODY, CLOSE_BODY] and "agent_roles" not in account.log
+    out, err = capsys.readouterr()
+    assert ("closing anyway: sending the close body built from the read when the window opened" in out) == (after == 1)
+    assert f"WARNING: Foundry account {ACCOUNT} may still be open to {IP} (the steps finished)" in err
+    assert "kept answering Service Unavailable 4 times" in err
+    url = (f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-dev/providers/Microsoft.CognitiveServices/accounts/"
+           f"{ACCOUNT}?api-version=2025-06-01")
+    assert f'az rest --method patch --url "{url}" --body @' in err and f'az rest --method get --url "{url}" --query' in err
+
+
 def interrupting(account, when):
     """The account's routes, recording the SIGINT handler at each ARM call and raising KeyboardInterrupt (a Ctrl+C)
     at the first call `when(args)` picks."""
@@ -1785,6 +1850,27 @@ def test_every_window_az_call_is_bounded_and_a_hung_close_prints_the_command(hoo
         assert "az rest --method patch --url" in err and "foundry-window-close.json" in err
     else:
         assert err == "" and hooks.window_closed({"properties": account.properties})
+
+
+def test_a_close_pre_read_that_hangs_still_sends_the_open_time_close_body_once(hooks, tmp_path, deployer, capsys):
+    account = FakeAccount()
+    ctx = window_context(hooks, tmp_path, account, FA_CONFIRM_DEPLOY_WINDOW=IP)
+    fake, closing, hung = ctx.run, [], []
+
+    def run(args, **kwargs):  # only the close's read before its PATCH hangs; the read-back answers
+        if closing and "Microsoft.CognitiveServices/accounts/" in " ".join(args) and "get" in args and not hung:
+            hung.append(kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+        return fake(args, **kwargs)
+
+    ctx.run = run
+    with hooks.data_plane_window(ctx, hooks.window_ip(ctx, seeding=True)):
+        closing.append(True)
+    assert hung == [90] and account.patches == [OPEN_BODY, CLOSE_BODY] and hooks.window_closed({"properties": account.properties})
+    out, err = capsys.readouterr()
+    assert "the read before the close PATCH failed" in out and "timed out after 90" in out
+    assert "closing anyway: sending the close body built from the read when the window opened" in out
+    assert "closed again (read back: publicNetworkAccess Disabled, no IP rule)" in out and err == ""
 
 
 class FakeChild:
@@ -2010,6 +2096,19 @@ def test_the_deployer_ip_is_one_public_ipv4_or_a_stop(hooks, monkeypatch, body, 
 
 NOT_FOUND = failed("ERROR: Not Found({\"error\":{\"code\":\"ResourceNotFound\"}})")
 GATEWAY_TIMEOUT = failed("ERROR: (GatewayTimeout) The gateway did not receive a response")
+def workspace_error(what, inner="NotFoundError"):
+    """A project capability host GET's error (live run 2026-10-28, names replaced): az prints the service's reason
+    phrase, so neither "Not Found" nor "ResourceNotFound" is in the text."""
+    return failed(
+        f"ERROR: {what} not found in workspace '{ACCOUNT}@fa-dev@AM({{\"error\":{{\"code\":\"UserError\","
+        f"\"message\":\"{what} not found in workspace '{ACCOUNT}@fa-dev@AML'\",\"details\":[],\"additionalInfo\":"
+        "[{\"type\":\"ComponentName\",\"info\":{\"value\":\"managementfrontend\"}},{\"type\":\"InnerError\","
+        f"\"info\":{{\"value\":{{\"code\":\"{inner}\",\"innerError\":null}}}}}}]}}}})")
+
+
+HOST_MISSING = workspace_error("CapabilityHost 'caphostproj'")
+# The same front-end text about something other than the host: not "the host is gone".
+CONNECTION_MISSING = workspace_error("Connection 'x'")
 def nested(*ids):
     """The account DELETE's CannotDeleteResource, in the shape Azure answers (live run 2026-10-24)."""
     listed = ", ".join(f"'Microsoft.CognitiveServices/accounts/{ACCOUNT}/{item}'" for item in ids)
@@ -2029,12 +2128,21 @@ class FakeFoundry(FakeAccount):
     "no-start" (the account DELETE changes nothing), "project-timeout" (the project DELETE answers GatewayTimeout
     but goes on), "sticky-agents" (agent DELETEs answer 200, the agents stay), "agents-404" (agent DELETEs answer
     404 and the agents go), "purge-fails" (the purge is refused and the copy stays), "project-refused" (the project
-    DELETE answers STALE_PROJECT and the project stays). `refuse_delete`: the answer of every account DELETE."""
+    DELETE answers STALE_PROJECT and the project stays), "host-timeout" (the capability host DELETE answers
+    GatewayTimeout but goes on), "hosts-404" (the list of the project's capability hosts answers 404), "hosts-500" (it
+    answers InternalServerError). `refuse_delete`: the answer of every account DELETE. `host`: the project capability
+    host's provisioningState ("Deleting" goes after `host_polls` reads), or None (provisioned before it existed);
+    `host_name`: its name as the list answers it. [文件] Assumed, not probed: the project DELETE is refused while the
+    host is there (the official cleanup tool deletes it first; no probe has tried otherwise). Fault "host-gone-text":
+    a gone host's GET answers HOST_MISSING; "host-other-text": CONNECTION_MISSING."""
 
     def __init__(self, account="Succeeded", project=True, agents=("fa-dev-a", "fa-dev-b"), soft_deleted=False,
                  links=1, deleting_polls=2, delete_answer=None, refuse_delete=False, open_to=None, faults=(),
-                 stale_project=0):
-        super().__init__(open_to=open_to)
+                 stale_project=0, host="Succeeded", host_polls=1, host_name="caphostproj", unavailable=(0, 0),
+                 deleting_unavailable=0):
+        super().__init__(open_to=open_to, unavailable=unavailable)
+        self.deleting_unavailable = deleting_unavailable  # account GETs answering 503 while it is Deleting
+        self.host, self.host_polls, self.host_name = host, host_polls, host_name
         self.account, self.project, self.agents, self.soft_deleted = account, project, list(agents), soft_deleted
         self.links, self.deleting_polls, self.delete_answer = links, deleting_polls, delete_answer
         self.stale_project = stale_project
@@ -2056,9 +2164,36 @@ class FakeFoundry(FakeAccount):
                 self.soft_deleted, self.purging = False, False
                 return ok({"name": ACCOUNT})
             return ok({"name": ACCOUNT}) if self.soft_deleted else NOT_FOUND
+        if "/capabilityHosts" in text:
+            assert self.project is True, "the capability hosts are read and deleted only while their project is there"
+            if "/capabilityHosts?api-version=2025-06-01" in text:
+                assert method == "get"
+                if "hosts-404" in self.faults:
+                    return NOT_FOUND
+                if "hosts-500" in self.faults:
+                    return failed("ERROR: (InternalServerError) Something went wrong")
+                return ok({"value": [{"name": self.host_name, "properties": {"provisioningState": self.host}}]
+                           if self.host else []})
+            if f"/capabilityHosts/{self.host_name.rsplit('/', 1)[-1]}?api-version=2025-06-01" not in text:
+                return NOT_FOUND
+            if method == "delete":
+                self.log.append("host:delete")
+                self.host = "Deleting"
+                return GATEWAY_TIMEOUT if "host-timeout" in self.faults else ok()
+            if self.host == "Deleting":
+                self.host_polls -= 1
+                if self.host_polls < 0:
+                    self.host = None
+            if self.host is None:
+                if "host-other-text" in self.faults:
+                    return CONNECTION_MISSING
+                return HOST_MISSING if "host-gone-text" in self.faults else NOT_FOUND
+            return ok({"name": "caphostproj", "properties": {"provisioningState": self.host}})
         if "/projects/" in text:
             if method == "delete":
                 self.log.append("project:delete")
+                if self.host:
+                    return failed("ERROR: (Conflict) the project still has a capability host")  # [文件] assumed
                 if "project-refused" in self.faults:
                     return STALE_PROJECT
                 self.project = False
@@ -2081,6 +2216,11 @@ class FakeFoundry(FakeAccount):
             if "no-start" not in self.faults:
                 self.account = "Deleting"
             return self.delete_answer or ok()
+        if self.answers_unavailable():
+            return SERVICE_UNAVAILABLE
+        if self.account == "Deleting" and self.deleting_unavailable:
+            self.deleting_unavailable -= 1
+            return SERVICE_UNAVAILABLE
         if self.account == "Deleting":
             self.deleting_polls -= 1
             if self.deleting_polls < 0:
@@ -2125,18 +2265,21 @@ def writes(ctx):
             or "lock" in call and "delete" in call]
 
 
-def test_private_predown_asks_once_and_deletes_in_the_verified_order(hooks, tmp_path, deployer, capsys):
+def test_private_predown_asks_once_and_deletes_in_the_probed_order_plus_the_documented_host_step(hooks, tmp_path,
+                                                                                                 deployer, capsys):
+    # [探針] agents, project, account, purge, link; [文件] the capability host before the project (no probe saw it).
     foundry = FakeFoundry(links=3)
     ctx, asked = private_down(hooks, tmp_path, foundry)
     hooks.predown(ctx)
     assert asked == [f"Type the environment name (dev) to permanently delete and purge Foundry account {ACCOUNT} and "
                      "remove the backup lock: "]
-    assert foundry.log == ["window:open", "agent:fa-dev-a", "agent:fa-dev-b", "window:close", "project:delete",
-                           "account:delete", "purge", "lock:delete"]
+    assert foundry.log == ["window:open", "agent:fa-dev-a", "agent:fa-dev-b", "window:close", "host:delete",
+                           "project:delete", "account:delete", "purge", "lock:delete"]
     assert foundry.account is None and not foundry.soft_deleted and foundry.links == 0
     assert foundry.patches == [OPEN_BODY, CLOSE_BODY]
     out = capsys.readouterr().out
     assert (f"permanently deletes the Foundry account {ACCOUNT} with its models and Hosted Agents" in out
+            and "first deleting its project capability host caphostproj (that alone can wait up to 30 min)" in out
             and f"opens the account to {IP} alone" in out and "azd asks its own y/N for the rest" in out
             and "waiting for Foundry account" in out and "snet-agents has no service association link" in out)
     # Short lines, one point each, before the question.
@@ -2196,8 +2339,8 @@ def test_private_predown_without_a_terminal_runs_on_the_name_alone(hooks, tmp_pa
     foundry = FakeFoundry(agents=())
     ctx, asked = private_down(hooks, tmp_path, foundry, locks=(), tty=False, FA_CONFIRM_DELETE="dev")
     hooks.predown(ctx)
-    assert asked == [] and foundry.log == ["window:open", "window:close", "project:delete", "account:delete",
-                                           "purge"]
+    assert asked == [] and foundry.log == ["window:open", "window:close", "host:delete", "project:delete",
+                                           "account:delete", "purge"]
     assert "Hosted Agents: none left" in capsys.readouterr().out
 
 
@@ -2240,19 +2383,161 @@ def test_a_gateway_timeout_without_a_start_stops_after_about_90_s(hooks, tmp_pat
     assert foundry.log == ["account:delete"] and foundry.account == "Succeeded"  # sent once, no purge
 
 
+def test_predown_reads_a_transient_503_again_on_the_close_and_the_deleting_poll(hooks, tmp_path, deployer, capsys):
+    # 2026-10-28: an HTML 503 on the close's read, then on the poll of the Deleting account; both are reads.
+    foundry = FakeFoundry(unavailable=(1, 2), deleting_unavailable=3)
+    ctx, _ = private_down(hooks, tmp_path, foundry)
+    hooks.predown(ctx)
+    assert foundry.log == ["window:open", "agent:fa-dev-a", "agent:fa-dev-b", "window:close", "host:delete",
+                           "project:delete", "account:delete", "purge", "lock:delete"]  # each DELETE sent once
+    assert foundry.patches == [OPEN_BODY, CLOSE_BODY] and foundry.account is None
+    assert capsys.readouterr().out.count("answered Service Unavailable (transient); reading it again in") == 5
+
+
+def test_a_poll_reports_the_minutes_that_passed_not_its_reads(hooks, tmp_path, capsys):
+    ctx = context(hooks, tmp_path, {})
+    clock = [datetime(2026, 10, 28, 9, 0, tzinfo=timezone.utc)]
+    ctx.now = lambda: clock[0]
+    ctx.sleep = lambda seconds: clock.__setitem__(0, clock[0] + timedelta(seconds=seconds))
+
+    def check():
+        ctx.sleep(50)  # each read answered a transient error three times: 5 + 15 + 30 s
+        return False, "still there"
+
+    with pytest.raises(hooks.Stop, match="x: not reached"):
+        hooks.wait_until(ctx, "x", check, attempts=25, every=5)
+    assert [line for line in capsys.readouterr().out.splitlines() if "waiting for x" in line] == [
+        "FA: waiting for x: still there (0 min so far, read 1 of 25)",
+        "FA: waiting for x: still there (11 min so far, read 13 of 25)"]  # 13 x 50 s + 12 x 5 s, not "1 of at most 2"
+
+
+def test_a_poll_that_keeps_answering_503_stops_and_never_resends_the_delete(hooks, tmp_path):
+    foundry = FakeFoundry(project=False, deleting_unavailable=10_000)
+    ctx, _ = private_down(hooks, tmp_path, foundry)
+    sleeps = []
+    ctx.sleep = sleeps.append
+    with pytest.raises(hooks.Stop, match=f"az rest get .*/accounts/{ACCOUNT} kept answering Service Unavailable 4 "
+                                         r"times over about 50 s \(a transient Azure error\); nothing more was sent"):
+        hooks.predown(ctx)
+    assert foundry.log == ["account:delete"] and sleeps == [5, 15, 30]  # no resend, no purge, the lock stays
+
+
+def test_a_gateway_timeout_then_a_poll_that_keeps_answering_503_names_the_read(hooks, tmp_path):
+    foundry = FakeFoundry(project=False, delete_answer=GATEWAY_TIMEOUT, deleting_unavailable=10_000)
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    with pytest.raises(hooks.Stop) as stop:
+        hooks.predown(ctx)
+    assert "kept answering Service Unavailable 4 times" in str(stop.value)
+    assert "The delete did not start" not in str(stop.value)  # it may have: only the read failed
+    assert foundry.log == ["account:delete"]
+
+
+def test_a_delete_answering_an_html_503_is_not_sent_again(hooks, tmp_path):
+    foundry = FakeFoundry(project=False, delete_answer=SERVICE_UNAVAILABLE, faults={"no-start"})
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    with pytest.raises(hooks.Stop, match=rf"deleting Foundry account {ACCOUNT} failed \(ERROR: Service Unavailable"
+                                         r"\(<!DOCTYPE.*\); it is still Succeeded"):
+        hooks.predown(ctx)
+    assert foundry.log == ["account:delete"]  # a write is sent once, whatever it answered
+
+
+def test_predown_warns_with_the_ip_when_the_window_cannot_be_read_closed(hooks, tmp_path, deployer, capsys):
+    foundry = FakeFoundry(unavailable=(1, 10_000))
+    ctx, _ = private_down(hooks, tmp_path, foundry)
+    with pytest.raises(hooks.Stop, match=f"Foundry account {ACCOUNT} could not be closed again"):
+        hooks.predown(ctx)
+    # the close body from the open's read is sent once; nothing else is deleted, the lock is kept
+    assert foundry.log == ["window:open", "agent:fa-dev-a", "agent:fa-dev-b", "window:close"]
+    err = capsys.readouterr().err
+    assert f"WARNING: Foundry account {ACCOUNT} may still be open to {IP}" in err
+    assert "kept answering Service Unavailable" in err and "az rest --method patch --url" in err
+
+
 def test_a_gateway_timeout_on_the_project_delete_is_polled_never_resent(hooks, tmp_path, deployer, capsys):
     foundry = FakeFoundry(agents=(), faults={"project-timeout"})
     ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
     hooks.predown(ctx)
-    assert foundry.log == ["window:open", "window:close", "project:delete", "account:delete", "purge"]
+    assert foundry.log == ["window:open", "window:close", "host:delete", "project:delete", "account:delete", "purge"]
     assert "the delete of project fa-dev answered: ERROR: (GatewayTimeout)" in capsys.readouterr().out
+
+
+def test_a_gateway_timeout_on_the_capability_host_delete_is_polled_never_resent(hooks, tmp_path, deployer, capsys):
+    foundry = FakeFoundry(agents=(), faults={"host-timeout"}, host_polls=3)
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    hooks.predown(ctx)
+    assert foundry.log == ["window:open", "window:close", "host:delete", "project:delete", "account:delete", "purge"]
+    out = capsys.readouterr().out
+    assert ("the delete of project capability host caphostproj answered: ERROR: (GatewayTimeout)" in out
+            and "project capability host caphostproj: deleted (read back)" in out)
+
+
+def test_a_deleted_capability_host_answering_its_own_404_text_reads_as_gone(hooks, tmp_path, deployer, capsys):
+    foundry = FakeFoundry(agents=(), faults={"host-gone-text"}, host_polls=2)
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    hooks.predown(ctx)
+    assert foundry.log == ["window:open", "window:close", "host:delete", "project:delete", "account:delete", "purge"]
+    assert "project capability host caphostproj: deleted (read back)" in capsys.readouterr().out
+
+
+def test_another_not_found_in_workspace_error_on_the_host_read_stops(hooks, tmp_path, deployer):
+    foundry = FakeFoundry(agents=(), faults={"host-other-text"}, host_polls=2)
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    with pytest.raises(hooks.Stop, match="az rest get .*/capabilityHosts/caphostproj failed: ERROR: Connection 'x' "
+                                         "not found in workspace"):
+        hooks.predown(ctx)
+    assert foundry.log == ["window:open", "window:close", "host:delete"]  # the project is not deleted
+
+
+@pytest.mark.parametrize("host, faults", [
+    (None, ()),             # provisioned before the project capability host existed: an empty list
+    (None, {"hosts-404"}),  # the list answers 404: none either, so `azd down` of such an environment goes on
+    ("Deleting", ()),       # an earlier run's delete is still going: polled, never sent again
+])
+def test_a_missing_or_deleting_capability_host_is_not_deleted_again(hooks, tmp_path, deployer, capsys, host, faults):
+    foundry = FakeFoundry(agents=(), host=host, host_polls=2, faults=faults)
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    hooks.predown(ctx)
+    assert foundry.log == ["window:open", "window:close", "project:delete", "account:delete", "purge"]
+    assert foundry.host is None
+    out = capsys.readouterr().out
+    assert ("project capability host caphostproj: deleted (read back)" in out) == bool(host)
+    assert ("first deleting its project capability host" in out) == bool(host)
+
+
+def test_a_capability_host_of_another_name_is_listed_and_deleted(hooks, tmp_path, deployer, capsys):
+    # Not only foundry.bicep's caphostproj: whatever the project has, as the official cleanup tool lists them.
+    foundry = FakeFoundry(agents=(), host_name=f"{ACCOUNT}/fa-dev/older-host")
+    ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
+    hooks.predown(ctx)
+    assert foundry.log == ["window:open", "window:close", "host:delete", "project:delete", "account:delete", "purge"]
+    deleted = [call for call in writes(ctx) if "/capabilityHosts/" in " ".join(call)]
+    assert len(deleted) == 1 and "/projects/fa-dev/capabilityHosts/older-host?api-version=2025-06-01" in deleted[0][5]
+    assert "project capability host older-host: deleted (read back)" in capsys.readouterr().out
+
+
+def test_a_failed_read_of_the_capability_hosts_stops_before_anything_is_written(hooks, tmp_path, deployer):
+    foundry = FakeFoundry(agents=(), faults={"hosts-500"})
+    ctx, asked = private_down(hooks, tmp_path, foundry)
+    with pytest.raises(hooks.Stop, match="capabilityHosts failed: ERROR: .InternalServerError."):
+        hooks.predown(ctx)
+    assert asked == [] and writes(ctx) == [] and foundry.log == []
+
+
+def test_a_capability_host_that_never_goes_stops_with_the_project_and_backups_kept(hooks, tmp_path, deployer):
+    foundry = FakeFoundry(agents=(), host="Deleting", host_polls=10_000)
+    ctx, _ = private_down(hooks, tmp_path, foundry)
+    with pytest.raises(hooks.Stop, match="project capability host caphostproj to be deleted: not reached within "
+                                         "30 min.*nothing more was sent"):
+        hooks.predown(ctx)
+    assert foundry.log == ["window:open", "window:close"] and foundry.project is True  # no delete sent, lock stays
+    assert hooks.window_closed({"properties": foundry.properties})
 
 
 def test_an_agent_delete_answering_404_counts_as_deleted(hooks, tmp_path, deployer, capsys):
     foundry = FakeFoundry(agents=("fa-dev-a",), faults={"agents-404"})
     ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
     hooks.predown(ctx)
-    assert foundry.log[:4] == ["window:open", "agent:fa-dev-a", "window:close", "project:delete"]
+    assert foundry.log[:5] == ["window:open", "agent:fa-dev-a", "window:close", "host:delete", "project:delete"]
     assert "Hosted Agent fa-dev-a: already deleted (404)" in capsys.readouterr().out
 
 
@@ -2296,7 +2581,7 @@ def test_a_refused_project_delete_is_never_resent(hooks, tmp_path, deployer):
     ctx, _ = private_down(hooks, tmp_path, foundry)
     with pytest.raises(hooks.Stop, match="deleting project fa-dev failed.*CannotDeleteResource"):
         hooks.predown(ctx)
-    assert foundry.log == ["window:open", "window:close", "project:delete"]
+    assert foundry.log == ["window:open", "window:close", "host:delete", "project:delete"]
 
 
 def test_a_deleted_project_still_blocking_the_account_delete_is_resent_until_it_starts(hooks, tmp_path, deployer,
@@ -2304,7 +2589,8 @@ def test_a_deleted_project_still_blocking_the_account_delete_is_resent_until_it_
     foundry = FakeFoundry(agents=(), stale_project=2)
     ctx, _ = private_down(hooks, tmp_path, foundry, locks=())
     hooks.predown(ctx)
-    assert foundry.log == ["window:open", "window:close", "project:delete"] + ["account:delete"] * 3 + ["purge"]
+    assert foundry.log == (["window:open", "window:close", "host:delete", "project:delete"] + ["account:delete"] * 3
+                           + ["purge"])
     assert "still listed (CannotDeleteResource); sending it again every 15 s for at most 5 min" in capsys.readouterr().out
 
 
@@ -2337,9 +2623,16 @@ def test_an_account_that_never_goes_stops_after_the_bounded_wait(hooks, tmp_path
 @pytest.mark.parametrize("answer, outcome", [
     (NOT_FOUND, None),
     (failed("ERROR: Not Found({\"error\":{\"code\":\"DeletedAccountNotFound\"}})"), None),  # any 404 of the resource
+    (HOST_MISSING, None),  # a project capability host's 404, whose text has no "Not Found"
+    (workspace_error("CapabilityHost 'caphostproj'", inner="OtherError"), "az rest get .* failed: ERROR: CapabilityHost"),
+    (CONNECTION_MISSING, "az rest get .* failed: ERROR: Connection 'x' not found in workspace"),
     (failed("ERROR: Not Found({\"error\":{\"code\":\"SubscriptionNotFound\"}})"), "subscription .* was not found"),
     (failed("ERROR: Not Found({\"error\":{\"code\":\"ResourceGroupNotFound\"}})"), "resource group rg-dev was not"),
     (failed("ERROR: (AuthorizationFailed) no read"), "az rest get .* failed: ERROR: \\(AuthorizationFailed\\)"),
+    # A transient answer is never read as gone: read four times, then a stop that names it.
+    (SERVICE_UNAVAILABLE, "az rest get .*/providers/y kept answering Service Unavailable"),
+    (failed("ERROR: Internal Server Error(<html><body>error</body></html>)"), "kept answering Internal Server Error"),
+    (failed("ERROR: Not Found(<html><body>gone</body></html>)"), None),  # a 404 is read as before, page or not
 ])
 def test_only_a_404_of_the_resource_itself_reads_as_gone(hooks, tmp_path, answer, outcome):
     ctx = context(hooks, tmp_path, {"rest --method get": answer})
@@ -2559,6 +2852,45 @@ def test_clearing_the_vnet_of_an_account_injected_into_it_stops_before_any_write
                                          "not FA's own vnet-dev, and injection cannot change"):
         hooks.preprovision(ctx)
     assert writes_nothing(ctx) and "FA_TEAM_OWNER_OID" not in ctx.values
+
+
+OWN_AGENT_SUBNET = (f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-dev/providers/Microsoft.Network/virtualNetworks/"
+                    "vnet-dev/subnets/snet-agents")
+
+
+def provisioned_private(hooks, tmp_path, hosts):
+    """preprovision of a private environment whose injected account exists; `hosts` answers the project's list."""
+    routes = {"/projects/fa-dev/capabilityHosts?": hosts,
+              **preprovision_routes(ok({"ok": True}), foundry=injected_into(OWN_AGENT_SUBNET))}
+    return context(hooks, tmp_path, routes, FA_TEAM_OWNER_OID=OWNER, **PRIVATE)
+
+
+def test_a_failed_project_capability_host_stops_provision_with_the_delete_command(hooks, tmp_path):
+    # Learn: a capability host cannot be updated, so the Bicep PUT cannot repair it; the delete stays the operator's.
+    hosts = ok({"value": [{"name": f"{ACCOUNT}/fa-dev/caphostproj", "properties": {"provisioningState": "Failed"}}]})
+    ctx = provisioned_private(hooks, tmp_path, hosts)
+    url = (f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-dev/providers/Microsoft.CognitiveServices/accounts/"
+           f"{ACCOUNT}/projects/fa-dev/capabilityHosts/caphostproj?api-version=2025-06-01")
+    with pytest.raises(hooks.Stop) as stop:
+        hooks.preprovision(ctx)
+    assert f"project capability host caphostproj of Foundry account {ACCOUNT} is Failed" in str(stop.value)
+    assert f'`az rest --method delete --url "{url}"`' in str(stop.value)
+    assert str(stop.value).endswith("then rerun `azd provision`; nothing was changed")
+    assert writes_nothing(ctx) and "FA_MODELS" not in ctx.values
+    assert not [call for call in ctx.run.calls if "--method" in call and call[call.index("--method") + 1] != "get"]
+
+
+@pytest.mark.parametrize("hosts", [
+    ok({"value": [{"name": "caphostproj", "properties": {"provisioningState": "Succeeded"}}]}),
+    ok({"value": []}),
+    NOT_FOUND,  # no project yet (a provision that stopped after the account): none
+    failed("ERROR: (InternalServerError) Something went wrong"),  # only a warning: provision goes on as before
+])
+def test_provision_goes_on_unless_a_project_capability_host_is_failed(hooks, tmp_path, hosts):
+    ctx = provisioned_private(hooks, tmp_path, hosts)
+    hooks.preprovision(ctx)
+    assert any("preflight_subscription.py" in " ".join(call) for call in ctx.run.calls)
+    assert [call for call in ctx.run.calls if "/capabilityHosts?" in " ".join(call)]
 
 
 ENDPOINTS = ok([{"name": "pe-table", "customDnsConfigs": [

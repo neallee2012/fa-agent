@@ -14,7 +14,6 @@ The code identity is printed by the matching API/Hosted image; it is not the con
 import argparse
 import hashlib
 import json
-import os
 import re
 import sys
 import time
@@ -28,7 +27,7 @@ from azure.identity import AzureCliCredential
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
-from deployment_config import load_config
+from deployment_config import load_config, write_x as _write_x
 
 sys.path.insert(0, str(HERE.parents[1] / "src" / "fa-shared-context-poc"))
 from shared_context.behavior_agent_versions import METADATA_DEFINITION, definition_matches, definition_sha256
@@ -64,13 +63,6 @@ def definition(agent, image):
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
-
-
-def _write_x(path, value):
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=1)
-        stream.flush()
-        os.fsync(stream.fileno())
 
 
 def _of_definition(project, name, core, expected):

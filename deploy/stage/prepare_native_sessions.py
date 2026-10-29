@@ -20,7 +20,6 @@ owner's login in the project-specific AZURE_CONFIG_DIR.
 """
 import argparse
 import json
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,16 +28,9 @@ import httpx
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
-from deployment_config import config_path, load_config  # noqa: E402
+from deployment_config import config_path, load_config, write_x as _write_x  # noqa: E402
 
 EXPECTED = {"state": "ready", "model_started": False, "original_work_replayed": False}
-
-
-def _write_x(path, value):
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=1)
-        stream.flush()
-        os.fsync(stream.fileno())
 
 
 def _post(client, path, body, headers):

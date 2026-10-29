@@ -1,5 +1,6 @@
 """One explicit owner decision attached to the original follow; its required-files intent stays intact."""
 
+from dataclasses import dataclass
 from typing import Annotated, Literal
 import logging
 
@@ -336,9 +337,43 @@ def _initial_record(runtime, current, command):
     return _Following(view=view, idle_only=command.follow.idle_only, files_required=True, responses=False)
 
 
-async def confirm_omission(runtime, command):
-    from .native_environment import follow_session, retarget_session, _source_matches, _key as following_key, _retarget_keys, _progress, _check_read
-    from .native_turns import TURNS_STORE, _changed
+@dataclass
+class _Confirmation:
+    """The Agent and follow records one confirmation acts on; starting the follow re-reads them."""
+    current: object
+    agent_etag: str
+    key: str
+    record: _Following | None
+    record_etag: str | None
+    initial: bool
+    pending_retarget: bool = False
+    previous: _Omission | None = None
+
+
+def _require_named_follow(runtime, command, record):
+    if (record is None or record.view.request_id != command.follow.request_id
+            or record.view.previous_hosted_session_id != command.follow.expected_session_id
+            or record.view.hosted_session_id != runtime.identity.session_id
+            or record.view.hosted_agent_version != runtime.identity.agent_version
+            or record.idle_only != command.follow.idle_only):
+        raise Problem(409, "NATIVE_FILES_CONFIRMATION_REQUIRED", "confirm the exact original source and destination")
+
+
+def _pending_retarget(runtime, current, command, record):
+    if not (command.pending_request_id is not None and current.environment is not None
+            and current.environment.request_id != command.follow.request_id):
+        return False
+    expected = _initial_record(runtime, current, command).view
+    fields = ("agent_id", "request_id", "previous_hosted_session_id", "previous_agent_version",
+              "hosted_session_id", "hosted_agent_version")
+    if (record.files is not None or record.retarget_request_id is not None
+            or any(getattr(record.view, name) != getattr(expected, name) for name in fields)):
+        raise Problem(409, "NATIVE_FILES_CONFLICT", "the unselected retarget has different file material or scope")
+    return True
+
+
+async def _select(runtime, command):
+    from .native_environment import _retarget_keys, _check_read
 
     current, agent_etag = await _check_read(runtime._agent_record(), "agent")
     key = await _check_read(_selected_following_key(runtime, current), "following")
@@ -348,127 +383,183 @@ async def confirm_omission(runtime, command):
         alternate, alternate_etag = await _check_read(_read(runtime, key=progress_key), "following")
         if alternate is not None:
             record, record_etag, key = alternate, alternate_etag, progress_key
-    initial = record is None
-    if initial and command.stage in {"check", "confirm", "read"}:
-        record = _initial_record(runtime, current, command)
-    if (record is None or record.view.request_id != command.follow.request_id
-            or record.view.previous_hosted_session_id != command.follow.expected_session_id
-            or record.view.hosted_session_id != runtime.identity.session_id
-            or record.view.hosted_agent_version != runtime.identity.agent_version
-            or record.idle_only != command.follow.idle_only):
-        raise Problem(409, "NATIVE_FILES_CONFIRMATION_REQUIRED", "confirm the exact original source and destination")
-    pending_retarget = (command.pending_request_id is not None and current.environment is not None
-                        and current.environment.request_id != command.follow.request_id)
-    if pending_retarget:
-        expected = _initial_record(runtime, current, command).view
-        fields = ("agent_id", "request_id", "previous_hosted_session_id", "previous_agent_version",
-                  "hosted_session_id", "hosted_agent_version")
-        if (record.files is not None or record.retarget_request_id is not None
-                or any(getattr(record.view, name) != getattr(expected, name) for name in fields)):
-            raise Problem(409, "NATIVE_FILES_CONFLICT", "the unselected retarget has different file material or scope")
-    previous = await _check_read(_recorded_omission(runtime, record), "confirmation")
-    await _confirmation_identity(runtime, command, record, previous=previous)
-    if previous is not None:
-        if (previous.request_id != command.request_id
-                or command.stage in {"confirm", "activate"} and previous.missing != command.missing):
-            raise Problem(409, "NATIVE_FILES_CONFLICT", "the original file omission has another confirmation request")
-        if record.view.files_migrated is not False:
-            if command.stage == "read":
-                return _changed(record.view, files_confirmation_saved=previous.request_id,
-                                files_confirmation_reason=previous.missing)
-            if command.stage == "check":
-                pending = await _idle(runtime, current, record, command, agent_etag)
-                return _check_view(record.view, pending, files_confirmation_saved=previous.request_id,
-                                   files_confirmation_reason=previous.missing)
-            if command.stage not in {"activate", "confirm"}:
-                raise Problem(409, "NATIVE_FILES_CONFIRMATION_REQUIRED", "continue the saved confirmation; do not submit it again")
-            if canonical_bytes(record) != canonical_bytes(previous.original):
-                raise Problem(409, "NATIVE_FILES_CONFLICT", "the original following changed after its saved confirmation")
-            _source_matches(current, record.view)
-            pending = await _idle(runtime, current, record, command, agent_etag)
-            if pending is not None:
-                return _check_view(record.view, pending)
-            await _confirmation_identity(runtime, command, record, save=True, previous=previous)
-            marked = _changed(record, view=omission_view(record.view, previous),
-                              after=None, page_offset=0, page_digest=None)
-            await _progress(runtime, marked, record_etag, key=key)
-            record = marked
-        elif record.view.files_skip_request_id != previous.request_id:
-            raise Problem(409, "NATIVE_FILES_CONFLICT", "the active file omission names another confirmation")
-    if previous is None:
-        if command.stage == "activate":
-            raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original file omission has not been confirmed")
-        if not pending_retarget:
-            _source_matches(current, record.view)
-        if command.stage == "read":
-            from .native_environment import _tasks_pending
-            scan = await scan_observation(runtime, record.view, command.request_id)
-            return _changed(record.view, files_confirmation_absent=command.request_id,
-                            progress_token=material_digest({
-                                "record": record.model_dump(mode="json"), "scan": scan,
-                                "admitting": None if current.admitting is None else current.admitting.model_dump(mode="json"),
-                                "executing": runtime.execution_lock.locked(),
-                                "tasks_complete": await _tasks_pending(
-                                    runtime, current, record.view.previous_hosted_session_id, responses=bool(record.responses)) is None}),
-                            operation_idle_only=record.idle_only)
-        if not _retained_staging(record, command.missing, command.decision_basis) or record.retarget_request_id is not None:
-            raise Problem(409, "NATIVE_FILES_CONFLICT", "file material or another transition cannot be discarded")
-        if pending_retarget:
-            original_key = following_key(runtime, session_id=command.pending_session_id)
-            original, _ = await _check_read(_read(runtime, key=original_key), "following")
-            if original is None or original.view.request_id != command.pending_request_id:
-                _, original_key = _retarget_keys(command.pending_request_id)
-                original, _ = await _check_read(_read(runtime, key=original_key), "following")
-            if (original is None or original.view.request_id != command.pending_request_id
-                    or not _retained_staging(original, command.missing, command.decision_basis)
-                    or original.retarget_request_id not in {None, command.follow.request_id}):
-                raise Problem(409, "NATIVE_FILES_CONFLICT", "the blocked original file intent cannot be discarded")
-        if command.missing == "destination" and runtime.workspace_files is not None:
-            raise Problem(409, "NATIVE_FILES_CONFLICT", "the destination helper is available; do not skip its files")
-        pending = await _idle(runtime, current, record, command, agent_etag)
-        if pending is not None:
-            return _check_view(record.view, pending)
-        if command.stage == "check":
-            return _changed(record.view, reason=None, files_check=None)
-        await _confirmation_identity(runtime, command, record, save=True)
-        if initial or pending_retarget:
-            if command.pending_request_id is None:
-                await follow_session(runtime, command.follow)
-            else:
-                transition = await retarget_session(runtime, NativeSessionRetarget(
-                    request_id=command.follow.request_id, expected_session_id=command.follow.expected_session_id,
-                    expected_etag=agent_etag, expected_agent_version=runtime.identity.agent_version,
-                    pending_request_id=command.pending_request_id, pending_session_id=command.pending_session_id,
-                    idle_only=True))
-            current, _ = await runtime._agent_record()
-            if pending_retarget:
-                if current.environment is None:
-                    raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original pending retarget is no longer selected")
-                if current.environment.request_id != command.follow.request_id:
-                    _initial_record(runtime, current, command)
-                    if transition.reason == "task_access_denied":
-                        raise _blocked("task_access_denied")
-                    detail = (NativeFilesCheckDetail(category="scan_pending")
-                              if transition.reason == "scan_pending" else None)
-                    return _changed(transition, files_confirmation_pending=command.request_id, files_check=detail)
-            key = await _selected_following_key(runtime, current)
-            record, record_etag = await _read(runtime, key=key)
-            if record is None or record.files is not None:
-                raise Problem(409, "NATIVE_FILES_CONFLICT", "the original file operation changed during confirmation")
-        previous = _Omission(request_id=command.request_id, missing=command.missing, original=record,
-                             decision_basis=command.decision_basis)
-        async with runtime._store(TURNS_STORE) as store:
-            await runtime._immutable(store, _key(record.view), previous)
-        # The decision adds keys to this store; only the mutable follow scan starts over.
-        marked = _changed(record, view=omission_view(record.view, previous),
-                          after=None, page_offset=0, page_digest=None)
-        await _progress(runtime, marked, record_etag, key=key)
-        record = marked
-    if command.stage == "check":
-        return omission_view(record.view, previous)
+    state = _Confirmation(current, agent_etag, key, record, record_etag, initial=record is None)
+    if state.initial and command.stage in {"check", "confirm", "read"}:
+        state.record = _initial_record(runtime, current, command)
+    _require_named_follow(runtime, command, state.record)
+    state.pending_retarget = _pending_retarget(runtime, current, command, state.record)
+    return state
+
+
+def _same_confirmation(command, previous):
     if previous.request_id != command.request_id or command.stage in {"confirm", "activate"} and previous.missing != command.missing:
         raise Problem(409, "NATIVE_FILES_CONFLICT", "the original file omission has another confirmation request")
-    if (current.environment is not None and current.environment.state == "ready"
-            and current.environment.request_id == record.view.request_id):
-        return current.environment
-    return omission_view(record.view, previous)
+
+
+async def _mark(runtime, state):
+    from .native_environment import _progress
+    from .native_turns import _changed
+
+    marked = _changed(state.record, view=omission_view(state.record.view, state.previous),
+                      after=None, page_offset=0, page_digest=None)
+    await _progress(runtime, marked, state.record_etag, key=state.key)
+    state.record = marked
+
+
+async def _continue_saved(runtime, command, state):
+    from .native_environment import _source_matches
+    from .native_turns import _changed
+
+    previous, record = state.previous, state.record
+    _same_confirmation(command, previous)
+    if record.view.files_migrated is False:
+        if record.view.files_skip_request_id != previous.request_id:
+            raise Problem(409, "NATIVE_FILES_CONFLICT", "the active file omission names another confirmation")
+        return None
+    if command.stage == "read":
+        return _changed(record.view, files_confirmation_saved=previous.request_id,
+                        files_confirmation_reason=previous.missing)
+    if command.stage == "check":
+        pending = await _idle(runtime, state.current, record, command, state.agent_etag)
+        return _check_view(record.view, pending, files_confirmation_saved=previous.request_id,
+                           files_confirmation_reason=previous.missing)
+    if command.stage not in {"activate", "confirm"}:
+        raise Problem(409, "NATIVE_FILES_CONFIRMATION_REQUIRED", "continue the saved confirmation; do not submit it again")
+    if canonical_bytes(record) != canonical_bytes(previous.original):
+        raise Problem(409, "NATIVE_FILES_CONFLICT", "the original following changed after its saved confirmation")
+    _source_matches(state.current, record.view)
+    pending = await _idle(runtime, state.current, record, command, state.agent_etag)
+    if pending is not None:
+        return _check_view(record.view, pending)
+    await _confirmation_identity(runtime, command, record, save=True, previous=previous)
+    await _mark(runtime, state)
+    return None
+
+
+async def _absent_view(runtime, command, state):
+    from .native_environment import _tasks_pending
+    from .native_turns import _changed
+
+    record, current = state.record, state.current
+    scan = await scan_observation(runtime, record.view, command.request_id)
+    return _changed(record.view, files_confirmation_absent=command.request_id,
+                    progress_token=material_digest({
+                        "record": record.model_dump(mode="json"), "scan": scan,
+                        "admitting": None if current.admitting is None else current.admitting.model_dump(mode="json"),
+                        "executing": runtime.execution_lock.locked(),
+                        "tasks_complete": await _tasks_pending(
+                            runtime, current, record.view.previous_hosted_session_id, responses=bool(record.responses)) is None}),
+                    operation_idle_only=record.idle_only)
+
+
+async def _require_blocked_original_discardable(runtime, command):
+    from .native_environment import _key as following_key, _retarget_keys, _check_read
+
+    original_key = following_key(runtime, session_id=command.pending_session_id)
+    original, _ = await _check_read(_read(runtime, key=original_key), "following")
+    if original is None or original.view.request_id != command.pending_request_id:
+        _, original_key = _retarget_keys(command.pending_request_id)
+        original, _ = await _check_read(_read(runtime, key=original_key), "following")
+    if (original is None or original.view.request_id != command.pending_request_id
+            or not _retained_staging(original, command.missing, command.decision_basis)
+            or original.retarget_request_id not in {None, command.follow.request_id}):
+        raise Problem(409, "NATIVE_FILES_CONFLICT", "the blocked original file intent cannot be discarded")
+
+
+async def _require_discardable(runtime, command, state):
+    record = state.record
+    if not _retained_staging(record, command.missing, command.decision_basis) or record.retarget_request_id is not None:
+        raise Problem(409, "NATIVE_FILES_CONFLICT", "file material or another transition cannot be discarded")
+    if state.pending_retarget:
+        await _require_blocked_original_discardable(runtime, command)
+    if command.missing == "destination" and runtime.workspace_files is not None:
+        raise Problem(409, "NATIVE_FILES_CONFLICT", "the destination helper is available; do not skip its files")
+
+
+def _unselected_retarget(runtime, current, command, transition):
+    from .native_turns import _changed
+
+    if current.environment is None:
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original pending retarget is no longer selected")
+    if current.environment.request_id == command.follow.request_id:
+        return None
+    _initial_record(runtime, current, command)
+    if transition.reason == "task_access_denied":
+        raise _blocked("task_access_denied")
+    detail = (NativeFilesCheckDetail(category="scan_pending")
+              if transition.reason == "scan_pending" else None)
+    return _changed(transition, files_confirmation_pending=command.request_id, files_check=detail)
+
+
+async def _start_follow(runtime, command, state):
+    from .native_environment import follow_session, retarget_session
+
+    if command.pending_request_id is None:
+        await follow_session(runtime, command.follow)
+    else:
+        transition = await retarget_session(runtime, NativeSessionRetarget(
+            request_id=command.follow.request_id, expected_session_id=command.follow.expected_session_id,
+            expected_etag=state.agent_etag, expected_agent_version=runtime.identity.agent_version,
+            pending_request_id=command.pending_request_id, pending_session_id=command.pending_session_id,
+            idle_only=True))
+    state.current, _ = await runtime._agent_record()
+    if state.pending_retarget:
+        answer = _unselected_retarget(runtime, state.current, command, transition)
+        if answer is not None:
+            return answer
+    state.key = await _selected_following_key(runtime, state.current)
+    state.record, state.record_etag = await _read(runtime, key=state.key)
+    if state.record is None or state.record.files is not None:
+        raise Problem(409, "NATIVE_FILES_CONFLICT", "the original file operation changed during confirmation")
+    return None
+
+
+async def _confirm_new(runtime, command, state):
+    from .native_environment import _source_matches
+    from .native_turns import TURNS_STORE, _changed
+
+    if command.stage == "activate":
+        raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original file omission has not been confirmed")
+    if not state.pending_retarget:
+        _source_matches(state.current, state.record.view)
+    if command.stage == "read":
+        return await _absent_view(runtime, command, state)
+    await _require_discardable(runtime, command, state)
+    pending = await _idle(runtime, state.current, state.record, command, state.agent_etag)
+    if pending is not None:
+        return _check_view(state.record.view, pending)
+    if command.stage == "check":
+        return _changed(state.record.view, reason=None, files_check=None)
+    await _confirmation_identity(runtime, command, state.record, save=True)
+    if state.initial or state.pending_retarget:
+        answer = await _start_follow(runtime, command, state)
+        if answer is not None:
+            return answer
+    state.previous = _Omission(request_id=command.request_id, missing=command.missing, original=state.record,
+                               decision_basis=command.decision_basis)
+    async with runtime._store(TURNS_STORE) as store:
+        await runtime._immutable(store, _key(state.record.view), state.previous)
+    # The decision adds keys to this store; only the mutable follow scan starts over.
+    await _mark(runtime, state)
+    return None
+
+
+async def confirm_omission(runtime, command):
+    from .native_environment import _check_read
+
+    state = await _select(runtime, command)
+    state.previous = await _check_read(_recorded_omission(runtime, state.record), "confirmation")
+    await _confirmation_identity(runtime, command, state.record, previous=state.previous)
+    if state.previous is not None:
+        answer = await _continue_saved(runtime, command, state)
+    else:
+        answer = await _confirm_new(runtime, command, state)
+    if answer is not None:
+        return answer
+    if command.stage == "check":
+        return omission_view(state.record.view, state.previous)
+    _same_confirmation(command, state.previous)
+    environment = state.current.environment
+    if environment is not None and environment.state == "ready" and environment.request_id == state.record.view.request_id:
+        return environment
+    return omission_view(state.record.view, state.previous)

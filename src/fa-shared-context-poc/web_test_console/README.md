@@ -4061,7 +4061,7 @@ $env:PYTHONPATH = '<repo>\src\fa-shared-context-poc;<repo>\tests\shared_context'
   --basetemp '<本批 artifact>\pytest'
 ```
 
-正式慢 fixture 依父凍結的 Window／原 signed／stop／result／handoff producers，用本批 `run_tests.ps1` 的 isolated cwd／PYTHONPATH 串行跑。一次閉環後以同一孤立 snapshot 測 expiry、owner 撤權、ACK 與 fulfillment 真 EGT ACKloss，不需重跑原後端 22／72 suites。其他 HTTP 範例反例使用已核 SHA 的 `tests\shared_context\web_test_console_original_failure\producer-example.json`，它只是正式離線 producer 原件重播，不是 native 配置。
+原本串接 handoff HTTP receiver 的正式慢 fixture 已於 2026-10 移除。其他 HTTP 範例反例使用已核 SHA 的 `tests\shared_context\web_test_console_original_failure\producer-example.json`，它只是正式離線 producer 原件重播，不是 native 配置。
 
 真 API／JWT／原 producer 的 browser fixture **只在 tests**，不由正式 launcher 匯入：
 

@@ -485,29 +485,3 @@ def test_finished_report_loss_is_exact_receipt_reconciled_without_rewriting_resu
     assert ack.payload["result"]["fulfillment"] == "fulfilled"
     assert len(lost) == 1 and posts.count(lost[0].request_id) == 1 and len(stops) == 1
     assert validate_retirement(c.store.read_inventory(), c.config)[1]["model_outcome"] == "unknown"
-
-
-def test_recovery_operator_http_rejects_client_stop_evidence(durable_result, signing_key):
-    from fastapi.testclient import TestClient
-    from test_m3_auth import token
-    from shared_context.behavior_recovery_api import create_recovery_app
-    c = durable_result.c
-    service, stops = service_for(durable_result)
-    app = create_recovery_app(c.composition, service.scope, stop=service.stop)
-    bearer = token(signing_key, {"tid": c.config.identity.tenant_id,
-        "iss": f"https://sts.windows.net/{c.config.identity.tenant_id}/", "aud": c.config.identity.audience,
-        "oid": c.config.identity.human_oid, "appid": c.config.identity.admin_client_id,
-        "scp": "Behavior.Read Behavior.Approve"})
-    with TestClient(app) as client:
-        headers, prefix = {"Authorization": "Bearer " + bearer}, "/operator/v1/sdk-recovery"
-        plan = client.post(prefix + "/plan", json={}, headers=headers)
-        assert plan.status_code == 200 and plan.json()["recovery_phase"] == "after_durable_finish"
-        approved = client.post(prefix + "/authorize", json={"plan": plan.json(), "decision_id": "finished-http-approved"}, headers=headers)
-        assert approved.status_code == 200
-        assert client.post(prefix + "/execute", json={**approved.json(), "sdk_stop": {"graceful": True}},
-                           headers=headers).status_code == 422
-        assert stops == []
-        result = client.post(prefix + "/execute", json=approved.json(), headers=headers)
-        assert result.status_code == 200 and result.json()["state"] == "succeeded" and len(stops) == 1
-        assert result.json()["sdk_graceful_exit_claim"] is False
-        assert client.post(prefix + "/reconcile", json=approved.json(), headers=headers).json()["stop_resent"] is False

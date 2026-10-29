@@ -13,7 +13,7 @@ from pydantic import field_validator
 from .behavior_agent_registry import AgentScopeRegistry, _request as peer_request, registry_key
 from .behavior_agent_registry_operator import _peer_policy
 from .behavior_code_identity import code_sha256
-from .behavior_migration import MigrationStore, installation_record, migration_key
+from .behavior_migration import MigrationStore, installation_record, origin_pointer_keys
 from .behavior_operations import _Model, _parse, _utc, control_key
 from .behavior_runtime import _PlanIndex, material, runtime_key
 from .behavior_runtime_transition import _payload_hash
@@ -276,10 +276,7 @@ def installed_fresh_origin(store, config):
         registry_key(domain, record.plan.peer_policy.agent_id),
         *(runtime_key("policy", binding.binding_id) for binding in config.bindings),
     }
-    absent = (
-        work_policy_key("current", domain), migration_key(domain, "current"),
-        control_key("runtime-transition-current", domain), control_key("runtime-rotation-current", domain),
-    )
+    absent = origin_pointer_keys(domain)[1:]
     rows = store.read_snapshot((*sorted(immutable), *absent, work_policy_key("cost", domain)))
     expected = dict(receipt.payload["writes"])
     _require(all(rows[key] is not None and _payload_hash(rows[key].payload) == expected[key] for key in immutable)

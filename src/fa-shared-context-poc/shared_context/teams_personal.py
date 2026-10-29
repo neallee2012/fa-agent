@@ -18,9 +18,7 @@ from typing import Literal
 import httpx
 from azure.identity import ManagedIdentityCredential
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
 from pydantic import ValidationError, field_validator
-from starlette.concurrency import run_in_threadpool
 
 from .behavior_delivery import (
     ArtifactVersion, DeliveryCore, RuntimeRegistration, _Model, _material, _utc, authority_snapshot,
@@ -30,7 +28,7 @@ from .behavior_store import BehaviorStore, ControlChanges, ControlRequest, Contr
 from .errors import Problem
 from .teams_deployment import CALLBACK_PATH, INTENDED_USER, PersonalTeamsConfig, TENANT
 from .teams_identity import BOT_SCOPE, TEAMS_VERSION, ConnectorIdentity, TeamsRouteRecord, TeamsSettings, VerifiedTeamsActivity, digest
-from .teams_runtime import TeamsAdmission, TeamsRuntime, retained
+from .teams_runtime import TeamsAdmission, TeamsRuntime, activity_response, retained
 from .teams_delivery import TeamsArtifactLink, TeamsDeliveryAdapter, TeamsSendContext
 from .teams_native import TeamsDeliveryCore, TeamsNativeRegistration
 from .teams_handshake import normalize_handshake
@@ -243,18 +241,7 @@ class PersonalTeamsEntry:
 
         @router.post(CALLBACK_PATH)
         async def activity(request: Request):
-            try:
-                if request.headers.get("content-type", "").split(";")[0] != "application/json":
-                    raise Problem(415, "TEAMS_CONTENT_TYPE", "application/json is required")
-                body = bytearray()
-                async for part in request.stream():
-                    body.extend(part)
-                    if len(body) > 32768:
-                        raise Problem(413, "TEAMS_BODY_LIMIT", "the complete activity exceeds the fixed byte bound")
-                result = await run_in_threadpool(self.receive, request.headers.get("authorization", ""), bytes(body))
-                return JSONResponse(result)
-            except Problem as error:
-                return JSONResponse(error.body, status_code=error.status)
+            return await activity_response(request, self, "the complete activity exceeds the fixed byte bound")
 
         return router
 

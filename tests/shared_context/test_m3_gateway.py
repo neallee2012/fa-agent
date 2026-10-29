@@ -11,7 +11,6 @@ from fastapi.testclient import TestClient
 from conftest import A
 from shared_context.api import create_app
 from shared_context.m2_gateway import M2Gateway, M2Settings
-from shared_context.m3_config import model_settings_from_env
 from shared_context.m2_copilot import ToolOutput, ToolSpec, run_copilot
 from test_m2_gateway import BODY, CHAT, BUDGET, PROJECT, NATIVE, Credential
 from test_m2_integration import RUNTIME, completion
@@ -50,25 +49,6 @@ def test_m3_inference_and_exhaustion_never_reset_or_charge_m2_receipts(m3):
     assert repository.data[m2.partition, m2.row] == prior
     assert len(forwarded) == 3
     assert m2.partition != m3_gateway.partition
-
-
-def test_m3_model_settings_are_separate_opt_in_not_an_m2_allowance_amendment(m3):
-    assert model_settings_from_env({}) is None
-    for values in (
-        {"CONTEXT_M3_RUN_ID": "m3-test"},
-        {"CONTEXT_M3_ADDITIONAL_REQUESTS": "40"},
-        {"CONTEXT_M3_RUN_ID": "m2-old", "CONTEXT_M3_MODEL": "gpt-4.1-mini", "CONTEXT_M3_MAX_REQUESTS": "20"},
-        {"CONTEXT_M3_RUN_ID": "m3-new", "CONTEXT_M3_MODEL": "gpt-4.1-mini", "CONTEXT_M3_MAX_REQUESTS": "121"},
-    ):
-        with pytest.raises(ValueError):
-            model_settings_from_env(values)
-    settings = model_settings_from_env({
-        "CONTEXT_M3_RUN_ID": "m3-new", "CONTEXT_M3_MODEL": "gpt-4.1-mini", "CONTEXT_M3_MAX_REQUESTS": "20",
-    })
-    assert settings.run_id == "m3-new" and settings.additional_requests is None
-    with pytest.raises(ValueError):
-        M2Gateway(m3[0].context, M2Settings("m3-new", "gpt-4.1-mini", 20, 1, "amend"), PROJECT,
-                  Credential(), milestone="m3")
 
 
 @pytest.mark.skipif(not RUNTIME.is_file(), reason="requires explicitly provisioned SDK runtime 1.0.83")

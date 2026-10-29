@@ -462,36 +462,6 @@ def test_legacy_scope_plan_authorization_and_liability_json_shapes_remain_unchan
     assert c.h.c.first_plan.liability.model_outcome == "unknown"
 
 
-def test_existing_operator_endpoints_accept_only_server_bound_multi_plan(mixed_models, signing_key):
-    from fastapi.testclient import TestClient
-    from shared_context.behavior_recovery_api import create_recovery_app
-    from test_m3_auth import token
-    h, c = mixed_models, mixed_models.c
-    service, calls = service_for(h)
-    app = create_recovery_app(c.composition, service.scope, stop=service.stop)
-    authorization = "Bearer " + token(signing_key, {
-        "tid": c.config.identity.tenant_id, "iss": f"https://sts.windows.net/{c.config.identity.tenant_id}/",
-        "aud": c.config.identity.audience, "oid": c.config.identity.human_oid,
-        "appid": c.config.identity.admin_client_id, "scp": "Behavior.Read Behavior.Approve",
-    })
-    with TestClient(app) as client:
-        headers = {"Authorization": authorization}
-        prefix = "/operator/v1/sdk-recovery"
-        plan = client.post(prefix + "/plan", json={}, headers=headers)
-        assert plan.status_code == 200, plan.text
-        body = plan.json()
-        assert body["recovery_phase"] == "after_sdk_model_requests" and len(body["model_intents"]) == 2
-        approved = client.post(prefix + "/authorize", json={"plan": body, "decision_id": "original-multi-approved"}, headers=headers)
-        assert approved.status_code == 200, approved.text
-        forged = client.post(prefix + "/execute", json={**approved.json(), "stop_receipt": {"status_code": 204}}, headers=headers)
-        assert forged.status_code == 422 and calls == []
-        executed = client.post(prefix + "/execute", json=approved.json(), headers=headers)
-        assert executed.status_code == 200, executed.text
-        assert executed.json()["state"] == "cancelled" and executed.json()["model_outcome"] == "unknown"
-        replay = client.post(prefix + "/reconcile", json=approved.json(), headers=headers)
-        assert replay.status_code == 200 and replay.json()["stop_resent"] is False and len(calls) == 1
-
-
 @pytest.mark.usefixtures("sixteen_queries")
 @pytest.mark.parametrize("mixed_models", ["exhausted"], indirect=True)
 def test_multi_recovery_after_sixteen_real_unknown_reports_preserves_counters(mixed_models):

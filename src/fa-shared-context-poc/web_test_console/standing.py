@@ -102,15 +102,7 @@ class StandingPolicyReader:
 
     def checked(self, query, task, binding, raw, *, instruction=False, previous_guard=None):
         c, p = self.config, self.config.standing_policy
-        try:
-            data = strict_json(raw)
-            result = WorkPreflight.model_validate_json(raw)
-            require(type(data) is dict and set(data) == set(result.model_dump(mode="json"))
-                    and type(data["monetary_budget"]) is dict
-                    and set(data["monetary_budget"]) == set(result.monetary_budget.model_dump(mode="json")),
-                    "WORK_POLICY_INVALID", 502)
-        except (ValueError, TypeError, KeyError):
-            raise ConsoleError("WORK_POLICY_INVALID", 502) from None
+        result = _parsed_preflight(raw)
         if result.memory_setting_ref is not None:
             ref = result.memory_setting_ref
             admission = work_policy_key("admission", *p.scope_ids, p.template.human_oid, task.submit_request_id)
@@ -118,70 +110,135 @@ class StandingPolicyReader:
                     and (not result.already_admitted or ref.state == "captured"), "WORK_POLICY_INVALID", 502)
             binding = with_memory_slots(binding, admission)
         money = result.monetary_budget
-        now = self.clock()
-        times = (result.observed_at, money.observed_at, result.execution_deadline, result.queue_deadline)
-        if instruction:
-            require(result.execution_deadline is None and result.queue_deadline is None, "WORK_POLICY_INVALID", 502)
-        require(all(t is None or t.tzinfo is not None and t.utcoffset() == timedelta(0) for t in times)
-                and money.observed_at <= result.observed_at
-                and (instruction or result.observed_at <= now)
-                and (result.queue_deadline is None or result.queue_deadline <= result.observed_at+timedelta(seconds=p.queue_seconds))
-                and (result.execution_deadline is None or result.queue_deadline is not None
-                     and result.execution_deadline <= result.observed_at+timedelta(seconds=p.execution_seconds)
-                     and result.execution_deadline <= result.queue_deadline+timedelta(seconds=p.execution_seconds)),
-                "WORK_POLICY_INVALID", 502)
-        require(result.read_id == money.read_id == query.read_id
-                and result.request_id == query.submit_request_id
-                and result.submit_body_sha256 == query.submit_body_sha256
-                and result.configuration_sha256 == c.backend_configuration_sha256
-                and result.policy_sha256 == c.standing_policy_sha256
-                and (result.tenant_id, result.team_id, result.human_oid, result.template_binding_id) ==
-                    (p.template.tenant_id, p.template.team_id, p.template.human_oid, p.template.binding_id)
-                and result.binding == binding and task_matches(task, result.binding)
-                and (money.policy_id, money.policy_revision, money.budget_id) ==
-                    (p.policy_id, p.revision, work_policy_key("cost", p.authority_domain))
-                and money.unit == "USD-micro" and not money.authorization
-                and not money.provider_hard_cap and not result.authorization,
-                "WORK_POLICY_INVALID", 502)
-        amounts = (money.required_microusd, money.observed_high_water_microusd, money.reserved_microusd)
-        bounded = (money.remaining_microusd, money.safety_reserve_microusd, money.cumulative_ceiling_microusd)
-        require((all(type(value) is int and 0 <= value <= 2**63-1 for value in bounded)
-                 and money.cumulative_ceiling_microusd == p.cumulative_ceiling_microusd
-                 and money.safety_reserve_microusd == p.safety_reserve_microusd
-                 and money.remaining_microusd == max(0, money.cumulative_ceiling_microusd
-                    - money.safety_reserve_microusd - money.observed_high_water_microusd - money.reserved_microusd))
-                if money.budget_enforced else all(value is None for value in bounded),
-                "WORK_POLICY_INVALID", 502)
-        require(all(type(value) is int and 0 <= value <= 2**63-1 for value in amounts)
-                and money.observed_high_water_microusd >= p.minimum_observed_microusd
-                and money.required_microusd == (0 if instruction or result.already_admitted else p.work_estimate_microusd)
-                and type(result.guard_revision) is int and result.guard_revision >= 0
-                and ((previous_guard if instruction else self.last_guard_revision) is None
-                     or result.guard_revision >= (previous_guard if instruction else self.last_guard_revision)),
-                "WORK_POLICY_INVALID", 502)
-        if result.already_admitted:
-            require(money.decision == result.decision == "allow"
-                    and money.reason == result.reason == "original_admission_replay_only"
-                    and (instruction or result.queue_deadline is not None), "WORK_POLICY_INVALID", 502)
-        else:
-            # Registration can persist before its job admission. Preserve its
-            # original queue deadline rather than treating it as a new work.
-            require(result.execution_deadline is None
-                    and money.reason != "original_admission_replay_only", "WORK_POLICY_INVALID", 502)
-        require(result.decision != "allow" or (
-            money.decision == "allow" and result.reason == money.reason
-            and money.reason in {"allowed", "original_admission_replay_only"}
-            and (not money.budget_enforced or money.remaining_microusd >= money.required_microusd)),
-            "WORK_POLICY_INVALID", 502)
+        _check_clock(result, self.clock(), instruction)
+        _check_deadlines(result, p)
+        _check_echo(result, query, c, task, binding)
+        _check_budget_owner(result, p)
+        _check_budget_bounds(result, p)
+        _check_spend(result, p, instruction, previous_guard if instruction else self.last_guard_revision)
+        _check_admission(result, instruction)
+        _check_allow(result)
         if not instruction:
             self.last_guard_revision = result.guard_revision
-        reason = (("within_budget" if money.budget_enforced else "accounting_only") if result.decision == "allow" else
-                  "budget_exhausted" if result.reason in {"cumulative_budget_exhausted", "abstract_root_budget_exhausted"} else
-                  "revoked" if "revoked" in result.reason else "not_ready")
-        return StandingWorkObservation(query=query, decision=result.decision, reason=reason,
+        return StandingWorkObservation(query=query, decision=result.decision, reason=_observation_reason(result),
             revision=str(result.guard_revision), observed_at=result.observed_at,
             execution_deadline=result.execution_deadline,
             budget=CumulativeBudget(budget_id=money.budget_id, unit="USD-micro",
                                     remaining=money.remaining_microusd, required=money.required_microusd,
                                     enforced=money.budget_enforced),
             preflight=result)
+
+
+def _parsed_preflight(raw):
+    """The preflight, rejected unless its JSON keys are exactly the model's own (no defaults filled in)."""
+    try:
+        data = strict_json(raw)
+        result = WorkPreflight.model_validate_json(raw)
+        require(type(data) is dict and set(data) == set(result.model_dump(mode="json"))
+                and type(data["monetary_budget"]) is dict
+                and set(data["monetary_budget"]) == set(result.monetary_budget.model_dump(mode="json")),
+                "WORK_POLICY_INVALID", 502)
+    except (ValueError, TypeError, KeyError):
+        raise ConsoleError("WORK_POLICY_INVALID", 502) from None
+    return result
+
+
+def _check_clock(result, now, instruction):
+    """Every time is UTC and none is ahead of the read; an instruction read carries no deadlines."""
+    money = result.monetary_budget
+    times = (result.observed_at, money.observed_at, result.execution_deadline, result.queue_deadline)
+    if instruction:
+        require(result.execution_deadline is None and result.queue_deadline is None, "WORK_POLICY_INVALID", 502)
+    require(all(t is None or t.tzinfo is not None and t.utcoffset() == timedelta(0) for t in times)
+            and money.observed_at <= result.observed_at
+            and (instruction or result.observed_at <= now), "WORK_POLICY_INVALID", 502)
+
+
+def _check_deadlines(result, p):
+    # Runs after _check_clock: deadlines are not UTC-validated on parse, and a naive one cannot be compared.
+    require((result.queue_deadline is None or result.queue_deadline <= result.observed_at+timedelta(seconds=p.queue_seconds))
+            and (result.execution_deadline is None or result.queue_deadline is not None
+                 and result.execution_deadline <= result.observed_at+timedelta(seconds=p.execution_seconds)
+                 and result.execution_deadline <= result.queue_deadline+timedelta(seconds=p.execution_seconds)),
+            "WORK_POLICY_INVALID", 502)
+
+
+def _check_echo(result, query, c, task, binding):
+    """The read answers this query under the pinned configuration, policy, identity and binding."""
+    p, money = c.standing_policy, result.monetary_budget
+    require(result.read_id == money.read_id == query.read_id
+            and result.request_id == query.submit_request_id
+            and result.submit_body_sha256 == query.submit_body_sha256
+            and result.configuration_sha256 == c.backend_configuration_sha256
+            and result.policy_sha256 == c.standing_policy_sha256
+            and (result.tenant_id, result.team_id, result.human_oid, result.template_binding_id) ==
+                (p.template.tenant_id, p.template.team_id, p.template.human_oid, p.template.binding_id)
+            and result.binding == binding and task_matches(task, result.binding), "WORK_POLICY_INVALID", 502)
+
+
+def _check_budget_owner(result, p):
+    """The money decision is this policy's cost budget, and nothing in the read authorizes anything."""
+    money = result.monetary_budget
+    require((money.policy_id, money.policy_revision, money.budget_id) ==
+            (p.policy_id, p.revision, work_policy_key("cost", p.authority_domain))
+            and money.unit == "USD-micro" and not money.authorization
+            and not money.provider_hard_cap and not result.authorization,
+            "WORK_POLICY_INVALID", 502)
+
+
+def _check_budget_bounds(result, p):
+    """An enforced budget reports the policy's ceiling and reserve and their exact remainder; otherwise none."""
+    money = result.monetary_budget
+    # The int check runs first: it keeps None out of the remainder arithmetic.
+    bounded = (money.remaining_microusd, money.safety_reserve_microusd, money.cumulative_ceiling_microusd)
+    require((all(type(value) is int and 0 <= value <= 2**63-1 for value in bounded)
+             and money.cumulative_ceiling_microusd == p.cumulative_ceiling_microusd
+             and money.safety_reserve_microusd == p.safety_reserve_microusd
+             and money.remaining_microusd == max(0, money.cumulative_ceiling_microusd
+                - money.safety_reserve_microusd - money.observed_high_water_microusd - money.reserved_microusd))
+            if money.budget_enforced else all(value is None for value in bounded),
+            "WORK_POLICY_INVALID", 502)
+
+
+def _check_spend(result, p, instruction, prior_guard):
+    """This read's own amounts, its required cost, and a guard revision that never goes back."""
+    money = result.monetary_budget
+    amounts = (money.required_microusd, money.observed_high_water_microusd, money.reserved_microusd)
+    require(all(type(value) is int and 0 <= value <= 2**63-1 for value in amounts)
+            and money.observed_high_water_microusd >= p.minimum_observed_microusd
+            and money.required_microusd == (0 if instruction or result.already_admitted else p.work_estimate_microusd)
+            and type(result.guard_revision) is int and result.guard_revision >= 0
+            and (prior_guard is None or result.guard_revision >= prior_guard),
+            "WORK_POLICY_INVALID", 502)
+
+
+def _check_admission(result, instruction):
+    """An admitted read is only its original replay; a new one has no execution deadline yet."""
+    money = result.monetary_budget
+    if result.already_admitted:
+        require(money.decision == result.decision == "allow"
+                and money.reason == result.reason == "original_admission_replay_only"
+                and (instruction or result.queue_deadline is not None), "WORK_POLICY_INVALID", 502)
+    else:
+        # Registration can persist before its job admission. Preserve its
+        # original queue deadline rather than treating it as a new work.
+        require(result.execution_deadline is None
+                and money.reason != "original_admission_replay_only", "WORK_POLICY_INVALID", 502)
+
+
+def _check_allow(result):
+    """An allow is backed by an allowed money decision with the same reason and enough remaining budget."""
+    money = result.monetary_budget
+    require(result.decision != "allow" or (
+        money.decision == "allow" and result.reason == money.reason
+        and money.reason in {"allowed", "original_admission_replay_only"}
+        and (not money.budget_enforced or money.remaining_microusd >= money.required_microusd)),
+        "WORK_POLICY_INVALID", 502)
+
+
+def _observation_reason(result):
+    if result.decision == "allow":
+        return "within_budget" if result.monetary_budget.budget_enforced else "accounting_only"
+    if result.reason in {"cumulative_budget_exhausted", "abstract_root_budget_exhausted"}:
+        return "budget_exhausted"
+    return "revoked" if "revoked" in result.reason else "not_ready"

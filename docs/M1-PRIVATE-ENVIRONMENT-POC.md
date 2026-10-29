@@ -203,7 +203,7 @@ build、deploy、invoke、檔案API操作、提權或支援案件送出，也沒
 | 部署宣告 | 既有A6／B5 definition readback的`environment_variables`只有本POC的`CONTEXT_*`設定，沒有HOME覆寫 | 不能因此判定平台或SDK在哪一個階段改變了HOME |
 | 真正runtime | A6／B5都回 `HOME=/home/session`、effective UID10001、home owner UID0、0755；兩份回應的SDK／平台session binding一致 | 可以確認與image宣告有差異，但尚未分辨平台掛載、初始化／還原或SDK選路徑的機制 |
 | SDK線索 | requirements固定 `azure-ai-agentserver-invocations==1.1.0`；兩份response header回報 `azure-ai-agentserver-core/2.1.0 (python/3.11)` | Header不是完整套件清單，也不能單憑版本字串判定SDK有bug |
-| 首個失敗操作 | [environment.py](../src/fa-shared-context-poc/shared_context/environment.py) 的 `base.mkdir(mode=0o700, exist_ok=True)`，目標為 `$HOME/.fa-m1`，得到 `PermissionError`／errno13 | `ENVIRONMENT_HOME_NOT_WRITABLE`與HTTP503是本POC的錯誤映射，不是官方Foundry錯誤碼 |
+| 首個失敗操作 | environment.py（已於 2026-10 移除） 的 `base.mkdir(mode=0o700, exist_ok=True)`，目標為 `$HOME/.fa-m1`，得到 `PermissionError`／errno13 | `ENVIRONMENT_HOME_NOT_WRITABLE`與HTTP503是本POC的錯誤映射，不是官方Foundry錯誤碼 |
 | 尚未到達 | 該呼叫在工作檔、工具設定、profile及browser啟動前就失敗；environment分支不呼叫Context API／Memory，並略過舊HOME marker寫入 | 只能縮小本次失敗位置，不是宣稱已另行部署過不含SDK／GUI的最小image |
 
 本機支援草稿：`.azure\m1-home-support-draft-20260914.json`，
@@ -241,9 +241,9 @@ SDK初始化前的HOME及owner觀察。這些是可供平台團隊判讀的待�
 | `backup` | 須唯一32位hex `backup_id`及checkpoint hash；先真正read／乾淨關閉browser，再封存、透過API create-only上傳，回固定Blob版本receipt | 這個action會啟動GUI；上傳成功本身不等於已驗恢復 |
 | `restore` | 同一stable agent的新session，以`backup` receipt指定雲端版本；驗完整封存件後，建立新run並明確重綁checkpoint | 不覆寫既有run；還須另做`read`才能驗實際profile／工具；不是整個HOME或SDK工作恢復 |
 
-程式：[environment.py](../src/fa-shared-context-poc/shared_context/environment.py)、
+程式：environment.py（已於 2026-10 移除）、
 [GUI 接線](../src/fa-shared-context-poc/shared_context/gui.py)、
-[公開入口測試](../tests/shared_context/test_environment.py)。
+公開入口測試（已於 2026-10 移除）。
 
 `target_agent_id` 要用平台 `FOUNDRY_AGENT_ID` 的 stable GUID，**不是** MI principal／client ID、
 `agent-a` 角色名稱或使用者送來的 header。它必須與目前平台 binding 相同，否則在讀取私人 HOME 前拒絕。

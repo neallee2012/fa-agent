@@ -1,0 +1,10 @@
+{
+  "api_secret_environment": {
+    "FA_FEED_MCP_SIGNING_KEY": "fa-feed-mcp-signing-key"
+  },
+  "deploy_client_id": "7a8b9c0d-8888-4999-8aaa-bbbbccccdddd",
+  "feed_app": "ca-feed-dev",
+  "feed_environment": {
+    "FEED_MCP_PUBLIC_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  }
+}

@@ -4,8 +4,7 @@ import base64
 import copy
 import hashlib
 import json
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -13,7 +12,6 @@ from azure.data.tables import TableClient
 
 from conftest import A, C, TENANT
 from shared_context.errors import Problem
-from shared_context.m3_cli import main
 from shared_context.m3_client import ArtifactClient
 from shared_context.m3_models import (
     MAX_ARTIFACT_VERSIONS, MAX_SKILL_REVIEW_ENTRIES, ApprovalInput, CreateArtifact, SkillDeactivationInput,
@@ -200,25 +198,6 @@ def test_client_rejects_a_page_for_another_request_or_cacheable_page(m3):
         with pytest.raises(Problem) as invalid:
             stale.skill_reviews()
         assert invalid.value.body["error"]["code"] == "M3_RESPONSE_INVALID"
-
-
-def test_cli_list_follows_pages_and_prints_metadata_only(m3, capsys, monkeypatch):
-    service, _, store = m3
-    review_fixture(service, store)
-    monkeypatch.setattr("shared_context.m3_artifacts.MAX_SKILL_REVIEW_ENTRIES", 3)
-    credential = MagicMock()
-    credential.__enter__.return_value = credential
-    credential.get_token.return_value = SimpleNamespace(token="synthetic-human-token")
-    with patch("shared_context.m3_cli.InteractiveBrowserCredential", return_value=credential), \
-            patch("shared_context.m3_cli.httpx.Client", return_value=client(service, HUMAN)), \
-            patch("builtins.input", side_effect=AssertionError("listing never asks for a decision")):
-        outcome = main(CLI)
-    captured = capsys.readouterr()
-    assert outcome == 0, captured.err
-    printed = json.loads(captured.out)
-    assert printed["team"] == HUMAN.team
-    assert observed(SkillReviewEntry.model_validate_json(json.dumps(entry)) for entry in printed["entries"]) == EXPECTED
-    assert "SKILL_REVIEW_BODY_CANARY" not in captured.out and "synthetic-human-token" not in captured.out
 
 
 def table(responses):

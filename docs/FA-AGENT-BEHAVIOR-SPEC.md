@@ -2095,6 +2095,20 @@ root再次驗證失敗時移除可重用origin；驗證進行中不先丟掉仍�
 本機只驗「首個B claim內inventory=0、claim_state=fresh」及scope/fence拒絕，
 不是B業務完成、live通過或完整歷史golden驗收；結果見[固定評測](agent-runtime-evaluation-baseline.md#2026-10-01b23-首次-claim-沿用-root-origin)。
 
+**2026-10-28 補充：standing-policy 安裝的 root 逐請求沿用已驗 origin**（Neal 2026-10-28 批准；總協調依對抗式審查選這個簡化做法，ADR 方案見 PR #1024 草稿）。
+只有 standing-policy（work-policy）安裝的`installed_work_policy_origin`會讀整個 partition（`read_inventory(max_entities=None)`，dev 約 150 秒），
+所以只有這一種沿用。root 第一次完整驗證前，先按 key 讀`origin_pointer_keys`列出的安裝指標、channels current 和它們指向的 history 列，記下 hash；
+之後每個要驗證據的請求（含 Teams 每則訊息）重讀同一組，程序、store、fence、config hash 與 hash 都相同才沿用，並照舊跑`_check_installation()`、
+probe 短讀、`attach_standing_policy`、`activate_target`；寫入仍經`_check_installation()`與 protected rows。
+任一沿用條件不符就先移除可重用 origin，再走完整`installed_origin`，照原本的錯誤拒絕；完整驗證失敗也移除。
+origin 檢查之後的錯誤只有一種不移除：standing-policy 安裝遇到 412 `BEHAVIOR_CONFLICT`（`acquire_evidence`會重試的暫時衝突），peer 不因此收到 503；
+其他錯誤（例如 403 `WORK_POLICY_SCOPE_CHANGED`）照 main 移除，peer 收到 503 `AGENT_ORIGIN_UNAVAILABLE`。
+只有完整驗證成功的請求會寫入可重用 origin，沿用的請求不覆寫。
+縮小的一點：本程序啟動後在 FA 以外寫入的列（安裝指標與 history 除外），要到下次啟動的完整驗證才會被抓到，跟 peer 現在一樣。
+沿用種類在本程序第一次驗證時決定；程序啟動後才安裝 standing-policy 時，要重啟 API 才開始沿用（在那之前每次完整驗證）。
+fresh（stage 用的種類）、legacy、migration、transition、rotation、channels 安裝不沿用，跟 main 完全一樣：每個請求完整驗證（fresh 仍每次核成本帳與回條），
+任何錯誤（含 412）都移除可重用 origin。唯一差別是手上沒有可重用 origin 時（程序第一次驗證，或失敗移除後的下一次驗證）多一次指標 key 讀。
+
 ## 2026-10-01 SDK 橋接前置：原工作資料與 VM 回合入口
 
 純 builder 只能沿真 WorkRegistration／job／ExecutorBinding 準備 Assignment 與原 code-bound

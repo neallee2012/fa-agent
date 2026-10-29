@@ -231,3 +231,41 @@ def test_production_application_registers_proposal_routes_without_other_new_capa
     assert {prefix, prefix + "/preview", prefix + "/reconcile", prefix + "/{request_id}"} <= paths
     assert prefix + "/commit" not in paths and prefix + "/activate" not in paths
     assert prefix + "/{proposal_request_id}/bridge/commit" in paths
+
+
+def test_both_note_families_keep_route_order_and_request_errors(proposal_case, monkeypatch):
+    from shared_context import memory_note_proposal_api as api
+
+    c = proposal_case
+    install_case(c)
+    raised = []
+
+    class Recorded(api.Problem):
+        def __init__(self, *args):
+            super().__init__(*args)
+            raised.append(self.body["error"])
+
+    monkeypatch.setattr(api, "Problem", Recorded)
+    expected = []
+    for segment in ("note-proposals", "note-syntheses"):
+        prefix = "/behavior/v1/bindings/{binding_id}/" + segment
+        expected += [(prefix + path, {"POST"}) for path in ("/preview", "/reconcile", "")]
+        expected += [(prefix + "/{proposal_request_id}/bridge/" + stage, {"POST"})
+                     for stage in ("prepare", "preview", "review", "commit", "reconcile")]
+        expected.append((prefix + "/{request_id}", {"GET"}))
+    routes = [(route.path, route.methods) for route in c.h.app.routes
+              if "/note-proposals" in route.path or "/note-syntheses" in route.path]
+    assert routes == expected
+    for segment, code, noun in (("note-proposals", "NOTE_PROPOSAL_INVALID_REQUEST", "proposal"),
+                                ("note-syntheses", "NOTE_SYNTHESIS_INVALID_REQUEST", "synthesis")):
+        base = "/behavior/v1/bindings/" + c.binding.binding_id + "/" + segment
+        identifiers = {"code": code, "message": "only the original identifiers are supported"}
+        for method, path in (("POST", "/preview?x=1"), ("POST", "/request-a/bridge/review?x=1"),
+                             ("GET", "/request-a?x=1")):
+            raised.clear()
+            response = c.h.client.request(method, base + path, headers=c.h.headers())
+            assert (response.status_code, raised) == (422, [identifiers]), (method, path)
+        raised.clear()
+        response = c.h.client.request("GET", base + "/request-a", content=b"{}", headers=c.h.headers())
+        assert (response.status_code, raised) == (
+            422, [{"code": code, "message": noun + " reads do not accept a body"}])

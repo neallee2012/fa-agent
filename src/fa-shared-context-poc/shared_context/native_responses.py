@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from contextlib import aclosing
+from dataclasses import dataclass
 from uuid import uuid4
 
 from azure.ai.agentserver.core import get_request_context
@@ -44,8 +46,21 @@ MAX_DISPLAY_BYTES = 128 * 1024
 class _DisplayBuffer:
     """Display text waiting for the SSE stream: merged without dropping, until a 128 KiB total limit."""
 
-    def __init__(self):
+    def __init__(self, first_preview):
         self.parts, self.ready, self.size, self.full = [], asyncio.Event(), 0, False
+        self.first_preview, self.previewed = first_preview, False
+
+    def observe(self, event):
+        """The SDK turn's public event observer: tool starts and live preview text become display text."""
+        text = _tool_progress_text(event)
+        preview = event.get("live_text")
+        if isinstance(preview, str) and preview:
+            if not self.previewed:
+                self.previewed = True
+                self.first_preview()
+            text = preview if text is None else text + preview
+        if text is not None:
+            self.add(text)
 
     def add(self, text):
         if self.full:
@@ -105,6 +120,33 @@ async def _progress_events(stream, pending, running, response_id):
         yield _message_done(message, item, text.final_text)
 
 
+@dataclass
+class _Turn:
+    """One response over its original RID; ``original`` and ``receipt`` move forward as the handler rereads or writes."""
+
+    stream: ResponseEventStream
+    context: ResponseContext
+    cancellation_signal: asyncio.Event
+    entered: float
+    rid: str
+    original: object
+    receipt: object
+    ended: bool = False  # a failure event already ended this response
+
+    def fenced(self):
+        return self.cancellation_signal.is_set() and not self.context.client_cancelled
+
+    def signals(self, value):
+        value.shutdown = self.context.shutdown.is_set()
+        # The cause flag /cancel stamps on this context: a recovered handler's signal is not the one /cancel sets.
+        value.cancelled = value.cancelled or self.context.client_cancelled
+        value.fenced = value.fenced or (self.fenced() and not value.shutdown)
+
+    def fail(self, code, message):
+        self.ended = True
+        return self.stream.emit_failed(code=code, message=message)
+
+
 class NativeResponsesHandler:
     def __init__(self, runtime: NativeTurnRuntime):
         self.runtime = runtime
@@ -148,153 +190,25 @@ class NativeResponsesHandler:
         entered = perf_counter()
         try:
             original = await self._original(request, context)
-            rid = original.value.receipt.request_id
-            receipt = original.value.receipt
-            if receipt.status in {"accepted", "started"}:
-                if receipt.status == "accepted" or not context.is_recovery:
-                    await self.runtime._require_original_session(receipt=receipt)
-                if context.shutdown.is_set():
-                    await context.exit_for_recovery()
-            elapsed_timing("native_response_admit", entered, job_id=timing_id(rid))
-            if rid in self.runtime.responses_queued:
+            turn = _Turn(stream, context, cancellation_signal, entered, original.value.receipt.request_id,
+                         original, original.value.receipt)
+            await self._admit(turn)
+            if turn.rid in self.runtime.responses_queued:
                 yield stream.emit_failed(code="NATIVE_TURN_QUEUED", message="This original RID is already queued.")
                 return
-            if receipt.status == "accepted" and (
-                    receipt.cancel_requested or cancellation_signal.is_set() and context.client_cancelled):
-                receipt = await self.runtime._unknown(original, "NATIVE_TURN_CANCELLED")
-            queue_refused = receipt.status == "accepted" and cancellation_signal.is_set() and not context.client_cancelled
-            if receipt.status == "accepted" and not queue_refused and self.runtime.response_queue_full():
-                if receipt.human_origin:
-                    refused = _changed(receipt, status="busy_refused", failure_code="NATIVE_TURN_BUSY")
-                    current, _ = await self.runtime._cas(original, _changed(original.value, receipt=refused))
-                    receipt = current.value.receipt
-                queue_refused = True
-            if receipt.status in {"accepted", "started"} and not queue_refused:
-                self.runtime.responses_queued.add(rid)
-                reserved = rid
-            control = NativeTurnControl()
-
-            def signals(value):
-                value.shutdown = context.shutdown.is_set()
-                value.cancelled = value.cancelled or (
-                    cancellation_signal.is_set() and context.client_cancelled)
-                value.fenced = value.fenced or (
-                    cancellation_signal.is_set() and not context.client_cancelled and not value.shutdown)
-
-            if reserved is not None:
-                async with self.runtime.execution_slot(original, control, signals) as acquired:
-                    # As the Invocations chain: before "started", while an earlier turn's CLI still runs this one stays
-                    # accepted (no second SDK) until that CLI exits, the recovery shutdown defers it, or the bound ends
-                    # it resendable (below).
-                    exited = not acquired or await self.runtime._await_runtime_exit(
-                        lambda: context.shutdown.is_set() or cancellation_signal.is_set(), receipt.conversation_id)
-                    signals(control)
-                    starting = perf_counter()
-                    if context.shutdown.is_set():
-                        await context.exit_for_recovery()
-                    original = await self.runtime._rid(rid)
-                    receipt = original.value.receipt
-                    if receipt.hosted_session_id != self.runtime.identity.session_id:
-                        # ADR-0009 M9: the session the Agent switched to adopted it; it runs there, untouched here.
-                        yield stream.emit_failed(code="NATIVE_SESSION_CHANGED",
-                                                 message="The original RID now belongs to another Hosted session.")
-                        return
-                    if receipt.status != "accepted":
-                        receipt = await self.runtime._reenter(
-                            original, failure_code="NATIVE_TURN_UNKNOWN" if (
-                                cancellation_signal.is_set() and not context.client_cancelled) else None,
-                            recovered=context.is_recovery and not context.client_cancelled)
-                    elif not exited:
-                        receipt = await self.runtime._close_unstarted(original)
-                    elif cancellation_signal.is_set() and not context.client_cancelled:
-                        # The public signal does not identify its cause. Keep this unstarted intent retryable.
-                        pass
-                    elif control.cancelled or receipt.cancel_requested:
-                        receipt = await self.runtime._unknown(original, "NATIVE_TURN_CANCELLED")
-                    elif acquired:
-                        meta, _ = await self.runtime._meta(receipt.conversation_id)
-                        if meta.inflight_rid != rid:
-                            yield stream.emit_failed(
-                                code="NATIVE_TURN_NOT_TAKEN", message="The original RID does not own the CID slot.")
-                            return
-                        started = _changed(original.value, run_token=uuid4().hex, receipt=_changed(
-                            receipt, status="started", response_id=context.response_id))
-                        try:
-                            original, ours = await self.runtime._cas(original, started)
-                        except _UnchangedRidWrite:
-                            receipt = await self.runtime._unknown(original, "NATIVE_STATE_STORE_UNKNOWN")
-                        else:
-                            elapsed_timing("native_start", starting, job_id=timing_id(rid))
-                            if ours:
-                                pending = _DisplayBuffer()
-                                previewed = False
-
-                                def public_event(event):
-                                    nonlocal previewed
-                                    text = _tool_progress_text(event)
-                                    preview = event.get("live_text")
-                                    if isinstance(preview, str) and preview:
-                                        if not previewed:
-                                            previewed = True
-                                            elapsed_timing("native_first_preview", entered, job_id=timing_id(rid))
-                                        text = preview if text is None else text + preview
-                                    if text is not None:
-                                        pending.add(text)
-
-                                control.on_event = public_event
-                                running = asyncio.create_task(
-                                    self.runtime._execute_started(original, control, signals))
-                                try:
-                                    async for event in _progress_events(stream, pending, running, context.response_id):
-                                        yield event
-                                    receipt = await running
-                                finally:
-                                    control.on_event = None
-                                    if not running.done():
-                                        running.cancel()
-                                    await asyncio.gather(running, return_exceptions=True)
-                            elif original.value.receipt.hosted_session_id != self.runtime.identity.session_id:
-                                receipt = original.value.receipt
-                            else:
-                                receipt = await self.runtime._reenter(original)
-                        signals(control)
-                        if context.shutdown.is_set():
-                            await context.exit_for_recovery()
-            if reserved is not None:
+            if await self._takes_queue_place(turn):
+                self.runtime.responses_queued.add(turn.rid)
+                reserved = turn.rid
+                async with aclosing(self._slot_events(turn, NativeTurnControl())) as events:
+                    async for event in events:
+                        yield event
+                if turn.ended:
+                    return
                 self.runtime.responses_queued.discard(reserved)
                 reserved = None
-            if context.is_recovery and not context.client_cancelled:
-                from .native_continuations import schedule_continuation
-                try:
-                    await schedule_continuation(self.runtime, receipt)
-                except Problem:
-                    await self.runtime._notify_terminal(receipt)
-                    raise
-            receipt = await self.runtime._notify_terminal(receipt)
-            if receipt.status == "completed":
-                parts, part = [], 0
-                while True:
-                    result = await self.runtime.result(NativeResult(
-                        request_id=rid, conversation_id=receipt.conversation_id, part=part))
-                    parts.append(result.text)
-                    if result.next_part is None:
-                        break
-                    part = result.next_part
-                message, item = _message(stream, context.response_id, "final_answer")
-                yield message.emit_added(item)
-                text = TextContentBuilder(
-                    stream, output_index=message.output_index, item_id=message.item_id, content_index=0)
-                yield text.emit_added()
-                original_text = "".join(parts)
-                yield text.emit_delta(original_text)
-                yield text.emit_text_done(original_text)
-                yield text.emit_done()
-                yield _message_done(message, item, original_text)
-                yield stream.emit_completed()
-            else:
-                yield stream.emit_failed(
-                    code=receipt.failure_code or "NATIVE_TURN_NOT_TAKEN",
-                    message="The original native receipt did not complete; retain its RID.")
+            async with aclosing(self._terminal_events(turn)) as events:
+                async for event in events:
+                    yield event
         except TaskDeferred:
             if not context.shutdown.is_set():
                 raise
@@ -306,6 +220,145 @@ class NativeResponsesHandler:
         finally:
             if reserved is not None:
                 self.runtime.responses_queued.discard(reserved)
+
+    async def _admit(self, turn):
+        receipt, context = turn.receipt, turn.context
+        if receipt.status in {"accepted", "started"}:
+            if receipt.status == "accepted" or not context.is_recovery:
+                await self.runtime._require_original_session(receipt=receipt)
+            if context.shutdown.is_set():
+                await context.exit_for_recovery()
+        elapsed_timing("native_response_admit", turn.entered, job_id=timing_id(turn.rid))
+
+    async def _takes_queue_place(self, turn):
+        """Close a cancelled intent, or refuse a signalled or full queue; True when this response waits for the slot."""
+        if turn.receipt.status == "accepted" and (turn.receipt.cancel_requested or turn.context.client_cancelled):
+            turn.receipt = await self.runtime._unknown(turn.original, "NATIVE_TURN_CANCELLED")
+        if turn.receipt.status != "accepted":
+            return turn.receipt.status == "started"
+        if turn.fenced():
+            return False
+        if not self.runtime.response_queue_full():
+            return True
+        if turn.receipt.human_origin:
+            refused = _changed(turn.receipt, status="busy_refused", failure_code="NATIVE_TURN_BUSY")
+            current, _ = await self.runtime._cas(turn.original, _changed(turn.original.value, receipt=refused))
+            turn.receipt = current.value.receipt
+        return False
+
+    async def _slot_events(self, turn, control):
+        context = turn.context
+        async with self.runtime.execution_slot(turn.original, control, turn.signals) as acquired:
+            # As the Invocations chain: before "started", while an earlier turn's CLI still runs this one stays
+            # accepted (no second SDK) until that CLI exits, the recovery shutdown defers it, or the bound ends
+            # it resendable (below).
+            exited = not acquired or await self.runtime._await_runtime_exit(
+                lambda: context.shutdown.is_set() or turn.cancellation_signal.is_set() or context.client_cancelled,
+                turn.receipt.conversation_id)
+            turn.signals(control)
+            starting = perf_counter()
+            if context.shutdown.is_set():
+                await context.exit_for_recovery()
+            turn.original = await self.runtime._rid(turn.rid)
+            turn.receipt = turn.original.value.receipt
+            if turn.receipt.hosted_session_id != self.runtime.identity.session_id:
+                # ADR-0009 M9: the session the Agent switched to adopted it; it runs there, untouched here.
+                yield turn.fail("NATIVE_SESSION_CHANGED", "The original RID now belongs to another Hosted session.")
+                return
+            if await self._settled_unstarted(turn, control, acquired, exited):
+                return
+            async with aclosing(self._start_events(turn, control, starting)) as events:
+                async for event in events:
+                    yield event
+
+    async def _settled_unstarted(self, turn, control, acquired, exited):
+        """Re-enter, close or keep the reread receipt; False only when this response should start its SDK turn."""
+        context = turn.context
+        if turn.receipt.status != "accepted":
+            turn.receipt = await self.runtime._reenter(
+                turn.original, failure_code="NATIVE_TURN_UNKNOWN" if turn.fenced() else None,
+                recovered=context.is_recovery and not context.client_cancelled)
+        elif not exited:
+            turn.receipt = await self.runtime._close_unstarted(turn.original)
+        elif turn.fenced():
+            # The public signal does not identify its cause. Keep this unstarted intent retryable.
+            pass
+        elif control.cancelled or turn.receipt.cancel_requested:
+            turn.receipt = await self.runtime._unknown(turn.original, "NATIVE_TURN_CANCELLED")
+        elif acquired:
+            return False
+        return True
+
+    async def _start_events(self, turn, control, starting):
+        runtime, context = self.runtime, turn.context
+        meta, _ = await runtime._meta(turn.receipt.conversation_id)
+        if meta.inflight_rid != turn.rid:
+            yield turn.fail("NATIVE_TURN_NOT_TAKEN", "The original RID does not own the CID slot.")
+            return
+        started = _changed(turn.original.value, run_token=uuid4().hex, receipt=_changed(
+            turn.receipt, status="started", response_id=context.response_id))
+        try:
+            turn.original, ours = await runtime._cas(turn.original, started)
+        except _UnchangedRidWrite:
+            turn.receipt = await runtime._unknown(turn.original, "NATIVE_STATE_STORE_UNKNOWN")
+        else:
+            elapsed_timing("native_start", starting, job_id=timing_id(turn.rid))
+            if ours:
+                pending = _DisplayBuffer(
+                    lambda: elapsed_timing("native_first_preview", turn.entered, job_id=timing_id(turn.rid)))
+                control.on_event = pending.observe
+                running = asyncio.create_task(runtime._execute_started(turn.original, control, turn.signals))
+                try:
+                    async for event in _progress_events(turn.stream, pending, running, context.response_id):
+                        yield event
+                    turn.receipt = await running
+                finally:
+                    control.on_event = None
+                    if not running.done():
+                        running.cancel()
+                    await asyncio.gather(running, return_exceptions=True)
+            elif turn.original.value.receipt.hosted_session_id != runtime.identity.session_id:
+                turn.receipt = turn.original.value.receipt
+            else:
+                turn.receipt = await runtime._reenter(turn.original)
+        turn.signals(control)
+        if context.shutdown.is_set():
+            await context.exit_for_recovery()
+
+    async def _terminal_events(self, turn):
+        receipt, context, stream = turn.receipt, turn.context, turn.stream
+        if context.is_recovery and not context.client_cancelled:
+            from .native_continuations import schedule_continuation
+            try:
+                await schedule_continuation(self.runtime, receipt)
+            except Problem:
+                await self.runtime._notify_terminal(receipt)
+                raise
+        receipt = await self.runtime._notify_terminal(receipt)
+        if receipt.status != "completed":
+            yield stream.emit_failed(
+                code=receipt.failure_code or "NATIVE_TURN_NOT_TAKEN",
+                message="The original native receipt did not complete; retain its RID.")
+            return
+        original_text = await self._result_text(turn.rid, receipt.conversation_id)
+        message, item = _message(stream, context.response_id, "final_answer")
+        yield message.emit_added(item)
+        text = TextContentBuilder(stream, output_index=message.output_index, item_id=message.item_id, content_index=0)
+        yield text.emit_added()
+        yield text.emit_delta(original_text)
+        yield text.emit_text_done(original_text)
+        yield text.emit_done()
+        yield _message_done(message, item, original_text)
+        yield stream.emit_completed()
+
+    async def _result_text(self, rid, conversation_id):
+        parts, part = [], 0
+        while True:
+            result = await self.runtime.result(NativeResult(request_id=rid, conversation_id=conversation_id, part=part))
+            parts.append(result.text)
+            if result.next_part is None:
+                return "".join(parts)
+            part = result.next_part
 
 
 def native_responses_handler_factory(hosted, native_runtime: NativeTurnRuntime | None):

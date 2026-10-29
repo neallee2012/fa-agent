@@ -6,6 +6,7 @@ import asyncio
 from collections import OrderedDict
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
+from importlib import import_module
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -38,6 +39,9 @@ from .behavior_native_turn_wire import (
     NativeCrash, NativeEnvironmentNotice, NativeTurnCapture, TurnNumber, canonical_bytes, material_digest,
     NativeSessionRead, NativeSessionPrepare, NativeSessionPreparation, NativeSessionState, NativeCandidateRead,
     NativeEnvironmentView, NativeSessionFollow, NativeSessionRetarget, native_model_switch_enabled,
+    NativeContinuationRead, NativeContinuationReady, NativeContinuationSubmit, NativePrewarm, NativeReceivedRead,
+    NativeSessionAbandon, NativeSessionCheckpointCheck, NativeSessionCut, NativeSessionFilesOmission,
+    NativeSessionPrerestore, NativeSessionWithdraw, NativeUnfinishedRead,
 )
 from .behavior_sdk_state import (
     NativeCheckpointRef, NativeCheckpointScope, NativeCheckpointTurn, NativeCompactionExecution, SdkState,
@@ -49,7 +53,11 @@ from .errors import Problem
 from .native_responses_wire import (
     NATIVE_RESPONSES_PROFILE, UNLABELED_STATE_PROFILE, NativeResponseDispatch, NativeStateProfile, channel)
 from .native_append_wire import NativeAppend, NativeAppendRead
-from .native_progress_wire import NativeProgressRead
+from .native_progress_wire import NativeProgressRead, NativeTurnStatusRead
+from .native_files_wire import NativeSessionFiles
+from .native_image_wire import NativeImageRead, NativeImagesRead
+from .native_skill_draft_wire import NativeSkillDraftIntentRead
+from .behavior_user_images import NativeUserImageUpload
 from .copilot_steering import SdkSteeringChannel
 from .native_assembly import NativeAssembly
 from .native_left_receipts import STALL_SECONDS
@@ -105,6 +113,16 @@ def _raised(value):
     if isinstance(value, BaseException):
         raise value
     return value
+
+
+async def _pending_when_transient(awaitable):
+    """A 5xx or transport failure becomes ``NativePostTurnPending``: core retries the task within its finite budget."""
+    try:
+        return await awaitable
+    except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
+        if isinstance(error, Problem) and error.status < 500:
+            raise
+        raise NativePostTurnPending() from None
 
 
 def _changed(model, **updates):
@@ -318,6 +336,17 @@ class NativeSdkFailure(Problem):
         self.assembly = assembly
 
 
+def _carried(exc, outcome):
+    """What a failed started run carries into its receipt: an SDK failure's own usage, delegation and assembly, else
+    those of the outcome the SDK returned (none when it raised)."""
+    usage = exc.usage if isinstance(exc, NativeSdkFailure) else None if outcome is None else outcome.usage
+    delegation = (exc.delegation if isinstance(exc, NativeSdkFailure)
+                  else None if outcome is None else outcome.delegation)
+    assembly = (exc.assembly if isinstance(exc, NativeSdkFailure)
+                else None if outcome is None else outcome.assembly)
+    return usage, delegation, assembly
+
+
 class NativePostTurnPending(Problem):
     def __init__(self):
         super().__init__(503, "NATIVE_POST_TURN_UNKNOWN",
@@ -372,6 +401,30 @@ class _AgentSession(WireModel):
                     or expected != self.hosted_session_id):
                 raise ValueError("the environment transition must retain the original Agent binding")
         return self
+
+
+def _wanted_admission(current, request):
+    """This request's admission intent and whether the record already retains it; 409 when its RID retains other
+    material."""
+    wanted = None if request is None else _Admission(request_id=request.command.request_id, submit_digest=request.sha256)
+    retained = wanted is not None and current.admitting == wanted
+    if (wanted is not None and current.admitting is not None
+            and current.admitting.request_id == wanted.request_id and not retained):
+        raise Problem(409, "NATIVE_RID_CONFLICT", "the original admission retains different submitted material")
+    return wanted, retained
+
+
+async def _read_back_mark(store, marked, error, known):
+    """After an uncertain admission-mark write: the marked record and the ETag read back when that write applied, None
+    when ``known`` went stale (a conflict), else 503."""
+    found = await store.get_item("agent")
+    value = None if found is None else _decode(found.value, _AgentSession)
+    if value == marked:
+        return marked, found.etag or None
+    elif known is not None and isinstance(error, _CONFLICT):
+        return None
+    else:
+        raise Problem(503, "NATIVE_BOOTSTRAP_UNKNOWN", "original admission binding is unconfirmed") from None
 
 
 class NativeTurnRuntime:
@@ -542,35 +595,33 @@ class NativeTurnRuntime:
         if ctx.shutdown.is_set():
             return await self._exit_for_recovery(ctx)
         if supplied.continuation_of is not None:
-            if ctx.shutdown.is_set():
-                return await self._exit_for_recovery(ctx)
-            if ctx.cancel_requested or ctx.timeout_exceeded:
-                from .native_continuations import stop_handoff
-                await stop_handoff(self, await self.read(supplied.continuation_of), failure_code=(
-                    "NATIVE_TURN_CANCELLED" if ctx.cancel_requested else "NATIVE_TURN_TIMEOUT"))
-                raise Problem(409, "NATIVE_TURN_CANCELLED" if ctx.cancel_requested else "NATIVE_TURN_TIMEOUT",
-                              "the original continuation dispatch stopped before submission")
-            from .native_continuations import dispatch_continuation
-            try:
-                return await dispatch_continuation(self, supplied)
-            except Problem as error:
-                if error.status >= 500:
-                    raise NativePostTurnPending() from None
-                raise
+            return await self._enqueue_continuation(ctx, supplied)
         try:
             original = await self._rid(supplied.request_id)
         except Problem as error:
             if error.status >= 500:
                 return await self._enqueue_unconfirmed(ctx, error.body["error"]["code"])
             raise
+        return await self._enqueue_accepted(ctx, supplied, original)
+
+    async def _enqueue_continuation(self, ctx, supplied):
+        if ctx.cancel_requested or ctx.timeout_exceeded:
+            from .native_continuations import stop_handoff
+            await stop_handoff(self, await self.read(supplied.continuation_of), failure_code=(
+                "NATIVE_TURN_CANCELLED" if ctx.cancel_requested else "NATIVE_TURN_TIMEOUT"))
+            raise Problem(409, "NATIVE_TURN_CANCELLED" if ctx.cancel_requested else "NATIVE_TURN_TIMEOUT",
+                          "the original continuation dispatch stopped before submission")
+        from .native_continuations import dispatch_continuation
+        try:
+            return await dispatch_continuation(self, supplied)
+        except Problem as error:
+            if error.status >= 500:
+                raise NativePostTurnPending() from None
+            raise
+
+    async def _enqueue_accepted(self, ctx, supplied, original):
         receipt = original.value.receipt
-        if supplied.execution_version is not None and supplied.execution_version != self.identity.agent_version:
-            # Only the receipt's own session marks it (review P3 on #889): a retired SID's mark of a RID another
-            # session adopted and runs would read "resend" while it runs.
-            if receipt.hosted_session_id == self.identity.session_id and await self._mark_refused(supplied):
-                if (viewed := _refused_final(receipt)) is not receipt:  # a finished RID already told its sender
-                    await self._notify_terminal(viewed)
-            raise Problem(409, "NATIVE_SESSION_CHANGED", "the queued input belongs to another execution version")
+        await self._refuse_drifted_enqueue(supplied, receipt)
         if receipt.status != "accepted":
             await self._notify_terminal(receipt)
             return receipt.request_id
@@ -578,6 +629,19 @@ class NativeTurnRuntime:
             await self._notify_terminal(await self._unknown(
                 original, "NATIVE_TURN_TIMEOUT" if ctx.timeout_exceeded else "NATIVE_TURN_CANCELLED"))
             return receipt.request_id
+        return await self._start_enqueued(ctx, original)
+
+    async def _refuse_drifted_enqueue(self, supplied, receipt):
+        if supplied.execution_version is not None and supplied.execution_version != self.identity.agent_version:
+            # Only the receipt's own session marks it (review P3 on #889): a retired SID's mark of a RID another
+            # session adopted and runs would read "resend" while it runs.
+            if receipt.hosted_session_id == self.identity.session_id and await self._mark_refused(supplied):
+                if (viewed := _refused_final(receipt)) is not receipt:  # a finished RID already told its sender
+                    await self._notify_terminal(viewed)
+            raise Problem(409, "NATIVE_SESSION_CHANGED", "the queued input belongs to another execution version")
+
+    async def _start_enqueued(self, ctx, original):
+        receipt = original.value.receipt
         try:
             binding = await self._require_original_session(receipt=receipt)
             if receipt.cancel_requested:
@@ -909,20 +973,35 @@ class NativeTurnRuntime:
         and the turn start check the session again."""
         if self._agent_session is None:
             raise Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "native State stores have not initialized")
+        known, (current, etag) = await self._checked_record(admitting, known)
+        wanted, retained = _wanted_admission(current, request)
+        self._refuse_following(current, receipt, retained)
+        self._refuse_replaced(current, receipt)
+        if admitting and (not current.admission_started or wanted is not None and not retained):
+            marked = await self._mark_admission(current, etag, wanted, known)
+            if marked is None:
+                log.info("FA_NATIVE_ADMISSION_MARK_REREAD")
+                return await self._original_session(admitting=admitting, receipt=receipt, request=request)
+            current, etag = marked
+        self._agent_session = current
+        return current, etag
+
+    async def _checked_record(self, admitting, known):
+        """``known`` and the (record, ETag) to check: ``known`` itself unless the mark needs an ETag it lacks."""
         if known is not None and (not admitting or known[1] is not None):
-            current, etag = known
-        else:
-            known, (current, etag) = None, await self._agent_record()
-        wanted = None if request is None else _Admission(request_id=request.command.request_id, submit_digest=request.sha256)
-        retained = wanted is not None and current.admitting == wanted
-        if (wanted is not None and current.admitting is not None
-                and current.admitting.request_id == wanted.request_id and not retained):
-            raise Problem(409, "NATIVE_RID_CONFLICT", "the original admission retains different submitted material")
+            return known, known
+        return None, await self._agent_record()
+
+    def _refuse_following(self, current, receipt, retained):
+        """503 while an owned task is unconfirmed or the Agent changes environments; a receipt's own work goes on."""
         if self._recovery_error is not None and receipt is None:
             raise Problem(503, "AGENT_VERSION_FOLLOWING", "the original owned task is not yet confirmed")
         if (current.environment is not None and current.environment.state == "pending"
                 and receipt is None and not retained):
             raise Problem(503, "AGENT_VERSION_FOLLOWING", "this Agent is changing environments; no new work was accepted")
+
+    def _refuse_replaced(self, current, receipt):
+        """409 when the Agent's session, or the receipt's, is not this Hosted session."""
         replaced = current.hosted_session_id != self.identity.session_id
         if replaced or (receipt is not None and receipt.hosted_session_id != self.identity.session_id):
             # Only a replaced session names the current SID: when just the receipt's SID differs, the current one is
@@ -930,31 +1009,19 @@ class NativeTurnRuntime:
             raise Problem(409, "NATIVE_SESSION_CHANGED",
                           "read-only: the official chain belongs to the original Hosted session; do not replace its task ID",
                           **({"current_hosted_session_id": current.hosted_session_id} if replaced else {}))
-        if admitting and (not current.admission_started or wanted is not None and not retained):
-            if wanted is not None and current.admitting is not None:
-                raise Problem(503, "NATIVE_ADMISSION_PENDING", "the original admission must be reconciled first")
-            marked = _changed(current, admission_started=True,
-                              admitting=current.admitting if wanted is None else wanted)
-            moved = False
-            async with self._store(TURNS_STORE) as store:
-                try:
-                    ref = await store.set_item("agent", _json(marked), if_match=etag)
-                    etag = getattr(ref, "etag", None) or None
-                except _UNCERTAIN as error:
-                    found = await store.get_item("agent")
-                    value = None if found is None else _decode(found.value, _AgentSession)
-                    if value == marked:
-                        etag = found.etag or None
-                    elif known is not None and isinstance(error, _CONFLICT):
-                        moved = True
-                    else:
-                        raise Problem(503, "NATIVE_BOOTSTRAP_UNKNOWN", "original admission binding is unconfirmed") from None
-            if moved:
-                log.info("FA_NATIVE_ADMISSION_MARK_REREAD")
-                return await self._original_session(admitting=admitting, receipt=receipt, request=request)
-            current = marked
-        self._agent_session = current
-        return current, etag
+
+    async def _mark_admission(self, current, etag, wanted, known):
+        """CAS the admission mark; returns the marked record and its ETag, or None when ``known`` went stale."""
+        if wanted is not None and current.admitting is not None:
+            raise Problem(503, "NATIVE_ADMISSION_PENDING", "the original admission must be reconciled first")
+        marked = _changed(current, admission_started=True,
+                          admitting=current.admitting if wanted is None else wanted)
+        async with self._store(TURNS_STORE) as store:
+            try:
+                ref = await store.set_item("agent", _json(marked), if_match=etag)
+                return marked, getattr(ref, "etag", None) or None
+            except _UNCERTAIN as error:
+                return await _read_back_mark(store, marked, error, known)
 
     async def _settle_admission(self, *, admitted=None, recorded=False):
         """Clear a finished admission intent; returns the Agent record this leaves and its ETag (None when unknown).
@@ -2216,29 +2283,50 @@ class NativeTurnRuntime:
         return result
 
     async def _handle_turn(self, ctx: TaskContext[NativeTaskInput]):
+        dropped, supplied = await self._turn_input(ctx)
+        binding, _ = await self._agent_record()
+        if ctx.shutdown.is_set():
+            # A started RID is never marked here: an earlier lifetime that crashed stays unmarked, so it still counts.
+            return await self._exit_unstarted(ctx, supplied)
+        original = await self._rid(supplied.request_id)
+        self._check_turn_scope(ctx, binding, supplied, original)
+        if original.value.receipt.status != "accepted":
+            return await self._reenter_turn(ctx, original)
+        if dropped is not None:
+            return await _pending_when_transient(self._settle_unstarted(supplied))
+        await self._refuse_unrunnable(supplied, original)
+        if channel(original.value.receipt.state_profile) != "invocations":
+            raise Problem(409, "NATIVE_STATE_SCOPE", "Responses turns never run through the Invocations chain")
+        await self._require_original_session(receipt=original.value.receipt)
+        from .native_left_receipts import defer, turn_order
+
+        order = await turn_order(self, original)
+        if not order.go:
+            # ADR-0009 §7a "(r)(s) 的競爭": it stays ``accepted`` (an ordinary queued message, never refused) and waits
+            # in its conversation's left queue with a wait task of its own; this chain turn ends now, so the Agent's
+            # other conversations go on. The wait task puts it back on the chain when its turn comes.
+            await _pending_when_transient(defer(self, original, order.behind))
+            return original.value.receipt
+        return await self._start_turn(ctx, supplied, original, order)
+
+    async def _turn_input(self, ctx):
         dropped = None
         if ctx.input is None and ctx.entry_mode == "recovered" and self.task_observer is not None:
             # Core 2.2.0 re-enters a drained input with payload.input=None (it reads steering.active_input only while
             # drain_in_progress); that input is read from the task record. Started, it re-enters as usual; accepted,
-            # core can never run it again, so it is settled resendable (below).
-            try:
-                dropped = await self._dropped_input(ctx.task_id)
-            except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
-                if isinstance(error, Problem) and error.status < 500:
-                    raise
-                raise NativePostTurnPending() from None  # core retries within its finite budget
+            # core can never run it again, so it is settled resendable (``_handle_turn``).
+            dropped = await _pending_when_transient(self._dropped_input(ctx.task_id))
         if dropped is not None:
-            supplied = dropped
-        else:
-            supplied = ctx.input if isinstance(ctx.input, NativeTaskInput) else _decode(ctx.input, NativeTaskInput)
-        binding, _ = await self._agent_record()
-        if ctx.shutdown.is_set():
-            # A started RID is never marked here: an earlier lifetime that crashed stays unmarked, so it still counts.
-            if ctx.is_steered_turn:
-                # A drained input: core's re-entry gets payload.input=None and can never run it, so it ends resendable.
-                await self._settle_unstarted(supplied, best_effort=True)
-            return await self._exit_for_recovery(ctx)
-        original = await self._rid(supplied.request_id)
+            return dropped, dropped
+        return None, ctx.input if isinstance(ctx.input, NativeTaskInput) else _decode(ctx.input, NativeTaskInput)
+
+    async def _exit_unstarted(self, ctx, supplied, original=None):
+        if ctx.is_steered_turn:
+            # A drained input: core's re-entry gets payload.input=None and can never run it, so it ends resendable.
+            await self._settle_unstarted(supplied, best_effort=True)
+        return await self._exit_for_recovery(ctx, original)
+
+    def _check_turn_scope(self, ctx, binding, supplied, original):
         if ctx.task_id != binding.task_id or binding.hosted_session_id != self.identity.session_id:
             source = original.value.receipt
             if (ctx.entry_mode != "recovered" or source.status == "accepted"
@@ -2247,23 +2335,19 @@ class NativeTurnRuntime:
         # core 2.1.0 steering reports last_input_id on ctx; the persisted input owns this RID.
         if supplied.call_id != original.value.call_id:
             raise Problem(403, "NATIVE_STATE_SCOPE", "the persisted caller context differs from the accepted request")
-        if original.value.receipt.status != "accepted":
-            recovered = ctx.entry_mode == "recovered" and not ctx.cancel_requested and not ctx.timeout_exceeded
-            if recovered:
-                await self._count_unmarked_reentry(original)
-            try:
-                return await self._reenter(original, recovered=recovered)
-            except TaskDeferred:
-                if not ctx.shutdown.is_set():
-                    raise
-                return await self._exit_for_recovery(ctx, original)
-        if dropped is not None:
-            try:
-                return await self._settle_unstarted(supplied)
-            except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
-                if isinstance(error, Problem) and error.status < 500:
-                    raise
-                raise NativePostTurnPending() from None
+
+    async def _reenter_turn(self, ctx, original):
+        recovered = ctx.entry_mode == "recovered" and not ctx.cancel_requested and not ctx.timeout_exceeded
+        if recovered:
+            await self._count_unmarked_reentry(original)
+        try:
+            return await self._reenter(original, recovered=recovered)
+        except TaskDeferred:
+            if not ctx.shutdown.is_set():
+                raise
+            return await self._exit_for_recovery(ctx, original)
+
+    async def _refuse_unrunnable(self, supplied, original):
         drifted = supplied.execution_version is not None and supplied.execution_version != self.identity.agent_version
         # A RID refused once never runs: its owner was told to send it again as a new message, so a resend of the same
         # RID (relay, API retry, a wait task re-run after a recycle) at the current version would do the work twice.
@@ -2280,23 +2364,8 @@ class NativeTurnRuntime:
             if marked:
                 await self._notify_terminal(_refused_final(original.value.receipt))
             raise Problem(409, "NATIVE_SESSION_CHANGED", "the original input cannot execute in another Hosted version")
-        if channel(original.value.receipt.state_profile) != "invocations":
-            raise Problem(409, "NATIVE_STATE_SCOPE", "Responses turns never run through the Invocations chain")
-        await self._require_original_session(receipt=original.value.receipt)
-        from .native_left_receipts import defer, dequeue, turn_order
 
-        order = await turn_order(self, original)
-        if not order.go:
-            # ADR-0009 §7a "(r)(s) 的競爭": it stays ``accepted`` (an ordinary queued message, never refused) and waits
-            # in its conversation's left queue with a wait task of its own; this chain turn ends now, so the Agent's
-            # other conversations go on. The wait task puts it back on the chain when its turn comes.
-            try:
-                await defer(self, original, order.behind)
-            except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
-                if isinstance(error, Problem) and error.status < 500:
-                    raise
-                raise NativePostTurnPending() from None
-            return original.value.receipt
+    async def _start_turn(self, ctx, supplied, original, order):
         control = NativeTurnControl()
 
         def signals(value):
@@ -2313,10 +2382,7 @@ class NativeTurnRuntime:
             signals(control)
             starting = perf_counter()
             if ctx.shutdown.is_set():
-                if ctx.is_steered_turn:
-                    # A drained input: core's re-entry gets payload.input=None and can never run it.
-                    await self._settle_unstarted(supplied, best_effort=True)
-                return await self._exit_for_recovery(ctx, original)
+                return await self._exit_unstarted(ctx, supplied, original)
             original = await self._rid(supplied.request_id)
             if original.value.receipt.hosted_session_id != self.identity.session_id:
                 # ADR-0009 M9: the session the Agent switched to adopted this never-started receipt; it runs there.
@@ -2331,24 +2397,29 @@ class NativeTurnRuntime:
                 return original.value.receipt
             if not exited:
                 return await self._close_unstarted(original)
-            started = _changed(original.value, run_token=uuid4().hex,
-                               receipt=_changed(original.value.receipt, status="started"))
-            # Use the ETag persisted in the accepted task input, not a refreshed read.
-            try:
-                original, ours = await self._cas(_Versioned(original.value, supplied.accepted_etag), started)
-            except _UnchangedRidWrite:
-                return await self._unknown(original, "NATIVE_STATE_STORE_UNKNOWN")
-            elapsed_timing("native_start", starting, job_id=timing_id(supplied.request_id))
-            if not ours:
-                if original.value.receipt.hosted_session_id != self.identity.session_id:
-                    return original.value.receipt
-                return await self._reenter(original)
-            if order.queued:
-                await dequeue(self, original.value.receipt)
-            result = await self._execute_started(original, control, signals)
-            if ctx.shutdown.is_set():
-                return await self._exit_for_recovery(ctx, original)
-            return result
+            return await self._start_and_execute(ctx, supplied, original, order, control, signals, starting)
+
+    async def _start_and_execute(self, ctx, supplied, original, order, control, signals, starting):
+        from .native_left_receipts import dequeue
+
+        started = _changed(original.value, run_token=uuid4().hex,
+                           receipt=_changed(original.value.receipt, status="started"))
+        # Use the ETag persisted in the accepted task input, not a refreshed read.
+        try:
+            original, ours = await self._cas(_Versioned(original.value, supplied.accepted_etag), started)
+        except _UnchangedRidWrite:
+            return await self._unknown(original, "NATIVE_STATE_STORE_UNKNOWN")
+        elapsed_timing("native_start", starting, job_id=timing_id(supplied.request_id))
+        if not ours:
+            if original.value.receipt.hosted_session_id != self.identity.session_id:
+                return original.value.receipt
+            return await self._reenter(original)
+        if order.queued:
+            await dequeue(self, original.value.receipt)
+        result = await self._execute_started(original, control, signals)
+        if ctx.shutdown.is_set():
+            return await self._exit_for_recovery(ctx, original)
+        return result
 
     async def _execute_started(self, original, control, signals):
         done = asyncio.get_running_loop().create_future()
@@ -2374,16 +2445,7 @@ class NativeTurnRuntime:
                 from .native_continuations import stop_requested
                 if await stop_requested(self, original.value.receipt):
                     return await self._unknown(original, "NATIVE_TURN_CANCELLED")
-            start_recall = getattr(self.executor, "start_recall", None)
-            if start_recall is not None:
-                # Memory recall needs only this receipt, so it overlaps allocation. Whether the static profile is owed
-                # (no SDK history) is known only after it: a new CID has none, a follow-up almost always has some.
-                # shortcut: native_start (slot, RID read, "started" CAS) still runs before it; earlier means both entry paths.
-                from .sdk_telemetry import turn_context
-                guess = original.value.receipt.command.conversation_id is None
-                with turn_context(rid):  # its tasks join this turn's trace, as the executor's own phases do
-                    recall = start_recall(original.value.receipt, first_turn=guess)
-                control.recall = None if recall is None else (guess, recall)
+            self._begin_recall(original, control, rid)
             original, meta, previous = await self._allocate_timed(original)
             control.adopted = original.value.adopted_from is not None
             control.checkpoint_turn = self._checkpoint_turn(original.value.receipt, meta)
@@ -2402,68 +2464,93 @@ class NativeTurnRuntime:
                 await settle_appends(self, original.value.receipt, control, finished=True)
             signals(control)
             current = await self._rid(rid)
-            if control.shutdown:
-                return current.value.receipt
-            if current.value.run_token != original.value.run_token or current.value.receipt.status != "started":
-                return current.value.receipt
-            if control.fenced:
-                return await self._unknown(current, "NATIVE_TURN_UNKNOWN",
-                                           usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
-            if control.timeout:
-                return await self._unknown(current, "NATIVE_TURN_TIMEOUT",
-                                           usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
-            if control.cancelled or current.value.receipt.cancel_requested:
-                return await self._unknown(current, "NATIVE_TURN_CANCELLED",
-                                           usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
+            stopped = await self._stopped_after_run(current, original, control, outcome)
+            if stopped is not None:
+                return stopped
             saving = True
-            with phase_timing("native_save_turn", job_id=timing_id(rid)):
-                # Every save step is idempotent (content-addressed creates, the RID CAS on its original ETag), so an
-                # unconfirmed (503) step is retried with the same outcome; the SDK never runs again.
-                for delay in (*SAVE_RETRY_SECONDS, None):
-                    try:
-                        return await self._save_turn(current, meta, outcome)
-                    except _UnknownRidWrite:
-                        raise
-                    except Problem as error:
-                        if error.status != 503 or delay is None:
-                            raise
-                        log.warning("FA_NATIVE_SAVE_RETRY code=%s", error.body["error"]["code"])
-                    await asyncio.sleep(delay)
+            return await self._save_turn_retrying(current, meta, outcome, rid)
         except _UnknownRidWrite:
             raise
         except Exception as exc:
-            # Never repeat the SDK after started, including provider and persistence failures.
-            signals(control)
-            if control.shutdown:
-                return (await self._rid(rid)).value.receipt
-            code = ("NATIVE_TURN_TIMEOUT" if control.timeout else
-                    "NATIVE_TURN_CANCELLED" if control.cancelled else
-                    "NATIVE_TURN_UNKNOWN" if control.fenced else
-                    exc.body["error"]["code"] if isinstance(exc, Problem) else "NATIVE_TURN_UNKNOWN")
-            usage = exc.usage if isinstance(exc, NativeSdkFailure) else None if outcome is None else outcome.usage
-            delegation = (exc.delegation if isinstance(exc, NativeSdkFailure)
-                          else None if outcome is None else outcome.delegation)
-            assembly = (exc.assembly if isinstance(exc, NativeSdkFailure)
-                        else None if outcome is None else outcome.assembly)
-            log.warning("FA_NATIVE_TURN_UNKNOWN code=%s exception_type=%s", code, type(exc).__name__)
-            current = await self._rid(rid)
-            if current.value.run_token != original.value.run_token:
-                return current.value.receipt
-            if saving:
-                return await self._reenter(current, failure_code=code, usage=usage,
-                                           delegation=delegation, assembly=assembly)
-            return await self._unknown(current, code, usage=usage, delegation=delegation, assembly=assembly)
+            return await self._started_failure(exc, original, control, signals, outcome, saving, rid)
         finally:
-            if control.recall is not None:  # every path; a no-op once _run settled it, the stop for turns that ended earlier
-                control.recall[1].cancel()
-                await asyncio.gather(control.recall[1], return_exceptions=True)
-            if watcher is not None:
-                watcher.cancel()
-                await asyncio.gather(watcher, return_exceptions=True)
-            if control.steering is not None and not appends_settled:
-                from .native_appends import settle_appends
-                control.steering.close()
-                await settle_appends(self, original.value.receipt, control, finished=True)
+            await self._release_started(original, control, watcher, appends_settled)
+
+    def _begin_recall(self, original, control, rid):
+        start_recall = getattr(self.executor, "start_recall", None)
+        if start_recall is not None:
+            # Memory recall needs only this receipt, so it overlaps allocation. Whether the static profile is owed
+            # (no SDK history) is known only after it: a new CID has none, a follow-up almost always has some.
+            # shortcut: native_start (slot, RID read, "started" CAS) still runs before it; earlier means both entry paths.
+            from .sdk_telemetry import turn_context
+            guess = original.value.receipt.command.conversation_id is None
+            with turn_context(rid):  # its tasks join this turn's trace, as the executor's own phases do
+                recall = start_recall(original.value.receipt, first_turn=guess)
+            control.recall = None if recall is None else (guess, recall)
+
+    async def _stopped_after_run(self, current, original, control, outcome):
+        """The receipt to return instead of saving the turn the SDK returned, or None to save it (a stop always returns
+        a receipt): shutdown, a run that is no longer this one, then a fence, timeout or cancel."""
+        if control.shutdown:
+            return current.value.receipt
+        if current.value.run_token != original.value.run_token or current.value.receipt.status != "started":
+            return current.value.receipt
+        if control.fenced:
+            return await self._unknown(current, "NATIVE_TURN_UNKNOWN",
+                                       usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
+        if control.timeout:
+            return await self._unknown(current, "NATIVE_TURN_TIMEOUT",
+                                       usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
+        if control.cancelled or current.value.receipt.cancel_requested:
+            return await self._unknown(current, "NATIVE_TURN_CANCELLED",
+                                       usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
+        return None
+
+    async def _save_turn_retrying(self, current, meta, outcome, rid):
+        with phase_timing("native_save_turn", job_id=timing_id(rid)):
+            # Every save step is idempotent (content-addressed creates, the RID CAS on its original ETag), so an
+            # unconfirmed (503) step is retried with the same outcome; the SDK never runs again.
+            for delay in (*SAVE_RETRY_SECONDS, None):
+                try:
+                    return await self._save_turn(current, meta, outcome)
+                except _UnknownRidWrite:
+                    raise
+                except Problem as error:
+                    if error.status != 503 or delay is None:
+                        raise
+                    log.warning("FA_NATIVE_SAVE_RETRY code=%s", error.body["error"]["code"])
+                await asyncio.sleep(delay)
+
+    async def _started_failure(self, exc, original, control, signals, outcome, saving, rid):
+        # Never repeat the SDK after started, including provider and persistence failures.
+        signals(control)
+        if control.shutdown:
+            return (await self._rid(rid)).value.receipt
+        code = ("NATIVE_TURN_TIMEOUT" if control.timeout else
+                "NATIVE_TURN_CANCELLED" if control.cancelled else
+                "NATIVE_TURN_UNKNOWN" if control.fenced else
+                exc.body["error"]["code"] if isinstance(exc, Problem) else "NATIVE_TURN_UNKNOWN")
+        usage, delegation, assembly = _carried(exc, outcome)
+        log.warning("FA_NATIVE_TURN_UNKNOWN code=%s exception_type=%s", code, type(exc).__name__)
+        current = await self._rid(rid)
+        if current.value.run_token != original.value.run_token:
+            return current.value.receipt
+        if saving:
+            return await self._reenter(current, failure_code=code, usage=usage,
+                                       delegation=delegation, assembly=assembly)
+        return await self._unknown(current, code, usage=usage, delegation=delegation, assembly=assembly)
+
+    async def _release_started(self, original, control, watcher, appends_settled):
+        if control.recall is not None:  # every path; a no-op once _run settled it, the stop for turns that ended earlier
+            control.recall[1].cancel()
+            await asyncio.gather(control.recall[1], return_exceptions=True)
+        if watcher is not None:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+        if control.steering is not None and not appends_settled:
+            from .native_appends import settle_appends
+            control.steering.close()
+            await settle_appends(self, original.value.receipt, control, finished=True)
 
     async def _continuation_blocker(self, meta, execution_sid):
         if meta.state_profile == NATIVE_RESPONSES_PROFILE and meta.hosted_session_id != execution_sid:
@@ -2632,110 +2719,11 @@ class NativeTurnRuntime:
         return current.value.receipt
 
     async def dispatch(self, command: NativeRequest):
-        from .behavior_native_turn_wire import NativeSessionFilesOmission
-        if isinstance(command, NativeSessionFilesOmission):
-            from .native_files_omission import confirm_omission
-            return await confirm_omission(self, command)
-        from .native_files_wire import NativeSessionFiles
-        if isinstance(command, NativeSessionFiles):
-            from .native_environment_files import session_files
-            return await session_files(self, command)
-        from .behavior_native_turn_wire import NativeContinuationRead, NativeContinuationReady, NativeContinuationSubmit
-        if isinstance(command, NativeContinuationReady):
-            from .native_continuations import acknowledge_ready
-            return await acknowledge_ready(self, command)
-        if isinstance(command, NativeContinuationRead):
-            from .native_continuations import read_continuation
-            return await read_continuation(self, command.request_id)
-        if isinstance(command, NativeContinuationSubmit):
-            return await self.continue_turn(command)
-        if isinstance(command, NativeHitlHistoryRead):
-            from .native_effects import read_hitl_history
-            return await read_hitl_history(self, command)
-        from .behavior_native_turn_wire import NativeReceivedRead
-        if isinstance(command, NativeReceivedRead):
-            from .native_received import read_received
-            return await read_received(self, command)
-        if isinstance(command, NativeProgressRead):
-            from .native_progress import read_progress
-            return await read_progress(self, command)
-        from .native_progress_wire import NativeTurnStatusRead
-        if isinstance(command, NativeTurnStatusRead):
-            return await self.turn_status(command)
-        if isinstance(command, (NativeAppend, NativeAppendRead)):
-            from .native_appends import append, read_append
-            return await (append(self, command) if isinstance(command, NativeAppend) else read_append(self, command))
-        if isinstance(command, NativeSessionRetarget):
-            from .native_environment import retarget_session
-            return await retarget_session(self, command)
-        from .native_skill_draft_wire import NativeSkillDraftIntentRead
-        from .native_image_wire import NativeImageRead, NativeImagesRead
-
-        if isinstance(command, (NativeImagesRead, NativeImageRead)):
-            from .native_images import read_image, read_images
-            return await (read_image(self, command) if isinstance(command, NativeImageRead) else read_images(self, command))
-        if isinstance(command, NativeSkillDraftIntentRead):
-            from .native_skill_draft import read_intent
-            return await read_intent(self, command)
-        from .behavior_user_images import NativeUserImageUpload
-        if isinstance(command, NativeUserImageUpload):
-            from .native_user_images import upload
-            return await upload(self, command)
-        if isinstance(command, NativeSessionFollow):
-            from .native_environment import follow_session
-            return await follow_session(self, command)
-        from .behavior_native_turn_wire import NativeSessionAbandon
-        if isinstance(command, NativeSessionAbandon):
-            from .native_environment_abandon import abandon_session
-            return await abandon_session(self, command)
-        from .behavior_native_turn_wire import NativeSessionCut
-        if isinstance(command, NativeSessionCut):
-            from .native_environment_cut import cut_session
-            return await cut_session(self, command)
-        from .behavior_native_turn_wire import NativeSessionWithdraw
-        if isinstance(command, NativeSessionWithdraw):
-            from .native_environment_cut import withdraw_session
-            return await withdraw_session(self, command)
-        from .behavior_native_turn_wire import NativeUnfinishedRead
-        if isinstance(command, NativeUnfinishedRead):
-            from .native_environment_abandon import unfinished_sessions
-            return await unfinished_sessions(self)
-        if isinstance(command, NativeSessionRead):
-            return await self.session_state(environment_request_id=command.environment_request_id,
-                                            workspace=command.workspace)
-        if isinstance(command, NativeSessionPrepare):
-            return await self.prepare_session(command)
-        if isinstance(command, NativeSubmit):
-            return await self.submit(command)
-        if isinstance(command, NativeAgentReceive):
-            return await self.receive(command)
-        if isinstance(command, NativeRoutineSubmit):
-            return await self.receive_routine(command)
-        if isinstance(command, NativeRead):
-            return await self._observed_read(command.request_id)
-        if isinstance(command, NativeConversationRead):
-            return await self.conversation(command.conversation_id)
-        if isinstance(command, NativeHistory):
-            return await self.history(command)
-        if isinstance(command, NativeResult):
-            return await self.result(command)
-        if isinstance(command, NativeCancel):
-            return await self.cancel(command)
-        if isinstance(command, NativeResponseNotStarted):
-            return await self.response_not_started(command)
-        if isinstance(command, NativeDelivered):
-            return await self.delivered(command)
-        if isinstance(command, NativeCandidateRead):
-            from .native_memory_candidate import read_candidate
-            return await read_candidate(self, command)
-        from .behavior_native_turn_wire import NativePrewarm
-        if isinstance(command, NativePrewarm):
-            return await self.prewarm(command)
-        from .behavior_native_turn_wire import NativeSessionCheckpointCheck, NativeSessionPrerestore
-        if isinstance(command, (NativeSessionCheckpointCheck, NativeSessionPrerestore)):
-            from .native_checkpoint_check import read_back
-            return await read_back(self, command)
-        raise Problem(422, "NATIVE_REQUEST_INVALID", "unknown native operation")
+        # The MRO walk keeps isinstance semantics: a subclass of a typed request reaches that request's handler.
+        handler = next((_HANDLERS[cls] for cls in type(command).__mro__ if cls in _HANDLERS), None)
+        if handler is None:
+            raise Problem(422, "NATIVE_REQUEST_INVALID", "unknown native operation")
+        return await handler(self, command)
 
     async def prewarm(self, command):
         """The owner is typing (README#typing-prewarm). Reaching this session already woke its compute (the platform
@@ -2747,6 +2735,54 @@ class NativeTurnRuntime:
         count = 0 if start is None else start(command.toolboxes)
         return NativePrewarmView(agent_id=self.identity.agent_id, hosted_session_id=self.identity.session_id,
                                  toolboxes=count)
+
+
+def _handler(module, name):
+    """The handler modules import this one, so each is imported when its first request arrives."""
+    return getattr(import_module(module, __package__), name)
+
+
+# One handler per typed native request in NativeRequest; test_native_turns checks the keys are exactly that union.
+_HANDLERS: dict[type, Callable[[NativeTurnRuntime, NativeRequest], Awaitable]] = {
+    NativeSessionFilesOmission: lambda rt, c: _handler(".native_files_omission", "confirm_omission")(rt, c),
+    NativeSessionFiles: lambda rt, c: _handler(".native_environment_files", "session_files")(rt, c),
+    NativeContinuationReady: lambda rt, c: _handler(".native_continuations", "acknowledge_ready")(rt, c),
+    NativeContinuationRead: lambda rt, c: _handler(".native_continuations", "read_continuation")(rt, c.request_id),
+    NativeContinuationSubmit: lambda rt, c: rt.continue_turn(c),
+    NativeHitlHistoryRead: lambda rt, c: _handler(".native_effects", "read_hitl_history")(rt, c),
+    NativeReceivedRead: lambda rt, c: _handler(".native_received", "read_received")(rt, c),
+    NativeProgressRead: lambda rt, c: _handler(".native_progress", "read_progress")(rt, c),
+    NativeTurnStatusRead: lambda rt, c: rt.turn_status(c),
+    NativeAppend: lambda rt, c: _handler(".native_appends", "append")(rt, c),
+    NativeAppendRead: lambda rt, c: _handler(".native_appends", "read_append")(rt, c),
+    NativeSessionRetarget: lambda rt, c: _handler(".native_environment", "retarget_session")(rt, c),
+    NativeImagesRead: lambda rt, c: _handler(".native_images", "read_images")(rt, c),
+    NativeImageRead: lambda rt, c: _handler(".native_images", "read_image")(rt, c),
+    NativeSkillDraftIntentRead: lambda rt, c: _handler(".native_skill_draft", "read_intent")(rt, c),
+    NativeUserImageUpload: lambda rt, c: _handler(".native_user_images", "upload")(rt, c),
+    NativeSessionFollow: lambda rt, c: _handler(".native_environment", "follow_session")(rt, c),
+    NativeSessionAbandon: lambda rt, c: _handler(".native_environment_abandon", "abandon_session")(rt, c),
+    NativeSessionCut: lambda rt, c: _handler(".native_environment_cut", "cut_session")(rt, c),
+    NativeSessionWithdraw: lambda rt, c: _handler(".native_environment_cut", "withdraw_session")(rt, c),
+    NativeUnfinishedRead: lambda rt, c: _handler(".native_environment_abandon", "unfinished_sessions")(rt),
+    NativeSessionRead: lambda rt, c: rt.session_state(environment_request_id=c.environment_request_id,
+                                                      workspace=c.workspace),
+    NativeSessionPrepare: lambda rt, c: rt.prepare_session(c),
+    NativeSubmit: lambda rt, c: rt.submit(c),
+    NativeAgentReceive: lambda rt, c: rt.receive(c),
+    NativeRoutineSubmit: lambda rt, c: rt.receive_routine(c),
+    NativeRead: lambda rt, c: rt._observed_read(c.request_id),
+    NativeConversationRead: lambda rt, c: rt.conversation(c.conversation_id),
+    NativeHistory: lambda rt, c: rt.history(c),
+    NativeResult: lambda rt, c: rt.result(c),
+    NativeCancel: lambda rt, c: rt.cancel(c),
+    NativeResponseNotStarted: lambda rt, c: rt.response_not_started(c),
+    NativeDelivered: lambda rt, c: rt.delivered(c),
+    NativeCandidateRead: lambda rt, c: _handler(".native_memory_candidate", "read_candidate")(rt, c),
+    NativePrewarm: lambda rt, c: rt.prewarm(c),
+    NativeSessionCheckpointCheck: lambda rt, c: _handler(".native_checkpoint_check", "read_back")(rt, c),
+    NativeSessionPrerestore: lambda rt, c: _handler(".native_checkpoint_check", "read_back")(rt, c),
+}
 
 
 async def native_response(request, runtime: NativeTurnRuntime | None, *, action="invoke"):

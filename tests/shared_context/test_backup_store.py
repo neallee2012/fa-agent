@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
-from unittest.mock import Mock
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
@@ -11,9 +9,8 @@ from azure.core.exceptions import ServiceRequestError, ServiceResponseError
 from azure.core.pipeline.transport import HttpResponse, HttpTransport
 from azure.core.utils import CaseInsensitiveDict
 from azure.storage.blob import ContainerClient
-from fastapi.testclient import TestClient
 
-from conftest import A, B, AUDIENCE, TENANT
+from conftest import A, B, TENANT
 from shared_context.auth import Actor
 from shared_context.backup_store import BlobBackupStore
 from shared_context.errors import Problem
@@ -144,53 +141,6 @@ def test_sdk_download_uses_the_exact_version_etag_and_bounded_range():
     assert get.headers["x-ms-range"] == "bytes=0-2"
     for request in (head, get):
         assert parse_qs(urlparse(request.url).query)["versionid"] == [VERSION]
-
-
-def test_production_backup_uses_existing_uami_without_startup_data_or_management_calls(monkeypatch):
-    import azure.storage.blob
-    import shared_context.production as production
-
-    values = {
-        "CONTEXT_TENANT_ID": TENANT, "CONTEXT_API_AUDIENCE": AUDIENCE,
-        "CONTEXT_ACTORS_JSON": json.dumps({A.oid: {"actor": A.actor, "team": A.team}}),
-        "CONTEXT_ISSUERS_JSON": json.dumps([f"https://sts.windows.net/{TENANT}/"]),
-        "CONTEXT_TABLE_ENDPOINT": "https://synthetic.table.core.windows.net",
-        "CONTEXT_TABLE_NAME": "workstate",
-        "CONTEXT_MEMORY_ENDPOINT": "https://synthetic.services.ai.azure.com/api/projects/poc",
-        "CONTEXT_MEMORY_STORE": "poc-team-memory",
-        "CONTEXT_BACKUP_BLOB_ENDPOINT": ENDPOINT, "CONTEXT_BACKUP_CONTAINER": CONTAINER,
-        "AZURE_CLIENT_ID": "00000000-0000-0000-0000-000000000027",
-    }
-    for key, value in values.items():
-        monkeypatch.setenv(key, value)
-    credential, table, project = Mock(), Mock(), Mock()
-    credential_factory = Mock(return_value=credential)
-    monkeypatch.setattr(production, "ManagedIdentityCredential", credential_factory)
-    monkeypatch.setattr(production, "TableClient", Mock(return_value=table))
-    monkeypatch.setattr(production, "AIProjectClient", Mock(return_value=project))
-    transport = BlobTransport([])
-    created = []
-
-    def container_factory(**kwargs):
-        created.append(kwargs)
-        return ContainerClient(**kwargs, transport=transport)
-
-    monkeypatch.setattr(azure.storage.blob, "ContainerClient", container_factory)
-    with TestClient(production.create_production_app()) as client:
-        assert client.get("/healthz").status_code == 200
-        response = client.put("/private-environments/backups/" + BACKUP_ID, content=b"abc")
-        assert response.status_code == 401
-        assert transport.requests == []
-        assert credential.method_calls == table.method_calls == project.method_calls == []
-    assert transport.closed
-    assert len(created) == 1
-    assert created[0]["account_url"] == ENDPOINT and created[0]["container_name"] == CONTAINER
-    assert created[0]["credential"] is credential
-    assert created[0]["retry_total"] == 0
-    assert created[0]["connection_timeout"] == 10 and created[0]["read_timeout"] == 20
-    credential_factory.assert_called_once_with(client_id=values["AZURE_CLIENT_ID"])
-    for resource in (credential, table, project):
-        resource.close.assert_called_once()
 
 
 @pytest.mark.parametrize("headers,code", [

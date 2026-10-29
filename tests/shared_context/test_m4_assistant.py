@@ -5,20 +5,15 @@ import asyncio
 import copy
 import hashlib
 import json
-import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from uuid import uuid4
 
-import httpx
 import pytest
 from pydantic import ValidationError
 
 from shared_context.errors import Problem
-from shared_context.hosted import HostedClient
 from shared_context.m2_assistant import AssistantCommand, AssistantEngine
 from shared_context.m2_copilot import ToolFailure
 from test_m2_assistant import AGENT, hosted_runtime
@@ -49,56 +44,6 @@ def command(action="start", **fields):
 def enabled(monkeypatch):
     monkeypatch.setenv("CONTEXT_M4_TOOLS_ENABLED", "true")
     monkeypatch.setenv("CONTEXT_M4_RUN_ID", RUN)
-
-
-@pytest.mark.parametrize("feature_enabled", [False, True], ids=["m4-disabled", "m4-enabled"])
-def test_fresh_hosted_import_rejects_api_table_auth_and_server_m4_dependencies(feature_enabled):
-    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    program = """
-import importlib.abc
-import os
-import sys
-sys.dont_write_bytecode = True
-sys.path.insert(0, sys.argv[1])
-os.environ['CONTEXT_M4_TOOLS_ENABLED'] = sys.argv[2]
-os.environ['CONTEXT_M4_RUN_ID'] = 'm4-context-01'
-os.environ['CONTEXT_M3_TOOLS_ENABLED'] = 'true'
-blocked = (
-    'azure.data', 'azure.storage', 'jwt', 'fastapi',
-    'shared_context.api', 'shared_context.auth', 'shared_context.service',
-    'shared_context.storage', 'shared_context.production',
-    'shared_context.m3_auth', 'shared_context.m3_artifacts', 'shared_context.m3_cli',
-    'shared_context.m4_context', 'shared_context.m4_api', 'shared_context.m4_config',
-)
-class BlockApiOnly(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if any(fullname == name or fullname.startswith(name + '.') for name in blocked):
-            raise AssertionError('Hosted imported an API-only dependency: ' + fullname)
-sys.meta_path.insert(0, BlockApiOnly())
-import shared_context.hosted
-import shared_context.m2_copilot
-from shared_context.m2_assistant import AssistantCommand, m4_enabled
-assert m4_enabled() == (sys.argv[2] == 'true')
-shared_context.hosted.ModelBudgetProbe(operation='model_budget', milestone='m4')
-shared_context.hosted.M4SeedProbe(fixture_id='short_team', suite_sha256='a' * 64)
-AssistantCommand.model_validate({
-    'operation': 'assistant', 'action': 'start',
-    'target_agent_id': '00000000-0000-0000-0000-00000000005d',
-    'run_id': 'm4-context-01-check', 'team': 'team-one', 'work': 'm4-context-01-work',
-    'prompt': 'Read current context.', 'input_text': '',
-    'evaluation_run_id': 'm4-context-01', 'require_checkpoint': True,
-})
-assert not any(fullname == name or fullname.startswith(name + '.')
-               for fullname in sys.modules for name in blocked)
-print('Hosted M4 client/SDK imports remain independent of API/Table/human-auth modules')
-"""
-    result = subprocess.run(
-        [sys.executable, "-X", "utf8", "-I", "-B", "-c", program, str(source),
-         "true" if feature_enabled else "false"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "independent of API/Table/human-auth" in result.stdout
 
 
 def status_until(engine, terminal=("completed", "failed", "incomplete")):
@@ -586,124 +531,3 @@ def test_oversized_context_never_satisfies_m4_read_requirement(tmp_path, monkeyp
     assert "usage" not in evidence and "usage_bindings" not in evidence
 
 
-@pytest.fixture
-def probe_client():
-    calls = []
-
-    def send(request):
-        calls.append((request.method, request.url.path, json.loads(request.content) if request.content else None))
-        return httpx.Response(403 if "/private/agent-b/" in request.url.path else 200,
-                              json={"synthetic_boundary": True})
-
-    http = httpx.Client(transport=httpx.MockTransport(send))
-    client = HostedClient(
-        ContextBoundary.api_url, ContextBoundary.api_audience, "https://example.table.core.windows.net", "workstate",
-        "https://example.services.ai.azure.com/api/projects/poc", "synthetic-memory",
-        SimpleNamespace(get_token=lambda _scope: SimpleNamespace(token="synthetic-token")), http,
-    )
-    yield client, calls
-    http.close()
-
-
-@pytest.mark.parametrize("method,path,body", [
-    ("GET", f"/m4/teams/team-one/works/{WORK}/context", None),
-    ("POST", "/m4/teams/team-one/memory/seed", {"fixture_id": "short_team", "suite_sha256": FIXTURE_HASH}),
-    ("GET", "/m4/teams/team-one/memory/operations/" + "a" * 32, None),
-    ("POST", "/m4/teams/team-one/memory/private/agent-a/search", {"query": "Project Lyra"}),
-    ("POST", "/m4/teams/team-one/memory/private/agent-b/search", {"query": "Project Lyra"}),
-])
-def test_m4_probe_exact_paths_require_flag_and_bound_run(probe_client, monkeypatch, method, path, body):
-    client, calls = probe_client
-    payload = {"operation": "api", "method": method, "path": path, "body": body}
-    monkeypatch.delenv("CONTEXT_M4_TOOLS_ENABLED", raising=False)
-    monkeypatch.delenv("CONTEXT_M4_RUN_ID", raising=False)
-    for flag, run in ((None, None), ("true", "other-run"), ("false", RUN)):
-        if flag is not None:
-            monkeypatch.setenv("CONTEXT_M4_TOOLS_ENABLED", flag)
-            monkeypatch.setenv("CONTEXT_M4_RUN_ID", run)
-        with pytest.raises(Problem):
-            client.dispatch(payload)
-    assert calls == []
-    enabled(monkeypatch)
-    result = client.dispatch(payload)["outcome"]
-    assert calls == [(method, path, body)]
-    assert result["http_status"] == (403 if "/agent-b/" in path else 200)
-
-
-@pytest.mark.parametrize("path", [
-    "/m4/teams/team-one/works/one", "/m4/teams/team-one/works/one/publish",
-    "/m4/teams/team-one/artifacts/report", "/m4/teams/team-one/memory/team",
-    "/m4/teams/team-one/memory/team/search", "/m4/teams/team-one/memory/private/agent-a",
-    "/m4/teams/team-one/memory/seed/anything", "/m4/teams/team-one/memory/operations/" + "G" * 32,
-    "/m4/teams/team-one/memory/operations/" + "a" * 31,
-    "/m4/teams/team-one/works/one/context?extra=true", "/m4/teams/team-one/works/../context",
-    "/m4/model/v1/budget", "/m4/model/v1/chat/completions",
-])
-def test_m4_probe_does_not_expand_legacy_allowlists(probe_client, monkeypatch, path):
-    enabled(monkeypatch)
-    client, calls = probe_client
-    with pytest.raises(Problem):
-        client.dispatch({"operation": "api", "method": "GET", "path": path})
-    assert calls == []
-
-
-@pytest.mark.parametrize("body", [
-    None, {}, {"fixture_id": "arbitrary", "suite_sha256": FIXTURE_HASH},
-    {"fixture_id": "private_a", "suite_sha256": "invalid"},
-    {"fixture_id": "short_team", "suite_sha256": FIXTURE_HASH, "items": ["unrestricted upload"]},
-    {"fixture_id": "private_b", "suite_sha256": FIXTURE_HASH, "actor": "agent-a"},
-])
-def test_m4_seed_body_is_strict(probe_client, monkeypatch, body):
-    enabled(monkeypatch)
-    client, calls = probe_client
-    with pytest.raises(Problem):
-        client.dispatch({"operation": "api", "method": "POST", "path": "/m4/teams/team-one/memory/seed", "body": body})
-    assert calls == []
-
-
-@pytest.mark.parametrize("fixture", ["short_team", "long_team", "private_a", "private_b"])
-def test_m4_probe_transports_only_named_fixture_seeds(probe_client, monkeypatch, fixture):
-    enabled(monkeypatch)
-    client, calls = probe_client
-    body = {"fixture_id": fixture, "suite_sha256": FIXTURE_HASH}
-    client.dispatch({"operation": "api", "method": "POST", "path": "/m4/teams/team-one/memory/seed", "body": body})
-    assert calls == [("POST", "/m4/teams/team-one/memory/seed", body)]
-
-
-@pytest.mark.parametrize("method,path,extra", [
-    ("POST", f"/m4/teams/team-one/works/{WORK}/context", {}),
-    ("PATCH", "/m4/teams/team-one/memory/seed", {}),
-    ("GET", "/m4/teams/team-one/memory/private/agent-a/search", {}),
-    ("GET", f"/m4/teams/team-one/works/{WORK}/context", {"body": {}}),
-    ("GET", f"/m4/teams/team-one/works/{WORK}/context", {"etag": '"one"'}),
-])
-def test_m4_probe_rejects_wrong_method_body_or_etag(probe_client, monkeypatch, method, path, extra):
-    enabled(monkeypatch)
-    client, calls = probe_client
-    with pytest.raises(Problem):
-        client.dispatch({"operation": "api", "method": method, "path": path, **extra})
-    assert calls == []
-
-
-def test_model_budget_and_legacy_probes_keep_explicit_milestone_gates(probe_client, monkeypatch):
-    client, calls = probe_client
-    monkeypatch.delenv("CONTEXT_M4_TOOLS_ENABLED", raising=False)
-    monkeypatch.delenv("CONTEXT_M3_TOOLS_ENABLED", raising=False)
-    client.dispatch({"operation": "model_budget"})
-    with pytest.raises(Problem):
-        client.dispatch({"operation": "model_budget", "milestone": "m4"})
-    enabled(monkeypatch)
-    client.dispatch({"operation": "model_budget", "milestone": "m4"})
-    with pytest.raises(Problem):
-        client.dispatch({"operation": "model_budget", "milestone": "m3"})
-    monkeypatch.setenv("CONTEXT_M3_TOOLS_ENABLED", "true")
-    client.dispatch({"operation": "model_budget", "milestone": "m3"})
-    with pytest.raises(Problem):
-        client.dispatch({"operation": "model_budget", "milestone": "m5"})
-    assert [path for _, path, _ in calls] == [
-        "/model/v1/budget", "/m4/model/v1/budget", "/m3/model/v1/budget",
-    ]
-    client.dispatch({"operation": "api", "method": "GET", "path": "/teams/team-one/works/legacy/context"})
-    client.dispatch({"operation": "api", "method": "GET", "path": "/teams/team-one/artifacts/legacy"})
-    assert calls[-2][1] == "/teams/team-one/works/legacy/context"
-    assert calls[-1][1] == "/teams/team-one/artifacts/legacy"

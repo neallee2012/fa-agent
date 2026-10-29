@@ -292,33 +292,3 @@ def test_positive_platform_proof_cannot_be_relabelled_as_a_success_result(recove
     with pytest.raises(Problem):
         verify_platform_stop(service.native, launch, changed, proof_row)
     assert len(calls) == 1
-
-
-def test_signed_operator_http_has_no_business_entry_or_client_supplied_stop_proof(recovery):
-    from fastapi.testclient import TestClient
-    from shared_context.behavior_recovery_api import create_recovery_app
-    h, service, _, calls = recovery
-    composition = SimpleNamespace(
-        config=service.config, verifier=h.verifier, installation=lambda: None, close=lambda: None,
-        _peer_router=None, _peers={}, assistant=None,
-        runtime=SimpleNamespace(dep=SimpleNamespace(native_launches=service.native, delivery=h.dep.delivery),
-                                clock=lambda: h.time),
-    )
-    with TestClient(create_recovery_app(composition, service.scope, stop=service.stop)) as client:
-        base = "/operator/v1/sdk-recovery"
-        assert client.post(base + "/plan", json={}).status_code == 401
-        assert client.post(base + "/plan", json={"clock": "override"}, headers=h.headers("human")).status_code == 422
-        plan = client.post(base + "/plan", json={}, headers=h.headers("human"))
-        assert plan.status_code == 200, plan.text
-        auth = client.post(base + "/authorize", json={"plan": plan.json(), "decision_id": "signed-cancel"},
-                           headers=h.headers("human"))
-        assert auth.status_code == 200, auth.text
-        assert client.post(base + "/execute", json={**auth.json(), "stop_receipt": {}},
-                           headers=h.headers("human")).status_code == 422
-        result = client.post(base + "/execute", json=auth.json(), headers=h.headers("human"))
-        assert result.status_code == 200, result.text
-        assert result.json()["state"] == "cancelled" and result.json()["delivered"] is False
-        assert client.post("/behavior/v1/bindings/binding-one/assistant/submit", json={},
-                           headers=h.headers("human")).status_code == 404
-        assert client.get("/healthz").json()["models"] == "DISABLED"
-    assert len(calls) == 1

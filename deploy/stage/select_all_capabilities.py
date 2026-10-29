@@ -41,7 +41,6 @@ selection, a new native conversation uses the completions lane, where reasoning 
 """
 import argparse
 import json
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,7 +55,7 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
-from deployment_config import config_path, load_config  # noqa: E402
+from deployment_config import config_path, load_config, write_x as _write_x  # noqa: E402
 
 STAGE = json.loads((HERE / "stage.json").read_text(encoding="utf-8"))
 DEFAULTS = STAGE["conversation_defaults"]
@@ -127,13 +126,6 @@ def load_initial_template(path):
         raise SystemExit(f"cannot read initial template {path}: {error}") from None
     except ValidationError:
         raise SystemExit(f"{path} is not a valid fa-agent-template-v1 template") from None
-
-
-def _write_x(path, value):
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=1)
-        stream.flush()
-        os.fsync(stream.fileno())
 
 
 def _same(left, right):

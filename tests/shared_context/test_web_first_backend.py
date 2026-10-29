@@ -96,62 +96,42 @@ def web_handoff_for(stopped):
     return OriginalFailureWebHandoff(c.parent,scope,observation,lambda:observation,original_scope=old.scope)
 
 
-
-
-
-
-def test_web_handoff_http_and_late_contract_changes_deny(stopped_original,monkeypatch):
-    import copy,json
-    from fastapi.testclient import TestClient
-    from shared_context.behavior_web_handoff_api import create_handoff_app
-    from shared_context.behavior_web_handoff import handoff_key
-    from shared_context.behavior_operations import control_key
-    from shared_context.behavior_assistant import key
-    from shared_context.behavior_delivery import _update
+def test_web_handoff_authorize_denies_changed_plan(stopped_original):
     from shared_context.errors import Problem
-    from test_m3_auth import token
-    from test_behavior_settlement import write
-    c,old,original,stops=stopped_original
+    c,_,_,_=stopped_original
     service=web_handoff_for(stopped_original)
-    app=create_handoff_app(c.parent,service.scope,observation=service.observation,
-        current_observation=service.current_observation,original_scope=old.scope)
-    api=TestClient(app)
-    identity=c.config.identity
-    claims={"tid":identity.tenant_id,"iss":f"https://sts.windows.net/{identity.tenant_id}/","aud":identity.audience,
-        "oid":identity.human_oid,"appid":identity.admin_client_id,"scp":"Behavior.Read"}
-    read={"Authorization":"Bearer "+token(c.h.c.signing_key,claims)}
-    approve={"Authorization":"Bearer "+token(c.h.c.signing_key,{**claims,"scp":"Behavior.Read Behavior.Approve"})}
-    prefix="/operator/v1/original-failure-web"
-    assert api.post(prefix+"/preview",json={},headers=read).status_code==403
-    for field in ("oid","tid","appid"):
-        assert api.post(prefix+"/preview",json={},headers={"Authorization":"Bearer "+
-            token(c.h.c.signing_key,{**claims,field:"wrong","scp":"Behavior.Read Behavior.Approve"})}).status_code in (401,403)
-    for action in ("execute","stop","claim","acquire","model"):
-        assert api.post(prefix+"/"+action,json={},headers=approve).status_code==404
     before=c.store.read_inventory()
     plan=service.preview(c.principal)
     for changes in ({"original_route":plan.original_route.model_copy(update={"recipient_id":"other"})},
                     {"code_sha256":"a"*64},{"payload":plan.payload.model_copy(update={"data":b"arbitrary"})}):
         with pytest.raises(Problem):service.authorize(c.principal,plan.model_copy(update=changes),"not-exact")
         assert c.store.read_inventory()==before
-    result=api.post(prefix+"/authorize",json={"plan":plan.model_dump(mode="json"),"decision_id":"offline-web-approved"},headers=approve)
-    assert result.status_code==200,result.text
-    path="/web/v1/original-failure/"+service.scope.handoff_id
-    assert api.get(path+"/status",headers=read).json()["confirmed_levels"]==[]
+
+
+def test_web_handoff_fetch_denies_late_contract_changes(stopped_original):
+    import copy
+    from shared_context.behavior_operations import control_key
+    from shared_context.behavior_assistant import key
+    from shared_context.behavior_foundry import native_key
+    from shared_context.errors import Problem
+    from test_behavior_settlement import write
+    c,_,_,stops=stopped_original
+    service=web_handoff_for(stopped_original)
+    plan=service.preview(c.principal)
+    service.authorize(c.principal,plan,"offline-web-approved")
     backing=c.transport.backing
     baseline,sequence,time=copy.deepcopy(backing.rows),backing.sequence,c.clock[0]
+    restore=service.current_observation
     for fault in ("owner","late-model","late-acquire","late-result","late-claim","route","unknown-row","scope-expired","observer"):
         backing.rows,backing.sequence,c.clock[0]=copy.deepcopy(baseline),sequence,time
-        probe=app.state.handoff
-        probe.current_observation=service.current_observation
-        if fault=="scope-expired":c.clock[0]=probe.scope.expires_at
-        elif fault=="observer":probe.current_observation=lambda:probe.observation.model_copy(update={"deployment_sha256":"c"*64})
+        service.current_observation=restore
+        if fault=="scope-expired":c.clock[0]=service.scope.expires_at
+        elif fault=="observer":service.current_observation=lambda:service.observation.model_copy(update={"deployment_sha256":"c"*64})
         else:
             sid=c.supervisor.clients[c.launch_id].assignment.session_id
             rid={"owner":control_key("owner",c.work.binding.owner.owner_record_id),
                 "late-model":key("model-intent",sid,"e"*64),"late-acquire":key("session",sid),
-                "late-result":key("result",c.work.binding.work.work_id),
-                "late-claim":__import__("shared_context.behavior_foundry",fromlist=["native_key"]).native_key("launch",c.launch_id),
+                "late-result":key("result",c.work.binding.work.work_id),"late-claim":native_key("launch",c.launch_id),
                 "route":control_key("teams-route",c.config.channels.route_id),"unknown-row":"unexpected-web-row"}[fault]
             row=c.store.read_snapshot((rid,))[rid]
             data=({"request_sha256":"e"*64,"consumed":False} if fault=="late-model" else {"unknown":True} if row is None
@@ -159,41 +139,13 @@ def test_web_handoff_http_and_late_contract_changes_deny(stopped_original,monkey
                         else {"aad_object_id":"other"} if fault=="route" else {"epoch":2})})
             write(c.store,rid,data)
         frozen=c.store.read_inventory()
-        response=api.post(path+"/fetch",json={"request_id":"exact-web-original"},headers=read)
-        assert response.status_code>=400,(fault,response.text)
-        assert c.store.read_inventory()==frozen
+        with pytest.raises(Problem):service.fetch(c.principal,Command(request_id="exact-web-original"))
+        assert c.store.read_inventory()==frozen,fault
     backing.rows,backing.sequence,c.clock[0]=copy.deepcopy(baseline),sequence,time
-    app.state.handoff.current_observation=service.current_observation
-    fetched=api.post(path+"/fetch",json={"request_id":"exact-web-original"},headers=read)
-    assert fetched.status_code==200,fetched.text
-    assert fetched.content==plan.payload.data and fetched.headers["X-Behavior-Confirmation-Level"]=="client_received"
-    assert api.get(path+"/status",headers=read).json()["fulfillment"]=="pending"
-    assert api.post(path+"/fetch",json={"request_id":"restarted-client"},headers=read).headers["X-Behavior-Exchange"]==fetched.headers["X-Behavior-Exchange"]
-    with pytest.raises(Problem):service.preview(c.principal)
-    import base64,os
-    acknowledged=api.post(path+"/acknowledge",json={
-        "request_id":"same-original-client-ACK","exchange_id":fetched.headers["X-Behavior-Exchange"],
-        "acknowledgment_token":fetched.headers["X-Behavior-Ack-Token"],
-        "binding":json.loads(base64.urlsafe_b64decode(fetched.headers["X-Behavior-Binding"])),
-        "confirmation_level":"client_received"},headers=read)
-    assert acknowledged.status_code==200,acknowledged.text
-    body=acknowledged.json()
-    assert set(body)=={"result","control_request_id","control_request_digest"}
-    assert body["result"]["confirmed_levels"]==["client_received"]
-    original_receipt=c.store.read_inventory().receipts[body["control_request_id"]]
-    assert body["control_request_digest"]==original_receipt.payload["request"]["request_digest"]
-    assert api.get(path+"/status",headers=read).json()["fulfilled"] is True
-    if output:=os.environ.get("WEB_HANDOFF_SHAPES"):
-        from pathlib import Path
-        Path(output.replace("-shapes.json","-http-proof.json")).write_text(json.dumps({
-            "actual_environment":"NOT_RUN","response":body,"request":original_receipt.payload["request"],
-            "write_set":original_receipt.payload["writes"],"binding":plan.web_delivery.model_dump(mode="json"),
-            "payload_sha256":plan.payload.sha256,"same_read_only_human_JWT":True},indent=2),encoding="utf-8")
-    c.clock[0]=service.scope.expires_at
-    assert api.post(path+"/fetch",json={"request_id":"expired"},headers=read).status_code==403
-    assert api.get(path+"/status",headers=read).json()["expired"] is True
+    service.current_observation=restore
+    # positive control: the faults, not a broken fetch, caused the denials above
+    assert service.fetch(c.principal,Command(request_id="exact-web-original")).payload==plan.payload.data
     assert c.sends==[] and len(stops)==1
-    print("same_human_JWT/readonly_UI; arbitrary_plan/owner/orphan_model/acquire/result/route/unknown/expiry/observer denied; fetch_not_fulfilled")
 
 
 def test_web_handoff_all_ackloss_restart_original_only(stopped_original,monkeypatch):

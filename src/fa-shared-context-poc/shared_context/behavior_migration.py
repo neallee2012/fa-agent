@@ -14,6 +14,7 @@ import inspect
 import json
 import copy
 import logging
+import re
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -40,7 +41,7 @@ from .behavior_store import (
     _execution_owner,
 )
 from .errors import Problem
-from .models import Identifier, StrictModel
+from .models import ID_PATTERN, Identifier, StrictModel
 from .records import Record
 from .source_materials import (
     InventoryProtectionVerifier, NoAutoGCConfiguration, SourceEvent, SourceHead, SourcePlan,
@@ -342,9 +343,10 @@ class MigrationStore(BehaviorStore):
             raise Problem(502, "BEHAVIOR_PROTOCOL_ERROR", "inventory omitted its authority guard")
         if log_capacity:
             # Use the API's configured INFO sink without enabling other SDK loggers.
+            # bytes_pct is of the bound this read enforced; the field name stays for existing log searches.
             logging.getLogger("uvicorn.error").info(
                 "BEHAVIOR_INVENTORY_READ bytes=%d entities=%d bytes_pct_of_default=%.2f entities_pct_of_default=%.2f",
-                size, len(hashes), 100 * size / DEFAULT_INVENTORY_MAX_BYTES,
+                size, len(hashes), 100 * size / max_bytes,
                 100 * len(hashes) / DEFAULT_INVENTORY_MAX_ENTITIES,
             )
         return AuthorityInventory(self._scope, Record(guard.model_dump(mode="json"), guard_etag),
@@ -545,15 +547,41 @@ def _receipt(inventory, request):
     return record
 
 
+def origin_pointer_keys(domain: str) -> tuple[str, str, str, str, str]:
+    """The pointers installed_origin dispatches on, in its order; a fresh installation has none after the first."""
+    from .behavior_fresh_installation import fresh_key
+    from .behavior_work_policy import work_policy_key
+    return (fresh_key(domain), work_policy_key("current", domain), migration_key(domain, "current"),
+            control_key("runtime-transition-current", domain), control_key("runtime-rotation-current", domain))
+
+
+def installed_origin_pins(store: MigrationStore, config: ServerConfiguration) -> dict[str, str | None] | None:
+    """Key reads only: None unless installed_origin dispatches to the standing-policy origin, the one kind that reads
+    the whole partition (read_inventory(max_entities=None)); else the hash of each pointer and named history row."""
+    from .behavior_channels_migration import channel_key
+    from .behavior_runtime_transition import _payload_hash
+    domain = config.table.scope.authority_domain
+    pointers = origin_pointer_keys(domain)
+    rows = store.read_snapshot((*pointers, channel_key("current", domain)))
+    if rows[pointers[0]] is not None or rows[pointers[1]] is None:
+        return None
+    # A name that is not a row key is hashed only in its pointer, so the full check refuses it with its own code.
+    named = {value for row in rows.values() if row is not None
+             for value in (row.payload["data"].get("history_key"), row.payload["data"].get("history_id"))
+             if isinstance(value, str) and re.fullmatch(ID_PATTERN, value)}
+    if named:
+        rows.update(store.read_snapshot(tuple(sorted(named))))
+    return {key: None if row is None else _payload_hash(row.payload) for key, row in rows.items()}
+
+
 def installed_origin(store: MigrationStore, config: ServerConfiguration) -> ServerConfiguration:
     """Verify exact immutable lineage; the original atomic probe is not rerun."""
-    from .behavior_fresh_installation import fresh_key, installed_fresh_origin
+    from .behavior_fresh_installation import installed_fresh_origin
     store._verified_fresh_initialization = None
-    initial = fresh_key(config.table.scope.authority_domain)
+    initial, current_work_policy, current_key, transition_key, rotation_key = origin_pointer_keys(
+        config.table.scope.authority_domain)
     if store.read_snapshot((initial,))[initial] is not None:
         return installed_fresh_origin(store, config)
-    from .behavior_work_policy import work_policy_key
-    current_work_policy=work_policy_key("current",config.table.scope.authority_domain)
     if store.read_snapshot((current_work_policy,))[current_work_policy] is not None:
         from .behavior_work_policy_installation import installed_work_policy_origin
         return installed_work_policy_origin(store,config)
@@ -561,9 +589,6 @@ def installed_origin(store: MigrationStore, config: ServerConfiguration) -> Serv
         from .behavior_channels_migration import installed_channels_origin
         return installed_channels_origin(store, config)
     key, expected = installation_record(config)
-    current_key = migration_key(config.table.scope.authority_domain, "current")
-    transition_key = control_key("runtime-transition-current", config.table.scope.authority_domain)
-    rotation_key = control_key("runtime-rotation-current", config.table.scope.authority_domain)
     rows = store.read_snapshot((key, current_key, transition_key, rotation_key, *protection_keys(config)))
     if rows[key] is None or rows[key].payload["data"] != expected:
         raise Problem(503, "BEHAVIOR_CONFIGURATION", "operator-approved installation differs")

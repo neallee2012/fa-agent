@@ -36,6 +36,9 @@ _OWNER = (*_APPROVE, NativeHitlAnswer, ConnectorConsentDecision)
 _WAITS = (NativeHitlPendingCreate, NativeHitlQuestionCreate, ConnectorConsentCreate)
 # The Agent's own idempotent closing writes: re-running a lost apply cannot grant, decide or restart anything.
 _REAPPLY = (NativeHitlEnd, NativeHitlClose)
+# The states an Agent's close may replace, and with which observation; a still-pending effect_unknown also
+# needs a saved authorization.
+_CLOSES = {"pending": {"expired", "interrupted"}, "allow": {"expired", "interrupted", "effect_unknown"}}
 
 
 class _Scope(WireModel):
@@ -144,6 +147,10 @@ def _record(rows, key, model):
     if record is None:
         raise Problem(404, "NATIVE_HITL_NOT_FOUND", "the original approval record is unavailable")
     return _parse(record.payload["data"], model)
+
+
+def _team_scope(principal):
+    return dict(tenant_id=principal.tenant_id, team_id=principal.team)
 
 
 def _unknown():
@@ -448,7 +455,7 @@ class NativeHitlService:
             else:
                 current[found] = NativeHitlRule(rule_id=rule_id, **rule.model_dump())
         revision = rules.revision + 1
-        scope = dict(tenant_id=principal.tenant_id, team_id=principal.team)
+        scope = _team_scope(principal)
         snapshot = _RulesSnapshot(**scope, revision=revision, rules=tuple(current), intent_id=intent_id)
         return (
             _write(self._snapshot_key(principal, revision), snapshot, "create"),
@@ -648,137 +655,157 @@ class NativeHitlService:
         self._authorize(principal, owner=isinstance(command, _OWNER), write=True, rows=rows,
                         approve=isinstance(command, _APPROVE))
         now = self._now()
-        scope = dict(tenant_id=principal.tenant_id, team_id=principal.team)
         result = {"request_id": command.request_id, "kind": command.kind,
                   "purpose": "readback-only-not-execution-permission"}
-        if isinstance(command, NativeHitlEnd):
-            self._agent(principal, command.turn)
-            key, index = self._index(principal, command.turn, rows)
-            closed = index.model_copy(update={"closed": True})
-            return ControlChanges(
-                writes=(_write(key, closed, "create" if rows[key] is None else "replace"),),
-                result={**result, "turn": command.turn.model_dump(mode="json"), "closed": True})
-        if isinstance(command, NativeHitlRuleChange):
-            rules = self._version(principal, command, rows)
-            writes, revision, rule_id = self._rule_writes(
-                principal, rules, intent.intent_id, operation=command.operation, rule_id=command.rule_id, rule=command.rule)
-            return ControlChanges(writes=writes, result={**result, "rules_revision": revision, "rule_id": rule_id})
-        if isinstance(command, NativeHitlPendingCreate):
-            self._agent(principal, command.action.call)
-            rules = self._version(principal, command, rows)
-            ikey, index = self._index(principal, self._turn(command.action.call), rows)
-            if index.closed:
-                raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn no longer has a live approval wait")
-            if not set(command.review.matched_rule_ids) <= {rule.rule_id for rule in rules.rules}:
-                raise Problem(409, "NATIVE_HITL_RULES_CHANGED", "reviewed rule IDs must exist in the current revision")
-            pid = pending_id(principal.tenant_id, principal.team, command.action.call)
-            if command.action.category == "routine":
-                # The card shows the draft an owner's allow writes; only a valid draft that asks the owner is a card.
-                if command.review.source != "default":
-                    raise Problem(422, "NATIVE_HITL_INVALID_REQUEST", "a routine proposal always asks the owner directly")
-                try:
-                    routine_proposal_change(command.action, pid)
-                except Problem:
-                    raise Problem(422, "NATIVE_HITL_INVALID_REQUEST", "the routine proposal draft is invalid") from None
-            akey = hitl_key("authorization", principal.tenant_id, principal.team, pid)
-            if rows[pid] is not None or rows[akey] is not None:
-                raise Problem(409, "NATIVE_HITL_CALL_EXISTS", "read the original pending call; never restart its wait")
-            pending = NativeHitlPending(
-                **scope, pending_id=pid, agent_oid=principal.oid, command=command,
-                created_at=intent.created_at, expires_at=intent.expires_at)
-            if now >= pending.expires_at:
-                raise Problem(410, "NATIVE_HITL_EXPIRED", "the original waiting window has expired")
-            state = _State(**scope, pending_id=pid, status="pending")
-            return ControlChanges(writes=(
-                *material_writes(pid, pending),
-                _write(hitl_key("state", principal.tenant_id, principal.team, pid), state, "create"),
-                _write(ikey, index.model_copy(update={"pending_ids": (*index.pending_ids, pid)}),
-                       "create" if rows[ikey] is None else "replace"),
-            ), result={**result, "pending_id": pid, "pending_digest": pending.sha256, "status": "pending"})
-        if isinstance(command, NativeHitlAuthorize):
-            return self._authorize_effect(principal, intent, rows, now, result)
-        if isinstance(command, NativeHitlQuestionCreate):
-            call = command.question.call
-            self._agent(principal, call)
-            ikey, index = self._index(principal, self._turn(call), rows)
-            if index.closed:
-                raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn no longer has a live question wait")
-            qid = question_id(principal.tenant_id, principal.team, call)
-            if rows[qid] is not None:
-                raise Problem(409, "NATIVE_HITL_CALL_EXISTS", "read the original question; never restart its wait")
-            pending = NativeHitlQuestionPending(
-                **scope, question_id=qid, agent_oid=principal.oid, command=command,
-                created_at=intent.created_at, expires_at=intent.expires_at)
-            if now >= pending.expires_at:
-                raise Problem(410, "NATIVE_HITL_EXPIRED", "the original waiting window has expired")
-            return ControlChanges(writes=(
-                _write(qid, pending, "create"),
-                _write(ikey, index.model_copy(update={"question_ids": (*index.question_ids, qid)}),
-                       "create" if rows[ikey] is None else "replace"),
-            ), result={**result, "question_id": qid, "question_digest": pending.sha256, "status": "pending"})
-        if isinstance(command, ConnectorConsentCreate):
-            call = command.consent.call
-            self._agent(principal, call)
-            ikey, index = self._index(principal, self._turn(call), rows)
-            if index.closed:
-                raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn no longer has a live Connect wait")
-            cid = consent_id(principal.tenant_id, principal.team, call)
-            if rows[cid] is not None:
-                raise Problem(409, "NATIVE_HITL_CALL_EXISTS", "read the original Connect card; never restart its wait")
-            if rows[self._declined_key(principal, call, command.consent.toolbox_name)] is not None:
-                raise Problem(409, "NATIVE_HITL_HUMAN_DENIED", "the owner declined this connector in this conversation")
-            pending = ConnectorConsentPending(
-                **scope, consent_id=cid, agent_oid=principal.oid, command=command,
-                created_at=intent.created_at, expires_at=intent.expires_at)
-            if now >= pending.expires_at:
-                raise Problem(410, "NATIVE_HITL_EXPIRED", "the original waiting window has expired")
-            return ControlChanges(writes=(
-                _write(cid, pending, "create"),
-                _write(ikey, index.model_copy(update={"consent_ids": (*index.consent_ids, cid)}),
-                       "create" if rows[ikey] is None else "replace"),
-            ), result={**result, "consent_id": cid, "consent_digest": pending.sha256, "status": "pending"})
-        if isinstance(command, ConnectorConsentDecision):
-            consent = self._consent(principal, command.consent_id, rows)
-            if command.consent_digest != consent.sha256:
-                raise Problem(409, "NATIVE_HITL_ACTION_CHANGED", "the click must name the original complete Connect card")
-            dkey = hitl_key("consent-decision", principal.tenant_id, principal.team, consent.consent_id)
-            if rows[dkey] is not None:
-                raise Problem(409, "NATIVE_HITL_STATE_CONFLICT", "the original Connect card already has its one click")
-            if now >= consent.expires_at:
-                raise Problem(410, "NATIVE_HITL_EXPIRED", "an expired Connect card cannot resume")
-            _, index = self._index(principal, self._turn(consent.command.consent.call), rows)
-            if index.closed:
-                raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn has ended")
-            decision = _ConsentDecision(**scope, consent_id=consent.consent_id, owner_oid=principal.oid, command=command)
-            writes = [_write(dkey, decision, "create")]
-            if command.choice == "decline":
-                asked = consent.command.consent
-                mkey = self._declined_key(principal, asked.call, asked.toolbox_name)
-                if rows[mkey] is None:  # an earlier decline in this conversation keeps its row
-                    writes.append(_write(mkey, _ConsentDeclined(
-                        **scope, agent_id=asked.call.agent_id, conversation_id=asked.call.conversation_id,
-                        toolbox_name=asked.toolbox_name, consent_id=consent.consent_id, owner_oid=principal.oid,
-                        created_at=now), "create"))
-            return ControlChanges(writes=tuple(writes), result={
-                **result, "consent_id": consent.consent_id, "status": command.choice})
-        if isinstance(command, NativeHitlAnswer):
-            question = self._question(principal, command.question_id, rows)
-            if command.question_digest != question.sha256:
-                raise Problem(409, "NATIVE_HITL_QUESTION_CHANGED", "the answer must name the original complete question")
-            akey = hitl_key("answer", principal.tenant_id, principal.team, question.question_id)
-            if rows[akey] is not None:
-                raise Problem(409, "NATIVE_HITL_STATE_CONFLICT", "the original question already has its one answer")
-            if now >= question.expires_at:
-                raise Problem(410, "NATIVE_HITL_EXPIRED", "an expired question cannot receive a new answer")
-            _, index = self._index(principal, self._turn(question.command.question.call), rows)
-            if index.closed:
-                raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original SDK wait has ended")
-            asked = question.command.question
-            if command.was_freeform and not asked.allow_freeform or not command.was_freeform and command.answer not in asked.choices:
-                raise Problem(422, "NATIVE_HITL_ANSWER_INVALID", "pick one of the original choices or a permitted own reply")
-            answer = _QuestionAnswer(**scope, question_id=question.question_id, owner_oid=principal.oid, command=command)
-            return ControlChanges(writes=(_write(akey, answer, "create"),), result={
-                **result, "question_id": question.question_id, "status": "answered"})
+        return self._CHANGES[type(command)](self, principal, intent, rows, now, result)
+
+    def _end_changes(self, principal, intent, rows, now, result):
+        command = intent.command
+        self._agent(principal, command.turn)
+        key, index = self._index(principal, command.turn, rows)
+        closed = index.model_copy(update={"closed": True})
+        return ControlChanges(
+            writes=(_write(key, closed, "create" if rows[key] is None else "replace"),),
+            result={**result, "turn": command.turn.model_dump(mode="json"), "closed": True})
+
+    def _rule_changes(self, principal, intent, rows, now, result):
+        command = intent.command
+        rules = self._version(principal, command, rows)
+        writes, revision, rule_id = self._rule_writes(
+            principal, rules, intent.intent_id, operation=command.operation, rule_id=command.rule_id, rule=command.rule)
+        return ControlChanges(writes=writes, result={**result, "rules_revision": revision, "rule_id": rule_id})
+
+    def _pending_changes(self, principal, intent, rows, now, result):
+        command = intent.command
+        scope = _team_scope(principal)
+        self._agent(principal, command.action.call)
+        rules = self._version(principal, command, rows)
+        ikey, index = self._index(principal, self._turn(command.action.call), rows)
+        if index.closed:
+            raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn no longer has a live approval wait")
+        if not set(command.review.matched_rule_ids) <= {rule.rule_id for rule in rules.rules}:
+            raise Problem(409, "NATIVE_HITL_RULES_CHANGED", "reviewed rule IDs must exist in the current revision")
+        pid = pending_id(principal.tenant_id, principal.team, command.action.call)
+        if command.action.category == "routine":
+            # The card shows the draft an owner's allow writes; only a valid draft that asks the owner is a card.
+            if command.review.source != "default":
+                raise Problem(422, "NATIVE_HITL_INVALID_REQUEST", "a routine proposal always asks the owner directly")
+            try:
+                routine_proposal_change(command.action, pid)
+            except Problem:
+                raise Problem(422, "NATIVE_HITL_INVALID_REQUEST", "the routine proposal draft is invalid") from None
+        akey = hitl_key("authorization", principal.tenant_id, principal.team, pid)
+        if rows[pid] is not None or rows[akey] is not None:
+            raise Problem(409, "NATIVE_HITL_CALL_EXISTS", "read the original pending call; never restart its wait")
+        pending = NativeHitlPending(
+            **scope, pending_id=pid, agent_oid=principal.oid, command=command,
+            created_at=intent.created_at, expires_at=intent.expires_at)
+        if now >= pending.expires_at:
+            raise Problem(410, "NATIVE_HITL_EXPIRED", "the original waiting window has expired")
+        state = _State(**scope, pending_id=pid, status="pending")
+        return ControlChanges(writes=(
+            *material_writes(pid, pending),
+            _write(hitl_key("state", principal.tenant_id, principal.team, pid), state, "create"),
+            _write(ikey, index.model_copy(update={"pending_ids": (*index.pending_ids, pid)}),
+                   "create" if rows[ikey] is None else "replace"),
+        ), result={**result, "pending_id": pid, "pending_digest": pending.sha256, "status": "pending"})
+
+    def _question_changes(self, principal, intent, rows, now, result):
+        command = intent.command
+        scope = _team_scope(principal)
+        call = command.question.call
+        self._agent(principal, call)
+        ikey, index = self._index(principal, self._turn(call), rows)
+        if index.closed:
+            raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn no longer has a live question wait")
+        qid = question_id(principal.tenant_id, principal.team, call)
+        if rows[qid] is not None:
+            raise Problem(409, "NATIVE_HITL_CALL_EXISTS", "read the original question; never restart its wait")
+        pending = NativeHitlQuestionPending(
+            **scope, question_id=qid, agent_oid=principal.oid, command=command,
+            created_at=intent.created_at, expires_at=intent.expires_at)
+        if now >= pending.expires_at:
+            raise Problem(410, "NATIVE_HITL_EXPIRED", "the original waiting window has expired")
+        return ControlChanges(writes=(
+            _write(qid, pending, "create"),
+            _write(ikey, index.model_copy(update={"question_ids": (*index.question_ids, qid)}),
+                   "create" if rows[ikey] is None else "replace"),
+        ), result={**result, "question_id": qid, "question_digest": pending.sha256, "status": "pending"})
+
+    def _consent_changes(self, principal, intent, rows, now, result):
+        command = intent.command
+        scope = _team_scope(principal)
+        call = command.consent.call
+        self._agent(principal, call)
+        ikey, index = self._index(principal, self._turn(call), rows)
+        if index.closed:
+            raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn no longer has a live Connect wait")
+        cid = consent_id(principal.tenant_id, principal.team, call)
+        if rows[cid] is not None:
+            raise Problem(409, "NATIVE_HITL_CALL_EXISTS", "read the original Connect card; never restart its wait")
+        if rows[self._declined_key(principal, call, command.consent.toolbox_name)] is not None:
+            raise Problem(409, "NATIVE_HITL_HUMAN_DENIED", "the owner declined this connector in this conversation")
+        pending = ConnectorConsentPending(
+            **scope, consent_id=cid, agent_oid=principal.oid, command=command,
+            created_at=intent.created_at, expires_at=intent.expires_at)
+        if now >= pending.expires_at:
+            raise Problem(410, "NATIVE_HITL_EXPIRED", "the original waiting window has expired")
+        return ControlChanges(writes=(
+            _write(cid, pending, "create"),
+            _write(ikey, index.model_copy(update={"consent_ids": (*index.consent_ids, cid)}),
+                   "create" if rows[ikey] is None else "replace"),
+        ), result={**result, "consent_id": cid, "consent_digest": pending.sha256, "status": "pending"})
+
+    def _click_changes(self, principal, intent, rows, now, result):
+        command = intent.command
+        scope = _team_scope(principal)
+        consent = self._consent(principal, command.consent_id, rows)
+        if command.consent_digest != consent.sha256:
+            raise Problem(409, "NATIVE_HITL_ACTION_CHANGED", "the click must name the original complete Connect card")
+        dkey = hitl_key("consent-decision", principal.tenant_id, principal.team, consent.consent_id)
+        if rows[dkey] is not None:
+            raise Problem(409, "NATIVE_HITL_STATE_CONFLICT", "the original Connect card already has its one click")
+        if now >= consent.expires_at:
+            raise Problem(410, "NATIVE_HITL_EXPIRED", "an expired Connect card cannot resume")
+        _, index = self._index(principal, self._turn(consent.command.consent.call), rows)
+        if index.closed:
+            raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn has ended")
+        decision = _ConsentDecision(**scope, consent_id=consent.consent_id, owner_oid=principal.oid, command=command)
+        writes = [_write(dkey, decision, "create")]
+        if command.choice == "decline":
+            asked = consent.command.consent
+            mkey = self._declined_key(principal, asked.call, asked.toolbox_name)
+            if rows[mkey] is None:  # an earlier decline in this conversation keeps its row
+                writes.append(_write(mkey, _ConsentDeclined(
+                    **scope, agent_id=asked.call.agent_id, conversation_id=asked.call.conversation_id,
+                    toolbox_name=asked.toolbox_name, consent_id=consent.consent_id, owner_oid=principal.oid,
+                    created_at=now), "create"))
+        return ControlChanges(writes=tuple(writes), result={
+            **result, "consent_id": consent.consent_id, "status": command.choice})
+
+    def _answer_changes(self, principal, intent, rows, now, result):
+        command = intent.command
+        scope = _team_scope(principal)
+        question = self._question(principal, command.question_id, rows)
+        if command.question_digest != question.sha256:
+            raise Problem(409, "NATIVE_HITL_QUESTION_CHANGED", "the answer must name the original complete question")
+        akey = hitl_key("answer", principal.tenant_id, principal.team, question.question_id)
+        if rows[akey] is not None:
+            raise Problem(409, "NATIVE_HITL_STATE_CONFLICT", "the original question already has its one answer")
+        if now >= question.expires_at:
+            raise Problem(410, "NATIVE_HITL_EXPIRED", "an expired question cannot receive a new answer")
+        _, index = self._index(principal, self._turn(question.command.question.call), rows)
+        if index.closed:
+            raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original SDK wait has ended")
+        asked = question.command.question
+        if command.was_freeform and not asked.allow_freeform or not command.was_freeform and command.answer not in asked.choices:
+            raise Problem(422, "NATIVE_HITL_ANSWER_INVALID", "pick one of the original choices or a permitted own reply")
+        answer = _QuestionAnswer(**scope, question_id=question.question_id, owner_oid=principal.oid, command=command)
+        return ControlChanges(writes=(_write(akey, answer, "create"),), result={
+            **result, "question_id": question.question_id, "status": "answered"})
+
+    def _bound_state(self, principal, command, rows):
+        """(pending, state key, state) of the original card a decision or close names, in this fixed order."""
         pending = self._pending(principal, command.pending_id, rows)
         if command.pending_digest != pending.sha256:
             raise Problem(409, "NATIVE_HITL_ACTION_CHANGED", "the decision must bind the original complete pending action")
@@ -787,23 +814,27 @@ class NativeHitlService:
         if (state.tenant_id, state.team_id, state.pending_id) != (
                 principal.tenant_id, principal.team, pending.pending_id):
             raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the approval state has another scope")
-        if isinstance(command, NativeHitlClose):
-            self._agent(principal, pending.command.action.call)
-            allowed = (state.status == "pending" and command.status in {"expired", "interrupted"}
-                       or state.status == "allow" and command.status in {"expired", "interrupted", "effect_unknown"}
-                       or state.status == "pending" and command.status == "effect_unknown"
-                       and rows[hitl_key("authorization", principal.tenant_id, principal.team, pending.pending_id)] is not None)
-            if not allowed or command.status == "expired" and now < pending.expires_at:
-                raise Problem(409, "NATIVE_HITL_STATE_CONFLICT", "this observation cannot replace the original decision or outcome")
-            closed = _State(**scope, pending_id=pending.pending_id, status=command.status,
-                            decision_id=state.decision_id, close_id=intent.intent_id)
-            return ControlChanges(writes=(_write(skey, closed, "replace"),),
-                                  result={**result, "pending_id": pending.pending_id, "status": command.status})
-        if state.status != "pending":
-            raise Problem(409, "NATIVE_HITL_STATE_CONFLICT", "the original pending call already has a decision or observation")
+        return pending, skey, state
+
+    def _close_changes(self, principal, intent, rows, now, result):
+        command = intent.command
+        pending, skey, state = self._bound_state(principal, command, rows)
+        self._agent(principal, pending.command.action.call)
+        # The authorization row is read only for a still-pending card closing as effect_unknown.
+        allowed = (command.status in _CLOSES.get(state.status, ())
+                   or state.status == "pending" and command.status == "effect_unknown"
+                   and rows[hitl_key("authorization", principal.tenant_id, principal.team, pending.pending_id)] is not None)
+        if not allowed or command.status == "expired" and now < pending.expires_at:
+            raise Problem(409, "NATIVE_HITL_STATE_CONFLICT", "this observation cannot replace the original decision or outcome")
+        closed = _State(**_team_scope(principal), pending_id=pending.pending_id, status=command.status,
+                        decision_id=state.decision_id, close_id=intent.intent_id)
+        return ControlChanges(writes=(_write(skey, closed, "replace"),),
+                              result={**result, "pending_id": pending.pending_id, "status": command.status})
+
+    def _refuse_undecidable(self, principal, command, pending, rows, now):
+        """Raise for a still-pending card whose wait expired, ended or was authorized, or a rule it may not get."""
         if now >= pending.expires_at:
             raise Problem(410, "NATIVE_HITL_EXPIRED", "an expired call cannot receive a new human decision")
-        ikey = self._index_key(principal, self._turn(pending.command.action.call))
         _, index = self._index(principal, self._turn(pending.command.action.call), rows)
         if index.closed:
             raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original SDK wait has ended")
@@ -815,6 +846,14 @@ class NativeHitlService:
         if command.choice == "allow_rule" and pending.command.action.category == "routine":
             # Each schedule is the owner's own click on its card; no Team rule may approve future schedules.
             raise Problem(422, "NATIVE_HITL_INVALID_REQUEST", "a routine proposal is approved once per card, not by a rule")
+
+    def _decision_changes(self, principal, intent, rows, now, result):
+        command = intent.command
+        scope = _team_scope(principal)
+        pending, skey, state = self._bound_state(principal, command, rows)
+        if state.status != "pending":
+            raise Problem(409, "NATIVE_HITL_STATE_CONFLICT", "the original pending call already has a decision or observation")
+        self._refuse_undecidable(principal, command, pending, rows, now)
         rules = self._version(principal, command, rows)
         revision, writes = rules.revision, ()
         if command.choice == "allow_rule":
@@ -891,6 +930,14 @@ class NativeHitlService:
                                 authorization=authorization, intent_id=intent.intent_id)
         return ControlChanges(writes=(_write(akey, record, "create"),),
                               result={**result, "authorization": authorization.model_dump(mode="json")})
+
+    # One handler per command kind, after _changes' shared identity check and its one clock read.
+    _CHANGES = {
+        NativeHitlEnd: _end_changes, NativeHitlRuleChange: _rule_changes, NativeHitlPendingCreate: _pending_changes,
+        NativeHitlAuthorize: _authorize_effect, NativeHitlQuestionCreate: _question_changes,
+        ConnectorConsentCreate: _consent_changes, ConnectorConsentDecision: _click_changes,
+        NativeHitlAnswer: _answer_changes, NativeHitlClose: _close_changes, NativeHitlDecision: _decision_changes,
+    }
 
     def read(self, principal, pid):
         try:

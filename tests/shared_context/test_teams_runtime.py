@@ -125,3 +125,104 @@ def test_body_limit_and_duplicate_json_fields_are_rejected_before_admission():
         response = client.post("/behavior/v1/teams/activities", content=body,
                                headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"})
         assert response.status_code == status
+
+
+class _Receiver:
+    """Stands in for the runtime or personal entry; records each call to receive."""
+    def __init__(self, outcome=None):
+        self.calls, self.outcome = [], outcome
+
+    def receive(self, authorization, body):
+        self.calls.append((authorization, body))
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return {"echo": len(body)} if self.outcome is None else self.outcome
+
+
+def _runtime_route(receiver):
+    return teams_router(receiver)
+
+
+def _personal_route(receiver):
+    from shared_context.teams_personal import PersonalTeamsEntry
+    return PersonalTeamsEntry.router(receiver)
+
+
+ACTIVITY_ROUTERS = pytest.mark.parametrize("make_router,limit_message,name", (
+    (_runtime_route, "Teams input exceeds the fixed byte bound", "activities"),
+    (_personal_route, "the complete activity exceeds the fixed byte bound", "activity"),
+), ids=("runtime", "personal"))
+
+
+def _activity_client(make_router, receiver):
+    app = FastAPI()
+    app.include_router(make_router(receiver))
+    return TestClient(app)
+
+
+@ACTIVITY_ROUTERS
+def test_activity_route_is_one_post_on_the_callback_path(make_router, limit_message, name):
+    assert [(route.path, route.methods, route.name) for route in make_router(_Receiver()).routes] == [
+        ("/behavior/v1/teams/activities", {"POST"}, name)]
+
+
+@ACTIVITY_ROUTERS
+@pytest.mark.parametrize("content_type", (None, "text/plain", "application/jsonx", "application/json-patch+json"))
+def test_activity_route_rejects_a_non_json_content_type_before_reading(make_router, limit_message, name, content_type):
+    receiver = _Receiver()
+    headers = {} if content_type is None else {"Content-Type": content_type}
+    response = _activity_client(make_router, receiver).post(
+        "/behavior/v1/teams/activities", content=b"{}", headers=headers)
+    assert response.status_code == 415
+    assert response.json() == {"error": {"code": "TEAMS_CONTENT_TYPE", "message": "application/json is required"}}
+    assert receiver.calls == []
+
+
+@ACTIVITY_ROUTERS
+def test_activity_route_passes_the_exact_bytes_and_authorization_at_the_bound(make_router, limit_message, name):
+    receiver = _Receiver()
+    client = _activity_client(make_router, receiver)
+    body = b"x" * 32768
+    response = client.post("/behavior/v1/teams/activities", content=body,
+                           headers={"Authorization": "Bearer abc", "Content-Type": "application/json; charset=utf-8"})
+    assert (response.status_code, response.json()) == (200, {"echo": 32768})
+    missing = client.post("/behavior/v1/teams/activities", content=b"{}", headers={"Content-Type": "application/json"})
+    assert (missing.status_code, missing.json()) == (200, {"echo": 2})
+    assert receiver.calls == [("Bearer abc", body), ("", b"{}")]
+    assert all(type(call[1]) is bytes for call in receiver.calls)
+
+
+@ACTIVITY_ROUTERS
+def test_activity_route_rejects_one_byte_over_the_bound_with_its_own_message(make_router, limit_message, name):
+    receiver = _Receiver()
+    response = _activity_client(make_router, receiver).post(
+        "/behavior/v1/teams/activities", content=b"x" * 32769, headers={"Content-Type": "application/json"})
+    assert response.status_code == 413
+    assert response.json() == {"error": {"code": "TEAMS_BODY_LIMIT", "message": limit_message}}
+    assert receiver.calls == []
+
+
+@ACTIVITY_ROUTERS
+def test_activity_route_returns_a_receive_problem_as_its_status_and_body(make_router, limit_message, name):
+    receiver = _Receiver(Problem(409, "TEAMS_EXAMPLE_CONFLICT", "kept as raised", hint="kept"))
+    response = _activity_client(make_router, receiver).post(
+        "/behavior/v1/teams/activities", content=b"{}", headers={"Content-Type": "application/json"})
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": "TEAMS_EXAMPLE_CONFLICT", "message": "kept as raised", "hint": "kept"}}
+
+
+@ACTIVITY_ROUTERS
+def test_activity_route_does_not_turn_other_receive_errors_into_a_response(make_router, limit_message, name):
+    receiver = _Receiver(RuntimeError("not a Problem"))
+    with pytest.raises(RuntimeError, match="not a Problem"):
+        _activity_client(make_router, receiver).post(
+            "/behavior/v1/teams/activities", content=b"{}", headers={"Content-Type": "application/json"})
+
+
+@ACTIVITY_ROUTERS
+def test_activity_route_reads_receive_at_request_time(make_router, limit_message, name):
+    receiver = _Receiver()
+    client = _activity_client(make_router, receiver)
+    receiver.receive = lambda authorization, body: {"replaced": True}
+    response = client.post("/behavior/v1/teams/activities", content=b"{}", headers={"Content-Type": "application/json"})
+    assert response.json() == {"replaced": True}

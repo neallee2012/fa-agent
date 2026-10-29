@@ -612,10 +612,13 @@ def test_a_routine_trigger_inside_the_selector_window_never_invokes_the_kept_old
     destination = platform.follow_elsewhere(replace=False).target.session_id
     platform.invoked.clear()
     # No clock change: the selector read by the definition save is still inside SELECTOR_CHECK_SECONDS.
-    refused = case.trigger({"routine_id": "daily-summary", "scheduled_for": due.isoformat()})
-    # The routine's conversation stays on the old session: the selected one refuses it, nothing is admitted.
-    assert (refused.status_code, refused.json()["error"]["code"]) == (409, "NATIVE_SESSION_CHANGED"), refused.text
-    assert platform.invoked == [(destination, "session_read"), (destination, "read"), (destination, "conversation")]
+    admitted = case.trigger({"routine_id": "daily-summary", "scheduled_for": due.isoformat()})
+    # Each run opens its own conversation on the selected session (README#native-routine-fresh-conversation), so
+    # the kept old session holding the approval conversation is never called.
+    assert admitted.status_code == 202, admitted.text
+    assert admitted.json()["conversation_id"] != "native-cid"
+    assert platform.invoked == [(destination, "session_read"), (destination, "read"), (destination, "conversation"),
+                                (destination, "routine_receive")]
     assert source not in {sid for sid, _ in platform.invoked}
 
 

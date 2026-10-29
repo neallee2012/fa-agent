@@ -9,7 +9,6 @@ from fastapi.testclient import TestClient
 from conftest import A, B, C
 from shared_context.api import create_app
 from shared_context.errors import Problem
-from shared_context.m3_config import M3Settings
 from shared_context.m3_models import MAX_ARTIFACT_BYTES
 from shared_context.models import CreateWork
 from test_m3_artifacts import HUMAN, V1, V2, m3
@@ -141,18 +140,6 @@ def test_large_upload_authenticates_before_receiving_any_bytes(m3):
         assert next(message for message in messages if message["type"] == "http.response.start")["status"] == 401
 
     asyncio.run(execute())
-
-
-def test_m3_is_disabled_without_explicit_dependencies_and_config(m3):
-    service, _, _ = m3
-    assert TestClient(create_app(service.context, lambda: A)).get(PATH).status_code == 404
-    with pytest.raises(ValueError):
-        create_app(service.context, lambda: A, artifact_service=service)
-    with pytest.raises(ValueError):
-        create_app(service.context, lambda: A, artifact_policy_ids=("report",))
-    assert M3Settings.from_env({}) is None
-    with pytest.raises(ValueError):
-        M3Settings.from_env({"CONTEXT_M3_TEAM": A.team})
 
 
 def test_missing_configured_policy_is_an_explicit_error(m3):

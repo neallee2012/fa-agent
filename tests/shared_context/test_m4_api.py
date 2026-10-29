@@ -30,12 +30,10 @@ from shared_context.m4_fixtures import (
     POLICY_TEXT, POLICY_VERSION, PROMPT, PROMPT_TOKENS_LIMIT, SUITE, encoded, fixtures,
 )
 from shared_context.models import CreateWork
-from shared_context.production import create_production_app
 from shared_context.storage import Record
 from test_adapters import WireTransport
 from test_m2_gateway import Credential, NATIVE, PROJECT
 from test_m3_artifacts import HUMAN, m3
-from test_m3_production import env as m3_env
 
 SETTINGS = M4Settings(SUITE, MODEL, MAX_REQUESTS, MEMORY_STORE, FIXTURE_SHA256)
 BASE = "/m4/teams/team-one"
@@ -549,72 +547,3 @@ def test_m4_settings_are_disabled_by_default_fixed_and_all_or_none():
             M4Settings.from_env(M4_ENV)
 
 
-@pytest.mark.parametrize("recovery", [False, True])
-def test_production_wires_m4_separate_store_shared_clients_and_closes_once(monkeypatch, recovery):
-    m3_env(monkeypatch)
-    monkeypatch.setenv("CONTEXT_ACTORS_JSON", json.dumps({
-        actor.oid: {"actor": actor.actor, "team": actor.team, "role_instruction": actor.role_instruction}
-        for actor in (A, B)
-    }))
-    monkeypatch.setenv("CONTEXT_M3_POLICY_ARTIFACTS", POLICY_ARTIFACT)
-    for name, value in M4_ENV.items():
-        monkeypatch.setenv(name, value)
-    expected_store = MEMORY_STORE
-    if recovery:
-        expected_store = "poc-m4-context-02"
-        monkeypatch.setenv("CONTEXT_M4_MEMORY_STORE", expected_store)
-        monkeypatch.setenv("CONTEXT_M4_ADDITIONAL_REQUESTS", "120")
-        monkeypatch.setenv("CONTEXT_M4_AMENDMENT_ID", "m4-threefold-20260915")
-    credential, table, project, container = Mock(), Mock(), Mock(), Mock()
-    container.account_url = "https://synthetic.blob.core.windows.net"
-    container.container_name = "m3-artifacts"
-    monkeypatch.setattr("shared_context.production.ManagedIdentityCredential", Mock(return_value=credential))
-    monkeypatch.setattr("shared_context.production.TableClient", Mock(return_value=table))
-    monkeypatch.setattr("shared_context.production.AIProjectClient", Mock(return_value=project))
-    monkeypatch.setattr("azure.storage.blob.ContainerClient", Mock(return_value=container))
-    composition = Mock(wraps=create_app)
-    monkeypatch.setattr("shared_context.production.create_app", composition)
-    with TestClient(create_production_app()) as client:
-        assert client.get("/healthz").status_code == 200
-        assert client.get("/m4/model/v1/budget").status_code == 401
-        assert client.post(BASE + "/memory/seed", json=SEED).status_code == 401
-    legacy = composition.call_args.args[0]
-    selected = composition.call_args.kwargs
-    isolated = selected["m4_service"]
-    gateway = selected["m4_model_gateway"]
-    assert isolated.memory.client is legacy.memory.client is project
-    assert isolated.repository is legacy.repository
-    assert isolated.memory.store == expected_store and legacy.memory.store == "synthetic-memory"
-    assert gateway.credential is credential and gateway.http.is_closed
-    assert gateway.milestone == "m4" and gateway.settings.max_requests == 60
-    assert gateway.settings.additional_requests == (120 if recovery else None)
-    assert selected["m3_model_gateway"] is None and selected["model_gateway"] is None
-    for resource in (credential, table, project, container):
-        resource.close.assert_called_once()
-    project.beta.memory_stores.begin_update_memories.assert_not_called()
-    table.create_entity.assert_not_called()
-
-
-@pytest.mark.parametrize("invalid", ["partial", "store", "policy", "m3_missing"])
-def test_production_rejects_invalid_m4_config_before_creating_clients(monkeypatch, invalid):
-    m3_env(monkeypatch)
-    for name, value in M4_ENV.items():
-        monkeypatch.setenv(name, value)
-    monkeypatch.setenv("CONTEXT_M3_POLICY_ARTIFACTS", POLICY_ARTIFACT)
-    if invalid == "partial":
-        monkeypatch.delenv("CONTEXT_M4_MODEL")
-    elif invalid == "store":
-        monkeypatch.setenv("CONTEXT_MEMORY_STORE", MEMORY_STORE)
-    elif invalid == "policy":
-        monkeypatch.delenv("CONTEXT_M3_POLICY_ARTIFACTS")
-    else:
-        for name in (
-            "CONTEXT_M3_BLOB_ENDPOINT", "CONTEXT_M3_CONTAINER", "CONTEXT_M3_APPROVER_OID",
-            "CONTEXT_M3_CLIENT_ID", "CONTEXT_M3_TEAM", "CONTEXT_M3_POLICY_ARTIFACTS",
-        ):
-            monkeypatch.delenv(name)
-    credential = Mock()
-    monkeypatch.setattr("shared_context.production.ManagedIdentityCredential", credential)
-    with pytest.raises(ValueError):
-        create_production_app()
-    credential.assert_not_called()

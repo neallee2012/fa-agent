@@ -14,14 +14,13 @@ usage: python deploy/stage/new_memory_store.py --out <private dir> [--config <pr
 """
 import argparse
 import json
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
-from deployment_config import load_config  # noqa: E402
+from deployment_config import load_config, write_x as _write_x  # noqa: E402
 
 DEFINITION = {
     "kind": "default", "chat_model": "gpt-4.1-mini", "embedding_model": "text-embedding-3-small",
@@ -45,13 +44,6 @@ def matches(observed, expected):
     options = observed.get("options") or {}
     return (all(observed.get(key) == expected[key] for key in ("kind", "chat_model", "embedding_model"))
             and all(options.get(key) == value for key, value in expected["options"].items()))
-
-
-def _write_x(path, value):
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=1)
-        stream.flush()
-        os.fsync(stream.fileno())
 
 
 def ensure(stores, out, name, not_found=LookupError, expected=DEFINITION):

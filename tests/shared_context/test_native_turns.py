@@ -2,12 +2,14 @@
 
 import asyncio
 from dataclasses import dataclass
+import importlib
 import json
 import logging
 import os
 from pathlib import Path
 import time
 from types import SimpleNamespace
+from typing import Literal, get_args
 from uuid import uuid4
 
 import pytest
@@ -17,6 +19,7 @@ from azure.ai.agentserver.core.tasks import RetryPolicy, SteeringQueueFull, Task
 from azure.core.exceptions import ServiceResponseError
 from starlette.testclient import TestClient
 
+from shared_context import behavior_native_turn_wire as wire
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import (
     NATIVE_STATE_PROFILE, NATIVE_TURN_HEADER, NativeCancel, NativeDelivered, NativeHistory,
@@ -24,12 +27,12 @@ from shared_context.behavior_native_turn_wire import (
 )
 from shared_context.behavior_sdk_state import SdkState
 from shared_context.behavior_turn_usage import TURN_USAGE_SCHEMA, ModelUsage, TurnModelUsage
-from shared_context.behavior_wire import AssistantSdkStop, HostedIdentity
+from shared_context.behavior_wire import AssistantSdkStop, HostedIdentity, WireModel
 from shared_context.errors import Problem
 from shared_context.native_checkpoint import conversation_store_name, open_durable_store, segment_key
 from shared_context.native_progress_wire import NativeTurnStatusRead
 from shared_context.native_turns import (
-    EFFECTS_STORE, TURNS_STORE, NativePostTurnPending, NativeSdkResult, NativeTaskInput, NativeTurnControl, NativeTurnRuntime, _changed,
+    _HANDLERS, EFFECTS_STORE, TURNS_STORE, NativePostTurnPending, NativeSdkResult, NativeTaskInput, NativeTurnControl, NativeTurnRuntime, _changed,
 )
 from test_native_turn_wire import agent_receive, submit
 
@@ -544,6 +547,154 @@ def test_official_cancel_causes_win_over_steering_without_false_shutdown_termina
         assert stored.failure_code == ("NATIVE_TURN_CANCELLED" if cause == "cancel" else "NATIVE_TURN_TIMEOUT")
 
 
+@pytest.mark.parametrize(("causes", "code"), [
+    ({"fence"}, "NATIVE_TURN_UNKNOWN"), ({"timeout"}, "NATIVE_TURN_TIMEOUT"),
+    ({"task-cancel"}, "NATIVE_TURN_CANCELLED"), ({"owner-cancel"}, "NATIVE_TURN_CANCELLED"),
+    # Precedence when several land together: a fence, then a timeout, then a cancel.
+    ({"fence", "timeout", "task-cancel"}, "NATIVE_TURN_UNKNOWN"), ({"timeout", "owner-cancel"}, "NATIVE_TURN_TIMEOUT"),
+], ids=["fence", "timeout", "task-cancel", "owner-cancel", "fence-first", "timeout-before-cancel"])
+def test_a_stop_that_lands_as_the_sdk_returns_keeps_its_usage_and_saves_no_turn(harness, causes, code):
+    """The SDK returned a complete result, but a fence, timeout or cancel arrived first: the RID ends unknown with that
+    cause's code and the turn's usage, and the result is never saved."""
+    accepted = accept_without_chain(harness)
+    ctx = task_context(accepted)
+    sdk = harness.sdk
+
+    async def returns_then_stops(receipt, scope, previous, control):
+        result = await sdk(receipt, scope, previous, control)
+        if "fence" in causes:
+            control.fenced = True
+        if "timeout" in causes:
+            ctx.timeout_exceeded = True
+        if "task-cancel" in causes:
+            ctx.cancel_requested = True
+        if "owner-cancel" in causes:
+            await harness.runtime.cancel(NativeCancel(
+                conversation_id=receipt.conversation_id, request_id=receipt.request_id))
+        return result
+
+    harness.runtime.executor = returns_then_stops
+    returned = harness.call(harness.runtime.handle_turn, ctx)
+    stored = harness.call(harness.runtime.read, "rid-1")
+    assert returned == stored
+    assert (stored.status, stored.failure_code, stored.result) == ("unknown", code, None)
+    assert stored.usage is not None and stored.usage.usage[0].requests == 1
+    assert [call[0] for call in sdk.calls] == ["rid-1"]
+
+
+@pytest.mark.parametrize("failure", ["completed-write-unconfirmed", "refused", "unknown-rid-write"])
+def test_a_failed_save_is_retried_only_while_unconfirmed_and_never_reruns_the_sdk(harness, monkeypatch, failure):
+    """A save whose RID completion stays unconfirmed (503) through every retry waits each SAVE_RETRY_SECONDS delay,
+    then re-enters the turn it saved and completes from it; a definite refusal is not retried and ends unknown with
+    its code and the delegation the SDK returned; an unconfirmed unknown transition is not retried and escapes as
+    is. The SDK runs once either way."""
+    import dataclasses
+
+    import shared_context.native_turns as native_turns
+    from shared_context.behavior_native_agent_wire import NativeRelayAcceptance
+    from shared_context.native_turns import _UnknownRidWrite
+
+    runtime = harness.runtime
+    accepted = accept_without_chain(harness)
+    save, cas, sdk = runtime._save_turn, runtime._cas, harness.sdk
+    saves, lost = [], []
+    delegation = NativeRelayAcceptance(
+        message_id="OFFLINE-relay-message", recipient_agent_id="22222222-2222-2222-2222-222222222222",
+        conversation_id="OFFLINE-peer-conversation", submit_digest="d" * 64, status="accepted")
+
+    async def delegating(receipt, scope, previous, control):
+        return dataclasses.replace(await sdk(receipt, scope, previous, control), delegation=delegation)
+
+    async def failing_save(current, meta, outcome):
+        saves.append(time.monotonic())
+        if failure == "refused":
+            raise Problem(409, "OFFLINE_SAVE_REFUSED", "OFFLINE definite save refusal")
+        if failure == "unknown-rid-write":
+            raise _UnknownRidWrite(503, "NATIVE_STATE_STORE_UNKNOWN", "OFFLINE unconfirmed unknown transition")
+        return await save(current, meta, outcome)
+
+    async def unconfirmed(original, replacement):
+        if failure == "completed-write-unconfirmed" and replacement.receipt.status == "completed" and len(lost) < 3:
+            lost.append(replacement.receipt.request_id)
+            raise Problem(503, "OFFLINE_STORE_UNAVAILABLE", "OFFLINE completed write unconfirmed")
+        return await cas(original, replacement)
+
+    monkeypatch.setattr(native_turns, "SAVE_RETRY_SECONDS", (0.2, 0.3))
+    if failure == "refused":
+        runtime.executor = delegating
+    monkeypatch.setattr(runtime, "_save_turn", failing_save)
+    monkeypatch.setattr(runtime, "_cas", unconfirmed)
+    if failure == "unknown-rid-write":
+        with pytest.raises(_UnknownRidWrite):
+            harness.call(runtime.handle_turn, task_context(accepted))
+        assert len(saves) == 1 and harness.call(runtime.read, "rid-1").status == "started"
+    else:
+        stored = harness.call(runtime.handle_turn, task_context(accepted))
+        if failure == "refused":
+            assert len(saves) == 1
+            assert (stored.status, stored.failure_code, stored.result) == ("unknown", "OFFLINE_SAVE_REFUSED", None)
+            assert stored.delegation == delegation
+        else:
+            assert len(saves) == 3 and len(lost) == 3
+            # asyncio may wake a sleep up to one clock resolution early (~15.6 ms on Windows).
+            assert saves[1] - saves[0] >= 0.18 and saves[2] - saves[1] >= 0.28
+            assert stored.status == "completed" and stored.result is not None
+    assert [call[0] for call in harness.sdk.calls] == ["rid-1"]
+
+
+def test_an_sdk_failure_records_its_own_usage_and_assembly_and_stops_the_control_watcher(harness):
+    """The SDK failed without a publishable result: the RID ends unknown with the failure's code, usage and assembly
+    (there is no outcome to take them from), and the turn's control watcher stops with it."""
+    from shared_context.native_assembly import NativeAssembly
+    from shared_context.native_turns import NativeSdkFailure
+
+    accepted = accept_without_chain(harness)
+    sdk = harness.sdk
+
+    async def fails(receipt, scope, previous, control):
+        result = await sdk(receipt, scope, previous, control)
+        raise NativeSdkFailure("ASSISTANT_MODEL_OUTCOME_UNKNOWN", result.usage, assembly=NativeAssembly(
+            state="partial", reason="turn_interrupted", capture_digest=receipt.capture_digest))
+
+    harness.runtime.executor = fails
+    stored = harness.call(harness.runtime.handle_turn, task_context(accepted))
+    assert (stored.status, stored.failure_code, stored.result) == ("unknown", "ASSISTANT_MODEL_OUTCOME_UNKNOWN", None)
+    assert stored.usage is not None and stored.usage.usage[0].requests == 1
+    assert (stored.assembly.state, stored.assembly.reason) == ("partial", "turn_interrupted")
+    assert "rid-1" not in harness.runtime._control_wakes
+
+
+@pytest.mark.parametrize("recall", [False, True], ids=["nothing-to-recall", "recall-running"])
+def test_the_runtime_starts_recall_before_allocation_and_stops_it_with_the_turn(harness, recall):
+    """An executor with start_recall has it started before allocation, first_turn guessed from the command (a new
+    conversation has no SDK history yet): nothing to recall leaves control.recall empty, and a recall the executor
+    never took is cancelled when the turn ends."""
+    sdk, guesses, seen = harness.sdk, [], []
+
+    class Recalling:
+        def start_recall(self, receipt, *, first_turn):
+            guesses.append(first_turn)
+            return asyncio.get_running_loop().create_future() if recall else None
+
+        async def __call__(self, receipt, scope, previous, control):
+            seen.append(control.recall)
+            return await sdk(receipt, scope, previous, control)
+
+    accepted = accept_without_chain(harness)
+    harness.runtime.executor = Recalling()
+    # Run directly, so an error in the turn's own cleanup (after the save) reaches the test.
+    first = harness.call(harness.runtime.handle_turn, task_context(accepted))
+    assert first.status == "completed"
+    harness.invoke(submit("rid-2", first.conversation_id, text="Continue original conversation"))
+    harness.wait("rid-2", "completed")
+    assert guesses == [True, False]
+    if recall:
+        assert [guess for guess, _ in seen] == [True, False]
+        assert all(running.cancelled() for _, running in seen)
+    else:
+        assert seen == [None, None]
+
+
 def test_a_drained_input_whose_handler_starts_after_shutdown_ends_resendable(harness):
     """Review P3-2 on #903: core's re-entry of a drained input gets payload.input=None and can never run it, so a
     drained handler that starts after shutdown settles its unstarted RID before the recovery exit (an undrained one
@@ -596,6 +747,116 @@ def test_a_recovered_entry_without_input_reads_the_drained_input_from_the_task_r
         assert (stored.status, stored.failure_code) == ("unknown", "NATIVE_TURN_NOT_STARTED") and not reentered
     else:
         assert stored.status == "started" and reentered == ["rid-1"]
+    assert not harness.sdk.calls
+
+
+def test_a_recovered_entry_with_its_input_never_reads_the_task_record(harness):
+    """Only an entry without input reads the drained input from the task record; one with its input runs that input."""
+    accepted = accept_without_chain(harness)
+
+    async def original(*, task_id=None):
+        raise AssertionError("OFFLINE the supplied input is the one to run")
+
+    harness.runtime.task_observer = SimpleNamespace(original=original)
+    returned = harness.call(harness.runtime.handle_turn, task_context(accepted))
+    assert returned.status == "completed" and [call[0] for call in harness.sdk.calls] == ["rid-1"]
+
+
+@pytest.mark.parametrize(("failure", "pending"), [
+    (Problem(500, "OFFLINE_STORE_FAILED", "OFFLINE task record read failed"), True),
+    (ServiceResponseError("OFFLINE task record read unconfirmed"), True),
+    (Problem(404, "OFFLINE_TASK_MISSING", "OFFLINE task record missing"), False)])
+def test_an_unread_task_record_of_an_entry_without_input_is_retried_by_core_unless_definite(harness, failure, pending):
+    """A 5xx or transport failure reading the drained input is NativePostTurnPending (core retries); a 4xx is raised."""
+    accepted = accept_without_chain(harness)
+
+    async def original(*, task_id=None):
+        raise failure
+
+    harness.runtime.task_observer = SimpleNamespace(original=original)
+    ctx = task_context(accepted)
+    ctx.input = None
+    with pytest.raises(Problem) as raised:
+        harness.call(harness.runtime.handle_turn, ctx)
+    if pending:
+        assert type(raised.value) is NativePostTurnPending
+    else:
+        assert raised.value is failure
+    assert harness.call(harness.runtime.read, "rid-1").status == "accepted" and not harness.sdk.calls
+
+
+def test_a_drained_input_whose_close_is_unconfirmed_at_shutdown_still_exits_for_recovery(harness, monkeypatch, caplog):
+    """The close on the way to a recovery exit is best effort: an unconfirmed one is logged and the exit goes on."""
+    accepted = accept_without_chain(harness)
+
+    async def unconfirmed(original):
+        raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "OFFLINE close unconfirmed")
+
+    monkeypatch.setattr(harness.runtime, "_close_unstarted", unconfirmed)
+    ctx = task_context(accepted, entry_mode="resumed")
+    ctx.is_steered_turn = True
+    ctx.shutdown.set()
+    with caplog.at_level(logging.WARNING):
+        harness.call(harness.runtime.handle_turn, ctx)
+    assert "FA_NATIVE_UNSTARTED_CLOSE_UNCONFIRMED" in caplog.text
+    assert harness.call(harness.runtime.read, "rid-1").status == "accepted" and not harness.sdk.calls
+
+
+@pytest.mark.parametrize(("entry_mode", "status", "refused"), [
+    ("recovered", "started", False), ("fresh", "started", True), ("recovered", "accepted", True)])
+def test_a_task_other_than_the_bound_one_only_reenters_a_recovered_started_rid(harness, entry_mode, status, refused):
+    """A chain task that is not the binding's (here this Agent's per-session task ID) may only re-enter a started RID
+    on recovery; a fresh entry or a never-started RID is refused 403 and nothing is written or run."""
+    from shared_context.native_turns import binding_task_id
+
+    accepted = accept_without_chain(harness) if status == "accepted" else seed_started(harness)[0]
+    binding, _ = harness.call(harness.runtime._agent_record)
+    other = binding_task_id(IDENTITY.agent_id, IDENTITY.session_id)
+    assert binding.task_id == IDENTITY.agent_id != other and binding.hosted_session_id == IDENTITY.session_id
+    ctx = task_context(accepted, entry_mode=entry_mode)
+    ctx.task_id = other
+    if refused:
+        with pytest.raises(Problem) as raised:
+            harness.call(harness.runtime.handle_turn, ctx)
+        assert (raised.value.status, raised.value.body["error"]["code"]) == (403, "NATIVE_STATE_SCOPE")
+        assert harness.call(harness.runtime.read, "rid-1").status == status
+    else:
+        assert harness.call(harness.runtime.handle_turn, ctx).status == "unknown"
+    assert not harness.sdk.calls
+
+
+@pytest.mark.parametrize("cause", ["cancel", "timeout", "shutdown"])
+def test_a_cancel_timeout_or_shutdown_ends_the_wait_for_an_earlier_cli_at_once(harness, cause):
+    """The wait before "started" for an earlier turn's CLI (bounded by UNEXITED_WAIT_SECONDS) stops on any of the three
+    signals, not at its bound."""
+    accepted = accept_without_chain(harness)
+    looks = []
+
+    def unexited():
+        looks.append(1)
+        return True
+
+    harness.sdk.runtime_unexited = unexited
+    ctx = task_context(accepted, entry_mode="fresh")
+
+    async def run():
+        turn = asyncio.create_task(harness.runtime.handle_turn(ctx))
+        async with asyncio.timeout(5):
+            while len(looks) < 2:
+                await asyncio.sleep(0.01)
+            if cause == "cancel":
+                ctx.cancel_requested = True
+            elif cause == "timeout":
+                ctx.timeout_exceeded = True
+            else:
+                ctx.shutdown.set()
+            return await turn
+
+    harness.call(run)
+    stored = harness.call(harness.runtime.read, "rid-1")
+    assert (stored.status, stored.failure_code) == {
+        "cancel": ("unknown", "NATIVE_TURN_CANCELLED"), "timeout": ("unknown", "NATIVE_TURN_TIMEOUT"),
+        "shutdown": ("accepted", None)}[cause]
     assert not harness.sdk.calls
 
 
@@ -1555,6 +1816,61 @@ def test_an_append_accepted_before_the_close_ends_with_the_one_after_it_and_keep
     assert [read_append(harness, active, f"append-{n}").status for n in (1, 2)] == ["not_applied"] * 2
 
 
+def finished_settles(monkeypatch):
+    """The turn status seen by each ``settle_appends(finished=True)``, the turn's final settle of its appends."""
+    from shared_context import native_appends
+
+    settle, seen = native_appends.settle_appends, []
+
+    async def recording(runtime, target, control, *, finished=False):
+        if finished:
+            seen.append((await runtime.read(target.request_id)).status)
+        return await settle(runtime, target, control, finished=finished)
+
+    monkeypatch.setattr(native_appends, "settle_appends", recording)
+    return seen
+
+
+def test_a_completed_turn_settles_its_appends_once_before_the_save_and_leaves_the_channel_to_the_sdk(harness, monkeypatch):
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    session = steer(harness)
+    assert harness.invoke(append_command(active)).status_code == 202
+    until(lambda: session.sent, seconds=5)
+    seen = finished_settles(monkeypatch)
+    harness.sdk.block = False
+    harness.wait("rid-1", "completed")
+    until(lambda: "rid-1" not in harness.runtime.running_controls)  # the turn's own cleanup has returned
+    assert seen == ["started"]
+    assert session.channel.closed is False  # the SDK executor closes its own channel; this path leaves it to it
+    applied = read_append(harness, active)
+    assert (applied.status, applied.delivery) == ("applied", "queued")
+
+
+def test_a_failed_turn_closes_its_channel_and_ends_an_undelivered_append_as_cancelled(harness):
+    from shared_context.copilot_steering import SdkSteeringChannel
+
+    harness.sdk.block = True
+    harness.invoke(submit())
+    active = harness.wait("rid-1", "started")
+    control = harness.sdk.controls["rid-1"]
+
+    async def unopened_channel():  # the SDK session never became ready, so the append is kept and never handed over
+        control.steering = SdkSteeringChannel(control.stop_requested)
+
+    harness.call(unopened_channel)
+    accepted = harness.invoke(append_command(active))
+    assert accepted.json()["status"] == "accepted", accepted.text
+    cancel = harness.invoke(NativeCancel(conversation_id=active.conversation_id, request_id="rid-1"))
+    assert cancel.status_code == 200, cancel.text
+    assert harness.wait("rid-1", "unknown").failure_code == "NATIVE_TURN_CANCELLED"  # OfflineSdk raises on the stop
+    until(lambda: "rid-1" not in harness.runtime.running_controls)  # the settle after the failure has landed
+    ended = read_append(harness, active)
+    assert (ended.status, ended.reason) == ("not_applied", "cancelled")
+    assert control.steering.closed is True
+
+
 def test_a_crash_between_the_reply_and_the_save_keeps_the_append_resendable_and_never_reruns(local_env, monkeypatch):
     from shared_context import native_appends
 
@@ -1590,3 +1906,163 @@ def test_a_new_turn_sent_in_the_tail_is_accepted_at_once_and_runs_after_the_firs
     assert (first.turn_number, second.turn_number) == (1, 2)
     assert [call[0] for call in harness.sdk.calls] == ["rid-1", "rid-2"] and harness.sdk.calls[1][2] is not None
     assert harness.sdk.max_active == 1
+
+
+def test_a_turn_behind_an_older_queued_message_waits_in_the_left_queue_and_runs_after_it(harness, monkeypatch):
+    """ADR-0009 §7a: an older message of the conversation is first in its left queue, so the chain turn of a new one
+    parks it there behind that message with a wait task of its own; it stays ``accepted`` (never refused, never run
+    early) and runs once the older one has gone first."""
+    from shared_context import native_left_receipts
+    from shared_context.native_left_receipts import QUEUE_KEY, enqueue
+
+    monkeypatch.setattr(native_left_receipts, "POLL_SECONDS", 0.02)
+    assert harness.invoke(submit()).status_code == 202
+    cid = harness.wait("rid-1", "completed").conversation_id
+    older = submit("rid-older", cid, text="Older message")
+    chain = harness.runtime.chain
+
+    async def bound_elsewhere(**kwargs):
+        raise TaskConflictError("OFFLINE the older message never reached the chain")
+
+    harness.runtime.chain = SimpleNamespace(start=bound_elsewhere)
+    try:
+        assert harness.invoke(older).status_code == 409
+    finally:
+        harness.runtime.chain = chain
+    harness.call(enqueue, harness.runtime, harness.call(harness.runtime._rid, "rid-older"))
+
+    def queue():
+        async def read():
+            async with harness.runtime._store(conversation_store_name(cid)) as store:
+                item = await store.get_item(QUEUE_KEY)
+                return () if item is None else tuple(item.value["request_ids"])
+        return harness.call(read)
+
+    assert harness.invoke(submit("rid-behind", cid, text="Behind it")).status_code == 202
+    until(lambda: queue() == ("rid-older", "rid-behind"))
+    time.sleep(0.2)  # its wait task looks again several times meanwhile
+    assert harness.call(harness.runtime.read, "rid-behind").status == "accepted"
+    assert [call[0] for call in harness.sdk.calls] == ["rid-1"]
+    assert harness.invoke(older).status_code == 202
+    first, then = harness.wait("rid-older", "completed"), harness.wait("rid-behind", "completed")
+    assert (first.turn_number, then.turn_number) == (2, 3)
+    assert [call[0] for call in harness.sdk.calls] == ["rid-1", "rid-older", "rid-behind"]
+    assert queue() == ()
+
+
+# Every typed native request and where ``dispatch`` sends it: (request type, handler module or None for a
+# NativeTurnRuntime method, handler name, what the handler receives after the runtime).
+DISPATCH_ROUTES = [
+    (wire.NativeSessionFilesOmission, "native_files_omission", "confirm_omission", "command"),
+    (wire.NativeSessionFiles, "native_environment_files", "session_files", "command"),
+    (wire.NativeContinuationReady, "native_continuations", "acknowledge_ready", "command"),
+    (wire.NativeContinuationRead, "native_continuations", "read_continuation", "request_id"),
+    (wire.NativeContinuationSubmit, None, "continue_turn", "command"),
+    (wire.NativeHitlHistoryRead, "native_effects", "read_hitl_history", "command"),
+    (wire.NativeReceivedRead, "native_received", "read_received", "command"),
+    (wire.NativeProgressRead, "native_progress", "read_progress", "command"),
+    (wire.NativeTurnStatusRead, None, "turn_status", "command"),
+    (wire.NativeAppend, "native_appends", "append", "command"),
+    (wire.NativeAppendRead, "native_appends", "read_append", "command"),
+    (wire.NativeSessionRetarget, "native_environment", "retarget_session", "command"),
+    (wire.NativeImagesRead, "native_images", "read_images", "command"),
+    (wire.NativeImageRead, "native_images", "read_image", "command"),
+    (wire.NativeSkillDraftIntentRead, "native_skill_draft", "read_intent", "command"),
+    (wire.NativeUserImageUpload, "native_user_images", "upload", "command"),
+    (wire.NativeSessionFollow, "native_environment", "follow_session", "command"),
+    (wire.NativeSessionAbandon, "native_environment_abandon", "abandon_session", "command"),
+    (wire.NativeSessionCut, "native_environment_cut", "cut_session", "command"),
+    (wire.NativeSessionWithdraw, "native_environment_cut", "withdraw_session", "command"),
+    (wire.NativeUnfinishedRead, "native_environment_abandon", "unfinished_sessions", "nothing"),
+    (wire.NativeSessionRead, None, "session_state", "session"),
+    (wire.NativeSessionPrepare, None, "prepare_session", "command"),
+    (wire.NativeSubmit, None, "submit", "command"),
+    (wire.NativeAgentReceive, None, "receive", "command"),
+    (wire.NativeRoutineSubmit, None, "receive_routine", "command"),
+    (wire.NativeRead, None, "_observed_read", "request_id"),
+    (wire.NativeConversationRead, None, "conversation", "conversation_id"),
+    (wire.NativeHistory, None, "history", "command"),
+    (wire.NativeResult, None, "result", "command"),
+    (wire.NativeCancel, None, "cancel", "command"),
+    (wire.NativeResponseNotStarted, None, "response_not_started", "command"),
+    (wire.NativeDelivered, None, "delivered", "command"),
+    (wire.NativeCandidateRead, "native_memory_candidate", "read_candidate", "command"),
+    (wire.NativePrewarm, None, "prewarm", "command"),
+    (wire.NativeSessionCheckpointCheck, "native_checkpoint_check", "read_back", "command"),
+    (wire.NativeSessionPrerestore, "native_checkpoint_check", "read_back", "command"),
+]
+ROUTE_FIELDS = {"request_id": "rid-route", "conversation_id": "cid-route", "environment_request_id": "erid-route",
+                "workspace": "workspace-route"}
+
+
+def route_spies(monkeypatch):
+    """Replace every handler with one that records its call and returns its own name."""
+    calls = []
+    for _, module, name, _ in DISPATCH_ROUTES:
+        def spy(*args, _route=(module, name), **kwargs):
+            calls.append((_route, args, kwargs))
+
+            async def handled():
+                return _route
+            return handled()
+        monkeypatch.setattr(NativeTurnRuntime if module is None else importlib.import_module("shared_context." + module),
+                            name, spy)
+    return calls
+
+
+def routed(cls):
+    return cls.model_construct(**{key: value for key, value in ROUTE_FIELDS.items() if key in cls.model_fields})
+
+
+def test_the_dispatch_routes_name_every_typed_native_request_once():
+    assert len(DISPATCH_ROUTES) == 37
+    assert [route[0] for route in DISPATCH_ROUTES] == list(dict.fromkeys(route[0] for route in DISPATCH_ROUTES))
+    assert {route[0] for route in DISPATCH_ROUTES} == set(get_args(get_args(wire.NativeRequest)[0]))
+
+
+def test_the_dispatch_table_has_one_entry_per_typed_native_request():
+    assert set(_HANDLERS) == set(get_args(get_args(wire.NativeRequest)[0]))
+
+
+@pytest.mark.parametrize(("cls", "module", "name", "receives"), DISPATCH_ROUTES,
+                         ids=[route[0].__name__ for route in DISPATCH_ROUTES])
+def test_dispatch_sends_each_typed_native_request_to_its_one_handler(monkeypatch, cls, module, name, receives):
+    calls = route_spies(monkeypatch)
+    runtime = object.__new__(NativeTurnRuntime)
+    command = routed(cls)
+    expected = {
+        "command": ((runtime, command), {}),
+        "request_id": ((runtime, "rid-route"), {}),
+        "conversation_id": ((runtime, "cid-route"), {}),
+        "nothing": ((runtime,), {}),
+        "session": ((runtime,), {"environment_request_id": "erid-route", "workspace": "workspace-route"}),
+    }[receives]
+
+    assert asyncio.run(runtime.dispatch(command)) == (module, name)
+    assert calls == [((module, name), *expected)]
+
+
+def test_dispatch_sends_a_subclass_of_a_typed_request_to_the_same_handler(monkeypatch):
+    class LaterSubmit(wire.NativeSubmit):
+        pass
+
+    calls = route_spies(monkeypatch)
+    runtime = object.__new__(NativeTurnRuntime)
+    command = LaterSubmit.model_construct()
+
+    assert asyncio.run(runtime.dispatch(command)) == (None, "submit")
+    assert calls == [((None, "submit"), (runtime, command), {})]
+
+
+def test_dispatch_refuses_an_untyped_native_request_without_calling_a_handler(monkeypatch):
+    class NativeUnknown(WireModel):
+        operation: Literal["unknown"] = "unknown"
+
+    calls = route_spies(monkeypatch)
+
+    with pytest.raises(Problem) as refused:
+        asyncio.run(object.__new__(NativeTurnRuntime).dispatch(NativeUnknown()))
+
+    assert refused.value.status == 422
+    assert refused.value.body == {"error": {"code": "NATIVE_REQUEST_INVALID", "message": "unknown native operation"}}
+    assert calls == []

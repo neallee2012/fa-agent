@@ -5,7 +5,6 @@ import copy
 import hashlib
 import json
 from unittest.mock import patch
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -306,49 +305,6 @@ def test_purpose_header_is_single_bounded_and_not_silently_ignored(m3, signing_k
     ])
     assert response.status_code == 422
     assert http.get(PATH, headers=agent).json() == initial.json()
-
-
-@pytest.mark.parametrize("digest", ["missing", "wrong", "exact"])
-@pytest.mark.parametrize("action", ["approve", "reject"])
-def test_human_cli_displays_purpose_and_requires_its_explicit_digest(
-    m3, signing_key, jwk_client, monkeypatch, capsys, digest, action,
-):
-    from unittest.mock import MagicMock
-    from shared_context.m3_cli import main
-    http, _, human, uploaded, version = draft(m3, signing_key, jwk_client)
-    credential = MagicMock()
-    credential.__enter__.return_value = credential
-    credential.get_token.return_value = SimpleNamespace(token=human["Authorization"].removeprefix("Bearer "))
-    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    args = [
-        "--api", "https://poc.example.westus3.azurecontainerapps.io",
-        "--tenant", m3[0].context.auth.tenant_id, "--audience", m3[0].context.auth.audience,
-        "--client-id", m3[0].approval.client_id, "--team", A.team, action, "report",
-        "--version", V1, "--sha256", version["sha256"], "--decision-id", V1,
-    ]
-    if digest != "missing":
-        args += ["--metadata-sha256", version["metadata_sha256"] if digest == "exact" else "0" * 64]
-    previews = []
-    def confirm_displayed(_):
-        previews.append(capsys.readouterr().out)
-        return action
-    with patch("shared_context.m3_cli.InteractiveBrowserCredential", return_value=credential), \
-            patch("shared_context.m3_cli.httpx.Client", return_value=http), \
-            patch("builtins.input", side_effect=confirm_displayed) as confirm:
-        result = main(args)
-    assert result == (0 if digest == "exact" else 1)
-    capsys.readouterr()
-    if digest == "exact":
-        confirm.assert_called_once()
-        assert len(previews) == 1 and version["metadata_sha256"] in previews[0]
-        assert PURPOSE in previews[0] and r"\u6838" not in previews[0]
-        decided = m3[0].get(A, A.team, "report").payload
-        assert decided["effective_version_id"] == (V1 if action == "approve" else None)
-        assert decided["versions"][0]["approval"]["decision"] == action
-        assert decided["versions"][0]["approval"]["metadata_sha256"] == version["metadata_sha256"]
-    else:
-        confirm.assert_not_called()
-        assert m3[0].get(A, A.team, "report").payload["effective_version_id"] is None
 
 
 def test_metadata_acknowledgement_cannot_substitute_different_purpose(m3, signing_key, jwk_client):

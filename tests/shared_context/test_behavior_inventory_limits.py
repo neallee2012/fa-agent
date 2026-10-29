@@ -170,6 +170,24 @@ def test_inventory_default_byte_bound_refuses_over_256mib():
     assert denied.value.body["error"]["message"] == "complete inventory exceeds its bound"
 
 
+def test_startup_reads_its_inventory_with_the_default_byte_bound():
+    from shared_context.behavior_work_policy_installation import installed_work_policy_origin
+
+    class Stop(Exception):
+        pass
+
+    class Store:
+        def read_inventory(self, **bounds):
+            seen.update(bounds)
+            raise Stop
+
+    seen = {}
+    with pytest.raises(Stop):
+        installed_work_policy_origin(Store(), None)
+    # No max_bytes: startup keeps the 256 MiB default; data near it can exhaust API memory before the 413.
+    assert seen == {"max_entities": None, "log_capacity": True}
+
+
 def test_inventory_default_page_bound_accepts_its_limit_and_refuses_next_page():
     store, table = store_with_row()
     table.page_size = 1

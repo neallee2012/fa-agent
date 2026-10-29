@@ -1,5 +1,82 @@
 # Shared Context POC
 
+<a id="responses-platform-signal-get"></a>
+## Responses：平台訊號期間的一次 GET 會蓋掉 FA 的終態（agentserver-responses 2.2.0 已知問題，未修；2026-10-28，CODE/offline，未部署）
+
+- **現象**：回合已 `started`，平台設了取消訊號但不是 client `/cancel`（FA 視為 fenced，回合結束成
+  `failed`／`NATIVE_TURN_UNKNOWN`）。在 handler 送出終態事件前，只要有一次 `GET /responses/{id}`，那次就回
+  `cancelled`；之後存下的 response 一直停在 `in_progress`、`output` 是 `[]`。`stream=true` 的回合還會讓 SDK task
+  記成失敗（`invalid status transition: cancelled -> failed`），live stream 停在 `response.in_progress`、沒有終態事件，
+  重播回 400。沒有那次 GET 時一切正常。
+- **測試**：`tests/shared_context/test_native_response_platform_signal_status.py`。`test_pin_…_in_2_2_0` 照常通過，
+  把上面 2.2.0 的錯誤結果寫成固定值；**升版後先壞的是它**，看到它失敗就回來重看這一節。旁邊的
+  `xfail(strict=True, raises=AssertionError)` 寫的是正確結果，只有斷言失敗才算 XFAIL（其他例外、等待逾時都是 FAIL）。
+- **根因**（`azure/ai/agentserver/responses/hosting/_orchestrator.py`，2.2.0）：`_refresh_background_status`
+  （1256–1257）只要 `record.cancel_signal` 已設、還沒終態，就直接寫 `record.status = "cancelled"`，不經
+  `transition_to`；GET（`_endpoint_handler.py:1135`，在 1137 的 `stream=true` 分支之前）、DELETE（1527）、cancel（1693）都會呼叫它。
+  之後 `_bg_resolve_terminal_status`（638）看到已是終態就不套 handler 的終態，`_bg_persist_terminal`（856）
+  遇到 `cancelled` 不寫存檔，只留建立時的 `in_progress`；`stream=true` 路徑的 `transition_to(status)`（1839）丟例外。
+  FA 程式沒有設這個訊號的地方。
+- **哪些訊號真的會發生（FA 的設定）**：
+  - 只有**新進入**（fresh entry）的回合會翻：那時 `record.cancel_signal` 就是 handler 的第 3 個參數
+    （`_resilient_orchestrator.py:1160` 登記、`:1086` 取出），task 的 `ctx.cancel` 經 `:759/777` 設它。**恢復進入**時
+    record 另建（`:312-327`，沒帶訊號，`models/runtime.py:128` 給新的 Event），handler 拿到另一個新 Event（`:1086`），
+    `ctx.cancel` 類的訊號不會讓 GET 翻。
+  - Steering：FA 設 `steerable_conversations=False`（`behavior_hosted.py:813`），傳到 task 的 `steerable=`
+    （`_resilient_orchestrator.py:351/550`）；core 的 steering cancel（`core/tasks/_decorator.py:929`、`:1322`，
+    `_manager.py:1130`、`:1538`）都在 `steerable` 為真的分支裡，不會發生。
+  - 逾時看門狗：`core/tasks/_manager.py:1647-1648`（恢復時預算已用完則在 `:1820-1821` 直接設）。responses 註冊 task
+    沒傳 `timeout`，用預設 1 天（`_decorator.py:63`、`:107-119`）。只有超過 1 天的回合會碰到。
+  - Lease 續約失敗：`core/tasks/_lease.py:198-203`（失去 ownership）、`:214-220` 等（連續續約失敗）、`:223-235`（eviction）
+    都設 `on_cancel_callback`，而 `_manager.py:1142/1550` 傳入的正是 `ctx.cancel`（`:1092/1101`、`:1466/1507`）。
+    所以 lease 失效**是**真的來源；終態寫入遇到 lease 已換人（`_manager.py:3339`）則是丟例外，那是另一條路。
+    這與 [N6 設計](../../docs/n6-responses-migration-design.md) 第 176 行列的「lease 失效」一致。
+  - `TaskRun.cancel`（`core/tasks/_run.py:164-165`）：responses 只在非背景同步回應斷線時呼叫（`_orchestrator.py:3505`），
+    而 `_refresh_background_status` 對非背景回應直接返回（1253）；FA 程式沒有呼叫它。
+  - 收尾（wind-down，`_endpoint_handler.py:1970`）：先設 `context.shutdown`（1968），再直接設 `record.cancel_signal`，
+    所以恢復進入的回合也會翻。FA 看到 shutdown 就 `exit_for_recovery()`（`native_responses.py:325-326` 等），
+    `_bg_persist_terminal` 遇到 `exit_for_recovery` 不寫（`_orchestrator.py:855`），恢復時 record 重建成 `in_progress`；
+    這段時間的 GET 只會短暫回 `cancelled`，不會存錯。
+  - 換 session 不靠這個訊號：FA 讀自己的回條，發現屬於別的 session 就回 `NATIVE_SESSION_CHANGED`（`native_responses.py:261-264`）。
+- **誰會在窗口內 GET**：API 的即時預覽轉送（`behavior_native_stream_api.py`）對平台發
+  `GET /responses/{id}?stream=true&starting_after=N`，每段最多 230 秒（`STREAM_SECONDS`，第 32 行），工作台再用上次的序號
+  接續（`web_test_console/responses.py:19-20`），所以頁面開著時至少每 230 秒一次；SDK 在走 `stream=true` 分支前就先跑
+  `_refresh_background_status`（`_endpoint_handler.py:1135-1137`）。API 讀單一 response 歷史（`history_record`，
+  `behavior_foundry_responses.py:266-267`）也是一次 GET。平台在回合進行中是否把這些 GET 轉進容器，沒有在雲端核對。
+- **對 FA 的影響**：FA 的權威狀態是 native 回條，`/status` 照樣回 `unknown`／`NATIVE_TURN_UNKNOWN`。`history()`
+  拿到的 `output` 是 `[]`，所以沒有助理那一列、`fallback` 是 `None`，不走 `native-result` 退路
+  （`behavior_native_responses_api.py:335`、`:348`）。`stream_source` 重播拿到 400，回 409 `NATIVE_STREAM_UNAVAILABLE`
+  （`behavior_native_stream_api.py:121`）。工作台預覽只是顯示，最後以 `/status` 保存的回覆取代（`web_test_console/responses.py`
+  的 `live_text` 說明）。錯的是平台上存的 response 與 SDK task 紀錄。真的 client `/cancel` 回 `cancelled` 本來就對。
+- **選項**：
+  1. **回報上游、等 SDK 修**：`_refresh_background_status` 改看 `record.cancel_requested`（只有 `/cancel`
+     端點會設，`_endpoint_handler.py:1725`），並走 `transition_to`。代價是修好前窗口還在，但 FA 的讀者都以回條為準。
+     **還沒有回報**；要對外開 issue 需 Neal 批准。
+  2. handler 收到平台訊號就 `cancellation_signal.clear()`：只能縮小窗口（設訊號、GET、handler 醒來的先後由
+     event loop 排）。更重要的是 FA 自己用這個訊號判斷 fenced（`native_responses.py:136`、`:279`、`:283`），清掉後會讀成
+     沒被 fence；而 SDK 收尾倒數 `_iter_with_winddown`（`_orchestrator.py:207`）在訊號第一次被看到時就鎖定期限（`:229`），
+     清掉也不會取消。不採用。
+  3. FA 換掉 `_refresh_background_status`，或在 GET 路由前加 middleware 擋：等於改套件私有行為，違反 AGENTS
+     第 1 條（SDK-first）。不採用。
+
+**Verified against：**
+
+- 程式基準：`origin/main` `57e43d8c`；本分支只加測試與這一節。套件 `azure-ai-agentserver-responses` 2.2.0、
+  `azure-ai-agentserver-core` 2.2.0（`.venv` site-packages）。
+- 已讀程式：上面引用的 SDK 行號（`responses/hosting/_orchestrator.py`、`_endpoint_handler.py`、`_resilient_orchestrator.py`、
+  `models/runtime.py`；`core/tasks/_decorator.py`、`_manager.py`、`_lease.py`、`_run.py`），以及 FA 的 `behavior_hosted.py`、
+  `native_responses.py`、`behavior_native_responses_api.py`、`behavior_native_stream_api.py`、`behavior_foundry_responses.py`、
+  `web_test_console/responses.py`。
+- 其他版本：2026-10-28 從 GitHub raw 取 tag
+  [`azure-ai-agentserver-responses_2.2.0`](https://raw.githubusercontent.com/Azure/azure-sdk-for-python/azure-ai-agentserver-responses_2.2.0/sdk/agentserver/azure-ai-agentserver-responses/azure/ai/agentserver/responses/hosting/_orchestrator.py)（與安裝的檔案逐字相同）、
+  [`_2.3.0`](https://raw.githubusercontent.com/Azure/azure-sdk-for-python/azure-ai-agentserver-responses_2.3.0/sdk/agentserver/azure-ai-agentserver-responses/azure/ai/agentserver/responses/hosting/_orchestrator.py)、
+  [`_2.4.0b2`](https://raw.githubusercontent.com/Azure/azure-sdk-for-python/azure-ai-agentserver-responses_2.4.0b2/sdk/agentserver/azure-ai-agentserver-responses/azure/ai/agentserver/responses/hosting/_orchestrator.py)：
+  `_refresh_background_status` 整個函式相同（2.4.0b2 在 1252–1268）。只核了這個函式；`gh api` 被 Azure org 的 SAML 擋，改用 raw。
+- 實際驗證：上述測試檔在 Windows（`.venv`）與 Linux 容器（`linux-pytest.ps1`，Python 3.11.14）各跑 5 次，每次
+  `2 passed, 2 xfailed`；`--runxfail` 時兩個參數都在 `assert during["status"] == "in_progress"` 失敗（實得 `'cancelled'`）；暫時拿掉窗口內那次 GET（未提交）
+  再跑，兩個參數的其餘斷言都通過（`failed`／`NATIVE_TURN_UNKNOWN`，live 與重播都以 `response.failed` 結束）。
+- 證據與限制：離線替身（`OfflineSdk`），沒有真 Hosted、真平台或雲端；平台是否把進行中的 GET 轉進容器未核對。
+
 <a id="cosmos-memory-relay"></a>
 ## `private` 長期記憶的 API 轉送（ADR-0011 第 3 階段，2026-10-24，CODE/offline，未部署）
 
@@ -2182,7 +2259,7 @@ Neal 10:33 在 stage 請 A「每天晚上6點自動幫我整理 Stratechery 和�
   - 既有 stage CI、版本發布、Agent sync、「＋」相關測試 148 passed；`meta` 在沒有 pydantic 的一般 python 跑得起來，現在的 `stage.json` 照常通過。
 
 <a id="native-routine-fresh-conversation"></a>
-**2026-10-23 每次執行開一個新對話（Neal 10-23：不需要接續前一天；CODE/offline，未部署）：**
+**2026-10-23 每次執行開一個新對話（Neal 10-23：不需要接續前一天；隨第 36 版 2026-10-25 上 stage）：**
 stage A 的每日 routine 原本每天接在同一個對話後面，第一次呼叫模型的 input 從 10-15 的 189K tokens 長到 10-22 的 306K。
 runtime 自己估的只有約 177K，沒到壓縮門檻（宣告上限 272K 的 80%），所以一直沒壓縮；10-22 撞到 `gpt-6.1-sol` 的 500K TPM，停在 `unknown`
 （[根因](../../docs/progress.md#stage-v35-1022)）。改成每次執行都開新對話，context 不再逐日變大；不改 SDK、壓縮設定或 checkpoint 契約。
@@ -10264,7 +10341,8 @@ If-Match綁當前artifact。原同row CAS一次存deactivations回條並清effec
 新的deactivations欄位空時不輸出，舊wire bytes保留；最多12版本／12次各版本停用，
 沿48KiB record界線。舊strict reader可能拒絕新history欄位，不外推mixed-version部署相容性。
 
-管理CLI新增`deactivate`，沿原API／tenant／audience／client／Team設定：
+管理CLI新增`deactivate`，沿原API／tenant／audience／client／Team設定
+（`shared_context.m3_cli`與`m3_artifacts_cli.py`已於 2026-10 移除，以下為歷史紀錄）：
 
 ```powershell
 $env:PYTHONPATH = ".\src\fa-shared-context-poc" # 從 repo 根目錄執行
@@ -16693,6 +16771,7 @@ worker_profile 必須由 admission 捕獲；沿既有 profile 選 per-turn 或
 ### T1b 原票與開始／結束回條接點（LOCAL，draft）
 
 此片提供可接 T2 的 receipt core、wire、HTTP installer 與 Hosted consumer；**尚未切換正式入口**。
+（2026-10 更新：HTTP installer `behavior_turn_api` 與 Hosted consumer `behavior_turn_client` 已因無正式入口、只剩測試引用而移除，現存的是 receipt core 與 wire；下面提到 `install_turn_routes`、`TurnReceiptClient` 的兩段是當時的設計紀錄。）
 API 的 caller 先完成 owner／目標 Agent 解析，用原 job 的可信 `Assignment` 和 server 的
 `AgentVmBinding` 建立 `TurnTicket`，不能由 browser／模型自己組這些欄位。
 `prepare_turn(ticket, principal, expected_vm=vm)` 是純函式，回
@@ -17151,7 +17230,7 @@ TC-12只追加子集證據，current baseline／其餘資格不改，不宣稱�
 結果、可下載真成果與唯讀CLI範例見[M3結果](../../docs/M3-ARTIFACTS-POC.md)；新模型工作需另批範圍。
 
 這是獨立於舊 work 的成果資源，不改寫 M2 已發布的 revision6，也不重設其160次模型計數。
-`m3_artifacts.py` 管理成果版本與批准；`m3_artifacts_cli.py` 是供人查看、下載、拒絕／批准的薄入口，
+`m3_artifacts.py` 管理成果版本與批准；`m3_artifacts_cli.py`（已於 2026-10 移除）是供人查看、下載、拒絕／批准的薄入口，
 不是自然語言交辦入口。人工JWT、Blob adapter、Hosted成果工具與M3獨立模型路由均已接線，
 本機已驗成果v1／v2、原檔不覆寫、未知上傳核對、人工批准／拒絕、生效context及SDK新路由。
 本機測試的JWT採RS256測試簽章，Blob採Azure SDK搭配假transport；這些測試本身不是真雲端證據。
@@ -17271,6 +17350,7 @@ Hosted的`operation:model_budget`可另帶`milestone:m3`讀新counter；省略�
 檔名只收ASCII字母／數字開頭及`.`、`_`、`-`；拒絕路徑、重複header、壓縮body及超量串流。
 M3上傳路由先驗身份再收大body，不把其他JSON路由的64 KiB上限一併放大。
 
+**此CLI（`m3_artifacts_cli.py`／`shared_context.m3_cli`）已於 2026-10 移除；以下命令為歷史紀錄。**
 `--help`不需要雲端。其餘命令需指定既有成果，並由指定admin互動登入；從repo根目錄使用：
 
 ```powershell
@@ -17293,7 +17373,8 @@ HTTP失敗不自動重送決定，先查看該artifact的決定receipt。這些�
 
 #### Skill審核清單（只讀，LOCAL，未部署）
 
-`list`不需指定成果，列出設定Team內所有skill的目前審核狀態，讓人類找出待批准或已停用的版本：
+`list`不需指定成果，列出設定Team內所有skill的目前審核狀態，讓人類找出待批准或已停用的版本
+（CLI已於 2026-10 移除，命令為歷史紀錄；`ArtifactClient.skill_reviews`仍在）：
 
 ```powershell
 & .\src\fa-shared-context-poc\.venv\Scripts\python.exe .\src\fa-shared-context-poc\m3_artifacts_cli.py list
@@ -17783,6 +17864,10 @@ operation；receipt 保留 `starting`／`start_failed_or_unknown`。本 POC 不�
 
 ## Hosted invocations
 
+**已於 2026-10 移除：** 本節描述的 `hosted_main.py`、`shared_context/hosted.py`、
+`environment.py`、`environment_backup.py`、`backup_client.py` 與 `Dockerfile.hosted` 都已刪除，內容為歷史紀錄；
+現行 Hosted 入口是 `behavior_assistant_main`（`Dockerfile.behavior-assistant-desktop`）。
+
 `hosted_main.py` 沿用原始 POC 的 `InvocationAgentServerHost` 與同步 JSON `POST /invocations`；
 SDK **預設 port 8088**。Foundry agent definition 的 protocol 用既有 `invocations` 配置，不是
 Responses API 或 WebSocket。兩個不同 Hosted agent definitions 可用同一 image，但必須各有不同 MI。
@@ -17952,37 +18037,12 @@ MAX_PATH 令封存讀取失敗。每次使用獨立 testBase，不指向需要�
 自由指令 UI 的合成回覆與長回答 fixture 已放在 `tests\shared_context\fixtures\web_test_console`，
 不需要私有 session 目錄或舊的固定 backend core。
 
-實際 API 啟動（須先設好所有 API env；此命令沒有本機 auth bypass）：
-
-```powershell
-$env:PYTHONPATH = Join-Path $PWD 'src\fa-shared-context-poc'
-& .\src\fa-shared-context-poc\.venv\Scripts\python.exe -m uvicorn shared_context.production:create_production_app --factory --host 0.0.0.0 --port 8080 --no-access-log
-```
-
-Hosted 本機 entry（只有真實 MI 環境能執行需 token 的探針；本機 fake 僅在 tests）：
-
-```powershell
-& .\src\fa-shared-context-poc\.venv\Scripts\python.exe .\src\fa-shared-context-poc\hosted_main.py
-```
-
-Docker build 範例（各自安裝 API／Hosted 的 pinned direct dependencies；本 POC 已以 ACR
-安全 staging 完成 build／部署，不需為閱讀文件重跑）：
-
-```powershell
-docker build -f .\src\fa-shared-context-poc\Dockerfile.api -t fa-context-api:poc .\src\fa-shared-context-poc
-docker build -f .\src\fa-shared-context-poc\Dockerfile.hosted -t fa-context-hosted:poc .
-```
+舊 M2–M4 的 API 啟動（`shared_context.production:create_production_app`）、Hosted 本機 entry（`hosted_main.py`）
+與 `Dockerfile.api`／`Dockerfile.hosted`（含 `Dockerfile.hosted.dockerignore`）已於 2026-10 移除；
+現行 image 為 `Dockerfile.behavior-api` 與 `Dockerfile.behavior-assistant-desktop`。
 
 API 與 Hosted manifests 都明確包含 `httpx==0.28.1`，不依賴 `azure-ai-projects==2.3.0`
 的 transitive dependency 宣告來提供它。單元測試也檢查兩份 manifest 及 SDK imports。
-
-API build context 維持 source folder；Hosted 改用 **repository root**，但 COPY 只含本目錄的
-runtime／manifest 與原 POC 的單一 `desktop_smoke.py`。鄰接的
-`Dockerfile.hosted.dockerignore` 是全拒絕後逐檔／目錄 allowlist，不包含 `.azure`、evidence、
-credentials、venv 或其他舊 POC helpers。編排者使用的 cloud builder 必須支援此 Dockerfile-specific
-ignore；若 uploader 不支援，先建立同樣 allowlist 的 build staging，**不能直接上傳未篩選的 repo**。
-Hosted OS 套件只加入 Chromium、Xvfb、Openbox、xdotool、ImageMagick、fonts 與 CA certificates；
-沒有 SMB/OAuth/native mount 依賴。
 
 ## v1.2 首輪測試入口：web-first（本機預覽）
 
@@ -18030,6 +18090,8 @@ Web client 可讀舊版 `delivery_state=fulfilled` 及新版 `delivered`，
 
 ### 原已停止結果的正式web轉交
 
+（2026-10 更新：獨立receiver `behavior_web_handoff_api` 已因無正式入口、只剩測試引用而移除；`behavior_web_handoff` 後端核心仍在。以下為當時的設計紀錄。）
+
 `behavior_web_handoff_api.create_app`是獨立receiver，不掛到普通業務入口，
 也沒有submit／claim／模型／stop／Teams發送方法。
 指定人員的Read＋Approve只批准這次同人、同原結果的通道轉交；
@@ -18057,6 +18119,7 @@ binding／profile／route，也不會把動態工作塞進 `config.bindings`。�
 assignment仍為accepted、完整same-SID模型intent集合及artifact／result／archive／restore／
 operation皆沒有副作用的分支；缺資料或其他分支不會被改成「沒有請求」。
 
+（2026-10 更新：`behavior_recovery_api` 已因無正式入口、只剩測試引用而移除，下一段是當時的設計紀錄。）
 既有 `behavior_recovery_api.create_app` 仍讀 `FA_CLAIMED_RECOVERY_SCOPE_JSON`，
 在此明確schema下提供 `/operator/v1/sdk-recovery/` 的 `plan`、`authorize`、
 `execute`、`finish`、`deliver`、`reconcile`。指定真人需要原Read＋Approve；
@@ -18200,7 +18263,7 @@ rotation預覽超限仍413 `ROTATION_INVENTORY_LIMIT`，不交出部分或空inv
 
 standing啟動的live完整讀取通過最後一次guard核對後，既有API INFO logger只記一行`BEHAVIOR_INVENTORY_READ`：
 `bytes`、`entities`、`bytes_pct_of_default`及`entities_pct_of_default`，不記row內容或識別值。
-百分比以共用128MiB／65,536預設值作觀測基準；standing的`max_entities=None`不因此變成新的gate，
+`bytes_pct_of_default`以該次讀取實際套用的位元組上限、`entities_pct_of_default`以共用預設筆數作觀測基準（2026-10-28；欄位名不變）；standing的`max_entities=None`不因此變成新的gate，
 也不依比例新增警告或拒絕。`log_capacity`預設False，只有standing啟動的live讀取傳True；
 失敗、不完整讀取，以及未opt-in的operator／歷史snapshot讀取不輸出這行，避免把舊preimage當成live容量。
 

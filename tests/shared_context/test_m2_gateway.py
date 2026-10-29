@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from copy import deepcopy
 from threading import Barrier, Lock
-from unittest.mock import Mock
 
 import httpx
 import anyio
@@ -17,7 +16,7 @@ import pytest
 from azure.core.credentials import AccessToken
 from fastapi.testclient import TestClient
 
-from conftest import A, B, C, AUDIENCE, TENANT, FakeMemory, InMemoryRepository
+from conftest import A, B, C, FakeMemory, InMemoryRepository
 from shared_context.api import create_app
 from shared_context.auth import JwtVerifier
 from shared_context.errors import Problem
@@ -607,48 +606,6 @@ def test_malformed_compact_receipts_fail_closed(relays, auth, changes):
     assert client.get(BUDGET).status_code == 502
     assert client.post(CHAT, json=BODY).status_code == 502
     assert len(repository.writes) == writes_before and observed == credential.scopes == []
-
-
-def test_production_opt_in_reuses_api_identity_and_closes_model_transport_without_startup_calls(monkeypatch):
-    import shared_context.production as production
-
-    values = {
-        "CONTEXT_TENANT_ID": TENANT, "CONTEXT_API_AUDIENCE": AUDIENCE,
-        "CONTEXT_ACTORS_JSON": json.dumps({A.oid: {"actor": A.actor, "team": A.team}}),
-        "CONTEXT_ISSUERS_JSON": json.dumps([f"https://sts.windows.net/{TENANT}/"]),
-        "CONTEXT_TABLE_ENDPOINT": "https://synthetic.table.core.windows.net", "CONTEXT_TABLE_NAME": "workstate",
-        "CONTEXT_MEMORY_ENDPOINT": PROJECT, "CONTEXT_MEMORY_STORE": "poc-team-memory",
-        "CONTEXT_M2_RUN_ID": "m2-production", "CONTEXT_M2_MODEL": MODEL, "CONTEXT_M2_MAX_REQUESTS": "120",
-        "AZURE_CLIENT_ID": "00000000-0000-0000-0000-000000000027",
-    }
-    for key, value in values.items():
-        monkeypatch.setenv(key, value)
-    for key in ("CONTEXT_BACKUP_BLOB_ENDPOINT", "CONTEXT_BACKUP_CONTAINER"):
-        monkeypatch.delenv(key, raising=False)
-    credential, table, project = Mock(), Mock(), Mock()
-    identity_factory = Mock(return_value=credential)
-    monkeypatch.setattr(production, "ManagedIdentityCredential", identity_factory)
-    monkeypatch.setattr(production, "TableClient", Mock(return_value=table))
-    monkeypatch.setattr(production, "AIProjectClient", Mock(return_value=project))
-
-    class Transport(httpx.MockTransport):
-        closed = False
-
-        async def aclose(self):
-            self.closed = True
-
-    transport = Transport(lambda _: pytest.fail("no native model call at startup or without auth"))
-    factory = Mock(return_value=transport)
-    monkeypatch.setattr(httpx, "AsyncHTTPTransport", factory)
-    with TestClient(production.create_production_app()) as client:
-        assert client.get(BUDGET).status_code == 401
-        assert client.post(CHAT, content=b"x" * (4 * 1024 * 1024 + 1)).status_code == 401
-        assert table.method_calls == project.method_calls == credential.method_calls == []
-    identity_factory.assert_called_once_with(client_id=values["AZURE_CLIENT_ID"])
-    factory.assert_called_once_with(retries=0)
-    assert transport.closed
-    for resource in (credential, table, project):
-        resource.close.assert_called_once()
 
 
 async def asgi_post(app, receive, headers=None):

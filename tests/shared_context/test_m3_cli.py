@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import os
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
 
 from shared_context.errors import Problem
-from shared_context.m3_cli import main
 from shared_context.m3_client import ArtifactClient
 from shared_context.m3_models import ApprovalInput
 from test_m3_api import client
@@ -138,104 +136,3 @@ def test_invalid_metadata_is_never_presented_as_a_valid_artifact(payload):
             ArtifactClient(http, HUMAN.team, lambda: "synthetic-token").get("report")
 
 
-def test_main_refuses_noninteractive_approval_before_opening_login(monkeypatch):
-    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
-    with patch("shared_context.m3_cli.InteractiveBrowserCredential") as credential:
-        result = main([
-            "--api", "https://poc.example.westus3.azurecontainerapps.io",
-            "--tenant", "11111111-1111-1111-1111-111111111111",
-            "--audience", "api://22222222-2222-2222-2222-222222222222",
-            "--client-id", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "--team", HUMAN.team,
-            "approve", "report", "--version", V1, "--sha256", "0" * 64,
-        ])
-    assert result == 1
-    credential.assert_not_called()
-
-
-@pytest.mark.parametrize("answer,expected", [("approve", 0), ("cancel", 1)])
-def test_human_cli_preview_and_confirmation_control_the_actual_decision(m3, monkeypatch, capsys, answer, expected):
-    service, _, _ = m3
-    create(service, "sop")
-    record = upload(service)
-    digest = record.payload["versions"][0]["sha256"]
-    http = client(service, HUMAN)
-    credential = MagicMock()
-    credential.__enter__.return_value = credential
-    credential.get_token.return_value = SimpleNamespace(token="synthetic-human-token")
-    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    with patch("shared_context.m3_cli.InteractiveBrowserCredential", return_value=credential), \
-            patch("shared_context.m3_cli.httpx.Client", return_value=http), \
-            patch("builtins.input", return_value=answer):
-        outcome = main([
-            "--api", "https://poc.example.westus3.azurecontainerapps.io",
-            "--tenant", "11111111-1111-1111-1111-111111111111",
-            "--audience", "api://22222222-2222-2222-2222-222222222222",
-            "--client-id", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "--team", HUMAN.team,
-            "approve", "report", "--version", V1, "--sha256", digest, "--decision-id", V1,
-        ])
-    assert outcome == expected
-    credential.authenticate.assert_called_once_with(
-        scopes=["api://22222222-2222-2222-2222-222222222222/Artifacts.Approve"],
-    )
-    captured = capsys.readouterr()
-    assert "report v1" in captured.out and digest in captured.out
-    assert "synthetic-human-token" not in captured.out + captured.err
-    assert service.get(HUMAN, HUMAN.team, "report").payload["effective_version_id"] == (V1 if expected == 0 else None)
-
-
-@pytest.mark.parametrize("failure", [
-    "metadata_timeout", "content_timeout", "decision_timeout", "metadata_connect_error", "metadata_repeated_timeout",
-])
-def test_cli_retries_only_preview_timeouts_once_without_reauthenticating(m3, monkeypatch, capsys, failure):
-    service, _, _ = m3
-    create(service, "sop")
-    record = upload(service)
-    digest = record.payload["versions"][0]["sha256"]
-    http = client(service, HUMAN)
-    original_stream = http.stream
-    calls, failed = [], []
-
-    def stream(method, path, **kwargs):
-        phase = "decision" if method == "POST" else ("content" if path.endswith("/content") else "metadata")
-        calls.append(phase)
-        if failure.startswith(phase + "_") and (not failed or failure == "metadata_repeated_timeout"):
-            failed.append(phase)
-            if phase == "decision":
-                with original_stream(method, path, **kwargs) as response:
-                    response.read()
-                    assert response.status_code == 200
-            error = httpx.ConnectError if failure == "metadata_connect_error" else httpx.ReadTimeout
-            raise error("sensitive diagnostic text must not be printed")
-        return original_stream(method, path, **kwargs)
-
-    credential = MagicMock()
-    credential.__enter__.return_value = credential
-    credential.get_token.return_value = SimpleNamespace(token="synthetic-human-token")
-    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    with patch("shared_context.m3_cli.InteractiveBrowserCredential", return_value=credential), \
-            patch("shared_context.m3_cli.httpx.Client", return_value=http), \
-            patch.object(http, "stream", side_effect=stream), \
-            patch("builtins.input", return_value="approve") as confirm:
-        outcome = main([
-            "--api", "https://poc.example.westus3.azurecontainerapps.io",
-            "--tenant", "11111111-1111-1111-1111-111111111111",
-            "--audience", "api://22222222-2222-2222-2222-222222222222",
-            "--client-id", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "--team", HUMAN.team,
-            "approve", "report", "--version", V1, "--sha256", digest, "--decision-id", V1,
-        ])
-    recovered = failure in ("metadata_timeout", "content_timeout")
-    decision_sent = recovered or failure == "decision_timeout"
-    assert outcome == (0 if recovered else 1)
-    assert calls.count("decision") == int(decision_sent)
-    assert confirm.call_count == int(decision_sent)
-    credential.authenticate.assert_called_once()
-    phase = failure.split("_")[0]
-    read_retry = failure in ("metadata_timeout", "content_timeout", "metadata_repeated_timeout")
-    assert calls.count(phase) == (2 if read_retry else 1)
-    captured = capsys.readouterr()
-    assert ("M3_READ_RETRY" in captured.err) == read_retry
-    if not recovered:
-        assert f'"phase": "{phase}"' in captured.err
-    assert "sensitive diagnostic text" not in captured.out + captured.err
-    assert "synthetic-human-token" not in captured.out + captured.err
-    assert service.get(HUMAN, HUMAN.team, "report").payload["effective_version_id"] == (V1 if decision_sent else None)

@@ -49,7 +49,10 @@ def strict_json(raw):
         return value
     def invalid(_):
         raise ValueError("non-finite JSON")
-    return json.loads(raw, object_pairs_hook=pairs, parse_constant=invalid)
+    try:
+        return json.loads(raw, object_pairs_hook=pairs, parse_constant=invalid)
+    except RecursionError as error:  # nested deeper than the parser's recursion limit: just another unreadable body
+        raise ValueError("JSON nested too deep") from error
 
 
 def error_code(raw):
@@ -369,6 +372,246 @@ def checked_result(task, body, headers, delivery_id):
     return VerifiedResult(body, binding, exchange, SecretStr(token), payload)
 
 
+_NATIVE_TURNS = "/work-policy/v1/native-turns/"
+_RESPONSES_TURNS = "/work-policy/v1/responses-turns/"
+_TEMPLATE = "/work-policy/v1/agent-template"
+_ID = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
+_ROUTINE_DEFINITIONS = re.compile(r"/native-routines/v1/agents/" + _ID + "/definitions(/" + _ID + ")?")
+_PARSED_PREFIXES = ("/team-skills/v1/", "/team-mcp/v1/", "/team-connectors/v1/", "/native-groups/v1/",
+                    "/native-hitl/v1/", "/work-policy/v1/")
+_DELEGATION_READ = re.compile(r"/work-policy/v1/conversations/[^/]+/turns/[1-9][0-9]*/delegation")
+_NATIVE_NOT_DISPATCHED_PATHS = frozenset({
+    "/work-policy/v1/native-turns/submit", "/work-policy/v1/responses-turns/submit",
+    "/work-policy/v1/native-turns/cancel", "/work-policy/v1/responses-turns/cancel",
+    "/work-policy/v1/native-turns/delivered", "/work-policy/v1/native-turns/append"})
+_SERVER_FOLLOWING = frozenset({(409, "NATIVE_SESSION_CHANGED"), (503, "AGENT_VERSION_FOLLOWING"),
+                               (503, "NATIVE_EXECUTION_UNAVAILABLE")})
+_NATIVE_EXTRA_CODES = frozenset({
+    "FOUNDRY_INVOCATION_UNKNOWN", "FOUNDRY_RESPONSE_INVALID", "FOUNDRY_NATIVE_BINDING_MISMATCH",
+    "BEHAVIOR_COMMIT_UNKNOWN", "AGENT_USAGE_CONFLICT", "INSTRUCTION_ROUTE_CHANGED"})
+_DELEGATION_CODES = frozenset({
+    "DELEGATION_UNKNOWN", "DELEGATION_UNAVAILABLE", "DELEGATION_DISABLED", "DELEGATION_SESSION_READ_ONLY",
+    "DELEGATION_PARENT_REQUIRED", "DELEGATION_SCOPE_CHANGED", "DELEGATION_RECORD_INVALID", "DELEGATION_RESULT_INVALID"})
+_CONFLICT_CODES = frozenset({
+    "CONVERSATION_ARCHIVED", "CONVERSATION_SESSION_RESET_REQUIRED", "CONVERSATION_SESSION_UNAVAILABLE",
+    "CONVERSATION_SESSION_VERSION_CHANGED", "CONVERSATION_TURN_UNRESOLVED", "WORK_SUBMIT_UNKNOWN",
+    "CANCELLATION_RECEIPT_UNKNOWN", "CANCELLATION_RECEIPT_CHANGED", "CANCELLATION_RECEIPT_INVALID",
+    "CONVERSATION_TRANSFER_NOT_READY", "CONVERSATION_TRANSFER_SCOPE", "CONVERSATION_TRANSFER_ARCHIVE_INVALID",
+    "CONVERSATION_TRANSFER_UNAVAILABLE", "CONVERSATION_TRANSFER_UNKNOWN", "CONVERSATION_TRANSFER_CHANGED",
+    "CONVERSATION_TRANSFER_CONFLICT", "CONVERSATION_TRANSFER_INVALID", "CONVERSATION_TRANSFER_BUDGET"})
+_SYSTEM_PROMPT_CODES = frozenset({
+    "SYSTEM_PROMPT_UNRECONSTRUCTABLE", "AGENT_TEMPLATE_PROFILE_UNSUPPORTED", "AGENT_ROLE_PROMPT_INVALID",
+    "AGENT_ROLE_PROMPT_MISSING", "CAPABILITY_SOURCES_CHANGED", "NATIVE_TURNS_DISABLED"})
+_SELECTION_PATHS = frozenset({_TEMPLATE + "/select", _TEMPLATE + "/selection", _TEMPLATE + "/selection-reconcile"})
+_SELECTION_CODES = frozenset({
+    "PROFILE_SELECTION_UNSUPPORTED", "PROFILE_SELECTION_DISABLED", "PROFILE_SELECTION_DENIED",
+    "PROFILE_SELECTION_CONFLICT", "PROFILE_SELECTION_SOURCES_CHANGED", "PROFILE_SELECTION_MISSING",
+    "PROFILE_SELECTION_INVALID", "PROFILE_SELECTION_UNKNOWN"})
+
+
+def _allow(ok):
+    require(ok, "ORIGIN_DENIED", 403)
+
+
+def _int_within(params, key, high):
+    return key not in params or type(params[key]) is int and 1 <= params[key] <= high
+
+
+def _only_after_id(params):
+    return set(params) == {"after"} and type(params["after"]) is str and re.fullmatch(_ID, params["after"]) is not None
+
+
+def _check_origin(url, origin, path):
+    _allow(urlsplit(url).netloc == urlsplit(origin).netloc
+           and path.startswith("/") and not path.startswith("//") and "?" not in path and "#" not in path)
+
+
+def _request_headers(token, if_match):
+    return {"Authorization": "Bearer "+token, "Content-Type": "application/json",
+            "Accept-Encoding": "identity", NOTICE_KINDS_HEADER: NOTICE_KINDS_VERSION,
+            UPGRADE_WAITING_HEADER: UPGRADE_WAITING_VERSION,
+            ROLLBACK_NOTICE_HEADER: ROLLBACK_NOTICE_VERSION, UPGRADE_VETOED_HEADER: UPGRADE_VETOED_VERSION,
+            **({} if if_match is None else {"If-Match": if_match})}
+
+
+def _read_limited(response, token, limit, start):
+    data = bytearray()
+    for chunk in response.iter_bytes():
+        data.extend(chunk)
+        require(len(data) <= limit and time.monotonic()-start < 120, "RESPONSE_LIMIT", 502)
+    require(token.encode() not in data, "RESULT_INVALID", 502)
+    return data
+
+
+def _require_no_store(data, headers):
+    require(not data and headers.get("cache-control") == "no-store", "DELEGATION_RESPONSE_INVALID", 502)
+
+
+def _check_if_match(method, path, if_match):
+    # Only a Team skill decision carries the owner's observed ETag; nothing else sends If-Match.
+    _allow(if_match is None or path.startswith("/team-skills/v1/") and method == "POST" and type(if_match) is str
+           and 0 < len(if_match) <= 256 and if_match.isprintable())
+
+
+def _check_attention_params(get_only, params):
+    from pydantic import TypeAdapter
+    from shared_context.native_hitl_wire import AttentionCursor
+    _allow(get_only and set(params) <= {"cursor", "limit"} and _int_within(params, "limit", 20))
+    if "cursor" in params:
+        try:
+            TypeAdapter(AttentionCursor).validate_python(params["cursor"], strict=True)
+        except ValueError:
+            raise ConsoleError("ORIGIN_DENIED", 403) from None
+
+
+def _check_responses_params(get_only, path, params):
+    _allow(get_only and re.fullmatch(
+        r"/work-policy/v1/responses-turns/(conversations|responses)/[A-Za-z0-9_-]{1,128}/history", path)
+        and set(params) <= {"after", "limit"}
+        and ("after" not in params or type(params["after"]) is str
+             and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", params["after"]))
+        and _int_within(params, "limit", 100))
+
+
+def _check_received_params(get_only, params):
+    # The official State store cursor of the previous page (StateStoreCursor), passed back unchanged.
+    _allow(get_only and set(params) == {"after"} and type(params["after"]) is str
+           and 0 < len(params["after"]) <= 2048 and params["after"].isprintable())
+
+
+def _check_native_params(get_only, path, params):
+    names = {"after_turn", "limit"} if path.endswith("/history") else {"part"} if path.endswith("/result") else set()
+    _allow(path.startswith(_NATIVE_TURNS) and get_only and set(params) <= names
+           and all(type(value) is int and value >= 0 for value in params.values()))
+
+
+def _check_params(method, path, body, params):
+    get_only = method == "GET" and body is None
+    if path == "/native-hitl/v1/attention":
+        _check_attention_params(get_only, params)
+    elif path.startswith("/team-skills/v1/"):
+        _allow(get_only and path == "/team-skills/v1/reviews" and _only_after_id(params))
+    elif _ROUTINE_DEFINITIONS.fullmatch(path):
+        _allow(get_only and path.endswith("/definitions") and _only_after_id(params))
+    elif path.startswith(_RESPONSES_TURNS):
+        _check_responses_params(get_only, path, params)
+    elif path == "/work-policy/v1/native-turns/received":
+        _check_received_params(get_only, params)
+    else:
+        _check_native_params(get_only, path, params)
+
+
+def _is_delegation_read(method, path, body):
+    return method == "GET" and body is None and _DELEGATION_READ.fullmatch(path) is not None
+
+
+def _accepted(method, status, path):
+    if method != "POST":
+        return False
+    if status == 201:
+        return path == "/native-groups/v1/groups"
+    return status == 202 and (
+        path.startswith(_NATIVE_TURNS) and (path.endswith("/submit") or path == _NATIVE_TURNS + "append")
+        or path in {_RESPONSES_TURNS + "submit", _RESPONSES_TURNS + "reconcile"})
+
+
+def _problem(data):
+    """The problem body's ``error`` value as sent (None when the body is not a JSON object with one), and that
+    object's ``code`` as sent (None when ``error`` is not an object or has no ``code``)."""
+    try:
+        problem = strict_json(bytes(data))
+    except (ValueError, TypeError):
+        problem = {}
+    error = problem.get("error") if type(problem) is dict else None
+    return error, error.get("code") if type(error) is dict else None
+
+
+def _problem_for(method, path, data):
+    """``_problem`` only where a body can change the outcome, as before: a read or a route with its own codes."""
+    if method == "GET" or path.startswith(_PARSED_PREFIXES) or _ROUTINE_DEFINITIONS.fullmatch(path):
+        return _problem(data)
+    return None, None
+
+
+def _retry_hint(method, detail):
+    return method == "GET" and type(detail) is dict and detail.get("automatic_retry") is True
+
+
+def _raise_listed(code, codes, shown, status):
+    if type(code) is str and code in codes:
+        raise ConsoleError(code, shown, status)
+
+
+def _raise_service_error(path, status, code):
+    # The error sets are imported lazily, as before: they live in modules that import this one.
+    client_status = status if 400 <= status < 500 else 502
+    if path.startswith("/team-skills/v1/"):
+        from .team_skills import TEAM_SKILL_ERRORS
+        _raise_listed(code, TEAM_SKILL_ERRORS, client_status, status)
+    if path.startswith(("/team-mcp/v1/", "/team-connectors/v1/")):
+        from .team_connectors import API_ERRORS
+        _raise_listed(code, API_ERRORS, client_status, status)
+    if path.startswith("/native-groups/v1/"):
+        from shared_context.native_group_wire import NATIVE_GROUP_ERRORS
+        _raise_listed(code, NATIVE_GROUP_ERRORS, status, status)
+    routine_definitions = _ROUTINE_DEFINITIONS.fullmatch(path) is not None
+    if path.startswith("/native-hitl/v1/") or routine_definitions:
+        from shared_context.native_hitl_wire import NATIVE_HITL_ERRORS
+        from shared_context.native_routine_wire import NATIVE_ROUTINE_ERRORS
+        # An owner's allow on a routine card first saves its schedule, so it can return a routine code.
+        _raise_listed(code, NATIVE_ROUTINE_ERRORS | (frozenset() if routine_definitions else NATIVE_HITL_ERRORS),
+                      status, status)
+
+
+def _not_dispatched(method, path, body, status, error, code):
+    # The server says this send certainly did not go out (rid:<RID> was not created). API #680
+    # sets it only then, on a 4xx refusal or a 5xx whose uncertainty is about a version follow,
+    # not this message. Without it a 5xx stays UNKNOWN. Its own code is kept, whatever it is.
+    # A cancel or delivery acknowledgement carries it when no session was invoked (#813).
+    return (method == "POST" and path in _NATIVE_NOT_DISPATCHED_PATHS
+            and 400 <= status < 600 and type(code) is str
+            and re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", code) is not None
+            and error.get("not_dispatched") is True and isinstance(body, dict)
+            and error.get("request_id") == body.get("request_id"))
+
+
+def _raise_native_turn_error(method, path, body, status, error, code):
+    from shared_context.behavior_native_turn_wire import NATIVE_TURN_ERRORS
+    not_dispatched = _not_dispatched(method, path, body, status, error, code)
+    server_following = (not_dispatched and error.get("server_following") is True
+                        and (status, code) in _SERVER_FOLLOWING)
+    if not_dispatched or type(code) is str and code in NATIVE_TURN_ERRORS | _NATIVE_EXTRA_CODES:
+        raise ConsoleError(code, status, status, not_dispatched=not_dispatched, server_following=server_following)
+
+
+def _raise_realtime_error(method, path, status, code):
+    if method == "GET" and path == "/work-policy/v1/realtime/negotiate":
+        _raise_listed(code, {"REALTIME_DISABLED", "REALTIME_UNAVAILABLE"}, 503, status)
+
+
+def _raise_work_policy_error(method, path, body, status, error, code):
+    _raise_realtime_error(method, path, status, code)
+    if path == "/work-policy/v1/agent-connectors" and 400 <= status < 500:
+        from .team_connectors import AGENT_API_ERRORS
+        _raise_listed(code, AGENT_API_ERRORS, status, status)
+    if path.startswith((_NATIVE_TURNS, _RESPONSES_TURNS)):
+        _raise_native_turn_error(method, path, body, status, error, code)
+    for applies, codes in (
+            (_is_delegation_read(method, path, body), _DELEGATION_CODES), (True, _CONFLICT_CODES),
+            (method == "GET" and path == _TEMPLATE and status == 409, {"AGENT_TEMPLATE_PROFILE_UNSUPPORTED"}),
+            (method == "GET" and path == _TEMPLATE + "/system-prompt", _SYSTEM_PROMPT_CODES),
+            (path in _SELECTION_PATHS, _SELECTION_CODES)):
+        if applies:
+            _raise_listed(code, codes, 409, status)
+
+
+def _raise_known_error(method, path, body, status, error, code):
+    """Raise the API's own error code for a non-success response when this route lists it; else return."""
+    _raise_service_error(path, status, code)
+    if path.startswith("/work-policy/v1/"):
+        _raise_work_policy_error(method, path, body, status, error, code)
+
+
 class PullAdapter:
     def __init__(self, config, client, *, api_prefix=""):
         if api_prefix:
@@ -394,212 +637,26 @@ class PullAdapter:
 
     def send(self, method, path, body, token, *, limit=131072, params=None, if_match=None):
         url = self.config.backend_origin+self.api_prefix+path
-        require(urlsplit(url).netloc == urlsplit(self.config.backend_origin).netloc
-                and path.startswith("/") and not path.startswith("//") and "?" not in path and "#" not in path,
-                "ORIGIN_DENIED", 403)
-        native = path.startswith("/work-policy/v1/native-turns/")
-        responses = path.startswith("/work-policy/v1/responses-turns/")
-        team_skills = path.startswith("/team-skills/v1/")
-        routine_definitions = re.fullmatch(
-            r"/native-routines/v1/agents/[A-Za-z0-9][A-Za-z0-9_-]{0,63}/definitions(/[A-Za-z0-9][A-Za-z0-9_-]{0,63})?",
-            path) is not None
-        # Only a Team skill decision carries the owner's observed ETag; nothing else sends If-Match.
-        require(if_match is None or team_skills and method == "POST" and type(if_match) is str
-                and 0 < len(if_match) <= 256 and if_match.isprintable(), "ORIGIN_DENIED", 403)
+        _check_origin(url, self.config.backend_origin, path)
+        _check_if_match(method, path, if_match)
         if params:
-            if path == "/native-hitl/v1/attention":
-                from pydantic import TypeAdapter
-                from shared_context.native_hitl_wire import AttentionCursor
-                require(method == "GET" and body is None and set(params) <= {"cursor", "limit"}
-                        and ("limit" not in params or type(params["limit"]) is int and 1 <= params["limit"] <= 20),
-                        "ORIGIN_DENIED", 403)
-                if "cursor" in params:
-                    try:
-                        TypeAdapter(AttentionCursor).validate_python(params["cursor"], strict=True)
-                    except ValueError:
-                        raise ConsoleError("ORIGIN_DENIED", 403) from None
-            elif team_skills:
-                require(method == "GET" and body is None and path == "/team-skills/v1/reviews" and set(params) == {"after"}
-                        and type(params["after"]) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", params["after"]),
-                        "ORIGIN_DENIED", 403)
-            elif routine_definitions:
-                require(method == "GET" and body is None and path.endswith("/definitions") and set(params) == {"after"}
-                        and type(params["after"]) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", params["after"]),
-                        "ORIGIN_DENIED", 403)
-            elif responses:
-                require(method == "GET" and body is None and re.fullmatch(
-                    r"/work-policy/v1/responses-turns/(conversations|responses)/[A-Za-z0-9_-]{1,128}/history", path)
-                    and set(params) <= {"after", "limit"}
-                    and ("after" not in params or type(params["after"]) is str
-                         and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", params["after"]))
-                    and ("limit" not in params or type(params["limit"]) is int and 1 <= params["limit"] <= 100),
-                    "ORIGIN_DENIED", 403)
-            elif path == "/work-policy/v1/native-turns/received":
-                # The official State store cursor of the previous page (StateStoreCursor), passed back unchanged.
-                require(method == "GET" and body is None and set(params) == {"after"} and type(params["after"]) is str
-                        and 0 < len(params["after"]) <= 2048 and params["after"].isprintable(), "ORIGIN_DENIED", 403)
-            else:
-                names = {"after_turn", "limit"} if path.endswith("/history") else {"part"} if path.endswith("/result") else set()
-                require(native and method == "GET" and body is None and set(params) <= names
-                        and all(type(value) is int and value >= 0 for value in params.values()), "ORIGIN_DENIED", 403)
-        delegation_read = method == "GET" and body is None and re.fullmatch(
-            r"/work-policy/v1/conversations/[^/]+/turns/[1-9][0-9]*/delegation", path) is not None
+            _check_params(method, path, body, params)
+        delegation_read = _is_delegation_read(method, path, body)
         retry_hint = False
         try:
             start = time.monotonic()
             with self.client.stream(method, url, params=params, content=None if body is None else canonical(body),
-                headers={"Authorization": "Bearer "+token, "Content-Type": "application/json",
-                         "Accept-Encoding": "identity", NOTICE_KINDS_HEADER: NOTICE_KINDS_VERSION,
-                         UPGRADE_WAITING_HEADER: UPGRADE_WAITING_VERSION,
-                         ROLLBACK_NOTICE_HEADER: ROLLBACK_NOTICE_VERSION, UPGRADE_VETOED_HEADER: UPGRADE_VETOED_VERSION,
-                         **({} if if_match is None else {"If-Match": if_match})},
-                follow_redirects=False) as response:
-                data = bytearray()
-                for chunk in response.iter_bytes():
-                    data.extend(chunk)
-                    require(len(data) <= limit and time.monotonic()-start < 120, "RESPONSE_LIMIT", 502)
-                require(token.encode() not in data, "RESULT_INVALID", 502)
-                if response.status_code == 204 and delegation_read:
-                    require(not data and response.headers.get("cache-control") == "no-store",
-                            "DELEGATION_RESPONSE_INVALID", 502)
+                                    headers=_request_headers(token, if_match), follow_redirects=False) as response:
+                data = _read_limited(response, token, limit, start)
+                status = response.status_code
+                if status == 204 and delegation_read:
+                    _require_no_store(data, response.headers)
                     return None, response.headers
-                accepted_post = method == "POST" and response.status_code == 202 and (
-                    native and (path.endswith("/submit") or path == "/work-policy/v1/native-turns/append")
-                    or responses and path in {
-                        "/work-policy/v1/responses-turns/submit", "/work-policy/v1/responses-turns/reconcile"})
-                group_created = method == "POST" and response.status_code == 201 and path == "/native-groups/v1/groups"
-                if response.status_code != 200 and not accepted_post and not group_created:
-                    if method == "GET":
-                        try:
-                            problem = strict_json(bytes(data))
-                            retry_hint = (type(problem) is dict and type(problem.get("error")) is dict
-                                          and problem["error"].get("automatic_retry") is True)
-                        except (ValueError, TypeError):
-                            retry_hint = False
-                    if team_skills:
-                        from .team_skills import TEAM_SKILL_ERRORS
-                        try:
-                            problem = strict_json(bytes(data))
-                        except (ValueError, TypeError):
-                            problem = {}
-                        error = problem.get("error") if type(problem) is dict else None
-                        code = error.get("code") if type(error) is dict else None
-                        if type(code) is str and code in TEAM_SKILL_ERRORS:
-                            raise ConsoleError(code, response.status_code if 400 <= response.status_code < 500 else 502,
-                                               response.status_code)
-                    if path.startswith(("/team-mcp/v1/", "/team-connectors/v1/")):
-                        from .team_connectors import API_ERRORS
-                        try:
-                            problem = strict_json(bytes(data))
-                        except (ValueError, TypeError):
-                            problem = {}
-                        error = problem.get("error") if type(problem) is dict else None
-                        code = error.get("code") if type(error) is dict else None
-                        if type(code) is str and code in API_ERRORS:
-                            raise ConsoleError(code, response.status_code if 400 <= response.status_code < 500 else 502,
-                                               response.status_code)
-                    if path.startswith("/native-groups/v1/"):
-                        from shared_context.native_group_wire import NATIVE_GROUP_ERRORS
-                        try:
-                            problem = strict_json(bytes(data))
-                        except (ValueError, TypeError):
-                            problem = {}
-                        error = problem.get("error") if type(problem) is dict else None
-                        code = error.get("code") if type(error) is dict else None
-                        if type(code) is str and code in NATIVE_GROUP_ERRORS:
-                            raise ConsoleError(code, response.status_code, response.status_code)
-                    if path.startswith("/native-hitl/v1/") or routine_definitions:
-                        from shared_context.native_hitl_wire import NATIVE_HITL_ERRORS
-                        from shared_context.native_routine_wire import NATIVE_ROUTINE_ERRORS
-                        try:
-                            problem = strict_json(bytes(data))
-                        except (ValueError, TypeError):
-                            problem = {}
-                        error = problem.get("error") if type(problem) is dict else None
-                        code = error.get("code") if type(error) is dict else None
-                        # An owner's allow on a routine card first saves its schedule, so it can return a routine code.
-                        if type(code) is str and (code in NATIVE_ROUTINE_ERRORS or code in NATIVE_HITL_ERRORS
-                                                  and not routine_definitions):
-                            raise ConsoleError(code, response.status_code, response.status_code)
-                    if path.startswith("/work-policy/v1/"):
-                        try:
-                            problem=strict_json(bytes(data))
-                        except (ValueError,TypeError):
-                            problem={}
-                        error=problem.get("error") if type(problem) is dict else None
-                        code=error.get("code") if type(error) is dict else None
-                        if (method == "GET" and path == "/work-policy/v1/realtime/negotiate"
-                                and code in {"REALTIME_DISABLED", "REALTIME_UNAVAILABLE"}):
-                            raise ConsoleError(code, 503, response.status_code)
-                        if path == "/work-policy/v1/agent-connectors" and 400 <= response.status_code < 500:
-                            from .team_connectors import AGENT_API_ERRORS
-                            if type(code) is str and code in AGENT_API_ERRORS:
-                                raise ConsoleError(code, response.status_code, response.status_code)
-                        if native or responses:
-                            from shared_context.behavior_native_turn_wire import NATIVE_TURN_ERRORS
-                            # The server says this send certainly did not go out (rid:<RID> was not created). API #680
-                            # sets it only then, on a 4xx refusal or a 5xx whose uncertainty is about a version follow,
-                            # not this message. Without it a 5xx stays UNKNOWN. Its own code is kept, whatever it is.
-                            # A cancel or delivery acknowledgement carries it when no session was invoked (#813).
-                            not_dispatched = (method == "POST" and path in {
-                                "/work-policy/v1/native-turns/submit", "/work-policy/v1/responses-turns/submit",
-                                "/work-policy/v1/native-turns/cancel", "/work-policy/v1/responses-turns/cancel",
-                                "/work-policy/v1/native-turns/delivered", "/work-policy/v1/native-turns/append"}
-                                and 400 <= response.status_code < 600 and type(code) is str
-                                and re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", code) is not None
-                                and error.get("not_dispatched") is True and isinstance(body, dict)
-                                and error.get("request_id") == body.get("request_id"))
-                            server_following = (not_dispatched and error.get("server_following") is True
-                                and (response.status_code, code) in {
-                                    (409, "NATIVE_SESSION_CHANGED"), (503, "AGENT_VERSION_FOLLOWING"),
-                                    (503, "NATIVE_EXECUTION_UNAVAILABLE")})
-                            if not_dispatched or type(code) is str and code in NATIVE_TURN_ERRORS | {
-                                "FOUNDRY_INVOCATION_UNKNOWN", "FOUNDRY_RESPONSE_INVALID",
-                                "FOUNDRY_NATIVE_BINDING_MISMATCH", "BEHAVIOR_COMMIT_UNKNOWN",
-                                "AGENT_USAGE_CONFLICT", "INSTRUCTION_ROUTE_CHANGED",
-                            }:
-                                raise ConsoleError(code, response.status_code, response.status_code,
-                                                   not_dispatched=not_dispatched, server_following=server_following)
-                        if delegation_read and type(code) is str and code in {
-                            "DELEGATION_UNKNOWN", "DELEGATION_UNAVAILABLE", "DELEGATION_DISABLED",
-                            "DELEGATION_SESSION_READ_ONLY", "DELEGATION_PARENT_REQUIRED",
-                            "DELEGATION_SCOPE_CHANGED", "DELEGATION_RECORD_INVALID", "DELEGATION_RESULT_INVALID",
-                        }:
-                            raise ConsoleError(code, 409, response.status_code)
-                        if type(code) is str and code in {"CONVERSATION_ARCHIVED","CONVERSATION_SESSION_RESET_REQUIRED",
-                                    "CONVERSATION_SESSION_UNAVAILABLE","CONVERSATION_SESSION_VERSION_CHANGED",
-                                    "CONVERSATION_TURN_UNRESOLVED",
-                                    "WORK_SUBMIT_UNKNOWN",
-                                    "CANCELLATION_RECEIPT_UNKNOWN","CANCELLATION_RECEIPT_CHANGED",
-                                    "CANCELLATION_RECEIPT_INVALID"}:
-                            raise ConsoleError(code,409,response.status_code)
-                        if type(code) is str and code in {
-                            "CONVERSATION_TRANSFER_NOT_READY", "CONVERSATION_TRANSFER_SCOPE",
-                            "CONVERSATION_TRANSFER_ARCHIVE_INVALID", "CONVERSATION_TRANSFER_UNAVAILABLE",
-                            "CONVERSATION_TRANSFER_UNKNOWN", "CONVERSATION_TRANSFER_CHANGED",
-                            "CONVERSATION_TRANSFER_CONFLICT", "CONVERSATION_TRANSFER_INVALID",
-                            "CONVERSATION_TRANSFER_BUDGET",
-                        }:
-                            raise ConsoleError(code, 409, response.status_code)
-                        if (method == "GET" and path == "/work-policy/v1/agent-template"
-                                and response.status_code == 409 and code == "AGENT_TEMPLATE_PROFILE_UNSUPPORTED"):
-                            raise ConsoleError(code, 409, response.status_code)
-                        if (method == "GET" and path == "/work-policy/v1/agent-template/system-prompt"
-                                and type(code) is str and code in {
-                                    "SYSTEM_PROMPT_UNRECONSTRUCTABLE", "AGENT_TEMPLATE_PROFILE_UNSUPPORTED",
-                                    "AGENT_ROLE_PROMPT_INVALID", "AGENT_ROLE_PROMPT_MISSING",
-                                    "CAPABILITY_SOURCES_CHANGED", "NATIVE_TURNS_DISABLED"}):
-                            raise ConsoleError(code, 409, response.status_code)
-                        if (type(code) is str and path in {"/work-policy/v1/agent-template/select",
-                                     "/work-policy/v1/agent-template/selection",
-                                     "/work-policy/v1/agent-template/selection-reconcile"}
-                                and code in {"PROFILE_SELECTION_UNSUPPORTED", "PROFILE_SELECTION_DISABLED",
-                                             "PROFILE_SELECTION_DENIED", "PROFILE_SELECTION_CONFLICT",
-                                             "PROFILE_SELECTION_SOURCES_CHANGED", "PROFILE_SELECTION_MISSING",
-                                             "PROFILE_SELECTION_INVALID", "PROFILE_SELECTION_UNKNOWN"}):
-                            raise ConsoleError(code,409,response.status_code)
-                    raise ConsoleError(STATUS_ERRORS.get(response.status_code, "BACKEND_UNAVAILABLE"), 409,
-                                       response.status_code)
+                if status != 200 and not _accepted(method, status, path):
+                    detail, code = _problem_for(method, path, data)
+                    retry_hint = _retry_hint(method, detail)
+                    _raise_known_error(method, path, body, status, detail, code)
+                    raise ConsoleError(STATUS_ERRORS.get(status, "BACKEND_UNAVAILABLE"), 409, status)
                 return bytes(data), response.headers
         except ConsoleError as error:
             if retry_hint:

@@ -316,38 +316,3 @@ def test_cleanup_wire_expiry_and_wrong_payload_are_not_channel_authority(origina
     c.clock[0]=approval.expires_at
     assert service.reconcile(c.principal,approval)["stop_resent"] is False
     print("no_original_Teams_POST_for="+",".join(denied))
-
-
-def test_cleanup_http_requires_new_human_purpose_and_does_not_refresh_old_rule(original_teams_gap):
-    from fastapi.testclient import TestClient
-    from shared_context.behavior_recovery_api import create_recovery_app
-    from test_m3_auth import token
-    c=original_teams_gap
-    c.clock[0]=c.config.channels.valid_until+timedelta(minutes=1)
-    service,calls=cleanup_service(c)
-    app=create_recovery_app(c.parent,service.scope,stop=service._platform_stop,
-        cleanup_observation=service.observation,current_cleanup_observation=service.current_observation)
-    client=TestClient(app)
-    identity=c.config.identity
-    base={"tid":identity.tenant_id,"iss":f"https://sts.windows.net/{identity.tenant_id}/",
-          "aud":identity.audience,"oid":identity.human_oid,"appid":identity.admin_client_id,
-          "scp":"Behavior.Read Behavior.Approve"}
-    headers={"Authorization":"Bearer "+token(c.h.c.signing_key,base)}
-    prefix="/operator/v1/sdk-recovery"
-    reader={"Authorization":"Bearer "+token(c.h.c.signing_key,{**base,"scp":"Behavior.Read"})}
-    assert client.post(prefix+"/plan",json={},headers=reader).status_code==403
-    for wrong in ({"oid":"wrong"},{"appid":"wrong"},{"tid":"wrong"}):
-        assert client.post(prefix+"/plan",json={},headers={
-            "Authorization":"Bearer "+token(c.h.c.signing_key,{**base,**wrong})}).status_code in (401,403)
-    planned=client.post(prefix+"/plan",json={},headers=headers)
-    assert planned.status_code==200,planned.text
-    grant=client.post(prefix+"/authorize",json={"plan":planned.json(),"decision_id":"offline-expired-cleanup-human"},
-                      headers=headers)
-    assert grant.status_code==200,grant.text
-    assert grant.json()["schema_version"]=="fa-expired-teams-cleanup-authorization-v1"
-    assert client.post(prefix+"/execute",json={**grant.json(),"result_body":"arbitrary"},headers=headers).status_code==422
-    c.clock[0]=service.scope.expires_at
-    for stage in ("execute","finish","deliver"):
-        assert client.post(prefix+"/"+stage,json=grant.json(),headers=headers).status_code==403
-    assert client.post(prefix+"/reconcile",json=grant.json(),headers=reader).status_code==200
-    assert calls==[] and c.sends==[]

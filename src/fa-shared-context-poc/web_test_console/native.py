@@ -1,5 +1,6 @@
 """Native conversation client. Local records pin routing and requests, never execution authority."""
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from shared_context.behavior_assistant_wire import InstructionSubmit
@@ -197,6 +198,105 @@ def _decode(model, raw):
         return model.model_validate_json(raw)
     except (ValueError, TypeError):
         raise ConsoleError("NATIVE_STATE_INVALID", 502) from None
+
+
+# A native row's buttons, in the order the page lists them.
+_TASK_ACTIONS = ("status", "submit-reconcile", "submit-retry", "read-reply", "cancel", "read-cancel-receipt",
+                 "confirm-reply", "read-files", "read-skill-draft", "read-images", "read-appends", "read-progress",
+                 "read-system-prompt", "submit", "fetch", "acknowledge", "reconcile", "read-context", "read-delegation")
+
+
+@dataclass(frozen=True)
+class _NativeTask:
+    """One RID as the console knows it: its receipt, else its history turn, and what both decide."""
+    rid: str
+    value: object
+    turn: object
+    command: object
+    continuation: object
+    routine: object
+    source: object
+    result: object
+    authenticated: bool
+    current: bool
+    not_accepted: bool
+    observation: object
+    status: str
+
+
+@dataclass(frozen=True)
+class _TaskTexts:
+    user_text: str | None = None
+    agent_text: str | None = None
+    routine_text: str | None = None
+    continuation_text: str | None = None
+
+
+def _known(value, turn, name):
+    """The receipt's field, else the history turn's."""
+    return getattr(value, name) if value is not None else None if turn is None else getattr(turn, name)
+
+
+def _user_text(task, local):
+    """The page's own copy first, then the history turn, then a human receipt's command."""
+    value = task.value
+    if local is not None and (value is None or value.human_origin):
+        return local["content"]
+    if task.turn is not None:
+        return task.turn.user_text
+    if value is not None and value.human_origin:
+        return task.command.content
+    return None
+
+
+def _task_texts(task, local):
+    """A routine's or a continuation's own text replaces the user's and the Agent's."""
+    if task.routine is not None or task.continuation is not None:
+        # A receipt always carries its command; without one the RID is known from its history turn.
+        if task.command is not None:
+            routine_text = continuation_text = task.command.content
+        else:
+            routine_text, continuation_text = task.turn.routine_text, task.turn.continuation_text
+        return _TaskTexts(routine_text=None if task.routine is None else routine_text,
+                          continuation_text=None if task.continuation is None else continuation_text)
+    user_text = _user_text(task, local)
+    if task.turn is not None:
+        return _TaskTexts(user_text=user_text, agent_text=task.turn.agent_text)
+    if task.value is not None and task.value.source is not None:
+        return _TaskTexts(user_text=user_text, agent_text=task.command.content)
+    return _TaskTexts(user_text=user_text)
+
+
+def _command_views(command):
+    if command is None:
+        return {"user_files": [], "user_images": [], "attachments": []}
+    return {"user_files": [file_reference(item).model_dump(mode="json") for item in command.files],
+            "user_images": [item.model_dump(mode="json") for item in getattr(command, "images", ())],
+            "attachments": [item.model_dump(mode="json") for item in command.attachments]}
+
+
+def _granted(value, entry_id):
+    capabilities = value.capture.capabilities
+    return capabilities is not None and any(grant.entry_id == entry_id for grant in capabilities.grants)
+
+
+def _receipt_view(value):
+    return {"status": value.status,
+        "cancel_requested": value.cancel_requested, "delivered": value.delivered,
+        "failure_code": value.failure_code, "notification_error": value.notification_error,
+        "hosted_session_id": value.hosted_session_id, "response_id": value.response_id,
+        **({"queued_relay": value.queued_relay.model_dump(mode="json")} if value.queued_relay is not None else {}),
+        # Tool sources this turn ran without (their tool list could not be read); shown on the reply.
+        **({"unavailable_sources": [item.model_dump(mode="json") for item in value.assembly.unavailable_sources]}
+           if value.assembly is not None and value.assembly.unavailable_sources else {}),
+        "dispatch": None if value.dispatch is None else value.dispatch.model_dump(mode="json"),
+        # ADR-0009 §8: the API's notice on this answer (a submit's per-Agent slot notice, or a read's
+        # earlier-version view); the page shows it as a status line, never as an error.
+        **({"environment_notice": value.environment_notice.model_dump(mode="json")}
+           if value.environment_notice is not None else {}),
+        # ADR-0009 §12 6a (c): the 6-hour "有新版本" note (status line only, once per target).
+        **({"upgrade_waiting_version": value.upgrade_waiting_version}
+           if value.upgrade_waiting_version is not None else {})}
 
 
 class NativeAdapter(PullAdapter):
@@ -1508,103 +1608,109 @@ class NativeInstructionControl:
             order.sort(key=position)
         return [self.task_view(rid, thread_id, rows.get(rid)) for rid in order]
 
-    def task_view(self, rid, thread_id, local=None):
+    def _native_task(self, rid, thread_id):
         value = self.receipts.get(rid)
         turn = next((turn for turn in self.turns.get(thread_id, ()) if turn.request_id == rid), None)
-        command = None if value is None else value.command
-        continuation = value.continuation if value is not None else None if turn is None else turn.continuation
-        routine = value.routine if value is not None else None if turn is None else turn.routine
-        user_text = (local["content"] if local is not None and (value is None or value.human_origin) else
-                     turn.user_text if turn is not None else command.content if value is not None and value.human_origin else None)
-        agent_text = (turn.agent_text if turn is not None else
-                      command.content if value is not None and value.source is not None else None)
-        routine_text = None
-        if routine is not None:
-            routine_text = command.content if command is not None else turn.routine_text
-            user_text = agent_text = None
-        continuation_text = None
-        if continuation is not None:
-            continuation_text = command.content if command is not None else turn.continuation_text
-            user_text = agent_text = None
-        source = value.source if value is not None else None if turn is None else turn.source
-        result = self.answers.get(rid)
-        authenticated = self.console.vault.state() == "AVAILABLE"
-        current = value is not None and thread_id in self.observed
         not_accepted = self._not_accepted(rid)
-        observation = self.journal.get(rid, "native-version-refusal-observation")
-        status = (value.status if value is not None else "completed" if turn is not None
-                  else "not_accepted" if not_accepted else "unknown")
-        allowed = {"status": authenticated, "submit-reconcile": authenticated and not current,
-                   "submit-retry": authenticated and (self._retryable(rid) or current and value is not None
-                                   and value.human_origin and value.status == "accepted"),
-                   "read-reply": authenticated and (result is not None or value is not None and value.result is not None),
-                   "cancel": authenticated and current and status in {"accepted", "started"} and not value.cancel_requested,
-                   "read-cancel-receipt": authenticated and self.journal.get(rid, "cancel") is not None,
-                   "confirm-reply": authenticated and current and result is not None and not value.delivered,
-                   "read-files": authenticated and command is not None and bool(command.files)}
-        if observation is not None:
-            allowed["submit-retry"] = False
-        if continuation is not None:
-            allowed["submit-retry"] = allowed["submit-reconcile"] = False
-        handoff = self.continuations.get(rid)
-        if authenticated and current and status == "unknown" and handoff is not None:
-            allowed["cancel"] = handoff.continuation is not None and not handoff.cancel_requested
-        allowed["read-skill-draft"] = (authenticated and value is not None and value.human_origin
-            and value.capture.capabilities is not None
-            and any(grant.entry_id == "fa-skillify-v1" for grant in value.capture.capabilities.grants))
-        allowed["read-images"] = (authenticated and value is not None and value.turn_number is not None
-            and value.capture.capabilities is not None
-            and any(grant.entry_id == "fa-image-delivery-v1" for grant in value.capture.capabilities.grants))
-        allowed["read-appends"] = authenticated and value is not None
-        allowed["read-progress"] = authenticated and (value is not None or turn is not None)
-        allowed["read-system-prompt"] = authenticated and (value is not None or turn is not None)
-        if self.profile(thread_id) == NATIVE_RESPONSES_PROFILE and value is not None:
-            allowed["submit-retry"] = False
-            allowed["submit-reconcile"] = authenticated and self.response_reconcile_allowed(value)
-        if routine is not None:
-            allowed["submit-retry"] = allowed["submit-reconcile"] = False
-        reconciliation = self.response_reconciliation(rid) if self.profile(thread_id) == NATIVE_RESPONSES_PROFILE else None
-        for action in ("submit", "fetch", "acknowledge", "reconcile",
-                       "submit-retry", "read-context", "read-delegation"):
-            allowed.setdefault(action, False)
+        return _NativeTask(
+            rid=rid, value=value, turn=turn, command=None if value is None else value.command,
+            continuation=_known(value, turn, "continuation"), routine=_known(value, turn, "routine"),
+            source=_known(value, turn, "source"), result=self.answers.get(rid),
+            authenticated=self.console.vault.state() == "AVAILABLE",
+            current=value is not None and thread_id in self.observed, not_accepted=not_accepted,
+            observation=self.journal.get(rid, "native-version-refusal-observation"),
+            status=(value.status if value is not None else "completed" if turn is not None
+                    else "not_accepted" if not_accepted else "unknown"))
+
+    def _task_actions(self, task, profile):
+        """The row's buttons; a signed-out page offers none."""
+        allowed = dict.fromkeys(_TASK_ACTIONS, False)
+        if not task.authenticated:
+            return allowed
+        handoff = self.continuations.get(task.rid)
+        if task.current and task.status == "unknown" and handoff is not None:
+            cancel = handoff.continuation is not None and not handoff.cancel_requested
+        else:
+            cancel = task.current and task.status in {"accepted", "started"} and not task.value.cancel_requested
+        allowed.update({"status": True, "cancel": cancel,
+                        "confirm-reply": task.current and task.result is not None and not task.value.delivered,
+                        **self._read_actions(task), **self._resend_actions(task, profile)})
+        return allowed
+
+    def _read_actions(self, task):
+        value = task.value
+        known = value is not None or task.turn is not None
+        return {
+            "read-reply": task.result is not None or value is not None and value.result is not None,
+            "read-cancel-receipt": self.journal.get(task.rid, "cancel") is not None,
+            "read-files": task.command is not None and bool(task.command.files),
+            "read-skill-draft": value is not None and value.human_origin and _granted(value, "fa-skillify-v1"),
+            "read-images": (value is not None and value.turn_number is not None
+                            and _granted(value, "fa-image-delivery-v1")),
+            "read-appends": value is not None, "read-progress": known, "read-system-prompt": known,
+        }
+
+    def _resend_actions(self, task, profile):
+        """Whether this RID may go out again under the same RID; the overrides apply in this order."""
+        value = task.value
+        retry = self._retryable(task.rid) or (task.current and value is not None and value.human_origin
+                                              and value.status == "accepted")
+        reconcile = not task.current
+        if task.observation is not None:
+            retry = False
+        if task.continuation is not None:
+            retry = reconcile = False
+        if profile == NATIVE_RESPONSES_PROFILE and value is not None:
+            retry, reconcile = False, self.response_reconcile_allowed(value)
+        if task.routine is not None:
+            retry = reconcile = False
+        return {"submit-reconcile": reconcile, "submit-retry": retry}
+
+    def _journal_views(self, task):
+        """What the journal holds for this RID: how its send is known, and its cancel and acknowledge records."""
+        rid, observation = task.rid, task.observation
+        return {
+            "submission": ({"state": "OBSERVED", "method": "GET"}
+                           if task.continuation is not None or task.routine is not None
+                           or self.journal.get(rid, RECEIVED_PHASE) is not None else
+                           self._latest_submission(rid) or {"state": "CONFIRMED" if task.turn is not None else "NOT_SENT"}),
+            "submission_observation": None if observation is None else observation.get("observation"),
+            "cancellation": self.journal.get(rid, "cancel"), "acknowledgment": self.journal.get(rid, "acknowledge"),
+        }
+
+    def task_view(self, rid, thread_id, local=None):
+        task = self._native_task(rid, thread_id)
+        value, command, continuation, routine = task.value, task.command, task.continuation, task.routine
+        texts = _task_texts(task, local)
+        profile = self.profile(thread_id)
+        result, status = task.result, task.status
+        allowed = self._task_actions(task, profile)
+        reconciliation = self.response_reconciliation(rid) if profile == NATIVE_RESPONSES_PROFILE else None
         # The model this message asked for, also when it was refused before any receipt (a model switch the
         # conversation could not take); only for naming it, never a selection.
         requested = getattr(command, "model", None)
         if not requested and value is None:
             requested = (self.store.command(rid) or {}).get("model")
         return {
-            "state_profile": self.profile(thread_id), "task_id": rid, "submit_request_id": rid, "thread_id": thread_id,
-            "label": (user_text or agent_text or routine_text or rid)[:60], "description": "原生回合；狀態以 Agent 保存的回條為準。",
-            "mode": "native_turn", "instruction": user_text, "agent_text": agent_text,
-            **({"routine": routine.model_dump(mode="json"), "routine_text": routine_text} if routine is not None else {}),
+            "state_profile": profile, "task_id": rid, "submit_request_id": rid, "thread_id": thread_id,
+            "label": (texts.user_text or texts.agent_text or texts.routine_text or rid)[:60],
+            "description": "原生回合；狀態以 Agent 保存的回條為準。",
+            "mode": "native_turn", "instruction": texts.user_text, "agent_text": texts.agent_text,
+            **({"routine": routine.model_dump(mode="json"), "routine_text": texts.routine_text}
+               if routine is not None else {}),
             "continuation": None if continuation is None else continuation.model_dump(mode="json"),
-            "continuation_text": continuation_text,
+            "continuation_text": texts.continuation_text,
             "continuation_state": (None if rid not in self.continuations else
                                     self.continuations[rid].model_dump(mode="json")),
             "continuation_error": self.continuation_errors.get(rid),
             "continuation_usage": self._continuation_usage(rid, thread_id),
-            "source": None if source is None else source.model_dump(mode="json"),
+            "source": None if task.source is None else task.source.model_dump(mode="json"),
             "admission": None if value is None else {"conversation_id": value.conversation_id,
                 "turn_number": value.turn_number, "model": value.capture.model.id},
             **({"requested_model": requested} if requested else {}),
             "status": {"data": {"state": status}, "observed_at": self.observed.get(thread_id)},
-            "native_receipt": None if value is None else {"status": value.status,
-                "cancel_requested": value.cancel_requested, "delivered": value.delivered,
-                "failure_code": value.failure_code, "notification_error": value.notification_error,
-                "hosted_session_id": value.hosted_session_id, "response_id": value.response_id,
-                **({"queued_relay": value.queued_relay.model_dump(mode="json")} if value.queued_relay is not None else {}),
-                # Tool sources this turn ran without (their tool list could not be read); shown on the reply.
-                **({"unavailable_sources": [item.model_dump(mode="json") for item in value.assembly.unavailable_sources]}
-                   if value.assembly is not None and value.assembly.unavailable_sources else {}),
-                "dispatch": None if value.dispatch is None else value.dispatch.model_dump(mode="json"),
-                # ADR-0009 §8: the API's notice on this answer (a submit's per-Agent slot notice, or a read's
-                # earlier-version view); the page shows it as a status line, never as an error.
-                **({"environment_notice": value.environment_notice.model_dump(mode="json")}
-                   if value.environment_notice is not None else {}),
-                # ADR-0009 §12 6a (c): the 6-hour "有新版本" note (status line only, once per target).
-                **({"upgrade_waiting_version": value.upgrade_waiting_version}
-                   if value.upgrade_waiting_version is not None else {})},
-            "not_accepted": not_accepted,
+            "native_receipt": None if value is None else _receipt_view(value),
+            "not_accepted": task.not_accepted,
             "progress": (None if rid not in self.progress_snapshots else {
                 "data": {"state": status, "progress": self.progress_snapshots[rid].progress.model_dump(mode="json")},
                 "recorded": self.progress_snapshots[rid].recorded,
@@ -1617,14 +1723,7 @@ class NativeInstructionControl:
             "reply": None if result is None else {"data": {"text": result[1].decode("utf-8")},
                                                   "sha256": result[0].text_sha256, "byte_length": result[0].text_bytes,
                                                   "observed_at": self.observed.get(thread_id)},
-            "submission": ({"state": "OBSERVED", "method": "GET"} if continuation is not None or routine is not None
-                           or self.journal.get(rid, RECEIVED_PHASE) is not None else
-                           self._latest_submission(rid) or {"state": "CONFIRMED" if turn is not None else "NOT_SENT"}),
-            "submission_observation": None if observation is None else observation.get("observation"),
-            "cancellation": self.journal.get(rid, "cancel"), "acknowledgment": self.journal.get(rid, "acknowledge"),
-            "user_files": [] if command is None else [file_reference(item).model_dump(mode="json") for item in command.files],
-            "user_images": [] if command is None else [item.model_dump(mode="json") for item in getattr(command, "images", ())],
-            "attachments": [] if command is None else [item.model_dump(mode="json") for item in command.attachments],
+            **self._journal_views(task), **_command_views(command),
             "actions": {action: {"enabled": enabled, "reason": "" if enabled else "此原生回合目前不能執行這個動作。"}
                         for action, enabled in allowed.items()},
             "error": None if rid not in self.errors else {"code": self.errors[rid]},

@@ -337,6 +337,7 @@ class _VerifiedOrigin:
     store: object
     origin: ServerConfiguration
     installation_fence: tuple[str, str] | None
+    pins: Mapping[str, str | None] | None
 
 
 class ServerComposition:
@@ -367,6 +368,8 @@ class ServerComposition:
         self._agent_message_consumer_lock = Lock()
         self._peer_router = None
         self._verified_origin: _VerifiedOrigin | None = None
+        # One standing full check at a time: each holds up to the whole inventory read; RLock so re-entry cannot hang.
+        self._origin_check_lock = RLock()
 
     def close(self):
         with self._peer_lock:
@@ -419,14 +422,45 @@ class ServerComposition:
         self.close()
 
     def installation(self):
-        from .behavior_migration import installed_origin
+        from .behavior_migration import installed_origin, installed_origin_pins
 
         if self.closed:
             raise _denied("server composition is closed")
         store = self.runtime.store
+        verified_now, pins, locked = False, None, False
         try:
             if self.agent_id is None:
-                original = installed_origin(store, self.config)
+                verified = self._verified_origin
+                # Only a standing-policy origin has pins; every other kind keeps main's per-request check, unread.
+                # Read before the full check, so a pointer that moves during it fails the next request's match.
+                pins = (None if isinstance(verified, _VerifiedOrigin) and verified.pins is None
+                        else installed_origin_pins(store, self.config))
+
+                def reusable(verified):
+                    return (pins is not None and isinstance(verified, _VerifiedOrigin)
+                            and verified.process_id == getpid()
+                            and verified.configuration is self.config and verified.store is store
+                            and verified.installation_fence is not None
+                            and verified.installation_fence == store._installation_fence
+                            and verified.installation_fence[1] == self.config.sha256 and verified.pins == pins)
+
+                # Only the standing kind reads the whole partition; stage's fresh kind stays unlocked per request.
+                if pins is not None and not reusable(verified):
+                    self._origin_check_lock.acquire()
+                    locked = True
+                    verified = self._verified_origin  # a waiter reuses what the request before it just verified
+                    if reusable(verified):
+                        self._origin_check_lock.release()
+                        locked = False
+                if reusable(verified):
+                    # Same fence as peers: rows written outside FA after this process verified are caught at next start.
+                    store._check_installation()
+                    original = verified.origin
+                else:
+                    if pins is not None:
+                        self._verified_origin = None  # a reuse condition failed: the kept origin is not this install's
+                    original = installed_origin(store, self.config)
+                    verified_now = True
             else:
                 owner = getattr(self, "_agent_message_owner", None)
                 verified = getattr(owner, "_verified_origin", None)
@@ -450,13 +484,18 @@ class ServerComposition:
             attach_standing_policy(self, agent_id=self.agent_id)
             from .behavior_work_target import activate_target
             activate_target(self)
-            if self.agent_id is None:
+            if verified_now:
                 self._verified_origin = _VerifiedOrigin(
-                    getpid(), self.config, store, original, store._installation_fence)
-        except BaseException:
-            if self.agent_id is None:
+                    getpid(), self.config, store, original, store._installation_fence, pins)
+        except BaseException as error:
+            # Only a standing-policy origin survives the transient conflict acquire_evidence retries; else as main.
+            if self.agent_id is None and not (pins is not None and isinstance(error, Problem) and error.status == 412
+                                              and error.body["error"]["code"] == "BEHAVIOR_CONFLICT"):
                 self._verified_origin = None
             raise
+        finally:
+            if locked:
+                self._origin_check_lock.release()
 
     def require_current_native_evidence(self):
         if self.closed:
@@ -600,7 +639,7 @@ class ServerComposition:
         from .behavior_operations import _parse
         control=self.runtime.work_policy
         if control is None:return
-        control.refresh()
+        # Both callers run right after application()'s validate_startup() refreshed every registered work row.
         if getattr(self,"_agent_message_owner",None) is None:
             from .behavior_agent_message_runtime import resume_peer_messages
             resume_peer_messages(self)
@@ -940,10 +979,10 @@ def application(composition: ServerComposition, *, preactivation=False):
                 # operator one-shot ``agent-versions patrol --once`` stays.
                 from .native_upgrade_reconciler import NativeUpgradeReconciler
                 app.state.native_upgrade_reconciler = NativeUpgradeReconciler(composition)
-            return _lifespan(app, composition, lambda: (
-                composition.installation(),
-                composition.catalog.require_activation() if composition.runtime.work_policy is None else None,
-                composition.runtime.validate_startup(),
+            # installation() already ran above in this process; a second full inventory scan here only delayed the port.
+            # So did validate_startup(); with a work policy a repeat only re-read every registered work row.
+            return _lifespan(app, composition, lambda: None if composition.runtime.work_policy is not None else (
+                composition.catalog.require_activation(), composition.runtime.validate_startup(),
             ))
         app = FastAPI(title="FA operator preactivation (admissions CLOSED)", docs_url=None, redoc_url=None, openapi_url=None)
         _install_error_handlers(app)

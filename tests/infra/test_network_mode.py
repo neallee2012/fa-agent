@@ -418,7 +418,7 @@ def test_foundation_run_alone_with_private_keeps_the_azd_private_vnet(compiled, 
         "snet-api", "snet-private-endpoints", "snet-agents"]
 
 
-def test_private_creates_the_network_before_the_account_and_no_capability_host(compiled):
+def test_private_creates_the_network_before_the_account(compiled):
     template = compiled["infra/azd/main.bicep"]
     foundry = module(template, "foundry")
     # From network.outputs: the subnets and DNS zones exist before the account is created.
@@ -426,8 +426,27 @@ def test_private_creates_the_network_before_the_account_and_no_capability_host(c
     assert foundry["properties"]["parameters"]["networkMode"] == {"value": "[parameters('networkMode')]"}
     assert module(template, "network")["properties"]["parameters"]["networkMode"] == {
         "value": "[parameters('networkMode')]"}
-    # ADR-0010 phase 0 Q3: the platform creates the account capability host; FA creates none.
-    assert "capabilityHosts" not in json.dumps(template)
+
+
+CAPABILITY_HOSTS = "Microsoft.CognitiveServices/accounts/projects/capabilityHosts"
+
+
+def capability_hosts(found):
+    return {key: value for key, value in found.items() if CAPABILITY_HOSTS in key}
+
+
+def test_private_alone_gets_a_basic_project_capability_host(compiled, private):
+    # ADR-0010 2026-10-28: tools outside Foundry (WebIQ MCP) need it through the VNet. The account one is the
+    # platform's (phase 0 Q3), so FA declares no account capability host in either mode.
+    for entry in ("infra/azd/main.bicep", "infra/shared-context/foundry.bicep"):
+        assert capability_hosts(leaves(compiled[entry])) == {}, entry
+        assert "Microsoft.CognitiveServices/accounts/capabilityHosts" not in json.dumps(compiled[entry]), entry
+    (host,) = capability_hosts(private).values()
+    assert host["apiVersion"] == "2025-06-01" and host["properties"] == {"capabilityHostKind": "Agents"}
+    assert host["condition"] is True  # private, folded
+    assert host["name"]["args"][-1] == "caphostproj"
+    template = compiled["infra/shared-context/foundry.bicep"]
+    assert template["resources"]["projectCapabilityHost"]["dependsOn"] == ["project"]  # the project, after the account
 
 
 MEMORY_ACCOUNT = "fa-memory-cosmos-account"
@@ -530,7 +549,8 @@ def test_only_the_api_identity_gets_the_five_action_memory_role_on_the_container
 
 # Private without FA_VNET_RESOURCE_ID deploys identical resources (a normalized leaf comparison, not byte-identical
 # JSON): sha256 of the canonical private leaves of infra/azd/main.bicep on main at e9692be1 (without phase 2b), as
-# computed below; a changed value means it deploys something different. Diff with
+# computed below, less the project capability host added on 2026-10-28; a changed value means it deploys something
+# different. Diff with
 # `python tests/infra/test_network_mode.py <compiled.json> private` against that commit's output.
 PRIVATE_DEFAULT_SHA256 = "adaf9eb46f887c8a0e27774fdd6a1a21c441fa02527667bcccc8f501923f2b80"
 USER_VNET = "/subscriptions/s/resourceGroups/rg-net/providers/Microsoft.Network/virtualNetworks/vnet-hub"
@@ -569,7 +589,10 @@ def byo(compiled):
 
 
 def test_private_without_an_existing_vnet_deploys_exactly_what_it_did_before(private):
-    assert hashlib.sha256(json.dumps(private, sort_keys=True).encode("utf-8")).hexdigest() == PRIVATE_DEFAULT_SHA256
+    # The project capability host (2026-10-28) is the only addition since; everything else hashes as before.
+    before = {key: value for key, value in private.items() if key not in capability_hosts(private)}
+    assert len(before) == len(private) - 1
+    assert hashlib.sha256(json.dumps(before, sort_keys=True).encode("utf-8")).hexdigest() == PRIVATE_DEFAULT_SHA256
 
 
 def test_public_ignores_an_existing_vnet(compiled):

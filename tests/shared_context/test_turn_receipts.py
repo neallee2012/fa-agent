@@ -1,6 +1,5 @@
-"""Real receipt core/API with local Table, Blob, token and SDK-execution fakes; no live calls."""
+"""Real receipt core with local Table, Blob, token and SDK-execution fakes; no live calls."""
 
-from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -10,29 +9,23 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
-import httpx
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from conftest import A, B, C, InMemoryRepository, TENANT
-from shared_context.behavior_agent_control import AgentControlRelay, CONNECTION_HEADER
-from shared_context.behavior_agent_worker import AgentTurnAddress, AgentVmBinding, AgentWorkerControl
-from shared_context.behavior_api import _install_error_handlers
+from shared_context.behavior_agent_control import AgentControlRelay
+from shared_context.behavior_agent_worker import AgentTurnAddress, AgentVmBinding
 from shared_context.behavior_assistant_wire import ArchiveUnavailable, Assignment, InstructionSubmit, InstructionTask, SdkStop, Task
-from shared_context.behavior_auth import BehaviorAuthSettings, BehaviorJwtVerifier, BehaviorPrincipal
+from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_operations import control_key
 from shared_context.behavior_store import BehaviorStore, ControlChanges, ControlRequest, ControlWrite
-from shared_context.behavior_turn_api import PREFIX, install_turn_routes
-from shared_context.behavior_turn_client import TurnReceiptClient, TurnReceiptConsumer
 from shared_context.behavior_turn_receipts import (
     TurnReceiptStore, consumption_key, prepare_turn, start_key, ticket_handle, turn_key,
     validate_sdk_checkpoint, validate_turn_receipt_history,
 )
 from shared_context.behavior_turn_usage import TurnModelUsage
 from shared_context.behavior_turn_wire import (
-    BeginTurn, TurnEnd, TurnEndReceipt, TurnHandle, TurnObjectReference, TurnRelayContext, TurnTicket,
+    BeginTurn, TurnEnd, TurnHandle, TurnObjectReference, TurnRelayContext, TurnTicket,
 )
 from shared_context.behavior_wire import ExactSourceRef
 from shared_context.errors import Problem
@@ -41,7 +34,7 @@ from shared_context.source_materials import digest
 from test_behavior_store import FakeTable, SCOPE
 from test_conversation_transfer_startup import read_startup, saved_turn, synthetic_standing_v1
 from test_instruction_flow import instruction_models
-from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token
+from test_m3_auth import HUMAN_OID, jwk_client, signing_key  # fixtures that synthetic_standing_v1 needs
 from shared_context.team_data_relay import TeamDataRelay
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -68,7 +61,7 @@ def ticket_for(vm, *, rid="rid-one", oid=A.oid, cid="conversation-one", issuer=H
 
 
 @pytest.fixture
-def case(auth, jwk_client, signing_key):
+def case():
     table = FakeTable()
     store = BehaviorStore(table, SCOPE)
     store.initialize()
@@ -81,30 +74,12 @@ def case(auth, jwk_client, signing_key):
     context = control.connect(vm, "process-one", A.oid)
     human = BehaviorPrincipal(TENANT, HUMAN_OID, A.team, "human", None, frozenset({"read", "submit"}))
     agent = BehaviorPrincipal(TENANT, A.oid, A.team, "agent", A.actor, frozenset({"read", "submit", "execute"}))
-    verifier = BehaviorJwtVerifier(auth, BehaviorAuthSettings(HUMAN_OID, CLIENT_ID, A.team), jwk_client)
-
-    @contextmanager
-    def connection_context(principal):
-        with control._lock:
-            principal.require(vm.team_id, "execute")
-            yield control.peer(vm, caller_oid=principal.oid).context
-
-    app = FastAPI()
-    _install_error_handlers(app)
-    install_turn_routes(app, receipts, verifier, connection_context)
-    client = TestClient(app)
-    headers = {
-        "Authorization": "Bearer " + token(signing_key, {"oid": A.oid, "roles": ["Behavior.Agent"]}, remove=("scp",)),
-        CONNECTION_HEADER: context.control_connection_id,
-        "Content-Type": "application/json",
-    }
     c = SimpleNamespace(table=table, store=store, relay=relay, receipts=receipts, vm=vm, control=control,
-                        context=context, human=human, agent=agent, client=client, headers=headers)
+                        context=context, human=human, agent=agent)
     c.ticket = ticket_for(vm)
     c.delivery = receipts.issue(c.ticket, human, expected_vm=vm)
     c.handle = ticket_handle(c.ticket)
     yield c
-    client.close()
     control.close()
 
 
@@ -280,52 +255,6 @@ def test_usage_failure_keeps_completion_unconsumed_and_replay_records_once(case)
     assert c.receipts.consume_completion(c.agent, c.context, c.ticket.address) == consumed
 
 
-def test_signed_begin_uses_handshake_context_not_caller_selected_fields(case):
-    c = case
-    command = BeginTurn(address=c.ticket.address, ticket=c.handle)
-    count = len(c.table.submissions)
-    denied = c.client.post(PREFIX + "/begin", content=command.model_dump_json(),
-                          headers={**c.headers, CONNECTION_HEADER: "forged-connection"})
-    assert denied.status_code == 403 and len(c.table.submissions) == count
-    started = c.client.post(PREFIX + "/begin", content=command.model_dump_json(), headers=c.headers)
-    assert started.status_code == 200, started.text
-    assert started.json()["start"]["worker"]["caller_oid"] == A.oid
-    replay = c.client.post(PREFIX + "/begin", content=command.model_dump_json(), headers=c.headers)
-    assert replay.status_code == 409
-
-
-def test_t2_consumer_executes_once_and_read_never_reexecutes(case):
-    c = case
-    invoked = []
-
-    def transport(request):
-        response = c.client.request(request.method, request.url.path, content=request.content,
-                                    headers=dict(request.headers))
-        return httpx.Response(response.status_code, headers=response.headers, content=response.content)
-
-    client = TurnReceiptClient("https://context.invalid", token_provider=lambda: c.headers["Authorization"][7:],
-                               transport=httpx.MockTransport(transport))
-
-    def execute(context, started):
-        invoked.append(started.ticket.address.request_id)
-        return end_for(c, started)
-
-    consumer = TurnReceiptConsumer(client, execute=execute, abort=lambda _: None)
-    worker = AgentWorkerControl(c.vm, consumer, process_id=c.context.process_id, caller_oid=c.context.caller_oid)
-    connection = worker.connect(c.vm, context=c.context)
-    try:
-        result = connection.deliver(c.delivery).result(timeout=10)
-        assert TurnEndReceipt.model_validate_json(result).ticket == c.handle
-        with pytest.raises(Problem):
-            connection.deliver(c.delivery).result(timeout=10)
-        assert invoked == [c.ticket.address.request_id]
-        assert json.loads(connection.read(c.ticket.address))["state"] == "completed"
-        assert invoked == [c.ticket.address.request_id]
-    finally:
-        worker.close()
-        client.close()
-
-
 def test_incomplete_usage_and_checkpoints_cannot_be_claimed_as_success(case):
     c = case
     end = end_for(c, begin(c)).model_dump(mode="json")
@@ -431,7 +360,6 @@ class Forbidden(importlib.abc.MetaPathFinder):
             raise ImportError('forbidden dependency: ' + fullname)
 sys.meta_path.insert(0, Forbidden())
 import shared_context.behavior_turn_wire
-import shared_context.behavior_turn_client
 """
     completed = subprocess.run([sys.executable, "-X", "utf8", "-c", code], capture_output=True, text=True, timeout=30)
     assert completed.returncode == 0, completed.stderr

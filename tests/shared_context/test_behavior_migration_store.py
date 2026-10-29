@@ -70,22 +70,25 @@ def test_complete_inventory_retains_rows_receipts_and_exact_guard_without_writin
     assert len(table.submissions) == before
 
 
-@pytest.mark.parametrize("max_entities,reference_entities", [
-    (3, DEFAULT_INVENTORY_MAX_ENTITIES), (None, DEFAULT_INVENTORY_MAX_ENTITIES), (None, 2),
+@pytest.mark.parametrize("max_entities,reference_entities,max_bytes", [
+    (3, DEFAULT_INVENTORY_MAX_ENTITIES, DEFAULT_INVENTORY_MAX_BYTES),
+    (None, DEFAULT_INVENTORY_MAX_ENTITIES, DEFAULT_INVENTORY_MAX_BYTES), (None, 2, DEFAULT_INVENTORY_MAX_BYTES),
+    (None, DEFAULT_INVENTORY_MAX_ENTITIES, 1024 * 1024),  # a caller's own bound, not the default
 ])
-def test_completed_inventory_logs_numeric_capacity_once(caplog, monkeypatch, max_entities, reference_entities):
+def test_completed_inventory_logs_numeric_capacity_once(caplog, monkeypatch, max_entities, reference_entities,
+                                                        max_bytes):
     monkeypatch.setattr(migration, "DEFAULT_INVENTORY_MAX_ENTITIES", reference_entities)
     store, table = store_with_row()
     before = copy.deepcopy(table.backing.rows)
     size = sum(len(entity["Payload"]) for entity in before.values())
     with caplog.at_level(logging.INFO, logger="uvicorn.error"):
-        inventory = store.read_inventory(max_entities=max_entities, log_capacity=True)
+        inventory = store.read_inventory(max_entities=max_entities, max_bytes=max_bytes, log_capacity=True)
     records = [record for record in caplog.records if record.message.startswith("BEHAVIOR_INVENTORY_READ ")]
     assert len(records) == 1
     assert records[0].levelno == logging.INFO
     assert records[0].getMessage() == (
         f"BEHAVIOR_INVENTORY_READ bytes={size} entities=3 "
-        f"bytes_pct_of_default={100 * size / DEFAULT_INVENTORY_MAX_BYTES:.2f} "
+        f"bytes_pct_of_default={100 * size / max_bytes:.2f} "
         f"entities_pct_of_default={100 * 3 / reference_entities:.2f}"
     )
     assert len(inventory.entity_sha256) == 3

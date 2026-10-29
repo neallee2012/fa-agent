@@ -44,7 +44,7 @@ v3 的 SHA-256 為 `8ca595e5201e7069aee68127fa2d451b18a40aaf75ad645ef985f6f590fa
 
 ## 現在如何親自查看
 
-**基本 CLI 已可使用，不必等 M4。** 可查看既有成果與 SOP 決定、下載指定舊版並比對 hash。新自然語言交辦／修訂仍走 Hosted `assistant` 入口，不是下面的人類 CLI；本批 SDK jobs 和 stop 額度已用完，**不得因模型尚餘 21 次就再啟動工作**。新的付費試用需另列有界範圍，不重設既有 counter。
+**此 CLI（`m3_artifacts_cli.py`）已於 2026-10 移除，下列命令為歷史紀錄。** 當時：**基本 CLI 已可使用，不必等 M4。** 可查看既有成果與 SOP 決定、下載指定舊版並比對 hash。新自然語言交辦／修訂仍走 Hosted `assistant` 入口，不是下面的人類 CLI；本批 SDK jobs 和 stop 額度已用完，**不得因模型尚餘 21 次就再啟動工作**。新的付費試用需另列有界範圍，不重設既有 counter。
 
 在這個工作樹根目錄的 PowerShell 7 中執行下列唯讀範例。使用指定 admin 登入；公開 client ID 不是 secret，token 僅留在程序記憶體：
 

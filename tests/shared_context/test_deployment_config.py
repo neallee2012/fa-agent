@@ -2,8 +2,10 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
+import sys
 
 import pytest
 
@@ -138,3 +140,48 @@ def test_prepare_keeps_nat_egress_opt_in():
     module = load("prepare_environment_nat", ROOT / "deploy" / "shared-context" / "prepare_environment.py")
     params = module.resolve(_source(api_subnet_nat_egress=True))["parameters"]
     assert params["foundation.parameters.json"]["apiSubnetNatEgress"] is True
+
+
+INTENT_WRITERS = ("deploy/azd/fa_azd.py", "deploy/stage/new_memory_store.py", "deploy/stage/prepare_native_sessions.py",
+                  "deploy/stage/seed_agents.py", "deploy/stage/select_all_capabilities.py")
+
+
+@pytest.fixture(params=INTENT_WRITERS, ids=lambda relative: Path(relative).stem)
+def write_x(request, monkeypatch):
+    name = "write_x_" + Path(request.param).stem
+    spec = importlib.util.spec_from_file_location(name, ROOT / request.param)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)  # fa_azd's dataclasses look their module up here
+    spec.loader.exec_module(module)
+    return module._write_x
+
+
+def test_write_x_creates_indent_one_ascii_json_and_syncs_it_after_flushing(write_x, tmp_path, monkeypatch):
+    path = tmp_path / "intent.json"
+    expected = json.dumps({"b": [1, "\u00e9"], "a": None}, indent=1)
+    seen, real_fsync = [], os.fsync
+
+    def fsync(descriptor):
+        seen.append(path.read_bytes())  # what the OS already holds when fsync runs
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    assert write_x(path, {"b": [1, "\u00e9"], "a": None}) is None
+    assert expected == '{\n "b": [\n  1,\n  "\\u00e9"\n ],\n "a": null\n}'
+    assert path.read_bytes() == expected.replace("\n", os.linesep).encode("ascii")  # text mode: platform newlines
+    assert seen == [path.read_bytes()]
+
+
+def test_write_x_never_replaces_an_existing_file(write_x, tmp_path, monkeypatch):
+    path = tmp_path / "intent.json"
+    path.write_bytes(b"original")
+    monkeypatch.setattr(os, "fsync", lambda descriptor: pytest.fail("nothing to sync"))
+    with pytest.raises(FileExistsError):
+        write_x(path, {"replacement": True})
+    assert path.read_bytes() == b"original"
+
+
+def test_write_x_does_not_create_missing_parent_directories(write_x, tmp_path):
+    with pytest.raises(FileNotFoundError):
+        write_x(tmp_path / "missing" / "intent.json", {})
+    assert not (tmp_path / "missing").exists()

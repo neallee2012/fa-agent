@@ -70,7 +70,8 @@ module foundryAccount 'br/public:avm/res/cognitive-services/account:0.19.0' = {
       ipRules: []
       virtualNetworkRules: []
     }
-    // No project capability host: the platform creates the account one (ADR-0010 phase 0, Q3).
+    // The platform creates the account capability host with the injection (ADR-0010 phase 0, Q3); the project one is
+    // projectCapabilityHost below.
     networkInjections: isPrivate ? {
       scenario: 'agent'
       subnetResourceId: agentSubnetResourceId
@@ -115,6 +116,22 @@ resource project 'Microsoft.CognitiveServices/accounts/projects@2025-06-01' = {
   dependsOn: [
     foundryAccount
   ]
+}
+
+// ADR-0010 2026-10-28: tools outside Foundry (MCP such as WebIQ, OpenAPI, A2A) reached through the VNet need a project
+// capability host, or fail with `name or host unknown` (Learn: toolbox-network-isolation). Basic: platform-managed data,
+// no BYO connections (template 11). It needs the account one, which the injected account gets; the same PUT again is a
+// no-op (Learn: capability-hosts). deploy/azd/fa_azd.py lists the project's capability hosts and deletes them before
+// the project.
+resource projectCapabilityHost 'Microsoft.CognitiveServices/accounts/projects/capabilityHosts@2025-06-01' = if (isPrivate) {
+  parent: project
+  name: 'caphostproj'
+  properties: {
+    // In the Learn capability-hosts PUT and template 11, missing from Bicep's ProjectCapabilityHostProperties type and
+    // the REST spec. Should the PUT answer 400 on it, try `properties: {}` before another version (ADR-0010 section 4).
+    #disable-next-line BCP037
+    capabilityHostKind: 'Agents'
+  }
 }
 
 module operatorFoundryAccess '../vnet/project-access.bicep' = {

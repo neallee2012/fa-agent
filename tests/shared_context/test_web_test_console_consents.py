@@ -2,12 +2,13 @@
 
 import json
 
+import httpx
 import pytest
 
 from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_team_registry import resolve_agent_scope
 from shared_context.native_hitl_wire import (
-    ConnectorConsent, ConnectorConsentCreate, NativeHitlCall, NativeHitlEnd, NativeHitlTurn,
+    ConnectorConsent, ConnectorConsentCreate, ConnectorConsentPending, NativeHitlCall, NativeHitlEnd, NativeHitlTurn,
 )
 from test_m3_auth import jwk_client, signing_key  # noqa: F401
 from test_native_turn_api import native_api  # noqa: F401
@@ -62,8 +63,13 @@ def test_a_connect_card_shows_its_link_only_in_its_own_read_and_one_click_is_sen
     assert [entry["item"]["type"] for entry in attention] == ["connect_required"]
     item = attention[0]["item"]
     assert (item["item_id"], item["need"], item["connector_id"]) == (created["consent_id"], "consent", "teams")
+    before = len(c.calls)
     card = c.ui.client.get(route(c, "consents/" + item["item_id"]), headers=c.ui.headers)
     assert card.status_code == 200, card.text
+    # The card is shown only after its original turn was read back from the API.
+    assert [call[:2] for call in c.calls[before:]] == [
+        ("GET", "/native-hitl/v1/consents/" + item["item_id"]),
+        ("GET", "/work-policy/v1/native-turns/requests/" + draft["request_id"])]
     assert card.json()["readback"]["consent"]["command"]["consent"]["consent_urls"] == [LINK]
     assert card.json()["connector"]["display_name"] == "Microsoft Teams"
     assert card.json()["connector"]["disclosure"].startswith("Microsoft Teams 經 Work IQ 連線")
@@ -107,3 +113,81 @@ def test_a_click_that_cannot_count_never_posts(hitl_console, boundary):
     assert not any(method == "POST" for method, _, _ in c.calls[before:])
     assert c.ui.console.journal.entries(PHASE) == []
     assert json.loads(refused.text)["error"]["automatic_retry"] is False
+
+
+def test_a_lost_click_ack_is_only_reconciled_and_a_receipt_for_another_choice_is_refused(hitl_console):
+    c = hitl_console
+    draft, _ = consent_call(c)
+    item = attention_of(c, draft)[0]["item"]
+
+    def lose(request, response):
+        if request.url.path == "/native-hitl/v1/consent-decisions":
+            assert response.status_code == 200
+            raise httpx.ReadTimeout("OFFLINE lost consent decision response", request=request)
+        return response
+
+    c.mutate[0] = lose
+    assert ui_post(c, route(c, "consents"), {"consent": item["consent"], "choice": "resume"}).status_code != 200
+    identifier, original = c.ui.console.journal.entries(PHASE)[0]
+    assert original["state"] == "UNKNOWN"
+    c.ui.client.__exit__(None, None, None)
+    c.ui = c.open()
+
+    def other_choice(request, response):
+        if request.url.path == "/native-hitl/v1/consent-decisions/reconcile":
+            data = response.json()
+            assert data["result"]["status"] == "resume"
+            data["result"]["status"] = "decline"
+            return httpx.Response(200, json=data, headers=response.headers)
+        return response
+
+    c.mutate[0] = other_choice
+    refused = ui_post(c, route(c, "consent-reconcile"), {"request_id": identifier})
+    assert refused.status_code == 502, refused.text
+    assert refused.json()["error"]["code"] == "NATIVE_HITL_RECORD_INVALID"
+    assert c.ui.console.journal.get(identifier, PHASE) == original
+    c.mutate[0] = lambda request, response: response
+    result = ui_post(c, route(c, "consent-reconcile"), {"request_id": identifier})
+    assert result.status_code == 200, result.text
+    entry = result.json()["commands"][0]
+    assert entry["state"] == "CONFIRMED" and entry["command"]["choice"] == "resume"
+    assert entry["observation"]["result"]["status"] == "resume"
+    saved = c.ui.console.journal.get(identifier, PHASE)
+    assert saved["state"] == "CONFIRMED" and saved["receipt"] == entry["observation"]
+    assert len(decisions(c)) == 1
+    reconciled = [call for call in c.calls if call[1] == "/native-hitl/v1/consent-decisions/reconcile"]
+    assert len(reconciled) == 2 and all(json.loads(call[2]) == original["intent"]["body"] for call in reconciled)
+
+
+def test_a_card_id_that_is_not_a_digest_is_refused_before_any_read(hitl_console):
+    c = hitl_console
+    consent_call(c)
+    before = len(c.calls)
+    refused = c.ui.client.get(route(c, "consents/not-a-card"), headers=c.ui.headers)
+    assert refused.status_code == 400 and refused.json()["error"]["code"] == "NATIVE_HITL_INVALID_REQUEST"
+    assert c.calls[before:] == []
+
+
+@pytest.mark.parametrize("damage", ["other_card", "another_team"])
+def test_a_card_readback_for_another_card_or_another_team_shows_no_link(hitl_console, damage):
+    c = hitl_console
+    draft, created = consent_call(c)
+    identifier = created["consent_id"]
+
+    def damage_card(request, response):
+        if request.url.path != "/native-hitl/v1/consents/" + identifier:
+            return response
+        data = response.json()
+        if damage == "other_card":
+            data["reference"]["consent_id"] = "0" * 64
+        else:
+            data["consent"]["team_id"] = "another-team"
+            data["reference"]["consent_digest"] = ConnectorConsentPending.model_validate_json(
+                json.dumps(data["consent"])).sha256
+        return httpx.Response(200, json=data, headers=response.headers)
+
+    c.mutate[0] = damage_card
+    refused = c.ui.client.get(route(c, "consents/" + identifier), headers=c.ui.headers)
+    assert (refused.status_code, refused.json()["error"]["code"]) == (
+        (502, "NATIVE_HITL_RECORD_INVALID") if damage == "other_card" else (403, "NATIVE_HITL_SCOPE_DENIED"))
+    assert "consent.example.test" not in refused.text

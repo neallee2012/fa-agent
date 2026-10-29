@@ -7,16 +7,13 @@ import json
 import os
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-import httpx
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from shared_context.errors import Problem
-from shared_context.hosted import HostedClient
 from shared_context.m2_assistant import AssistantEngine, DesktopAction
 from shared_context.m2_copilot import ToolFailure
 
@@ -136,70 +133,6 @@ def test_assistant_saves_model_selected_result_without_repeating_an_accepted_upd
     assert evidence["files"]["result.txt"]["text"] == "Synthetic total: 40"
     assert evidence["binding"]["agent_id"] == AGENT
     assert evidence["sdk_session_id"] == final["sdk_session_id"]
-
-
-def test_invocations_entry_runs_assistant_through_the_real_context_api(system, work, tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-
-    monkeypatch.setenv("OTEL_SDK_DISABLED", "true")
-    import hosted_main
-
-    hosted_runtime(monkeypatch, tmp_path)
-    api = system[3]["agent-a"]
-
-    def send(request):
-        response = api.request(request.method, request.url.raw_path.decode(), content=request.content,
-                               headers={"content-type": "application/json",
-                                        **({"if-match": request.headers["if-match"]} if "if-match" in request.headers else {})})
-        return httpx.Response(response.status_code, content=response.content, headers=dict(response.headers))
-
-    credential = SimpleNamespace(get_token=lambda scope: SimpleNamespace(token="synthetic-invocations-token"))
-    client = HostedClient("https://context.example", ContextBoundary.api_audience,
-                          "https://synthetic.table.core.windows.net", "workstate",
-                          "https://synthetic.services.ai.azure.com/api/projects/poc", "synthetic-memory",
-                          credential, httpx.Client(transport=httpx.MockTransport(send)))
-
-    async def sdk_boundary(**options):
-        tools = {tool.name: tool for tool in options["tools"]}
-        for name, arguments in [
-            ("read_context", {}),
-            ("fa_write_file", {"name": "result.txt", "text": "Synthetic invocation total: 40"}),
-            ("update_work", {"step": "final", "progress": "finished", "artifact_text": "Synthetic invocation total: 40"}),
-            ("finish_task", {}),
-        ]:
-            await tools[name].handler({"session_id": options["sdk_session_id"], "tool_call_id": uuid4().hex,
-                                      "tool_name": name, "arguments": arguments})
-        return {"sdk_session_id": options["sdk_session_id"], "history": [], "final_message": "Finished"}
-
-    client.assistant = AssistantEngine(client, home=tmp_path, process_marker="invocations-process", runner=sdk_boundary)
-    monkeypatch.setattr(hosted_main, "client", client)
-
-    def metadata(*, probe_home):
-        assert probe_home is False
-        return {"fixed_vm_validated": False}
-
-    monkeypatch.setattr(hosted_main, "runtime_metadata", metadata)
-    route = "/invocations?agent_session_id=synthetic-native-session"
-    with TestClient(hosted_main.app) as http:
-        started = http.post(route, json=command("start", team="team-one", work="task-1",
-                                               prompt="Finish the synthetic task.", input_text="12 + 20 + 8"))
-        assert started.status_code == 200, started.text
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            response = http.post(route, json=command("status"))
-            assert response.status_code == 200, response.text
-            state = response.json()
-            if state["outcome"]["status"] in {"completed", "failed"}:
-                break
-            time.sleep(0.01)
-        assert state["outcome"]["status"] == "completed", state
-        assert state["runtime"]["session_id"] == "synthetic-native-session"
-        assert state["runtime"]["invocation_id"]
-        denied = http.post(route, json=command("evidence", target_agent_id=str(uuid4())))
-        assert denied.status_code == 403
-    result = api.get("/teams/team-one/works/task-1").json()
-    assert result["revision"] == 2
-    assert result["artifact"]["text"] == "Synthetic invocation total: 40"
 
 
 def test_new_process_resumes_unfinished_work_with_the_same_sdk_session_and_existing_receipts(tmp_path, monkeypatch):
@@ -330,23 +263,6 @@ def test_handoff_and_publish_are_explicit_capabilities_and_completion_checks_the
     assert context.record["status"] == "published" and context.mutations == 4
 
 
-def test_hosted_assistant_route_rejects_another_agent_before_creating_private_state(tmp_path, monkeypatch):
-    hosted_runtime(monkeypatch, tmp_path)
-    hosted = HostedClient("https://context.example", ContextBoundary.api_audience,
-                          "https://synthetic.table.core.windows.net", "Workstate",
-                          "https://synthetic.services.ai.azure.com/api/projects/poc", "poc-memory",
-                          credential=None)
-    hosted.assistant = AssistantEngine(hosted, home=tmp_path, process_marker="native-process")
-    try:
-        with pytest.raises(Problem) as denied:
-            hosted.dispatch(command("start", target_agent_id="00000000-0000-0000-0000-00000000005e",
-                                    team="poc-team", work="work-one", prompt="Read private files.", input_text="synthetic"))
-        assert denied.value.status == 403
-        assert list((tmp_path / ".fa-m1").iterdir()) == []
-    finally:
-        hosted.http.close()
-
-
 @pytest.mark.parametrize("actual_label,expected_status", [("amber sample", "completed"), ("wrong field", "failed")])
 def test_desktop_steps_deliver_pixels_and_finish_checks_actual_fields_and_cleanup(
     tmp_path, monkeypatch, actual_label, expected_status,
@@ -431,24 +347,6 @@ def test_desktop_steps_deliver_pixels_and_finish_checks_actual_fields_and_cleanu
     assert instances[0].actions == [{"type": "click", "x": 33, "y": 44}]
     evidence = engine.dispatch(command("evidence"))
     assert len(evidence["screenshots"]) == 2
-
-
-def test_model_budget_uses_only_the_fixed_authenticated_read_route():
-    seen = []
-
-    def gateway(request):
-        seen.append((request.method, str(request.url)))
-        return httpx.Response(200, json={"run_id": "m2-unit", "requests": 5})
-
-    credential = SimpleNamespace(get_token=lambda scope: SimpleNamespace(token="synthetic-credential"))
-    with httpx.Client(transport=httpx.MockTransport(gateway)) as http:
-        hosted = HostedClient("https://context.example", ContextBoundary.api_audience,
-                              "https://synthetic.table.core.windows.net", "Workstate",
-                              "https://synthetic.services.ai.azure.com/api/projects/poc", "poc-memory",
-                              credential, http)
-        result = hosted.dispatch({"operation": "model_budget"})["outcome"]
-        assert result["http_status"] == 200 and result["content"]["requests"] == 5
-    assert seen == [("GET", "https://context.example/model/v1/budget")]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows file-sharing transport boundary")

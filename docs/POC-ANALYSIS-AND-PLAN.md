@@ -54,7 +54,7 @@ Git發布不擴張雲端／模型／權限額度，不把新來源回讀機制�
 | GUI | A 非 root、headed Chromium、OS 視窗聚焦／鍵盤輸入、截圖、下載及清理通過；[實作](../src/fa-shared-context-poc/shared_context/gui.py) 呼叫固定的 xdotool 序列，使用 ephemeral temporary directory | 已證明部分 OS UI 操作鏈，不是 SDK 自主看畫面／決策；本 gate 未驗滑鼠定位／點擊／拖曳、一般桌面應用或私人 profile 持久性 |
 | 身份與原生存取 | API 驗 token／OID allowlist；跨 Team、私人 target／receipt 被拒；直接 Table／Memory 為 403 | 保留先授權再選 scope 的邊界；scope 不是 ACL，Storage 網路拒絕不能單獨證明 RBAC，靜態 A/B allowlist 不是完整組織治理 |
 | Session 控制 | service-name 模式曾增建額外 sessions；50 筆額外 active 被 stop。endpoint-only 回歸未新增記錄 | 修正方向保留；[Controller.invoke](../scripts/validate-shared-hosted.py) 的兩個明確 ID 不等於平台全量實際並行上限，後續須比對 inventory |
-| 真正的 AI 助理 | [hosted_main.invoke](../src/fa-shared-context-poc/hosted_main.py) 呼叫 [HostedClient.dispatch](../src/fa-shared-context-poc/shared_context/hosted.py)，執行已指定的 API／GUI／runtime 探針 | A/B 尚不是由 Copilot SDK 自主推理、選工具、分工的助理；Memory 內部使用模型也不等於已接上 agent harness |
+| 真正的 AI 助理 | hosted_main.invoke 呼叫 HostedClient.dispatch（兩者已於 2026-10 移除），執行已指定的 API／GUI／runtime 探針 | A/B 尚不是由 Copilot SDK 自主推理、選工具、分工的助理；Memory 內部使用模型也不等於已接上 agent harness |
 | 檔案成果 | [models](../src/fa-shared-context-poc/shared_context/models.py) 只支援 tiny artifact text；Table 工作 JSON 上限 48 KiB | 不把這個 payload 擴充成任意文件庫；正式檔案傳遞、版本歷史、來源及發布要另定合約 |
 | 費用 | 最後成功的延遲讀值約 US$1.32；較新查詢為 HTTP429，總額及剩餘額未知 | US$100 符合性仍 UNKNOWN。18688 個已回報 tokens、session 記錄數及零 active 都不是帳單 |
 | SMB | 6／100 輪後停止，MI 取票成功但 mount／kernel helper callout 仍 ENOENT，原 G0 BLOCKED | 保留失敗與定位界線，不再使用剩餘 94 輪；Context API 的 PASS 不回寫成 OS mount 成功 |

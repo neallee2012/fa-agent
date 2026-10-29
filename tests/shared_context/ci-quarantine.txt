@@ -99,7 +99,6 @@ tests/shared_context/test_behavior_recovery.py::test_foreign_or_stale_stop_canno
 tests/shared_context/test_behavior_recovery.py::test_positive_platform_proof_cannot_be_relabelled_as_a_success_result  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_behavior_recovery.py::test_provider_explicit_already_stopped_is_not_confused_with_idle_metadata  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_behavior_recovery.py::test_reused_target_refuses_even_the_recovery_plan  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
-tests/shared_context/test_behavior_recovery.py::test_signed_operator_http_has_no_business_entry_or_client_supplied_stop_proof  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_behavior_recovery.py::test_unknown_stop_never_releases_capacity_or_repeats_the_provider_request  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_behavior_reviewed_read_view.py::test_full_model_keeps_both_inventories_and_original_egt[before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_behavior_reviewed_read_view.py::test_real_controller_races_still_use_original_three_attempts[1-egt-guarded-view-before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)

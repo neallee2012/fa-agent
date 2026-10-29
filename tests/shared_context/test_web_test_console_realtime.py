@@ -30,7 +30,9 @@ def console(real_interface, tmp_path):
             return httpx.Response(200, json=directory_payload(), headers={"cache-control": "no-store"})
         if request.url.path == "/agents/agent-one/work-policy/v1/realtime/negotiate":
             seen.append(request)
-            return httpx.Response(replies["status"], json=replies["negotiate"], headers={"cache-control": "no-store"})
+            reply = replies["negotiate"]
+            body = {"content": reply} if type(reply) is bytes else {"json": reply}
+            return httpx.Response(replies["status"], **body, headers={"cache-control": "no-store"})
         path = request.url.path.removeprefix("/agents/agent-one")
         return c.backend.send(httpx.Request(request.method, request.url.copy_with(path=path),
                                            headers=request.headers, content=request.content))
@@ -123,6 +125,14 @@ def test_negotiate_refuses_a_malformed_reply(console):
         replies["negotiate"] = reply
         refused = ui.get("/api/realtime/negotiate", headers=AGENT)
         assert refused.status_code == 502 and refused.json()["error"]["code"] == "REALTIME_INVALID", reply
+
+
+def test_negotiate_refuses_a_reply_too_deep_to_parse(console):
+    start, replies, _, _ = console
+    ui, _ = start()
+    replies["negotiate"] = b"[" * 8192  # within NEGOTIATE_BYTES, deeper than the JSON parser's recursion limit
+    refused = ui.get("/api/realtime/negotiate", headers=AGENT)
+    assert refused.status_code == 502 and refused.json()["error"]["code"] == "REALTIME_INVALID"
 
 
 def test_received_import_takes_one_rid_and_never_switches_the_open_conversation(console):

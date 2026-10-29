@@ -33,7 +33,7 @@ Neal 2026-10-22 的需求原文：「azd的部分，我想要多一個選項，�
 - **Foundry Memory Store 不能用，長期記憶改走記憶選項 B**。官方文件寫明「Virtual network (VNet) integration isn't supported for memory stores.」（[What is memory，Limitations](https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/what-is-memory#limitations)）。探針實測：帳號入站只要是 `defaultAction: Deny`（含只開特定 IP，不論是否注入）記憶背景作業就失敗、搜尋逾時；（未注入帳號測得）只有 `Allow` 正常，而 `Allow` 與 `private` 的前提互相矛盾。Neal 2026-10-23 決定 `private` 採記憶選項 B：FA 自建長期記憶後端。B 原本寫的是 Azure AI Search＋private endpoint；總協調比較 AI Search 與 Cosmos DB 之後，Neal 同日改選 Cosmos DB serverless（「用Cosmos DB serverless」），詳細設計見 [ADR-0011](0011-private-mode-cosmos-memory.md)。ADR-0011 的實作完成前，`private` 一律搭配 `FA_ENABLE_MEMORY=false`（FA 在記憶關閉時已經會正常降級，回 `not_configured`）。`public` 不變，維持 Foundry Memory Store。
 - **只能在建立新環境時選，之後不能切換**。官方：「Network injection is part of the create-resource flow and can't be added」（[networking-options](https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/networking-options)）。
 - **主人無法再從公網用 Foundry 入口網站看 Agent 與資料**，要在 VNet 內或經 VPN。
-- 探針基礎設施部署約 5–7 分鐘（不含 FA 應用與 azd hook；探針：第 0 階段 4 分 38 秒，第 0b 階段約 6 分鐘；第 0 階段帳號加兩個模型部署 3 分 20 秒，平台自動建帳號層級 capability host 約 3 分鐘，與帳號同時完成）。刪除要照順序，而且慢很多：`azd down` 預期 45 分鐘以上（見第 7 節）。
+- 探針基礎設施部署約 5–7 分鐘（不含 FA 應用與 azd hook；探針：第 0 階段 4 分 38 秒，第 0b 階段約 6 分鐘；第 0 階段帳號加兩個模型部署 3 分 20 秒，平台自動建帳號層級 capability host 約 3 分鐘，與帳號同時完成）。2026-10-28 起 `private` 另建 project capability host（第 4 節）；[文件] 範本 15 README 寫注入帳號上建 capability host 可能要約 30–35 分鐘，FA 的 `private` provision 因此可能多這麼久（未實測）。刪除要照順序，而且慢很多：`azd down` 預期 45 分鐘以上（見第 7 節），先刪 project capability host 的時間未實測。2026-10-28 [實測]：project capability host 建立 48.7 秒、刪除 32 秒；整次 `azd down` 跨三次重跑約 59 分（見 progress `startup-private-1028`）。
 
 **已確認：BYO 為硬需求**（見「Neal 的決定」）。以下 D 的比較留作參考：官方另有 managed VNet（選項 D），「now supports Prompt and Hosted Agent services」。它省掉 subnet、NAT 和刪除順序的麻煩，入站同樣私有，但 agent 不在你自己的網路裡。
 
@@ -49,12 +49,12 @@ Neal 2026-10-22 的需求原文：「azd的部分，我想要多一個選項，�
 | [文件] 每個 Hosted session 占一個 IP；/24 約 250 個 session；用盡時回 429 `subnet_exhausted`，平台不預警 | deep-dive |
 | [文件] Micro VM 和每個 project 自己的 data proxy 都在委派的 subnet；agent 自己的出站直接走 subnet 上的網卡，工具呼叫走 data proxy | deep-dive |
 | [文件] Memory Store 不支援 VNet integration。[探針] 實測：帳號入站只要是 `Deny`（含 selected IPs）就壞，（未注入帳號測得）只有 `Allow` 正常，見「第 0 階段結果」 | [What is memory](https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/what-is-memory#limitations) |
-| [文件] Work IQ 在網路隔離的 project 不支援；MCP、OpenAPI 走 VNet subnet；toolbox 本身沒有網路資源，agent 經 project private endpoint 存取 | [toolbox network isolation](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/tools/toolbox-network-isolation)、[configure-private-link 工具表](https://learn.microsoft.com/en-us/azure/foundry/how-to/configure-private-link#agent-tools-with-network-isolation) |
+| [文件] Work IQ 在網路隔離的 project 不支援；MCP、OpenAPI 走 VNet subnet；toolbox 本身沒有網路資源，agent 經 project private endpoint 存取；[文件] 經 VNet 呼叫 Foundry 外的工具端點（MCP、OpenAPI、A2A）前，須先在 Foundry project 層級有 capability host，只有帳號層級不夠，沒有的話呼叫會以 `name or host unknown` 等連線錯誤失敗（2026-10-28 讀，頁面 updated_at 2026-10-26，[Configure capability hosts](https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/capability-hosts#configure-capability-hosts)） | [toolbox network isolation](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/tools/toolbox-network-isolation)、[configure-private-link 工具表](https://learn.microsoft.com/en-us/azure/foundry/how-to/configure-private-link#agent-tools-with-network-isolation) |
 | [文件] 關掉公網後，不能從公網工作站跑 `azd up`／`azd deploy`；azd 沒有內建 VNet 旗標 | virtual-networks（azd pivot） |
 | [文件] 入站有三種：Enabled、Enabled from selected IPs、Disabled | configure-private-link |
 | [文件] 需要註冊 `Microsoft.App` 和 `Microsoft.ContainerService` | virtual-networks |
-| [文件] 刪除時 subnet 會被 service association link 卡住，要先刪 capability host、purge 帳號；文件寫 capability host 建立約 30–35 分鐘（[探針] 實測不成立：帳號層級的由平台自動建，約 3 分鐘，與帳號同時完成） | virtual-networks 疑難排解、[範本 15 README](https://github.com/microsoft-foundry/foundry-samples/blob/main/infrastructure/infrastructure-setup-bicep/15-private-network-standard-agent-setup/README.md) |
-| [文件] 範本 11（BYO VNet＋平台管理的資料資源）明確建立 project capability host（`capabilityHostKind: 'Agents'`），帳號 `networkAcls` 用 `Deny`＋`AzureServices`（[探針] 實測不建 project capability host，Hosted Agent 也能跑，FA 維持不建） | [foundry-samples 範本 11](https://github.com/microsoft-foundry/foundry-samples/tree/main/infrastructure/infrastructure-setup-bicep) |
+| [文件] 刪除時 subnet 會被 service association link 卡住，要先刪 capability host、purge 帳號；官方清理工具的順序是 project capability host → 帳號 capability host → project → 刪帳號並 purge → 等 SAL 清空；文件寫注入帳號上建 capability host 約 30–35 分鐘（[探針] 帳號層級的由平台自動建，約 3 分鐘，與帳號同時完成；project 層級的建立時間 FA 沒有量過；2026-10-28 [實測] project 層級建立 48.7 秒、刪除 32 秒，見 progress `startup-private-1028`） | virtual-networks 疑難排解、[範本 15 README](https://github.com/microsoft-foundry/foundry-samples/blob/main/infrastructure/infrastructure-setup-bicep/15-private-network-standard-agent-setup/README.md)、[官方清理工具](https://github.com/microsoft-foundry/foundry-samples/tree/main/infrastructure/infrastructure-setup-bicep/deployment-tools/cleanup) |
+| [文件] 範本 11（BYO VNet＋平台管理的資料資源）明確建立 project capability host（`capabilityHostKind: 'Agents'`），帳號 `networkAcls` 用 `Deny`＋`AzureServices`（[探針] 實測不建 project capability host，Hosted Agent 也能跑；2026-10-28 起 FA 在 `private` 也照範本 11 建，見第 4 節） | [foundry-samples 範本 11](https://github.com/microsoft-foundry/foundry-samples/tree/main/infrastructure/infrastructure-setup-bicep) |
 | [文件] AVM `cognitive-services/account` 0.19 的 `networkInjections` 是單一物件 `{scenario, subnetResourceId, useMicrosoftManagedNetwork}`，內部轉成原生陣列 | [AVM README](https://github.com/Azure/bicep-registry-modules/tree/main/avm/res/cognitive-services/account) |
 | [文件] managed VNet 支援 Hosted；刪 Foundry 資源會一起刪 managed VNet | [managed-virtual-network](https://learn.microsoft.com/en-us/azure/foundry/how-to/managed-virtual-network) |
 
@@ -133,7 +133,17 @@ azd up
 - `networkInjections: { scenario: 'agent', subnetResourceId: snet-agents, useMicrosoftManagedNetwork: false }`；
 - `publicNetworkAccess` 與 `networkAcls`：`defaultAction: 'Deny'`、`bypass: 'AzureServices'`。部署期間暫時允許部署者 IP（第 0 階段第 2 題已通過），見下一節；
 - `privateEndpoints`；
-- **不建 project capability host**：探針實測，平台會自動建帳號層級的 capability host（約 3 分鐘），Hosted Agent 正常運作。範本 11 有建立；FA 的 `foundry.bicep` 從來沒建過，維持不變。
+- **建 project capability host**（2026-10-28 起；原本不建）：`foundry.bicep` 只在 `private` 建 `Microsoft.CognitiveServices/accounts/projects/capabilityHosts@2025-06-01`，名稱 `caphostproj`，`capabilityHostKind: 'Agents'`，不帶 BYO connection（Basic，平台管理資料，同範本 11）。帳號層級的仍由平台隨注入自動建，FA 不另建（同一範圍只能有一個，第二個回 409）。
+  - 第一版的決定是不建：探針實測，平台會自動建帳號層級的 capability host（約 3 分鐘），Hosted Agent 正常運作（Q3、Q8，結果照原樣保留）。這只對 Hosted Agent 本身成立。
+  - 2026-10-28 改變決定（Neal 同日批准程式修改）：[文件] [toolbox network isolation](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/tools/toolbox-network-isolation)（頁面 updated_at 2026-10-26）要求，經 VNet 呼叫 Foundry 外的工具端點（MCP、OpenAPI、A2A）前須有 project 層級 capability host，只有帳號層級不夠，否則以 `name or host unknown` 等連線錯誤失敗。FA 的 WebIQ 是 toolbox 內的 MCP，`private` 下經 `snet-agents` 與 NAT 出站，所以要建。
+  - 版本與屬性：[文件] [Configure capability hosts](https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/capability-hosts#configure-capability-hosts) 的 project PUT 用 `2025-06-01` 並帶 `capabilityHostKind: "Agents"`，與 FA 帳號、project 釘的版本相同。REST 參考與 Bicep 型別的 project capability host 沒有列 `capabilityHostKind`（Bicep 每個版本都報 BCP037，該行已停用警告）；範本 11 與本 repo 舊 VNet POC（`infra/vnet/main.bicep`，`2025-04-01-preview`，2026-09-13 讀回 `Succeeded`，[POC-RESULTS](../../POC-RESULTS.md)）都帶這個欄位。
+  - REST 規格（2026-10-28 讀，azure-rest-api-specs `139c4c0c`）：[文件] [REST 規格](https://github.com/Azure/azure-rest-api-specs/blob/139c4c0cabf25c50141d048f2d4c9832306d47ec/specification/cognitiveservices/resource-manager/Microsoft.CognitiveServices/CognitiveServices/stable/2025-06-01/cognitiveservices.json) 的 project 層級定義 `ProjectCapabilityHost`（client 名 `ProjectCapabilityHostProperties`，約第 8961 行）只有 `aiServicesConnections`、`provisioningState`、`storageConnections`、`threadStorageConnections`、`vectorStoreConnections`，而且 `additionalProperties: false`（約第 9006 行）；`capabilityHostKind` 與 `customerSubnet` 只在帳號層級的 `CapabilityHost`（約第 8842、8846 行）；`CapabilityHostKind` 的 enum 只有 `Agents`（約第 8925 行）。`2025-04-01-preview` 起到 `2026-09-15-preview` 的全部 15 個版本（stable 與 preview），project 層級都沒有 `capabilityHostKind`。所以這是規格不完整，不代表 PUT 會被拒：Learn 自己的 `2025-06-01` project PUT 範例帶它，舊 POC 的 `2025-04-01-preview` PUT（規格同樣 `additionalProperties: false`）也被接受。[推論] 換版本不會改變這個欄位的處境。
+  - 順序：[文件] 沒有帳號層級的就不能建 project 層級的；平台隨注入建帳號層級的，範本 11 也是帳號 → project → project capability host，不另等。`private` 建立 Hosted Agent 版本、WebIQ connection 與 toolbox 都在 postdeploy，晚於 provision，所以自然在它之後。同名同設定再 PUT 回 200（不變），重跑 `azd provision` 不影響。
+  - 這版之前建的 `private` 環境，下一次 `azd provision` 會補建；已存在的 Agent 版本是否因此能用外部工具，未實測。
+  - 刪除：見第 7 節，先刪它再刪 project。
+  - PUT 被拒時的退路：維持 `2025-06-01`。若 PUT 對 `capabilityHostKind` 回 400，先改成 `properties: {}`（enum 只有 `Agents`，帶不帶都只能是它），再 `azd provision`；仍被拒才考慮別的版本，而依上面的規格，換版本本身不會讓這個欄位變得合法。[推論] Learn 寫「同名、不同設定」回 400，所以若曾以 `properties: {}` 建成功，之後要改回帶 `capabilityHostKind` 得先刪掉再建。
+  - 卡在 `Failed` 的復原：[文件] Learn「Updating capability hosts is not supported. To modify a capability host, you must delete the existing one and recreate it」，所以重跑 `azd provision` 修不好。preprovision 在帳號已存在時唯讀列出 project 的 capability host，看到 `Failed` 就停下、什麼都不改，印出 `az rest --method delete` 與讀回的完整指令；刪除由操作者自己執行（hook 不自動刪），讀回 404 後再 `azd provision`。[文件] 官方清理工具把刪除回 409 解讀為它「may be in a failed state」，遇到時先讀狀態再決定是否再送一次。讀清單失敗只印警告，provision 照舊繼續。帳號層級的還沒好時，project 的 PUT 若回 409：[推論] 沒有建立任何東西（Learn 的 409 說明是同範圍已有別的 host 或另一個操作進行中，要等它完成再送），讀回確認清單裡沒有 `Failed` 的 host 後重跑 `azd provision`。
+  - 雲端驗收（2026-10-28 已做：8 項中 7 項 PASS、第 8 項略過；換版接續未測）：完整清單與結果見[stage 改成 private 的第 9 節第 8 點](#stage-private-1026)，過程見 [progress](../progress.md#startup-private-1028)。`private` 的 project capability host 已由 #1025 建出，`private` 環境裡 WebIQ MCP 的工具呼叫在雲端成功（只證明功能可用，不證明流量走哪條路；`tools/list` 750 ms、`tools/call` 506 ms）；這原本寫「未做」，保留當時的決定與順序。
 
 `public` 時這些參數都不傳。
 
@@ -191,13 +201,14 @@ azd 的流程是先跑 predown hook，hook 跑完 azd 才問自己的 y/N。所�
 1. **`private` 時 predown 一律自己要求輸入環境名稱。** 不管有沒有備份鎖。沿用既有的確認路徑：互動時輸入環境名稱，無終端機時設 `FA_CONFIRM_DELETE=<環境名稱>`（`fa_azd.py` 約 1114–1121 的備份鎖確認）。和備份鎖的確認合併成同一次詢問，使用者只被問一次，不是兩次。提示要說清楚：「接下來會永久刪除 Foundry 帳號（模型、Agent）和備份；確認後 azd 還會問一次 y/N，處理其餘資源」。輸入不符就停，什麼都不刪。
 2. 確認後依序執行（[探針] 驗證過的順序與坑）：
    1. 刪 Hosted agents。**有 session 時要用 `force=true`，否則回 409。**
-   2. 刪 project。**要先刪 project 才能刪帳號，否則回 `CannotDeleteResource`。**
-   3. 刪 Foundry 帳號（先不 purge）。FA 不建 project capability host。探針沒有單獨刪帳號層級 capability host：刪 project、刪帳號、等帳號消失後 purge 成功。該 capability host 的存在只有探針回報，保留的原始 log 沒有。**CLI 刪帳號可能回 `GatewayTimeout`，此時帳號其實已在 `Deleting`**（第 0b 階段實測）：讀狀態、輪詢，不要重送。唯一例外：project 已讀回不見，刪帳號卻回 `CannotDeleteResource`、列出的巢狀資源只有本帳號自己的 project（2026-10-24 實測），表示什麼都沒被接受，每 15 秒重送一次、最多 5 分鐘。
-   4. **輪詢帳號的 `provisioningState` 直到帳號消失**（探針約 22 分鐘）。`snet-agents` 的 service association link 比帳號早清空約 6.5 分鐘，所以 SAL 清空不代表帳號已刪完，不能只看 SAL。
-   5. **帳號消失後才 purge。** 探針的 purge 在帳號仍是 `Deleting` 時沒有結束碼，帳號消失後 exit 0。
-   6. **讀回** SAL 已清空。
-   7. 最後才交給 azd 刪 resource group（約 27 分鐘，卡在 Container Apps 環境）。
-3. 可重試：每一步先讀回目前狀態（agent 存在？project 存在？帳號存在、已在 `Deleting`、已 soft-delete、已 purge？SAL 還在？），從那一步接著做。**CLI 回報錯誤時，帳號可能已在 `Deleting`，先讀狀態再重試，不要直接重送。** 例外只有第 2 點第 3 步那一種 `CannotDeleteResource`。
+   2. （2026-10-28 起）刪 project 的 capability host：像官方清理工具一樣列出 `projects/{p}/capabilityHosts` 逐一刪（不只 `caphostproj`），每個輪詢到讀不到（最多 30 分鐘，官方清理工具的上限）。[文件] 順序依據：先刪 project 層級的，帳號層級的才刪得掉（範本 11 README「Before deleting the account capability host, ensure that the project capability host is deleted」）；SAL 不是因為刪 project 層級的而釋放，`customerSubnet` 只在帳號層級的 capability host 上（REST 規格），而 FA 靠 purge 觸發帳號層級的刪除（範本 11 README：purge 才會觸發它的刪除），SAL 在那之後釋放。它是 ARM 呼叫，在部署窗口之外；只送一次，`GatewayTimeout` 時讀狀態輪詢、不重送；已在 `Deleting` 就只輪詢；之前建的環境沒有（清單空的或 404）就略過；讀清單回其他錯誤時在問確認前停下。project 已在 `Deleting` 時不再列（[推論] 上次執行已先刪完 host 才刪 project）。這一步是文件順序，探針沒有看過；未實測。
+   3. 刪 project。**要先刪 project 才能刪帳號，否則回 `CannotDeleteResource`。**
+   4. 刪 Foundry 帳號（先不 purge）。帳號層級 capability host 不單獨刪（官方清理工具會先刪它；範本 15 README 寫 purge 會觸發刪除），靠 purge，與三次雲端拆除相同。探針沒有單獨刪帳號層級 capability host：刪 project、刪帳號、等帳號消失後 purge 成功。該 capability host 的存在只有探針回報，保留的原始 log 沒有。**CLI 刪帳號可能回 `GatewayTimeout`，此時帳號其實已在 `Deleting`**（第 0b 階段實測）：讀狀態、輪詢，不要重送。唯一例外：project 已讀回不見，刪帳號卻回 `CannotDeleteResource`、列出的巢狀資源只有本帳號自己的 project（2026-10-24 實測），表示什麼都沒被接受，每 15 秒重送一次、最多 5 分鐘。
+   5. **輪詢帳號的 `provisioningState` 直到帳號消失**（探針約 22 分鐘）。`snet-agents` 的 service association link 比帳號早清空約 6.5 分鐘，所以 SAL 清空不代表帳號已刪完，不能只看 SAL。
+   6. **帳號消失後才 purge。** 探針的 purge 在帳號仍是 `Deleting` 時沒有結束碼，帳號消失後 exit 0。
+   7. **讀回** SAL 已清空。
+   8. 最後才交給 azd 刪 resource group（約 27 分鐘，卡在 Container Apps 環境）。
+3. 可重試：每一步先讀回目前狀態（agent 存在？project capability host 存在、已在 `Deleting`？project 存在？帳號存在、已在 `Deleting`、已 soft-delete、已 purge？SAL 還在？），從那一步接著做。**CLI 回報錯誤時，帳號可能已在 `Deleting`，先讀狀態再重試，不要直接重送。** 例外只有第 2 點第 4 步那一種 `CannotDeleteResource`。
    - 時間：`azd down` 預期 45 分鐘以上（帳號約 22 分鐘＋resource group／Container Apps 環境約 27 分鐘；第 0 階段約 49 分鐘，第 0b 階段整套拆除 50 分鐘：帳號約 22 分鐘、RG 約 26 分鐘）。hook 要印出進度，不能讓使用者以為卡住。
    - **可能的殘留，要在拆除文件中列為檢查項：** 建立 Hosted 版本時，平台會自動建 Entra agent 身分（instance identity 與 blueprint）。第 0b 階段有 Graph 讀取權限：force 刪 agent 後，3 個 instance identity 與 3 個 blueprint principal 的讀取都回 404，很可能由平台自動清除。但刪除前是否讀得到沒有確認，所以 404 不是「已證明有清除」；拆除文件寫「0b 讀回 404，推定自動清除」，不宣稱「無殘留」，並保留檢查項。
 4. 使用者在 azd 的 y/N 回 N 時，Foundry 已經刪除，其他資源還在。提示要事先講明；重跑 `azd up` 會建一個新的注入帳號。
@@ -345,7 +356,7 @@ IP 要等 private endpoint 建好才知道，所以 `existing` 時 postprovision
 | 0 探針 | **已完成（2026-10-23）**：dev 訂閱新 RG：注入的 Foundry、private endpoint、NAT、一個 Hosted Agent。已刪除並 purge，費用估計 USD 1–3（實際金額待查）。結果見「第 0 階段結果」 | 已批准（2026-10-23）（新資源；預估 USD 5–10） |
 | 0b 平台對話接續與未測項目 | **已完成（2026-10-23）**：Hosted 內呼叫模型、平台對話儲存的多輪與換版接續、agent endpoint 403 的原始證據、Hosted→FA dev API 公網 `/healthz` 可達（經 NAT 為推論）、App Insights 擷取、身分端點。RG `rg-fa-netprobe0b-1023` 已刪，費用估計 USD 1–2（實際金額待查）。結果見「第 0b 階段結果」 | 已批准（2026-10-23，Neal：「好」）（新資源與費用） |
 | 0c 剩餘未測項目 | 見「第 0b 階段結果」的「仍未測」。**建議**併入第 3 階段驗收（需要完整 FA 環境：WebIQ MCP 出站、toolbox、重跑 `azd provision`、FA API app 呼叫 agent、desktop 完整啟動、帶身分的 Hosted→API 呼叫），不再另開探針；是否另開由 Neal 決定 | 併入各階段，無新增批准 |
-| 1 Bicep | 網路 module 移到 Foundry 前（兩種模式，用測試證明 public 不變）、`snet-agents`、注入、private endpoint、NAT 條件拆開、preprovision 檢查、provider 清單。不建 project capability host。**已實作於 #961（10-24 隨 `fa-priv-1024` 部署，見第 3 階段）**；單有這一階段 `private` 不能用 | 一般 PR |
+| 1 Bicep | 網路 module 移到 Foundry 前（兩種模式，用測試證明 public 不變）、`snet-agents`、注入、private endpoint、NAT 條件拆開、preprovision 檢查、provider 清單。不建 project capability host（2026-10-28 改為 `private` 建，見第 4 節）。**已實作於 #961（10-24 隨 `fa-priv-1024` 部署，見第 3 階段）**；單有這一階段 `private` 不能用 | 一般 PR |
 | 2 部署與刪除（azd hook） | 部署期間只允許部署者 IP（第 2 題已通過，Job 為備案）；predown 的確認、刪除順序與重試（force 刪 agent、先刪 project、輪詢帳號 provisioningState）；拆除文件列出 Entra agent 身分殘留檢查；文件警告。**已實作於 #963（10-24 在 `fa-priv-1024` 實際跑過窗口與刪除，見第 3 階段）** | 一般 PR |
 | 2 其餘：Work IQ 防護 | API 在 `private` 拒絕新增 Work IQ connector grant（`FA_NETWORK_MODE` 傳給 API）。**已實作於 #970（離線測試；10-24 隨 `fa-priv-1024` 部署，見第 3 階段）**：azd profile 只在 `private` 把 `FA_NETWORK_MODE=private` 放進 API 環境；加入或重新啟用 Work IQ 回 422 `TEAM_CONNECTOR_PRIVATE_NETWORK`，停用仍可，不刪除既有 grant；停用時不能帶 client secret 由 #974 加上（已合併；這項拒絕沒有在雲端觸發過。#974 的帳號刪除重送已在 10-24 `fa-priv2-1024` 拆除時實際跑過：`CannotDeleteResource` → 重送 → GatewayTimeout → 之後只輪詢，[紀錄](../progress.md#private-reruns-1024)）。防護已部署但沒有實際觸發過：azd 預設不安裝 Connectors 路由 | 一般 PR |
 | 2b 帶入既有 VNet | `FA_VNET_RESOURCE_ID`、subnet 名稱、使用者提供 DNS（`FA_DNS_MODE`）。設計見「[第 2b 階段設計](#第-2b-階段設計帶入既有-vnet2026-10-24)」；Neal 2026-10-24 決定隨下一個 staging release 出貨。**已實作於 #976；`FA_DNS_MODE=azd` 已在雲端驗證（2026-10-24 `fa-byo-1024`，[紀錄](../progress.md#private-reruns-1024)），`existing` 未在雲端測** | 一般 PR |
@@ -393,7 +404,7 @@ IP 要等 private endpoint 建好才知道，所以 `existing` 時 postprovision
 ### 對本文的影響
 
 - 部署走主路徑（暫開部署者 IPv4，PATCH 只送 `publicNetworkAccess` 與 `networkAcls`，結束讀回 `Disabled`）；Job 備案也實測可行。
-- 不建 project capability host；探針基礎設施部署時間改為約 5–7 分鐘，不含 FA 應用與 azd hook（第 0b 階段修正）。
+- 不建 project capability host（2026-10-28 改為 `private` 建，見第 4 節；探針結果不變）；探針基礎設施部署時間改為約 5–7 分鐘，不含 FA 應用與 azd hook（第 0b 階段修正）。
 - agent endpoint 在本設計的設定下隨帳號 `Disabled` 為私有。
 - Foundry Memory Store 在 `private` 不可用（任何 `Deny` 都壞）。`private` 的長期記憶採記憶選項 B，見「長期記憶的選項」。
 - 刪除流程補上 force 刪 agent、先刪 project、輪詢帳號 `provisioningState`、CLI 報錯時先讀狀態、`azd down` 預期 45 分鐘以上。
@@ -499,3 +510,188 @@ Neal 2026-10-23 的決定：「長期記憶是一個重要的元素，不能沒�
   - [ADR-0006](0006-team-trust-boundary-grokbot-mode.md)：Team 信任邊界與 API 轉送；
   - [ADR-0008](0008-environment-tiers-staging-cicd.md)：遠端工作台 Entra；
   - [azd 新環境設計](../azd-new-environment.md)。
+
+<a id="stage-private-1026"></a>
+## stage 改成 private（2026-10-26 Neal 決定）
+
+設計草稿（2026-10-26），只改文件，沒有任何雲端寫入。標示：[程式] 讀本 repo 程式確認；[讀回] 2026-10-26 唯讀 az 讀回；[文件] 官方文件；[實測] 引自前文或 progress；[推論] 未驗證。
+
+### 1. 決定（Neal 2026-10-26，經總協調轉述，非逐字）
+
+- stage 可以改成 private 架構（本 ADR 的網路隔離＋[ADR-0011](0011-private-mode-cosmos-memory.md) 的 Cosmos 記憶）。
+- stage 的 Foundry 端可以刪掉重建；stage 的對話、記憶、checkpoint 不搬，從空的開始。
+- stage 失去 Teams／Work IQ 可以接受（Work IQ 在網路隔離的 project 不支援；`private` 下 FA 拒絕新增，#970）。
+
+影響：ADR-0008 §1「stage＝共用帳號下的新 project」對 stage 不再成立（ADR-0008 原文不改，以本節為準）。注入只能在建立帳號時設定 [文件 networking-options]，所以 stage 要自己的新帳號；共用帳號 `cog-fasample-memory-demo` 上有 dev，不能刪、也不能改成 private（[讀回] 目前 `publicNetworkAccess` Enabled、`defaultAction` Allow、沒有 `networkInjections`）。
+
+### 2. 核心發現：例行 stage 部署不碰 Foundry 資料面
+
+[程式] `deploy-staging.yml` 每一步從 GitHub runner 發出的只有 ARM、ACR、git 與 API 公網入口：
+
+| 步驟 | runner 發出的呼叫 | Foundry 資料面 | 帳號 `Disabled` 的影響 |
+|---|---|---|---|
+| release-gate | GitHub GraphQL（核對 release PR） | 無 | 無 |
+| meta／check | 讀 profile、release.json（`ci_deploy.py:131-152`） | 無 | 無 |
+| guard | ARM GET API app、Web PubSub、identity；git（`ci_deploy.py:263-301`、`352-383`） | 無 | 無 |
+| build api／hosted／console／feed | `az acr login`、docker build／push（`ci_deploy.py:386-408`） | 無 | 無（ACR 維持 Basic 公網，同 azd `private`） |
+| gate／sync／follow | 只有 ARM `jobs/{job}/start` 與輪詢（`ci_deploy.py:847-882`） | 在 sync job 容器內（`ci_deploy.py:676-705`、`760-782`） | job 在 Container Apps 環境（VNet integration，`foundation.bicep:68`），經 Foundry private endpoint；前提是三個 DNS zone 連到該 VNet |
+| api／console／feed | ARM PATCH（`ci_deploy.py:907-952`）、API `/healthz`（`ci_deploy.py:1023-1032`） | 無 | 無（API 入口維持公網＋Entra） |
+| public-sync | 不登入 Azure（只有 checkout、gitleaks、scrub、push） | 無 | 無；但見阻礙 5 |
+
+- CI 身分只有 stage RG 內的 AcrPush、Container Apps Contributor、Jobs Operator、Managed Identity Operator、Reader＋Log Analytics Reader，沒有任何 Foundry 角色（`stage-ci-identity.bicep:3-5`、`24-32`）。
+- azd 的後續部署 `upgrade()` 就是同一組步驟（`fa_azd.py:1506-1519`），只有要設定 WebIQ 時才開部署者 IP 窗口（`fa_azd.py:1050-1065`）。
+- **結論**：本 ADR 第 5 節的備案「資料面步驟進 VNet 內的 Job」，對例行 CI 部署早已是現況。從 VNet 外打資料面的只剩一次性步驟：建 seed Agent 版本（`fa_azd.py:1172-1184`）、WebIQ connection 與 toolbox（`fa_azd.py:1438-1444`）、WebIQ 金鑰輪替（`deploy/README.md:251-259`）。
+- [實測] 間接證據：`fa-priv-1024` 以 #971 重新部署過一次（升級路徑，progress.md:78）。從 GitHub runner 對 `private` 環境跑完整 CI 沒有做過。
+
+### 3. 阻礙與各自需要什麼
+
+| # | 阻礙 | 證據 | 需要 |
+|---|---|---|---|
+| 1 | **模型配額**（最優先） | [讀回] westus3 GlobalStandard 用量／上限（單位：千 TPM）：gpt-6.1-sol 500／250、gpt-6-luna 500／250、gpt-5.4-mini 500／1000、text-embedding-3-small 40／1000。stage 預設模型是 gpt-6.1-sol（`stage.json:99`）。用量高於上限的原因未查 | [推論] 同訂閱同區域的新帳號拿不到 gpt-6.1-sol／luna 容量。Neal 從第 8 節選一項 |
+| 2 | 新 RG、帳號、project、名稱 | azd 主 Bicep 以 subscription 為範圍、自建 `rg-<env>`，名稱由環境名推出（`infra/azd/main.bicep:127-148`、`185-221`），和今天 stage 不同（例如 `ca-fa-behavior-stage` 變成 `ca-api-<env>`） | 工作台網址、API audience、Entra app 都換新（postprovision 註冊），使用者改用新網址 |
+| 3 | CI 身分 | `deploy_client_id` 沒有時 meta 停下（`ci_deploy.py:143-146`）；身分與角色只在自己的 RG（`stage-ci-identity.bicep`） | 新 RG 部署 `stage-ci-identity.bicep`（名稱參數改成 azd 名稱，`extraAppNames` 與 `extraIdentityNames` 放 console／feed 的 app 與身分）；FIC subject 不變（repo＋`staging`＋main）。雲端 IAM 寫入，要 Neal 批准 |
+| 4 | profile 形狀 | azd profile 與 stage.json 同形（`deploy/azd/profile.py:157-206`），但沒有 `deploy_client_id`、`feed_app`／`feed_environment`、`api_secret_environment`（`profile.defaults.json` 註明刻意不含 feed）。API 更新時，部署中的 `BEHAVIOR_SERVER_CONFIG_JSON` 必須等於 repo 的 `deploy/stage/runtime/config.json`（`ci_deploy.py:916-920`、`962-969`） | 一般 PR：把 `.azure/<env>/fa/profile.json` 與 `runtime/` 放進 `deploy/stage/`，補上述欄位 |
+| 5 | public-sync 去識別 | `scripts/public_export/mapping.json` 依今天 stage 的識別（例如 `demo` 字尾）去識別 | [推論] 新資源名稱與新 client ID 沒有對照時，verify 會 fail-closed 停下。換 stage.json 的同一個 PR 補對照 |
+| 6 | Teams／Work IQ | 登錄表只有 Work IQ（`TEAMS`，`private_network=False`，`connector_registry.py:58`、`75-101`）；`private` 新增或重新啟用回 422（`team_connector.py:131-138`）；profile 只在 `private` 放 `FA_NETWORK_MODE`（`profile.py:150-152`） | 照 Neal 決定放棄。新 stage.json 不放 `FA_TEAM_CONNECTORS_ENABLED`、`FA_CONNECTOR_TEAMS_CLIENT_ID`（留著也只會被拒，[推論]） |
+| 7 | WebIQ 與其他 team MCP | stage 有 `FA_CAPABILITY_TOOLBOX_ENTRIES=WebIQ`（`stage.json:103`）、`FA_TEAM_MCP_ENABLED`；WebIQ MCP 出站、toolbox 經 private endpoint 都未測（第 0b 階段「仍未測」） | 新帳號重建 WebIQ connection（終端機隱藏輸入金鑰）與 toolbox，要開窗口；或 stage 先不放 WebIQ（第 8 節） |
+| 8 | 記憶 | stage 今天用 Memory Store（`stage.json:25`）；`private` 改 Cosmos，不搬資料 | azd `private`＋記憶開（Cosmos、帳號範圍角色 #972、委派 #975） |
+| 9 | 首次安裝要 Team 主人 | 初始化批准與第一次 session 準備都核對 az 登入者是主人（`fa_azd.py:1273-1311`、`1459-1471`）；可用 `FA_APPROVE_INITIALIZATION=<env>` 事先批准（progress.md:54） | 由 Neal 本人的 az 登入跑 `azd up`，或 Neal 在旁登入 |
+| 10 | feed reader | azd 不建 feed（`profile.defaults.json`）；guard 會核 API secret 存在（`ci_deploy.py:185-189`、`354-357`） | 在新 RG 另外部署 `infra/feed-mcp` 與 API secret（Neal 批准），或先不放 |
+
+不受影響或已有實測：
+- 「＋」：azd `private` 建 project 與帳號範圍兩筆受限委派（`main.bicep:360-381`），#975 在 `fa-priv2-1024`、`fa-byo-1024` 實測過（progress.md:44-47、61）。
+- 帶身分的 Hosted→API：`FA_MEMORY_RELAY_WRITE status=201` 已實測（progress.md:88）。
+- 排程時鐘：在 API process 內；guard 要求 `minReplicas>=1`（`ci_deploy.py:362-365`），azd 建 API 時就是 1（`fa_azd.py:1376`）。`private` 下的排程觸發未測。
+- 監控：azd 一樣用 `stage-monitoring.bicep` 建 Log Analytics 與 App Insights 並連到 project（`main.bicep:223-233`）；Hosted→App Insights 已測（第 0b 階段 T6）；`private` 擋住外部 logstream，除錯改看 Log Analytics／App Insights（progress.md:98）。
+- 遠端工作台：維持公網＋Entra（ADR-0008 §3），由 azd 建，先 internal ingress、有登入設定後才開（`fa_azd.py:1405-1435`）。
+
+### 4. 選項組 A：deploy-staging 怎麼到達 private Foundry
+
+| | A1 runner IP 窗口 | A2 VNet 內的 Container Apps Job | A3 VNet 內自架 runner |
+|---|---|---|---|
+| 要改什麼 | `ci_deploy.py` 新增開窗、關窗、讀回，搬 `fa_azd.py` 的 `patch_window`／`close_window`／`window_closed`（`fa_azd.py:916`、`929-1007`）；CI 身分要帳號的 `Microsoft.CognitiveServices/accounts/write`（自訂角色也等於能改帳號任何屬性）；`confirm_window` 要求輸入的 IP 等於當下讀到的 IP（`fa_azd.py:1020`），runner 的 IP 事前不知道，CI 只能自我確認，等於拿掉本 ADR 第 5 節的人為確認 | 例行步驟不用改（第 2 節）；要有新 VNet 的 Foundry private endpoint 與三個 DNS zone（azd `private` 已建），以及 API 身分在新 project 的 Foundry User＋OpenAI User（azd 給）。若要把一次性步驟也搬進去：內嵌 seed／WebIQ 腳本、改用受控身分、intent 檔改存 Table／Blob、結果經 Log Analytics 傳回（第 5 節備案清單）；WebIQ 金鑰要經 job secret | 新 VM 或 Container Apps job runner（GitHub runner scaler）、註冊用 PAT 或 GitHub App；workflow 改 `runs-on`。Container Apps job 不能跑 Docker [文件]，`build` 要留在 GitHub runner 或改 `az acr build`；GitHub 的 Azure private networking 只支援 larger runners、在組織層設定 [文件]，本 repo 是個人帳號的免費 private repo（ADR-0008 §2） |
+| 費用 | 0 | job 按執行秒計，近 0 | VM 約 USD 30–40／月 [推論]，或 job 按秒計；維護另計 |
+| 風險 | GitHub 不建議拿 runner IP 當允許清單；Ubuntu runner 用 Azure 資料中心的 IP 範圍 [文件]，窗口開著時同一出口的其他工作也能進來；job 被取消時關窗可能沒跑到，要靠下一次部署先關 | 例行路徑不變。能 start job 的身分可讀 job secret、用 job 的受控身分 [文件]：CI 身分已有 Jobs Operator，範圍維持只限 sync job | 自架 runner 可能被 workflow 程式持續入侵，要用 JIT runner [文件]；多一套要修補、輪替的東西 |
+| dev 可測 | 可，要新的 dev CI 身分與 FIC（IAM） | 可，現有 azd 環境即可 | 可，要新資源 |
+| 結論 | 例行部署不需要。只留給操作者在筆電跑一次性步驟（今天的 fa_azd 窗口，有確認與讀回） | **採用**（現況） | 目前不需要；之後 `isolated`（ACR 改私有）才要重新評估 |
+
+### 5. 選項組 B：基礎設施怎麼建
+
+| | B1 用 azd `private` 重建 stage | B2 把網路與 Cosmos 移植到 stage 現有的逐 module 路徑 |
+|---|---|---|
+| 做法 | 操作者跑一次 `azd up`（`FA_NETWORK_MODE=private`、記憶開、名稱由新環境名推出）。之後一般 PR：換 `deploy/stage/stage.json` 與 `runtime/`、補阻礙 3–5；`deploy-staging.yml` 不改 | 為 `private-state-network`（加 `snet-agents`、NAT）、`foundry`（新帳號＋注入）、`memory-cosmos`、`account-onboarding-delegation` 各加 `*.stage.parameters.json`，照 ADR-0010 第 2 節的順序手動部署 |
+| guard／gate | azd 建 API 的 revision suffix 是 `<commit7>-r<n>-1`（`fa_azd.py:1224-1226`），符合 guard 的讀法（`ci_deploy.py:311`、`322`）；第一次 CI 部署會核對 ancestor，所以新環境要用 main 上的 commit 建。gate 是 armed（`profile.py:195`），新環境的 binding row 都是 v2 [推論] | 沿用今天的名稱與 revision，guard 照舊；gate 照舊 |
+| 一次性步驟 | 用同一個 azd 環境的窗口（WebIQ、輪替）。狀態在操作者筆電的 `.azure/<env>`；遺失時 hook 寫的值（例如 `FA_AGENT_*_OID`）無法只靠部署輸出重建 [推論]，非秘密值要備份到私密工作區 | 要另外寫窗口、seed、刪除流程，或手動 |
+| 費用 | 加價約 USD 58／月：本 ADR 的約 USD 50＋Cosmos 的 private endpoint 與 DNS zone 約 USD 8（ADR-0011）[推論，牌價]；其餘與今天 stage 同量 | 同左 |
+| 風險 | 名稱與網址換新；並存期間兩份 stage 費用 | 重複 `main.bicep` 已組好的東西；要改既有 VNet `vnet-facontext-api`（AVM VNet 以整份 subnets PUT，第 2 節）；沒有刪除流程 |
+| dev 可測 | 同一套 azd 已在 dev 訂閱跑過三輪（`fa-priv-1024`、`fa-priv2-1024`、`fa-byo-1024`） | 要另做一份 dev 參數，沒有現成 |
+
+### 6. 建議：A2（現況）＋B1
+
+理由：
+- 例行部署不碰 Foundry 資料面（第 2 節），A2 不用改程式。
+- B1 的 Bicep 與 hook 已在 dev 訂閱跑過三輪，B2 是重寫一份。
+- CI 身分不必拿 Foundry 帳號的寫入權（A1 要）。
+- 不必新增或維護 runner（A3 要）。
+
+**切換順序**（每一步的雲端寫入都另經 Neal 批准）：
+1. dev 演練（見下）。
+2. Neal 決定第 8 節的 1–4 項。
+3. 操作者以 Neal 的 az 登入在 stage 訂閱跑 `azd up`，建立新的 private stage，與舊 stage 並存（新 RG）。
+4. smoke：前 10 分鐘；記憶寫入、回想、更正；Team note；「＋」；排程；WebIQ（若保留）；App Insights 收到記憶事件。
+5. 一般 PR：換 `deploy/stage/stage.json` 與 `runtime/`、公開匯出的對照、README 與 CURRENT-STATE。這個 PR 合併不會部署（只看 release.json）。
+6. release PR（Neal 決定合併）：deploy-staging 第一次部署新 stage，讀回 guard、gate、sync、follow。失敗就停、往前修；這時舊 stage 還在，但 CI 已經不會再部署它。
+7. 舊 stage 退場，**每一項刪除都要 Neal 批准**：
+   1. 共用帳號仍是 `Allow`，所以先從筆電 force 刪舊 stage 的 agent（4 個 seed 加上用「＋」新增的）。
+   2. 只刪 project `faexample-stage`，不碰帳號與模型部署。
+   3. 共用帳號上給 stage 的角色指派與委派。
+   4. 舊 RG `rg-faexample-stage`（含舊 CI 身分與它的 FIC）。
+   - 共用帳號不刪。
+
+**dev 演練要證明的事**：
+- **CI 步驟在窗口關閉時能跑完。** 讀回 `Disabled`、沒有 ipRule 之後，從筆電（和 runner 一樣在 VNet 外）以 `ci_deploy.py --config <profile>` 依序跑 check、guard、build、gate、sync、api、console、follow，與 deploy-staging 相同；開始和結束都讀回窗口關閉。
+  - 建議不另建 dev 用的 OIDC 身分（那是 IAM 寫入）。OIDC 身分的權限由第 6 步的第一次 release 驗證。
+- **組出的 stage.json 形狀**（profile＋阻礙 3–4 的欄位）通過 `ci_deploy.py check` 與 `meta`。
+
+**仍未驗證的項目與量法**：
+
+| 項目 | 演練怎麼量 |
+|---|---|
+| 超過 1,000 筆向量 | 經 API 記憶路由寫入超過 1,000 筆合成記憶到同一個 scope，量 `TOP 5` 的 RU 與延遲；對照 0c 階段約 1,000 筆時約 68 RU |
+| Cosmos 429 | 併發寫入衝高 burst，看 SDK 重試、`FA_MEMORY_RELAY_*` log 與降級（ADR-0011 第 7 節） |
+| 延遲及格線 | Hosted 內暖回合依內容讀取 p50 ≤ 同環境的 `native_allocate`、p95 ≤ 1 秒（ADR-0011 第 9 節），從 #973 匯出到 App Insights 的事件讀 |
+| WebIQ MCP 出站、toolbox 經 private endpoint | 開一個帶 WebIQ 的對話，讀 Hosted 與 API log |
+| `private` 下的排程時鐘 | 建一個 5 分鐘後的排程，讀 `FA_NATIVE_ROUTINE_CLOCK_DISPATCH` |
+| 真實費用 | 資源 tag 與 RG 名稱，24–48 小時後讀 Cost Management；也補讀 progress.md:72 列的三輪 |
+
+**演練資源與粗估費用**：
+- 資源：dev 訂閱一個新 azd `private` 環境（新 RG、注入的帳號、NAT、private endpoint、Cosmos serverless、Container Apps 環境、API、console），跑完 `azd down --purge`。
+- 費用：前三輪估 USD 3–10／次（progress.md:100）；超過 1,000 筆與 429 測試的 RU 與 embedding 約 USD 1 以下 [推論]。
+- 模型：與 stage 同訂閱同區域，所以演練也受阻礙 1 限制；用 gpt-5.4-mini 跑。
+- 並存期：新 stage 每月加價約 USD 58，加上 API 與 console 的 Container Apps 重複一份 [推論]。
+- 預算：progress.md:35 記 10-25 約 USD 760.5，上限 900、停損 880，剩約 USD 120。並存期以 1–2 週內為準 [推論]，要先讀 Cost Management 確認。
+
+### 7. WAF 五大支柱（A2＋B1）
+
+- **可靠性**：stage 有自己的帳號，故障範圍與各部署的 TPM 不再和 dev 共用；模型配額仍以「訂閱＋區域」合計（stage 與 dev 同一個訂閱），見阻礙 1；例行部署路徑不變，失敗就停、往前修；agent subnet /24；Cosmos 單一區域、不開 AZ（ADR-0011）。
+- **安全性**：Foundry 入站私有；CI 身分不拿 Foundry 帳號寫入權；能 start job 等於能用 job 的 secret 與受控身分 [文件]，所以 Jobs Operator 維持只限 sync job；Work IQ 由 API 拒絕；Team 資料仍經公網 TLS 到 API（本 ADR 範圍，不宣稱全私有）。
+- **成本**：每月加價約 USD 58 [推論]，加上並存期的重複費用；不買 runner VM，不加 Firewall。
+- **營運卓越**：`deploy-staging.yml` 不改；同一份 azd Bicep 服務 dev 演練與 stage；一次性步驟留在有確認與讀回的 azd 窗口；`private` 擋住外部 logstream，靠 Log Analytics 與 App Insights。
+- **效能**：Hosted 出站多一段 NAT（探針 68–292 ms）；記憶延遲及格線未判定；API 每次新 revision 約 5–6 分鐘才開好 port（progress.md:32，與網路無關）。
+
+### 8. 要 Neal 決定的事
+
+1. **模型配額**：
+   - (a) 申請 westus3 配額；
+   - (b) 降低 dev 帳號的容量，讓給 stage（帳號層寫入，影響 dev）：目前用量 500K 已超過上限 250K；這 500K 是共用帳號的部署（dev 與 stage 兩個 project 一起用，westus3 沒有其他帳號），要降到「250K − 新 stage 要的量」以下，stage 才拿得到；例如 stage 要 100K，dev 得從 500K 降到 150K 以下；
+   - (c) 新 stage 先只用還有額度的模型（gpt-5.4-mini 等），預設模型改掉；
+   - (d) 換區域（要在 Hosted 區域表裡，VNet 同區域）。
+2. **stage 的 VNet**：azd 自建（固定 192.168.96.0/24＋192.168.97.0/24），或帶入既有 VNet（第 2b 階段，要先建客戶 VNet 與 NAT）。
+3. **WebIQ** 留不留在 stage：留就要重建 connection 與金鑰、開一次窗口，出站也還沒測。
+4. **feed reader** 留不留：留就要在新 RG 部署 feed app 與 API secret。
+5. dev 演練的批准：新資源與費用。
+6. 切換時的建立與刪除，逐項批准：新 RG 與資源、CI 身分與 FIC、舊 stage 的 agent、project、角色、RG。
+
+**Neal 2026-10-26 的選擇**：1(c) 先用 gpt-5.4-mini，gpt-6.1-sol／luna 的配額由 Neal 另外申請；2 azd 自建；3、4 都留；5 批准。
+
+<a id="stage-private-rehearsal-1026"></a>
+### 9. dev 演練結果（2026-10-26）
+
+環境 `fa-stgpriv-1026`（dev 訂閱、westus3、`private`、azd 自建 VNet、Cosmos 記憶、只有 gpt-5.4-mini），從 main `4ddd28fe` 建立，當天拆除。詳細數字見 [progress](../progress.md#stage-private-rehearsal-1026)。
+
+- **A2 在雲端成立（從筆電跑同樣的步驟；GitHub runner 還沒實跑）**：帳號 `Disabled`、沒有 IP rule（前後讀回）時，從筆電用 #994 轉出的 stage 形狀 profile，依 deploy-staging 的順序跑 `ci_deploy.py` 的 check→guard→build api→gate→build hosted／console／feed→sync→api→console→follow→feed，全部成功（約 10 分鐘），gate armed、pass、0 拒絕。
+- **B1 可行**：`azd up` 一次成功（76.6 分，初始化用 `FA_APPROVE_INITIALIZATION`，沒有人輸入）；feed reader 依 README 步驟在新 RG 部署成功。
+- **私有模式的執行期**：Entra 登入新工作台正常；Cosmos 記憶寫入（201）、新對話回想正確；寫入 1,200 筆合成資料後仍回想正確；排程在私有模式觸發並開新對話完成。
+- **WebIQ 沒有測**：Neal 當時用 Remote Control，無法在本機終端機的隱藏提示輸入金鑰；改在真正切換 stage 時用 `deploy/stage/new_webiq_connection.py` 加部署窗口測（切換後一次性步驟本來就這樣做）。WebIQ 經 NAT 出站、toolbox 經 private endpoint 仍未驗證。
+
+本節第 3 節沒寫到、演練中發現的事（切換前要處理或評估）：
+
+1. 新 stage 的 `environment` 必須維持 azd 環境名（已部署的 runtime config 綁這個名稱）；`ci_deploy.api_faults` 只在 `environment == "stage"` 時拒絕 dev 用的故障開關 `FA_NATIVE_CUT_FAULT`，對新 stage 會失效，要改判斷依據。
+2. 超過 1,000 筆向量不能經 API 記憶路由寫入（relay 只收 Hosted 內的 Agent token），演練改在 sync job 裡直接呼叫 relay 的寫入程式。
+3. `infra/feed-mcp/feed-mcp.bicep` 的參數預設值是舊 stage 的名稱，切換時每個名稱都要明確帶入。
+4. 切換後 stage 不能再用 `azd deploy`：CI 加上的 feed secretRef 會讓 azd 的 guard 停下，revision 名稱也可能和 CI 撞；一次性步驟改跑各自的腳本。
+5. 筆電跑 `ci_deploy.py` 一定要設 `GITHUB_SHA`，否則 revision 以 `local` 命名，之後 guard 讀不到服務中的 commit。
+6. 回合完成後工作台畫面沒有自動更新，要按「更新回覆」才顯示完成（推論：即時推送在私有模式沒送到工作台；原因未查）。
+7. 32 執行緒同時寫記憶時，relay 在 Cosmos client 還在建立時回 503（`FA_MEMORY_RELAY_FAILED stage=connect reason=build_in_progress`）；Cosmos 的 429 記成 `FA_MEMORY_RELAY_THROTTLED`。推論：relay 沒有等 client 建好再處理，而一般回合的同時寫入量比這次壓測低很多；是否改成等 client 建好待評估。
+8. （2026-10-28 新增）WebIQ 與外部 MCP 在 `private` 下可能因缺 project 層級 capability host 而失敗（依據見「已確認的事實（官方文件）」表；官方文件，寫的當時未測；2026-10-28 已在雲端測過：8 項中 7 項 PASS、第 8 項略過，結果在清單後）。**同日處理（程式已改；雲端驗收已於 10-28 做完，8 項中 7 項 PASS、第 8 項略過，見[progress](../progress.md#startup-private-1028)）**：Neal 批准程式修改，`foundry.bicep` 在 `private` 建 project capability host，predown 在刪 project 前先刪它（第 4 節、第 7 節）。Neal 也批准之後在 private dev 環境的計費測試，於審查後另行執行。範圍不只 WebIQ：第 0b 階段的證據（Hosted 內呼叫模型、平台對話儲存的多輪與換版接續、App Insights）都是在**沒有** project capability host 時量的，而 [文件] Learn 寫 project 層級的 capability host 決定該 project 用哪些 storage、conversation 與 vector store 資源，所以這些都要在有它的環境重驗。依序核對：
+   1. 先 GET `accounts/{n}/capabilityHosts`，記錄名稱、狀態與 `customerSubnet`。
+   2. PUT 被接受；GET 回來時有沒有 `capabilityHostKind`；量建立時間；帳號層級的還沒好時有沒有 409 或 `Failed`（處理見第 4 節）。
+   3. 第二次 `azd provision` 回 200、沒有變更；清單裡只有 `caphostproj`。
+   4. 從 Hosted 經 WebIQ MCP 的 `tools/list` 與一次工具呼叫成功（不是 `name or host unknown`）。
+   5. 0b 回歸：模型呼叫、多輪與換版接續、App Insights。
+   6. GET 一個不存在的 host 回 404，hook 視為不存在。
+   7. `azd down`：記錄 host DELETE 的回應碼與時間；中斷一次再重跑；最後 SAL 清空、帳號已 purge。
+   8. `public` 模式的 what-if 沒有變更。
+
+   **結果（2026-10-28，`fa-privcap-1028`，westus3，已拆除；細節見 [progress](../progress.md#startup-private-1028)）：** 1～7 PASS，8 略過（離線 `test_network_mode.py` 通過 22 項）。host 建立 48.7 秒，沒有 409 或 `Failed`；WebIQ 的 `tools/list` 750 ms、`tools/call` 506 ms；missing host 的 GET 回 404；host DELETE 202、32 秒 Succeeded。證明功能可用，不證明流量走哪條路。拆除跑了三次，因暫時性 HTML 503 讓 hook 在唯讀 GET 上停了兩次，已由 #1030 修。換版後的接續沒測。
+
+### 本節參考（實際讀過的頁面）
+
+- https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/networking-options（注入只能在建立帳號時設定、BYO 要求）
+- https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/virtual-networks（關掉公網後不能從公網工作站 `azd deploy`；VNet 內 self-hosted runner 是建議模式；2026-06-25 之後建的 project 支援私有 ACR）
+- https://learn.microsoft.com/en-us/azure/container-apps/jobs（觸發類型；能 start job 的身分可讀 job secret、用 job 的受控身分）
+- https://learn.microsoft.com/en-us/azure/container-apps/tutorial-ci-cd-runners-jobs（Container Apps job 當 GitHub runner；不支援在容器內跑 Docker）
+- https://docs.github.com/en/actions/reference/runners/github-hosted-runners（標準 runner 沒有固定 IP；不建議當允許清單；Ubuntu 用 Azure 資料中心 IP 範圍）
+- https://docs.github.com/en/organizations/managing-organization-settings/about-azure-private-networking-for-github-hosted-runners-in-your-organization（只支援 larger runners、在組織層設定；頁面沒寫方案限制）
+- https://docs.github.com/en/actions/reference/security/secure-use（自架 runner 可能被持續入侵；JIT runner）
+- https://learn.microsoft.com/en-us/azure/well-architected/pillars（五大支柱）

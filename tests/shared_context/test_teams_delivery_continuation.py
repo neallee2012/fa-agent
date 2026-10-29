@@ -111,40 +111,6 @@ def test_new_typed_continuation_delivers_original_failure_without_stop(stopped_o
             "sizes":{"entity":max(sizes),"multipart":max(bodies)}},indent=2),encoding="utf-8")
 
 
-def test_continuation_has_only_four_http_actions_and_same_original_expiry(stopped_original):
-    from fastapi.testclient import TestClient
-    from shared_context.behavior_teams_continuation_api import create_continuation_app
-    from test_m3_auth import token
-    c,old,original,stops=stopped_original
-    service=continuation_for(stopped_original)
-    app=create_continuation_app(c.parent,service.scope,original_scope=old.scope,
-        observation=service.observation,current_observation=service.current_observation)
-    assert {route.path.rsplit("/",1)[-1] for route in app.routes}=={"preview","authorize","deliver","reconcile"}
-    client=TestClient(app)
-    prefix="/operator/v1/original-failure-delivery"
-    identity=c.config.identity
-    base={"tid":identity.tenant_id,"iss":f"https://sts.windows.net/{identity.tenant_id}/","aud":identity.audience,
-          "oid":identity.human_oid,"appid":identity.admin_client_id,"scp":"Behavior.Read Behavior.Approve"}
-    headers={"Authorization":"Bearer "+token(c.h.c.signing_key,base)}
-    reader={"Authorization":"Bearer "+token(c.h.c.signing_key,{**base,"scp":"Behavior.Read"})}
-    assert client.post(prefix+"/preview",json={},headers=reader).status_code==403
-    for values in ({"oid":"wrong"},{"tid":"wrong"},{"appid":"wrong"}):
-        assert client.post(prefix+"/preview",json={},headers={"Authorization":"Bearer "+
-            token(c.h.c.signing_key,{**base,**values})}).status_code in (401,403)
-    planned=client.post(prefix+"/preview",json={},headers=headers)
-    assert planned.status_code==200,planned.text
-    approved=client.post(prefix+"/authorize",json={"plan":planned.json(),"decision_id":"offline-delivery-approval"},
-                         headers=headers)
-    assert approved.status_code==200,approved.text
-    for invalid in ("stop","execute","claim","acquire","model"):
-        assert client.post(prefix+"/"+invalid,json=approved.json(),headers=headers).status_code==404
-    assert client.post(prefix+"/deliver",json={**approved.json(),"body":"arbitrary"},headers=headers).status_code==422
-    c.clock[0]=original.expires_at
-    assert client.post(prefix+"/deliver",json=approved.json(),headers=headers).status_code==403
-    assert client.post(prefix+"/reconcile",json=approved.json(),headers=reader).json()["dispatch_performed"] is False
-    assert c.sends==[] and len(stops)==1
-
-
 def test_foreign_scope_body_owner_effects_and_expiry_never_reauthorize(stopped_original):
     from shared_context.behavior_teams_continuation import OriginalFailureDeliveryContinuation
     from shared_context.behavior_assistant import key

@@ -257,31 +257,3 @@ def test_missing_assignment_recovery_never_waives_original_identity_or_approval(
     with pytest.raises(Problem):
         service.plan(principal)
     assert not calls
-
-
-def test_new_api_plan_is_explicit_and_rejects_client_stop_proof(native_acquire):
-    from fastapi.testclient import TestClient
-    from shared_context.behavior_recovery_api import create_recovery_app, AuthorizeRecovery
-    from pydantic import TypeAdapter, ValidationError
-    c = native_acquire
-    service, calls = service_for(c)
-    plan = service.plan(c.principal)
-    scope = TypeAdapter(recovery.RecoveryScope | recovery.PreSdkRecoveryScope | recovery.PreAssignmentRecoveryScope
-                       ).validate_json(service.scope.model_dump_json())
-    assert type(scope) is recovery.PreAssignmentRecoveryScope
-    decoded = AuthorizeRecovery.model_validate_json(json.dumps(
-        {"plan": plan.model_dump(mode="json"), "decision_id": "exact-human-decision"}))
-    assert type(decoded.plan) is recovery.PreAssignmentRecoveryPlan
-    with pytest.raises(ValidationError):
-        AuthorizeRecovery.model_validate_json(json.dumps({"plan": plan.model_dump(mode="json"),
-            "decision_id": "bad", "stop_observation": {"status_code": 204}}))
-    raw = plan.model_dump(mode="json")
-    raw.pop("recovery_phase")
-    with pytest.raises(ValidationError):
-        recovery.RecoveryPlan.model_validate_json(json.dumps(raw))
-    app = create_recovery_app(c.composition, scope, stop=service.stop)
-    assert app.state.recovery.scope == scope
-    client = TestClient(app)
-    assert client.post("/operator/v1/sdk-recovery/execute",
-        json={"stop_observation": {"status_code": 204}}).status_code == 401
-    assert not calls

@@ -18,8 +18,6 @@ import httpx
 from pydantic import ValidationError
 
 from shared_context import gui
-from shared_context.errors import Problem
-from test_hosted import client
 
 
 @pytest.fixture
@@ -42,32 +40,6 @@ def helpers(monkeypatch):
 
 def command(**kwargs):
     return gui.GuiProbe(operation="gui", run_id="synthetic-run", nonce="amber-1", **kwargs)
-
-
-def test_gui_dispatch_is_optional_and_does_not_get_any_azure_token(monkeypatch):
-    hosted, credential = client(lambda request: pytest.fail("GUI must not call Azure"))
-    seen = []
-
-    def probe(request):
-        seen.append(request)
-        return {"probe_status": "unavailable", "error": {"code": "GUI_UNAVAILABLE"}}
-
-    monkeypatch.setattr("shared_context.hosted.run_gui_probe", probe)
-    response = hosted.dispatch({"operation": "gui", "run_id": "synthetic-run", "nonce": "amber-1"})
-    assert response["outcome"]["probe_status"] == "unavailable"
-    assert credential.scopes == []
-    assert seen[0].nonce == "amber-1"
-
-
-@pytest.mark.parametrize("extra", [
-    {"url": "https://example.com"}, {"publish_relative_path": "published.txt"},
-    {"command": "anything"}, {"include_screenshot": "true"}, {"run_id": "../escape"},
-])
-def test_gui_rejects_arbitrary_targets_commands_and_publish(extra):
-    hosted, credential = client(lambda request: pytest.fail("must not call Azure"))
-    with pytest.raises(Problem) as exc:
-        hosted.dispatch({"operation": "gui", "run_id": "synthetic-run", "nonce": "amber", **extra})
-    assert exc.value.status == 422 and credential.scopes == []
 
 
 @pytest.mark.parametrize("environment,message", [
@@ -363,19 +335,3 @@ def test_loopback_fixture_observes_cookie_and_language_but_does_not_reseed_on_re
                 assert not thread.is_alive()
 
 
-def test_hosted_image_uses_bootstrap_and_minimal_context_allowlist():
-    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    dockerfile = (source / "Dockerfile.hosted").read_text()
-    ignore = (source / "Dockerfile.hosted.dockerignore").read_text().splitlines()
-    assert "USER 0" in dockerfile
-    assert 'CMD ["python", "hosted_bootstrap.py"]' in dockerfile
-    assert "COPY src/fa-shared-context-poc/hosted_bootstrap.py ." in dockerfile
-    assert "install -d -m 0700 -o app -g app /home/session" in dockerfile
-    assert "COPY src/fa-hosted-sandbox-poc/desktop_smoke.py ." in dockerfile
-    assert "COPY src/fa-hosted-sandbox-poc/ ." not in dockerfile
-    for prohibited in ("cifs-utils", "smb_oauth", "poc_core.py", "netcat", "keyvault"):
-        assert prohibited not in dockerfile
-    assert ignore[0] == "**"
-    assert "!src/fa-hosted-sandbox-poc/desktop_smoke.py" in ignore
-    assert "!src/fa-shared-context-poc/hosted_bootstrap.py" in ignore
-    assert not any(".azure" in line or "evidence" in line for line in ignore)

@@ -328,22 +328,27 @@ class TeamsRuntime:
         return tuple(results)
 
 
+async def activity_response(request: Request, target, limit_message: str) -> JSONResponse:
+    """One JSON activity of at most 32768 bytes to target.receive; limit_message is each route's HTTP 413 text."""
+    try:
+        if request.headers.get("content-type", "").split(";")[0] != "application/json":
+            raise Problem(415, "TEAMS_CONTENT_TYPE", "application/json is required")
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > 32768:
+                raise Problem(413, "TEAMS_BODY_LIMIT", limit_message)
+        result = await run_in_threadpool(target.receive, request.headers.get("authorization", ""), bytes(body))
+        return JSONResponse(result)
+    except Problem as error:
+        return JSONResponse(error.body, status_code=error.status)
+
+
 def teams_router(runtime: TeamsRuntime) -> APIRouter:
     router = APIRouter()
 
     @router.post("/behavior/v1/teams/activities")
     async def activities(request: Request):
-        try:
-            if request.headers.get("content-type", "").split(";")[0] != "application/json":
-                raise Problem(415, "TEAMS_CONTENT_TYPE", "application/json is required")
-            body = bytearray()
-            async for chunk in request.stream():
-                body.extend(chunk)
-                if len(body) > 32768:
-                    raise Problem(413, "TEAMS_BODY_LIMIT", "Teams input exceeds the fixed byte bound")
-            result = await run_in_threadpool(runtime.receive, request.headers.get("authorization", ""), bytes(body))
-            return JSONResponse(result)
-        except Problem as error:
-            return JSONResponse(error.body, status_code=error.status)
+        return await activity_response(request, runtime, "Teams input exceeds the fixed byte bound")
 
     return router

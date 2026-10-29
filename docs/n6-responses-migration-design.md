@@ -49,8 +49,8 @@
 | 項目 | 現在（`75696b6f`） | N6 |
 |---|---|---|
 | Hosted 依賴（`requirements-hosted.txt:1-2`） | invocations 1.1.0、core 2.1.0 | responses **2.2.0**、core **2.2.0**、invocations **1.2.0**。三行同一個 PR 一起改 |
-| API image（`Dockerfile.api`、`requirements.txt`） | 不含 agentserver 套件 | 不變。API 用既有 httpx client 呼叫 Responses endpoint，不新增 SDK |
-| Host（`behavior_hosted.py:760-790`、`hosted_main.py:7,14`） | `InvocationAgentServerHost` | `class FaHost(InvocationAgentServerHost, ResponsesAgentServerHost)`[S15]；只在新旗標下註冊 `@app.response_handler` |
+| API image（`Dockerfile.api`（已於 2026-10 移除）、`requirements.txt`） | 不含 agentserver 套件 | 不變。API 用既有 httpx client 呼叫 Responses endpoint，不新增 SDK |
+| Host（`behavior_hosted.py:760-790`、`hosted_main.py:7,14`（已於 2026-10 移除）） | `InvocationAgentServerHost` | `class FaHost(InvocationAgentServerHost, ResponsesAgentServerHost)`[S15]；只在新旗標下註冊 `@app.response_handler` |
 | `protocol_versions`（`controller/private_controller.py:54`、`deploy/.../agent.yaml:7`、`behavior_agent_versions.py:223-228`） | `invocations 2.0.0`；桌面另加 `invocations_ws` | 加一筆 `{"protocol":"responses","version":"2.0.0"}`[S28]。容器協定版本仍是 2.0.0，不是套件版本 |
 | PR7 sync（`behavior_agent_versions sync`） | 複製 A 同 build 的定義 | 不變。A 的定義加上 responses 後，sync 和 onboarding 自動帶到所有 Agent |
 | API／Hosted 同 build（SdkStartGate `code_sha256`、`fa_build`） | 必須同 build | 不變。只有 active version 的定義含 responses 的 Agent，API 才會把新 CID 交給 Responses lane |
@@ -171,7 +171,7 @@
 
 | 情況 | 處理 |
 |---|---|
-| 使用者取消 | API 對 `rid` 中記錄的 `response_id` 呼叫官方 `POST /responses/{id}/cancel`（只適用 background）。handler 收到第三個參數 `cancellation_signal`，且 `client_cancelled=True`，就停止。還在等鎖的 RID，改由既有的 FA `NativeCancel` 標記，handler 拿到鎖後先檢查 |
+| 使用者取消 | API 對 `rid` 中記錄的 `response_id` 呼叫官方 `POST /responses/{id}/cancel`（只適用 background）。handler 看到 `client_cancelled=True` 就停止；跨行程 recovery 後 handler 拿到的 `cancellation_signal` 是新的、`/cancel` 不會觸發它（agentserver-responses 2.2.0 `_resilient_orchestrator.py:1086`），所以 FA 以 `/cancel` 蓋在同一個 context 上的 `client_cancelled` 為準，等前一個 CLI 結束時也會因此立即停止。還在等鎖的 RID，改由既有的 FA `NativeCancel` 標記，handler 拿到鎖後先檢查 |
 | shutdown | 看 `context.shutdown`，和取消分開。依官方做法呼叫 `exit_for_recovery` 交給 recovery，不當成使用者取消[S53]。`exit_for_recovery` 只能在 shutdown 時呼叫（core `tasks/_context.py:168` 起） |
 | lease 失效（`cancellation_signal` 已觸發，但不是 `client_cancelled`，也不是 shutdown） | 官方 `_bg_resolve_cancelled`（responses `hosting/_orchestrator.py:727-781`）會直接把 response 標成 `failed`，**不會重入**；只有「shutdown＋resilient background」才會保持 `in_progress`。FA 對應成 `fenced`：<br>・回條已是 `started`：停止 SDK，**當場**把 `started` CAS 成 `unknown/NATIVE_TURN_UNKNOWN`，釋出 CID 名額，不重跑。CAS 寫入結果不明時，照實記成「未確認」，不宣稱 unknown 已保存（71c7）。<br>・回條還是 `accepted`：什麼都不寫，由重送三方用同一個 RID 補送第二步；不宣稱平台已自動 recovery。<br>只有 `client_cancelled` 才用 `NATIVE_TURN_CANCELLED`，不把一般的 lease 訊號說成使用者取消。<br>不呼叫 `exit_for_recovery`，不設假的 shutdown，也不開新 task（df3d 在真 host 確認） |
 | 同一個對話重疊送出 | 接單步驟已經擋下同一個 CID 的第二個 RID。若仍收到官方 409 `conversation_locked`[S51]，表示 handler 還沒執行，回條維持 `accepted`。API 回「忙碌」，之後在同一個 SID 用同一個 RID 再送第二步；不換 RID。T5 的 wake 也一樣，用同一個確定的 RID 重送 |

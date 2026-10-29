@@ -25,7 +25,7 @@
 
 | 面向 | 目前可沿用的基礎 | 本提案要補的缺口 |
 |---|---|---|
-| Hosted 入口 | `hosted_main.invoke` 呼叫 `HostedClient.dispatch`，執行明確指定的 API／GUI／environment 探針 | Copilot SDK 自主工作循環、結構化工作事件與完成交付 |
+| Hosted 入口 | `hosted_main.invoke`（已於 2026-10 移除）呼叫 `HostedClient.dispatch`，執行明確指定的 API／GUI／environment 探針 | Copilot SDK 自主工作循環、結構化工作事件與完成交付 |
 | 精確工作狀態 | `ContextService` 有 owner、revision、handoff、published 不可變；`TableRepository.replace` 使用 ETag | 工作執行狀態、durable inbox／outbox、交付責任、取消與不確定結果 |
 | Context | `assemble` 讀權威工作，以 goal 前 2048 字依序搜尋 Team／私人記憶各最多 10 筆 | Token 預算、長歷史壓縮、相關性、來源與權限版本管理 |
 | 記憶 | `FoundryMemory` 有非同步抽取、scope search；operation receipt 不依賴 process memory | 一般記憶提案、證據稽核、矛盾／到期／撤銷與 User Model |
@@ -33,7 +33,7 @@
 | 私人環境 | M1 報告記錄指定檔案、工具設定、Chromium profile、替代 session 與相容設定版本恢復 | SDK 對話與業務 checkpoint 恢復、未知副作用核對；不能以 M1 代替 |
 | 多工與可靠性 | 有 POC controller、CAS 衝突與明確 stop/resume 案例 | 正式 mailbox、背景 job registry、事件喚醒、容量控制、重複事件去重與交付補償 |
 
-程式依據：[入口](../src/fa-shared-context-poc/hosted_main.py)、[dispatcher](../src/fa-shared-context-poc/shared_context/hosted.py)、[ContextService](../src/fa-shared-context-poc/shared_context/service.py)、[TableRepository](../src/fa-shared-context-poc/shared_context/storage.py)、[FoundryMemory](../src/fa-shared-context-poc/shared_context/memory.py)。
+程式依據：入口、dispatcher（兩者已於 2026-10 移除）、[ContextService](../src/fa-shared-context-poc/shared_context/service.py)、[TableRepository](../src/fa-shared-context-poc/shared_context/storage.py)、[FoundryMemory](../src/fa-shared-context-poc/shared_context/memory.py)。
 
 現有測項已表達應保留的契約：[owner／ETag／發布保護](../tests/shared_context/test_api.py)、[私人 scope／記憶失敗不偽裝成功](../tests/shared_context/test_memory_context.py)。它們不驗證本提案的新能力。M1 的較新狀態以 [M1 結果](M1-PRIVATE-ENVIRONMENT-POC.md) 為準，不沿用早期規格中「HOME 尚未驗收」的歷史快照，也不擴張 M1 的成功範圍。
 
