@@ -22,7 +22,7 @@ from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_sdk_state import CheckpointProfile, DIAG_ARCHIVE_CODEC
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import configured, saved_turn, submit, submit_legacy
 from test_m2_copilot import runtime_path
 from test_m3_auth import signing_key, jwk_client
@@ -150,7 +150,6 @@ def test_fixed_sdk_receives_exact_prefix_and_user_message_without_new_authority(
     done = h.runtime.controller.step(binding.binding_id)
     assert done.state == "succeeded" and done.result_forwarded, checks
     assert h.store.read_snapshot((operation_key,))[operation_key] == before
-    check_history(h)
     phase, current_text = "second", second_text
     h.executor.root = sdk_root/"second"
     if server_default:
@@ -161,7 +160,6 @@ def test_fixed_sdk_receives_exact_prefix_and_user_message_without_new_authority(
     assert control.records[second["binding_id"]].profile.prompt_profile == profile
     done = h.runtime.controller.step(second["binding_id"])
     assert done.state == "succeeded" and done.result_forwarded, checks
-    check_history(h)
     response = h.client.get("/work-policy/v1/conversations/"+first["conversation_id"], headers=h.headers())
     assert response.status_code == 200 and response.json()["can_follow_up"]
     turns = response.json()["turns"]

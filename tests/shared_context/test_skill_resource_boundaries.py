@@ -19,7 +19,7 @@ from shared_context.m3_auth import HumanApprover
 from shared_context.m3_models import ApprovalInput, CreateArtifact, SkillPurpose, SkillResources, VersionInput
 from test_approved_skill_api import post_skill
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import open_turn, ordinary, settle
@@ -235,7 +235,6 @@ def test_next_turn_uses_only_the_current_manifest_after_a_new_approved_version(a
         assert current.skill_metadata_sha256 == loaded.skill.metadata_sha256
     finally:
         second.client.close()
-    check_history(h)
     record("api-version-next-turn-" + alias, {
         "layer": "signed-api-no-sdk", "previous_version": V1, "current_version": V2, "v2_alias": alias,
         "same_conversation": True, **observed, "current_alias_exact_v2_data": True,

@@ -34,7 +34,7 @@ from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from shared_context.behavior_history_prompt import HISTORY_PROFILE
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -202,4 +202,3 @@ def test_cancelled_long_command_keeps_the_conversation_and_its_sandbox(assistant
         assert second.state == "succeeded" and second.result_forwarded
     result = shell.CommandResult.model_validate_json(outputs[-1])
     assert result.output.splitlines() == ["start", "sleeping=0"]
-    check_history(h)

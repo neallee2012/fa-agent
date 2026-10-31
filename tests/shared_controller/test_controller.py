@@ -270,6 +270,7 @@ class ControllerTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(__file__).resolve().parent / (".controller-fixture-" + uuid4().hex)
         self.root.mkdir()
+        (self.root / "azure.yaml").write_text("name: synthetic" + chr(10), encoding="utf-8")
         self.addCleanup(lambda: shutil.rmtree(self.root) if self.root.exists() else None)
         self.clock = FakeClock()
         self.world = FakeWorld()
@@ -283,6 +284,13 @@ class ControllerTests(unittest.TestCase):
         config = controller.Config(self.root, "synthetic-env", "session-a", "session-b",
                                    self.root / "evidence", gui=gui, **kwargs)
         return controller.Controller(config, self.world, self.clock, self.clock.sleep)
+
+    def test_azd_project_without_azure_yaml_fails_before_any_command(self):
+        # azd -C would otherwise walk up to an unrelated parent azure.yaml.
+        (self.root / "azure.yaml").unlink()
+        with self.assertRaisesRegex(ValueError, "azure.yaml"):
+            self.make()
+        self.assertEqual(self.world.calls, [])
 
     def test_invalid_or_mismatched_endpoints_fail_before_any_command(self):
         valid = (

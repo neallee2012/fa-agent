@@ -26,7 +26,7 @@ from shared_context.m3_models import ApprovalInput, CreateArtifact, SkillPurpose
 from shared_context.m3_skills import PurposeSkillReadResult
 from test_approved_skill_api import configured as configured_legacy, post_skill
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_instruction_prompt import submit
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import open_turn
@@ -162,7 +162,6 @@ def test_hosted_uses_only_the_resource_profile_tool_set_across_cold_continuation
         assert set(tools) == set(SKILL_RESOURCES_CAPABILITIES)
         assert set(tools["read_skill_resource"].parameters["properties"]) == {"name", "resource"}
         assert options["enable_config_discovery"] is False and options["mcp_servers"] == {}
-    check_history(h)
 
 
 def test_model_gateway_does_not_accept_resource_tool_without_explicit_profile_capability():

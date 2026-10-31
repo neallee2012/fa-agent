@@ -61,9 +61,9 @@ function fixture(){
       progress:{data:{state:"cancelled",reply_available:true,delivery_id:"delivery-offline"},observed_at:when},
       reply:null,
       submission:{state:"CONFIRMED",observed_at:when,historical:true},
-      acknowledgment:{state:"NOT_SENT"},reconciliation:{state:"NOT_SENT"},fetch:{state:"UNKNOWN"},
+      acknowledgment:{state:"NOT_SENT"},fetch:{state:"UNKNOWN"},
       actions:{status:action(true),fetch:action(false,"原請求已記錄，不會重送。"),
-        acknowledge:action(true),reconcile:action(false),"read-reply":action(true),"confirm-reply":action(true),
+        acknowledge:action(true),"read-reply":action(true),"confirm-reply":action(true),
         "submit-reconcile":action(false),"submit-retry":action(false),"read-context":action(false),
         "read-delegation":action(false),"cancel":action(false),"read-cancel-receipt":action(false),
         "read-files":action(false)},
@@ -7856,7 +7856,7 @@ test("logged out and submitted restart do not suggest another submission or send
   assert.match(ui.text("notice"),/交辦指令.*指定的助理/);
   assert.match(ui.text("work-message"),/已交辦.*不會再次送出/);
   assert.equal(ui.nodes.get("login").disabled,false);
-  for(const action of ["status","fetch","acknowledge","reconcile","submit-reconcile","submit-retry"]){
+  for(const action of ["status","fetch","acknowledge","submit-reconcile","submit-retry"]){
     assert.equal(ui.nodes.get(action).disabled,true);ui.click(action);
   }
   assert.equal(ui.calls.length,1);
@@ -7865,19 +7865,8 @@ test("logged out and submitted restart do not suggest another submission or send
   assert.doesNotMatch(html,/先通過固定工作|不提供自由文字聊天/);
 });
 
-test("original failure ACK reconciliation keeps its explicit recovery and human-read boundary",async()=>{
-  const data=fixture(),t=data.tasks[0];
-  t.mode="original_failure";t.acknowledgment={state:"UNKNOWN"};
-  t.actions.acknowledge=action(false);t.actions.reconcile=action(true);
-  const ui=await open(data);
-  assert.equal(ui.nodes.get("reconcile-panel").hidden,false);
-  t.reconciliation={state:"CONFIRMED",confirmation_level:"client_received",historical:true,observed_at:when};
-  t.actions.reconcile=action(false);ui.render(data);
-  assert.equal(ui.text("ack-state"),"已核對收到");
-  assert.match(ui.text("ack-detail"),/原收件回應遺失.*確認收到.*未重送/);
-  assert.equal(ui.nodes.get("reconcile-panel").hidden,true);
-  assert.match(ui.text("receipt-code"),/acknowledgment=UNKNOWN.*reconciliation=CONFIRMED/);
-  assert.match(html,/收件不代表真人已讀/);
+test("the delivery receipt panel says a receipt is not a human read",()=>{
+  assert.match(html,/<summary>交付回條（進階）<\/summary>(?:(?!<\/details>)[^])*收件不代表真人已讀/);
 });
 
 test("metrics answer uses only verified returned integers, never saved cancelled data as an answer",async()=>{

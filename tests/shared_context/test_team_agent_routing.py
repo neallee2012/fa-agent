@@ -228,16 +228,14 @@ def test_registration_outside_the_served_team_never_resolves(team_agent):
 
 
 def test_registered_agent_scope_passes_the_real_startup_readers_and_a_missing_target_is_refused(team_agent):
-    from shared_context.behavior_agent_registry import validate_agent_registry_history
-    from shared_context.behavior_migration import MigrationStore, _quiescence, installed_origin
+    from shared_context.behavior_migration import MigrationStore, installed_origin
     from test_resident_worker_poc import outcome_of
     case = team_agent
     config = case.config
 
     def readers():
         store = MigrationStore(case.c.h.composition.clients[0], config.table.scope)
-        return (outcome_of(lambda: read_startup(case.c)), outcome_of(lambda: _quiescence(store.read_inventory(), config)),
-                outcome_of(lambda: installed_origin(store, config)))
+        return (outcome_of(lambda: read_startup(case.c)), outcome_of(lambda: installed_origin(store, config)))
     baseline = readers()
     assert baseline[0] == "ok"
     _register_scope(case)
@@ -245,11 +243,6 @@ def test_registered_agent_scope_passes_the_real_startup_readers_and_a_missing_ta
     assert readers() == baseline
     inventory = case.a.runtime.store.read_inventory()
     assert inventory_agent_scope(inventory, config, case.target.agent_id).target == case.target
-    akey = agent_key(config.identity.tenant_id, case.target.agent_id)
-    missing = replace(inventory, rows={key: value for key, value in inventory.rows.items() if key != akey})
-    with pytest.raises(Problem) as refused:
-        validate_agent_registry_history(missing, config)
-    assert refused.value.status == 409
 
 
 def test_a_binding_path_finds_its_peer_without_rescanning_the_team(team_agent, signing_key, monkeypatch):

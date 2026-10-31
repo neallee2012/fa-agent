@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from conftest import A
-from shared_context.api import create_app
+from legacy_m2_m4.api import create_app
 from shared_context.behavior_dispatch import (
     ArtifactMetrics, ArtifactReadSpec, ArtifactRoute, ContextArtifactAdapter,
     ContextArtifactSettings, DispatchRecord, SafeArtifactResult, SEND_WINDOW_SECONDS,

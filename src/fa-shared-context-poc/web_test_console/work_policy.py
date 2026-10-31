@@ -4,9 +4,9 @@ The remaining DTOs are shared by the job-bound instruction lane's preflight
 reader. The workbench no longer uses them to gate legacy fixed tasks.
 """
 from datetime import datetime, timedelta
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, field_validator
 
 from shared_context import behavior_wire as wire
 from .adapter import require
@@ -52,12 +52,6 @@ class WorkPolicyObservation(wire.WireModel):
         if value is not None and (value.tzinfo is None or value.utcoffset() != timedelta(0)):
             raise ValueError("explicit UTC observation/work deadline required")
         return value
-
-
-class WorkPolicyReader(Protocol):
-    def read(self, query: WorkPolicyQuery, bearer: SecretStr) -> WorkPolicyObservation:
-        """Pure current read for this query; no cached grant, submit or reserve."""
-        ...
 
 
 def checked_observation(observation, query, now, *, instruction=False):

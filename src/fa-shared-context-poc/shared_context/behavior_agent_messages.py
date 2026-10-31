@@ -254,7 +254,7 @@ class AgentMessageLedger:
         self.store, self.directory, self.clock = store, _checked(directory, AgentDirectory), clock
 
     def _verified(self, key, model):
-        from .behavior_runtime_transition import _payload_hash
+        from .source_materials import _payload_hash
         row = self.store.read_snapshot((key,))[key]
         if row is None:
             raise Problem(503, "AGENT_MESSAGE_UNKNOWN", "only the original message receipt may be reconciled")

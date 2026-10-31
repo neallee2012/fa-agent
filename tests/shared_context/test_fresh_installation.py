@@ -5,9 +5,11 @@ from copy import deepcopy
 from datetime import timedelta
 import json
 import os
+from pathlib import Path
 import socket
 import subprocess
 import sys
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 from azure.data.tables import TableTransactionError
@@ -15,11 +17,11 @@ from fastapi.testclient import TestClient
 import pytest
 
 from shared_context.behavior_agent_registry import (
-    read_agent_registry, validate_agent_registry_history,
+    read_agent_registry,
 )
 from shared_context.behavior_fresh_installation import (
     FreshInitializer, FreshInstallationAuthorization, FreshInstallationInputs,
-    fresh_key, installed_fresh_origin, validate_fresh_inventory,
+    fresh_key, installed_fresh_origin,
 )
 from shared_context.behavior_migration import MigrationStore, installation_record, installed_origin, migration_key
 from shared_context.behavior_operations import control_key
@@ -129,8 +131,6 @@ def test_complete_atomic_installation_without_legacy_history_or_readiness(fresh_
     assert installed_origin(store, h.config) == h.config
     assert store._verified_fresh_initialization == h.config.sha256
     inventory = MigrationStore(h.composition.clients[0], h.config.table.scope).read_inventory()
-    initial = validate_fresh_inventory(inventory, h.config)
-    assert initial.authorization.approval_source == "operator-approved-file"
     assert len(inventory.receipts) == 1
     values = [row.payload["data"] for row in inventory.rows.values()]
     assert sum(value.get("kind") == "steady_cumulative_cost_ledger" for value in values) == 1
@@ -139,7 +139,6 @@ def test_complete_atomic_installation_without_legacy_history_or_readiness(fresh_
         "worker_readiness", "inbox_deployment_evidence", "native_execution_grant", "steady_work_registration",
     } for value in values)
     assert not any("handoff" in key or "retirement" in key for key in inventory.rows)
-    assert validate_agent_registry_history(inventory, h.config)
     assert h.calls == [] and h.source.requests == h.backup.requests == []
 
 
@@ -625,3 +624,61 @@ def test_offline_export_uses_existing_console_models_without_claiming_installati
     assert main(args) == 1
     assert first.read_text(encoding="utf-8") == "unrelated local data"
     assert h.table.backing.rows == before and writes(h) == 0
+
+
+def test_offline_export_cli_block_reaches_the_token_provider_and_is_all_or_none(fresh_case, tmp_path, monkeypatch, capsys):
+    from web_test_console.adapter import CliSettings, CliTokenProvider, ConsoleError, canonical
+    from web_test_console.agent_connections import AgentConnections, read_connection
+    from web_test_console.fresh_export import main
+    h = fresh_case
+    config_path, plan_path = tmp_path / "config.json", tmp_path / "plan.json"
+    config_path.write_text(h.config.model_dump_json(), encoding="utf-8")
+    plan_path.write_text(h.plan.model_dump_json(), encoding="utf-8")
+    exe, isolated = tmp_path / "az.cmd", tmp_path / "project-azure"
+    exe.write_text("not executed", encoding="ascii")
+    isolated.mkdir()
+    subscription = "00000000-0000-0000-0000-000000000001"
+    cli_args = ["--cli-executable", str(exe), "--cli-azure-config-dir", str(isolated),
+                "--cli-subscription-id", subscription]
+
+    def export(output, extra=()):
+        return main(["--config", str(config_path), "--plan", str(plan_path),
+                     "--backend-origin", "https://synthetic.example", "--client-id", h.config.identity.admin_client_id,
+                     "--output-directory", str(output), *extra])
+
+    def connections(output):
+        manifest = AgentConnections.model_validate_json((output / "agents.json").read_bytes())
+        return [(entry, *read_connection(entry)) for entry in manifest.agents]
+
+    with_cli, without_cli = tmp_path / "with-cli", tmp_path / "without-cli"
+    assert export(with_cli, cli_args) == 0 and export(without_cli) == 0
+    capsys.readouterr()
+    monkeypatch.setattr("web_test_console.adapter.subprocess.run", lambda _args, **_kwargs: SimpleNamespace(
+        returncode=0, stdout=json.dumps({"accessToken": "synthetic-token", "tenant": h.config.identity.tenant_id,
+                                         "subscription": subscription, "tokenType": "Bearer"})))
+    for (entry, connection, _), (plain_entry, plain, _) in zip(connections(with_cli), connections(without_cli)):
+        assert connection.cli == CliSettings(executable=str(exe), azure_config_dir=str(isolated),
+                                             subscription_id=subscription)
+        assert CliTokenProvider(connection)() == "synthetic-token"
+        with pytest.raises(ConsoleError, match="CLI_NOT_CONFIGURED"):
+            CliTokenProvider(plain)()
+        # The cli key is the only difference, so an export without the options keeps its original bytes.
+        assert plain.cli is None
+        assert (canonical({**json.loads(Path(entry.config_path).read_bytes()), "cli": None})
+                == Path(plain_entry.config_path).read_bytes())
+
+    monkeypatch.chdir(tmp_path)
+    for refused in (cli_args[:2], cli_args[2:4], cli_args[4:], cli_args[:4],
+                    ["--cli-executable", exe.name, *cli_args[2:]],
+                    ["--cli-executable", str(isolated), *cli_args[2:]],
+                    [*cli_args[:2], "--cli-azure-config-dir", isolated.name, *cli_args[4:]],
+                    [*cli_args[:2], "--cli-azure-config-dir", str(exe), *cli_args[4:]],
+                    [*cli_args[:4], "--cli-subscription-id", "not-a-subscription"]):
+        output = tmp_path / "refused"
+        assert export(output, refused) == 1
+        assert capsys.readouterr().err.strip() == '{"error":{"code":"FRESH_CONSOLE_EXPORT_REFUSED"}}'
+        assert not output.exists()
+    # Adding the block to an existing export is a different file, so it stays create-only.
+    untouched = (without_cli / "agents.json").read_bytes()
+    assert export(without_cli, cli_args) == 1
+    assert (without_cli / "agents.json").read_bytes() == untouched

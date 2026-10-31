@@ -21,7 +21,7 @@ from shared_context.behavior_inbox import PullInbox
 from shared_context.behavior_delivery import DeliveryCore
 from shared_context.behavior_assistant_hosted import AssistantClient
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_m3_auth import jwk_client, signing_key
 from test_work_cost_policy import standing
 from test_work_policy_lifecycle import enabled
@@ -255,7 +255,6 @@ def test_duplicate_occurrence_keeps_the_saved_result_without_running_the_sdk_aga
     done = c.h.runtime.controller.step(binding_id)
     assert done.state == "succeeded" and done.result_forwarded
     assert done.obligation_fulfilled is False
-    check_history(c.h)
     replay = c.h.client.post(path, json=body, headers=c.h.headers())
     assert replay.status_code == 200
     assert replay.json()["binding_id"] == binding_id

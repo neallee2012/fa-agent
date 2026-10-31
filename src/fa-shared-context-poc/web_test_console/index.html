@@ -719,11 +719,6 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <button id="acknowledge" class="primary" disabled>確認收到</button>
 <p id="acknowledge-reason" class="reason"></p>
 <p id="ack-detail" role="status" aria-live="polite"></p>
-<div id="reconcile-panel" hidden>
-<button id="reconcile" disabled>核對原收件回條</button>
-<p class="reason">只核對先前已送出的收件確認，可能補完原履行記錄；不會重送確認或重新取得結果。此操作只送一次，不會自動執行。</p>
-<p id="reconcile-reason" class="reason"></p>
-</div>
 <div class="actions"><a id="summary-download" class="download" hidden>下載收件摘要</a></div>
 <small>收件不代表真人已讀；失敗結果也不會被改稱工作成功。</small>
 </details>
@@ -7011,10 +7006,9 @@ function render(){
     state.composer.state_profile==="foundry-responses-v1"?
     "進度 GET 維持純讀；只有原回條尚未接手時，另以 POST 有限核回同一 RID。":
     "進度以純讀更新；不重送指令、不啟動模型。");
-  const ack=t?.acknowledgment,reconciliation=t?.reconciliation;
-  const reconciled=t?.mode==="original_failure"&&ack?.state==="UNKNOWN"&&reconciliation?.state==="CONFIRMED"&&reconciliation?.confirmation_level==="client_received";
+  const ack=t?.acknowledgment;
   const nativeDelivered=nativeProfile(t?.state_profile)&&t.native_receipt?.delivered===true;
-  const confirmed=(ack?.state==="CONFIRMED"&&ack?.confirmation_level==="client_received")||reconciled||nativeDelivered;
+  const confirmed=(ack?.state==="CONFIRMED"&&ack?.confirmation_level==="client_received")||nativeDelivered;
   const error=lastError||threadErrors.get(scopeKey(selectedThread))||t?.error;
   // P01: above the composer only one plain sentence (and a copyable request ID); the full text and raw error go to
   // the support details.
@@ -7028,7 +7022,7 @@ function render(){
   text("error-full",errorText);
   text("error-request",errorRequest?`request ID：${errorRequest}`:"");
   text("error-code",error?JSON.stringify(error,null,2):"");
-  for(const a of ["status","fetch","acknowledge","reconcile","submit-reconcile","submit-retry"]){
+  for(const a of ["status","fetch","acknowledge","submit-reconcile","submit-retry"]){
     el(a).disabled=!scopeAvailable()||busy||threadLoading||messagePending(t?.task_id)||!t?.actions[a]?.enabled;
     text(a+"-reason",t?.actions[a]?.reason||(!t?"尚無有效配置。":""));
   }
@@ -7074,7 +7068,6 @@ function render(){
   text("scope",reference?`模式：${state.authorization_mode}\n參考：${reference}${state.expires_at?`\n舊許可截止：${state.expires_at}`:""}`:"");
   text("work-message",!t?"尚未設定工作，不會送出任何交辦。":
     t.not_accepted===true&&t.submission_observation?"原接單與換版紀錄已核對：沒有接單，原未確認紀錄保留，不重送。":
-    t.mode==="original_failure"?"此項目只提供原工作的結果與收件紀錄，不會重新交辦工作。":
     t.admission&&t.submission.state==="UNKNOWN"?"原交辦回應遺失，已核對接單；未重送原指令。可更新進度或查看回覆。":
     t.submission.state==="CONFIRMED"?"這筆工作已交辦，不會再次送出。可查看處理狀態或結果。":
     t?.submission.state==="UNKNOWN"?"交辦回應尚未確認，不會再次送出。請查看原工作狀態。":
@@ -7082,8 +7075,7 @@ function render(){
   text("submission-state",names[t?.submission.state]||"尚未交辦");
   text("job-state",names[(r?.verified_bytes===true?r.work_state:null)||t?.progress?.data?.state||
     t?.status?.data?.state||t?.status?.data?.work_state||t?.status?.admission]||"尚未更新");
-  text("ack-state",reconciled?"已核對收到":confirmed?"已確認收到":ack?.state==="UNKNOWN"?"結果未知":"未確認");
-  el("reconcile-panel").hidden=!(t?.mode==="original_failure"&&ack?.state==="UNKNOWN"&&!reconciled);
+  text("ack-state",confirmed?"已確認收到":ack?.state==="UNKNOWN"?"結果未知":"未確認");
   el("ack-state").className=confirmed?"success":"";
   text("observed",r?.verified_bytes===true?"處理狀態依本次已核對結果顯示；不是持續更新的執行狀態。":
     t?.progress?`最近進度：${t.progress.observed_at||"未提供"}。由服務純讀取得，不是模擬的執行狀態。`:
@@ -7118,12 +7110,9 @@ function render(){
   text("ack-detail",nativeDelivered?(ack?.state==="UNKNOWN"?
        "原收件回應未知紀錄保留；Agent 原回條已標示 client 收件，沒有重送。":
        "Agent 原回條已標示 client 收件；不是人已閱讀，也不會再次確認。"):
-       reconciled?`${reconciliation.historical?"歷史核對紀錄：":""}原收件回應遺失；已核對原回條並確認收到，未重送。${reconciliation.observed_at}`:
       confirmed?`${ack.historical?"歷史收件紀錄（不是目前即時狀態）：":"服務已確認收到："}${ack.observed_at}`:
-      reconciliation?.state==="UNKNOWN"?"原收件確認與這次核對的回應皆未知；不會補送。請保留原紀錄交管理者核對。":
       ack?.state==="UNKNOWN"?"收件結果未知，不會補送。請由管理者核對原回條。":"尚未取得收件回條。");
-  text("receipt-code",reconciled?`原acknowledgment=UNKNOWN；reconciliation=CONFIRMED；confirmation_level=client_received；${reconciliation.observed_at}`:
-      confirmed?`confirmation_level=client_received；${ack?.observed_at||t?.status?.observed_at||""}`:"confirmation_level 尚未確認");
+  text("receipt-code",confirmed?`confirmation_level=client_received；${ack?.observed_at||t?.status?.observed_at||""}`:"confirmation_level 尚未確認");
   el("ack-detail").className=confirmed?"success":"muted";
   if(confirmed)text("acknowledge-reason","這筆結果已確認收到，不需再次確認；收件不等於工作成功。");
   if(r)text("fetch-reason","結果已核對，不會重新取件。");
@@ -7132,7 +7121,7 @@ function render(){
   if(t)el("summary-download").href=`/api/tasks/${encodeURIComponent(t.task_id)}/summary`;
   text("identifiers",t?JSON.stringify({binding:t.binding_id,job:t.job_id,work:t.work_id,
     submit_request:t.submit_request_id,fetch_request:t.fetch_request_id,ack_request:t.ack_request_id,
-    submission:t.submission,fetch:t.fetch,acknowledgment:ack,reconciliation,
+    submission:t.submission,fetch:t.fetch,acknowledgment:ack,
     execution:t.execution,status:t.status,actions:t.actions},null,2):"未配置");
   // Support only: what the conversation no longer shows (codes, receipts, digests, usage of automatic continuation).
   if(t)text("identifiers",el("identifiers").textContent+"\n"+JSON.stringify({message:{
@@ -8964,7 +8953,7 @@ el("reset-session").addEventListener("click",async()=>{
       ||el("reset-session").disabled||selectedThread!==thread||state.composer?.request_id!==request)return;
   run(`/api/instructions/${encodeURIComponent(thread)}/reset`,{},request);
 });
-for(const action of ["status","fetch","acknowledge","reconcile","submit-reconcile","submit-retry"]){
+for(const action of ["status","fetch","acknowledge","submit-reconcile","submit-retry"]){
   el(action).addEventListener("click",async()=>{
     if(el(action).disabled)return;
     const task=state.tasks.find(t=>t.task_id===selected);

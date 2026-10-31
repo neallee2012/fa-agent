@@ -9,8 +9,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import A
-from shared_context.api import create_app
-from shared_context.m2_gateway import M2Gateway, M2Settings
+from legacy_m2_m4.api import create_app
+from legacy_m2_m4.m2_gateway import M2Gateway, M2Settings
 from shared_context.m2_copilot import ToolOutput, ToolSpec, run_copilot
 from test_m2_gateway import BODY, CHAT, BUDGET, PROJECT, NATIVE, Credential
 from test_m2_integration import RUNTIME, completion

@@ -23,7 +23,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.source_materials import digest
 from test_approved_skill_api import post_skill
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_inventory, instruction_models, runtime_path
+from test_instruction_flow import instruction_inventory, instruction_models, runtime_path
 from test_instruction_prompt import saved_turn
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import event, open_turn, settle
@@ -105,7 +105,6 @@ def test_signed_midturn_deactivation_preserves_the_failure_and_admits_current_gu
         assert h.store.read_snapshot(tuple(retained)) == retained
         inventory = instruction_inventory(h)
         assert {identity: inventory.receipts[identity] for identity in retained_receipts} == retained_receipts
-        check_history(h)
 
     with ExitStack() as cleanup:
         cleanup.callback(h.client.close)

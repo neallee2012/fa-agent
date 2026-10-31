@@ -12,13 +12,13 @@ toolbox tools/list returned on 2026-10-10 (ids redacted); ``UPSTREAM_401`` is a 
 import asyncio
 import json
 import logging
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 
 import httpx
 import pytest
 
 from shared_context import native_toolbox
-from shared_context.behavior_capabilities import CapabilityCapture, available_grants
+from shared_context.behavior_capabilities import TOOLBOX_OUTCOME_UNKNOWN, CapabilityCapture, available_grants
 from shared_context.errors import Problem
 from shared_context.native_assembly import NativeAssemblyCollector
 from shared_context.native_capabilities import bind_capabilities
@@ -702,3 +702,165 @@ def test_a_relist_that_still_lacks_a_captured_tool_refuses_the_turn(caplog):
     assert ("NATIVE_TOOLBOX_FAILED method=bind stage=tool_list code=CAPABILITY_UNAVAILABLE "
             "reason=captured_tool_missing;listed=3;label_matches=2") in [record.getMessage() for record in caplog.records]
     assert "FA_NATIVE_TOOL_SOURCE_UNAVAILABLE" not in caplog.text
+
+
+# One HTTP/1.1 chunk: its size in hex (14 bytes), then the keep-alive comment.
+CHUNK = b"e\r\n: keep-alive\n\n\r\n"
+HEAD = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n"
+
+
+class Trickling(httpx.AsyncByteStream):
+    """A reply that keeps sending keep-alives and never ends, so no read ever waits long."""
+
+    async def __aiter__(self):
+        while True:
+            yield b": keep-alive\n\n"
+            await asyncio.sleep(0.001)
+
+
+def trickle(body=None):
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Trickling())
+
+
+def within(awaitable, seconds=5):
+    """Fails a run that would otherwise never end."""
+    return asyncio.wait_for(awaitable, seconds)
+
+
+def bind_within(provider, ctx):
+    async def run():
+        async with AsyncExitStack() as stack:
+            return await within(bind_capabilities(ctx, (provider,), stack))
+    return {spec.name: spec for binding in asyncio.run(run()) for spec in binding.tools}
+
+
+def deadline_lines(caplog):
+    return [record.getMessage() for record in caplog.records if "NATIVE_TOOLBOX_FAILED" in record.getMessage()
+            and "deadline" in record.getMessage()]
+
+
+def test_a_real_socket_that_keeps_trickling_outlives_every_read_timeout_but_not_the_deadline(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    # No double of httpx here: with a chunk every 10 ms its read timeout, the same value, never fires.
+    monkeypatch.setattr(native_toolbox, "_LIST_SECONDS", 0.5)
+
+    async def serve(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(HEAD)
+        with suppress(ConnectionError):
+            while not writer.is_closing():
+                writer.write(CHUNK)
+                await writer.drain()
+                await asyncio.sleep(0.01)
+        writer.close()
+
+    async def run():
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        url = "http://127.0.0.1:%d/toolbox" % server.sockets[0].getsockname()[1]
+        try:
+            await within(native_toolbox.ToolboxClient(url, lambda: "agent-token").default_version(url))
+        finally:
+            server.close()
+    with pytest.raises(Problem) as ended:
+        asyncio.run(run())
+    assert ended.value.unavailable == "network"
+    assert len(lines := deadline_lines(caplog)) == 1 and "method=toolbox_get stage=request" in lines[0]
+
+
+@pytest.mark.parametrize("method", ["initialize", "tools/list"])
+def test_a_listing_that_keeps_trickling_is_left_out_at_the_deadline_and_remembered(monkeypatch, caplog, method):
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(native_toolbox, "_LIST_SECONDS", 0.5)
+    clock, toolbox = Clock(), answering(Toolbox(), method, trickle)
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    turns = [recorded("rid-1"), recorded("rid-2")]
+    first = bind_within(provider, turns[0])
+    assert {name: spec.description for name, spec in first.items()} == {
+        "WebIQ-web": UNAVAILABLE_DESCRIPTION, "WebIQ-browse": UNAVAILABLE_DESCRIPTION}
+    # The failure names the step that hung, in the line sdk_telemetry exports.
+    assert len(lines := deadline_lines(caplog)) == 1 and f"method={method} stage=request" in lines[0]
+    sent = len(toolbox.requests)
+    # The existing backoff, not a second wait: the next turn inside it sends no listing.
+    assert bind_within(provider, turns[1]).keys() == first.keys()
+    assert methods(toolbox, sent) == []
+    assert [[item.reason for item in ctx.assembly.snapshot().unavailable_sources] for ctx in turns] == [["network"]] * 2
+
+
+def test_a_listing_whose_every_page_answers_in_time_still_ends_at_its_total_deadline(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(native_toolbox, "_WHOLE_LIST_SECONDS", 0.2)
+    toolbox = Toolbox()
+
+    async def handle(request):
+        body = json.loads(request.content) if request.method == "POST" else {}
+        if body.get("method") == "tools/list":
+            toolbox.requests.append((request, body))
+            await asyncio.sleep(0.05)
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {
+                "tools": [], "nextCursor": "more"}})
+        return toolbox.handle(request)
+    provider = native_toolbox.toolbox_provider(transport=httpx.MockTransport(handle))
+    ctx = recorded("rid-1")
+    assert bind_within(provider, ctx)["WebIQ-web"].description == UNAVAILABLE_DESCRIPTION
+    assert [item.reason for item in ctx.assembly.snapshot().unavailable_sources] == ["network"]
+    assert len(deadline_lines(caplog)) == 1
+
+
+def test_a_token_that_never_arrives_ends_at_its_deadline_and_is_not_remembered(monkeypatch):
+    monkeypatch.setattr(native_toolbox, "_TOKEN_SECONDS", 0.05)
+    clock, toolbox = Clock(), Toolbox()
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport, clock=clock)
+    tokens = iter(["agent-token"])
+
+    async def token():
+        # The default version reads with the only token; the listing's never arrives.
+        for value in tokens:
+            return value
+        await asyncio.Event().wait()
+    ctx = recorded("rid-1")
+    ctx.model_token_provider = token
+    assert bind_within(provider, ctx)["WebIQ-web"].description == UNAVAILABLE_DESCRIPTION
+    assert [item.reason for item in ctx.assembly.snapshot().unavailable_sources] == ["identity_unavailable"]
+    # This VM's own token, not the toolbox: the next turn lists as usual instead of waiting out a backoff.
+    assert bind_within(provider, context(rid="rid-2"))["WebIQ-web"].description == "Search the web"
+
+
+def test_a_turn_waiting_for_a_trickling_prewarm_is_bounded_by_the_prewarm_deadline(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(native_toolbox, "_LIST_SECONDS", 0.5)
+    waiting, listing = prewarm_waits(monkeypatch), asyncio.Event()
+
+    def listed(body):
+        listing.set()
+        return trickle()
+    toolbox = answering(Toolbox(), "tools/list", listed)
+    provider = native_toolbox.toolbox_provider(transport=toolbox.transport)
+
+    async def run():
+        warming = warm_org(provider)
+        await within(listing.wait())
+        async with AsyncExitStack() as stack:
+            binding = asyncio.ensure_future(bind_capabilities(context(), (provider,), stack))
+            await within(waiting.wait())
+            bindings = await within(binding)
+        await within(warming)
+        return {spec.name: spec.description for item in bindings for spec in item.tools}
+    assert asyncio.run(run()) == {"WebIQ-web": UNAVAILABLE_DESCRIPTION, "WebIQ-browse": UNAVAILABLE_DESCRIPTION}
+    # The prewarm's listing, then the turn's own: a failed prewarm starts no backoff.
+    assert methods(toolbox).count("tools/list") == 2
+
+
+def test_a_tool_call_that_keeps_trickling_ends_with_an_unknown_outcome_and_is_never_resent(monkeypatch):
+    monkeypatch.setattr(native_toolbox, "_CALL_SECONDS", 0.5)
+    toolbox = answering(Toolbox(), "tools/call", trickle)
+    spec = bind_within(native_toolbox.toolbox_provider(transport=toolbox.transport), context())["WebIQ-browse"]
+
+    async def run():
+        await within(spec.handler({"session_id": "sdk-1", "tool_call_id": "call-1", "tool_name": spec.name,
+                                   "arguments": {}}))
+    with pytest.raises(ToolFailure) as first:
+        asyncio.run(run())
+    assert first.value.public_code == TOOLBOX_OUTCOME_UNKNOWN
+    with pytest.raises(ToolFailure) as again:
+        asyncio.run(run())
+    assert again.value.public_code == TOOLBOX_OUTCOME_UNKNOWN and methods(toolbox).count("tools/call") == 1

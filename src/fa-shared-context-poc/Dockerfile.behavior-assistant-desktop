@@ -1,6 +1,5 @@
 # Behavior assistant image plus one owned desktop (CAP-05, x11vnc for the live viewer) and preinstalled Playwright MCP (CAP-03);
-# build context: src/fa-shared-context-poc. Same SDK/runtime layers as Dockerfile.behavior-assistant;
-# the slim image stays unchanged for agents without these capabilities.
+# build context: src/fa-shared-context-poc. Python dependencies come from requirements-hosted.txt.
 # git (SP-16) is for fa-shell-v1 run_command on the Agent's own computer; nothing here sets up a remote, login or push.
 # Playwright runs its own pinned Chromium (the chrome-for-testing channel that the catalog's --browser chromium
 # selects): headless, or on the Agent's desktop when the turn has one, where the desktop starts this same

@@ -81,6 +81,7 @@ Neal 原話（2026-10-02 16:57）：
   - **2026-10-05 起的發布順序**（Neal 07:5x 原文見上方「狀態」；目前沒有比 stage 更上層的環境，「prod」就是指 stage release）：
     1. 開發 PR 合併到 main。
     2. 在 dev 完整測試：包含這次要發布的所有變更。dev 部署照上面 dev 的規則逐次批准。~~以及退回上一個 stage 版本的演練~~（2026-10-06 起不做，見下方「失敗就停」那一條）。
+       - 2026-10-30 起，dev 測試報告要有 [`verify-workbench`](../../.claude/skills/verify-workbench/SKILL.md) 的 dev 層結果：每位助理各跑一輪真回合，逐位列出（Neal 2026-10-30 同意）。
     3. 總協調開 release PR（改 `deploy/stage/release.json`），PR 內附變更清單和 dev 測試報告。~~和退版方式~~（2026-10-06 起不附）。
     4. 由 Neal 決定是否合併；合併才部署 stage。
     - **只有這種 stage release PR** 要附 dev 測試報告、由 Neal 決定是否合併（Neal 08:16 澄清）。開發、修正和文件 PR 照原本流程（兩軸 review 清零且 GitHub 顯示 CLEAN 後，由該工作階段自己合併），不需要 Neal 逐一核准，也不用附 dev 報告；這些 PR 合併不會部署 stage。
@@ -150,7 +151,7 @@ Neal 原話（2026-10-02 16:57）：
 
 **不變的部分**
 - dev 的部署方式、資料與批准界線不變；本 ADR 不授權任何 dev 資源變更。
-- `deploy/shared-context/azure.yaml` 寫死 dev 的 endpoint 與 image，是歷史配置；stage 不直接沿用。
+- `deploy/shared-context/azure.yaml`（已於 2026-10 移除；舊檔）寫死 dev 的 endpoint 與 image，是歷史配置；stage 不直接沿用。
 - 同 build、換版接續（#369）、新 Agent 的角色與 endpoint 補設（#306）等部署規則，在 stage 同樣適用。#468 之後，stage 的角色與 endpoint 補設改由「＋」自動完成（見「6. stage 自助新增 Agent」）；dev 照舊手動。（已被 2026-10-15 修訂取代：Neal 把 #468 延伸到 dev 和 azd 預設，見 [ADR-0006](0006-team-trust-boundary-grokbot-mode.md) 該段修訂。）
 
 **相關工作線**

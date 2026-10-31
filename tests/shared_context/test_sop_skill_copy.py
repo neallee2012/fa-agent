@@ -11,21 +11,22 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import A, B, C
-from shared_context.api import create_app
+from legacy_m2_m4.api import create_app
 from shared_context.auth import JwtVerifier
 from shared_context.behavior_assistant import AssistantProfile, key
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.m3_auth import M3JwtVerifier
 from shared_context.m3_models import SkillPurpose
+from shared_context.behavior_operations import control_key
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_inventory, instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key, token
 from test_sdk_compaction_product import open_turn, ordinary, settle
 from test_work_policy_lifecycle import enabled
 from test_work_cost_policy import standing
-from shared_context.behavior_work_policy import WorkPolicyControl
+from shared_context.behavior_work_policy import WorkPolicyControl, work_policy_key
 
 PROFILE = "fa-instruction-sop-copy-v1"
 SOP = "copy-source-sop"
@@ -147,7 +148,6 @@ def test_current_ticket_copies_only_approved_sop_to_its_unapproved_skill_slot(as
         archived = h.store.read_snapshot((key("text-archive", turn.binding.job_id),))[key("text-archive", turn.binding.job_id)]
         assert archived.payload["data"]["sop_copy_receipt"] == result
         assert h.assistant.result(turn.start.binding).known_effects == (result["receipt_id"],)
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -316,7 +316,6 @@ def test_copy_ack_loss_reconciles_original_slot_without_repeating_effects(
             before = h.store._guard()
             assert post_copy(turn).json() == again.json() and h.store._guard() == before
             assert counts == {"create": 1, "upload": 1, "blob": 1}
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -370,7 +369,6 @@ def test_source_effective_version_changes_never_retarget_or_repeat_copy(
         assert calls["upload"] == (1 if when == "after-upload" else 0)
         counts = dict(calls)
         assert post_copy(turn).status_code == (200 if historical else 403) and calls == counts
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -600,3 +598,4 @@ def test_before_copy_source_change_fences_model_send_and_keeps_original_intent(
         assert len(sent) == (stage != "reserve")
     finally:
         turn.client.close()
+

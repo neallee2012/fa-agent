@@ -38,11 +38,12 @@ same call id and arguments again. Otherwise, or when it still is not connected, 
 other toolboxes and tools are bound as usual. The links go to the card's private record only, never to the model or a
 log.
 
-A toolbox whose tool list cannot be read at turn start (its source failed upstream, a 5xx, a timeout, an unreadable
-answer) is left out of that turn only (Neal 2026-10-10): its tools report ``NATIVE_TOOLBOX_UNAVAILABLE`` and the turn's
-assembly record names the source for the workbench. That failure (not this VM's identity token), or a connection
-need, is remembered for its kept version for ``LIST_FAILURE_BACKOFF_SECONDS``: a later turn in that window first waits
-for a prewarm in flight, then degrades the same way without listing, and lists again after it
+A toolbox whose tool list cannot be read at turn start (its source failed upstream, a 5xx, a timeout or a total
+deadline, an unreadable answer) is left out of that turn only (Neal 2026-10-10): its tools report
+``NATIVE_TOOLBOX_UNAVAILABLE`` and the turn's assembly record names the source for the workbench. That failure (not
+this VM's identity token), or a connection need, is remembered for its kept version for
+``LIST_FAILURE_BACKOFF_SECONDS``: a later turn in that window first waits for a prewarm in flight, then degrades the
+same way without listing, and lists again after it
 (README#toolbox-list-backoff). Any successful listing clears it; a successful Connect re-list clears every remembered
 connection need. The toolbox's own definite HTTP or JSON-RPC answer about the request or its configuration (-32700,
 -32600, -32601, -32602, -32007) and every capture check after a list (a missing tool, an approval setting, a schema)
@@ -90,6 +91,9 @@ _MAX_RESPONSE_BYTES = 512 * 1024
 _MAX_SCHEMA_BYTES = 16 * 1024
 _MAX_LIST_PAGES = 8
 _LIST_SECONDS = 60.0
+# One whole listing, every exchange of it; longer than one exchange, so the log names the exchange that hung.
+_WHOLE_LIST_SECONDS = 90.0
+_TOKEN_SECONDS = 60.0
 _CALL_SECONDS = 120.0
 # A kept version whose listing failed is not listed again by a turn for this long (README#toolbox-list-backoff).
 LIST_FAILURE_BACKOFF_SECONDS = 60.0
@@ -319,10 +323,11 @@ class ToolboxClient:
 
     async def _token(self, method):
         try:
-            token = self.token_provider()
-            if inspect.isawaitable(token):
-                token = await token
-        except (AzureError, OSError) as error:
+            async with asyncio.timeout(_TOKEN_SECONDS):
+                token = self.token_provider()
+                if inspect.isawaitable(token):
+                    token = await token
+        except (AzureError, OSError) as error:  # OSError includes the TimeoutError of the deadline above.
             raise self._fail(method, "token", UNKNOWN, f"exception_type={type(error).__name__}",
                         "the Agent identity token is unavailable", 503) from None
         if not isinstance(token, str) or not token or "\n" in token or "\r" in token:
@@ -335,8 +340,10 @@ class ToolboxClient:
             # Same construction as the model call to this host (behavior_model_direct): the transport keeps httpx's
             # default trust_env for TLS trust (SSL_CERT_FILE/SSL_CERT_DIR); the client still ignores proxy settings.
             transport = self.transport or httpx.AsyncHTTPTransport(retries=0)
-            async with httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(timeout, connect=5),
-                                         follow_redirects=False, trust_env=False) as client:
+            # httpx's timeouts bound each read, so a reply that keeps trickling never reaches them; this is the total.
+            async with asyncio.timeout(timeout), httpx.AsyncClient(
+                    transport=transport, timeout=httpx.Timeout(timeout, connect=5), follow_redirects=False,
+                    trust_env=False) as client:
                 async with client.stream(verb, url, json=body, headers=headers) as response:
                     status, content_type = response.status_code, response.headers.get("content-type", "")
                     if response.headers.get("content-encoding", "identity") != "identity":
@@ -349,6 +356,9 @@ class ToolboxClient:
                                         "the toolbox response exceeds its bound")
                         raw.extend(chunk)
                     return status, content_type, bytes(raw), response.headers.get("mcp-session-id")
+        except TimeoutError:
+            raise self._fail(method, "request", UNKNOWN, "deadline", "the toolbox outcome is unconfirmed",
+                             503) from None
         except httpx.HTTPError as error:
             raise self._fail(method, "request", UNKNOWN, f"exception_type={type(error).__name__}",
                         "the toolbox outcome is unconfirmed", 503) from None
@@ -470,9 +480,14 @@ class ToolboxClient:
         """This toolbox version's listed tools, listed on a new session when absent or refreshed."""
         box = self.toolbox
         if refresh or box.listed is None:
-            async with box.opening():
-                session = await self.initialize()
-            box.listed, self.fresh = await self.list_tools(session), True
+            try:
+                async with asyncio.timeout(_WHOLE_LIST_SECONDS):
+                    async with box.opening():
+                        session = await self.initialize()
+                    box.listed, self.fresh = await self.list_tools(session), True
+            except TimeoutError:
+                raise self._fail("tools/list", "request", UNKNOWN, "listing_deadline",
+                                 "the toolbox outcome is unconfirmed", 503) from None
             box.failed = None
         return box.listed
 

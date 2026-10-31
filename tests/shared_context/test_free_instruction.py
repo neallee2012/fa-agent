@@ -291,94 +291,6 @@ def test_instruction_effect_uses_its_transaction_snapshot_not_repeated_registrat
         assert len(reads)==1
 
 
-@pytest.mark.parametrize("budget_disabled", [False, True])
-def test_seven_real_model_http_requests_keep_selected_deployment_and_original_money(assistant, budget_disabled):
-    from dataclasses import replace
-    from datetime import timedelta
-    from types import SimpleNamespace
-    from fastapi.testclient import TestClient
-    from test_work_policy_lifecycle import enabled
-    from shared_context.behavior_assistant_api import create_assistant_app
-    from shared_context.behavior_assistant_gateway import AssistantProvider
-    from shared_context.behavior_assistant_wire import InstructionSubmit,Reservation,ModelRequest
-    from shared_context.behavior_wire import Command
-    from shared_context.behavior_operations import _row
-    from shared_context.behavior_work_policy import CostLedger
-    from shared_context.source_materials import digest
-    h,control,human,facts=enabled(assistant)
-    if budget_disabled:
-        from shared_context.behavior_work_budget import BudgetEnforcementCommand,set_budget_enforcement
-        set_budget_enforcement(control,human,BudgetEnforcementCommand(
-            request_id="approved-accounting-only",policy_sha256=control.policy.sha256,enforced=False))
-    before=_row(h.store.read_snapshot((control.cost_key,)),control.cost_key,CostLedger)
-    h.endpoint.expected_url="https://provider.invalid/openai/v1/chat/completions"
-    h.endpoint.expected_model="configured-second-model"
-    h.endpoint.unbounded=True
-    h.endpoint.replies=iter([{"content":"OFFLINE response"}]*(8 if budget_disabled else 7))
-    provider=AssistantProvider(h.endpoint.expected_url,SimpleNamespace(
-        get_token=lambda _:SimpleNamespace(token="OFFLINE-not-a-credential")),transport=h.endpoint.transport)
-    h.app=create_assistant_app(h.assistant,h.verifier,provider=provider)
-    h.client=TestClient(h.app)
-    binding,_=control.submit(human,InstructionSubmit(request_id="seven-requests",content="Explain recursion.",
-                                                      model="configured-second-model"))
-    assigned=[]
-    def start(command):
-        assignment,ticket=h.assistant.issue(command)
-        assigned.append((assignment,ticket))
-    h.workers.adapter=replace(h.workers.adapter,start=start)
-    h.workers.start(binding.job_id,binding.owner)
-    assignment,ticket=assigned[0]
-    root=f"/behavior/v1/bindings/{binding.binding_id}/assistant/sessions/{assignment.session_id}/"
-    headers={**h.headers("agent"),"x-behavior-assistant-ticket":ticket.get_secret_value()}
-    assert h.client.post(root+"acquire",content=Command(request_id="sdk-start").model_dump_json(),
-                         headers=headers).status_code==200
-    for index in range(7):
-        if index==3:h.time+=timedelta(seconds=301)
-        body={"model":"configured-second-model","messages":[{"role":"user","content":f"OFFLINE round {index}"}],
-              "stream":True}
-        request_hash=digest(body)
-        reserved=h.client.post(root+"reserve-model",content=Reservation(request_id=request_hash,
-            request_sha256=request_hash).model_dump_json(),headers=headers)
-        assert reserved.status_code==200,reserved.text
-        sent=ModelRequest(request_id=request_hash,body=body)
-        response=h.client.post(root+"model",content=sent.model_dump_json(),headers=headers)
-        assert response.status_code==200,response.text
-    assert len(h.endpoint.requests)==7
-    assert all(p["model"]=="configured-second-model" and "max_tokens" not in p and "max_completion_tokens" not in p
-               for p in h.endpoint.requests)
-    repeated=h.client.post(root+"model",content=sent.model_dump_json(),headers=headers)
-    assert repeated.status_code==409 and len(h.endpoint.requests)==7
-    after=_row(h.store.read_snapshot((control.cost_key,)),control.cost_key,CostLedger)
-    assert after.work_reservations_microusd==before.work_reservations_microusd
-    assert after.legacy_unresolved_reserve_microusd==before.legacy_unresolved_reserve_microusd
-    assert after.model_pending_microusd==0 and after.model_metered_microusd==7*16
-    from test_instruction_flow import instruction_inventory
-    from shared_context.behavior_recovery_history import _Inventory
-    from shared_context.behavior_instruction_cost import replay_cost_write
-    inventory=instruction_inventory(h)
-    cfg=SimpleNamespace(table=SimpleNamespace(scope=h.store._scope),sha256="f"*64,
-                        workers=h.workers.contract,delivery=h.delivery.contract)
-    view=_Inventory(inventory,cfg)
-    ledger=before
-    writes=sorted((r for r in view.receipts.values() if any(
-        inventory.rows[k].payload["data"].get("kind")=="instruction_model_cost" for k,_ in r.writes)),
-        key=lambda r:r.guard_revision)
-    for receipt in writes:
-        ledger=replay_cost_write(view,receipt,ledger,control.records,control.policy)
-    assert ledger==after
-    facts[0]=facts[0].model_copy(update={"observed_cumulative_microusd":99_000_000,"observed_at":h.time})
-    blocked_body={**body,"messages":[{"role":"user","content":"Do not spend beyond the original shared total."}]}
-    blocked_hash=digest(blocked_body)
-    assert h.client.post(root+"reserve-model",content=Reservation(request_id=blocked_hash,
-        request_sha256=blocked_hash).model_dump_json(),headers=headers).status_code==200
-    refused=h.client.post(root+"model",content=ModelRequest(request_id=blocked_hash,body=blocked_body).model_dump_json(),headers=headers)
-    assert refused.status_code==(200 if budget_disabled else 403),refused.text
-    assert len(h.endpoint.requests)==(8 if budget_disabled else 7)
-    updated=_row(h.store.read_snapshot((control.cost_key,)),control.cost_key,CostLedger)
-    assert updated.observed_high_water_microusd==99_000_000
-    assert updated.legacy_unresolved_reserve_microusd==before.legacy_unresolved_reserve_microusd
-
-
 def test_public_progress_is_bound_and_pure_to_read(assistant):
     from dataclasses import replace
     from test_work_policy_lifecycle import enabled
@@ -449,3 +361,77 @@ def test_exact_instruction_storage_boundary_does_not_impose_old_character_cap(as
     stored=Task.model_validate_json(h.runtime.job_input(binding))
     assert stored.instruction.content==command.content and len(h.runtime.job_input(binding))>8192
     with pytest.raises(ValueError):InstructionSubmit(request_id="too-large",content="A"*8191)
+
+
+@pytest.mark.parametrize("budget_disabled", [False, True])
+def test_seven_real_model_http_requests_keep_selected_deployment_and_original_money(assistant, budget_disabled):
+    from dataclasses import replace
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    from test_work_policy_lifecycle import enabled
+    from shared_context.behavior_assistant_api import create_assistant_app
+    from shared_context.behavior_assistant_gateway import AssistantProvider
+    from shared_context.behavior_assistant_wire import InstructionSubmit,Reservation,ModelRequest
+    from shared_context.behavior_wire import Command
+    from shared_context.behavior_operations import _row
+    from shared_context.behavior_work_policy import CostLedger
+    from shared_context.source_materials import digest
+    h,control,human,facts=enabled(assistant)
+    if budget_disabled:
+        from shared_context.behavior_work_budget import BudgetEnforcementCommand,set_budget_enforcement
+        set_budget_enforcement(control,human,BudgetEnforcementCommand(
+            request_id="approved-accounting-only",policy_sha256=control.policy.sha256,enforced=False))
+    before=_row(h.store.read_snapshot((control.cost_key,)),control.cost_key,CostLedger)
+    h.endpoint.expected_url="https://provider.invalid/openai/v1/chat/completions"
+    h.endpoint.expected_model="configured-second-model"
+    h.endpoint.unbounded=True
+    h.endpoint.replies=iter([{"content":"OFFLINE response"}]*(8 if budget_disabled else 7))
+    provider=AssistantProvider(h.endpoint.expected_url,SimpleNamespace(
+        get_token=lambda _:SimpleNamespace(token="OFFLINE-not-a-credential")),transport=h.endpoint.transport)
+    h.app=create_assistant_app(h.assistant,h.verifier,provider=provider)
+    h.client=TestClient(h.app)
+    binding,_=control.submit(human,InstructionSubmit(request_id="seven-requests",content="Explain recursion.",
+                                                      model="configured-second-model"))
+    assigned=[]
+    def start(command):
+        assignment,ticket=h.assistant.issue(command)
+        assigned.append((assignment,ticket))
+    h.workers.adapter=replace(h.workers.adapter,start=start)
+    h.workers.start(binding.job_id,binding.owner)
+    assignment,ticket=assigned[0]
+    root=f"/behavior/v1/bindings/{binding.binding_id}/assistant/sessions/{assignment.session_id}/"
+    headers={**h.headers("agent"),"x-behavior-assistant-ticket":ticket.get_secret_value()}
+    assert h.client.post(root+"acquire",content=Command(request_id="sdk-start").model_dump_json(),
+                         headers=headers).status_code==200
+    for index in range(7):
+        if index==3:h.time+=timedelta(seconds=301)
+        body={"model":"configured-second-model","messages":[{"role":"user","content":f"OFFLINE round {index}"}],
+              "stream":True}
+        request_hash=digest(body)
+        reserved=h.client.post(root+"reserve-model",content=Reservation(request_id=request_hash,
+            request_sha256=request_hash).model_dump_json(),headers=headers)
+        assert reserved.status_code==200,reserved.text
+        sent=ModelRequest(request_id=request_hash,body=body)
+        response=h.client.post(root+"model",content=sent.model_dump_json(),headers=headers)
+        assert response.status_code==200,response.text
+    assert len(h.endpoint.requests)==7
+    assert all(p["model"]=="configured-second-model" and "max_tokens" not in p and "max_completion_tokens" not in p
+               for p in h.endpoint.requests)
+    repeated=h.client.post(root+"model",content=sent.model_dump_json(),headers=headers)
+    assert repeated.status_code==409 and len(h.endpoint.requests)==7
+    after=_row(h.store.read_snapshot((control.cost_key,)),control.cost_key,CostLedger)
+    assert after.work_reservations_microusd==before.work_reservations_microusd
+    assert after.legacy_unresolved_reserve_microusd==before.legacy_unresolved_reserve_microusd
+    assert after.model_pending_microusd==0 and after.model_metered_microusd==7*16
+    facts[0]=facts[0].model_copy(update={"observed_cumulative_microusd":99_000_000,"observed_at":h.time})
+    blocked_body={**body,"messages":[{"role":"user","content":"Do not spend beyond the original shared total."}]}
+    blocked_hash=digest(blocked_body)
+    assert h.client.post(root+"reserve-model",content=Reservation(request_id=blocked_hash,
+        request_sha256=blocked_hash).model_dump_json(),headers=headers).status_code==200
+    refused=h.client.post(root+"model",content=ModelRequest(request_id=blocked_hash,body=blocked_body).model_dump_json(),headers=headers)
+    assert refused.status_code==(200 if budget_disabled else 403),refused.text
+    assert len(h.endpoint.requests)==(8 if budget_disabled else 7)
+    updated=_row(h.store.read_snapshot((control.cost_key,)),control.cost_key,CostLedger)
+    assert updated.observed_high_water_microusd==99_000_000
+    assert updated.legacy_unresolved_reserve_microusd==before.legacy_unresolved_reserve_microusd

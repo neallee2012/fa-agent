@@ -181,14 +181,18 @@ def test_real_sdk_resumes_with_final_phase_tools_without_replaying_draft(tmp_pat
         try:
             deadline = time.monotonic() + 25
             while not task.done():
-                state = json.loads(state_file.read_text(encoding="utf-8"))
+                if time.monotonic() >= deadline:
+                    raise AssertionError("real SDK never reached the durable checkpoint")
+                try:
+                    state = json.loads(state_file.read_text(encoding="utf-8"))
+                except PermissionError:  # Windows: this read met the writer's os.replace.
+                    await asyncio.sleep(0.02)
+                    continue
                 if state["checkpoint_wait_observed"] and state["status"] == "waiting":
                     task.cancel()
                     with suppress(asyncio.CancelledError):
                         await task
                     raise TimeoutError("simulated owned shutdown after durable checkpoint")
-                if time.monotonic() >= deadline:
-                    raise AssertionError("real SDK never reached the durable checkpoint")
                 await asyncio.sleep(0.02)
             return await task
         finally:

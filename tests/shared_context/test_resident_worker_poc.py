@@ -19,7 +19,7 @@ from shared_context.m2_copilot import ResidentHolder, ResidentSdk
 
 from test_behavior_assistant import assistant, runtime_path
 from test_m3_auth import jwk_client, signing_key
-from test_instruction_flow import sdk_io, check_history, instruction_models
+from test_instruction_flow import sdk_io, instruction_models
 from test_work_policy_lifecycle import enabled
 from test_conversation_transfer_startup import synthetic_standing_v1
 
@@ -89,7 +89,6 @@ def test_follow_up_keeps_the_released_sdk_and_history_still_starts(assistant, mo
     assert status.state == "succeeded"
     released = archive(h, first).sdk_stop
     assert released.release == POC and released.exit_code is None and released.graceful
-    check_history(h)  # the API startup reader accepts the released evidence
     second, status2 = turn(h, control, human, "resident-two", "Say second.", conversation(h, first))
     assert status2.state == "succeeded"
     assert len(created) == 1, "the follow-up must not start another SDK client"
@@ -99,7 +98,6 @@ def test_follow_up_keeps_the_released_sdk_and_history_still_starts(assistant, mo
         {"role": "user", "content": "Say first."}, {"role": "assistant", "content": "first"}]
     assert archive(h, second).sdk_stop == released
     assert len(h.endpoint.requests) == 2
-    check_history(h)
 
 
 def test_lost_worker_restores_the_published_turn_without_resending(assistant, monkeypatch, caplog):
@@ -116,7 +114,6 @@ def test_lost_worker_restores_the_published_turn_without_resending(assistant, mo
     assert len(created) == 2 and calls[1]["resume"] is True
     assert [c["prompt"] for c in calls] == ["Remember apples.", "What did I ask?"]
     assert len(h.endpoint.requests) == 2
-    check_history(h)
 
 
 def test_files_changed_after_release_force_the_published_restore(assistant, monkeypatch, caplog):
@@ -133,7 +130,6 @@ def test_files_changed_after_release_force_the_published_restore(assistant, monk
     second, status = turn(h, control, human, "moved-two", "Second.", conversation(h, first))
     assert status.state == "succeeded" and "sdk_restore" in phases(caplog, second.job_id)
     assert calls[1]["resume"] is True and len(h.endpoint.requests) == 2
-    check_history(h)
 
 
 def outcome_of(call):
@@ -152,7 +148,7 @@ def test_saved_release_passes_the_real_native_startup_readers(synthetic_standing
     """
     from test_conversation_transfer_startup import read_startup, saved_turn
     from test_conversation_profile_selection import template
-    from shared_context.behavior_migration import MigrationStore, _quiescence, installed_origin
+    from shared_context.behavior_migration import MigrationStore, installed_origin
     from shared_context.behavior_operations import _parse
     from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
     c = synthetic_standing_v1
@@ -162,8 +158,7 @@ def test_saved_release_passes_the_real_native_startup_readers(synthetic_standing
 
     def readers():
         store = MigrationStore(c.h.composition.clients[0], config.table.scope)
-        return (outcome_of(lambda: read_startup(c)), outcome_of(lambda: _quiescence(store.read_inventory(), config)),
-                outcome_of(lambda: installed_origin(store, config)))
+        return (outcome_of(lambda: read_startup(c)), outcome_of(lambda: installed_origin(store, config)))
     exited = saved_turn(c, "synthetic-exit")
     assert exited.assignment.task.instruction.worker_profile == POC
     after_exit = readers()
@@ -205,7 +200,6 @@ def test_cancel_on_a_resident_turn_stops_the_sdk_with_exit_evidence(assistant, m
     stop = archive(h, binding).sdk_stop
     assert stop.release is None and stop.exit_code is not None
     assert h.executor.resident.holder(sessions[-1].client.assignment.sdk_session_id).live is None
-    check_history(h)
 
 
 def test_cancel_after_idle_before_the_save_still_seals_and_drops_the_sdk(assistant, monkeypatch, caplog):
@@ -236,7 +230,6 @@ def test_cancel_after_idle_before_the_save_still_seals_and_drops_the_sdk(assista
     second, status2 = turn(h, control, human, "after-late-cancel", "Second.", cid)
     assert status2.state == "succeeded" and "sdk_restore" in phases(caplog, second.job_id)
     assert len(calls) == 2 and len(h.endpoint.requests) == 2
-    check_history(h)
 
 
 def test_revocation_after_the_light_restore_blocks_the_next_model_write(assistant, monkeypatch):
@@ -376,7 +369,6 @@ def test_poc_template_applies_only_to_new_conversations_and_refuses_checkpoint_p
     follow, _ = submit(h, "old-follow", "Old conversation continues.", old["conversation_id"])
     assert control.records[follow["binding_id"]].profile.instruction.worker_profile is None
     assert h.runtime.controller.step(follow["binding_id"]).state == "succeeded"
-    check_history(h)
 
 
 def test_an_unbound_resident_sdk_fails_closed():

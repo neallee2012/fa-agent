@@ -10,7 +10,7 @@ from shared_context.behavior_agent_registry import register_agent_scope
 from shared_context.errors import Problem
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from test_agent_scope_registry import peer_policy
-from test_behavior_channels_pin_refresh import review_source
+from assistant_sdk_fixture import review_source
 from test_conversation_transfer_startup import read_startup, saved_turn, synthetic_standing_v1
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key

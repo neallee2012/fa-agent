@@ -26,7 +26,7 @@ from shared_context.native_local_capabilities import local_capability_provider
 from shared_context.native_turns import NativeTurnRuntime
 from test_behavior_assistant import assistant  # noqa: F401
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_models, runtime_path  # noqa: F401
+from test_instruction_flow import instruction_models, runtime_path  # noqa: F401
 from test_instruction_prompt import saved_turn, sdk_options, submit
 from test_m3_auth import jwk_client, signing_key  # noqa: F401
 from test_native_local_capabilities import MODEL_ROOT, Handlers, browser_grant, with_grants
@@ -147,7 +147,6 @@ def test_selected_v4_starts_new_conversations_and_old_v3_conversations_keep_v3(a
     for configuration, profile in zip(options, (V3, V3, PROFILE), strict=True):
         assert configuration["system_message"] == {"mode": "replace", "content": assemble_prompt(profile).system_message}
     assert saved_turn(h, h.runtime.bindings[third["binding_id"]].job_id).prompt_assembly == assemble_prompt(PROFILE).record
-    check_history(h)
 
 
 def test_native_turn_sends_v4_before_the_desktop_and_browser_handover(local_env, monkeypatch, tmp_path):

@@ -172,21 +172,6 @@ def test_new_registry_passes_real_standing_and_current_runtime_startup_readers(s
     assert all(after.rows[key] == row for key, row in before.rows.items())
 
 
-def test_registry_reader_still_rejects_b_scope_from_a_different_projected_configuration(synthetic_standing_v1):
-    from dataclasses import replace
-    from shared_context.behavior_agent_registry import register_agent_scope, validate_agent_registry_history
-    c = synthetic_standing_v1
-    policy = peer_policy(c.h.config, c.control.policy)
-    register_agent_scope(c.h.runtime.store, c.h.config, policy, c.human, now=c.h.time)
-    original = read_startup(c)
-    different = c.h.config.model_copy(update={"deployment_id": "another-configuration"})
-    projected = replace(original, installation_configuration_sha256=different.sha256)
-    with pytest.raises(Problem) as denied:
-        validate_agent_registry_history(projected, different)
-    assert denied.value.body["error"]["code"] == "AGENT_SCOPE_INVALID"
-    assert read_startup(c).entity_sha256 == original.entity_sha256
-
-
 def test_registered_peer_cannot_attach_to_a_runtime_or_initialize_another_cost_ledger(synthetic_standing_v1):
     from shared_context.behavior_agent_registry import register_agent_scope
     from shared_context.behavior_work_policy import attach_standing_policy

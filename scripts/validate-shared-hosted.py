@@ -190,6 +190,9 @@ class Config:
     def validate(self):
         if not self.azd_project.is_dir():
             raise ValueError("--azd-project must be an existing project directory")
+        if not (self.azd_project / "azure.yaml").is_file():
+            # azd -C walks up to a parent azure.yaml, which would run against the wrong project.
+            raise ValueError("--azd-project must contain its own azure.yaml")
         for name in ("environment", "agent_a", "agent_b", "team", "actor_a", "actor_b"):
             if not ID.fullmatch(getattr(self, name)):
                 raise ValueError(f"invalid bounded identifier: {name}")

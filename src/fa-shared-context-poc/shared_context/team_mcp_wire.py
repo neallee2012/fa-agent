@@ -147,10 +147,6 @@ def toolbox_entry_sha256(entry_id: str, toolbox: str, server: _ServerFields) -> 
     return hashlib.sha256(_canonical(material)).hexdigest()
 
 
-def team_mcp_entry_sha256(team_id: str, server: _ServerFields) -> str:
-    return toolbox_entry_sha256(team_entry_id(server.server_label), team_toolbox_name(team_id), server)
-
-
 def toolbox_grant(entry_id: str, toolbox: str, server: TeamMcpServer) -> CapabilityGrant:
     """Pinned to the default version read at capture: an immutable definition and approval setting for the turn."""
     return CapabilityGrant(

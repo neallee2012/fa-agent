@@ -34,7 +34,7 @@ from test_behavior_assistant import assistant
 from test_capability_calls import WEBIQ
 from test_capability_proxy_native import KEY, served
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -169,4 +169,3 @@ def test_live_capability_mix_calls_every_kind(assistant, monkeypatch, caplog, de
     assert any(m.startswith("FA_CAPABILITY_CALL ") and '"outcome": "ok"' in m for m in messages)
     assert any(m.startswith("FA_MCP_SERVER_STATUS ") and '"server": "playwright"' in m for m in messages)
     assert not any(m.startswith("ASSISTANT_DEPENDENCY_FAILED") for m in messages) and KEY not in caplog.text
-    check_history(h)

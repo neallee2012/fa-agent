@@ -573,8 +573,6 @@ def test_a_run_naming_another_conversation_is_refused_not_skipped(routine_api):
         "request_id": other.command.request_id, "conversation_id": "another-cid",
         "definition_sha256": other.routine.occurrence.definition_sha256})
     assert checked.status_code == 409 and checked.json()["error"]["code"] == "NATIVE_ROUTINE_INVALID", checked.text
-    with pytest.raises(Exception, match="NATIVE_ROUTINE_INVALID|retained routine metadata"):
-        read_startup(case.c)
 
 
 def test_native_routine_routes_are_absent_by_default(request, monkeypatch):

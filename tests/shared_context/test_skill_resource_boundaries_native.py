@@ -21,7 +21,7 @@ from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_skill_resources_prompt import SKILL_RESOURCES_CAPABILITIES
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -234,7 +234,6 @@ def test_fixed_sdk_refuses_path_unlisted_and_unregistered_actions_from_hostile_s
     after_turn = [artifact for artifact in reads if artifact != NAME][len(turn_reads):]
     assert isinstance(archive.archive, aw.StoredSdkArchive)
     assert after_turn and set(after_turn) == {archive.archive.artifact_id}
-    check_history(h)
     assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
     record("fixed-sdk-boundary", {
         "layer": "fixed-sdk-offline-provider", "sdk_version": "1.0.13", "runtime_version": stop.runtime_version,

@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from conftest import A, AUDIENCE, TENANT
-from shared_context.api import create_app
+from legacy_m2_m4.api import create_app
 from shared_context.auth import AuthSettings, JwtVerifier
 from shared_context.config import validate_api_audience
 

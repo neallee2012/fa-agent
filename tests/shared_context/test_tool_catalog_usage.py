@@ -20,7 +20,7 @@ from shared_context.behavior_instruction_cost import usage_facts
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
 from test_capability_capture import WEB_TOOLS, choose, enabled, fake_services
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_instruction_prompt import saved_turn, submit
 from test_m3_auth import jwk_client, signing_key
 
@@ -104,7 +104,6 @@ def test_disabled_capability_tools_are_refused_by_gateway_and_capability_call(as
     assert registered[1] == sorted(HISTORY_CAPABILITIES)
     assert refusals == {"gateway": (403, "ASSISTANT_TOOLS_DENIED"), "capability_call": (403, "CAPABILITY_TOOL_DENIED")}
     assert service_calls == []
-    check_history(h)
 
 
 def test_model_route_logs_usage_facts_once_per_stream_without_content(assistant, caplog):

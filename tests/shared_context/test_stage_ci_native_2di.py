@@ -155,7 +155,8 @@ def test_switch_on_refuses_a_checkout_without_p5_and_p6(monkeypatch):
 
 def api_app(ci, monkeypatch, *, deployed=None, mode="Single", active=1, revision=None, ready_active=True, idle=None):
     """The API app guard/sync/api read; ``ready_active`` False: the one active revision is not the latest ready."""
-    env = [{"name": "PYTHONUTF8", "value": "1"}] + ([{"name": GUARD, "value": deployed}] if deployed else [])
+    env = [{"name": "PYTHONUTF8", "value": "1"}, {"name": ci.API_CONFIG_ENV, "value": ci._config_bytes().decode()}]
+    env += [{"name": GUARD, "value": deployed}] if deployed else []
     env += [{"name": IDLE, "value": idle}] if idle else []
     ready = revision or f"{ci.STAGE['api_app']}--abcdef1-r1-1"
     names = [ready, "r1", "r2"] if ready_active else ["r1", ready, "r2"]

@@ -25,7 +25,7 @@ from shared_context.errors import Problem
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from test_instruction_flow import (
-    check_history, instruction_inventory, instruction_models, runtime_path, sdk_io,
+    instruction_inventory, instruction_models, runtime_path, sdk_io,
 )
 from test_m3_auth import jwk_client, signing_key
 from test_work_policy_lifecycle import enabled
@@ -377,7 +377,6 @@ def completed_response_loss(case, state):
     assert observed["body"]["result_digest"] == b.original_response["result_digest"]
     assert observed["body"]["work_outcome"] == state
     read_and_ack_original(case, state)
-    check_history(case.h)
 
 
 @pytest.mark.parametrize("cancelled", [False, True], ids=["succeeded", "cancelled"])
@@ -436,5 +435,4 @@ def test_confirmed_save_replay_cannot_replace_original_bytes_or_turn_metadata(as
         assert changed["status"] in {403, 409}
         assert_original_receipt(case)
         read_and_ack_original(case, "succeeded")
-        check_history(case.h)
         b.complete = True

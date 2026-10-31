@@ -6,7 +6,7 @@
     "environmentName": {"value": "cae-facontext-private"},
     "apiIdentityName": {"value": "id-facontext-api"},
     "storageName": {"value": "stfacontextpocdemo"},
-    "tableName": {"value": "workstate"},
+    "tableName": {"value": "workstatefresh"},
     "registryName": {"value": "crfacontextpocdemo"},
     "foundryAccountName": {"value": "cog-fasample-memory-demo"},
     "projectName": {"value": "faexample"}

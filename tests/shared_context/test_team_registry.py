@@ -1,6 +1,7 @@
 """Team ownership and signed identity checks; all storage and tokens are local fakes."""
 
 from dataclasses import replace
+import copy
 import json
 from types import SimpleNamespace
 
@@ -14,10 +15,7 @@ from shared_context.behavior_auth import (
 from shared_context.behavior_agent_message_wire import MAX_TEAM_AGENTS
 from shared_context.behavior_foundry import FoundryTarget
 from shared_context.behavior_operations import _row
-from shared_context.behavior_team_registry import (
-    IdentityRegistration, TeamAgent, TeamAgents, TeamOwnership, TeamRegistry, agent_key, identity_key,
-    roster_key, team_key, validate_team_registry_history,
-)
+from shared_context.behavior_team_registry import IdentityRegistration, TeamAgent, TeamAgents, TeamOwnership, TeamRegistry, agent_key, identity_key, roster_key, team_key
 from shared_context.behavior_team_registry_operator import operate
 from shared_context.errors import Problem
 from test_behavior_store import FakeTable, SCOPE
@@ -456,50 +454,23 @@ def test_user_token_with_registered_agent_oid_is_not_a_human(registry, jwk_clien
     assert denied.value.body["error"]["code"] == "BEHAVIOR_HUMAN_NOT_ALLOWED"
 
 
-def test_owner_rows_survive_the_real_startup_history_classifier(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    ids = c.h.config.identity
-    registry = TeamRegistry(c.control.store, tenant_id=ids.tenant_id, operator_oid=ids.human_oid,
-                            legacy_team_id=ids.team_id, legacy_owner_oid=ids.human_oid,
-                            agent_oids=tuple(agent.oid for agent in ids.agents))
-    registry.register_owner(c.human, "startup-owner", "another-team", SECOND_OWNER)
-    registry.deactivate_owner(c.human, "startup-owner-deactivate", SECOND_OWNER)
-    inventory = read_startup(c)
-    classified = validate_team_registry_history(inventory, c.h.config)
-    assert len(classified) == 2
-    assert classified[identity_key(ids.tenant_id, SECOND_OWNER)].active is False
+def page_inventory(table):
+    def query(*, query_filter, parameters, raw_request_hook, results_per_page, **kwargs):
+        assert query_filter == "PartitionKey eq @partition" and kwargs["retry_total"] == 0
+        values = [copy.deepcopy(value) for (name, partition, _), value in sorted(table.backing.rows.items())
+                  if name == table.table_name and partition == parameters["partition"]]
 
+        def pages():
+            for offset in range(0, len(values), results_per_page):
+                raw_request_hook(SimpleNamespace(http_request=SimpleNamespace(
+                    method="GET", url=table.url + "/Behavior()", body=None)))
+                yield iter(values[offset:offset + results_per_page])
+        return SimpleNamespace(by_page=pages)
+    table.query_entities = query
 
-def test_agent_rows_survive_real_startup_readers_and_bad_rows_are_refused(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    config = c.h.config
-    ids = config.identity
-    registry = TeamRegistry(c.control.store, tenant_id=ids.tenant_id, operator_oid=ids.human_oid,
-                            legacy_team_id=ids.team_id, legacy_owner_oid=ids.human_oid,
-                            agent_oids=tuple(agent.oid for agent in ids.agents), targets=config.targets)
-    first, second = _target(1, AGENT_OID), _target(2, OTHER_AGENT_OID)
-    registry.register_agent(c.human, "startup-agent-one", first.agent_id, first)
-    registry.register_agent(c.human, "startup-agent-two", second.agent_id, second)
-    inventory = read_startup(c)
-    classified = validate_team_registry_history(inventory, config)
-    rkey = roster_key(ids.tenant_id, ids.team_id)
-    assert set(classified) == {
-        identity_key(ids.tenant_id, AGENT_OID), identity_key(ids.tenant_id, OTHER_AGENT_OID),
-        agent_key(ids.tenant_id, first.agent_id), agent_key(ids.tenant_id, second.agent_id), rkey,
-    }
-    akey = agent_key(ids.tenant_id, second.agent_id)
-    row = inventory.rows[akey]
-    data = {**row.payload["data"], "owner_oid": SECOND_OWNER}
-    tampered = replace(inventory, rows={**inventory.rows, akey: replace(row, payload={**row.payload, "data": data})})
-    with pytest.raises(Problem):
-        validate_team_registry_history(tampered, config)
-    missing = replace(inventory, rows={key: value for key, value in inventory.rows.items() if key != akey})
-    with pytest.raises(Problem):
-        validate_team_registry_history(missing, config)
 
 @pytest.fixture
 def activated(workspace, jwk_client, monkeypatch):
-    from test_behavior_rotation_settlement_history import page_inventory
     from test_behavior_server import Harness
     h = Harness(workspace, jwk_client)
     try:
@@ -512,35 +483,3 @@ def activated(workspace, jwk_client, monkeypatch):
         yield h
     finally:
         h.composition.close()
-
-
-@pytest.mark.parametrize("reader", ["migration-quiescence", "rotation-additions"])
-def test_registered_agents_pass_both_restart_readers_and_tampered_roster_is_refused(activated, reader):
-    from shared_context.behavior_migration import _quiescence
-    from shared_context.behavior_runtime_rotation_history import validate_additions
-    h = activated
-    ids, store = h.config.identity, h.runtime.store
-    baseline = store.read_inventory()
-    registry = TeamRegistry(store, tenant_id=ids.tenant_id, operator_oid=ids.human_oid,
-                            legacy_team_id=ids.team_id, legacy_owner_oid=ids.human_oid,
-                            agent_oids=tuple(agent.oid for agent in ids.agents), targets=h.config.targets)
-    human = BehaviorPrincipal(ids.tenant_id, ids.human_oid, ids.team_id, "human", None,
-                              frozenset({"read", "approve", "submit"}))
-    for n, oid in ((1, AGENT_OID), (2, OTHER_AGENT_OID)):
-        target = _target(n, oid)
-        registry.register_agent(human, f"restart-agent-{n}", target.agent_id, target)
-
-    def read(inventory):
-        if reader == "migration-quiescence":
-            _quiescence(inventory, h.config)
-        else:
-            validate_additions(inventory, h.config, h.config, set(baseline.rows), set())
-
-    inventory = store.read_inventory()
-    read(inventory)
-    rkey = roster_key(ids.tenant_id, ids.team_id)
-    row = inventory.rows[rkey]
-    data = {**row.payload["data"], "agent_ids": list(reversed(row.payload["data"]["agent_ids"]))}
-    tampered = replace(inventory, rows={**inventory.rows, rkey: replace(row, payload={**row.payload, "data": data})})
-    with pytest.raises(Problem):
-        read(tampered)

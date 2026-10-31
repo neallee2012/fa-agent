@@ -55,7 +55,7 @@ Neal 2026-10-19 決定：dev（`faexample`，RG `rg-faexample`）改走
   (3) PATCH 前的完整 GET JSON 已存到 repo 外（`az rest --method get --url https://management.azure.com/subscriptions/<dev 訂用帳戶>/resourceGroups/rg-faexample/providers/Microsoft.App/containerApps/ca-fa-behavior-poc?api-version=2025-01-01`）。
   image 不換，只把 GET 回來的 template 改成
   `command ["python"]`、`args ["-B","-m","shared_context.behavior_server","serve"]`，加一項
-  `BEHAVIOR_SERVER_CONFIG_JSON`＝`deploy/dev/runtime/config.json` 的內容（和原內嵌配置逐位元組相同），
+  `BEHAVIOR_SERVER_CONFIG_JSON`＝`deploy/dev/runtime/config.json` 的內容（和原內嵌配置逐位元組相同；2026-10-30 起改為 v1，見[下面](#dev-fresh-v1)），
   拿掉 `imageType`、`ephemeralStorage`，`revisionSuffix` 用**正在服務的 commit** 前 7 碼加 `-r0-1`
   （目前是 `ae3d30e-r0-1`；不是 checkout 的 HEAD，這樣 `guard` 讀得出服務中的 commit），再對同一個 URL `az rest --method patch`。
   寫入後讀回 revision Healthy、traffic 100%、`/healthz` 200、ENV 等於 `runtime/config.json`。
@@ -93,6 +93,19 @@ python -X utf8 deploy/stage/ci_deploy.py --config $cfg follow $api $hosted
 - Teams relay（`src/fa-teams-relay`）**不在** `ci_deploy` 裡（`build` 只有 api／hosted／console／feed），照
   [relay README](../src/fa-teams-relay/README.md) 另外做。
 - dev 沒有遠端工作台（`console_app` 是 `null`），不跑 `console`；`feed` 視需要在 `follow` 之後跑。
+- <a id="dev-fresh-v1"></a>**2026-10-30 起 dev 是全新安裝的 v1 設定**（Neal 2026-10-30 同意）：`dev.json` 的 `runtime`
+  改用新表 `workstatefresh`，Team `team-one` 和 authority domain `behavior-c1-0916` 沿用，
+  `deploy/dev/runtime/` 改成 `make_runtime.py --config deploy/dev/dev.json` 產生的 v1 `config.json` 和 `fresh-inputs.json`；
+  上面 W2 裡「和原內嵌配置逐位元組相同」的那份配置已經不在 repo 裡。`infra/shared-context/foundation.parameters.json` 的
+  `tableName` 也跟著改成 `workstatefresh`。舊表 `workstate` 原封保留，ARM incremental 部署不會刪掉它。
+  雲端做完首次安裝、API 換成這份 `config.json` 之前，部署序列會停在 `guard`：它發現部署中的
+  `BEHAVIOR_SERVER_CONFIG_JSON` 和這份不同就停下，和 `api` 步驟同一個判斷、同一句訊息，`sync` 還沒發布 Hosted、
+  也還沒切 route（2026-10-30 前 `guard` 只比對 ENV 名稱，要到 `api` 才停，Hosted 和 API 的版本會錯開）。
+  Team ID 沒變，所以 Team 記憶 scope、Team MCP 和 connector 的 toolbox 都接得上。這些 toolbox 的名稱由 Team ID 推出，
+  存在 Foundry 上，不在 Table 裡。各 Agent 的私人記憶 scope 只由 Agent 名稱決定，也不受影響。
+  存在 Table 裡的狀態都會重來，包括：
+  - 各 Agent 的 connector 關閉設定（`team_connector_narrowing.py`）
+  - Teams 聊天和 FA 對話的對照
 - <a id="dev-webiq-env-removal"></a>**2026-10-22 起的一次性步驟（WebIQ 只剩 toolbox）**：`dev.json` 不再有
   `FA_CAPABILITY_SECRET_WEBIQ_API_KEY`，但 live 的 `ca-fa-behavior-poc` 還掛著它，`ci_deploy` 沒有「退場 ENV」的機制。
   2026-10-22 起 `guard` 就會停在 `deployed ENV ['FA_CAPABILITY_SECRET_WEBIQ_API_KEY'] is not in the deployment profile`

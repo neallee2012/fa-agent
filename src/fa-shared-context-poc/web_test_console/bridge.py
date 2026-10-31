@@ -5,6 +5,7 @@ Remote mode (ADR-0008 §3) reuses the same code behind Container Apps Entra sign
 from __future__ import annotations
 
 from contextlib import asynccontextmanager, closing, contextmanager
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import secrets
@@ -12,21 +13,20 @@ import sqlite3
 from threading import RLock
 
 import httpx
-from fastapi import Depends, FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import SecretStr
-from starlette.concurrency import run_in_threadpool
 
 from .adapter import (
-    CliTokenProvider, ConsoleConfig, SteadyConsoleConfig, ConsoleError, OriginalFailureAdapter, PullAdapter, TokenVault,
+    CliTokenProvider, ConsoleConfig, SteadyConsoleConfig, ConsoleError, PullAdapter, TokenVault,
     canonical, now_utc, require, sha, strict_json,
 )
 from .standing import StandingConsoleConfig, StandingWorkObservation
 from .work_policy import checked_observation
 from .pull_continuation import PullContinuationSidecar
 from .instructions import NATIVE_LANE, InstructionConnection
-from .agent_connections import AgentConnections, AgentConsoles, MESSAGES as AGENT_MESSAGES, read_messages, validate_default
-from .agent_onboarding import AgentOnboarding, MESSAGES as ONBOARDING_MESSAGES, parse_input as onboarding_input
+from .agent_connections import AgentConnections, AgentConsoles, MESSAGES as AGENT_MESSAGES, validate_default
+from .agent_onboarding import AgentOnboarding, MESSAGES as ONBOARDING_MESSAGES
 from .native import NativeInstructionControl, MESSAGES as NATIVE_MESSAGES
 from .native_hitl import MESSAGES as HITL_MESSAGES, install_hitl_routes
 from .groups import GroupControl, MESSAGES as GROUP_MESSAGES, install_group_routes
@@ -36,12 +36,13 @@ from .team_skills import MESSAGES as TEAM_SKILL_MESSAGES, install_team_skill_rou
 from .team_mcp import MESSAGES as TEAM_MCP_MESSAGES, install_team_mcp_routes, is_team_mcp_write
 from .team_connectors import MESSAGES as TEAM_CONNECTOR_MESSAGES, install_team_connector_routes, is_connector_write
 from .routine_settings import MESSAGES as ROUTINE_SETTINGS_MESSAGES, install_routine_settings_routes, routines_available
+from .console_routes import (
+    install_agent_routes, install_conversation_routes, install_file_routes, install_page_routes,
+    install_reply_read_routes, install_task_routes, install_template_routes, install_session_routes, install_turn_routes,
+)
 from . import realtime
 from . import prewarm as typing_prewarm
-from shared_context.assistant_image_wire import MAX_IMAGE_BYTES as _MAX_USER_IMAGE_BYTES
 
-# One base64 PNG plus its name; the API refuses anything over the same image bound.
-MAX_IMAGE_UPLOAD_BODY_BYTES = (_MAX_USER_IMAGE_BYTES + 2) // 3 * 4 + 4096
 # A conversation's progress reads take turns. One that does not come back must not hold the next ones (a reload's first
 # read included) forever: a read waits this long for its turn, then answers retryable and the page reads again.
 PROGRESS_LOCK_WAIT_SECONDS = 25
@@ -146,7 +147,6 @@ MESSAGES = {
     "ALREADY_FETCHED": "已驗結果保留於本次記憶體；不再 fetch，不消耗額外取得配額。",
     "ALREADY_ACKNOWLEDGED": "原 backend 已確認收件；不需再次 ACK。",
     "ACTION_NOT_ALLOWED": "此項目不提供這個操作。",
-    "RETAINED_BACKEND_NOT_VERIFIED": "尚未提供已核對的原轉交資料；此結果的讀取保持停用。",
     "CONFIG_CHANGED": "本機 journal 已綁不同配置；禁止覆寫或用新配置解除原未知 intent。",
     "LOCAL_REQUEST_DENIED": "請由此 localhost 頁面操作；跨來源或不符的請求已拒絕。",
     "REMOTE_PRINCIPAL_DENIED": "只有已指派的登入帳號可以使用這個遠端工作台；請改用指定帳號登入。",
@@ -158,11 +158,6 @@ MESSAGES = {
     "LOCAL_FAILURE": "本機處理失敗；結果未確認，請保留 journal 核對，不重送。",
     "WORK_POLICY_UNAVAILABLE": "暫時無法核對這筆工作的權限與預算；不會送出，其他工作與讀取不受此項影響。",
     "WORK_POLICY_INVALID": "工作權限回應與原工作不符；未送出。",
-    "HANDOFF_EXPIRED": "這筆歷史結果的轉交許可已到期；仍可查狀態，不會重新取得或確認收件。",
-    "ORIGINAL_ACK_REQUIRED": "只有原收件確認已送出且回應未知時，才能核對原回條。",
-    "ORIGINAL_ACK_INVALID": "原收件意圖與這筆工作不符或資料不完整；不能另造請求核對。",
-    "ALREADY_RECONCILED": "已核對原回條，未重送收件確認。",
-    "RECONCILE_OUTCOME_UNKNOWN": "這次核對的回應仍未知；不再送出。保留原紀錄，交管理者核對。",
     "INSTRUCTION_INVALID": "請輸入非空白且在顯示的傳輸容量內的指令；不會替你刪字或截斷。",
     "INSTRUCTION_SCOPE": "這不是本機保存的原交辦；未送出。",
     "INSTRUCTION_CHANGED": "同一則交辦的原文或請求已改變；不能用原 ID 送不同內容。",
@@ -285,7 +280,6 @@ class Console:
             follow_redirects=False, timeout=httpx.Timeout(90, connect=10))
         self.owns_backend = backend is None
         self.adapter = None if config is None else PullAdapter(config, self.backend, api_prefix=api_prefix)
-        self.failure_adapter = None if config is None else OriginalFailureAdapter(config, self.backend, api_prefix=api_prefix)
         self.groups = None if config is None else GroupControl(self)
         self.results, self.statuses, self.errors = {}, {}, {}
         self.instruction_observations = {}
@@ -303,13 +297,6 @@ class Console:
 
     def native_request(self, request_id):
         return None if self.native_instructions is None else self.native_instructions.thread_for(request_id)
-
-    def configured_tasks(self):
-        return [] if self.config is None else [task for task in self.config.tasks if task.mode != "normal_pull"]
-
-    def tasks(self):
-        return [] if self.config is None else self.configured_tasks() + (
-            [] if self.instructions is None else self.instructions.tasks())
 
     def instruction_task(self, task):
         return self.instructions is not None and self.instructions.store.command(task.task_id) is not None
@@ -338,9 +325,7 @@ class Console:
         require(self.native_request(task_id) is None, "ACTION_NOT_ALLOWED", 403)
         if self.instructions is not None and self.instructions.store.command(task_id) is not None:
             return self.instructions.task(task_id)
-        task = next((v for v in self.config.tasks if v.task_id == task_id), None)
-        require(task is not None and task.mode != "normal_pull", "ACTION_NOT_ALLOWED", 403)
-        return task
+        raise ConsoleError("ACTION_NOT_ALLOWED", 403)  # configured normal_pull tasks are never workbench actions
 
     def active(self):
         require(self.config is not None, "PREVIEW_ONLY")
@@ -357,12 +342,6 @@ class Console:
         if phase in {"submit-reconcile","submit-retry"}:
             require(self.instruction_task(task), "ACTION_NOT_ALLOWED", 403)
             permission = "submit" if phase=="submit-retry" else "status"
-        if phase == "reconcile":
-            require(task.mode == "original_failure", "ACTION_NOT_ALLOWED", 403)
-            permission = "acknowledge"
-        if task.mode == "original_failure":
-            self.failure_adapter.require_enabled(task)
-            require(phase in {"status", "fetch", "acknowledge", "reconcile"}, "ACTION_NOT_ALLOWED", 403)
         require(permission in task.allowed_actions, "ACTION_NOT_ALLOWED", 403)
         token = self.vault.get()
         return token
@@ -370,7 +349,7 @@ class Console:
     def adapter_for(self, task):
         if self.instruction_task(task):
             return self.instructions.adapter
-        return self.failure_adapter if task.mode == "original_failure" else self.adapter
+        return self.adapter
 
     def refresh_instruction_work(self, task, token):
         require(self.instruction_task(task), "ACTION_NOT_ALLOWED", 403)
@@ -428,7 +407,7 @@ class Console:
     def task_view(self, task):
         actions = {}
         result = self.results.get(task.task_id)
-        for action in ("submit", "status", "fetch", "acknowledge", "reconcile", "submit-reconcile", "submit-retry", "read-reply", "read-context", "read-delegation", "confirm-reply", "cancel", "read-cancel-receipt", "read-files"):
+        for action in ("submit", "status", "fetch", "acknowledge", "submit-reconcile", "submit-retry", "read-reply", "read-context", "read-delegation", "confirm-reply", "cancel", "read-cancel-receipt", "read-files"):
             try:
                 self.gate(task, action)
                 if action == "submit-reconcile":
@@ -455,14 +434,6 @@ class Console:
                             and progress["data"]["delivery_id"] is not None, "NO_RESULT")
                     require(self.journal.get(task.task_id, "acknowledge") is None, "ALREADY_ACKNOWLEDGED")
                     require(result is not None or self.journal.get(task.task_id, "fetch") is None, "CHALLENGE_LOST")
-                if action == "reconcile":
-                    self.failure_adapter.original_ack(task, self.journal.get(task.task_id, "acknowledge"), self.clock())
-                    prior = self.journal.get(task.task_id, action)
-                    require(prior is None, "ALREADY_RECONCILED" if prior and prior["state"] == "CONFIRMED"
-                            else "RECONCILE_OUTCOME_UNKNOWN")
-                if task.mode == "original_failure" and action in {"fetch", "acknowledge", "reconcile"}:
-                    observed = self.statuses.get(task.task_id)
-                    require(observed is None or not observed["data"]["expired"], "HANDOFF_EXPIRED", 403)
                 if action in {"submit", "fetch", "acknowledge"}:
                     prior = self.journal.get(task.task_id, action)
                     code = ({"submit": "ALREADY_SUBMITTED", "fetch": "ALREADY_FETCHED",
@@ -497,7 +468,6 @@ class Console:
             "submission": self.phase(task, "submit"), "fetch": self.phase(task, "fetch"),
             "cancellation": self.phase(task, "cancel") if self.instruction_task(task) else None,
             "acknowledgment": self.phase(task, "acknowledge"), "actions": actions,
-            "reconciliation": self.phase(task, "reconcile"),
             "execution": self.instruction_execution_view(task) if self.instruction_task(task) else None,
             "error": self.errors.get(task.task_id),
         }
@@ -512,8 +482,7 @@ class Console:
             native = self.native_thread(thread_id) if self.instructions is not None else False
             composer = (None if self.instructions is None else
                         self.native_instructions.view(thread_id) if native else self.instructions.view(thread_id))
-            tasks=(self.tasks() if composer is None else self.configured_tasks() if native else
-                   [*self.configured_tasks(),*self.instructions.tasks(composer["thread_id"])])
+            tasks=[] if composer is None or native else self.instructions.tasks(composer["thread_id"])
             selection_error = None
             try:
                 selections = self.template_selection_history()
@@ -602,8 +571,6 @@ class Console:
                 self.instructions.retry_submission(task)
                 self.errors.pop(task_id,None)
                 return {"task": self.task_view(task)}
-            if action == "reconcile":
-                return self.reconcile_ack(task)
             require(action in {"submit", "status", "fetch", "acknowledge"}, "ACTION_NOT_ALLOWED", 403)
             # Repeated clicks observe this client's original attempt, never re-POST.
             prior = None if action == "status" else self.journal.get(task_id, action)
@@ -640,21 +607,12 @@ class Console:
                     status = adapter.status(task, token)
                     self.statuses[task_id] = {"data": status.model_dump(mode="json"), "observed_at": created,
                                              "not_current_live_result": True}
-                    if task.mode == "original_failure":
-                        require(not status.expired, "HANDOFF_EXPIRED", 403)
-                    else:
-                        require(status.result_forwarded and status.delivery_id is not None, "NO_RESULT")
+                    require(status.result_forwarded and status.delivery_id is not None, "NO_RESULT")
                 if action == "acknowledge":
                     require(result is not None, "CHALLENGE_LOST" if self.journal.get(task_id, "fetch")
                             else "RESULT_NOT_LOADED")
-                    if task.mode == "original_failure":
-                        current = adapter.status(task, token)
-                        self.statuses[task_id] = {"data": current.model_dump(mode="json"), "observed_at": created,
-                                                 "not_current_live_result": True}
-                        require(not current.expired, "HANDOFF_EXPIRED", 403)
                     body = adapter.ack_body(task, result)
-                    path = (adapter.paths(task)["acknowledge"] if task.mode == "original_failure" else
-                            "/behavior/v1/bindings/"+task.binding_id+"/delivery/acknowledge")
+                    path = "/behavior/v1/bindings/"+task.binding_id+"/delivery/acknowledge"
                     method = "POST"
                 else:
                     method, path, body = adapter.request(task, action)
@@ -1166,51 +1124,6 @@ class Console:
             self.instructions.adapter.check_delivery_link(task, result)
             return self.run(task_id, "acknowledge")
 
-    def reconcile_ack(self, task):
-        token = self.gate(task, "reconcile")
-        record = self.journal.get(task.task_id, "acknowledge")
-        original = self.failure_adapter.original_ack(task, record, self.clock())
-        original_hash = sha(canonical(record["intent"]))
-        prior = self.journal.get(task.task_id, "reconcile")
-        if prior is not None:
-            require(prior["intent"].get("original_ack_intent_sha256") == original_hash
-                    and prior["intent"].get("original_ack_body_sha256") == original.body_sha256,
-                    "ORIGINAL_ACK_INVALID")
-            return {"task": self.task_view(task)}
-        started = False
-        try:
-            status = self.failure_adapter.status(task, token)
-            self.statuses[task.task_id] = {"data": status.model_dump(mode="json"),
-                "observed_at": self.clock().isoformat(), "not_current_live_result": True}
-            require(not status.expired, "HANDOFF_EXPIRED", 403)
-            self.active()
-            token = self.vault.get()
-            require(self.journal.get(task.task_id, "acknowledge") == record, "ORIGINAL_ACK_INVALID")
-            method, path, body = self.failure_adapter.reconcile_request(task, original)
-            intent = {"method": method, "path": path, "request_id": original.request_id,
-                "body": body, "body_sha256": sha(canonical(body)), "created_at": self.clock().isoformat(),
-                "configuration_sha256": self.config.sha256,
-                "original_ack_intent_sha256": original_hash, "original_ack_body_sha256": original.body_sha256,
-                "exchange_id": original.exchange_id, "binding": original.binding.model_dump(mode="json")}
-            self.journal.begin(task.task_id, "reconcile", intent)
-            started = True
-            receipt = self.failure_adapter.reconcile(task, original, token)
-            self.journal.finish(task.task_id, "reconcile", {
-                "state": "CONFIRMED", "confirmation_level": "client_received", "receipt": receipt,
-                "payload_sha256": original.binding.payload_digest, "observed_at": self.clock().isoformat(),
-                "original_ack_state": "UNKNOWN", "ack_resent": False})
-            self.observed_here.add((task.task_id, "reconcile"))
-            self.errors.pop(task.task_id, None)
-            return {"task": self.task_view(task)}
-        except ConsoleError as error:
-            self.errors[task.task_id] = {"code": error.code, "message": MESSAGES[error.code],
-                "observed_at": self.clock().isoformat(), "upstream_status": error.upstream_status}
-            if started:
-                self.journal.finish(task.task_id, "reconcile", {
-                    "state": "UNKNOWN", "code": error.code, "observed_at": self.clock().isoformat(),
-                    "automatic_retry": False, "original_ack_state": "UNKNOWN", "ack_resent": False})
-            raise
-
     def payload(self, task_id):
         if self.native_request(task_id) is not None:
             return self.download_instruction_reply(task_id)[0]
@@ -1235,32 +1148,199 @@ class Console:
                     "note": "原回條的 delivered 只代表 client 收件，不代表真人已讀；不會重送。"}
         task = self.task(task_id)
         ack = self.journal.get(task_id, "acknowledge")
-        if task.mode != "original_failure":
-            summary = {"task_id": task_id, "mode": task.mode, "binding_id": task.binding_id, "job_id": task.job_id,
-                    "observed_at": None if ack is None else ack["observed_at"], "not_current_live_result": True,
-                    "confirmation_level": None if ack is None else ack.get("confirmation_level"),
-                    "state": "NOT_CONFIRMED" if ack is None else ack["state"],
-                    "receipt": None if ack is None else ack.get("receipt"),
-                    "note": "只有原 backend 回條確認 client_received 才算收件；不表示真人已讀。"}
-            if self.instruction_task(task):
-                summary["reply_read"] = self.instructions.replies.get(task_id)
-                summary["reply_read_is_not_receipt"] = True
-                if self.journal.get(task_id, "cancel") is not None:
-                    summary["cancellation"] = self.phase(task, "cancel")
-            return summary
-        reconciliation = self.journal.get(task_id, "reconcile") if task.mode == "original_failure" else None
-        reconciled = reconciliation is not None and reconciliation["state"] == "CONFIRMED"
-        observed = reconciliation if reconciled else ack
-        return {"task_id": task_id, "mode": task.mode, "binding_id": task.binding_id, "job_id": task.job_id,
-                "observed_at": None if observed is None else observed["observed_at"], "not_current_live_result": True,
-                "confirmation_level": None if observed is None else observed.get("confirmation_level"),
-                "state": "NOT_CONFIRMED" if observed is None else observed["state"],
-                "receipt": None if observed is None else observed.get("receipt"),
-                "confirmation_source": "original_ack_reconciliation" if reconciled else "acknowledgment",
-                "original_ack": self.phase(task, "acknowledge"), "reconciliation": self.phase(task, "reconcile"),
-                "ack_resent": False,
-                "note": ("原ACK回應遺失；已核對原回條client_received（未重送）。原ACK UNKNOWN記錄保留。"
-                         if reconciled else "只有原 backend 回條確認 client_received 才算收件；不表示真人已讀。")}
+        summary = {"task_id": task_id, "mode": task.mode, "binding_id": task.binding_id, "job_id": task.job_id,
+                "observed_at": None if ack is None else ack["observed_at"], "not_current_live_result": True,
+                "confirmation_level": None if ack is None else ack.get("confirmation_level"),
+                "state": "NOT_CONFIRMED" if ack is None else ack["state"],
+                "receipt": None if ack is None else ack.get("receipt"),
+                "note": "只有原 backend 回條確認 client_received 才算收件；不表示真人已讀。"}
+        if self.instruction_task(task):
+            summary["reply_read"] = self.instructions.replies.get(task_id)
+            summary["reply_read_is_not_receipt"] = True
+            if self.journal.get(task_id, "cancel") is not None:
+                summary["cancellation"] = self.phase(task, "cancel")
+        return summary
+
+
+@dataclass(frozen=True)
+class BrowserBoundary:
+    """Who may call this bridge: its origin, this start's page cookie and CSRF value, and the headers on every answer."""
+    remote: object
+    origin: str
+    host: str
+    cookie_name: str
+    cookie: str
+    csrf: str
+    headers: dict
+
+
+def browser_boundary(port, remote, realtime_host):
+    origin = f"http://127.0.0.1:{port}" if remote is None else remote.origin
+    host = origin.split("://", 1)[1]
+    desktop_socket = f"ws://127.0.0.1:{port}" if remote is None else f"wss://{host}"
+    realtime_socket = "" if realtime_host is None else f" wss://{realtime_host}"
+    # ws: is listed explicitly for the desktop viewer; data: covers noVNC's remote cursor image.
+    # Remote: the Container Apps sign-in layer treats a cookie POST without Origin/Referer as forgery, so the page
+    # sends its own origin as Referer to itself only.
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer" if remote is None else "same-origin", "Content-Security-Policy":
+            "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            f"connect-src 'self' {desktop_socket}{realtime_socket}; img-src 'self' blob: data:; frame-ancestors 'none'; "
+            "form-action 'none'; base-uri 'none'"}
+    return BrowserBoundary(remote, origin, host, "fa_console" if remote is None else "__Host-fa_console",
+                           secrets.token_urlsafe(32), secrets.token_urlsafe(32), headers)
+
+
+class AgentScope:
+    """Which Agent's Console one browser request addresses."""
+
+    def __init__(self, console, agents):
+        self.default_console = console
+        self.agents = agents
+
+    def selected_agent(self, request: Request):
+        values = request.headers.getlist("x-console-agent")
+        require(len(values) <= 1, "LOCAL_REQUEST_DENIED", 403)
+        return values[0] if values else None
+
+    def console(self, request: Request):
+        identity = self.selected_agent(request)
+        if self.agents is None:
+            require(identity is None, "AGENT_NOT_AVAILABLE")
+            return self.default_console
+        return self.agents.resolve(identity)
+
+    def state(self, value, request):
+        return value if self.agents is None else self.agents.decorate(value, self.selected_agent(request))
+
+
+def check_browser_request(request, boundary):
+    remote, headers, path = boundary.remote, request.headers, request.url.path
+    if remote is not None:
+        remote.admit(headers)
+    # After Entra sign-in the browser lands on "/" from a cross-site redirect chain, so only the remote page
+    # load accepts any Sec-Fetch-Site; it performs nothing and every API call stays same-origin only.
+    landing = remote is not None and request.method == "GET" and path == "/"
+    require(headers.get("host") == boundary.host
+            and (landing or headers.get("sec-fetch-site", "same-origin") in {"same-origin", "none"})
+            and (headers.get("origin") in {None, boundary.origin}),
+            "LOCAL_REQUEST_DENIED", 403)
+    if path != "/":
+        # A restarted remote replica issues a new page cookie; the page reloads once and resends nothing.
+        require(secrets.compare_digest(request.cookies.get(boundary.cookie_name, ""), boundary.cookie),
+                "LOCAL_REQUEST_DENIED" if remote is None else "REMOTE_SESSION_CHANGED", 403)
+
+
+def check_write_request(request, boundary):
+    require(request.method == "POST" and request.headers.get("origin") == boundary.origin
+            and secrets.compare_digest(request.headers.get("x-console-csrf", ""), boundary.csrf)
+            and request.headers.get("content-type", "").split(";")[0] == "application/json"
+            and not request.query_params, "LOCAL_REQUEST_DENIED", 403)
+
+
+def is_instruction_input(path):
+    if path.startswith("/api/instructions/"):
+        return path.endswith("/submit") or (path.count("/") == 4 and path.endswith(("/append", "/image-upload")))
+    if path.startswith("/api/native-hitl/"):
+        return path.count("/") == 4 and path.rsplit("/", 1)[1] in {
+            "rules", "decisions", "reconcile", "answers", "answer-reconcile", "consents", "consent-reconcile"}
+    return path in {"/api/groups/open", "/api/groups/list"}
+
+
+def is_standing_input(path):
+    # Team skill, MCP and connector writes are bounded in their own modules; the API still decides.
+    return (path in {"/api/agent-template/inspect", "/api/agent-template/select", "/api/agent-template/selection-reconcile"}
+            or is_team_skill_write(path) or is_team_mcp_write(path) or is_connector_write(path))
+
+
+def takes_input(path, console, onboarding):
+    return ((console.instructions is not None and is_instruction_input(path))
+            or (type(console.config) is StandingConsoleConfig and is_standing_input(path))
+            or (onboarding is not None and path == "/api/agents/onboarding"))
+
+
+async def require_empty_body(request):
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        require(len(body) <= 16, "LOCAL_REQUEST_DENIED", 403)
+    require(bytes(body).strip() in {b"{}", b""}, "LOCAL_REQUEST_DENIED", 403)
+
+
+async def admit_request(request, boundary, console, onboarding):
+    check_browser_request(request, boundary)
+    if request.method != "GET":
+        check_write_request(request, boundary)
+        if not takes_input(request.url.path, console, onboarding):
+            await require_empty_body(request)
+
+
+async def expected_error(request, error):
+    # A server refusal passed through by its own code (not_dispatched) may not have a local sentence yet.
+    return JSONResponse({"error": {"code": error.code, "message": MESSAGES.get(error.code, MESSAGES["BACKEND_DENIED"]),
+        "upstream_status": error.upstream_status,
+        "automatic_retry": error.automatic_retry and request.method == "GET",
+        **({"not_dispatched": True} if error.not_dispatched else {}),
+        **({"server_following": True} if error.server_following else {})}}, status_code=error.status)
+
+
+async def unexpected_failure(_request, _error):
+    return JSONResponse({"error": {"code": "LOCAL_FAILURE", "message": MESSAGES["LOCAL_FAILURE"],
+                                 "automatic_retry": False}}, status_code=500)
+
+
+def install_boundary(app, boundary, console, onboarding):
+    @app.middleware("http")
+    async def local_boundary(request, call_next):
+        try:
+            await admit_request(request, boundary, console, onboarding)
+            response = await call_next(request)
+        except ConsoleError as error:
+            response = JSONResponse({"error": {"code": error.code, "message": MESSAGES[error.code],
+                "automatic_retry": False}}, status_code=error.status)
+        response.headers.update(boundary.headers)
+        return response
+
+    app.add_exception_handler(ConsoleError, expected_error)
+    app.add_exception_handler(Exception, unexpected_failure)
+
+
+def install_feature_routes(app, boundary, agents, requested_console):
+    from .desktop import install_desktop_routes
+    install_desktop_routes(app, agents=agents, origin=boundary.origin, cookie=boundary.cookie,
+                           cookie_name=boundary.cookie_name, remote=boundary.remote)
+    install_hitl_routes(app, requested_console)
+    install_group_routes(app, requested_console)
+    install_question_routes(app, requested_console)
+    install_consent_routes(app, requested_console)
+    install_team_skill_routes(app, requested_console)
+    install_team_mcp_routes(app, requested_console)
+    install_team_connector_routes(app, requested_console)
+    install_routine_settings_routes(app, requested_console)
+
+
+def check_agent_start(agent_connections, config, instruction_connection, journal_path):
+    if agent_connections is None:
+        return
+    require(type(agent_connections) is AgentConnections and type(config) is StandingConsoleConfig
+            and type(instruction_connection) is InstructionConnection and journal_path is not None,
+            "AGENT_CONFIGURATION_INVALID")
+    validate_default(agent_connections, config, journal_path, instruction_connection)
+
+
+def release_on_shutdown(console, agents):
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            if console.vault is not None:
+                console.vault.clear()
+            for context in ([console] if agents is None else agents.consoles.values()):
+                context.results.clear()
+            if console.owns_backend:
+                console.backend.close()
+    return lifespan
 
 
 def create_app(config: ConsoleConfig | SteadyConsoleConfig | None = None, journal_path=None, *, token_provider=None,
@@ -1275,560 +1355,34 @@ def create_app(config: ConsoleConfig | SteadyConsoleConfig | None = None, journa
     """
     require(type(port) is int and 1024 <= port <= 65535, "LOCAL_REQUEST_DENIED", 400)
     require(type(prewarm) is bool, "LOCAL_REQUEST_DENIED", 400)
-    if agent_connections is not None:
-        require(type(agent_connections) is AgentConnections and type(config) is StandingConsoleConfig
-                and type(instruction_connection) is InstructionConnection and journal_path is not None,
-                "AGENT_CONFIGURATION_INVALID")
-        validate_default(agent_connections, config, journal_path, instruction_connection)
+    check_agent_start(agent_connections, config, instruction_connection, journal_path)
     prefix = "" if agent_connections is None else "/agents/" + agent_connections.default_agent_id
     console = Console(config, journal_path, token_provider=token_provider, vault=vault,
                       backend=backend, clock=clock, environment=environment, instruction_connection=instruction_connection,
                       api_prefix=prefix)
-    agents = None if agent_connections is None else AgentConsoles(
-        agent_connections, console, lambda config, journal, instructions, api_prefix: Console(
+    agents = onboarding = None
+    if agent_connections is not None:
+        agents = AgentConsoles(agent_connections, console, lambda config, journal, instructions, api_prefix: Console(
             config, journal, token_provider=console.token_provider, vault=console.vault, backend=console.backend,
             clock=clock, environment=environment, instruction_connection=instructions, api_prefix=api_prefix))
-    onboarding = None if agents is None else AgentOnboarding(agents, journal_path, roles_by_server=remote is not None)
-    if onboarding is not None:
+        onboarding = AgentOnboarding(agents, journal_path, roles_by_server=remote is not None)
         onboarding.restore_links()
-    origin = f"http://127.0.0.1:{port}" if remote is None else remote.origin
-    host = origin.split("://", 1)[1]
-    cookie_name = "fa_console" if remote is None else "__Host-fa_console"
-    cookie, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-    desktop_socket = f"ws://127.0.0.1:{port}" if remote is None else f"wss://{host}"
     realtime_host = realtime.endpoint_host(realtime_endpoint)
-    realtime_socket = "" if realtime_host is None else f" wss://{realtime_host}"
-    @asynccontextmanager
-    async def lifespan(_app):
-        try:
-            yield
-        finally:
-            if console.vault is not None:
-                console.vault.clear()
-            for context in ([console] if agents is None else agents.consoles.values()):
-                context.results.clear()
-            if console.owns_backend:
-                console.backend.close()
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    boundary = browser_boundary(port, remote, realtime_host)
+    scope = AgentScope(console, agents)
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=release_on_shutdown(console, agents))
     app.state.console = console
     app.state.agent_consoles = agents
-
-    def selected_agent(request: Request):
-        values = request.headers.getlist("x-console-agent")
-        require(len(values) <= 1, "LOCAL_REQUEST_DENIED", 403)
-        return values[0] if values else None
-
-    def requested_console(request: Request):
-        identity = selected_agent(request)
-        if agents is None:
-            require(identity is None, "AGENT_NOT_AVAILABLE")
-            return console
-        return agents.resolve(identity)
-
-    def scoped_state(value, request):
-        return value if agents is None else agents.decorate(value, selected_agent(request))
-
-    @app.middleware("http")
-    async def local_boundary(request, call_next):
-        try:
-            if remote is not None:
-                remote.admit(request.headers)
-            # After Entra sign-in the browser lands on "/" from a cross-site redirect chain, so only the remote page
-            # load accepts any Sec-Fetch-Site; it performs nothing and every API call stays same-origin only.
-            landing = remote is not None and request.method == "GET" and request.url.path == "/"
-            require(request.headers.get("host") == host
-                    and (landing or request.headers.get("sec-fetch-site", "same-origin") in {"same-origin", "none"})
-                    and (request.headers.get("origin") in {None, origin}),
-                    "LOCAL_REQUEST_DENIED", 403)
-            if request.url.path != "/":
-                # A restarted remote replica issues a new page cookie; the page reloads once and resends nothing.
-                require(secrets.compare_digest(request.cookies.get(cookie_name, ""), cookie),
-                        "LOCAL_REQUEST_DENIED" if remote is None else "REMOTE_SESSION_CHANGED", 403)
-            if request.method != "GET":
-                require(request.method == "POST" and request.headers.get("origin") == origin
-                        and secrets.compare_digest(request.headers.get("x-console-csrf", ""), csrf)
-                        and request.headers.get("content-type", "").split(";")[0] == "application/json"
-                        and not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-                text_input = (console.instructions is not None
-                              and request.url.path.startswith("/api/instructions/")
-                              and request.url.path.endswith("/submit"))
-                append_input = (console.instructions is not None
-                                and request.url.path.startswith("/api/instructions/")
-                                and request.url.path.count("/") == 4 and request.url.path.endswith("/append"))
-                template_input = (type(console.config) is StandingConsoleConfig
-                                  and request.url.path in {"/api/agent-template/inspect", "/api/agent-template/select",
-                                                           "/api/agent-template/selection-reconcile"})
-                image_input = (console.instructions is not None
-                               and request.url.path.startswith("/api/instructions/")
-                               and request.url.path.count("/") == 4
-                               and request.url.path.endswith("/image-upload"))
-                onboarding_input_path = onboarding is not None and request.url.path == "/api/agents/onboarding"
-                hitl_input = (console.instructions is not None and request.url.path.startswith("/api/native-hitl/")
-                              and request.url.path.count("/") == 4
-                              and request.url.path.rsplit("/", 1)[1] in {
-                                  "rules", "decisions", "reconcile", "answers", "answer-reconcile", "consents",
-                                  "consent-reconcile"})
-                group_input = console.instructions is not None and request.url.path in {"/api/groups/open", "/api/groups/list"}
-                # A bounded owner skill decision (2 KiB) or owner draft (128 KiB), capped in team_skills; the API still decides.
-                team_skill_input = type(console.config) is StandingConsoleConfig and is_team_skill_write(request.url.path)
-                # One bounded Team MCP change (16 KiB), capped in team_mcp; the API still decides.
-                team_mcp_input = type(console.config) is StandingConsoleConfig and is_team_mcp_write(request.url.path)
-                # One bounded connector change or Agent switch (8 KiB), capped in team_connectors; the API still decides.
-                connector_input = type(console.config) is StandingConsoleConfig and is_connector_write(request.url.path)
-                if (not text_input and not append_input and not template_input
-                        and not image_input and not onboarding_input_path and not hitl_input and not group_input
-                        and not team_skill_input and not team_mcp_input and not connector_input):
-                    body = bytearray()
-                    async for chunk in request.stream():
-                        body.extend(chunk)
-                        require(len(body) <= 16, "LOCAL_REQUEST_DENIED", 403)
-                    require(bytes(body).strip() in {b"{}", b""}, "LOCAL_REQUEST_DENIED", 403)
-            response = await call_next(request)
-        except ConsoleError as error:
-            response = JSONResponse({"error": {"code": error.code, "message": MESSAGES[error.code],
-                "automatic_retry": False}}, status_code=error.status)
-        # ws: is listed explicitly for the desktop viewer; data: covers noVNC's remote cursor image.
-        # Remote: the Container Apps sign-in layer treats a cookie POST without Origin/Referer as forgery, so the page
-        # sends its own origin as Referer to itself only.
-        response.headers.update({"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
-            "Referrer-Policy": "no-referrer" if remote is None else "same-origin", "Content-Security-Policy":
-                "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-                f"connect-src 'self' {desktop_socket}{realtime_socket}; img-src 'self' blob: data:; frame-ancestors 'none'; "
-                "form-action 'none'; base-uri 'none'"})
-        return response
-
-    @app.exception_handler(ConsoleError)
-    async def expected(request, error):
-        # A server refusal passed through by its own code (not_dispatched) may not have a local sentence yet.
-        return JSONResponse({"error": {"code": error.code, "message": MESSAGES.get(error.code, MESSAGES["BACKEND_DENIED"]),
-            "upstream_status": error.upstream_status,
-            "automatic_retry": error.automatic_retry and request.method == "GET",
-            **({"not_dispatched": True} if error.not_dispatched else {}),
-            **({"server_following": True} if error.server_following else {})}}, status_code=error.status)
-
-    @app.exception_handler(Exception)
-    async def failure(_request, _error):
-        return JSONResponse({"error": {"code": "LOCAL_FAILURE", "message": MESSAGES["LOCAL_FAILURE"],
-                                     "automatic_retry": False}}, status_code=500)
-
-    from .desktop import install_desktop_routes
-    install_desktop_routes(app, agents=agents, origin=origin, cookie=cookie, cookie_name=cookie_name, remote=remote)
-    install_hitl_routes(app, requested_console)
-    install_group_routes(app, requested_console)
-    install_question_routes(app, requested_console)
-    install_consent_routes(app, requested_console)
-    install_team_skill_routes(app, requested_console)
-    install_team_mcp_routes(app, requested_console)
-    install_team_connector_routes(app, requested_console)
-    install_routine_settings_routes(app, requested_console)
-
-    @app.get("/")
-    def page():
-        response = HTMLResponse(typing_prewarm.page(realtime.page(
-            Path(__file__).with_name("index.html").read_text(encoding="utf-8"), realtime_host), prewarm))
-        response.set_cookie(cookie_name, cookie, httponly=True, samesite="strict", path="/", secure=remote is not None)
-        return response
-
-    @app.get("/api/state")
-    def state(request: Request):
-        # Remote only: the signed-in name for display; identity is still checked by the API, not by this label.
-        shown = {} if remote is None else {"remote_user": remote.display_name(request.headers)}
-        if agents is not None and selected_agent(request) is None:
-            return {**agents.bootstrap(), "csrf": csrf, **shown}
-        context = requested_console(request)
-        return {**scoped_state(context.state(request.query_params.get("thread_id")), request), "csrf": csrf, **shown}
-
-    @app.get("/api/realtime/negotiate")
-    async def realtime_negotiate(request: Request, console=Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(realtime.negotiate, console, realtime_host)
-
-    @app.get("/api/agents")
-    async def agent_directory(request: Request):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        require(agents is not None, "AGENT_DIRECTORY_UNAVAILABLE")
-        return await run_in_threadpool(agents.refresh_directory)
-
-    # Onboarding always uses the logged-in default Team entry; a not-yet-ready Agent is never a request target.
-    async def no_input(request):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        require(onboarding is not None, "AGENT_ONBOARDING_UNAVAILABLE")
-
-    @app.get("/api/agents/onboarding")
-    async def agent_onboardings(request: Request):
-        await no_input(request)
-        return await run_in_threadpool(onboarding.list)
-
-    @app.post("/api/agents/onboarding")
-    async def create_agent(request: Request):
-        require(onboarding is not None, "AGENT_ONBOARDING_UNAVAILABLE")
-        raw = bytearray()
-        async for chunk in request.stream():
-            raw.extend(chunk)
-            # Name, a 2048-byte role and up to 12 tool and 4 skill references stay well under this bound.
-            require(len(raw) <= 16384, "AGENT_ONBOARDING_INPUT_INVALID", 413)
-        return await run_in_threadpool(onboarding.create, onboarding_input(bytes(raw)))
-
-    @app.get("/api/agents/onboarding/options")
-    async def agent_onboarding_options(request: Request):
-        await no_input(request)
-        return await run_in_threadpool(onboarding.options)
-
-    @app.get("/api/agents/onboarding/{request_id}")
-    async def agent_onboarding_status(request_id: str, request: Request):
-        await no_input(request)
-        return await run_in_threadpool(onboarding.refresh, request_id)
-
-    @app.post("/api/agents/onboarding/{request_id}/continue")
-    async def continue_agent_onboarding(request_id: str):
-        require(onboarding is not None, "AGENT_ONBOARDING_UNAVAILABLE")
-        return await run_in_threadpool(onboarding.resume, request_id)
-
-    @app.post("/api/agents/onboarding/{request_id}/prepare")
-    async def prepare_agent_onboarding(request_id: str):
-        require(onboarding is not None, "AGENT_ONBOARDING_UNAVAILABLE")
-        return await run_in_threadpool(onboarding.prepare, request_id)
-
-    @app.get("/api/agent-template")
-    async def agent_template(request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        raw = await run_in_threadpool(console.download_template)
-        return Response(raw, media_type="application/json", headers={
-            "Content-Disposition": 'attachment; filename="fa-agent-template.json"',
-            "x-content-sha256": sha(raw),
-        })
-
-    @app.post("/api/agent-template/inspect")
-    async def inspect_template(request: Request, console: Console = Depends(requested_console)):
-        from shared_context.behavior_agent_template import MAX_TEMPLATE_BYTES
-        console.template_token()
-        raw = bytearray()
-        async for chunk in request.stream():
-            raw.extend(chunk)
-            require(len(raw) <= MAX_TEMPLATE_BYTES, "TEMPLATE_INVALID", 413)
-        result = await run_in_threadpool(console.inspect_template, bytes(raw))
-        return JSONResponse(result.model_dump(mode="json"))
-
-    @app.get("/api/agent-template/options")
-    async def template_options(request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        result = await run_in_threadpool(console.template_options)
-        return JSONResponse(result.model_dump(mode="json"))
-
-    @app.get("/api/agent-template/system-prompt")
-    async def template_system_prompt(request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return JSONResponse(await run_in_threadpool(console.template_system_prompt),
-                            headers={"Cache-Control": "no-store"})
-
-    @app.get("/api/agent-template/selection")
-    async def template_selection(request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(console.read_template_selection)
-
-    @app.post("/api/agent-template/select")
-    async def select_template(request: Request, console: Console = Depends(requested_console)):
-        from .agent_template import MAX_SELECTION_BYTES, parse_selection
-        console.template_token()
-        raw = bytearray()
-        async for chunk in request.stream():
-            raw.extend(chunk)
-            require(len(raw) <= MAX_SELECTION_BYTES, "TEMPLATE_SELECTION_INVALID", 413)
-        return await run_in_threadpool(console.select_template, parse_selection(bytes(raw)))
-
-    @app.post("/api/agent-template/selection-reconcile")
-    async def reconcile_template_selection(request: Request, console: Console = Depends(requested_console)):
-        from shared_context.behavior_wire import Command
-        console.template_token()
-        raw = bytearray()
-        async for chunk in request.stream():
-            raw.extend(chunk)
-            require(len(raw) <= 256, "TEMPLATE_SELECTION_INVALID", 413)
-        try:
-            strict_json(bytes(raw))
-            command = Command.model_validate_json(bytes(raw))
-        except (ValueError, TypeError):
-            raise ConsoleError("TEMPLATE_SELECTION_INVALID", 400) from None
-        return await run_in_threadpool(console.reconcile_template_selection, command.request_id)
-
-    @app.get("/favicon.ico")
-    def favicon():
-        return Response(status_code=204)
-
-    @app.post("/api/authenticate")
-    def authenticate():
-        return console.authenticate() if agents is None else agents.authenticate()
-
-    @app.post("/api/authenticate/refresh")
-    def refresh_authentication():
-        return console.authenticate(automatic=True) if agents is None else agents.authenticate(automatic=True)
-
-    @app.post("/api/instructions/{thread_id}/next")
-    def new_instruction(thread_id: str, request: Request, console: Console = Depends(requested_console)):
-        return scoped_state(console.new_instruction(thread_id), request)
-
-    @app.post("/api/instructions/conversations/new")
-    def new_conversation(request: Request, console: Console = Depends(requested_console)):
-        return scoped_state(console.new_conversation(), request)
-
-    @app.post("/api/instructions/prewarm")
-    def prewarm_agent(console: Console = Depends(requested_console)):
-        # README#typing-prewarm: a hint only; no lock, journal entry or state, and the page ignores the answer.
-        return typing_prewarm.forward(console, prewarm)
-
-    @app.post("/api/instructions/{thread_id}/reset")
-    def reset_conversation(thread_id: str, request: Request, console: Console = Depends(requested_console)):
-        return scoped_state(console.reset_conversation(thread_id), request)
-
-    # P06: the workbench no longer prepares, advances, reconciles, or confirms environment transfer.
-    # The server follows versions during submit and reports server_following when the same RID should be retried.
-
-    @app.get("/api/instructions/progress")
-    def instruction_progress(request: Request, console: Console = Depends(requested_console)):
-        return {**scoped_state(console.instruction_progress(request.query_params.get("thread_id")), request), "csrf": csrf}
-
-    @app.get("/api/instructions/models")
-    def instruction_models(request: Request, console: Console = Depends(requested_console)):
-        return {**scoped_state(console.instruction_models(request.query_params.get("thread_id")), request), "csrf": csrf}
-
-    @app.get("/api/instructions/received")
-    def instruction_received(request: Request, console: Console = Depends(requested_console)):
-        query = request.query_params
-        require(set(query) <= {"request_id", "thread_id"} and all(len(query.getlist(key)) == 1 for key in query)
-                and "request_id" in query, "LOCAL_REQUEST_DENIED", 403)
-        return {**scoped_state(console.instruction_received(query["request_id"], query.get("thread_id")), request),
-                "csrf": csrf}
-
-    @app.get("/api/instructions/{task_id}/reply")
-    def instruction_reply(task_id: str, request: Request, console: Console = Depends(requested_console)):
-        return {**scoped_state(console.read_instruction_reply(task_id), request), "csrf": csrf}
-
-    @app.get("/api/instructions/{task_id}/reply.txt")
-    async def instruction_reply_text(task_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        raw, turn_number = await run_in_threadpool(console.download_instruction_reply, task_id)
-        return Response(raw, media_type="text/plain", headers={
-            "Content-Disposition": f'attachment; filename="fa-reply-{turn_number}.txt"',
-            "x-content-sha256": sha(raw),
-        })
-
-    @app.get("/api/instructions/{task_id}/context")
-    async def instruction_context(task_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(console.read_instruction_context, task_id)
-
-    @app.get("/api/instructions/{task_id}/system-prompt")
-    async def instruction_system_prompt(task_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return JSONResponse(await run_in_threadpool(console.instruction_system_prompt, task_id),
-                            headers={"Cache-Control": "no-store"})
-
-    @app.get("/api/instructions/{task_id}/skill-draft")
-    async def instruction_skill_draft(task_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        value = await run_in_threadpool(console.instruction_skill_draft, task_id)
-        return value.model_dump(mode="json")
-
-    @app.get("/api/instructions/{task_id}/skill-draft.md")
-    async def instruction_skill_draft_text(task_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        value = await run_in_threadpool(console.instruction_skill_draft, task_id)
-        require(value.receipt is not None and value.body is not None, "NATIVE_RESULT_MISSING", 409)
-        data = value.body.encode("utf-8")
-        return Response(data, media_type="text/markdown", headers={
-            "Content-Disposition": 'attachment; filename="fa-skill-draft.md"', "x-content-sha256": sha(data),
-            "X-Content-Type-Options": "nosniff"})
-
-    @app.get("/api/instructions/{task_id}/images")
-    async def instruction_images(task_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        value = await run_in_threadpool(console.instruction_images, task_id)
-        return {"entries": [entry.model_dump(mode="json") for entry in value.entries]}
-
-    @app.get("/api/instructions/{thread_id}/platform-history")
-    async def platform_history(thread_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(set(request.query_params) <= {"after", "previous"}
-                and len(request.query_params.multi_items()) == len(request.query_params)
-                and ("previous" not in request.query_params or request.query_params["previous"] == "1"),
-                "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(
-            console.instruction_platform_history, thread_id, after=request.query_params.get("after"),
-            previous=request.query_params.get("previous") == "1")
-
-    @app.get("/api/instructions/{task_id}/images/{version_id}")
-    async def instruction_image(task_id: str, version_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        raw, number = await run_in_threadpool(console.instruction_image, task_id, version_id)
-        return Response(raw, media_type="image/png", headers={
-            "Content-Disposition": f'attachment; filename="fa-screenshot-{number}.png"',
-            "x-content-sha256": sha(raw), "X-Content-Type-Options": "nosniff",
-        })
-
-    @app.get("/api/instructions/{task_id}/delegation")
-    async def instruction_delegation(task_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(console.read_instruction_delegation, task_id)
-
-    @app.get("/api/instructions/{task_id}/agent-messages")
-    async def agent_messages(task_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(read_messages, console, task_id)
-
-    @app.post("/api/instructions/{task_id}/confirm-reply")
-    def confirm_reply(task_id: str, console: Console = Depends(requested_console)):
-        return console.confirm_instruction_reply(task_id)
-
-    @app.post("/api/instructions/{task_id}/cancel")
-    def cancel_instruction(task_id: str, console: Console = Depends(requested_console)):
-        return console.cancel_instruction(task_id)
-
-    @app.get("/api/instructions/{task_id}/cancel-receipt")
-    async def cancellation_receipt(task_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(console.read_cancellation_receipt, task_id)
-
-    @app.post("/api/instructions/{request_id}/submit")
-    async def submit_instruction(request_id: str, request: Request, console: Console = Depends(requested_console)):
-        try:
-            raw = bytearray()
-            async for chunk in request.stream():
-                raw.extend(chunk)
-                require(len(raw) <= 32768, "LOCAL_REQUEST_DENIED", 403)
-            body = strict_json(raw)
-            require(type(body) is dict and {"content", "model"} <= set(body)
-                    and set(body) <= {"content", "model", "attachments", "files", "images"}, "LOCAL_REQUEST_DENIED", 403)
-        except (ValueError, TypeError):
-            raise ConsoleError("INSTRUCTION_INVALID", 400) from None
-        return await run_in_threadpool(console.submit_instruction, request_id, body["content"], body["model"],
-                                       body.get("attachments", ()), body.get("files", ()), body.get("images", ()))
-
-    @app.post("/api/instructions/{request_id}/image-upload")
-    async def upload_instruction_image(request_id: str, request: Request, console: Console = Depends(requested_console)):
-        """B1 PA-08: one browser-converted PNG (at most 512 KiB, sides at most 2000 px), stored before the send."""
-        try:
-            raw = bytearray()
-            async for chunk in request.stream():
-                raw.extend(chunk)
-                require(len(raw) <= MAX_IMAGE_UPLOAD_BODY_BYTES, "LOCAL_REQUEST_DENIED", 403)
-            body = strict_json(raw)
-            require(type(body) is dict and set(body) == {"name", "png_base64"}
-                    and all(type(body[key]) is str for key in body), "LOCAL_REQUEST_DENIED", 403)
-        except (ValueError, TypeError):
-            raise ConsoleError("USER_IMAGE_INPUT_INVALID", 400) from None
-        return await run_in_threadpool(console.upload_instruction_image, request_id, body["name"], body["png_base64"])
-
-    @app.post("/api/instructions/{request_id}/append")
-    async def append_instruction(request_id: str, request: Request, console: Console = Depends(requested_console)):
-        try:
-            raw = await request.body()
-            require(len(raw) <= 32768, "LOCAL_REQUEST_DENIED", 403)
-            body = strict_json(raw)
-            require(type(body) is dict and set(body) == {"append_id", "content"}, "LOCAL_REQUEST_DENIED", 403)
-        except (ValueError, TypeError):
-            raise ConsoleError("INSTRUCTION_INVALID", 400) from None
-        return await run_in_threadpool(console.append_instruction, request_id, body["append_id"], body["content"])
-
-    @app.get("/api/instructions/{request_id}/appends")
-    async def instruction_appends(request_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params and not await request.body(), "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(console.read_instruction_appends, request_id)
-
-    @app.get("/api/instructions/{request_id}/status")
-    async def instruction_status(request_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params and not await request.body(), "LOCAL_REQUEST_DENIED", 403)
-        value = await run_in_threadpool(console.instruction_status, request_id)
-        return {**scoped_state(value, request), "csrf": csrf}
-
-    @app.get("/api/instructions/{request_id}/stream")
-    async def instruction_live_text(request_id: str, request: Request, console: Console = Depends(requested_console)):
-        # RTT B: display-only live text, relayed as it arrives; the page still replaces it with /status.
-        query = request.query_params
-        require(set(query) <= {"starting_after"} and len(query.getlist("starting_after")) <= 1
-                and not await request.body(), "LOCAL_REQUEST_DENIED", 403)
-        raw = query.get("starting_after")
-        require(raw is None or raw.isascii() and raw.isdigit() and len(raw) <= 12, "LOCAL_REQUEST_DENIED", 403)
-        chunks = await run_in_threadpool(console.instruction_live_text, request_id,
-                                         None if raw is None else int(raw))
-        return StreamingResponse(chunks, media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
-
-    @app.get("/api/instructions/{request_id}/progress")
-    async def instruction_public_progress(request_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params and not await request.body(), "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(console.read_instruction_progress, request_id)
-
-    @app.get("/api/instructions/{request_id}/user-text-file-capability")
-    async def instruction_file_capability(request_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(console.instruction_file_capability, request_id)
-
-    @app.get("/api/instructions/{request_id}/files/{filename}")
-    async def instruction_file(request_id: str, filename: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        raw = await run_in_threadpool(console.download_instruction_file, request_id, filename)
-        return Response(raw, media_type="text/plain", headers={
-            "Content-Disposition": f'attachment; filename="{filename}"', "x-content-sha256": sha(raw),
-        })
-
-    @app.get("/api/instructions/{request_id}/attachment-sources")
-    async def instruction_attachment_sources(request_id: str, request: Request, console: Console = Depends(requested_console)):
-        require(not request.query_params, "LOCAL_REQUEST_DENIED", 403)
-        async for chunk in request.stream():
-            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
-        return await run_in_threadpool(console.instruction_attachment_sources, request_id)
-
-    @app.post("/api/tasks/{task_id}/{action}")
-    def operate(task_id: str, action: str, console: Console = Depends(requested_console)):
-        return console.run(task_id, action)
-
-    @app.get("/api/tasks/{task_id}/payload")
-    def download_payload(task_id: str, console: Console = Depends(requested_console)):
-        return Response(console.payload(task_id), media_type="application/octet-stream",
-            headers={"Content-Disposition": 'attachment; filename="verified-payload.json"'})
-
-    @app.get("/api/tasks/{task_id}/summary")
-    def download_summary(task_id: str, console: Console = Depends(requested_console)):
-        return JSONResponse(console.summary(task_id), headers={
-            "Content-Disposition": 'attachment; filename="receipt-summary.json"'})
-
+    install_boundary(app, boundary, console, onboarding)
+    # FastAPI matches in this order; these calls keep the routes' registration sequence.
+    install_feature_routes(app, boundary, agents, scope.console)
+    install_page_routes(app, boundary, scope, realtime_host, prewarm)
+    install_agent_routes(app, agents, onboarding)
+    install_template_routes(app, scope.console)
+    install_session_routes(app, console, agents)
+    install_conversation_routes(app, scope, boundary, prewarm)
+    install_reply_read_routes(app, scope.console)
+    install_turn_routes(app, scope, boundary)
+    install_file_routes(app, scope.console)
+    install_task_routes(app, scope.console)
     return app

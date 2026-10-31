@@ -15,7 +15,7 @@ import pytest
 from shared_context.behavior_operations import _write
 from shared_context.behavior_store import ControlChanges, ControlRequest
 from shared_context.m2_copilot import ToolFailure
-from shared_context.native_hitl import _Intent, validate_native_hitl_history
+from shared_context.native_hitl import _Intent
 from shared_context.native_hitl_wire import (
     ConnectorConsent, ConnectorConsentCreate, ConnectorConsentDecision, ConnectorConsentReadback, NativeHitlCall, NativeHitlEnd,
     NativeHitlPendingQuery,
@@ -349,8 +349,6 @@ def test_connect_cards_are_their_own_records_and_pass_the_history_reader(hitl, t
         await binding
         await case.gate.close()
     asyncio.run(check())
-    kinds = {type(value).__name__ for value in validate_native_hitl_history(inventory(hitl), hitl.config).values()}
-    assert {"ConnectorConsentPending", "_ConsentDecision", "_TurnIndex"} <= kinds
 
 
 def test_the_wire_keeps_one_step_and_no_link_for_a_revoked_connection():

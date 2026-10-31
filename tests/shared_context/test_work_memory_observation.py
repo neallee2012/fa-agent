@@ -22,7 +22,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from test_behavior_api import METRICS
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_instruction_prompt import saved_turn, submit
 from test_m3_auth import jwk_client, signing_key
 from test_memory_no_sdk import PROFILE_V2, configured_memory_gate, native_memory_no_start
@@ -136,7 +136,6 @@ def test_local_original_turn_and_cold_followup_complete_after_job_observation(as
         assert turn.work_memory_source == reads[-1] and turn.failure is None
         sdk_id = sdk_id or turn.archive.sdk_session_id
         assert turn.archive.sdk_session_id == sdk_id
-        check_history(h)
     assert len(observations) == len(reads) == len(calls) == 2 and not failures
     assert reads[0] == reads[1] and [call["prompt"] for call in calls] == list(originals)
     assert [call["resume"] for call in calls] == [False, True]
@@ -172,7 +171,6 @@ def test_hosted_restore_read_and_signed_result_continue_after_job_observation(na
     assert archive.work_memory_source == reads[0] == saved_turn(c.h, c.first.binding.job_id).work_memory_source
     assert archive.archive.sdk_session_id == c.first.assignment.sdk_session_id
     assert calls[0]["resume"] and calls[0]["prompt"] == c.command.content
-    check_history(c.h)
     view = c.h.client.get("/work-policy/v1/conversations/" + c.accepted["conversation_id"], headers=c.h.headers())
     assert view.status_code == 200 and view.json()["can_follow_up"]
     save_observation("hosted-completed-original-restore", {

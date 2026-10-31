@@ -153,7 +153,7 @@ class RuntimeBinding(_Model):
         if (
             self.agent_oid != self.owner.principal_id or self.agent_oid == self.human_oid
             or self.route.tenant_id != self.tenant_id or self.route.recipient_id != self.human_oid
-            or self.route.channel_id not in {INBOX_CHANNEL_ID, "msteams"}
+            or self.route.channel_id != INBOX_CHANNEL_ID
             or any(len(set(items)) != len(items) for items in (self.source_ids, self.claim_ids, self.allowed_input_refs))
             or len({job.job_id for job in self.registered_jobs}) != len(self.registered_jobs)
             or len({job.work.work_id for job in self.registered_jobs}) != len(self.registered_jobs)
@@ -295,7 +295,6 @@ class BehaviorRuntime:
         if not bindings or len(bindings) > 16 or len({b.binding_id for b in bindings}) != len(bindings):
             raise Problem(422, "BEHAVIOR_CONFIGURATION", "one to sixteen unique server bindings are required")
         self.dep, self.store, self.clock, self.mode = dependencies, dependencies.store, clock, mode
-        self.teams_metrics = None
         self.work_policy = None
         self.historical_binding_ids = frozenset()
         try:
@@ -392,13 +391,10 @@ class BehaviorRuntime:
         return tuple(dict.fromkeys((
             runtime_key("policy", binding.binding_id), control_key("owner", binding.owner.owner_record_id),
             control_key("policy", binding.owner.policy_id), control_key("budget", binding.owner.root_budget_id),
-            *(self.teams_metrics.gate_keys(binding) if self.teams_metrics is not None else ()),
             *(self.work_policy.gate_keys(binding) if self.work_policy is not None else ()),
         )))
 
     def _state(self, binding, rows, *, use="execute"):
-        if self.teams_metrics is not None:
-            self.teams_metrics.check_state(binding, rows)
         from .behavior_work_policy import PerWorkRuntimePolicy,WorkPolicyControl
         policy_key = runtime_key("policy", binding.binding_id)
         scoped = rows[policy_key] is not None and rows[policy_key].payload["data"].get(
@@ -437,8 +433,6 @@ class BehaviorRuntime:
             or principal.oid != (binding.human_oid if principal.kind == "human" else binding.agent_oid)
         ):
             raise Problem(403, "BEHAVIOR_BINDING_DENIED", "principal is not assigned to this binding")
-        if self.teams_metrics is not None:
-            self.teams_metrics.check_action(binding, action)
         if binding_id in self.historical_binding_ids:
             if action != "read" or not historical_status:
                 raise Problem(403, "CHANNELS_RETIRED_BINDING", "原已結案 binding 只保留狀態與專用回條讀取，不恢復來源或執行權")
@@ -452,25 +446,14 @@ class BehaviorRuntime:
         return binding, policy, context
 
     def refresh_bindings(self,binding_id=None):
-        if self.teams_metrics is not None:
-            self.teams_metrics.refresh()
         if self.work_policy is not None:
             self.work_policy.refresh(binding_id)
-
-    def delivery_for(self, binding):
-        if binding.route.channel_id == INBOX_CHANNEL_ID:
-            return self.dep.delivery
-        if self.teams_metrics is None:
-            raise Problem(403, "DELIVERY_CHANNEL_MISMATCH", "沒有 installed channel registry")
-        return self.teams_metrics.channel.core
 
     def delivery_for_obligation(self, obligation_id):
         key = control_key("delivery-obligation", obligation_id)
         ob = self.dep.delivery._row(self.store.read_snapshot((key,)), key, _Obligation)
         if ob.route.channel_id == INBOX_CHANNEL_ID:
             return self.dep.delivery
-        if self.teams_metrics is not None:
-            return self.delivery_for(self.teams_metrics.for_obligation(obligation_id).binding)
         raise Problem(403, "DELIVERY_CHANNEL_MISMATCH", "交付責任不屬於已安裝通道")
 
     def resolve_owner(self, owner_record_id: str, *, binding_id=None) -> ExecutionContext:
@@ -548,10 +531,7 @@ class BehaviorRuntime:
         for binding in self.bindings.values():
             if binding.binding_id in self.historical_binding_ids:
                 continue
-            # Revoked/expired Teams work still needs its receipt-only lane.
-            # Current policy is enforced again at admission and every effect.
-            if self.teams_metrics is None or binding.route.channel_id != "msteams":
-                self._state(binding, self.store.read_snapshot(self._gate_keys(binding)))
+            self._state(binding, self.store.read_snapshot(self._gate_keys(binding)))
             index = runtime_key("plan-index", binding.binding_id)
             _row(self.store.read_snapshot((index,)), index, _PlanIndex)
 
@@ -1428,8 +1408,6 @@ class BehaviorRuntime:
             peer_status = advance(self, binding)
             if peer_status is not None:
                 return peer_status
-        if self.teams_metrics is not None and binding.route.channel_id == "msteams":
-            self.teams_metrics.ensure_enqueued(binding)
         context = self.store.consistent_read(lambda: self.resolve_owner(binding.owner.owner_record_id,binding_id=binding_id))
         job = self.dep.workers.inspect(binding.job_id)
         if (job.state in {"starting", "running", "capacity_uncertain"} and not job.cancel_requested
@@ -1446,12 +1424,10 @@ class BehaviorRuntime:
                 self.dep.workers.reconcile(binding.job_id, context)
         job = self.dep.workers.inspect(binding.job_id)
         if job.state in {"succeeded", "failed", "cancelled"}:
-            delivery = self.delivery_for(binding)
+            delivery = self.dep.delivery
             if not job.result_forwarded:
                 self.dep.workers.forward_result(binding.job_id, context, delivery)
-            prepared = DeliveryConsumer(delivery).consume(binding.obligation_id, context, "behavior-api-consumer")
-            if binding.route.channel_id == "msteams":
-                self.teams_metrics.deliver(binding, prepared)
+            DeliveryConsumer(delivery).consume(binding.obligation_id, context, "behavior-api-consumer")
             if getattr(self, "agent_message_composition", None) is not None:
                 from .behavior_agent_message_runtime import complete_origin
                 complete_origin(self, binding)
@@ -1506,8 +1482,6 @@ class BehaviorRuntime:
         self._require_controller(controller)
         if type(limit) is not int or not 1 <= limit <= 32:
             raise Problem(422, "WORKER_SCAN_LIMIT", "runtime controller tick must be bounded to 1..32")
-        if self.teams_metrics is not None and self.work_policy is None:
-            return self.teams_metrics.drain(controller, limit=limit)
         workers = self.dep.workers
         pending = set(workers.pending())
         parks = []
@@ -1563,8 +1537,6 @@ class BehaviorRuntime:
 
     def fetch(self, binding_id, command: wire.Command, principal, *, continuation=False):
         binding, policy, context = self.authorize(binding_id, principal, "read")
-        if binding.route.channel_id != INBOX_CHANNEL_ID:
-            raise Problem(403, "DELIVERY_CHANNEL_MISMATCH", "Teams 交付不可透過 pull ACK 履行")
         from .behavior_result_delivery import continuation_key
         key = continuation_key(binding_id)
         if (not continuation and self.work_policy is not None and binding_id in self.work_policy.records

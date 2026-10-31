@@ -1,7 +1,6 @@
 """Bounded admission/obligation/outbox contract core. actual_environment=NOT_RUN.
 
-Model invocation is CLOSED. A separately registered Teams REST Adapter supports
-guarded offline send/receipt contracts; native Teams remains CLOSED. The supported native channel is
+Model invocation is CLOSED. The supported native channel is
 the authenticated PullInbox, with a durable, non-model DeliveryConsumer below.
 Native admission additionally requires that concrete adapter and independently
 verified, persisted deployment readiness. Offline registrations remain explicit;
@@ -27,8 +26,7 @@ unknown-send retry are deliberately unsupported. Receipts for older ack/progress
 versions can be retained without fulfilling the current final.
 
 Normal control, attention, deterministic notification and fulfillment credits
-are reserved separately. Model repair uses the existing root budget in the same
-EGT, is limited to two reservations, and cannot spend these notification credits.
+are reserved separately.
 No reservation is refunded on failure/unknown. These are finite logical credits,
 not a storage-capacity, cost, fairness or F18-F20 guarantee.
 
@@ -291,10 +289,6 @@ class DueCompletion(DueRequest):
     pass
 
 
-class ModelRepairRequest(DueRequest):
-    attempt_id: Identifier
-
-
 class ScanCursor(_Model):
     root_budget_id: Identifier
     owner_record_id: Identifier
@@ -470,7 +464,7 @@ class _Due(_Bound):
 
 
 M = TypeVar("M", bound=StrictModel)
-Command = AdmissionRequest | WorkResultRequest | MessageRequest | ReceiptRequest | DueRequest | ModelRepairRequest | ScanRequest
+Command = AdmissionRequest | WorkResultRequest | MessageRequest | ReceiptRequest | DueRequest | ScanRequest
 
 
 def _json(value: object) -> bytes:
@@ -541,10 +535,8 @@ class DeliveryCore:
             raise Problem(403, "DELIVERY_NATIVE_DISABLED", "native storage/protection/consumer/timer integration is not installed")
         if self.registration.mode == "native":
             from .behavior_inbox import PullInbox
-            from .teams_delivery import TeamsDeliveryAdapter
-
             adapter = self.registration.channel_adapter
-            if not isinstance(adapter, PullInbox) and type(adapter) is not TeamsDeliveryAdapter:
+            if not isinstance(adapter, PullInbox):
                 raise Problem(403, "DELIVERY_NATIVE_DISABLED", "the concrete authenticated pull channel is required")
             adapter.check_structure(self)
         elif self.registration.mode != "offline_contract":
@@ -689,7 +681,7 @@ class DeliveryCore:
         context = _check(context, ExecutionContext)
         if type(command) not in (
             AdmissionRequest, WorkResultRequest, MessageRequest, ReceiptRequest,
-            DueRequest, DueCompletion, ModelRepairRequest, ScanRequest,
+            DueRequest, DueCompletion, ScanRequest,
         ):
             raise Problem(422, "DELIVERY_INVALID_DATA", "unknown delivery transition")
         command = _check(command, type(command))
@@ -724,13 +716,6 @@ class DeliveryCore:
             elif isinstance(command, ReceiptRequest):
                 action, ids = "receipt", (command.obligation_id, command.delivery_id, command.evidence_id)
                 common += [control_key("delivery-outbox", command.delivery_id), *self._quota_keys(context)]
-            elif isinstance(command, ModelRepairRequest):
-                action, ids = "model-repair", (command.obligation_id, command.attempt_id)
-                common += [
-                    control_key("budget", context.root_budget_id), control_key("policy", context.policy_id),
-                    self._quota_keys(context)[2],
-                    control_key("delivery-due", command.obligation_id, str(command.generation)),
-                ]
             elif isinstance(command, DueCompletion):
                 action, ids = "complete-due", (command.obligation_id, str(command.generation))
                 common += [control_key("delivery-due", command.obligation_id, str(command.generation))]
@@ -775,12 +760,6 @@ class DeliveryCore:
         instruction=record is not None and record.profile.instruction is not None
         readiness = None if instruction else self._readiness()
         registration, config = self._enabled()
-        if config.channel.channel_id == "msteams":
-            from .teams_delivery import TeamsDeliveryAdapter
-
-            if type(registration.channel_adapter) is not TeamsDeliveryAdapter:
-                raise Problem(403, "TEAMS_REGISTRATION_DENIED", "Teams admission requires its concrete versioned adapter")
-            registration.channel_adapter.check_structure(self)
         if registration.verify_ingress is None:
             raise Problem(403, "DELIVERY_INGRESS_DISABLED", "authenticated ingress verification is missing")
         actor = _check(registration.verify_ingress(command.ingress_evidence_id), VerifiedIngress)
@@ -1001,15 +980,8 @@ class DeliveryCore:
         command, context = _command(command, ReceiptRequest), _check(context, ExecutionContext)
         request = self.request_for(command, context)
         registration, config = self._enabled()
-        from .teams_delivery import TeamsDeliveryAdapter
-
-        concrete_teams = type(registration.channel_adapter) is TeamsDeliveryAdapter
-        if config.channel.channel_id == "msteams" and not concrete_teams:
-            raise Problem(403, "TEAMS_REGISTRATION_DENIED", "Teams receipts require the concrete HTTP receipt verifier")
-        if concrete_teams:
-            registration.channel_adapter.check_structure(self)
         verifier = (registration.channel_adapter.verify_receipt
-                    if registration.mode == "native" or concrete_teams else registration.verify_receipt)
+                    if registration.mode == "native" else registration.verify_receipt)
         if verifier is None:
             raise Problem(403, "DELIVERY_RECEIPT_VERIFIER_DISABLED", "receipt verification is not installed")
         proof = _check(verifier(command.evidence_id), VerifiedDeliveryReceipt)
@@ -1204,80 +1176,7 @@ class DeliveryCore:
 
         return self._index_transact(request, decide, context, obligation_id=command.obligation_id)
 
-    def reserve_model_repair(self, command: ModelRepairRequest, context: ExecutionContext) -> Record:
-        command, context = _command(command, ModelRepairRequest), _check(context, ExecutionContext)
-        request = self.request_for(command, context)
-        config = self._enabled()[1]
-        if config.model_repair_contract is None:
-            raise Problem(403, "DELIVERY_MODEL_REPAIR_DISABLED", "controlled model entry/root-budget contract is not installed")
-        readiness = self._readiness()
-
-        def decide(snapshot: Snapshot):
-            ob = self._obligation(snapshot, command.obligation_id, context)
-            due = self._row(snapshot, control_key("delivery-due", ob.obligation_id, str(command.generation)), _Due)
-            work = self._work(snapshot, ob)
-            budget_key = control_key("budget", context.root_budget_id)
-            budget = self._row(snapshot, budget_key, BudgetRecord)
-            policy = self._row(snapshot, control_key("policy", context.policy_id), PolicyRecord)
-            root = self._row(snapshot, self._quota_keys(context)[2], QuotaRecord)
-            now = self._now()
-            if not readiness.observed_at <= now < readiness.expires_at:
-                raise Problem(403, "DELIVERY_PREREQUISITES_MISSING", "current model-repair control prerequisites are unavailable")
-            if (
-                ob.fulfillment != "pending" or ob.automation != "active"
-                or not ob.due_pending or command.generation != ob.generation or due.state != "pending"
-            ):
-                raise Problem(409, "DELIVERY_DUE_STALE", "model repair is not attached to an active due")
-            if work.result is not None:
-                raise Problem(409, "DELIVERY_USE_SAVED_RESULT", "use the saved result without a model")
-            if (
-                budget.root_budget_id != ob.root_budget_id or policy.policy_id != context.policy_id
-                or not policy.active or policy.revision != ob.policy_revision
-                or root.scope_kind != "root" or root.scope_id != ob.root_budget_id or root.root_request_id != ob.root_request_id
-            ):
-                raise Problem(403, "DELIVERY_MODEL_BUDGET_UNBOUND", "current model budget/policy binding differs")
-            denied = (
-                ob.model_attempts_reserved >= 2 or not budget.active or budget.remaining_attempts < 1
-                or budget.remaining_units < config.model_repair_units or now >= ob.deadline
-            )
-            if denied:
-                if not ob.attention_credit:
-                    raise Problem(429, "DELIVERY_MODEL_REPAIR_STOPPED", "model repair is exhausted; responsibility remains")
-                ob = _update(ob, automation="needs_attention", attention_reason="model_limit_or_budget", attention_credit=0)
-                return ControlChanges(writes=(
-                    self._write(control_key("delivery-obligation", ob.obligation_id), ob),
-                    *self._index_writes(snapshot, context, ob),
-                ), result=self._result(reservation="denied", reason="model_limit_or_budget", model_attempts_reserved=ob.model_attempts_reserved))
-            ob = _update(ob, model_attempts_reserved=ob.model_attempts_reserved + 1)
-            return ControlChanges(writes=(
-                self._write(control_key("delivery-obligation", ob.obligation_id), ob),
-                self._write(budget_key, _update(
-                    budget, remaining_attempts=budget.remaining_attempts - 1,
-                    remaining_units=budget.remaining_units - config.model_repair_units,
-                )),
-                self._write(control_key("delivery-model-attempt", ob.obligation_id, command.attempt_id), {
-                    **self._bound_data(), "kind": "delivery_model_reservation",
-                    "obligation_id": ob.obligation_id, "attempt_id": command.attempt_id,
-                    "generation": ob.generation, "owner": context.model_dump(mode="json"),
-                    "root_budget_id": ob.root_budget_id, "reserved_units": config.model_repair_units,
-                    "state": "reserved_or_unknown", "evidence_mode": "offline_contract",
-                }, "create"),
-            ), result=self._result(reservation="held", model_attempts_reserved=ob.model_attempts_reserved))
-
-        receipt = self._index_transact(request, decide, context, obligation_id=command.obligation_id)
-        if receipt.payload["result"]["reservation"] == "denied":
-            raise Problem(429, "DELIVERY_MODEL_REPAIR_STOPPED", "model repair stopped; non-model notification credits remain reserved",
-                          request_id=request.request_id, request_digest=request.request_digest)
-        return receipt
-
     def send(self, delivery_id: str) -> Record:
-        from .teams_delivery import TeamsDeliveryAdapter
-
-        registration = self.registration
-        if registration is not None and type(registration.channel_adapter) is TeamsDeliveryAdapter:
-            self._enabled()
-            registration.channel_adapter.check_structure(self)
-            return registration.channel_adapter.send(delivery_id)
         raise Problem(403, "DELIVERY_SEND_DISABLED", "outbound sends are disabled; use authenticated PullInbox.fetch")
 
 
@@ -1507,15 +1406,13 @@ class DeliveryConsumer:
 
     def drain(
         self, root_budget_id: str, resolve_context: Callable[[str], ExecutionContext],
-        worker_id: str, *, limit: int = 4, select_core: Callable[[str], DeliveryCore] | None = None,
+        worker_id: str, *, limit: int = 4,
         pending_binding: RuntimeBinding | None = None,
     ) -> tuple[dict, ...]:
         if type(limit) is not int or not 1 <= limit <= 16:
             raise Problem(422, "DELIVERY_SCAN_LIMIT", "drain limit must be 1..16")
         core = self.core
         if pending_binding is not None:
-            if select_core is not None:
-                raise Problem(403, "DELIVERY_DEFER_SCOPE_DENIED", "multi-channel delivery cannot defer an assistant page")
             if self._defer_pending(root_budget_id, resolve_context, pending_binding):
                 return ()
         index_key = control_key("delivery-index", root_budget_id)
@@ -1570,11 +1467,7 @@ class DeliveryConsumer:
             try:
                 ob_key = control_key("delivery-obligation", obligation_id)
                 ob = core._row(authority_snapshot(core.store, (ob_key,)), ob_key, _Obligation)
-                selected = core if select_core is None else select_core(obligation_id)
-                if (not isinstance(selected, DeliveryCore) or selected.store is not core.store
-                        or selected.configuration_digest() != core.configuration_digest()):
-                    raise Problem(403, "DELIVERY_AUTHORITY_MISMATCH", "selected channel must share the original root authority")
-                results.append(DeliveryConsumer(selected).consume(
+                results.append(DeliveryConsumer(core).consume(
                     obligation_id, resolve_context(ob.owner_record_id), worker_id))
             except Problem as exc:
                 results.append(core._result(obligation_id=obligation_id, problem=exc.body["error"]["code"]))

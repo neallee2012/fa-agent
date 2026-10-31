@@ -119,7 +119,8 @@ def test_hosted_only_changes_do_not_require_a_fake_core_code_change(monkeypatch)
         "properties": {"latestReadyRevisionName": module.STAGE["api_app"] + "--aaaaaaa-r1-1",
                        # Stage API read back min 1 on 2026-10-08 (README#native-routines-stage guard).
                        "template": {"scale": {"minReplicas": 1}, "containers": [{"env": [
-                           {"name": "FA_NATIVE_SESSION_GUARD_ENFORCE", "value": "1"}]}]},  # stage.json: 2d-i on
+                           {"name": "FA_NATIVE_SESSION_GUARD_ENFORCE", "value": "1"},  # stage.json: 2d-i on
+                           {"name": module.API_CONFIG_ENV, "value": module._config_bytes().decode()}]}]},
                        "configuration": {"secrets": secrets, "activeRevisionsMode": "Single"}}})
     monkeypatch.setattr(module.subprocess, "run", lambda *_a, **_k: SimpleNamespace(
         returncode=0, stdout="a" * 40, stderr=""))
@@ -242,6 +243,26 @@ def test_seed_matches_the_complete_definition_not_an_older_same_build_flag_set()
     matched = module._of_definition(project, agent["name"], "same-code", module.definition_sha256(desired))
     assert [item["version"] for item in matched] == ["5"]
     assert desired["environment_variables"]["FA_NATIVE_HITL_ENABLED"] == "1"
+
+
+def test_console_overlay_over_a_first_install_replaces_each_flag_once(monkeypatch):
+    # azd's first install sets these through web-console.bicep; the first upgrade then overlays the same names.
+    module = stage_module()
+    patched = []
+    original = [{"name": "FA_NATIVE_HITL_ENABLED", "value": "0"}, {"name": "FA_CONSOLE_PREWARM", "value": "1"}]
+
+    def rest(method, _path, body=None):
+        if method == "PATCH":
+            patched.append(body)
+        return {"properties": {"latestRevisionName": "offline-console--offline",
+                               "template": {"containers": [{"name": "console", "image": "old:image",
+                                                           "env": original, "resources": {}}]}}}
+
+    monkeypatch.setattr(module, "rest", rest)
+    module._update_container("containerApps", "offline-console", "new:image", "offline",
+                             environment_overrides={"FA_NATIVE_HITL_ENABLED": "1"})
+    assert patched[0]["properties"]["template"]["containers"][0]["env"] == [
+        {"name": "FA_NATIVE_HITL_ENABLED", "value": "1"}, {"name": "FA_CONSOLE_PREWARM", "value": "1"}]
 
 
 def test_console_flag_overlay_preserves_existing_secret_references_and_identity(monkeypatch):

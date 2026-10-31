@@ -19,7 +19,7 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 from test_read_history_profile import BODY as FILE_BODY, REPLY, history_turn
 from test_sdk_compaction_product import open_turn, ordinary, settle
@@ -84,7 +84,6 @@ def test_selected_new_conversation_reads_history_and_saves_one_unapproved_draft(
         settle(turn, ordinary(turn.assignment.sdk_session_id))
         archived = h.store.read_snapshot((key("text-archive", turn.binding.job_id),))[key("text-archive", turn.binding.job_id)]
         assert archived.payload["data"]["skill_draft_receipt"] == receipt.model_dump(mode="json")
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -114,7 +113,6 @@ def test_selected_draft_upload_unknown_reconciles_only_the_original_ids(assistan
         again = post_draft(turn)
         assert again.status_code == 200, again.text
         assert counts == {"create": 1, "upload": 1}
-        check_history(h)
     finally:
         turn.client.close()
 

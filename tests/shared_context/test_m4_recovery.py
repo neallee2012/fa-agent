@@ -7,10 +7,10 @@ import httpx
 import pytest
 from azure.ai.projects.models import MemoryStoreDefaultDefinition
 
-from shared_context import m4_config
+from legacy_m2_m4 import m4_config
 from shared_context.m4_fixtures import ALIASES
-from shared_context.m2_gateway import M2Gateway
-from shared_context.m4_context import M4ContextService, SeedFixture
+from legacy_m2_m4.m2_gateway import M2Gateway
+from legacy_m2_m4.m4_context import M4ContextService, SeedFixture
 from shared_context.errors import Problem
 from conftest import A, FakeMemory
 from test_m2_gateway import Credential, PROJECT

@@ -310,38 +310,3 @@ def read_team_authority(store, domain, team_id):
             ledger.tenant_id, ledger.team_id, ledger.authority_domain) != (value.tenant_id, team_id, domain):
         raise Problem(409, "TEAM_AUTHORITY_INVALID", "stored Team rows differ from their keys")
     return value, ledger
-
-
-def validate_team_authority_history(inventory, config):
-    """Recognize only exact Team settings/ledger pairs created by their original receipt."""
-    from .behavior_recovery_history import _Inventory
-
-    view = _Inventory(inventory, config)
-    domain, tenant = config.table.scope.authority_domain, str(config.identity.tenant_id)
-    classified = {}
-    for key, row in inventory.rows.items():
-        if row.payload["data"].get("kind") != "team_authority":
-            continue
-        value = view.row(key, TeamAuthority)
-        ownership = view.row(team_key(value.tenant_id, value.team_id), TeamOwnership)
-        if (key != team_authority_key(domain, value.team_id) or value.authority_domain != domain
-                or value.tenant_id != tenant or value.team_id == config.identity.team_id
-                or value.operator_oid != str(config.identity.human_oid) or ownership.owner_oid != value.owner_oid):
-            raise Problem(409, "TEAM_AUTHORITY_INVALID", "retained Team settings differ from their original scope")
-        lkey = team_ledger_key(domain, value.team_id)
-        ledger = view.row(lkey, TeamUsageLedger)
-        created = value.created()
-        view.receipt(_request(created), (key, lkey),
-                     exact={key: view.image_hash(key, created), lkey: view.image_hash(lkey, _initial_ledger(value))},
-                     result=_result(created))
-        for count, step in enumerate(value.narrowings, start=1):
-            image = value.through(count)
-            view.receipt(_narrow_request(value, step), (key,), exact={key: view.image_hash(key, image)},
-                         result=_narrow_result(image))
-        if ledger != _initial_ledger(value):
-            raise Problem(409, "TEAM_AUTHORITY_INVALID", "a Team usage ledger has no supported update yet")
-        classified.update({key: value, lkey: ledger})
-    for key, row in inventory.rows.items():
-        if row.payload["data"].get("kind") == "team_usage_ledger" and key not in classified:
-            raise Problem(409, "TEAM_AUTHORITY_INVALID", "a Team usage ledger has no original Team settings")
-    return classified

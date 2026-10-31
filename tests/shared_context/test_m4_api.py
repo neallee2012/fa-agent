@@ -18,13 +18,13 @@ from azure.ai.projects import AIProjectClient
 from fastapi.testclient import TestClient
 
 from conftest import A, B, C, TENANT, FakeMemory
-from shared_context.api import create_app
+from legacy_m2_m4.api import create_app
 from shared_context.errors import Problem
-from shared_context.m2_gateway import M2Gateway
+from legacy_m2_m4.m2_gateway import M2Gateway
 from shared_context.m3_models import ApprovalInput, CreateArtifact, VersionInput
-from shared_context.m4_api import MAX_M4_BODY_BYTES
-from shared_context.m4_config import ENV_NAMES, MAX_REQUESTS, MEMORY_STORE, MODEL, POLICY_SHA256, M4Settings
-from shared_context.m4_context import FIXTURE_ACTORS, M4ContextService, M4FoundryMemory, SeedFixture
+from legacy_m2_m4.m4_api import MAX_M4_BODY_BYTES
+from legacy_m2_m4.m4_config import ENV_NAMES, MAX_REQUESTS, MEMORY_STORE, MODEL, POLICY_SHA256, M4Settings
+from legacy_m2_m4.m4_context import FIXTURE_ACTORS, M4ContextService, M4FoundryMemory, SeedFixture
 from shared_context.m4_fixtures import (
     ALIASES, CASES, CONTEXT_BYTES_LIMIT, FIXTURE_SHA256, GOLD, POLICY_ARTIFACT,
     POLICY_TEXT, POLICY_VERSION, PROMPT, PROMPT_TOKENS_LIMIT, SUITE, encoded, fixtures,
@@ -542,7 +542,7 @@ def test_m4_settings_are_disabled_by_default_fixed_and_all_or_none():
     ):
         with pytest.raises(ValueError):
             M4Settings.from_env({**M4_ENV, name: value})
-    with patch("shared_context.m4_config.fixtures", return_value={"changed": True}):
+    with patch("legacy_m2_m4.m4_config.fixtures", return_value={"changed": True}):
         with pytest.raises(ValueError, match="fixture bytes"):
             M4Settings.from_env(M4_ENV)
 

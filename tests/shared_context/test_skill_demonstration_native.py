@@ -26,7 +26,7 @@ from shared_context.m3_auth import HumanApprover
 from shared_context.m3_models import ApprovalInput
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -112,5 +112,4 @@ def test_demonstrated_procedure_becomes_an_approved_skill_used_in_a_separate_con
         later = [item for item in requests if USE in item["users"]]
         assert later and all(DEMO not in item["users"] for item in later)
         assert all("read_skill" in item["tools"] and "save_skill_draft" in item["tools"] for item in later)
-        check_history(h)
     assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"

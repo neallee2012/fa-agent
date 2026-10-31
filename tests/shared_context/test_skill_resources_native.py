@@ -15,7 +15,7 @@ from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_skill_resources_prompt import SKILL_RESOURCES_CAPABILITIES
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -81,4 +81,3 @@ def test_fixed_sdk_loads_manifest_then_exact_resource_without_new_authority(assi
         assert bridges[0]._sdk_stop.graceful and bridges[0]._sdk_stop.runtime_version == "1.0.83"
         archive = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
         assert archive.prompt_assembly.declared_capabilities == SKILL_RESOURCES_CAPABILITIES
-        check_history(h)

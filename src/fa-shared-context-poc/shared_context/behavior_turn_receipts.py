@@ -7,7 +7,7 @@ from typing import Callable, Literal
 
 from pydantic import SecretBytes
 
-from .behavior_agent_worker import AgentTurnAddress, AgentTurnDelivery, AgentVmBinding, AgentWorkerContext
+from .behavior_agent_worker import AgentTurnDelivery, AgentVmBinding
 from .behavior_auth import BehaviorPrincipal
 from .behavior_operations import _Model, _parse, _row, _updated, _write, control_key
 from .behavior_store import BehaviorStore, ControlChanges, ControlRequest, ControlWrite
@@ -357,98 +357,3 @@ class TurnReceiptStore:
                                           "usage_recorded": consumed.usage_recorded})
 
         return self.store.transact(request, consume)
-
-
-def validate_turn_receipt_history(inventory, config):
-    """Classify the new control rows without moving or rewriting old checkpoints/results."""
-    from .behavior_recovery_history import _Inventory
-
-    view = _Inventory(inventory, config)
-    records = {
-        key: view.row(key, TurnTicketRecord) for key, row in inventory.rows.items()
-        if row.payload["data"].get("kind") == "vm_turn_ticket"
-    }
-    creation_hashes = {key: set() for key in records}
-    for receipt in inventory.receipts.values():
-        for key, fingerprint in receipt.payload["writes"]:
-            if key in creation_hashes:
-                creation_hashes[key].add(fingerprint)
-    classified = {}
-    for key, record in records.items():
-        ticket = record.ticket
-        handle = ticket_handle(ticket)
-        if (key != handle.ticket_id or ticket.tenant_id != config.identity.tenant_id
-                or view.image_hash(key, TurnTicketRecord(ticket=ticket)) not in creation_hashes[key]):
-            raise Problem(409, "TURN_RECEIPT_INVALID", "the turn has no original immutable admission write")
-        classified[key] = record
-        skey = start_key(key)
-        if record.started != (skey in inventory.rows):
-            raise Problem(409, "TURN_RECEIPT_INVALID", "the retained ticket and start disagree")
-        if record.started:
-            original = view.row(skey, TurnStartRecord)
-            started = original.start
-            session_reads = ()
-            session_writes = ()
-            from .behavior_assistant import _Session, key as assistant_key
-            from .behavior_workers import JobRecord, worker_key
-            session_key = assistant_key("session", ticket.assignment.session_id)
-            if session_key in inventory.rows:
-                session = view.row(session_key, _Session)
-                job_key = worker_key("job", ticket.assignment.task.job_id)
-                job = view.row(job_key, JobRecord)
-                if (session.vm_turn_ticket_id != key or session.ticket_digest is not None
-                        or session.assignment != ticket.assignment or session.execution != job.binding
-                        or job.spec.input != ticket.assignment.task.model_dump_json().encode()):
-                    raise Problem(409, "TURN_RECEIPT_INVALID", "the original begin did not create its SDK session")
-                session_reads = (session_key, job_key,
-                    control_key("owner", session.execution.owner.owner_record_id),
-                    worker_key("pool", config.workers.workspace_id, session.execution.job_id))
-                session_writes = (session_key,)
-                classified[session_key] = session
-            expected = ControlRequest(
-                request_id=skey,
-                request_digest=digest([
-                    BeginTurn(address=ticket.address, ticket=handle).model_dump(mode="json"),
-                    started.worker.model_dump(mode="json"), started.actor_id,
-                ]),
-                read_set=(key, skey, *session_reads),
-            )
-            if (started.ticket != handle or started.address != ticket.address or started.worker.vm != ticket.vm
-                    or started.worker.caller_oid != ticket.agent_oid or started.job_id != ticket.assignment.task.job_id
-                    or started.request_id != skey or original.request != expected):
-                raise Problem(409, "TURN_RECEIPT_INVALID", "the original start belongs to another turn or worker")
-            view.receipt(expected, (key, skey, *session_writes), exact={
-                key: view.image_hash(key, TurnTicketRecord(ticket=ticket, started=True)),
-                skey: view.hash(skey),
-            }, result={"start_sha256": digest(started.model_dump(mode="json"))})
-            classified[skey] = original
-        if record.cancel_requested:
-            cancel_id = control_key("vm-turn-cancel", key)
-            from .behavior_workers import JobRecord, worker_key
-            job_key = worker_key("job", ticket.assignment.task.job_id)
-            cancel_receipt = view.receipts.get(cancel_id)
-            extra = (job_key,) if cancel_receipt is not None and job_key in dict(cancel_receipt.writes) else ()
-            if extra:
-                job = view.row(job_key, JobRecord)
-                if not job.cancel_requested or job.spec.input != ticket.assignment.task.model_dump_json().encode():
-                    raise Problem(409, "TURN_RECEIPT_INVALID", "cancelled SDK job no longer matches its original ticket")
-            request = ControlRequest(request_id=cancel_id,
-                                     request_digest=handle.ticket_sha256, read_set=(key, *extra))
-            view.receipt(request, (key, *extra), exact={key: view.hash(key)}, result={"cancel_requested": True})
-        ckey = consumption_key(key)
-        if ckey in inventory.rows:
-            consumed = view.row(ckey, TurnConsumption)
-            if not record.started or consumed.ticket != handle:
-                raise Problem(409, "TURN_RECEIPT_INVALID", "an end was consumed without its original start")
-            view.receipt(ControlRequest(
-                request_id=ckey, request_digest=digest(consumed.model_dump(mode="json")),
-                read_set=(key, skey, ckey),
-            ), (ckey,), exact={ckey: view.hash(ckey)}, result={
-                "end_sha256": consumed.end_sha256, "usage_recorded": consumed.usage_recorded,
-            })
-            classified[ckey] = consumed
-    for key, row in inventory.rows.items():
-        if row.payload["data"].get("kind") in {"vm_turn_ticket", "vm_turn_start", "vm_turn_consumption"} \
-                and key not in classified:
-            raise Problem(409, "TURN_RECEIPT_INVALID", "a VM receipt has no original admitted ticket")
-    return classified

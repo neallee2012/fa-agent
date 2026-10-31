@@ -137,7 +137,7 @@ def read_selection(store, policy, identifier):
             or row.payload["material"] != material(value.model_dump(mode="json")).model_dump(mode="json")):
         raise Problem(409, "PROFILE_SELECTION_INVALID", "stored profile selection differs from its original approved request")
     receipt = store.reconcile(value.request)
-    from .behavior_runtime_transition import _payload_hash
+    from .source_materials import _payload_hash
     if dict(receipt.payload["writes"]).get(key) != _payload_hash(row.payload):
         raise Problem(409, "PROFILE_SELECTION_INVALID", "selection receipt does not cover the retained approval")
     profile_from_template(policy, value.command.template)
@@ -153,7 +153,7 @@ def current_selection(store, policy):
     value = read_selection(store, policy, current.selection_id)
     if current.agent_id != policy.agent_id or row.payload["material"] is not None:
         raise Problem(409, "PROFILE_SELECTION_INVALID", "profile selection pointer differs")
-    from .behavior_runtime_transition import _payload_hash
+    from .source_materials import _payload_hash
     receipt = store.reconcile(value.request)
     if dict(receipt.payload["writes"]).get(key) != _payload_hash(row.payload):
         raise Problem(409, "PROFILE_SELECTION_INVALID", "current selection is not the acknowledged head")
@@ -172,50 +172,6 @@ def choice_for_conversation(control, conversation):
             return None
         return read_selection(control.store, control.policy, previous.profile_selection_id)
     return current_selection(control.store, control.policy)
-
-
-def validate_profile_history(inventory, config, policy):
-    from .behavior_recovery_history import _Inventory
-    from .behavior_work_policy import work_policy_key
-    view = _Inventory(inventory, config)
-    choices = {}
-    for key, row in inventory.rows.items():
-        if row.payload["data"].get("kind") != "conversation_profile_selection":
-            continue
-        value = view.row(key, ConversationProfileSelection, material=True)
-        if value.agent_id != policy.agent_id:
-            continue
-        expected_key = selection_key(policy.authority_domain, value.selection_id, policy.agent_id)
-        expected_request = ControlRequest(
-            request_id=expected_key, request_digest=digest(value.command.model_dump(mode="json")),
-            read_set=(work_policy_key("policy", *policy.scope_ids), work_policy_key("revocation", *policy.scope_ids),
-                      expected_key, head_key(policy.authority_domain, policy.agent_id)),
-        )
-        if (key != expected_key or value.policy_sha256 != policy.sha256 or value.selected_by != config.identity.human_oid
-                or value.selection_id != control_key("conversation-profile-id", *policy.scope_ids, value.command.request_id)
-                or value.request != expected_request):
-            raise Problem(409, "PROFILE_SELECTION_INVALID", "historical profile selection escaped the original scope")
-        profile_from_template(policy, value.command.template)
-        pointer = ConversationProfileHead(selection_id=value.selection_id, agent_id=policy.agent_id)
-        view.receipt(value.request, (key, head_key(policy.authority_domain, policy.agent_id)), exact={
-            key: view.hash(key),
-            head_key(policy.authority_domain, policy.agent_id): view.image_hash(head_key(policy.authority_domain, policy.agent_id), pointer),
-        }, result=selection_result(value))
-        choices[value.selection_id] = value
-    ordered = sorted(choices.values(), key=lambda value: view.receipts[value.request.request_id].guard_revision)
-    previous = None
-    for value in ordered:
-        if value.command.expected_selection_id != previous:
-            raise Problem(409, "PROFILE_SELECTION_INVALID", "historical profile choices do not form the original sequence")
-        previous = value.selection_id
-    key = head_key(policy.authority_domain, policy.agent_id)
-    if ordered:
-        current = view.row(key, ConversationProfileHead)
-        if current.selection_id != previous or current.agent_id != policy.agent_id:
-            raise Problem(409, "PROFILE_SELECTION_INVALID", "current selection is not the latest approved choice")
-    elif key in inventory.rows:
-        raise Problem(409, "PROFILE_SELECTION_INVALID", "profile head lacks its original approval")
-    return choices
 
 
 def selection_result(value):

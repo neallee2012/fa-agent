@@ -28,7 +28,7 @@ from shared_context.behavior_wire import HostedIdentity
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_models, runtime_path
 from test_instruction_prompt import submit
 from test_m3_auth import jwk_client, signing_key
 from test_reviewed_work_memory import configured_memory, reviewed_note, revoke_review, withdraw_source
@@ -166,7 +166,6 @@ def test_memory_refusal_before_sdk_entry_reaches_original_failed_result(assistan
                              json={"request_id": "explicit-memory-reset"}, headers=h.headers())
         assert reset.status_code == 200 and reset.json()["archived"]
         assert h.store.read_snapshot(prior_keys) == prior
-        check_history(h)
         save_proof("local-v2-closed-before-restore", h, binding, constructors=constructors, source_code=failures[0])
     finally:
         first.client.close()
@@ -327,7 +326,6 @@ def test_hosted_memory_disposition_reaches_signed_report_and_original_failure(na
     assert c.h.store.read_snapshot(prior_keys) == old
     assert c.control.records[c.binding.binding_id].profile.instruction.content == c.command.content
     assert_failure_available(c.h, c.binding)
-    check_history(c.h)
     projection = c.h.client.get("/work-policy/v1/conversations/" + c.accepted["conversation_id"], headers=c.h.headers())
     assert projection.status_code == 200 and projection.json()["can_reset"]
     assert not projection.json()["can_follow_up"]
@@ -386,7 +384,6 @@ def test_metadata_capture_is_not_sdk_state_but_unknown_capture_ack_is_not_termin
         result = h.runtime.controller.step(binding.binding_id)
         assert result.state == "failed" and result.result_forwarded
         assert_failure_available(h, binding)
-        check_history(h)
     assert len(captured) == 1 and constructors == [] and h.endpoint.requests == []
     saved = h.store.read_snapshot((key("session", captured[0]),))[key("session", captured[0])]
     assert saved.payload["data"]["work_memory_source"]["claim_version"] == 2
@@ -453,7 +450,6 @@ def test_complete_signed_memory_source_over_response_bound_closes_only_v2_entry(
     from shared_context.behavior_work_memory import WORK_MEMORY_RESPONSE_BYTES
     assert WORK_MEMORY_RESPONSE_BYTES == 24576
     assert_failure_available(h, binding)
-    check_history(h)
     save_proof("complete-source-bound", h, binding, constructors=constructors, source_code="WORK_MEMORY_SOURCE_LIMIT")
 
 
@@ -853,6 +849,5 @@ def test_memory_report_ack_loss_and_replay_use_only_original_sealed_receipt(nati
     assert result.state == "failed" and result.result_forwarded
     assert c.h.store.read_snapshot((rkey, nkey)) == original and constructors == [] and c.provider_requests == []
     assert_failure_available(c.h, c.binding)
-    check_history(c.h)
     save_proof("report-ack-reconciled-original-only", c.h, c.binding, constructors=constructors,
                source_code="SOURCE_WITHDRAWN", observer=observed)

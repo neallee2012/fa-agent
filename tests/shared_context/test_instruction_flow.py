@@ -143,13 +143,6 @@ def instruction_inventory(h):
     return AuthorityInventory(h.store._scope,guard,rows,receipts,hashes)
 
 
-def check_history(h):
-    from shared_context.behavior_instruction import validate_instruction_history
-    config=SimpleNamespace(table=SimpleNamespace(scope=h.store._scope),sha256="f"*64,
-        workers=h.workers.contract,delivery=h.delivery.contract)
-    return validate_instruction_history(instruction_inventory(h),config,tuple(h.runtime.bindings.values()))
-
-
 def test_http_two_turns_use_saved_sdk_context_and_exact_reply_without_ack_gate(assistant,tmp_path,monkeypatch):
     h, control, human, _ = enabled(assistant)
     calls = sdk_io(monkeypatch)
@@ -185,7 +178,6 @@ def test_http_two_turns_use_saved_sdk_context_and_exact_reply_without_ack_gate(a
     assert accepted.status_code==200,accepted.text
     first_result=accepted.json()
     cid=first_result["conversation_id"]
-    check_history(h)
     try:status=h.runtime.controller.step(first_result["binding_id"])
     except Exception:
         pytest.fail("\n".join(failures))
@@ -194,7 +186,6 @@ def test_http_two_turns_use_saved_sdk_context_and_exact_reply_without_ack_gate(a
     assert current.status_code==200,current.text
     assert current.json()["can_follow_up"] is True
     assert current.json()["turns"][0]["model_requests"]==1
-    check_history(h)
     guard=h.store._guard()
     assert post("submit-reconcile",first).json()["status"]["state"]=="succeeded"
     assert h.store._guard()==guard and len(calls)==1
@@ -204,10 +195,8 @@ def test_http_two_turns_use_saved_sdk_context_and_exact_reply_without_ack_gate(a
     accepted2=post("submit",second)
     assert accepted2.status_code==200,accepted2.text
     assert accepted2.json()["conversation_id"]==cid and accepted2.json()["turn_number"]==2
-    check_history(h)
     status2=h.runtime.controller.step(accepted2.json()["binding_id"])
     assert status2.state=="succeeded" and status2.result_forwarded
-    check_history(h)
     assert [c["prompt"] for c in calls]==[first.content,second.content]
     assert calls[0]["sdk_session_id"]==calls[1]["sdk_session_id"] and calls[1]["resume"] is True
     assert calls[1]["messages"][:2]==[
@@ -279,7 +268,6 @@ def test_long_reference_get_and_original_ack_once(assistant,monkeypatch):
     guard=h.store._guard()
     assert h.client.post(path+"/acknowledge",content=acknowledgment.model_dump_json(),headers=h.headers()).status_code==200
     assert h.store._guard()==guard and len(h.endpoint.requests)==1
-    check_history(h)
     if os.environ.get("FA_REFERENCE_CAPTURE"):
         Path(os.environ["FA_REFERENCE_CAPTURE"]).write_text(json.dumps({
             "evidence":"OFFLINE real HTTP/Table producers; SDK I/O double; no native/provider/model",
@@ -318,7 +306,6 @@ def test_cancel_reaches_official_sdk_abort_and_keeps_original_work(assistant,tmp
     original=h.assistant.result(starts[0].binding)
     assert original.state=="cancelled"
     assert json.loads(original.content)["sdk_reply_available"] is False
-    check_history(h)
     client.close()
 
 
@@ -342,7 +329,6 @@ def test_unknown_checkpoint_upload_keeps_reply_but_never_restarts_empty(assistan
     with pytest.raises(Problem):
         control.submit(human,InstructionSubmit(request_id="no-empty-restart",content="Continue.",conversation_id=cid))
     assert h.store._guard()==guard and len(calls)==1
-    check_history(h)
 
 
 def test_missing_checkpoint_part_never_starts_an_empty_sdk_and_keeps_old_answer(assistant,monkeypatch):
@@ -390,7 +376,6 @@ def test_failed_instruction_has_failure_delivery_not_a_nonexistent_text_reply(as
     with pytest.raises(Problem) as absent:
         control.read_reply(human, cid, 1)
     assert absent.value.body["error"]["code"] == "INSTRUCTION_REPLY_NOT_READY"
-    check_history(h)
 
 
 def test_completion_notification_requires_original_saved_session_and_ticket(assistant, monkeypatch):

@@ -5,7 +5,7 @@ param jobName string
 param environmentName string = 'cae-facontext-private'
 param identityName string = 'id-facontext-api'
 param registryName string = 'crfacontextpocdemo'
-@allowed(['fa-behavior-api', 'fa-context-api'])
+@allowed(['fa-behavior-api'])
 param imageRepository string = 'fa-behavior-api'
 @minLength(64)
 @maxLength(64)

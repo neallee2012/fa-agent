@@ -11,7 +11,7 @@ from shared_context.behavior_assistant import AssistantProfile
 from shared_context.behavior_assistant_wire import InstructionTask
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import PATH, configured, select, template
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_instruction_prompt import submit
 from test_m3_auth import jwk_client, signing_key
 
@@ -162,7 +162,6 @@ def test_captured_origin_settings_route_real_sdk_callbacks_without_switching_old
     assert replay.status_code == 200, replay.text
     assert replay.json()["binding_id"] == chosen["binding_id"]
     assert h.store._guard() == before
-    check_history(h)
 
 
 @pytest.mark.parametrize("identity", ["agent", "read-only"])

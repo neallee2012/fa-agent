@@ -13,7 +13,7 @@ from shared_context.behavior_attachments import TextAttachment
 from shared_context.behavior_work_policy import WorkPreflightQuery
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import instruction_models, runtime_path, sdk_io, check_history
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_m3_auth import jwk_client, signing_key
 
 BODY = "  USER_FILE_CANARY\r\n名稱,數值\n範例,42\n"
@@ -167,7 +167,6 @@ def test_file_reaches_sdk_as_data_and_metadata_does_not_return_body(assistant, m
     assert calls[0]["prompt"] == sent[0][0] and calls[1]["resume"]
     assert calls[0]["sdk_session_id"] == calls[1]["sdk_session_id"]
     assert control.records[first["binding_id"]].profile.instruction.files == (file,)
-    check_history(h)
 
 
 def test_original_file_download_requires_current_owner_read_and_retains_exact_bytes(assistant):
@@ -230,7 +229,6 @@ def test_new_file_profile_does_not_reconfigure_existing_conversations(assistant,
     assert h.runtime.controller.step(followup["binding_id"]).state == "succeeded"
     assert control.records[old["binding_id"]].profile.user_text_file_profile is None
     assert control.records[followup["binding_id"]].profile.user_text_file_profile == "fa-user-text-files-v1"
-    check_history(h)
 
 
 @pytest.mark.parametrize("case", ["combined-limit", "duplicate-name"])

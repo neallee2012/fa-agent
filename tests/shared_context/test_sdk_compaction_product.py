@@ -26,7 +26,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import signing_key, jwk_client
 from test_work_policy_lifecycle import enabled
 
@@ -184,7 +184,6 @@ def test_exact_projection_raw_immutability_api_publication_and_inherited_followu
     reference = settle(c,state,compaction=c.fs.compaction)
     assert reference.codec == DIAG_ARCHIVE_CODEC and reference.source.previous_sha256 == c.previous_ref.sha256
     assert reference.source.execution == c.fs.compaction
-    check_history(c.h)
     third = open_turn(c.h,c.control,c.human,"checkpoint-third",c.assignment.task.instruction.conversation_id)
     try:
         recovered = third.client.restore()
@@ -198,7 +197,6 @@ def test_exact_projection_raw_immutability_api_publication_and_inherited_followu
         assert ref.source.execution == reference.source.execution
         assert ref.source.previous_job_id == c.binding.job_id and ref.source.previous_sha256 == reference.sha256
         assert ref.source.execution.job_id != third.binding.job_id
-        check_history(c.h)
     finally:
         third.client.close()
 
@@ -610,7 +608,6 @@ def assert_public_checkpoint_roundtrip(checkpoint_case, tmp_path, payload, locat
         next_fs.files["events.jsonl"] += json.dumps(event(
             "user.message", "next-public-content", {"content": "Continue normally."}, values[-1]["id"])) + "\n"
         settle(following, next_fs.snapshot())
-        check_history(c.h)
         assert load_state(c.h.assistant, c.session, c.previous_ref, job_id=c.previous_ref.job_id) == c.previous
     finally:
         following.client.close()
@@ -654,7 +651,6 @@ def test_long_malformed_prefix_does_not_hide_private_copy_or_discard_public_answ
     assert load_state(c.h.assistant, c.session, c.previous_ref, job_id=c.previous_ref.job_id) == c.previous
     state = c.h.client.get(f"/work-policy/v1/conversations/{cid}", headers=c.h.headers()).json()
     assert not state["can_follow_up"] and state["follow_up_blocker"] == "SDK_STATE_PRIVATE_MATERIAL"
-    check_history(c.h)
 
 
 @pytest.mark.parametrize("location", ["event", "request-messages", "json-sidecar"])
@@ -685,7 +681,6 @@ def test_deep_sdk_structure_keeps_final_answer_and_last_lawful_checkpoint(checkp
     assert load_state(c.h.assistant, c.session, c.previous_ref, job_id=c.previous_ref.job_id) == c.previous
     state = c.h.client.get(f"/work-policy/v1/conversations/{cid}", headers=c.h.headers()).json()
     assert not state["can_follow_up"] and state["follow_up_blocker"] == "SDK_STATE_UNSUPPORTED_FORMAT"
-    check_history(c.h)
 
 
 def test_disabled_consumer_profile_blocks_status_admission_and_restore_without_rewriting_history(
@@ -769,7 +764,6 @@ def test_signed_compaction_token_delta_survives_publication_and_inherited_restor
     assert record.prepare.request_digest == digest(record.model_dump(
         mode="json", exclude={"kind", "prepare", "reference"}))
     assert load_state(c.h.assistant, c.session, reference, job_id=c.binding.job_id) == state
-    check_history(c.h)
     following = open_turn(c.h, c.control, c.human, "signed-token-followup",
                           c.assignment.task.instruction.conversation_id)
     try:
@@ -785,7 +779,6 @@ def test_signed_compaction_token_delta_survives_publication_and_inherited_restor
         assert fs.compaction is None
         assert inherited.source.execution == reference.source.execution
         assert load_state(c.h.assistant, c.session, c.previous_ref, job_id=c.previous_ref.job_id) == c.previous
-        check_history(c.h)
     finally:
         following.client.close()
 
@@ -842,7 +835,6 @@ def test_documented_provider_metadata_survives_projection_and_restore(checkpoint
     try:
         assert next_turn.client.restore() == state
         assert load_state(c.h.assistant, c.session, c.previous_ref, job_id=c.previous_ref.job_id) == c.previous
-        check_history(c.h)
     finally:
         next_turn.client.close()
 

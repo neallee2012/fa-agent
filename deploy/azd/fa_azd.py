@@ -1475,6 +1475,7 @@ def console_bundle(ctx: Context, runtime_dir: Path, plan_path: Path) -> dict[str
 
 def console_app(ctx: Context, console_image: str, runtime_dir: Path, plan_path: Path, commit: str) -> None:
     files = console_bundle(ctx, runtime_dir, plan_path)
+    profile = json.loads(ctx.profile.read_text(encoding="utf-8"))
     parameters = {
         "location": ctx.need("AZURE_LOCATION"), "environmentName": ctx.need("FA_CONTAINER_APPS_ENVIRONMENT"),
         "registryName": ctx.need("FA_REGISTRY_NAME"), "vnetName": ctx.need("FA_VNET"),
@@ -1483,6 +1484,9 @@ def console_app(ctx: Context, console_image: str, runtime_dir: Path, plan_path: 
         "entraClientId": ctx.need("FA_CONSOLE_APP_ID"), "ownerOid": ctx.need("FA_TEAM_OWNER_OID"),
         "apiAudience": ctx.need("FA_API_AUDIENCE"), "imageSha256": digest_of(console_image),
         "minReplicas": 1, **files,
+        # The same flags the upgrade's console step applies; `ci_deploy.py check` validated them before this step.
+        "environmentVariables": [{"name": key, "value": value}
+                                 for key, value in profile["console_environment"].items()],
     }
     if ctx.get("FA_VNET_RESOURCE_ID"):  # ADR-0010 phase 2b: the Portal's blob private endpoint in the user's subnet
         parameters |= {"privateEndpointSubnetResourceId": subnet_id(ctx, "FA_PRIVATE_ENDPOINT_SUBNET_NAME"),

@@ -1,8 +1,74 @@
 # FA 進度與交接狀態
 
-更新日期：2026-10-28。
+更新日期：2026-10-30。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="r7-close-1031"></a>
+## 2026-10-31：品質整理第七輪完成，dev 再驗一次
+
+- 結果：第七輪的刪除與拆分都已合併，main `052d671a` 上 dev，API `ca-fa-behavior-poc--052d671-r4001-1` Healthy、流量 100%。數字與未處理項目見[基準頁](code-quality-baseline.md#第七輪結果2026-10-30-至-31)。
+- dev 層（05:23～05:25，真 bridge、真 dev API、真 Hosted、真模型 gpt-5.4-mini；port 8810，bridge 設了 `FA_NATIVE_HITL_ENABLED=1`）：
+  - A：通過，5 秒，已完成。
+  - B：通過，3 秒，已完成。Connect 卡出現，按「先不用」後回覆。B 的 Teams 仍未連線。
+  - 送出後 stream 先回 409 `NATIVE_STREAM_NOT_STARTED`，工作台自動重試，回覆照常顯示。
+- 沒測：Teams OAuth、relay 實際收發、azd 首裝實機（#1087 只有離線與 bicep 編譯）、stage。
+- stage release 要寫明：stage 是 fresh 只有旁證，直接讀 Table 被 403 擋下。fresh 列不在時，新 API 開機會以 `MIGRATION_INSTALLATION_CHANGED` 或 `BEHAVIOR_NOT_INITIALIZED` 失敗，程序起不來；安裝列相符、留有舊指標時是 `BEHAVIOR_CONFIGURATION`；安裝列相符、沒有舊指標時會照常開機。
+
+<a id="fa-context-b-connect-wait-1030"></a>
+## 2026-10-30：fa-context-b 的 `native_bind_toolbox` 卡住，是在等 Connect 卡，不是 toolbox 回應卡住
+
+- 結論：21:35 那次已確認。B 的 Teams connector 沒有 OAuth 連線，回合在等主人處理 Connect 卡；本機 bridge 沒開 HITL，卡片顯示不出來，看起來就像卡死。開了之後 B 通過（見[dev 層重跑](#dev-fresh-1030)）。當天稍早幾次沒有這條 log，推斷是同一原因。
+- 現象：dev `fa-context-b` 10-30 三個回合（`b0054fcee62d`、`9e4e4c1c42ae`、`d2fb409d3062`）的 `native_bind_toolbox` 分別等到 1,235、228、199 秒，主人按停止才結束；10-28 也有 825 秒（`f5de7c4d32c1`）與 31 秒（`8a3ac6fc1aa8`）。
+- 已查到的事實（log-fa-dev）：
+  - Foundry 的 `AppRequests` 記錄 `tools/list` 在約 1 秒內結束：03:27:07Z `fa-connector-team-one-teams:2` 500／`json_rpc_error` 865 ms、`fa-org-tools:1` 成功 425 ms；03:48:17Z connector 再次 500。之後到回合結束都沒有新的 `tools/list`。
+  - 10-30 三次都是 `outcome=returned`，在 `api_cancel` 結束後約 2.4 秒內；bind 期間的停止只改旗標、不取消 await，程式裡只有 Connect 卡的輪詢（`NativeHitlRuntime._owner_reply`，60 秒後每 3 秒）看得到停止，看到後 `_connected` 回 False，bind 正常返回。真正卡在回應的呼叫不會因為停止而結束。
+  - 10-28 `f5de7c4d32c1` 沒有被停止：bind 結束後回合照常跑完，且沒有再列一次，符合主人拒絕卡片（按「我連好了，繼續」才會再列）。
+  - 互動回合的卡片等待上限是 86,400 秒（`hitl_settings` 預設），不是 dev 設定的 600 秒（那是背景回合）。
+  - 10-30 依時間對應（`AppRequests` 沒有 agent 名稱）：A 的 2 次 bind（03:23Z、05:44Z，各約 3.2 秒）對到 connector `tools/list` 成功；B 的 3 次（03:27Z、03:48Z、05:46Z）都對到 500。
+- 已確認（21:35，`AppTraces`）：`NATIVE_TOOLBOX_FAILED method=tools/list stage=rpc_error code=NATIVE_CAPABILITY_REFUSED reason=rpc_code=-32006;need=consent`，bind 依 C3 設計等主人處理 Connect 卡。
+- 為什麼沒有卡片：bridge 讀自己程序的 `FA_NATIVE_HITL_ENABLED`，沒設時工作台不會去要卡片，畫面只轉「正在準備回覆…」；直接打 `/api/native-hitl/team/attention` 會回 409 `NATIVE_HITL_UNAVAILABLE`。設了之後卡片就出現（實測）。當天 8765 與 8810 的啟動腳本都沒設；沒有用舊碼重跑。stage 的 API、Hosted、遠端工作台都有設。dev 沒有遠端工作台，只有 API 寫在 `dev.json`，Hosted 沿用已服務版本。azd 首裝的 Portal 當時沒有帶這個變數，已由 #1087 修正，還沒實機驗。
+- 查不到的：卡片紀錄（dev 儲存帳戶擋本機網路，沒有改規則）。
+- 同時修了獨立的缺口：回應一直滴資料時 httpx 永遠不逾時，改加總時限（[README](../src/fa-shared-context-poc/README.md#toolbox-total-deadline)，CODE/offline，未部署）。這一項沒有改變等 Connect 卡的行為。工具呼叫的時限也變成整次總時限；dev 近 30 天 124 次 `tools/call` 最長 21 秒，沒有超過 60 秒的。
+- 待決：等 Connect 卡要不要繼續擋住整個回合，以及 B 要不要連 Teams。
+
+<a id="dev-fresh-1030"></a>
+## 2026-10-30：dev 全新安裝重建（#1024 選項 a，總協調）
+
+- 結果：dev 改用新表 `workstatefresh`（#1065），config 回到 `fa-behavior-server-v1`，A 版本 177、B 版本 137，API revision `ca-fa-behavior-poc--6b51529-r3801-1`，controller 已停。舊表 `workstate` 保留，刪除另外核准。
+- 重建中遇到的問題：
+  - 新表不會清掉 Hosted 那邊的東西。舊 session 超過 100 個時 prepare 回 503，刪掉 A、B 全部 209 個舊 session 才過（Neal 核准）。
+  - Hosted State store 的舊紀錄讓 reconcile 回 409，改走 `native-turns/environment/advance`，`files_migrated=false`。
+  - 選版範本有 13 項 capability，超過上限 12，API 回 422 沒寫入。拿掉兩個 Team MCP 測試 server（`team-feed_v17`、`team-learn_v16`），A、B 各 11 項。要用時到工作台打開，只影響新對話。
+  - `fresh_export` 沒帶 `cli`，工作台「連線」回 `CLI_NOT_CONFIGURED`，已由 #1068 補上選項。
+- 工作台對話清單仍看得到舊對話（A→B 交辦、10-25 排程測試）：新表開始時是空的，所以這些紀錄不在新表裡，存放位置沒有查。這次重建換了新 Table、刪了舊 session，沒有清掉這些紀錄。
+- dev 層實跑（真 bridge、真 dev API、真 Hosted、真模型 gpt-5.4-mini；port 8810、全新 journal；13:43～13:50）：
+  - A：通過，3 秒回覆，已完成。
+  - B：當時判不通過（等 3 分鐘沒回，手動停止）。這個判定後來更正，見下面的重跑。同日第一次在 8765 卡 20.6 分鐘，log 的 `native_bind_toolbox` 到按停止才返回。查 Log Analytics `AppTraces`（`AppRoleName=fa-context-b`）：10-28 這一步有 3 筆，中位數 31 秒，最久 13.7 分鐘；同日 A 最久 22.8 秒。所以重建前就有這一步很慢的紀錄，但 10-28 那幾筆為什麼慢沒有查。原因見[10-30 等 Connect 卡](#fa-context-b-connect-wait-1030)。
+  - 切到第二位助理後模型清單不載入、輸入框鎖住，8765 與 8810 都重現，另案修。
+- dev 層重跑（21:30～21:48，main `c4e3b226`，API `ca-fa-behavior-poc--c4e3b22-r3901-1`，含第七輪拆完的 `run_copilot`；bridge 設了 `FA_NATIVE_HITL_ENABLED=1`，port 8810）：
+  - A：通過，3 秒，已完成。環境 v177→v178。
+  - B：通過，2 秒，已完成。Connect 卡出現，按「先不用」後回覆。環境 v137→v138。B 的 Teams 仍未連線，OAuth 要主人做。
+  - 這是新 `run_copilot` 第一次跑真 Hosted 與真模型。沒測：Teams OAuth、relay 實際收發。
+- 品質整理第七輪：Neal 2026-10-30 核准，先刪後拆，10-31 完成（[紀錄](#r7-close-1031)）。
+- 驗收規則（Neal 同意）：改到工作台路徑的 PR 附 standin 證據；stage release 的 dev 測試報告要逐位助理列 dev 層結果（[CONVENTIONS](CONVENTIONS.md)）。
+
+<a id="model-gateway-probe-1029"></a>
+## 2026-10-29：hosted agent 經企業 AI Gateway 呼叫模型（dev 已實測）
+
+- 起因：客戶問 hosted agent 能否用企業 AI Gateway 上的模型（Foundry 模型或地端 OpenAI 相容模型）。
+- 依官方文件：Foundry 內建 BYOM 只支援 prompt agent；hosted agent 要由程式自己呼叫 gateway，BYO VNet 下流量從委派子網出去。UDR 是否套用到 micro-VM、agent 身分 token 的 `appid` 未有文件，要實測。
+- dev 實測（2026-10-29）：經私網 APIM 呼叫 Foundry（Chat Completions 與 Responses）、經 peering 呼叫模擬地端模型都成功；委派子網的路由表會套用到現有與新 session（只驗證黑洞路由；導向防火牆未測）。agent 身分預設沒有 project 的模型推論權限（T0 401）。結果與限制見 [model-gateway-probe](model-gateway-probe.md#實測結果)。
+- FA 的模型網址寫死為 project endpoint，要接企業 gateway 需另提產品變更；本次不改 FA 程式。
+
+<a id="stage-v37-1028"></a>
+## 2026-10-28：stage 第 37 版部署後驗證
+
+- **範圍**：release PR #1032（`2026.10.28-37`），Neal 14:02:59Z 合併，merge commit `97e1a7bf`。內容基準是 [10-28 dev 測試](#dev-test-r2-1028)與[啟動加速](#startup-private-1028)；dev run 3703（`25a1f970`）之後只多了 #1031（文件）。證據是總協調的唯讀讀回，原始輸出不在 repo，ID 只寫前綴。
+- **部署**：deploy-staging run `40702138337` 成功，deploy job 14 分 41 秒（14:04:11～14:18:52Z）。閘門 `armed=True, override=False; decision: pass (0 refusals)`；sync 與 follow 兩個 job Succeeded；API `…97e1a7b-r125-1`、console、feed `…97e1a7b-r125-1` ready。
+- **讀回**：API 唯一 active revision `…97e1a7b-r125-1`，Healthy、100%；GUARD="1"、IDLE="0"、RECONCILER="0"、`FA_NATIVE_ROUTINE_CLOCK=api`。容器 log（`az containerapp logs show`，到 14:23 共 7 行）：14:16:13 `Started server process` → 14:16:16 `Application startup complete`，**lifespan 約 3 秒**（dev 同一段約 26.5 秒；dev 的 374→142 秒是 container 啟動到開 port，量的不是同一段）；deploy 的「Update stage API」從 14:15:39 到 `ready` 14:16:27，換版到 ready ≤48 秒。沒有 Traceback、ERROR、5xx，沒有 `BEHAVIOR_INVENTORY_READ`（stage 是全新安裝，推論不做 dev 那種完整核對；只有 7 行，證據薄），也還沒有回合。`FA_NATIVE_ROUTINE_CLOCK_AGENT` 兩筆 `AGENT_SCOPE_MISSING` 是 executor C／D 沒有 agent scope，預期內，與[第 35 版](#stage-v35-1022) follow 的 `skipped` 同因。`log-fa-stage` 的 `ContainerAppConsoleLogs` 查這個 revision 是 0 筆，原因未查。
+- **public-sync 沒有發佈**：run `40704709603` 的 job 沒有啟動，GitHub 註記 “recent account payments have failed or your spending limit needs to be increased”（付款失敗或花費上限不足，哪一個未確認）。公開 repo 仍停在 `v2026.10.25-36`；同時間 PR 的 CI 也都在 3～4 秒內以同樣註記失敗。要 Neal 處理付款或上限，之後再重跑。
+- **沒有驗證到的**：A、B 冒煙（沒開 stage console），所以這版沒有 send RTT p50／p95；Agent 版本號（只看 follow job 的 Succeeded）、HITL 批准卡、恢復後的取消、格式錯誤的錯誤內容（這三項只有離線測試）；A 每日排程留待 10-29 10:00Z 讀回。
 
 <a id="startup-private-1028"></a>
 ## 2026-10-28：dev API 啟動修正的讀回，與 private 模式 project capability host 的雲端驗收（main `25a1f970`，總協調）
@@ -33,7 +99,7 @@
 - **還沒解決的**：
   - 開機讀取上限仍是 256 MiB；依 #1029 的文件註記，記憶體可能在回 413 之前就先用完。
   - 真正的解法（有記憶體上限或串流的核對）是後續項目。
-  - draft PR #1024（ADR-0012 增量設計）暫放，沒動。
+  - PR #1024（ADR-0012 增量設計）2026-10-29 Neal 決定撤回，改以重建 dev 為全新安裝處理；PR 改為記錄撤回。
 
 ### B. private 模式 project capability host（#1025、#1027、#1030）
 

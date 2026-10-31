@@ -22,8 +22,7 @@ from .errors import Problem
 from .models import Identifier
 from .source_materials import digest
 from .behavior_delegation_wire import (
-    CAPABILITY_ID, CHILD_AGENT_TYPE, DelegationPublicText, DelegationStatus, DelegationTask,
-    pack_delegation_text, unpack_delegation_text,
+    DelegationPublicText, DelegationStatus, DelegationTask, pack_delegation_text, unpack_delegation_text,
 )
 
 if TYPE_CHECKING:
@@ -271,101 +270,6 @@ def _parent_model_cost(rows, parent, request_sha256):
     return cost
 
 
-def validate_delegation_history(inventory, config, bindings, *, row_ids=None):
-    """Validate original parent/receipt links, not a new capability authorization."""
-    from .behavior_assistant import key as assistant_key
-    from .behavior_instruction_cost import cost_key
-    from .behavior_recovery_history import _Inventory
-    from .behavior_work_policy import WorkRegistration
-    models = {model.model_fields["kind"].default: model for model in (
-        DelegationIntent, DelegationState, DelegationResult, DelegationModelUsage)}
-    selected = {key: models[row.payload["data"]["kind"]]
-                for key, row in inventory.rows.items()
-                if (row_ids is None or key in row_ids) and row.payload["data"].get("kind") in models}
-    if not selected:
-        return {}
-    view = _Inventory(inventory, config)
-    values = {key: view.row(key, model, material=True
-                           if model in {DelegationIntent, DelegationModelUsage} else None)
-              for key, model in selected.items()}
-    registered = {binding.binding_id: binding for binding in bindings}
-    checked = set()
-
-    def require(condition, message):
-        if not condition:
-            raise Problem(409, "DELEGATION_HISTORY_INVALID", message)
-
-    def written(key, request, expected_writes):
-        return view.receipt(request, expected_writes, exact={key: view.hash(key)})
-
-    for identifier in {value.delegation_id for value in values.values()}:
-        intent = view.row(identifier, DelegationIntent, material=True)
-        parent = intent.parent
-        state_id = state_key(identifier)
-        state = view.row(state_id, DelegationState)
-        registration = view.row(parent.registration_id, WorkRegistration)
-        require(registered.get(parent.binding_id) == registration.binding
-                and identifier == intent.delegation_id == delegation_key(parent.execution.work_id)
-                and state.delegation_id == identifier
-                and intent.request == _request(parent, intent.tool_call_id, intent.input_sha256),
-                "delegation escaped its original registered parent")
-        _current_parent({key: inventory.rows.get(key) for key in _parent_keys(parent)}, parent, executing=False)
-        initial = DelegationState(delegation_id=identifier, request=intent.request)
-        view.receipt(intent.request, (identifier, state_id),
-                     exact={identifier: view.hash(identifier), state_id: view.image_hash(state_id, initial)},
-                     result={"delegation_id": identifier, "status": "unknown"})
-        checked.update((identifier, state_id))
-        result = None
-        if state.result_id is not None:
-            require(state.result_id == result_key(identifier), "child result key differs")
-            result = view.row(state.result_id, DelegationResult)
-            require(result.delegation_id == identifier and result.child_agent_id == state.child_agent_id
-                    and result.request.read_set == (*_parent_keys(parent), identifier, state_id, state.result_id),
-                    "child result scope or original predicates differ")
-            _result_text(result)
-            written(state.result_id, result.request, (state_id, state.result_id))
-            checked.add(state.result_id)
-        if state.request == intent.request:
-            writes = (identifier, state_id)
-        else:
-            require(state.request.read_set in {
-                (*_parent_keys(parent), identifier, state_id),
-                (*_parent_keys(parent), identifier, state_id, result_key(identifier)),
-            }, "child observation predicates escaped the parent")
-            writes = ((state_id, state.result_id) if result is not None and state.request == result.request
-                      else (state_id,))
-        written(state_id, state.request, writes)
-        for event_id, result_observation in ((state.child_cancelled_event_id, True),
-                                             (state.parent_idle_event_id, False)):
-            if event_id is None:
-                continue
-            proof = view.receipts.get(control_key("sdk-delegation-event", identifier, event_id))
-            require(proof is not None
-                    and proof.request.read_set == (*_parent_keys(parent), identifier, state_id,
-                        *((result_key(identifier),) if result_observation else ()))
-                    and proof.result.get("delegation_id") == identifier
-                    and proof.result.get("status") in {"unknown", "cancelled"},
-                    "cancellation requires both original scoped observations")
-        for row_id, link in values.items():
-            if not isinstance(link, DelegationModelUsage) or link.delegation_id != identifier:
-                continue
-            cost_id = cost_key(parent.session_id, link.request_sha256)
-            require(link.child_agent_id == state.child_agent_id and link.parent_work_id == parent.execution.work_id
-                    and link.root_request_id == parent.root_request_id
-                    and link.root_budget_id == parent.execution.owner.root_budget_id
-                    and link.session_id == parent.session_id and link.job_id == parent.execution.job_id
-                    and link.model_cost_id == cost_id and row_id == usage_key(cost_id)
-                    and link.request.request_id == row_id,
-                    "child usage escaped the original root")
-            cost_reads = (cost_id, parent.registration_id,
-                          assistant_key("model-intent", parent.session_id, link.request_sha256))
-            _parent_model_cost({key: inventory.rows.get(key) for key in cost_reads}, parent, link.request_sha256)
-            written(row_id, link.request, (row_id,))
-            checked.add(row_id)
-    require(set(values) <= checked, "orphan delegation record is not an original child outcome")
-    return values
-
-
 class DelegationLedger:
     def __init__(self, store: BehaviorStore):
         self.store = store
@@ -556,7 +460,7 @@ class DelegationLedger:
     def read_model_usage(self, parent, request_sha256):
         from .behavior_assistant import key
         from .behavior_instruction_cost import cost_key
-        from .behavior_runtime_transition import _payload_hash
+        from .source_materials import _payload_hash
         parent = _checked(parent, DelegationParent)
 
         def read():
@@ -585,7 +489,7 @@ class DelegationLedger:
         return self.store.consistent_read(lambda: self._read(parent))
 
     def _read(self, parent):
-        from .behavior_runtime_transition import _payload_hash
+        from .source_materials import _payload_hash
         identifier = delegation_key(parent.execution.work_id)
         rows = self.store.read_snapshot((identifier, state_key(identifier)))
         if rows[identifier] is None or rows[state_key(identifier)] is None:

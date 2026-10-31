@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from shared_context import behavior_assistant_wire as aw
-from shared_context.behavior_instruction_cost import cost_key, record_usage, replay_cost_write, usage_from_sse
+from shared_context.behavior_instruction_cost import cost_key, record_usage, usage_from_sse
 from shared_context.behavior_operations import _row
 from shared_context.behavior_work_policy import CostLedger
 from shared_context.behavior_work_policy_api import install_work_policy_routes
@@ -28,47 +28,6 @@ def responses_usage(input_tokens=21, output_tokens=13, reasoning_tokens=8):
             "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
         }},
     }) + "\n\n").encode()
-
-
-def test_responses_usage_moves_pending_to_the_original_ledger_without_losing_reasoning(assistant):
-    h, control, human, _ = enabled(assistant)
-    install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier,
-        installation=lambda: None, require_current_native_evidence=lambda: None))
-    turn = open_turn(h, control, human, "responses-usage")
-    try:
-        body = {"model": "gpt-4.1-mini", "messages": [{"role": "user", "content": "Synthetic cost seam."}], "stream": True}
-        identity = digest(body)
-        turn.client.reserve_model(identity)
-        principal = h.verifier(h.client.build_request("GET", "/", headers=h.headers("agent")))
-        before = _row(h.store.read_snapshot((control.cost_key,)), control.cost_key, CostLedger)
-        h.assistant.consume_model(turn.session, aw.ModelRequest(request_id=identity, body=body), principal)
-        pending = _row(h.store.read_snapshot((control.cost_key,)), control.cost_key, CostLedger)
-        assert pending.model_pending_microusd > 0
-        counts = usage_from_sse(responses_usage(), wire_api="responses")
-        assert counts == (21, 13, 8)
-        record_usage(h.assistant, turn.session, identity, counts)
-        identifier = cost_key(turn.assignment.session_id, identity)
-        saved = h.store.read_snapshot((identifier, control.cost_key))
-        cost = saved[identifier].payload["data"]
-        ledger = _row(saved, control.cost_key, CostLedger)
-        assert (cost["input_tokens"], cost["output_tokens"], cost["reasoning_tokens"]) == (21, 13, 8)
-        assert cost["metered_microusd"] == 30
-        assert ledger.model_pending_microusd == 0 and ledger.model_metered_microusd == 30
-        assert ledger.legacy_unresolved_reserve_microusd == pending.legacy_unresolved_reserve_microusd
-        assert ledger.work_reservations_microusd == pending.work_reservations_microusd
-        from shared_context.behavior_recovery_history import _Inventory
-        inventory = instruction_inventory(h)
-        view = _Inventory(inventory, SimpleNamespace(table=SimpleNamespace(scope=h.store._scope), sha256="f"*64,
-            workers=h.workers.contract, delivery=h.delivery.contract))
-        replayed = before
-        for receipt in sorted((receipt for receipt in view.receipts.values() if any(
-                inventory.rows[key].payload["data"].get("kind") == "instruction_model_cost"
-                for key, _ in receipt.writes)), key=lambda receipt: receipt.guard_revision):
-            replayed = replay_cost_write(view, receipt, replayed, control.records, control.policy)
-        assert replayed == ledger
-        assert not h.endpoint.requests
-    finally:
-        turn.client.close()
 
 
 @pytest.mark.parametrize("input_tokens,output_tokens,reasoning_tokens", [
@@ -403,8 +362,6 @@ def test_responses_checkpoint_publication_and_restore_remain_bound_to_the_captur
                     conversation_id=reference.conversation_id, sdk_session_id=reference.sdk_session_id,
                     job_id=reference.job_id)
             assert error.value.body["error"]["code"] == "SDK_STATE_UNSUPPORTED_FORMAT"
-            from test_instruction_flow import check_history
-            check_history(h)
         finally:
             second.client.close()
     finally:
@@ -509,5 +466,36 @@ def test_selected_responses_model_route_uses_the_original_send_and_records_provi
         assert ledger.model_pending_microusd == 0 and ledger.model_metered_microusd == 30
         assert post_skill(turn, {"request_id": identity, "body": body}, action="model").status_code == 409
         assert len(calls) == 1 and h.store.read_snapshot((identifier, control.cost_key)) == saved
+    finally:
+        turn.client.close()
+
+
+def test_responses_usage_moves_pending_to_the_original_ledger_without_losing_reasoning(assistant):
+    h, control, human, _ = enabled(assistant)
+    install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier,
+        installation=lambda: None, require_current_native_evidence=lambda: None))
+    turn = open_turn(h, control, human, "responses-usage")
+    try:
+        body = {"model": "gpt-4.1-mini", "messages": [{"role": "user", "content": "Synthetic cost seam."}], "stream": True}
+        identity = digest(body)
+        turn.client.reserve_model(identity)
+        principal = h.verifier(h.client.build_request("GET", "/", headers=h.headers("agent")))
+        before = _row(h.store.read_snapshot((control.cost_key,)), control.cost_key, CostLedger)
+        h.assistant.consume_model(turn.session, aw.ModelRequest(request_id=identity, body=body), principal)
+        pending = _row(h.store.read_snapshot((control.cost_key,)), control.cost_key, CostLedger)
+        assert pending.model_pending_microusd > 0
+        counts = usage_from_sse(responses_usage(), wire_api="responses")
+        assert counts == (21, 13, 8)
+        record_usage(h.assistant, turn.session, identity, counts)
+        identifier = cost_key(turn.assignment.session_id, identity)
+        saved = h.store.read_snapshot((identifier, control.cost_key))
+        cost = saved[identifier].payload["data"]
+        ledger = _row(saved, control.cost_key, CostLedger)
+        assert (cost["input_tokens"], cost["output_tokens"], cost["reasoning_tokens"]) == (21, 13, 8)
+        assert cost["metered_microusd"] == 30
+        assert ledger.model_pending_microusd == 0 and ledger.model_metered_microusd == 30
+        assert ledger.legacy_unresolved_reserve_microusd == pending.legacy_unresolved_reserve_microusd
+        assert ledger.work_reservations_microusd == pending.work_reservations_microusd
+        assert not h.endpoint.requests
     finally:
         turn.client.close()

@@ -22,7 +22,7 @@ from shared_context.behavior_agent_role_prompt import ROLE_PROMPT_MAX_BYTES
 from shared_context.behavior_agent_role_prompt_versions import current_role_prompt
 from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_code_identity import code_sha256
-from shared_context.behavior_team_registry import TeamRegistry, registered_agent_ids, validate_team_registry_history
+from shared_context.behavior_team_registry import TeamRegistry, registered_agent_ids
 from shared_context.behavior_work_target import instruction_hosted_version
 import shared_context.behavior_agent_versions as onboarding_versions
 from shared_context.errors import Problem
@@ -510,14 +510,13 @@ def test_routes_return_202_until_ready_and_keep_refusal_details(team, monkeypatc
 
 
 def test_onboarding_passes_the_real_startup_readers_and_a_tampered_row_is_refused(team):
-    from shared_context.behavior_migration import MigrationStore, _quiescence, installed_origin
+    from shared_context.behavior_migration import MigrationStore, installed_origin
     from test_resident_worker_poc import outcome_of
     config = team.config
 
     def readers():
         store = MigrationStore(team.c.h.composition.clients[0], config.table.scope)
-        return (outcome_of(lambda: read_startup(team.c)), outcome_of(lambda: _quiescence(store.read_inventory(), config)),
-                outcome_of(lambda: installed_origin(store, config)))
+        return (outcome_of(lambda: read_startup(team.c)), outcome_of(lambda: installed_origin(store, config)))
     baseline = readers()
     assert baseline[0] == "ok"
     team.run()
@@ -526,26 +525,6 @@ def test_onboarding_passes_the_real_startup_readers_and_a_tampered_row_is_refuse
     team.foundry.ready_after = 10**6
     team.run(rid="onboard-open", name="Open", deadline_seconds=0)
     assert readers() == baseline
-    inventory = team.a.runtime.store.read_inventory()
-    ids = config.identity
-    okey = onboarding_key(ids.tenant_id, ids.team_id, "onboard-open")
-    pkey = pending_key(ids.tenant_id, ids.team_id)
-    without_pending = replace(inventory, rows={k: v for k, v in inventory.rows.items() if k != pkey})
-    with pytest.raises(Problem) as refused:
-        validate_team_registry_history(without_pending, config)
-    assert refused.value.status == 409
-    row = inventory.rows[okey]
-    data = TeamAgentOnboarding.model_validate(row.payload["data"]).model_copy(update={"display_name": "Changed"})
-    tampered = replace(inventory, rows={**inventory.rows, okey: replace(row, payload={
-        **row.payload, "data": data.model_dump(mode="json")})})
-    with pytest.raises(Problem):
-        validate_team_registry_history(tampered, config)
-    akey = onboarding.attempt_key(ids.tenant_id, ids.team_id, "onboard-failed", 1)
-    arow = inventory.rows[akey]
-    moved = replace(inventory, rows={**inventory.rows, akey: replace(arow, payload={
-        **arow.payload, "data": {**arow.payload["data"], "claim": "forged"}})})
-    with pytest.raises(Problem):
-        validate_team_registry_history(moved, config)
 
 
 def _stop_before_role(team, monkeypatch):
@@ -887,14 +866,13 @@ def test_a_with_skill_artifacts_can_seed_a_chosen_agent(team, monkeypatch):
 
 
 def test_legacy_and_chosen_records_resume_and_pass_the_real_startup_readers(team, monkeypatch):
-    from shared_context.behavior_migration import MigrationStore, _quiescence, installed_origin
+    from shared_context.behavior_migration import MigrationStore, installed_origin
     from test_resident_worker_poc import outcome_of
     config = team.config
 
     def readers():
         store = MigrationStore(team.c.h.composition.clients[0], config.table.scope)
-        return (outcome_of(lambda: read_startup(team.c)), outcome_of(lambda: _quiescence(store.read_inventory(), config)),
-                outcome_of(lambda: installed_origin(store, config)))
+        return (outcome_of(lambda: read_startup(team.c)), outcome_of(lambda: installed_origin(store, config)))
     baseline = readers()
     assert baseline[0] == "ok"
     grants = _grants(team, SKILLS_ENTRY_ID)

@@ -18,7 +18,7 @@ from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_behavior_assistant import assistant
 from test_instruction_attachments import BODY, configured_attachments, post
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
 
@@ -86,4 +86,3 @@ def test_fixed_sdk_selection_uses_exact_text_and_retains_it_on_cold_resume(assis
         assert all(item._sdk_stop.graceful and item._sdk_stop.runtime_version == "1.0.83" for item in bridges)
         assert not any((item.root / "work" / "reference.txt").exists() for item in bridges)
         assert "Exception in callback" not in caplog.text
-        check_history(h)

@@ -38,7 +38,7 @@ def _retry_windows_local_state_replace():
 if os.name == "nt":
     _retry_windows_local_state_replace()
 
-from shared_context.api import create_app
+from legacy_m2_m4.api import create_app
 from shared_context.auth import Actor, AuthSettings
 from shared_context.errors import Problem
 from shared_context.service import ContextService

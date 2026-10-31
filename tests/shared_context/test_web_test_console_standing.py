@@ -65,11 +65,11 @@ def open_ui(case, path, config=None):
 
 @pytest.fixture
 def standing_client(auth, jwk_client, signing_key, tmp_path, monkeypatch):
-    import test_teams_metrics
-    monkeypatch.setattr(test_teams_metrics, "TENANT", TENANT)
+    import assistant_sdk_fixture
+    monkeypatch.setattr(assistant_sdk_fixture, "TENANT", TENANT)
     original = assistant_harness(auth, jwk_client, signing_key)
     h, control, human, observations = enabled(original, after_global=True)
-    executor = test_teams_metrics.SdkProtocolExecutor(h)
+    executor = assistant_sdk_fixture.SdkProtocolExecutor(h)
     h.workers.adapter = executor.adapter()
     composition = SimpleNamespace(runtime=h.runtime, verifier=h.verifier,
         installation=lambda: control.installed(),
@@ -102,3 +102,11 @@ def standing_client(auth, jwk_client, signing_key, tmp_path, monkeypatch):
 
 def action(c, phase, task="A"):
     return c.browser.ui.post("/api/tasks/"+task+"/"+phase, json={}, headers=c.browser.headers)
+
+
+@pytest.mark.parametrize("field,value", [("submission", "lifecycle"), ("binding_id", "another-binding")])
+def test_a_standing_task_that_departs_from_the_policy_derivation_is_refused(standing_client, field, value):
+    raw = configuration(standing_client.h, standing_client.control)
+    raw["tasks"][0][field] = value
+    with pytest.raises(ValueError, match="standing tasks must exactly match the original deterministic policy derivation"):
+        parse_config(json.dumps(raw).encode())

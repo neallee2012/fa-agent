@@ -3,6 +3,8 @@
 `scripts\validate-shared-hosted.py` 只用 Python 3.11+ stdlib。它不建立資源、身份、角色、
 registry、agent 或額外 session，也不刪除 session；不修改已建置的 runtime。
 
+> **注意：下列範例指令已失效（已於 2026-10 移除）。** 範例的 `--azd-project ".\deploy\shared-context"` 所指的 `deploy/shared-context/azure.yaml` 已刪除，該目錄不再是 azd 專案；controller 現在會在缺少 `azure.yaml` 時直接報錯，不會讓 azd 往上層找。需要重跑時，`--azd-project` 要改指向另一個含自己 `azure.yaml` 的 azd 專案。舊檔可看固定連結：（原私有 repo 連結）。
+
 由 parent 建立／設定 API、A/B agents 與兩個 sessions 後，從 repository root 執行：
 
 ```powershell

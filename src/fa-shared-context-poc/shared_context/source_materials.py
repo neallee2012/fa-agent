@@ -123,6 +123,11 @@ def digest(value: object) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+# Table receipts already store this unsorted form; digest() sorts keys, so the two cannot be merged.
+def _payload_hash(payload):
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
 def checked(value: M, model: type[M]) -> M:
     try:
         if not isinstance(value, model):

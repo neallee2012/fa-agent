@@ -1292,8 +1292,14 @@ def test_a_new_console_is_internal_until_its_sign_in_config_exists(hooks, tmp_pa
             "FA_CONSOLE_APP_OBJECT_ID", "FA_DEPLOY_RUN")
     ctx = context(hooks, tmp_path, {"azd env set": ok()}, FA_CONSOLE_URL="https://ca-console.example.io",
                   **{key: "x" for key in keys})
+    ctx.profile.write_text(json.dumps({"console_environment": {
+        "FA_NATIVE_HITL_ENABLED": "1", "FA_NATIVE_HITL_TTL_SECONDS": "600"}}), encoding="utf-8")
     hooks.console_app(ctx, "cr/fa-web-console@sha256:" + "a" * 64, tmp_path, tmp_path / "plan.json", "f" * 40)
     assert [parameters["ingressExternal"] for _, parameters in deployed] == [False, True]
+    # The bridge reads its flags from its own process: without them HITL cards never show and the turn waits forever.
+    for _, parameters in deployed:
+        assert parameters["environmentVariables"] == [{"name": "FA_NATIVE_HITL_ENABLED", "value": "1"},
+                                                      {"name": "FA_NATIVE_HITL_TTL_SECONDS", "value": "600"}]
     # Every name passed is a parameter of the template, so the flag cannot be dropped by a rename.
     declared = set(re.findall(r"^param (\w+)", deployed[0][0].read_text(encoding="utf-8"), re.MULTILINE))
     assert set(deployed[0][1]) <= declared and set(deployed[1][1]) <= declared
@@ -2930,6 +2936,7 @@ def test_the_portal_endpoint_goes_into_the_users_subnet(hooks, tmp_path, monkeyp
             "FA_CONSOLE_APP_OBJECT_ID", "FA_DEPLOY_RUN")
     ctx = context(hooks, tmp_path, {"azd env set": ok()}, FA_CONSOLE_URL="https://ca-console.example.io",
                   **{key: "x" for key in keys}, **BYO, FA_DNS_MODE="existing", FA_PRIVATE_ENDPOINT_SUBNET_NAME="pe")
+    ctx.profile.write_text(json.dumps({"console_environment": {}}), encoding="utf-8")
     hooks.console_app(ctx, "cr/fa-web-console@sha256:" + "a" * 64, tmp_path, tmp_path / "plan.json", "f" * 40)
     declared = set(re.findall(r"^param (\w+)", deployed[0][0].read_text(encoding="utf-8"), re.MULTILINE))
     for _, parameters in deployed:

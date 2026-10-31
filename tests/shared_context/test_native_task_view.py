@@ -19,7 +19,7 @@ from test_m3_auth import jwk_client, signing_key  # noqa: F401
 REASON = "此原生回合目前不能執行這個動作。"
 ACTIONS = ["status", "submit-reconcile", "submit-retry", "read-reply", "cancel", "read-cancel-receipt",
            "confirm-reply", "read-files", "read-skill-draft", "read-images", "read-appends", "read-progress",
-           "read-system-prompt", "submit", "fetch", "acknowledge", "reconcile", "read-context", "read-delegation"]
+           "read-system-prompt", "submit", "fetch", "acknowledge", "read-context", "read-delegation"]
 KEYS = ["state_profile", "task_id", "submit_request_id", "thread_id", "label", "description", "mode", "instruction",
         "agent_text", "continuation", "continuation_text", "continuation_state", "continuation_error",
         "continuation_usage", "source", "admission", "requested_model", "status", "native_receipt", "not_accepted",

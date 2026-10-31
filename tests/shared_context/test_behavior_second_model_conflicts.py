@@ -12,10 +12,7 @@ from shared_context.behavior_workers import worker_key
 from shared_context.behavior_assistant_wire import TurnStopped
 from shared_context.errors import Problem
 from test_behavior_assistant_claim_boundaries import hosted_flow, reviewed, run
-from test_behavior_assistant_acquire_conflicts import native_acquire, current_rotation
-from test_behavior_rotation_cutoff import two_rotations
-from test_behavior_rotation_settlement_history import current_cancelled
-from test_behavior_runtime_rotation import rotated
+from test_behavior_assistant_acquire_conflicts import installed_assistant, native_acquire
 from test_m3_auth import jwk_client, signing_key
 from test_behavior_store import before_closing_guard, rewrite_key, stored_row
 

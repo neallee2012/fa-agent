@@ -13,13 +13,58 @@ from shared_context.memory_note_proposal_api import install_note_proposal_routes
 from test_behavior_api import METRICS
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_inventory, instruction_models, runtime_path
+from test_instruction_flow import instruction_inventory, instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import open_turn, ordinary, settle
 from test_memory_note_bridge import review_command
 
 
 SETTINGS = "/operator/v1/memory-bridge-settings"
+
+
+def captured_memory_read_keys(policy, capture, *, first_turn, records):
+    """The rows this feature adds to an admission's read set, spelled out apart from admission."""
+    from shared_context.behavior_operations import control_key
+    from shared_context.behavior_profile_selection import selection_key
+    from shared_context.behavior_runtime import runtime_key
+    from shared_context.behavior_work_policy import work_policy_key
+    from shared_context.errors import Problem
+    from shared_context.memory_bridge_settings import settings_head_key
+    from shared_context.memory_governance import ClaimReference
+    from shared_context.source_materials import SourceReference, SourceScope
+
+    keys = [settings_head_key(policy.authority_domain, policy.agent_scope)] if first_turn else []
+    if capture is None:
+        return set(keys)
+    keys.append(capture.settings_id)
+    if first_turn and capture.recall is not None:
+        origin = next((record for record in records
+                       if record.binding.binding_id == capture.recall.origin_binding_id), None)
+        if origin is None:
+            raise Problem(409, "MEMORY_SETTINGS_INVALID", "the original note work is missing from retained history")
+        if origin.agent_scope != policy.agent_scope:
+            raise Problem(409, "MEMORY_SETTINGS_INVALID", "the selected note history belongs to another agent scope")
+        b, source = origin.binding, capture.recall.source
+        keys.extend((
+            runtime_key("policy", b.binding_id), control_key("owner", b.owner.owner_record_id),
+            control_key("policy", b.owner.policy_id), control_key("budget", b.owner.root_budget_id),
+            work_policy_key("policy", *policy.scope_ids), work_policy_key("revocation", *policy.scope_ids),
+            work_policy_key("registration", origin.admission_id),
+        ))
+        if origin.profile_selection_id is not None:
+            keys.append(selection_key(policy.authority_domain, origin.profile_selection_id, policy.agent_id))
+        if origin.profile.memory_scope is not None:
+            keys.append(origin.profile.memory_scope.settings_id)
+        scope = SourceScope(tenant_id=b.tenant_id, team_id=b.team_id, visibility="team")
+        reference = ClaimReference(scope=scope, subject=b.subject, claim_id=source.claim_id,
+                                   version=source.claim_version, sha256=source.claim_sha256)
+        keys.extend((control_key("memory-subject", scope.key, b.subject), reference.key,
+                     control_key("source-human-review", scope.key, source.claim_sha256, source.review_policy_version),
+                     control_key("source-human-revocation", scope.key, source.claim_sha256)))
+        for item in source.sources:
+            ref = SourceReference(scope=scope, **item.model_dump())
+            keys.extend((ref.key, ref.head_key))
+    return set(keys)
 
 
 @pytest.fixture
@@ -115,22 +160,12 @@ def test_new_conversation_reads_selected_committed_note_without_changing_older_c
         assert control.records[old.binding.binding_id].model_dump_json() == old_record
         assert second.client.read_reviewed_note() == note
         settle(second, ordinary(second.assignment.sdk_session_id))
-        from shared_context.memory_bridge_settings import validate_memory_settings_history
         inventory = instruction_inventory(h)
-        config = SimpleNamespace(table=SimpleNamespace(scope=h.store._scope), sha256="f" * 64,
-                                 workers=h.workers.contract, delivery=h.delivery.contract)
-        retained = validate_memory_settings_history(inventory, config, control.policy)
-        assert len(retained) == 2
         from shared_context.behavior_instruction import conversation_key
-        from shared_context.behavior_migration import _kind_models
         from shared_context.behavior_operations import control_key
         from shared_context.behavior_profile_selection import head_key, selection_key
         from shared_context.behavior_runtime import runtime_key
         from shared_context.behavior_work_policy import work_policy_key
-        from shared_context.memory_bridge_settings import captured_memory_read_keys
-        kinds = _kind_models()
-        for setting in retained.values():
-            assert kinds[setting.kind].model_validate_json(setting.model_dump_json()) == setting
         for original in (control.records[first.binding.binding_id], control.records[second.binding.binding_id]):
             b = original.binding
             row_id = work_policy_key("registration", original.admission_id)
@@ -144,7 +179,6 @@ def test_new_conversation_reads_selected_committed_note_without_changing_older_c
             memory = captured_memory_read_keys(control.policy, original.profile.memory_scope,
                                                 first_turn=True, records=tuple(control.records.values()))
             assert set(actual) == fixed | memory
-        check_history(h)
         later_old = open_turn(h, control, human, "old-followup", old.assignment.task.instruction.conversation_id)
         assert later_old.assignment.task.instruction.prompt_profile == HISTORY_SKILL_DRAFT_PROFILE
         assert control.records[later_old.binding.binding_id].profile.memory_scope is None

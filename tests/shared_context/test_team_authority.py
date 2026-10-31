@@ -10,10 +10,7 @@ from shared_context.behavior_auth import APPROVAL_SCOPE, READ_SCOPE, BehaviorAut
 from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_store import BehaviorStore
 from shared_context.behavior_server_config import TeamDefaults
-from shared_context.behavior_team_authority import (
-    MAX_TEAM_NARROWINGS, TeamAuthority, TeamUsageLedger, initialize_team, narrow_team, read_team_authority,
-    team_authority_key, team_ledger_key, team_root_budget_id, validate_team_authority_history,
-)
+from shared_context.behavior_team_authority import MAX_TEAM_NARROWINGS, TeamAuthority, TeamUsageLedger, initialize_team, narrow_team, read_team_authority, team_authority_key, team_ledger_key, team_root_budget_id
 from shared_context.behavior_team_authority_operator import operate
 from shared_context.behavior_team_registry import TeamRegistry
 from shared_context.errors import Problem
@@ -134,61 +131,6 @@ def test_operator_cli_initializes_shows_and_reconciles(teams, jwk_client, signin
     with pytest.raises(Problem) as denied:
         operate(composition, "init", owner, team_id="team-two", request_id="owner-cannot", **cli)
     assert denied.value.status == 403
-
-
-def test_team_rows_survive_the_real_startup_history_classifier(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    ids = c.h.config.identity
-    registry = TeamRegistry(c.control.store, tenant_id=ids.tenant_id, operator_oid=ids.human_oid,
-                            legacy_team_id=ids.team_id, legacy_owner_oid=ids.human_oid,
-                            agent_oids=tuple(agent.oid for agent in ids.agents))
-    registry.register_owner(c.human, "startup-owner", "another-team", SECOND_OWNER)
-    initialize_team(c.control.store, registry, c.human, "startup-team", "another-team", **SETTINGS)
-    inventory = read_startup(c)
-    classified = validate_team_authority_history(inventory, c.h.config)
-    domain = c.h.config.table.scope.authority_domain
-    assert set(classified) == {team_authority_key(domain, "another-team"), team_ledger_key(domain, "another-team")}
-    assert isinstance(classified[team_authority_key(domain, "another-team")], TeamAuthority)
-
-
-def test_startup_classifier_refuses_an_orphan_or_changed_ledger(synthetic_standing_v1):
-    from shared_context.behavior_operations import _write
-    from shared_context.behavior_store import ControlChanges, ControlRequest
-    c = synthetic_standing_v1
-    ids = c.h.config.identity
-    domain = c.h.config.table.scope.authority_domain
-    orphan = TeamUsageLedger(tenant_id=str(ids.tenant_id), team_id="ghost-team", authority_domain=domain)
-    key = team_ledger_key(domain, "ghost-team")
-    c.control.store.transact(ControlRequest(request_id="orphan-ledger", request_digest="e" * 64, read_set=(key,)),
-                             lambda _: ControlChanges(writes=(_write(key, orphan, "create"),), result={}))
-    with pytest.raises(Problem) as orphaned:
-        validate_team_authority_history(read_startup(c), c.h.config)
-    assert orphaned.value.body["error"]["code"] == "TEAM_AUTHORITY_INVALID"
-
-
-def test_startup_classifier_refuses_a_ledger_changed_after_initialization(synthetic_standing_v1):
-    from shared_context.behavior_operations import _row, _write
-    from shared_context.behavior_store import ControlChanges, ControlRequest
-    c = synthetic_standing_v1
-    ids = c.h.config.identity
-    domain = c.h.config.table.scope.authority_domain
-    registry = TeamRegistry(c.control.store, tenant_id=ids.tenant_id, operator_oid=ids.human_oid,
-                            legacy_team_id=ids.team_id, legacy_owner_oid=ids.human_oid,
-                            agent_oids=tuple(agent.oid for agent in ids.agents))
-    registry.register_owner(c.human, "changed-owner", "changed-team", SECOND_OWNER)
-    initialize_team(c.control.store, registry, c.human, "changed-team-init", "changed-team", **SETTINGS)
-    key = team_ledger_key(domain, "changed-team")
-
-    def change(rows):
-        ledger = _row(rows, key, TeamUsageLedger)
-        return ControlChanges(writes=(_write(key, ledger.model_copy(update={"model_metered_microusd": 1}), "replace"),),
-                              result={})
-
-    c.control.store.transact(ControlRequest(request_id="unsupported-ledger-change", request_digest="d" * 64,
-                                            read_set=(key,)), change)
-    with pytest.raises(Problem) as changed:
-        validate_team_authority_history(read_startup(c), c.h.config)
-    assert changed.value.body["error"]["code"] == "TEAM_AUTHORITY_INVALID"
 
 
 OWNER = BehaviorPrincipal(TENANT, SECOND_OWNER, "team-two", "human", None, frozenset({"read", "submit", "approve"}))
@@ -333,7 +275,7 @@ def test_server_configurations_without_team_defaults_keep_their_digest(synthetic
     assert ServerConfigurationDocument.model_validate_json(with_defaults.model_dump_json()) == with_defaults
 
 
-def test_owner_steps_survive_the_real_startup_history_classifier(synthetic_standing_v1):
+def test_owner_steps_narrow_the_stored_limits(synthetic_standing_v1):
     c = synthetic_standing_v1
     ids = c.h.config.identity
     registry = TeamRegistry(c.control.store, tenant_id=ids.tenant_id, operator_oid=ids.human_oid,
@@ -345,35 +287,8 @@ def test_owner_steps_survive_the_real_startup_history_classifier(synthetic_stand
                               frozenset({"read", "approve"}))
     narrow_team(c.control.store, registry, owner, "startup-lower-1", "another-team", connectors=("crm",))
     narrow_team(c.control.store, registry, owner, "startup-lower-2", "another-team", model_cap_microusd=1)
-    classified = validate_team_authority_history(read_startup(c), c.h.config)
-    domain = c.h.config.table.scope.authority_domain
-    value = classified[team_authority_key(domain, "another-team")]
+    value, _ = read_team_authority(c.control.store, c.h.config.table.scope.authority_domain, "another-team")
     assert value.limits.model_dump(mode="json") == {"model_cap_microusd": 1, "max_agents": 4, "connectors": ["crm"]}
-
-
-def test_startup_classifier_refuses_an_owner_step_without_its_original_receipt(synthetic_standing_v1):
-    from shared_context.behavior_operations import _row, _write
-    from shared_context.behavior_store import ControlChanges, ControlRequest
-    from shared_context.behavior_team_authority import TeamNarrowing
-    c = synthetic_standing_v1
-    ids = c.h.config.identity
-    domain = c.h.config.table.scope.authority_domain
-    registry = TeamRegistry(c.control.store, tenant_id=ids.tenant_id, operator_oid=ids.human_oid,
-                            legacy_team_id=ids.team_id, legacy_owner_oid=ids.human_oid,
-                            agent_oids=tuple(agent.oid for agent in ids.agents))
-    registry.register_owner(c.human, "forged-owner", "forged-team", SECOND_OWNER)
-    initialize_team(c.control.store, registry, c.human, "forged-team-init", "forged-team", **SETTINGS)
-    key = team_authority_key(domain, "forged-team")
-
-    def forge(rows):
-        value = _row(rows, key, TeamAuthority)
-        step = TeamNarrowing(request_id="never-requested", owner_oid=SECOND_OWNER, max_agents=1)
-        return ControlChanges(writes=(_write(key, value.model_copy(update={"narrowings": (step,)}), "replace"),),
-                              result={})
-
-    c.control.store.transact(ControlRequest(request_id="forged-step", request_digest="c" * 64, read_set=(key,)), forge)
-    with pytest.raises(Problem):
-        validate_team_authority_history(read_startup(c), c.h.config)
 
 
 def test_owners_of_two_teams_may_use_the_same_request_id(teams):

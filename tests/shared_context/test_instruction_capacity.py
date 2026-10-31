@@ -23,7 +23,7 @@ from shared_context.behavior_work_policy import work_policy_key
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_models, runtime_path
 from test_instruction_prompt import configured as configured_prompt, sdk_options
 from test_m3_auth import signing_key, jwk_client
 
@@ -106,7 +106,6 @@ def test_next_turn_switches_model_capacity_without_mutating_previous_task_or_arc
     public = h.client.get("/work-policy/v1/conversations/" + first["conversation_id"], headers=h.headers())
     assert public.status_code == 200
     assert [turn["model_capacity"]["model"] for turn in public.json()["turns"]] == list(facts)
-    check_history(h)
 
 
 @pytest.mark.parametrize("values", [
@@ -338,7 +337,6 @@ def test_new_turn_uses_reloaded_facts_but_saved_task_remains_its_original_snapsh
     assert options[1]["model_capabilities"].limits.max_output_tokens == 1024
     assert control.records[second["binding_id"]].profile.instruction.model_capacity.source_sha256 != snapshot.source_sha256
     assert h.store.read_snapshot(keys) == original
-    check_history(h)
 
 
 def test_capacity_drift_after_acquire_refuses_original_restore_without_new_model_or_archive(assistant, monkeypatch):

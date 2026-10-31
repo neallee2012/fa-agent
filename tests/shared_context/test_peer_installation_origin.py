@@ -126,27 +126,15 @@ def test_peer_refuses_an_unverified_or_different_origin_without_falling_back_to_
         assert refused.value.body["error"]["code"] == "AGENT_ORIGIN_UNAVAILABLE"
 
 
-def test_root_still_validates_full_history_and_failed_validation_cannot_be_reused(origin_peer, monkeypatch):
+def test_a_refused_root_leaves_its_peer_no_origin_to_reuse(origin_peer):
     peers, _loop = origin_peer
     owner, peer = peers.a, peers.b
-    scans = []
-    inventory = owner.runtime.store.read_inventory
-
-    def counted(*args, **kwargs):
-        peer.installation()
-        scans.append(True)
-        return inventory(*args, **kwargs)
-
-    monkeypatch.setattr(owner.runtime.store, "read_inventory", counted)
-    # This fixture's later standing-history predecessor hashes are deliberately synthetic.
+    # This fixture's table carries a retired standing-policy pointer, so the root's origin check refuses it.
     with pytest.raises(Problem):
         owner.installation()
-    assert scans
-    scans.clear()
     with pytest.raises(Problem) as refused:
         peer.installation()
     assert refused.value.body["error"]["code"] == "AGENT_ORIGIN_UNAVAILABLE"
-    assert scans == []
 
 
 def test_peer_keeps_the_real_installation_fence_and_atomic_probe_reads(origin_peer, monkeypatch):

@@ -8,7 +8,7 @@ from shared_context import behavior_wire as wire
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
 from test_conversation_note_memory import SETTINGS, commit_note, enable_memory, memory_conversations
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import open_turn, ordinary, settle
 
@@ -44,7 +44,6 @@ def test_human_selected_type_and_validity_reach_the_same_reader_without_changing
         assert result.usage == "knowledge-data-not-permission"
         assert all(original.text == "original inventory" for original in result.originals)
         settle(reader, ordinary(reader.assignment.sdk_session_id))
-        check_history(h)
         assert h.endpoint.requests == []
     finally:
         if reader is not None:

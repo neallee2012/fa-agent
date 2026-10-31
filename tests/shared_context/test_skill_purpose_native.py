@@ -25,7 +25,7 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy import work_policy_key
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -201,7 +201,6 @@ def test_fixed_sdk_catalog_discloses_approved_purpose_then_reads_exact_body_acro
             assert [event["data"]["content"] for event in events if event["type"] == "user.message"] == list(texts[:phase + 1])
             assert not any(event["type"] in {"skill.invoked", "newskill.invoked", "session.compaction_start"} for event in events)
             assert bridge._sdk_stop.graceful
-            check_history(h)
     assert prompts == list(texts) and len(calls) == 5 and not forced
     assert set(checkpoint_reads) == checkpoint_artifacts
     assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"

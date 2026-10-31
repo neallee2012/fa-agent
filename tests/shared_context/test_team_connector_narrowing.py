@@ -199,7 +199,7 @@ def test_the_agent_settings_api_saves_one_owner_choice_per_request_with_compare_
 
 
 def test_saved_choices_pass_the_real_startup_and_migration_readers(team):
-    from shared_context.behavior_migration import MigrationStore, _quiescence, installed_origin
+    from shared_context.behavior_migration import MigrationStore, installed_origin
     from test_conversation_transfer_startup import read_startup
     from test_resident_worker_poc import outcome_of
 
@@ -207,8 +207,7 @@ def test_saved_choices_pass_the_real_startup_and_migration_readers(team):
 
     def readers():
         store = MigrationStore(c.h.composition.clients[0], config.table.scope)
-        return (outcome_of(lambda: read_startup(c)), outcome_of(lambda: _quiescence(store.read_inventory(), config)),
-                outcome_of(lambda: installed_origin(store, config)))
+        return (outcome_of(lambda: read_startup(c)), outcome_of(lambda: installed_origin(store, config)))
 
     baseline = readers()
     assert baseline[0] == "ok"

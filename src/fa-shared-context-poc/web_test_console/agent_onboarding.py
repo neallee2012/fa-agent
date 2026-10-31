@@ -243,15 +243,12 @@ class AgentOnboarding:
                 and policy.sha256 != original.standing_policy_sha256, "AGENT_ONBOARDING_RESPONSE_INVALID", 502)
         tasks = []
         for task in original.tasks:
-            if task.mode != "normal_pull":
-                continue
             _, binding, _ = derive_work(policy, task.submit_request_id, policy.evidence_mode)
             tasks.append({**task.model_dump(mode="json"),
                 "binding_id": binding.binding_id, "job_id": binding.job_id, "work_id": binding.work.work_id,
                 "event_id": binding.event_id, "root_request_id": binding.root_request_id,
                 "obligation_id": binding.obligation_id, "owner_record_id": binding.owner.owner_record_id,
                 "route": binding.route.model_dump(mode="json")})
-        require(tasks, "AGENT_ONBOARDING_UNAVAILABLE")
         try:
             config = parse_config(canonical({
                 **original.model_dump(mode="json"), "console_id": "console-" + sha(agent_id.encode())[:24],

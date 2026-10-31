@@ -87,19 +87,11 @@ def require(value, code, status=409):
         raise ConsoleError(code, status)
 
 
-class OriginalFailureReference(wire.WireModel):
-    contract: Literal["fa-original-web-handoff-status-v1"]
-    payload_sha256: wire.Digest
-    payload_bytes: Annotated[int, Field(ge=1, le=131072)]
-    delivery_entry_id: wire.Identifier
-    owner_conversation_id: wire.Identifier
-
-
 class FixedTask(wire.WireModel):
     task_id: wire.Identifier
     label: Annotated[str, Field(min_length=1, max_length=80)]
     description: Annotated[str, Field(max_length=400)] = ""
-    mode: Literal["normal_pull", "original_failure"] = "normal_pull"
+    mode: Literal["normal_pull"] = "normal_pull"
     submission: Literal["assistant", "lifecycle"] = "assistant"
     binding_id: wire.Identifier
     job_id: wire.Identifier
@@ -113,8 +105,7 @@ class FixedTask(wire.WireModel):
     submit_request_id: wire.Identifier
     fetch_request_id: wire.Identifier
     ack_request_id: wire.Identifier
-    handoff_id: wire.Identifier | None = None
-    original_failure: OriginalFailureReference | None = Field(default=None, exclude_if=lambda value: value is None)
+    handoff_id: wire.Identifier | None = None  # always None; kept so the config SHA of existing journals does not change
     allowed_actions: tuple[Literal["status", "submit", "fetch", "acknowledge"], ...] = ("status",)
     max_payload_bytes: Annotated[int, Field(ge=1, le=131072)] = 32768
 
@@ -123,15 +114,7 @@ class FixedTask(wire.WireModel):
         if (self.route.channel_id != INBOX_CHANNEL_ID or len(set(self.allowed_actions)) != len(self.allowed_actions)
                 or len({self.submit_request_id, self.fetch_request_id, self.ack_request_id}) != 3):
             raise ValueError("one authenticated-pull destination and unique fixed command IDs required")
-        if self.mode == "original_failure":
-            if self.handoff_id is None or "submit" in self.allowed_actions:
-                raise ValueError("retained handoff cannot submit work")
-            if self.original_failure is not None and (
-                    self.route.account_id != self.original_failure.delivery_entry_id
-                    or self.route.thread_id != self.original_failure.owner_conversation_id
-                    or self.original_failure.payload_bytes > self.max_payload_bytes):
-                raise ValueError("web handoff requires the original entry/conversation and bounded payload")
-        elif self.handoff_id is not None or self.original_failure is not None:
+        if self.handoff_id is not None:
             raise ValueError("normal pull cannot supply a retained handoff")
         return self
 
@@ -721,170 +704,3 @@ class PullAdapter:
         except (ValueError, TypeError, KeyError):
             raise ConsoleError("ACK_UNCONFIRMED", 502) from None
         return receipt
-
-
-class OriginalFailureStatus(wire.WireModel):
-    schema_version: Literal["fa-original-web-handoff-status-v1"]
-    handoff_id: wire.Identifier
-    job_id: wire.Identifier
-    obligation_id: wire.Identifier
-    delivery_id: wire.Identifier
-    payload_sha256: wire.Digest
-    work_state: Literal["cancelled"]
-    fulfillment: Literal["pending", "fulfilled"]
-    fulfilled: bool
-    confirmation_level: Literal["client_received"] | None
-    confirmed_levels: Annotated[tuple[Literal["client_received"], ...], Field(max_length=1)]
-    supported_confirmation_level: Literal["client_received"]
-    expired: bool
-    dispatch_performed: Literal[False]
-
-    @model_validator(mode="after")
-    def receipt_meaning(self):
-        expected = ("fulfilled", "client_received", ("client_received",)) if self.fulfilled else ("pending", None, ())
-        if (self.fulfillment, self.confirmation_level, self.confirmed_levels) != expected:
-            raise ValueError("status confirmation and fulfillment fields disagree")
-        return self
-
-
-class OriginalFailureReceiptResult(wire.WireModel):
-    fulfillment: Literal["fulfilled"]
-    confirmation_level: Literal["client_received"]
-    confirmed_levels: tuple[Literal["client_received"]]
-    fulfillment_receipt_id: wire.Identifier
-    channel_handoff_id: wire.Identifier
-
-
-class OriginalFailureReceipt(wire.WireModel):
-    result: OriginalFailureReceiptResult
-    control_request_id: wire.Identifier
-    control_request_digest: wire.Digest
-
-
-class OriginalAckIntent(wire.WireModel):
-    """Existing non-secret journal image; never reconstruct an ACK challenge."""
-    method: Literal["POST"]
-    path: str
-    request_id: wire.Identifier
-    body_sha256: wire.Digest
-    created_at: datetime
-    configuration_sha256: wire.Digest
-    scope_id: wire.Identifier | None = None
-    console_id: wire.Identifier | None = None
-    authorization_mode: Literal["backend-per-work"] | None = None
-    exchange_id: wire.Identifier
-    binding: wire.DeliveryBinding
-
-    @field_validator("created_at")
-    @classmethod
-    def utc(cls, value):
-        if value.tzinfo is None or value.utcoffset() != timedelta(0):
-            raise ValueError("original intent time must be UTC")
-        return value
-
-
-class OriginalFailureAdapter(PullAdapter):
-    """Fixed receiver, plus explicit original-ACK reconciliation; no operator."""
-    reason = "RETAINED_BACKEND_NOT_VERIFIED"
-
-    @staticmethod
-    def paths(task):
-        require(task.mode == "original_failure" and task.handoff_id is not None, "ACTION_NOT_ALLOWED", 403)
-        root = "/web/v1/original-failure/"+task.handoff_id
-        return {"status": root+"/status", "fetch": root+"/fetch", "acknowledge": root+"/acknowledge"}
-
-    def require_enabled(self, task):
-        require(task.mode == "original_failure" and task.original_failure is not None, self.reason)
-
-    def request(self, task, action):
-        self.require_enabled(task)
-        paths = self.paths(task)
-        require(action in {"status", "fetch"}, "ACTION_NOT_ALLOWED", 403)
-        return ("GET", paths[action], None) if action == "status" else (
-            "POST", paths[action], wire.Command(request_id=task.fetch_request_id).model_dump(mode="json"))
-
-    def status(self, task, token):
-        data, _ = self.send(*self.request(task, "status"), token)
-        try:
-            strict_json(data)
-            result = OriginalFailureStatus.model_validate_json(data)
-        except (ValueError, TypeError):
-            raise ConsoleError("STATUS_INVALID", 502) from None
-        require(result.handoff_id == task.handoff_id and result.job_id == task.job_id
-                and result.obligation_id == task.obligation_id
-                and result.delivery_id == control_key("delivery-final-id", task.obligation_id)
-                and result.payload_sha256 == task.original_failure.payload_sha256, "STATUS_BINDING_MISMATCH", 502)
-        return result
-
-    def fetch(self, task, token, delivery_id):
-        self.require_enabled(task)
-        result = super().fetch(task, token, delivery_id)
-        expected = task.original_failure
-        require(result.binding.delivery_id == control_key("delivery-final-id", task.obligation_id)
-                and result.binding.version == 1 and not result.binding.artifacts
-                and result.binding.payload_digest == expected.payload_sha256
-                and len(result.payload) == expected.payload_bytes
-                and result.parsed.message_kind == "failure" and result.parsed.work_state == "cancelled"
-                and result.parsed.notification_code == "delivery_needs_attention"
-                and result.parsed.known_effects == result.parsed.unresolved_operations == ()
-                and result.parsed.result_evidence_id is not None,
-                "RESULT_BINDING_MISMATCH", 502)
-        return result
-
-    def acknowledge(self, task, result, token):
-        self.require_enabled(task)
-        require(result.binding.payload_digest == task.original_failure.payload_sha256
-                and result.binding.delivery_id == control_key("delivery-final-id", task.obligation_id)
-                and result.binding.obligation_id == task.obligation_id and result.binding.route == task.route
-                and result.binding.version == 1 and not result.binding.artifacts, "RESULT_BINDING_MISMATCH", 502)
-        data, _ = self.send("POST", self.paths(task)["acknowledge"], self.ack_body(task, result), token)
-        return self.checked_receipt(task, result.binding, data)
-
-    def checked_receipt(self, task, binding, data):
-        from shared_context.behavior_web_handoff import handoff_key
-        try:
-            strict_json(data)
-            receipt = OriginalFailureReceipt.model_validate_json(data)
-        except (ValueError, TypeError):
-            raise ConsoleError("ACK_UNCONFIRMED", 502) from None
-        require(receipt.control_request_id == handoff_key("fulfillment", task.handoff_id)
-                and receipt.result.channel_handoff_id == task.handoff_id
-                and receipt.result.fulfillment_receipt_id == control_key(
-                    "inbox-ack-evidence", binding.delivery_id), "ACK_UNCONFIRMED", 502)
-        # The digest covers a server-only VerifiedDeliveryReceipt, not these
-        # public response fields. Its full proof is verified by the backend.
-        return receipt.model_dump(mode="json")
-
-    def original_ack(self, task, record, now):
-        self.require_enabled(task)
-        require(isinstance(record, dict) and record.get("state") == "UNKNOWN"
-                and "receipt" not in record and "confirmation_level" not in record,
-                "ORIGINAL_ACK_REQUIRED")
-        try:
-            value = OriginalAckIntent.model_validate_json(canonical(record["intent"]))
-        except (ValueError, TypeError, KeyError):
-            raise ConsoleError("ORIGINAL_ACK_INVALID") from None
-        identity = (
-            value.console_id == self.config.console_id and value.authorization_mode == self.config.authorization_mode
-            and value.scope_id is None if isinstance(self.config, SteadyConsoleConfig) else
-            value.scope_id == self.config.scope_id and value.console_id is None and value.authorization_mode is None)
-        binding = value.binding
-        require(value.configuration_sha256 == self.config.sha256 and identity
-                and value.path == self.paths(task)["acknowledge"] and value.request_id == task.ack_request_id
-                and value.created_at <= now and binding.payload_digest == task.original_failure.payload_sha256
-                and binding.obligation_id == task.obligation_id
-                and binding.delivery_id == control_key("delivery-final-id", task.obligation_id)
-                and binding.version == 1 and not binding.artifacts and binding.route == task.route
-                and binding.channel_version == task.channel_version,
-                "ORIGINAL_ACK_INVALID")
-        return value
-
-    def reconcile_request(self, task, original):
-        self.require_enabled(task)
-        require(original.request_id == task.ack_request_id, "ORIGINAL_ACK_INVALID")
-        path = "/web/v1/original-failure/"+task.handoff_id+"/reconcile"
-        return "POST", path, wire.Command(request_id=original.request_id).model_dump(mode="json")
-
-    def reconcile(self, task, original, token):
-        data, _ = self.send(*self.reconcile_request(task, original), token)
-        return self.checked_receipt(task, original.binding, data)

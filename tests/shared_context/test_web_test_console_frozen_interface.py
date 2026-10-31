@@ -59,10 +59,10 @@ def test_sidebar_agent_is_derived_from_the_actual_bound_configuration(real_inter
 
 @pytest.fixture
 def real_interface(auth,jwk_client,signing_key,tmp_path,tmp_path_factory,monkeypatch):
-    from shared_context.behavior_channels_pin_refresh import core_code_sha256
+    from shared_context.behavior_code_identity import code_sha256 as core_code_sha256
     current_core=core_code_sha256()
-    import test_teams_metrics
-    monkeypatch.setattr(test_teams_metrics,"TENANT",TENANT)
+    import assistant_sdk_fixture
+    monkeypatch.setattr(assistant_sdk_fixture,"TENANT",TENANT)
     h,control,human,facts=enabled(assistant_harness(auth,jwk_client,signing_key),after_global=True)
     catalog=[{"deployment":name,"provisioning":"Succeeded","capabilities":{"chatCompletion":"true"}}
              for name in ("gpt-4.1-mini","configured-second-model")]

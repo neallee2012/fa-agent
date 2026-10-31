@@ -24,7 +24,7 @@ from shared_context.behavior_sdk_state import DIAG_ARCHIVE_CODEC
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_m2_copilot import runtime_path
 from test_m3_auth import signing_key, jwk_client
 from test_sdk_compaction_product import configured
@@ -159,7 +159,6 @@ def test_short_native_compaction_preserves_signed_metadata_and_inherited_restore
             if phase != "first":
                 assert upload.source.execution.tokens_removed == -11
                 assert upload.source.execution.messages_removed == 3
-            check_history(h)
             current = h.client.get("/work-policy/v1/conversations/" + cid, headers=h.headers())
             assert current.status_code == 200 and current.json()["can_follow_up"]
         for number, expected in ((1, FIRST_REPLY), (2, SECOND_REPLY)):

@@ -1,6 +1,6 @@
-"""The native capability turn gate reads the target selection and the legacy-CID row in one guarded snapshot.
+"""The native capability turn gate reads only the legacy-CID row (the target selection reader was retired, R6-H).
 
-Offline counts (FA_TIMING ``table_gets``/``batches``); the same results and the same refusals in the same order.
+Offline counts (FA_TIMING ``table_gets``/``batches``); the same refusals in the same order.
 """
 
 import json
@@ -12,7 +12,6 @@ from shared_context import behavior_capability_calls, mcp_client, native_agent_a
 from shared_context.behavior_instruction import conversation_key
 from shared_context.behavior_timing import phase_timing
 from shared_context.errors import Problem
-from shared_context.native_capability_api import NativeCapabilityGateway
 from test_agent_runtime import peer_runtime  # noqa: F401
 from test_behavior_store import changes, request, write
 from test_capability_calls import KEY, listed
@@ -52,35 +51,17 @@ def measured(caplog, call):
     return result, (timing["table_gets"], timing["batches"])
 
 
-def test_catalog_gate_reads_both_rows_in_one_snapshot_with_the_same_result(listing, monkeypatch, caplog):
+def test_catalog_gate_reads_one_guarded_legacy_row_snapshot(listing, caplog):
     case, native = listing, gateway(listing)
     scope = started(case, (WEB, SKILLS))
-    batched, batched_counts = measured(caplog, lambda: native.capability_catalog(case.principal, scope))
-    monkeypatch.setattr(NativeCapabilityGateway, "_rows", lambda self, scope, cid: None)
-    separate, separate_counts = measured(caplog, lambda: native.capability_catalog(case.principal, scope))
-    assert batched == separate and [item.entry_id for item in batched.entries] == ["WebIQ-MCP"]
-    # Separate: two guard/installation-bracketed single-row snapshots. Batched: one bracket, both rows together.
-    assert separate_counts == (10, 10)
-    assert batched_counts == (6, 5)
+    result, counts = measured(caplog, lambda: native.capability_catalog(case.principal, scope))
+    # Was (6, 5) with the selection key batched in, (10, 10) unbatched.
+    assert counts == (5, 5)
+    assert [item.entry_id for item in result.entries] == ["WebIQ-MCP"]
 
 
-@pytest.mark.parametrize("case_name", ["no_conversation", "other_target"])
-def test_rows_reads_nothing_without_a_conversation_or_for_another_target(listing, caplog, case_name):
+def test_catalog_gate_keeps_its_refusals_and_their_order(listing, monkeypatch):
     case, native = listing, gateway(listing)
-    scope, cid = native.relay._sender_scope(case.principal), case.sender.conversation_id
-    if case_name == "no_conversation":
-        cid = None
-    else:
-        scope = scope.model_copy(update={"target": scope.target.model_copy(update={"agent_id": "registered-peer"})})
-    rows, counts = measured(caplog, lambda: native._rows(scope, cid))
-    assert rows is None and counts == (0, 0)
-
-
-@pytest.mark.parametrize("batched", [True, False])
-def test_catalog_gate_keeps_its_refusals_and_their_order(listing, monkeypatch, batched):
-    case, native = listing, gateway(listing)
-    if not batched:
-        monkeypatch.setattr(NativeCapabilityGateway, "_rows", lambda self, scope, cid: None)
     scope = started(case, (WEB, SKILLS))
     case.base.a.runtime.work_policy.store.transact(
         request("legacy-table-conversation"),

@@ -513,51 +513,14 @@ class ServerConfiguration(_Model):
         return self
 
 
-from .behavior_channels import TeamsChannelConfiguration
-
-
-class ServerConfigurationV2(ServerConfiguration):
-    """Explicit extension; v1 serialization and every original contract stay intact."""
-    schema_version: Literal["fa-behavior-server-v2"]
-    channels: TeamsChannelConfiguration
-
-    @model_validator(mode="after")
-    def exact_channels(self):
-        setup = self.channels
-        if (self.workload_version != "assistant-v1.2" or self.workers.capacity != 1
-                or self.delivery.channel.channel_id != "authenticated-pull"
-                or self.delivery.channel.supported_levels != ("client_received",)
-                or self.delivery.channel.max_confirmation_level != "client_received"
-                or len(self.bindings) != 1 or len(self.roots) != 1
-                or setup.template_binding_id != self.bindings[0].binding_id
-                or setup.personal.team_id != self.identity.team_id
-                or setup.personal.tenant_id != self.identity.tenant_id
-                or setup.personal.intended_user_oid != self.identity.human_oid
-                or setup.personal.uami_client_id != self.identity.managed_identity_client_id
-                or setup.native_max_generations > self.workers.max_generations
-                or setup.max_model_requests > self.assistant.profiles[0].max_model_requests
-                or self.assistant.profiles[0].require_operation):
-            raise ValueError("Teams metrics requires the original C1/root, designated personal identity and reviewed SDK template")
-        _path(setup.native_evidence_path)
-        return self
-
-    def predecessor(self):
-        value = self.model_dump(mode="json")
-        value.pop("channels")
-        value["schema_version"] = "fa-behavior-server-v1"
-        return ServerConfiguration.model_validate_json(json.dumps(value))
-
-    def resource_bindings(self):
-        return {**super().resource_bindings(),
-                "channels_sha256": digest(self.channels.model_dump(mode="json"))}
-
-
 class ServerConfigurationDocument:
     @staticmethod
     def model_validate_json(raw):
         value = json.loads(raw, object_pairs_hook=_pairs)
-        model = ServerConfigurationV2 if value.get("schema_version") == "fa-behavior-server-v2" else ServerConfiguration
-        return model.model_validate_json(raw)
+        if value.get("schema_version") == "fa-behavior-server-v2":
+            from .errors import Problem
+            raise Problem(503, "BEHAVIOR_CONFIGURATION", "the retired v2 Teams configuration can no longer start")
+        return ServerConfiguration.model_validate_json(raw)
 
 
 class ProtectionObservation(_Model):

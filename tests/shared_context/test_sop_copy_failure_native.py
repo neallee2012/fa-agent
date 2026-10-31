@@ -21,7 +21,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.behavior_sdk_compaction import events_from
 from web_test_console.freeform import ConversationProjection
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import submit, saved_turn
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -104,7 +104,6 @@ def test_fixed_sdk_cancel_after_known_copy_keeps_historical_effect_and_real_stop
         assert archive.sdk_stop.runtime_version == "1.0.83" and not forced and aborts
         events = events_from(bridges[0]._session_files.snapshot().files)
         assert [event["data"]["content"] for event in events if event["type"] == "user.message"] == [original]
-        check_history(h)
         response = h.client.get("/work-policy/v1/conversations/" + accepted["conversation_id"], headers=h.headers())
         view = ConversationProjection.model_validate_json(response.content)
         assert view.turns[0].state == "cancelled" and view.turns[0].sop_copy_outcome.stage == "saved"

@@ -25,7 +25,7 @@ from shared_context.errors import Problem
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from test_instruction_capacity import configured_capacity, declared_facts, submit_capacity
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
 
@@ -166,7 +166,6 @@ def test_fixed_sdk_transmits_model_specific_capacity_and_reports_runtime_observa
             assert options["enable_config_discovery"] is False and options["mcp_servers"] == {}
             assert all(options[field] == [] for field in (
                 "skill_directories", "plugin_directories", "instruction_directories", "custom_agents"))
-            check_history(h)
         projection = h.client.get("/work-policy/v1/conversations/" + conversation, headers=h.headers())
         assert projection.status_code == 200 and projection.json()["can_follow_up"]
         assert [turn["model_capacity"] for turn in projection.json()["turns"]] == snapshots

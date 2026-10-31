@@ -21,7 +21,7 @@ from shared_context.tool_catalog import build_catalog, parse_entry_file
 from test_behavior_assistant import assistant
 from test_capability_capture import WEB_TOOLS, choose, enabled, turn
 from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_models, runtime_path
 from test_instruction_prompt import saved_turn, sdk_options
 from test_m3_auth import jwk_client, signing_key
 
@@ -161,4 +161,3 @@ def test_archive_saves_and_rebuilds_the_capability_record(assistant, monkeypatch
                            headers=h.headers())
     assert context.status_code == 200, context.text
     assert context.json()["capability_assembly"] == saved.capability_assembly.model_dump(mode="json")
-    check_history(h)

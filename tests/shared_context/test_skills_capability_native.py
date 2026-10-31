@@ -22,7 +22,7 @@ from shared_context.behavior_history_skill_draft_prompt import HISTORY_SKILL_DRA
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -89,5 +89,4 @@ def test_fixed_sdk_reads_an_approved_skill_through_the_skills_capability(assista
         archive = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
         assert archive.capability_assembly == combined.record
         assert [entry.name for entry in archive.skill_catalog.entries] == ["receipt-guide"]
-        check_history(h)
     assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"

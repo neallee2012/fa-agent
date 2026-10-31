@@ -1,4 +1,5 @@
 """Claimed SDK recovery on explicit offline transports; never native stop proof."""
+import copy
 import hashlib
 import json
 from datetime import timedelta
@@ -292,3 +293,22 @@ def test_positive_platform_proof_cannot_be_relabelled_as_a_success_result(recove
     with pytest.raises(Problem):
         verify_platform_stop(service.native, launch, changed, proof_row)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("schema_version", [
+    "fa-teams-pre-acquire-recovery-plan-v1", "fa-expired-teams-cleanup-plan-v1"])
+def test_a_stored_teams_stop_proof_refuses_at_parse(recovery, schema_version):
+    h, service, principal, _ = recovery
+    service.execute(principal, approve(service, principal))
+    from shared_context.behavior_foundry import _NativeEvidence
+    from shared_context.behavior_recovery import verify_platform_stop
+    launch = service.native.launch(service.scope.launch_id)
+    saved = _NativeEvidence.model_validate_json(json.dumps(data(h, "native-evidence", launch.sealed_evidence_id)))
+    key = native_key("platform-stop", launch.launch_id)
+    row = h.store.read_snapshot((key,))[key]
+    verify_platform_stop(service.native, launch, saved, row)
+    old = copy.deepcopy(row.payload)
+    old["data"]["intent"]["authorization"]["plan"]["schema_version"] = schema_version
+    with pytest.raises(Problem) as refused:
+        verify_platform_stop(service.native, launch, saved, SimpleNamespace(payload=old))
+    assert refused.value.body["error"]["code"] == "DELIVERY_RECORD_INVALID"

@@ -680,7 +680,7 @@ equivalent to 320 CSS pixels」；表格與程式碼區塊屬原文例外的二�
 
 **仍有人呼叫，不列入清理**
 - `/work-policy/v1/preflight`、`/work-policy/v1/submit`、`/work-policy/v1/submit-reconcile`：job-bound instruction lane 使用。
-- `/behavior/v1/bindings/{binding_id}/delivery/pull` 與 `/delivery/acknowledge`：instruction delivery 與 `original_failure` 仍使用。
+- `/behavior/v1/bindings/{binding_id}/delivery/pull` 與 `/delivery/acknowledge`：instruction delivery 仍使用。
 - `GET /behavior/v1/bindings/{binding_id}/operation`、`GET /operation/decision-state`、`POST /operation/approve`、`POST /operation/reject`、`POST /operation/approval-reconcile`、`POST /operation/rejection-reconcile`：`shared_context.behavior_operation_cli` 的 show/state/approve/reject/reconcile 仍使用（reconcile 走 `_RECONCILE_PATHS`），不能列為沒人呼叫。
 
 **只為相容保留**
@@ -2178,6 +2178,11 @@ manifest 固定匯出環境的絕對路徑；在目的地產生，移到不同�
 已有不同內容不覆寫。這是給 configured A/B 的檔案準備，不擴大 onboarding 的 HTTP reader，
 不改聊天 UI、舊 lane、Responses 或真人批准流程。
 
+本機工作台要用「連線」時，匯出加 `--cli-executable`、`--cli-azure-config-dir`、
+`--cli-subscription-id`（三個一起給），寫入 A/B 兩份 `config.json` 的 `cli`，
+`--client-id` 同時要填 Azure CLI client；都不給時 `cli` 維持 `null`，「連線」回 `CLI_NOT_CONFIGURED`。
+條件與範例見 [fresh runbook](../../../docs/POC-RUNBOOK.md#fresh-console-export)。遠端工作台與 azd 不用這些參數。
+
 原生 sidecar 只指定路徑，不能替 scoped B 批准範本。B 尚無版本化 profile／自己的
 selection 時，API template export／native capture 都回 `AGENT_TEMPLATE_PROFILE_UNSUPPORTED`；
 明確 `foundry-native-v1` 連線不 fallback 到 job-bound。沿既有主人選版流程保存精確範本
@@ -2193,6 +2198,9 @@ selection 時，API template export／native capture 都回 `AGENT_TEMPLATE_PROF
 2026-10-07 接續另核 `NativeInstructionControl.refresh_routing`、`configured_prompt_override`、
 template export／`new_conversation_template` 及原 `select_profile`；fresh signed API 回歸
 確認 scoped B 明選後才能 export／capture，沒有放寬 server default 或改工作台路由。
+2026-10-30 的 `--cli-*` 參數由 `test_offline_export_cli_block_reaches_the_token_provider_and_is_all_or_none`
+涵蓋（讀回 `cli`、`CliTokenProvider` 用替身 `subprocess.run` 取得 token、9 種拒絕情境、拒絕覆寫）；
+未跑真 `az`，也沒有在 bridge 實際按「連線」。
 
 ## WAKE-03 忙碌時追加文字（LOCAL，未部署）
 
@@ -2747,7 +2755,7 @@ API prefix也涵蓋既有`/behavior/v1/...`的狀態、操作預覽／決定、p
 #### Verified against
 
 - 本片從已發布 `a3ac6c5` 工作；共用DTO取API線已發布 `434bf8e` 的純wire單檔，未修改其格式。
-  CLI／`AgentConnections`／`AgentConsoles`、原`StandingPolicyReader`與逐請求FastAPI dependency是實際入口。
+  CLI／`AgentConnections`／`AgentConsoles`、`InstructionReader`與逐請求FastAPI dependency是實際入口。
 - 真B policy／signed API的選版先重現`TEMPLATE_SELECTION_RESPONSE_INVALID`；client改用原
   `policy.scope_ids`／`agent_id`核ID與回條。B記憶回合的狀態也核真正觀察，而非僅HTTP200；
   admission改用同一scope。原A命名與hash不變。
@@ -3850,7 +3858,7 @@ SP-13只更新partial，PA-16原接受基準與四個C／12情境不變；三批
 主畫面只保留 Agent、聊天訊息、模型選擇與輸入。P05 後 legacy 固定測試與預算／期限面板也不再留在診斷區；舊 config／journal 只作相容。SHA、工作識別碼、回條與錯誤細節均為次要資訊；沒有新增 controller、批准或後端執行流程。
 
 - 已交辦或交辦回應未知時，主畫面不再引導重新送出。重啟後仍看原紀錄，不重新建立工作。
-- 已核對結果／已確認收件優先於舊取件的 NOT_STARTED 觀察；舊觀察和原 UNKNOWN 在明細保留。取得結果不等於收到；只有原 ACK 或原 failure ACK reconciliation 的 `client_received` 回條才顯示已收到。收件回應未知不因 GET 顯示 fulfilled 而改成成功。
+- 已核對結果／已確認收件優先於舊取件的 NOT_STARTED 觀察；舊觀察和原 UNKNOWN 在明細保留。取得結果不等於收到；只有原 ACK 的 `client_received` 回條才顯示已收到。收件回應未知不因 GET 顯示 fulfilled 而改成成功。
 - 取消結果只按已驗 payload 的已知欄位整理：工作已取消、是否已保存資料、模型結果是否仍未明、未驗證正常完成、預算未退回。保存不等於正常完成，取消不表示退款；未明操作只在主區顯示筆數，完整識別碼留在明細。
 - 正常固定 metrics 只顯示真回傳的三個整數欄位；不填預期答案。無法辨認的格式明示不能整理，原始內容及 payload 下載 bytes/SHA 不变，不把取消資料或保存狀態轉成成功答案。
 
@@ -3886,7 +3894,7 @@ P05 後，工作台不再提供 legacy `normal_pull` 固定工作、預算／期
 - `work_policy.py` 只保留 job-bound instruction lane 需要的 typed observation DTO 與核對 helper；不再提供 normal fixed-work `query_for` 或 `blocking_code` gate。
 - `standing.py` 的 preflight checker 仍供 `InstructionReader` 使用；normal `AssistantSubmit` 固定工作不再由 bridge 建立、顯示或送出。
 - `pull_continuation.py` 只剩 sidecar schema，CLI 參數仍接受；runtime 不再讀取、核對或續接 normal pull。
-- `original_failure` 是正式歷史轉交讀取路徑，仍保留；它不啟用 normal submit。
+- `original_failure` 模式已於 2026-10 移除：後端 `/web/v1/original-failure/*` 路由早已不存在（`OriginalFailureWebHandoff` 已移除），呼叫必然 404。task `mode` 只剩 `normal_pull`，因此 `tasks` 目前只是舊配置 schema，工作台不會列出任何設定的 task。
 
 若要查舊設計，請用 git 歷史；目前 README 只記錄 P05 後的有效行為。
 
@@ -3925,7 +3933,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 | `allowed_actions` | `status`、`submit`、`fetch`、`acknowledge` 的明確子集；預設只有 `status`。 |
 | `route` | 只允許原 `authenticated-pull`，recipient 必須是指定真人。`msteams` 不能透過此台履行責任。 |
 
-P05 後，這些 `normal_pull` task 只為舊配置相容而保留在 schema；工作台不列出、不送出，也不再用它們的預算／期限或 preflight gate。`original_failure` 仍可走正式歷史轉交讀取路徑。
+P05 後，這些 `normal_pull` task 只為舊配置相容而保留在 schema；工作台不列出、不送出，也不再用它們的預算／期限或 preflight gate。`original_failure` 模式已於 2026-10 移除。
 
 啟動時固定原配置 bytes 的 SHA：
 
@@ -3986,69 +3994,15 @@ submit、cancel、fetch、ACK 或其他工作 POST；只恢復之後正常使用
 | 確認收到 | 使用記憶體內原 exchange／ACK token／binding／digest，沿 `wire.PullAcknowledgment` 手動 `POST /delivery/acknowledge` 一次。只接受原 receipt 的 `client_received`／fulfilled／原 obligation、channel 與 evidence/request identity。不是 `provider_accepted`，也不是真人已讀。 |
 | 下載 | 原 verified payload bytes 或已檢查的收件摘要；不含 bearer 或 challenge token。摘要明列觀察時間、不是目前 live 結果。 |
 
-`/work/reconcile` 不是此台的輪詢：現有 runtime 後續仍可能 `_enqueue`。這個 client 因此**不呼叫它**。失聯、timeout、commit unknown、失去 challenge 時只保留原 intent；不換 ID、重新 ACK POST、返還 budget 或自稱已收到。GET status 顯示 fulfilled 也不會自動把未知 ACK 改成 client_received。僅 `original_failure` 有下述明確手動「核對原收件回條」；其他模式仍由管理者按原 requests／receipts 處理。
+`/work/reconcile` 不是此台的輪詢：現有 runtime 後續仍可能 `_enqueue`。這個 client 因此**不呼叫它**。失聯、timeout、commit unknown、失去 challenge 時只保留原 intent；不換 ID、重新 ACK POST、返還 budget 或自稱已收到。GET status 顯示 fulfilled 也不會自動把未知 ACK 改成 client_received。需要核對時由管理者按原 requests／receipts 處理。
 
 雙擊、重整及同 journal 重啟不再送提交／fetch／ACK。不同配置不能打開同 journal 來重置已送狀態。不要刪 journal 或換路徑避開未明責任。journal 是 client 的 once-intent 記錄，不是新的後端權威；它無法阻止人手刪檔或另造任意 client。
 
 challenge 和原 payload 只在單一 bridge process 記憶體；重啟後明列 `CHALLENGE_LOST`。已保存的正向 ACK 回條可唯讀下載，但標成**歷史觀察，不是目前 live 結果**。新登入不恢復舊窗口權利。
 
-## 原 failure：正式獨立轉交接點
+## 原 failure：已移除
 
-此 adapter 依 frozen `web-handoff-manifest.json` SHA `e5b12d0a02dcc7da99b74284eea19784c7aebbcbbceb9cce471e567d97218c29`、`web-handoff-contract.md` SHA `efb171996cf9d10b57dcfcd16795d094bb76fc04ac01662fbce591b63ed49f33` 實作。後端是 `OriginalFailureWebHandoff`，不是一般 msteams→pull 旁路。
-
-- `GET /web/v1/original-failure/{handoff_id}/status`
-- `POST /web/v1/original-failure/{handoff_id}/fetch`，body `wire.Command`
-- `POST /web/v1/original-failure/{handoff_id}/acknowledge`，body `wire.PullAcknowledgment`
-
-`OriginalFailureAdapter.paths()` 只產以上三條固定路徑；手動原 ACK 核對另以固定 `/reconcile` 路徑實作，沒有任意 path／operator 設定。父先在**獨立 operator 平面**完成原 signed source、positive stop、cancelled result 與 typed web handoff 的批准；UI 永不提供 preview／authorize／transfer／stop／model。
-
-可信 task 使用 `mode=original_failure`、原 `handoff_id`、`allowed_actions` 只含 `status/fetch/acknowledge`。另外提供 `original_failure` typed 參考：
-
-| 欄位 | 來源／要求 |
-|---|---|
-| `contract` | 固定 `fa-original-web-handoff-status-v1`，不是 enable boolean。 |
-| `payload_sha256`／`payload_bytes` | 父從已核的原 `WebHandoffPlan.payload` 取得 exact hash／長度，不由 HTTP200 或頁面自報。 |
-| `delivery_entry_id` | 原 `config.delivery.entry_id`，等於 task web route.account_id。 |
-| `owner_conversation_id` | 原 owner.conversation_id，等於 task web route.thread_id。 |
-
-task 的其他 work/event/root-request/owner/obligation/job/recipient 都是原件，不能自行建立。delivery ID 必須是 `control_key("delivery-final-id", original_obligation_id)`、version=1、artifacts=[]，web route 為原 tenant／原真人／authenticated-pull／`fa-pull-inbox-v1`。缺 `original_failure` 的舊配置仍保持 `RETAINED_BACKEND_NOT_VERIFIED`；normal 模式禁止帶此欄位，舊 normal JSON 序列化不新增 null 欄位。
-
-receiver 使用原同真人 delegated **Behavior.Read**（原 verifier 已映射 acknowledge），不需要 UI 取得 Approve。所有請求仍到固定 HTTPS origin；先 exact `WebHandoffStatus` 核 handoff/job/obligation/delivery/payloadSHA、cancelled、pending/fulfilled 與確認層級的一致性。status 到期仍可純讀；`expired=true` 只停用這筆 fetch/ACK，不關閉 steady 介面或其他工作。
-
-fetch 仍先核原 bytes／五個 headers／shared `_Payload`／typed Binding 與原 task、root、owner、recipient。再核這份原 saved failure 的 SHA／長度、version1、failure+cancelled、result evidence、空 artifacts／known effects／unresolved operations 與原 notification code。不重新序列化、不填 dummy 答案。fetch 後仍 pending。
-
-ACK 回應外殼**恰** `result/control_request_id/control_request_digest`，不接受額外 `guard_revision`。result 也只接受正式五欄，必須 fulfilled/client_received/[client_received]、同 handoff、`fulfillment_receipt_id=control_key("inbox-ack-evidence", delivery_id)`；`control_request_id=handoff_key("fulfillment", handoff_id)`。
-
-**信任界線**：公開 response 沒有完整 `VerifiedDeliveryReceipt`。client 只能核 control digest 的合法 SHA256 形式與上述原 IDs／回條語義，不能拿 `hash(result)` 冒稱重算 server proof。完整 canonical proof、request/read-set/write-set/history 由可信 backend 驗。本批真 producer ASGI 整合測試把 UI 收到的 digest 與原 `ControlRequest` receipt、實際 `VerifiedDeliveryReceipt` canonical digest 逐一比對；此測試不是 client 額外造一層權威。
-
-同 handoff 換 fetch request ID 不會取得新 exchange；client 更保守地只用原 fixed request 一次。ACK／履行回覆遺失、重啟或失去 challenge，都保留原 intent／UNKNOWN，不重 POST、不新 ID。GET status 顯示 fulfilled **不會**改本機 UNKNOWN 為已收件。
-
-### 手動「核對原收件回條」
-
-只對 `original_failure`，且既有 `allowed_actions` 已允許 `acknowledge`，才提供此按鈕。**不用改 config schema／config SHA、scope、日期或原 journal 路徑**。原資料库必須已有 `phase=acknowledge` 的 durable intent，而且 outcome 仍 `UNKNOWN`；沒有原 ACK、已確認或錯工作都拒絕。
-
-使用原 journal 已存的 typed `binding`／`exchange_id`／`request_id`／`body_sha256`／配置 SHA 核對同 handoff、原 payload SHA、version1、空 artifacts、原 recipient/route/channel。只接受原 ACK path/method/request ID；不從 browser 接受 ID、token 或 Binding。**不依賴已消失的 challenge 或 payload，不重新合成 ACK**。
-
-原 `body_sha256` 是當時確切 ACK bytes 的摘要。因 challenge 刻意不落盤，重啟後不能獨立重算該原 ACK digest；client 驗格式與其固定原 intent 關聯，並把原 intent SHA／body SHA 綁進新的 reconcile intent。它不是證明伺服器已收到 ACK：原 ACK 是否存在、是否可完成履行，仍由正式 backend 核對，不以 GET fulfilled 代替。
-
-點擊後先以同真人登入核對目前 status；expired 拒絕寫入。接著在原 journal 用 FULL transaction **另存** `phase=reconcile` 的一次性 intent，再送：
-
-```text
-POST /web/v1/original-failure/{同原handoff_id}/reconcile
-{"request_id":"原ACK完全相同的request_id"}
-```
-
-這可能補完已持久 ACK 的原履行 EGT，**不是 pure GET**。按鈕旁會明說可能補履行，只由人手點擊一次，不由 login／status／fetch／refresh／poll 觸發。不 fetch、不重送 ACK、不造新 exchange、ID、批准或預算。
-
-回應重用與 ACK 同一正式三欄外殼／五欄 result 校驗：原 deterministic control/evidence/handoff IDs、client_received／fulfilled 語義，以及 control digest 的合法 SHA256 形式。完整 `VerifiedDeliveryReceipt` 未在 response 出現，不能虛構 client 已獨立驗 server-only proof。
-
-成功另存 reconcile outcome／原 receipt，**原 ACK UNKNOWN row 的 intent 與 outcome bytes 完全保留**。畫面顯示「原ACK回應遺失；已核對原回條client_received（未重送）」，收件摘要含 `confirmation_source=original_ack_reconciliation`、`original_ack.state=UNKNOWN`、新的 `reconciliation` 回條與 `ack_resent=false`；失敗／取消的工作狀態不變，不表示真人已讀。
-
-如果 reconcile 自身 timeout、回覆不合法或拒絕，該 phase 保持 UNKNOWN，不重 POST；雙擊、refresh、重啟或不同 bridge instance 使用同 journal 都只觀察原 attempt。再次需要處理由管理者按原 ID 做獨立核對。原 backend grant 已過期時不寫，GET status／本機歷史摘要仍可用。token 正常過期／wrong human／CSRF 保護不變。
-
-本補丁保留原 HTTPX 90 秒 read timeout、connect10、原 bounded body時間與 retries=0；**沒有把 native BACKEND_OFFLINE 直接歸因到某個 transport timeout，也沒有拉長 timeout 充當修復**。保留父既有 CLI 修正：get-access-token 只傳固定 subscription+resource，核回應 tenant/subscription；不恢復互斥的 `--tenant`。
-
-status、fetch、ACK、reconcile 的 authorization/grant 期限都由原 backend 控制，不延舊 cleanup／window，也不把原 Teams route 改成 pull；只有正式 typed transfer＋原 web receipt 才解除原 pending。
+`original_failure` task 模式、`OriginalFailureAdapter` 與手動「核對原收件回條」於 2026-10 一併移除：它們呼叫的 `/web/v1/original-failure/*` 在後端已沒有路由。要查舊設計，請用 git 歷史。
 
 ## 本機驗證
 
@@ -4061,7 +4015,7 @@ $env:PYTHONPATH = '<repo>\src\fa-shared-context-poc;<repo>\tests\shared_context'
   --basetemp '<本批 artifact>\pytest'
 ```
 
-原本串接 handoff HTTP receiver 的正式慢 fixture 已於 2026-10 移除。其他 HTTP 範例反例使用已核 SHA 的 `tests\shared_context\web_test_console_original_failure\producer-example.json`，它只是正式離線 producer 原件重播，不是 native 配置。
+原本串接 handoff HTTP receiver 的正式慢 fixture，以及重播它的離線 producer 範例，已於 2026-10 移除。
 
 真 API／JWT／原 producer 的 browser fixture **只在 tests**，不由正式 launcher 匯入：
 

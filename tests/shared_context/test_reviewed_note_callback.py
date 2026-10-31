@@ -24,7 +24,7 @@ from test_behavior_assistant import assistant
 from test_conversation_note_memory import (
     SETTINGS, commit_note, enable_memory, memory_conversations, memory_slot_ids,
 )
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_instruction_prompt import submit
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import open_turn, ordinary, settle
@@ -163,7 +163,6 @@ def test_selected_note_reaches_model_as_tool_data_and_survives_original_cold_fol
         assert value == reads[0] and body["messages"][-1]["role"] == "tool"
     reply = h.client.get(f"/work-policy/v1/conversations/{first['conversation_id']}/turns/2/reply", headers=h.headers())
     assert reply.status_code == 200 and reply.json()["text"] == "The same selected note v1 says original inventory."
-    check_history(h)
 
 
 @pytest.mark.parametrize("change", ["source-withdrawn", "origin-read-revoked", "claim-corrected"])

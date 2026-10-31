@@ -4,7 +4,6 @@ import asyncio
 import pytest
 
 from shared_context.behavior_assistant_wire import Task
-from shared_context.behavior_instruction import registration_image
 from shared_context.behavior_instruction_prompt import assemble_instruction_prompt
 from shared_context.behavior_skill_prompt import SKILL_PROFILE
 from shared_context.behavior_work_policy import derive_registered_work
@@ -12,7 +11,7 @@ from shared_context.behavior_work_policy_api import work_response
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_inventory, instruction_models, runtime_path
+from test_instruction_flow import instruction_inventory, instruction_models, runtime_path
 from test_instruction_prompt import configured, saved_turn, sdk_options, submit, submit_legacy
 from test_m3_auth import jwk_client, signing_key
 
@@ -106,7 +105,6 @@ def test_v2_default_reaches_original_task_sdk_save_and_cold_followup(
                for turn in projection.json()["turns"])
     assert original not in expected.system_message
     assert len(h.endpoint.requests) == 2
-    check_history(h)
 
 
 def test_explicit_v1_survives_setting_removal_refresh_and_cold_filesystem(
@@ -134,7 +132,6 @@ def test_explicit_v1_survives_setting_removal_refresh_and_cold_filesystem(
     assert profile_for(h, third) == "fa-instruction-v2"
     assert h.runtime.controller.step(third["binding_id"]).state == "succeeded"
 
-    check_history(h)
     assert control.policy.model_dump_json() == policy
     assert len(h.endpoint.requests) == 3
     assert calls[1]["resume"] and calls[0]["sdk_session_id"] == calls[1]["sdk_session_id"]
@@ -181,7 +178,6 @@ def test_v2_default_does_not_change_an_existing_legacy_conversation(assistant, m
     for accepted in (first, second):
         saved = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
         assert saved.prompt_assembly is None and "prompt_assembly" not in saved.model_dump()
-    check_history(h)
 
 
 def test_original_admission_reconcile_keeps_its_profile_when_default_changes(assistant, monkeypatch):
@@ -241,7 +237,6 @@ def test_invalid_new_default_does_not_prevent_an_existing_conversation_followup(
     second, _ = submit(h, "after-invalid-setting", "Continue the original.", first["conversation_id"])
     assert profile_for(h, second) is None
     assert h.runtime.controller.step(second["binding_id"]).state == "succeeded"
-    check_history(h)
 
 
 @pytest.mark.parametrize("profile", ["fa-instruction-v1", "fa-instruction-v2", "fa-instruction-v3", "fa-instruction-v4",
@@ -275,22 +270,3 @@ def test_runtime_and_history_share_original_profile_reconstruction(assistant, mo
         derive_registered_work(control.policy, invalid, mode)
     assert refused.value.body["error"]["code"] == "WORK_POLICY_REGISTRY_INVALID"
 
-
-def test_conversation_history_refuses_a_silent_profile_switch(assistant, monkeypatch):
-    h, control, _ = configured(assistant, None)
-    sdk_options(monkeypatch)
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "Original."}])
-    monkeypatch.setenv(ENV, "fa-instruction-v1")
-    first, _ = submit(h, "history-first", "Keep this profile.")
-    assert h.runtime.controller.step(first["binding_id"]).state == "succeeded"
-    second, _ = submit(h, "history-second", "Continue.", first["conversation_id"])
-    original = control.records[first["binding_id"]]
-    changed = control.records[second["binding_id"]]
-    changed = changed.model_copy(update={"profile": changed.profile.model_copy(update={
-        "prompt_profile": None,
-        "instruction": changed.profile.instruction.model_copy(update={"prompt_profile": None}),
-    })})
-    with pytest.raises(Problem) as refused:
-        registration_image(changed, (original, changed))
-    assert refused.value.body["error"]["code"] == "CONVERSATION_HISTORY_INVALID"

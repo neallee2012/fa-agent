@@ -109,6 +109,23 @@ manifest 使用**匯出環境的絕對路徑**，若要搬到另一個作業系�
 `connections-exported, agents=2, installation_verified=false, table_writes=0`；
 由 71c7 把原 W9 回條與準備檔交接 3ef6，不由本片自行啟動工作台或呼叫 Agent。
 
+要在本機工作台（8765）用「連線」按鈕時，匯出加上下面三個參數，否則按下去會得到 `CLI_NOT_CONFIGURED`。
+這時 `--client-id` 要填 Azure CLI client（等於 config 的 `admin_client_id`）：
+`az` 取得的 token 屬於這個 client，填別的值，連線會回 `IDENTITY_MISMATCH`。
+啟動本機工作台前要設 `FA_NATIVE_HITL_ENABLED=1`，否則 Connect、批准與提問卡片都不會出現，等卡片的回合看起來像卡住。
+
+```text
+python -m web_test_console.fresh_export --config stage-config.json --plan stage-fresh-plan.json --backend-origin https://approved-api.example --client-id 04b07795-8ddb-461a-bbee-02f9e1bf7b46 --output-directory private-console --cli-executable C:\approved\az.cmd --cli-azure-config-dir C:\approved\.azure-project --cli-subscription-id 00000000-0000-0000-0000-000000000000
+```
+
+三個要一起給，缺一個就回 `FRESH_CONSOLE_EXPORT_REFUSED`，什麼都不寫。
+`--cli-executable` 與 `--cli-azure-config-dir` 必須是**匯出環境已存在**的絕對路徑，檢查條件和 `CliTokenProvider` 相同。
+三個都不給時，`config.json` 的 `cli` 維持 `null`。
+已匯出的目錄不能事後補：內容不同會拒絕覆寫，要換新目錄重新匯出。
+匯出不跑 `az`，也不證明登入有效。
+遠端工作台用 Entra 登入，不需要這三個參數；azd 的 `console_bundle` 沒有傳，
+手動跑 `remote-bundle` 時也不要用帶 `cli` 的匯出，因為 `cli` 會原樣進遠端設定。
+
 ### Verified against（fresh operator）
 
 可重跑的最小**離線**入口（正常 test requirements＋固定 tokenizer cache；output 目錄必須不存在）：
@@ -129,6 +146,12 @@ runner 以 synthetic config／本機 Table transport 執行真正 `-m shared_con
 使用 Table SDK 12.7.0／本機 HTTP transports、真 JWT verifier，
 CLI 的 plan→apply→reconcile→同 apply 回讀與既有工作台 DTO 讀回均納入。
 本片沒有 Azure／Hosted／真模型操作，W9 的實際結果須另留紀錄，不回填本機 PASS 為 live PASS。
+
+2026-10-30 的 `--cli-*` 參數：讀過 `fresh_export.py`、`adapter.py` 的 `CliTokenProvider` 與 `TokenVault.set`、
+`bridge.py` 的 `Console.authenticate`、`remote.py` 的 `remote_bundle`、`deploy/azd/fa_azd.py` 的 `console_bundle`、
+`deploy/azd/profile.py` 的 `AZURE_CLI_CLIENT_ID`。`test_offline_export_cli_block_reaches_the_token_provider_and_is_all_or_none`
+通過；另把 `524c82d3` 的舊版與新版跑在同一 fixture，不帶參數時 5 個檔案 bytes 相同。
+未跑真 `az`，也沒有在 bridge 實際按「連線」。
 
 ## stage 完整測試的操作經驗（2026-10-04）
 

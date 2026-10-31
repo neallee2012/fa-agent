@@ -21,7 +21,7 @@ from shared_context.errors import Problem
 from test_behavior_assistant import assistant
 from test_capability_assembly import ALL
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_inventory, instruction_models, runtime_path
+from test_instruction_flow import instruction_inventory, instruction_models, runtime_path
 from test_instruction_prompt import saved_turn, sdk_options, submit
 from test_m3_auth import jwk_client, signing_key
 from test_conversation_transfer_startup import synthetic_standing_v1
@@ -115,7 +115,6 @@ def test_new_version_applies_from_the_next_turn_and_saved_turns_keep_their_captu
     control.refresh()
     record = control.records[first["binding_id"]]
     assert record.model_dump_json() == retained and record.profile.instruction.role_prompt.version == 1
-    check_history(h)
 
 
 def preflight(h, request_id):
@@ -277,15 +276,14 @@ def test_saving_requires_approve(assistant):
 def test_saved_versions_and_role_turns_pass_the_real_native_startup_readers(synthetic_standing_v1):
     from test_conversation_transfer_startup import read_startup, saved_turn as native_turn
     from test_resident_worker_poc import outcome_of
-    from shared_context.behavior_migration import MigrationStore, _quiescence, installed_origin
+    from shared_context.behavior_migration import MigrationStore, installed_origin
     from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
     c = synthetic_standing_v1
     config = c.h.config
 
     def readers():
         store = MigrationStore(c.h.composition.clients[0], config.table.scope)
-        return (outcome_of(lambda: read_startup(c)), outcome_of(lambda: _quiescence(store.read_inventory(), config)),
-                outcome_of(lambda: installed_origin(store, config)))
+        return (outcome_of(lambda: read_startup(c)), outcome_of(lambda: installed_origin(store, config)))
     baseline = readers()
     assert baseline[0] == "ok"
     save(c.control, c.human, "startup-role-v1", "Synthetic startup role.")

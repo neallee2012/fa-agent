@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from shared_context.behavior_delegation import CHILD_AGENT_TYPE, DelegationLedger, capture_parent
+from shared_context.behavior_delegation import DelegationLedger, capture_parent
+from shared_context.behavior_delegation_wire import CHILD_AGENT_TYPE
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant

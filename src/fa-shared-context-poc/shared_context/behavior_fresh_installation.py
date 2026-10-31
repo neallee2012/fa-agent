@@ -16,7 +16,6 @@ from .behavior_code_identity import code_sha256
 from .behavior_migration import MigrationStore, installation_record, origin_pointer_keys
 from .behavior_operations import _Model, _parse, _utc, control_key
 from .behavior_runtime import _PlanIndex, material, runtime_key
-from .behavior_runtime_transition import _payload_hash
 from .behavior_server_config import ServerConfiguration
 from .behavior_store import ControlChanges, ControlRequest, ControlWrite, Digest, _Row
 from .behavior_work_policy import (
@@ -25,7 +24,7 @@ from .behavior_work_policy import (
 from .behavior_workers import Slot, _Pool, worker_key
 from .errors import Problem
 from .models import Identifier
-from .source_materials import digest
+from .source_materials import _payload_hash, digest
 
 
 def fresh_key(domain):
@@ -254,16 +253,6 @@ def peer_initialization_receipt(store, config, registry, expected):
              and all(dict(receipt.payload["writes"]).get(key) == value for key, value in expected.items()),
              "B does not belong to this original atomic fresh installation")
     return receipt
-
-
-def validate_fresh_inventory(inventory, config):
-    key = fresh_key(config.table.scope.authority_domain)
-    _require(key in inventory.rows, "the original fresh installation is missing from inventory")
-    record = _parse(inventory.rows[key].payload["data"], FreshInstallation)
-    receipt = inventory.receipts.get(record.request.request_id)
-    _require(receipt is not None, "the original fresh installation receipt is missing")
-    _verify_receipt(config, record, receipt)
-    return record
 
 
 def installed_fresh_origin(store, config):

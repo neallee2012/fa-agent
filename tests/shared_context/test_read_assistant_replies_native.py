@@ -18,7 +18,7 @@ from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_behavior_assistant import assistant
 from test_conversation_routing import conversation_view
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_text_files import post
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -115,4 +115,3 @@ def test_native_tool_reads_exact_past_reply_after_compaction(assistant, monkeypa
         assert completed[0]["tool_start_seq"] == starts[0]["seq"] and completed[0]["status"] == "succeeded"
         assert "read-reply-after-summary" not in json.dumps(events) and CANARY not in json.dumps(events)
         assert "Exception in callback" not in caplog.text
-        check_history(h)

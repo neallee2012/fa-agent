@@ -67,7 +67,7 @@ def serving(ci, monkeypatch, repo, revision):
     """The stage API app as stage.json leaves it: 2d-i on (FA_NATIVE_SESSION_GUARD_ENFORCE), single revision mode.
     The turn-on's own checks are in test_stage_ci_native_2di.py."""
     monkeypatch.setattr(ci, "ROOT", repo)
-    env = [{"name": ci.SESSION_GUARD, "value": "1"}]
+    env = [{"name": ci.SESSION_GUARD, "value": "1"}, {"name": ci.API_CONFIG_ENV, "value": ci._config_bytes().decode()}]
     monkeypatch.setattr(ci, "rest", lambda method, path, body=None: {"properties": {
         "latestReadyRevisionName": f"{ci.STAGE['api_app']}--{revision}", "template": {"containers": [{"env": env}]},
         "configuration": {"activeRevisionsMode": "Single"}}})
@@ -174,6 +174,7 @@ def test_guard_refuses_a_live_only_env_before_anything_else_runs(ci, monkeypatch
     assert [method for method, _ in calls] == ["GET"]
     # A declared secret ENV and the installed configuration are known names: guard goes on to its next check.
     ci.STAGE["api_secret_environment"] = {"FA_CAPABILITY_SECRET_WEBIQ_API_KEY": "webiq-api-key"}
+    env[1] = {"name": ci.API_CONFIG_ENV, "value": ci._config_bytes().decode()}
     monkeypatch.setattr(ci, "_require_secrets", lambda *args: None)
 
     def next_check():
@@ -182,6 +183,24 @@ def test_guard_refuses_a_live_only_env_before_anything_else_runs(ci, monkeypatch
     monkeypatch.setattr(ci, "api_routines", next_check)
     with pytest.raises(SystemExit, match="^next check$"):
         ci.guard()
+
+
+@pytest.mark.parametrize("deployed", ["{}", None])
+def test_guard_refuses_a_different_installed_configuration_before_sync(ci, monkeypatch, deployed):
+    """api's refusal, before sync publishes Hosted and moves routes (2026-10-30: dev's fresh v1 configuration)."""
+    calls = []
+    env = [{"name": ci.SESSION_GUARD, "value": "1"}]
+    env += [{"name": ci.API_CONFIG_ENV, "value": deployed}] if deployed else []
+    monkeypatch.setattr(ci, "rest", lambda method, path, body=None: calls.append((method, path)) or {"properties": {
+        "latestReadyRevisionName": f"{ci.STAGE['api_app']}--1234567-r9-1", "template": {"containers": [{"env": env}]}}})
+    for later in ("api_routines", "feed_config", "serving_commit", "switch_preconditions", "realtime_ready"):
+        monkeypatch.setattr(ci, later, lambda *args, **kwargs: pytest.fail("ran after the refusal"))
+    with pytest.raises(SystemExit) as stopped:
+        ci.guard()
+    assert str(stopped.value) == (f"{ci.STAGE['api_app']}: deployed {ci.API_CONFIG_ENV} differs from the repo; a "
+                                  "configuration change is an operator action (fresh installation is bound to it), "
+                                  "not a CI image update")
+    assert [method for method, _ in calls] == ["GET"]
 
 
 # --- wait loops: a failed read is retried, a write never is ------------------------------------------------------

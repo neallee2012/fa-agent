@@ -14,8 +14,8 @@ from shared_context.behavior_agent_retire import (
     STUCK_ONBOARDING_SECONDS, AgentRoleAssignments, _cleanup, preview, preview_failed, retire, retire_failed,
 )
 from shared_context.behavior_agent_setup import FOUNDRY_USER, OPENAI_USER
-from shared_context.behavior_migration import MigrationStore, _quiescence, installed_origin
-from shared_context.behavior_team_registry import registered_agent_ids, retired_agent_ids, validate_team_registry_history
+from shared_context.behavior_migration import MigrationStore, installed_origin
+from shared_context.behavior_team_registry import registered_agent_ids, retired_agent_ids
 from shared_context.errors import Problem
 from test_agent_onboarding import FakeFoundry as OnboardingFoundry, team  # noqa: F401  (fixture)
 from test_agent_retire import NOW, _code
@@ -314,8 +314,7 @@ def test_a_stuck_registered_onboarding_is_retired_and_frees_its_pending_slot(tea
 
     def readers():  # the real startup readers, as in test_agent_retire.py: the retire changes none of their outcomes
         migration = MigrationStore(team.a.clients[0], config.table.scope)
-        return (outcome_of(lambda: read_startup(team.c)), outcome_of(lambda: _quiescence(migration.read_inventory(),
-                                                                                        config)),
+        return (outcome_of(lambda: read_startup(team.c)),
                 outcome_of(lambda: installed_origin(migration, config)))
     baseline = readers()
     assert baseline[0] == "ok"
@@ -324,7 +323,6 @@ def test_a_stuck_registered_onboarding_is_retired_and_frees_its_pending_slot(tea
     assert _pending(team) == [] and onboarding_status(team.a, team.c.human, "onboard-one")["state"] == "registered"
     assert (registered_agent_ids(store, config), retired_agent_ids(store, config)) == ((), (agent_id,))
     assert agent_id not in {entry.agent_id for entry in public_agents(team.a, team.c.human).agents}
-    validate_team_registry_history(store.read_inventory(), config)
     assert readers() == baseline
     # A rerun (the explicit flag, any time) returns the original tombstone; the same onboarding body is now refused.
     again = retire(composition, team.c.human, stuck=True, now=team.clock.wall, **kwargs)
@@ -345,7 +343,6 @@ def test_the_explicit_flag_retires_a_stuck_onboarding_whose_create_is_recent(tea
                     confirm=agent_id, stuck=True, now=team.clock.wall)
     assert result["state"] == "ok" and result["tombstone"]["onboarding_request_id"] == "onboard-one"
     assert _pending(team) == []
-    validate_team_registry_history(team.a.runtime.store.read_inventory(), team.config)
 
 
 def test_a_stuck_retire_of_an_already_tombstoned_agent_still_frees_its_pending_slot(team, monkeypatch):
@@ -357,7 +354,6 @@ def test_a_stuck_retire_of_an_already_tombstoned_agent_still_frees_its_pending_s
         team.run()
     assert _code(resumed) == (410, "AGENT_RETIRED") and _pending(team) == ["onboard-one"]
     assert onboarding_status(team.a, team.c.human, "onboard-one")["state"] == "registered"
-    validate_team_registry_history(store.read_inventory(), config)
     composition = _operator(team)
     kwargs = dict(agent_id=agent_id, request_id="retire-stuck", reason="stuck", confirm=agent_id, stuck=True)
     result = retire(composition, team.c.human, **kwargs)
@@ -365,7 +361,6 @@ def test_a_stuck_retire_of_an_already_tombstoned_agent_still_frees_its_pending_s
     assert _pending(team) == []
     guard = store._guard()
     assert retire(composition, team.c.human, **kwargs) == result and store._guard() == guard  # rerun writes nothing
-    validate_team_registry_history(store.read_inventory(), config)
     read_startup(team.c)
     finished, value = team.run(rid="onboard-two", name="Writer")
     assert finished and value["state"] == "ready"
@@ -388,12 +383,10 @@ def test_an_agent_tombstoned_while_creating_reads_as_retired_and_frees_its_pendi
     assert _pending(team) == [] and onboarding_status(team.a, team.c.human, "onboard-one")["state"] == "creating"
     guard = store._guard()
     assert retire(composition, team.c.human, **kwargs) == result and store._guard() == guard  # rerun writes nothing
-    validate_team_registry_history(store.read_inventory(), config)
     read_startup(team.c)
     with pytest.raises(Problem) as resumed:  # the owner's resend still ends at the retired Agent
         team.run()
     assert _code(resumed) == (410, "AGENT_RETIRED") and _pending(team) == []
-    validate_team_registry_history(store.read_inventory(), config)
     finished, value = team.run(rid="onboard-two", name="Writer")
     assert finished and value["state"] == "ready"
 
@@ -415,7 +408,6 @@ def test_the_stuck_hour_counts_from_entering_registered_not_from_the_create_clai
     later = lambda: team.clock.wall() + timedelta(seconds=STUCK_ONBOARDING_SECONDS)  # noqa: E731
     assert retire(composition, team.c.human, now=later, **kwargs)["tombstone"]["outcome"] == "written"
     assert _pending(team) == []
-    validate_team_registry_history(store.read_inventory(), team.config)
 
 
 class LeftoverFoundry(OnboardingFoundry):

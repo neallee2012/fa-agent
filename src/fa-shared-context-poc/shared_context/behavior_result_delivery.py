@@ -6,7 +6,7 @@ from .behavior_auth import BehaviorPrincipal
 from .behavior_foundry import _NativeLaunch, native_key
 from .behavior_inbox import CurrentWorkInboxAccess, INBOX_CHANNEL_ID
 from .behavior_operations import control_key
-from .behavior_runtime import RuntimeBinding, runtime_key
+from .behavior_runtime import runtime_key
 from .behavior_store import ControlChanges, ControlRequest
 from .behavior_workers import ExecutorEvidence, JobRecord, worker_key
 from .errors import Problem
@@ -192,71 +192,3 @@ def require_continuation(runtime, binding_id, command, principal):
         "original delivery exchange exists; continuation denied")
     return value, binding, context
 
-
-def validate_result_history(inventory, config, bindings):
-    """Recognize this producer without accepting arbitrary appended final versions."""
-    candidates = {key: row for key, row in inventory.rows.items()
-                  if row.payload["data"].get("kind") == "original_result_delivery"}
-    if not candidates:
-        return {}
-    from .behavior_recovery_history import _Inventory
-    view = _Inventory(inventory, config)
-    for key in candidates:
-        value = view.row(key, OriginalResultDelivery, material=True)
-        binding = next((b for b in bindings if b.binding_id == value.runtime_binding_id), None)
-        require(binding is not None and key == continuation_key(binding.binding_id)
-                and value.job_id == binding.job_id and value.previous.obligation_id == value.current.obligation_id == binding.obligation_id
-                and value.previous.route == value.current.route == binding.route
-                and value.current.version == value.previous.version + 1 <= config.delivery.max_delivery_versions
-                and value.current.delivery_id == control_key("delivery-result-version", binding.obligation_id, str(value.current.version)),
-                "result continuation escaped original binding/version")
-        oldkey = control_key("delivery-outbox", value.previous.delivery_id)
-        newkey = control_key("delivery-outbox", value.current.delivery_id)
-        obkey = control_key("delivery-obligation", binding.obligation_id)
-        old = view.row(oldkey, d._Outbox)
-        new = view.row(newkey, d._Outbox)
-        ob = view.row(obkey, d._Obligation)
-        work = view.row(control_key("delivery-work-state", binding.obligation_id), d._Work)
-        require(work.result is not None and work.result.state == "cancelled", "saved cancellation result is missing")
-        result = view.row(worker_key("work-result", work.result.evidence_id), d.VerifiedWorkResult, material=True)
-        material = d._material(_payload(binding, result).model_dump(mode="json"))
-        oldmaterial = d._parse(inventory.rows[oldkey].payload["material"], d.InlineMaterial)
-        expected_old = d._Payload(event_id=binding.event_id, root_request_id=binding.root_request_id,
-            work_id=binding.work.work_id, message_kind="failure", work_state="queued",
-            result_evidence_id=None, content=None, artifacts=(), known_effects=None, unresolved_operations=None,
-            responsibility_owner=binding.owner.owner_record_id, notification_code="delivery_needs_attention")
-        require(old.binding == value.previous and old.message_kind == new.message_kind == "failure"
-                and old.send_outcome is None and old.receipt_count == 0 and not old.confirmed_levels
-                and oldmaterial == d._material(expected_old.model_dump(mode="json"))
-                and oldmaterial.sha256 == value.previous.payload_digest
-                and inventory.rows.get(control_key("inbox-exchange", value.previous.delivery_id)) is None
-                and result == work.result and new.binding == value.current
-                and value.current.payload_digest == material.sha256 and value.current.artifacts == result.artifacts
-                and inventory.rows[newkey].payload["material"] == material.model_dump(mode="json")
-                and ob.final_delivery_id == value.current.delivery_id and ob.final_version == ob.last_version == value.current.version,
-                "result continuation did not retain exact old/new payload")
-        original = value.original_obligation
-        require(original.obligation_id == binding.obligation_id and original.final_delivery_id == value.previous.delivery_id
-                and original.final_version == original.last_version == value.previous.version
-                and original.fulfillment == "pending" and not original.confirmed_levels
-                and original.route == binding.route,
-                "result continuation original obligation differs")
-        oldaccesskey = runtime_key("inbox-access", value.original_access_evidence_id)
-        access = view.row(oldaccesskey, CurrentWorkInboxAccess, material=True)
-        require(access.binding == value.previous and access.runtime_binding_id == binding.binding_id
-                and access.principal_id == binding.human_oid and access.action == "fetch",
-                "original failed read is not retained")
-        body = [binding.binding_id, {"request_id": value.original_fetch_request_id}, value.previous.model_dump(mode="json")]
-        require(value.request.request_id == key and value.request.request_digest == digest(body),
-                "original request ID continuation differs")
-        freshout = d._Outbox(configuration_digest=new.configuration_digest, evidence_mode=new.evidence_mode,
-                            binding=value.current, message_kind="failure")
-        after = d._update(original, final_delivery_id=value.current.delivery_id, final_version=value.current.version,
-                          last_version=value.current.version, delivery_state="final_prepared")
-        # _Outbox's defaults are the same initial image emitted by prepare_message.
-        view.receipt(value.request, (key, newkey, obkey), exact={
-            key: view.hash(key), newkey: view.image_hash(newkey, freshout), obkey: view.image_hash(obkey, after),
-        }, result={"binding_id": binding.binding_id, "delivery_id": value.current.delivery_id,
-                   "version": value.current.version, "original_fetch_request_id": value.original_fetch_request_id,
-                   "previous_delivery_id": value.previous.delivery_id, "exchange_created": False, "acknowledged": False})
-    return candidates

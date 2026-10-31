@@ -20,7 +20,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import open_turn, ordinary, settle
 from test_sop_skill_copy import approved_sop, change_source, copy_scope, configured_copy, post_copy, BODY, LEGACY_WORK
@@ -105,7 +105,6 @@ def test_signed_cancel_preserves_original_copy_ledger_and_failure_delivery(
         h.executor._complete(turn.start, saved.json())
         done = h.runtime.controller.step(turn.binding.binding_id)
         assert done.state == "cancelled" and done.result_forwarded
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -146,7 +145,6 @@ def test_later_target_decision_or_version_keeps_the_original_historical_copy_rec
         saved = turn.client.save_text_reply("The receipt describes the original copy, not current approval.", archive, turn.stop)
         h.executor._complete(turn.start, saved.model_dump(mode="json"))
         assert h.runtime.controller.step(turn.binding.binding_id).state == "succeeded"
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -199,7 +197,6 @@ def test_lost_upload_then_changed_source_can_save_original_unresolved_copy_failu
         h.executor._complete(turn.start, response.json())
         done = h.runtime.controller.step(turn.binding.binding_id)
         assert done.state == result.state and done.result_forwarded
-        check_history(h)
         view = h.client.get("/work-policy/v1/conversations/" + turn.assignment.task.instruction.conversation_id,
                             headers=h.headers())
         assert view.status_code == 200 and not view.json()["can_follow_up"]
@@ -262,7 +259,6 @@ def test_failure_save_uses_original_ledger_not_new_copy_permission(assistant, si
             h.executor._complete(turn.start, response.json())
             done = h.runtime.controller.step(turn.binding.binding_id)
             assert done.state == "failed" and done.result_forwarded
-            check_history(h)
         else:
             assert h.store.read_snapshot((key("result", turn.binding.work.work_id),))[key("result", turn.binding.work.work_id)] is None
         record_case("failure-read-boundary-" + change, {
@@ -324,7 +320,6 @@ def test_confirmed_effect_survives_model_gates_and_never_replays_copy(assistant,
         saved = turn.client.save_text_reply("Historical effect retained; no approval claim.", reference, turn.stop)
         h.executor._complete(turn.start, saved.model_dump(mode="json"))
         assert h.runtime.controller.step(turn.binding.binding_id).state == "succeeded"
-        check_history(h)
         record_case("historical-model-" + changed, {
             "runtime_mode": h.runtime.mode, "mutation": changed, "offline_provider_requests": len(requests),
             "model_replay_denied": True, "receipt_state_scope": receipt["state_scope"],
@@ -375,7 +370,6 @@ def test_original_upload_reconciles_after_source_changes_without_second_put(
         ledger = h.store.read_snapshot((ekey,))[ekey]
         assert ledger.payload["data"]["stage"] == "saved"
         assert post_copy(turn).json() == recovered.json() and counts == before
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -406,7 +400,6 @@ def test_unfinalizable_original_blob_stays_unresolved_but_failure_can_be_saved(
         result = h.assistant.result(turn.start.binding)
         assert result.state == "failed" and result.unresolved_operations == (ekey,)
         assert h.store.read_snapshot((ekey,))[ekey] == original and writes == [True]
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -431,7 +424,6 @@ def test_separate_admissions_have_distinct_slots_not_one_installation_lifetime_s
             turn.client.close()
     assert receipts[0]["job_id"] != receipts[1]["job_id"] and receipts[0]["artifact_id"] != receipts[1]["artifact_id"]
     assert all(h.artifacts.get(A, A.team, value["artifact_id"]) == target for value, target in zip(receipts, targets))
-    check_history(h)
 
 
 @pytest.mark.parametrize("stage", ["create_unknown", "created"])
@@ -466,7 +458,6 @@ def test_unfinished_metadata_stage_is_preserved_in_failed_result(assistant, sign
         assert result.known_effects == (() if stage == "create_unknown" else (ekey,))
         assert result.unresolved_operations == (ekey,) and result.state == "failed"
         assert h.store.read_snapshot((ekey,))[ekey] == original
-        check_history(h)
     finally:
         turn.client.close()
 

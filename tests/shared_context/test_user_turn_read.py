@@ -21,7 +21,7 @@ from shared_context.behavior_work_policy import work_policy_key
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_models, runtime_path
 from test_instruction_prompt import configured as configured_profile, submit
 from test_m3_auth import jwk_client, signing_key
 from test_m3_auth import token
@@ -83,7 +83,6 @@ def test_completed_past_user_turn_is_read_verbatim_with_immutable_provenance(ass
         assert second.client.read_user_turn(1).text == ORIGINAL
         assert h.store._guard() == reads_guard
         settle(second, state)
-        check_history(h)
         assert h.store.read_snapshot(prior_keys) == before and h.endpoint.requests == []
     finally:
         if second is not None:

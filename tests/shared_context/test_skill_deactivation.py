@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import A, B, C
-from shared_context.api import create_app
+from legacy_m2_m4.api import create_app
 from shared_context.auth import JwtVerifier
 from shared_context.errors import Problem
 from shared_context.m3_auth import HumanApprover, M3JwtVerifier

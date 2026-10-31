@@ -282,6 +282,200 @@ def agent_client(composition, control):
     return clients[0].for_target(target)
 
 
+def _parsed_response(body, model):
+    try:
+        json.loads(body, object_pairs_hook=_unique, parse_constant=_nonfinite)
+        return model.model_validate_json(body)
+    except (ValueError, TypeError):
+        raise Problem(502, "NATIVE_STATE_INVALID", "the native response does not match its fixed schema") from None
+
+
+def _require_complete_text(text, result):
+    raw = text.encode("utf-8")
+    if len(raw) != result.text_bytes or hashlib.sha256(raw).hexdigest() != result.text_sha256:
+        raise Problem(502, "NATIVE_RESULT_INCOMPLETE", "the complete original result length or hash differs")
+
+
+def _history_turn_fits(command, last_turn, turn):
+    return (turn.conversation_id == command.conversation_id
+            and turn.result.turn_number == turn.turn_number
+            and command.after_turn < turn.turn_number <= last_turn)
+
+
+def _history_cursor_fits(page, numbers):
+    return page.next_after_turn is None or bool(numbers) and page.next_after_turn == numbers[-1]
+
+
+def _check_history_page(command, page):
+    numbers = [turn.turn_number for turn in page.turns]
+    if (len(page.turns) > command.limit or numbers != sorted(set(numbers))
+            or len({turn.request_id for turn in page.turns}) != len(page.turns)
+            or not all(_history_turn_fits(command, page.conversation.last_turn, turn) for turn in page.turns)
+            or not _history_cursor_fits(page, numbers)):
+        raise Problem(502, "NATIVE_STATE_INVALID", "native history does not match its original page")
+
+
+def _checked_scope(command, value):
+    """The record that names the answer's owner; a page or status is checked as a whole first."""
+    if isinstance(value, NativeHistoryPage):
+        _check_history_page(command, value)
+        return value.conversation
+    if isinstance(value, NativeTurnStatus):
+        if value.text is not None:
+            _require_complete_text(value.text, value.receipt.result)
+        return value.receipt
+    return value
+
+
+def _check_response_owner(client, command, scope):
+    if (hasattr(scope, "agent_id") and scope.agent_id != client.target.agent_id
+            or hasattr(command, "conversation_id") and scope.conversation_id != command.conversation_id
+            or not isinstance(command, (
+                NativeSessionPrepare, NativeSessionFollow, NativeContinuationRead, NativeSessionFilesOmission,
+                NativeSessionAbandon, NativeSessionWithdraw))
+            and hasattr(command, "request_id") and getattr(scope, "request_id", None) != command.request_id):
+        raise Problem(502, "NATIVE_STATE_SCOPE", "the native response belongs to another Agent or request")
+
+
+def _check_continuation(_client, command, value):
+    if value.original_request_id != command.request_id:
+        raise Problem(502, "NATIVE_STATE_SCOPE", "the continuation view belongs to another original request")
+
+
+def _check_submitted(client, command, value):
+    if (value.command != command.command or value.capture != command.capture
+            or value.source != getattr(command, "source", None) or value.submit_digest != command.sha256
+            or value.routine != getattr(command, "routine", None)
+            or value.continuation != getattr(command, "continuation", None)):
+        raise Problem(409, "NATIVE_CAPTURE_CHANGED", "the response differs from the original submitted material")
+    if value.status not in {"completed", "unknown", "busy_refused"}:
+        # Hosted's create-or-read may return a finished original of an earlier session; it executes nothing.
+        NativeTurnGateway._same_session(client, value)
+
+
+def _check_prepared(client, _command, value):
+    NativeTurnGateway._same_session(client, value)
+
+
+def _on_target(client, value):
+    return (value.hosted_session_id == client.target.session_id
+            and value.hosted_agent_version == client.target.agent_version)
+
+
+def _check_transition(client, command, value):
+    if (value.state not in {"pending", "ready"} or value.request_id is None
+            or value.previous_hosted_session_id != command.expected_session_id or not _on_target(client, value)):
+        raise Problem(502, "NATIVE_STATE_SCOPE", "the environment response differs from the approved source and target")
+
+
+def _omission_recorded(command, value):
+    """``check`` only reads; every other stage must answer with the evidence that stage leaves."""
+    return (command.stage == "check"
+            or value.files_skip_request_id == command.request_id and value.files_migrated is False
+            or command.stage == "confirm" and value.files_confirmation_pending == command.request_id
+            or command.stage == "read" and command.request_id in {
+                value.files_confirmation_saved, value.files_confirmation_absent})
+
+
+def _check_omission(client, command, value):
+    if (value.request_id != command.follow.request_id
+            or value.previous_hosted_session_id != command.follow.expected_session_id
+            or not _on_target(client, value) or not _omission_recorded(command, value)):
+        raise Problem(502, "NATIVE_STATE_SCOPE", "the file omission differs from the original confirmed operation")
+
+
+def _same_files_scope(record, command):
+    return all(getattr(record, name) == getattr(command, name) for name in NativeFilesScope.model_fields)
+
+
+def _check_send_claim(command, progress):
+    if command.stage != "begin":
+        raise Problem(502, "NATIVE_STATE_INVALID", "a readback cannot authorize a file upload")
+    if progress is None or progress.next_index != command.index or progress.sending != command.send_token:
+        raise Problem(502, "NATIVE_STATE_INVALID", "the file send claim did not read back")
+
+
+def _check_files(_client, command, value):
+    if not _same_files_scope(value, command):
+        raise Problem(502, "NATIVE_STATE_SCOPE", "the file progress differs from its original operation")
+    if value.progress is not None and not _same_files_scope(value.progress.manifest, command):
+        raise Problem(502, "NATIVE_STATE_SCOPE", "the manifest differs from its original operation")
+    if value.send_allowed:
+        _check_send_claim(command, value.progress)
+
+
+def _check_result_page(_client, command, value):
+    if value.part != command.part:
+        raise Problem(502, "NATIVE_RESULT_INCOMPLETE", "the original result part differs")
+    if value.complete:
+        _require_complete_text(value.text, value.result)
+
+
+def _check_image(_client, command, value):
+    if value.entry.version_id != command.version_id:
+        raise Problem(502, "IMAGE_DELIVERY_CONFLICT", "the image differs from the requested original version")
+
+
+def _check_review_page(_client, command, value):
+    if len(value.entries) > command.limit or value.next_after is not None and value.next_after == command.after:
+        raise Problem(502, "NATIVE_STATE_INVALID", "the original review page did not advance")
+
+
+def _check_received_page(_client, command, value):
+    if (len(value.items) > command.limit
+            or len({item.request_id for item in value.items}) != len(value.items)
+            or value.next_after is not None and value.next_after == command.after):
+        raise Problem(502, "NATIVE_STATE_INVALID", "the original received page did not advance")
+
+
+def _check_append(_client, command, value):
+    if value.append_id != command.append_id:
+        raise Problem(502, "NATIVE_STATE_SCOPE", "the append response differs from the original control")
+
+
+def _check_delivered(_client, command, value):
+    if value.result is None or value.result.result_digest != command.result_digest or not value.delivered:
+        raise Problem(409, "NATIVE_DELIVERY_CONFLICT", "the original completed result was not acknowledged")
+
+
+# (commands, the model of their answer, what that answer must also prove once its owner is confirmed). No command
+# class derives from another, so at most one row applies; anything else answers with a plain receipt.
+_RESPONSE_CONTRACTS = (
+    ((NativeSessionRead, NativeSessionWithdraw), NativeSessionState, None),
+    ((NativeSessionFiles,), NativeFilesView, _check_files),
+    ((NativeContinuationRead,), NativeContinuationView, _check_continuation),
+    ((NativeContinuationReady,), NativeContinuationReadyReceipt, None),
+    ((NativeSessionFollow, NativeSessionRetarget), NativeEnvironmentView, _check_transition),
+    ((NativeSessionFilesOmission,), NativeEnvironmentView, _check_omission),
+    ((NativeSessionAbandon, NativeSessionCut), NativeEnvironmentView, None),
+    ((NativeUnfinishedRead,), NativeUnfinishedSessions, None),
+    ((NativeSessionPrepare,), NativeSessionPreparation, _check_prepared),
+    ((NativeConversationRead,), NativeConversation, None),
+    ((NativeHistory,), NativeHistoryPage, None),
+    ((NativeResult,), NativeResultPage, _check_result_page),
+    ((NativeImagesRead,), NativeTurnImages, None),
+    ((NativeImageRead,), NativeImageContent, _check_image),
+    ((NativeProgressRead,), NativeProgressSnapshot, None),
+    ((NativeTurnStatusRead,), NativeTurnStatus, None),
+    ((NativeHitlHistoryRead,), NativeHitlReviewHistory, _check_review_page),
+    ((NativeReceivedRead,), NativeReceivedPage, _check_received_page),
+    ((NativeAppend, NativeAppendRead), NativeAppendReceipt, _check_append),
+    ((NativeUserImageUpload,), NativeUserImageStored, None),
+    ((NativeSkillDraftIntentRead,), NativeSkillDraftProof, None),
+    ((NativePrewarm, NativeSessionCheckpointCheck, NativeSessionPrerestore), NativePrewarmView, None),
+    ((NativeCandidateRead,), NativeCandidateView, None),
+    ((NativeSubmit, NativeAgentReceive, NativeRoutineSubmit, NativeContinuationSubmit), NativeReceipt, _check_submitted),
+    ((NativeDelivered,), NativeReceipt, _check_delivered),
+)
+
+
+def _response_contract(command):
+    if isinstance(command, NativeAppendRead) and command.append_id is None:
+        return NativeAppends, None
+    return next(((model, check) for commands, model, check in _RESPONSE_CONTRACTS if isinstance(command, commands)),
+                (NativeReceipt, None))
+
+
 class NativeTurnGateway:
     def __init__(self, composition, *, enabled):
         self.composition, self.enabled = composition, enabled
@@ -390,11 +584,10 @@ class NativeTurnGateway:
                 retry = False
 
     @staticmethod
-    def _legacy(control, cid, rows=None):
-        """``rows``: an already read snapshot of ``control.store`` holding this CID's conversation key."""
+    def _legacy(control, cid):
         if cid is not None:
             key = conversation_key(cid)
-            if (control.store.read_snapshot((key,)) if rows is None else rows)[key] is not None:
+            if control.store.read_snapshot((key,))[key] is not None:
                 raise Problem(409, "NATIVE_STATE_SCOPE", "an existing Table conversation must keep its original route")
 
     @staticmethod
@@ -435,128 +628,11 @@ class NativeTurnGateway:
     @staticmethod
     def _invoke(client, command, timeout=None):
         response = client.invoke_native(command, **({} if timeout is None else {"timeout": timeout}))
-        model = (NativeSessionState if isinstance(command, (NativeSessionRead, NativeSessionWithdraw)) else
-                 NativeFilesView if isinstance(command, NativeSessionFiles) else
-                 NativeContinuationView if isinstance(command, NativeContinuationRead) else
-                 NativeContinuationReadyReceipt if isinstance(command, NativeContinuationReady) else
-                 NativeEnvironmentView if isinstance(command, (NativeSessionFollow, NativeSessionRetarget, NativeSessionFilesOmission,
-                                                               NativeSessionAbandon, NativeSessionCut)) else
-                 NativeUnfinishedSessions if isinstance(command, NativeUnfinishedRead) else
-                 NativeSessionPreparation if isinstance(command, NativeSessionPrepare) else
-                 NativeConversation if isinstance(command, NativeConversationRead) else
-                 NativeHistoryPage if isinstance(command, NativeHistory) else
-                 NativeResultPage if isinstance(command, NativeResult) else
-                 NativeTurnImages if isinstance(command, NativeImagesRead) else
-                 NativeImageContent if isinstance(command, NativeImageRead) else
-                 NativeProgressSnapshot if isinstance(command, NativeProgressRead) else
-                 NativeTurnStatus if isinstance(command, NativeTurnStatusRead) else
-                 NativeHitlReviewHistory if isinstance(command, NativeHitlHistoryRead) else
-                 NativeReceivedPage if isinstance(command, NativeReceivedRead) else
-                 NativeAppends if isinstance(command, NativeAppendRead) and command.append_id is None else
-                 NativeAppendReceipt if isinstance(command, (NativeAppend, NativeAppendRead)) else
-                 NativeUserImageStored if isinstance(command, NativeUserImageUpload) else
-                 NativeSkillDraftProof if isinstance(command, NativeSkillDraftIntentRead) else
-                 NativePrewarmView if isinstance(command, (NativePrewarm, NativeSessionCheckpointCheck,
-                                                           NativeSessionPrerestore)) else
-                 NativeCandidateView if isinstance(command, NativeCandidateRead) else NativeReceipt)
-        try:
-            json.loads(response.body, object_pairs_hook=_unique, parse_constant=_nonfinite)
-            value = model.model_validate_json(response.body)
-        except (ValueError, TypeError):
-            raise Problem(502, "NATIVE_STATE_INVALID", "the native response does not match its fixed schema") from None
-        if isinstance(value, NativeHistoryPage):
-            scope = value.conversation
-            numbers = [turn.turn_number for turn in value.turns]
-            if (len(value.turns) > command.limit or numbers != sorted(set(numbers))
-                    or len({turn.request_id for turn in value.turns}) != len(value.turns)
-                    or any(turn.conversation_id != command.conversation_id
-                           or turn.result.turn_number != turn.turn_number
-                           or not command.after_turn < turn.turn_number <= scope.last_turn for turn in value.turns)
-                    or value.next_after_turn is not None and (
-                        not numbers or value.next_after_turn != numbers[-1])):
-                raise Problem(502, "NATIVE_STATE_INVALID", "native history does not match its original page")
-        elif isinstance(value, NativeTurnStatus):
-            scope = value.receipt
-            if value.text is not None:
-                raw = value.text.encode("utf-8")
-                if (len(raw) != scope.result.text_bytes
-                        or hashlib.sha256(raw).hexdigest() != scope.result.text_sha256):
-                    raise Problem(502, "NATIVE_RESULT_INCOMPLETE", "the complete original result length or hash differs")
-        else:
-            scope = value
-        if (hasattr(scope, "agent_id") and scope.agent_id != client.target.agent_id
-                or hasattr(command, "conversation_id") and scope.conversation_id != command.conversation_id
-                or not isinstance(command, (
-                    NativeSessionPrepare, NativeSessionFollow, NativeContinuationRead, NativeSessionFilesOmission,
-                    NativeSessionAbandon, NativeSessionWithdraw))
-                and hasattr(command, "request_id") and getattr(scope, "request_id", None) != command.request_id):
-            raise Problem(502, "NATIVE_STATE_SCOPE", "the native response belongs to another Agent or request")
-        if isinstance(command, NativeContinuationRead) and value.original_request_id != command.request_id:
-            raise Problem(502, "NATIVE_STATE_SCOPE", "the continuation view belongs to another original request")
-        if isinstance(command, (NativeSubmit, NativeAgentReceive, NativeRoutineSubmit, NativeContinuationSubmit)):
-            if (value.command != command.command or value.capture != command.capture
-                    or value.source != getattr(command, "source", None) or value.submit_digest != command.sha256
-                    or value.routine != getattr(command, "routine", None)
-                    or value.continuation != getattr(command, "continuation", None)):
-                raise Problem(409, "NATIVE_CAPTURE_CHANGED", "the response differs from the original submitted material")
-            if value.status not in {"completed", "unknown", "busy_refused"}:
-                # Hosted's create-or-read may return a finished original of an earlier session; it executes nothing.
-                NativeTurnGateway._same_session(client, value)
-        if isinstance(command, NativeSessionPrepare):
-            NativeTurnGateway._same_session(client, value)
-        if isinstance(command, (NativeSessionFollow, NativeSessionRetarget)) and (
-                value.state not in {"pending", "ready"} or value.request_id is None
-                or value.previous_hosted_session_id != command.expected_session_id
-                or value.hosted_session_id != client.target.session_id
-                or value.hosted_agent_version != client.target.agent_version):
-            raise Problem(502, "NATIVE_STATE_SCOPE", "the environment response differs from the approved source and target")
-        if isinstance(command, NativeSessionFilesOmission) and (
-                value.request_id != command.follow.request_id
-                or value.previous_hosted_session_id != command.follow.expected_session_id
-                or value.hosted_session_id != client.target.session_id
-                or value.hosted_agent_version != client.target.agent_version
-                or command.stage != "check" and not (
-                    value.files_skip_request_id == command.request_id and value.files_migrated is False
-                    or command.stage == "confirm" and value.files_confirmation_pending == command.request_id
-                    or command.stage == "read" and command.request_id in {
-                        value.files_confirmation_saved, value.files_confirmation_absent})):
-            raise Problem(502, "NATIVE_STATE_SCOPE", "the file omission differs from the original confirmed operation")
-        if isinstance(command, NativeSessionFiles):
-            if any(getattr(value, name) != getattr(command, name) for name in NativeFilesScope.model_fields):
-                raise Problem(502, "NATIVE_STATE_SCOPE", "the file progress differs from its original operation")
-            if value.progress is not None and any(
-                    getattr(value.progress.manifest, name) != getattr(command, name)
-                    for name in NativeFilesScope.model_fields):
-                raise Problem(502, "NATIVE_STATE_SCOPE", "the manifest differs from its original operation")
-            if value.send_allowed and command.stage != "begin":
-                raise Problem(502, "NATIVE_STATE_INVALID", "a readback cannot authorize a file upload")
-            if value.send_allowed and (value.progress is None
-                                       or value.progress.next_index != command.index
-                                       or value.progress.sending != command.send_token):
-                raise Problem(502, "NATIVE_STATE_INVALID", "the file send claim did not read back")
-        if isinstance(command, NativeResult) and value.part != command.part:
-            raise Problem(502, "NATIVE_RESULT_INCOMPLETE", "the original result part differs")
-        if isinstance(command, NativeImageRead) and value.entry.version_id != command.version_id:
-            raise Problem(502, "IMAGE_DELIVERY_CONFLICT", "the image differs from the requested original version")
-        if isinstance(command, NativeHitlHistoryRead) and (
-                len(value.entries) > command.limit
-                or value.next_after is not None and value.next_after == command.after):
-            raise Problem(502, "NATIVE_STATE_INVALID", "the original review page did not advance")
-        if isinstance(command, NativeReceivedRead) and (
-                len(value.items) > command.limit
-                or len({item.request_id for item in value.items}) != len(value.items)
-                or value.next_after is not None and value.next_after == command.after):
-            raise Problem(502, "NATIVE_STATE_INVALID", "the original received page did not advance")
-        if (isinstance(command, (NativeAppend, NativeAppendRead)) and command.append_id is not None
-                and value.append_id != command.append_id):
-            raise Problem(502, "NATIVE_STATE_SCOPE", "the append response differs from the original control")
-        if isinstance(value, NativeResultPage) and value.complete:
-            raw = value.text.encode("utf-8")
-            if len(raw) != value.result.text_bytes or hashlib.sha256(raw).hexdigest() != value.result.text_sha256:
-                raise Problem(502, "NATIVE_RESULT_INCOMPLETE", "the complete original result length or hash differs")
-        if isinstance(command, NativeDelivered) and (
-                value.result is None or value.result.result_digest != command.result_digest or not value.delivered):
-            raise Problem(409, "NATIVE_DELIVERY_CONFLICT", "the original completed result was not acknowledged")
+        model, check = _response_contract(command)
+        value = _parsed_response(response.body, model)
+        _check_response_owner(client, command, _checked_scope(command, value))
+        if check is not None:
+            check(client, command, value)
         return value, response
 
     def read(self, principal, command):

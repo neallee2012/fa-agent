@@ -3,8 +3,6 @@ from datetime import timedelta
 import copy
 from dataclasses import replace
 import json
-import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -18,14 +16,8 @@ from shared_context.behavior_operations import control_key
 from shared_context.errors import Problem
 from test_behavior_finished_sdk_wait import finished_flow
 from test_behavior_assistant_claim_boundaries import hosted_flow, reviewed
-from test_behavior_assistant_acquire_conflicts import native_acquire, current_rotation
-from test_behavior_rotation_cutoff import two_rotations
-from test_behavior_rotation_settlement_history import current_cancelled
-from test_behavior_runtime_rotation import rotated
+from test_behavior_assistant_acquire_conflicts import installed_assistant, native_acquire
 from test_behavior_unclaimed_closure import normal_report, read_current
-from test_behavior_rotation_settlement_history import next_rotation
-from shared_context.behavior_migration import MigrationStore, installed_origin
-from shared_context.behavior_runtime_rotation_history import validate_retirement
 from shared_context.source_materials import digest
 from shared_context.behavior_recovery import recovery_key
 from shared_context.behavior_store import ControlRequest
@@ -33,17 +25,6 @@ from test_behavior_store import parse_batch
 from shared_context.behavior_assistant_wire import Answer
 from test_behavior_assistant_sse import stream
 from test_m3_auth import jwk_client, signing_key
-
-
-@pytest.fixture(autouse=True)
-def sufficient_initial_budget(monkeypatch):
-    import test_behavior_migration as migration
-    original = migration.BudgetRecord
-    def budget(**fields):
-        if fields.get("remaining_attempts") == 7 and fields.get("remaining_units") == 11:
-            fields.update(remaining_attempts=1000, remaining_units=10000)
-        return original(**fields)
-    monkeypatch.setattr(migration, "BudgetRecord", budget)
 
 
 @pytest.fixture
@@ -118,72 +99,6 @@ def test_original_finished_result_survives_one_platform_stop_without_sdk_exit_cl
     assert service.execute(c.principal, approval)["stop_resent"] is False and len(stops) == 1
 
 
-@pytest.mark.parametrize("durable_result", [1, 3, 6], indirect=True)
-def test_finished_result_every_commit_readable_and_next_rotation_preserves_unknown_models(durable_result, monkeypatch):
-    h, c = durable_result, durable_result.c
-    service, stops = service_for(h)
-    before = c.store.read_inventory()
-    plan = service.plan(c.principal)
-    sizes, inline_sizes, posts, ops_counts, stages = [], [], [], [], []
-    entity, transact, send = c.store._entity, c.store.transact, c.transport.send
-    def encoded(*args, **kwargs):
-        result = entity(*args, **kwargs)
-        sizes.append(len(result["Payload"]))
-        if getattr(args[1], "material", None) is not None:
-            inline_sizes.append(len(args[1].material.data))
-        return result
-    def committed(request, decide, **kwargs):
-        result = transact(request, decide, **kwargs)
-        read_current(c)
-        stages.append(request.request_id)
-        return result
-    def transport(request, **kwargs):
-        if request.method == "POST":
-            posts.append(len(request.body))
-            ops_counts.append(len(parse_batch(request)[0]))
-        return send(request, **kwargs)
-    monkeypatch.setattr(c.store, "_entity", encoded)
-    monkeypatch.setattr(c.store, "transact", committed)
-    monkeypatch.setattr(c.transport, "send", transport)
-    approval = service.authorize(c.principal, plan, "original-finish-approved")
-    done = service.execute(c.principal, approval)
-    assert done["state"] == "succeeded" and done["model_outcome"] == "unknown"
-    normal_report(c)
-    final = c.store.read_inventory()
-    _, liability = validate_retirement(final, c.config)
-    assert liability["business_result"] == "succeeded" and liability["model_outcome"] == "unknown"
-    assert len(liability["model_intents"]) == len(h.model_calls)
-    assert liability["finished_result"]["sdk_outcome"] == "not_observed"
-    successor = next_rotation(SimpleNamespace(config=c.config, clock=c.clock, store=c.store,
-                                              first_plan=c.h.plan, h=c.h.c.h), suffix="-after-finished")
-    rotation = successor.plan(c.principal, rotation_id="after-finished")
-    allowed = successor.authorize(c.principal, rotation, decision_id="after-finished-approved",
-                                  expires_at=c.clock[0] + timedelta(minutes=5))
-    successor.apply(c.principal, rotation, allowed)
-    successor.verify(c.principal, rotation, allowed)
-    fresh = MigrationStore(c.composition.clients[0], c.store._scope)
-    assert installed_origin(fresh, successor.new) == c.h.c.h.original
-    inventory = fresh.read_inventory()
-    for k in (key("result", c.binding.work.work_id), key("artifact", c.binding.work.work_id),
-              control_key("budget", c.binding.owner.root_budget_id)):
-        assert inventory.rows[k] == before.rows[k]
-    assert all(inventory.receipts[k] == value for k, value in before.receipts.items())
-    assert len(stops) == 1 and len(stages) >= 10 and max(sizes) <= 49152 and max(posts) <= 4 * 1024 * 1024
-    assert max(inline_sizes) <= 32768 and max(ops_counts) <= 100
-    if directory := os.environ.get("FINISHED_RESULT_SHAPES"):
-        path = Path(directory)
-        path.mkdir(parents=True, exist_ok=True)
-        shape = {"scope": service.scope.model_dump(mode="json"), "plan": plan.model_dump(mode="json"),
-                 "authorization": approval.model_dump(mode="json"), "execute_result": done,
-                 "liability": rotation.liability.model_dump(mode="json"),
-                 "result_sha256": plan.finished_result.result_image_sha256,
-                 "size": {"max_entity": max(sizes), "max_inline": max(inline_sizes),
-                          "max_multipart": max(posts), "max_operations": max(ops_counts)}}
-        (path / f"models-{len(h.model_calls)}.json").write_text(json.dumps(shape, indent=2) + "\n", encoding="utf-8")
-    print(f"models={len(h.model_calls)} max_entity={max(sizes)} max_inline={max(inline_sizes)} "
-          f"max_multipart={max(posts)} max_ops={max(ops_counts)} stop_calls=1")
-
-
 @pytest.mark.parametrize("fault", ["bytes", "etag", "source-work", "owner", "pending", "late-result", "missing-finish",
                                   "missing-assignment", "missing-acquire", "missing-context", "inventory-readfailure"])
 def test_original_artifact_receipts_and_live_m3_are_mandatory(durable_result, monkeypatch, fault):
@@ -255,7 +170,6 @@ def test_finished_stop_does_not_invent_quiescence_or_repeat_unknown_send(durable
     if stop_outcome == "already-stopped":
         assert service.execute(c.principal, approval)["state"] == "succeeded"
         normal_report(c)
-        assert validate_retirement(c.store.read_inventory(), c.config)[1]["model_outcome"] == "unknown"
     else:
         with pytest.raises(Problem):
             service.execute(c.principal, approval)
@@ -324,91 +238,7 @@ def test_finished_original_ack_loss_never_repeats_stop_or_work(durable_result, m
             result = service.finish(c.principal, approval)
         assert result["state"] == "succeeded" and len(stops) == 1
         normal_report(c)
-        assert validate_retirement(c.store.read_inventory(), c.config)[1]["liability_kind"] == "finished_result_platform_stop"
     assert posts.count(lost[0].request_id) == 1 and len(h.model_calls) == 3
-
-
-@pytest.mark.parametrize("lost_stage", [None, "plan", "authorization", "fetch", "ack", "confirmation"])
-def test_retained_only_original_success_after_policy_expiry_remains_exact(durable_result, monkeypatch, lost_stage):
-    from azure.core.exceptions import ServiceRequestError
-    from shared_context.behavior_settlement import RetainedResultSettlement, SettlementRegistration
-    from shared_context.behavior_settlement import settlement_key
-    from test_behavior_settlement import OfflineProtection, approve, fetch_command, ack_command
-    c = durable_result.c
-    service, stops = service_for(durable_result)
-    before = c.store.read_inventory()
-    approval = service.authorize(c.principal, service.plan(c.principal), "before-policy-expiry")
-    service.execute(c.principal, approval)
-    c.clock[0] = c.config.policies[0].policy.valid_until + timedelta(seconds=1)
-    observer = OfflineProtection(c.clock[0], "native")
-    registration = SettlementRegistration(
-        settlement_id="original-finished-report", binding_id=c.binding.binding_id,
-        configuration_sha256=c.config.sha256, expires_at=c.clock[0] + timedelta(minutes=10),
-        protection_evidence_id="offline-retained-original", protection_verifier_version="offline-retention-v1",
-        protection_verifier=observer)
-    settlement = RetainedResultSettlement(c.config, c.composition.runtime, registration)
-    c.composition.runtime.dep.inbox.register_retained_results(settlement)
-    original, transact = c.transport.send, c.store.transact
-    lost, posts, stages = [], [], []
-    def committed(request, decide, **kwargs):
-        result = transact(request, decide, **kwargs)
-        read_current(c)
-        stages.append(request.request_id)
-        return result
-    def send(request, **kwargs):
-        record = None
-        if request.method == "POST":
-            operations, _ = parse_batch(request)
-            record = next(json.loads(op[1]["Payload"]) for op in operations if "behavior:v1:receipt:" in op[1]["RowKey"])
-            posts.append(record["request"]["request_id"])
-        response = original(request, **kwargs)
-        if record is not None and lost_stage is not None and not lost:
-            result = record["result"]
-            selected = (record["request"]["request_id"] == settlement_key(lost_stage, registration.settlement_id)
-                        if lost_stage in {"plan", "authorization"} else
-                        set(result) == {"exchange_id"} if lost_stage == "fetch" else
-                        result.get("confirmation_level") == "client_received" if lost_stage == "ack" else
-                        result.get("fulfillment") == "fulfilled")
-            if selected:
-                lost.append(ControlRequest.model_validate_json(json.dumps(record["request"])))
-                raise ServiceRequestError("synthetic retained original response loss")
-        return response
-    monkeypatch.setattr(c.store, "transact", committed)
-    monkeypatch.setattr(c.transport, "send", send)
-    def use(action):
-        try:
-            return action()
-        except Problem as error:
-            assert error.body["error"]["code"] == "BEHAVIOR_COMMIT_UNKNOWN" and len(lost) == 1
-            c.store.reconcile(lost[0])
-            read_current(c)
-            return action()
-    granted = use(lambda: approve(settlement, c.principal))
-    read_current(c)
-    received = use(lambda: settlement.fetch(c.principal, fetch_command(granted)))
-    read_current(c)
-    ack = use(lambda: settlement.acknowledge(c.principal, ack_command(granted, received)))
-    read_current(c)
-    assert ack.payload["result"]["fulfillment"] == "fulfilled" and len(stops) == 1
-    liability = validate_retirement(c.store.read_inventory(), c.config)[1]
-    assert liability["business_result"] == "succeeded" and liability["model_outcome"] == "unknown"
-    successor = next_rotation(SimpleNamespace(config=c.config, clock=c.clock, store=c.store,
-                                              first_plan=c.h.plan, h=c.h.c.h), suffix="-retained-finished")
-    rotation = successor.plan(c.principal, rotation_id="retained-finished")
-    allowed = successor.authorize(c.principal, rotation, decision_id="retained-finished-approved",
-                                  expires_at=c.clock[0] + timedelta(minutes=5))
-    successor.apply(c.principal, rotation, allowed)
-    successor.verify(c.principal, rotation, allowed)
-    fresh = MigrationStore(c.composition.clients[0], c.store._scope)
-    assert installed_origin(fresh, successor.new) == c.h.c.h.original
-    after = fresh.read_inventory()
-    for k in (key("result", c.binding.work.work_id), key("artifact", c.binding.work.work_id),
-              control_key("budget", c.binding.owner.root_budget_id)):
-        assert after.rows[k] == before.rows[k]
-    assert all(after.receipts[k] == value for k, value in before.receipts.items())
-    assert len(stages) >= 6 and len(durable_result.model_calls) == 3
-    assert len(lost) == (0 if lost_stage is None else 1)
-    assert not lost or posts.count(lost[0].request_id) == 1
 
 
 @pytest.mark.parametrize("stage", ["fence-finished-result", "stop-intent", "sealed"])
@@ -484,4 +314,3 @@ def test_finished_report_loss_is_exact_receipt_reconciled_without_rewriting_resu
     ack = use(lambda: runtime.acknowledge(b.binding_id, command, c.principal))
     assert ack.payload["result"]["fulfillment"] == "fulfilled"
     assert len(lost) == 1 and posts.count(lost[0].request_id) == 1 and len(stops) == 1
-    assert validate_retirement(c.store.read_inventory(), c.config)[1]["model_outcome"] == "unknown"

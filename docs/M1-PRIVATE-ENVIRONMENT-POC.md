@@ -93,7 +93,7 @@ checkpoint SHA-256是 `a265e55595f863143fa684eddfcb0e9dfb306f44ac9a995f992103fc7
 
 ### 啟動契約與邊界
 
-[hosted_bootstrap.py](../src/fa-shared-context-poc/hosted_bootstrap.py)只接受已觀察的Linux UID0與`HOME=/home/session`。
+hosted_bootstrap.py（`bootstrap()`已於 2026-10 移除）只接受已觀察的Linux UID0與`HOME=/home/session`。
 使用directory fd／`O_NOFOLLOW`限制路徑，僅對**本次新建**的`.fa-m1`做`fchown`／`fchmod`；
 既有目錄只驗owner／mode，不修補、不遞迴、不更動內容。接著清supplementary groups、
 設定real/effective/saved GID與UID，再檢查程序身分與上述三種capabilities；任一步不符就停止，不以root啟動agent。

@@ -20,7 +20,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from test_approved_skill_api import change_artifact, post_skill
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_instruction_capacity import change_loaded_capacity
 from test_instruction_prompt import submit
 from test_m3_auth import jwk_client, signing_key
@@ -273,7 +273,6 @@ def test_hosted_sends_the_bounded_description_without_hiding_names_in_an_enum(
     assert tokenizer.count(next_reader.description.encode()) <= budget
     assert calls[1]["resume"] and calls[1]["sdk_session_id"] == calls[0]["sdk_session_id"]
     assert control.records[accepted["binding_id"]].model_dump_json() == first
-    check_history(h)
 
 
 def test_export_retains_budget_profile_as_a_reference_not_new_authority(

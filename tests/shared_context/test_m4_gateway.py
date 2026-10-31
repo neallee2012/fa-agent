@@ -10,9 +10,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import A, TENANT
-from shared_context.api import create_app
+from legacy_m2_m4.api import create_app
 from shared_context.errors import Problem
-from shared_context.m2_gateway import M2Gateway, M2Settings, is_model_upload
+from legacy_m2_m4.m2_gateway import M2Gateway, M2Settings, is_model_upload
 from shared_context.m4_fixtures import PROMPT_TOKENS_LIMIT, SUITE
 from test_m2_gateway import BODY, BUDGET, CHAT, Credential, NATIVE, PROJECT
 from test_m4_api import BASE, SETTINGS, m3, m4

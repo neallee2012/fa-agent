@@ -27,7 +27,7 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -141,7 +141,6 @@ def test_fixed_sdk_saves_user_procedure_as_one_unapproved_skill_draft(assistant,
         projection = client.get("/work-policy/v1/conversations/" + accepted["conversation_id"], headers=h.headers())
         assert projection.status_code == 200 and projection.json()["can_follow_up"]
         assert projection.json()["turns"][0]["prompt_assembly"] == prompt.record.model_dump(mode="json")
-        check_history(h)
         record_property("offline_wiring", json.dumps({
             "profile": profile,
             "sdk_version": importlib.metadata.version("github-copilot-sdk"),

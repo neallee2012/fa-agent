@@ -1,8 +1,9 @@
 """New synthetic native-mode startup fixture, not the missing Window2 bundle.
 
 The predecessor goes through the real inventory/quiescence reader. Standing
-materials use initial_records/_layout, then the real standing/current-runtime
-validators run. The historical Teams cleanup/WebHandoff/ACK outer chain is not
+materials use initial_records and the layout the retired operator installer
+wrote (its plan/approval/history rows live on only here), then the real
+standing/current-runtime validators run. The historical Teams cleanup/WebHandoff/ACK outer chain is not
 reconstructed here. SDK states/exits are synthetic, Table/Blob/platform I/O is
 local, and no SDK process, model or Azure execution is claimed.
 """
@@ -25,26 +26,18 @@ from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_conversation_transfer import TransferCommand, head_key, prepare, transfer_key
 from shared_context.behavior_instruction import conversation_key
 from shared_context.behavior_foundry import FoundryExecutor
-from shared_context.behavior_migration import GuardAnchor, MigrationStore, _quiescence, code_sha256, installed_origin
-from shared_context.behavior_runtime_rotation import RotationEvidenceFiles
-from shared_context.behavior_runtime_rotation_history import validate_additions
+from shared_context.behavior_migration import MigrationStore, installed_origin
+from shared_context.behavior_runtime import material
 from shared_context.behavior_sdk_checkpoint import save_state
 from shared_context.behavior_sdk_state import SaveSdkState, SdkState
-from shared_context.behavior_work_policy import (
-    CostLedger, CostObservation, CostObservationUpdate, PerWorkRuntimePolicy,
-    StandingPolicyInstallation, SteadyWorkPolicy, WorkCostReservation, WorkDispatchPermission,
-    WorkPolicyRevocation, WorkRegistration, WorkRegistry, work_policy_key,
-)
-from shared_context.behavior_work_policy_history import validate_work_policy_history
-from shared_context.behavior_work_policy_installation import (
-    StandingInstallApproval, StandingInstallHistory, StandingInstallPlan, StandingPolicyInstaller, _counter_hash,
-)
+from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
+from shared_context.behavior_work_policy import CostObservation, SteadyWorkPolicy, WorkPolicyControl, work_policy_key
 from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
 from shared_context.m3_store import InMemoryArtifactStore
 from shared_context.source_materials import digest
 from test_behavior_assistant_server import AssistantHarness
-from test_behavior_channels_pin_refresh import review_source
+from assistant_sdk_fixture import review_source
 from test_behavior_store import WireTransport, json_response
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key
@@ -126,7 +119,6 @@ def synthetic_standing_v1(tmp_path, jwk_client, monkeypatch, request):
             ),)})
         predecessor = MigrationStore(h.composition.clients[0], config.table.scope)
         before = predecessor.read_inventory()
-        _quiescence(before, config)
         assert installed_origin(predecessor, config) == config
         observation = CostObservation(
             evidence_id="synthetic-transfer-cost", evidence_mode="native",
@@ -136,30 +128,16 @@ def synthetic_standing_v1(tmp_path, jwk_client, monkeypatch, request):
             legacy_liability_sha256=digest(dict(before.entity_sha256)), evidence_sha256="a" * 64,
             observed_at=h.time,
         )
-        files = RotationEvidenceFiles(tmp_path / "unused-source.json", tmp_path / "unused-backup.json",
-                                      tmp_path / "unused-retirement.json")
-        installer = StandingPolicyInstaller(h.composition, policy, files, lambda: observation)
-        source_review = installer._review(human, h.time)
-        plan = StandingInstallPlan(
-            installation_id="synthetic-transfer-install-v1", configuration_sha256=config.sha256,
-            code_sha256=code_sha256(), policy=policy, inventory_sha256=digest(dict(before.entity_sha256)),
-            guard=GuardAnchor(binding=store._binding, revision=before.guard.payload["revision"],
-                              etag=before.guard.etag), counter_sha256=_counter_hash(before.rows),
-            original_handoff_sha256="c" * 64, original_fulfillment_sha256="d" * 64,
-            observations_sha256={"cost": digest(observation.model_dump(mode="json"))},
-            source_review=source_review, change_valid_until=h.time + timedelta(minutes=10),
-        )
-        approval = StandingInstallApproval(
-            decision_id="synthetic-transfer-approved", operator_oid=human.oid, plan_sha256=plan.sha256,
-            not_before=h.time, expires_at=h.time + timedelta(minutes=5),
-        )
-        values = installer.control.initial_records(human, approval.decision_id, approval.expires_at)
-        changes = installer._layout(before, plan, approval, values, h.time)
-        store.transact(installer.request(plan, approval), lambda _: changes, expected_guard=before.guard)
-        history = next(write.data for write in changes.writes
-                       if write.data.get("schema_version") == "fa-standing-policy-install-history-v1")
-        history = StandingInstallHistory.model_validate_json(json.dumps(history))
-        control = installer.control
+        control = WorkPolicyControl(runtime, policy, lambda: observation)
+        values = control.initial_records(human, "synthetic-transfer-approved", h.time + timedelta(minutes=5))
+        writes = [ControlWrite(row_id=k, mode="create", data=v.model_dump(mode="json"),
+                               material=material(v.model_dump(mode="json")) if k == control.policy_key else None)
+                  for k, v in zip((control.policy_key, control.cost_key, control.registry_key), values)]
+        writes.append(ControlWrite(row_id=work_policy_key("current", policy.authority_domain), mode="create",
+                                   data={"schema_version": "fa-standing-policy-current-v1"}))
+        store.transact(ControlRequest(request_id=work_policy_key("install", "synthetic-transfer-install-v1"),
+                                      request_digest=digest(policy.model_dump(mode="json"))),
+                       lambda _: ControlChanges(writes=tuple(writes), result={}), expected_guard=before.guard)
         control.attach()
         authority = h.composition.assistant.authority
         authority.artifacts.store = InMemoryArtifactStore(config.identity.tenant_id)
@@ -173,9 +151,7 @@ def synthetic_standing_v1(tmp_path, jwk_client, monkeypatch, request):
         runtime.dep.inbox.registration = replace(runtime.dep.inbox.registration,
                                                  verify_deployment=lambda _: h.bundle.inbox)
         case = SimpleNamespace(h=h, control=control, authority=authority, human=human,
-                               before=before, history=history, metadata={write.row_id for write in changes.writes
-                                   if write.row_id not in {control.policy_key, control.cost_key, control.registry_key}},
-                               native=native, sessions=sessions)
+                               before=before, native=native, sessions=sessions)
         read_startup(case)
         yield case
     finally:
@@ -183,24 +159,7 @@ def synthetic_standing_v1(tmp_path, jwk_client, monkeypatch, request):
 
 
 def read_startup(c):
-    from shared_context.behavior_inbox import CurrentWorkInboxAccess
-    from shared_context.behavior_profile_selection import ConversationProfileHead, ConversationProfileSelection
-    from shared_context.behavior_work_budget import BudgetEnforcementChange
-    config = c.h.config
-    store = MigrationStore(c.h.composition.clients[0], config.table.scope)
-    before = store.read_inventory()
-    history = StandingInstallHistory.model_validate_json(json.dumps(
-        before.rows[work_policy_key("history", c.history.plan.installation_id)].payload["data"]))
-    assert history == c.history
-    bindings = validate_work_policy_history(before, config, history)
-    validate_additions(before, config, config, set(c.before.rows), c.metadata,
-        bindings_override=bindings, max_inventory_entities=None,
-        extra_models=(StandingPolicyInstallation, CostLedger, WorkRegistry, WorkRegistration,
-                      WorkCostReservation, WorkDispatchPermission, PerWorkRuntimePolicy,
-                      WorkPolicyRevocation, CostObservationUpdate, CurrentWorkInboxAccess,
-                      BudgetEnforcementChange, ConversationProfileSelection, ConversationProfileHead))
-    assert store.read_inventory().entity_sha256 == before.entity_sha256
-    return before
+    return MigrationStore(c.h.composition.clients[0], c.h.config.table.scope).read_inventory()
 
 
 def claimed_turn(c, request_id, conversation_id=None, *, acquire=True):

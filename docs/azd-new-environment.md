@@ -121,7 +121,7 @@ ACR、CAE、API UAMI（名稱／client ID／principal ID）、Table／備份 sto
 | 10 首次安裝 | `postdeploy` | `make_runtime.py`→部署 Job→`run_fresh_job.py plan`→本機重建 plan 並核 hash→**owner 在終端機打字批准**（或事先設 `FA_APPROVE_INITIALIZATION`，見 §6）→`apply`→`reconcile` |
 | 8 API | `postdeploy` | `behavior-api.bicep`（首次安裝後才建，避免 D4 的 crash loop） |
 | 11 Sync／route（首次不 follow） | `postdeploy` | `ci_deploy.py sync`；首次安裝**不跑 follow**：從沒準備過的 Agent 沒有舊環境可跟，伺服器回 `NATIVE_FILES_CONFIRMATION_REQUIRED`（10-10 實跑）。第一次 session 準備直接綁定已路由的版本；之後的 `azd deploy` 才 follow |
-| 15 Portal app | `postdeploy` | `fresh_export`→`remote-bundle`→`web-console.bicep`→補 redirect URI 與 FIC→consent |
+| 15 Portal app | `postdeploy` | `fresh_export`→`remote-bundle`→`web-console.bicep`（環境變數取自 profile 的 `console_environment`）→補 redirect URI 與 FIC→consent |
 | 13 首次 session 準備 | `postdeploy` | `prepare_native_sessions.py`（owner token） |
 | 16 WebIQ（選用） | `postdeploy` | `FA_ENABLE_WEBIQ=true` 時：`new_webiq_connection.py`（getpass）＋`new_toolbox.py` |
 | 再次 `azd deploy` | `postdeploy` | 首次安裝已完成（API 存在且 `FA_SESSIONS_PREPARED=true`）才走升級：`ci_deploy.py check`→WebIQ（若開）→`guard/sync/api/console/follow`，跟 stage CI 相同；首次安裝中斷時則照首次路徑接續（每步先讀回） |

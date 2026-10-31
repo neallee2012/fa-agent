@@ -27,11 +27,7 @@ from .native_routine_auth import (
     NativeRoutineApiClock, routine_clock_enabled,
 )
 from .native_routine_wire import (
-    NativeOnceSchedule, NativeReminderQuery, NativeRoutineChange, NativeRoutineCheck, NativeRoutineCurrent, NativeRoutineDefinition,
-    NativeRoutineDispatch, NativeRoutineDue, NativeRoutineDuePage,
-    NativeRoutineIssue, NativeRoutineList, NativeRoutineOrigin,
-    NativeRoutineTrigger, NativeRoutineView, NativeWorkReminder, NativeWorkReminders,
-    native_routine_request_id, native_routines_enabled, routine_origin_for,
+    NativeOnceSchedule, NativeReminderQuery, NativeRoutineChange, NativeRoutineCheck, NativeRoutineCurrent, NativeRoutineDefinition, NativeRoutineDispatch, NativeRoutineDue, NativeRoutineDuePage, NativeRoutineIssue, NativeRoutineList, NativeRoutineTrigger, NativeRoutineView, NativeWorkReminder, NativeWorkReminders, native_routine_request_id, native_routines_enabled, routine_origin_for,
 )
 
 
@@ -707,82 +703,3 @@ class NativeRoutineService:
         NativeTurnGateway._accounted(control, (receipt, None), composition)
         self._settle(control, receipt)
         return self._dispatch(receipt)
-
-
-def validate_native_routine_history(inventory, config):
-    """Recognize original routine metadata during existing startup/rotation reads; never dispatch."""
-    from .behavior_team_registry import TeamOwnership, team_key
-
-    models = {model.model_fields["kind"].default: model for model in (
-        NativeRoutineIndex, NativeRoutineHead, NativeRoutineVersion, NativeRoutineIntent)}
-    values = {}
-
-    def key(value, kind, identifier):
-        return control_key("native-routine-" + kind, *value.scope_ids, identifier)
-
-    def invalid():
-        raise Problem(409, "NATIVE_ROUTINE_INVALID", "retained routine metadata differs from its original scope or reference")
-
-    def subject(value, source):
-        if source.agent_id != value.agent_id or source.tenant_id != config.identity.tenant_id:
-            invalid()
-        if source.team_id == config.identity.team_id:
-            owner = config.identity.human_oid
-        else:
-            ownership = _read(inventory.rows.get(team_key(source.tenant_id, source.team_id)), TeamOwnership)
-            if ownership is None or (ownership.tenant_id, ownership.team_id) != (source.tenant_id, source.team_id):
-                invalid()
-            owner = ownership.owner_oid
-        if source.owner_oid != owner:
-            invalid()
-
-    for identifier, row in inventory.rows.items():
-        kind = row.payload["data"].get("kind")
-        if not isinstance(kind, str) or not kind.startswith("native_routine_"):
-            continue
-        if kind not in models:
-            invalid()
-        value = _read(row, models[kind])
-        if (value.scope_ids[0] != config.table.scope.authority_domain
-                or len(value.scope_ids) == 1 and value.agent_id not in {target.agent_id for target in config.targets}):
-            invalid()
-        if isinstance(value, NativeRoutineVersion):
-            subject(value, value.definition)
-            expected = key(value, "version", value.definition.request_id)
-        elif isinstance(value, NativeRoutineIntent):
-            subject(value, value.submission.routine)
-            expected = key(value, "intent", value.submission.command.request_id)
-        elif isinstance(value, NativeRoutineHead):
-            expected = key(value, "head", value.routine_id)
-        else:
-            expected = key(value, "index", "definitions")
-        if identifier != expected:
-            invalid()
-        values[identifier] = value
-    for value in values.values():
-        if isinstance(value, NativeRoutineIndex):
-            for routine_id in value.routine_ids:
-                head = values.get(key(value, "head", routine_id))
-                if not isinstance(head, NativeRoutineHead) or head.agent_id != value.agent_id:
-                    invalid()
-        elif isinstance(value, NativeRoutineHead):
-            version = values.get(key(value, "version", value.version_id))
-            index = values.get(key(value, "index", "definitions"))
-            if (not isinstance(version, NativeRoutineVersion) or version.agent_id != value.agent_id
-                    or version.definition.routine_id != value.routine_id
-                    or not isinstance(index, NativeRoutineIndex) or value.routine_id not in index.routine_ids):
-                invalid()
-            for rid in value.pending:
-                intent = values.get(key(value, "intent", rid))
-                if (not isinstance(intent, NativeRoutineIntent) or intent.agent_id != value.agent_id
-                        or intent.submission.routine.occurrence.routine_id != value.routine_id):
-                    invalid()
-        elif isinstance(value, NativeRoutineIntent):
-            source = value.submission.routine
-            version = values.get(key(value, "version", source.occurrence.approved_version))
-            if (not isinstance(version, NativeRoutineVersion) or version.agent_id != value.agent_id
-                    or source != routine_origin_for(version.definition, source.occurrence.scheduled_for,
-                                                    conversation_id=source.conversation_id)
-                    or value.submission.command.conversation_id not in (None, version.definition.conversation_id)):
-                invalid()
-    return values

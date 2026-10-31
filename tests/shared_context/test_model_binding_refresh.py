@@ -29,7 +29,7 @@ from test_instruction_flow import instruction_models
 from test_instruction_responses import responses_usage
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import open_turn
-from test_teams_metrics import metrics
+from assistant_sdk_fixture import sdk_assistant
 from test_work_policy_lifecycle import enabled
 
 
@@ -38,9 +38,9 @@ from test_work_policy_lifecycle import enabled
     ("true", True, "openai-responses"),
 ], ids=["paged-image", "paged-text", "legacy-image", "legacy-text", "responses-paged-image"])
 def test_third_image_model_keeps_its_binding_during_conversation_registry_refresh(
-    metrics, monkeypatch, images, writer, model_provider,
+    sdk_assistant, monkeypatch, images, writer, model_provider,
 ):
-    h, control, human, _ = enabled(metrics)
+    h, control, human, _ = enabled(sdk_assistant)
     monkeypatch.setenv("FA_WORK_REGISTRY_WRITER", writer)
     h.runtime.capability_catalog = build_catalog([])
     grants = available_grants(h.runtime.capability_catalog, ("fa-desktop-v1",))
@@ -54,7 +54,7 @@ def test_third_image_model_keeps_its_binding_during_conversation_registry_refres
     sent, token_reads, overlap, source_reads = [], [], [], []
     entered, release = Event(), Event()
     reader_thread = [None]
-    original_refresh, original_sources = h.teams.refresh, h.assistant.model_sources
+    original_refresh, original_sources = h.runtime.refresh_bindings, h.assistant.model_sources
 
     def credential(_scope):
         token_reads.append(True)
@@ -77,8 +77,8 @@ def test_third_image_model_keeps_its_binding_during_conversation_registry_refres
     turn = open_turn(h, control, human, "desktop-original-third-model")
     cid = turn.assignment.task.instruction.conversation_id
 
-    def refresh():
-        original_refresh()
+    def refresh(binding_id=None):
+        original_refresh(binding_id)
         if get_ident() == reader_thread[0] and not entered.is_set():
             entered.set()
             assert release.wait(10)
@@ -109,7 +109,7 @@ def test_third_image_model_keeps_its_binding_during_conversation_registry_refres
                 release.set()
                 reading.result(timeout=10)
 
-    monkeypatch.setattr(h.teams, "refresh", refresh)
+    monkeypatch.setattr(h.runtime, "refresh_bindings", refresh)
     monkeypatch.setattr(h.assistant, "model_sources", sources)
     messages = [{"role": "user", "content": "Observe the original desktop, then continue."}]
     headers = {**h.headers("agent"), TICKET_HEADER: turn.client.ticket.get_secret_value()}
@@ -151,7 +151,7 @@ def test_third_image_model_keeps_its_binding_during_conversation_registry_refres
         refused = h.client.post(root, json=aw.ModelRequest(request_id=identifier, body=body).model_dump(mode="json"),
                                 headers=headers)
         assert refused.status_code == 403 and len(sent) == 3
-        assert h.sdk.starts == [] and h.sent == []
+        assert h.sdk.starts == []
     finally:
         release.set()
         turn.client.close()
@@ -161,17 +161,17 @@ def test_third_image_model_keeps_its_binding_during_conversation_registry_refres
         h.client = old_client
 
 
-def test_channel_refresh_does_not_restore_work_removed_from_the_standing_registry(metrics, monkeypatch):
+def test_channel_refresh_does_not_restore_work_removed_from_the_standing_registry(sdk_assistant, monkeypatch):
     # Admission contract since 7c66d6a9 (#264): removing a registry row keeps the turn it already admitted until the
     # next admission, which reads the registry again and refuses a follow-up whose prior turn is no longer listed.
     monkeypatch.setenv("FA_WORK_REGISTRY_WRITER", "false")
-    h, control, human, _ = enabled(metrics)
+    h, control, human, _ = enabled(sdk_assistant)
     first = aw.InstructionSubmit(request_id="removed-original-binding", content="Keep only current registered work.")
     binding, _ = control.submit(human, first)
     assert binding.binding_id in control.records
     h.mutate(control.registry_key, entries=[])
     control.refresh()
-    h.teams.refresh()
+    h.runtime.refresh_bindings()
     assert control.records[binding.binding_id].turn_authorization is not None
     assert binding.binding_id in h.runtime.bindings
     kept = set(control.records)
@@ -181,13 +181,13 @@ def test_channel_refresh_does_not_restore_work_removed_from_the_standing_registr
             conversation_id=conversation_id(control.policy, first)))
     assert (denied.value.status, denied.value.body["error"]["code"]) == (403, "BEHAVIOR_BINDING_DENIED")
     assert set(control.records) == kept
-    assert h.sdk.starts == [] and h.sent == []
+    assert h.sdk.starts == []
 
 
-def test_registration_added_during_channel_publication_uses_one_work_snapshot(metrics, monkeypatch):
+def test_registration_added_during_channel_publication_uses_one_work_snapshot(sdk_assistant, monkeypatch):
     from shared_context import behavior_work_registry
 
-    h, control, human, _ = enabled(metrics)
+    h, control, human, _ = enabled(sdk_assistant)
     first, _ = control.submit(human, aw.InstructionSubmit(request_id="prior-to-publication", content="Original work."))
     command = aw.InstructionSubmit(request_id="during-publication", content="Another original work.")
     committed, continue_registration, added = Event(), Event(), Event()
@@ -231,7 +231,7 @@ def test_registration_added_during_channel_publication_uses_one_work_snapshot(me
         writing = writers.submit(register)
         try:
             assert committed.wait(10)
-            h.teams.refresh()
+            h.runtime.refresh_bindings()
         finally:
             continue_registration.set()
             second = writing.result(timeout=10)
@@ -239,4 +239,4 @@ def test_registration_added_during_channel_publication_uses_one_work_snapshot(me
     for binding in (first, second.binding):
         assert h.runtime.bindings[binding.binding_id] == binding
         assert h.runtime.profiles[binding.binding_id] == control.records[binding.binding_id].profile
-    assert h.sdk.starts == [] and h.sent == []
+    assert h.sdk.starts == []

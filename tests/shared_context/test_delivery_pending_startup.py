@@ -6,7 +6,6 @@ from shared_context import behavior_wire as wire
 from shared_context.behavior_delivery_pending import (
     WRITER_ENV, PendingHead, PendingMember, PendingPage, head_key, member_key, page_key,
 )
-from shared_context.behavior_migration import _kind_models
 from shared_context.behavior_operations import control_key
 from test_conversation_transfer_startup import read_startup, saved_turn, synthetic_standing_v1  # noqa: F401
 from test_instruction_flow import instruction_models  # noqa: F401
@@ -41,12 +40,6 @@ def acknowledge(c, binding, request_id):
         request_id=request_id, exchange_id=got.exchange_id, acknowledgment_token=got.acknowledgment_token,
         binding=wire.DeliveryBinding.model_validate_json(got.binding.model_dump_json())), c.human)
     assert runtime.job_status(binding.binding_id, c.human).obligation_fulfilled
-
-
-def test_pending_kinds_are_classified_by_startup_readers():
-    kinds = _kind_models()
-    assert (kinds["delivery_pending_head_v1"], kinds["delivery_pending_page_v1"],
-            kinds["delivery_pending_member_v1"]) == (PendingHead, PendingPage, PendingMember)
 
 
 def test_new_members_and_original_entries_survive_cold_start_and_ack(synthetic_standing_v1, monkeypatch):

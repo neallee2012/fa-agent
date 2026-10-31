@@ -26,7 +26,7 @@ from shared_context.behavior_workers import TERMINAL_STATES, worker_key
 from .adapter import FixedTask, canonical, require, sha, strict_json, ConsoleError
 from .instructions import InstructionStore, InstructionConnection, INSTRUCTION_QUOTED_UTF8_LIMIT
 from .standing import (
-    StandingConsoleConfig, StandingPolicyReader, StandingPullAdapter,
+    StandingConsoleConfig, StandingPreflightCheck, StandingPullAdapter,
 )
 from .work_policy import WorkPolicyQuery
 
@@ -296,7 +296,7 @@ class InstructionAdapter(StandingPullAdapter):
         checked_delivery_reference(result.parsed.content, raw)
 
 
-class InstructionReader(StandingPolicyReader):
+class InstructionReader(StandingPreflightCheck):
     def __init__(self, config, adapter, clock, control):
         require(type(config) is StandingConsoleConfig and type(adapter) is InstructionAdapter, "WORK_POLICY_INVALID")
         self.config, self.adapter, self.clock, self.control = config, adapter, clock, control

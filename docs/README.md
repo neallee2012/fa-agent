@@ -8,6 +8,7 @@
 | [目前狀態摘要](status/CURRENT-STATE.md) | 新工作階段先讀：現在在哪、近期完成、下一步與待核對事項 |
 | [開發與規格維護慣例](CONVENTIONS.md) | 文件權威、變更同步、針對性驗證、POC 結果與部署差異 |
 | [擴充 FA](extending.md) | 新使用者加 MCP、skills、connector：`azd up` 後的預設狀態、要不要改程式，以及 FA 沒有 plugin 機制 |
+| [Hosted agent 經企業 AI Gateway](model-gateway-probe.md) | 客戶問題的官方能力判讀（BYOM 只支援 prompt agent）與 APIM／模擬地端模型／UDR 的 dev 實測設計、費用、批准點與結果；dev 已實測：APIM 與地端模擬可通，路由表會套用到 micro-VM（導向防火牆未測） |
 | [公開 repo 同步](public-sync.md) | stage 部署成功後把該版去識別化推到公開 repo：排除清單、fail-closed 檢查、Neal 的一次性設定與私有連結待決 |
 | [CURRENT-STATE 工作法研究](current-state-workflow-research.md) | 來源 repo 的短摘要、權威分工與實際接線；區分明文規則、觀察與移植建議 |
 | [Grok 四章 Context 完整比較](grok-context-comparison.md) | 系統提示、回合組裝、逐字稿／壓縮及 skills 的逐項差異；公開基準、WIP 與實驗結果分開 |

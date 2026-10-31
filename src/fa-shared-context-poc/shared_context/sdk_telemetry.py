@@ -393,17 +393,17 @@ def _build_processor():
 # fixed reason code or a hash prefix; FA_NATIVE_TURN_UNKNOWN a fixed code and exception type; FA_MODEL_DIRECT_* status,
 # fixed provider codes, counts and wait ms; NATIVE_UPGRADE_CUT codes, counts, ms, a RID prefix and session IDs;
 # FA_PRIVATE_MEMORY_* / FA_TEAM_MEMORY_* status, stage and reason codes, exception types, counts, official update or
-# memory IDs and a RID prefix. Other lines of the same loggers (FA_MCP_SERVER_STATUS error text, FA_NATIVE_HTTP, ...)
-# stay out.
+# memory IDs and a RID prefix; NATIVE_TOOLBOX_FAILED a toolbox failure's method, stage, codes, status and exception
+# type. Other lines of the same loggers (FA_MCP_SERVER_STATUS error text, FA_NATIVE_HTTP, ...) stay out.
 LOG_LOGGERS = ("shared_context.behavior_timing", "shared_context.behavior_hosted", "shared_context.m2_copilot",
                "shared_context.native_resident", "shared_context.native_sdk", "shared_context.native_turns",
                "shared_context.behavior_model_direct", "shared_context.native_environment_cut",
                "shared_context.behavior_private_memory", "shared_context.cosmos_private_memory",
                "shared_context.native_private_memory", "shared_context.native_team_memory",
-               "shared_context.native_memory_candidate")
+               "shared_context.native_memory_candidate", "shared_context.native_toolbox")
 # Lines with these prefixes leave the container: their arguments must stay fixed codes, hashes or numbers, never text.
 LOG_PREFIXES = ("FA_TIMING ", "RESIDENT_SDK_", "FA_NATIVE_TURN_UNKNOWN ", "FA_MODEL_DIRECT_", "NATIVE_UPGRADE_CUT ",
-                "FA_PRIVATE_MEMORY_", "FA_TEAM_MEMORY_")
+                "FA_PRIVATE_MEMORY_", "FA_TEAM_MEMORY_", "NATIVE_TOOLBOX_FAILED ")
 # The memory clients name their event as the first argument ("%s status=..."); only these exact names count.
 LOG_EVENTS = ("FA_PRIVATE_MEMORY_SEARCH", "FA_PRIVATE_MEMORY_UPDATE", "FA_TEAM_MEMORY_SEARCH", "FA_TEAM_MEMORY_CREATE")
 

@@ -24,7 +24,7 @@ from shared_context.errors import Problem
 from shared_context.m3_auth import HumanApprover
 from shared_context.m3_models import ApprovalInput
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import signing_key, token, jwk_client
 from test_sdk_compaction_product import open_turn, ordinary, settle
 from test_work_cost_policy import standing
@@ -155,7 +155,6 @@ def test_save_skill_draft_creates_one_unapproved_team_review_then_human_approve(
         archived = h.store.read_snapshot((key("text-archive", turn.binding.job_id),))[key("text-archive", turn.binding.job_id)]
         assert archived.payload["data"]["skill_draft_receipt"] == receipt
         assert h.assistant.result(turn.start.binding).known_effects == (receipt["receipt_id"],)
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -224,7 +223,6 @@ def test_unknown_create_or_upload_reconciles_only_original_ids(assistant, monkey
         else:
             assert again.status_code == 200, again.text
             assert counts == {"create": 1, "upload": 1, "blob": 1}
-        check_history(h)
     finally:
         turn.client.close()
 

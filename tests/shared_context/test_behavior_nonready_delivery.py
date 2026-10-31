@@ -12,10 +12,7 @@ from shared_context.behavior_runtime import runtime_key
 from shared_context.behavior_server import run_controller
 from shared_context.behavior_server_config import SupervisorLimits
 from shared_context.errors import Problem
-from test_behavior_assistant_acquire_conflicts import native_acquire, current_rotation
-from test_behavior_rotation_cutoff import two_rotations
-from test_behavior_rotation_settlement_history import current_cancelled
-from test_behavior_runtime_rotation import rotated
+from test_behavior_assistant_acquire_conflicts import installed_assistant, native_acquire
 from test_m3_auth import jwk_client, signing_key
 from test_behavior_settlement import write
 from test_behavior_second_model_conflicts import controller_write
@@ -32,22 +29,15 @@ def drain(c, *, pending=True, binding=None):
 
 @pytest.fixture
 def adequate_original_scans(monkeypatch):
-    import test_behavior_migration as migration
-    import test_behavior_runtime_transition as transition
-    from shared_context.behavior_server_config import ServerConfiguration
-    original, quota_type = transition.synthetic_configuration, migration.QuotaRecord
+    import test_behavior_assistant_server as assistant
+    original = assistant.assistant_configuration
     def configuration():
-        raw = original().model_dump(mode="json")
+        raw = original()
         raw["workers"].update(queries_per_generation=16, control_units=16)
         for root in raw["roots"]:
             root["scans"] = 1000
-        return ServerConfiguration.model_validate_json(json.dumps(raw))
-    def quota(**fields):
-        if fields.get("scope_kind") == "root" and fields.get("scans_remaining") == 3:
-            fields["scans_remaining"] = 1000
-        return quota_type(**fields)
-    monkeypatch.setattr(transition, "synthetic_configuration", configuration)
-    monkeypatch.setattr(migration, "QuotaRecord", quota)
+        return raw
+    monkeypatch.setattr(assistant, "assistant_configuration", configuration)
 
 
 def test_actual_controller_does_not_write_nonready_delivery_pages(native_acquire):

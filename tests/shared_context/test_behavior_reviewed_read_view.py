@@ -12,10 +12,7 @@ import pytest
 from shared_context.behavior_assistant import _Session, _row, key
 from shared_context.errors import Problem
 from test_behavior_assistant_claim_boundaries import hosted_flow, reviewed
-from test_behavior_assistant_acquire_conflicts import native_acquire, current_rotation
-from test_behavior_rotation_cutoff import two_rotations
-from test_behavior_rotation_settlement_history import current_cancelled
-from test_behavior_runtime_rotation import rotated
+from test_behavior_assistant_acquire_conflicts import installed_assistant, native_acquire
 from test_m3_auth import jwk_client, signing_key
 from test_behavior_nonready_delivery import adequate_original_scans, drain
 from test_behavior_second_model_conflicts import controller_write
@@ -94,8 +91,7 @@ def test_full_model_keeps_both_inventories_and_original_egt(hosted_flow, monkeyp
     assert before["remaining_units"] - after["remaining_units"] == 5
     assert len(models) == len(h.endpoint.requests) == 3 and len(h.supervisor.threads) == 1
     print(f"full_model={dict(counts)}; source_ms={spans}; provider=3; debits=5")
-    # Later read reductions cut point reads (182->86, source 34->9); inventories and the one EGT are unchanged.
-    assert counts == {"point": 86, "source_point": 9, "full_inventory_gate": 2, "inventory": 2, "EGT": 1}
+    assert counts == {"point": 72, "source_point": 9, "full_inventory_gate": 2, "EGT": 1}
 
 
 @pytest.mark.usefixtures("adequate_original_scans")
@@ -242,7 +238,7 @@ def test_scope_never_caches_permission_or_hides_invalid_source(native_acquire, m
                                     expected_binding=c.starts[0].binding).result()
             else:
                 when = (c.config.policies[0].policy.valid_until if fault == "policy-clock" else
-                        c.clock[0] + timedelta(minutes=11))
+                        c.h.harness.bundle.expires_at + timedelta(seconds=1))
                 c.clock[0] = when
         return result
     monkeypatch.setattr(c.authority, "_reviewed_once", after_source)

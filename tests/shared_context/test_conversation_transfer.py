@@ -222,67 +222,6 @@ def test_unreadable_prepared_environment_never_changes_conversation_or_recreates
     assert len(c.io) == 1
 
 
-def test_new_human_message_restores_the_last_legal_archive_without_replaying_the_failed_turn(transfer_case):
-    from shared_context.behavior_conversation_transfer import prepare, TransferCommand
-    c = transfer_case
-    original_failed = c.control.records[c.failed.binding_id]
-    prepared = prepare(c.control, c.h.assistant, c.human, c.cid,
-                       TransferCommand(request_id="human-chosen-new-environment", failed_job_id=c.failed.job_id,
-                                       expected_agent_version="42"))
-    projection = c.control.conversation(c.human, c.cid)
-    assert projection["can_follow_up"] is True and projection["follow_up_blocker"] is None
-    assert len(c.io) == 1 and len(c.creates) == 1
-    c.h.workers.adapter = c.h.executor.adapter()
-    c.h.endpoint.replies = iter([{"content": "Continued from the original saved context."}])
-    third, _ = c.control.submit(c.human, InstructionSubmit(
-        request_id="new-human-message", conversation_id=c.cid, content="This is a new explicitly sent message."))
-    registered = c.control.records[third.binding_id]
-    assert registered.hosted_session_id == prepared.hosted_session_id
-    assert registered.environment_transfer_id == prepared.transfer_id
-    assert registered.profile.instruction.turn_number == 3
-    assert registered.profile.instruction.hosted_agent_version == "42"
-    assert c.h.runtime.controller.step(third.binding_id).state == "succeeded"
-    assert len(c.io) == 2 and c.io[1]["resume"] is True
-    assert c.io[0]["sdk_session_id"] == c.io[1]["sdk_session_id"]
-    messages = [message["content"] for message in c.io[1]["messages"]]
-    assert any("Original reply and context remain available." in message for message in messages)
-    assert all("Do not resend this automatically." not in message for message in messages)
-    assert c.control.records[c.failed.binding_id] == original_failed
-    assert c.h.workers.inspect(c.failed.job_id).state == "failed"
-    assert c.control.read_reply(c.human, c.cid, 1).text == "Original reply and context remain available."
-    assert c.control.conversation(c.human, c.cid)["can_follow_up"] is True
-    from shared_context.behavior_instruction import validate_instruction_history
-    history = retained_history(c)
-    validate_instruction_history(history.inventory, history.config,
-                                 tuple(record.binding for record in c.control.records.values()))
-
-
-@pytest.mark.parametrize("unknown", [False, True])
-def test_transfer_reservation_and_readiness_remain_classified_in_the_history_reader(transfer_case, unknown):
-    from shared_context.behavior_conversation_transfer import (
-        prepare, TransferCommand, validate_history, EnvironmentTransfer, EnvironmentHead,
-    )
-    from shared_context.behavior_instruction import validate_instruction_history
-    from shared_context.behavior_migration import _kind_models
-    c = transfer_case
-    command = TransferCommand(request_id="retain-explicit-transfer", failed_job_id=c.failed.job_id, expected_agent_version="42")
-    c.platform["lose_create"] = unknown
-    if unknown:
-        with pytest.raises(Problem):
-            prepare(c.control, c.h.assistant, c.human, c.cid, command)
-    else:
-        prepare(c.control, c.h.assistant, c.human, c.cid, command)
-    view = retained_history(c)
-    transfers = validate_history(view, tuple(c.control.records.values()))
-    assert len(transfers) == 1
-    kinds = _kind_models()
-    assert kinds["conversation_environment_transfer"] is EnvironmentTransfer
-    assert kinds["conversation_environment_head"] is EnvironmentHead
-    checked = validate_instruction_history(view.inventory, view.config,
-                                           tuple(record.binding for record in c.control.records.values()))
-    assert set(transfers) <= checked
-
-
 def test_environment_http_routes_only_prepare_after_explicit_post_and_reconcile_the_original(transfer_case):
     from shared_context.behavior_work_policy_api import install_work_policy_routes
     c = transfer_case
@@ -329,7 +268,6 @@ def test_transferred_compacted_archive_keeps_its_original_compaction_lineage(com
     from shared_context.behavior_conversation_transfer import prepare, TransferCommand
     from shared_context.behavior_sdk_files import SdkSessionFiles
     from shared_context.behavior_sdk_state import CheckpointProfile, local_platform
-    from test_instruction_flow import check_history
     original = compacted_transfer_source
     state = original.fs.snapshot()
     reference = settle(original, state, compaction=original.fs.compaction)
@@ -348,7 +286,6 @@ def test_transferred_compacted_archive_keeps_its_original_compaction_lineage(com
         assert saved.source.execution == reference.source.execution
         assert saved.source.previous_job_id == original.binding.job_id
         assert saved.source.execution.job_id != following.binding.job_id
-        check_history(c.h)
     finally:
         following.client.close()
 
@@ -390,3 +327,34 @@ def test_current_human_submit_authority_is_required_for_environment_preparation(
                 TransferCommand(request_id="no-foreign-choice", failed_job_id=c.failed.job_id, expected_agent_version="42"))
     assert denied.value.status == 403
     assert c.h.transport.backing.rows == before and c.creates == c.reads == []
+
+
+def test_new_human_message_restores_the_last_legal_archive_without_replaying_the_failed_turn(transfer_case):
+    from shared_context.behavior_conversation_transfer import prepare, TransferCommand
+    c = transfer_case
+    original_failed = c.control.records[c.failed.binding_id]
+    prepared = prepare(c.control, c.h.assistant, c.human, c.cid,
+                       TransferCommand(request_id="human-chosen-new-environment", failed_job_id=c.failed.job_id,
+                                       expected_agent_version="42"))
+    projection = c.control.conversation(c.human, c.cid)
+    assert projection["can_follow_up"] is True and projection["follow_up_blocker"] is None
+    assert len(c.io) == 1 and len(c.creates) == 1
+    c.h.workers.adapter = c.h.executor.adapter()
+    c.h.endpoint.replies = iter([{"content": "Continued from the original saved context."}])
+    third, _ = c.control.submit(c.human, InstructionSubmit(
+        request_id="new-human-message", conversation_id=c.cid, content="This is a new explicitly sent message."))
+    registered = c.control.records[third.binding_id]
+    assert registered.hosted_session_id == prepared.hosted_session_id
+    assert registered.environment_transfer_id == prepared.transfer_id
+    assert registered.profile.instruction.turn_number == 3
+    assert registered.profile.instruction.hosted_agent_version == "42"
+    assert c.h.runtime.controller.step(third.binding_id).state == "succeeded"
+    assert len(c.io) == 2 and c.io[1]["resume"] is True
+    assert c.io[0]["sdk_session_id"] == c.io[1]["sdk_session_id"]
+    messages = [message["content"] for message in c.io[1]["messages"]]
+    assert any("Original reply and context remain available." in message for message in messages)
+    assert all("Do not resend this automatically." not in message for message in messages)
+    assert c.control.records[c.failed.binding_id] == original_failed
+    assert c.h.workers.inspect(c.failed.job_id).state == "failed"
+    assert c.control.read_reply(c.human, c.cid, 1).text == "Original reply and context remain available."
+    assert c.control.conversation(c.human, c.cid)["can_follow_up"] is True

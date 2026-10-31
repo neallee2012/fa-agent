@@ -3,6 +3,7 @@
 import copy
 import hashlib
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +11,7 @@ from shared_context.behavior_agent_registry import read_agent_registry
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_peer_runtime import _binding_agent
 from shared_context.behavior_work_registry import WRITER_ENV, head_key, read_registry
-from shared_context.behavior_work_registry import PAGE_SIZE, page_key, read_inventory_registry
+from shared_context.behavior_work_registry import PAGE_SIZE, page_key
 from shared_context.errors import Problem
 from test_agent_runtime import peer_runtime
 from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
@@ -79,23 +80,18 @@ def test_scoped_page_boundary_is_readable_and_partial_or_wrong_scope_history_is_
     cb = b.runtime.work_policy
     records = [register(c, cb, f"b-page-{number}") for number in range(PAGE_SIZE + 1)]
     inventory = read_startup(c)
-    assert read_inventory_registry(inventory, cb.policy).entries == tuple(record.admission_id for record in records)
+    assert read_registry(b.runtime.store, cb.policy).entries == tuple(record.admission_id for record in records)
     assert read_registry(a.runtime.store, a.runtime.work_policy.policy).entries == ()
     key = page_key(cb.registry_key, 2)
-    for damage in ("missing", "scope", "orphan"):
+    for damage in ("missing", "scope"):
         rows = dict(inventory.rows)
         if damage == "missing":
             rows.pop(key)
         else:
             altered = copy.deepcopy(rows[key].payload)
-            if damage == "scope":
-                altered["data"]["index_key"] = a.runtime.work_policy.registry_key
-                rows[key] = replace(rows[key], payload=altered)
-            else:
-                altered["data"]["number"] = 3
-                rows[page_key(cb.registry_key, 3)] = replace(rows[key], payload=altered)
-        broken = replace(inventory, rows=rows)
-        from shared_context.behavior_work_registry import inventory_registries
+            altered["data"]["index_key"] = a.runtime.work_policy.registry_key
+            rows[key] = replace(rows[key], payload=altered)
+        snapshot = SimpleNamespace(read_snapshot=lambda keys: {name: rows.get(name) for name in keys})
         with pytest.raises(Problem):
-            inventory_registries(broken, (a.runtime.work_policy.policy, cb.policy))
+            read_registry(snapshot, cb.policy)
     assert c.sessions.calls == []

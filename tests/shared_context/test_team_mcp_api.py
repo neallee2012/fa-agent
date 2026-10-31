@@ -639,33 +639,6 @@ def test_sdk_wrapper_uses_official_versions_metadata_and_default_and_never_delet
     assert not any(call[0].startswith("delete") for call in toolboxes.calls)
 
 
-def test_migration_and_rotation_classify_retired_team_mcp_rows():
-    import inspect
-    from shared_context import behavior_migration, behavior_runtime_rotation_history
-    from shared_context.team_mcp import _head_key, _intent_key, validate_team_mcp_history
-
-    server = {"server_label": "Alpha", "server_url": "https://mcp.example.test/sse", "project_connection_id": "safe-aad",
-              "allowed_tools": ["search"], "version": "v1"}
-    command = {"request_id": "e" * 32, "schema_version": "fa-team-mcp-change-v1", "expected_revision": 0,
-               "expected_etag": None, "operation": "add", "server_label": "Alpha",
-               "server": {key: value for key, value in server.items() if key != "version"}}
-    head = {"kind": "team_mcp_head", "tenant_id": TENANT, "team_id": A.team, "toolbox": TOOLBOX, "revision": 1,
-            "servers": [server], "pending": None}
-    intent = {"kind": "team_mcp_intent", "tenant_id": TENANT, "team_id": A.team, "request_id": "e" * 32,
-              "principal_oid": HUMAN_OID, "command": command, "base_revision": 0,
-              "desired_servers": [command["server"]], "created_at": "2026-10-03T08:00:00Z", "state": "applied",
-              "toolbox_version": "v1"}
-    keys = (_head_key(TENANT, A.team), _intent_key(TENANT, A.team, "e" * 32))
-    rows = {keys[0]: SimpleNamespace(payload={"data": head}), keys[1]: SimpleNamespace(payload={"data": intent})}
-    config = SimpleNamespace(identity=SimpleNamespace(tenant_id=TENANT, team_id=A.team, human_oid=HUMAN_OID))
-    assert set(validate_team_mcp_history(SimpleNamespace(rows=rows), config)) == set(keys)
-    with pytest.raises(Exception) as invalid:
-        validate_team_mcp_history(SimpleNamespace(rows={"wrong-key": rows[keys[0]]}), config)
-    assert invalid.value.body["error"]["code"] == "TEAM_MCP_INVALID"
-    assert "validate_team_mcp_history" in inspect.getsource(behavior_migration._quiescence)
-    assert "validate_team_mcp_history" in inspect.getsource(behavior_runtime_rotation_history.validate_additions)
-
-
 def test_a_failed_grants_read_is_reused_briefly_so_an_outage_waits_once(monkeypatch, team_mcp):
     c = team_mcp
     monkeypatch.setenv(TEAM_MCP_ENABLED_ENV, "1")

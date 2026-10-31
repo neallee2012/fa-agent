@@ -16,7 +16,7 @@ from shared_context.errors import Problem
 from shared_context.tool_catalog import build_catalog, load_catalog, parse_entry_file
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_instruction_prompt import submit
 from test_m3_auth import jwk_client, signing_key
 
@@ -122,11 +122,9 @@ def test_selected_capabilities_are_captured_and_can_only_narrow(assistant, monke
 
     control.records.clear()
     control.refresh()
-    check_history(h)
     h.runtime.capability_grants = {}
     control.records.clear()
     control.refresh()
-    check_history(h)
 
 
 def test_catalog_removal_narrows_the_next_turn_without_breaking_history(assistant, monkeypatch):
@@ -140,7 +138,6 @@ def test_catalog_removal_narrows_the_next_turn_without_breaking_history(assistan
     sdk_io(monkeypatch, expected_tools=HISTORY_CAPABILITIES)
     _, follow = turn(h, control, "catalog-follow", accepted["conversation_id"])
     assert follow.capabilities.grants == ()
-    check_history(h)
 
 
 def test_a_saved_webiq_mcp_selection_runs_without_it_once_the_committed_catalog_drops_it(assistant, monkeypatch):
@@ -173,7 +170,6 @@ def test_a_saved_webiq_mcp_selection_runs_without_it_once_the_committed_catalog_
                       value=template(HISTORY_PROFILE, user_text_file_profile=FILES, capabilities=saved))
     assert again.status_code == 409 and again.json()["error"]["code"] == "CAPABILITY_SOURCES_CHANGED"
     assert h.store._guard() == before_refusal
-    check_history(h)
 
 
 def test_selection_refuses_unknown_changed_or_non_composable_entries(assistant, monkeypatch):

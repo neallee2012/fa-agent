@@ -13,20 +13,18 @@ from pydantic import ValidationError
 
 from shared_context.behavior_delivery import (
     AdmissionRequest, ArtifactVersion, ChannelContract, DeliveryBinding, DeliveryCore,
-    DueCompletion, DueRequest, IncomingEvent, MessageRequest, ModelRepairRequest,
+    DueCompletion, DueRequest, IncomingEvent, MessageRequest,
     PendingIndexRecord, QuotaRecord, ReadinessEvidence, ReceiptRequest, Route,
     RuntimeContract, RuntimeRegistration, ScanCursor, ScanRequest, VerifiedDeliveryReceipt,
     VerifiedIngress, VerifiedWorkResult, WorkDefinition, WorkResultRequest,
     admission_digest, obligation_id_for,
 )
 from shared_context.behavior_operations import (
-    AdapterContract, AuthorizationRequest, BudgetRecord, ExecutionContext, GrantRecord,
-    GrantSubject, OwnerRecord, PolicyRecord, RegisteredAdapter, ToolBrokerCore, ToolIntent, control_key,
+    BudgetRecord, ExecutionContext, OwnerRecord, PolicyRecord, control_key,
 )
 from shared_context.behavior_store import BehaviorStore, ControlChanges, ControlRequest, ControlWrite, GUARD_KEY, InlineMaterial
 from shared_context.errors import Problem
 from test_behavior_store import FakeTable, SCOPE, code, wire_store
-from test_behavior_operations import DESCRIPTION
 
 NOW = datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc)
 CONTEXT = ExecutionContext(
@@ -45,7 +43,7 @@ LEVELS = ("persisted", "provider_accepted", "client_received", "ui_rendered", "h
 class Harness:
     """Explicit offline_contract registration; fixture evidence is not native."""
 
-    def __init__(self, *, wire=False, model=False, **settings):
+    def __init__(self, *, wire=False, **settings):
         if wire:
             self.store, self.client = wire_store()
         else:
@@ -62,7 +60,7 @@ class Harness:
             protection_version="inline-no-gc-v1", consumer_version="offline-consumer-v1",
             timer_version="offline-timer-v1", verifier_version="offline-verifier-v1",
             channel=channel,
-            model_repair_contract="offline-model-budget-v1" if model else None, **settings,
+            **settings,
         )
         self.registration = RuntimeRegistration(
             contract=self.config, mode="offline_contract", verify_readiness=self.readiness,
@@ -731,14 +729,11 @@ def test_due_replays_and_lost_ack_do_not_add_an_intent_or_spend_again():
 
 
 def test_due_uses_saved_results_first_and_does_not_rerun_the_work():
-    h = Harness(model=True)
+    h = Harness()
     ob, _, _ = h.admit()
     h.work_result(ob)
     receipt, _ = h.due(ob)
     assert receipt.payload["result"]["intent"]["action"] == "use_saved_result"
-    with pytest.raises(Problem) as error:
-        h.core.reserve_model_repair(ModelRepairRequest(obligation_id=ob, generation=0, attempt_id="repair"), CONTEXT)
-    assert code(error) == "DELIVERY_USE_SAVED_RESULT"
     assert h.data("budget", "root")["remaining_attempts"] == 20
 
 
@@ -771,141 +766,6 @@ def test_deadline_creates_attention_intent_not_false_failure_or_notification():
     assert payload["work_state"] == "queued" and payload["unresolved_operations"] is None
     assert payload["notification_code"] == "delivery_needs_attention"
     assert h.data("delivery-obligation", ob)["fulfillment"] == "pending"
-
-
-def test_model_repair_defaults_disabled_without_touching_root_budget():
-    h = Harness()
-    ob, _, _ = h.admit()
-    h.due(ob)
-    count = h.submissions()
-    with pytest.raises(Problem) as error:
-        h.core.reserve_model_repair(ModelRepairRequest(obligation_id=ob, generation=0, attempt_id="a"), CONTEXT)
-    assert code(error) == "DELIVERY_MODEL_REPAIR_DISABLED" and h.submissions() == count
-    assert h.data("budget", "root")["remaining_attempts"] == 20
-
-
-def test_lost_prerequisite_verifier_cannot_reserve_model_repair():
-    h = Harness(model=True)
-    ob, _, _ = h.admit()
-    h.due(ob)
-    broken = h.broker(h.store, replace(h.registration, verify_readiness=None))
-    count = h.submissions()
-    with pytest.raises(Problem) as error:
-        broken.reserve_model_repair(ModelRepairRequest(obligation_id=ob, generation=0, attempt_id="a"), CONTEXT)
-    assert code(error) == "DELIVERY_PREREQUISITES_MISSING" and h.submissions() == count
-
-
-def test_model_repair_max_two_survives_due_generation_and_unknown_commit():
-    h = Harness(model=True)
-    ob, _, _ = h.admit()
-    h.due(ob)
-    first = ModelRepairRequest(obligation_id=ob, generation=0, attempt_id="a")
-    reserved = h.core.reserve_model_repair(first, CONTEXT)
-    count = h.submissions()
-    assert h.core.reserve_model_repair(first, CONTEXT) == reserved
-    assert h.submissions() == count
-    h.core.complete_due(DueCompletion(obligation_id=ob, generation=0), CONTEXT)
-    h.due(ob)
-    second = ModelRepairRequest(obligation_id=ob, generation=1, attempt_id="b")
-    request = h.core.request_for(second, CONTEXT)
-    h.client.failure = "after"
-    with pytest.raises(Problem) as error:
-        h.core.reserve_model_repair(second, CONTEXT)
-    assert code(error) == "BEHAVIOR_COMMIT_UNKNOWN"
-    h.store.reconcile(request)
-    h.client.failure = None
-    rebuilt = h.broker(BehaviorStore(FakeTable(h.client.backing), SCOPE))
-    denied = ModelRepairRequest(obligation_id=ob, generation=1, attempt_id="c")
-    with pytest.raises(Problem) as error:
-        rebuilt.reserve_model_repair(denied, CONTEXT)
-    assert code(error) == "DELIVERY_MODEL_REPAIR_STOPPED"
-    state = h.data("delivery-obligation", ob)
-    assert state["model_attempts_reserved"] == 2 and state["automation"] == "needs_attention"
-    assert state["notification_credit"] == state["fulfillment_credit"] == 1
-    assert h.data("budget", "root")["remaining_attempts"] == 18
-    assert h.data("budget", "root")["remaining_units"] == 38
-    count = h.submissions()
-    with pytest.raises(Problem):
-        rebuilt.reserve_model_repair(denied, CONTEXT)
-    assert h.submissions() == count
-
-
-def test_model_repair_binding_must_match_existing_root_budget():
-    h = Harness(model=True)
-    ob, _, _ = h.admit()
-    h.due(ob)
-    h.mutate("budget", "root", root_budget_id="foreign")
-    count = h.submissions()
-    with pytest.raises(Problem) as error:
-        h.core.reserve_model_repair(ModelRepairRequest(obligation_id=ob, generation=0, attempt_id="a"), CONTEXT)
-    assert code(error) == "DELIVERY_MODEL_BUDGET_UNBOUND" and h.submissions() == count
-    assert h.data("delivery-obligation", ob)["model_attempts_reserved"] == 0
-
-
-@pytest.mark.parametrize("kind,ids,updates", [
-    ("policy", ("policy",), {"revision": 2}),
-    ("delivery-quota", ("root", "root"), {"root_request_id": "rebound"}),
-])
-def test_model_repair_rechecks_policy_and_root_request_association(kind, ids, updates):
-    h = Harness(model=True)
-    ob, _, _ = h.admit()
-    h.due(ob)
-    h.mutate(kind, *ids, **updates)
-    count = h.submissions()
-    with pytest.raises(Problem) as error:
-        h.core.reserve_model_repair(ModelRepairRequest(obligation_id=ob, generation=0, attempt_id="a"), CONTEXT)
-    assert code(error) == "DELIVERY_MODEL_BUDGET_UNBOUND" and h.submissions() == count
-
-
-def test_two_consumers_cannot_both_take_last_root_model_attempt():
-    h = Harness(model=True)
-    ob, _, _ = h.admit()
-    h.due(ob)
-    h.mutate("budget", "root", remaining_attempts=1, remaining_units=1)
-    other = h.broker(BehaviorStore(FakeTable(h.client.backing), SCOPE))
-    wins = []
-    h.client.before_submit = lambda: wins.append(other.reserve_model_repair(
-        ModelRepairRequest(obligation_id=ob, generation=0, attempt_id="b"), CONTEXT,
-    ))
-    with pytest.raises(Problem) as error:
-        h.core.reserve_model_repair(ModelRepairRequest(obligation_id=ob, generation=0, attempt_id="a"), CONTEXT)
-    assert code(error) == "BEHAVIOR_CONFLICT"
-    assert len(wins) == 1 and h.data("delivery-obligation", ob)["model_attempts_reserved"] == 1
-    assert h.data("budget", "root")["remaining_attempts"] == 0
-
-
-def test_tool_broker_and_delivery_repairs_share_the_same_last_root_budget_slot():
-    h = Harness(model=True)
-    ob, _, _ = h.admit()
-    h.due(ob)
-    operation_store = BehaviorStore(FakeTable(h.client.backing), SCOPE)
-    broker = ToolBrokerCore(operation_store, clock=lambda: h.time, adapter=RegisteredAdapter(
-        contract=AdapterContract(
-            adapter_id=DESCRIPTION.adapter_id, adapter_version=DESCRIPTION.adapter_version,
-            allowed_kinds=("request",), allowed_methods=("POST",), allowed_targets=(DESCRIPTION.target,),
-            reservation_units=1, evidence_source="offline-destination", outcome_contract_version="offline-v1",
-        ),
-        resolve=lambda _: DESCRIPTION,
-    ))
-    prepared = broker.prepare(ToolIntent(operation_id="op-a", input_ref="current"), CONTEXT).payload["result"]
-    h.put([(control_key("grant", "grant"), GrantRecord(
-        grant_id="grant", approval_source="human", approval_id="offline-synthetic-approval",
-        subjects=(GrantSubject(principal_id=CONTEXT.principal_id, conversation_id=CONTEXT.conversation_id),),
-        root_budget_id="root", description_digest=prepared["description_digest"],
-        adapter_contract_digest=prepared["adapter_contract_digest"], policy_id="policy", policy_revision=1,
-        revocation_revision=0, revoked=False, not_before=NOW, expires_at=NOW + timedelta(hours=1),
-        remaining_uses=1, remaining_units=1,
-    ))])
-    h.mutate("budget", "root", remaining_attempts=1, remaining_units=1)
-    h.client.before_submit = lambda: broker.authorize(
-        AuthorizationRequest(operation_id="op-a", attempt_id="tool-attempt", grant_id="grant"), CONTEXT,
-    )
-    with pytest.raises(Problem) as error:
-        h.core.reserve_model_repair(ModelRepairRequest(obligation_id=ob, generation=0, attempt_id="repair"), CONTEXT)
-    assert code(error) == "BEHAVIOR_CONFLICT"
-    assert h.data("budget", "root")["remaining_attempts"] == h.data("budget", "root")["remaining_units"] == 0
-    assert h.data("delivery-obligation", ob)["model_attempts_reserved"] == 0
-    assert h.data("operation", "op-a")["current_attempt_id"] == "tool-attempt"
 
 
 def test_non_model_final_and_receipt_keep_reserved_slots_after_normal_control_exhaustion():
@@ -980,7 +840,7 @@ def test_unknown_versions_and_wrong_command_types_are_rejected():
     ob, _, _ = h.admit()
     count = h.submissions()
     with pytest.raises(Problem) as error:
-        h.core.mark_due(ModelRepairRequest(obligation_id=ob, generation=0, attempt_id="wrong-type"), CONTEXT)
+        h.core.mark_due(DueCompletion(obligation_id=ob, generation=0), CONTEXT)
     assert code(error) == "DELIVERY_INVALID_DATA" and h.submissions() == count
 
 
@@ -1116,3 +976,17 @@ def test_authority_snapshot_delegates_to_public_store_reader(monkeypatch):
     count = h.submissions()
     assert authority_snapshot(h.store, keys) is expected
     assert calls == [keys] and h.submissions() == count
+
+
+@pytest.mark.parametrize("moved", ["channel_id", "channel_version"])
+def test_an_obligation_moved_to_another_channel_is_refused_by_this_core(moved):
+    # The row now names a channel this core does not serve, e.g. after another channel took the obligation over.
+    h = Harness()
+    ob, _, _ = h.admit()
+    row = h.data("delivery-obligation", ob)
+    h.mutate("delivery-obligation", ob, **({"route": {**row["route"], "channel_id": "other-channel"}}
+                                            if moved == "channel_id" else {"channel_version": "channel-v2"}))
+    count = h.submissions()
+    with pytest.raises(Problem) as error:
+        h.work_result(ob)
+    assert code(error) == "DELIVERY_CHANNEL_MISMATCH" and h.submissions() == count

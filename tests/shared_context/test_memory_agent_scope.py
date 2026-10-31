@@ -76,14 +76,11 @@ def test_peer_settings_never_fall_back_or_overwrite_legacy_a(memory_scopes):
 
 
 def test_a_and_b_settings_remain_readable_together_at_startup(memory_scopes):
-    from shared_context.memory_bridge_settings import validate_memory_settings_history
 
     x, c = memory_scopes, memory_scopes.case
     a = x.a.select(c.human, command()).payload["result"]["settings_id"]
     b = x.b.select(c.human, command(enabled=False)).payload["result"]["settings_id"]
     inventory = read_startup(c)
-    assert set(validate_memory_settings_history(inventory, c.h.config, c.control.policy)) == {a}
-    assert set(validate_memory_settings_history(inventory, c.h.config, x.b_policy)) == {b}
     assert sum(row.payload["data"].get("kind") == "steady_cumulative_cost_ledger"
                for row in inventory.rows.values()) == 1
 
@@ -178,22 +175,6 @@ def test_b_unknown_setting_only_reads_its_original_receipt(memory_scopes, monkey
     assert receipt.payload["result"]["settings_id"] == request_id != aid
     assert attempts == [request_id] and c.h.runtime.store._guard() == before
     assert x.a.current(c.human)["settings_id"] == aid
-
-
-def test_b_head_with_an_a_pointer_is_not_ignored_by_startup(memory_scopes):
-    from shared_context.memory_bridge_settings import validate_memory_settings_history
-
-    x, c = memory_scopes, memory_scopes.case
-    aid = x.a.select(c.human, command()).payload["result"]["settings_id"]
-    x.b.select(c.human, command())
-    inventory = read_startup(c)
-    bhead = settings_head_key(x.b_policy.authority_domain, x.b_policy.agent_scope)
-    original = inventory.rows[bhead]
-    payload = copy.deepcopy(original.payload)
-    payload["data"]["settings_id"] = aid
-    bad = replace(inventory, rows={**inventory.rows, bhead: replace(original, payload=payload)})
-    with pytest.raises(Problem):
-        validate_memory_settings_history(bad, c.h.config, c.control.policy)
 
 
 def test_b_revocation_blocks_memory_without_revoking_a(memory_scopes):

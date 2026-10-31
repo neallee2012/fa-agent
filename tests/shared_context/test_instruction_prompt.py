@@ -11,7 +11,7 @@ import pytest
 from shared_context import m2_copilot
 from shared_context.behavior_assistant import AssistantProfile, key
 from shared_context.behavior_assistant_wire import InstructionSubmit, InstructionTask, Task, SdkStop
-from shared_context.behavior_instruction import TurnArchive, turn_material, validate_instruction_history
+from shared_context.behavior_instruction import TurnArchive, turn_material
 from shared_context.behavior_instruction_prompt import (
     INSTRUCTION_CAPABILITIES, PromptAssemblyRecord, assemble_instruction_prompt,
 )
@@ -20,7 +20,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_inventory, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_inventory, instruction_models, runtime_path, sdk_io
 from test_m3_auth import signing_key, jwk_client
 from test_work_policy_lifecycle import enabled
 
@@ -177,7 +177,6 @@ def test_http_task_hosted_save_history_and_public_record_preserve_exact_input(as
     h.executor.root = tmp_path/"fresh-sdk-filesystem"
     second, _ = submit(h, "prompt-second", " New question.\r\n", first["conversation_id"])
     assert h.runtime.controller.step(second["binding_id"]).state == "succeeded"
-    check_history(h)
     projection = h.client.get("/work-policy/v1/conversations/"+first["conversation_id"], headers=h.headers())
     assert projection.status_code == 200 and projection.json()["can_follow_up"]
     expected = assemble_instruction_prompt(profile)
@@ -344,28 +343,6 @@ def test_hosted_false_tool_catalog_fails_before_sdk_or_model_dispatch(assistant,
         turn.client.close()
 
 
-def test_valid_subset_manifest_cannot_replace_the_bound_history_record(assistant, monkeypatch):
-    h, _, _ = configured(assistant)
-    sdk_options(monkeypatch)
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "Fixture reply."}])
-    accepted, _ = submit(h, "manifest-source", "Original task.")
-    binding = h.runtime.bindings[accepted["binding_id"]]
-    assert h.runtime.controller.step(binding.binding_id).state == "succeeded"
-    inventory = instruction_inventory(h)
-    archive_key = key("text-archive", binding.job_id)
-    payload = inventory.rows[archive_key].payload
-    forged = saved_turn(h, binding.job_id).model_copy(update={
-        "prompt_assembly": assemble_instruction_prompt("fa-instruction-v1", capabilities=("read_context",)).record})
-    payload["data"] = forged.model_dump(mode="json")
-    payload["material"] = turn_material(forged).model_dump(mode="json")
-    config = SimpleNamespace(table=SimpleNamespace(scope=h.store._scope), sha256="f"*64,
-        workers=h.workers.contract, delivery=h.delivery.contract)
-    with pytest.raises(Problem) as denied:
-        validate_instruction_history(inventory, config, tuple(h.runtime.bindings.values()))
-    assert denied.value.body["error"]["code"] == "MIGRATION_RECOVERY_HISTORY_INVALID"
-
-
 def test_client_save_cannot_supply_a_manifest(assistant):
     from test_sdk_compaction_product import open_turn
     h, control, human = configured(assistant)
@@ -395,7 +372,6 @@ def test_failed_turn_retains_configuration_metadata_without_claiming_model_execu
         h.executor._complete(turn.start, result.model_dump(mode="json"))
         done = h.runtime.controller.step(turn.binding.binding_id)
         assert done.state == "failed" and done.result_forwarded
-        check_history(h)
         saved = saved_turn(h, turn.binding.job_id)
         assert saved.prompt_assembly.source == "server-profile-recomputed"
         assert saved.prompt_assembly.prefix_tokens is None and h.endpoint.requests == []

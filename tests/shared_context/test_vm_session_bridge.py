@@ -10,7 +10,6 @@ from pydantic import SecretStr
 
 from conftest import InMemoryRepository
 from shared_context import behavior_assistant_wire as aw
-from shared_context.behavior_agent_control import AgentControlRelay
 from shared_context.behavior_agent_worker import AgentTurnAddress, AgentVmBinding
 from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_code_identity import code_sha256
@@ -29,6 +28,7 @@ from shared_context.team_data_relay import TeamDataRelay
 from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key
+from test_turn_receipts import worker_context
 
 
 @pytest.fixture
@@ -59,17 +59,13 @@ def vm_turn(synthetic_standing_v1):
     actor = c.h.config.identity.auth().actors[binding.agent_oid]
     agent = BehaviorPrincipal(binding.tenant_id, actor.oid, actor.team, "agent", actor.actor,
                               frozenset({"read", "execute", "submit", "consume"}))
-    control = AgentControlRelay(wait_seconds=0)
-    context = control.connect(vm, "original-process", agent.oid)
+    context = worker_context(vm, "original-process", agent.oid)
     receipts = TurnReceiptStore(c.control.store,
         TeamDataRelay(InMemoryRepository(), InMemoryArtifactStore(binding.tenant_id), binding.tenant_id),
         validate_checkpoint=partial(validate_sdk_checkpoint, c.authority), assistant=c.authority)
     delivery = receipts.issue(ticket, c.human, expected_vm=vm)
-    try:
-        yield SimpleNamespace(c=c, binding=binding, start=start, record=record, ticket=ticket,
-                              agent=agent, context=context, receipts=receipts, delivery=delivery)
-    finally:
-        control.close()
+    yield SimpleNamespace(c=c, binding=binding, start=start, record=record, ticket=ticket,
+                          agent=agent, context=context, receipts=receipts, delivery=delivery)
 
 
 def begin(turn):

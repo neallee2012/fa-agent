@@ -26,7 +26,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from sdk_checkpoint_local import sse
 from test_approved_skill_api import BODY, add_skill, configured
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_inventory, instruction_models
+from test_instruction_flow import instruction_inventory, instruction_models
 from test_instruction_prompt import submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -581,7 +581,6 @@ def exercise_task_local_isolation(assistant, runtime_path, monkeypatch, tmp_path
             done = h.runtime.controller.step(binding.binding_id)
             require(done.state == "succeeded" and done.result_forwarded and not done.obligation_fulfilled,
                     "FA_TURN_NOT_SAVED")
-            check_history(h)
             bridge = observation.bridges[-1]
             records = events_from(bridge._session_files.snapshot().files)
             require([record["data"]["content"] for record in records if record["type"] == "user.message"]

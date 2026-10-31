@@ -11,14 +11,26 @@ from shared_context.behavior_server_config import load_configuration, read_docum
 from shared_context.behavior_work_policy import derive_work
 from shared_context.errors import Problem
 
-from .adapter import ConsoleError, FixedTask, canonical, sha
+from .adapter import CliSettings, ConsoleError, FixedTask, canonical, sha
 from .agent_connections import AgentConnection, AgentConnections
 from .agent_onboarding import _create_only
 from .instructions import NATIVE_LANE, InstructionConnection
 from .standing import StandingConsoleConfig
 
 
-def export_connections(config, plan, *, backend_origin, client_id, output_directory):
+def _cli_settings(executable, azure_config_dir, subscription_id):
+    if executable is None and azure_config_dir is None and subscription_id is None:
+        return None
+    # A missing value fails CliSettings, so the three options are all-or-none.
+    cli = CliSettings(executable=executable, azure_config_dir=azure_config_dir, subscription_id=subscription_id)
+    file, directory = Path(executable), Path(azure_config_dir)
+    # Same condition as CliTokenProvider.
+    if not (file.is_absolute() and file.is_file() and directory.is_absolute() and directory.is_dir()):
+        raise ValueError("cli paths must be an existing absolute file and directory")
+    return cli
+
+
+def export_connections(config, plan, *, backend_origin, client_id, output_directory, cli):
     _check_plan(config, plan)
     root = Path(output_directory).resolve()
     entries = []
@@ -38,7 +50,7 @@ def export_connections(config, plan, *, backend_origin, client_id, output_direct
             authorization_mode="backend-per-work", console_id=seed, backend_origin=backend_origin,
             tenant_id=config.identity.tenant_id, human_oid=config.identity.human_oid,
             client_id=client_id, audience=config.identity.audience, backend_configuration_sha256=config.sha256,
-            backend_core_sha256=plan.code_sha256, tasks=(task,),
+            backend_core_sha256=plan.code_sha256, cli=cli, tasks=(task,),
             standing_policy=policy, standing_policy_sha256=policy.sha256,
         )
         instructions = InstructionConnection(
@@ -67,11 +79,15 @@ def main(argv=None):
     parser.add_argument("--backend-origin", required=True)
     parser.add_argument("--client-id", required=True, help="An already approved delegated client; this does not authorize it.")
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--cli-executable", help="Absolute az path; give all three --cli-* options or none.")
+    parser.add_argument("--cli-azure-config-dir", help="Absolute AZURE_CONFIG_DIR for local console sign-in.")
+    parser.add_argument("--cli-subscription-id")
     args = parser.parse_args(argv)
     try:
         manifest = export_connections(
             load_configuration(args.config), read_document(args.plan, FreshInstallationPlan),
             backend_origin=args.backend_origin, client_id=args.client_id, output_directory=args.output_directory,
+            cli=_cli_settings(args.cli_executable, args.cli_azure_config_dir, args.cli_subscription_id),
         )
         print(json.dumps({"state": "connections-exported", "agents": len(manifest.agents),
                           "installation_verified": False, "table_writes": 0}, separators=(",", ":")))

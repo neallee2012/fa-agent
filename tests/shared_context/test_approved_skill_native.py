@@ -23,7 +23,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from sdk_checkpoint_local import sse
 from test_approved_skill_api import BODY, add_skill, approve_skill_version, change_artifact, configured
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_instruction_prompt_native import sdk_root
 from test_m2_copilot import runtime_path
@@ -118,14 +118,12 @@ def test_fixed_sdk_custom_reader_discloses_only_selected_body_and_rechecks_cold_
     done = h.runtime.controller.step(binding.binding_id)
     assert done.state == "succeeded" and done.result_forwarded
     assert h.store.read_snapshot((operation,))[operation] == before
-    check_history(h)
 
     phase = "resume"
     h.executor.root = sdk_root / "replacement"
     second, _ = submit(h, "native-skill-resume", "Read receipt-guide again.", first["conversation_id"])
     done = h.runtime.controller.step(second["binding_id"])
     assert done.state == "succeeded" and done.result_forwarded
-    check_history(h)
     projection = h.client.get("/work-policy/v1/conversations/" + first["conversation_id"], headers=h.headers())
     assert projection.status_code == 200 and projection.json()["can_follow_up"]
     for bridge, config, turn in zip(bridges, configurations, projection.json()["turns"], strict=True):
@@ -289,7 +287,6 @@ def test_fixed_sdk_new_turns_replace_only_current_catalog_and_preserve_historica
             done = h.runtime.controller.step(binding.binding_id)
             assert done.state == "succeeded" and done.result_forwarded
             assert h.store.read_snapshot((operation_key,))[operation_key] == operation
-            check_history(h)
             bridge, options = bridges[-1], configurations[-1]
             state = bridge._session_files.snapshot()
             assert sdk_id is None or state.sdk_session_id == sdk_id
@@ -405,7 +402,6 @@ def test_fixed_sdk_custom_tool_failure_never_discloses_body_or_enables_native_lo
     assert any(event["type"] == "tool.execution_complete" and event["data"].get("success") is False for event in events)
     assert not any(event["type"] in {"skill.invoked", "newskill.invoked"} for event in events)
     assert "APPROVED_SKILL_BODY_CANARY" not in bridge._session_files.snapshot().encoded().decode()
-    check_history(h)
     if os.environ.get("FA_SKILL_EVIDENCE_DIR"):
         from pathlib import Path
         directory = Path(os.environ["FA_SKILL_EVIDENCE_DIR"])
@@ -519,7 +515,6 @@ def test_fixed_sdk_new_user_turn_continues_after_a_midturn_catalog_fence(assista
             assert done.state == ("failed" if phase == 1 else "succeeded") and done.result_forwarded
             outcomes.append(done.state)
             assert h.store.read_snapshot((operation_key,))[operation_key] == operation
-            check_history(h)
             saved = saved_turn(h, binding.job_id)
             assert isinstance(saved.archive, StoredSdkArchive)
             assert saved.skill_catalog.entries[0].version_id == str(phase + 1) * 32

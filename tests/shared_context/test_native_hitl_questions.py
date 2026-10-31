@@ -8,7 +8,7 @@ import pytest
 
 from conftest import A
 from shared_context.errors import Problem
-from shared_context.native_hitl import pending_id, question_id, validate_native_hitl_history
+from shared_context.native_hitl import pending_id, question_id
 from shared_context.native_hitl_wire import (
     NativeHitlAnswer, NativeHitlCall, NativeHitlEnd, NativeHitlPendingQuery, NativeHitlQuestion,
     NativeHitlQuestionCreate, NativeHitlQuestionReadback, NativeHitlTurn,
@@ -84,8 +84,6 @@ def test_a_question_is_one_owner_reply_in_its_own_namespace_never_an_approval(hi
     assert view.status == "answered" and view.answer == answer(created) and view.attention is None
     assert page(c, TURN)["attention"] == []
     assert c.service.rules(c.owner).revision == 0
-    kinds = {type(value).__name__ for value in validate_native_hitl_history(inventory(c), c.config).values()}
-    assert kinds == {"_Intent", "NativeHitlQuestionPending", "_QuestionAnswer", "_TurnIndex"}
     assert len(c.table.submissions) > before
 
 

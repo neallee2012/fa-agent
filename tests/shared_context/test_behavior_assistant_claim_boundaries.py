@@ -16,10 +16,7 @@ from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from pydantic import SecretStr
-from test_behavior_assistant_acquire_conflicts import native_acquire, current_rotation
-from test_behavior_rotation_cutoff import two_rotations
-from test_behavior_rotation_settlement_history import current_cancelled
-from test_behavior_runtime_rotation import rotated
+from test_behavior_assistant_acquire_conflicts import installed_assistant, native_acquire
 from test_behavior_assistant import call
 from test_behavior_api import METRICS
 from test_m2_copilot import ScriptedEndpoint
@@ -114,10 +111,7 @@ def test_full_http_startup_preserves_original_capability_across_known_conflicts(
     assert len(claim_posts) == (2 if phase == "native-commit" else 1)
 
 
-@pytest.mark.parametrize("phase", [
-    "all-authority-ledgers", "context-native-evidence", "provider-evidence",
-])
-def test_complete_sdk_flow_survives_controller_conflicts_without_repeating_effects(hosted_flow, monkeypatch, phase):
+def test_complete_sdk_flow_survives_controller_conflicts_without_repeating_effects(hosted_flow, monkeypatch):
     from shared_context.behavior_operations import control_key
     h, c = hosted_flow, hosted_flow.c
     sid = key("session-id", c.starts[0].binding.start_request_id)
@@ -146,12 +140,8 @@ def test_complete_sdk_flow_survives_controller_conflicts_without_repeating_effec
             kind = "model" if last.url.path.endswith("/reserve-model") else "model-send"
             ids[key(kind, sid, command["request_id"])] = kind
         ledger = next((label for rid, label in ids.items() if request.method == "POST" and rid.encode() in request.body), None)
-        selected = (ledger if phase == "all-authority-ledgers" else
-                    phase if request.method == "GET" and request.url.split("?")[0].rstrip("()").endswith("/Behavior")
-                    and last is not None and (last.url.path.endswith("/context") if phase == "context-native-evidence"
-                                             else consumed[0]) else None)
-        if selected is not None and selected not in injected:
-            injected.add(selected)
+        if ledger is not None and ledger not in injected:
+            injected.add(ledger)
             c.tick()
         result = original(request, **kwargs)
         if ledger == "model-send":
@@ -160,8 +150,7 @@ def test_complete_sdk_flow_survives_controller_conflicts_without_repeating_effec
     monkeypatch.setattr(c.transport, "send", send)
     run(h)
     assert uploads == creates == [1]
-    assert injected == ({"acquire", "context", "model", "model-send", "save", "created", "upload_unknown", "saved", "finish"}
-                        if phase == "all-authority-ledgers" else {phase})
+    assert injected == {"acquire", "context", "model", "model-send", "save", "created", "upload_unknown", "saved", "finish"}
     assert len(h.supervisor.threads) == 1
     assert len([r for r in c.requests if r.url.path.endswith("/model")]) == 3
     after_budget = c.store.read_snapshot((budget_key,))[budget_key].payload["data"]

@@ -6,10 +6,10 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from .behavior_operations import _Model, _row, _write, control_key
-from .behavior_runtime_transition import _payload_hash
 from .behavior_store import Digest
 from .errors import Problem
 from .models import Identifier
+from .source_materials import _payload_hash
 
 PAGE_SIZE = 64
 WRITER_ENV = "FA_WORK_REGISTRY_WRITER"
@@ -102,7 +102,7 @@ def count_registry(store, policy, rows=None):
     return len(legacy.entries) + (0 if head is None else head.entry_count)
 
 
-def _read(get_rows, policy, rows=None, *, live=True):
+def _read(get_rows, policy, rows=None):
     from .behavior_work_policy import WorkRegistry
     key = index_key(policy)
     legacy, head = _basis(get_rows, policy, rows)
@@ -117,8 +117,7 @@ def _read(get_rows, policy, rows=None, *, live=True):
     for number, pkey in enumerate(keys, 1):
         page = _value(pages, pkey, WorkRegistryPage, policy)
         expected = min(PAGE_SIZE, head.entry_count - (number - 1) * PAGE_SIZE)
-        _require(page.index_key == key and page.number == number
-                 and (len(page.entries) >= expected if live else len(page.entries) == expected))
+        _require(page.index_key == key and page.number == number and len(page.entries) >= expected)
         # A concurrent append may extend the tail after this head was observed.
         # Its immutable prefix still represents this snapshot; the caller's CAS
         # or consistent-read guard fences using it as current authority.
@@ -130,23 +129,6 @@ def _read(get_rows, policy, rows=None, *, live=True):
 def read_registry(store, policy, rows=None):
     return _read(store.read_snapshot, policy, rows)
 
-
-def read_inventory_registry(inventory, policy):
-    return _read(lambda keys: {key: inventory.rows.get(key) for key in keys}, policy, live=False)
-
-
-def inventory_registries(inventory, policies):
-    result, expected = {}, set()
-    for policy in policies:
-        key, hkey = index_key(policy), head_key(index_key(policy))
-        result[policy.sha256] = read_inventory_registry(inventory, policy)
-        if hkey in inventory.rows:
-            head = _value(inventory.rows, hkey, WorkRegistryHead, policy)
-            expected.update((hkey, *(page_key(key, number) for number in range(1, head.page_count + 1))))
-    for key, row in inventory.rows.items():
-        if row.payload["data"].get("kind") in {"work_registry_head_v1", "work_registry_page_v1"}:
-            _require(key in expected)
-    return result
 
 
 def transact(store, policy, request, decide, *, append=False):
@@ -207,21 +189,3 @@ def append_writes(policy, rows, admission):
     return (_write(pkey, page, "create" if rows[pkey] is None else "replace"),
             _write(hkey, head, "create" if rows[hkey] is None else "replace"))
 
-
-def registration_index_images(inventory, policy, admission):
-    """Exact layout images at one original registration, independent of writer ENV."""
-    key, hkey = index_key(policy), head_key(index_key(policy))
-    legacy, head = _parts(policy, {key: inventory.rows.get(key), hkey: inventory.rows.get(hkey)})
-    if admission in legacy.entries:
-        return {key: None}
-    _require(head is not None)
-    logical = read_inventory_registry(inventory, policy)
-    appended = logical.entries[len(legacy.entries):]
-    _require(admission in appended)
-    offset = appended.index(admission)
-    number = offset // PAGE_SIZE + 1
-    page = WorkRegistryPage(index_key=key, number=number,
-                           entries=appended[(number - 1) * PAGE_SIZE:offset + 1])
-    image = WorkRegistryHead(index_key=key, policy_id=policy.policy_id, policy_sha256=policy.sha256,
-        legacy_sha256=_payload_hash(inventory.rows[key].payload), entry_count=offset + 1, page_count=number)
-    return {head_key(key): image, page_key(key, number): page}

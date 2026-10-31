@@ -17,10 +17,10 @@ from azure.core.credentials import AccessToken
 from fastapi.testclient import TestClient
 
 from conftest import A, B, C, FakeMemory, InMemoryRepository
-from shared_context.api import create_app
+from legacy_m2_m4.api import create_app
 from shared_context.auth import JwtVerifier
 from shared_context.errors import Problem
-from shared_context.m2_gateway import M2Gateway, M2Settings
+from legacy_m2_m4.m2_gateway import M2Gateway, M2Settings
 from shared_context.service import ContextService
 from shared_context.storage import MAX_PAYLOAD_BYTES, Record, serialize
 

@@ -24,7 +24,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -231,7 +231,6 @@ def test_native_summary_cannot_create_human_consent_after_compaction(
                     assert upload.reference.codec == DIAG_ARCHIVE_CODEC
                     assert upload.source.execution.summary_sha256 == rpc[0]["summary_sha256"]
                     assert protected_rows(turn) == original_operation and effects == []
-                check_history(h)
         assert len(processes) == len(bridges) == 2 and len(requests) == 6 and len(operations) == 1
         assert len({process.pid for process in processes}) == 2
         assert configurations == [

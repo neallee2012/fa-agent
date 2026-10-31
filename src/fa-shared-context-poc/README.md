@@ -206,8 +206,7 @@ v2 的 Agent 並提示用 `"1"` 重跑、stage 拒絕故障點）、`test_agent_
   工作台目錄（`public_agents`）、啟動時的 peer 準備、`agent_versions sync`／`follow_all`、收件人清單都用它。
 
 routine 時鐘略過已退役的 Agent，只記一次 `FA_NATIVE_ROUTINE_CLOCK_RETIRED`；部署相容性閘門把它的綁定列放在
-`retired_rows`，不擋部署。`validate_team_registry_history` 核對 tombstone、停用後的身分列與原退役回條，
-`_quiescence`／`validate_additions` 因此接受它。工作台把 `AGENT_RETIRED` 顯示成「這位助理已退役；訊息沒有送出」。
+`retired_rows`，不擋部署。工作台把 `AGENT_RETIRED` 顯示成「這位助理已退役；訊息沒有送出」。
 API 重啟後 binding 路徑的 registry 掃描也查已退役的 Agent，回 410；Teams 轉送回一句退役說明（`RelayReply` refused），
 不是 raw 410；群組活動跳過退役成員（只記 log，activity wire 沒有欄位，加欄位要換 profile）；session keepalive 跳過退役的
 peer，只記一次。CLI 帶 `--delete-foundry` 時，roster 另一位 Agent（含已退役）同 project＋name 就拒絕。onboarding
@@ -363,7 +362,7 @@ commit 成功後才把 `complete_for` 設成新 SID、`complete_since` 設成這
    **不建 task、RID 或任何紀錄，不碰 admission 與 execution lock，不送模型，也不寫回條。**
 4. toolbox provider 的 `warm`：沒釘版本的先讀 `default_version`（和回合相同），再對那個實際版本 `initialize`＋`tools/list`，
    放進同一份依版本快取；已有清單就略過。不帶 call id、不登記 HITL 核准設定、不呼叫工具。失敗只記數。
-5. 回合的 bind：同一版本的預熱列表還在跑時，`asyncio.wait` 等它（不取消、不重送）；等完有清單就不再列，預熱失敗就照原路自己列。
+5. 回合的 bind：同一版本的預熱列表還在跑時，`asyncio.wait` 等它（不取消、不重送，最多等到[列表總時限](#toolbox-total-deadline)）；等完有清單就不再列，預熱失敗就照原路自己列。
 
 **不變。** 每回合開哪些工具仍只看該回合的 capture；`require_approval` 仍用該回合確認過的版本清單判斷；沒釘版本每回合照舊讀
 `default_version`、讀不到時照舊 fail-closed；快取不含 token 或 call id。預熱沒有 RID，不出現在對話、回條或用量帳。
@@ -7194,9 +7193,8 @@ WIP02 的 N0 fixture 未設 SDK 平台 session 環境及 tokenizer cache 缺件�
   不寫任何列。preflight 原本就不計算能力 capture（有能力的 profile 在 preflight 會先回 deny），所以只在 admission 檢查。
 - **Admission：**profile 是角色 profile 時，每個回合都讀當時的 head 並把版本存進 task；新版本從下一回合起對所有對話生效，
   重建時沿用該回合 `WorkRegistration` 的 capture，不重讀 head。沒有 head 時在寫入前回 409 `AGENT_ROLE_PROMPT_MISSING`。
-- **啟動讀取器：**`agent_role_prompt_version`／`agent_role_prompt_head` 已加入 `_kind_models`，
-  current-runtime `validate_additions` 與 migration `_quiescence` 都能分類；[測試](../../tests/shared_context/test_agent_role_prompt.py)
-  在保存兩版並跑完一個角色回合後，真 native 啟動讀取器結果與保存前相同。
+- **啟動讀取：**fresh 開機只讀固定 key，新列不必登記型別清單；[測試](../../tests/shared_context/test_agent_role_prompt.py)
+  在保存兩版並跑完一個角色回合後，`read_startup` 與 `installed_origin` 的結果與保存前相同。
 - **PR4 補修：**路由先用 `role_prompt_command` 檢查文字，超過 64K parse bound 也回 422 `AGENT_ROLE_PROMPT_TOO_LARGE`＋`max_bytes`，
   不再丟 pydantic 錯誤。policy 重新安裝後同 ID、同文字、同批准人重送，改回 409 `AGENT_ROLE_PROMPT_POLICY_CHANGED`（附原 `version`，
   沒有再保存）；真的不同文字才說 “different role text”，其他情況說明是 request ID 已綁定別的輸入。
@@ -7232,8 +7230,7 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
   新對話的版本依 PR7「部署版本跟隨」選定（見下方），不讀 ENV。
 - **S6／失敗：**ready 與釋放未完成名額在同一筆 CAS。只有 Foundry 明確拒絕（400／422）或版本 status=failed，**而且**讀回確認沒有可用版本時，
   才標 failed（`FOUNDRY_CREATE_REJECTED`／`FOUNDRY_VERSION_FAILED`）並同時釋放名稱與名額；結果未知時保留名額，用同一個 rid 續做。
-- **啟動讀取器：**三種新列與每一步的回條都由 `validate_team_registry_history` 重建驗證，自動進 `validate_additions`／`_quiescence`；
-  測試以真實啟動讀取器在 ready、failed、未完成三種狀態並存時通過，缺列或改列會被擋下。
+- **啟動讀取：**三種新列不經開機歷史驗證（`validate_team_registry_history`、`validate_additions`、`_quiescence` 已於 2026-10-30 刪除），fresh 開機只讀固定 key。
 - **新 Agent 的 endpoint 協定與 project 角色（#468，預設關閉，CODE/offline）：**S1 拿到 active 版本後、`register_agent` 之前，
   依兩個獨立開關做「＋」原本要部署線手動補的兩件事（[模組](shared_context/behavior_agent_setup.py)、
   [測試](../../tests/shared_context/test_agent_setup.py)）。放在登記前，是因為部署時的 `sync`／`route()` 只處理已登記的 Agent，
@@ -7777,6 +7774,8 @@ preflight仍200、原132項保留。這是本機真producer重現，不是讀回
 保留原48KiB檢查，不靠提高常數或放寬CAS解堵。
 
 ## 通道刷新保留原工作（2026-09-30，CODE/offline）
+
+> 歷史紀錄。`TeamsMetrics` 已在 2026-10-30 刪除，下文只說明當時的修正。
 
 同一 API runtime 同時載入 `TeamsMetrics` 與 standing work 時，通道的 `refresh()` 原本會先以
 通道資料覆蓋整份 `bindings`／`profiles`，再由後續工作刷新補回。另一個對話查詢在這個間隙執行，
@@ -8482,7 +8481,7 @@ current／result／receipt改用shared DTO，#98既有wire shape及保存契約�
 ### Verified against
 
 - `behavior_profile_selection`的不可變決定／pointer／回條／原版本重建；
-  `behavior_work_policy`接單／guard及`behavior_work_policy_history`的選擇順序。
+  `behavior_work_policy`接單／guard的選擇順序（`behavior_work_policy_history` 已於 2026-10-30 刪除）。
 - `behavior_agent_template`仍共用原DTO，沒有移轉帳號／讀權；
   `test_conversation_profile_selection.py`涵蓋指定human、Read+Approve、原None、版本更換、
   原對話維持、same-ID衝突、ACK loss、M3版本不符與歷史hash／sequence。
@@ -9360,8 +9359,7 @@ python -X utf8 -m pytest '.\tests\shared_context\test_skill_draft_native.py::tes
 
 ### Verified against
 
-- `behavior_work_policy.py`：新對話選擇、原record重建與快取缺失讀回；
-  `behavior_work_policy_history.py`共用同一重建接點。
+- `behavior_work_policy.py`：新對話選擇、原record重建與快取缺失讀回。
 - `behavior_instruction.registration_image`拒絕同一對話混合profile；
   `behavior_work_policy_api.py`只公開固定的安全錯碼。
 - `test_instruction_prompt_defaults.py`的接單、原回條、設定變更、冷檔案系統、
@@ -10959,14 +10957,34 @@ Neal 決策：「工具列不出來時，這一回合少那個工具照常跑，
   - SDK-first：固定版 Copilot SDK 1.0.13 不經手 toolbox 列表；Hosted 沒裝 `azure-ai-projects`；FA 的 httpx transport 是 `retries=0`。
     都沒有「列表失敗後退避」可用，所以加在既有的 kept 清單上。
   - 觀測：跳過列表時記 `FA_TIMING native_bind_toolbox_list_backoff`（同一個回合 ID）。`FA_TIMING ` 在 #953 的 `LOG_PREFIXES`、
-    `shared_context.behavior_timing` 在 `LOG_LOGGERS`，所以會送到 App Insights；`FA_NATIVE_TOOL_SOURCE_UNAVAILABLE`／
-    `NATIVE_TOOLBOX_FAILED`（`shared_context.native_toolbox` logger）仍不匯出。
+    `shared_context.behavior_timing` 在 `LOG_LOGGERS`，所以會送到 App Insights；`NATIVE_TOOLBOX_FAILED` 2026-10-30 起也匯出（見下一項）；
+    `FA_NATIVE_TOOL_SOURCE_UNAVAILABLE`（帶 agent 與 RID）仍不匯出。
   - 測試：`tests/shared_context/test_native_toolbox_unavailable.py`（假時鐘、不 sleep）：60 秒內第二回合不送 `tools/list`、
     原因相同；常數是 60 秒；到期重列；預熱在 backoff 內仍列且成功即恢復；回合在 backoff 內仍等進行中的預熱、預熱成功就綁工具；
     等慢的預熱時 backoff 過期、預熱也逾時，回合沿用記住的 `network`、不再列；預熱失敗不開始 backoff；要連線也記；
     Connect 重列成功清掉兩個 toolbox 記住的要連線；Connect 清掉、但仍未連線的 toolbox 下一回合列一次又記住、再下一回合不列；重列被明確拒絕（403）不記、下一回合重列；
     重列 503 記成 `service_error`、下一回合不列；token 失敗不記；別的 toolbox、別的 provider（別的 Agent）不受影響。
   - 沒改：kept 清單少了 capture 工具時的「再列一次」若一直失敗，仍每回合付一次（不在本項範圍）。
+- <a id="toolbox-total-deadline"></a>**toolbox 呼叫的總時限（2026-10-30，CODE/offline，未部署）**：httpx 的 read timeout 只限「等下一塊資料」
+  （[官方](https://www.python-httpx.org/advanced/timeouts/)），回應一直滴 keep-alive 就永遠等不到逾時；bind 期間按停止也不會中斷這個等待
+  （停止只改旗標，bind 不取消）。改用官方的 [`asyncio.timeout`](https://docs.python.org/3.11/library/asyncio-task.html#timeouts)（3.11 起有，可巢狀）：
+  - 一次 HTTP 交換（`_exchange`）的總時限＝傳入的 `timeout`：列表與 `default_version` 60 秒、`tools/call` 是該 entry 的 `timeout_ms`
+    或 120 秒。**工具呼叫的 `timeout` 從「兩塊資料的間隔」變成「整次呼叫」**：持續送進度超過時限的呼叫，現在算結果不明，不重送。
+    dev 2026-10-30 讀回近 30 天 124 次 `tools/call`（`AppRequests`）最長 21 秒，沒有超過 60 秒的。
+  - 一次列表（`initialize`＋所有分頁）另有總時限 `_WHOLE_LIST_SECONDS`（90 秒）；比單次交換長，所以單一步驟卡住時 log 記的是那一步。
+  - 取 token 也限 60 秒（`_TOKEN_SECONDS`），算 `token` 階段（這台 VM 的問題，不記 backoff）。
+  - 到時限沿用既有路徑：列表→`request` 階段的 `network`，這個 toolbox 這回合少掉、記 backoff；工具呼叫→結果不明、不重送；讀
+    `default_version`→照舊 fail-closed。明確拒絕的語意不變。
+  - 預熱的列表走同一個 `tools()`，所以 `list_failure` 等預熱最多等到預熱的時限，不必再加一層。沒有整個 bind 的總時限，已知的最壞情況
+    是讀 `default_version` 120 秒（token 60＋交換 60）＋等預熱 90 秒＋自己列 90 秒；kept 清單少工具的再列與 Connect 後的重列各再加 90 秒。
+  - 限制：讀不到 `default_version` 的回合本來就不保留任何東西（版本不明），所以沒有 backoff：toolbox 整個卡住時，沒釘版本的 grant 每回合都付
+    `default_version` 加列表的時間，有上限但不會變快。
+  - 觀測：`NATIVE_TOOLBOX_FAILED`（`shared_context.native_toolbox` logger）加進 `LOG_PREFIXES`／`LOG_LOGGERS`，參數都是固定的 method、stage、
+    code、reason。到時限時 `reason=deadline`（單次交換，`method` 就是卡住的那一步）或 `listing_deadline`（整次列表）。
+  - **這不是 fa-context-b 2026-10-28／30 長時間卡住的修法。** 那幾次的讀法見 [progress](../../docs/progress.md#fa-context-b-connect-wait-1030)。
+  - 測試：`test_native_toolbox_unavailable.py` 的真 socket 滴水（httpx 的 read timeout 擋不住）、`initialize`／`tools/list` 滴水後少掉並記
+    backoff、每頁都及時但整次超時、token 一直不來但不記 backoff、回合等滴水的預熱、工具呼叫滴水後結果不明且不重送；`test_sdk_telemetry.py` 的匯出範圍。
+  - Verified against：程式基準 main `524c82d3` 加未提交差異；httpx 0.28.1（`requirements-hosted.txt`）；官方文件 2026-10-30 查閱。本機 Python 3.12.10（Hosted 映像檔 3.11.14 未實跑）：toolbox、bind、Connect、預熱與 telemetry 測試 165 passed；`test_sdk_telemetry.py` 另有 7 個 error，缺 `M2_TEST_RUNTIME`，基準 commit 同樣 7 個。修正前新測試全部失敗；分別拿掉交換、整次列表、token 三道時限，對應測試都失敗。
 - **工作台**：見 [工作台 README](web_test_console/README.md#tool-source-unavailable)。
 - **混版注意**：降級回合的 receipt 帶 `unavailable_sources`；舊版 API／工作台（`WireModel` `extra=forbid`、schema
   `fa-native-assembly-v1`）會拒收那則回條，所以 Hosted、API、工作台要一起出版。沒有降級的回合不輸出這個欄位，回條與舊版相同。
@@ -11056,6 +11074,9 @@ skill draft 路由。
   選定列（`selection_record`）和舊 Table 對話列（`_legacy`）原本各一次 guard／installation 包住的單列 snapshot，現在放進同一次
   `read_snapshot`，再交給原本的檢查；檢查順序不變（target 不符仍先 403，再輪到舊對話 409），結果相同。註冊的 peer Agent
   照舊讀取。離線：10 次 GET／10 輪 → 6 次 GET／5 輪。選定列存在時 `store.reconcile` 另讀 3 次（推論就是 dev 的 13），不變。
+  - 後續（2026-10-29，R6-H）：`selection_record` 與 `_rows` 已刪，`_legacy` 自己讀舊對話列（離線 5 次 GET／5 輪）；
+    遺留的 standing-target 列改由單點讀取拒絕：root 在啟動時的 `activate_target`（502 `DELIVERY_RECORD_INVALID`），
+    peer 在 `for_agent` 建立它的 `build_peer`（對外 503 `AGENT_RUNTIME_UNAVAILABLE`，不留快取）。
 - **`api_*` 的 job_id**：路徑沒有 `request_id` 的路由（`api_catalog`、`api_submit` 等）改用 `_body` 已驗證的 body
   `request_id`，以同一個 `timing_id` 雜湊，可以跟 Hosted 的 `native_bind_*` 對上；路徑的 `binding_id`／`request_id` 仍優先。
 - 未部署、未在 dev 量測；省下的時間要部署後用同樣的 `api_catalog` 計時比對。
@@ -15367,7 +15388,7 @@ provider stream 本身失敗、Hosted 仍活著時不受影響：回合會以 fa
 - `tests/shared_context/test_lost_session_closure.py`（synthetic native startup fixture，本機 Table I/O 與 Foundry client 替身）：
   - session 仍 active 時維持 unknown；變成 `failed`／`deleted`／`expired` 後，只讀 status、不再送 invocation 就收尾為 failed 並轉交；
     對話 blocker 與新追問都是 `ASSISTANT_SESSION_LOST`，上一回合回覆仍可讀；
-    `read_startup`、`_quiescence`、`installed_origin` 的結果和封存前相同。
+    `read_startup`、`installed_origin` 的結果和封存前相同。
   - 讀取失敗、仍 active、session ID 不同、未取消只讀到 `idle`：都不封存，也不呼叫 `stop_session`；
     只有 `idle` 時只讀 status，不送 observe invocation。
   - 取消時 Hosted 不回應：只呼叫一次 `stop_session`，收尾為 cancelled；取消時已是 `idle`：
@@ -15410,8 +15431,7 @@ API 讀到結束回條後，**先**呼叫 `record_turn_usage(control, job_id=…
 - **撤權後照樣入帳**：VM 直連後，回合可能跨過撤權繼續執行。開機時「撤權後不得再 admit／dispatch」的檢查，不套用在記錄已發生花費的寫入：
   也就是 `instruction_turn_usage`，以及既有逐次 `record_usage` 的 usage 階段。否則撤權後入帳的回合，下次開機就會失敗。接單、派工與 model-send 預約仍照原規則。
 - **範圍**：只接受已登錄的 instruction work。`wire_api` 只有 `responses`；Completions 仍走 API 的 reserve／consume 與 `record_usage`，不會重複記帳。
-- **開機驗證**：`behavior_work_policy_history` 用 `replay_turn_usage` 逐筆重建這類寫入，包括原 request 和帳本的確切變化；rotation 驗證只接受屬於原 job、key 正確的 `TurnUsageRecord`。
-  少了這兩處接線時，開機會報 `cost writer has no original policy scope`，測試會是 RED。
+- **開機驗證**：這類寫入不經開機重建（`behavior_work_policy_history`、`replay_turn_usage`、rotation 驗證已於 2026-10-30 刪除），fresh 開機只讀固定 key。
 - **未完成**：VM 直連的傳送與累加見下一節（T4b，預設關閉）。唯讀帳務投影 `fa-work-accounting-read-v1` 暫時不顯示 `model_unmetered_requests`。
 
 ### VM 直連 Responses（ADR-0006 §5 T4b，預設關閉）
@@ -15580,7 +15600,7 @@ ADR-0007 的新對話不再建立 Table job 和 WorkRegistration，所以不能�
 - **撤權後照樣入帳**：和 T4a 一樣，記錄已發生的花費不算新的 admit 或 dispatch。
 - **開機驗證**：
   - `replay_agent_turn_usage` 逐筆重建原 request 和帳本的確切變化；
-  - `receipt_control` 依 `agent_oid` 找出唯一一個原 policy，找不到就拒絕開機：`agent turn usage has no original Agent policy`；
+  - `_receipt_control` 依 `agent_oid` 找出唯一一個原 policy，找不到就拒絕開機：`agent turn usage has no original Agent policy`；
   - rotation 驗證只接受 key 正確的 `AgentTurnUsageRecord`。
 - **預留**：#315 私人記憶直連的記憶服務用量（查詢 embedding、非同步萃取），之後以第二種來源 `memory` 和它自己的用量型別走同一個接點；這次不接受，也不接上。
 - **範圍**：純新增。舊 job 路徑的 `record_turn_usage` 和 `TurnUsageRecord` 都沒改；同一個 RID 在 job 路徑和原生路徑各成一筆。
@@ -16622,6 +16642,9 @@ provider／API／Hosted／SDK傳遞。中途傳輸失敗保留原請求與未決
 `outcome=returned` 只是函式返回，不代表工作成功。此輪未把 SDK 改成常駐程序。
 ### 一般 Agent 接單的純 builder（LOCAL，尚未接 T5）
 
+（2026-10 更新：這個 builder 一直沒有接上正式入口，只剩測試引用，`behavior_agent_admission` 已整檔刪除。
+正式 Agent 互傳走 native relay。以下保留當時設計紀錄。）
+
 此片只收尾已開始的Table路徑接合，不另建 queue、agent loop 或 State store。
 **2026-10-01 16:00更新：** POC改以Hosted原生優先，可用preview／experimental，
 權威不必留在FA；Conversations／State store／Resilient Tasks的替代範圍由ADR-0007另定。
@@ -16865,8 +16888,7 @@ CLI 的唯讀動作仍驗原組織 operator 的有效 JWT 與 scope，不以 Tea
 
 - 程式基準：`b98b3d8a`（main `379cd4e9` 加本片）；接點為 `behavior_team_registry`、
   `behavior_team_registry_operator`、`behavior_auth`、`behavior_server._verifier`。
-- 新紀錄同步接入 `validate_additions` 與 `_quiescence`，既有 startup inventory 接受 exact
-  owner/index/原回條；不更動舊記錄、counter、receipt 或 checkpoint。
+- 不更動舊記錄、counter、receipt 或 checkpoint；當時的開機歷史驗證已於 2026-10-30 刪除，fresh 開機只讀固定 key。
 - 本機 `test_team_registry.py`、原 `test_behavior_auth.py` 與相關 server 建構／入口案例共58案通過；
   包含CAS競爭、完整startup與server無I/O建構。簽章token與storage均為本機替身，沒有live。
 - 兩軸發現的無效停用 RID 與原 operator 停用後無法核回 lost ACK，已先用4個反例重現，
@@ -16907,13 +16929,11 @@ Verifier：oid 不在 config actors、token 為 app-only（無 `scp`，`idtyp` �
 查不到、inactive、owner oid 一律 403 `BEHAVIOR_ACTOR_NOT_ALLOWED`。user token 帶 Agent oid 仍回 403
 `BEHAVIOR_HUMAN_NOT_ALLOWED`；config actors 仍優先且 0 GET。
 
-`validate_team_registry_history` 認得 Agent 索引列、目標列與 roster 列，並以原 register 回條
-（含當時 roster 影像）重建核對；roster 只列已登錄的 Agent。`validate_additions` 與 `_quiescence`
-透過它自動接受新紀錄，壞列擋下。registry Agent 的 scope 解析與路由屬 PR3b，本片登錄後尚不可路由。
+roster 只列已登錄的 Agent。當時的開機歷史驗證（`validate_team_registry_history` 等）已於 2026-10-30 刪除。registry Agent 的 scope 解析與路由屬 PR3b，本片登錄後尚不可路由。
 
 #### Verified against — CAP-06 PR3a
 
-- 本機 `test_team_registry.py` 50 案通過（含真實 `_quiescence`／`validate_additions` 重啟讀取），
+- 當時本機 `test_team_registry.py` 50 案通過（含重啟讀取，該驗證已於 2026-10-30 刪除），
   `test_m3_auth.py`、`test_operation_rejection_history.py` 97 案通過；token 與 storage 皆本機替身，沒有 live。
 
 ### CAP-06 PR3b registry Agent 的解析與路由（LOCAL）
@@ -18083,14 +18103,14 @@ Web client 可讀舊版 `delivery_state=fulfilled` 及新版 `delivered`，
 `python -B -m web_test_console schema --configuration steady`查閱。
 正式CLI在未接可信後端逐工作reader時，提交明列`NOT_CONNECTED`；
 其他原讀取／收件仍各自受後端權限核對，不被此缺件一起鎖死。
-原失敗結果後端`behavior_web_handoff`已接回，client的`original_failure`仍停用並正在配對接線，
+原失敗結果後端`behavior_web_handoff`當時已接回（2026-10 更新：`OriginalFailureWebHandoff`已移除，以下為當時的設計紀錄），client的`original_failure`仍停用並正在配對接線，
 須依正式status／Binding／receipt規則驗證後啟用，不能用boolean跳過驗證。
 後端三關仍在CODE／OFFLINE整備，沒有新模式的native部署；
 本機預覽不表示已存在可用的原生FA測試入口。
 
 ### 原已停止結果的正式web轉交
 
-（2026-10 更新：獨立receiver `behavior_web_handoff_api` 已因無正式入口、只剩測試引用而移除；`behavior_web_handoff` 後端核心仍在。以下為當時的設計紀錄。）
+（2026-10 更新：獨立receiver `behavior_web_handoff_api` 已因無正式入口、只剩測試引用而移除；`behavior_web_handoff` 的轉交服務 `OriginalFailureWebHandoff` 也已因無建立點而移除，只留歷史驗證用的 model 與 `validate_web_handoff`。以下為當時的設計紀錄。）
 
 `behavior_web_handoff_api.create_app`是獨立receiver，不掛到普通業務入口，
 也沒有submit／claim／模型／stop／Teams發送方法。
@@ -18106,7 +18126,9 @@ status純讀；`reconcile`可能補原已保存ACK的履行，因此不是UI輪�
 
 ## v1.2 原動態 Teams 工作的 pre-acquire 收尾
 
-`behavior_teams_recovery.TeamsPreAcquireRecovery` 是獨立的 v2 operator，
+（已刪除，以下僅為當時的設計紀錄。`TeamsPreAcquireRecovery`、`ExpiredTeamsCleanup`、`CleanupDelivery` 與 `MigrationStore.transact(decision_final_check=...)` 於 2026-10 移除；Scope／Plan／Authorization／History model、channel 啟動的歷史驗證與 `_verify_channel_history` 於 2026-10-30 隨 v2 Teams 一起刪除。fresh 啟動只讀固定 key，看不到這些舊列。）
+
+`behavior_teams_recovery.TeamsPreAcquireRecovery` 當時是獨立的 v2 operator，
 不是舊靜態 job recovery 的放寬分支。`TeamsPreAcquireRecoveryScope`／`Plan`／
 `Authorization`／`History` 使用明確的 `fa-teams-pre-acquire-recovery-*-v1` schema，
 phase 固定為 `teams_before_sdk_acquire`。目前這個 v1 契約必須仍在原 WindowInstallation
@@ -18733,17 +18755,15 @@ admission capture 接到正式 SDK `task`，不新增另一套批准流程。
   仍是唯一計費來源；child 完成、取消或重複關聯都不再加一次費用，也不把未知 usage 改成零。
   child 的成功不呼叫父 work finish／delivery，父代仍負責整合及原真人交付。
 - 四種明確 kind 為 `sdk_delegation_intent`、`sdk_delegation_state`、`sdk_delegation_result`、
-  `sdk_delegation_model_usage`。migration 共用型別表與 current-runtime reader 已接線；
-  reader 另核原父身份、回條、完整結果與 root 用量，拒絕有型別但無原意圖的孤兒紀錄。
+  `sdk_delegation_model_usage`。
 
 ### Verified against — A2a
 
-- 程式：`behavior_delegation.py`、`behavior_migration._kind_models/_quiescence`、
-  `behavior_runtime_rotation_history.validate_additions`。
+- 程式：`behavior_delegation.py`。當時的開機歷史驗證（`_kind_models`、`_quiescence`、`validate_additions`）已於 2026-10-30 刪除。
 - 直接契約：`tests/shared_context/test_behavior_delegation.py`，包括 commit 回應遺失、
   原 ID 衝突、空／tool-only、取消雙證據、完整內容與原 ModelCost。
 - 真開機 reader：`tests/shared_context/test_delegation_startup.py` 重用 #141 的
-  `synthetic_standing_v1`／`read_startup`，跑實際 standing/current-runtime validators。
+  `synthetic_standing_v1`／`read_startup` 讀回（當時的 validators 已於 2026-10-30 刪除）。
   原 transfer 與 memory startup 同組回歸；沒有 mock 這些 validators。
 - 證據範圍：本機 API／store producer、合成 SDK state／exit／child 觀察，不是 SDK 委派或 Hosted live 驗收。
   沿 #141 核准界線，沒有重建 Window2／TeamsWebHandoff／ACK 外層。
@@ -18822,6 +18842,9 @@ admission capture 接到正式 SDK `task`，不新增另一套批准流程。
   並確認沒有預留 gate；也逐一驗證每個 gate code 只保存 code。
 
 ## Agent 常駐控制第一片（ADR-0006 T2，CODE/offline）
+
+（2026-10 更新：這條控制連線一直沒有掛上正式 app，`behavior_agent_control`、`AgentWorkerControl` 與 Hosted 端的綁定已刪除；
+`behavior_agent_worker` 只留 wire 型別。以下保留當時設計紀錄。）
 
 本片建立每個 Agent 原 VM 的控制接點及排他佇列，**尚未把既有 admission／Foundry 啟動改走新路徑**。
 T1 的入口票／消耗／開始與完成回條尚需下一片整合；原每對話 Hosted 路由、claim、SDK 保存與原資料皆不改寫。

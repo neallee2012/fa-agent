@@ -45,6 +45,7 @@ FA 是**單一組織、多 Team 的代管 AI 助理平台**：每個 Team 只屬
 - 先讀真實呼叫路徑與既有 helper，再做完整而精準的修改。SDK／API／image 的版本以對應 manifest、契約及部署讀回為準，不把最新版文件的能力直接套到固定舊版。
 - 只增加能防止資料損失、重送或明顯執行錯誤的必要控制；不要把額外治理、完整歷史重驗或新框架變成部署前置。程式、consumer、測試與直接相關文件一起對齊。
 - 驗證依本次 diff 選最小有意義範圍。離線替身、真本機 SDK、Hosted、真模型及 Azure 儲存的證據不可互換；品質、恢復能力與效能各自驗收。
+- **工作台驗收分兩層（Neal 2026-10-30）：** 改到工作台路徑的 PR 附 standin 證據，stage release 的 dev 測試報告逐位助理列 dev 層結果；範圍見 [CONVENTIONS](docs/CONVENTIONS.md)。
 - **本機 Docker、Storage REST 存取或 session-private `$HOME` 持久性，都不是 Foundry Hosted 共享檔案系統掛載成功的證據。** GUI 啟動也不等於自主 UI、登入持續有效或完整環境恢復。
 
 ## 批准、費用與 Git

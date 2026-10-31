@@ -21,10 +21,7 @@ from shared_context.behavior_assistant import key, _Session, _row
 from shared_context.behavior_operations import control_key
 from test_behavior_model_diagnostics import BODY, CANARY, LocalHTTP, LocalAsyncHTTP, socket_server, send_bytes
 from test_behavior_assistant_sse import stream
-from test_behavior_assistant_acquire_conflicts import native_acquire, current_rotation
-from test_behavior_rotation_cutoff import two_rotations
-from test_behavior_rotation_settlement_history import current_cancelled
-from test_behavior_runtime_rotation import rotated
+from test_behavior_assistant_acquire_conflicts import installed_assistant, native_acquire
 from test_behavior_assistant_claim_boundaries import reviewed
 from test_m3_auth import jwk_client, signing_key
 from types import SimpleNamespace

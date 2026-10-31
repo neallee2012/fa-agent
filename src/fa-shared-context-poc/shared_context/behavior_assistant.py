@@ -243,8 +243,6 @@ class AssistantRuntime(BehaviorRuntime):
                     self.profiles[binding.binding_id].model_dump(mode="json")),
                 command=command, admission_request=request,
             )
-            if self.teams_metrics is not None and binding.route.channel_id == "msteams":
-                consent = self.teams_metrics.delegation(binding, consent)
             extra_writes = (*extra_writes, _write(key("delegation", binding.event_id), consent, "create",
                                                  material(consent.model_dump(mode="json"))))
         return super()._save_plan(binding, kind, principal, command, context, data, request,
@@ -402,10 +400,6 @@ class AssistantAuthority:
         else:
             delegation = _row(rows, key("delegation", binding.event_id), _Delegation)
             obligation = _row(rows, control_key("delivery-obligation", binding.obligation_id), _Obligation)
-            if binding.route.channel_id == "msteams":
-                if self.runtime.teams_metrics is None:
-                    raise Problem(403, "ASSISTANT_EXECUTION_FENCED", "Teams 工作缺少原 operator policy")
-                self.runtime.teams_metrics.verify_delegation(binding, delegation, rows)
             consent_matches = (delegation.human_oid == binding.human_oid and delegation.event_id == binding.event_id
                 and delegation.profile_digest == session.assignment.task.profile_digest
                 and _parse(rows[key("delegation", binding.event_id)].payload["material"], InlineMaterial)
@@ -514,7 +508,7 @@ class AssistantAuthority:
             return ControlChanges(writes=tuple(writes),
                                   result={"session_id": sid})
 
-        if self.runtime.mode == "native" and binding.route.channel_id != "msteams":
+        if self.runtime.mode == "native":
             _ledger_conflicts(self.store, request, decide)
         else:
             self.store.transact(request, decide)
@@ -547,8 +541,7 @@ class AssistantAuthority:
             if name in {"model", "model-send"}:
                 from .behavior_agent_message_runtime import check_model_time
                 check_model_time(self, session, rows)
-            native_model = (name in {"model", "model-send"} and self.runtime.mode == "native"
-                            and self._binding(session).route.channel_id != "msteams")
+            native_model = name in {"model", "model-send"} and self.runtime.mode == "native"
             if session.turn_authorization_digest is not None or native_model:
                 current = _row(rows, key("session", session.assignment.session_id), _Session)
                 if (native_model and current.state != "running" or current.assignment != session.assignment
@@ -558,7 +551,7 @@ class AssistantAuthority:
                     raise Problem(403, "ASSISTANT_EXECUTION_FENCED",
                                   "current session, ticket and execution are required")
             return decide(rows)
-        if (self.runtime.mode == "native" and self._binding(session).route.channel_id != "msteams"
+        if (self.runtime.mode == "native"
                 and name in {"context", "model", "model-send", "save", "artifact-stage", "finish", "stopped", "checkpoint","progress"}):
             return _ledger_conflicts(self.store, request, guarded)
         return self.store.transact(request, guarded)
@@ -607,7 +600,7 @@ class AssistantAuthority:
         record = None if control is None else control.records.get(binding_id)
         binding = self.runtime.bindings.get(binding_id)
         if (record is None or record.profile.instruction is None or binding is None or binding != record.binding
-                or binding.route.channel_id == "msteams" or binding_id in self.runtime.historical_binding_ids):
+                or binding_id in self.runtime.historical_binding_ids):
             return self.current_session(binding_id, sid, ticket, principal)
         if not isinstance(principal, BehaviorPrincipal):
             raise Problem(403, "BEHAVIOR_BINDING_DENIED", "unknown authorized binding")
@@ -788,8 +781,6 @@ class AssistantAuthority:
                        _ModelIntent(request_sha256=command.request_sha256), "create"),
                 _write(key("session", sid), _updated(
                     current, model_requests=current.model_requests + 1,
-                    model_intent_ids=(*current.model_intent_ids, key("model-intent", sid, command.request_sha256))
-                    if self._binding(session).route.channel_id == "msteams" else current.model_intent_ids,
                 ), "replace"),
                 *(() if instruction else (_write(budget_key, _updated(budget, remaining_attempts=budget.remaining_attempts - 1,
                                           remaining_units=budget.remaining_units - 1), "replace"),)),
@@ -1405,18 +1396,7 @@ class AssistantAuthority:
                     or checkpoint.task_digest != _digest(session.assignment.task.model_dump(mode="json"))):
                 raise Problem(403, "ASSISTANT_NATIVE_CHECKPOINT", "exact stopped SDK checkpoint is required")
             snapshot = self.store.read_snapshot((session_key, key("archive", sid)))
-            binding = self._binding(session)
-            metrics = self.runtime.teams_metrics
-            if (binding.route.channel_id == "msteams" and metrics is not None
-                    and launch.start.binding.generation >= metrics.setup.native_max_generations):
-                return self._teams_failed_result(session, command, snapshot)
             return None, command.checkpoint, snapshot
-        binding = self._binding(session)
-        if command.outcome == "failed" and binding.route.channel_id == "msteams":
-            if (command.result is not None or command.checkpoint is not None
-                    or session.state == "ready_to_finalize"):
-                raise Problem(403, "ASSISTANT_NATIVE_UNKNOWN", "失敗不能掩蓋已完成結果或未知模型歷史")
-            return self._teams_failed_result(session, command, {session_key: self.store.read_snapshot((session_key,))[session_key]})
         raise Problem(403, "ASSISTANT_NATIVE_UNKNOWN", "unfinished or unverified SDK exit retains execution responsibility")
 
     def no_sdk_report_context(self, launch, command):
@@ -1433,38 +1413,6 @@ class AssistantAuthority:
                 or owner.process_generation != launch.process_generation):
             raise Problem(403, "SDK_NO_START_SCOPE", "only the original enabled native observer may report this closed gate")
         return session, keys(self, session)
-
-    def _teams_failed_result(self, session, command, initial):
-        binding, sid = self._binding(session), session.assignment.session_id
-        if session.model_requests != len(session.model_intent_ids):
-            raise Problem(403, "ASSISTANT_NATIVE_UNKNOWN", "原模型預留歷史不完整，不可宣稱無未知效果")
-        effect_key, operation_key = key("artifact", binding.work.work_id), control_key("operation", binding.operation_id)
-        snapshot = {**initial, **self.store.read_snapshot((effect_key, operation_key, *session.model_intent_ids))}
-        known, unresolved = [], []
-        for intent_id in session.model_intent_ids:
-            intent = _row(snapshot, intent_id, _ModelIntent)
-            if intent.consumed:
-                unresolved.append(intent_id)
-        if snapshot[effect_key] is not None:
-            effect = _row(snapshot, effect_key, _ArtifactEffect)
-            if effect.stage != "create_unknown":
-                known.append(effect_key)
-            if effect.stage in {"create_unknown", "upload_unknown"}:
-                unresolved.append(effect_key)
-        if snapshot[operation_key] is not None:
-            operation = _row(snapshot, operation_key, _Operation)
-            if operation.effect_state == "applied":
-                known.append(binding.operation_id)
-            if operation.unsettled_attempt_ids:
-                unresolved.append(binding.operation_id)
-        result = VerifiedWorkResult(
-            evidence_id=key("failed-result", sid), verifier_version=self.runtime.dep.delivery.contract.verifier_version,
-            work_id=binding.work.work_id, definition_digest=session.assignment.task.definition_digest,
-            state="failed", passed_checks=(), known_effects=tuple(known), unresolved_operations=tuple(unresolved),
-            content="SDK 工作已停止但未完成；原模型與外部效果預留保留，未自動重跑。".encode(),
-            proof=_json({"session_id": sid, "owned_sdk_stop": command.sdk_stop.model_dump(mode="json")}),
-        )
-        return result, None, snapshot
 
     def verify_native_report_snapshot(self, rows, snapshot):
         self._current_sources(rows, snapshot)

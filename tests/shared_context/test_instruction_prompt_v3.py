@@ -8,7 +8,7 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_inventory, instruction_models, runtime_path
+from test_instruction_flow import instruction_inventory, instruction_models, runtime_path
 from test_instruction_prompt import saved_turn, sdk_options, submit
 from test_m3_auth import jwk_client, signing_key
 
@@ -148,4 +148,3 @@ def test_manual_version_survives_later_selection_environment_and_cold_followup(
     assert all(turn["prompt_assembly"] == assemble_prompt(original_profile).record.model_dump(mode="json")
                for turn in projection.json()["turns"])
     assert len(h.endpoint.requests) == 3
-    check_history(h)

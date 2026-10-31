@@ -23,7 +23,7 @@ from shared_context.behavior_native_turn_wire import NativeReceipt, NativeSubmit
 from shared_context.errors import Problem
 from shared_context.m2_copilot import ToolFailure, ToolOutput
 from shared_context.native_capabilities import NativeCapabilityContext, guard_native_tool
-from shared_context.native_hitl import NativeHitlService, hitl_key, validate_native_hitl_history
+from shared_context.native_hitl import NativeHitlService, hitl_key
 from shared_context.native_hitl_runtime import NativeAutoReview, NativeHitlClient, NativeHitlRuntime
 from shared_context.native_hitl_wire import (
     NativeHitlAction, NativeHitlApprovalReference, NativeHitlAuthorize, NativeHitlCall,
@@ -706,8 +706,6 @@ def test_api_authorization_is_agent_only_single_claim_and_history_stays_typed(hi
     assert len(c.table.submissions) == before
     error(post(c, "/authorize", command.model_copy(update={"request_id": "second-claim", "effect_token": "new-token"}),
                c.agent), 409)
-    values = validate_native_hitl_history(inventory(c), c.config)
-    assert any(type(value).__name__ == "_Authorization" for value in values.values())
 
 
 def test_closed_rid_blocks_late_pending_and_human_click_without_queue_or_new_rid(hitl):
@@ -1133,7 +1131,6 @@ def test_p2_original_delegation_capacity_keeps_complete_control_material(hitl, t
         result = await waiting
         assert result["permissionDecision"] == "allow"
         assert delegate.claims["large-call"].record.hitl.action.arguments == arguments
-        validate_native_hitl_history(inventory(hitl), hitl.config)
         await case.gate.close()
     asyncio.run(check())
 
@@ -1158,8 +1155,6 @@ def test_p2_segmented_control_lost_ack_reconciles_complete_original_without_any_
     packed = HitlPackedRecord.model_validate_json(json.dumps(c.store.read_record(pid).payload["data"]))
     assert len(packed.parts) > 1
     assert c.table.backing.rows == before and len(c.table.submissions) == count
-    values = validate_native_hitl_history(inventory(c), c.config)
-    assert values[pid].command == command
 
 
 def test_p2_image_readback_refuses_changed_or_missing_original_part(hitl, tmp_path):

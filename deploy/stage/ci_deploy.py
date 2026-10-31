@@ -22,7 +22,10 @@ come from the selected profile (api_environment), so an ENV change is a normal P
                                                        read-only warning if the one-time Web PubSub resource/role
                                                        is missing (never stops: hints are optional); stops if a
                                                        declared API secret or the named feed app does not exist,
-                                                       or the API routine clock is on with minReplicas < 1
+                                                       the API has an ENV the profile does not know, its installed
+                                                       BEHAVIOR_SERVER_CONFIG_JSON differs from <runtime>/config.json
+                                                       (api's refusal, before sync writes anything), or the API
+                                                       routine clock is on with minReplicas < 1
   python3 deploy/stage/ci_deploy.py build <kind>    -> builds and pushes one image, prints its digest reference
   python3 deploy/stage/ci_deploy.py gate <api-ref>  -> ADR-0009 phase 3b compatibility gate, before sync: the new API
                                                        image (sync job, API identity) reads every binding row and the
@@ -196,6 +199,15 @@ def _require_known_env(app, deployed, known):
         raise SystemExit(f"{app}: deployed ENV {unknown} is not in the deployment profile; add it first")
 
 
+def _require_guarded(app, deployed, guarded):
+    """A guarded ENV (the installed configuration) must already equal the repo's; CI never replaces it."""
+    for key, value in guarded.items():
+        current = deployed.get(key, {}).get("value")
+        if current is None or json.loads(current) != json.loads(value):
+            raise SystemExit(f"{app}: deployed {key} differs from the repo; a configuration change is an "
+                             "operator action (fresh installation is bound to it), not a CI image update")
+
+
 def _release_file():
     return Path(STAGE["release_file"]) if STAGE.get("release_file") else CONFIG.parent / "release.json"
 
@@ -355,10 +367,12 @@ def guard():
     # Read-only, before any build or write: a declared API secret or the feed app missing stops here.
     secrets = api_secrets()
     _require_secrets(STAGE["api_app"], properties, secrets)
-    # The same refusal as api's update, before sync publishes Hosted (no half deploy; stage CI just stops earlier).
+    # The same refusals as api's update (unknown ENV, a different installed configuration), before sync publishes
+    # Hosted and moves routes (no half deploy; stage CI just stops earlier).
     container = (((properties.get("template") or {}).get("containers")) or [{}])[0]
-    _require_known_env(STAGE["api_app"], [item.get("name") for item in container.get("env") or []],
-                       {*STAGE["api_environment"], API_CONFIG_ENV, *secrets})
+    current = {item.get("name"): item for item in container.get("env") or []}
+    _require_known_env(STAGE["api_app"], current, {*STAGE["api_environment"], API_CONFIG_ENV, *secrets})
+    _require_guarded(STAGE["api_app"], current, {API_CONFIG_ENV: _config_bytes().decode("utf-8")})
     # The routine clock runs inside the API process (README#native-routine-api-clock): it needs one resident replica.
     if api_routines() and (((properties.get("template") or {}).get("scale") or {}).get("minReplicas") or 0) < 1:
         raise SystemExit(f"{STAGE['api_app']}: FA_NATIVE_ROUTINE_CLOCK=api needs minReplicas >= 1; "
@@ -913,11 +927,7 @@ def _update_container(kind, name, image, suffix, guarded=None, environment=None,
     template = properties["template"]
     container = template["containers"][0]
     current = {item["name"]: item for item in container.get("env") or []}
-    for key, value in (guarded or {}).items():
-        deployed = current.get(key, {}).get("value")
-        if deployed is None or json.loads(deployed) != json.loads(value):
-            raise SystemExit(f"{name}: deployed {key} differs from the repo; a configuration change is an "
-                             "operator action (fresh installation is bound to it), not a CI image update")
+    _require_guarded(name, current, guarded or {})
     secrets = dict(secret_environment or {})
     if secrets:
         # ENV name -> the app's own Container Apps secret (format checked by api_secrets in meta); read back again.

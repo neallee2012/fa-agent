@@ -26,7 +26,7 @@ from shared_context.errors import Problem
 from shared_context.behavior_turn_context import TurnContext
 from shared_context.source_materials import SourceWithdrawalInput
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_m3_auth import jwk_client, signing_key
 from test_work_policy_lifecycle import enabled
 
@@ -117,7 +117,6 @@ def test_exact_attachment_is_saved_and_original_request_reconciles_without_repla
     assert h.store._guard() == before and not h.endpoint.requests
     changed = command.model_copy(update={"attachments": (attachment.model_copy(update={"name": "changed.txt"}),)})
     assert post(h, changed).status_code == 409
-    check_history(h)
 
 
 def test_attachment_profile_is_explicit_and_old_request_serialization_stays_unchanged(assistant):
@@ -191,7 +190,6 @@ def test_explicit_attachment_reaches_sdk_after_the_unchanged_user_text_and_cold_
     metadata = TurnContext.model_validate_json(context.content)
     assert metadata.attachments == (attachment,)
     assert "ATTACHED_SOURCE_CANARY" not in context.text
-    check_history(h)
 
 
 def test_withdrawn_historical_attachment_blocks_new_turn_without_replacing_old_result(assistant, monkeypatch):

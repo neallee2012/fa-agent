@@ -406,11 +406,6 @@ def registration_request_digest(record):
         *(() if record.agent_origin is None else (record.agent_origin.model_dump(mode="json"),))])
 
 
-def registration_receipt_id(record):
-    return (work_policy_key("registration",record.admission_id) if record.agent_origin is None
-            else record.agent_origin.request.request_id)
-
-
 def registered_instruction(record):
     task=record.profile.instruction
     return None if task is None else InstructionSubmit(request_id=record.request_id,content=task.content,
@@ -1490,22 +1485,12 @@ class WorkPolicyControl:
         rpkey=runtime_key("policy",binding.binding_id)
         indexkey=runtime_key("plan-index",binding.binding_id)
         grant_writes=()
-        target_reads=()
-        target_row=None
         if self.runtime.mode=="native":
             import hashlib
             from .behavior_foundry import NativeExecutionGrant,native_key,instruction_target
             from .behavior_assistant_wire import Task
             native=self.runtime.dep.native_launches
             if native is None:raise Problem(403,"WORK_POLICY_NATIVE_DISABLED","existing original native authority required")
-            from .behavior_work_target import target_key, StandingTarget
-            selection_key=target_key(policy.authority_domain,policy.agent_id)
-            target_reads=(selection_key,)
-            target_row=self.store.read_snapshot(target_reads)[selection_key]
-            if target_row is not None:
-                selected=_parse(target_row.payload["data"],StandingTarget)
-                if native.targets!=(selected.command.target,):
-                    raise Problem(409,"STANDING_TARGET_DENIED","reload the selected native target before new admission")
             task=Task(job_id=binding.job_id,work_id=binding.work.work_id,
                 definition_digest=digest(binding.work.model_dump(mode="json")),profile_digest=digest(profile.model_dump(mode="json")),
                 source=profile.source,artifact_id=profile.artifact_id,artifact_version=profile.artifact_version,
@@ -1521,14 +1506,12 @@ class WorkPolicyControl:
             grant_writes=(_write(native_key("grant",gid),grant,"create"),)
         request=ControlRequest(request_id=key,request_digest=registration_request_digest(registered),
             read_set=tuple(dict.fromkeys((self.policy_key,self.revocation_key,self.cost_key,self.registry_key,key,
-                      ownerkey,opkey,rpkey,indexkey,*target_reads,*profile_reads,*conversation_reads,*memory_snapshot,*peer_snapshot))))
+                      ownerkey,opkey,rpkey,indexkey,*profile_reads,*conversation_reads,*memory_snapshot,*peer_snapshot))))
         def changes(current):
             from .behavior_work_registry import append_writes, count_registry
             active=self.installed(current)
             if routine is not None:
                 validate_submission(active,principal.oid,instruction,routine,now=self.runtime._now())
-            if target_reads and current[target_reads[0]]!=target_row:
-                raise Problem(412,"BEHAVIOR_CONFLICT","selected target changed before original registration")
             if conversation_reads and current[conversation_reads[0]]!=conversation_row:
                 raise Problem(412,"BEHAVIOR_CONFLICT","original conversation changed before admission")
             if conversation is not None and conversation.jobs and any(

@@ -27,7 +27,7 @@ from shared_context.errors import Problem
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_approved_skill_api import add_skill, approve_skill_version, configured
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models, runtime_path
+from test_instruction_flow import instruction_models, runtime_path
 from test_instruction_prompt import submit
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import open_turn, ordinary, settle
@@ -120,11 +120,9 @@ def test_closed_sdk_entry_delivers_failure_and_allows_only_explicit_reset(assist
         assert projection.json()["can_follow_up"] is False and projection.json()["can_reset"] is True
         assert projection.json()["follow_up_blocker"] == "SDK_NOT_STARTED_RESET_REQUIRED"
         assert projection.json()["turns"][-1]["reply_available"] is False
-        check_history(h)
         reset = h.client.post("/work-policy/v1/conversations/" + accepted["conversation_id"] + "/reset",
             json={"request_id": "explicit-reset"}, headers=h.headers())
         assert reset.status_code == 200 and reset.json()["archived"]
-        check_history(h)
         assert h.store.read_snapshot(previous_keys) == previous
         save_evidence("local-closed-entry", h, binding, constructors=len(sdk_constructions))
     finally:
@@ -226,7 +224,6 @@ def test_hosted_closed_gate_reports_original_failure_through_signed_probe(native
     assert h.store.read_snapshot(previous_keys) == previous
     assert c.control.records[c.binding.binding_id].profile.instruction.content == c.command.content
     assert_failure_available(h, c.binding)
-    check_history(h)
     projection = h.client.get("/work-policy/v1/conversations/" + c.accepted["conversation_id"], headers=h.headers())
     assert projection.status_code == 200 and projection.json()["can_reset"]
     assert not projection.json()["can_follow_up"]
@@ -432,7 +429,6 @@ def test_no_sdk_report_replay_and_late_probe_do_not_rewrite_original_failure(nat
     done = c.h.runtime.controller.step(c.binding.binding_id)
     assert done.state == "failed" and done.result_forwarded
     assert c.h.store.read_snapshot((result_key,))[result_key] == original
-    check_history(c.h)
 
 
 @pytest.mark.parametrize("native_no_start", [False], indirect=True)
@@ -573,7 +569,6 @@ def test_lost_no_sdk_report_ack_reconciles_original_evidence_without_reexecuting
     assert c.h.store.read_snapshot((nkey, rkey)) == original
     assert c.h.endpoint.requests == []
     assert c.host.start(c.starts[0], c.invocation, c.identity.session_id)["status"] == "pending"
-    check_history(c.h)
 
 
 def test_server_selection_is_versioned_and_pinned_without_new_identity_scope():

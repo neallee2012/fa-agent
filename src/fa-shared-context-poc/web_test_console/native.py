@@ -200,10 +200,10 @@ def _decode(model, raw):
         raise ConsoleError("NATIVE_STATE_INVALID", 502) from None
 
 
-# A native row's buttons, in the order the page lists them.
+# Every action flag a native row reports; the page reads the ones it shows by name.
 _TASK_ACTIONS = ("status", "submit-reconcile", "submit-retry", "read-reply", "cancel", "read-cancel-receipt",
                  "confirm-reply", "read-files", "read-skill-draft", "read-images", "read-appends", "read-progress",
-                 "read-system-prompt", "submit", "fetch", "acknowledge", "reconcile", "read-context", "read-delegation")
+                 "read-system-prompt", "submit", "fetch", "acknowledge", "read-context", "read-delegation")
 
 
 @dataclass(frozen=True)

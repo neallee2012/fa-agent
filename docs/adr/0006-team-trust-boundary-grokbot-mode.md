@@ -99,7 +99,7 @@ Grokbot 的做法（外部唯讀調查）：入口驗一次身分，之後整個
 - **現有資料不搬、不刪、不改寫**：
   - 原 Behavior 表只有一個 partition 和一個 guard，列永遠不刪，歷史讀取器也會對整個 partition 做雜湊比對，所以它繼續作為組織的權威紀錄。
   - 舊 checkpoint 和成果都照原路徑讀回。
-  - 如果新增沒有 `kind` 的紀錄型別，要同時加進 `validate_additions` 和 `_quiescence` 的型別白名單，否則存檔後可能讓啟動失敗。
+  - 新增紀錄型別不必登記型別白名單：fresh 啟動只讀固定 key。（原本要加進 `validate_additions`、`_quiescence` 的要求，已於 2026-10-30 隨這兩個函式刪除。）
 - **語意記憶（Memory Store）**：官方只能在 project 層授權，`scope` 也只是用來分區，不是 ACL（[memory-usage](https://learn.microsoft.com/azure/foundry/agents/how-to/memory-usage)、[ADR-0002](0002-shared-context-without-file-share.md)）。所以照第 1 節第 4 項，經 API 核對團隊後才能使用。例外：私人記憶（#306）和 Team note（#400）由 Hosted 直接讀寫，scope 仍由 FA 固定，不由模型決定（見第 1 節已知例外）。
 - **模型直連**：agent identity 預設就能透過 project endpoint 呼叫模型（[hosted-agent-permissions](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agent-permissions)），所以第 5 節 A 讓 VM 直連模型，不經 API。
 - **最小驗證**：

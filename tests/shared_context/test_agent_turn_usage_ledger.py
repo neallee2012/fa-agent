@@ -155,19 +155,6 @@ def test_only_a_typed_report_or_explicit_unknown_is_accepted(synthetic_standing_
     assert invalid.value.body["error"]["code"] == "AGENT_USAGE_INVALID"
 
 
-def test_startup_refuses_usage_of_an_agent_without_an_original_policy(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    control = c.control
-    other = control.policy.model_copy(update={"template": control.policy.template.model_copy(
-        update={"agent_oid": "not-a-registered-agent"})})
-    stray = SimpleNamespace(policy=other, cost_key=control.cost_key, store=control.store, models=control.models)
-    record_agent_turn_usage(stray, rid="native-stray", usage=report(group()))
-    with pytest.raises(Problem) as refused:
-        read_startup(c)
-    assert refused.value.status == 409
-    assert refused.value.body["error"]["message"] == "agent turn usage has no original Agent policy"
-
-
 def test_the_verified_agent_reports_its_own_final_turn_usage_once_over_the_api(assistant):
     from shared_context.behavior_turn_usage import AGENT_TURN_USAGE_PATH, AgentTurnUsageReport
     from test_sdk_compaction_product import configured

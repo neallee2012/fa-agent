@@ -246,7 +246,7 @@ Grok Bot 沒有官方的 Teams 聊天入口，Teams 只以 connector 出現；�
 
 上一版推薦的路徑 b 保留為備案：Azure Bot（身分用 API 的 UAMI，不建 secret）把 messaging endpoint 指到 FA API，API 驗 Bot Connector 簽章、核 `from.aadObjectId`、從 `activity.id` 算 RID，回合結束後主動送回覆。它需要 Teams 通道程式、對話位址表和交付紀錄；Teams 15 秒沒回會重送（官方文件：https://learn.microsoft.com/en-us/microsoftteams/platform/bots/bot-concepts ），主動送訊要自己存 `serviceUrl`（官方文件：https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/send-proactive-messages ）。
 
-2026-09-17 的「FA Personal POC」從未端到端，程式綁在已退役的 v1.2 模型（`docs/progress.md` 09-17、09-20 段）。真的走備案時，只取 `infra/teams/personal-bot.bicep`、`deploy/teams/manifest.template.json` 和 `sc/teams_identity.py` 裡的簽章核對值當範本，不重用 `sc/teams_*.py` 的執行碼。
+2026-09-17 的「FA Personal POC」從未端到端，程式綁在已退役的 v1.2 模型（`docs/progress.md` 09-17、09-20 段）。這批程式與部署範本已在 2026-10-30 刪除。真的走備案時，從 git 歷史（`e8d974f0`）取 `infra/teams/personal-bot.bicep`、`deploy/teams/manifest.template.json` 和 `shared_context/teams_identity.py` 裡的簽章核對值當範本，不重用 `teams_*.py` 的執行碼。
 
 ## Neal 要決定的事
 

@@ -413,8 +413,6 @@ def test_cold_rebuild_omits_unavailable_skill_without_erasing_the_completed_arch
             assert denied.value.body["error"]["code"] == "SKILL_SOURCE_DENIED"
             assert h.store._guard() == guard
             settle(second, state)
-            from test_instruction_flow import check_history
-            check_history(h)
         finally:
             second.client.close()
         assert h.store.read_snapshot((archive_key,))[archive_key] == archive
@@ -455,8 +453,6 @@ def test_completed_turn_can_continue_with_the_new_approved_skill_version(assista
                 h.assistant.skills.read(A, A.team, ("receipt-guide",), old_catalog.entries[0])
             assert stale.value.body["error"]["code"] == "SKILL_SOURCE_CHANGED"
             settle(second, state)
-            from test_instruction_flow import check_history
-            check_history(h)
             assert h.store.read_snapshot((archive_key,))[archive_key] == archive
             assert h.endpoint.requests == []
         finally:
@@ -468,7 +464,6 @@ def test_completed_turn_can_continue_with_the_new_approved_skill_version(assista
 @pytest.mark.parametrize("prior_state", ["missing", "pending", "rejected"])
 def test_completed_turn_can_gain_a_newly_approved_configured_skill(assistant, prior_state):
     from shared_context.behavior_assistant import key
-    from test_instruction_flow import check_history
     from test_sdk_compaction_product import ordinary, settle
 
     if prior_state != "missing":
@@ -491,7 +486,6 @@ def test_completed_turn_can_gain_a_newly_approved_configured_skill(assistant, pr
             assert second.client.skill_catalog().entries[0].version_id == "2" * 32
             assert second.client.read_skill("receipt-guide").text == BODY
             settle(second, state)
-            check_history(h)
             assert h.store.read_snapshot((archive_key,))[archive_key] == archive
             assert h.endpoint.requests == []
         finally:
@@ -620,7 +614,6 @@ def test_benign_catalog_update_does_not_restore_history_after_real_access_loss(a
 @pytest.mark.parametrize("terminal", ["failed", "cancelled"])
 def test_new_user_turn_can_continue_after_a_catalog_fence_is_terminally_saved(assistant, terminal):
     from shared_context.behavior_assistant import key
-    from test_instruction_flow import check_history
     from test_instruction_prompt import saved_turn
     from test_sdk_compaction_product import ordinary, settle
 
@@ -684,7 +677,6 @@ def test_new_user_turn_can_continue_after_a_catalog_fence_is_terminally_saved(as
         assert third.client.skill_catalog().entries[0].version_id == "3" * 32
         assert third.client.read_skill("receipt-guide").text == "Approved v3."
         settle(third, state)
-        check_history(h)
         assert h.workers.inspect(second.binding.job_id).state == terminal
         assert h.store.read_snapshot(tuple(retained)) == retained
         assert h.endpoint.requests == []

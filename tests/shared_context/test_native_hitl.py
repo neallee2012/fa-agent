@@ -21,7 +21,7 @@ from shared_context.behavior_team_registry import TeamRegistry
 from shared_context.errors import Problem
 from shared_context.m3_store import InMemoryArtifactStore
 from shared_context.native_hitl import (
-    NativeHitlService, _Intent, _RulesSnapshot, hitl_key, pending_id, validate_native_hitl_history,
+    NativeHitlService, _Intent, _RulesSnapshot, hitl_key, pending_id,
 )
 from shared_context.native_hitl_api import ENABLED_ENV, PREFIX, TTL_ENV, install_native_hitl_routes
 from shared_context.native_hitl_wire import INTERACTIVE_TTL_ENV, hitl_settings
@@ -211,8 +211,6 @@ def test_a_record_without_wait_is_background_and_keeps_its_original_bytes(hitl):
     stored = read(c, response.json()["result"]["pending_id"]).json()
     assert stored["pending"]["command"]["wait"] == "interactive"
     assert stored["pending"]["expires_at"] == "2026-10-03T09:00:00Z"
-    assert {type(value).__name__ for value in validate_native_hitl_history(inventory(c), c.config).values()} >= {
-        "NativeHitlPending", "_Intent"}
 
 
 def test_signed_owner_rules_create_update_delete_keep_ids_revisions_and_history(hitl):
@@ -633,31 +631,36 @@ def test_attention_is_a_persisted_approval_projection_not_a_question_or_grant(hi
     error(c.client.get(PREFIX + "/rules?team=team-two", headers=c.headers()), 422)
 
 
-def test_history_recognizes_h1_records_without_reclassifying_them_as_legacy_work(hitl):
-    c = hitl
-    assert post(c, "/rules", change(c, "first-rule")).status_code == 200
-    _, pending = create_pending(c)
-    assert post(c, "/decisions", decision(c, pending, choice="allow_rule")).status_code == 200
-    values = validate_native_hitl_history(inventory(c), c.config)
-    assert values
-    assert {type(value).__name__ for value in values.values()} == {
-        "_Intent", "_RulesHead", "_RulesSnapshot", "NativeHitlPending", "_State", "_Decision", "NativeHitlOnceGrant",
-        "_TurnIndex",
-    }
-    wrong = inventory(c)
-    row = wrong.rows[pending["pending_id"]]
-    changed = {**row.payload, "data": {**row.payload["data"], "tenant_id": UNKNOWN_OID}}
-    wrong.rows[pending["pending_id"]] = Record(changed, row.etag)
-    with pytest.raises(Problem) as refused:
-        validate_native_hitl_history(wrong, c.config)
-    assert refused.value.body["error"]["code"] == "NATIVE_HITL_RECORD_INVALID"
+def test_cold_api_import_blocks_all_hosted_and_copilot_packages():
+    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
+    program = """
+import importlib
+import importlib.abc
+import sys
+class ApiOnly(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == 'copilot' or name.startswith(('copilot.', 'azure.ai.agentserver')):
+            raise AssertionError('H1 imported a Hosted/SDK dependency: ' + name)
+sys.meta_path.insert(0, ApiOnly())
+def offline(event, args):
+    if event == 'socket.connect':
+        raise AssertionError('H1 cold import attempted network I/O')
+sys.addaudithook(offline)
+sys.path.insert(0, sys.argv[1])
+for name in ('native_hitl_wire', 'native_hitl', 'native_hitl_api', 'native_routine_proposals', 'native_routines',
+             'behavior_server'):
+    importlib.import_module('shared_context.' + name)
+print('H1 API-only imports PASS')
+"""
+    completed = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", "-c", program, str(source)],
+                               capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "H1 API-only imports PASS" in completed.stdout
 
 
-def test_real_server_factory_and_both_history_readers_keep_h1_separate(workspace, jwk_client, signing_key, monkeypatch):
+def test_real_server_factory_keeps_h1_separate(workspace, jwk_client, signing_key, monkeypatch):
     from shared_context import behavior_server
-    from shared_context.behavior_migration import _quiescence
-    from shared_context.behavior_runtime_rotation_history import validate_additions
-    from test_behavior_rotation_settlement_history import page_inventory
+    from test_team_registry import page_inventory
     from test_behavior_server import Harness
 
     # Tokenization is unrelated to the approval control path; no cache download or model is needed.
@@ -670,8 +673,6 @@ def test_real_server_factory_and_both_history_readers_keep_h1_separate(workspace
             backing=h.table.backing, table_name=h.config.table.scope.table_name, url=h.config.table.endpoint)
         page_inventory(inventory_table)
         monkeypatch.setattr(h.composition.clients[0], "query_entities", inventory_table.query_entities)
-        baseline = h.runtime.store.read_inventory()
-        before = _quiescence(baseline, h.config)
         disabled = behavior_server.application(h.composition)
         assert not hasattr(disabled.state, "native_hitl")
         assert all(not getattr(route, "path", "").startswith(PREFIX) for route in disabled.routes)
@@ -698,40 +699,7 @@ def test_real_server_factory_and_both_history_readers_keep_h1_separate(workspace
             approved = client.post(PREFIX + "/decisions", json=choice.model_dump(mode="json"),
                                    headers=h.headers(signing_key, "Behavior.Read Behavior.Approve"))
             assert approved.status_code == 200, approved.text
-            current = h.runtime.store.read_inventory()
-            validate_additions(current, h.config, h.config, set(baseline.rows), set())
-            counts, unsubmitted = _quiescence(current, h.config)
-            assert unsubmitted == before[1]
-            assert {name: counts[name] for name in before[0]} == before[0]
-            assert counts["NativeHitlOnceGrant"] == 1 and counts["NativeHitlPending"] == 1
             assert h.calls == []
             assert h.runtime.bindings.keys() == disabled.state.composition.runtime.bindings.keys()
     finally:
         h.composition.close()
-
-
-def test_cold_api_import_blocks_all_hosted_and_copilot_packages():
-    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    program = """
-import importlib
-import importlib.abc
-import sys
-class ApiOnly(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path=None, target=None):
-        if name == 'copilot' or name.startswith(('copilot.', 'azure.ai.agentserver')):
-            raise AssertionError('H1 imported a Hosted/SDK dependency: ' + name)
-sys.meta_path.insert(0, ApiOnly())
-def offline(event, args):
-    if event == 'socket.connect':
-        raise AssertionError('H1 cold import attempted network I/O')
-sys.addaudithook(offline)
-sys.path.insert(0, sys.argv[1])
-for name in ('native_hitl_wire', 'native_hitl', 'native_hitl_api', 'native_routine_proposals', 'native_routines',
-             'behavior_server'):
-    importlib.import_module('shared_context.' + name)
-print('H1 API-only imports PASS')
-"""
-    completed = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", "-c", program, str(source)],
-                               capture_output=True, text=True, encoding="utf-8", timeout=60)
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "H1 API-only imports PASS" in completed.stdout

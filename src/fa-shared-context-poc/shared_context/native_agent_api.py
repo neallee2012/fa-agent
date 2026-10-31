@@ -56,13 +56,12 @@ class NativeAgentRelayGateway:
             raise Problem(403, "NATIVE_AGENT_SOURCE_INVALID", "the verified Agent differs from its server scope")
         return scope
 
-    def _client(self, scope, *, prepared=True, dispatch=False, rows=None):
+    def _client(self, scope, *, prepared=True, dispatch=False):
         """``dispatch``: work is delivered to this Agent's session, so (like an owner submit) the endpoint selector
-        is read in this request rather than reused from the last ``SELECTOR_CHECK_SECONDS``. ``rows``: an already
-        read snapshot of this Agent's store holding its target selection key (``selected_targets``)."""
+        is read in this request rather than reused from the last ``SELECTOR_CHECK_SECONDS``."""
         composition = self.owner.for_agent(scope.target.agent_id)
         control = composition.runtime.work_policy
-        targets = selected_targets(control.store, composition.config, agent_id=scope.target.agent_id, rows=rows)
+        targets = selected_targets(control.store, composition.config, agent_id=scope.target.agent_id)
         if len(targets) != 1 or targets[0].agent_oid != scope.identity.oid:
             raise Problem(403, "NATIVE_STATE_SCOPE", "one original server-selected Agent target is required")
         clients = [client for client in composition.clients

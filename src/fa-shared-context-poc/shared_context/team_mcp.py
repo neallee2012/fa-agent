@@ -22,23 +22,16 @@ import itertools
 import json
 import logging
 import threading
-from datetime import datetime
 from time import monotonic
-from typing import Annotated, Literal
 from urllib.parse import quote
 
-from pydantic import Field
 
 from .behavior_auth import BehaviorJwtVerifier, BehaviorPrincipal
-from .behavior_operations import _Model, _parse
-from .behavior_wire import Command, WireModel
 from .errors import Problem
 from .feed_signature import FEED_SIGNATURE_HEADER, FEED_URL_HEADER, sign_feed_url
 from .source_materials import digest
 from .team_mcp_wire import (
-    MAX_TEAM_MCP_SERVERS, ConnectionName, ServerLabel, TeamMcpChange, TeamMcpChangeResult, TeamMcpConnection,
-    TeamMcpConnections, TeamMcpServer, TeamMcpServerInput, TeamMcpView, TeamToolName, ToolboxVersion,
-    team_mcp_grant, team_toolbox_name,
+    MAX_TEAM_MCP_SERVERS, TeamMcpChange, TeamMcpChangeResult, TeamMcpConnection, TeamMcpConnections, TeamMcpServer, TeamMcpServerInput, TeamMcpView, team_mcp_grant, team_toolbox_name,
 )
 
 _log = logging.getLogger(__name__)
@@ -68,12 +61,6 @@ PROJECT_SCOPE_ENV = "FA_TEAM_MCP_PROJECT_RESOURCE_ID"
 def _team_lock(tenant: str, team: str) -> threading.Lock:
     with _TEAM_LOCKS_GUARD:
         return _TEAM_LOCKS.setdefault((tenant, team), threading.Lock())
-
-
-def team_mcp_key(kind, tenant, team, *parts) -> str:
-    raw = json.dumps(["fa-operation-control-v1", "team-mcp-" + kind, tenant, team, *parts],
-                     ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
 
 
 def team_connection_prefix(project_scope: str, team_id: str) -> str:
@@ -577,113 +564,6 @@ class TeamMcpService:
 
 
 # Retired head/intent rows (written until 2026-10-06): kept unchanged and only classified for migration and rotation.
-class _LegacyServerInput(WireModel):
-    server_label: ServerLabel
-    server_url: Annotated[str, Field(min_length=1, max_length=2048)]
-    project_connection_id: ConnectionName | None = Field(default=None, exclude_if=lambda value: value is None)
-    allowed_tools: Annotated[tuple[TeamToolName, ...], Field(min_length=1, max_length=32)]
-
-
-class _LegacyServer(_LegacyServerInput):
-    version: ToolboxVersion
-
-
-class _LegacyDesired(_LegacyServerInput):
-    version: ToolboxVersion | None = Field(default=None, exclude_if=lambda value: value is None)
-
-
-class _LegacyChange(Command):
-    schema_version: Literal["fa-team-mcp-change-v1"]
-    expected_revision: Annotated[int, Field(ge=0, le=2**31 - 1)]
-    expected_etag: Annotated[str, Field(min_length=1, max_length=1024)] | None = None
-    operation: Literal["add", "modify", "disable"]
-    server_label: ServerLabel
-    server: _LegacyServerInput | None = None
-
-
-class _LegacyPending(WireModel):
-    request_id: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")]
-    operation: Literal["add", "modify", "disable"]
-    server_label: ServerLabel
-    created_at: datetime
-
-
-class _Head(_Model):
-    kind: Literal["team_mcp_head"] = "team_mcp_head"
-    tenant_id: str
-    team_id: str
-    toolbox: str
-    revision: Annotated[int, Field(ge=0, le=2**31 - 1)]
-    servers: Annotated[tuple[_LegacyServer, ...], Field(max_length=MAX_TEAM_MCP_SERVERS)] = ()
-    pending: _LegacyPending | None = None
-
-
-class _Intent(_Model):
-    kind: Literal["team_mcp_intent"] = "team_mcp_intent"
-    tenant_id: str
-    team_id: str
-    request_id: str
-    principal_oid: str
-    command: _LegacyChange
-    base_revision: Annotated[int, Field(ge=0, le=2**31 - 1)]
-    desired_servers: Annotated[tuple[_LegacyDesired, ...], Field(max_length=MAX_TEAM_MCP_SERVERS)]
-    created_at: datetime
-    state: Literal["pending", "applied", "refused"]
-    toolbox_version: ToolboxVersion | None = Field(default=None, exclude_if=lambda value: value is None)
-    refused_code: str | None = Field(default=None, exclude_if=lambda value: value is None)
-
-
-def _head_key(tenant: str, team: str) -> str:
-    return team_mcp_key("head", tenant, team)
-
-
-def _intent_key(tenant: str, team: str, request_id: str) -> str:
-    return team_mcp_key("intent", tenant, team, request_id)
-
-
-def _record(rows, key, model):
-    row = rows.get(key)
-    if row is None:
-        return None
-    return _parse(row.payload["data"], model)
-
-
-def validate_team_mcp_history(inventory, config):
-    """Classify the retired Team MCP head and intent rows for migration and rotation; nothing reads or resumes them."""
-    from .behavior_team_registry import TeamOwnership, team_key
-
-    models = {model.model_fields["kind"].default: model for model in (_Head, _Intent)}
-    values = {}
-    for key, row in inventory.rows.items():
-        data = row.payload["data"]
-        kind = data.get("kind")
-        if not isinstance(kind, str) or not kind.startswith("team_mcp_"):
-            continue
-        if kind not in models:
-            raise Problem(409, "TEAM_MCP_INVALID", "unknown retained Team MCP schema")
-        value = _parse(data, models[kind])
-        tenant, team = value.tenant_id, value.team_id
-        if tenant != config.identity.tenant_id:
-            raise Problem(409, "TEAM_MCP_INVALID", "retained Team MCP data belongs to another tenant")
-        if team == config.identity.team_id:
-            owner_oid = config.identity.human_oid
-        else:
-            ownership = _record(inventory.rows, team_key(tenant, team), TeamOwnership)
-            if ownership is None or (ownership.tenant_id, ownership.team_id) != (tenant, team):
-                raise Problem(409, "TEAM_MCP_INVALID", "retained Team MCP data has no original Team owner")
-            owner_oid = ownership.owner_oid
-        if isinstance(value, _Head):
-            expected = _head_key(tenant, team)
-        else:
-            expected = _intent_key(tenant, team, value.request_id)
-            if value.command.request_id != value.request_id or value.principal_oid != owner_oid:
-                raise Problem(409, "TEAM_MCP_INVALID", "the retained Team MCP command has no matching Team owner")
-        if key != expected:
-            raise Problem(409, "TEAM_MCP_INVALID", "retained Team MCP key differs from its original identity")
-        values[key] = value
-    return values
-
-
 def current_team_mcp_grants(runtime) -> tuple:
     # AssistantRuntime.bindings maps binding_id -> RuntimeBinding; every binding of one runtime is in one Team.
     service = getattr(runtime, "team_mcp", None)

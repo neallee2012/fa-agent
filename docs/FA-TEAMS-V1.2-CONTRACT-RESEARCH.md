@@ -1,5 +1,7 @@
 # FA Teams v1.2 外部契約研究
 
+> 歷史紀錄。本文提到的 `teams_*.py`、`ServerConfigurationV2`、`ChannelMigration` 已在 2026-10-30 刪除，現行 Teams 走 [Teams relay](../src/fa-teams-relay/README.md)。
+
 研究日期：2026-09-16。唯一規範仍為 [FA Agent 行為控制規格 v1.2](FA-AGENT-BEHAVIOR-SPEC.md)；本文不是部署批准或 Teams PASS。BR-06 的身分、路由與回條必須獨立取證，不能沿用 PullInbox 的 `client_received`。
 
 ## SDK 與可重用的 Module

@@ -22,7 +22,7 @@ from shared_context.errors import Problem
 from sdk_checkpoint_local import LocalArtifactStore, sse
 from test_behavior_assistant import assistant
 from test_behavior_model_deadlines import asgi_server
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_m2_copilot import runtime_path
 from test_m3_auth import signing_key, jwk_client
 from test_sdk_compaction_product import configured
@@ -231,7 +231,6 @@ def native_checkpoint_roundtrip(assistant, tmp_path, runtime_path, *, provider_m
                 h.store.read_snapshot((checkpoint_key(binding.job_id),))[checkpoint_key(binding.job_id)].payload["data"]))
             assert upload.reference is not None and upload.sha256==proofs[-1]["state_sha256"]
             references.append(upload.reference)
-            check_history(h)
             current=h.client.get("/work-policy/v1/conversations/"+conversation,headers=h.headers())
             assert current.status_code==200 and current.json()["can_follow_up"]
             assert len(current.json()["turns"])==len(proofs)

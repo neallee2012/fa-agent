@@ -25,7 +25,7 @@ from shared_context.source_materials import digest
 from sdk_checkpoint_local import sse
 from test_approved_skill_api import post_skill
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -235,7 +235,6 @@ def test_fixed_sdk_deactivation_keeps_history_but_requires_a_new_approved_versio
             archive_key = key("text-archive", binding.job_id)
             archives[archive_key] = h.store.read_snapshot((archive_key,))[archive_key]
             assert h.store.read_snapshot(tuple(archives)) == archives
-            check_history(h)
     assert len(calls) == 6 and len(bridges) == 3 and len(receipts) == 1 and not forced
     assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == "1.0.83" for bridge in bridges)
     assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"

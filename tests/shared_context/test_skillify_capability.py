@@ -22,7 +22,7 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_instruction_prompt import saved_turn, submit
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import open_turn, ordinary, settle
@@ -93,7 +93,6 @@ def test_selected_skillify_saves_one_unapproved_team_draft_and_receipt(assistant
         control.records.clear()
         control.refresh()
         assert control.records[turn.binding.binding_id].model_dump_json() == original
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -159,7 +158,6 @@ def test_without_skillify_selection_cannot_write_from_text_or_forged_attestation
         archived = saved_turn(h, turn.binding.job_id)
         assert archived.skill_draft_receipt is None and archived.skill_draft_outcome is None
         assert archived.capability_assembly is None and archived.prompt_assembly == assemble_prompt(profile).record
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -230,7 +228,6 @@ def test_skillify_unknown_upload_never_resends_original_bytes(assistant, monkeyp
                 "conversation_id": turn.assignment.task.instruction.conversation_id, "content": "Continue.",
             })
             assert follow.status_code == 409 and follow.json()["error"]["code"] == "SKILL_DRAFT_OUTCOME_UNKNOWN"
-        check_history(h)
     finally:
         turn.client.close()
 
@@ -266,7 +263,6 @@ def test_removing_skillify_disables_followup_writer_without_rewriting_saved_work
             "authorize_own_result": True,
         })
         assert reconciled.status_code == 200 and h.store._guard() == before
-        check_history(h)
     finally:
         first.client.close()
         if follow is not None:
@@ -378,4 +374,3 @@ def test_selected_skillify_registers_exact_tools_and_draft_description(assistant
         assert draft.startswith(hosted.SKILLIFY_DRAFT_DESCRIPTION)
     assert "begin the purpose with that name" in draft
     assert json.loads(draft.split("Server-selected target metadata only:\n", 1)[1])["target_approved"] is False
-    check_history(h)

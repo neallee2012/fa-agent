@@ -31,7 +31,7 @@ from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from test_capability_capture import CATALOG, FILES, GRANTS, WEB_TOOLS, fake_services, refs
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn
 from test_instruction_responses_native import response_bytes
 from test_m2_copilot import runtime_path
@@ -240,6 +240,5 @@ def test_paused_compaction_preserves_followup_and_refreshes_next_prefix(
         assert requests[0]["prefix_sha256"] == requests[2]["prefix_sha256"]
         assert requests[3]["prefix_sha256"] != requests[2]["prefix_sha256"]
         assert service_calls == []
-        check_history(h)
     finally:
         compact_released.set()

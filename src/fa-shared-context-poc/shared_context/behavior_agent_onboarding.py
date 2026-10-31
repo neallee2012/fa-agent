@@ -28,10 +28,7 @@ from .behavior_operations import _Model, _parse, _row, _write, control_key
 from .behavior_skill_catalog import CatalogBudgetProfile
 from .behavior_store import ControlChanges, ControlRequest
 from .behavior_team_authority import TeamAuthority, team_authority_key
-from .behavior_team_registry import (
-    IdentityRegistration, Oid, TeamAgent, TeamAgentRetired, TeamAgents, _release_request, _release_result,
-    identity_key, roster_key,
-)
+from .behavior_team_registry import IdentityRegistration, Oid, TeamAgent, TeamAgents, identity_key, roster_key
 from .behavior_turn_origin import TurnOriginProfile
 from .behavior_wire import Command, Digest
 from .errors import Problem
@@ -933,97 +930,3 @@ def console_connection(composition, principal, agent_id):
 
 
 # ----- startup history --------------------------------------------------------------------------------------
-
-
-def validate_onboarding_history(view_, inventory, config, classified):
-    """Recognize onboarding/name/pending rows and every original step receipt of each onboarding."""
-    from .behavior_team_registry import agent_key
-    identity = config.identity
-    domain = config.table.scope.authority_domain
-    tenant, team = str(identity.tenant_id), identity.team_id
-    onboardings, names, pendings, attempts = {}, {}, {}, {}
-    for key, row in inventory.rows.items():
-        kind = row.payload["data"].get("kind")
-        if kind == "team_agent_onboarding":
-            onboardings[key] = view_.row(key, TeamAgentOnboarding)
-        elif kind == "team_agent_name":
-            names[key] = view_.row(key, TeamAgentName)
-        elif kind == "team_agent_pending":
-            pendings[key] = view_.row(key, TeamAgentPending)
-        elif kind == "team_agent_create_attempt":
-            attempts[key] = view_.row(key, TeamAgentCreateAttempt)
-
-    def invalid(message):
-        raise Problem(409, "TEAM_REGISTRY_INVALID", message)
-
-    by_rid = {}
-    for key, value in onboardings.items():
-        if (key != onboarding_key(value.tenant_id, value.team_id, value.request_id)
-                or (value.tenant_id, value.team_id) != (tenant, team)
-                or value.agent_name != derived_names(tenant, team, value.request_id)["agent_name"]):
-            invalid("a retained onboarding differs from its original scope")
-        chain = (*_CHAIN[:_CHAIN.index(value.state) + 1],) if value.state != "failed" else (
-            "admitted", "creating", "failed")
-        for state in chain:
-            image = TeamAgentOnboarding.model_validate_json(json.dumps({
-                **value.model_dump(mode="json"), "state": state,
-                "target": value.model_dump(mode="json").get("target") if state in {"registered", "ready"} else None,
-                "registered_at": value.model_dump(mode="json").get("registered_at")
-                if state in {"registered", "ready"} else None,
-                "reason": value.reason if state == "failed" else None,
-            }))
-            request = (_admit_request(image, domain) if state == "admitted" else _step_request(image, state))
-            writes = request.read_set[:3] if state == "admitted" else request.read_set
-            view_.receipt(request, writes, exact={key: view_.image_hash(key, image)}, result=_result(image))
-        if value.state in {"registered", "ready"}:
-            akey = agent_key(tenant, value.target.agent_id)
-            agent = inventory.rows.get(akey)
-            data = None if agent is None else agent.payload["data"]
-            if (data is None or data.get("request_id") != value.request_id
-                    or data.get("target") != value.target.model_dump(mode="json")):
-                invalid("a registered onboarding lacks its original Team agent registration")
-        by_rid[value.request_id] = value
-    pkey = pending_key(tenant, team)
-    for key, value in pendings.items():
-        if key != pkey or (value.tenant_id, value.team_id) != (tenant, team):
-            invalid("a retained pending list differs from its original Team")
-    waiting = set() if pkey not in pendings else set(pendings[pkey].request_ids)
-    # A stuck 'registered' onboarding left the list in its Agent's retire CAS (checked by the registry history), or,
-    # under a tombstone written without it (also one left admitted or creating), in its own release CAS.
-    retired = {value.agent_id: value for value in classified.values() if isinstance(value, TeamAgentRetired)}
-    agents = {value.request_id: value.agent_id for value in classified.values() if isinstance(value, TeamAgent)}
-    released = {value.onboarding_request_id for value in retired.values()}
-    for rid, value in by_rid.items():
-        tombstone = retired.get(agents.get(rid)) if value.state not in {"ready", "failed"} else None
-        if tombstone is not None and tombstone.onboarding_request_id is None and rid not in waiting:
-            view_.receipt(_release_request(tombstone, rid), (pkey,), result=_release_result(tombstone, rid))
-            released.add(rid)
-    open_ = {rid for rid, value in by_rid.items() if value.state not in {"ready", "failed"} and rid not in released}
-    if waiting != open_:
-        invalid("the pending onboarding list differs from the open onboardings")
-    for key, value in names.items():
-        owner = by_rid.get(value.request_id)
-        if (key != name_key(tenant, team, value.display_name) or (value.tenant_id, value.team_id) != (tenant, team)
-                or owner is None or owner.display_name != value.display_name
-                or value.active == (owner.state == "failed")):
-            invalid("a retained agent name differs from its original onboarding")
-    for value in by_rid.values():
-        nkey = name_key(tenant, team, value.display_name)
-        if value.state != "failed" and (nkey not in names or names[nkey].request_id != value.request_id):
-            invalid("an onboarding lacks its original agent name")
-    claimed = {}
-    for key, claim in attempts.items():
-        owner = by_rid.get(claim.request_id)
-        if (key != attempt_key(tenant, team, claim.request_id, claim.attempt)
-                or (claim.tenant_id, claim.team_id) != (tenant, team) or owner is None or owner.state == "admitted"):
-            invalid("a retained create attempt differs from its original onboarding")
-        view_.receipt(_attempt_request(owner, claim), (key,), exact={key: view_.image_hash(key, claim)},
-                      result=_attempt_result(claim))
-        claimed.setdefault(claim.request_id, set()).add(claim.attempt)
-    if any(numbers != set(range(1, len(numbers) + 1)) for numbers in claimed.values()):
-        invalid("retained create attempts are not contiguous")
-    classified.update(onboardings)
-    classified.update(names)
-    classified.update(pendings)
-    classified.update(attempts)
-    return classified

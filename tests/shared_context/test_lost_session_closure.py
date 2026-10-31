@@ -14,7 +14,7 @@ from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_foundry import (
     SESSION_LOST, STOP_ACCEPTED, FoundryExecutor, _NativeLaunch, _TargetReservation, lost_session_failure, native_key,
 )
-from shared_context.behavior_migration import MigrationStore, _quiescence, installed_origin
+from shared_context.behavior_migration import MigrationStore, installed_origin
 from shared_context.behavior_operations import _parse
 from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
@@ -75,8 +75,7 @@ def readers(c):
         except Problem as error:
             return error.body["error"]["code"]
     store = MigrationStore(c.h.composition.clients[0], c.h.config.table.scope)
-    return (outcome(lambda: read_startup(c)), outcome(lambda: _quiescence(store.read_inventory(), c.h.config)),
-            outcome(lambda: installed_origin(store, c.h.config)))
+    return (outcome(lambda: read_startup(c)), outcome(lambda: installed_origin(store, c.h.config)))
 
 
 def launch_rows(c, binding):

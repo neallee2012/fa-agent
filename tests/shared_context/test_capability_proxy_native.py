@@ -30,7 +30,7 @@ from shared_context.errors import Problem
 from test_behavior_assistant import assistant
 from test_capability_capture import CATALOG, GRANTS, WEB_TOOLS, choose
 from test_conversation_profile_selection import configured
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -150,5 +150,4 @@ def test_pinned_runtime_calls_a_captured_api_capability_through_the_fa_proxy(ass
     archive = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
     assert archive.capability_assembly == combined.record
     assert KEY not in json.dumps([r["system"] for r in requests])
-    check_history(h)
     assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"

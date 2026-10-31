@@ -26,10 +26,7 @@ from shared_context.behavior_operations import control_key
 from shared_context.behavior_workers import worker_key
 from shared_context.source_materials import digest
 from test_behavior_assistant_sse import stream
-from test_behavior_assistant_acquire_conflicts import native_acquire, current_rotation
-from test_behavior_rotation_cutoff import two_rotations
-from test_behavior_rotation_settlement_history import current_cancelled
-from test_behavior_runtime_rotation import rotated
+from test_behavior_assistant_acquire_conflicts import installed_assistant, native_acquire
 from test_behavior_assistant_claim_boundaries import reviewed
 from test_m3_auth import jwk_client, signing_key
 
@@ -445,19 +442,6 @@ def test_cancelled_provider_wait_never_posts_after_sync_dependency_returns(monke
         assert server.seen == []
 
 
-@pytest.fixture
-def sixteen_queries(monkeypatch):
-    import test_behavior_runtime_transition as transition
-    from shared_context.behavior_server_config import ServerConfiguration
-    original = transition.synthetic_configuration
-    def configuration():
-        raw = original().model_dump(mode="json")
-        raw["workers"].update(queries_per_generation=16, control_units=16)
-        return ServerConfiguration.model_validate_json(json.dumps(raw))
-    monkeypatch.setattr(transition, "synthetic_configuration", configuration)
-
-
-@pytest.mark.usefixtures("sixteen_queries")
 def test_capacity_uncertain_and_elapsed_lease_do_not_invent_execution_revocation(native_acquire):
     c = native_acquire
     reviewed(c)
@@ -478,7 +462,7 @@ def test_capacity_uncertain_and_elapsed_lease_do_not_invent_execution_revocation
     for _ in range(workers.contract.queries_per_generation):
         workers.reconcile(binding.job_id, binding.owner)
     job = workers.inspect(binding.job_id)
-    assert job.state == "capacity_uncertain" and job.queries_reserved == 16
+    assert job.state == "capacity_uncertain" and job.queries_reserved == 8
     pool_key = worker_key("pool", c.config.workers.workspace_id)
     pool = c.store.read_snapshot((pool_key,))[pool_key].payload["data"]
     from datetime import datetime
@@ -486,7 +470,7 @@ def test_capacity_uncertain_and_elapsed_lease_do_not_invent_execution_revocation
     c.hosted.reserve_model(digest(BODY))
     assert c.hosted.context().item_count == 3
     assert workers.inspect(binding.job_id).state == "capacity_uncertain"
-    assert workers.inspect(binding.job_id).queries_reserved == 16
+    assert workers.inspect(binding.job_id).queries_reserved == 8
     assert c.store.read_snapshot((pool_key,))[pool_key].payload["data"] == pool
 
 

@@ -95,18 +95,6 @@ def test_completed_inventory_logs_numeric_capacity_once(caplog, monkeypatch, max
     assert table.backing.rows == before
 
 
-def test_historical_snapshot_does_not_repeat_live_inventory_log(caplog):
-    from shared_context.behavior_runtime_rotation import _snapshot_store
-
-    store, _ = store_with_row()
-    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
-        live = store.read_inventory(log_capacity=True)
-        replay = _snapshot_store(store, live, SimpleNamespace(sha256="b" * 64)).read_inventory()
-    assert replay.rows == live.rows and replay.receipts == live.receipts
-    records = [record for record in caplog.records if record.message.startswith("BEHAVIOR_INVENTORY_READ ")]
-    assert len(records) == 1
-
-
 @pytest.mark.parametrize("limits", [{"max_entities": 1}, {"max_bytes": 1}, {"max_pages": 1}])
 def test_incomplete_inventory_does_not_log_success(caplog, limits):
     store, _ = store_with_row()
@@ -150,11 +138,6 @@ def test_runtime_inventory_can_exceed_legacy_count_without_losing_byte_or_page_b
     assert len(store.read_inventory().entity_sha256) == 4098
     inventory = store.read_inventory(max_entities=None)
     assert len(inventory.entity_sha256) == 4098 and len(table.submissions) == writes
-    from shared_context.behavior_recovery_history import validate_recovery_history
-    with pytest.raises(Problem):
-        validate_recovery_history(inventory, None, max_entities=4096)
-    assert dict(validate_recovery_history(inventory, None)) == {}
-    assert dict(validate_recovery_history(inventory, None, max_entities=None)) == {}
     for limits in ({"max_bytes": 1024}, {"max_pages": 1}):
         with pytest.raises(Problem) as bounded:
             store.read_inventory(max_entities=None, **limits)

@@ -480,21 +480,3 @@ def test_native_admission_never_wakes_an_idle_legacy_conversation_session(assist
     finally:
         client.close()
 
-
-def test_routine_version_failures_do_not_consume_the_manual_cancellation_limit():
-    from shared_context.behavior_migration import _UnclaimedFence
-    from shared_context.behavior_recovery_history import _check_unclaimed_fence_limit
-    manual = _UnclaimedFence(
-        launch_id="manual-original", original_start_request_id="manual-start",
-        cancel_requested=True, claim_never_issued=True, no_provider_stop_claim=True,
-    )
-    failures = tuple(_UnclaimedFence(
-        launch_id=f"version-{number}", original_start_request_id=f"start-{number}",
-        cancel_requested=False, claim_never_issued=True, no_provider_stop_claim=True,
-        failure_code=SESSION_VERSION_CHANGED, observed_agent_version="999",
-    ) for number in range(33))
-    _check_unclaimed_fence_limit(failures)
-    _check_unclaimed_fence_limit((*failures, *(manual for _ in range(32))))
-    with pytest.raises(Problem) as limited:
-        _check_unclaimed_fence_limit((*failures, *(manual for _ in range(33))))
-    assert limited.value.body["error"]["code"] == "MIGRATION_RECOVERY_HISTORY_INVALID"

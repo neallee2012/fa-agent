@@ -13,15 +13,14 @@ import pytest
 from pydantic import ValidationError
 
 from conftest import A, B, C, InMemoryRepository, TENANT
-from shared_context.behavior_agent_control import AgentControlRelay
-from shared_context.behavior_agent_worker import AgentTurnAddress, AgentVmBinding
+from shared_context.behavior_agent_worker import AgentTurnAddress, AgentVmBinding, AgentWorkerContext
 from shared_context.behavior_assistant_wire import ArchiveUnavailable, Assignment, InstructionSubmit, InstructionTask, SdkStop, Task
 from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_operations import control_key
 from shared_context.behavior_store import BehaviorStore, ControlChanges, ControlRequest, ControlWrite
 from shared_context.behavior_turn_receipts import (
     TurnReceiptStore, consumption_key, prepare_turn, start_key, ticket_handle, turn_key,
-    validate_sdk_checkpoint, validate_turn_receipt_history,
+    validate_sdk_checkpoint,
 )
 from shared_context.behavior_turn_usage import TurnModelUsage
 from shared_context.behavior_turn_wire import (
@@ -39,6 +38,10 @@ from shared_context.team_data_relay import TeamDataRelay
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 VERSION = "0123456789abcdef0123456789abcdef"
+
+
+def worker_context(vm, process_id, caller_oid):
+    return AgentWorkerContext(vm=vm, process_id=process_id, control_connection_id="connection-one", caller_oid=caller_oid)
 
 
 def ticket_for(vm, *, rid="rid-one", oid=A.oid, cid="conversation-one", issuer=HUMAN_OID, source="human",
@@ -70,17 +73,15 @@ def case():
         validate_checkpoint=lambda *_: pytest.fail("this fixture did not publish a checkpoint"))
     vm = AgentVmBinding(team_id=A.team, agent_id="agent-a", hosted_session_id="agent-session",
                         hosted_agent_version="41", vm_generation="session-generation-one")
-    control = AgentControlRelay(wait_seconds=0)
-    context = control.connect(vm, "process-one", A.oid)
+    context = worker_context(vm, "process-one", A.oid)
     human = BehaviorPrincipal(TENANT, HUMAN_OID, A.team, "human", None, frozenset({"read", "submit"}))
     agent = BehaviorPrincipal(TENANT, A.oid, A.team, "agent", A.actor, frozenset({"read", "submit", "execute"}))
-    c = SimpleNamespace(table=table, store=store, relay=relay, receipts=receipts, vm=vm, control=control,
+    c = SimpleNamespace(table=table, store=store, relay=relay, receipts=receipts, vm=vm,
                         context=context, human=human, agent=agent)
     c.ticket = ticket_for(vm)
     c.delivery = receipts.issue(c.ticket, human, expected_vm=vm)
     c.handle = ticket_handle(c.ticket)
     yield c
-    control.close()
 
 
 def begin(c, *, context=None):
@@ -319,36 +320,6 @@ def test_same_raw_request_id_in_another_team_has_a_distinct_ticket(case):
     assert c.receipts.read(c.agent, c.context, c.ticket.address).state == "issued"
 
 
-def test_ticket_start_cancel_and_consumption_are_readable_by_the_real_startup_classifier(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    ids = c.h.config.identity
-    target = c.h.config.active_targets[0]
-    vm = AgentVmBinding(team_id=ids.team_id, agent_id=target.agent_id, hosted_session_id="logical-agent-session",
-                        hosted_agent_version="41", vm_generation="logical-generation")
-    ticket = ticket_for(vm, oid=target.agent_oid, issuer=ids.human_oid, owner=ids.human_oid, tenant_id=ids.tenant_id)
-    relay = TeamDataRelay(InMemoryRepository(), InMemoryArtifactStore(ids.tenant_id), ids.tenant_id)
-    receipts = TurnReceiptStore(c.control.store, relay, validate_checkpoint=lambda *_: pytest.fail("no checkpoint"))
-    control = AgentControlRelay(wait_seconds=0)
-    context = control.connect(vm, "original-process", target.agent_oid)
-    actor = ids.auth().actors[target.agent_oid]
-    agent = BehaviorPrincipal(ids.tenant_id, actor.oid, actor.team, "agent", actor.actor,
-                              frozenset({"read", "execute", "submit"}))
-    try:
-        receipts.issue(ticket, c.human, expected_vm=vm)
-        started = receipts.begin(agent, context, BeginTurn(address=ticket.address, ticket=ticket_handle(ticket)))
-        receipts.cancel(agent, context, ticket.address)
-        end = TurnEnd(
-            ticket=ticket_handle(ticket), address=ticket.address,
-            start_sha256=digest(started.start.model_dump(mode="json")), outcome="cancelled",
-            result=None, checkpoint=None, sdk_stop=None, model_usage=None)
-        receipts.complete(agent, context, end)
-        receipts.consume_completion(agent, context, ticket.address)
-        inventory = read_startup(c)
-        assert len(validate_turn_receipt_history(inventory, c.h.config)) == 3
-    finally:
-        control.close()
-
-
 def test_hosted_receipt_modules_do_not_import_api_storage_or_the_sdk():
     code = """
 import importlib.abc
@@ -417,26 +388,22 @@ def test_actual_usage_recorder_commits_before_completion_and_is_not_called_on_re
     actor = c.h.config.identity.auth().actors[binding.agent_oid]
     agent = BehaviorPrincipal(binding.tenant_id, actor.oid, actor.team, "agent", actor.actor,
                               frozenset({"read", "execute", "submit"}))
-    control = AgentControlRelay(wait_seconds=0)
-    context = control.connect(vm, "original-process", actor.oid)
+    context = worker_context(vm, "original-process", actor.oid)
     relay = TeamDataRelay(InMemoryRepository(), InMemoryArtifactStore(binding.tenant_id), binding.tenant_id)
     receipts = TurnReceiptStore(c.control.store, relay, record_usage=partial(record_turn_usage, c.control),
                                validate_checkpoint=partial(validate_sdk_checkpoint, c.authority))
-    try:
-        receipts.issue(ticket, c.human, expected_vm=vm)
-        started = receipts.begin(agent, context, BeginTurn(address=address, ticket=ticket_handle(ticket)))
-        end = TurnEnd(
-            ticket=ticket_handle(ticket), address=address, start_sha256=started.start.sha256, outcome="cancelled",
-            result=None, checkpoint=None, sdk_stop=None,
-            model_usage=TurnModelUsage(schema_version="fa-turn-model-usage-v1", usage=()))
-        receipts.complete(agent, context, end)
-        consumed = receipts.consume_completion(agent, context, address)
-        usage = c.control.store.read_record(turn_usage_key(binding.job_id, rid))
-        assert usage.payload["data"]["rid"] == rid
-        assert usage.payload["data"]["job_id"] == binding.job_id
-        assert consumed.payload["result"]["usage_recorded"] is True
-        receipts.record_usage = lambda **_: pytest.fail("a retained completion needs no new usage operation")
-        assert receipts.consume_completion(agent, context, address) == consumed
-        read_startup(c)
-    finally:
-        control.close()
+    receipts.issue(ticket, c.human, expected_vm=vm)
+    started = receipts.begin(agent, context, BeginTurn(address=address, ticket=ticket_handle(ticket)))
+    end = TurnEnd(
+        ticket=ticket_handle(ticket), address=address, start_sha256=started.start.sha256, outcome="cancelled",
+        result=None, checkpoint=None, sdk_stop=None,
+        model_usage=TurnModelUsage(schema_version="fa-turn-model-usage-v1", usage=()))
+    receipts.complete(agent, context, end)
+    consumed = receipts.consume_completion(agent, context, address)
+    usage = c.control.store.read_record(turn_usage_key(binding.job_id, rid))
+    assert usage.payload["data"]["rid"] == rid
+    assert usage.payload["data"]["job_id"] == binding.job_id
+    assert consumed.payload["result"]["usage_recorded"] is True
+    receipts.record_usage = lambda **_: pytest.fail("a retained completion needs no new usage operation")
+    assert receipts.consume_completion(agent, context, address) == consumed
+    read_startup(c)

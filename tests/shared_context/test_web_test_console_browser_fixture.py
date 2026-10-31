@@ -81,9 +81,9 @@ def main():
     args = parser.parse_args()
     key = signing_key.__wrapped__()
     h = assistant_harness(auth.__wrapped__(), jwk_client.__wrapped__(key), key)
-    import test_teams_metrics
-    test_teams_metrics.TENANT = TENANT
-    executor = test_teams_metrics.SdkProtocolExecutor(h)
+    import assistant_sdk_fixture
+    assistant_sdk_fixture.TENANT = TENANT
+    executor = assistant_sdk_fixture.SdkProtocolExecutor(h)
     h.workers.adapter = executor.adapter()
     local = _LocalHttp(h.client)
     trace = []

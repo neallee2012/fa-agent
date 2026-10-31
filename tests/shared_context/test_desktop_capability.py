@@ -28,7 +28,7 @@ from test_behavior_assistant import assistant
 from test_behavior_desktop import FakeRunner
 from test_capability_capture import GRANTS, choose
 from test_conversation_profile_selection import configured
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -188,7 +188,6 @@ def test_pinned_runtime_edits_a_private_file_and_a_turn_without_the_grant_closes
         task = control.records[followed["binding_id"]].profile.instruction
         assert task.capabilities is None or task.capabilities.grants == ()
     assert len(requests) == 6
-    check_history(h)
 
 
 def test_a_release_during_another_desktop_turn_never_leaves_an_untracked_desktop(tmp_path, fake_desktop):

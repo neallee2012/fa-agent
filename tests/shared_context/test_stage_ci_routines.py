@@ -232,7 +232,8 @@ def test_guard_stops_when_the_api_clock_would_not_stay_resident(ci, monkeypatch,
     turn_on(ci)
     scale = {} if replicas == "missing" else {"minReplicas": replicas}
     monkeypatch.setattr(ci, "rest", lambda method, path, body=None: {"properties": {
-        "template": {"scale": scale}, "configuration": {"secrets": [{"name": "fa-feed-mcp-signing-key"}]},
+        "template": {"scale": scale, "containers": [{"env": [{"name": ci.API_CONFIG_ENV, "value": ci._config_bytes().decode()}]}]},
+        "configuration": {"secrets": [{"name": "fa-feed-mcp-signing-key"}]},
         "latestReadyRevisionName": ci.STAGE["api_app"] + "--abcdef1-r1-1"}})
 
     class PastTheClockCheck(Exception):

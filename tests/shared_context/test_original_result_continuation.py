@@ -13,13 +13,12 @@ from shared_context import behavior_wire as wire
 from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_assistant import AssistantRuntime
 from shared_context.behavior_delivery import (
-    DeliveryCore, RuntimeRegistration, RuntimeContract, ChannelContract, DeliveryConsumer, _Obligation,
+    DeliveryCore, RuntimeRegistration, RuntimeContract, ChannelContract, _Obligation,
 )
 from shared_context.behavior_inbox import PullInbox, InboxRegistration
-from shared_context.behavior_runtime import RuntimeBinding, RuntimeEvidenceAuthority, runtime_key
-from shared_context.behavior_store import BehaviorStore, AuthorityScope, _Guard, GUARD_KEY
+from shared_context.behavior_runtime import RuntimeBinding, RuntimeEvidenceAuthority
+from shared_context.behavior_store import BehaviorStore, AuthorityScope, GUARD_KEY
 from shared_context.behavior_work_policy import WorkPolicyControl, StandingPolicyInstallation, WorkRegistration, WorkRegistry
-from shared_context.behavior_workers import WorkerCore, WorkerContract
 from shared_context.errors import Problem
 from test_behavior_store import FakeTable, NativeEntity
 
@@ -93,7 +92,7 @@ def captured():
     runtime.store, runtime.mode, runtime.clock = store, "native", lambda: now
     runtime.bindings = MappingProxyType({installed.policy.template.binding_id: installed.policy.template})
     runtime.profiles = MappingProxyType({installed.policy.profile.binding_id: installed.policy.profile})
-    runtime.teams_metrics, runtime.work_policy = None, None
+    runtime.work_policy = None
     runtime.historical_binding_ids = frozenset()
     runtime.dep = SimpleNamespace(store=store, delivery=core, inbox=inbox, workers=worker,
                                  evidence=evidence, native_launches=None, source_backups=None, memory_projections=None)
@@ -140,29 +139,6 @@ def old_binding(h):
     return key, _parse(h.store.read_snapshot((key,))[key].payload["data"], _Outbox).binding
 
 
-def check_history(h):
-    from shared_context.behavior_migration import AuthorityInventory
-    from shared_context.behavior_result_delivery import validate_result_history
-    from shared_context.records import Record
-    rows, receipts, hashes = {}, {}, {}
-    guard = None
-    for (_, _, key), value in h.table.backing.rows.items():
-        raw = value["Payload"]
-        payload = json.loads(raw)
-        saved = Record(payload, value.metadata["etag"])
-        hashes[key] = hashlib.sha256(raw).hexdigest()
-        if key == GUARD_KEY:
-            guard = saved
-        elif key.startswith("behavior:v1:row:"):
-            rows[key.removeprefix("behavior:v1:row:")] = saved
-        elif key.startswith("behavior:v1:receipt:"):
-            receipts[key.removeprefix("behavior:v1:receipt:")] = saved
-    inventory = AuthorityInventory(h.store._scope, guard, rows, receipts, hashes)
-    config = SimpleNamespace(table=SimpleNamespace(scope=h.store._scope), sha256="f" * 64,
-        workers=SimpleNamespace(control_binding=h.store._binding), delivery=h.core.contract)
-    return validate_result_history(inventory, config, (h.binding,))
-
-
 def test_captured_saved_cancelled_result_must_be_readable_without_accepting_queued_notice(captured):
     from shared_context.behavior_result_delivery import append_saved_result
     from shared_context.behavior_operations import control_key
@@ -180,7 +156,6 @@ def test_captured_saved_cancelled_result_must_be_readable_without_accepting_queu
     repair = append_saved_result(h.runtime, h.binding.binding_id, h.command, h.principal, out.binding)
     assert repair.payload["result"]["version"] == 2
     assert h.store.read_snapshot((oldkey,))[oldkey] == old
-    assert check_history(h)
     before_missing = copy.deepcopy(h.table.backing.rows)
     with pytest.raises(Problem) as missing:
         h.runtime.reconcile_fetch(h.binding.binding_id, h.command, h.principal)
@@ -193,22 +168,10 @@ def test_captured_saved_cancelled_result_must_be_readable_without_accepting_queu
     assert json.loads(got.payload)["work_state"] == "cancelled"
     assert got.binding.version == 2 and got.send_outcome == "unknown"
     assert h.runtime.reconcile_fetch(h.binding.binding_id, h.command, h.principal) == got
-    assert check_history(h)
     before_replay = copy.deepcopy(h.table.backing.rows)
     assert h.runtime.continue_fetch(h.binding.binding_id, h.command, h.principal) == got
     assert append_saved_result(h.runtime, h.binding.binding_id, h.command, h.principal, out.binding) == repair
     assert h.table.backing.rows == before_replay
-    # A new record cannot enter current history with missing immutable material.
-    from shared_context.behavior_result_delivery import continuation_key
-    row_id = "behavior:v1:row:" + continuation_key(h.binding.binding_id)
-    entity = h.table.backing.rows[("Behavior", h.store._scope.partition_key, row_id)]
-    saved_bytes = entity["Payload"]
-    altered = json.loads(saved_bytes)
-    altered["material"] = None
-    entity["Payload"] = json.dumps(altered, separators=(",", ":")).encode()
-    with pytest.raises(Problem):
-        check_history(h)
-    entity["Payload"] = saved_bytes
     with pytest.raises(Problem):
         h.runtime.continue_fetch(h.binding.binding_id, wire.Command(request_id="another-fetch"), h.principal)
     # Every captured original except the obligation remains byte-for-byte
@@ -276,7 +239,6 @@ def test_cas_and_lost_append_or_fetch_response_use_same_receipt_without_resendin
     result = h.runtime.reconcile_fetch(h.binding.binding_id, h.command, h.principal)
     assert json.loads(result.payload)["work_state"] == "cancelled"
     assert len(h.table.submissions) == count
-    assert check_history(h)
 
 
 def test_http_original_id_continue_reconcile_and_explicit_ack_use_exact_v2_binding(captured, monkeypatch):
@@ -358,4 +320,3 @@ def test_http_original_id_continue_reconcile_and_explicit_ack_use_exact_v2_bindi
         accepted = client.post(base + "/acknowledge", content=command.model_dump_json(), headers=headers)
         assert accepted.status_code == 200, accepted.text
         assert accepted.json()["result"]["fulfillment"] == "fulfilled"
-        assert check_history(h)

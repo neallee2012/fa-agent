@@ -230,7 +230,7 @@ def read_transfer(control, transfer_id):
             or row.payload["material"] != _material(value.model_dump(mode="json")).model_dump(mode="json")):
         raise Problem(409, "CONVERSATION_TRANSFER_INVALID", "the immutable environment transfer differs")
     receipt = control.store.reconcile(value.request)
-    from .behavior_runtime_transition import _payload_hash
+    from .source_materials import _payload_hash
     if dict(receipt.payload["writes"]).get(transfer_id) != _payload_hash(row.payload):
         raise Problem(409, "CONVERSATION_TRANSFER_INVALID", "the original transfer reservation differs")
     return value
@@ -248,7 +248,7 @@ def _access(control, principal, value):
 
 def _completed(control, value):
     from .behavior_store import _Receipt, _Row
-    from .behavior_runtime_transition import _payload_hash
+    from .source_materials import _payload_hash
     request = _apply_request(value)
     stored = control.store._read("behavior:v1:receipt:" + request.request_id, _Receipt)
     if stored is None:
@@ -346,107 +346,6 @@ def ready_conversation(value):
         "hosted_session_id": value.target.session_id, "hosted_agent_version": value.target.agent_version,
         "active_job_id": None,
     })
-
-
-def validate_history(view, records):
-    from types import SimpleNamespace
-    from .behavior_foundry import _NativeEvidence, _NativeLaunch, NativeLaunchAuthority
-    from .behavior_instruction import sdk_session_id
-    from .behavior_work_policy import work_policy_key
-    by_job = {record.binding.job_id: record for record in records}
-    scope = view.config.table.scope.authority_domain
-    control = SimpleNamespace(
-        policy_key=work_policy_key("policy", scope), revocation_key=work_policy_key("revocation", scope),
-        cost_key=work_policy_key("cost", scope),
-    )
-    transfers, ordered = {}, {}
-    def require(condition):
-        if not condition:
-            raise Problem(409, "CONVERSATION_TRANSFER_INVALID", "the original environment transfer history differs")
-    for key, row in view.inventory.rows.items():
-        if row.payload["data"].get("kind") != "conversation_environment_transfer":
-            continue
-        value = view.row(key, EnvironmentTransfer, material=True)
-        record = by_job.get(value.command.failed_job_id)
-        require(record is not None and record.profile.instruction is not None)
-        task, binding = record.profile.instruction, record.binding
-        conversation = value.source
-        job = view.row(worker_key("job", binding.job_id), JobRecord)
-        archive = view.row(conversation.archive_id, TurnArchive)
-        prefix = sorted((r for r in records if r.profile.instruction is not None
-                         and r.profile.instruction.conversation_id == conversation.conversation_id
-                         and r.profile.instruction.turn_number <= task.turn_number),
-                        key=lambda r: r.profile.instruction.turn_number)
-        require(
-            key == value.transfer_id == transfer_key(conversation.conversation_id, binding.job_id)
-            and conversation.jobs == tuple(r.binding.job_id for r in prefix)
-            and conversation.jobs[-1] == binding.job_id
-            and conversation.active_job_id in {None, binding.job_id} and conversation.reset_request_id is None
-            and conversation.sdk_session_id == sdk_session_id(task.conversation_id)
-            and (conversation.human_oid, conversation.team_id, conversation.agent_oid) ==
-                (binding.human_oid, binding.team_id, binding.agent_oid)
-            and value.requested_by == record.principal_oid == conversation.human_oid
-            and value.policy_sha256 == record.policy_sha256
-            and value.profile_digest == digest(record.profile.model_dump(mode="json"))
-            and conversation.hosted_session_id == record.hosted_session_id
-            and conversation.hosted_agent_version == task.hosted_agent_version
-            and conversation.archive_id == task.previous_archive_id and _archive_matches(value, archive)
-            and job.state == "failed" and job.result_forwarded and job.binding is not None
-            and value.target.agent_oid == binding.agent_oid
-            and value.target.agent_version == value.command.expected_agent_version
-            and value.target.session_id == "fa-move-" + control_key(
-                "conversation-environment-session", conversation.conversation_id,
-                value.command.failed_job_id, value.command.request_id)[:48]
-        )
-        launch_id = native_key("launch-id", job.binding.start_request_id)
-        launch = view.row(native_key("launch", launch_id), _NativeLaunch)
-        evidence = view.row(native_key("evidence", native_key("unclaimed-fence-evidence", launch_id)),
-                            _NativeEvidence, material=True)
-        fence = view.inventory.rows.get(native_key("unclaimed-fence", launch_id))
-        NativeLaunchAuthority._verify_unclaimed_fence(None, launch, evidence, fence)
-        require(evidence.evidence.state == "failed" and launch.start.binding == job.binding
-                and launch.target == value.target.model_copy(update={
-                    "session_id": conversation.hosted_session_id, "agent_version": conversation.hosted_agent_version}))
-        source = _Source(conversation, job, record, archive)
-        expected = ControlRequest(
-            request_id=key, request_digest=digest([conversation.conversation_id, value.command.model_dump(mode="json")]),
-            read_set=_keys(control, source, key),
-        )
-        require(value.request == expected)
-        reservation = view.receipt(expected, (key,), exact={key: view.hash(key)}, result={"transfer_reserved": True})
-        application = _apply_request(value)
-        applied = view.receipts.get(application.request_id)
-        if applied is not None:
-            ckey, hkey = conversation_key(conversation.conversation_id), head_key(conversation.conversation_id)
-            view.receipt(application, (ckey, hkey), exact={
-                ckey: view.image_hash(ckey, ready_conversation(value)),
-                hkey: view.image_hash(hkey, EnvironmentHead(transfer_id=key)),
-            }, result=_result(value, "ready").model_dump(mode="json"))
-            require(reservation.guard_revision < applied.guard_revision)
-        ordered.setdefault(conversation.conversation_id, []).append((reservation.guard_revision, value, applied))
-        transfers[key] = value
-    for identifier, entries in ordered.items():
-        previous = None
-        applied_revision = 0
-        for revision, value, applied in sorted(entries, key=lambda item: item[0]):
-            require(value.previous_transfer_id == previous and applied_revision < revision)
-            if applied is not None:
-                previous = value.transfer_id
-                applied_revision = applied.guard_revision
-        hkey = head_key(identifier)
-        if previous is None:
-            require(hkey not in view.inventory.rows)
-        else:
-            require(view.row(hkey, EnvironmentHead).transfer_id == previous)
-    for key, row in view.inventory.rows.items():
-        if row.payload["data"].get("kind") == "conversation_environment_head":
-            head = view.row(key, EnvironmentHead)
-            require(head.transfer_id in transfers and key == head_key(transfers[head.transfer_id].source.conversation_id))
-    return transfers
-
-
-def history_ready(view, value):
-    return _apply_request(value).request_id in view.receipts
 
 
 def preview(control, authority, principal, identifier):

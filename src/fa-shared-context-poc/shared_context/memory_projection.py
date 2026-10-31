@@ -20,7 +20,7 @@ lost. Only the invocation that definitely committed a fresh intent can send.
 Reconciliation is read-only. There is no retry, repair, supplied update ID,
 continuation token, or background poller. A crash before sending can therefore
 leave an unknown forever; this is deliberate, not permission to resubmit.
-Poll slots are durable and finite, independent of the model-repair allowance.
+Poll slots are durable and finite.
 
 SDK contract: azure-ai-projects 2.3.0 BetaMemoryStoresOperations public
 begin_update_memories(polling=False), search_memories; authenticated send_request

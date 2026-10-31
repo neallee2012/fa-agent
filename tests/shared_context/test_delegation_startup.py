@@ -81,18 +81,6 @@ def test_delegation_intent_result_usage_and_stop_facts_survive_startup(
     assert all(after.receipts[key] == row for inventory in stages for key, row in inventory.receipts.items())
 
 
-def test_typed_receipted_state_without_an_original_parent_intent_does_not_pass_startup(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    key = state_key("unregistered-delegation")
-    request = ControlRequest(request_id="synthetic-orphan-state", request_digest="a" * 64, read_set=(key,))
-    orphan = DelegationState(delegation_id="unregistered-delegation", request=request)
-    c.h.runtime.store.transact(request, lambda _: ControlChanges(
-        writes=(ControlWrite(row_id=key, mode="create", data=orphan.model_dump(mode="json")),),
-        result={"synthetic_invalid_state": True}))
-    with pytest.raises(Problem):
-        read_startup(c)
-
-
 def test_captured_delegation_api_and_child_model_link_remain_readable_at_startup(synthetic_standing_v1, monkeypatch):
     from shared_context import behavior_delegation_api as api
     from shared_context.behavior_capabilities import available_grants

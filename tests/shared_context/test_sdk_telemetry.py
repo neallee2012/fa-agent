@@ -545,6 +545,11 @@ def test_hosted_log_export_sends_only_the_listed_prefixes_of_the_listed_loggers(
         private.warning("FA_NATIVE_ASSEMBLY_PARTIAL reason=observer_failed exception_type=%s", LOG_CANARY)
         cosmos.warning("%s status=transport_error", "FA_PRIVATE_MEMORY_UPDATE", exc_info=ValueError(LOG_CANARY))
         logging.getLogger("shared_context.memory_relay").warning("FA_PRIVATE_MEMORY_UPDATE %s", LOG_CANARY)  # API side
+        toolbox = logging.getLogger("shared_context.native_toolbox")
+        toolbox.warning("NATIVE_TOOLBOX_FAILED method=%s stage=%s code=%s reason=%s", "tools/list", "request",
+                        "NATIVE_CAPABILITY_UNKNOWN", "deadline;call_id=absent")
+        toolbox.warning("FA_NATIVE_TOOL_SOURCE_UNAVAILABLE agent_id=%s", LOG_CANARY)  # names the Agent and the turn
+        toolbox.warning("NATIVE_TOOLBOX_CALL_FAILED agent_id=%s", LOG_CANARY)  # the prefix ends with its space
         assert provider.force_flush(10000)
     finally:
         provider and provider.shutdown()
@@ -554,7 +559,7 @@ def test_hosted_log_export_sends_only_the_listed_prefixes_of_the_listed_loggers(
 
     logs = [item for item in telemetry.items if item["data"]["baseType"] == "MessageData"]
     messages = [item["data"]["baseData"]["message"] for item in logs]
-    assert len(messages) == 12, messages
+    assert len(messages) == 13, messages
     timing = json.loads(messages[0].removeprefix("FA_TIMING "))
     assert (timing["phase"], timing["job_id"], timing["outcome"]) == ("sdk_process_start", "0123456789ab", "returned")
     assert messages[1:] == [
@@ -570,7 +575,9 @@ def test_hosted_log_export_sends_only_the_listed_prefixes_of_the_listed_loggers(
         "FA_TEAM_MEMORY_SEARCH status=404 mode=contextual",
         "FA_PRIVATE_MEMORY_INACTIVE reason=api_unavailable",
         "FA_PRIVATE_MEMORY_USAGE_UNREPORTED rid_prefix=0123abcd reason=no_reporter",
-        "FA_TEAM_MEMORY_INACTIVE reason=store_unavailable"]
+        "FA_TEAM_MEMORY_INACTIVE reason=store_unavailable",
+        "NATIVE_TOOLBOX_FAILED method=tools/list stage=request code=NATIVE_CAPABILITY_UNKNOWN "
+        "reason=deadline;call_id=absent"]
     assert {item["tags"]["ai.cloud.role"] for item in logs} == {"fa-test-agent"}
     assert LOG_CANARY not in json.dumps(telemetry.items)
 

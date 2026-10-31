@@ -1704,42 +1704,6 @@ class AssistantSupervisor:
 
 
 class AssistantHostedRuntime(HostedRuntime):
-    def agent_control_client(self, binding, consumer, *, caller_oid, transport=None):
-        from .behavior_agent_control import AgentControlClient
-
-        worker = self.bind_agent_worker(binding, consumer, caller_oid=caller_oid)
-
-        def token():
-            if self.api.credential is None:
-                raise Problem(403, "HOSTED_MI_DISABLED", "the original Hosted API credential is required")
-            try:
-                return self.api.credential.get_token(self.api.audience + "/.default").token
-            except Exception as error:
-                raise Problem(503, "HOSTED_MI_UNAVAILABLE", "the original API credential is unavailable",
-                              exception_type=_exception_type(error)) from None
-
-        return AgentControlClient(self.api.api_url, worker, token_provider=token, transport=transport)
-
-    def bind_agent_worker(self, binding, consumer, *, caller_oid):
-        from .behavior_agent_worker import AgentVmBinding, AgentWorkerControl
-
-        if (not isinstance(binding, AgentVmBinding) or not isinstance(self.supervisor, AssistantSupervisor)
-                or (binding.agent_id, binding.hosted_session_id, binding.hosted_agent_version) !=
-                (self.identity.agent_id, self.identity.session_id, self.identity.agent_version)):
-            raise Problem(403, "AGENT_WORKER_BINDING_CHANGED", "the control binding differs from this Hosted process")
-        with self.lock:
-            worker = getattr(self, "agent_worker", None)
-            if worker is not None:
-                if (worker.binding != binding or worker.consumer is not consumer
-                        or worker.caller_oid != caller_oid):
-                    raise Problem(409, "AGENT_WORKER_BINDING_CHANGED", "the original worker binding cannot be replaced")
-                return worker
-            worker = AgentWorkerControl(
-                binding, consumer, process_id=self.supervisor.supervisor_id, caller_oid=caller_oid,
-            )
-            self.agent_worker = worker
-            return worker
-
     def keepalive(self, invocation_id, session_id, launch_id):
         self._native(invocation_id, session_id)
         if not isinstance(self.supervisor, AssistantSupervisor):

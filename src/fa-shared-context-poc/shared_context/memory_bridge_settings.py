@@ -149,7 +149,7 @@ def settings_result(record):
 
 
 def read_memory_settings(store, policy, identifier):
-    from .behavior_runtime_transition import _payload_hash
+    from .source_materials import _payload_hash
 
     row = store.read_snapshot((identifier,))[identifier]
     if row is None:
@@ -181,7 +181,7 @@ def read_memory_settings(store, policy, identifier):
 
 
 def current_memory_settings(store, policy):
-    from .behavior_runtime_transition import _payload_hash
+    from .source_materials import _payload_hash
 
     key = settings_head_key(policy.authority_domain, policy.agent_scope)
     row = store.read_snapshot((key,))[key]
@@ -323,120 +323,6 @@ def human_memory_source_write(runtime, binding, source_id, principal):
     capture = None if record is None else record.profile.memory_scope
     if capture is not None and capture.enabled and source_id == memory_slot_ids(record.admission_id)[0]:
         control._human(principal, "approve")
-
-
-def captured_memory_read_keys(policy, capture, *, first_turn, records):
-    """Reconstruct only this feature's original admission predicates for history readers."""
-    from .behavior_runtime import runtime_key
-    from .behavior_work_policy import work_policy_key
-    from .behavior_profile_selection import selection_key
-    from .memory_governance import ClaimReference
-    from .source_materials import SourceReference, SourceScope
-
-    keys = [settings_head_key(policy.authority_domain, policy.agent_scope)] if first_turn else []
-    if capture is None:
-        return set(keys)
-    keys.append(capture.settings_id)
-    if first_turn and capture.recall is not None:
-        origin = next((record for record in records
-                       if record.binding.binding_id == capture.recall.origin_binding_id), None)
-        if origin is None:
-            raise Problem(409, "MEMORY_SETTINGS_INVALID", "the original note work is missing from retained history")
-        if origin.agent_scope != policy.agent_scope:
-            raise Problem(409, "MEMORY_SETTINGS_INVALID", "the selected note history belongs to another agent scope")
-        b, source = origin.binding, capture.recall.source
-        keys.extend((
-            runtime_key("policy", b.binding_id), control_key("owner", b.owner.owner_record_id),
-            control_key("policy", b.owner.policy_id), control_key("budget", b.owner.root_budget_id),
-            work_policy_key("policy", *policy.scope_ids), work_policy_key("revocation", *policy.scope_ids),
-            work_policy_key("registration", origin.admission_id),
-        ))
-        if origin.profile_selection_id is not None:
-            keys.append(selection_key(policy.authority_domain, origin.profile_selection_id, policy.agent_id))
-        if origin.profile.memory_scope is not None:
-            keys.append(origin.profile.memory_scope.settings_id)
-        scope = SourceScope(tenant_id=b.tenant_id, team_id=b.team_id, visibility="team")
-        reference = ClaimReference(scope=scope, subject=b.subject, claim_id=source.claim_id,
-                                   version=source.claim_version, sha256=source.claim_sha256)
-        keys.extend((control_key("memory-subject", scope.key, b.subject), reference.key,
-                     control_key("source-human-review", scope.key, source.claim_sha256, source.review_policy_version),
-                     control_key("source-human-revocation", scope.key, source.claim_sha256)))
-        for item in source.sources:
-            ref = SourceReference(scope=scope, **item.model_dump())
-            keys.extend((ref.key, ref.head_key))
-    return set(keys)
-
-
-def validate_memory_settings_history(inventory, config, policy):
-    from .behavior_agent_registry import AgentScopeRegistry, validate_agent_registry_history
-    from .behavior_recovery_history import _Inventory
-    from .behavior_work_policy import StandingPolicyInstallation, work_policy_key
-
-    view = _Inventory(inventory, config)
-    legacy = view.row(work_policy_key("policy", policy.authority_domain), StandingPolicyInstallation, material=True).policy
-    policies = {legacy.sha256: legacy}
-    for value in validate_agent_registry_history(inventory, config).values():
-        if isinstance(value, AgentScopeRegistry):
-            policies[value.policy.sha256] = value.policy
-    if policies.get(policy.sha256) != policy:
-        raise Problem(409, "MEMORY_SETTINGS_INVALID", "the requested memory scope has no original registered policy")
-    grouped = {identifier: {} for identifier in policies}
-    heads = {settings_head_key(value.authority_domain, value.agent_scope) for value in policies.values()}
-    for key, row in inventory.rows.items():
-        kind = row.payload["data"].get("kind")
-        if kind == "new_conversation_memory_settings":
-            record = view.row(key, MemoryBridgeSettingsRecord, material=True)
-            if record.policy_sha256 not in grouped:
-                raise Problem(409, "MEMORY_SETTINGS_INVALID", "memory settings have no original registered scope")
-            grouped[record.policy_sha256][key] = record
-        elif kind == "new_conversation_memory_settings_head" and key not in heads:
-            raise Problem(409, "MEMORY_SETTINGS_INVALID", "memory head has no original registered scope")
-    choices = {
-        identifier: _validate_memory_scope_history(view, inventory, value, grouped[identifier])
-        for identifier, value in policies.items()
-    }
-    return choices[policy.sha256]
-
-
-def _validate_memory_scope_history(view, inventory, policy, records):
-    from .behavior_work_policy import work_policy_key
-
-    choices = {}
-    head_key = settings_head_key(policy.authority_domain, policy.agent_scope)
-    for key, record in records.items():
-        if (key != settings_key(policy.authority_domain, record.command.request_id, policy.agent_scope)
-                or record.settings_id != key or record.selected_by != policy.template.human_oid
-                or record.policy_sha256 != policy.sha256
-                or record.request.request_id != key
-                or record.request.request_digest != digest([policy.sha256, record.selected_by,
-                                                           record.command.model_dump(mode="json")])
-                or not {work_policy_key("policy", *policy.scope_ids),
-                        work_policy_key("revocation", *policy.scope_ids), key, head_key} <= set(record.request.read_set)
-                or (record.command.recall is None) != (record.selected_source is None)):
-            raise Problem(409, "MEMORY_SETTINGS_INVALID", "retained memory setting escaped its original human scope")
-        capture = ConversationMemoryCapture(
-            settings_id=key, enabled=record.command.enabled,
-            recall=None if record.command.recall is None else CapturedReviewedNote(
-                origin_binding_id=record.command.recall.origin_binding_id, source=record.selected_source))
-        validate_capture_record(policy, capture, record)
-        pointer = MemoryBridgeSettingsHead(settings_id=key)
-        view.receipt(record.request, (key, head_key), exact={
-            key: view.hash(key), head_key: view.image_hash(head_key, pointer),
-        }, result=settings_result(record))
-        choices[key] = record
-    ordered = sorted(choices.values(), key=lambda value: view.receipts[value.request.request_id].guard_revision)
-    previous = None
-    for revision, record in enumerate(ordered, 1):
-        if record.command.expected_settings_id != previous or record.revision != revision:
-            raise Problem(409, "MEMORY_SETTINGS_INVALID", "retained settings no longer form their approved sequence")
-        previous = record.settings_id
-    if ordered:
-        head = view.row(head_key, MemoryBridgeSettingsHead)
-        if head.settings_id != previous or inventory.rows[head_key].payload["material"] is not None:
-            raise Problem(409, "MEMORY_SETTINGS_INVALID", "the retained setting head is not its latest approved version")
-    elif head_key in inventory.rows:
-        raise Problem(409, "MEMORY_SETTINGS_INVALID", "a memory setting head has no original approval")
-    return choices
 
 
 class MemoryBridgeSettingsService:

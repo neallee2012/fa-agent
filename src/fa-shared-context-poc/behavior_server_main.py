@@ -2,10 +2,8 @@
 
 Mount BEHAVIOR_SERVER_CONFIG and its current evidence catalog as trusted
 read-only files. Recovery uses BEHAVIOR_RECOVERY_CONFIG and a separate identity.
-The API image accepts serve/probe/recovery/controller/bootstrap and an isolated,
-default-off runtime-rotation operator plane. Rotation schemas are offline-only
-exports. The Hosted image uses hosted-bootstrap, then execs the existing
-constrained serve module.
+The API image accepts serve/probe/recovery/controller/bootstrap. The Hosted image
+uses hosted-bootstrap, then execs the existing constrained serve module.
 """
 
 from __future__ import annotations
@@ -87,7 +85,6 @@ def main():
     )
     from shared_context.memory_projection import ProjectionSetup
     from shared_context.behavior_server import bootstrap, build_server, run_controller
-    from shared_context.behavior_runtime_rotation_api import SCHEMA_KINDS, add_operator_arguments, input_schema, serve_operator
     from shared_context.errors import Problem
 
     parser = argparse.ArgumentParser(description="FA native behavior composition (no resource/RBAC provisioning)")
@@ -100,11 +97,9 @@ def main():
         serve.add_argument("--port", type=int, default=8080)
     schema = sub.add_parser("schema")
     schema.add_argument("kind", choices=("config", "evidence", "authorization", "recovery", "recovery-catalog",
-                                        "projection", "projection-evidence", "tokenizer", *SCHEMA_KINDS),
+                                        "projection", "projection-evidence", "tokenizer"),
                         default="config", nargs="?")
     sub.add_parser("sample-config")
-    add_operator_arguments(sub.add_parser("runtime-rotation",
-                                         help="isolated Read+Approve rotation API; no bootstrap or business work"))
     boot = sub.add_parser("bootstrap")
     boot.add_argument("--stage", choices=("records", "worker", "activate"), required=True)
     boot.add_argument("--authorization", type=Path, required=True)
@@ -121,9 +116,6 @@ def main():
     args = parser.parse_args()
     try:
         if args.mode == "schema":
-            if args.kind in SCHEMA_KINDS:
-                print(json.dumps(input_schema(args.kind), indent=2))
-                return
             models = {"config": ServerConfiguration, "evidence": NativeEvidenceBundle, "authorization": BootstrapAuthorization,
                       "recovery": RecoveryConfiguration, "recovery-catalog": RecoveryCatalog,
                       "projection": ProjectionSetup, "projection-evidence": ProjectionInstallationEvidence,
@@ -132,11 +124,6 @@ def main():
             return
         if args.mode == "sample-config":
             print(synthetic_configuration().model_dump_json(indent=2))
-            return
-        if args.mode == "runtime-rotation":
-            if args.config is not None or args.evidence is not None:
-                raise ValueError("rotation requires its six explicit operator file inputs, not general config/evidence flags")
-            serve_operator(args)
             return
         if args.config is not None:
             key = "BEHAVIOR_RECOVERY_CONFIG" if args.mode == "recovery" else "BEHAVIOR_SERVER_CONFIG"

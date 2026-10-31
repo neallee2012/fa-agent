@@ -7,15 +7,11 @@ from pydantic import model_validator
 from shared_context import behavior_wire as wire
 from shared_context.behavior_assistant_wire import AssistantSubmit
 from shared_context.behavior_work_policy import (
-    SteadyWorkPolicy, WorkPreflight, WorkPreflightQuery, WorkPolicyDecision, derive_work, work_policy_key,
+    SteadyWorkPolicy, WorkPreflight, WorkPolicyDecision, derive_work, work_policy_key,
 )
 from shared_context.memory_bridge_settings import with_memory_slots
-from .adapter import ConsoleError, PullAdapter, SteadyConsoleConfig, require, sha, strict_json
+from .adapter import ConsoleError, PullAdapter, SteadyConsoleConfig, require, strict_json
 from .work_policy import CumulativeBudget, WorkPolicyObservation
-
-
-def submit_contract_digest(task):
-    return sha(AssistantSubmit(request_id=task.submit_request_id).model_dump_json().encode("utf-8"))
 
 
 def task_matches(task, binding):
@@ -39,10 +35,9 @@ class StandingConsoleConfig(SteadyConsoleConfig):
                 or p.template.route.recipient_id != self.human_oid):
             raise ValueError("exact trusted standing policy/configuration/identity required")
         for task in self.tasks:
-            if task.mode == "normal_pull":
-                _, expected, _ = derive_work(p, task.submit_request_id, p.evidence_mode)
-                if task.submission != "assistant" or not task_matches(task, expected):
-                    raise ValueError("standing tasks must exactly match the original deterministic policy derivation")
+            _, expected, _ = derive_work(p, task.submit_request_id, p.evidence_mode)
+            if task.submission != "assistant" or not task_matches(task, expected):
+                raise ValueError("standing tasks must exactly match the original deterministic policy derivation")
         return self
 
 
@@ -54,7 +49,7 @@ class StandingSubmitReply(wire.WireModel):
 class StandingPullAdapter(PullAdapter):
     def request(self, task, action):
         if action == "submit":
-            require(task.mode == "normal_pull" and task.submission == "assistant", "ACTION_NOT_ALLOWED", 403)
+            require(task.submission == "assistant", "ACTION_NOT_ALLOWED", 403)
             return "POST", "/work-policy/v1/submit", AssistantSubmit(request_id=task.submit_request_id).model_dump(mode="json")
         return super().request(task, action)
 
@@ -75,31 +70,8 @@ class StandingWorkObservation(WorkPolicyObservation):
     preflight: WorkPreflight
 
 
-class StandingPolicyReader:
-    """One fixed pure-read endpoint, only from a trusted complete policy pin."""
-    def __init__(self, config, adapter, clock):
-        require(type(config) is StandingConsoleConfig and type(adapter) is StandingPullAdapter,
-                "WORK_POLICY_INVALID", 502)
-        self.config, self.adapter, self.clock = config, adapter, clock
-        self.last_guard_revision = None
-
-    def read(self, query, bearer):
-        c, p = self.config, self.config.standing_policy
-        task = next((t for t in c.tasks if t.mode == "normal_pull" and t.submit_request_id == query.submit_request_id), None)
-        require(task is not None and query.backend_origin == c.backend_origin
-                and query.backend_configuration_sha256 == c.backend_configuration_sha256
-                and query.backend_core_sha256 == c.backend_core_sha256
-                and (query.tenant_id, query.human_oid, query.client_id) == (c.tenant_id, c.human_oid, c.client_id)
-                and (query.binding_id, query.job_id, query.work_id, query.root_request_id, query.route) ==
-                    (task.binding_id, task.job_id, task.work_id, task.root_request_id, task.route)
-                and query.submit_body_sha256 == submit_contract_digest(task), "WORK_POLICY_INVALID", 502)
-        body = WorkPreflightQuery(read_id=query.read_id, request_id=task.submit_request_id,
-                                  submit_body_sha256=submit_contract_digest(task))
-        raw, _ = self.adapter.send("POST", "/work-policy/v1/preflight", body.model_dump(mode="json"),
-                                  bearer.get_secret_value())
-        _, binding, _ = derive_work(p, task.submit_request_id, p.evidence_mode)
-        return self.checked(query, task, binding, raw)
-
+class StandingPreflightCheck:
+    """Checks one preflight read against the pin; the subclass supplies the read and config, clock, last_guard_revision."""
     def checked(self, query, task, binding, raw, *, instruction=False, previous_guard=None):
         c, p = self.config, self.config.standing_policy
         result = _parsed_preflight(raw)

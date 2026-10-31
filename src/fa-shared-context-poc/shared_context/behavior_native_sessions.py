@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -12,6 +13,7 @@ import random
 import re
 from threading import Event, Lock, RLock
 from time import monotonic, sleep
+from typing import Callable
 
 from azure.core.exceptions import AzureError, ResourceNotFoundError
 
@@ -22,7 +24,8 @@ from .behavior_native_turn_wire import (
     NATIVE_STATE_PROFILE, NativeEnvironmentMetadata, NativeEnvironmentReplacementPreview, NativeEnvironmentView, NativeSessionMetadata,
     NativeSessionAbandon, NativeSessionFollow, NativeSessionRead, NativeSessionPrepare, NativeSessionRetarget,
     NativeSessionFilesOmission, NativeUnfinishedRead,
-    NativeEnvironmentCommand, NativeEnvironmentRetargetCommand, material_digest,
+    NativeEnvironmentCommand, NativeEnvironmentRetargetCommand, NativeEnvironmentWithoutFiles, NativeSessionState,
+    material_digest,
 )
 from . import upgrade_snapshot_flow
 from .errors import Problem
@@ -455,6 +458,147 @@ def _metadata_sessions(client):
         raise Problem(status if status in {401, 403} else 503, "NATIVE_ENVIRONMENT_UNAVAILABLE",
                       "the platform session metadata could not be read") from None
     return observed, truncated
+
+
+# The reason named to Hosted is the first of these that holds.
+_OMISSION_REASONS = ("source_changed", "original_destination", "destination", "source", "source_not_migratable")
+_SYSTEM_OMISSION_WAITS = frozenset({
+    "accepted_or_started", "admission_pending", "task_active", "task_unconfirmed", "task_access_denied"})
+_REFUSED_CHECKS = frozenset({
+    "NATIVE_FILES_CONFLICT", "NATIVE_FILES_CONFIRMATION_REQUIRED", "NATIVE_ENVIRONMENT_CONFLICT"})
+
+
+@dataclass(frozen=True)
+class _OmissionCall:
+    """What one ``without_files`` call was asked to do; it never changes during that call."""
+    client: object
+    command: NativeEnvironmentWithoutFiles
+    before_send: Callable[[], object]
+    reconcile: bool
+    preview: bool
+    resume: bool
+    observe_only: bool
+    refusal_code: str | None
+    system_policy: bool
+
+
+@dataclass(frozen=True)
+class _OmissionRoute:
+    """Where the omission goes: the follow it resumes (the original one, or a retarget derived from it) and its source."""
+    destination: object
+    state: NativeSessionState
+    follow: NativeEnvironmentCommand
+    source_sid: str
+    retained: NativeEnvironmentView | None
+    fresh_follow: bool
+    already_ready: bool
+    pending_request_id: str | None
+    pending_session_id: str | None
+
+
+def _ready_at(environment, follow, session_id):
+    return (environment is not None and environment.state == "ready"
+            and environment.request_id == follow.request_id
+            and environment.hosted_session_id == session_id
+            and environment.hosted_agent_version == follow.expected_agent_version)
+
+
+def _fresh_recorded(state, request_id, source_sid, target_sid, target_version):
+    return any(value is not None and value.request_id == request_id
+               and value.previous_hosted_session_id == source_sid
+               and value.hosted_session_id == target_sid
+               and value.hosted_agent_version == target_version
+               for value in (state.environment, state.following))
+
+
+def _retarget(command, state, source_sid, target_sid, target_version, *, request_id=None):
+    """The follow to the target that takes over from the original, and the source it leaves. ``request_id``: a fresh
+    follow's; otherwise one derived from the confirmation, so a resend names the same operation."""
+    follow = NativeEnvironmentCommand(
+        request_id=request_id or material_digest({
+            "kind": "files-omission-retarget", "confirmation": command.request_id, "original": command.follow.request_id,
+            "source": source_sid, "target": target_sid}),
+        expected_session_id=source_sid, expected_agent_version=target_version, idle_only=True)
+    environment = state.environment
+    if environment is not None and environment.request_id == follow.request_id:
+        return follow, environment.previous_hosted_session_id
+    return follow, source_sid
+
+
+def _routed_follow(command, state, original_sid, target_sid, target_version):
+    """(follow to resume, its source, whether a fresh follow replaced the original, (pending RID, pending SID))."""
+    follow = command.follow
+    retained = state.following or state.environment
+    if target_version == follow.expected_agent_version:
+        return follow, _retained_source(command, state, retained), False, (None, None)
+    fresh_request_id = material_digest({
+        "kind": "files-omission-follow", "confirmation": command.request_id,
+        "original": follow.request_id, "source": original_sid, "target": target_sid})
+    original_ready = _ready_at(state.environment, follow, original_sid)
+    if original_ready and follow.expected_session_id not in {None, state.environment.previous_hosted_session_id}:
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the referenced ready operation has another source")
+    if original_ready or _fresh_recorded(state, fresh_request_id, original_sid, target_sid, target_version):
+        return (*_retarget(command, state, original_sid, target_sid, target_version, request_id=fresh_request_id),
+                True, (None, None))
+    source_sid = _retained_source(command, state, retained)
+    return (*_retarget(command, state, source_sid, target_sid, target_version), False,
+            (follow.request_id, original_sid))
+
+
+def _source_record(state):
+    """(files profile, version) the Agent's record gives its source: the session a pending transition is leaving."""
+    original = state.environment or state.preparation
+    if original is None:
+        return None, None
+    if state.environment is not None and state.environment.state == "pending":
+        return original.previous_files_profile, original.previous_agent_version
+    return original.files_profile, original.hosted_agent_version
+
+
+def _source_moved(actual, version):
+    return actual is not None and version is not None and actual.version_indicator.agent_version != version
+
+
+def _source_available(route, actual, version):
+    state, retained = route.state, route.retained
+    refused = (state.source_invocation_refused and state.hosted_session_id == route.source_sid or
+               retained is not None and retained.previous_hosted_session_id == route.source_sid
+               and retained.source_invocation_refused)
+    return (not refused and actual is not None and actual.status in {"active", "idle"}
+            and actual.version_indicator.agent_version == version)
+
+
+def _retained_source(command, state, retained):
+    """The source the owner saw, unless the operation already in progress is this one: then that one's source."""
+    follow = command.follow
+    if retained is None or (
+            retained.request_id != follow.request_id and retained.files_skip_request_id != command.request_id):
+        return follow.expected_session_id or state.hosted_session_id
+    if follow.expected_session_id is not None and follow.expected_session_id != retained.previous_hosted_session_id:
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the displayed source differs from the original file operation")
+    return retained.previous_hosted_session_id
+
+
+def _first_omission_reason(call, reasons):
+    for reason in _OMISSION_REASONS:
+        if reason in reasons:
+            return reason
+    if call.preview or call.resume:
+        raise Problem(409, "NATIVE_FILES_CONFLICT", "both helpers are available; keep the original migration")
+    from .behavior_native_turn_api import _OmissionBeforeDispatch
+    raise _OmissionBeforeDispatch(call.command.request_id, "NATIVE_FILES_CONFLICT",
+                                  "both helpers are available; no omission confirmation was dispatched")
+
+
+def _omission_active(value, command):
+    return value.files_migrated is False and value.files_skip_request_id == command.request_id
+
+
+def _with_saved_reason(internal, observed, reasons):
+    reason = observed.files_confirmation_reason
+    if observed.files_confirmation_saved != internal.request_id or reason not in reasons:
+        raise Problem(409, "NATIVE_FILES_CONFLICT", "the saved omission reason is no longer confirmed")
+    return internal.model_copy(update={"missing": reason})
 
 
 class NativeSessions:
@@ -2083,188 +2227,167 @@ class NativeSessions:
 
     def without_files(self, client, command, *, before_send, reconcile=False, preview=False, resume=False,
                       observe_only=False, refusal_code=None, system_policy=False):
-        from .behavior_native_turn_api import NativeTurnGateway, _OmissionBeforeDispatch
-        from .native_files_wire import FILES_PROFILE
-
+        call = _OmissionCall(client, command, before_send, reconcile, preview, resume, observe_only, refusal_code,
+                             system_policy)
         with self._changing():
-            follow = command.follow
-            target_version = command.expected_agent_version or follow.expected_agent_version
+            target_version = command.expected_agent_version or command.follow.expected_agent_version
             if (preview or resume) and self.selected_version(client) != target_version:
                 raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the displayed destination version changed")
-            original_destination_changed = False
-            if not reconcile and target_version != follow.expected_agent_version:
-                original = self.candidate(client, version=follow.expected_agent_version)
-                metadata = _session_metadata(original)
-                original_destination_changed = (metadata is not None
-                    and metadata.version_indicator.agent_version != follow.expected_agent_version)
-                if preview and metadata is not None and (
-                        _read_platform_session(self.candidate(client, version=target_version)) is None):
-                    return NativeEnvironmentReplacementPreview(
-                        agent_id=client.target.agent_id,
-                        hosted_session_id=self.candidate(client, version=target_version).target.session_id,
-                        hosted_agent_version=target_version, original_request_id=follow.request_id,
-                        original_hosted_session_id=original.target.session_id,
-                        original_hosted_agent_version=follow.expected_agent_version,
-                        observed_agent_version=metadata.version_indicator.agent_version,
-                        reason="destination_version_changed" if original_destination_changed else "reader_required")
-            if reconcile or preview or resume:
-                destination = self.candidate(client, version=target_version)
-                actual = _read_platform_session(destination)
-                if actual is None or actual.agent_version != target_version:
-                    raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "read the original omission destination; nothing was created")
-                destination = destination.for_target(actual)
-            else:
-                destination = self._destination(client, target_version, before_send)
+            destination_changed, replacement = self._original_destination(call, target_version)
+            if replacement is not None:
+                return replacement
+            destination = self._omission_destination(call, target_version)
             state = self._state(destination)
             if state.files_omission_profile != "fa-files-omission-v1":
                 raise Problem(409, "NATIVE_FILES_CONFIRMATION_UNSUPPORTED",
                               "this destination image predates explicit file omission; use a compatible image")
-            changed_target = target_version != follow.expected_agent_version
-            original_target_sid = self.candidate(client, version=follow.expected_agent_version).target.session_id
-            fresh_request_id = material_digest({
-                "kind": "files-omission-follow", "confirmation": command.request_id,
-                "original": follow.request_id, "source": original_target_sid, "target": destination.target.session_id})
-            original_ready = (changed_target and state.environment is not None and state.environment.state == "ready"
-                and state.environment.request_id == follow.request_id
-                and state.environment.hosted_session_id == original_target_sid
-                and state.environment.hosted_agent_version == follow.expected_agent_version)
-            fresh_follow = changed_target and (original_ready or any(
-                value is not None and value.request_id == fresh_request_id
-                and value.previous_hosted_session_id == original_target_sid
-                and value.hosted_session_id == destination.target.session_id
-                and value.hosted_agent_version == target_version
-                for value in (state.environment, state.following)))
-            if original_ready and follow.expected_session_id is not None and (
-                    follow.expected_session_id != state.environment.previous_hosted_session_id):
-                raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the referenced ready operation has another source")
-            source_sid = follow.expected_session_id or state.hosted_session_id
-            retained = state.following or state.environment
-            if fresh_follow:
-                source_sid = original_target_sid
-            elif retained is not None and (
-                    retained.request_id == follow.request_id or retained.files_skip_request_id == command.request_id):
-                if follow.expected_session_id is not None and follow.expected_session_id != retained.previous_hosted_session_id:
-                    raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the displayed source differs from the original file operation")
-                source_sid = retained.previous_hosted_session_id
-            pending_request_id = pending_session_id = None
-            if changed_target:
-                if not fresh_follow:
-                    pending_request_id = follow.request_id
-                    pending_session_id = original_target_sid
-                follow = NativeEnvironmentCommand(
-                    request_id=fresh_request_id if fresh_follow else material_digest({
-                        "kind": "files-omission-retarget", "confirmation": command.request_id, "original": follow.request_id,
-                        "source": source_sid, "target": destination.target.session_id}),
-                    expected_session_id=source_sid, expected_agent_version=target_version, idle_only=True)
-                if state.environment is not None and state.environment.request_id == follow.request_id:
-                    source_sid = state.environment.previous_hosted_session_id
-            if source_sid == destination.target.session_id:
-                raise Problem(409, "NATIVE_FILES_CONFIRMATION_REQUIRED", "there is no original environment transition to confirm")
-            already_ready = (retained is not None and retained.state == "ready" and retained.request_id == follow.request_id
-                             and retained.files_skip_request_id == command.request_id)
-            missing = None
-            valid_reasons = set()
-            if not reconcile and not already_ready:
-                source = client.for_target(_target(client.target, session_id=source_sid))
-                actual = _session_metadata(source)
-                original = state.environment or state.preparation
-                pending = state.environment is not None and state.environment.state == "pending"
-                profile = (original.previous_files_profile if pending else original.files_profile) if original is not None else None
-                version = (original.previous_agent_version if pending else original.hosted_agent_version) if original is not None else None
-                refused = (state.source_invocation_refused and state.hosted_session_id == source_sid or
-                           retained is not None and retained.previous_hosted_session_id == source_sid
-                           and retained.source_invocation_refused)
-                if actual is not None and version is not None and actual.version_indicator.agent_version != version:
-                    valid_reasons.add("source_changed")
-                if original_destination_changed and not fresh_follow:
-                    valid_reasons.add("original_destination")
-                if state.files_profile != FILES_PROFILE:
-                    valid_reasons.add("destination")
-                if not (profile == FILES_PROFILE and not refused and actual is not None
-                        and actual.status in {"active", "idle"} and actual.version_indicator.agent_version == version):
-                    valid_reasons.add("source")
-                if system_policy and refusal_code is not None:
-                    valid_reasons.add("source_not_migratable")
-                if "source_changed" in valid_reasons:
-                    missing = "source_changed"
-                elif "original_destination" in valid_reasons:
-                    missing = "original_destination"
-                elif "destination" in valid_reasons:
-                    missing = "destination"
-                elif "source" in valid_reasons:
-                    missing = "source"
-                elif "source_not_migratable" in valid_reasons:
-                    missing = "source_not_migratable"
-                else:
-                    if not preview and not resume:
-                        raise _OmissionBeforeDispatch(
-                            command.request_id, "NATIVE_FILES_CONFLICT",
-                            "both helpers are available; no omission confirmation was dispatched")
-                    raise Problem(409, "NATIVE_FILES_CONFLICT", "both helpers are available; keep the original migration")
+            route = self._omission_route(call, target_version, destination, state)
+            reasons, missing = self._omission_decision(call, route, destination_changed)
             before_send()
-            internal = NativeSessionFilesOmission(
-                request_id=command.request_id,
-                follow=NativeSessionFollow(
-                    request_id=follow.request_id, expected_session_id=source_sid, expected_etag=state.etag,
-                    stage="prepare", idle_only=follow.idle_only, files_required=True,
-                    settled_session_ids=self._settled(self._binding_row(client.target.agent_id), destination)),
-                stage="read" if reconcile or already_ready else "check" if preview else "activate" if resume else "confirm",
-                missing=missing,
-                pending_request_id=pending_request_id, pending_session_id=pending_session_id,
-                confirmation_digest=None if system_policy else material_digest(command),
-                decision_basis="system_policy" if system_policy else None)
+            return self._send_omission(call, route, self._omission_internal(call, route, missing), reasons)
 
-            def original_reason(observed):
-                reason = observed.files_confirmation_reason
-                if observed.files_confirmation_saved != command.request_id or reason not in valid_reasons:
-                    raise Problem(409, "NATIVE_FILES_CONFLICT", "the saved omission reason is no longer confirmed")
-                return internal.model_copy(update={"missing": reason})
+    def _original_destination(self, call, target_version):
+        """(the original destination moved off its version, the preview that offers a replacement instead or None)."""
+        follow = call.command.follow
+        if call.reconcile or target_version == follow.expected_agent_version:
+            return False, None
+        original = self.candidate(call.client, version=follow.expected_agent_version)
+        metadata = _session_metadata(original)
+        changed = metadata is not None and metadata.version_indicator.agent_version != follow.expected_agent_version
+        if not call.preview or metadata is None or (
+                _read_platform_session(self.candidate(call.client, version=target_version)) is not None):
+            return changed, None
+        return changed, NativeEnvironmentReplacementPreview(
+            agent_id=call.client.target.agent_id,
+            hosted_session_id=self.candidate(call.client, version=target_version).target.session_id,
+            hosted_agent_version=target_version, original_request_id=follow.request_id,
+            original_hosted_session_id=original.target.session_id,
+            original_hosted_agent_version=follow.expected_agent_version,
+            observed_agent_version=metadata.version_indicator.agent_version,
+            reason="destination_version_changed" if changed else "reader_required")
 
-            if internal.stage == "activate":
-                observed, _ = self._follow_invoke(
-                    destination, internal.model_copy(update={"stage": "read", "missing": None}))
-                if observed.files_migrated is False and observed.files_skip_request_id == command.request_id:
-                    return self.follow(client, follow, before_send=before_send)
-                internal = original_reason(observed)
-            if internal.stage == "confirm":
-                try:
-                    checked, _ = self._follow_invoke(destination, internal.model_copy(update={"stage": "check"}))
-                    if checked.files_migrated is False and checked.files_skip_request_id == command.request_id:
-                        return self.follow(client, follow, before_send=before_send)
-                    if checked.reason == "scan_pending":
-                        return checked.model_copy(update={
-                            "files_confirmation_saved": None, "files_confirmation_reason": None,
-                            "files_confirmation_absent": None,
-                            "files_confirmation_pending": command.request_id})
-                    if system_policy and checked.reason in {
-                            "accepted_or_started", "admission_pending", "task_active", "task_unconfirmed", "task_access_denied"}:
-                        return checked
-                    if checked.files_confirmation_saved is not None:
-                        internal = original_reason(checked)
-                except Problem as error:
-                    if error.status == 409 and error.body["error"]["code"] in {
-                            "NATIVE_FILES_CONFLICT", "NATIVE_FILES_CONFIRMATION_REQUIRED", "NATIVE_ENVIRONMENT_CONFLICT"}:
-                        raise _OmissionBeforeDispatch(command.request_id, error.body["error"]["code"],
-                                                     "the read-only check refused; no omission confirmation was dispatched",
-                                                     files_check=error.body["error"].get("files_check")) from None
-                    raise
-                before_send()
-            value, _ = self._follow_invoke(destination, internal)
-            if observe_only:
-                return value
-            if reconcile:
-                if value.state == "ready":
-                    return value
-                if command.request_id in {value.files_confirmation_absent, value.files_confirmation_saved}:
-                    before_send()
-                    return self.without_files(client, command, before_send=before_send, system_policy=system_policy,
-                                              refusal_code=refusal_code)
-                if value.files_migrated is False and value.files_skip_request_id == command.request_id:
-                    return self.follow(client, follow, before_send=before_send)
-                return value
-            if preview or already_ready or value.files_confirmation_pending == command.request_id:
-                return value
-            return self.follow(client, follow, before_send=before_send)
+    def _omission_destination(self, call, target_version):
+        if not (call.reconcile or call.preview or call.resume):
+            return self._destination(call.client, target_version, call.before_send)
+        destination = self.candidate(call.client, version=target_version)
+        actual = _read_platform_session(destination)
+        if actual is None or actual.agent_version != target_version:
+            raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "read the original omission destination; nothing was created")
+        return destination.for_target(actual)
+
+    def _omission_route(self, call, target_version, destination, state):
+        command, target_sid = call.command, destination.target.session_id
+        original_sid = self.candidate(call.client, version=command.follow.expected_agent_version).target.session_id
+        follow, source_sid, fresh_follow, pending = _routed_follow(command, state, original_sid, target_sid, target_version)
+        if source_sid == target_sid:
+            raise Problem(409, "NATIVE_FILES_CONFIRMATION_REQUIRED", "there is no original environment transition to confirm")
+        retained = state.following or state.environment
+        already_ready = (retained is not None and retained.state == "ready" and retained.request_id == follow.request_id
+                         and retained.files_skip_request_id == command.request_id)
+        return _OmissionRoute(destination, state, follow, source_sid, retained, fresh_follow, already_ready, *pending)
+
+    def _omission_decision(self, call, route, destination_changed):
+        """(every reason that lets this omission go ahead, the one named to Hosted). A read names none."""
+        if call.reconcile or route.already_ready:
+            return set(), None
+        reasons = self._omission_reasons(call, route, destination_changed)
+        return reasons, _first_omission_reason(call, reasons)
+
+    def _omission_reasons(self, call, route, destination_changed):
+        from .native_files_wire import FILES_PROFILE
+
+        state = route.state
+        actual = _session_metadata(call.client.for_target(_target(call.client.target, session_id=route.source_sid)))
+        profile, version = _source_record(state)
+        reasons = set()
+        if _source_moved(actual, version):
+            reasons.add("source_changed")
+        if destination_changed and not route.fresh_follow:
+            reasons.add("original_destination")
+        if state.files_profile != FILES_PROFILE:
+            reasons.add("destination")
+        if profile != FILES_PROFILE or not _source_available(route, actual, version):
+            reasons.add("source")
+        if call.system_policy and call.refusal_code is not None:
+            reasons.add("source_not_migratable")
+        return reasons
+
+    def _omission_internal(self, call, route, missing):
+        follow, command = route.follow, call.command
+        return NativeSessionFilesOmission(
+            request_id=command.request_id,
+            follow=NativeSessionFollow(
+                request_id=follow.request_id, expected_session_id=route.source_sid, expected_etag=route.state.etag,
+                stage="prepare", idle_only=follow.idle_only, files_required=True,
+                settled_session_ids=self._settled(self._binding_row(call.client.target.agent_id), route.destination)),
+            stage=("read" if call.reconcile or route.already_ready else "check" if call.preview else
+                   "activate" if call.resume else "confirm"),
+            missing=missing,
+            pending_request_id=route.pending_request_id, pending_session_id=route.pending_session_id,
+            confirmation_digest=None if call.system_policy else material_digest(command),
+            decision_basis="system_policy" if call.system_policy else None)
+
+    def _send_omission(self, call, route, internal, reasons):
+        if internal.stage == "activate":
+            return self._activate_omission(call, route, internal, reasons)
+        if internal.stage == "confirm":
+            return self._confirm_omission(call, route, internal, reasons)
+        return self._finish_omission(call, route, internal)
+
+    def _resume_follow(self, call, route):
+        return self.follow(call.client, route.follow, before_send=call.before_send)
+
+    def _activate_omission(self, call, route, internal, reasons):
+        observed, _ = self._follow_invoke(
+            route.destination, internal.model_copy(update={"stage": "read", "missing": None}))
+        if _omission_active(observed, call.command):
+            return self._resume_follow(call, route)
+        return self._finish_omission(call, route, _with_saved_reason(internal, observed, reasons))
+
+    def _confirm_omission(self, call, route, internal, reasons):
+        try:
+            checked, _ = self._follow_invoke(route.destination, internal.model_copy(update={"stage": "check"}))
+            if _omission_active(checked, call.command):
+                return self._resume_follow(call, route)
+            if checked.reason == "scan_pending":
+                return checked.model_copy(update={
+                    "files_confirmation_saved": None, "files_confirmation_reason": None,
+                    "files_confirmation_absent": None,
+                    "files_confirmation_pending": call.command.request_id})
+            if call.system_policy and checked.reason in _SYSTEM_OMISSION_WAITS:
+                return checked
+            if checked.files_confirmation_saved is not None:
+                internal = _with_saved_reason(internal, checked, reasons)
+        except Problem as error:
+            if error.status == 409 and error.body["error"]["code"] in _REFUSED_CHECKS:
+                from .behavior_native_turn_api import _OmissionBeforeDispatch
+                raise _OmissionBeforeDispatch(call.command.request_id, error.body["error"]["code"],
+                                              "the read-only check refused; no omission confirmation was dispatched",
+                                              files_check=error.body["error"].get("files_check")) from None
+            raise
+        call.before_send()
+        return self._finish_omission(call, route, internal)
+
+    def _finish_omission(self, call, route, internal):
+        value, _ = self._follow_invoke(route.destination, internal)
+        if call.observe_only:
+            return value
+        if call.reconcile:
+            return self._reconciled_omission(call, route, value)
+        if call.preview or route.already_ready or value.files_confirmation_pending == call.command.request_id:
+            return value
+        return self._resume_follow(call, route)
+
+    def _reconciled_omission(self, call, route, value):
+        if value.state == "ready":
+            return value
+        if call.command.request_id in {value.files_confirmation_absent, value.files_confirmation_saved}:
+            call.before_send()
+            return self.without_files(call.client, call.command, before_send=call.before_send,
+                                      system_policy=call.system_policy, refusal_code=call.refusal_code)
+        if _omission_active(value, call.command):
+            return self._resume_follow(call, route)
+        return value
 
     def cut(self, client, *, stop=None, target=None):
         """ADR-0009 M1 2d-i step 2, run in the background after a turn end (``native_cut``): move the Agent from the

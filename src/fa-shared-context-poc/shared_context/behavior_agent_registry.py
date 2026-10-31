@@ -8,16 +8,13 @@ from pydantic import Field, field_validator, model_validator
 from .behavior_auth import BehaviorPrincipal
 from .behavior_operations import BudgetRecord, _Model, _row, _utc, _write, control_key
 from .behavior_runtime import material
-from .behavior_runtime_transition import _payload_hash
 from .behavior_server_config import ServerAgentScope
 from .behavior_store import ControlChanges, ControlRequest, Digest, _Row
-from .behavior_team_registry import inventory_agent_scope, resolve_agent_scope
-from .behavior_work_policy import (
-    CostLedger, StandingPolicyInstallation, SteadyWorkPolicy, WorkPolicyRevocation, WorkRegistry, work_policy_key,
-)
+from .behavior_team_registry import resolve_agent_scope
+from .behavior_work_policy import CostLedger, StandingPolicyInstallation, SteadyWorkPolicy, WorkRegistry, work_policy_key
 from .errors import Problem
 from .models import Identifier
-from .source_materials import digest
+from .source_materials import _payload_hash, digest
 
 
 def _require(condition, message):
@@ -213,64 +210,3 @@ def register_agent_scope(store, config, policy, principal, *, now, reconcile=Fal
         ), result=_result(value))
 
     return store.transact(request, changes)
-
-
-def validate_agent_registry_history(inventory, config):
-    from .behavior_recovery_history import _Inventory
-    from .behavior_profile_selection import ConversationProfileHead, head_key, selection_key, validate_profile_history
-    from .behavior_work_registry import read_inventory_registry
-    view = _Inventory(inventory, config)
-    checked = {}
-    for key, row in inventory.rows.items():
-        if row.payload["data"].get("kind") != "agent_scope_registry":
-            continue
-        value = view.row(key, AgentScopeRegistry, material=True)
-        policy = value.policy
-        legacy = view.row(work_policy_key("policy", policy.authority_domain), StandingPolicyInstallation, material=True)
-        _check_record(value, config, legacy.policy, inventory_agent_scope(inventory, config, policy.agent_id))
-        _require(key == registry_key(policy.authority_domain, policy.agent_id), "registry escaped its agent key")
-        index_key = work_policy_key("registry", *policy.scope_ids)
-        index = read_inventory_registry(inventory, policy)
-        _require(index.policy_id == policy.policy_id, "peer work registry belongs to another policy")
-        expected = {
-            key: view.hash(key), index_key: view.image_hash(index_key, WorkRegistry(policy_id=policy.policy_id)),
-        }
-        if value.initialization_request is None:
-            view.receipt(value.request, (key, index_key), exact=expected, result=_result(value))
-        else:
-            from .behavior_fresh_installation import validate_fresh_inventory
-            initial = validate_fresh_inventory(inventory, config)
-            _require(initial.request == value.initialization_request
-                     and initial.plan.peer_policy == value.policy
-                     and all(dict(view.receipts[initial.request.request_id].writes).get(k) == v
-                             for k, v in expected.items()), "peer lacks its original fresh installation receipt")
-        checked.update({key: value, index_key: index})
-        choices = validate_profile_history(inventory, config, policy)
-        for choice in choices.values():
-            _require(view.receipts[choice.request.request_id].guard_revision
-                     > view.receipts[registration_request(value).request_id].guard_revision,
-                     "peer profile selection predates its registered policy")
-            checked[selection_key(policy.authority_domain, choice.selection_id, policy.agent_id)] = choice
-        if choices:
-            head = head_key(policy.authority_domain, policy.agent_id)
-            checked[head] = view.row(head, ConversationProfileHead)
-        revoked_key = work_policy_key("revocation", *policy.scope_ids)
-        if revoked_key in inventory.rows:
-            revoked = view.row(revoked_key, WorkPolicyRevocation, material=True)
-            _require(revoked.policy_id == policy.policy_id and revoked.policy_sha256 == policy.sha256
-                     and revoked.principal_oid == config.identity.human_oid,
-                     "peer revocation belongs to another policy or human")
-            receipt = view.receipt(ControlRequest(
-                request_id=revoked_key, request_digest=digest(revoked.model_dump(mode="json")),
-                read_set=(key, revoked_key),
-            ), (revoked_key,), exact={revoked_key: view.hash(revoked_key)}, result={
-                "policy_id": policy.policy_id, "revoked": True, "reservations_refunded": False,
-            })
-            _require(all(view.receipts[choice.request.request_id].guard_revision < receipt.guard_revision
-                         for choice in choices.values()), "a revoked peer cannot select another profile")
-            checked[revoked_key] = revoked
-    for key, row in inventory.rows.items():
-        data = row.payload["data"]
-        if data.get("kind") in {"conversation_profile_selection", "conversation_profile_head"} and data.get("agent_id") is not None:
-            _require(key in checked, "peer profile selection has no registered agent scope")
-    return checked

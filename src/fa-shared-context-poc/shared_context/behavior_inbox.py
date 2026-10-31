@@ -204,20 +204,17 @@ class PullInbox:
 
     def register_retained_results(self, service) -> None:
         from .behavior_settlement import RetainedResultSettlement
-        from .behavior_web_handoff import OriginalFailureWebHandoff
 
-        if (type(service) not in {RetainedResultSettlement, OriginalFailureWebHandoff} or service.inbox is not self
+        if (type(service) is not RetainedResultSettlement or service.inbox is not self
                 or service.registration is None or self._retained_results is not None):
             raise Problem(403, "SETTLEMENT_DISABLED", "one explicit retained-result verifier must own this inbox")
         self._retained_results = service
 
     def _retained_access(self, permit, command, context, action):
         from .behavior_settlement import _RetainedAccess
-        from .behavior_web_handoff import _WebHandoffAccess, OriginalFailureWebHandoff
 
-        if (type(permit) not in {_RetainedAccess, _WebHandoffAccess} or self._retained_results is None
-                or permit.service is not self._retained_results
-                or (type(permit) is _WebHandoffAccess) != (type(self._retained_results) is OriginalFailureWebHandoff)):
+        if (type(permit) is not _RetainedAccess or self._retained_results is None
+                or permit.service is not self._retained_results):
             raise Problem(403, "SETTLEMENT_DISABLED", "no registered terminal-result authorization")
         return self._retained_results._check_permit(permit, command, context, action)
 
@@ -374,10 +371,6 @@ class PullInbox:
         )
 
     def _bound(self, rows, command, context, access, retained=None):
-        if retained is not None:
-            from .behavior_web_handoff import OriginalFailureWebHandoff
-            if type(retained.service) is OriginalFailureWebHandoff:
-                return retained.service._bound(rows, command, context, access)
         core = self._core()
         ob = core._obligation(rows, command.obligation_id, context)
         outbox = core._row(rows, control_key("delivery-outbox", command.delivery_id), _Outbox)
@@ -536,10 +529,7 @@ class PullInbox:
         self.store.transact(request, decide)
         if retained is not None:
             self._retained_results._gate(authority_snapshot(self.store, request.read_set), retained)
-        from .behavior_web_handoff import OriginalFailureWebHandoff
-        receipt = (retained.service._complete(command.delivery_id, context, retained)
-                   if retained is not None and type(retained.service) is OriginalFailureWebHandoff
-                   else self.reconcile(command.delivery_id, context))
+        receipt = self.reconcile(command.delivery_id, context)
         if retained is not None:
             self._retained_results._gate(authority_snapshot(self.store, request.read_set), retained)
         return receipt

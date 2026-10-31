@@ -10,7 +10,7 @@ from shared_context.behavior_wire import Command
 from shared_context.behavior_foundry import FoundryExecutor, FoundryHttpClient, instruction_target
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path, sdk_io, check_history
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_m3_auth import jwk_client, signing_key
 from test_work_policy_lifecycle import enabled
 from test_foundry_start_diagnostics import Credential, SessionTransport, inject_sdk
@@ -38,7 +38,6 @@ def test_followups_keep_hosted_identity_version_and_reset_preserves_old_results(
     assert two.hosted_session_id == sid
     assert two.profile.instruction.hosted_agent_version == one.profile.instruction.hosted_agent_version == "33"
     assert calls[0]["sdk_session_id"] == calls[1]["sdk_session_id"]
-    check_history(h)
     before = control.read_reply(human, cid, 1).model_dump_json()
     reset = control.reset_conversation(human, cid, Command(request_id="explicit-reset"))
     assert reset["archived"] and reset["hosted_session_id"] == sid and reset["session_stop"] == "not_run"
@@ -51,7 +50,6 @@ def test_followups_keep_hosted_identity_version_and_reset_preserves_old_results(
     with pytest.raises(Problem) as archived:
         control.submit(human, InstructionSubmit(request_id="no-hidden-restart", content="Continue.", conversation_id=cid))
     assert archived.value.body["error"]["code"] == "CONVERSATION_ARCHIVED"
-    check_history(h)
     fresh, _ = control.submit(human, InstructionSubmit(request_id="new-session", content="Fresh context."))
     assert control.records[fresh.binding_id].hosted_session_id != sid
     assert control.records[fresh.binding_id].profile.instruction.hosted_agent_version == "34"

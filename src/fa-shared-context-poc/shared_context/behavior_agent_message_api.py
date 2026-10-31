@@ -17,12 +17,11 @@ from .behavior_capabilities import BUILTIN_CAPABILITIES, runtime_grants
 from .behavior_delegation import capture_parent, _current_parent, _parent_keys
 from .behavior_operations import _Model, _row, _write, control_key
 from .behavior_runtime import material
-from .behavior_runtime_transition import _payload_hash
 from .behavior_store import ControlChanges, ControlRequest, Digest
 from .behavior_wire import Identifier
 from .behavior_workers import ExecutorBinding
 from .errors import Problem
-from .source_materials import digest
+from .source_materials import _payload_hash, digest
 
 
 class AgentMessageOrigin(_Model):

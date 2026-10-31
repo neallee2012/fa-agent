@@ -17,7 +17,7 @@ from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_text_files import UserTextFile
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_text_files import BODY, configured_files, post
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -83,4 +83,3 @@ def test_literal_file_is_user_data_in_actual_sdk_requests_and_cold_resume(assist
                            headers=h.headers("read-only"))
         assert saved.status_code == 200 and saved.content == BODY.encode("utf-8")
         assert control.records[first["binding_id"]].profile.instruction.files == (file,)
-        check_history(h)

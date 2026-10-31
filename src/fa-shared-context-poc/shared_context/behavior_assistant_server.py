@@ -129,24 +129,6 @@ class AssistantServer:
             return False
         path = getattr(request.scope.get("route"), "path", None)
         root = "/behavior/v1/bindings/{binding_id}"
-        if binding.route.channel_id == "msteams":
-            from .teams_metrics import TeamsMetrics
-
-            metrics = composition.teams
-            if (path != root + "/assistant/sessions/{session_id}/acquire"
-                    or type(metrics) is not TeamsMetrics or metrics.runtime is not composition.runtime
-                    or composition.runtime.teams_metrics is not metrics):
-                return False
-            registered = metrics.records.get(binding.binding_id)
-            if registered is None:
-                return False
-            profile = composition.runtime.profiles[binding.binding_id]
-            # Only select the existing pure-read wrapper. Current installation,
-            # registry, owner and ticket authority are still checked downstream.
-            return (registered.binding == binding and registered.profile == profile
-                    and registered.rule_sha256 == metrics.rule_sha256
-                    and registered.route_id == metrics.setup.route_id
-                    and metrics.derive(registered.event_id) == (binding, profile))
         return path in {
             root + "/hosted/launches/{launch_id}/claim", root + "/assistant/launches/{launch_id}/claim",
             *(root + "/assistant/sessions/{session_id}/" + action for action in (

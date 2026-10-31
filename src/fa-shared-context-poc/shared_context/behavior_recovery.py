@@ -19,7 +19,7 @@ from .behavior_assistant import _ArtifactEffect, _ModelIntent, _Session, key as 
 from .behavior_auth import BehaviorPrincipal
 from .behavior_delivery import DeliveryCore, VerifiedWorkResult, _Model, _material, _parse, _update, _utc
 from .behavior_foundry import FoundryTarget, NativeLaunchAuthority, NativeRecoveryBinding, _NativeEvidence, _NativeLaunch, _TargetReservation, native_key
-from .behavior_migration import code_sha256
+from .behavior_code_identity import code_sha256
 from .behavior_operations import control_key
 from .behavior_server_config import ServerConfiguration
 from .behavior_store import ControlChanges, ControlRequest, ControlWrite, Digest, InlineMaterial, _Receipt, GUARD_KEY
@@ -199,76 +199,6 @@ class FinishedResultRecoveryPlan(MultiModelRecoveryPlan):
     finished_result: FinishedResultProof
 
 
-class TeamsPreAcquireRecoveryScope(MultiModelRecoveryScope):
-    schema_version: Literal["fa-teams-pre-acquire-recovery-scope-v1"] = "fa-teams-pre-acquire-recovery-scope-v1"
-    recovery_phase: Literal["teams_before_sdk_acquire"]
-    model_intents: tuple[()] = ()
-    event_id: Digest
-
-
-class TeamsPreAcquireRecoveryPlan(MultiModelRecoveryPlan):
-    schema_version: Literal["fa-teams-pre-acquire-recovery-plan-v1"] = "fa-teams-pre-acquire-recovery-plan-v1"
-    recovery_phase: Literal["teams_before_sdk_acquire"]
-    model_intents: tuple[()] = ()
-    event_id: Digest
-    original_rows: Annotated[dict[Identifier, Digest], Field(min_length=1, max_length=32)]
-    original_receipts: Annotated[dict[Identifier, Digest], Field(min_length=1, max_length=16)]
-    original_job_state: Literal["starting", "running", "capacity_uncertain"]
-    original_last_sequence: Annotated[int, Field(ge=0)]
-    original_last_evidence_id: Identifier | None
-    original_native_execution_id: Identifier | None
-    original_scans_remaining: Annotated[int, Field(ge=0)]
-
-
-class ExpiredTeamsCleanupObservation(_Model):
-    schema_version: Literal["fa-expired-teams-cleanup-observation-v1"] = "fa-expired-teams-cleanup-observation-v1"
-    purpose: Literal["stop_original_and_deliver_failure"]
-    evidence_id: Identifier
-    observer_oid: Identifier
-    configuration_sha256: Digest
-    code_sha256: Digest
-    event_id: Digest
-    job_id: Identifier
-    launch_id: Identifier
-    inventory_sha256: Digest
-    guard_revision: Annotated[int, Field(ge=0)]
-    target_sha256: Digest
-    original_native_evidence_sha256: Digest
-    retained_authority_sha256: Digest
-    protection_observation_sha256: Digest
-    deployment_observation_sha256: Digest
-    observed_at: datetime
-    expires_at: datetime
-    coverage: Literal["original-execution-and-exact-failure-only"]
-    proof: Annotated[bytes, Field(min_length=1, max_length=2048)]
-    _times = field_validator("observed_at", "expires_at")(_utc)
-
-
-class ExpiredTeamsCleanupScope(TeamsPreAcquireRecoveryScope):
-    schema_version: Literal["fa-expired-teams-cleanup-scope-v1"] = "fa-expired-teams-cleanup-scope-v1"
-    recovery_phase: Literal["expired_original_teams_pre_acquire"]
-    purpose: Literal["stop_original_and_deliver_failure"]
-    not_before: datetime
-    observation_sha256: Digest
-    _start = field_validator("not_before")(_utc)
-
-    @model_validator(mode="after")
-    def finite_cleanup(self):
-        if not self.not_before < self.expires_at <= self.not_before + timedelta(minutes=60):
-            raise ValueError("cleanup requires an independent window of at most sixty minutes")
-        return self
-
-
-class ExpiredTeamsCleanupPlan(TeamsPreAcquireRecoveryPlan):
-    schema_version: Literal["fa-expired-teams-cleanup-plan-v1"] = "fa-expired-teams-cleanup-plan-v1"
-    recovery_phase: Literal["expired_original_teams_pre_acquire"]
-    purpose: Literal["stop_original_and_deliver_failure"]
-    not_before: datetime
-    cleanup_expires_at: datetime
-    observation: ExpiredTeamsCleanupObservation
-    _times = field_validator("not_before", "cleanup_expires_at")(_utc)
-
-
 def _model_digests(value):
     if isinstance(value, (MultiModelRecoveryScope, MultiModelRecoveryPlan)):
         return tuple(item.request_sha256 for item in value.model_intents)
@@ -276,27 +206,11 @@ def _model_digests(value):
 
 
 class RecoveryAuthorization(_Model):
-    plan: RecoveryPlan | PreSdkRecoveryPlan | PreAssignmentRecoveryPlan | MultiModelRecoveryPlan | FinishedResultRecoveryPlan | TeamsPreAcquireRecoveryPlan | ExpiredTeamsCleanupPlan
+    plan: RecoveryPlan | PreSdkRecoveryPlan | PreAssignmentRecoveryPlan | MultiModelRecoveryPlan | FinishedResultRecoveryPlan
     decision_id: Identifier
     approved_at: datetime
     expires_at: datetime
     _times = field_validator("approved_at", "expires_at")(_utc)
-
-
-class TeamsPreAcquireRecoveryAuthorization(RecoveryAuthorization):
-    schema_version: Literal["fa-teams-pre-acquire-recovery-authorization-v1"] = "fa-teams-pre-acquire-recovery-authorization-v1"
-    plan: TeamsPreAcquireRecoveryPlan
-
-
-class ExpiredTeamsCleanupAuthorization(RecoveryAuthorization):
-    schema_version: Literal["fa-expired-teams-cleanup-authorization-v1"] = "fa-expired-teams-cleanup-authorization-v1"
-    plan: ExpiredTeamsCleanupPlan
-
-
-def _authorization_model(plan):
-    if isinstance(plan, ExpiredTeamsCleanupPlan):
-        return ExpiredTeamsCleanupAuthorization
-    return TeamsPreAcquireRecoveryAuthorization if isinstance(plan, TeamsPreAcquireRecoveryPlan) else RecoveryAuthorization
 
 
 class PlatformStopObservation(_Model):
@@ -311,7 +225,7 @@ class PlatformStopObservation(_Model):
 
 
 class _StopIntent(_Model):
-    authorization: RecoveryAuthorization | TeamsPreAcquireRecoveryAuthorization | ExpiredTeamsCleanupAuthorization
+    authorization: RecoveryAuthorization
     fenced_at: datetime
     _time = field_validator("fenced_at")(_utc)
 
@@ -324,23 +238,8 @@ class _PlatformProof(_Model):
     stop_receipt_sha256: Digest
 
 
-class TeamsPreAcquireRecoveryHistory(_PlatformProof):
-    schema_version: Literal["fa-teams-pre-acquire-recovery-history-v1"] = "fa-teams-pre-acquire-recovery-history-v1"
-
-
-class ExpiredTeamsCleanupHistory(_PlatformProof):
-    schema_version: Literal["fa-expired-teams-cleanup-history-v1"] = "fa-expired-teams-cleanup-history-v1"
-
-
-def _proof_model(plan):
-    if isinstance(plan, ExpiredTeamsCleanupPlan):
-        return ExpiredTeamsCleanupHistory
-    return TeamsPreAcquireRecoveryHistory if isinstance(plan, TeamsPreAcquireRecoveryPlan) else _PlatformProof
-
-
 def _fence_stage(plan):
-    return ("cancel-teams-pre-acquire" if isinstance(plan, TeamsPreAcquireRecoveryPlan) else
-            "fence-finished-result" if isinstance(plan, FinishedResultRecoveryPlan) else "cancel-model-set")
+    return "fence-finished-result" if isinstance(plan, FinishedResultRecoveryPlan) else "cancel-model-set"
 
 
 def stop_endpoint(target):
@@ -407,12 +306,6 @@ def _claimed_receipt(inventory, launch, native_keys, *, original_request=None):
 
 def _multi_models(inventory, config, launch, expected, *, finished=False):
     """Read the complete original intent set and its immutable producer receipts."""
-    if config.schema_version == "fa-behavior-server-v2":
-        from .behavior_teams_recovery import original_teams_state
-        if expected or finished:
-            raise denied("RECOVERY_MODEL_SET_CHANGED", "Teams pre-acquire closure requires zero model intents")
-        original_teams_state(inventory, config, launch)
-        return ()
     from .behavior_recovery_history import _Inventory
     from .behavior_runtime import runtime_key
     view = _Inventory(inventory, config)
@@ -569,7 +462,7 @@ def _multi_inventory(inventory, config, plan, recovery_keys, authorization=None)
             raise denied("RECOVERY_PLAN_STALE", "unrelated authority commit interleaved with original recovery")
         revision += 1
         if stage == "authorization":
-            value = view.row(request_id, _authorization_model(plan), material=True)
+            value = view.row(request_id, RecoveryAuthorization, material=True)
             if value.plan != plan or authorization is not None and value != authorization:
                 raise denied("RECOVERY_AUTHORIZATION_INVALID", "original approval differs")
             expected = ControlRequest(request_id=request_id, request_digest=digest(value.model_dump(mode="json")))
@@ -602,12 +495,6 @@ def _multi_inventory(inventory, config, plan, recovery_keys, authorization=None)
 
 
 def _cancel_request(native, plan):
-    if isinstance(plan, TeamsPreAcquireRecoveryPlan):
-        from .behavior_teams_recovery import recovery_keys
-        return ControlRequest(request_id=recovery_key(_fence_stage(plan), plan.recovery_id),
-                              request_digest=plan.sha256,
-                              read_set=recovery_keys(native.assistant.runtime.teams_metrics.config,
-                                                     native.launch(plan.launch_id), native.store.read_inventory()))
     if isinstance(plan, (PreAssignmentRecoveryPlan, MultiModelRecoveryPlan)):
         return ControlRequest(request_id=recovery_key(
             "fence-finished-result" if isinstance(plan, FinishedResultRecoveryPlan) else
@@ -624,20 +511,6 @@ def _cancel_request(native, plan):
 
 def _cancelled_result(native, launch, proof, *, retained_result=None):
     plan = proof.intent.authorization.plan
-    if isinstance(plan, TeamsPreAcquireRecoveryPlan):
-        provenance = ({"schema_version": "fa-expired-teams-cleanup-result-proof-v1",
-                       "platform_proof_key": native_key("platform-stop", plan.launch_id),
-                       "platform_proof_sha256": digest(proof.model_dump(mode="json")),
-                       "original_work_id": plan.binding.work_id, "model_outcome": "not_requested"}
-                      if isinstance(plan, ExpiredTeamsCleanupPlan) else proof.model_dump(mode="json"))
-        return VerifiedWorkResult(
-            evidence_id=native_key("platform-stop-result", plan.launch_id), verifier_version=native.verifier_version,
-            work_id=plan.binding.work_id, definition_digest=digest(launch.definition.model_dump(mode="json")),
-            state="cancelled", passed_checks=(), known_effects=(), unresolved_operations=(),
-            content=_material({"state": "cancelled", "work_id": plan.binding.work_id,
-                "model_outcome": "not_requested", "budget_refunded": False,
-                "reason": "Original Teams assignment closed before SDK acquisition after verified platform stop."}).data,
-            proof=_material(provenance).data)
     if isinstance(plan, FinishedResultRecoveryPlan):
         result_key = assistant_key("result", plan.binding.work_id)
         record = retained_result if retained_result is not None else native.store.read_snapshot((result_key,))[result_key]
@@ -863,8 +736,8 @@ class ClaimedSdkRecovery:
         if plan != self.plan(principal):
             raise denied("RECOVERY_PLAN_STALE", "the exact reviewed recovery plan changed")
         approved_at = self.clock()
-        limit = timedelta(minutes=60 if isinstance(plan, ExpiredTeamsCleanupPlan) else 15)
-        value = _authorization_model(plan)(plan=plan, decision_id=decision_id, approved_at=approved_at,
+        limit = timedelta(minutes=15)
+        value = RecoveryAuthorization(plan=plan, decision_id=decision_id, approved_at=approved_at,
                                       expires_at=min(self.scope.expires_at, approved_at + limit))
         key = recovery_key("authorization", plan.recovery_id)
         request = ControlRequest(request_id=key, request_digest=digest(value.model_dump(mode="json")))
@@ -873,8 +746,6 @@ class ClaimedSdkRecovery:
             inventory = self.store.read_inventory()
             _multi_inventory(inventory, self.config, plan, self._keys(self.native.launch(plan.launch_id), _model_digests(plan)))
             options["expected_guard"] = inventory.guard
-            if isinstance(plan, TeamsPreAcquireRecoveryPlan):
-                options["before_send"] = lambda: self._approval_gate(principal, plan)
         self.store.transact(request, lambda _: ControlChanges(writes=(ControlWrite(
             row_id=key, mode="create", data=value.model_dump(mode="json"), material=_material(value.model_dump(mode="json")),
         ),), result={"authorization_key": key}), **options)
@@ -932,8 +803,7 @@ class ClaimedSdkRecovery:
             return ControlChanges(writes=(self.workers._write(
                 job_key, _update(job, cancel_requested=True, cancel_credit=0), rows),),
                 result=self.workers._result(status=job.state, cancel_accepted=True, executor_stopped=False))
-        options = {"before_send": lambda: self._write_gate(principal, authorization)} if isinstance(plan, TeamsPreAcquireRecoveryPlan) else {}
-        return self.store.transact(request, fence, expected_guard=inventory.guard, **options)
+        return self.store.transact(request, fence, expected_guard=inventory.guard)
 
     def execute(self, principal, authorization):
         self._authorization(principal, authorization)
@@ -978,8 +848,6 @@ class ClaimedSdkRecovery:
             _multi_models(inventory, self.config, launch, plan.model_intents, finished=isinstance(plan, FinishedResultRecoveryPlan))
             _multi_inventory(inventory, self.config, plan, keys, authorization)
             options["expected_guard"] = inventory.guard
-            if isinstance(plan, TeamsPreAcquireRecoveryPlan):
-                options["before_send"] = lambda: self._write_gate(principal, authorization)
         self.store.transact(request, reserve, **options)
         if not fresh:
             return self.reconcile(principal, authorization)
@@ -1004,17 +872,10 @@ class ClaimedSdkRecovery:
         self._check_stop(intent, observation)
         stop_key = recovery_key("stop-observation", plan.recovery_id)
         stop_request = ControlRequest(request_id=stop_key, request_digest=digest(observation.model_dump(mode="json")))
-        options = {}
-        if isinstance(plan, TeamsPreAcquireRecoveryPlan):
-            self._write_gate(principal, authorization)
-            inventory = self.store.read_inventory()
-            _multi_inventory(inventory, self.config, plan, keys, authorization)
-            options = {"expected_guard": inventory.guard,
-                       "before_send": lambda: self._write_gate(principal, authorization)}
         self.store.transact(stop_request, lambda _: ControlChanges(writes=(ControlWrite(
             row_id=stop_key, mode="create", data=observation.model_dump(mode="json"),
             material=_material(observation.model_dump(mode="json")),
-        ),), result={"provider_stop_observed": True}), **options)
+        ),), result={"provider_stop_observed": True}))
         return self.finish(principal, authorization)
 
     def _check_stop(self, intent, observation):
@@ -1058,7 +919,7 @@ class ClaimedSdkRecovery:
             stop_receipt = self.store.reconcile(ControlRequest(
                 request_id=stop_key, request_digest=digest(observation.model_dump(mode="json")),
             ))
-            proof = _proof_model(plan)(intent=intent, observation=observation,
+            proof = _PlatformProof(intent=intent, observation=observation,
                                    cancellation_receipt_sha256=digest(cancel_receipt.payload),
                                    stop_receipt_sha256=digest(stop_receipt.payload))
             evidence_id = native_key("platform-stop-evidence", plan.launch_id)
@@ -1115,7 +976,7 @@ class ClaimedSdkRecovery:
             self.workers.forward_result(plan.binding.job_id, plan.binding.owner, self.delivery)
         return {"recovery_id": plan.recovery_id, "state": self.workers.inspect(plan.binding.job_id).state,
                 "platform_stop_evidence_id": evidence_id,
-                "model_outcome": "not_requested" if isinstance(plan, (PreSdkRecoveryPlan, TeamsPreAcquireRecoveryPlan)) else "unknown",
+                "model_outcome": "not_requested" if isinstance(plan, PreSdkRecoveryPlan) else "unknown",
                 "stop_resent": False,
                 "delivered": False,
                 **({"execution_closure": "platform_stop_after_durable_finish", "sdk_graceful_exit_claim": False}
@@ -1123,15 +984,9 @@ class ClaimedSdkRecovery:
 
 
 def verify_platform_stop(native, launch, saved, proof_row):
-    data = proof_row.payload["data"]
-    model = (ExpiredTeamsCleanupHistory if data.get("schema_version") == "fa-expired-teams-cleanup-history-v1" else
-             TeamsPreAcquireRecoveryHistory if data.get("schema_version") == "fa-teams-pre-acquire-recovery-history-v1" else _PlatformProof)
-    proof = _parse(data, model)
+    proof = _parse(proof_row.payload["data"], _PlatformProof)
     plan, observation = proof.intent.authorization.plan, proof.observation
-    if isinstance(plan, TeamsPreAcquireRecoveryPlan):
-        from .behavior_teams_recovery import verify_plan_original
-        verify_plan_original(native.store.read_inventory(), native.assistant.runtime.teams_metrics.config, launch, plan)
-    elif isinstance(plan, PreAssignmentRecoveryPlan):
+    if isinstance(plan, PreAssignmentRecoveryPlan):
         claim = _unassigned_claim(native.store.read_inventory(), launch, native._keys(launch),
                                   original_request=plan.native_claim_request)
         if digest(claim.payload) != plan.native_claim_receipt_sha256:
@@ -1215,9 +1070,8 @@ def verify_platform_stop(native, launch, saved, proof_row):
     reservation = ControlRequest(
         request_id=recovery_key("stop-intent", plan.recovery_id),
         request_digest=digest(proof.intent.model_dump(mode="json")),
-        read_set=(_cancel_request(native, plan).read_set if isinstance(plan, TeamsPreAcquireRecoveryPlan)
-                  else _recovery_keys(native, launch, _model_digests(plan),
-                                     before_assignment=isinstance(plan, (PreAssignmentRecoveryPlan, MultiModelRecoveryPlan)))),
+        read_set=_recovery_keys(native, launch, _model_digests(plan),
+                                before_assignment=isinstance(plan, (PreAssignmentRecoveryPlan, MultiModelRecoveryPlan))),
     )
     if (digest(native.store.reconcile(cancel).payload) != proof.cancellation_receipt_sha256
             or digest(native.store.reconcile(stop).payload) != proof.stop_receipt_sha256

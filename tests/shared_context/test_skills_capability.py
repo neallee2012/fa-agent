@@ -13,7 +13,7 @@ from shared_context.behavior_history_skill_draft_prompt import HISTORY_SKILL_DRA
 from shared_context.behavior_skill_draft import HISTORY_SKILL_DRAFT_PROFILE
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import check_history, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_instruction_prompt import saved_turn, submit
 from test_m3_auth import jwk_client, signing_key
 
@@ -95,4 +95,3 @@ def test_selected_skills_capability_reads_skills_with_history_tools_and_can_be_n
     assert follow.capabilities.grants == () and follow.skill_catalog_budget_profile is None
     assert saved_turn(h, h.runtime.bindings[followed["binding_id"]].job_id).skill_catalog is None
     assert len(reads) == 1
-    check_history(h)

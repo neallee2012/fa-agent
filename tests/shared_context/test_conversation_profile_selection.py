@@ -8,11 +8,11 @@ import pytest
 from shared_context.behavior_agent_template import AgentTemplate, TemplateRole, TemplateSettings, TemplateSkill
 from shared_context.behavior_assistant import AssistantProfile
 from shared_context.behavior_profile_selection import SelectConversationProfile
-from shared_context.behavior_profile_selection import validate_profile_history, selection_key
+from shared_context.behavior_profile_selection import selection_key
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_inventory, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_inventory, instruction_models, runtime_path, sdk_io
 from shared_context.errors import Problem
 from shared_context.behavior_work_policy import derive_registered_work
 from shared_context.behavior_work_policy import WorkPreflightQuery
@@ -82,7 +82,6 @@ def test_human_selection_changes_only_new_conversations_and_survives_reconstruct
     control.refresh()
     assert control.records[first["binding_id"]].model_dump_json() == old_record
     assert control.records[third["binding_id"]].profile.prompt_profile == profile
-    check_history(h)
 
 
 def test_responses_selection_captures_only_new_conversations_without_rewriting_old_checkpoints(assistant, monkeypatch):
@@ -109,7 +108,6 @@ def test_responses_selection_captures_only_new_conversations_without_rewriting_o
     control.records.clear()
     control.refresh()
     assert control.records[newest["binding_id"]].profile.instruction.model_provider == "openai-responses"
-    check_history(h)
 
 
 def test_responses_reasoning_mode_is_captured_without_reloading_current_model_facts(assistant):
@@ -200,11 +198,6 @@ def test_wrong_previous_selection_and_same_request_with_new_content_do_not_overw
                         value=template(text_attachment_profile="fa-source-text-attachments-v1"))
     assert changed.status_code == 200, changed.text
     assert h.client.get(PATH, headers=h.headers()).json()["settings"]["text_attachment_profile"] == "fa-source-text-attachments-v1"
-    config = SimpleNamespace(table=SimpleNamespace(scope=h.store._scope), sha256="f" * 64,
-        workers=h.workers.contract, delivery=h.delivery.contract,
-        identity=SimpleNamespace(human_oid=h.binding.human_oid))
-    choices = validate_profile_history(instruction_inventory(h), config, control.policy)
-    assert set(choices) == {selected.json()["result"]["selection_id"], changed.json()["result"]["selection_id"]}
 
 
 def test_unknown_original_selection_is_not_replayed_as_a_new_choice(assistant):
@@ -273,7 +266,6 @@ def test_later_human_choice_does_not_change_original_selection_or_work(assistant
     record = control.records[third["binding_id"]]
     with pytest.raises(Problem):
         derive_registered_work(control.policy, record, h.runtime.mode)
-    check_history(h)
 
 
 def test_approved_destination_skill_can_be_selected_without_moving_policy_or_grants(
@@ -298,7 +290,6 @@ def test_approved_destination_skill_can_be_selected_without_moving_policy_or_gra
     assert profile.prompt_profile == "fa-instruction-skill-purpose-v1"
     assert h.runtime.controller.step(accepted["binding_id"]).state == "succeeded"
     assert control.policy.model_dump_json() == original_policy
-    check_history(h)
 
 
 def test_template_cannot_select_unavailable_destination_skill_versions(assistant):

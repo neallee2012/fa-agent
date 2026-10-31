@@ -11,12 +11,9 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from shared_context import behavior_recovery_history
 from shared_context.behavior_migration import (
     DEFAULT_INVENTORY_MAX_BYTES, DEFAULT_INVENTORY_MAX_ENTITIES, DEFAULT_INVENTORY_MAX_PAGES,
 )
-from shared_context.behavior_recovery_history import validate_recovery_history
-from shared_context.behavior_runtime_rotation import _measure_layout
 from shared_context.behavior_store import GUARD_KEY, ControlChanges, ControlRequest, ControlWrite, _Receipt, _json
 from shared_context.errors import Problem
 from test_behavior_migration_store import store_with_row
@@ -106,86 +103,11 @@ def test_startup_inventory_and_current_history_accept_over_32mib(
     total = payload_bytes(table, scope)
     assert target_mib * 1024 * 1024 < total < DEFAULT_INVENTORY_MAX_BYTES
     before = dict(table.backing.rows)
-    parsed = behavior_recovery_history._parsed
-    receipt_parses = []
-
-    def counted(value, model):
-        if model is _Receipt:
-            receipt_parses.append(1)
-        return parsed(value, model)
-
-    monkeypatch.setattr(behavior_recovery_history, "_parsed", counted)
     inventory = read_startup(c)
     assert len(inventory.receipts) == len(c.before.receipts) + 1 + count
-    # Every startup view of one inventory shares one checked receipt copy instead of re-parsing it.
-    assert len(receipt_parses) == len(inventory.receipts)
     assert table.backing.rows == before
     assert not c.sessions.calls
     print(json.dumps({"inventory_bytes": total, "entities": len(before), "startup_readers_completed": True}))
-
-
-def assert_cutover_limit(store, table, inventory, changes):
-    writes = len(table.submissions)
-    with pytest.raises(Problem) as denied:
-        _measure_layout(
-            store, inventory, SimpleNamespace(sha256="b" * 64), SimpleNamespace(sha256="c" * 64),
-            ControlRequest(request_id="inventory-capacity-preview", request_digest="d" * 64), changes,
-        )
-    assert denied.value.status == 413
-    assert denied.value.body["error"]["code"] == "ROTATION_INVENTORY_LIMIT"
-    assert len(table.submissions) == writes
-
-
-def test_inventory_default_entity_bound_accepts_its_limit_and_refuses_next_entity():
-    store, table = store_with_row()
-    table.page_size = 1000
-    append_receipts(table, SCOPE, DEFAULT_INVENTORY_MAX_ENTITIES - len(table.backing.rows))
-    inventory = store.read_inventory()
-    assert len(inventory.entity_sha256) == DEFAULT_INVENTORY_MAX_ENTITIES == 131072
-    assert dict(validate_recovery_history(inventory, None)) == {}
-    assert_cutover_limit(store, table, inventory, ControlChanges(result={}))
-    append_receipts(table, SCOPE, 1)
-    with pytest.raises(Problem) as denied:
-        store.read_inventory()
-    assert denied.value.status == 413
-    assert denied.value.body["error"]["code"] == "BEHAVIOR_INVENTORY_LIMIT"
-
-
-def test_inventory_default_byte_bound_refuses_over_256mib():
-    store, table = store_with_row()
-    table.page_size = 1000
-    append_receipts(table, SCOPE, DEFAULT_INVENTORY_MAX_BYTES // (32 * 1024) - 1, receipt_bytes=32 * 1024)
-    inventory = store.read_inventory()
-    assert DEFAULT_INVENTORY_MAX_BYTES == 256 * 1024 * 1024
-    assert DEFAULT_INVENTORY_MAX_BYTES - 1024 * 1024 < payload_bytes(table, SCOPE) < DEFAULT_INVENTORY_MAX_BYTES
-    assert_cutover_limit(store, table, inventory, ControlChanges(writes=(
-        ControlWrite(row_id="cutover-extra", mode="create", data={"padding": "x" * 47000}),
-    ), result={}))
-    append_receipts(table, SCOPE, 1, receipt_bytes=32 * 1024)
-    assert payload_bytes(table, SCOPE) > DEFAULT_INVENTORY_MAX_BYTES
-    with pytest.raises(Problem) as denied:
-        store.read_inventory(max_entities=None)
-    assert denied.value.status == 413
-    assert denied.value.body["error"]["code"] == "BEHAVIOR_INVENTORY_LIMIT"
-    assert denied.value.body["error"]["message"] == "complete inventory exceeds its bound"
-
-
-def test_startup_reads_its_inventory_with_the_default_byte_bound():
-    from shared_context.behavior_work_policy_installation import installed_work_policy_origin
-
-    class Stop(Exception):
-        pass
-
-    class Store:
-        def read_inventory(self, **bounds):
-            seen.update(bounds)
-            raise Stop
-
-    seen = {}
-    with pytest.raises(Stop):
-        installed_work_policy_origin(Store(), None)
-    # No max_bytes: startup keeps the 256 MiB default; data near it can exhaust API memory before the 413.
-    assert seen == {"max_entities": None, "log_capacity": True}
 
 
 def test_inventory_default_page_bound_accepts_its_limit_and_refuses_next_page():
@@ -214,3 +136,32 @@ def test_invalid_inventory_bounds_still_fail_before_table_query(limits):
     assert denied.value.status == 422
     assert denied.value.body["error"]["code"] == "BEHAVIOR_INVENTORY_LIMIT"
     assert queries == []
+
+
+def test_inventory_default_entity_bound_accepts_its_limit_and_refuses_next_entity():
+    store, table = store_with_row()
+    table.page_size = 1000
+    append_receipts(table, SCOPE, DEFAULT_INVENTORY_MAX_ENTITIES - len(table.backing.rows))
+    inventory = store.read_inventory()
+    assert len(inventory.entity_sha256) == DEFAULT_INVENTORY_MAX_ENTITIES == 131072
+    append_receipts(table, SCOPE, 1)
+    with pytest.raises(Problem) as denied:
+        store.read_inventory()
+    assert denied.value.status == 413
+    assert denied.value.body["error"]["code"] == "BEHAVIOR_INVENTORY_LIMIT"
+
+
+def test_inventory_default_byte_bound_refuses_over_256mib():
+    store, table = store_with_row()
+    table.page_size = 1000
+    append_receipts(table, SCOPE, DEFAULT_INVENTORY_MAX_BYTES // (32 * 1024) - 1, receipt_bytes=32 * 1024)
+    inventory = store.read_inventory()
+    assert DEFAULT_INVENTORY_MAX_BYTES == 256 * 1024 * 1024
+    assert DEFAULT_INVENTORY_MAX_BYTES - 1024 * 1024 < payload_bytes(table, SCOPE) < DEFAULT_INVENTORY_MAX_BYTES
+    append_receipts(table, SCOPE, 1, receipt_bytes=32 * 1024)
+    assert payload_bytes(table, SCOPE) > DEFAULT_INVENTORY_MAX_BYTES
+    with pytest.raises(Problem) as denied:
+        store.read_inventory(max_entities=None)
+    assert denied.value.status == 413
+    assert denied.value.body["error"]["code"] == "BEHAVIOR_INVENTORY_LIMIT"
+    assert denied.value.body["error"]["message"] == "complete inventory exceeds its bound"

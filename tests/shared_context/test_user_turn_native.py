@@ -26,7 +26,7 @@ from shared_context.behavior_user_turn_prompt import USER_TURN_CAPABILITIES, USE
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
-from test_instruction_flow import check_history, instruction_models
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import signing_key, jwk_client
@@ -173,7 +173,6 @@ def test_compacted_new_runtime_reads_saved_user_original_not_summary(assistant, 
                 assert archive.archive.codec == DIAG_ARCHIVE_CODEC
             retained.update(h.store.read_snapshot((key("text-archive", binding.job_id),
                                                    key("result", binding.work.work_id))))
-            check_history(h)
             events = events_from(bridges[-1]._session_files.snapshot().files)
             expected_users = [texts[3]] if phase == 3 else list(texts[:phase + 1])
             assert [event["data"]["content"] for event in events if event["type"] == "user.message"] == expected_users

@@ -1,0 +1,12 @@
+[
+  {"id": "T0", "url": "https://<foundryAccountName>.services.ai.azure.com/api/projects/<projectName>/openai/v1/chat/completions",
+   "wire": "chat", "model": "gpt-5-mini", "auth": {"type": "mi", "audience": "https://ai.azure.com"}},
+  {"id": "T1", "url": "https://<apimName>.azure-api.net/foundry/openai/v1/chat/completions",
+   "wire": "chat", "model": "gpt-5-mini", "auth": {"type": "mi", "audience": "https://cognitiveservices.azure.com"}},
+  {"id": "T2", "url": "https://<apimName>.azure-api.net/foundry/openai/v1/responses",
+   "wire": "responses", "model": "gpt-5-mini", "auth": {"type": "mi", "audience": "https://cognitiveservices.azure.com"}},
+  {"id": "T5ip", "url": "http://<mockVmPrivateIp>:8000/v1/chat/completions",
+   "wire": "chat", "model": "gpt-5-mini", "auth": {"type": "key", "header": "api-key", "env": "MOCK_API_KEY"}},
+  {"id": "T5dns", "url": "http://llm.onprem-sim.test:8000/v1/chat/completions",
+   "wire": "chat", "model": "gpt-5-mini", "auth": {"type": "key", "header": "api-key", "env": "MOCK_API_KEY"}}
+]

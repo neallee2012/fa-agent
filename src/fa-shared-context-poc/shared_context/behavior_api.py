@@ -377,8 +377,7 @@ def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, 
                 principal: BehaviorPrincipal = Depends(identity),
             ):
                 assistant_claim = (method == "claim" and runtime.mode == "native"
-                                   and binding_id in getattr(runtime, "profiles", {})
-                                   and runtime.bindings[binding_id].route.channel_id != "msteams")
+                                   and binding_id in getattr(runtime, "profiles", {}))
                 try:
                     if assistant_claim:
                         from .behavior_assistant import _read_conflicts

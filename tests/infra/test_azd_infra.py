@@ -59,6 +59,13 @@ def test_standalone_templates_build(workspace, template):
     assert build(workspace, template)["resources"]
 
 
+def test_the_console_environment_reaches_the_container(workspace):
+    template = build(workspace, "infra/web-console/web-console.bicep")
+    assert "defaultValue" not in template["parameters"]["environmentVariables"]  # forgetting it fails, never wipes
+    container = deployments(template)["fa-web-console-app"]["properties"]["parameters"]["containers"]["value"][0]
+    assert container["env"] == "[parameters('environmentVariables')]"
+
+
 def deployments(template):
     return {resource["name"]: resource for resource in template["resources"].values()} \
         if isinstance(template["resources"], dict) else {item["name"]: item for item in template["resources"]}

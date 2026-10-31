@@ -6,14 +6,14 @@ from types import SimpleNamespace
 import pytest
 
 from shared_context.behavior_assistant_wire import ModelRequest
-from shared_context.behavior_profile_selection import SelectConversationProfile, validate_profile_history
+from shared_context.behavior_profile_selection import SelectConversationProfile
 from shared_context.behavior_sdk_files import SdkSessionFiles
 from shared_context.behavior_sdk_state import CheckpointProfile
 from shared_context.behavior_work_policy import WorkPolicyControl
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import PATH, configured, select, template
-from test_instruction_flow import check_history, instruction_inventory, instruction_models, runtime_path, sdk_io
+from test_instruction_flow import instruction_inventory, instruction_models, runtime_path, sdk_io
 from test_instruction_prompt import submit
 from test_m3_auth import signing_key, jwk_client
 from test_sdk_compaction_product import checkpoint_profile, event, observation, open_turn, ordinary, raw_files, settle
@@ -34,8 +34,6 @@ def selection_history(h, control):
     config = SimpleNamespace(table=SimpleNamespace(scope=h.store._scope), sha256="f" * 64,
         workers=h.workers.contract, delivery=h.delivery.contract,
         identity=SimpleNamespace(human_oid=h.binding.human_oid))
-    validate_profile_history(instruction_inventory(h), config, control.policy)
-    check_history(h)
 
 
 def test_selected_checkpoint_profile_survives_disable_and_restart(assistant):

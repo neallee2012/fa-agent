@@ -12,10 +12,10 @@ import httpx
 import pytest
 
 from conftest import A
-from shared_context.api import create_app
+from legacy_m2_m4.api import create_app
 from shared_context.m2_assistant import DesktopAction
 from shared_context.m2_copilot import ToolOutput, ToolSpec, run_copilot
-from shared_context.m2_gateway import M2Gateway, M2Settings
+from legacy_m2_m4.m2_gateway import M2Gateway, M2Settings
 
 RUNTIME = Path(os.environ.get("M2_TEST_RUNTIME", str(
     Path(__file__).resolve().parents[2] / ".azure" / "m2-runtime-1.0.83" / "prebuilds" / "win32-x64" / "copilot-runtime.exe"

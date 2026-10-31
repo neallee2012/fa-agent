@@ -2,10 +2,11 @@
 
 from dataclasses import replace
 from datetime import timedelta
+import base64
 import json
 import os
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -20,7 +21,6 @@ from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_migration import MigrationStore, installed_origin
 from shared_context.behavior_operations import control_key
 from shared_context.behavior_server import application, build_server
-from shared_context.behavior_server_config import NativeEvidenceBundle, ProtectionObservation
 from shared_context.behavior_store import ControlRequest
 from shared_context.source_materials import digest
 from shared_context.errors import Problem
@@ -29,36 +29,48 @@ from shared_context.m3_auth import ApprovalSettings
 from shared_context.m3_store import InMemoryArtifactStore
 from shared_context.models import CreateWork
 from shared_context.service import ContextService
-from test_behavior_rotation_cutoff import publish_worker, publish_inbox, two_rotations
-from test_behavior_rotation_settlement_history import current_cancelled
-from test_behavior_runtime_rotation import rotated
-from test_behavior_runtime_rotation_sources import QueryTransport
-from test_behavior_store import Credential, WireTransport
+from test_behavior_assistant_server import AssistantHarness
+from test_behavior_server import NOW
+from test_behavior_store import Credential, WireTransport, json_response
 from test_m3_auth import jwk_client, signing_key, token
 from conftest import InMemoryRepository, FakeMemory
 
 
-@pytest.fixture
-def current_rotation(monkeypatch, request, tmp_path):
-    import test_behavior_runtime_transition as transition
-    original = transition.synthetic_configuration
-    def configuration():
-        config = original()
-        return config.model_copy(update={
-            "tokenizer": config.tokenizer.model_copy(update={"cache_directory": os.environ["TIKTOKEN_CACHE_DIR"]}),
-            "evidence": config.evidence.model_copy(update={"path": str(tmp_path / "current-evidence.json")}),
-        })
-    monkeypatch.setattr(transition, "synthetic_configuration", configuration)
-    return request.getfixturevalue("two_rotations")
+class QueryTransport(WireTransport):
+    """Actual Table SDK serialization, exclusively local HTTP responses."""
+    def send(self, request, **kwargs):
+        if request.method == "GET" and urlsplit(request.url).path.rstrip("()") == "/Behavior":
+            self.requests.append(request)
+            assert parse_qs(urlsplit(request.url).query)["$filter"] == ["PartitionKey eq 'authority'"]
+            items = [{**entity, "Payload": base64.b64encode(entity["Payload"]).decode(),
+                      "Payload@odata.type": "Edm.Binary", "odata.etag": entity.metadata["etag"]}
+                     for (table, partition, _), entity in sorted(self.backing.rows.items())
+                     if table == "Behavior" and partition == "authority"]
+            return json_response(request, 200, {"value": items}, {})
+        return super().send(request, **kwargs)
 
 
 @pytest.fixture
-def native_acquire(current_rotation, jwk_client, signing_key, request):
-    h, c = current_rotation, current_rotation.c
-    config = h.service.new
+def installed_assistant(tmp_path, jwk_client):
+    """An assistant configuration installed by the ordinary bootstrap writer, on its own offline Table."""
+    h = AssistantHarness(tmp_path, jwk_client)
+    h.legacy()
+    h.activate()
+    identity = h.config.identity
+    principal = BehaviorPrincipal(identity.tenant_id, identity.human_oid, identity.team_id, "human", None,
+                                  frozenset({"read", "submit", "approve", "acknowledge"}))
+    try:
+        yield SimpleNamespace(harness=h, table=h.table, config=h.config, principal=principal, clock=[NOW])
+    finally:
+        h.composition.close()
+
+
+@pytest.fixture
+def native_acquire(installed_assistant, jwk_client, signing_key, request):
+    c, config = installed_assistant, installed_assistant.config
     clock = [c.clock[0] + timedelta(seconds=1)]
     transport = QueryTransport()
-    transport.backing = c.h.table.backing
+    transport.backing = c.table.backing
     def forbidden(*args, **kwargs):
         pytest.fail("no external model, Blob or Foundry call is allowed")
     no_io = WireTransport()
@@ -70,27 +82,6 @@ def native_acquire(current_rotation, jwk_client, signing_key, request):
         runtime = composition.runtime
         store = runtime.store
         installed_origin(store, config)
-        _, worker = publish_worker(store, config, clock[0], "acquire-worker")
-        worker = worker.model_copy(update={
-            "native_binding_reference": config.deployment_id, "supervisor_reference": config.controller_id,
-            "protection_reference": config.sources.protection.generation, "evidence_id": "bound-acquire-worker",
-            "observed_at": clock[0] + timedelta(microseconds=1),
-        })
-        clock[0] += timedelta(microseconds=1)
-        runtime.dep.workers.adapter = replace(runtime.dep.workers.adapter, verify_readiness=lambda _: worker)
-        runtime.dep.workers.publish_readiness(worker.evidence_id)
-        _, _, inbox = publish_inbox(store, config, clock[0], worker, "bound-acquire-inbox")
-        bundle = NativeEvidenceBundle(
-            catalog_id=config.evidence.catalog_id, revision=config.evidence.minimum_revision,
-            observer_oid=config.evidence.observer_oid, configuration_sha256=config.sha256,
-            deployment_id=config.deployment_id, resource_bindings=config.resource_bindings(),
-            captured_at=clock[0], expires_at=clock[0] + timedelta(minutes=10),
-            sources=ProtectionObservation.model_validate_json(h.c.h.paths.sources.read_bytes()),
-            backups=ProtectionObservation.model_validate_json(h.c.h.paths.backups.read_bytes()),
-            worker=worker, inbox=inbox, delivery=inbox.readiness,
-        )
-        from pathlib import Path
-        Path(config.evidence.path).write_text(bundle.model_dump_json(), encoding="utf-8")
         b, profile = config.bindings[0], config.assistant.profiles[0]
         auth = config.identity.auth()
         actor = auth.actors[b.agent_oid]
@@ -143,7 +134,7 @@ def native_acquire(current_rotation, jwk_client, signing_key, request):
             "https://context.invalid", assignment, ticket,
             token_provider=lambda: headers["Authorization"].removeprefix("Bearer "),
             transport=httpx.MockTransport(send))
-        competitor = MigrationStore(c.h.table, store._scope)
+        competitor = MigrationStore(composition.clients[0], store._scope)
         other_inbox = inbox_module.PullInbox(competitor, runtime.dep.inbox.registration)
         other_core = delivery.DeliveryCore(
             competitor, clock=lambda: clock[0],
@@ -159,7 +150,7 @@ def native_acquire(current_rotation, jwk_client, signing_key, request):
                 runtime.dep.native_launches.probe(starts[0].binding)
         try:
             yield SimpleNamespace(
-                h=h, config=config, clock=clock, composition=composition, authority=authority, store=store,
+                h=c, config=config, clock=clock, composition=composition, authority=authority, store=store,
                 transport=transport, hosted=hosted, requests=requests, client=client,
                 assignment=assignment, ticket=ticket, binding=b, tick=tick, count=count, starts=starts,
                 statuses=statuses, competitor=competitor, native=runtime.dep.native_launches,
@@ -188,9 +179,7 @@ def inject_race(case, monkeypatch, kind, *, times=1, change=None):
     requests = []
     acquire_id = key("acquire", case.assignment.session_id, "sdk-start")
     def send(request, **kwargs):
-        match = (request.method == "GET" and urlsplit(request.url).path.rstrip("()") == "/Behavior"
-                 if kind == "inventory" else request.method == "POST"
-                 and acquire_id.encode() in request.body)
+        match = request.method == "POST" and acquire_id.encode() in request.body
         if match:
             requests.append(request)
             if len(requests) <= times:
@@ -202,7 +191,7 @@ def inject_race(case, monkeypatch, kind, *, times=1, change=None):
     return requests
 
 
-@pytest.mark.parametrize("race", ["inventory", "egt", "predicate"])
+@pytest.mark.parametrize("race", ["egt", "predicate"])
 def test_one_no_effect_conflict_does_not_strand_the_original_acquire(native_acquire, monkeypatch, race):
     c = native_acquire
     original = c.transport.send
@@ -237,7 +226,7 @@ def test_one_no_effect_conflict_does_not_strand_the_original_acquire(native_acqu
         c.hosted.acquire()
 
 
-@pytest.mark.parametrize("race,phase", [("inventory", "native_evidence"), ("egt", "acquire_authority")])
+@pytest.mark.parametrize("race,phase", [("egt", "acquire_authority")])
 def test_exhausted_conflicts_keep_first_safe_category_and_do_not_spawn_sdk(native_acquire, monkeypatch, tmp_path, race, phase):
     c = native_acquire
     seen = inject_race(c, monkeypatch, race, times=3)
@@ -406,13 +395,6 @@ def test_bounded_reentry_retains_original_assignment_and_request_bytes(native_ac
     saved = receipt(c)
     assert saved.payload["request"]["request_digest"] == digest({"request_id": "sdk-start"})
     assert len(saved.payload["writes"]) == 1
-
-
-def test_read_only_status_uses_bounded_full_evidence_guard_without_acquiring(native_acquire, monkeypatch):
-    c = native_acquire
-    seen = inject_race(c, monkeypatch, "inventory", times=1)
-    assert c.hosted.status().state == "accepted"
-    assert len(seen) >= 2 and c.count == [1] and receipt(c) is None
 
 
 @pytest.mark.parametrize("field", ["code", "phase", "duplicate"])

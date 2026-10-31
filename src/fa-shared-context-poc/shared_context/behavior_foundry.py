@@ -1307,10 +1307,6 @@ class NativeLaunchAuthority:
                     raise Problem(403, "NATIVE_ASSISTANT_DISABLED", "durable assistant result/checkpoint is required")
                 self.assistant.verify_native_report_snapshot(rows, assistant_plan[2])
                 result, checkpoint = assistant_plan[:2]
-                if state == "parked" and result is not None and result.state == "failed" and checkpoint is None:
-                    # The explicit Teams rule exhausts a bounded SDK generation
-                    # only AFTER the same verified full-tree parked/stop proof.
-                    state = "failed"
             elif sealed and state == "succeeded":
                 expected = {
                     "workload_version": "checksum-count-v1", "input_digest": current.start.binding.input_digest,
@@ -1571,12 +1567,8 @@ class NativeLaunchAuthority:
         elif launch.sealed_evidence_id == native_key("lost-session-evidence", launch.launch_id):
             self._verify_lost_session(launch, saved)
         elif launch.sealed_evidence_id == native_key("original-stop-close-evidence", launch.launch_id):
-            from .behavior_recovery_close import verify_closed
-            proof_key = native_key("original-stop-close", launch.launch_id)
-            proof = self.store.read_snapshot((proof_key,))[proof_key]
-            if proof is None:
-                raise Problem(403, "NATIVE_EVIDENCE_INVALID", "original stop closure is missing")
-            verify_closed(self, launch, saved, proof)
+            # No deployed producer wrote this closure (#1051); its reader is gone, so never fall through to accept it.
+            raise Problem(403, "NATIVE_EVIDENCE_INVALID", "original stop closures are retired and cannot be verified")
         elif launch.sealed_evidence_id == native_key("platform-stop-evidence", launch.launch_id):
             from .behavior_recovery import verify_platform_stop
             proof_key = native_key("platform-stop", launch.launch_id)
@@ -1682,11 +1674,12 @@ class NativeLaunchAuthority:
         original_key = native_key("evidence", launch.sealed_evidence_id)
         unclaimed = launch.native_invocation_id is None
         platform_stopped = launch.sealed_evidence_id == native_key("platform-stop-evidence", launch_id)
-        original_closed = launch.sealed_evidence_id == native_key("original-stop-close-evidence", launch_id)
+        if launch.sealed_evidence_id == native_key("original-stop-close-evidence", launch_id):
+            # No deployed producer wrote this closure (#1051); its reader is gone, so never reconcile it as terminal.
+            raise Problem(403, "NATIVE_TERMINAL_INVALID", "original stop closures are retired and cannot be reconciled")
         lost = launch.sealed_evidence_id == native_key("lost-session-evidence", launch_id)
         proof_key = (native_key("unclaimed-fence", launch_id) if unclaimed
                      else native_key("platform-stop", launch_id) if platform_stopped
-                     else native_key("original-stop-close", launch_id) if original_closed
                      else original_key if lost
                      else native_key("report", launch.sealed_evidence_id))
         sequence = launch.evidence_sequence + 1
@@ -1712,11 +1705,6 @@ class NativeLaunchAuthority:
                 self._verify_unclaimed_fence(current, original, rows[proof_key])
             elif lost:
                 self._verify_lost_session(current, original)
-            elif original_closed:
-                from .behavior_recovery_close import verify_closed
-                if rows[proof_key] is None:
-                    raise Problem(403, "NATIVE_TERMINAL_INVALID", "original stop closure is missing")
-                verify_closed(self, current, original, rows[proof_key])
             elif platform_stopped:
                 from .behavior_recovery import verify_platform_stop
                 if rows[proof_key] is None:

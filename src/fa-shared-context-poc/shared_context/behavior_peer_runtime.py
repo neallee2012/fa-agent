@@ -21,7 +21,7 @@ from .behavior_team_registry import agent_retired, registered_agent_ids, resolve
 from .behavior_runtime import RuntimeDependencies
 from .behavior_work_policy import attach_standing_policy
 from .behavior_work_policy import work_policy_key
-from .behavior_work_target import selected_targets
+from .behavior_work_target import refuse_retired_selection, selected_targets
 from .behavior_workers import WorkerCore
 from .errors import Problem
 
@@ -34,6 +34,8 @@ def build_peer(owner, policy, *, credential, native_transports, assistant_transp
     if (config.workers.capacity != 1 or len(targets) != 1
             or targets[0].agent_oid != policy.template.owner.principal_id):
         raise Problem(503, "AGENT_RUNTIME_SCOPE_NOT_WIRED", "a peer requires one exact owning C1 target")
+    # Peers are built here, not by the startup installation, so a leftover selection row stops this peer too.
+    refuse_retired_selection(store, config, policy)
     resources = ExitStack()
     try:
         catalog = NativeEvidenceCatalog(config, clock=clock)

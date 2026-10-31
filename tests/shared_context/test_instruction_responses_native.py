@@ -223,7 +223,6 @@ def test_native_responses_crosses_hosted_api_checkpoint_progress_and_original_le
     from shared_context.behavior_work_policy import CostLedger
     from shared_context.behavior_work_policy_api import install_work_policy_routes
     from test_conversation_profile_selection import configured, select, template
-    from test_instruction_flow import check_history
 
     h, control, human = configured(assistant)
     control.models.models["gpt-5.4-mini"] = InstructionModel(id="gpt-5.4-mini", display_name="gpt-5.4-mini",
@@ -277,4 +276,3 @@ def test_native_responses_crosses_hosted_api_checkpoint_progress_and_original_le
         assert upload.reference.model_provider == "openai-responses"
     ledger = _row(h.store.read_snapshot((control.cost_key,)), control.cost_key, CostLedger)
     assert len(calls) == 4 and ledger.model_pending_microusd == 0 and ledger.model_metered_microusd == 120
-    check_history(h)

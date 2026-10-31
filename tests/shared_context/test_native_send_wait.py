@@ -232,6 +232,7 @@ def test_an_older_follows_pending_is_withdrawn_in_request_and_the_message_is_adm
         stage="prepare", idle_only=True, files_required=True))
     assert left.status_code == 200 and left.json()["state"] == "pending", left.text
     enforcing(fixture, monkeypatch)
+    fake_time(monkeypatch)  # the send resends once; a slow machine must not use up the real 10 s wait
     caplog.set_level(logging.WARNING)
     start = len(fixture.controls)
     admitted(submit_on_source(fixture, "after-older-follow"), fixture.source.session_id)

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 import httpx
 import pytest
 
-from shared_context.behavior_channels_pin_refresh import core_code_sha256
+from shared_context.behavior_code_identity import code_sha256 as core_code_sha256
 from shared_context.behavior_assistant import _LocalHttp
 from shared_context.behavior_profile_selection import SelectConversationProfile
 from shared_context.behavior_peer_runtime import install_peer_routing

@@ -337,7 +337,6 @@ class _VerifiedOrigin:
     store: object
     origin: ServerConfiguration
     installation_fence: tuple[str, str] | None
-    pins: Mapping[str, str | None] | None
 
 
 class ServerComposition:
@@ -348,7 +347,6 @@ class ServerComposition:
         self.clients, self._resources, self.closed = clients, resources, False
         self._probe_transport = probe_transport
         self.assistant = None
-        self.teams = None
         self._instruction_tasks = {}
         self._instruction_wakes = {}
         # Bindings whose original Hosted did not answer; the keepalive must not wake their session.
@@ -368,8 +366,6 @@ class ServerComposition:
         self._agent_message_consumer_lock = Lock()
         self._peer_router = None
         self._verified_origin: _VerifiedOrigin | None = None
-        # One standing full check at a time: each holds up to the whole inventory read; RLock so re-entry cannot hang.
-        self._origin_check_lock = RLock()
 
     def close(self):
         with self._peer_lock:
@@ -401,8 +397,9 @@ class ServerComposition:
                     peer = self._peer_factory(policy)
                 except Exception as error:
                     import logging
-                    logging.getLogger(__name__).error("AGENT_RUNTIME_UNAVAILABLE agent_id=%s exception_type=%s",
-                                                       agent_id, type(error).__name__)
+                    code = error.body["error"]["code"] if isinstance(error, Problem) else "UNCLASSIFIED"
+                    logging.getLogger(__name__).error("AGENT_RUNTIME_UNAVAILABLE agent_id=%s exception_type=%s code=%s",
+                                                       agent_id, type(error).__name__, code)
                     raise Problem(503, "AGENT_RUNTIME_UNAVAILABLE", "the selected peer runtime could not be initialized") from None
                 owned = set(self.runtime.bindings)
                 for previous in self._peers.values():
@@ -422,45 +419,14 @@ class ServerComposition:
         self.close()
 
     def installation(self):
-        from .behavior_migration import installed_origin, installed_origin_pins
+        from .behavior_migration import installed_origin
 
         if self.closed:
             raise _denied("server composition is closed")
         store = self.runtime.store
-        verified_now, pins, locked = False, None, False
         try:
             if self.agent_id is None:
-                verified = self._verified_origin
-                # Only a standing-policy origin has pins; every other kind keeps main's per-request check, unread.
-                # Read before the full check, so a pointer that moves during it fails the next request's match.
-                pins = (None if isinstance(verified, _VerifiedOrigin) and verified.pins is None
-                        else installed_origin_pins(store, self.config))
-
-                def reusable(verified):
-                    return (pins is not None and isinstance(verified, _VerifiedOrigin)
-                            and verified.process_id == getpid()
-                            and verified.configuration is self.config and verified.store is store
-                            and verified.installation_fence is not None
-                            and verified.installation_fence == store._installation_fence
-                            and verified.installation_fence[1] == self.config.sha256 and verified.pins == pins)
-
-                # Only the standing kind reads the whole partition; stage's fresh kind stays unlocked per request.
-                if pins is not None and not reusable(verified):
-                    self._origin_check_lock.acquire()
-                    locked = True
-                    verified = self._verified_origin  # a waiter reuses what the request before it just verified
-                    if reusable(verified):
-                        self._origin_check_lock.release()
-                        locked = False
-                if reusable(verified):
-                    # Same fence as peers: rows written outside FA after this process verified are caught at next start.
-                    store._check_installation()
-                    original = verified.origin
-                else:
-                    if pins is not None:
-                        self._verified_origin = None  # a reuse condition failed: the kept origin is not this install's
-                    original = installed_origin(store, self.config)
-                    verified_now = True
+                original = installed_origin(store, self.config)
             else:
                 owner = getattr(self, "_agent_message_owner", None)
                 verified = getattr(owner, "_verified_origin", None)
@@ -478,24 +444,17 @@ class ServerComposition:
                 _authority_probe_readback(store, original)
             if self.assistant is not None:
                 self.assistant.start()
-            if self.teams is not None:
-                self.teams.start()
             from .behavior_work_policy import attach_standing_policy
             attach_standing_policy(self, agent_id=self.agent_id)
             from .behavior_work_target import activate_target
             activate_target(self)
-            if verified_now:
+            if self.agent_id is None:
                 self._verified_origin = _VerifiedOrigin(
-                    getpid(), self.config, store, original, store._installation_fence, pins)
-        except BaseException as error:
-            # Only a standing-policy origin survives the transient conflict acquire_evidence retries; else as main.
-            if self.agent_id is None and not (pins is not None and isinstance(error, Problem) and error.status == 412
-                                              and error.body["error"]["code"] == "BEHAVIOR_CONFLICT"):
+                    getpid(), self.config, store, original, store._installation_fence)
+        except BaseException:
+            if self.agent_id is None:
                 self._verified_origin = None
             raise
-        finally:
-            if locked:
-                self._origin_check_lock.release()
 
     def require_current_native_evidence(self):
         if self.closed:
@@ -697,7 +656,7 @@ def build_server(
     Created SDK clients are always owned/closed here; an injected credential is
     caller-owned. Production's default is ManagedIdentityCredential ONLY.
     """
-    from .behavior_server_config import ServerConfigurationDocument, ServerConfigurationV2
+    from .behavior_server_config import ServerConfigurationDocument
     config = ServerConfigurationDocument.model_validate_json(config.model_dump_json())
     from .upgrade_snapshot_store import snapshot_container_url
     upgrade_snapshot_container_url = snapshot_container_url(config)  # before any client: a bad value stops startup
@@ -827,9 +786,6 @@ def build_server(
             composition._peer_factory = lambda policy: build_peer(
                 composition, policy, credential=credential, native_transports=native_transports,
                 assistant_transport=assistant_transport)
-        if type(config) is ServerConfigurationV2:
-            from .teams_metrics import TeamsMetrics
-            composition.teams = TeamsMetrics(composition)
         return composition
     except BaseException:
         resources.close()
@@ -939,8 +895,6 @@ def application(composition: ServerComposition, *, preactivation=False):
                 app.state.team_data = TeamDataRelay(
                     artifacts.repository, artifacts.store, composition.config.identity.tenant_id)
                 install_team_data_routes(app, app.state.team_data, composition.verifier)
-            if composition.teams is not None:
-                composition.teams.install_routes(app, composition.verifier)
             if composition.runtime.work_policy is not None:
                 from .behavior_work_policy_api import install_work_policy_routes
                 from .memory_note_proposal_api import install_note_proposal_routes
@@ -1202,8 +1156,6 @@ def bootstrap_records(config, grants=None):
 
 def bootstrap(composition, approval: BootstrapAuthorization, *, stage="records"):
     """Explicit operator-only CLI operation. No human operation grants are minted."""
-    if composition.config.schema_version == "fa-behavior-server-v2":
-        raise Problem(403, "CHANNELS_BOOTSTRAP_DISABLED", "v2 只能走原 authority 的明確遷移，不可 bootstrap root/pool")
     if stage not in {"records", "worker", "activate"}:
         raise ValueError("unknown bootstrap stage")
     grants = _validate_approval(composition, approval)
@@ -1394,18 +1346,15 @@ def run_controller(composition, *, limits=None, preactivation=False, stop_reques
                     pending_binding = None
                     if (composition.config.workload_version == "assistant-v1.2"
                             and composition.assistant is not None and composition.config.workers.capacity == 1
-                            and getattr(composition, "teams", None) is None and len(runtime.bindings) == 1):
+                            and len(runtime.bindings) == 1):
                         candidate = next(iter(runtime.bindings.values()))
                         if (candidate.binding_id in runtime.profiles and candidate.route.channel_id == "authenticated-pull"
                                 and candidate.owner.root_budget_id == root.root_budget_id):
                             pending_binding = candidate
                     page = DeliveryConsumer(runtime.dep.delivery).drain(
                         root.root_budget_id, runtime.resolve_owner, composition.config.controller_id, limit=limits.page_limit,
-                        select_core=runtime.delivery_for_obligation if getattr(composition, "teams", None) is not None else None,
                         **({"pending_binding": pending_binding} if pending_binding is not None else {}),
                     )
-                    if getattr(composition, "teams", None) is not None:
-                        page = composition.teams.deliver_page(page)
                     delivery_items += len(page)
                     count_problems(page)
             ticks += 1

@@ -10,14 +10,10 @@ import pytest
 
 from shared_context import behavior_assistant_hosted as hosted
 from shared_context.behavior_assistant import key, _Session, _row
-from shared_context.behavior_operations import control_key
 from shared_context.behavior_recovery import ClaimedSdkRecovery, MultiModelRecoveryScope, ModelIntentState
 from shared_context.errors import Problem
 from test_behavior_assistant_claim_boundaries import hosted_flow, reviewed
-from test_behavior_assistant_acquire_conflicts import native_acquire, current_rotation
-from test_behavior_rotation_cutoff import two_rotations
-from test_behavior_rotation_settlement_history import current_cancelled
-from test_behavior_runtime_rotation import rotated
+from test_behavior_assistant_acquire_conflicts import installed_assistant, native_acquire
 from test_behavior_model_deadlines import asgi_server
 from test_behavior_model_diagnostics import LocalHTTP, LocalAsyncHTTP, socket_server, send_bytes
 from test_behavior_assistant_sse import stream
@@ -191,7 +187,6 @@ def test_current_cancel_scopes_do_not_discard_existing_success_result(finished_f
 
 
 def test_original_graceful_success_still_needs_its_distinct_retirement_contract(finished_flow):
-    from shared_context.behavior_runtime_rotation_history import validate_retirement
     h, _, calls, _, completed, _ = finished_flow
     c = h.c
     assert completed.is_set() and h.supervisor.observe(c.launch_id).phase == "sealed"
@@ -199,5 +194,3 @@ def test_original_graceful_success_still_needs_its_distinct_retirement_contract(
     c.native.workers.forward_result(c.binding.job_id, c.binding.owner, c.composition.runtime.dep.delivery)
     normal_report(c)
     assert c.native.workers.inspect(c.binding.job_id).state == "succeeded" and len(calls) == 3
-    with pytest.raises(Problem, match="final cancellation exchange"):
-        validate_retirement(c.store.read_inventory(), c.config)

@@ -418,7 +418,7 @@ Responses 通道、伺服器提供的全部能力（桌面、技能、Shell、�
 （`ci_deploy.py check` → WebIQ（有開才做；連線已存在就只讀回，不需終端機）→ 下面五步），只改映像與 profile 宣告的 ENV；
 已安裝的 runtime 設定不會被改。閘門擋下時見[升級路徑](#upgrade-2dii)。
 
-- `guard`：檢查 commit 順序。
+- `guard`：檢查 commit 順序，以及 API 上的 ENV 名稱和已安裝的 `BEHAVIOR_SERVER_CONFIG_JSON` 是否和 profile 一致（不一致就在 `sync` 之前停下）。
 - `sync`：發布 Hosted Agent 新版。
 - `api`：更新 API。
 - `console`：更新工作台。

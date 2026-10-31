@@ -54,18 +54,3 @@ def set_budget_enforcement(control, principal, command):
         ), result={"budget_enforced": command.enforced, "accounting_preserved": True})
     return control.store.transact(request, decide)
 
-
-def replay_budget_enforcement(view, receipt, ledger, policy, key):
-    from .behavior_runtime_rotation_history import require
-    change = view.row(key, BudgetEnforcementChange, material=True)
-    expected_key, request = change_request(policy, change.command)
-    require(key == expected_key and receipt.request == request
-        and change.policy_id == policy.policy_id and change.command.policy_sha256 == policy.sha256
-        and change.principal_oid == policy.template.human_oid
-        and change.previous_enforced == ledger.budget_enforced,
-        "budget mode is not the original human change against the retained ledger")
-    costkey = work_policy_key("cost", policy.authority_domain)
-    updated = _updated(ledger, budget_enforced=change.command.enforced)
-    view.receipt(request, (costkey, key), exact={key: view.hash(key), costkey: view.image_hash(costkey, updated)},
-        result={"budget_enforced": change.command.enforced, "accounting_preserved": True})
-    return updated

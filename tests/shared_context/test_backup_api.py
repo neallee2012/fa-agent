@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from conftest import A, B, AUDIENCE, TENANT
-from shared_context.api import create_app
+from legacy_m2_m4.api import create_app
 from shared_context.auth import JwtVerifier
 from shared_context.backup_models import BackupReceipt
 from shared_context.backup_store import InMemoryBackupStore

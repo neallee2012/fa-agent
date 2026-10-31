@@ -2095,7 +2095,7 @@ root再次驗證失敗時移除可重用origin；驗證進行中不先丟掉仍�
 本機只驗「首個B claim內inventory=0、claim_state=fresh」及scope/fence拒絕，
 不是B業務完成、live通過或完整歷史golden驗收；結果見[固定評測](agent-runtime-evaluation-baseline.md#2026-10-01b23-首次-claim-沿用-root-origin)。
 
-**2026-10-28 補充：standing-policy 安裝的 root 逐請求沿用已驗 origin**（Neal 2026-10-28 批准；總協調依對抗式審查選這個簡化做法，ADR 方案見 PR #1024 草稿）。
+**2026-10-28 補充：standing-policy 安裝的 root 逐請求沿用已驗 origin**（Neal 2026-10-28 批准；總協調依對抗式審查選這個簡化做法，ADR 方案見 PR #1024 草稿）。本段機制已於 2026-10-30 隨 standing-policy 安裝刪除，以下為歷史紀錄。
 只有 standing-policy（work-policy）安裝的`installed_work_policy_origin`會讀整個 partition（`read_inventory(max_entities=None)`，dev 約 150 秒），
 所以只有這一種沿用。root 第一次完整驗證前，先按 key 讀`origin_pointer_keys`列出的安裝指標、channels current 和它們指向的 history 列，記下 hash；
 之後每個要驗證據的請求（含 Teams 每則訊息）重讀同一組，程序、store、fence、config hash 與 hash 都相同才沿用，並照舊跑`_check_installation()`、

@@ -55,6 +55,13 @@ param instructionsSha256 string
 @minLength(64)
 @maxLength(64)
 param agentsSha256 string
+@description('The console container ENV: the profile console_environment, the one source shared with the CI console step.')
+param environmentVariables environmentVariableType[]
+
+type environmentVariableType = {
+  name: string
+  value: string
+}
 
 var tags = {
   workload: 'hosted-sandbox-poc'
@@ -228,6 +235,7 @@ module app 'br/public:avm/res/app/container-app:0.23.0' = {
           identity.outputs.clientId
         ]
         resources: {cpu: json('0.25'), memory: '0.5Gi'}
+        env: environmentVariables
         volumeMounts: [{volumeName: 'console-config', mountPath: '/config'}]
         // Probes reach the container directly, without the sign-in headers, so only the port is checked.
         probes: [

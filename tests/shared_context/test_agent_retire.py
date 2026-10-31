@@ -17,7 +17,7 @@ from shared_context.behavior_operations import _parse
 from shared_context.behavior_peer_runtime import install_peer_routing
 from shared_context.behavior_team_registry import (
     IdentityRegistration, TeamAgentRetired, TeamRegistry, _retire_request, identity_key, registered_agent_ids,
-    retired_agent_ids, retired_key, team_recipient_ids, team_recipient_ready, validate_team_registry_history,
+    retired_agent_ids, retired_key, team_recipient_ids, team_recipient_ready,
 )
 from shared_context.errors import Problem
 from shared_context.native_routine_clock import NativeRoutineClock
@@ -101,46 +101,6 @@ def test_a_retired_agent_token_is_refused_at_the_api_entry(registry, jwk_client,
     assert refused.value.body["error"]["code"] == "BEHAVIOR_ACTOR_NOT_ALLOWED"
 
 
-@pytest.mark.parametrize("reader", ["migration-quiescence", "rotation-additions"])
-def test_a_tombstone_passes_both_restart_readers_and_a_tampered_one_is_refused(activated, reader):
-    from shared_context.behavior_migration import _quiescence
-    from shared_context.behavior_runtime_rotation_history import validate_additions
-    from shared_context.behavior_auth import BehaviorPrincipal
-    h = activated
-    ids, store = h.config.identity, h.runtime.store
-    baseline = store.read_inventory()
-    registry = TeamRegistry(store, tenant_id=ids.tenant_id, operator_oid=ids.human_oid,
-                            legacy_team_id=ids.team_id, legacy_owner_oid=ids.human_oid,
-                            agent_oids=tuple(agent.oid for agent in ids.agents), targets=h.config.targets)
-    human = BehaviorPrincipal(ids.tenant_id, ids.human_oid, ids.team_id, "human", None,
-                              frozenset({"read", "approve", "submit"}))
-    for n, oid in ((1, AGENT_OID), (2, OTHER_AGENT_OID)):
-        target = _target(n, oid)
-        registry.register_agent(human, f"restart-agent-{n}", target.agent_id, target)
-    retired = _target(1, AGENT_OID).agent_id
-    registry.retire_agent(human, "restart-retire-1", retired, "dev test agent", now=NOW)
-
-    def read(inventory):
-        if reader == "migration-quiescence":
-            _quiescence(inventory, h.config)
-        else:
-            validate_additions(inventory, h.config, h.config, set(baseline.rows), set())
-
-    inventory = store.read_inventory()
-    read(inventory)
-    classified = validate_team_registry_history(inventory, h.config)
-    assert classified[retired_key(ids.tenant_id, retired)].request_id == "restart-retire-1"
-    tkey = retired_key(ids.tenant_id, retired)
-    row = inventory.rows[tkey]
-    tampered = replace(inventory, rows={**inventory.rows, tkey: replace(row, payload={
-        **row.payload, "data": {**row.payload["data"], "reason": "rewritten"}})})
-    with pytest.raises(Problem):
-        read(tampered)
-    missing = replace(inventory, rows={key: value for key, value in inventory.rows.items() if key != tkey})
-    with pytest.raises(Problem):
-        read(missing)
-
-
 # ----- every live path honours it -----------------------------------------------------------------------------------
 
 
@@ -151,7 +111,7 @@ def _retire(case, agent_id=None):
 
 def test_a_fully_onboarded_agent_retired_still_passes_the_real_startup_readers(team_agent):
     """The dev case: the retired Agent also has its runtime registration, policy and a built peer."""
-    from shared_context.behavior_migration import MigrationStore, _quiescence, installed_origin
+    from shared_context.behavior_migration import MigrationStore, installed_origin
     from test_conversation_transfer_startup import read_startup
     from test_resident_worker_poc import outcome_of
     case = team_agent
@@ -159,8 +119,7 @@ def test_a_fully_onboarded_agent_retired_still_passes_the_real_startup_readers(t
 
     def readers():
         store = MigrationStore(case.c.h.composition.clients[0], config.table.scope)
-        return (outcome_of(lambda: read_startup(case.c)), outcome_of(lambda: _quiescence(store.read_inventory(), config)),
-                outcome_of(lambda: installed_origin(store, config)))
+        return (outcome_of(lambda: read_startup(case.c)), outcome_of(lambda: installed_origin(store, config)))
     _register_scope(case)
     case.a.for_agent(case.target.agent_id)
     baseline = readers()

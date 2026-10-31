@@ -17,7 +17,7 @@ from shared_context.behavior_user_turn import UserTurnRead
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, check_history
+from test_instruction_flow import instruction_models
 from test_instruction_prompt import submit
 from test_m2_copilot import runtime_path
 from test_m3_auth import signing_key, jwk_client
@@ -104,7 +104,6 @@ def test_native_scope_refusal_is_safe_actionable_and_keeps_the_original_work(ass
             completed = h.runtime.controller.step(binding.binding_id)
             assert completed.state == "succeeded" and completed.result_forwarded
             assert not completed.obligation_fulfilled
-            check_history(h)
     assert calls == ([0, 1, 1] if fault else [0, 1, 1, 1])
     assert len(reads) == (0 if fault else 1)
     assert len({binding.job_id for binding in bindings}) == 2

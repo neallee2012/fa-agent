@@ -1,4 +1,4 @@
-"""Pins StandingPolicyReader.checked with the inputs a real instruction status read hands it."""
+"""Pins InstructionReader.checked with the inputs a real instruction status read hands it."""
 import json
 from datetime import datetime, timedelta, timezone
 

@@ -21,12 +21,6 @@ def compatibility_config(legacy):
     data = legacy.model_dump(mode="json")
     for name in ("scope_id", "not_before", "expires_at", "approval_reference", "approval_sha256"):
         data.pop(name)
-    task = data["tasks"][0]
-    task.update(mode="original_failure", handoff_id="original-handoff", allowed_actions=["status", "fetch", "acknowledge"],
-        original_failure={"contract": "fa-original-web-handoff-status-v1",
-            "payload_sha256": "d" * 64, "payload_bytes": 1,
-            "delivery_entry_id": task["route"]["account_id"],
-            "owner_conversation_id": task["route"]["thread_id"]})
     data.update(schema_version="fa-web-test-console-steady-v2", console_id="offline-steady",
                 authorization_mode="backend-per-work")
     return SteadyConsoleConfig.model_validate_json(json.dumps(data))
@@ -200,5 +194,4 @@ def test_pull_continuation_arguments_remain_startup_compatible_without_actions(c
                  "--pull-continuation", str(sidecar_path),
                  "--pull-continuation-sha256", sha(sidecar_path.read_bytes())]) == 0
     app, _ = captured[0]
-    assert app.state.console.tasks() == [config.tasks[0]]
     assert "pull_continuation" not in app.state.console.task_view(config.tasks[0])

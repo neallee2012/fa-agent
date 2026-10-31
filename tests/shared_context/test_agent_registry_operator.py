@@ -156,11 +156,10 @@ def test_fresh_operator_verifies_installation_before_preparing_any_b_work(operat
     before = sum(request.method == "POST" for request in case.h.table.requests)
     with build_server(case.h.config, **case.h.options) as fresh:
         assert fresh.runtime.work_policy is None
-        # This fixture deliberately lacks the complete Window2/WebHandoff
-        # installation lineage. A fresh operator must reject it before writing.
+        # This table carries a retired standing-policy pointer; a fresh operator must reject it before writing.
         with pytest.raises(Problem) as invalid:
             operate(fresh, "register", agent_id, authorization, request_id="fresh-unverified-b")
-        assert "standing policy is not exact original approved history" in str(invalid.value)
+        assert "retired standing-policy installation" in str(invalid.value)
         assert sum(request.method == "POST" for request in case.h.table.requests) == before
         assert operate(fresh, "show", agent_id, authorization)["state"] == "missing"
         with pytest.raises(Problem) as absent:
@@ -169,24 +168,3 @@ def test_fresh_operator_verifies_installation_before_preparing_any_b_work(operat
         assert sum(request.method == "POST" for request in case.h.table.requests) == before
 
 
-def test_original_migration_reader_enables_the_same_fenced_writer_without_changing_its_epoch():
-    from shared_context.behavior_migration import MigrationStore, installation_record, installed_origin
-    from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
-    from test_behavior_migration_release_fences import migrated
-
-    _, original, table, _, config, _, _, _ = migrated()
-    writer = MigrationStore(table, original._scope,
-                            expected_installation=(installation_record(config)[0], config.sha256))
-    request = ControlRequest(request_id="operator-after-original-installation", request_digest="e" * 64)
-
-    def prepare(_):
-        return ControlChanges(writes=(ControlWrite(
-            row_id="operator-new-row", mode="create", data={"original_installation_checked": True},
-        ),), result={"saved": True})
-
-    with pytest.raises(Problem) as unverified:
-        writer.transact(request, prepare)
-    assert unverified.value.body["error"]["code"] == "MIGRATION_HISTORY_UNVERIFIED"
-    installed_origin(writer, config)
-    assert writer.transact(request, prepare).payload["result"] == {"saved": True}
-    assert writer.reconcile(request).payload["result"] == {"saved": True}

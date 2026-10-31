@@ -25,7 +25,7 @@ from .native_hitl_wire import (
     ConnectorConsentReadback, ConnectorConsentReference, NativeConnectRequiredItem, consent_id,
 )
 from .source_materials import digest
-from .native_hitl_material import HitlMaterialPart, HitlPackedRecord, material_writes, pending_summary, unpack
+from .native_hitl_material import HitlPackedRecord, material_writes, pending_summary, unpack
 from .native_routine_wire import routine_proposal_change
 
 _ID = TypeAdapter(Digest)
@@ -1035,103 +1035,3 @@ class NativeHitlService:
                 turn=query.turn, references=tuple(references), attention=tuple(attention), closed=index.closed,
                 next_after=end if end < len(index.pending_ids) else None)
         return self.store.consistent_read(read)
-
-
-def validate_native_hitl_history(inventory, config):
-    """Classify only this API's typed records; retained choices never resume an SDK wait."""
-    from .behavior_team_registry import TeamOwnership, inventory_agent_scope, team_key
-
-    models = {model.model_fields["kind"].default: model for model in (
-        _RulesHead, _RulesSnapshot, _Intent, _State, _Decision, NativeHitlPending, NativeHitlOnceGrant,
-        _TurnIndex, _Authorization, HitlMaterialPart, NativeHitlQuestionPending, _QuestionAnswer,
-        ConnectorConsentPending, _ConsentDecision, _ConsentDeclined,
-    )}
-    values = {}
-    for key, row in inventory.rows.items():
-        data = row.payload["data"]
-        kind = data.get("kind")
-        if not isinstance(kind, str) or not kind.startswith("native_hitl_"):
-            continue
-        if kind == "native_hitl_packed_record":
-            data = unpack(row, key, inventory.rows.get)
-            kind = data.get("kind")
-        if kind not in models:
-            raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "unknown retained native approval schema")
-        value = _parse(data, models[kind])
-        if value.tenant_id != config.identity.tenant_id:
-            raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "retained HITL data belongs to another tenant")
-        tenant, team = value.tenant_id, value.team_id
-        if team == config.identity.team_id:
-            owner_oid = config.identity.human_oid
-        else:
-            tkey = team_key(tenant, team)
-            ownership = _record(inventory.rows, tkey, TeamOwnership)
-            if (ownership.tenant_id, ownership.team_id) != (tenant, team):
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "retained HITL data has no original Team owner")
-            owner_oid = ownership.owner_oid
-        if isinstance(value, _RulesHead):
-            expected = hitl_key("rules", tenant, team)
-            if value.revision == 0:
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "a stored rule head requires a published revision")
-        elif isinstance(value, _RulesSnapshot):
-            expected = hitl_key("rules-revision", tenant, team, str(value.revision))
-        elif isinstance(value, _Intent):
-            expected = hitl_key("intent", tenant, team, value.principal_oid, value.command.request_id)
-            is_owner = isinstance(value.command, _OWNER)
-            if (value.intent_id != expected or (value.principal_kind == "human") != is_owner
-                    or is_owner and value.principal_oid != owner_oid):
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the retained command has no matching original principal")
-        elif isinstance(value, _TurnIndex):
-            expected = hitl_key("turn", tenant, team, value.turn.agent_id, value.turn.conversation_id, value.turn.request_id)
-        elif isinstance(value, _Authorization):
-            expected = hitl_key("authorization", tenant, team, pending_id(tenant, team, value.authorization.call))
-            if value.authorization.authorization_id != expected:
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the retained effect authorization identity differs")
-        elif isinstance(value, HitlMaterialPart):
-            expected = hitl_key("material", tenant, team, value.parent_id, str(value.index))
-            parent = _record(inventory.rows, value.parent_id, HitlPackedRecord)
-            if ((parent.tenant_id, parent.team_id) != (tenant, team) or value.index >= len(parent.parts)
-                    or parent.parts[value.index] != key):
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the material part has no original parent")
-        elif isinstance(value, NativeHitlPending):
-            expected = pending_id(tenant, team, value.command.action.call)
-            scope = inventory_agent_scope(inventory, config, value.command.action.call.agent_id)
-            if (str(scope.tenant_id), scope.team_id, str(scope.identity.oid)) != (tenant, team, value.agent_oid):
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the original pending Agent differs")
-        elif isinstance(value, NativeHitlQuestionPending):
-            expected = question_id(tenant, team, value.command.question.call)
-            scope = inventory_agent_scope(inventory, config, value.command.question.call.agent_id)
-            if (str(scope.tenant_id), scope.team_id, str(scope.identity.oid)) != (tenant, team, value.agent_oid):
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the original question Agent differs")
-        elif isinstance(value, ConnectorConsentPending):
-            expected = consent_id(tenant, team, value.command.consent.call)
-            scope = inventory_agent_scope(inventory, config, value.command.consent.call.agent_id)
-            if (str(scope.tenant_id), scope.team_id, str(scope.identity.oid)) != (tenant, team, value.agent_oid):
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the original Connect card Agent differs")
-        elif isinstance(value, _ConsentDecision):
-            expected = hitl_key("consent-decision", tenant, team, value.consent_id)
-            if value.owner_oid != owner_oid:
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the original click has no matching Team owner")
-        elif isinstance(value, _ConsentDeclined):
-            expected = hitl_key("consent-declined", tenant, team, value.agent_id, value.conversation_id, value.toolbox_name)
-            if value.owner_oid != owner_oid:
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the original decline has no matching Team owner")
-        elif isinstance(value, _QuestionAnswer):
-            expected = hitl_key("answer", tenant, team, value.question_id)
-            if value.owner_oid != owner_oid:
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the original answer has no matching Team owner")
-        elif isinstance(value, _State):
-            expected = hitl_key("state", tenant, team, value.pending_id)
-        elif isinstance(value, _Decision):
-            intent = hitl_key("intent", tenant, team, value.owner_oid, value.command.request_id)
-            expected = hitl_key("decision", tenant, team, intent)
-            if value.owner_oid != owner_oid or value.decision_id != expected:
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the original human decision differs")
-        else:
-            expected = hitl_key("grant", tenant, team, value.approval.pending_id)
-            if value.grant_id != expected:
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the original once grant differs")
-        if key != expected:
-            raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "retained HITL key differs from its original identity")
-        values[key] = value
-    return values
