@@ -1149,6 +1149,7 @@ A 用 `send_agent_message` 交辦時，B 在自己的 Hosted session 開一段**
   網址或側欄指定的 thread 本機還沒有時，先用該 RID 讀原回條，確認是別的助理開的對話才掛入；否則照舊 `INSTRUCTION_SCOPE`。
   讀不到清單（較舊的 API 或 image）只記 `received_error`，不影響自己的對話。
 - **唯讀**：收件對話不能送出、追問或追加，畫面與工作台 server 端都擋（`AGENT_CONVERSATION_READ_ONLY`）。
+  沒指定 thread 的頁面不開收件對話，要點清單或帶 `thread_id` 才開；排程對話是主人自己的，照舊可以當預設。
   理由：這段工作屬於 A 的原請求，B 的回覆已自動送回 A；在 B 這邊用真人訊息接續不會回到 A，
   還會把 Agent 交辦與真人指令混在同一段對話。這是最小做法：不改 API 授權（owner 本來就能讀 B 的對話），
   只是工作台不提供接續入口；批准卡、停止回覆等 owner 原有動作照舊。要接著談就回 A 的原對話，或開新對話。

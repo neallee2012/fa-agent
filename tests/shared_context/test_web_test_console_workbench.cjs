@@ -154,6 +154,8 @@ async function open(initial=fixture(),responses={}){
       if(/^\/api\/instructions\/[^/]+\/stream(\?|$)/.test(url)&&holder.streamResponse)return holder.streamResponse(url,options);
       if(holder.onboarding&&url.startsWith("/api/agents/onboarding"))return holder.onboarding(url,options);
       if(url==="/api/agents"&&holder.agentDirectoryResponse)return holder.agentDirectoryResponse;
+      if(url.startsWith("/api/instructions/models")&&holder.agentModelsResponses?.[options.headers?.["X-Console-Agent"]])
+        return holder.agentModelsResponses[options.headers["X-Console-Agent"]];
       if(holder.agentStates&&(url.startsWith("/api/state")||url.startsWith("/api/instructions/models"))){
         const identity=options.headers?.["X-Console-Agent"];
         if(identity&&holder.agentStates[identity])return {ok:true,json:async()=>copy(holder.agentStates[identity])};
@@ -3822,6 +3824,45 @@ test("a conversation another Agent opened is labelled as Agent data and stays re
   assert.equal(ui.nodes.get("new-instruction").disabled,true);
   assert.match(ui.text("follow-up-detail"),/其他助理交辦給這位助理的對話，只能檢視/);
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
+
+test("while an Agent's first read runs the composer says so, not that a reply or a model list is missing",async()=>{
+  const a=sidebarChat("agent-one",true),b=sidebarChat("agent-two",true);
+  const ui=await open(a,{agentStates:{"agent-one":a,"agent-two":b},agentModelsResponses:{"agent-two":new Promise(()=>{})}});
+  sidebar(ui,"agent-two").button.events.click();await ui.tick();await ui.tick();
+  assert.equal(ui.nodes.get("instruction").placeholder,"正在讀取對話…");
+  assert.equal(ui.text("instruction-reason"),"正在讀取這位助理的對話…");
+});
+
+test("a failed Agent read says so and 更新清單 reads it again; no reply is pretended to be pending",async()=>{
+  const a=sidebarChat("agent-one",true),b=sidebarChat("agent-two",true);
+  const ui=await open(a,{agentStates:{"agent-one":a,"agent-two":b},
+    agentModelsResponses:{"agent-two":{ok:false,json:async()=>({error:{code:"BACKEND_UNAVAILABLE"}})}}});
+  sidebar(ui,"agent-two").button.events.click();await ui.tick();await ui.tick();
+  assert.equal(ui.nodes.get("instruction").placeholder,"對話還沒讀到");
+  assert.equal(ui.text("instruction-reason"),"這位助理的對話還沒讀到，請從選單更新清單");
+  assert.equal(ui.nodes.get("instruction").disabled,true);
+  assert.equal(ui.nodes.get("refresh-models").disabled,false);
+  delete ui.holder.agentModelsResponses["agent-two"];
+  ui.click("refresh-models");await ui.tick();await ui.tick();
+  assert.equal(ui.nodes.get("error").hidden,true);
+  assert.equal(ui.nodes.get("refresh-models").disabled,false);
+  assert.notEqual(ui.text("instruction-reason"),"尚無可用模型，請從選單更新清單");
+  assert.ok(ui.nodes.get("model").children.length>0);
+});
+
+test("更新清單 after a failed read asks for the conversation that Agent was on, not the default one",async()=>{
+  const a=sidebarChat("agent-one",true),b=sidebarChat("agent-two",true);
+  const ui=await open(a,{agentStates:{"agent-one":a,"agent-two":b}});
+  sidebar(ui,"agent-two").button.events.click();await ui.tick();await ui.tick();
+  sidebar(ui,"agent-one").button.events.click();await ui.tick();await ui.tick();
+  ui.holder.agentModelsResponses={"agent-two":{ok:false,json:async()=>({error:{code:"BACKEND_UNAVAILABLE"}})}};
+  sidebar(ui,"agent-two").button.events.click();await ui.tick();await ui.tick();
+  delete ui.holder.agentModelsResponses["agent-two"];
+  ui.calls.length=0;
+  ui.click("refresh-models");await ui.tick();await ui.tick();
+  assert.deepEqual(ui.calls.filter(call=>call.url.startsWith("/api/instructions/models")).map(call=>call.url),
+    [`/api/instructions/models?thread_id=${encodeURIComponent(b.composer.thread_id)}`]);
 });
 
 function peerReturned(a){

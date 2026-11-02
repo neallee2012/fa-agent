@@ -145,7 +145,7 @@ def test_pinned_sdk_executes_one_native_completions_turn_and_saves_original_resu
         assert receipt.usage.usage[0].wire_api == "completions"
         assert receipt.usage.usage[0].input_tokens == 17
         if agent_input:
-            assert sdk_inputs[0][1][0]["text"] == request.command.files[0].text
+            assert request.command.files[0].text in sdk_inputs[0][0] and sdk_inputs[0][1] is None
             assert receipt.command.files == request.command.files
             assert request.command.content in sdk_inputs[0][0]
 

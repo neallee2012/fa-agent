@@ -38,6 +38,10 @@ from copilot import CopilotClient, CopilotRequestHandler, RuntimeConnection, Too
 from copilot.client import ModelCapabilities, ModelInfo, ModelLimits, ModelSupports
 from copilot.generated.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
 from copilot.session import ModelCapabilitiesOverride, ModelLimitsOverride, ModelSupportsOverride
+from copilot.session_events import (
+    AssistantMessageData, SessionErrorData, SessionIdleData, SessionMode, SessionShutdownData,
+    ToolExecutionCompleteData, ToolExecutionStartData, UserMessageData,
+)
 from copilot.tools import Tool, ToolBinaryResult, ToolResult
 from jsonschema import Draft202012Validator
 
@@ -103,6 +107,23 @@ _LOCAL_CDP = re.compile(r"http://127\.0\.0\.1:[1-9]\d{0,4}")
 _OWN_BROWSER = ("--cdp-endpoint", "--user-data-dir", "--extension", "--endpoint")
 
 
+def _desktop_browser(display_env):
+    """The desktop's CDP endpoint, if any, once its display and endpoint are both known to be local."""
+    if set(display_env) not in ({"DISPLAY"}, {"DISPLAY", "CDP_ENDPOINT"}) \
+            or not isinstance(display_env["DISPLAY"], str) or not _X_DISPLAY.fullmatch(display_env["DISPLAY"]):
+        raise ValueError("a desktop display is one local X display number")
+    endpoint = display_env.get("CDP_ENDPOINT")
+    if endpoint is not None and (not isinstance(endpoint, str) or not _LOCAL_CDP.fullmatch(endpoint)):
+        raise ValueError("a desktop browser is one local CDP endpoint")
+    return endpoint
+
+
+def _attached_to(endpoint, args):
+    if any(arg.split("=", 1)[0] in _OWN_BROWSER for arg in args):
+        return args
+    return [arg for arg in args if arg != "--isolated"] + ["--cdp-endpoint", endpoint]
+
+
 def show_on_desktop(servers: dict, display_env: dict) -> None:
     """Run the Playwright MCP on the Agent's own desktop, so the live viewer shows its browser.
 
@@ -112,19 +133,12 @@ def show_on_desktop(servers: dict, display_env: dict) -> None:
     catalog entry keeps its flags, so its approved ``entry_sha256`` is unchanged; only the trusted VM-side desktop
     supplies the display and endpoint. https://github.com/microsoft/playwright-mcp#configuration
     """
-    if set(display_env) not in ({"DISPLAY"}, {"DISPLAY", "CDP_ENDPOINT"}) \
-            or not isinstance(display_env["DISPLAY"], str) or not _X_DISPLAY.fullmatch(display_env["DISPLAY"]):
-        raise ValueError("a desktop display is one local X display number")
-    endpoint = display_env.get("CDP_ENDPOINT")
-    if endpoint is not None and (not isinstance(endpoint, str) or not _LOCAL_CDP.fullmatch(endpoint)):
-        raise ValueError("a desktop browser is one local CDP endpoint")
+    endpoint = _desktop_browser(display_env)
     for name, flag in HEADED_ON_DESKTOP.items():
         server = servers.get(name)
         if server is not None:
             args = [arg for arg in server.get("args", ()) if arg != flag]
-            if endpoint is not None and not any(arg.split("=", 1)[0] in _OWN_BROWSER for arg in args):
-                args = [arg for arg in args if arg != "--isolated"] + ["--cdp-endpoint", endpoint]
-            server["args"] = args
+            server["args"] = args if endpoint is None else _attached_to(endpoint, args)
             server["env"] = {**server.get("env", {}), "DISPLAY": display_env["DISPLAY"]}
 
 
@@ -208,57 +222,94 @@ def _written_estimate(event):
     return sum(len(item.encode("utf-8")) for item in large) + 16 * 1024
 
 
-def _omit_unsendable_images(body):
-    """A browser screenshot can be JPEG or larger than the API model gateway admits; keep the turn and replace it."""
-    omitted = 0
-    responses = "input" in body
-    for message in body.get("input" if responses else "messages", []):
-        content = message.get("content", message.get("output"))
-        if not isinstance(content, list):
-            continue
-        for index, part in enumerate(content):
-            if not isinstance(part, dict) or part.get("type") != ("input_image" if responses else "image_url"):
-                continue
-            image = part.get("image_url")
-            url = image.get("url") if isinstance(image, dict) else image
-            if isinstance(url, str) and url.startswith("data:image/png;base64,") and len(url) <= MODEL_IMAGE_URL_CHARS:
-                continue
-            content[index] = {"type": "input_text" if responses else "text", "text": (
-                "[Screenshot omitted from model context: not a PNG within the model image bound. "
-                "If deliver_image is available, the latest PNG screenshot can still be delivered to the user.]")}
-            omitted += 1
-    return omitted
-
-
-def _retain_latest_inline_png(body, keep=1):
-    retained, omitted = 0, 0
+def _image_parts(body):
+    """Each image part's (content, index, url) on the Responses or chat wire shape, latest first."""
     responses = "input" in body
     for message in reversed(body.get("input" if responses else "messages", [])):
         content = message.get("content", message.get("output"))
-        if not isinstance(content, list):
-            continue
-        for index in range(len(content) - 1, -1, -1):
-            part = content[index]
-            if not isinstance(part, dict) or part.get("type") != ("input_image" if responses else "image_url"):
-                continue
-            image = part.get("image_url")
-            url = image.get("url") if isinstance(image, dict) else image
-            if not isinstance(url, str) or not url.startswith("data:image/png;base64,"):
-                continue
-            if retained >= keep:
-                content[index] = {
-                    "type": "input_text" if responses else "text",
-                    "text": (
-                        "[Earlier inline PNG omitted from model context; only the latest "
-                        "desktop screenshot is included. Original image remains in session history.]"
-                        if keep == 1 else
-                        f"[Earlier inline PNG omitted from model context; only the latest {keep} "
-                        "screenshots are included. Original image remains in session history.]"
-                    ),
-                }
-                omitted += 1
-            retained += 1
-    return omitted
+        if isinstance(content, list):
+            for index, part in reversed(list(enumerate(content))):
+                if isinstance(part, dict) and part.get("type") == ("input_image" if responses else "image_url"):
+                    image = part.get("image_url")
+                    yield content, index, image.get("url") if isinstance(image, dict) else image
+
+
+def _is_inline_png(url):
+    return isinstance(url, str) and url.startswith("data:image/png;base64,")
+
+
+def _replace_with_text(body, slots, text):
+    for content, index in slots:
+        content[index] = {"type": "input_text" if "input" in body else "text", "text": text}
+    return len(slots)
+
+
+def _omit_unsendable_images(body):
+    """A browser screenshot can be JPEG or larger than the API model gateway admits; keep the turn and replace it."""
+    unsendable = [(content, index) for content, index, url in _image_parts(body)
+                  if not _is_inline_png(url) or len(url) > MODEL_IMAGE_URL_CHARS]
+    return _replace_with_text(body, unsendable, (
+        "[Screenshot omitted from model context: not a PNG within the model image bound. "
+        "If deliver_image is available, the latest PNG screenshot can still be delivered to the user.]"))
+
+
+def _retain_latest_inline_png(body, keep=1):
+    pngs = [(content, index) for content, index, url in _image_parts(body) if _is_inline_png(url)]
+    return _replace_with_text(body, pngs[keep:], (
+        "[Earlier inline PNG omitted from model context; only the latest "
+        "desktop screenshot is included. Original image remains in session history.]"
+        if keep == 1 else
+        f"[Earlier inline PNG omitted from model context; only the latest {keep} "
+        "screenshots are included. Original image remains in session history.]"))
+
+
+def _task_tool_description(runtime):
+    limit = runtime.max_children
+    return (("Run one subtask in the server-configured synchronous child with only read_user_file. "
+             if runtime.read_user_files else
+             "Run one subtask in the server-configured synchronous zero-tool child. ") +
+            (f"Separate subtasks may be separate task calls, up to {limit} in this turn. "
+             if limit > 1 else "Only one task call can run in this turn. ") +
+            "Use agent_type=fa-delegate-v1 and mode=sync; the model is inherited. "
+            "Do not supply model, reasoning_effort, context_tier or other overrides.")
+
+
+def _narrow_task_tool(body, runtime, responses):
+    from .behavior_delegation_wire import DelegationTask
+    for tool in body.get("tools", []):
+        function = tool if responses else tool["function"]
+        if function["name"] == "task":
+            function["parameters"] = DelegationTask.model_json_schema()
+            function["description"] = _task_tool_description(runtime)
+
+
+def _drop_reasoning(body):
+    # Runtime 1.0.83 sends its own default reasoning options for a model ID it knows, even with the SDK's
+    # model_capabilities.supports.reasoning_effort=False; a deployment declared without them rejects them
+    # (400). Chat Completions: reasoning_effort; Responses: reasoning and its encrypted-content include.
+    body.pop("reasoning_effort", None)
+    body.pop("reasoning", None)
+    if isinstance(body.get("include"), list):
+        kept = [item for item in body["include"] if item != "reasoning.encrypted_content"]
+        if kept:
+            body["include"] = kept
+        else:
+            body.pop("include")
+
+
+def _local_model_list():
+    return {"data": [{
+        "id": MODEL, "name": MODEL, "object": "model", "vendor": "OpenAI",
+        "version": "1", "preview": False, "model_picker_enabled": True,
+        "supported_endpoints": ["/chat/completions"],
+        "capabilities": {
+            "type": "chat", "family": MODEL, "tokenizer": "o200k_base",
+            "limits": {"max_context_window_tokens": MAX_PROMPT_TOKENS + 1024,
+                       "max_output_tokens": MAX_OUTPUT_TOKENS},
+            "supports": {"streaming": True, "tool_calls": True,
+                         "parallel_tool_calls": False, "vision": True},
+        },
+    }]}
 
 
 class _FailureAwareStream(httpx.AsyncByteStream):
@@ -316,160 +367,160 @@ class _ModelGateway(CopilotRequestHandler):
                 )
             self.emit({"type": "m2.provider_failed", "data": dict(self.failure)})
 
-    async def send_request(self, request, ctx):
-        if request.url == self.endpoint and request.method == "POST":
-            if self.failure is not None or self.boundary is not None and self.boundary.failure is not None:
-                raise RuntimeError("Model transport halted after prior failure; retry refused")
-            if self.session_files is not None and self.session_files.checkpoint_error is not None:
-                from .errors import Problem
-                error = Problem(409, self.session_files.checkpoint_error, "unapproved compaction cannot dispatch a model request")
-                self._fail(ctx.request_id, "authority", error=error)
-                raise RuntimeError("Model transport halted after unapproved compaction")
-            if not self.instruction and self.attempts >= 120:
-                self._fail(ctx.request_id, "request_budget")
-                raise RuntimeError("Model request budget exceeded")
-            if self.model_call_limit is not None and self.attempts >= self.model_call_limit:
-                from .behavior_http_diagnostics import AssistantModelFailure
-                error = AssistantModelFailure("Model call limit reached", {
-                    "upstream_error_code": "MODEL_CALL_LIMIT_REACHED", "upstream_error_phase": "request_budget",
-                })
-                self._fail(ctx.request_id, "request_budget", error=error)
-                raise error
-            body = json.loads(request.content)
-            if body.get("model") != self.model:
-                self._fail(ctx.request_id, "model")
-                raise RuntimeError("Model is not allowed")
-            if self.delegation_runtime is not None:
-                from .behavior_delegation_wire import DelegationTask
-                for tool in body.get("tools", []):
-                    function = tool if self.endpoint.path.endswith("/responses") else tool["function"]
-                    if function["name"] == "task":
-                        limit = self.delegation_runtime.max_children
-                        function["parameters"] = DelegationTask.model_json_schema()
-                        function["description"] = (
-                            ("Run one subtask in the server-configured synchronous child with only read_user_file. "
-                             if self.delegation_runtime.read_user_files else
-                             "Run one subtask in the server-configured synchronous zero-tool child. ") +
-                            (f"Separate subtasks may be separate task calls, up to {limit} in this turn. "
-                             if limit > 1 else "Only one task call can run in this turn. ") +
-                            "Use agent_type=fa-delegate-v1 and mode=sync; the model is inherited. "
-                            "Do not supply model, reasoning_effort, context_tier or other overrides.")
-            # Runtime 1.0.83 omits the BYOK output limit on this wire API and
-            # includes Copilot-only/non-gpt-4.1 fields. Keep the native messages.
-            body.pop("snippy", None)
-            if not self.instruction:
-                body.pop("reasoning_effort", None)
-                body.pop("max_completion_tokens", None)
-                body["max_tokens"] = MAX_OUTPUT_TOKENS
-            elif self.supports_reasoning_effort is False:
-                # Runtime 1.0.83 sends its own default reasoning options for a model ID it knows, even with the SDK's
-                # model_capabilities.supports.reasoning_effort=False; a deployment declared without them rejects them
-                # (400). Chat Completions: reasoning_effort; Responses: reasoning and its encrypted-content include.
-                body.pop("reasoning_effort", None)
-                body.pop("reasoning", None)
-                if isinstance(body.get("include"), list):
-                    kept = [item for item in body["include"] if item != "reasoning.encrypted_content"]
-                    if kept:
-                        body["include"] = kept
-                    else:
-                        body.pop("include")
-            unsendable = _omit_unsendable_images(body) if self.instruction else 0
-            older = _retain_latest_inline_png(body, self.image_limit)
-            omitted = unsendable + older
-            if omitted:
-                self.emit({"type": "m2.context_images", "data": {
-                    "request_id": ctx.request_id, "omitted_inline_pngs": omitted,
-                    "unsendable_inline_pngs": unsendable, "older_inline_pngs": older,
-                }})
-            headers = dict(request.headers)
-            headers.pop("content-length", None)
-            request = httpx.Request("POST", self.endpoint, headers=headers, json=body)
-            if len(request.content) > (4 if self.image_limit == 1 else CAPABILITY_IMAGE_BODY_MIB) * 1024 * 1024:
-                self._fail(ctx.request_id, "body_budget")
-                raise RuntimeError("Model request body budget exceeded")
-            fingerprint = hashlib.sha256(json.dumps(
-                body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-            ).encode()).digest()
-            if fingerprint in self.request_fingerprints:
-                self._fail(ctx.request_id, "replayed_request")
-                raise RuntimeError("Model request replay refused")
-            self.request_fingerprints.add(fingerprint)
-            if self.inference is not None:
-                request.extensions["fa_inference"] = self.inference.prepare(
-                    request.content, self.model, "responses" if self.endpoint.path.endswith("/responses") else "completions",
-                    source="gateway", sdk_request_id=ctx.request_id, sdk_session_id=ctx.session_id,
-                    fingerprint=fingerprint.hex(),
-                    interaction_type=getattr(ctx, "interaction_type", None),
-                    purpose="compaction" if self.session_files is not None and self.session_files.compacting else "unknown")
-            # Reserve locally before the first await so concurrent SDK requests share the same limit.
-            self.attempts += 1
-            attempt = self.attempts
-            if self.boundary is not None:
-                try:
-                    if self.delegation_runtime is not None:
-                        reference = await self.delegation_runtime.model_ref(ctx)
-                        if reference is not None:
-                            request.extensions["fa_delegation"] = reference
-                            if self.inference is not None:
-                                self.inference.purpose(request.extensions.get("fa_inference"), "delegation")
-                    if self.session_files is not None:
-                        self.session_files.observe_model_request(fingerprint.hex())
-                    await self.boundary.before_request(fingerprint.hex())
-                    if self.boundary.sender is None:
-                        request.headers["authorization"] = "Bearer " + await self.private_token(None)
-                except Exception as error:
-                    self._fail(ctx.request_id, "authority", error=error)
-                    raise RuntimeError("Assistant request reservation denied") from None
-            self.emit({"type": "m2.provider_request", "data": {
-                "request_id": ctx.request_id, "session_id": ctx.session_id,
-                "attempt": attempt,
+    @property
+    def _wire_api(self):
+        return "responses" if self.endpoint.path.endswith("/responses") else "completions"
+
+    def _require_admitted(self, ctx):
+        if self.failure is not None or self.boundary is not None and self.boundary.failure is not None:
+            raise RuntimeError("Model transport halted after prior failure; retry refused")
+        if self.session_files is not None and self.session_files.checkpoint_error is not None:
+            from .errors import Problem
+            error = Problem(409, self.session_files.checkpoint_error, "unapproved compaction cannot dispatch a model request")
+            self._fail(ctx.request_id, "authority", error=error)
+            raise RuntimeError("Model transport halted after unapproved compaction")
+        if not self.instruction and self.attempts >= 120:
+            self._fail(ctx.request_id, "request_budget")
+            raise RuntimeError("Model request budget exceeded")
+        if self.model_call_limit is not None and self.attempts >= self.model_call_limit:
+            from .behavior_http_diagnostics import AssistantModelFailure
+            error = AssistantModelFailure("Model call limit reached", {
+                "upstream_error_code": "MODEL_CALL_LIMIT_REACHED", "upstream_error_phase": "request_budget",
+            })
+            self._fail(ctx.request_id, "request_budget", error=error)
+            raise error
+
+    def _shape_fields(self, body):
+        # Runtime 1.0.83 omits the BYOK output limit on this wire API and
+        # includes Copilot-only/non-gpt-4.1 fields. Keep the native messages.
+        body.pop("snippy", None)
+        if not self.instruction:
+            body.pop("reasoning_effort", None)
+            body.pop("max_completion_tokens", None)
+            body["max_tokens"] = MAX_OUTPUT_TOKENS
+        elif self.supports_reasoning_effort is False:
+            _drop_reasoning(body)
+
+    def _limit_images(self, body, ctx):
+        unsendable = _omit_unsendable_images(body) if self.instruction else 0
+        older = _retain_latest_inline_png(body, self.image_limit)
+        omitted = unsendable + older
+        if omitted:
+            self.emit({"type": "m2.context_images", "data": {
+                "request_id": ctx.request_id, "omitted_inline_pngs": omitted,
+                "unsendable_inline_pngs": unsendable, "older_inline_pngs": older,
             }})
+
+    def _outbound(self, request, ctx):
+        """The (body, request) to send for the SDK's ``request``, or a refusal."""
+        body = json.loads(request.content)
+        if body.get("model") != self.model:
+            self._fail(ctx.request_id, "model")
+            raise RuntimeError("Model is not allowed")
+        if self.delegation_runtime is not None:
+            _narrow_task_tool(body, self.delegation_runtime, self._wire_api == "responses")
+        self._shape_fields(body)
+        self._limit_images(body, ctx)
+        headers = dict(request.headers)
+        headers.pop("content-length", None)
+        outbound = httpx.Request("POST", self.endpoint, headers=headers, json=body)
+        if len(outbound.content) > (4 if self.image_limit == 1 else CAPABILITY_IMAGE_BODY_MIB) * 1024 * 1024:
+            self._fail(ctx.request_id, "body_budget")
+            raise RuntimeError("Model request body budget exceeded")
+        return body, outbound
+
+    def _claim_fingerprint(self, body, ctx):
+        fingerprint = hashlib.sha256(json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode()).digest()
+        if fingerprint in self.request_fingerprints:
+            self._fail(ctx.request_id, "replayed_request")
+            raise RuntimeError("Model request replay refused")
+        self.request_fingerprints.add(fingerprint)
+        return fingerprint.hex()
+
+    def _prepare_inference(self, request, fingerprint, ctx):
+        request.extensions["fa_inference"] = self.inference.prepare(
+            request.content, self.model, self._wire_api,
+            source="gateway", sdk_request_id=ctx.request_id, sdk_session_id=ctx.session_id,
+            fingerprint=fingerprint,
+            interaction_type=getattr(ctx, "interaction_type", None),
+            purpose="compaction" if self.session_files is not None and self.session_files.compacting else "unknown")
+
+    async def _reserve(self, request, fingerprint, ctx):
+        try:
+            if self.delegation_runtime is not None:
+                reference = await self.delegation_runtime.model_ref(ctx)
+                if reference is not None:
+                    request.extensions["fa_delegation"] = reference
+                    if self.inference is not None:
+                        self.inference.purpose(request.extensions.get("fa_inference"), "delegation")
+            if self.session_files is not None:
+                self.session_files.observe_model_request(fingerprint)
+            await self.boundary.before_request(fingerprint)
+            if self.boundary.sender is None:
+                request.headers["authorization"] = "Bearer " + await self.private_token(None)
+        except Exception as error:
+            self._fail(ctx.request_id, "authority", error=error)
+            raise RuntimeError("Assistant request reservation denied") from None
+
+    async def _transmit(self, request, ctx):
+        try:
+            if self.boundary is not None and self.boundary.sender is not None:
+                return await self.boundary.sender(request)
+            return await self.http.send(request, stream=True)
+        except Exception as error:
+            # Transport exception strings may contain headers or credentials.
+            self._fail(ctx.request_id, "transport", error=error)
+            raise RuntimeError("Context API model transport failed") from None
+
+    async def _delivered(self, response, request, ctx):
+        if not response.is_success:
+            self._fail(ctx.request_id, "http_status", response.status_code)
+        from .sdk_telemetry import watch_model_response
+        if self.boundary is not None:
             try:
-                if self.boundary is not None and self.boundary.sender is not None:
-                    response = await self.boundary.sender(request)
-                else:
-                    response = await self.http.send(request, stream=True)
+                response = await self.boundary.response(response)
             except Exception as error:
-                # Transport exception strings may contain headers or credentials.
-                self._fail(ctx.request_id, "transport", error=error)
-                raise RuntimeError("Context API model transport failed") from None
-            if not response.is_success:
-                self._fail(ctx.request_id, "http_status", response.status_code)
-            from .sdk_telemetry import watch_model_response
-            wire_api = "responses" if self.endpoint.path.endswith("/responses") else "completions"
-            if self.boundary is not None:
-                try:
-                    delivered = await self.boundary.response(response)
-                except Exception as error:
-                    self._fail(ctx.request_id, "output_boundary", error=error)
-                    raise RuntimeError("Assistant provider output refused") from None
-                return watch_model_response(delivered, wire_api)
-            if response.is_stream_consumed:
-                return watch_model_response(response, wire_api)
-            return watch_model_response(httpx.Response(
+                self._fail(ctx.request_id, "output_boundary", error=error)
+                raise RuntimeError("Assistant provider output refused") from None
+        elif not response.is_stream_consumed:
+            response = httpx.Response(
                 response.status_code, headers=response.headers, request=request,
                 stream=_FailureAwareStream(
                     response, lambda: self._fail(ctx.request_id, "stream"),
                 ),
-            ), wire_api)
+            )
+        return watch_model_response(response, self._wire_api)
+
+    async def _send_to_model(self, request, ctx):
+        self._require_admitted(ctx)
+        body, outbound = self._outbound(request, ctx)
+        fingerprint = self._claim_fingerprint(body, ctx)
+        if self.inference is not None:
+            self._prepare_inference(outbound, fingerprint, ctx)
+        # Reserve locally before the first await so concurrent SDK requests share the same limit.
+        self.attempts += 1
+        attempt = self.attempts
+        if self.boundary is not None:
+            await self._reserve(outbound, fingerprint, ctx)
+        self.emit({"type": "m2.provider_request", "data": {
+            "request_id": ctx.request_id, "session_id": ctx.session_id,
+            "attempt": attempt,
+        }})
+        response = await self._transmit(outbound, ctx)
+        return await self._delivered(response, outbound, ctx)
+
+    async def send_request(self, request, ctx):
+        if request.url == self.endpoint and request.method == "POST":
+            return await self._send_to_model(request, ctx)
         # Released SDK E2E precedent: local runtime metadata, NEVER model results.
         # Explicit model capabilities normally avoid these bootstrap requests.
         if not self.instruction and request.url.host == "api.githubcopilot.com" and request.url.scheme == "https":
             path = request.url.path
             if path == "/models" and request.method == "GET":
                 self.emit({"type": "m2.local_metadata", "data": {"path": path}})
-                return httpx.Response(200, json={"data": [{
-                    "id": MODEL, "name": MODEL, "object": "model", "vendor": "OpenAI",
-                    "version": "1", "preview": False, "model_picker_enabled": True,
-                    "supported_endpoints": ["/chat/completions"],
-                    "capabilities": {
-                        "type": "chat", "family": MODEL, "tokenizer": "o200k_base",
-                        "limits": {"max_context_window_tokens": MAX_PROMPT_TOKENS + 1024,
-                                   "max_output_tokens": MAX_OUTPUT_TOKENS},
-                        "supports": {"streaming": True, "tool_calls": True,
-                                     "parallel_tool_calls": False, "vision": True},
-                    },
-                }]})
+                return httpx.Response(200, json=_local_model_list())
         self.emit({"type": "m2.network_denied", "data": {
             "method": request.method, "host": request.url.host, "path": request.url.path,
         }})
@@ -687,72 +738,94 @@ _RELAY_VM_CONTEXT = (
 )
 
 
-async def _send_until_idle(session, prompt, owned_process, *, attachments=None, steering=None, terminal_tools=frozenset()):
+class _TurnRounds:
+    """The parent's messages so far, by round; only the parent's events belong here."""
+
+    def __init__(self, terminal_tools):
+        self.terminal_tools = terminal_tools
+        self.parts, self.final, self.last, self.started = [], None, None, {}
+
+    def result(self):
+        return [*self.parts, *([] if (self.final or self.last) is None else [self.final or self.last])]
+
+    def _start_round(self):
+        if self.final is not None:
+            self.parts.append(self.final)
+        self.final = self.last = None
+
+    def _end_round_at_terminal_tool(self):
+        # The handoff text comes first; the model's own words in that round follow it, never lost.
+        self.parts.append(None)
+        self.parts.extend(item for item in (self.final, None if self.last is self.final else self.last)
+                          if item is not None)
+        self.final = self.last = None
+
+    def observe(self, value):
+        data = value.data
+        if isinstance(data, AssistantMessageData):
+            self.last = value
+            if not data.tool_requests:
+                self.final = value
+        elif isinstance(data, UserMessageData):
+            self._start_round()
+        elif isinstance(data, ToolExecutionStartData) and data.tool_name in self.terminal_tools:
+            self.started[data.tool_call_id] = True
+        elif (isinstance(data, ToolExecutionCompleteData) and data.success
+              and self.started.pop(data.tool_call_id, False)):
+            self._end_round_at_terminal_tool()
+
+
+def _settle_turn(data, done, rounds, steered):
+    """An abort or a failed session ends any turn; a steered turn's plain idle is the steering's own to call."""
+    if isinstance(data, SessionIdleData) and data.mode != SessionMode.AUTOPILOT:
+        if data.aborted:
+            done.set_exception(SdkUserCancelled("Original SDK turn was cancelled"))
+        elif not steered:
+            done.set_result(rounds.result())
+    elif isinstance(data, (SessionErrorData, SessionShutdownData)):
+        done.set_exception(RuntimeError("SDK session failed or disconnected before its turn completed"))
+
+
+async def _settle_at_steering_idle(steering, done, rounds):
+    await steering.wait_idle()
+    if not done.done():
+        done.set_result(rounds.result())
+
+
+async def _process_exit(process):
+    # Polled, not a blocking wait: a resident SDK outlives this turn and must not pin a thread.
+    while process.poll() is None:
+        await asyncio.sleep(0.2)
+
+
+async def _send_until_idle(session, prompt, owned_process, *, steering=None, terminal_tools=frozenset(), **send_options):
     """SDK events finish the turn; process death is an error, not a work deadline.
 
     Returns each round's final parent message in order. An append the SDK takes during the turn starts a new
     round at its user message; a successful terminal tool ends its round with a ``None`` marker (the caller's
     handoff text) followed by the model's own words in that round, so no round's answer is replaced by it."""
-    from copilot.session_events import (
-        AssistantMessageData, SessionIdleData, SessionErrorData, SessionShutdownData, SessionMode,
-        ToolExecutionCompleteData, ToolExecutionStartData, UserMessageData,
-    )
-    loop = asyncio.get_running_loop()
-    done = loop.create_future()
-    parts, final, last, started = [], None, None, {}
-
-    def rounds():
-        return [*parts, *([] if (final or last) is None else [final or last])]
+    done = asyncio.get_running_loop().create_future()
+    rounds = _TurnRounds(terminal_tools)
 
     def event(value):
-        nonlocal final, last
         if done.done():
             return
+        parent = getattr(value, "agent_id", None) in {None, session.session_id}
         if steering is not None:
-            if getattr(value, "agent_id", None) not in {None, session.session_id}:
+            if not parent:
                 return
             steering.observe(value)
-        parent = getattr(value, "agent_id", None) in {None, session.session_id}
-        if isinstance(value.data, AssistantMessageData) and parent:
-            last = value
-            if not value.data.tool_requests:
-                final = value
-        elif isinstance(value.data, UserMessageData) and parent:
-            if final is not None:
-                parts.append(final)
-            final = last = None
-        elif isinstance(value.data, ToolExecutionStartData) and parent and value.data.tool_name in terminal_tools:
-            started[value.data.tool_call_id] = True
-        elif (isinstance(value.data, ToolExecutionCompleteData) and parent and value.data.success
-              and started.pop(value.data.tool_call_id, False)):
-            # The handoff text comes first; the model's own words in that round follow it, never lost.
-            parts.append(None)
-            parts.extend(item for item in (final, None if last is final else last) if item is not None)
-            final = last = None
-        elif isinstance(value.data, SessionIdleData) and value.data.mode!=SessionMode.AUTOPILOT:
-            if value.data.aborted:done.set_exception(SdkUserCancelled("Original SDK turn was cancelled"))
-            elif steering is None:done.set_result(rounds())
-        elif isinstance(value.data, (SessionErrorData, SessionShutdownData)):
-            done.set_exception(RuntimeError("SDK session failed or disconnected before its turn completed"))
+        if parent:
+            rounds.observe(value)
+        _settle_turn(value.data, done, rounds, steering is not None)
     unsubscribe = session.on(event)
-
-    async def watch_exit():
-        # Polled, not a blocking wait: a resident SDK outlives this turn and must not pin a thread.
-        while owned_process.poll() is None:
-            await asyncio.sleep(0.2)
-    exited = asyncio.ensure_future(watch_exit())
+    exited = asyncio.ensure_future(_process_exit(owned_process))
     settled = None
     try:
-        await session.send(prompt, **({} if attachments is None else {"attachments": attachments}))
+        await session.send(prompt, **send_options)
         if steering is not None:
             steering.open(session)
-
-            async def steering_idle():
-                await steering.wait_idle()
-                if not done.done():
-                    done.set_result(rounds())
-
-            settled = asyncio.create_task(steering_idle())
+            settled = asyncio.create_task(_settle_at_steering_idle(steering, done, rounds))
         await asyncio.wait((done, exited), return_when=asyncio.FIRST_COMPLETED)
         if done.done():
             return done.result()

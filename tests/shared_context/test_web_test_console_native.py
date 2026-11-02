@@ -486,6 +486,37 @@ def test_b_lists_and_reads_a_conversation_another_agent_opened_without_sending(n
                    for _, command in c.api.remote.calls)
 
 
+def test_a_page_that_names_no_conversation_opens_the_owners_own_not_a_newer_agent_conversation(request):
+    """Stage 38, 2026-10-31: the page opened on a read-only 「來自 B 的交辦」, because importing it made it the newest row."""
+    reopened_loop = asyncio.new_event_loop()
+    request.addfinalizer(lambda: reopened_loop.close()
+                         if not reopened_loop.is_closed() and not reopened_loop.is_running() else None)
+    c = request.getfixturevalue("native_console")
+    own = first(c)
+    target = c.api.remote.target
+    message = agent_receive(rid="message-from-b", recipient=target.agent_id)
+    c.api.remote.records["message-from-b"] = NativeReceipt(state_profile=message.state_profile,
+        agent_id=target.agent_id, hosted_session_id=target.session_id, request_id="message-from-b",
+        conversation_id="received-cid", command=message.command, capture=message.capture,
+        source=message.source, submit_digest=message.sha256, capture_digest=message.capture.sha256,
+        status="accepted")
+    c.api.remote.completed("message-from-b")
+
+    # The first listing imports it, and a new bridge on the same journal finds it already newest.
+    opened = c.ui.client.get("/api/instructions/models")
+    assert opened.status_code == 200, opened.text
+    restarted = c.open(loop_factory=lambda: reopened_loop)
+    for ui in (c.ui, restarted):
+        for path in ("/api/instructions/models", "/api/state", "/api/instructions/progress"):
+            composer = ui.client.get(path).json()["composer"]
+            assert composer["thread_id"] == own["thread_id"], path
+            assert composer["editable"] is True and composer["agent_conversation"] is None
+            assert "message-from-b" in [thread["thread_id"] for thread in composer["threads"]]
+    # Naming it still opens it, read-only.
+    named = restarted.client.get("/api/state?thread_id=message-from-b").json()["composer"]
+    assert named["thread_id"] == "message-from-b" and named["follow_up_blocker"] == "AGENT_CONVERSATION_READ_ONLY"
+
+
 def routine_run(c, capture, day):
     """A completed run of routine_origin()'s routine ``day`` days later, opened in its own conversation (2026-10-23)."""
     from datetime import timedelta
@@ -505,6 +536,16 @@ def routine_run(c, capture, day):
         status="accepted")
     c.api.remote.completed(source.request_id)
     return source.request_id
+
+
+def test_a_page_that_names_no_conversation_still_opens_a_newer_routine_run(native_console):
+    """Unlike a conversation another Agent opened, a routine run is the owner's own: it has no sender to exclude."""
+    c = native_console
+    own = first(c)
+    assert send(c, own).status_code == 200
+    rid = routine_run(c, c.api.remote.records[own["request_id"]].capture, 0)
+    assert c.ui.client.get("/api/instructions/models").status_code == 200  # the listing imports it
+    assert c.ui.client.get("/api/instructions/models").json()["composer"]["thread_id"] == rid
 
 
 def test_owner_finds_each_routine_run_as_its_own_dated_conversation_and_can_follow_up(native_console):

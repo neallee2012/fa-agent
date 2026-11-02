@@ -5526,7 +5526,7 @@ function renderComposer(){
     const shownText=inputDrafts.get(scopeKey(draftId))??"";
     if(el("instruction").value!==shownText)el("instruction").value=shownText;
   }
-  selectedThread=composer?.thread_id??null;
+  selectedThread=composer?.thread_id??selectedThread;
   // A sent message stays in its turn and its RID is never sent again (AGENTS.md 7). Unless the server said it was not
   // accepted (resent with the same RID) or busy (terminal "not run", the owner may send it again), its text leaves the
   // composer, so an UNKNOWN send or same-RID retry is not one click away from going out under a new RID.
@@ -5587,7 +5587,7 @@ function renderComposer(){
     composer?.editable||composer?.can_follow_up||composer?.can_append&&!appendUnknown);
   el("model").disabled=opening?!scopeAvailable()||state.authentication!=="AVAILABLE"||!models.length:
     Boolean(appendTarget)||busy||messageBusy||threadLoading||!canCompose||!models.length;
-  el("refresh-models").disabled=!scopeAvailable()||busy||!composer||state.authentication!=="AVAILABLE";
+  el("refresh-models").disabled=!scopeAvailable()||busy||threadLoading||state.authentication!=="AVAILABLE";
   const selectedModel=models.find(model=>model.id===el("model").value);
   text("model-capacity",selectedModel?
     `目前專案提供 ${models.length} 個聊天部署。上下文容量：${selectedModel.context_window_tokens??"未知（不代表無限）"} tokens；`+
@@ -5641,6 +5641,7 @@ function renderComposer(){
     appendHasFiles?"這次只能追加文字；附件保留在草稿，請移除或等回合結束後送出。":
     appendBusy?"追加傳送中…":messageBusy?"正在送出…":composer?.archived||composer?.conversation?.archived?(blockedMessage||"這段對話已封存。"):
     canCompose?"":waiting?"助理處理中，完成後即可接著聊":blockedMessage?blockedMessage:composer?.follow_up_blocker?followUpMessage(composer):
+    !composer?(threadLoading?"正在讀取這位助理的對話…":"這位助理的對話還沒讀到，請從選單更新清單"):
     !models.length?"尚無可用模型，請從選單更新清單":"正在準備對話…";
   text("instruction-reason",reason||(openingKept?"剛才在新對話打的字已保留；新對話開好後會自動帶回，不會自動送出。":""));
   renderPresence(resumeBlocked||appendUnknown||Boolean(unresolvedSentDraft)||Boolean(composer?.command_incomplete)||
@@ -5652,7 +5653,7 @@ function renderComposer(){
       "回覆已取消，請從選單查看接續方式":
     composer?.follow_up_blocker==="NATIVE_SUBMISSION_NOT_ACCEPTED"&&composer.can_new_conversation?
       "請開新對話傳送新訊息；原訊息不會重送":
-    resumeBlocked?"目前不能在這段對話續問":"等待助理回覆…";
+    resumeBlocked?"目前不能在這段對話續問":composer?"等待助理回覆…":threadLoading?"正在讀取對話…":"對話還沒讀到";
   const showBlocker=!opening&&!canCompose&&Boolean(resumeBlocked||composer?.follow_up_blocker);
   el("follow-up-blocker").hidden=!showBlocker;
   text("follow-up-detail",showBlocker?(blockedMessage||followUpMessage(composer)):"");

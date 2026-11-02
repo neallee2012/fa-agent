@@ -360,7 +360,7 @@ Neal 2026-10-30 核准，順序是先刪後拆，並核准刪除 Teams 舊分支
 
 - 部分測試 fixture 會延遲 import 別的測試模組，刪測試檔時單跑相關檔案看不出來。大量刪除後要跑 `pytest --collect-only tests/shared_context`。
 - 跟著舊遷移一起刪掉的測試，可能是某道還活著的閘門僅剩的保護。#1089 複審抓到 `MIGRATION_OPERATOR_REQUIRED` 已沒有測試，補上後用 mutant 確認。
-- `ci-quarantine.txt` 還列著已刪測試檔的案例，下次動它時一起清。
+- `ci-quarantine.txt` 還列著已刪測試檔的案例。已在下面的「離線測試基線清理」處理。
 - PR CI 不跑 `shared-context-tests.yml`，它只在每週排程與手動觸發時跑，刪除型 PR 要自己跑全量。
 
 ### 未處理／後續
@@ -368,11 +368,210 @@ Neal 2026-10-30 核准，順序是先刪後拆，並核准刪除 Teams 舊分支
 - `installed_origin` 只留 fresh、`agent_origin`：測試 Harness 靠 bootstrap（實作者報約 150 檔，沒有另外數），要先改。非 fresh 分支只有手動跑 `behavior_server_main.py bootstrap` 才走得到，走到時會以無 policy 狀態開機。
 - `MIGRATION_HISTORY_UNVERIFIED` 與 epoch 不符的拒絕沒有測試，只有 guard schema 2 走得到，收 `_guard_epoch` 時一起處理。`MIGRATION_HISTORY_INVALID` 已無人發出。
 - 綁工作狀態的一批：`_run_turn`、m2_assistant、`install_assistant_routes`。要先核對資料，API 先上，Hosted 晚一個版本。
-- `m2_copilot`：`send_request` 53、`_send_until_idle` 34、`_retain_latest_inline_png` 14、`_omit_unsendable_images` 13、`show_on_desktop` 13。
-- 其他 CC 超過 9：`_submit`（`behavior_native_turn_api` 45）、`append_saved_result` 28、`_submit`（`behavior_store` 16）、`scan_due` 12、`work_response` 12。
+- 其他 CC 超過 9：`append_saved_result` 28、`_submit`（`behavior_store` 16）、`scan_due` 12、`work_response` 12。`behavior_native_turn_api` 的 `_submit` 已在第八輪處理。
 - `web_test_console/standing.py:75,90,94`：`instruction=False` 與 `last_guard_revision` 還留著。
 - #1076 留下的 P3：`native_toolbox.py` token backoff。
-- 舊失敗：`test_native_capability_integration` 的 4 個（在隔離清單）；`test_catalog_gate_reads_one_guarded_legacy_row_snapshot`（`WebSearch-MCP` != `WebIQ-MCP`，不在隔離清單）；其餘 5 個見上面的 10 個失敗。
+- 舊失敗：已在下面的「離線測試基線清理」處理，修後在 `aac10725` 全量 0 failed，併入第八輪後在 `a50247ad` 再跑一次也是 0 failed。
+
+## 離線測試基線清理（2026-10-31）
+
+從 main `0e79caaa` 開始，只改測試、`ci-quarantine.txt` 與本頁。這一輪沒有確認到產品 bug，也沒有改產品程式。
+
+### 隔離清單
+
+用 `pytest --collect-only tests/shared_context` 收集到的 13,007 個節點，逐項核對 471 項，10 項對不上，清完剩 462 項，再核一次 0 項失效。
+
+- `test_standing_review_clock.py` 的 7 項：檔案已刪，清單開頭的 `STANDING_CLOCK_PARENT_ART` 一併拿掉。
+- `test_complete_sdk_flow_survives_controller_conflicts_without_repeating_effects` 的 3 個參數 id：測試還在，id 已變成 `[before-native]`。它仍然要 `M2_TEST_RUNTIME`，所以換成現在的 1 個 id，沒有直接刪。
+
+`shared-context-tests.yml` 開頭的註解還提到 captured artifacts，這一輪不改 workflow。
+
+### 全量結果
+
+| | commit | failed | passed | skipped | xfailed | 耗時 |
+|---|---|---:|---:|---:|---:|---|
+| 修前 | `0e79caaa` | 10 | 12,965 | 30 | 2 | 4 小時 01 分 |
+| 修後 | `aac10725` | 0 | 12,975 | 30 | 2 | 3 小時 17 分 |
+
+修前的 10 個在修後全部通過，沒有新增失敗。測試數量沒有減少，也沒有新增隔離項目。
+
+全量在這台 Windows 機器上要幾小時，上面第七輪的「2:54」是 2 小時 54 分。修後那次開跑時，機器上還有其他 session 的全量 pytest 在跑。
+
+### 逐項判定
+
+| 測試 | 判定 | 依據 | 修正 |
+|---|---|---|---|
+| `test_catalog_gate_reads_one_guarded_legacy_row_snapshot` | 測試過期 | `64aff624` 退場 `WebIQ-MCP`，`17b1e2e1` 把假資料改名 `WebSearch-MCP`，斷言沒跟著改 | `caadaaf5` |
+| `test_literal_file_is_user_data_in_actual_sdk_requests_and_cold_resume` | 測試過期 | `cc26ecb9` 刻意把文字檔接在原話後面：runtime 1.0.83 一則訊息只顯示第一個 selection，Responses provider 也不送 `text/plain` blob | `7454eb16` |
+| `test_pinned_sdk_executes_one_native_completions_turn_and_saves_original_result[True]` | 測試過期 | 同上，檔案在 prompt 裡，attachments 是 `None` | `7454eb16` |
+| `test_a_subset_preserves_full_template_and_original_result_with_real_consumers` | 測試過期 | `1fa91150` 起各 consumer 並行 bind，`h.bindings` 是完成順序；close 依 consumer 順序入堆疊，改比對其反向 | `c709f7b1` |
+| `test_a_all_ten_capabilities_share_original_ui_turn_and_image_readback[peers]` | 測試過期 | `65d69dd7` 起 API 送 `foundry-native-v2`，`state_profile` 在 submit digest 內；測試重組請求時漏了它，409 是對的。帶上後取回原回條 | `c709f7b1` |
+| `test_saved_image_survives_original_child_cancel_and_remains_read_only_in_native_console[peers]` | 測試過期 | 同上 | `c709f7b1` |
+| `test_a_handoff_uses_original_api_and_preserves_b_zero_capability_capture[peers]` | 測試過期 | `918f0089` 起回「結果會回到這段對話」，README 與 `test_native_agent_tools` 都是這句 | `c709f7b1` |
+| `test_loaded_skill_deactivation_fences_sources_not_independent_operation_grants` 的 2 個參數 | 測試過期 | `aeafe33e`（R3）把 consume 定為送出前最後一道核對，README「撤權的秒級窗口」寫明 reserve 之後的 skill 目錄變更，這一次仍送出 | `aac10725` |
+| `test_a_native_human_turn_recalls_first_and_updates_once_after_completion[cosmos]` | 間歇失敗，未重現，未改 | 見下 | 無 |
+
+`test_skill_deactivation_context` 改成和 `test_historical_loaded_skill_does_not_bypass_current_model_source_or_read_authority` 的 `approved-replacement` 分支同一個形狀：目錄、讀取與新的 reserve 回 403，先前 reserve 的請求送出一次（200），已送出的重送回 409。第二次送出會改到 cost 與第二筆 intent，所以原本比對整組 row 不變的斷言改成逐項比對：第一筆 intent 不變、第二筆變成 consumed。
+
+`[cosmos]` 那一項不屬於長期失敗。先前 3 次全量（`r7base`、`r7final`、`r7ofix_full`）都沒有它，修後全量也通過。單獨跑、整檔跑、前 60 個檔接著跑，以及照順序跑前 205 個檔（4,696 passed）都沒有重現。當次的紀錄是 `native_executor` 花了 8.9 秒，超過 `Harness.wait` 的 8 秒上限；`TaskDeferred` 是之後 teardown 的結果。機器負載是推測的原因，沒有直接證據。所以沒有放寬等待上限，也沒有放進隔離清單。
+
+上面第七輪的 10 個裡，有一個是 `test_native_response_sdk`：跑測前先建了 `N6_NATIVE_WORKSPACE` 造成的 `FileExistsError`，這是操作問題，用全新目錄就不會出現。其餘 9 個是上表前 8 列的測試（skill 停用那列含 2 個參數），其中 8 個在隔離清單裡，`test_catalog_gate_reads_one_guarded_legacy_row_snapshot` 不在。
+
+### 做法與教訓
+
+- 過期的 9 個測試有 8 個在隔離清單裡，CI 不跑，產品改版時沒有人被提醒。本機要帶 `M2_TEST_RUNTIME` 跑全量才看得到，只看 CI 綠燈不足以確認它們還對得上產品。
+- 清隔離清單要用收集結果比對到節點 id，只看檔案是否存在，會漏掉參數 id 已改的項目。
+
+## 第八輪結果（2026-10-31 至 11-01）
+
+目標是依工作拆函式，不動 wire 格式、錯誤碼、log 字串、HTTP 狀態與副作用順序。四條線並行，每條線先補測試鎖住舊行為，再拆，最後用手寫 mutant 確認守得住。過程中也刪了走不到的分支與條件。#1095 的 PR 另列了四項看不出實際影響的細微差異，例如 `messages` 不是 list 時，`TypeError` 文字由 `not iterable` 變成 `not reversible`，以及 `session_id` 改在 `steering.observe` 之前讀。
+
+| 線 | PR | CC 前 → 後 |
+|---|---|---|
+| `m2_copilot` | #1095 | `send_request` 53 → 8；`_send_until_idle` 34 → 9；`_retain_latest_inline_png` 14 → 3；`_omit_unsendable_images` 13 → 3；`show_on_desktop` 13 → 5 |
+| `behavior_work_policy` | #1096 | `register` 95 → 15；`conversation` 71 → 7；`verify_result_access` 67 → 12 |
+| `behavior_foundry` | #1097 | `_request` 98 → 10；`report` 71 → 8；`reconcile_sealed` 51 → 17 |
+| `behavior_server_config`、`behavior_native_turn_api` | #1099 | `exact` 94 → 4；`install_native_turn_routes` 50 → 12；`_submit` 45 → 14 |
+
+### 重新量（main `431101d3`）
+
+| 項目 | 第七輪後（`052d671a`） | 第八輪後（`431101d3`） |
+|---|---|---|
+| 函式（不含 novnc） | 5,866 | 5,987 |
+| CC ≥ 10 | 966 | 971 |
+| CC ≥ 20 | 283 | 272 |
+| CC ≥ 50 | 35 | 26 |
+| CC ≥ 100 | 2 | 2 |
+| dryer 重複（≥ 0.8，至少 4 行） | 291 對，213 對完全相同 | 291 對，213 對完全相同 |
+
+CC ≥ 10 多了 5 個，拆出來的函式有些仍在 10 到 15 之間，沒有逐項歸因。這一輪沒有消重複，也沒有量覆蓋率。
+
+### 驗證
+
+- 全量 `tests/shared_context`（離線，`a50247ad`，即 #1099 合併後的內容）：0 failed、13,756 passed、30 skipped、2 xfailed，3 小時 01 分。
+- 中途的一次性失敗有 `test_official_timeout_distinguishes_unsent_wait_from_an_unconfirmed_post[False]`（0.25 秒逾時）、`test_m2_desktop` 的 WinError 5、`test_sdk_no_start` 的 `wrong-generation`、`test_vm_sdk_start` 的 5 秒等待。後來都沒有重現，原因沒有查到。
+- 這一輪沒有部署，沒有 Hosted 或 dev 驗證，內容也還沒上 stage。
+
+### 做法與教訓
+
+- 拆函式最容易出錯的地方，是原本只讀一次的值變成 helper 各讀一次。#1097 的 `_request` 把 `self.target` 留給 helper 重讀，請求進行中 client 改指向後，回覆被對到新 session，變成 502 `FOUNDRY_NATIVE_BINDING_MISMATCH`。測試要在發送前和回覆時都改指向；只在回覆階段改的話，手寫 mutant 會存活。
+- 手寫 mutant 的 runner 要檢查 pytest 真的跑了。config 線路由 63/63、submit 85/85 的第一次結果全是假的：實作者回報 subprocess 叫到錯的 `bash`（exit 127），測試根本沒跑，卻被算成「殺掉」。runner 現在遇到非 pytest 的結果就中止。
+- 不要在背景測試還在跑的 worktree 裡做 mutant。全量改開獨立的 detached worktree，修正和測試才不會互相影響。
+- 用 `| tail` 收測試輸出，一次性失敗的訊息就不見了。輸出要寫進檔案。
+
+### 未處理／後續
+
+- 綁工作狀態的一批：`_run_turn` 148、`install_assistant_routes` 100、m2_assistant。要先核對資料，API 先上，Hosted 晚一個版本。
+- `NativeSessions.cut` 62、`follow` 56：等 ADR-0009 的閒置升級。
+- 這輪碰過但仍超過 9：`reconcile_sealed` 17、`register` 15、`_turn_view` 15、`_submit` 14、`install_native_turn_routes` 12、`verify_result_access` 12、`_unless_rid_conflict` 12、`_request` 10、`_require_admitted` 10。
+- 沒碰、仍超過 9：`append_saved_result` 28、`_after_refusal` 17、`_submit`（`behavior_store` 16）、`scan_due` 12、`work_response` 12。
+- `_unless_rid_conflict`：9 個參數，「回傳就是繼續」不好讀，先保留。
+- 13 條 `_selectors` 的訊息到不了客戶端，共用 handler 會把 422 改寫成通用回應。
+- skill 在 reserve 之後才停用時，該請求仍送出一次。這是現行設計，Neal 2026-11-01 決定不收緊。
+
+## 第九輪結果（2026-11-01）
+
+目標是依工作拆函式，不動 wire 格式、錯誤碼、log 字串、HTTP 狀態與副作用順序。六條線並行：五條拆函式的線先補測試鎖住舊行為，再拆，最後用手寫 mutant 檢查，少數沒殺掉的列在各 PR；其中 #1101、#1104、#1105、#1106 也刪了走不到的條件。#1102 則合併幾處真重複。各 PR 列出了已知的細微差異，例如 `n` 的檢查移到 messages 之前（仍是同一個 422），以及 `TeamGrantCache.store` 的到期時間改在拿鎖之前算。
+
+| 線 | PR | CC 前 → 後 |
+|---|---|---|
+| `behavior_recovery` | #1101 | `_snapshot` 60 → 9；`verify_platform_stop` 54 → 9；`_multi_models` 46 → 1 |
+| 消重複 | #1102 | 共用 `_wait_window`、`_original_agent`、`TeamGrantCache`、`runtime_bindings` |
+| `behavior_api`、`behavior_hosted` | #1103 | `behavior_router` 67 → 5；`create_host` 63 → 5 |
+| assistant 的 gateway、boundary、progress | #1104 | `validate` 66 → 8；`response` 58 → 14；`public_event` 57 → 9 |
+| effects、workers、agent message、instruction | #1105 | `save_reply` 64 → 6；`receive` 60 → 7；peer `forward_result` 57 → 1；`WorkerCore.forward_result` 44 → 7 |
+| `behavior_delivery` | #1106 | `_defer_pending` 60 → 10；`_admit_once` 46 → 9；`record_receipt` 42 → 5 |
+
+### 重新量（main `1d92544a`）
+
+| 項目 | 第八輪後（`431101d3`） | 第九輪後（`1d92544a`） |
+|---|---|---|
+| 函式（不含 novnc） | 5,987 | 6,162 |
+| CC ≥ 10 | 971 | 963 |
+| CC ≥ 20 | 272 | 257 |
+| CC ≥ 50 | 26 | 15 |
+| CC ≥ 100 | 2 | 2 |
+| dryer 重複（≥ 0.8，至少 4 行） | 291 對，213 對完全相同 | 281 對，209 對完全相同 |
+
+CC ≥ 50 少的 11 個，正是這輪拆掉的 11 個 CC ≥ 50 函式。數字是在合併用的 tree 上量的，這個 tree 和 `1d92544a` 內容相同。這一輪沒有量覆蓋率。
+
+### 驗證
+
+- 全量 `tests/shared_context`（離線，六條線合併後的 `238b8473`，與 `1d92544a` 內容相同）：0 failed、14,796 passed、30 skipped、2 xfailed，3 小時 09 分。這次全量沒有一次性失敗。
+- 六條線各自只跑相關測試，全量合併後才跑一次，所以中途沒有逐條的全量結果。
+- 每條線的 poteto 與 ponytail 兩軸審查 P1／P2 都清零。
+- 沒有在 Linux 上跑。#1101 對 weekly CI 的修正，要等 2026-11-02 那次才看得到結果。
+- 這一輪沒有部署，沒有 Hosted 或 dev 驗證，內容也還沒上 stage。
+
+### 做法與教訓
+
+- 第八輪的「只讀一次」在 effects 線又出現：`store`、`runtime` 拆開後變成讀多次。審查抓到，`7deaa0ff`、`dfe7f4f1` 修回。這條規則已寫進實作指引，仍然發生，所以審查要逐一核對。
+- 審查抓到 recovery 的假綠測試：改的值走不到判斷。測試要確認真的走到要鎖的那條拒絕。
+- recovery 線新增的 18 筆拒絕測試原本靠 runtime，先進了分支上的隔離名單。審查後改用不靠 runtime 的 fixture，全部移出，所以 main 的隔離名單沒有變。`test_a_stored_teams_stop_proof_refuses_at_parse` 也改用同一個 fixture，補上它沒有隔離、週一 weekly CI 會變紅的缺口。
+- 這輪合併 #1101 後，其他 PR 短暫顯示 UNKNOWN。連續合併的腳本因此跳過了五個 PR，改成逐一等它算完再合併。
+
+### 未處理／後續
+
+- 綁工作狀態的一批：`_run_turn` 148、`install_assistant_routes` 100、m2_assistant 的 `_execute` 59、`dispatch` 53。要先核對資料，API 先上，Hosted 晚一個版本。
+- `NativeSessions.cut` 62、`follow` 56：等 ADR-0009 的閒置升級。
+- 還沒碰、CC ≥ 50 的 9 個：`BehaviorRuntime.__init__` 65、`NativeInstructionControl.view` 54、`NativeAgentRelayClient.__init__` 53、`send_recorded` 52、`session_files` 52、`check_existing_vnet` 51、`valid_history` 51、`validate_config` 50、`behavior_operation_cli.main` 50。
+- 這輪碰過但仍超過 9：`_finished_proof` 31、`execute` 17、`response` 14、`_read_frames` 12、`_install_invocation_handlers` 11，以及 CC 10 的 `_defer_pending`、`_cancel`、`_call_fragment`、`_check_tools`、`_tool_refused`、`_require_accepted_cancellation`。
+- 重複的判讀結果：建議下一輪做 17 對，真重複但不划算 23 對，其餘是誤判、排除範圍或別條線的。
+- 各 PR 列出的 P3 測試缺口沒有補，例如 `behavior_api.py:190`、`:412`、`behavior_hosted.py:985`。
+- 既有問題：`tool.function` 不是 dict 時會丟 `AttributeError`，這輪沒有改。
+
+## 第十輪結果（2026-11-01 至 02）
+
+目標和第九輪相同：依工作拆函式，不動 wire 格式、錯誤碼、log 字串、HTTP 狀態與副作用順序。七條線並行，把第九輪列出、還沒碰的 9 個 CC ≥ 50 函式拆完，並處理前幾輪留下的一部分項目。有分支沒人守的先補測試；走不到的條件先刪，刪除和拆分分開 commit；最後用手寫 mutant 檢查，沒涵蓋到的列在各 PR（例如 #1114 刪 `_FinishChain` 後沒有重跑）。各 PR 也列出了已知的細微差異與刪除理由。
+
+| 線 | PR | CC 前 → 後 |
+|---|---|---|
+| `behavior_runtime` | #1108 | `BehaviorRuntime.__init__` 65 → 5 |
+| relay、environment files | #1109 | `NativeAgentRelayClient.__init__` 53 → 4；`session_files` 52 → 11 |
+| agent messages | #1110 | `send_recorded` 52 → 7 |
+| models、操作 CLI | #1111 | `valid_history` 51 → 2；`behavior_operation_cli.main` 50 → 9 |
+| 部署檢查 | #1112 | `check_existing_vnet` 51 → 7；`validate_config` 50 → 9 |
+| 工作台 | #1113 | `NativeInstructionControl.view` 54 → 10；`decode`、`owner_token` 合成一份，console 重複 16 組 → 2 組 |
+| 前輪遺留 | #1114 | `_finished_proof` 31 → 8；`execute` 17 → 4；三對重複合併，背景迴圈共用 `BackgroundLoop` |
+
+### 重新量（main `47b47bcd`）
+
+| 項目 | 第九輪後（`1d92544a`） | 第十輪後（`47b47bcd`） |
+|---|---|---|
+| 函式（不含 novnc） | 6,162 | 6,266 |
+| CC ≥ 10 | 963 | 958 |
+| CC ≥ 20 | 257 | 247 |
+| CC ≥ 50 | 15 | 6 |
+| CC ≥ 100 | 2 | 2 |
+| dryer 重複（≥ 0.8，至少 4 行） | 281 對，209 對完全相同 | 264 對，192 對完全相同 |
+
+CC ≥ 50 少的 9 個，正是這輪拆掉的 9 個。剩下的 6 個都是刻意不動的，見下面「未處理／後續」。數字是在合併用的 tree `d98fbad4` 上量的，它和 `47b47bcd` 內容相同。這一輪沒有量覆蓋率。
+
+### 驗證
+
+- 全量 `tests/shared_context`（離線，七條線合併後的 `d98fbad4`，與 `47b47bcd` 內容相同）：0 failed、15,729 passed、30 skipped、2 xfailed，3 小時 10 分。
+- weekly CI 的條件（不設 `M2_TEST_RUNTIME`，排除兩份名單）：這輪改到的 17 個測試檔 1,823 passed，排除 462 個 id；五個需要 runtime 的檔案 154 passed，2 deselected。兩份名單沒有變動。
+- 工作台 standin（假 Hosted、固定回覆）：連線、送訊息、看到回覆、重新整理保存、Agent Team 設定與助理設定的分頁都通過（訊息用真鍵盤；連線、選單與分頁用 `.click()`，Escape 用 `dispatchEvent`）。和 `43b88ec5` 的第二份替身比對，九個畫面的文字 hash 與七個 GET 的狀態碼全部相同；`/api/agent-template/options` 的 500 和四個 409 在基準上也一樣。
+- 每條線的 poteto 與 ponytail 兩軸審查 P1／P2 都清零。
+- 沒有在 Linux 上跑。`tests/infra/test_azd_infra.py` 沒跑，本機 venv 沒有 yaml。
+- 這一輪沒有部署，沒有 Hosted 或 dev 驗證，內容也還沒上 stage。
+
+### 做法與教訓
+
+- runtime 線的手寫 mutant runner 把 setup error 算成殺掉，poteto 審查抓到。之後改用嚴格 runner，並用鎖 `vars(self)` 的哨兵測試，讓 mutant 被斷言殺掉，不是被 setup 失敗蓋過。
+- 平行審查曾共用一個暫存資料夾，一條線的輸出被另一條蓋掉。之後每個審查者用自己的資料夾，也不准用萬用字元刪除。
+- 三條線用新舊差分補強手寫 mutant：relay 132,000 組情境，models 46,000 組，console 20,000 個 seed，結果都相同。
+- 比對兩個替身時，兩頁都在 127.0.0.1，cookie 不分 port。後載入的頁面會讓另一頁回 403 `LOCAL_REQUEST_DENIED`，重新載入那一頁就恢復。這個現象已寫進 `verify-workbench`。
+
+### 未處理／後續
+
+- 綁工作狀態的一批：`_run_turn` 148、`install_assistant_routes` 100、m2_assistant 的 `_execute` 59、`dispatch` 53。要先核對資料，API 先上，Hosted 晚一個版本。
+- `NativeSessions.cut` 62、`follow` 56：等 ADR-0009 的閒置升級。
+- 這輪碰過但仍 ≥ 10：`_follow_environment` 25（原本 28）、`_list` 12、`session_files` 11，以及 CC 10 的 `_require_reply`、`_require_api_origin`、`_send_original`、`view`。`_list`、`_send_original` 是同一道檢查，`_require_api_origin` 只有一個條件，再拆只會更難讀。
+- 第九輪判讀的重複：建議做的 17 對這輪只處理了一部分，沒有逐對對帳；「真重複但不划算」的 23 對沒有列為工作。
+- 既有問題：`tool.function` 不是 dict 時會丟 `AttributeError`，這輪也沒有改。
+- standin 走不到的沒有驗證：批准卡、Team MCP 和 Connectors 的寫入、助理設定的清單與套用、`chat-new`。這些要到 dev 才能驗。
+- #1109 的 SDK 契約測試讀 core 2.2.0 的私有欄位 `Task._opts`、`_input_type`、`_output_type`。升 SDK 時可能要跟著改，這是刻意的。
 
 ## 重新量
 

@@ -59,6 +59,128 @@ def _manifest_aliases(detail):
 _ALIASES = TypeAdapter(tuple[Filename, ...])
 
 
+async def _read_body(response, limit):
+    raw = bytearray()
+    async for chunk in response.aiter_bytes():
+        raw.extend(chunk)
+        if len(raw) > limit:
+            raise ValueError()
+    return raw
+
+
+def _frame_choices(line, finish):
+    """The frame's choices: none for a usage-only frame, otherwise exactly one, before the finish."""
+    value = json.loads(line[6:], object_pairs_hook=_unique)
+    choices = value.get("choices")
+    if choices == []:
+        return choices
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise ValueError()
+    if finish is not None:
+        raise ValueError()
+    return choices
+
+
+def _check_delta(delta):
+    if not isinstance(delta, dict) or set(delta) - {"role", "content", "tool_calls", "refusal", "function_call"}:
+        raise ValueError()
+    if (delta.get("content") not in (None, "") or delta.get("role") not in (None, "assistant")
+            or delta.get("refusal") is not None or delta.get("function_call") is not None):
+        raise ValueError()
+
+
+def _function_fragment(function):
+    if function is None:
+        function = {}
+    if not isinstance(function, dict) or set(function) - {"name", "arguments"}:
+        raise ValueError()
+    name, arguments = function.get("name"), function.get("arguments")
+    if any(value is not None and not isinstance(value, str) for value in (name, arguments)):
+        raise ValueError()
+    return name, arguments
+
+
+def _call_fragment(calls):
+    """(name, arguments) of the delta's one call, each possibly None; None when the delta has no call."""
+    if calls is not None and not isinstance(calls, list):
+        raise ValueError()
+    if not calls:
+        return None
+    if len(calls) != 1 or not isinstance(calls[0], dict):
+        raise ValueError()
+    part = calls[0]
+    if (set(part) - {"index", "id", "type", "function"}
+            or type(part.get("index", 0)) is not int or part.get("index", 0) != 0
+            or part.get("type") not in (None, "function")):
+        raise ValueError()
+    return _function_fragment(part.get("function"))
+
+
+def _extend_tool(tool, name, arguments):
+    if tool is None:
+        tool = {"name": "", "arguments": ""}
+    tool["name"] += "" if name is None else name
+    tool["arguments"] += "" if arguments is None else arguments
+    if len(tool["arguments"]) > 1024 or len(tool["name"]) > 64:
+        raise ValueError()
+    return tool
+
+
+def _read_frames(lines):
+    """(tool, finish, done) of a legacy stream; any frame outside the accepted shape is refused."""
+    done, tool, finish = False, None, None
+    for line in lines:
+        if not line:
+            continue
+        if line == "data: [DONE]":
+            if done or finish is None:
+                raise ValueError()
+            done = True
+            continue
+        if not line.startswith("data: ") or done:
+            raise ValueError()
+        choices = _frame_choices(line, finish)
+        if not choices:
+            continue
+        choice = choices[0]
+        finish = choice.get("finish_reason")
+        if finish is not None and finish not in ("stop", "tool_calls"):
+            raise ValueError()
+        delta = choice.get("delta", {})
+        _check_delta(delta)
+        fragment = _call_fragment(delta.get("tool_calls"))
+        if fragment is not None:
+            tool = _extend_tool(tool, *fragment)
+    return tool, finish, done
+
+
+def _tool_delta(tool, counter):
+    schema = {
+        "read_context": Empty, "save_result": Answer, "finish_task": Empty,
+        "execute_operation": Empty,
+    }.get(tool["name"])
+    if schema is None:
+        raise ValueError()
+    json.loads(tool["arguments"], object_pairs_hook=_unique)
+    parsed = schema.model_validate_json(tool["arguments"])
+    return {"role": "assistant", "tool_calls": [{
+        "index": 0, "id": f"fa_call_{counter}", "type": "function",
+        "function": {"name": tool["name"], "arguments": parsed.model_dump_json()},
+    }]}
+
+
+def _rebuilt_response(delta, finish, counter, response):
+    common = {"id": f"fa_response_{counter}", "object": "chat.completion.chunk",
+              "created": 1, "model": "gpt-4.1-mini"}
+    messages = []
+    for value, reason in ((delta, None), ({}, finish)):
+        messages.append("data: " + json.dumps({**common, "choices": [{
+            "index": 0, "delta": value, "finish_reason": reason,
+        }]}) + "\n\n")
+    return httpx.Response(200, content=("".join(messages) + "data: [DONE]\n\n").encode(),
+                          headers={"content-type": "text/event-stream"}, request=response.request)
+
+
 class AssistantModelBoundary:
     @staticmethod
     def delegation_result(value):
@@ -189,6 +311,32 @@ class AssistantModelBoundary:
             return parse_instruction_context(text).model_dump_json()
         return models[name].model_validate_json(text).model_dump_json()
 
+    def _checked_stream(self, response):
+        from .behavior_instruction_stream import BoundedStream
+        boundary = self
+        class CheckedStream(BoundedStream):
+            async def __aiter__(self):
+                try:
+                    async for chunk in super().__aiter__():
+                        yield chunk
+                except BaseException as error:
+                    boundary.record_failure(error,phase="stream")
+                    raise
+        return httpx.Response(200,request=response.request,
+            headers={"content-type":"text/event-stream"},stream=CheckedStream(response))
+
+    async def _close(self, response, *, failed):
+        try:
+            await response.aclose()
+        except Exception as error:
+            if failed:
+                logging.getLogger(__name__).warning("ASSISTANT_MODEL_RESPONSE_CLOSE_UNRESOLVED")
+            else:
+                detail = model_failure(error, phase="output_boundary")
+                detail["boundary_phase"] = "response_close"
+                self.record_failure(AssistantModelFailure("Assistant output unresolved", detail), phase="output_boundary")
+                raise AssistantModelFailure("Assistant provider output refused before SDK ingress", detail) from None
+
     async def response(self, response):
         phase, failed = "response_status", False
         handed_off = False
@@ -200,87 +348,19 @@ class AssistantModelBoundary:
             if content_type != "text/event-stream":
                 raise ValueError()
             if self.text_reply and self.streaming:
-                from .behavior_instruction_stream import BoundedStream
-                boundary = self
-                class CheckedStream(BoundedStream):
-                    async def __aiter__(self):
-                        try:
-                            async for chunk in super().__aiter__():
-                                yield chunk
-                        except BaseException as error:
-                            boundary.record_failure(error,phase="stream")
-                            raise
-                streamed = httpx.Response(200,request=response.request,
-                    headers={"content-type":"text/event-stream"},stream=CheckedStream(response))
+                streamed = self._checked_stream(response)
                 handed_off = True
                 return streamed
-            raw = bytearray()
             phase = "response_body"
-            async for chunk in response.aiter_bytes():
-                raw.extend(chunk)
-                if len(raw) > (4*1024*1024 if self.text_reply else 65536):
-                    raise ValueError()
+            raw = await _read_body(response, 4*1024*1024 if self.text_reply else 65536)
             if self.text_reply:
                 # The official SDK parses free text/tool SSE. Never rebuild its content or IDs.
                 return httpx.Response(200, content=bytes(raw), headers={"content-type": "text/event-stream"},
                                       request=response.request)
             phase = "response_decode"
             lines = raw.decode("utf-8").splitlines()
-            messages, done, tool, finish = [], False, None, None
             phase = "sse_frame"
-            for line in lines:
-                if not line:
-                    continue
-                if line == "data: [DONE]":
-                    if done or finish is None:
-                        raise ValueError()
-                    done = True
-                    continue
-                if not line.startswith("data: ") or done:
-                    raise ValueError()
-                value = json.loads(line[6:], object_pairs_hook=_unique)
-                choices = value.get("choices")
-                if choices == []:
-                    continue
-                if not isinstance(choices, list) or len(choices) != 1:
-                    raise ValueError()
-                if finish is not None:
-                    raise ValueError()
-                choice = choices[0]
-                finish = choice.get("finish_reason")
-                if finish is not None and finish not in ("stop", "tool_calls"):
-                    raise ValueError()
-                delta = choice.get("delta", {})
-                if not isinstance(delta, dict) or set(delta) - {"role", "content", "tool_calls", "refusal", "function_call"}:
-                    raise ValueError()
-                if (delta.get("content") not in (None, "") or delta.get("role") not in (None, "assistant")
-                        or delta.get("refusal") is not None or delta.get("function_call") is not None):
-                    raise ValueError()
-                calls = delta.get("tool_calls")
-                if calls is not None and not isinstance(calls, list):
-                    raise ValueError()
-                if calls:
-                    if len(calls) != 1 or not isinstance(calls[0], dict):
-                        raise ValueError()
-                    part = calls[0]
-                    if (set(part) - {"index", "id", "type", "function"}
-                            or type(part.get("index", 0)) is not int or part.get("index", 0) != 0
-                            or part.get("type") not in (None, "function")):
-                        raise ValueError()
-                    function = part.get("function")
-                    if function is None:
-                        function = {}
-                    if not isinstance(function, dict) or set(function) - {"name", "arguments"}:
-                        raise ValueError()
-                    name, arguments = function.get("name"), function.get("arguments")
-                    if any(value is not None and not isinstance(value, str) for value in (name, arguments)):
-                        raise ValueError()
-                    if tool is None:
-                        tool = {"name": "", "arguments": ""}
-                    tool["name"] += "" if name is None else name
-                    tool["arguments"] += "" if arguments is None else arguments
-                    if len(tool["arguments"]) > 1024 or len(tool["name"]) > 64:
-                        raise ValueError()
+            tool, finish, done = _read_frames(lines)
             phase = "sse_terminal"
             if not done or finish != ("stop" if tool is None else "tool_calls"):
                 raise ValueError()
@@ -290,26 +370,8 @@ class AssistantModelBoundary:
                 delta = {"role": "assistant", "content": ""}
             else:
                 phase = "tool_schema"
-                schema = {
-                    "read_context": Empty, "save_result": Answer, "finish_task": Empty,
-                    "execute_operation": Empty,
-                }.get(tool["name"])
-                if schema is None:
-                    raise ValueError()
-                json.loads(tool["arguments"], object_pairs_hook=_unique)
-                parsed = schema.model_validate_json(tool["arguments"])
-                delta = {"role": "assistant", "tool_calls": [{
-                    "index": 0, "id": f"fa_call_{self.counter}", "type": "function",
-                    "function": {"name": tool["name"], "arguments": parsed.model_dump_json()},
-                }]}
-            common = {"id": f"fa_response_{self.counter}", "object": "chat.completion.chunk",
-                      "created": 1, "model": "gpt-4.1-mini"}
-            for value, reason in ((delta, None), ({}, finish)):
-                messages.append("data: " + json.dumps({**common, "choices": [{
-                    "index": 0, "delta": value, "finish_reason": reason,
-                }]}) + "\n\n")
-            return httpx.Response(200, content=("".join(messages) + "data: [DONE]\n\n").encode(),
-                                  headers={"content-type": "text/event-stream"}, request=response.request)
+                delta = _tool_delta(tool, self.counter)
+            return _rebuilt_response(delta, finish, self.counter, response)
         except (Exception, asyncio.CancelledError) as error:
             failed = True
             detail = model_failure(error, phase="output_boundary")
@@ -319,14 +381,5 @@ class AssistantModelBoundary:
                 raise
             raise AssistantModelFailure("Assistant provider output refused before SDK ingress", detail) from None
         finally:
-            try:
-                if not handed_off:
-                    await response.aclose()
-            except Exception as error:
-                if failed:
-                    logging.getLogger(__name__).warning("ASSISTANT_MODEL_RESPONSE_CLOSE_UNRESOLVED")
-                else:
-                    detail = model_failure(error, phase="output_boundary")
-                    detail["boundary_phase"] = "response_close"
-                    self.record_failure(AssistantModelFailure("Assistant output unresolved", detail), phase="output_boundary")
-                    raise AssistantModelFailure("Assistant provider output refused before SDK ingress", detail) from None
+            if not handed_off:
+                await self._close(response, failed=failed)

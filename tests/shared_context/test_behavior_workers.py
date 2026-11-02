@@ -8,17 +8,19 @@ real worker process. Neither is Azure Table/Foundry/native-capacity evidence.
 from __future__ import annotations
 
 import hashlib
+import json
 import multiprocessing
 import os
 import pickle
 import sqlite3
 from dataclasses import replace
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
 from shared_context.behavior_delivery import (
-    DeliveryConsumer, DeliveryCore, RuntimeContract, RuntimeRegistration, VerifiedWorkResult, authority_snapshot,
+    DeliveryConsumer, DeliveryCore, RuntimeContract, RuntimeRegistration, VerifiedWorkResult, _material, authority_snapshot,
 )
 from shared_context.behavior_operations import (
     OperationDescription, ReceiptResult, ResolvedResource, _Operation, control_key,
@@ -29,7 +31,7 @@ from shared_context.behavior_workers import (
     worker_key,
 )
 from shared_context.errors import Problem
-from test_behavior_delivery import CONTEXT, NOW, Harness
+from test_behavior_delivery import CONTEXT, NOW, OTHER, Harness
 from test_behavior_store import Backing, FakeTable, SCOPE, code
 
 
@@ -347,10 +349,7 @@ def test_cancellation_preserves_opaque_operation_records_or_keeps_the_completion
     assert not h.executor.starts
 
 
-@pytest.mark.parametrize("applied", [False, True])
-def test_cancellation_classifies_prepared_and_verified_applied_operations(applied):
-    h = WorkerHarness()
-    ob, command, _ = h.admit()
+def retain_operation(h, operation_id, applied):
     description = OperationDescription(
         adapter_id="configured-adapter", adapter_version="1", kind="request", method="PATCH",
         target="test-work://original", content=b"exact approved bytes",
@@ -359,7 +358,7 @@ def test_cancellation_classifies_prepared_and_verified_applied_operations(applie
     material = description.model_dump_json().encode()
     digest = hashlib.sha256(material).hexdigest()
     operation = _Operation(
-        operation_id="op-a", owner_record_id=CONTEXT.owner_record_id, conversation_id=CONTEXT.conversation_id,
+        operation_id=operation_id, owner_record_id=CONTEXT.owner_record_id, conversation_id=CONTEXT.conversation_id,
         root_budget_id=CONTEXT.root_budget_id, description_digest=digest, adapter_contract_digest="1" * 64,
         current_attempt_id="original-attempt" if applied else None,
         effect_state="applied" if applied else "unknown", business_state="succeeded" if applied else "pending",
@@ -368,12 +367,19 @@ def test_cancellation_classifies_prepared_and_verified_applied_operations(applie
     )
     from shared_context.behavior_store import InlineMaterial
     h.store.transact(
-        ControlRequest(request_id="retained-applied", request_digest=hashlib.sha256(b"retained").hexdigest()),
+        ControlRequest(request_id="retained-" + operation_id, request_digest=hashlib.sha256(operation_id.encode()).hexdigest()),
         lambda _: ControlChanges(writes=(ControlWrite(
-            row_id=control_key("operation", "op-a"), mode="create", data=operation.model_dump(mode="json"),
+            row_id=control_key("operation", operation_id), mode="create", data=operation.model_dump(mode="json"),
             material=InlineMaterial(data=material, sha256=digest),
         ),), result={"synthetic_only": True}),
     )
+
+
+@pytest.mark.parametrize("applied", [False, True])
+def test_cancellation_classifies_prepared_and_verified_applied_operations(applied):
+    h = WorkerHarness()
+    ob, command, _ = h.admit()
+    retain_operation(h, "op-a", applied)
     h.workers.enqueue(JobSpec(job_id="cancel", work_id=command.work.work_id, input=b"saved", obligation_id=ob), CONTEXT)
     h.workers.cancel("cancel", CONTEXT)
     delivery = h.broker(h.store, replace(h.registration, verify_work_result=h.workers.verify_work_result))
@@ -382,6 +388,18 @@ def test_cancellation_classifies_prepared_and_verified_applied_operations(applie
     assert result["known_effects"] == (["op-a"] if applied else [])
     assert result["unresolved_operations"] == []
     assert result["state"] == "cancelled"
+    proof = json.loads(VerifiedWorkResult.model_validate_json(json.dumps(result)).proof)
+    assert proof["known_effects"] == result["known_effects"]
+
+
+def test_cancellation_with_too_many_known_effects_keeps_the_completion_pending():
+    h = WorkerHarness()
+    ob, _ = inactive_job(h)
+    identifiers = [f"applied-{number}" for number in range(17)]
+    for identifier in identifiers:
+        retain_operation(h, identifier, True)
+    h.mutate("owner", CONTEXT.owner_record_id, operation_ids=identifiers)
+    refused(h, "WORKER_CANCELLATION_RECONCILIATION_REQUIRED", ob)
 
 
 def test_parked_cancel_retains_child_responsibilities_without_claiming_the_child_stopped():
@@ -856,3 +874,306 @@ def test_real_restarted_delivery_process_reconstructs_saved_result_without_busin
     assert row["last_version"] == 1 and row["fulfillment"] == "pending"
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT count(*) FROM business").fetchone()[0] == 0
+
+
+def retained_delivery(h):
+    return h.broker(h.store, replace(h.registration, verify_work_result=h.workers.verify_work_result))
+
+
+def inactive_job(h):
+    ob, command, _ = h.admit()
+    h.workers.enqueue(JobSpec(job_id="job", work_id=command.work.work_id, input=b"saved", obligation_id=ob), CONTEXT)
+    h.workers.cancel("job", CONTEXT)
+    return ob, "0"
+
+
+def stopped_job(h):
+    ob, command, _ = h.admit()
+    h.workers.enqueue(JobSpec(job_id="job", work_id=command.work.work_id, input=b"saved", obligation_id=ob), CONTEXT)
+    h.workers.start("job", CONTEXT)
+    h.workers.cancel("job", CONTEXT)
+    h.workers.observe("job", h.proof("job", "stopped"), CONTEXT)
+    return ob, "1"
+
+
+def rewrite_row(h, kind, ids, **updates):
+    """Forge a retained row with self-consistent material, past what a store write allows."""
+    row = "behavior:v1:row:" + control_key(kind, *ids)
+    entity = h.client.backing.rows[("Behavior", SCOPE.partition_key, row)]
+    payload = json.loads(entity["Payload"])
+    payload["data"] = {**payload["data"], **updates}
+    payload["material"] = _material(payload["data"]).model_dump(mode="json")
+    entity["Payload"] = json.dumps(payload).encode()
+
+
+def around_transact(h, monkeypatch, action, *, before=None, after=None):
+    """Change rows just before or after one worker transaction, once."""
+    transact = h.store.transact
+
+    def wrapped(request, decide, **options):
+        if request.request_id != worker_key(action, "job"):
+            return transact(request, decide, **options)
+        monkeypatch.setattr(h.store, "transact", transact)
+        if before is not None:
+            before()
+        receipt = transact(request, decide, **options)
+        if after is not None:
+            after()
+        return receipt
+
+    monkeypatch.setattr(h.store, "transact", wrapped)
+
+
+def refused(h, expected, ob, context=CONTEXT, delivery=None):
+    with pytest.raises(Problem) as error:
+        h.workers.forward_result("job", context, delivery or retained_delivery(h))
+    assert code(error) == expected
+    assert h.data("delivery-work-state", ob)["state"] == "queued"
+    assert not h.data("worker-job", "job")["result_forwarded"]
+
+
+@pytest.mark.parametrize("delivery", [
+    SimpleNamespace(contract=None),
+    SimpleNamespace(contract=SimpleNamespace(control_binding="another-authority")),
+], ids=["no-contract", "another-authority"])
+def test_forward_requires_the_same_delivery_authority(delivery):
+    h = WorkerHarness()
+    ob, _ = inactive_job(h)
+    refused(h, "WORKER_DELIVERY_AUTHORITY", ob, delivery=delivery)
+
+
+def test_forward_requires_a_terminal_job_with_an_obligation():
+    h = WorkerHarness()
+    ob, command, _ = h.admit()
+    h.workers.enqueue(JobSpec(job_id="job", work_id=command.work.work_id, input=b"saved", obligation_id=ob), CONTEXT)
+    refused(h, "WORKER_RESULT_PENDING", ob)
+    h.workers.enqueue(JobSpec(job_id="free", work_id="free-work", input=b"saved"), CONTEXT)
+    h.workers.cancel("free", CONTEXT)
+    with pytest.raises(Problem) as pending:
+        h.workers.forward_result("free", CONTEXT, retained_delivery(h))
+    assert code(pending) == "WORKER_RESULT_PENDING"
+
+
+def test_forward_requires_a_retained_completion():
+    h = WorkerHarness()
+    ob, command, _ = h.admit()
+    h.workers.enqueue(JobSpec(job_id="job", work_id=command.work.work_id, input=b"saved", obligation_id=ob), CONTEXT)
+    h.mutate("worker-job", "job", state="failed")
+    refused(h, "WORKER_RECORD_MISSING", ob)
+
+
+def test_stop_with_a_saved_result_forwards_that_result_not_a_cancellation():
+    h = WorkerHarness()
+    ob, command, _ = h.admit()
+    h.workers.enqueue(JobSpec(job_id="job", work_id=command.work.work_id, input=b"saved", obligation_id=ob), CONTEXT)
+    h.workers.start("job", CONTEXT)
+    h.workers.cancel("job", CONTEXT)
+    work = h.data("delivery-work-state", ob)
+    saved = VerifiedWorkResult(
+        evidence_id="saved-before-stop", verifier_version=h.config.verifier_version, work_id=command.work.work_id,
+        definition_digest=work["definition_digest"], state="cancelled", passed_checks=(),
+        content=b"saved before the stop", proof=b"offline result proof")
+    h.workers.observe("job", h.proof("job", "stopped", result=saved), CONTEXT)
+    h.workers.forward_result("job", CONTEXT, retained_delivery(h))
+    assert decoded_result(h, ob) == saved
+
+
+def test_forward_refuses_another_owners_job_and_a_fenced_owner(monkeypatch):
+    h = WorkerHarness()
+    ob, _ = inactive_job(h)
+    refused(h, "WORKER_JOB_FENCED", ob, context=OTHER)
+    owner = {**h.data("worker-job", "job")["owner"], "principal_id": "someone-else"}
+    around_transact(h, monkeypatch, "prepare-forward", before=lambda: h.mutate("worker-job", "job", owner=owner))
+    refused(h, "WORKER_JOB_FENCED", ob)
+    h.mutate("worker-job", "job", owner=CONTEXT.model_dump(mode="json"))
+    h.mutate("owner", CONTEXT.owner_record_id, epoch=2)
+    refused(h, "WORKER_OWNER_FENCED", ob)
+
+
+@pytest.mark.parametrize("change", ["binding", "not-reserved", "evidence", "material"])
+def test_forward_requires_the_retained_completion_it_reserved(change):
+    h = WorkerHarness()
+    ob, generation = stopped_job(h)
+    if change == "binding":
+        h.mutate("worker-job", "job", binding=None)
+    elif change == "not-reserved":
+        h.mutate("worker-pool", h.worker_contract.workspace_id, completions=[])
+    elif change == "evidence":
+        h.mutate("worker-job", "job", last_evidence_id="other-evidence")
+    else:
+        h.mutate("worker-completion", "job", generation, sequence=99)
+    refused(h, "WORKER_RESULT_PENDING", ob)
+
+
+@pytest.mark.parametrize("build", [inactive_job, stopped_job], ids=["inactive", "stopped"])
+@pytest.mark.parametrize("updates", [{"state": "failed"}, {"cancel_requested": False}], ids=["state", "not-requested"])
+def test_forward_of_no_result_requires_an_accepted_cancellation(build, updates):
+    h = WorkerHarness()
+    ob, _ = build(h)
+    h.mutate("worker-job", "job", **updates)
+    refused(h, "WORKER_CANCELLATION_UNVERIFIED", ob)
+
+
+@pytest.mark.parametrize("change", ["spec", "owner", "generation"])
+def test_forward_of_inactive_cancel_requires_its_exact_job(change, monkeypatch):
+    h = WorkerHarness()
+    ob, _ = inactive_job(h)
+    job = h.data("worker-job", "job")
+    if change == "spec":
+        h.mutate("worker-job", "job", spec={**job["spec"], "parent_job_id": "other-parent"})
+    elif change == "owner":
+        h.mutate("worker-job", "job", owner={**job["owner"], "epoch": 2})
+    else:
+        around_transact(h, monkeypatch, "prepare-forward", before=lambda: h.mutate("worker-job", "job", generation=1))
+    refused(h, "WORKER_CANCELLATION_UNVERIFIED", ob)
+
+
+@pytest.mark.parametrize("change", ["state", "result"])
+def test_forward_of_stop_rechecks_the_proof_it_classified(change, monkeypatch):
+    h = WorkerHarness()
+    ob, generation = stopped_job(h)
+    updates = {"state": "failed"} if change == "state" else {"result": VerifiedWorkResult(
+        evidence_id="late-result", verifier_version=h.config.verifier_version,
+        work_id=h.data("worker-job", "job")["spec"]["work_id"], definition_digest=h.data("delivery-work-state", ob)["definition_digest"],
+        state="failed", passed_checks=(), content=b"late", proof=b"late",
+    ).model_dump(mode="json")}
+    around_transact(h, monkeypatch, "prepare-forward",
+                    before=lambda: rewrite_row(h, "worker-completion", ("job", generation), **updates))
+    refused(h, "WORKER_CANCELLATION_UNVERIFIED", ob)
+
+
+def test_forward_of_cancellation_requires_the_same_queued_work():
+    h = WorkerHarness()
+    ob, _ = stopped_job(h)
+    job = h.data("worker-job", "job")
+    h.mutate("worker-job", "job", spec={**job["spec"], "work_id": "another-work"})
+    refused(h, "WORKER_RESULT_PENDING", ob)
+
+    h = WorkerHarness()
+    ob, _ = stopped_job(h)
+    h.work_result(ob)
+    with pytest.raises(Problem) as pending:
+        h.workers.forward_result("job", CONTEXT, retained_delivery(h))
+    assert code(pending) == "WORKER_RESULT_PENDING"
+    assert h.workers.completions() == ("job",)
+
+
+def test_forward_of_cancellation_refuses_a_changed_operation_scope(monkeypatch):
+    h = WorkerHarness()
+    ob, _ = inactive_job(h)
+    around_transact(h, monkeypatch, "prepare-forward", before=lambda: h.mutate(
+        "owner", CONTEXT.owner_record_id, operation_ids=["arrived-late"]))
+    refused(h, "WORKER_CANCELLATION_UNVERIFIED", ob)
+
+
+def decoded_result(h, ob):
+    return VerifiedWorkResult.model_validate_json(json.dumps(h.data("delivery-work-state", ob)["result"]))
+
+
+@pytest.mark.parametrize("build", [inactive_job, stopped_job], ids=["inactive", "stopped"])
+def test_forward_of_cancellation_keeps_its_exact_saved_result_and_plan(build):
+    h = WorkerHarness()
+    ob, generation = build(h)
+    completion = h.data("worker-completion", "job", generation)
+    inactive = build is inactive_job
+    delivery = retained_delivery(h)
+    receipt = h.workers.forward_result("job", CONTEXT, delivery)
+    count = h.submissions()
+    assert h.workers.forward_result("job", CONTEXT, delivery) == receipt
+    assert h.submissions() == count
+    result = decoded_result(h, ob)
+    evidence = completion["evidence_id"] if inactive else worker_key("stopped-cancel", completion["evidence_id"])
+    assert result.evidence_id == evidence and result.state == "cancelled" and result.passed_checks == ()
+    assert result.verifier_version == h.config.verifier_version
+    assert result.definition_digest == h.data("delivery-work-state", ob)["definition_digest"]
+    assert result.content == (
+        b"Job cancelled with no executor slot held. Prior work and child work are not rolled back." if inactive else
+        b"Job cancelled after verified executor fencing. Existing operation and child records require separate "
+        b"reconciliation; effects are not rolled back.")
+    operations = h.data("owner", CONTEXT.owner_record_id)["operation_ids"]
+    assert result.proof == _material({"cancellation": completion, "operation_ids_checked": operations, "known_effects": (),
+                                      "unreconciled_records": ()}).data
+    saved = h.raw("worker-work-result", evidence)
+    assert saved["data"] == h.data("delivery-work-state", ob)["result"]
+    assert saved["material"]["sha256"] == _material(saved["data"]).sha256
+    plan = h.raw("worker-result-forward", "job")
+    assert plan["material"]["sha256"] == _material(plan["data"]).sha256
+    assert plan["data"]["job_id"] == "job" and plan["data"]["context"] == CONTEXT.model_dump(mode="json")
+    assert plan["data"]["command"] == {"obligation_id": ob, "evidence_id": evidence}
+    assert plan["data"]["delivery_configuration_digest"] == delivery.configuration_digest()
+    assert set(receipt.payload["result"]) == {"actual_environment", "result_forwarded", "work_receipt_request_id"}
+    assert receipt.payload["result"]["result_forwarded"] is True
+
+
+@pytest.mark.parametrize("build,expected", [(inactive_job, ["retained-child"]), (stopped_job, ["current-child", "opaque"])],
+                         ids=["inactive-uses-its-proof", "stopped-uses-the-job"])
+def test_forward_of_cancellation_names_each_unreconciled_record_once(build, expected):
+    h = WorkerHarness()
+    if build is inactive_job:
+        ob, command, _ = h.admit()
+        h.workers.enqueue(JobSpec(job_id="job", work_id=command.work.work_id, input=b"saved", obligation_id=ob), CONTEXT)
+        h.mutate("worker-job", "job", children=["retained-child"])
+        h.workers.cancel("job", CONTEXT)
+        h.mutate("worker-job", "job", children=["later-child"])
+    else:
+        ob, _ = build(h)
+        retain_operation(h, "opaque", False)
+        h.mutate("operation", "opaque", effect_state="applied")
+        h.mutate("worker-job", "job", children=["current-child", "opaque"])
+        h.mutate("owner", CONTEXT.owner_record_id, operation_ids=["opaque"])
+    h.workers.forward_result("job", CONTEXT, retained_delivery(h))
+    result = decoded_result(h, ob)
+    assert sorted(result.unresolved_operations) == sorted(expected)
+    assert json.loads(result.proof)["unreconciled_records"] == list(result.unresolved_operations)
+
+
+@pytest.mark.parametrize("change", ["context", "configuration", "request", "material"])
+def test_forward_rechecks_the_retained_plan_before_delivery(change, monkeypatch):
+    h = WorkerHarness()
+    ob, _ = inactive_job(h)
+    plan = ("job",)
+    tamper = {
+        "context": lambda: rewrite_row(h, "worker-result-forward", plan, context=OTHER.model_dump(mode="json")),
+        "configuration": lambda: rewrite_row(h, "worker-result-forward", plan, delivery_configuration_digest="0" * 64),
+        "request": lambda: rewrite_row(h, "worker-result-forward", plan, request={
+            **h.data("worker-result-forward", "job")["request"], "request_digest": "0" * 64}),
+        "material": lambda: h.mutate("worker-result-forward", "job", job_id="another-job"),
+    }[change]
+    around_transact(h, monkeypatch, "prepare-forward", after=tamper)
+    refused(h, "WORKER_FORWARD_FENCED", ob)
+
+
+def test_forward_rechecks_the_owner_before_delivery_and_before_finishing(monkeypatch):
+    h = WorkerHarness()
+    ob, _ = inactive_job(h)
+    around_transact(h, monkeypatch, "prepare-forward", after=lambda: h.mutate("owner", CONTEXT.owner_record_id, epoch=2))
+    refused(h, "WORKER_OWNER_FENCED", ob)
+
+    h = WorkerHarness()
+    inactive_job(h)
+    around_transact(h, monkeypatch, "forwarded", before=lambda: h.mutate("owner", CONTEXT.owner_record_id, epoch=2))
+    with pytest.raises(Problem) as fenced:
+        h.workers.forward_result("job", CONTEXT, retained_delivery(h))
+    assert code(fenced) == "WORKER_OWNER_FENCED"
+    assert not h.data("worker-job", "job")["result_forwarded"]
+
+
+def test_forward_finish_requires_the_job_scope_and_its_completion_reservation(monkeypatch):
+    h = WorkerHarness()
+    inactive_job(h)
+    around_transact(h, monkeypatch, "forwarded", before=lambda: h.mutate(
+        "worker-pool", h.worker_contract.workspace_id, completions=[]))
+    with pytest.raises(Problem) as fenced:
+        h.workers.forward_result("job", CONTEXT, retained_delivery(h))
+    assert code(fenced) == "WORKER_FORWARD_FENCED"
+    assert not h.data("worker-job", "job")["result_forwarded"]
+    assert h.data("delivery-work-state", h.data("worker-job", "job")["spec"]["obligation_id"])["state"] == "cancelled"
+
+    h = WorkerHarness()
+    inactive_job(h)
+    owner = {**h.data("worker-job", "job")["owner"], "principal_id": "someone-else"}
+    around_transact(h, monkeypatch, "forwarded", before=lambda: h.mutate("worker-job", "job", owner=owner))
+    with pytest.raises(Problem) as fenced:
+        h.workers.forward_result("job", CONTEXT, retained_delivery(h))
+    assert code(fenced) == "WORKER_JOB_FENCED"
+    assert not h.data("worker-job", "job")["result_forwarded"]

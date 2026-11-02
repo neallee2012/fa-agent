@@ -53,6 +53,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -66,8 +67,7 @@ from .behavior_operations import (
     AdapterContract, AttemptBinding, AuthorizationRequest, BudgetRecord, ExecutionContext,
     GrantRecord, GrantSubject, OperationDescription, OutcomeRequest, PolicyRecord,
     ReceiptResult, RegisteredAdapter, ResolvedResource, ToolBrokerCore, _Attempt,
-    _Model, _checked, _digest, _json, _parse, _row, _updated, _utc, _write,
-    canonical_material, control_key,
+    _Model, _Operation, _checked, _digest, _json, _parse, _row, _updated, _utc, _write, control_key,
 )
 from .behavior_store import BehaviorStore, ControlChanges, ControlRequest, Digest, InlineMaterial
 from .behavior_workers import worker_key
@@ -307,6 +307,70 @@ class WorkStateEffectAdapter:
         return record
 
 
+@dataclass(frozen=True)
+class _Consumed:
+    """The rows of one receiver decision, parsed once from its guarded snapshot."""
+
+    command: WorkEffectDelivery
+    context: ExecutionContext
+    envelope: _Envelope
+    operation: _Operation
+    material: InlineMaterial
+    description: OperationDescription
+    attempt: _Attempt
+    dispatch: DispatchRecord
+    responsibility: DispatchObligation
+    retained: _Envelope
+
+
+def _dispatch_differs(seen: _Consumed) -> bool:
+    dispatch, attempt = seen.dispatch, seen.attempt
+    return (
+        dispatch.context != seen.context or attempt.context != seen.context
+        or dispatch.execution_contract != EFFECT_CONTRACT or dispatch.phase != "consumed"
+        or dispatch.grant_id != attempt.grant_id or dispatch.binding != attempt.binding
+        or dispatch.consume_request_id != seen.command.consume_request_id
+    )
+
+
+def _responsibility_differs(seen: _Consumed) -> bool:
+    responsibility, context = seen.responsibility, seen.context
+    return (
+        responsibility.binding != seen.attempt.binding
+        or responsibility.consume_request_id != seen.command.consume_request_id
+        or responsibility.state != "pending_reconciliation"
+        or responsibility.owner_record_id != context.owner_record_id
+        or responsibility.root_budget_id != context.root_budget_id
+    )
+
+
+def _attempt_resolved(seen: _Consumed) -> bool:
+    operation, attempt, attempt_id = seen.operation, seen.attempt, seen.command.attempt_id
+    return (
+        operation.current_attempt_id != attempt_id or operation.unsettled_attempt_ids != (attempt_id,)
+        or operation.effect_state != "unknown" or attempt.effect_state != "unknown"
+        or attempt.observation_sequence != 0
+    )
+
+
+def _policy_differs(seen: _Consumed, grant: GrantRecord, policy: PolicyRecord) -> bool:
+    policy_id = seen.context.policy_id
+    return (
+        grant.policy_id != policy_id or policy.policy_id != policy_id or not policy.active
+        or policy.revision != grant.policy_revision or policy.revision != seen.attempt.policy_revision
+        or policy.revision != seen.dispatch.policy_revision
+    )
+
+
+def _require_pinned_revision(spec: WorkGoalUpdate, ob, work, state: Record) -> None:
+    if (
+        ob.work_id != spec.work_id or ob.fulfillment != "pending" or ob.final_delivery_id is not None
+        or work.state != "queued" or state.etag != spec.expected_etag
+        or work.definition_digest != spec.expected_definition_digest or work.definition.goal == spec.goal
+    ):
+        raise Problem(409, "WORK_EFFECT_REVISION_CONFLICT", "queued work revision or definition differs")
+
+
 class WorkStateEffectReceiver:
     def __init__(self, core: ToolBrokerCore, adapter: WorkStateEffectAdapter):
         self.core, self.adapter, self.store = core, adapter, core.store
@@ -349,6 +413,76 @@ class WorkStateEffectReceiver:
             raise Problem(409, "WORK_EFFECT_DELIVERY_DENIED", "protected receiver delivery differs")
         return envelope
 
+    def _delivery_differs(self, seen: _Consumed) -> bool:
+        return (
+            seen.retained != seen.envelope or seen.command.material != seen.material
+            or seen.envelope.receiver_request != self.request_for(seen.command, seen.context, seen.attempt.grant_id)
+        )
+
+    def _attempt_binding_differs(self, seen: _Consumed) -> bool:
+        binding, command, material = seen.attempt.binding, seen.command, seen.material
+        return (
+            binding.description_digest != material.sha256
+            or binding.adapter_contract_digest != self.core._contract_digest()
+            or binding.target != seen.description.target
+            or binding.operation_id != command.operation_id or binding.attempt_id != command.attempt_id
+            or binding.idempotency_key != control_key("idempotency", command.operation_id, material.sha256)
+        )
+
+    def _require_consumed(self, seen: _Consumed) -> None:
+        if (
+            self._delivery_differs(seen) or _dispatch_differs(seen) or _responsibility_differs(seen)
+            or _attempt_resolved(seen) or self._attempt_binding_differs(seen)
+        ):
+            raise Problem(403, "WORK_EFFECT_BINDING_DENIED", "receiver requires the exact existing consumed attempt")
+
+    def _grant_differs(self, seen: _Consumed, grant: GrantRecord) -> bool:
+        attempt, context = seen.attempt, seen.context
+        return (
+            grant.grant_id != attempt.grant_id or grant.revoked
+            or grant.revocation_revision != attempt.grant_revocation_revision
+            or grant.revocation_revision != seen.dispatch.grant_revocation_revision
+            or grant.root_budget_id != context.root_budget_id or grant.description_digest != seen.material.sha256
+            or grant.adapter_contract_digest != self.core._contract_digest()
+            or GrantSubject(principal_id=context.principal_id, conversation_id=context.conversation_id) not in grant.subjects
+        )
+
+    def _require_grant(self, seen: _Consumed, grant: GrantRecord, policy: PolicyRecord, budget: BudgetRecord) -> None:
+        if (
+            self._grant_differs(seen, grant) or _policy_differs(seen, grant, policy)
+            or budget.root_budget_id != seen.context.root_budget_id or not budget.active
+            or seen.attempt.reserved_units != self.adapter.contract.reservation_units
+        ):
+            raise Problem(403, "WORK_EFFECT_GRANT_DENIED", "current grant, revocation, policy or reservation differs")
+
+    def _applied(self, seen, spec, work, identity, grant, policy, checked_at, deadline) -> ControlChanges:
+        """The one EGT: work change, identity digest and immutable receipt together."""
+        command = seen.command
+        definition = _updated(work.definition, goal=spec.goal)
+        changed = _updated(work, definition=definition, definition_digest=_digest(definition.model_dump(mode="json")))
+        proof = WorkEffectReceipt(
+            receipt_id=effect_key("receipt", command.operation_id, command.attempt_id),
+            request_id=seen.envelope.receiver_request.request_id, consume_request_id=command.consume_request_id,
+            binding=seen.attempt.binding, work_id=spec.work_id, obligation_id=spec.obligation_id,
+            prior_work_revision=hashlib.sha256(spec.expected_etag.encode()).hexdigest(),
+            previous_definition_digest=work.definition_digest, applied_definition_digest=changed.definition_digest,
+            applied_state_digest=_digest(changed.model_dump(mode="json")), owner_epoch=seen.context.epoch,
+            approval_id=grant.approval_id, grant_revocation_revision=grant.revocation_revision,
+            policy_revision=policy.revision, receiver_checked_at=checked_at, receiver_not_after=deadline,
+        )
+        proof_material = _material(proof.model_dump(mode="json"))
+        return ControlChanges(writes=(
+            _write(control_key("delivery-work-state", spec.obligation_id), changed, "replace"),
+            self.adapter.delivery._write(
+                control_key("delivery-work", spec.work_id),
+                {**identity.payload["data"], "definition_digest": changed.definition_digest},
+            ),
+            _write(proof.receipt_id, proof, "create", proof_material),
+        ), result={
+            "receipt": proof.model_dump(mode="json"),
+            "receiver_receipt_digest": proof_material.sha256, "effect_state": "applied",
+        })
+
     def receive(self, command: WorkEffectDelivery, context: ExecutionContext) -> Record:
         command, context = _checked(command, WorkEffectDelivery), _checked(context, ExecutionContext)
         self.adapter._configuration(self.store)
@@ -364,87 +498,28 @@ class WorkStateEffectReceiver:
             spec = self.adapter.validate(description, context)
             attempt = _row(rows, control_key("attempt", command.operation_id, command.attempt_id), _Attempt)
             dispatch = _row(rows, control_key("dispatch", command.operation_id, command.attempt_id), DispatchRecord)
-            responsibility = _row(rows, control_key("dispatch-obligation", command.operation_id, command.attempt_id), DispatchObligation)
-            retained = _row(rows, effect_key("delivery", command.operation_id, command.attempt_id), _Envelope)
-            if (
-                retained != envelope or command.material != material or canonical_material(description) != material
-                or envelope.receiver_request != self.request_for(command, context, attempt.grant_id)
-                or dispatch.context != context or attempt.context != context
-                or dispatch.execution_contract != EFFECT_CONTRACT or dispatch.phase != "consumed"
-                or dispatch.grant_id != attempt.grant_id or dispatch.binding != attempt.binding
-                or dispatch.consume_request_id != command.consume_request_id
-                or responsibility.binding != attempt.binding or responsibility.consume_request_id != command.consume_request_id
-                or responsibility.state != "pending_reconciliation"
-                or responsibility.owner_record_id != context.owner_record_id or responsibility.root_budget_id != context.root_budget_id
-                or operation.current_attempt_id != command.attempt_id or operation.unsettled_attempt_ids != (command.attempt_id,)
-                or operation.effect_state != "unknown" or attempt.effect_state != "unknown" or attempt.observation_sequence
-                or attempt.binding.description_digest != material.sha256
-                or attempt.binding.adapter_contract_digest != self.core._contract_digest()
-                or attempt.binding.target != description.target
-                or attempt.binding.operation_id != command.operation_id or attempt.binding.attempt_id != command.attempt_id
-                or attempt.binding.idempotency_key != control_key("idempotency", command.operation_id, material.sha256)
-            ):
-                raise Problem(403, "WORK_EFFECT_BINDING_DENIED", "receiver requires the exact existing consumed attempt")
+            seen = _Consumed(
+                command, context, envelope, operation, material, description, attempt, dispatch,
+                responsibility=_row(rows, control_key("dispatch-obligation", command.operation_id, command.attempt_id), DispatchObligation),
+                retained=_row(rows, effect_key("delivery", command.operation_id, command.attempt_id), _Envelope),
+            )
+            self._require_consumed(seen)
             grant = _row(rows, control_key("grant", attempt.grant_id), GrantRecord)
             policy = _row(rows, control_key("policy", context.policy_id), PolicyRecord)
             budget = _row(rows, control_key("budget", context.root_budget_id), BudgetRecord)
-            if (
-                grant.grant_id != attempt.grant_id or grant.revoked
-                or grant.revocation_revision != attempt.grant_revocation_revision
-                or grant.revocation_revision != dispatch.grant_revocation_revision
-                or grant.root_budget_id != context.root_budget_id or grant.description_digest != material.sha256
-                or grant.adapter_contract_digest != self.core._contract_digest()
-                or GrantSubject(principal_id=context.principal_id, conversation_id=context.conversation_id) not in grant.subjects
-                or grant.policy_id != context.policy_id or policy.policy_id != context.policy_id or not policy.active
-                or policy.revision != grant.policy_revision or policy.revision != attempt.policy_revision
-                or policy.revision != dispatch.policy_revision
-                or budget.root_budget_id != context.root_budget_id or not budget.active
-                or attempt.reserved_units != self.adapter.contract.reservation_units
-            ):
-                raise Problem(403, "WORK_EFFECT_GRANT_DENIED", "current grant, revocation, policy or reservation differs")
+            self._require_grant(seen, grant, policy, budget)
             ob = self.adapter.delivery._obligation(rows, spec.obligation_id, context)
             work = self.adapter.delivery._work(rows, ob)
             identity = self.adapter._identity(rows, spec.work_id, spec.obligation_id, work)
             if rows[worker_key("admission", spec.obligation_id)] is not None:
                 raise Problem(409, "WORK_EFFECT_EXECUTION_BOUND", "enqueued work requires a new revision and execution binding")
-            state_key = control_key("delivery-work-state", spec.obligation_id)
-            state = rows[state_key]
-            if (
-                ob.work_id != spec.work_id or ob.fulfillment != "pending" or ob.final_delivery_id is not None
-                or work.state != "queued" or work.result is not None or state.payload["material"] is not None
-                or state.etag != spec.expected_etag or work.definition_digest != spec.expected_definition_digest
-                or work.definition.goal == spec.goal
-            ):
-                raise Problem(409, "WORK_EFFECT_REVISION_CONFLICT", "queued work revision or definition differs")
+            _require_pinned_revision(spec, ob, work, rows[control_key("delivery-work-state", spec.obligation_id)])
             checked_at = self.core._now()
             deadline = min(grant.expires_at, attempt.not_after, dispatch.not_after, ob.deadline)
-            start = max(grant.not_before, attempt.authorized_at, dispatch.gated_at, dispatch.armed_at)
+            start = max(grant.not_before, attempt.authorized_at, dispatch.gated_at)
             _within(self.core.clock, start, deadline)
             interval.append((checked_at, deadline))
-            definition = _updated(work.definition, goal=spec.goal)
-            changed = _updated(work, definition=definition, definition_digest=_digest(definition.model_dump(mode="json")))
-            proof = WorkEffectReceipt(
-                receipt_id=effect_key("receipt", command.operation_id, command.attempt_id),
-                request_id=envelope.receiver_request.request_id, consume_request_id=command.consume_request_id,
-                binding=attempt.binding, work_id=spec.work_id, obligation_id=spec.obligation_id,
-                prior_work_revision=hashlib.sha256(spec.expected_etag.encode()).hexdigest(),
-                previous_definition_digest=work.definition_digest, applied_definition_digest=changed.definition_digest,
-                applied_state_digest=_digest(changed.model_dump(mode="json")), owner_epoch=context.epoch,
-                approval_id=grant.approval_id, grant_revocation_revision=grant.revocation_revision,
-                policy_revision=policy.revision, receiver_checked_at=checked_at, receiver_not_after=deadline,
-            )
-            proof_material = _material(proof.model_dump(mode="json"))
-            return ControlChanges(writes=(
-                _write(state_key, changed, "replace"),
-                self.adapter.delivery._write(
-                    control_key("delivery-work", spec.work_id),
-                    {**identity.payload["data"], "definition_digest": changed.definition_digest},
-                ),
-                _write(proof.receipt_id, proof, "create", proof_material),
-            ), result={
-                "receipt": proof.model_dump(mode="json"),
-                "receiver_receipt_digest": proof_material.sha256, "effect_state": "applied",
-            })
+            return self._applied(seen, spec, work, identity, grant, policy, checked_at, deadline)
 
         try:
             return store.transact(envelope.receiver_request, decide)

@@ -47,6 +47,58 @@ def code_error(code, **extra):
     return {"code": code, **extra}
 
 
+# ---------------------------------------------------------------- job status replies
+
+JOB = {"job_id": "job-1", "work_id": "work-1", "state": "running", "generation": 1, "result_forwarded": False}
+TASK = SimpleNamespace(binding_id="binding-1", job_id="job-1", work_id="work-1", submit_request_id="request-1",
+                       submission="work")
+JOB_REQUESTS = {
+    "status": ("GET", "/behavior/v1/bindings/binding-1/jobs/job-1", b""),
+    "submit": ("POST", "/behavior/v1/bindings/binding-1/work/submit", None),
+}
+# Pydantic alone would take the last value; only the strict parse refuses a repeated key.
+REPEATED_KEY = b'{"job_id": "job-1", "job_id": "job-1", "work_id": "work-1", "state": "running", "generation": 1,' \
+               b' "result_forwarded": false}'
+
+
+def job_call(action, content):
+    adapter, seen = make(lambda request: httpx.Response(200, content=content))
+    return (lambda: getattr(adapter, action)(TASK, TOKEN)), seen
+
+
+@pytest.mark.parametrize("action", JOB_REQUESTS)
+def test_a_job_reply_comes_back_parsed_from_the_actions_own_request(action):
+    call, seen = job_call(action, json.dumps({**JOB, "delivery_id": "delivery-1"}).encode())
+    status = call()
+    assert (status.job_id, status.work_id, status.state, status.generation, status.delivery_id) == (
+        "job-1", "work-1", "running", 1, "delivery-1")
+    method, path, content = JOB_REQUESTS[action]
+    assert [(request.method, request.url.path) for request in seen] == [(method, path)]
+    assert seen[0].headers["authorization"] == "Bearer " + TOKEN
+    if content is None:
+        assert json.loads(seen[0].content)["request_id"] == "request-1"
+    else:
+        assert seen[0].content == content
+
+
+@pytest.mark.parametrize("action", JOB_REQUESTS)
+@pytest.mark.parametrize("raw", [b"not json", REPEATED_KEY, b'{"a": NaN}', b"{}"])
+def test_an_unreadable_job_reply_is_status_invalid(action, raw):
+    call, _ = job_call(action, raw)
+    with pytest.raises(ConsoleError) as error:
+        call()
+    assert (error.value.code, error.value.status) == ("STATUS_INVALID", 502)
+
+
+@pytest.mark.parametrize("action", JOB_REQUESTS)
+@pytest.mark.parametrize("field", ["job_id", "work_id"])
+def test_a_reply_for_another_job_is_a_binding_mismatch(action, field):
+    call, _ = job_call(action, json.dumps({**JOB, field: "other"}).encode())
+    with pytest.raises(ConsoleError) as error:
+        call()
+    assert (error.value.code, error.value.status) == ("STATUS_BINDING_MISMATCH", 502)
+
+
 # ---------------------------------------------------------------- request guards
 
 @pytest.mark.parametrize("path", ["x", "//evil.test/x", "/a?b=1", "/a#b", "@evil.test/x"])
@@ -618,3 +670,11 @@ def test_unknown_work_policy_failures_fall_back():
     assert mapped("GET", WP + "x", None, 500) == FALLBACK
     assert mapped("GET", WP + "x", "text", 500) == FALLBACK
     assert failure("GET", WP + "x", raw=b"[1]") == FALLBACK
+
+
+@pytest.mark.parametrize("raw", [b"{}", b'{"a":1,"a":2}', b"NaN", None])
+def test_decode_turns_an_unreadable_reply_into_the_callers_502(raw):
+    """b"{}" fails the model, a duplicate key or NaN fails strict JSON, None is a TypeError from the parser."""
+    with pytest.raises(ConsoleError) as error:
+        adapter_module.decode(adapter_module.FixedTask, raw, "MINE")
+    assert (error.value.code, error.value.status) == ("MINE", 502)

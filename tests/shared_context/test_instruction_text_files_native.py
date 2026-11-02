@@ -10,6 +10,7 @@ from copilot.session import CopilotSession
 from fastapi.testclient import TestClient
 
 from sdk_checkpoint_local import sse
+from shared_context import m2_copilot
 from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_assistant_hosted import AssistantSession
@@ -75,8 +76,8 @@ def test_literal_file_is_user_data_in_actual_sdk_requests_and_cold_resume(assist
         assert h.runtime.controller.step(second.json()["binding_id"]).state == "succeeded"
         assert len(packets) == len(sent) == 2 and sent[0][0] == sent[1][0]
         assert len(stops) == 2 and all(stop.graceful and stop.runtime_version == "1.0.83" for stop in stops)
-        assert sent[0][1] == prompt and sent[0][2][0]["text"] == BODY and sent[1][2] is None
-        assert sent[0][2][0]["filePath"] == "data.csv"
+        assert sent[0][1:] == (prompt + "\n\n" + m2_copilot._TEXT_FILES_HEADER + "\n"
+                               + m2_copilot._text_file_block(file.name, BODY), None) and sent[1][2] is None
         assert not list(Path(directory).rglob("data.csv"))
         assert "Exception in callback" not in caplog.text
         saved = client.get(f"/work-policy/v1/conversations/{first['conversation_id']}/turns/1/files/data.csv",

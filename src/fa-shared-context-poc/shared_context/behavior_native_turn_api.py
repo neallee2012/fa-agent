@@ -905,58 +905,14 @@ class NativeTurnGateway:
                 queue(partial(send, refused=sessions.moved))
         prefetch = (self._prefetch(control, reader, principal, command)
                     if early and original is None and command.conversation_id is not None else None)
-        try:
-            with phase_timing("api_submit_session", job_id=timed):
-                client = sessions.current(reader, checked_since=started)
-        except Problem as error:
-            if error.body["error"]["code"] == "NATIVE_SESSION_CHANGED":
-                # Without FA_NATIVE_SESSION_GUARD_ENFORCE a submit never bootstraps: it follows only an Agent prepared
-                # earlier, seen either as prepared state naming the new version's session (``following_candidate``) or
-                # as an existing earlier session.
-                # A reconcile of an accepted RID is not marked.
-                if original is not None:
-                    raise
-                try:
-                    prepared = sessions.following_candidate is not None or self._prepared_before(
-                        sessions, reader, getattr(error, "located", None))
-                except Problem as unconfirmed:
-                    code = unconfirmed.body["error"]["code"]
-                    if code == "AGENT_VERSION_FOLLOWING" or (
-                            unconfirmed.status == 503 and code == "NATIVE_ENVIRONMENT_UNAVAILABLE"):
-                        # The selector or the session listing could not be read (or the selected session is past
-                        # its bounded page): nothing is invoked or followed from here, and the same RID and body are
-                        # sent again later. It is not "never prepared".
-                        raise _BeforeAdmission(unconfirmed, rid) from None
-                    prepared = None
-                if prepared is False and sessions.guard.enforce:
-                    raise self._bootstrap(principal, reader, sessions, error, rid) from None
-                raise (self._follow_before_admission(principal, reader, sessions, error, rid)
-                       if prepared else _BeforeAdmission(error, rid)) from None
-            if error.body["error"]["code"] == "AGENT_VERSION_FOLLOWING" and original is None:
-                if sessions.guard.enforce and error.body["error"].get("not_dispatched") is True:
-                    # 2d-i: the zero-call guard refused the Agent's incompatible SID, or a fence step is moving it
-                    # (nothing was sent): the in-request switch runs, as for any refused submit.
-                    raise self._follow_before_admission(principal, reader, sessions, error, rid) from None
-                # The selected version is not this API build's (deploy in progress): nothing is sent or followed here.
-                raise _BeforeAdmission(error, rid) from None
-            raise
+        client = self._current_client(principal, reader, sessions, rid, started=started, timed=timed, original=original)
         if original is None:
             try:
                 sessions.admission(client, request_id=rid, resolved=True)
                 capture, previous = self._prepare(control, client, principal, command, state_profile, timed=timed,
                                                   prefetch=prefetch)
             except Problem as refusal:
-                # Refused before reaching Hosted: only a retry of an already accepted RID continues as before.
-                if refusal.status >= 500 and refusal.body["error"]["code"] != "AGENT_VERSION_FOLLOWING":
-                    raise
-                try:
-                    original, response = self._existing(client, rid)
-                except Problem:
-                    raise refusal from None
-                if original is None:
-                    if refusal.body["error"]["code"] == "AGENT_VERSION_FOLLOWING":
-                        raise self._follow_before_admission(principal, reader, sessions, refusal, rid) from None
-                    raise _not_admitted(refusal, rid) from None
+                original, response = self._before_hosted_refusal(principal, reader, sessions, client, refusal, rid)
             else:
                 from .behavior_native_responses_api import submit_native_turn
                 try:
@@ -976,47 +932,108 @@ class NativeTurnGateway:
                             state_profile=state_profile, defer=defer)
                         return self._bound(sessions, sent, result, owner_notice, notice_kinds, rollback_notice,
                                            vetoed_notice)
-                    actual = conflict.body["error"].get("actual_version")
-                    if conflict.body["error"]["code"] == "NATIVE_SESSION_CHANGED" and actual is not None:
-                        # A newer image reported the VM's own version: record it (ADR-0009 §4 step 6). This also
-                        # claims an Agent that had no row, so the same RID sent again is located by the row.
-                        sessions.observed_binding(client, version=actual)
-                        if (conflict.body["error"].get("reason") == "version"
-                                and conflict.body["error"].get("not_dispatched") is True):
-                            # Nothing was dispatched: the client sends the same RID and body again (no follow).
-                            sessions.forget()
-                            raise _BeforeAdmission(conflict, rid, server_following=True) from None
-                    if sessions.guard.enforce and (conflict.status, conflict.body["error"]["code"]) == (
-                            503, "NATIVE_ADMISSION_PENDING"):
-                        # 2d-i: another RID's ``admitting`` kept this one out before rid:<RID> (Hosted's admission
-                        # check). The durable stuck-admission bound runs from here, then the same RID is resent.
-                        sessions.admission_stuck(client, before_send=lambda: self._context(
-                            principal, "submit", prepared=False))
-                        raise _BeforeAdmission(conflict, rid, server_following=True) from None
-                    if conflict.body["error"]["code"] != "NATIVE_RID_CONFLICT":
-                        # Not resent here; the client's retry of this same RID reads the binding again.
-                        sessions.moved(conflict)
-                        if conflict.body["error"].get("not_dispatched") is True:
-                            # Hosted refused before rid:<RID> because the Agent is changing versions: this request
-                            # moves it on, so every resend that is told to wait has advanced the follow once.
-                            code = conflict.body["error"]["code"]
-                            if code in {"NATIVE_SESSION_CHANGED", "AGENT_VERSION_FOLLOWING"}:
-                                raise self._follow_before_admission(
-                                    principal, reader, sessions, conflict, rid,
-                                    refused_session_id=(client.target.session_id
-                                                        if code == "AGENT_VERSION_FOLLOWING" else None)) from None
-                            if older_image(self.composition, control, client, conflict, started, cut=early):
-                                raise _BeforeAdmission(Problem(
-                                    503, "AGENT_VERSION_FOLLOWING", "the Agent is moving to its selected version; "
-                                    "nothing was sent", not_dispatched=True), rid, server_following=True) from None
-                            raise _not_admitted(conflict, rid) from None
-                        raise
+                    self._unless_rid_conflict(control, principal, reader, sessions, client, conflict, rid,
+                                              started=started, early=early)
                     original, response = self._existing(client, rid)
                     if original is None:
                         raise
         return self._bound(sessions, client, self._retained(
             control, client, command, original, state_profile, response=response, defer=defer), owner_notice,
             notice_kinds, rollback_notice, vetoed_notice)
+
+    def _current_client(self, principal, reader, sessions, rid, *, started, timed, original):
+        """The session this submit goes to; a refusal to locate it leaves as what the client should do next."""
+        try:
+            with phase_timing("api_submit_session", job_id=timed):
+                return sessions.current(reader, checked_since=started)
+        except Problem as error:
+            if error.body["error"]["code"] == "NATIVE_SESSION_CHANGED":
+                # A reconcile of an accepted RID is not marked.
+                if original is not None:
+                    raise
+                raise self._switch_refusal(principal, reader, sessions, error, rid) from None
+            if error.body["error"]["code"] == "AGENT_VERSION_FOLLOWING" and original is None:
+                if sessions.guard.enforce and error.body["error"].get("not_dispatched") is True:
+                    # 2d-i: the zero-call guard refused the Agent's incompatible SID, or a fence step is moving it
+                    # (nothing was sent): the in-request switch runs, as for any refused submit.
+                    raise self._follow_before_admission(principal, reader, sessions, error, rid) from None
+                # The selected version is not this API build's (deploy in progress): nothing is sent or followed here.
+                raise _BeforeAdmission(error, rid) from None
+            raise
+
+    def _switch_refusal(self, principal, reader, sessions, error, rid):
+        """What a first attempt that met ``NATIVE_SESSION_CHANGED`` raises instead.
+
+        Without FA_NATIVE_SESSION_GUARD_ENFORCE a submit never bootstraps: it follows only an Agent prepared earlier,
+        seen either as prepared state naming the new version's session (``following_candidate``) or as an existing
+        earlier session."""
+        try:
+            prepared = sessions.following_candidate is not None or self._prepared_before(
+                sessions, reader, getattr(error, "located", None))
+        except Problem as unconfirmed:
+            code = unconfirmed.body["error"]["code"]
+            if code == "AGENT_VERSION_FOLLOWING" or (
+                    unconfirmed.status == 503 and code == "NATIVE_ENVIRONMENT_UNAVAILABLE"):
+                # The selector or the session listing could not be read (or the selected session is past
+                # its bounded page): nothing is invoked or followed from here, and the same RID and body are
+                # sent again later. It is not "never prepared".
+                return _BeforeAdmission(unconfirmed, rid)
+            prepared = None
+        if prepared is False and sessions.guard.enforce:
+            return self._bootstrap(principal, reader, sessions, error, rid)
+        return self._follow_before_admission(principal, reader, sessions, error, rid) if prepared else _BeforeAdmission(
+            error, rid)
+
+    def _before_hosted_refusal(self, principal, reader, sessions, client, refusal, rid):
+        """Refused before reaching Hosted: only a retry of an already accepted RID continues as before, with this
+        ``(original, response)``; anything else is raised."""
+        if refusal.status >= 500 and refusal.body["error"]["code"] != "AGENT_VERSION_FOLLOWING":
+            raise refusal
+        try:
+            original, response = self._existing(client, rid)
+        except Problem:
+            raise refusal from None
+        if original is None:
+            if refusal.body["error"]["code"] == "AGENT_VERSION_FOLLOWING":
+                raise self._follow_before_admission(principal, reader, sessions, refusal, rid) from None
+            raise _not_admitted(refusal, rid) from None
+        return original, response
+
+    def _unless_rid_conflict(self, control, principal, reader, sessions, client, conflict, rid, *, started, early):
+        """Hosted refused the first send: returns only for ``NATIVE_RID_CONFLICT`` (the RID may name an original);
+        every other refusal is raised as what the client should do next."""
+        detail = conflict.body["error"]
+        code = detail["code"]
+        if code == "NATIVE_SESSION_CHANGED" and detail.get("actual_version") is not None:
+            # A newer image reported the VM's own version: record it (ADR-0009 §4 step 6). This also
+            # claims an Agent that had no row, so the same RID sent again is located by the row.
+            sessions.observed_binding(client, version=detail["actual_version"])
+            if detail.get("reason") == "version" and detail.get("not_dispatched") is True:
+                # Nothing was dispatched: the client sends the same RID and body again (no follow).
+                sessions.forget()
+                raise _BeforeAdmission(conflict, rid, server_following=True) from None
+        if sessions.guard.enforce and (conflict.status, code) == (503, "NATIVE_ADMISSION_PENDING"):
+            # 2d-i: another RID's ``admitting`` kept this one out before rid:<RID> (Hosted's admission
+            # check). The durable stuck-admission bound runs from here, then the same RID is resent.
+            sessions.admission_stuck(client, before_send=lambda: self._context(principal, "submit", prepared=False))
+            raise _BeforeAdmission(conflict, rid, server_following=True) from None
+        if code == "NATIVE_RID_CONFLICT":
+            return
+        # Not resent here; the client's retry of this same RID reads the binding again.
+        sessions.moved(conflict)
+        if detail.get("not_dispatched") is not True:
+            raise conflict
+        # Hosted refused before rid:<RID> because the Agent is changing versions: this request
+        # moves it on, so every resend that is told to wait has advanced the follow once.
+        if code in {"NATIVE_SESSION_CHANGED", "AGENT_VERSION_FOLLOWING"}:
+            raise self._follow_before_admission(
+                principal, reader, sessions, conflict, rid,
+                refused_session_id=client.target.session_id if code == "AGENT_VERSION_FOLLOWING" else None) from None
+        if older_image(self.composition, control, client, conflict, started, cut=early):
+            raise _BeforeAdmission(Problem(
+                503, "AGENT_VERSION_FOLLOWING", "the Agent is moving to its selected version; "
+                "nothing was sent", not_dispatched=True), rid, server_following=True) from None
+        raise _not_admitted(conflict, rid) from None
 
     def _after_refusal(self, control, principal, reader, sessions, client, command, capture, previous, conflict, *,
                        state_profile, defer):
@@ -1399,6 +1416,77 @@ def _knows_vetoed_notice(request) -> bool:
     return request.headers.getlist(UPGRADE_VETOED_HEADER) == [UPGRADE_VETOED_VERSION]
 
 
+def _selectors(model, message, **fields):
+    try:
+        return model(**fields)
+    except ValueError:
+        raise Problem(422, "NATIVE_REQUEST_INVALID", message) from None
+
+
+async def read_request(request, *, queries=()):
+    if (set(request.query_params) - set(queries)
+            or any(len(request.query_params.getlist(key)) != 1 for key in request.query_params)
+            or await request.body()):
+        raise Problem(422, "NATIVE_REQUEST_INVALID", "this read accepts only its original selectors")
+
+
+_TRANSPORT_ERRORS = {
+    "FOUNDRY_INVOCATION_UNKNOWN", "FOUNDRY_RESPONSE_INVALID", "FOUNDRY_NATIVE_BINDING_MISMATCH",
+    "FOUNDRY_CREDENTIAL_DISABLED", "FOUNDRY_CREDENTIAL_UNAVAILABLE",
+}
+_RECONCILE_CODES = {
+    "NATIVE_TURN_UNKNOWN", "NATIVE_STATE_STORE_UNKNOWN", "SDK_STATE_UPLOAD_UNKNOWN",
+    "FOUNDRY_INVOCATION_UNKNOWN", "NATIVE_BOOTSTRAP_UNKNOWN", "NATIVE_RESPONSE_UNCONFIRMED",
+    "NATIVE_APPEND_UNKNOWN", "BEHAVIOR_COMMIT_UNKNOWN",
+}
+
+
+def _answered_refusal(error, *, read):
+    """Whether this route answers ``error`` itself; anything else goes to the shared error handler."""
+    from .behavior_work_policy_api import _SAFE_WORK_ERRORS
+    code = error.body["error"]["code"]
+    # Reading again is safe: a lost Table read, or a lost commit of this read's RID-keyed usage entry.
+    return (code in NATIVE_TURN_ERRORS | _TRANSPORT_ERRORS or code in _SAFE_WORK_ERRORS
+            or (not read and code in _ATTACHED_SOURCE_ERRORS) or isinstance(error, _BeforeAdmission)
+            or (read and (code in {"BEHAVIOR_READ_FAILED", "BEHAVIOR_COMMIT_UNKNOWN"}
+                          or (code == "BEHAVIOR_CONFLICT" and error.status == 412))))
+
+
+def _refusal_message(code, *, following, retry):
+    from .behavior_work_policy_api import _SAFE_WORK_ERRORS
+    if following:
+        return ("The Agent is moving to its current version; this message was not accepted yet. "
+                "Send the same request ID and body again shortly.")
+    if code == "AGENT_VERSION_FOLLOWING":
+        return "The entire Agent is changing environments; no new work was accepted."
+    return _SAFE_WORK_ERRORS.get(code, _ATTACHED_SOURCE_ERRORS.get(
+        code, "This read did not complete; reading again is safe." if retry else
+        "The original native command could not be completed; no automatic retry."))
+
+
+def _refusal_response(error, *, read, rid):
+    from .behavior_native_sessions import _RetiredSession
+    code = error.body["error"]["code"]
+    logging.getLogger(__name__).warning("NATIVE_TURN_REFUSED code=%s rid=%s", code, timing_id(rid) if rid else "-")
+    before_admission = isinstance(error, _BeforeAdmission)
+    following = before_admission and error.server_following
+    # A disabled lane or a retired session does not clear by reading again. A 412 is a read that lost its
+    # CAS races (the RID-keyed usage entry): the next read finds the winner's commit. A 409 is a real conflict.
+    retry = (read and (error.status >= 500 or error.status == 412) and code != "NATIVE_TURNS_DISABLED"
+             and not isinstance(error, _RetiredSession))
+    return JSONResponse(status_code=error.status, headers={"Cache-Control": "no-store"}, content={"error": {
+        "code": code, "message": _refusal_message(code, following=following, retry=retry),
+        # A read changes nothing, so a transient 5xx (platform or Hosted read timeout) is polled again.
+        "automatic_retry": retry,
+        "reconcile_original": not before_admission and code in _RECONCILE_CODES,
+        **({"not_dispatched": True, "request_id": error.request_id, **({"server_following": True} if following else {})}
+           if before_admission else {}),
+        **({"confirmation_not_dispatched": True, "request_id": error.request_id}
+           if isinstance(error, _OmissionBeforeDispatch) else {}),
+        **({"files_check": error.body["error"]["files_check"]} if "files_check" in error.body["error"] else {}),
+    }})
+
+
 def install_native_turn_routes(app, composition, *, enabled):
     gateway = NativeTurnGateway(composition, enabled=enabled)
     identity = _principal_dependency(composition.verifier)
@@ -1410,47 +1498,9 @@ def install_native_turn_routes(app, composition, *, enabled):
         try:
             value, upstream = await run_in_threadpool(call)
         except Problem as error:
-            from .behavior_native_sessions import _RetiredSession
-            from .behavior_work_policy_api import _SAFE_WORK_ERRORS
-            code = error.body["error"]["code"]
-            transport_errors = {
-                "FOUNDRY_INVOCATION_UNKNOWN", "FOUNDRY_RESPONSE_INVALID", "FOUNDRY_NATIVE_BINDING_MISMATCH",
-                "FOUNDRY_CREDENTIAL_DISABLED", "FOUNDRY_CREDENTIAL_UNAVAILABLE",
-            }
-            # Reading again is safe: a lost Table read, or a lost commit of this read's RID-keyed usage entry.
-            if (code not in NATIVE_TURN_ERRORS | transport_errors and code not in _SAFE_WORK_ERRORS
-                    and (read or code not in _ATTACHED_SOURCE_ERRORS) and not isinstance(error, _BeforeAdmission)
-                    and not (read and (code in {"BEHAVIOR_READ_FAILED", "BEHAVIOR_COMMIT_UNKNOWN"}
-                                       or (code == "BEHAVIOR_CONFLICT" and error.status == 412)))):
+            if not _answered_refusal(error, read=read):
                 raise
-            logging.getLogger(__name__).warning("NATIVE_TURN_REFUSED code=%s rid=%s", code,
-                                                timing_id(rid) if rid else "-")
-            following = isinstance(error, _BeforeAdmission) and error.server_following
-            # A disabled lane or a retired session does not clear by reading again. A 412 is a read that lost its
-            # CAS races (the RID-keyed usage entry): the next read finds the winner's commit. A 409 is a real conflict.
-            retry = (read and (error.status >= 500 or error.status == 412) and code != "NATIVE_TURNS_DISABLED"
-                     and not isinstance(error, _RetiredSession))
-            return JSONResponse(status_code=error.status, headers={"Cache-Control": "no-store"}, content={"error": {
-                "code": code, "message": (
-                    "The Agent is moving to its current version; this message was not accepted yet. "
-                    "Send the same request ID and body again shortly." if following else
-                    "The entire Agent is changing environments; no new work was accepted."
-                    if code == "AGENT_VERSION_FOLLOWING" else _SAFE_WORK_ERRORS.get(code, _ATTACHED_SOURCE_ERRORS.get(
-                        code, "This read did not complete; reading again is safe." if retry else
-                        "The original native command could not be completed; no automatic retry."))),
-                # A read changes nothing, so a transient 5xx (platform or Hosted read timeout) is polled again.
-                "automatic_retry": retry,
-                "reconcile_original": not isinstance(error, _BeforeAdmission) and code in {
-                    "NATIVE_TURN_UNKNOWN", "NATIVE_STATE_STORE_UNKNOWN", "SDK_STATE_UPLOAD_UNKNOWN",
-                    "FOUNDRY_INVOCATION_UNKNOWN", "NATIVE_BOOTSTRAP_UNKNOWN", "NATIVE_RESPONSE_UNCONFIRMED",
-                    "NATIVE_APPEND_UNKNOWN", "BEHAVIOR_COMMIT_UNKNOWN",
-                },
-                **({"not_dispatched": True, "request_id": error.request_id, **({"server_following": True} if following else {})}
-                   if isinstance(error, _BeforeAdmission) else {}),
-                **({"confirmation_not_dispatched": True, "request_id": error.request_id}
-                   if isinstance(error, _OmissionBeforeDispatch) else {}),
-                **({"files_check": error.body["error"]["files_check"]} if "files_check" in error.body["error"] else {}),
-            }})
+            return _refusal_response(error, read=read, rid=rid)
         response = _response(value, max_bytes=MAX_NATIVE_TURN_HTTP_BYTES)
         response.status_code = 200 if upstream is None else upstream.status_code
         response.headers["Cache-Control"] = "no-store"
@@ -1547,10 +1597,8 @@ def install_native_turn_routes(app, composition, *, enabled):
     @app.get(PREFIX + "/conversations/{conversation_id}/attachment-sources")
     async def attachments(conversation_id: str, request: Request, principal=Depends(identity)):
         await read_request(request)
-        try:
-            command = NativeConversationRead(conversation_id=conversation_id)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "one original conversation ID is required") from None
+        command = _selectors(NativeConversationRead, "one original conversation ID is required",
+                             conversation_id=conversation_id)
         def read():
             from .behavior_attachment_catalog import read_attachment_catalog
 
@@ -1563,12 +1611,6 @@ def install_native_turn_routes(app, composition, *, enabled):
                                                native_template=original.capture.template)
             return catalog, upstream
         return await reply_read(read)
-
-    async def read_request(request, *, queries=()):
-        if (set(request.query_params) - set(queries)
-                or any(len(request.query_params.getlist(key)) != 1 for key in request.query_params)
-                or await request.body()):
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "this read accepts only its original selectors")
 
     @app.post(PREFIX + "/submit")
     async def submit(request: Request, principal=Depends(identity)):
@@ -1622,10 +1664,8 @@ def install_native_turn_routes(app, composition, *, enabled):
     async def read_status(conversation_id: str, request_id: str, request: Request, principal=Depends(identity)):
         # One poll for one RID: receipt, public progress and, once completed, the single-page reply.
         await read_request(request)
-        try:
-            command = NativeTurnStatusRead(conversation_id=conversation_id, request_id=request_id)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "one original CID and RID are required") from None
+        command = _selectors(NativeTurnStatusRead, "one original CID and RID are required",
+                             conversation_id=conversation_id, request_id=request_id)
         return await reply_read(lambda: gateway.read(principal, command), request_id)
 
     @app.get(PREFIX + "/conversations/{conversation_id}/requests/{request_id}/hitl-reviews")
@@ -1634,11 +1674,8 @@ def install_native_turn_routes(app, composition, *, enabled):
         limit: int = Query(MAX_HITL_REVIEW_PAGE, ge=1, le=MAX_HITL_REVIEW_PAGE), principal=Depends(identity),
     ):
         await read_request(request, queries=("after", "limit"))
-        try:
-            command = NativeHitlHistoryRead(
-                conversation_id=conversation_id, request_id=request_id, after=after, limit=limit)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "native review history selectors are invalid") from None
+        command = _selectors(NativeHitlHistoryRead, "native review history selectors are invalid",
+                             conversation_id=conversation_id, request_id=request_id, after=after, limit=limit)
         return await reply_read(lambda: gateway.read(principal, command))
 
     from .behavior_native_responses_api import (
@@ -1693,95 +1730,71 @@ def install_native_turn_routes(app, composition, *, enabled):
     @app.get(PREFIX + "/requests/{request_id}")
     async def receipt(request_id: str, request: Request, principal=Depends(identity)):
         await read_request(request)
-        try:
-            command = NativeRead(request_id=request_id)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "one original request ID is required") from None
+        command = _selectors(NativeRead, "one original request ID is required", request_id=request_id)
         return await reply_read(lambda: gateway.read(principal, command), request_id)
 
     @app.get(PREFIX + "/requests/{request_id}/continuation")
     async def continuation(request_id: str, request: Request, principal=Depends(identity)):
         await read_request(request)
-        try:
-            command = NativeContinuationRead(request_id=request_id)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "one original request ID is required") from None
+        command = _selectors(NativeContinuationRead, "one original request ID is required", request_id=request_id)
         return await reply_read(lambda: gateway.read(principal, command))
 
     @app.get(PREFIX + "/requests/{request_id}/system-prompt")
     async def turn_system_prompt(request_id: str, request: Request, principal=Depends(identity)):
         await read_request(request)
-        try:
-            command = NativeRead(request_id=request_id)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "one original request ID is required") from None
+        command = _selectors(NativeRead, "one original request ID is required", request_id=request_id)
         return await reply_read(lambda: gateway.system_prompt(principal, command))
 
     @app.get(PREFIX + "/conversations/{conversation_id}")
     async def conversation(conversation_id: str, request: Request, principal=Depends(identity)):
         await read_request(request)
-        try:
-            command = NativeConversationRead(conversation_id=conversation_id)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "one original conversation ID is required") from None
+        command = _selectors(NativeConversationRead, "one original conversation ID is required",
+                             conversation_id=conversation_id)
         return await reply_read(lambda: gateway.read(principal, command))
 
     @app.get(PREFIX + "/received")
     async def received(request: Request, after: str | None = Query(None),
                        limit: int = Query(MAX_RECEIVED_PAGE, ge=1, le=MAX_RECEIVED_PAGE), principal=Depends(identity)):
         await read_request(request, queries=("after", "limit"))
-        try:
-            command = NativeReceivedRead(after=after, limit=limit)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "received page selectors are invalid") from None
+        command = _selectors(NativeReceivedRead, "received page selectors are invalid", after=after, limit=limit)
         return await reply_read(lambda: gateway.read(principal, command))
 
     @app.get(PREFIX + "/conversations/{conversation_id}/history")
     async def history(conversation_id: str, request: Request, after_turn: int = Query(0, ge=0),
                       limit: int = Query(20, ge=1, le=100), principal=Depends(identity)):
         await read_request(request, queries=("after_turn", "limit"))
-        try:
-            command = NativeHistory(conversation_id=conversation_id, after_turn=after_turn, limit=limit)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "native history selectors are invalid") from None
+        command = _selectors(NativeHistory, "native history selectors are invalid",
+                             conversation_id=conversation_id, after_turn=after_turn, limit=limit)
         return await reply_read(lambda: gateway.read(principal, command))
 
     @app.get(PREFIX + "/conversations/{conversation_id}/requests/{request_id}/result")
     async def result(conversation_id: str, request_id: str, request: Request, part: int = Query(0, ge=0),
                      principal=Depends(identity)):
         await read_request(request, queries=("part",))
-        try:
-            command = NativeResult(conversation_id=conversation_id, request_id=request_id, part=part)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "native result selectors are invalid") from None
+        command = _selectors(NativeResult, "native result selectors are invalid",
+                             conversation_id=conversation_id, request_id=request_id, part=part)
         return await reply_read(lambda: gateway.read(principal, command))
 
     @app.get(PREFIX + "/conversations/{conversation_id}/requests/{request_id}/memory-candidate")
     async def memory_candidate(conversation_id: str, request_id: str, request: Request, principal=Depends(identity)):
         # ADR-0007 C5: the original human inspects an inactive suggestion; reading never shares or activates it.
         await read_request(request)
-        try:
-            command = NativeCandidateRead(conversation_id=conversation_id, request_id=request_id)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "one original conversation and request ID are required") from None
+        command = _selectors(NativeCandidateRead, "one original conversation and request ID are required",
+                             conversation_id=conversation_id, request_id=request_id)
         return await reply_read(lambda: gateway.read(principal, command))
 
     @app.get(PREFIX + "/conversations/{conversation_id}/requests/{request_id}/images")
     async def images(conversation_id: str, request_id: str, request: Request, principal=Depends(identity)):
         await read_request(request)
-        try:
-            command = NativeImagesRead(conversation_id=conversation_id, request_id=request_id)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "one original CID and RID are required") from None
+        command = _selectors(NativeImagesRead, "one original CID and RID are required",
+                             conversation_id=conversation_id, request_id=request_id)
         return await reply_read(lambda: gateway.read(principal, command))
 
     @app.get(PREFIX + "/conversations/{conversation_id}/requests/{request_id}/images/{version_id}")
     async def image(conversation_id: str, request_id: str, version_id: str, request: Request, principal=Depends(identity)):
         await read_request(request)
-        try:
-            command = NativeImageRead(conversation_id=conversation_id, request_id=request_id, version_id=version_id)
-        except ValueError:
-            raise Problem(422, "NATIVE_REQUEST_INVALID", "one original CID, RID and image version are required") from None
+        command = _selectors(NativeImageRead, "one original CID, RID and image version are required",
+                             conversation_id=conversation_id, request_id=request_id, version_id=version_id)
         return await reply_read(lambda: gateway.read(principal, command))
 
     @app.post(PREFIX + "/cancel")

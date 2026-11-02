@@ -22,14 +22,11 @@ from shared_context.native_progress_wire import NativeProgressSnapshot
 from shared_context.native_continuation_wire import NativeContinuationView, MAX_AUTOMATIC_CONTINUATIONS
 from shared_context.errors import Problem
 from .adapter import ConsoleError, PullAdapter, canonical, require, sha, strict_json
-from .instructions import NATIVE_LANE, lane_of
+from .instructions import NATIVE_LANE, RECEIVED_PHASE, lane_of
 
 PREFIX = "/work-policy/v1/native-turns"
 _NOT_ACCEPTED = frozenset({"AGENT_VERSION_FOLLOWING", "NATIVE_ADMISSION_PENDING"})
 _FETCH = object()
-# A conversation another Agent or a routine run (2026-10-23) opened here: its thread is its first RID, read back from
-# this Agent's receipts.
-RECEIVED_PHASE = "agent-received"
 RECEIVED_SECONDS = 15
 # Pages of the received listing read per refresh, newest first (a daily routine run adds a key a day, past the first
 # page's 50 keys). It stops at the first page holding an imported RID, and after a first page holding no received
@@ -222,6 +219,43 @@ class _NativeTask:
     not_accepted: bool
     observation: object
     status: str
+
+
+def _conversation_id(current, known):
+    return current.conversation_id if current is not None else next(
+        (item.conversation_id for item in known if item.status != "busy_refused"), None)
+
+
+def _composer_actions(draft, target, command, prior, imported, models, conversation_blocker, authenticated, can_follow):
+    return {
+        "editable": authenticated and draft["content"] is None,
+        "can_append": target is not None and not target["pending"],
+        "append_target": target,
+        "command_incomplete": command is None and prior is not None,
+        "can_submit": authenticated and prior is None and not imported
+        and models is not None and conversation_blocker is None,
+        "can_follow_up": can_follow, "can_new_conversation": authenticated, "can_reset": False,
+    }
+
+
+def _conversation_view(cid, profile, can_follow, tasks, current, known):
+    return {
+        "conversation_id": cid, "conversation": None if cid is None else {
+            "state_profile": profile, "conversation_id": cid,
+            "can_follow_up": can_follow,
+            "turns": [{"request_id": task["task_id"], "state": task["status"]["data"]["state"]}
+                      for task in tasks],
+        },
+        "hosted_session_id": running_session(current, known),
+        "hosted_agent_version": None,
+    }
+
+
+def _draft_files(command, receipt):
+    return {
+        "attachments": [] if command is None else command.get("attachments", []),
+        "user_files": [] if receipt is None else [file_reference(item).model_dump(mode="json") for item in receipt.command.files],
+    }
 
 
 @dataclass(frozen=True)
@@ -1732,39 +1766,27 @@ class NativeInstructionControl:
             "append_error": self.appends.errors.get(rid),
         }
 
-    def view(self, thread_id=None):
-        draft = self.store.current(thread_id)
-        thread = draft["thread_id"]
-        profile = self.profile(thread)
-        self._saved(thread)
-        tasks = self.views(thread)
-        value = self.receipts.get(draft["request_id"])
-        current = self.conversations.get(thread)
+    def _last_turn(self, draft_receipt, current):
+        """The conversation's newest receipt, past the automatic continuations already held."""
         last = None if current is None else self.receipts.get(current.last_request_id)
         if last is None:
-            last = value
+            last = draft_receipt
         for _ in range(MAX_AUTOMATIC_CONTINUATIONS):
             continuation = None if last is None else self.continuations.get(last.request_id)
             following = None if continuation is None else self.receipts.get(continuation.request_id)
             if following is None:
                 break
             last = following
-        authenticated = self.console.vault.state() == "AVAILABLE"
-        command = self.store.command(draft["request_id"])
-        prior = self.journal.get(draft["request_id"], "submit")
-        received = self.received_thread(thread)
-        imported = (self.journal.get(draft["request_id"], "group-observation") is not None
-                    or self.journal.get(draft["request_id"], RECEIVED_PHASE) is not None)
-        known = [item for rid, item in self.receipts.items() if self.request_threads.get(rid) == thread]
-        cid = current.conversation_id if current is not None else next(
-            (item.conversation_id for item in known if item.status != "busy_refused"), None)
+        return last
+
+    def _follow_up(self, draft, prior, authenticated, received, conversation_blocker):
+        """Whether the draft can follow up, and what the page names as the blocker."""
         # Neal 2026-10-06 09:58 「FA portal為什麼要控制user能否傳送訊息、能否續問?」: the workbench is a thin client
         # (AGENTS.md 9). Whether a message runs now, queues or is refused is the server's answer to the submit (Hosted
         # rid:<RID>, busy_refused, AGENT_VERSION_FOLLOWING, continuation_blocker); the only local rule left is that a
         # sent RID is never sent again (submit: RECONCILE_REQUIRED; _cid: no CID while the first send is unknown).
         # A blocker the server already reported for this conversation is shown, not guessed.
-        conversation_blocker = None if current is None else current.continuation_blocker
-        can_follow = authenticated and draft["content"] is not None and not received and conversation_blocker is None
+        can_follow = authenticated and draft["content"] is not None and conversation_blocker is None
         blocker = None
         if self._not_accepted(draft["request_id"]):
             blocker = (prior["code"] if prior is not None and prior.get("not_dispatched") is True
@@ -1772,62 +1794,91 @@ class NativeInstructionControl:
         if self._retryable(draft["request_id"]):
             # This text goes out again with the same RID once the version follow is done; a new RID would send it twice.
             can_follow = False
-        blocker = conversation_blocker or blocker
         if received:
             # Its owner is the sending Agent's original request; a human message here would not reach it.
-            can_follow, blocker = False, "AGENT_CONVERSATION_READ_ONLY"
-        append_original = None if received else next((item for item in (value, last, *reversed(known)) if item is not None
-                                and item.status in {"accepted", "started"} and not item.cancel_requested), None)
-        append_target = (self.appends.proposal(append_original) if authenticated
-                         and thread in self.observed and append_original is not None else None)
-        models = self.legacy.models
-        values = self.store.threads()
-        runs = self.routine_runs(values)
+            return False, "AGENT_CONVERSATION_READ_ONLY"
+        return can_follow, conversation_blocker or blocker
+
+    def _append_target(self, thread, authenticated, candidates):
+        """The first open turn of ``candidates`` an append would join, when one can be sent now."""
+        original = next((item for item in candidates if item is not None
+                         and item.status in {"accepted", "started"} and not item.cancel_requested), None)
+        if authenticated and thread in self.observed and original is not None:
+            return self.appends.proposal(original)
+        return None
+
+    def _received_view(self, thread, received):
+        return {"agent_conversation": None if not received else {
+                    "sender_agent_id": self.journal.get(thread, RECEIVED_PHASE)["intent"]["sender_agent_id"],
+                    "read_only": True},
+                "received_error": None if self.received_error is None else {"code": self.received_error}}
+
+    def _peer_view(self, thread):
         return {
-            **draft, "state_profile": profile, "editable": authenticated and draft["content"] is None,
-            "can_append": append_target is not None and not append_target["pending"],
-            "append_target": append_target,
-            "command_incomplete": command is None and prior is not None,
-            "can_submit": authenticated and prior is None and not imported and models is not None
-            and conversation_blocker is None,
-            "can_follow_up": can_follow, "can_new_conversation": authenticated, "can_reset": False,
-            "conversation_id": cid, "conversation": None if cid is None else {
-                "state_profile": profile, "conversation_id": cid,
-                "can_follow_up": can_follow,
-                "turns": [{"request_id": task["task_id"], "state": task["status"]["data"]["state"]}
-                          for task in tasks],
-            },
-            "hosted_session_id": running_session(current, known),
-            "hosted_agent_version": None, "threads": self.threads(thread, values),
-            "agent_conversation": None if not received else {
-                "sender_agent_id": self.journal.get(thread, RECEIVED_PHASE)["intent"]["sender_agent_id"],
-                "read_only": True},
-            "received_error": None if self.received_error is None else {"code": self.received_error},
-            "progress_available": authenticated and (prior is not None or cid is not None),
             "awaiting_agent_reply": any(self._peer_waiting(original) for original in self._peer_requests(thread)) or any(
                     value.queued_relay is not None and value.queued_relay.status == "queued"
                     for rid, value in self.receipts.items() if self.request_threads.get(rid) == thread),
             "peer_reply_overdue": any(self._peer_waiting(original) and self._peer_overdue(original)
                                       for original in self._peer_requests(thread)),
-            "observed_at": self.observed.get(thread), "follow_up_blocker": blocker,
-            "model": command.get("model") if command else None if models is None else models.default_model,
-            "models": None if models is None else models.model_dump(mode="json"),
-            "models_observed_at": self.legacy.models_observed_at,
-            "attachments": [] if command is None else command.get("attachments", []),
-            "user_files": [] if value is None else [file_reference(item).model_dump(mode="json") for item in value.command.files],
-            "input_capacity": {"unit": "quoted-utf8-bytes", "maximum": 8192},
-            "message": ("Responses尚未確認接手時，工作台以原RID有限核回；已開始或unknown不重送。"
-                        if profile == NATIVE_RESPONSES_PROFILE else
-                        "原生回合由 Agent 保存；失聯只核對原請求，不會自動重送。"),
-            "progress_polling": {"method": "GET", "interval_ms": 1000, "model_or_reserve": False},
-            "connection_metadata": self.legacy.connection.model_dump(mode="json"),
-            "connection_metadata_is_not_live_attestation": True,
+        }
+
+    def _model_view(self, command, models):
+        return {"model": command.get("model") if command else None if models is None else models.default_model,
+                "models": None if models is None else models.model_dump(mode="json"),
+                "models_observed_at": self.legacy.models_observed_at}
+
+    def _attention_view(self, thread, runs):
+        return {
             "attention": self.routines.attention([*self.hitl.attention(), *self.questions.attention(),
                                                    *self.consents.attention()]),
             **({"routines": self.routines.view(thread, runs)} if self.routines.enabled else {}),
             **({"native_hitl": self.hitl.view(thread), "native_questions": self.questions.view(thread),
                 "native_consents": self.consents.view(thread)}
                if self.hitl.enabled else {}),
-            "platform_history": self.platform_history_view(thread) if profile == NATIVE_RESPONSES_PROFILE else None,
+        }
+
+    def view(self, thread_id=None):
+        draft = self.store.current(thread_id)
+        rid, thread = draft["request_id"], draft["thread_id"]
+        profile = self.profile(thread)
+        self._saved(thread)
+        tasks = self.views(thread)
+        receipt = self.receipts.get(rid)
+        current = self.conversations.get(thread)
+        last = self._last_turn(receipt, current)
+        authenticated = self.console.vault.state() == "AVAILABLE"
+        command = self.store.command(rid)
+        prior = self.journal.get(rid, "submit")
+        received = self.received_thread(thread)
+        imported = (self.journal.get(rid, "group-observation") is not None
+                    or self.journal.get(rid, RECEIVED_PHASE) is not None)
+        known = [item for key, item in self.receipts.items() if self.request_threads.get(key) == thread]
+        cid = _conversation_id(current, known)
+        conversation_blocker = None if current is None else current.continuation_blocker
+        can_follow, blocker = self._follow_up(draft, prior, authenticated, received, conversation_blocker)
+        append_target = self._append_target(thread, authenticated, () if received else (receipt, last, *reversed(known)))
+        models = self.legacy.models
+        thread_rows = self.store.threads()
+        runs = self.routine_runs(thread_rows)
+        responses_lane = profile == NATIVE_RESPONSES_PROFILE
+        return {
+            **draft, "state_profile": profile,
+            **_composer_actions(draft, append_target, command, prior, imported, models, conversation_blocker,
+                                authenticated, can_follow),
+            **_conversation_view(cid, profile, can_follow, tasks, current, known),
+            "threads": self.threads(thread, thread_rows), **self._received_view(thread, received),
+            "progress_available": authenticated and (prior is not None or cid is not None),
+            **self._peer_view(thread),
+            "observed_at": self.observed.get(thread), "follow_up_blocker": blocker,
+            **self._model_view(command, models), **_draft_files(command, receipt),
+            "input_capacity": {"unit": "quoted-utf8-bytes", "maximum": 8192},
+            "message": ("Responses尚未確認接手時，工作台以原RID有限核回；已開始或unknown不重送。"
+                        if responses_lane else
+                        "原生回合由 Agent 保存；失聯只核對原請求，不會自動重送。"),
+            "progress_polling": {"method": "GET", "interval_ms": 1000, "model_or_reserve": False},
+            "connection_metadata": self.legacy.connection.model_dump(mode="json"),
+            "connection_metadata_is_not_live_attestation": True,
+            **self._attention_view(thread, runs),
+            "platform_history": self.platform_history_view(thread) if responses_lane else None,
             "responses": None if self.responses_options is None else self.responses_options.model_dump(mode="json"),
         }

@@ -1,5 +1,7 @@
 """Owner control/readback on H1, using the console's existing durable once journal."""
 
+from functools import partial
+
 from pydantic import TypeAdapter
 
 from shared_context.behavior_wire import Digest
@@ -9,7 +11,7 @@ from shared_context.native_hitl_wire import (
     NativeHitlApprovalReference, NativeHitlPendingPage, NativeHitlPendingQuery, NativeHitlReadback, NativeHitlTurn,
     hitl_key, hitl_settings,
 )
-from .adapter import ConsoleError, PullAdapter, canonical, require, sha, strict_json
+from .adapter import ConsoleError, PullAdapter, canonical, decode, require, sha, strict_json
 
 PHASE = "native-hitl"
 MAX_WRITE_BYTES = 8192
@@ -28,12 +30,7 @@ MESSAGES.update({
 })
 
 
-def decode(model, raw):
-    try:
-        strict_json(raw)
-        return model.model_validate_json(raw)
-    except (ValueError, TypeError):
-        raise ConsoleError("NATIVE_HITL_RECORD_INVALID", 502) from None
+_decode = partial(decode, code="NATIVE_HITL_RECORD_INVALID")
 
 
 def action_display(pending):
@@ -64,7 +61,7 @@ class NativeHitlAdapter(PullAdapter):
         require(headers.get("cache-control") == "no-store"
                 and headers.get("content-type", "").split(";")[0] == "application/json",
                 "NATIVE_HITL_RECORD_INVALID", 502)
-        value = decode(model, raw)
+        value = _decode(model, raw)
         if isinstance(value, NativeHitlRules):
             require(headers.get("etag") == value.etag, "NATIVE_HITL_RECORD_INVALID", 502)
         return value
@@ -352,7 +349,7 @@ class NativeHitlControl:
             token = self.token(thread)
             entry, command = self.original(identifier)
             if isinstance(command, NativeHitlDecision):
-                reference = decode(NativeHitlApprovalReference, canonical(entry["intent"]["selection"]))
+                reference = _decode(NativeHitlApprovalReference, canonical(entry["intent"]["selection"]))
                 self.call_scope(thread, reference.call, token)
             self.observations.pop(identifier, None)
             receipt = self._receipt(entry["intent"]["path"], command, entry["intent"]["team_id"], token, reconcile=True)
@@ -365,7 +362,7 @@ class NativeHitlControl:
             require(type(data) is dict and not {"request_id", "pending_id", "pending_digest"} & data.keys(),
                     "NATIVE_HITL_INVALID_REQUEST", 400)
             data = dict(data)
-            reference = decode(NativeHitlApprovalReference, canonical(data.pop("approval", None)))
+            reference = _decode(NativeHitlApprovalReference, canonical(data.pop("approval", None)))
             selection = reference.model_dump(mode="json")
             command = self.command(NativeHitlDecision, {
                 **data, "pending_id": reference.pending_id, "pending_digest": reference.pending_digest}, selection)
@@ -429,7 +426,7 @@ def install_hitl_routes(app, requested_console):
 
     @app.post("/api/native-hitl/team/reconcile")
     async def team_reconcile(request: Request, console=Depends(requested_console)):
-        command = decode(Command, canonical(await body(request)))
+        command = _decode(Command, canonical(await body(request)))
         return await run_in_threadpool(control(console).reconcile, None, command.request_id)
 
     @app.get("/api/native-hitl/{thread_id}/rules")
@@ -443,7 +440,7 @@ def install_hitl_routes(app, requested_console):
 
     @app.post("/api/native-hitl/{thread_id}/reconcile")
     async def reconcile(thread_id: str, request: Request, console=Depends(requested_console)):
-        command = decode(Command, canonical(await body(request)))
+        command = _decode(Command, canonical(await body(request)))
         return await run_in_threadpool(control(console).reconcile, thread_id, command.request_id)
 
     @app.get("/api/native-hitl/{thread_id}/pending/{pending_id}")

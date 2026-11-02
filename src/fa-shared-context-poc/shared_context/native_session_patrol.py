@@ -23,6 +23,7 @@ import time
 from .behavior_native_sessions import (
     _RETIRED, RETIRED_CONFIRM_SECONDS, RETIRED_PAIR_SECONDS, _MetadataUnconfirmed, _session_metadata, _target)
 from .errors import Problem
+from .native_background import BackgroundLoop
 from .native_binding import binding_store, session_guard_enforced
 from .native_responses_wire import UNLABELED_STATE_PROFILE
 
@@ -44,7 +45,7 @@ def _code(error):
     return error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
 
 
-class NativeSessionPatrol:
+class NativeSessionPatrol(BackgroundLoop):
     # The log prefix and thread name; the upgrade reconciler reuses this loop under its own.
     name, thread = "NATIVE_SESSION_PATROL", "fa-session-patrol"
 
@@ -239,13 +240,3 @@ class NativeSessionPatrol:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=self.thread)
         self._task = asyncio.get_running_loop().create_task(self._loop())
         _LOG.warning("%s_STARTED interval=%s jitter=%s", self.name, self.interval, self.jitter)
-
-    async def stop(self):
-        self._stopping = True
-        task, self._task = self._task, None
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        executor, self._executor = self._executor, None
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)

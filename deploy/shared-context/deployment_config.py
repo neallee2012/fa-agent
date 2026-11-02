@@ -76,76 +76,95 @@ def load_config(
     return profile
 
 
+def _matches(pattern: re.Pattern[str], value: Any) -> bool:
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def _is_nonempty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _is_string_map(value: Any) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    )
+
+
+def _check_identifiers(profile: dict[str, Any]) -> None:
+    for key in ("tenant_id", "subscription_id"):
+        if not _matches(UUID, profile[key]):
+            raise SystemExit(f"deployment config {key} must be a UUID")
+    for key in ("resource_group", "registry_name", "api_app", "api_identity", "sync_job"):
+        if not _matches(RESOURCE_NAME, profile[key]):
+            raise SystemExit(f"deployment config {key} is not a valid Azure resource name")
+    if not _matches(HTTPS_URL, profile["project_endpoint"]):
+        raise SystemExit("deployment config project_endpoint must be an https URL")
+    if not isinstance(profile["registry"], str) or not profile["registry"].endswith(".azurecr.io"):
+        raise SystemExit("deployment config registry must be an Azure Container Registry hostname")
+    if not _is_nonempty_text(profile["api_audience"]):
+        raise SystemExit("deployment config api_audience must be a non-empty string")
+
+
+def _check_settings(profile: dict[str, Any]) -> None:
+    if not isinstance(profile["hosted_idle_timeout_seconds"], int) or profile["hosted_idle_timeout_seconds"] < 1:
+        raise SystemExit("deployment config hosted_idle_timeout_seconds must be a positive integer")
+    for key in ("api_environment", "assistant_environment"):
+        if not _is_string_map(profile[key]):
+            raise SystemExit(f"deployment config {key} must map strings to strings")
+
+
+def _check_agent(index: int, agent: Any, require_runtime: bool) -> None:
+    if not isinstance(agent, dict):
+        raise SystemExit(f"deployment config agents[{index}] must be an object")
+    for key in ("name", "kind", "description"):
+        if not _is_nonempty_text(agent.get(key)):
+            raise SystemExit(f"deployment config agents[{index}].{key} must be a non-empty string")
+    if agent["kind"] not in {"assistant", "executor"}:
+        raise SystemExit(f"deployment config agents[{index}].kind is invalid")
+    if require_runtime:
+        for key in ("agent_id", "agent_oid"):
+            if not _matches(UUID, agent.get(key)):
+                raise SystemExit(f"deployment config agents[{index}].{key} must be a UUID")
+
+
+def _check_runtime(profile: dict[str, Any]) -> None:
+    # deploy_client_id is the GitHub OIDC identity; only the CI's `ci_deploy.py meta` needs it (and checks it).
+    # An azd environment (deploy/azd) deploys as the signed-in operator and has none.
+    for key in ("api_identity_client_id", "api_url"):
+        if not _is_nonempty_text(profile.get(key)):
+            raise SystemExit(f"deployment config {key} is required for runtime deployment")
+    if HTTPS_URL.fullmatch(profile["api_url"]) is None:
+        raise SystemExit("deployment config api_url must be an https URL")
+    runtime = profile.get("runtime")
+    if not isinstance(runtime, dict):
+        raise SystemExit("deployment config runtime must be an object")
+    for key in ("authority_domain", "team_id", "human_oid", "admin_client_id",
+                "table_account", "table_name", "blob_account", "sources_container",
+                "backups_container"):
+        if not _is_nonempty_text(runtime.get(key)):
+            raise SystemExit(f"deployment config runtime.{key} must be a non-empty string")
+    if UUID.fullmatch(runtime["human_oid"]) is None:
+        raise SystemExit("deployment config runtime.human_oid must be a UUID")
+    if "console_app" not in profile:
+        raise SystemExit("deployment config console_app is required for runtime deployment")
+
+
 def validate_config(profile: Any, *, path: Path | None = None, require_runtime: bool = True) -> None:
-    """Validate the cross-script contract shared by infra and runtime steps."""
+    """Validate the cross-script contract shared by infra and runtime steps; the first broken rule stops it."""
     where = f" in {path}" if path else ""
     if not isinstance(profile, dict):
         raise SystemExit(f"deployment config{where} must be a JSON object")
     missing = [key for key in COMMON_REQUIRED if key not in profile]
     if missing:
         raise SystemExit(f"deployment config{where} is missing: {', '.join(missing)}")
-
-    for key in ("tenant_id", "subscription_id"):
-        if not isinstance(profile[key], str) or UUID.fullmatch(profile[key]) is None:
-            raise SystemExit(f"deployment config {key} must be a UUID")
-    for key in ("resource_group", "registry_name", "api_app", "api_identity", "sync_job"):
-        if not isinstance(profile[key], str) or RESOURCE_NAME.fullmatch(profile[key]) is None:
-            raise SystemExit(f"deployment config {key} is not a valid Azure resource name")
-    for key in ("project_endpoint",):
-        if not isinstance(profile[key], str) or HTTPS_URL.fullmatch(profile[key]) is None:
-            raise SystemExit(f"deployment config {key} must be an https URL")
-    for key in ("registry",):
-        if not isinstance(profile[key], str) or not profile[key].endswith(".azurecr.io"):
-            raise SystemExit(f"deployment config {key} must be an Azure Container Registry hostname")
-    if not isinstance(profile["api_audience"], str) or not profile["api_audience"]:
-        raise SystemExit("deployment config api_audience must be a non-empty string")
-    if not isinstance(profile["hosted_idle_timeout_seconds"], int) or profile["hosted_idle_timeout_seconds"] < 1:
-        raise SystemExit("deployment config hosted_idle_timeout_seconds must be a positive integer")
-    if not isinstance(profile["api_environment"], dict) or not all(
-        isinstance(key, str) and isinstance(value, str)
-        for key, value in profile["api_environment"].items()
-    ):
-        raise SystemExit("deployment config api_environment must map strings to strings")
-    if not isinstance(profile["assistant_environment"], dict) or not all(
-        isinstance(key, str) and isinstance(value, str)
-        for key, value in profile["assistant_environment"].items()
-    ):
-        raise SystemExit("deployment config assistant_environment must map strings to strings")
+    _check_identifiers(profile)
+    _check_settings(profile)
     if not isinstance(profile["agents"], list) or not profile["agents"]:
         raise SystemExit("deployment config agents must be a non-empty array")
     for index, agent in enumerate(profile["agents"]):
-        if not isinstance(agent, dict):
-            raise SystemExit(f"deployment config agents[{index}] must be an object")
-        for key in ("name", "kind", "description"):
-            if not isinstance(agent.get(key), str) or not agent[key]:
-                raise SystemExit(f"deployment config agents[{index}].{key} must be a non-empty string")
-        if agent["kind"] not in {"assistant", "executor"}:
-            raise SystemExit(f"deployment config agents[{index}].kind is invalid")
-        if require_runtime:
-            for key in ("agent_id", "agent_oid"):
-                if not isinstance(agent.get(key), str) or UUID.fullmatch(agent[key]) is None:
-                    raise SystemExit(f"deployment config agents[{index}].{key} must be a UUID")
-
+        _check_agent(index, agent, require_runtime)
     if require_runtime:
-        # deploy_client_id is the GitHub OIDC identity; only the CI's `ci_deploy.py meta` needs it (and checks it).
-        # An azd environment (deploy/azd) deploys as the signed-in operator and has none.
-        for key in ("api_identity_client_id", "api_url"):
-            if not isinstance(profile.get(key), str) or not profile[key]:
-                raise SystemExit(f"deployment config {key} is required for runtime deployment")
-        if HTTPS_URL.fullmatch(profile["api_url"]) is None:
-            raise SystemExit("deployment config api_url must be an https URL")
-        runtime = profile.get("runtime")
-        if not isinstance(runtime, dict):
-            raise SystemExit("deployment config runtime must be an object")
-        for key in ("authority_domain", "team_id", "human_oid", "admin_client_id",
-                    "table_account", "table_name", "blob_account", "sources_container",
-                    "backups_container"):
-            if not isinstance(runtime.get(key), str) or not runtime[key]:
-                raise SystemExit(f"deployment config runtime.{key} must be a non-empty string")
-        if UUID.fullmatch(runtime["human_oid"]) is None:
-            raise SystemExit("deployment config runtime.human_oid must be a UUID")
-        if "console_app" not in profile:
-            raise SystemExit("deployment config console_app is required for runtime deployment")
+        _check_runtime(profile)
 
 
 def set_config(value: str | os.PathLike[str] | None = None, *, require_runtime: bool = True) -> dict[str, Any]:

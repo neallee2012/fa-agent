@@ -2,6 +2,7 @@
 import logging
 import re
 from datetime import datetime
+from functools import partial
 from urllib.parse import urlsplit, urlunsplit
 from . import behavior_assistant_wire as aw
 from .errors import safe_text
@@ -30,6 +31,11 @@ PEER_FAILURE_CODES = frozenset({
     "AGENT_MESSAGE_RESULT_UNCONFIRMED", "AGENT_MESSAGE_ALLOWANCE",
     "AGENT_MESSAGE_ROOT_EXPIRED", "AGENT_MESSAGE_HANDOFF_EXISTS",
 })
+_STAGES = {
+    "session.start": ("started", "SDK session started"),
+    "assistant.turn_start": ("started", "SDK turn started"),
+    "session.idle": ("succeeded", "SDK turn ended"),
+}
 
 
 def _public_url(value):
@@ -145,6 +151,114 @@ def provider_refusal(failure):
     return " ".join(parts)
 
 
+def _relay_queued(event, data, allowed_tools):
+    if (isinstance(data, dict) and data.get("tool_name") == "send_agent_message"
+            and "send_agent_message" in allowed_tools and isinstance(data.get("recipient"), str)):
+        return event(kind="stage", status="started",
+            summary=_public_summary(data["recipient"], "已排隊，")[:180] + " 換版完成後處理；尚未確認送達，不會重送。")
+    return None
+
+
+def _model_failed(event, kind, code, failure):
+    if isinstance(code, str) and code in MODEL_FAILURE_CODES:
+        return event(kind="error", status="failed", summary=code)
+    refused = provider_refusal(failure)
+    if refused is not None:
+        return event(kind="error", status="failed", summary=refused)
+    if kind == "session.error":
+        return event(kind="error", status="unknown", summary="SDK reported an unresolved error")
+    return None
+
+
+def _peer_failure(data, allowed_tools):
+    return (data.get("tool_name") == "send_agent_message" and "send_agent_message" in allowed_tools
+            and isinstance(data.get("code"), str) and data["code"] in PEER_FAILURE_CODES)
+
+
+def _tool_refused(event, kind, data, allowed_tools):
+    if not isinstance(data, dict):
+        return None
+    if kind == "m2.tool_failure" and _peer_failure(data, allowed_tools):
+        return event(kind="error",
+            status="unknown" if data["code"] == "AGENT_MESSAGE_RESULT_UNCONFIRMED" else "failed",
+            summary=data["code"])
+    if data.get("tool_name") in allowed_tools:
+        from .native_hitl_wire import NATIVE_HITL_FAILURE_GUIDANCE, native_hitl_failure_feedback
+        code = data.get("hitl") if kind == "m2.permission" else data.get("code")
+        if isinstance(code, str) and code in NATIVE_HITL_FAILURE_GUIDANCE:
+            return event(kind="error",
+                status="unknown" if code in {"NATIVE_HITL_EFFECT_UNKNOWN", "NATIVE_HITL_AUTHORITY_UNAVAILABLE"} else "failed",
+                summary=native_hitl_failure_feedback(code))
+    return None
+
+
+def _assistant_message(event, value, data, allowed_tools, *, model_provider, reasoning_summary, sdk_session_id):
+    if value.get("agent_id") not in (None,sdk_session_id):
+        return None
+    summary=_assistant_summary(data,allowed_tools)
+    reasoning=(_reasoning_summary(data) if model_provider=="openai-responses" and reasoning_summary else None)
+    return None if summary is None and reasoning is None else event(
+        kind="stage",status="started",summary=summary or "OpenAI reasoning summary",reasoning_summary=reasoning)
+
+
+def _tool_started(event, seq, call, data, tools, allowed_tools):
+    if call in tools:
+        tools[call]=None
+        logging.getLogger(__name__).warning("INSTRUCTION_PUBLIC_TOOL_ID_REUSED")
+        return None
+    name=data.get("tool_name")
+    if not isinstance(name,str) or name not in allowed_tools:
+        tools[call]=None
+        return None
+    # Capability tools keep "<entry>-<tool>" names; the stored public name stays in the original
+    # letters/digits/underscore format so existing readers keep accepting progress records.
+    public=name.replace("-","_")
+    tools[call]=(public,seq,name)
+    return event(kind="tool_started",tool_name=public,tool_start_seq=seq,status="started",
+        summary=_tool_summary(name,data.get("arguments")) or "Configured tool call started")
+
+
+def _context_source(data):
+    result=data.get("result")
+    content=result.get("content") if isinstance(result,dict) else None
+    if not isinstance(content,str):
+        return None
+    try:
+        return aw.parse_instruction_context(content).source
+    except ValueError:
+        from .behavior_native_turn_wire import NativeInstructionContext
+        try:
+            NativeInstructionContext.model_validate_json(content)
+        except ValueError:
+            logging.getLogger(__name__).warning("INSTRUCTION_PUBLIC_SOURCE_UNAVAILABLE")
+    return None
+
+
+def _tool_completed(event, call, data, tools):
+    if tools.get(call) is None:
+        return None
+    if type(data.get("success")) is not bool:
+        logging.getLogger(__name__).warning("INSTRUCTION_PUBLIC_TOOL_RESULT_UNAVAILABLE")
+        return None
+    name,start_seq,raw=tools[call]
+    # Retain a tombstone: a reused raw ID must never attach a late result to a new call.
+    tools[call]=None
+    source=_context_source(data) if raw=="read_context" and data.get("success") is True else None
+    return event(kind="tool_completed",tool_name=name,tool_start_seq=start_seq,
+        status="succeeded" if data.get("success") is True else "failed",source=source,
+        summary="Tool returned a result" if data.get("success") is True else "Tool did not return a confirmed result")
+
+
+def _tool_event(event, seq, kind, data, tools, allowed_tools):
+    call=data.get("tool_call_id")
+    if not isinstance(call,str) or not call:
+        logging.getLogger(__name__).warning("INSTRUCTION_PUBLIC_TOOL_ID_UNAVAILABLE")
+        return None
+    if kind=="tool.execution_start":
+        return _tool_started(event,seq,call,data,tools,allowed_tools)
+    return _tool_completed(event,call,data,tools)
+
+
 def public_event(value,seq,tools,*,allowed_tools=(),model_provider=None,reasoning_summary=False,sdk_session_id=None,
                  model_failure_code=None,model_failure=None):
     kind=value.get("type")
@@ -152,92 +266,22 @@ def public_event(value,seq,tools,*,allowed_tools=(),model_provider=None,reasonin
     if not isinstance(at,str):return None
     timestamp=datetime.fromisoformat(at.replace("Z","+00:00"))
     data=value.get("data",{})
-    if (kind == "m2.relay_queued" and isinstance(data, dict) and data.get("tool_name") == "send_agent_message"
-            and "send_agent_message" in allowed_tools and isinstance(data.get("recipient"), str)):
-        return aw.PublicProgressEvent(seq=seq, at=timestamp, kind="stage", status="started",
-            summary=_public_summary(data["recipient"], "已排隊，")[:180] + " 換版完成後處理；尚未確認送達，不會重送。")
-    if (kind in {"m2.provider_failed", "session.error"} and isinstance(model_failure_code, str)
-            and model_failure_code in MODEL_FAILURE_CODES):
-        return aw.PublicProgressEvent(seq=seq, at=timestamp, kind="error", status="failed",
-                                      summary=model_failure_code)
-    refused = provider_refusal(model_failure) if kind in {"m2.provider_failed", "session.error"} else None
-    if refused is not None:
-        return aw.PublicProgressEvent(seq=seq, at=timestamp, kind="error", status="failed", summary=refused)
-    if (kind == "m2.tool_failure" and isinstance(data, dict) and data.get("tool_name") == "send_agent_message"
-            and "send_agent_message" in allowed_tools and isinstance(data.get("code"), str)
-            and data["code"] in PEER_FAILURE_CODES):
-        return aw.PublicProgressEvent(seq=seq, at=timestamp, kind="error",
-            status="unknown" if data["code"] == "AGENT_MESSAGE_RESULT_UNCONFIRMED" else "failed",
-            summary=data["code"])
-    if kind in {"m2.permission", "m2.tool_failure"} and isinstance(data, dict) and data.get("tool_name") in allowed_tools:
-        from .native_hitl_wire import NATIVE_HITL_FAILURE_GUIDANCE, native_hitl_failure_feedback
-        code = data.get("hitl") if kind == "m2.permission" else data.get("code")
-        if isinstance(code, str) and code in NATIVE_HITL_FAILURE_GUIDANCE:
-            return aw.PublicProgressEvent(seq=seq, at=timestamp, kind="error",
-                status="unknown" if code in {"NATIVE_HITL_EFFECT_UNKNOWN", "NATIVE_HITL_AUTHORITY_UNAVAILABLE"} else "failed",
-                summary=native_hitl_failure_feedback(code))
-    if kind in {"session.start","assistant.turn_start","session.idle"}:
-        return aw.PublicProgressEvent(seq=seq,at=timestamp,kind="stage",
-            status="succeeded" if kind=="session.idle" else "started",
-            summary={"session.start":"SDK session started","assistant.turn_start":"SDK turn started",
-                     "session.idle":"SDK turn ended"}[kind])
-    if kind=="session.error":
-        return aw.PublicProgressEvent(seq=seq,at=timestamp,kind="error",status="unknown",
-                                      summary="SDK reported an unresolved error")
+    event=partial(aw.PublicProgressEvent,seq=seq,at=timestamp)
+    if kind=="m2.relay_queued":
+        return _relay_queued(event,data,allowed_tools)
+    if kind in {"m2.provider_failed","session.error"}:
+        return _model_failed(event,kind,model_failure_code,model_failure)
+    if kind in {"m2.permission","m2.tool_failure"}:
+        return _tool_refused(event,kind,data,allowed_tools)
+    if kind in _STAGES:
+        status,summary=_STAGES[kind]
+        return event(kind="stage",status=status,summary=summary)
     if kind not in {"assistant.message","tool.execution_start","tool.execution_complete"}:
         return None
     if not isinstance(data,dict):
         logging.getLogger(__name__).warning("INSTRUCTION_PUBLIC_EVENT_DATA_INVALID")
         return None
     if kind=="assistant.message":
-        if value.get("agent_id") not in (None,sdk_session_id):
-            return None
-        summary=_assistant_summary(data,allowed_tools)
-        reasoning=(_reasoning_summary(data) if model_provider=="openai-responses" and reasoning_summary else None)
-        return None if summary is None and reasoning is None else aw.PublicProgressEvent(
-            seq=seq,at=timestamp,kind="stage",status="started",summary=summary or "OpenAI reasoning summary",
-            reasoning_summary=reasoning)
-    call=data.get("tool_call_id")
-    if not isinstance(call,str) or not call:
-        logging.getLogger(__name__).warning("INSTRUCTION_PUBLIC_TOOL_ID_UNAVAILABLE")
-        return None
-    if kind=="tool.execution_start":
-        if call in tools:
-            tools[call]=None
-            logging.getLogger(__name__).warning("INSTRUCTION_PUBLIC_TOOL_ID_REUSED")
-            return None
-        name=data.get("tool_name")
-        if not isinstance(name,str) or name not in allowed_tools:
-            tools[call]=None
-            return None
-        # Capability tools keep "<entry>-<tool>" names; the stored public name stays in the original
-        # letters/digits/underscore format so existing readers keep accepting progress records.
-        public=name.replace("-","_")
-        tools[call]=(public,seq,name)
-        return aw.PublicProgressEvent(seq=seq,at=timestamp,kind="tool_started",
-            tool_name=public,tool_start_seq=seq,status="started",
-            summary=_tool_summary(name,data.get("arguments")) or "Configured tool call started")
-    if kind=="tool.execution_complete" and tools.get(call) is not None:
-        if type(data.get("success")) is not bool:
-            logging.getLogger(__name__).warning("INSTRUCTION_PUBLIC_TOOL_RESULT_UNAVAILABLE")
-            return None
-        name,start_seq,raw=tools[call]
-        # Retain a tombstone: a reused raw ID must never attach a late result to a new call.
-        tools[call]=None
-        source=None
-        if raw=="read_context" and data.get("success") is True:
-            result=data.get("result") or {}
-            content=result.get("content") if isinstance(result,dict) else None
-            if isinstance(content,str):
-                try:source=aw.parse_instruction_context(content).source
-                except ValueError:
-                    from .behavior_native_turn_wire import NativeInstructionContext
-                    try:
-                        NativeInstructionContext.model_validate_json(content)
-                    except ValueError:
-                        logging.getLogger(__name__).warning("INSTRUCTION_PUBLIC_SOURCE_UNAVAILABLE")
-        return aw.PublicProgressEvent(seq=seq,at=timestamp,kind="tool_completed",tool_name=name,
-            tool_start_seq=start_seq,
-            status="succeeded" if data.get("success") is True else "failed",source=source,
-            summary="Tool returned a result" if data.get("success") is True else "Tool did not return a confirmed result")
-    return None
+        return _assistant_message(event,value,data,allowed_tools,model_provider=model_provider,
+                                  reasoning_summary=reasoning_summary,sdk_session_id=sdk_session_id)
+    return _tool_event(event,seq,kind,data,tools,allowed_tools)

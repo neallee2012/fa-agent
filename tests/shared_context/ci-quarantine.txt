@@ -1,6 +1,6 @@
 # Deselected only by .github/workflows/shared-context-tests.yml (Linux CI). One pytest node id per line, then
 # `# reason`. Only tests whose input Linux CI cannot have: the pinned Windows Copilot runtime 1.0.83
-# (M2_TEST_RUNTIME) or STANDING_CLOCK_PARENT_ART. A local run still runs them and fails loudly without them.
+# (M2_TEST_RUNTIME). A local run still runs them and fails loudly without it.
 tests/shared_context/test_agent_message_continuation.py::test_two_pinned_sdks_use_the_real_message_api_and_only_a_delivers_final  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_agent_message_tools.py::test_pinned_responses_peer_failure_keeps_the_assigned_recipient_and_honest_feedback[accepted_unknown]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_agent_message_tools.py::test_pinned_responses_peer_failure_keeps_the_assigned_recipient_and_honest_feedback[recipient]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
@@ -19,9 +19,7 @@ tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_assignmen
 tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_assignment_conflict_or_claim_replay_cannot_bypass_current_scope[expired-before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_assignment_conflict_or_claim_replay_cannot_bypass_current_scope[revoked-before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_assignment_conflict_or_claim_replay_cannot_bypass_current_scope[wrong-report-before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
-tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_complete_sdk_flow_survives_controller_conflicts_without_repeating_effects[all-authority-ledgers-before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
-tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_complete_sdk_flow_survives_controller_conflicts_without_repeating_effects[context-native-evidence-before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
-tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_complete_sdk_flow_survives_controller_conflicts_without_repeating_effects[provider-evidence-before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
+tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_complete_sdk_flow_survives_controller_conflicts_without_repeating_effects[before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_consumed_model_intent_never_retries_an_unknown_provider_send[http500-before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_consumed_model_intent_never_retries_an_unknown_provider_send[timeout-before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_behavior_assistant_claim_boundaries.py::test_first_http_claim_does_not_relax_identity_or_retry_transport_failure[unknown500-before-native]  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
@@ -433,13 +431,6 @@ tests/shared_context/test_skillify_native.py::test_skillified_procedure_is_used_
 tests/shared_context/test_skills_capability_native.py::test_fixed_sdk_reads_an_approved_skill_through_the_skills_capability  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_sop_copy_failure_native.py::test_fixed_sdk_cancel_after_known_copy_keeps_historical_effect_and_real_stop  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_sop_skill_copy_native.py::test_fixed_sdk_copy_returns_only_one_unapproved_receipt_without_model_body_input  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
-tests/shared_context/test_standing_review_clock.py::test_advancing_clock_real_plan_authorize_source_retains_both_times  # needs STANDING_CLOCK_PARENT_ART (captured artifacts outside the repo)
-tests/shared_context/test_standing_review_clock.py::test_clock_and_bound_material_tampering_rejected_before_approval_or_source  # needs STANDING_CLOCK_PARENT_ART (captured artifacts outside the repo)
-tests/shared_context/test_standing_review_clock.py::test_exact_native_review_clock_replay  # needs STANDING_CLOCK_PARENT_ART (captured artifacts outside the repo)
-tests/shared_context/test_standing_review_clock.py::test_expiry_after_last_source_validation_never_authorizes  # needs STANDING_CLOCK_PARENT_ART (captured artifacts outside the repo)
-tests/shared_context/test_standing_review_clock.py::test_new_loaded_code_still_rejects_original_native_plan_pin  # needs STANDING_CLOCK_PARENT_ART (captured artifacts outside the repo)
-tests/shared_context/test_standing_review_clock.py::test_rehashed_bad_evidence_and_readset_still_use_real_source_verifier  # needs STANDING_CLOCK_PARENT_ART (captured artifacts outside the repo)
-tests/shared_context/test_standing_review_clock.py::test_source_unknown_reconciles_original_producer_receipt_without_retime  # needs STANDING_CLOCK_PARENT_ART (captured artifacts outside the repo)
 tests/shared_context/test_state_room_native.py::test_a_screenshot_path_outside_the_tool_folder_is_refused_with_how_to_fix_it  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_state_room_native.py::test_a_written_screenshot_still_reserved_is_not_counted_twice_as_full  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)
 tests/shared_context/test_state_room_native.py::test_parallel_screenshots_each_reserve_room_before_any_result_is_written  # needs M2_TEST_RUNTIME (pinned Windows runtime 1.0.83)

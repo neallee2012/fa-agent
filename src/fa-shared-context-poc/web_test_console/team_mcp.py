@@ -6,12 +6,13 @@ reuses its toolbox version. A key typed for a new connection passes through once
 not stored, logged or echoed here.
 """
 
+from functools import partial
 import json
 import re
 
 from shared_context.team_mcp_wire import TeamMcpChange, TeamMcpChangeResult, TeamMcpConnections, TeamMcpView
 
-from .adapter import ConsoleError, PullAdapter, require, strict_json
+from .adapter import ConsoleError, PullAdapter, decode, owner_token, require, strict_json
 
 PREFIX = "/team-mcp/v1"
 MAX_READ_BYTES = 128 * 1024
@@ -48,12 +49,7 @@ MESSAGES.update({
 })
 
 
-def _decode(model, raw):
-    try:
-        strict_json(raw)
-        return model.model_validate_json(raw)
-    except (ValueError, TypeError):
-        raise ConsoleError("TEAM_MCP_RESPONSE_INVALID", 502) from None
+_decode = partial(decode, code="TEAM_MCP_RESPONSE_INVALID")
 
 
 class TeamMcpAdapter(PullAdapter):
@@ -74,11 +70,7 @@ class TeamMcp:
         self.adapter = TeamMcpAdapter(console.config, console.backend)
 
     def _token(self, *, write=False):
-        self.console.active()
-        token = self.console.vault.get()
-        if write:
-            require(self.console.vault.allows("Behavior.Approve"), "TEAM_MCP_OWNER_ONLY", 403)
-        return token
+        return owner_token(self.console, "TEAM_MCP_OWNER_ONLY", write=write)
 
     def servers(self):
         view = _decode(TeamMcpView, self.adapter.call("GET", "/servers", self._token())).model_dump(mode="json")

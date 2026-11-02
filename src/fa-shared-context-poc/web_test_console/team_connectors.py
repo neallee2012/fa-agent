@@ -17,7 +17,7 @@ from shared_context.team_connector_wire import (
     TeamConnectorsView,
 )
 
-from .adapter import ConsoleError, PullAdapter, require, strict_json
+from .adapter import ConsoleError, PullAdapter, decode, owner_token, require, strict_json
 from .team_mcp import TEAM_MCP_ERRORS
 
 PREFIX = "/team-connectors/v1"
@@ -59,14 +59,6 @@ MESSAGES = {
 }
 
 
-def _decode(model, raw, code):
-    try:
-        strict_json(raw)
-        return model.model_validate_json(raw)
-    except (ValueError, TypeError):
-        raise ConsoleError(code, 502) from None
-
-
 def _parse(model, data, code):
     try:
         return model.model_validate_json(json.dumps(data))
@@ -89,13 +81,6 @@ class TeamConnectors:
         self.console = console
         # Team routes live at the API root; the Agent switch goes through the selected Agent's own prefix.
         self.team = PullAdapter(console.config, console.backend)
-
-    def _token(self, code, *, write=False):
-        self.console.active()
-        token = self.console.vault.get()
-        if write:
-            require(self.console.vault.allows("Behavior.Approve"), code, 403)
-        return token
 
     def _can_manage(self):
         return bool(self.console.vault.allows("Behavior.Approve"))
@@ -123,24 +108,24 @@ class TeamConnectors:
                 raise ConsoleError("AGENT_CONNECTORS_OWNER_ONLY", 403, error.upstream_status) from None
             raise
         require(headers.get("cache-control") == "no-store", "AGENT_CONNECTORS_RESPONSE_INVALID", 502)
-        return _decode(AgentConnectorsView, raw, "AGENT_CONNECTORS_RESPONSE_INVALID")
+        return decode(AgentConnectorsView, raw, "AGENT_CONNECTORS_RESPONSE_INVALID")
 
     def connectors(self):
-        view = _decode(TeamConnectorsView, self._team_call("GET", "/connectors", self._token("TEAM_CONNECTOR_OWNER_ONLY")),
-                       "TEAM_CONNECTOR_RESPONSE_INVALID")
+        view = decode(TeamConnectorsView, self._team_call("GET", "/connectors", owner_token(self.console, "TEAM_CONNECTOR_OWNER_ONLY")),
+                      "TEAM_CONNECTOR_RESPONSE_INVALID")
         return {"schema_version": "fa-console-team-connectors-v1", "can_manage": self._can_manage(),
                 "connectors": [_card(state) for state in view.connectors]}
 
     def change(self, data):
         command = _parse(TeamConnectorChange, data, "TEAM_CONNECTOR_INPUT_INVALID")
         require(_REQUEST_ID.fullmatch(command.request_id), "TEAM_CONNECTOR_INPUT_INVALID", 400)
-        token = self._token("TEAM_CONNECTOR_OWNER_ONLY", write=True)
+        token = owner_token(self.console, "TEAM_CONNECTOR_OWNER_ONLY", write=True)
         body = command.model_dump(mode="json")
         if command.client_secret is not None:
             # The dump masks the secret; only this one outgoing body carries it.
             body["client_secret"] = command.client_secret.get_secret_value()
-        result = _decode(TeamConnectorChangeResult, self._team_call("POST", "/changes", token, body),
-                         "TEAM_CONNECTOR_RESPONSE_INVALID")
+        result = decode(TeamConnectorChangeResult, self._team_call("POST", "/changes", token, body),
+                        "TEAM_CONNECTOR_RESPONSE_INVALID")
         require(result.request_id == command.request_id and result.connector.connector_id == command.connector_id,
                 "TEAM_CONNECTOR_RESPONSE_INVALID", 502)
         return {"schema_version": "fa-console-team-connector-change-v1", "request_id": result.request_id,
@@ -155,12 +140,12 @@ class TeamConnectors:
                                for ref in CONNECTORS.values()]}
 
     def agent_connectors(self):
-        return self._agent_view(self._agent_call("GET", self._token("AGENT_CONNECTORS_OWNER_ONLY")))
+        return self._agent_view(self._agent_call("GET", owner_token(self.console, "AGENT_CONNECTORS_OWNER_ONLY")))
 
     def select_agent_connectors(self, data):
         command = _parse(SelectAgentConnectors, data, "AGENT_CONNECTORS_INPUT_INVALID")
         require(_REQUEST_ID.fullmatch(command.request_id), "AGENT_CONNECTORS_INPUT_INVALID", 400)
-        token = self._token("AGENT_CONNECTORS_OWNER_ONLY", write=True)
+        token = owner_token(self.console, "AGENT_CONNECTORS_OWNER_ONLY", write=True)
         view = self._agent_call("POST", token, command.model_dump(mode="json"))
         # The same request ID returns its original result, also after later changes.
         require(view.revision == command.expected_revision + 1

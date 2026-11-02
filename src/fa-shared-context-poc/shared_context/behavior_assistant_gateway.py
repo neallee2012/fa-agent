@@ -21,6 +21,17 @@ MAX_REQUEST_IMAGES = 3
 MAX_IMAGE_DATA_URL_CHARS = 1_400_000
 CAPABILITY_IMAGE_BODY_BYTES = 6 * 1024 * 1024
 _PNG_URL_PREFIX = "data:image/png;base64,"
+_CHAT_FIELDS = frozenset({
+    "model", "messages", "tools", "tool_choice", "stream", "stream_options",
+    "max_tokens", "temperature", "top_p", "n", "stop", "parallel_tool_calls",
+    "presence_penalty", "frequency_penalty", "store",
+    "max_completion_tokens", "reasoning_effort",
+})
+_RESPONSES_FIELDS = frozenset({
+    "model", "input", "instructions", "tools", "tool_choice", "stream", "store", "reasoning",
+    "max_output_tokens", "temperature", "top_p", "parallel_tool_calls", "prompt_cache_key", "include",
+})
+_BASE_TOOLS = frozenset({"read_context", "save_result", "finish_task", "execute_operation"})
 
 
 def _check_images(messages, allow_images):
@@ -39,6 +50,68 @@ def _check_images(messages, allow_images):
                     or not url.startswith(_PNG_URL_PREFIX) or len(url) > MAX_IMAGE_DATA_URL_CHARS):
                 raise Problem(403, "ASSISTANT_IMAGES_DENIED",
                               "images are allowed only for this turn's captured image capability, within its bound")
+
+
+def _uses_responses(text_reply, capability_tools, allow_images, model_provider):
+    if (capability_tools or allow_images) and not text_reply:
+        raise Problem(403, "ASSISTANT_TOOLS_DENIED", "capabilities belong only to free instructions")
+    responses = model_provider == "openai-responses"
+    if model_provider is not None and (not responses or not text_reply):
+        raise Problem(403, "ASSISTANT_PROVIDER_CONFIGURATION", "provider must belong to this original instruction")
+    return responses
+
+
+def _outside_profile(body, *, text_reply, model, responses):
+    return (set(body) - (_RESPONSES_FIELDS if responses else _CHAT_FIELDS)
+            or body.get("model") != (model if text_reply else "gpt-4.1-mini")
+            or not text_reply and body.get("max_tokens") != 1024
+            or body.get("stream") is not True or body.get("n", 1) != 1)
+
+
+def _outside_bounds(body, messages, *, text_reply, allow_images):
+    if not isinstance(messages, list) or not messages or not text_reply and len(messages)>128:
+        return True
+    return len(json.dumps(body,ensure_ascii=not text_reply).encode()) > (
+        CAPABILITY_IMAGE_BODY_BYTES if allow_images else 128*1024 if text_reply else 24000)
+
+
+def _check_local_input(body, items):
+    if (body.get("store") is not False or body.get("include", []) not in ([], ["reasoning.encrypted_content"])
+            or any(not isinstance(item, dict) or item.get("type", "message") not in (
+                "message", "function_call", "function_call_output", "reasoning") for item in items)):
+        raise Problem(422, "ASSISTANT_MODEL_REQUEST_INVALID", "Responses must carry complete local input without provider storage")
+
+
+def _check_reasoning(reasoning):
+    if reasoning is not None and (not isinstance(reasoning, dict) or set(reasoning)-{"effort", "summary"}
+            or reasoning.get("summary") not in (None, "auto", "concise", "detailed")
+            or reasoning.get("effort") not in (None, "none", "minimal", "low", "medium", "high", "xhigh")):
+        raise Problem(422, "ASSISTANT_MODEL_REQUEST_INVALID", "unsupported Responses reasoning options")
+
+
+def _check_past_turn_reads(user_file_access, assistant_reply_access, user_turn):
+    if user_file_access and not user_turn:
+        raise Problem(403, "ASSISTANT_TOOLS_DENIED", "original user-turn capability is required for file reads")
+    if assistant_reply_access and not user_turn:
+        raise Problem(403, "ASSISTANT_TOOLS_DENIED", "original user-turn capability is required for reply reads")
+
+
+def _tool_names(grants, capability_tools):
+    names = _BASE_TOOLS | {tool for tool, granted in grants if granted}
+    if capability_tools:
+        if names & set(capability_tools):
+            raise Problem(403, "ASSISTANT_TOOLS_DENIED", "capability tools cannot shadow a base tool")
+        names |= set(capability_tools)
+    return names
+
+
+def _check_tools(tools, names, *, text_reply, responses):
+    if not isinstance(tools, list) or not text_reply and len(tools) > 4 or any(
+        not isinstance(tool, dict) or tool.get("type") != "function"
+        or responses and not isinstance(tool.get("name"), str)
+        or (tool.get("name") if responses else tool.get("function", {}).get("name")) not in names for tool in tools
+    ):
+        raise Problem(403, "ASSISTANT_TOOLS_DENIED", "only the bounded assistant tool catalog is allowed")
 
 
 class AssistantProvider:
@@ -60,75 +133,28 @@ class AssistantProvider:
                  work_memory_access=False, sop_copy_access=False, skill_draft_access=False,
                  skill_resource_access=False, user_file_access=False, assistant_reply_access=False,
                  reviewed_note_access=False, capability_tools=frozenset(), allow_images=False, model_provider=None):
-        if (capability_tools or allow_images) and not text_reply:
-            raise Problem(403, "ASSISTANT_TOOLS_DENIED", "capabilities belong only to free instructions")
-        allowed = {
-            "model", "messages", "tools", "tool_choice", "stream", "stream_options",
-            "max_tokens", "temperature", "top_p", "n", "stop", "parallel_tool_calls",
-            "presence_penalty", "frequency_penalty", "store",
-            "max_completion_tokens", "reasoning_effort",
-        }
-        responses = model_provider == "openai-responses"
-        if model_provider is not None and (not responses or not text_reply):
-            raise Problem(403, "ASSISTANT_PROVIDER_CONFIGURATION", "provider must belong to this original instruction")
-        if responses:
-            allowed = {
-                "model", "input", "instructions", "tools", "tool_choice", "stream", "store", "reasoning",
-                "max_output_tokens", "temperature", "top_p", "parallel_tool_calls", "prompt_cache_key", "include",
-            }
+        responses = _uses_responses(text_reply, capability_tools, allow_images, model_provider)
         messages = body.get("input" if responses else "messages")
-        if (set(body) - allowed or body.get("model") != (model if text_reply else "gpt-4.1-mini")
-                or not text_reply and body.get("max_tokens") != 1024
-                or body.get("stream") is not True or not isinstance(messages, list)
-                or not messages or not text_reply and len(messages)>128 or body.get("n", 1) != 1
-                or len(json.dumps(body,ensure_ascii=not text_reply).encode()) > (
-                    CAPABILITY_IMAGE_BODY_BYTES if allow_images else 128*1024 if text_reply else 24000)):
+        if (_outside_profile(body, text_reply=text_reply, model=model, responses=responses)
+                or _outside_bounds(body, messages, text_reply=text_reply, allow_images=allow_images)):
             raise Problem(422, "ASSISTANT_MODEL_REQUEST_INVALID", "bounded pinned-model request is required")
         if responses:
-            if (body.get("store") is not False or body.get("include", []) not in ([], ["reasoning.encrypted_content"])
-                    or any(not isinstance(item, dict) or item.get("type", "message") not in (
-                        "message", "function_call", "function_call_output", "reasoning") for item in messages)):
-                raise Problem(422, "ASSISTANT_MODEL_REQUEST_INVALID", "Responses must carry complete local input without provider storage")
-            reasoning = body.get("reasoning")
-            if reasoning is not None and (not isinstance(reasoning, dict) or set(reasoning)-{"effort", "summary"}
-                    or reasoning.get("summary") not in (None, "auto", "concise", "detailed")
-                    or reasoning.get("effort") not in (None, "none", "minimal", "low", "medium", "high", "xhigh")):
-                raise Problem(422, "ASSISTANT_MODEL_REQUEST_INVALID", "unsupported Responses reasoning options")
+            _check_local_input(body, messages)
+            _check_reasoning(body.get("reasoning"))
         _check_images(messages, allow_images)
-        tools = body.get("tools", [])
-        names = {"read_context", "save_result", "finish_task", "execute_operation"}
-        if text_reply and skill_access:
-            names.add("read_skill")
-        if text_reply and skill_access and skill_resource_access:
-            names.add("read_skill_resource")
-        if text_reply and user_turn_access:
-            names.add("read_user_turn")
-        if user_file_access:
-            if not text_reply or not user_turn_access:
-                raise Problem(403, "ASSISTANT_TOOLS_DENIED", "original user-turn capability is required for file reads")
-            names.add("read_user_file")
-        if assistant_reply_access:
-            if not text_reply or not user_turn_access:
-                raise Problem(403, "ASSISTANT_TOOLS_DENIED", "original user-turn capability is required for reply reads")
-            names.add("read_assistant_reply")
-        if text_reply and work_memory_access:
-            names.add("read_work_memory")
-        if text_reply and reviewed_note_access:
-            names.add("read_reviewed_note")
-        if text_reply and sop_copy_access:
-            names.add("copy_sop_to_skill_draft")
-        if text_reply and skill_draft_access:
-            names.add("save_skill_draft")
-        if text_reply and capability_tools:
-            if names & set(capability_tools):
-                raise Problem(403, "ASSISTANT_TOOLS_DENIED", "capability tools cannot shadow a base tool")
-            names.update(capability_tools)
-        if not isinstance(tools, list) or not text_reply and len(tools) > 4 or any(
-            not isinstance(tool, dict) or tool.get("type") != "function"
-            or responses and not isinstance(tool.get("name"), str)
-            or (tool.get("name") if responses else tool.get("function", {}).get("name")) not in names for tool in tools
-        ):
-            raise Problem(403, "ASSISTANT_TOOLS_DENIED", "only the bounded assistant tool catalog is allowed")
+        _check_past_turn_reads(user_file_access, assistant_reply_access, text_reply and user_turn_access)
+        names = _tool_names((
+            ("read_skill", skill_access),
+            ("read_skill_resource", skill_access and skill_resource_access),
+            ("read_user_turn", user_turn_access),
+            ("read_user_file", user_file_access),
+            ("read_assistant_reply", assistant_reply_access),
+            ("read_work_memory", work_memory_access),
+            ("read_reviewed_note", reviewed_note_access),
+            ("copy_sop_to_skill_draft", sop_copy_access),
+            ("save_skill_draft", skill_draft_access),
+        ) if text_reply else (), capability_tools)
+        _check_tools(body.get("tools", []), names, text_reply=text_reply, responses=responses)
 
     async def send(self, body, *, before_send=None, text_reply=False, model=None, stream_response=False,
                    skill_access=False, user_turn_access=False, work_memory_access=False, sop_copy_access=False,

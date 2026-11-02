@@ -14,36 +14,39 @@ from pydantic import ValidationError
 from shared_context.behavior_delivery import VerifiedWorkResult, WorkResultRequest
 from shared_context.behavior_effects import (
     GOAL_REVIEW, GOAL_VERIFY, WorkEffectDelivery, WorkEffectReceipt,
-    WorkGoalUpdate, WorkStateEffectAdapter, effect_key,
+    WorkGoalUpdate, WorkStateEffectAdapter, _material, effect_key,
 )
 from shared_context.behavior_operations import (
     AuthorizationRequest, GrantRecord, GrantSubject, OperationDescription,
-    ToolBrokerCore, ToolIntent, canonical_material, control_key,
+    ToolBrokerCore, ToolIntent, _digest, canonical_material, control_key,
 )
-from shared_context.behavior_store import BehaviorStore
+from shared_context.behavior_store import BehaviorStore, ControlChanges, ControlRequest, ControlWrite
+from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
 from test_behavior_delivery import CONTEXT, NOW, Harness
 from test_behavior_store import FakeTable, SCOPE, code
 
 
 class EffectHarness(Harness):
-    def __init__(self, *, wire=False):
+    def __init__(self, *, wire=False, pinned=None, before_pin=None, also_allowed=()):
         super().__init__(wire=wire)
         self.ob, self.admission, _ = self.admit()
         self.work_id = self.admission.work.work_id
         self.references = {}
         self.adapter = WorkStateEffectAdapter(
-            self.core, allowed_work_ids=(self.work_id,), references=self.references,
+            self.core, allowed_work_ids=(self.work_id, *also_allowed), references=self.references,
         )
         self.effects = ToolBrokerCore(
             self.store, clock=lambda: self.time,
             adapter=self.adapter.registration, execution_adapter=self.adapter,
         )
+        if before_pin is not None:
+            before_pin(self)
         version = self.adapter.inspect(self.work_id, CONTEXT)
-        self.spec = WorkGoalUpdate(
-            work_id=self.work_id, obligation_id=self.ob, expected_etag=version.etag,
-            expected_definition_digest=version.definition_digest, goal=GOAL_REVIEW,
-        )
+        self.spec = WorkGoalUpdate(**{
+            "work_id": self.work_id, "obligation_id": self.ob, "expected_etag": version.etag,
+            "expected_definition_digest": version.definition_digest, "goal": GOAL_REVIEW, **(pinned or {}),
+        })
         self.references["current"] = self.spec
         self.effects.prepare(ToolIntent(operation_id="op-a", input_ref="current"), CONTEXT)
         prepared = self.data("operation", "op-a")
@@ -463,3 +466,286 @@ def test_another_authority_cannot_install_receiver_for_this_work():
     with pytest.raises(Problem) as error:
         ToolBrokerCore(other, clock=lambda: NOW, adapter=h.adapter.registration, execution_adapter=h.adapter)
     assert code(error) == "WORK_EFFECT_AUTHORITY_MISMATCH"
+
+
+def nested(h, kind, ids, path, value):
+    """Change one nested field of a retained row, keeping its other fields and material."""
+    data = copy.deepcopy(h.data(kind, *ids))
+    leaf = data
+    for name in path[:-1]:
+        leaf = leaf[name]
+    leaf[path[-1]] = value
+    h.mutate(kind, *ids, **{path[0]: data[path[0]]})
+
+
+ATTEMPT = ("attempt", ("op-a", "a"))
+DISPATCH = ("dispatch", ("op-a", "a"))
+RESPONSIBILITY = ("dispatch-obligation", ("op-a", "a"))
+OPERATION = ("operation", ("op-a",))
+GRANT = ("grant", ("grant",))
+POLICY = ("policy", ("policy",))
+BUDGET = ("budget", ("root",))
+DIGEST = "0" * 64
+OTHER_CONTEXT = {**CONTEXT.model_dump(mode="json"), "principal_id": "someone-else"}
+
+
+@pytest.mark.parametrize("row,path,value", [
+    (DISPATCH, ("context",), OTHER_CONTEXT),
+    (ATTEMPT, ("context",), OTHER_CONTEXT),
+    (DISPATCH, ("execution_contract",), "fa-context-one-send-1"),
+    (ATTEMPT, ("grant_id",), "other-grant"),
+    (DISPATCH, ("grant_id",), "other-grant"),
+    (DISPATCH, ("binding", "target"), "fa-work-state://other"),
+    (DISPATCH, ("consume_request_id",), DIGEST),
+    (RESPONSIBILITY, ("binding", "target"), "fa-work-state://other"),
+    (RESPONSIBILITY, ("consume_request_id",), DIGEST),
+    (RESPONSIBILITY, ("state",), "resolved"),
+    (RESPONSIBILITY, ("owner_record_id",), "owner-two"),
+    (RESPONSIBILITY, ("root_budget_id",), "other-root"),
+    (OPERATION, ("current_attempt_id",), "other-attempt"),
+    (OPERATION, ("unsettled_attempt_ids",), []),
+    (OPERATION, ("effect_state",), "applied"),
+    (ATTEMPT, ("effect_state",), "applied"),
+    (ATTEMPT, ("observation_sequence",), 1),
+])
+def test_receiver_requires_the_exact_existing_consumed_attempt(row, path, value):
+    h = EffectHarness()
+    delivery = h.stage()
+    before = h.work()
+    nested(h, *row, path, value)
+    count = h.submissions()
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(delivery, CONTEXT)
+    assert code(error) == "WORK_EFFECT_BINDING_DENIED"
+    assert h.submissions() == count and h.work() == before
+
+
+def test_receiver_requires_a_consumed_not_a_settled_dispatch():
+    h = EffectHarness()
+    delivery = h.stage()
+    h.mutate("dispatch", "op-a", "a", phase="settled", responsibility="resolved", effect_state="applied", result_digest=DIGEST)
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(delivery, CONTEXT)
+    assert code(error) == "WORK_EFFECT_BINDING_DENIED"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("description_digest", DIGEST), ("adapter_contract_digest", DIGEST), ("target", "fa-work-state://other"),
+    ("operation_id", "other-operation"), ("attempt_id", "other-attempt"), ("idempotency_key", DIGEST),
+])
+def test_receiver_rechecks_the_attempt_binding_itself_when_every_row_agrees(field, value):
+    h = EffectHarness()
+    delivery = h.stage()
+    for row in (ATTEMPT, DISPATCH, RESPONSIBILITY):
+        nested(h, *row, ("binding", field), value)
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(delivery, CONTEXT)
+    assert code(error) == "WORK_EFFECT_BINDING_DENIED"
+
+
+def rewrite_envelope(h, **updates):
+    """Forge the retained delivery with self-consistent material, past what a store write allows."""
+
+    envelope = h.receiver._envelope("op-a", "a").model_copy(update=updates)
+    row = "behavior:v1:row:" + effect_key("delivery", "op-a", "a")
+    entity = h.client.backing.rows[("Behavior", SCOPE.partition_key, row)]
+    payload = json.loads(entity["Payload"])
+    payload["data"] = envelope.model_dump(mode="json")
+    payload["material"] = _material(payload["data"]).model_dump(mode="json")
+    entity["Payload"] = json.dumps(payload).encode()
+    return envelope
+
+
+def test_receiver_requires_the_retained_delivery_it_read_before_the_transaction(monkeypatch):
+    h = EffectHarness()
+    delivery = h.stage()
+    original = h.receiver._envelope("op-a", "a")
+    rewrite_envelope(h, receiver_request=original.receiver_request.model_copy(update={"request_digest": DIGEST}))
+    monkeypatch.setattr(h.receiver, "_envelope", lambda *_: original)
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(delivery, CONTEXT)
+    assert code(error) == "WORK_EFFECT_BINDING_DENIED"
+
+
+def test_receiver_requires_the_prepared_material_and_its_own_receiver_request():
+    h = EffectHarness()
+    delivery = h.stage()
+    description = OperationDescription.model_validate_json(delivery.material.data)
+    changed = canonical_material(description.model_copy(update={"target": h.adapter.target("another-work")}))
+    forged = delivery.model_copy(update={"material": changed})
+    rewrite_envelope(h, command=forged)
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(forged, CONTEXT)
+    assert code(error) == "WORK_EFFECT_BINDING_DENIED"
+
+    h = EffectHarness()
+    delivery = h.stage()
+    request = h.receiver._envelope("op-a", "a").receiver_request.model_copy(update={"request_digest": DIGEST})
+    rewrite_envelope(h, receiver_request=request)
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(delivery, CONTEXT)
+    assert code(error) == "WORK_EFFECT_BINDING_DENIED"
+
+
+@pytest.mark.parametrize("row,path,value", [
+    (GRANT, ("grant_id",), "other-grant"),
+    (GRANT, ("revoked",), True),
+    (ATTEMPT, ("grant_revocation_revision",), 1),
+    (DISPATCH, ("grant_revocation_revision",), 1),
+    (GRANT, ("root_budget_id",), "other-root"),
+    (GRANT, ("description_digest",), DIGEST),
+    (GRANT, ("adapter_contract_digest",), DIGEST),
+    (GRANT, ("subjects",), [{"principal_id": "someone-else", "conversation_id": CONTEXT.conversation_id}]),
+    (GRANT, ("policy_id",), "other-policy"),
+    (POLICY, ("policy_id",), "other-policy"),
+    (GRANT, ("policy_revision",), 2),
+    (ATTEMPT, ("policy_revision",), 2),
+    (DISPATCH, ("policy_revision",), 2),
+    (BUDGET, ("root_budget_id",), "other-root"),
+    (ATTEMPT, ("reserved_units",), 2),
+])
+def test_receiver_rechecks_each_grant_policy_and_reservation_term(row, path, value):
+    h = EffectHarness()
+    delivery = h.stage()
+    before = h.work()
+    nested(h, *row, path, value)
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(delivery, CONTEXT)
+    assert code(error) == "WORK_EFFECT_GRANT_DENIED"
+    assert h.work() == before
+
+
+def seed_admission(h):
+    h.store.transact(
+        ControlRequest(request_id="seed-admission", request_digest=hashlib.sha256(b"admission").hexdigest()),
+        lambda _: ControlChanges(writes=(ControlWrite(
+            row_id=worker_key("admission", h.ob), mode="create", data={"job_id": "later-job"},
+        ),), result={"synthetic_only": True}),
+    )
+
+
+def test_receiver_refuses_work_already_bound_to_an_execution():
+    h = EffectHarness()
+    delivery = h.stage()
+    before = h.work()
+    seed_admission(h)
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(delivery, CONTEXT)
+    assert code(error) == "WORK_EFFECT_EXECUTION_BOUND"
+    assert h.work() == before
+
+
+def requeue_with(h, **definition):
+    """A self-consistent queued definition, identity row included."""
+    changed = {**h.work()["definition"], **definition}
+    digest = _digest(changed)
+    h.mutate("delivery-work-state", h.ob, definition=changed, definition_digest=digest)
+    h.mutate("delivery-work", h.work_id, definition_digest=digest)
+
+
+def forge_identity(h):
+    """A second identity row claiming the same obligation, for a server reference naming it."""
+    identity = h.raw("delivery-work", h.work_id)
+    h.store.transact(
+        ControlRequest(request_id="seed-identity", request_digest=hashlib.sha256(b"identity").hexdigest()),
+        lambda _: ControlChanges(writes=(ControlWrite(
+            row_id=control_key("delivery-work", "forged-work"), mode="create",
+            data={**identity["data"], "work_id": "forged-work"},
+        ),), result={"synthetic_only": True}),
+    )
+
+
+@pytest.mark.parametrize("change", [
+    "fulfilled", "final-delivery", "pinned-definition", "same-goal", "terminal", "another-work",
+])
+def test_receiver_refuses_a_queued_work_other_than_the_pinned_revision(change):
+    if change == "pinned-definition":
+        h = EffectHarness(pinned={"expected_definition_digest": DIGEST})
+    elif change == "terminal":
+        h = EffectHarness(before_pin=lambda fixture: fixture.work_result(fixture.ob))
+    elif change == "another-work":
+        h = EffectHarness(also_allowed=("forged-work",), before_pin=forge_identity, pinned={"work_id": "forged-work"})
+    elif change == "same-goal":
+        h = EffectHarness(before_pin=lambda fixture: requeue_with(fixture, goal=GOAL_REVIEW))
+    else:
+        h = EffectHarness()
+    delivery = h.stage()
+    if change == "fulfilled":
+        h.mutate("delivery-obligation", h.ob, fulfillment="fulfilled")
+    elif change == "final-delivery":
+        h.mutate("delivery-obligation", h.ob, final_delivery_id="delivery-one")
+    before = h.work()
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(delivery, CONTEXT)
+    assert code(error) == "WORK_EFFECT_REVISION_CONFLICT"
+    assert h.work() == before
+
+FUTURE = (NOW + timedelta(seconds=5)).isoformat()
+PAST = (NOW - timedelta(seconds=5)).isoformat()
+
+
+@pytest.mark.parametrize("row,path,value", [
+    (GRANT, ("not_before",), FUTURE),
+    (ATTEMPT, ("authorized_at",), FUTURE),
+    (ATTEMPT, ("not_after",), PAST),
+    (GRANT, ("expires_at",), NOW.isoformat()),
+    (("delivery-obligation", None), ("deadline",), PAST),
+    (DISPATCH, ("gated_at",), (NOW + timedelta(seconds=1)).isoformat()),
+], ids=["grant-not-yet", "authorized-later", "attempt-expired", "grant-expired", "obligation-expired", "gated-later"])
+def test_receiver_window_is_the_tightest_of_every_saved_bound(row, path, value):
+    h = EffectHarness()
+    delivery = h.stage()
+    before = h.work()
+    nested(h, row[0], row[1] or (h.ob,), path, value)
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(delivery, CONTEXT)
+    assert code(error) == "OPERATION_DISPATCH_WINDOW_CLOSED"
+    assert h.work() == before
+
+
+@pytest.mark.parametrize("first,second,expected", [
+    ("binding", "grant", "WORK_EFFECT_BINDING_DENIED"),
+    ("grant", "scope", "WORK_EFFECT_GRANT_DENIED"),
+    ("scope", "identity", "DELIVERY_SCOPE_DENIED"),
+    ("identity", "admission", "WORK_EFFECT_WORK_INVALID"),
+    ("admission", "revision", "WORK_EFFECT_EXECUTION_BOUND"),
+    ("revision", "window", "WORK_EFFECT_REVISION_CONFLICT"),
+])
+def test_receiver_gates_stay_in_their_original_order(first, second, expected):
+    h = EffectHarness()
+    delivery = h.stage()
+    faults = {
+        "binding": lambda: h.mutate("attempt", "op-a", "a", effect_state="applied"),
+        "grant": lambda: h.mutate("grant", "grant", revoked=True),
+        "scope": lambda: h.mutate("delivery-obligation", h.ob, root_budget_id="other-root"),
+        "identity": lambda: h.mutate("delivery-work", h.work_id, event_id="other-event"),
+        "admission": lambda: seed_admission(h),
+        "revision": lambda: h.mutate("delivery-work-state", h.ob, state="queued"),
+        "window": lambda: setattr(h, "time", NOW + timedelta(seconds=2)),
+    }
+    faults[first]()
+    faults[second]()
+    with pytest.raises(Problem) as error:
+        h.receiver.receive(delivery, CONTEXT)
+    assert code(error) == expected
+
+
+def test_receiver_receipt_records_exactly_what_it_checked():
+    h = EffectHarness()
+    delivery = h.stage()
+    dispatch, attempt = h.data("dispatch", "op-a", "a"), h.data("attempt", "op-a", "a")
+    receipt = h.receiver.receive(delivery, CONTEXT)
+    result = receipt.payload["result"]
+    proof = result["receipt"]
+    assert set(result) == {"receipt", "receiver_receipt_digest", "effect_state"} and result["effect_state"] == "applied"
+    assert result["receiver_receipt_digest"] == _material(proof).sha256 == h.material("work-effect-receipt", "op-a", "a").sha256
+    assert proof["receipt_id"] == effect_key("receipt", "op-a", "a")
+    assert proof["request_id"] == effect_key("receive", "op-a", "a")
+    assert proof["consume_request_id"] == delivery.consume_request_id
+    assert proof["binding"] == attempt["binding"] == dispatch["binding"]
+    assert (proof["work_id"], proof["obligation_id"]) == (h.work_id, h.ob)
+    assert proof["applied_state_digest"] == _digest(h.work())
+    assert proof["owner_epoch"] == CONTEXT.epoch and proof["approval_id"] == "trusted-human-approval"
+    assert (proof["grant_revocation_revision"], proof["policy_revision"]) == (0, 1)
+    assert proof["receiver_checked_at"] == NOW.isoformat().replace("+00:00", "Z")
+    assert proof["receiver_not_after"] == dispatch["not_after"]

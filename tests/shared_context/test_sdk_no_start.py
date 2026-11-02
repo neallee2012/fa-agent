@@ -608,3 +608,110 @@ def test_legacy_execution_and_report_bytes_do_not_gain_no_sdk_fields():
     for model, document in ((LocalExecution, execution), (HostedReportBody, report)):
         original = json.dumps(document, separators=(",", ":"))
         assert model.model_validate_json(original).model_dump_json() == original
+
+
+def no_sdk_reported(c, monkeypatch):
+    observed = close_native_entry(c, monkeypatch)
+    probe, body = report_packet(c, observed)
+    response = post_native_report(c, probe, body)
+    assert response.status_code == 200
+    return SimpleNamespace(launch_id=c.starts[0].launch_id, evidence_id=response.json()["evidence_id"],
+                           execution=c.h.workers.inspect(c.binding.job_id).binding)
+
+
+def saved_row(c, row_key, change):
+    """Rewrite one saved row as storage damage would, keeping its inline material matching."""
+    from shared_context.behavior_delivery import _material
+    entity = c.h.transport.backing.rows[(c.h.store._scope.table_name, c.h.store._scope.partition_key,
+                                         "behavior:v1:row:" + row_key)]
+    payload = json.loads(entity["Payload"])
+    change(payload["data"])
+    if payload["material"] is not None:
+        payload["material"] = _material(payload["data"]).model_dump(mode="json")
+    entity["Payload"] = json.dumps(payload).encode()
+    return payload["data"]
+
+
+def saved_gate(c, saved, change):
+    from shared_context.behavior_delivery import _digest
+    report = saved_row(c, native_key("report", saved.evidence_id), lambda data: change(data["sdk_no_start"]["gate"]))
+    saved_row(c, native_key("evidence", saved.evidence_id), lambda data: data.update(report_digest=_digest(report)))
+
+
+def assigned_task(c, saved, change):
+    """Rewrite the assigned input (never re-read by a running turn) and return the new task's digest."""
+    from shared_context.behavior_assistant_wire import Task
+    from shared_context.behavior_delivery import _digest
+    launch = c.native.launch(saved.launch_id)
+    task = Task.model_validate_json(launch.start.input)
+    task = task.model_copy(update=change(task))
+    start = launch.start.model_copy(update={"input": task.model_dump_json().encode()}).model_dump(mode="json")
+    saved_row(c, native_key("launch", saved.launch_id), lambda data: data.update(start=start))
+    return _digest(task.model_dump(mode="json"))
+
+
+def refused_reconcile(c, saved):
+    with pytest.raises(Problem) as caught:
+        c.native.reconcile_sealed(saved.execution)
+    assert (caught.value.status, caught.value.body["error"]["code"]) == (403, "NATIVE_TERMINAL_INVALID")
+    assert caught.value.body["error"]["message"] == "retained native exit/claim fence is inconsistent"
+
+
+@pytest.mark.parametrize("part,field,value", [
+    ("binding", "task_digest", "f" * 64), ("binding", "profile_digest", "f" * 64),
+    ("binding", "execution_digest", "f" * 64), ("binding", "worker_configuration_digest", "f" * 64),
+    ("owner", "launch_id", "another-launch"), ("owner", "claim_id", "another-claim"),
+    ("owner", "supervisor_id", "another-supervisor"), ("owner", "process_generation", 9),
+])
+def test_a_retained_no_sdk_gate_must_still_name_the_original_turn_and_owner(native_no_start, monkeypatch, part, field, value):
+    c = native_no_start
+    saved = no_sdk_reported(c, monkeypatch)
+    saved_gate(c, saved, lambda gate: gate[part].update({field: value}))
+    refused_reconcile(c, saved)
+
+
+def test_a_retained_no_sdk_gate_passes_with_nothing_changed(native_no_start, monkeypatch):
+    c = native_no_start
+    saved = no_sdk_reported(c, monkeypatch)
+    saved_gate(c, saved, lambda gate: None)
+    assert c.native.reconcile_sealed(saved.execution)
+
+
+def test_a_retained_no_sdk_disposition_cannot_follow_a_started_child(native_no_start, monkeypatch):
+    c = native_no_start
+    saved = no_sdk_reported(c, monkeypatch)
+    saved_row(c, native_key("launch", saved.launch_id), lambda data: data.update(child_pid=7))
+    refused_reconcile(c, saved)
+
+
+def test_a_retained_no_sdk_disposition_is_only_for_an_assistant_workload(native_no_start, monkeypatch):
+    c = native_no_start
+    saved = no_sdk_reported(c, monkeypatch)
+    grant = c.native.launch(saved.launch_id).grant_id
+    saved_row(c, native_key("launch", saved.launch_id), lambda data: data.update(workload_version="checksum-count-v1"))
+    saved_row(c, native_key("grant", grant), lambda data: data.update(workload_version="checksum-count-v1"))
+    refused_reconcile(c, saved)
+
+
+def test_a_retained_no_sdk_disposition_is_only_a_failure(native_no_start, monkeypatch):
+    c = native_no_start
+    saved = no_sdk_reported(c, monkeypatch)
+    saved_row(c, native_key("evidence", saved.evidence_id), lambda data: data["evidence"].update(state="stopped"))
+    refused_reconcile(c, saved)
+
+
+def test_a_retained_no_sdk_gate_must_match_the_tasks_start_profile(native_no_start, monkeypatch):
+    c = native_no_start
+    saved = no_sdk_reported(c, monkeypatch)
+    digest = assigned_task(c, saved, lambda task: {
+        "instruction": task.instruction.model_copy(update={"sdk_start_profile": None})})
+    saved_gate(c, saved, lambda gate: gate["binding"].update(task_digest=digest))
+    refused_reconcile(c, saved)
+
+
+def test_a_retained_no_sdk_gate_needs_an_instruction_task(native_no_start, monkeypatch):
+    c = native_no_start
+    saved = no_sdk_reported(c, monkeypatch)
+    digest = assigned_task(c, saved, lambda task: {"instruction": None})
+    saved_gate(c, saved, lambda gate: gate["binding"].update(task_digest=digest))
+    refused_reconcile(c, saved)

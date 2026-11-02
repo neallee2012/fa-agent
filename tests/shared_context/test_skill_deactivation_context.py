@@ -62,20 +62,20 @@ def test_loaded_skill_deactivation_fences_sources_not_independent_operation_gran
         assistant, signing_key, jwk_client, profile):
     external = configure_read_operation(assistant, signing_key, jwk_client)
     h, control, human, source = configure_guidance(assistant, signing_key, jwk_client, profile)
-    receipts, calls, at_effect = [], [], {}
+    receipts, calls = [], []
 
     def change_source(_scope):
-        assert not receipts
-        at_effect.update(h.store.read_snapshot((control.cost_key,)))
-        receipts.append(deactivate_original(h, signing_key, jwk_client, source))
+        if not receipts:
+            receipts.append(deactivate_original(h, signing_key, jwk_client, source))
         return SimpleNamespace(token="OFFLINE_DEACTIVATION_PROVIDER")
 
-    def forbidden_provider(_request):
-        calls.append(True)
-        raise AssertionError("A deactivated source must not be sent to the provider")
+    def provider_dispatch(request):
+        calls.append(json.loads(request.content)["messages"][-1]["content"])
+        return httpx.Response(200, content=b'data: {"choices":[{"delta":{"content":"in-flight"}}]}\n\n'
+                              b'data: [DONE]\n\n', headers={"content-type": "text/event-stream"})
 
     provider = AssistantProvider("https://provider.invalid/openai/v1/chat/completions",
-        SimpleNamespace(get_token=change_source), transport=httpx.MockTransport(forbidden_provider))
+        SimpleNamespace(get_token=change_source), transport=httpx.MockTransport(provider_dispatch))
     h.app = create_assistant_app(h.assistant, h.verifier, provider=provider)
     install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier,
         installation=lambda: None, require_current_native_evidence=lambda: None))
@@ -100,11 +100,11 @@ def test_loaded_skill_deactivation_fences_sources_not_independent_operation_gran
         later_id = digest(later_body)
         assert turn.client.reserve_model(original_id).state == "accepted"
         assert turn.client.reserve_model(later_id).state == "accepted"
-        denied = post_skill(turn, {"request_id": original_id, "body": body}, action="model")
-        assert denied.status_code == 403
-        assert denied.headers["x-behavior-model-upstream-error-code"] == "SKILL_SOURCE_CHANGED"
-        assert len(receipts) == 1 and calls == []
-        assert h.store.read_snapshot((control.cost_key,)) == at_effect
+        # The deactivation lands inside this dispatch, after its consume CAS gate: inside the seconds-level window
+        # the original request is sent once; every later read, catalog and reserve below is refused.
+        sent = post_skill(turn, {"request_id": original_id, "body": body}, action="model")
+        assert sent.status_code == 200
+        assert len(receipts) == 1 and calls == ["Use only current permitted sources."]
         preserved_keys = (key("session", turn.assignment.session_id),
                           key("model-intent", turn.assignment.session_id, original_id),
                           key("model-intent", turn.assignment.session_id, later_id), control.cost_key)
@@ -119,10 +119,16 @@ def test_loaded_skill_deactivation_fences_sources_not_independent_operation_gran
         reserve = post_skill(turn, {"request_id": fresh_id, "request_sha256": fresh_id}, action="reserve-model")
         consume = post_skill(turn, {"request_id": later_id, "body": later_body}, action="model")
         repeat = post_skill(turn, {"request_id": original_id, "body": body}, action="model")
-        assert [response.status_code for response in (catalog, read, reserve, consume, repeat)] == [403] * 5
+        # A request reserved before the deactivation is inside the same window and goes out once (README, 撤權的秒級窗口);
+        # the already-sent request is never resent.
+        assert [response.status_code for response in (catalog, read, reserve, consume, repeat)] == [403, 403, 403, 200, 409]
         assert "SK06_UNTRUSTED_GUIDANCE_CANARY" not in read.text
-        assert h.store.read_snapshot(preserved_keys) == preserved
-        assert protected_rows(turn) == original_operation and external == [] and calls == []
+        after = h.store.read_snapshot(preserved_keys)
+        assert after[preserved_keys[0]] == preserved[preserved_keys[0]]
+        assert after[preserved_keys[1]] == preserved[preserved_keys[1]]
+        assert after[preserved_keys[2]].payload["data"]["consumed"] is True
+        assert protected_rows(turn) == original_operation and external == []
+        assert calls == ["Use only current permitted sources.", "Original second reservation."]
         assert h.assistant.skills.catalog(A, A.team, (NAME,)).entries == ()
         fresh_key = key("model-intent", turn.assignment.session_id, fresh_id)
         assert h.store.read_snapshot((fresh_key,))[fresh_key] is None

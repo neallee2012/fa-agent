@@ -12,8 +12,10 @@ import pytest
 
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_foundry import (
-    SESSION_LOST, STOP_ACCEPTED, FoundryExecutor, _NativeLaunch, _TargetReservation, lost_session_failure, native_key,
+    SESSION_LOST, SESSION_VERSION_CHANGED, STOP_ACCEPTED, FoundryExecutor, _NativeLaunch, _TargetReservation,
+    _lost_session_result, _version_refusal_result, lost_session_failure, native_key,
 )
+from shared_context.behavior_delivery import _digest, _json
 from shared_context.behavior_migration import MigrationStore, installed_origin
 from shared_context.behavior_operations import _parse
 from shared_context.behavior_workers import worker_key
@@ -23,6 +25,21 @@ from test_conversation_transfer_startup import (
 )
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key
+
+
+@pytest.mark.parametrize("build,kind,code", [
+    (_lost_session_result, "lost-session-result", SESSION_LOST),
+    (_version_refusal_result, "version-refusal-result", SESSION_VERSION_CHANGED),
+])
+def test_a_closed_turn_keeps_its_own_evidence_id_and_failure_notice(build, kind, code):
+    launch = SimpleNamespace(launch_id="launch-1", start=SimpleNamespace(binding=SimpleNamespace(work_id="work-1")),
+                             definition=SimpleNamespace(model_dump=lambda mode: {"mode": mode}))
+    result = build(launch, {"proof": 1}, "verifier-1")
+    assert result.evidence_id == native_key(kind, "launch-1") and result.verifier_version == "verifier-1"
+    assert (result.work_id, result.state, result.passed_checks) == ("work-1", "failed", ())
+    assert result.definition_digest == _digest({"mode": "json"}) and result.proof == _json({"proof": 1})
+    assert json.loads(result.content) == {"schema_version": "fa-assistant-notice-v1", "state": "failed",
+                                          "code": code, "sdk_reply_available": False}
 
 
 class LostHostedClient(SyntheticSessionClient):

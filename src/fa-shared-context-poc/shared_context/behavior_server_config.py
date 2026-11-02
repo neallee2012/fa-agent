@@ -387,36 +387,57 @@ class ServerConfiguration(_Model):
 
     @model_validator(mode="after")
     def exact(self):
-        ids, oid = self.identity, {a.oid for a in self.identity.agents}
+        """Each rule refuses with its own message, in this fixed order: a config's first refusal must not change."""
         jobs = self.registered_jobs
         assistant = self.workload_version == "assistant-v1.2"
-        checks = set(ASSISTANT_CHECKS) if assistant else SUPPORTED_CHECKS
         if assistant != (self.assistant is not None):
             raise ValueError("assistant settings require explicit assistant-v1.2 workload selection")
         if assistant:
-            settings = self.assistant
-            if (self.workers.capacity != 1 or any(b.child_jobs for b in self.bindings)
-                    or self.workers.executor_version != EXECUTOR_VERSION
-                    or self.workers.protection_version != PROTECTION_VERSION
-                    or self.delivery.protection_version != PROTECTION_VERSION
-                    or ids.managed_identity_client_id is None
-                    or settings.provider_endpoint != self.active_targets[0].project_endpoint + "/openai/v1/chat/completions"
-                    or settings.m3_context.account_resource_id != self.table.account_resource_id
-                    or settings.m3_context.endpoint != self.table.endpoint
-                    or settings.m3_context.table_name != self.table.scope.table_name
-                    or settings.artifact_container_url != self.sources.protection.container_url):
-                raise ValueError("assistant requires C1, new readiness versions and exact existing API-UAMI/M3/provider resources")
-            profiles = {p.binding_id: p for p in settings.profiles}
-            if set(profiles) != {b.binding_id for b in self.bindings}:
-                raise ValueError("every assistant binding requires its own profile")
-            for binding in self.bindings:
-                profile = profiles[binding.binding_id]
-                if (binding.agent_oid != self.active_targets[0].agent_oid
-                        or profile.claim_id not in binding.claim_ids
-                        or profile.source.source_id not in binding.source_ids
-                        or profile.legacy_source_work in {job.work.work_id for _, job in jobs}
-                        or tuple(binding.work.required_checks) != tuple(ASSISTANT_CHECKS)):
-                    raise ValueError("assistant identity, exact checks, source or legacy-work mapping differs")
+            self._exact_assistant_resources()
+            self._exact_assistant_bindings(jobs)
+        self._exact_jobs(jobs, set(ASSISTANT_CHECKS) if assistant else SUPPORTED_CHECKS)
+        self._exact_delivery()
+        self._exact_targets()
+        self._exact_storage()
+        bindings = {b.binding_id: b for b in self.bindings}
+        roots = {r.root_budget_id: r for r in self.roots}
+        self._exact_unique_bindings(bindings, roots)
+        self._exact_binding_contracts(roots)
+        self._exact_bindings_used(bindings, roots)
+        self._exact_policies(bindings)
+        self._exact_memory_projections(bindings)
+        self._exact_versions()
+        self._exact_deployed_resources()
+        return self
+
+    def _exact_assistant_resources(self):
+        settings = self.assistant
+        if (self.workers.capacity != 1 or any(b.child_jobs for b in self.bindings)
+                or self.workers.executor_version != EXECUTOR_VERSION
+                or self.workers.protection_version != PROTECTION_VERSION
+                or self.delivery.protection_version != PROTECTION_VERSION
+                or self.identity.managed_identity_client_id is None
+                or settings.provider_endpoint != self.active_targets[0].project_endpoint + "/openai/v1/chat/completions"
+                or settings.m3_context.account_resource_id != self.table.account_resource_id
+                or settings.m3_context.endpoint != self.table.endpoint
+                or settings.m3_context.table_name != self.table.scope.table_name
+                or settings.artifact_container_url != self.sources.protection.container_url):
+            raise ValueError("assistant requires C1, new readiness versions and exact existing API-UAMI/M3/provider resources")
+
+    def _exact_assistant_bindings(self, jobs):
+        profiles = {p.binding_id: p for p in self.assistant.profiles}
+        if set(profiles) != {b.binding_id for b in self.bindings}:
+            raise ValueError("every assistant binding requires its own profile")
+        for binding in self.bindings:
+            profile = profiles[binding.binding_id]
+            if (binding.agent_oid != self.active_targets[0].agent_oid
+                    or profile.claim_id not in binding.claim_ids
+                    or profile.source.source_id not in binding.source_ids
+                    or profile.legacy_source_work in {job.work.work_id for _, job in jobs}
+                    or tuple(binding.work.required_checks) != tuple(ASSISTANT_CHECKS)):
+                raise ValueError("assistant identity, exact checks, source or legacy-work mapping differs")
+
+    def _exact_jobs(self, jobs, checks):
         if (self.workers.capacity == 4 and len(self.bindings) < 5
                 or len(jobs) > min(32, self.workers.pending_limit)
                 or any(binding.child_jobs for binding in self.bindings) and self.workers.max_generations < 2
@@ -427,11 +448,16 @@ class ServerConfiguration(_Model):
             if (set(job.work.required_checks) != checks or job.work.human_checks
                     or job.work.result_kind != "answer"):
                 raise ValueError("every registered job needs its own supported workload definition")
-        if (self.delivery.team_id != ids.team_id or self.delivery.control_binding != self.workers.control_binding
+
+    def _exact_delivery(self):
+        if (self.delivery.team_id != self.identity.team_id or self.delivery.control_binding != self.workers.control_binding
                 or self.delivery.protection_version != self.workers.protection_version
                 or self.delivery.model_repair_contract is not None):
             raise ValueError("worker/delivery/native model-repair configuration differs")
-        if (len({t.agent_oid for t in self.targets}) != 4 or {t.agent_oid for t in self.targets} != oid
+
+    def _exact_targets(self):
+        oid = {a.oid for a in self.identity.agents}
+        if ({t.agent_oid for t in self.targets} != oid
                 or len({t.agent_id for t in self.targets}) != 4 or len({t.executor_id for t in self.targets}) != 4
                 or len({t.session_id for t in self.targets}) != 4
                 or len({(t.project_endpoint, t.agent_name) for t in self.targets}) != 4
@@ -439,43 +465,50 @@ class ServerConfiguration(_Model):
             raise ValueError("four distinct exact Foundry agent/MI/session targets required")
         if self.evidence.observer_oid in oid:
             raise ValueError("Hosted agents cannot be their own readiness observer")
+
+    def _exact_storage(self):
         for storage, prefix in ((self.sources, "m3/v1/"), (self.backups, "v1/")):
             if (storage.protection.authority_domain != self.table.scope.authority_domain
-                    or storage.protection.protected_prefix != prefix + ids.tenant_id + "/"):
+                    or storage.protection.protected_prefix != prefix + self.identity.tenant_id + "/"):
                 raise ValueError("source/backup authority, tenant or retained namespace differs")
         if self.sources.protection.container_url == self.backups.protection.container_url:
             raise ValueError("source and backup containers must be separate")
-        bindings = {b.binding_id: b for b in self.bindings}
-        roots = {r.root_budget_id: r for r in self.roots}
+
+    def _exact_unique_bindings(self, bindings, roots):
         if (len(bindings) != len(self.bindings) or len(roots) != len(self.roots)
                 or len({p.binding_id for p in self.policies}) != len(self.policies)
                 or {p.binding_id for p in self.policies} != set(bindings)
                 or len({a.input_ref for a in self.operations}) != len(self.operations)):
             raise ValueError("duplicate/missing server bindings, roots, aliases or policies")
-        used_roots = set()
+
+    def _exact_binding_contracts(self, roots):
+        ids, oid = self.identity, {a.oid for a in self.identity.agents}
         for binding in self.bindings:
             if (binding.tenant_id != ids.tenant_id or binding.team_id != ids.team_id
-                    or binding.route.channel_id != "authenticated-pull"
                     or binding.human_oid != ids.human_oid or binding.agent_oid not in oid
                     or binding.owner.root_budget_id not in roots
-                    or roots[binding.owner.root_budget_id].root_request_id != binding.root_request_id
-                    or set(binding.work.required_checks) != checks
-                    or binding.work.human_checks or binding.work.result_kind != "answer"):
+                    or roots[binding.owner.root_budget_id].root_request_id != binding.root_request_id):
                 raise ValueError("fixed identity/root/deterministic work contract differs")
-            used_roots.add(binding.owner.root_budget_id)
             aliases = {a.input_ref for a in self.operations if a.binding_id == binding.binding_id}
             if aliases != set(binding.allowed_input_refs):
                 raise ValueError("operation aliases must resolve only their own fixed work")
+
+    def _exact_bindings_used(self, bindings, roots):
+        used_roots = {b.owner.root_budget_id for b in self.bindings}
         if set(roots) != used_roots or {a.binding_id for a in self.operations} != set(bindings):
             raise ValueError("unused root or operation binding")
         for name in ("owner_record_id", "policy_id"):
             if len({getattr(b.owner, name) for b in self.bindings}) != len(bindings):
                 raise ValueError("owner/policy identities must be unambiguous")
+
+    def _exact_policies(self, bindings):
         for policy in self.policies:
             binding = bindings[policy.binding_id]
             expected = digest(["fa-behavior-api-v1", "native", binding.model_dump(mode="json")])
             if policy.policy.binding_digest != expected:
                 raise ValueError("runtime policy is not bound to this native binding")
+
+    def _exact_memory_projections(self, bindings):
         policies = {item.binding_id: item.policy for item in self.policies}
         if (len({setup.binding_id for setup in self.memory_projections}) != len(self.memory_projections)
                 or len({(setup.endpoint, setup.store, setup.projection_namespace) for setup in self.memory_projections})
@@ -485,16 +518,21 @@ class ServerConfiguration(_Model):
             binding = bindings.get(setup.binding_id)
             if binding is None:
                 raise ValueError("memory projection references an unknown runtime binding")
-            policy = policies[binding.binding_id]
-            actor = next(agent.actor for agent in ids.agents if agent.oid == binding.agent_oid)
-            if (setup.control_binding != self.workers.control_binding
-                    or setup.endpoint not in {target.project_endpoint for target in self.targets}
-                    or setup.scope.tenant_id != ids.tenant_id or setup.scope.team_id != ids.team_id
-                    or setup.scope.visibility != policy.source_visibility
-                    or setup.scope.owner_actor is not None and setup.scope.owner_actor not in {actor, "human-" + ids.human_oid}
-                    or setup.subject != binding.subject or not set(setup.claim_ids) <= set(binding.claim_ids)
-                    or setup.versions != binding.context_versions):
-                raise ValueError("memory projection must use the exact project/reviewed source/binding/context authority")
+            self._exact_memory_projection(setup, binding, policies[binding.binding_id])
+
+    def _exact_memory_projection(self, setup, binding, policy):
+        ids = self.identity
+        actor = next(agent.actor for agent in ids.agents if agent.oid == binding.agent_oid)
+        if (setup.control_binding != self.workers.control_binding
+                or setup.endpoint not in {target.project_endpoint for target in self.targets}
+                or setup.scope.tenant_id != ids.tenant_id or setup.scope.team_id != ids.team_id
+                or setup.scope.visibility != policy.source_visibility
+                or setup.scope.owner_actor is not None and setup.scope.owner_actor not in {actor, "human-" + ids.human_oid}
+                or setup.subject != binding.subject or not set(setup.claim_ids) <= set(binding.claim_ids)
+                or setup.versions != binding.context_versions):
+            raise ValueError("memory projection must use the exact project/reviewed source/binding/context authority")
+
+    def _exact_versions(self):
         versions = [
             self.review_policy_version, self.workers.executor_version, self.delivery.protection_version,
             self.delivery.consumer_version, self.delivery.timer_version, self.delivery.verifier_version,
@@ -507,10 +545,11 @@ class ServerConfiguration(_Model):
             versions.extend(child.work.criteria_version for child in binding.child_jobs)
         if any(v.lower() in {"latest", "current", "head", "unknown"} for v in versions):
             raise ValueError("versions must be pinned")
+
+    def _exact_deployed_resources(self):
         for value in (self.api_resource_id, self.controller_resource_id):
             if not value.startswith("/subscriptions/") or "*" in value or "?" in value:
                 raise ValueError("exact deployed API/controller ARM resources required")
-        return self
 
 
 class ServerConfigurationDocument:

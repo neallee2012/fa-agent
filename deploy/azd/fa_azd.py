@@ -622,29 +622,28 @@ def _prefix(subnet: dict[str, Any]) -> Any:
     return ipaddress.ip_network((properties.get("addressPrefixes") or [properties.get("addressPrefix")])[0])
 
 
-def check_existing_vnet(ctx: Context, mode: str, account: dict[str, Any] | None) -> None:
-    """Read only (ADR-0010 phase 2b): the user's VNet and its three subnets meet what the Foundry injection, the
-    Container Apps environment and the private endpoints need, and nothing else uses them. Never writes the VNet;
-    egress (NAT or a route to a firewall) is the user's, so its absence only warns."""
-    dns = ctx.get("FA_DNS_MODE", "azd")
-    if dns not in DNS_MODES:
-        raise Stop(f"FA_DNS_MODE must be azd or existing, not '{dns}'; nothing was changed")
-    injected = [item.get("subnetArmId") or "" for item in _properties(account).get("networkInjections") or []
-                if item.get("scenario") == "agent"]
-    vnet_id = ctx.get("FA_VNET_RESOURCE_ID")
-    if vnet_id is None:
-        extra = [key for key in SUBNET_INPUTS if ctx.get(key)] + (["FA_DNS_MODE=existing"] if dns == "existing" else [])
-        if extra:
-            raise Stop(f"{', '.join(extra)} only apply with an existing VNet (FA_VNET_RESOURCE_ID); FA's own VNet has "
-                       "fixed subnet names and its own DNS zones. Set FA_VNET_RESOURCE_ID or clear them; nothing was "
-                       "changed")
-        own = (f"/subscriptions/{ctx.need('AZURE_SUBSCRIPTION_ID')}/resourceGroups/{ctx.group}/providers/"
-               f"Microsoft.Network/virtualNetworks/vnet-{ctx.env}/subnets/snet-agents")
-        if injected and own.lower() not in (item.lower() for item in injected):
-            raise Stop(f"Foundry account {account.get('name')} was created injected into {', '.join(injected)}, not "
-                       f"FA's own vnet-{ctx.env}, and injection cannot change: set FA_VNET_RESOURCE_ID (and the subnet "
-                       "names) back to that VNet; nothing was changed")
-        return
+def _overlaps_reserved(network: Any) -> bool:
+    return any(network.overlaps(reserved) for reserved in APP_RESERVED)
+
+
+def _check_own_vnet(ctx: Context, dns: str, account: dict[str, Any] | None, injected: list[str]) -> None:
+    """Without FA_VNET_RESOURCE_ID no existing-VNet input applies, and an injected account must be in FA's own VNet."""
+    extra = [key for key in SUBNET_INPUTS if ctx.get(key)] + (["FA_DNS_MODE=existing"] if dns == "existing" else [])
+    if extra:
+        raise Stop(f"{', '.join(extra)} only apply with an existing VNet (FA_VNET_RESOURCE_ID); FA's own VNet has "
+                   "fixed subnet names and its own DNS zones. Set FA_VNET_RESOURCE_ID or clear them; nothing was "
+                   "changed")
+    own = (f"/subscriptions/{ctx.need('AZURE_SUBSCRIPTION_ID')}/resourceGroups/{ctx.group}/providers/"
+           f"Microsoft.Network/virtualNetworks/vnet-{ctx.env}/subnets/snet-agents")
+    if injected and own.lower() not in (item.lower() for item in injected):
+        raise Stop(f"Foundry account {account.get('name')} was created injected into {', '.join(injected)}, not "
+                   f"FA's own vnet-{ctx.env}, and injection cannot change: set FA_VNET_RESOURCE_ID (and the subnet "
+                   "names) back to that VNet; nothing was changed")
+
+
+def _accept_vnet_id(ctx: Context, mode: str, vnet_id: str) -> tuple[str, str, str]:
+    """Refuse a VNet ID this environment cannot use (mode, NAT, shape, subscription, group); else its subscription,
+    group and name. Reads nothing."""
     if mode != "private":
         raise Stop("FA_VNET_RESOURCE_ID needs FA_NETWORK_MODE=private (an existing VNet is for the injected Foundry "
                    "account); nothing was changed")
@@ -662,6 +661,10 @@ def check_existing_vnet(ctx: Context, mode: str, account: dict[str, Any] | None)
     if group.lower() == ctx.group.lower():
         raise Stop(f"VNet {name} is in {ctx.group}, the resource group `azd down` deletes with everything in it. Use "
                    "a VNet in another resource group; nothing was changed")
+    return subscription, group, name
+
+
+def _subnet_names(ctx: Context) -> dict[str, str]:
     names = {key: ctx.get(key, default) for key, default in SUBNET_INPUTS.items()}
     if len({value.lower() for value in names.values()}) != len(names):
         raise Stop(f"the API, agent and private endpoint subnets must be three different subnets "
@@ -669,6 +672,17 @@ def check_existing_vnet(ctx: Context, mode: str, account: dict[str, Any] | None)
                    "Apps needs its own; nothing was changed")
     if len(names["FA_AGENT_SUBNET_NAME"].encode("utf-8")) > 63:
         raise Stop("FA_AGENT_SUBNET_NAME must be at most 63 bytes (Foundry Agent Service limit); nothing was changed")
+    return names
+
+
+def _check_address_space(vnet: dict[str, Any], name: str) -> None:
+    for prefix in (_properties(vnet).get("addressSpace") or {}).get("addressPrefixes") or []:
+        if _overlaps_reserved(ipaddress.ip_network(prefix)):
+            raise Stop(f"VNet {name} address space {prefix} overlaps a range Container Apps and Foundry reserve "
+                       f"({', '.join(map(str, APP_RESERVED))}); nothing was changed")
+
+
+def _check_vnet(ctx: Context, vnet_id: str, name: str, dns: str) -> None:
     vnet = ctx.az("rest", "--method", "get", "--url", f"{vnet_id}?{NETWORK_API}", missing_ok=True)
     if vnet is None:
         raise Stop(f"VNet {vnet_id} was not found; check FA_VNET_RESOURCE_ID; nothing was changed")
@@ -676,37 +690,45 @@ def check_existing_vnet(ctx: Context, mode: str, account: dict[str, Any] | None)
     if (vnet.get("location") or "").lower() != region:
         raise Stop(f"VNet {name} is in {vnet.get('location')}, but the Foundry account must be in the VNet's region "
                    f"({region}); use a VNet in {region}; nothing was changed")
-    for prefix in (_properties(vnet).get("addressSpace") or {}).get("addressPrefixes") or []:
-        if any(ipaddress.ip_network(prefix).overlaps(reserved) for reserved in APP_RESERVED):
-            raise Stop(f"VNet {name} address space {prefix} overlaps a range Container Apps and Foundry reserve "
-                       f"({', '.join(map(str, APP_RESERVED))}); nothing was changed")
+    _check_address_space(vnet, name)
     if dns == "azd" and (_properties(vnet).get("dhcpOptions") or {}).get("dnsServers"):
         raise Stop(f"VNet {name} uses its own DNS servers, which do not query the private DNS zones FA would link to "
                    "it. Set FA_DNS_MODE existing and serve the names yourself (deploy/azd/README.md); nothing was "
                    "changed")
+
+
+def _read_subnets(ctx: Context, vnet_id: str, vnet_name: str,
+                  subnet_names: dict[str, str]) -> dict[str, dict[str, Any]]:
     subnets = {}
-    for key, value in names.items():
-        subnets[key] = ctx.az("rest", "--method", "get", "--url", f"{vnet_id}/subnets/{value}?{NETWORK_API}",
+    for key, subnet_name in subnet_names.items():
+        subnets[key] = ctx.az("rest", "--method", "get", "--url", f"{vnet_id}/subnets/{subnet_name}?{NETWORK_API}",
                               missing_ok=True)
         if subnets[key] is None:
-            raise Stop(f"VNet {name} has no subnet {value} ({key}); create it or name another; nothing was changed")
-    for key in ("FA_API_SUBNET_NAME", "FA_AGENT_SUBNET_NAME"):
-        subnet, value = subnets[key], names[key]
-        network = _prefix(subnet)
-        services = [_properties(item).get("serviceName") for item in _properties(subnet).get("delegations") or []]
-        if APP_DELEGATION not in services:
-            raise Stop(f"subnet {value} must be delegated to {APP_DELEGATION}; nothing was changed")
-        if network.version != 4 or network.prefixlen > 27:
-            raise Stop(f"subnet {value} ({network}) must be an IPv4 /27 or larger; nothing was changed")
-        if any(network.overlaps(reserved) for reserved in APP_RESERVED):
-            raise Stop(f"subnet {value} ({network}) overlaps a range Container Apps and Foundry reserve "
-                       f"({', '.join(map(str, APP_RESERVED))}); nothing was changed")
-        if not _properties(subnet).get("natGateway") and not _properties(subnet).get("routeTable"):
-            print(f"FA: warning: subnet {value} has no NAT gateway or route table. FA adds no egress to your VNet: "
-                  "make sure it reaches the internet (the FA API, Entra ID, ACR, App Insights), e.g. through a "
-                  "Virtual WAN hub", flush=True)
-    agents = names["FA_AGENT_SUBNET_NAME"]
-    network = _prefix(subnets["FA_AGENT_SUBNET_NAME"])
+            raise Stop(f"VNet {vnet_name} has no subnet {subnet_name} ({key}); create it or name another; nothing was "
+                       "changed")
+    return subnets
+
+
+def _check_app_subnet(subnet: dict[str, Any], subnet_name: str) -> None:
+    """What the API and the agent subnets share: both are delegated to Container Apps."""
+    network = _prefix(subnet)
+    services = [_properties(item).get("serviceName") for item in _properties(subnet).get("delegations") or []]
+    if APP_DELEGATION not in services:
+        raise Stop(f"subnet {subnet_name} must be delegated to {APP_DELEGATION}; nothing was changed")
+    if network.version != 4 or network.prefixlen > 27:
+        raise Stop(f"subnet {subnet_name} ({network}) must be an IPv4 /27 or larger; nothing was changed")
+    if _overlaps_reserved(network):
+        raise Stop(f"subnet {subnet_name} ({network}) overlaps a range Container Apps and Foundry reserve "
+                   f"({', '.join(map(str, APP_RESERVED))}); nothing was changed")
+    if not _properties(subnet).get("natGateway") and not _properties(subnet).get("routeTable"):
+        print(f"FA: warning: subnet {subnet_name} has no NAT gateway or route table. FA adds no egress to your VNet: "
+              "make sure it reaches the internet (the FA API, Entra ID, ACR, App Insights), e.g. through a "
+              "Virtual WAN hub", flush=True)
+
+
+def _check_agent_subnet(subnet: dict[str, Any], agents: str, vnet_id: str, account: dict[str, Any] | None,
+                        injected: list[str]) -> None:
+    network = _prefix(subnet)
     if not any(network.subnet_of(private) for private in RFC1918):
         raise Stop(f"subnet {agents} ({network}) must be in an RFC 1918 range (10/8, 172.16/12, 192.168/16) for "
                    "Foundry Agent Service; nothing was changed")
@@ -718,12 +740,15 @@ def check_existing_vnet(ctx: Context, mode: str, account: dict[str, Any] | None)
         raise Stop(f"Foundry account {account.get('name')} was created injected into "
                    f"{', '.join(injected) or 'no subnet'}, and injection cannot change: FA_VNET_RESOURCE_ID and "
                    "FA_AGENT_SUBNET_NAME must name that subnet; nothing was changed")
-    if account is None and _properties(subnets["FA_AGENT_SUBNET_NAME"]).get("serviceAssociationLinks"):
+    if account is None and _properties(subnet).get("serviceAssociationLinks"):
         raise Stop(f"subnet {agents} already has a service association link, so another Foundry account uses it (or "
                    "one is still being deleted); a subnet serves one account only. Name a free subnet; nothing was "
                    "changed")
-    api = names["FA_API_SUBNET_NAME"]
-    if _properties(subnets["FA_API_SUBNET_NAME"]).get("serviceAssociationLinks"):
+
+
+def _check_api_subnet_link(ctx: Context, subnet: dict[str, Any], api: str, vnet_id: str, subscription: str) -> None:
+    """A link on the API subnet is fine only if it is this environment's own Container Apps environment."""
+    if _properties(subnet).get("serviceAssociationLinks"):
         environment = ctx.get("FA_CONTAINER_APPS_ENVIRONMENT", f"cae-{ctx.env}")
         cae = ctx.az("rest", "--method", "get", "--url",
                      f"/subscriptions/{subscription}/resourceGroups/{ctx.group}/providers/Microsoft.App/"
@@ -733,13 +758,42 @@ def check_existing_vnet(ctx: Context, mode: str, account: dict[str, Any] | None)
             raise Stop(f"subnet {api} already has a service association link and this environment's {environment} "
                        "does not use it, so another Container Apps environment does; name a free subnet; nothing was "
                        "changed")
-    endpoints = names["FA_PRIVATE_ENDPOINT_SUBNET_NAME"]
-    if _properties(subnets["FA_PRIVATE_ENDPOINT_SUBNET_NAME"]).get("delegations"):
+
+
+def _check_endpoint_subnet(subnet: dict[str, Any], endpoints: str) -> None:
+    if _properties(subnet).get("delegations"):
         raise Stop(f"subnet {endpoints} is delegated, and private endpoints cannot use a delegated subnet; nothing was "
                    "changed")
-    if _prefix(subnets["FA_PRIVATE_ENDPOINT_SUBNET_NAME"]).prefixlen > 28:
+    if _prefix(subnet).prefixlen > 28:
         raise Stop(f"subnet {endpoints} must be /28 or larger (FA uses up to about 10 private endpoint IPs); nothing "
                    "was changed")
+
+
+def check_existing_vnet(ctx: Context, mode: str, account: dict[str, Any] | None) -> None:
+    """Read only (ADR-0010 phase 2b): the user's VNet and its three subnets meet what the Foundry injection, the
+    Container Apps environment and the private endpoints need, and nothing else uses them. Never writes the VNet;
+    egress (NAT or a route to a firewall) is the user's, so its absence only warns."""
+    dns = ctx.get("FA_DNS_MODE", "azd")
+    if dns not in DNS_MODES:
+        raise Stop(f"FA_DNS_MODE must be azd or existing, not '{dns}'; nothing was changed")
+    injected = [item.get("subnetArmId") or "" for item in _properties(account).get("networkInjections") or []
+                if item.get("scenario") == "agent"]
+    vnet_id = ctx.get("FA_VNET_RESOURCE_ID")
+    if vnet_id is None:
+        _check_own_vnet(ctx, dns, account, injected)
+        return
+    subscription, group, name = _accept_vnet_id(ctx, mode, vnet_id)
+    names = _subnet_names(ctx)
+    _check_vnet(ctx, vnet_id, name, dns)
+    subnets = _read_subnets(ctx, vnet_id, name, names)
+    for key in ("FA_API_SUBNET_NAME", "FA_AGENT_SUBNET_NAME"):
+        _check_app_subnet(subnets[key], names[key])
+    api = names["FA_API_SUBNET_NAME"]
+    agents = names["FA_AGENT_SUBNET_NAME"]
+    endpoints = names["FA_PRIVATE_ENDPOINT_SUBNET_NAME"]
+    _check_agent_subnet(subnets["FA_AGENT_SUBNET_NAME"], agents, vnet_id, account, injected)
+    _check_api_subnet_link(ctx, subnets["FA_API_SUBNET_NAME"], api, vnet_id, subscription)
+    _check_endpoint_subnet(subnets["FA_PRIVATE_ENDPOINT_SUBNET_NAME"], endpoints)
     print(f"FA: existing VNet {name} in {group} (read only): {api} and {agents} delegated to {APP_DELEGATION}, "
           f"private endpoints in {endpoints}; DNS {dns}. FA creates no VNet, subnet, NSG or NAT in it", flush=True)
 

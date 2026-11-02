@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import ssl
 import sys
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 import httpx
@@ -35,6 +36,24 @@ _ATTEMPT_VERSIONS = {
 _RECONCILE_PATHS = {
     "approve": "/approval-reconcile", "reject": "/rejection-reconcile", "revoke": "/revocation-reconcile",
 }
+_CONFIRMATION_PROMPTS = {
+    "approve":
+    "輸入 approve 批准以上精確操作及UTC期限／次數／單位；後續代理可依原grant執行。"
+    "此CLI不執行、不退款，也不把unknown改為未發生：\n",
+    "reject": "輸入 reject 拒絕以上精確操作；不取消工作、不退款，也不宣稱效果未發生：\n",
+    "revoke": "輸入 revoke 撤銷以上原grant及revision；不取消工作、不退款或逆轉已發生／未知效果：\n",
+}
+
+
+class _DecisionRequest(NamedTuple):
+    """The decision or reconcile this run acts on; files and saved attempt are checked before login, the live preview after."""
+
+    decision: str
+    command: OperationApproval | OperationRejection | OperationRevocation
+    attempt: Path
+    frozen: dict
+    route: str
+    target: dict  # reconcile: what the saved attempt names; a new decision learns this from the preview
 
 
 def _pairs(items):
@@ -237,6 +256,141 @@ def parser():
     return result
 
 
+def _require_api_origin(api):
+    origin = urlsplit(api)
+    if (origin.scheme != "https" or not origin.hostname or not origin.hostname.endswith(".azurecontainerapps.io")
+            or origin.username or origin.password or origin.query or origin.fragment
+            or origin.path not in ("", "/") or origin.port not in (None, 443)):
+        raise ValueError("the configured HTTPS Azure Container Apps origin is required")
+
+
+def _validated_api(args):
+    _require_api_origin(args.api)
+    canonical_oid(args.tenant)
+    canonical_oid(args.client_id)
+    validate_api_audience(args.audience)
+    TypeAdapter(Identifier).validate_python(args.binding, strict=True)
+    return args.api.rstrip("/")
+
+
+def _request_paths(args):
+    original = _path(args.request_file)
+    return original, _path(original.with_name(original.name + ".attempt.json"))
+
+
+def _frozen_attempt(args, api, version, command):
+    frozen = {
+        "schema_version": version,
+        "api": api, "tenant": args.tenant, "audience": args.audience, "client_id": args.client_id,
+        "binding_id": args.binding,
+        "command_sha256": hashlib.sha256(_canonical(command.model_dump(mode="json"))).hexdigest(),
+    }
+    if version in _ATTEMPT_VERSIONS.values():
+        frozen["command"] = command.model_dump(mode="json")
+    return frozen
+
+
+def _saved_command(saved, version, original):
+    decision = next((name for name, schema in _ATTEMPT_VERSIONS.items() if schema == version), None)
+    if decision is not None:
+        command = _decision_command(saved["command"], decision=decision)
+        if original.exists() and _decision_command(_read_file(original), decision=decision) != command:
+            raise ValueError("the request file differs from its immutable original command")
+        return decision, command
+    if version == "fa-operation-rejection-cli-attempt-v1":
+        return "reject", OperationRejection.model_validate(_read_file(original))
+    raise ValueError("unknown attempt format; preserve the original files")
+
+
+def _saved_request(args, api):
+    original, attempt = _request_paths(args)
+    saved = _read_file(attempt)
+    version = saved["schema_version"]
+    decision, command = _saved_command(saved, version, original)
+    frozen = _frozen_attempt(args, api, version, command)
+    target = {"operation_id": TypeAdapter(Identifier).validate_python(saved["operation_id"], strict=True)}
+    if decision == "revoke":
+        target["grant_id"] = TypeAdapter(Identifier).validate_python(saved["grant_id"], strict=True)
+    if saved != {**frozen, **target}:
+        raise ValueError("original request or connection differs from its saved attempt")
+    return _DecisionRequest(decision, command, attempt, frozen, _RECONCILE_PATHS[decision], target)
+
+
+def _decision_request(args, api):
+    if args.action == "reconcile":
+        return _saved_request(args, api)
+    if args.action not in _ATTEMPT_VERSIONS:
+        return None
+    if not sys.stdin.isatty():
+        raise ValueError("a human decision requires an interactive terminal; there is no automatic confirmation")
+    original, attempt = _request_paths(args)
+    if attempt.exists():
+        raise Problem(409, "RECONCILE_REQUIRED", "original attempt exists; only reconcile, never resubmit")
+    command = _decision_command(_read_file(original), decision=args.action)
+    frozen = _frozen_attempt(args, api, _ATTEMPT_VERSIONS[args.action], command)
+    return _DecisionRequest(args.action, command, attempt, frozen, "/" + args.action, {})
+
+
+def _scopes(args):
+    scopes = [args.audience + "/" + READ_SCOPE]
+    if args.action in _ATTEMPT_VERSIONS:
+        scopes.append(args.audience + "/" + APPROVAL_SCOPE)
+    return scopes
+
+
+def _api_client(api):
+    return httpx.Client(
+        base_url=api, trust_env=False, follow_redirects=False, timeout=30,
+        transport=httpx.HTTPTransport(retries=0, trust_env=False,
+            verify=ssl.create_default_context(cafile=os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE"))),
+    )
+
+
+def _revocable_grant(observed, command, operation_id, preview):
+    if (observed.operation_id != operation_id
+            or observed.description_digest != command.description_digest
+            or observed.adapter_contract_digest != preview["adapter_contract_digest"]
+            or observed.grant is None or observed.grant.revoked
+            or observed.grant.revocation_revision != command.expected_revocation_revision):
+        raise ValueError("revocation requires the exact observed original grant and revision")
+    return observed.grant.grant_id
+
+
+def _require_open_operation(preview, command):
+    if (preview["rejection_recorded"]
+            or preview["adapter_contract_digest"] != command.adapter_contract_digest):
+        raise ValueError("the exact original un-rejected operation must match the request file")
+
+
+def _require_confirmation(decision):
+    if input(_CONFIRMATION_PROMPTS[decision]) != decision:
+        raise ValueError("confirmation did not match; no decision submitted")
+
+
+def _persist_attempt(attempt, material):
+    with attempt.open("xb") as stream:
+        stream.write(_canonical(material) + b"\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    if os.name != "nt":
+        descriptor = os.open(attempt.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _confirmed_output(value, request, binding, target):
+    command, operation_id = request.command, target["operation_id"]
+    if request.decision == "approve":
+        result = _approval_receipt(value, command, binding, operation_id)
+        return {"state": "confirmed", "purpose": "original-approval-receipt-not-current-permission", "result": result}
+    if request.decision == "revoke":
+        result = _revocation_receipt(value, command, binding, operation_id, target["grant_id"])
+        return {"state": "confirmed", "purpose": "original-revocation-receipt-not-effect-outcome", "result": result}
+    return {"state": "confirmed", "result": _receipt(value, command, operation_id)}
+
+
 def main(argv=None):
     options = parser()
     args = options.parse_args(argv)
@@ -244,69 +398,13 @@ def main(argv=None):
         options.error("configure the API origin, tenant, audience and existing delegated behavior client ID")
     phase = "validation"
     try:
-        origin = urlsplit(args.api)
-        if (origin.scheme != "https" or not origin.hostname or not origin.hostname.endswith(".azurecontainerapps.io")
-                or origin.username or origin.password or origin.query or origin.fragment
-                or origin.path not in ("", "/") or origin.port not in (None, 443)):
-            raise ValueError("the configured HTTPS Azure Container Apps origin is required")
-        canonical_oid(args.tenant)
-        canonical_oid(args.client_id)
-        validate_api_audience(args.audience)
-        TypeAdapter(Identifier).validate_python(args.binding, strict=True)
-        api = args.api.rstrip("/")
-        if args.action in _ATTEMPT_VERSIONS and not sys.stdin.isatty():
-            raise ValueError("a human decision requires an interactive terminal; there is no automatic confirmation")
-        command, attempt, frozen, operation_id, grant_id = None, None, None, None, None
-        decision = args.action if args.action in _ATTEMPT_VERSIONS else None
-        target = {}
-        if decision is not None or args.action == "reconcile":
-            original = _path(args.request_file)
-            attempt = _path(original.with_name(original.name + ".attempt.json"))
-            if decision is not None and attempt.exists():
-                raise Problem(409, "RECONCILE_REQUIRED", "original attempt exists; only reconcile, never resubmit")
-            version = _ATTEMPT_VERSIONS.get(decision)
-            if args.action == "reconcile":
-                saved = _read_file(attempt)
-                version = saved["schema_version"]
-                decision = next((name for name, schema in _ATTEMPT_VERSIONS.items() if schema == version), None)
-                if decision is not None:
-                    command = _decision_command(saved["command"], decision=decision)
-                    if original.exists() and _decision_command(_read_file(original), decision=decision) != command:
-                        raise ValueError("the request file differs from its immutable original command")
-                elif version == "fa-operation-rejection-cli-attempt-v1":
-                    decision = "reject"
-                    command = OperationRejection.model_validate(_read_file(original))
-                else:
-                    raise ValueError("unknown attempt format; preserve the original files")
-            else:
-                command = _decision_command(_read_file(original), decision=decision)
-            frozen = {
-                "schema_version": version,
-                "api": api, "tenant": args.tenant, "audience": args.audience, "client_id": args.client_id,
-                "binding_id": args.binding,
-                "command_sha256": hashlib.sha256(_canonical(command.model_dump(mode="json"))).hexdigest(),
-            }
-            if version in _ATTEMPT_VERSIONS.values():
-                frozen["command"] = command.model_dump(mode="json")
-            if args.action == "reconcile":
-                operation_id = TypeAdapter(Identifier).validate_python(saved["operation_id"], strict=True)
-                target = {"operation_id": operation_id}
-                if decision == "revoke":
-                    grant_id = TypeAdapter(Identifier).validate_python(saved["grant_id"], strict=True)
-                    target["grant_id"] = grant_id
-                if saved != {**frozen, **target}:
-                    raise ValueError("original request or connection differs from its saved attempt")
-        scopes = [args.audience + "/" + READ_SCOPE]
-        if args.action in _ATTEMPT_VERSIONS:
-            scopes.append(args.audience + "/" + APPROVAL_SCOPE)
+        api = _validated_api(args)
+        request = _decision_request(args, api)
+        scopes = _scopes(args)
         with _private_auth_logging(), InteractiveBrowserCredential(
             tenant_id=args.tenant, client_id=args.client_id, redirect_uri="http://localhost:8400",
             disable_automatic_authentication=True,
-        ) as credential, httpx.Client(
-            base_url=api, trust_env=False, follow_redirects=False, timeout=30,
-            transport=httpx.HTTPTransport(retries=0, trust_env=False,
-                verify=ssl.create_default_context(cafile=os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE"))),
-        ) as http:
+        ) as credential, _api_client(api) as http:
             phase = "authentication"
             credential.authenticate(scopes=scopes)
             token = lambda: credential.get_token(*scopes).token
@@ -317,64 +415,32 @@ def main(argv=None):
                 observed = _observation(data, args.binding)
                 print(_terminal_json(observed.model_dump(mode="json")))
                 return 0
-            if args.action != "reconcile":
+            if args.action == "reconcile":
+                target = request.target
+            else:
                 phase = "preview"
-                operation_id, preview = _preview(_request(http, token, "GET", path), complete=decision in ("approve", "revoke"))
+                operation_id, preview = _preview(_request(http, token, "GET", path), complete=args.action in ("approve", "revoke"))
                 print(_terminal_json(preview))
                 if args.action == "show":
                     return 0
-                if preview["description_digest"] != command.description_digest:
+                if preview["description_digest"] != request.command.description_digest:
                     raise ValueError("the exact original operation must match the request file")
                 target = {"operation_id": operation_id}
-                if decision == "revoke":
+                if request.decision == "revoke":
                     phase = "state"
                     observed = _observation(_request(http, token, "GET", path + "/decision-state"), args.binding)
-                    if (observed.operation_id != operation_id
-                            or observed.description_digest != command.description_digest
-                            or observed.adapter_contract_digest != preview["adapter_contract_digest"]
-                            or observed.grant is None or observed.grant.revoked
-                            or observed.grant.revocation_revision != command.expected_revocation_revision):
-                        raise ValueError("revocation requires the exact observed original grant and revision")
-                    grant_id = observed.grant.grant_id
-                    target["grant_id"] = grant_id
+                    target["grant_id"] = _revocable_grant(observed, request.command, operation_id, preview)
                     print(_terminal_json(observed.model_dump(mode="json")))
-                elif (preview["rejection_recorded"]
-                        or preview["adapter_contract_digest"] != command.adapter_contract_digest):
-                    raise ValueError("the exact original un-rejected operation must match the request file")
-                print(_terminal_json(command.model_dump(mode="json")))
+                else:
+                    _require_open_operation(preview, request.command)
+                print(_terminal_json(request.command.model_dump(mode="json")))
                 phase = "confirmation"
-                prompt = {
-                    "approve":
-                    "輸入 approve 批准以上精確操作及UTC期限／次數／單位；後續代理可依原grant執行。"
-                    "此CLI不執行、不退款，也不把unknown改為未發生：\n",
-                    "reject": "輸入 reject 拒絕以上精確操作；不取消工作、不退款，也不宣稱效果未發生：\n",
-                    "revoke": "輸入 revoke 撤銷以上原grant及revision；不取消工作、不退款或逆轉已發生／未知效果：\n",
-                }[decision]
-                if input(prompt) != args.action:
-                    raise ValueError("confirmation did not match; no decision submitted")
+                _require_confirmation(request.decision)
                 phase = "persist-attempt"
-                with attempt.open("xb") as stream:
-                    stream.write(_canonical({**frozen, **target}) + b"\n")
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                if os.name != "nt":
-                    descriptor = os.open(attempt.parent, os.O_RDONLY | os.O_DIRECTORY)
-                    try:
-                        os.fsync(descriptor)
-                    finally:
-                        os.close(descriptor)
+                _persist_attempt(request.attempt, {**request.frozen, **target})
             phase = args.action
-            action = _RECONCILE_PATHS[decision] if args.action == "reconcile" else "/" + decision
-            value = _request(http, token, "POST", path + action, command.model_dump(mode="json"))
-            if decision == "approve":
-                result = _approval_receipt(value, command, args.binding, operation_id)
-                output = {"state": "confirmed", "purpose": "original-approval-receipt-not-current-permission", "result": result}
-            elif decision == "revoke":
-                result = _revocation_receipt(value, command, args.binding, operation_id, grant_id)
-                output = {"state": "confirmed", "purpose": "original-revocation-receipt-not-effect-outcome", "result": result}
-            else:
-                output = {"state": "confirmed", "result": _receipt(value, command, operation_id)}
-            print(_terminal_json(output))
+            value = _request(http, token, "POST", path + request.route, request.command.model_dump(mode="json"))
+            print(_terminal_json(_confirmed_output(value, request, args.binding, target)))
         return 0
     except Problem as error:
         print(json.dumps({**error.body, "phase": phase}, ensure_ascii=True), file=sys.stderr)

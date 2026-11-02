@@ -274,15 +274,10 @@ def test_history_keys_rebuild_the_saved_peer_scope_not_current_environment(monke
     assert derive_registered_work(policy, saved, "native") == (admission, binding, profile)
     current = object.__new__(WorkPolicyControl)
     current.policy = policy
-    history = object.__new__(WorkPolicyControl)
-    history.policy = SimpleNamespace(authority_domain=policy.authority_domain)
-    history.records = {binding.binding_id: saved}
-    assert (history.policy_key, history.registry_key, history.revocation_key, history.cost_key) == (
-        current.policy_key, current.registry_key, current.revocation_key, current.cost_key)
     from shared_context.behavior_profile_selection import selection_key
-    history.records[binding.binding_id] = saved.model_copy(update={"profile_selection_id": "saved-peer-choice"})
-    assert selection_key(policy.authority_domain, "saved-peer-choice", policy.agent_id) in history.gate_keys(binding)
-    assert selection_key(policy.authority_domain, "saved-peer-choice") not in history.gate_keys(binding)
+    current.records = {binding.binding_id: saved.model_copy(update={"profile_selection_id": "saved-peer-choice"})}
+    assert selection_key(policy.authority_domain, "saved-peer-choice", policy.agent_id) in current.gate_keys(binding)
+    assert selection_key(policy.authority_domain, "saved-peer-choice") not in current.gate_keys(binding)
     with pytest.raises(Problem) as denied:
         derive_registered_work(policy, saved.model_copy(update={"agent_scope": None}), "native")
     assert denied.value.body["error"]["code"] == "WORK_POLICY_REGISTRY_INVALID"

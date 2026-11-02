@@ -1,5 +1,6 @@
 """Drive the retained peer work through the existing controller and C1 worker."""
 
+from dataclasses import dataclass
 from typing import Literal
 from pydantic import Field
 import logging
@@ -158,105 +159,193 @@ def _result_current(root, peer, receiver, refs):
             receiver_principal=recipient, refs=refs, allowed_refs=root.spec.allowed_refs)
 
 
-def forward_result(peer, receiver, root, ledger, message, job):
+@dataclass(frozen=True)
+class _PeerOutcome:
+    """What the finished peer left: a saved result, a verified stop, or a cancellation before the SDK."""
+    completion_key: str
+    result_key: str
+    completion: ExecutorEvidence | None
+    result: object
+    reply: object
+    stop_digest: str | None
+    no_sdk: bool
+
+
+@dataclass(frozen=True)
+class _PeerForward:
+    peer: object
+    store: object
+    receiver: object
+    root: object
+    ledger: object
+    principal: BehaviorPrincipal
+    reference: object
+    claim: _QueueClaim
+
+
+def _require_pre_sdk_cancellation(peer, job, rows):
+    receipt = peer.runtime.dep.workers.read_cancellation_receipt(job.spec.job_id, job.owner, 0)
+    if (receipt.payload["result"].get("executor_stopped") is not True
+            or any(value is not None for value in rows.values())):
+        raise Problem(409, "AGENT_MESSAGE_RESULT_INVALID", "the original pre-SDK cancellation receipt is required")
+
+
+def _agreeing_completion(rows, completion_key, job):
+    completion = _row(rows, completion_key, ExecutorEvidence)
+    if (completion.binding != job.binding or completion.evidence_id != job.last_evidence_id
+            or not completion.entire_tree_idle or not completion.all_inflight_starts_fenced):
+        raise Problem(409, "AGENT_MESSAGE_RESULT_INVALID", "the original peer completion and saved result must agree")
+    return completion
+
+
+def _intact_stop_digest(rows, job, completion, completion_key, result_key, reply_key):
+    from .behavior_delivery import _material
+    if (rows[result_key] is not None or rows[reply_key] is not None
+            or rows[completion_key].payload["material"] != _material(
+                completion.model_dump(mode="json")).model_dump(mode="json")):
+        raise Problem(409, "AGENT_MESSAGE_RESULT_INVALID", "an intact terminal stop without a saved result is required")
+    return stopped_peer_digest(job, completion)
+
+
+def _saved_result(store, rows, binding, completion, result_key):
+    from .behavior_delivery import VerifiedWorkResult
+    if rows[result_key] is None and completion.result is not None:
+        result_key = worker_key("work-result", completion.result.evidence_id)
+        rows.update(store.read_snapshot((result_key,)))
+    result = _row(rows, result_key, VerifiedWorkResult)
+    if completion.result != result or result.work_id != binding.work.work_id:
+        raise Problem(409, "AGENT_MESSAGE_RESULT_INVALID", "the original peer completion and saved result must agree")
+    return result_key, result
+
+
+def _cancelled_before_sdk(job):
+    return job.state == "cancelled" and job.generation == 0 and job.binding is None and job.cancel_requested
+
+
+def _saved_reply(rows, reply_key):
+    from .behavior_instruction import SavedReply, unpack_reply
+    return None if rows[reply_key] is None else unpack_reply(_row(rows, reply_key, SavedReply))
+
+
+def _saved_outcome(peer, store, binding, job):
     from .behavior_assistant import key
-    from .behavior_instruction import SavedReply, failure_notice, unpack_reply
-    from .behavior_delivery import VerifiedWorkResult, _material
-    store = peer.runtime.store
-    binding = receiver.binding
     completion_key = worker_key("completion", job.spec.job_id, str(job.generation))
     result_key = key("result", binding.work.work_id)
     reply_key = key("reply", binding.job_id)
     rows = dict(store.read_snapshot((completion_key, result_key, reply_key)))
     stop_digest = None
-    no_sdk = job.state == "cancelled" and job.generation == 0 and job.binding is None and job.cancel_requested
+    no_sdk = _cancelled_before_sdk(job)
     if no_sdk:
-        receipt = peer.runtime.dep.workers.read_cancellation_receipt(job.spec.job_id, job.owner, 0)
-        if (receipt.payload["result"].get("executor_stopped") is not True
-                or any(rows[key] is not None for key in (completion_key, result_key, reply_key))):
-            raise Problem(409, "AGENT_MESSAGE_RESULT_INVALID", "the original pre-SDK cancellation receipt is required")
+        _require_pre_sdk_cancellation(peer, job, rows)
         completion, result = None, None
     else:
-        completion = _row(rows, completion_key, ExecutorEvidence)
-        if (completion.binding != job.binding or completion.evidence_id != job.last_evidence_id
-                or not completion.entire_tree_idle or not completion.all_inflight_starts_fenced):
-            raise Problem(409, "AGENT_MESSAGE_RESULT_INVALID", "the original peer completion and saved result must agree")
+        completion = _agreeing_completion(rows, completion_key, job)
         if completion.state == "stopped" and completion.result is None:
-            if (rows[result_key] is not None or rows[reply_key] is not None
-                    or rows[completion_key].payload["material"] != _material(
-                        completion.model_dump(mode="json")).model_dump(mode="json")):
-                raise Problem(409, "AGENT_MESSAGE_RESULT_INVALID", "an intact terminal stop without a saved result is required")
             result = None
-            stop_digest = stopped_peer_digest(job, completion)
+            stop_digest = _intact_stop_digest(rows, job, completion, completion_key, result_key, reply_key)
         else:
-            if rows[result_key] is None and completion.result is not None:
-                result_key = worker_key("work-result", completion.result.evidence_id)
-                rows.update(store.read_snapshot((result_key,)))
-            result = _row(rows, result_key, VerifiedWorkResult)
-            if completion.result != result or result.work_id != binding.work.work_id:
-                raise Problem(409, "AGENT_MESSAGE_RESULT_INVALID", "the original peer completion and saved result must agree")
-    saved = None if rows[reply_key] is None else _row(rows, reply_key, SavedReply)
-    reply = None if saved is None else unpack_reply(saved)
+            result_key, result = _saved_result(store, rows, binding, completion, result_key)
+    reply = _saved_reply(rows, reply_key)
     if result is not None and result.state == "succeeded" and reply is None:
         raise Problem(409, "AGENT_MESSAGE_RESULT_INVALID", "a successful peer result requires its complete saved SDK reply")
-    text = (STOPPED_PEER_NOTICE if stop_digest is not None else
-            "The peer work was cancelled before SDK execution." if no_sdk else
+    return _PeerOutcome(completion_key=completion_key, result_key=result_key, completion=completion, result=result,
+                        reply=reply, stop_digest=stop_digest, no_sdk=no_sdk)
+
+
+def _result_text(job, outcome):
+    from .behavior_instruction import failure_notice
+    result, reply = outcome.result, outcome.reply
+    text = (STOPPED_PEER_NOTICE if outcome.stop_digest is not None else
+            "The peer work was cancelled before SDK execution." if outcome.no_sdk else
             f"The peer work ended as {job.state}; no successful result was produced."
             if reply is None else reply.text)
     if result is not None and reply is None and result.content == failure_notice("failed", "model_call_limit_reached"):
         text = "The peer reached MODEL_CALL_LIMIT_REACHED and stopped; no successful peer result was produced."
-    principal = _controller_principal(root.directory.agents[1])
-    reference = receiver.profile.instruction.peer_work
-    claim, _ = ledger._verified(claim_key(reference.message_key), _QueueClaim)
+    return text
+
+
+def _result_command(forward, message, job, outcome):
+    result, reply = outcome.result, outcome.reply
     command = AgentMessage(
-        message_id=control_key("agent-message-result", binding.job_id), recipient_agent_id=root.spec.origin_agent_id,
-        kind="result" if result is not None and result.state == "succeeded" else "blocked", content=text,
-        in_reply_to=reference.message_key, refs=() if no_sdk or reply is None else message.command.refs)
+        message_id=control_key("agent-message-result", forward.receiver.binding.job_id),
+        recipient_agent_id=forward.root.spec.origin_agent_id,
+        kind="result" if result is not None and result.state == "succeeded" else "blocked",
+        content=_result_text(job, outcome),
+        in_reply_to=forward.reference.message_key, refs=() if reply is None else message.command.refs)
     if len(canonical(command.model_dump(mode="json"))) > MAX_AGENT_MESSAGE_BYTES:
-        command = command.model_copy(update={"kind": "blocked", "content": SAVED_RESULT_LIMIT_NOTICE, "refs": ()})
+        return command.model_copy(update={"kind": "blocked", "content": SAVED_RESULT_LIMIT_NOTICE, "refs": ()})
+    return command
+
+
+def _send_checked(forward, command):
+    current = lambda: _result_current(forward.root, forward.peer, forward.receiver, command.refs)
+    current()
+    return forward.store.validated_writes(
+        lambda: forward.ledger.send(forward.principal, forward.claim.assignment, command), current)
+
+
+def _send_result(forward, command, response_key):
+    try:
+        return _send_checked(forward, command)
+    except Problem as error:
+        code = error.body["error"]["code"]
+        if code not in REFERENCE_REFUSALS or not command.refs:
+            raise
+        if forward.store.read_snapshot((response_key,))[response_key] is not None:
+            return forward.ledger.read(forward.principal, response_key)
+        return _send_checked(forward, command.model_copy(
+            update={"kind": "blocked", "content": reference_refusal_notice(code), "refs": ()}))
+
+
+def _result_response(forward, command):
+    root, reference = forward.root, forward.reference
     response_key = message_key(root.spec.root_request_id, reference.recipient_agent_id, command.message_id)
-    if store.read_snapshot((response_key,))[response_key] is not None:
-        response = ledger.read(principal, response_key)
-        if (response.message.from_work_id != binding.work.work_id
-                or response.message.to_work_id != root.spec.origin_work_id
-                or response.command.in_reply_to != reference.message_key):
-            raise Problem(409, "AGENT_MESSAGE_RESULT_CHANGED", "the retained response belongs to another original work")
-    else:
-        current = lambda: _result_current(root, peer, receiver, command.refs)
-        try:
-            current()
-            response = store.validated_writes(lambda: ledger.send(principal, claim.assignment, command), current)
-        except Problem as error:
-            code = error.body["error"]["code"]
-            if code not in REFERENCE_REFUSALS or not command.refs:
-                raise
-            if store.read_snapshot((response_key,))[response_key] is not None:
-                response = ledger.read(principal, response_key)
-            else:
-                command = command.model_copy(update={"kind": "blocked", "content": reference_refusal_notice(code), "refs": ()})
-                current()
-                response = store.validated_writes(lambda: ledger.send(principal, claim.assignment, command), current)
-    ledger.acknowledge(principal, claim.claim_id, consumer_id=claim.consumer_id, epoch=claim.epoch)
-    job_key, pool_key = worker_key("job", binding.job_id), peer.runtime.dep.workers.pool_key(binding.job_id)
-    forward_key = control_key("agent-message-result-forward", binding.job_id)
-    result_digest = None if result is None else digest(result.model_dump(mode="json"))
+    if forward.store.read_snapshot((response_key,))[response_key] is None:
+        return _send_result(forward, command, response_key)
+    response = forward.ledger.read(forward.principal, response_key)
+    if (response.message.from_work_id != forward.receiver.binding.work.work_id
+            or response.message.to_work_id != root.spec.origin_work_id
+            or response.command.in_reply_to != reference.message_key):
+        raise Problem(409, "AGENT_MESSAGE_RESULT_CHANGED", "the retained response belongs to another original work")
+    return response
+
+
+def _saved_rows_differ(rows, outcome):
+    from .behavior_delivery import VerifiedWorkResult
+    completion_key, result_key = outcome.completion_key, outcome.result_key
+    return ((None if rows[completion_key] is None else _row(rows, completion_key, ExecutorEvidence)) != outcome.completion
+            or (None if rows[result_key] is None else _row(rows, result_key, VerifiedWorkResult)) != outcome.result)
+
+
+def _forward_record(forward, outcome, response, forward_key, read_set):
+    root, claim, job_id = forward.root, forward.claim, forward.receiver.binding.job_id
+    result_digest = None if outcome.result is None else digest(outcome.result.model_dump(mode="json"))
+    stop_digest = outcome.stop_digest
     request = ControlRequest(request_id=forward_key, request_digest=digest([
-        root.request.request_id, binding.job_id, claim.claim_id, response.message.message_key,
+        root.request.request_id, job_id, claim.claim_id, response.message.message_key,
         result_digest, *((stop_digest,) if stop_digest is not None else ())]),
-        read_set=(job_key, pool_key, completion_key, result_key, forward_key,
-                  response.message.message_key, message_state_key(reference.message_key)))
-    forwarded = PeerResultForward(root_id=root.request.request_id, job_id=binding.job_id, claim_id=claim.claim_id,
+        read_set=read_set)
+    return PeerResultForward(root_id=root.request.request_id, job_id=job_id, claim_id=claim.claim_id,
         result_message_key=response.message.message_key, result_sha256=result_digest,
         stop_evidence_sha256=stop_digest, request=request)
+
+
+def _record_forward(forward, job, outcome, response):
+    peer, claim, binding = forward.peer, forward.claim, forward.receiver.binding
+    state_key = message_state_key(forward.reference.message_key)
+    job_key, pool_key = worker_key("job", binding.job_id), peer.runtime.dep.workers.pool_key(binding.job_id)
+    forward_key = control_key("agent-message-result-forward", binding.job_id)
+    forwarded = _forward_record(forward, outcome, response, forward_key, (
+        job_key, pool_key, outcome.completion_key, outcome.result_key, forward_key,
+        response.message.message_key, state_key))
     def finish(rows):
         actual = _row(rows, job_key, JobRecord)
         pool = _row(rows, pool_key, _Pool)
         accepted = _row(rows, response.message.message_key, MessageEnvelope)
-        consumed = _row(rows, message_state_key(reference.message_key), _MessageState)
+        consumed = _row(rows, state_key, _MessageState)
         if (actual != job or actual.result_forwarded or binding.job_id in (*pool.pending, *pool.completions)
                 or any(slot.binding is not None for slot in pool.slots)
-                or (None if rows[completion_key] is None else _row(rows, completion_key, ExecutorEvidence)) != completion
-                or (None if rows[result_key] is None else _row(rows, result_key, VerifiedWorkResult)) != result
+                or _saved_rows_differ(rows, outcome)
                 or accepted != response.message or consumed.status != "completed" or consumed.claim_id != claim.claim_id):
             raise Problem(409, "AGENT_MESSAGE_RESULT_CHANGED", "the original saved peer result or receipt changed")
         return ControlChanges(writes=(
@@ -264,7 +353,20 @@ def forward_result(peer, receiver, root, ledger, message, job):
             _write(forward_key, forwarded, "create", material(forwarded.model_dump(mode="json"))),
         ), result={"job_id": binding.job_id, "result_message_key": response.message.message_key,
                    "human_obligation_fulfilled": False})
-    store.transact(request, finish)
+    forward.store.transact(forwarded.request, finish)
+
+
+def forward_result(peer, receiver, root, ledger, message, job):
+    store = peer.runtime.store
+    outcome = _saved_outcome(peer, store, receiver.binding, job)
+    principal = _controller_principal(root.directory.agents[1])
+    reference = receiver.profile.instruction.peer_work
+    claim, _ = ledger._verified(claim_key(reference.message_key), _QueueClaim)
+    forward = _PeerForward(peer=peer, store=store, receiver=receiver, root=root, ledger=ledger, principal=principal,
+                           reference=reference, claim=claim)
+    response = _result_response(forward, _result_command(forward, message, job, outcome))
+    ledger.acknowledge(principal, claim.claim_id, consumer_id=claim.consumer_id, epoch=claim.epoch)
+    _record_forward(forward, job, outcome, response)
 
 
 def _stopped_reason(peer, root):

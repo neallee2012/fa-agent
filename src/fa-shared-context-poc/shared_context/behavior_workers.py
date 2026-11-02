@@ -267,6 +267,28 @@ class _ForwardPlan(_Model):
     delivery_configuration_digest: Digest
 
 
+@dataclass(frozen=True)
+class _Forward:
+    """One forward_result call: the job and completion classification it read before any transaction."""
+
+    job_id: str
+    job: JobRecord
+    context: ExecutionContext
+    delivery: DeliveryCore
+    job_key: str
+    pool_key: str
+    completion_key: str
+    plan_key: str
+    inactive: bool
+    stopped_without_result: bool
+    operation_ids: tuple[str, ...]
+    reads: tuple[str, ...]
+
+    @property
+    def without_result(self) -> bool:
+        return self.inactive or self.stopped_without_result
+
+
 class WorkerCore:
     def __init__(
         self, store: BehaviorStore, contract: WorkerContract, *, adapter: ExecutorAdapter | None,
@@ -996,102 +1018,12 @@ class WorkerCore:
         self._scope(job, context)
         if job.state not in TERMINAL_STATES or job.spec.obligation_id is None:
             raise Problem(409, "WORKER_RESULT_PENDING", "no terminal admission result is ready to forward")
-        job_key, pool_key = worker_key("job", job_id), self.pool_key(job_id)
-        completion_key = worker_key("completion", job_id, str(job.generation))
-        plan_key = worker_key("result-forward", job_id)
-        retained = self.store.read_snapshot((completion_key,))[completion_key]
-        inactive = retained is not None and retained.payload["data"].get("kind") == "worker_inactive_cancel"
-        stopped_without_result = (
-            retained is not None and not inactive and retained.payload["data"].get("state") == "stopped"
-            and retained.payload["data"].get("result") is None
-        )
-        reads = (job_key, pool_key, completion_key, plan_key, *self._owner_keys(context))
-        operation_ids = ()
-        if inactive or stopped_without_result:
-            owner_key = control_key("owner", context.owner_record_id)
-            owner = self._row(self.store.read_snapshot((owner_key,)), owner_key, OwnerRecord)
-            operation_ids = owner.operation_ids
-            reads += (control_key("delivery-obligation", job.spec.obligation_id),
-                      control_key("delivery-work-state", job.spec.obligation_id),
-                      control_key("delivery-conversation", context.conversation_id),
-                      *(control_key("operation", operation_id) for operation_id in operation_ids))
-        plan_request = self._request("prepare-forward", (job_id,), [job_id, delivery.configuration_digest()], reads)
-
-        def prepare(rows):
-            self._owner(rows, context, policy=False)
-            current = self._row(rows, job_key, JobRecord)
-            self._scope(current, context)
-            pool = self._pool(rows)
-            proof = self._row(rows, completion_key, _InactiveCancellation if inactive else ExecutorEvidence)
-            if (
-                current.binding != proof.binding or job_id not in pool.completions
-                or current.last_evidence_id != proof.evidence_id
-                or _parse(rows[completion_key].payload["material"], InlineMaterial) != _material(proof.model_dump(mode="json"))
-            ):
-                raise Problem(409, "WORKER_RESULT_PENDING", "verified retained work result is unavailable")
-            if inactive or stopped_without_result:
-                if current.state != "cancelled" or not current.cancel_requested:
-                    raise Problem(403, "WORKER_CANCELLATION_UNVERIFIED", "an accepted verified cancellation is required")
-                if inactive and (proof.spec != current.spec or proof.owner != current.owner
-                                 or proof.generation != current.generation):
-                    raise Problem(403, "WORKER_CANCELLATION_UNVERIFIED", "retained inactive cancellation binding differs")
-                if stopped_without_result and (proof.state != "stopped" or proof.result is not None):
-                    raise Problem(403, "WORKER_CANCELLATION_UNVERIFIED", "the retained full-tree stop proof differs")
-                obligation = delivery._obligation(rows, job.spec.obligation_id, context)
-                work = delivery._work(rows, obligation)
-                if work.definition.work_id != current.spec.work_id or work.state != "queued":
-                    raise Problem(409, "WORKER_RESULT_PENDING", "the admitted work is not awaiting its cancellation result")
-                if self._row(rows, control_key("owner", context.owner_record_id), OwnerRecord).operation_ids != operation_ids:
-                    raise Problem(409, "WORKER_CANCELLATION_UNVERIFIED", "the operation scope changed during cancellation reconciliation")
-                known, pending_operations = self._operation_effects(rows, operation_ids, context)
-                unresolved = tuple(dict.fromkeys((
-                    *pending_operations,
-                    *(proof.children if inactive else current.children),
-                )))
-                if len(unresolved) > 16 or len(known) > 16:
-                    raise Problem(409, "WORKER_CANCELLATION_RECONCILIATION_REQUIRED", "reconcile existing operation/child records before bounded cancellation delivery")
-                result = VerifiedWorkResult(
-                    evidence_id=(proof.evidence_id if inactive else worker_key("stopped-cancel", proof.evidence_id)),
-                    verifier_version=delivery.contract.verifier_version,
-                    work_id=work.definition.work_id, definition_digest=work.definition_digest,
-                    state="cancelled", passed_checks=(), known_effects=known,
-                    unresolved_operations=unresolved,
-                    content=(b"Job cancelled with no executor slot held. Prior work and child work are not rolled back."
-                             if inactive else
-                             b"Job cancelled after verified executor fencing. Existing operation and child records require separate reconciliation; effects are not rolled back."),
-                    proof=_material({
-                        "cancellation": proof.model_dump(mode="json"), "operation_ids_checked": operation_ids,
-                        "known_effects": known, "unreconciled_records": unresolved,
-                    }).data,
-                )
-            else:
-                result = proof.result
-                if result is None:
-                    raise Problem(409, "WORKER_RESULT_PENDING", "verified retained work result is unavailable")
-            command = WorkResultRequest(obligation_id=job.spec.obligation_id, evidence_id=result.evidence_id)
-            plan = _ForwardPlan(
-                job_id=job_id, context=context, command=command,
-                request=delivery.request_for(command, context),
-                delivery_configuration_digest=delivery.configuration_digest(),
-            )
-            writes = (self._write(plan_key, plan, material=_material(plan.model_dump(mode="json"))),)
-            if inactive or stopped_without_result:
-                writes += (self._write(worker_key("work-result", result.evidence_id), result,
-                                       material=_material(result.model_dump(mode="json"))),)
-            return ControlChanges(writes=writes,
-                                  result=self._result(plan_key=plan_key))
-
-        self.store.transact(plan_request, prepare)
-        rows = authority_snapshot(self.store, reads)
-        self._owner(rows, context, policy=False)
-        plan = self._row(rows, plan_key, _ForwardPlan)
-        if (
-            plan.context != context or plan.delivery_configuration_digest != delivery.configuration_digest()
-            or _parse(rows[plan_key].payload["material"], InlineMaterial) != _material(plan.model_dump(mode="json"))
-            or delivery.request_for(plan.command, context) != plan.request
-        ):
-            raise Problem(403, "WORKER_FORWARD_FENCED", "retained forwarding owner/request differs")
+        forward = self._forward_scope(job_id, job, context, delivery)
+        plan_request = self._request("prepare-forward", (job_id,), [job_id, delivery.configuration_digest()], forward.reads)
+        self.store.transact(plan_request, lambda rows: self._prepare_forward(rows, forward))
+        plan = self._retained_forward_plan(forward)
         delivered = delivery.record_work_result(plan.command, context)
+        job_key, pool_key = forward.job_key, forward.pool_key
         finish_request = self._request("forwarded", (job_id,), plan.model_dump(mode="json"), (
             job_key, pool_key, *self._owner_keys(context),
         ))
@@ -1109,6 +1041,119 @@ class WorkerCore:
             ), result=self._result(work_receipt_request_id=delivered.payload["request"]["request_id"], result_forwarded=True))
 
         return self.store.transact(finish_request, finish)
+
+    def _forward_scope(self, job_id, job, context, delivery) -> _Forward:
+        """Classify the retained completion once; every later step uses this same reading."""
+        job_key, pool_key = worker_key("job", job_id), self.pool_key(job_id)
+        completion_key = worker_key("completion", job_id, str(job.generation))
+        plan_key = worker_key("result-forward", job_id)
+        retained = self.store.read_snapshot((completion_key,))[completion_key]
+        inactive = retained is not None and retained.payload["data"].get("kind") == "worker_inactive_cancel"
+        stopped_without_result = (
+            retained is not None and retained.payload["data"].get("state") == "stopped"
+            and retained.payload["data"].get("result") is None
+        )
+        reads = (job_key, pool_key, completion_key, plan_key, *self._owner_keys(context))
+        operation_ids = ()
+        if inactive or stopped_without_result:
+            owner_key = control_key("owner", context.owner_record_id)
+            owner = self._row(self.store.read_snapshot((owner_key,)), owner_key, OwnerRecord)
+            operation_ids = owner.operation_ids
+            reads += (control_key("delivery-obligation", job.spec.obligation_id),
+                      control_key("delivery-work-state", job.spec.obligation_id),
+                      control_key("delivery-conversation", context.conversation_id),
+                      *(control_key("operation", operation_id) for operation_id in operation_ids))
+        return _Forward(job_id, job, context, delivery, job_key, pool_key, completion_key, plan_key,
+                        inactive, stopped_without_result, operation_ids, reads)
+
+    def _prepare_forward(self, rows, forward: _Forward) -> ControlChanges:
+        job_id, context, delivery = forward.job_id, forward.context, forward.delivery
+        completion_key, plan_key = forward.completion_key, forward.plan_key
+        self._owner(rows, context, policy=False)
+        current = self._row(rows, forward.job_key, JobRecord)
+        self._scope(current, context)
+        pool = self._pool(rows)
+        proof = self._row(rows, completion_key, _InactiveCancellation if forward.inactive else ExecutorEvidence)
+        if (
+            current.binding != proof.binding or job_id not in pool.completions
+            or current.last_evidence_id != proof.evidence_id
+            or _parse(rows[completion_key].payload["material"], InlineMaterial) != _material(proof.model_dump(mode="json"))
+        ):
+            raise Problem(409, "WORKER_RESULT_PENDING", "verified retained work result is unavailable")
+        if forward.without_result:
+            result = self._cancelled_result(rows, forward, current, proof)
+        else:
+            result = proof.result
+            if result is None:
+                raise Problem(409, "WORKER_RESULT_PENDING", "verified retained work result is unavailable")
+        command = WorkResultRequest(obligation_id=forward.job.spec.obligation_id, evidence_id=result.evidence_id)
+        plan = _ForwardPlan(
+            job_id=job_id, context=context, command=command,
+            request=delivery.request_for(command, context),
+            delivery_configuration_digest=delivery.configuration_digest(),
+        )
+        writes = (self._write(plan_key, plan, material=_material(plan.model_dump(mode="json"))),)
+        if forward.without_result:
+            writes += (self._write(worker_key("work-result", result.evidence_id), result,
+                                   material=_material(result.model_dump(mode="json"))),)
+        return ControlChanges(writes=writes,
+                              result=self._result(plan_key=plan_key))
+
+    @staticmethod
+    def _require_accepted_cancellation(forward: _Forward, current, proof) -> None:
+        if current.state != "cancelled" or not current.cancel_requested:
+            raise Problem(403, "WORKER_CANCELLATION_UNVERIFIED", "an accepted verified cancellation is required")
+        if forward.inactive and (proof.spec != current.spec or proof.owner != current.owner
+                                 or proof.generation != current.generation):
+            raise Problem(403, "WORKER_CANCELLATION_UNVERIFIED", "retained inactive cancellation binding differs")
+        if forward.stopped_without_result and (proof.state != "stopped" or proof.result is not None):
+            raise Problem(403, "WORKER_CANCELLATION_UNVERIFIED", "the retained full-tree stop proof differs")
+
+    def _cancelled_result(self, rows, forward: _Forward, current, proof) -> VerifiedWorkResult:
+        """The cancellation is the result: built only from rows this transaction read."""
+        inactive, context, delivery = forward.inactive, forward.context, forward.delivery
+        operation_ids = forward.operation_ids
+        self._require_accepted_cancellation(forward, current, proof)
+        obligation = delivery._obligation(rows, forward.job.spec.obligation_id, context)
+        work = delivery._work(rows, obligation)
+        if work.definition.work_id != current.spec.work_id or work.state != "queued":
+            raise Problem(409, "WORKER_RESULT_PENDING", "the admitted work is not awaiting its cancellation result")
+        if self._row(rows, control_key("owner", context.owner_record_id), OwnerRecord).operation_ids != operation_ids:
+            raise Problem(409, "WORKER_CANCELLATION_UNVERIFIED", "the operation scope changed during cancellation reconciliation")
+        known, pending_operations = self._operation_effects(rows, operation_ids, context)
+        unresolved = tuple(dict.fromkeys((
+            *pending_operations,
+            *(proof.children if inactive else current.children),
+        )))
+        if len(unresolved) > 16 or len(known) > 16:
+            raise Problem(409, "WORKER_CANCELLATION_RECONCILIATION_REQUIRED", "reconcile existing operation/child records before bounded cancellation delivery")
+        return VerifiedWorkResult(
+            evidence_id=(proof.evidence_id if inactive else worker_key("stopped-cancel", proof.evidence_id)),
+            verifier_version=delivery.contract.verifier_version,
+            work_id=work.definition.work_id, definition_digest=work.definition_digest,
+            state="cancelled", passed_checks=(), known_effects=known,
+            unresolved_operations=unresolved,
+            content=(b"Job cancelled with no executor slot held. Prior work and child work are not rolled back."
+                     if inactive else
+                     b"Job cancelled after verified executor fencing. Existing operation and child records require separate reconciliation; effects are not rolled back."),
+            proof=_material({
+                "cancellation": proof.model_dump(mode="json"), "operation_ids_checked": operation_ids,
+                "known_effects": known, "unreconciled_records": unresolved,
+            }).data,
+        )
+
+    def _retained_forward_plan(self, forward: _Forward) -> _ForwardPlan:
+        context, delivery, plan_key = forward.context, forward.delivery, forward.plan_key
+        rows = authority_snapshot(self.store, forward.reads)
+        self._owner(rows, context, policy=False)
+        plan = self._row(rows, plan_key, _ForwardPlan)
+        if (
+            plan.context != context or plan.delivery_configuration_digest != delivery.configuration_digest()
+            or _parse(rows[plan_key].payload["material"], InlineMaterial) != _material(plan.model_dump(mode="json"))
+            or delivery.request_for(plan.command, context) != plan.request
+        ):
+            raise Problem(403, "WORKER_FORWARD_FENCED", "retained forwarding owner/request differs")
+        return plan
 
 
 class WorkerConsumer:

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import re
-import threading
 from time import monotonic
 
 from .behavior_auth import BehaviorJwtVerifier
@@ -22,8 +21,8 @@ from .team_connector_wire import (
     connector_metadata, connector_servers, connector_toolbox_name, connector_tools,
 )
 from .team_mcp import (
-    OAUTH2_CONNECTION_API_VERSION, _server, _status, _team_lock, _write_failure, authorize_team_owner,
-    promote_request_version, read_failure, team_connection_prefix,
+    OAUTH2_CONNECTION_API_VERSION, TeamGrantCache, _server, _status, _team_lock, _write_failure, authorize_team_owner,
+    promote_request_version, read_failure, runtime_bindings, team_connection_prefix,
 )
 from .team_mcp_wire import toolbox_grant
 
@@ -44,11 +43,7 @@ class TeamConnectorService:
     def __init__(self, verifier: BehaviorJwtVerifier, *, foundry_factory, project_scope: str | None, app_settings):
         self.verifier, self.foundry_factory = verifier, foundry_factory
         self.project_scope, self.app_settings = project_scope, app_settings
-        self._grants: dict[tuple[str, str], tuple[float, tuple]] = {}
-        self._grants_lock = threading.Lock()
-        # Bumped by forget(): a read that started before a change never stores the grants it read.
-        self._generations: dict[tuple[str, str], int] = {}
-        self._flights: dict[tuple[str, str], threading.Lock] = {}
+        self._grants = TeamGrantCache()
 
     def _names(self, team: str, ref: ConnectorRef) -> tuple[str, str]:
         if self.project_scope is None:
@@ -175,23 +170,18 @@ class TeamConnectorService:
             return self._finish(foundry, principal, ref, command, version)
 
     def forget(self, tenant: str, team: str) -> None:
-        with self._grants_lock:
-            self._grants.pop((tenant, team), None)
-            self._generations[(tenant, team)] = self._generations.get((tenant, team), 0) + 1
+        self._grants.forget((tenant, team))
 
     def team_grants(self, tenant: str, team: str) -> tuple:
         """The Team's enabled connectors, as grants pinned to each connector toolbox's current default version."""
         if self.project_scope is None:
             return ()
-        with self._grants_lock:
-            flight = self._flights.setdefault((tenant, team), threading.Lock())
-        with flight:  # single-flight, as Team MCP: captures arriving during a read take what it stored
+        with self._grants.flight((tenant, team)):  # as Team MCP: captures arriving during a read take what it stored
             return self._read_grants(tenant, team)
 
     def _read_grants(self, tenant: str, team: str) -> tuple:
         key, now = (tenant, team), monotonic()
-        with self._grants_lock:
-            cached, generation = self._grants.get(key), self._generations.get(key, 0)
+        cached, generation = self._grants.peek(key)
         if cached is not None and cached[0] > now:
             return cached[1]
         foundry, grants = self.foundry_factory(), []
@@ -204,21 +194,16 @@ class TeamConnectorService:
         except Exception as error:
             _log.warning("TEAM_CONNECTOR_GRANTS_UNAVAILABLE status=%s cached=%s", _status(error), cached is not None)
             value = () if cached is None else cached[1]
-            with self._grants_lock:
-                if self._generations.get(key, 0) == generation:
-                    self._grants[key] = (monotonic() + FAILED_GRANTS_SECONDS, value)
+            self._grants.store(key, generation, monotonic() + FAILED_GRANTS_SECONDS, value)
             return value
         value = tuple(grants)
-        with self._grants_lock:
-            if self._generations.get(key, 0) == generation:
-                self._grants[key] = (now + GRANTS_SECONDS, value)
+        self._grants.store(key, generation, now + GRANTS_SECONDS, value)
         return value
 
 
 def current_team_connector_grants(runtime) -> tuple:
     service = getattr(runtime, "team_connectors", None)
-    raw = getattr(runtime, "bindings", None) or {}
-    bindings = tuple(raw.values()) if hasattr(raw, "values") else tuple(raw)
+    bindings = runtime_bindings(runtime)
     if service is None or not bindings:
         return ()
     return service.team_grants(bindings[0].tenant_id, bindings[0].team_id)

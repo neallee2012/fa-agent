@@ -119,13 +119,35 @@ def _needs_response_follow(accepted):
     return accepted.dispatch.state != "already_queued"
 
 
+def _require_original_api(api_url):
+    address = urlsplit(api_url)
+    if (address.scheme != "https" or not address.hostname or address.username or address.password
+            or address.query or address.fragment or address.path not in {"", "/"}
+            or address.port not in {None, 443}):
+        raise Problem(403, "HOSTED_API_CONFIGURATION", "the original HTTPS behavior API is required")
+
+
+def _continuing(ctx):
+    """False once shutdown asks the task to leave for recovery; cancellation raises, after that check."""
+    if ctx.shutdown.is_set():
+        return False
+    if ctx.cancel.is_set():
+        raise asyncio.CancelledError()
+    return True
+
+
+def _queued_input(value):
+    if isinstance(value, (NativeRelaySend, _AcceptedFollow, _WaitingEnvironment)):
+        return value
+    try:
+        return _FOLLOW_INPUT.validate_json(json.dumps(value, allow_nan=False))
+    except (ValueError, TypeError):
+        raise Problem(409, "NATIVE_RELAY_REFUSED", "the original relay task input is invalid") from None
+
+
 class NativeAgentRelayClient:
     def __init__(self, api_url, token_provider, *, transport=None):
-        address = urlsplit(api_url)
-        if (address.scheme != "https" or not address.hostname or address.username or address.password
-                or address.query or address.fragment or address.path not in {"", "/"}
-                or address.port not in {None, 443}):
-            raise Problem(403, "HOSTED_API_CONFIGURATION", "the original HTTPS behavior API is required")
+        _require_original_api(api_url)
         self.api_url, self.token_provider, self.transport = api_url.rstrip("/"), token_provider, transport
         self.runtime: NativeTurnRuntime | None = None
         # Roster read once per conversation in this process for up to _DIRECTORY_SECONDS (the response has no
@@ -136,98 +158,108 @@ class NativeAgentRelayClient:
             max_attempts=10, initial_delay=1, max_delay=60,
             retry_on=(NativeRecipientFollowing, NativeResponseFollowFailure))
 
-        async def delivery(ctx):
-            if ctx.shutdown.is_set():
-                return await ctx.exit_for_recovery()
-            if ctx.cancel.is_set():
-                raise asyncio.CancelledError()
-            value = ctx.input
-            if not isinstance(value, (NativeRelaySend, _AcceptedFollow, _WaitingEnvironment)):
-                try:
-                    value = _FOLLOW_INPUT.validate_json(json.dumps(value, allow_nan=False))
-                except (ValueError, TypeError):
-                    raise Problem(409, "NATIVE_RELAY_REFUSED", "the original relay task input is invalid") from None
-            retained = None
-            if isinstance(value, _WaitingEnvironment):
-                if self.runtime is not None:
-                    sender = await self.runtime.read(value.command.request_id)
-                    if sender.conversation_id != value.command.conversation_id:
-                        raise Problem(409, "NATIVE_STATE_SCOPE", "the queued sender conversation differs")
-                    retained = sender.delegation
-                    if retained is not None and retained.recipient_agent_id != value.command.message.recipient_agent_id:
-                        raise Problem(409, "NATIVE_STATE_SCOPE", "the retained acceptance names another recipient")
-                if retained is None and not await self._follow_environment(ctx, value.command):
-                    return await ctx.exit_for_recovery()
-                value = value.command
-            if isinstance(value, NativeRelaySend):
-                while True:
-                    if ctx.shutdown.is_set():
-                        return await ctx.exit_for_recovery()
-                    if ctx.cancel.is_set():
-                        raise asyncio.CancelledError()
-                    attempt = None
-                    try:
-                        if self.runtime is not None:
-                            from .native_relay_delivery import before_send
-                            attempt = await before_send(self.runtime, value)
-                        if ctx.shutdown.is_set():
-                            return await ctx.exit_for_recovery()
-                        if ctx.cancel.is_set():
-                            raise asyncio.CancelledError()
-                        accepted = await self._request("/send", NativeRelayAcceptance, value)
-                    except (NativeRecipientFollowing, NativeRecipientNotReady) as error:
-                        if self.runtime is not None and not (
-                                isinstance(error, NativeRecipientFollowing) and error.admission_unconfirmed):
-                            from .native_relay_delivery import refused_before_delivery
-                            await refused_before_delivery(self.runtime, value, attempt)
-                        if retained is not None:
-                            raise NativeResponseFollowFailure() from None
-                        waiting = (await self._follow_environment(ctx, value) if isinstance(error, NativeRecipientFollowing)
-                                   else await self._wait(ctx, 1))
-                        if not waiting:
-                            return await ctx.exit_for_recovery()
-                        continue
-                    except Problem as error:
-                        if error.status >= 500 and error.body["error"]["code"] == "NATIVE_RELAY_OUTCOME_UNKNOWN":
-                            raise NativeResponseFollowFailure() from None
-                        raise
-                    break
-                if accepted.recipient_agent_id != value.message.recipient_agent_id:
-                    raise Problem(502, "NATIVE_RELAY_OUTCOME_UNKNOWN", "the receipt belongs to another recipient")
-                if retained is not None and _follow_scope(accepted) != _follow_scope(retained):
-                    raise Problem(409, "NATIVE_STATE_SCOPE", "the original send returned a different acceptance")
-                if self.runtime is not None:
-                    from .native_relay_delivery import accepted as save_acceptance
-                    bound = await self.runtime._rid(value.request_id)
-                    if bound.value.receipt.conversation_id != value.conversation_id:
-                        raise Problem(409, "NATIVE_STATE_SCOPE", "the queued sender conversation differs")
-                    if not await save_acceptance(self.runtime, value, accepted) and accepted.status != "busy_refused":
-                        await self._retain_queued_acceptance(self.runtime, bound, accepted)
-                await self._start_response_follow("/send", value, accepted)
-                return accepted
-            return await self._follow_accepted(ctx, value)
-
         @task(name="fa-native-version-message-v1", retry=self._follow_retry)
         async def following(ctx: TaskContext[NativeRelaySend | _AcceptedFollow | _WaitingEnvironment]) -> NativeRelayAcceptance:
             try:
-                return await delivery(ctx)
+                return await self._deliver(ctx)
             except (Problem, asyncio.CancelledError) as error:
                 if isinstance(error, (NativeRecipientFollowing, NativeResponseFollowFailure)) and (
                         ctx.retry_attempt + 1 < self._follow_retry.max_attempts):
                     raise
-                value = ctx.input
-                if not isinstance(value, (NativeRelaySend, _AcceptedFollow, _WaitingEnvironment)):
-                    value = _FOLLOW_INPUT.validate_json(json.dumps(value))
-                command = value.command if isinstance(value, _WaitingEnvironment) else value
-                if self.runtime is not None and isinstance(command, NativeRelaySend):
-                    self._directories.pop(command.conversation_id, None)
-                    from .native_relay_delivery import stopped
-                    await stopped(self.runtime, command, expired=ctx.timeout_exceeded, reason=(
-                        "NATIVE_RELAY_WAIT_EXPIRED" if ctx.timeout_exceeded else
-                        error.body["error"]["code"] if isinstance(error, Problem) else "NATIVE_RELAY_OUTCOME_UNKNOWN"))
+                await self._record_stopped(ctx, error)
                 raise
 
         self._following = following
+
+    async def _deliver(self, ctx):
+        if not _continuing(ctx):
+            return await ctx.exit_for_recovery()
+        value = _queued_input(ctx.input)
+        retained = None
+        if isinstance(value, _WaitingEnvironment):
+            if self.runtime is not None:
+                retained = await self._retained_acceptance(value.command)
+            if retained is None and not await self._follow_environment(ctx, value.command):
+                return await ctx.exit_for_recovery()
+            value = value.command
+        if not isinstance(value, NativeRelaySend):
+            return await self._follow_accepted(ctx, value)
+        accepted = await self._send_original(ctx, value, retained)
+        if accepted is None:
+            return await ctx.exit_for_recovery()
+        await self._save_acceptance(value, accepted, retained)
+        await self._start_response_follow("/send", value, accepted)
+        return accepted
+
+    async def _retained_acceptance(self, command):
+        sender = await self.runtime.read(command.request_id)
+        if sender.conversation_id != command.conversation_id:
+            raise Problem(409, "NATIVE_STATE_SCOPE", "the queued sender conversation differs")
+        retained = sender.delegation
+        if retained is not None and retained.recipient_agent_id != command.message.recipient_agent_id:
+            raise Problem(409, "NATIVE_STATE_SCOPE", "the retained acceptance names another recipient")
+        return retained
+
+    async def _send_original(self, ctx, value, retained):
+        """The recipient acceptance, or None once shutdown leaves the task for recovery."""
+        while True:
+            if not _continuing(ctx):
+                return None
+            attempt = None
+            try:
+                if self.runtime is not None:
+                    from .native_relay_delivery import before_send
+                    attempt = await before_send(self.runtime, value)
+                if not _continuing(ctx):
+                    return None
+                return await self._request("/send", NativeRelayAcceptance, value)
+            except (NativeRecipientFollowing, NativeRecipientNotReady) as error:
+                if not await self._wait_after_refusal(ctx, value, attempt, retained, error):
+                    return None
+            except Problem as error:
+                if error.status >= 500 and error.body["error"]["code"] == "NATIVE_RELAY_OUTCOME_UNKNOWN":
+                    raise NativeResponseFollowFailure() from None
+                raise
+
+    async def _wait_after_refusal(self, ctx, value, attempt, retained, error):
+        """Mark the attempt refused, then wait for the recipient; False once shutdown ended the wait.
+
+        A retained acceptance raises NativeResponseFollowFailure instead of waiting.
+        """
+        if self.runtime is not None and not (
+                isinstance(error, NativeRecipientFollowing) and error.admission_unconfirmed):
+            from .native_relay_delivery import refused_before_delivery
+            await refused_before_delivery(self.runtime, value, attempt)
+        if retained is not None:
+            raise NativeResponseFollowFailure() from None
+        return (await self._follow_environment(ctx, value) if isinstance(error, NativeRecipientFollowing)
+                else await self._wait(ctx, 1))
+
+    async def _save_acceptance(self, value, accepted, retained):
+        if accepted.recipient_agent_id != value.message.recipient_agent_id:
+            raise Problem(502, "NATIVE_RELAY_OUTCOME_UNKNOWN", "the receipt belongs to another recipient")
+        if retained is not None and _follow_scope(accepted) != _follow_scope(retained):
+            raise Problem(409, "NATIVE_STATE_SCOPE", "the original send returned a different acceptance")
+        if self.runtime is not None:
+            from .native_relay_delivery import accepted as save_acceptance
+            bound = await self.runtime._rid(value.request_id)
+            if bound.value.receipt.conversation_id != value.conversation_id:
+                raise Problem(409, "NATIVE_STATE_SCOPE", "the queued sender conversation differs")
+            if not await save_acceptance(self.runtime, value, accepted) and accepted.status != "busy_refused":
+                await self._retain_queued_acceptance(self.runtime, bound, accepted)
+
+    async def _record_stopped(self, ctx, error):
+        value = ctx.input
+        # Unlike _queued_input, a failure here escapes as it is: delivery has already refused this input.
+        if not isinstance(value, (NativeRelaySend, _AcceptedFollow, _WaitingEnvironment)):
+            value = _FOLLOW_INPUT.validate_json(json.dumps(value))
+        command = value.command if isinstance(value, _WaitingEnvironment) else value
+        if self.runtime is not None and isinstance(command, NativeRelaySend):
+            self._directories.pop(command.conversation_id, None)
+            from .native_relay_delivery import stopped
+            await stopped(self.runtime, command, expired=ctx.timeout_exceeded, reason=(
+                "NATIVE_RELAY_WAIT_EXPIRED" if ctx.timeout_exceeded else
+                error.body["error"]["code"] if isinstance(error, Problem) else "NATIVE_RELAY_OUTCOME_UNKNOWN"))
 
     @staticmethod
     async def _retain_queued_acceptance(runtime, original, accepted):
@@ -296,19 +328,13 @@ class NativeAgentRelayClient:
             for signal in signals:
                 signal.cancel()
             await asyncio.gather(*signals, return_exceptions=True)
-        if ctx.shutdown.is_set():
-            return False
-        if ctx.cancel.is_set():
-            raise asyncio.CancelledError()
-        return True
+        return _continuing(ctx)
 
     async def _follow_environment(self, ctx, command):
         attempts, baseline, observing = 0, None, False
         while True:
-            if ctx.shutdown.is_set():
+            if not _continuing(ctx):
                 return False
-            if ctx.cancel.is_set():
-                raise asyncio.CancelledError()
             try:
                 view = await self._request(
                     "/environment/observe" if observing else "/environment", NativeEnvironmentView, command)
@@ -316,10 +342,8 @@ class NativeAgentRelayClient:
                 if not await self._wait(ctx, attempts):
                     return False
                 continue
-            if ctx.shutdown.is_set():
+            if not _continuing(ctx):
                 return False
-            if ctx.cancel.is_set():
-                raise asyncio.CancelledError()
             if view.agent_id != command.message.recipient_agent_id:
                 raise Problem(502, "NATIVE_STATE_SCOPE", "the environment belongs to another recipient")
             if view.files_reconcile_required:
@@ -340,10 +364,8 @@ class NativeAgentRelayClient:
                         if not await self._wait(ctx, attempts):
                             return False
                         continue
-                    if ctx.shutdown.is_set():
+                    if not _continuing(ctx):
                         return False
-                    if ctx.cancel.is_set():
-                        raise asyncio.CancelledError()
                     if observed.agent_id != command.message.recipient_agent_id:
                         raise Problem(502, "NATIVE_STATE_SCOPE", "the environment belongs to another recipient")
                     if observed.files_reconcile_required:
@@ -370,10 +392,8 @@ class NativeAgentRelayClient:
                 for signal in signals:
                     signal.cancel()
                 await asyncio.gather(*signals, return_exceptions=True)
-            if ctx.shutdown.is_set():
+            if not _continuing(ctx):
                 return await ctx.exit_for_recovery()
-            if ctx.cancel.is_set():
-                raise asyncio.CancelledError()
             try:
                 accepted = await self._request(original.route, NativeRelayAcceptance, original.command)
             except Problem as error:

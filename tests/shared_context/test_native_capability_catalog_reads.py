@@ -57,7 +57,7 @@ def test_catalog_gate_reads_one_guarded_legacy_row_snapshot(listing, caplog):
     result, counts = measured(caplog, lambda: native.capability_catalog(case.principal, scope))
     # Was (6, 5) with the selection key batched in, (10, 10) unbatched.
     assert counts == (5, 5)
-    assert [item.entry_id for item in result.entries] == ["WebIQ-MCP"]
+    assert [item.entry_id for item in result.entries] == ["WebSearch-MCP"]
 
 
 def test_catalog_gate_keeps_its_refusals_and_their_order(listing, monkeypatch):

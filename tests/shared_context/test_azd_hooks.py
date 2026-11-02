@@ -2863,6 +2863,398 @@ def test_clearing_the_vnet_of_an_account_injected_into_it_stops_before_any_write
 OWN_AGENT_SUBNET = (f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-dev/providers/Microsoft.Network/virtualNetworks/"
                     "vnet-dev/subnets/snet-agents")
 
+# ---- check_existing_vnet alone: exact messages, which rule stops first, and every az read ---------------------------
+
+NETWORK_READ = "api-version=2024-05-01"
+RESERVED_RANGES = ("169.254.0.0/16, 172.30.0.0/16, 172.31.0.0/16, 192.0.2.0/24, 100.100.0.0/17, 100.100.128.0/19, "
+                   "100.100.160.0/19, 100.100.192.0/19, 100.100.224.0/19, 0.0.0.0/8, 127.0.0.0/8")
+CAE_URL = (f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-dev/providers/Microsoft.App/managedEnvironments/cae-dev"
+           "?api-version=2024-03-01")
+EVERY_READ = [f"{USER_VNET}?{NETWORK_READ}", f"{USER_VNET}/subnets/snet-api?{NETWORK_READ}",
+              f"{USER_VNET}/subnets/snet-agents?{NETWORK_READ}",
+              f"{USER_VNET}/subnets/snet-private-endpoints?{NETWORK_READ}", CAE_URL]
+OTHER_SUBNET = f"{USER_VNET}/subnets/snet-other"
+
+
+def injected_into_account(*subnets, scenario="agent"):
+    return {"name": ACCOUNT, "properties": {"networkInjections": [{"scenario": scenario, "subnetArmId": subnet}
+                                                                  for subnet in subnets]}}
+
+
+ACCOUNT_ELSEWHERE = injected_into_account(OTHER_SUBNET)
+# In source order, with how many of EVERY_READ happen before the stop. A rule's api, agents and pe keys are subnet
+# fields; a later rule's fields stay in force where the earlier rule did not set them.
+VNET_RULES = [
+    ("FA_DNS_MODE must be azd or existing, not 'hub'; nothing was changed", {"FA_DNS_MODE": "hub"}, 0),
+    ("FA_VNET_RESOURCE_ID needs FA_NETWORK_MODE=private (an existing VNet is for the injected Foundry account); "
+     "nothing was changed", {"mode": "public"}, 0),
+    ("FA_API_SUBNET_NAT_EGRESS creates FA's own NAT, which an existing VNet does not get: give your subnets egress "
+     "yourself and set FA_API_SUBNET_NAT_EGRESS false; nothing was changed", {"FA_API_SUBNET_NAT_EGRESS": " True "}, 0),
+    (f"FA_VNET_RESOURCE_ID must be a VNet resource ID, /subscriptions/<id>/resourceGroups/<group>/providers/"
+     f"Microsoft.Network/virtualNetworks/<name>, not '{USER_VNET}/'; nothing was changed",
+     {"FA_VNET_RESOURCE_ID": USER_VNET + "/"}, 0),
+    (f"VNet vnet-hub is in subscription {OTHER[:36]}, not this environment's {SUBSCRIPTION}; use a VNet in the same "
+     "subscription; nothing was changed", {"FA_VNET_RESOURCE_ID": USER_VNET.replace(SUBSCRIPTION, OTHER[:36])}, 0),
+    ("VNet vnet-hub is in rg-dev, the resource group `azd down` deletes with everything in it. Use a VNet in another "
+     "resource group; nothing was changed", {"FA_VNET_RESOURCE_ID": USER_VNET.replace("rg-net", "RG-DEV")}, 0),
+    ("the API, agent and private endpoint subnets must be three different subnets (shared, SHARED, "
+     "snet-private-endpoints): the agent subnet serves one Foundry account only and Container Apps needs its own; "
+     "nothing was changed", {"FA_API_SUBNET_NAME": "shared", "FA_AGENT_SUBNET_NAME": "SHARED"}, 0),
+    ("FA_AGENT_SUBNET_NAME must be at most 63 bytes (Foundry Agent Service limit); nothing was changed",
+     {"FA_AGENT_SUBNET_NAME": "é" * 32}, 0),
+    (f"VNet {USER_VNET} was not found; check FA_VNET_RESOURCE_ID; nothing was changed", {"no_vnet": True}, 1),
+    ("VNet vnet-hub is in eastus, but the Foundry account must be in the VNet's region (westus3); use a VNet in "
+     "westus3; nothing was changed", {"location": "eastus"}, 1),
+    (f"VNet vnet-hub address space 100.100.224.0/20 overlaps a range Container Apps and Foundry reserve "
+     f"({RESERVED_RANGES}); nothing was changed", {"space": ["10.20.0.0/16", "100.100.224.0/20"]}, 1),
+    ("VNet vnet-hub uses its own DNS servers, which do not query the private DNS zones FA would link to it. Set "
+     "FA_DNS_MODE existing and serve the names yourself (deploy/azd/README.md); nothing was changed",
+     {"dns": ["10.0.0.4"]}, 1),
+    ("VNet vnet-hub has no subnet snet-api (FA_API_SUBNET_NAME); create it or name another; nothing was changed",
+     {"api": None}, 2),
+    ("VNet vnet-hub has no subnet snet-agents (FA_AGENT_SUBNET_NAME); create it or name another; nothing was changed",
+     {"agents": None}, 3),
+    ("VNet vnet-hub has no subnet snet-private-endpoints (FA_PRIVATE_ENDPOINT_SUBNET_NAME); create it or name "
+     "another; nothing was changed", {"pe": None}, 4),
+    ("subnet snet-api must be delegated to Microsoft.App/environments; nothing was changed",
+     {"api": {"delegations": []}}, 4),
+    ("subnet snet-api (10.20.0.0/28) must be an IPv4 /27 or larger; nothing was changed",
+     {"api": {"prefix": "10.20.0.0/28"}}, 4),
+    (f"subnet snet-api (172.30.0.0/27) overlaps a range Container Apps and Foundry reserve ({RESERVED_RANGES}); "
+     "nothing was changed", {"api": {"prefix": "172.30.0.0/27"}}, 4),
+    ("subnet snet-agents must be delegated to Microsoft.App/environments; nothing was changed",
+     {"agents": {"delegations": []}}, 4),
+    ("subnet snet-agents (10.20.1.0/28) must be an IPv4 /27 or larger; nothing was changed",
+     {"agents": {"prefix": "10.20.1.0/28"}}, 4),
+    (f"subnet snet-agents (100.100.130.0/27) overlaps a range Container Apps and Foundry reserve ({RESERVED_RANGES}); "
+     "nothing was changed", {"agents": {"prefix": "100.100.130.0/27"}}, 4),
+    ("subnet snet-agents (100.64.1.0/24) must be in an RFC 1918 range (10/8, 172.16/12, 192.168/16) for Foundry Agent "
+     "Service; nothing was changed", {"agents": {"prefix": "100.64.1.0/24"}}, 4),
+    (f"Foundry account {ACCOUNT} was created injected into {OTHER_SUBNET}, and injection cannot change: "
+     "FA_VNET_RESOURCE_ID and FA_AGENT_SUBNET_NAME must name that subnet; nothing was changed",
+     {"account": ACCOUNT_ELSEWHERE}, 4),
+    ("subnet snet-agents already has a service association link, so another Foundry account uses it (or one is still "
+     "being deleted); a subnet serves one account only. Name a free subnet; nothing was changed",
+     {"agents": {"links": 1}}, 4),
+    ("subnet snet-api already has a service association link and this environment's cae-dev does not use it, so "
+     "another Container Apps environment does; name a free subnet; nothing was changed", {"api": {"links": 1}}, 5),
+    ("subnet snet-private-endpoints is delegated, and private endpoints cannot use a delegated subnet; nothing was "
+     "changed", {"pe": {"delegations": DELEGATED}}, 4),
+    ("subnet snet-private-endpoints must be /28 or larger (FA uses up to about 10 private endpoint IPs); nothing was "
+     "changed", {"pe": {"prefix": "10.20.2.0/29"}}, 4),
+]
+SUBNET_DEFAULTS = {"api": {"prefix": "10.20.0.0/27"}, "agents": {"prefix": "10.20.1.0/24"},
+                   "pe": {"prefix": "10.20.2.0/27", "delegations": []}}
+SUBNET_NAMES = {"api": "snet-api", "agents": "snet-agents", "pe": "snet-private-endpoints"}
+
+
+def vnet_case(*rules):
+    """The rules' fields merged so that an earlier rule wins, but a subnet keeps a later rule's other fields."""
+    case = {}
+    for rule in reversed(rules):
+        for key, value in rule.items():
+            both_rules_set_fields = key in SUBNET_DEFAULTS and value and case.get(key)
+            case[key] = {**case[key], **value} if both_rules_set_fields else value
+    return case
+
+
+def checked_vnet(hooks, tmp_path, case=None, *, account=None, mode="private", cae=NO_RESOURCE, **values):
+    """A context whose user VNet is built from `case`, not yet checked; returns the check as a callable too."""
+    case = case or {}
+    subnets = {name: (None if case.get(key, {}) is None
+                      else app_subnet(**{**SUBNET_DEFAULTS[key], **case.get(key, {})}))
+               for key, name in SUBNET_NAMES.items()}
+    vnet = (lambda args: NO_RESOURCE) if case.get("no_vnet") else user_vnet(
+        location=case.get("location", "westus3"), dns=case.get("dns", ()), space=case.get("space", ("10.20.0.0/16",)),
+        **subnets)
+    routes = {"Microsoft.Network/virtualNetworks/": vnet, "Microsoft.App/managedEnvironments/": cae}
+    env = {key: value for key, value in case.items() if key.startswith("FA_")}
+    ctx = context(hooks, tmp_path, routes, **{**BYO, **env, **values})
+    return ctx, lambda: hooks.check_existing_vnet(ctx, case.get("mode", mode), case.get("account", account))
+
+
+def urls(ctx):
+    for call in ctx.run.calls:
+        assert call[:5] == ["az", "rest", "--method", "get", "--url"] and call[6:] == ["-o", "json"], call
+    return [call[5] for call in ctx.run.calls]
+
+
+@pytest.mark.parametrize("first", range(len(VNET_RULES)), ids=lambda index: VNET_RULES[index][0][:60])
+def test_each_vnet_rule_alone_stops_with_its_exact_message_after_its_reads(hooks, tmp_path, first):
+    message, rule, reads = VNET_RULES[first]
+    ctx, check = checked_vnet(hooks, tmp_path, rule)
+    with pytest.raises(hooks.Stop) as stopped:
+        check()
+    assert str(stopped.value) == message
+    assert urls(ctx) == EVERY_READ[:reads]
+
+
+@pytest.mark.parametrize("first", range(len(VNET_RULES)), ids=lambda index: VNET_RULES[index][0][:60])
+def test_the_earliest_broken_vnet_rule_is_the_one_reported(hooks, tmp_path, first):
+    message, _, reads = VNET_RULES[first]
+    ctx, check = checked_vnet(hooks, tmp_path, vnet_case(*[rule for _, rule, _ in VNET_RULES[first:]]))
+    with pytest.raises(hooks.Stop) as stopped:
+        check()
+    assert str(stopped.value) == message
+    assert urls(ctx) == EVERY_READ[:reads]
+
+
+def test_a_vnet_that_fits_is_read_once_each_in_order_and_says_so(hooks, tmp_path, capsys):
+    ctx, check = checked_vnet(hooks, tmp_path)
+    assert check() is None
+    assert urls(ctx) == EVERY_READ[:4]
+    assert capsys.readouterr().out == (
+        "FA: existing VNet vnet-hub in rg-net (read only): snet-api and snet-agents delegated to "
+        "Microsoft.App/environments, private endpoints in snet-private-endpoints; DNS azd. FA creates no VNet, subnet, "
+        "NSG or NAT in it\n")
+
+
+def test_a_vnet_read_that_fails_stops_with_the_az_error_and_reads_nothing_more(hooks, tmp_path):
+    denied = failed("ERROR: Forbidden AuthorizationFailed")
+    for url, reads in ((EVERY_READ[0], 1), (EVERY_READ[2], 3)):
+        ctx, check = checked_vnet(hooks, tmp_path)
+        answer = ctx.run.routes["Microsoft.Network/virtualNetworks/"]
+        ctx.run.routes["Microsoft.Network/virtualNetworks/"] = (
+            lambda args, url=url: denied if args[5] == url else answer(args))
+        with pytest.raises(hooks.Stop) as stopped:
+            check()
+        assert str(stopped.value) == "az rest --method get failed: ERROR: Forbidden AuthorizationFailed"
+        assert urls(ctx) == EVERY_READ[:reads]
+    ctx, check = checked_vnet(hooks, tmp_path, {"api": {"links": 1}}, cae=denied)
+    with pytest.raises(hooks.Stop, match="^az rest --method get failed: ERROR: Forbidden AuthorizationFailed$"):
+        check()
+    assert urls(ctx) == EVERY_READ
+
+
+def test_warnings_come_in_order_and_before_a_later_stop(hooks, tmp_path, capsys):
+    api = ("FA: warning: subnet snet-api has no NAT gateway or route table. FA adds no egress to your VNet: make sure "
+           "it reaches the internet (the FA API, Entra ID, ACR, App Insights), e.g. through a Virtual WAN hub\n")
+    agents = api.replace("snet-api", "snet-agents")
+    small = ("FA: warning: subnet snet-agents is 10.20.1.0/26; Foundry recommends /24 or larger for production (each "
+             "Hosted session takes one IP)\n")
+    bare = {"api": {"egress": False}, "agents": {"egress": False, "prefix": "10.20.1.0/26"}}
+    done = ("FA: existing VNet vnet-hub in rg-net (read only): snet-api and snet-agents delegated to "
+            "Microsoft.App/environments, private endpoints in snet-private-endpoints; DNS azd. FA creates no VNet, "
+            "subnet, NSG or NAT in it\n")
+    checked_vnet(hooks, tmp_path, bare)[1]()
+    assert capsys.readouterr().out == api + agents + small + done
+    # A later stop: the warnings before it printed, the ones after it did not.
+    _, check = checked_vnet(hooks, tmp_path, vnet_case({"agents": {"delegations": []}}, bare))
+    with pytest.raises(hooks.Stop, match="snet-agents must be delegated"):
+        check()
+    assert capsys.readouterr().out == api
+    _, check = checked_vnet(hooks, tmp_path, vnet_case({"agents": {"prefix": "100.64.1.0/26"}}, bare))
+    with pytest.raises(hooks.Stop, match="RFC 1918"):
+        check()
+    assert capsys.readouterr().out == api + agents
+    _, check = checked_vnet(hooks, tmp_path, vnet_case({"account": ACCOUNT_ELSEWHERE}, bare))
+    with pytest.raises(hooks.Stop, match="injection cannot change"):
+        check()
+    assert capsys.readouterr().out == api + agents + small
+
+
+@pytest.mark.parametrize("subnet, says_egress", [
+    ({"properties": {"addressPrefix": "10.20.0.0/27", "delegations": DELEGATED, "routeTable": {"id": "rt"}}}, False),
+    ({"properties": {"addressPrefix": "10.20.0.0/27", "delegations": DELEGATED, "natGateway": {"id": "nat"}}}, False),
+    ({"properties": {"addressPrefix": "10.20.0.0/27", "delegations": DELEGATED}}, True),
+])
+def test_either_a_nat_gateway_or_a_route_table_counts_as_egress(hooks, tmp_path, capsys, subnet, says_egress):
+    ctx = context(hooks, tmp_path, {"Microsoft.Network/virtualNetworks/": user_vnet(**{"snet-api": subnet})}, **BYO)
+    hooks.check_existing_vnet(ctx, "private", None)
+    assert ("warning: subnet snet-api has no NAT" in capsys.readouterr().out) is says_egress
+
+
+@pytest.mark.parametrize("subnet, message", [
+    # /20 is large enough, so only the IPv4 half of the rule can refuse it.
+    (app_subnet("2000::/20"), "subnet snet-api .2000::/20. must be an IPv4 /27 or larger"),
+    # addressPrefixes wins over addressPrefix, and only its first entry counts.
+    ({"properties": {"addressPrefix": "10.20.0.0/27", "addressPrefixes": ["10.20.0.0/28", "10.20.0.0/24"],
+                     "delegations": DELEGATED, "natGateway": {"id": "nat"}}},
+     "subnet snet-api .10.20.0.0/28. must be an IPv4 /27 or larger"),
+])
+def test_the_subnet_prefix_rule_reads_ipv6_and_address_prefixes(hooks, tmp_path, subnet, message):
+    ctx = context(hooks, tmp_path, {"Microsoft.Network/virtualNetworks/": user_vnet(**{"snet-api": subnet})}, **BYO)
+    with pytest.raises(hooks.Stop, match=message):
+        hooks.check_existing_vnet(ctx, "private", None)
+
+
+def test_the_smallest_subnets_the_rules_take(hooks, tmp_path):
+    _, check = checked_vnet(hooks, tmp_path, {"pe": {"prefix": "10.20.2.0/28"}, "agents": {"prefix": "10.20.1.0/27"}})
+    check()
+
+
+def test_an_agent_subnet_smaller_than_a_24_warns_from_a_25(hooks, tmp_path, capsys):
+    checked_vnet(hooks, tmp_path, {"agents": {"prefix": "10.20.1.0/25"}})[1]()
+    assert capsys.readouterr().out.startswith(
+        "FA: warning: subnet snet-agents is 10.20.1.0/25; Foundry recommends /24 or larger for production (each "
+        "Hosted session takes one IP)\n")
+
+
+@pytest.mark.parametrize("properties", [
+    {}, {"addressSpace": None, "dhcpOptions": None}, {"addressSpace": {}, "dhcpOptions": {}},
+    {"addressSpace": {"addressPrefixes": None}, "dhcpOptions": {"dnsServers": None}}])
+def test_a_vnet_that_omits_its_address_space_or_dns_fields_still_passes(hooks, tmp_path, properties):
+    # az leaves out dhcpOptions for the default Azure DNS; the other omissions are only tolerated, never required.
+    ctx, check = checked_vnet(hooks, tmp_path)
+    answer = ctx.run.routes["Microsoft.Network/virtualNetworks/"]
+    ctx.run.routes["Microsoft.Network/virtualNetworks/"] = (
+        lambda args: ok({"location": "westus3", "properties": properties}) if args[5].split("?")[0] == USER_VNET
+        else answer(args))
+    check()
+
+
+def test_a_subnet_without_a_delegations_field_is_not_delegated(hooks, tmp_path):
+    ctx, check = checked_vnet(hooks, tmp_path)
+    answer = ctx.run.routes["Microsoft.Network/virtualNetworks/"]
+    ctx.run.routes["Microsoft.Network/virtualNetworks/"] = (
+        lambda args: ok({"properties": {"addressPrefix": "10.20.0.0/27"}}) if args[5].split("?")[0].endswith("snet-api")
+        else answer(args))
+    with pytest.raises(hooks.Stop, match="^subnet snet-api must be delegated to Microsoft.App/environments;"):
+        check()
+
+
+def test_names_and_ids_compare_ignoring_case_and_the_region_is_trimmed(hooks, tmp_path):
+    id_as_typed = USER_VNET.replace(SUBSCRIPTION, SUBSCRIPTION.upper())
+    case = {"api": {"links": 1}, "location": "WestUS3"}
+    used = ok({"properties": {"vnetConfiguration": {"infrastructureSubnetId": f"{USER_VNET.upper()}/SUBNETS/SNET-API"}}})
+    ctx, check = checked_vnet(hooks, tmp_path, case, cae=used, FA_VNET_RESOURCE_ID=id_as_typed,
+                              AZURE_LOCATION=" WESTUS3 ")
+    ctx.run.routes["Microsoft.Network/virtualNetworks/"] = (
+        lambda args, answer=ctx.run.routes["Microsoft.Network/virtualNetworks/"]:
+        answer([*args[:5], args[5].replace(id_as_typed, USER_VNET), *args[6:]]))
+    check()
+    # The ID is used as typed: the reads and the Container Apps environment's subscription take its spelling.
+    assert [url.split("?")[0] for url in urls(ctx)] == [
+        id_as_typed, *[f"{id_as_typed}/subnets/{name}" for name in SUBNET_NAMES.values()],
+        CAE_URL.split("?")[0].replace(SUBSCRIPTION, SUBSCRIPTION.upper())]
+
+
+@pytest.mark.parametrize("case, message", [
+    # Two rules that read the same input: the case breaks both, so the table above cannot order them.
+    ({"FA_VNET_RESOURCE_ID": USER_VNET.replace(SUBSCRIPTION, OTHER[:36]).replace("rg-net", "rg-dev")},
+     "not this environment's"),
+    ({"FA_API_SUBNET_NAME": "a" * 64, "FA_AGENT_SUBNET_NAME": "a" * 64}, "must be three different subnets"),
+    ({"api": {"prefix": "172.30.0.0/28"}}, "subnet snet-api .172.30.0.0/28. must be an IPv4 /27 or larger"),
+    ({"agents": {"prefix": "100.64.1.0/28"}}, "subnet snet-agents .100.64.1.0/28. must be an IPv4 /27 or larger"),
+])
+def test_rules_on_the_same_input_keep_their_order(hooks, tmp_path, case, message):
+    _, check = checked_vnet(hooks, tmp_path, case)
+    with pytest.raises(hooks.Stop, match=message):
+        check()
+
+
+def test_a_vnet_without_a_location_is_refused_not_a_crash(hooks, tmp_path):
+    _, check = checked_vnet(hooks, tmp_path, {"location": None})
+    with pytest.raises(hooks.Stop, match="VNet vnet-hub is in None, but the Foundry account"):
+        check()
+
+
+def test_a_subnet_delegated_to_another_service_is_not_delegated(hooks, tmp_path):
+    other = [{"name": "web", "properties": {"serviceName": "Microsoft.Web/serverFarms"}}]
+    _, check = checked_vnet(hooks, tmp_path, {"api": {"delegations": other}})
+    with pytest.raises(hooks.Stop, match="subnet snet-api must be delegated to Microsoft.App/environments"):
+        check()
+
+
+def test_the_agent_subnet_name_limit_counts_bytes_up_to_63(hooks, tmp_path):
+    name = "a" * 63
+    vnet = user_vnet(**{name: app_subnet("10.20.1.0/24")})
+    ctx = context(hooks, tmp_path, {"Microsoft.Network/virtualNetworks/": vnet}, **BYO, FA_AGENT_SUBNET_NAME=name)
+    hooks.check_existing_vnet(ctx, "private", None)
+
+
+def test_the_network_mode_and_dns_rules_take_their_other_spellings(hooks, tmp_path):
+    for values in ({"FA_API_SUBNET_NAT_EGRESS": "false"}, {"FA_API_SUBNET_NAT_EGRESS": "yes"}, {"FA_DNS_MODE": "azd"}):
+        _, check = checked_vnet(hooks, tmp_path, **values)
+        check()
+    ctx, check = checked_vnet(hooks, tmp_path, {"dns": ["10.0.0.4"]}, FA_DNS_MODE="existing")
+    check()
+    assert len(urls(ctx)) == 4
+
+
+def test_a_custom_container_apps_environment_is_the_one_read_and_named(hooks, tmp_path):
+    ctx, check = checked_vnet(hooks, tmp_path, {"api": {"links": 1}}, FA_CONTAINER_APPS_ENVIRONMENT="cae-mine",
+                              AZURE_RESOURCE_GROUP="rg-mine")
+    with pytest.raises(hooks.Stop, match="this environment's cae-mine does not use it"):
+        check()
+    assert urls(ctx)[4] == (f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-mine/providers/Microsoft.App/"
+                            "managedEnvironments/cae-mine?api-version=2024-03-01")
+
+
+def test_the_container_apps_environment_is_read_only_when_the_api_subnet_has_a_link(hooks, tmp_path):
+    ctx, check = checked_vnet(hooks, tmp_path, {"agents": {"links": 1}}, account=injected_into_account(
+        f"{USER_VNET}/subnets/snet-agents"))
+    check()
+    assert urls(ctx) == EVERY_READ[:4]
+
+
+def test_an_account_may_be_injected_into_several_subnets_if_one_is_the_agent_subnet(hooks, tmp_path):
+    account = injected_into_account(OTHER_SUBNET, f"{USER_VNET}/subnets/SNET-AGENTS")
+    _, check = checked_vnet(hooks, tmp_path, account=account)
+    check()
+
+
+@pytest.mark.parametrize("account, listed", [
+    ({"name": ACCOUNT, "properties": {"networkInjections": [{"scenario": "agent"}]}}, "no subnet"),
+    (injected_into_account(OTHER_SUBNET, scenario="other"), "no subnet"),
+    ({"name": ACCOUNT}, "no subnet"),
+    (injected_into_account(OTHER_SUBNET, f"{OTHER_SUBNET}2"), f"{OTHER_SUBNET}, {OTHER_SUBNET}2"),
+])
+def test_the_injection_stop_lists_what_the_account_has(hooks, tmp_path, account, listed):
+    _, check = checked_vnet(hooks, tmp_path, account=account)
+    with pytest.raises(hooks.Stop) as stopped:
+        check()
+    assert str(stopped.value) == (f"Foundry account {ACCOUNT} was created injected into {listed}, and injection cannot "
+                                  "change: FA_VNET_RESOURCE_ID and FA_AGENT_SUBNET_NAME must name that subnet; nothing "
+                                  "was changed")
+
+
+NO_VNET = {"FA_VNET_RESOURCE_ID": ""}
+
+
+def own_vnet(hooks, tmp_path, account=None, **values):
+    ctx = context(hooks, tmp_path, {}, **{**PRIVATE, **NO_VNET, **values})
+    return ctx, lambda: hooks.check_existing_vnet(ctx, "private", account)
+
+
+def test_own_vnet_with_no_or_its_own_injection_reads_nothing(hooks, tmp_path):
+    for account in (None, {"name": ACCOUNT}, injected_into_account(OWN_AGENT_SUBNET.upper()),
+                    injected_into_account(OTHER_SUBNET, scenario="other")):
+        ctx, check = own_vnet(hooks, tmp_path, account)
+        assert check() is None and ctx.run.calls == []
+
+
+def test_own_vnet_refuses_each_existing_vnet_input_listed_in_order(hooks, tmp_path):
+    _, check = own_vnet(hooks, tmp_path, injected_into_account(OTHER_SUBNET), FA_DNS_MODE="existing",
+                        FA_PRIVATE_ENDPOINT_SUBNET_NAME="pe", FA_AGENT_SUBNET_NAME="agents", FA_API_SUBNET_NAME="app")
+    with pytest.raises(hooks.Stop) as stopped:
+        check()
+    assert str(stopped.value) == (
+        "FA_API_SUBNET_NAME, FA_AGENT_SUBNET_NAME, FA_PRIVATE_ENDPOINT_SUBNET_NAME, FA_DNS_MODE=existing only apply "
+        "with an existing VNet (FA_VNET_RESOURCE_ID); FA's own VNet has fixed subnet names and its own DNS zones. Set "
+        "FA_VNET_RESOURCE_ID or clear them; nothing was changed")
+
+
+def test_own_vnet_checks_the_dns_mode_before_the_subnet_inputs(hooks, tmp_path):
+    _, check = own_vnet(hooks, tmp_path, FA_DNS_MODE="hub", FA_API_SUBNET_NAME="app")
+    with pytest.raises(hooks.Stop, match="FA_DNS_MODE must be azd or existing, not 'hub'"):
+        check()
+
+
+def test_own_vnet_refuses_an_account_injected_elsewhere(hooks, tmp_path):
+    own_group = OWN_AGENT_SUBNET.replace("rg-dev", "rg-mine")
+    _, check = own_vnet(hooks, tmp_path, injected_into_account(own_group), AZURE_RESOURCE_GROUP="rg-mine")
+    check()
+    _, check = own_vnet(hooks, tmp_path, injected_into_account(OTHER_SUBNET, f"{OTHER_SUBNET}2"))
+    with pytest.raises(hooks.Stop) as stopped:
+        check()
+    assert str(stopped.value) == (
+        f"Foundry account {ACCOUNT} was created injected into {OTHER_SUBNET}, {OTHER_SUBNET}2, not FA's own vnet-dev, "
+        "and injection cannot change: set FA_VNET_RESOURCE_ID (and the subnet names) back to that VNet; nothing was "
+        "changed")
+    _, check = own_vnet(hooks, tmp_path, injected_into_account(OWN_AGENT_SUBNET, OTHER_SUBNET))
+    check()
+
 
 def provisioned_private(hooks, tmp_path, hosts):
     """preprovision of a private environment whose injected account exists; `hosts` answers the project's list."""

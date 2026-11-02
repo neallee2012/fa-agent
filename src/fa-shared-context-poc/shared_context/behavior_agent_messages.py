@@ -236,6 +236,84 @@ def claim_key(identifier):
     return control_key("agent-message-contract-claim", identifier)
 
 
+@dataclass(frozen=True)
+class _Send:
+    """One send's facts, fixed before its first transaction attempt; a retry reuses them without reading again."""
+    root: RootEnvelope
+    assignment: AgentAssignment
+    command: AgentMessage
+    sender: AgentRoute
+    receiver: AgentRoute
+    prior: MessageEnvelope | None
+
+    @property
+    def origin(self):
+        return (self.assignment.agent_id, self.assignment.work_id, self.assignment.attempt_id) == (
+            self.root.spec.origin_agent_id, self.root.spec.origin_work_id, self.root.spec.origin_attempt_id)
+
+    @property
+    def closing(self):
+        return self.command.kind in {"result", "blocked"}
+
+    @property
+    def receipt_only(self):
+        return self.command.kind == "receipt"
+
+    @property
+    def answers_prior(self):
+        prior, kind = self.prior, self.command.kind
+        return (prior.root_request_id == self.assignment.root_request_id
+                and prior.recipient_agent_id == self.sender.agent_id
+                and prior.sender_agent_id == self.receiver.agent_id
+                and prior.to_work_id == self.assignment.work_id
+                and kind in {"result", "blocked", "receipt", "fyi"}
+                and not (kind == "receipt" and prior.message_kind == "receipt"))
+
+    @property
+    def reply_claim_id(self):
+        return None if self.prior is None or self.origin else claim_key(self.prior.message_key)
+
+    @property
+    def hop(self):
+        return 1 if self.prior is None else self.prior.hop + (0 if self.receipt_only else 1)
+
+    @property
+    def identifier(self):
+        if self.receipt_only:
+            return control_key("agent-message-contract-receipt", self.command.in_reply_to, self.sender.agent_id)
+        return message_key(self.assignment.root_request_id, self.sender.agent_id, self.command.message_id)
+
+    def request(self, directory_sha256):
+        root_request_id = self.assignment.root_request_id
+        return ControlRequest(request_id=self.identifier,
+            request_digest=digest([self.assignment.model_dump(mode="json"), self.command.model_dump(mode="json"),
+                                   directory_sha256]),
+            read_set=(root_key(root_request_id), root_state_key(root_request_id), self.identifier,
+                      message_state_key(self.identifier), queue_key(self.receiver.agent_id),
+                      *((self.prior.message_key,) if self.prior is not None else ()),
+                      *((self.reply_claim_id,) if self.reply_claim_id is not None else ())))
+
+    def envelope(self, payload, request):
+        return MessageEnvelope(
+            message_key=self.identifier, message_id=self.command.message_id, message_kind=self.command.kind,
+            root_request_id=self.assignment.root_request_id, root_budget_id=self.root.spec.root_budget_id,
+            sender_agent_id=self.sender.agent_id, sender_oid=self.sender.principal_oid,
+            recipient_agent_id=self.receiver.agent_id, from_work_id=self.assignment.work_id,
+            from_attempt_id=self.assignment.attempt_id,
+            to_work_id=(control_key("agent-message-contract-work", self.identifier, self.receiver.agent_id)
+                        if self.prior is None else self.prior.from_work_id),
+            hop=self.hop,
+            causation_id=self.root.spec.root_request_id if self.prior is None else self.prior.message_key,
+            payload_sha256=payload.sha256, request=request)
+
+
+def _message_payload(command):
+    body = canonical(command.model_dump(mode="json"))
+    if len(body) > MAX_INLINE_BYTES:
+        raise Problem(413, "AGENT_MESSAGE_LIMIT", "complete message exceeds the original inline envelope")
+    return InlineMaterial(data=body, sha256=digest(command.model_dump(mode="json")))
+
+
 def _require_allowance(root, counter, command, hop, now):
     closing, receipt_only = command.kind in {"result", "blocked"}, command.kind == "receipt"
     if not (closing or receipt_only) and now >= root.spec.deadline:
@@ -247,6 +325,38 @@ def _require_allowance(root, counter, command, hop, now):
         raise Problem(429, "AGENT_MESSAGE_ALLOWANCE", "the original root message allowance is exhausted")
     if command.kind in {"request", "handoff"} and counter.handoff_message_id is not None:
         raise Problem(409, "AGENT_MESSAGE_HANDOFF_EXISTS", "one original A-to-B work is already retained")
+
+
+_SENT_STATUS = {"wake": "queued", "queued": "queued", "needs_attention": "needs_attention", "silence": "silenced"}
+
+
+def _queue_write(send, request, rows):
+    queue_id = queue_key(send.receiver.agent_id)
+    prior = rows[queue_id]
+    queue = (_ReceiverQueue(agent_id=send.receiver.agent_id, request=request)
+             if prior is None else _row(rows, queue_id, _ReceiverQueue))
+    if len(queue.pending) >= 32:
+        raise Problem(429, "AGENT_MESSAGE_QUEUE_FULL", "the bounded original receiver queue is full")
+    return _write(queue_id, _updated(queue, pending=(*queue.pending, send.identifier), request=request),
+                  "create" if prior is None else "replace")
+
+
+def _send_changes(send, envelope, payload, decision, counter, rows):
+    """The atomic writes for one attempt; everything but the counter and queue rows was fixed before it."""
+    identifier, request, status = send.identifier, envelope.request, _SENT_STATUS[decision.action]
+    state = _MessageState(message_key=identifier, status=status, decision=decision, request=request)
+    writes = [_write(identifier, envelope, "create", payload),
+              _write(message_state_key(identifier), state, "create"),
+              _write(root_state_key(send.assignment.root_request_id), _updated(counter,
+                  message_count=counter.message_count + int(not send.receipt_only),
+                  receipt_count=counter.receipt_count + int(send.receipt_only),
+                  handoff_message_id=identifier if send.command.kind in {"request", "handoff"} else counter.handoff_message_id,
+                  response_message_id=identifier if send.closing else counter.response_message_id,
+                  message_keys=(*counter.message_keys, identifier),
+                  request=request), "replace")]
+    if status != "silenced":
+        writes.append(_queue_write(send, request, rows))
+    return ControlChanges(writes=tuple(writes), result={"message_key": identifier, "status": status, "model_started": False})
 
 
 class AgentMessageLedger:
@@ -328,6 +438,21 @@ class AgentMessageLedger:
             if len(queue.pending) >= 32:
                 raise Problem(429, "AGENT_MESSAGE_QUEUE_FULL", "the original receiver queue is full")
 
+    def _require_reply(self, send):
+        """Refuse a send that does not start from the origin or answer its original message and claim."""
+        if send.prior is None:
+            if not send.origin or send.command.kind not in {"request", "handoff", "fyi"}:
+                raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "a reply or receipt needs its original message")
+            return
+        if not send.answers_prior:
+            raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "reply must match the original root, peers and work")
+        if send.reply_claim_id is not None:
+            claim, _ = self._verified(send.reply_claim_id, _QueueClaim)
+            if claim.assignment != send.assignment:
+                raise Problem(403, "AGENT_MESSAGE_ASSIGNMENT_DENIED", "only the original claimed peer work may reply")
+        if send.closing and (send.prior.message_kind not in {"request", "handoff"} or send.origin):
+            raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "only the assigned peer returns the original result")
+
     def send(self, principal, assignment: AgentAssignment, command: AgentMessage, *, receiver_busy=False):
         return self.send_recorded(principal, assignment, command, receiver_busy=receiver_busy).view
 
@@ -342,109 +467,55 @@ class AgentMessageLedger:
             raise Problem(403, "AGENT_MESSAGE_SHARE_DENIED", "only the root's exact approved Team references may be carried")
         if sender.agent_id == receiver.agent_id or sender.agent_id != assignment.agent_id:
             raise Problem(403, "AGENT_MESSAGE_ASSIGNMENT_DENIED", "sender identity must come from its original assignment")
-        origin = (assignment.agent_id, assignment.work_id, assignment.attempt_id) == (
-            root.spec.origin_agent_id, root.spec.origin_work_id, root.spec.origin_attempt_id)
         previous = None if command.in_reply_to is None else self.read(principal, command.in_reply_to)
-        closing = command.kind in {"result", "blocked"}
-        reply_claim_id = None
-        if previous is not None:
-            prior = previous.message
-            if (prior.root_request_id != assignment.root_request_id or prior.recipient_agent_id != sender.agent_id
-                    or prior.sender_agent_id != receiver.agent_id or prior.to_work_id != assignment.work_id
-                    or command.kind not in {"result", "blocked", "receipt", "fyi"}
-                    or command.kind == "receipt" and prior.message_kind == "receipt"):
-                raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "reply must match the original root, peers and work")
-            if not origin:
-                reply_claim_id = claim_key(prior.message_key)
-                claim, _ = self._verified(reply_claim_id, _QueueClaim)
-                if claim.assignment != assignment:
-                    raise Problem(403, "AGENT_MESSAGE_ASSIGNMENT_DENIED", "only the original claimed peer work may reply")
-            if closing and (prior.message_kind not in {"request", "handoff"} or origin):
-                raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "only the assigned peer returns the original result")
-        elif not origin or command.kind not in {"request", "handoff", "fyi"}:
-            raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "a reply or receipt needs its original message")
-        body = canonical(command.model_dump(mode="json"))
-        if len(body) > MAX_INLINE_BYTES:
-            raise Problem(413, "AGENT_MESSAGE_LIMIT", "complete message exceeds the original inline envelope")
-        payload = InlineMaterial(data=body, sha256=digest(command.model_dump(mode="json")))
-        receipt_only = command.kind == "receipt"
-        identifier = (control_key("agent-message-contract-receipt", command.in_reply_to, sender.agent_id)
-                      if receipt_only else message_key(assignment.root_request_id, sender.agent_id, command.message_id))
-        state_id = message_state_key(identifier)
-        root_id, counter_id = root_key(assignment.root_request_id), root_state_key(assignment.root_request_id)
-        queue_id = queue_key(receiver.agent_id)
-        request = ControlRequest(request_id=identifier,
-            request_digest=digest([assignment.model_dump(mode="json"), command.model_dump(mode="json"),
-                                   self.directory.sha256]),
-            read_set=(root_id, counter_id, identifier, state_id, queue_id,
-                      *((previous.message.message_key,) if previous is not None else ()),
-                      *((reply_claim_id,) if reply_claim_id is not None else ())))
+        send = _Send(root, assignment, command, sender, receiver, None if previous is None else previous.message)
+        self._require_reply(send)
+        payload = _message_payload(command)
+        request = send.request(self.directory.sha256)
         decision = decide_wake(command.kind, receiver_busy=receiver_busy,
                                allowance_available=_utc(self.clock()) < root.spec.deadline)
-        queued = decision.action in {"wake", "queued", "needs_attention"}
-        hop = 1 if previous is None else previous.message.hop + (0 if receipt_only else 1)
-        envelope = MessageEnvelope(
-            message_key=identifier, message_id=command.message_id, message_kind=command.kind,
-            root_request_id=assignment.root_request_id, root_budget_id=root.spec.root_budget_id,
-            sender_agent_id=sender.agent_id, sender_oid=sender.principal_oid,
-            recipient_agent_id=receiver.agent_id, from_work_id=assignment.work_id, from_attempt_id=assignment.attempt_id,
-            to_work_id=(control_key("agent-message-contract-work", identifier, receiver.agent_id)
-                        if previous is None else previous.message.from_work_id),
-            hop=hop, causation_id=root.spec.root_request_id if previous is None else previous.message.message_key,
-            payload_sha256=payload.sha256, request=request)
-        fresh = False
+        fresh = self._commit_send(send, send.envelope(payload, request), payload, decision)
+        return MessageSubmission(self.read(principal, send.identifier), fresh)
+
+    def _counter_at_commit(self, send, rows):
+        """Check one attempt's own rows and clock; a transaction runs this again after a lost race."""
+        root_request_id, identifier = send.assignment.root_request_id, send.identifier
+        current = _row(rows, root_key(root_request_id), RootEnvelope)
+        counter = _row(rows, root_state_key(root_request_id), _RootState)
+        if current != send.root:
+            raise Problem(403, "AGENT_MESSAGE_ROOT_EXPIRED", "original root authority or deadline changed")
+        _require_allowance(send.root, counter, send.command, send.hop, _utc(self.clock()))
+        if rows[identifier] is not None or rows[message_state_key(identifier)] is not None:
+            raise Problem(409, "AGENT_MESSAGE_ORIGINAL_REQUIRED", "read the original message and receipt")
+        if send.closing and (counter.handoff_message_id != send.prior.message_key
+                             or counter.response_message_id is not None):
+            raise Problem(409, "AGENT_MESSAGE_RESULT_EXISTS", "the original peer result cannot be replaced")
+        if send.reply_claim_id is not None and _row(rows, send.reply_claim_id, _QueueClaim).assignment != send.assignment:
+            raise Problem(409, "AGENT_MESSAGE_ASSIGNMENT_DENIED", "original peer assignment changed")
+        return counter
+
+    def _commit_send(self, send, envelope, payload, decision):
+        """Commit one request across lost races; True only when this call's attempt wrote it."""
+        request = envelope.request
 
         def decide(rows):
             nonlocal fresh
-            current = _row(rows, root_id, RootEnvelope)
-            counter = _row(rows, counter_id, _RootState)
-            if current != root:
-                raise Problem(403, "AGENT_MESSAGE_ROOT_EXPIRED", "original root authority or deadline changed")
-            _require_allowance(root, counter, command, hop, _utc(self.clock()))
-            if rows[identifier] is not None or rows[state_id] is not None:
-                raise Problem(409, "AGENT_MESSAGE_ORIGINAL_REQUIRED", "read the original message and receipt")
-            if closing and (previous is None or counter.handoff_message_id != previous.message.message_key
-                            or counter.response_message_id is not None):
-                raise Problem(409, "AGENT_MESSAGE_RESULT_EXISTS", "the original peer result cannot be replaced")
-            if reply_claim_id is not None and _row(rows, reply_claim_id, _QueueClaim).assignment != assignment:
-                raise Problem(409, "AGENT_MESSAGE_ASSIGNMENT_DENIED", "original peer assignment changed")
-            state = _MessageState(message_key=identifier,
-                                  status="needs_attention" if decision.action == "needs_attention" else
-                                  "queued" if queued else "silenced",
-                                  decision=decision, request=request)
+            counter = self._counter_at_commit(send, rows)
             fresh = True
-            writes = [_write(identifier, envelope, "create", payload), _write(state_id, state, "create"),
-                      _write(counter_id, _updated(counter, message_count=counter.message_count + int(not receipt_only),
-                          receipt_count=counter.receipt_count + int(receipt_only),
-                          handoff_message_id=identifier if command.kind in {"request", "handoff"} else counter.handoff_message_id,
-                          response_message_id=identifier if closing else counter.response_message_id,
-                          message_keys=(*counter.message_keys, identifier),
-                          request=request), "replace")]
-            if queued:
-                prior = rows[queue_id]
-                queue = (_ReceiverQueue(agent_id=receiver.agent_id, request=request)
-                         if prior is None else _row(rows, queue_id, _ReceiverQueue))
-                if len(queue.pending) >= 32:
-                    raise Problem(429, "AGENT_MESSAGE_QUEUE_FULL", "the bounded original receiver queue is full")
-                writes.append(_write(queue_id, _updated(queue, pending=(*queue.pending, identifier), request=request),
-                                     "create" if prior is None else "replace"))
-            return ControlChanges(writes=tuple(writes),
-                                  result={"message_key": identifier, "status": state.status, "model_started": False})
+            return _send_changes(send, envelope, payload, decision, counter, rows)
         for attempt in range(3):
             fresh = False
             try:
                 self.store.transact(request, decide)
-                break
+                return fresh
             except Problem as error:
                 if error.status != 412 or error.body["error"]["code"] != "BEHAVIOR_CONFLICT":
                     raise
                 if self.store._receipt(request) is not None:
-                    fresh = False
-                    break
+                    return False
                 if attempt == 2:
                     raise
                 logging.getLogger(__name__).warning("AGENT_MESSAGE_COMMIT_CONFLICT attempt=%s maximum=3", attempt + 1)
-        return MessageSubmission(self.read(principal, identifier), fresh)
 
     def messages(self, principal, root_request_id):
         root = self._root(root_request_id)

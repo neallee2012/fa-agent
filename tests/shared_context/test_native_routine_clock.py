@@ -1,5 +1,8 @@
 """API-resident routine clock: one fixed RID per occurrence through the original due/trigger seams. No cloud."""
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import time
 from datetime import timedelta
 from types import SimpleNamespace
@@ -305,3 +308,34 @@ def test_lifespan_starts_one_tick_at_once_and_stops_the_clock():
             time.sleep(0.01)
         assert ticks == [1] and clock._task is not None
     assert clock._task is None and clock._executor is None and clock._stopping is True and closed == [1]
+
+
+def background_owners():
+    from shared_context.native_routine_clock import NativeRoutineClock
+    from shared_context.native_session_patrol import NativeSessionPatrol
+    from shared_context.native_upgrade_reconciler import NativeUpgradeReconciler
+    return NativeRoutineClock, NativeSessionPatrol, NativeUpgradeReconciler
+
+
+@pytest.mark.parametrize("owner", background_owners())
+def test_stop_ends_the_loop_and_queued_runs_but_leaves_the_run_in_flight(owner):
+    worker = object.__new__(owner)
+    worker._stopping = False
+    running, release = threading.Event(), threading.Event()
+
+    async def stopped():
+        worker._executor = ThreadPoolExecutor(max_workers=1)
+        inflight = worker._executor.submit(lambda: (running.set(), release.wait(5)))
+        queued = worker._executor.submit(lambda: None)
+        loop = worker._task = asyncio.create_task(asyncio.sleep(60))
+        await asyncio.to_thread(running.wait, 5)
+        await worker.stop()
+        return loop.cancelled(), inflight, queued
+
+    loop_ended, inflight, queued = asyncio.run(stopped())
+    assert loop_ended and queued.cancelled() and not inflight.done()
+    assert worker._stopping is True and worker._task is None and worker._executor is None
+    release.set()
+    assert inflight.result(5) == (None, True)
+    asyncio.run(worker.stop())  # nothing left to close; the same as a stop before any start
+    assert worker._task is None and worker._executor is None

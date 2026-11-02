@@ -359,6 +359,35 @@ def promote_request_version(foundry, toolbox: str, version: str, expected_versio
         raise failure from None
 
 
+class TeamGrantCache:
+    """Each Team's grants between Foundry reads. Callers read Foundry and pick the expiry; this keeps the two rules
+    they share: one read per Team at a time, and a read that started before forget() never stores what it read."""
+
+    def __init__(self):
+        self._entries: dict[tuple[str, str], tuple[float, tuple]] = {}
+        self._lock = threading.Lock()
+        self._generations: dict[tuple[str, str], int] = {}
+        self._flights: dict[tuple[str, str], threading.Lock] = {}
+
+    def flight(self, key: tuple[str, str]) -> threading.Lock:
+        with self._lock:
+            return self._flights.setdefault(key, threading.Lock())
+
+    def peek(self, key: tuple[str, str]) -> tuple[tuple[float, tuple] | None, int]:
+        with self._lock:
+            return self._entries.get(key), self._generations.get(key, 0)
+
+    def store(self, key: tuple[str, str], generation: int, expires_at: float, value: tuple) -> None:
+        with self._lock:
+            if self._generations.get(key, 0) == generation:
+                self._entries[key] = (expires_at, value)
+
+    def forget(self, key: tuple[str, str]) -> None:
+        with self._lock:
+            self._entries.pop(key, None)
+            self._generations[key] = self._generations.get(key, 0) + 1
+
+
 class TeamMcpService:
     def __init__(self, verifier: BehaviorJwtVerifier, *, foundry_factory, single_team: bool,
                  project_scope: str | None = None, feed_signing_key=None):
@@ -366,11 +395,7 @@ class TeamMcpService:
         self.single_team, self.project_scope = single_team, project_scope
         # Ed25519 private key for the FA feed reader (feed_signature.py); None until the environment sets it.
         self.feed_signing_key = feed_signing_key
-        self._grants: dict[tuple[str, str], tuple[float, tuple]] = {}
-        self._grants_lock = threading.Lock()
-        # Bumped by forget(): a read that started before a change never stores the grants it read.
-        self._generations: dict[tuple[str, str], int] = {}
-        self._flights: dict[tuple[str, str], threading.Lock] = {}
+        self._grants = TeamGrantCache()
 
     def _authorize(self, principal, *, write=False):
         authorize_team_owner(self.verifier, principal, write=write)
@@ -527,21 +552,16 @@ class TeamMcpService:
             return self._finish(foundry, principal, command, version, connection)
 
     def forget(self, tenant: str, team: str) -> None:
-        with self._grants_lock:
-            self._grants.pop((tenant, team), None)
-            self._generations[(tenant, team)] = self._generations.get((tenant, team), 0) + 1
+        self._grants.forget((tenant, team))
 
     def team_grants(self, tenant: str, team: str) -> tuple:
         """The Team's servers in its current default version, as grants pinned to that version."""
-        with self._grants_lock:
-            flight = self._flights.setdefault((tenant, team), threading.Lock())
-        with flight:  # single-flight: captures arriving during a read wait for it and take what it stored
+        with self._grants.flight((tenant, team)):  # captures arriving during a read wait and take what it stored
             return self._read_grants(tenant, team)
 
     def _read_grants(self, tenant: str, team: str) -> tuple:
         key, now = (tenant, team), monotonic()
-        with self._grants_lock:
-            cached, generation = self._grants.get(key), self._generations.get(key, 0)
+        cached, generation = self._grants.peek(key)
         if cached is not None and cached[0] > now:
             return cached[1]
         try:
@@ -550,25 +570,25 @@ class TeamMcpService:
             # Not a refusal: the last read servers stay offered; without one, this turn has no Team MCP tools.
             _log.warning("TEAM_MCP_GRANTS_UNAVAILABLE status=%s cached=%s", _status(error), cached is not None)
             value = () if cached is None else cached[1]
-            with self._grants_lock:
-                if self._generations.get(key, 0) == generation:
-                    self._grants[key] = (monotonic() + FAILED_GRANTS_SECONDS, value)
+            self._grants.store(key, generation, monotonic() + FAILED_GRANTS_SECONDS, value)
             return value
         servers = sorted((server for server in (_server(tool, default) for tool in tools) if server is not None),
                          key=lambda item: item.server_label)
         value = tuple(team_mcp_grant(team, server) for server in servers)
-        with self._grants_lock:
-            if self._generations.get(key, 0) == generation:
-                self._grants[key] = (now + GRANTS_SECONDS, value)
+        self._grants.store(key, generation, now + GRANTS_SECONDS, value)
         return value
+
+
+def runtime_bindings(runtime) -> tuple:
+    # AssistantRuntime.bindings maps binding_id -> RuntimeBinding; every binding of one runtime is in one Team.
+    raw = getattr(runtime, "bindings", None) or {}
+    return tuple(raw.values()) if hasattr(raw, "values") else tuple(raw)
 
 
 # Retired head/intent rows (written until 2026-10-06): kept unchanged and only classified for migration and rotation.
 def current_team_mcp_grants(runtime) -> tuple:
-    # AssistantRuntime.bindings maps binding_id -> RuntimeBinding; every binding of one runtime is in one Team.
     service = getattr(runtime, "team_mcp", None)
-    raw = getattr(runtime, "bindings", None) or {}
-    bindings = tuple(raw.values()) if hasattr(raw, "values") else tuple(raw)
+    bindings = runtime_bindings(runtime)
     if service is None or not bindings:
         return ()
     try:

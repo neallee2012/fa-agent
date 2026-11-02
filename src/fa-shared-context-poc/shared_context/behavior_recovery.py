@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import hashlib
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Callable, Literal
+from typing import Annotated, Callable, Literal, NamedTuple
 
 from pydantic import Field, field_validator, model_validator
 
@@ -304,120 +304,190 @@ def _claimed_receipt(inventory, launch, native_keys, *, original_request=None):
     return matches[0]
 
 
-def _multi_models(inventory, config, launch, expected, *, finished=False):
-    """Read the complete original intent set and its immutable producer receipts."""
-    from .behavior_recovery_history import _Inventory
+def _configured(config, job_id):
+    return next(item for item in config.bindings if item.job_id == job_id)
+
+
+def _original_reads(config, configured, binding, session_key):
+    """The leading read set every original session receipt carries."""
     from .behavior_runtime import runtime_key
-    view = _Inventory(inventory, config)
-    sid, binding = assistant_key("session-id", launch.start.binding.start_request_id), launch.start.binding
-    session_key = assistant_key("session", sid)
-    session = view.row(session_key, _Session)
-    configured = next(item for item in config.bindings if item.job_id == binding.job_id)
-    selected = {assistant_key("model-intent", sid, item.request_sha256): item for item in expected}
-    actual = {key for key, row in inventory.rows.items()
-              if isinstance(value := row.payload["data"].get("request_sha256"), str)
-              and key == assistant_key("model-intent", sid, value)}
-    if (actual != set(selected) or session.model_requests != len(expected)
-            or session.state != ("ready_to_finalize" if finished else "waiting")
-            or (session.reason not in (None, "sdk_failed") if finished else session.reason != "sdk_failed")
-            or session.execution != binding or session.assignment.resume or launch.start.checkpoint is not None
-            or configured.route.channel_id != "authenticated-pull"
-            or any(assistant_key(kind, sid) in inventory.rows for kind in ("archive", "restore"))
-            or not finished and any(assistant_key(kind, binding.work_id) in inventory.rows for kind in ("artifact", "result"))):
-        raise denied("RECOVERY_MODEL_SET_CHANGED", "complete original model/session set differs")
-    base = (runtime_key("policy", configured.binding_id), control_key("owner", binding.owner.owner_record_id),
+    return (runtime_key("policy", configured.binding_id), control_key("owner", binding.owner.owner_record_id),
             control_key("policy", binding.owner.policy_id), control_key("budget", binding.owner.root_budget_id),
             worker_key("job", binding.job_id), worker_key("pool", config.workers.workspace_id), session_key,
             assistant_key("delegation", configured.event_id), control_key("delivery-obligation", configured.obligation_id))
+
+
+def _model_intent_keys(inventory, sid):
+    return {key for key, row in inventory.rows.items()
+            if isinstance(value := row.payload["data"].get("request_sha256"), str)
+            and key == assistant_key("model-intent", sid, value)}
+
+
+def _session_differs(session, binding, finished):
+    return (session.state != ("ready_to_finalize" if finished else "waiting")
+            or (session.reason not in (None, "sdk_failed") if finished else session.reason != "sdk_failed")
+            or session.execution != binding or session.assignment.resume)
+
+
+def _later_rows_retained(inventory, sid, work_id, finished):
+    return (any(assistant_key(kind, sid) in inventory.rows for kind in ("archive", "restore"))
+            or not finished and any(assistant_key(kind, work_id) in inventory.rows for kind in ("artifact", "result")))
+
+
+def _check_model_set(inventory, launch, session, configured, sid, selected, finished):
+    binding = launch.start.binding
+    if (_model_intent_keys(inventory, sid) != selected or session.model_requests != len(selected)
+            or _session_differs(session, binding, finished) or launch.start.checkpoint is not None
+            or configured.route.channel_id != "authenticated-pull"
+            or _later_rows_retained(inventory, sid, binding.work_id, finished)):
+        raise denied("RECOVERY_MODEL_SET_CHANGED", "complete original model/session set differs")
+
+
+def _context_reads(view, session, sid, base):
+    """The original context read set; a session that never read context has none to bind."""
+    if not session.context_read:
+        return None
     context = view.receipts.get(assistant_key("context", sid, "current-context"))
-    if session.context_read and (context is None
+    if (context is None
             or context.request.request_digest != digest({"request_id": "current-context"})
             or context.request.read_set[:len(base)] != base or context.result != {"state": "accepted"}
-            or set(dict(context.writes)) != {session_key}):
+            or set(dict(context.writes)) != {assistant_key("session", sid)}):
         raise denied("RECOVERY_MODEL_RECEIPT_INVALID", "original context read lacks its bound producer receipt")
-    proofs = []
-    for key, item in selected.items():
-        model = view.row(key, _ModelIntent)
-        reserve_id = assistant_key("model", sid, item.request_sha256)
-        reserve = view.receipts.get(reserve_id)
-        consume_id = assistant_key("model-send", sid, item.request_sha256)
-        consume = view.receipts.get(consume_id)
-        if (model.request_sha256 != item.request_sha256 or model.consumed != item.consumed or reserve is None
-                or reserve.request.request_digest != digest({"request_id": item.request_sha256,
-                                                            "request_sha256": item.request_sha256})
-                or reserve.request.read_set[:len(base)] != base or len(reserve.request.read_set) <= len(base)
-                or session.context_read and reserve.request.read_set != context.request.read_set
-                or len(set(reserve.request.read_set)) != len(reserve.request.read_set)
-                or reserve.result != {"state": "accepted"}
-                or set(dict(reserve.writes)) != {key, session_key, control_key("budget", binding.owner.root_budget_id)}
-                or dict(reserve.writes)[key] != view.image_hash(key, model.model_copy(update={"consumed": False}))
-                or model.consumed != (consume is not None)):
-            raise denied("RECOVERY_MODEL_RECEIPT_INVALID", "original reservation/image/consume absence differs")
-        if consume is not None and (
-                consume.request.read_set != (*base, key, *reserve.request.read_set[len(base):])
-                or consume.result != {"state": "accepted"} or consume.writes != ((key, view.hash(key)),)
-                or consume.guard_revision <= reserve.guard_revision):
-            raise denied("RECOVERY_MODEL_RECEIPT_INVALID", "original consume request/image/causal receipt differs")
-        proof = ModelIntentProof(request_sha256=item.request_sha256, consumed=item.consumed, image_sha256=view.hash(key),
-            reserve_request_sha256=digest(reserve.request.model_dump(mode="json")),
-            reserve_receipt_sha256=digest(inventory.receipts[reserve_id].payload),
-            consume_request_sha256=None if consume is None else digest(consume.request.model_dump(mode="json")),
-            consume_receipt_sha256=None if consume is None else digest(inventory.receipts[consume_id].payload))
-        if isinstance(item, ModelIntentProof) and proof != item:
-            raise denied("RECOVERY_MODEL_RECEIPT_INVALID", "original reviewed model receipts changed")
-        proofs.append(proof)
-    return tuple(proofs)
+    return context.request.read_set
+
+
+class _ModelChain(NamedTuple):
+    """What every original model intent's receipts have to bind to."""
+    view: object
+    sid: str
+    base: tuple
+    context_reads: tuple | None
+    reserve_writes: frozenset
+
+
+def _reserve_differs(chain, key, item, model, reserve):
+    request = reserve.request
+    return (request.request_digest != digest({"request_id": item.request_sha256, "request_sha256": item.request_sha256})
+            or request.read_set[:len(chain.base)] != chain.base or len(request.read_set) <= len(chain.base)
+            or chain.context_reads is not None and request.read_set != chain.context_reads
+            or reserve.result != {"state": "accepted"}
+            or set(dict(reserve.writes)) != {key, *chain.reserve_writes}
+            or dict(reserve.writes)[key] != chain.view.image_hash(key, model.model_copy(update={"consumed": False})))
+
+
+def _consume_differs(chain, key, reserve, consume):
+    return consume is not None and (
+        consume.request.read_set != (*chain.base, key, *reserve.request.read_set[len(chain.base):])
+        or consume.result != {"state": "accepted"} or consume.writes != ((key, chain.view.hash(key)),)
+        or consume.guard_revision <= reserve.guard_revision)
+
+
+def _model_proof(chain, key, item):
+    view = chain.view
+    model = view.row(key, _ModelIntent)
+    reserve_id = assistant_key("model", chain.sid, item.request_sha256)
+    reserve = view.receipts.get(reserve_id)
+    consume_id = assistant_key("model-send", chain.sid, item.request_sha256)
+    consume = view.receipts.get(consume_id)
+    if (model.consumed != item.consumed or reserve is None or _reserve_differs(chain, key, item, model, reserve)
+            or model.consumed != (consume is not None)):
+        raise denied("RECOVERY_MODEL_RECEIPT_INVALID", "original reservation/image/consume absence differs")
+    if _consume_differs(chain, key, reserve, consume):
+        raise denied("RECOVERY_MODEL_RECEIPT_INVALID", "original consume request/image/causal receipt differs")
+    return ModelIntentProof(request_sha256=item.request_sha256, consumed=item.consumed, image_sha256=view.hash(key),
+        reserve_request_sha256=digest(reserve.request.model_dump(mode="json")),
+        reserve_receipt_sha256=digest(view.inventory.receipts[reserve_id].payload),
+        consume_request_sha256=None if consume is None else digest(consume.request.model_dump(mode="json")),
+        consume_receipt_sha256=None if consume is None else digest(view.inventory.receipts[consume_id].payload))
+
+
+def _reviewed(proof, item):
+    if isinstance(item, ModelIntentProof) and proof != item:
+        raise denied("RECOVERY_MODEL_RECEIPT_INVALID", "original reviewed model receipts changed")
+    return proof
+
+
+def _multi_models(inventory, config, launch, expected, *, finished=False):
+    """Read the complete original intent set and its immutable producer receipts."""
+    from .behavior_recovery_history import _Inventory
+    view = _Inventory(inventory, config)
+    binding = launch.start.binding
+    sid = assistant_key("session-id", binding.start_request_id)
+    session_key = assistant_key("session", sid)
+    session = view.row(session_key, _Session)
+    configured = _configured(config, binding.job_id)
+    selected = {assistant_key("model-intent", sid, item.request_sha256): item for item in expected}
+    _check_model_set(inventory, launch, session, configured, sid, set(selected), finished)
+    base = _original_reads(config, configured, binding, session_key)
+    chain = _ModelChain(view, sid, base, _context_reads(view, session, sid, base),
+                        frozenset((session_key, control_key("budget", binding.owner.root_budget_id))))
+    return tuple(_reviewed(_model_proof(chain, key, item), item) for key, item in selected.items())
+
+
+def _finished_rows_differ(session, effect, binding):
+    return (session.state != "ready_to_finalize" or session.reason not in (None, "sdk_failed") or not session.context_read
+            or session.execution != binding or session.assignment.task.work_id != binding.work_id
+            or effect.execution != binding or effect.stage != "saved"
+            or effect.description_digest != digest(effect.description.model_dump(mode="json"))
+            or effect.artifact_sha256 != hashlib.sha256(effect.content).hexdigest())
+
+
+def _result_outcome_differs(result, result_key, config, launch):
+    from .behavior_assistant_wire import CHECKS
+    return (result.evidence_id != result_key or result.state != "succeeded"
+            or result.work_id != launch.start.binding.work_id
+            or result.verifier_version != config.delivery.verifier_version
+            or result.definition_digest != digest(launch.definition.model_dump(mode="json"))
+            or result.passed_checks != CHECKS or result.known_effects or result.unresolved_operations)
+
+
+def _result_delivery_differs(result, effect, profile, artifact_key, launch):
+    return (len(result.artifacts) != 1 or result.artifacts[0].artifact_id != profile.artifact_id
+            or result.artifacts[0].version != profile.artifact_version
+            or result.artifacts[0].sha256 != effect.artifact_sha256 or result.content != effect.content
+            or result.proof != _material({"effect": artifact_key, "description_digest": effect.description_digest,
+                "finish_request_id": "finish-task", "criteria_version": launch.definition.criteria_version}).data)
+
+
+def _finish_receipts(view, launch, configured, sid, base, skey, artifact_key, rkey, artifact_sha256):
+    """What the original finish receipts have to bind to."""
+    context = view.receipts.get(assistant_key("context", sid, "current-context"))
+    if context is None or context.request.read_set[:len(base)] != base:
+        raise denied("RECOVERY_FINISHED_RESULT_INVALID", "original reviewed context receipt is missing")
+    issue = view.receipt(ControlRequest(request_id=assistant_key("issue", sid), read_set=base,
+                                        request_digest=digest(launch.start.model_dump(mode="json"))),
+                         (skey,), result={"session_id": sid})
+    acquire = view.receipt(ControlRequest(request_id=assistant_key("acquire", sid, "sdk-start"), read_set=base,
+                                          request_digest=digest({"request_id": "sdk-start"})),
+                           (skey,), result={"state": "running"})
+    finish_reads = tuple(dict.fromkeys((*context.request.read_set, artifact_key,
+        control_key("operation", configured.operation_id), rkey,
+        control_key("delivery-work-state", configured.obligation_id))))
+    finish = view.receipt(ControlRequest(request_id=assistant_key("finish", sid, "finish-task"), read_set=finish_reads,
+                                         request_digest=digest({"request_id": "finish-task"})),
+                          (skey, rkey), exact={skey: view.hash(skey), rkey: view.hash(rkey)},
+                          result={"state": "ready_to_finalize", "receipt_id": rkey, "artifact_sha256": artifact_sha256})
+    return context, issue, acquire, finish
 
 
 def _finished_proof(inventory, config, launch, blob_etag, *, expected=None):
     """Pure exact original finish chain; live caller separately verifies M3 bytes."""
     from .behavior_recovery_history import _Inventory
-    from .behavior_runtime import runtime_key
-    from .behavior_assistant_wire import CHECKS
     view = _Inventory(inventory, config)
     binding = launch.start.binding
-    configured = next(item for item in config.bindings if item.job_id == binding.job_id)
+    configured = _configured(config, binding.job_id)
     profile = next(item for item in config.assistant.profiles if item.binding_id == configured.binding_id)
     sid = assistant_key("session-id", binding.start_request_id)
     skey, akey, rkey = assistant_key("session", sid), assistant_key("artifact", binding.work_id), assistant_key("result", binding.work_id)
     session = view.row(skey, _Session)
     effect = view.row(akey, _ArtifactEffect)
     result = view.row(rkey, VerifiedWorkResult, material=True)
-    if (session.state != "ready_to_finalize" or session.reason not in (None, "sdk_failed") or not session.context_read
-            or session.execution != binding or session.assignment.task.work_id != binding.work_id
-            or effect.execution != binding or effect.stage != "saved" or effect.authority_source != "human_admission"
-            or effect.description_digest != digest(effect.description.model_dump(mode="json"))
-            or effect.artifact_sha256 != hashlib.sha256(effect.content).hexdigest()
-            or result.evidence_id != rkey or result.state != "succeeded" or result.work_id != binding.work_id
-            or result.verifier_version != config.delivery.verifier_version
-            or result.definition_digest != digest(launch.definition.model_dump(mode="json"))
-            or result.passed_checks != CHECKS or result.known_effects or result.unresolved_operations
-            or len(result.artifacts) != 1 or result.artifacts[0].artifact_id != profile.artifact_id
-            or result.artifacts[0].version != profile.artifact_version
-            or result.artifacts[0].sha256 != effect.artifact_sha256 or result.content != effect.content
-            or result.proof != _material({"effect": akey, "description_digest": effect.description_digest,
-                "finish_request_id": "finish-task", "criteria_version": launch.definition.criteria_version}).data):
+    if (_finished_rows_differ(session, effect, binding) or _result_outcome_differs(result, rkey, config, launch)
+            or _result_delivery_differs(result, effect, profile, akey, launch)):
         raise denied("RECOVERY_FINISHED_RESULT_INVALID", "original complete result/artifact/criteria differ")
-    base = (runtime_key("policy", configured.binding_id), control_key("owner", binding.owner.owner_record_id),
-            control_key("policy", binding.owner.policy_id), control_key("budget", binding.owner.root_budget_id),
-            worker_key("job", binding.job_id), worker_key("pool", config.workers.workspace_id), skey,
-            assistant_key("delegation", configured.event_id), control_key("delivery-obligation", configured.obligation_id))
-    context_id = assistant_key("context", sid, "current-context")
-    context = view.receipts.get(context_id)
-    if context is None or context.request.read_set[:len(base)] != base:
-        raise denied("RECOVERY_FINISHED_RESULT_INVALID", "original reviewed context receipt is missing")
-    issue_id, acquire_id, finish_id = (assistant_key(action, sid, *ids) for action, ids in (
-        ("issue", ()), ("acquire", ("sdk-start",)), ("finish", ("finish-task",))))
-    issue = view.receipt(ControlRequest(request_id=issue_id, request_digest=digest(launch.start.model_dump(mode="json")),
-                                       read_set=base), (skey,), result={"session_id": sid})
-    acquire = view.receipt(ControlRequest(request_id=acquire_id, request_digest=digest({"request_id": "sdk-start"}),
-                                         read_set=base), (skey,), result={"state": "running"})
-    finish_reads = tuple(dict.fromkeys((*context.request.read_set, akey,
-        control_key("operation", configured.operation_id), rkey, control_key("delivery-work-state", configured.obligation_id))))
-    finish = view.receipt(ControlRequest(request_id=finish_id, request_digest=digest({"request_id": "finish-task"}),
-                                        read_set=finish_reads), (skey, rkey),
-        exact={skey: view.hash(skey), rkey: view.hash(rkey)},
-        result={"state": "ready_to_finalize", "receipt_id": rkey, "artifact_sha256": effect.artifact_sha256})
+    context, issue, acquire, finish = _finish_receipts(
+        view, launch, configured, sid, _original_reads(config, configured, binding, skey), skey, akey, rkey,
+        effect.artifact_sha256)
     native_keys = (native_key("launch", launch.launch_id), native_key("grant", launch.grant_id),
                   control_key("owner", binding.owner.owner_record_id), control_key("policy", binding.owner.policy_id),
                   control_key("budget", binding.owner.root_budget_id), worker_key("job", binding.job_id),
@@ -429,11 +499,11 @@ def _finished_proof(inventory, config, launch, blob_etag, *, expected=None):
         session_image_sha256=view.hash(skey), artifact_image_sha256=view.hash(akey), result_image_sha256=view.hash(rkey),
         native_claim_request_sha256=digest(claimed.payload["request"]), native_claim_receipt_sha256=digest(claimed.payload),
         assignment_request_sha256=digest(issue.request.model_dump(mode="json")),
-        assignment_receipt_sha256=digest(inventory.receipts[issue_id].payload),
+        assignment_receipt_sha256=digest(inventory.receipts[issue.request.request_id].payload),
         acquire_request_sha256=digest(acquire.request.model_dump(mode="json")),
-        acquire_receipt_sha256=digest(inventory.receipts[acquire_id].payload),
+        acquire_receipt_sha256=digest(inventory.receipts[acquire.request.request_id].payload),
         finish_request_sha256=digest(finish.request.model_dump(mode="json")),
-        finish_receipt_sha256=digest(inventory.receipts[finish_id].payload),
+        finish_receipt_sha256=digest(inventory.receipts[finish.request.request_id].payload),
         artifact_id=profile.artifact_id, artifact_version=profile.artifact_version,
         artifact_sha256=effect.artifact_sha256, artifact_blob_etag=blob_etag)
     if expected is not None and value != expected:
@@ -552,6 +622,59 @@ def _cancelled_result(native, launch, proof, *, retained_result=None):
     )
 
 
+def _row_payloads(rows):
+    return {key: None if row is None else row.payload for key, row in rows.items()}
+
+
+def _unfenced_image(rows, job_key, job):
+    """The rows as reviewed: this recovery's own fence and reservation undone on the job."""
+    return {**_row_payloads(rows), job_key: {**rows[job_key].payload, "data": _update(
+        job, cancel_requested=False, cancel_credit=1, stop_credit=1).model_dump(mode="json")}}
+
+
+def _check_consumed_model(rows, session, model_digest, sid):
+    model_key = assistant_key("model-intent", sid, model_digest)
+    if rows[model_key] is None:
+        raise denied("RECOVERY_ORIGINAL_CHANGED", "original SDK model intent is missing")
+    model = _parse(rows[model_key].payload["data"], _ModelIntent)
+    if (session.state != "waiting" or session.reason != "sdk_failed" or session.model_requests != 1
+            or not model.consumed or model.request_sha256 != model_digest):
+        raise denied("RECOVERY_ORIGINAL_CHANGED", "the exact consumed model intent differs")
+
+
+def _claim_differs(job, launch, scope, active_targets):
+    return (job.binding != launch.start.binding or job.state not in {"starting", "running", "capacity_uncertain"}
+            or launch.phase != "claimed" or launch.native_invocation_id is None
+            or job.spec.job_id != scope.job_id or launch.launch_id != scope.launch_id
+            or launch.workload_version != "assistant-v1.2" or launch.target not in active_targets)
+
+
+def _reservation_differs(reservation, launch):
+    return (reservation.active_launch_id != launch.launch_id or reservation.generation != launch.process_generation
+            or reservation.target != launch.target)
+
+
+def _work_differs(job, launch, configured, session):
+    return (job.children or job.spec.obligation_id != configured.obligation_id or launch.definition != configured.work
+            or job.native_execution_id not in {None, launch.native_invocation_id}
+            or session is not None and session.execution != job.binding)
+
+
+def _result_retained(rows, work_id, scope):
+    return not isinstance(scope, FinishedResultRecoveryScope) and (
+        rows[assistant_key("artifact", work_id)] is not None or rows[assistant_key("result", work_id)] is not None)
+
+
+def _pool_differs(pool, job):
+    return (len(pool.slots) != 1 or pool.slots[0].binding != job.binding
+            or pool.pending != (job.spec.job_id,) or pool.completions)
+
+
+def _credits_differ(job, after_fence, after_reservation):
+    return (job.cancel_requested != after_fence or job.cancel_credit != (0 if after_fence else 1)
+            or job.stop_credit != (0 if after_reservation else 1) or not job.completion_credit)
+
+
 class ClaimedSdkRecovery:
     def __init__(self, configuration: ServerConfiguration, native: NativeLaunchAuthority,
                  scope: RecoveryScope | PreSdkRecoveryScope | PreAssignmentRecoveryScope | MultiModelRecoveryScope,
@@ -621,74 +744,59 @@ class ClaimedSdkRecovery:
         authority._current_sources(source_rows, source_snapshot)
         return _finished_proof(inventory, self.config, launch, version.blob.etag, expected=expected)
 
-    def _snapshot(self, launch, model_digest, *, after_fence=False, after_reservation=False):
-        before_assignment = isinstance(self.scope, PreAssignmentRecoveryScope)
-        multi = isinstance(self.scope, MultiModelRecoveryScope)
-        finished = isinstance(self.scope, FinishedResultRecoveryScope)
-        if before_assignment or multi:
-            inventory = self.store.read_inventory()
-            if multi:
-                _multi_models(inventory, self.config, launch, self.scope.model_intents, finished=finished)
-            else:
-                _unassigned_claim(inventory, launch, self.native._keys(launch))
-            rows = {key: inventory.rows.get(key) for key in self._keys(launch, model_digest)}
+    def _attempt_rows(self, scope, launch, model_digest):
+        if not isinstance(scope, (PreAssignmentRecoveryScope, MultiModelRecoveryScope)):
+            return self.store.read_snapshot(self._keys(launch, model_digest))
+        inventory = self.store.read_inventory()
+        if isinstance(scope, MultiModelRecoveryScope):
+            _multi_models(inventory, self.config, launch, scope.model_intents,
+                          finished=isinstance(scope, FinishedResultRecoveryScope))
         else:
-            rows = self.store.read_snapshot(self._keys(launch, model_digest))
+            _unassigned_claim(inventory, launch, self.native._keys(launch))
+        return {key: inventory.rows.get(key) for key in self._keys(launch, model_digest)}
+
+    def _check_unacquired(self, session, launch, sid):
+        if (session.state != "accepted" or session.reason is not None
+                or session.context_read or session.model_requests != 0 or session.assignment.resume
+                or launch.start.checkpoint is not None):
+            raise denied("RECOVERY_ORIGINAL_CHANGED", "the original assignment is not an unacquired SDK start")
+        # Only the underlying exact receipt lookup distinguishes a 404 from
+        # an unavailable read. Public reconcile deliberately calls absence unknown.
+        acquire_key = "behavior:v1:receipt:" + assistant_key("acquire", sid, "sdk-start")
+        if self.store._read(acquire_key, _Receipt) is not None:
+            raise denied("RECOVERY_ORIGINAL_CHANGED", "the original SDK acquire receipt must remain absent")
+
+    def _phase_session(self, scope, rows, launch, model_digest, sid):
+        """The scope's phase rules; before assignment there is no session to read."""
+        if isinstance(scope, PreAssignmentRecoveryScope):
+            return None
+        session_key = assistant_key("session", sid)
+        if rows[session_key] is None:
+            raise denied("RECOVERY_ORIGINAL_CHANGED", "original SDK session/model intent is missing")
+        session = _parse(rows[session_key].payload["data"], _Session)
+        if isinstance(scope, PreSdkRecoveryScope):
+            self._check_unacquired(session, launch, sid)
+        elif not isinstance(scope, MultiModelRecoveryScope):
+            _check_consumed_model(rows, session, model_digest, sid)
+        return session
+
+    def _snapshot(self, launch, model_digest, *, after_fence=False, after_reservation=False):
+        scope = self.scope
+        rows = self._attempt_rows(scope, launch, model_digest)
         job_key = worker_key("job", launch.start.binding.job_id)
         job = self.workers._row(rows, job_key, JobRecord)
         pool = self.workers._pool(rows)
-        configured = next(binding for binding in self.config.bindings if binding.job_id == self.scope.job_id)
+        configured = _configured(self.config, scope.job_id)
         reservation = self.native._row(rows, native_key("target", launch.target.executor_id), _TargetReservation)
         if job.binding is None:
             raise denied("RECOVERY_ORIGINAL_CHANGED", "original claimed binding is missing")
-        sid = assistant_key("session-id", job.binding.start_request_id)
-        if not before_assignment and rows[assistant_key("session", sid)] is None:
-            raise denied("RECOVERY_ORIGINAL_CHANGED", "original SDK session/model intent is missing")
-        session = None if before_assignment else _parse(rows[assistant_key("session", sid)].payload["data"], _Session)
-        if before_assignment:
-            if model_digest is not None or launch.start.checkpoint is not None:
-                raise denied("RECOVERY_ORIGINAL_CHANGED", "missing assignment cannot cover a resumed SDK/model")
-        elif isinstance(self.scope, PreSdkRecoveryScope):
-            if (model_digest is not None or session.state != "accepted" or session.reason is not None
-                    or session.context_read or session.model_requests != 0 or session.assignment.resume
-                    or launch.start.checkpoint is not None):
-                raise denied("RECOVERY_ORIGINAL_CHANGED", "the original assignment is not an unacquired SDK start")
-            # Only the underlying exact receipt lookup distinguishes a 404 from
-            # an unavailable read. Public reconcile deliberately calls absence unknown.
-            acquire_key = "behavior:v1:receipt:" + assistant_key("acquire", sid, "sdk-start")
-            if self.store._read(acquire_key, _Receipt) is not None:
-                raise denied("RECOVERY_ORIGINAL_CHANGED", "the original SDK acquire receipt must remain absent")
-        elif not multi:
-            model_key = assistant_key("model-intent", sid, model_digest)
-            if rows[model_key] is None:
-                raise denied("RECOVERY_ORIGINAL_CHANGED", "original SDK model intent is missing")
-            model = _parse(rows[model_key].payload["data"], _ModelIntent)
-            if (session.state != "waiting" or session.reason != "sdk_failed" or session.model_requests != 1
-                    or not model.consumed or model.request_sha256 != model_digest):
-                raise denied("RECOVERY_ORIGINAL_CHANGED", "the exact consumed model intent differs")
-        if (job.binding != launch.start.binding or job.state not in {"starting", "running", "capacity_uncertain"}
-                or launch.phase != "claimed" or launch.native_invocation_id is None
-                or job.spec.job_id != self.scope.job_id or launch.launch_id != self.scope.launch_id
-                or launch.workload_version != "assistant-v1.2" or launch.target not in self.config.active_targets
-                or reservation.active_launch_id != launch.launch_id or reservation.generation != launch.process_generation
-                or reservation.target != launch.target or job.children
-                or job.spec.obligation_id != configured.obligation_id or launch.definition != configured.work
-                or job.native_execution_id not in {None, launch.native_invocation_id}
-                or session is not None and session.execution != job.binding
-                or not finished and (rows[assistant_key("artifact", job.spec.work_id)] is not None
-                                     or rows[assistant_key("result", job.spec.work_id)] is not None)
-                or len(pool.slots) != 1 or pool.slots[0].binding != job.binding
-                or pool.pending != (job.spec.job_id,) or pool.completions
-                or job.cancel_requested != after_fence or job.cancel_credit != (0 if after_fence else 1)
-                or job.stop_credit != (0 if after_reservation else 1) or not job.completion_credit):
+        session = self._phase_session(scope, rows, launch, model_digest, assistant_key("session-id", job.binding.start_request_id))
+        if (_claim_differs(job, launch, scope, self.config.active_targets) or _reservation_differs(reservation, launch)
+                or _work_differs(job, launch, configured, session) or _result_retained(rows, job.spec.work_id, scope)
+                or _pool_differs(pool, job) or _credits_differ(job, after_fence, after_reservation)):
             raise denied("RECOVERY_ORIGINAL_CHANGED", "the exact failed SDK attempt or its reservations changed")
         self.native._current(rows, launch)
-        normalized = {key: None if row is None else row.payload for key, row in rows.items()}
-        if after_fence:
-            normalized[job_key] = {**rows[job_key].payload, "data": _update(
-                job, cancel_requested=False, cancel_credit=1, stop_credit=1,
-            ).model_dump(mode="json")}
-        return rows, digest(normalized)
+        return rows, digest(_unfenced_image(rows, job_key, job) if after_fence else _row_payloads(rows))
 
     def plan(self, principal):
         self._operator(principal)
@@ -792,8 +900,7 @@ class ClaimedSdkRecovery:
                 raise denied("RECOVERY_CLAIM_UNVERIFIED", "original claim receipt changed")
         def fence(rows):
             self._authorization(principal, authorization)
-            normalized = {key: None if row is None else row.payload for key, row in rows.items()}
-            if digest(normalized) != plan.snapshot_sha256:
+            if digest(_row_payloads(rows)) != plan.snapshot_sha256:
                 raise denied("RECOVERY_PLAN_STALE", "original missing-assignment snapshot changed")
             job_key = worker_key("job", plan.binding.job_id)
             job = self.workers._row(rows, job_key, JobRecord)
@@ -816,9 +923,26 @@ class ClaimedSdkRecovery:
         _, snapshot = self._snapshot(launch, _model_digests(plan), after_fence=current.cancel_requested)
         if snapshot != plan.snapshot_sha256:
             raise denied("RECOVERY_PLAN_STALE", "original authority data changed")
-        cancellation = self._cancel(principal, authorization)
+        self._cancel(principal, authorization)
         intent = _StopIntent(authorization=authorization, fenced_at=self.clock())
         keys = self._keys(launch, _model_digests(plan))
+        if not self._reserve_stop(principal, authorization, launch, intent, keys):
+            return self.reconcile(principal, authorization)
+        self._recheck_before_stop(principal, authorization, keys)
+        observation = self._send_stop(plan.target, authorization.expires_at)
+        self._check_stop(intent, observation)
+        stop_key = recovery_key("stop-observation", plan.recovery_id)
+        stop_request = ControlRequest(request_id=stop_key, request_digest=digest(observation.model_dump(mode="json")))
+        self.store.transact(stop_request, lambda _: ControlChanges(writes=(ControlWrite(
+            row_id=stop_key, mode="create", data=observation.model_dump(mode="json"),
+            material=_material(observation.model_dump(mode="json")),
+        ),), result={"provider_stop_observed": True}))
+        return self.finish(principal, authorization)
+
+    def _reserve_stop(self, principal, authorization, launch, intent, keys):
+        """True only when this call wrote the one stop reservation; a replayed receipt means another caller did."""
+        plan = authorization.plan
+        intent_key = recovery_key("stop-intent", plan.recovery_id)
         job_key = worker_key("job", plan.binding.job_id)
         request = ControlRequest(request_id=intent_key, request_digest=digest(intent.model_dump(mode="json")), read_set=keys)
         fresh = False
@@ -830,10 +954,7 @@ class ClaimedSdkRecovery:
             if job.binding != plan.binding or not job.cancel_requested or not job.stop_credit:
                 raise denied("RECOVERY_STOP_FENCED", "original cancellation or stop reservation changed")
             if isinstance(plan, (PreAssignmentRecoveryPlan, MultiModelRecoveryPlan)):
-                normalized = {key: None if row is None else row.payload for key, row in rows.items()}
-                normalized[job_key] = {**rows[job_key].payload, "data": _update(
-                    job, cancel_requested=False, cancel_credit=1, stop_credit=1).model_dump(mode="json")}
-                if digest(normalized) != plan.snapshot_sha256:
+                if digest(_unfenced_image(rows, job_key, job)) != plan.snapshot_sha256:
                     raise denied("RECOVERY_STOP_FENCED", "missing-assignment predicates changed before stop reservation")
             fresh = True
             return ControlChanges(writes=(
@@ -849,8 +970,11 @@ class ClaimedSdkRecovery:
             _multi_inventory(inventory, self.config, plan, keys, authorization)
             options["expected_guard"] = inventory.guard
         self.store.transact(request, reserve, **options)
-        if not fresh:
-            return self.reconcile(principal, authorization)
+        return fresh
+
+    def _recheck_before_stop(self, principal, authorization, keys):
+        """The last look before the one external stop; each read here is deliberately a new one."""
+        plan = authorization.plan
         _, snapshot = self._snapshot(self.native.launch(plan.launch_id), _model_digests(plan),
                                      after_fence=True, after_reservation=True)
         if snapshot != plan.snapshot_sha256:
@@ -863,20 +987,14 @@ class ClaimedSdkRecovery:
             _multi_inventory(inventory, self.config, plan, keys, authorization)
             if isinstance(plan, FinishedResultRecoveryPlan) and self.store.read_inventory().entity_sha256 != inventory.entity_sha256:
                 raise denied("RECOVERY_PLAN_STALE", "finished-result authority changed before stop")
+
+    def _send_stop(self, target, deadline):
         try:
-            observation = self.stop(plan.target, authorization.expires_at)
+            return self.stop(target, deadline)
         except Problem:
             raise
         except Exception:
             raise Problem(503, "RECOVERY_STOP_UNKNOWN", "original platform stop is unresolved; never resend") from None
-        self._check_stop(intent, observation)
-        stop_key = recovery_key("stop-observation", plan.recovery_id)
-        stop_request = ControlRequest(request_id=stop_key, request_digest=digest(observation.model_dump(mode="json")))
-        self.store.transact(stop_request, lambda _: ControlChanges(writes=(ControlWrite(
-            row_id=stop_key, mode="create", data=observation.model_dump(mode="json"),
-            material=_material(observation.model_dump(mode="json")),
-        ),), result={"provider_stop_observed": True}))
-        return self.finish(principal, authorization)
 
     def _check_stop(self, intent, observation):
         observation = _parse(observation.model_dump(mode="json"), PlatformStopObservation)
@@ -983,90 +1101,114 @@ class ClaimedSdkRecovery:
                    if isinstance(plan, FinishedResultRecoveryPlan) else {})}
 
 
-def verify_platform_stop(native, launch, saved, proof_row):
-    proof = _parse(proof_row.payload["data"], _PlatformProof)
+def _row_image(record):
+    return hashlib.sha256(json.dumps(record.payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def _verify_unassigned_claim(native, launch, plan):
+    claim = _unassigned_claim(native.store.read_inventory(), launch, native._keys(launch),
+                              original_request=plan.native_claim_request)
+    if digest(claim.payload) != plan.native_claim_receipt_sha256:
+        raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original native claim receipt differs")
+
+
+def _verify_intent(inventory, sid, key, item):
+    if _row_image(inventory.rows[key]) != item.image_sha256:
+        raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original model intent image changed after stop")
+    for action, request_hash, receipt_hash in (
+            ("model", item.reserve_request_sha256, item.reserve_receipt_sha256),
+            ("model-send", item.consume_request_sha256, item.consume_receipt_sha256)):
+        retained = inventory.receipts.get(assistant_key(action, sid, item.request_sha256))
+        if request_hash is None:
+            if retained is not None:
+                raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "late model consume receipt")
+        elif retained is None or digest(retained.payload) != receipt_hash or digest(retained.payload["request"]) != request_hash:
+            raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original model receipt changed after stop")
+
+
+def _verify_finished_rows(inventory, plan, sid):
+    refs = plan.finished_result
+    for kind, identifier, fingerprint in (
+            ("session", sid, refs.session_image_sha256),
+            ("artifact", plan.binding.work_id, refs.artifact_image_sha256),
+            ("result", plan.binding.work_id, refs.result_image_sha256)):
+        record = inventory.rows.get(assistant_key(kind, identifier))
+        if record is None or _row_image(record) != fingerprint:
+            raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original finished row changed after stop")
+
+
+def _verify_finished(native, inventory, launch, plan, sid):
+    _verify_finished_rows(inventory, plan, sid)
+    refs = plan.finished_result
+    claim = _claimed_receipt(inventory, launch, native._keys(launch))
+    if digest(claim.payload) != refs.native_claim_receipt_sha256 or digest(claim.payload["request"]) != refs.native_claim_request_sha256:
+        raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original finished claim changed")
+    for action, ids, request_hash, receipt_hash in (
+            ("issue", (), refs.assignment_request_sha256, refs.assignment_receipt_sha256),
+            ("acquire", ("sdk-start",), refs.acquire_request_sha256, refs.acquire_receipt_sha256),
+            ("finish", ("finish-task",), refs.finish_request_sha256, refs.finish_receipt_sha256)):
+        record = inventory.receipts.get(assistant_key(action, sid, *ids))
+        if record is None or digest(record.payload["request"]) != request_hash or digest(record.payload) != receipt_hash:
+            raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original finish/acquire/assignment receipt changed")
+
+
+def _verify_model_set(native, launch, plan):
+    # Native verification has no server configuration handle. The original
+    # immutable model set is also checked by the recovery/history readers.
+    inventory = native.store.read_inventory()
+    sid = assistant_key("session-id", plan.binding.start_request_id)
+    expected = {assistant_key("model-intent", sid, item.request_sha256): item for item in plan.model_intents}
+    if _model_intent_keys(inventory, sid) != set(expected):
+        raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original model set changed after stop")
+    for key, item in expected.items():
+        _verify_intent(inventory, sid, key, item)
+    if isinstance(plan, FinishedResultRecoveryPlan):
+        _verify_finished(native, inventory, launch, plan, sid)
+
+
+def _stop_binding_differs(native, launch, proof, proof_row):
     plan, observation = proof.intent.authorization.plan, proof.observation
-    if isinstance(plan, PreAssignmentRecoveryPlan):
-        claim = _unassigned_claim(native.store.read_inventory(), launch, native._keys(launch),
-                                  original_request=plan.native_claim_request)
-        if digest(claim.payload) != plan.native_claim_receipt_sha256:
-            raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original native claim receipt differs")
-    elif isinstance(plan, MultiModelRecoveryPlan):
-        # Native verification has no server configuration handle. The original
-        # immutable model set is also checked by the recovery/history readers.
-        inventory = native.store.read_inventory()
-        sid = assistant_key("session-id", plan.binding.start_request_id)
-        expected = {assistant_key("model-intent", sid, item.request_sha256): item for item in plan.model_intents}
-        actual = {key for key, row in inventory.rows.items()
-                  if isinstance(value := row.payload["data"].get("request_sha256"), str)
-                  and key == assistant_key("model-intent", sid, value)}
-        if actual != set(expected):
-            raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original model set changed after stop")
-        for key, item in expected.items():
-            raw = json.dumps(inventory.rows[key].payload, ensure_ascii=False, separators=(",", ":")).encode()
-            if hashlib.sha256(raw).hexdigest() != item.image_sha256:
-                raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original model intent image changed after stop")
-            for action, request_hash, receipt_hash in (
-                    ("model", item.reserve_request_sha256, item.reserve_receipt_sha256),
-                    ("model-send", item.consume_request_sha256, item.consume_receipt_sha256)):
-                retained = inventory.receipts.get(assistant_key(action, sid, item.request_sha256))
-                if request_hash is None:
-                    if retained is not None:
-                        raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "late model consume receipt")
-                elif retained is None or digest(retained.payload) != receipt_hash or digest(retained.payload["request"]) != request_hash:
-                    raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original model receipt changed after stop")
-        if isinstance(plan, FinishedResultRecoveryPlan):
-            refs = plan.finished_result
-            for kind, identifier, fingerprint in (
-                    ("session", sid, refs.session_image_sha256),
-                    ("artifact", plan.binding.work_id, refs.artifact_image_sha256),
-                    ("result", plan.binding.work_id, refs.result_image_sha256)):
-                record = inventory.rows.get(assistant_key(kind, identifier))
-                if record is None or hashlib.sha256(json.dumps(
-                        record.payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest() != fingerprint:
-                    raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original finished row changed after stop")
-            claim = _claimed_receipt(inventory, launch, native._keys(launch))
-            if digest(claim.payload) != refs.native_claim_receipt_sha256 or digest(claim.payload["request"]) != refs.native_claim_request_sha256:
-                raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original finished claim changed")
-            for action, ids, request_hash, receipt_hash in (
-                    ("issue", (), refs.assignment_request_sha256, refs.assignment_receipt_sha256),
-                    ("acquire", ("sdk-start",), refs.acquire_request_sha256, refs.acquire_receipt_sha256),
-                    ("finish", ("finish-task",), refs.finish_request_sha256, refs.finish_receipt_sha256)):
-                record = inventory.receipts.get(assistant_key(action, sid, *ids))
-                if record is None or digest(record.payload["request"]) != request_hash or digest(record.payload) != receipt_hash:
-                    raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original finish/acquire/assignment receipt changed")
-    job = native.workers.inspect(plan.binding.job_id)
     expected_binding = NativeRecoveryBinding(
         configuration_sha256=plan.configuration_sha256, operator_oid=plan.operator_oid,
         credential_client_id=observation.credential_client_id,
     )
-    if (native.recovery_binding != expected_binding
+    return (native.recovery_binding != expected_binding
             or proof_row.payload["material"] != _material(proof.model_dump(mode="json")).model_dump(mode="json")
             or plan.launch_id != launch.launch_id or plan.binding != launch.start.binding
             or plan.native_invocation_id != launch.native_invocation_id or observation.target != launch.target
             or observation.endpoint != stop_endpoint(launch.target)
-            or (observation.status_code, observation.error_code) not in {(204, None), (409, "session_already_stopped")}
-            or not proof.intent.authorization.approved_at <= proof.intent.fenced_at
-            or not proof.intent.fenced_at <= observation.observed_at < proof.intent.authorization.expires_at
-            or not job.cancel_requested or job.binding != plan.binding or launch.phase != "sealed"
-            or saved.evidence.state != ("succeeded" if isinstance(plan, FinishedResultRecoveryPlan) else "stopped")
-            or saved.evidence.checkpoint is not None
-            or not saved.evidence.entire_tree_idle or not saved.evidence.all_inflight_starts_fenced
+            or (observation.status_code, observation.error_code) not in {(204, None), (409, "session_already_stopped")})
+
+
+def _stop_times_differ(proof):
+    return (not proof.intent.authorization.approved_at <= proof.intent.fenced_at
+            or not proof.intent.fenced_at <= proof.observation.observed_at < proof.intent.authorization.expires_at)
+
+
+def _sealed_evidence_differs(native, launch, saved, proof):
+    plan = proof.intent.authorization.plan
+    return (saved.evidence.state != ("succeeded" if isinstance(plan, FinishedResultRecoveryPlan) else "stopped")
             or saved.evidence.result != _cancelled_result(native, launch, proof)
             or saved.evidence.native_execution_id != plan.native_invocation_id
             or saved.evidence.proof != _material(proof.model_dump(mode="json")).data
-            or saved.report_digest != digest(proof.model_dump(mode="json"))):
-        raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "permanent original cancellation/platform-stop proof differs")
+            or saved.report_digest != digest(proof.model_dump(mode="json")))
+
+
+def _verify_provenance(native, proof):
     for name, expected in (("authorization", proof.intent.authorization.model_dump(mode="json")),
                            ("stop-intent", proof.intent.model_dump(mode="json")),
-                           ("stop-observation", observation.model_dump(mode="json"))):
-        key = recovery_key(name, plan.recovery_id)
+                           ("stop-observation", proof.observation.model_dump(mode="json"))):
+        key = recovery_key(name, proof.intent.authorization.plan.recovery_id)
         row = native.store.read_snapshot((key,))[key]
         if row is None or row.payload["data"] != expected or row.payload["material"] != _material(expected).model_dump(mode="json"):
             raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "exact immutable cancellation/stop provenance is missing")
+
+
+def _verify_stop_receipts(native, launch, proof):
+    plan = proof.intent.authorization.plan
     cancel = _cancel_request(native, plan)
     stop = ControlRequest(request_id=recovery_key("stop-observation", plan.recovery_id),
-                          request_digest=digest(observation.model_dump(mode="json")))
+                          request_digest=digest(proof.observation.model_dump(mode="json")))
     reservation = ControlRequest(
         request_id=recovery_key("stop-intent", plan.recovery_id),
         request_digest=digest(proof.intent.model_dump(mode="json")),
@@ -1077,3 +1219,19 @@ def verify_platform_stop(native, launch, saved, proof_row):
             or digest(native.store.reconcile(stop).payload) != proof.stop_receipt_sha256
             or native.store.reconcile(reservation).payload["result"] != {"stop_reserved": True}):
         raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "original cancellation and stop receipts differ")
+
+
+def verify_platform_stop(native, launch, saved, proof_row):
+    proof = _parse(proof_row.payload["data"], _PlatformProof)
+    plan = proof.intent.authorization.plan
+    if isinstance(plan, PreAssignmentRecoveryPlan):
+        _verify_unassigned_claim(native, launch, plan)
+    elif isinstance(plan, MultiModelRecoveryPlan):
+        _verify_model_set(native, launch, plan)
+    job = native.workers.inspect(plan.binding.job_id)
+    if (_stop_binding_differs(native, launch, proof, proof_row) or _stop_times_differ(proof)
+            or not job.cancel_requested or job.binding != plan.binding or launch.phase != "sealed"
+            or _sealed_evidence_differs(native, launch, saved, proof)):
+        raise denied("RECOVERY_PLATFORM_PROOF_INVALID", "permanent original cancellation/platform-stop proof differs")
+    _verify_provenance(native, proof)
+    _verify_stop_receipts(native, launch, proof)

@@ -278,105 +278,176 @@ class RuntimeController:
         return self._runtime._controller_drain(self, limit=limit)
 
 
+def _require_concrete_dependencies(dep):
+    expected = (
+        (dep.store, BehaviorStore), (dep.sources, SourceMaterials), (dep.memory, MemoryGovernance),
+        (dep.broker, ToolBrokerCore), (dep.delivery, DeliveryCore), (dep.inbox, PullInbox),
+        (dep.workers, WorkerCore), (dep.evidence, RuntimeEvidenceAuthority),
+    )
+    if any(not isinstance(value, model) for value, model in expected):
+        raise Problem(503, "BEHAVIOR_CONFIGURATION", "all concrete behavior dependencies are required")
+
+
+def _controller_identifier(controller_id):
+    try:
+        return None if controller_id is None else TypeAdapter(wire.Identifier).validate_python(controller_id, strict=True)
+    except ValidationError:
+        raise Problem(503, "BEHAVIOR_CONFIGURATION", "controller must be an explicit server identifier") from None
+
+
+def _require_distinct_bindings(bindings, registered):
+    if (len(registered) > 32 or len({job.job_id for job in registered}) != len(registered)
+            or len({job.work.work_id for job in registered}) != len(registered)):
+        raise Problem(503, "BEHAVIOR_CONFIGURATION", "root/child job and work identities must be distinct and bounded")
+    # job_id and work_id are not compared per binding: each root job is already in `registered`, checked above.
+    for selector in (
+        lambda b: b.owner.owner_record_id, lambda b: b.event_id, lambda b: b.operation_id, lambda b: b.grant_id,
+    ):
+        if len({selector(binding) for binding in bindings}) != len(bindings):
+            raise Problem(503, "BEHAVIOR_CONFIGURATION", "work, owner, job and operation bindings must be unambiguous")
+
+
+def _components_unshared(dep):
+    components = (dep.sources, dep.memory, dep.broker, dep.delivery, dep.inbox, dep.workers, dep.evidence)
+    return (
+        any(item.store is not dep.store for item in components)
+        or dep.memory.sources is not dep.sources
+        or dep.inbox.core is not dep.delivery
+    )
+
+
+def _registration_differs(dep, mode):
+    registration = dep.delivery.registration
+    return (
+        registration is None
+        or registration.mode != mode or dep.workers.mode != mode
+        or registration.channel_adapter is not dep.inbox
+        or registration.verify_ingress != dep.evidence.verify_ingress
+        or registration.verify_work_result != dep.workers.verify_work_result
+        or registration.verify_receipt != dep.inbox.verify_receipt
+        or dep.inbox.registration.verify_access != dep.evidence.verify_access
+        or dep.inbox.registration.authentication_version != dep.evidence.authentication_version
+    )
+
+
+def _contract_differs(dep, bindings):
+    contract = dep.delivery.contract
+    return (
+        contract.channel.channel_id != INBOX_CHANNEL_ID
+        or contract.channel.version != INBOX_VERSION
+        or dep.workers.contract.control_binding != dep.store._binding
+        or contract.control_binding != dep.store._binding
+        or any(binding.team_id != contract.team_id for binding in bindings)
+    )
+
+
+def _claim_reviewer_differs(dep):
+    reviewer = dep.claim_reviewer
+    return reviewer is not None and (
+        not isinstance(reviewer, DurableHumanReviewVerifier)
+        or reviewer.sources is not dep.sources
+        or dep.memory._review is not reviewer
+    )
+
+
+def _require_wired_dependencies(dep, bindings, mode):
+    if (
+        _components_unshared(dep) or _registration_differs(dep, mode)
+        or _contract_differs(dep, bindings) or _claim_reviewer_differs(dep)
+    ):
+        raise Problem(503, "BEHAVIOR_CONFIGURATION", "explicit, identically bound behavior dependencies are required")
+
+
+def _native_owner_differs(native, dep, controller):
+    return (
+        not isinstance(native, NativeLaunchAuthority) or native.workers is not dep.workers
+        or controller is None or native.controller_id != controller.controller_id
+        or native.team_id != dep.delivery.contract.team_id
+    )
+
+
+def _native_executor_differs(native, executor, adapter):
+    return (
+        not isinstance(executor, FoundryExecutor) or executor.authority is not native
+        or adapter.query != executor.query or adapter.stop != executor.stop or adapter.verify != native.verify
+    )
+
+
+def _native_routes_differ(native, bindings, registered):
+    return set(native.jobs) != {job.job_id for job in registered} or any(
+        native.jobs[job.job_id].api_binding_id != binding.binding_id
+        for binding in bindings.values() for job in binding.registered_jobs
+    )
+
+
+def _require_native_authority(dep, bindings, registered, controller, mode):
+    native = dep.native_launches
+    if mode == "native" and native is None:
+        raise Problem(503, "BEHAVIOR_CONFIGURATION", "native mode requires the concrete permit-bound launch authority")
+    if native is None:
+        return
+    adapter = dep.workers.adapter
+    executor = getattr(adapter.start, "__self__", None) if adapter else None
+    if (
+        _native_owner_differs(native, dep, controller) or _native_executor_differs(native, executor, adapter)
+        or _native_routes_differ(native, bindings, registered)
+    ):
+        raise Problem(503, "BEHAVIOR_CONFIGURATION", "native callbacks require the exact configured controller and native invocation adapter")
+
+
+def _require_live_backup_authority(dep, bindings):
+    backups = dep.source_backups
+    if backups is not None and (
+        not isinstance(backups, SourceBackupService) or backups.sources is not dep.sources
+        or backups.settings.authority_domain != dep.store._scope.authority_domain
+        or any(backups.settings.tenant_id != binding.tenant_id for binding in bindings.values())
+    ):
+        raise Problem(503, "BEHAVIOR_CONFIGURATION", "backup upload must use the exact live source authority")
+
+
+def _projection_differs(projection, binding_id, binding, memory):
+    setup = projection.setup
+    return (
+        projection.governance is not memory
+        or setup.binding_id != binding_id
+        or setup.subject != binding.subject
+        or setup.scope.tenant_id != binding.tenant_id
+        or setup.scope.team_id != binding.team_id
+        or not set(setup.claim_ids) <= set(binding.claim_ids)
+    )
+
+
+def _require_bound_memory_projections(dep, bindings):
+    if dep.memory_projections is None:
+        return
+    for binding_id, projection in dep.memory_projections.items():
+        binding = bindings.get(binding_id)
+        if (binding is None or not isinstance(projection, NativeMemoryProjection)
+                or _projection_differs(projection, binding_id, binding, dep.memory)):
+            raise Problem(503, "BEHAVIOR_CONFIGURATION", "native memory projection binding differs")
+
+
 class BehaviorRuntime:
     def __init__(
         self, dependencies: RuntimeDependencies, bindings: tuple[RuntimeBinding, ...], *,
         clock: Callable[[], datetime], mode: Literal["native", "offline_contract"],
         controller_id: str | None = None,
     ):
-        expected = (
-            (dependencies.store, BehaviorStore), (dependencies.sources, SourceMaterials),
-            (dependencies.memory, MemoryGovernance), (dependencies.broker, ToolBrokerCore),
-            (dependencies.delivery, DeliveryCore), (dependencies.inbox, PullInbox),
-            (dependencies.workers, WorkerCore), (dependencies.evidence, RuntimeEvidenceAuthority),
-        )
-        if any(not isinstance(value, model) for value, model in expected):
-            raise Problem(503, "BEHAVIOR_CONFIGURATION", "all concrete behavior dependencies are required")
+        _require_concrete_dependencies(dependencies)
         if not bindings or len(bindings) > 16 or len({b.binding_id for b in bindings}) != len(bindings):
             raise Problem(422, "BEHAVIOR_CONFIGURATION", "one to sixteen unique server bindings are required")
         self.dep, self.store, self.clock, self.mode = dependencies, dependencies.store, clock, mode
         self.work_policy = None
         self.historical_binding_ids = frozenset()
-        try:
-            checked_controller = None if controller_id is None else TypeAdapter(wire.Identifier).validate_python(controller_id, strict=True)
-        except ValidationError:
-            raise Problem(503, "BEHAVIOR_CONFIGURATION", "controller must be an explicit server identifier") from None
+        checked_controller = _controller_identifier(controller_id)
         self.controller = None if checked_controller is None else RuntimeController(self, checked_controller)
         self.bindings = MappingProxyType({b.binding_id: _checked(b, RuntimeBinding) for b in bindings})
         registered = [job for binding in self.bindings.values() for job in binding.registered_jobs]
-        if (len(registered) > 32 or len({job.job_id for job in registered}) != len(registered)
-                or len({job.work.work_id for job in registered}) != len(registered)):
-            raise Problem(503, "BEHAVIOR_CONFIGURATION", "root/child job and work identities must be distinct and bounded")
-        for selector in (
-            lambda b: b.owner.owner_record_id, lambda b: b.work.work_id, lambda b: b.event_id,
-            lambda b: b.job_id, lambda b: b.operation_id, lambda b: b.grant_id,
-        ):
-            if len({selector(binding) for binding in bindings}) != len(bindings):
-                raise Problem(503, "BEHAVIOR_CONFIGURATION", "work, owner, job and operation bindings must be unambiguous")
-        objects = (
-            dependencies.sources, dependencies.memory, dependencies.broker,
-            dependencies.delivery, dependencies.inbox, dependencies.workers, dependencies.evidence,
-        )
-        if (
-            any(item.store is not self.store for item in objects)
-            or dependencies.memory.sources is not dependencies.sources
-            or dependencies.inbox.core is not dependencies.delivery
-            or dependencies.delivery.registration is None
-            or dependencies.delivery.registration.mode != mode or dependencies.workers.mode != mode
-            or dependencies.delivery.registration.channel_adapter is not dependencies.inbox
-            or dependencies.delivery.registration.verify_ingress != dependencies.evidence.verify_ingress
-            or dependencies.delivery.registration.verify_work_result != dependencies.workers.verify_work_result
-            or dependencies.delivery.registration.verify_receipt != dependencies.inbox.verify_receipt
-            or dependencies.inbox.registration.verify_access != dependencies.evidence.verify_access
-            or dependencies.inbox.registration.authentication_version != dependencies.evidence.authentication_version
-            or dependencies.delivery.contract.channel.channel_id != INBOX_CHANNEL_ID
-            or dependencies.delivery.contract.channel.version != INBOX_VERSION
-            or dependencies.workers.contract.control_binding != self.store._binding
-            or dependencies.delivery.contract.control_binding != self.store._binding
-            or any(binding.team_id != dependencies.delivery.contract.team_id for binding in bindings)
-            or dependencies.claim_reviewer is not None and (
-                not isinstance(dependencies.claim_reviewer, DurableHumanReviewVerifier)
-                or dependencies.claim_reviewer.sources is not dependencies.sources
-                or dependencies.memory._review is not dependencies.claim_reviewer
-            )
-        ):
-            raise Problem(503, "BEHAVIOR_CONFIGURATION", "explicit, identically bound behavior dependencies are required")
-        native = dependencies.native_launches
-        if mode == "native" and native is None:
-            raise Problem(503, "BEHAVIOR_CONFIGURATION", "native mode requires the concrete permit-bound launch authority")
-        if native is not None:
-            executor = getattr(dependencies.workers.adapter.start, "__self__", None) if dependencies.workers.adapter else None
-            if (
-                not isinstance(native, NativeLaunchAuthority) or native.workers is not dependencies.workers
-                or self.controller is None or native.controller_id != self.controller.controller_id
-                or native.team_id != dependencies.delivery.contract.team_id
-                or not isinstance(executor, FoundryExecutor) or executor.authority is not native
-                or dependencies.workers.adapter.query != executor.query
-                or dependencies.workers.adapter.stop != executor.stop
-                or dependencies.workers.adapter.verify != native.verify
-                or set(native.jobs) != {job.job_id for job in registered}
-                or any(native.jobs[job.job_id].api_binding_id != binding.binding_id
-                       for binding in self.bindings.values() for job in binding.registered_jobs)
-            ):
-                raise Problem(503, "BEHAVIOR_CONFIGURATION", "native callbacks require the exact configured controller and native invocation adapter")
-        backups = dependencies.source_backups
-        if backups is not None and (
-            not isinstance(backups, SourceBackupService) or backups.sources is not dependencies.sources
-            or backups.settings.authority_domain != self.store._scope.authority_domain
-            or any(backups.settings.tenant_id != binding.tenant_id for binding in self.bindings.values())
-        ):
-            raise Problem(503, "BEHAVIOR_CONFIGURATION", "backup upload must use the exact live source authority")
-        if dependencies.memory_projections is not None:
-            for binding_id, projection in dependencies.memory_projections.items():
-                binding = self.bindings.get(binding_id)
-                if (binding is None or not isinstance(projection, NativeMemoryProjection)
-                        or projection.governance is not dependencies.memory
-                        or projection.setup.binding_id != binding_id
-                        or projection.setup.subject != binding.subject
-                        or projection.setup.scope.tenant_id != binding.tenant_id
-                        or projection.setup.scope.team_id != binding.team_id
-                        or not set(projection.setup.claim_ids) <= set(binding.claim_ids)):
-                    raise Problem(503, "BEHAVIOR_CONFIGURATION", "native memory projection binding differs")
+        _require_distinct_bindings(bindings, registered)
+        _require_wired_dependencies(dependencies, bindings, mode)
+        _require_native_authority(dependencies, self.bindings, registered, self.controller, mode)
+        _require_live_backup_authority(dependencies, self.bindings)
+        _require_bound_memory_projections(dependencies, self.bindings)
 
     def binding_digest(self, binding: RuntimeBinding):
         return _digest([RUNTIME_VERSION, self.mode, binding.model_dump(mode="json")])

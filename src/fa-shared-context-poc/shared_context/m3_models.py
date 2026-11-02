@@ -322,6 +322,102 @@ def skill_metadata_sha256(team: str, artifact: str, version: dict) -> str | None
     return hashlib.sha256(raw).hexdigest()
 
 
+def _check_source(document):
+    check_artifact_source(document.source_work, document.native_source)
+    source = document.native_source
+    if source is not None and (source.team_id, source.author_oid) != (document.team, document.owner_oid):
+        raise ValueError("the native source must belong to the artifact's Team and owner")
+    if isinstance(source, OwnerArtifactSource) != (document.owner == OWNER_AUTHOR):
+        raise ValueError("only a Team owner source uses the Team owner author name")
+
+
+def _check_version(document, version):
+    source = version.native_source
+    if (source is None) != (document.native_source is None):
+        raise ValueError("native and legacy artifact provenance cannot be mixed")
+    if source is not None and source.team_id != document.team:
+        raise ValueError("a native artifact version cannot cross Teams")
+    if source is not None and source.author != document.native_source.author:
+        raise ValueError("the native artifact source must retain the original author")
+    if version.skill_purpose is not None and document.kind != "skill":
+        raise ValueError("Only skill versions may carry an approved purpose")
+    if version.metadata_sha256 != skill_metadata_sha256(
+        document.team, document.artifact_id, version.model_dump(mode="json"),
+    ):
+        raise ValueError("Skill version metadata differs from its immutable digest")
+
+
+def _check_pending(document):
+    pending = document.pending
+    if pending is None:
+        return
+    if pending.skill_purpose is not None and document.kind != "skill":
+        raise ValueError("Only skill versions may propose a purpose")
+    if pending.native_source is not None and pending.native_source.team_id != document.team:
+        raise ValueError("a native pending version cannot cross Teams")
+    if (pending.native_source is None) != (document.native_source is None):
+        raise ValueError("native and legacy pending provenance cannot be mixed")
+
+
+def _check_numbering(document):
+    ids = [item.version_id for item in document.versions]
+    if len(ids) != len(set(ids)) or [item.number for item in document.versions] != list(range(1, len(ids) + 1)):
+        raise ValueError("version history must be unique and sequential")
+    if document.pending and (document.pending.version_id in ids or len(ids) >= MAX_ARTIFACT_VERSIONS):
+        raise ValueError("invalid pending version")
+
+
+def _check_version_owner(document):
+    if any(item.created_by_oid != document.owner_oid for item in document.versions) or (
+        document.pending and document.pending.created_by_oid != document.owner_oid
+    ):
+        raise ValueError("version provenance must match the artifact owner")
+
+
+def _check_kind_rules(document):
+    if document.kind == "deliverable" and (
+        document.effective_version_id is not None or any(item.approval for item in document.versions)
+    ):
+        raise ValueError("ordinary deliverables do not activate policies")
+    if document.deactivations and document.kind != "skill":
+        raise ValueError("Only skills support explicit deactivation")
+
+
+def _version_named(document, version_id):
+    return next((item for item in document.versions if item.version_id == version_id), None)
+
+
+def _deactivated_versions(document) -> set[str]:
+    deactivated, revision = set(), 0
+    for decision in document.deactivations:
+        version = _version_named(document, decision.version_id)
+        if (version is None or version.approval is None or version.approval.decision != "approve"
+                or decision.sha256 != version.sha256 or decision.metadata_sha256 != version.metadata_sha256):
+            raise ValueError("Deactivation must retain an exact approved skill version")
+        if decision.version_id in deactivated or not revision < decision.applied_revision <= document.revision:
+            raise ValueError("Deactivation history must be unique and ordered")
+        deactivated.add(decision.version_id)
+        revision = decision.applied_revision
+    return deactivated
+
+
+def _check_decision_ids(document):
+    decisions = [item.approval.decision_id for item in document.versions if item.approval]
+    decisions.extend(item.decision_id for item in document.deactivations)
+    if len(decisions) != len(set(decisions)):
+        raise ValueError("decision IDs cannot be reused")
+
+
+def _check_effective_version(document, deactivated):
+    if document.effective_version_id is None:
+        return
+    if document.effective_version_id in deactivated:
+        raise ValueError("A deactivated version cannot silently become effective again")
+    effective = _version_named(document, document.effective_version_id)
+    if effective is None or effective.approval is None or effective.approval.decision != "approve":
+        raise ValueError("effective version must have an exact human approval")
+
+
 class ArtifactDocument(CreateArtifact):
     schema_version: Literal[1] = 1
     source_work: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -340,66 +436,16 @@ class ArtifactDocument(CreateArtifact):
 
     @model_validator(mode="after")
     def valid_history(self):
-        check_artifact_source(self.source_work, self.native_source)
-        if self.native_source is not None and (self.native_source.team_id, self.native_source.author_oid) != (
-                self.team, self.owner_oid):
-            raise ValueError("the native source must belong to the artifact's Team and owner")
-        if isinstance(self.native_source, OwnerArtifactSource) != (self.owner == OWNER_AUTHOR):
-            raise ValueError("only a Team owner source uses the Team owner author name")
+        _check_source(self)
         for version in self.versions:
-            if (version.native_source is None) != (self.native_source is None):
-                raise ValueError("native and legacy artifact provenance cannot be mixed")
-            if version.native_source is not None and version.native_source.team_id != self.team:
-                raise ValueError("a native artifact version cannot cross Teams")
-            if version.native_source is not None and version.native_source.author != self.native_source.author:
-                raise ValueError("the native artifact source must retain the original author")
-            if version.skill_purpose is not None and self.kind != "skill":
-                raise ValueError("Only skill versions may carry an approved purpose")
-            if version.metadata_sha256 != skill_metadata_sha256(
-                self.team, self.artifact_id, version.model_dump(mode="json"),
-            ):
-                raise ValueError("Skill version metadata differs from its immutable digest")
-        if self.pending and self.pending.skill_purpose is not None and self.kind != "skill":
-            raise ValueError("Only skill versions may propose a purpose")
-        if self.pending and self.pending.native_source is not None and self.pending.native_source.team_id != self.team:
-            raise ValueError("a native pending version cannot cross Teams")
-        if self.pending and (self.pending.native_source is None) != (self.native_source is None):
-            raise ValueError("native and legacy pending provenance cannot be mixed")
-        ids = [item.version_id for item in self.versions]
-        if len(ids) != len(set(ids)) or [item.number for item in self.versions] != list(range(1, len(ids) + 1)):
-            raise ValueError("version history must be unique and sequential")
-        if self.pending and (self.pending.version_id in ids or len(ids) >= MAX_ARTIFACT_VERSIONS):
-            raise ValueError("invalid pending version")
-        if any(item.created_by_oid != self.owner_oid for item in self.versions) or (
-            self.pending and self.pending.created_by_oid != self.owner_oid
-        ):
-            raise ValueError("version provenance must match the artifact owner")
-        if self.kind == "deliverable" and (
-            self.effective_version_id is not None or any(item.approval for item in self.versions)
-        ):
-            raise ValueError("ordinary deliverables do not activate policies")
-        if self.deactivations and self.kind != "skill":
-            raise ValueError("Only skills support explicit deactivation")
-        deactivated, revision = set(), 0
-        for decision in self.deactivations:
-            version = next((item for item in self.versions if item.version_id == decision.version_id), None)
-            if (version is None or version.approval is None or version.approval.decision != "approve"
-                    or decision.sha256 != version.sha256 or decision.metadata_sha256 != version.metadata_sha256):
-                raise ValueError("Deactivation must retain an exact approved skill version")
-            if decision.version_id in deactivated or not revision < decision.applied_revision <= self.revision:
-                raise ValueError("Deactivation history must be unique and ordered")
-            deactivated.add(decision.version_id)
-            revision = decision.applied_revision
-        decisions = [item.approval.decision_id for item in self.versions if item.approval]
-        decisions.extend(item.decision_id for item in self.deactivations)
-        if len(decisions) != len(set(decisions)):
-            raise ValueError("decision IDs cannot be reused")
-        if self.effective_version_id is not None:
-            if self.effective_version_id in deactivated:
-                raise ValueError("A deactivated version cannot silently become effective again")
-            effective = next((item for item in self.versions if item.version_id == self.effective_version_id), None)
-            if effective is None or effective.approval is None or effective.approval.decision != "approve":
-                raise ValueError("effective version must have an exact human approval")
+            _check_version(self, version)
+        _check_pending(self)
+        _check_numbering(self)
+        _check_version_owner(self)
+        _check_kind_rules(self)
+        deactivated = _deactivated_versions(self)
+        _check_decision_ids(self)
+        _check_effective_version(self, deactivated)
         return self
 
 

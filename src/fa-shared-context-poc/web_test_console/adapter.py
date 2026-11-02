@@ -87,6 +87,24 @@ def require(value, code, status=409):
         raise ConsoleError(code, status)
 
 
+def decode(model, raw, code):
+    """One API reply as ``model``, strictly; anything else is the caller's own 502."""
+    try:
+        strict_json(raw)
+        return model.model_validate_json(raw)
+    except (ValueError, TypeError):
+        raise ConsoleError(code, 502) from None
+
+
+def owner_token(console, owner_only, *, write=False):
+    """The login's token; a write also needs Behavior.Approve, checked only after a login exists."""
+    console.active()
+    token = console.vault.get()
+    if write:
+        require(console.vault.allows("Behavior.Approve"), owner_only, 403)
+    return token
+
+
 class FixedTask(wire.WireModel):
     task_id: wire.Identifier
     label: Annotated[str, Field(min_length=1, max_length=80)]
@@ -648,25 +666,17 @@ class PullAdapter:
         except (httpx.HTTPError, OSError):
             raise ConsoleError("BACKEND_OFFLINE", 503) from None
 
-    def status(self, task, token):
-        data, _ = self.send(*self.request(task, "status"), token)
-        try:
-            strict_json(data)
-            status = wire.JobStatus.model_validate_json(data)
-        except (ValueError, TypeError):
-            raise ConsoleError("STATUS_INVALID", 502) from None
+    def _job_status(self, task, action, token):
+        data, _ = self.send(*self.request(task, action), token)
+        status = decode(wire.JobStatus, data, "STATUS_INVALID")
         require(status.job_id == task.job_id and status.work_id == task.work_id, "STATUS_BINDING_MISMATCH", 502)
         return status
 
+    def status(self, task, token):
+        return self._job_status(task, "status", token)
+
     def submit(self, task, token):
-        data, _ = self.send(*self.request(task, "submit"), token)
-        try:
-            strict_json(data)
-            status = wire.JobStatus.model_validate_json(data)
-        except (ValueError, TypeError):
-            raise ConsoleError("STATUS_INVALID", 502) from None
-        require(status.job_id == task.job_id and status.work_id == task.work_id, "STATUS_BINDING_MISMATCH", 502)
-        return status
+        return self._job_status(task, "submit", token)
 
     def fetch(self, task, token, delivery_id):
         data, headers = self.send(*self.request(task, "fetch"), token, limit=task.max_payload_bytes)

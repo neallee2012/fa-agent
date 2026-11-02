@@ -14,6 +14,7 @@ import time
 
 from .behavior_team_registry import registered_agent_ids, retired_agent_ids
 from .errors import Problem
+from .native_background import BackgroundLoop
 from .native_routine_auth import NativeRoutineApiClock
 from .native_routine_wire import NativeRoutineTrigger
 
@@ -30,7 +31,7 @@ def _code(error):
     return error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
 
 
-class NativeRoutineClock:
+class NativeRoutineClock(BackgroundLoop):
     def __init__(self, service, *, interval=TICK_SECONDS, offset=TICK_OFFSET_SECONDS, budget=TICK_BUDGET_SECONDS,
                  monotonic=time.monotonic, wall=time.time):
         self.service, self.owner = service, service.owner
@@ -141,14 +142,3 @@ class NativeRoutineClock:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fa-routine-clock")
         self._task = asyncio.get_running_loop().create_task(self._run())
         _LOG.warning("FA_NATIVE_ROUTINE_CLOCK_STARTED interval=%s budget=%s", self.interval, self.budget)
-
-    async def stop(self):
-        self._stopping = True
-        task, self._task = self._task, None
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        executor, self._executor = self._executor, None
-        if executor is not None:
-            # An in-flight trigger finishes on its own; its RID is reconciled by the next process.
-            executor.shutdown(wait=False, cancel_futures=True)

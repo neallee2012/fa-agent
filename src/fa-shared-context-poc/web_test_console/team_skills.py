@@ -5,6 +5,7 @@ A decision ID is chosen by the page and reused for a retry, so the API's M3 deci
 returns the original record) is what keeps a lost reply from becoming a second decision.
 """
 
+from functools import partial
 import hashlib
 import json
 import re
@@ -15,7 +16,7 @@ from shared_context.m3_models import (
 )
 from shared_context.team_skill_draft_wire import OWNER_DRAFT_REQUEST_BYTES, OwnerSkillDraftInput, owner_material
 
-from .adapter import ConsoleError, PullAdapter, require, strict_json
+from .adapter import ConsoleError, PullAdapter, decode, owner_token, require, strict_json
 
 PREFIX = "/team-skills/v1"
 MAX_READ_BYTES = 256 * 1024
@@ -60,12 +61,7 @@ MESSAGES.update({
 })
 
 
-def _decode(model, raw):
-    try:
-        strict_json(raw)
-        return model.model_validate_json(raw)
-    except (ValueError, TypeError):
-        raise ConsoleError("TEAM_SKILL_RESPONSE_INVALID", 502) from None
+_decode = partial(decode, code="TEAM_SKILL_RESPONSE_INVALID")
 
 
 class TeamSkillsAdapter(PullAdapter):
@@ -86,11 +82,7 @@ class TeamSkills:
         self.adapter = TeamSkillsAdapter(console.config, console.backend)
 
     def _token(self, *, write=False):
-        self.console.active()
-        token = self.console.vault.get()
-        if write:
-            require(self.console.vault.allows("Behavior.Approve"), "TEAM_SKILLS_OWNER_ONLY", 403)
-        return token
+        return owner_token(self.console, "TEAM_SKILLS_OWNER_ONLY", write=write)
 
     def reviews(self, after=None):
         require(after is None or _ID.fullmatch(after), "TEAM_SKILL_INPUT_INVALID", 400)

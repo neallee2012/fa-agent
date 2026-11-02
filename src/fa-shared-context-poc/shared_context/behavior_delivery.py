@@ -521,6 +521,144 @@ def admission_digest(command: AdmissionRequest) -> str:
     return _digest(command.model_dump(mode="json", exclude={"expected_sequence"}))
 
 
+@dataclass(frozen=True)
+class _Admission:
+    """One admission attempt. Everything here is read once, before its transaction."""
+
+    command: AdmissionRequest
+    context: ExecutionContext
+    request: ControlRequest
+    mode: str
+    config: RuntimeContract
+    instruction: bool
+    readiness: ReadinessEvidence | None
+    actor: VerifiedIngress
+    actor_material: InlineMaterial
+    event_material: InlineMaterial
+    cost_observation: object
+    obligation_id: str
+
+    @property
+    def credits(self) -> int:
+        return self.config.normal_control_units + 3
+
+    @property
+    def intent_id(self) -> str:
+        return control_key("delivery-intent-id", self.command.event.event_id)
+
+
+def _verified_ingress(command: AdmissionRequest, context: ExecutionContext, registration, config) -> VerifiedIngress:
+    if registration.verify_ingress is None:
+        raise Problem(403, "DELIVERY_INGRESS_DISABLED", "authenticated ingress verification is missing")
+    actor = _check(registration.verify_ingress(command.ingress_evidence_id), VerifiedIngress)
+    if (
+        actor.evidence_id != command.ingress_evidence_id or actor.admission_digest != admission_digest(command)
+        or actor.verifier_version != config.verifier_version
+        or actor.on_behalf_of_principal_id != context.principal_id
+        or command.event.conversation_id != context.conversation_id
+        or command.route.channel_id != config.channel.channel_id
+        or command.required_confirmation_level not in config.channel.supported_levels
+    ):
+        raise Problem(403, "DELIVERY_INGRESS_DENIED", "authenticated ingress, route or confirmation requirement differs")
+    return actor
+
+
+def _admission_window_closed(attempt: _Admission, now: datetime) -> bool:
+    command, actor, readiness = attempt.command, attempt.actor, attempt.readiness
+    return (
+        not actor.observed_at <= now < actor.expires_at
+        or readiness is not None and not readiness.observed_at <= now < readiness.expires_at
+        or (command.deadline is not None if attempt.instruction else
+            command.deadline is None
+            or not now < command.deadline <= now + timedelta(seconds=attempt.config.max_queue_seconds))
+    )
+
+
+def _require_admission_open(attempt: _Admission, policy: PolicyRecord, budget: BudgetRecord, now: datetime) -> None:
+    context = attempt.context
+    if (
+        policy.policy_id != context.policy_id or not policy.active or policy.revision != attempt.actor.policy_revision
+        or budget.root_budget_id != context.root_budget_id or not budget.active
+        or _admission_window_closed(attempt, now)
+    ):
+        raise Problem(403, "DELIVERY_ADMISSION_DENIED", "current policy, budget, readiness or admission time window is invalid")
+
+
+def _admitted_obligation(attempt: _Admission, bound: dict, policy: PolicyRecord, now: datetime) -> _Obligation:
+    command, context, config = attempt.command, attempt.context, attempt.config
+    review_at = now + timedelta(seconds=config.review_interval_seconds)
+    return _Obligation(
+        **bound, obligation_id=attempt.obligation_id, event_id=command.event.event_id,
+        root_request_id=command.event.root_request_id, work_id=command.work.work_id,
+        owner_record_id=context.owner_record_id, conversation_id=context.conversation_id,
+        root_budget_id=context.root_budget_id, route=command.route,
+        policy_revision=policy.revision,
+        required_confirmation_level=command.required_confirmation_level, channel_version=config.channel.version,
+        review_at=review_at if attempt.instruction else min(command.deadline, review_at),
+        deadline=command.deadline, normal_control_remaining=None if attempt.instruction else config.normal_control_units,
+    )
+
+
+def _verified_receipt(command: ReceiptRequest, registration, config) -> VerifiedDeliveryReceipt:
+    verifier = (registration.channel_adapter.verify_receipt
+                if registration.mode == "native" else registration.verify_receipt)
+    if verifier is None:
+        raise Problem(403, "DELIVERY_RECEIPT_VERIFIER_DISABLED", "receipt verification is not installed")
+    proof = _check(verifier(command.evidence_id), VerifiedDeliveryReceipt)
+    if (
+        proof.evidence_id != command.evidence_id or proof.verifier_version != config.verifier_version
+        or not set(proof.confirmed_levels) <= set(config.channel.supported_levels)
+    ):
+        raise Problem(403, "DELIVERY_RECEIPT_DENIED", "receipt identity or channel evidence level differs")
+    return proof
+
+
+def _require_receipt_binding(command: ReceiptRequest, ob: _Obligation, outbox: _Outbox, proof: VerifiedDeliveryReceipt) -> None:
+    if (
+        proof.binding != outbox.binding or outbox.binding.obligation_id != ob.obligation_id
+        or outbox.binding.delivery_id != command.delivery_id or outbox.binding.route != ob.route
+        or outbox.binding.channel_version != ob.channel_version
+    ):
+        raise Problem(409, "DELIVERY_RECEIPT_DENIED", "receipt digest, route, version or association differs")
+
+
+def _receipt_fulfills(ob: _Obligation, outbox: _Outbox, proof: VerifiedDeliveryReceipt, current: bool) -> bool:
+    return (
+        ob.fulfillment == "pending" and current and outbox.message_kind in {"final", "failure"}
+        and proof.send_outcome == "emitted" and ob.required_confirmation_level in proof.confirmed_levels
+    )
+
+
+def _require_receipt_capacity(ob: _Obligation, outbox: _Outbox, fulfills: bool, config: RuntimeContract) -> None:
+    limit = config.max_receipts_per_delivery
+    if ob.fulfillment == "pending" and outbox.message_kind in {"final", "failure"} and not fulfills:
+        limit -= 1
+    if ob.deadline is not None and outbox.receipt_count >= limit:
+        raise Problem(429, "DELIVERY_RECEIPT_LIMIT", "bounded non-fulfilling receipt capacity is exhausted")
+
+
+def _after_nonfulfilling_receipt(ob: _Obligation, outbox: _Outbox, proof: VerifiedDeliveryReceipt, current: bool) -> _Obligation:
+    if ob.fulfillment != "pending":
+        return ob
+    if current and proof.send_outcome in {"unknown", "failed"}:
+        return _update(ob, delivery_state="delivery_unknown" if proof.send_outcome == "unknown" else "delivery_failed")
+    if not ob.final_delivery_id and outbox.message_kind == "ack" and proof.send_outcome == "emitted":
+        return _update(ob, delivery_state="acked")
+    return ob
+
+
+def _receipted_outbox(outbox: _Outbox, proof: VerifiedDeliveryReceipt, config: RuntimeContract) -> _Outbox:
+    """A later receipt adds to what earlier ones proved; it never takes emitted back."""
+    return _update(
+        outbox,
+        send_outcome="emitted" if "emitted" in (outbox.send_outcome, proof.send_outcome) else proof.send_outcome,
+        confirmed_levels=tuple(level for level in config.channel.supported_levels if (
+            level in outbox.confirmed_levels or proof.send_outcome == "emitted" and level in proof.confirmed_levels
+        )),
+        receipt_count=outbox.receipt_count + 1,
+    )
+
+
 class DeliveryCore:
     def __init__(
         self, store: BehaviorStore, *, clock: Callable[[], datetime],
@@ -760,117 +898,22 @@ class DeliveryCore:
         instruction=record is not None and record.profile.instruction is not None
         readiness = None if instruction else self._readiness()
         registration, config = self._enabled()
-        if registration.verify_ingress is None:
-            raise Problem(403, "DELIVERY_INGRESS_DISABLED", "authenticated ingress verification is missing")
-        actor = _check(registration.verify_ingress(command.ingress_evidence_id), VerifiedIngress)
-        if (
-            actor.evidence_id != command.ingress_evidence_id or actor.admission_digest != admission_digest(command)
-            or actor.verifier_version != config.verifier_version
-            or actor.on_behalf_of_principal_id != context.principal_id
-            or command.event.conversation_id != context.conversation_id
-            or command.route.channel_id != config.channel.channel_id
-            or command.required_confirmation_level not in config.channel.supported_levels
-        ):
-            raise Problem(403, "DELIVERY_INGRESS_DENIED", "authenticated ingress, route or confirmation requirement differs")
+        actor = _verified_ingress(command, context, registration, config)
         actor_material = _material(actor.model_dump(mode="json"))
         cost_observation = None if self.work_policy is None else self.work_policy.admission_observation(command)
         event_material = InlineMaterial(data=command.event.content, sha256=hashlib.sha256(command.event.content).hexdigest())
         ob_id = obligation_id_for(command.event.event_id)
+        attempt = _Admission(
+            command=command, context=context, request=request, mode=registration.mode, config=config,
+            instruction=instruction, readiness=readiness, actor=actor, actor_material=actor_material,
+            event_material=event_material, cost_observation=cost_observation, obligation_id=ob_id,
+        )
         fresh = False
 
         def decide(snapshot: Snapshot):
             nonlocal fresh
             fresh = True
-            self._owner(snapshot, context)
-            policy = self._row(snapshot, control_key("policy", context.policy_id), PolicyRecord)
-            budget = self._row(snapshot, control_key("budget", context.root_budget_id), BudgetRecord)
-            now = self._now()
-            if (
-                policy.policy_id != context.policy_id or not policy.active or policy.revision != actor.policy_revision
-                or budget.root_budget_id != context.root_budget_id or not budget.active
-                or not actor.observed_at <= now < actor.expires_at
-                or readiness is not None and not readiness.observed_at <= now < readiness.expires_at
-                or (command.deadline is not None if instruction else
-                    command.deadline is None or not now < command.deadline <= now + timedelta(seconds=config.max_queue_seconds))
-            ):
-                raise Problem(403, "DELIVERY_ADMISSION_DENIED", "current policy, budget, readiness or admission time window is invalid")
-            conv_key = control_key("delivery-conversation", context.conversation_id)
-            previous = snapshot[conv_key]
-            sequence = 0 if previous is None else self._row(snapshot, conv_key, _Conversation).sequence
-            if sequence != command.expected_sequence:
-                raise Problem(409, "DELIVERY_SEQUENCE_CONFLICT", "conversation sequence differs")
-            if snapshot[control_key("delivery-event", command.event.event_id)] is not None:
-                raise Problem(409, "DELIVERY_EVENT_WITHOUT_RECEIPT", "event alone does not prove a complete admission")
-            from .behavior_delivery_pending import counts
-            pending_count, non_instruction_count = counts(self, snapshot, context.root_budget_id)
-            quotas = self._quotas(snapshot, context)
-            if quotas[2].pending != non_instruction_count:
-                raise Problem(409, "DELIVERY_INDEX_INVALID", "root pending count and index differ")
-            credits = config.normal_control_units + 3
-            if not instruction and (
-                any(q.pending >= q.pending_limit for q in quotas) or pending_count >= 32
-                or quotas[2].available_control_units < credits
-            ):
-                raise Problem(429, "DELIVERY_ADMISSION_FULL", "pending or reserved control capacity is exhausted")
-            if quotas[2].root_request_id != command.event.root_request_id:
-                raise Problem(403, "DELIVERY_SCOPE_DENIED", "root request/budget association differs")
-            bound = {"configuration_digest": self.configuration_digest(), "evidence_mode": registration.mode}
-            work = _Work(**bound, event_id=command.event.event_id, definition=command.work, definition_digest=_digest(command.work.model_dump(mode="json")))
-            ob = _Obligation(
-                **bound, obligation_id=ob_id, event_id=command.event.event_id,
-                root_request_id=command.event.root_request_id, work_id=command.work.work_id,
-                owner_record_id=context.owner_record_id, conversation_id=context.conversation_id,
-                root_budget_id=context.root_budget_id, route=command.route,
-                policy_revision=policy.revision,
-                required_confirmation_level=command.required_confirmation_level, channel_version=config.channel.version,
-                review_at=(now+timedelta(seconds=config.review_interval_seconds) if instruction else
-                           min(command.deadline,now+timedelta(seconds=config.review_interval_seconds))),
-                deadline=command.deadline, normal_control_remaining=None if instruction else config.normal_control_units,
-            )
-            intent_id = control_key("delivery-intent-id", command.event.event_id)
-            writes = [
-                self._write(conv_key, _Conversation(
-                    **bound, conversation_id=context.conversation_id, owner_record_id=context.owner_record_id,
-                    epoch=context.epoch, sequence=sequence + 1,
-                ), "create" if previous is None else "replace"),
-                self._write(control_key("delivery-event", command.event.event_id), {
-                    **self._bound_data(), "kind": "delivery_event",
-                    **command.event.model_dump(mode="json", exclude={"content"}),
-                    "sequence": sequence + 1, "work_id": command.work.work_id,
-                    "source": actor.model_dump(mode="json"), "content_digest": event_material.sha256,
-                    "admission_request_id": request.request_id,
-                    "execution_context": context.model_dump(mode="json"),
-                }, "create", event_material),
-                self._write(control_key("delivery-work", command.work.work_id), {
-                    **self._bound_data(), "kind": "delivery_work_identity", "work_id": command.work.work_id,
-                    "event_id": command.event.event_id, "obligation_id": ob_id,
-                    "definition_digest": work.definition_digest,
-                    "state_row_id": control_key("delivery-work-state", ob_id),
-                }, "create"),
-                self._write(control_key("delivery-work-state", ob_id), work, "create"),
-                self._write(control_key("delivery-obligation", ob_id), ob, "create"),
-                self._write(control_key("delivery-intent", intent_id), _Intent(
-                    **bound, intent_id=intent_id, obligation_id=ob_id, action="process_event",
-                    consumer_version=config.consumer_version, generation=0,
-                    state_row_id=control_key("delivery-work-state", ob_id),
-                ), "create"),
-                *self._index_writes(snapshot, context, ob, admission=True),
-            ]
-            for key, quota in (() if instruction else zip(self._quota_keys(context), quotas)):
-                writes.append(self._write(key, _update(
-                    quota, pending=quota.pending + 1,
-                    available_control_units=quota.available_control_units - credits if quota.scope_kind == "root" else quota.available_control_units,
-                )))
-            if self.work_policy is not None:
-                writes.extend(self.work_policy.admission_writes(snapshot,command,context,actor,cost_observation))
-            return ControlChanges(writes=tuple(writes), result=self._result(
-                status="queued", event_id=command.event.event_id, work_id=command.work.work_id,
-                obligation_id=ob_id, sequence=sequence + 1, processing_intent_id=intent_id,
-                actor_digest=actor_material.sha256,
-                valid_until=min(actor.expires_at if readiness is None else readiness.expires_at, actor.expires_at,
-                    actor.expires_at if instruction else command.deadline).isoformat(),
-                admitted_at=now.isoformat(),
-            ))
+            return self._admission_changes(attempt, snapshot)
 
         commit = lambda: self._index_transact(request, decide, context,
                                              obligation_id=ob_id, admission=True)
@@ -886,6 +929,99 @@ class DeliveryCore:
                 raise Problem(409, "DELIVERY_ADMISSION_UNKNOWN", "admission remains reserved; reconcile the original request",
                               request_id=request.request_id, request_digest=request.request_digest)
         return receipt
+
+    def _admission_changes(self, attempt: _Admission, snapshot: Snapshot) -> ControlChanges:
+        """Runs once per transaction read, so the clock and every row stay current here."""
+        command, context, actor, readiness = attempt.command, attempt.context, attempt.actor, attempt.readiness
+        self._owner(snapshot, context)
+        policy = self._row(snapshot, control_key("policy", context.policy_id), PolicyRecord)
+        budget = self._row(snapshot, control_key("budget", context.root_budget_id), BudgetRecord)
+        now = self._now()
+        _require_admission_open(attempt, policy, budget, now)
+        conv_key = control_key("delivery-conversation", context.conversation_id)
+        previous = snapshot[conv_key]
+        sequence = 0 if previous is None else self._row(snapshot, conv_key, _Conversation).sequence
+        if sequence != command.expected_sequence:
+            raise Problem(409, "DELIVERY_SEQUENCE_CONFLICT", "conversation sequence differs")
+        if snapshot[control_key("delivery-event", command.event.event_id)] is not None:
+            raise Problem(409, "DELIVERY_EVENT_WITHOUT_RECEIPT", "event alone does not prove a complete admission")
+        quotas = self._admission_quotas(attempt, snapshot)
+        bound = {"configuration_digest": self.configuration_digest(), "evidence_mode": attempt.mode}
+        work = _Work(**bound, event_id=command.event.event_id, definition=command.work, definition_digest=_digest(command.work.model_dump(mode="json")))
+        ob = _admitted_obligation(attempt, bound, policy, now)
+        writes = [
+            *self._admission_rows(attempt, bound, previous, sequence, work, ob),
+            *self._index_writes(snapshot, context, ob, admission=True),
+            *self._admission_quota_writes(attempt, quotas),
+        ]
+        if self.work_policy is not None:
+            writes.extend(self.work_policy.admission_writes(snapshot,command,context,actor,attempt.cost_observation))
+        return ControlChanges(writes=tuple(writes), result=self._result(
+            status="queued", event_id=command.event.event_id, work_id=command.work.work_id,
+            obligation_id=attempt.obligation_id, sequence=sequence + 1, processing_intent_id=attempt.intent_id,
+            actor_digest=attempt.actor_material.sha256,
+            valid_until=(actor.expires_at if attempt.instruction else
+                         min(readiness.expires_at, actor.expires_at, command.deadline)).isoformat(),
+            admitted_at=now.isoformat(),
+        ))
+
+    def _admission_quotas(self, attempt: _Admission, snapshot: Snapshot):
+        """The current quotas, once the index agrees and this admission still fits."""
+        from .behavior_delivery_pending import counts
+        context = attempt.context
+        pending_count, non_instruction_count = counts(self, snapshot, context.root_budget_id)
+        quotas = self._quotas(snapshot, context)
+        if quotas[2].pending != non_instruction_count:
+            raise Problem(409, "DELIVERY_INDEX_INVALID", "root pending count and index differ")
+        if not attempt.instruction and (
+            any(q.pending >= q.pending_limit for q in quotas) or pending_count >= 32
+            or quotas[2].available_control_units < attempt.credits
+        ):
+            raise Problem(429, "DELIVERY_ADMISSION_FULL", "pending or reserved control capacity is exhausted")
+        if quotas[2].root_request_id != attempt.command.event.root_request_id:
+            raise Problem(403, "DELIVERY_SCOPE_DENIED", "root request/budget association differs")
+        return quotas
+
+    def _admission_rows(self, attempt: _Admission, bound: dict, previous, sequence: int, work: _Work, ob: _Obligation):
+        """The rows one admission creates, in their fixed write order."""
+        command, context, config = attempt.command, attempt.context, attempt.config
+        ob_id, intent_id = attempt.obligation_id, attempt.intent_id
+        return (
+            self._write(control_key("delivery-conversation", context.conversation_id), _Conversation(
+                **bound, conversation_id=context.conversation_id, owner_record_id=context.owner_record_id,
+                epoch=context.epoch, sequence=sequence + 1,
+            ), "create" if previous is None else "replace"),
+            self._write(control_key("delivery-event", command.event.event_id), {
+                **self._bound_data(), "kind": "delivery_event",
+                **command.event.model_dump(mode="json", exclude={"content"}),
+                "sequence": sequence + 1, "work_id": command.work.work_id,
+                "source": attempt.actor.model_dump(mode="json"), "content_digest": attempt.event_material.sha256,
+                "admission_request_id": attempt.request.request_id,
+                "execution_context": context.model_dump(mode="json"),
+            }, "create", attempt.event_material),
+            self._write(control_key("delivery-work", command.work.work_id), {
+                **self._bound_data(), "kind": "delivery_work_identity", "work_id": command.work.work_id,
+                "event_id": command.event.event_id, "obligation_id": ob_id,
+                "definition_digest": work.definition_digest,
+                "state_row_id": control_key("delivery-work-state", ob_id),
+            }, "create"),
+            self._write(control_key("delivery-work-state", ob_id), work, "create"),
+            self._write(control_key("delivery-obligation", ob_id), ob, "create"),
+            self._write(control_key("delivery-intent", intent_id), _Intent(
+                **bound, intent_id=intent_id, obligation_id=ob_id, action="process_event",
+                consumer_version=config.consumer_version, generation=0,
+                state_row_id=control_key("delivery-work-state", ob_id),
+            ), "create"),
+        )
+
+    def _admission_quota_writes(self, attempt: _Admission, quotas):
+        return [
+            self._write(key, _update(
+                quota, pending=quota.pending + 1,
+                available_control_units=quota.available_control_units - attempt.credits if quota.scope_kind == "root" else quota.available_control_units,
+            ))
+            for key, quota in (() if attempt.instruction else zip(self._quota_keys(attempt.context), quotas))
+        ]
 
     def record_work_result(self, command: WorkResultRequest, context: ExecutionContext) -> Record:
         command, context = _command(command, WorkResultRequest), _check(context, ExecutionContext)
@@ -980,76 +1116,27 @@ class DeliveryCore:
         command, context = _command(command, ReceiptRequest), _check(context, ExecutionContext)
         request = self.request_for(command, context)
         registration, config = self._enabled()
-        verifier = (registration.channel_adapter.verify_receipt
-                    if registration.mode == "native" else registration.verify_receipt)
-        if verifier is None:
-            raise Problem(403, "DELIVERY_RECEIPT_VERIFIER_DISABLED", "receipt verification is not installed")
-        proof = _check(verifier(command.evidence_id), VerifiedDeliveryReceipt)
-        if (
-            proof.evidence_id != command.evidence_id or proof.verifier_version != config.verifier_version
-            or not set(proof.confirmed_levels) <= set(config.channel.supported_levels)
-        ):
-            raise Problem(403, "DELIVERY_RECEIPT_DENIED", "receipt identity or channel evidence level differs")
+        proof = _verified_receipt(command, registration, config)
         proof_material = _material(proof.model_dump(mode="json"))
 
         def decide(snapshot: Snapshot):
             ob = self._obligation(snapshot, command.obligation_id, context)
             outbox_key = control_key("delivery-outbox", command.delivery_id)
             outbox = self._row(snapshot, outbox_key, _Outbox)
-            if (
-                proof.binding != outbox.binding or outbox.binding.obligation_id != ob.obligation_id
-                or outbox.binding.delivery_id != command.delivery_id or outbox.binding.route != ob.route
-                or outbox.binding.channel_version != ob.channel_version or ob.channel_version != config.channel.version
-            ):
-                raise Problem(409, "DELIVERY_RECEIPT_DENIED", "receipt digest, route, version or association differs")
+            _require_receipt_binding(command, ob, outbox, proof)
             material = _parse(snapshot[outbox_key].payload["material"], InlineMaterial)
             if material.sha256 != proof.binding.payload_digest:
                 raise Problem(409, "DELIVERY_RECEIPT_DENIED", "saved payload differs")
             current = ob.final_delivery_id == command.delivery_id and ob.final_version == proof.binding.version
-            fulfills = (
-                ob.fulfillment == "pending" and current and outbox.message_kind in {"final", "failure"}
-                and proof.send_outcome == "emitted" and ob.required_confirmation_level in proof.confirmed_levels
-            )
-            limit = config.max_receipts_per_delivery
-            if ob.fulfillment == "pending" and outbox.message_kind in {"final", "failure"} and not fulfills:
-                limit -= 1
-            if ob.deadline is not None and outbox.receipt_count >= limit:
-                raise Problem(429, "DELIVERY_RECEIPT_LIMIT", "bounded non-fulfilling receipt capacity is exhausted")
-            writes = []
+            fulfills = _receipt_fulfills(ob, outbox, proof, current)
+            _require_receipt_capacity(ob, outbox, fulfills, config)
             if fulfills:
-                if not ob.fulfillment_credit:
-                    raise Problem(429, "DELIVERY_CONTROL_EXHAUSTED", "fulfillment reservation is missing")
-                ob = _update(
-                    ob, fulfillment="fulfilled", delivery_state="fulfilled", fulfillment_credit=0,
-                    fulfillment_receipt_id=proof.evidence_id, confirmed_levels=proof.confirmed_levels,
-                    due_pending=False, automation="stopped",
-                )
-                for key, quota in (() if ob.deadline is None else zip(self._quota_keys(context), self._quotas(snapshot, context))):
-                    if quota.pending < 1:
-                        raise Problem(409, "DELIVERY_QUOTA_INVALID", "pending reservation is missing")
-                    if quota.scope_kind == "root":
-                        from .behavior_delivery_pending import counts
-                        if quota.pending != counts(self, snapshot, context.root_budget_id)[1]:
-                            raise Problem(409, "DELIVERY_INDEX_INVALID", "root pending count and index differ")
-                    writes.append(self._write(key, _update(quota, pending=quota.pending - 1)))
-                writes.extend(self._index_writes(snapshot, context, ob))
+                ob, writes = self._fulfillment(snapshot, context, ob, proof)
             else:
-                ob = self._credit(ob)
-                if ob.fulfillment == "pending":
-                    if current and proof.send_outcome in {"unknown", "failed"}:
-                        ob = _update(ob, delivery_state="delivery_unknown" if proof.send_outcome == "unknown" else "delivery_failed")
-                    elif not ob.final_delivery_id and outbox.message_kind == "ack" and proof.send_outcome == "emitted":
-                        ob = _update(ob, delivery_state="acked")
+                ob, writes = _after_nonfulfilling_receipt(self._credit(ob), outbox, proof, current), []
             writes.extend((
                 self._write(control_key("delivery-obligation", ob.obligation_id), ob),
-                self._write(outbox_key, _update(
-                    outbox,
-                    send_outcome="emitted" if "emitted" in (outbox.send_outcome, proof.send_outcome) else proof.send_outcome,
-                    confirmed_levels=tuple(level for level in config.channel.supported_levels if (
-                        level in outbox.confirmed_levels or proof.send_outcome == "emitted" and level in proof.confirmed_levels
-                    )),
-                    receipt_count=outbox.receipt_count + 1,
-                ), material=material),
+                self._write(outbox_key, _receipted_outbox(outbox, proof, config), material=material),
                 self._write(control_key("delivery-receipt", command.delivery_id, proof.evidence_id),
                             {**self._bound_data(), "kind": "delivery_verified_receipt", "evidence": proof.model_dump(mode="json")},
                             "create", proof_material),
@@ -1065,6 +1152,26 @@ class DeliveryCore:
         if receipt.payload["result"]["evidence_digest"] != proof_material.sha256:
             raise Problem(409, "DELIVERY_EVIDENCE_CONFLICT", "receipt evidence ID has changed")
         return receipt
+
+    def _fulfillment(self, snapshot: Snapshot, context: ExecutionContext, ob: _Obligation, proof: VerifiedDeliveryReceipt):
+        """The fulfilled obligation, and the quota and index writes that release its reservation."""
+        from .behavior_delivery_pending import counts
+        if not ob.fulfillment_credit:
+            raise Problem(429, "DELIVERY_CONTROL_EXHAUSTED", "fulfillment reservation is missing")
+        ob = _update(
+            ob, fulfillment="fulfilled", delivery_state="fulfilled", fulfillment_credit=0,
+            fulfillment_receipt_id=proof.evidence_id, confirmed_levels=proof.confirmed_levels,
+            due_pending=False, automation="stopped",
+        )
+        writes = []
+        for key, quota in (() if ob.deadline is None else zip(self._quota_keys(context), self._quotas(snapshot, context))):
+            if quota.pending < 1:
+                raise Problem(409, "DELIVERY_QUOTA_INVALID", "pending reservation is missing")
+            if quota.scope_kind == "root" and quota.pending != counts(self, snapshot, context.root_budget_id)[1]:
+                raise Problem(409, "DELIVERY_INDEX_INVALID", "root pending count and index differ")
+            writes.append(self._write(key, _update(quota, pending=quota.pending - 1)))
+        writes.extend(self._index_writes(snapshot, context, ob))
+        return ob, writes
 
     def scan_due(self, command: ScanRequest, context: ExecutionContext) -> Record:
         command, context = _command(command, ScanRequest), _check(context, ExecutionContext)
@@ -1206,6 +1313,83 @@ class _ConsumerPage(_Bound):
     active: bool = False
 
 
+_C1_JOB_STATES = frozenset({"queued", "starting", "running", "capacity_uncertain"})
+
+
+def _require_defer_scope(binding: RuntimeBinding, root_budget_id: str, registration, contract: RuntimeContract) -> None:
+    from .behavior_assistant_wire import CHECKS
+    if (registration.mode != "native" or set(binding.work.required_checks) != set(CHECKS)
+            or binding.child_jobs or binding.owner.root_budget_id != root_budget_id
+            or binding.team_id != contract.team_id):
+        raise Problem(403, "DELIVERY_DEFER_SCOPE_DENIED", "one exact native assistant pull binding is required")
+
+
+def _require_defer_policy(policy, current_policy: PolicyRecord, owner: OwnerRecord, context: ExecutionContext,
+                          binding: RuntimeBinding, now: datetime) -> None:
+    from .behavior_runtime import RUNTIME_VERSION
+    if (policy.binding_digest != _digest([RUNTIME_VERSION, "native", binding.model_dump(mode="json")])
+            or not policy.active or not current_policy.active or current_policy.policy_id != context.policy_id
+            or policy.operation_policy_revision != current_policy.revision or now >= policy.valid_until
+            or binding.operation_id not in owner.operation_ids):
+        raise Problem(403, "BEHAVIOR_CURRENT_POLICY_DENIED", "current owner, policy or binding is unavailable")
+
+
+def _require_defer_readiness(current, published, readiness: ReadinessEvidence, now: datetime) -> None:
+    if current != published or not readiness.observed_at <= now < readiness.expires_at:
+        raise Problem(403, "DELIVERY_PREREQUISITES_MISSING", "current readiness is unavailable")
+
+
+def _require_defer_quota(quota: QuotaRecord, index: PendingIndexRecord, root_budget_id: str, binding: RuntimeBinding) -> None:
+    if (quota.scope_id != root_budget_id or quota.root_request_id != binding.root_request_id
+            or quota.pending != sum(not entry.instruction for entry in index.entries)):
+        raise Problem(403, "DELIVERY_SCOPE_DENIED", "root index/quota binding differs")
+
+
+def _require_defer_job(pool, job, published, context: ExecutionContext, binding: RuntimeBinding) -> None:
+    if (pool.workspace_id != published.worker_workspace_id
+            or pool.configuration_digest != published.worker_configuration_digest
+            or job.configuration_digest != pool.configuration_digest or job.owner != context
+            or job.spec.job_id != binding.job_id or job.spec.work_id != binding.work.work_id
+            or job.spec.obligation_id != binding.obligation_id):
+        raise Problem(403, "DELIVERY_SCOPE_DENIED", "original worker/job binding differs")
+
+
+def _require_defer_slot(pool, job) -> None:
+    if len(pool.slots) == 1 and (pool.slots[0].number != 0 or
+            pool.slots[0].binding != job.binding and job.state in _C1_JOB_STATES):
+        raise Problem(403, "DELIVERY_SCOPE_DENIED", "original C1 reservation differs from its job")
+
+
+def _require_defer_delivery(obligation: _Obligation, work: _Work, binding: RuntimeBinding) -> None:
+    # _work already tied obligation.work_id to work.definition, so the definition covers both.
+    if (obligation.route != binding.route or obligation.event_id != binding.event_id
+            or obligation.root_request_id != binding.root_request_id
+            or work.definition != binding.work):
+        raise Problem(403, "DELIVERY_SCOPE_DENIED", "exact original delivery binding differs")
+
+
+def _defer_entry(obligation: _Obligation, index: PendingIndexRecord) -> PendingEntry:
+    """The pending entry C1 expects; a lone entry for this obligation must match it."""
+    expected = PendingEntry(
+        obligation_id=obligation.obligation_id, owner_record_id=obligation.owner_record_id,
+        conversation_id=obligation.conversation_id, review_at=obligation.review_at,
+        generation=obligation.generation, automation=obligation.automation, due_pending=obligation.due_pending)
+    if (len(index.entries) == 1 and index.entries[0].obligation_id == obligation.obligation_id
+            and index.entries[0] != expected):
+        raise Problem(409, "DELIVERY_INDEX_INVALID", "original pending entry differs from its obligation")
+    return expected
+
+
+def _worker_moved_on(pool, job, binding: RuntimeBinding) -> bool:
+    return (len(pool.slots) != 1 or pool.pending != (binding.job_id,) or pool.completions != ()
+            or job.state not in _C1_JOB_STATES or job.cancel_requested)
+
+
+def _delivery_moved_on(obligation: _Obligation, work: _Work, plan: Record | None) -> bool:
+    return (obligation.fulfillment != "pending" or obligation.final_delivery_id is not None
+            or plan is not None or work.state != "queued")
+
+
 class DeliveryConsumer:
     """A bounded restartable consumer; it NEVER invokes a business/model executor.
 
@@ -1243,22 +1427,23 @@ class DeliveryConsumer:
             and budget.remaining_units and current.automation == "active"
         )
 
+    def _defer_page(self, rows, page_key: str, root_budget_id: str) -> _ConsumerPage | None:
+        page = None if rows[page_key] is None else self.core._row(rows, page_key, _ConsumerPage)
+        if page is not None and page.root_budget_id != root_budget_id:
+            raise Problem(403, "DELIVERY_SCOPE_DENIED", "consumer page belongs to another root")
+        return page
+
     def _defer_pending(self, root_budget_id: str, resolve_context: Callable[[str], ExecutionContext],
                        binding: RuntimeBinding) -> bool:
         """Read-only, exact native C1 eligibility; no remembered scheduling decision."""
-        from .behavior_assistant_wire import CHECKS
-        from .behavior_inbox import INBOX_CHANNEL_ID, InboxDeploymentEvidence
-        from .behavior_runtime import RUNTIME_VERSION, RuntimeBinding, RuntimePolicy, runtime_key
+        from .behavior_inbox import InboxDeploymentEvidence
+        from .behavior_runtime import RuntimeBinding, RuntimePolicy, runtime_key
         from .behavior_workers import JobRecord, _Pool, worker_key
 
         core = self.core
         binding = _check(binding, RuntimeBinding)
         registration, contract = core._enabled()
-        if (registration.mode != "native" or binding.route.channel_id != INBOX_CHANNEL_ID
-                or contract.channel.channel_id != INBOX_CHANNEL_ID or set(binding.work.required_checks) != set(CHECKS)
-                or binding.child_jobs or binding.owner.root_budget_id != root_budget_id
-                or binding.team_id != contract.team_id):
-            raise Problem(403, "DELIVERY_DEFER_SCOPE_DENIED", "one exact native assistant pull binding is required")
+        _require_defer_scope(binding, root_budget_id, registration, contract)
         before = core.store._guard()
         readiness = core._readiness()
         inbox_key = control_key("inbox-readiness", core.configuration_digest())
@@ -1289,52 +1474,21 @@ class DeliveryConsumer:
         current_policy = core._row(rows, control_key("policy", context.policy_id), PolicyRecord)
         policy = core._row(rows, policy_key, RuntimePolicy)
         now = core._now()
-        if (policy.binding_digest != _digest([RUNTIME_VERSION, "native", binding.model_dump(mode="json")])
-                or not policy.active or not current_policy.active or current_policy.policy_id != context.policy_id
-                or policy.operation_policy_revision != current_policy.revision or now >= policy.valid_until
-                or binding.operation_id not in owner.operation_ids):
-            raise Problem(403, "BEHAVIOR_CURRENT_POLICY_DENIED", "current owner, policy or binding is unavailable")
-        if (core._row(rows, inbox_key, InboxDeploymentEvidence) != published
-                or not readiness.observed_at <= now < readiness.expires_at):
-            raise Problem(403, "DELIVERY_PREREQUISITES_MISSING", "current readiness is unavailable")
+        _require_defer_policy(policy, current_policy, owner, context, binding, now)
+        _require_defer_readiness(core._row(rows, inbox_key, InboxDeploymentEvidence), published, readiness, now)
         index = core._index(rows, context)
-        quota = core._row(rows, quota_key, QuotaRecord)
-        if (quota.scope_kind != "root" or quota.scope_id != root_budget_id
-                or quota.root_request_id != binding.root_request_id
-                or quota.pending != sum(not entry.instruction for entry in index.entries)):
-            raise Problem(403, "DELIVERY_SCOPE_DENIED", "root index/quota binding differs")
-        page = None if rows[page_key] is None else core._row(rows, page_key, _ConsumerPage)
-        if page is not None and page.root_budget_id != root_budget_id:
-            raise Problem(403, "DELIVERY_SCOPE_DENIED", "consumer page belongs to another root")
+        _require_defer_quota(core._row(rows, quota_key, QuotaRecord), index, root_budget_id, binding)
+        page = self._defer_page(rows, page_key, root_budget_id)
         pool = core._row(rows, pool_key, _Pool)
         job = core._row(rows, job_key, JobRecord)
-        if (pool.workspace_id != published.worker_workspace_id
-                or pool.configuration_digest != published.worker_configuration_digest
-                or job.configuration_digest != pool.configuration_digest or job.owner != context
-                or job.spec.job_id != binding.job_id or job.spec.work_id != binding.work.work_id
-                or job.spec.obligation_id != binding.obligation_id):
-            raise Problem(403, "DELIVERY_SCOPE_DENIED", "original worker/job binding differs")
-        if len(pool.slots) == 1 and (pool.slots[0].number != 0 or
-                pool.slots[0].binding != job.binding and job.state in {"queued", "starting", "running", "capacity_uncertain"}):
-            raise Problem(403, "DELIVERY_SCOPE_DENIED", "original C1 reservation differs from its job")
+        _require_defer_job(pool, job, published, context, binding)
+        _require_defer_slot(pool, job)
         obligation = core._obligation(rows, binding.obligation_id, context)
         work = core._work(rows, obligation)
-        if (obligation.route != binding.route or obligation.event_id != binding.event_id
-                or obligation.work_id != binding.work.work_id or obligation.root_request_id != binding.root_request_id
-                or work.definition != binding.work):
-            raise Problem(403, "DELIVERY_SCOPE_DENIED", "exact original delivery binding differs")
-        expected_entry = PendingEntry(
-            obligation_id=obligation.obligation_id, owner_record_id=obligation.owner_record_id,
-            conversation_id=obligation.conversation_id, review_at=obligation.review_at,
-            generation=obligation.generation, automation=obligation.automation, due_pending=obligation.due_pending)
-        if (len(index.entries) == 1 and index.entries[0].obligation_id == binding.obligation_id
-                and index.entries[0] != expected_entry):
-            raise Problem(409, "DELIVERY_INDEX_INVALID", "original pending entry differs from its obligation")
+        _require_defer_delivery(obligation, work, binding)
+        expected_entry = _defer_entry(obligation, index)
         if (index.entries != (expected_entry,) or page is not None and page.active
-                or len(pool.slots) != 1 or pool.pending != (binding.job_id,) or pool.completions
-                or job.state not in {"queued", "starting", "running", "capacity_uncertain"} or job.cancel_requested
-                or obligation.fulfillment != "pending" or obligation.final_delivery_id is not None
-                or rows[plan_key] is not None or work.state != "queued" or work.result is not None):
+                or _worker_moved_on(pool, job, binding) or _delivery_moved_on(obligation, work, rows[plan_key])):
             return False
         current, work, budget = self._original_work(rows, binding.obligation_id, context, intent_id)
         if core.store._guard() != before:

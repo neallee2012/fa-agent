@@ -2,6 +2,7 @@
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass,field
 from datetime import datetime,timedelta
 from typing import Annotated,Literal
 from pydantic import Field,field_validator,model_validator
@@ -657,6 +658,76 @@ def refresh_once():
         _REFRESHED.reset(token)
 
 
+def _work_unsettled(job,work,b):
+    return (job.state not in {"succeeded","failed","cancelled"} or not job.result_forwarded or job.completion_credit
+            or work.definition!=b.work or work.state!=job.state or work.result is None)
+
+
+def _route_differs(access,b,ob,out):
+    return (ob.route!=b.route or ob.final_delivery_id!=access.binding.delivery_id
+            or out.binding.route!=b.route or out.binding.obligation_id!=b.obligation_id)
+
+
+def _cancellation_differs(evidence,job):
+    return (evidence.spec!=job.spec or evidence.owner!=job.owner or evidence.generation!=0
+            or evidence.binding is not None or evidence.prior_evidence_id is not None or evidence.children
+            or evidence.evidence_id!=job.last_evidence_id)
+
+
+def _terminal_proof_differs(completed,job,launch):
+    return (completed.state!=("stopped" if job.state=="cancelled" else job.state)
+            or not completed.entire_tree_idle or not completed.all_inflight_starts_fenced
+            or completed.evidence_id!=job.last_evidence_id or completed.native_execution_id!=launch.native_invocation_id)
+
+
+@dataclass(frozen=True)
+class _NewWork:
+    """What one new registration captured; its transaction rechecks every row read here."""
+    admission:str
+    binding:RuntimeBinding
+    profile:AssistantProfile
+    conversation:object=None
+    conversation_row:object=None
+    conversation_reads:tuple=()
+    environment_transfer:object=None
+    profile_choice:object=None
+    profile_reads:tuple=()
+    profile_snapshot:dict=field(default_factory=dict)
+    memory_snapshot:dict=field(default_factory=dict)
+    peer_snapshot:dict=field(default_factory=dict)
+    captured_vm:AgentVmBinding|None=None
+
+
+def _require_profile_head(snapshot,policy,expected,message):
+    from .behavior_profile_selection import ConversationProfileHead,head_key
+    row=snapshot[head_key(policy.authority_domain,policy.agent_id)]
+    selected=None if row is None else _parse(row.payload["data"],ConversationProfileHead).selection_id
+    if selected!=(None if expected is None else expected.selection_id):
+        raise Problem(409,"PROFILE_SELECTION_CONFLICT",message)
+
+
+def _require_admission_reads(current,work,admission_registry):
+    if work.conversation_reads and current[work.conversation_reads[0]]!=work.conversation_row:
+        raise Problem(412,"BEHAVIOR_CONFLICT","original conversation changed before admission")
+    if work.conversation is not None and work.conversation.jobs and any(
+            current[name]!=value for name,value in admission_registry.items()):
+        raise Problem(412,"BEHAVIOR_CONFLICT","the continuation registry changed before admission")
+    for snapshot,message in ((work.profile_snapshot,"approved profile selection changed before admission"),
+                             (work.memory_snapshot,"memory setting or selected note changed before admission"),
+                             (work.peer_snapshot,"the original peer assignment changed before registration")):
+        if any(current[key]!=value for key,value in snapshot.items()):
+            raise Problem(412,"BEHAVIOR_CONFLICT",message)
+
+
+def _model_capacity(profile,model):
+    return None if profile.model_capacity_profile is None else model.capacity_snapshot()
+
+
+def _reasoning_summary(profile,model):
+    supported=profile.model_provider=="openai-responses" and model.supports_reasoning_summary is True
+    return "detailed" if supported else None
+
+
 class WorkPolicyControl:
     """One registered standing scope; returned decisions are never write grants."""
     def __init__(self,runtime,policy,cost_reader):
@@ -922,8 +993,6 @@ class WorkPolicyControl:
 
     def conversation(self,principal,identifier):
         from .behavior_instruction import Conversation,conversation_key
-        from .behavior_assistant import key as assistant_key,_Session
-        from .behavior_delivery import _Obligation
         self._human(principal)
         ckey=conversation_key(identifier)
         row=self.store.read_snapshot((ckey,))[ckey]
@@ -936,136 +1005,169 @@ class WorkPolicyControl:
         records={r.binding.job_id:r for r in self.records.values()}
         turns=[];job=None
         for number,job_id in enumerate(conversation.jobs,1):
-            r=records[job_id];binding=r.binding
-            self.runtime.authorize(binding.binding_id,principal,"read")
-            jkey=worker_key("job",job_id)
-            jobrow=self.store.read_snapshot((jkey,))[jkey]
-            job=None if jobrow is None else _parse(jobrow.payload["data"],JobRecord)
-            sid=None if job is None or job.binding is None else assistant_key("session-id",job.binding.start_request_id)
-            skey=assistant_key("session",sid) if sid else None
-            orow=self.store.read_snapshot((control_key("delivery-obligation",binding.obligation_id),))[control_key("delivery-obligation",binding.obligation_id)]
-            sessionrow=None if skey is None else self.store.read_snapshot((skey,))[skey]
-            session=None if sessionrow is None else _parse(sessionrow.payload["data"],_Session)
-            obligation=None if orow is None else _parse(orow.payload["data"],_Obligation)
-            reply_key=assistant_key("reply",job_id)
-            replyrow=self.store.read_snapshot((reply_key,))[reply_key]
-            from .behavior_assistant_wire import PublicProgress
-            progress=PublicProgress()
-            if sid is not None:
-                from .behavior_instruction_progress import ProgressRecord
-                pkey=assistant_key("progress",sid)
-                prow=self.store.read_snapshot((pkey,))[pkey]
-                if prow is not None:
-                    saved=_parse(prow.payload["data"],ProgressRecord)
-                    if saved.job_id!=job_id or saved.conversation_id!=identifier or saved.turn_number!=number:
-                        raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","public progress belongs to another turn")
-                    progress=saved.progress
-            turns.append({"request_id":r.request_id,"binding_id":binding.binding_id,"job_id":job_id,
-                "work_id":binding.work.work_id,"turn_number":number,"state":"admitting" if job is None else job.state,
-                "model_requests":0 if session is None else session.model_requests,
-                "reply_available":job is not None and job.result_forwarded and replyrow is not None,"model":r.profile.instruction.model,
-                "delivery_id":None if obligation is None else obligation.final_delivery_id,
-                "progress":progress.model_dump(mode="json")})
-            if r.profile.instruction.model_capacity is not None:
-                turns[-1]["model_capacity"] = r.profile.instruction.model_capacity.model_dump(mode="json")
-            if r.profile.instruction.prompt_profile is not None:
-                from .behavior_instruction import TurnArchive,turn_material
-                from .behavior_skill_prompt import assemble_prompt
-                archive_key=assistant_key("text-archive",job_id)
-                archive_row=self.store.read_snapshot((archive_key,))[archive_key]
-                if archive_row is not None:
-                    saved=_parse(archive_row.payload["data"],TurnArchive)
-                    expected=assemble_prompt(r.profile.instruction.prompt_profile).record
-                    if (saved.job_id!=job_id or saved.conversation_id!=identifier or saved.turn_number!=number
-                            or saved.prompt_assembly!=expected
-                            or archive_row.payload["material"]!=turn_material(saved).model_dump(mode="json")):
-                        raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","saved instruction assembly differs")
-                    turns[-1]["prompt_assembly"]=saved.prompt_assembly.model_dump(mode="json")
-                    if saved.sop_copy_outcome is not None:
-                        turns[-1]["sop_copy_outcome"] = saved.sop_copy_outcome.model_dump(mode="json")
-                    if saved.skill_draft_outcome is not None:
-                        turns[-1]["skill_draft_outcome"] = saved.skill_draft_outcome.model_dump(mode="json")
-        completed=bool(turns) and job is not None and job.state in {"succeeded","failed","cancelled"} and job.result_forwarded
-        ready=(completed
-               and conversation.active_job_id is None and conversation.archive_id is not None)
-        blocker=None if ready else "turn_unresolved"
-        if completed and conversation.active_job_id is None and conversation.archive_id is None:
-            from .behavior_instruction_no_sdk import NoSdkTurn
-            nkey = assistant_key("no-sdk-turn", conversation.jobs[-1])
-            no_sdk = self.store.read_snapshot((nkey,))[nkey]
-            if no_sdk is not None:
-                saved = _parse(no_sdk.payload["data"], NoSdkTurn)
-                if (saved.conversation_id != identifier or saved.job_id != conversation.jobs[-1]
-                        or saved.turn_number != len(conversation.jobs)
-                        or no_sdk.payload["material"] != material(saved.model_dump(mode="json")).model_dump(mode="json")):
-                    raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "original no-SDK failure material differs")
-                blocker = "SDK_NOT_STARTED_RESET_REQUIRED"
-        if conversation.reset_request_id is not None:
-            ready=False;blocker="CONVERSATION_ARCHIVED"
-        elif conversation.hosted_session_id is None:
-            ready=False;blocker="CONVERSATION_SESSION_RESET_REQUIRED"
-        if ready:
-            from .behavior_instruction import TurnArchive
-            from .behavior_assistant_checkpoint import unpack
-            archive_key=conversation.archive_id
-            archived=_row(self.store.read_snapshot((archive_key,)),archive_key,TurnArchive)
-            from .behavior_conversation_transfer import current_transfer, transferred_failure, _archive_matches
-            transfer = current_transfer(self, conversation)
-            restored_failure = transferred_failure(self, conversation, job)
-            if (archived.conversation_id!=identifier or archived.job_id!=conversation.jobs[-1]
-                    and not (restored_failure and _archive_matches(transfer, archived))):
-                raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","saved SDK context differs")
-            from .behavior_assistant_wire import SdkArchive,StoredSdkArchive
-            if not isinstance(archived.archive,(SdkArchive,StoredSdkArchive)):
-                ready=False
-                blocker=archived.archive.error
-            else:
-                if archived.archive.sdk_session_id!=conversation.sdk_session_id:
-                    raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","saved SDK session differs")
-                if isinstance(archived.archive,SdkArchive):
-                    unpack(archived.archive)
-                else:
-                    from .behavior_sdk_checkpoint import checkpoint_key,SdkStateUpload
-                    stored=self.store.read_snapshot((checkpoint_key(archived.job_id),))
-                    if _row(stored,checkpoint_key(archived.job_id),SdkStateUpload).reference!=archived.archive:
-                        raise Problem(409,"SDK_STATE_INCOMPLETE","stored checkpoint pointer differs")
-                    try:
-                        from .behavior_profile_selection import choice_for_conversation, profile_from_template
-                        choice = choice_for_conversation(self, conversation)
-                        consumer = self.policy.profile if choice is None else profile_from_template(self.policy, choice.command.template)
-                        archived.archive.require_profile(consumer.checkpoint_profile, model_provider=consumer.model_provider)
-                    except Problem as error:
-                        if error.body["error"]["code"] != "SDK_STATE_UNSUPPORTED_FORMAT":
-                            raise
-                        ready=False
-                        blocker="SDK_STATE_UNSUPPORTED_FORMAT"
-            if archived.sop_copy_outcome is not None and archived.sop_copy_outcome.unresolved_operations:
-                ready=False
-                blocker="SOP_COPY_OUTCOME_UNKNOWN"
-            if archived.skill_draft_outcome is not None and archived.skill_draft_outcome.unresolved_operations:
-                ready=False
-                blocker="SKILL_DRAFT_OUTCOME_UNKNOWN"
-        if conversation.reset_request_id is None:
-            from .behavior_foundry import session_version_failure, lost_session_failure
-            failure = session_version_failure(self.store, job)
-            from .behavior_conversation_transfer import transferred_failure
-            if failure is not None and not transferred_failure(self, conversation, job):
-                ready=False
-                blocker=failure if job.result_forwarded else "CONVERSATION_FAILURE_DELIVERY_PENDING"
-            elif failure is None and lost_session_failure(self.store, job) is not None:
-                # The Hosted compute stopped mid-turn: its outcome is unknown and nothing is resent.
-                ready=False
-                blocker="ASSISTANT_SESSION_LOST" if job.result_forwarded else "CONVERSATION_FAILURE_DELIVERY_PENDING"
+            turn,job=self._turn_view(principal,identifier,number,records[job_id])
+            turns.append(turn)
+        completed=job is not None and job.state in {"succeeded","failed","cancelled"} and job.result_forwarded
+        blocker=self._follow_up_blocker(identifier,conversation,job,completed)
         return {"conversation_id":identifier,"sdk_session_id":conversation.sdk_session_id,
-                "can_follow_up":ready,"follow_up_blocker":blocker,"turns":turns,
+                "can_follow_up":blocker is None,"follow_up_blocker":blocker,"turns":turns,
                 "hosted_session_id":conversation.hosted_session_id,
                 "hosted_agent_version":conversation.hosted_agent_version,
                 "archived":conversation.reset_request_id is not None,
                 "can_reset":completed and conversation.reset_request_id is None}
 
+    def _turn_view(self,principal,identifier,number,r):
+        """One turn's public projection and its job row, which the follow-up gates read for the last turn."""
+        from .behavior_assistant import key as assistant_key,_Session
+        from .behavior_delivery import _Obligation
+        binding=r.binding;job_id=binding.job_id;task=r.profile.instruction
+        self.runtime.authorize(binding.binding_id,principal,"read")
+        jkey=worker_key("job",job_id)
+        jobrow=self.store.read_snapshot((jkey,))[jkey]
+        job=None if jobrow is None else _parse(jobrow.payload["data"],JobRecord)
+        sid=None if job is None or job.binding is None else assistant_key("session-id",job.binding.start_request_id)
+        skey=assistant_key("session",sid) if sid else None
+        orow=self.store.read_snapshot((control_key("delivery-obligation",binding.obligation_id),))[control_key("delivery-obligation",binding.obligation_id)]
+        sessionrow=None if skey is None else self.store.read_snapshot((skey,))[skey]
+        session=None if sessionrow is None else _parse(sessionrow.payload["data"],_Session)
+        obligation=None if orow is None else _parse(orow.payload["data"],_Obligation)
+        reply_key=assistant_key("reply",job_id)
+        replyrow=self.store.read_snapshot((reply_key,))[reply_key]
+        progress=self._turn_progress(identifier,number,job_id,sid)
+        turn={"request_id":r.request_id,"binding_id":binding.binding_id,"job_id":job_id,
+            "work_id":binding.work.work_id,"turn_number":number,"state":"admitting" if job is None else job.state,
+            "model_requests":0 if session is None else session.model_requests,
+            "reply_available":job is not None and job.result_forwarded and replyrow is not None,"model":task.model,
+            "delivery_id":None if obligation is None else obligation.final_delivery_id,
+            "progress":progress.model_dump(mode="json")}
+        if task.model_capacity is not None:
+            turn["model_capacity"]=task.model_capacity.model_dump(mode="json")
+        if task.prompt_profile is not None:
+            turn.update(self._turn_assembly(identifier,number,job_id,task))
+        return turn,job
+
+    def _turn_progress(self,identifier,number,job_id,sid):
+        from .behavior_assistant import key as assistant_key
+        from .behavior_assistant_wire import PublicProgress
+        if sid is None:return PublicProgress()
+        from .behavior_instruction_progress import ProgressRecord
+        pkey=assistant_key("progress",sid)
+        prow=self.store.read_snapshot((pkey,))[pkey]
+        if prow is None:return PublicProgress()
+        saved=_parse(prow.payload["data"],ProgressRecord)
+        if saved.job_id!=job_id or saved.conversation_id!=identifier or saved.turn_number!=number:
+            raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","public progress belongs to another turn")
+        return saved.progress
+
+    def _turn_assembly(self,identifier,number,job_id,task):
+        """The saved prompt assembly and copy outcomes; nothing until this turn's archive exists."""
+        from .behavior_assistant import key as assistant_key
+        from .behavior_instruction import TurnArchive,turn_material
+        from .behavior_skill_prompt import assemble_prompt
+        archive_key=assistant_key("text-archive",job_id)
+        archive_row=self.store.read_snapshot((archive_key,))[archive_key]
+        if archive_row is None:return {}
+        saved=_parse(archive_row.payload["data"],TurnArchive)
+        expected=assemble_prompt(task.prompt_profile).record
+        if (saved.job_id!=job_id or saved.conversation_id!=identifier or saved.turn_number!=number
+                or saved.prompt_assembly!=expected
+                or archive_row.payload["material"]!=turn_material(saved).model_dump(mode="json")):
+            raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","saved instruction assembly differs")
+        fields={"prompt_assembly":saved.prompt_assembly.model_dump(mode="json")}
+        if saved.sop_copy_outcome is not None:
+            fields["sop_copy_outcome"]=saved.sop_copy_outcome.model_dump(mode="json")
+        if saved.skill_draft_outcome is not None:
+            fields["skill_draft_outcome"]=saved.skill_draft_outcome.model_dump(mode="json")
+        return fields
+
+    def _follow_up_blocker(self,identifier,conversation,job,completed):
+        """None lets the conversation continue; each later gate replaces an earlier reason."""
+        idle=conversation.active_job_id is None
+        blocker=None if completed and idle and conversation.archive_id is not None else "turn_unresolved"
+        if completed and idle and conversation.archive_id is None:
+            blocker=self._no_sdk_blocker(identifier,conversation) or blocker
+        if conversation.reset_request_id is not None:
+            blocker="CONVERSATION_ARCHIVED"
+        elif conversation.hosted_session_id is None:
+            blocker="CONVERSATION_SESSION_RESET_REQUIRED"
+        if blocker is None:
+            blocker=self._archive_blocker(identifier,conversation,job)
+        if conversation.reset_request_id is None:
+            blocker=self._session_failure_blocker(conversation,job) or blocker
+        return blocker
+
+    def _no_sdk_blocker(self,identifier,conversation):
+        from .behavior_assistant import key as assistant_key
+        from .behavior_instruction_no_sdk import NoSdkTurn
+        nkey=assistant_key("no-sdk-turn",conversation.jobs[-1])
+        no_sdk=self.store.read_snapshot((nkey,))[nkey]
+        if no_sdk is None:return None
+        saved=_parse(no_sdk.payload["data"],NoSdkTurn)
+        if (saved.conversation_id!=identifier or saved.job_id!=conversation.jobs[-1]
+                or saved.turn_number!=len(conversation.jobs)
+                or no_sdk.payload["material"]!=material(saved.model_dump(mode="json")).model_dump(mode="json")):
+            raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","original no-SDK failure material differs")
+        return "SDK_NOT_STARTED_RESET_REQUIRED"
+
+    def _archive_blocker(self,identifier,conversation,job):
+        from .behavior_instruction import TurnArchive
+        from .behavior_conversation_transfer import current_transfer,transferred_failure,_archive_matches
+        archive_key=conversation.archive_id
+        archived=_row(self.store.read_snapshot((archive_key,)),archive_key,TurnArchive)
+        transfer=current_transfer(self,conversation)
+        restored_failure=transferred_failure(self,conversation,job)
+        if (archived.conversation_id!=identifier or archived.job_id!=conversation.jobs[-1]
+                and not (restored_failure and _archive_matches(transfer,archived))):
+            raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","saved SDK context differs")
+        blocker=self._checkpoint_blocker(conversation,archived)
+        if archived.sop_copy_outcome is not None and archived.sop_copy_outcome.unresolved_operations:
+            blocker="SOP_COPY_OUTCOME_UNKNOWN"
+        if archived.skill_draft_outcome is not None and archived.skill_draft_outcome.unresolved_operations:
+            blocker="SKILL_DRAFT_OUTCOME_UNKNOWN"
+        return blocker
+
+    def _checkpoint_blocker(self,conversation,archived):
+        from .behavior_assistant_checkpoint import unpack
+        from .behavior_assistant_wire import SdkArchive,StoredSdkArchive
+        if not isinstance(archived.archive,(SdkArchive,StoredSdkArchive)):
+            return archived.archive.error
+        if archived.archive.sdk_session_id!=conversation.sdk_session_id:
+            raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","saved SDK session differs")
+        if isinstance(archived.archive,SdkArchive):
+            unpack(archived.archive)
+            return None
+        return self._stored_checkpoint_blocker(conversation,archived)
+
+    def _stored_checkpoint_blocker(self,conversation,archived):
+        from .behavior_sdk_checkpoint import checkpoint_key,SdkStateUpload
+        stored=self.store.read_snapshot((checkpoint_key(archived.job_id),))
+        if _row(stored,checkpoint_key(archived.job_id),SdkStateUpload).reference!=archived.archive:
+            raise Problem(409,"SDK_STATE_INCOMPLETE","stored checkpoint pointer differs")
+        try:
+            from .behavior_profile_selection import choice_for_conversation,profile_from_template
+            choice=choice_for_conversation(self,conversation)
+            consumer=self.policy.profile if choice is None else profile_from_template(self.policy,choice.command.template)
+            archived.archive.require_profile(consumer.checkpoint_profile,model_provider=consumer.model_provider)
+        except Problem as error:
+            if error.body["error"]["code"]!="SDK_STATE_UNSUPPORTED_FORMAT":
+                raise
+            return "SDK_STATE_UNSUPPORTED_FORMAT"
+        return None
+
+    def _session_failure_blocker(self,conversation,job):
+        from .behavior_conversation_transfer import transferred_failure
+        from .behavior_foundry import session_version_failure,lost_session_failure
+        failure=session_version_failure(self.store,job)
+        if failure is not None and not transferred_failure(self,conversation,job):
+            return failure if job.result_forwarded else "CONVERSATION_FAILURE_DELIVERY_PENDING"
+        if failure is None and lost_session_failure(self.store,job) is not None:
+            # The Hosted compute stopped mid-turn: its outcome is unknown and nothing is resent.
+            return "ASSISTANT_SESSION_LOST" if job.result_forwarded else "CONVERSATION_FAILURE_DELIVERY_PENDING"
+        return None
+
     @property
     def policy_key(self):
-        return work_policy_key("policy",*self._key_scope())
+        return work_policy_key("policy",*self.policy.scope_ids)
 
     @property
     def cost_key(self):
@@ -1073,20 +1175,11 @@ class WorkPolicyControl:
 
     @property
     def registry_key(self):
-        return work_policy_key("registry",*self._key_scope())
+        return work_policy_key("registry",*self.policy.scope_ids)
 
     @property
     def revocation_key(self):
-        return work_policy_key("revocation",*self._key_scope())
-
-    def _key_scope(self):
-        if isinstance(self.policy,SteadyWorkPolicy):
-            return self.policy.scope_ids
-        # Cold readers carry only the authority domain and the original registrations.
-        scopes=tuple(record.agent_scope for record in self.records.values())
-        if not scopes or any(scope!=scopes[0] for scope in scopes):
-            raise Problem(409,"WORK_POLICY_REGISTRY_INVALID","history keys require one captured agent scope")
-        return (self.policy.authority_domain,*(() if scopes[0] is None else (scopes[0].agent_id,)))
+        return work_policy_key("revocation",*self.policy.scope_ids)
 
     def _human(self,principal,action="read"):
         b=self.policy.template
@@ -1294,174 +1387,209 @@ class WorkPolicyControl:
         rows=self.store.read_snapshot((self.policy_key,self.revocation_key,self.cost_key,self.registry_key,registry_head))
         admission_registry={name:rows[name] for name in (self.registry_key,registry_head)}
         policy=self.installed(rows)
-        if routine is not None:
-            from .behavior_routine import validate_submission
-            if type(routine) is not RoutineOccurrence or peer_work is not None or type(instruction) is not InstructionSubmit:
-                raise Problem(403,"ROUTINE_SOURCE_CHANGED","a routine requires its original owner instruction")
+        if routine is not None and (type(routine) is not RoutineOccurrence or peer_work is not None
+                                    or type(instruction) is not InstructionSubmit):
+            raise Problem(403,"ROUTINE_SOURCE_CHANGED","a routine requires its original owner instruction")
         admission,binding,profile=derive_work(policy,request_id,self.runtime.mode)
         key=work_policy_key("registration",admission)
         prior=self.store.read_snapshot((key,))[key]
         if prior is not None:
-            if not policy.active or not policy.read_enabled:
-                raise Problem(403,"WORK_POLICY_REVOKED","current original rights are revoked")
-            saved=_parse(prior.payload["data"],WorkRegistration)
-            if saved.request_id!=request_id or saved.submit_sha256!=submit_sha256 or saved.principal_oid!=principal.oid:
-                raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","same work ID has different original input")
-            if saved.routine!=routine:
-                raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","the original work has a different occurrence source")
-            if agent_vm is not None and saved.agent_vm!=agent_vm:
-                raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","the original request cannot be rebound to another VM")
-            if peer_work is not None and (saved.profile.instruction is None or saved.profile.instruction.peer_work!=peer_work):
-                raise Problem(409,"AGENT_MESSAGE_ASSIGNMENT_DENIED","the original receiver work has a different peer source")
-            self.records[saved.binding.binding_id]=saved
-            self.refresh(saved.binding.binding_id)
-            return saved
+            return self._replayed(prior,policy,principal,request_id,submit_sha256,peer_work,routine,agent_vm)
         if routine is not None:
+            from .behavior_routine import validate_submission
             validate_submission(policy,principal.oid,instruction,routine,now=self.runtime._now())
-        conversation=None
-        conversation_row=None
-        conversation_reads=()
-        environment_transfer=None
-        profile_choice=None
-        profile_reads=()
-        profile_snapshot={}
-        memory_capture=None
-        memory_snapshot={}
-        peer_snapshot={}
-        captured_vm=None
+        work=_NewWork(admission,binding,profile)
         if instruction is not None and peer_work is None:
-            if type(instruction) is not InstructionSubmit or instruction.request_id!=request_id:
-                raise Problem(422,"WORK_POLICY_COMMAND","original typed instruction required")
-            if instruction.images:
-                # Attached images reach the model only on native turns; never drop them silently here.
-                raise Problem(422,"WORK_POLICY_COMMAND","attached images need a native Agent turn")
-            from .behavior_instruction import instruction_state,conversation_key
-            conversation,conversation_row=instruction_state(self,instruction,registry_rows=rows)
-            captured_vm=conversation.agent_vm
-            if agent_vm is not None:
-                agent_vm=AgentVmBinding.model_validate_json(agent_vm.model_dump_json())
-                from .behavior_vm_assignment import capture_agent_vm
-                conversation=capture_agent_vm(self,conversation,conversation_row,agent_vm)
-                captured_vm=conversation.agent_vm
-            from .behavior_conversation_transfer import current_transfer
-            environment_transfer=current_transfer(self,conversation)
-            from .behavior_profile_selection import choice_for_conversation,head_key,selection_key,profile_from_template
-            profile_choice=self.store.consistent_read(lambda:choice_for_conversation(self,conversation))
-            effective_profile=policy.profile if profile_choice is None else profile_from_template(policy,profile_choice.command.template)
-            profile_reads=(() if conversation.jobs else (head_key(policy.authority_domain,policy.agent_id),)) + (
-                () if profile_choice is None else (selection_key(policy.authority_domain,profile_choice.selection_id,policy.agent_id),))
-            profile_snapshot=self.store.read_snapshot(profile_reads)
-            captured=self.store.consistent_read(lambda:self.conversation_memory(principal,conversation))
-            memory_capture,memory_snapshot=captured.value,captured.predicates
-            if not conversation.jobs:
-                from .behavior_profile_selection import ConversationProfileHead
-                row=profile_snapshot[head_key(policy.authority_domain,policy.agent_id)]
-                selected=None if row is None else _parse(row.payload["data"],ConversationProfileHead).selection_id
-                if selected!=(None if profile_choice is None else profile_choice.selection_id):
-                    raise Problem(409,"PROFILE_SELECTION_CONFLICT","the new-conversation profile changed during admission")
-            capability_capture=None
-            if effective_profile.capabilities:
-                from .behavior_capabilities import capture as capture_capabilities,runtime_grants
-                from .behavior_profile_selection import ConversationProfileHead,current_selection
-                if profile_choice is None:
-                    raise Problem(403,"CAPABILITY_SELECTION_REQUIRED","capabilities apply only through a human profile selection")
-                head=profile_choice
-                if conversation.jobs:
-                    head=self.store.consistent_read(lambda:current_selection(self.store,policy))
-                    extra=(head_key(policy.authority_domain,policy.agent_id),)+(
-                        () if head is None or head.selection_id==profile_choice.selection_id
-                        else (selection_key(policy.authority_domain,head.selection_id,policy.agent_id),))
-                    profile_reads=tuple(dict.fromkeys((*profile_reads,*extra)))
-                    profile_snapshot=self.store.read_snapshot(profile_reads)
-                    row=profile_snapshot[head_key(policy.authority_domain,policy.agent_id)]
-                    if (None if row is None else _parse(row.payload["data"],ConversationProfileHead).selection_id)!=(
-                            None if head is None else head.selection_id):
-                        raise Problem(409,"PROFILE_SELECTION_CONFLICT","the current profile selection changed during admission")
-                head_refs=() if head is None else profile_from_template(policy,head.command.template).capabilities
-                capability_capture=capture_capabilities(effective_profile.capabilities,head_refs,
-                    None if head is None else head.selection_id,runtime_grants(self.runtime))
-            if profile_choice is not None:
-                prompt_override=None
-            elif conversation.jobs:
-                previous=self._job_record(conversation.jobs[-1])
-                if previous is None:
-                    self.refresh()
-                    previous=self._job_record(conversation.jobs[-1])
-                if (previous is None or previous.profile.instruction is None
-                        or previous.profile.instruction.conversation_id!=conversation.conversation_id
-                        or previous.profile.instruction.turn_number!=len(conversation.jobs)):
-                    raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","original conversation profile is unavailable")
-                prompt_override=registered_prompt_override(policy,previous.profile)
-            else:
-                prompt_override=configured_prompt_override(policy)
-            from .behavior_attachment_source import validate_admission
-            validate_admission(self,policy.model_copy(update={"profile":effective_profile}),principal,instruction,conversation)
-            if conversation_row is not None and captured_vm is None and self.runtime.mode=="native":
-                from .behavior_foundry import instruction_target
-                executor=self._session_executor()
-                target=instruction_target(self.runtime.dep.native_launches.targets[0],binding.job_id,
-                    agent_version=conversation.hosted_agent_version,session_id=conversation.hosted_session_id)
-                original=executor.clients[target.executor_id]
-                client=original if original.target==target else original.for_target(target)
-                session=client.verify_session(before_send=lambda:self._human(principal,"submit"))
-                if session.status!="active":
-                    # ADR-0009 §10: the metadata read wakes nothing, but a turn sent to an idle (reclaimed) SID makes
-                    # the platform re-create it on an arbitrary version; reset or a new conversation stays explicit.
-                    raise Problem(409,"CONVERSATION_SESSION_UNAVAILABLE",
-                        "the original session is not active and is not woken; reset or new session must be explicit")
-            selected_model=self.models.select(instruction.model)
-            if capability_capture is not None and capability_capture.vision and selected_model.supports_image_input is not True:
-                raise Problem(422,"CAPABILITY_MODEL_UNSUPPORTED","a selected capability needs a model that accepts images")
-            selected_capacity = (None if effective_profile.model_capacity_profile is None
-                                 else selected_model.capacity_snapshot())
-            from .behavior_capability_prompt import skill_access
-            if (effective_profile.skill_catalog_budget_profile is not None
-                    and skill_access(effective_profile.prompt_profile,capability_capture)):
-                from .behavior_skill_catalog import validate_catalog_budget
-                if selected_capacity is None:
-                    raise Problem(503,"SKILL_CATALOG_CAPACITY_UNKNOWN","catalog budgeting requires declared model capacity")
-                validate_catalog_budget(selected_capacity,len(effective_profile.skill_artifacts),self.runtime.dep.memory._count)
-            from .behavior_work_target import instruction_hosted_version
-            hosted_version=(captured_vm.hosted_agent_version if captured_vm is not None else
-                            instruction_hosted_version(self,conversation,existing=conversation_row is not None))
-            conversation=conversation.model_copy(update={"hosted_agent_version":hosted_version})
-            conversation_reads=(conversation_key(conversation.conversation_id),)
-            # Each turn captures the head at its own admission; later versions apply from the next turn on.
-            from .behavior_agent_role_prompt_versions import captured_role_prompt
-            role_prompt=self.store.consistent_read(
-                lambda:captured_role_prompt(self.store,policy,effective_profile.prompt_profile))
-            admission,binding,profile=derive_work(policy,request_id,self.runtime.mode,instruction=instruction,
-                turn_number=len(conversation.jobs)+1,previous_archive_id=conversation.archive_id,model=selected_model.id,
-                hosted_agent_version=hosted_version,model_capacity=selected_capacity,prompt_override=prompt_override,
-                reasoning_summary=("detailed" if effective_profile.model_provider=="openai-responses"
-                                   and selected_model.supports_reasoning_summary is True else None),
-                profile_template=None if profile_choice is None else profile_choice.command.template,
-                memory_capture=memory_capture,capability_capture=capability_capture,role_prompt=role_prompt)
+            work=self._instruction_work(principal,policy,request_id,instruction,binding,rows,agent_vm)
         elif peer_work is not None:
-            from .behavior_agent_peer_work import peer_reads, narrow_profile
-            from .behavior_instruction import Conversation, conversation_key
-            peer_snapshot=self.store.read_snapshot(peer_reads(peer_root))
-            route=peer_root.directory.agents[1]
-            conversation=Conversation(conversation_id=route.conversation_id,human_oid=policy.template.human_oid,
-                team_id=policy.template.team_id,agent_oid=policy.template.agent_oid,sdk_session_id=route.sdk_session_id,
-                hosted_session_id=route.hosted_session_id,hosted_agent_version=peer_root.recipient_hosted_version)
-            conversation_reads=(conversation_key(route.conversation_id),)
-            conversation_row=self.store.read_snapshot(conversation_reads)[conversation_reads[0]]
-            if conversation_row is not None:
-                raise Problem(409,"AGENT_MESSAGE_HANDOFF_EXISTS","this root already has its original receiver conversation")
-            selected_model=self.models.select(instruction.model)
-            effective_profile=narrow_profile(policy.profile)
-            selected_capacity=None if effective_profile.model_capacity_profile is None else selected_model.capacity_snapshot()
-            admission,binding,profile=derive_work(policy,request_id,self.runtime.mode,instruction=instruction,
-                model=selected_model.id,hosted_agent_version=peer_root.recipient_hosted_version,
-                model_capacity=selected_capacity,peer_work=peer_work,
-                reasoning_summary=("detailed" if effective_profile.model_provider=="openai-responses"
-                                   and selected_model.supports_reasoning_summary is True else None))
+            work=self._peer_work(policy,request_id,instruction,peer_work,peer_root)
+        policy=self._paid_policy(principal,policy,request_id,instruction,work)
+        now=self.runtime._now()
+        work_policy=self._per_work_policy(policy,work.admission,work.binding,work.profile,now,instruction is not None)
+        registered=WorkRegistration(admission_id=work.admission,request_id=request_id,submit_sha256=submit_sha256,
+            policy_id=policy.policy_id,policy_revision=policy.revision,policy_sha256=policy.sha256,
+            principal_oid=principal.oid,binding=work.binding,profile=work.profile,runtime_policy=work_policy,
+            hosted_session_id=None if work.conversation is None else work.conversation.hosted_session_id,
+            profile_selection_id=None if work.profile_choice is None else work.profile_choice.selection_id,
+            environment_transfer_id=None if work.environment_transfer is None else work.environment_transfer.transfer_id,
+            agent_scope=policy.agent_scope,routine=routine,
+            turn_authorization=None if instruction is None else TurnAuthorization(),agent_vm=work.captured_vm)
+        self._transact_registration(principal,policy,registered,work,instruction=instruction,routine=routine,
+            admission_registry=admission_registry,grant_writes=self._native_grant_writes(registered,now,instruction),
+            peer_root=peer_root)
+        self.records[registered.binding.binding_id]=registered
+        self.refresh(registered.binding.binding_id)
+        return registered
+
+    def _replayed(self,prior,policy,principal,request_id,submit_sha256,peer_work,routine,agent_vm):
+        """The same original request returns its saved work; anything that differs is refused."""
+        if not policy.active or not policy.read_enabled:
+            raise Problem(403,"WORK_POLICY_REVOKED","current original rights are revoked")
+        saved=_parse(prior.payload["data"],WorkRegistration)
+        if saved.request_id!=request_id or saved.submit_sha256!=submit_sha256 or saved.principal_oid!=principal.oid:
+            raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","same work ID has different original input")
+        if saved.routine!=routine:
+            raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","the original work has a different occurrence source")
+        if agent_vm is not None and saved.agent_vm!=agent_vm:
+            raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","the original request cannot be rebound to another VM")
+        if peer_work is not None and (saved.profile.instruction is None or saved.profile.instruction.peer_work!=peer_work):
+            raise Problem(409,"AGENT_MESSAGE_ASSIGNMENT_DENIED","the original receiver work has a different peer source")
+        self.records[saved.binding.binding_id]=saved
+        self.refresh(saved.binding.binding_id)
+        return saved
+
+    def _instruction_work(self,principal,policy,request_id,instruction,binding,rows,agent_vm):
+        """Capture one human turn: its conversation, profile, memory, capabilities, model and role prompt."""
+        from .behavior_agent_role_prompt_versions import captured_role_prompt
+        from .behavior_attachment_source import validate_admission
+        from .behavior_conversation_transfer import current_transfer
+        from .behavior_instruction import conversation_key
+        from .behavior_work_target import instruction_hosted_version
+        conversation,conversation_row=self._instruction_conversation(request_id,instruction,rows,agent_vm)
+        captured_vm=conversation.agent_vm
+        environment_transfer=current_transfer(self,conversation)
+        profile_choice,effective_profile,profile_reads,profile_snapshot=self._instruction_profile(policy,conversation)
+        captured=self.store.consistent_read(lambda:self.conversation_memory(principal,conversation))
+        if not conversation.jobs:
+            _require_profile_head(profile_snapshot,policy,profile_choice,"the new-conversation profile changed during admission")
+        capability_capture=None
+        if effective_profile.capabilities:
+            capability_capture,profile_reads,profile_snapshot=self._instruction_capabilities(
+                policy,conversation,effective_profile,profile_choice,profile_reads,profile_snapshot)
+        prompt_override=self._instruction_prompt_override(policy,conversation,profile_choice)
+        validate_admission(self,policy.model_copy(update={"profile":effective_profile}),principal,instruction,conversation)
+        if conversation_row is not None and captured_vm is None and self.runtime.mode=="native":
+            self._require_active_session(principal,conversation,binding)
+        selected_model,selected_capacity=self._instruction_model(instruction,effective_profile,capability_capture)
+        hosted_version=(captured_vm.hosted_agent_version if captured_vm is not None else
+                        instruction_hosted_version(self,conversation,existing=conversation_row is not None))
+        conversation=conversation.model_copy(update={"hosted_agent_version":hosted_version})
+        # Each turn captures the head at its own admission; later versions apply from the next turn on.
+        role_prompt=self.store.consistent_read(
+            lambda:captured_role_prompt(self.store,policy,effective_profile.prompt_profile))
+        admission,binding,profile=derive_work(policy,request_id,self.runtime.mode,instruction=instruction,
+            turn_number=len(conversation.jobs)+1,previous_archive_id=conversation.archive_id,model=selected_model.id,
+            hosted_agent_version=hosted_version,model_capacity=selected_capacity,prompt_override=prompt_override,
+            reasoning_summary=_reasoning_summary(effective_profile,selected_model),
+            profile_template=None if profile_choice is None else profile_choice.command.template,
+            memory_capture=captured.value,capability_capture=capability_capture,role_prompt=role_prompt)
+        return _NewWork(admission,binding,profile,conversation=conversation,conversation_row=conversation_row,
+            conversation_reads=(conversation_key(conversation.conversation_id),),
+            environment_transfer=environment_transfer,profile_choice=profile_choice,profile_reads=profile_reads,
+            profile_snapshot=profile_snapshot,memory_snapshot=captured.predicates,captured_vm=captured_vm)
+
+    def _instruction_conversation(self,request_id,instruction,rows,agent_vm):
+        if type(instruction) is not InstructionSubmit or instruction.request_id!=request_id:
+            raise Problem(422,"WORK_POLICY_COMMAND","original typed instruction required")
+        if instruction.images:
+            # Attached images reach the model only on native turns; never drop them silently here.
+            raise Problem(422,"WORK_POLICY_COMMAND","attached images need a native Agent turn")
+        from .behavior_instruction import instruction_state
+        conversation,conversation_row=instruction_state(self,instruction,registry_rows=rows)
+        if agent_vm is not None:
+            agent_vm=AgentVmBinding.model_validate_json(agent_vm.model_dump_json())
+            from .behavior_vm_assignment import capture_agent_vm
+            conversation=capture_agent_vm(self,conversation,conversation_row,agent_vm)
+        return conversation,conversation_row
+
+    def _instruction_profile(self,policy,conversation):
+        from .behavior_profile_selection import choice_for_conversation,head_key,selection_key,profile_from_template
+        profile_choice=self.store.consistent_read(lambda:choice_for_conversation(self,conversation))
+        effective_profile=policy.profile if profile_choice is None else profile_from_template(policy,profile_choice.command.template)
+        profile_reads=(() if conversation.jobs else (head_key(policy.authority_domain,policy.agent_id),)) + (
+            () if profile_choice is None else (selection_key(policy.authority_domain,profile_choice.selection_id,policy.agent_id),))
+        return profile_choice,effective_profile,profile_reads,self.store.read_snapshot(profile_reads)
+
+    def _instruction_capabilities(self,policy,conversation,effective_profile,profile_choice,profile_reads,profile_snapshot):
+        from .behavior_capabilities import capture as capture_capabilities,runtime_grants
+        from .behavior_profile_selection import current_selection,head_key,selection_key,profile_from_template
+        if profile_choice is None:
+            raise Problem(403,"CAPABILITY_SELECTION_REQUIRED","capabilities apply only through a human profile selection")
+        head=profile_choice
+        if conversation.jobs:
+            head=self.store.consistent_read(lambda:current_selection(self.store,policy))
+            extra=(head_key(policy.authority_domain,policy.agent_id),)+(
+                () if head is None or head.selection_id==profile_choice.selection_id
+                else (selection_key(policy.authority_domain,head.selection_id,policy.agent_id),))
+            profile_reads=tuple(dict.fromkeys((*profile_reads,*extra)))
+            profile_snapshot=self.store.read_snapshot(profile_reads)
+            _require_profile_head(profile_snapshot,policy,head,"the current profile selection changed during admission")
+        head_refs=() if head is None else profile_from_template(policy,head.command.template).capabilities
+        capture=capture_capabilities(effective_profile.capabilities,head_refs,
+            None if head is None else head.selection_id,runtime_grants(self.runtime))
+        return capture,profile_reads,profile_snapshot
+
+    def _instruction_prompt_override(self,policy,conversation,profile_choice):
+        if profile_choice is not None:
+            return None
+        if not conversation.jobs:
+            return configured_prompt_override(policy)
+        previous=self._job_record(conversation.jobs[-1])
+        if previous is None:
+            self.refresh()
+            previous=self._job_record(conversation.jobs[-1])
+        if (previous is None or previous.profile.instruction is None
+                or previous.profile.instruction.conversation_id!=conversation.conversation_id
+                or previous.profile.instruction.turn_number!=len(conversation.jobs)):
+            raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","original conversation profile is unavailable")
+        return registered_prompt_override(policy,previous.profile)
+
+    def _require_active_session(self,principal,conversation,binding):
+        from .behavior_foundry import instruction_target
+        executor=self._session_executor()
+        target=instruction_target(self.runtime.dep.native_launches.targets[0],binding.job_id,
+            agent_version=conversation.hosted_agent_version,session_id=conversation.hosted_session_id)
+        original=executor.clients[target.executor_id]
+        client=original if original.target==target else original.for_target(target)
+        session=client.verify_session(before_send=lambda:self._human(principal,"submit"))
+        if session.status!="active":
+            # ADR-0009 §10: the metadata read wakes nothing, but a turn sent to an idle (reclaimed) SID makes
+            # the platform re-create it on an arbitrary version; reset or a new conversation stays explicit.
+            raise Problem(409,"CONVERSATION_SESSION_UNAVAILABLE",
+                "the original session is not active and is not woken; reset or new session must be explicit")
+
+    def _instruction_model(self,instruction,effective_profile,capability_capture):
+        from .behavior_capability_prompt import skill_access
+        selected_model=self.models.select(instruction.model)
+        if capability_capture is not None and capability_capture.vision and selected_model.supports_image_input is not True:
+            raise Problem(422,"CAPABILITY_MODEL_UNSUPPORTED","a selected capability needs a model that accepts images")
+        selected_capacity=_model_capacity(effective_profile,selected_model)
+        if (effective_profile.skill_catalog_budget_profile is not None
+                and skill_access(effective_profile.prompt_profile,capability_capture)):
+            from .behavior_skill_catalog import validate_catalog_budget
+            if selected_capacity is None:
+                raise Problem(503,"SKILL_CATALOG_CAPACITY_UNKNOWN","catalog budgeting requires declared model capacity")
+            validate_catalog_budget(selected_capacity,len(effective_profile.skill_artifacts),self.runtime.dep.memory._count)
+        return selected_model,selected_capacity
+
+    def _peer_work(self,policy,request_id,instruction,peer_work,peer_root):
+        from .behavior_agent_peer_work import peer_reads,narrow_profile
+        from .behavior_instruction import Conversation,conversation_key
+        peer_snapshot=self.store.read_snapshot(peer_reads(peer_root))
+        route=peer_root.directory.agents[1]
+        conversation=Conversation(conversation_id=route.conversation_id,human_oid=policy.template.human_oid,
+            team_id=policy.template.team_id,agent_oid=policy.template.agent_oid,sdk_session_id=route.sdk_session_id,
+            hosted_session_id=route.hosted_session_id,hosted_agent_version=peer_root.recipient_hosted_version)
+        conversation_reads=(conversation_key(route.conversation_id),)
+        conversation_row=self.store.read_snapshot(conversation_reads)[conversation_reads[0]]
+        if conversation_row is not None:
+            raise Problem(409,"AGENT_MESSAGE_HANDOFF_EXISTS","this root already has its original receiver conversation")
+        selected_model=self.models.select(instruction.model)
+        effective_profile=narrow_profile(policy.profile)
+        admission,binding,profile=derive_work(policy,request_id,self.runtime.mode,instruction=instruction,
+            model=selected_model.id,hosted_agent_version=peer_root.recipient_hosted_version,
+            model_capacity=_model_capacity(effective_profile,selected_model),peer_work=peer_work,
+            reasoning_summary=_reasoning_summary(effective_profile,selected_model))
+        return _NewWork(admission,binding,profile,conversation=conversation,conversation_reads=conversation_reads,
+            peer_snapshot=peer_snapshot)
+
+    def _paid_policy(self,principal,policy,request_id,instruction,work):
+        """The current policy, once a fresh cost observation allows this new paid work."""
         observation=self.cost_reader()
         if instruction is not None:
             # Before the first write (the cost observation below): the later dispatch row must fit one Table row.
-            check_dispatch_row(self,admission,binding,profile,
-                self._per_work_policy(policy,admission,binding,profile,self.runtime._now(),True),observation)
+            check_dispatch_row(self,work.admission,work.binding,work.profile,
+                self._per_work_policy(policy,work.admission,work.binding,work.profile,self.runtime._now(),True),observation)
         self.observe_cost(observation,instruction=instruction is not None)
         rows=self.store.read_snapshot((self.policy_key,self.revocation_key,self.cost_key,self.registry_key))
         policy=self.installed(rows)
@@ -1470,59 +1598,50 @@ class WorkPolicyControl:
         if decision.decision!="allow":
             raise Problem(403,"WORK_POLICY_"+decision.reason.upper(),"new paid work is not authorized")
         if instruction is None:self.source_ready(principal,policy)
-        now=self.runtime._now()
-        work_policy=self._per_work_policy(policy,admission,binding,profile,now,instruction is not None)
-        registered=WorkRegistration(admission_id=admission,request_id=request_id,submit_sha256=submit_sha256,
-            policy_id=policy.policy_id,policy_revision=policy.revision,policy_sha256=policy.sha256,
-            principal_oid=principal.oid,binding=binding,profile=profile,runtime_policy=work_policy,
-            hosted_session_id=None if conversation is None else conversation.hosted_session_id,
-            profile_selection_id=None if profile_choice is None else profile_choice.selection_id,
-            environment_transfer_id=None if environment_transfer is None else environment_transfer.transfer_id,
-            agent_scope=policy.agent_scope,routine=routine,
-            turn_authorization=None if instruction is None else TurnAuthorization(),agent_vm=captured_vm)
+        return policy
+
+    def _native_grant_writes(self,registered,now,instruction):
+        if self.runtime.mode!="native":
+            return ()
+        import hashlib
+        from .behavior_foundry import NativeExecutionGrant,native_key,instruction_target
+        from .behavior_assistant_wire import Task
+        binding,profile,work_policy=registered.binding,registered.profile,registered.runtime_policy
+        native=self.runtime.dep.native_launches
+        if native is None:raise Problem(403,"WORK_POLICY_NATIVE_DISABLED","existing original native authority required")
+        task=Task(job_id=binding.job_id,work_id=binding.work.work_id,
+            definition_digest=digest(binding.work.model_dump(mode="json")),profile_digest=digest(profile.model_dump(mode="json")),
+            source=profile.source,artifact_id=profile.artifact_id,artifact_version=profile.artifact_version,
+            operation_id=binding.operation_id,instruction=profile.instruction)
+        gid=native_key("bootstrap-grant",binding.job_id)
+        grant=NativeExecutionGrant(grant_id=gid,controller_id=native.controller_id,owner=binding.owner,
+            policy_revision=work_policy.operation_policy_revision,job_id=binding.job_id,definition=binding.work,
+            input_digest=hashlib.sha256(task.model_dump_json().encode()).hexdigest(),
+            targets=tuple(instruction_target(t,binding.job_id,agent_version=profile.instruction.hosted_agent_version,
+                                            session_id=registered.hosted_session_id)
+                          for t in native.targets) if instruction is not None else native.targets,
+            active=True,remaining_uses=1,not_before=now,expires_at=work_policy.queue_deadline,workload_version="assistant-v1.2")
+        return (_write(native_key("grant",gid),grant,"create"),)
+
+    def _transact_registration(self,principal,policy,registered,work,*,instruction,routine,admission_registry,grant_writes,peer_root):
+        from .behavior_work_registry import transact
+        binding,admission,work_policy=registered.binding,registered.admission_id,registered.runtime_policy
+        key=work_policy_key("registration",admission)
         ownerkey=control_key("owner",binding.owner.owner_record_id)
         opkey=control_key("policy",binding.owner.policy_id)
         rpkey=runtime_key("policy",binding.binding_id)
         indexkey=runtime_key("plan-index",binding.binding_id)
-        grant_writes=()
-        if self.runtime.mode=="native":
-            import hashlib
-            from .behavior_foundry import NativeExecutionGrant,native_key,instruction_target
-            from .behavior_assistant_wire import Task
-            native=self.runtime.dep.native_launches
-            if native is None:raise Problem(403,"WORK_POLICY_NATIVE_DISABLED","existing original native authority required")
-            task=Task(job_id=binding.job_id,work_id=binding.work.work_id,
-                definition_digest=digest(binding.work.model_dump(mode="json")),profile_digest=digest(profile.model_dump(mode="json")),
-                source=profile.source,artifact_id=profile.artifact_id,artifact_version=profile.artifact_version,
-                operation_id=binding.operation_id,instruction=profile.instruction)
-            gid=native_key("bootstrap-grant",binding.job_id)
-            grant=NativeExecutionGrant(grant_id=gid,controller_id=native.controller_id,owner=binding.owner,
-                policy_revision=work_policy.operation_policy_revision,job_id=binding.job_id,definition=binding.work,
-                input_digest=hashlib.sha256(task.model_dump_json().encode()).hexdigest(),
-                targets=tuple(instruction_target(t,binding.job_id,agent_version=profile.instruction.hosted_agent_version,
-                                                session_id=registered.hosted_session_id)
-                              for t in native.targets) if instruction is not None else native.targets,
-                active=True,remaining_uses=1,not_before=now,expires_at=work_policy.queue_deadline,workload_version="assistant-v1.2")
-            grant_writes=(_write(native_key("grant",gid),grant,"create"),)
         request=ControlRequest(request_id=key,request_digest=registration_request_digest(registered),
             read_set=tuple(dict.fromkeys((self.policy_key,self.revocation_key,self.cost_key,self.registry_key,key,
-                      ownerkey,opkey,rpkey,indexkey,*profile_reads,*conversation_reads,*memory_snapshot,*peer_snapshot))))
+                      ownerkey,opkey,rpkey,indexkey,*work.profile_reads,*work.conversation_reads,
+                      *work.memory_snapshot,*work.peer_snapshot))))
         def changes(current):
             from .behavior_work_registry import append_writes, count_registry
             active=self.installed(current)
             if routine is not None:
+                from .behavior_routine import validate_submission
                 validate_submission(active,principal.oid,instruction,routine,now=self.runtime._now())
-            if conversation_reads and current[conversation_reads[0]]!=conversation_row:
-                raise Problem(412,"BEHAVIOR_CONFLICT","original conversation changed before admission")
-            if conversation is not None and conversation.jobs and any(
-                    current[name]!=value for name,value in admission_registry.items()):
-                raise Problem(412,"BEHAVIOR_CONFLICT","the continuation registry changed before admission")
-            if any(current[key]!=value for key,value in profile_snapshot.items()):
-                raise Problem(412,"BEHAVIOR_CONFLICT","approved profile selection changed before admission")
-            if any(current[key]!=value for key,value in memory_snapshot.items()):
-                raise Problem(412,"BEHAVIOR_CONFLICT","memory setting or selected note changed before admission")
-            if any(current[key]!=value for key,value in peer_snapshot.items()):
-                raise Problem(412,"BEHAVIOR_CONFLICT","the original peer assignment changed before registration")
+            _require_admission_reads(current,work,admission_registry)
             if peer_root is not None:
                 from .behavior_delegation import _current_parent
                 _current_parent(current,peer_root.origin)
@@ -1531,7 +1650,7 @@ class WorkPolicyControl:
             if instruction is None and count_registry(self.store,policy,current)>=32:
                 raise Problem(429,"WORK_POLICY_CATALOG_CAPACITY","bounded retained registry capacity is exhausted")
             from .behavior_instruction import registration_write
-            conversation_writes=() if conversation is None else (registration_write(conversation,binding.job_id),)
+            conversation_writes=() if work.conversation is None else (registration_write(work.conversation,binding.job_id),)
             return ControlChanges(writes=(
                 _write(key,registered,"create",material(registered.model_dump(mode="json"))),
                 _write(ownerkey,OwnerRecord(**binding.owner.model_dump(),active=True,operation_ids=(binding.operation_id,)),"create"),
@@ -1540,11 +1659,7 @@ class WorkPolicyControl:
                 *append_writes(policy,current,admission),
                 *grant_writes,*conversation_writes,
             ),result={"admission_id":admission,"binding_id":binding.binding_id,"not_yet_admitted":True})
-        from .behavior_work_registry import transact
         transact(self.store,policy,request,changes,append=True)
-        self.records[registered.binding.binding_id]=registered
-        self.refresh(registered.binding.binding_id)
-        return registered
 
     def _per_work_policy(self,policy,admission,binding,profile,now,instruction):
         fields=policy.legacy_template_policy.model_dump()
@@ -1737,8 +1852,6 @@ class WorkPolicyControl:
     def verify_result_access(self,access):
         from . import behavior_delivery as delivery
         from .behavior_inbox import CurrentWorkInboxAccess
-        from .behavior_foundry import _NativeLaunch,native_key
-        from .behavior_workers import ExecutorEvidence
         if type(access) is not CurrentWorkInboxAccess:
             raise Problem(403,"WORK_RESULT_ACCESS_DENIED","explicit current result access required")
         # Refresh only this reader: this check also runs inside the fetch EGT decision window.
@@ -1747,72 +1860,93 @@ class WorkPolicyControl:
         if record is None:
             raise Problem(403,"WORK_RESULT_ACCESS_DENIED","registered original result reader required")
         b=record.binding
+        outkey=control_key("delivery-outbox",access.binding.delivery_id)
         keys=(*self.runtime._gate_keys(b),control_key("delivery-work-state",b.obligation_id),
-              worker_key("job",b.job_id),control_key("delivery-obligation",b.obligation_id),
-              control_key("delivery-outbox",access.binding.delivery_id))
+              worker_key("job",b.job_id),control_key("delivery-obligation",b.obligation_id),outkey)
         rows=self.store.read_snapshot(keys)
         policy,context=self.runtime._state(b,rows,use="read")
         job=_row(rows,worker_key("job",b.job_id),JobRecord)
         work=_row(rows,control_key("delivery-work-state",b.obligation_id),delivery._Work)
         ob=_row(rows,control_key("delivery-obligation",b.obligation_id),delivery._Obligation)
-        out=_row(rows,control_key("delivery-outbox",access.binding.delivery_id),delivery._Outbox)
+        out=_row(rows,outkey,delivery._Outbox)
         result=work.result
-        if (access.work_policy_id!=policy.policy_id or access.principal_id!=b.human_oid or access.binding!=out.binding
-                or access.authentication_version!=self.runtime.dep.evidence.authentication_version
-                or access.policy_revision!=policy.operation_policy_revision
-                or job.state not in {"succeeded","failed","cancelled"} or not job.result_forwarded or job.completion_credit
-                or work.definition!=b.work or work.state!=job.state or result is None
-                or result.work_id!=b.work.work_id or result.state!=job.state
-                or result.definition_digest!=digest(b.work.model_dump(mode="json")) or result.work_revision!=1
-                or result.verifier_version!=self.runtime.dep.delivery.contract.verifier_version
-                or job.spec.job_id!=b.job_id or job.spec.work_id!=b.work.work_id or job.spec.obligation_id!=b.obligation_id
-                or job.spec.input!=self.runtime.job_input(b)
-                or ob.route!=b.route or ob.final_delivery_id!=access.binding.delivery_id
-                or out.binding.route!=b.route or out.binding.obligation_id!=b.obligation_id
+        if (self._reader_differs(access,b,policy,out) or _work_unsettled(job,work,b)
+                or self._result_differs(result,job,b) or self._job_spec_differs(job,b)
+                or _route_differs(access,b,ob,out)
                 or any(getattr(job.owner,k)!=getattr(context,k) for k in type(context).model_fields if k!="epoch")):
             raise Problem(403,"WORK_RESULT_ACCESS_DENIED","only the exact saved terminal result is readable")
+        self._require_saved_result(result)
+        self._require_retained_payload(b,result,out,rows[outkey])
+        if self.runtime.mode!="native":
+            return
+        if job.binding is None:
+            self._require_never_started(b,job)
+        else:
+            self._require_native_proof(b,job,result)
+
+    def _reader_differs(self,access,b,policy,out):
+        return (access.work_policy_id!=policy.policy_id or access.principal_id!=b.human_oid or access.binding!=out.binding
+                or access.authentication_version!=self.runtime.dep.evidence.authentication_version
+                or access.policy_revision!=policy.operation_policy_revision)
+
+    def _result_differs(self,result,job,b):
+        return (result.work_id!=b.work.work_id or result.state!=job.state
+                or result.definition_digest!=digest(b.work.model_dump(mode="json")) or result.work_revision!=1
+                or result.verifier_version!=self.runtime.dep.delivery.contract.verifier_version)
+
+    def _job_spec_differs(self,job,b):
+        return (job.spec.job_id!=b.job_id or job.spec.work_id!=b.work.work_id or job.spec.obligation_id!=b.obligation_id
+                or job.spec.input!=self.runtime.job_input(b))
+
+    def _require_saved_result(self,result):
+        from .behavior_delivery import VerifiedWorkResult
         resultkey=worker_key("work-result",result.evidence_id)
         saved=self.store.read_snapshot((resultkey,))[resultkey]
-        if (saved is None or _parse(saved.payload["data"],delivery.VerifiedWorkResult)!=result
+        if (saved is None or _parse(saved.payload["data"],VerifiedWorkResult)!=result
                 or saved.payload["material"]!=material(result.model_dump(mode="json")).model_dump(mode="json")):
             raise Problem(403,"WORK_RESULT_ACCESS_DENIED","original worker result material differs")
+
+    def _require_retained_payload(self,b,result,out,outrow):
+        from .behavior_delivery import _Payload
         kind="final" if result.state=="succeeded" else "failure"
-        expected=delivery._Payload(event_id=b.event_id,root_request_id=b.root_request_id,work_id=b.work.work_id,
+        expected=_Payload(event_id=b.event_id,root_request_id=b.root_request_id,work_id=b.work.work_id,
             message_kind=kind,work_state=result.state,result_evidence_id=result.evidence_id,content=result.content,
             artifacts=result.artifacts,known_effects=result.known_effects,unresolved_operations=result.unresolved_operations,
             responsibility_owner=b.owner.owner_record_id,notification_code="verified_result" if kind=="final" else "delivery_needs_attention")
         payload=material(expected.model_dump(mode="json"))
         if (out.message_kind!=kind or out.binding.payload_digest!=payload.sha256 or out.binding.artifacts!=result.artifacts
-                or rows[control_key("delivery-outbox",access.binding.delivery_id)].payload["material"]!=payload.model_dump(mode="json")):
+                or outrow.payload["material"]!=payload.model_dump(mode="json")):
             raise Problem(403,"WORK_RESULT_ACCESS_DENIED","exact retained payload/route differs")
-        if self.runtime.mode=="native":
-            if job.binding is None:
-                from .behavior_workers import _InactiveCancellation
-                completionkey=worker_key("completion",b.job_id,"0")
-                never_started=self.store.read_snapshot((completionkey,
-                    worker_key("attempt",b.job_id,"1"),
-                    native_key("launch",native_key("launch-id",worker_key("start",b.job_id,"1")))))
-                evidence=_row(never_started,completionkey,_InactiveCancellation)
-                if (job.state!="cancelled" or job.generation!=0 or not job.cancel_requested
-                        or evidence.spec!=job.spec or evidence.owner!=job.owner or evidence.generation!=0
-                        or evidence.binding is not None or evidence.prior_evidence_id is not None or evidence.children
-                        or evidence.evidence_id!=job.last_evidence_id
-                        or any(value is not None for key,value in never_started.items() if key!=completionkey)
-                        or never_started[completionkey].payload["material"]!=material(evidence.model_dump(mode="json")).model_dump(mode="json")):
-                    raise Problem(403,"WORK_RESULT_ACCESS_DENIED","only an original fenced never-started cancellation is eligible")
-                return
-            launchkey=native_key("launch",native_key("launch-id",job.binding.start_request_id))
-            completionkey=worker_key("completion",b.job_id,str(job.generation))
-            native=self.store.read_snapshot((launchkey,completionkey))
-            launch=_row(native,launchkey,_NativeLaunch);completed=_row(native,completionkey,ExecutorEvidence)
-            if (launch.phase!="sealed" or completed.binding!=job.binding or completed.result!=result
-                    or launch.start.binding!=job.binding or launch.api_binding_id!=b.binding_id or launch.definition!=b.work
-                    or launch.configuration_digest!=self.runtime.dep.workers.configuration_digest()
-                    or completed.state!=("stopped" if job.state=="cancelled" else job.state)
-                    or not completed.entire_tree_idle or not completed.all_inflight_starts_fenced
-                    or completed.evidence_id!=job.last_evidence_id or completed.native_execution_id!=launch.native_invocation_id
-                    or native[completionkey].payload["material"]!=material(completed.model_dump(mode="json")).model_dump(mode="json")):
-                raise Problem(403,"WORK_RESULT_ACCESS_DENIED","saved result lacks original terminal native proof")
+
+    def _require_never_started(self,b,job):
+        from .behavior_foundry import native_key
+        from .behavior_workers import _InactiveCancellation
+        completionkey=worker_key("completion",b.job_id,"0")
+        never_started=self.store.read_snapshot((completionkey,
+            worker_key("attempt",b.job_id,"1"),
+            native_key("launch",native_key("launch-id",worker_key("start",b.job_id,"1")))))
+        evidence=_row(never_started,completionkey,_InactiveCancellation)
+        if (job.state!="cancelled" or job.generation!=0 or not job.cancel_requested
+                or _cancellation_differs(evidence,job)
+                or any(value is not None for key,value in never_started.items() if key!=completionkey)
+                or never_started[completionkey].payload["material"]!=material(evidence.model_dump(mode="json")).model_dump(mode="json")):
+            raise Problem(403,"WORK_RESULT_ACCESS_DENIED","only an original fenced never-started cancellation is eligible")
+
+    def _require_native_proof(self,b,job,result):
+        from .behavior_foundry import _NativeLaunch,native_key
+        from .behavior_workers import ExecutorEvidence
+        launchkey=native_key("launch",native_key("launch-id",job.binding.start_request_id))
+        completionkey=worker_key("completion",b.job_id,str(job.generation))
+        native=self.store.read_snapshot((launchkey,completionkey))
+        launch=_row(native,launchkey,_NativeLaunch);completed=_row(native,completionkey,ExecutorEvidence)
+        if (self._launch_differs(launch,completed,job,result,b) or _terminal_proof_differs(completed,job,launch)
+                or native[completionkey].payload["material"]!=material(completed.model_dump(mode="json")).model_dump(mode="json")):
+            raise Problem(403,"WORK_RESULT_ACCESS_DENIED","saved result lacks original terminal native proof")
+
+    def _launch_differs(self,launch,completed,job,result,b):
+        return (launch.phase!="sealed" or completed.binding!=job.binding or completed.result!=result
+                or launch.start.binding!=job.binding or launch.api_binding_id!=b.binding_id or launch.definition!=b.work
+                or launch.configuration_digest!=self.runtime.dep.workers.configuration_digest())
 
     def _admission_record(self,command):
         return next((record for record in self.records.values() if record.binding.event_id==command.event.event_id),None)

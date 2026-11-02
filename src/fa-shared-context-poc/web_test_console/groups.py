@@ -1,5 +1,6 @@
 """Thin group panel controls; original group IDs and local UNKNOWN intents survive reload."""
 
+from functools import partial
 import secrets
 
 from pydantic import TypeAdapter
@@ -10,7 +11,7 @@ from shared_context.native_group_wire import (
     NATIVE_GROUP_ERRORS, NATIVE_GROUP_PREFIX, NativeGroupActivity, NativeGroupList, NativeGroupListQuery,
     NativeGroupOpen, NativeGroupOptions, NativeGroupStarted, NativeGroupTranscript, NativeGroupView, groups_enabled,
 )
-from .adapter import ConsoleError, PullAdapter, canonical, require, sha, strict_json
+from .adapter import ConsoleError, PullAdapter, canonical, decode, require, sha, strict_json
 
 MESSAGES = {code: "群組操作未通過核對；保留原編號並讀回狀態，不會自動重送。" for code in NATIVE_GROUP_ERRORS}
 MESSAGES.update({
@@ -20,12 +21,7 @@ MESSAGES.update({
 })
 
 
-def decode(model, raw):
-    try:
-        strict_json(raw)
-        return model.model_validate_json(raw)
-    except (ValueError, TypeError):
-        raise ConsoleError("NATIVE_GROUP_STATE_INVALID", 502) from None
+_decode = partial(decode, code="NATIVE_GROUP_STATE_INVALID")
 
 
 class GroupControl:
@@ -45,7 +41,7 @@ class GroupControl:
                                         body, token, limit=512 * 1024)
         self.console.native_instructions._current(token)
         require(headers.get("cache-control") == "no-store", "NATIVE_GROUP_STATE_INVALID", 502)
-        return decode(model, raw)
+        return _decode(model, raw)
 
     def options(self):
         if not self.enabled:
@@ -75,7 +71,7 @@ class GroupControl:
 
     def open(self, data):
         token = self.token()
-        command = decode(NativeGroupOpen, canonical(data))
+        command = _decode(NativeGroupOpen, canonical(data))
         native = self.console.native_instructions
         with self.console.message_lock("group-open"):
             phase = "group-open"
@@ -239,7 +235,7 @@ def install_group_routes(app, requested_console):
 
     @app.post("/api/groups/list")
     async def listing(request: Request, console=Depends(requested_console)):
-        value = decode(NativeGroupListQuery, canonical(await body(request)))
+        value = _decode(NativeGroupListQuery, canonical(await body(request)))
         return await run_in_threadpool(control(console).listing, value.after)
 
     @app.post("/api/groups/open")

@@ -42,6 +42,7 @@ from shared_context.behavior_native_turn_wire import (
 from shared_context.behavior_peer_runtime import install_peer_routing
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_wire import HostedIdentity
+from shared_context.native_capabilities import selected_providers
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.behavior_capabilities import (
     BUILTIN_CAPABILITIES, DELEGATE_READER_ENTRY_ID, SKILL_RESOURCES_ENTRY_ID,
@@ -340,6 +341,14 @@ def tool_result(body, call_id):
     return json.loads(output)
 
 
+def closing_order(h, receipt):
+    # Consumers bind concurrently, so h.bindings is finish order; each close is pushed in consumer order (LIFO).
+    executor = h.runtime.executor
+    chosen = selected_providers(receipt.capture, executor.capability_providers,
+                                agent_messages=executor.agent_tools is not None)
+    return [tuple(grant.entry_id for grant in grants) for _, grants in reversed(chosen)]
+
+
 def b_capture(case):
     role = assemble_prompt("fa-instruction-v1").record
     template = AgentTemplate(
@@ -523,7 +532,7 @@ def test_a_subset_preserves_full_template_and_original_result_with_real_consumer
     assert len(receipt.capture.template.settings.capabilities) == 10
     assert tuple(grant.entry_id for grant in receipt.capture.capabilities.grants) == A_SUBSET
     assert {selected for selected, _, _ in h.bindings} == {(name,) for name in A_SUBSET}
-    assert h.closed == [selected for selected, _, _ in reversed(h.bindings)]
+    assert h.closed == closing_order(h, receipt)
     page = h.call(h.runtime.result, NativeResult(conversation_id=receipt.conversation_id,
                                                request_id=receipt.request_id))
     assert page.complete and page.text == "C6 original result: 530."
@@ -1029,7 +1038,7 @@ def test_a_all_ten_capabilities_share_original_ui_turn_and_image_readback(
             assert received.capture.capabilities is None and received.capture.template.skills == ()
             assert received.capture.template.settings.model_provider is None
             assert received.source.sender.request_id == rid
-            repeat = NativeSubmit(command=receipt.command, capture=receipt.capture)
+            repeat = NativeSubmit(command=receipt.command, capture=receipt.capture, state_profile=receipt.state_profile)
             assert h.invoke(repeat).json()["status"] == "completed"
             assert len(peer.remote.records) == 1
             assert h.call(h.runtime.dispatch, NativeImagesRead(
@@ -1057,8 +1066,8 @@ def test_a_all_ten_capabilities_share_original_ui_turn_and_image_readback(
         assert h.sdk_calls[0]["model_capacity"] == receipt.capture.model_capacity
         page = h.call(h.runtime.result, NativeResult(conversation_id=receipt.conversation_id,
                                                    request_id=receipt.request_id))
-        assert page.text.startswith("已交給 ") and "結果會在本對話另開回合回覆" in page.text
-        assert not receipt.delivered and h.closed == [selected for selected, _, _ in reversed(h.bindings)]
+        assert page.text.startswith("已交給 ") and "結果會回到這段對話" in page.text
+        assert not receipt.delivered and h.closed == closing_order(h, receipt)
     finally:
         behavior_desktop_capability.DESKTOP_CAPABILITY.release(NativeOwner(h.runtime.executor.root))
     assert desktop.stopped and behavior_desktop_capability.DESKTOP_CAPABILITY.current_env() is None
@@ -1202,7 +1211,7 @@ def test_a_handoff_uses_original_api_and_preserves_b_zero_capability_capture(int
         assert received.capture.template.settings.model_provider is None
         page = h.call(h.runtime.result, NativeResult(conversation_id=receipt.conversation_id,
                                                    request_id=receipt.request_id))
-        assert page.text.startswith("已交給 ") and "結果會在本對話另開回合回覆" in page.text
+        assert page.text.startswith("已交給 ") and "結果會回到這段對話" in page.text
         assert receipt.delivered is False and receipt.usage.usage[0].requests == 1
         assert h.invoke(command).json()["status"] == "completed"
         assert len(requests) == len(remote.records) == 1
@@ -1654,7 +1663,7 @@ def test_saved_image_survives_original_child_cancel_and_remains_read_only_in_nat
         assert original.data == image.content and original.submit_sha256 == receipt.submit_digest
         assert len(created) == len(set(created)) == 2 and lost
         assert all(method == "GET" for method, _, _ in console.calls[before:])
-        repeat = NativeSubmit(command=receipt.command, capture=receipt.capture)
+        repeat = NativeSubmit(command=receipt.command, capture=receipt.capture, state_profile=receipt.state_profile)
         assert h.invoke(repeat).json()["status"] == "unknown"
         assert h.call(bridge.read) == child and len(requests) == 4 and len(created) == 2
         assert ui.get(path + "/" + entry["version_id"]).content == image.content

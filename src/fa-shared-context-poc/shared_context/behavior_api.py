@@ -183,15 +183,17 @@ def _principal_dependency(verifier):
     return identity
 
 
-def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, registered_actor=None) -> APIRouter:
-    if not isinstance(verifier, BehaviorJwtVerifier):
-        raise Problem(503, "BEHAVIOR_CONFIGURATION", "the explicit behavior JWT verifier is required")
+def _served_actors(verifier, registered_actor):
     actors = verifier.auth.actors
     if registered_actor is not None:
         # One Team-registry peer verified by resolve_agent_scope; it never replaces a configured actor.
         if registered_actor.oid in actors:
             raise Problem(503, "BEHAVIOR_CONFIGURATION", "a registered agent cannot reuse a configured actor")
         actors = {**actors, registered_actor.oid: registered_actor}
+    return actors
+
+
+def _check_bindings(runtime, verifier, actors):
     for binding in runtime.bindings.values():
         actor = actors.get(binding.agent_oid)
         if (
@@ -199,51 +201,72 @@ def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, 
             or binding.team_id != verifier.settings.team or actor is None or actor.team != binding.team_id
         ):
             raise Problem(503, "BEHAVIOR_CONFIGURATION", "JWT and runtime principal bindings differ")
+
+
+def _check_native_targets(runtime, actors):
     if runtime.dep.native_launches is not None:
         for target in runtime.dep.native_launches.targets:
             actor = actors.get(target.agent_oid)
             if actor is None or actor.team != runtime.dep.native_launches.team_id:
                 raise Problem(503, "BEHAVIOR_CONFIGURATION", "native executor MI must be explicitly allowlisted")
-    router = APIRouter()
-    identity = _principal_dependency(verifier)
 
-    def add(path, model, action, handler, *, method="POST", render=_response):
-        async def endpoint(request: Request, binding_id: str, principal: BehaviorPrincipal = Depends(identity)):
-            binding, _, _ = runtime.authorize(binding_id, principal, action)
-            values = dict(request.path_params)
-            try:
-                for name, value in values.items():
-                    if name == "backup_id":
-                        TypeAdapter(wire.BackupId).validate_python(value, strict=True)
-                    elif name == "version":
-                        if not re.fullmatch(r"[1-9][0-9]{0,9}", value) or int(value) > 2**31 - 1:
-                            raise ValueError("invalid source version")
-                        values[name] = int(value)
-                    else:
-                        _id.validate_python(value, strict=True)
-                if "job_id" in values and values["job_id"] != binding.job_id:
-                    raise ValueError("job is outside binding")
-                if "child_id" in values and values["child_id"] not in {child.job_id for child in binding.child_jobs}:
-                    raise ValueError("child is outside binding")
-            except (ValueError, ValidationError):
-                raise Problem(403, "BEHAVIOR_BINDING_DENIED", "path is outside the authorized binding") from None
-            if request.query_params:
-                raise Problem(422, "BEHAVIOR_INVALID_REQUEST", "query parameters are unsupported")
-            if model is None and (
-                request.headers.get("content-length", "0") != "0" or "transfer-encoding" in request.headers
-            ):
-                raise Problem(422, "BEHAVIOR_INVALID_REQUEST", "read endpoints do not accept a body")
-            command = None if model is None else await _body(request, model)
-            try:
-                result = await run_in_threadpool(handler, values, command, principal)
-                return render(result)
-            except Problem:
-                raise
-            except Exception:
-                raise Problem(503, "BEHAVIOR_DEPENDENCY_UNAVAILABLE", "required dependency failed") from None
 
-        router.add_api_route(PREFIX + path, endpoint, methods=[method], name="behavior-" + path.replace("/", "-") + method)
+def _path_value(name, value):
+    if name == "version":
+        if not re.fullmatch(r"[1-9][0-9]{0,9}", value) or int(value) > 2**31 - 1:
+            raise ValueError("invalid source version")
+        return int(value)
+    if name == "backup_id":
+        TypeAdapter(wire.BackupId).validate_python(value, strict=True)
+    else:
+        _id.validate_python(value, strict=True)
+    return value
 
+
+def _path_values(path_params, binding):
+    try:
+        values = {name: _path_value(name, value) for name, value in path_params.items()}
+        if "job_id" in values and values["job_id"] != binding.job_id:
+            raise ValueError("job is outside binding")
+        if "child_id" in values and values["child_id"] not in {child.job_id for child in binding.child_jobs}:
+            raise ValueError("child is outside binding")
+    except (ValueError, ValidationError):
+        raise Problem(403, "BEHAVIOR_BINDING_DENIED", "path is outside the authorized binding") from None
+    return values
+
+
+def _endpoint(runtime, identity, model, action, handler, render):
+    async def endpoint(request: Request, binding_id: str, principal: BehaviorPrincipal = Depends(identity)):
+        binding, _, _ = runtime.authorize(binding_id, principal, action)
+        values = _path_values(request.path_params, binding)
+        if request.query_params:
+            raise Problem(422, "BEHAVIOR_INVALID_REQUEST", "query parameters are unsupported")
+        if model is None and (
+            request.headers.get("content-length", "0") != "0" or "transfer-encoding" in request.headers
+        ):
+            raise Problem(422, "BEHAVIOR_INVALID_REQUEST", "read endpoints do not accept a body")
+        command = None if model is None else await _body(request, model)
+        try:
+            result = await run_in_threadpool(handler, values, command, principal)
+            return render(result)
+        except Problem:
+            raise
+        except Exception:
+            raise Problem(503, "BEHAVIOR_DEPENDENCY_UNAVAILABLE", "required dependency failed") from None
+
+    return endpoint
+
+
+def _exact_source(exact):
+    if len(exact.original) > 8192:
+        raise Problem(413, "BEHAVIOR_RESPONSE_LIMIT", "source exceeds the supported exact-output bound")
+    return Response(exact.original, media_type=exact.event.media_type, headers={
+        "Cache-Control": "no-store", "X-Source-SHA256": exact.event.reference.sha256,
+        "X-Source-Version": str(exact.event.reference.version),
+    })
+
+
+def _add_source_routes(add, runtime):
     for stage in ("commit", "reconcile"):
         add("/sources/{source_id}/" + stage, wire.Command, "submit" if stage == "commit" else "read",
             lambda p, c, who, reconcile=stage == "reconcile": runtime.commit_source(
@@ -256,31 +279,27 @@ def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, 
             lambda p, c, who, reconcile=stage == "withdrawal-reconcile": runtime.withdraw_source(
                 p["binding_id"], p["source_id"], c, who, reconcile=reconcile,
             ))
-
-    def exact_source(exact):
-        if len(exact.original) > 8192:
-            raise Problem(413, "BEHAVIOR_RESPONSE_LIMIT", "source exceeds the supported exact-output bound")
-        return Response(exact.original, media_type=exact.event.media_type, headers={
-            "Cache-Control": "no-store", "X-Source-SHA256": exact.event.reference.sha256,
-            "X-Source-Version": str(exact.event.reference.version),
-        })
-
     add("/sources/{source_id}/versions/{version}", None, "read",
         lambda p, _, who: runtime.read_source(p["binding_id"], p["source_id"], p["version"], who),
-        method="GET", render=exact_source)
+        method="GET", render=_exact_source)
     add("/snapshots/{snapshot_id}/capture", wire.SnapshotCapture, "submit",
         lambda p, c, who: runtime.capture_snapshot(p["binding_id"], p["snapshot_id"], c, who))
     add("/snapshots/{snapshot_id}/verify", wire.Command, "read",
         lambda p, c, who: runtime.verify_snapshot(p["binding_id"], p["snapshot_id"], c, who),
         render=lambda result: _response({"manifest": result.manifest, "originals": result.originals}))
-    if runtime.dep.source_backups is not None:
-        add("/backups/{backup_id}/prepare", wire.BackupPrepare, "backup",
-            lambda p, c, who: runtime.prepare_backup(p["binding_id"], p["backup_id"], c, who))
-        for stage in ("upload", "reconcile"):
-            add("/backups/{backup_id}/" + stage, wire.Command, "backup",
-                lambda p, c, who, reconcile=stage == "reconcile": runtime.upload_backup(
-                    p["binding_id"], p["backup_id"], c, who, reconcile=reconcile,
-                ))
+
+
+def _add_backup_routes(add, runtime):
+    add("/backups/{backup_id}/prepare", wire.BackupPrepare, "backup",
+        lambda p, c, who: runtime.prepare_backup(p["binding_id"], p["backup_id"], c, who))
+    for stage in ("upload", "reconcile"):
+        add("/backups/{backup_id}/" + stage, wire.Command, "backup",
+            lambda p, c, who, reconcile=stage == "reconcile": runtime.upload_backup(
+                p["binding_id"], p["backup_id"], c, who, reconcile=reconcile,
+            ))
+
+
+def _add_claim_routes(add, runtime):
     add("/claims/{claim_id}/review", wire.ClaimReview, "approve",
         lambda p, c, who: runtime.review_claim(p["binding_id"], p["claim_id"], c, who))
     add("/claims/{claim_id}/preview", wire.ClaimDraft, "approve",
@@ -295,6 +314,9 @@ def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, 
     add("/context", wire.ContextRequest, "read",
         lambda p, c, who: runtime.context(p["binding_id"], c, who),
         render=lambda result: _response({"manifest": result.manifest, "claims": result.claims, "originals": result.originals}))
+
+
+def _add_operation_routes(add, runtime):
     add("/operation/prepare", wire.OperationPrepare, "read",
         lambda p, c, who: runtime.prepare_operation(p["binding_id"], c, who))
     add("/operation", None, "read", lambda p, _, who: runtime.operation_preview(p["binding_id"], who), method="GET")
@@ -315,6 +337,9 @@ def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, 
     for stage in ("execute", "reconcile"):
         add("/operation/" + stage, wire.Command, "execute" if stage == "execute" else "read",
             lambda p, c, who, reconcile=stage == "reconcile": runtime.execute_operation(p["binding_id"], c, who, reconcile=reconcile))
+
+
+def _add_work_routes(add, runtime):
     for stage in ("submit", "reconcile"):
         add("/work/" + stage, wire.SubmitWork, "submit" if stage == "submit" else "read",
             lambda p, c, who, reconcile=stage == "reconcile": runtime.submit(p["binding_id"], c, who, reconcile=reconcile))
@@ -327,31 +352,33 @@ def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, 
             ))
     add("/children/{child_id}", None, "read",
         lambda p, _, who: runtime.child_status(p["binding_id"], p["child_id"], who), method="GET")
-    if runtime.dep.memory_projections:
-        for stage in ("plan", "start", "poll", "reconcile", "search", "context"):
-            model = (wire.Command if stage == "plan" else
-                     wire.MemoryProjectionQuery if stage in {"search", "context"} else wire.MemoryProjectionCommand)
-            action = "submit" if stage in {"plan", "start", "poll"} else "read"
-            add("/memory/" + stage, model, action,
-                lambda p, c, who, operation=stage: runtime.memory_projection(
-                    p["binding_id"], c, who, action=operation,
-                ))
 
-    def pull(result):
-        metadata = base64.urlsafe_b64encode(result.binding.model_dump_json().encode()).decode()
-        return Response(result.payload, media_type="application/json", headers={
-            "Cache-Control": "no-store", "X-Behavior-Exchange": result.exchange_id,
-            "X-Behavior-Ack-Token": result.acknowledgment_token, "X-Behavior-Binding": metadata,
-            "X-Behavior-Payload-SHA256": result.binding.payload_digest,
-            "X-Behavior-Confirmation-Level": "client_received",
-        })
 
-    add("/delivery/pull", wire.Command, "read", lambda p, c, who: runtime.fetch(p["binding_id"], c, who), render=pull)
-    add("/delivery/pull-continue", wire.Command, "read",
-        lambda p, c, who: runtime.continue_fetch(p["binding_id"], c, who), render=pull)
+def _add_memory_routes(add, runtime):
+    for stage in ("plan", "start", "poll", "reconcile", "search", "context"):
+        model = (wire.Command if stage == "plan" else
+                 wire.MemoryProjectionQuery if stage in {"search", "context"} else wire.MemoryProjectionCommand)
+        action = "submit" if stage in {"plan", "start", "poll"} else "read"
+        add("/memory/" + stage, model, action,
+            lambda p, c, who, operation=stage: runtime.memory_projection(
+                p["binding_id"], c, who, action=operation,
+            ))
+
+
+def _pull_response(result):
+    metadata = base64.urlsafe_b64encode(result.binding.model_dump_json().encode()).decode()
+    return Response(result.payload, media_type="application/json", headers={
+        "Cache-Control": "no-store", "X-Behavior-Exchange": result.exchange_id,
+        "X-Behavior-Ack-Token": result.acknowledgment_token, "X-Behavior-Binding": metadata,
+        "X-Behavior-Payload-SHA256": result.binding.payload_digest,
+        "X-Behavior-Confirmation-Level": "client_received",
+    })
+
+
+def _add_delivery_routes(add, runtime):
     def reconcile_pull(params, command, principal):
         try:
-            return pull(runtime.reconcile_fetch(params["binding_id"], command, principal))
+            return _pull_response(runtime.reconcile_fetch(params["binding_id"], command, principal))
         except Problem as error:
             if error.body["error"]["code"] != "INBOX_FETCH_NOT_STARTED":
                 raise
@@ -359,64 +386,111 @@ def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, 
                 "code": "INBOX_FETCH_NOT_STARTED", "message": "No exchange exists for the continued original fetch.",
                 "original_request_id": command.request_id, "automatic_retry": False,
             }}, status_code=409, headers={"Cache-Control": "no-store"})
+
+    add("/delivery/pull", wire.Command, "read", lambda p, c, who: runtime.fetch(p["binding_id"], c, who),
+        render=_pull_response)
+    add("/delivery/pull-continue", wire.Command, "read",
+        lambda p, c, who: runtime.continue_fetch(p["binding_id"], c, who), render=_pull_response)
     add("/delivery/pull-reconcile", wire.Command, "read",
         reconcile_pull, render=lambda result: result)
     add("/delivery/acknowledge", wire.PullAcknowledgment, "acknowledge",
         lambda p, c, who: runtime.acknowledge(p["binding_id"], c, who))
 
+
+def _private_capability(request, name):
+    values = request.headers.getlist(name)
+    if len(values) != 1 or re.fullmatch(r"[a-f0-9]{64}", values[0]) is None:
+        raise Problem(403, "BEHAVIOR_EXECUTOR_DENIED", "one private native capability is required")
+    return SecretStr(values[0])
+
+
+def _assigned_executor(runtime, binding_id, launch_id, principal, *, claim, assistant_claim):
+    if not assistant_claim:
+        return runtime.executor_callback(binding_id, launch_id, principal, claim=claim)
+    from .behavior_assistant import _read_conflicts
+    return _read_conflicts(lambda: runtime.executor_callback(
+        binding_id, launch_id, principal, claim=True), phase="hosted_claim_authority")
+
+
+async def _claim_response(native, binding_id, launch_id, command, principal, *, assistant_claim):
+    options = {"assistant_conflicts": True} if assistant_claim else {}
+    result = await run_in_threadpool(native.claim, binding_id, launch_id, command, principal, **options)
+    response = _response(result.model_dump(mode="json", exclude={"report_token"}))
+    if result.claim_state == "fresh" and result.report_token is not None:
+        response.headers["X-Behavior-Report-Token"] = result.report_token.get_secret_value()
+    return response
+
+
+async def _probe_response(native, method, request, binding_id, launch_id, command, principal):
+    probe_id = request.path_params["probe_id"]
+    _id.validate_python(probe_id, strict=True)
+    operation = native.resolve_probe if method == "resolve" else native.report
+    result = await run_in_threadpool(operation, binding_id, launch_id, probe_id, command, principal)
+    return _response(result)
+
+
+def _add_native_callback(router, runtime, identity, path, body_model, credential_model, header, method):
+    async def endpoint(
+        request: Request, binding_id: str, launch_id: str,
+        principal: BehaviorPrincipal = Depends(identity),
+    ):
+        assistant_claim = (method == "claim" and runtime.mode == "native"
+                           and binding_id in getattr(runtime, "profiles", {}))
+        try:
+            native = _assigned_executor(runtime, binding_id, launch_id, principal,
+                                        claim=method == "claim", assistant_claim=assistant_claim)
+            capability = _private_capability(request, header)
+            body = await _body(request, body_model)
+            field = "launch_permit" if method == "claim" else "report_token"
+            command = credential_model(**body.model_dump(), **{field: capability})
+            if method == "claim":
+                return await _claim_response(native, binding_id, launch_id, command, principal,
+                                             assistant_claim=assistant_claim)
+            return await _probe_response(native, method, request, binding_id, launch_id, command, principal)
+        except Problem as error:
+            if assistant_claim:
+                from .behavior_assistant_api import acquire_http_error
+                raise acquire_http_error(error, "hosted_claim") from None
+            raise
+        except Exception:
+            raise Problem(503, "BEHAVIOR_DEPENDENCY_UNAVAILABLE", "native callback failed") from None
+
+    router.add_api_route(PREFIX + path, endpoint, methods=["POST"], name="assigned-native-" + method)
+
+
+def _add_native_callbacks(router, runtime, identity):
+    _add_native_callback(router, runtime, identity, "/hosted/launches/{launch_id}/claim",
+                         wire.HostedClaimBody, wire.HostedClaimRequest, "x-behavior-launch-permit", "claim")
+    _add_native_callback(router, runtime, identity, "/hosted/launches/{launch_id}/probes/{probe_id}/resolve",
+                         wire.HostedProbeBody, wire.HostedProbeRequest, "x-behavior-report-token", "resolve")
+    _add_native_callback(router, runtime, identity, "/hosted/launches/{launch_id}/probes/{probe_id}/report",
+                         wire.HostedReportBody, wire.HostedReport, "x-behavior-report-token", "report")
+
+
+def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, registered_actor=None) -> APIRouter:
+    if not isinstance(verifier, BehaviorJwtVerifier):
+        raise Problem(503, "BEHAVIOR_CONFIGURATION", "the explicit behavior JWT verifier is required")
+    actors = _served_actors(verifier, registered_actor)
+    _check_bindings(runtime, verifier, actors)
+    _check_native_targets(runtime, actors)
+    router = APIRouter()
+    identity = _principal_dependency(verifier)
+
+    def add(path, model, action, handler, *, method="POST", render=_response):
+        router.add_api_route(PREFIX + path, _endpoint(runtime, identity, model, action, handler, render),
+                             methods=[method], name="behavior-" + path.replace("/", "-") + method)
+
+    _add_source_routes(add, runtime)
+    if runtime.dep.source_backups is not None:
+        _add_backup_routes(add, runtime)
+    _add_claim_routes(add, runtime)
+    _add_operation_routes(add, runtime)
+    _add_work_routes(add, runtime)
+    if runtime.dep.memory_projections:
+        _add_memory_routes(add, runtime)
+    _add_delivery_routes(add, runtime)
     if runtime.dep.native_launches is not None:
-        def private_capability(request, name):
-            values = request.headers.getlist(name)
-            if len(values) != 1 or re.fullmatch(r"[a-f0-9]{64}", values[0]) is None:
-                raise Problem(403, "BEHAVIOR_EXECUTOR_DENIED", "one private native capability is required")
-            return SecretStr(values[0])
-
-        def callback(path, body_model, credential_model, header, method):
-            async def endpoint(
-                request: Request, binding_id: str, launch_id: str,
-                principal: BehaviorPrincipal = Depends(identity),
-            ):
-                assistant_claim = (method == "claim" and runtime.mode == "native"
-                                   and binding_id in getattr(runtime, "profiles", {}))
-                try:
-                    if assistant_claim:
-                        from .behavior_assistant import _read_conflicts
-                        native = _read_conflicts(lambda: runtime.executor_callback(
-                            binding_id, launch_id, principal, claim=True), phase="hosted_claim_authority")
-                    else:
-                        native = runtime.executor_callback(binding_id, launch_id, principal, claim=method == "claim")
-                    capability = private_capability(request, header)
-                    body = await _body(request, body_model)
-                    field = "launch_permit" if method == "claim" else "report_token"
-                    command = credential_model(**body.model_dump(), **{field: capability})
-                    if method == "claim":
-                        options = {"assistant_conflicts": True} if assistant_claim else {}
-                        result = await run_in_threadpool(native.claim, binding_id, launch_id, command, principal, **options)
-                        response = _response(result.model_dump(mode="json", exclude={"report_token"}))
-                        if result.claim_state == "fresh" and result.report_token is not None:
-                            response.headers["X-Behavior-Report-Token"] = result.report_token.get_secret_value()
-                        return response
-                    probe_id = request.path_params["probe_id"]
-                    _id.validate_python(probe_id, strict=True)
-                    operation = native.resolve_probe if method == "resolve" else native.report
-                    result = await run_in_threadpool(operation, binding_id, launch_id, probe_id, command, principal)
-                    return _response(result)
-                except Problem as error:
-                    if assistant_claim:
-                        from .behavior_assistant_api import acquire_http_error
-                        raise acquire_http_error(error, "hosted_claim") from None
-                    raise
-                except Exception:
-                    raise Problem(503, "BEHAVIOR_DEPENDENCY_UNAVAILABLE", "native callback failed") from None
-
-            router.add_api_route(PREFIX + path, endpoint, methods=["POST"], name="assigned-native-" + method)
-
-        callback("/hosted/launches/{launch_id}/claim", wire.HostedClaimBody, wire.HostedClaimRequest,
-                 "x-behavior-launch-permit", "claim")
-        callback("/hosted/launches/{launch_id}/probes/{probe_id}/resolve", wire.HostedProbeBody, wire.HostedProbeRequest,
-                 "x-behavior-report-token", "resolve")
-        callback("/hosted/launches/{launch_id}/probes/{probe_id}/report", wire.HostedReportBody, wire.HostedReport,
-                 "x-behavior-report-token", "report")
+        _add_native_callbacks(router, runtime, identity)
     return router
 
 

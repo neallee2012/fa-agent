@@ -13,6 +13,9 @@ INSTRUCTION_QUOTED_UTF8_LIMIT = 8192
 # not the profile the API sends (v2 from ADR-0009 2d-ii), so existing files and databases keep their value.
 NATIVE_LANE = UNLABELED_STATE_PROFILE
 STATE_PROFILES = (None, NATIVE_LANE, NATIVE_RESPONSES_PROFILE)
+# A conversation another Agent or a routine run (2026-10-23) opened here: its thread is its first RID, read back from
+# this Agent's receipts.
+RECEIVED_PHASE = "agent-received"
 
 
 def lane_of(profile):
@@ -97,7 +100,11 @@ class InstructionStore:
     def current(self, thread_id=None):
         with self.journal.connect() as db:
             if thread_id is None:
-                latest = db.execute("SELECT thread_id FROM instruction_threads ORDER BY rowid DESC LIMIT 1").fetchone()
+                # A conversation another Agent opened is read-only here, so only a page that names it opens it.
+                latest = db.execute("""SELECT t.thread_id FROM instruction_threads t WHERE NOT EXISTS (
+                    SELECT 1 FROM intents x WHERE x.task_id=t.thread_id AND x.phase=?
+                    AND json_extract(x.intent,'$.sender_agent_id') IS NOT NULL)
+                    ORDER BY t.rowid DESC LIMIT 1""", (RECEIVED_PHASE,)).fetchone()
                 require(latest is not None, "LOCAL_FAILURE", 500)
                 thread_id = latest[0]
             row = db.execute("""SELECT i.request_id,i.content,i.created_at,i.thread_id FROM instructions i

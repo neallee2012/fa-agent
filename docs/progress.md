@@ -1,8 +1,49 @@
 # FA 進度與交接狀態
 
-更新日期：2026-10-30。
+更新日期：2026-10-31。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="stage-v38-verify-1031"></a>
+## 2026-10-31：stage 第 38 版冒煙、停止與每日排程讀回
+
+- **結果**：新 API 搭新 Hosted 的真回合通過，停止正常，每日排程跑完並存檔入帳。接著[部署讀回](#stage-v38-1031)補上當時沒驗到的項目。證據是總協調的唯讀讀回，原始輸出不在 repo。fresh 列仍未證實。
+- **冒煙**（05:27～05:41Z，Neal 操作 stage console）：9 個回合，3 個主人發的、6 個 Agent 之間的訊息，都存檔入帳。WebIQ、playwright、Team feed、`send_agent_message` 都沒有失敗，也沒有相容性錯誤。A、B 的回合沒有 `DELIVERY_RECORD_INVALID`。A 05:27:46、B 05:30:38 各有一筆 `NATIVE_INVOCATION_FAILURE`（409 `NATIVE_SESSION_CHANGED`，7.2、7.8 秒），同時記 `NATIVE_VERSION_OBSERVED` v82→89，SID 不變，是版本更新後第一次呼叫的漂移偵測。
+- **回合中停止**（06:00Z，A 的新對話，job `a4402af1d95f`，總協調在 stage console 按）：`api_cancel` 3.3 秒回應，模型請求 06:00:35 中止，06:00:38 記 `NATIVE_TURN_CANCELLED`，用量有回報。畫面顯示「已停止。停止前可能已經做了部分動作。」，輸入框恢復，沒有留下部分文字。沒有 Traceback 或 ERROR。
+- **送出 RTT**（毫秒，nearest-rank，算法同第 36 版；樣本少只供參考）：
+
+  | 指標 | n | p50 | p95 |
+  |---|---|---|---|
+  | `api_submit` | 4 | 1,869 | 3,146 |
+  | `api_submit_session` | 4 | 339 | 677 |
+  | `api_submit_context` | 4 | 87 | 142 |
+  | `api_submit_capture` | 4 | 103 | 123 |
+  | `api_submit_hosted` | 4 | 798 | 953 |
+
+  第 36 版的 `api_submit` 是 p50 2,022、p95 3,570。n=4 的 p95 就是最大值，不能說變快。
+- **每日排程**（10:00Z，A，job `a33a4c9d089a`）：時鐘 `accepted`、`started`、`completed` 都有，10:11:03 完成；`native_executor` 649 秒，存檔 487 ms，用量回報 106 ms。這是這版第一個自動回合。沒有讀回報告內容，也沒有確認通知送達。
+- **發現：A 的 vocus.cc 頁面連續六天沒有開成**。排程每天都呼叫 `playwright-browser_navigate` 開 `vocus.cc/salon/example-salon/room/example-room`。10-26 到 10-31 共 6 次，批准都等 602～604 秒，結果都是 `denied-interactively-by-user`。
+  - 這個結果是 SDK 的標籤。時間對應 stage 的 `FA_NATIVE_HITL_TTL_SECONDS=600`，推斷是批准卡逾時，不是有人按拒絕；卡片紀錄沒有讀。
+  - 這是設計行為：排程回合遇到批准照 600 秒等待，逾時不執行（[connector 交接清單](connector-implementation-handoff.md)）。其他工具不受影響，回合會繼續；今天 A 等完後讀了 Stratechery，10:10:44 才出現第一段文字。
+  - 10-26～29 A 先用 `WebIQ-browse` 讀同一頁，3～4 秒成功回傳，之後仍改用 playwright；10-30、31 直接用 playwright。原因沒有查，推斷是 WebIQ 拿到的內容不夠。
+  - 影響是排程每天多等 10 分鐘。報告內容沒有讀，所以缺不缺這個來源不確定。
+  - [第 36 版紀錄](#stage-v36-1026)推論 10-26 那 10 分鐘是模型呼叫卡住，現在由此取代：10:00:38 開始的就是這次批准等待。
+  - **工作台的「自動允許」規則對這裡沒有用**：排程回合沒有真人訊息時，審查不看規則，一律回 `ask`（`NativeAutoReview`，`human_request_unavailable`）。
+  - 當時的選項：把這個來源從排程拿掉、排程改只用 WebIQ 讀這一頁（10-26～29 讀得到，內容夠不夠沒查），或改程式讓已批准的排程可以適用規則。後者會動到「排程不是永久批准」的界線，要另外設計。
+  - **Neal 2026-11-01 決定先停下排程**：10:02（台灣時間）在 stage 工作台停用，讀回是 `enabled=false`。A 只有這一個排程，所以 Stratechery 也一起停了。要再用得在對話裡重新提出並批准。停用後的 18:00 有沒有真的不跑，寫這段時還沒到點。
+
+<a id="stage-v38-1031"></a>
+## 2026-10-31：stage 第 38 版部署後驗證
+
+- **範圍**：release PR #1091（`2026.10.31-38`），Neal 04:55:56Z 合併，merge commit `6d45af1c`。內容是第三到第七輪程式整理，dev 基準見[第七輪收尾](#r7-close-1031)。證據是總協調的唯讀讀回，原始輸出不在 repo。
+- **部署**：deploy-staging run `41170535631` 成功，deploy job 13 分 7 秒（04:57:09～05:10:16Z）。`release-gate` 與 guard 通過，後者含 #1066 的新比對，這是第一次在 stage 跑。閘門 `armed=True, override=False; decision: pass (0 refusals)`。`DEPLOY_COMPAT_GATE`：A、B、第五位 `fa-agent-f167…` 為 `foundry-native-v2`、`compatible`；`unclaimed` 是 C、D；`refused`、`unserved_rows`、`vetoed_versions` 都是空的。
+- **讀回**：
+  - API 唯一 active revision `…6d45af1-r126-1`，Healthy、100%；GUARD="1"、IDLE="0"、RECONCILER="0"。
+  - 開機：05:07:24 `Started server process` → 05:07:28 `Uvicorn running`，3.7 秒；「Update stage API」從 05:06:51 到 `ready` 05:07:39，48 秒。r126 這 7 行 log 沒有 Traceback、ERROR，也沒有 `BEHAVIOR_INVENTORY_READ`。
+  - follow 後 A、B、C、D 都是版本 89，第五位版本 37，全部 `state=ok`、`route=ok`，`build` 都是 `4e5a6f35…`；3 個 job 沒有 Traceback。
+- **fresh 前提**：部署前最大的風險沒有發生，新 API 順利開機。依程式，開機有兩條路：有 fresh 列就完整驗證，沒有 fresh 列就核對安裝列；兩條路都拒絕舊指標。所以開機排除的是「安裝不符」與「舊指標」，**不能證明 fresh 列一定在**。這次沒有跑讀 Table 的 job，分不出走的是哪一條。`standing-target` 列也沒有完全排除：有 work policy 時，開機會讀域級與根 policy 那位 Agent 的 key；其他 Agent 的 key 到各自建 peer 才讀，留到第一個回合。
+- **public-sync**：run `41171512214` 成功。第二道 `gate2_check.py` 的 [A]、[B]、[C] 通過，verify 的 [0]～[4] 通過。公開 tag `v2026.10.31-38`，commit `f50ab72a`，tree `90659c7f…`；用 GitHub API 另外讀回 tree，與 #1091 本文的指紋相同。Release 已發佈。`CURRENT-STATE` 原本的「公開仍是 v36」是舊資訊：10-31 唯讀 clone 公開 tag `v2026.10.28-37`，tree 等於第 37 版 PR 的指紋。
+- **沒有驗證到的**：讀回時（約 05:15Z）r126 的 log 只有開機 7 行，還沒有任何回合。所以這版還沒有 send RTT p50／p95，也還沒驗 A、B 冒煙、回合中停止、工具呼叫（WebIQ）、stage console，以及新 API 搭新 Hosted 的真回合。A 每日排程（10:00Z）是第一個自動回合，要讀回。
 
 <a id="r7-close-1031"></a>
 ## 2026-10-31：品質整理第七輪完成，dev 再驗一次

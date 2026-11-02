@@ -33,7 +33,7 @@ import sysconfig
 import ssl
 import re
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from threading import RLock
 from typing import Annotated, Literal
@@ -757,18 +757,16 @@ class HostedRuntime:
         raise Problem(403, "HOSTED_KEEPALIVE_UNAVAILABLE", "this workload has no read-only keepalive")
 
 
-def create_host(runtime: HostedRuntime, *, native_runtime=None, responses_handler_factory=None):
-    """Build the real SDK host; no legacy Hosted/M2/M3 registration is altered."""
-    from azure.ai.agentserver.invocations import InvocationAgentServerHost
-    from starlette.responses import JSONResponse
-    from .behavior_foundry_probe import NativeStateProbe, PROBE_HEADER, probe_response
-    from .behavior_native_turn_wire import NATIVE_TURN_HEADER
-
+def _native_runtime_for(runtime, native_runtime):
     if native_runtime is None and os.environ.get("FA_NATIVE_TURNS"):
         from .native_sdk import native_runtime_from_environment
         native_runtime = native_runtime_from_environment(runtime)
     if native_runtime is not None and native_runtime.identity != runtime.identity:
         raise Problem(403, "NATIVE_STATE_SCOPE", "native turns must use this Hosted process identity")
+    return native_runtime
+
+
+def _responses_enabled():
     responses_flag = os.environ.get("FA_RESPONSES_ENABLED", "")
     if responses_flag not in {"", "0", "1"}:
         raise Problem(422, "RESPONSES_FLAG_INVALID", "FA_RESPONSES_ENABLED must be 0 or 1")
@@ -777,142 +775,174 @@ def create_host(runtime: HostedRuntime, *, native_runtime=None, responses_handle
         os.environ.get("FA_N6_RESPONSES_PROBE") or os.environ.get("FA_N6_RESPONSES_INTERRUPT_SESSION_ID")
     ):
         raise Problem(422, "N6_PROBE_DISABLED", "the test probe also requires explicit Responses enablement")
-    probe = NativeStateProbe.from_environment(runtime.identity)
-    if probe is not None or native_runtime is not None:
-        from azure.ai.agentserver.core.tasks import set_resilient_tasks_enabled
+    return responses_enabled
 
-        set_resilient_tasks_enabled(True)
-    responses_probe = None
-    if responses_enabled:
-        from azure.ai.agentserver.responses import ResponsesAgentServerHost, ResponsesServerOptions
-        from .responses_probe import N6ResponsesProbe, ProbeRequestFieldsMiddleware, ProbeSessionOnlyMiddleware
 
-        class FaHost(InvocationAgentServerHost, ResponsesAgentServerHost):
-            pass
+def _responses_state_root(runtime):
+    try:
+        owned_root = runtime.supervisor.journal.root
+        if not owned_root.is_absolute():
+            raise ValueError()
+    except (AttributeError, ValueError):
+        raise Problem(503, "RESPONSES_STATE_ROOT_UNAVAILABLE", "the original Hosted private root is required") from None
+    state_root = owned_root / "agentserver"
+    guard(owned_root, state_root)
+    state_root.mkdir(mode=0o700, exist_ok=True)
+    return state_root
 
-        responses_probe = N6ResponsesProbe.from_environment(runtime.identity)
-        if responses_probe is not None and responses_handler_factory is not None:
-            raise Problem(422, "RESPONSES_HANDLER_CONFLICT", "test and production handlers cannot share this lane")
-        if responses_probe is None and responses_handler_factory is None:
-            raise Problem(503, "RESPONSES_HANDLER_UNAVAILABLE", "the production Responses handler is not installed")
-        if responses_probe is not None and responses_probe.interrupt_session and native_runtime is not None:
-            raise Problem(403, "N6_PROBE_SESSION_BUSY", "the interrupt session cannot also run native turns")
+
+def _check_responses_lane(responses_probe, responses_handler_factory, native_runtime):
+    if responses_probe is not None and responses_handler_factory is not None:
+        raise Problem(422, "RESPONSES_HANDLER_CONFLICT", "test and production handlers cannot share this lane")
+    if responses_probe is None and responses_handler_factory is None:
+        raise Problem(503, "RESPONSES_HANDLER_UNAVAILABLE", "the production Responses handler is not installed")
+    if responses_probe is not None and responses_probe.interrupt_session and native_runtime is not None:
+        raise Problem(403, "N6_PROBE_SESSION_BUSY", "the interrupt session cannot also run native turns")
+
+
+def _responses_host(runtime, native_runtime, responses_handler_factory):
+    from azure.ai.agentserver.invocations import InvocationAgentServerHost
+    from azure.ai.agentserver.responses import ResponsesAgentServerHost, ResponsesServerOptions
+    from .responses_probe import N6ResponsesProbe, ProbeRequestFieldsMiddleware, ProbeSessionOnlyMiddleware
+
+    class FaHost(InvocationAgentServerHost, ResponsesAgentServerHost):
+        pass
+
+    responses_probe = N6ResponsesProbe.from_environment(runtime.identity)
+    _check_responses_lane(responses_probe, responses_handler_factory, native_runtime)
+    state_root = _responses_state_root(runtime)
+    # The Responses constructor configures file-backed replay before the SDK lifespan starts.
+    os.environ["AGENTSERVER_STATE_ROOT"] = str(state_root)
+    app = FaHost(
+        # Official SSE keep-alive comments keep a replayed preview open while the model reasons (RTT B).
+        options=ResponsesServerOptions(resilient_background=True, steerable_conversations=False,
+                                       sse_keep_alive_interval_seconds=15),
+        configure_observability=None, access_log=None,
+    )
+    handler = (responses_probe.handler if responses_probe is not None
+               else responses_handler_factory(runtime, native_runtime))
+    app.response_handler(handler)
+    if responses_probe is not None:
+        app.add_middleware(ProbeRequestFieldsMiddleware)
+    if responses_probe is not None and responses_probe.interrupt_session:
+        app.add_middleware(ProbeSessionOnlyMiddleware)
+    return app, responses_probe
+
+
+def _native_lifespan(native_runtime, sdk_lifespan):
+    @asynccontextmanager
+    async def native_lifespan(application):
+        await native_runtime.initialize()
         try:
-            owned_root = runtime.supervisor.journal.root
-            if not owned_root.is_absolute():
-                raise ValueError()
-        except (AttributeError, ValueError):
-            raise Problem(503, "RESPONSES_STATE_ROOT_UNAVAILABLE", "the original Hosted private root is required") from None
-        state_root = owned_root / "agentserver"
-        guard(owned_root, state_root)
-        state_root.mkdir(mode=0o700, exist_ok=True)
-        # The Responses constructor configures file-backed replay before the SDK lifespan starts.
-        os.environ["AGENTSERVER_STATE_ROOT"] = str(state_root)
-        app = FaHost(
-            # Official SSE keep-alive comments keep a replayed preview open while the model reasons (RTT B).
-            options=ResponsesServerOptions(resilient_background=True, steerable_conversations=False,
-                                           sse_keep_alive_interval_seconds=15),
-            configure_observability=None, access_log=None,
-        )
-        handler = (responses_probe.handler if responses_probe is not None
-                   else responses_handler_factory(runtime, native_runtime))
-        app.response_handler(handler)
-        if responses_probe is not None:
-            app.add_middleware(ProbeRequestFieldsMiddleware)
-        if responses_probe is not None and responses_probe.interrupt_session:
-            app.add_middleware(ProbeSessionOnlyMiddleware)
-    else:
-        app = InvocationAgentServerHost(configure_observability=None, access_log=None)
-    if native_runtime is not None:
-        from contextlib import asynccontextmanager
+            async with sdk_lifespan(application):
+                await native_runtime.recover_owned()
+                yield
+        finally:
+            # Background open-RID removals (``NativeTurnRuntime._cas``) get a short bound; any cut stays stale.
+            close_runtime = getattr(native_runtime, "aclose", None)
 
-        sdk_lifespan = app.router.lifespan_context
-
-        @asynccontextmanager
-        async def native_lifespan(application):
-            await native_runtime.initialize()
-            try:
-                async with sdk_lifespan(application):
-                    await native_runtime.recover_owned()
-                    yield
-            finally:
-                # Background open-RID removals (``NativeTurnRuntime._cas``) get a short bound; any cut stays stale.
-                close_runtime = getattr(native_runtime, "aclose", None)
-
-                async def drain_removals():
-                    if close_runtime is not None:
-                        try:
-                            await close_runtime()
-                        except Exception:
-                            logging.getLogger(__name__).warning("NATIVE_RUNTIME_SHUTDOWN_UNCONFIRMED")
-
-                await drain_removals()
-                # ADR-0005: kept SDKs stop with the VM, best effort; their checkpoints are already published.
-                close = getattr(getattr(native_runtime, "executor", None), "aclose", None)
-                if close is not None:
+            async def drain_removals():
+                if close_runtime is not None:
                     try:
-                        await close()
+                        await close_runtime()
                     except Exception:
-                        logging.getLogger(__name__).warning("RESIDENT_SDK_SHUTDOWN_UNCONFIRMED")
-                    # A turn the executor stopped writes its terminal receipt and starts a removal; drain once more.
-                    await drain_removals()
+                        logging.getLogger(__name__).warning("NATIVE_RUNTIME_SHUTDOWN_UNCONFIRMED")
 
-        app.router.lifespan_context = native_lifespan
+            await drain_removals()
+            # ADR-0005: kept SDKs stop with the VM, best effort; their checkpoints are already published.
+            close = getattr(getattr(native_runtime, "executor", None), "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:
+                    logging.getLogger(__name__).warning("RESIDENT_SDK_SHUTDOWN_UNCONFIRMED")
+                # A turn the executor stopped writes its terminal receipt and starts a removal; drain once more.
+                await drain_removals()
 
-    async def bounded_body(request):
-        raw = bytearray()
-        async for chunk in request.stream():
-            if len(raw) + len(chunk) > 4096:
-                raise Problem(413, "HOSTED_INVOCATION_LIMIT", "native launch body exceeds its bound")
-            raw.extend(chunk)
-        try:
-            def unique(pairs):
-                result = dict(pairs)
-                if len(result) != len(pairs):
-                    raise ValueError("duplicate fields")
-                return result
+    return native_lifespan
 
-            json.loads(raw, object_pairs_hook=unique)
-            body = HostedInvocationBody.model_validate_json(raw)
-            values = request.headers.getlist(wire.NATIVE_LAUNCH_PERMIT_HEADER)
-            if len(values) != 1 or re.fullmatch(r"[a-f0-9]{64}", values[0]) is None:
-                raise Problem(403, "HOSTED_CAPABILITY_INVALID", "one private native launch capability is required")
-            return HostedInvocation(**body.model_dump(), launch_permit=SecretStr(values[0]))
-        except (ValueError, TypeError):
-            raise Problem(422, "HOSTED_INVOCATION_INVALID", "only a typed native launch selector/permit is accepted") from None
 
-    async def respond(request, action):
-        try:
-            if action == "start":
-                payload = await bounded_body(request)
-                result = await asyncio.to_thread(
-                    runtime.start, payload, request.state.invocation_id, request.state.session_id,
-                )
-                return JSONResponse(result, status_code=202)
-            keepalive = request.headers.getlist(wire.NATIVE_KEEPALIVE_HEADER)
-            if keepalive:
-                if (action != "observe" or len(keepalive) != 1 or request.headers.getlist(wire.NATIVE_PROBE_HEADER)
-                        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", keepalive[0]) is None):
-                    raise Problem(403, "HOSTED_KEEPALIVE_INVALID", "only the original read-only invocation may be kept alive")
-                async for chunk in request.stream():
-                    if chunk:
-                        raise Problem(403, "HOSTED_KEEPALIVE_INVALID", "keepalive accepts no body")
-                result = await asyncio.to_thread(
-                    runtime.keepalive, request.state.invocation_id, request.state.session_id, keepalive[0])
-                return JSONResponse(result.model_dump(mode="json"))
-            probes = request.headers.getlist(wire.NATIVE_PROBE_HEADER)
-            if len(probes) != 1 or re.fullmatch(r"[a-f0-9]{64}", probes[0]) is None:
-                raise Problem(403, "HOSTED_PROBE_INVALID", "a fresh controller probe is required")
-            probe_id = probes[0]
+async def _bounded_body(request):
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > 4096:
+            raise Problem(413, "HOSTED_INVOCATION_LIMIT", "native launch body exceeds its bound")
+        raw.extend(chunk)
+    try:
+        def unique(pairs):
+            result = dict(pairs)
+            if len(result) != len(pairs):
+                raise ValueError("duplicate fields")
+            return result
+
+        json.loads(raw, object_pairs_hook=unique)
+        body = HostedInvocationBody.model_validate_json(raw)
+        values = request.headers.getlist(wire.NATIVE_LAUNCH_PERMIT_HEADER)
+        if len(values) != 1 or re.fullmatch(r"[a-f0-9]{64}", values[0]) is None:
+            raise Problem(403, "HOSTED_CAPABILITY_INVALID", "one private native launch capability is required")
+        return HostedInvocation(**body.model_dump(), launch_permit=SecretStr(values[0]))
+    except (ValueError, TypeError):
+        raise Problem(422, "HOSTED_INVOCATION_INVALID", "only a typed native launch selector/permit is accepted") from None
+
+
+async def _keepalive(runtime, request, action, keepalive):
+    if (action != "observe" or len(keepalive) != 1 or request.headers.getlist(wire.NATIVE_PROBE_HEADER)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", keepalive[0]) is None):
+        raise Problem(403, "HOSTED_KEEPALIVE_INVALID", "only the original read-only invocation may be kept alive")
+    async for chunk in request.stream():
+        if chunk:
+            raise Problem(403, "HOSTED_KEEPALIVE_INVALID", "keepalive accepts no body")
+    return await asyncio.to_thread(
+        runtime.keepalive, request.state.invocation_id, request.state.session_id, keepalive[0])
+
+
+async def _observe(runtime, request, action):
+    probes = request.headers.getlist(wire.NATIVE_PROBE_HEADER)
+    if len(probes) != 1 or re.fullmatch(r"[a-f0-9]{64}", probes[0]) is None:
+        raise Problem(403, "HOSTED_PROBE_INVALID", "a fresh controller probe is required")
+    probe_id = probes[0]
+    return await asyncio.to_thread(
+        runtime.observe, request.state.invocation_id, request.state.session_id, probe_id,
+        cancellation=action == "cancel",
+    )
+
+
+async def _respond(runtime, request, action):
+    from starlette.responses import JSONResponse
+
+    try:
+        if action == "start":
+            payload = await _bounded_body(request)
             result = await asyncio.to_thread(
-                runtime.observe, request.state.invocation_id, request.state.session_id, probe_id,
-                cancellation=action == "cancel",
+                runtime.start, payload, request.state.invocation_id, request.state.session_id,
             )
-            return JSONResponse(result.model_dump(mode="json"))
-        except Problem as exc:
-            return JSONResponse(exc.body, status_code=exc.status)
-        except (OSError, sqlite3.Error, ValueError):
-            return JSONResponse({"error": {"code": "HOSTED_EXECUTOR_UNKNOWN", "message": "executor outcome remains unknown"}}, status_code=503)
+            return JSONResponse(result, status_code=202)
+        keepalive = request.headers.getlist(wire.NATIVE_KEEPALIVE_HEADER)
+        if keepalive:
+            result = await _keepalive(runtime, request, action, keepalive)
+        else:
+            result = await _observe(runtime, request, action)
+        return JSONResponse(result.model_dump(mode="json"))
+    except Problem as exc:
+        return JSONResponse(exc.body, status_code=exc.status)
+    except (OSError, sqlite3.Error, ValueError):
+        return JSONResponse({"error": {"code": "HOSTED_EXECUTOR_UNKNOWN", "message": "executor outcome remains unknown"}}, status_code=503)
+
+
+def _log_dispatch(runtime, request, native_headers, state_probes):
+    from .behavior_http_diagnostics import native_correlation_id
+    logging.getLogger(__name__).warning("FA_HOSTED_DISPATCH %s", json.dumps({
+        "lane": "probe" if state_probes else "native" if native_headers else "legacy",
+        "native_header_count": len(native_headers),
+        "agent_id": runtime.identity.agent_id, "session_id": runtime.identity.session_id,
+        "invocation_id": native_correlation_id(getattr(request.state, "invocation_id", None)),
+    }, sort_keys=True))
+
+
+def _install_invocation_handlers(app, runtime, native_runtime, probe, responses_probe):
+    from starlette.responses import JSONResponse
+    from .behavior_foundry_probe import PROBE_HEADER, probe_response
+    from .behavior_native_turn_wire import NATIVE_TURN_HEADER
 
     @app.invoke_handler
     async def invoke(request):
@@ -922,39 +952,54 @@ def create_host(runtime: HostedRuntime, *, native_runtime=None, responses_handle
         if responses_probe is not None and responses_probe.interrupt_session:
             return JSONResponse({"error": {"code": "N6_PROBE_SESSION_ONLY"}}, status_code=403)
         native_headers = request.headers.getlist(NATIVE_TURN_HEADER)
+        state_probes = request.headers.getlist(PROBE_HEADER)
         if native_runtime is not None or native_headers:
-            from .behavior_http_diagnostics import native_correlation_id
-            logging.getLogger(__name__).warning("FA_HOSTED_DISPATCH %s", json.dumps({
-                "lane": "probe" if request.headers.getlist(PROBE_HEADER) else "native" if native_headers else "legacy",
-                "native_header_count": len(native_headers),
-                "agent_id": runtime.identity.agent_id, "session_id": runtime.identity.session_id,
-                "invocation_id": native_correlation_id(getattr(request.state, "invocation_id", None)),
-            }, sort_keys=True))
-        if request.headers.getlist(PROBE_HEADER):
+            _log_dispatch(runtime, request, native_headers, state_probes)
+        if state_probes:
             return await probe_response(request, probe)
-        if request.headers.getlist(NATIVE_TURN_HEADER):
+        if native_headers:
             from .native_turns import native_response
             return await native_response(request, native_runtime)
-        return await respond(request, "start")
+        return await _respond(runtime, request, "start")
+
+    async def existing_invocation(request, action):
+        if responses_probe is not None and responses_probe.interrupt_session:
+            return JSONResponse({"error": {"code": "N6_PROBE_SESSION_ONLY"}}, status_code=403)
+        if request.headers.getlist(NATIVE_TURN_HEADER):
+            from .native_turns import native_response
+            return await native_response(request, native_runtime, action=action)
+        return await _respond(runtime, request, action)
 
     @app.get_invocation_handler
     async def observe(request):
-        if responses_probe is not None and responses_probe.interrupt_session:
-            return JSONResponse({"error": {"code": "N6_PROBE_SESSION_ONLY"}}, status_code=403)
-        if request.headers.getlist(NATIVE_TURN_HEADER):
-            from .native_turns import native_response
-            return await native_response(request, native_runtime, action="observe")
-        return await respond(request, "observe")
+        return await existing_invocation(request, "observe")
 
     @app.cancel_invocation_handler
     async def cancel(request):
-        if responses_probe is not None and responses_probe.interrupt_session:
-            return JSONResponse({"error": {"code": "N6_PROBE_SESSION_ONLY"}}, status_code=403)
-        if request.headers.getlist(NATIVE_TURN_HEADER):
-            from .native_turns import native_response
-            return await native_response(request, native_runtime, action="cancel")
-        return await respond(request, "cancel")
+        return await existing_invocation(request, "cancel")
 
+
+def create_host(runtime: HostedRuntime, *, native_runtime=None, responses_handler_factory=None):
+    """Build the real SDK host; no legacy Hosted/M2/M3 registration is altered."""
+    from azure.ai.agentserver.invocations import InvocationAgentServerHost
+    from . import behavior_native_turn_wire  # noqa: F401  # a broken import still fails before any startup write
+    from .behavior_foundry_probe import NativeStateProbe
+
+    native_runtime = _native_runtime_for(runtime, native_runtime)
+    responses_enabled = _responses_enabled()
+    probe = NativeStateProbe.from_environment(runtime.identity)
+    if probe is not None or native_runtime is not None:
+        from azure.ai.agentserver.core.tasks import set_resilient_tasks_enabled
+
+        set_resilient_tasks_enabled(True)
+    responses_probe = None
+    if responses_enabled:
+        app, responses_probe = _responses_host(runtime, native_runtime, responses_handler_factory)
+    else:
+        app = InvocationAgentServerHost(configure_observability=None, access_log=None)
+    if native_runtime is not None:
+        app.router.lifespan_context = _native_lifespan(native_runtime, app.router.lifespan_context)
+    _install_invocation_handlers(app, runtime, native_runtime, probe, responses_probe)
     return app
 
 

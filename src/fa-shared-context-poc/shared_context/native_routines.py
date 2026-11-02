@@ -276,14 +276,7 @@ class NativeRoutineService:
                 raise Problem(409, "NATIVE_ROUTINE_INVALID", "the occurrence differs from its original key")
         return value
 
-    @staticmethod
-    def _original(client, rid):
-        try:
-            return NativeTurnGateway._invoke(client, NativeRead(request_id=rid))[0]
-        except Problem as error:
-            if error.status == 404 and error.body["error"]["code"] == "NATIVE_RID_MISSING":
-                return None
-            raise
+    _original = staticmethod(NativeAgentRelayGateway._original)
 
     @staticmethod
     def _dispatch(receipt):

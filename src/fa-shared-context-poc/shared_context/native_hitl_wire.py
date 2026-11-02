@@ -91,6 +91,20 @@ def _wait_field():
     return Field(default="background", exclude_if=lambda value: value == "background")
 
 
+def _wait_window(not_utc, no_window):
+    """The ``created_at``/``expires_at`` rule of a saved wait, with that wait's own refusal texts."""
+
+    @model_validator(mode="after")
+    def window(self):
+        for value in (self.created_at, self.expires_at):
+            if value.tzinfo is None or value.utcoffset() != timedelta(0):
+                raise ValueError(not_utc)
+        if self.expires_at <= self.created_at:
+            raise ValueError(no_window)
+        return self
+    return window
+
+
 def hitl_settings(environ=None):
     """(enabled, background wait seconds, interactive wait seconds); the interactive bound is cleanup, never shown."""
     environ = os.environ if environ is None else environ
@@ -299,14 +313,7 @@ class NativeHitlPending(WireModel):
     created_at: datetime
     expires_at: datetime
 
-    @model_validator(mode="after")
-    def window(self):
-        for value in (self.created_at, self.expires_at):
-            if value.tzinfo is None or value.utcoffset() != timedelta(0):
-                raise ValueError("pending timestamps must be explicit UTC")
-        if self.expires_at <= self.created_at:
-            raise ValueError("the pending call needs a positive wait window")
-        return self
+    window = _wait_window("pending timestamps must be explicit UTC", "the pending call needs a positive wait window")
 
     @property
     def sha256(self) -> str:
@@ -510,14 +517,7 @@ class NativeHitlQuestionPending(WireModel):
     created_at: datetime
     expires_at: datetime
 
-    @model_validator(mode="after")
-    def window(self):
-        for value in (self.created_at, self.expires_at):
-            if value.tzinfo is None or value.utcoffset() != timedelta(0):
-                raise ValueError("question timestamps must be explicit UTC")
-        if self.expires_at <= self.created_at:
-            raise ValueError("the question needs a positive wait window")
-        return self
+    window = _wait_window("question timestamps must be explicit UTC", "the question needs a positive wait window")
 
     @property
     def sha256(self) -> str:
@@ -650,14 +650,7 @@ class ConnectorConsentPending(WireModel):
     created_at: datetime
     expires_at: datetime
 
-    @model_validator(mode="after")
-    def window(self):
-        for value in (self.created_at, self.expires_at):
-            if value.tzinfo is None or value.utcoffset() != timedelta(0):
-                raise ValueError("consent timestamps must be explicit UTC")
-        if self.expires_at <= self.created_at:
-            raise ValueError("the consent needs a positive wait window")
-        return self
+    window = _wait_window("consent timestamps must be explicit UTC", "the consent needs a positive wait window")
 
     @property
     def sha256(self) -> str:

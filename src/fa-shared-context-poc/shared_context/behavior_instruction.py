@@ -1,4 +1,5 @@
 """Work indexes and original SDK archives; the SDK remains the conversation authority."""
+from dataclasses import dataclass
 from typing import Annotated, Literal
 from datetime import datetime
 import hashlib
@@ -241,126 +242,222 @@ def archive_conversation(control,principal,identifier,command):
     return control.store.transact(request,decide)
 
 
-def save_reply(authority, session, command):
-    from .behavior_assistant import _Session, _write, key, _ledger_conflicts
+@dataclass(frozen=True)
+class _ReplySave:
+    """What save_reply settled before its transaction; a retried decide reads the same values."""
+    authority: object
+    runtime: object
+    session: object
+    command: object
+    task: object
+    binding: object
+    final_progress: object
+    packed: SavedReply | None
+    session_key: str
+    conversation_key: str
+    archive_key: str
+    result_key: str
+    reply_key: str
+    progress_key: str
+    checkpoint_key: str | None
+    request: ControlRequest
+
+
+def _require_saved_state(authority, session, task, archive):
     from .behavior_assistant_checkpoint import unpack
-    task = session.assignment.task.instruction
-    if task is None or command.request_id != "save-text-reply":
-        raise Problem(403, "INSTRUCTION_RESULT_DENIED", "original free instruction reply required")
-    if isinstance(command.archive,aw.SdkArchive):
+    if isinstance(archive,aw.SdkArchive):
         if task.model_provider is not None:
             raise Problem(409, "SDK_STATE_UNSUPPORTED_FORMAT", "Responses requires its provider-bound checkpoint codec")
-        unpack(command.archive)
-    if isinstance(command.archive,aw.StoredSdkArchive):
+        unpack(archive)
+    if isinstance(archive,aw.StoredSdkArchive):
         from .behavior_sdk_checkpoint import load_state
-        load_state(authority, session, command.archive, job_id=session.execution.job_id)
-    reply, archive = command.reply, command.archive
+        load_state(authority, session, archive, job_id=session.execution.job_id)
+
+
+def _agent_turn(authority, session, task):
     control = authority.runtime.work_policy
     registration = None if control is None else control.records.get(session.binding_id)
-    agent_turn = task.peer_work is not None or registration is not None and registration.agent_origin is not None
-    if (reply is None and command.failure is None
-            or command.failure == "model_call_limit_reached" and (reply is not None or not agent_turn)
-            or reply is not None and (reply.conversation_id != task.conversation_id or reply.turn_number != task.turn_number
-                                      or reply.sdk_session_id != session.assignment.sdk_session_id)
+    return task.peer_work is not None or registration is not None and registration.agent_origin is not None
+
+
+def _outcome_invalid(command, agent_turn):
+    reply = command.reply
+    return (reply is None and command.failure is None
+            or command.failure == "model_call_limit_reached" and (reply is not None or not agent_turn))
+
+
+def _sdk_binding_differs(session, task, command):
+    reply, archive = command.reply, command.archive
+    return (reply is not None and (reply.conversation_id != task.conversation_id or reply.turn_number != task.turn_number
+                                   or reply.sdk_session_id != session.assignment.sdk_session_id)
             or isinstance(archive,(aw.SdkArchive,aw.StoredSdkArchive)) and archive.sdk_session_id != session.assignment.sdk_session_id
-            or not command.sdk_stop.graceful
-            or command.sdk_stop.release is not None and command.sdk_stop.release != task.worker_profile):
-        raise Problem(403, "INSTRUCTION_RESULT_DENIED", "reply/archive must bind the original stopped SDK session")
-    runtime, store = authority.runtime, authority.store
+            or command.sdk_stop.release is not None and command.sdk_stop.release != task.worker_profile)
+
+
+def _packed_reply(reply, job_id):
+    if reply is None:
+        return None
+    raw=reply.model_dump_json().encode("utf-8")
+    compressed=zlib.compress(raw)
+    if len(raw)>4*1024*1024 or len(compressed)>32768:
+        raise Problem(413,"INSTRUCTION_REPLY_STORAGE_LIMIT","complete reply exceeds the protected Table envelope; nothing is truncated")
+    return SavedReply(job_id=job_id,data=compressed,sha256=hashlib.sha256(raw).hexdigest(),byte_length=len(raw))
+
+
+def _plan_reply_save(authority, runtime, session, command, task):
+    from .behavior_assistant import key
+    from .behavior_instruction_progress import progress_record
+    from .behavior_sdk_checkpoint import checkpoint_key
     binding = authority._binding(session)
     sid = session.assignment.session_id
     ckey, akey, rkey = conversation_key(task.conversation_id), key("text-archive", binding.job_id), key("result", binding.work.work_id)
     reply_key=key("reply",binding.job_id)
     operation_key=control_key("operation",binding.operation_id)
-    from .behavior_instruction_progress import progress_record,ProgressRecord
     final_progress=None if command.progress is None else progress_record(session,command.progress)
     pkey=key("progress",sid)
-    from .behavior_sdk_checkpoint import checkpoint_key,SdkStateUpload
-    checkpoint_reads=() if not isinstance(archive,aw.StoredSdkArchive) else (checkpoint_key(binding.job_id),)
+    checkpoint=None if not isinstance(command.archive,aw.StoredSdkArchive) else checkpoint_key(binding.job_id)
     draft_reads = () if task.sop_copy is None and not skill_draft_enabled(task.prompt_profile, task.capabilities) else (
         key("artifact", binding.work.work_id),)
-    reads = tuple(dict.fromkeys((*authority._keys(session), ckey, akey, rkey,reply_key,operation_key,*checkpoint_reads,
+    reads = tuple(dict.fromkeys((*authority._keys(session), ckey, akey, rkey,reply_key,operation_key,
+                                *(() if checkpoint is None else (checkpoint,)),
                                 *draft_reads,*((pkey,) if final_progress is not None else ()))))
     request = ControlRequest(request_id=key("text-reply", sid), request_digest=digest(command.model_dump(mode="json")), read_set=reads)
-    packed=None
-    if reply is not None:
-        raw=reply.model_dump_json().encode("utf-8")
-        compressed=zlib.compress(raw)
-        if len(raw)>4*1024*1024 or len(compressed)>32768:
-            raise Problem(413,"INSTRUCTION_REPLY_STORAGE_LIMIT","complete reply exceeds the protected Table envelope; nothing is truncated")
-        packed=SavedReply(job_id=binding.job_id,data=compressed,sha256=hashlib.sha256(raw).hexdigest(),byte_length=len(raw))
+    return _ReplySave(authority=authority, runtime=runtime, session=session, command=command, task=task, binding=binding,
+                      final_progress=final_progress, packed=_packed_reply(command.reply, binding.job_id),
+                      session_key=key("session", sid), conversation_key=ckey, archive_key=akey, result_key=rkey,
+                      reply_key=reply_key, progress_key=pkey, checkpoint_key=checkpoint, request=request)
+
+
+def _read_turn_state(save, rows):
+    if save.session.vm_turn_ticket_id is not None:
+        from .behavior_vm_session import vm_session_state
+        return vm_session_state(save.authority,save.session,rows,executing=False)
+    return save.runtime._state(save.binding,rows,use="read")
+
+
+def _require_turn_state(save, rows, job):
+    if save.task.sop_copy is not None:
+        _read_turn_state(save, rows)
+    if save.command.failure is None and not job.cancel_requested:save.authority._gate(save.session,rows)
+    else:_read_turn_state(save, rows)
+
+
+def _execution_changed(save, job, current):
+    execution = save.session.execution
+    return (job.binding != execution or job.owner != execution.owner
+            or save.command.failure=="cancelled" and not job.cancel_requested
+            or job.state not in {"starting", "running", "capacity_uncertain"}
+            or current.state not in {"running","waiting"} or current.execution != execution)
+
+
+def _conversation_moved(save, conversation):
+    job_id = save.binding.job_id
+    return (conversation.active_job_id != job_id or conversation.jobs[-1] != job_id
+            or conversation.sdk_session_id != save.session.assignment.sdk_session_id
+            or len(conversation.jobs) != save.task.turn_number)
+
+
+def _final_progress_writes(save, rows):
+    from .behavior_assistant import _write
+    from .behavior_instruction_progress import ProgressRecord
+    final_progress, pkey = save.final_progress, save.progress_key
+    if final_progress is None:
+        return ()
+    previous=rows[pkey]
+    if previous is not None:
+        old=_parse(previous.payload["data"],ProgressRecord)
+        if old.progress.events[-1].seq>final_progress.progress.events[-1].seq:
+            raise Problem(409,"INSTRUCTION_PROGRESS_INVALID","final progress cannot replace newer events")
+    return (_write(pkey,final_progress,"create" if previous is None else "replace"),)
+
+
+def _saved_side_work(save, rows, failure):
+    task = save.task
+    copied, drafted = (None, None), (None, None)
+    if task.sop_copy is not None:
+        from .behavior_skill_copy_source import saved_copy
+        copied = saved_copy(save.session, rows, allow_unresolved=failure is not None)
+    if skill_draft_enabled(task.prompt_profile, task.capabilities):
+        from .behavior_skill_draft_source import saved_draft
+        drafted = saved_draft(save.session, rows, allow_unresolved=failure is not None)
+    return copied, drafted
+
+
+def _turn_archive(save, current, copied, drafted):
+    task, command = save.task, save.command
+    copy_receipt, copy_outcome = copied
+    skill_draft_receipt, skill_draft_outcome = drafted
+    return TurnArchive(conversation_id=task.conversation_id, job_id=save.binding.job_id,
+                       turn_number=task.turn_number, archive=command.archive, sdk_stop=command.sdk_stop,
+                       context_read=current.context_read,failure=command.failure,progress=command.progress,
+                       prompt_assembly=assemble_prompt(task.prompt_profile).record,
+                       capability_assembly=capability_record(task.prompt_profile, task.capabilities),
+                       skill_catalog=current.skill_catalog, user_turn_sources=current.user_turn_sources,
+                       work_memory_source=current.work_memory_source, sop_copy_receipt=copy_receipt,
+                       sop_copy_outcome=copy_outcome, skill_draft_receipt=skill_draft_receipt,
+                       skill_draft_outcome=skill_draft_outcome)
+
+
+def _work_result(save, rows, failure, side_outcomes):
+    session, binding, command, runtime = save.session, save.binding, save.command, save.runtime
+    known,unresolved=runtime.dep.workers._operation_effects(rows,(binding.operation_id,),session.execution.owner)
+    for outcome in side_outcomes:
+        if outcome is not None:
+            known = (*known, *outcome.known_effects)
+            unresolved = (*unresolved, *outcome.unresolved_operations)
+    state="cancelled" if failure=="cancelled" else "failed" if failure or unresolved else "succeeded"
+    content=reply_reference(save.packed) if save.packed is not None else failure_notice(state, failure)
+    return VerifiedWorkResult(evidence_id=save.result_key,verifier_version=runtime.dep.delivery.contract.verifier_version,
+        work_id=binding.work.work_id,definition_digest=digest(binding.work.model_dump(mode="json")),
+        state=state,passed_checks=aw.TEXT_CHECKS if state=="succeeded" else (),
+        content=content,known_effects=known,unresolved_operations=unresolved,
+        proof=reply_proof(session.assignment.sdk_session_id,command.archive,command.sdk_stop,failure))
+
+
+def _commit_reply(save, rows):
+    from .behavior_assistant import _Session, _write
+    from .behavior_sdk_checkpoint import SdkStateUpload
+    command, packed, skey, ckey = save.command, save.packed, save.session_key, save.conversation_key
+    job = _parse(rows[worker_key("job", save.binding.job_id)].payload["data"], JobRecord)
+    _require_turn_state(save, rows, job)
+    current = _parse(rows[skey].payload["data"], _Session)
+    conversation = _parse(rows[ckey].payload["data"], Conversation)
+    if _execution_changed(save, job, current) or _conversation_moved(save, conversation):
+        raise Problem(409, "INSTRUCTION_RESULT_FENCED", "original turn execution or conversation changed")
+    failure="cancelled" if job.cancel_requested else command.failure
+    if save.checkpoint_key is not None and _parse(rows[save.checkpoint_key].payload["data"],SdkStateUpload).reference!=command.archive:
+        raise Problem(409,"SDK_STATE_INCOMPLETE","saved SDK state reference changed before reply commit")
+    progress_writes=_final_progress_writes(save, rows)
+    copied, drafted = _saved_side_work(save, rows, failure)
+    saved = _turn_archive(save, current, copied, drafted)
+    result = _work_result(save, rows, failure, (copied[1], drafted[1]))
+    return ControlChanges(writes=(
+        _write(save.result_key, result, "create", _material(result.model_dump(mode="json"))),
+        *(() if packed is None else (_write(save.reply_key,packed,"create"),)),
+        _write(save.archive_key, saved, "create", turn_material(saved)),
+        _write(skey, _update(current, state="ready_to_finalize"), "replace"),
+        _write(ckey, _update(conversation, active_job_id=None, archive_id=save.archive_key), "replace"),
+        *progress_writes,
+    ), result={"state": "ready_to_finalize", "result_digest": digest(result.model_dump(mode="json")),"work_outcome":result.state})
+
+
+def save_reply(authority, session, command):
+    from .behavior_assistant import _ledger_conflicts
+    task = session.assignment.task.instruction
+    if task is None or command.request_id != "save-text-reply":
+        raise Problem(403, "INSTRUCTION_RESULT_DENIED", "original free instruction reply required")
+    _require_saved_state(authority, session, task, command.archive)
+    if (_outcome_invalid(command, _agent_turn(authority, session, task))
+            or _sdk_binding_differs(session, task, command)):
+        raise Problem(403, "INSTRUCTION_RESULT_DENIED", "reply/archive must bind the original stopped SDK session")
+    runtime, store = authority.runtime, authority.store
+    save = _plan_reply_save(authority, runtime, session, command, task)
+
     def decide(rows):
-        job = _parse(rows[worker_key("job", binding.job_id)].payload["data"], JobRecord)
-        def read_state():
-            if session.vm_turn_ticket_id is not None:
-                from .behavior_vm_session import vm_session_state
-                return vm_session_state(authority,session,rows,executing=False)
-            return runtime._state(binding,rows,use="read")
-        if task.sop_copy is not None:
-            read_state()
-        if command.failure is None and not job.cancel_requested:authority._gate(session,rows)
-        else:read_state()
-        current = _parse(rows[key("session", sid)].payload["data"], _Session)
-        conversation = _parse(rows[ckey].payload["data"], Conversation)
-        if (job.binding != session.execution or job.owner != session.execution.owner
-                or command.failure=="cancelled" and not job.cancel_requested
-                or job.state not in {"starting", "running", "capacity_uncertain"}
-                or current.state not in {"running","waiting"} or current.execution != session.execution
-                or conversation.active_job_id != binding.job_id or conversation.jobs[-1] != binding.job_id
-                or conversation.sdk_session_id != session.assignment.sdk_session_id or len(conversation.jobs) != task.turn_number):
-            raise Problem(409, "INSTRUCTION_RESULT_FENCED", "original turn execution or conversation changed")
-        failure="cancelled" if job.cancel_requested else command.failure
-        if checkpoint_reads and _parse(rows[checkpoint_reads[0]].payload["data"],SdkStateUpload).reference!=archive:
-            raise Problem(409,"SDK_STATE_INCOMPLETE","saved SDK state reference changed before reply commit")
-        progress_writes=()
-        if final_progress is not None:
-            previous=rows[pkey]
-            if previous is not None:
-                old=_parse(previous.payload["data"],ProgressRecord)
-                if old.progress.events[-1].seq>final_progress.progress.events[-1].seq:
-                    raise Problem(409,"INSTRUCTION_PROGRESS_INVALID","final progress cannot replace newer events")
-            progress_writes=(_write(pkey,final_progress,"create" if previous is None else "replace"),)
-        copy_receipt, copy_outcome = None, None
-        if task.sop_copy is not None:
-            from .behavior_skill_copy_source import saved_copy
-            copy_receipt, copy_outcome = saved_copy(session, rows, allow_unresolved=failure is not None)
-        skill_draft_receipt, skill_draft_outcome = None, None
-        if skill_draft_enabled(task.prompt_profile, task.capabilities):
-            from .behavior_skill_draft_source import saved_draft
-            skill_draft_receipt, skill_draft_outcome = saved_draft(session, rows, allow_unresolved=failure is not None)
-        saved = TurnArchive(conversation_id=task.conversation_id, job_id=binding.job_id,
-                            turn_number=task.turn_number, archive=archive, sdk_stop=command.sdk_stop,
-                            context_read=current.context_read,failure=command.failure,progress=command.progress,
-                            prompt_assembly=assemble_prompt(task.prompt_profile).record,
-                            capability_assembly=capability_record(task.prompt_profile, task.capabilities),
-                            skill_catalog=current.skill_catalog, user_turn_sources=current.user_turn_sources,
-                            work_memory_source=current.work_memory_source, sop_copy_receipt=copy_receipt,
-                            sop_copy_outcome=copy_outcome, skill_draft_receipt=skill_draft_receipt,
-                            skill_draft_outcome=skill_draft_outcome)
-        known,unresolved=runtime.dep.workers._operation_effects(rows,(binding.operation_id,),session.execution.owner)
-        if copy_outcome is not None:
-            known = (*known, *copy_outcome.known_effects)
-            unresolved = (*unresolved, *copy_outcome.unresolved_operations)
-        if skill_draft_outcome is not None:
-            known = (*known, *skill_draft_outcome.known_effects)
-            unresolved = (*unresolved, *skill_draft_outcome.unresolved_operations)
-        state="cancelled" if failure=="cancelled" else "failed" if failure or unresolved else "succeeded"
-        content=reply_reference(packed) if packed is not None else failure_notice(state, failure)
-        result=VerifiedWorkResult(evidence_id=rkey,verifier_version=runtime.dep.delivery.contract.verifier_version,
-            work_id=binding.work.work_id,definition_digest=digest(binding.work.model_dump(mode="json")),
-            state=state,passed_checks=aw.TEXT_CHECKS if state=="succeeded" else (),
-            content=content,known_effects=known,unresolved_operations=unresolved,
-            proof=reply_proof(session.assignment.sdk_session_id,archive,command.sdk_stop,failure))
-        return ControlChanges(writes=(
-            _write(rkey, result, "create", _material(result.model_dump(mode="json"))),
-            *(() if packed is None else (_write(reply_key,packed,"create"),)),
-            _write(akey, saved, "create", turn_material(saved)),
-            _write(key("session", sid), _update(current, state="ready_to_finalize"), "replace"),
-            _write(ckey, _update(conversation, active_job_id=None, archive_id=akey), "replace"),
-            *progress_writes,
-        ), result={"state": "ready_to_finalize", "result_digest": digest(result.model_dump(mode="json")),"work_outcome":state})
-    record = (_ledger_conflicts(store,request,decide) if runtime.mode=="native"
-              else store.transact(request,decide))
+        return _commit_reply(save, rows)
+
+    record = (_ledger_conflicts(store,save.request,decide) if runtime.mode=="native"
+              else store.transact(save.request,decide))
     return aw.ToolReceipt(**record.payload["result"])
 
 
@@ -455,7 +552,3 @@ def restore_turn(authority, session, principal, *, resident=None):
         from .behavior_sdk_checkpoint import load_state
         return load_state(authority,session,saved.archive,job_id=saved.job_id)
     return saved.archive
-
-
-# The four predicates below are one conjunction ("saved SDK reply changed or claimed unsupported effects"),
-# split at its own term boundaries; the caller joins them with `and` in the original order.

@@ -6,13 +6,14 @@ version, so a resend after an unknown reply finds the routine already disabled a
 edits, re-enables or deletes a routine.
 """
 
+from functools import partial
 import json
 import re
 
 from shared_context.behavior_native_turn_wire import material_digest
 from shared_context.native_routine_wire import NativeRoutineChange, NativeRoutineList, NativeRoutineView
 
-from .adapter import ConsoleError, PullAdapter, require, strict_json
+from .adapter import ConsoleError, PullAdapter, decode, owner_token, require
 
 PREFIX = "/native-routines/v1/agents/"
 MAX_PAGES = 50
@@ -35,12 +36,7 @@ MESSAGES = {
 }
 
 
-def _decode(model, raw):
-    try:
-        strict_json(raw)
-        return model.model_validate_json(raw)
-    except (ValueError, TypeError):
-        raise ConsoleError("ROUTINE_SETTINGS_RESPONSE_INVALID", 502) from None
+_decode = partial(decode, code="ROUTINE_SETTINGS_RESPONSE_INVALID")
 
 
 class RoutineSettings:
@@ -62,11 +58,7 @@ class RoutineSettings:
         return agents.pop()
 
     def _token(self, *, write=False):
-        self.console.active()
-        token = self.console.vault.get()
-        if write:
-            require(self.console.vault.allows("Behavior.Approve"), "ROUTINE_SETTINGS_OWNER_ONLY", 403)
-        return token
+        return owner_token(self.console, "ROUTINE_SETTINGS_OWNER_ONLY", write=write)
 
     def _send(self, method, path, token, body=None, params=None):
         raw, headers = self.adapter.send(method, PREFIX + self.agent_id + path, body, token, limit=512 * 1024,

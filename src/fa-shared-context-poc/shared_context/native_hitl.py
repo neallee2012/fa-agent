@@ -463,6 +463,12 @@ class NativeHitlService:
                    "create" if rules.revision == 0 else "replace"),
         ), revision, rule_id
 
+    def _original_agent(self, principal, call, value, refusal):
+        if principal.kind == "agent":
+            self._agent(principal, call)
+            if principal.oid != value.agent_oid:
+                raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", refusal)
+
     def _pending(self, principal, pid, rows):
         value = self._load(rows.get(pid), pid, NativeHitlPending)
         call = value.command.action.call
@@ -470,10 +476,7 @@ class NativeHitlService:
             raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "the pending call belongs to another Team")
         if pid != pending_id(principal.tenant_id, principal.team, call):
             raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the pending key does not identify its original call")
-        if principal.kind == "agent":
-            self._agent(principal, call)
-            if principal.oid != value.agent_oid:
-                raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "only the original Agent may read or close this pending call")
+        self._original_agent(principal, call, value, "only the original Agent may read or close this pending call")
         return value
 
     def _question(self, principal, qid, rows):
@@ -483,10 +486,7 @@ class NativeHitlService:
             raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "the question belongs to another Team")
         if qid != question_id(principal.tenant_id, principal.team, call):
             raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the question key does not identify its original wait")
-        if principal.kind == "agent":
-            self._agent(principal, call)
-            if principal.oid != value.agent_oid:
-                raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "only the original Agent may read this question")
+        self._original_agent(principal, call, value, "only the original Agent may read this question")
         return value
 
     @staticmethod
@@ -567,10 +567,7 @@ class NativeHitlService:
             raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "the Connect card belongs to another Team")
         if cid != consent_id(principal.tenant_id, principal.team, call):
             raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the Connect card key does not identify its original wait")
-        if principal.kind == "agent":
-            self._agent(principal, call)
-            if principal.oid != value.agent_oid:
-                raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "only the original Agent may read this Connect card")
+        self._original_agent(principal, call, value, "only the original Agent may read this Connect card")
         return value
 
     @staticmethod

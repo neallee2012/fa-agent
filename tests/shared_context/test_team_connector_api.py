@@ -22,7 +22,9 @@ from shared_context.errors import Problem
 from shared_context.team_connector import current_team_connector_grants
 from shared_context.team_connector_api import PREFIX, install_team_connector_routes
 from shared_context.team_connector_wire import TEAM_CONNECTORS_ENABLED_ENV, TeamConnectorChange
-from shared_context.team_mcp import PROJECT_SCOPE_ENV, TeamMcpFoundryClient, TeamMcpFoundryError, team_connection_prefix
+from shared_context.team_mcp import (
+    PROJECT_SCOPE_ENV, TeamMcpFoundryClient, TeamMcpFoundryError, current_team_mcp_grants, team_connection_prefix,
+)
 from test_behavior_store import FakeTable, SCOPE
 from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token  # noqa: F401
 from test_team_mcp_api import ENDPOINT, PROJECT, SECOND_OWNER, FakeFoundry
@@ -450,6 +452,19 @@ def test_arm_oauth2_connection_put_matches_the_p0b_readback_shape_and_never_logs
         "credentials": {"clientId": APP_ID, "clientSecret": SECRET}, "metadata": {"fa_team": A.team}}}
 
 
+def test_read_grants_stay_cached_for_thirty_seconds(monkeypatch, connectors):
+    c = connectors
+    clock = [1000.0]
+    monkeypatch.setattr("shared_context.team_connector.monotonic", lambda: clock[0])
+    assert post(c, change(c, "f1" * 16)).status_code == 200
+    assert team_grants(c) != {}
+    reads = c.foundry.reads
+    clock[0] += 29
+    assert team_grants(c) != {} and c.foundry.reads == reads
+    clock[0] += 2
+    assert team_grants(c) != {} and c.foundry.reads > reads
+
+
 def test_a_failed_grants_read_is_reused_briefly_so_an_outage_waits_once(monkeypatch, connectors):
     c = connectors
     clock = [1000.0]
@@ -489,3 +504,15 @@ def test_captures_during_a_failing_read_share_that_one_foundry_read(monkeypatch,
     reads, results = concurrent_captures_during_one_slow_failing_read(
         lambda: team_grants(c), c.foundry, "read_default_version", monkeypatch)
     assert reads == 1 and results == [{}] * 3
+
+
+@pytest.mark.parametrize(("read", "service_name"), [
+    (current_team_connector_grants, "team_connectors"), (current_team_mcp_grants, "team_mcp")])
+def test_current_grants_ask_the_team_of_the_first_binding(read, service_name):
+    first, second = SimpleNamespace(tenant_id=TENANT, team_id=A.team), SimpleNamespace(tenant_id="other", team_id="other")
+    service = SimpleNamespace(team_grants=lambda tenant, team: (tenant, team))
+    for bindings in (MappingProxyType({"b": first, "c": second}), [first, second], (first,)):
+        assert read(SimpleNamespace(**{service_name: service}, bindings=bindings)) == (TENANT, A.team)
+    for runtime in (SimpleNamespace(**{service_name: service}, bindings={}), SimpleNamespace(**{service_name: service}),
+                    SimpleNamespace(bindings=(first,)), SimpleNamespace(**{service_name: service}, bindings=None)):
+        assert read(runtime) == ()
