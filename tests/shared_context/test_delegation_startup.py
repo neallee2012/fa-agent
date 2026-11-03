@@ -97,7 +97,9 @@ def test_captured_delegation_api_and_child_model_link_remain_readable_at_startup
 
     def before_reply(session, command, principal):
         first = api.prepare(c.authority, session, DelegationPrepare(tool_call_id="startup-task", arguments=TASK), principal)
-        assert first.fresh
+        assert (first.fresh, first.status, first.tool_call_id, first.child_agent_id, first.result) == (
+            True, "unknown", "startup-task", None, None)
+        assert first.sdk_session_id == command.reply.sdk_session_id
         api.observe(c.authority, session, DelegationObservation(kind="started", event_id="startup-start",
             tool_call_id="startup-task", child_agent_id="startup-child"), principal)
         read_startup(c)

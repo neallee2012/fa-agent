@@ -1,5 +1,6 @@
 """Original copy outcomes survive cancellation; signed API, synthetic SDK archive/stop."""
 
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -18,6 +19,8 @@ from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
+from shared_context.m3_models import ApprovalInput, VersionInput
+from shared_context.models import Handoff
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models, runtime_path
@@ -47,22 +50,16 @@ def cancel(turn):
     assert response.status_code == 200, response.text
 
 
-def change_target(http, agent, human, receipt, change):
-    path = "/teams/" + A.team + "/artifacts/" + receipt["artifact_id"]
-    snapshot = http.get(path, headers=agent)
-    assert snapshot.status_code == 200
+def change_target(artifacts, agent, human, receipt, change):
+    snapshot = artifacts.get(agent, A.team, receipt["artifact_id"])
     if change in {"approve", "reject"}:
-        response = http.post(path + "/decisions", headers={**human, "If-Match": snapshot.headers["etag"]},
-            json={"decision_id": "b" * 32, "version_id": receipt["version_id"], "decision": change,
-                  "sha256": receipt["sha256"], "metadata_sha256": receipt["metadata_sha256"]})
+        artifacts.decide(human, A.team, receipt["artifact_id"], snapshot.etag, ApprovalInput(
+            decision_id="b" * 32, version_id=receipt["version_id"], decision=change,
+            sha256=receipt["sha256"], metadata_sha256=receipt["metadata_sha256"]))
     else:
-        import hashlib
         later = b"Another version submitted after the original confirmed copy."
-        response = http.put(path + "/versions/" + "e" * 32, content=later, headers={
-            **agent, "If-Match": snapshot.headers["etag"], "Content-Type": "application/octet-stream",
-            "X-Artifact-Filename": "later.md", "X-Artifact-Media-Type": "text/markdown",
-            "X-Artifact-SHA256": hashlib.sha256(later).hexdigest()})
-    assert response.status_code == 200, response.text
+        artifacts.upload(agent, A.team, receipt["artifact_id"], "e" * 32, snapshot.etag, VersionInput(
+            filename="later.md", media_type="text/markdown", sha256=hashlib.sha256(later).hexdigest()), later)
 
 
 @pytest.mark.parametrize("copied", [False, True], ids=["no-copy", "known-copy"])
@@ -113,14 +110,14 @@ def test_signed_cancel_preserves_original_copy_ledger_and_failure_delivery(
 def test_later_target_decision_or_version_keeps_the_original_historical_copy_receipt(
         assistant, signing_key, jwk_client, change):
     h = assistant
-    http, agent, human_headers, source = approved_sop(h, signing_key, jwk_client)
+    artifacts, agent, approver, source = approved_sop(h, signing_key, jwk_client)
     h, control, human = configured_copy(h, copy_scope(source))
     turn = open_turn(h, control, human, "copy-target-history")
     try:
         first = post_copy(turn)
         assert first.status_code == 200
         receipt = first.json()
-        change_target(http, agent, human_headers, receipt, change)
+        change_target(artifacts, agent, approver, receipt, change)
         ekey = key("artifact", turn.binding.work.work_id)
         original = h.store.read_snapshot((ekey,))[ekey]
         target = h.artifacts.get(A, A.team, receipt["artifact_id"])
@@ -153,7 +150,7 @@ def test_later_target_decision_or_version_keeps_the_original_historical_copy_rec
 def test_lost_upload_then_changed_source_can_save_original_unresolved_copy_failure(
         assistant, signing_key, jwk_client, monkeypatch, failure):
     h = assistant
-    http, agent, human_headers, source = approved_sop(h, signing_key, jwk_client)
+    artifacts, agent, approver, source = approved_sop(h, signing_key, jwk_client)
     h, control, human = configured_copy(h, copy_scope(source))
     turn = open_turn(h, control, human, "failed-unknown-copy")
     try:
@@ -169,7 +166,7 @@ def test_lost_upload_then_changed_source_can_save_original_unresolved_copy_failu
         monkeypatch.setattr(h.artifacts, "upload", lost)
         assert post_copy(turn).status_code == 503 and writes == [True]
         monkeypatch.setattr(h.artifacts, "upload", original_upload)
-        change_source(http, agent, human_headers)
+        change_source(artifacts, agent, approver)
         ekey = key("artifact", turn.binding.work.work_id)
         before = h.store.read_snapshot((ekey,))[ekey]
         assert before.payload["data"]["stage"] == "upload_unknown"
@@ -221,7 +218,7 @@ def test_lost_upload_then_changed_source_can_save_original_unresolved_copy_failu
 @pytest.mark.parametrize("change", ["source-version", "source-owner", "m3-access", "overall-read-revoked"])
 def test_failure_save_uses_original_ledger_not_new_copy_permission(assistant, signing_key, jwk_client, monkeypatch, change):
     h = assistant
-    http, agent, human_headers, source = approved_sop(h, signing_key, jwk_client)
+    artifacts, agent, approver, source = approved_sop(h, signing_key, jwk_client)
     h, control, human = configured_copy(h, copy_scope(source))
     turn = open_turn(h, control, human, "historical-copy-failure")
     try:
@@ -232,13 +229,10 @@ def test_failure_save_uses_original_ledger_not_new_copy_permission(assistant, si
         ekey = key("artifact", turn.binding.work.work_id)
         original = h.store.read_snapshot((ekey,))[ekey]
         if change == "source-version":
-            change_source(http, agent, human_headers)
+            change_source(artifacts, agent, approver)
         elif change == "source-owner":
-            path = "/teams/" + A.team + "/works/" + LEGACY_WORK
-            original_work = http.get(path, headers=agent)
-            handed = http.post(path + "/handoff", headers={**agent, "If-Match": original_work.headers["etag"]},
-                               json={"to_actor": B.actor})
-            assert handed.status_code == 200, handed.text
+            original_work = artifacts.context.get(agent, A.team, LEGACY_WORK)
+            artifacts.context.handoff(agent, A.team, LEGACY_WORK, original_work.etag, Handoff(to_actor=B.actor))
         elif change == "m3-access":
             monkeypatch.setattr(h.artifacts.context, "auth", replace(h.artifacts.context.auth, actors={B.oid: B}))
         else:
@@ -276,7 +270,7 @@ def test_failure_save_uses_original_ledger_not_new_copy_permission(assistant, si
 def test_confirmed_effect_survives_model_gates_and_never_replays_copy(assistant, signing_key, jwk_client, changed):
     from sdk_checkpoint_local import sse
     h = assistant
-    http, agent, human_headers, source = approved_sop(h, signing_key, jwk_client)
+    artifacts, agent, approver, source = approved_sop(h, signing_key, jwk_client)
     h, control, human = configured_copy(h, copy_scope(source))
     requests = []
     def provider(request):
@@ -295,9 +289,9 @@ def test_confirmed_effect_survives_model_gates_and_never_replays_copy(assistant,
         assert first.status_code == 200
         receipt = first.json()
         if changed == "source-version":
-            change_source(http, agent, human_headers)
+            change_source(artifacts, agent, approver)
         else:
-            change_target(http, agent, human_headers, receipt, {
+            change_target(artifacts, agent, approver, receipt, {
                 "target-approved": "approve", "target-rejected": "reject", "target-new-version": "new-version"}[changed])
         body = {"model": "gpt-4.1-mini", "stream": True, "messages": [
             {"role": "user", "content": "Report the original operation only."},
@@ -333,7 +327,7 @@ def test_confirmed_effect_survives_model_gates_and_never_replays_copy(assistant,
 def test_original_upload_reconciles_after_source_changes_without_second_put(
         assistant, signing_key, jwk_client, monkeypatch, failure):
     h = assistant
-    http, agent, human_headers, source = approved_sop(h, signing_key, jwk_client)
+    artifacts, agent, approver, source = approved_sop(h, signing_key, jwk_client)
     h, control, human = configured_copy(h, copy_scope(source))
     turn = open_turn(h, control, human, "copy-original-upload-readback")
     upload = h.artifacts.upload
@@ -359,7 +353,7 @@ def test_original_upload_reconciles_after_source_changes_without_second_put(
     monkeypatch.setattr(h.artifacts.store, "put", putting)
     try:
         assert post_copy(turn).status_code == 503
-        change_source(http, agent, human_headers)
+        change_source(artifacts, agent, approver)
         before = dict(counts)
         assert before == {"upload": 1, "put": 1}
         recovered = post_copy(turn)
@@ -464,14 +458,14 @@ def test_unfinished_metadata_stage_is_preserved_in_failed_result(assistant, sign
 
 def test_historical_receipt_still_rejects_corrupted_original_blob(assistant, signing_key, jwk_client, monkeypatch):
     h = assistant
-    http, agent, human_headers, source = approved_sop(h, signing_key, jwk_client)
+    artifacts, agent, approver, source = approved_sop(h, signing_key, jwk_client)
     h, control, human = configured_copy(h, copy_scope(source))
     turn = open_turn(h, control, human, "copy-immutable-readback")
     try:
         copied = post_copy(turn)
         assert copied.status_code == 200
         receipt = copied.json()
-        change_target(http, agent, human_headers, receipt, "approve")
+        change_target(artifacts, agent, approver, receipt, "approve")
         read = h.artifacts.store.read
         def corrupt(team, artifact_id, version_id, version):
             return b"SYNTHETIC_CORRUPTED_COPY" if artifact_id == receipt["artifact_id"] else read(team, artifact_id, version_id, version)

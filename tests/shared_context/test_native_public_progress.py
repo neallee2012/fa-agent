@@ -17,6 +17,7 @@ from test_native_append_sdk import (
 )
 from test_instruction_responses_native import OPAQUE, response_bytes
 from test_web_test_console_native import first, native_console, progress, send
+from shared_context.sdk_pin import RUNTIME_VERSION
 
 
 @pytest.mark.parametrize("append_sdk", [None, "responses"], indirect=True, ids=["invocations", "responses"])
@@ -178,7 +179,7 @@ def test_progress_finishes_after_sdk_stop_with_200ms_store_io(append_sdk, monkey
     assert observed.json()["finished"] and not observed.json()["unconfirmed"], observed.text
     assert delayed_writes and len(env.requests) == 1
     assert env.read(rid) == saved
-    assert env.stopped[0].runtime_version == "1.0.83" and env.stopped[0].graceful
+    assert env.stopped[0].runtime_version == RUNTIME_VERSION and env.stopped[0].graceful
 
 
 def test_one_progress_read_timeout_does_not_discard_later_steps_or_final_snapshot(append_sdk, monkeypatch):

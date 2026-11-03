@@ -68,6 +68,9 @@ def test_invalid_success_response_records_real_status_not_wrapped_status(caplog)
     (502, {"error": {"code": CANARY, "message": CANARY}},
      "NATIVE_HITL_AUTHORITY_UNAVAILABLE", "UNCLASSIFIED", "Problem"),
     (503, CANARY, "NATIVE_HITL_AUTHORITY_UNAVAILABLE", "UNCLASSIFIED", "JSONDecodeError"),
+    (409, {"error": {"code": ["NATIVE_HITL_EXPIRED"]}}, "NATIVE_HITL_AUTHORITY_UNAVAILABLE", "UNCLASSIFIED", "Problem"),
+    (409, {"error": {"code": {"code": "NATIVE_HITL_EXPIRED"}}},
+     "NATIVE_HITL_AUTHORITY_UNAVAILABLE", "UNCLASSIFIED", "Problem"),
 ])
 def test_non_success_status_and_codes_are_not_reclassified_or_retried(
         caplog, status, body, returned_code, logged_code, exception):

@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from starlette.testclient import TestClient
 
-from feed_fixtures import FEED_URL, TOKEN, keys, rss, signed_headers  # noqa: F401  (first: puts the app on sys.path)
+from feed_fixtures import FEED_URL, TOKEN, keys, rss, signed_headers  # first: puts the app on sys.path
 from feed_mcp.fetch import FeedError
 from feed_mcp.parse import READ_PAGE_CHARS, SUMMARY_CHARS, Scrubber, parse_feed, safe_link
 from feed_mcp.server import create_app

@@ -141,7 +141,7 @@ def test_concurrent_sdk_requests_share_the_limit_before_awaiting_authority(adapt
         asyncio.run(run_copilot(**adapter.options))
     assert len(sent) == len(reserved) == 2
     assert adapter.boundary.failure["upstream_error_code"] == "MODEL_CALL_LIMIT_REACHED"
-    adapter.client.stop.assert_awaited_once()
+    adapter.client.stop.assert_awaited_once_with()
 
 
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5, "100"])
@@ -188,4 +188,4 @@ def test_repeated_sdk_model_request_never_uses_a_new_slot_to_resend(adapter, unk
     assert len(sent) == len(reserved) == 1
     assert adapter.boundary.failure["upstream_error_phase"] == ("transport" if unknown else "replayed_request")
     assert "OFFLINE private transport detail" not in str(adapter.boundary.failure)
-    adapter.client.stop.assert_awaited_once()
+    adapter.client.stop.assert_awaited_once_with()

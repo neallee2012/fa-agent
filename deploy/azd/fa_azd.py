@@ -58,10 +58,10 @@ REQUIREMENTS = APP / "requirements-behavior.txt"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(SHARED_DIR))
 
-import entra  # noqa: E402
-import models  # noqa: E402
-import profile as fa_profile  # noqa: E402
-from deployment_config import write_x as _write_x  # noqa: E402
+import entra
+import models
+import profile as fa_profile
+from deployment_config import write_x as _write_x
 
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 DIGEST_REF = re.compile(r"[a-z0-9.-]+\.azurecr\.io/[a-z0-9-]+@sha256:[0-9a-f]{64}")
@@ -128,7 +128,6 @@ class Context:
             raise Stop(f"no answer was read (input closed or interrupted): nothing was approved and no answer was "
                        f"saved. Run `{self.resume}` in a terminal to answer it again") from None
 
-    # ---- azd environment -------------------------------------------------------------------------------------
     def get(self, key: str, default: str | None = None) -> str | None:
         value = self.values.get(key)
         return value if value not in (None, "") else default
@@ -168,7 +167,6 @@ class Context:
     def group(self) -> str:
         return self.get("AZURE_RESOURCE_GROUP") or f"rg-{self.env}"
 
-    # ---- tools -----------------------------------------------------------------------------------------------
     def az(self, *args: str, missing_ok: bool = False, timeout: int | None = None, read_again: bool = False) -> Any:
         """`read_again` only for a GET (read_retrying); a write is always sent once."""
         command = [*self.az_cmd, *args, "-o", "json"]
@@ -262,8 +260,6 @@ def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
 
-
-# ---- preprovision ------------------------------------------------------------------------------------------------
 
 def signed_in_user(ctx: Context) -> dict[str, str]:
     me = ctx.graph("GET", "/me?$select=id,userPrincipalName", None, {}) or {}
@@ -890,8 +886,6 @@ def _az_flag(ctx: Context) -> list[str]:
     return ["--az", ctx.az_cmd[0]] if ctx.az_cmd and Path(ctx.az_cmd[0]).name.lower().startswith("python") else []
 
 
-# ---- postprovision -----------------------------------------------------------------------------------------------
-
 def aca_ready(ctx: Context, tenant: str) -> str:
     document = preflight_document(ctx, tenant, [])
     result = ctx.script(SHARED_DIR / "preflight_subscription.py", "aca-ready", "--deployment", str(document),
@@ -1201,8 +1195,6 @@ def data_plane_window(ctx: Context, ip: str | None) -> Any:
                    f"was opened. Rerun `{ctx.resume}` to confirm the new one")
     return foundry_window(ctx, ctx.need("FA_FOUNDRY_ACCOUNT"), ctx.need("FA_PROJECT_ENDPOINT"), ip)
 
-
-# ---- deploy ------------------------------------------------------------------------------------------------------
 
 def git_commit() -> str:
     result = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
@@ -1719,8 +1711,6 @@ def deploy(ctx: Context) -> None:
     ctx.set("FA_SESSIONS_PREPARED", "true")
     summary(ctx)
 
-
-# ---- entry -------------------------------------------------------------------------------------------------------
 
 def ensure_venv(ctx: Context) -> str:
     """deploy needs the API packages (make_runtime, plan rebuild, Portal export): one private venv per environment,

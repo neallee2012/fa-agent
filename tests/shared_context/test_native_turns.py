@@ -172,6 +172,40 @@ def test_real_official_chain_preserves_caller_capture_and_resumes_conversation(h
     assert "events.jsonl" not in page.model_dump_json()
 
 
+@pytest.mark.parametrize("retried", [False, True], ids=["first-attempt", "after-a-503"])
+def test_a_stop_after_the_answer_is_saved_still_shows_the_answer(harness, monkeypatch, retried):
+    """turn:n and its checkpoint are saved, then a stop moves the receipt's ETag before it is marked completed: the
+    stop came too late and the saved answer wins (Neal 2026-11-03, #1145), also when the step after the lost CAS
+    fails once and the save loop sees the stop on its retry."""
+    write, stopped = FoundryStateStore.set_item, []
+    if retried:
+        reenter, failed = harness.runtime._reenter, []
+
+        async def fail_once(*args, **kwargs):
+            if not failed:
+                failed.append(True)
+                raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "OFFLINE the read after the lost CAS failed once")
+            return await reenter(*args, **kwargs)
+
+        monkeypatch.setattr(harness.runtime, "_reenter", fail_once)
+
+    async def stop_first(store, key, value, *args, **kwargs):
+        if key == "rid:rid-1" and value["receipt"]["status"] == "completed" and not stopped:
+            current = await store.get_item(key)
+            receipt = {**current.value["receipt"], "cancel_requested": True}
+            stopped.append(await write(store, key, {**current.value, "receipt": receipt}, if_match=current.etag))
+        return await write(store, key, value, *args, **kwargs)
+
+    monkeypatch.setattr(FoundryStateStore, "set_item", stop_first)
+    assert harness.invoke(submit()).status_code == 202
+    completed = harness.wait("rid-1", "completed")
+    assert stopped and completed.cancel_requested and completed.failure_code is None
+    assert not retried or failed
+    page = harness.call(harness.runtime.result, NativeResult(
+        conversation_id=completed.conversation_id, request_id="rid-1"))
+    assert page.complete and page.text == "Complete public answer" and len(harness.sdk.calls) == 1
+
+
 @pytest.mark.parametrize("refusal", ["preflight-409", "missing-conversation", "recovery-following", "preflight-503"])
 def test_a_definite_refusal_before_the_rid_exists_is_marked_not_dispatched(harness, refusal):
     """Only a refusal raised before ``rid:<RID>`` is created says nothing was admitted; the same RID then goes through."""
@@ -370,6 +404,7 @@ def test_cancel_landing_during_queued_recovery_keeps_the_unconfirmed_relay_code(
     """The recovery path only runs for a sender whose tool call already dispatched, so the SDK has run: a cancel that
     lands after the entry check but before the re-read is kept as ``cancel_requested``, not as a cancelled turn."""
     _, started = seed_started(harness)
+    started = harness.call(harness.runtime._allocate, started)[0]  # dispatched a tool, so it was numbered first
 
     async def cancel_then_fail(original):
         cancelled = _changed(original.value, receipt=_changed(original.value.receipt, cancel_requested=True))
@@ -625,7 +660,7 @@ def test_a_failed_save_is_retried_only_while_unconfirmed_and_never_reruns_the_sd
     monkeypatch.setattr(runtime, "_save_turn", failing_save)
     monkeypatch.setattr(runtime, "_cas", unconfirmed)
     if failure == "unknown-rid-write":
-        with pytest.raises(_UnknownRidWrite):
+        with pytest.raises(NativePostTurnPending):  # still past the turn's own handler, for core to retry
             harness.call(runtime.handle_turn, task_context(accepted))
         assert len(saves) == 1 and harness.call(runtime.read, "rid-1").status == "started"
     else:
@@ -696,7 +731,7 @@ def test_the_runtime_starts_recall_before_allocation_and_stops_it_with_the_turn(
 
 
 def test_a_drained_input_whose_handler_starts_after_shutdown_ends_resendable(harness):
-    """Review P3-2 on #903: core's re-entry of a drained input gets payload.input=None and can never run it, so a
+    """#903: core's re-entry of a drained input gets payload.input=None and can never run it, so a
     drained handler that starts after shutdown settles its unstarted RID before the recovery exit (an undrained one
     stays accepted for its re-entry, above)."""
     accepted = accept_without_chain(harness)
@@ -710,7 +745,7 @@ def test_a_drained_input_whose_handler_starts_after_shutdown_ends_resendable(har
 
 
 def test_a_turn_waiting_on_a_cli_that_never_exits_ends_resendable_within_the_bound(harness, monkeypatch):
-    """Review P2-1 on #903: the Invocations wait before "started" is bounded too; a CLI that never exits and a
+    """#903: the Invocations wait before "started" is bounded too; a CLI that never exits and a
     recovery restart that never comes end the RID as NATIVE_TURN_NOT_STARTED without any SDK call."""
     from shared_context import native_turns
 
@@ -723,9 +758,15 @@ def test_a_turn_waiting_on_a_cli_that_never_exits_ends_resendable_within_the_bou
 
 @pytest.mark.parametrize("status", ["accepted", "started"])
 def test_a_recovered_entry_without_input_reads_the_drained_input_from_the_task_record(harness, monkeypatch, status):
-    """Review P3-1 on #903: core re-enters a drained input with payload.input=None and steering.active_input=<input>.
-    Accepted, that RID can never run again and ends resendable; started, it re-enters as any recovered start."""
-    accepted = accept_without_chain(harness) if status == "accepted" else seed_started(harness)[0]
+    """#903: core re-enters a drained input with payload.input=None and steering.active_input=<input>.
+    Accepted, that RID can never run again and ends resendable; started and numbered, it re-enters as any recovered
+    start."""
+    if status == "accepted":
+        accepted = accept_without_chain(harness)
+    else:
+        accepted, started = seed_started(harness)
+        harness.call(harness.runtime._cas, started, _changed(
+            started.value, receipt=_changed(started.value.receipt, turn_number=1)))
     active = task_context(accepted).input.model_dump(mode="json")
     reentered = []
 
@@ -783,6 +824,319 @@ def test_an_unread_task_record_of_an_entry_without_input_is_retried_by_core_unle
     else:
         assert raised.value is failure
     assert harness.call(harness.runtime.read, "rid-1").status == "accepted" and not harness.sdk.calls
+
+
+def store_outage(monkeypatch):
+    """Real State store calls fail while ``down`` is set; ``reads``: the outage covers reads too, not only writes."""
+    outage = SimpleNamespace(down=False, reads=True)
+
+    def failing(call, read):
+        async def outaged(store, *args, **options):
+            if outage.down and (outage.reads or not read):
+                raise ServiceResponseError("OFFLINE State store unreachable")
+            return await call(store, *args, **options)
+        return outaged
+
+    monkeypatch.setattr(FoundryStateStore, "get_item", failing(FoundryStateStore.get_item, True))
+    monkeypatch.setattr(FoundryStateStore, "set_item", failing(FoundryStateStore.set_item, False))
+    monkeypatch.setattr(FoundryStateStore, "create_item", failing(FoundryStateStore.create_item, False))
+    return outage
+
+
+def down_after_answer(harness, outage):
+    sdk = harness.sdk
+
+    async def answered(*args):
+        result = await sdk(*args)
+        outage.down = True
+        return result
+
+    harness.runtime.executor = answered
+
+
+def test_a_store_outage_before_the_turn_starts_is_retried_and_runs_it_once(harness, monkeypatch):
+    """5xx before ``started``: core retries the same input; nothing ran, so the retry runs the turn."""
+    accepted = accept_without_chain(harness)
+    outage = store_outage(monkeypatch)
+    ctx = task_context(accepted, entry_mode="fresh")
+    outage.down = True
+    with pytest.raises(NativePostTurnPending):
+        harness.call(harness.runtime.handle_turn, ctx)
+    outage.down = False
+    assert harness.call(harness.runtime.read, "rid-1").status == "accepted" and not harness.sdk.calls
+    assert harness.call(harness.runtime.handle_turn, ctx).status == "completed"
+    assert [call[0] for call in harness.sdk.calls] == ["rid-1"]
+
+
+@pytest.mark.parametrize("reads", [True, False], ids=["all-calls", "writes-only"])
+def test_a_store_outage_after_the_answer_ends_the_receipt_on_retry_without_the_sdk(harness, monkeypatch, reads):
+    """The SDK answered and the save could not finish: the in-memory answer is gone, so a retry ends the receipt
+    ``unknown`` once the store answers (``started`` stays cancel- and resend-proof otherwise). The SDK never runs again.
+    Writes-only: the ``unknown`` write itself is what fails (``_UnknownRidWrite``), and that must be retried too."""
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "SAVE_RETRY_SECONDS", (0.01, 0.01))
+    accepted = accept_without_chain(harness)
+    outage = store_outage(monkeypatch)
+    outage.reads = reads
+    down_after_answer(harness, outage)
+    ctx = task_context(accepted, entry_mode="fresh")
+    with pytest.raises(NativePostTurnPending):
+        harness.call(harness.runtime.handle_turn, ctx)
+    outage.down = False
+    assert harness.call(harness.runtime.read, "rid-1").status == "started"
+    stored = harness.call(harness.runtime.handle_turn, ctx)
+    assert (stored.status, stored.failure_code, stored.result) == ("unknown", "NATIVE_RESULT_MISSING", None)
+    assert [call[0] for call in harness.sdk.calls] == ["rid-1"]
+
+
+def test_a_saved_answer_is_marked_completed_on_retry_without_the_sdk(harness, monkeypatch):
+    """The outage begins at the RID's ``completed`` write: ``turn:1`` is durable, so the retry's re-entry completes it."""
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "SAVE_RETRY_SECONDS", (0.01, 0.01))
+    accepted = accept_without_chain(harness)
+    outage = store_outage(monkeypatch)
+    write = FoundryStateStore.set_item
+    outage.begins = True
+
+    async def outage_at_completed(store, key, value, **options):
+        if key == "rid:rid-1" and value["receipt"]["status"] == "completed" and outage.begins:
+            outage.down = True
+        return await write(store, key, value, **options)
+
+    monkeypatch.setattr(FoundryStateStore, "set_item", outage_at_completed)
+    ctx = task_context(accepted, entry_mode="fresh")
+    with pytest.raises(NativePostTurnPending):
+        harness.call(harness.runtime.handle_turn, ctx)
+    outage.down = outage.begins = False
+    assert harness.call(harness.runtime.read, "rid-1").status == "started"
+    stored = harness.call(harness.runtime.handle_turn, ctx)
+    assert stored.status == "completed" and stored.result is not None and stored.usage.usage[0].requests == 1
+    assert [call[0] for call in harness.sdk.calls] == ["rid-1"]
+
+
+@pytest.mark.parametrize(("point", "left", "closed"), [
+    ("before-start", "accepted", None),
+    ("after-start", "started", ("unknown", "NATIVE_TURN_NOT_STARTED")),
+    ("after-answer", "started", ("unknown", "NATIVE_RESULT_MISSING")),
+    ("after-save", "started", ("completed", None)),
+    ("closed-unconfirmed", "unknown", ("unknown", "NATIVE_TURN_NOT_STARTED")),
+])
+def test_an_outage_past_the_retry_budget_is_logged_with_its_rid(harness, monkeypatch, caplog, point, left, closed):
+    """Through real core: the budget ends while no write can land, so the RID stays as it is and the log says which.
+    An accepted RID still runs on a resend. Core dropped a started one's input, so once the store answers this session
+    closes it as a retry would (a saved turn:1 completes), with one terminal notice and no second SDK run (#1146).
+    Closed-unconfirmed: the chain's own close landed but its answer and reread were lost, so only the closer tells."""
+    from azure.ai.agentserver.core.tasks import TaskFailed
+
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "SAVE_RETRY_SECONDS", (0.01, 0.01))
+    # The closer's first read comes after the test lifts the outage below.
+    monkeypatch.setattr(native_turns, "OUTAGE_CLOSE_SECONDS", (0.2,) * 20)
+    applied = FoundryStateStore.set_item
+    outage = store_outage(monkeypatch)
+    if point == "closed-unconfirmed":
+        unreachable, outage.reads = FoundryStateStore.set_item, False
+
+        async def lands_unconfirmed(store, key, value, **options):
+            if outage.down and key == "rid:rid-1" and value["receipt"]["status"] == "unknown":
+                await applied(store, key, value, **options)
+                outage.reads = True  # its reread fails too
+            return await unreachable(store, key, value, **options)
+
+        monkeypatch.setattr(FoundryStateStore, "set_item", lands_unconfirmed)
+    if point == "after-save":
+        write, began = FoundryStateStore.set_item, []
+
+        async def down_at_completed(store, key, value, **options):
+            if key == "rid:rid-1" and value["receipt"]["status"] == "completed" and not began:
+                began.append(True)
+                outage.down = True
+            return await write(store, key, value, **options)
+
+        monkeypatch.setattr(FoundryStateStore, "set_item", down_at_completed)
+    runs, attempts, notices = [], [], []
+    start, handle = harness.runtime.chain.start, harness.runtime.handle_turn
+
+    async def noticed(receipt):
+        notices.append((receipt.status, receipt.failure_code))
+
+    harness.runtime.on_terminal = noticed
+    if point in {"after-start", "closed-unconfirmed"}:
+        allocate = harness.runtime._allocate
+
+        async def down_at_numbering(original):
+            outage.down = True
+            return await allocate(original)
+
+        monkeypatch.setattr(harness.runtime, "_allocate", down_at_numbering)
+
+    async def capture_run(**kwargs):
+        runs.append(await start(**kwargs))
+        return runs[-1]
+
+    async def counted(ctx):
+        attempts.append(ctx.retry_attempt)
+        if point == "before-start":
+            outage.down = True
+        return await handle(ctx)
+
+    monkeypatch.setattr(harness.runtime.chain, "start", capture_run)
+    monkeypatch.setattr(harness.runtime, "handle_turn", counted)
+    if point == "after-answer":
+        down_after_answer(harness, outage)
+    assert harness.invoke(submit()).status_code == 202
+    with caplog.at_level(logging.ERROR), pytest.raises(TaskFailed):
+        harness.call(runs[0].result)
+    lock = harness.runtime.execution_lock
+    if point == "after-start":
+        # Another turn holds the execution slot: the closer waits for it, as a retry on the chain would.
+        harness.call(lock.acquire)
+    outage.down = False
+    assert attempts == list(range(harness.runtime._queue_retry.max_attempts))
+    assert "FA_NATIVE_TURN_RETRIES_EXHAUSTED rid=rid-1 input_id=rid-1 code=NATIVE_STATE_STORE_UNKNOWN" in caplog.text
+    ran = point in {"after-answer", "after-save"}
+    assert harness.call(harness.runtime.read, "rid-1").status == left
+    assert len(harness.sdk.calls) == ran
+    if point == "after-start":
+        time.sleep(0.6)
+        assert harness.call(harness.runtime.read, "rid-1").status == "started"
+        harness.call(lock.release)
+    if closed is not None:
+        deadline = time.monotonic() + 8
+        while not notices and time.monotonic() < deadline:
+            time.sleep(0.05)
+        receipt = harness.call(harness.runtime.read, "rid-1")
+        assert (receipt.status, receipt.failure_code) == closed
+        assert (receipt.result is not None) == (closed[0] == "completed")
+        harness.call(harness.runtime.aclose)
+        assert notices == [closed] and len(harness.sdk.calls) == ran
+    if left == "accepted":
+        monkeypatch.setattr(harness.runtime, "handle_turn", handle)
+        assert harness.invoke(submit()).status_code == 202
+        assert harness.wait("rid-1", "completed").result is not None
+        assert len(harness.sdk.calls) == 1
+
+
+def test_a_resend_that_runs_the_rid_again_cancels_its_outage_closer(harness, monkeypatch):
+    """The last attempt left a closer sleeping; a resend runs the accepted RID again, and its own run owns it (#1146)."""
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "OUTAGE_CLOSE_SECONDS", (5,))
+    accepted = accept_without_chain(harness)
+    outage = store_outage(monkeypatch)
+    last = task_context(accepted, entry_mode="fresh")
+    last.retry_attempt = harness.runtime._queue_retry.max_attempts - 1
+    outage.down = True
+    with pytest.raises(NativePostTurnPending):
+        harness.call(harness.runtime.handle_turn, last)
+    outage.down = False
+    closer = harness.runtime._outage_closes["rid-1"]
+    assert harness.call(harness.runtime.handle_turn, task_context(accepted, entry_mode="fresh")).status == "completed"
+    assert closer.cancelled() and "rid-1" not in harness.runtime._outage_closes
+
+
+def test_a_last_attempt_that_fails_only_at_its_notice_still_tells(harness, monkeypatch, caplog):
+    """The turn completed on core's last attempt and only its notice failed: core drops the input, so the outage
+    closer finds the completed receipt and sends the notice once, with no second SDK run (#1146)."""
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "OUTAGE_CLOSE_SECONDS", (0.05,) * 5)
+    accepted = accept_without_chain(harness)
+    notices, start, failed = [], harness.runtime.notifications.start, []
+
+    async def noticed(receipt):
+        notices.append((receipt.status, receipt.failure_code))
+
+    async def down_once(**kwargs):
+        if not failed:
+            failed.append(True)
+            raise OSError("OFFLINE task store")
+        return await start(**kwargs)
+
+    harness.runtime.on_terminal = noticed
+    monkeypatch.setattr(harness.runtime, "notifications", SimpleNamespace(start=down_once))
+    last = task_context(accepted, entry_mode="fresh")
+    last.retry_attempt = harness.runtime._queue_retry.max_attempts - 1
+    with caplog.at_level(logging.ERROR), pytest.raises(NativePostTurnPending):
+        harness.call(harness.runtime.handle_turn, last)
+    assert harness.call(harness.runtime.read, "rid-1").status == "completed"
+    assert "FA_NATIVE_TURN_RETRIES_EXHAUSTED rid=rid-1" in caplog.text
+    deadline = time.monotonic() + 8
+    while not notices and time.monotonic() < deadline:
+        time.sleep(0.05)
+    harness.call(harness.runtime.aclose)
+    assert notices == [("completed", None)] and len(harness.sdk.calls) == 1
+
+
+def test_an_outage_closer_never_touches_the_healthy_turn_steered_after_it(harness, monkeypatch):
+    """Steered turns carry the chain's last_input_id on ctx, not their own RID. rid-2 started and then exhausted its
+    retries while rid-3 and rid-4 queued: its own closer ends it resendable, and nothing closes rid-3 while its SDK
+    runs (#1146)."""
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "OUTAGE_CLOSE_SECONDS", (0.3,) * 5)
+    runtime, sdk, seen, released = harness.runtime, harness.sdk, [], []
+    real = runtime._handle_turn
+
+    async def outage_for_rid_2(ctx):
+        seen.append((ctx.input_id, ctx.input.request_id))
+        if ctx.input.request_id == "rid-2":
+            while not released:
+                await asyncio.sleep(0.01)
+            original = await runtime._rid("rid-2")
+            if original.value.receipt.status == "accepted":
+                await runtime._cas(original, _changed(original.value, run_token=uuid4().hex,
+                                                      receipt=_changed(original.value.receipt, status="started")))
+            raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "OFFLINE outage on rid-2 only")
+        return await real(ctx)
+
+    monkeypatch.setattr(runtime, "_handle_turn", outage_for_rid_2)
+    sdk.block = True
+    assert harness.invoke(submit("rid-1")).status_code == 202
+    harness.wait("rid-1", "started")
+    for rid in ("rid-2", "rid-3"):
+        assert harness.invoke(submit(rid)).json()["status"] == "accepted"
+    sdk.block = False
+    harness.wait("rid-1", "completed")
+    sdk.block = True
+    deadline = time.monotonic() + 8
+    while not any(rid == "rid-2" for _, rid in seen) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert harness.invoke(submit("rid-4")).json()["status"] == "accepted"
+    released.append(True)
+    harness.wait("rid-3", "started")
+    time.sleep(1.2)
+    assert any(reported != rid for reported, rid in seen)
+    assert harness.call(runtime.read, "rid-3").status == "started"
+    sdk.block = False
+    assert harness.wait("rid-3", "completed").result is not None
+    stuck = harness.wait("rid-2", "unknown")
+    assert stuck.failure_code == "NATIVE_TURN_NOT_STARTED" and "rid-2" not in [call[0] for call in sdk.calls]
+
+
+def test_one_failed_read_after_the_answer_does_not_lose_it(harness, monkeypatch):
+    """The read that decides whether to save is retried with the save: a blip there never drops a finished answer."""
+    from shared_context import native_turns
+
+    monkeypatch.setattr(native_turns, "SAVE_RETRY_SECONDS", (0.01, 0.01))
+    accepted = accept_without_chain(harness)
+    outage = store_outage(monkeypatch)
+    read = FoundryStateStore.get_item
+
+    async def one_lost_read(store, key, **options):
+        if outage.down and key == "rid:rid-1":
+            outage.down = False
+            raise ServiceResponseError("OFFLINE read after the answer lost")
+        return await read(store, key, **options)
+
+    monkeypatch.setattr(FoundryStateStore, "get_item", one_lost_read)
+    down_after_answer(harness, outage)
+    stored = harness.call(harness.runtime.handle_turn, task_context(accepted, entry_mode="fresh"))
+    assert stored.status == "completed" and stored.result is not None
+    assert [call[0] for call in harness.sdk.calls] == ["rid-1"]
 
 
 def test_a_drained_input_whose_close_is_unconfirmed_at_shutdown_still_exits_for_recovery(harness, monkeypatch, caplog):
@@ -980,6 +1334,25 @@ def test_stale_accepted_etag_cannot_execute_after_a_cancel_flag(harness):
         conversation_id=original.conversation_id, request_id=original.request_id))
     returned = harness.call(harness.runtime.handle_turn, task_context(accepted))
     assert returned.status == "unknown" and not harness.sdk.calls
+
+
+def test_a_cancel_that_beats_the_start_write_closes_the_receipt(harness):
+    """The cancel lands after the receipt was reread: the start CAS loses and nothing else will ever close it."""
+    runtime = harness.runtime
+    accepted = accept_without_chain(harness)
+    original = accepted.value.receipt
+    cas = runtime._cas
+
+    async def cancel_first(current, replacement):
+        if replacement.receipt.status == "started":
+            await runtime.cancel(NativeCancel(
+                conversation_id=original.conversation_id, request_id=original.request_id))
+        return await cas(current, replacement)
+
+    runtime._cas = cancel_first
+    returned = harness.call(runtime.handle_turn, task_context(accepted))
+    assert (returned.status, returned.failure_code) == ("unknown", "NATIVE_TURN_CANCELLED")
+    assert harness.call(runtime.read, "rid-1").status == "unknown" and not harness.sdk.calls
 
 
 def test_saved_result_with_lost_completed_ack_is_read_back_without_another_model(harness, monkeypatch):
@@ -1228,6 +1601,18 @@ def until(condition, seconds=10):
         time.sleep(0.01)
 
 
+CONTROL_SCALE = 10
+
+
+def fast_control(monkeypatch):
+    """The control observer's tick, polls and backoff cap, all ``CONTROL_SCALE`` times shorter, set before the turn
+    starts (the observer reads its interval once). A window that short still counts reads per poll, and a read per
+    tick still stands out."""
+    from shared_context import native_turns
+    for name in ("CONTROL_TICK_SECONDS", "CONTROL_POLL_SECONDS", "SLOT_WAIT_POLL_SECONDS", "CONTROL_POLL_MAX_SECONDS"):
+        monkeypatch.setattr(native_turns, name, getattr(native_turns, name) / CONTROL_SCALE)
+
+
 @pytest.fixture
 def quick_control(monkeypatch):
     from shared_context import native_turns
@@ -1302,15 +1687,16 @@ def test_a_missing_rid_is_a_definite_answer_and_fences_the_turn(harness, monkeyp
 
 def test_a_running_turn_reads_its_rid_about_once_a_second(harness, monkeypatch):
     """Audit finding 14: the control observer read the RID every 0.1 s (10 reads/s per turn)."""
+    fast_control(monkeypatch)
     harness.sdk.block = True
     harness.invoke(submit())
     harness.wait("rid-1", "started")
     counted = flaky_reads(monkeypatch, "rid:rid-1")
-    time.sleep(2.2)
+    time.sleep(5 / CONTROL_SCALE)  # 5 polls; long enough that a stalled event loop still reads once
     reads = counted.reads
     harness.sdk.block = False
     harness.wait("rid-1", "completed")
-    assert 1 <= reads <= 4, reads
+    assert 1 <= reads <= 7, reads
 
 
 def test_a_turn_waiting_for_the_slot_reads_its_rid_at_most_every_two_seconds(harness, monkeypatch):
@@ -1436,16 +1822,17 @@ def appends_key(rid="rid-1"):
 
 def test_a_running_turn_with_steering_reads_its_appends_about_once_a_second(harness, monkeypatch):
     """Audit finding 14, second half: append delivery read ``appends:`` every 0.1 s while steering was ready."""
+    fast_control(monkeypatch)
     harness.sdk.block = True
     harness.invoke(submit())
     harness.wait("rid-1", "started")
     steer(harness)
     counted = flaky_reads(monkeypatch, appends_key())
-    time.sleep(2.2)
+    time.sleep(5 / CONTROL_SCALE)  # 5 polls; long enough that a stalled event loop still reads once
     reads = counted.reads
     harness.sdk.block = False
     harness.wait("rid-1", "completed")
-    assert 1 <= reads <= 4, reads
+    assert 1 <= reads <= 7, reads
 
 
 def test_an_append_saved_here_is_delivered_at_once(harness, monkeypatch):
@@ -1577,9 +1964,10 @@ def test_an_unconfirmed_append_remember_write_is_retried_and_the_append_sent_onc
     assert applied.status == "applied" and applied.sdk_message_id == "OFFLINE-sdk-message-1"
 
 
-def test_an_unconfirmed_sdk_handoff_keeps_the_turn_and_never_resends_the_append(harness):
+def test_an_unconfirmed_sdk_handoff_keeps_the_turn_and_never_resends_the_append(harness, monkeypatch):
     """The SDK send itself raised (503 ``NATIVE_APPEND_UNKNOWN``): the turn goes on; the claimed entry is not sent
     again and ends ``unknown`` (``sdk_unconfirmed``), so the owner reads it instead of getting a duplicate."""
+    fast_control(monkeypatch)
     harness.sdk.block = True
     harness.invoke(submit())
     active = harness.wait("rid-1", "started")
@@ -1593,7 +1981,8 @@ def test_an_unconfirmed_sdk_handoff_keeps_the_turn_and_never_resends_the_append(
     session.send = failing
     assert harness.invoke(append_command(active)).status_code == 202
     until(lambda: attempts)
-    time.sleep(2.5)  # past the first retry
+    passes = flaky_reads(monkeypatch, appends_key())
+    until(lambda: passes.reads >= 2)  # two delivery passes after the failure, each one a chance to resend
     assert not harness.sdk.controls["rid-1"].stop_requested()
     harness.sdk.block = False
     assert harness.wait("rid-1", "completed").result is not None

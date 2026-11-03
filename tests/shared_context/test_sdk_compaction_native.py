@@ -19,6 +19,7 @@ from shared_context.behavior_sdk_checkpoint import SdkStateUpload, checkpoint_ke
 from shared_context.behavior_sdk_state import DIAG_ARCHIVE_CODEC
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import LocalArtifactStore, sse
 from test_behavior_assistant import assistant
 from test_behavior_model_deadlines import asgi_server
@@ -251,8 +252,8 @@ def native_checkpoint_roundtrip(assistant, tmp_path, runtime_path, *, provider_m
     assert len({proof["sdk_session_id"] for proof in proofs})==1
     assert len({proof["conversation_id"] for proof in proofs})==1
     assert [proof["compaction_invoked"] for proof in proofs]==[False,True,False,False]
-    assert all(proof["sdk_stop"]["graceful"] and proof["sdk_stop"]["runtime_version"]=="1.0.83" for proof in proofs)
-    assert all(proof["sdk_version"]=="1.0.13" and proof["force_stop_calls"]==0 for proof in proofs)
+    assert all(proof["sdk_stop"]["graceful"] and proof["sdk_stop"]["runtime_version"]==RUNTIME_VERSION for proof in proofs)
+    assert all(proof["sdk_version"]==SDK_VERSION and proof["force_stop_calls"]==0 for proof in proofs)
     assert all(proof["python_driver_exit"]==0 for proof in proofs)
     if not provider_metadata:
         assert proofs[0]["state_bytes"]>131072 and proofs[0]["zlib_comparison_bytes"]>16000
@@ -277,7 +278,7 @@ def native_checkpoint_roundtrip(assistant, tmp_path, runtime_path, *, provider_m
     assert all(any(item["stage"]=="after_"+phase and item["turn_number"]==1 for item in reply_observations)
                for phase in ("compact","follow1","follow2"))
     assert reply_observations and all(item["acknowledged"] is False for item in reply_observations)
-    evidence={"sdk_version":"1.0.13","runtime_version":"1.0.83","evidence":"native SDK/runtime; offline transport; product API/authority/SQLite ArtifactStore",
+    evidence={"sdk_version": SDK_VERSION,"runtime_version": RUNTIME_VERSION,"evidence":"native SDK/runtime; offline transport; product API/authority/SQLite ArtifactStore",
         "documented_provider_metadata": provider_metadata,
         "provider_model": provider_model,
         "proofs":proofs,"model_requests":calls,"cloud_requests":0,"paid_model_requests":0,

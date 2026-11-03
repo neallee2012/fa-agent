@@ -8,6 +8,7 @@ from test_instruction_flow import instruction_models
 from test_instruction_save_receipts import save_case, completed_response_loss, sha
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
+from shared_context.sdk_pin import RUNTIME_VERSION
 
 
 def test_fixed_sdk_save_ack_loss_has_one_original_send_model_and_graceful_stop(assistant, monkeypatch):
@@ -59,7 +60,7 @@ def test_fixed_sdk_save_ack_loss_has_one_original_send_model_and_graceful_stop(a
 
     with save_case(assistant, monkeypatch, "after-commit", observed) as case:
         completed_response_loss(case, "succeeded")
-        assert versions and set(versions) == {"1.0.83"}
+        assert versions and set(versions) == {RUNTIME_VERSION}
         assert len(stops) == 1
         assert case.boundary.save_body["sdk_stop"]["pid"] == stops[0]["pid"]
         assert case.boundary.save_body["sdk_stop"]["exit_code"] == stops[0]["exit_code"]

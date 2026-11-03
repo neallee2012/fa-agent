@@ -646,6 +646,73 @@ test("Agent bootstrap uses the explicit default even when the directory order is
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
 });
 
+// The page opens on the default Agent, but its first read answers 401 (stage 2026-11-01): the bootstrap state stays.
+async function agentFirstReadRefused({refreshAt=null,now}={}){
+  const a=agentChat("agent-one"),bootstrap=agentChat(null);
+  bootstrap.tasks=[];bootstrap.composer=null;bootstrap.routines_available=false;a.routines_available=true;
+  bootstrap.authentication_refresh_at=refreshAt;
+  let finish;
+  const answer=new Promise(resolve=>{finish=resolve});
+  const ui=await open(bootstrap,{now,agentStates:{"agent-one":a},agentModelsResponses:{"agent-one":answer}});
+  const reads=()=>ui.calls.filter(call=>call.url.startsWith("/api/instructions/models")).length;
+  const refuse=async()=>{
+    finish({ok:false,status:401,json:async()=>({error:{code:"LOGIN_REQUIRED"}})});
+    delete ui.holder.agentModelsResponses["agent-one"];
+    await ui.tick();await ui.tick();await ui.tick();
+  };
+  return {ui,reads,refuse,a};
+}
+const pageState=ui=>vm.runInContext("state",ui.context);
+async function fireConnectionRefresh(ui,agents){
+  ui.holder.response={ok:true,json:async()=>({authentication:"AVAILABLE",authentication_refresh_at:null,
+    default_agent_id:"agent-one",agents})};
+  const [id,refresh]=[...ui.timers.entries()].find(([,fn])=>fn.name==="refreshAuthentication");
+  ui.timers.delete(id);refresh();
+  await ui.tick();await ui.tick();await ui.tick();await ui.tick();
+}
+
+test("the default Agent is read again once its refused first read's sign-in is good; nothing else would read it",async()=>{
+  const now=Date.parse("2026-09-30T09:00:00Z");
+  const {ui,reads,refuse,a}=await agentFirstReadRefused({refreshAt:now/1000+300,now});
+  await refuse();
+  assert.equal(reads(),1);
+  assert.equal(ui.nodes.get("agent-list").children[0].children[0].getAttribute("aria-current"),"true","still the selected Agent");
+  assert.equal(ui.nodes.get("instruction").placeholder,"對話還沒讀到");
+  await fireConnectionRefresh(ui,a.agents);
+  assert.equal(reads(),2);
+  assert.equal(pageState(ui).composer?.thread_id,a.composer.thread_id);
+  assert.equal(pageState(ui).routines_available,true,"the 排程 tab needs the Agent's own state");
+  assert.equal(ui.nodes.get("instruction").disabled,false);
+  assert.equal(ui.nodes.get("error").hidden,true);
+});
+
+test("clicking the selected Agent reads it again when its first read failed, and only then",async()=>{
+  const {ui,reads,refuse,a}=await agentFirstReadRefused();
+  await refuse();
+  assert.equal(reads(),1);
+  sidebar(ui,"agent-one").button.events.click();await ui.tick();await ui.tick();await ui.tick();
+  assert.equal(reads(),2);
+  assert.equal(pageState(ui).composer?.thread_id,a.composer.thread_id);
+  assert.equal(ui.nodes.get("error").hidden,true);
+  sidebar(ui,"agent-one").button.events.click();await ui.tick();await ui.tick();
+  assert.equal(reads(),2,"a loaded Agent is not read again by a click");
+});
+
+test("a connection refresh waits for the conversation read in flight, so it cannot pull the token from under it",async()=>{
+  // native._current refuses a read whose token was replaced meanwhile with 401 LOGIN_REQUIRED; only a non-default
+  // Agent's console can see that (the default one's read and refresh share Console.lock). The page treats them alike.
+  const now=Date.parse("2026-09-30T09:00:00Z");
+  const {ui,reads,refuse,a}=await agentFirstReadRefused({refreshAt:now/1000-1,now});
+  ui.holder.response={ok:true,json:async()=>({authentication:"AVAILABLE",authentication_refresh_at:null,
+    default_agent_id:"agent-one",agents:a.agents})};
+  const [id,refresh]=[...ui.timers.entries()].find(([,fn])=>fn.name==="refreshAuthentication");
+  ui.timers.delete(id);refresh();await ui.tick();await ui.tick();
+  assert.equal(ui.calls.some(call=>call.url==="/api/authenticate/refresh"),false,"not while the read runs");
+  assert.ok([...ui.timers.values()].some(fn=>fn.name==="refreshAuthentication"),"asked again later");
+  await refuse();
+  assert.equal(reads(),1);
+});
+
 test("an unavailable selected Agent keeps its draft and never switches to the default",async()=>{
   const b=agentChat("agent-two");
   const ui=await open(b,{agentStates:{"agent-two":b}});
@@ -1435,7 +1502,7 @@ test("a running turn whose progress read failed upstream keeps polling at its pa
 });
 
 test("a read conflict on the opening /status is not re-read in a tight loop",async()=>{
-  // #686 review: a 409 RESULT_UNKNOWN/412 reset the backoff to 1 s and the opening read re-armed at 0 ms.
+  // #686: a 409 RESULT_UNKNOWN/412 reset the backoff to 1 s and the opening read re-armed at 0 ms.
   const {data}=restartedConversation(2);
   const ui=await open(data,{progressResponse:()=>({ok:false,status:409,
     json:async()=>({error:{code:"RESULT_UNKNOWN",upstream_status:412}})})});
@@ -3405,7 +3472,7 @@ test("a message the server refused as busy keeps its text for sending again",asy
 });
 
 test("a message whose send ended unknown leaves the composer, so it is never one click from a new RID",async()=>{
-  // #679 review: with the composer always open, an UNKNOWN send left its text in place and one more click sent it
+  // #679: with the composer always open, an UNKNOWN send left its text in place and one more click sent it
   // again under a new RID. The text stays in its own turn instead (AGENTS.md 7: never resend an unknown request).
   const data=nativeChat("completed"),composer=data.composer;
   Object.assign(composer,{request_id:"draft-rid",editable:true,can_submit:true,content:null,observed_at:when});
@@ -3430,7 +3497,7 @@ test("a message whose send ended unknown leaves the composer, so it is never one
 });
 
 test("a refusal that is final for its RID offers no same-RID resend and says the text can be sent again",async()=>{
-  // #679 review round 3: only a version refusal goes out again with the same RID; the bridge refuses any other.
+  // #679: only a version refusal goes out again with the same RID; the bridge refuses any other.
   const data=nativeChat("completed"),final=copy(data.tasks[0]);
   Object.assign(final,{task_id:"refused-rid",submit_request_id:"refused-rid",instruction:"附了不能附的來源",reply:null,
     native_receipt:null,admission:null,not_accepted:true,status:{data:{state:"not_accepted"}},
@@ -3447,7 +3514,7 @@ test("a refusal that is final for its RID offers no same-RID resend and says the
 });
 
 test("a same-RID retry whose answer is unknown also leaves the composer; a refusal still waiting for it keeps the text",async()=>{
-  // #679 review round 2: the version resend (submit-retry) journals its outcome apart from the first submit, so the
+  // #679: the version resend (submit-retry) journals its outcome apart from the first submit, so the
   // first rule (submission UNKNOWN) missed it and the text was one click from a new RID.
   const base=nativeChat("completed"),sent=copy(base.tasks[0]);
   Object.assign(sent,{task_id:"retry-rid",submit_request_id:"retry-rid",instruction:"換版重送的訊息",reply:null,
@@ -3668,7 +3735,7 @@ test("a completed Responses handoff keeps observing until the peer reply appears
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
 });
 
-// Audit #13 round 2 (2026-10-14): a full read while a delegated reply is awaited costs 3+N API reads and the wait has
+// A full read while a delegated reply is awaited costs 3+N API reads and the wait has
 // no limit, but backing off from the first unchanged read showed the reply 4-8 s late (release 30 dev test). Unchanged
 // reads keep the usual pace for 30 s, then double up to 5 s whether push is open or not.
 const UNAVAILABLE_READ=()=>({ok:false,status:503,json:async()=>({error:{code:"NATIVE_BOOTSTRAP_UNKNOWN",automatic_retry:true}})});
@@ -3717,7 +3784,7 @@ test("waiting for a delegated reply reads unchanged conversations every second f
   }
 });
 
-// Audit round 1 (2026-10-14): a long (error) wait must not restart on every render, and must be short without push.
+// A long (error) wait must not restart on every render, and must be short without push.
 test("a render in the middle of a long wait does not push the next progress read further out",async()=>{
   const {ui,fire,delay}=await awaitingReplyUi({realtime:true});
   let clock=Date.parse(when);
@@ -3824,6 +3891,28 @@ test("a conversation another Agent opened is labelled as Agent data and stays re
   assert.equal(ui.nodes.get("new-instruction").disabled,true);
   assert.match(ui.text("follow-up-detail"),/其他助理交辦給這位助理的對話，只能檢視/);
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
+
+test("a finished read-only conversation leaves the owner nothing to do, so the header does not ask for action",async()=>{
+  const ui=await open(receivedChat());
+  assert.equal(ui.text("chat-presence"),"可以聊天");
+  assert.equal(ui.nodes.get("chat-presence").getAttribute("data-presence"),"ready");
+  // The line under the input still says why it is read-only.
+  assert.match(ui.text("follow-up-detail"),/只能檢視/);
+  assert.equal(ui.nodes.get("instruction").placeholder,"目前不能在這段對話續問");
+});
+
+test("a read-only conversation with a card waiting for the owner still asks for action",async()=>{
+  const data=receivedChat(),card=hitlChat().composer;
+  data.composer.native_hitl=card.native_hitl;
+  data.composer.attention=[{...card.attention[0],thread_id:data.composer.thread_id}];
+  const ui=await open(data);
+  assert.equal(ui.text("chat-presence"),"需要處理");
+});
+
+test("a conversation whose follow-up is really blocked still asks for action",async()=>{
+  const ui=await open(blockedConversation());
+  assert.equal(ui.text("chat-presence"),"需要處理");
 });
 
 test("while an Agent's first read runs the composer says so, not that a reply or a model list is missing",async()=>{
@@ -4243,7 +4332,7 @@ test("after a reload a kept link whose RID carried other text offers 帶回輸�
   assert.doesNotMatch(historyText(ui),/沒趕上這一回合/);
   assert.equal(sendsOrAppends(ui),0);
 });
-// Review round 2 on #941: the past tense waits for /submit, so a /next that fails never claimed a handover.
+// #941: the past tense waits for /submit, so a /next that fails never claimed a handover.
 test("a resend whose /next fails never said it was sent and offers 帶回輸入框 again",async()=>{
   const {ui}=await appendInTail("not_applied");
   assert.match(historyText(ui),/"沒趕上這一回合，會改成新訊息送出。"/);
@@ -4271,7 +4360,7 @@ test("a resend whose submit never went out keeps no link",async()=>{
     "written, then removed");
   assert.equal(JSON.parse(ui.context.localStorage.getItem("fa-resent-appends")||"{}")["append-offline-a"],undefined);
 });
-// Review round 3 on #941: agentFetch refuses an unavailable Agent before any request, so that /submit never went out:
+// #941: agentFetch refuses an unavailable Agent before any request, so that /submit never went out:
 // no "sent", no link, and the append keeps 帶回輸入框.
 test("a resend refused before its submit goes out keeps 帶回輸入框 and no link",async()=>{
   const {ui,done}=await appendInTail("not_applied",{agents:true});
@@ -4378,7 +4467,7 @@ test("an append read that never answers stops waiting and frees the composer",as
   assert.equal(vm.runInContext("progressBusy",ui.context),false);
   assert.deepEqual(sendPosts(ui),[]);
 });
-// Review round 2 on #941: one slow append read is a read to retry, not "the workbench did not answer", and the next good
+// #941: one slow append read is a read to retry, not "the workbench did not answer", and the next good
 // poll clears it.
 test("an append read timeout shows the progress retry notice and the next good poll clears it",async()=>{
   const {ui,after,settled}=await appendEndsUnread();
@@ -4392,7 +4481,7 @@ test("an append read timeout shows the progress retry notice and the next good p
   assert.equal(vm.runInContext("lastError",ui.context),null);
   assert.deepEqual(sendPosts(ui),[]);
 });
-// Review round 3 on #941: once its turn ended no progress read is due, so a failed append read reads itself again
+// #941: once its turn ended no progress read is due, so a failed append read reads itself again
 // (GET only) on the progress backoff, one timer per turn.
 const appendRetryTimer=ui=>{
   const id=vm.runInContext("[...appendRetryTimers.values()][0]??null",ui.context);
@@ -4470,7 +4559,7 @@ test("an append read refused with its own code keeps that code's meaning",async(
   assert.equal(vm.runInContext("lastError.code",ui.context),"NATIVE_STATE_INVALID");
   assert.equal(vm.runInContext("lastError.phase",ui.context),undefined);
 });
-// Review round 3 on #941: a failed append read without an error body is unreadable, like a progress read that throws,
+// #941: a failed append read without an error body is unreadable, like a progress read that throws,
 // so it is a read to retry rather than a fixed LOCAL_FAILURE.
 test("an append read failing without an error body shows the progress retry notice",async()=>{
   const data=appendChat(),rid=data.composer.request_id;
@@ -4481,7 +4570,7 @@ test("an append read failing without an error body shows the progress retry noti
   assert.equal(vm.runInContext("lastError.retrying",ui.context),true);
   assert.equal(ui.text("error-full"),"暫時讀不到進度，正在重試。訊息不會重送。");
 });
-// Review round 3 on #941: a coded error the read marks retryable (readRetryable) is a read to retry, not that code's
+// #941: a coded error the read marks retryable (readRetryable) is a read to retry, not that code's
 // own fixed meaning.
 for(const error of [{code:"BACKEND_OFFLINE"},{code:"NATIVE_BOOTSTRAP_UNKNOWN",automatic_retry:true}]){
   test(`an append read answering ${error.code} shows the progress retry notice`,async()=>{
@@ -4495,7 +4584,7 @@ for(const error of [{code:"BACKEND_OFFLINE"},{code:"NATIVE_BOOTSTRAP_UNKNOWN",au
     assert.equal(ui.text("error-full"),"暫時讀不到進度，正在重試。訊息不會重送。");
   });
 }
-// Review on #941: every progress poll of a running turn reads its accepted appends; that read must not shut 送出 for
+// #941: every progress poll of a running turn reads its accepted appends; that read must not shut 送出 for
 // a second append typed meanwhile. Only a turn that has ended holds the next message.
 test("an append read while its turn still runs leaves 送出 open for the next append",async()=>{
   const data=appendChat(),rid=data.composer.request_id,ui=await open(data),content="第一句";
@@ -4558,7 +4647,7 @@ test("an append answered not_applied while its original still stops and saves go
   assert.equal(ui.calls.filter(call=>call.method==="POST"&&/\/(next|submit|append)$/.test(call.url)).length,3,
     "the append, one /next and one /submit");
 });
-// Review P1 on #916: Responses has no queue (a human turn sent while the slot holder runs is busy_refused), so there the
+// #916: Responses has no queue (a human turn sent while the slot holder runs is busy_refused), so there the
 // resend waits for the original to end, as before.
 test("on Responses an append answered not_applied while its original still runs goes out only after it ends",async()=>{
   const data=appendChat();data.composer.can_follow_up=true;
@@ -4586,7 +4675,7 @@ test("on Responses an append answered not_applied while its original still runs 
   assert.deepEqual(submits.map(call=>call.url),["/api/instructions/next-rid/submit"]);
   assert.equal(JSON.parse(submits[0].body).content,content);
 });
-// Review P2 on #916: A1 accepted just before the channel closed, A2 answered not_applied after it. A read that still
+// #916: A1 accepted just before the channel closed, A2 answered not_applied after it. A read that still
 // shows A1 unsettled must not let A2 go first; once A1 settles, A1 goes out, then A2.
 test("two tail appends go out as new turns in their append order",async()=>{
   const data=appendChat();data.composer.can_follow_up=true;
@@ -4679,7 +4768,7 @@ test("an unsent native append remains visible after the original turn completes"
   await vm.runInContext("updateProgress()",ui.context);
   assert.equal(ui.nodes.get("instruction").value,"還沒送出的追加");
   assert.equal(ui.nodes.get("instruction").disabled,false);
-  // RTT A round 2: the turn ended with text in the box, so the conversation's next RID is taken ahead (local only).
+  // The turn ended with text in the box, so the conversation's next RID is taken ahead (local only).
   const nexts=ui.holder.pendingPosts.filter(post=>post.url.endsWith("/next"));
   assert.deepEqual(nexts.map(post=>post.url),[`/api/instructions/${done.composer.thread_id}/next`]);
   const next=copy(done);
@@ -5054,7 +5143,7 @@ test("a follow-up takes the next RID and submits it, with no environment check f
   assert.equal(sent.some(call=>/\/environment/.test(call.url)),false);
 });
 
-// RTT A round 2 (dev #706: 220-290 ms between the click and the submit went to /next): text typed after a finished turn
+// dev #706 (220-290 ms between the click and the submit went to /next): text typed after a finished turn
 // takes the conversation's next RID ahead, so the send's first request is the submit. The RID is still fixed before
 // the send, and a send while that request is on its way waits for it instead of asking a second time.
 function followUpReady(data,rid="follow-rid"){
@@ -6169,7 +6258,7 @@ function delayedNewConversation(){
   return {old,next};
 }
 function chooseModel(ui,id){ui.nodes.get("model").value=id;ui.nodes.get("model").events.change()}
-// RTT A round 2: text typed after a finished turn takes the conversation's next RID ahead (/next, local, never a send).
+// Text typed after a finished turn takes the conversation's next RID ahead (/next, local, never a send).
 // These cases are about other flows, so they look up their own POST and only require that nothing was sent.
 function newConversationPost(ui){
   return ui.holder.pendingPosts.filter(post=>post.url==="/api/instructions/conversations/new").at(-1);
@@ -8224,6 +8313,21 @@ test("a stopped native turn says it stopped and may have acted, also after 更�
   const other=copy(stopped);other.tasks[0].native_receipt.failure_code="NATIVE_TURN_UNKNOWN";ui.render(other);
   assert.equal(turnNode(ui).children[3].textContent,"這次回覆的結果還不確定。");
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
+
+// #1145 (Neal 2026-11-03): a stop that lands after the answer is saved comes too late; the answer is shown.
+test("a native turn completed after a late stop shows its answer and says the stop came too late",async()=>{
+  const done=nativeChat("completed");done.tasks[0].native_receipt.cancel_requested=true;
+  const ui=await open(done);
+  const shown=JSON.stringify(turnNode(ui),(key,value)=>key==="events"?undefined:value);
+  assert.match(shown,/完整回覆/);
+  assert.match(shown,/按停止時已經答完，答案照常保存。/);
+  assert.doesNotMatch(shown,/已要求停止這次回覆|已停止。|排隊中的交辦/);
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+  const handoff=nativeChat("completed"),receipt=handoff.tasks[0].native_receipt;
+  receipt.cancel_requested=true;receipt.queued_relay={status:"unknown",reason:"NATIVE_AGENT_SOURCE_INVALID"};
+  assert.match(JSON.stringify(turnNode(await open(handoff)),(key,value)=>key==="events"?undefined:value),
+    /按停止時已經答完，答案照常保存。排隊中的交辦因停止沒有送出。/);
 });
 
 test("a stopped native turn with tool steps says 已停止 in the summary row, not 結果不確定",async()=>{
@@ -11143,6 +11247,8 @@ test("routine settings: the owner disables one schedule against the version show
   assert.equal(routineRows(ui)[0].children[1].textContent,ROUTINE_DRAFT.content);
   assert.match(routineRows(ui)[0].children[2].textContent,/來源對話 conversa · 批准於/);
   assert.match(routineRows(ui)[1].children[0].textContent,/已停用/);
+  // Disabling publishes a new version whose approved_at is the moment it was disabled (native_routines.publish).
+  assert.match(routineRows(ui)[1].children[2].textContent,/來源對話 conversa · 停用於/);
   assert.equal(routineRows(ui)[1].children.length,3,"a disabled schedule has no button");
   const path="/api/routines/r1/versions/v-r1/disable";
   ui.holder.templateResponses[path]={ok:false,json:async()=>({error:{code:"LOCAL_OFFLINE"}})};
@@ -11284,7 +11390,7 @@ const routineRunNote=async status=>{
   return [ui,ui.nodes.get("attention-items").children.find(node=>node.getAttribute("data-routine-run")==="scheduled-rid")];
 };
 test("routine run 10-23: the approval conversation names a run needing attention and opens its conversation",async()=>{
-  // Review 2026-10-23 (P3-1): accepted/started may simply still be running; only unknown says it needs handling.
+  // accepted/started may simply still be running; only unknown says it needs handling.
   for(const status of ["accepted","unknown"])assert.equal((await routineRunNote(status))[1].textContent,
     `排程（10-23 09:00）${status==="accepted"?"執行中或等你處理":"需要處理"}，在『排程 10-23 09:00：整理文章』對話`);
   const [ui,note]=await routineRunNote("started");
@@ -11879,7 +11985,7 @@ test("a native stop refused as not sent asks again in the page and posts the sam
     [["/api/instructions/offline/cancel",{}],["/api/instructions/offline/cancel",{}]]);
 });
 
-// #813 review round 4: a delivery acknowledgement the API sent to no session says 「確認收到」 was not sent, not the
+// #813: a delivery acknowledgement the API sent to no session says 「確認收到」 was not sent, not the
 // message-send wording; a refused message send keeps its own wording.
 test("a native delivery acknowledgement the API sent to no session says the acknowledgement was not sent",async()=>{
   const data=nativeChat("completed"),task=data.tasks[0];

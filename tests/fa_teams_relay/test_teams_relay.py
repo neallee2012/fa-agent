@@ -141,7 +141,7 @@ UNCONFIRMED = "暫時無法確認助理有沒有收到；請先到工作台查�
 
 
 def test_a_message_no_poll_confirmed_is_unconfirmed_never_running(chat):
-    # #903 round 9: a poll that sent nothing confirms nothing, and no reply proves an earlier poll's send was not taken.
+    # #903: a poll that sent nothing confirms nothing, and no reply proves an earlier poll's send was not taken.
     case = chat(NOT_DISPATCHED)
     assert case.say() == UNCONFIRMED
     assert sum(case.clock.sleeps) == 108 and len(case.fake.posts) == 37

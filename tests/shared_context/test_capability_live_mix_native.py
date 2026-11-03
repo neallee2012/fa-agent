@@ -1,4 +1,4 @@
-"""Pinned SDK 1.0.13 / runtime 1.0.83 turn with the live v44 capability mix: WebIQ + desktop + Playwright.
+"""Pinned SDK 1.0.26 / runtime 1.0.103 turn with the live v44 capability mix: WebIQ + desktop + Playwright.
 
 Scripted provider, in-process fake WebIQ through the real API-side MCP client, and an offline stdio stand-in
 for Playwright with the same tool names; the desktop handler is replaced by a refusing stub (no X on this host).

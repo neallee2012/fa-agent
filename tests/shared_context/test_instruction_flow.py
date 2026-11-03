@@ -21,6 +21,8 @@ from shared_context import m2_copilot
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_checkpoint_privacy import jsonl_lines
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 
 @pytest.fixture
@@ -55,7 +57,7 @@ def sdk_io(monkeypatch,after_response=None,archive_oversize=False,*,expected_too
         sdk._cli_process = SimpleNamespace(pid=999,poll=lambda:0 if exited.is_set() else None,
                                            wait=lambda:exited.wait(),returncode=0)
         sdk.stop.side_effect=lambda:exited.set()
-        sdk.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+        sdk.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
         async def opened(*args, **options):
             resume = bool(args)
             sid = args[0] if resume else options["session_id"]
@@ -76,6 +78,7 @@ def sdk_io(monkeypatch,after_response=None,archive_oversize=False,*,expected_too
                     directory.mkdir(parents=True)
                     (directory/"workspace.yaml").write_text(metadata,encoding="utf-8")
             session = create_autospec(CopilotSession, instance=True)
+            session.rpc = OFFLINE_SESSION_RPC
             handlers=[]
             def subscribe(handler):
                 handlers.append(handler)

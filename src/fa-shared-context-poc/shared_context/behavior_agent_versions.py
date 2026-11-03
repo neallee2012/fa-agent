@@ -24,7 +24,7 @@ import time
 from .behavior_agent_onboarding import _PROBE_ENV, FoundryCallError, _list
 from .behavior_code_identity import code_sha256
 from .errors import Problem
-from .native_responses_wire import ACCEPTED_STATE_PROFILES, NATIVE_V2_PROFILE
+from .native_responses_wire import ACCEPTED_STATE_PROFILES, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE
 
 log = logging.getLogger(__name__)
 
@@ -223,8 +223,8 @@ class HostedVersions:
         return self._builds.get((target.project_endpoint, target.agent_name, version))
 
     def current(self, target, *, require_responses=False):
-        """The selected version, when this API can follow to it: from ADR-0009 2d-ii only a v2 definition (of any
-        build; v2 has its snapshot test). A v1 definition is incompatible, whatever its build."""
+        """The selected version, when this API can follow to it: a definition declaring an accepted profile (of any
+        build; each has its snapshot test), v2 or v3 from ADR-0009 3d-i. A v1 definition is incompatible."""
         try:
             foundry = self._foundry_for(target.project_endpoint)
             version = endpoint_version(foundry, target.agent_name)
@@ -242,7 +242,7 @@ class HostedVersions:
             raise refusal(503, FOLLOWING, "this Agent's Hosted version for the deployed build is not readable yet") from None
         if (not isinstance(observed, dict) or observed.get("name") != target.agent_name or observed.get("version") != version
                 or not _same_identity(observed, target)
-                or _declared_profile(observed) != NATIVE_V2_PROFILE
+                or _declared_profile(observed) not in ACCEPTED_STATE_PROFILES
                 or observed.get("status") != "active" or not isinstance(observed.get("definition"), dict)
                 or observed["definition"].get("kind") != "hosted"):
             log.warning("agent endpoint version is incompatible agent=%s version=%s", target.agent_name, version)
@@ -323,8 +323,6 @@ def deployed_build(runtime):
     return code_sha256() if resolver is None else resolver.build
 
 
-# ----- sync (deployment) ------------------------------------------------------------------------------------------
-
 _SYNC_LOCKS = {}
 _SYNC_GUARD = threading.Lock()
 
@@ -363,28 +361,17 @@ def sync_agent_version(foundry, target, *, build, source, preferred_version=None
             except FoundryCallError:
                 return {**result, "state": "pending", "reason": "FOUNDRY_READ_UNKNOWN"}
             if ready:
-                if (observed.get("name") != target.agent_name or observed.get("version") != version
-                        or not _same_identity(observed, target)
-                        or not _of_build([observed], build)
-                        or not definition_matches(observed.get("definition"), expected_hash)):
+                if _readback_conflicts(observed, version, target, build, expected_hash):
                     return {**result, "state": "failed", "reason": "HOSTED_DEFINITION_READBACK_CONFLICT"}
                 return {**result, "state": "ok", "version": version}
-            if version is not None:
+            action, reason = _next_action(same, version, mismatch, posted, before)
+            if action == "failed":
+                return {**result, "state": "failed", "reason": reason}
+            if action == "wait":
                 if clock() >= deadline:
                     return {**result, "state": "pending", "reason": "VERSION_NOT_ACTIVE_YET"}
                 sleep(_POLL_SECONDS)
                 continue
-            if mismatch:
-                return {**result, "state": "failed", "reason": "AGENT_VERSION_IDENTITY_MISMATCH"}
-            # Only versions that were not listed before our POST can be its result.
-            new = [item for item in same if _number(item) not in before]
-            if any(item.get("status") not in _SETTLED for item in same) or (posted and not new):
-                if clock() >= deadline:
-                    return {**result, "state": "pending", "reason": "VERSION_NOT_ACTIVE_YET"}
-                sleep(_POLL_SECONDS)
-                continue
-            if posted:
-                return {**result, "state": "failed", "reason": "FOUNDRY_VERSION_FAILED"}
             before = {_number(item) for item in same}
             try:
                 foundry.create_version(target.agent_name, definition=definition,
@@ -396,6 +383,29 @@ def sync_agent_version(foundry, target, *, build, source, preferred_version=None
                 # Unknown outcome: never POST again in this run; read back until it shows up or the wait ends.
                 log.warning("agent version create unknown agent=%s status=%s", target.agent_name, error.status)
             posted = True
+
+
+def _readback_conflicts(observed, version, target, build, expected_hash):
+    return bool(observed.get("name") != target.agent_name or observed.get("version") != version
+                or not _same_identity(observed, target)
+                or not _of_build([observed], build)
+                or not definition_matches(observed.get("definition"), expected_hash))
+
+
+def _next_action(same, version, mismatch, posted, before):
+    """After a listing with no active version of the definition: ``("wait", None)``, ``("create", None)`` or
+    ``("failed", reason)``."""
+    if version is not None:
+        return "wait", None
+    if mismatch:
+        return "failed", "AGENT_VERSION_IDENTITY_MISMATCH"
+    # Only versions that were not listed before our POST can be its result.
+    new = [item for item in same if _number(item) not in before]
+    if any(item.get("status") not in _SETTLED for item in same) or (posted and not new):
+        return "wait", None
+    if posted:
+        return "failed", "FOUNDRY_VERSION_FAILED"
+    return "create", None
 
 
 def _definition(foundry, name, version, code="SOURCE_VERSION_MISSING"):
@@ -438,32 +448,44 @@ _ENVIRONMENT_FLAGS = frozenset({
 })
 
 
-def _check_environment(environment, idle_timeout_seconds):
-    environment = {} if environment is None else environment
+def _environment_shape_invalid(environment):
+    """Not an object of known flag names with bounded non-empty text values."""
     try:
-        invalid = (not isinstance(environment, dict) or set(environment) - _ENVIRONMENT_FLAGS
-                   or any(not isinstance(value, str) or not value or len(value.encode("utf-8")) > 2048
-                          for value in environment.values()))
+        return bool(not isinstance(environment, dict) or set(environment) - _ENVIRONMENT_FLAGS
+                    or any(not isinstance(value, str) or not value or len(value.encode("utf-8")) > 2048
+                           for value in environment.values()))
     except UnicodeError:
-        invalid = True
-    if invalid or type(idle_timeout_seconds) is not int or not 120 <= idle_timeout_seconds <= 3600:
-        raise Problem(409, "HOSTED_ENVIRONMENT_INVALID", "only bounded non-secret deployment settings are accepted")
+        return True
+
+
+def _flag_value_invalid(environment):
     switches = _ENVIRONMENT_FLAGS - {"FA_NATIVE_TURNS", "FA_NATIVE_HITL_TTL_SECONDS", "FA_PRIVATE_MEMORY_STORE", "TZ",
                                      "FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL"}
-    if (any(key in environment and environment[key] not in {"0", "1"} for key in switches)
-            or "FA_NATIVE_TURNS" in environment and environment["FA_NATIVE_TURNS"] not in ACCEPTED_STATE_PROFILES
-            or environment.get("FA_MEMORY_BACKEND", "foundry") not in {"foundry", "cosmos"}
-            or "FA_NATIVE_HITL_TTL_SECONDS" in environment
-            and re.fullmatch(r"[1-9][0-9]{0,5}", environment["FA_NATIVE_HITL_TTL_SECONDS"]) is None
-            or any("\x00" in value or "\r" in value or "\n" in value for value in environment.values())):
+    return bool(any(key in environment and environment[key] not in {"0", "1"} for key in switches)
+                or "FA_NATIVE_TURNS" in environment and environment["FA_NATIVE_TURNS"] not in ACCEPTED_STATE_PROFILES
+                or environment.get("FA_MEMORY_BACKEND", "foundry") not in {"foundry", "cosmos"}
+                or "FA_NATIVE_HITL_TTL_SECONDS" in environment
+                and re.fullmatch(r"[1-9][0-9]{0,5}", environment["FA_NATIVE_HITL_TTL_SECONDS"]) is None
+                or any("\x00" in value or "\r" in value or "\n" in value for value in environment.values()))
+
+
+def _check_environment(environment, idle_timeout_seconds):
+    environment = {} if environment is None else environment
+    if (_environment_shape_invalid(environment)
+            or type(idle_timeout_seconds) is not int or not 120 <= idle_timeout_seconds <= 3600):
+        raise Problem(409, "HOSTED_ENVIRONMENT_INVALID", "only bounded non-secret deployment settings are accepted")
+    if _flag_value_invalid(environment):
         raise Problem(409, "HOSTED_ENVIRONMENT_INVALID", "a deployment flag value is invalid")
     return dict(environment)
 
 
 def _carried_environment(environment):
     """The ENV a new definition keeps: probe keys never carry over, and a native Agent with text groups also gets
-    the Responses lane every group turn runs on (only when unset; an explicit 0 stays 0)."""
-    carried = {key: value for key, value in environment.items() if key not in _PROBE_ENV}
+    the Responses lane every group turn runs on (only when unset; an explicit 0 stays 0).
+
+    The runtime path is the image's own ENV: a carried value would point a new image at a runtime it does not ship."""
+    carried = {key: value for key, value in environment.items()
+               if key not in _PROBE_ENV and key != "BEHAVIOR_ASSISTANT_RUNTIME_PATH"}
     if (carried.get("FA_NATIVE_GROUPS_ENABLED") == "1" and carried.get("FA_NATIVE_TURNS") in ACCEPTED_STATE_PROFILES
             and "FA_RESPONSES_ENABLED" not in carried):
         carried["FA_RESPONSES_ENABLED"] = "1"
@@ -573,48 +595,21 @@ def sync_all(composition, foundry_for, *, image=None, agent_id=None, set_route=F
              hosted_environment=None, idle_timeout_seconds=900, native_v2_registered=False,
              sleep=time.sleep, clock=time.monotonic, wait_seconds=SYNC_WAIT_SECONDS):
     """One result per Agent; each is independent and a failure only logs. ``native_v2_registered`` (the switch is on): a registered Agent whose served definition declares a native profile
-    (an assistant: onboarding copies A's definition; executors declare none) also declares v2, the overlay ci_deploy
+    (an assistant: onboarding copies A's definition; executors declare none) also declares v3 (ADR-0009 3d-i; the flag keeps its 2d-i name), the overlay ci_deploy
     gives the configured assistants; its other ENV carries over unchanged."""
     build = code_sha256() if build is None else build
     original, agents = _agents(composition)
-    hosted_environment = {} if hosted_environment is None else hosted_environment
-    if not isinstance(hosted_environment, dict) or set(hosted_environment) - {target.agent_id for target, _ in agents}:
-        raise Problem(409, "HOSTED_ENVIRONMENT_INVALID", "deployment settings must name a served Agent")
-    for environment in hosted_environment.values():
-        if not isinstance(environment, dict):
-            raise Problem(409, "HOSTED_ENVIRONMENT_INVALID", "each Agent override must be an object")
-        _check_environment(environment, idle_timeout_seconds)
-    _check_environment({}, idle_timeout_seconds)
+    hosted_environment = _checked_overrides(agents, hosted_environment, idle_timeout_seconds)
     results = []
     for target, kind in agents:
         if agent_id is not None and target.agent_id != agent_id:
             continue
         foundry = foundry_for(target.project_endpoint)
         try:
-            published = endpoint_version(foundry, target.agent_name)
-            upgrade = native_v2_registered and kind == "registered"
-            details = foundry.get_version(target.agent_name, published) if set_route or upgrade else None
-            if set_route:
-                if details.get("status") != "active" or not _same_identity(details, target):
-                    raise Problem(409, "SOURCE_VERSION_MISSING", "the served source version is not confirmed")
-                route(foundry, target.agent_name, published)
-            overlay = hosted_environment.get(target.agent_id)
-            declared = _declared_profile(details) if upgrade else None
-            if upgrade and declared in ACCEPTED_STATE_PROFILES:
-                overlay = {**(overlay or {}), "FA_NATIVE_TURNS": NATIVE_V2_PROFILE}
-            elif upgrade:  # no accepted profile (an executor declares none): its ENV carries over, no v2
-                log.info("agent version sync %s: registered, served FA_NATIVE_TURNS=%s is no native profile; "
-                         "v2 not added", target.agent_id, declared)
-            source = desired_source(image_source(foundry, target, image), overlay,
-                                    idle_timeout_seconds=idle_timeout_seconds)
-            result = sync_agent_version(foundry, target, build=build, source=source, sleep=sleep, clock=clock,
-                                        wait_seconds=wait_seconds, preferred_version=published)
-            if set_route and result["state"] == "ok":
-                try:
-                    route(foundry, target.agent_name, result["version"])
-                    result["route"] = "ok"
-                except (Problem, FoundryCallError) as error:
-                    result["route"] = getattr(error, "body", {}).get("error", {}).get("code", "ROUTE_UNKNOWN")
+            result = _sync_target(
+                foundry, target, upgrade=native_v2_registered and kind == "registered", image=image,
+                set_route=set_route, build=build, overlay=hosted_environment.get(target.agent_id),
+                idle_timeout_seconds=idle_timeout_seconds, sleep=sleep, clock=clock, wait_seconds=wait_seconds)
         except Exception as error:  # one Agent never stops the others
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
             result = {"agent_id": target.agent_id, "agent_name": target.agent_name, "build": build,
@@ -626,9 +621,54 @@ def sync_all(composition, foundry_for, *, image=None, agent_id=None, set_route=F
     return results
 
 
-def main(argv=None):
-    from .behavior_server import build_server
-    from .behavior_server_config import load_configuration
+def _checked_overrides(agents, hosted_environment, idle_timeout_seconds):
+    """The per-Agent ENV overrides, refused before any Agent is touched unless each names a served Agent."""
+    hosted_environment = {} if hosted_environment is None else hosted_environment
+    if not isinstance(hosted_environment, dict) or set(hosted_environment) - {target.agent_id for target, _ in agents}:
+        raise Problem(409, "HOSTED_ENVIRONMENT_INVALID", "deployment settings must name a served Agent")
+    for environment in hosted_environment.values():
+        if not isinstance(environment, dict):
+            raise Problem(409, "HOSTED_ENVIRONMENT_INVALID", "each Agent override must be an object")
+        _check_environment(environment, idle_timeout_seconds)
+    _check_environment({}, idle_timeout_seconds)
+    return hosted_environment
+
+
+def _sync_target(foundry, target, *, upgrade, image, set_route, build, overlay, idle_timeout_seconds, sleep, clock,
+                 wait_seconds):
+    """One Agent's sync; ``upgrade``: a registered Agent whose served definition is moved to v3 (ADR-0009 3d-i)."""
+    published = endpoint_version(foundry, target.agent_name)
+    details = foundry.get_version(target.agent_name, published) if set_route or upgrade else None
+    if set_route:
+        if details.get("status") != "active" or not _same_identity(details, target):
+            raise Problem(409, "SOURCE_VERSION_MISSING", "the served source version is not confirmed")
+        route(foundry, target.agent_name, published)
+    if upgrade:
+        overlay = _v3_overlay(overlay, details, target)
+    source = desired_source(image_source(foundry, target, image), overlay, idle_timeout_seconds=idle_timeout_seconds)
+    result = sync_agent_version(foundry, target, build=build, source=source, sleep=sleep, clock=clock,
+                                wait_seconds=wait_seconds, preferred_version=published)
+    if set_route and result["state"] == "ok":
+        try:
+            route(foundry, target.agent_name, result["version"])
+            result["route"] = "ok"
+        except (Problem, FoundryCallError) as error:
+            result["route"] = getattr(error, "body", {}).get("error", {}).get("code", "ROUTE_UNKNOWN")
+    return result
+
+
+def _v3_overlay(overlay, details, target):
+    declared = _declared_profile(details)
+    # ADR-0009 3d-i: a served definition declaring v1 (stored before M1 retired the alias) or v2 is moved to v3 here
+    if declared in ACCEPTED_STATE_PROFILES or declared == UNLABELED_STATE_PROFILE:
+        return {**(overlay or {}), "FA_NATIVE_TURNS": NATIVE_V3_PROFILE}
+    # no accepted profile (an executor declares none): its ENV carries over, no v3
+    log.info("agent version sync %s: registered, served FA_NATIVE_TURNS=%s is no native profile; "
+             "v3 not added", target.agent_id, declared)
+    return overlay
+
+
+def _parser():
     parser = argparse.ArgumentParser(prog="agent-versions",
         description="Create each Agent's Hosted version for this image's build (run from the new image).")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -643,7 +683,7 @@ def main(argv=None):
     sync.add_argument("--verify-follow", action="store_true",
                       help="ADR-0009 2d-i: report each Agent's environment (metadata only), never follow")
     sync.add_argument("--native-v2-registered", action="store_true",
-                      help="ADR-0009 2d-i switch on: registered assistants also declare foundry-native-v2")
+                      help="ADR-0009 2d-i switch on: registered assistants declare foundry-native-v3 (3d-i)")
     sync.add_argument("--follow-wait-seconds", type=int, default=1200,
                       help="deployment wait for original environment readiness; a timeout never cancels the follow")
     sync.add_argument("--hosted-environment", help="deployment-only JSON: Agent ID to explicit non-secret ENV overrides")
@@ -657,73 +697,101 @@ def main(argv=None):
     patrol = commands.add_parser("patrol", help="ADR-0009 2d-i P8: run one metadata-only session patrol pass now")
     patrol.add_argument("--config")
     patrol.add_argument("--once", action="store_true", required=True, help="the only mode: one pass, print its summary")
-    args = parser.parse_args(argv)
-    if args.command == "patrol":
-        from .native_session_patrol import NativeSessionPatrol
-        try:
-            with build_server(load_configuration(args.config)) as composition:
-                composition.installation()
-                if composition.runtime.work_policy is None:
-                    raise Problem(503, "WORK_POLICY_DISABLED", "the installed standing policy is required")
-                counts = NativeSessionPatrol(composition, switch=lambda _agent_id: False).run_once()
-        except Problem as error:
-            print(json.dumps({"state": "failed", "reason": error.body["error"]["code"]}), file=sys.stderr)
-            return 1
-        print(json.dumps({"state": "ok", "patrol": counts}, sort_keys=True))
-        return 0
-    if args.command == "fence":
-        if args.clear and args.confirm != args.agent_id:
-            parser.error("--clear needs --confirm with the same Agent ID")
-        from .native_cut import fence_command
-        try:
-            with build_server(load_configuration(args.config)) as composition:
-                composition.installation()
-                print(json.dumps(fence_command(composition, args.agent_id, clear=args.clear), sort_keys=True))
-        except Problem as error:
-            print(json.dumps({"state": "failed", "reason": error.body["error"]["code"]}), file=sys.stderr)
-            return 1
-        return 0
+    return parser
+
+
+def _patrol(args):
+    from .behavior_server import build_server
+    from .behavior_server_config import load_configuration
+    from .native_session_patrol import NativeSessionPatrol
+    try:
+        with build_server(load_configuration(args.config)) as composition:
+            composition.installation()
+            if composition.runtime.work_policy is None:
+                raise Problem(503, "WORK_POLICY_DISABLED", "the installed standing policy is required")
+            counts = NativeSessionPatrol(composition, switch=lambda _agent_id: False).run_once()
+    except Problem as error:
+        print(json.dumps({"state": "failed", "reason": error.body["error"]["code"]}), file=sys.stderr)
+        return 1
+    print(json.dumps({"state": "ok", "patrol": counts}, sort_keys=True))
+    return 0
+
+
+def _fence(parser, args):
+    from .behavior_server import build_server
+    from .behavior_server_config import load_configuration
+    if args.clear and args.confirm != args.agent_id:
+        parser.error("--clear needs --confirm with the same Agent ID")
+    from .native_cut import fence_command
+    try:
+        with build_server(load_configuration(args.config)) as composition:
+            composition.installation()
+            print(json.dumps(fence_command(composition, args.agent_id, clear=args.clear), sort_keys=True))
+    except Problem as error:
+        print(json.dumps({"state": "failed", "reason": error.body["error"]["code"]}), file=sys.stderr)
+        return 1
+    return 0
+
+
+def _read_overlay(path):
+    """The deployment-only Agent ID -> ENV overrides file (at most 64 KiB), None when no file is named."""
+    from .behavior_api import _nonfinite, _unique
+    if path is None:
+        return None
+    with Path(path).open("rb") as stream:
+        raw = stream.read(65537)
+    if len(raw) > 65536:
+        raise Problem(413, "HOSTED_ENVIRONMENT_INVALID", "the deployment overlay exceeds 64 KiB")
+    return json.loads(raw, object_pairs_hook=_unique, parse_constant=_nonfinite)
+
+
+def _follow_published(composition, results, args, settled):
+    """Follow every Agent whose version and route are published; one that does not settle fails its result."""
+    from .native_environment_sync import follow_all
+    published = {item["agent_id"] for item in results if item["state"] == "ok" and item.get("route") == "ok"}
+    if not published:
+        return
+    composition.installation()
+    verify = {"verify_only": True} if args.verify_follow else {}  # P6's deploy hook
+    followed = {item["agent_id"]: item for item in follow_all(
+        composition, agent_id=args.agent_id, published=published, wait_seconds=args.follow_wait_seconds, **verify)}
+    for item in results:
+        if item["agent_id"] in followed:
+            observation = followed[item["agent_id"]]
+            item["environment_follow"] = observation
+            if observation["state"] not in settled:
+                item.update(version_state=item["state"], state="failed",
+                            reason=observation.get("reason", "NATIVE_ENVIRONMENT_PENDING"))
+
+
+def _checked_core(parser, args):
+    """This image's code identity, after the flag combinations and ``--core`` are refused or accepted."""
     if (args.follow_wait_seconds < 1 or args.defer_follow and not args.route
             or args.verify_follow and (args.defer_follow or not args.route)):
         parser.error("--defer-follow and --verify-follow require --route and exclude each other; "
                      "--follow-wait-seconds must be positive")
-    # "drifted" is reported, never a failure (follow and verify). Verify-only also accepts "pending": an Agent still on
-    # its earlier session moves after its next turn end.
-    settled = {"ok", "skipped", "drifted"} | ({"pending"} if args.verify_follow else set())
     core = code_sha256()
     if args.core is not None and (re.fullmatch(r"[0-9a-f]{64}", args.core) is None or args.core != core):
         parser.error("--core must be the 64-hex code identity from this image's code_sha256(), not its image digest")
+    return core
+
+
+def _sync_command(parser, args):
+    from .behavior_server import build_server
+    from .behavior_server_config import load_configuration
+    core = _checked_core(parser, args)
+    # "drifted" is reported, never a failure (follow and verify). Verify-only also accepts "pending": an Agent still on
+    # its earlier session moves after its next turn end.
+    settled = {"ok", "skipped", "drifted"} | ({"pending"} if args.verify_follow else set())
     try:
-        from .behavior_api import _nonfinite, _unique
-        environment = None
-        if args.hosted_environment is not None:
-            with Path(args.hosted_environment).open("rb") as stream:
-                raw = stream.read(65537)
-            if len(raw) > 65536:
-                raise Problem(413, "HOSTED_ENVIRONMENT_INVALID", "the deployment overlay exceeds 64 KiB")
-            environment = json.loads(raw, object_pairs_hook=_unique, parse_constant=_nonfinite)
+        environment = _read_overlay(args.hosted_environment)
         with build_server(load_configuration(args.config)) as composition:
             results = sync_all(composition, composition.hosted_versions._foundry_for,
                                image=args.image, agent_id=args.agent_id, set_route=args.route, build=core,
                                hosted_environment=environment, idle_timeout_seconds=args.idle_timeout_seconds,
                                native_v2_registered=args.native_v2_registered)
             if args.route and not args.defer_follow:
-                from .native_environment_sync import follow_all
-                published = {item["agent_id"] for item in results
-                             if item["state"] == "ok" and item.get("route") == "ok"}
-                if published:
-                    composition.installation()
-                    verify = {"verify_only": True} if args.verify_follow else {}  # P6's deploy hook
-                    followed = {item["agent_id"]: item for item in follow_all(
-                        composition, agent_id=args.agent_id, published=published, wait_seconds=args.follow_wait_seconds,
-                        **verify)}
-                    for item in results:
-                        if item["agent_id"] in followed:
-                            observation = followed[item["agent_id"]]
-                            item["environment_follow"] = observation
-                            if observation["state"] not in settled:
-                                item.update(version_state=item["state"], state="failed",
-                                            reason=observation.get("reason", "NATIVE_ENVIRONMENT_PENDING"))
+                _follow_published(composition, results, args, settled)
     except Problem as error:
         print(json.dumps({"state": "failed", "reason": error.body["error"]["code"]}), file=sys.stderr)
         return 1
@@ -735,6 +803,16 @@ def main(argv=None):
     return 0 if all(result["state"] == "ok" and result.get("route", "ok") == "ok"
                     and result.get("environment_follow", {}).get("state", "ok") in settled
                     for result in results) else 1
+
+
+def main(argv=None):
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.command == "patrol":
+        return _patrol(args)
+    if args.command == "fence":
+        return _fence(parser, args)
+    return _sync_command(parser, args)
 
 
 if __name__ == "__main__":

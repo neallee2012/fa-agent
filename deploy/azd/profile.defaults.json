@@ -3,8 +3,7 @@
   "hosted_idle_timeout_seconds": 3600,
   "assistant_environment": {
     "BEHAVIOR_ASSISTANT_PROFILE": "assistant-v1.2",
-    "BEHAVIOR_ASSISTANT_RUNTIME_PATH": "/opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime",
-    "FA_NATIVE_TURNS": "foundry-native-v1"
+    "FA_NATIVE_TURNS": "foundry-native-v3"
   },
   "assistant_hosted_environment": {
     "FA_NATIVE_HITL_ENABLED": "1",
@@ -46,7 +45,7 @@
     "FA_CAPABILITY_BUILTINS": "fa-desktop-v1,fa-delegate-v1,fa-delegate-reader-v1,fa-skills-v1,fa-skill-resources-v1,fa-memory-candidate-v1,fa-skillify-v1,fa-image-delivery-v1,fa-shell-v1,fa-agent-collaboration-v1",
     "FA_DELIVERY_PENDING_INDEX_WRITER": "true",
     "FA_WORK_REGISTRY_WRITER": "true",
-    "FA_NATIVE_TURNS": "foundry-native-v1",
+    "FA_NATIVE_TURNS": "foundry-native-v2",
     "FA_NATIVE_HITL_ENABLED": "1",
     "FA_NATIVE_HITL_TTL_SECONDS": "600",
     "FA_NATIVE_GROUPS_ENABLED": "1",

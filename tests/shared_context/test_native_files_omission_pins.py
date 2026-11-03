@@ -7,7 +7,7 @@ from shared_context.native_environment import _key, _read
 from shared_context.native_files_omission import scan_observation
 from shared_context.native_turns import TURNS_STORE, _json
 from test_native_environment import invoke
-from test_native_files_api import (  # noqa: F401 - pytest fixtures
+from test_native_files_api import (  # fixture
     file_api, file_loops, follow, instruction_models, jwk_client, local_env, native_api, signing_key,
     synthetic_standing_v1, token, legacy_source,
 )

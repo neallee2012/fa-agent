@@ -116,7 +116,8 @@ def test_a_saved_answer_longer_than_one_result_part_is_published_whole(responses
 
 @pytest.mark.parametrize("winner, expected", [
     ("another-session", ("NATIVE_TURN_NOT_TAKEN", "started", "OFFLINE-other-token")),
-    ("same-session", ("NATIVE_TURN_UNKNOWN", "unknown", "OFFLINE-other-token")),
+    # Nobody numbered it, so closing it fences the other writer before the SDK (#1147).
+    ("same-session", ("NATIVE_TURN_NOT_STARTED", "unknown", "OFFLINE-other-token")),
 ], ids=["another-session", "same-session"])
 def test_a_start_write_another_writer_won_is_not_run_here(responses, monkeypatch, winner, expected):
     """An unconfirmed start CAS whose record now differs from both ours and the original: never this response's SDK."""

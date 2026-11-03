@@ -19,8 +19,8 @@ from typing import Any, Mapping
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
 sys.path.insert(0, str(HERE))
-from deployment_config import validate_config  # noqa: E402
-import models  # noqa: E402
+from deployment_config import validate_config
+import models
 
 DEFAULTS = HERE / "profile.defaults.json"
 # Microsoft Azure CLI, the first-party public client the operator scripts use for the owner's delegated token.

@@ -1,7 +1,7 @@
 """FA_SDK_TELEMETRY (on by default): pinned SDK/runtime spans reach Application Insights through Microsoft's exporter.
 
 Offline only: synthetic model HTTP, a loopback stand-in for the ingestion endpoint, no Azure call.
-The real-runtime cases need the pinned runtime 1.0.83 (``M2_TEST_RUNTIME``), like test_m2_copilot.
+The real-runtime cases need the pinned runtime 1.0.103 (``M2_TEST_RUNTIME``), like test_m2_copilot.
 """
 import asyncio
 import gzip
@@ -27,9 +27,9 @@ from shared_context.behavior_assistant_boundary import AssistantModelBoundary
 from shared_context.behavior_sdk_files import SdkSessionFiles
 from shared_context.m2_copilot import ToolOutput, ToolSpec, run_copilot
 from test_instruction_responses_native import OPAQUE, SUMMARY, response_bytes
-from test_m2_copilot import ScriptedEndpoint, runtime_path, workspace  # noqa: F401 (fixtures)
-from test_native_responses import responses  # noqa: F401 (fixture)
-from test_native_turns import local_env  # noqa: F401 (fixture)
+from test_m2_copilot import ScriptedEndpoint, runtime_path, workspace  # fixture
+from test_native_responses import responses  # fixture
+from test_native_turns import local_env  # fixture
 
 TURN_TRACE, TURN_PARENT = "1f" * 16, "2e" * 8
 RAW_REASONING = "RAW_PROVIDER_REASONING_CANARY"
@@ -521,7 +521,9 @@ def test_hosted_log_export_sends_only_the_listed_prefixes_of_the_listed_loggers(
                        "items=3 tools=2 images=0 keys=input,model", 3, False)
         cut = logging.getLogger("shared_context.native_environment_cut")
         cut.warning("NATIVE_UPGRADE_CUT outcome=%s reason=%s scan_ms=%d", "ready", "none", 518)
-        turns.warning("FA_NATIVE_HTTP %s", json.dumps({"canary": LOG_CANARY}))  # same logger, an unlisted prefix
+        turns.warning("FA_NATIVE_HTTP %s", json.dumps({"phase": "entered", "operation": None}))
+        turns.warning("FA_NATIVE_HTTP_RAW %s", LOG_CANARY)  # the prefix ends with its space
+        logging.getLogger("shared_context.behavior_hosted").warning("FA_HOSTED_DISPATCH %s", LOG_CANARY)  # unlisted
         turns.info("FA_NATIVE_ENQUEUE_RETAINED rid=%s", LOG_CANARY)  # INFO is on now; unlisted INFO lines stay out
         turns.warning("FA_NATIVE_POST_TURN_UNKNOWN exception_type=%s", LOG_CANARY)  # the prefix ends with its space
         cut.warning("NATIVE_UPGRADE_WITHDRAWN request_id_prefix=%s", LOG_CANARY)
@@ -559,7 +561,7 @@ def test_hosted_log_export_sends_only_the_listed_prefixes_of_the_listed_loggers(
 
     logs = [item for item in telemetry.items if item["data"]["baseType"] == "MessageData"]
     messages = [item["data"]["baseData"]["message"] for item in logs]
-    assert len(messages) == 13, messages
+    assert len(messages) == 14, messages
     timing = json.loads(messages[0].removeprefix("FA_TIMING "))
     assert (timing["phase"], timing["job_id"], timing["outcome"]) == ("sdk_process_start", "0123456789ab", "returned")
     assert messages[1:] == [
@@ -570,6 +572,7 @@ def test_hosted_log_export_sends_only_the_listed_prefixes_of_the_listed_loggers(
         "error_type=none error_param=none inner_code=none items=3 tools=2 images=0 keys=input,model attempts=3 "
         "before_output=False",
         "NATIVE_UPGRADE_CUT outcome=ready reason=none scan_ms=518",
+        'FA_NATIVE_HTTP {"phase": "entered", "operation": null}',
         "FA_PRIVATE_MEMORY_UPDATE status=401 stage=embedding",
         "FA_TEAM_MEMORY_CREATE status=skipped reason=embedding_unavailable",
         "FA_TEAM_MEMORY_SEARCH status=404 mode=contextual",

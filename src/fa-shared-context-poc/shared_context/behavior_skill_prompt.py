@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from .behavior_instruction_prompt import PromptAssemblyRecord, PromptProfile, assemble_instruction_prompt
-from .behavior_wire import Digest, WireModel
+from .behavior_wire import Digest, WireModel, exact_prefix, known_release
 from .behavior_user_turn_prompt import USER_TURN_PROFILE, UserTurnPromptAssemblyRecord, assemble_user_turn_prompt
 from .behavior_user_file_prompt import USER_FILE_PROFILE, UserFilePromptAssemblyRecord, assemble_user_file_prompt
 from .behavior_assistant_reply_prompt import (
@@ -37,6 +37,8 @@ from .behavior_reviewed_note_prompt import REVIEWED_NOTE_PROFILE, ReviewedNotePr
 from .behavior_skill_resources_prompt import (
     SKILL_RESOURCES_PROFILE, SkillResourcesPromptRecord, assemble_skill_resources_prompt,
 )
+from .native_responses_wire import SENT_RELEASE
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 SKILL_PROFILE = "fa-instruction-skills-v1"
 PURPOSE_SKILL_PROFILES = (SKILL_PURPOSE_PROFILE, SKILL_RESOURCES_PROFILE)
@@ -110,17 +112,14 @@ class SkillPromptAssemblyRecord(WireModel):
     prefix_sha256: Digest
     prefix_utf8_bytes: Annotated[int, Field(gt=0)]
     prefix_tokens: None = None
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]
+    runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
+    _release = model_validator(mode="after")(known_release)
     omissions: tuple[str, ...] = _OMISSIONS
 
     @model_validator(mode="after")
     def exact(self):
-        raw = SKILL_PROMPT.encode("utf-8")
-        if (self.prefix_sha256 != hashlib.sha256(raw).hexdigest() or self.prefix_utf8_bytes != len(raw)
-                or self.omissions != _OMISSIONS):
-            raise ValueError("Skill prompt assembly differs from its versioned source")
-        return self
+        return exact_prefix(self, SKILL_PROMPT, _OMISSIONS, "Skill prompt assembly differs from its versioned source")
 
 
 AssemblyRecord = (PromptAssemblyRecord | SkillPromptAssemblyRecord | UserTurnPromptAssemblyRecord

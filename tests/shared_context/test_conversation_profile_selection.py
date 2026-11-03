@@ -2,6 +2,7 @@
 
 from types import MappingProxyType, SimpleNamespace
 import hashlib
+import json
 
 import pytest
 
@@ -22,6 +23,7 @@ from shared_context.behavior_operations import control_key
 from test_instruction_prompt import submit, submit_legacy
 from test_m3_auth import jwk_client, signing_key, token
 from test_work_policy_lifecycle import enabled
+from test_stage_select_all_capabilities import script
 
 PATH = "/work-policy/v1/agent-template"
 
@@ -381,3 +383,50 @@ def test_impossible_default_model_catalog_budget_is_refused_before_selection(ass
     assert response.status_code in {413, 503}
     assert response.json()["error"]["code"] == expected
     assert h.store._guard() == before and not control.records
+
+
+@pytest.mark.parametrize("settings", [{"sdk_version": "1.0.26", "runtime_version": "1.0.103"},
+                                      {"state_profile": "foundry-native-v3"}], ids=["v3-pair", "v3-state-profile"])
+def test_a_new_selection_names_only_what_the_send_profiles_images_read(assistant, monkeypatch, settings):
+    """ADR-0009 §3 (c): a selection reaches every new conversation's capture, so while the API sends v2 a v3 pair or a
+    v3 state profile (which a v2 image refuses) is 422; a same-ID resend of an already stored one still returns it."""
+    from shared_context import behavior_profile_selection
+    from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE
+
+    h, control, _ = configured(assistant)
+    before = h.store._guard()
+    refused, _ = select(h, request_id="v3-choice", value=template(**settings))
+    assert refused.status_code == 422 and refused.json()["error"]["code"] == "PROFILE_SELECTION_UNSUPPORTED"
+    assert h.store._guard() == before
+    # Stored under a later send profile (3d-ii), then resent with the same request ID by an image that still sends v2.
+    with monkeypatch.context() as later:
+        later.setattr(behavior_profile_selection, "SENT_RELEASE", ("1.0.26", "1.0.103"))
+        later.setattr(behavior_profile_selection, "SENT_STATE_PROFILES",
+                      frozenset({UNLABELED_STATE_PROFILE, NATIVE_RESPONSES_PROFILE, NATIVE_V3_PROFILE}))
+        stored, _ = select(h, request_id="v3-choice", value=template(
+            **{"sdk_version": "1.0.26", "runtime_version": "1.0.103", **settings}))
+    assert stored.status_code == 200, stored.text
+    again, _ = select(h, request_id="v3-choice", value=template(
+        **{"sdk_version": "1.0.26", "runtime_version": "1.0.103", **settings}))
+    assert again.status_code == 200 and again.json() == stored.json()
+    assert not control.records
+
+
+def test_the_scripts_templates_pass_the_real_selection(script, assistant):
+    """The azd first install (select_defaults) and --keep-capabilities send these templates to the real select_profile,
+    which refuses any pair but SENT_RELEASE (422): both name it, also over a base selected under another known pair."""
+    from shared_context.native_responses_wire import SENT_RELEASE
+    from shared_context.sdk_pin import KNOWN_RELEASES
+
+    h, _, _ = configured(assistant)
+    first = AgentTemplate.model_validate_json(json.dumps(script.template({"capabilities": [], "skills": []})))
+    assert first.settings.state_profile == "foundry-responses-v1"
+    selected, _ = select(h, request_id="script-template", value=first)
+    assert selected.status_code == 200, selected.text
+    current = h.client.get(PATH + "/selection", headers=h.headers("read-only")).json()
+    other = next(pair for pair in KNOWN_RELEASES if pair != SENT_RELEASE)
+    current["template"]["settings"].update(sdk_version=other[0], runtime_version=other[1])
+    kept = AgentTemplate.model_validate_json(json.dumps(script.keep_current(current)))
+    assert (kept.settings.sdk_version, kept.settings.runtime_version) == SENT_RELEASE
+    again, _ = select(h, request_id="script-keep", previous=current["selection_id"], value=kept)
+    assert again.status_code == 200, again.text

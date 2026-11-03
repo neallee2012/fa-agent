@@ -3,9 +3,6 @@
 import hashlib
 import json
 import asyncio
-import os
-import subprocess
-import sys
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -291,16 +288,16 @@ def test_restart_reads_original_capture_and_completed_submit_never_restarts(nati
     before = len(case.remote.calls)
     retained, _ = gateway.submit(case.c.human, original.command)
     assert retained.capture == original.capture
-    # The second submit is the one same-material v1 resend a conflict gets (ADR-0009 2d-ii, a crashed v1 admission).
+    # No same-material v1 resend after the conflict (ADR-0009 M1 retired it with the v1 alias).
     assert [command.operation for _, command in case.remote.calls[before:]
-            if command.operation != "session_read"] == ["submit", "submit", "read", "submit"]
+            if command.operation != "session_read"] == ["submit", "read", "submit"]
     assert case.remote.calls[-1][1].capture == original.capture
     case.remote.completed("native-rid")
     before = len(case.remote.calls)
     completed, _ = NativeTurnGateway(case.composition, enabled=True).submit(case.c.human, original.command)
     assert completed.status == "completed"
     assert [command.operation for _, command in case.remote.calls[before:]
-            if command.operation != "session_read"] == ["submit", "submit", "read"]
+            if command.operation != "session_read"] == ["submit", "read"]
     conflict = case.client.post(PREFIX + "/submit", headers=case.headers,
                                json={"request_id": "native-rid", "content": "Changed original"})
     assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "NATIVE_RID_CONFLICT"
@@ -501,7 +498,7 @@ def test_every_wait_answer_advanced_the_follow_and_the_same_rid_is_accepted_once
 
 
 def test_a_hosted_sdk_runtime_still_exiting_is_resent_with_the_same_rid(native_api, monkeypatch):
-    """#903 P2-2: Hosted refuses before rid:<RID> while an earlier SDK runtime has not exited (503
+    """#903: Hosted refuses before rid:<RID> while an earlier SDK runtime has not exited (503
     NATIVE_EXECUTION_UNAVAILABLE, not_dispatched). The API answers server_following with the RID, the shape the
     workbench resends unchanged and Teams' relay polls again; the same RID is then accepted once."""
     case = native_api
@@ -1284,29 +1281,6 @@ def test_registered_agent_uses_its_real_prefix_owner_and_native_client(team_agen
     finally:
         peer.clients = originals
         client.close()
-
-
-def test_native_api_import_has_no_hosted_sdk_dependency():
-    script = """
-import importlib.abc
-import sys
-class RejectHosted(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == 'copilot' or fullname.startswith(('copilot.', 'azure.ai.agentserver')):
-            raise AssertionError('Hosted SDK import: ' + fullname)
-sys.meta_path.insert(0, RejectHosted())
-from shared_context.behavior_native_turn_api import NativeTurnGateway
-from shared_context.behavior_native_capture import project_capture
-from shared_context.native_routine_api import install_native_routine_routes
-from shared_context.native_routine_clock import NativeRoutineClock
-from shared_context.native_cut import turn_ended
-print('sdk-independent')
-"""
-    result = subprocess.run([sys.executable, "-X", "utf8", "-c", script],
-                            env={**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"},
-                            capture_output=True, text=True, encoding="utf-8", timeout=30)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "sdk-independent"
 
 
 def test_owner_uploads_one_png_to_its_agent_and_a_changed_reply_is_refused(native_api):

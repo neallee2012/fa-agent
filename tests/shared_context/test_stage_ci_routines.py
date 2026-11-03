@@ -88,7 +88,8 @@ def test_ci_reads_the_one_hosted_key_list_that_sync_accepts():
 
 def test_ci_and_sync_accept_and_refuse_the_same_hosted_overlays():
     ci = load_ci()
-    values = ["0", "1", "2", "true", "", "api", "foundry-native-v1", "foundry-native-v2", "foundry-native-v3", "600",
+    values = ["0", "1", "2", "true", "", "api", "foundry-native-v1", "foundry-native-v2", "foundry-native-v3",
+              "foundry-native-v4", "600",
               "0600", "Asia/Taipei", "a\nb", "x" * 2049, "foundry", "cosmos", "gpt-5.4-mini"]
     cases = [{key: value} for key, value in itertools.product(sorted(versions._ENVIRONMENT_FLAGS), values)]
     cases += [{"AZURE_CLIENT_SECRET": "synthetic"}, {"FA_NATIVE_ROUTINE_CLOCK": "api"}, {}, ["not", "a", "dict"],
@@ -110,19 +111,20 @@ def test_ci_and_sync_accept_the_cosmos_memory_overlay_azd_writes():
         assert refused(bad) and stops(ci._check_hosted, "agent", bad, 3600), bad
 
 
-def test_ci_accepts_a_v2_hosted_definition_and_keeps_the_api_on_v1(ci, monkeypatch):
-    """ADR-0009 2d-i: a Hosted definition may declare v2 (only through the 2d-i switch, P9). The API's own
-    FA_NATIVE_TURNS only switches native on, so it stays the v1 string also after 2d-ii (the API then sends v2)."""
+def test_ci_accepts_a_v2_hosted_definition_and_the_api_on_v2(ci, monkeypatch):
+    """ADR-0009 2d-i: a Hosted definition declares the Hosted profile (only through the 2d-i switch, P9; v3 from 3d-i).
+    ADR-0009 M1: the v1 alias
+    is retired, so the API's own FA_NATIVE_TURNS is v2 as well; the v1 string stops the routine clock check."""
     from shared_context.native_responses_wire import ACCEPTED_STATE_PROFILES, UNLABELED_STATE_PROFILE
     assert ci.HOSTED_STATE_PROFILES == ACCEPTED_STATE_PROFILES
     monkeypatch.setattr(ci, "missing_2di", lambda commit=None: [])
     ci.STAGE["api_environment"][ci.SESSION_GUARD] = "1"
-    assert ci.hosted_environment()[agent(ci, A)["agent_id"]]["FA_NATIVE_TURNS"] == "foundry-native-v2"
+    assert ci.hosted_environment()[agent(ci, A)["agent_id"]]["FA_NATIVE_TURNS"] == "foundry-native-v3"  # 3d-i
     ci.STAGE["api_environment"].update({**API_ON, "FA_NATIVE_HITL_ENABLED": "1", "FA_NATIVE_TURNS": "foundry-native-v2"})
+    assert ci.api_routines() is True
+    ci.STAGE["api_environment"]["FA_NATIVE_TURNS"] = UNLABELED_STATE_PROFILE
     with pytest.raises(SystemExit):
         ci.api_routines()
-    ci.STAGE["api_environment"]["FA_NATIVE_TURNS"] = UNLABELED_STATE_PROFILE
-    assert ci.api_routines() is True
 
 
 def test_the_enabling_settings_pass_meta_and_reach_sync_api_and_the_workbench(ci, capsys):
@@ -206,7 +208,7 @@ def test_turning_off_means_zero_not_a_deleted_key():
     dropped; only an explicit "0" turns a routine flag off."""
     served = {"kind": "hosted", "image": "old", "environment_variables": {**HOSTED_ON, "FA_NATIVE_HITL_ENABLED": "1"},
               "session_configuration": {"idle_timeout_seconds": 3600}}
-    source = lambda: (copy.deepcopy(served), "agent:1")  # noqa: E731
+    source = lambda: (copy.deepcopy(served), "agent:1")
     dropped, _ = versions.desired_source(source, {"FA_NATIVE_HITL_ENABLED": "1"}, idle_timeout_seconds=3600)()
     off, _ = versions.desired_source(source, {key: "0" for key in HOSTED_ON}, idle_timeout_seconds=3600)()
     assert dropped["environment_variables"]["FA_NATIVE_ROUTINE_PROPOSALS"] == "1", "a deleted key stays on"

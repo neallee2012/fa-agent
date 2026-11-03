@@ -52,10 +52,11 @@ from pydantic import ValidationError
 from shared_context.behavior_agent_template import AgentTemplate
 from shared_context.behavior_capabilities import base_supports
 from shared_context.behavior_skill_prompt import assemble_prompt
+from shared_context.native_responses_wire import SENT_RELEASE
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
-from deployment_config import config_path, load_config, write_x as _write_x  # noqa: E402
+from deployment_config import config_path, load_config, write_x as _write_x
 
 STAGE = json.loads((HERE / "stage.json").read_text(encoding="utf-8"))
 DEFAULTS = STAGE["conversation_defaults"]
@@ -89,7 +90,7 @@ def template(options, defaults=None):
     return {"schema_version": "fa-agent-template-v1",
             "role": {"profile": role.profile, "prefix_sha256": role.prefix_sha256,
                      "capability_catalog_version": role.capability_catalog_version},
-            "settings": {"sdk_version": "1.0.13", "runtime_version": "1.0.83", "mode": "empty",
+            "settings": {"sdk_version": SENT_RELEASE[0], "runtime_version": SENT_RELEASE[1], "mode": "empty",
                          **defaults["settings"], "capabilities": capabilities},
             "skills": skills, "unavailable_skills": []}
 
@@ -114,7 +115,9 @@ def keep_current(current, initial_template=None, defaults=None):
         raise SystemExit("--keep-capabilities for an unselected Agent requires --initial-template with an "
                          "owner-reviewed fa-agent-template-v1 JSON file")
     wanted = json.loads(json.dumps(base))
-    wanted["settings"].update(defaults["settings"])
+    # A new selection is sent material: it names the send profile's pair (ADR-0009 §3 (c); the API refuses any other),
+    # whichever pair the base names.
+    wanted["settings"].update(defaults["settings"], sdk_version=SENT_RELEASE[0], runtime_version=SENT_RELEASE[1])
     return wanted
 
 

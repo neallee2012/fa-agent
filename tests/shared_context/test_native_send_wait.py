@@ -18,15 +18,15 @@ from shared_context.behavior_native_sessions import NativeSessions
 from shared_context.behavior_native_turn_api import NativeTurnGateway
 from shared_context.behavior_native_turn_wire import NOTICE_KINDS_HEADER, NOTICE_KINDS_VERSION, NativeSessionFollow
 from shared_context.native_binding import NativeBindingStore
-from test_native_abandon_source import OLD_PROFILE, binding_rows  # noqa: F401
+from test_native_abandon_source import OLD_PROFILE, binding_rows
 import test_native_abandon_source as abandon
-from test_native_binding import bound, declared  # noqa: F401
-from test_native_cut import (  # noqa: F401
+from test_native_binding import bound, declared
+from test_native_cut import (
     Crash, _FOLLOW, control, cut, enforcing, operations, ready, replace_retried, restarted, sessions, set_admitting,
     state, submit_on_source,
 )
 from test_native_environment import invoke
-from test_native_files_api import (  # noqa: F401
+from test_native_files_api import (
     PREFIX, file_api, file_loops, instruction_models, jwk_client, local_env, native_api, signing_key,
     synthetic_standing_v1, token,
 )
@@ -83,8 +83,6 @@ def crashed_fence(fixture, monkeypatch):
 def follow_operations(fixture, since=0):
     return [operation for operation in operations(fixture, since) if operation[0] == "session_follow"]
 
-
-# --- flag-off parity and the fence-less send -----------------------------------------------------------------------
 
 def test_without_the_flag_a_send_meeting_a_fence_makes_one_attempt_as_on_main(file_api, monkeypatch):
     fixture = ready(file_api, monkeypatch)
@@ -211,8 +209,6 @@ def test_a_send_never_queues_behind_a_fence_step_that_holds_the_sessions_lock(fi
         release.set()
         worker.join()
 
-
-# --- follow entries off --------------------------------------------------------------------------------------------
 
 def test_a_selector_moved_submit_is_served_by_the_bound_sid_and_starts_no_follow(file_api, monkeypatch):
     fixture = ready(file_api, monkeypatch)  # the row is on 41, the selector names 42

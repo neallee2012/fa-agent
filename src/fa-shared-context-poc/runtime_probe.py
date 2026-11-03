@@ -8,6 +8,8 @@ from tempfile import TemporaryDirectory
 
 from copilot import CopilotClient, CopilotRequestHandler, RuntimeConnection
 
+from shared_context.sdk_pin import RUNTIME_PATH
+
 
 class NoNetwork(CopilotRequestHandler):
     async def send_request(self, request, ctx):
@@ -23,7 +25,7 @@ async def main():
     with TemporaryDirectory(prefix="fa-m2-runtime-probe-") as temporary:
         client = CopilotClient(
             connection=RuntimeConnection.for_stdio(
-                path="/opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime",
+                path=RUNTIME_PATH,
             ),
             working_directory=temporary, base_directory=str(Path(temporary) / "sdk"),
             env={"HOME": temporary, "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",

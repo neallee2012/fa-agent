@@ -176,50 +176,40 @@ def _proposal_input(args):
     return command, attempt, frozen
 
 
-def _proposal_action(args, http, token, command, attempt, frozen):
-    synthesis = getattr(args, "synthesis", False)
-    model = NoteSynthesisView if synthesis else NoteProposalView
-    prefix = "/behavior/v1/bindings/" + args.binding + ("/note-syntheses" if synthesis else "/note-proposals")
-    if args.action == "proposal":
-        value = model.model_validate_json(_canonical(_request(
-            http, token, "GET", prefix + "/" + args.request_id)))
-        if value.binding_id != args.binding or value.request_id != args.request_id or value.state != "pending_review":
-            raise ValueError("the original pending proposal differs")
-        print(_terminal_json(value.model_dump(mode="json")))
-        return
-    body = command.model_dump(mode="json")
-    if args.action == "propose":
-        preview = model.model_validate_json(_canonical(_request(http, token, "POST", prefix + "/preview", body)))
-        if (preview.binding_id != args.binding or preview.request_id != command.request_id
-                or preview.team_id != command.share_team_id or preview.work_id != command.share_work_id
-                or preview.state != "not_submitted"):
-            raise ValueError("the server preview does not match the exact sharing command")
-        if synthesis:
-            sources = (preview.summary_source, *(fragment.source for fragment in preview.evidence.fragments))
-            selections = (command.summary, *command.supporting)
-            if any(source.conversation_id != command.conversation_id
-                   or any(getattr(source, field) != getattr(selection, field)
-                          for field in ("turn_number", "source_sha256", "start_byte", "end_byte"))
-                   for source, selection in zip(sources, selections, strict=True)):
-                raise ValueError("the synthesis preview differs from the selected originals")
-        elif any(getattr(preview.source, name) != getattr(command, name) for name in
-                 ("conversation_id", "turn_number", "speaker", "source_sha256", "start_byte", "end_byte")):
-            raise ValueError("the server preview does not match the exact sharing command")
-        print(_terminal_json(preview.model_dump(mode="json")))
-        confirmation = "share-synthesis" if synthesis else "share-note"
-        if input("輸入 " + confirmation + " 將以上精確片段分享給原Team/work並建立未生效提案；目前不會成為有效記憶：\n") != confirmation:
-            raise ValueError("sharing was not confirmed")
-        with attempt.open("xb") as stream:
-            stream.write(_canonical(frozen) + b"\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        if os.name != "nt":
-            descriptor = os.open(attempt.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-    response = _request(http, token, "POST", prefix + ("/reconcile" if args.action == "proposal-reconcile" else ""), body)
+def _save_attempt(attempt, record):
+    """The durable marker of the one attempt: written and flushed (file, then directory) before the send."""
+    with attempt.open("xb") as stream:
+        stream.write(_canonical(record) + b"\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    if os.name != "nt":
+        descriptor = os.open(attempt.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _check_proposal_preview(preview, binding, command, synthesis):
+    if (preview.binding_id != binding or preview.request_id != command.request_id
+            or preview.team_id != command.share_team_id or preview.work_id != command.share_work_id
+            or preview.state != "not_submitted"):
+        raise ValueError("the server preview does not match the exact sharing command")
+    if synthesis:
+        sources = (preview.summary_source, *(fragment.source for fragment in preview.evidence.fragments))
+        selections = (command.summary, *command.supporting)
+        if any(source.conversation_id != command.conversation_id
+               or any(getattr(source, field) != getattr(selection, field)
+                      for field in ("turn_number", "source_sha256", "start_byte", "end_byte"))
+               for source, selection in zip(sources, selections, strict=True)):
+            raise ValueError("the synthesis preview differs from the selected originals")
+    elif any(getattr(preview.source, name) != getattr(command, name) for name in
+             ("conversation_id", "turn_number", "speaker", "source_sha256", "start_byte", "end_byte")):
+        raise ValueError("the server preview does not match the exact sharing command")
+
+
+def _proposal_result(response, command, synthesis):
+    """The inactive proposal receipt's result, once the whole receipt matches the original command."""
     if set(response) != {"result", "control_request_id", "control_request_digest"}:
         raise ValueError("a complete original proposal receipt is required")
     TypeAdapter(Digest).validate_python(response["control_request_digest"], strict=True)
@@ -234,6 +224,31 @@ def _proposal_action(args, http, token, command, attempt, frozen):
     kind = "memory-note-synthesis-write" if synthesis else "memory-note-proposal-write"
     if response["control_request_id"] != control_key(kind, result["proposal_id"]):
         raise ValueError("proposal receipt identity differs")
+    return result
+
+
+def _proposal_action(args, http, token, command, attempt, frozen):
+    synthesis = getattr(args, "synthesis", False)
+    model = NoteSynthesisView if synthesis else NoteProposalView
+    prefix = "/behavior/v1/bindings/" + args.binding + ("/note-syntheses" if synthesis else "/note-proposals")
+    if args.action == "proposal":
+        value = model.model_validate_json(_canonical(_request(
+            http, token, "GET", prefix + "/" + args.request_id)))
+        if value.binding_id != args.binding or value.request_id != args.request_id or value.state != "pending_review":
+            raise ValueError("the original pending proposal differs")
+        print(_terminal_json(value.model_dump(mode="json")))
+        return
+    body = command.model_dump(mode="json")
+    if args.action == "propose":
+        preview = model.model_validate_json(_canonical(_request(http, token, "POST", prefix + "/preview", body)))
+        _check_proposal_preview(preview, args.binding, command, synthesis)
+        print(_terminal_json(preview.model_dump(mode="json")))
+        confirmation = "share-synthesis" if synthesis else "share-note"
+        if input("輸入 " + confirmation + " 將以上精確片段分享給原Team/work並建立未生效提案；目前不會成為有效記憶：\n") != confirmation:
+            raise ValueError("sharing was not confirmed")
+        _save_attempt(attempt, frozen)
+    response = _request(http, token, "POST", prefix + ("/reconcile" if args.action == "proposal-reconcile" else ""), body)
+    result = _proposal_result(response, command, synthesis)
     print(_terminal_json({"state": "confirmed", "result": result}))
 
 
@@ -276,20 +291,32 @@ def _bridge_preview(value, proposal, mapping, bridge_id, binding, tenant):
     returned_mapping = NoteBridgeCommand.model_validate_json(_canonical(value["mapping"]))
     synthesis = isinstance(proposal, NoteSynthesisView)
     text = proposal.evidence.original() if synthesis else proposal.text.encode("utf-8")
-    if (value["bridge_id"] != bridge_id or value["proposal_id"] != proposal.proposal_id
-            or value["binding_id"] != binding or returned_mapping != mapping
-            or value["text"] != proposal.text or value["effective"] is not False
-            or source.source_id != mapping.source_id or source.version != 1
-            or source.sha256 != hashlib.sha256(text).hexdigest() or source.byte_length != len(text)
-            or claim.claim_id != mapping.claim_id or claim.version != mapping.claim_version
-            or claim.scope.visibility != "team" or claim.scope.team_id != proposal.team_id
-            or claim.scope.tenant_id != tenant
-            or claim.sha256 != value["review"]["candidate_sha256"]):
+    if (_preview_differs_from_proposal(value, proposal, returned_mapping, mapping, bridge_id, binding)
+            or _source_differs(source, mapping, text)
+            or _claim_differs(claim, mapping, proposal, tenant, value)):
         raise ValueError("the review preview does not match the original proposal and mapping")
     if synthesis and (value.get("evidence") != proposal.evidence.model_dump(mode="json")
                       or value.get("summary_source") != proposal.summary_source.model_dump(mode="json")):
         raise ValueError("the review must show the original evidence, not just the summary")
     return source, claim
+
+
+def _preview_differs_from_proposal(value, proposal, returned_mapping, mapping, bridge_id, binding):
+    return bool(value["bridge_id"] != bridge_id or value["proposal_id"] != proposal.proposal_id
+                or value["binding_id"] != binding or returned_mapping != mapping
+                or value["text"] != proposal.text or value["effective"] is not False)
+
+
+def _source_differs(source, mapping, text):
+    return bool(source.source_id != mapping.source_id or source.version != 1
+                or source.sha256 != hashlib.sha256(text).hexdigest() or source.byte_length != len(text))
+
+
+def _claim_differs(claim, mapping, proposal, tenant, value):
+    return bool(claim.claim_id != mapping.claim_id or claim.version != mapping.claim_version
+                or claim.scope.visibility != "team" or claim.scope.team_id != proposal.team_id
+                or claim.scope.tenant_id != tenant
+                or claim.sha256 != value["review"]["candidate_sha256"])
 
 
 def _bridge_result(value, stage, expected):
@@ -355,16 +382,7 @@ def _bridge_action(args, http, token, command, attempt, frozen, expected):
     confirmation = {"prepare": "prepare-note", "review": "review-note", "commit": "commit-note"}[args.stage]
     if input("輸入 " + confirmation + " 確認以上精確步驟；只在原允許範圍執行，未確認結果不得重送：\n") != confirmation:
         raise ValueError("the bridge stage was not confirmed")
-    with attempt.open("xb") as stream:
-        stream.write(_canonical({**frozen, "expected": expected}) + b"\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    if os.name != "nt":
-        descriptor = os.open(attempt.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    _save_attempt(attempt, {**frozen, "expected": expected})
     value = _request(http, token, "POST", prefix + "/bridge/" + args.stage, body)
     print(_terminal_json(_bridge_result(value, args.stage, expected)))
 
@@ -393,51 +411,35 @@ def _settings_input(args):
     return command, attempt, frozen
 
 
-def _settings_action(args, http, token, command, attempt, frozen):
-    prefix = "/operator/v1/memory-bridge-settings"
-    if args.action == "memory-settings":
-        value = MemoryBridgeSettingsView.model_validate_json(_canonical(_request(http, token, "GET", prefix)))
-        print(_terminal_json(value.model_dump(mode="json")))
-        return
-    body = command.model_dump(mode="json")
-    if args.action == "select-memory-settings":
-        preview = _request(http, token, "POST", prefix + "/preview", body)
-        if (set(preview) != {"command", "applies_to", "data_scope_change", "submitted", "note"}
-                or SelectMemoryBridgeSettings.model_validate_json(_canonical(preview["command"])) != command
-                or preview["applies_to"] != "new-conversations-only"
-                or preview["data_scope_change"] is not True or preview["submitted"] is not False
-                or (preview["note"] is None) != (command.recall is None)):
-            raise ValueError("the future-conversation preview differs from the original setting")
-        if command.recall is not None:
-            note = preview["note"]
-            if (not isinstance(note, dict) or set(note) != {"origin_binding_id", "text", "source", "usage"}
-                    or not isinstance(note["text"], str)):
-                raise ValueError("a complete reviewed-note preview is required")
-            source = WorkMemorySource.model_validate_json(_canonical(note["source"]))
-            text = note["text"].encode("utf-8")
-            if (note["origin_binding_id"] != command.recall.origin_binding_id
-                    or note["usage"] != "knowledge-data-not-permission"
-                    or source.claim_id != command.recall.claim_id
-                    or source.claim_version != command.recall.expected_claim_version
-                    or source.claim_sha256 != command.recall.expected_claim_sha256
-                    or source.text_utf8_bytes != len(text)
-                    or source.text_sha256 != hashlib.sha256(text).hexdigest()):
-                raise ValueError("the selected reviewed note differs from the human's original choice")
-        print(_terminal_json(preview))
-        if input("輸入 select-memory 確認只改之後新對話的記憶資料範圍；不回寫舊對話或自動建立記憶：\n") != "select-memory":
-            raise ValueError("the new-conversation setting was not confirmed")
-        with attempt.open("xb") as stream:
-            stream.write(_canonical(frozen) + b"\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        if os.name != "nt":
-            descriptor = os.open(attempt.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-    route = prefix + ("/reconcile" if args.action == "memory-settings-reconcile" else "")
-    response = _request(http, token, "POST", route, body)
+def _check_settings_preview(preview, command):
+    if (set(preview) != {"command", "applies_to", "data_scope_change", "submitted", "note"}
+            or SelectMemoryBridgeSettings.model_validate_json(_canonical(preview["command"])) != command
+            or preview["applies_to"] != "new-conversations-only"
+            or preview["data_scope_change"] is not True or preview["submitted"] is not False
+            or (preview["note"] is None) != (command.recall is None)):
+        raise ValueError("the future-conversation preview differs from the original setting")
+    if command.recall is not None:
+        _check_previewed_note(preview["note"], command.recall)
+
+
+def _check_previewed_note(note, recall):
+    if (not isinstance(note, dict) or set(note) != {"origin_binding_id", "text", "source", "usage"}
+            or not isinstance(note["text"], str)):
+        raise ValueError("a complete reviewed-note preview is required")
+    source = WorkMemorySource.model_validate_json(_canonical(note["source"]))
+    text = note["text"].encode("utf-8")
+    if (note["origin_binding_id"] != recall.origin_binding_id
+            or note["usage"] != "knowledge-data-not-permission"
+            or source.claim_id != recall.claim_id
+            or source.claim_version != recall.expected_claim_version
+            or source.claim_sha256 != recall.expected_claim_sha256
+            or source.text_utf8_bytes != len(text)
+            or source.text_sha256 != hashlib.sha256(text).hexdigest()):
+        raise ValueError("the selected reviewed note differs from the human's original choice")
+
+
+def _settings_result(response, command):
+    """The settings view of the receipt, once the whole receipt matches the original setting."""
     if set(response) != {"result", "control_request_id", "control_request_digest"}:
         raise ValueError("a complete original setting receipt is required")
     result = MemoryBridgeSettingsView.model_validate_json(_canonical(response["result"]))
@@ -450,7 +452,116 @@ def _settings_action(args, http, token, command, attempt, frozen):
             or response["control_request_id"] != result.settings_id):
         raise ValueError("the original memory setting receipt differs")
     TypeAdapter(Digest).validate_python(response["control_request_digest"], strict=True)
+    return result
+
+
+def _settings_action(args, http, token, command, attempt, frozen):
+    prefix = "/operator/v1/memory-bridge-settings"
+    if args.action == "memory-settings":
+        value = MemoryBridgeSettingsView.model_validate_json(_canonical(_request(http, token, "GET", prefix)))
+        print(_terminal_json(value.model_dump(mode="json")))
+        return
+    body = command.model_dump(mode="json")
+    if args.action == "select-memory-settings":
+        preview = _request(http, token, "POST", prefix + "/preview", body)
+        _check_settings_preview(preview, command)
+        print(_terminal_json(preview))
+        if input("輸入 select-memory 確認只改之後新對話的記憶資料範圍；不回寫舊對話或自動建立記憶：\n") != "select-memory":
+            raise ValueError("the new-conversation setting was not confirmed")
+        _save_attempt(attempt, frozen)
+    route = prefix + ("/reconcile" if args.action == "memory-settings-reconcile" else "")
+    response = _request(http, token, "POST", route, body)
+    result = _settings_result(response, command)
     print(_terminal_json({"state": "confirmed", "settings": result.model_dump(mode="json")}))
+
+
+_SETTINGS_ACTIONS = frozenset({"memory-settings", "select-memory-settings", "memory-settings-reconcile"})
+
+
+def _check_arguments(args):
+    origin = urlsplit(args.api)
+    if (origin.scheme != "https" or not origin.hostname or not origin.hostname.endswith(".azurecontainerapps.io")
+            or origin.username or origin.password or origin.query or origin.fragment
+            or origin.path not in ("", "/") or origin.port not in (None, 443)):
+        raise ValueError("the configured HTTPS Azure Container Apps origin is required")
+    canonical_oid(args.tenant)
+    canonical_oid(args.client_id)
+    validate_api_audience(args.audience)
+    if args.action not in _SETTINGS_ACTIONS:
+        TypeAdapter(Identifier).validate_python(args.binding, strict=True)
+    if args.action in {"show", "proposal", "bridge"}:
+        TypeAdapter(Identifier).validate_python(
+            args.claim_id if args.action == "show" else args.request_id, strict=True)
+
+
+def _read_inputs(args):
+    """(command, attempt, frozen, expected) of the actions that send a command; all None for the others."""
+    if args.action in {"propose", "proposal-reconcile"}:
+        return (*_proposal_input(args), None)
+    if args.action == "bridge":
+        return _bridge_input(args)
+    if args.action in {"select-memory-settings", "memory-settings-reconcile"}:
+        return (*_settings_input(args), None)
+    return None, None, None, None
+
+
+def _scopes(args):
+    scopes = [args.audience + "/" + READ_SCOPE]
+    if args.action == "select-memory-settings" or args.action == "bridge" and not args.reconcile:
+        scopes.append(args.audience + "/" + APPROVAL_SCOPE)
+    return scopes
+
+
+def _http_client(args):
+    return httpx.Client(
+        base_url=args.api.rstrip("/"), trust_env=False, follow_redirects=False, timeout=30,
+        transport=httpx.HTTPTransport(retries=0, trust_env=False,
+            verify=ssl.create_default_context(cafile=os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE"))),
+    )
+
+
+def _candidate_action(args, http, token):
+    value = CandidateView.model_validate_json(_canonical(_request(
+        http, token, "GET", "/behavior/v1/bindings/" + args.binding + "/memory-candidate")))
+    if value.binding_id != args.binding:
+        raise ValueError("the candidate belongs to another original binding")
+    print(_terminal_json(value.model_dump(mode="json")))
+
+
+def _show_action(args, http, token, phase):
+    phase[0] = "read"
+    path = "/behavior/v1/bindings/" + args.binding + "/claims/" + args.claim_id
+    value = _read(http, token, path)
+    phase[0] = "response"
+    result = _view(value, args.binding, args.tenant, args.claim_id)
+    if args.with_sources:
+        phase[0] = "sources"
+        originals = [_read_original(http, token, args.binding, reference) for reference in result["supporting"]]
+        phase[0] = "recheck"
+        current = _view(_read(http, token, path), args.binding, args.tenant, args.claim_id)
+        if current != result:
+            raise Problem(409, "MEMORY_NOTE_CHANGED", "the current note changed while its sources were read")
+        result = {**result, "originals": originals}
+    print(_terminal_json(result))
+
+
+def _run_action(args, http, token, inputs, phase):
+    """Run the chosen action; ``phase[0]`` is the step a failure is reported in."""
+    command, attempt, frozen, expected = inputs
+    if args.action in _SETTINGS_ACTIONS:
+        phase[0] = args.action
+        _settings_action(args, http, token, command, attempt, frozen)
+    elif args.action == "bridge":
+        phase[0] = "bridge-" + args.stage + ("-reconcile" if args.reconcile else "")
+        _bridge_action(args, http, token, command, attempt, frozen, expected)
+    elif args.action == "candidate":
+        phase[0] = "candidate-read"
+        _candidate_action(args, http, token)
+    elif args.action != "show":
+        phase[0] = args.action
+        _proposal_action(args, http, token, command, attempt, frozen)
+    else:
+        _show_action(args, http, token, phase)
 
 
 def main(argv=None):
@@ -458,88 +569,30 @@ def main(argv=None):
     args = options.parse_args(argv)
     if not all((args.api, args.tenant, args.audience, args.client_id)):
         options.error("configure the API origin, tenant, audience and existing delegated behavior client ID")
-    phase = "validation"
+    phase = ["validation"]
     try:
-        origin = urlsplit(args.api)
-        if (origin.scheme != "https" or not origin.hostname or not origin.hostname.endswith(".azurecontainerapps.io")
-                or origin.username or origin.password or origin.query or origin.fragment
-                or origin.path not in ("", "/") or origin.port not in (None, 443)):
-            raise ValueError("the configured HTTPS Azure Container Apps origin is required")
-        canonical_oid(args.tenant)
-        canonical_oid(args.client_id)
-        validate_api_audience(args.audience)
-        settings_action = args.action in {"memory-settings", "select-memory-settings", "memory-settings-reconcile"}
-        if not settings_action:
-            TypeAdapter(Identifier).validate_python(args.binding, strict=True)
-        if args.action in {"show", "proposal", "bridge"}:
-            TypeAdapter(Identifier).validate_python(
-                args.claim_id if args.action == "show" else args.request_id, strict=True)
-        command, attempt, frozen, expected = None, None, None, None
-        if args.action in {"propose", "proposal-reconcile"}:
-            command, attempt, frozen = _proposal_input(args)
-        elif args.action == "bridge":
-            command, attempt, frozen, expected = _bridge_input(args)
-        elif args.action in {"select-memory-settings", "memory-settings-reconcile"}:
-            command, attempt, frozen = _settings_input(args)
-        scopes = [args.audience + "/" + READ_SCOPE]
-        if args.action == "select-memory-settings" or args.action == "bridge" and not args.reconcile:
-            scopes.append(args.audience + "/" + APPROVAL_SCOPE)
+        _check_arguments(args)
+        inputs = _read_inputs(args)
+        scopes = _scopes(args)
         with private_auth_logging(), InteractiveBrowserCredential(
             tenant_id=args.tenant, client_id=args.client_id, redirect_uri="http://localhost:8400",
             disable_automatic_authentication=True,
-        ) as credential, httpx.Client(
-            base_url=args.api.rstrip("/"), trust_env=False, follow_redirects=False, timeout=30,
-            transport=httpx.HTTPTransport(retries=0, trust_env=False,
-                verify=ssl.create_default_context(cafile=os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE"))),
-        ) as http:
-            phase = "authentication"
+        ) as credential, _http_client(args) as http:
+            phase[0] = "authentication"
             credential.authenticate(scopes=scopes)
             token = lambda: credential.get_token(*scopes).token
-            if settings_action:
-                phase = args.action
-                _settings_action(args, http, token, command, attempt, frozen)
-                return 0
-            if args.action == "bridge":
-                phase = "bridge-" + args.stage + ("-reconcile" if args.reconcile else "")
-                _bridge_action(args, http, token, command, attempt, frozen, expected)
-                return 0
-            if args.action == "candidate":
-                phase = "candidate-read"
-                value = CandidateView.model_validate_json(_canonical(_request(
-                    http, token, "GET", "/behavior/v1/bindings/" + args.binding + "/memory-candidate")))
-                if value.binding_id != args.binding:
-                    raise ValueError("the candidate belongs to another original binding")
-                print(_terminal_json(value.model_dump(mode="json")))
-                return 0
-            if args.action != "show":
-                phase = args.action
-                _proposal_action(args, http, token, command, attempt, frozen)
-                return 0
-            phase = "read"
-            path = "/behavior/v1/bindings/" + args.binding + "/claims/" + args.claim_id
-            value = _read(http, token, path)
-            phase = "response"
-            result = _view(value, args.binding, args.tenant, args.claim_id)
-            if args.with_sources:
-                phase = "sources"
-                originals = [_read_original(http, token, args.binding, reference) for reference in result["supporting"]]
-                phase = "recheck"
-                current = _view(_read(http, token, path), args.binding, args.tenant, args.claim_id)
-                if current != result:
-                    raise Problem(409, "MEMORY_NOTE_CHANGED", "the current note changed while its sources were read")
-                result = {**result, "originals": originals}
-            print(_terminal_json(result))
+            _run_action(args, http, token, inputs, phase)
         return 0
     except Problem as error:
-        print(json.dumps({**error.body, "phase": phase}, ensure_ascii=True), file=sys.stderr)
+        print(json.dumps({**error.body, "phase": phase[0]}, ensure_ascii=True), file=sys.stderr)
     except ClientAuthenticationError:
         print(json.dumps({"error": {"code": "MEMORY_NOTE_AUTHENTICATION_FAILED",
                                    "message": "未取得憑證；若已有提案attempt，保留原件並查回條。"},
-                          "phase": phase}, ensure_ascii=True), file=sys.stderr)
+                          "phase": phase[0]}, ensure_ascii=True), file=sys.stderr)
     except (ValueError, OSError, KeyError, TypeError):
         print(json.dumps({"error": {"code": "MEMORY_NOTE_CLI_UNCONFIRMED",
                                    "message": "未取得確認結果；不使用舊內容代替，已有提案attempt時只查原回條。"},
-                          "phase": phase}, ensure_ascii=True), file=sys.stderr)
+                          "phase": phase[0]}, ensure_ascii=True), file=sys.stderr)
     return 1
 
 

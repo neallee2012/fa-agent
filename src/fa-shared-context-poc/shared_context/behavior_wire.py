@@ -13,6 +13,8 @@ from typing import Annotated, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, field_validator, model_validator
 
+from .sdk_pin import KNOWN_RELEASES, KnownRuntimeVersion, RUNTIME_VERSION
+
 Identifier = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")]
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 ModelDeployment = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")]
@@ -42,6 +44,30 @@ class WireModel(BaseModel):
         extra="forbid", strict=True, frozen=True, allow_inf_nan=False,
         ser_json_bytes="base64", val_json_bytes="base64",
     )
+
+
+def known_release(record):
+    """CTX-03 §4: a record names one (sdk, runtime) pair a known release wrote, never a mix of two releases."""
+    if (record.sdk_version, record.runtime_version) not in KNOWN_RELEASES:
+        raise ValueError("the SDK and runtime versions are not one known release")
+    return record
+
+
+def same_but_release(saved, current):
+    """ADR-0009 §3 (c): sent material names the send profile's pair, so a record saved under another known pair (each
+    side's ``known_release``) still matches a fresh one: everything but ``sdk_version``/``runtime_version`` is equal."""
+    fields = {"sdk_version", "runtime_version"}
+    return type(saved) is type(current) and (
+        saved is None or saved.model_dump(mode="json", exclude=fields) == current.model_dump(mode="json", exclude=fields))
+
+
+def exact_prefix(record, prompt, omissions, refusal):
+    """A prompt assembly record's hash, size and omissions must match its fixed source."""
+    raw = prompt.encode("utf-8")
+    if (record.prefix_sha256 != hashlib.sha256(raw).hexdigest()
+            or record.prefix_utf8_bytes != len(raw) or record.omissions != omissions):
+        raise ValueError(refusal)
+    return record
 
 
 class HostedKeepalive(WireModel):
@@ -437,7 +463,7 @@ class AssistantSdkStop(WireModel):
     A release keeps the process running but unbinds every tool, permission and model callback from
     this job; only a task captured with the resident worker profile may present it.
     """
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    runtime_version: KnownRuntimeVersion = RUNTIME_VERSION
     pid: Annotated[int, Field(ge=1)]
     exit_code: int | None = Field(default=None, exclude_if=lambda value: value is None)
     graceful: Literal[True] = True

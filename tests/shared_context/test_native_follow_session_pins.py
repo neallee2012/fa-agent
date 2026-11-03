@@ -18,7 +18,7 @@ from shared_context.native_files_omission import _Omission, _key as omission_key
 from shared_context.native_turns import TURNS_STORE, _json
 from shared_context.native_workspace_files import NativeWorkspaceFiles
 from test_native_open_rids import V2, V3, _inactive
-from test_native_session_cut import (  # noqa: F401 - fixtures
+from test_native_session_cut import (  # fixture
     SOURCE, _withdraw, following_key, items, local_env, probe, source)
 
 CONFLICT = "NATIVE_ENVIRONMENT_CONFLICT"

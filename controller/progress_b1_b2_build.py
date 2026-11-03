@@ -15,8 +15,8 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import context_target_eval as cte  # noqa: E402
-import progress_b1_b2 as progress  # noqa: E402
+import context_target_eval as cte
+import progress_b1_b2 as progress
 
 BEGIN, END = "<!-- BEGIN GENERATED: progress_b1_b2 -->", "<!-- END GENERATED: progress_b1_b2 -->"
 PR_MERGE = re.compile(r"Merge (?:pull request|PR) #(\d+)\b")

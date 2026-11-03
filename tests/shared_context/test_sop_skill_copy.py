@@ -11,12 +11,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import A, B, C
-from legacy_m2_m4.api import create_app
-from shared_context.auth import JwtVerifier
 from shared_context.behavior_assistant import AssistantProfile, key
 from shared_context.behavior_work_policy_api import install_work_policy_routes
-from shared_context.m3_auth import M3JwtVerifier
-from shared_context.m3_models import SkillPurpose
+from shared_context.m3_auth import HumanApprover
+from shared_context.m3_models import ApprovalInput, CreateArtifact, SkillPurpose, VersionInput
+from shared_context.models import CreateWork
 from shared_context.behavior_operations import control_key
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
@@ -36,34 +35,24 @@ BODY = "APPROVED_TEAM_SOP_CANARY\r\n核對原始回條，不批准操作。\t\n"
 PURPOSE = "  用於核對已保存回條；僅為草稿，不是批准。  "
 
 
+def procedure(body):
+    return VersionInput(filename="procedure.md", media_type="text/markdown", sha256=hashlib.sha256(body).hexdigest())
+
+
 def approved_sop(h, signing_key, jwk_client, *, body=BODY, version=SOURCE_VERSION, approve=True, kind="sop"):
-    http = TestClient(create_app(h.artifacts.context, JwtVerifier(h.artifacts.context.auth, jwk_client),
-        artifact_service=h.artifacts,
-        verified_artifact_identity_dependency=M3JwtVerifier(h.artifacts.context.auth, h.artifacts.approval, jwk_client)))
-    agent = {"Authorization": "Bearer " + token(signing_key, {"oid": A.oid})}
-    human = {"Authorization": "Bearer " + token(signing_key)}
-    original = http.post("/teams/" + A.team + "/works/" + LEGACY_WORK, headers=agent,
-                         json={"goal": "Synthetic existing Team work for an approved procedure."})
-    assert original.status_code == 201, original.text
-    path = "/teams/" + A.team + "/artifacts/" + SOP
-    created = http.post(path, headers=agent, json={
-        "kind": kind, "title": "Approved shared Team procedure", "source_work": LEGACY_WORK,
-    })
-    assert created.status_code == 201, created.text
-    uploaded = http.put(path + "/versions/" + version, content=body, headers={
-        **agent, "If-Match": created.headers["etag"], "Content-Type": "application/octet-stream",
-        "X-Artifact-Filename": "procedure.md", "X-Artifact-Media-Type": "text/markdown",
-        "X-Artifact-SHA256": hashlib.sha256(body).hexdigest(),
-    })
-    assert uploaded.status_code == 200, uploaded.text
+    """Returns (ArtifactService, agent, configured human, source version) built in process."""
+    artifacts = h.artifacts
+    human = HumanApprover(artifacts.approval.approver_oid, artifacts.approval.team)
+    artifacts.context.create(A, A.team, LEGACY_WORK, CreateWork(goal="Synthetic existing Team work for an approved procedure."))
+    created = artifacts.create(A, A.team, SOP, CreateArtifact(
+        kind=kind, title="Approved shared Team procedure", source_work=LEGACY_WORK,
+    ))
+    uploaded = artifacts.upload(A, A.team, SOP, version, created.etag, procedure(body), body)
     if approve:
-        approved = http.post(path + "/decisions", headers={**human, "If-Match": uploaded.headers["etag"]}, json={
-            "decision_id": version, "version_id": version, "sha256": hashlib.sha256(body).hexdigest(), "decision": "approve",
-        })
-        assert approved.status_code == 200, approved.text
-    source = http.get(path + "/versions/" + version, headers=agent)
-    assert source.status_code == 200
-    return http, agent, human, source.json()
+        artifacts.decide(human, A.team, SOP, uploaded.etag, ApprovalInput(
+            decision_id=version, version_id=version, sha256=hashlib.sha256(body).hexdigest(), decision="approve",
+        ))
+    return artifacts, A, human, artifacts.version(A, A.team, SOP, version).model_dump(mode="json")
 
 
 def copy_scope(version):
@@ -103,19 +92,12 @@ def post_copy(turn, **extra):
     )
 
 
-def change_source(http, agent, human, *, body=BODY, approve=True):
-    path = "/teams/" + A.team + "/artifacts/" + SOP
-    current = http.get(path, headers=agent)
-    uploaded = http.put(path + "/versions/" + "d" * 32, content=body, headers={
-        **agent, "If-Match": current.headers["etag"], "Content-Type": "application/octet-stream",
-        "X-Artifact-Filename": "procedure.md", "X-Artifact-Media-Type": "text/markdown",
-        "X-Artifact-SHA256": hashlib.sha256(body).hexdigest(),
-    })
-    assert uploaded.status_code == 200
-    result = http.post(path + "/decisions", headers={**human, "If-Match": uploaded.headers["etag"]}, json={
-        "decision_id": "d" * 32, "version_id": "d" * 32,
-        "sha256": hashlib.sha256(body).hexdigest(), "decision": "approve" if approve else "reject"})
-    assert result.status_code == 200
+def change_source(artifacts, agent, human, *, body=BODY, approve=True):
+    current = artifacts.get(agent, A.team, SOP)
+    uploaded = artifacts.upload(agent, A.team, SOP, "d" * 32, current.etag, procedure(body), body)
+    artifacts.decide(human, A.team, SOP, uploaded.etag, ApprovalInput(
+        decision_id="d" * 32, version_id="d" * 32,
+        sha256=hashlib.sha256(body).hexdigest(), decision="approve" if approve else "reject"))
 
 
 def test_current_ticket_copies_only_approved_sop_to_its_unapproved_skill_slot(assistant, signing_key, jwk_client):
@@ -324,13 +306,13 @@ def test_copy_ack_loss_reconciles_original_slot_without_repeating_effects(
 def test_source_effective_version_changes_never_retarget_or_repeat_copy(
         assistant, signing_key, jwk_client, monkeypatch, when):
     h = assistant
-    http, agent, human_headers, source = approved_sop(h, signing_key, jwk_client)
+    artifacts, agent, approver, source = approved_sop(h, signing_key, jwk_client)
     h, control, human = configured_copy(h, copy_scope(source))
     turn = open_turn(h, control, human, "copy-source-race")
     changed, calls = [], {"create": 0, "upload": 0}
     def update():
         changed.append(True)
-        change_source(http, agent, human_headers)
+        change_source(artifacts, agent, approver)
     before = None
     if when == "after-copy":
         result = post_copy(turn)
@@ -402,7 +384,7 @@ def test_current_write_authority_is_not_resurrected_by_a_saved_source_approval(
 def test_saved_copy_is_team_visible_but_draft_and_later_rejection_never_activates_it(
         assistant, signing_key, jwk_client):
     h = assistant
-    http, agent, human_headers, source = approved_sop(h, signing_key, jwk_client)
+    artifacts, agent, approver, source = approved_sop(h, signing_key, jwk_client)
     h, control, human = configured_copy(h, copy_scope(source))
     turn = open_turn(h, control, human, "copy-team-not-private")
     try:
@@ -413,14 +395,14 @@ def test_saved_copy_is_team_visible_but_draft_and_later_rejection_never_activate
         assert h.artifacts.download(B, A.team, receipt["artifact_id"], receipt["version_id"], version.blob.etag)[1] == BODY
         with pytest.raises(Problem):
             h.artifacts.get(C, A.team, receipt["artifact_id"])
-        path = "/teams/" + A.team + "/artifacts/" + receipt["artifact_id"]
-        snapshot = http.get(path, headers=agent)
-        decision = {"version_id": receipt["version_id"], "decision_id": "a" * 32, "decision": "reject",
-                    "sha256": receipt["sha256"], "metadata_sha256": receipt["metadata_sha256"]}
-        assert http.post(path + "/decisions", headers={**agent, "If-Match": snapshot.headers["etag"]},
-                         json=decision).status_code == 403
-        rejected = http.post(path + "/decisions", headers={**human_headers, "If-Match": snapshot.headers["etag"]}, json=decision)
-        assert rejected.status_code == 200 and rejected.json()["effective_version_id"] is None
+        snapshot = artifacts.get(agent, A.team, receipt["artifact_id"])
+        decision = ApprovalInput(version_id=receipt["version_id"], decision_id="a" * 32, decision="reject",
+                                 sha256=receipt["sha256"], metadata_sha256=receipt["metadata_sha256"])
+        with pytest.raises(Problem) as agent_decision:
+            artifacts.decide(agent, A.team, receipt["artifact_id"], snapshot.etag, decision)
+        assert agent_decision.value.status == 403
+        rejected = artifacts.decide(approver, A.team, receipt["artifact_id"], snapshot.etag, decision)
+        assert rejected.payload["effective_version_id"] is None
         assert h.assistant.skills.catalog(A, A.team, (receipt["artifact_id"],)).entries == ()
         before = h.store._guard()
         assert post_copy(turn).json() == receipt and h.store._guard() == before
@@ -549,12 +531,12 @@ def test_before_copy_source_change_fences_model_send_and_keeps_original_intent(
     from shared_context.behavior_assistant_api import create_assistant_app
     from shared_context.behavior_assistant_gateway import AssistantProvider
     h = assistant
-    source_http, agent, human_headers, source = approved_sop(h, signing_key, jwk_client)
+    artifacts, agent, approver, source = approved_sop(h, signing_key, jwk_client)
     h, control, human = configured_copy(h, copy_scope(source))
     sent = []
     def credential(_):
         if stage == "egress":
-            change_source(source_http, agent, human_headers)
+            change_source(artifacts, agent, approver)
         return SimpleNamespace(token="OFFLINE_COPY_EGRESS")
     gateway = AssistantProvider("https://provider.invalid/openai/v1/chat/completions",
         SimpleNamespace(get_token=credential), transport=httpx.MockTransport(lambda request: sent.append(True) or httpx.Response(
@@ -573,12 +555,12 @@ def test_before_copy_source_change_fences_model_send_and_keeps_original_intent(
             return body, digest(body)
         body, request_sha = request("Copy only the currently approved original SOP.")
         if stage == "reserve":
-            change_source(source_http, agent, human_headers)
+            change_source(artifacts, agent, approver)
             refused = request_sha
         else:
             turn.client.reserve_model(request_sha)
             if stage == "consume":
-                change_source(source_http, agent, human_headers)
+                change_source(artifacts, agent, approver)
             response = turn.client.model(httpx.Request(
                 "POST", "https://context.invalid/model/v1/chat/completions", json=body))
             assert response.status_code == 200 and sent == [True]

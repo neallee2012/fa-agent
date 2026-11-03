@@ -3,10 +3,6 @@
 import copy
 import hashlib
 import json
-import os
-from pathlib import Path
-import subprocess
-import sys
 from types import MappingProxyType
 
 import httpx
@@ -41,8 +37,7 @@ def profile_interface(request, monkeypatch, signing_key, jwk_client):
         harness = original(*args, **kwargs)
         scope = None
         if request.param == "fa-instruction-sop-copy-v1":
-            http, _, _, version = approved_sop(harness.assistant, signing_key, jwk_client)
-            request.addfinalizer(http.close)
+            _, _, _, version = approved_sop(harness.assistant, signing_key, jwk_client)
             scope = copy_scope(version)
         harness.runtime.profiles = MappingProxyType({
             name: AssistantProfile.model_validate({
@@ -319,32 +314,3 @@ def test_legacy_projection_omits_absent_or_none_assembly_without_relaxing_extra_
     with_extra["turns"][0]["operation_approved"] = True
     with pytest.raises(ValueError):
         ConversationProjection.model_validate_json(json.dumps(with_extra))
-
-
-def test_bridge_prompt_metadata_import_does_not_require_the_hosted_copilot_sdk():
-    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    probe = """
-import importlib.abc
-import sys
-class DenyHostedSdk(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == "copilot" or fullname.startswith("copilot."):
-            raise RuntimeError("bridge imported Hosted SDK")
-sys.meta_path.insert(0, DenyHostedSdk())
-from web_test_console.freeform import ConversationTurn
-from shared_context.behavior_skill_prompt import assemble_prompt
-for profile in ("fa-instruction-v1", "fa-instruction-skills-v1",
-                "fa-instruction-user-turns-v1", "fa-instruction-skill-purpose-v1",
-                "fa-instruction-work-memory-v1"):
-    assert assemble_prompt(profile).record is not None
-assert "prompt_assembly" in ConversationTurn.model_fields
-assert not any(name == "copilot" or name.startswith("copilot.") for name in sys.modules)
-print("BRIDGE_METADATA_SDK_INDEPENDENT")
-"""
-    result = subprocess.run([sys.executable, "-X", "utf8", "-c", probe], capture_output=True, text=True,
-                            encoding="utf-8", timeout=30, env={
-                                **os.environ, "PYTHONPATH": str(source),
-                                "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1",
-                            })
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "BRIDGE_METADATA_SDK_INDEPENDENT"

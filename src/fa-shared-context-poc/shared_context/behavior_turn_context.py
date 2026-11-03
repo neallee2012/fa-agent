@@ -15,9 +15,10 @@ from .behavior_text_files import UserTextFileReference, file_reference
 from .behavior_skill_prompt import AssemblyRecord, assemble_prompt
 from .behavior_capability_prompt import CapabilityAssemblyRecord, capability_record
 from .behavior_user_turn import MAX_USER_TURN_SOURCES
-from .behavior_wire import Digest, Identifier, WireModel
+from .behavior_wire import Digest, Identifier, WireModel, same_but_release
 from .errors import Problem
 from .m3_skills import PurposeSkillEntry
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 MAX_TURN_CONTEXT_BYTES = 16384
 PositiveBytes = Annotated[int, Field(ge=1, le=MAX_BACKUP_BYTES)]
@@ -26,8 +27,8 @@ PositiveBytes = Annotated[int, Field(ge=1, le=MAX_BACKUP_BYTES)]
 class ArchiveMetrics(WireModel):
     codec: Literal["zlib-v1", "artifact-session-fs-v1", "artifact-session-fs-diag-empty-v1",
                    "artifact-session-fs-responses-v1", "artifact-session-fs-responses-diag-v1"] | None
-    sdk_version: Literal["1.0.13"] | None
-    runtime_version: Literal["1.0.83"] | None
+    sdk_version: KnownSdkVersion | None
+    runtime_version: KnownRuntimeVersion | None
     sha256: Digest | None
     encoded_state_bytes: PositiveBytes | None
     inline_zlib_bytes: Annotated[int, Field(ge=1, le=16000)] | None
@@ -183,7 +184,7 @@ def read_saved_turn_context(control, principal, identifier, turn_number):
     saved = _parse(raw, TurnArchive)
     retained = turn_material(saved)
     if (saved.conversation_id != identifier or saved.job_id != binding.job_id or saved.turn_number != turn_number
-            or saved.prompt_assembly != assemble_prompt(record.profile.instruction.prompt_profile).record
+            or not same_but_release(saved.prompt_assembly, assemble_prompt(record.profile.instruction.prompt_profile).record)
             or saved.capability_assembly != capability_record(record.profile.instruction.prompt_profile,
                                                               record.profile.instruction.capabilities)
             or rows[akey].payload["material"] != retained.model_dump(mode="json")

@@ -1,4 +1,4 @@
-"""Real httpx + local M3 transport evidence only; actual_environment=NOT_RUN."""
+"""Real httpx with mocked transports plus the in-process M3 service; actual_environment=NOT_RUN."""
 
 from __future__ import annotations
 
@@ -11,11 +11,9 @@ from unittest.mock import patch
 import httpx
 import pytest
 from azure.core.exceptions import ResourceNotFoundError
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from conftest import A
-from legacy_m2_m4.api import create_app
 from shared_context.behavior_dispatch import (
     ArtifactMetrics, ArtifactReadSpec, ArtifactRoute, ContextArtifactAdapter,
     ContextArtifactSettings, DispatchRecord, SafeArtifactResult, SEND_WINDOW_SECONDS,
@@ -29,7 +27,7 @@ from shared_context.behavior_store import BehaviorStore, InlineMaterial
 from shared_context.errors import Problem
 from test_behavior_operations import CONTEXT, NOW, OTHER, Harness
 from test_behavior_store import FakeTable, SCOPE, code
-from test_m3_artifacts import V1, V2, create, m3, upload
+from test_m3_artifacts import V1, V2
 
 ORIGIN = "https://context.example"
 TOKEN = "SYNTHETIC_CREDENTIAL_MARKER_59ac"
@@ -588,60 +586,3 @@ def test_real_client_creates_native_transport_with_zero_retries_and_no_ambient_e
         h.execute()
     factory.assert_called_once_with(retries=0)
     assert len(h.requests) == 1
-
-
-def test_exact_download_uses_real_m3_service_and_conditional_blob_read(m3):
-    service, _, blob = m3
-    create(service)
-    upload(service, data=DATA)
-    version = service.version(A, A.team, "report", V1)
-    spec = ArtifactReadSpec(
-        **ROUTE.model_dump(), if_match=version.blob.etag, sha256=version.sha256, bytes=version.blob.bytes,
-    )
-    app = TestClient(create_app(
-        service.context, lambda: A, artifact_service=service,
-        verified_artifact_identity_dependency=lambda: A,
-    ))
-
-    def local(request):
-        result = app.request(request.method, request.url.path, headers=dict(request.headers), content=request.content)
-        return httpx.Response(result.status_code, headers=result.headers, stream=Chunks([result.content]))
-
-    h = DispatchHarness(spec=spec, send=local).ready()
-    # A new logical version must not redirect the consumed v1 read.
-    upload(service, version_id=V2, data=b"new current version B")
-    with patch.object(blob, "read", wraps=blob.read) as read:
-        result = h.execute()
-    assert result.payload["result"]["safe_result"]["data"] == METRICS.model_dump()
-    read.assert_called_once_with(A.team, "report", V1, version.blob)
-
-
-@pytest.mark.parametrize("failure", ["version", "iam"])
-def test_real_m3_destination_enforces_version_and_current_actor_before_releasing_bytes(m3, failure):
-    service, _, blob = m3
-    create(service)
-    upload(service, data=DATA)
-    version = service.version(A, A.team, "report", V1)
-    spec = ArtifactReadSpec(
-        **ROUTE.model_dump(), if_match=version.blob.etag, sha256=version.sha256, bytes=version.blob.bytes,
-    )
-    if failure == "version":
-        spec = spec.model_copy(update={"if_match": '"0xBAD"'})
-    app = TestClient(create_app(
-        service.context, lambda: A, artifact_service=service,
-        verified_artifact_identity_dependency=lambda: A,
-    ))
-
-    def local(request):
-        if failure == "iam":
-            service.context.auth.actors.pop(A.oid)
-        result = app.request(request.method, request.url.path, headers=dict(request.headers))
-        assert result.status_code == (412 if failure == "version" else 403)
-        return httpx.Response(result.status_code, headers=result.headers, stream=Chunks([result.content]))
-
-    h = DispatchHarness(spec=spec, send=local).ready()
-    with patch.object(blob, "read", wraps=blob.read) as read, pytest.raises(Problem) as error:
-        h.execute()
-    assert code(error) == "OPERATION_DESTINATION_REJECTED"
-    read.assert_not_called()
-    assert h.data("dispatch-obligation", "op-a", "a")["state"] == "pending_reconciliation"

@@ -222,6 +222,7 @@ def test_both_runtime_manifests_explicitly_pin_httpx_and_sdk_imports():
     from azure.ai.agentserver.invocations import InvocationAgentServerHost
     from azure.ai.agentserver.responses import ResponsesAgentServerHost
     from importlib.metadata import version
+    from shared_context.sdk_pin import SDK_VERSION
 
     source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
     for manifest in ("requirements.txt", "requirements-hosted.txt"):
@@ -229,7 +230,7 @@ def test_both_runtime_manifests_explicitly_pin_httpx_and_sdk_imports():
     assert httpx.__version__ == "0.28.1"
     for package, pinned in (
         ("azure-ai-agentserver-core", "2.2.0"), ("azure-ai-agentserver-responses", "2.2.0"),
-        ("azure-ai-agentserver-invocations", "1.2.0"), ("github-copilot-sdk", "1.0.13"),
+        ("azure-ai-agentserver-invocations", "1.2.0"), ("github-copilot-sdk", SDK_VERSION),
     ):
         assert f"{package}=={pinned}" in (source / "requirements-hosted.txt").read_text().splitlines()
         assert version(package) == pinned

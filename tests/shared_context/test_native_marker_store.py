@@ -24,7 +24,7 @@ from shared_context.native_checkpoint import open_durable_store
 from shared_context.native_markers import EARLIER_VERSION_UNFINISHED, MARKER_TTL_SECONDS, MARKERS_STORE
 from shared_context.native_turns import TURNS_STORE, NativeTaskInput, NativeTurnRuntime
 from test_native_turn_wire import agent_receive, submit
-from test_native_turns import (  # noqa: F401 - fixtures
+from test_native_turns import (  # fixture
     IDENTITY, Harness, OfflineSdk, accept_without_chain, harness, local_env, native_retry_policy, seed_started,
     task_context,
 )
@@ -280,7 +280,7 @@ def final(response):
 
 
 def test_a_resend_of_a_refused_rid_reads_final_and_never_runs(harness):
-    """Review P2 on #889: the owner was told "請用新訊息再送一次", so the same RID sent again (relay resend, API retry)
+    """#889: the owner was told "請用新訊息再送一次", so the same RID sent again (relay resend, API retry)
     is never started at the current version; it answers the same final view and the receipt keeps its bytes."""
     accepted = accept_without_chain(harness)
     refuse(harness, accepted, "handle_turn")
@@ -295,7 +295,7 @@ def test_a_resend_of_a_refused_rid_reads_final_and_never_runs(harness):
 
 
 def test_a_wait_task_rerun_after_a_recycle_never_runs_a_refused_rid(harness):
-    """Review P2 on #889: a wait task recovered after a VM recycle puts the RID back on the chain at the current
+    """#889: a wait task recovered after a VM recycle puts the RID back on the chain at the current
     version; the chain refuses it, so the SDK is never called."""
     from shared_context.native_left_receipts import _queue, _wait_input, enqueue, wait_turn
 
@@ -323,7 +323,7 @@ def test_a_wait_task_rerun_after_a_recycle_never_runs_a_refused_rid(harness):
 
 
 def test_a_miss_cached_while_the_first_refusal_waits_to_create_the_store_never_resurfaces(harness, monkeypatch):
-    """Review P3 on #889: a read gets its 404 while the first refusal's create waits for the lock; once the store client
+    """#889: a read gets its 404 while the first refusal's create waits for the lock; once the store client
     is evicted (``STORE_CLIENTS``), that miss must not hide ``refused:<RID>``."""
     import asyncio
 
@@ -359,7 +359,7 @@ def at_current_version(accepted, *, entry_mode="fresh"):
 
 
 def test_an_unconfirmed_markers_read_at_the_gate_retries_later_and_never_runs_a_refused_rid(harness, monkeypatch):
-    """Review P2 on #889: the owner already read "請用新訊息再送一次"; a wait-task re-run or recover_owned that cannot
+    """#889: the owner already read "請用新訊息再送一次"; a wait-task re-run or recover_owned that cannot
     confirm ``refused:<RID>`` must not run it (the owner's resend would run it twice). It is NativePostTurnPending,
     which the chain's retry policy retries; the retry reads the marker and refuses it."""
     accepted = accept_without_chain(harness)
@@ -395,7 +395,7 @@ def test_a_missing_markers_store_at_the_gate_is_no_refusal_and_the_rid_runs(harn
 
 
 def test_an_adopted_rid_another_process_refused_is_refused_at_the_gate_despite_a_cached_miss(harness):
-    """Review P2 on #889: ``adopt`` reads leniently, so a store error there adopts a refused RID; the gate then looks
+    """#889: ``adopt`` reads leniently, so a store error there adopts a refused RID; the gate then looks
     again (``fresh``) instead of trusting this process's cached miss, so it is refused, not run."""
     accepted = accept_without_chain(harness)
     adopted, _ = harness.call(harness.runtime._cas, accepted,
@@ -409,7 +409,7 @@ def test_an_adopted_rid_another_process_refused_is_refused_at_the_gate_despite_a
 
 @pytest.mark.parametrize("entry", ["handle_turn", "_enqueue_attempt"])
 def test_a_session_that_no_longer_holds_the_receipt_refuses_its_input_without_marking_it(harness, entry):
-    """Review P3 on #889: another session adopted the RID (its receipt names that SID) and runs it; this session's
+    """#889: another session adopted the RID (its receipt names that SID) and runs it; this session's
     refusal by version must not write ``refused:<RID>``, or reads would say "請用新訊息再送一次" while it runs."""
     accepted = accept_without_chain(harness)
     moved, _ = harness.call(harness.runtime._cas, accepted, native_turns._changed(
@@ -456,7 +456,7 @@ REFUSED_NOTICE = [("rid-1", "unknown", EARLIER_VERSION_UNFINISHED)]
 
 @pytest.mark.parametrize("entry", ["handle_turn", "_enqueue_attempt"])
 def test_a_refused_rid_tells_its_peer_sender_on_each_drifted_reentry_and_resend(harness, entry):
-    """#889 P3: the 409 refusal (the chain's, or the enqueue task's) ends the RID for every reader, so the peer sender
+    """#889: the 409 refusal (the chain's, or the enqueue task's) ends the RID for every reader, so the peer sender
     hears it with the final code. #915: the same drifted input again and a resend of the RID tell it again (the sender
     dedupes by RID, ``test_unknown_peer_outcome_wakes_a_once_without_claiming_the_sdk_stopped``); the chain's refusal
     of a current-version input adds nothing."""
@@ -477,7 +477,7 @@ def test_a_refused_rid_tells_its_peer_sender_on_each_drifted_reentry_and_resend(
 @pytest.mark.parametrize("loss", ["marker-then-crash", "notification-start-lost"])
 @pytest.mark.parametrize("entry", ["handle_turn", "_enqueue_attempt"])
 def test_a_refused_rid_whose_notice_was_lost_tells_its_sender_on_the_next_reentry_or_resend(harness, entry, loss):
-    """#915 P2: the marker exists but no notice went out (its create landed and the reply was lost, so the retry got
+    """#915: the marker exists but no notice went out (its create landed and the reply was lost, so the retry got
     409; the process ended right after the write; or the notification task start failed). Nothing sweeps it, so the
     next drifted re-entry tells the sender, and so does a resend of the RID."""
     accepted = accept_peer_without_chain(harness)
@@ -509,7 +509,7 @@ def test_a_refused_rid_whose_notice_was_lost_tells_its_sender_on_the_next_reentr
 
 
 def test_a_stale_refused_view_of_a_rid_a_resend_started_tells_its_sender_nothing(harness):
-    """#915 P3: the enqueue task reads ``accepted``, a current-version resend starts the RID before the marker is
+    """#915: the enqueue task reads ``accepted``, a current-version resend starts the RID before the marker is
     written, then the notification task reads ``started``: not final, so no hook runs (its own end notifies)."""
     accepted, _ = seed_started(harness)
     calls = sender_notices(harness)
@@ -525,7 +525,7 @@ def test_a_stale_refused_view_of_a_rid_a_resend_started_tells_its_sender_nothing
 
 
 def test_a_drifted_input_of_a_finished_rid_tells_its_sender_nothing_more(harness):
-    """#889 P3: a finished RID told its sender when it ended; the enqueue task's refusal of its drifted input does not
+    """#889: a finished RID told its sender when it ended; the enqueue task's refusal of its drifted input does not
     tell it again (``_enqueue_attempt``'s ``_refused_final`` guard)."""
     notices, completed = sender_notices(harness), []
 
@@ -541,7 +541,7 @@ def test_a_drifted_input_of_a_finished_rid_tells_its_sender_nothing_more(harness
 
 
 def test_a_refused_rids_exhausted_notification_never_rewrites_its_receipt(harness):
-    """#915 P3: the refused RID is final only as a read-time view; when every notification attempt fails, the
+    """#915: the refused RID is final only as a read-time view; when every notification attempt fails, the
     ``notification_error`` write is skipped, so the stored ``accepted`` receipt keeps its bytes (ADR-0009 §9)."""
     accepted = accept_peer_without_chain(harness)
     before = harness.call(rid_item)

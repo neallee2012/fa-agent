@@ -24,14 +24,15 @@ from shared_context.behavior_profile_selection import SELECTABLE_PROFILES
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.native_local_capabilities import local_capability_provider
 from shared_context.native_turns import NativeTurnRuntime
-from test_behavior_assistant import assistant  # noqa: F401
+from shared_context.sdk_pin import RUNTIME_VERSION
+from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import instruction_models, runtime_path  # noqa: F401
+from test_instruction_flow import instruction_models, runtime_path
 from test_instruction_prompt import saved_turn, sdk_options, submit
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_m3_auth import jwk_client, signing_key
 from test_native_local_capabilities import MODEL_ROOT, Handlers, browser_grant, with_grants
 from test_native_turn_wire import submit as native_submit
-from test_native_turns import Harness, IDENTITY, local_env  # noqa: F401
+from test_native_turns import Harness, IDENTITY, local_env
 
 PROFILE = "fa-instruction-v4"
 V3 = "fa-instruction-v3"
@@ -164,7 +165,7 @@ def test_native_turn_sends_v4_before_the_desktop_and_browser_handover(local_env,
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "done", "sdk_stop": {"pid": 1, "exit_code": 0, "graceful": True,
-                                                      "runtime_version": "1.0.83"}}
+                                                      "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

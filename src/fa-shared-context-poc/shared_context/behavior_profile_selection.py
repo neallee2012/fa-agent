@@ -13,6 +13,7 @@ from .behavior_skill_prompt import assemble_prompt
 from .behavior_store import ControlChanges, ControlRequest, ControlWrite
 from .behavior_wire import Command, Digest, Identifier, WireModel
 from .errors import Problem
+from .native_responses_wire import SENT_RELEASE, SENT_STATE_PROFILES
 from .source_materials import digest
 
 READ_ONLY_PROFILES = {
@@ -213,6 +214,12 @@ def select_profile(control, authority, principal, command, *, reconcile=False):
         raise Problem(503, "PROFILE_SELECTION_UNKNOWN", "original profile selection is not confirmed; do not resend with a new ID")
     if rows[current_key] is not None:
         current_selection(control.store, policy)
+    settings = command.template.settings
+    # ADR-0009 §3 (c): a new selection is sent material, so it names the send profile's pair and a state profile the
+    # send profile's images read; an old image refuses others in every capture.
+    if ((settings.sdk_version, settings.runtime_version) != SENT_RELEASE
+            or settings.state_profile not in SENT_STATE_PROFILES):
+        raise Problem(422, "PROFILE_SELECTION_UNSUPPORTED", "template settings do not form a compatible original-scope profile")
     profile = profile_from_template(policy, command.template)
     from .behavior_capabilities import check_selectable, runtime_grants
     check_selectable(profile.capabilities, profile.prompt_profile, runtime_grants(control.runtime))

@@ -1376,8 +1376,22 @@ class NativeInstructionControl:
             self._current(token)
             require(conversation.state_profile == NATIVE_RESPONSES_PROFILE, "NATIVE_STATE_SCOPE", 502)
             self.conversations[thread] = conversation
-            for rid in {conversation.last_request_id, conversation.inflight_request_id} - {None}:
+            # Turns with no local submit (a received root, a relay) get no read above; one seen unfinished and no longer
+            # the last turn would stay so. Same rule as the Invocations lane's imported root in refresh().
+            unsettled = {rid for rid, value in self.receipts.items() if self.request_threads.get(rid) == thread
+                         and value.status not in {"completed", "busy_refused"} and self.journal.get(rid, "submit") is None}
+            newest = {conversation.last_request_id, conversation.inflight_request_id} - {None}
+            for rid in newest:
                 self._remember(thread, self._receipt(rid, token))
+            # Like _unread_unknown: one old turn that cannot be read stays on its own turn; the rest is still read.
+            for rid in unsettled - newest:
+                try:
+                    self._remember(thread, self._receipt(rid, token))
+                    self.errors.pop(rid, None)
+                except ConsoleError as error:
+                    if _signed_out(error):
+                        raise
+                    self.errors[rid] = error.code
         self._refresh_peer_replies(thread, token)
         self.observed[thread] = self.clock().isoformat()
 

@@ -7,9 +7,9 @@ from shared_context.behavior_fresh_installation import fresh_key
 from shared_context.behavior_migration import origin_pointer_keys
 from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
 from shared_context.errors import Problem
-from test_behavior_assistant_server import assistant_server  # noqa: F401
-from test_fresh_installation import fresh_case, initialize  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_behavior_assistant_server import assistant_server
+from test_fresh_installation import fresh_case, initialize
+from test_m3_auth import jwk_client, signing_key
 from test_per_request_verified_origin import external_write
 
 

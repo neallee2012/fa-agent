@@ -5,6 +5,7 @@ import pytest
 from shared_context.behavior_assistant_wire import Task
 from shared_context.behavior_instruction_prompt import PromptAssemblyRecord, assemble_instruction_prompt
 from shared_context.behavior_skill_prompt import assemble_prompt
+from shared_context.native_responses_wire import SENT_RELEASE
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
@@ -59,7 +60,7 @@ def test_v3_keeps_canonical_base_tools_and_exact_safe_record():
         assert SOURCE_RULE in value.system_message and DRAFT_RULE in value.system_message
         assert value.record.prefix_tokens is None
         assert value.record.source == "server-profile-recomputed"
-        assert value.record.sdk_version == "1.0.13" and value.record.runtime_version == "1.0.83"
+        assert (value.record.sdk_version, value.record.runtime_version) == SENT_RELEASE
         assert PromptAssemblyRecord.model_validate_json(value.record.model_dump_json()) == value.record
         assert value.system_message not in value.record.model_dump_json()
     assert "save_skill_draft" not in full.system_message

@@ -19,6 +19,7 @@ from shared_context.native_skill_draft_wire import (
     NativeSkillDraftIntentRead, NativeSkillDraftReceipt, NativeSkillDraftWrite, artifact_id, draft_material,
 )
 from shared_context.native_turns import NativeTurnRuntime
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_m2_copilot import runtime_path
 from test_native_capabilities import selected_capture
 from test_native_turn_wire import submit
@@ -82,7 +83,7 @@ def test_sdk_skillify_reserves_original_slot_and_returns_same_m3_receipt_without
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n"})
         observations.append("sdk-finished")
         return {"final_message": "Saved an unapproved draft for human review, not an active skill.",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     provider = skill_draft_provider(transport=httpx.MockTransport(api))

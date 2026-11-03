@@ -11,9 +11,9 @@ from web_test_console import __main__ as launcher
 from web_test_console import prewarm as typing_prewarm
 from web_test_console.agent_connections import AgentConnections
 from web_test_console.bridge import create_app
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_m3_auth import jwk_client, signing_key
 from test_web_test_console_agents import connection_file, directory_payload
-from test_web_test_console_frozen_interface import real_interface  # noqa: F401
+from test_web_test_console_frozen_interface import real_interface
 
 ORIGIN = "http://127.0.0.1:8875"
 AGENT = {"X-Console-Agent": "agent-one"}

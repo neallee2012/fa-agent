@@ -143,6 +143,7 @@ class NativeHitlClient:
                         except (ValueError, AttributeError) as error:
                             decode_error = error
                             code = None
+                        code = code if isinstance(code, str) else None
                         diagnostic_code = code if code is not None else "UNCLASSIFIED"
                         if code not in NATIVE_HITL_ERRORS | {"BEHAVIOR_COMMIT_UNKNOWN", "BEHAVIOR_CONFLICT"}:
                             code = "NATIVE_HITL_AUTHORITY_UNAVAILABLE"

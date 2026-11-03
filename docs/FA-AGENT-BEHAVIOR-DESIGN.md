@@ -35,7 +35,7 @@
 
 程式依據：入口、dispatcher（兩者已於 2026-10 移除）、[ContextService](../src/fa-shared-context-poc/shared_context/service.py)、[TableRepository](../src/fa-shared-context-poc/shared_context/storage.py)、[FoundryMemory](../src/fa-shared-context-poc/shared_context/memory.py)。
 
-現有測項已表達應保留的契約：[owner／ETag／發布保護](../tests/shared_context/test_api.py)、[私人 scope／記憶失敗不偽裝成功](../tests/shared_context/test_memory_context.py)。它們不驗證本提案的新能力。M1 的較新狀態以 [M1 結果](M1-PRIVATE-ENVIRONMENT-POC.md) 為準，不沿用早期規格中「HOME 尚未驗收」的歷史快照，也不擴張 M1 的成功範圍。
+現有測項已表達應保留的契約：owner／ETag／發布保護（只測舊 HTTP 前端，已於 2026-11 移除）、私人 scope／記憶失敗不偽裝成功（同樣只測舊 HTTP 前端，已於 2026-11 移除）。它們不驗證本提案的新能力。M1 的較新狀態以 [M1 結果](M1-PRIVATE-ENVIRONMENT-POC.md) 為準，不沿用早期規格中「HOME 尚未驗收」的歷史快照，也不擴張 M1 的成功範圍。
 
 ## 3. 文章九個層面如何落到 FA
 

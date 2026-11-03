@@ -8,9 +8,9 @@ from pydantic import ValidationError
 from shared_context.errors import Problem
 from shared_context.native_hitl_attention import approval_code, find_approval_ids
 from shared_context.native_teams_relay import RelayDecision, RelayReply, TeamsRelay
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_hitl import hitl, read  # noqa: F401
-from test_native_hitl_attention import attention, pending  # noqa: F401
+from test_m3_auth import jwk_client, signing_key
+from test_native_hitl import hitl, read
+from test_native_hitl_attention import attention, pending
 
 NO_CARD = RelayReply(state="failed", text="這個代碼沒有對應的待批准項目（可能已處理或過期）。")
 

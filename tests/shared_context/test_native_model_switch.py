@@ -21,7 +21,7 @@ from shared_context.native_assembly import NativeAssembly
 from shared_context.native_inference import NativeInference, SdkContext
 from shared_context.native_turns import NativeTurnRuntime
 from test_native_turn_wire import capture, submit
-from test_native_turns import Harness, IDENTITY, OfflineSdk, local_env, native_retry_policy  # noqa: F401
+from test_native_turns import Harness, IDENTITY, OfflineSdk, local_env, native_retry_policy
 
 FLAG = "FA_NATIVE_MODEL_SWITCH"
 

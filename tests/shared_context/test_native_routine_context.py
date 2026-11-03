@@ -9,6 +9,7 @@ import pytest
 from shared_context import native_sdk
 from shared_context.behavior_native_turn_wire import NativeSubmit, NativeTurnCapture
 from shared_context.m2_copilot import ToolFailure
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_routine_turns import routine_request
 from test_native_responses import response_submit, responses
 from test_native_turn_wire import submit
@@ -21,7 +22,7 @@ async def sdk_answer(options):
         "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
     })
     return {"final_message": "OFFLINE original answer",
-            "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+            "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
 
 def test_only_the_scheduled_sdk_input_carries_its_original_occurrence_and_started_state(
@@ -143,6 +144,20 @@ def test_work_context_reads_the_original_rid_instead_of_inventing_a_new_work(har
     assert observed[0]["data"]["content"] == "Keep working on the original report."
     assert observed[0]["data"]["source_kind"] == "human"
     assert observed[0]["authorization"] is False
+
+
+def test_a_completed_work_stopped_too_late_reads_as_a_saved_result_not_cancelled_work():
+    from types import SimpleNamespace
+    from shared_context.native_work_context import work_next_step
+
+    def receipt(status, cancel_requested=False, failure_code=None):
+        return SimpleNamespace(status=status, cancel_requested=cancel_requested, failure_code=failure_code)
+
+    assert work_next_step(receipt("completed", True)) == "read-saved-result-not-a-new-execution"  # #1145
+    assert work_next_step(receipt("unknown", True, "NATIVE_TURN_CANCELLED")) == "do-not-revive-cancelled-work"
+    assert work_next_step(receipt("busy_refused", True)) == "do-not-revive-cancelled-work"
+    assert work_next_step(receipt("unknown")) == "read-original-receipts-do-not-repeat-unknown-effects"
+    assert work_next_step(receipt("started")) == "after-the-follow-up-return-to-this-original-work"
 
 
 def test_long_form_style_is_loaded_on_request_not_injected_into_short_answers(harness, monkeypatch, tmp_path):

@@ -21,6 +21,7 @@ from shared_context.behavior_operations import control_key
 from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_sdk_state import CheckpointProfile, DIAG_ARCHIVE_CODEC
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
 from test_instruction_prompt import configured, saved_turn, submit, submit_legacy
@@ -167,7 +168,7 @@ def test_fixed_sdk_receives_exact_prefix_and_user_message_without_new_authority(
     for turn, bridge in zip(turns, bridges, strict=True):
         saved = saved_turn(h, turn["job_id"])
         assert saved.prompt_assembly == expected.record
-        assert bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == "1.0.83"
+        assert bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == RUNTIME_VERSION
         state = bridge._session_files.snapshot()
         events = events_from(state.files)
         raw_events = events_from(bridge._session_files.files)
@@ -188,12 +189,12 @@ def test_fixed_sdk_receives_exact_prefix_and_user_message_without_new_authority(
     assert len(calls) == (4 if checkpoint else 3)
     assert [turn["model_requests"] for turn in turns] == [2, 2 if checkpoint else 1]
     assert not force_stops
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     evidence = {
         "evidence": "fixed SDK/runtime; product HTTP/authority/save path; explicit offline provider",
         "profile": profile, "checkpoint_profile_enabled": checkpoint,
         "fixture_first_reply_utf8_bytes": len(first_reply.encode("utf-8")),
-        "sdk_version": "1.0.13", "runtime_version": "1.0.83",
+        "sdk_version": SDK_VERSION, "runtime_version": RUNTIME_VERSION,
         "prefix_sha256": hashlib.sha256(expected.system_message.encode()).hexdigest(),
         "prefix_utf8_bytes": len(expected.system_message.encode("utf-8")), "prefix_tokens": None,
         "assembly_record": None if expected.record is None else expected.record.model_dump(mode="json"),

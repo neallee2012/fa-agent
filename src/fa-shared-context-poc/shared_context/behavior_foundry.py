@@ -4,7 +4,7 @@ actual_environment=NOT_RUN. Construction/import never acquires credentials,
 creates a session, deploys, invokes a model, or enables native readiness.
 
 Protocol sources (read 2026-09-15):
-* controller/run_poc.py: v1 invocations endpoint and explicit existing session.
+* controller/run_poc.py (removed 2026-11-03, see 0330d456): v1 invocations endpoint and explicit existing session.
 * Microsoft Learn, manage-hosted-sessions, Sessions versus conversations:
   Invocations binds a sandbox ONLY through the agent_session_id query parameter.
 * azure-ai-agentserver-invocations 1.1.0 README and installed _invocation.py:
@@ -953,6 +953,78 @@ def _lost_session_result(launch, proof, verifier_version):
     return _notice_result("lost-session-result", SESSION_LOST, launch, proof, verifier_version)
 
 
+def _different_version(observed, launch):
+    """Whether a reported agent version is concrete and not the one this launch expected."""
+    return (isinstance(observed, str) and re.fullmatch(r"[1-9][0-9]{0,15}", observed) is not None
+            and observed != launch.target.agent_version)
+
+
+def _claim_issued(launch):
+    """Whether any field only a claim writes is set."""
+    return (launch.native_invocation_id is not None or launch.claim_id is not None
+            or launch.process_id is not None or launch.report_token_digest is not None
+            or launch.child_pid is not None)
+
+
+def _unclaimed_fence_proof(launch_id, start_request_id, observed_agent_version=None):
+    proof = {"kind": "terminal_unclaimed_launch_fence", "launch_id": launch_id,
+             "original_start_request_id": start_request_id, "cancel_requested": observed_agent_version is None,
+             "claim_never_issued": True, "no_provider_stop_claim": True}
+    if observed_agent_version is not None:
+        proof.update(failure_code=SESSION_VERSION_CHANGED, observed_agent_version=observed_agent_version)
+    return proof
+
+
+def _fence_observation(authority, launch, saved, fence):
+    """The version a refusal fence saved, or None for a cancel fence. authority is None for stored-state readers."""
+    if fence is None or "failure_code" not in fence.payload["data"]:
+        return None
+    data = fence.payload["data"]
+    observed = data.get("observed_agent_version")
+    if (data.get("failure_code") != SESSION_VERSION_CHANGED or not _different_version(observed, launch)
+            or saved.evidence.result is None
+            or authority is not None and saved.evidence.result.verifier_version != authority.verifier_version):
+        raise Problem(403, "NATIVE_EVIDENCE_INVALID", "version refusal lacks its exact original observation")
+    return observed
+
+
+def _claim_may_own_launch(current, job, reservation, binding, launch_id, failed):
+    """Whether this launch is anything but the original unclaimed one a fence may close."""
+    return (current.start.binding != binding or current.phase != "post_unknown" or _claim_issued(current)
+            or job.binding != binding or job.cancel_requested != (not failed)
+            or reservation.active_launch_id != launch_id)
+
+
+def _terminal_evidence_differs(saved, launch, *, probe_id, expected, state, execution_id, result):
+    """Whether saved evidence is not the exact idle terminal record these values prove."""
+    evidence = saved.evidence
+    return (saved.launch_id != launch.launch_id or saved.probe_id != probe_id
+            or saved.report_digest != _digest(expected) or evidence.proof != _json(expected)
+            or evidence.state != state or evidence.binding != launch.start.binding
+            or evidence.native_execution_id != execution_id
+            or not evidence.entire_tree_idle or not evidence.all_inflight_starts_fenced
+            or evidence.result != result or evidence.checkpoint is not None)
+
+
+def _expected_lost_proof(launch, proof):
+    """What a saved proof must equal for this launch, keeping only the stop facts it recorded itself."""
+    if not isinstance(proof, dict):
+        return None
+    return {
+        "kind": "terminal_lost_session", "launch_id": launch.launch_id,
+        "original_start_request_id": launch.start.binding.start_request_id,
+        "native_invocation_id": launch.native_invocation_id, "session_id": launch.target.session_id,
+        "agent_version": launch.target.agent_version, "session_status": proof.get("session_status"),
+        "stop_requested": proof.get("stop_requested"), "cancel_requested": proof.get("cancel_requested") is True,
+        "failure_code": SESSION_LOST, "no_provider_effect_claim": True,
+    }
+
+
+def _lost_launch_differs(launch):
+    return (launch.phase != "sealed" or launch.native_invocation_id is None or launch.claim_id is None
+            or launch.sealed_evidence_id != native_key("lost-session-evidence", launch.launch_id))
+
+
 def lost_session_failure(store, job):
     """The original turn ended because its session compute stopped, per its sealed evidence."""
     if job is None or job.state not in {"failed", "cancelled"} or job.binding is None:
@@ -999,6 +1071,15 @@ def session_version_failure(store, job):
     if launch.start.binding != job.binding or evidence.evidence.state != "failed":
         raise Problem(409, "NATIVE_EVIDENCE_INVALID", "version refusal belongs to another original start")
     return SESSION_VERSION_CHANGED
+
+
+def _require_saved_attempt(attempt, start):
+    if (
+        attempt is None or attempt.payload["data"].get("kind") != "worker_attempt"
+        or _parse(attempt.payload["data"].get("start"), ExecutorStart) != start
+        or _parse(attempt.payload["material"], InlineMaterial) != _material(start.model_dump(mode="json"))
+    ):
+        raise Problem(403, "NATIVE_INPUT_UNVERIFIED", "only the worker's saved immutable attempt may launch")
 
 
 class NativeLaunchAuthority:
@@ -1121,6 +1202,14 @@ class NativeLaunchAuthority:
         grant = self._row(rows, native_key("grant", launch.grant_id), NativeExecutionGrant)
         policy = self._row(rows, control_key("policy", context.policy_id), PolicyRecord)
         budget = self._row(rows, control_key("budget", context.root_budget_id), BudgetRecord)
+        self._require_associated(launch, owner, grant, policy, budget)
+        if dispatch:
+            self._require_dispatchable(context, owner, grant, policy, budget)
+        return grant
+
+    def _require_associated(self, launch, owner, grant, policy, budget):
+        """The grant was issued for this launch, and the owner, policy and budget are still the binding's."""
+        context = launch.start.binding.owner
         if (
             grant.controller_id != self.controller_id or grant.job_id != launch.start.binding.job_id
             or grant.grant_id != launch.grant_id or grant.input_digest != launch.start.binding.input_digest
@@ -1132,7 +1221,10 @@ class NativeLaunchAuthority:
             or budget.root_budget_id != context.root_budget_id
         ):
             raise Problem(403, "NATIVE_AUTHORITY_FENCED", "current owner/grant/policy association differs")
-        if dispatch and (
+
+    def _require_dispatchable(self, context, owner, grant, policy, budget):
+        """Everything is still active, at the granted revision and epoch, and inside the grant window."""
+        if (
             not grant.active or not policy.active or not budget.active or policy.revision != grant.policy_revision
             or owner.epoch != context.epoch or grant.owner != context
             or grant.not_before>self._now()
@@ -1140,7 +1232,6 @@ class NativeLaunchAuthority:
             or grant.expires_at is not None and self._now()>=grant.expires_at
         ):
             raise Problem(403, "NATIVE_AUTHORITY_FENCED", "native dispatch grant is revoked, stale, or expired")
-        return grant
 
     def _keys(self, launch):
         owner = launch.start.binding.owner
@@ -1169,6 +1260,44 @@ class NativeLaunchAuthority:
     def target_key(self,target,job_id):
         return native_key("target",target.executor_id,*((job_id,) if self.workers.instruction(job_id) else ()))
 
+    def _require_current_start(self, rows, start):
+        self.workers._owner(rows, start.binding.owner)
+        current = self.workers._row(rows, worker_key("job", start.binding.job_id), JobRecord)
+        if current.binding != start.binding or current.state != "starting" or current.cancel_requested:
+            raise Problem(409, "NATIVE_START_FENCED", "original worker start is no longer current")
+
+    def _free_target(self, rows, start, targets):
+        """The target of this job's one capacity slot, once its predecessor has settled."""
+        pool = self.workers._pool(rows)
+        slots = [slot for slot in pool.slots if slot.binding == start.binding]
+        if len(slots) != 1:
+            raise Problem(409, "NATIVE_SLOT_FENCED", "one current global capacity reservation is required")
+        target = targets[slots[0].number]
+        target_key = self.target_key(target,start.binding.job_id)
+        reservation = (
+            _TargetReservation(target=target, configuration_digest=self.workers.configuration_digest(),
+                job_id=start.binding.job_id if self.workers.instruction(start.binding.job_id) else None) if rows[target_key] is None
+            else self._row(rows, target_key, _TargetReservation)
+        )
+        if reservation.target != target or reservation.active_launch_id is not None:
+            raise Problem(409, "NATIVE_TARGET_BUSY", "the predecessor's actual target is not settled")
+        return target, target_key, reservation
+
+    def _require_grant_covers(self, start, grant, route):
+        assistant_profile = grant.workload_version == "assistant-v1.2"
+        if assistant_profile:
+            if self.assistant is None:
+                raise Problem(403, "NATIVE_ASSISTANT_DISABLED", "concrete assistant authority is not registered")
+            self.assistant.validate_native_start(start, grant, route.api_binding_id)
+        if (
+            grant.remaining_uses < 1 or grant.definition.work_id != start.binding.work_id
+            or not assistant_profile and not set(grant.definition.required_checks) <= SUPPORTED_CHECKS
+            or grant.definition.human_checks or grant.definition.result_kind != "answer"
+            or hashlib.sha256(start.input).hexdigest() != grant.input_digest
+            or grant.checkpoint_after_bytes is not None and grant.checkpoint_after_bytes > len(start.input)
+        ):
+            raise Problem(403, "NATIVE_GRANT_DENIED", "constrained checks/input or remaining native grant differs")
+
     def prepare(self, start: ExecutorStart) -> tuple[_NativeLaunch, SecretStr | None]:
         """Internal controller only. A replay returns NO permit and cannot POST."""
         start = _check(start, ExecutorStart)
@@ -1196,30 +1325,9 @@ class NativeLaunchAuthority:
 
         def decide(rows):
             nonlocal fresh
-            self.workers._owner(rows, start.binding.owner)
-            current = self.workers._row(rows, worker_key("job", start.binding.job_id), JobRecord)
-            if current.binding != start.binding or current.state != "starting" or current.cancel_requested:
-                raise Problem(409, "NATIVE_START_FENCED", "original worker start is no longer current")
-            attempt = rows[attempt_key]
-            if (
-                attempt is None or attempt.payload["data"].get("kind") != "worker_attempt"
-                or _parse(attempt.payload["data"].get("start"), ExecutorStart) != start
-                or _parse(attempt.payload["material"], InlineMaterial) != _material(start.model_dump(mode="json"))
-            ):
-                raise Problem(403, "NATIVE_INPUT_UNVERIFIED", "only the worker's saved immutable attempt may launch")
-            pool = self.workers._pool(rows)
-            slots = [slot for slot in pool.slots if slot.binding == start.binding]
-            if len(slots) != 1:
-                raise Problem(409, "NATIVE_SLOT_FENCED", "one current global capacity reservation is required")
-            target = targets[slots[0].number]
-            target_key = self.target_key(target,start.binding.job_id)
-            reservation = (
-                _TargetReservation(target=target, configuration_digest=self.workers.configuration_digest(),
-                    job_id=start.binding.job_id if self.workers.instruction(start.binding.job_id) else None) if rows[target_key] is None
-                else self._row(rows, target_key, _TargetReservation)
-            )
-            if reservation.target != target or reservation.active_launch_id is not None:
-                raise Problem(409, "NATIVE_TARGET_BUSY", "the predecessor's actual target is not settled")
+            self._require_current_start(rows, start)
+            _require_saved_attempt(rows[attempt_key], start)
+            target, target_key, reservation = self._free_target(rows, start, targets)
             grant = self._row(rows, native_key("grant", route.grant_id), NativeExecutionGrant)
             launch = _NativeLaunch(
                 launch_id=launch_id, api_binding_id=route.api_binding_id, grant_id=route.grant_id,
@@ -1231,19 +1339,7 @@ class NativeLaunchAuthority:
                 workload_version=grant.workload_version,
             )
             self._current(rows, launch, dispatch=True)
-            assistant_profile = grant.workload_version == "assistant-v1.2"
-            if assistant_profile:
-                if self.assistant is None:
-                    raise Problem(403, "NATIVE_ASSISTANT_DISABLED", "concrete assistant authority is not registered")
-                self.assistant.validate_native_start(start, grant, route.api_binding_id)
-            if (
-                grant.remaining_uses < 1 or grant.definition.work_id != start.binding.work_id
-                or not assistant_profile and not set(grant.definition.required_checks) <= SUPPORTED_CHECKS
-                or grant.definition.human_checks or grant.definition.result_kind != "answer"
-                or hashlib.sha256(start.input).hexdigest() != grant.input_digest
-                or grant.checkpoint_after_bytes is not None and grant.checkpoint_after_bytes > len(start.input)
-            ):
-                raise Problem(403, "NATIVE_GRANT_DENIED", "constrained checks/input or remaining native grant differs")
+            self._require_grant_covers(start, grant, route)
             fresh = True
             return ControlChanges(writes=(
                 self._write(key, launch),
@@ -1272,12 +1368,7 @@ class NativeLaunchAuthority:
     def claim(self, binding_id, launch_id, command, principal, *, assistant_conflicts=False):
         """Executor callback; MI alone NEVER consumes a launch."""
         command = _check(command, wire.HostedClaimRequest)
-        if assistant_conflicts:
-            from .behavior_assistant import _ledger_conflicts, _read_conflicts
-        launch = (_read_conflicts(lambda: self.launch(launch_id), phase="hosted_claim")
-                  if assistant_conflicts else self.launch(launch_id))
-        if assistant_conflicts and (launch.workload_version != "assistant-v1.2" or self.assistant is None):
-            raise Problem(403, "NATIVE_ASSISTANT_DISABLED", "bounded claim requires the registered assistant profile")
+        launch = self._launch_to_claim(launch_id, assistant_conflicts)
         self._agent(launch, principal, command.identity)
         permit_digest = _secret_digest(command.launch_permit)
         if (binding_id != launch.api_binding_id or not _valid_invocation_id(command.invocation_id)
@@ -1293,19 +1384,9 @@ class NativeLaunchAuthority:
 
         def decide(rows):
             nonlocal fresh
-            current = self._row(rows, native_key("launch", launch_id), _NativeLaunch)
-            self._current(rows, current, dispatch=True)
-            job = self.workers._row(rows, worker_key("job", current.start.binding.job_id), JobRecord)
-            reservation = self._row(rows,self.target_key(current.target,current.start.binding.job_id),_TargetReservation)
-            if (
-                current.phase != "post_unknown" or current.native_invocation_id is not None
-                or not secrets.compare_digest(current.permit_digest, permit_digest)
-                or job.cancel_requested or job.binding != current.start.binding
-                or reservation.active_launch_id != launch_id or reservation.generation != current.process_generation
-            ):
-                raise Problem(403, "NATIVE_CLAIM_DENIED", "one-use native launch permit is unavailable")
             current = _update(
-                current, phase="claimed", claim_id=claim_id, process_id=command.process_id,
+                self._unclaimed_launch(rows, launch_id, permit_digest),
+                phase="claimed", claim_id=claim_id, process_id=command.process_id,
                 report_token_digest=_secret_digest(token), native_invocation_id=command.invocation_id,
             )
             fresh = True
@@ -1313,22 +1394,63 @@ class NativeLaunchAuthority:
                                   result={"claim_id": claim_id})
 
         if assistant_conflicts:
+            from .behavior_assistant import _ledger_conflicts
             _ledger_conflicts(self.store, request, decide)
         else:
             self.store.transact(request, decide)
+        current = self._committed_claim(launch_id, command, permit_digest, assistant_conflicts)
+        return wire.HostedClaimReceipt(assignment=self._claim_assignment(launch_id, current),
+                                      claim_state="fresh" if fresh else "replay",
+                                      report_token=token if fresh else None)
+
+    def _launch_to_claim(self, launch_id, assistant_conflicts):
+        """The saved launch; a bounded assistant claim retries read conflicts and needs the registered profile."""
+        if not assistant_conflicts:
+            return self.launch(launch_id)
+        from .behavior_assistant import _read_conflicts
+        launch = _read_conflicts(lambda: self.launch(launch_id), phase="hosted_claim")
+        if launch.workload_version != "assistant-v1.2" or self.assistant is None:
+            raise Problem(403, "NATIVE_ASSISTANT_DISABLED", "bounded claim requires the registered assistant profile")
+        return launch
+
+    def _unclaimed_launch(self, rows, launch_id, permit_digest):
+        """The launch, still posted and unclaimed under this permit, for its current job and target generation."""
+        current = self._row(rows, native_key("launch", launch_id), _NativeLaunch)
+        self._current(rows, current, dispatch=True)
+        job = self.workers._row(rows, worker_key("job", current.start.binding.job_id), JobRecord)
+        reservation = self._row(rows,self.target_key(current.target,current.start.binding.job_id),_TargetReservation)
+        if (
+            current.phase != "post_unknown" or current.native_invocation_id is not None
+            or not secrets.compare_digest(current.permit_digest, permit_digest)
+            or job.cancel_requested or job.binding != current.start.binding
+            or reservation.active_launch_id != launch_id or reservation.generation != current.process_generation
+        ):
+            raise Problem(403, "NATIVE_CLAIM_DENIED", "one-use native launch permit is unavailable")
+        return current
+
+    def _committed_claim(self, launch_id, command, permit_digest, assistant_conflicts):
+        """The claimed launch read back under current authority; a replay must be this same process and permit."""
         def read_current():
             current = self.launch(launch_id)
             self._current(self.store.read_snapshot(self._keys(current)), current, dispatch=True)
             return current
-        current = _read_conflicts(read_current, phase="hosted_claim_post_commit") if assistant_conflicts else read_current()
+        if assistant_conflicts:
+            from .behavior_assistant import _read_conflicts
+            current = _read_conflicts(read_current, phase="hosted_claim_post_commit")
+        else:
+            current = read_current()
         if (current.process_id != command.process_id or current.permit_digest != permit_digest
                 or current.native_invocation_id != command.invocation_id):
             raise Problem(403, "NATIVE_CLAIM_DENIED", "claim replay belongs to another process/permit")
+        return current
+
+    def _claim_assignment(self, launch_id, current):
+        """What the executor runs from a claimed launch; a resumed one names the launch before it."""
         previous = (
             native_key("launch-id", worker_key("start", current.start.binding.job_id, str(current.start.binding.generation - 1)))
             if current.start.checkpoint is not None else None
         )
-        assignment = wire.HostedAssignment(
+        return wire.HostedAssignment(
             launch_id=launch_id, claim_id=current.claim_id, invocation_id=current.native_invocation_id,
             identity=_identity(current.target), process_id=current.process_id,
             process_generation=current.process_generation, binding_digest=_digest(current.start.binding.model_dump(mode="json")),
@@ -1337,8 +1459,6 @@ class NativeLaunchAuthority:
             previous_launch_id=previous, checkpoint_after_bytes=current.checkpoint_after_bytes,
             workload_version=current.workload_version,
         )
-        return wire.HostedClaimReceipt(assignment=assignment, claim_state="fresh" if fresh else "replay",
-                                      report_token=token if fresh else None)
 
     def probe(self, binding: ExecutorBinding, directive="observe") -> _NativeProbe:
         """Internal controller only; a probe is persisted BEFORE native I/O."""
@@ -1573,38 +1693,18 @@ class NativeLaunchAuthority:
                                                            "evidence_id": evidence_id, "state": outcome.state})
 
     def _verify_unclaimed_fence(self, launch, saved, fence):
-        expected = {
-            "kind": "terminal_unclaimed_launch_fence", "launch_id": launch.launch_id,
-            "original_start_request_id": launch.start.binding.start_request_id, "cancel_requested": True,
-            "claim_never_issued": True, "no_provider_stop_claim": True,
-        }
-        failed = fence is not None and "failure_code" in fence.payload["data"]
-        result = None
-        if failed:
-            observed = fence.payload["data"].get("observed_agent_version")
-            if (fence.payload["data"].get("failure_code") != SESSION_VERSION_CHANGED
-                    or not isinstance(observed, str) or re.fullmatch(r"[1-9][0-9]{0,15}", observed) is None
-                    or observed == launch.target.agent_version or saved.evidence.result is None
-                    or self is not None and saved.evidence.result.verifier_version != self.verifier_version):
-                raise Problem(403, "NATIVE_EVIDENCE_INVALID", "version refusal lacks its exact original observation")
-            expected.update(cancel_requested=False, failure_code=SESSION_VERSION_CHANGED,
-                            observed_agent_version=observed)
-            result = _version_refusal_result(launch, expected, saved.evidence.result.verifier_version)
-        if (launch.phase != "sealed" or launch.native_invocation_id is not None
-                or launch.claim_id is not None or launch.process_id is not None
-                or launch.report_token_digest is not None or launch.child_pid is not None
-                or launch.checkpoint is not None
+        observed = _fence_observation(self, launch, saved, fence)
+        failed = observed is not None
+        expected = _unclaimed_fence_proof(launch.launch_id, launch.start.binding.start_request_id, observed)
+        result = _version_refusal_result(launch, expected, saved.evidence.result.verifier_version) if failed else None
+        if (launch.phase != "sealed" or _claim_issued(launch) or launch.checkpoint is not None
                 or launch.sealed_evidence_id != native_key("unclaimed-fence-evidence", launch.launch_id)
                 or fence is None or fence.payload["data"] != expected
                 or _parse(fence.payload["material"], InlineMaterial) != _material(expected)
-                or saved.launch_id != launch.launch_id
-                or saved.probe_id != native_key("unclaimed-fence", launch.launch_id)
-                or saved.report_digest != _digest(expected) or saved.evidence.proof != _json(expected)
-                or saved.evidence.state != ("failed" if failed else "stopped")
-                or saved.evidence.binding != launch.start.binding
-                or saved.evidence.native_execution_id != launch.start.binding.start_request_id
-                or not saved.evidence.entire_tree_idle or not saved.evidence.all_inflight_starts_fenced
-                or saved.evidence.result != result or saved.evidence.checkpoint is not None):
+                or _terminal_evidence_differs(
+                    saved, launch, probe_id=native_key("unclaimed-fence", launch.launch_id), expected=expected,
+                    state="failed" if failed else "stopped", execution_id=launch.start.binding.start_request_id,
+                    result=result)):
             raise Problem(403, "NATIVE_EVIDENCE_INVALID", "permanent unclaimed gate-fence proof is inconsistent")
 
     def _verify_lost_session(self, launch, saved):
@@ -1613,29 +1713,18 @@ class NativeLaunchAuthority:
             proof = json.loads(saved.evidence.proof)
         except ValueError:
             proof = None
-        cancelled = isinstance(proof, dict) and proof.get("cancel_requested") is True
-        expected = None if not isinstance(proof, dict) else {
-            "kind": "terminal_lost_session", "launch_id": launch.launch_id,
-            "original_start_request_id": launch.start.binding.start_request_id,
-            "native_invocation_id": launch.native_invocation_id, "session_id": launch.target.session_id,
-            "agent_version": launch.target.agent_version, "session_status": proof.get("session_status"),
-            "stop_requested": proof.get("stop_requested"), "cancel_requested": cancelled,
-            "failure_code": SESSION_LOST, "no_provider_effect_claim": True,
-        }
+        expected = _expected_lost_proof(launch, proof)
+        cancelled = expected is not None and expected["cancel_requested"]
         result = None if cancelled or expected is None or saved.evidence.result is None else _lost_session_result(
             launch, expected, saved.evidence.result.verifier_version)
         if (expected is None or proof != expected or not _proven_stop(proof["session_status"], proof["stop_requested"])
                 or self is not None and result is not None and result.verifier_version != self.verifier_version
-                or launch.phase != "sealed" or launch.native_invocation_id is None or launch.claim_id is None
-                or launch.sealed_evidence_id != native_key("lost-session-evidence", launch.launch_id)
-                or saved.launch_id != launch.launch_id or saved.probe_id != native_key("lost-session", launch.launch_id)
-                or saved.report_digest != _digest(expected) or saved.evidence.proof != _json(expected)
-                or saved.evidence.state != ("stopped" if cancelled else "failed")
-                or saved.evidence.binding != launch.start.binding
-                or saved.evidence.native_execution_id != launch.native_invocation_id
-                or not saved.evidence.entire_tree_idle or not saved.evidence.all_inflight_starts_fenced
-                or saved.evidence.result != result or cancelled != (result is None)
-                or saved.evidence.checkpoint is not None):
+                or _lost_launch_differs(launch)
+                or _terminal_evidence_differs(
+                    saved, launch, probe_id=native_key("lost-session", launch.launch_id), expected=expected,
+                    state="stopped" if cancelled else "failed", execution_id=launch.native_invocation_id,
+                    result=result)
+                or cancelled != (result is None)):
             raise Problem(403, "NATIVE_EVIDENCE_INVALID", "lost-session proof is inconsistent")
 
     def seal_lost_session(self, binding: ExecutorBinding, *, session_status: str, stop_requested: bool) -> str:
@@ -1748,6 +1837,28 @@ class NativeLaunchAuthority:
             raise Problem(403, "NATIVE_EVIDENCE_INVALID", "fresh protected native execution evidence is unavailable")
         return saved.evidence
 
+    def _assignment_moved(self, rows, job, owner_key, operation_ids, absent):
+        """Whether anything ran since the owner read before this transaction; operation_ids stay that earlier read."""
+        return (job.state not in {"starting", "capacity_uncertain"} or job.generation != 1
+                or job.children or job.checkpoint is not None
+                or self._row(rows, owner_key, OwnerRecord).operation_ids != operation_ids
+                or any(rows[key] is not None for key in absent))
+
+    def _fence_evidence(self, current, binding, proof, evidence_id, fence_key, now):
+        failed = "failure_code" in proof
+        evidence = ExecutorEvidence(
+            evidence_id=evidence_id, binding=binding, sequence=current.evidence_sequence + 1,
+            native_execution_id=binding.start_request_id, state="failed" if failed else "stopped",
+            entire_tree_idle=True, all_inflight_starts_fenced=True,
+            result=_version_refusal_result(current, proof, self.verifier_version) if failed else None,
+            proof=_json(proof),
+        )
+        return evidence, _NativeEvidence(
+            launch_id=proof["launch_id"], configuration_digest=self.workers.configuration_digest(),
+            probe_id=fence_key, evidence=evidence, observed_at=now, expires_at=now + timedelta(seconds=60),
+            report_digest=_digest(proof),
+        )
+
     def fence_unclaimed(self, binding: ExecutorBinding, *, observed_agent_version: str | None = None) -> str:
         """Fence cancellation or a version refusal before any child can start.
 
@@ -1764,9 +1875,7 @@ class NativeLaunchAuthority:
         absent = ()
         request_body = binding.model_dump(mode="json")
         if failed:
-            if (not isinstance(observed_agent_version, str)
-                    or re.fullmatch(r"[1-9][0-9]{0,15}", observed_agent_version) is None
-                    or observed_agent_version == launch.target.agent_version):
+            if not _different_version(observed_agent_version, launch):
                 raise Problem(409, "NATIVE_VERSION_REFUSAL_INVALID", "a different concrete version is required")
             owner = self._row(self.store.read_snapshot((owner_key,)), owner_key, OwnerRecord)
             operation_ids = owner.operation_ids
@@ -1781,37 +1890,14 @@ class NativeLaunchAuthority:
             job = self.workers._row(rows, worker_key("job", binding.job_id), JobRecord)
             target_key = self.target_key(current.target,current.start.binding.job_id)
             reservation = self._row(rows, target_key, _TargetReservation)
-            if (current.start.binding != binding or current.phase != "post_unknown"
-                    or current.native_invocation_id is not None
-                    or current.claim_id is not None or current.process_id is not None
-                    or current.report_token_digest is not None or current.child_pid is not None
-                    or job.binding != binding or job.cancel_requested != (not failed)
-                    or reservation.active_launch_id != launch_id):
+            if _claim_may_own_launch(current, job, reservation, binding, launch_id, failed):
                 raise Problem(409, "NATIVE_CLAIM_ALREADY_OWNED", "cannot fence an executor that may have acquired its launch")
-            if failed and (job.state not in {"starting", "capacity_uncertain"} or job.generation != 1
-                           or job.children or job.checkpoint is not None
-                           or self._row(rows, owner_key, OwnerRecord).operation_ids != operation_ids
-                           or any(rows[key] is not None for key in absent)):
+            if failed and self._assignment_moved(rows, job, owner_key, operation_ids, absent):
                 raise Problem(409, "NATIVE_VERSION_REFUSAL_UNRESOLVED",
                               "original assignment, operation or result activity prevents a pre-SDK refusal")
             now = self._now()
-            proof = {"kind": "terminal_unclaimed_launch_fence", "launch_id": launch_id,
-                     "original_start_request_id": binding.start_request_id, "cancel_requested": not failed,
-                     "claim_never_issued": True, "no_provider_stop_claim": True}
-            if failed:
-                proof.update(failure_code=SESSION_VERSION_CHANGED, observed_agent_version=observed_agent_version)
-            evidence = ExecutorEvidence(
-                evidence_id=evidence_id, binding=binding, sequence=current.evidence_sequence + 1,
-                native_execution_id=binding.start_request_id, state="failed" if failed else "stopped",
-                entire_tree_idle=True, all_inflight_starts_fenced=True,
-                result=_version_refusal_result(current, proof, self.verifier_version) if failed else None,
-                proof=_json(proof),
-            )
-            saved = _NativeEvidence(
-                launch_id=launch_id, configuration_digest=self.workers.configuration_digest(),
-                probe_id=fence_key, evidence=evidence, observed_at=now, expires_at=now + timedelta(seconds=60),
-                report_digest=_digest(proof),
-            )
+            proof = _unclaimed_fence_proof(launch_id, binding.start_request_id, observed_agent_version)
+            evidence, saved = self._fence_evidence(current, binding, proof, evidence_id, fence_key, now)
             return ControlChanges(writes=(
                 self._write(native_key("launch", launch_id), _update(
                     current, phase="sealed", sealed_evidence_id=evidence_id, evidence_sequence=evidence.sequence,

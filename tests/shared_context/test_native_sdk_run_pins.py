@@ -17,9 +17,9 @@ from shared_context.native_turns import NativeTurnRuntime
 from shared_context.m3_skills import PurposeSkillReadResult
 from test_native_capabilities import selected_capture
 from test_native_assembly import install_executor, offline_sdk, run_turn, skill_request
-from test_native_responses import responses  # noqa: F401
+from test_native_responses import responses
 from test_native_turn_wire import submit
-from test_native_turns import Harness, IDENTITY, harness, local_env, native_retry_policy  # noqa: F401
+from test_native_turns import Harness, IDENTITY, harness, local_env, native_retry_policy
 
 
 def probe(name="probe", entry=None, tools=True, **binding):
@@ -254,7 +254,7 @@ def test_the_recovery_reader_refuses_a_stopped_turn_and_reads_human_answers_with
             outcome.append(str(error))
         return await offline_sdk(**options)
 
-    credential = lambda: "OFFLINE-agent"  # noqa: E731
+    credential = lambda: "OFFLINE-agent"
     recover(local_env, monkeypatch, tmp_path, sdk, final="unknown", api_token_provider=credential)
     assert clients == [("https://api.offline.invalid", credential)]
     assert outcome[0][0] == "human" and isinstance(outcome[0][1], FakeHitl)
@@ -393,7 +393,7 @@ def test_reminders_use_the_agent_credential_and_only_the_agents_own_work(respons
         prompts.append(options["system_message"])
         return await offline_sdk(**options)
 
-    credential = lambda: "OFFLINE-agent"  # noqa: E731
+    credential = lambda: "OFFLINE-agent"
     install_executor(responses, monkeypatch, tmp_path, sdk, api_token_provider=credential)
     assert responses.invoke(submit()).status_code == 202
     if owner == "own":

@@ -29,7 +29,6 @@ from test_m3_auth import jwk_client, signing_key
 from test_sdk_compaction_product import event, open_turn, settle
 from test_skill_deactivation_context import deactivate_original
 from test_skill_guidance_authority import NAME, PROFILES, PURPOSE, configure_guidance, load_guidance
-from test_skill_purpose import signed_m3
 from test_skill_purpose_api import add_purpose_skill
 
 
@@ -71,7 +70,6 @@ def test_signed_midturn_deactivation_preserves_the_failure_and_admits_current_gu
     monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_native)
     h, control, human, source = configure_guidance(assistant, signing_key, jwk_client, profile)
     receipts, provider_calls, before_deactivation, retained, retained_receipts = [], [], {}, {}, {}
-    path = "/teams/" + A.team + "/artifacts/" + NAME
 
     def change_source(_scope):
         assert not receipts
@@ -108,8 +106,6 @@ def test_signed_midturn_deactivation_preserves_the_failure_and_admits_current_gu
 
     with ExitStack() as cleanup:
         cleanup.callback(h.client.close)
-        source_http, agent, _ = signed_m3(h.artifacts, signing_key, jwk_client)
-        cleanup.callback(source_http.close)
         first = open_turn(h, control, human, "deactivation-prior")
         cleanup.callback(first.client.close)
         conversation = first.assignment.task.instruction.conversation_id
@@ -151,10 +147,9 @@ def test_signed_midturn_deactivation_preserves_the_failure_and_admits_current_gu
         assert accounting[accounting_keys[1]].payload["data"]["consumed"] is True
         assert accounting[accounting_keys[2]].payload["data"]["consumed"] is False
         assert accounting[control.cost_key].payload["data"]["model_pending_microusd"] > 0
-        deactivated = source_http.get(path, headers=agent)
-        assert deactivated.status_code == 200
-        original_version = deactivated.json()["versions"][0]
-        assert deactivated.json()["deactivations"] == receipts
+        deactivated = h.artifacts.get(A, A.team, NAME).payload
+        original_version = deactivated["versions"][0]
+        assert deactivated["deactivations"] == receipts
 
         def refused_followup(identifier):
             before = h.store._guard()
@@ -209,9 +204,9 @@ def test_signed_midturn_deactivation_preserves_the_failure_and_admits_current_gu
         new_body = b"SK09_NEWLY_APPROVED_VERSION_CANARY\n"
         revised = add_purpose_skill(h, signing_key, jwk_client, name=NAME, body=new_body,
                                    description=PURPOSE, version="2" * 32, create=False)
-        latest = source_http.get(path, headers=agent)
-        assert latest.status_code == 200 and latest.json()["effective_version_id"] == revised["version_id"]
-        assert latest.json()["versions"][0] == original_version and latest.json()["deactivations"] == receipts
+        latest = h.artifacts.get(A, A.team, NAME).payload
+        assert latest["effective_version_id"] == revised["version_id"]
+        assert latest["versions"][0] == original_version and latest["deactivations"] == receipts
         fresh = open_turn(h, control, human, "deactivation-new-approved-next", conversation)
         cleanup.callback(fresh.client.close)
         assert fresh.assignment.sdk_session_id == first.assignment.sdk_session_id

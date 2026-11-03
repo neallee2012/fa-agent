@@ -4,8 +4,8 @@ import pytest
 
 from shared_context.errors import Problem
 from test_connector_consent import create_card
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_hitl import create_pending, hitl, inventory  # noqa: F401
+from test_m3_auth import jwk_client, signing_key
+from test_native_hitl import create_pending, hitl, inventory
 from test_native_hitl_questions import create_question
 
 

@@ -45,7 +45,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
-from verify_export import read_tree  # noqa: E402
+from verify_export import read_tree
 
 MIN_NAME = 4
 MIN_FRAGMENT = 5

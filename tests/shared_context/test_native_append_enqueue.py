@@ -8,7 +8,7 @@ from shared_context.behavior_native_agent_wire import NativePeerDirectory
 from shared_context.behavior_native_turn_wire import NativeReceipt, NativeSubmit
 from shared_context.behavior_wire import WireModel
 from shared_context.m2_copilot import ToolOutput, ToolSpec
-from test_m2_copilot import runtime_path  # noqa: F401
+from test_m2_copilot import runtime_path
 from test_native_agent_tools import collaboration_turn
 
 APPEND = "另外，不用工具直接回答：台北 101 地上有幾層樓？"

@@ -1,6 +1,6 @@
 """B1 TC S1: the pinned runtime compacts automatically; a native conversation must keep going past it.
 
-Real pinned SDK 1.0.13 / runtime 1.0.83 through the public N1 host; model transport is offline.
+Real pinned SDK 1.0.26 / runtime 1.0.103 through the public N1 host; model transport is offline.
 """
 
 import asyncio
@@ -115,7 +115,7 @@ def run_turns(monkeypatch, runtime_path, name, selected, turns=7, paragraphs=60,
             text = ("MARK-TURN-1 " if n == 1 else "") + "".join(FILLER.format(i=n * 1000 + j) for j in range(paragraphs))
             request = NativeSubmit(command=submit(rid=rid, cid=cid, text=text).command, capture=selected)
             response = client.post("/invocations", json=request.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v1", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-" + rid, "x-agent-foundry-call-id": "OFFLINE-call-" + rid,
             })
             if response.status_code != 202:
@@ -205,7 +205,7 @@ def large_replies(requests, turn=lambda: None):
     return provider
 
 
-@pytest.mark.parametrize("declared,first", [(None, 5), (272000, 8)])
+@pytest.mark.parametrize("declared,first", [(None, 4), (272000, 8)])
 def test_the_runtime_compacts_at_the_declared_input_limit_even_above_its_128000_default(
         monkeypatch, runtime_path, declared, first):
     """TC-04: gpt-5.4-mini's documented 272000 input reaches the pinned runtime, which compacts at 80% of it."""
@@ -222,7 +222,8 @@ def test_the_runtime_compacts_at_the_declared_input_limit_even_above_its_128000_
     requests, receipts, _, _ = run_turns(monkeypatch, runtime_path, f"declared-{declared}", selected,
                                          turns=first, paragraphs=5, provider=large_replies)
     assert [status for status, _, _ in receipts] == ["completed"] * first, receipts
-    # Without a declaration the runtime's 128000 default compacts at turn 5 (~120k); 272000 waits until ~240k.
+    # Without a declaration runtime 1.0.103's 128000 default compacts at turn 4 (1.0.83: turn 5, ~120k); 272000
+    # waits until ~240k.
     assert [request["turn"] for request in requests if request["compaction"]] == [first]
 
 
@@ -412,7 +413,7 @@ def test_after_compaction_the_original_wording_is_read_back_exactly_and_history_
             text = ((KEEP + " ") if n == 1 else "") + "".join(FILLER.format(i=n * 1000 + j) for j in range(100))
             request = NativeSubmit(command=submit(rid=rid, cid=cid, text=text).command, capture=selected)
             response = client.post("/invocations", json=request.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v1", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-" + rid, "x-agent-foundry-call-id": "OFFLINE-call-" + rid,
             })
             assert response.status_code == 202, response.text

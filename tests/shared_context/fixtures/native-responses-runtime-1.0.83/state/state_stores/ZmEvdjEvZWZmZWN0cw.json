@@ -1,0 +1,14 @@
+{
+  "items": {},
+  "store": {
+    "created_at": 1793697171,
+    "description": null,
+    "id": "ss_df3c45a42f791102102b8493",
+    "item_ttl_seconds": -1,
+    "name": "fa/v1/effects",
+    "object": "state_store",
+    "tags": {},
+    "updated_at": 1793697171,
+    "user_isolation": false
+  }
+}

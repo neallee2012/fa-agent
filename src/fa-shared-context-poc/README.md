@@ -1,5 +1,41 @@
 # Shared Context POC
 
+<a id="sdk-1026-3di"></a>
+## 3d-i：Hosted 換到 SDK 1.0.26／runtime 1.0.103，宣告 v3（2026-11-03，CODE/offline，未部署）
+
+- **改了什麼**：`sdk_pin` 換成 1.0.26／1.0.103，`OLDER_RELEASES` 留 (1.0.13, 1.0.83)；image、deploy 的 runtime 路徑跟著換。
+  Hosted 宣告 `foundry-native-v3`，API 仍送 v2（[ADR-0009 §3](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md) 3d-i）。
+  新 image 啟動時拒絕 v2 宣告，所以手動跑 `behavior_agent_versions sync` 也要像 `ci_deploy` 一樣帶 `--native-v2-registered`，已註冊助理才會改宣告 v3。
+- **runtime 路徑只由 image 決定**（2026-11-03 dev 4400 後補）：dev 部署後，sync 從舊 definition 帶過去的
+  `BEHAVIOR_ASSISTANT_RUNTIME_PATH=/opt/copilot/1.0.83/...` 蓋過新 image 的 ENV，新 image 沒有這個檔案，
+  啟動時就以 503 `NATIVE_EXECUTION_UNAVAILABLE` 結束，A、B 每個回合都卡 30 秒逾時。sync 現在不再帶這個 key
+  （`behavior_agent_versions._carried_environment`），三份部署設定也拿掉，改由 Dockerfile 的 `ENV` 決定。
+- **API 寫的版本號跟著送出 profile**：template settings 與提示組裝紀錄標 `SENT_RELEASE`（`PROFILE_RELEASES[NATIVE_STATE_PROFILE]`，
+  3d-i 是 1.0.13／1.0.83），所以 v2 image 照收；Hosted 自己寫的 checkpoint、SDK 狀態、assembly、sdk_stop 標它實際跑的版本。
+  主人新存的選擇也必須帶 `SENT_RELEASE`。紀錄的版本必須是一整組已知版本，混搭拒絕。
+- **runtime 1.0.103 已知差異**：completions 帶宣告的 max output；子代理回空字串改報 failed（父回合結果不變）；
+  沒宣告上限時早一回合自動壓縮、`tokensRemoved` 回 0；gpt-5.4-mini 的 Responses 請求帶 `text.verbosity`。runtime 預設送 `"low"`，回答比 1.0.83 短；
+  FA 在每個開啟的 session 以 `session.rpc.options.update` 設成 `"medium"`（`m2_copilot._open_session`）。OpenAI 文件寫明不送時預設
+  是 medium；Azure 的 Responses 參考沒寫預設值，所以「等於 1.0.83 行為」是推論。不支援 verbosity 的模型（例如 Chat Completions 的 gpt-4.1-mini）runtime 不送這個欄位；
+  交辦的子代理沿用同一個設定。兩者都有離線真 runtime 測試。SDK 標這組 options API 為 Experimental（同 `history.compact`），
+  升 SDK 時要重看；runtime 回 `success=false` 時記 `SDK_VERBOSITY_NOT_APPLIED`，回合照常完成。
+- **證據**：Windows 本機、真 runtime 1.0.103、離線 provider。整套 shared_context 測試與 1.0.83 存檔接續測試
+  （`test_sdk_checkpoint_cross_version_native.py`、原生 Responses 的 `test_native_responses_cross_version_native.py`）。
+  **未驗證**：真模型、Hosted 上的回合。
+
+<a id="sdk-1026-shape-ahead"></a>
+## 預先接受 SDK 1.0.26／runtime 1.0.103 的新欄位（2026-11-02，CODE/offline，未部署）
+
+- **目的**：升版前先在固定的 1.0.13／1.0.83 上接受新版 runtime 會多送的形狀，升版 PR 只換版本。現行版本不送這些欄位，行為不變。
+- **checkpoint**：`model_call_success` 的可選 metadata 與 `modelCall.request_body_*`（`behavior_sdk_compaction.CALL_OPTIONAL`／`MODEL_CALL_OPTIONAL`），
+  以及 Responses 推理容器的 `ordered_blocks: null`（`behavior_responses_checkpoint.reasoning_container`）。規則見
+  [CTX-03 §6.4](../../docs/ctx03-checkpoint-contract.md#64-modelmodel_call_success)。
+- **API 轉送**：Responses 請求可帶 `text`，但只接受恰為 `{"verbosity": "low"|"medium"|"high"}`（SDK 1.0.26 的 `Verbosity` enum），
+  其他形狀回 422 `unsupported Responses text options`（`behavior_assistant_gateway._check_text`）。實測 runtime 1.0.103 對
+  gpt-5.4-mini 送 `{"verbosity": "low"}`；原版本不送，由模型用自己的預設值；FA 現在明確指定 `"medium"`（見上面 3d-i 段）。
+- **證據**：Windows 本機、真 runtime 1.0.103、離線 provider（未接真模型）。`test_instruction_responses_native.py` 3 項通過；
+  `test_sdk_compaction_native.py` 的 provider metadata 兩項跑完 checkpoint 來回，只在寫死的版本斷言失敗（升版 PR 更新）。
+
 <a id="responses-platform-signal-get"></a>
 ## Responses：平台訊號期間的一次 GET 會蓋掉 FA 的終態（agentserver-responses 2.2.0 已知問題，未修；2026-10-28，CODE/offline，未部署）
 
@@ -130,6 +166,8 @@
 H2d 定義），API 打開 P5～P7 的背景切換與送出路徑。**2d-ii（#891）起 API 只送、只支援 v2，開關必須是 `"1"`：**
 `"0"`、沒寫或其他值在 `meta`／`check` 就停下，什麼都沒建、沒寫；P8 的每日巡查不再排程（只剩下面的單次指令）。
 API 自己的 `FA_NATIVE_TURNS` 只當 native 的開關，送出的 profile 是程式常數 v2。
+**v1 別名退役（2026-11-02，ADR-0009 M1）起：** API 與 Hosted 的 `FA_NATIVE_TURNS` 一律寫 `foundry-native-v2`，API 寫 v1 時 native 請求一律回 503
+`NATIVE_TURNS_DISABLED`，Hosted 不收 v1 header；存著的 v1 與沒標 profile 的項目照舊讀成 v1。本檔較早段落裡寫 `FA_NATIVE_TURNS=foundry-native-v1` 的是當時的歷史紀錄。
 onboarding 加的 Agent 不在 profile 的 `agents` 裡：sync 一律帶 `--native-v2-registered`（fresh initialization 例外，見 `run_fresh_job.py` 註解），已登記、服務中
 定義宣告 native profile 的 Agent（助理）只把 `FA_NATIVE_TURNS` 改成 v2，其他 ENV 照舊（ADR-0009 M1，2026-10-20）。
 `deploy/stage/stage.json` 與 `deploy/azd/profile.defaults.json` 都寫 `"1"`（azd 以前的 `FA_NATIVE_2DI` 已不讀）。
@@ -3088,13 +3126,6 @@ API-only DTO／codec 不匯入 Hosted SDK；正常同 build 配對新版 reader�
   及匯入其 harness 的測試，會在 setup 停在 `the pinned offline tokenizer cache is required`。
   每個 shell 都要設 `TIKTOKEN_CACHE_DIR`，指向已用固定版 `tiktoken` 正式 loader 預先下載的 cache
   （預設位置是 `src/fa-shared-context-poc/.venv/fa-tokenizer-cache`，新建的 worktree 沒有這個目錄）。
-- **原工作 artifacts**：`test_original_result_continuation.py`
-  讀 repo 外的 `min-close-native-0921` 原件。設 `ORIGINAL_RESULT_ART=<該目錄>\contract`
-  （內有 `original-fetch-readonly.json`，SHA `0188f42f…`），同層要有 `parent-inputs\normal-console-config.json`。
-  沒設時這兩個檔案顯示 SKIPPED，不算通過。
-- **私有 C1 設定快照**：`test_behavior_assistant_server.py` 的兩則凍結序列化測試讀 repository 根目錄的
-  `.azure/behavior-migration-native/config-new.json`（SHA `f5b4b89c…`）。這個檔案不在 repository 裡，
-  沒有時這兩則顯示 SKIPPED，其他測試照常執行。
 - **Windows 長路徑**：`test_behavior_assistant.py` 的三則 cold-resume 測試，會在測試目錄下建立約 200 字元的
   離線 SDK checkpoint 路徑。Windows 沒開 `LongPathsEnabled=1` 時，請改用短的 `--basetemp`（例如 `C:\t`）；
   否則這三則會顯示 SKIPPED（原本是 `WinError 206`），不算通過。Hosted 跑在 Linux，沒有這個限制。
@@ -3111,6 +3142,13 @@ CI（`.github/workflows/shared-context-tests.yml`）只在 Linux 上跳過兩份
 這個 workflow 只在手動（`workflow_dispatch`）和每週一 01:00 UTC 執行，不隨 PR 或 push 觸發：一次約 130 runner 分鐘
 （8 片），private repo 的免費額度每月只有 2000 分鐘。要每個 PR 都跑，需要付費的分鐘預算；在那之前，每個 PR 的檢查是針對
 變更範圍的本機測試。
+
+本機快速跑法：執行
+`python -X utf8 tests/shared_context/fast_lane.py -q -p no:cacheprovider`（後面可再加任何 pytest 參數，相對路徑以 repository 根目錄為準；Windows 路徑太長時加 `--basetemp` 指到短路徑）。腳本會先切到 repository 根目錄，並印出排除了幾則。
+它用和 CI 相同的方式讀這兩份清單，跳過約 462 則要真 runtime 或原件、或在 main 上本來就失敗的測試。
+Windows 的命令列放不下 462 個 `--deselect`，所以這支腳本在程序內呼叫 `pytest.main`。
+快速跑法只用在回合中途；回合結束的驗收仍是備好上面各項前提（含 `M2_TEST_RUNTIME`）後跑全量
+`python -X utf8 -m pytest tests/shared_context ...`，並加 `--durations=50`，把最慢的 50 項列進報告，方便看出新的慢測試。
 
 ## HITL 原等待讀取競爭修正（CODE/offline）
 
@@ -4482,6 +4520,42 @@ N6的Responses2.2另有官方session-incarnation GUID task命名，新SID／GUID
   原官方enqueue尚未啟動也遭transport失敗時，同樣收尾原accepted，不新增另一張queue。
 - 8765只對`NATIVE_TURN_NOT_STARTED`顯示「這次沒有開始執行，請重新送出」；
   一般unknown仍先核原紀錄，不提供重跑原RID。若原CID有可接續的保存狀態，可明確建立新RID送新訊息。
+- 2026-11-02：chain 工作再次進入一個已 started、但 `_allocate` 還沒寫上 turn_number 的回合時，`_reenter_turn` 直接收成 `NATIVE_TURN_NOT_STARTED`。
+  - 會發生在兩種情況：開工之後、進模型之前資料庫短暫斷線，core 重試；或 VM 在同一個空檔當掉，從 recovered 重入。
+  - 回條已有 cancel_requested，或 `ctx.cancel_requested`，則收成 `NATIVE_TURN_CANCELLED`。
+  - 以前這種回條會走 `_reenter`，收成 `NATIVE_CONVERSATION_MISSING`／`NATIVE_TURN_UNKNOWN`／`NATIVE_RESULT_MISSING`。`prepare_continuation` 要求 `meta.n == receipt.turn_number`，所以以前也接續不了。
+  - `_unknown` 合併時，如果讀到的版本已經有 turn_number，`NATIVE_TURN_NOT_STARTED` 會改成 `NATIVE_TURN_UNKNOWN`。
+  - 進模型前只有一個步驟失敗、下一次讀取已恢復時，`_started_failure` 當場收尾。失敗是 5xx `Problem` 或傳輸錯誤，而且回條還沒編號時，收成 `NATIVE_TURN_NOT_STARTED`（有停止要求則是 `NATIVE_TURN_CANCELLED`）。以前是 `NATIVE_STATE_STORE_UNKNOWN`／`NATIVE_TURN_UNKNOWN`。4xx 拒絕保留原碼。同時逾時也收成 `NATIVE_TURN_NOT_STARTED`，因為模型沒跑過，重送就好。
+  - started 寫入失敗、讀回仍是原 accepted ETag 與原值（`_UnchangedRidWrite`）時，Invocations 和 Responses 都改走 `_close_unstarted`，收成 `NATIVE_TURN_NOT_STARTED`，不再收成 `NATIVE_STATE_STORE_UNKNOWN`。這個碼是 10-02 先選的，當時還沒有 `NATIVE_TURN_NOT_STARTED`。我們自己的 started 若在讀回之後才落地（帶這次的 run_token、仍未編號），`_close_unstarted` 也當場收掉，因為沒有人會執行它；其他 session 的 started 照舊保留。
+- 2026-11-03（#1147）：沒編號就收成 `NATIVE_TURN_NOT_STARTED` 這條判斷從 `_reenter_turn` 移進共用的 `_reenter`，Responses 的重進（`_settled_unstarted` 與開工 CAS 輸掉後）也照這條收尾。以前 Responses 重進讀到沒編號的 started（例如晚到的開工寫入落地、收尾寫入又失敗後重試請求），會收成「可能跑過」的 `NATIVE_TURN_UNKNOWN`。
+  - 以前 `_reenter` 讀 `meta` 後才決定：`meta.rid` 不是這個 RID 就收成 `NATIVE_TURN_UNKNOWN`，是就讀 turn；讀 `meta` 遇到 503 則保持 started。現在不讀 `meta`，沒編號就直接收掉，讀不到 `meta` 也收得掉。
+  - 收掉別的 run 開工、還沒編號的回條也安全：`_allocate` 以回條 ETag 做 CAS 寫上 turn_number，收尾改了 ETag，那個 run 會在進模型前收到 409。同一個 session 裡另一個寫入者搶到開工的 Responses 回條，因此收成 `NATIVE_TURN_NOT_STARTED`，不再是 `NATIVE_TURN_UNKNOWN`。
+  - 停止要求照舊：回條 `cancel_requested`、Invocations 的 `ctx.cancel_requested` 或 Responses 的 `control.cancelled` 都收成 `NATIVE_TURN_CANCELLED`。
+- 2026-11-03（#1145，Neal 決定答案優先）：`_save_turn` 已寫好 turn:n 與 checkpoint，標完成的 CAS 卻輸給後到的停止（`cancel_requested` 改了 ETag）時，不再收成 `NATIVE_TURN_CANCELLED`，改走 `_reenter` 標成 `completed`（保留 `cancel_requested`）。
+  - 和 recovered 重進一致：`_reenter` 讀到已存好的 turn 本來就標完成，不看停止。
+  - `_stopped_after_run` 看到停止一律走 `_reenter(failure_code="NATIVE_TURN_CANCELLED")`：turn:n 已存（例如 CAS 輸掉後下一步 503、存檔迴圈重試）就標完成，沒存就照舊收成 `NATIVE_TURN_CANCELLED`（帶用量）。
+  - 「completed 且 `cancel_requested`」的讀法：
+    - 被交辦的助理答完才收到停止，結果照常傳回交辦者（`native_agent_relay._sender` 只對 started 看 `cancel_requested`）。
+    - 模型讀工作概況（`read_work_context`）時，`next_step` 是 `read-saved-result-not-a-new-execution`，不是已取消。
+    - 工作台顯示答案，停止提示寫「按停止時已經答完，答案照常保存。」；還有沒送出的排隊交辦時，再加「排隊中的交辦因停止沒有送出。」。
+  - 沒有改的：這個回合還沒送出的排隊 Agent 訊息（`queued_request_matches`）照舊被停止擋下；答案存好後才逾時、又遇到存檔重試時，照舊收成 `NATIVE_TURN_TIMEOUT`。
+- 2026-11-03（#1146）：State store 斷線超過 core 的重試預算（`_queue_retry`，約 4 分鐘）時，core 丟掉這個 RID 的輸入並暫停 chain，之後只有 `accepted` 回條的同 RID 重送會再進這個 RID。
+  - 以前 `started` 回條在同一個 session 裡收不掉，只能等換環境後下一個 session 的 stall rule。
+  - 現在最後一次重試失敗時，`handle_turn` 在 chain 旁邊開一個收尾工作（`_close_after_outage`）。RID 取自輸入本身（`_input_rid`）：core 排隊接續的回合，`ctx.input_id` 是 chain 最新一則的 ID，不是這個回合的 RID。
+  - 收尾工作照 `OUTAGE_CLOSE_SECONDS`（1、2、4…秒，之後每 60 秒，合計約 55 分鐘）重讀回條，store 恢復後通常一分鐘內就會收；別的回合正在跑時要等它放 lock，azure-core 自己的重試退避也會再加時間，所以這兩個時間都是下限。回條仍是這個 SID 的 `started`，就拿 execution lock，用非 recovered 重試會走的 `_reenter` 收掉：
+    - 沒編號收成 `NATIVE_TURN_NOT_STARTED`（有停止要求收 `NATIVE_TURN_CANCELLED`）。
+    - 已編號就照已存的 turn 收成 `completed` 或 `unknown`。
+    - chain 已經不替這個 RID 排順序，lock 代替它：同一對話的下一則訊息編號（`_allocate`）也在這把 lock 裡，不會在收尾途中改 `meta`。這個回條已編號、但下一則訊息先編號時，照 `_reenter` 收成 `NATIVE_TURN_UNKNOWN`，和排在它後面的重試結果相同。
+    - 收掉後送一次終態通知；只有通知失敗時，下一次才重送通知。SDK 不會再跑。
+  - 讀到已是終態時，也送一次終態通知再結束：最後一次重試的寫入可能已生效、只是沒收到回應，或回合已收尾、只有送通知失敗（`handle_turn` 把送通知也算進最後一次重試；通知依 RID 去重）。讀到 `accepted` 或已不屬於這個 SID 時，直接結束。
+  - `accepted` 回條不收：人送的訊息照舊由使用者同 RID 重送救回。Agent 或排程送來的沒有人重送，照舊等 stall rule。
+  - 重送讓這個 RID 再次進 `handle_turn` 時，先取消它的收尾工作，回條由新的執行負責。
+  - 同一對話的下一則訊息不會被卡住的 `started` 回條擋下（同 SID 的 `_continuation_blocker`、`_allocation_fence` 都放行）。例外是換過環境、在對話 left 佇列裡的 `accepted` 回條：重送之前，後面的訊息照舊排在它後面。
+  - 限制：
+    - 收尾工作只活在這個 process。VM 關機時 `aclose` 直接取消它；剛好在收掉回條、還沒送通知時取消，這次通知就不會送。
+    - 約 55 分鐘都連不上 store 時，記 `FA_NATIVE_OUTAGE_CLOSE_EXHAUSTED`；遇到確定的 4xx 拒絕（store 或 FA 自己的檢查，例如 `NATIVE_STATE_STORE_TTL`、`NATIVE_RID_CONFLICT`）時記 `FA_NATIVE_OUTAGE_CLOSE_REFUSED` 並停止；收尾工作意外出錯時，記 `FA_NATIVE_OUTAGE_CLOSE_FAILED`。這些情況都照舊等換環境後的 stall rule。
+    - VM 重啟後重進（recovered）時用盡重試的回合（包括只剩送通知失敗的），不開收尾工作，照舊等 stall rule：照非 recovered 收會跳過 `prepare_continuation` 和排隊交辦的恢復（`on_recover_queued`）。core 給的輸入是空的時候，也不開收尾工作。
+    - Responses 回合不走 chain，不在這次範圍內。
 
 固定SDK的必要接點與缺口：core 2.1.0先保存input，再PATCH in_progress／lease，最後才建立handler；
 decorator的RetryPolicy不涵蓋第二個PATCH。`TransportClassifiedError`直接繼承Exception，
@@ -7395,9 +7469,10 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
 - 為什麼：冷回合比暖回合慢（依總協調轉來的 stage 送訊延遲調查，p50 約 6.7 秒對 2.5 秒；原始查詢未存入 repo），要先知道慢在 `sdk_process_start`、`sdk_session_resume`、`native_bind_*` 哪一段、常駐 SDK 為什麼被丟掉（`RESIDENT_SDK_DISCARDED reason=…`），再設計修正。這些行原本只在 Hosted stderr（`azd ai agent monitor` 看得到），Log Analytics 查不到。
 - 後加的三種（2026-10-22）：stage 每日 routine（RID `77d3e869…`）回合中途被 `gpt-6.1-sol` 限流後記成 `unknown`，但 Hosted 的 `FA_NATIVE_TURN_UNKNOWN code=…`、`FA_MODEL_DIRECT_RETRY`／`HTTP_FAILURE` 只在 stderr，查不到確切 failure code，也看不出 FA 自己的 429 重試有沒有參與；`NATIVE_UPGRADE_CUT` 的 `scan_ms` 要從 stage 補收（gate 7）。API 端的 `NATIVE_UPGRADE_CUT_API` 等行本來就在 API console log，不在這裡。
 - 後加的記憶行（2026-10-24）：`private` 模式 e2e（`fa-priv-1024`）的 `AppTraces` 只有 `FA_TIMING`、少數 `RESIDENT_SDK_CONTINUED` 與 SDK 事件，看不到 `FA_PRIVATE_MEMORY_UPDATE status=401 stage=embedding`、`status=skipped reason=embedding_unavailable`、`FA_PRIVATE_MEMORY_USAGE_UNREPORTED`、`FA_PRIVATE_MEMORY_INACTIVE` 與 Team 記憶的同類行，embedding 的 404／401 只能從 `FA_TIMING` 的耗時推測。`private` 模式從 VNet 外讀不到 Hosted logstream，所以這些行也要送。API 端的 `FA_MEMORY_RELAY_*`（`memory_relay`）本來就在 API console log，不在這裡。
+- 後加的 `FA_NATIVE_HTTP`（2026-11-02）：stage 第 39 版冒煙有一次 `turn_status` 等滿 30 秒 `ReadTimeout`，平台沒有對應的 `invoke_agent` span，而 Hosted stderr 只留最後 300 行，分不出請求沒進 Hosted，還是進來後卡住。有 `entered` 沒 `returned`／`raised` 是卡在 Hosted，連 `entered` 都沒有是沒進來；`invocation_id` 可對平台 span 的 `azure.ai.agentserver.invocation_id`。這些行是批次送出、不落盤，容器回收、佇列滿、送出失敗或啟動後約 1 秒內的行都可能沒到，所以少一行時先確認同一段時間、同一位 Agent 的 `FA_TIMING` 有到，再下判斷（丟棄筆數看 SDKStats）。每次呼叫多兩行。
 - 做法：Hosted 入口（`behavior_assistant_main.main`）在背景執行緒呼叫 `sdk_telemetry.attach_log_export()`，用官方 exporter 範例的接法（私有 `LoggerProvider`＋`BatchLogRecordProcessor`＋`AzureMonitorLogExporter`＋`LoggingHandler`），送到與 SDK span 相同、平台注入連線字串的 App Insights，`AppRoleName` 一樣是 `FOUNDRY_AGENT_NAME`。開關與 tracing 相同：`FA_SDK_TELEMETRY=0` 或沒有連線字串就不送；建不起來記 `FA_SDK_TELEMETRY_INACTIVE reason=log_exporter_unavailable`，不影響啟動。背景建立是為了不讓約 0.9 秒的 exporter 匯入（本機 Windows 量測）算進容器啟動；啟動後最前面約 1 秒內的行只在 stderr。
-- 只送哪些：handler 只掛在 `shared_context.behavior_timing`、`behavior_hosted`、`m2_copilot`、`native_resident`、`native_sdk`、`native_turns`、`behavior_model_direct`、`native_environment_cut`、`behavior_private_memory`、`cosmos_private_memory`、`native_private_memory`、`native_team_memory`、`native_memory_candidate` 十三個 logger（不掛 root，也避免 exporter 自己的 azure-core log 迴圈），而且只放行**格式字串**以 `FA_TIMING `、`RESIDENT_SDK_`、`FA_NATIVE_TURN_UNKNOWN `、`FA_MODEL_DIRECT_`、`NATIVE_UPGRADE_CUT `、`FA_PRIVATE_MEMORY_` 或 `FA_TEAM_MEMORY_` 開頭、沒有例外資訊的行。記憶模組多數行寫成 `"%s status=…"`、事件名稱放在第一個參數，所以另外放行以 `%s ` 開頭、第一個參數**完全等於** `FA_PRIVATE_MEMORY_SEARCH`、`FA_PRIVATE_MEMORY_UPDATE`、`FA_TEAM_MEMORY_SEARCH`、`FA_TEAM_MEMORY_CREATE` 之一的行（`sdk_telemetry.LOG_EVENTS`；只是以事件名稱開頭的參數不算）。`FA_TIMING` 只有 phase、雜湊過的回合 ID 或 binding ID、毫秒、outcome 與 Table 讀取次數；`RESIDENT_SDK_*` 只有固定原因碼或 hash 前 12 碼；`FA_NATIVE_TURN_UNKNOWN` 只有固定 failure code 與例外類型名稱；`FA_MODEL_DIRECT_*`（`RETRY`、`HTTP_FAILURE`、`INACTIVE`）只有狀態碼、通過識別字檢查的 provider 代碼與 deployment 名稱、次數、等待毫秒與 request 的項目數；`NATIVE_UPGRADE_CUT`（ADR-0009 gate 7）只有固定代碼、次數、毫秒、RID 前 8 碼與 Hosted session ID；`FA_PRIVATE_MEMORY_*`／`FA_TEAM_MEMORY_*` 只有 HTTP 狀態碼、固定的 status／stage／reason／mode 代碼、例外類型名稱（`_exception_type` 的固定對照或類別名稱）、筆數與 token 數、官方 kind 名稱的計數（其他 kind 記成 `unknown`）、通過 `_OFFICIAL_ID` 檢查的 `update_id`／`memory_id`，以及 RID 前 8 碼；都沒有對話內容、記憶內容、scope、token 或個資。同一批 logger 的其他行（例如可能帶 runtime 錯誤文字的 `FA_MCP_SERVER_STATUS`、`FA_HOSTED_DISPATCH`、`FA_NATIVE_HTTP`，以及記憶 logger 上的 `FA_NATIVE_ASSEMBLY_PARTIAL`）不送。這十三個 logger 改成 INFO 等級，`RESIDENT_SDK_CONTINUED`（INFO，沿用常駐 SDK）才會送。
-- stderr 不變：logger 一旦有 handler，Python 就不再用 `logging.lastResort` 印到 stderr，所以同時把 `logging.lastResort` 本身掛上這十三個 logger（只在 root 沒有 handler 時，也就是 Hosted 入口現況）；stderr 照舊只印 WARNING 以上。
+- 只送哪些：handler 只掛在 `shared_context.behavior_timing`、`behavior_hosted`、`m2_copilot`、`native_resident`、`native_sdk`、`native_turns`、`behavior_model_direct`、`native_environment_cut`、`behavior_private_memory`、`cosmos_private_memory`、`native_private_memory`、`native_team_memory`、`native_memory_candidate`、`native_toolbox` 十四個 logger（不掛 root，也避免 exporter 自己的 azure-core log 迴圈），而且只放行**格式字串**以 `FA_TIMING `、`RESIDENT_SDK_`、`FA_NATIVE_TURN_UNKNOWN `、`FA_MODEL_DIRECT_`、`NATIVE_UPGRADE_CUT `、`FA_PRIVATE_MEMORY_`、`FA_TEAM_MEMORY_`、`NATIVE_TOOLBOX_FAILED ` 或 `FA_NATIVE_HTTP ` 開頭、沒有例外資訊的行。記憶模組多數行寫成 `"%s status=…"`、事件名稱放在第一個參數，所以另外放行以 `%s ` 開頭、第一個參數**完全等於** `FA_PRIVATE_MEMORY_SEARCH`、`FA_PRIVATE_MEMORY_UPDATE`、`FA_TEAM_MEMORY_SEARCH`、`FA_TEAM_MEMORY_CREATE` 之一的行（`sdk_telemetry.LOG_EVENTS`；只是以事件名稱開頭的參數不算）。`FA_TIMING` 只有 phase、雜湊過的回合 ID 或 binding ID、毫秒、outcome 與 Table 讀取次數；`RESIDENT_SDK_*` 只有固定原因碼或 hash 前 12 碼；`FA_NATIVE_TURN_UNKNOWN` 只有固定 failure code 與例外類型名稱；`FA_MODEL_DIRECT_*`（`RETRY`、`HTTP_FAILURE`、`INACTIVE`）只有狀態碼、通過識別字檢查的 provider 代碼與 deployment 名稱、次數、等待毫秒與 request 的項目數；`NATIVE_UPGRADE_CUT`（ADR-0009 gate 7）只有固定代碼、次數、毫秒、RID 前 8 碼與 Hosted session ID；`FA_PRIVATE_MEMORY_*`／`FA_TEAM_MEMORY_*` 只有 HTTP 狀態碼、固定的 status／stage／reason／mode 代碼、例外類型名稱（`_exception_type` 的固定對照或類別名稱）、筆數與 token 數、官方 kind 名稱的計數（其他 kind 記成 `unknown`）、通過 `_OFFICIAL_ID` 檢查的 `update_id`／`memory_id`，以及 RID 前 8 碼；`NATIVE_TOOLBOX_FAILED` 只有 method、stage、代碼、狀態碼與例外類型名稱；`FA_NATIVE_HTTP` 只有階段與 action、固定 operation／status／code、例外類型名稱、毫秒、Agent ID 與版本、session／invocation ID 與 RID 的 SHA-256；都沒有對話內容、記憶內容、scope、token 或個資。同一批 logger 的其他行（例如可能帶 runtime 錯誤文字的 `FA_MCP_SERVER_STATUS`、`FA_HOSTED_DISPATCH`，以及記憶 logger 上的 `FA_NATIVE_ASSEMBLY_PARTIAL`）不送。這十四個 logger 改成 INFO 等級，`RESIDENT_SDK_CONTINUED`（INFO，沿用常駐 SDK）才會送。
+- stderr 不變：logger 一旦有 handler，Python 就不再用 `logging.lastResort` 印到 stderr，所以同時把 `logging.lastResort` 本身掛上這十四個 logger（只在 root 沒有 handler 時，也就是 Hosted 入口現況）；stderr 照舊只印 WARNING 以上。
 - 讀回（`log-fa-stage`／`log-fa-dev` 的 Log Analytics；換成要查的 Agent 名稱）：
 
   ```kusto
@@ -7457,7 +7532,7 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
 - 測試（本機，真 SDK 1.0.13＋runtime 1.0.83＋離線模型替身＋本機假 ingestion 端點，沒有雲端呼叫）：`python -X utf8 -m pytest .\tests\shared_context\test_sdk_telemetry.py -q`，19 passed（10-04 當時的數字；之後另加 3 個 log export 測試，見下方 Hosted log 那一項）。涵蓋：預設（不設旗標）就打開、明確 `0`／沒有連線字串／讀不懂的值都不送且前兩者不記 warning；不設旗標又沒有連線字串時真 runtime 回合照常完成、不帶 header、不產生 span 檔；ingestion 連不上與 exporter 建不起來時真 runtime 回合照常完成、span 檔清掉；真 runtime 經正式 `DirectResponses` 送模型（每個請求帶回合 traceparent）、Responses 線路帶／不帶原始 `reasoning_text`、gateway 自己的 HTTP 路徑（同舊 assistant 經 API 的路徑）帶／不帶原始推理、`watch_model_response` 各種回應（串流、已讀、壓縮、旗標關閉）、native 路徑（請求帶的 traceparent → 收單記住 → 背景回合 → SDK context 與模型 sender）、沒有 OpenTelemetry 的程序。
 - sync／onboarding ENV：`python -X utf8 -m pytest .\tests\shared_context\test_endpoint_versions.py -q -k tracing`，5 passed（sync 與「＋」複製都不加旗標、明確 `0` 會保留、overlay 可設 `0`／`1`、其他值在寫入前拒絕）。
 - 唯讀查詢 `appi-fa-stage`（10-04）與一次使用者身分的極小 Responses 呼叫（見上）。未部署、未在 Hosted 實測。
-- [FA 自己的 Hosted log](#hosted-fa-logs)（以 main `1bb3da33` 為基準）：`sdk_telemetry.attach_log_export`／`export_logs`／`_exportable`、`behavior_assistant_main.main`；log 行來源 `behavior_timing.elapsed_timing`、`native_resident`、`m2_copilot`、`native_sdk`、`behavior_hosted`、`native_turns._run_started`、`behavior_model_direct.DirectResponses`、`native_environment_cut`；記憶行（以 main `2358d87a` 為基準）`behavior_private_memory.PrivateMemory`、`cosmos_private_memory.CosmosPrivateMemory`、`native_private_memory`、`native_team_memory.NativeTeamMemory`、`native_memory_candidate`。本機套件 azure-monitor-opentelemetry-exporter 1.0.0b58、opentelemetry-sdk 1.45.0、opentelemetry-instrumentation-logging 0.66b0（經 agentserver-core → microsoft-opentelemetry 間接帶入，manifest 沒有直接固定；舊版沒有新 handler 時改用 SDK 內建的）。測試：`python -X utf8 -B -m pytest tests/shared_context/test_sdk_telemetry.py -q -k log_export`，3 passed（本機假 ingestion 端點：只收到 `FA_TIMING`、`RESIDENT_SDK_CONTINUED`、`FA_NATIVE_TURN_UNKNOWN`、`FA_MODEL_DIRECT_RETRY`／`HTTP_FAILURE`、`NATIVE_UPGRADE_CUT`，以及 6 行記憶狀態（`FA_PRIVATE_MEMORY_UPDATE status=401 stage=embedding`、Team 的 `embedding_unavailable` 與 404、`INACTIVE`、`USAGE_UNREPORTED`），同 logger 的其他前綴、INFO 行、未列 logger 的同名前綴、第一個參數不完全等於事件名稱的 `%s` 行、帶例外資訊的記憶行與 API 端 `memory_relay` logger 都不送、內容 canary 不出現、handler 只在十三個 logger；把「完全等於」改成「以事件名稱開頭」時這個測試會失敗（2026-10-24 突變檢查）；exporter 建不起來時回 None、記 warning、不掛任何 handler；另一個乾淨子程序確認開與關時 stderr 的 FA 行相同）。部署後把映像實際解析到的這三個套件版本讀回記進驗收紀錄。未部署、未在 Hosted 實測。
+- [FA 自己的 Hosted log](#hosted-fa-logs)（以 main `1bb3da33` 為基準）：`sdk_telemetry.attach_log_export`／`export_logs`／`_exportable`、`behavior_assistant_main.main`；log 行來源 `behavior_timing.elapsed_timing`、`native_resident`、`m2_copilot`、`native_sdk`、`behavior_hosted`、`native_turns._run_started`、`behavior_model_direct.DirectResponses`、`native_environment_cut`；記憶行（以 main `2358d87a` 為基準）`behavior_private_memory.PrivateMemory`、`cosmos_private_memory.CosmosPrivateMemory`、`native_private_memory`、`native_team_memory.NativeTeamMemory`、`native_memory_candidate`。本機套件 azure-monitor-opentelemetry-exporter 1.0.0b58、opentelemetry-sdk 1.45.0、opentelemetry-instrumentation-logging 0.66b0（經 agentserver-core → microsoft-opentelemetry 間接帶入，manifest 沒有直接固定；舊版沒有新 handler 時改用 SDK 內建的）。測試：`python -X utf8 -B -m pytest tests/shared_context/test_sdk_telemetry.py -q -k log_export`，3 passed（本機假 ingestion 端點：只收到 `FA_TIMING`、`RESIDENT_SDK_CONTINUED`、`FA_NATIVE_TURN_UNKNOWN`、`FA_MODEL_DIRECT_RETRY`／`HTTP_FAILURE`、`NATIVE_UPGRADE_CUT`，以及 6 行記憶狀態（`FA_PRIVATE_MEMORY_UPDATE status=401 stage=embedding`、Team 的 `embedding_unavailable` 與 404、`INACTIVE`、`USAGE_UNREPORTED`），同 logger 的其他前綴、INFO 行、未列 logger 的同名前綴、第一個參數不完全等於事件名稱的 `%s` 行、帶例外資訊的記憶行與 API 端 `memory_relay` logger 都不送、內容 canary 不出現、handler 只在十四個 logger；把「完全等於」改成「以事件名稱開頭」時這個測試會失敗（2026-10-24 突變檢查）；exporter 建不起來時回 None、記 warning、不掛任何 handler；另一個乾淨子程序確認開與關時 stderr 的 FA 行相同）。部署後把映像實際解析到的這三個套件版本讀回記進驗收紀錄。未部署、未在 Hosted 實測。
 
 ## stage 環境與 CI/CD（ADR-0008）
 
@@ -13532,8 +13607,8 @@ custom `read_skill`，不新增資料庫、loader、MCP、scripts、plugins 或 
 沿原 binary `PUT /teams/{team}/artifacts/{artifact}/versions/{id}`，
 `X-Artifact-Skill-Purpose` 傳 **單一、canonical padded base64url 的 UTF-8 JSON**，
 完整 header 上限 **2048 ASCII bytes**（含 JSON escaping／base64 成本，不是另一個描述額度）。
-`ArtifactClient.upload()` 對 typed `VersionInput.skill_purpose` 產生這個 header；
-缺省不送。未知 schema、重複 JSON keys／header、錯誤編碼及超限明確拒絕，沒有舊格式 fallback。
+這條 route 與測試用 `ArtifactClient` 已於 2026-11 移除；`SkillPurpose.header()`／`from_header`
+仍保留這個格式與界線，缺省不送。未知 schema、重複 JSON keys、錯誤編碼及超限明確拒絕（重複 header 的檢查隨 route 一起移除），沒有舊格式 fallback。
 M3 已有 12-version／512 KiB artifact、skill 正文 8192 bytes／hash／ETag 界線不變。
 
 `ArtifactVersion.metadata_sha256` 是 server 重算的完整 metadata digest，**不是正文 hash**：
@@ -17394,7 +17469,7 @@ HTTP失敗不自動重送決定，先查看該artifact的決定receipt。這些�
 #### Skill審核清單（只讀，LOCAL，未部署）
 
 `list`不需指定成果，列出設定Team內所有skill的目前審核狀態，讓人類找出待批准或已停用的版本
-（CLI已於 2026-10 移除，命令為歷史紀錄；`ArtifactClient.skill_reviews`仍在）：
+（CLI已於 2026-10 移除，命令為歷史紀錄；測試用 `ArtifactClient` 與這條 HTTP route 已於 2026-11 移除，清單現由 `ArtifactService.skill_reviews` 及 `/team-skills/v1/reviews` 提供）：
 
 ```powershell
 & .\src\fa-shared-context-poc\.venv\Scripts\python.exe .\src\fa-shared-context-poc\m3_artifacts_cli.py list
@@ -17539,12 +17614,9 @@ M4更新僅寫`artifact_text`，保留權威`progress`；resume沿用SDK session
   - `workstate` 由 ARM 建立，Table Data Contributor 僅授予該 Table；API 啟動時不建立或列出 service-level tables。
 - 一個 team 是一個 `PartitionKey`。每個工作是 `RowKey=work:<work-id>`，權威 JSON 存在 `Payload` 的 `Edm.Binary`，UTF-8 序列化最多 **48 KiB**。Binary 避免中文文字遇到 Table 單一字串的 UTF-16 限制。
 - 工作包括owner、revision、draft/published、goal、progress、交接、發布時間／actor，以及artifact text、SHA-256、version；工作狀態仍在Table，不改成Blob。
-- 私人環境備份另用專用Blob container。只有API MI有container級read/write；由已驗JWT的tenant／oid決定namespace，不接受呼叫者指定owner或URL，不授權Hosted直接存取Blob。
 - `create_entity` 不會覆寫既有工作。所有更新使用 `update_entity(mode=REPLACE, etag=..., match_condition=IfNotModified)`，不是先 GET 後無條件覆寫。兩個更新最多一個成功。
 - 所有工作修改均要求目前 owner 與精確 ETag。發布後連 goal／progress／owner 都不可改；沒有 DELETE、PUT、通用 Table proxy、Memory-to-work 自動回寫。修訂已發布成果需新 work ID。
 - 私人記憶是 `private:<team>:<actor>`，Team 記憶是 `team:<team>`。API 先授權才選 scope；scope 本身**不是 ACL**。
-- Memory operation receipt 存在同 Table 的 `operation:<32-hex-id>`，記錄 scope／owner／native update ID；不依賴 process memory。私人 operation 的讀取也受相同邊界保護。
-- Context 由伺服器角色指令、該工作的權威狀態、最多 10 筆 Team 與 10 筆自己的私人記憶組成；搜尋 query 取自工作 goal（最多 2048 字）。記憶與成果文字仍是資料，不會變成 system instruction 或批准。
 
 ## API 設定
 
@@ -17558,8 +17630,6 @@ M4更新僅寫`artifact_text`，保留權威`progress`；resume沿用SDK session
 | `CONTEXT_TABLE_NAME` | `workstate`，已由 ARM 建立 |
 | `CONTEXT_MEMORY_ENDPOINT` | `https://cog-fasample-memory-demo.services.ai.azure.com/api/projects/faexample` |
 | `CONTEXT_MEMORY_STORE` | `poc-team-memory`，必須先由編排者建立 |
-| `CONTEXT_BACKUP_BLOB_ENDPOINT` | opt-in；`https://stfam1backupdemo.blob.core.windows.net`，與下列container必須同時設定 |
-| `CONTEXT_BACKUP_CONTAINER` | opt-in；`m1-environment-backups`，已由ARM建立；API啟動不建立container |
 | `CONTEXT_M2_RUN_ID` | M2 opt-in；本輪固定計數 ID，不能換 ID 重設已用額度 |
 | `CONTEXT_M2_MODEL` | 與其他兩項 M2 設定同時提供，僅接受 `gpt-4.1-mini` |
 | `CONTEXT_M2_MAX_REQUESTS` | 與其他兩項 M2 設定同時提供，1–120；失敗與未知 attempt 也計入 |
@@ -18362,7 +18432,7 @@ Table 狀態是否能改由 Foundry Conversations／State store 承接，由 83d
 2026-09-14 已完成真正 Hosted A5／B4 的 17 gates／370 checks；完整結果、失敗歷史、
 固定 VM 待驗與費用未知見 [POC-RESULTS.md](../../POC-RESULTS.md)。
 以下是可重現的驗收順序，不是尚待執行的任務；實際 rerun 需符合新授權及預算。
-本機 controller 已改為 endpoint-only，必要參數見 [controller 手冊](../../tests/shared_controller/README.md)，
+本機 controller 已改為 endpoint-only，controller 手冊（2026-11-03 已移除，見 `0330d456`），
 避免已重現的 service-name 路徑多餘 session。修改後僅執行 A/B runtime／已發布成果唯讀回歸，
 沒有重送 Memory update 或把歷史 session 上限偏差標為 PASS。
 

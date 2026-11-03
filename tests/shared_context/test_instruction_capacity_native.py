@@ -22,6 +22,7 @@ from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_work_policy import work_policy_key
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
+from shared_context.sdk_pin import RUNTIME_VERSION
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from test_instruction_capacity import configured_capacity, declared_facts, submit_capacity
@@ -109,8 +110,8 @@ def test_fixed_sdk_transmits_model_specific_capacity_and_reports_runtime_observa
         calls.append({"phase": phase, "model": body.get("model"), "output_token_limit": output,
                       "snapshot_not_in_model_prompt": "fa-model-capacity-snapshot-v1" not in json.dumps(body["messages"])})
         assert body["model"] == models[phase]
-        # The pinned official E2E documents that completions do not echo this configured cap.
-        assert output is None, calls
+        # Runtime 1.0.103 sends the declared output cap on completions (1.0.83 left it out).
+        assert output == facts[models[phase]]["max_output_tokens"], calls
         assert calls[-1]["snapshot_not_in_model_prompt"]
         assert sum(call["phase"] == phase for call in calls) == 1
         return sse(request, {"content": f"Offline reply for declared model {models[phase]}."}, len(calls))
@@ -184,7 +185,7 @@ def test_fixed_sdk_transmits_model_specific_capacity_and_reports_runtime_observa
         target.mkdir(parents=True, exist_ok=True)
         (target / "capacity-native.json").write_text(json.dumps({
             "evidence": "fixed SDK create/cold resume with synthetic server facts and offline model transport",
-            "sdk_version": importlib.metadata.version("github-copilot-sdk"), "runtime_version": "1.0.83",
+            "sdk_version": importlib.metadata.version("github-copilot-sdk"), "runtime_version": RUNTIME_VERSION,
             "configured_snapshots": snapshots, "sdk_capacity_wire": wire,
             "runtime_observations": observed, "provider_requests": calls,
             "stops": [bridge._sdk_stop.model_dump(mode="json") for bridge in bridges], "force_stop_calls": 0,
@@ -284,14 +285,14 @@ def test_opted_in_capacity_profile_preserves_structured_sdk_save_and_finish(assi
                          json={"request_id": "read-original-structured-result"}, headers=h.headers())
     assert pull.status_code == 200 and pull.json()["work_state"] == "succeeded"
     assert not done.obligation_fulfilled
-    assert len(stops) == 1 and stops[0]["graceful"] and stops[0]["runtime_version"] == "1.0.83"
+    assert len(stops) == 1 and stops[0]["graceful"] and stops[0]["runtime_version"] == RUNTIME_VERSION
     assert force_stops == []
     if os.environ.get("FA_CAPACITY_EVIDENCE_DIR"):
         target = Path(os.environ["FA_CAPACITY_EVIDENCE_DIR"])
         target.mkdir(parents=True, exist_ok=True)
         (target / "structured-capacity-regression.json").write_text(json.dumps({
             "evidence": "real signed API/controller/M3 with fixed SDK and scripted offline provider",
-            "sdk_version": importlib.metadata.version("github-copilot-sdk"), "runtime_version": "1.0.83",
+            "sdk_version": importlib.metadata.version("github-copilot-sdk"), "runtime_version": RUNTIME_VERSION,
             "server_capacity_profile": record.profile.model_capacity_profile,
             "structured_task_has_instruction_or_capacity_snapshot": False,
             "sdk_create_calls": len(configurations), "offline_model_requests": len(h.endpoint.requests),

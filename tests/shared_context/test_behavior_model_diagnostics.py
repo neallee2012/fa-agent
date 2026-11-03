@@ -68,8 +68,9 @@ def socket_server(handle):
 
 class LocalHTTP(httpx.BaseTransport):
     def __init__(self, port):
-        self.port, self.http = port, httpx.HTTPTransport(retries=0)
+        self.port, self.http, self.timeouts = port, httpx.HTTPTransport(retries=0), []
     def handle_request(self, request):
+        self.timeouts.append((request.url.path, dict(request.extensions["timeout"])))
         local = httpx.Request(request.method, request.url.copy_with(scheme="http", host="127.0.0.1", port=self.port),
                               headers=request.headers, content=request.content, extensions=request.extensions)
         return self.http.handle_request(local)
@@ -246,10 +247,7 @@ def test_synchronous_credential_does_not_starve_provider_event_loop():
             await asyncio.sleep(0.02)
             elapsed = time.monotonic() - start
             released.set()
-            try:
-                await pending
-            except Problem:
-                pass
+            assert (await pending).status_code == 200
             assert entered.is_set()
             assert elapsed < 0.3, "synchronous credential blocked the API event loop"
         asyncio.run(run())
@@ -275,10 +273,7 @@ def test_provider_current_evidence_does_not_block_event_loop(monkeypatch):
             await asyncio.sleep(0.02)
             elapsed = time.monotonic() - started
             release.set()
-            try:
-                await task
-            except Exception:
-                pass
+            assert (await task).status_code == 200
             assert entered.is_set() and elapsed < 0.3
         asyncio.run(run())
 

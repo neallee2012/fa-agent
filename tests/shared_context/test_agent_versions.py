@@ -14,9 +14,9 @@ from shared_context.behavior_agent_versions import (
 )
 from shared_context.behavior_work_target import instruction_hosted_version
 from shared_context.errors import Problem
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
 from test_team_registry import AGENT_OID, OTHER_AGENT_OID, _target
 
 REAL_CURRENT = versions.current_hosted_version
@@ -257,7 +257,7 @@ def test_each_selection_reads_the_selector_and_only_a_newly_selected_versions_de
 
 
 def test_a_kept_definition_failing_a_check_is_dropped_so_the_next_selection_reads_it_again():
-    """#942 review: an Agent re-created under the same name and version number (another GUID) failed the identity
+    """#942: an Agent re-created under the same name and version number (another GUID) failed the identity
     check against the kept snapshot on every selection until the process restarted."""
     foundry = Foundry(R)
     foundry.add(R.agent_name, 4, "new")
@@ -274,7 +274,7 @@ def test_a_kept_definition_failing_a_check_is_dropped_so_the_next_selection_read
 
 
 def test_a_kept_definition_dropped_by_another_thread_never_breaks_an_eviction(monkeypatch):
-    """#942 review: selections can run in parallel threads. One thread evicting the oldest snapshot while another
+    """#942: selections can run in parallel threads. One thread evicting the oldest snapshot while another
     drops a failing one could change the dict between ``iter`` and ``next`` (forced here): RuntimeError, a 500."""
     import threading
 
@@ -297,7 +297,7 @@ def test_a_kept_definition_dropped_by_another_thread_never_breaks_an_eviction(mo
     def evict():
         try:
             outcome.append(resolver.current(A))
-        except Exception as error:  # noqa: BLE001 - the failure under test
+        except Exception as error:  # the failure under test
             outcome.append(error)
 
     resolver._definitions = Paused(resolver._definitions)

@@ -10,6 +10,7 @@ import pytest
 from shared_context import behavior_assistant_wire as aw
 from shared_context.behavior_api import _install_error_handlers
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_conversation_transfer_startup import claimed_turn, read_startup, saved_turn, synthetic_standing_v1
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key
@@ -46,7 +47,7 @@ def test_progress_only_restarts_original_observer_when_its_final_is_saved(observ
         current = client.get(path, headers=headers)
         assert current.status_code == 200, current.text
         assert calls == [] and c.h.runtime.store._guard() == before
-        stop = aw.SdkStop(runtime_version="1.0.83", pid=99, exit_code=0, graceful=True)
+        stop = aw.SdkStop(runtime_version=RUNTIME_VERSION, pid=99, exit_code=0, graceful=True)
         c.authority.save_text_reply(opened.session, aw.SaveTextReply(
             request_id="save-text-reply", sdk_stop=stop,
             archive=aw.ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE"),
@@ -127,7 +128,7 @@ def test_ready_callback_can_observe_only_the_persisted_original_result(observer_
     with TestClient(app, backend_options={"loop_factory": lambda: loop}) as client:
         early = client.post(prefix + "/execution-ready", json={"request_id": "execution-ready"}, headers=headers)
         assert early.status_code == 409 and notifications == []
-        stop = aw.SdkStop(runtime_version="1.0.83", pid=99, exit_code=0, graceful=True)
+        stop = aw.SdkStop(runtime_version=RUNTIME_VERSION, pid=99, exit_code=0, graceful=True)
         command = aw.SaveTextReply(request_id="save-text-reply", sdk_stop=stop,
             archive=aw.ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE"),
             reply=aw.TextReply(text="The original completed answer.", sdk_session_id=opened.assignment.sdk_session_id,

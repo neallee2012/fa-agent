@@ -7,7 +7,9 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from .behavior_skill_copy import SOP_COPY_PROFILE
-from .behavior_wire import Digest, WireModel
+from .behavior_wire import Digest, WireModel, exact_prefix, known_release
+from .native_responses_wire import SENT_RELEASE
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 SOP_COPY_CAPABILITIES = ("read_context", "execute_operation", "copy_sop_to_skill_draft")
 SOP_COPY_PROMPT = (
@@ -69,17 +71,15 @@ class SopCopyPromptRecord(WireModel):
     prefix_sha256: Digest
     prefix_utf8_bytes: Annotated[int, Field(gt=0)]
     prefix_tokens: None = None
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]
+    runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
+    _release = model_validator(mode="after")(known_release)
     omissions: tuple[str, ...] = _OMISSIONS
 
     @model_validator(mode="after")
     def exact(self):
-        raw = SOP_COPY_PROMPT.encode("utf-8")
-        if (self.prefix_sha256 != hashlib.sha256(raw).hexdigest() or self.prefix_utf8_bytes != len(raw)
-                or self.omissions != _OMISSIONS):
-            raise ValueError("SOP copy assembly differs from its original literal profile")
-        return self
+        return exact_prefix(
+            self, SOP_COPY_PROMPT, _OMISSIONS, "SOP copy assembly differs from its original literal profile")
 
 
 @dataclass(frozen=True)

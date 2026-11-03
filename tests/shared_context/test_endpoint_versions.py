@@ -224,7 +224,21 @@ def test_new_definition_inherits_the_agents_served_flags_not_an_unpublished_cand
     assert foundry.versions[R.agent_name][1]["definition"] == candidate
 
 
-NATIVE_GROUPS = {"FA_NATIVE_TURNS": "foundry-native-v1", "FA_NATIVE_GROUPS_ENABLED": "1"}
+def test_a_new_image_runs_its_own_runtime_not_the_one_the_old_definition_named():
+    # dev 4400 (ADR-0009 3d-i): the carried 1.0.83 path outlived the image change and every turn failed to start.
+    from shared_context.behavior_agent_versions import desired_source, image_source
+
+    foundry = Foundry(R)
+    old = "/opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime"
+    served = {"kind": "hosted", "image": "old:image",
+              "environment_variables": {"BEHAVIOR_ASSISTANT_RUNTIME_PATH": old, "TZ": "Asia/Taipei"}}
+    foundry.add(R.agent_name, 4, "old", definition=served)
+    foundry.selectors[R.agent_name] = "4"
+    desired, _ = desired_source(image_source(foundry, R, "next:image"))()
+    assert desired["environment_variables"] == {"TZ": "Asia/Taipei"}
+
+
+NATIVE_GROUPS = {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_NATIVE_GROUPS_ENABLED": "1"}  # ADR-0009 M1: v1 retired
 
 
 @pytest.mark.parametrize("served,expected", [

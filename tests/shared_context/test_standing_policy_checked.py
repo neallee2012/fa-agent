@@ -5,11 +5,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from shared_context.behavior_work_policy import WorkPreflight
-from test_behavior_assistant import assistant  # noqa: F401
-from test_conversation_note_memory import enable_memory, memory_conversations  # noqa: F401
-from test_instruction_flow import instruction_models, runtime_path  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_memory_preflight import memory_console  # noqa: F401
+from test_behavior_assistant import assistant
+from test_conversation_note_memory import enable_memory, memory_conversations
+from test_instruction_flow import instruction_models, runtime_path
+from test_m3_auth import jwk_client, signing_key
+from test_memory_preflight import memory_console
 from web_test_console.adapter import ConsoleError
 
 T0 = datetime(2026, 9, 15, 10, tzinfo=timezone.utc)

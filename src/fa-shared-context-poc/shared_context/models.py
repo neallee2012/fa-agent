@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
 Identifier = Annotated[str, Field(pattern=ID_PATTERN, min_length=1, max_length=64)]
@@ -15,26 +15,10 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-class EmptyBody(StrictModel):
-    pass
-
-
 class CreateWork(StrictModel):
     goal: Goal
     progress: Progress = ""
     artifact_text: ArtifactText = ""
-
-
-class UpdateWork(StrictModel):
-    goal: Goal | None = None
-    progress: Progress | None = None
-    artifact_text: ArtifactText | None = None
-
-    @model_validator(mode="after")
-    def nonempty_changes(self):
-        if not self.model_fields_set or any(getattr(self, k) is None for k in self.model_fields_set):
-            raise ValueError("at least one non-null editable field is required")
-        return self
 
 
 class Handoff(StrictModel):
@@ -54,6 +38,3 @@ class SyntheticMemory(StrictModel):
             )}],
         }]
 
-
-class SearchMemory(StrictModel):
-    query: Annotated[str, Field(min_length=1, max_length=2048)]

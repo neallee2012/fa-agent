@@ -12,7 +12,7 @@ from shared_context.errors import Problem
 from shared_context.native_continuations import read_intent
 from shared_context.native_turns import NativeTurnRuntime
 from test_native_responses import ResponsesHarness, build_responses_host, response_submit
-from test_native_turns import IDENTITY, OfflineSdk, local_env  # noqa: F401 - local_env is a fixture
+from test_native_turns import IDENTITY, OfflineSdk, local_env  # local_env is a fixture
 
 # Promptly: well under the 10 s /cancel grace and the 60 s CLI exit bound (UNEXITED_WAIT_SECONDS).
 PROMPT_SECONDS = 3
@@ -83,7 +83,7 @@ def cancel_recovered(root, rid, response_id, monkeypatch, *, cli_exits):
 
 @pytest.mark.parametrize("cli_exits", [True, False], ids=["cli-exits-after-cancel", "cli-never-exits"])
 def test_a_client_cancel_of_a_recovered_accepted_rid_closes_it_without_starting_the_sdk(
-        local_env, monkeypatch, tmp_path, cli_exits):  # noqa: F811
+        local_env, monkeypatch, tmp_path, cli_exits):
     monkeypatch.setenv("FA_RESPONSES_ENABLED", "1")
     root = tmp_path / "journal"
     root.mkdir()
@@ -97,7 +97,7 @@ def test_a_client_cancel_of_a_recovered_accepted_rid_closes_it_without_starting_
 
 @pytest.mark.parametrize("cli_exits", [True, False], ids=["cli-exits-after-cancel", "cli-never-exits"])
 def test_a_client_cancel_of_a_recovered_started_rid_closes_it_without_a_continuation(
-        local_env, monkeypatch, tmp_path, cli_exits):  # noqa: F811
+        local_env, monkeypatch, tmp_path, cli_exits):
     """The recovered record carries its context, so the official cancel reaches a recovered handler waiting for the
     CLI exit: that cancel makes the reentry not a recovery, and no continuation intent is prepared for it."""
     monkeypatch.setenv("FA_RESPONSES_ENABLED", "1")
@@ -113,7 +113,7 @@ def test_a_client_cancel_of_a_recovered_started_rid_closes_it_without_a_continua
 
 
 def test_a_client_cancel_stops_a_recovered_sdk_turn_that_is_already_running(
-        local_env, monkeypatch, tmp_path):  # noqa: F811
+        local_env, monkeypatch, tmp_path):
     """The earlier CLI has exited, so the recovered handler starts its SDK turn; a cancel then stops that turn through
     the control the runtime polls (native_turns ``_observe_control``), not only before the start."""
     monkeypatch.setenv("FA_RESPONSES_ENABLED", "1")

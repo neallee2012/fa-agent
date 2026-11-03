@@ -24,8 +24,9 @@ from shared_context.native_local_capabilities import (
 )
 from shared_context.native_turns import NativeTurnRuntime
 from shared_context.tool_catalog import StdioEntry
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_capabilities import selected_capture
-from test_native_turns import Harness, IDENTITY, local_env  # noqa: F401
+from test_native_turns import Harness, IDENTITY, local_env
 from test_native_turn_wire import submit
 
 MODEL_ROOT = "https://offline-fixture.services.ai.azure.com/api/projects/offline/openai/v1"
@@ -216,7 +217,7 @@ def test_native_turn_runs_local_tools_with_capture_vision_and_mcp_through_the_ex
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "done", "sdk_stop": {"pid": 1, "exit_code": 0, "graceful": True,
-                                                      "runtime_version": "1.0.83"}}
+                                                      "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

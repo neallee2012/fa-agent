@@ -777,7 +777,6 @@ class NativeSessionState(WireModel):
     # still decodes; the API never forwards it to a client whose strict decoder predates it (observe_preparation).
     actual_version: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,15}$")] | None = Field(
         default=None, exclude_if=lambda value: value is None)
-    # ADR-0009 M7, reserved: phase 4d's crash-loop read; never filled before then.
     recent_crashes: Annotated[tuple[NativeCrash, ...], Field(max_length=8)] = Field(
         default=(), exclude_if=lambda value: not value)
     # ``NativeSessionRead(workspace=True)`` only: the workspace root's mode and entries (``fa-workspace-files-v1``),

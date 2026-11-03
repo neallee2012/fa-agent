@@ -22,6 +22,7 @@ from shared_context.behavior_sdk_checkpoint import SdkStateUpload, checkpoint_ke
 from shared_context.behavior_sdk_state import DIAG_ARCHIVE_CODEC
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
@@ -239,11 +240,11 @@ def test_native_summary_cannot_create_human_consent_after_compaction(
         ]
         assert [item["type"] for item in events] == ["session.compaction_start", "session.compaction_complete"]
         assert all(item["trigger"] == "manual" for item in events)
-        assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == "1.0.83" for bridge in bridges)
+        assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == RUNTIME_VERSION for bridge in bridges)
         assert all(process.poll() is not None for process in processes) and not forces
         assert all(bridge._sdk_stop.pid == process.pid and bridge._sdk_stop.exit_code == process.poll()
                    for bridge, process in zip(bridges, processes, strict=True))
-        assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+        assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     finally:
         if os.environ.get("TC08_SUMMARY_EVIDENCE_DIR"):
             destination = Path(os.environ["TC08_SUMMARY_EVIDENCE_DIR"])

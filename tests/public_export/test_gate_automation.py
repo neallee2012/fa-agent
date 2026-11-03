@@ -17,11 +17,11 @@ ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "scripts" / "public_export"
 sys.path.insert(0, str(TOOLS))
 
-import fingerprint  # noqa: E402
-import gate2_check  # noqa: E402
-import inventory_scan  # noqa: E402
-import prepush_check  # noqa: E402
-import scrub_export  # noqa: E402
+import fingerprint
+import gate2_check
+import inventory_scan
+import prepush_check
+import scrub_export
 
 SECRET_NAME = "Zephyr" + "Quill"          # an "original" value the export must replace
 PLACEHOLDER_NAME = "example" + "name"
@@ -84,9 +84,6 @@ def publish(private: Path, public: Path, tag: str) -> str:
     return git(public, "rev-parse", "HEAD^{tree}")
 
 
-# --- fingerprint -------------------------------------------------------------------------------------------
-
-
 def test_fingerprint_equals_the_tree_public_sync_commits(private: Path, tmp_path: Path):
     published = publish(private, tmp_path / "public", "v1")
     assert fingerprint.commit_fingerprint(private, "HEAD") == published
@@ -126,9 +123,6 @@ def test_parse_fingerprint_needs_exactly_one_value():
     assert fingerprint.parse_fingerprint(f"public-sync fingerprint: {a}\npublic-sync fingerprint: {a}") == a
     assert fingerprint.parse_fingerprint(f"public-sync fingerprint: {a}\npublic-sync fingerprint: {b}") is None
     assert fingerprint.parse_fingerprint("no record here") is None
-
-
-# --- gate 2 ------------------------------------------------------------------------------------------------
 
 
 def gate2(private: Path, public: Path, tmp_path: Path, *extra: str) -> int:
@@ -236,8 +230,6 @@ def test_gate2_never_falls_back_to_the_clone_head(private: Path, tmp_path: Path,
     out = capsys.readouterr().out
     assert "cannot read v1 in the public repo" in out and "gate 2: PASS" not in out
 
-
-# --- inventory scan ----------------------------------------------------------------------------------------
 
 STEM = "zephyr" + "quill"
 INVENTORY = [

@@ -257,9 +257,6 @@ def view(value):
     return result
 
 
-# ----- Foundry (agent version) ------------------------------------------------------------------------------
-
-
 class FoundryCallError(Exception):
     """status None means the outcome is unknown (transport or unexpected failure)."""
 
@@ -318,9 +315,6 @@ def default_setup(composition):
     from .behavior_agent_setup import ROLE_SCOPE_ENV, NewAgentSetup
     credential = composition.clients[0].credential if os.environ.get(ROLE_SCOPE_ENV) else None
     return NewAgentSetup.from_environment(composition.config.targets[0].project_endpoint, credential)
-
-
-# ----- context ----------------------------------------------------------------------------------------------
 
 
 def _owner_context(composition, principal, *, write):
@@ -485,9 +479,6 @@ def _original_policy(composition, selection=None, *, check=False):
     return original
 
 
-# ----- S0 admission -----------------------------------------------------------------------------------------
-
-
 def _admit(composition, principal, value):
     store, config = composition.runtime.store, composition.config
     domain = config.table.scope.authority_domain
@@ -574,9 +565,6 @@ def _advance(store, current, state, *, target=None, reason=None, registered_at=N
         return ControlChanges(writes=tuple(writes), result=_result(updated))
 
     _transact(store, request, decide)
-
-
-# ----- S1/S2 Foundry ----------------------------------------------------------------------------------------
 
 
 def _number(version):
@@ -718,9 +706,6 @@ def _create(composition, foundry, value, *, deadline, sleep, clock, now):
         sleep(1)
 
 
-# ----- S4/S5 runtime registration and role --------------------------------------------------------------------
-
-
 def _register_runtime(composition, principal, value):
     from .behavior_agent_registry import _check_policy, read_agent_registry, register_agent_scope
     from .behavior_agent_registry_operator import _owned_result_work, _peer_policy
@@ -785,9 +770,6 @@ def _select_tools(composition, principal, value):
         raise Problem(409, "AGENT_ONBOARDING_SELECTION_STALE",
                       "the original tool and skill choice no longer matches the Team catalog; the agent is registered "
                       "and this request ID stays the only way forward", cause=code) from None
-
-
-# ----- entry points -----------------------------------------------------------------------------------------
 
 
 def onboard(composition, principal, body, *, foundry=None, setup=None, deadline_seconds=20, sleep=time.sleep,
@@ -927,6 +909,3 @@ def console_connection(composition, principal, agent_id):
     return AgentConsoleConnection(agent_id=agent_id, display_name=current.display_name,
                                   backend_configuration_sha256=policy.configuration_sha256,
                                   standing_policy=policy, standing_policy_sha256=policy.sha256)
-
-
-# ----- startup history --------------------------------------------------------------------------------------

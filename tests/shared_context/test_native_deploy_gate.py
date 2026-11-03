@@ -26,7 +26,7 @@ from shared_context.native_binding import (
 from shared_context.native_version_veto import VETO_PARTITION, NativeVersionVetoStore
 
 ROOT = Path(__file__).resolve().parents[2]
-V1, V2 = "foundry-native-v1", "foundry-native-v2"
+V1, V2, V3 = "foundry-native-v1", "foundry-native-v2", "foundry-native-v3"
 A = SimpleNamespace(agent_id="agent-a", agent_name="fa-stage-a", project_endpoint="https://project.example/a")
 B = SimpleNamespace(agent_id="agent-b", agent_name="fa-stage-b", project_endpoint="https://project.example/a")
 IMAGE = "cr.example.azurecr.io/fa-behavior-assistant-desktop@sha256:"
@@ -91,9 +91,6 @@ def read_with(foundry):
     return lambda target, version: foundry.get_version(target.agent_name, version)["definition"]
 
 
-# ----- the gate's verdict -----------------------------------------------------------------------------------------
-
-
 def test_armed_gate_refuses_when_the_support_set_misses_a_recorded_row_profile():
     store, _ = store_with(row("agent-a", "sid-a", "141"))
     foundry = RecordingFoundry({("fa-stage-a", "141"): definition(V1, "a")})
@@ -118,11 +115,11 @@ def test_armed_gate_refuses_a_session_whose_recorded_version_declares_an_unsuppo
 
 
 def test_the_2dii_api_reports_v1_rows_incompatible_and_v2_rows_compatible():
-    # ADR-0009 M1 2d-ii: the new API's own supported set (no override) is {v2}; unarmed it only reports.
+    # ADR-0009 M1 2d-ii: the new API's own supported set (no override), {v2, v3} from 3d-i; unarmed it only reports.
     store, _ = store_with(row("agent-a", "sid-a", "141"), row("agent-b", "sid-b", "150", profile=V2))
     foundry = RecordingFoundry({("fa-stage-a", "141"): definition(V1, "a"), ("fa-stage-b", "150"): definition(V2, "c")})
     report = gate.evaluate([A, B], store.rows, read_with(foundry), armed=True)
-    assert report["supported"] == [V2] and report["decision"] == "refuse"
+    assert report["supported"] == [V2, V3] and report["decision"] == "refuse"
     assert report["refused"] == [{"agent_id": "agent-a", "reason": "row_profile_unsupported"}]
     assert [entry["verdict"] for entry in report["agents"]][1] == "compatible"
     assert gate.evaluate([A, B], store.rows, read_with(foundry), armed=False)["decision"] == "observe"
@@ -288,9 +285,6 @@ def test_rows_reads_every_page_and_refuses_a_malformed_row():
     assert error.value.body["error"]["code"] == "NATIVE_BINDING_INVALID"
 
 
-# ----- retention ----------------------------------------------------------------------------------------------------
-
-
 def test_versions_and_images_a_binding_row_references_never_appear_in_a_cleanup_list():
     store, _ = store_with(row("agent-a", "sid-a", "150", "145",
                               previous=[NativeBindingSession(hosted_session_id="sid-older", agent_version="120"),
@@ -335,9 +329,6 @@ def test_no_repository_script_deletes_a_version_or_an_image():
                 path = Path(directory) / name
                 if path.suffix in {".py", ".ps1", ".sh", ".bicep", ".yml", ".yaml"}:
                     assert pattern.search(path.read_text(encoding="utf-8", errors="replace")) is None, path
-
-
-# ----- CI wiring ----------------------------------------------------------------------------------------------------
 
 
 def load_ci():

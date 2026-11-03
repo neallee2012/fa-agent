@@ -1,4 +1,4 @@
-"""Real FA adapter, autospecced SDK 1.0.13 failures; no runtime or model I/O."""
+"""Real FA adapter, autospecced SDK 1.0.26 failures; no runtime or model I/O."""
 import asyncio
 import json
 import subprocess
@@ -16,6 +16,8 @@ from shared_context.behavior_assistant_boundary import AssistantModelBoundary
 from shared_context.behavior_assistant_hosted import AssistantClient, AssistantSession
 from shared_context.behavior_http_diagnostics import AssistantModelFailure
 from shared_context.errors import Problem
+from shared_context.sdk_pin import RUNTIME_VERSION
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 
 CANARY = "OFFLINE-PRIVATE-EXCEPTION-AND-TOKEN"
@@ -37,9 +39,10 @@ def adapter(tmp_path, monkeypatch):
     runtime = tmp_path / "not-a-runtime"
     runtime.write_bytes(b"OFFLINE non-executable path-validation fixture")
     session = create_autospec(CopilotSession, instance=True)
+    session.rpc = OFFLINE_SESSION_RPC
     session.session_id = SESSION
     client = create_autospec(CopilotClient, instance=True)
-    client.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+    client.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
     client.create_session.return_value = session
     client.resume_session.return_value = session
     process = SimpleNamespace(pid=4242, returncode=0, poll=lambda: 0, kill=lambda: None)  # #903: FA kills its own PID

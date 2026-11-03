@@ -32,7 +32,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
-from deployment_config import load_config  # noqa: E402
+from deployment_config import load_config
 
 API_VERSION = "2025-06-01"
 TARGET = "https://api.microsoft.ai/v3/mcp"

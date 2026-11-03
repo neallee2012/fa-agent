@@ -22,7 +22,7 @@ from test_native_capability_integration import (
 )
 from test_instruction_responses_native import response_bytes
 from test_native_turn_api import native_api
-from test_skill_catalog_budget_api import tokenizer  # noqa: F401
+from test_skill_catalog_budget_api import tokenizer
 
 
 RESOURCES = "fa-skill-resources-v1"

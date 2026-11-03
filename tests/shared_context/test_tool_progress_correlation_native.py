@@ -7,6 +7,7 @@ import json
 from shared_context import behavior_assistant_wire as aw
 from shared_context.behavior_assistant_boundary import AssistantModelBoundary
 from shared_context.m2_copilot import ToolOutput, ToolSpec, run_copilot
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_m2_copilot import ScriptedEndpoint, runtime_path, workspace
 
 
@@ -58,7 +59,7 @@ def test_native_public_pairs_hide_sdk_ids_and_tool_bodies(workspace, runtime_pat
     assert all(event.tool_name == "read_context" and event.status == "succeeded" for event in completed)
     assert all(event.source == source for event in completed)
     assert len(endpoint.requests) == len(reservations) == 2
-    assert result["sdk_stop"]["runtime_version"] == "1.0.83" and result["sdk_stop"]["graceful"]
+    assert result["sdk_stop"]["runtime_version"] == RUNTIME_VERSION and result["sdk_stop"]["graceful"]
     assert "PRIVATE_" not in json.dumps(result)
     assert "PRIVATE_" not in json.dumps(events)
     assert result["final_message"] == "OFFLINE public tool pairing complete"

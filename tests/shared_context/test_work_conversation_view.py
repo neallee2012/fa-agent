@@ -17,16 +17,16 @@ from shared_context.behavior_skill_copy import SopCopyOutcome
 from shared_context.behavior_skill_draft import SkillDraftOutcome
 from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
-from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
 from test_work_result_access import DIGEST, Reads
 
 RESET = {"reset_request_id": "a-reset", "archived_at": "2026-10-31T00:00:00+00:00"}
 
 
 @pytest.fixture
-def turn(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def turn(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     saved = saved_turn(c, "conversation-view")
     store = c.h.runtime.store

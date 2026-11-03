@@ -289,6 +289,18 @@ class _Forward:
         return self.inactive or self.stopped_without_result
 
 
+def _never_attempted(operation):
+    return (operation.current_attempt_id is None and not operation.unsettled_attempt_ids
+            and operation.effect_state == "unknown" and operation.business_state == "pending"
+            and operation.successful_result is None)
+
+
+def _settled_success(operation):
+    return (operation.effect_state == "applied" and operation.business_state == "succeeded"
+            and operation.current_attempt_id is not None and not operation.unsettled_attempt_ids
+            and operation.successful_result is not None and operation.successful_result.status == "completed")
+
+
 class WorkerCore:
     def __init__(
         self, store: BehaviorStore, contract: WorkerContract, *, adapter: ExecutorAdapter | None,
@@ -347,13 +359,7 @@ class WorkerCore:
         if self.mode != "native" or self.adapter is None or self.adapter.verify_readiness is None:
             raise Problem(403, "WORKER_NATIVE_DISABLED", "native deployment verifier is missing")
         proof = _check(self.adapter.verify_readiness(evidence_id), WorkerReadiness)
-        if (
-            proof.evidence_id != evidence_id or proof.configuration_digest != self.configuration_digest()
-            or proof.control_binding != self.contract.control_binding
-            or proof.protection_version != self.contract.protection_version
-            or (proof.executor_id, proof.executor_version) != (self.contract.executor_id, self.contract.executor_version)
-        ):
-            raise Problem(403, "WORKER_NATIVE_DISABLED", "independent native readiness binding differs")
+        self._require_independent_readiness(proof, evidence_id)
         key = worker_key("readiness", self.contract.workspace_id)
         pool_key = worker_key("pool", self.contract.workspace_id)
         prior_key = worker_key("readiness-evidence", evidence_id if supersedes is None else supersedes)
@@ -368,28 +374,9 @@ class WorkerCore:
             if not proof.observed_at <= self._now() < proof.expires_at:
                 raise Problem(403, "WORKER_NATIVE_DISABLED", "native readiness witness has expired")
             if supersedes is not None:
-                pool = self._pool(rows)
-                if pool.pending or pool.completions or any(
-                    slot.binding is not None or slot.lease_until is not None for slot in pool.slots
-                ):
-                    raise Problem(409, "WORKER_MIGRATION_NOT_DRAINED", "readiness replacement requires the migrated empty pool")
-                pointer, retained = rows[key], rows[prior_key]
-                if any(row is None or row.payload["binding"] != self.contract.control_binding for row in (pointer, retained)):
-                    raise Problem(409, "WORKER_READINESS_PREDECESSOR_INVALID", "exact retained predecessor is missing")
-                prior = _parse(pointer.payload["data"], WorkerReadiness)
-                if (
-                    prior.evidence_id != supersedes or prior.control_binding != self.contract.control_binding
-                    or prior.configuration_digest == proof.configuration_digest
-                    or _parse(retained.payload["data"], WorkerReadiness) != prior
-                    or _parse(retained.payload["material"], InlineMaterial) != _material(prior.model_dump(mode="json"))
-                ):
-                    raise Problem(409, "WORKER_READINESS_PREDECESSOR_INVALID", "readiness predecessor binding or material differs")
-                if prior.observed_at >= proof.observed_at:
-                    raise Problem(409, "WORKER_READINESS_STALE", "readiness cannot move backward")
+                self._supersede_readiness(rows, proof, supersedes, key, pool_key, prior_key)
             elif rows[key] is not None:
-                prior = self._row(rows, key, WorkerReadiness)
-                if prior.observed_at >= proof.observed_at:
-                    raise Problem(409, "WORKER_READINESS_STALE", "readiness cannot move backward")
+                self._require_newer_readiness(self._row(rows, key, WorkerReadiness), proof)
             return ControlChanges(writes=(
                 self._write(key, proof, rows),
                 self._write(worker_key("readiness-evidence", evidence_id), proof,
@@ -397,6 +384,39 @@ class WorkerCore:
             ), result=self._result(readiness_evidence_id=evidence_id))
 
         return self.store.transact(request, decide)
+
+    def _require_independent_readiness(self, proof, evidence_id):
+        if (
+            proof.evidence_id != evidence_id or proof.configuration_digest != self.configuration_digest()
+            or proof.control_binding != self.contract.control_binding
+            or proof.protection_version != self.contract.protection_version
+            or (proof.executor_id, proof.executor_version) != (self.contract.executor_id, self.contract.executor_version)
+        ):
+            raise Problem(403, "WORKER_NATIVE_DISABLED", "independent native readiness binding differs")
+
+    def _require_newer_readiness(self, prior, proof):
+        if prior.observed_at >= proof.observed_at:
+            raise Problem(409, "WORKER_READINESS_STALE", "readiness cannot move backward")
+
+    def _supersede_readiness(self, rows, proof, supersedes, key, pool_key, prior_key):
+        """A drained, migrated pool may replace exactly the retained predecessor readiness with newer evidence."""
+        pool = self._pool(rows)
+        if pool.pending or pool.completions or any(
+            slot.binding is not None or slot.lease_until is not None for slot in pool.slots
+        ):
+            raise Problem(409, "WORKER_MIGRATION_NOT_DRAINED", "readiness replacement requires the migrated empty pool")
+        pointer, retained = rows[key], rows[prior_key]
+        if any(row is None or row.payload["binding"] != self.contract.control_binding for row in (pointer, retained)):
+            raise Problem(409, "WORKER_READINESS_PREDECESSOR_INVALID", "exact retained predecessor is missing")
+        prior = _parse(pointer.payload["data"], WorkerReadiness)
+        if (
+            prior.evidence_id != supersedes or prior.control_binding != self.contract.control_binding
+            or prior.configuration_digest == proof.configuration_digest
+            or _parse(retained.payload["data"], WorkerReadiness) != prior
+            or _parse(retained.payload["material"], InlineMaterial) != _material(prior.model_dump(mode="json"))
+        ):
+            raise Problem(409, "WORKER_READINESS_PREDECESSOR_INVALID", "readiness predecessor binding or material differs")
+        self._require_newer_readiness(prior, proof)
 
     def _row(self, rows, key, model):
         row = rows[key]
@@ -598,54 +618,9 @@ class WorkerCore:
 
         def decide(rows):
             nonlocal fresh
-            self._owner(rows, context)
-            current = self._row(rows, job_key, JobRecord)
-            self._scope(current, context, exact=True)
-            pool, budget = self._pool(rows), self._row(rows, budget_key, BudgetRecord)
-            if (
-                current.state not in {"queued", "waiting_dependency"} or current.cancel_requested
-                or current.generation + 1 != generation or not instruction and generation > self.contract.max_generations
-                or current.spec != job.spec or current.checkpoint != dispatch.checkpoint
-                or current.children != job.children
-                or _parse(rows[job_key].payload["material"], InlineMaterial).data != dispatch.input
-            ):
-                raise Problem(409, "WORKER_START_FENCED", "job generation/input/checkpoint is no longer dispatchable")
-            if current.state == "waiting_dependency":
-                if current.checkpoint is None or any(
-                    self._row(rows, worker_key("job", child), JobRecord).state not in TERMINAL_STATES
-                    for child in current.children
-                ):
-                    raise Problem(409, "WORKER_CHILDREN_PENDING", "parent must stay parked until its children complete")
-            available = next((slot for slot in pool.slots if slot.binding is None), None)
-            if available is None:
-                raise Problem(429, "WORKER_CAPACITY_FULL", "all real executor slots remain reserved")
-            if (
-                budget.root_budget_id != context.root_budget_id or not budget.active
-                or not instruction and (budget.remaining_attempts < 1 or budget.remaining_units < self.contract.reservation_units)
-            ):
-                raise Problem(429, "WORKER_BUDGET_EXHAUSTED", "executor attempt budget is unavailable")
-            slots = tuple(
-                _update(slot, binding=binding, lease_until=self._now() + timedelta(seconds=self.contract.lease_seconds))
-                if slot.number == available.number else slot for slot in pool.slots
-            )
-            current = _update(
-                current, state="starting", generation=generation, binding=binding,
-                native_execution_id=None, last_sequence=0, last_evidence_id=None,
-                stop_credit=1, queries_reserved=0,
-            )
+            changes = self._start_changes(rows, job, context, dispatch, policy_observation, instruction, pool_key)
             fresh = True
-            extra=() if self.work_policy is None else self.work_policy.start_writes(rows,dispatch,policy_observation)
-            return ControlChanges(writes=(
-                self._write(job_key, current, rows),
-                self._write(pool_key, _update(pool, slots=slots), rows),
-                *(() if instruction else (self._write(budget_key, _update(
-                    budget, remaining_attempts=budget.remaining_attempts - 1,
-                    remaining_units=budget.remaining_units - self.contract.reservation_units,
-                ), rows),)),
-                self._write(worker_key("attempt", job_id, str(generation)), _Attempt(start=dispatch),
-                            material=_material(dispatch.model_dump(mode="json"))),
-                *extra,
-            ), result=self._result(status="starting", binding=binding.model_dump(mode="json")))
+            return changes
 
         receipt = (self.store.transact(request,decide) if self.work_policy is None else
                    self.work_policy.start_commit(job_id,policy_observation,lambda:self.store.transact(request,decide)))
@@ -661,6 +636,64 @@ class WorkerCore:
             raise Problem(503, "WORKER_START_UNKNOWN", "original executor start remains reserved; reconcile its binding",
                           request_id=request.request_id, request_digest=request.request_digest) from None
         return receipt if evidence_id is None else self.observe(job_id, evidence_id, context)
+
+    def _start_changes(self, rows, job, context, dispatch, policy_observation, instruction, pool_key):
+        """Reserve one executor slot and one attempt for a dispatchable job, or refuse why it cannot start."""
+        binding = dispatch.binding
+        job_id, generation = binding.job_id, binding.generation
+        job_key, budget_key = worker_key("job", job_id), control_key("budget", context.root_budget_id)
+        self._owner(rows, context)
+        current = self._row(rows, job_key, JobRecord)
+        self._scope(current, context, exact=True)
+        pool, budget = self._pool(rows), self._row(rows, budget_key, BudgetRecord)
+        self._require_dispatchable(rows, current, job, dispatch, instruction)
+        available = next((slot for slot in pool.slots if slot.binding is None), None)
+        if available is None:
+            raise Problem(429, "WORKER_CAPACITY_FULL", "all real executor slots remain reserved")
+        if (
+            budget.root_budget_id != context.root_budget_id or not budget.active
+            or not instruction and (budget.remaining_attempts < 1 or budget.remaining_units < self.contract.reservation_units)
+        ):
+            raise Problem(429, "WORKER_BUDGET_EXHAUSTED", "executor attempt budget is unavailable")
+        slots = tuple(
+            _update(slot, binding=binding, lease_until=self._now() + timedelta(seconds=self.contract.lease_seconds))
+            if slot.number == available.number else slot for slot in pool.slots
+        )
+        current = _update(
+            current, state="starting", generation=generation, binding=binding,
+            native_execution_id=None, last_sequence=0, last_evidence_id=None,
+            stop_credit=1, queries_reserved=0,
+        )
+        extra=() if self.work_policy is None else self.work_policy.start_writes(rows,dispatch,policy_observation)
+        return ControlChanges(writes=(
+            self._write(job_key, current, rows),
+            self._write(pool_key, _update(pool, slots=slots), rows),
+            *(() if instruction else (self._write(budget_key, _update(
+                budget, remaining_attempts=budget.remaining_attempts - 1,
+                remaining_units=budget.remaining_units - self.contract.reservation_units,
+            ), rows),)),
+            self._write(worker_key("attempt", job_id, str(generation)), _Attempt(start=dispatch),
+                        material=_material(dispatch.model_dump(mode="json"))),
+            *extra,
+        ), result=self._result(status="starting", binding=binding.model_dump(mode="json")))
+
+    def _require_dispatchable(self, rows, current, job, dispatch, instruction):
+        """The job is still exactly what was read when this start was planned, and a parked parent's children are done."""
+        generation = dispatch.binding.generation
+        if (
+            current.state not in {"queued", "waiting_dependency"} or current.cancel_requested
+            or current.generation + 1 != generation or not instruction and generation > self.contract.max_generations
+            or current.spec != job.spec or current.checkpoint != dispatch.checkpoint
+            or current.children != job.children
+            or _parse(rows[worker_key("job", dispatch.binding.job_id)].payload["material"], InlineMaterial).data != dispatch.input
+        ):
+            raise Problem(409, "WORKER_START_FENCED", "job generation/input/checkpoint is no longer dispatchable")
+        if current.state == "waiting_dependency":
+            if current.checkpoint is None or any(
+                self._row(rows, worker_key("job", child), JobRecord).state not in TERMINAL_STATES
+                for child in current.children
+            ):
+                raise Problem(409, "WORKER_CHILDREN_PENDING", "parent must stay parked until its children complete")
 
     def observe(self, job_id: str, evidence_id: str, context: ExecutionContext) -> Record:
         if self.adapter is None:
@@ -681,16 +714,7 @@ class WorkerCore:
         """Pure writes shared with the trusted atomic original-stop closure."""
         evidence_id = proof.evidence_id
         job_key, pool_key = worker_key("job", job_id), self.pool_key(job_id)
-        attempt_key = worker_key("attempt", job_id, str(proof.binding.generation))
-        self._owner(rows, context, policy=False)
-        job = self._row(rows, job_key, JobRecord)
-        self._scope(job, context)
-        attempt = self._row(rows, attempt_key, _Attempt)
-        if (
-            attempt.start.binding != proof.binding
-            or _parse(rows[attempt_key].payload["material"], InlineMaterial) != _material(attempt.start.model_dump(mode="json"))
-        ):
-            raise Problem(403, "WORKER_EVIDENCE_DENIED", "native attempt/input/checkpoint/owner binding differs")
+        job = self._observed_job(rows, job_id, proof, context)
         material = _material(proof.model_dump(mode="json"))
         writes = [self._write(worker_key("evidence", evidence_id), proof, material=material)]
         late = proof.binding != job.binding or job.state in TERMINAL_STATES or job.state == "waiting_dependency"
@@ -708,55 +732,85 @@ class WorkerCore:
             "last_evidence_id": evidence_id, "last_sequence": proof.sequence,
         }
         if idle:
-            if proof.state == "parked":
-                assistant_checkpoint = False
-                if not job.children:
-                    from .behavior_assistant_wire import Checkpoint, Task
-                    try:
-                        task = Task.model_validate_json(job.spec.input)
-                        checkpoint = Checkpoint.model_validate_json(proof.checkpoint)
-                        assistant_checkpoint = (
-                            task.job_id == job.spec.job_id and task.work_id == job.spec.work_id
-                            and checkpoint.task_digest == _digest(task.model_dump(mode="json"))
-                        )
-                    except ValueError:
-                        pass
-                if not (job.children or assistant_checkpoint) or job.control_remaining==0:
-                    raise Problem(409, "WORKER_PARK_DENIED", "yield requires registered children and a control reservation")
-                updates.update(state="waiting_dependency", checkpoint=proof.checkpoint,
-                               control_remaining=None if job.control_remaining is None else job.control_remaining-1)
-            else:
-                if not job.completion_credit:
-                    raise Problem(409, "WORKER_COMPLETION_EXHAUSTED", "completion reservation is missing")
-                updates.update(
-                    state="cancelled" if proof.state == "stopped" else proof.state, completion_credit=0,
-                )
-                writes.append(self._write(worker_key("completion", job_id, str(job.generation)), proof, material=material))
-                if proof.result is not None:
-                    writes.append(self._write(
-                        worker_key("work-result", proof.result.evidence_id), proof.result,
-                        material=_material(proof.result.model_dump(mode="json")),
-                    ))
-            slots = tuple(_update(slot, binding=None, lease_until=None) if slot.binding == proof.binding else slot for slot in pool.slots)
-            pending = pool.pending if proof.state == "parked" else tuple(value for value in pool.pending if value != job_id)
-            completions = (
-                (*pool.completions, job_id)
-                if proof.state != "parked" and job.spec.obligation_id is not None else pool.completions
-            )
-            writes.append(self._write(pool_key, _update(pool, slots=slots, pending=pending, completions=completions), rows))
+            idle_updates, idle_writes = self._idle_outcome(job, job_id, proof, material)
+            updates.update(idle_updates)
+            writes.extend(idle_writes)
+            writes.append(self._write(pool_key, self._pool_after_idle(pool, job, job_id, proof), rows))
         else:
-            if job.control_remaining==0:
-                raise Problem(429, "WORKER_CONTROL_EXHAUSTED", "nonterminal observation budget is exhausted; slot stays reserved")
-            updates.update(
-                state="running" if proof.state == "running" else "capacity_uncertain",
-                control_remaining=None if job.control_remaining is None else job.control_remaining-1,
-            )
+            updates.update(self._active_updates(job, proof))
         job = _update(job, **updates)
         writes.append(self._write(job_key, job, rows))
         return ControlChanges(writes=tuple(writes), result=self._result(
             status=job.state, job_id=job_id, cancel_requested=job.cancel_requested,
             completion_evidence_id=evidence_id if job.state in TERMINAL_STATES else None,
         ))
+
+    def _observed_job(self, rows, job_id, proof, context):
+        """The job this evidence belongs to, once its owner, scope and original attempt all match."""
+        job_key = worker_key("job", job_id)
+        attempt_key = worker_key("attempt", job_id, str(proof.binding.generation))
+        self._owner(rows, context, policy=False)
+        job = self._row(rows, job_key, JobRecord)
+        self._scope(job, context)
+        attempt = self._row(rows, attempt_key, _Attempt)
+        if (
+            attempt.start.binding != proof.binding
+            or _parse(rows[attempt_key].payload["material"], InlineMaterial) != _material(attempt.start.model_dump(mode="json"))
+        ):
+            raise Problem(403, "WORKER_EVIDENCE_DENIED", "native attempt/input/checkpoint/owner binding differs")
+        return job
+
+    def _idle_outcome(self, job, job_id, proof, material):
+        """What an idle executor report changes on the job, and the completion records it retains."""
+        if proof.state == "parked":
+            return self._parked_updates(job, proof), []
+        if not job.completion_credit:
+            raise Problem(409, "WORKER_COMPLETION_EXHAUSTED", "completion reservation is missing")
+        updates = {"state": "cancelled" if proof.state == "stopped" else proof.state, "completion_credit": 0}
+        return updates, self._completion_writes(job_id, job, proof, material)
+
+    def _parked_updates(self, job, proof):
+        assistant_checkpoint = False
+        if not job.children:
+            from .behavior_assistant_wire import Checkpoint, Task
+            try:
+                task = Task.model_validate_json(job.spec.input)
+                checkpoint = Checkpoint.model_validate_json(proof.checkpoint)
+                assistant_checkpoint = (
+                    task.job_id == job.spec.job_id and task.work_id == job.spec.work_id
+                    and checkpoint.task_digest == _digest(task.model_dump(mode="json"))
+                )
+            except ValueError:
+                pass
+        if not (job.children or assistant_checkpoint) or job.control_remaining==0:
+            raise Problem(409, "WORKER_PARK_DENIED", "yield requires registered children and a control reservation")
+        return {"state": "waiting_dependency", "checkpoint": proof.checkpoint,
+                "control_remaining": None if job.control_remaining is None else job.control_remaining-1}
+
+    def _completion_writes(self, job_id, job, proof, material):
+        writes = [self._write(worker_key("completion", job_id, str(job.generation)), proof, material=material)]
+        if proof.result is not None:
+            writes.append(self._write(
+                worker_key("work-result", proof.result.evidence_id), proof.result,
+                material=_material(proof.result.model_dump(mode="json")),
+            ))
+        return writes
+
+    def _pool_after_idle(self, pool, job, job_id, proof):
+        """The pool once the executor went idle: its permit is released, and a finished job leaves pending."""
+        slots = tuple(_update(slot, binding=None, lease_until=None) if slot.binding == proof.binding else slot for slot in pool.slots)
+        pending = pool.pending if proof.state == "parked" else tuple(value for value in pool.pending if value != job_id)
+        completions = (
+            (*pool.completions, job_id)
+            if proof.state != "parked" and job.spec.obligation_id is not None else pool.completions
+        )
+        return _update(pool, slots=slots, pending=pending, completions=completions)
+
+    def _active_updates(self, job, proof):
+        if job.control_remaining==0:
+            raise Problem(429, "WORKER_CONTROL_EXHAUSTED", "nonterminal observation budget is exhausted; slot stays reserved")
+        return {"state": "running" if proof.state == "running" else "capacity_uncertain",
+                "control_remaining": None if job.control_remaining is None else job.control_remaining-1}
 
     def reconcile(self, job_id: str, context: ExecutionContext) -> Record:
         if self.adapter is None:
@@ -981,28 +1035,29 @@ class WorkerCore:
             if row.payload["data"].get("kind") != "operation":
                 unresolved.append(operation_id)
                 continue
-            operation = self._row(rows, key, _Operation)
-            if (operation.operation_id != operation_id or operation.owner_record_id != context.owner_record_id
-                    or operation.conversation_id != context.conversation_id or operation.root_budget_id != context.root_budget_id):
-                raise Problem(403, "WORKER_OPERATION_FENCED", "retained operation belongs to a different scope")
-            material = _parse(row.payload["material"], InlineMaterial)
-            if material.sha256 != operation.description_digest:
-                raise Problem(409, "WORKER_OPERATION_FENCED", "retained operation description differs")
-            try:
-                OperationDescription.model_validate_json(material.data)
-            except (ValueError, TypeError):
-                raise Problem(409, "WORKER_OPERATION_FENCED", "retained operation description is invalid") from None
-            if (operation.current_attempt_id is None and not operation.unsettled_attempt_ids
-                    and operation.effect_state == "unknown" and operation.business_state == "pending"
-                    and operation.successful_result is None):
+            operation = self._retained_operation(rows, key, row, operation_id, context)
+            if _never_attempted(operation):
                 continue
             if operation.effect_state == "applied":
                 known.append(operation_id)
-            if not (operation.effect_state == "applied" and operation.business_state == "succeeded"
-                    and operation.current_attempt_id is not None and not operation.unsettled_attempt_ids
-                    and operation.successful_result is not None and operation.successful_result.status == "completed"):
+            if not _settled_success(operation):
                 unresolved.append(operation_id)
         return tuple(known), tuple(unresolved)
+
+    def _retained_operation(self, rows, key, row, operation_id, context):
+        """A retained operation record that belongs to this scope and still carries its valid description."""
+        operation = self._row(rows, key, _Operation)
+        if (operation.operation_id != operation_id or operation.owner_record_id != context.owner_record_id
+                or operation.conversation_id != context.conversation_id or operation.root_budget_id != context.root_budget_id):
+            raise Problem(403, "WORKER_OPERATION_FENCED", "retained operation belongs to a different scope")
+        material = _parse(row.payload["material"], InlineMaterial)
+        if material.sha256 != operation.description_digest:
+            raise Problem(409, "WORKER_OPERATION_FENCED", "retained operation description differs")
+        try:
+            OperationDescription.model_validate_json(material.data)
+        except (ValueError, TypeError):
+            raise Problem(409, "WORKER_OPERATION_FENCED", "retained operation description is invalid") from None
+        return operation
 
     def forward_result(self, job_id: str, context: ExecutionContext, delivery: DeliveryCore) -> Record:
         """Consume the durable completion inbox using saved verified bytes only.

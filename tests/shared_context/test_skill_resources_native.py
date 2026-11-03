@@ -14,6 +14,7 @@ from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_skill_resources_prompt import SKILL_RESOURCES_CAPABILITIES
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
@@ -78,6 +79,6 @@ def test_fixed_sdk_loads_manifest_then_exact_resource_without_new_authority(assi
         accepted, _ = submit(h, "resource-native", "Read the approved resource-guide and its reference data.")
         assert h.runtime.controller.step(accepted["binding_id"]).state == "succeeded"
         assert len(calls) == 3 and len(bridges) == 1
-        assert bridges[0]._sdk_stop.graceful and bridges[0]._sdk_stop.runtime_version == "1.0.83"
+        assert bridges[0]._sdk_stop.graceful and bridges[0]._sdk_stop.runtime_version == RUNTIME_VERSION
         archive = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
         assert archive.prompt_assembly.declared_capabilities == SKILL_RESOURCES_CAPABILITIES

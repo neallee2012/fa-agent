@@ -1,4 +1,4 @@
-"""B1 PA-08: images a human attaches to a native turn; offline stores and the pinned SDK 1.0.13 / runtime 1.0.83."""
+"""B1 PA-08: images a human attaches to a native turn; offline stores and the pinned SDK 1.0.26 / runtime 1.0.103."""
 
 import asyncio
 import base64
@@ -15,10 +15,11 @@ from shared_context.behavior_user_images import (
     NativeUserImageStored, NativeUserImageUpload, UserImage, canonical_png, stored,
 )
 from shared_context.errors import Problem
-from test_m2_copilot import runtime_path, workspace  # noqa: F401
-from assistant_sdk_fixture import sdk_assistant  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_turns import local_env  # noqa: F401
+from shared_context.sdk_pin import RUNTIME_VERSION
+from test_m2_copilot import runtime_path, workspace
+from assistant_sdk_fixture import sdk_assistant
+from test_m3_auth import jwk_client, signing_key
+from test_native_turns import local_env
 
 
 def png(width=2, height=2, seed=0):
@@ -189,7 +190,7 @@ def _native_case(local_env, monkeypatch, tmp_path, state_padding=0):
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "Seen.", "sdk_stop": {"pid": 1, "exit_code": 0, "graceful": True,
-                                                        "runtime_version": "1.0.83"}}
+                                                        "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -221,7 +222,7 @@ def test_a_native_turn_needs_its_uploaded_images_and_hands_them_to_the_sdk(local
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "Seen.", "sdk_stop": {"pid": 1, "exit_code": 0, "graceful": True,
-                                                        "runtime_version": "1.0.83"}}
+                                                        "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

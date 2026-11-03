@@ -22,11 +22,13 @@ from shared_context.storage import MAX_PAYLOAD_BYTES, serialize
 HUMAN = HumanApprover("dddddddd-dddd-dddd-dddd-dddddddddddd", A.team)
 SETTINGS = ApprovalSettings(HUMAN.oid, "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", A.team)
 V1, V2, V3 = "1" * 32, "2" * 32, "3" * 32
+# The one blob write upload(service) makes: team, artifact, version, bytes, sha256.
+V1_PUT = (A.team, "report", V1, b"report v1\n", hashlib.sha256(b"report v1\n").hexdigest())
 
 
 @pytest.fixture
 def m3(system):
-    context, repository, _, _ = system
+    context, repository, _ = system
     context.create(A, A.team, "source-work", CreateWork(goal="Synthetic M3 source"))
     store = InMemoryArtifactStore(TENANT)
     return ArtifactService(context, store, SETTINGS), repository, store
@@ -175,13 +177,13 @@ def test_unknown_blob_write_is_reconciled_without_resending_bytes(m3):
         with pytest.raises(Problem) as exc:
             upload(service)
         assert code(exc) == "M3_UPLOAD_UNKNOWN"
-        put.assert_called_once()
+        put.assert_called_once_with(*V1_PUT)
         with pytest.raises(Problem):
             service.download(HUMAN, A.team, "report", V1, '"anything"')
         completed = service.reconcile(A, A.team, "report", V1, pending.etag)
         assert completed.payload["pending"] is None
         assert completed.payload["versions"][0]["blob"]["sha256"] == hashlib.sha256(b"report v1\n").hexdigest()
-        put.assert_called_once()
+        put.assert_called_once_with(*V1_PUT)
 
 
 def test_unknown_final_table_commit_recovers_by_reading_completed_receipt(m3):
@@ -199,7 +201,7 @@ def test_unknown_final_table_commit_recovers_by_reading_completed_receipt(m3):
         with pytest.raises(Problem):
             upload(service)
         assert upload(service).payload["versions"][0]["version_id"] == V1
-        put.assert_called_once()
+        put.assert_called_once_with(*V1_PUT)
 
 
 def test_failed_reservation_does_not_upload_or_overwrite(m3):
@@ -222,7 +224,7 @@ def test_unknown_upload_without_a_blob_stays_blocked_without_resend(m3):
             service.reconcile(A, A.team, "report", V1, pending.etag)
         with pytest.raises(Problem):
             upload(service)
-        put.assert_called_once()
+        put.assert_called_once_with(*V1_PUT)
     assert service.get(A, A.team, "report") == pending
 
 
@@ -253,8 +255,9 @@ def test_concurrent_proposals_do_not_create_two_blobs(m3):
     with patch.object(store, "put", wraps=store.put) as put, ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(attempt, (V1, V2)))
     assert results.count("accepted") == 1
-    put.assert_called_once()
-    assert len(service.get(A, A.team, "report").payload["versions"]) == 1
+    versions = service.get(A, A.team, "report").payload["versions"]
+    assert len(versions) == 1
+    put.assert_called_once_with(A.team, "report", versions[0]["version_id"], *V1_PUT[3:])
 
 
 def test_approval_cas_cannot_activate_a_superseded_snapshot(m3):

@@ -14,9 +14,11 @@ from copilot.session import CopilotSession
 from shared_context import behavior_assistant_progress, live_text, m2_copilot
 from shared_context.behavior_assistant_boundary import AssistantModelBoundary
 from shared_context.behavior_capability_prompt import CapabilitySession
-from shared_context.behavior_sdk_files import SdkSessionFiles
 from shared_context.m2_copilot import ToolFailure, ToolOutput, ToolSpec
 from shared_context.native_hitl_wire import native_hitl_failure_feedback
+from test_run_copilot_lifecycle import session_files
+from shared_context.sdk_pin import RUNTIME_VERSION
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 SID = "handler-contract"
 PNG = "iVBORw0KGgo="
@@ -107,10 +109,11 @@ async def current_work():
 @pytest.fixture
 def harness(tmp_path, monkeypatch):
     session = create_autospec(CopilotSession, instance=True)
+    session.rpc = OFFLINE_SESSION_RPC
     session.session_id = SID
     session.get_events.return_value = []
     client = create_autospec(CopilotClient, instance=True)
-    client.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+    client.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
     client._cli_process = SimpleNamespace(pid=7, returncode=0, poll=lambda: 0, kill=lambda: None)
     monkeypatch.setattr(m2_copilot, "CopilotClient", create_autospec(CopilotClient, return_value=client))
     monkeypatch.setattr(AssistantModelBoundary, "tool_result", lambda _self, name, text: f"{name}: {text}")
@@ -272,9 +275,7 @@ def test_mcp_call_failing_a_fixed_check_is_refused_with_its_own_feedback(harness
 ])
 @pytest.mark.parametrize("request_", [mcp_request(), custom_request("snap", args={})], ids=["mcp", "custom"])
 def test_call_with_no_state_room_is_refused_with_the_reason(harness, room, feedback, request_):
-    files = create_autospec(SdkSessionFiles, instance=True)
-    files.session_id, files.restored, files.model_provider = SID, False, None
-    files.checkpoint_profile, files.automatic = None, False
+    files = session_files(session_id=SID)  # sets the per-turn attributes an autospec cannot see
     files.reserve_large_result.return_value = room
     assembly = Assembly()
     decision, _ = harness.run(permission(request_), session_files=files, native_assembly=assembly)

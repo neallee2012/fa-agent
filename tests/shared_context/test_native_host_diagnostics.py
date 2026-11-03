@@ -7,6 +7,10 @@ from shared_context.behavior_native_turn_wire import NativeRead, NATIVE_STATE_PR
 from shared_context.behavior_http_diagnostics import native_correlation_id
 from test_native_turns import harness, local_env, native_retry_policy, IDENTITY, accept_without_chain
 
+# This line leaves the container and the export filter never reads its JSON: a new field is a decision, not a side effect.
+NATIVE_HTTP_FIELDS = {"action", "agent_id", "agent_version", "code", "elapsed_ms", "exception_type", "invocation_id",
+                      "operation", "phase", "request_id_sha256", "session_id", "status"}
+
 
 def events(caplog, prefix):
     return [json.loads(record.getMessage().removeprefix(prefix + " "))
@@ -59,6 +63,7 @@ def test_successful_read_logs_only_metadata_and_keeps_original_receipt(harness, 
     assert response.status_code == 200 and response.json() == accepted.value.receipt.model_dump(mode="json")
     start, finish = events(caplog, "FA_NATIVE_HTTP")
     assert finish["status"] == 200 and finish["code"] is None and finish["phase"] == "returned"
+    assert set(start) == set(finish) == NATIVE_HTTP_FIELDS
     captured = json.dumps((start, finish))
     assert accepted.value.receipt.command.content not in captured
     assert accepted.value.receipt.capture.role_prompt.text not in captured
@@ -73,7 +78,7 @@ def test_unhandled_exception_is_categorized_and_still_reaches_sdk_error_path(har
     assert response.status_code == 500
     start, failure = events(caplog, "FA_NATIVE_HTTP")
     assert failure["phase"] == "raised" and failure["status"] is None
-    assert failure["exception_type"] == "ValueError"
+    assert failure["exception_type"] == "ValueError" and set(failure) == NATIVE_HTTP_FIELDS
     assert "private exception" not in json.dumps((start, failure))
     assert not harness.sdk.calls
 

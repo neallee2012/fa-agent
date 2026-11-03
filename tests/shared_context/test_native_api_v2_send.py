@@ -16,11 +16,11 @@ from shared_context.behavior_native_turn_api import NativeTurnGateway
 from shared_context.behavior_native_turn_wire import NATIVE_TURN_HEADER, NativeConversation
 from shared_context.native_continuation_wire import NativeContinuation
 from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_V2_PROFILE, UNLABELED_STATE_PROFILE
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_routine_api import daily_definition, routine_api  # noqa: F401
-from test_native_turn_api import native_api, submit  # noqa: F401
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
+from test_native_routine_api import daily_definition, routine_api
+from test_native_turn_api import native_api, submit
 from test_native_turn_wire import agent_receive, capture
 
 AGENT = "11111111-1111-1111-1111-111111111111"
@@ -111,7 +111,7 @@ def _owner_requests(case):
 
 
 @pytest.mark.parametrize("label", [V1, V2])
-def test_an_owner_follow_up_into_a_v1_or_v2_conversation_is_sent_as_v2(native_api, monkeypatch, label):  # noqa: F811
+def test_an_owner_follow_up_into_a_v1_or_v2_conversation_is_sent_as_v2(native_api, monkeypatch, label):
     case = native_api
     assert submit(case).status_code == 202
     case.remote.completed("native-rid")
@@ -125,7 +125,7 @@ def test_an_owner_follow_up_into_a_v1_or_v2_conversation_is_sent_as_v2(native_ap
 
 
 @pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
-def test_a_routine_into_a_v2_labelled_conversation_is_sent_as_v2(routine_api, monkeypatch):  # noqa: F811
+def test_a_routine_into_a_v2_labelled_conversation_is_sent_as_v2(routine_api, monkeypatch):
     case = routine_api
     due = case.c.h.time.replace(second=0, microsecond=0) + timedelta(minutes=1)
     saved = case.client.post(case.routine_prefix + "/definitions", headers=case.headers, json=daily_definition(
@@ -139,9 +139,10 @@ def test_a_routine_into_a_v2_labelled_conversation_is_sent_as_v2(routine_api, mo
     assert len(sent) == 1 and sent[0][0] == V2 and json.loads(sent[0][1])["state_profile"] == V2
 
 
-@pytest.mark.parametrize("value, enabled", [(None, False), (V1, True), (V2, True), ("foundry-native-v3", None)])
+@pytest.mark.parametrize("value, enabled", [(None, False), (V1, None), (V2, True), ("foundry-native-v3", True),
+                                            ("foundry-native-v4", None)])
 def test_the_apis_own_fa_native_turns_only_switches_native_on(monkeypatch, value, enabled):
-    """2d-ii: the API's FA_NATIVE_TURNS (still the v1 string in the profiles) is a switch; it sends v2 either way."""
+    """2d-ii: the API's FA_NATIVE_TURNS is a switch; it sends v2. ADR-0009 M1: the v1 alias is retired, so v1 stops it."""
     from shared_context.behavior_native_turn_api import configured_native_turns
     from shared_context.errors import Problem
 
@@ -188,10 +189,10 @@ def _crashed_admission(case, monkeypatch):
     return admitting, digests
 
 
-def test_a_v1_admission_a_crashed_hosted_left_is_admitted_under_its_digest_on_resend(native_api, monkeypatch):  # noqa: F811
-    """The API before 2d-ii sent v1; Hosted marked ``admitting`` and crashed before ``rid:<RID>``. The 2d-ii API's
-    same-RID resend (v2) conflicts with that digest, so it resends the same material labelled v1 once: 202, receipt
-    under the original digest, and the RID is admitted once."""
+def test_a_v1_admission_a_crashed_hosted_left_stays_a_conflict_on_resend(native_api, monkeypatch):
+    """The API before 2d-ii sent v1; Hosted marked ``admitting`` and crashed before ``rid:<RID>``. The same-RID
+    resend (v2) conflicts with that digest. ADR-0009 M1 retired the v1 alias and its one-time v1 resend, so the 409
+    stands and nothing else is sent."""
     from shared_context import behavior_native_responses_api as responses
 
     case = native_api
@@ -201,34 +202,16 @@ def test_a_v1_admission_a_crashed_hosted_left_is_admitted_under_its_digest_on_re
     assert submit(case).status_code == 503
     monkeypatch.setattr(responses, "turn_profile", real)
     again = submit(case)
-    assert again.status_code == 202, again.text
-    assert again.json()["submit_digest"] == admitting["native-rid"] and again.json()["state_profile"] == V1
-    assert len(digests) == 3 and digests[1] != digests[0] == digests[2]  # v1 (crash), v2 (409), v1 again
+    assert again.status_code == 409, again.text
+    assert again.json()["error"]["code"] == "NATIVE_RID_CONFLICT"
+    assert len(digests) == 2 and digests[1] != digests[0] == admitting["native-rid"]  # v1 (crash), v2 (409)
 
 
-@pytest.mark.parametrize("status, code", [(503, "NATIVE_STATE_STORE_UNKNOWN"), (504, "NATIVE_UPSTREAM_TIMEOUT")])
-def test_an_unknown_answer_to_the_v1_resend_is_not_reported_as_a_conflict(monkeypatch, status, code):
-    """AGENTS rule 7: only a second NATIVE_RID_CONFLICT says "not accepted"; a 503 or timeout stays retryable."""
-    from shared_context.errors import Problem
-
-    answers = [Problem(409, "NATIVE_RID_CONFLICT", "v2 digest"), Problem(status, code, "unknown")]
-
-    def invoke(client, request):
-        raise answers.pop(0)
-
-    monkeypatch.setattr(NativeTurnGateway, "_invoke", staticmethod(invoke))
-    client = SimpleNamespace(target=SimpleNamespace(agent_id=AGENT))
-    with pytest.raises(Problem) as raised:
-        submit_native_turn(SimpleNamespace(runtime=None), client,
-                           InstructionSubmit(request_id="native-rid", content="Original text"), capture())
-    assert (raised.value.status, raised.value.body["error"]["code"]) == (status, code) and answers == []
-
-
-def test_a_resend_with_different_material_still_conflicts_and_is_tried_once(native_api, monkeypatch):  # noqa: F811
+def test_a_resend_with_different_material_still_conflicts_and_is_tried_once(native_api, monkeypatch):
     case = native_api
     _, digests = _crashed_admission(case, monkeypatch)
     assert submit(case).status_code == 503
     from test_native_turn_api import PREFIX
     body = InstructionSubmit(request_id="native-rid", content="Other user text").model_dump(mode="json")
     changed = case.client.post(PREFIX + "/submit", json=body, headers=case.headers)
-    assert changed.status_code == 409 and len(digests) == 3  # the v2 resend and one v1 resend, both refused
+    assert changed.status_code == 409 and len(digests) == 2  # the v2 resend only, refused

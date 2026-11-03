@@ -38,7 +38,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scrub_export import GUID_RE, Scrubber, decode_text, guid_sha256, is_excluded  # noqa: E402
+from scrub_export import GUID_RE, Scrubber, decode_text, guid_sha256, is_excluded
 
 SWEEPS = {
     "subscription-id": re.compile(r"/subscriptions/([^/\s\"'`)<>{}$]+)"),

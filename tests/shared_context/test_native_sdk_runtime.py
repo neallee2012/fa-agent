@@ -17,6 +17,7 @@ from shared_context.behavior_native_turn_wire import NativeResult, NativeSubmit,
 from shared_context.native_checkpoint import open_durable_store, verify_checkpoint, conversation_store_name
 from shared_context.native_sdk import NativeSdkExecutor
 from shared_context.native_turns import NativeTurnRuntime
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_m2_copilot import runtime_path
 from test_native_turn_wire import agent_receive, capture, submit
 from test_native_turns import IDENTITY
@@ -129,7 +130,7 @@ def test_pinned_sdk_executes_one_native_completions_turn_and_saves_original_resu
 
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
         accepted = client.post("/invocations", json=request.model_dump(mode="json"), headers={
-            "x-client-fa-state-profile": "foundry-native-v1", "x-agent-session-id": IDENTITY.session_id,
+            "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
             "x-agent-invocation-id": "OFFLINE-native-platform", "x-agent-foundry-call-id": "OFFLINE-native-call",
         })
         assert accepted.status_code == 202, accepted.text
@@ -163,7 +164,7 @@ def test_pinned_sdk_executes_one_native_completions_turn_and_saves_original_resu
             other = NativeSubmit(command=submit(rid="rid-2", text="Second conversation question.").command,
                                  capture=selected)
             assert client.post("/invocations", json=other.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v1", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-native-platform-2", "x-agent-foundry-call-id": "OFFLINE-native-call-2",
             }).status_code == 202
 
@@ -185,7 +186,7 @@ def test_pinned_sdk_executes_one_native_completions_turn_and_saves_original_resu
             requests.pop()
     assert len(requests) == len(stops if agent_input else stops[:1]) == 1
     # ADR-0005: an idle native turn keeps its SDK; the checkpoint above was saved from the live runtime's files.
-    assert stops[0].runtime_version == "1.0.83" and stops[0].release == "fa-resident-worker-poc-v1"
+    assert stops[0].runtime_version == RUNTIME_VERSION and stops[0].release == "fa-resident-worker-poc-v1"
     assert stops[0].exit_code is None
     proof = {
         "sdk": importlib.metadata.version("github-copilot-sdk"), "runtime": stops[0].runtime_version,
@@ -269,7 +270,7 @@ def test_pinned_sdk_resume_replaces_the_previous_role_in_the_same_conversation(m
         def post(rid, cid, text, chosen):
             request = NativeSubmit(command=submit(rid=rid, cid=cid, text=text).command, capture=chosen)
             return client.post("/invocations", json=request.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v1", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-" + rid, "x-agent-foundry-call-id": "OFFLINE-call-" + rid,
             })
 
@@ -381,7 +382,7 @@ def test_pinned_sdk_sends_agent_role_v2_with_native_tools_and_the_role_text_last
         for rid, text in (("rid-role", "ROLE-ALPHA keeps answers short."), ("rid-plain", None)):
             request = NativeSubmit(command=submit(rid=rid, text="Hello.").command, capture=selection(text))
             assert client.post("/invocations", json=request.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v1", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-" + rid, "x-agent-foundry-call-id": "OFFLINE-call-" + rid,
             }).status_code == 202
 
@@ -488,7 +489,7 @@ def test_pinned_sdk_carries_the_first_turns_static_profile_only_in_history(monke
         def turn(rid, cid, text):
             request = NativeSubmit(command=submit(rid=rid, cid=cid, text=text).command, capture=chosen)
             assert client.post("/invocations", json=request.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v1", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-" + rid, "x-agent-foundry-call-id": "OFFLINE-call-" + rid,
             }).status_code == 202
 

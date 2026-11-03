@@ -13,11 +13,13 @@ from shared_context.native_hitl_wire import (
     NativeHitlAnswer, NativeHitlCall, NativeHitlEnd, NativeHitlPendingQuery, NativeHitlQuestion,
     NativeHitlQuestionCreate, NativeHitlQuestionReadback, NativeHitlTurn,
 )
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_hitl import create_pending, decision, error, hitl, inventory, post  # noqa: F401
+from shared_context.sdk_pin import RUNTIME_VERSION
+from test_m3_auth import jwk_client, signing_key
+from test_native_hitl import create_pending, decision, error, hitl, inventory, post
 from test_native_hitl_h2 import SID, setup_gate
-from test_native_responses import responses  # noqa: F401
-from test_native_turns import local_env  # noqa: F401
+from test_native_responses import responses
+from test_native_turns import local_env
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 PREFIX = "/native-hitl/v1"
 
@@ -289,11 +291,12 @@ def _lane_sdk(monkeypatch, asked):
         exited = Event()
         client._cli_process = SimpleNamespace(pid=999, poll=lambda: 0 if exited.is_set() else None, returncode=0)
         client.stop.side_effect = exited.set
-        client.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+        client.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
 
         async def create(**options):
             sid = options["session_id"]
             session = create_autospec(CopilotSession, instance=True)
+            session.rpc = OFFLINE_SESSION_RPC
             session.session_id = sid
             session.get_events.return_value = []
             handlers = []

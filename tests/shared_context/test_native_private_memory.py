@@ -21,6 +21,7 @@ from shared_context.native_agent_tools import NativeAgentRelayClient
 from shared_context.native_checkpoint import open_durable_store
 from shared_context.native_private_memory import NativePrivateMemory
 from shared_context.native_turns import EFFECTS_STORE
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_turn_wire import receipt_for, submit
 from test_native_turns import IDENTITY, local_env
 
@@ -61,7 +62,7 @@ async def sdk(**options):
         "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
     })
     return {"final_message": "OFFLINE answer",
-            "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+            "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
 
 def test_an_unexpected_private_memory_failure_never_raises(local_env, monkeypatch, caplog):
@@ -105,7 +106,7 @@ def test_the_native_factory_runs_private_memory_after_the_original_completion_re
         await current.on_terminal(receipt)  # the peer result goes out ahead of usage and memory
         await current.on_completed(receipt, None)
     with monkeypatch.context() as environment:
-        for name, value in {"FA_NATIVE_TURNS": "foundry-native-v1", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
+        for name, value in {"FA_NATIVE_TURNS": "foundry-native-v3", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
                             "AGENTSERVER_TASKS_BACKEND": "hosted", "HOME": str(home),
                             "BEHAVIOR_ASSISTANT_RUNTIME_PATH": str(runtime_path), "FOUNDRY_PROJECT_ENDPOINT": ENDPOINT,
                             "FOUNDRY_AGENT_NAME": "OFFLINE-agent", memory.STORE_ENV: "fa-memory-store"}.items():
@@ -136,7 +137,7 @@ def test_the_native_factory_passes_the_api_connection_and_names_why_memory_is_of
     )
     runtimes = {}
     with monkeypatch.context() as environment, caplog.at_level(logging.WARNING):
-        for name, value in {"FA_NATIVE_TURNS": "foundry-native-v1", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
+        for name, value in {"FA_NATIVE_TURNS": "foundry-native-v3", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
                             "AGENTSERVER_TASKS_BACKEND": "hosted", "HOME": str(home),
                             "BEHAVIOR_ASSISTANT_RUNTIME_PATH": str(runtime_path), "FOUNDRY_PROJECT_ENDPOINT": ENDPOINT,
                             "FOUNDRY_AGENT_NAME": "OFFLINE-agent", memory.STORE_ENV: "fa-memory-store",

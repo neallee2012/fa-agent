@@ -1,4 +1,4 @@
-"""One fixed SDK 1.0.13 / runtime 1.0.83 turn: history-skill-draft plus the captured fa-skills-v1 capability.
+"""One fixed SDK 1.0.26 / runtime 1.0.103 turn: history-skill-draft plus the captured fa-skills-v1 capability.
 
 Scripted provider; no cloud, network or real model.
 """
@@ -20,6 +20,7 @@ from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_capability_prompt import assemble_capabilities
 from shared_context.behavior_history_skill_draft_prompt import HISTORY_SKILL_DRAFT_CAPABILITIES
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import SDK_VERSION
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select
 from test_instruction_flow import instruction_models
@@ -89,4 +90,4 @@ def test_fixed_sdk_reads_an_approved_skill_through_the_skills_capability(assista
         archive = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
         assert archive.capability_assembly == combined.record
         assert [entry.name for entry in archive.skill_catalog.entries] == ["receipt-guide"]
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION

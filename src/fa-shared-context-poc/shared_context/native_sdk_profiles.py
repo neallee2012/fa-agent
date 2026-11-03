@@ -5,6 +5,7 @@ import importlib.metadata
 from .behavior_code_identity import code_sha256
 from .behavior_native_turn_wire import NativeInstructionContext, NativeReceipt, NativeTurnOrigin
 from .errors import Problem
+from .sdk_pin import SDK_VERSION
 
 ORIGIN_ADDENDUM = (
     "\n\n## Native turn origin\n"
@@ -29,8 +30,9 @@ def check_start_capture(capture, *, adopted=False):
         raise Problem(409, "NATIVE_PROFILE_UNSUPPORTED", "this native path has no consumer for the legacy v2 start profile")
     if capture.sdk_start_code_sha256 is None or (capture.sdk_start_code_sha256 != code_sha256() and not adopted):
         raise Problem(409, "SDK_START_GATE_CODE_CHANGED", "the original API capture and installed Hosted build differ")
-    if importlib.metadata.version("github-copilot-sdk") != settings.sdk_version:
-        raise Problem(409, "NATIVE_PROFILE_UNSUPPORTED", "the selected SDK release differs")
+    # The template's release records what it was selected under; this build runs its own pin (sdk_pin).
+    if importlib.metadata.version("github-copilot-sdk") != SDK_VERSION:
+        raise Problem(409, "NATIVE_PROFILE_UNSUPPORTED", "the installed SDK release differs from this build")
 
 
 class NativeSdkStart:

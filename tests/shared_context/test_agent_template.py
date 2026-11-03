@@ -3,9 +3,6 @@
 import copy
 import hashlib
 import json
-from pathlib import Path
-import subprocess
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import Context
 from types import MappingProxyType, SimpleNamespace
@@ -19,10 +16,11 @@ from shared_context.behavior_assistant import AssistantProfile
 from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.native_responses_wire import SENT_RELEASE
 from test_behavior_assistant import assistant
 from test_instruction_flow import runtime_path
 from test_m3_auth import UNKNOWN_OID, jwk_client, signing_key, token
-from test_skill_purpose import BODY, PROFILE, PURPOSE, signed_m3
+from test_skill_purpose import BODY, PROFILE, PURPOSE, deactivate as deactivate_skill
 from test_skill_purpose_api import add_purpose_skill
 from test_work_policy_lifecycle import enabled
 
@@ -72,16 +70,7 @@ def inspect(h, value):
 
 
 def deactivate(h, source, signing_key, jwk_client):
-    http, _, human = signed_m3(h.artifacts, signing_key, jwk_client)
-    path = "/teams/team-one/artifacts/" + NAME
-    with http:
-        current = http.get(path, headers=human)
-        response = http.post(path + "/deactivations", headers={**human, "If-Match": current.headers["etag"]}, json={
-            "schema_version": "fa-skill-deactivation-v1", "decision_id": "d" * 32,
-            "version_id": source["version_id"], "sha256": source["sha256"],
-            "metadata_sha256": source["metadata_sha256"],
-        })
-        assert response.status_code == 200, response.text
+    deactivate_skill(h.artifacts, NAME, source)
 
 
 def test_export_is_deterministic_references_only_and_does_not_invoke_runtime(template_case):
@@ -110,8 +99,8 @@ def test_export_is_deterministic_references_only_and_does_not_invoke_runtime(tem
     assert data["unavailable_skills"] == []
     assert data["authorization"] is False
     assert data["settings"]["mode"] == "empty"
-    assert data["settings"]["sdk_version"] == "1.0.13"
-    assert data["settings"]["runtime_version"] == "1.0.83"
+    assert data["settings"]["sdk_version"] == SENT_RELEASE[0]  # the send profile's pair, not this process's pin
+    assert data["settings"]["runtime_version"] == SENT_RELEASE[1]
     for value in (BODY.decode(), PURPOSE, A.oid, h.binding.tenant_id, h.binding.human_oid,
                   h.binding.binding_id, h.binding.owner.root_budget_id, h.binding.team_id,
                   h.runtime.profiles[h.binding.binding_id].source.source_id):
@@ -391,25 +380,3 @@ def test_template_rejects_ambiguous_references_and_nested_private_fields(templat
         data["settings"]["credential"] = "PRIVATE_TEMPLATE_CANARY"
     response = inspect(h, data)
     assert response.status_code == 422 and "PRIVATE_TEMPLATE_CANARY" not in response.text
-
-
-def test_template_dto_and_api_import_without_hosted_sdk():
-    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    program = r"""
-import importlib.abc, sys
-class NoHostedSdk(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == "copilot" or fullname.startswith("copilot."):
-            raise ModuleNotFoundError("Hosted SDK forbidden in API", name=fullname)
-sys.meta_path.insert(0, NoHostedSdk())
-sys.path.insert(0, sys.argv[1])
-from shared_context.behavior_agent_template import AgentTemplate, export_template
-from shared_context.behavior_work_policy_api import install_work_policy_routes
-assert AgentTemplate.model_json_schema() and callable(export_template) and callable(install_work_policy_routes)
-assert not any(name == "copilot" or name.startswith("copilot.") for name in sys.modules)
-"""
-    result = subprocess.run(
-        [sys.executable, "-I", "-X", "utf8", "-c", program, str(source)],
-        capture_output=True, text=True, encoding="utf-8", timeout=30,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr

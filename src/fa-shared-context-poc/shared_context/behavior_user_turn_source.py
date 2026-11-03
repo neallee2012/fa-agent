@@ -13,6 +13,7 @@ from .behavior_history_prompt import REPLY_READ_PROFILES
 from .behavior_workers import JobRecord, worker_key
 from .errors import Problem
 from .source_materials import digest
+from .behavior_wire import same_but_release
 
 
 def _record(value, model):
@@ -133,7 +134,7 @@ def _read(authority, session, principal, turn_number):
             or original.assignment.sdk_session_id != conversation.sdk_session_id
             or archive.conversation_id != conversation.conversation_id or archive.job_id != job_id
             or archive.turn_number != turn_number or archive.archive.sdk_session_id != conversation.sdk_session_id
-            or archive.prompt_assembly != assemble_prompt(task.prompt_profile).record
+            or not same_but_release(archive.prompt_assembly, assemble_prompt(task.prompt_profile).record)
             or archive.context_read != original.context_read or archive.skill_catalog != original.skill_catalog
             or archive.user_turn_sources != original.user_turn_sources
             or archive.work_memory_source != original.work_memory_source

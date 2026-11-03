@@ -264,7 +264,7 @@ def test_a_changed_reference_refuses_the_review(world):
 
 def test_rules_speak_in_chain_order(world):
     w = world
-    late = lambda forgery: forgery.receipt(w.finish, edit(guard_revision=revision(w, w.context)))  # noqa: E731
+    late = lambda forgery: forgery.receipt(w.finish, edit(guard_revision=revision(w, w.context)))
     bad_row = forged(w).data(w.session, edit(state="running"))
     assert refusal(w, bad_row.drop_receipt(w.context)) == ROWS
     assert refusal(w, forged(w).drop_receipt(w.context).drop_receipt(w.issue)) == CONTEXT

@@ -151,8 +151,6 @@ class AgentOnboarding:
             self._journal = Journal(self.root / "onboarding.sqlite3", self.default.config)
         return self._journal
 
-    # ----- server calls (default Team entry only) -----
-
     def _send(self, method, path, body=None, *, limit=MAX_CONSOLE_CONNECTION_BYTES):
         token = self.default.vault.get()
         url = self.default.config.backend_origin + path
@@ -208,8 +206,6 @@ class AgentOnboarding:
             if 400 <= status < 500 and code in _REFUSED:
                 observed["state"] = "REFUSED"
         return observed
-
-    # ----- local link -----
 
     def _connection_entries(self):
         """Running manifest plus every Agent this onboarding journal has already linked, in a stable order."""
@@ -294,8 +290,6 @@ class AgentOnboarding:
                 "observed_at": self.default.clock().isoformat(), "connection": link.model_dump(mode="json"),
                 "manifest_path": str(path), "manifest_sha256": digest}
 
-    # ----- browser-facing operations -----
-
     def _record(self, rid, observed):
         if observed.get("state") == "SERVER" and observed.get("server_state") == "ready":
             observed = self._link(rid, observed["agent_id"], observed["display_name"])
@@ -312,8 +306,6 @@ class AgentOnboarding:
             except ConsoleError:
                 pass  # the link stays confirmed; the view shows the prepare state and its retry
         return self.view(rid)
-
-    # ----- native environment of the new Agent -----
 
     @staticmethod
     def _native(agent_id, tail):

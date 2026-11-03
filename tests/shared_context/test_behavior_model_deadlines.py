@@ -78,11 +78,12 @@ def request():
 
 @pytest.mark.parametrize("wait_at", ["provider", "last-gate"])
 def test_legal_buffered_response_over_old_twenty_seconds_survives(native_acquire, monkeypatch, wait_at):
+    """A model wait past the other routes' read timeout (20 s in production, 0.5 s here) still gets its answer."""
     c = native_acquire
     reviewed(c)
     def provider_http(handler, _):
         if wait_at == "provider":
-            time.sleep(21)
+            time.sleep(1)
         send_bytes(handler, stream([{}], finish_reason="stop").content)
     with model_stack(c, provider_http) as provider:
         c.hosted.acquire()
@@ -92,16 +93,22 @@ def test_legal_buffered_response_over_old_twenty_seconds_survives(native_acquire
             intent_key = key("model-intent", c.assignment.session_id, digest(BODY))
             def slow():
                 if c.store.read_snapshot((intent_key,))[intent_key].payload["data"]["consumed"]:
-                    time.sleep(21)
+                    time.sleep(1)
                 return original()
             monkeypatch.setattr(c.composition, "require_current_native_evidence", slow)
+        c.hosted.http.timeout = httpx.Timeout(0.5, connect=5)  # the other routes' timeout, now shorter than the wait
         started = time.monotonic()
         response = c.hosted.model(request())
         elapsed = time.monotonic() - started
         assert response.status_code == 200 and b"[DONE]" in response.content
-        assert 20 < elapsed < 35 and len(provider.seen) == 1
-        assert c.hosted.http.timeout.read == 20, "non-model routes retain their original timeout"
-        print(f"wait_at={wait_at}; buffered-response={elapsed:.3f}s; provider-posts=1; other-route-read-timeout=20")
+        assert 1 < elapsed < 15 and len(provider.seen) == 1
+        assert c.hosted.http.timeout.read == 0.5, "non-model routes retain their original timeout"
+        # The wait is shorter here, so each hop's own read timeout is checked against the old 20 s directly.
+        hosted_hop = [timeout["read"] > 20 for path, timeout in c.hosted.http._transport.timeouts
+                      if path.endswith("/model")]
+        assert hosted_hop == [True], "the hosted-to-API model hop keeps its own long timeout"
+        assert [timeout["read"] > 20 for timeout in c.composition.assistant.provider.transport.timeouts] == [True]
+        print(f"wait_at={wait_at}; buffered-response={elapsed:.3f}s; provider-posts=1; other-route-read-timeout=0.5")
 
 
 def test_absolute_route_deadline_starts_before_first_native_evidence(native_acquire, monkeypatch):

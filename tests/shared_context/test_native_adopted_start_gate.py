@@ -1,4 +1,4 @@
-"""#880 review P2: a never-started receipt vN accepted, adopted by the vN+1 SID (ADR-0009 M9), runs there on its own
+"""#880: a never-started receipt vN accepted, adopted by the vN+1 SID (ADR-0009 M9), runs there on its own
 pin, through the real native executor and SDK start gate; only the SDK process is an offline double."""
 
 import json
@@ -11,9 +11,10 @@ from shared_context import native_sdk, native_sdk_profiles
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import NativeReceipt, NativeSubmit
 from shared_context.native_turns import TURNS_STORE, NativeTurnRuntime, _json, _Rid
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_capabilities import selected_capture
 from test_native_turn_wire import submit
-from test_native_turns import Harness, IDENTITY, local_env  # noqa: F401
+from test_native_turns import Harness, IDENTITY, local_env
 
 OLD = "0" * 64  # the build of the vN image that accepted the receipt
 NEW = "2" * 64  # this (vN+1) image's own build
@@ -29,7 +30,7 @@ def gated(pin, **role):
 
 
 @pytest.fixture
-def image(local_env, monkeypatch, tmp_path):  # noqa: F811
+def image(local_env, monkeypatch, tmp_path):
     entered = []
 
     async def sdk(**options):
@@ -41,7 +42,7 @@ def image(local_env, monkeypatch, tmp_path):  # noqa: F811
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "adopted answer",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     monkeypatch.setattr(native_sdk_profiles, "code_sha256", lambda: NEW)

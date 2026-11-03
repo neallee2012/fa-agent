@@ -13,15 +13,16 @@ from shared_context.behavior_native_turn_wire import (
     NATIVE_REQUEST, NATIVE_STATE_PROFILE, NativeReceipt, NativeSessionPreparation,
 )
 from shared_context.errors import Problem
-from test_agent_runtime import peer_runtime  # noqa: F401
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_agent_api import relay_case, relay_http, send_command  # noqa: F401
-from test_native_binding import bound, claim, switch_view  # noqa: F401
-from test_native_responses_api import responses_api  # noqa: F401
-from test_native_routine_api import daily_definition, routine_api  # noqa: F401
-from test_native_turn_api import native_api, submit  # noqa: F401
+from shared_context.sdk_pin import SDK_VERSION
+from test_agent_runtime import peer_runtime
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
+from test_native_agent_api import relay_case, relay_http, send_command
+from test_native_binding import bound, claim, switch_view
+from test_native_responses_api import responses_api
+from test_native_routine_api import daily_definition, routine_api
+from test_native_turn_api import native_api, submit
 
 API = code_sha256()
 OLD = "0" * 64  # the image v41 runs: deployed before this API changed core
@@ -67,7 +68,7 @@ def images(monkeypatch, runtime, remote, builds):
     """Each VM runs the build its version was published for (``builds``, also the versions' ``fa_build``)."""
     gated_captures(monkeypatch)
     monkeypatch.setattr(native_sdk_profiles, "code_sha256", lambda: builds[remote.target.agent_version])
-    monkeypatch.setattr(native_sdk_profiles.importlib.metadata, "version", lambda _name: "1.0.13")
+    monkeypatch.setattr(native_sdk_profiles.importlib.metadata, "version", lambda _name: SDK_VERSION)
     monkeypatch.setattr(runtime.agent_message_composition, "hosted_versions", Versions(**builds), raising=False)
 
 
@@ -106,7 +107,7 @@ def old_image(case, monkeypatch, refusals=None, **builds):
 def moving():
     return [Problem(503, "AGENT_VERSION_FOLLOWING", "the Agent is moving to its selected version")]
 
-def test_a_newer_api_core_is_served_by_the_running_older_image(native_api, monkeypatch):  # noqa: F811
+def test_a_newer_api_core_is_served_by_the_running_older_image(native_api, monkeypatch):
     """dev 2026-10-17 (4-3/5-1): V_rec 41 runs an older core than this API. Before the fix every send was refused
     SDK_START_GATE_CODE_CHANGED; now the capture names the v41 image's own build and the turn is admitted there."""
     case = native_api
@@ -119,7 +120,7 @@ def test_a_newer_api_core_is_served_by_the_running_older_image(native_api, monke
     assert [command.operation for _, command in case.remote.calls if command.operation != "session_read"] == ["submit"]
 
 
-def test_drift_to_an_older_image_resends_with_that_images_pin(bound, monkeypatch):  # noqa: F811
+def test_drift_to_an_older_image_resends_with_that_images_pin(bound, monkeypatch):
     """§4 step 6: V_rec 40, the VM woke on 41 and says so; the same RID goes to 41 pinned to 41's build, not 40's."""
     case = bound
     claim(case, observed="40")
@@ -130,7 +131,7 @@ def test_drift_to_an_older_image_resends_with_that_images_pin(bound, monkeypatch
     assert NativeReceipt.model_validate_json(accepted.content).capture.sdk_start_code_sha256 == OLD
 
 
-def test_the_pin_changes_only_a_selected_gate_and_a_known_build(native_api):  # noqa: F811
+def test_the_pin_changes_only_a_selected_gate_and_a_known_build(native_api):
     from shared_context.behavior_native_capture import start_pinned
     from shared_context.behavior_native_turn_wire import NativeTurnCapture
 
@@ -166,8 +167,8 @@ def move(case, monkeypatch, version):
 
 @pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
 def test_a_routine_refused_on_v41_is_served_by_v42_with_its_intent_and_digest_unchanged(
-        routine_api, bound, monkeypatch):  # noqa: F811
-    """#880 review P2-1: the occurrence goes to v41 and is refused before rid:<RID> exists; the Agent moves to v42.
+        routine_api, bound, monkeypatch):
+    """#880: the occurrence goes to v41 and is refused before rid:<RID> exists; the Agent moves to v42.
     A pin saved in the intent made every later tick SDK_START_GATE_CODE_CHANGED. The intent never names it: the
     tick is pinned to v42's build at dispatch, and the resend of the accepted RID carries the receipt's digest."""
     from shared_context.native_routines import NativeRoutineService
@@ -201,8 +202,8 @@ def test_a_routine_refused_on_v41_is_served_by_v42_with_its_intent_and_digest_un
 
 
 def test_a_handoff_refused_on_its_first_version_is_served_after_the_recipient_moves(
-        relay_http, monkeypatch):  # noqa: F811
-    """#880 review P2-1: an Agent handoff reaches the recipient's v41 image and is refused before admission; the
+        relay_http, monkeypatch):
+    """#880: an Agent handoff reaches the recipient's v41 image and is refused before admission; the
     recipient then moves to v42. The resend keeps its RID and relay allowance and is pinned to v42's build."""
     from shared_context.behavior_native_agent_wire import NATIVE_AGENT_PREFIX
     from test_native_environment_api import environment_at

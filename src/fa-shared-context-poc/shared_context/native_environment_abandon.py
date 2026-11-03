@@ -81,7 +81,7 @@ async def _log_left_work(runtime, current):
                     inputs = steering.get("pending_inputs", [])
                     pending = len(inputs) if isinstance(inputs, list) else None
                     active = steering.get("active_input") is not None
-        except Exception as error:  # noqa: BLE001 - an audit read never blocks the switch (CancelledError passes)
+        except Exception as error:  # an audit read never blocks the switch (CancelledError passes)
             log.warning("NATIVE_ENVIRONMENT_SOURCE_TASK_UNREAD type=%s", type(error).__name__)
     log.warning("NATIVE_ENVIRONMENT_SOURCE_WORK_LEFT task_id=%s task_status=%s lease=%s pending_inputs=%s "
                 "active_input=%s admitting=%s", task, status, lease, pending, active,

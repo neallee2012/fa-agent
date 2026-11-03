@@ -17,9 +17,9 @@ from shared_context.behavior_operations import _parse, control_key
 from shared_context.behavior_runtime import material
 from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
-from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
 
 DIGEST = "0" * 64
 TERMINAL = "only the exact saved terminal result is readable"
@@ -104,7 +104,7 @@ def reading(c, monkeypatch, binding, request_id):
 
 
 @pytest.fixture
-def finished(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def finished(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     turn = saved_turn(c, "result-access-finished")
     c.h.runtime.controller.step(turn.binding.binding_id)
@@ -116,7 +116,7 @@ def finished(synthetic_standing_v1, monkeypatch):  # noqa: F811
 
 
 @pytest.fixture
-def cancelled(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def cancelled(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     binding, _ = c.control.submit(c.human, InstructionSubmit(request_id="result-access-cancelled", content="Never started."))
     c.control.cancel(c.human, binding.binding_id)

@@ -1,4 +1,4 @@
-"""SK-08 on the pinned SDK 1.0.13 / runtime 1.0.83: skillify a procedure from an earlier turn, use it on demand.
+"""SK-08 on the pinned SDK 1.0.26 / runtime 1.0.103: skillify a procedure from an earlier turn, use it on demand.
 
 Scripted provider; no cloud, network or real model. The long procedure never enters the resident prefix of the
 later conversation; it is only reachable through read_skill, and the base safety text keeps its exact bytes.
@@ -24,6 +24,7 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.m3_auth import HumanApprover
 from shared_context.m3_models import ApprovalInput
+from shared_context.sdk_pin import SDK_VERSION
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
 from test_instruction_flow import instruction_models
@@ -133,4 +134,4 @@ def test_skillified_procedure_is_used_on_demand_and_never_resident(assistant, mo
         later = [system for current, system in systems if USE in current]
         assert later and all(MARKER not in text for system in later for text in system)
         assert all(any(text.startswith(base) for text in system) for system in later)
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION

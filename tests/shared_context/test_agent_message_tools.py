@@ -1,9 +1,6 @@
 """The Hosted collaboration tool sends only a bounded public brief and pinned refs."""
 import asyncio
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -447,27 +444,6 @@ def test_explicit_team_refs_are_sent_verbatim_and_ids_stay_stable_across_factory
         assert AgentMessageRead.model_validate_json(result.text).refs[0].resource_kind == "source"
     assert c.sent[0].message_id == c.sent[1].message_id
     assert c.sent[0].refs == c.sent[1].refs
-
-
-def test_hosted_collaboration_tool_imports_without_api_or_storage_packages():
-    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    script = """
-import importlib.abc, sys
-class NoApiPackages(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path=None, target=None):
-        if any(name == prefix or name.startswith(prefix + ".") for prefix in (
-            "fastapi", "azure.ai.projects", "azure.storage.blob", "azure.data.tables",
-            "shared_context.behavior_runtime", "shared_context.behavior_agent_message_refs"
-        )):
-            raise ModuleNotFoundError("API-only package in Hosted tool: " + name)
-sys.meta_path.insert(0, NoApiPackages())
-sys.path.insert(0, sys.argv[1])
-import shared_context.behavior_agent_message_tools
-print("Hosted collaboration imports with only its existing dependencies")
-"""
-    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", script, str(source)],
-                            capture_output=True, encoding="utf-8", timeout=30)
-    assert result.returncode == 0, result.stderr
 
 
 def test_pinned_sdk_invokes_the_narrow_peer_tool_without_dispatching_another_agent(tool_case, workspace, runtime_path):

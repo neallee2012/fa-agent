@@ -19,8 +19,9 @@ from shared_context.behavior_native_turn_wire import (
 from shared_context.behavior_sdk_state import NativeCheckpointScope
 from shared_context.errors import Problem
 from shared_context.native_turns import TURNS_STORE, NativeTurnControl, NativeTurnRuntime, _json, _Rid
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_turn_wire import capture, submit
-from test_m2_copilot import runtime_path  # noqa: F401
+from test_m2_copilot import runtime_path
 from test_native_turns import Harness, IDENTITY, local_env
 from test_native_responses import response_submit, responses
 
@@ -47,7 +48,7 @@ def test_native_factory_reuses_one_managed_identity_credential(local_env, monkey
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
     )
     with monkeypatch.context() as environment:
-        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
@@ -116,7 +117,7 @@ def test_peer_result_is_sent_before_usage_and_memory_and_each_lands_once_after_r
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
     )
     with monkeypatch.context() as environment:
-        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
@@ -143,7 +144,7 @@ def test_peer_result_is_sent_before_usage_and_memory_and_each_lands_once_after_r
 
 
 def test_production_wires_a_waiting_responses_message_to_the_api_send(local_env, monkeypatch, tmp_path):
-    """Review round 4 (P3): ADR-0009 §7a (s) — the production runtime asks the API to send a waiting Responses message
+    """ADR-0009 §7a (s) — the production runtime asks the API to send a waiting Responses message
     through the same Agent-identity relay as its continuations (``NativeAgentRelayClient.dispatch_waiting``); without
     this wiring ``on_slot_taken`` is None and the message waits at ``needs_response`` for the API's next touch."""
     from shared_context.native_agent_tools import NativeAgentRelayClient
@@ -163,7 +164,7 @@ def test_production_wires_a_waiting_responses_message_to_the_api_send(local_env,
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
     )
     with monkeypatch.context() as environment:
-        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
@@ -193,7 +194,7 @@ def test_original_role_text_precedes_native_origin_guidance_without_changing_cap
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE role and origin",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -254,7 +255,7 @@ def test_host_to_existing_runner_adapter_keeps_capture_checkpoint_text_and_usage
         else:
             assert files.restored
         return {"final_message": "完整原文" * 30_000,
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -305,7 +306,7 @@ def test_native_runner_wires_session_output_reader_and_its_result_contract(respo
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "original output", "sdk_stop": {
-            "pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+            "pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -344,7 +345,7 @@ def test_reply_preview_shows_only_while_started_and_never_replaces_the_saved_out
         if not stopped:
             raise RuntimeError("OFFLINE SDK stop failed after the reply")
         return {"final_message": "OFFLINE preview answer", "sdk_stop": {
-            "pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+            "pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -416,7 +417,7 @@ def test_sk03_a_catalog_budget_capture_has_a_native_consumer(tmp_path):
 
 
 def test_native_environment_remains_explicit_and_never_falls_back_to_local(monkeypatch):
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     monkeypatch.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
     monkeypatch.setenv("AGENTSERVER_TASKS_BACKEND", "local")
     with pytest.raises(Problem) as rejected:
@@ -448,7 +449,7 @@ def test_native_factory_runs_under_bootstrap_owned_root_when_home_is_not_writabl
 
     monkeypatch.setattr(Path, "mkdir", bootstrap_permissions)
     with monkeypatch.context() as environment:
-        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("HOME", str(home))
@@ -471,7 +472,7 @@ def test_native_factory_runs_under_bootstrap_owned_root_when_home_is_not_writabl
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE factory reached SDK boundary",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     request = submit()
@@ -597,7 +598,7 @@ def test_a_turn_removes_its_dirs_unless_its_sdk_is_kept(local_env, monkeypatch, 
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE turn dirs",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -1010,7 +1011,7 @@ def test_native_agent_input_does_not_add_the_legacy_model_call_limit(local_env, 
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -1050,7 +1051,7 @@ def test_typed_agent_or_approval_markers_in_human_text_stay_the_humans_own_data(
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

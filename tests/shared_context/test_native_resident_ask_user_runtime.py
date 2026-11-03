@@ -1,4 +1,4 @@
-"""ADR-0005 on the pinned SDK 1.0.13 / runtime 1.0.83: a turn that asked the owner keeps its SDK.
+"""ADR-0005 on the pinned SDK 1.0.26 / runtime 1.0.103: a turn that asked the owner keeps its SDK.
 
 The real runtime asks through ``ask_user`` in both turns of one native conversation. The second turn runs on the
 same CLI process and session, its question reaches only its own turn's wait, and the model still sees the first
@@ -8,7 +8,7 @@ turn's answer. The owner's wait itself is covered offline; model I/O is offline.
 import json
 from types import SimpleNamespace
 
-from test_m2_copilot import runtime_path  # noqa: F401
+from test_m2_copilot import runtime_path
 from test_native_auto_compaction import completion_stream, run_turns, small_capture
 from test_native_resident import phases, track_hitl
 

@@ -9,8 +9,8 @@ import pytest
 
 from feed_fixtures import FEED_URL, PUBLIC_IP, TOKEN, FakeNetwork, http_response, rss  # first: puts the app on sys.path
 
-import feed_mcp.fetch as fetch  # noqa: E402
-from feed_mcp.fetch import FeedError, GuardedBackend, fetch_feed, public_address  # noqa: E402
+import feed_mcp.fetch as fetch
+from feed_mcp.fetch import FeedError, GuardedBackend, fetch_feed, public_address
 
 FEED = rss([{"title": "One", "guid": "1"}])
 

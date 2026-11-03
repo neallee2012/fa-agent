@@ -317,6 +317,13 @@ class _ModelIntent(_Model):
     consumed: bool = False
 
 
+def _carried(previous, prior_turn, name, default):
+    """A turn-to-turn value: the resumed session's if any, else the previous instruction turn's, else the default."""
+    if previous is not None:
+        return getattr(previous, name)
+    return default if prior_turn is None else getattr(prior_turn, name)
+
+
 class AssistantAuthority:
     def __init__(self, runtime: AssistantRuntime, artifacts: ArtifactService, actors: tuple[Actor, ...], *,
                  require_legacy_sources=True):
@@ -423,6 +430,47 @@ class AssistantAuthority:
             raise Problem(403, "ASSISTANT_ASSIGNMENT_DENIED", "immutable task differs")
         sid = key("session-id", start.binding.start_request_id)
         task = aw.Task.model_validate_json(start.input)
+        assignment, prior_turn = self._start_assignment(start, binding, sid, task)
+        previous = archive = None
+        if start.checkpoint is not None:
+            previous, archive, assignment = self._resumed_session(start, task, assignment)
+        assignment = self._with_sdk_start_binding(start, task, sid, assignment)
+        session = _Session(binding_id=binding.binding_id, assignment=assignment, execution=start.binding,
+                           ticket_digest=ticket_digest, vm_turn_ticket_id=vm_turn_ticket_id,
+                           state="running" if vm_turn_ticket_id is not None else "accepted",
+                           turn_authorization_digest=self._turn_authorization_digest(binding),
+                           context_read=_carried(previous, prior_turn, "context_read", False),
+                           model_requests=0 if previous is None else previous.model_requests,
+                           model_intent_ids=() if previous is None else previous.model_intent_ids,
+                           user_turn_sources=_carried(previous, prior_turn, "user_turn_sources", ()),
+                           work_memory_source=_carried(previous, prior_turn, "work_memory_source", None))
+        self.current_model_capacity(session)
+        session = self._session_skills(session, task, previous, prior_turn)
+        return session, archive
+
+    def _with_sdk_start_binding(self, start, task, sid, assignment):
+        if task.instruction is None or task.instruction.sdk_start_profile is None:
+            return assignment
+        from .behavior_code_identity import code_sha256
+        return assignment.model_copy(update={"sdk_start_binding": wire.SdkStartBinding(
+            schema_version="fa-sdk-start-binding-" + wire.sdk_start_version(task.instruction.sdk_start_profile),
+            profile=task.instruction.sdk_start_profile,
+            session_id=sid, sdk_session_id=assignment.sdk_session_id, job_id=start.binding.job_id,
+            task_digest=_digest(task.model_dump(mode="json")), profile_digest=task.profile_digest,
+            execution_digest=_digest(start.binding.model_dump(mode="json")),
+            worker_configuration_digest=self.runtime.dep.workers.configuration_digest(),
+            code_sha256=code_sha256(),
+        )})
+
+    def _turn_authorization_digest(self, binding):
+        control = self.runtime.work_policy
+        admitted = None if control is None else control.records.get(binding.binding_id)
+        if admitted is None or admitted.turn_authorization is None:
+            return None
+        return _digest(admitted.model_dump(mode="json"))
+
+    def _start_assignment(self, start, binding, sid, task):
+        """The first assignment of this start, plus the archive of the previous instruction turn it continues."""
         from .behavior_agent_message_api import assignment_recipient
         assignment = aw.Assignment(binding_id=binding.binding_id, session_id=sid, sdk_session_id=sid,
                                    task=task, resume=start.checkpoint is not None,
@@ -436,45 +484,23 @@ class AssistantAuthority:
             if task.instruction.previous_archive_id is not None:
                 archive_key = task.instruction.previous_archive_id
                 prior_turn = _row(self.store.read_snapshot((archive_key,)), archive_key, TurnArchive)
-        previous = None
-        if start.checkpoint is not None:
-            checkpoint = aw.Checkpoint.model_validate_json(start.checkpoint)
-            previous = _row(_read_conflicts(lambda: self.store.read_snapshot((key("session", checkpoint.session_id),)),
-                                           phase="resume_session"),
-                            key("session", checkpoint.session_id), _Session)
-            archive = self.archive(previous)
-            if (previous.state != "waiting" or previous.assignment.task != task
-                    or checkpoint.task_digest != _digest(task.model_dump(mode="json"))
-                    or checkpoint.archive_digest != archive.sha256):
-                raise Problem(403, "ASSISTANT_CHECKPOINT_INVALID", "resume checkpoint differs from its original task")
-            assignment = assignment.model_copy(update={"sdk_session_id": previous.assignment.sdk_session_id})
-        if task.instruction is not None and task.instruction.sdk_start_profile is not None:
-            from .behavior_code_identity import code_sha256
-            assignment = assignment.model_copy(update={"sdk_start_binding": wire.SdkStartBinding(
-                schema_version="fa-sdk-start-binding-" + wire.sdk_start_version(task.instruction.sdk_start_profile),
-                profile=task.instruction.sdk_start_profile,
-                session_id=sid, sdk_session_id=assignment.sdk_session_id, job_id=start.binding.job_id,
-                task_digest=_digest(task.model_dump(mode="json")), profile_digest=task.profile_digest,
-                execution_digest=_digest(start.binding.model_dump(mode="json")),
-                worker_configuration_digest=self.runtime.dep.workers.configuration_digest(),
-                code_sha256=code_sha256(),
-            )})
-        control = self.runtime.work_policy
-        admitted = None if control is None else control.records.get(binding.binding_id)
-        admitted = admitted if admitted is not None and admitted.turn_authorization is not None else None
-        session = _Session(binding_id=binding.binding_id, assignment=assignment, execution=start.binding,
-                           ticket_digest=ticket_digest, vm_turn_ticket_id=vm_turn_ticket_id,
-                           state="running" if vm_turn_ticket_id is not None else "accepted",
-                           turn_authorization_digest=None if admitted is None else _digest(admitted.model_dump(mode="json")),
-                           context_read=(previous.context_read if previous is not None else
-                                         prior_turn.context_read if prior_turn is not None else False),
-                           model_requests=0 if previous is None else previous.model_requests,
-                           model_intent_ids=() if previous is None else previous.model_intent_ids,
-                           user_turn_sources=(previous.user_turn_sources if previous is not None else
-                                              prior_turn.user_turn_sources if prior_turn is not None else ()),
-                           work_memory_source=(previous.work_memory_source if previous is not None else
-                                               prior_turn.work_memory_source if prior_turn is not None else None))
-        self.current_model_capacity(session)
+        return assignment, prior_turn
+
+    def _resumed_session(self, start, task, assignment):
+        """The waiting session a checkpoint resumes, its archive, and the assignment bound to its SDK session."""
+        checkpoint = aw.Checkpoint.model_validate_json(start.checkpoint)
+        previous = _row(_read_conflicts(lambda: self.store.read_snapshot((key("session", checkpoint.session_id),)),
+                                        phase="resume_session"),
+                        key("session", checkpoint.session_id), _Session)
+        archive = self.archive(previous)
+        if (previous.state != "waiting" or previous.assignment.task != task
+                or checkpoint.task_digest != _digest(task.model_dump(mode="json"))
+                or checkpoint.archive_digest != archive.sha256):
+            raise Problem(403, "ASSISTANT_CHECKPOINT_INVALID", "resume checkpoint differs from its original task")
+        return previous, archive, assignment.model_copy(update={"sdk_session_id": previous.assignment.sdk_session_id})
+
+    def _session_skills(self, session, task, previous, prior_turn):
+        """Pin the configured skill catalog, and refuse a resumed turn whose retained catalog changed."""
         if task.instruction is not None and skill_access(task.instruction.prompt_profile, task.instruction.capabilities):
             session = _updated(session, skill_catalog=self._configured_skills(session))
         if previous is not None and previous.skill_catalog is not None and previous.skill_catalog != session.skill_catalog:
@@ -483,7 +509,7 @@ class AssistantAuthority:
             from .behavior_instruction import previous_turn, validate_turn_skills
             prior_turn, _ = previous_turn(self, session)
             validate_turn_skills(self, session, prior_turn)
-        return session, archive if previous is not None else None
+        return session
 
     def issue(self, start: ExecutorStart):
         """Controller-internal only; a replay cannot mint another execution ticket."""
@@ -1122,40 +1148,40 @@ class AssistantAuthority:
 
     def _model_sources(self, session, principal):
         self.current_model_capacity(session)
-        historical = {}
-        if session.assignment.task.instruction is not None and session.assignment.task.instruction.text_attachment_profile is not None:
-            from .behavior_attachment_source import current_sources
-            historical.update(current_sources(self, session, principal)[1])
-        if session.assignment.task.instruction is not None and session.assignment.task.instruction.sop_copy is not None:
-            from .behavior_skill_copy_source import current
-            historical.update(current(self, session, principal))
-        if (session.assignment.task.instruction is not None
-                and skill_draft_enabled(session.assignment.task.instruction.prompt_profile,
-                                        session.assignment.task.instruction.capabilities)):
-            from .behavior_skill_draft_source import current
-            historical.update(current(self, session, principal))
-        if session.work_memory_source is not None or (session.assignment.task.instruction is not None
-                and session.assignment.task.instruction.prompt_profile == WORK_MEMORY_PROFILE):
-            from .behavior_work_memory_source import current_sources
-            historical.update(current_sources(self, session, principal))
-        if (session.assignment.task.instruction is not None
-                and session.assignment.task.instruction.prompt_profile == REVIEWED_NOTE_PROFILE):
-            from .behavior_reviewed_note_source import current_sources
-            historical.update(current_sources(self, session, principal))
-        if session.user_turn_sources or (session.assignment.task.instruction is not None
-                                        and session.assignment.task.instruction.prompt_profile in USER_INPUT_READ_PROFILES):
-            from .behavior_user_turn_source import current_sources
-            historical.update(current_sources(self, session, principal))
+        historical = self._historical_sources(session, principal)
+        task = session.assignment.task.instruction
         if session.skill_catalog is not None or (
-                session.assignment.task.instruction is not None
-                and skill_access(session.assignment.task.instruction.prompt_profile,
-                                 session.assignment.task.instruction.capabilities)):
+                task is not None and skill_access(task.prompt_profile, task.capabilities)):
             self.current_skills(session)
-        snapshot = (historical if session.assignment.task.instruction is not None and not session.context_read
+        snapshot = (historical if task is not None and not session.context_read
                     else {**historical, **self._reviewed(session, principal)[2]})
         if len(set((*self._keys(session), *snapshot))) > 96:
             raise Problem(413, "USER_TURN_SOURCE_LIMIT", "complete source authorization exceeds the atomic read-set bound")
         return snapshot
+
+    def _historical_sources(self, session, principal):
+        """Every earlier source this turn still authorizes and reads, merged in a fixed order."""
+        task = session.assignment.task.instruction
+        historical = {}
+        if task is not None and task.text_attachment_profile is not None:
+            from .behavior_attachment_source import current_sources
+            historical.update(current_sources(self, session, principal)[1])
+        if task is not None and task.sop_copy is not None:
+            from .behavior_skill_copy_source import current
+            historical.update(current(self, session, principal))
+        if task is not None and skill_draft_enabled(task.prompt_profile, task.capabilities):
+            from .behavior_skill_draft_source import current
+            historical.update(current(self, session, principal))
+        if session.work_memory_source is not None or (task is not None and task.prompt_profile == WORK_MEMORY_PROFILE):
+            from .behavior_work_memory_source import current_sources
+            historical.update(current_sources(self, session, principal))
+        if task is not None and task.prompt_profile == REVIEWED_NOTE_PROFILE:
+            from .behavior_reviewed_note_source import current_sources
+            historical.update(current_sources(self, session, principal))
+        if session.user_turn_sources or (task is not None and task.prompt_profile in USER_INPUT_READ_PROFILES):
+            from .behavior_user_turn_source import current_sources
+            historical.update(current_sources(self, session, principal))
+        return historical
 
     def attached_text(self, session, command, principal):
         from .behavior_attachment_source import current_sources
@@ -1344,6 +1370,22 @@ class AssistantAuthority:
         sid = key("session-id", launch.start.binding.start_request_id)
         session_key = key("session", sid)
         session = _row(self.store.read_snapshot((session_key,)), session_key, _Session)
+        self._require_graceful_stop(session, launch, command)
+        instruction = session.assignment.task.instruction is not None
+        if command.outcome == "succeeded" or instruction and command.outcome in {"failed","stopped"}:
+            return self._finished_report_plan(launch, command, principal, session, sid, instruction)
+        if command.outcome == "parked":
+            checkpoint = aw.Checkpoint.model_validate_json(command.checkpoint)
+            archive = self.archive(session)
+            if (session.state != "waiting" or command.result is not None
+                    or checkpoint.session_id != sid or checkpoint.archive_digest != archive.sha256
+                    or checkpoint.task_digest != _digest(session.assignment.task.model_dump(mode="json"))):
+                raise Problem(403, "ASSISTANT_NATIVE_CHECKPOINT", "exact stopped SDK checkpoint is required")
+            snapshot = self.store.read_snapshot((session_key, key("archive", sid)))
+            return None, command.checkpoint, snapshot
+        raise Problem(403, "ASSISTANT_NATIVE_UNKNOWN", "unfinished or unverified SDK exit retains execution responsibility")
+
+    def _require_graceful_stop(self, session, launch, command):
         stop = command.sdk_stop
         instruction_task = session.assignment.task.instruction
         released = (stop is not None and stop.release is not None and instruction_task is not None
@@ -1355,49 +1397,47 @@ class AssistantAuthority:
                 or released and command.outcome == "parked"
                 or not stop.graceful):
             raise Problem(403, "ASSISTANT_NATIVE_IDLE", "gracefully stopped exact owned SDK runtime is required")
-        instruction=session.assignment.task.instruction is not None
-        if command.outcome == "succeeded" or instruction and command.outcome in {"failed","stopped"}:
-            result = self.result(launch.start.binding)
-            if instruction and result.state!={"succeeded":"succeeded","failed":"failed","stopped":"cancelled"}[command.outcome]:
-                raise Problem(403,"ASSISTANT_NATIVE_RESULT","reported SDK exit and saved work outcome differ")
-            expected = aw.ExecutionResult(session_id=sid, result_digest=_digest(result.model_dump(mode="json")))
-            if command.result != expected or command.checkpoint is not None or session.state != "ready_to_finalize":
-                raise Problem(403, "ASSISTANT_NATIVE_RESULT", "SDK turn end is not a durable finish receipt")
-            snapshot = {} if instruction else self.model_sources(session,principal)
-            result_key, effect_key = key("result", launch.start.binding.work_id), key("artifact", launch.start.binding.work_id)
-            if session.assignment.task.instruction is not None:
-                from .behavior_instruction import TurnArchive
-                effect_key = key("text-archive",launch.start.binding.job_id)
-                saved = _row(self.store.read_snapshot((effect_key,)),effect_key,TurnArchive)
-                if (saved.sdk_stop != stop or isinstance(saved.archive,(aw.SdkArchive,aw.StoredSdkArchive))
-                        and saved.archive.sdk_session_id != session.assignment.sdk_session_id):
-                    raise Problem(403,"ASSISTANT_NATIVE_RESULT","original reply and archive must bind the same stopped SDK")
-            binding = self._binding(session)
-            peer_work = instruction and session.assignment.task.instruction.peer_work is not None
-            if peer_work:
-                from .behavior_work_policy import WorkRegistration, work_policy_key
-                registered = self.runtime.work_policy.records[binding.binding_id]
-                work_key = work_policy_key("registration", registered.admission_id)
-            else:
-                work_key = control_key("delivery-work-state", binding.obligation_id)
-            snapshot = {**snapshot, **self.store.read_snapshot((session_key, result_key, effect_key, work_key))}
-            if _row(snapshot, session_key, _Session) != session:
-                raise Problem(409, "ASSISTANT_RESULT_CHANGED", "result session changed during verification")
-            definition = (_digest(_row(snapshot, work_key, WorkRegistration).binding.work.model_dump(mode="json"))
-                          if peer_work else _row(snapshot, work_key, _Work).definition_digest)
-            if definition != result.definition_digest:
-                raise Problem(409, "ASSISTANT_WORK_CHANGED", "native completion no longer matches current work")
-            return result, None, snapshot
-        if command.outcome == "parked":
-            checkpoint = aw.Checkpoint.model_validate_json(command.checkpoint)
-            archive = self.archive(session)
-            if (session.state != "waiting" or command.result is not None
-                    or checkpoint.session_id != sid or checkpoint.archive_digest != archive.sha256
-                    or checkpoint.task_digest != _digest(session.assignment.task.model_dump(mode="json"))):
-                raise Problem(403, "ASSISTANT_NATIVE_CHECKPOINT", "exact stopped SDK checkpoint is required")
-            snapshot = self.store.read_snapshot((session_key, key("archive", sid)))
-            return None, command.checkpoint, snapshot
-        raise Problem(403, "ASSISTANT_NATIVE_UNKNOWN", "unfinished or unverified SDK exit retains execution responsibility")
+
+    def _finished_report_plan(self, launch, command, principal, session, sid, instruction):
+        session_key = key("session", sid)
+        result = self.result(launch.start.binding)
+        if instruction and result.state!={"succeeded":"succeeded","failed":"failed","stopped":"cancelled"}[command.outcome]:
+            raise Problem(403,"ASSISTANT_NATIVE_RESULT","reported SDK exit and saved work outcome differ")
+        expected = aw.ExecutionResult(session_id=sid, result_digest=_digest(result.model_dump(mode="json")))
+        if command.result != expected or command.checkpoint is not None or session.state != "ready_to_finalize":
+            raise Problem(403, "ASSISTANT_NATIVE_RESULT", "SDK turn end is not a durable finish receipt")
+        snapshot = {} if instruction else self.model_sources(session,principal)
+        result_key, effect_key = key("result", launch.start.binding.work_id), key("artifact", launch.start.binding.work_id)
+        if instruction:
+            effect_key = self._require_archived_reply(launch, session, command.sdk_stop)
+        binding = self._binding(session)
+        peer_work = instruction and session.assignment.task.instruction.peer_work is not None
+        if peer_work:
+            from .behavior_work_policy import WorkRegistration, work_policy_key
+            registered = self.runtime.work_policy.records[binding.binding_id]
+            work_key = work_policy_key("registration", registered.admission_id)
+        else:
+            work_key = control_key("delivery-work-state", binding.obligation_id)
+        snapshot = {**snapshot, **self.store.read_snapshot((session_key, result_key, effect_key, work_key))}
+        if _row(snapshot, session_key, _Session) != session:
+            raise Problem(409, "ASSISTANT_RESULT_CHANGED", "result session changed during verification")
+        if peer_work:
+            definition = _digest(_row(snapshot, work_key, WorkRegistration).binding.work.model_dump(mode="json"))
+        else:
+            definition = _row(snapshot, work_key, _Work).definition_digest
+        if definition != result.definition_digest:
+            raise Problem(409, "ASSISTANT_WORK_CHANGED", "native completion no longer matches current work")
+        return result, None, snapshot
+
+    def _require_archived_reply(self, launch, session, stop):
+        """The text archive key of an instruction turn, once its saved reply binds the same stopped SDK."""
+        from .behavior_instruction import TurnArchive
+        effect_key = key("text-archive",launch.start.binding.job_id)
+        saved = _row(self.store.read_snapshot((effect_key,)),effect_key,TurnArchive)
+        if (saved.sdk_stop != stop or isinstance(saved.archive,(aw.SdkArchive,aw.StoredSdkArchive))
+                and saved.archive.sdk_session_id != session.assignment.sdk_session_id):
+            raise Problem(403,"ASSISTANT_NATIVE_RESULT","original reply and archive must bind the same stopped SDK")
+        return effect_key
 
     def no_sdk_report_context(self, launch, command):
         from .behavior_instruction_no_sdk import keys
@@ -1454,7 +1494,7 @@ class LocalAssistantExecutor:
             bridge = AssistantSession(client, root=self.root / assignment.session_id,
                                       runtime_path=self.runtime_path, model_transport=self.model_transport,
                                       resident=self.resident)
-            engine = AssistantEngine(None, process_marker=assignment.session_id, behavior=bridge)
+            engine = AssistantEngine(behavior=bridge)
             outcome = engine.dispatch({"operation": "assistant", "profile": aw.PROFILE, "action": "start"})
             return self._complete(start, outcome)
         finally:

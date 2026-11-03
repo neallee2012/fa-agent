@@ -1,6 +1,6 @@
 """A provider stream that fails mid-body after several tool rounds ends the turn explicitly; nothing is resent.
 
-Pinned SDK 1.0.13 / runtime 1.0.83 behind the real API app, Hosted session and checkpoint store; the tool is an
+Pinned SDK 1.0.26 / runtime 1.0.103 behind the real API app, Hosted session and checkpoint store; the tool is an
 in-process stand-in for run_command and the provider is a scripted local transport.
 """
 

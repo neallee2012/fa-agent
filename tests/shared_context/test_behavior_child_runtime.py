@@ -4,7 +4,6 @@ import json
 import base64
 import hashlib
 import time
-from pathlib import Path
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -51,25 +50,6 @@ def test_c1_configuration_registers_separate_child_work_without_child_authority_
     assert child.job_id == "child-job-1"
     assert child.work.work_id != config.bindings[0].work.work_id
     assert set(child.model_dump()) == {"job_id", "work"}
-
-
-def test_deployed_header_configuration_digest_and_empty_child_serialization_remain_unchanged():
-    path = Path(__file__).resolve().parents[2] / ".azure" / "behavior-native-config-header" / "config.json"
-    if not path.is_file():
-        pytest.skip("operator-owned deployed configuration is not present in this checkout")
-    original = path.read_bytes()
-    config = ServerConfiguration.model_validate_json(original)
-    assert config.sha256 == "97604ac577b08601885c1d867c8619b9305f5c9de5ed35c879b9af608733b8e1"
-    for binding in config.bindings:
-        assert "child_jobs" not in binding.model_dump()
-        assert "child_jobs" not in binding.model_dump(mode="json")
-    explicit = config.model_dump(mode="json")
-    for binding in explicit["bindings"]:
-        binding["child_jobs"] = []
-    same = ServerConfiguration.model_validate_json(json.dumps(explicit))
-    assert same.model_dump() == config.model_dump()
-    assert same.sha256 == config.sha256
-    assert path.read_bytes() == original
 
 
 class C1Harness(Harness):

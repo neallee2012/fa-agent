@@ -1,0 +1,591 @@
+{
+  "items": {
+    "ckpt:baeca2834ce8eb456ed29d3dbe888f79fa9423cc5b1c3d2cd6f12f05bdb038d7:0": {
+      "created_at": 1793697173,
+      "etag": "\"local-faa76784c0c3409fa159fd8f37687b73\"",
+      "expires_at": null,
+      "id": "it_da8681a09c53b836b19c582d",
+      "key": "ckpt:baeca2834ce8eb456ed29d3dbe888f79fa9423cc5b1c3d2cd6f12f05bdb038d7:0",
+      "object": "state_store.item",
+      "tags": null,
+      "updated_at": 1793697173,
+      "value": {
+        "count": 1,
+        "data": "eyJjb2RlYyI6InNlc3Npb24tZnMtcmVzcG9uc2VzLXYxIiwiZGlyZWN0b3JpZXMiOlsiY2hlY2twb2ludHMiLCJmaWxlcyIsInJlc2VhcmNoIl0sImZpbGVzIjp7ImNoZWNrcG9pbnRzL2luZGV4Lm1kIjoiIyBDaGVja3BvaW50IEhpc3RvcnlcblxuQ2hlY2twb2ludHMgYXJlIGxpc3RlZCBpbiBjaHJvbm9sb2dpY2FsIG9yZGVyLiBDaGVja3BvaW50IDEgaXMgdGhlIG9sZGVzdCwgaGlnaGVyIG51bWJlcnMgYXJlIG1vcmUgcmVjZW50LlxuXG58ICMgfCBUaXRsZSB8IEZpbGUgfFxufC0tLXwtLS0tLS0tfC0tLS0tLXxcbiIsImV2ZW50cy5qc29ubCI6IntcInR5cGVcIjogXCJzZXNzaW9uLnN0YXJ0XCIsIFwiZGF0YVwiOiB7XCJzZXNzaW9uSWRcIjogXCJzZGstZjEyZTU2ZDdhOGYzNDk0ODdiZWFlNGFlOTE3ODFmZGJlZmNhNjE2NmViODZjYzllXCIsIFwidmVyc2lvblwiOiAxLCBcInByb2R1Y2VyXCI6IFwiY29waWxvdC1hZ2VudFwiLCBcImNvcGlsb3RWZXJzaW9uXCI6IFwiMC4wLjBcIiwgXCJzdGFydFRpbWVcIjogXCIyMDI2LTExLTAzVDA5OjEyOjUyLjQxMFpcIiwgXCJzZWxlY3RlZE1vZGVsXCI6IFwiT0ZGTElORS1tb2RlbFwiLCBcImNvbnRleHRUaWVyXCI6IG51bGwsIFwiY29udGV4dFwiOiB7XCJjd2RcIjogXCIvXCJ9LCBcInJlbW90ZVN0ZWVyYWJsZVwiOiBmYWxzZSwgXCJhbHJlYWR5SW5Vc2VcIjogZmFsc2V9LCBcImlkXCI6IFwiZWM3MWViZWUtNTA0NC00OGM1LWIzZmEtZWJkYzIzODhiMTAzXCIsIFwidGltZXN0YW1wXCI6IFwiMjAyNi0xMS0wM1QwOToxMjo1Mi40MzBaXCIsIFwicGFyZW50SWRcIjogbnVsbH1cbntcInR5cGVcIjogXCJ1c2VyLm1lc3NhZ2VcIiwgXCJkYXRhXCI6IHtcImNvbnRlbnRcIjogXCJNQVJLLVFVRVNUSU9OLTE6IHRoZSBzaGlwbWVudCBjb2RlIGlzIEFaLTc3MzE7IHJlbWVtYmVyIGl0LlwiLCBcInRyYW5zZm9ybWVkQ29udGVudFwiOiBcIjxjdXJyZW50X2RhdGV0aW1lPjIwMjYtMTEtMDNUMTc6MTI6NTIuOTYwKzA4OjAwPC9jdXJyZW50X2RhdGV0aW1lPlxcblxcbk1BUkstUVVFU1RJT04tMTogdGhlIHNoaXBtZW50IGNvZGUgaXMgQVotNzczMTsgcmVtZW1iZXIgaXQuXCIsIFwibWVzc2FnZUlkXCI6IFwiMWIwODRmMGUtOTkyOS00ZDYxLWEwNDYtMWUyYThjYWMxYTA1XCIsIFwic3VwcG9ydGVkTmF0aXZlRG9jdW1lbnRNaW1lVHlwZXNcIjogW10sIFwiZGVsaXZlcnlcIjogXCJpZGxlXCIsIFwiaW50ZXJhY3Rpb25JZFwiOiBcImE2N2Q1NTdlLTJjYTAtNGRjMS1hZmRlLWQ4ZjIzOWI4OGYxN1wiLCBcInR1cm5JZFwiOiBcIjBcIiwgXCJwYXJlbnRBZ2VudFRhc2tJZFwiOiBcIjFlZDQyZDNkLTAzZWUtNGRlYS04ODRlLTE4MDMzZjQ4YTQxYlwifSwgXCJpZFwiOiBcIjliMDk1MmU5LTczMTctNDVhYS1iZDdlLWMxMzllMTc3YzExMlwiLCBcInRpbWVzdGFtcFwiOiBcIjIwMjYtMTEtMDNUMDk6MTI6NTIuOTYyWlwiLCBcInBhcmVudElkXCI6IFwiZWM3MWViZWUtNTA0NC00OGM1LWIzZmEtZWJkYzIzODhiMTAzXCJ9XG57XCJ0eXBlXCI6IFwic3lzdGVtLm1lc3NhZ2VcIiwgXCJkYXRhXCI6IHtcInJvbGVcIjogXCJzeXN0ZW1cIiwgXCJjb250ZW50XCI6IFwiXCIsIFwiaW50ZXJhY3Rpb25JZFwiOiBcImE2N2Q1NTdlLTJjYTAtNGRjMS1hZmRlLWQ4ZjIzOWI4OGYxN1wifSwgXCJpZFwiOiBcIjMxNjQ0NjRjLTQ5NzgtNDMxZC1iOWY4LTdhOWY4ZTI1MDY5MFwiLCBcInRpbWVzdGFtcFwiOiBcIjIwMjYtMTEtMDNUMDk6MTI6NTIuOTYyWlwiLCBcInBhcmVudElkXCI6IFwiOWIwOTUyZTktNzMxNy00NWFhLWJkN2UtYzEzOWUxNzdjMTEyXCJ9XG57XCJ0eXBlXCI6IFwiYXNzaXN0YW50LnR1cm5fc3RhcnRcIiwgXCJkYXRhXCI6IHtcInR1cm5JZFwiOiBcIjBcIiwgXCJpbnRlcmFjdGlvbklkXCI6IFwiYTY3ZDU1N2UtMmNhMC00ZGMxLWFmZGUtZDhmMjM5Yjg4ZjE3XCJ9LCBcImlkXCI6IFwiZTA4ZDcwMzAtMWRjYy00NzM2LWE1YTctM2ZlZmJiODdjMGY3XCIsIFwidGltZXN0YW1wXCI6IFwiMjAyNi0xMS0wM1QwOToxMjo1Mi45NjNaXCIsIFwicGFyZW50SWRcIjogXCIzMTY0NDY0Yy00OTc4LTQzMWQtYjlmOC03YTlmOGUyNTA2OTBcIn1cbntcInR5cGVcIjogXCJhc3Npc3RhbnQubWVzc2FnZVwiLCBcImRhdGFcIjoge1wibWVzc2FnZUlkXCI6IFwiODFiMDU1Y2YtODg2YS00YTY2LWI3NGMtMDdhNjdhMzg0OGU4XCIsIFwibW9kZWxcIjogXCJPRkZMSU5FLW1vZGVsXCIsIFwiY29udGVudFwiOiBcIk1BUkstQU5TV0VSLTE6IG5vdGVkLCBBWi03NzMxLlwiLCBcInRvb2xSZXF1ZXN0c1wiOiBbXSwgXCJpbnRlcmFjdGlvbklkXCI6IFwiYTY3ZDU1N2UtMmNhMC00ZGMxLWFmZGUtZDhmMjM5Yjg4ZjE3XCIsIFwidHVybklkXCI6IFwiMFwiLCBcInJ0ZVwiOiBmYWxzZSwgXCJhcGlDYWxsSWRcIjogXCJyZXNwX29mZmxpbmVfMVwiLCBcInNlcnZlclRvb2xzXCI6IHtcInByb3ZpZGVyXCI6IFwib3BlbmFpLXJlc3BvbnNlc1wifX0sIFwiaWRcIjogXCIzZDdkNmM2Yi02NzkyLTRhODQtYTI1NS02Y2RjMDgyZjJlYTZcIiwgXCJ0aW1lc3RhbXBcIjogXCIyMDI2LTExLTAzVDA5OjEyOjUzLjExNFpcIiwgXCJwYXJlbnRJZFwiOiBcImUwOGQ3MDMwLTFkY2MtNDczNi1hNWE3LTNmZWZiYjg3YzBmN1wifVxue1widHlwZVwiOiBcImFzc2lzdGFudC50dXJuX2VuZFwiLCBcImRhdGFcIjoge1widHVybklkXCI6IFwiMFwifSwgXCJpZFwiOiBcImZmMGMxNTVmLTMzMjQtNDg2Mi05ZDg3LTY1MWIyYjkwYjJiNVwiLCBcInRpbWVzdGFtcFwiOiBcIjIwMjYtMTEtMDNUMDk6MTI6NTMuMTE1WlwiLCBcInBhcmVudElkXCI6IFwiM2Q3ZDZjNmItNjc5Mi00YTg0LWEyNTUtNmNkYzA4MmYyZWE2XCJ9XG4iLCJ3b3Jrc3BhY2UueWFtbCI6ImlkOiBzZGstZjEyZTU2ZDdhOGYzNDk0ODdiZWFlNGFlOTE3ODFmZGJlZmNhNjE2NmViODZjYzllXG5jd2Q6IC9cbmNsaWVudF9uYW1lOiBzZGtcbm5hbWU6ICdNQVJLLVFVRVNUSU9OLTE6IHRoZSBzaGlwbWVudCBjb2RlIGlzIEFaLTc3MzE7IHJlbWVtYmVyIGl0LidcbnVzZXJfbmFtZWQ6IGZhbHNlXG5zdW1tYXJ5X2NvdW50OiAwXG5mb3JrX2NvdW50OiAwXG5jcmVhdGVkX2F0OiAyMDI2LTExLTAzVDA5OjEyOjUyLjQxNlpcbnVwZGF0ZWRfYXQ6IDIwMjYtMTEtMDNUMDk6MTI6NTIuOTU1WlxuIn0sIm1vZGVsX3Byb3ZpZGVyIjoib3BlbmFpLXJlc3BvbnNlcyIsInJ1bnRpbWVfdmVyc2lvbiI6IjEuMC44MyIsInNka19zZXNzaW9uX2lkIjoic2RrLWYxMmU1NmQ3YThmMzQ5NDg3YmVhZTRhZTkxNzgxZmRiZWZjYTYxNjZlYjg2Y2M5ZSIsInNka192ZXJzaW9uIjoiMS4wLjEzIn0=",
+        "index": 0,
+        "kind": "fa-native-checkpoint-segment-v1",
+        "segment_sha256": "baeca2834ce8eb456ed29d3dbe888f79fa9423cc5b1c3d2cd6f12f05bdb038d7",
+        "sha256": "baeca2834ce8eb456ed29d3dbe888f79fa9423cc5b1c3d2cd6f12f05bdb038d7"
+      }
+    },
+    "meta": {
+      "created_at": 1793697172,
+      "etag": "\"local-2cccddf386eb4f858d61018bd23a824e\"",
+      "expires_at": null,
+      "id": "it_3cb5113696bc5a3286e9bf0e",
+      "key": "meta",
+      "object": "state_store.item",
+      "tags": null,
+      "updated_at": 1793697172,
+      "value": {
+        "agent_id": "11111111-1111-1111-1111-111111111111",
+        "base_ckpt": null,
+        "capture": {
+          "attached_text": null,
+          "capabilities": null,
+          "model": {
+            "context_window_tokens": null,
+            "display_name": "OFFLINE model",
+            "id": "OFFLINE-model",
+            "input_microusd_per_million": null,
+            "max_output_tokens": null,
+            "output_microusd_per_million": null,
+            "supports_reasoning_effort": null
+          },
+          "model_capacity": null,
+          "profile_selection_id": null,
+          "reasoning_summary": null,
+          "role_prompt": {
+            "sha256": "f9119ef7e75386b87a0621e20905ef70054c2dff392c143ee3d25da3f8f7c16c",
+            "text": "Reply using only the supplied synthetic material.",
+            "version": 1
+          },
+          "schema_version": "fa-native-turn-capture-v1",
+          "template": {
+            "authorization": false,
+            "required_at_destination": [
+              "current-human-agent-team-binding",
+              "current-standing-read-and-work-policy",
+              "reviewed-work-sources-and-private-memory",
+              "model-deployment-and-provider-connection",
+              "connector-accounts-and-tool-grants",
+              "compatible-sdk-runtime-and-checkpoint"
+            ],
+            "role": {
+              "capability_catalog_version": "fa-instruction-tools-history-v1",
+              "prefix_sha256": "9c2a8bbe1609ba0fc93c5a86e90c0aab3386bb6ad5c5bee4dad7ac44e29dabb6",
+              "profile": "fa-instruction-agent-role-v1"
+            },
+            "schema_version": "fa-agent-template-v1",
+            "settings": {
+              "checkpoint_profile": {
+                "name": "auto-no-custom-v1",
+                "platform": "win32-x64",
+                "provider": "openai-responses"
+              },
+              "mode": "empty",
+              "model_capacity_profile": null,
+              "model_provider": "openai-responses",
+              "runtime_version": "1.0.83",
+              "sdk_start_profile": null,
+              "sdk_version": "1.0.13",
+              "user_text_file_profile": "fa-user-text-files-v1"
+            },
+            "skills": [],
+            "unavailable_skills": []
+          }
+        },
+        "conversation_id": "native-4cd1fc8e3cc2436584c365f5bb566a54",
+        "hosted_session_id": "OFFLINE-host-session",
+        "n": 1,
+        "rid": "rid-1",
+        "sdk_session_id": "sdk-f12e56d7a8f349487beae4ae91781fdbefca6166eb86cc9e",
+        "state_profile": "foundry-native-v2"
+      }
+    },
+    "text:7d503d48a48b5a97c9dc724cc02457df4374a40c732a25b2b9fa84f3632a87b7:0": {
+      "created_at": 1793697173,
+      "etag": "\"local-676f45dfd8254149b801496952971e66\"",
+      "expires_at": null,
+      "id": "it_42db6840c4163cfb21951a7b",
+      "key": "text:7d503d48a48b5a97c9dc724cc02457df4374a40c732a25b2b9fa84f3632a87b7:0",
+      "object": "state_store.item",
+      "tags": null,
+      "updated_at": 1793697173,
+      "value": {
+        "sha256": "7d503d48a48b5a97c9dc724cc02457df4374a40c732a25b2b9fa84f3632a87b7",
+        "text": "MARK-ANSWER-1: noted, AZ-7731."
+      }
+    },
+    "turn:1": {
+      "created_at": 1793697173,
+      "etag": "\"local-0b6b3ed30e7844968f3e12db8949b8d4\"",
+      "expires_at": null,
+      "id": "it_ec731a721d6ce1ec87c828f4",
+      "key": "turn:1",
+      "object": "state_store.item",
+      "tags": null,
+      "updated_at": 1793697173,
+      "value": {
+        "assembly": {
+          "capture_digest": "5cd5603159226414f54b69576b0c47d2a0072af14be4695428a7915c66a4d475",
+          "event_scope": "observed-metadata-not-exhaustive-history",
+          "inference": {
+            "attempts": [
+              {
+                "attempt_id": 1,
+                "body_bytes": 7663,
+                "body_sha256": "4ec00ed57467a2b0579d0760100900814127358075f3a853af949eb0b094de46",
+                "http_status": 200,
+                "ledger_measured": true,
+                "logical_id": 1,
+                "model": "OFFLINE-model",
+                "provider_id_reason": "not_reported",
+                "provider_request_id": null,
+                "provider_usage": {
+                  "cache_read_tokens": 0,
+                  "cache_write_tokens": null,
+                  "input_tokens": 21,
+                  "output_tokens": 13,
+                  "reasoning_tokens": 8,
+                  "total_tokens": 34,
+                  "unknown_reason": "not_reported_or_invalid"
+                },
+                "state": "complete",
+                "stream_complete": true,
+                "unknown_reason": "not_observed_or_unverified",
+                "usage_reason": null,
+                "wire_api": "responses"
+              }
+            ],
+            "billing_effect": "none-observation-only",
+            "counter_reason": null,
+            "full_request_tokens": null,
+            "full_request_tokens_reason": "counter_unavailable",
+            "logical_prepared": 1,
+            "omitted_observations": 0,
+            "provider_usage_ref": "receipt.usage",
+            "reason": null,
+            "requests": [
+              {
+                "body_bytes": 7663,
+                "body_sha256": "4ec00ed57467a2b0579d0760100900814127358075f3a853af949eb0b094de46",
+                "gateway_fingerprint": "4b7fe04f24ef34f85a797c7938509fafc303c5f8f69ae8f87acdce40711754c6",
+                "identity_reason": null,
+                "logical_id": 1,
+                "model": "OFFLINE-model",
+                "purpose": "unknown",
+                "purpose_reason": "not_reported",
+                "sdk_interaction_type": "conversation-agent",
+                "sdk_request_id": "e799ef69-6719-4fec-b0e5-479f9cb33d4a",
+                "sdk_session_id": "sdk-f12e56d7a8f349487beae4ae91781fdbefca6166eb86cc9e",
+                "source": "gateway",
+                "unknown_reason": "not_reported_or_invalid",
+                "wire_api": "responses"
+              }
+            ],
+            "schema_version": "fa-native-inference-observation-v1",
+            "sdk_context": [
+              {
+                "conversation_tokens": 48,
+                "current_tokens": 1508,
+                "event_id": "36407a85-31ba-45aa-857b-49223ba70e11",
+                "messages_length": 2,
+                "scope": "context-window-snapshot-not-turn-usage",
+                "system_tokens": 753,
+                "token_limit": 128000,
+                "tool_definitions_tokens": 707,
+                "unknown_reason": "not_reported_or_invalid"
+              }
+            ],
+            "sdk_context_reason": null,
+            "sdk_usage": [
+              {
+                "api_call_id": "resp_offline_1",
+                "dedup_reason": null,
+                "event_id": "5e8c5e83-f924-46c4-bc6d-b96b365bf705",
+                "identity_reason": "not_reported_or_invalid",
+                "match_reason": "no_verified_cross_source_id",
+                "model": "OFFLINE-model",
+                "provider_call_id": null,
+                "request_match": null,
+                "sdk_agent_id": null,
+                "sdk_session_id": "sdk-f12e56d7a8f349487beae4ae91781fdbefca6166eb86cc9e",
+                "service_request_id": null,
+                "tokens": {
+                  "cache_read_tokens": 0,
+                  "cache_write_tokens": 0,
+                  "input_tokens": 21,
+                  "output_tokens": 13,
+                  "reasoning_tokens": 8,
+                  "total_tokens": null,
+                  "unknown_reason": "not_reported_or_invalid"
+                }
+              }
+            ],
+            "sdk_usage_reason": null,
+            "state": "observed",
+            "transport_started": 1
+          },
+          "parts": [
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "base",
+              "reason": null,
+              "sha256": "9c2a8bbe1609ba0fc93c5a86e90c0aab3386bb6ad5c5bee4dad7ac44e29dabb6",
+              "source_ref": "capture.template.role",
+              "source_sha256": null,
+              "state": "configured",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": 3957
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "capabilities",
+              "reason": "not_selected",
+              "sha256": null,
+              "source_ref": "capture.capabilities",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "role",
+              "reason": null,
+              "sha256": "f9119ef7e75386b87a0621e20905ef70054c2dff392c143ee3d25da3f8f7c16c",
+              "source_ref": "capture.role_prompt",
+              "source_sha256": null,
+              "state": "included",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": 49
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "origin",
+              "reason": "not_selected",
+              "sha256": null,
+              "source_ref": "capture.template.settings",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "teammates",
+              "reason": "not_configured",
+              "sha256": null,
+              "source_ref": "native.peer_directory",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "groups",
+              "reason": "not_configured",
+              "sha256": null,
+              "source_ref": "native.group_context",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "providers",
+              "reason": "not_configured",
+              "sha256": null,
+              "source_ref": "native.providers",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "system_message",
+              "reason": null,
+              "sha256": "f769823a4668470bd410d1ae485818adae722ca58a886039a797a2697d9a80a8",
+              "source_ref": "sdk.arguments",
+              "source_sha256": null,
+              "state": "included",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": 4008
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "user_prompt",
+              "reason": null,
+              "sha256": "c6ec084e38614d1ee26695845fe5a2a6ce5e6877c0aa14f0aec3be7aad3e6c42",
+              "source_ref": "sdk.arguments",
+              "source_sha256": null,
+              "state": "included",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": 59
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "private_memory",
+              "reason": "not_configured",
+              "sha256": null,
+              "source_ref": "native.memory_search",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "team_memory",
+              "reason": "not_configured",
+              "sha256": null,
+              "source_ref": "native.memory_search",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "attachments",
+              "reason": "not_selected",
+              "sha256": null,
+              "source_ref": "capture.attached_text",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "user_files",
+              "reason": "not_selected",
+              "sha256": null,
+              "source_ref": "command.files",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "user_images",
+              "reason": "not_selected",
+              "sha256": null,
+              "source_ref": "command.images",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "checkpoint",
+              "reason": "no_previous_checkpoint",
+              "sha256": null,
+              "source_ref": "previous_checkpoint",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "routines",
+              "reason": "not_configured",
+              "sha256": null,
+              "source_ref": "receipt.routine",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "reminders",
+              "reason": "not_selected",
+              "sha256": null,
+              "source_ref": "native.work_reminders",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            },
+            {
+              "data_bytes": null,
+              "hash_scope": "utf8-text",
+              "name": "writing_style",
+              "reason": "not_selected",
+              "sha256": null,
+              "source_ref": "native.writing_style",
+              "source_sha256": null,
+              "state": "omitted",
+              "token_reason": "counter_unavailable",
+              "tokens": null,
+              "utf8_bytes": null
+            }
+          ],
+          "reason": null,
+          "schema_version": "fa-native-assembly-v1",
+          "sdk_binding_observed": true,
+          "sdk_binding_reason": null,
+          "selection": {
+            "base": {
+              "capability_catalog_version": "fa-instruction-tools-history-v1",
+              "prefix_sha256": "9c2a8bbe1609ba0fc93c5a86e90c0aab3386bb6ad5c5bee4dad7ac44e29dabb6",
+              "profile": "fa-instruction-agent-role-v1"
+            },
+            "capability_head_selection_id": null,
+            "capability_reason": "not_configured",
+            "checkpoint_profile": {
+              "name": "auto-no-custom-v1",
+              "platform": "win32-x64",
+              "provider": "openai-responses"
+            },
+            "model": "OFFLINE-model",
+            "profile_selection_id": null,
+            "profile_selection_reason": "not_selected",
+            "role_reason": null,
+            "role_sha256": "f9119ef7e75386b87a0621e20905ef70054c2dff392c143ee3d25da3f8f7c16c",
+            "role_version": 1,
+            "runtime_version": "1.0.83",
+            "sdk_version": "1.0.13"
+          },
+          "state": "recorded",
+          "tools": [
+            {
+              "grants": [],
+              "name": "read_context",
+              "schema_sha256": "9d75707c168746ad69e19fccbde7cd64d340b6cbf72692f03d2afd7770227304",
+              "toolbox_version": null,
+              "toolbox_version_reason": "not_applicable"
+            },
+            {
+              "grants": [],
+              "name": "execute_operation",
+              "schema_sha256": "9d75707c168746ad69e19fccbde7cd64d340b6cbf72692f03d2afd7770227304",
+              "toolbox_version": null,
+              "toolbox_version_reason": "not_applicable"
+            },
+            {
+              "grants": [],
+              "name": "read_user_turn",
+              "schema_sha256": "a567f14f6b4fb7fe40eb20a3072a42515def197c629951f0acaf527d9fcd6c4a",
+              "toolbox_version": null,
+              "toolbox_version_reason": "not_applicable"
+            },
+            {
+              "grants": [],
+              "name": "read_user_file",
+              "schema_sha256": "7237506b74b751a9a55f6f11f321bc7531efc48e262976dd1511a9b22e296e88",
+              "toolbox_version": null,
+              "toolbox_version_reason": "not_applicable"
+            },
+            {
+              "grants": [],
+              "name": "read_assistant_reply",
+              "schema_sha256": "a567f14f6b4fb7fe40eb20a3072a42515def197c629951f0acaf527d9fcd6c4a",
+              "toolbox_version": null,
+              "toolbox_version_reason": "not_applicable"
+            },
+            {
+              "grants": [],
+              "name": "read_tool_output",
+              "schema_sha256": "dabe0f1700af4895b3290795c05813803e5ba1951555bd4f293fc3c40c4db8cf",
+              "toolbox_version": null,
+              "toolbox_version_reason": "not_applicable"
+            }
+          ],
+          "tools_count": 6,
+          "tools_reason": null,
+          "tools_scope": "fa-bound-tool-specs"
+        },
+        "checkpoints": [
+          {
+            "agent_id": "11111111-1111-1111-1111-111111111111",
+            "byte_length": 3314,
+            "codec": "native-session-fs-responses-v1",
+            "conversation_id": "native-4cd1fc8e3cc2436584c365f5bb566a54",
+            "kind": "fa-native-checkpoint-v1",
+            "lineage": {
+              "capture_digest": "5cd5603159226414f54b69576b0c47d2a0072af14be4695428a7915c66a4d475",
+              "previous_request_id": null,
+              "previous_sha256": null,
+              "previous_turn_number": null,
+              "request_id": "rid-1",
+              "turn_number": 1
+            },
+            "model_provider": "openai-responses",
+            "runtime_version": "1.0.83",
+            "sdk_session_id": "sdk-f12e56d7a8f349487beae4ae91781fdbefca6166eb86cc9e",
+            "sdk_version": "1.0.13",
+            "segments": 1,
+            "sha256": "baeca2834ce8eb456ed29d3dbe888f79fa9423cc5b1c3d2cd6f12f05bdb038d7"
+          }
+        ],
+        "conversation_id": "native-4cd1fc8e3cc2436584c365f5bb566a54",
+        "n": 1,
+        "request_id": "rid-1",
+        "submit_digest": "95e86bf07eddf3bb594060d4f16c53531d6b11fc78cc8ad807b11e964260c66a",
+        "text_bytes": 30,
+        "text_parts": [
+          "7d503d48a48b5a97c9dc724cc02457df4374a40c732a25b2b9fa84f3632a87b7"
+        ],
+        "text_sha256": "7d503d48a48b5a97c9dc724cc02457df4374a40c732a25b2b9fa84f3632a87b7",
+        "usage": {
+          "schema_version": "fa-turn-model-usage-v1",
+          "usage": [
+            {
+              "input_tokens": 21,
+              "measured_requests": 1,
+              "model": "OFFLINE-model",
+              "output_tokens": 13,
+              "reasoning_tokens": 8,
+              "requests": 1,
+              "wire_api": "responses"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "store": {
+    "created_at": 1793697171,
+    "description": null,
+    "id": "ss_d29443966a633cd396b96d87",
+    "item_ttl_seconds": -1,
+    "name": "fa/v1/conv/native-4cd1fc8e3cc2436584c365f5bb566a54",
+    "object": "state_store",
+    "tags": {},
+    "updated_at": 1793697171,
+    "user_isolation": false
+  }
+}

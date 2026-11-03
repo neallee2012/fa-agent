@@ -28,10 +28,10 @@ from shared_context.native_capability_tools import REFUSED, UNKNOWN
 from shared_context.native_sdk import native_capability_providers
 from shared_context.native_turns import NativeTurnControl
 from shared_context.tool_catalog import CatalogError, build_catalog, load_catalog, parse_entry_file
-from test_behavior_assistant import assistant  # noqa: F401
+from test_behavior_assistant import assistant
 from test_capability_calls import WEBIQ
-from test_instruction_flow import instruction_models, runtime_path  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_instruction_flow import instruction_models, runtime_path
+from test_m3_auth import jwk_client, signing_key
 
 CATALOG_DIR = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc" / "tool_catalog"
 ENDPOINT = "https://acct.services.ai.azure.com/api/projects/proj"
@@ -264,7 +264,11 @@ def test_one_sdk_call_is_sent_once_and_an_unknown_or_refused_outcome_is_never_re
              (lambda body: httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
                                                      "error": {"code": -32602, "message": "bad"}}), TOOLBOX_NOT_RUN),
              (lambda body: httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
-                                                     "error": {"code": -32603, "message": "x"}}), TOOLBOX_OUTCOME_UNKNOWN)]
+                                                     "error": {"code": -32603, "message": "x"}}), TOOLBOX_OUTCOME_UNKNOWN),
+             (lambda body: httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
+                                                     "error": {"code": [-32602], "message": "x"}}), TOOLBOX_OUTCOME_UNKNOWN),
+             (lambda body: httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
+                                                     "error": {"code": -32602.0, "message": "x"}}), TOOLBOX_OUTCOME_UNKNOWN)]
     for index, (reply, code) in enumerate(cases):
         toolbox.reply = reply
         sent = len(toolbox.calls)
@@ -365,6 +369,15 @@ def reply_for(method, response):
     ("tools/list", lambda body: httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
                                                           "error": {"code": -32603, "message": CANARY}}),
      "rpc_error", "rpc_code=-32603", "source_error"),
+    ("tools/list", lambda body: httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
+                                                          "error": {"code": [-32603], "message": CANARY}}),
+     "rpc_error", "rpc_code=invalid", "source_error"),
+    ("tools/list", lambda body: httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
+                                                          "error": {"code": {"code": -32603}, "message": CANARY}}),
+     "rpc_error", "rpc_code=invalid", "source_error"),
+    ("tools/list", lambda body: httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
+                                                          "error": {"code": -32700.0, "message": CANARY}}),
+     "rpc_error", "rpc_code=invalid", "source_error"),
 ])
 def test_every_failed_listing_logs_a_fixed_reason_and_never_content(caplog, method, response, stage, reason,
                                                                    unavailable):

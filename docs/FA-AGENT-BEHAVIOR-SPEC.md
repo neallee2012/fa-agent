@@ -1753,6 +1753,24 @@ turns僅有agent item且effects為空，才能以原ETag明示綁到API MI candi
 原CID有已核可接續資料時沿原checkpoint追問，否則保留不可接續狀態，不改成空歷史。
 [固定SDK依據、驗證與部署步驟](../src/fa-shared-context-poc/README.md#原生未開始回合收尾local未部署)。
 
+2026-11-02 補充（LOCAL，未部署）：回條已是 started、但還沒有 turn_number 時，模型一定還沒跑，因為編號寫入在進模型之前。
+chain 工作再次進入這種回條時，這種回條同樣收成 `unknown`／`NATIVE_TURN_NOT_STARTED`。再次進入可能是資料庫短暫斷線後的 core 重試，也可能是 VM 當掉後的 recovered 重入。
+回條已有 cancel_requested，或 core 要求停止時，收成 `NATIVE_TURN_CANCELLED`。
+recovered 重入以前也接續不了這種回條：自動接續要求 meta.n 等於回條的 turn_number，空的編號一定不符。
+收尾寫入若合併到另一個已經寫上 turn_number 的版本，改記 `NATIVE_TURN_UNKNOWN`，不說成沒跑過。
+同一個回合在進模型前，如果只有一個步驟暫時失敗（5xx 或傳輸錯誤），而下一次讀取已經恢復，就不會進入重試，而是當場收尾。這時也收成 `NATIVE_TURN_NOT_STARTED`，有停止要求就收成 `NATIVE_TURN_CANCELLED`。
+明確的 4xx 拒絕，例如 `NATIVE_CAPTURE_CHANGED`，照舊保留原碼，因為重送也會再被拒絕。同時逾時也收成 `NATIVE_TURN_NOT_STARTED`，因為模型沒跑過。
+開工寫入失敗、讀回確認回條仍是原本的 accepted 時，Invocations 和 Responses 也收成 `NATIVE_TURN_NOT_STARTED`，不再顯示「請稍後核對」。
+2026-11-03 補充（#1147）：Responses 重新進入一個 started、還沒編號的回條時，也收成 `NATIVE_TURN_NOT_STARTED`（有停止要求收 `NATIVE_TURN_CANCELLED`），與 Invocations 一致，不再說成可能跑過。
+
+2026-11-03 決定（Neal，#1145，LOCAL，未部署）：答案和 checkpoint 已經存好、回條還沒標完成時才到的停止，來得太晚，答案優先。
+回條收成 `completed`，保留 `cancel_requested`；畫面照常顯示答案，並說明按停止時已經答完。和 VM 重啟後重進時的處理一致（`_reenter` 讀到已存好的 turn 一律標完成）。
+答案存好之前看到的停止照舊收成 `NATIVE_TURN_CANCELLED`。
+被交辦的助理答完才收到停止時，結果照常傳回交辦者；模型讀工作概況時，也把它當成已完成的結果。
+這個回合還沒送出的排隊 Agent 訊息，照舊被停止擋下，不會送出。
+
+2026-11-03 補充（#1146，LOCAL，未部署）：State store 斷線超過 core 的重試預算、core 丟掉輸入後，同一個 session 會在 store 恢復後通常約一分鐘內，把留下的 `started` 回條收成終態並送終態通知（最多再等約 55 分鐘；正在跑的回合和 store 自己的重試會讓它更晚）。最後一次重試的寫入若已生效、只是沒收到回應，收尾時也會補送通知。規則和非 recovered 的重試相同：沒編號可重送，已編號照已存的 turn 收尾，SDK 不再跑。VM 在這段期間關機，或一直連不上 store 時，回條照舊留到換環境後，由 stall rule 收尾。`accepted` 回條照舊由使用者重送。
+
 ## 2026-10-02 過期 pending 的明示重指（LOCAL，未部署）
 
 當已保存的接續目標落後目前build，owner／部署線可用**新的接續ID**明示改指目前server選定版本，
@@ -2724,7 +2742,7 @@ SDK／平台已有能力直接沿用，FA只補本次必要的業務差額。
 不以新增一般重試器、生命週期框架或多層批准流程替代。
 驗收先走真正SDK的最小呼叫鏈，再加必要FA業務控制；不能僅靠mock宣稱SDK能力已整合。
 
-當前版本基準為SDK `1.0.13`／runtime `1.0.83`；參考固定版本的
+當前版本基準為SDK `1.0.13`／runtime `1.0.83`（`shared_context/sdk_pin.py`）。模板、回條與checkpoint記下的是當時的版本，屬平台事實而非主人批准內容（Neal 2026-11-02）；讀取接受build宣告的`KNOWN_RELEASES`，新紀錄與實際執行一律用目前版本。參考固定版本的
 [Python SDK Interface](https://github.com/github/copilot-sdk/blob/f13e4a2cc7e4e220974d2333142234e162a3252e/python/README.md)、
 [Azure managed identity接法](https://github.com/github/copilot-sdk/blob/f13e4a2cc7e4e220974d2333142234e162a3252e/docs/setup/azure-managed-identity.md)，
 既有session／events資料來源見[官方平台證據](FA-BEHAVIOR-PLATFORM-EVIDENCE.md)。
@@ -2811,7 +2829,7 @@ M4 現有五案、上限與不包含項目只在[開發計畫的 M4 本批段落
 上述Interface受本文件SDK-first修訂約束：session與回合生命週期委由SDK，
 FA只保留可指出業務必要性的狀態及Adapter，不從這張邏輯表推導另一套通用runtime。
 
-現有 [AssistantEngine](../src/fa-shared-context-poc/shared_context/m2_assistant.py) 已有私人 run state、binding、`pending_or_unknown` 操作與明確 resume；它的 threads／process locks 不當成全域 mailbox／容量。現有 [ArtifactService](../src/fa-shared-context-poc/shared_context/m3_artifacts.py) 的 `create`／`upload`／`reconcile`／`decide`／`policy_context` 直接沿用。只有新增責任才新增 Module，不要求先搬目錄或改名全部 M2／M3 程式。
+現有 [AssistantEngine](../src/fa-shared-context-poc/shared_context/m2_assistant.py) 只是路由：`profile` 為 `assistant-v1.2` 且已組好 typed `AssistantSession` 時轉給它，其他 payload 一律拒絕；它不保存 run state、binding 或待核操作，也不提供 mailbox／容量。現有 [ArtifactService](../src/fa-shared-context-poc/shared_context/m3_artifacts.py) 的 `create`／`upload`／`reconcile`／`decide`／`policy_context` 直接沿用。只有新增責任才新增 Module，不要求先搬目錄或改名全部 M2／M3 程式。
 
 ### 最小持久資料
 

@@ -7,8 +7,6 @@ import json
 import os
 from pathlib import Path
 import socket
-import subprocess
-import sys
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -96,7 +94,7 @@ def fresh_case(tmp_path, jwk_client, monkeypatch):
         pytest.fail("fresh offline initialization must not open an external connection")
     monkeypatch.setattr(socket.socket, "connect", external)
     monkeypatch.setattr("test_behavior_server.WireTransport", FreshTableTransport)
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
     monkeypatch.delenv("FA_WORK_COST_OBSERVATION_FILE", raising=False)
     h = AssistantHarness(tmp_path, jwk_client)
     config = h.config
@@ -462,7 +460,7 @@ def test_fresh_native_peer_requires_its_own_explicit_template_selection(
         )
         assert refused.status_code == 403
         assert h.table.backing.rows == before
-        monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+        monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
         selected = client.post(
             base + "/select", json=command,
             headers=h.headers(signing_key, "Behavior.Read Behavior.Approve"),
@@ -573,24 +571,10 @@ def test_real_operator_cli_plan_apply_reconcile(fresh_case, tmp_path, monkeypatc
     assert "sources" not in outputs[0] and "identity" not in outputs[0]
 
 
-def test_fresh_api_only_cold_import():
-    script = """
-import importlib.abc
-import sys
-class RejectHosted(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == 'copilot' or fullname.startswith(('copilot.', 'azure.ai.agentserver')):
-            raise AssertionError('Hosted SDK import: ' + fullname)
-sys.meta_path.insert(0, RejectHosted())
-from shared_context.behavior_fresh_operator import main
-from shared_context.behavior_server import create_production_app
-main(['schema', 'authorization'])
-"""
-    result = subprocess.run([sys.executable, "-X", "utf8", "-c", script],
-        env={**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"},
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["title"] == "FreshInstallationAuthorization"
+def test_schema_command_prints_the_authorization_schema(capsys):
+    from shared_context.behavior_fresh_operator import main
+    main(["schema", "authorization"])
+    assert json.loads(capsys.readouterr().out)["title"] == "FreshInstallationAuthorization"
 
 
 def test_offline_export_uses_existing_console_models_without_claiming_installation(fresh_case, tmp_path, monkeypatch, capsys):

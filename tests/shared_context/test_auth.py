@@ -6,12 +6,12 @@ from types import SimpleNamespace
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi.testclient import TestClient
+from fastapi import Request
 
 from conftest import A, AUDIENCE, TENANT
-from legacy_m2_m4.api import create_app
 from shared_context.auth import AuthSettings, JwtVerifier
 from shared_context.config import validate_api_audience
+from shared_context.errors import Problem
 
 
 @pytest.fixture(scope="module")
@@ -33,10 +33,28 @@ def signed(private_key, changes=None, remove=None, headers=None):
     return jwt.encode(data, private_key, algorithm="RS256", headers=headers or {"kid": "test-key"})
 
 
+def request(*headers):
+    return Request({"type": "http", "headers": [(name.encode(), value.encode()) for name, value in headers]})
+
+
+def bearer(token):
+    return request(("authorization", "Bearer " + token))
+
+
+def status(verifier, incoming):
+    """The Problem status the live verifier raises for this request."""
+    with pytest.raises(Problem) as denied:
+        verifier(incoming)
+    return denied.value.status
+
+
+def local_keys(private_key):
+    return SimpleNamespace(get_signing_key_from_jwt=lambda token: SimpleNamespace(key=private_key.public_key()))
+
+
 @pytest.fixture
-def authenticated(system, auth, private_key):
-    keys = SimpleNamespace(get_signing_key_from_jwt=lambda token: SimpleNamespace(key=private_key.public_key()))
-    return TestClient(create_app(system[0], JwtVerifier(auth, keys)))
+def authenticated(auth, private_key):
+    return JwtVerifier(auth, local_keys(private_key))
 
 
 @pytest.mark.parametrize("issuer", [
@@ -45,10 +63,8 @@ def authenticated(system, auth, private_key):
 ])
 def test_signed_allowed_actor(authenticated, private_key, issuer):
     token = signed(private_key, {"iss": issuer, "actor": "spoofed", "team": "team-two"})
-    response = authenticated.post("/teams/team-one/works/auth-test", json={"goal": "synthetic"},
-                                  headers={"Authorization": f"Bearer {token}", "X-Actor": "agent-b"})
-    assert response.status_code == 201
-    assert response.json()["owner"] == A.actor and response.json()["team"] == A.team
+    actor = authenticated(request(("authorization", f"Bearer {token}"), ("x-actor", "agent-b")))
+    assert actor == A and actor.team == A.team
 
 
 @pytest.mark.parametrize("change", [
@@ -62,27 +78,21 @@ def test_signed_allowed_actor(authenticated, private_key, issuer):
     {"oid": 123},
 ])
 def test_reject_bad_claims(authenticated, private_key, change):
-    response = authenticated.get("/teams/team-one/works/auth-test",
-                                  headers={"Authorization": "Bearer " + signed(private_key, change)})
-    assert response.status_code == 401
+    assert status(authenticated, bearer(signed(private_key, change))) == 401
 
 
 @pytest.mark.parametrize("claim", ["exp", "iss", "aud", "tid", "oid"])
 def test_require_claims(authenticated, private_key, claim):
-    response = authenticated.get("/teams/team-one/works/auth-test",
-                                  headers={"Authorization": "Bearer " + signed(private_key, remove=claim)})
-    assert response.status_code == 401
+    assert status(authenticated, bearer(signed(private_key, remove=claim))) == 401
 
 
 def test_reject_unknown_oid(authenticated, private_key):
     token = signed(private_key, {"oid": "dddddddd-dddd-dddd-dddd-dddddddddddd"})
-    assert authenticated.get("/teams/team-one/works/auth-test",
-                             headers={"Authorization": "Bearer " + token}).status_code == 403
+    assert status(authenticated, bearer(token)) == 403
 
 
 def test_reject_header_bypass_none_hs256_invalid_signature(authenticated, private_key):
-    route = "/teams/team-one/works/auth-test"
-    assert authenticated.get(route, headers={"X-Actor": "agent-a", "X-Team": "team-one"}).status_code == 401
+    assert status(authenticated, request(("x-actor", "agent-a"), ("x-team", "team-one"))) == 401
     other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     for token in (
         jwt.encode(claims(), "", algorithm="none", headers={"kid": "test-key"}),
@@ -90,17 +100,17 @@ def test_reject_header_bypass_none_hs256_invalid_signature(authenticated, privat
         signed(other_key),
         jwt.encode(claims(), private_key, algorithm="RS256"),
     ):
-        assert authenticated.get(route, headers={"Authorization": "Bearer " + token}).status_code == 401
+        assert status(authenticated, bearer(token)) == 401
 
 
-def test_jwks_outage_fails_closed(system, auth, private_key):
+def test_jwks_outage_fails_closed(auth, private_key):
     def missing(_token):
         raise jwt.PyJWKClientConnectionError("unavailable")
-    client = TestClient(create_app(system[0], JwtVerifier(auth, SimpleNamespace(get_signing_key_from_jwt=missing))))
-    response = client.get("/teams/team-one/works/auth-test",
-                          headers={"Authorization": "Bearer " + signed(private_key)})
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "AUTH_KEYS_UNAVAILABLE"
+    verifier = JwtVerifier(auth, SimpleNamespace(get_signing_key_from_jwt=missing))
+    with pytest.raises(Problem) as unavailable:
+        verifier(bearer(signed(private_key)))
+    assert unavailable.value.status == 503
+    assert unavailable.value.body["error"]["code"] == "AUTH_KEYS_UNAVAILABLE"
 
 
 def test_no_arbitrary_issuer_configuration(auth):
@@ -108,18 +118,13 @@ def test_no_arbitrary_issuer_configuration(auth):
         AuthSettings(TENANT, AUDIENCE, ("https://evil.example/",), auth.actors)
 
 
-def test_resource_uri_audience_is_matched_exactly(system, auth, private_key):
+def test_resource_uri_audience_is_matched_exactly(auth, private_key):
     audience = "api://00000000-0000-0000-0000-000000000013/fa-context-poc-api"
     settings = AuthSettings(TENANT, audience, (f"https://sts.windows.net/{TENANT}/",), auth.actors)
-    keys = SimpleNamespace(get_signing_key_from_jwt=lambda token: SimpleNamespace(key=private_key.public_key()))
-    client = TestClient(create_app(system[0], JwtVerifier(settings, keys)))
+    verifier = JwtVerifier(settings, local_keys(private_key))
     for token_audience in (audience.rsplit("/", 1)[0], audience + "/.default", audience + "-other"):
-        response = client.post("/teams/team-one/works/resource-uri", json={"goal": "synthetic"},
-                               headers={"Authorization": "Bearer " + signed(private_key, {"aud": token_audience})})
-        assert response.status_code == 401
-    accepted = client.post("/teams/team-one/works/resource-uri", json={"goal": "synthetic"},
-                           headers={"Authorization": "Bearer " + signed(private_key, {"aud": audience})})
-    assert accepted.status_code == 201
+        assert status(verifier, bearer(signed(private_key, {"aud": token_audience}))) == 401
+    assert verifier(bearer(signed(private_key, {"aud": audience}))) == A
 
 
 @pytest.mark.parametrize("audience", [
@@ -162,29 +167,28 @@ def clock():
     _reset_forced_refresh_window()
 
 
-def test_unknown_kids_force_at_most_one_key_download_per_window(system, auth, private_key, monkeypatch, clock):
+def test_unknown_kids_force_at_most_one_key_download_per_window(auth, private_key, monkeypatch, clock):
     import uuid
     keys = _CountingKeys(monkeypatch, {"test-key": private_key}, lambda: clock.value)
-    client = TestClient(create_app(system[0], JwtVerifier(auth, keys.client)))
-    route = "/teams/team-one/works/auth-test"
-    assert client.post(route, json={"goal": "synthetic"},
-                       headers={"Authorization": "Bearer " + signed(private_key)}).status_code == 201
+    verifier = JwtVerifier(auth, keys.client)
+    assert verifier(bearer(signed(private_key))) == A
     assert keys.fetches == 1  # the cold fill
     for _ in range(25):
         forged = signed(private_key, headers={"kid": uuid.uuid4().hex})
-        response = client.get(route, headers={"Authorization": "Bearer " + forged})
-        assert response.status_code == 401 and response.json()["error"]["code"] == "UNAUTHENTICATED"
+        with pytest.raises(Problem) as denied:
+            verifier(bearer(forged))
+        assert denied.value.status == 401 and denied.value.body["error"]["code"] == "UNAUTHENTICATED"
     assert keys.fetches == 2, "one forced refresh per window, however many unknown kids arrive"
-    assert client.get(route, headers={"Authorization": "Bearer " + signed(private_key)}).status_code == 200
+    assert verifier(bearer(signed(private_key))) == A
     assert keys.fetches == 2
 
     rotated = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     keys.keys["rotated-key"] = rotated
-    new = {"Authorization": "Bearer " + signed(rotated, headers={"kid": "rotated-key"})}
+    new = bearer(signed(rotated, headers={"kid": "rotated-key"}))
     clock.value += 30
-    assert client.get(route, headers=new).status_code == 401 and keys.fetches == 2
+    assert status(verifier, new) == 401 and keys.fetches == 2
     clock.value += 31
-    assert client.get(route, headers=new).status_code == 200, "a rotated key is picked up after the window"
+    assert verifier(new) == A, "a rotated key is picked up after the window"
     assert keys.fetches == 3
 
 

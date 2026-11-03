@@ -965,7 +965,7 @@ def test_stage_keeps_its_original_webiq_names(monkeypatch):
 def deploy_case(hooks, tmp_path, monkeypatch, api_exists, keep_select=False, routes=None, steps=None, tty=True,
                 **values):
     steps = [] if steps is None else steps
-    record = lambda name, result=None: (lambda *args, **kwargs: steps.append(name) or result)  # noqa: E731
+    record = lambda name, result=None: (lambda *args, **kwargs: steps.append(name) or result)
     built = {"api": "a", "hosted": "h", "console": "c"}
     monkeypatch.setattr(hooks, "git_commit", lambda: "f" * 40)
     monkeypatch.setattr(hooks, "code_identity", lambda: "e" * 64)
@@ -1803,7 +1803,7 @@ def test_ctrl_c_in_the_window_steps_still_closes_it_with_ctrl_c_deferred(hooks, 
 
 def test_ctrl_c_during_the_close_is_loud_and_goes_on(hooks, tmp_path, deployer, capsys):
     account = FakeAccount()
-    closing = lambda args: "patch" in args and "foundry-window-close.json" in " ".join(args)  # noqa: E731
+    closing = lambda args: "patch" in args and "foundry-window-close.json" in " ".join(args)
     routes, _ = interrupting(account, closing)
     ctx = context(hooks, tmp_path, routes, **PRIVATE_DEPLOY, FA_PROJECT_ENDPOINT="https://p",
                   FA_CONFIRM_DEPLOY_WINDOW=IP)

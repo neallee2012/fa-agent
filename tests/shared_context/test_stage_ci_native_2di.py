@@ -1,5 +1,6 @@
 """ADR-0009 2d-i's one deploy switch (P9, src README#native-2di-switch): api_environment
-FA_NATIVE_SESSION_GUARD_ENFORCE="1" also makes every assistant's Hosted definition declare foundry-native-v2, the
+FA_NATIVE_SESSION_GUARD_ENFORCE="1" also makes every assistant's Hosted definition declare the Hosted profile
+(foundry-native-v3 from ADR-0009 3d-i, as the assistant seed does; the API stays v2), the
 deploy follow only reports, and guard, sync, api and follow let it on only over one serving revision that already
 runs P5+P6.
 
@@ -16,7 +17,7 @@ from shared_context import behavior_agent_versions as versions
 from test_stage_ci_routines import load_ci
 
 ROOT = Path(__file__).resolve().parents[2]
-V1, V2 = "foundry-native-v1", "foundry-native-v2"
+V1, V2, V3 = "foundry-native-v1", "foundry-native-v2", "foundry-native-v3"
 GUARD = "FA_NATIVE_SESSION_GUARD_ENFORCE"
 IDLE = "FA_NATIVE_IDLE_UPGRADE"
 
@@ -46,8 +47,10 @@ def test_stage_and_a_new_azd_environment_are_on(ci):
     for path in (ROOT / "deploy" / "stage" / "stage.json", ROOT / "deploy" / "azd" / "profile.defaults.json"):
         profile = json.loads(path.read_text(encoding="utf-8"))
         assert profile["api_environment"][GUARD] == "1" and profile["api_environment"][IDLE] == "0", path
-        # The files keep v1: ci_deploy derives the assistants' v2 from the switch, never from the profile.
-        assert profile["assistant_environment"]["FA_NATIVE_TURNS"] == V1
+        # ADR-0009 3d-i: the assistant seed declares the image's v3 (a v3 image refuses v2: native_sdk), the API v2;
+        # the deploy overlay still derives the assistants' value from the switch.
+        assert profile["assistant_environment"]["FA_NATIVE_TURNS"] == V3
+        assert profile["api_environment"]["FA_NATIVE_TURNS"] == V2
         assert all("FA_NATIVE_TURNS" not in (agent.get("hosted_environment") or {})
                    for agent in profile.get("agents", []))
         assert "FA_NATIVE_TURNS" not in profile.get("assistant_hosted_environment", {})
@@ -57,10 +60,10 @@ def test_stage_and_a_new_azd_environment_are_on(ci):
 @pytest.mark.parametrize("value", ["0", None])
 def test_a_guard_off_profile_deploy_is_blocked(ci, value):
     """ADR-0009 2d-ii: the API sends and supports v2 only, so a profile with the 2d-i switch off (or left out) stops
-    before any build or write; the v1 seed of the checked-in profiles is still only switched to v2 by it."""
+    before any build or write, even though the checked-in profiles already seed v3."""
     for path in (ROOT / "deploy" / "stage" / "stage.json", ROOT / "deploy" / "azd" / "profile.defaults.json"):
         profile = json.loads(path.read_text(encoding="utf-8"))
-        assert profile["assistant_environment"]["FA_NATIVE_TURNS"] == V1
+        assert profile["assistant_environment"]["FA_NATIVE_TURNS"] == V3
         assert all("FA_NATIVE_TURNS" not in (agent.get("hosted_environment") or {})
                    for agent in profile.get("agents", []))
     if value is None:
@@ -82,13 +85,13 @@ def test_the_real_stage_profile_passes_every_offline_turn_on_precondition(monkey
     ci.release = lambda: "test"
     api = ci.STAGE["api_environment"]
     assert ci.native_2di() is True and ci.missing_2di() == []
-    assert api[IDLE] == "0" and api["FA_NATIVE_UPGRADE_RECONCILER"] == "0" and api["FA_NATIVE_TURNS"] == V1
+    assert api[IDLE] == "0" and api["FA_NATIVE_UPGRADE_RECONCILER"] == "0" and api["FA_NATIVE_TURNS"] == V2
     assert "FA_UPGRADE_SNAPSHOT_CONTAINER_URL" not in api
     ci.check()
     overlay = ci.hosted_environment()
     for agent in ci.STAGE["agents"]:
         environment = overlay.get(agent["agent_id"]) or {}
-        assert (environment.get("FA_NATIVE_TURNS") == V2) is (agent["kind"] == "assistant"), agent["name"]
+        assert (environment.get("FA_NATIVE_TURNS") == V3) is (agent["kind"] == "assistant"), agent["name"]
         if environment:
             assert versions._check_environment(environment, ci.STAGE["hosted_idle_timeout_seconds"]) == environment
     assert "'--verify-follow'" in ci._sync_script("registry/hosted@sha256:" + "a" * 64, follow=True)
@@ -102,19 +105,19 @@ def test_switch_on_sets_both_and_the_follow_only_reports(ci):
     switch_on(ci)
     ci.check()
     overlay = ci.hosted_environment()
-    assert {agent_id for agent_id, env in overlay.items() if env.get("FA_NATIVE_TURNS") == V2} == {
+    assert {agent_id for agent_id, env in overlay.items() if env.get("FA_NATIVE_TURNS") == V3} == {
         agent["agent_id"] for agent in assistants(ci)}
     for agent in assistants(ci):
         environment = overlay[agent["agent_id"]]
         assert versions._check_environment(environment, ci.STAGE["hosted_idle_timeout_seconds"]) == environment
-    assert ci.STAGE["api_environment"][GUARD] == "1" and ci.STAGE["api_environment"]["FA_NATIVE_TURNS"] == V1
+    assert ci.STAGE["api_environment"][GUARD] == "1" and ci.STAGE["api_environment"]["FA_NATIVE_TURNS"] == V2
     script = ci._sync_script("registry/hosted@sha256:" + "a" * 64, follow=True)
     assert "'--verify-follow'" in script and "--defer-follow" not in script
     assert "--verify-follow" not in ci._sync_script("registry/hosted@sha256:" + "a" * 64)  # the sync step
 
 
 @pytest.mark.parametrize("case", ["v2_hosted_without_switch", "v2_seed_without_switch", "v1_hosted_with_switch",
-                                  "bad_value"])
+                                  "v2_hosted_with_switch", "bad_value"])
 def test_one_without_the_other_is_refused(ci, case):
     a = assistants(ci)[0]
     if case == "v2_hosted_without_switch":
@@ -123,9 +126,9 @@ def test_one_without_the_other_is_refused(ci, case):
     elif case == "v2_seed_without_switch":
         guard_off_profile(ci)
         ci.STAGE["assistant_environment"]["FA_NATIVE_TURNS"] = V2
-    elif case == "v1_hosted_with_switch":
+    elif case in {"v1_hosted_with_switch", "v2_hosted_with_switch"}:  # 3d-i: the switch sets v3 on assistants
         switch_on(ci)
-        a["hosted_environment"]["FA_NATIVE_TURNS"] = V1
+        a["hosted_environment"]["FA_NATIVE_TURNS"] = V1 if case.startswith("v1") else V2
     else:
         ci.STAGE["api_environment"][GUARD] = "true"
     with pytest.raises(SystemExit, match="2d-i switch"):
@@ -396,11 +399,13 @@ def _sync_registered(monkeypatch, served, **options):
     return foundry, R, {target.agent_name: foundry.creates(target.agent_name)[0][2] for target in (A, R)}
 
 
-def test_with_the_switch_on_a_registered_assistant_declares_v2_and_keeps_its_other_env(monkeypatch):
-    _, _, created = _sync_registered(monkeypatch, SERVED, native_v2_registered=True)
-    assert created["agent-r"]["environment_variables"] == {**SERVED, "FA_NATIVE_TURNS": V2}
-    # Configured Agents get v2 only from ci_deploy's overlay (hosted_environment()), not from this path.
-    assert created["agent-a"]["environment_variables"] == SERVED
+@pytest.mark.parametrize("served", [V1, V2])
+def test_with_the_switch_on_a_registered_assistant_declares_v3_and_keeps_its_other_env(monkeypatch, served):
+    served = {**SERVED, "FA_NATIVE_TURNS": served}
+    _, _, created = _sync_registered(monkeypatch, served, native_v2_registered=True)
+    assert created["agent-r"]["environment_variables"] == {**served, "FA_NATIVE_TURNS": V3}
+    # Configured Agents get v3 only from ci_deploy's overlay (hosted_environment()), not from this path.
+    assert created["agent-a"]["environment_variables"] == served
 
 
 def test_without_the_registered_flag_a_registered_agent_keeps_v1(monkeypatch):
@@ -415,7 +420,7 @@ def test_a_registered_agent_declaring_no_native_profile_is_untouched(monkeypatch
     served = {key: value for key, value in SERVED.items() if key != "FA_NATIVE_TURNS"}
     _, registered, created = _sync_registered(monkeypatch, served, native_v2_registered=True)
     assert created["agent-r"]["environment_variables"] == served
-    skipped = [record.getMessage() for record in caplog.records if "v2 not added" in record.getMessage()]
+    skipped = [record.getMessage() for record in caplog.records if "v3 not added" in record.getMessage()]
     assert len(skipped) == 1 and registered.agent_id in skipped[0] and "FA_NATIVE_TURNS=None" in skipped[0]
 
 
@@ -429,7 +434,7 @@ def test_after_the_release_the_2dii_gate_no_longer_lists_the_registered_agent_as
     version = foundry.selectors[registered.agent_name]
     store, _ = store_with(row(registered.agent_id, "sid-r", version,
                               profile=gate.definition_profile(created[registered.agent_name])))
-    report = gate.evaluate([registered], store.rows, read_with(foundry), armed=True, supported=frozenset({V2}))
+    report = gate.evaluate([registered], store.rows, read_with(foundry), armed=True, supported=frozenset({V2, V3}))
     if on:
         assert (report["decision"], report["refused"]) == ("pass", [])
     else:

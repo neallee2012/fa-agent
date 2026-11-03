@@ -79,7 +79,7 @@ Container App      Container App              one VM per assistant
 | Monitoring | Log Analytics, Application Insights | [`stage-monitoring.bicep`](infra/shared-context/stage-monitoring.bicep) |
 | Images | Azure Container Registry | [`foundation.bicep`](infra/shared-context/foundation.bicep) |
 
-The main pinned versions are `github-copilot-sdk==1.0.13`, Copilot runtime 1.0.83 (the executable the SDK starts inside the VM, downloaded and pinned when the image is built), `azure-ai-agentserver-core==2.2.0`, and `azure-ai-projects==2.3.0`. Versions for the assistant VM are in [`requirements-hosted.txt`](src/fa-shared-context-poc/requirements-hosted.txt), and API versions are in [`requirements.txt`](src/fa-shared-context-poc/requirements.txt).
+The main pinned versions are `github-copilot-sdk==1.0.26`, Copilot runtime 1.0.103 (the executable the SDK starts inside the VM, downloaded and pinned when the image is built), `azure-ai-agentserver-core==2.2.0`, and `azure-ai-projects==2.3.0`. Versions for the assistant VM are in [`requirements-hosted.txt`](src/fa-shared-context-poc/requirements-hosted.txt), and API versions are in [`requirements.txt`](src/fa-shared-context-poc/requirements.txt).
 
 ## Deploy to your Azure
 

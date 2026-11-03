@@ -26,6 +26,8 @@ from .errors import Problem
 MAX_PARALLEL_CHILDREN = 4
 _ARGUMENTS = (" Use agent_type=fa-delegate-v1 and mode=sync, with name, description and prompt only; "
               "overrides are unavailable.")
+_SIZE_REFUSAL_MESSAGE = ("Delegation material size exceeds 192 KiB. No child or intent was started; "
+                         "reduce the supplied material.")
 
 
 def _hash(value):
@@ -124,11 +126,7 @@ class SdkDelegationRuntime(ABC):
         agent_id = _field(event, "agent_id", "agentId")
         if (event.get("type") == "tool.execution_start" and agent_id in {None, self.sdk_session_id}
                 and _field(data, "tool_name", "toolName") == "task"):
-            identity = _field(data, "tool_call_id", "toolCallId")
-            if isinstance(identity, str):
-                arguments = data.get("arguments")
-                self.starts[identity] = (arguments if identity not in self.starts or self.starts[identity] == arguments
-                                         else None)
+            self._record_task_start(data)
             return
         if not self.children:
             return
@@ -140,48 +138,67 @@ class SdkDelegationRuntime(ABC):
         self._seen.add(event_id)
         try:
             if kind == "subagent.started":
-                child = self.children.get(_field(data, "tool_call_id", "toolCallId"))
-                if (child is None or _field(data, "agent_name", "agentName") != CHILD_AGENT_TYPE
-                        or not isinstance(agent_id, str) or child.child_id not in {None, agent_id}
-                        or self._by_agent(agent_id) not in {None, child}):
-                    raise ValueError("original child identity differs")
-                child.child_id = agent_id
-                self._queue(child, DelegationObservation(event_id=event_id, tool_call_id=child.tool_call_id,
-                                                         kind="started", child_agent_id=agent_id))
+                self._child_started(data, agent_id, event_id)
             elif kind == "assistant.message":
-                child = self._by_agent(agent_id)
-                if child is not None:
-                    child.last_text = data.get("content")
-                    child.last_has_tools = bool(_field(data, "tool_requests", "toolRequests"))
-                    if child.last_text is not None and not isinstance(child.last_text, str):
-                        raise ValueError("public child result must be text")
+                self._child_message(data, agent_id)
             elif kind in {"subagent.completed", "subagent.failed"}:
-                child = self.children.get(_field(data, "tool_call_id", "toolCallId"))
-                if child is None or child.child_id is None or agent_id != child.child_id:
-                    raise ValueError("child completion identity differs")
-                cancelled = data.get("cancelled") is True
-                self.cancelled |= cancelled
-                child.finished = not cancelled
-                self._queue(child, DelegationObservation(event_id=event_id, tool_call_id=child.tool_call_id,
-                    kind="result", child_agent_id=child.child_id, text=child.last_text,
-                    ended_in_tool_call=child.last_has_tools,
-                    outcome="cancelled" if cancelled else "failed" if kind == "subagent.failed" else "completed",
-                    failure_code="SDK_CHILD_FAILED" if kind == "subagent.failed" and not cancelled else None))
-                child.completion_observed.set()
-                if cancelled and child.idle_event_id is not None:
-                    self._queue_idle(child)
-            elif (kind == "session.idle" and agent_id in {None, self.sdk_session_id}
-                  and (self.cancelled or data.get("aborted") is True)):
-                for child in self.children.values():
-                    if child.child_id is not None and not child.finished:
-                        child.idle_event_id = event_id
-                        if self.cancelled:
-                            self._queue_idle(child)
+                self._child_ended(kind, data, agent_id, event_id)
+            elif kind == "session.idle":
+                self._parent_idle(data, agent_id, event_id)
         except (TypeError, ValueError):
             self.failure = Problem(409, "DELEGATION_OBSERVATION_INVALID", "the original SDK child observation differs")
             logging.getLogger(__name__).warning("DELEGATION_OBSERVATION_INVALID kind=%s", kind)
             for child in self.children.values():
                 child.completion_observed.set()
+
+    def _record_task_start(self, data):
+        identity = _field(data, "tool_call_id", "toolCallId")
+        if isinstance(identity, str):
+            arguments = data.get("arguments")
+            self.starts[identity] = (arguments if identity not in self.starts or self.starts[identity] == arguments
+                                     else None)
+
+    def _child_started(self, data, agent_id, event_id):
+        child = self.children.get(_field(data, "tool_call_id", "toolCallId"))
+        if (child is None or _field(data, "agent_name", "agentName") != CHILD_AGENT_TYPE
+                or not isinstance(agent_id, str) or child.child_id not in {None, agent_id}
+                or self._by_agent(agent_id) not in {None, child}):
+            raise ValueError("original child identity differs")
+        child.child_id = agent_id
+        self._queue(child, DelegationObservation(event_id=event_id, tool_call_id=child.tool_call_id,
+                                                 kind="started", child_agent_id=agent_id))
+
+    def _child_message(self, data, agent_id):
+        child = self._by_agent(agent_id)
+        if child is not None:
+            child.last_text = data.get("content")
+            child.last_has_tools = bool(_field(data, "tool_requests", "toolRequests"))
+            if child.last_text is not None and not isinstance(child.last_text, str):
+                raise ValueError("public child result must be text")
+
+    def _child_ended(self, kind, data, agent_id, event_id):
+        child = self.children.get(_field(data, "tool_call_id", "toolCallId"))
+        if child is None or child.child_id is None or agent_id != child.child_id:
+            raise ValueError("child completion identity differs")
+        cancelled = data.get("cancelled") is True
+        self.cancelled |= cancelled
+        child.finished = not cancelled
+        self._queue(child, DelegationObservation(event_id=event_id, tool_call_id=child.tool_call_id,
+            kind="result", child_agent_id=child.child_id, text=child.last_text,
+            ended_in_tool_call=child.last_has_tools,
+            outcome="cancelled" if cancelled else "failed" if kind == "subagent.failed" else "completed",
+            failure_code="SDK_CHILD_FAILED" if kind == "subagent.failed" and not cancelled else None))
+        child.completion_observed.set()
+        if cancelled and child.idle_event_id is not None:
+            self._queue_idle(child)
+
+    def _parent_idle(self, data, agent_id, event_id):
+        if agent_id in {None, self.sdk_session_id} and (self.cancelled or data.get("aborted") is True):
+            for child in self.children.values():
+                if child.child_id is not None and not child.finished:
+                    child.idle_event_id = event_id
+                    if self.cancelled:
+                        self._queue_idle(child)
 
     def _queue_idle(self, child):
         self._queue(child, DelegationObservation(event_id=child.idle_event_id, tool_call_id=child.tool_call_id,
@@ -234,69 +251,86 @@ class SdkDelegationRuntime(ABC):
                                                action, type(error).__name__)
             raise self.failure from None
 
+    def _refused(self, reason, message=None):
+        logging.getLogger(__name__).warning("FA_DELEGATION_REFUSED %s=%s reason=%s",
+                                           *self.diagnostic_scope, reason)
+        return {"permissionDecision": "deny", "permissionDecisionReason": message or (
+            f"Delegation refused [{reason}]. The original reservation for this subtask is unresolved; "
+            "do not resend it under another call or claim its result.")}
+
+    def _denied(self, command, reason, message):
+        # Nothing ran for this call: forget its start so a retry with the same arguments stays unambiguous.
+        self.starts.pop(command.tool_call_id, None)
+        return self._refused(reason, message)
+
     async def pre_tool(self, data, context):
         name = data.get("toolName")
-        def refused(reason, message=None):
-            logging.getLogger(__name__).warning("FA_DELEGATION_REFUSED %s=%s reason=%s",
-                                               *self.diagnostic_scope, reason)
-            return {"permissionDecision": "deny", "permissionDecisionReason": message or (
-                f"Delegation refused [{reason}]. The original reservation for this subtask is unresolved; "
-                "do not resend it under another call or claim its result.")}
         if context.get("session_id") != self.sdk_session_id:
-            return refused("session_mismatch")
+            return self._refused("session_mismatch")
         if data.get("sessionId") != self.sdk_session_id:
-            child = self._by_agent(data.get("sessionId"))
-            if not self.read_user_files or name != "read_user_file" or child is None or self.cancelled:
-                return refused("child_tool_denied")
-            try:
-                await self.drain()
-                if (child.reply is None or child.reply.status != "running"
-                        or child.reply.child_agent_id != child.child_id or await self.current() is not True):
-                    return refused("original_child_inactive")
-            except Problem:
-                return refused("original_child_unconfirmed")
-            return {"permissionDecision": "allow"}
+            return await self._child_tool(data, name)
         if name != "task":
             return None
         try:
             task = DelegationTask.model_validate(data.get("toolArgs"))
         except ValueError:
-            return refused("unsupported_arguments", not_started("unsupported_arguments", _ARGUMENTS))
+            return self._refused("unsupported_arguments", not_started("unsupported_arguments", _ARGUMENTS))
         candidates = [identity for identity, arguments in self.starts.items()
                       if arguments == data.get("toolArgs")]
         if len(candidates) != 1:
             reason = "tool_call_unmatched" if not candidates else "tool_call_ambiguous"
-            return refused(reason, not_started(reason, " Give each subtask its own distinct prompt."))
+            return self._refused(reason, not_started(reason, " Give each subtask its own distinct prompt."))
         command = DelegationPrepare(tool_call_id=candidates[0], arguments=task)
-
-        def denied(reason, message):
-            # Nothing ran for this call: forget its start so a retry with the same arguments stays unambiguous.
-            self.starts.pop(command.tool_call_id, None)
-            return refused(reason, message)
-
-        size_refusal = "Delegation material size exceeds 192 KiB. No child or intent was started; reduce the supplied material."
         if len(command.model_dump_json().encode("utf-8")) > DELEGATION_PREPARE_BYTES:
-            return denied("material_size_limit", size_refusal)
+            return self._denied(command, "material_size_limit", _SIZE_REFUSAL_MESSAGE)
+        refusal = await self._claim_slot(command)
+        if refusal is None:
+            refusal = await self._authorize(command)
+        if refusal is not None:
+            return refusal
+        if self.failure is not None:
+            # Another call's reservation became unresolved while this one waited.
+            return self._refused("original_reserved_or_unknown")
+        return await self._reserve(command, task)
+
+    async def _child_tool(self, data, name):
+        child = self._by_agent(data.get("sessionId"))
+        if not self.read_user_files or name != "read_user_file" or child is None or self.cancelled:
+            return self._refused("child_tool_denied")
+        try:
+            await self.drain()
+            if (child.reply is None or child.reply.status != "running"
+                    or child.reply.child_agent_id != child.child_id or await self.current() is not True):
+                return self._refused("original_child_inactive")
+        except Problem:
+            return self._refused("original_child_unconfirmed")
+        return {"permissionDecision": "allow"}
+
+    async def _claim_slot(self, command):
+        """Hold one of the turn's child slots, or return the refusal that says why the call did not run."""
         async with self._lock:
             if self.cancelled:
-                return denied("cancelled", "Delegation not started [cancelled]: this turn was cancelled; "
-                              "start no further subtasks.")
+                return self._denied(command, "cancelled", "Delegation not started [cancelled]: this turn was cancelled; "
+                                    "start no further subtasks.")
             if (command.tool_call_id in self.children or command.tool_call_id in self._pending
                     or self.failure is not None):
-                return refused("original_reserved_or_unknown")
+                return self._refused("original_reserved_or_unknown")
             if len(self.children) + len(self._pending) >= self.max_children:
-                return denied("child_limit", (
+                return self._denied(command, "child_limit", (
                     f"Delegation not started [child_limit]: at most {self.max_children} subtask call(s) can run "
                     "in this turn, so this one did not run; do it yourself."))
             # The slot is held while a human may still decide; the child exists only once its reservation starts.
             self._pending.add(command.tool_call_id)
+
+    async def _authorize(self, command):
+        """Check current authority and the approval hook, then release the held slot; a refusal comes back as the answer."""
         try:
             try:
                 authorized = await self.current()
             except Exception:
-                return denied("authority_unavailable", not_started("authority_unavailable"))
+                return self._denied(command, "authority_unavailable", not_started("authority_unavailable"))
             if authorized is not True:
-                return denied("current_authority_denied", not_started("current_authority_denied"))
+                return self._denied(command, "current_authority_denied", not_started("current_authority_denied"))
             if self.before_prepare is not None:
                 try:
                     await self.before_prepare(command)
@@ -304,37 +338,36 @@ class SdkDelegationRuntime(ABC):
                     code = error.body["error"]["code"]
                     if not code.startswith("NATIVE_HITL_"):
                         raise
-                    return denied(code, "This original child action was not approved; do not resend it.")
+                    return self._denied(command, code, "This original child action was not approved; do not resend it.")
         except Exception as error:
             # The hook may already have written this call's reservation, so its outcome is unknown.
             self.failure = self.failure or Problem(
                 503, "DELEGATION_UNKNOWN", "original delegation reservation is unresolved; do not respawn")
             logging.getLogger(__name__).warning("DELEGATION_OBSERVATION_UNRESOLVED phase=before_prepare exception_type=%s",
                                                type(error).__name__)
-            return refused("authority_or_reservation_error")
+            return self._refused("authority_or_reservation_error")
         finally:
             self._pending.discard(command.tool_call_id)
-        if self.failure is not None:
-            # Another call's reservation became unresolved while this one waited.
-            return refused("original_reserved_or_unknown")
+
+    async def _reserve(self, command, task):
         child = self.children[command.tool_call_id] = _Child(command.tool_call_id, _hash(task.model_dump(mode="json")))
         try:
             receipt = await self._call(child, "prepare", command)
             if self.cancelled:
-                return refused("cancelled")
+                return self._refused("cancelled")
             if not receipt.fresh:
                 self.failure = Problem(409, "DELEGATION_ORIGINAL_REQUIRED", "the original intent is already reserved; do not respawn")
-                return refused("original_reserved_or_unknown")
+                return self._refused("original_reserved_or_unknown")
             if receipt.status != "unknown" or receipt.child_agent_id is not None or receipt.result is not None:
                 self.failure = Problem(409, "DELEGATION_RECORD_INVALID", "the first reservation cannot contain another child")
-                return refused("initial_receipt_invalid")
+                return self._refused("initial_receipt_invalid")
         except Problem as error:
             if error.body["error"]["code"] == DELEGATION_SIZE_REFUSAL:
                 self.children.pop(command.tool_call_id, None)
-                return denied("material_size_limit", size_refusal)
-            return refused("authority_or_reservation_error")
+                return self._denied(command, "material_size_limit", _SIZE_REFUSAL_MESSAGE)
+            return self._refused("authority_or_reservation_error")
         except Exception:
-            return refused("authority_or_reservation_error")
+            return self._refused("authority_or_reservation_error")
         return {"permissionDecision": "allow", "modifiedArgs": task.model_dump(mode="json")}
 
     async def post_tool(self, data, context):

@@ -1,6 +1,6 @@
 """A cancelled long run_command keeps its conversation: the stopped SDK state is saved, and the next turn continues.
 
-Pinned SDK 1.0.13 / runtime 1.0.83 behind the real API app, Hosted session and checkpoint store. On Linux (the
+Pinned SDK 1.0.26 / runtime 1.0.103 behind the real API app, Hosted session and checkpoint store. On Linux (the
 desktop image as UID10001) the real shell runs; elsewhere a same-named stand-in writes runs.log and blocks.
 """
 

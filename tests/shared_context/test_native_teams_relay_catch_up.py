@@ -11,12 +11,12 @@ from shared_context.behavior_native_turn_wire import NATIVE_REQUEST, NativeRecei
 from shared_context.behavior_team_registry import resolve_agent_scope
 from shared_context.errors import Problem
 from shared_context.native_teams_relay import CATCH_UP_CUT, CHAT_PARTITION, REPLY_UTF16_BYTES, Chat
-from test_native_teams_relay import RELAY, STRANGER, complete, relay, rid  # noqa: F401
-from test_native_responses_api import responses_api  # noqa: F401
-from test_native_turn_api import native_api  # noqa: F401
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_native_teams_relay import RELAY, STRANGER, complete, relay, rid
+from test_native_responses_api import responses_api
+from test_native_turn_api import native_api
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
 
 HEADING = "先前的回覆（剛完成）："
 RUNNING = "這一輪還在跑；完成後，回覆會附在你下一則訊息的回覆前面，也可以先到工作台看。"

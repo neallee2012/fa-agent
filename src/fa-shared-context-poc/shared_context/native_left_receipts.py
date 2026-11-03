@@ -3,8 +3,8 @@
 The new session only numbers a turn of the conversation (r) or gives it the Responses slot (s) once the left receipt
 can no longer complete, so the conversation never forks, repeats work or runs two turns at once:
 
-- ``accepted`` (never started) on any earlier SID, retired or not: adopted (M9, Neal 2026-10-13; on a retired SID too,
-  review round 3: the platform can not run it there, so adopting it only gains). One CAS on its ``rid:`` item makes it
+- ``accepted`` (never started) on any earlier SID, retired or not: adopted (M9, Neal 2026-10-13; on a retired SID too:
+  the platform can not run it there, so adopting it only gains). One CAS on its ``rid:`` item makes it
   this session's (``hosted_session_id``), keeps its RID and request bytes and records ``adopted_from``; it then runs
   here exactly once, before newer messages of its conversation. The changed ETag rejects the source's own late writes
   (v28 ``_cas`` sends its ``started`` / ``_save_turn`` write with the accepted ETag first; the store refuses it).
@@ -26,10 +26,10 @@ marked here) its cards close as at a normal turn end (``close_cards``, ADR-0009 
 A message that has to wait never holds the Agent's chain (other conversations go on) and is never refused: it joins
 its conversation's ``left-queue`` (conversation store) and a ``fa-native-left-wait-v1`` task of its own looks again
 every ``POLL_SECONDS``, driving the stall rule above without any poll from outside; that task's own SDK timeout hands it
-over to a successor task and never ends the message (review round 5). Only the queue's first RID goes on,
+over to a successor task and never ends the message. Only the queue's first RID goes on,
 so older messages are served first whoever sent them. A Responses message then holds the slot (``needs_response``);
 Hosted can not send a Responses request to itself, so its wait task asks the API to send it (``on_slot_taken``, the
-Agent's own identity, review round 3) and keeps looking until it started, at most once per ``RESEND_SECONDS``: a
+Agent's own identity) and keeps looking until it started, at most once per ``RESEND_SECONDS``: a
 caller that stopped polling (the Teams relay stops at 110 s) still gets it sent, once. An adopted Responses slot
 holder gets the same wait task.
 
@@ -41,7 +41,7 @@ receipt every second (v28: every 0.1 s) and saves only by CAS on the original ET
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import logging
 import time
@@ -60,24 +60,24 @@ STALL_SECONDS = 600
 POLL_SECONDS = 5
 # How long a waiting Responses message that holds its slot waits for its request to arrive before asking the API again.
 RESEND_SECONDS = 30
-# The SDK timeout of one wait task (the SDK default is 1 day). It is not a limit on how long a message may wait (review
-# round 5): a holder that keeps progressing is waited for however long its turn takes, so when the timeout fires (or
+# The SDK timeout of one wait task (the SDK default is 1 day). It is not a limit on how long a message may wait: a
+# holder that keeps progressing is waited for however long its turn takes, so when the timeout fires (or
 # fires at once on a recovered task whose budget already passed) the task starts its successor and ends, and the
 # message stays ``accepted`` in its queue. Only the stall rule (N) decides that a holder is lost.
 WAIT_TIMEOUT_SECONDS = 3600
-# Review round 5: how many requests to send a waiting Responses message one wait task lets fail (404 from an older API,
+# How many requests to send a waiting Responses message one wait task lets fail (404 from an older API,
 # 5xx, transport error), at least ``RESEND_SECONDS`` apart, before it ends the message ``unknown``
 # (``NATIVE_TURN_TIMEOUT``) with its terminal notice: the owner sees it fail, never a silent ``needs_response``. The
-# count is per task run (review round 6): a successor, or the same task recovered after a VM restart, starts again from
+# count is per task run: a successor, or the same task recovered after a VM restart, starts again from
 # zero. Failing without a break takes about 30 minutes, under one task's hour, so a lasting outage ends the message in
 # the task where it began or, when it began late in that task, in its successor: without a VM restart, at most about
 # twice ``SEND_ATTEMPTS`` requests in all.
 SEND_ATTEMPTS = 60
-# Review round 6: the longest backoff between requests a 409 ``NATIVE_SESSION_CHANGED`` answers (``early_delay``).
+# The longest backoff between requests a 409 ``NATIVE_SESSION_CHANGED`` answers (``early_delay``).
 EARLY_MAX_SECONDS = 300
 FAILURE_CODE = "NATIVE_SOURCE_STALLED"
 # The API refused to send a waiting Responses message because the owner's work policy is revoked or inactive; the
-# message keeps waiting (review round 5), like an owner send under that policy.
+# message keeps waiting, like an owner send under that policy.
 REVOKED_CODE = "WORK_POLICY_REVOKED"
 _RETIRED = frozenset({"failed", "deleted", "expired", "missing"})
 _TERMINAL = frozenset({"completed", "unknown", "busy_refused"})
@@ -337,23 +337,15 @@ async def turn_order(runtime, original, *, meta=_UNREAD, held=None):
     (``slot:``, the one-at-a-time rule; an adopted one not sent yet is ``adopted:`` and the message queues instead).
     ``meta`` / ``held``: the conversation meta (None: none) and its holder's receipt the caller just read; only the
     queue is read again then, so an admission pays one extra read and no second meta read."""
-    from .native_checkpoint import conversation_store_name
-    from .native_turns import _Meta, _TASK_TRANSPORT_ERRORS, _decode
+    from .native_turns import _decode
 
     receipt = original.value.receipt
     rid, cid = receipt.request_id, receipt.conversation_id
     responses = receipt.state_profile == NATIVE_RESPONSES_PROFILE
-    try:
-        async with runtime._store(conversation_store_name(cid)) as store:
-            if meta is _UNREAD:
-                meta_item, queue_item = await asyncio.gather(store.get_item("meta"), store.get_item(QUEUE_KEY))
-                meta = None if meta_item is None else _decode(meta_item.value, _Meta)
-            else:
-                queue_item = await store.get_item(QUEUE_KEY)
-    except Problem as error:
-        if error.body["error"]["code"] == "NATIVE_STATE_STORE_MISSING":
-            return Order(True, False)
-        raise
+    reads = await _order_reads(runtime, cid, meta)
+    if reads is None:
+        return Order(True, False)
+    meta, queue_item = reads
     queue = None if queue_item is None else _decode(queue_item.value, _Queue)
     queued = queue is not None and rid in queue.request_ids
     first = await _head(runtime, cid, queue, None if queue_item is None else queue_item.etag)
@@ -365,24 +357,59 @@ async def turn_order(runtime, original, *, meta=_UNREAD, held=None):
     if held is None or held.value.receipt.request_id != holder:
         held = await runtime._rid(holder)
     if left(runtime, held.value.receipt):
-        adopted = await adopt(runtime, held)
+        adopted = await _adopt_holder(runtime, held)
         if adopted is None:
             return Order(await settled(runtime, held), queued, "left:" + holder)
-        try:
-            await _dispatch_adopted(runtime, adopted)
-        except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
-            # The adoption is committed; this caller's own send still advances the holder (``_advance_inflight``).
-            if isinstance(error, Problem) and error.status < 500:
-                raise
-            log.warning("NATIVE_LEFT_RECEIPT_ADOPTION_WAIT_UNCONFIRMED exception_type=%s", type(error).__name__)
         held = adopted
-    if responses and held.value.receipt.status == "accepted" and held.value.adopted_from is not None:
-        # Review round 3: an adopted holder not sent yet is waited for like a left one (queued, never refused);
+    # Invocations: the order among this session's own turns is the chain's.
+    return _slot_order(held, holder, queued) if responses else Order(True, queued)
+
+
+async def _order_reads(runtime, cid, meta):
+    """The conversation meta and the queue's item; None when the conversation has no store yet."""
+    from .native_checkpoint import conversation_store_name
+    from .native_turns import _Meta, _decode
+
+    try:
+        async with runtime._store(conversation_store_name(cid)) as store:
+            if meta is _UNREAD:
+                meta_item, queue_item = await asyncio.gather(store.get_item("meta"), store.get_item(QUEUE_KEY))
+                meta = None if meta_item is None else _decode(meta_item.value, _Meta)
+            else:
+                queue_item = await store.get_item(QUEUE_KEY)
+    except Problem as error:
+        if error.body["error"]["code"] == "NATIVE_STATE_STORE_MISSING":
+            return None
+        raise
+    return meta, queue_item
+
+
+async def _adopt_holder(runtime, held):
+    """The holder an earlier SID left, adopted and given its wait task; None when it can not be adopted."""
+    from .native_turns import _TASK_TRANSPORT_ERRORS
+
+    adopted = await adopt(runtime, held)
+    if adopted is None:
+        return None
+    try:
+        await _dispatch_adopted(runtime, adopted)
+    except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
+        # The adoption is committed; this caller's own send still advances the holder (``_advance_inflight``).
+        if isinstance(error, Problem) and error.status < 500:
+            raise
+        log.warning("NATIVE_LEFT_RECEIPT_ADOPTION_WAIT_UNCONFIRMED exception_type=%s", type(error).__name__)
+    return adopted
+
+
+def _slot_order(held, holder, queued):
+    """Behind a Responses holder of this session: one at a time until it ends."""
+    status = held.value.receipt.status
+    if status == "accepted" and held.value.adopted_from is not None:
+        # An adopted holder not sent yet is waited for like a left one (queued, never refused);
         # one at a time still holds, since only the queue's first takes the slot once the holder ends.
         return Order(False, queued, "adopted:" + holder)
-    if responses and held.value.receipt.status not in _TERMINAL:
+    if status not in _TERMINAL:
         return Order(False, queued, "slot:" + holder)
-    # Invocations: the order among this session's own turns is the chain's.
     return Order(True, queued)
 
 
@@ -426,7 +453,7 @@ def _wait_input(runtime, original):
 async def defer(runtime, original, behind, *, after=None):
     """Queue this accepted receipt in its conversation and start its own wait task (never the Agent's chain).
 
-    ``after``: the ID of the wait task this one succeeds (its timeout fired, review round 5); part of the new task's ID,
+    ``after``: the ID of the wait task this one succeeds (its timeout fired); part of the new task's ID,
     so the successor differs from it and a recovered copy of the same task finds the same successor (no second one)."""
     from azure.ai.agentserver.core.tasks import TaskConflictError
 
@@ -448,12 +475,20 @@ async def defer(runtime, original, behind, *, after=None):
 
 
 def early_delay(count: int) -> float:
-    """How long after its ``count``-th 409 ``NATIVE_SESSION_CHANGED`` in a row a waiting message is asked for again
-    (review round 6): the next look (``POLL_SECONDS``), then ``RESEND_SECONDS``, doubling up to ``EARLY_MAX_SECONDS``;
+    """How long after its ``count``-th 409 ``NATIVE_SESSION_CHANGED`` in a row a waiting message is asked for again:
+    the next look (``POLL_SECONDS``), then ``RESEND_SECONDS``, doubling up to ``EARLY_MAX_SECONDS``;
     never a failure, so it is never ended for it."""
     if count <= 1:
         return POLL_SECONDS
     return min(RESEND_SECONDS * 2 ** (count - 2), EARLY_MAX_SECONDS)
+
+
+@dataclass
+class _Sends:
+    """The requests to send one waiting Responses message in this task run."""
+    due_at: float | None = None  # monotonic: no request to send it before this
+    failed: int = 0
+    early: int = 0
 
 
 async def wait_turn(runtime, ctx):
@@ -461,86 +496,108 @@ async def wait_turn(runtime, ctx):
     until it may go on, then puts it on the Agent's chain (Invocations) or gives it the slot (Responses) and has the
     API send it, until its Responses handler started it.
 
-    Its SDK timeout never ends the message (review round 5): a holder that keeps progressing is waited for however long
+    Its SDK timeout never ends the message: a holder that keeps progressing is waited for however long
     its turn takes (only the stall rule decides it is lost), so on ``timeout_exceeded`` (also set at once on a task
     recovered after a VM restart whose budget passed) the task starts its successor and ends, the message still
     ``accepted`` in its queue. Failed sends are bounded by ``SEND_ATTEMPTS`` instead; a cancel still ends it."""
-    from time import monotonic
-
     from azure.ai.agentserver.core.tasks import SteeringQueueFull
 
     from .native_turns import NativeTaskInput, _TASK_TRANSPORT_ERRORS, _decode
 
     supplied = ctx.input if isinstance(ctx.input, NativeTaskInput) else _decode(ctx.input, NativeTaskInput)
     rid = supplied.request_id
-    due_at = None  # monotonic: no request to send it before this
-    failed = early = 0
+    sends = _Sends()
     while True:
         if ctx.shutdown.is_set():
             return await ctx.exit_for_recovery()
-        # Review round 6: the read, the cancel and the hand-over to a successor retry a transient error (5xx, transport)
+        # The read, the cancel and the hand-over to a successor retry a transient error (5xx, transport)
         # like a look does; ``cancel_requested`` / ``timeout_exceeded`` stay set, so the next pass does it again.
         # Failing the task there would leave the message ``accepted`` at its queue's head with no task looking at it.
         try:
-            original = await runtime._rid(rid)
-            receipt = original.value.receipt
-            if receipt.status != "accepted" or receipt.hosted_session_id != runtime.identity.session_id:
-                await dequeue(runtime, receipt)
-                return rid
-            if ctx.cancel_requested or receipt.cancel_requested:
-                return await _end(runtime, original, "NATIVE_TURN_CANCELLED")
-            if ctx.timeout_exceeded:
-                await defer(runtime, original, "renewed", after=ctx.task_id)
-                log.warning("NATIVE_LEFT_WAIT_RENEWED rid_prefix=%s", rid[:8])
-                return rid
-            if (await turn_order(runtime, original)).go:
-                if receipt.state_profile != NATIVE_RESPONSES_PROFILE:
-                    binding = await runtime._require_original_session(receipt=receipt)
-                    await runtime.chain.start(task_id=binding.task_id, input_id=rid,
-                                              input=_wait_input(runtime, original))
-                    return rid
-                taken = await runtime._response_slot(original, wait=False)
-                if taken.status != "accepted" or taken.dispatch is None:
-                    return rid
-                if taken.dispatch.state == "needs_response":
-                    if runtime.on_slot_taken is None:
-                        return rid
-                    if due_at is None or monotonic() >= due_at:
-                        outcome = await _send(runtime, taken)
-                        if outcome in {"refused", "revoked"}:
-                            # Review round 5: like an owner send under a revoked policy, nothing was sent and the
-                            # receipt is left as it is (``accepted``, holding its slot); it is sent once the policy is
-                            # restored, at the API's next touch of the conversation (``_advance_inflight``) or the
-                            # owner's reconcile of the same RID. Messages queued behind it keep looking every
-                            # ``POLL_SECONDS`` until then (review round 6): the owner's own action holds them.
-                            return rid
-                        if outcome in {"later", "failed"}:
-                            failed += 1
-                            if failed >= SEND_ATTEMPTS:
-                                return await _end(runtime, await runtime._rid(rid), "NATIVE_TURN_TIMEOUT")
-                        # "early": refused before anything was sent, never a failure; asked again after a backoff
-                        # (``early_delay``, review round 6). "sent", "failed" and "later" (an older API's 404) are
-                        # asked again after ``RESEND_SECONDS``.
-                        early = early + 1 if outcome == "early" else 0
-                        due_at = monotonic() + (early_delay(early) if early else RESEND_SECONDS)
-                # ``not_taken``, ``already_queued`` or just sent: look again; the top of the loop ends this task once
-                # the Responses handler started it (or it ended).
+            ended = await _look(runtime, ctx, rid, sends)
+            if ended is not None:
+                return ended
         except (SteeringQueueFull, *_TASK_TRANSPORT_ERRORS) as error:
             log.info("NATIVE_LEFT_WAIT_RETRY exception_type=%s", type(error).__name__)
         except Problem as error:
             if error.status < 500:
                 raise
             log.info("NATIVE_LEFT_WAIT_RETRY code=%s", error.body["error"]["code"])
-        # ``cancel`` is already set when a cancel or the timeout is being retried (the SDK sets it with
-        # ``timeout_exceeded``): then only shutdown cuts the sleep short, so the retry still waits ``POLL_SECONDS``.
-        signals = (asyncio.create_task(ctx.shutdown.wait()),
-                   *(() if ctx.cancel.is_set() else (asyncio.create_task(ctx.cancel.wait()),)))
-        try:
-            await asyncio.wait(signals, timeout=POLL_SECONDS, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for signal in signals:
-                signal.cancel()
-            await asyncio.gather(*signals, return_exceptions=True)
+        await _next_look(ctx)
+
+
+async def _look(runtime, ctx, rid, sends):
+    """One pass of the wait task; the RID when the task is done, None to look again."""
+    original = await runtime._rid(rid)
+    receipt = original.value.receipt
+    if receipt.status != "accepted" or receipt.hosted_session_id != runtime.identity.session_id:
+        await dequeue(runtime, receipt)
+        return rid
+    if ctx.cancel_requested or receipt.cancel_requested:
+        return await _end(runtime, original, "NATIVE_TURN_CANCELLED")
+    if ctx.timeout_exceeded:
+        await defer(runtime, original, "renewed", after=ctx.task_id)
+        log.warning("NATIVE_LEFT_WAIT_RENEWED rid_prefix=%s", rid[:8])
+        return rid
+    if (await turn_order(runtime, original)).go:
+        return await _go_on(runtime, original, rid, sends)
+    return None
+
+
+async def _go_on(runtime, original, rid, sends):
+    """Its turn came: the Agent's chain (Invocations) or the slot (Responses), sent by the API; as ``_look``."""
+    receipt = original.value.receipt
+    if receipt.state_profile != NATIVE_RESPONSES_PROFILE:
+        binding = await runtime._require_original_session(receipt=receipt)
+        await runtime.chain.start(task_id=binding.task_id, input_id=rid, input=_wait_input(runtime, original))
+        return rid
+    taken = await runtime._response_slot(original, wait=False)
+    if taken.status != "accepted" or taken.dispatch is None:
+        return rid
+    if taken.dispatch.state != "needs_response":
+        # ``not_taken`` or ``already_queued``: look again; the top of the loop ends this task once the Responses
+        # handler started it (or it ended).
+        return None
+    if runtime.on_slot_taken is None:
+        return rid
+    if sends.due_at is not None and time.monotonic() < sends.due_at:
+        return None
+    return await _ask_api(runtime, taken, rid, sends)
+
+
+async def _ask_api(runtime, taken, rid, sends):
+    """One send request and what it means for this task; as ``_look``."""
+    outcome = await _send(runtime, taken)
+    if outcome in {"refused", "revoked"}:
+        # Like an owner send under a revoked policy, nothing was sent and the receipt is left as it is
+        # (``accepted``, holding its slot); it is sent once the policy is restored, at the API's next touch of the
+        # conversation (``_advance_inflight``) or the owner's reconcile of the same RID. Messages queued behind it keep
+        # looking every ``POLL_SECONDS`` until then: the owner's own action holds them.
+        return rid
+    if outcome in {"later", "failed"}:
+        sends.failed += 1
+        if sends.failed >= SEND_ATTEMPTS:
+            return await _end(runtime, await runtime._rid(rid), "NATIVE_TURN_TIMEOUT")
+    # "early": refused before anything was sent, never a failure; asked again after a backoff (``early_delay``).
+    # "sent", "failed" and "later" (an older API's 404) are asked again after ``RESEND_SECONDS``.
+    sends.early = sends.early + 1 if outcome == "early" else 0
+    sends.due_at = time.monotonic() + (early_delay(sends.early) if sends.early else RESEND_SECONDS)
+    return None
+
+
+async def _next_look(ctx):
+    """Sleeps ``POLL_SECONDS``, cut short by a shutdown or a cancel.
+
+    ``cancel`` is already set when a cancel or the timeout is being retried (the SDK sets it with ``timeout_exceeded``):
+    then only shutdown cuts the sleep short, so the retry still waits ``POLL_SECONDS``."""
+    signals = (asyncio.create_task(ctx.shutdown.wait()),
+               *(() if ctx.cancel.is_set() else (asyncio.create_task(ctx.cancel.wait()),)))
+    try:
+        await asyncio.wait(signals, timeout=POLL_SECONDS, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for signal in signals:
+            signal.cancel()
+        await asyncio.gather(*signals, return_exceptions=True)
 
 
 async def _end(runtime, original, code):
@@ -562,15 +619,15 @@ async def _send(runtime, taken):
     - ``"sent"``: answered; looked at again no sooner than ``RESEND_SECONDS``, so a request still on its way is not
       sent twice (and Hosted's Responses handler admits one RID once: ``responses_queued`` and the ``started`` CAS);
     - ``"failed"``: a 5xx / transport error, after which the request may have been sent; spaced like ``"sent"`` and
-      counted against ``SEND_ATTEMPTS`` (review round 5);
+      counted against ``SEND_ATTEMPTS``;
     - ``"early"``: 409 ``NATIVE_SESSION_CHANGED``, refused before anything was sent (the API has not caught up with the
       switch that made this session the Agent's); asked again after a backoff (``early_delay``: the next look, then
       ``RESEND_SECONDS``, doubling up to ``EARLY_MAX_SECONDS``), never counted as failed. A session that is really no
       longer the Agent's sees its message adopted by the next one and its task ends at the top of the loop;
-    - ``"revoked"``: 403 ``WORK_POLICY_REVOKED``, the owner's work policy is revoked or inactive and nothing was sent
-      (review round 4): handled like ``"refused"`` (review round 5), as an owner send under that policy leaves its
+    - ``"revoked"``: 403 ``WORK_POLICY_REVOKED``, the owner's work policy is revoked or inactive and nothing was sent:
+      handled like ``"refused"``, as an owner send under that policy leaves its
       receipt ``accepted`` to be sent once the policy is restored;
-    - ``"later"``: 404, an API older than this route (review round 4; deploy order is API before Hosted): nothing was
+    - ``"later"``: 404, an API older than this route (deploy order is API before Hosted): nothing was
       sent, asked again no sooner than ``RESEND_SECONDS``, counted against ``SEND_ATTEMPTS``;
     - ``"refused"``: any other 4xx: the message keeps its slot and is sent at the API's next touch of the
       conversation, as before."""
@@ -590,8 +647,8 @@ async def _send(runtime, taken):
             log.warning("NATIVE_LEFT_SLOT_DISPATCH_REVOKED rid_prefix=%s", taken.request_id[:8])
             return "revoked"
         if error.status == 404:
-            # Review round 4: an API older than this route (deploy order is API first); asked again after
-            # ``RESEND_SECONDS``, at most ``SEND_ATTEMPTS`` failed requests in all (review round 5).
+            # An API older than this route (deploy order is API first); asked again after
+            # ``RESEND_SECONDS``, at most ``SEND_ATTEMPTS`` failed requests in all.
             log.info("NATIVE_LEFT_SLOT_DISPATCH_RETRY status=404 code=%s", code)
             return "later"
         if error.status < 500:
@@ -608,7 +665,7 @@ async def _send(runtime, taken):
 async def _dispatch_adopted(runtime, adopted):
     """An adopted receipt runs through the ordinary path of this session: it waits its turn in its conversation's
     queue with a wait task of its own. A Responses slot holder keeps its slot (it is the queue's first) and its wait
-    task has the API send it (review round 3: before, it waited for the API's next touch)."""
+    task has the API send it."""
     await defer(runtime, adopted, "adopted")
 
 
@@ -636,52 +693,71 @@ async def observe_left(runtime, original):
     return True
 
 
-async def adopt_left(runtime, source=None, rids=None):
-    """Right after an abandon commit, under the admission lock: adopt every never-started receipt other SIDs left,
-    oldest first, before this session admits anything, then close the cards of every turn that started on ``source``
-    (the SID just abandoned) when it is retired: such a turn can never complete (ADR-0009 gate 6). Bounded like the
-    backfill read; what it misses is adopted or closed when it is read (``observe_left``). ``rids``: the open-RID set
-    when it was complete for ``source`` (every open receipt is listed), read instead of every receipt."""
-    from time import monotonic
+@dataclass
+class _LeftScan:
+    """What ``adopt_left`` read so far; a read cut short keeps it and only ``complete`` turns False."""
+    source: str | None
+    deadline: float  # monotonic
+    found: list = field(default_factory=list)  # (created_at, key, receipt) never started: to adopt
+    started: list = field(default_factory=list)  # started on ``source``: its cards may have to close
+    complete: bool = True
 
+
+async def _left_keys(store, rids, after):
+    if rids is not None:
+        return ["rid:" + rid for rid in sorted(rids)], None
+    page = await store.list_keys(limit=100, after=after)
+    return [key.key for key in page.keys], page
+
+
+def _sort_left(runtime, scan, key, item, original):
+    receipt = original.value.receipt
+    if receipt.status == "accepted" and left(runtime, receipt):
+        created = getattr(item, "created_at", None)
+        scan.found.append((created if isinstance(created, int) and not isinstance(created, bool) else 0, key, original))
+    elif left(runtime, receipt) and receipt.hosted_session_id == scan.source:
+        scan.started.append(original)
+
+
+async def _scan_keys(runtime, store, keys, scan):
+    for key in keys:
+        if not key.startswith("rid:"):
+            continue
+        if time.monotonic() > scan.deadline:
+            scan.complete = False
+            return
+        item = await store.get_item(key)
+        try:
+            original = runtime._check_rid(item, key[4:])
+        except Problem:
+            continue
+        _sort_left(runtime, scan, key, item, original)
+
+
+async def _scan_left(runtime, scan, rids):
     from .native_turns import TURNS_STORE, _TASK_TRANSPORT_ERRORS
 
-    found, started, complete, after, deadline = [], [], True, None, monotonic() + _ADOPT_SCAN_SECONDS
+    after = None
     try:
         async with runtime._store(TURNS_STORE) as store:
-            while complete:
-                if rids is not None:
-                    keys, page = ["rid:" + rid for rid in sorted(rids)], None
-                else:
-                    page = await store.list_keys(limit=100, after=after)
-                    keys = [key.key for key in page.keys]
-                for key in keys:
-                    if not key.startswith("rid:"):
-                        continue
-                    if monotonic() > deadline:
-                        complete = False
-                        break
-                    item = await store.get_item(key)
-                    try:
-                        original = runtime._check_rid(item, key[4:])
-                    except Problem:
-                        continue
-                    if original.value.receipt.status == "accepted" and left(runtime, original.value.receipt):
-                        created = getattr(item, "created_at", None)
-                        found.append((created if isinstance(created, int) and not isinstance(created, bool) else 0,
-                                      key, original))
-                    elif left(runtime, original.value.receipt) and original.value.receipt.hosted_session_id == source:
-                        started.append(original)
+            while scan.complete:
+                keys, page = await _left_keys(store, rids, after)
+                await _scan_keys(runtime, store, keys, scan)
                 if page is None or not page.has_more:
                     break
                 if not page.last_id or page.last_id == after:
-                    complete = False
+                    scan.complete = False
                     break
                 after = page.last_id
     except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
         # Never fails the committed switch: what is not adopted here is adopted when it is read.
         log.warning("NATIVE_LEFT_RECEIPTS_ADOPTION_READ_UNCONFIRMED exception_type=%s", type(error).__name__)
-        complete = False
+        scan.complete = False
+
+
+async def _adopt_found(runtime, found):
+    from .native_turns import _TASK_TRANSPORT_ERRORS
+
     adopted = 0
     for _, _, original in sorted(found, key=lambda entry: entry[:2]):
         try:
@@ -692,10 +768,28 @@ async def adopt_left(runtime, source=None, rids=None):
         except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
             log.warning("NATIVE_LEFT_RECEIPT_ADOPTION_UNCONFIRMED exception_type=%s code=%s", type(error).__name__,
                         error.body["error"]["code"] if isinstance(error, Problem) else None)
-    log.warning("NATIVE_LEFT_RECEIPTS_ADOPTED count=%d complete=%s", adopted, complete)
+    return adopted
+
+
+async def _close_started(runtime, started):
+    from .native_turns import _TASK_TRANSPORT_ERRORS
+
     for original in started:
         try:
             if not await can_complete(runtime, original):
                 runtime._close_cards_later(original.value.receipt)
         except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
             log.info("NATIVE_LEFT_RECEIPT_CARDS_UNCONFIRMED exception_type=%s", type(error).__name__)
+
+
+async def adopt_left(runtime, source=None, rids=None):
+    """Right after an abandon commit, under the admission lock: adopt every never-started receipt other SIDs left,
+    oldest first, before this session admits anything, then close the cards of every turn that started on ``source``
+    (the SID just abandoned) when it is retired: such a turn can never complete (ADR-0009 gate 6). Bounded like the
+    backfill read; what it misses is adopted or closed when it is read (``observe_left``). ``rids``: the open-RID set
+    when it was complete for ``source`` (every open receipt is listed), read instead of every receipt."""
+    scan = _LeftScan(source=source, deadline=time.monotonic() + _ADOPT_SCAN_SECONDS)
+    await _scan_left(runtime, scan, rids)
+    adopted = await _adopt_found(runtime, scan.found)
+    log.warning("NATIVE_LEFT_RECEIPTS_ADOPTED count=%d complete=%s", adopted, scan.complete)
+    await _close_started(runtime, scan.started)

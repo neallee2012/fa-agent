@@ -51,7 +51,8 @@ from .behavior_turn_usage import TurnModelUsage
 from .behavior_wire import AssistantSdkStop, Digest, HostedIdentity, Identifier, WireModel
 from .errors import Problem
 from .native_responses_wire import (
-    NATIVE_RESPONSES_PROFILE, UNLABELED_STATE_PROFILE, NativeResponseDispatch, NativeStateProfile, channel)
+    NATIVE_RESPONSES_PROFILE, NATIVE_V2_PROFILE, UNLABELED_STATE_PROFILE, NativeResponseDispatch, NativeStateProfile,
+    channel)
 from .native_append_wire import NativeAppend, NativeAppendRead
 from .native_progress_wire import NativeProgressRead, NativeTurnStatusRead
 from .native_files_wire import NativeSessionFiles
@@ -66,6 +67,12 @@ from .native_markers import (
     _Deferred, _Refused,
 )
 
+# ADR-0009 §3 v2→v3 3d-i: a runtime also admits the v2 header as an alias of its own profile while the API still sends
+# v2. Temporary: the first image after 3d-ii removes it.
+HEADER_ALIAS_PROFILES = frozenset({NATIVE_V2_PROFILE})
+# Body Invocations profiles a runtime admits besides its own: an unlabeled v1 or a v2 original resent with its own
+# digest. Permanent, unlike the header alias (stored originals keep their profile).
+STORED_BODY_PROFILES = frozenset({UNLABELED_STATE_PROFILE, NATIVE_V2_PROFILE})
 TURNS_STORE = "fa/v1/turns"
 EFFECTS_STORE = "fa/v1/effects"
 MAX_ITEM_BYTES = 1_000_000
@@ -93,8 +100,11 @@ _MARKER_WRITE_SECONDS = 2
 UNEXITED_WAIT_SECONDS = 60
 # ``_unknown`` writes again onto a RID that another writer (cancel, append) changed meanwhile, at most this often.
 UNKNOWN_MERGES = 3
-# Waits before each further attempt to save a finished turn after an unconfirmed (503) step; then it is re-entered.
-SAVE_RETRY_SECONDS = (0.5, 2.0)
+# Waits before each further attempt to save a finished turn after an unconfirmed (503) step; then it is re-entered. An
+# unsaved answer exists only in this process, so it gets about as long (4 min) as core gives the chain's own retries.
+SAVE_RETRY_SECONDS = (0.5, 2.0, 4, 8, 16, 32, 60, 60, 60)
+# #1146 _close_after_outage: about 55 min, at most a minute between reads, like core's own retry cap.
+OUTAGE_CLOSE_SECONDS = (1, 2, 4, 8, 16, 32, *(60,) * 54)
 _UNCERTAIN = (FoundryStorageError, AzureError, OSError)
 _CONFLICT = (FoundryStorageConflictError, FoundryStoragePreconditionError)
 _TASK_TRANSPORT_ERRORS = (AzureError, OSError, TransportClassifiedError)
@@ -115,18 +125,12 @@ def _raised(value):
     return value
 
 
-async def _pending_when_transient(awaitable):
-    """A 5xx or transport failure becomes ``NativePostTurnPending``: core retries the task within its finite budget."""
-    try:
-        return await awaitable
-    except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
-        if isinstance(error, Problem) and error.status < 500:
-            raise
-        raise NativePostTurnPending() from None
-
-
 def _changed(model, **updates):
     return type(model).model_validate_json(model.model_copy(update=updates).model_dump_json())
+
+
+def _may_have_entered_sdk(receipt):
+    return receipt.turn_number is not None
 
 
 def _refused_final(receipt):
@@ -178,6 +182,17 @@ def _decode(value, model):
         return model.model_validate_json(json.dumps(value, ensure_ascii=False, allow_nan=False))
     except (ValueError, TypeError):
         raise Problem(409, "NATIVE_STATE_INVALID", "the saved native state has an invalid shape") from None
+
+
+def _input_rid(ctx):
+    """This turn's RID: core steering reports the chain's last_input_id on ctx, the input itself names the RID. None
+    for a recovered drained input (core passes payload.input=None; ``_turn_input`` reads it from the task record)."""
+    if ctx.input is None:
+        return None
+    try:
+        return (ctx.input if isinstance(ctx.input, NativeTaskInput) else _decode(ctx.input, NativeTaskInput)).request_id
+    except Problem:
+        return None
 
 
 def _conversation_capture(capture, *, include_model=True):
@@ -274,7 +289,7 @@ class _StoreClients:
     def __init__(self, loop):
         self.loop, self.stores, self.users = loop, OrderedDict(), {}
         self.lock, self.credential, self.credential_scope = asyncio.Lock(), None, AsyncExitStack()
-        # Review P2 on #889: a markers store this process found missing, so each RID read does not pay its 404 again.
+        # A markers store this process found missing, so each RID read does not pay its 404 again.
         # shortcut: per process; a store another process created is seen after a restart, except by ``adopt`` (another
         # SID's receipt), which looks again (``fresh``); this process's own creates clear it. One Hosted session, one VM.
         self.missing = set()
@@ -435,7 +450,7 @@ class NativeTurnRuntime:
                  state_profile=NATIVE_STATE_PROFILE):
         self.identity, self.executor = identity, executor
         # ADR-0009 M1 2d-i: the profile this runtime declares (FA_NATIVE_TURNS); it labels new conversations' _Meta
-        # and, at v2, admits the v1 header too. Digest-bearing items keep the profile of the request that made them.
+        # and is the header it admits (with 3d-i's v2 alias). Digest-bearing items keep the profile of their request.
         self.state_profile = state_profile
         self.credential_factory, self.cache_root, self.preflight = credential_factory, cache_root, preflight
         self._agent_session = None
@@ -450,6 +465,8 @@ class NativeTurnRuntime:
         # Open-RID removals after a terminal write, run beside the chain instead of before its next turn (``_cas``),
         # and left turns' card closes (``_close_cards_later``); drained together at shutdown.
         self._open_removals: set[asyncio.Task] = set()
+        # Closers of started RIDs whose input core dropped (#1146); shutdown cancels them, the stall rule remains.
+        self._outage_closes: dict[str, asyncio.Task] = {}
         # RIDs whose card close already started here: one per RID per process, however often the RID is read.
         self._card_closes: set[str] = set()
         self.execution_lock = asyncio.Lock()
@@ -503,7 +520,7 @@ class NativeTurnRuntime:
         @task(name="fa-native-terminal-notification-v1", retry=self._notification_retry)
         async def notify(ctx: TaskContext[str]):
             try:
-                # A RID refused by version is final only as a read-time view (#889 P3): strict, so an unconfirmed
+                # A RID refused by version is final only as a read-time view: strict, so an unconfirmed
                 # markers read retries rather than delivers an ``accepted`` receipt.
                 receipt = await self._refused_view(await self.read(ctx.input), strict=True)
             except Problem as error:
@@ -633,7 +650,7 @@ class NativeTurnRuntime:
 
     async def _refuse_drifted_enqueue(self, supplied, receipt):
         if supplied.execution_version is not None and supplied.execution_version != self.identity.agent_version:
-            # Only the receipt's own session marks it (review P3 on #889): a retired SID's mark of a RID another
+            # Only the receipt's own session marks it: a retired SID's mark of a RID another
             # session adopted and runs would read "resend" while it runs.
             if receipt.hosted_session_id == self.identity.session_id and await self._mark_refused(supplied):
                 if (viewed := _refused_final(receipt)) is not receipt:  # a finished RID already told its sender
@@ -676,7 +693,7 @@ class NativeTurnRuntime:
             try:
                 await asyncio.wait_for(self._mark_deferred(original.value.receipt.request_id, token),
                                        _MARKER_WRITE_SECONDS)
-            except Exception as error:  # noqa: BLE001 - whatever the store answers, the shutdown goes on
+            except Exception as error:  # whatever the store answers, the shutdown goes on
                 log.warning("FA_NATIVE_DEFERRED_MARK_UNCONFIRMED exception_type=%s", type(error).__name__)
         return await ctx.exit_for_recovery()
 
@@ -704,14 +721,14 @@ class NativeTurnRuntime:
                 except _CONFLICT:
                     pass  # refused before (a retry of the same input); the first marker stays
             return True
-        except Exception as error:  # noqa: BLE001 - the refusal itself never depends on the marker
+        except Exception as error:  # the refusal itself never depends on the marker
             log.warning("FA_NATIVE_REFUSED_MARK_UNCONFIRMED exception_type=%s", type(error).__name__)
             return False
 
     async def _refused(self, rid, *, fresh=False, strict=False):
         """True when ``refused:<RID>`` exists; a missing store is not a refusal. ``fresh``: also looks when this process
         cached the store as missing (another session may have created it since). An unconfirmed read is not a refusal
-        either, except when ``strict`` (the gate before a run, review P2 on #889): then it is NativePostTurnPending."""
+        either, except when ``strict`` (the gate before a run): then it is NativePostTurnPending."""
         try:
             async with self._store(MARKERS_STORE, fresh=fresh) as store:
                 return await store.get_item(f"refused:{rid}") is not None
@@ -894,7 +911,7 @@ class NativeTurnRuntime:
     async def _count_crash(self, receipt):
         try:
             await self._record_crash(receipt)
-        except Exception as error:  # noqa: BLE001 - a lost count never stops the turn or its refusal
+        except Exception as error:  # a lost count never stops the turn or its refusal
             log.warning("FA_NATIVE_CRASH_UNCONFIRMED exception_type=%s", type(error).__name__)
 
     async def _record_crash(self, receipt):
@@ -1133,7 +1150,7 @@ class NativeTurnRuntime:
         from .native_checkpoint import open_durable_store
 
         cached = clients.stores.get(name)
-        # ``fresh``: a read that decides whether work runs never trusts a miss cached earlier (review P3 on #889).
+        # ``fresh``: a read that decides whether work runs never trusts a miss cached earlier.
         if cached is None and not (create or fresh) and name in clients.missing:
             raise Problem(404, "NATIVE_STATE_STORE_MISSING", "the State store does not exist; nothing was created")
         if cached is None:
@@ -1153,7 +1170,7 @@ class NativeTurnRuntime:
                         raise
                     clients.stores[name] = cached
                     # Under the lock: a miss a read cached while this create waited for it is healed here, so it never
-                    # resurfaces once this client is evicted (review P3 on #889).
+                    # resurfaces once this client is evicted.
                     clients.missing.discard(name)
         clients.stores.move_to_end(name)
         return cached
@@ -1374,7 +1391,7 @@ class NativeTurnRuntime:
         async def removal():
             try:
                 await remove(self, rid)
-            except Exception as error:  # noqa: BLE001 - best effort; the next follow re-checks a stale entry
+            except Exception as error:  # best effort; the next follow re-checks a stale entry
                 log.warning("FA_NATIVE_OPEN_RID_KEPT exception_type=%s", type(error).__name__)
 
         self._beside(removal())
@@ -1391,7 +1408,7 @@ class NativeTurnRuntime:
         async def closing():
             try:
                 await close_cards(self, receipt)
-            except Exception as error:  # noqa: BLE001 - best effort; an unclosed card keeps its TTL
+            except Exception as error:  # best effort; an unclosed card keeps its TTL
                 log.warning("NATIVE_LEFT_RECEIPT_CARDS_UNCONFIRMED exception_type=%s", type(error).__name__)
 
         self._beside(closing())
@@ -1421,6 +1438,10 @@ class NativeTurnRuntime:
     async def aclose(self):
         """VM shutdown: give the open-RID removals in flight a short bound to finish. Called again after the SDK
         executor closes, for the removals of turns that ended while it stopped them (each call has its own bound)."""
+        closers = tuple(self._outage_closes.values())
+        for task in closers:
+            task.cancel()
+        await asyncio.gather(*closers, return_exceptions=True)
         await self.drain_open_removals(timeout=_OPEN_REMOVALS_CLOSE_SECONDS)
 
     async def _cas_rid(self, original: _Versioned, replacement: _Rid):
@@ -1939,7 +1960,7 @@ class NativeTurnRuntime:
             return await settle()
         try:
             return await asyncio.wait_for(settle(), _MARKER_WRITE_SECONDS)
-        except Exception as error:  # noqa: BLE001 - whatever the store answers, the shutdown goes on
+        except Exception as error:  # whatever the store answers, the shutdown goes on
             log.warning("FA_NATIVE_UNSTARTED_CLOSE_UNCONFIRMED exception_type=%s", type(error).__name__)
 
     async def _await_runtime_exit(self, stop, conversation_id=None):
@@ -1965,7 +1986,7 @@ class NativeTurnRuntime:
             return None
         return _decode(active, NativeTaskInput)
 
-    async def _close_unstarted(self, original):
+    async def _close_unstarted(self, original, *, run_token=None):
         receipt = original.value.receipt
         if receipt.status != "accepted" or original.value.run_token is not None or receipt.turn_number is not None:
             return receipt
@@ -1973,8 +1994,15 @@ class NativeTurnRuntime:
             closed = await self._unknown(original, "NATIVE_TURN_NOT_STARTED", usage=receipt.usage)
         except _UnknownRidWrite:
             # A start whose answer was lost may have run: a read-back started or terminal winner is kept and returned.
-            closed = (await self._rid(receipt.request_id)).value.receipt
-            if closed.status == "accepted":
+            current = await self._rid(receipt.request_id)
+            closed = current.value.receipt
+            if (run_token is not None and current.value.run_token == run_token
+                    and closed.status == "started" and not _may_have_entered_sdk(closed)):
+                # Our own start landed after its read-back said it had not: nothing runs it, so close it here.
+                closed = await self._unknown(
+                    current, "NATIVE_TURN_CANCELLED" if closed.cancel_requested else "NATIVE_TURN_NOT_STARTED",
+                    usage=receipt.usage)
+            elif closed.status == "accepted":
                 raise
         if closed.status == "accepted":
             raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "the original unstarted outcome was not confirmed")
@@ -2007,6 +2035,8 @@ class NativeTurnRuntime:
                 # A cancel that won the race becomes NATIVE_TURN_CANCELLED only for a code raised before the SDK
                 # starts (_close_unstarted; preflight, capability binds and _run before run_copilot). Any other code
                 # is kept, since the SDK may have run; cancel_requested stays on the receipt either way.
+                if code == "NATIVE_TURN_NOT_STARTED" and _may_have_entered_sdk(current.value.receipt):
+                    code = "NATIVE_TURN_UNKNOWN"
                 if (current.value.receipt.cancel_requested
                         and code in {"NATIVE_TURN_NOT_STARTED", "NATIVE_EXECUTION_UNAVAILABLE"}):
                     code = "NATIVE_TURN_CANCELLED"
@@ -2033,12 +2063,16 @@ class NativeTurnRuntime:
             raise Problem(409, "NATIVE_RESULT_INCOMPLETE", "the complete result differs from its original digest")
 
     async def _reenter(self, original, *, failure_code=None, usage=None, delegation=None, assembly=None,
-                       recovered=False):
+                       recovered=False, cancelled=False):
         from .native_checkpoint import conversation_store_name, verify_checkpoint
 
         receipt = original.value.receipt
         if receipt.status != "started":
             return receipt
+        if not _may_have_entered_sdk(receipt):
+            # Numbering is the SDK gate (the ``_allocate`` CAS): closing it here fences any run that has not numbered it.
+            return await self._unknown(original, "NATIVE_TURN_CANCELLED" if cancelled or receipt.cancel_requested
+                                       else "NATIVE_TURN_NOT_STARTED")
         if (recovered and not receipt.cancel_requested and receipt.delegation is None and receipt.queued_relay is None
                 and self.on_recover_queued is not None):
             try:
@@ -2262,25 +2296,92 @@ class NativeTurnRuntime:
         receipt = _changed(original.value.receipt, status="completed", result=turn.reference(),
                            usage=outcome.usage, delegation=turn.delegation, assembly=turn.assembly)
         current, _ = await self._cas(original, _changed(original.value, receipt=receipt))
-        if current.value.receipt.status == "started" and current.value.receipt.cancel_requested:
-            return await self._unknown(current, "NATIVE_TURN_CANCELLED",
-                                       usage=outcome.usage, delegation=turn.delegation, assembly=turn.assembly)
+        # A stop that moved the ETag after turn:n was saved came too late: the saved answer wins (Neal 2026-11-03, #1145).
         if current.value.receipt.status == "started":
-            return await self._reenter(current)
+            return await self._reenter(current, usage=outcome.usage, delegation=turn.delegation, assembly=turn.assembly)
         return current.value.receipt
 
     async def handle_turn(self, ctx: TaskContext[NativeTaskInput]):
-        result = await self._handle_turn(ctx)
-        if isinstance(result, NativeReceipt):
-            if ctx.entry_mode == "recovered" and not ctx.cancel_requested and not ctx.timeout_exceeded:
-                from .native_continuations import schedule_continuation
-                try:
-                    await schedule_continuation(self, result)
-                except NativePostTurnPending:
-                    await self._notify_terminal(result)
-                    raise
-            return await self._notify_terminal(result)
-        return result
+        # A resend of the accepted RID runs it again here: its own run owns the receipt from now on.
+        rid = _input_rid(ctx)
+        if (closer := self._outage_closes.pop(rid, None)) is not None:
+            closer.cancel()
+        try:
+            result = await self._handle_turn(ctx)
+            if isinstance(result, NativeReceipt):
+                if ctx.entry_mode == "recovered" and not ctx.cancel_requested and not ctx.timeout_exceeded:
+                    from .native_continuations import schedule_continuation
+                    try:
+                        await schedule_continuation(self, result)
+                    except NativePostTurnPending:
+                        await self._notify_terminal(result)
+                        raise
+                return await self._notify_terminal(result)
+            return result
+        except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
+            # A 5xx or transport failure, the terminal notice's too, becomes ``NativePostTurnPending``: core retries the
+            # task within its finite budget (_queue_retry, about 4 min), then drops the input and suspends the chain
+            # while no write can land. An accepted RID still runs on a resend; a started one is closed, and a terminal
+            # one notified, beside the chain once the store answers (``_close_after_outage``). Pending hides the
+            # original code from core, so the last attempt logs it.
+            if isinstance(error, Problem) and error.status < 500:
+                raise
+            if ctx.retry_attempt + 1 >= self._queue_retry.max_attempts:
+                code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
+                log.error("FA_NATIVE_TURN_RETRIES_EXHAUSTED rid=%s input_id=%s code=%s", rid, ctx.input_id, code)
+
+                def forget(done):
+                    if self._outage_closes.get(rid) is done:
+                        del self._outage_closes[rid]
+                    if not done.cancelled() and done.exception() is not None:
+                        log.error("FA_NATIVE_OUTAGE_CLOSE_FAILED rid=%s exception_type=%s",
+                                  rid, type(done.exception()).__name__)
+
+                # A recovered RID keeps the stall rule: closing it here would skip its queued relay's recovery.
+                if rid is not None and ctx.entry_mode != "recovered":
+                    task = self._outage_closes[rid] = asyncio.get_running_loop().create_task(
+                        self._close_after_outage(rid))
+                    task.add_done_callback(forget)
+            if isinstance(error, NativePostTurnPending):
+                raise
+            raise NativePostTurnPending() from None
+
+    async def _close_after_outage(self, rid):
+        """#1146: core dropped this RID's input; only a resend of an accepted RID runs it again (``handle_turn`` then
+        cancels this). A ``started`` receipt is closed as a non-recovered retry would close it (``_reenter``:
+        unnumbered ends resendable, numbered by its saved turn), over ``OUTAGE_CLOSE_SECONDS``; after that it stays
+        until the environment changes (the stall rule). The execution lock stands in for the chain's order: the
+        conversation's next turn can not number it meanwhile. A receipt found terminal is notified too, since the
+        last attempt's own write may have landed unconfirmed, or only its notice failed (the notice dedupes by RID)."""
+        closed = None
+        for delay in OUTAGE_CLOSE_SECONDS:
+            await asyncio.sleep(delay)
+            try:
+                if closed is None:
+                    # Read outside the lock first: a read failing in the outage never holds the execution slot.
+                    receipt = (await self._rid(rid)).value.receipt
+                    if receipt.status == "started" and receipt.hosted_session_id == self.identity.session_id:
+                        async with self.execution_lock:
+                            self.execution_owner = rid
+                            try:
+                                original = await self._rid(rid)
+                                receipt = original.value.receipt
+                                if receipt.status == "started" and receipt.hosted_session_id == self.identity.session_id:
+                                    receipt = await self._reenter(original)
+                            finally:
+                                self.execution_owner = None
+                    if receipt.hosted_session_id != self.identity.session_id or receipt.status == "accepted":
+                        return
+                    if receipt.status == "started":
+                        continue
+                    closed = receipt
+                await self._notify_terminal(closed)
+                return
+            except (Problem, *_TASK_TRANSPORT_ERRORS) as error:
+                if isinstance(error, Problem) and error.status < 500:
+                    log.warning("FA_NATIVE_OUTAGE_CLOSE_REFUSED rid=%s code=%s", rid, error.body["error"]["code"])
+                    return
+        log.error("FA_NATIVE_OUTAGE_CLOSE_EXHAUSTED rid=%s", rid)
 
     async def _handle_turn(self, ctx: TaskContext[NativeTaskInput]):
         dropped, supplied = await self._turn_input(ctx)
@@ -2293,7 +2394,7 @@ class NativeTurnRuntime:
         if original.value.receipt.status != "accepted":
             return await self._reenter_turn(ctx, original)
         if dropped is not None:
-            return await _pending_when_transient(self._settle_unstarted(supplied))
+            return await self._settle_unstarted(supplied)
         await self._refuse_unrunnable(supplied, original)
         if channel(original.value.receipt.state_profile) != "invocations":
             raise Problem(409, "NATIVE_STATE_SCOPE", "Responses turns never run through the Invocations chain")
@@ -2305,7 +2406,7 @@ class NativeTurnRuntime:
             # ADR-0009 §7a "(r)(s) 的競爭": it stays ``accepted`` (an ordinary queued message, never refused) and waits
             # in its conversation's left queue with a wait task of its own; this chain turn ends now, so the Agent's
             # other conversations go on. The wait task puts it back on the chain when its turn comes.
-            await _pending_when_transient(defer(self, original, order.behind))
+            await defer(self, original, order.behind)
             return original.value.receipt
         return await self._start_turn(ctx, supplied, original, order)
 
@@ -2315,7 +2416,7 @@ class NativeTurnRuntime:
             # Core 2.2.0 re-enters a drained input with payload.input=None (it reads steering.active_input only while
             # drain_in_progress); that input is read from the task record. Started, it re-enters as usual; accepted,
             # core can never run it again, so it is settled resendable (``_handle_turn``).
-            dropped = await _pending_when_transient(self._dropped_input(ctx.task_id))
+            dropped = await self._dropped_input(ctx.task_id)
         if dropped is not None:
             return dropped, dropped
         return None, ctx.input if isinstance(ctx.input, NativeTaskInput) else _decode(ctx.input, NativeTaskInput)
@@ -2341,7 +2442,7 @@ class NativeTurnRuntime:
         if recovered:
             await self._count_unmarked_reentry(original)
         try:
-            return await self._reenter(original, recovered=recovered)
+            return await self._reenter(original, recovered=recovered, cancelled=ctx.cancel_requested)
         except TaskDeferred:
             if not ctx.shutdown.is_set():
                 raise
@@ -2388,7 +2489,7 @@ class NativeTurnRuntime:
                 # ADR-0009 M9: the session the Agent switched to adopted this never-started receipt; it runs there.
                 return original.value.receipt
             if original.value.receipt.status != "accepted":
-                return await self._reenter(original)
+                return await self._reenter(original, cancelled=control.cancelled)
             if control.timeout:
                 return await self._unknown(original, "NATIVE_TURN_TIMEOUT")
             if control.cancelled or original.value.receipt.cancel_requested:
@@ -2408,12 +2509,15 @@ class NativeTurnRuntime:
         try:
             original, ours = await self._cas(_Versioned(original.value, supplied.accepted_etag), started)
         except _UnchangedRidWrite:
-            return await self._unknown(original, "NATIVE_STATE_STORE_UNKNOWN")
+            return await self._close_unstarted(original, run_token=started.run_token)
         elapsed_timing("native_start", starting, job_id=timing_id(supplied.request_id))
         if not ours:
             if original.value.receipt.hosted_session_id != self.identity.session_id:
                 return original.value.receipt
-            return await self._reenter(original)
+            # A cancel landed after the reread: this turn ends here, so nothing else would close the receipt.
+            if original.value.receipt.status == "accepted" and original.value.receipt.cancel_requested:
+                return await self._unknown(original, "NATIVE_TURN_CANCELLED")
+            return await self._reenter(original, cancelled=control.cancelled)
         if order.queued:
             await dequeue(self, original.value.receipt)
         result = await self._execute_started(original, control, signals)
@@ -2436,7 +2540,6 @@ class NativeTurnRuntime:
 
     async def _run_started(self, original, control, signals):
         watcher = None
-        appends_settled = False
         saving = False
         outcome = None
         rid = original.value.receipt.request_id
@@ -2458,23 +2561,14 @@ class NativeTurnRuntime:
                 watcher.result()
             watcher.cancel()
             await asyncio.gather(watcher, return_exceptions=True)
-            if control.steering is not None:
-                from .native_appends import settle_appends
-                appends_settled = True
-                await settle_appends(self, original.value.receipt, control, finished=True)
-            signals(control)
-            current = await self._rid(rid)
-            stopped = await self._stopped_after_run(current, original, control, outcome)
-            if stopped is not None:
-                return stopped
             saving = True
-            return await self._save_turn_retrying(current, meta, outcome, rid)
+            return await self._save_turn_retrying(original, control, signals, meta, outcome, rid)
         except _UnknownRidWrite:
             raise
         except Exception as exc:
             return await self._started_failure(exc, original, control, signals, outcome, saving, rid)
         finally:
-            await self._release_started(original, control, watcher, appends_settled)
+            await self._release_started(original, control, watcher, saving)
 
     def _begin_recall(self, original, control, rid):
         start_recall = getattr(self.executor, "start_recall", None)
@@ -2502,16 +2596,25 @@ class NativeTurnRuntime:
             return await self._unknown(current, "NATIVE_TURN_TIMEOUT",
                                        usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
         if control.cancelled or current.value.receipt.cancel_requested:
-            return await self._unknown(current, "NATIVE_TURN_CANCELLED",
+            # turn:n an earlier attempt saved before the stop wins (#1145); without it the turn ends cancelled.
+            return await self._reenter(current, failure_code="NATIVE_TURN_CANCELLED",
                                        usage=outcome.usage, delegation=outcome.delegation, assembly=outcome.assembly)
         return None
 
-    async def _save_turn_retrying(self, current, meta, outcome, rid):
+    async def _save_turn_retrying(self, original, control, signals, meta, outcome, rid):
         with phase_timing("native_save_turn", job_id=timing_id(rid)):
-            # Every save step is idempotent (content-addressed creates, the RID CAS on its original ETag), so an
-            # unconfirmed (503) step is retried with the same outcome; the SDK never runs again.
+            # Every step after the SDK is idempotent (settled appends, content-addressed creates, the RID CAS on the
+            # ETag just read), so an unconfirmed (503) step is retried with the same outcome; the SDK never runs again.
             for delay in (*SAVE_RETRY_SECONDS, None):
                 try:
+                    if control.steering is not None:
+                        from .native_appends import settle_appends
+                        await settle_appends(self, original.value.receipt, control, finished=True)
+                    signals(control)
+                    current = await self._rid(rid)
+                    stopped = await self._stopped_after_run(current, original, control, outcome)
+                    if stopped is not None:
+                        return stopped
                     return await self._save_turn(current, meta, outcome)
                 except _UnknownRidWrite:
                     raise
@@ -2538,16 +2641,20 @@ class NativeTurnRuntime:
         if saving:
             return await self._reenter(current, failure_code=code, usage=usage,
                                        delegation=delegation, assembly=assembly)
+        receipt = current.value.receipt
+        transient = isinstance(exc, _TASK_TRANSPORT_ERRORS) or isinstance(exc, Problem) and exc.status >= 500
+        if transient and not _may_have_entered_sdk(receipt):
+            code = "NATIVE_TURN_CANCELLED" if control.cancelled or receipt.cancel_requested else "NATIVE_TURN_NOT_STARTED"
         return await self._unknown(current, code, usage=usage, delegation=delegation, assembly=assembly)
 
-    async def _release_started(self, original, control, watcher, appends_settled):
+    async def _release_started(self, original, control, watcher, saving):
         if control.recall is not None:  # every path; a no-op once _run settled it, the stop for turns that ended earlier
             control.recall[1].cancel()
             await asyncio.gather(control.recall[1], return_exceptions=True)
         if watcher is not None:
             watcher.cancel()
             await asyncio.gather(watcher, return_exceptions=True)
-        if control.steering is not None and not appends_settled:
+        if control.steering is not None and not saving:
             from .native_appends import settle_appends
             control.steering.close()
             await settle_appends(self, original.value.receipt, control, finished=True)
@@ -2813,9 +2920,9 @@ async def native_response(request, runtime: NativeTurnRuntime | None, *, action=
 
     diagnostic("entered")
     try:
-        # ADR-0009 M1 (i): the v1 alias is the fixed v1 string, not the send constant, until the first image after 2d-ii.
-        if runtime is None or request.headers.getlist(NATIVE_TURN_HEADER) not in (
-                [UNLABELED_STATE_PROFILE], [runtime.state_profile]):
+        # ADR-0009 §3: one header naming this runtime's own profile, or 3d-i's v2 alias (``HEADER_ALIAS_PROFILES``).
+        profiles = request.headers.getlist(NATIVE_TURN_HEADER)
+        if runtime is None or len(profiles) != 1 or profiles[0] not in {runtime.state_profile, *HEADER_ALIAS_PROFILES}:
             raise refused(Problem(403, "NATIVE_TURNS_DISABLED", "the Hosted native path is not enabled"),
                           "runtime" if runtime is None else "profile")
         if request.state.session_id != runtime.identity.session_id:
@@ -2847,9 +2954,10 @@ async def native_response(request, runtime: NativeTurnRuntime | None, *, action=
         except (ValueError, TypeError):
             raise Problem(422, "NATIVE_REQUEST_INVALID", "only the typed native request is accepted") from None
         profile = getattr(command, "state_profile", None)
-        # ADR-0009 boundary 8: the body's Invocations profile is bounded like the header, so a v1 runtime stores no v2.
+        # ADR-0009 boundary 8: the body's Invocations profile is this runtime's, or a stored v1/v2 original resent with
+        # its own digest (``STORED_BODY_PROFILES``, behavior_native_responses_api.turn_profile).
         if profile is not None and channel(profile) == "invocations" and profile not in (
-                UNLABELED_STATE_PROFILE, runtime.state_profile):
+                *STORED_BODY_PROFILES, runtime.state_profile):
             raise refused(Problem(403, "NATIVE_TURNS_DISABLED", "the Hosted native path is not enabled"), "profile")
         details["operation"] = command.operation
         original = command.command if isinstance(command, (

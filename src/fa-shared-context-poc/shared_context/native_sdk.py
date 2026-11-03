@@ -51,6 +51,7 @@ from .native_capability_tools import approved_skills_provider, mcp_api_provider
 from .native_sdk_profiles import NativeSdkStart, ORIGIN_ADDENDUM, check_start_capture, native_context
 from .native_assembly import NativeAssemblyCollector
 from .native_inference import NativeInferenceCollector
+from .sdk_pin import PROFILE_RELEASES, RUNTIME_VERSION, SDK_VERSION
 
 _PROFILES = frozenset({
     "fa-instruction-v1", "fa-instruction-v2", "fa-instruction-v3", "fa-instruction-v4",
@@ -593,7 +594,7 @@ class NativeSdkExecutor:
         if (assembly.prefix_sha256, assembly.capability_catalog_version) != (
                 capture.template.role.prefix_sha256, capture.template.role.capability_catalog_version):
             raise Problem(409, "NATIVE_CAPTURE_CHANGED", "the captured prompt version differs from this runtime")
-        if importlib.metadata.version("github-copilot-sdk") != "1.0.13":
+        if importlib.metadata.version("github-copilot-sdk") != SDK_VERSION:
             raise Problem(409, "NATIVE_PROFILE_UNSUPPORTED", "the captured SDK version is required")
 
     def start_recall(self, receipt, *, first_turn):
@@ -1247,6 +1248,10 @@ def native_runtime_from_environment(hosted):
     state_profile = os.environ.get("FA_NATIVE_TURNS")
     if state_profile not in ACCEPTED_STATE_PROFILES:
         raise Problem(403, "NATIVE_TURNS_DISABLED", "the native state profile must be explicitly enabled")
+    # ADR-0009 §3 (c): a profile names its SDK/runtime pair; declaring another image's profile would label new state
+    # with a pair this runtime does not write (a v3 image declaring v2 loses its work files at 3d-ii).
+    if PROFILE_RELEASES[state_profile] != (SDK_VERSION, RUNTIME_VERSION):
+        raise Problem(403, "NATIVE_TURNS_DISABLED", "the native state profile names another SDK/runtime release")
     if (not os.environ.get("FOUNDRY_HOSTING_ENVIRONMENT")
             or os.environ.get("AGENTSERVER_TASKS_BACKEND", "").strip().lower() not in {"", "hosted"}):
         raise Problem(403, "NATIVE_TURNS_DISABLED", "the deployed native path requires the official Hosted backend")

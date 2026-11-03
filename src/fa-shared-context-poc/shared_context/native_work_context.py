@@ -17,6 +17,19 @@ WORK_CONTEXT_GUIDANCE = {
 CAPABILITY_TOOL_GUIDANCE.update(WORK_CONTEXT_GUIDANCE)
 
 
+def work_next_step(receipt):
+    # A saved result wins over a stop that came too late (completed with cancel_requested, #1145).
+    if receipt.status == "completed":
+        return "read-saved-result-not-a-new-execution"
+    if receipt.cancel_requested or receipt.failure_code == "NATIVE_TURN_CANCELLED":
+        return "do-not-revive-cancelled-work"
+    if receipt.status == "unknown":
+        return "read-original-receipts-do-not-repeat-unknown-effects"
+    if receipt.status == "busy_refused":
+        return "read-saved-result-not-a-new-execution"
+    return "after-the-follow-up-return-to-this-original-work"
+
+
 class NativeWorkContextQuery(WireModel):
     request_id: Identifier | None = None
     section: Literal["work", "effects", "questions", "approvals"] = "work"
@@ -70,11 +83,7 @@ def work_context_tool(runtime, receipt, control, *, related=(), hitl_client=None
                     "continuation": None if original.continuation is None else original.continuation.model_dump(mode="json"),
                     "delegation_snapshot": None if original.delegation is None else original.delegation.model_dump(mode="json"),
                     "delegation_meaning": "initial-dispatch-snapshot-not-current-child-status",
-                    "next_step": ("do-not-revive-cancelled-work" if (
-                        original.cancel_requested or original.failure_code == "NATIVE_TURN_CANCELLED") else
-                                  "read-original-receipts-do-not-repeat-unknown-effects" if original.status == "unknown" else
-                                  "read-saved-result-not-a-new-execution" if original.status in {"completed", "busy_refused"} else
-                                  "after-the-follow-up-return-to-this-original-work"),
+                    "next_step": work_next_step(original),
                 }
             elif query.section == "effects":
                 from .native_effects import NativeEffects

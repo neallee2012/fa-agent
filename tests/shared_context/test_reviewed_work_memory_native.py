@@ -23,6 +23,7 @@ from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy import work_policy_key
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from web_test_console.freeform import ConversationProjection
 from test_behavior_api import METRICS
 from test_behavior_assistant import assistant
@@ -171,7 +172,7 @@ def test_fixed_sdk_reads_reviewed_team_note_only_on_demand_and_restores_its_exac
             assert not any(event["type"] in {"skill.invoked", "session.compaction_start"} for event in events)
             assert bridge._sdk_stop.graceful
     assert references[0] == references[1] and user_sends == list(texts)
-    assert not forced and len(calls) == 6 and importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert not forced and len(calls) == 6 and importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     response = h.client.get("/work-policy/v1/conversations/" + conversation, headers=h.headers())
     assert response.status_code == 200
     projection = ConversationProjection.model_validate_json(response.content)
@@ -190,7 +191,7 @@ def test_fixed_sdk_reads_reviewed_team_note_only_on_demand_and_restores_its_exac
         target = Path(os.environ["FA_WORK_MEMORY_EVIDENCE_DIR"])
         target.mkdir(parents=True, exist_ok=True)
         (target / "reviewed-work-memory-native.json").write_text(json.dumps({
-            "profile": PROFILE, "sdk_version": "1.0.13", "runtime_version": "1.0.83",
+            "profile": PROFILE, "sdk_version": SDK_VERSION, "runtime_version": RUNTIME_VERSION,
             "prefix_sha256": PREFIX_SHA, "prefix_utf8_bytes": 2719,
             "claim_sha256": references[0].claim_sha256, "claim_text_sha256": references[0].text_sha256,
             "review_sha256": references[0].review_sha256, "source_hashes": [value.sha256 for value in references[0].sources],

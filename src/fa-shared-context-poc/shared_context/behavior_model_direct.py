@@ -297,6 +297,7 @@ class DirectResponses:
                     code = value.get("error", {}).get("code") if isinstance(value, dict) else None
                 except (ValueError, TypeError, AttributeError):
                     code = None
+                code = code if isinstance(code, str) else None
                 # A definite provider refusal before this turn handed any model output to the runtime: nothing ran.
                 self.refused_before_output = response.status_code in DEFINITE_REFUSALS and self.delivered == 0
                 # Fixed identifiers and counts only; never the provider message, prompt or token.

@@ -1,8 +1,8 @@
 """P05 removes legacy normal_pull from the workbench while keeping old configs loadable."""
 import json
 
-from test_m3_auth import jwk_client, signing_key  # noqa: F401 - pytest fixtures
-from test_web_test_console import action, console  # noqa: F401 - pytest fixture
+from test_m3_auth import jwk_client, signing_key  # fixture
+from test_web_test_console import action, console  # fixture
 
 
 def test_normal_pull_config_loads_but_state_offers_no_fixed_task(console):

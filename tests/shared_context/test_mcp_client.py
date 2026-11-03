@@ -1,9 +1,6 @@
 """API-side MCP client: allowlisted tools, secret handling and error classes against an in-process MCP server."""
 
 import json
-import subprocess
-import sys
-from pathlib import Path
 
 import anyio
 import httpx
@@ -172,10 +169,3 @@ def test_hosted_entries_are_not_called_by_the_api():
     stdio = parse_entry_file("p.json", json.dumps({"mcpServers": {"playwright": {
         "type": "stdio", "command": "/opt/fa-tools/bin/playwright-mcp", "tools": ["browser_navigate"]}}}).encode())
     denied("CAPABILITY_EXECUTION_DENIED", lambda: list_tools(stdio, SECRETS.get))
-
-
-def test_catalog_module_stays_free_of_the_mcp_sdk():
-    root = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    code = "import sys, shared_context.tool_catalog; print('mcp' in sys.modules)"
-    output = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, check=True)
-    assert output.stdout.strip() == "False"

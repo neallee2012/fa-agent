@@ -839,7 +839,7 @@ def test_a_routine_run_opens_one_platform_conversation_and_its_retry_reuses_it(r
 
 def test_a_platform_conversation_left_unused_by_a_failed_intent_save_is_logged(
         routine_flags, responses_api, signing_key, monkeypatch, caplog):
-    """Review 2026-10-23: POST /conversations succeeded but the run's intent was not saved; one log line names it."""
+    """POST /conversations succeeded but the run's intent was not saved; one log line names it."""
     from datetime import timedelta
     from shared_context.native_routines import NativeRoutineService
     from test_native_routine_api import clock_call, daily_definition

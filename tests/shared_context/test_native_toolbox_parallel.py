@@ -20,10 +20,10 @@ from shared_context.errors import Problem
 from shared_context.m2_copilot import ToolFailure
 from shared_context.native_hitl_runtime import NativeHitlClient
 from test_behavior_store import NativeEntity
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_hitl import hitl  # noqa: F401
+from test_m3_auth import jwk_client, signing_key
+from test_native_hitl import hitl
 from test_native_toolbox import Toolbox
-from test_native_toolbox_approval import decide, packet, permit, platform, setup, wait_pending  # noqa: F401
+from test_native_toolbox_approval import decide, packet, permit, platform, setup, wait_pending
 
 
 def advance_guard(backing):

@@ -10,6 +10,7 @@ from copilot import CopilotClient
 
 from shared_context import m2_copilot
 from shared_context.m2_copilot import ResidentHolder, ToolSpec
+from shared_context.sdk_pin import SDK_VERSION
 
 
 def tool(name="lookup", parameters=None):
@@ -29,7 +30,7 @@ REFUSALS = [
     ("session-id", {"sdk_session_id": "../escape"}, ValueError, "Invalid sdk_session_id"),
     ("blank-prompt", {"prompt": "  "}, ValueError, "A nonempty prompt is required"),
     ("async-on-event", {"on_event": async_event}, TypeError, "on_event must be synchronous"),
-    ("untyped-boundary", {"behavior_boundary": object()}, ValueError, "typed boundary and SDK 1.0.13"),
+    ("untyped-boundary", {"behavior_boundary": object()}, ValueError, f"typed boundary and SDK {SDK_VERSION}"),
     ("instruction-without-boundary", {"instruction": True}, ValueError, "authority-backed model transport"),
     ("call-limit-without-instruction", {"model_call_limit": 5}, ValueError, "A model call limit requires"),
     ("unknown-provider", {"model_provider": "other"}, ValueError, "public reasoning summary"),

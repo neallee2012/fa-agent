@@ -17,6 +17,7 @@ from shared_context.behavior_assistant_hosted import AssistantSession
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_text_files import UserTextFile
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
 from test_instruction_text_files import BODY, configured_files, post
@@ -75,7 +76,7 @@ def test_literal_file_is_user_data_in_actual_sdk_requests_and_cold_resume(assist
         assert second.status_code == 200, second.text
         assert h.runtime.controller.step(second.json()["binding_id"]).state == "succeeded"
         assert len(packets) == len(sent) == 2 and sent[0][0] == sent[1][0]
-        assert len(stops) == 2 and all(stop.graceful and stop.runtime_version == "1.0.83" for stop in stops)
+        assert len(stops) == 2 and all(stop.graceful and stop.runtime_version == RUNTIME_VERSION for stop in stops)
         assert sent[0][1:] == (prompt + "\n\n" + m2_copilot._TEXT_FILES_HEADER + "\n"
                                + m2_copilot._text_file_block(file.name, BODY), None) and sent[1][2] is None
         assert not list(Path(directory).rglob("data.csv"))

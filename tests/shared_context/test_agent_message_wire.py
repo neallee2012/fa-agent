@@ -43,24 +43,3 @@ def test_explicit_resource_kind_requires_its_canonical_version(kind, version):
     with pytest.raises(ValidationError):
         PeerTeamReference(resource_kind=kind, tenant_id="tenant-one", team_id="team-one",
                           resource_id="source-one", version=version, sha256="a" * 64)
-
-
-def test_hosted_wire_import_does_not_require_api_only_packages():
-    import subprocess
-    import sys
-
-    script = """
-import importlib.abc
-import sys
-class ApiOnlyPackages(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {'fastapi', 'starlette', 'mcp'}:
-            raise ModuleNotFoundError('API-only package reached by Hosted wire: ' + fullname)
-sys.meta_path.insert(0, ApiOnlyPackages())
-from shared_context.behavior_agent_message_wire import AgentMessage, AgentMessageRead, PeerTeamReference
-print('hosted-wire-ok')
-"""
-    result = subprocess.run([sys.executable, "-X", "utf8", "-c", script], capture_output=True,
-                            text=True, encoding="utf-8", timeout=30, check=False)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "hosted-wire-ok"

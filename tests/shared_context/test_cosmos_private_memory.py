@@ -26,7 +26,7 @@ from shared_context.native_checkpoint import conversation_store_name, open_durab
 from shared_context.native_private_memory import NativePrivateMemory, claim_key
 from shared_context.native_turns import EFFECTS_STORE
 from test_native_turn_wire import receipt_for, submit
-from test_native_turns import IDENTITY, local_env  # noqa: F401
+from test_native_turns import IDENTITY, local_env
 
 HUMAN = "我住在高雄，以後回答都先給結論。"
 ENDPOINT = "https://fa-acct.services.ai.azure.com/api/projects/fa-project"

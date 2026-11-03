@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"))
 
-from shared_context.feed_signature import (  # noqa: E402
+from shared_context.feed_signature import (
     generate_keypair, load_public_key, load_signing_key, sign_feed_url,
 )
 

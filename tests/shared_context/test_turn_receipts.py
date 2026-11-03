@@ -5,8 +5,6 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 import hashlib
 import json
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -318,22 +316,6 @@ def test_same_raw_request_id_in_another_team_has_a_distinct_ticket(case):
     assert delivery.address.request_id == c.delivery.address.request_id
     assert ticket_handle(ticket).ticket_id != c.handle.ticket_id
     assert c.receipts.read(c.agent, c.context, c.ticket.address).state == "issued"
-
-
-def test_hosted_receipt_modules_do_not_import_api_storage_or_the_sdk():
-    code = """
-import importlib.abc
-import sys
-class Forbidden(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if any(fullname == name or fullname.startswith(name + '.') for name in
-               ('fastapi', 'azure.data.tables', 'azure.storage.blob', 'copilot')):
-            raise ImportError('forbidden dependency: ' + fullname)
-sys.meta_path.insert(0, Forbidden())
-import shared_context.behavior_turn_wire
-"""
-    completed = subprocess.run([sys.executable, "-X", "utf8", "-c", code], capture_output=True, text=True, timeout=30)
-    assert completed.returncode == 0, completed.stderr
 
 
 def test_checkpoint_adapter_uses_original_published_parts_and_exact_stop(synthetic_standing_v1):

@@ -1,4 +1,4 @@
-"""Pinned real SDK/runtime 1.0.83, official local N1, synthetic model/API HTTP: one tool list for every native turn.
+"""Pinned real SDK/runtime 1.0.103, official local N1, synthetic model/API HTTP: one tool list for every native turn.
 
 dev 10-07 (#732): after a scheduled turn, the next human turn in the same conversation could no longer propose a
 schedule. The pinned runtime tells the model a tool it used earlier is "no longer available" when a later turn drops
@@ -19,11 +19,11 @@ from shared_context.behavior_native_turn_wire import NativeSubmit, NativeTurnCap
 from shared_context.native_sdk import NativeSdkExecutor
 from shared_context.native_turns import NativeTurnRuntime
 from test_instruction_responses_native import response_bytes
-from test_m2_copilot import runtime_path  # noqa: F401
+from test_m2_copilot import runtime_path
 from test_native_routine_context import routine_client
 from test_native_routine_turns import routine_request
 from test_native_turn_wire import capture, submit
-from test_native_turns import Harness, IDENTITY, local_env  # noqa: F401
+from test_native_turns import Harness, IDENTITY, local_env
 
 
 class QuietHitl:
@@ -37,7 +37,7 @@ class QuietHitl:
 
 
 def test_a_scheduled_turn_keeps_the_human_tools_so_the_next_human_turn_can_use_them(
-        local_env, monkeypatch, tmp_path, runtime_path, caplog):  # noqa: F811
+        local_env, monkeypatch, tmp_path, runtime_path, caplog):
     import _socket
 
     for name, value in {"FA_NATIVE_ROUTINES_ENABLED": "1", "FA_NATIVE_ROUTINE_PROPOSALS": "1",

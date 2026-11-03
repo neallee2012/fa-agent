@@ -29,7 +29,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scrub_export import git, render  # noqa: E402
+from scrub_export import git, render
 
 MAPPING_PATH = "scripts/public_export/mapping.json"
 LINE_PREFIX = "public-sync fingerprint:"

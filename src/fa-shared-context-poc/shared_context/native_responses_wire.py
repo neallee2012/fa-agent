@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from .behavior_wire import Digest, Identifier, WireModel
+from .sdk_pin import PROFILE_RELEASES
 
 
 # ADR-0009 §3: the one profile whose material may be unlabeled. It is fixed, not ``NATIVE_STATE_PROFILE``: a v1 digest
@@ -12,12 +13,21 @@ from .behavior_wire import Digest, Identifier, WireModel
 # Every DTO default is this profile, so an unlabeled stored item keeps reading as v1 after 2d-ii.
 UNLABELED_STATE_PROFILE = "foundry-native-v1"
 NATIVE_V2_PROFILE = "foundry-native-v2"
-# ADR-0009 M1 2d-ii: the profile the API sends (and labels new v2 material with) is v2.
+# ADR-0009 §3 v2→v3 (SDK 1.0.26 / runtime 1.0.103): what a 3d-i Hosted image declares and labels new _Meta with.
+NATIVE_V3_PROFILE = "foundry-native-v3"
+# ADR-0009 M1 2d-ii: the profile the API sends (and labels new v2 material with) is v2; it stays v2 through 3d-i.
 NATIVE_STATE_PROFILE = NATIVE_V2_PROFILE
+# ADR-0009 §3 (c): the (sdk, runtime) pair API-written material names follows the send profile, not this process's
+# pin, so a v2 image (which decodes only its own pair) keeps accepting it until 3d-ii flips NATIVE_STATE_PROFILE.
+SENT_RELEASE = PROFILE_RELEASES[NATIVE_STATE_PROFILE]
 NATIVE_RESPONSES_PROFILE = "foundry-responses-v1"
-# What a Hosted runtime may declare (FA_NATIVE_TURNS): H2d images keep the v1 alias until the first image after 2d-ii.
-ACCEPTED_STATE_PROFILES = frozenset({UNLABELED_STATE_PROFILE, NATIVE_V2_PROFILE})
-NativeStateProfile = Literal["foundry-native-v1", "foundry-responses-v1", "foundry-native-v2"]
+# The template ``state_profile`` values sent material may carry: a v2 image's NativeStateProfile is {v1, responses-v1,
+# v2}, so a new owner selection naming v3 would reach it in every capture until 3d-ii flips NATIVE_STATE_PROFILE.
+SENT_STATE_PROFILES = frozenset({UNLABELED_STATE_PROFILE, NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE})
+# What a Hosted runtime or the API may declare (FA_NATIVE_TURNS): ADR-0009 3d-i expands it to {v2, v3} (assistants
+# declare v3, the API still v2); 3d-ii narrows it to v3. Stored v1 and unlabeled items still read as v1.
+ACCEPTED_STATE_PROFILES = frozenset({NATIVE_V2_PROFILE, NATIVE_V3_PROFILE})
+NativeStateProfile = Literal["foundry-native-v1", "foundry-responses-v1", "foundry-native-v2", "foundry-native-v3"]
 
 
 def channel(profile) -> Literal["invocations", "responses"]:

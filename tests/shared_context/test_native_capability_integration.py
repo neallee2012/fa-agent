@@ -43,6 +43,7 @@ from shared_context.behavior_peer_runtime import install_peer_routing
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_wire import HostedIdentity
 from shared_context.native_capabilities import selected_providers
+from shared_context.native_responses_wire import NATIVE_V3_PROFILE, SENT_RELEASE
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.behavior_capabilities import (
     BUILTIN_CAPABILITIES, DELEGATE_READER_ENTRY_ID, SKILL_RESOURCES_ENTRY_ID,
@@ -54,19 +55,19 @@ from shared_context.m3_models import ApprovalInput, CreateArtifact, VersionInput
 from shared_context.tool_catalog import build_catalog, load_catalog
 from hosted_versions_stub import deployed_versions
 from sdk_checkpoint_local import sse
-from test_agent_runtime import peer_runtime  # noqa: F401
+from test_agent_runtime import peer_runtime
 from test_agent_runtime_routing import agent_headers
 from test_approved_skill_api import BODY as SKILL_BODY
 from test_capability_calls import WEBIQ
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_instruction_flow import instruction_models
 from test_instruction_responses_native import response_bytes
-from test_m2_copilot import runtime_path  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_m2_copilot import runtime_path
+from test_m3_auth import jwk_client, signing_key
 from test_native_delegation import TASK
 from test_native_session_prepare_api import platform_sessions
 from test_native_turn_api import Credential
-from test_native_turns import local_env  # noqa: F401
+from test_native_turns import local_env
 from test_skill_isolation_native import child_environment
 from test_sdk_compaction_product import SUMMARY
 
@@ -159,7 +160,7 @@ def integrated(request, local_env, monkeypatch, tmp_path, runtime_path, signing_
         supervisor=SimpleNamespace(journal=SimpleNamespace(root=tmp_path / "agent")),
     )
     with monkeypatch.context() as environment:
-        environment.setenv("FA_NATIVE_TURNS", NATIVE_STATE_PROFILE)
+        environment.setenv("FA_NATIVE_TURNS", NATIVE_V3_PROFILE)
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-factory-configuration")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
@@ -167,7 +168,7 @@ def integrated(request, local_env, monkeypatch, tmp_path, runtime_path, signing_
         runtime = native_sdk.native_runtime_from_environment(hosted)
     monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", target.session_id)
     monkeypatch.setenv("FOUNDRY_AGENT_NAME", target.agent_name)
-    monkeypatch.setenv("FA_NATIVE_TURNS", NATIVE_STATE_PROFILE)
+    monkeypatch.setenv("FA_NATIVE_TURNS", NATIVE_V3_PROFILE)
 
     api = api_application(composition)
     api_calls, bindings, closed, sdk_calls, sdk_outcomes, errors = [], [], [], [], [], []
@@ -477,6 +478,7 @@ def test_a_subset_preserves_full_template_and_original_result_with_real_consumer
         assert count <= 6, "The tracer permits only the original parent/child model calls."
         assert body["model"] == "gpt-5.4-mini" and body["store"] is False
         assert "previous_response_id" not in body
+        assert body["text"] == {"verbosity": "medium"}, "The delegated child (call 5) keeps the parent's verbosity."
         names = {tool["name"] for tool in body.get("tools", ())}
         if count == 5:
             assert names == set()
@@ -580,7 +582,7 @@ def test_b_v1_completions_does_not_inherit_optional_capabilities_from_the_team_c
     assert receipt.capture == captured and not receipt.delivered
     assert captured.capabilities is None and captured.template.skills == ()
     assert captured.template.settings.model_dump(mode="json") == {
-        "sdk_version": "1.0.13", "runtime_version": "1.0.83", "mode": "empty",
+        "sdk_version": SENT_RELEASE[0], "runtime_version": SENT_RELEASE[1], "mode": "empty",
         "checkpoint_profile": None, "sdk_start_profile": None, "model_capacity_profile": None,
     }
     assert h.bindings == h.closed == []
@@ -1225,8 +1227,8 @@ def test_a_handoff_uses_original_api_and_preserves_b_zero_capability_capture(int
 def test_native_skillify_enters_real_m3_approval_and_c2_read_without_a_second_upload(
         integrated, monkeypatch, signing_key, jwk_client, lose_reply):
     from shared_context.native_skill_draft_wire import NativeSkillDraftReceipt, NativeSkillDraftView
-    from test_m3_auth import token as signed_token
-    from test_skill_purpose import signed_m3
+    from shared_context.m3_auth import HumanApprover
+    from shared_context.m3_models import ApprovalInput
 
     monkeypatch.setattr(behavior_sdk_files, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(behavior_sdk_files, "platform", SimpleNamespace(machine=lambda: "x86_64"))
@@ -1338,35 +1340,22 @@ def test_native_skillify_enters_real_m3_approval_and_c2_read_without_a_second_up
     assert before.state == "awaiting_decision" and before.receipt == draft and before.body == arguments["body"]
     assert h.case.authority.skills.catalog(
         actor, actor.team, (draft.artifact_id,), schema_version="fa-approved-skill-catalog-v2").entries == ()
-    http, agent_headers_m3, human_headers_m3 = signed_m3(service, signing_key, jwk_client)
-    auth = service.context.auth
-    claims = {"aud": auth.audience, "tid": auth.tenant_id, "iss": f"https://sts.windows.net/{auth.tenant_id}/"}
-    agent_headers_m3 = {"Authorization": "Bearer " + signed_token(
-        signing_key, {**claims, "oid": actor.oid, "idtyp": "app"}, remove=("scp",))}
-    human_headers_m3 = {"Authorization": "Bearer " + signed_token(
-        signing_key, {**claims, "oid": service.approval.approver_oid,
-                      "appid": service.approval.client_id, "scp": "Artifacts.Approve"})}
-    path = "/teams/" + actor.team + "/artifacts/" + draft.artifact_id
-    with http:
-        listed = http.get("/teams/" + actor.team + "/skill-reviews", headers=human_headers_m3)
-        assert listed.status_code == 200, listed.text
-        entry = next(item for item in listed.json()["entries"] if item["artifact_id"] == draft.artifact_id)
-        assert entry["status"] == "awaiting_decision" and entry["native_source"] == draft.native_source.model_dump(mode="json")
-        record = http.get(path, headers=human_headers_m3)
-        version = http.get(path + "/versions/" + draft.version_id, headers=human_headers_m3)
-        assert version.status_code == 200 and version.json()["approval"] is None
-        assert version.json()["native_source"] == draft.native_source.model_dump(mode="json")
-        content = http.get(path + "/versions/" + draft.version_id + "/content",
-                           headers={**human_headers_m3, "If-Match": version.json()["blob"]["etag"]})
-        assert content.content == arguments["body"].encode("utf-8")
-        decision = {"decision_id": draft.version_id, "version_id": draft.version_id, "sha256": draft.sha256,
-                    "metadata_sha256": draft.metadata_sha256, "decision": "approve"}
-        refused = http.post(path + "/decisions", json=decision,
-                            headers={**agent_headers_m3, "If-Match": record.headers["etag"]})
-        assert refused.status_code == 403
-        approved = http.post(path + "/decisions", json=decision,
-                             headers={**human_headers_m3, "If-Match": record.headers["etag"]})
-        assert approved.status_code == 200, approved.text
+    human_m3 = HumanApprover(service.approval.approver_oid, service.approval.team)
+    listed = service.skill_reviews(human_m3, actor.team).model_dump(mode="json")
+    entry = next(item for item in listed["entries"] if item["artifact_id"] == draft.artifact_id)
+    assert entry["status"] == "awaiting_decision" and entry["native_source"] == draft.native_source.model_dump(mode="json")
+    record = service.get(human_m3, actor.team, draft.artifact_id)
+    version = service.version(human_m3, actor.team, draft.artifact_id, draft.version_id)
+    assert version.approval is None
+    assert version.native_source.model_dump(mode="json") == draft.native_source.model_dump(mode="json")
+    _, content = service.download(human_m3, actor.team, draft.artifact_id, draft.version_id, version.blob.etag)
+    assert content == arguments["body"].encode("utf-8")
+    decision = ApprovalInput(decision_id=draft.version_id, version_id=draft.version_id, sha256=draft.sha256,
+                             metadata_sha256=draft.metadata_sha256, decision="approve")
+    with pytest.raises(Problem) as refused:
+        service.decide(actor, actor.team, draft.artifact_id, record.etag, decision)
+    assert refused.value.status == 403
+    service.decide(human_m3, actor.team, draft.artifact_id, record.etag, decision)
 
     # Reconciliation and owner review must not need an invocation of the original Hosted SID.
     server = h.servers.pop(h.identity.session_id)

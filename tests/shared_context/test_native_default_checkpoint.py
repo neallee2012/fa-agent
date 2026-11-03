@@ -15,9 +15,9 @@ from shared_context.behavior_profile_selection import SelectConversationProfile,
 from shared_context.behavior_sdk_state import (
     AUTO_PROFILE, CheckpointProfile, local_platform, native_default_checkpoint,
 )
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_m3_auth import jwk_client, signing_key
+from test_instruction_flow import instruction_models
 
 AUTO = {"name": AUTO_PROFILE, "platform": local_platform(), "provider": "openai-completions"}
 

@@ -76,7 +76,7 @@ class AgentRoleAssignments:
                               follow_redirects=False, timeout=httpx.Timeout(30, connect=5)) as client:
                 return client.request(method, ARM + path, params={"api-version": ARM_API_VERSION, **params},
                                       headers={"Authorization": "Bearer " + token})
-        except Exception as error:  # noqa: BLE001 - token or transport: the outcome is unknown, never a token in logs
+        except Exception as error:  # token or transport: the outcome is unknown, never a token in logs
             raise Problem(503, "ROLE_ASSIGNMENTS_UNAVAILABLE", "ARM could not be reached",
                           exception_type=type(error).__name__) from None
 

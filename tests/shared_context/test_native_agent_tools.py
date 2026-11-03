@@ -13,6 +13,7 @@ from shared_context.behavior_capabilities import CapabilityCapture, available_gr
 from shared_context.behavior_native_agent_wire import NativePeerDirectory, NativeRelayAcceptance, NativeRelaySend
 from shared_context.behavior_native_turn_wire import NativeReceipt, NativeSubmit
 from shared_context.native_agent_tools import NOT_SELECTED_REASON
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_agent_relay import sender_case
 from test_m2_copilot import runtime_path
 from test_native_turns import harness, local_env, native_retry_policy
@@ -312,7 +313,7 @@ def test_native_sdk_saves_the_verified_handoff_text_when_a_terminal_tool_has_no_
         if runner_error:
             raise RuntimeError("synthetic SDK interruption after the child accepted")
         return {"final_message": "", "sdk_stop": {
-            "pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+            "pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -504,7 +505,7 @@ def test_teammates_are_a_versioned_section_only_when_this_turn_can_hand_work_to_
             "events.jsonl": json.dumps({"type": "session.start", "data": {"sessionId": sid}}) + "\n",
             "workspace.yaml": "id: " + sid + "\n"})
         return {"final_message": "ok", "sdk_stop": {"pid": 1, "exit_code": 0, "graceful": True,
-                                                    "runtime_version": "1.0.83"}}
+                                                    "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     scope = NativeCheckpointScope(
@@ -570,7 +571,7 @@ def test_a_turn_without_collaboration_says_so_where_the_roster_would_be(tmp_path
             "events.jsonl": json.dumps({"type": "session.start", "data": {"sessionId": sid}}) + "\n",
             "workspace.yaml": "id: " + sid + "\n"})
         return {"final_message": "ok", "sdk_stop": {"pid": 1, "exit_code": 0, "graceful": True,
-                                                    "runtime_version": "1.0.83"}}
+                                                    "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     scope = NativeCheckpointScope(

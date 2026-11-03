@@ -30,14 +30,14 @@ from shared_context.native_environment import follow_session
 from shared_context.native_environment_cut import cut_session, withdraw_session
 from shared_context.native_turns import _RECORD_READS, TURNS_STORE, NativeTurnRuntime, _json
 from shared_context.native_workspace_files import NativeWorkspaceFiles
-from test_native_open_rids import (  # noqa: F401 - fixtures
+from test_native_open_rids import (  # fixture
     GHOST, HISTORY, V2, V3, Quiet, _clone, _follow, _inactive, _open_set, _runtime, history, reads)
 from test_native_profile_snapshot import H0_FIXTURE
 from test_native_responses import response_submit
 from test_native_routine_turns import routine_request
 from test_native_session_bootstrap import prepare
 from test_native_turn_wire import agent_receive, submit
-from test_native_turns import IDENTITY, Harness, OfflineSdk, local_env  # noqa: F401 - fixture
+from test_native_turns import IDENTITY, Harness, OfflineSdk, local_env  # fixture
 
 SOURCE = IDENTITY.session_id
 H0 = json.loads(H0_FIXTURE.read_text(encoding="utf-8"))
@@ -90,7 +90,7 @@ def probe(identity=V2, **options):
 
 
 @pytest.fixture
-def source(local_env, monkeypatch):  # noqa: F811
+def source(local_env, monkeypatch):
     """The Agent's current session: prepared, one finished turn, no open-RID marker (it was never followed to)."""
     sdk = OfflineSdk()
     runtime = _runtime(IDENTITY, monkeypatch, sdk)
@@ -189,7 +189,7 @@ def test_an_admission_during_the_scan_makes_the_cut_busy(source, monkeypatch, en
     assert source.call(source.runtime._rid, command.command.request_id).value.receipt.hosted_session_id == SOURCE
 
 
-def test_a_continuation_admitted_during_the_scan_makes_the_cut_busy(local_env, monkeypatch):  # noqa: F811
+def test_a_continuation_admitted_during_the_scan_makes_the_cut_busy(local_env, monkeypatch):
     """The fifth entry (``continue_turn``, official recovery's derived input) moves the ETag the same way."""
     from shared_context.native_effects import NativeEffects
 
@@ -476,7 +476,7 @@ def test_a_withdraw_after_fas_recorded_stop_is_refused_and_answers_the_pending(s
 
 def test_a_retarget_record_naming_another_pending_never_blocks_withdrawing_an_unmarked_fence(source, tmp_path,
                                                                                             monkeypatch):
-    """#858 review P3: ``_original_progress`` answers 409 ``NATIVE_ENVIRONMENT_CONFLICT`` when a retained retarget names
+    """#858: ``_original_progress`` answers 409 ``NATIVE_ENVIRONMENT_CONFLICT`` when a retained retarget names
     another pending; that says nothing about FA stopping this fence's source, so the withdraw goes on."""
     before = items()["agent"]
     destination = probe(workspace_files=NativeWorkspaceFiles(tmp_path / "destination-files"))

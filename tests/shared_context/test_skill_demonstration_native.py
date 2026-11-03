@@ -1,4 +1,4 @@
-"""E-12 on the pinned SDK 1.0.13 / runtime 1.0.83: a demonstrated procedure becomes an approved skill used elsewhere.
+"""E-12 on the pinned SDK 1.0.26 / runtime 1.0.103: a demonstrated procedure becomes an approved skill used elsewhere.
 
 Conversation A saves the user's procedure as an unapproved Team draft; a human approves it; the template then pins
 that skill with fa-skills-v1; a separate conversation B reads the approved version. Scripted provider; no cloud,
@@ -24,6 +24,7 @@ from shared_context.behavior_skill_draft import HISTORY_SKILL_DRAFT_PROFILE, Ski
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.m3_auth import HumanApprover
 from shared_context.m3_models import ApprovalInput
+from shared_context.sdk_pin import SDK_VERSION
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
 from test_instruction_flow import instruction_models
@@ -112,4 +113,4 @@ def test_demonstrated_procedure_becomes_an_approved_skill_used_in_a_separate_con
         later = [item for item in requests if USE in item["users"]]
         assert later and all(DEMO not in item["users"] for item in later)
         assert all("read_skill" in item["tools"] and "save_skill_draft" in item["tools"] for item in later)
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION

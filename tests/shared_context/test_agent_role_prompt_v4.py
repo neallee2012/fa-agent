@@ -25,9 +25,10 @@ from shared_context.behavior_native_turn_wire import NativeSubmit, NativeTurnCap
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.native_local_capabilities import local_capability_provider
 from shared_context.native_turns import NativeTurnRuntime
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_local_capabilities import MODEL_ROOT, Handlers, browser_grant, with_grants
 from test_native_turn_wire import submit as native_submit
-from test_native_turns import Harness, IDENTITY, local_env  # noqa: F401
+from test_native_turns import Harness, IDENTITY, local_env
 
 V2_SHA256 = "a2ebe72807770127e06e2cd7f3b7b600cb9377912740cfdbeb8114b916076334"
 V3_SHA256 = "e28722ad651d1f539cf6eba326700976e97f14648e89a69471fa58b8ee00ccdd"
@@ -123,7 +124,7 @@ def test_native_turn_sends_role_v4_then_the_handover_and_the_role_text_last(loca
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "done", "sdk_stop": {"pid": 1, "exit_code": 0, "graceful": True,
-                                                      "runtime_version": "1.0.83"}}
+                                                      "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

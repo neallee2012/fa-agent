@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from conftest import TENANT
 from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key
-from test_web_test_console import console  # noqa: F401 - pytest fixture
+from test_web_test_console import console  # fixture
 from web_test_console.adapter import ConsoleError, SteadyConsoleConfig, canonical, sha
 from web_test_console.bridge import create_app
 from web_test_console.instructions import InstructionConnection

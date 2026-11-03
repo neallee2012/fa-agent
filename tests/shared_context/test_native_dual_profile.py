@@ -1,5 +1,7 @@
-"""ADR-0009 M1 2d-i (H2d): a runtime declaring foundry-native-v2 accepts the v1 and v2 headers, labels new
-conversations' ``_Meta`` with v2 and keeps v1 items unlabeled and byte-identical; a v1 runtime accepts only v1.
+"""ADR-0009 M1: a runtime declaring foundry-native-v2 accepts only the v2 header (the v1 alias is retired), still
+admits an unlabeled v1 body (a stored v1 original resent with its digest), labels new conversations' ``_Meta`` with v2
+and keeps v1 items unlabeled and byte-identical; a v1 runtime (no longer declarable) accepts only v1. ADR-0009 3d-i:
+a v3 runtime also admits the v2 header (a temporary alias) and v1/v2 bodies (permanent), and labels new ``_Meta`` v3.
 
 Official local task/store and host; only SDK/model I/O is synthetic (``test_native_turns``)."""
 
@@ -17,18 +19,19 @@ from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import NATIVE_TURN_HEADER, NativeReceipt, canonical_bytes
 from shared_context.errors import Problem
 from shared_context.native_checkpoint import conversation_store_name, open_durable_store
-from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_V2_PROFILE, UNLABELED_STATE_PROFILE
+from shared_context.native_responses_wire import (
+    NATIVE_RESPONSES_PROFILE, NATIVE_V2_PROFILE, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE)
 from shared_context.native_turns import TURNS_STORE, NativeTurnRuntime
 from test_native_profile_snapshot import H0_FIXTURE
 from test_native_responses import ResponsesHarness, build_responses_host, response_submit
 from test_native_turn_wire import submit
-from test_native_turns import Harness, IDENTITY, OfflineSdk, local_env, native_retry_policy  # noqa: F401
+from test_native_turns import Harness, IDENTITY, OfflineSdk, local_env, native_retry_policy
 
-V1, V2 = UNLABELED_STATE_PROFILE, NATIVE_V2_PROFILE
+V1, V2, V3 = UNLABELED_STATE_PROFILE, NATIVE_V2_PROFILE, NATIVE_V3_PROFILE
 
 
 @pytest.fixture
-def declared(request, local_env, tmp_path, native_retry_policy):  # noqa: F811
+def declared(request, local_env, tmp_path, native_retry_policy):
     """A runtime declaring ``request.param`` (what ``FA_NATIVE_TURNS`` sets in Hosted)."""
     sdk = OfflineSdk()
     cache = str((tmp_path / "OFFLINE-cache").resolve())
@@ -54,9 +57,11 @@ def item(harness, store_name, key):
 
 
 @pytest.mark.parametrize("declared, header, admitted", [
-    (V1, V1, True), (V1, V2, False), (V2, V1, True), (V2, V2, True), (V2, NATIVE_RESPONSES_PROFILE, False),
+    (V2, V1, False), (V2, V2, True), (V2, NATIVE_RESPONSES_PROFILE, False), (V2, V3, False),
+    # ADR-0009 3d-i: a v3 runtime also admits the v2 header as an alias while the API still sends v2
+    (V3, V3, True), (V3, V2, True), (V3, V1, False), (V3, NATIVE_RESPONSES_PROFILE, False),
 ], indirect=["declared"])
-def test_a_v2_runtime_accepts_v1_and_v2_headers_and_a_v1_runtime_only_v1(declared, header, admitted):
+def test_each_runtime_accepts_only_its_own_header(declared, header, admitted):
     response = post(declared, submit("dual-header"), header)
     if admitted:
         assert response.status_code == 202, response.text
@@ -72,37 +77,20 @@ def test_a_v2_runtime_accepts_v1_and_v2_headers_and_a_v1_runtime_only_v1(declare
 
 
 @pytest.mark.parametrize("declared", [V2], indirect=True)
-def test_the_v1_alias_does_not_follow_the_send_profile(declared, monkeypatch):
-    """ADR-0009 2d-ii flips the send constant; a v2 runtime keeps the fixed v1 alias (header and body) until H-alias."""
-    from shared_context import behavior_native_turn_wire, native_responses_wire, native_turns
-
-    for module in (native_responses_wire, behavior_native_turn_wire, native_turns):
-        monkeypatch.setattr(module, "NATIVE_STATE_PROFILE", V2)
-    request = submit("alias-v1").model_copy(update={"state_profile": V1})
-    assert post(declared, request, V1).status_code == 202
-    assert declared.wait("alias-v1", "completed").state_profile == V1
-
-
-@pytest.mark.parametrize("declared", [V1], indirect=True)
-def test_a_v1_runtime_refuses_a_v2_body_under_the_v1_header(declared):
-    """ADR-0009 boundary 8: the decoded body's profile is checked too, so H0-era runtimes store no v2 receipt."""
-    response = post(declared, submit("v2-body").model_copy(update={"state_profile": V2}), V1)
-    error = response.json()["error"]
-    assert response.status_code == 403 and error["code"] == "NATIVE_TURNS_DISABLED", response.text
-    assert (error["not_dispatched"], error["reason"]) == (True, "profile")
-    assert not declared.sdk.calls
-    with pytest.raises(Problem) as absent:
-        declared.call(declared.runtime.read, "v2-body")
-    assert absent.value.body["error"]["code"] == "NATIVE_RID_MISSING"
+def test_a_v1_body_is_still_admitted_under_the_v2_header(declared):
+    """ADR-0009 M1: the v1 header alias is retired, but a stored v1 original is resent with its own (unlabeled) body."""
+    request = submit("original-v1").model_copy(update={"state_profile": V1})
+    assert post(declared, request, V2).status_code == 202
+    assert declared.wait("original-v1", "completed").state_profile == V1
 
 
 @pytest.mark.parametrize("declared", [V2], indirect=True)
 def test_v1_receipts_continue_a_v2_labelled_conversation(declared):
-    assert post(declared, submit("v2-first"), V1).status_code == 202
+    assert post(declared, submit("v2-first"), V2).status_code == 202
     first = declared.wait("v2-first", "completed")
     meta = item(declared, conversation_store_name(first.conversation_id), "meta")
     assert meta["state_profile"] == V2  # _Meta is labelled with the declared profile, written explicitly
-    for rid, header in (("v1-next", V1), ("v2-header-next", V2)):
+    for rid, header in (("v1-next", V2), ("v2-header-next", V2)):
         assert post(declared, submit(rid, first.conversation_id, text="Continue " + rid), header).status_code == 202
         assert declared.wait(rid, "completed").conversation_id == first.conversation_id
     assert [call[0] for call in declared.sdk.calls] == ["v2-first", "v1-next", "v2-header-next"]
@@ -111,7 +99,7 @@ def test_v1_receipts_continue_a_v2_labelled_conversation(declared):
     assert (view.state_profile, view.last_turn, view.last_request_id) == (V2, 3, "v2-header-next")
 
 
-def test_a_v1_conversation_continues_under_a_v2_body_on_a_v2_runtime(local_env):  # noqa: F811
+def test_a_v1_conversation_continues_under_a_v2_body_on_a_v2_runtime(local_env):
     """ADR-0009 §3: admission (1234) and the run (1549) compare the v1 ``_Meta`` with a v2 body by channel."""
     first = NativeTurnRuntime(IDENTITY, OfflineSdk(), state_profile=V1)
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=first)) as client:
@@ -128,7 +116,42 @@ def test_a_v1_conversation_continues_under_a_v2_body_on_a_v2_runtime(local_env):
         assert second.executor.calls[0][2] is not None  # the v1 checkpoint was restored
 
 
-def test_official_recovery_continues_a_v1_root_in_a_v2_labelled_conversation(local_env):  # noqa: F811
+@pytest.mark.parametrize("declared, body, admitted", [
+    (V3, V1, True), (V3, V2, True), (V3, V3, True), (V2, V3, False),
+], indirect=["declared"])
+def test_stored_v1_and_v2_bodies_stay_admitted_on_a_v3_runtime(declared, body, admitted):
+    """ADR-0009 3d-i: body profiles are separate from the header alias; a stored v1 or v2 original keeps its own."""
+    request = submit("body-" + body[-2:]).model_copy(update={"state_profile": body})
+    response = post(declared, request, V2)
+    if not admitted:
+        assert response.status_code == 403 and response.json()["error"]["reason"] == "profile", response.text
+        return
+    assert response.status_code == 202, response.text
+    completed = declared.wait(request.command.request_id, "completed")
+    meta = item(declared, conversation_store_name(completed.conversation_id), "meta")
+    assert (completed.state_profile, meta["state_profile"]) == (body, V3)  # a new conversation is labelled v3
+
+
+def test_a_v2_conversation_continues_on_a_v3_runtime(local_env):
+    """ADR-0009 3d-i: a conversation moved from a v2 SID keeps its v2 ``_Meta``; the v3 runtime reads it by channel."""
+    first = NativeTurnRuntime(IDENTITY, OfflineSdk(), state_profile=V2)
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=first)) as client:
+        harness = Harness(first, first.executor, client)
+        request = submit("v2-base").model_copy(update={"state_profile": V2})
+        assert post(harness, request, V2).status_code == 202
+        cid = harness.wait("v2-base", "completed").conversation_id
+    second = NativeTurnRuntime(IDENTITY, OfflineSdk(), state_profile=V3)
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=second)) as client:
+        harness = Harness(second, second.executor, client)
+        request = submit("v2-next", cid, "Continue").model_copy(update={"state_profile": V2})
+        assert post(harness, request, V2).status_code == 202
+        assert harness.wait("v2-next", "completed").state_profile == V2
+        assert item(harness, conversation_store_name(cid), "meta")["state_profile"] == V2
+        assert second.executor.calls[0][2] is not None  # the v2 checkpoint was restored
+        assert harness.call(second.conversation, cid).state_profile == V2
+
+
+def test_official_recovery_continues_a_v1_root_in_a_v2_labelled_conversation(local_env):
     """The API copies the conversation's v2 label into the continuation (``turn_profile``); the v1 root still owns it."""
     from shared_context.behavior_native_turn_wire import NativeContinuationRead, NativeContinuationSubmit
     from shared_context.native_effects import NativeEffects
@@ -143,10 +166,10 @@ def test_official_recovery_continues_a_v1_root_in_a_v2_labelled_conversation(loc
     first.executor = tracked
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=first)) as client:
         harness = Harness(first, first_sdk, client)
-        assert post(harness, submit("labelled-base"), V1).status_code == 202
+        assert post(harness, submit("labelled-base"), V2).status_code == 202
         cid = harness.wait("labelled-base", "completed").conversation_id
         first_sdk.block = True
-        assert post(harness, submit("v1-root", cid, "Continue the original work."), V1).status_code == 202
+        assert post(harness, submit("v1-root", cid, "Continue the original work."), V2).status_code == 202
         root = harness.wait("v1-root", "started")
     assert root.state_profile == V1
 
@@ -182,16 +205,16 @@ def test_official_recovery_continues_a_v1_root_in_a_v2_labelled_conversation(loc
 def test_v1_submit_bytes_and_same_rid_resend_are_unchanged_on_a_v2_runtime(declared):
     request = submit("v1-bytes")
     assert b"state_profile" not in canonical_bytes(request)
-    assert post(declared, request, V1).status_code == 202
+    assert post(declared, request, V2).status_code == 202
     completed = declared.wait("v1-bytes", "completed")
     stored = item(declared, TURNS_STORE, "rid:v1-bytes")["receipt"]
     # a receipt always names its profile (v1, as H0 writes it); the digest is over the unlabeled v1 submit
     assert stored["state_profile"] == V1 and stored["submit_digest"] == request.sha256 == completed.submit_digest
     assert canonical_bytes(NativeReceipt.model_validate_json(json.dumps(stored))) == canonical_bytes(completed)
-    for header in (V1, V2):  # the same RID under either header is the same submission, never a conflict
-        resent = post(declared, request, header)
-        assert resent.status_code in {200, 202}, resent.text
-        assert (resent.json()["request_id"], resent.json()["submit_digest"]) == ("v1-bytes", request.sha256)
+    resent = post(declared, request, V2)  # the same RID is the same submission, never a conflict
+    assert resent.status_code in {200, 202}, resent.text
+    assert (resent.json()["request_id"], resent.json()["submit_digest"]) == ("v1-bytes", request.sha256)
+    assert post(declared, request, V1).status_code == 403  # the retired v1 header alias
     assert item(declared, TURNS_STORE, "rid:v1-bytes")["receipt"] == stored
     assert [call[0] for call in declared.sdk.calls] == ["v1-bytes"]
 
@@ -206,7 +229,7 @@ def test_the_agent_record_emits_no_key_outside_h0_on_a_v2_runtime(declared):
 
 
 @pytest.fixture
-def responses_v2(local_env, monkeypatch, tmp_path):  # noqa: F811
+def responses_v2(local_env, monkeypatch, tmp_path):
     sdk = OfflineSdk()
     runtime = NativeTurnRuntime(IDENTITY, sdk, state_profile=V2)
     contexts = {}
@@ -219,7 +242,7 @@ def responses_v2(local_env, monkeypatch, tmp_path):  # noqa: F811
 
 
 def test_a_responses_v1_conversation_continues_on_a_v2_runtime(responses_v2):
-    assert post(responses_v2, response_submit("resp-1"), V1).status_code == 202
+    assert post(responses_v2, response_submit("resp-1"), V2).status_code == 202
     first = responses_v2.call(responses_v2.runtime.read, "resp-1")
     assert responses_v2.respond(first).status_code == 200
     first = responses_v2.wait("resp-1", "completed")
@@ -232,8 +255,8 @@ def test_a_responses_v1_conversation_continues_on_a_v2_runtime(responses_v2):
     assert [call[0] for call in responses_v2.sdk.calls] == ["resp-1", "resp-2"]
 
 
-@pytest.mark.parametrize("profile", [V1, V2, NATIVE_RESPONSES_PROFILE, "foundry-native-v3"])
-def test_the_runtime_declares_the_environment_profile_and_refuses_any_other(local_env, monkeypatch, tmp_path,  # noqa: F811
+@pytest.mark.parametrize("profile", [V1, V2, NATIVE_V3_PROFILE, NATIVE_RESPONSES_PROFILE, "foundry-native-v4"])
+def test_the_runtime_declares_the_environment_profile_and_refuses_any_other(local_env, monkeypatch, tmp_path,
                                                                             profile):
     from shared_context.behavior_assistant_hosted import AssistantSupervisor
 
@@ -248,9 +271,12 @@ def test_the_runtime_declares_the_environment_profile_and_refuses_any_other(loca
     monkeypatch.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
     monkeypatch.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://offline-fixture.services.ai.azure.com/api/projects/offline")
-    if profile in {V1, V2}:
+    # ADR-0009 M1: v1 is no longer declarable; 3d-i: v2 is accepted but names SDK 1.0.13 / runtime 1.0.83, not the
+    # release this image runs, so only v3 starts (a v3 image declaring v2 would lose its work files at 3d-ii).
+    if profile == NATIVE_V3_PROFILE:
         assert native_sdk.native_runtime_from_environment(hosted).state_profile == profile
         return
     with pytest.raises(Problem) as refused:
         native_sdk.native_runtime_from_environment(hosted)
     assert refused.value.body["error"]["code"] == "NATIVE_TURNS_DISABLED"
+    assert ("another SDK/runtime release" in refused.value.body["error"]["message"]) is (profile == V2)

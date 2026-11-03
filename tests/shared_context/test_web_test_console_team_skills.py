@@ -8,9 +8,9 @@ import pytest
 
 from web_test_console.adapter import ConsoleError, PullAdapter
 from web_test_console.team_skills import TeamSkills, install_team_skill_routes, is_team_skill_write
-from test_m3_auth import jwk_client, signing_key  # noqa: F401  (fixtures used by team_skills)
-from test_team_skills_api import SKILL, SKILL_TEXT, RESOURCE_TEXT, owner_draft, team_skills, upload_skill  # noqa: F401
-from test_web_test_console_frozen_interface import real_interface  # noqa: F401
+from test_m3_auth import jwk_client, signing_key  # fixtures used by team_skills
+from test_team_skills_api import SKILL, SKILL_TEXT, RESOURCE_TEXT, owner_draft, team_skills, upload_skill
+from test_web_test_console_frozen_interface import real_interface
 
 
 def console_for(api, identity="owner"):

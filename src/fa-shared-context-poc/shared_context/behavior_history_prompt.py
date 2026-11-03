@@ -8,7 +8,9 @@ from pydantic import Field, model_validator
 
 from .behavior_assistant_reply_prompt import ASSISTANT_REPLY_PROFILE, ASSISTANT_REPLY_PROMPT
 from .behavior_skill_draft import HISTORY_SKILL_DRAFT_MEMORY_PROFILE, HISTORY_SKILL_DRAFT_PROFILE
-from .behavior_wire import Digest, WireModel
+from .behavior_wire import Digest, WireModel, exact_prefix, known_release
+from .native_responses_wire import SENT_RELEASE
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 HISTORY_PROFILE = "fa-instruction-history-v1"
 # Same readers and fixed platform text as history-v1, followed by a Team-approved role (behavior_agent_role_prompt).
@@ -71,17 +73,14 @@ class HistoryPromptAssemblyRecord(WireModel):
     prefix_sha256: Digest
     prefix_utf8_bytes: Annotated[int, Field(gt=0)]
     prefix_tokens: None = None
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]
+    runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
+    _release = model_validator(mode="after")(known_release)
     omissions: tuple[str, ...] = _OMISSIONS
 
     @model_validator(mode="after")
     def exact(self):
-        raw = HISTORY_PROMPT.encode("utf-8")
-        if (self.prefix_sha256 != hashlib.sha256(raw).hexdigest()
-                or self.prefix_utf8_bytes != len(raw) or self.omissions != _OMISSIONS):
-            raise ValueError("History-reader assembly differs from its fixed source")
-        return self
+        return exact_prefix(self, HISTORY_PROMPT, _OMISSIONS, "History-reader assembly differs from its fixed source")
 
 
 @dataclass(frozen=True)

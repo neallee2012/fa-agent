@@ -65,7 +65,7 @@ class CutDriver:
             outcome, reason = "destination_unready", "shutdown" if self._stop.is_set() else "fence_overrun"
         except Problem as error:
             reason = error.body["error"]["code"]
-        except Exception as error:  # noqa: BLE001 - a background attempt only logs; the next turn end tries again
+        except Exception as error:  # a background attempt only logs; the next turn end tries again
             reason = type(error).__name__
         finally:
             with self._lock:
@@ -97,7 +97,7 @@ def turn_ended(composition, control, receipt):
     try:
         if native_sessions(composition).guard.enforce:
             native_cut_driver(composition).turn_ended(control, receipt.agent_id, receipt.request_id)
-    except Exception as error:  # noqa: BLE001 - see the docstring
+    except Exception as error:  # see the docstring
         log.warning("NATIVE_UPGRADE_CUT_HOOK_FAILED code=%s agent_id=%s", type(error).__name__, receipt.agent_id)
 
 

@@ -17,7 +17,7 @@ from shared_context import behavior_desktop_view_api as broker
 from shared_context import behavior_team_registry
 from shared_context.behavior_auth import BehaviorAuthSettings, BehaviorJwtVerifier
 from shared_context.errors import Problem
-from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token  # noqa: F401
+from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token
 from test_team_registry import AGENT_OID, _target
 
 TARGET = _target(1, AGENT_OID)
@@ -235,4 +235,6 @@ def test_the_production_api_serves_the_viewer_route():
     import inspect
 
     from shared_context import behavior_server
-    assert "install_desktop_view_routes(app, composition)" in inspect.getsource(behavior_server.application)
+    # The production app builder installs the Team routes, and that group includes the desktop viewer.
+    assert "_install_team_routes(app, composition)" in inspect.getsource(behavior_server._operational_application)
+    assert "install_desktop_view_routes(app, composition)" in inspect.getsource(behavior_server._install_team_routes)

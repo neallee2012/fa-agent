@@ -18,9 +18,9 @@ ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "scripts" / "public_export"
 sys.path.insert(0, str(TOOLS))
 
-import discover  # noqa: E402
-import scrub_export  # noqa: E402
-import verify_export  # noqa: E402
+import discover
+import scrub_export
+import verify_export
 
 TENANT_GUID = "3f2a9c41-7b6e-4d18-9a5c-2e8b71f04d63"
 PLACEHOLDER = "00000000-0000-0000-0000-000000000010"

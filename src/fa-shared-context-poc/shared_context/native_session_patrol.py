@@ -101,7 +101,7 @@ class NativeSessionPatrol(BackgroundLoop):
         try:
             if self.switch(agent_id):
                 counts["handed"] += 1
-        except Exception as error:  # noqa: BLE001 - the next run hands it again
+        except Exception as error:  # the next run hands it again
             _LOG.warning("%s_UNHANDED agent=%s code=%s", self.name, agent_id[:8], _code(error))
 
     def status(self, source):
@@ -166,7 +166,7 @@ class NativeSessionPatrol(BackgroundLoop):
                     continue
                 source = self.source(agent_id, row)
                 status = self.status(source)
-            except Exception as error:  # noqa: BLE001 - 5xx, timeout, 401/403, a bad registration: read again tomorrow
+            except Exception as error:  # 5xx, timeout, 401/403, a bad registration: read again tomorrow
                 counts["unread"] += 1
                 _LOG.warning("NATIVE_SESSION_PATROL_UNREAD agent=%s code=%s", agent_id[:8], _code(error))
                 continue
@@ -203,7 +203,7 @@ class NativeSessionPatrol(BackgroundLoop):
             decided = store.decide_abandon(
                 agent_id, hosted_session_id=row.hosted_session_id, basis="retired", source_status=status,
                 created_agent_version=row.created_agent_version, state_profile=row.state_profile)
-        except Exception as error:  # noqa: BLE001 - one Agent never blocks another
+        except Exception as error:  # one Agent never blocks another
             counts["unread"] += 1
             _LOG.warning("NATIVE_SESSION_PATROL_UNREAD agent=%s code=%s", agent_id[:8], _code(error))
             return
@@ -229,7 +229,7 @@ class NativeSessionPatrol(BackgroundLoop):
             await asyncio.sleep(wait)
             try:
                 await loop.run_in_executor(self._executor, self.run)
-            except Exception as error:  # noqa: BLE001 - the next day runs again
+            except Exception as error:  # the next day runs again
                 _LOG.error("%s_FAILED code=%s", self.name, _code(error))
             wait = self.interval + random.uniform(0, self.jitter)
 

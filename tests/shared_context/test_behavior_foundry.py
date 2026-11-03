@@ -198,6 +198,12 @@ class ApiCredential:
         return SimpleNamespace(token="synthetic-mi-token")
 
 
+class SlowImportSupervisor(ChecksumSupervisor):
+    # A real child imports this package before it reads park/cancel: 4-7 s on Windows, past HostedRuntime's 2 s wait.
+    def control(self, launch_id, action, request_id, *, wait_seconds=0):
+        return super().control(launch_id, action, request_id, wait_seconds=10 if wait_seconds else 0)
+
+
 class NativeHarness(WorkerHarness):
     """Concrete clients, server authority and real children over OFFLINE HTTP/Table transports."""
 
@@ -254,7 +260,7 @@ class NativeHarness(WorkerHarness):
             )
             runtime = HostedRuntime(
                 wire.HostedIdentity(**{field: getattr(target, field) for field in ("agent_id", "agent_name", "agent_version", "session_id")}),
-                ChecksumSupervisor(root / target.executor_id), api, clock=lambda: self.time,
+                SlowImportSupervisor(root / target.executor_id), api, clock=lambda: self.time,
             )
             self.runtimes[target.executor_id] = runtime
             self.clients.append(FoundryHttpClient(
@@ -502,7 +508,7 @@ def test_concrete_c1_parent_parks_child_progresses_then_resumes_and_late_predece
         # A new Hosted process gets a new capability for the next launch, not the
         # old reporter token. The original native park is already sealed server-side.
         h.runtimes[h.targets[0].executor_id] = HostedRuntime(
-            old_runtime.identity, ChecksumSupervisor(old_runtime.supervisor.journal.root),
+            old_runtime.identity, SlowImportSupervisor(old_runtime.supervisor.journal.root),
             old_runtime.api, clock=lambda: h.time,
         )
         assert not h.runtimes[h.targets[0].executor_id].report_tokens
@@ -654,7 +660,10 @@ def test_native_adoption_requires_verified_park_and_current_owner_and_renewed_ex
         h.workers.start(parent, CONTEXT)
         h.specs[1] = h.specs[1].model_copy(update={"parent_job_id": parent})
         h.workers.enqueue(h.specs[1], CONTEXT)
-        parked = h.foundry.park(h.workers.inspect(parent).binding)
+        binding = h.workers.inspect(parent).binding
+        h.runtimes[h.targets[0].executor_id].supervisor.children[
+            native_key("launch-id", binding.start_request_id)].wait(timeout=15)
+        parked = h.foundry.park(binding)
         h.workers.observe(parent, parked, CONTEXT)
         h.mutate("owner", CONTEXT.owner_record_id, epoch=2)
         new_owner = CONTEXT.model_copy(update={"epoch": 2})

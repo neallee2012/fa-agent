@@ -21,6 +21,7 @@ BOUNDED = (422, "ASSISTANT_MODEL_REQUEST_INVALID", "bounded pinned-model request
 LOCAL_INPUT = (422, "ASSISTANT_MODEL_REQUEST_INVALID",
                "Responses must carry complete local input without provider storage")
 REASONING = (422, "ASSISTANT_MODEL_REQUEST_INVALID", "unsupported Responses reasoning options")
+TEXT = (422, "ASSISTANT_MODEL_REQUEST_INVALID", "unsupported Responses text options")
 IMAGES = (403, "ASSISTANT_IMAGES_DENIED",
           "images are allowed only for this turn's captured image capability, within its bound")
 FILE_READS = (403, "ASSISTANT_TOOLS_DENIED", "original user-turn capability is required for file reads")
@@ -120,7 +121,7 @@ def test_provider_must_be_the_responses_provider_on_a_free_instruction(options):
     (free(unknown=1), FREE),
     (responses(unknown=1), RESPONSES),
     *[(legacy(**{field: 1}), {}) for field in (
-        "input", "instructions", "reasoning", "max_output_tokens", "prompt_cache_key", "include")],
+        "input", "instructions", "reasoning", "max_output_tokens", "prompt_cache_key", "include", "text")],
     *[(responses(**{field: 1}), RESPONSES) for field in (
         "messages", "stream_options", "max_tokens", "n", "stop", "presence_penalty", "frequency_penalty",
         "max_completion_tokens", "reasoning_effort")],
@@ -207,6 +208,19 @@ def test_responses_keep_input_local(changes):
 ])
 def test_responses_reasoning_stays_on_the_listed_options(reasoning):
     assert refusal(responses(reasoning=reasoning), **RESPONSES) == REASONING
+
+
+@pytest.mark.parametrize("verbosity", ["low", "medium", "high"])
+def test_the_newer_runtimes_verbosity_passes(verbosity):
+    assert PROVIDER.validate(responses(text={"verbosity": verbosity}), **RESPONSES) is None
+
+
+@pytest.mark.parametrize("text", [
+    "low", None, {}, {"verbosity": "max"}, {"verbosity": None}, {"format": {"type": "text"}},
+    {"verbosity": "low", "format": {"type": "text"}},
+])
+def test_responses_text_stays_on_the_observed_verbosity(text):
+    assert refusal(responses(text=text), **RESPONSES) == TEXT
 
 
 def test_images_are_read_from_the_input_the_mode_actually_sends():
@@ -296,6 +310,11 @@ def test_only_legacy_requests_cap_the_tool_count():
     [{"type": "custom", "function": {"name": "read_context"}}],
     [{"type": "function"}],
     [{"type": "function", "function": {}}],
+    [{"type": "function", "function": None}],
+    [{"type": "function", "function": "read_context"}],
+    [{"type": "function", "function": ["read_context"]}],
+    [chat_tool(["read_context"])],
+    [chat_tool({"name": "read_context"})],
     [{"type": "function", "name": "read_context"}],
     [chat_tool("shell")],
     [chat_tool("read_context"), chat_tool("shell")],

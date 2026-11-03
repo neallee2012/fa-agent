@@ -389,7 +389,7 @@ def test_lost_receive_response_keeps_original_id_and_only_one_quota_entry(relay_
 
 
 def test_a_recipient_whose_earlier_cli_has_not_exited_has_the_sender_resend_the_same_message(relay_case):
-    """#903 P2-2: Hosted's not_dispatched 503 NATIVE_EXECUTION_UNAVAILABLE (an earlier SDK runtime still exiting) is
+    """#903: Hosted's not_dispatched 503 NATIVE_EXECUTION_UNAVAILABLE (an earlier SDK runtime still exiting) is
     NATIVE_RELAY_RECIPIENT_UNAVAILABLE, the code the sender's relay waits on and resends; the resend is accepted once."""
     from shared_context.native_agent_api import NativeAgentRelayGateway
 
@@ -895,7 +895,7 @@ def test_a_continuation_reads_the_sender_selector_and_never_invokes_its_kept_old
 
 @pytest.mark.parametrize("misrouted", [False, True], ids=["unknown-to-the-caller", "read-through-the-caller"])
 def test_another_agent_can_not_have_a_waiting_responses_message_sent(relay_case, monkeypatch, misrouted):
-    """Review round 4 (P3), ADR-0009 §7a (s): ``/waiting-dispatch`` with a registered teammate's (B's) identity for
+    """ADR-0009 §7a (s): ``/waiting-dispatch`` with a registered teammate's (B's) identity for
     A's waiting Responses message reads through B's own session: the RID is unknown there, or (were B's session to
     show A's receipt) the transport refuses another Agent's receipt; refused either way, nothing sent. A's own
     identity sends it once."""

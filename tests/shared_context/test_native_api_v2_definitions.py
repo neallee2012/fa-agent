@@ -1,6 +1,7 @@
-"""ADR-0009 M1 2d-ii: the API accepts only Hosted versions whose definition declares foundry-native-v2.
+"""ADR-0009 M1 2d-ii: the API accepts only Hosted versions whose definition declares a supported profile.
 
-The supported set is {v2} and the API sends v2; a v1 definition or row is incompatible. Offline doubles only."""
+The supported set is {v2, v3} from 3d-i and the API sends v2; a v1 definition or row is incompatible. Offline doubles
+only."""
 
 import logging
 from types import SimpleNamespace
@@ -13,10 +14,10 @@ from shared_context.behavior_agent_versions import FOLLOWING, HostedVersions
 from shared_context.behavior_native_sessions import NativeSessions, _require_native_version
 from shared_context.errors import Problem
 from shared_context.native_binding import NativeBindingObservation, NativeBindingRow, SessionGuard
-from shared_context.native_responses_wire import NATIVE_V2_PROFILE, UNLABELED_STATE_PROFILE
+from shared_context.native_responses_wire import NATIVE_V2_PROFILE, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE
 from test_agent_versions import Foundry, R, _code
 
-V1, V2 = UNLABELED_STATE_PROFILE, NATIVE_V2_PROFILE
+V1, V2, V3 = UNLABELED_STATE_PROFILE, NATIVE_V2_PROFILE, NATIVE_V3_PROFILE
 
 
 def hosted(profile, **environment):
@@ -37,6 +38,9 @@ def test_a_v2_selected_version_of_another_build_is_a_follow_target_and_a_v1_one_
         assert _code(refused) == (503, FOLLOWING)
     foundry.selectors[R.agent_name] = "4"
     assert resolver.current(R) == "4"
+    foundry.add(R.agent_name, 6, "other-build", definition=hosted(V3))  # ADR-0009 3d-i: assistants declare v3
+    foundry.selectors[R.agent_name] = "6"
+    assert resolver.current(R) == "6"
 
 
 def test_a_v2_definition_still_needs_its_identity_and_active_status():
@@ -50,7 +54,8 @@ def test_a_v2_definition_still_needs_its_identity_and_active_status():
         assert _code(refused) == (503, FOLLOWING)
 
 
-@pytest.mark.parametrize("profile, accepted", [(V1, False), (V2, True), ("foundry-native-v3", False), (None, False)])
+@pytest.mark.parametrize("profile, accepted", [(V1, False), (V2, True), (V3, True), ("foundry-native-v4", False),
+                                               (None, False)])
 def test_the_selected_version_must_declare_a_supported_profile(monkeypatch, profile, accepted):
     monkeypatch.setattr(behavior_native_sessions, "_native_profile", lambda _client: profile)
     if accepted:
@@ -62,9 +67,10 @@ def test_the_selected_version_must_declare_a_supported_profile(monkeypatch, prof
 
 
 def test_sync_and_the_responses_lane_accept_a_v2_definition():
-    assert versions._check_environment({"FA_NATIVE_TURNS": V2}, 900) == {"FA_NATIVE_TURNS": V2}
+    for profile in (V2, V3):
+        assert versions._check_environment({"FA_NATIVE_TURNS": profile}, 900) == {"FA_NATIVE_TURNS": profile}
     with pytest.raises(Problem):
-        versions._check_environment({"FA_NATIVE_TURNS": "foundry-native-v3"}, 900)
+        versions._check_environment({"FA_NATIVE_TURNS": "foundry-native-v4"}, 900)
     definition = hosted(V2, FA_RESPONSES_ENABLED="1")
     definition["protocol_versions"] = [{"protocol": "responses", "version": "2.0.0"}]
     assert versions._responses_enabled(definition)
@@ -99,7 +105,8 @@ def row(profile):
 @pytest.mark.parametrize("enforce", [False, True])
 def test_a_v2_row_is_supported_and_the_guard_neither_logs_nor_refuses(monkeypatch, caplog, enforce):
     v2 = row(V2)
-    assert v2.supported() and not row("foundry-native-v3").supported() and not row(V1).supported()
+    assert v2.supported() and row(V3).supported() and not row("foundry-native-v4").supported()
+    assert not row(V1).supported()
     guard = SessionGuard(lambda: SimpleNamespace(read=lambda _agent_id: v2), enforce=enforce)
     # The source check before an abandon decision marks incompatible SIDs; a v2 row and definition are neither.
     monkeypatch.setattr(behavior_native_sessions, "_native_profile", lambda _client, **_: V2)

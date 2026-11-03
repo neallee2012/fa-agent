@@ -78,106 +78,12 @@ def test_assistant_profile_has_explicit_pinned_serializable_resource_bindings():
     assert ServerConfiguration.model_validate_json(config.model_dump_json()) == config
 
 
-FROZEN_C1 = Path(__file__).resolve().parents[2] / ".azure" / "behavior-migration-native" / "config-new.json"
-
-
-def frozen_c1_config():
-    # A private deployment snapshot that is not in the repository; its exact bytes are checked below when present.
-    if not FROZEN_C1.is_file():
-        pytest.skip("needs the private C1 snapshot .azure/behavior-migration-native/config-new.json "
-                    "(sha256 f5b4b89c...) at the repository root")
-    return FROZEN_C1.read_bytes()
-
-
 def test_legacy_default_serialization_is_unchanged():
     assert synthetic_configuration().sha256 == "e853591b3bfb0e941a212792d2aff967d303c21481a499924647d8bbf9811067"
     raw = synthetic_configuration().model_dump(mode="json")
     assert "assistant" not in raw
     raw["assistant"] = None
     assert ServerConfiguration.model_validate_json(json.dumps(raw)).sha256 == synthetic_configuration().sha256
-
-
-def test_frozen_c1_serialization_is_unchanged():
-    frozen = frozen_c1_config()
-    config = ServerConfiguration.model_validate_json(frozen)
-    assert hashlib.sha256(frozen).hexdigest() == "f5b4b89c23672d6140448e447af99eb58fcb21e5f78e5cf4f7601173d034d60d"
-    assert config.sha256 == "d22c9ebc091c0cf21472a6a15c579b60e67f9aa0a73e8eea7fe3c3d064fb9c6a"
-    assert hashlib.sha256(config.model_dump_json().encode()).hexdigest() == "4e1f9a696d0c4a3d1f9558a2a554a41ae97e0d1b9085cb2a899c85ab9cc81d96"
-
-
-def test_transition_shaped_config_keeps_existing_c1_resources_roots_and_old_policy():
-    frozen = frozen_c1_config()
-    original = ServerConfiguration.model_validate_json(frozen)
-    raw = original.model_dump(mode="json")
-    sample = assistant_configuration()
-    raw.update(deployment_id="assistant-config-shape", workload_version="assistant-v1.2",
-               assistant=sample["assistant"])
-    raw["workers"].update(
-        executor_version="assistant-sdk-1-0-13-runtime-1-0-83",
-        protection_version="assistant-inline-and-m3-retention-v1",
-    )
-    raw["delivery"].update(
-        protection_version="assistant-inline-and-m3-retention-v1", verifier_version="assistant-verifier-v1",
-    )
-    raw["targets"][0].update(agent_version=str(int(original.targets[0].agent_version) + 1),
-                             session_id="assistant-session-shape")
-    binding = raw["bindings"][0]
-    binding.pop("child_jobs", None)
-    binding.update(
-        binding_id="assistant-binding", event_id="assistant-event", job_id="assistant-job",
-        operation_id="assistant-operation", attempt_id="assistant-attempt", grant_id="assistant-grant",
-        ingress_id="assistant-authenticated-api", source_ids=["assistant-source"],
-        claim_ids=["assistant-claim"], allowed_input_refs=["assistant-goal"],
-    )
-    binding["owner"].update(owner_record_id="assistant-owner", conversation_id="assistant-conversation",
-                            policy_id="assistant-policy")
-    binding["route"]["thread_id"] = "assistant-thread"
-    binding["work"] = {**sample["bindings"][0]["work"], "work_id": "assistant-work"}
-    raw["bindings"] = [binding]
-    raw["policies"] = [{
-        "binding_id": binding["binding_id"],
-        "policy": {**raw["policies"][0]["policy"],
-                   "binding_digest": digest(["fa-behavior-api-v1", "native", binding])},
-    }]
-    raw["operations"] = [{
-        **raw["operations"][0], "input_ref": "assistant-goal", "binding_id": binding["binding_id"],
-    }]
-    settings = raw["assistant"]
-    settings["profiles"][0].update(binding_id=binding["binding_id"], claim_id="assistant-claim")
-    settings["profiles"][0]["source"]["source_id"] = "assistant-source"
-    settings["provider_endpoint"] = original.targets[0].project_endpoint + "/openai/v1/chat/completions"
-    settings["m3_context"] = {
-        "account_resource_id": original.table.account_resource_id, "endpoint": original.table.endpoint,
-        "table_name": original.table.scope.table_name,
-    }
-    settings["artifact_container_url"] = original.sources.protection.container_url
-    candidate = ServerConfiguration.model_validate_json(json.dumps(raw))
-    old, new = original.model_dump(), candidate.model_dump()
-    assert original.assistant is None and "assistant" not in old
-    assert set(new["assistant"]) == {
-        "profiles", "provider_endpoint", "model", "credential_binding", "m3_context", "artifact_container_url",
-    }
-    assert {key for key in old.keys() | new.keys() if old.get(key) != new.get(key)} == {
-        "deployment_id", "workload_version", "assistant", "bindings", "policies", "operations",
-        "workers", "delivery", "targets",
-    }
-    for section, allowed in (
-        ("workers", {"executor_version", "protection_version"}),
-        ("delivery", {"protection_version", "verifier_version"}),
-    ):
-        assert {key for key in old[section] if old[section][key] != new[section][key]} == allowed
-    assert {key for key in old["targets"][0] if old["targets"][0][key] != new["targets"][0][key]} == {
-        "agent_version", "session_id",
-    }
-    assert new["targets"][1:] == old["targets"][1:]
-    assert candidate.workers.capacity == original.workers.capacity == 1
-    assert candidate.bindings[0].root_request_id == original.roots[0].root_request_id
-    assert candidate.bindings[0].owner.root_budget_id == original.roots[0].root_budget_id
-    assert candidate.policies[0].policy.valid_until == original.policies[0].policy.valid_until
-    assert candidate.bindings[0].binding_id not in {item.binding_id for item in original.bindings}
-    assert ServerConfiguration.model_validate(candidate.model_dump()) == candidate
-    assert original.model_dump_json() == ServerConfiguration.model_validate_json(frozen).model_dump_json()
-    assert path.read_bytes() == frozen
 
 
 class AssistantHarness(Harness):

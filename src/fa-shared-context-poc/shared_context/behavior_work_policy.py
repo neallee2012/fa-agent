@@ -29,6 +29,7 @@ from .behavior_agent_worker import AgentVmBinding
 from .behavior_agent_message_wire import PeerTeamReference
 from .behavior_turn_wire import TurnRelayContext, TurnStartReceipt
 from .behavior_routine_wire import DailyRoutineDefinition, RoutineOccurrence
+from .behavior_wire import same_but_release
 
 Money=Annotated[int,Field(ge=0,le=2**63-1)]
 
@@ -276,19 +277,31 @@ class WorkPreflight(_Model):
     _time=field_validator("observed_at")(_utc)
 
 
-def cumulative_decision(policy,ledger,observation,now,*,read_id,mode,instruction=False):
-    """Pure read; no reservation, receipt, model call, or dispatch permission."""
-    now=_utc(now)
-    scope_ok=(type(observation) is CostObservation and observation.evidence_mode==mode==policy.evidence_mode
-              and observation.observer_oid==policy.cost_observer_oid and observation.authority_domain==policy.authority_domain
-              and observation.control_binding==policy.control_binding and observation.cost_scope_sha256==policy.cost_scope_sha256
-              and observation.legacy_liability_sha256==ledger.legacy_liability_sha256)
-    fresh=scope_ok and observation.observed_at<=now and (instruction or not ledger.budget_enforced or
+def _observation_in_scope(policy,ledger,observation,mode):
+    return (type(observation) is CostObservation and observation.evidence_mode==mode==policy.evidence_mode
+            and observation.observer_oid==policy.cost_observer_oid and observation.authority_domain==policy.authority_domain
+            and observation.control_binding==policy.control_binding and observation.cost_scope_sha256==policy.cost_scope_sha256
+            and observation.legacy_liability_sha256==ledger.legacy_liability_sha256)
+
+
+def _observation_fresh(policy,ledger,observation,now,instruction):
+    """An instruction or an accounting-only ledger needs no recent cost, only one not from the future."""
+    return observation.observed_at<=now and (instruction or not ledger.budget_enforced or
         now<observation.observed_at+timedelta(seconds=policy.cost_max_age_seconds))
-    monotonic=scope_ok and (observation.observed_at>=ledger.latest_observed_at
-              and observation.observed_cumulative_microusd>=ledger.observed_high_water_microusd
-              and observation.observed_cumulative_microusd>=policy.minimum_observed_microusd
-              and observation.legacy_unresolved_reserve_microusd>=ledger.legacy_unresolved_reserve_microusd)
+
+
+def _observation_monotonic(policy,ledger,observation):
+    return (observation.observed_at>=ledger.latest_observed_at
+            and observation.observed_cumulative_microusd>=ledger.observed_high_water_microusd
+            and observation.observed_cumulative_microusd>=policy.minimum_observed_microusd
+            and observation.legacy_unresolved_reserve_microusd>=ledger.legacy_unresolved_reserve_microusd)
+
+
+def _observation_verdict(policy,ledger,observation,now,mode,instruction):
+    """Return the first policy or observation reason to deny, and whether the observation may raise the ledger."""
+    scope_ok=_observation_in_scope(policy,ledger,observation,mode)
+    fresh=scope_ok and _observation_fresh(policy,ledger,observation,now,instruction)
+    monotonic=scope_ok and _observation_monotonic(policy,ledger,observation)
     reason="allowed"
     if not policy.active:reason="policy_revoked"
     elif not policy.read_enabled:reason="result_access_revoked"
@@ -298,13 +311,24 @@ def cumulative_decision(policy,ledger,observation,now,*,read_id,mode,instruction
         reason="cost_observation_stale"
     elif not monotonic:
         reason="cost_observation_regressed"
-    if ledger.authority_domain!=policy.authority_domain or ledger.cost_scope_sha256!=policy.cost_scope_sha256:
-        raise Problem(409,"WORK_POLICY_BUDGET_SCOPE","the original cumulative cost authority differs")
-    matched=fresh and monotonic
+    return reason,fresh and monotonic
+
+
+def _budget_amounts(policy,ledger,observation,matched):
+    """Spent high water, every held amount, and what is left under the ceiling less the safety reserve."""
     high=max(ledger.observed_high_water_microusd,observation.observed_cumulative_microusd if matched else 0)
     legacy=max(ledger.legacy_unresolved_reserve_microusd,observation.legacy_unresolved_reserve_microusd if matched else 0)
     held=legacy+ledger.work_reservations_microusd+ledger.model_pending_microusd+ledger.model_metered_microusd
-    remaining=max(0,policy.cumulative_ceiling_microusd-policy.safety_reserve_microusd-high-held)
+    return high,held,max(0,policy.cumulative_ceiling_microusd-policy.safety_reserve_microusd-high-held)
+
+
+def cumulative_decision(policy,ledger,observation,now,*,read_id,mode,instruction=False):
+    """Pure read; no reservation, receipt, model call, or dispatch permission."""
+    now=_utc(now)
+    reason,matched=_observation_verdict(policy,ledger,observation,now,mode,instruction)
+    if ledger.authority_domain!=policy.authority_domain or ledger.cost_scope_sha256!=policy.cost_scope_sha256:
+        raise Problem(409,"WORK_POLICY_BUDGET_SCOPE","the original cumulative cost authority differs")
+    high,held,remaining=_budget_amounts(policy,ledger,observation,matched)
     required=0 if instruction else policy.work_estimate_microusd
     if ledger.budget_enforced and reason=="allowed" and (remaining==0 if instruction else remaining<required):
         reason="cumulative_budget_exhausted"
@@ -480,6 +504,72 @@ def derive_work_binding(policy,request_id,*,instruction=None,agent_origin=None):
     return seed,binding
 
 
+def _peer_work_scope(base_profile,binding,peer_work,*,instruction,profile_template,memory_capture,capability_capture,
+                     prompt_override,previous_archive_id,turn_number):
+    """An Agent handoff starts a fresh first turn on a narrowed profile, bound to the recipient's own work."""
+    from .behavior_agent_peer_work import narrow_profile
+    from .behavior_agent_messages import claim_key
+    if (instruction is None or profile_template is not None or memory_capture is not None
+            or capability_capture is not None or prompt_override is not None or previous_archive_id is not None
+            or turn_number != 1):
+        raise Problem(403,"AGENT_MESSAGE_ASSIGNMENT_DENIED","peer work cannot inherit a private conversation or profile")
+    return narrow_profile(base_profile),RuntimeBinding.model_validate({**binding.model_dump(),
+        "attempt_id":claim_key(peer_work.message_key),"work":{**binding.work.model_dump(),
+        "work_id":peer_work.recipient_work_id,"goal":"Follow the original agent handoff: "+peer_work.content_sha256}})
+
+
+def _override_prompt(policy,profile,prompt_override,instruction):
+    if (instruction is None or policy.profile.prompt_profile is not None
+            or prompt_override not in {"fa-instruction-v1","fa-instruction-v2"}):
+        raise Problem(422,"WORK_POLICY_PROMPT_PROFILE","only the supported default for an unconfigured instruction is allowed")
+    return AssistantProfile.model_validate_json(profile.model_copy(update={"prompt_profile":prompt_override}).model_dump_json())
+
+
+def _composed_capabilities(base_profile,prompt_profile,capability_capture):
+    """Return the captured capabilities this prompt can compose and the skill catalog budget they unlock."""
+    from .behavior_capabilities import CAPABILITY_BASE_PROFILES,check_captured
+    capabilities=check_captured(base_profile.capabilities,capability_capture)
+    if capabilities is not None and prompt_profile not in CAPABILITY_BASE_PROFILES:
+        raise Problem(422,"CAPABILITY_BASE_UNSUPPORTED","this instruction profile does not compose capabilities")
+    from .behavior_capability_prompt import skill_access
+    return capabilities,(base_profile.skill_catalog_budget_profile if skill_access(prompt_profile,capabilities) else None)
+
+
+def _instruction_task(policy,instruction,base_profile,profile,*,peer_work,capability_capture,role_prompt,
+                      turn_number,previous_archive_id,model,hosted_agent_version,model_capacity,reasoning_summary):
+    """Check the original instruction against the server profile and fix every setting its turn runs with."""
+    from .behavior_instruction import conversation_id
+    instruction=InstructionSubmit.model_validate_json(instruction.model_dump_json())
+    if instruction.attachments and base_profile.text_attachment_profile is None:
+        raise Problem(403,"ATTACHMENTS_DISABLED","the original server policy does not enable source attachments")
+    if instruction.files and base_profile.user_text_file_profile is None:
+        raise Problem(403,"USER_TEXT_FILES_DISABLED","the original server policy does not enable literal text files")
+    capabilities,skill_budget=_composed_capabilities(base_profile,profile.prompt_profile,capability_capture)
+    from .behavior_agent_role_prompt import role_text_mismatch
+    mismatch=role_text_mismatch(profile.prompt_profile,role_prompt)
+    if mismatch=="AGENT_ROLE_PROMPT_MISSING":
+        raise Problem(409,mismatch,"the agent-role profile needs its saved role prompt")
+    if mismatch is not None:
+        raise Problem(422,mismatch,"role text applies only to the agent-role profiles")
+    return InstructionTask(content=instruction.content,
+                           conversation_id=conversation_id(policy,instruction) if peer_work is None else peer_work.conversation_id,
+                           turn_number=turn_number,previous_archive_id=previous_archive_id,
+                           model=model or instruction.model,requested_model=instruction.model,
+                           hosted_agent_version=hosted_agent_version,
+                           checkpoint_profile=base_profile.checkpoint_profile,
+                           model_provider=base_profile.model_provider,
+                           reasoning_summary=reasoning_summary,
+                           prompt_profile=profile.prompt_profile,
+                           sdk_start_profile=base_profile.sdk_start_profile,
+                           model_capacity=model_capacity,sop_copy=base_profile.sop_copy,
+                           skill_catalog_budget_profile=skill_budget,
+                           turn_origin_profile=base_profile.turn_origin_profile,
+                           worker_profile=base_profile.worker_profile,
+                           text_attachment_profile=base_profile.text_attachment_profile,attachments=instruction.attachments,
+                           user_text_file_profile=base_profile.user_text_file_profile,files=instruction.files,
+                           capabilities=capabilities,peer_work=peer_work,role_prompt=role_prompt)
+
+
 def derive_work(policy,request_id,mode,*,instruction=None,turn_number=1,previous_archive_id=None,model=None,
                 hosted_agent_version=None,model_capacity=None,prompt_override:PromptProfile|None=None,profile_template=None,
                 memory_capture=None,capability_capture=None,reasoning_summary=None,peer_work=None,role_prompt=None,
@@ -490,16 +580,9 @@ def derive_work(policy,request_id,mode,*,instruction=None,turn_number=1,previous
     named=lambda kind:work_policy_key(kind,seed)
     base_profile=policy.profile
     if peer_work is not None:
-        from .behavior_agent_peer_work import narrow_profile
-        from .behavior_agent_messages import claim_key
-        if (instruction is None or profile_template is not None or memory_capture is not None
-                or capability_capture is not None or prompt_override is not None or previous_archive_id is not None
-                or turn_number != 1):
-            raise Problem(403,"AGENT_MESSAGE_ASSIGNMENT_DENIED","peer work cannot inherit a private conversation or profile")
-        base_profile=narrow_profile(base_profile)
-        binding=RuntimeBinding.model_validate({**binding.model_dump(),
-            "attempt_id":claim_key(peer_work.message_key),"work":{**binding.work.model_dump(),
-            "work_id":peer_work.recipient_work_id,"goal":"Follow the original agent handoff: "+peer_work.content_sha256}})
+        base_profile,binding=_peer_work_scope(base_profile,binding,peer_work,instruction=instruction,
+            profile_template=profile_template,memory_capture=memory_capture,capability_capture=capability_capture,
+            prompt_override=prompt_override,previous_archive_id=previous_archive_id,turn_number=turn_number)
     if profile_template is not None:
         from .behavior_profile_selection import profile_from_template
         if instruction is None or prompt_override is not None:
@@ -510,56 +593,17 @@ def derive_work(policy,request_id,mode,*,instruction=None,turn_number=1,previous
         "artifact_version":named("artifact-version")[:32],"max_model_requests":policy.max_model_requests,
     }).model_dump_json())
     if prompt_override is not None:
-        if (instruction is None or policy.profile.prompt_profile is not None
-                or prompt_override not in {"fa-instruction-v1","fa-instruction-v2"}):
-            raise Problem(422,"WORK_POLICY_PROMPT_PROFILE","only the supported default for an unconfigured instruction is allowed")
-        profile=AssistantProfile.model_validate_json(
-            profile.model_copy(update={"prompt_profile":prompt_override}).model_dump_json())
+        profile=_override_prompt(policy,profile,prompt_override,instruction)
     if memory_capture is not None:
         from .memory_bridge_settings import apply_memory_capture
         if instruction is None:
             raise Problem(403,"MEMORY_RECALL_SCOPE_DENIED","memory settings apply only to an original instruction")
         profile,binding=apply_memory_capture(profile,binding,seed,memory_capture,selected_template=profile_template)
     if instruction is not None:
-        from .behavior_instruction import conversation_id
-        if type(instruction) is not InstructionSubmit or instruction.request_id!=request_id:
-            raise Problem(422,"WORK_POLICY_COMMAND","original typed instruction required")
-        instruction=InstructionSubmit.model_validate_json(instruction.model_dump_json())
-        if instruction.attachments and base_profile.text_attachment_profile is None:
-            raise Problem(403,"ATTACHMENTS_DISABLED","the original server policy does not enable source attachments")
-        if instruction.files and base_profile.user_text_file_profile is None:
-            raise Problem(403,"USER_TEXT_FILES_DISABLED","the original server policy does not enable literal text files")
-        from .behavior_capabilities import CAPABILITY_BASE_PROFILES,check_captured
-        capabilities=check_captured(base_profile.capabilities,capability_capture)
-        if capabilities is not None and profile.prompt_profile not in CAPABILITY_BASE_PROFILES:
-            raise Problem(422,"CAPABILITY_BASE_UNSUPPORTED","this instruction profile does not compose capabilities")
-        from .behavior_capability_prompt import skill_access
-        skill_budget=(base_profile.skill_catalog_budget_profile
-                      if skill_access(profile.prompt_profile,capabilities) else None)
-        from .behavior_agent_role_prompt import role_text_mismatch
-        mismatch=role_text_mismatch(profile.prompt_profile,role_prompt)
-        if mismatch=="AGENT_ROLE_PROMPT_MISSING":
-            raise Problem(409,mismatch,"the agent-role profile needs its saved role prompt")
-        if mismatch is not None:
-            raise Problem(422,mismatch,"role text applies only to the agent-role profiles")
-        task=InstructionTask(content=instruction.content,
-                             conversation_id=conversation_id(policy,instruction) if peer_work is None else peer_work.conversation_id,
-                             turn_number=turn_number,previous_archive_id=previous_archive_id,
-                             model=model or instruction.model,requested_model=instruction.model,
-                             hosted_agent_version=hosted_agent_version,
-                             checkpoint_profile=base_profile.checkpoint_profile,
-                             model_provider=base_profile.model_provider,
-                             reasoning_summary=reasoning_summary,
-                             prompt_profile=profile.prompt_profile,
-                             sdk_start_profile=base_profile.sdk_start_profile,
-                             model_capacity=model_capacity,sop_copy=base_profile.sop_copy,
-                             skill_catalog_budget_profile=skill_budget,
-                             turn_origin_profile=base_profile.turn_origin_profile,
-                             worker_profile=base_profile.worker_profile,
-                             text_attachment_profile=base_profile.text_attachment_profile,attachments=instruction.attachments,
-                             user_text_file_profile=base_profile.user_text_file_profile,files=instruction.files,
-                             capabilities=capabilities,peer_work=peer_work,role_prompt=role_prompt)
-        profile=profile.model_copy(update={"instruction":task})
+        profile=profile.model_copy(update={"instruction":_instruction_task(policy,instruction,base_profile,
+            profile,peer_work=peer_work,capability_capture=capability_capture,role_prompt=role_prompt,
+            turn_number=turn_number,previous_archive_id=previous_archive_id,model=model,
+            hosted_agent_version=hosted_agent_version,model_capacity=model_capacity,reasoning_summary=reasoning_summary)})
     return seed,binding,profile
 
 
@@ -726,6 +770,21 @@ def _model_capacity(profile,model):
 def _reasoning_summary(profile,model):
     supported=profile.model_provider=="openai-responses" and model.supports_reasoning_summary is True
     return "detailed" if supported else None
+
+
+def _preflight_submission(query):
+    """The submission a preflight query names and the digest of its exact bytes."""
+    import hashlib
+    from .behavior_assistant_wire import AssistantSubmit
+    submitted=(AssistantSubmit(request_id=query.request_id) if query.content is None else InstructionSubmit(
+        request_id=query.request_id,content=query.content,conversation_id=query.conversation_id,model=query.model,
+        attachments=query.attachments,files=query.files))
+    if query.content is None and (query.attachments or query.files):
+        raise Problem(422,"ATTACHMENT_FORMAT","attachments require an original instruction")
+    expected=hashlib.sha256(submitted.model_dump_json().encode()).hexdigest()
+    if query.submit_body_sha256!=expected:
+        raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","canonical fixed submission bytes differ")
+    return submitted,expected
 
 
 class WorkPolicyControl:
@@ -1070,7 +1129,7 @@ class WorkPolicyControl:
         saved=_parse(archive_row.payload["data"],TurnArchive)
         expected=assemble_prompt(task.prompt_profile).record
         if (saved.job_id!=job_id or saved.conversation_id!=identifier or saved.turn_number!=number
-                or saved.prompt_assembly!=expected
+                or not same_but_release(saved.prompt_assembly,expected)
                 or archive_row.payload["material"]!=turn_material(saved).model_dump(mode="json")):
             raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","saved instruction assembly differs")
         fields={"prompt_assembly":saved.prompt_assembly.model_dump(mode="json")}
@@ -1274,20 +1333,11 @@ class WorkPolicyControl:
         return memory_for_conversation(self,principal,conversation)
 
     def preflight(self,principal,query):
-        import hashlib
-        from .behavior_assistant_wire import AssistantSubmit
         from .behavior_workers import _Pool
         self._human(principal)
         if type(query) is not WorkPreflightQuery:
             raise Problem(422,"WORK_POLICY_QUERY","typed exact preflight query required")
-        submitted=(AssistantSubmit(request_id=query.request_id) if query.content is None else InstructionSubmit(
-            request_id=query.request_id,content=query.content,conversation_id=query.conversation_id,model=query.model,
-            attachments=query.attachments,files=query.files))
-        if query.content is None and (query.attachments or query.files):
-            raise Problem(422,"ATTACHMENT_FORMAT","attachments require an original instruction")
-        expected=hashlib.sha256(submitted.model_dump_json().encode()).hexdigest()
-        if query.submit_body_sha256!=expected:
-            raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","canonical fixed submission bytes differ")
+        submitted,expected=_preflight_submission(query)
         self.refresh()
         instruction=submitted if type(submitted) is InstructionSubmit else None
         admission,binding=derive_work_binding(self.policy,query.request_id,instruction=instruction)
@@ -1302,60 +1352,23 @@ class WorkPolicyControl:
         existing=rows[worker_key("job",binding.job_id)] is not None
         if existing:
             self.runtime.authorize(binding.binding_id,principal,"read")
-            remaining=max(0,policy.cumulative_ceiling_microusd-policy.safety_reserve_microusd-
-                          ledger.observed_high_water_microusd-ledger.legacy_unresolved_reserve_microusd-ledger.work_reservations_microusd)
-            money=WorkPolicyDecision(read_id=query.read_id,policy_id=policy.policy_id,policy_revision=policy.revision,
-                decision="allow",reason="original_admission_replay_only",observed_at=self.runtime._now(),
-                budget_id=self.cost_key,remaining_microusd=remaining if ledger.budget_enforced else None,required_microusd=0,
-                observed_high_water_microusd=ledger.observed_high_water_microusd,
-                reserved_microusd=ledger.legacy_unresolved_reserve_microusd+ledger.work_reservations_microusd,
-                budget_enforced=ledger.budget_enforced,
-                safety_reserve_microusd=policy.safety_reserve_microusd if ledger.budget_enforced else None,
-                cumulative_ceiling_microusd=policy.cumulative_ceiling_microusd if ledger.budget_enforced else None)
+            money=self._replay_decision(query,policy,ledger)
         else:
             money=cumulative_decision(policy,ledger,self.cost_reader(),self.runtime._now(),read_id=query.read_id,
                                       mode=self.runtime.mode,instruction=instruction is not None)
         allowed,reason=money.decision,money.reason
-        if not existing and allowed=="allow" and instruction is None:
-            try:self.source_ready(principal,policy)
-            except Problem as error:
-                allowed,reason="deny",error.body["error"]["code"]
-        if not existing and instruction is None and (not root.active or root.remaining_attempts<policy.max_model_requests+3
-            or root.remaining_units<policy.max_model_requests+2+self.runtime.dep.workers.contract.reservation_units):
-            allowed,reason="deny","abstract_root_budget_exhausted"
+        denied=None
         turn=None
         memory_ref=None
-        if instruction is not None:
-            if rows[work_policy_key("registration",admission)] is not None:
-                saved=self.records[binding.binding_id]
-                if saved.submit_sha256!=expected:
-                    raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","original input differs")
-                if not existing:
-                    self.runtime.authorize(binding.binding_id,principal,"read")
-                binding=saved.binding
-                turn=saved.profile.instruction
-                memory_ref=memory_setting_reference(admission,saved.profile.memory_scope,captured=True)
-            else:
-                from .behavior_instruction import instruction_state
-                try:
-                    conversation,_=instruction_state(self,instruction)
-                    from .behavior_profile_selection import choice_for_conversation
-                    choice=choice_for_conversation(self,conversation)
-                    memory=self.conversation_memory(principal,conversation)
-                    from .behavior_agent_role_prompt_versions import captured_role_prompt
-                    from .behavior_profile_selection import profile_from_template
-                    selected=self.policy.profile if choice is None else profile_from_template(self.policy,choice.command.template)
-                    role_prompt=captured_role_prompt(self.store,self.policy,selected.prompt_profile)
-                    _,binding,profile=derive_work(self.policy,query.request_id,self.runtime.mode,instruction=instruction,
-                        turn_number=len(conversation.jobs)+1,profile_template=None if choice is None else choice.command.template,
-                        memory_capture=memory.value,role_prompt=role_prompt)
-                    turn=profile.instruction
-                    memory_ref=memory_setting_reference(admission,memory.value,captured=False)
-                except Problem as error:
-                    # A role Agent without a saved role is a clear 409, not a deny the workbench cannot place.
-                    if error.body["error"]["code"] in {"AGENT_ROLE_PROMPT_MISSING","AGENT_ROLE_PROMPT_INVALID"}:
-                        raise
-                    allowed,reason="deny",error.body["error"]["code"]
+        if instruction is None:
+            if not existing:
+                denied=self._fixed_work_denial(principal,policy,root,allowed)
+        elif rows[work_policy_key("registration",admission)] is not None:
+            binding,turn,memory_ref=self._saved_turn(principal,binding,admission,expected,existing)
+        else:
+            binding,turn,memory_ref,denied=self._candidate_turn(principal,query,instruction,admission,binding)
+        if denied is not None:
+            allowed,reason="deny",denied
         scoped=(_row(rows,runtime_key("policy",binding.binding_id),PerWorkRuntimePolicy)
                 if rows[runtime_key("policy",binding.binding_id)] is not None else None)
         if self.store._guard()!=guard:
@@ -1369,10 +1382,69 @@ class WorkPolicyControl:
             execution_deadline=None if scoped is None or scoped.stage!="dispatched" else scoped.valid_until,
             queue_deadline=None if scoped is None else scoped.queue_deadline,
             abstract_attempts_remaining=root.remaining_attempts,abstract_units_remaining=root.remaining_units,
-            conversation_id=None if turn is None else turn.conversation_id,
-            turn_number=None if turn is None else turn.turn_number,
-            model=None if turn is None else (turn.model or self.models.select(instruction.model).id),
-            memory_setting_ref=memory_ref)
+            memory_setting_ref=memory_ref,**self._previewed_turn(turn,instruction))
+
+    def _replay_decision(self,query,policy,ledger):
+        """Admitted work needs no new money decision: what it reports is what is left."""
+        remaining=max(0,policy.cumulative_ceiling_microusd-policy.safety_reserve_microusd-
+                      ledger.observed_high_water_microusd-ledger.legacy_unresolved_reserve_microusd-ledger.work_reservations_microusd)
+        return WorkPolicyDecision(read_id=query.read_id,policy_id=policy.policy_id,policy_revision=policy.revision,
+            decision="allow",reason="original_admission_replay_only",observed_at=self.runtime._now(),
+            budget_id=self.cost_key,remaining_microusd=remaining if ledger.budget_enforced else None,required_microusd=0,
+            observed_high_water_microusd=ledger.observed_high_water_microusd,
+            reserved_microusd=ledger.legacy_unresolved_reserve_microusd+ledger.work_reservations_microusd,
+            budget_enforced=ledger.budget_enforced,
+            safety_reserve_microusd=policy.safety_reserve_microusd if ledger.budget_enforced else None,
+            cumulative_ceiling_microusd=policy.cumulative_ceiling_microusd if ledger.budget_enforced else None)
+
+    def _fixed_work_denial(self,principal,policy,root,allowed):
+        """Why new fixed work is denied beyond its money decision; None when it is not."""
+        denied=None
+        if allowed=="allow":
+            try:self.source_ready(principal,policy)
+            except Problem as error:
+                denied=error.body["error"]["code"]
+        if (not root.active or root.remaining_attempts<policy.max_model_requests+3
+                or root.remaining_units<policy.max_model_requests+2+self.runtime.dep.workers.contract.reservation_units):
+            denied="abstract_root_budget_exhausted"
+        return denied
+
+    def _saved_turn(self,principal,binding,admission,expected,existing):
+        saved=self.records[binding.binding_id]
+        if saved.submit_sha256!=expected:
+            raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","original input differs")
+        if not existing:
+            self.runtime.authorize(binding.binding_id,principal,"read")
+        return (saved.binding,saved.profile.instruction,
+                memory_setting_reference(admission,saved.profile.memory_scope,captured=True))
+
+    def _candidate_turn(self,principal,query,instruction,admission,binding):
+        """The binding, turn and memory reference a new instruction would get, and the code that denies it (if any)."""
+        from .behavior_instruction import instruction_state
+        try:
+            conversation,_=instruction_state(self,instruction)
+            from .behavior_profile_selection import choice_for_conversation
+            choice=choice_for_conversation(self,conversation)
+            memory=self.conversation_memory(principal,conversation)
+            from .behavior_agent_role_prompt_versions import captured_role_prompt
+            from .behavior_profile_selection import profile_from_template
+            selected=self.policy.profile if choice is None else profile_from_template(self.policy,choice.command.template)
+            role_prompt=captured_role_prompt(self.store,self.policy,selected.prompt_profile)
+            _,binding,profile=derive_work(self.policy,query.request_id,self.runtime.mode,instruction=instruction,
+                turn_number=len(conversation.jobs)+1,profile_template=None if choice is None else choice.command.template,
+                memory_capture=memory.value,role_prompt=role_prompt)
+            return binding,profile.instruction,memory_setting_reference(admission,memory.value,captured=False),None
+        except Problem as error:
+            # A role Agent without a saved role is a clear 409, not a deny the workbench cannot place.
+            if error.body["error"]["code"] in {"AGENT_ROLE_PROMPT_MISSING","AGENT_ROLE_PROMPT_INVALID"}:
+                raise
+            return binding,None,None,error.body["error"]["code"]
+
+    def _previewed_turn(self,turn,instruction):
+        if turn is None:
+            return {"conversation_id":None,"turn_number":None,"model":None}
+        return {"conversation_id":turn.conversation_id,"turn_number":turn.turn_number,
+                "model":turn.model or self.models.select(instruction.model).id}
 
     def register(self,principal,request_id,submit_sha256,*,instruction=None,peer_work=None,routine=None,agent_vm=None):
         from .behavior_work_registry import head_key
@@ -1704,7 +1776,6 @@ class WorkPolicyControl:
         self.store.transact(request,decide)
 
     def refresh(self,binding_id=None):
-        from types import MappingProxyType
         from .behavior_work_registry import head_key,read_registry
         self._runtime_scope()
         done=_REFRESHED.get()
@@ -1712,16 +1783,7 @@ class WorkPolicyControl:
         if done is not None and binding_id is not None and phase_key in done and binding_id in self.records:
             return
         # Taken before the registry read: anything cached now was registered before that index.
-        seen=set(self.records)
-        view=_READ_VIEW.get()
-        if view is not None:
-            # A pure-read view returns its first registry copy to every later refresh; only work cached
-            # before that copy was read may be dropped by it, never work another thread admitted since.
-            marks=getattr(view,"work_policy_seen",None)
-            if marks is None:
-                marks={}
-                view.work_policy_seen=marks
-            seen=marks.setdefault(id(self),seen)
+        seen=self._droppable_work()
         rows=self.store.read_snapshot((self.policy_key,self.revocation_key,self.registry_key,head_key(self.registry_key)))
         self.installed(rows)
         index=read_registry(self.store,self.policy,rows)
@@ -1732,35 +1794,69 @@ class WorkPolicyControl:
         admitted={k:r for k,r in self.records.items() if r.turn_authorization is not None}
         records={**admitted,**({k:r for k,r in self.records.items() if r.admission_id in index.entries} if scoped else {})}
         for admission in ((cached.admission_id,) if scoped else index.entries):
-            key=work_policy_key("registration",admission)
-            row=self.store.read_snapshot((key,))[key]
-            if row is None:raise Problem(409,"WORK_POLICY_REGISTRY_INVALID","original registered work is missing")
-            record=_parse(row.payload["data"],WorkRegistration)
-            turn=record.profile.instruction
-            from .behavior_conversation_transfer import registration_transfer
-            transfer=registration_transfer(self,record)
-            if record.hosted_session_id is not None:
-                from .behavior_instruction import hosted_session_id
-                if turn is None or transfer is None and record.agent_vm is None \
-                        and record.hosted_session_id!=hosted_session_id(turn.conversation_id):
-                    raise Problem(409,"WORK_POLICY_REGISTRY_INVALID","Hosted session is outside this original conversation")
-            from .behavior_profile_selection import read_selection
-            choice=(None if record.profile_selection_id is None
-                    else read_selection(self.store,self.policy,record.profile_selection_id))
-            if choice is not None:
-                self.profile_selections[choice.selection_id]=choice
-            if record.profile.memory_scope is not None:
-                from .memory_bridge_settings import read_memory_settings, validate_capture_record
-                setting=read_memory_settings(self.store,self.policy,record.profile.memory_scope.settings_id)
-                validate_capture_record(self.policy,record.profile.memory_scope,setting)
-            derived,binding,profile=derive_registered_work(self.policy,record,self.runtime.mode,
-                profile_template=None if choice is None else choice.command.template)
-            if (derived!=admission or record.binding!=binding or record.profile!=profile
-                    or turn is not None and (None if turn.model_capacity is None else turn.model_capacity.profile)
-                    != record.profile.model_capacity_profile
-                    or row.payload["material"]!=material(record.model_dump(mode="json")).model_dump(mode="json")):
-                raise Problem(409,"WORK_POLICY_REGISTRY_INVALID","registered original work differs")
-            records[binding.binding_id]=record
+            record=self._registered(admission)
+            records[record.binding.binding_id]=record
+        self._install_records(records,seen,index)
+        if done is not None and binding_id is not None:
+            done.add(phase_key)
+
+    def _droppable_work(self):
+        """The cached work a registry index read after this may drop."""
+        seen=set(self.records)
+        view=_READ_VIEW.get()
+        if view is None:
+            return seen
+        # A pure-read view returns its first registry copy to every later refresh; only work cached
+        # before that copy was read may be dropped by it, never work another thread admitted since.
+        marks=getattr(view,"work_policy_seen",None)
+        if marks is None:
+            marks={}
+            view.work_policy_seen=marks
+        return marks.setdefault(id(self),seen)
+
+    def _registered(self,admission):
+        """One listed registration, read back only if every fact it saved still derives from the current policy."""
+        key=work_policy_key("registration",admission)
+        row=self.store.read_snapshot((key,))[key]
+        if row is None:raise Problem(409,"WORK_POLICY_REGISTRY_INVALID","original registered work is missing")
+        record=_parse(row.payload["data"],WorkRegistration)
+        turn=record.profile.instruction
+        self._require_original_session(record,turn)
+        choice=self._saved_choice(record)
+        if record.profile.memory_scope is not None:
+            from .memory_bridge_settings import read_memory_settings, validate_capture_record
+            setting=read_memory_settings(self.store,self.policy,record.profile.memory_scope.settings_id)
+            validate_capture_record(self.policy,record.profile.memory_scope,setting)
+        derived,binding,profile=derive_registered_work(self.policy,record,self.runtime.mode,
+            profile_template=None if choice is None else choice.command.template)
+        if (derived!=admission or record.binding!=binding or record.profile!=profile
+                or turn is not None and (None if turn.model_capacity is None else turn.model_capacity.profile)
+                != record.profile.model_capacity_profile
+                or row.payload["material"]!=material(record.model_dump(mode="json")).model_dump(mode="json")):
+            raise Problem(409,"WORK_POLICY_REGISTRY_INVALID","registered original work differs")
+        return record
+
+    def _require_original_session(self,record,turn):
+        from .behavior_conversation_transfer import registration_transfer
+        transfer=registration_transfer(self,record)
+        if record.hosted_session_id is None:
+            return
+        from .behavior_instruction import hosted_session_id
+        if turn is None or transfer is None and record.agent_vm is None \
+                and record.hosted_session_id!=hosted_session_id(turn.conversation_id):
+            raise Problem(409,"WORK_POLICY_REGISTRY_INVALID","Hosted session is outside this original conversation")
+
+    def _saved_choice(self,record):
+        if record.profile_selection_id is None:
+            return None
+        from .behavior_profile_selection import read_selection
+        choice=read_selection(self.store,self.policy,record.profile_selection_id)
+        if choice is not None:
+            self.profile_selections[choice.selection_id]=choice
+        return choice
+
+    def _install_records(self,records,seen,index):
+        from types import MappingProxyType
         with _REFRESH_LOCK:
             # An admitted turn keeps its original identity; this index is checked again at the next admission.
             records={**{k:r for k,r in self.records.items()
@@ -1775,8 +1871,6 @@ class WorkPolicyControl:
                 b=record.binding
                 self.runtime.dep.native_launches.jobs[b.job_id]=NativeJobRoute(job_id=b.job_id,api_binding_id=b.binding_id,
                     grant_id=native_key("bootstrap-grant",b.job_id))
-        if done is not None and binding_id is not None:
-            done.add(phase_key)
 
     def listed(self,binding_id,rows=None):
         """Whether the current registry still lists this cached work.
@@ -1812,42 +1906,59 @@ class WorkPolicyControl:
     def check(self,binding,policy,rows,*,use):
         current=self.installed(rows)
         record=self.records.get(binding.binding_id)
-        if (record is None or record.binding!=binding or policy.policy_id!=current.policy_id
+        if record is None or self._scope_differs(record,binding,policy,current,use):
+            raise Problem(403,"WORK_POLICY_SCOPE_CHANGED","current original work/read scope changed")
+        self._require_saved_registration(record,rows)
+        if record.profile.instruction is not None and record.profile.instruction.peer_work is not None:
+            self._require_current_peer(record,current,rows,use)
+        if record.profile_selection_id is not None:
+            self._require_saved_selection(record,rows)
+        if record.profile.memory_scope is not None:
+            self._require_saved_memory(record,rows)
+        if not policy.instruction and use not in {"read","control"} and self.runtime._now()>=policy.valid_until:
+            raise Problem(403,"WORK_EXECUTION_DEADLINE","only this work's execution permission has expired")
+
+    @staticmethod
+    def _scope_differs(record,binding,policy,current,use):
+        return (record.binding!=binding or policy.policy_id!=current.policy_id
                 or policy.admission_id!=record.admission_id or policy.job_id!=binding.job_id
                 or policy.instruction!=(record.profile.instruction is not None)
-                or not current.active or use=="read" and not current.read_enabled):
-            raise Problem(403,"WORK_POLICY_SCOPE_CHANGED","current original work/read scope changed")
+                or not current.active or use=="read" and not current.read_enabled)
+
+    @staticmethod
+    def _require_saved_registration(record,rows):
         key=work_policy_key("registration",record.admission_id)
         actual=_row(rows,key,WorkRegistration)
         if (actual!=record or rows[key].payload["material"]!=material(actual.model_dump(mode="json")).model_dump(mode="json")):
             raise Problem(403,"WORK_POLICY_SCOPE_CHANGED","current transaction registration differs")
-        if record.profile.instruction is not None and record.profile.instruction.peer_work is not None:
-            from .behavior_agent_message_api import AgentCollaborationRoot
-            from .behavior_agent_peer_work import validate_reference
-            from .behavior_delegation import _current_parent
-            peer_work=record.profile.instruction.peer_work
-            root=_row(rows,peer_work.root_id,AgentCollaborationRoot)
-            if root!=self.peer_roots.get(peer_work.root_id):
-                raise Problem(403,"AGENT_MESSAGE_ASSIGNMENT_DENIED","the immutable original peer root changed")
-            validate_reference(root,current,peer_work,record.request_id,registered_instruction(record))
-            _current_parent(rows,root.origin,executing=use not in {"read","control"})
-        if record.profile_selection_id is not None:
-            from .behavior_profile_selection import ConversationProfileSelection,selection_key
-            choicekey=selection_key(self.policy.authority_domain,record.profile_selection_id,
-                                    None if record.agent_scope is None else record.agent_scope.agent_id)
-            choice=_row(rows,choicekey,ConversationProfileSelection)
-            if (self.profile_selections.get(record.profile_selection_id)!=choice
-                    or rows[choicekey].payload["material"]!=material(choice.model_dump(mode="json")).model_dump(mode="json")):
-                raise Problem(403,"PROFILE_SELECTION_INVALID","the original approved profile selection changed")
-        if record.profile.memory_scope is not None:
-            from .memory_bridge_settings import MemoryBridgeSettingsRecord, validate_capture_record
-            memory_key=record.profile.memory_scope.settings_id
-            setting=_row(rows,memory_key,MemoryBridgeSettingsRecord)
-            validate_capture_record(self.policy,record.profile.memory_scope,setting)
-            if rows[memory_key].payload["material"]!=material(setting.model_dump(mode="json")).model_dump(mode="json"):
-                raise Problem(403,"MEMORY_SETTINGS_INVALID","the original memory setting changed")
-        if not policy.instruction and use not in {"read","control"} and self.runtime._now()>=policy.valid_until:
-            raise Problem(403,"WORK_EXECUTION_DEADLINE","only this work's execution permission has expired")
+
+    def _require_current_peer(self,record,current,rows,use):
+        from .behavior_agent_message_api import AgentCollaborationRoot
+        from .behavior_agent_peer_work import validate_reference
+        from .behavior_delegation import _current_parent
+        peer_work=record.profile.instruction.peer_work
+        root=_row(rows,peer_work.root_id,AgentCollaborationRoot)
+        if root!=self.peer_roots.get(peer_work.root_id):
+            raise Problem(403,"AGENT_MESSAGE_ASSIGNMENT_DENIED","the immutable original peer root changed")
+        validate_reference(root,current,peer_work,record.request_id,registered_instruction(record))
+        _current_parent(rows,root.origin,executing=use not in {"read","control"})
+
+    def _require_saved_selection(self,record,rows):
+        from .behavior_profile_selection import ConversationProfileSelection,selection_key
+        choicekey=selection_key(self.policy.authority_domain,record.profile_selection_id,
+                                None if record.agent_scope is None else record.agent_scope.agent_id)
+        choice=_row(rows,choicekey,ConversationProfileSelection)
+        if (self.profile_selections.get(record.profile_selection_id)!=choice
+                or rows[choicekey].payload["material"]!=material(choice.model_dump(mode="json")).model_dump(mode="json")):
+            raise Problem(403,"PROFILE_SELECTION_INVALID","the original approved profile selection changed")
+
+    def _require_saved_memory(self,record,rows):
+        from .memory_bridge_settings import MemoryBridgeSettingsRecord, validate_capture_record
+        memory_key=record.profile.memory_scope.settings_id
+        setting=_row(rows,memory_key,MemoryBridgeSettingsRecord)
+        validate_capture_record(self.policy,record.profile.memory_scope,setting)
+        if rows[memory_key].payload["material"]!=material(setting.model_dump(mode="json")).model_dump(mode="json"):
+            raise Problem(403,"MEMORY_SETTINGS_INVALID","the original memory setting changed")
 
     def verify_result_access(self,access):
         from . import behavior_delivery as delivery

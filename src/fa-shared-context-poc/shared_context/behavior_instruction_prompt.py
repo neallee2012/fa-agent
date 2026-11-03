@@ -6,7 +6,9 @@ from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
-from .behavior_wire import Digest, WireModel
+from .behavior_wire import Digest, WireModel, known_release
+from .native_responses_wire import SENT_RELEASE
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 PromptProfile = Literal["fa-instruction-v1", "fa-instruction-v2", "fa-instruction-v3", "fa-instruction-v4"]
 # v3 and v4 are v2 with added passages; they share its catalog wording and omissions.
@@ -282,8 +284,9 @@ class PromptAssemblyRecord(WireModel):
     prefix_sha256: Digest
     prefix_utf8_bytes: Annotated[int, Field(gt=0)]
     prefix_tokens: None = None
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]
+    runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
+    _release = model_validator(mode="after")(known_release)
     omissions: tuple[str, ...] = _OMISSIONS
 
     @model_validator(mode="after")

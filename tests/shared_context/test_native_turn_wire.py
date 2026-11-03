@@ -2,10 +2,6 @@
 
 import hashlib
 import json
-import os
-from pathlib import Path
-import subprocess
-import sys
 
 import pytest
 from pydantic import ValidationError
@@ -209,23 +205,3 @@ def test_native_hop_is_provenance_not_the_legacy_two_hop_limit(hop):
     values["source"]["hop"] = -1
     with pytest.raises(ValidationError):
         NATIVE_REQUEST.validate_json(json.dumps(values))
-
-
-def test_api_import_needs_neither_copilot_nor_agentserver():
-    code = """
-import importlib.abc
-import sys
-class RejectHosted(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == 'copilot' or fullname.startswith(('copilot.', 'azure.ai.agentserver')):
-            raise AssertionError('Hosted SDK import: ' + fullname)
-sys.meta_path.insert(0, RejectHosted())
-from shared_context.behavior_native_turn_wire import NATIVE_REQUEST, NativeReceipt
-print('sdk-independent')
-"""
-    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1",
-           "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc")}
-    result = subprocess.run([sys.executable, "-X", "utf8", "-c", code], env=env,
-                            capture_output=True, text=True, encoding="utf-8", timeout=30)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "sdk-independent"

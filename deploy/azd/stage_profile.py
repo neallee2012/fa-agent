@@ -26,8 +26,8 @@ from typing import Any, Mapping
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import fa_azd  # noqa: E402
-import profile as fa_profile  # noqa: E402
+import fa_azd
+import profile as fa_profile
 
 SIGNING_SECRET = "fa-feed-mcp-signing-key"  # the stage app's secret name (src README "Feed reader MCP")
 

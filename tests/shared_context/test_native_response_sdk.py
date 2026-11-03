@@ -13,6 +13,7 @@ from starlette.testclient import TestClient
 from shared_context.behavior_native_turn_wire import NATIVE_REQUEST
 from shared_context.native_sdk import NativeSdkExecutor
 from shared_context.native_turns import NativeTurnRuntime
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_m2_copilot import runtime_path
 from test_native_response_streaming import sse_events
 from test_native_responses import ResponsesHarness, build_responses_host, response_submit
@@ -119,7 +120,7 @@ def test_pinned_sdk_public_events_and_display_failure_do_not_change_the_saved_tu
         completed = harness.wait("rid-1", "completed")
         assert len(requests) == 2 and len(stops) == 1
         # ADR-0005: the idle turn keeps its SDK; the checkpoint is saved from the live runtime's files.
-        assert stops[0].runtime_version == "1.0.83" and stops[0].graceful
+        assert stops[0].runtime_version == RUNTIME_VERSION and stops[0].graceful
         assert stops[0].release == "fa-resident-worker-poc-v1"
         assert "tool.execution_start" in event_types and "assistant.message_delta" in event_types
         output = events[-1]["response"]["output"]

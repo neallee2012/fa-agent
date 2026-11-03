@@ -9,13 +9,14 @@ import logging
 import re
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .behavior_agent_template import TemplateRole, TemplateSkill
 from .behavior_capabilities import CapabilityRef, EntryId
 from .behavior_sdk_state import CheckpointProfile, NativeCheckpointRef
-from .behavior_wire import Digest, ExactSourceRef, Identifier, ModelDeployment, WireModel
+from .behavior_wire import Digest, ExactSourceRef, Identifier, ModelDeployment, WireModel, known_release
 from .native_inference import NativeInference, NativeInferenceCollector
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion, RUNTIME_VERSION, SDK_VERSION
 
 MAX_ASSEMBLY_BYTES = 24 * 1024
 
@@ -46,8 +47,9 @@ class AssemblySelection(WireModel):
     role_version: Count | None
     role_sha256: Digest | None
     role_reason: Literal["not_configured"] | None
-    sdk_version: Literal["1.0.13"]
-    runtime_version: Literal["1.0.83"]
+    sdk_version: KnownSdkVersion
+    runtime_version: KnownRuntimeVersion
+    _release = model_validator(mode="after")(known_release)
     checkpoint_profile: CheckpointProfile | None
     model: ModelDeployment
     capability_head_selection_id: Identifier | None
@@ -253,7 +255,7 @@ class NativeAssemblyCollector:
                 role_version=None if role is None else role.version,
                 role_sha256=None if role is None else role.sha256,
                 role_reason="not_configured" if role is None else None,
-                sdk_version=settings.sdk_version, runtime_version=settings.runtime_version,
+                sdk_version=SDK_VERSION, runtime_version=RUNTIME_VERSION,
                 checkpoint_profile=settings.checkpoint_profile, model=capture.model.id,
                 capability_head_selection_id=(None if capture.capabilities is None
                                               else capture.capabilities.head_selection_id),

@@ -2,7 +2,7 @@
 
 The toolbox holds the credential on its project connection; the native turn reaches it with this Agent's own
 managed identity (scope ``https://ai.azure.com/.default``), so no secret reaches the VM or the FA API. The
-pinned SDK 1.0.13 HTTP MCP config only takes fixed headers, while the toolbox wants a fresh token on every
+SDK's HTTP MCP config (as of SDK 1.0.13) only takes fixed headers, while the toolbox wants a fresh token on every
 request, so this thin bridge follows the official Bring-Your-Own Responses toolbox sample: JSON-RPC POSTs with
 ``httpx`` (``initialize``, ``tools/list``, ``tools/call``) and the ``mcp-session-id`` it returns.
 
@@ -417,8 +417,10 @@ class ToolboxClient:
         error = message.get("error")
         if error is not None:
             number = error.get("code") if isinstance(error, dict) else None
+            # JSON-RPC codes are integers; anything else (even -32700.0) is no code, so never a definite refusal.
+            number = number if type(number) is int else None
             code = REFUSED if number in _DEFINITE_RPC else UNKNOWN
-            reason = f"rpc_code={number}" if type(number) is int else "rpc_code=invalid"
+            reason = "rpc_code=invalid" if number is None else f"rpc_code={number}"
             needed = _connection_needed(number, error.get("message")) if isinstance(error, dict) else None
             if needed is not None:
                 # Logged by code and need only: the message carries the consent links.

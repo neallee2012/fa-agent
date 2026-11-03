@@ -15,13 +15,13 @@
 
 - 後續以共享工作狀態、Team／私人長期記憶、必要討論與成果參照組裝各 agent 本輪 context；不再要求 OS 共同掛載，不再執行 SMB 盲測。
 - 原 R1–R3／G0–G2 及第 3–7 節中的 File Share、Key Vault key、CIFS、VNet、重掛配置，保留為**歷史測試規格**，不是新方案的資源計畫或 gate。原 G0 實測仍是 BLOCKED。
-- 新方案驗收跨 agent／session 的狀態與記憶共享、私人／Team 邊界、更新衝突處理及工作恢復；[介面與實作](../src/fa-shared-context-poc/README.md)及[指定 sessions 驗收 controller](../tests/shared_controller/README.md)已完成。不把 Memory Store 建立或本機測試通過當成雲端驗收。
+- 新方案驗收跨 agent／session 的狀態與記憶共享、私人／Team 邊界、更新衝突處理及工作恢復；[介面與實作](../src/fa-shared-context-poc/README.md)及指定 sessions 驗收 controller（2026-11-03 已移除，見 `0330d456`）已完成。不把 Memory Store 建立或本機測試通過當成雲端驗收。
 - 允許建立 Non-VNet Foundry 使用 Memory Store，並確認範圍後刪除目前 VNet Foundry；保持 Entra 驗證，不擴大其他資源的 public access。
 - 原 US$100、最多兩個同時 active Hosted sessions、每個 2 vCPU／4 GiB、60 分鐘測試窗口維持。Memory 所需模型與費用納入新的精確計畫，不自動啟用 G4。
 - G3 的本地 desktop／browser 能力方向保留；固定 VM 維持 DEFERRED_NOT_VALIDATED，完整私人環境及 10 倍效能仍未驗收。
 
 新方案程式位於 `src/fa-shared-context-poc`，部署配置位於 `infra/shared-context` 與
-`deploy/shared-context`，雲端驗收入口是 `scripts/validate-shared-hosted.py`。先讀 ADR-0002
+`deploy/shared-context`，雲端驗收入口原為 `scripts/validate-shared-hosted.py`（2026-11-03 已移除，見 `0330d456`）。先讀 ADR-0002
 與 [目前結果](../POC-RESULTS.md)；只有重現歷史測試時才使用下方原 SMB 流程。
 
 ### 新方案的確定性驗收

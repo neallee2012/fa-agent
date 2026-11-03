@@ -5,6 +5,7 @@ from datetime import datetime
 from functools import partial
 from urllib.parse import urlsplit, urlunsplit
 from . import behavior_assistant_wire as aw
+from .behavior_responses_checkpoint import reasoning_container
 from .errors import safe_text
 
 
@@ -111,8 +112,7 @@ def _reasoning_summary(data):
     container = data.get("reasoning_blocks")
     if container is None or data.get("parent_tool_call_id") is not None:
         return None
-    if (not isinstance(container, dict) or set(container) != {"provider", "blocks"}
-            or container.get("provider") != "openai-responses" or not isinstance(container.get("blocks"), list)):
+    if not reasoning_container(container):
         logging.getLogger(__name__).warning("INSTRUCTION_PUBLIC_REASONING_UNAVAILABLE")
         return None
     parts = []

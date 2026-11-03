@@ -26,32 +26,20 @@ from test_instruction_flow import instruction_models, runtime_path
 from test_m3_artifacts import V1
 from test_m3_auth import jwk_client, signing_key, token
 from test_sdk_compaction_product import open_turn, ordinary, settle
-from test_skill_purpose import BODY, PROFILE, PURPOSE, signed_m3, upload_purpose
+from test_skill_purpose import BODY, PROFILE, PURPOSE, create_skill, decide, human, upload_purpose
 from test_work_policy_lifecycle import enabled
 
 
 def add_purpose_skill(h, signing_key, jwk_client, *, name="receipt-guide", description=PURPOSE,
                       body=BODY, version=V1, create=True, approve=True, resources=None):
-    http, agent, human = signed_m3(h.artifacts, signing_key, jwk_client)
-    path = "/teams/team-one/artifacts/" + name
-    if create:
-        created = http.post(path, headers=agent, json={
-            "kind": "skill", "title": "Not the approved purpose", "source_work": "legacy-source",
-        })
-        assert created.status_code == 201, created.text
-        before = created
-    else:
-        before = http.get(path, headers=agent)
-    uploaded = upload_purpose(http, agent, before.headers["etag"], version=version,
-                              description=description, body=body, path=path, resources=resources)
-    assert uploaded.status_code == 200, uploaded.text
-    selected = http.get(path + "/versions/" + version, headers=human).json()
+    artifacts = h.artifacts
+    before = (create_skill(artifacts, name, source_work="legacy-source") if create
+              else artifacts.get(A, A.team, name))
+    uploaded = upload_purpose(artifacts, before.etag, version=version, description=description, body=body,
+                              name=name, resources=resources)
+    selected = artifacts.version(human(artifacts), A.team, name, version).model_dump()
     if approve:
-        decided = http.post(path + "/decisions", headers={**human, "If-Match": uploaded.headers["etag"]}, json={
-            "decision_id": version, "version_id": version, "decision": "approve",
-            "sha256": selected["sha256"], "metadata_sha256": selected["metadata_sha256"],
-        })
-        assert decided.status_code == 200, decided.text
+        decide(artifacts, uploaded, selected, name=name)
     return selected
 
 
@@ -442,14 +430,8 @@ def test_new_profile_omits_unapproved_purposes_and_preserves_legacy_unknown(
     add_purpose_skill(assistant, signing_key, jwk_client, name="pending", description="PENDING_PURPOSE_CANARY", approve=False)
     rejected = add_purpose_skill(assistant, signing_key, jwk_client, name="rejected",
                                 description="REJECTED_PURPOSE_CANARY", approve=False)
-    http, _, human_headers = signed_m3(assistant.artifacts, signing_key, jwk_client)
-    path = "/teams/team-one/artifacts/rejected"
-    current = http.get(path, headers=human_headers)
-    response = http.post(path + "/decisions", headers={**human_headers, "If-Match": current.headers["etag"]}, json={
-        "decision_id": V1, "version_id": V1, "decision": "reject",
-        "sha256": rejected["sha256"], "metadata_sha256": rejected["metadata_sha256"],
-    })
-    assert response.status_code == 200
+    current = assistant.artifacts.get(A, A.team, "rejected")
+    decide(assistant.artifacts, current, rejected, name="rejected", decision="reject")
     add_skill(assistant, "legacy-guide", text="This body's first paragraph is not approved purpose metadata.")
     h, control, human = configured_purpose(assistant, ("receipt-guide", "pending", "rejected", "legacy-guide"))
     turn = open_turn(h, control, human, "purpose-unavailable")

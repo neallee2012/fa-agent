@@ -70,6 +70,91 @@ def test_original_scope_and_spent_high_water_cannot_regress(assistant):
         assert denied.decision=="deny" and denied.reason==reason
 
 
+def test_every_observation_scope_field_and_mode_must_match(assistant):
+    h,p,o,ledger,_=standing(assistant)
+    decide=lambda observation,mode=h.runtime.mode:cumulative_decision(p,ledger,observation,h.time,read_id="scope",mode=mode)
+    for changes in ({"observer_oid":"other-observer"},{"authority_domain":"other-domain"},
+                    {"control_binding":"f"*64},{"legacy_liability_sha256":"f"*64}):
+        assert decide(o.model_copy(update=changes)).reason=="cost_observation_scope"
+    assert decide(None).reason=="cost_observation_scope"
+    assert decide(o,"native").reason=="cost_observation_scope"
+
+
+def test_freshness_and_regression_edges(assistant):
+    h,p,o,ledger,_=standing(assistant)
+    decide=lambda observation,now=h.time,book=ledger:cumulative_decision(p,book,observation,now,read_id="edge",
+                                                                         mode=h.runtime.mode)
+    assert decide(o.model_copy(update={"observed_at":h.time+timedelta(seconds=1)})).reason=="cost_observation_stale"
+    assert decide(o,h.time+timedelta(seconds=299)).decision=="allow"
+    assert decide(o,h.time+timedelta(seconds=300)).reason=="cost_observation_stale"
+    later=ledger.model_copy(update={"latest_observed_at":h.time+timedelta(seconds=1)})
+    assert decide(o,h.time+timedelta(seconds=2),later).reason=="cost_observation_regressed"
+    low=ledger.model_copy(update={"observed_high_water_microusd":0})
+    assert decide(o.model_copy(update={"observed_cumulative_microusd":45_479_999}),book=low).reason==(
+        "cost_observation_regressed")
+
+
+def test_revocation_precedence_and_ledger_authority(assistant):
+    import pytest
+    from shared_context.errors import Problem
+    h,p,o,ledger,_=standing(assistant)
+    decide=lambda policy,observation=o,book=ledger:cumulative_decision(policy,book,observation,h.time,read_id="order",
+                                                                       mode=h.runtime.mode)
+    assert decide(p.model_copy(update={"read_enabled":False})).reason=="result_access_revoked"
+    assert decide(p.model_copy(update={"active":False,"read_enabled":False})).reason=="policy_revoked"
+    assert decide(p.model_copy(update={"read_enabled":False}),None).reason=="result_access_revoked"
+    spent=ledger.model_copy(update={"work_reservations_microusd":53_000_000})
+    assert decide(p,None,spent).reason=="cost_observation_scope"
+    for changes in ({"authority_domain":"other-domain"},{"cost_scope_sha256":"f"*64}):
+        with pytest.raises(Problem) as denied:
+            decide(p.model_copy(update={"active":False}),book=ledger.model_copy(update=changes))
+        assert (denied.value.status,denied.value.body["error"]["code"])==(409,"WORK_POLICY_BUDGET_SCOPE")
+
+
+def test_amounts_use_only_a_matched_observation_and_every_held_amount(assistant):
+    from shared_context.behavior_work_policy import work_policy_key
+    h,p,o,ledger,_=standing(assistant)
+    grown=o.model_copy(update={"observed_cumulative_microusd":50_000_000,"legacy_unresolved_reserve_microusd":3_000_000})
+    held=ledger.model_copy(update={"model_pending_microusd":1_000_000,"model_metered_microusd":500_000})
+    decide=lambda book,observation=o,now=h.time:cumulative_decision(p,book,observation,now,read_id="amounts",
+                                                                    mode=h.runtime.mode)
+    allowed=decide(held,grown)
+    assert (allowed.observed_high_water_microusd,allowed.reserved_microusd,allowed.remaining_microusd)==(
+        50_000_000,9_500_000,40_500_000)
+    assert (allowed.budget_id,allowed.policy_id,allowed.policy_revision,allowed.read_id,allowed.observed_at)==(
+        work_policy_key("cost",p.authority_domain),p.policy_id,1,"amounts",h.time)
+    assert (allowed.safety_reserve_microusd,allowed.cumulative_ceiling_microusd,allowed.budget_enforced)==(
+        10_000_000,110_000_000,True)
+    stale=decide(held,grown,h.time+timedelta(seconds=300))
+    assert (stale.reason,stale.observed_high_water_microusd,stale.reserved_microusd,stale.remaining_microusd)==(
+        "cost_observation_stale",45_480_000,8_500_000,46_020_000)
+    exact=ledger.model_copy(update={"work_reservations_microusd":5_000_000+47_520_000-2_000_000})
+    assert (decide(exact).decision,decide(exact).remaining_microusd)==("allow",2_000_000)
+    short=exact.model_copy(update={"work_reservations_microusd":exact.work_reservations_microusd+1})
+    assert decide(short).reason=="cumulative_budget_exhausted"
+
+
+def test_an_instruction_needs_only_some_budget_and_no_fresh_cost(assistant):
+    h,p,o,ledger,_=standing(assistant)
+    decide=lambda book,now=h.time:cumulative_decision(p,book,o,now,read_id="turn",mode=h.runtime.mode,instruction=True)
+    late=decide(ledger,h.time+timedelta(days=1))
+    assert (late.decision,late.required_microusd,late.remaining_microusd)==("allow",0,47_520_000)
+    nearly=decide(ledger.model_copy(update={"work_reservations_microusd":5_000_000+47_520_000-1}))
+    assert (nearly.decision,nearly.remaining_microusd)==("allow",1)
+    spent=decide(ledger.model_copy(update={"work_reservations_microusd":53_000_000}))
+    assert (spent.reason,spent.remaining_microusd)==("cumulative_budget_exhausted",0)
+    assert decide(ledger,h.time-timedelta(seconds=1)).reason=="cost_observation_stale"
+
+
+def test_accounting_only_reports_no_budget_numbers_and_never_exhausts(assistant):
+    h,p,o,ledger,_=standing(assistant)
+    off=ledger.model_copy(update={"budget_enforced":False,"work_reservations_microusd":200_000_000})
+    late=cumulative_decision(p,off,o,h.time+timedelta(days=1),read_id="off",mode=h.runtime.mode)
+    assert (late.decision,late.remaining_microusd,late.safety_reserve_microusd,late.cumulative_ceiling_microusd,
+            late.budget_enforced,late.required_microusd)==("allow",None,None,None,False,2_000_000)
+    assert late.model_dump(mode="json")["budget_enforced"] is False
+
+
 def test_delayed_native_usd_observation_is_rounded_up_not_reset():
     from shared_context.behavior_work_policy import microusd_from_decimal
     assert microusd_from_decimal("47.11268605947896027")==47_112_687

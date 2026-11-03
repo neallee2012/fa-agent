@@ -28,9 +28,9 @@ import shared_context.behavior_agent_versions as onboarding_versions
 from shared_context.errors import Problem
 import test_conversation_transfer_startup as startup
 from test_agent_registry_operator import OperatorTableTransport
-from test_conversation_transfer_startup import read_startup, synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
 from test_team_registry import OTHER_AGENT_OID
 
 PROBES = {"FA_MODEL_DIRECT_PROBE_URL": "https://probe", "FA_MODEL_DIRECT_PROBE_MODEL": "probe-model"}
@@ -617,11 +617,11 @@ def test_console_connection_route_returns_the_exact_connection(team):
 
 # ----- PR6: owner-chosen Team-approved tools and skills -------------------------------------------------------
 
-from shared_context.behavior_agent_template import TemplateSkill  # noqa: E402
-from shared_context.behavior_capabilities import (  # noqa: E402
+from shared_context.behavior_agent_template import TemplateSkill
+from shared_context.behavior_capabilities import (
     SKILLIFY_ENTRY_ID, SKILLS_ENTRY_ID, CapabilityRef, available_grants,
 )
-from shared_context.m3_skills import ApprovedSkillSource  # noqa: E402
+from shared_context.m3_skills import ApprovedSkillSource
 
 SKILL = TemplateSkill(name="receipt-guide", version_id="1" * 32, sha256="a" * 64, metadata_sha256="b" * 64)
 
@@ -1081,7 +1081,7 @@ def test_a_new_agents_first_selection_defaults_to_the_declared_model_capacity(te
 
 
 @pytest.fixture
-def declared_capacity(instruction_models, tmp_path):  # noqa: F811
+def declared_capacity(instruction_models, tmp_path):
     """A declared input window (like gpt-5.4-mini's documented facts) so A can select a catalog budget."""
     facts = tmp_path / "OFFLINE-model-facts.json"
     values = json.loads(facts.read_text(encoding="utf-8"))

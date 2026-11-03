@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fingerprint import parse_fingerprint  # noqa: E402
+from fingerprint import parse_fingerprint
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 

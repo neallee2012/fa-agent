@@ -12,6 +12,7 @@ import pytest
 from copilot.generated.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
 
 from shared_context.m2_copilot import MODEL, ToolOutput, ToolSpec, _ModelGateway, run_copilot
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 
 SCHEMA = {"type": "object", "properties": {}, "additionalProperties": False}
@@ -33,6 +34,7 @@ def test_sdk_prefix_and_session_contract_preserve_auth_discovery_and_tool_permis
 
     class FakeSession:
         session_id = "same-sdk-session"
+        rpc = OFFLINE_SESSION_RPC
 
         def __init__(self, options, client):
             self.options, self.client = options, client
@@ -135,6 +137,7 @@ def test_reply_hook_sees_final_parts_before_the_runtime_stops_and_never_changes_
 
     class FakeSession:
         session_id = "same-sdk-session"
+        rpc = OFFLINE_SESSION_RPC
 
         async def send_and_wait(self, prompt, timeout):
             return SimpleNamespace(data=SimpleNamespace(content="synthetic completion"))
@@ -250,6 +253,7 @@ def test_sdk_turn_phases_share_the_turn_timing_id_and_record_a_failed_outcome(
 
     class FakeSession:
         session_id = "timed-session"
+        rpc = OFFLINE_SESSION_RPC
 
         async def send_and_wait(self, prompt, timeout):
             if fails:

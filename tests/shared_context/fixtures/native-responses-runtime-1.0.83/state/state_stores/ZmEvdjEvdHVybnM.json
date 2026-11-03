@@ -1,0 +1,643 @@
+{
+  "items": {
+    "agent": {
+      "created_at": 1793697171,
+      "etag": "\"local-6bdb226c1df04e2c9322463dd0b0667f\"",
+      "expires_at": null,
+      "id": "it_46284f478ccb848d3f18a931",
+      "key": "agent",
+      "object": "state_store.item",
+      "tags": null,
+      "updated_at": 1793697171,
+      "value": {
+        "admission_started": true,
+        "agent_id": "11111111-1111-1111-1111-111111111111",
+        "agent_name": "OFFLINE-agent",
+        "following_supported": true,
+        "hosted_session_id": "OFFLINE-host-session"
+      }
+    },
+    "open-rids": {
+      "created_at": 1793697171,
+      "etag": "\"local-d0524b6e28374fe48a69a907d0a2655b\"",
+      "expires_at": null,
+      "id": "it_27daec7689bac1ac25a998ca",
+      "key": "open-rids",
+      "object": "state_store.item",
+      "tags": null,
+      "updated_at": 1793697173,
+      "value": {
+        "rids": []
+      }
+    },
+    "preview:2ca5a99e38a0743bbc0a1f8657c6a4a5926ee4bfefc3b44092d0fb4fb746ac0b": {
+      "created_at": 1793697173,
+      "etag": "\"local-8dd98020ffc84276b1120d6318a91dc4\"",
+      "expires_at": null,
+      "id": "it_a6a600a6962aea709cbf1db1",
+      "key": "preview:2ca5a99e38a0743bbc0a1f8657c6a4a5926ee4bfefc3b44092d0fb4fb746ac0b",
+      "object": "state_store.item",
+      "tags": null,
+      "updated_at": 1793697173,
+      "value": {
+        "kind": "fa-native-reply-preview-v1",
+        "request_id": "rid-1",
+        "submit_digest": "95e86bf07eddf3bb594060d4f16c53531d6b11fc78cc8ad807b11e964260c66a",
+        "text": "MARK-ANSWER-1: noted, AZ-7731.",
+        "text_sha256": "7d503d48a48b5a97c9dc724cc02457df4374a40c732a25b2b9fa84f3632a87b7"
+      }
+    },
+    "progress:2ca5a99e38a0743bbc0a1f8657c6a4a5926ee4bfefc3b44092d0fb4fb746ac0b": {
+      "created_at": 1793697172,
+      "etag": "\"local-97e1bd09efa645c7915f56be377b34d6\"",
+      "expires_at": null,
+      "id": "it_9468924b81c8b804a6173b62",
+      "key": "progress:2ca5a99e38a0743bbc0a1f8657c6a4a5926ee4bfefc3b44092d0fb4fb746ac0b",
+      "object": "state_store.item",
+      "tags": null,
+      "updated_at": 1793697173,
+      "value": {
+        "agent_id": "11111111-1111-1111-1111-111111111111",
+        "byte_length": 1005,
+        "conversation_id": "native-4cd1fc8e3cc2436584c365f5bb566a54",
+        "finished": true,
+        "hosted_session_id": "OFFLINE-host-session",
+        "progress": {
+          "events": [
+            {
+              "at": "2026-11-03T09:12:52.430000Z",
+              "kind": "stage",
+              "seq": 1,
+              "source": null,
+              "status": "started",
+              "summary": "SDK session started",
+              "tool_name": null
+            },
+            {
+              "at": "2026-11-03T09:12:52.963000Z",
+              "kind": "stage",
+              "seq": 2,
+              "source": null,
+              "status": "started",
+              "summary": "SDK turn started",
+              "tool_name": null
+            },
+            {
+              "at": "2026-11-03T09:12:53.125000Z",
+              "kind": "stage",
+              "seq": 3,
+              "source": null,
+              "status": "succeeded",
+              "summary": "SDK turn ended",
+              "tool_name": null
+            }
+          ],
+          "reasoning_summary": {
+            "availability": "not_provided",
+            "source": "copilot-sdk-1.0.13",
+            "text": null
+          }
+        },
+        "recorded": true,
+        "request_id": "rid-1",
+        "schema_version": "fa-native-public-progress-v1",
+        "submit_digest": "95e86bf07eddf3bb594060d4f16c53531d6b11fc78cc8ad807b11e964260c66a",
+        "truncated": false,
+        "unconfirmed": false
+      }
+    },
+    "rid:rid-1": {
+      "created_at": 1793697171,
+      "etag": "\"local-f853eaa51daf4efaa6258fd8ced8b3ff\"",
+      "expires_at": null,
+      "id": "it_af369d7f14153d41fbe47db7",
+      "key": "rid:rid-1",
+      "object": "state_store.item",
+      "tags": null,
+      "updated_at": 1793697173,
+      "value": {
+        "call_id": "OFFLINE-call-1",
+        "receipt": {
+          "agent_id": "11111111-1111-1111-1111-111111111111",
+          "assembly": {
+            "capture_digest": "5cd5603159226414f54b69576b0c47d2a0072af14be4695428a7915c66a4d475",
+            "event_scope": "observed-metadata-not-exhaustive-history",
+            "inference": {
+              "attempts": [
+                {
+                  "attempt_id": 1,
+                  "body_bytes": 7663,
+                  "body_sha256": "4ec00ed57467a2b0579d0760100900814127358075f3a853af949eb0b094de46",
+                  "http_status": 200,
+                  "ledger_measured": true,
+                  "logical_id": 1,
+                  "model": "OFFLINE-model",
+                  "provider_id_reason": "not_reported",
+                  "provider_request_id": null,
+                  "provider_usage": {
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": null,
+                    "input_tokens": 21,
+                    "output_tokens": 13,
+                    "reasoning_tokens": 8,
+                    "total_tokens": 34,
+                    "unknown_reason": "not_reported_or_invalid"
+                  },
+                  "state": "complete",
+                  "stream_complete": true,
+                  "unknown_reason": "not_observed_or_unverified",
+                  "usage_reason": null,
+                  "wire_api": "responses"
+                }
+              ],
+              "billing_effect": "none-observation-only",
+              "counter_reason": null,
+              "full_request_tokens": null,
+              "full_request_tokens_reason": "counter_unavailable",
+              "logical_prepared": 1,
+              "omitted_observations": 0,
+              "provider_usage_ref": "receipt.usage",
+              "reason": null,
+              "requests": [
+                {
+                  "body_bytes": 7663,
+                  "body_sha256": "4ec00ed57467a2b0579d0760100900814127358075f3a853af949eb0b094de46",
+                  "gateway_fingerprint": "4b7fe04f24ef34f85a797c7938509fafc303c5f8f69ae8f87acdce40711754c6",
+                  "identity_reason": null,
+                  "logical_id": 1,
+                  "model": "OFFLINE-model",
+                  "purpose": "unknown",
+                  "purpose_reason": "not_reported",
+                  "sdk_interaction_type": "conversation-agent",
+                  "sdk_request_id": "e799ef69-6719-4fec-b0e5-479f9cb33d4a",
+                  "sdk_session_id": "sdk-f12e56d7a8f349487beae4ae91781fdbefca6166eb86cc9e",
+                  "source": "gateway",
+                  "unknown_reason": "not_reported_or_invalid",
+                  "wire_api": "responses"
+                }
+              ],
+              "schema_version": "fa-native-inference-observation-v1",
+              "sdk_context": [
+                {
+                  "conversation_tokens": 48,
+                  "current_tokens": 1508,
+                  "event_id": "36407a85-31ba-45aa-857b-49223ba70e11",
+                  "messages_length": 2,
+                  "scope": "context-window-snapshot-not-turn-usage",
+                  "system_tokens": 753,
+                  "token_limit": 128000,
+                  "tool_definitions_tokens": 707,
+                  "unknown_reason": "not_reported_or_invalid"
+                }
+              ],
+              "sdk_context_reason": null,
+              "sdk_usage": [
+                {
+                  "api_call_id": "resp_offline_1",
+                  "dedup_reason": null,
+                  "event_id": "5e8c5e83-f924-46c4-bc6d-b96b365bf705",
+                  "identity_reason": "not_reported_or_invalid",
+                  "match_reason": "no_verified_cross_source_id",
+                  "model": "OFFLINE-model",
+                  "provider_call_id": null,
+                  "request_match": null,
+                  "sdk_agent_id": null,
+                  "sdk_session_id": "sdk-f12e56d7a8f349487beae4ae91781fdbefca6166eb86cc9e",
+                  "service_request_id": null,
+                  "tokens": {
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "input_tokens": 21,
+                    "output_tokens": 13,
+                    "reasoning_tokens": 8,
+                    "total_tokens": null,
+                    "unknown_reason": "not_reported_or_invalid"
+                  }
+                }
+              ],
+              "sdk_usage_reason": null,
+              "state": "observed",
+              "transport_started": 1
+            },
+            "parts": [
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "base",
+                "reason": null,
+                "sha256": "9c2a8bbe1609ba0fc93c5a86e90c0aab3386bb6ad5c5bee4dad7ac44e29dabb6",
+                "source_ref": "capture.template.role",
+                "source_sha256": null,
+                "state": "configured",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": 3957
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "capabilities",
+                "reason": "not_selected",
+                "sha256": null,
+                "source_ref": "capture.capabilities",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "role",
+                "reason": null,
+                "sha256": "f9119ef7e75386b87a0621e20905ef70054c2dff392c143ee3d25da3f8f7c16c",
+                "source_ref": "capture.role_prompt",
+                "source_sha256": null,
+                "state": "included",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": 49
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "origin",
+                "reason": "not_selected",
+                "sha256": null,
+                "source_ref": "capture.template.settings",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "teammates",
+                "reason": "not_configured",
+                "sha256": null,
+                "source_ref": "native.peer_directory",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "groups",
+                "reason": "not_configured",
+                "sha256": null,
+                "source_ref": "native.group_context",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "providers",
+                "reason": "not_configured",
+                "sha256": null,
+                "source_ref": "native.providers",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "system_message",
+                "reason": null,
+                "sha256": "f769823a4668470bd410d1ae485818adae722ca58a886039a797a2697d9a80a8",
+                "source_ref": "sdk.arguments",
+                "source_sha256": null,
+                "state": "included",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": 4008
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "user_prompt",
+                "reason": null,
+                "sha256": "c6ec084e38614d1ee26695845fe5a2a6ce5e6877c0aa14f0aec3be7aad3e6c42",
+                "source_ref": "sdk.arguments",
+                "source_sha256": null,
+                "state": "included",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": 59
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "private_memory",
+                "reason": "not_configured",
+                "sha256": null,
+                "source_ref": "native.memory_search",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "team_memory",
+                "reason": "not_configured",
+                "sha256": null,
+                "source_ref": "native.memory_search",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "attachments",
+                "reason": "not_selected",
+                "sha256": null,
+                "source_ref": "capture.attached_text",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "user_files",
+                "reason": "not_selected",
+                "sha256": null,
+                "source_ref": "command.files",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "user_images",
+                "reason": "not_selected",
+                "sha256": null,
+                "source_ref": "command.images",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "checkpoint",
+                "reason": "no_previous_checkpoint",
+                "sha256": null,
+                "source_ref": "previous_checkpoint",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "routines",
+                "reason": "not_configured",
+                "sha256": null,
+                "source_ref": "receipt.routine",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "reminders",
+                "reason": "not_selected",
+                "sha256": null,
+                "source_ref": "native.work_reminders",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              },
+              {
+                "data_bytes": null,
+                "hash_scope": "utf8-text",
+                "name": "writing_style",
+                "reason": "not_selected",
+                "sha256": null,
+                "source_ref": "native.writing_style",
+                "source_sha256": null,
+                "state": "omitted",
+                "token_reason": "counter_unavailable",
+                "tokens": null,
+                "utf8_bytes": null
+              }
+            ],
+            "reason": null,
+            "schema_version": "fa-native-assembly-v1",
+            "sdk_binding_observed": true,
+            "sdk_binding_reason": null,
+            "selection": {
+              "base": {
+                "capability_catalog_version": "fa-instruction-tools-history-v1",
+                "prefix_sha256": "9c2a8bbe1609ba0fc93c5a86e90c0aab3386bb6ad5c5bee4dad7ac44e29dabb6",
+                "profile": "fa-instruction-agent-role-v1"
+              },
+              "capability_head_selection_id": null,
+              "capability_reason": "not_configured",
+              "checkpoint_profile": {
+                "name": "auto-no-custom-v1",
+                "platform": "win32-x64",
+                "provider": "openai-responses"
+              },
+              "model": "OFFLINE-model",
+              "profile_selection_id": null,
+              "profile_selection_reason": "not_selected",
+              "role_reason": null,
+              "role_sha256": "f9119ef7e75386b87a0621e20905ef70054c2dff392c143ee3d25da3f8f7c16c",
+              "role_version": 1,
+              "runtime_version": "1.0.83",
+              "sdk_version": "1.0.13"
+            },
+            "state": "recorded",
+            "tools": [
+              {
+                "grants": [],
+                "name": "read_context",
+                "schema_sha256": "9d75707c168746ad69e19fccbde7cd64d340b6cbf72692f03d2afd7770227304",
+                "toolbox_version": null,
+                "toolbox_version_reason": "not_applicable"
+              },
+              {
+                "grants": [],
+                "name": "execute_operation",
+                "schema_sha256": "9d75707c168746ad69e19fccbde7cd64d340b6cbf72692f03d2afd7770227304",
+                "toolbox_version": null,
+                "toolbox_version_reason": "not_applicable"
+              },
+              {
+                "grants": [],
+                "name": "read_user_turn",
+                "schema_sha256": "a567f14f6b4fb7fe40eb20a3072a42515def197c629951f0acaf527d9fcd6c4a",
+                "toolbox_version": null,
+                "toolbox_version_reason": "not_applicable"
+              },
+              {
+                "grants": [],
+                "name": "read_user_file",
+                "schema_sha256": "7237506b74b751a9a55f6f11f321bc7531efc48e262976dd1511a9b22e296e88",
+                "toolbox_version": null,
+                "toolbox_version_reason": "not_applicable"
+              },
+              {
+                "grants": [],
+                "name": "read_assistant_reply",
+                "schema_sha256": "a567f14f6b4fb7fe40eb20a3072a42515def197c629951f0acaf527d9fcd6c4a",
+                "toolbox_version": null,
+                "toolbox_version_reason": "not_applicable"
+              },
+              {
+                "grants": [],
+                "name": "read_tool_output",
+                "schema_sha256": "dabe0f1700af4895b3290795c05813803e5ba1951555bd4f293fc3c40c4db8cf",
+                "toolbox_version": null,
+                "toolbox_version_reason": "not_applicable"
+              }
+            ],
+            "tools_count": 6,
+            "tools_reason": null,
+            "tools_scope": "fa-bound-tool-specs"
+          },
+          "cancel_requested": false,
+          "capture": {
+            "attached_text": null,
+            "capabilities": null,
+            "model": {
+              "context_window_tokens": null,
+              "display_name": "OFFLINE model",
+              "id": "OFFLINE-model",
+              "input_microusd_per_million": null,
+              "max_output_tokens": null,
+              "output_microusd_per_million": null,
+              "supports_reasoning_effort": null
+            },
+            "model_capacity": null,
+            "profile_selection_id": null,
+            "reasoning_summary": null,
+            "role_prompt": {
+              "sha256": "f9119ef7e75386b87a0621e20905ef70054c2dff392c143ee3d25da3f8f7c16c",
+              "text": "Reply using only the supplied synthetic material.",
+              "version": 1
+            },
+            "schema_version": "fa-native-turn-capture-v1",
+            "template": {
+              "authorization": false,
+              "required_at_destination": [
+                "current-human-agent-team-binding",
+                "current-standing-read-and-work-policy",
+                "reviewed-work-sources-and-private-memory",
+                "model-deployment-and-provider-connection",
+                "connector-accounts-and-tool-grants",
+                "compatible-sdk-runtime-and-checkpoint"
+              ],
+              "role": {
+                "capability_catalog_version": "fa-instruction-tools-history-v1",
+                "prefix_sha256": "9c2a8bbe1609ba0fc93c5a86e90c0aab3386bb6ad5c5bee4dad7ac44e29dabb6",
+                "profile": "fa-instruction-agent-role-v1"
+              },
+              "schema_version": "fa-agent-template-v1",
+              "settings": {
+                "checkpoint_profile": {
+                  "name": "auto-no-custom-v1",
+                  "platform": "win32-x64",
+                  "provider": "openai-responses"
+                },
+                "mode": "empty",
+                "model_capacity_profile": null,
+                "model_provider": "openai-responses",
+                "runtime_version": "1.0.83",
+                "sdk_start_profile": null,
+                "sdk_version": "1.0.13",
+                "user_text_file_profile": "fa-user-text-files-v1"
+              },
+              "skills": [],
+              "unavailable_skills": []
+            }
+          },
+          "capture_digest": "5cd5603159226414f54b69576b0c47d2a0072af14be4695428a7915c66a4d475",
+          "command": {
+            "authorize_own_result": true,
+            "content": "MARK-QUESTION-1: the shipment code is AZ-7731; remember it.",
+            "request_id": "rid-1"
+          },
+          "conversation_id": "native-4cd1fc8e3cc2436584c365f5bb566a54",
+          "delivered": false,
+          "failure_code": null,
+          "hosted_session_id": "OFFLINE-host-session",
+          "request_id": "rid-1",
+          "result": {
+            "checkpoint_sha256": "baeca2834ce8eb456ed29d3dbe888f79fa9423cc5b1c3d2cd6f12f05bdb038d7",
+            "result_digest": "080329a716aefbe3f5519ea3d0f273184fb160e8430ab45b731f8edbd9504bd8",
+            "text_bytes": 30,
+            "text_parts": 1,
+            "text_sha256": "7d503d48a48b5a97c9dc724cc02457df4374a40c732a25b2b9fa84f3632a87b7",
+            "turn_key": "turn:1",
+            "turn_number": 1
+          },
+          "state_profile": "foundry-native-v2",
+          "status": "completed",
+          "submit_digest": "95e86bf07eddf3bb594060d4f16c53531d6b11fc78cc8ad807b11e964260c66a",
+          "turn_number": 1,
+          "usage": {
+            "schema_version": "fa-turn-model-usage-v1",
+            "usage": [
+              {
+                "input_tokens": 21,
+                "measured_requests": 1,
+                "model": "OFFLINE-model",
+                "output_tokens": 13,
+                "reasoning_tokens": 8,
+                "requests": 1,
+                "wire_api": "responses"
+              }
+            ]
+          }
+        },
+        "run_token": "ca4de2ce5d024b9db20a809e40acf656"
+      }
+    }
+  },
+  "store": {
+    "created_at": 1793697171,
+    "description": null,
+    "id": "ss_8504a429a08608ef24b66db2",
+    "item_ttl_seconds": -1,
+    "name": "fa/v1/turns",
+    "object": "state_store",
+    "tags": {},
+    "updated_at": 1793697171,
+    "user_isolation": false
+  }
+}

@@ -663,23 +663,8 @@ def build_server(
     resources = ExitStack()
     try:
         credential = _credential(config.identity, resources, credential)
-        options = {} if table_transport is None else {"transport": table_transport}
-        table = TableClient(config.table.endpoint, config.table.scope.table_name, credential=credential, **SDK_OPTIONS, **options)
-        resources.callback(table.close)
-        from .behavior_migration import MigrationStore, installation_record
-
-        store = MigrationStore(table, config.table.scope,
-                               expected_installation=(installation_record(config)[0], config.sha256))
-        if store._binding != config.workers.control_binding:
-            raise ValueError("configured control_binding does not match the exact Table SDK endpoint")
-        options = {} if source_transport is None else {"transport": source_transport}
-        source = ContainerClient.from_container_url(
-            config.sources.protection.container_url, credential=credential, **SDK_OPTIONS, **options,
-            max_single_put_size=MAX_ARTIFACT_BYTES, max_single_get_size=MAX_ARTIFACT_BYTES,
-        )
-        resources.callback(source.close)
-        if source.url != config.sources.protection.container_url:
-            raise ValueError("source SDK container endpoint differs")
+        table, store = _open_table(config, credential, resources, table_transport)
+        source = _open_source_container(config, credential, resources, source_transport)
         backup = make_blob_backup_store(SourceBackupSettings(
             tenant_id=config.identity.tenant_id, authority_domain=config.table.scope.authority_domain,
             container_url=config.backups.protection.container_url,
@@ -717,15 +702,7 @@ def build_server(
                 credential_client_id=config.identity.managed_identity_client_id,
             ) if config.assistant is not None and config.identity.managed_identity_client_id is not None else None,
         )
-        if native_transports is not None and set(native_transports) not in (
-            {t.executor_id for t in config.targets}, {t.executor_id for t in config.active_targets},
-        ):
-            raise ValueError("offline transports must cover the exact native target set")
-        native_clients = []
-        for target in config.active_targets:
-            client = FoundryHttpClient(target, credential, transport=None if native_transports is None else native_transports[target.executor_id])
-            resources.callback(client.close)
-            native_clients.append(client)
+        native_clients = _open_native_clients(config, credential, resources, native_transports)
         executor = FoundryExecutor(native, tuple(native_clients))
         workers.adapter = executor.adapter(verify_readiness=catalog.worker)
         reviewer = DurableHumanReviewVerifier(sources, HumanReviewPolicy(policy_version=config.review_policy_version), clock=clock)
@@ -734,20 +711,7 @@ def build_server(
             sources, clock=clock, token_counter=tokenizer.count, review_verifier=reviewer,
             max_context_tokens=config.max_context_tokens, max_context_bytes=config.max_context_bytes,
         )
-        if memory_transports is not None and set(memory_transports) != {s.binding_id for s in config.memory_projections}:
-            raise ValueError("offline memory transports must cover the exact configured projection bindings")
-        projections, project_clients = {}, []
-        for setup in config.memory_projections:
-            options = {} if memory_transports is None else {"transport": memory_transports[setup.binding_id]}
-            project = AIProjectClient(
-                endpoint=setup.endpoint, credential=credential, api_version="v1",
-                credential_scopes=["https://ai.azure.com/.default"], retry_total=0, retry_connect=0,
-                retry_read=0, retry_status=0, redirect_max=0, logging_enable=False,
-                connection_timeout=10, read_timeout=20, **options,
-            )
-            resources.callback(project.close)
-            project_clients.append(project)
-            projections[setup.binding_id] = NativeMemoryProjection(memory, project, setup)
+        projections, project_clients = _open_memory_projections(config, credential, resources, memory, memory_transports)
         aliases = _OperationCatalog(config)
         effect = WorkStateEffectAdapter(delivery, allowed_work_ids=tuple(b.work.work_id for b in config.bindings), references=aliases)
         broker = ToolBrokerCore(store, clock=clock, adapter=effect.registration, execution_adapter=effect)
@@ -755,15 +719,7 @@ def build_server(
             store, sources, memory, broker, delivery, inbox, workers, evidence, reviewer, native, backups,
             memory_projections=None if not projections else MappingProxyType(projections),
         )
-        if config.assistant is None:
-            runtime = BehaviorRuntime(dependencies, config.bindings, clock=clock, mode="native", controller_id=config.controller_id)
-        else:
-            from .behavior_assistant import AssistantRuntime
-
-            runtime = AssistantRuntime(
-                dependencies, config.bindings, profiles=config.assistant.profiles,
-                clock=clock, mode="native", controller_id=config.controller_id,
-            )
+        runtime = _make_runtime(config, dependencies, clock)
         catalog.runtime, aliases.runtime, aliases.adapter = runtime, runtime, effect
         composition = ServerComposition(config, runtime, _verifier(config.identity, key_client, store, config.targets), catalog,
                                         (table, source, backup.container, *native_clients, *project_clients), resources,
@@ -775,21 +731,92 @@ def build_server(
         composition.hosted_versions = hosted_versions
         composition.upgrade_snapshot_container_url = upgrade_snapshot_container_url
         if config.assistant is not None:
-            from .behavior_assistant_server import AssistantServer
-
-            composition.assistant = AssistantServer(
-                composition, table, source, credential, transport=assistant_transport,
-            )
-            from .behavior_capabilities import load_runtime_capabilities
-            runtime.capability_grants, runtime.capability_catalog = load_runtime_capabilities()
-            from .behavior_peer_runtime import build_peer
-            composition._peer_factory = lambda policy: build_peer(
-                composition, policy, credential=credential, native_transports=native_transports,
-                assistant_transport=assistant_transport)
+            _attach_assistant(composition, runtime, table, source, credential, native_transports, assistant_transport)
         return composition
     except BaseException:
         resources.close()
         raise
+
+
+def _open_table(config, credential, resources, table_transport):
+    options = {} if table_transport is None else {"transport": table_transport}
+    table = TableClient(config.table.endpoint, config.table.scope.table_name, credential=credential, **SDK_OPTIONS, **options)
+    resources.callback(table.close)
+    from .behavior_migration import MigrationStore, installation_record
+
+    store = MigrationStore(table, config.table.scope,
+                           expected_installation=(installation_record(config)[0], config.sha256))
+    if store._binding != config.workers.control_binding:
+        raise ValueError("configured control_binding does not match the exact Table SDK endpoint")
+    return table, store
+
+
+def _open_source_container(config, credential, resources, source_transport):
+    options = {} if source_transport is None else {"transport": source_transport}
+    source = ContainerClient.from_container_url(
+        config.sources.protection.container_url, credential=credential, **SDK_OPTIONS, **options,
+        max_single_put_size=MAX_ARTIFACT_BYTES, max_single_get_size=MAX_ARTIFACT_BYTES,
+    )
+    resources.callback(source.close)
+    if source.url != config.sources.protection.container_url:
+        raise ValueError("source SDK container endpoint differs")
+    return source
+
+
+def _open_native_clients(config, credential, resources, native_transports):
+    if native_transports is not None and set(native_transports) not in (
+        {t.executor_id for t in config.targets}, {t.executor_id for t in config.active_targets},
+    ):
+        raise ValueError("offline transports must cover the exact native target set")
+    native_clients = []
+    for target in config.active_targets:
+        client = FoundryHttpClient(target, credential, transport=None if native_transports is None else native_transports[target.executor_id])
+        resources.callback(client.close)
+        native_clients.append(client)
+    return native_clients
+
+
+def _open_memory_projections(config, credential, resources, memory, memory_transports):
+    if memory_transports is not None and set(memory_transports) != {s.binding_id for s in config.memory_projections}:
+        raise ValueError("offline memory transports must cover the exact configured projection bindings")
+    projections, project_clients = {}, []
+    for setup in config.memory_projections:
+        options = {} if memory_transports is None else {"transport": memory_transports[setup.binding_id]}
+        project = AIProjectClient(
+            endpoint=setup.endpoint, credential=credential, api_version="v1",
+            credential_scopes=["https://ai.azure.com/.default"], retry_total=0, retry_connect=0,
+            retry_read=0, retry_status=0, redirect_max=0, logging_enable=False,
+            connection_timeout=10, read_timeout=20, **options,
+        )
+        resources.callback(project.close)
+        project_clients.append(project)
+        projections[setup.binding_id] = NativeMemoryProjection(memory, project, setup)
+    return projections, project_clients
+
+
+def _make_runtime(config, dependencies, clock):
+    if config.assistant is None:
+        return BehaviorRuntime(dependencies, config.bindings, clock=clock, mode="native", controller_id=config.controller_id)
+    from .behavior_assistant import AssistantRuntime
+
+    return AssistantRuntime(
+        dependencies, config.bindings, profiles=config.assistant.profiles,
+        clock=clock, mode="native", controller_id=config.controller_id,
+    )
+
+
+def _attach_assistant(composition, runtime, table, source, credential, native_transports, assistant_transport):
+    from .behavior_assistant_server import AssistantServer
+
+    composition.assistant = AssistantServer(
+        composition, table, source, credential, transport=assistant_transport,
+    )
+    from .behavior_capabilities import load_runtime_capabilities
+    runtime.capability_grants, runtime.capability_catalog = load_runtime_capabilities()
+    from .behavior_peer_runtime import build_peer
+    composition._peer_factory = lambda policy: build_peer(
+        composition, policy, credential=credential, native_transports=native_transports,
+        assistant_transport=assistant_transport)
 
 
 def _lifespan(app, composition, validate):
@@ -846,123 +873,148 @@ def _health(app, *, preactivation):
 def application(composition: ServerComposition, *, preactivation=False):
     try:
         if not preactivation:
-            composition.installation()
-            if composition.runtime.work_policy is None:
-                composition.catalog.require_activation()
-            composition.runtime.validate_startup()
-            from .native_binding import idle_upgrade_enabled
-            idle_upgrade_enabled()  # refuses FA_NATIVE_IDLE_UPGRADE=1 without the 2d-i switch
-            identity = _principal_dependency(composition.verifier)
-
-            def current_native_evidence(request: Request, _principal=Depends(identity)):
-                if composition.instruction_request(request):
-                    return
-                if (composition.runtime.work_policy is not None
-                        and composition.runtime.work_policy.result_route(request)):
-                    composition.installation()
-                elif composition.assistant is not None and composition.assistant.bounded_route(composition, request):
-                    composition.assistant.acquire_evidence(composition)
-                else:
-                    composition.require_current_native_evidence()
-
-            app = FastAPI(title="FA bounded native behavior API", docs_url=None, redoc_url=None, openapi_url=None)
-            from .behavior_timing import RouteTiming
-            app.add_middleware(RouteTiming)
-            _install_error_handlers(app)
-            app.include_router(behavior_router(composition.runtime, composition.verifier,
-                                               registered_actor=composition.registered_actor),
-                               dependencies=[Depends(current_native_evidence)])
-            if composition.assistant is not None:
-                from .behavior_assistant_api import install_assistant_routes
-
-                def current_assistant_evidence(request: Request, _principal=Depends(identity)):
-                    if composition.instruction_request(request):
-                        return
-                    if composition.assistant.bounded_route(composition, request):
-                        composition.assistant.acquire_evidence(composition)
-                    else:
-                        composition.require_current_native_evidence()
-
-                routes = APIRouter(dependencies=[Depends(current_assistant_evidence)])
-                install_assistant_routes(
-                    routes, composition.assistant.authority, composition.verifier,
-                    provider=composition.assistant.provider,
-                    on_result_ready=composition.instruction_ready,
-                )
-                app.include_router(routes)
-                from .team_data_relay import TeamDataRelay, install_team_data_routes
-                artifacts = composition.assistant.artifacts
-                app.state.team_data = TeamDataRelay(
-                    artifacts.repository, artifacts.store, composition.config.identity.tenant_id)
-                install_team_data_routes(app, app.state.team_data, composition.verifier)
-            if composition.runtime.work_policy is not None:
-                from .behavior_work_policy_api import install_work_policy_routes
-                from .memory_note_proposal_api import install_note_proposal_routes
-                from .memory_bridge_settings_api import install_memory_bridge_settings_routes
-                from .memory_candidate_api import install_memory_candidate_routes
-                install_work_policy_routes(app,composition,start_work=composition.launch_instruction,
-                                           wake_work=composition.instruction_ready)
-                install_note_proposal_routes(app, composition.runtime, composition.verifier)
-                install_memory_bridge_settings_routes(app, composition.runtime, composition.verifier)
-                install_memory_candidate_routes(app, composition.runtime, composition.verifier)
-                if composition.assistant is not None:
-                    from .assistant_image_api import install_image_routes
-                    install_image_routes(app, composition.assistant.authority, composition.verifier)
-            _health(app, preactivation=False)
-            from .native_hitl_api import install_native_hitl_routes
-            install_native_hitl_routes(app, composition)
-            from .memory_relay import install_memory_relay_routes
-            install_memory_relay_routes(app, composition)
-            from .team_skills_api import install_team_skills_routes
-            install_team_skills_routes(app, composition)
-            from .team_mcp_api import install_team_mcp_routes
-            install_team_mcp_routes(app, composition)
-            from .team_connector_api import install_team_connector_routes
-            install_team_connector_routes(app, composition)
-            if composition.agent_id is None:
-                from .native_teams_relay import install_teams_relay_routes
-                install_teams_relay_routes(app, composition)
-            from .native_group_api import install_native_group_routes
-            install_native_group_routes(app, composition)
-            from .behavior_desktop_view_api import install_desktop_view_routes
-            install_desktop_view_routes(app, composition)
-            if composition.agent_id is None and composition.runtime.work_policy is not None:
-                from .behavior_peer_runtime import install_peer_routing
-                install_peer_routing(app, composition, application)
-                # ADR-0009 M1 step 3 (b): the daily patrol is off from 2d-ii (no v1 row is left to find); the
-                # operator one-shot ``agent-versions patrol --once`` stays.
-                from .native_upgrade_reconciler import NativeUpgradeReconciler
-                app.state.native_upgrade_reconciler = NativeUpgradeReconciler(composition)
-            # installation() already ran above in this process; a second full inventory scan here only delayed the port.
-            # So did validate_startup(); with a work policy a repeat only re-read every registered work row.
-            return _lifespan(app, composition, lambda: None if composition.runtime.work_policy is not None else (
-                composition.catalog.require_activation(), composition.runtime.validate_startup(),
-            ))
-        app = FastAPI(title="FA operator preactivation (admissions CLOSED)", docs_url=None, redoc_url=None, openapi_url=None)
-        _install_error_handlers(app)
-        _health(app, preactivation=True)
-        callbacks = behavior_router(composition.runtime, composition.verifier)
-        callbacks.routes[:] = [route for route in callbacks.routes if "/hosted/launches/" in route.path]
-        app.include_router(callbacks)
-        identity = _principal_dependency(composition.verifier)
-
-        @app.get("/behavior/v1/operator/prerequisites")
-        @app.get("/behavior/v1/operator/config-check")
-        def prerequisites(principal=Depends(identity)):
-            principal.require(composition.config.identity.team_id, "read")
-            if principal.kind != "human" or principal.oid != composition.config.identity.human_oid:
-                raise Problem(403, "BEHAVIOR_ACCESS_DENIED", "only the configured operator may inspect prerequisites")
-            return _response({
-                "admissions": "CLOSED", "configuration_sha256": composition.config.sha256,
-                "control_binding": composition.runtime.store._binding,
-                "worker_configuration_digest": composition.runtime.dep.workers.configuration_digest(),
-                "delivery_configuration_digest": composition.runtime.dep.delivery.configuration_digest(),
-                "prerequisite_verification": "OPERATOR_EVIDENCE_REQUIRED", "actual_environment": "NOT_RUN",
-            })
-        return _lifespan(app, composition, lambda: None)
+            return _operational_application(composition)
+        return _preactivation_application(composition)
     except BaseException:
         composition.close()
         raise
+
+
+def _native_evidence_dependency(composition, identity):
+    def current_native_evidence(request: Request, _principal=Depends(identity)):
+        if composition.instruction_request(request):
+            return
+        if (composition.runtime.work_policy is not None
+                and composition.runtime.work_policy.result_route(request)):
+            composition.installation()
+        elif composition.assistant is not None and composition.assistant.bounded_route(composition, request):
+            composition.assistant.acquire_evidence(composition)
+        else:
+            composition.require_current_native_evidence()
+
+    return current_native_evidence
+
+
+def _install_assistant_api(app, composition, identity):
+    from .behavior_assistant_api import install_assistant_routes
+
+    def current_assistant_evidence(request: Request, _principal=Depends(identity)):
+        if composition.instruction_request(request):
+            return
+        if composition.assistant.bounded_route(composition, request):
+            composition.assistant.acquire_evidence(composition)
+        else:
+            composition.require_current_native_evidence()
+
+    routes = APIRouter(dependencies=[Depends(current_assistant_evidence)])
+    install_assistant_routes(
+        routes, composition.assistant.authority, composition.verifier,
+        provider=composition.assistant.provider,
+        on_result_ready=composition.instruction_ready,
+    )
+    app.include_router(routes)
+    from .team_data_relay import TeamDataRelay, install_team_data_routes
+    artifacts = composition.assistant.artifacts
+    app.state.team_data = TeamDataRelay(
+        artifacts.repository, artifacts.store, composition.config.identity.tenant_id)
+    install_team_data_routes(app, app.state.team_data, composition.verifier)
+
+
+def _install_work_policy_api(app, composition):
+    from .behavior_work_policy_api import install_work_policy_routes
+    from .memory_note_proposal_api import install_note_proposal_routes
+    from .memory_bridge_settings_api import install_memory_bridge_settings_routes
+    from .memory_candidate_api import install_memory_candidate_routes
+    install_work_policy_routes(app,composition,start_work=composition.launch_instruction,
+                               wake_work=composition.instruction_ready)
+    install_note_proposal_routes(app, composition.runtime, composition.verifier)
+    install_memory_bridge_settings_routes(app, composition.runtime, composition.verifier)
+    install_memory_candidate_routes(app, composition.runtime, composition.verifier)
+    if composition.assistant is not None:
+        from .assistant_image_api import install_image_routes
+        install_image_routes(app, composition.assistant.authority, composition.verifier)
+
+
+def _install_team_routes(app, composition):
+    from .native_hitl_api import install_native_hitl_routes
+    install_native_hitl_routes(app, composition)
+    from .memory_relay import install_memory_relay_routes
+    install_memory_relay_routes(app, composition)
+    from .team_skills_api import install_team_skills_routes
+    install_team_skills_routes(app, composition)
+    from .team_mcp_api import install_team_mcp_routes
+    install_team_mcp_routes(app, composition)
+    from .team_connector_api import install_team_connector_routes
+    install_team_connector_routes(app, composition)
+    if composition.agent_id is None:
+        from .native_teams_relay import install_teams_relay_routes
+        install_teams_relay_routes(app, composition)
+    from .native_group_api import install_native_group_routes
+    install_native_group_routes(app, composition)
+    from .behavior_desktop_view_api import install_desktop_view_routes
+    install_desktop_view_routes(app, composition)
+
+
+def _operational_application(composition):
+    composition.installation()
+    if composition.runtime.work_policy is None:
+        composition.catalog.require_activation()
+    composition.runtime.validate_startup()
+    from .native_binding import idle_upgrade_enabled
+    idle_upgrade_enabled()  # refuses FA_NATIVE_IDLE_UPGRADE=1 without the 2d-i switch
+    identity = _principal_dependency(composition.verifier)
+    current_native_evidence = _native_evidence_dependency(composition, identity)
+
+    app = FastAPI(title="FA bounded native behavior API", docs_url=None, redoc_url=None, openapi_url=None)
+    from .behavior_timing import RouteTiming
+    app.add_middleware(RouteTiming)
+    _install_error_handlers(app)
+    app.include_router(behavior_router(composition.runtime, composition.verifier,
+                                       registered_actor=composition.registered_actor),
+                       dependencies=[Depends(current_native_evidence)])
+    if composition.assistant is not None:
+        _install_assistant_api(app, composition, identity)
+    if composition.runtime.work_policy is not None:
+        _install_work_policy_api(app, composition)
+    _health(app, preactivation=False)
+    _install_team_routes(app, composition)
+    if composition.agent_id is None and composition.runtime.work_policy is not None:
+        from .behavior_peer_runtime import install_peer_routing
+        install_peer_routing(app, composition, application)
+        # ADR-0009 M1 step 3 (b): the daily patrol is off from 2d-ii (no v1 row is left to find); the
+        # operator one-shot ``agent-versions patrol --once`` stays.
+        from .native_upgrade_reconciler import NativeUpgradeReconciler
+        app.state.native_upgrade_reconciler = NativeUpgradeReconciler(composition)
+    # installation() already ran above in this process; a second full inventory scan here only delayed the port.
+    # So did validate_startup(); with a work policy a repeat only re-read every registered work row.
+    return _lifespan(app, composition, lambda: None if composition.runtime.work_policy is not None else (
+        composition.catalog.require_activation(), composition.runtime.validate_startup(),
+    ))
+
+
+def _preactivation_application(composition):
+    app = FastAPI(title="FA operator preactivation (admissions CLOSED)", docs_url=None, redoc_url=None, openapi_url=None)
+    _install_error_handlers(app)
+    _health(app, preactivation=True)
+    callbacks = behavior_router(composition.runtime, composition.verifier)
+    callbacks.routes[:] = [route for route in callbacks.routes if "/hosted/launches/" in route.path]
+    app.include_router(callbacks)
+    identity = _principal_dependency(composition.verifier)
+
+    @app.get("/behavior/v1/operator/prerequisites")
+    @app.get("/behavior/v1/operator/config-check")
+    def prerequisites(principal=Depends(identity)):
+        principal.require(composition.config.identity.team_id, "read")
+        if principal.kind != "human" or principal.oid != composition.config.identity.human_oid:
+            raise Problem(403, "BEHAVIOR_ACCESS_DENIED", "only the configured operator may inspect prerequisites")
+        return _response({
+            "admissions": "CLOSED", "configuration_sha256": composition.config.sha256,
+            "control_binding": composition.runtime.store._binding,
+            "worker_configuration_digest": composition.runtime.dep.workers.configuration_digest(),
+            "delivery_configuration_digest": composition.runtime.dep.delivery.configuration_digest(),
+            "prerequisite_verification": "OPERATOR_EVIDENCE_REQUIRED", "actual_environment": "NOT_RUN",
+        })
+    return _lifespan(app, composition, lambda: None)
 
 
 def create_production_app():
@@ -979,35 +1031,55 @@ def _validate_approval(composition, approval):
     if approval.authorizing_human_oid != config.identity.human_oid or approval.configuration_sha256 != config.sha256:
         raise Problem(403, "BEHAVIOR_BOOTSTRAP_DENIED", "operator approval is not for this exact configuration")
     _fresh(approval.not_before, approval.expires_at, now, 86400)
-    grants = {g.job_id: g for g in approval.native_grants}
-    if len(grants) != len(approval.native_grants) or set(grants) != {job.job_id for _, job in config.registered_jobs}:
-        raise Problem(403, "BEHAVIOR_BOOTSTRAP_DENIED", "every exact job needs separate launch authorization")
+    grants = _grants_by_job(config, approval)
     policies = {p.binding_id: p.policy for p in config.policies}
     for binding, job in config.registered_jobs:
         grant = grants[job.job_id]
         body = (composition.runtime.job_input(binding) if job.job_id == binding.job_id
                 else executor_job_input(job.job_id, job.work))
-        if (grant.grant_id != native_key("bootstrap-grant", job.job_id)
+        if _grant_not_for_workload(grant, binding, job, config, policies, body) or _grant_outside_window(
+                grant, binding, approval, policies, config, body, now):
+            raise Problem(403, "BEHAVIOR_BOOTSTRAP_DENIED", "native grant exceeds the exact workload/input/agent authorization")
+        _check_checkpoint_grant(grant, binding, job, len(body))
+    return grants
+
+
+def _grants_by_job(config, approval):
+    grants = {g.job_id: g for g in approval.native_grants}
+    if len(grants) != len(approval.native_grants) or set(grants) != {job.job_id for _, job in config.registered_jobs}:
+        raise Problem(403, "BEHAVIOR_BOOTSTRAP_DENIED", "every exact job needs separate launch authorization")
+    return grants
+
+
+def _check_checkpoint_grant(grant, binding, job, body_length):
+    if binding.child_jobs and job.job_id == binding.job_id and (
+        grant.checkpoint_after_bytes is None or grant.checkpoint_after_bytes >= body_length
+        or grant.remaining_uses < 2
+    ):
+        raise Problem(403, "BEHAVIOR_BOOTSTRAP_DENIED", "registered-child parent requires a partial checkpoint and a resume grant")
+    if job.job_id != binding.job_id and grant.checkpoint_after_bytes is not None:
+        raise Problem(403, "BEHAVIOR_BOOTSTRAP_DENIED", "registered leaf child cannot park without its own dependency contract")
+
+
+def _grant_not_for_workload(grant, binding, job, config, policies, body):
+    """The grant names another identity, policy, definition, input, workload or target than the exact job."""
+    return bool(grant.grant_id != native_key("bootstrap-grant", job.job_id)
                 or grant.controller_id != config.controller_id or grant.owner != binding.owner
                 or grant.policy_revision != policies[binding.binding_id].operation_policy_revision
                 or grant.definition != job.work or grant.input_digest != hashlib.sha256(body).hexdigest()
                 or grant.workload_version != config.workload_version
                 or config.workload_version == "assistant-v1.2" and grant.checkpoint_after_bytes is not None
-                or grant.targets != config.active_targets or not grant.active
+                or grant.targets != config.active_targets)
+
+
+def _grant_outside_window(grant, binding, approval, policies, config, body, now):
+    """The grant is inactive, over its use cap, expired, outside the approval's window or checkpoints past the input."""
+    return bool(not grant.active
                 or not 1 <= grant.remaining_uses <= config.workers.max_generations
                 or now >= policies[binding.binding_id].valid_until
                 or grant.not_before < approval.not_before or grant.expires_at > approval.expires_at
                 or not grant.not_before <= now < grant.expires_at
-                or grant.checkpoint_after_bytes is not None and grant.checkpoint_after_bytes > len(body)):
-            raise Problem(403, "BEHAVIOR_BOOTSTRAP_DENIED", "native grant exceeds the exact workload/input/agent authorization")
-        if binding.child_jobs and job.job_id == binding.job_id and (
-            grant.checkpoint_after_bytes is None or grant.checkpoint_after_bytes >= len(body)
-            or grant.remaining_uses < 2
-        ):
-            raise Problem(403, "BEHAVIOR_BOOTSTRAP_DENIED", "registered-child parent requires a partial checkpoint and a resume grant")
-        if job.job_id != binding.job_id and grant.checkpoint_after_bytes is not None:
-            raise Problem(403, "BEHAVIOR_BOOTSTRAP_DENIED", "registered leaf child cannot park without its own dependency contract")
-    return grants
+                or grant.checkpoint_after_bytes is not None and grant.checkpoint_after_bytes > len(body))
 
 
 def _probe_layout(config):
@@ -1290,6 +1362,63 @@ def create_recovery_app():
     return recovery_application(load_configuration(recovery=True))
 
 
+def _count_problems(problems, results):
+    """Count each item's problem code in ``problems``: at most 32 distinct codes, then ``OTHER_PROBLEMS``."""
+    for item in results:
+        code = item.get("problem")
+        if code is None:
+            continue
+        if not isinstance(code, str) or re.fullmatch(r"[A-Z0-9_]{1,96}", code) is None:
+            code = "BEHAVIOR_DEPENDENCY_UNAVAILABLE"
+        if code not in problems and len(problems) >= 32:
+            code = "OTHER_PROBLEMS"
+        problems[code] = problems.get(code, 0) + 1
+
+
+def _start_controller(composition, runtime, preactivation):
+    composition.installation()
+    if preactivation:
+        composition.catalog.worker()
+        runtime.dep.workers._ready()
+        runtime.dep.workers.pending()
+    else:
+        composition.catalog.require_activation()
+        runtime.validate_startup()
+
+
+def _pending_binding(composition, runtime, root):
+    """The one authenticated-pull binding of this root that may defer a nonready new delivery page, else None."""
+    if not (composition.config.workload_version == "assistant-v1.2"
+            and composition.assistant is not None and composition.config.workers.capacity == 1
+            and len(runtime.bindings) == 1):
+        return None
+    candidate = next(iter(runtime.bindings.values()))
+    if (candidate.binding_id in runtime.profiles and candidate.route.channel_id == "authenticated-pull"
+            and candidate.owner.root_budget_id == root.root_budget_id):
+        return candidate
+    return None
+
+
+def _drain_deliveries(composition, runtime, limits, problems, stopping):
+    """One delivery page per root that has pending deliveries; the number of items drained."""
+    items = 0
+    for root in composition.config.roots:
+        if stopping():
+            break
+        index_key = control_key("delivery-index", root.root_budget_id)
+        rows = runtime.store.read_snapshot((index_key, pending_head_key(root.root_budget_id)))
+        if not pending_counts(runtime.dep.delivery, rows, root.root_budget_id)[0]:
+            continue
+        pending_binding = _pending_binding(composition, runtime, root)
+        page = DeliveryConsumer(runtime.dep.delivery).drain(
+            root.root_budget_id, runtime.resolve_owner, composition.config.controller_id, limit=limits.page_limit,
+            **({"pending_binding": pending_binding} if pending_binding is not None else {}),
+        )
+        items += len(page)
+        _count_problems(problems, page)
+    return items
+
+
 def run_controller(composition, *, limits=None, preactivation=False, stop_requested=lambda: False,
                    monotonic=time.monotonic, sleep=time.sleep):
     """Foreground bounded ticks. No threads, models, HTTP-selected code or blind resend.
@@ -1309,54 +1438,19 @@ def run_controller(composition, *, limits=None, preactivation=False, stop_reques
         began, ticks, worker_items, delivery_items = monotonic(), 0, 0, 0
         problems = {}
 
-        def count_problems(results):
-            for item in results:
-                code = item.get("problem")
-                if code is None:
-                    continue
-                if not isinstance(code, str) or re.fullmatch(r"[A-Z0-9_]{1,96}", code) is None:
-                    code = "BEHAVIOR_DEPENDENCY_UNAVAILABLE"
-                if code not in problems and len(problems) >= 32:
-                    code = "OTHER_PROBLEMS"
-                problems[code] = problems.get(code, 0) + 1
+        def stopping():
+            return stop_requested() or monotonic() - began >= limits.max_run_seconds
 
-        composition.installation()
-        if preactivation:
-            composition.catalog.worker()
-            runtime.dep.workers._ready()
-            runtime.dep.workers.pending()
-        else:
-            composition.catalog.require_activation()
-            runtime.validate_startup()
+        _start_controller(composition, runtime, preactivation)
         for tick in range(limits.ticks):
-            if stop_requested() or monotonic() - began >= limits.max_run_seconds:
+            if stopping():
                 break
             composition.catalog.worker() if preactivation else composition.catalog.require_activation()
             result = runtime.controller.drain(limit=limits.page_limit)
             worker_items += len(result)
-            count_problems(result)
+            _count_problems(problems, result)
             if not preactivation:
-                for root in composition.config.roots:
-                    if stop_requested() or monotonic() - began >= limits.max_run_seconds:
-                        break
-                    index_key = control_key("delivery-index", root.root_budget_id)
-                    rows = runtime.store.read_snapshot((index_key, pending_head_key(root.root_budget_id)))
-                    if not pending_counts(runtime.dep.delivery, rows, root.root_budget_id)[0]:
-                        continue
-                    pending_binding = None
-                    if (composition.config.workload_version == "assistant-v1.2"
-                            and composition.assistant is not None and composition.config.workers.capacity == 1
-                            and len(runtime.bindings) == 1):
-                        candidate = next(iter(runtime.bindings.values()))
-                        if (candidate.binding_id in runtime.profiles and candidate.route.channel_id == "authenticated-pull"
-                                and candidate.owner.root_budget_id == root.root_budget_id):
-                            pending_binding = candidate
-                    page = DeliveryConsumer(runtime.dep.delivery).drain(
-                        root.root_budget_id, runtime.resolve_owner, composition.config.controller_id, limit=limits.page_limit,
-                        **({"pending_binding": pending_binding} if pending_binding is not None else {}),
-                    )
-                    delivery_items += len(page)
-                    count_problems(page)
+                delivery_items += _drain_deliveries(composition, runtime, limits, problems, stopping)
             ticks += 1
             if tick + 1 < limits.ticks and not stop_requested():
                 remaining = limits.max_run_seconds - (monotonic() - began)

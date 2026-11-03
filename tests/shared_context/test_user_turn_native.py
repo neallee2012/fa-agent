@@ -24,6 +24,7 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_user_turn import UserTurnRead
 from shared_context.behavior_user_turn_prompt import USER_TURN_CAPABILITIES, USER_TURN_PROFILE
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
@@ -194,7 +195,7 @@ def test_compacted_new_runtime_reads_saved_user_original_not_summary(assistant, 
         destination.mkdir(parents=True, exist_ok=True)
         (destination / "user-original-native.json").write_text(json.dumps({
             "scope": "fixed SDK compaction/restore/custom tool plus real signed local API; scripted offline provider",
-            "sdk_version": importlib.metadata.version("github-copilot-sdk"), "runtime_version": "1.0.83",
+            "sdk_version": importlib.metadata.version("github-copilot-sdk"), "runtime_version": RUNTIME_VERSION,
             "requests": calls, "graceful_stops": [bridge._sdk_stop.model_dump(mode="json") for bridge in bridges],
             "force_stop_calls": 0, "prefix_sha256": prefix.record.prefix_sha256,
             "prefix_utf8_bytes": prefix.record.prefix_utf8_bytes, "original_sha256": reads[0].source.sha256,

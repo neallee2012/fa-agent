@@ -21,7 +21,8 @@ def _sender(principal: BehaviorPrincipal, scope: ServerAgentScope, receipt: Nati
     if (principal.kind != "agent" or principal.tenant_id != str(scope.tenant_id)
             or principal.oid != str(scope.identity.oid) or principal.actor_id != scope.identity.actor
             or receipt.agent_id != scope.target.agent_id
-            or status is not None and (receipt.status != status or receipt.cancel_requested)):
+            # A stop that came after the answer was saved leaves it completed with cancel_requested (#1145).
+            or status is not None and (receipt.status != status or status == "started" and receipt.cancel_requested)):
         raise Problem(403, "NATIVE_AGENT_SOURCE_INVALID", "the original turn must belong to the verified sending Agent")
 
 

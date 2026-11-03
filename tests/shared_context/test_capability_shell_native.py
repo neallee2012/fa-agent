@@ -1,4 +1,4 @@
-"""Pinned SDK 1.0.13 / runtime 1.0.83: the model's run_command reaches the Hosted shell and its result returns.
+"""Pinned SDK 1.0.26 / runtime 1.0.103: the model's run_command reaches the Hosted shell and its result returns.
 
 Linux only (the desktop image as UID10001); scripted provider, no network or model.
 """

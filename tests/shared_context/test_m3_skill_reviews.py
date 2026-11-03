@@ -12,17 +12,14 @@ from azure.data.tables import TableClient
 
 from conftest import A, C, TENANT
 from shared_context.errors import Problem
-from shared_context.m3_client import ArtifactClient
+from shared_context.m3_auth import HumanApprover
 from shared_context.m3_models import (
     MAX_ARTIFACT_VERSIONS, MAX_SKILL_REVIEW_ENTRIES, ApprovalInput, CreateArtifact, SkillDeactivationInput,
     SkillReviewEntry, SkillReviewList, SkillReviewVersion, VersionInput,
 )
 from shared_context.storage import TableRepository
 from test_adapters import Credential, WireTransport
-from test_m3_api import client
 from test_m3_artifacts import HUMAN, V1, V2, m3
-from test_m3_auth import jwk_client, signing_key, token
-from test_skill_purpose import signed_m3
 
 BODY = b"SKILL_REVIEW_BODY_CANARY: follow the reviewed receipt.\n"
 DEACTIVATION = "a" * 32
@@ -36,12 +33,6 @@ EXPECTED = {
     "redraft": ("awaiting_decision", None, None, (V1,)),
     "rejected-update": ("rejected", "reject", V1, ()),
 }
-CLI = [
-    "--api", "https://poc.example.westus3.azurecontainerapps.io",
-    "--tenant", "11111111-1111-1111-1111-111111111111",
-    "--audience", "api://22222222-2222-2222-2222-222222222222",
-    "--client-id", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "--team", HUMAN.team, "list",
-]
 
 
 def add_version(service, name, version_id=V1, body=BODY):
@@ -104,11 +95,8 @@ def test_review_list_reports_each_skill_state_without_bodies_or_writes(m3):
     before = copy.deepcopy(repository.data)
     for principal in (HUMAN, A):
         with patch.object(store, "read", side_effect=AssertionError("the review list must not read skill bodies")):
-            response = client(service, principal).get("/teams/team-one/skill-reviews")
-        assert response.status_code == 200, response.text
-        assert response.headers["cache-control"] == "no-store"
-        assert "SKILL_REVIEW_BODY_CANARY" not in response.text
-        listed = SkillReviewList.model_validate_json(response.content)
+            listed = service.skill_reviews(principal, A.team)
+        assert "SKILL_REVIEW_BODY_CANARY" not in listed.model_dump_json()
         assert listed.team == A.team and listed.after is None and listed.next_after is None
         assert observed(listed.entries) == EXPECTED
         latest = {entry.artifact_id: entry.latest_version for entry in listed.entries}
@@ -123,12 +111,9 @@ def test_pages_cover_every_skill_once_even_when_deliverables_fill_a_page(m3, mon
     service, _, store = m3
     review_fixture(service, store)
     monkeypatch.setattr("shared_context.m3_artifacts.MAX_SKILL_REVIEW_ENTRIES", 2)
-    http = client(service, HUMAN)
     pages, after = [], None
     while True:
-        response = http.get("/teams/team-one/skill-reviews" + ("" if after is None else "?after=" + after))
-        assert response.status_code == 200, response.text
-        page = SkillReviewList.model_validate_json(response.content)
+        page = service.skill_reviews(HUMAN, A.team, after)
         assert page.after == after and len(page.entries) <= 2
         pages.append(page)
         if page.next_after is None:
@@ -138,24 +123,22 @@ def test_pages_cover_every_skill_once_even_when_deliverables_fill_a_page(m3, mon
     entries = [entry for page in pages for entry in page.entries]
     assert [entry.artifact_id for entry in entries] == sorted(EXPECTED)
     assert observed(entries) == EXPECTED
-    consumer = ArtifactClient(http, HUMAN.team, lambda: "synthetic-token")
-    assert consumer.all_skill_reviews() == tuple(entries)
-    for query in ("?after=..%2Fx", "?after=a&after=b", "?kind=skill"):
-        assert http.get("/teams/team-one/skill-reviews" + query).status_code == 422
+    with pytest.raises(Problem) as invalid:
+        service.skill_reviews(HUMAN, A.team, "../x")
+    assert invalid.value.status == 422
 
 
-def test_review_list_keeps_existing_team_authorization(m3, signing_key, jwk_client):
+def test_review_list_keeps_existing_team_authorization(m3):
     service, _, _ = m3
     artifact(service, "guide")
-    http, agent, human = signed_m3(service, signing_key, jwk_client)
-    other_team = {"Authorization": "Bearer " + token(signing_key, {"oid": C.oid})}
-    with http:
-        assert http.get("/teams/team-one/skill-reviews", headers=human).status_code == 200
-        assert http.get("/teams/team-one/skill-reviews", headers=agent).status_code == 200
-        assert http.get("/teams/team-one/skill-reviews").status_code == 401
-        assert http.get("/teams/team-one/skill-reviews", headers=other_team).status_code == 403
-        denied = http.get("/teams/team-two/skill-reviews", headers=human)
-        assert denied.status_code == 403 and denied.json()["error"]["code"] == "M3_TEAM_DENIED"
+    assert [entry.artifact_id for entry in service.skill_reviews(HUMAN, A.team).entries] == ["guide"]
+    assert [entry.artifact_id for entry in service.skill_reviews(A, A.team).entries] == ["guide"]
+    with pytest.raises(Problem) as other_team:
+        service.skill_reviews(C, A.team)
+    assert other_team.value.status == 403
+    with pytest.raises(Problem) as denied:
+        service.skill_reviews(HumanApprover(HUMAN.oid, C.team), C.team)
+    assert denied.value.status == 403 and denied.value.body["error"]["code"] == "M3_TEAM_DENIED"
 
 
 @pytest.mark.parametrize("change", ["unknown-field", "row-identity"])
@@ -173,7 +156,7 @@ def test_review_list_refuses_unverifiable_state(m3, change):
     assert denied.value.status == 502 and denied.value.body["error"]["code"] == "M3_STATE_INVALID"
 
 
-def test_worst_case_page_fits_the_client_response_limit():
+def test_worst_case_page_fits_one_64k_response():
     version = SkillReviewVersion(version_id=V1, number=MAX_ARTIFACT_VERSIONS, sha256="a" * 64,
                                  metadata_sha256="b" * 64, created_at="x" * 64, decision="approve")
     entries = tuple(SkillReviewEntry(
@@ -183,21 +166,6 @@ def test_worst_case_page_fits_the_client_response_limit():
     ) for index in range(MAX_SKILL_REVIEW_ENTRIES))
     page = SkillReviewList(team="t" * 64, after="0" * 64, entries=entries, next_after="z" * 64)
     assert len(json.dumps(page.model_dump(mode="json"), ensure_ascii=False).encode("utf-8")) < 64 * 1024
-
-
-def test_client_rejects_a_page_for_another_request_or_cacheable_page(m3):
-    service, _, store = m3
-    review_fixture(service, store)
-    listed = service.skill_reviews(HUMAN, HUMAN.team).model_dump(mode="json")
-    for headers, body in (({}, listed), ({"Cache-Control": "no-store"}, {**listed, "team": "team-two"}),
-                          ({"Cache-Control": "no-store"}, {**listed, "after": "awaiting"})):
-        transport = httpx.MockTransport(lambda request, headers=headers, body=body: httpx.Response(
-            200, headers=headers, json=body))
-        stale = ArtifactClient(httpx.Client(transport=transport, base_url="https://m3.invalid"),
-                               HUMAN.team, lambda: "synthetic-token")
-        with pytest.raises(Problem) as invalid:
-            stale.skill_reviews()
-        assert invalid.value.body["error"]["code"] == "M3_RESPONSE_INVALID"
 
 
 def table(responses):

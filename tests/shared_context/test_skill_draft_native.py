@@ -25,6 +25,7 @@ from shared_context.behavior_skill_draft import HISTORY_SKILL_DRAFT_PROFILE, SKI
 from shared_context.behavior_skill_draft_prompt import SKILL_DRAFT_CAPABILITIES
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
 from test_instruction_flow import instruction_models
@@ -122,7 +123,7 @@ def test_fixed_sdk_saves_user_procedure_as_one_unapproved_skill_draft(assistant,
         completed = h.runtime.controller.step(accepted["binding_id"])
         assert completed.state == "succeeded" and completed.result_forwarded
         assert len(bridges) == len(options) == 1 and len(requests) == 2 and len(receipts) == 1
-        assert bridges[0]._sdk_stop.graceful and bridges[0]._sdk_stop.runtime_version == "1.0.83"
+        assert bridges[0]._sdk_stop.graceful and bridges[0]._sdk_stop.runtime_version == RUNTIME_VERSION
         assert force_stops == []
         assert options[0]["available_tools"].to_list() == ["custom:" + name for name in capabilities]
         assert options[0]["excluded_tools"].to_list() == ["builtin:*", "mcp:*"]
@@ -158,4 +159,4 @@ def test_fixed_sdk_saves_user_procedure_as_one_unapproved_skill_draft(assistant,
             "paid_model_requests": 0,
             "cloud_requests": 0,
         }))
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION

@@ -16,11 +16,12 @@ from .behavior_attachments import TextAttachmentProfile
 from .behavior_capabilities import CapabilityRef, validate_refs
 from .behavior_text_files import UserTextFileProfile
 from .behavior_turn_origin import TurnOriginProfile
-from .behavior_wire import Digest, Identifier, SdkStartProfile, WireModel, WorkerProfile
+from .behavior_wire import Digest, Identifier, SdkStartProfile, WireModel, WorkerProfile, known_release, same_but_release
 from .errors import Problem
 from .m3_models import VersionId
 from .m3_skills import PurposeSkillCatalog, SkillSelection, validate_selection
-from .native_responses_wire import UNLABELED_STATE_PROFILE, NativeStateProfile, unlabeled_profile
+from .native_responses_wire import SENT_RELEASE, UNLABELED_STATE_PROFILE, NativeStateProfile, unlabeled_profile
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 if TYPE_CHECKING:
     from .behavior_assistant import AssistantAuthority
@@ -53,8 +54,9 @@ class TemplateRole(WireModel):
 
 
 class TemplateSettings(WireModel):
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]  # API-written: the send profile's pair (ADR-0009 §3 (c))
+    runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
+    _release = model_validator(mode="after")(known_release)
     mode: Literal["empty"] = "empty"
     checkpoint_profile: CheckpointProfile | None = None
     model_provider: ModelProvider | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -216,7 +218,7 @@ def inspect_template(imported: AgentTemplate, current: AgentTemplate) -> Templat
     results.extend(TemplateSkillInspection(name=name, status="unresolved_reference") for name in imported.unavailable_skills)
     selected_names = {item.name for item in imported.skills} | set(imported.unavailable_skills)
     current_names = set(available) | set(current.unavailable_skills)
-    role_matches, settings_match = imported.role == current.role, imported.settings == current.settings
+    role_matches, settings_match = imported.role == current.role, same_but_release(imported.settings, current.settings)
     selection_matches = selected_names == current_names
     return TemplateInspection(
         template_sha256=hashlib.sha256(imported.model_dump_json().encode("utf-8")).hexdigest(),

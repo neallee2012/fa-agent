@@ -2,6 +2,7 @@
 
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime
 from time import monotonic
 from typing import Annotated, Literal
@@ -110,6 +111,41 @@ def _scoped(control, agent_id, record, model):
 def _write(key, value, record):
     return ControlWrite(row_id=key, mode="create" if record is None else "replace",
                         data=value.model_dump(mode="json"))
+
+
+@dataclass(frozen=True)
+class _TriggeredRun:
+    """One clock trigger of one occurrence; fixed once its RID is known."""
+    clock: NativeRoutineApiClock
+    agent_id: str
+    command: NativeRoutineTrigger
+    composition: object
+    control: object
+    raw_client: object
+    rid: str
+
+
+@dataclass
+class _ReminderRead:
+    """One read of a conversation's reminders: what it asks and the page it collects, by RID."""
+    control: object
+    agent_id: str
+    command: NativeReminderQuery
+    read_turn: object
+    actionable_only: bool
+    now: datetime
+    values: dict = field(default_factory=dict)
+    turns: dict = field(default_factory=dict)
+    issues: list = field(default_factory=list)
+
+    def page(self):
+        after = self.command.after
+        selected = sorted(key for key in self.values.keys() | self.turns.keys() if after is None or key > after)
+        return NativeWorkReminders(
+            reminders=tuple(self.values[key] for key in selected[:20] if key in self.values),
+            routine_turns=tuple(self.turns[key] for key in selected[:20] if key in self.turns),
+            next_after=selected[19] if len(selected) > 20 else None,
+            issues=tuple(self.issues) if after is None else ())
 
 
 class NativeRoutineService:
@@ -426,6 +462,14 @@ class NativeRoutineService:
             return None
 
     def _reminders(self, control, agent_id, command, read_turn, *, actionable_only=False):
+        read = _ReminderRead(control, agent_id, command, read_turn, actionable_only, now=control.runtime._now())
+        for definition, head in self._reminder_sources(control, agent_id):
+            for rid in self._run_references(agent_id, definition, head):
+                self._observe_run(read, definition, rid)
+            self._project_reminder(read, definition)
+        return read.page()
+
+    def _reminder_sources(self, control, agent_id):
         def definitions():
             self._current(control)
             index = _scoped(control, agent_id, control.store.read_record(routine_key(control, "index", "definitions")), NativeRoutineIndex)
@@ -437,67 +481,70 @@ class NativeRoutineService:
                 values.append((definition, head))
             return values
 
-        values, turns, issues = {}, {}, []
-        now = control.runtime._now()
-        for definition, head in control.store.consistent_read(definitions):
-            references = set(head.pending)
-            if head.last_scheduled_for is not None:
-                references.add(native_routine_request_id(
-                    definition.tenant_id, definition.team_id, agent_id, definition.routine_id, head.last_scheduled_for))
-            for rid in sorted(references):
-                intent = self._intent(control, agent_id, rid)
-                if intent is None:
-                    raise Problem(409, "NATIVE_ROUTINE_INVALID", "the original scheduled reference has no retained intent")
-                submission = intent.submission
-                if submission.command.conversation_id is not None:
-                    _check_run_conversation(submission, self._version(
-                        control, agent_id, submission.routine.occurrence.approved_version))
-                # A run is observed in its own conversation; one without a receipt yet (it has no conversation to
-                # read) stays an issue in the conversation its routine was approved in.
-                if command.conversation_id not in (submission.routine.conversation_id, definition.conversation_id):
-                    continue
-                original = self._reminder_receipt(read_turn, definition.routine_id, rid, issues)
-                if original is None:
-                    continue
-                if (original.agent_id != agent_id or original.conversation_id != submission.routine.conversation_id
-                        or not _same_occurrence(original, submission)):
-                    raise Problem(409, "NATIVE_ROUTINE_CONFLICT", "the scheduled observation differs from its original receipt")
-                observed = self._dispatch(original)
-                if original.conversation_id != command.conversation_id:
-                    # The owner's approval conversation also lists a run still needing attention (an approval card,
-                    # a question or no final state yet), naming the run's own conversation; the Agent's prompt does not.
-                    if actionable_only or not observed.needs_attention:
-                        continue
-                elif actionable_only and not observed.needs_attention:
-                    continue
-                turns[rid] = observed
-            if not definition.enabled or definition.kind != "reminder" or definition.conversation_id != command.conversation_id:
-                continue
-            due = self._due_time(definition, now, issues)
-            if due is None or due > now or due < definition.approved_at:
-                continue
-            original = self._reminder_receipt(read_turn, definition.routine_id, definition.related_request_id, issues)
-            if original is None:
-                continue
-            if (original.agent_id, original.conversation_id) != (agent_id, command.conversation_id):
-                raise Problem(403, "NATIVE_ROUTINE_SCOPE", "the original reminder target belongs to another conversation")
-            if (original.cancel_requested or original.failure_code == "NATIVE_TURN_CANCELLED"
-                    or original.status in {"completed", "busy_refused"}):
-                continue
-            if original.request_id in values and values[original.request_id].scheduled_for >= due:
-                continue
-            values[original.request_id] = NativeWorkReminder(
-                routine_id=definition.routine_id,
-                occurrence_id=native_routine_request_id(
-                    definition.tenant_id, definition.team_id, agent_id, definition.routine_id, due),
-                scheduled_for=due, agent_id=agent_id, conversation_id=original.conversation_id, request_id=original.request_id,
-                status=original.status, failure_code=original.failure_code)
-        selected = sorted(key for key in values.keys() | turns.keys() if command.after is None or key > command.after)
-        return NativeWorkReminders(
-            reminders=tuple(values[key] for key in selected[:20] if key in values),
-            routine_turns=tuple(turns[key] for key in selected[:20] if key in turns),
-            next_after=selected[19] if len(selected) > 20 else None,
-            issues=tuple(issues) if command.after is None else ())
+        return control.store.consistent_read(definitions)
+
+    @staticmethod
+    def _run_references(agent_id, definition, head):
+        references = set(head.pending)
+        if head.last_scheduled_for is not None:
+            references.add(native_routine_request_id(
+                definition.tenant_id, definition.team_id, agent_id, definition.routine_id, head.last_scheduled_for))
+        return sorted(references)
+
+    def _observe_run(self, read, definition, rid):
+        """Lists one scheduled run of ``definition`` in ``read.turns`` when this conversation should see it."""
+        control, agent_id, command = read.control, read.agent_id, read.command
+        intent = self._intent(control, agent_id, rid)
+        if intent is None:
+            raise Problem(409, "NATIVE_ROUTINE_INVALID", "the original scheduled reference has no retained intent")
+        submission = intent.submission
+        if submission.command.conversation_id is not None:
+            _check_run_conversation(submission, self._version(
+                control, agent_id, submission.routine.occurrence.approved_version))
+        # A run is observed in its own conversation; one without a receipt yet (it has no conversation to
+        # read) stays an issue in the conversation its routine was approved in.
+        if command.conversation_id not in (submission.routine.conversation_id, definition.conversation_id):
+            return
+        original = self._reminder_receipt(read.read_turn, definition.routine_id, rid, read.issues)
+        if original is None:
+            return
+        if (original.agent_id != agent_id or original.conversation_id != submission.routine.conversation_id
+                or not _same_occurrence(original, submission)):
+            raise Problem(409, "NATIVE_ROUTINE_CONFLICT", "the scheduled observation differs from its original receipt")
+        observed = self._dispatch(original)
+        if original.conversation_id != command.conversation_id:
+            # The owner's approval conversation also lists a run still needing attention (an approval card,
+            # a question or no final state yet), naming the run's own conversation; the Agent's prompt does not.
+            if read.actionable_only or not observed.needs_attention:
+                return
+        elif read.actionable_only and not observed.needs_attention:
+            return
+        read.turns[rid] = observed
+
+    def _project_reminder(self, read, definition):
+        """Keeps in ``read.values`` the latest due reminder ``definition`` raises on unfinished work."""
+        agent_id, command, now = read.agent_id, read.command, read.now
+        if not definition.enabled or definition.kind != "reminder" or definition.conversation_id != command.conversation_id:
+            return
+        due = self._due_time(definition, now, read.issues)
+        if due is None or due > now or due < definition.approved_at:
+            return
+        original = self._reminder_receipt(read.read_turn, definition.routine_id, definition.related_request_id, read.issues)
+        if original is None:
+            return
+        if (original.agent_id, original.conversation_id) != (agent_id, command.conversation_id):
+            raise Problem(403, "NATIVE_ROUTINE_SCOPE", "the original reminder target belongs to another conversation")
+        if (original.cancel_requested or original.failure_code == "NATIVE_TURN_CANCELLED"
+                or original.status in {"completed", "busy_refused"}):
+            return
+        if original.request_id in read.values and read.values[original.request_id].scheduled_for >= due:
+            return
+        read.values[original.request_id] = NativeWorkReminder(
+            routine_id=definition.routine_id,
+            occurrence_id=native_routine_request_id(
+                definition.tenant_id, definition.team_id, agent_id, definition.routine_id, due),
+            scheduled_for=due, agent_id=agent_id, conversation_id=original.conversation_id, request_id=original.request_id,
+            status=original.status, failure_code=original.failure_code)
 
     def check(self, principal, command):
         command = NativeRoutineCheck.model_validate_json(command.model_dump_json())
@@ -563,7 +610,6 @@ class NativeRoutineService:
     def trigger(self, clock, agent_id, command):
         from .behavior_team_registry import resolve_agent_scope
         from .behavior_native_sessions import native_sessions
-        from .behavior_native_turn_wire import NativeEnvironmentCommand
 
         command = NativeRoutineTrigger.model_validate_json(command.model_dump_json())
         self._clock(clock)
@@ -572,50 +618,20 @@ class NativeRoutineService:
         control = composition.runtime.work_policy
         self._current(control)
         binding = control.policy.template
-        rid = native_routine_request_id(
-            binding.tenant_id, binding.team_id, agent_id, command.routine_id, command.scheduled_for)
-        intent = self._intent(control, agent_id, rid)
+        run = _TriggeredRun(clock, agent_id, command, composition, control, raw_client, native_routine_request_id(
+            binding.tenant_id, binding.team_id, agent_id, command.routine_id, command.scheduled_for))
+        intent = self._intent(control, agent_id, run.rid)
         sessions = native_sessions(composition)
-        environment_command = None
-        try:
-            # A routine dispatches work, so (like an owner submit) the selector is read in this request.
-            client = sessions.current(raw_client, checked_since=monotonic())
-        except Problem as error:
-            if error.body["error"]["code"] not in {"NATIVE_SESSION_CHANGED", "AGENT_VERSION_FOLLOWING"}:
-                raise
-            candidate_definition = (self._current_definition(control, agent_id, command.routine_id) if intent is None
-                                    else self._version(control, agent_id, intent.submission.routine.occurrence.approved_version))
-            self._active_definition(control, agent_id, candidate_definition)
-            version = sessions.selected_version(raw_client)
-            environment_command = NativeEnvironmentCommand(
-                request_id=material_digest({"routine_environment": agent_id, "version": version}),
-                expected_agent_version=version, idle_only=True)
-
-            def authorize_environment():
-                self._clock(clock)
-                self._active_definition(control, agent_id, candidate_definition)
-
-            if sessions.guard.enforce:
-                client = self._switched(sessions, raw_client, environment_command, authorize_environment, rid)
-                environment_command = None
-            else:
-                client = sessions._destination(raw_client, version, authorize_environment)
-        original = self._original(client, rid)
+        client, environment_command = self._located(run, sessions, intent)
+        original = self._original(client, run.rid)
         if original is not None and (intent is None or not _same_occurrence(original, intent.submission)):
             raise Problem(409, "NATIVE_ROUTINE_CONFLICT", "the original native receipt has another source")
         if original is not None and original.status != "accepted":
-            NativeTurnGateway._accounted(control, (original, None), composition)
-            self._settle(control, original)
-            return self._dispatch(original)
-        definition = (self._current_definition(control, agent_id, command.routine_id) if intent is None else
-                      self._version(control, agent_id, intent.submission.routine.occurrence.approved_version))
+            return self._finished(run, original)
+        definition = self._run_definition(run, intent)
         if definition.kind != "routine":
             raise Problem(403, "NATIVE_ROUTINE_ATTENTION_ONLY", "reminders only project their original work; no turn is started")
-
-        def current():
-            self._clock(clock)
-            self._active_definition(control, agent_id, definition)
-
+        current = self._authorization(run, definition)
         current()
         # The conversation the owner approved the routine in; it still gives each run its model.
         home, _ = NativeTurnGateway._invoke(
@@ -626,73 +642,134 @@ class NativeRoutineService:
         if continuing and environment_command is None:
             NativeTurnGateway._same_session(client, home)
         if intent is None:
-            scheduled = _occurrence(definition.schedule, command.scheduled_for, control.runtime._now())
-            if scheduled < definition.approved_at:
-                raise Problem(409, "ROUTINE_OCCURRENCE_STALE", "an unregistered occurrence predating approval cannot be backfilled")
-            # The model the owner runs in the routine's conversation, not the project default.
-            submitted = NativeAgentCommand(request_id=rid, content=definition.content, model=home.capture.model.id)
-            # Settings come from the conversation the owner approved the routine in, as before 2026-10-23, never the
-            # Team's current new-conversation template: role, skills, capabilities, connectors and channel stay the
-            # approved ones. Only the conversation is new (resolved with home's CID, sent without one).
-            capture = resolve_routine_capture(
-                control, composition.assistant.authority,
-                submitted.model_copy(update={"conversation_id": definition.conversation_id}), conversation=home,
-                authorize=current)
-            # The profile submit_native_turn recomputes for a new conversation; the intent carries the same one.
-            profile = turn_profile(capture)
-            # The run's CID is fixed in the intent below, so every retry of this RID reuses it.
-            # shortcut: a lost reserve race or a crash before the reserve leaves one empty platform conversation that
-            # nothing lists or reads (logged below when the process survives); reserve the CID before creating it if
-            # that ever matters.
-            cid = (open_conversation(platform_client(composition, client), before_send=current)
-                   if profile == NATIVE_RESPONSES_PROFILE else "native-" + uuid4().hex)
-            orphaned = profile == NATIVE_RESPONSES_PROFILE
-            try:
-                intent = self._reserve(control, agent_id, definition, NativeRoutineSubmit(
-                    command=submitted, capture=capture,
-                    routine=routine_origin_for(definition, scheduled, conversation_id=cid), state_profile=profile))
-                orphaned = orphaned and intent.submission.routine.conversation_id != cid
-            finally:
-                if orphaned:
-                    logging.getLogger(__name__).warning(
-                        "FA_NATIVE_ROUTINE_CONVERSATION_UNUSED rid=%s conversation=%s", rid[:12], cid[:12])
+            intent = self._new_intent(run, client, definition, home, current)
         submission = intent.submission
-        if environment_command is not None:
-            try:
-                environment = sessions.advance(raw_client, environment_command, before_send=current)
-                if environment.state not in {"ready", "current"}:
-                    # The next minute's tick re-sends this occurrence; nothing reads a progress token any more.
-                    return NativeRoutineDispatch(
-                        purpose="original-routine-environment-progress", routine_id=command.routine_id,
-                        scheduled_for=command.scheduled_for, request_id=rid,
-                        conversation_id=submission.routine.conversation_id, status="environment_pending")
-            except Problem as error:
-                raise Problem(error.status, "NATIVE_ROUTINE_UNCONFIRMED",
-                              "the original environment is not ready; its routine was not resubmitted",
-                              request_id=rid, environment_code=error.body["error"]["code"]) from None
-            client = sessions.current(raw_client, checked_since=monotonic())
-            if continuing:
-                home, _ = NativeTurnGateway._invoke(
-                    client, NativeConversationRead(conversation_id=definition.conversation_id))
-                NativeTurnGateway._same_session(client, home)
-            original = self._original(client, rid)
-            if original is not None and not _same_occurrence(original, submission):
-                raise Problem(409, "NATIVE_ROUTINE_CONFLICT", "the occurrence changed while its environment was being prepared")
-            if original is not None and original.status != "accepted":
-                NativeTurnGateway._accounted(control, (original, None), composition)
-                self._settle(control, original)
-                return self._dispatch(original)
+        conversation = home if continuing else None
+        if environment_command is None:
+            return self._submit(run, client, submission, original, conversation, current)
+        return self._submit_after_environment(
+            run, sessions, environment_command, submission, definition, conversation, current)
+
+    def _submit_after_environment(self, run, sessions, command, submission, definition, conversation, current):
+        """The occurrence's intent is saved: change its environment, read everything again, then send it.
+        ``conversation``: the home conversation of a run that continues it, None otherwise."""
+        pending = self._advance_environment(run, sessions, command, submission, current)
+        if pending is not None:
+            return pending
+        client = sessions.current(run.raw_client, checked_since=monotonic())
+        if conversation is not None:
+            conversation, _ = NativeTurnGateway._invoke(
+                client, NativeConversationRead(conversation_id=definition.conversation_id))
+            NativeTurnGateway._same_session(client, conversation)
+        original = self._original(client, run.rid)
+        if original is not None and not _same_occurrence(original, submission):
+            raise Problem(409, "NATIVE_ROUTINE_CONFLICT", "the occurrence changed while its environment was being prepared")
+        if original is not None and original.status != "accepted":
+            return self._finished(run, original)
+        return self._submit(run, client, submission, original, conversation, current)
+
+    def _run_definition(self, run, intent):
+        """An intent keeps the version it was reserved under; a new occurrence takes the current one."""
+        if intent is None:
+            return self._current_definition(run.control, run.agent_id, run.command.routine_id)
+        return self._version(run.control, run.agent_id, intent.submission.routine.occurrence.approved_version)
+
+    def _authorization(self, run, definition):
+        def current():
+            self._clock(run.clock)
+            self._active_definition(run.control, run.agent_id, definition)
+
+        return current
+
+    def _located(self, run, sessions, intent):
+        """The client of the Agent's current session and, when its environment has yet to change after the intent is
+        saved, the command that changes it."""
+        try:
+            # A routine dispatches work, so (like an owner submit) the selector is read in this request.
+            return sessions.current(run.raw_client, checked_since=monotonic()), None
+        except Problem as error:
+            if error.body["error"]["code"] not in {"NATIVE_SESSION_CHANGED", "AGENT_VERSION_FOLLOWING"}:
+                raise
+            return self._switching(run, sessions, intent)
+
+    def _switching(self, run, sessions, intent):
+        from .behavior_native_turn_wire import NativeEnvironmentCommand
+
+        definition = self._run_definition(run, intent)
+        self._active_definition(run.control, run.agent_id, definition)
+        version = sessions.selected_version(run.raw_client)
+        command = NativeEnvironmentCommand(
+            request_id=material_digest({"routine_environment": run.agent_id, "version": version}),
+            expected_agent_version=version, idle_only=True)
+        authorize = self._authorization(run, definition)
+        if sessions.guard.enforce:
+            return self._switched(sessions, run.raw_client, command, authorize, run.rid), None
+        return sessions._destination(run.raw_client, version, authorize), command
+
+    def _new_intent(self, run, client, definition, home, current):
+        control, composition = run.control, run.composition
+        scheduled = _occurrence(definition.schedule, run.command.scheduled_for, control.runtime._now())
+        if scheduled < definition.approved_at:
+            raise Problem(409, "ROUTINE_OCCURRENCE_STALE", "an unregistered occurrence predating approval cannot be backfilled")
+        # The model the owner runs in the routine's conversation, not the project default.
+        submitted = NativeAgentCommand(request_id=run.rid, content=definition.content, model=home.capture.model.id)
+        # Settings come from the conversation the owner approved the routine in, as before 2026-10-23, never the
+        # Team's current new-conversation template: role, skills, capabilities, connectors and channel stay the
+        # approved ones. Only the conversation is new (resolved with home's CID, sent without one).
+        capture = resolve_routine_capture(
+            control, composition.assistant.authority,
+            submitted.model_copy(update={"conversation_id": definition.conversation_id}), conversation=home,
+            authorize=current)
+        # The profile submit_native_turn recomputes for a new conversation; the intent carries the same one.
+        profile = turn_profile(capture)
+        # The run's CID is fixed in the intent below, so every retry of this RID reuses it.
+        # shortcut: a lost reserve race or a crash before the reserve leaves one empty platform conversation that
+        # nothing lists or reads (logged below when the process survives); reserve the CID before creating it if
+        # that ever matters.
+        cid = (open_conversation(platform_client(composition, client), before_send=current)
+               if profile == NATIVE_RESPONSES_PROFILE else "native-" + uuid4().hex)
+        orphaned = profile == NATIVE_RESPONSES_PROFILE
+        try:
+            intent = self._reserve(control, run.agent_id, definition, NativeRoutineSubmit(
+                command=submitted, capture=capture,
+                routine=routine_origin_for(definition, scheduled, conversation_id=cid), state_profile=profile))
+            orphaned = orphaned and intent.submission.routine.conversation_id != cid
+            return intent
+        finally:
+            if orphaned:
+                logging.getLogger(__name__).warning(
+                    "FA_NATIVE_ROUTINE_CONVERSATION_UNUSED rid=%s conversation=%s", run.rid[:12], cid[:12])
+
+    def _advance_environment(self, run, sessions, command, submission, current):
+        """Its progress while the environment is not ready, None once it is."""
+        try:
+            environment = sessions.advance(run.raw_client, command, before_send=current)
+            if environment.state not in {"ready", "current"}:
+                # The next minute's tick re-sends this occurrence; nothing reads a progress token any more.
+                return NativeRoutineDispatch(
+                    purpose="original-routine-environment-progress", routine_id=run.command.routine_id,
+                    scheduled_for=run.command.scheduled_for, request_id=run.rid,
+                    conversation_id=submission.routine.conversation_id, status="environment_pending")
+        except Problem as error:
+            raise Problem(error.status, "NATIVE_ROUTINE_UNCONFIRMED",
+                          "the original environment is not ready; its routine was not resubmitted",
+                          request_id=run.rid, environment_code=error.body["error"]["code"]) from None
+        return None
+
+    def _submit(self, run, client, submission, original, conversation, current):
         try:
             receipt, _ = submit_native_turn(
-                composition, client, submission.command, submission.capture if original is None else original.capture,
-                routine=submission.routine, original=original, conversation=home if continuing else None,
-                before_send=current)
+                run.composition, client, submission.command, submission.capture if original is None else original.capture,
+                routine=submission.routine, original=original, conversation=conversation, before_send=current)
         except Problem as error:
-            if error.status < 500 and not older_image(composition, control, client, error):
+            if error.status < 500 and not older_image(run.composition, run.control, client, error):
                 raise
             raise Problem(503, "NATIVE_ROUTINE_UNCONFIRMED",
                           "read the original occurrence; do not replace its RID or replay unknown effects",
-                          request_id=rid) from None
-        NativeTurnGateway._accounted(control, (receipt, None), composition)
-        self._settle(control, receipt)
+                          request_id=run.rid) from None
+        return self._finished(run, receipt)
+
+    def _finished(self, run, receipt):
+        NativeTurnGateway._accounted(run.control, (receipt, None), run.composition)
+        self._settle(run.control, receipt)
         return self._dispatch(receipt)

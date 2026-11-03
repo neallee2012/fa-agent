@@ -18,12 +18,13 @@ from shared_context.native_responses import native_responses_handler_factory
 from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE
 from shared_context.native_sdk_profiles import native_context
 from shared_context.native_turns import NativeTurnRuntime, native_response
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_capabilities import selected_capture
 from test_native_memory_candidate import QUOTE, TEXT, stage_args
 from test_native_private_memory import ENDPOINT, actions, private
 from test_native_responses import ResponsesHarness
 from test_native_turn_wire import submit
-from test_native_turns import IDENTITY, local_env  # noqa: F401  (pytest fixture)
+from test_native_turns import IDENTITY, local_env  # fixture
 
 
 def responses_submit(rid="rid-1"):
@@ -72,7 +73,7 @@ def test_a_responses_human_turn_keeps_recall_one_update_and_the_candidate_on_the
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE answer",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

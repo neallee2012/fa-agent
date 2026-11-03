@@ -13,8 +13,8 @@ from shared_context.native_hitl_wire import (
     NativeHitlCall, NativeHitlClose, NativeHitlEnd, NativeHitlPendingCreate, NativeHitlPendingQuery, NativeHitlReview,
     NativeHitlTurn,
 )
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_hitl import START, change, decision, hitl, proposal  # noqa: F401
+from test_m3_auth import jwk_client, signing_key
+from test_native_hitl import START, change, decision, hitl, proposal
 from test_native_hitl_questions import answer, ask
 
 TURN = NativeHitlTurn(agent_id="native-a", conversation_id="cid-one", request_id="rid-one")
@@ -101,8 +101,6 @@ def click(created, choice="resume", request_id="click-one", digest=None):
                                     consent_digest=digest or created["consent_digest"], choice=choice)
 
 
-# --- End and rule changes -------------------------------------------------------------------------------------------
-
 def test_end_closes_a_new_or_existing_turn_index(hitl):
     c = hitl
     empty = NativeHitlTurn(agent_id="native-a", conversation_id="cid-one", request_id="rid-empty")
@@ -135,8 +133,6 @@ def test_rule_changes_return_the_new_revision_and_stable_rule_id(hitl):
     refused(c, c.owner, stale, 409, "NATIVE_HITL_RULES_CHANGED",
             "read the current rules and reassess the original action")
 
-
-# --- Pending approval cards -----------------------------------------------------------------------------------------
 
 def test_pending_create_returns_the_card_reference(hitl):
     c = hitl
@@ -188,8 +184,6 @@ def test_pending_create_at_its_deadline_is_expired(hitl):
     expiring(c, command)
     refused(c, c.agent, command, 410, "NATIVE_HITL_EXPIRED", "the original waiting window has expired")
 
-
-# --- Questions -------------------------------------------------------------------------------------------------------
 
 def test_question_create_returns_its_reference(hitl):
     c = hitl
@@ -256,8 +250,6 @@ def test_an_answer_at_the_deadline_or_after_the_turn_ended_is_refused(hitl):
             "the original SDK wait has ended")
 
 
-# --- Connect cards ---------------------------------------------------------------------------------------------------
-
 def test_consent_create_returns_its_reference(hitl):
     c = hitl
     command = consent()
@@ -317,8 +309,6 @@ def test_a_click_must_name_the_original_live_card(hitl):
     refused(c, c.owner, click(other, request_id="click-closed"), 409, "NATIVE_HITL_TURN_CLOSED",
             "the original turn has ended")
 
-
-# --- Owner decisions -------------------------------------------------------------------------------------------------
 
 def test_allow_once_writes_a_grant_and_deny_does_not(hitl):
     c = hitl
@@ -403,8 +393,6 @@ def test_a_stale_decision_rules_version_is_refused(hitl):
     submit(c, c.owner, change(c, "rule-add"))
     refused(c, c.owner, stale, 409, "NATIVE_HITL_RULES_CHANGED", "read the current rules and reassess the original action")
 
-
-# --- Agent closes ----------------------------------------------------------------------------------------------------
 
 def test_a_waiting_card_closes_as_interrupted_or_at_its_deadline_as_expired(hitl):
     c = hitl

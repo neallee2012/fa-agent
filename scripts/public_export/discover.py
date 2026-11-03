@@ -28,7 +28,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from scrub_export import GUID_RE, Scrubber, decode_text, guid_sha256, head_files, is_synthetic  # noqa: E402
+from scrub_export import GUID_RE, Scrubber, decode_text, guid_sha256, head_files, is_synthetic
 
 FIRST_PLACEHOLDER = 0x10  # ...000000000000 to ...000000000003 are already used by tests
 

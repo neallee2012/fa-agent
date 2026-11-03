@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
+import sys
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
@@ -9,9 +13,11 @@ from azure.core.exceptions import ServiceRequestError, ServiceResponseError
 from azure.core.pipeline.transport import HttpResponse, HttpTransport
 from azure.core.utils import CaseInsensitiveDict
 from azure.storage.blob import ContainerClient
+from pydantic import ValidationError
 
 from conftest import A, B, TENANT
 from shared_context.auth import Actor
+from shared_context.backup_models import BackupReceipt
 from shared_context.backup_store import BlobBackupStore
 from shared_context.errors import Problem
 
@@ -331,3 +337,48 @@ def test_unsafe_native_etags_cannot_produce_a_receipt_or_download(etag, operatio
     assert error.value.status == 502
     assert error.value.body["error"]["code"] == "BACKUP_PROTOCOL_ERROR"
     assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("field,value", [
+    ("backup_id", "A" * 32), ("backup_id", "a" * 31),
+    ("owner_oid", A.oid.upper()), ("owner_oid", "not-a-uuid"),
+    ("sha256", "A" * 64), ("sha256", "a" * 63),
+    ("bytes", 0), ("bytes", 8388609), ("bytes", True), ("bytes", "3"),
+    ("version_id", ""), ("version_id", "x" * 257), ("version_id", "bad\n"),
+    ("version_id", "\u00e9"), ("version_id", "\x7f"),
+    ("etag", ""), ("etag", "x" * 257), ("etag", "bad\r\n"), ("etag", "\x80"),
+    ("unexpected_owner", B.oid),
+])
+def test_receipt_model_rejects_unsafe_or_noncanonical_receipts(field, value):
+    receipt = {
+        "backup_id": BACKUP_ID, "owner_oid": A.oid, "sha256": ABC_SHA256,
+        "bytes": 3, "version_id": "native-version", "etag": '"native-etag"',
+    }
+    with pytest.raises(ValidationError):
+        BackupReceipt.model_validate({**receipt, field: value})
+
+
+@pytest.mark.parametrize("etag", ["*", " * ", '"one", "two"', '"one",*', '"one"\n', '"one"\r\n'])
+def test_receipt_requires_a_single_non_wildcard_etag(etag):
+    with pytest.raises(ValidationError):
+        BackupReceipt(
+            backup_id=BACKUP_ID, owner_oid=A.oid, sha256=ABC_SHA256,
+            bytes=3, version_id="native-version", etag=etag,
+        )
+
+
+def test_shared_receipt_and_store_imports_do_not_require_the_blob_sdk():
+    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
+    result = subprocess.run([sys.executable, "-c", """
+import importlib.abc
+import sys
+class NoBlobSDK(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'azure.storage.blob':
+            raise AssertionError('shared imports must not require the Blob SDK')
+sys.meta_path.insert(0, NoBlobSDK())
+from shared_context.backup_models import BackupReceipt
+from shared_context.backup_store import InMemoryBackupStore
+assert 'azure.storage.blob' not in sys.modules
+"""], env={**os.environ, "PYTHONPATH": str(source)}, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr

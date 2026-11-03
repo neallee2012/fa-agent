@@ -29,8 +29,8 @@ from shared_context.native_files_wire import MAX_FILE_BYTES, WORKSPACE_ROOT, Nat
 from shared_context.native_workspace_files import NativeWorkspaceFiles
 from shared_context.upgrade_snapshot_store import MANIFEST_NAME, UpgradeSnapshotStore
 from test_backup_store import Credential
-from test_native_abandon_source import binding_rows  # noqa: F401
-from test_native_cut import (  # noqa: F401
+from test_native_abandon_source import binding_rows
+from test_native_cut import (
     PREFIX, _moved_with_files, abandon, control, cut, file_api, file_loops, finished, instruction_models, jwk_client,
     local_env, native_api, operations, ready, replace_retried, sessions, set_admitting, signing_key, state,
     synthetic_standing_v1, token)

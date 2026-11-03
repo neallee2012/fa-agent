@@ -157,7 +157,8 @@ def _checkpoint(control, authority, conversation, record):
                 model_provider=task.model_provider,
             )
         else:
-            SdkState(sdk_session_id=conversation.sdk_session_id, files=unpack(archive.archive))
+            SdkState(sdk_version=archive.archive.sdk_version, runtime_version=archive.archive.runtime_version,
+                     sdk_session_id=conversation.sdk_session_id, files=unpack(archive.archive))
     except (ValueError, TypeError, KeyError):
         raise Problem(409, "CONVERSATION_TRANSFER_ARCHIVE_INVALID", "a complete compatible SDK archive is required") from None
     except Problem as error:

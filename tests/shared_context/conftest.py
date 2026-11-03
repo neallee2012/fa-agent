@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import sys
 import threading
@@ -8,7 +9,6 @@ import time
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"))
 
@@ -35,12 +35,60 @@ def _retry_windows_local_state_replace():
     LocalStateStoreBackend._write = write
 
 
+def _cache_windows_local_state_reads():
+    """Windows only: the pinned core re-reads its whole JSON file on every operation, and opening it right after
+    ``os.replace`` costs 13-18 ms there (about half of a native test file's time). Keep the JSON text this
+    process last read or wrote, and reuse it while the file's (inode, mtime, size) is unchanged, so the file stays
+    the source of truth: a restart, a second runtime or a hand-edited file is read again. A hit is parsed from that
+    text, so it round-trips like the file (tuples become lists, keys become strings). Both calls run under the
+    core's per-path lock, so it holds for one writing process; a second process writing the same file is unlocked in
+    the core itself, and its write between our replace and our stat would go unseen."""
+    try:
+        from azure.ai.agentserver.core.storage._local_state import LocalStateStoreBackend
+    except ImportError:
+        return
+    pinned_read, pinned_write, documents = LocalStateStoreBackend._read, LocalStateStoreBackend._write, {}
+
+    def signature(path):
+        try:
+            found = os.stat(path)
+        except FileNotFoundError:
+            return None
+        # Without an inode (FAT, some network drives) a same-size write in one clock tick would look unchanged.
+        return (found.st_ino, found.st_mtime_ns, found.st_size) if found.st_ino else None
+
+    def remember(path, sign, document):
+        if sign is None or document is None:
+            documents.pop(path, None)
+            return
+        if len(documents) >= 64:  # one entry per tmp_path store; keep the session's memory flat
+            documents.clear()
+        documents[path] = sign, json.dumps(document, sort_keys=True)  # sort_keys, as the core writes it
+
+    def read(self):
+        path = str(self._path)
+        sign, known = signature(path), documents.get(path)
+        if sign is not None and known is not None and known[0] == sign:
+            return json.loads(known[1])
+        document = pinned_read(self)
+        remember(path, sign, document)  # a write between the stat and the read leaves an old sign: a miss next time
+        return document
+
+    def write(self, document):
+        path = str(self._path)
+        pinned_write(self, document)
+        remember(path, signature(path), document)
+
+    LocalStateStoreBackend._read, LocalStateStoreBackend._write = read, write
+
+
 if os.name == "nt":
     _retry_windows_local_state_replace()
+    _cache_windows_local_state_reads()
 
-from legacy_m2_m4.api import create_app
 from shared_context.auth import Actor, AuthSettings
 from shared_context.errors import Problem
+from shared_context.models import CreateWork
 from shared_context.service import ContextService
 from shared_context.storage import Record, serialize
 
@@ -131,23 +179,11 @@ def auth():
 @pytest.fixture
 def system(auth):
     repository, memory = InMemoryRepository(), FakeMemory()
-    service = ContextService(repository, memory, auth)
-    clients = {}
-    def dependency(selected):
-        def verified_identity():
-            return selected
-        return verified_identity
-    for actor in (A, B, C):
-        # Zero public-header identity overrides. Tests inject only this internal dependency.
-        clients[actor.actor] = TestClient(create_app(service, dependency(actor)))
-    return service, repository, memory, clients
+    return ContextService(repository, memory, auth), repository, memory
 
 
 @pytest.fixture
 def work(system):
-    client = system[3][A.actor]
-    response = client.post("/teams/team-one/works/task-1", json={
-        "goal": "Verify synthetic amber fixture", "artifact_text": "draft v1",
-    })
-    assert response.status_code == 201
-    return response.json()
+    return system[0].create(A, A.team, "task-1", CreateWork(
+        goal="Verify synthetic amber fixture", artifact_text="draft v1",
+    )).response()

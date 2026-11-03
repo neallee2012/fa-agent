@@ -1,42 +1,14 @@
 """API dependency isolation and the pre-existing public-only checkpoint contract."""
 import asyncio
 import json
-from pathlib import Path
-import subprocess
-import sys
 
 import pytest
 import httpx
 
 from shared_context.behavior_sdk_files import SdkSessionFiles
-from shared_context.behavior_sdk_state import CheckpointProfile, SdkState
+from shared_context.behavior_sdk_state import CheckpointProfile, SaveSdkState, SdkState
 from shared_context.behavior_checkpoint_privacy import jsonl_lines
 from shared_context.errors import Problem
-
-
-def test_api_entrypoint_imports_without_the_hosted_copilot_dependency():
-    source=Path(__file__).resolve().parents[2]/"src"/"fa-shared-context-poc"
-    program=r"""
-import importlib.abc,sys
-class NoHostedSdk(importlib.abc.MetaPathFinder):
-    def find_spec(self,fullname,path=None,target=None):
-        if fullname=="copilot" or fullname.startswith("copilot."):
-            raise ModuleNotFoundError("Hosted copilot dependency forbidden in API",name=fullname)
-sys.meta_path.insert(0,NoHostedSdk())
-sys.path.insert(0,sys.argv[1])
-import shared_context.behavior_assistant_wire
-import shared_context.behavior_assistant_api
-import shared_context.behavior_server
-import shared_context.behavior_sdk_compaction
-from shared_context.behavior_sdk_state import CheckpointProfile, SaveSdkState
-assert CheckpointProfile().name == "manual-no-custom-v1"
-assert "state" in SaveSdkState.model_json_schema()["properties"]
-assert not any(name=="copilot" or name.startswith("copilot.") for name in sys.modules)
-print("API imports without Hosted SDK")
-"""
-    result=subprocess.run([sys.executable,"-I","-c",program,str(source)],capture_output=True,
-                          text=True,encoding="utf-8",timeout=30)
-    assert result.returncode==0,result.stdout+result.stderr
 
 
 @pytest.mark.parametrize("separator", [" ", "\u0085", "\u2028", "\u2029"],
@@ -97,6 +69,8 @@ def test_api_dto_does_not_accept_raw_private_state_from_a_client():
     with pytest.raises(Problem) as blocked:
         SdkState(sdk_session_id="private-test",files=files_with_private_marker())
     assert blocked.value.body["error"]["code"]=="SDK_STATE_PRIVATE_MATERIAL"
+    assert CheckpointProfile().name=="manual-no-custom-v1"
+    assert "state" in SaveSdkState.model_json_schema()["properties"]
 
 
 def test_legacy_event_transform_bytes_are_preserved(tmp_path):

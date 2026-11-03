@@ -13,9 +13,9 @@ from shared_context.m2_copilot import _ModelGateway
 from shared_context.native_inference import NativeInferenceCollector
 from test_native_assembly import install_executor, offline_sdk, run_turn
 from test_native_reasoning_facts import completions_stream
-from test_native_responses import response_submit, responses  # noqa: F401
+from test_native_responses import response_submit, responses
 from test_native_turn_wire import submit
-from test_native_turns import local_env  # noqa: F401
+from test_native_turns import local_env
 
 
 @pytest.mark.parametrize("lane", ["invocations", "responses"])

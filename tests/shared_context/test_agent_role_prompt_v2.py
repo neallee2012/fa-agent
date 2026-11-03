@@ -17,9 +17,9 @@ from shared_context.behavior_instruction_prompt import assemble_instruction_prom
 from shared_context.behavior_native_turn_wire import NativeTurnCapture
 from shared_context.behavior_skill_prompt import assemble_prompt
 from test_native_turn_wire import capture
-from test_behavior_assistant import assistant  # noqa: F401
-from test_instruction_flow import instruction_models, runtime_path  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_behavior_assistant import assistant
+from test_instruction_flow import instruction_models, runtime_path
+from test_m3_auth import jwk_client, signing_key
 
 V3 = assemble_instruction_prompt("fa-instruction-v3", capabilities=()).system_message
 

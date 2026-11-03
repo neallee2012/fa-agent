@@ -11,9 +11,9 @@ import pytest
 
 from web_test_console.adapter import ConsoleError, PullAdapter
 from web_test_console.team_connectors import TeamConnectors, install_team_connector_routes, is_connector_write
-from test_m3_auth import jwk_client, signing_key  # noqa: F401  (fixtures used by connectors)
-from test_team_connector_api import SECRET, connectors  # noqa: F401
-from test_web_test_console_frozen_interface import real_interface  # noqa: F401
+from test_m3_auth import jwk_client, signing_key  # fixtures used by connectors
+from test_team_connector_api import SECRET, connectors
+from test_web_test_console_frozen_interface import real_interface
 
 DISCLOSURE = "Microsoft Teams 經 Work IQ 連線。Agent 能讀取的不只 Teams，也可能包含你的 Microsoft 365 郵件與檔案。"
 AGENT_ORIGIN = "http://agent-api.test"

@@ -129,7 +129,7 @@ def file_api(local_env, file_loops, native_api, monkeypatch, tmp_path, request):
     lane = setting["lane"] if isinstance(setting, dict) else setting
     recover = isinstance(setting, dict) and setting.get("recover") is True
     api_capture = isinstance(setting, dict) and not recover
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
     monkeypatch.setenv("FA_RESPONSES_ENABLED", "1")
     source = case.remote.target
     source_version = options.get("source_version", source.agent_version)
@@ -301,7 +301,7 @@ def file_api(local_env, file_loops, native_api, monkeypatch, tmp_path, request):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://offline") as client:
                     return await client.post("/responses" if is_response else "/invocations", content=packet.content, headers={
                         **{name: value for name, value in packet.headers.items() if name.startswith("x-client-")},
-                        "x-client-fa-state-profile": "foundry-native-v1", "x-agent-session-id": sid,
+                        "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": sid,
                         "x-agent-invocation-id": "offline-files", "x-agent-foundry-call-id": "offline-control",
                     })
 

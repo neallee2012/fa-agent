@@ -22,7 +22,7 @@
 
 | 項目 | 本版契約的第一個適用範圍 |
 |---|---|
-| SDK／runtime | 精確固定 Python SDK `1.0.13`／runtime `1.0.83`；不接受相容版本推定 |
+| SDK／runtime | 執行時精確固定 Python SDK `1.0.26`／runtime `1.0.103`（`shared_context/sdk_pin.py`；2026-11-03 前是 `1.0.13`／`1.0.83`）；讀取時接受這個 build 的 `KNOWN_RELEASES`，每加一個舊版本都要有本版 runtime 接續該版存檔的測試；不接受相容版本推定（2026-11-02 Neal：SDK 版本是平台事實） |
 | 已有實驗平台 | Windows x64；不同 Python／runtime process，同 SDK session／conversation |
 | 已有模型傳輸證據 | Offline OpenAI-compatible completions fixture；配置的模型名稱不是實際模型品質證明 |
 | 已驗 compaction 呼叫 | 原 default-positive 使用無參數 `history.compact()`；此歷史結果保留，不回填新的 trigger |
@@ -181,7 +181,9 @@ reader 只補和原 session.start、index/path/number精確吻合的格式，摘
 | `session-fs-diag-empty-v1`（待實作） | 明確宣告本文件限定的 diagnostics projection；對應部署／profile 未啟用時拒絕，文件確認不會開啟功能 |
 | `artifact-session-fs-diag-empty-v1`（待實作） | 只引用上一列 codec 的 canonical bytes；不得與舊 state codec 交叉配對 |
 | `ctx03-candidate-b-v1`／其 test-only reference | **永不直接作為 production 輸入**；不靠換名、去掉 `test_only_format` 或複製測試 store 來遷移 |
-| 不認識的 codec／版本 | 拒絕，不猜、不自動降級，不先交 runtime 試讀 |
+| 不認識的 codec／版本（版本不在這個 build 的 `KNOWN_RELEASES`） | 拒絕，不猜、不自動降級，不先交 runtime 試讀；認得的舊版本照原 digest 讀，不改寫標籤，下次保存才寫目前版本 |
+
+**2026-11-03（ADR-0009 3d-i）：** 固定版本換成 SDK `1.0.26`／runtime `1.0.103`，`KNOWN_RELEASES` 另含 (`1.0.13`, `1.0.83`)。紀錄裡的版本必須是其中**一整組**，`("1.0.26", "1.0.83")` 這類混搭一律拒絕（`behavior_wire.known_release`）；checkpoint 參照照 state 的那一組寫，載入時兩者必須相同。runtime 1.0.103 接續 1.0.83 存檔由 `test_sdk_checkpoint_cross_version_native.py` 驗（本機 runtime、離線 provider），拿掉這一組時同一份存檔在解析時被拒。
 
 新格式沿用 SDK／runtime version、SDK session、完整 `files`／`directories` 及現有 reference 的 tenant／team／agent／conversation／job／artifact／hash／parts 綁定；另保存有序的 `projected_event_ids`。Codec 名稱決定投影規則版本，不另加可由呼叫者自由選取的任意 filter。
 
@@ -290,6 +292,24 @@ raw shape 拒絕亦記去值 WARNING 的 missing／extra keys／types，方便�
 也不能把其他 SDK／envelope key 的變動用一般 redaction 或「整個 `model.*` 一律清空」掩蓋。
 本機 scripted-provider 或真 provider native 結果，不等於已讀到回收容器內的 live event，
 也不等於 live smoke 已通過；[實作與直接回歸](../src/fa-shared-context-poc/README.md#2026-09-29provider-metadata-的-checkpoint-相容修補)分開記錄。
+
+**2026-11-02 新版 runtime 欄位預先相容：** 2026-11-02 在 Windows 本機用 SDK 1.0.26／runtime 1.0.103
+跑真 runtime、離線 provider 的測試（模型名 gpt-4.1-mini、gpt-5.4-mini；未接真模型）時，
+`model_call_success` 多送下列欄位；固定的 1.0.13／1.0.83 不送，所以現行行為不變。
+同次觀察 `model.message`／`model.response` 的 `modelCall` 沒有新增欄位，維持原精確 keys。
+每個欄位只接受觀察到的精確形狀，其他新欄位或形狀仍拒絕：
+
+| 位置 | 可選欄位 | 形狀 |
+|---|---|---|
+| `data` | `customToolCallCount`、`orphanToolCallCount`、`unmatchedToolResultCount`、`maxOutputTokens` | 非負 int（不把 bool 當 int） |
+| `data` | `modelDisplayName` | string |
+| `data` | `requestSettings` | 只有 `enabledFeatureFlags`，值為 string list |
+| `modelCall` | `request_body_bytes`、`request_body_wire_bytes` | 非負 int |
+| `modelCall` | `request_body_encoding` | string |
+
+Responses 的 `reasoning_blocks`／`reasoningBlocks` 容器另可帶 `ordered_blocks`，
+但只接受 null；非 null 時 checkpoint 拒絕，公開推理摘要也不顯示。
+這兩處檢查共用 `behavior_responses_checkpoint.reasoning_container`。
 
 ### 6.5 先前已投影事件與續存
 

@@ -278,3 +278,4 @@ def test_keep_capabilities_writes_once_and_a_rerun_only_reconciles(script, tmp_p
     assert stage.selection["template"]["settings"]["checkpoint_profile"]["name"] == "auto-no-custom-v1"
     again, _ = script.select(stage, {}, tmp_path, agent, "r1", False, True)
     assert again["outcome"] == "intent-exists-reconciled" and stage.posts == ["select", "selection-reconcile"]
+

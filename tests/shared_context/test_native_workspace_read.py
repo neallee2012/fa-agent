@@ -4,10 +4,10 @@ import hashlib
 
 from shared_context.behavior_native_turn_wire import NativeSessionRead, NativeSessionState
 from shared_context.native_workspace_files import NativeWorkspaceFiles
-from test_native_turns import harness, local_env, native_retry_policy  # noqa: F401
+from test_native_turns import harness, local_env, native_retry_policy
 
 
-def test_the_workspace_read_answers_the_tree_and_creates_nothing(harness, tmp_path):  # noqa: F811
+def test_the_workspace_read_answers_the_tree_and_creates_nothing(harness, tmp_path):
     plain = NativeSessionState.model_validate_json(harness.invoke(NativeSessionRead()).content)
     assert harness.invoke(NativeSessionRead(workspace=True)).json()["error"]["code"] == "NATIVE_FILES_UNSUPPORTED"
     harness.runtime.workspace_files = workspace = NativeWorkspaceFiles(tmp_path / "home")

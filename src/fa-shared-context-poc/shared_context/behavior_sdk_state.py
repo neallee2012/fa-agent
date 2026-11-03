@@ -9,9 +9,10 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from .backup_models import MAX_BACKUP_BYTES
-from .behavior_wire import WireModel, Identifier, Digest, Command, AssistantSdkStop
+from .behavior_wire import WireModel, Identifier, Digest, Command, AssistantSdkStop, known_release
 from .m3_models import BlobReceipt
 from .behavior_checkpoint_privacy import checkpoint_events, validate_checkpoint_files
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion, RUNTIME_VERSION, SDK_VERSION
 
 DIAG_CODEC = "session-fs-diag-empty-v1"
 DIAG_ARCHIVE_CODEC = "artifact-session-fs-diag-empty-v1"
@@ -107,8 +108,9 @@ def checked_path(value):
 
 
 class SdkState(WireModel):
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SDK_VERSION
+    runtime_version: KnownRuntimeVersion = RUNTIME_VERSION
+    _release = model_validator(mode="after")(known_release)
     sdk_session_id: Identifier
     model_provider: ModelProvider | None = Field(default=None, exclude_if=lambda value:value is None)
     codec: Literal["session-fs-v1", "session-fs-diag-empty-v1",
@@ -162,8 +164,9 @@ class SdkStatePart(WireModel):
 
 
 class StoredSdkArchive(WireModel):
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SDK_VERSION
+    runtime_version: KnownRuntimeVersion = RUNTIME_VERSION
+    _release = model_validator(mode="after")(known_release)
     codec: Literal["artifact-session-fs-v1", "artifact-session-fs-diag-empty-v1",
                    "artifact-session-fs-responses-v1", "artifact-session-fs-responses-diag-v1"] = "artifact-session-fs-v1"
     sdk_session_id: Identifier
@@ -269,8 +272,9 @@ class NativeCheckpointLineage(WireModel):
 class NativeCheckpointRef(WireModel):
     """The complete manifest of one checkpoint stored as ``ckpt:<sha256>:<index>`` in ``fa/v1/conv/<CID>``."""
     kind: Literal["fa-native-checkpoint-v1"] = "fa-native-checkpoint-v1"
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SDK_VERSION
+    runtime_version: KnownRuntimeVersion = RUNTIME_VERSION
+    _release = model_validator(mode="after")(known_release)
     codec: Literal["native-session-fs-v1", "native-session-fs-responses-v1",
                    "native-session-fs-diag-empty-v1", "native-session-fs-responses-diag-v1"]
     model_provider: ModelProvider | None = Field(default=None, exclude_if=lambda value: value is None)

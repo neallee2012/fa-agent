@@ -111,7 +111,7 @@ def test_version_refusal_says_not_dispatched_why_and_the_vms_own_version(harness
 
 def test_profile_refusal_says_not_dispatched_why_and_the_vms_own_version(harness):
     response = harness.client.post("/invocations", json=submit("other-profile").model_dump(mode="json"), headers={
-        # a profile this runtime does not declare (it declares v2 and keeps the v1 alias, ADR-0009 2d-ii)
+        # a profile this runtime does not declare (it declares v2 only, ADR-0009 M1)
         NATIVE_TURN_HEADER: "foundry-native-v3", "x-agent-session-id": IDENTITY.session_id,
         "x-agent-invocation-id": "offline-profile", "x-agent-foundry-call-id": "offline-version-caller",
         "x-client-fa-expected-version": IDENTITY.agent_version})

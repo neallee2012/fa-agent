@@ -18,7 +18,7 @@ from shared_context import behavior_desktop_view_api as broker
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_wire import HostedIdentity
 from test_behavior_desktop import ALLOWED_ENV
-from test_desktop_capability import GRANT, fake_desktop, session  # noqa: F401
+from test_desktop_capability import GRANT, fake_desktop, session
 
 IDENTITY = HostedIdentity(agent_id="0a0a0a0a-0a0a-4a0a-8a0a-0a0a0a0a0a0a", agent_name="OFFLINE-agent",
                           agent_version="1", session_id="OFFLINE-session")

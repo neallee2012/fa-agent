@@ -573,6 +573,71 @@ CC ≥ 50 少的 9 個，正是這輪拆掉的 9 個。剩下的 6 個都是刻�
 - standin 走不到的沒有驗證：批准卡、Team MCP 和 Connectors 的寫入、助理設定的清單與套用、`chat-new`。這些要到 dev 才能驗。
 - #1109 的 SDK 契約測試讀 core 2.2.0 的私有欄位 `Task._opts`、`_input_type`、`_output_type`。升 SDK 時可能要跟著改，這是刻意的。
 
+## 第十一輪結果（2026-11-02）
+
+規則和前兩輪相同：依工作拆函式，不動 wire 格式、錯誤碼、log 字串、HTTP 狀態與副作用順序。CC ≥ 50 剩下的 6 個仍刻意不動，這輪改拆 CC 20～41 的長判斷，分五條線並行；第六條線把 13 個 prompt 模組的固定來源檢查合成一份。各線先把新測試放到修改前的 src 上跑，確認測試釘住的是原本的行為，再動手拆；直接呼叫拆出來的新函式的測試除外。
+
+| 線 | PR | CC 前 → 後 |
+|---|---|---|
+| 原生啟動授權、結果保存 | #1125 | `_describe` 41 → 1；`_verify_unclaimed_fence` 33 → 11；`_verify_lost_session` 30 → 16；`prepare` 28 → 4；`_state` 27 → 11；`fence_unclaimed` 25 → 6；`_installed` 24 → 11 |
+| 工作政策、排程觸發、回條等待 | #1126 | `refresh` 38 → 14；`preflight` 38 → 13；`_reminders` 37 → 3；`trigger` 33 → 13；`wait_turn` 27 → 8；`turn_order` 26 → 16；`adopt_left` 25 → 1；`check` 24 → 10 |
+| HITL、跨 VM 轉送 | #1127 | HITL：`_authorize` 32 → 14、`read` 27 → 11、`_authorize_effect` 24 → 7、`_request` 21 → 8。relay client：`_request` 41 → 8、`_follow_environment` 25 → 15、`recover_queued` 23 → 12。gateway：`_send` 34 → 19、`_original_source` 27 → 8、`_returned` 23 → 9 |
+| 記憶 CLI、agent-versions、server | #1128 | memory_cli：`main` 32 → 5、`_proposal_action` 32 → 11、`_settings_action` 30 → 5、`_bridge_preview` 21 → 8。agent_versions：`main` 35 → 3、`sync_all` 29 → 11、`sync_agent_version` 25 → 15、`_check_environment` 20 → 6。server：`run_controller` 32 → 13、`_validate_approval` 32 → 7、`build_server` 22 → 9、`application` 21 → 3 |
+| 交辦、助理、worker、compaction | #1129 | `observe` 41 → 14；`pre_tool` 40 → 12；`native_report_plan` 38 → 10；`prepare_session` 37 → 9；`_observe_changes` 34 → 12；`start` 32 → 10；`_provider_objects` 32 → 8；`publish_readiness` 27 → 9；`_operation_effects` 22 → 7；`validate_native_files` 22 → 12；`_model_sources` 21 → 7；`_raw_shape` 21 → 8 |
+| prompt 固定來源 | #1124 | 13 個模組共用 `exact_prefix`；這條線單獨合併後，dryer 264 → 173 對（六條線都合併後是 174 對，見下表） |
+
+同一段時間另外合併了兩批：
+
+- #1131：Windows 上兩個 foundry 測試必定失敗。checksum supervisor 的子程序要先 import `behavior_hosted.py` 和它的相依才讀 park／cancel，Windows 上要 4～7 秒，超過 `HostedRuntime.observe` 等的 2 秒。只改測試，產品碼不動。
+- 註解清理五個 PR，共約 749 處：#1130 修兩句和程式不符的註解，拿掉 501 個 `noqa`（保留 42 個有理由的，51 個改成 `# fixture`）和 72 條純分隔線；#1134、#1135、#1136、#1137 拿掉註解與 docstring 裡的審查輪次標籤，依序 18、33、15、約 108 處。測試名稱、ADR／§ 編號、`(#NNN)` 線索和產品用語都保留。#1130、#1134、#1136 動到 `shared_context`，下次 dev 部署的 `code_sha256` 會變。
+
+### 重新量（main `a2738763`）
+
+| 項目 | 第十一輪前 | 第十一輪後（`a2738763`） |
+|---|---|---|
+| 函式（不含 novnc） | 6,266 | 6,460 |
+| CC ≥ 10 | 958 | 966 |
+| CC ≥ 20 | 247 | 199 |
+| CC ≥ 30 | 87 | 64 |
+| CC ≥ 50 | 6 | 6 |
+| CC ≥ 100 | 2 | 2 |
+| dryer 重複（≥ 0.8，至少 4 行） | 264 對，192 對完全相同 | 174 對，126 對完全相同 |
+
+「第十一輪前」是開工前另量的一次，數字和第十輪的 `47b47bcd` 完全相同，量的是哪個 commit 沒有留下紀錄；兩者之間合併的 #1118 只改了 `native_turns.py` 3 行。
+
+CC ≥ 20 少了 48 個。CC ≥ 10 反而多 8 個：拆出來的函式有幾個仍 ≥ 10，期間也有其他 PR 合併，兩者沒有分開算。這一輪沒有量覆蓋率。
+
+### 驗證
+
+- 全量 `tests/shared_context`（Windows、離線，main `1ad3a272`，含第十一輪、#1131、註解清理與 #1133）：兩組同時跑，約 3 小時 37 分。結果是 43 failed、16,924 passed、30 skipped、2 xfailed。
+- 43 個裡有 37 個是跑測時漏設環境。subprocess 測試要 `PYTHONPATH`；設了 `M2_TEST_RUNTIME`，真 runtime 測試就要有 `N1_NATIVE_WORKSPACE`、`N6_NATIVE_WORKSPACE`。補上後只重跑這 43 個，37 個通過。
+- 剩下 6 個都不是這一輪造成的，也都不在 `ci-quarantine.txt` 或 `known-failing-on-main.txt`：
+  - `test_native_queued_sender_recovery.py` 5 個：#1133 合併前的 `5b6a6077` 全過，main `3b8ad314` 上失敗。負責 #1133 的工作階段已接手處理。
+  - `test_behavior_wire.py::test_wire_has_only_standard_library_and_pydantic_imports`：#1132 在 `behavior_wire.py` 加了 `from .sdk_pin import …`，這個測試只准 level 0 的 import。`5b6a6077`、`3b8ad314` 都失敗，已通知 #1132 的工作階段。
+- 第一次全量用 `-q` 跑，撞到 4 小時上限，停在 71%（12,004 個，35 failed）。`-q` 的進度字元被 `FA_TIMING` log 行打亂，對不回測試名稱，所以那份結果作廢。
+- 修改前 src 的檢查：A 179 個、B 205 個全過；D 88／92，失敗的 4 個直接呼叫拆出來的 `_pending_binding`、`_check_checkpoint_grant`、`_start_controller`；E 的 `test_assistant_carried_values.py` 在修改前的 src 上無法收集。C 由審查者另跑，細節在各 PR 說明。
+- 每條線的 poteto 與 ponytail 兩軸審查 P1／P2 都清零。
+- 沒有在 Linux 上跑。這一輪沒有部署，沒有 Hosted 或 dev 驗證，內容也還沒上 stage。
+
+### 做法與教訓
+
+- conftest 會釘住自己那份 src，`PYTHONPATH` 換不掉測試用的程式。要在基準版上驗新測試，得把基準版的 src 封存出來，再複製測試過去，並先印出模組路徑確認。
+- 但 subprocess 測試只認 `PYTHONPATH`。全量跑時要把它設成被測 worktree 的 src，不能整個拿掉。
+- 假 runtime 會產生假失敗，要用真 runtime 重跑才能判讀。
+- 給審查者的範圍要列出確切的函式名稱，不能只給檔案。
+- mutant runner 中途被砍掉時，可能把 mutant 留在 src 裡。之後先比對 git 狀態再繼續。
+- 有一次 `git reset --hard` 把還沒 commit 的測試一起丟了。之後先 commit 再重設。
+- 長時間全量一定要用 `-v -o console_output_style=classic -rfE`，每個測試一行，失敗名稱才找得回來。
+
+### 未處理／後續
+
+- 綁工作狀態的一批與 `NativeSessions.cut`、`follow`：理由同第十輪，CC ≥ 50 的 6 個不動。
+- 這輪改過的檔案裡，還在 CC 25 以上、沒碰的：`derive_work` 35、`cumulative_decision` 34、`_current` 26、`claim` 25。
+- 既有問題，這輪也沒有改：relay `_request` 收到 list 或 dict 形式的 code 時會丟 `TypeError`；`validate_native_files` 的 `AttributeError`；`tool.function` 不是 dict 時的 `AttributeError`。
+- E 線的 `test_only_a_newer_sequence_moves_the_job` 有一半斷言走不到，還沒補。
+- #1131 留下的 P3：`HostedRuntime` 那層 2 秒逾時的路徑現在沒有測試；沒有「子程序還在 import 時就 park」的測試；10 秒上限只剩約 3 秒餘裕；5 處重複的 `children[...].wait(timeout=15)` 可以抽成 helper。
+- 各 PR 列出的其他 P3 沒有補。
+
 ## 重新量
 
 ```powershell

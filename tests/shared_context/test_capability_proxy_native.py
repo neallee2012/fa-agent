@@ -1,4 +1,4 @@
-"""One pinned SDK 1.0.13 / runtime 1.0.83 turn using a captured WebIQ-style capability.
+"""One pinned SDK 1.0.26 / runtime 1.0.103 turn using a captured WebIQ-style capability.
 
 The model is a scripted provider and the MCP service is an in-process fake served through the real
 API-side MCP client; no network, cloud or real model is used.
@@ -27,6 +27,7 @@ from shared_context.behavior_capability_prompt import assemble_capabilities
 from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
+from shared_context.sdk_pin import SDK_VERSION
 from test_behavior_assistant import assistant
 from test_capability_capture import CATALOG, GRANTS, WEB_TOOLS, choose
 from test_conversation_profile_selection import configured
@@ -150,4 +151,4 @@ def test_pinned_runtime_calls_a_captured_api_capability_through_the_fa_proxy(ass
     archive = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
     assert archive.capability_assembly == combined.record
     assert KEY not in json.dumps([r["system"] for r in requests])
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION

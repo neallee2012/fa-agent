@@ -21,20 +21,17 @@ from shared_context.behavior_team_registry import (
 )
 from shared_context.errors import Problem
 from shared_context.native_routine_clock import NativeRoutineClock
-from test_behavior_server import workspace  # noqa: F401  (fixture)
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401  (fixture)
-from test_instruction_flow import instruction_models  # noqa: F401  (fixture)
-from test_m3_auth import HUMAN_OID, jwk_client, signing_key  # noqa: F401  (fixtures)
-from test_team_agent_routing import _register_scope, register_more_agents, team_agent  # noqa: F401  (fixture)
-from test_team_registry import AGENT_OID, OTHER_AGENT_OID, _app, _target, _verifier, activated, registry  # noqa: F401
+from test_behavior_server import workspace  # fixture
+from test_conversation_transfer_startup import synthetic_standing_v1  # fixture
+from test_instruction_flow import instruction_models  # fixture
+from test_m3_auth import HUMAN_OID, jwk_client, signing_key  # fixture
+from test_team_agent_routing import _register_scope, register_more_agents, team_agent  # fixture
+from test_team_registry import AGENT_OID, OTHER_AGENT_OID, _app, _target, _verifier, activated, registry
 
 NOW = datetime(2026, 10, 15, 9, 0, tzinfo=timezone.utc)
 
 def _code(failure):
     return failure.value.status, failure.value.body["error"]["code"]
-
-
-# ----- the tombstone ------------------------------------------------------------------------------------------------
 
 
 def test_tombstone_is_create_only_with_the_identity_deactivation_and_a_rerun_returns_the_original(registry):
@@ -99,9 +96,6 @@ def test_a_retired_agent_token_is_refused_at_the_api_entry(registry, jwk_client,
     with pytest.raises(Problem) as refused:
         verifier(_app(signing_key, AGENT_OID))
     assert refused.value.body["error"]["code"] == "BEHAVIOR_ACTOR_NOT_ALLOWED"
-
-
-# ----- every live path honours it -----------------------------------------------------------------------------------
 
 
 def _retire(case, agent_id=None):

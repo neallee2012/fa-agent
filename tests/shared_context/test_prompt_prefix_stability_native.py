@@ -27,6 +27,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from shared_context.m3_skills import PurposeSkillReadResult, ResourceSkillReadResult
 from shared_context.m3_models import SkillResourceRead, SkillResources
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from web_test_console.freeform import ConversationProjection
 from sdk_checkpoint_local import sse
 from test_approved_skill_api import add_skill, approve_skill_version, configured as configured_skills
@@ -123,8 +124,7 @@ def test_native_prefix_is_stable_across_new_questions_time_and_conversations(
             for name, value in assistant.runtime.profiles.items()
         })
     if copy_writer:
-        copy_http, copy_agent, _, copy_version = approved_sop(assistant, signing_key, jwk_client)
-        request.addfinalizer(copy_http.close)
+        copy_artifacts, copy_agent, _, copy_version = approved_sop(assistant, signing_key, jwk_client)
         copy_configuration = TeamSopCopy.model_validate(copy_scope(copy_version))
         h, copy_control, _ = configured_copy(assistant, copy_configuration)
     elif memory_reader:
@@ -409,18 +409,17 @@ def test_native_prefix_is_stable_across_new_questions_time_and_conversations(
                 assert copied.artifact_id == assignment.artifact_id
                 assert copied.version_id == assignment.artifact_version
                 copy_receipts.append(copied)
-                path = "/teams/" + copy_configuration.team_id + "/artifacts/" + copied.artifact_id
-                saved = copy_http.get(path, headers=copy_agent)
-                version = copy_http.get(path + "/versions/" + copied.version_id, headers=copy_agent)
-                assert saved.status_code == version.status_code == 200
-                assert saved.json()["kind"] == "skill" and saved.json()["effective_version_id"] is None
-                assert len(saved.json()["versions"]) == 1
-                assert version.json()["approval"] is None
-                assert version.json()["source_work"] == COPY_WORK
-                original = copy_http.get(path + "/versions/" + copied.version_id + "/content",
-                    headers={**copy_agent, "If-Match": version.json()["blob"]["etag"]})
-                assert original.status_code == 200 and original.content == COPY_BODY
-                copied_versions.append((saved.content, version.content))
+                team = copy_configuration.team_id
+                saved = copy_artifacts.get(copy_agent, team, copied.artifact_id)
+                version = copy_artifacts.version(copy_agent, team, copied.artifact_id, copied.version_id)
+                assert saved.payload["kind"] == "skill" and saved.payload["effective_version_id"] is None
+                assert len(saved.payload["versions"]) == 1
+                assert version.approval is None
+                assert version.source_work == COPY_WORK
+                _, original = copy_artifacts.download(copy_agent, team, copied.artifact_id, copied.version_id,
+                                                      version.blob.etag)
+                assert original == COPY_BODY
+                copied_versions.append((saved.response(), version.model_dump()))
             if len(current) < 2:
                 return sse(request, {"tool_calls": [{
                     "index": 0, "id": "PA02_COPY_TOOL_" + str(len(current)), "type": "function",
@@ -566,8 +565,8 @@ def test_native_prefix_is_stable_across_new_questions_time_and_conversations(
         assert normal[0]["tool_catalog_sha256"] != normal[-1]["tool_catalog_sha256"]
         assert len({item["prefix_sha256"] for item in normal}) == 1
     assert len(options_seen) == len(stops) == len(questions)
-    assert versions and set(versions) == {"1.0.83"} and force_stops == []
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert versions and set(versions) == {RUNTIME_VERSION} and force_stops == []
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     if output := os.environ.get("FA_PREFIX_STABILITY_EVIDENCE_DIR"):
         destination = Path(output)
         destination.mkdir(parents=True, exist_ok=True)
@@ -600,7 +599,7 @@ def test_native_prefix_is_stable_across_new_questions_time_and_conversations(
             "copy_target_ids_absent_from_tool_catalog": copy_writer,
             "historical_copy_not_reported_as_another_turns_effect": copy_writer,
             "copy_public_tool_pairs_hide_raw_ids_and_body": copy_writer,
-            "sdk_version": "1.0.13",
+            "sdk_version": SDK_VERSION,
             "runtime_versions": versions,
             "requests": requests,
             "normal_request_count": len(normal),
@@ -649,8 +648,7 @@ def test_new_server_selector_cannot_silently_attach_an_old_installation(
     add_skill(assistant)
     sop_copy = None
     if "fa-instruction-sop-copy-v1" in (original, replacement):
-        http, _, _, version = approved_sop(assistant, signing_key, jwk_client)
-        request.addfinalizer(http.close)
+        _, _, _, version = approved_sop(assistant, signing_key, jwk_client)
         sop_copy = TeamSopCopy.model_validate(copy_scope(version))
     if original == "fa-instruction-sop-copy-v1":
         h, control, _ = configured_copy(assistant, sop_copy)

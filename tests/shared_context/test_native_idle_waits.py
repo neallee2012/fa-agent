@@ -17,6 +17,7 @@ from shared_context.native_environment import follow_session
 from shared_context.native_environment_cut import cut_session
 from shared_context.native_hitl_wire import NativeHitlTurn
 from shared_context.native_turns import NativeTurnRuntime
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_m3_auth import jwk_client, signing_key
 from test_native_hitl import hitl, post
 from test_native_hitl_h2 import MODEL_ROOT, api_client
@@ -25,6 +26,7 @@ from test_native_responses import response_submit, responses
 from test_native_session_bootstrap import prepare
 from test_native_turn_wire import submit
 from test_native_turns import IDENTITY, OfflineSdk, local_env
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 
 def _cut_waits(harness, probe, request_id, state):
@@ -164,11 +166,12 @@ def _card_sdk(monkeypatch, kind, ended):
         exited = Event()
         client._cli_process = SimpleNamespace(pid=999, poll=lambda: 0 if exited.is_set() else None, returncode=0)
         client.stop.side_effect = exited.set
-        client.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+        client.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
 
         async def create(**options):
             sid = options["session_id"]
             session = create_autospec(CopilotSession, instance=True)
+            session.rpc = OFFLINE_SESSION_RPC
             session.session_id = sid
             session.get_events.return_value = []
             handlers = []

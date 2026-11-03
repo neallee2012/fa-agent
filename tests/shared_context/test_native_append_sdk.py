@@ -22,6 +22,7 @@ from shared_context.behavior_native_turn_wire import NativeSessionPreparation
 from shared_context.behavior_wire import HostedIdentity
 from shared_context.native_sdk import NativeSdkExecutor
 from shared_context.native_turns import NativeTurnRuntime
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_conversation_transfer_startup import synthetic_standing_v1
 from test_instruction_flow import instruction_models
 from test_m2_copilot import runtime_path
@@ -126,7 +127,7 @@ def append_sdk(native_api, monkeypatch, runtime_path, tmp_path, request, signing
         host.supervisor = SimpleNamespace(journal=SimpleNamespace(root=journal))
         host_options["responses_handler_factory"] = native_responses_handler_factory
     with TestClient(create_host(host, native_runtime=runtime, **host_options)) as hosted:
-        headers = {"x-client-fa-state-profile": "foundry-native-v1", "x-agent-session-id": identity.session_id,
+        headers = {"x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": identity.session_id,
                    "x-agent-invocation-id": "OFFLINE-control", "x-agent-foundry-call-id": "OFFLINE-owner"}
         state = hosted.post("/invocations", json={"operation": "session_read"}, headers=headers).json()
         prepared = hosted.post("/invocations", json={
@@ -234,7 +235,7 @@ def test_busy_owner_append_is_persisted_and_reaches_the_original_sdk(append_sdk)
     assert len(env.requests) == 2 and "追加-保留原工作" in json.dumps(env.requests[1], ensure_ascii=False)
     applied = env.api.client.get(path, headers=env.api.headers).json()
     assert applied["status"] == "applied" and applied["delivery"] in {"steering", "queued"}
-    assert env.stopped[0].runtime_version == "1.0.83" and env.stopped[0].graceful
+    assert env.stopped[0].runtime_version == RUNTIME_VERSION and env.stopped[0].graceful
     # Stage A 2026-10-04: every round's final answer is saved, not only the last (or the first) round's.
     result = env.api.client.get(PREFIX + "/conversations/" + original["conversation_id"]
                                 + "/requests/original-rid/result", headers=env.api.headers)

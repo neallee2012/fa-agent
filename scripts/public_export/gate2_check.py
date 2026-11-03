@@ -35,9 +35,9 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import verify_export  # noqa: E402
-from fingerprint import commit_fingerprint, parse_fingerprint  # noqa: E402
-from scrub_export import head_files, render  # noqa: E402
+import verify_export
+from fingerprint import commit_fingerprint, parse_fingerprint
+from scrub_export import head_files, render
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+")

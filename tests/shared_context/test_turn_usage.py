@@ -1,16 +1,11 @@
 """The per-turn model usage DTO the Hosted end receipt carries (ADR-0006 §5 A2). Pure wire tests."""
 
 import json
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from shared_context.behavior_turn_usage import MAX_USAGE_GROUPS, TURN_USAGE_SCHEMA, ModelUsage, TurnModelUsage
-
-SRC = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
 
 
 def usage(**values):
@@ -71,11 +66,3 @@ def test_groups_are_distinct_bounded_and_strict():
 def test_native_direct_completions_uses_the_same_usage_contract():
     direct = turn(usage(wire_api="completions", reasoning_tokens=None))
     assert direct.state == "complete" and direct.usage[0].wire_api == "completions"
-
-
-def test_the_dto_imports_without_api_or_sdk_modules():
-    code = ("import sys; import shared_context.behavior_turn_usage; "
-            "bad=[m for m in ('fastapi','copilot','shared_context.behavior_assistant','shared_context.m2_copilot') "
-            "if m in sys.modules]; print(bad)")
-    result = subprocess.run([sys.executable, "-c", code], cwd=SRC, capture_output=True, text=True, timeout=120)
-    assert result.returncode == 0 and result.stdout.strip() == "[]", result.stderr

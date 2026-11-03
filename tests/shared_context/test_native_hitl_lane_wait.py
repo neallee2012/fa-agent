@@ -27,6 +27,7 @@ from shared_context.m2_copilot import ToolOutput, ToolSpec
 from shared_context.native_capabilities import NativeCapabilityBinding, NativeCapabilityProvider
 from shared_context.native_effects import NativeEffects
 from shared_context.native_hitl_wire import NativeHitlPendingQuery, NativeHitlReadback, NativeHitlTurn, hitl_key
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_m3_auth import jwk_client, signing_key
 from test_native_capabilities import OfflineResult, selected_capture
 from test_native_hitl import change, decision, hitl, post, read
@@ -34,6 +35,7 @@ from test_native_hitl_h2 import MODEL_ROOT, api_client, permission_request, verd
 from test_native_responses import response_submit, responses
 from test_native_turn_wire import submit
 from test_native_turns import IDENTITY, local_env
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 
 def sdk_wait_io(monkeypatch, *, model_io=False):
@@ -50,11 +52,12 @@ def sdk_wait_io(monkeypatch, *, model_io=False):
         exited = Event()
         client._cli_process = SimpleNamespace(pid=999, poll=lambda: 0 if exited.is_set() else None, returncode=0)
         client.stop.side_effect = exited.set
-        client.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+        client.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
 
         async def create(**options):
             sid = options["session_id"]
             session = create_autospec(CopilotSession, instance=True)
+            session.rpc = OFFLINE_SESSION_RPC
             session.session_id = sid
             session.get_events.return_value = []
             handlers = []
@@ -277,7 +280,7 @@ def test_each_lane_waits_for_signed_owner_then_executes_the_same_call_once(
         (318, 38) if choice == "allow_rule" else (307, 33) if review_failure is None else (300, 30))
     assert (responses.call(responses.runtime.read, "rid-1")).usage == completed.usage
     assert sdk_calls[0]["permission_returned"] is sdk_calls[0]["provider_returned"] is True
-    sessions[0].send.assert_awaited_once()
+    sessions[0].send.assert_awaited_once_with("Original user text")
     if lane == "foundry-responses-v1":
         assert len(responses.contexts["rid-1"]) == 1
         assert responses.response_result(response_id)["status"] == "completed"

@@ -67,12 +67,11 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 | 範圍 | 入口範例 |
 |---|---|
 | Python API／Hosted／checkpoint | `python -X utf8 -m pytest .\tests\shared_context\test_sdk_checkpoint.py -q`；將檔案換成受影響測項，可合併 selectors |
-| 指定 A/B controller 的離線契約 | `python -X utf8 -m unittest discover -s .\tests\shared_controller -p "test_*.py"` |
 | 工作台前端行為 | `node --test .\tests\shared_context\test_web_test_console_workbench.cjs` |
 | 工作台真人路徑 | [`verify-workbench`](../.claude/skills/verify-workbench/SKILL.md) 的 standin 層；適用範圍見本節末 |
 | 文件 | 檢查新增／變更連結、路徑、敘述與 diff；若沒有相關文件測試，不新增工具或跑產品完整套件 |
 
-Shared Context 的 Windows 暫存與長路徑方式見其 README「本機命令」；暫存目錄必須是本次專用、可清理的目錄，不指向使用者資料。Controller 的 fake runner 與原生雲端入口分別見 [controller README](../tests/shared_controller/README.md)。
+Shared Context 的 Windows 暫存與長路徑方式見其 README「本機命令」；暫存目錄必須是本次專用、可清理的目錄，不指向使用者資料。
 
 真 SDK＋離線模型 transport 只支持 SDK 接線／恢復的觀察，不是真模型品質或 Hosted／Blob 驗收。涉及套件邊界時，依實際 API／Hosted image 的相依集合檢查；整套開發環境可匯入，不足以證明精簡映像可啟動。
 

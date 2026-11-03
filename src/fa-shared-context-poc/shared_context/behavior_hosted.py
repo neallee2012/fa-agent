@@ -982,7 +982,7 @@ def _install_invocation_handlers(app, runtime, native_runtime, probe, responses_
 def create_host(runtime: HostedRuntime, *, native_runtime=None, responses_handler_factory=None):
     """Build the real SDK host; no legacy Hosted/M2/M3 registration is altered."""
     from azure.ai.agentserver.invocations import InvocationAgentServerHost
-    from . import behavior_native_turn_wire  # noqa: F401  # a broken import still fails before any startup write
+    from . import behavior_native_turn_wire  # a broken import still fails before any startup write
     from .behavior_foundry_probe import NativeStateProbe
 
     native_runtime = _native_runtime_for(runtime, native_runtime)

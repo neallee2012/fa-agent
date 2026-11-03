@@ -7,7 +7,9 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from .behavior_user_turn_prompt import USER_TURN_PROMPT
-from .behavior_wire import Digest, WireModel
+from .behavior_wire import Digest, WireModel, exact_prefix, known_release
+from .native_responses_wire import SENT_RELEASE
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 ASSISTANT_REPLY_PROFILE = "fa-instruction-assistant-replies-v1"
 ASSISTANT_REPLY_CAPABILITIES = ("read_context", "execute_operation", "read_user_turn", "read_assistant_reply")
@@ -57,17 +59,15 @@ class AssistantReplyPromptAssemblyRecord(WireModel):
     prefix_sha256: Digest
     prefix_utf8_bytes: Annotated[int, Field(gt=0)]
     prefix_tokens: None = None
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]
+    runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
+    _release = model_validator(mode="after")(known_release)
     omissions: tuple[str, ...] = _OMISSIONS
 
     @model_validator(mode="after")
     def exact(self):
-        raw = ASSISTANT_REPLY_PROMPT.encode("utf-8")
-        if (self.prefix_sha256 != hashlib.sha256(raw).hexdigest()
-                or self.prefix_utf8_bytes != len(raw) or self.omissions != _OMISSIONS):
-            raise ValueError("Past-assistant-reply assembly differs from its fixed source")
-        return self
+        return exact_prefix(
+            self, ASSISTANT_REPLY_PROMPT, _OMISSIONS, "Past-assistant-reply assembly differs from its fixed source")
 
 
 @dataclass(frozen=True)

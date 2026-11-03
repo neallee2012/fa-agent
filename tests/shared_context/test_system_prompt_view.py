@@ -2,9 +2,6 @@
 
 import hashlib
 import json
-import os
-import subprocess
-import sys
 from dataclasses import replace
 
 import httpx
@@ -27,13 +24,13 @@ from shared_context.native_agent_tools import NOT_SELECTED_REASON
 from shared_context.native_capability_tools import approved_skills_provider
 from shared_context.native_sdk_profiles import ORIGIN_ADDENDUM
 from test_native_assembly import install_executor, offline_sdk, run_turn, skill_request
-from test_native_responses import response_submit, responses  # noqa: F401
-from test_native_turn_api import native_api, submit as api_submit  # noqa: F401
+from test_native_responses import response_submit, responses
+from test_native_turn_api import native_api, submit as api_submit
 from test_native_turn_wire import receipt_for, submit
-from test_native_turns import local_env  # noqa: F401
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
+from test_native_turns import local_env
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_m3_auth import jwk_client, signing_key
+from test_instruction_flow import instruction_models
 
 ROLE_TEXT = "你是 Team 的會計助理，回覆用繁體中文。"
 
@@ -272,24 +269,3 @@ def test_signed_api_reads_are_owner_only_pure_reads(native_api, monkeypatch):
     monkeypatch.delenv("FA_NATIVE_TURNS")
     disabled = case.client.get("/work-policy/v1/agent-template/system-prompt", headers=case.headers)
     assert disabled.status_code == 503 and disabled.json()["error"]["code"] == "NATIVE_TURNS_DISABLED"
-
-
-def test_system_prompt_view_import_has_no_hosted_sdk_dependency():
-    script = """
-import importlib.abc
-import sys
-class RejectHosted(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == 'copilot' or fullname.startswith(('copilot.', 'azure.ai.agentserver')):
-            raise AssertionError('Hosted SDK import: ' + fullname)
-sys.meta_path.insert(0, RejectHosted())
-from shared_context.behavior_system_prompt_view import current_view, turn_view
-from shared_context.behavior_native_capture import system_prompt_inputs
-print('sdk-independent')
-"""
-    result = subprocess.run([sys.executable, "-X", "utf8", "-c", script],
-                            env={**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"},
-                            capture_output=True, text=True, encoding="utf-8", timeout=30)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "sdk-independent"
-

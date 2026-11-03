@@ -71,7 +71,8 @@ class SdkCheckpointStore:
             if self.artifacts.read(binding.team_id, artifact, version, receipt) != data:
                 raise Problem(409, "SDK_STATE_INCOMPLETE", "SDK state part readback differs")
             parts.append(SdkStatePart(version_id=version, receipt=receipt))
-        return StoredSdkArchive(sdk_session_id=state.sdk_session_id, conversation_id=conversation_id,
+        return StoredSdkArchive(sdk_version=state.sdk_version, runtime_version=state.runtime_version,
+            sdk_session_id=state.sdk_session_id, conversation_id=conversation_id,
             job_id=binding.job_id, tenant_id=binding.tenant_id, team_id=binding.team_id, agent_oid=binding.agent_oid,
             artifact_id=artifact, sha256=state_sha, byte_length=len(raw), parts=tuple(parts),
             codec=ARCHIVE_CODECS[state.codec], source=source,
@@ -105,6 +106,7 @@ class SdkCheckpointStore:
         try:
             state = SdkState.model_validate_json(raw)
             if (state.sdk_session_id != sdk_session_id or state.encoded() != raw
+                    or (state.sdk_version, state.runtime_version) != (reference.sdk_version, reference.runtime_version)
                     or state.model_provider != reference.model_provider
                     or ARCHIVE_CODECS[state.codec] != reference.codec):
                 raise ValueError()
@@ -154,7 +156,8 @@ def _source(authority, session, command):
             unverified()
     else:
         from .behavior_assistant_checkpoint import unpack
-        prior = SdkState(sdk_session_id=previous.archive.sdk_session_id, files=unpack(previous.archive))
+        prior = SdkState(sdk_version=previous.archive.sdk_version, runtime_version=previous.archive.runtime_version,
+                         sdk_session_id=previous.archive.sdk_session_id, files=unpack(previous.archive))
     events = events_from(command.state.files)
     validate_inherited(events, prior)
     if prior.codec in DIAG_CODECS:

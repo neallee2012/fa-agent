@@ -164,7 +164,7 @@ def test_group_publication_failure_never_prevents_the_original_peer_notification
     monkeypatch.delenv(TEAM_ENV, raising=False)
     monkeypatch.delenv("FA_NATIVE_HITL_ENABLED", raising=False)
     for name, value in {
-        "FA_NATIVE_TURNS": "foundry-native-v1", "FA_NATIVE_GROUPS_ENABLED": "1",
+        "FA_NATIVE_TURNS": "foundry-native-v3", "FA_NATIVE_GROUPS_ENABLED": "1",
         "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform", "AGENTSERVER_TASKS_BACKEND": "hosted",
         "HOME": str(home), "BEHAVIOR_ASSISTANT_RUNTIME_PATH": str(runtime_path),
         "FOUNDRY_PROJECT_ENDPOINT": "https://offline.services.ai.azure.com/api/projects/offline",
@@ -228,7 +228,7 @@ def test_a_refused_peer_rids_notice_also_posts_its_group_completion(tmp_path, mo
     monkeypatch.delenv(TEAM_ENV, raising=False)
     monkeypatch.delenv("FA_NATIVE_HITL_ENABLED", raising=False)
     for name, value in {
-        "FA_NATIVE_TURNS": "foundry-native-v1", "FA_NATIVE_GROUPS_ENABLED": "1",
+        "FA_NATIVE_TURNS": "foundry-native-v3", "FA_NATIVE_GROUPS_ENABLED": "1",
         "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform", "AGENTSERVER_TASKS_BACKEND": "hosted",
         "HOME": str(home), "BEHAVIOR_ASSISTANT_RUNTIME_PATH": str(runtime_path),
         "FOUNDRY_PROJECT_ENDPOINT": "https://offline.services.ai.azure.com/api/projects/offline",

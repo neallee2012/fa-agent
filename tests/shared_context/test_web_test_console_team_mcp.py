@@ -8,9 +8,9 @@ import pytest
 
 from web_test_console.adapter import ConsoleError
 from web_test_console.team_mcp import TeamMcp, install_team_mcp_routes, is_team_mcp_write
-from test_m3_auth import jwk_client, signing_key  # noqa: F401  (fixtures used by team_mcp)
-from test_team_mcp_api import SECRET, team_mcp  # noqa: F401
-from test_web_test_console_frozen_interface import real_interface  # noqa: F401
+from test_m3_auth import jwk_client, signing_key  # fixtures used by team_mcp
+from test_team_mcp_api import SECRET, team_mcp
+from test_web_test_console_frozen_interface import real_interface
 
 
 def console_for(api, identity="owner"):

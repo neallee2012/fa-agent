@@ -84,7 +84,7 @@ def test_verified_registry_shaped_recipient_accepts_once_and_queues_behind_its_a
     assert harness.sdk.max_active == 1
 
 
-@pytest.mark.parametrize("case", ["self", "team", "tenant", "human", "oid", "receipt", "ended"])
+@pytest.mark.parametrize("case", ["self", "team", "tenant", "human", "oid", "receipt", "ended", "stopped"])
 def test_native_relay_refuses_untrusted_sender_or_cross_scope_before_receiving(case):
     from shared_context.native_agent_relay import NativePeerRequest, prepare_request
 
@@ -101,6 +101,8 @@ def test_native_relay_refuses_untrusted_sender_or_cross_scope_before_receiving(c
         principal = replace(principal, oid="ffffffff-ffff-ffff-ffff-ffffffffffff")
     elif case == "receipt":
         sender = sender.model_copy(update={"agent_id": recipient.target.agent_id})
+    elif case == "stopped":
+        sender = sender.model_copy(update={"cancel_requested": True})
     else:
         sender = sender.model_copy(update={"status": "unknown"})
     with pytest.raises(Problem) as refused:
@@ -110,7 +112,10 @@ def test_native_relay_refuses_untrusted_sender_or_cross_scope_before_receiving(c
     assert refused.value.status == 403
 
 
-def test_completed_peer_result_wakes_the_original_cid_with_the_original_request_message_id():
+@pytest.mark.parametrize("stopped_too_late", [False, True])
+def test_completed_peer_result_wakes_the_original_cid_with_the_original_request_message_id(stopped_too_late):
+    """A stop that came after the peer's answer was saved leaves it completed with cancel_requested (#1145): its
+    result still goes back."""
     from shared_context.native_agent_relay import NativePeerRequest, prepare_request, prepare_result
 
     _, scope, recipient, principal, sender = sender_case()
@@ -128,7 +133,7 @@ def test_completed_peer_result_wakes_the_original_cid_with_the_original_request_
         request_id=request.command.request_id, conversation_id="peer-cid",
         submit_digest=request.sha256, capture_digest=request.capture.sha256,
         command=request.command, capture=request.capture, source=request.source,
-        status="completed", turn_number=1, result=reference)
+        status="completed", turn_number=1, result=reference, cancel_requested=stopped_too_late)
     peer_principal = replace(principal, oid=str(recipient.identity.oid), actor_id=recipient.identity.actor)
     wake = prepare_result(peer_principal, recipient, completed, scope, sender.capture, reference, text)
     assert wake.command.request_id == request.source.message_id == wake.source.in_reply_to

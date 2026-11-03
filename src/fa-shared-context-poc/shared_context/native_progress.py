@@ -12,7 +12,7 @@ from .native_progress_wire import NativeProgressSnapshot, progress_snapshot
 
 log = logging.getLogger(__name__)
 
-# SDK 1.0.13 stop() can join two threads for one second each on this event loop.
+# Observed on SDK 1.0.13: stop() can join two threads for one second each on this event loop.
 _SAVE_TIMEOUT_SECONDS = 5
 _FINISH_WAIT_SECONDS = 1
 

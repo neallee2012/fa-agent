@@ -429,7 +429,7 @@ def test_a_routine_turn_runs_on_its_conversations_model_not_the_project_default(
 
 @pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
 def test_a_run_keeps_the_approval_conversations_settings_after_the_team_template_changes(routine_api):
-    """Review 2026-10-23: a run opens a new conversation, but it must not take the Team's current new-conversation
+    """A run opens a new conversation, but it must not take the Team's current new-conversation
     template, or role, skills, capabilities, connectors or channel would change without the owner approving again."""
     from shared_context.behavior_agent_template import AgentTemplate, TemplateSettings, export_template
     from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
@@ -549,7 +549,7 @@ def test_an_intent_saved_before_the_change_still_continues_its_original_conversa
 
 @pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
 def test_a_run_naming_another_conversation_is_refused_not_skipped(routine_api):
-    """Review 2026-10-23: a run's command CID is empty or its definition's; anything else is a 409, as before, not a
+    """A run's command CID is empty or its definition's; anything else is a 409, as before, not a
     reference silently left out."""
     from test_conversation_transfer_startup import read_startup
 

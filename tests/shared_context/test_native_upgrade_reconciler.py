@@ -14,12 +14,12 @@ import pytest
 from shared_context.behavior_native_turn_wire import NativeEnvironmentNotice, NativeEnvironmentView
 from shared_context.errors import Problem
 from shared_context.native_upgrade_reconciler import RECONCILE_BACKOFF_SECONDS, RECONCILE_SECONDS, NativeUpgradeReconciler
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401  (fixture)
-from test_instruction_flow import instruction_models  # noqa: F401  (fixture)
-from test_m3_auth import jwk_client, signing_key  # noqa: F401  (fixtures)
-from test_native_session_patrol import own_loop, patrol  # noqa: F401  (fixtures)
+from test_conversation_transfer_startup import synthetic_standing_v1  # fixture
+from test_instruction_flow import instruction_models  # fixture
+from test_m3_auth import jwk_client, signing_key  # fixture
+from test_native_session_patrol import own_loop, patrol  # fixture
 from test_native_session_patrol import bind as bind_row, roster as roster_rows
-from test_native_turn_api import native_api  # noqa: F401  (fixture)
+from test_native_turn_api import native_api  # fixture
 
 V2 = "foundry-native-v2"  # ADR-0009 2d-ii: the one supported profile, so a "compatible" row is v2 (v1 is incompatible)
 
@@ -477,7 +477,7 @@ def test_a_note_made_before_this_agents_veto_is_not_shown_after_it(patrol, selec
 
 
 def test_a_note_made_before_the_project_veto_is_cleared_by_the_next_pass(patrol, selector):
-    """#912 review P3: the project row is not on the binding row, so ``waiting_version()`` kept answering 42."""
+    """#912: the project row is not on the binding row, so ``waiting_version()`` kept answering 42."""
     from shared_context.native_version_veto import veto_store
 
     case = patrol

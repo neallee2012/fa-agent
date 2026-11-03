@@ -28,7 +28,7 @@ from test_native_files_api import (
     synthetic_standing_v1, token,
 )
 from test_native_follow_no_wake import source_calls
-from test_native_hitl import hitl  # noqa: F401
+from test_native_hitl import hitl
 from test_native_session_prepare_api import project_client
 from test_native_turn_wire import submit
 from test_native_turns import Harness, OfflineSdk
@@ -265,7 +265,7 @@ def test_d_an_incompatible_deleted_source_needs_one_read(file_api, monkeypatch):
 
 
 def test_e_only_receipts_of_previous_sids_get_the_earlier_version_notice(file_api, monkeypatch):
-    """(e), review round 2 P2-4/P2-5: a ``started`` receipt left on an idle source may still finish, so it reads as
+    """(e): a ``started`` receipt left on an idle source may still finish, so it reads as
     ordinary progress (no resend asked: boundary 7); once Hosted marks it after N unchanged minutes (the read itself
     advances the stall rule) it reads with the notice, keeping its own failure code. A SID neither current nor
     previous is undecidable."""
@@ -308,7 +308,7 @@ def test_f_the_commit_rewrites_the_binding_row_and_backfills_unfinished_sids(fil
     assert switched.last_switch == NativeBindingSwitch(
         reason="abandon_source", previous_hosted_session_id=fixture.source.session_id, files_migrated=False,
         basis="incompatible", source_status="idle")
-    older = read_request(fixture, "older-stuck")  # a backfilled SID is not known retired: it may still finish (P2-4)
+    older = read_request(fixture, "older-stuck")  # a backfilled SID is not known retired: it may still finish
     assert older.json()["status"] == "started" and "environment_notice" not in older.json(), older.text
 
 
@@ -421,7 +421,7 @@ def test_j_a_crash_after_the_commit_is_repaired_by_the_rerun(file_api, monkeypat
     assert repaired.hosted_session_id == fixture.destination.session_id
     assert repaired.earlier(fixture.source.session_id) and repaired.last_switch.reason == "abandon_source"
     assert [call for call in fixture.files.calls if call[0] == "create"] == [("create", fixture.destination.session_id)]
-    after = read_request(fixture, "stuck-started").json()  # idle source: ordinary progress until it settles (P2-4)
+    after = read_request(fixture, "stuck-started").json()  # idle source: ordinary progress until it settles
     assert after["status"] == "started" and "environment_notice" not in after
 
 
@@ -579,7 +579,7 @@ def test_n_a_drifted_idle_sid_does_not_hold_the_switch(file_api, monkeypatch, me
     assert source_calls(fixture) == ([], [], [])
     assert row(fixture).last_switch.basis == "drifted" and row(fixture).last_switch.source_status == "idle"
     # M9: the receipt pinned before the drift never started, so the new session adopts and runs it (no resend); the
-    # started one stays byte for byte and reads as ordinary progress until it settles (P2-4).
+    # started one stays byte for byte and reads as ordinary progress until it settles.
     assert Harness(fixture.runtime, sdk, fixture.hosted).wait("pinned-before-drift", "completed")
     assert [rid for rid, *_ in seen] == ["pinned-before-drift"]
     assert raw(fixture, "pinned-before-drift")[0]["adopted_from"] == fixture.source.session_id
@@ -1322,11 +1322,8 @@ def test_k_enforcement_is_a_setting_off_by_default(file_api, monkeypatch):
     assert behavior_native_sessions.NativeSessions(fixture.case.composition).guard.enforce is True
 
 
-# Review round 2 (2026-10-13).
-
-
 def test_r_a_message_waiting_behind_a_left_receipt_never_holds_the_agents_other_conversations(file_api, monkeypatch):
-    """P1-2: the waiting message leaves the Agent's chain (a wait task of its own holds it), so another conversation of
+    """The waiting message leaves the Agent's chain (a wait task of its own holds it), so another conversation of
     the same Agent runs to completion meanwhile; the waiting one runs once the left receipt is marked."""
     from shared_context import native_left_receipts
 
@@ -1348,7 +1345,7 @@ def test_r_a_message_waiting_behind_a_left_receipt_never_holds_the_agents_other_
 
 
 def test_r_messages_waiting_behind_a_left_receipt_run_oldest_first(file_api, monkeypatch):
-    """P1-1 order (Invocations): two messages wait behind the same left receipt; once it is marked they run in the
+    """Order (Invocations): two messages wait behind the same left receipt; once it is marked they run in the
     order they were accepted, each once."""
     from shared_context import native_left_receipts
 
@@ -1381,7 +1378,7 @@ class RecordingResponses:
 
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 def test_s_a_waiting_message_takes_the_slot_without_any_poll_and_goes_before_the_next(file_api, monkeypatch):
-    """P1-1 (s) for a caller that never polls (a Teams-like relay): Hosted's own wait task advances the stall rule and
+    """(s) for a caller that never polls (a Teams-like relay): Hosted's own wait task advances the stall rule and
     gives the waiting message the slot; the owner's next message is accepted behind it (never refused, never ahead of
     it), and the API's advance of that send dispatches the first message, once."""
     from shared_context import native_left_receipts
@@ -1415,7 +1412,7 @@ def test_s_a_waiting_message_takes_the_slot_without_any_poll_and_goes_before_the
 
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 def test_s_an_older_waiting_message_goes_first_even_before_its_wait_task_looks_again(file_api, monkeypatch):
-    """P1-1 order (s): the left receipt can be marked by the next message's own admission before the older message's
+    """Order (s): the left receipt can be marked by the next message's own admission before the older message's
     wait task looks again; the older one still takes the slot and the newer one waits behind it."""
     from shared_context import native_left_receipts
     from test_native_responses import response_submit
@@ -1437,9 +1434,9 @@ def test_s_an_older_waiting_message_goes_first_even_before_its_wait_task_looks_a
 
 @pytest.mark.parametrize("source", ["idle", "deleted"])
 def test_m9_a_never_started_receipt_is_adopted_and_runs_before_newer_messages(file_api, monkeypatch, source):
-    """P2-3 / M9: the source accepted a message in an existing conversation and never started it. The new session
+    """M9: the source accepted a message in an existing conversation and never started it. The new session
     adopts it at the switch and runs it from the conversation's checkpoint before a message sent after the switch.
-    Review round 3: the same on a retired source (the platform can not run it there); no resend is asked."""
+    The same on a retired source (the platform can not run it there); no resend is asked."""
     fixture = file_api
     incompatible_idle(fixture, monkeypatch, status=source)
     cid = fixture.saved.conversation_id
@@ -1461,9 +1458,9 @@ def test_m9_a_never_started_receipt_is_adopted_and_runs_before_newer_messages(fi
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 @pytest.mark.parametrize("source", ["idle", "deleted"])
 def test_m9_a_never_started_slot_holder_is_adopted_and_keeps_its_slot(file_api, monkeypatch, source):
-    """(s) with M9: the slot holder never started, so the new session adopts it and it keeps the slot. Review round 3
-    (decision 1): the next human message is accepted and queued behind it (never ``busy_refused``), and the API's
-    advance of that send dispatches the adopted one, once."""
+    """(s) with M9: the slot holder never started, so the new session adopts it and it keeps the slot. The next
+    human message is accepted and queued behind it (never ``busy_refused``), and the API's advance of that send
+    dispatches the adopted one, once."""
     from shared_context.behavior_native_responses_api import _advance_inflight
     from shared_context.behavior_native_turn_wire import NativeReceipt
     from test_native_responses import response_submit
@@ -1491,9 +1488,9 @@ def test_m9_a_never_started_slot_holder_is_adopted_and_keeps_its_slot(file_api, 
 
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 def test_m9_the_next_message_queues_behind_an_adopted_holder_even_without_its_queue_entry(file_api, monkeypatch):
-    """Review round 3 (decision 1) on its own: the adopted holder's queue entry and wait task were not confirmed (the
-    adoption itself was), so only the holder's state can tell the next human message to wait; it is accepted and
-    queued, never ``busy_refused``."""
+    """The adoption alone (unlike test_m9_a_never_started_slot_holder_is_adopted_and_keeps_its_slot): the adopted
+    holder's queue entry and wait task were not confirmed (the adoption itself was), so only the holder's state can
+    tell the next human message to wait; it is accepted and queued, never ``busy_refused``."""
     from shared_context import native_left_receipts
     from test_native_responses import response_submit
 
@@ -1521,7 +1518,7 @@ def test_m9_the_next_message_queues_behind_an_adopted_holder_even_without_its_qu
 
 def test_e_a_never_started_receipt_on_a_retired_source_whose_adoption_is_unconfirmed_is_never_called_lost(
         file_api, monkeypatch):
-    """Review round 3 (decision 2): on a retired source only a ``started`` receipt can no longer complete; a
+    """On a retired source only a ``started`` receipt can no longer complete; a
     never-started one is adopted, so while its adoption is unconfirmed it reads as it is (no "resend it" notice) and
     the next read adopts it."""
     from shared_context import native_left_receipts
@@ -1575,7 +1572,7 @@ def test_9_a_never_started_receipt_refused_by_version_is_not_adopted_and_reads_f
 
 
 def test_9_an_adopted_receipt_its_chain_refuses_by_version_reads_final_not_queued_forever(file_api, monkeypatch):
-    """Review P1 on #889: M9 adopts a RID and puts it on the chain, the VM drifts before the chain takes it, and the chain
+    """#889: M9 adopts a RID and puts it on the chain, the VM drifts before the chain takes it, and the chain
     refuses it (``refused:<RID>``, out of its queue). Nothing starts it again, so it must read final like any other
     refused RID, not ``accepted`` forever."""
     from azure.ai.agentserver.core.tasks import TaskContext
@@ -1609,7 +1606,7 @@ def test_9_an_adopted_receipt_its_chain_refuses_by_version_reads_final_not_queue
 
 
 def test_9_a_markers_store_the_new_session_cached_as_missing_never_lets_it_adopt_a_refused_rid(file_api, monkeypatch):
-    """Review P3 on #889: the new session's health check cached the markers store as missing before the old session
+    """#889: the new session's health check cached the markers store as missing before the old session
     wrote its first refusal (the old session's own process creates the store); ``adopt`` looks again instead of
     trusting that miss, so the refused RID is neither adopted nor run, and reads final."""
     from shared_context.native_markers import MARKERS_STORE
@@ -1660,7 +1657,7 @@ def release_28():
 @pytest.mark.parametrize("image", ["release-28", "this-image"])
 def test_m9_a_source_turn_parked_before_the_switch_never_starts_or_writes_the_adopted_receipt(
         release_28, file_api, monkeypatch, image):
-    """P2-3, against the source's own code: its turn passed the start check before the switch and waits for the
+    """Against the source's own code: its turn passed the start check before the switch and waits for the
     execution slot (another turn holds it). The new session adopts the message and runs it once. The parked turn ends
     without starting or writing it: release 28 can not read the adopted item at all (``adopted_from`` with
     ``extra="forbid"``: ``NATIVE_STATE_INVALID`` at its next 0.1 s read), this image sees another session owns it."""
@@ -1748,7 +1745,7 @@ def test_m9_an_image_before_the_adoption_field_can_not_read_an_adopted_receipt(f
 
 
 def test_r_a_mark_that_loses_to_the_source_finishing_continues_from_its_checkpoint(file_api, monkeypatch):
-    """"(r)(s) 的競爭" (4) at the mark itself (P2-5): N unchanged minutes pass and the source saves its turn in the instant
+    """"(r)(s) 的競爭" (4) at the mark itself: N unchanged minutes pass and the source saves its turn in the instant
     before the mark's CAS. The CAS loses on the changed ETag, the read-back is ``completed`` (never marked, no 503 to
     anyone), and the queued message continues from that turn's checkpoint. A coverage test: the wait task's next pass
     would also continue, so the read-back itself is pinned by ``test_s_a_mark_that_loses_…_in_the_same_pass``."""
@@ -1786,7 +1783,7 @@ def test_r_a_mark_that_loses_to_the_source_finishing_continues_from_its_checkpoi
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 def test_s_a_mark_that_loses_to_the_source_finishing_is_decided_by_its_read_back_in_the_same_pass(
         file_api, monkeypatch):
-    """Review round 3 (decision 4): the mark's own read-back decides. The source writes its terminal ``unknown`` in the
+    """The mark's own read-back decides. The source writes its terminal ``unknown`` in the
     instant before the mark's CAS; the CAS loses on the changed ETag and the read-back sees the source's terminal
     receipt, so this very pass releases the slot: one status read of the waiting message takes it. The message is only
     queued here (no wait task runs), so no other pass can stand in for the read-back (without it this read answers
@@ -1823,7 +1820,7 @@ def test_s_a_mark_that_loses_to_the_source_finishing_is_decided_by_its_read_back
 
 
 def api_driver(fixture, signing_key, *, behind_the_switch=0):
-    """Review round 3: Hosted's own path to the API (``NativeAgentRelayClient`` with the Agent's identity, as in
+    """Hosted's own path to the API (``NativeAgentRelayClient`` with the Agent's identity, as in
     production ``native_sdk``) asking it to send a waiting Responses message; served by the real API app in-process.
     ``behind_the_switch``: that many first requests get the API's 409 ``NATIVE_SESSION_CHANGED`` (an API that has not
     caught up with the switch). Returns the RIDs Hosted asked for, one entry per request."""
@@ -1867,7 +1864,7 @@ def posts_of(fixture, content):
 @pytest.mark.parametrize("file_api", [{"lane": "foundry-responses-v1"}], indirect=True)  # the API's own capture
 def test_s_a_teams_message_is_sent_once_after_the_relay_stops_polling_and_its_reply_is_read_later(
         file_api, monkeypatch, signing_key):
-    """Review round 3 (decision 3), the Teams relay's own API path (``TeamsRelay.turn``): the message is accepted
+    """The Teams relay's own API path (``TeamsRelay.turn``): the message is accepted
     behind a left ``started`` receipt and the relay answers ``running``; it then stops polling (``WAIT_SECONDS`` 110,
     far below N) and nothing reads the RID or sends to the conversation. After N unchanged minutes Hosted's wait task
     marks the left receipt, takes the slot and asks the API to send the message; the API sends it once, the new session
@@ -1914,9 +1911,9 @@ def test_s_a_teams_message_is_sent_once_after_the_relay_stops_polling_and_its_re
 
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 def test_m9_an_adopted_slot_holder_is_sent_once_with_no_poll(file_api, monkeypatch, signing_key):
-    """Review round 3 (decision 3) with M9: a never-started slot holder adopted at the switch gets a wait task of its
+    """With M9: a never-started slot holder adopted at the switch gets a wait task of its
     own, which has the API send it; a 409 ``NATIVE_SESSION_CHANGED`` (an API still finishing the switch) is asked again
-    after the ``early_delay`` backoff (shrunk here; review round 6). It runs once in the new session with no read or
+    after the ``early_delay`` backoff (shrunk here). It runs once in the new session with no read or
     later message."""
     from shared_context import native_left_receipts
 
@@ -1972,7 +1969,7 @@ def test_the_api_sends_only_the_agents_own_waiting_responses_message(file_api, m
 
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 def test_the_api_does_not_send_a_waiting_message_after_the_owner_policy_is_revoked(file_api, monkeypatch, signing_key):
-    """Review round 4 (P2-1): like every owner send, ``/waiting-dispatch`` reads the owner's work policy again before
+    """Like every owner send, ``/waiting-dispatch`` reads the owner's work policy again before
     the billable POST. Revoked: 403 ``WORK_POLICY_REVOKED``, nothing sent, and Hosted's client keeps that code."""
     from shared_context.behavior_native_agent_wire import NATIVE_AGENT_PREFIX
     from test_native_responses import response_submit
@@ -1998,7 +1995,7 @@ def test_the_api_does_not_send_a_waiting_message_after_the_owner_policy_is_revok
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 def test_a_waiting_message_refused_for_a_revoked_owner_policy_waits_and_is_sent_once_restored(
         file_api, monkeypatch, signing_key):
-    """Review round 5 (P2-2), end to end: the owner's policy is revoked while an adopted slot holder waits for its
+    """End to end: the owner's policy is revoked while an adopted slot holder waits for its
     send. Hosted asks the API once; the API sends nothing (403 ``WORK_POLICY_REVOKED``) and the receipt is left as an
     owner send under that policy leaves it: ``accepted``, ``needs_response``, holding its slot, not ended and not asked
     again. Once the policy is restored, the API's next touch of the conversation (the owner's next message) sends it,
@@ -2067,7 +2064,7 @@ def test_a_waiting_message_refused_for_a_revoked_owner_policy_waits_and_is_sent_
 @pytest.mark.parametrize("gate", ["after-the-slot", "before-the-start"])
 def test_m9_a_source_responses_turn_parked_before_the_switch_never_touches_the_adopted_receipt(
         file_api, monkeypatch, signing_key, gate):
-    """Review round 4 (P2-2), the Responses analog of the parked Invocations case, against this image's own handler:
+    """The Responses analog of the parked Invocations case, against this image's own handler:
     the source's Responses handler passed its checks before the switch and waits in its execution slot. The new
     session adopts the message, the API sends it there and it starts. The parked handler then goes on:
 
@@ -2186,7 +2183,7 @@ def test_m9_a_source_responses_turn_parked_before_the_switch_never_touches_the_a
 
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 def test_an_api_without_the_waiting_dispatch_route_is_asked_again(file_api, monkeypatch, signing_key):
-    """Review round 4 (P3): deploy order is API before Hosted, but a Hosted image that meets an older API (its
+    """Deploy order is API before Hosted, but a Hosted image that meets an older API (its
     ``/waiting-dispatch`` is 404, nothing sent) asks again after ``RESEND_SECONDS`` instead of giving up; once the
     API has the route, the adopted slot holder is sent once and runs."""
     import httpx
@@ -2224,7 +2221,7 @@ def test_an_api_without_the_waiting_dispatch_route_is_asked_again(file_api, monk
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 @pytest.mark.parametrize("failure", ["5xx", "transport", "404"])
 def test_a_waiting_send_the_api_keeps_failing_ends_after_its_attempt_budget(file_api, monkeypatch, failure):
-    """Review round 5 (P2-1): failed requests to send a waiting message (5xx, a transport error, an older API's 404)
+    """Failed requests to send a waiting message (5xx, a transport error, an older API's 404)
     are bounded by ``SEND_ATTEMPTS``, not by the wait task's timeout (which now hands over to a successor; left long
     enough here not to fire, so the budget alone ends it): after that many failed requests the message ends
     ``unknown`` (``NATIVE_TURN_TIMEOUT``), never a silent ``needs_response``, and is not asked for again."""
@@ -2262,7 +2259,7 @@ def test_a_waiting_send_the_api_keeps_failing_ends_after_its_attempt_budget(file
 
 
 def test_a_waiting_send_the_api_answers_early_backs_off_from_the_next_look_to_five_minutes():
-    """Review round 6 (P3): a 409 ``NATIVE_SESSION_CHANGED`` in a row is asked again at the next look (5 s), then
+    """A 409 ``NATIVE_SESSION_CHANGED`` in a row is asked again at the next look (5 s), then
     after ``RESEND_SECONDS`` (30 s), doubling up to 5 minutes, and stays there: never every 5 s without end, never a
     failure."""
     from shared_context import native_left_receipts
@@ -2276,7 +2273,7 @@ def test_a_waiting_send_the_api_answers_early_backs_off_from_the_next_look_to_fi
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 def test_a_waiting_send_the_api_answers_early_is_asked_again_with_backoff_and_runs(
         file_api, monkeypatch, signing_key):
-    """Review round 6 (P3): the API keeps answering 409 ``NATIVE_SESSION_CHANGED`` (it has not caught up with the
+    """The API keeps answering 409 ``NATIVE_SESSION_CHANGED`` (it has not caught up with the
     switch; nothing sent). The wait task asks again with the ``early_delay`` backoff (shrunk here), not at every look,
     never counts it as failed (``SEND_ATTEMPTS`` 2 here would end it), and the message runs once the API answers."""
     import time
@@ -2351,7 +2348,7 @@ def move_progress(fixture, rid, text):
 
 
 def test_r_a_message_waits_behind_a_healthy_left_turn_longer_than_one_wait_task(file_api, monkeypatch):
-    """Review round 5 (P2-1): the left turn keeps progressing for more than an hour (simulated clock; each step under
+    """The left turn keeps progressing for more than an hour (simulated clock; each step under
     N). Each wait task's timeout (shrunk) hands over to a successor: the message stays ``accepted`` in its queue,
     never ``NATIVE_TURN_TIMEOUT``, and runs once the left turn is done (stalled here, so marked)."""
     import time
@@ -2385,7 +2382,7 @@ def test_r_a_message_waits_behind_a_healthy_left_turn_longer_than_one_wait_task(
 
 
 def test_r_a_wait_task_recovered_past_its_timeout_hands_over_to_a_successor(file_api, monkeypatch):
-    """Review round 5 (P2-1): after a VM restart the SDK recovers the wait task with its budget already passed and sets
+    """After a VM restart the SDK recovers the wait task with its budget already passed and sets
     ``timeout_exceeded`` before its first look (``_compute_remaining_for_watchdog``). The message is not ended: the
     task starts one successor (a new task ID derived from its own) and returns; the same recovered task run again
     finds that successor (no second one)."""
@@ -2428,7 +2425,7 @@ def test_r_a_wait_task_recovered_past_its_timeout_hands_over_to_a_successor(file
 
 
 def test_r_a_left_turn_that_stalls_across_a_wait_task_timeout_is_marked_and_the_message_runs(file_api, monkeypatch):
-    """Review round 5 (P2-1), the stalled side: the left turn stops changing; the wait task's timeout (shrunk) fires
+    """The stalled side: the left turn stops changing; the wait task's timeout (shrunk) fires
     before and after N passes. The stall rule decides as before: the left receipt is marked ``unknown``
     (``NATIVE_SOURCE_STALLED``) and the queued message runs, once; the timeout itself never fails the message."""
     import time
@@ -2456,7 +2453,7 @@ def test_r_a_left_turn_that_stalls_across_a_wait_task_timeout_is_marked_and_the_
 
 @pytest.mark.parametrize("failure", ["queue-503", "start-transport"])
 def test_r_a_transient_error_handing_over_to_a_successor_is_retried(file_api, monkeypatch, failure):
-    """Review round 6 (P3): the hand-over on ``timeout_exceeded`` meets a brief error once: a 503 writing the
+    """The hand-over on ``timeout_exceeded`` meets a brief error once: a 503 writing the
     conversation's queue (``enqueue``) or a transport error starting the successor task. The task does not fail with it
     (that left the message ``accepted`` at its queue's head with no task looking at it): it looks again after
     ``POLL_SECONDS``, starts the successor, and the message runs once the left turn is marked stalled."""
@@ -2506,7 +2503,7 @@ def test_r_a_transient_error_handing_over_to_a_successor_is_retried(file_api, mo
 @pytest.mark.parametrize("file_api", ["foundry-responses-v1"], indirect=True)
 @pytest.mark.parametrize("caller", ["another-agent", "an-unknown-app"])
 def test_only_the_agents_own_identity_can_have_its_waiting_message_sent(file_api, monkeypatch, signing_key, caller):
-    """Review round 4 (P3): ``/waiting-dispatch`` with another Agent's token (or an app that is no Agent) is refused
+    """``/waiting-dispatch`` with another Agent's token (or an app that is no Agent) is refused
     and nothing is sent; the message keeps waiting for its own Agent. A registered teammate reading through its own
     session: ``test_native_agent_api.test_another_agent_can_not_have_a_waiting_responses_message_sent``."""
     from shared_context.behavior_native_agent_wire import NATIVE_AGENT_PREFIX

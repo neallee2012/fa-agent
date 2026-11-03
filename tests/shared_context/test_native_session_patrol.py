@@ -16,10 +16,10 @@ from shared_context import native_binding
 from shared_context.behavior_native_sessions import RETIRED_CONFIRM_SECONDS, RETIRED_PAIR_SECONDS
 from shared_context.native_binding import binding_store
 from shared_context.native_session_patrol import NativeSessionPatrol
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401  (fixture)
-from test_instruction_flow import instruction_models  # noqa: F401  (fixture)
-from test_m3_auth import jwk_client, signing_key  # noqa: F401  (fixtures)
-from test_native_turn_api import native_api  # noqa: F401  (fixture)
+from test_conversation_transfer_startup import synthetic_standing_v1  # fixture
+from test_instruction_flow import instruction_models  # fixture
+from test_m3_auth import jwk_client, signing_key  # fixture
+from test_native_turn_api import native_api  # fixture
 
 
 class Platform:

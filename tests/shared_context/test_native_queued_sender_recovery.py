@@ -26,6 +26,11 @@ from test_native_turns import (
 )
 
 
+def numbered(harness, started):
+    # A turn that dispatched a tool was numbered first: the SDK runs only after ``_allocate`` writes turn_number.
+    return harness.call(harness.runtime._allocate, started)[0]
+
+
 def test_production_factory_binds_queue_recovery_to_its_own_sender(local_env, tmp_path, monkeypatch):
     from shared_context import native_sdk
     from test_native_sdk import AssistantSupervisor, MODEL_ROOT
@@ -41,7 +46,7 @@ def test_production_factory_binds_queue_recovery_to_its_own_sender(local_env, tm
         calls.append((client.runtime, runtime, original))
 
     monkeypatch.setattr(NativeAgentRelayClient, "recover_queued", observed)
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     monkeypatch.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
     monkeypatch.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
     monkeypatch.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(executable))
@@ -70,6 +75,8 @@ def test_recovered_sender_joins_the_original_queue_before_becoming_unknown(
                 return json.dumps((await store.get_item(f"turn:{meta.n}")).value, sort_keys=True)
 
         before = harness.call(saved_turn_bytes)
+    else:
+        original = numbered(harness, original)
     receipt = original.value.receipt
     message = NativePeerRequest(recipient_agent_id="peer", kind="request", content="Original queued brief.")
     queued = NativeRelaySend(
@@ -324,7 +331,7 @@ def test_recovery_does_not_join_a_task_that_differs_from_the_indexed_original(ha
     from azure.core.exceptions import ServiceResponseError
     from shared_context.behavior_native_turn_wire import material_digest
 
-    _, original = seed_started(harness)
+    original = numbered(harness, seed_started(harness)[1])
     receipt = original.value.receipt
     command = NativeRelaySend(
         conversation_id=receipt.conversation_id, request_id=receipt.request_id, tool_call_id="scoped-send",

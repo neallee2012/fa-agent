@@ -26,7 +26,7 @@ from shared_context.team_mcp import (
     PROJECT_SCOPE_ENV, TeamMcpFoundryClient, TeamMcpFoundryError, current_team_mcp_grants, team_connection_prefix,
 )
 from test_behavior_store import FakeTable, SCOPE
-from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token  # noqa: F401
+from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token
 from test_team_mcp_api import ENDPOINT, PROJECT, SECOND_OWNER, FakeFoundry
 
 TOOLBOX = "fa-connector-team-one-teams"

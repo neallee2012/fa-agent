@@ -51,6 +51,13 @@ def _unsupported(location, value, event_type=None):
     raise Problem(409, "SDK_STATE_UNSUPPORTED_FORMAT", "Responses private material has an unrecognized shape")
 
 
+def reasoning_container(container):
+    """True for the one provider block container FA reads; runtime 1.0.103 adds an empty ``ordered_blocks``."""
+    return (isinstance(container, dict) and set(container) - {"ordered_blocks"} == {"provider", "blocks"}
+            and container.get("ordered_blocks") is None
+            and container.get("provider") == "openai-responses" and isinstance(container.get("blocks"), list))
+
+
 def _reasoning_fields(value, event_type=None):
     known = RESPONSES_PRIVATE_FIELDS | {"reasoningWireField", "reasoning_wire_field"}
     if any(any(marker in key.casefold() for marker in ("reasoning", "encrypted", "private")) and key not in known
@@ -64,8 +71,7 @@ def _reasoning_fields(value, event_type=None):
         container = value.get(name)
         if container is None:
             continue
-        if (not isinstance(container, dict) or set(container) != {"provider", "blocks"}
-                or container.get("provider") != "openai-responses" or not isinstance(container.get("blocks"), list)):
+        if not reasoning_container(container):
             _unsupported("reasoning.container", container, event_type)
         for block in container["blocks"]:
             if (not isinstance(block, dict) or block.get("type") != "reasoning"

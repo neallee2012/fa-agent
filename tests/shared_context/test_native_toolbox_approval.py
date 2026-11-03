@@ -24,9 +24,9 @@ from shared_context.native_capabilities import NativeCapabilityContext, bind_cap
 from shared_context.native_hitl_runtime import NativeAutoReview, NativeHitlRuntime
 from shared_context.native_hitl_wire import NativeHitlPendingQuery, NativeHitlReview
 from shared_context.native_turns import NativeTurnControl
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_m3_auth import jwk_client, signing_key
 from test_native_capabilities import selected_capture
-from test_native_hitl import change, decision, error, hitl, post  # noqa: F401
+from test_native_hitl import change, decision, error, hitl, post
 from test_native_hitl_h2 import SID, EffectRuntime, api_client, model_sender, permission_request, verdict
 from test_native_toolbox import ENDPOINT, GRANT, Toolbox, approving
 from test_native_turn_wire import submit

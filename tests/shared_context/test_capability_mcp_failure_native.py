@@ -1,4 +1,4 @@
-"""Pinned SDK 1.0.13 / runtime 1.0.83: a failed Hosted MCP tool call leaves one bounded, redacted log line.
+"""Pinned SDK 1.0.26 / runtime 1.0.103: a failed Hosted MCP tool call leaves one bounded, redacted log line.
 
 The SDK error text otherwise exists only in the archived tool result. Offline stdio stand-in with the Playwright
 tool name and a scripted provider; no browser, network or model.

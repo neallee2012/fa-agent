@@ -11,6 +11,7 @@ from shared_context.behavior_code_identity import code_sha256
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import NativeSubmit, NativeTurnCapture
 from shared_context.native_turns import NativeTurnRuntime
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_capabilities import selected_capture
 from test_native_turn_wire import submit
 from test_native_turns import Harness, IDENTITY, local_env
@@ -61,7 +62,7 @@ def test_original_a_profiles_reach_sdk_start_and_native_origin_without_clearing_
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE native profiles",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -154,7 +155,7 @@ def test_manual_checkpoint_and_cold_followup_retain_original_native_rid_lineage(
                 "user.message", "followup", {"content": "The corrected count is 851."}, "compact-complete")) + "\n"
         states.append(files)
         return {"final_message": "original saved response",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

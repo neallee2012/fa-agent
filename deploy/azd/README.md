@@ -336,7 +336,7 @@ FA 不會改你的 VNet：不建、不改 subnet、NSG、NAT、route table。落
 「相容閘門」是 azd deploy 的 hook 在改動任何東西之前先做的唯讀檢查，確認沒有還記著舊格式的助理；全新環境沒有舊記錄，這兩項都已經預設好。
 
 ADR-0009 2d-i 一律打開，不是選用設定：`profile.defaults.json` 寫 `FA_NATIVE_SESSION_GUARD_ENFORCE="1"`，部署時兩位助理的定義宣告
-`foundry-native-v2`。2d-ii 起 API 只送 v2，所以開關不能關、不能退版；以前的 `FA_NATIVE_2DI` 已不再讀取。第一次安裝還沒有 API
+`foundry-native-v3`（3d-i 起；之前是 v2）。2d-ii 起 API 只送 v2（3d-i 的 image 也照收），所以開關不能關、不能退版；以前的 `FA_NATIVE_2DI` 已不再讀取。第一次安裝還沒有 API
 在服務，沒有舊版本要收斂，所以打開的前提（服務中的 API 已有 P5＋P6）不適用；之後的 `azd deploy` 照 stage 的規則檢查
 （見 [2d-i 開關](../../src/fa-shared-context-poc/README.md#native-2di-switch)）。2d-ii（#891）合併前用 azd 建、開關還是 `"0"` 的環境，
 只有在還沒有任何綁定列（從沒用過助理）時，下一次 `azd deploy` 才會一併打開 2d-i（服務中的 API 要已有 P5＋P6，而且只有一個 active revision）；已經有 v1 列的環境會被下面的相容閘門擋下，照[升級路徑](#upgrade-2dii)走。
@@ -355,7 +355,7 @@ profile 一律寫 `compatibility_gate_armed: true`（`FA_COMPAT_GATE_ARMED` 不�
 1. `git checkout v2026.10.20-33`（公開 repo `neallee2012/fa-agent` 的第 33 版，最後一版仍會讀 `FA_NATIVE_2DI`）。
 2. `azd env set FA_NATIVE_2DI true`
 3. `azd deploy`
-4. 對閘門訊息列出的每個 Agent 傳一則訊息，等它回覆；它的綁定列就會記成 `foundry-native-v2`。
+4. 對閘門訊息列出的每個 Agent 傳一則訊息，等它回覆；它的綁定列就會記成 `foundry-native-v2`（換回 3d-i 起的版本後，背景切換會把它搬到新 SID，新 SID 記成 `foundry-native-v3`）。
 5. 換回 2d-ii 的 release（`git checkout main`，或其後的版本 tag），再跑 `azd deploy`。
 6. 閘門若還是點名某位 Agent，就再傳訊息給它，或[退役它](../README.md#retire-agent)。
 

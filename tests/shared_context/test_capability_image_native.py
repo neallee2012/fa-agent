@@ -1,4 +1,4 @@
-"""Pinned SDK 1.0.13 / runtime 1.0.83: a screenshot PNG from a Hosted MCP tool or an FA tool reaches on_tool_image.
+"""Pinned SDK 1.0.26 / runtime 1.0.103: a screenshot PNG from a Hosted MCP tool or an FA tool reaches on_tool_image.
 
 The SDK tool-completion event is the only place Hosted sees an MCP tool's image bytes. Offline stdio stand-in
 and scripted provider; no browser, network or model.

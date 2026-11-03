@@ -36,6 +36,42 @@ from .native_agent_relay import (
 from .native_relay_quota import NativeRelayQuota
 from .storage import TableRepository
 
+
+def _wake_request_differs(receipt, original, result, request):
+    source, sent = receipt.source, request.source
+    return (result.conversation_id != source.sender.conversation_id
+            or sent.message_id != source.in_reply_to
+            or message_material_digest(request) != original.payload_sha256
+            or sent.sender.agent_id != receipt.agent_id
+            or sent.sender.conversation_id != receipt.conversation_id
+            or source.continuation is not None and source.continuation != sent.sender
+            or sent.root_id != source.root_id or sent.root != source.root)
+
+
+def _wake_result_differs(source, result):
+    if source.kind == "agent_result":
+        return result.status != "completed" or result.delegation is not None or result.result != source.result
+    return source.kind == "agent_notice" and outcome_reference(result) != source.outcome
+
+
+def _is_final_turn(command, sender, completed):
+    if (sender is None or sender.conversation_id != command.conversation_id
+            or sender.delegation is not None or sender.queued_relay is not None):
+        return False
+    if completed:
+        return sender.status == "completed" and sender.result is not None
+    return sender.status in {"unknown", "busy_refused"}
+
+
+def _member_refused(error):
+    """Hosted refuses a lane it has not enabled with 403 before creating any receipt; the API's own platform 403
+    (no automatic_retry flag) is a credential problem, not a member refusal."""
+    code = error.body["error"]["code"]
+    return (error.status == 409 and code in {"NATIVE_TURNS_DISABLED", "NATIVE_SESSION_CHANGED"}
+            or error.status == 403 and code == "NATIVE_TURNS_DISABLED"
+            and error.body["error"].get("automatic_retry") is False)
+
+
 class NativeAgentRelayGateway:
     def __init__(self, composition, *, enabled, repository=None):
         self.owner = getattr(composition, "_agent_message_owner", None) or composition
@@ -92,29 +128,29 @@ class NativeAgentRelayGateway:
         if source is None:
             return
         identifier = source.message_id if source.kind == "agent_request" else source.in_reply_to
-        original = next((item for item in self._quota(principal).read(source.root_id).messages
-                         if item.message_id == identifier), None)
+        original = self._reservation(self._quota(principal), source.root_id, identifier)
         if original is None:
             raise Problem(403, "AGENT_MESSAGE_ROOT_DENIED", "the inherited root has no original relay reservation")
         if source.kind == "agent_request":
             if original.payload_sha256 != message_material_digest(receipt):
                 raise Problem(403, "AGENT_MESSAGE_ROOT_DENIED", "the received request differs from its original reservation")
         else:
-            peer = self._recipient(principal, source.sender.agent_id)
-            _, client = self._client(peer)
-            result = self._original(client, source.sender.request_id)
-            request = None if result is None else self._reply_request(result, client)
-            if (result is None or result.conversation_id != source.sender.conversation_id
-                    or request is None or request.source.message_id != source.in_reply_to
-                    or message_material_digest(request) != original.payload_sha256
-                    or request.source.sender.agent_id != receipt.agent_id
-                    or request.source.sender.conversation_id != receipt.conversation_id
-                    or source.continuation is not None and source.continuation != request.source.sender
-                    or request.source.root_id != source.root_id or request.source.root != source.root
-                    or (source.kind == "agent_result" and (
-                        result.status != "completed" or result.delegation is not None or result.result != source.result))
-                    or (source.kind == "agent_notice" and outcome_reference(result) != source.outcome)):
-                raise Problem(403, "AGENT_MESSAGE_ROOT_DENIED", "the wake must retain its original request and result")
+            self._require_original_wake(principal, receipt, original)
+
+    def _require_original_wake(self, principal, receipt, original):
+        """Ask the peer itself: a wake only stands for the request this Agent reserved and the peer's own final turn."""
+        source = receipt.source
+        peer = self._recipient(principal, source.sender.agent_id)
+        _, client = self._client(peer)
+        result = self._original(client, source.sender.request_id)
+        request = None if result is None else self._reply_request(result, client)
+        if (result is None or request is None or _wake_request_differs(receipt, original, result, request)
+                or _wake_result_differs(source, result)):
+            raise Problem(403, "AGENT_MESSAGE_ROOT_DENIED", "the wake must retain its original request and result")
+
+    @staticmethod
+    def _reservation(quota, root_id, message_id):
+        return next((item for item in quota.read(root_id).messages if item.message_id == message_id), None)
 
     def _recipient(self, principal, agent_id):
         # Only this recipient's rows: the whole Team is read for directory(), never per message.
@@ -230,10 +266,8 @@ class NativeAgentRelayGateway:
     def send(self, principal: BehaviorPrincipal, command: NativeRelaySend) -> NativeRelayAcceptance:
         return self._waiting(lambda: self._send(principal, command))
 
-    def _send(self, principal: BehaviorPrincipal, command: NativeRelaySend) -> NativeRelayAcceptance:
-        command = NativeRelaySend.model_validate_json(command.model_dump_json())
-        sender_scope, sender_client, sender = self._sender_command(principal, command)
-        identifier = message_identifier(principal, sender, command.tool_call_id)
+    def _send_target(self, principal, command, sender, identifier):
+        """This message's recipient and saved receipt. Every refusal here means nothing was delivered by this attempt."""
         try:
             recipient = self._recipient(principal, command.message.recipient_agent_id)
             peer, client = self._client(recipient, dispatch=True)
@@ -260,6 +294,22 @@ class NativeAgentRelayGateway:
                 error.status, "NATIVE_RELAY_RECIPIENT_UNAVAILABLE",
                 "the recipient cannot currently receive; this attempt added no delivery; prior outcomes remain unconfirmed",
             ) from None
+        return recipient, peer, client, original
+
+    @staticmethod
+    def _group_request(principal, quota, message):
+        if os.environ.get("FA_NATIVE_GROUPS_ENABLED") != "1":
+            return None
+        from .native_groups import NativeGroupStore
+        groups = NativeGroupStore(quota.repository, tenant_id=principal.tenant_id, team_id=principal.team)
+        groups.relay_request(message)
+        return groups
+
+    def _send(self, principal: BehaviorPrincipal, command: NativeRelaySend) -> NativeRelayAcceptance:
+        command = NativeRelaySend.model_validate_json(command.model_dump_json())
+        sender_scope, sender_client, sender = self._sender_command(principal, command)
+        identifier = message_identifier(principal, sender, command.tool_call_id)
+        recipient, peer, client, original = self._send_target(principal, command, sender, identifier)
         if original is None:
             client = native_sessions(peer).admission(client, request_id=identifier, resolved=True)
         quota = self._quota(principal)
@@ -274,31 +324,21 @@ class NativeAgentRelayGateway:
             if retained is None:
                 quota.reserve_message(message.source.root_id, identifier, material)
             else:
-                allowed = next((item for item in quota.read(message.source.root_id).messages
-                                if item.message_id == identifier), None)
+                allowed = self._reservation(quota, message.source.root_id, identifier)
                 if allowed is None or allowed.payload_sha256 != material:
                     raise Problem(403, "AGENT_MESSAGE_ROOT_DENIED", "the original relay allowance must name this message")
                 if retained.status != "accepted":
                     # A resend is the retry of a usage write that failed on an earlier send (idempotent per RID).
                     NativeTurnGateway._accounted(peer.runtime.work_policy, (retained, None), peer)
                     return self._accepted(retained)
-            groups = None
-            if os.environ.get("FA_NATIVE_GROUPS_ENABLED") == "1":
-                from .native_groups import NativeGroupStore
-                groups = NativeGroupStore(quota.repository, tenant_id=principal.tenant_id, team_id=principal.team)
-                groups.relay_request(message)
+            groups = self._group_request(principal, quota, message)
             try:
                 received, _ = submit_native_turn(
                     peer, client, message.command, message.capture, source=message.source, original=retained,
                     before_send=lambda: principal.require(recipient.team_id, "submit"))
             except Problem as error:
                 code = error.body["error"]["code"]
-                # Hosted refuses a lane it has not enabled with 403 before creating any receipt; the API's own
-                # platform 403 (no automatic_retry flag) is a credential problem, not a member refusal.
-                if (groups is not None and retained is None
-                        and (error.status == 409 and code in {"NATIVE_TURNS_DISABLED", "NATIVE_SESSION_CHANGED"}
-                             or error.status == 403 and code == "NATIVE_TURNS_DISABLED"
-                             and error.body["error"].get("automatic_retry") is False)
+                if (groups is not None and retained is None and _member_refused(error)
                         and self._original(client, identifier) is None):
                     groups.refused_request(message, code)
                 if code == "NATIVE_EXECUTION_UNAVAILABLE" and error.body["error"].get("not_dispatched") is True:
@@ -418,27 +458,19 @@ class NativeAgentRelayGateway:
     def _return_outcome(self, principal, command, *, completed):
         return self._waiting(lambda: self._returned(principal, command, completed=completed))
 
-    def _returned(self, principal, command, *, completed):
-        command = NativeRelayResult.model_validate_json(command.model_dump_json())
-        scope = self._sender_scope(principal)
-        sender_composition, sender_client = self._client(scope)
-        NativeTurnGateway._legacy(sender_composition.runtime.work_policy, command.conversation_id)
-        sender = self._original(sender_client, command.request_id)
-        if (sender is None or sender.conversation_id != command.conversation_id
-                or sender.delegation is not None or sender.queued_relay is not None
-                or (completed and (sender.status != "completed" or sender.result is None))
-                or (not completed and sender.status not in {"unknown", "busy_refused"})):
-            raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "the original final peer outcome is required")
-        if not completed and self._continuation_pending(sender, sender_client):
-            raise Problem(409, "NATIVE_CONTINUATION_PENDING", "the original result awaits its bounded continuation")
+    def _admitted_request(self, principal, sender, sender_client):
+        """The upstream request this turn answers, only if the relay really admitted that exact request."""
         request = self._reply_request(sender, sender_client)
         if request is None:
             raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "this outcome has no upstream peer request")
         source = request.source
-        admitted = next((item for item in self._quota(principal).read(source.root_id).messages
-                         if item.message_id == source.message_id), None)
+        admitted = self._reservation(self._quota(principal), source.root_id, source.message_id)
         if admitted is None or admitted.payload_sha256 != message_material_digest(request):
             raise Problem(403, "AGENT_MESSAGE_ROOT_DENIED", "the result must belong to the original relayed request")
+        return request
+
+    def _publish_group_outcome(self, principal, command):
+        """A group is published before the asker is resolved; a failed publication leaves the outcome returnable."""
         if os.environ.get("FA_NATIVE_GROUPS_ENABLED") == "1":
             from .native_group_api import NativeGroupGateway
             try:
@@ -446,21 +478,41 @@ class NativeAgentRelayGateway:
             except Problem as error:
                 logging.getLogger(__name__).warning(
                     "NATIVE_GROUP_PUBLICATION_PENDING code=%s", error.body["error"]["code"])
+
+    @staticmethod
+    def _admit_return(principal, recipient, target, client, source):
+        """The first return of an outcome: a new turn in the asker's conversation, under a fresh capture."""
+        client = native_sessions(target).admission(client, request_id=source.message_id, resolved=True)
+        conversation = NativeTurnGateway._invoke(
+            client, NativeConversationRead(conversation_id=source.sender.conversation_id))[0]
+        NativeTurnGateway._same_session(client, conversation)
+        capture = resolve_agent_capture(
+            target.runtime.work_policy, target.assistant.authority, principal, recipient,
+            NativeAgentCommand(request_id=source.message_id, conversation_id=source.sender.conversation_id,
+                               model=conversation.capture.model.id, content="Original peer result notification."),
+            conversation=conversation)
+        return client, conversation, capture
+
+    def _returned(self, principal, command, *, completed):
+        command = NativeRelayResult.model_validate_json(command.model_dump_json())
+        scope = self._sender_scope(principal)
+        sender_composition, sender_client = self._client(scope)
+        NativeTurnGateway._legacy(sender_composition.runtime.work_policy, command.conversation_id)
+        sender = self._original(sender_client, command.request_id)
+        if not _is_final_turn(command, sender, completed):
+            raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "the original final peer outcome is required")
+        if not completed and self._continuation_pending(sender, sender_client):
+            raise Problem(409, "NATIVE_CONTINUATION_PENDING", "the original result awaits its bounded continuation")
+        request = self._admitted_request(principal, sender, sender_client)
+        self._publish_group_outcome(principal, command)
+        source = request.source
         recipient = self._recipient(principal, source.sender.agent_id)
         target, client = self._client(recipient, dispatch=True)
         NativeTurnGateway._legacy(target.runtime.work_policy, source.sender.conversation_id)
         original = self._original(client, source.message_id)
         conversation = None
         if original is None:
-            client = native_sessions(target).admission(client, request_id=source.message_id, resolved=True)
-            conversation = NativeTurnGateway._invoke(
-                client, NativeConversationRead(conversation_id=source.sender.conversation_id))[0]
-            NativeTurnGateway._same_session(client, conversation)
-            capture = resolve_agent_capture(
-                target.runtime.work_policy, target.assistant.authority, principal, recipient,
-                NativeAgentCommand(request_id=source.message_id, conversation_id=source.sender.conversation_id,
-                                   model=conversation.capture.model.id, content="Original peer result notification."),
-                conversation=conversation)
+            client, conversation, capture = self._admit_return(principal, recipient, target, client, source)
         else:
             capture = original.capture
         if completed:
@@ -504,7 +556,7 @@ class NativeAgentRelayGateway:
         return page
 
     def dispatch_waiting(self, principal: BehaviorPrincipal, command: NativeRelayResult):
-        """ADR-0009 §7a (s), review round 3: the Agent's own Hosted session asks for the Responses request of one of
+        """ADR-0009 §7a (s): the Agent's own Hosted session asks for the Responses request of one of
         its accepted messages that just took its conversation slot in Hosted (one that waited behind a left receipt,
         or an adopted one). Hosted can not send a Responses request to itself, and a caller such as the Teams relay
         stops polling after 110 s, so without this the message would wait at ``needs_response`` until the next touch.
@@ -513,10 +565,10 @@ class NativeAgentRelayGateway:
         ``_send_response``, only while Hosted reports ``needs_response`` for this Agent's current session; anything
         else (already sent, started, ended, another session) is returned as read, with nothing sent.
 
-        Review round 4: like every owner send (``NativeTurnGateway._context(..., "submit")``), the Agent's current
+        Like every owner send (``NativeTurnGateway._context(..., "submit")``), the Agent's current
         owner work policy is read again before the billable POST (and once more right before it); a revoked or
-        inactive policy is 403 ``WORK_POLICY_REVOKED`` with nothing sent; Hosted leaves the message ``accepted``
-        (review round 5), as an owner send under that policy does, and it is sent once the policy is restored."""
+        inactive policy is 403 ``WORK_POLICY_REVOKED`` with nothing sent; Hosted leaves the message ``accepted``,
+        as an owner send under that policy does, and it is sent once the policy is restored."""
         from .behavior_native_responses_api import _send_response, platform_client
         from .native_responses_wire import NATIVE_RESPONSES_PROFILE
 
@@ -674,7 +726,7 @@ def install_native_agent_routes(app, composition, *, enabled, repository=None):
                                             (403, "WORK_POLICY_REVOKED")}:
                 raise
             # Named, so Hosted can tell "not caught up with the switch yet" (ask again) and "the owner's work policy
-            # is revoked" (the message ends with that code, review round 4) from a refusal; nothing was sent.
+            # is revoked" (the message ends with that code) from a refusal; nothing was sent.
             _log_request_failure(request, code)
             return JSONResponse(status_code=error.status, headers={"Cache-Control": "no-store"}, content={"error": {
                 "code": code, "message": "Nothing was sent for the original message.", "automatic_retry": False,

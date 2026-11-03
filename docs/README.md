@@ -41,7 +41,6 @@
 | [原件與權威儲存研究](FA-DATA-STORE-RESEARCH.md) | 參考Grok的分層；Table＋Blob保存原件／版本，Memory為投影，交易與備份邊界分開 |
 | [Hosted HOME官方查證](fa-hosted-home-ownership-evidence.md) | 已確認持久化語意；non-root ownership初始化仍NOT_CONFIRMED，附支援問題 |
 | [共享 Context 實作](../src/fa-shared-context-poc/README.md) | API、身分邊界、Memory 契約與同 sandbox GUI |
-| [雲端驗收 controller](../tests/shared_controller/README.md) | 指定 A/B sessions、衝突／恢復／GUI 與有界收尾 |
 | [POC 歷史交接](FA-POC-Handoff.md) | 特定舊批次的交接材料；不是通用開工入口或新批准 |
 | [詳細進度與歷史](progress.md) | 帶日期的實作、部署及結果紀錄；由 CURRENT-STATE 按需導入 |
 | [平台研究](fa-platform-evidence.md) | Foundry／Copilot SDK 官方證據與訪談決策 |

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from feed_fixtures import FEED_URL, keys  # noqa: F401  (first: puts the app on sys.path)
+from feed_fixtures import FEED_URL, keys  # first: puts the app on sys.path
 from shared_context.feed_signature import (
     check_feed_url, generate_keypair, load_public_key, load_signing_key, sign_feed_url, verify_feed_url,
 )

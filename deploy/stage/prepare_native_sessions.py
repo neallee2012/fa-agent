@@ -28,7 +28,7 @@ import httpx
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
-from deployment_config import config_path, load_config, write_x as _write_x  # noqa: E402
+from deployment_config import config_path, load_config, write_x as _write_x
 
 EXPECTED = {"state": "ready", "model_started": False, "original_work_replayed": False}
 

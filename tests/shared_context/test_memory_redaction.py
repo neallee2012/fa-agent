@@ -15,11 +15,11 @@ from shared_context.native_checkpoint import open_durable_store
 from shared_context.native_private_memory import claim_key
 from shared_context.native_turns import EFFECTS_STORE
 import test_native_team_memory as team_case
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_hitl import change, hitl, post  # noqa: F401
+from test_m3_auth import jwk_client, signing_key
+from test_native_hitl import change, hitl, post
 from test_native_hitl_h2 import pending_view, permit, setup_gate, verdict
 from test_native_private_memory import private, updates
-from test_native_turns import local_env  # noqa: F401
+from test_native_turns import local_env
 
 KEY = "FAKE-KEY-235fe2"
 PROBE = ("我示範一個整理週報的程序：先列三個重點、再列數字、最後列風險。示範用的 API 金鑰是 " + KEY

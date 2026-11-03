@@ -23,9 +23,6 @@ docs/evidence/*
 local-evidence/
 src/fa-hosted-sandbox-poc/.env
 src/fa-hosted-sandbox-poc/.foundry/results/
-infra/poc/main.json
-infra/vnet/main.json
-infra/mi-smb-role.json
 
 # Public export review output (holds original values; see docs/public-sync.md)
 scripts/public_export/candidates.txt

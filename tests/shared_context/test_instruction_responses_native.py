@@ -78,6 +78,8 @@ def test_native_responses_summary_and_cold_resume_need_no_private_checkpoint_or_
         assert body["store"] is False and not body.get("previous_response_id")
         assert all(item.get("type") != "item_reference" for item in body["input"])
         assert body["reasoning"]["summary"] == "auto"
+        # Runtime 1.0.103 alone sends "low"; FA keeps 1.0.83's answer length, on a new and a resumed session.
+        assert body["text"] == {"verbosity": "medium"}
         requests.append(body)
         return httpx.Response(200, request=request, headers={"content-type": "text/event-stream"},
                               content=response_bytes(len(requests)))

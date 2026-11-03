@@ -10,7 +10,9 @@ from .behavior_history_skill_draft_prompt import (
     HISTORY_SKILL_DRAFT_CAPABILITIES, HISTORY_SKILL_DRAFT_PROMPT, assemble_history_skill_draft_prompt,
 )
 from .behavior_skill_draft import HISTORY_SKILL_DRAFT_MEMORY_PROFILE
-from .behavior_wire import Digest, WireModel
+from .behavior_wire import Digest, WireModel, exact_prefix, known_release
+from .native_responses_wire import SENT_RELEASE
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 
 REVIEWED_NOTE_PROFILE = HISTORY_SKILL_DRAFT_MEMORY_PROFILE
@@ -64,17 +66,15 @@ class ReviewedNotePromptRecord(WireModel):
     prefix_sha256: Digest
     prefix_utf8_bytes: Annotated[int, Field(gt=0)]
     prefix_tokens: None = None
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]
+    runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
+    _release = model_validator(mode="after")(known_release)
     omissions: tuple[str, ...] = _OMISSIONS
 
     @model_validator(mode="after")
     def exact(self):
-        raw = REVIEWED_NOTE_PROMPT.encode("utf-8")
-        if (self.prefix_sha256 != hashlib.sha256(raw).hexdigest()
-                or self.prefix_utf8_bytes != len(raw) or self.omissions != _OMISSIONS):
-            raise ValueError("The reviewed-note superset differs from its fixed source")
-        return self
+        return exact_prefix(
+            self, REVIEWED_NOTE_PROMPT, _OMISSIONS, "The reviewed-note superset differs from its fixed source")
 
 
 @dataclass(frozen=True)

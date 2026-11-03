@@ -3232,7 +3232,8 @@ function renderRoutineSettings(ready){
     row.className="settings-review";row.setAttribute("data-routine",routine.routine_id);
     title.textContent=`每天 ${draft.local_time}（${draft.time_zone}）· ${routine.enabled?"啟用中":"已停用"}`;
     body.textContent=draft.content;body.style.whiteSpace="pre-wrap";body.style.overflowWrap="anywhere";
-    meta.textContent=`來源對話 ${routine.conversation_id.slice(0,8)} · 批准於 ${hitlTime(routine.approved_at)}`;
+    // Disabling publishes a new version, so a disabled one's approved_at is when it was disabled.
+    meta.textContent=`來源對話 ${routine.conversation_id.slice(0,8)} · ${routine.enabled?"批准於":"停用於"} ${hitlTime(routine.approved_at)}`;
     row.append(title,body,meta);
     if(routine.enabled&&routineSettings.can_manage===true){
       const actions=document.createElement("div");actions.className="actions";
@@ -3433,7 +3434,7 @@ function renderAgents(){
     button.addEventListener("click",()=>{
       if(button.disabled)return;
       agentUnread.delete(agent.id);
-      if(agentMode&&agent.id!==selectedAgent){switchAgent(agent.id);return}
+      if(agentMode&&(agent.id!==selectedAgent||!state.composer)){switchAgent(agent.id);return}
       closeSidebar();el("instruction").focus?.();
     });
     const gear=document.createElement("button");gear.className="agent-settings";gear.textContent="⚙";
@@ -3632,11 +3633,19 @@ async function loadAgentState(identity,thread,revision){
   if(value.agent_mode!==true||value.selected_agent_id!==identity)throw {code:"AGENT_DIRECTORY_INVALID"};
   state=value;selectedThread=value.composer?.thread_id??thread;render();
 }
+async function readAgent(identity,thread,revision){
+  lastError=null;threadLoading=true;render();
+  try{await loadAgentState(identity,thread,revision)}
+  catch(error){if(revision===agentRevision)lastError=error?.code?error:{code:"LOCAL_OFFLINE",message:error.message}}
+  finally{if(revision===agentRevision){threadLoading=false;realtime.progressDue=!lastError;render()}}
+}
 async function switchAgent(identity,targetThread=null){
   if(!agentMode||!state.agents?.some(agent=>agent.id===identity&&agent.enabled===true))return;
   agentUnread.delete(identity);
   if(identity===selectedAgent){
-    if(targetThread&&targetThread!==selectedThread)await switchThread(targetThread);
+    // No composer: this Agent's read failed or was dropped, and without a composer no poll reads it again.
+    if(!state.composer&&!threadLoading){closeSidebar();await readAgent(identity,targetThread||selectedThread,agentRevision)}
+    else if(targetThread&&targetThread!==selectedThread)await switchThread(targetThread);
     return;
   }
   if(draftId!==null){
@@ -3646,17 +3655,15 @@ async function switchAgent(identity,targetThread=null){
   if(selectedAgent!==null&&selectedThread)agentThreads.set(selectedAgent,selectedThread);
   selectedAgent=identity;
   const revision=++agentRevision,thread=targetThread||agentThreads.get(identity)||null;
-  clearAgentObservations();selected="";selectedThread=thread;draftId=null;lastError=null;threadLoading=true;
+  clearAgentObservations();selected="";selectedThread=thread;draftId=null;
   busy=busyAgents.has(identity);
   state={...state,selected_agent_id:identity,tasks:[],composer:null,template_selections:[],
     template_tools_available:false,template_selection_error:null};
-  render();closeSidebar();
-  try{await loadAgentState(identity,thread,revision)}
-  catch(error){if(revision===agentRevision)lastError=error?.code?error:{code:"LOCAL_OFFLINE",message:error.message}}
-  finally{if(revision===agentRevision){threadLoading=false;realtime.progressDue=!lastError;render()}}
+  closeSidebar();
+  await readAgent(identity,thread,revision);
 }
 function nativeProfile(value){
-  return value==="foundry-native-v1"||value==="foundry-native-v2"||value==="foundry-responses-v1";
+  return value==="foundry-native-v1"||value==="foundry-native-v2"||value==="foundry-native-v3"||value==="foundry-responses-v1";
 }
 function clearGroupPanel(){
   groupRevision++;groupOptions=null;groupView=null;groupList=null;groupPending=null;groupBusy=false;
@@ -4027,7 +4034,11 @@ function cancellationMessage(task){
   if(pendingCancellations.has(scopeKey(task?.task_id)))return "正在送出停止請求…";
   if(nativeProfile(task?.state_profile)){
     if(stoppedTurn(task))return STOPPED_TURN_TEXT;
-    if(task.native_receipt?.cancel_requested)return "已要求停止這次回覆。";
+    // A stop that came after the answer was saved: the saved answer wins (#1145).
+    if(task.native_receipt?.cancel_requested)
+      return task.native_receipt.status!=="completed"?"已要求停止這次回覆。":"按停止時已經答完，答案照常保存。"+
+        // The stop still blocks an unsent queued hand-off (queued_request_matches).
+        (task.native_receipt.queued_relay&&task.native_receipt.queued_relay.status!=="accepted"?"排隊中的交辦因停止沒有送出。":"");
     if(task.cancellation?.state==="CONFIRMED"&&task.cancellation.receipt?.result)
       return cancellationReceiptMessage(task,task.cancellation.receipt.result);
     // The server invoked no session (not_dispatched): nothing was sent, and the same stop can be sent again.
@@ -5644,8 +5655,9 @@ function renderComposer(){
     !composer?(threadLoading?"正在讀取這位助理的對話…":"這位助理的對話還沒讀到，請從選單更新清單"):
     !models.length?"尚無可用模型，請從選單更新清單":"正在準備對話…";
   text("instruction-reason",reason||(openingKept?"剛才在新對話打的字已保留；新對話開好後會自動帶回，不會自動送出。":""));
-  renderPresence(resumeBlocked||appendUnknown||Boolean(unresolvedSentDraft)||Boolean(composer?.command_incomplete)||
-    Boolean(composer&&!opening&&!models.length));
+  // Read-only is why this conversation takes no message, not something the owner has to do; a card here still asks.
+  renderPresence(resumeBlocked&&composer?.agent_conversation?.read_only!==true||appendUnknown||Boolean(unresolvedSentDraft)||
+    Boolean(composer?.command_incomplete)||Boolean(composer&&!opening&&!models.length));
   text("send-instruction",appendBusy?"追加中":appendTarget?"追加":messageBusy?"送出中":"送出");
   el("instruction").placeholder=opening?"新對話開好後即可送出；可以先輸入…":
     canCompose?(appendTarget?"補充正在進行的工作…":composer?.can_follow_up||composer?.conversation_id?"接著問…":"傳送訊息…"):
@@ -7168,7 +7180,8 @@ async function platformRefresh(){
 }
 async function refreshAuthentication(){
   authenticationTimer=null;
-  if(authenticationBusy||authenticationStopped||document.hidden){scheduleAuthentication();return}
+  // A replaced token fails another Agent's read in flight with 401 (native._current), so it waits for that read.
+  if(authenticationBusy||authenticationStopped||document.hidden||threadLoading){scheduleAuthentication();return}
   authenticationBusy=true;
   const revision=attachmentAuthRevision;
   try{
@@ -7195,6 +7208,9 @@ async function refreshAuthentication(){
     if(state.authentication==="AVAILABLE"&&["LOGIN_REQUIRED","LOGIN_EXPIRED"].includes(lastError?.code)){
       lastError=null;progressPaused=false;progressRetryMs=1000;
     }
+    // Like run("/api/authenticate"): a read refused before this refresh left the selected Agent unread.
+    if(agentMode&&selectedAgent!==null&&!state.composer&&state.authentication==="AVAILABLE"&&scopeAvailable())
+      switchAgent(selectedAgent);
   }catch(error){
     if(revision===attachmentAuthRevision){
       authenticationStopped=true;state.authentication="LOGIN_EXPIRED";state.authentication_refresh_at=null;

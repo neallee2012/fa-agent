@@ -388,7 +388,9 @@ def test_native_child_failure_is_not_a_successful_parent_result_and_usage_stays_
             break
         time.sleep(0.02)
     original = harness.call(bridges[0].read)
-    assert original.status == "incomplete" and original.failure_code == "DELEGATION_RESULT_INCOMPLETE"
+    # Runtime 1.0.103 reports an empty child reply as subagent.failed (1.0.83: completed with no text); the parent
+    # outcome below is the same either way.
+    assert (original.status, original.failure_code) == ("failed", "SDK_CHILD_FAILED")
     assert result.status == "unknown" and result.result is None
     assert result.failure_code == "DELEGATION_INCOMPLETE"
     assert result.usage.usage[0].requests == len(requests) == 3

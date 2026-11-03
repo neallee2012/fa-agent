@@ -18,6 +18,7 @@ import pytest
 from shared_context import behavior_assistant_hosted as hosted
 from shared_context import behavior_assistant_wire as aw
 from shared_context import behavior_private_memory as memory
+from shared_context.sdk_pin import RUNTIME_VERSION
 
 ENDPOINT = "https://fa-acct.services.ai.azure.com/api/projects/fa-project"
 STORE = "fa-memory-store"
@@ -168,7 +169,7 @@ def test_remember_is_sent_once_and_never_retried(kwargs, outcome, caplog):
 
 def _turn(tmp_path, monkeypatch, *, outcome="succeeded", peer=False, configured=True, files=(), search=None,
           content="ORIGINAL"):
-    stop = aw.SdkStop(runtime_version="1.0.83", pid=42, exit_code=0, graceful=True)
+    stop = aw.SdkStop(runtime_version=RUNTIME_VERSION, pid=42, exit_code=0, graceful=True)
     events, sent = [], []
     peer_work = None if not peer else aw.PeerWorkReference(
         root_id="root", message_id="message", message_key="message-key", message_sha256="a" * 64,

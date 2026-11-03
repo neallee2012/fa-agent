@@ -74,7 +74,7 @@ Container App      Container App              每位助理一台 VM
 | 監控 | Log Analytics、Application Insights | [`stage-monitoring.bicep`](infra/shared-context/stage-monitoring.bicep) |
 | 映像 | Azure Container Registry | [`foundation.bicep`](infra/shared-context/foundation.bicep) |
 
-主要固定版本有 `github-copilot-sdk==1.0.13`、Copilot runtime 1.0.83（SDK 在 VM 裡啟動的執行檔，建映像時下載並固定）、`azure-ai-agentserver-core==2.2.0` 和 `azure-ai-projects==2.3.0`。Hosted 的版本在 [`requirements-hosted.txt`](src/fa-shared-context-poc/requirements-hosted.txt)，API 的版本在 [`requirements.txt`](src/fa-shared-context-poc/requirements.txt)。
+主要固定版本有 `github-copilot-sdk==1.0.26`、Copilot runtime 1.0.103（SDK 在 VM 裡啟動的執行檔，建映像時下載並固定）、`azure-ai-agentserver-core==2.2.0` 和 `azure-ai-projects==2.3.0`。Hosted 的版本在 [`requirements-hosted.txt`](src/fa-shared-context-poc/requirements-hosted.txt)，API 的版本在 [`requirements.txt`](src/fa-shared-context-poc/requirements.txt)。
 
 <a id="deploy-to-your-azure"></a>
 ## 部署到你的 Azure

@@ -20,6 +20,7 @@ from shared_context.behavior_operations import control_key
 from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_skill_prompt import SKILL_CAPABILITIES, assemble_prompt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_approved_skill_api import BODY, add_skill, approve_skill_version, change_artifact, configured
 from test_behavior_assistant import assistant
@@ -132,7 +133,7 @@ def test_fixed_sdk_custom_reader_discloses_only_selected_body_and_rechecks_cold_
         assert all(config[name] == [] for name in (
             "skill_directories", "plugin_directories", "instruction_directories", "custom_agents"))
         assert config["mcp_servers"] == {}
-        assert bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == "1.0.83"
+        assert bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == RUNTIME_VERSION
         state = bridge._session_files.snapshot()
         assert not any(event["type"] in {"skill.invoked", "newskill.invoked"} for event in events_from(state.files))
         assert all(secret not in state.encoded().decode("utf-8") for secret in bridge.client._checkpoint_secrets)
@@ -144,10 +145,10 @@ def test_fixed_sdk_custom_reader_discloses_only_selected_body_and_rechecks_cold_
         assert "CANARY" not in public and "receipt-guide" not in public and "SECRET" not in public
         assert turn["prompt_assembly"]["prefix_tokens"] is None
     assert len(calls) == 5 and not stops
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     evidence = {
         "evidence": "controlled approved-skill source; fixed SDK custom tool and real local API; offline transport",
-        "sdk_version": "1.0.13", "runtime_version": "1.0.83",
+        "sdk_version": SDK_VERSION, "runtime_version": RUNTIME_VERSION,
         "profile": "fa-instruction-skills-v1", "calls": calls,
         "prefix_sha256": expected.record.prefix_sha256, "prefix_utf8_bytes": expected.record.prefix_utf8_bytes,
         "prefix_tokens": None, "catalog_tokens": None,
@@ -313,11 +314,11 @@ def test_fixed_sdk_new_turns_replace_only_current_catalog_and_preserve_historica
             assert len(projection.json()["turns"]) == phase + 1
 
     assert len(requests) == 10 and len(bridges) == 5 and not forced
-    assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == "1.0.83" for bridge in bridges)
+    assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == RUNTIME_VERSION for bridge in bridges)
     if os.environ.get("FA_SKILL_EVIDENCE_DIR"):
         evidence = {
             "scenario": "completed catalog transitions; real API/controller/restore/custom tool; offline transport",
-            "sdk_version": importlib.metadata.version("github-copilot-sdk"), "runtime_version": "1.0.83",
+            "sdk_version": importlib.metadata.version("github-copilot-sdk"), "runtime_version": RUNTIME_VERSION,
             "requests": requests, "graceful_stops": [bridge._sdk_stop.model_dump(mode="json") for bridge in bridges],
             "prefix_sha256": prompt.record.prefix_sha256,
             "archive_references": [{
@@ -397,7 +398,7 @@ def test_fixed_sdk_custom_tool_failure_never_discloses_body_or_enables_native_lo
     assert done.state == "succeeded" and done.result_forwarded
     assert len(calls) == 2 and len(bridges) == 1 and not force_stops
     bridge = bridges[0]
-    assert bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == "1.0.83"
+    assert bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == RUNTIME_VERSION
     events = events_from(bridge._session_files.files)
     assert any(event["type"] == "tool.execution_complete" and event["data"].get("success") is False for event in events)
     assert not any(event["type"] in {"skill.invoked", "newskill.invoked"} for event in events)
@@ -547,11 +548,11 @@ def test_fixed_sdk_new_user_turn_continues_after_a_midturn_catalog_fence(assista
         assert options["mcp_servers"] == {}
         assert all(options[name] == [] for name in (
             "skill_directories", "plugin_directories", "instruction_directories", "custom_agents"))
-    assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == "1.0.83" for bridge in bridges)
+    assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == RUNTIME_VERSION for bridge in bridges)
     if os.environ.get("FA_SKILL_EVIDENCE_DIR"):
         evidence = {
             "scenario": "C2 to C3 during a real SDK turn; API reserve fenced; graceful failed archive; new user turn",
-            "sdk_version": importlib.metadata.version("github-copilot-sdk"), "runtime_version": "1.0.83",
+            "sdk_version": importlib.metadata.version("github-copilot-sdk"), "runtime_version": RUNTIME_VERSION,
             "requests": requests, "refused_model_reserves": refused, "outcomes": outcomes,
             "graceful_stops": [bridge._sdk_stop.model_dump(mode="json") for bridge in bridges],
             "force_stop_calls": 0, "prior_archives_and_results_unchanged": True,

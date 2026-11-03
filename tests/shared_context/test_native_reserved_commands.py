@@ -17,7 +17,7 @@ from shared_context.native_checkpoint import conversation_store_name, segment_ke
 from shared_context.native_turns import TURNS_STORE, _RECORD_READS
 from test_native_profile_snapshot import _v2_baseline
 from test_native_turn_wire import submit
-from test_native_turns import harness, local_env, native_retry_policy  # noqa: F401
+from test_native_turns import harness, local_env, native_retry_policy
 
 COMMANDS = (NativeSessionCheckpointCheck, NativeSessionPrerestore)
 
@@ -71,7 +71,7 @@ async def _rewrite(harness, cid, key, change):
 @pytest.mark.parametrize("state, expected", [
     ("good", "ok"), ("segment_differs", "unreadable"), ("unknown_codec", "unsupported")])
 def test_each_conversation_gets_its_own_result_without_the_sdk(
-        harness, monkeypatch, tmp_path, command, state, expected):  # noqa: F811
+        harness, monkeypatch, tmp_path, command, state, expected):
     cid, sha, restores = _completed(harness, monkeypatch, tmp_path)
     if state == "segment_differs":
         harness.call(_rewrite, harness, cid, segment_key(sha, 0), lambda value: value.update(data="eA=="))
@@ -88,7 +88,7 @@ def test_each_conversation_gets_its_own_result_without_the_sdk(
 
 
 @pytest.mark.parametrize("prerestored", [True, False])
-def test_prerestore_makes_the_next_turn_skip_the_cold_restore(harness, monkeypatch, tmp_path, prerestored):  # noqa: F811
+def test_prerestore_makes_the_next_turn_skip_the_cold_restore(harness, monkeypatch, tmp_path, prerestored):
     cid, sha, restores = _completed(harness, monkeypatch, tmp_path)
     if prerestored:
         response = harness.invoke(NativeSessionPrerestore(conversation_ids=(cid,)))
@@ -102,7 +102,7 @@ def test_prerestore_makes_the_next_turn_skip_the_cold_restore(harness, monkeypat
     assert restores.count(sha) == (0 if prerestored else 1)
 
 
-def test_prerestore_is_idempotent(harness, monkeypatch, tmp_path):  # noqa: F811
+def test_prerestore_is_idempotent(harness, monkeypatch, tmp_path):
     cid, sha, restores = _completed(harness, monkeypatch, tmp_path)
     before, calls = _etags(harness, cid), len(harness.sdk.calls)
     answers = [harness.invoke(NativeSessionPrerestore(conversation_ids=(cid,))) for _ in range(3)]
@@ -113,7 +113,7 @@ def test_prerestore_is_idempotent(harness, monkeypatch, tmp_path):  # noqa: F811
     assert len(harness.sdk.calls) == calls and _etags(harness, cid) == before
 
 
-def test_the_check_reads_the_store_even_after_a_prerestore(harness, monkeypatch, tmp_path):  # noqa: F811
+def test_the_check_reads_the_store_even_after_a_prerestore(harness, monkeypatch, tmp_path):
     cid, sha, restores = _completed(harness, monkeypatch, tmp_path)
     assert harness.invoke(NativeSessionPrerestore(conversation_ids=(cid,))).json()["checkpoints"] == {cid: "ok"}
     harness.call(_rewrite, harness, cid, segment_key(sha, 0), lambda value: value.update(data="eA=="))
@@ -121,7 +121,7 @@ def test_the_check_reads_the_store_even_after_a_prerestore(harness, monkeypatch,
     assert response.json()["checkpoints"] == {cid: "unreadable"} and restores == [sha, sha]
 
 
-def test_a_destination_that_is_not_yet_the_current_sid_still_answers(harness, monkeypatch, tmp_path):  # noqa: F811
+def test_a_destination_that_is_not_yet_the_current_sid_still_answers(harness, monkeypatch, tmp_path):
     """ADR-0009 4b: before the switch the Agent record names the source SID; a record read would answer 409 here."""
     from shared_context.behavior_native_turn_wire import (
         NATIVE_LOCATOR_BINDING_ROW, NATIVE_LOCATOR_HEADER, NATIVE_STATE_PROFILE, NATIVE_TURN_HEADER, NativePrewarm)
@@ -149,7 +149,7 @@ def test_a_destination_that_is_not_yet_the_current_sid_still_answers(harness, mo
 
 
 @pytest.mark.parametrize("command", COMMANDS, ids=lambda command: command().operation)
-def test_no_conversation_named_checks_nothing(harness, command):  # noqa: F811
+def test_no_conversation_named_checks_nothing(harness, command):
     response = harness.invoke(command())
     assert response.status_code == 200, response.text
     assert response.json()["checkpoints"] == {} and harness.sdk.calls == []
@@ -170,7 +170,7 @@ def _counted_restores(monkeypatch):
 @pytest.mark.parametrize("command", COMMANDS, ids=lambda command: command().operation)
 @pytest.mark.parametrize("other", ["never_created", "queued"])
 def test_a_conversation_without_a_store_owes_nothing_and_fails_no_other(
-        harness, monkeypatch, tmp_path, command, other):  # noqa: F811
+        harness, monkeypatch, tmp_path, command, other):
     """ADR-0009 §7a (r): never allocated (no State store, or a receipt still queued) owes no checkpoint; per conversation."""
     cid, _, _ = _completed(harness, monkeypatch, tmp_path)
     waiting = "OFFLINE-never-allocated"
@@ -187,7 +187,7 @@ def test_a_conversation_without_a_store_owes_nothing_and_fails_no_other(
 
 
 @pytest.mark.parametrize("command", COMMANDS, ids=lambda command: command().operation)
-def test_a_first_turn_still_running_owes_no_checkpoint(harness, monkeypatch, command):  # noqa: F811
+def test_a_first_turn_still_running_owes_no_checkpoint(harness, monkeypatch, command):
     restores = _counted_restores(monkeypatch)
     harness.sdk.block = True
     assert harness.invoke(submit()).status_code == 202
@@ -197,7 +197,7 @@ def test_a_first_turn_still_running_owes_no_checkpoint(harness, monkeypatch, com
     assert restores == []
 
 
-def test_the_check_verifies_base_ckpt_while_the_last_turn_is_not_completed(harness, monkeypatch, tmp_path):  # noqa: F811
+def test_the_check_verifies_base_ckpt_while_the_last_turn_is_not_completed(harness, monkeypatch, tmp_path):
     cid, sha, restores = _completed(harness, monkeypatch, tmp_path)
     harness.sdk.block = True
     assert harness.invoke(submit("rid-2", cid, text="Continue")).status_code == 202
@@ -209,7 +209,7 @@ def test_the_check_verifies_base_ckpt_while_the_last_turn_is_not_completed(harne
     assert harness.invoke(check).json()["checkpoints"] == {cid: "unreadable"}
 
 
-def test_a_prerestore_leaves_a_running_turn_and_its_hot_copy_alone(harness, monkeypatch, tmp_path):  # noqa: F811
+def test_a_prerestore_leaves_a_running_turn_and_its_hot_copy_alone(harness, monkeypatch, tmp_path):
     cid, sha, restores = _completed(harness, monkeypatch, tmp_path)
     harness.sdk.block = True
     assert harness.invoke(submit("rid-2", cid, text="Continue")).status_code == 202
@@ -224,7 +224,7 @@ def test_a_prerestore_leaves_a_running_turn_and_its_hot_copy_alone(harness, monk
     assert restores == [] and newer.is_file() and not restored.exists()
 
 
-def test_a_checkpoint_of_another_scope_is_that_conversations_unreadable(harness, monkeypatch, tmp_path):  # noqa: F811
+def test_a_checkpoint_of_another_scope_is_that_conversations_unreadable(harness, monkeypatch, tmp_path):
     """403 ASSISTANT_CHECKPOINT_SCOPE (the meta's base_ckpt names another SDK session) is one conversation's answer."""
     cid, _, _ = _completed(harness, monkeypatch, tmp_path)
     harness.sdk.block = True
@@ -237,7 +237,7 @@ def test_a_checkpoint_of_another_scope_is_that_conversations_unreadable(harness,
     assert response.json()["checkpoints"] == {cid: "unreadable", "OFFLINE-never-allocated": "ok"}
 
 
-def test_a_prerestore_segment_read_is_bounded_like_the_check(harness, monkeypatch, tmp_path):  # noqa: F811
+def test_a_prerestore_segment_read_is_bounded_like_the_check(harness, monkeypatch, tmp_path):
     from shared_context import native_environment
 
     cid, _, _ = _completed(harness, monkeypatch, tmp_path)

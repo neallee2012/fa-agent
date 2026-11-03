@@ -18,9 +18,9 @@ from shared_context.behavior_native_turn_api import agent_client
 from shared_context.native_binding import NativeBindingIdleUpgrade, NativeBindingObservation, NativeBindingSession
 from shared_context.native_version_veto import veto_store
 import test_native_abandon_source as abandon
-from test_native_abandon_source import binding_rows  # noqa: F401
-from test_native_cut import cut, replace_retried, sessions  # noqa: F401
-from test_native_files_api import (  # noqa: F401
+from test_native_abandon_source import binding_rows
+from test_native_cut import cut, replace_retried, sessions
+from test_native_files_api import (
     file_api, file_loops, instruction_models, jwk_client, local_env, native_api, signing_key, synthetic_standing_v1,
 )
 
@@ -513,9 +513,6 @@ def test_a_failed_project_veto_write_is_retried_at_the_next_turn_end_then_never_
     monkeypatch.setattr(behavior_native_sessions, "_native_profile", profile)
     rolled_back(fixture, cut(fixture))
     assert len(writes) == 2
-
-
-# ----- an in-place drift (Neal 2026-10-20) ---------------------------------------------------------------------------
 
 
 def drifted(fixture, monkeypatch, *, minutes_ago=1, at=None, created="41", switch=False, to="42"):

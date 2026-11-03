@@ -71,7 +71,7 @@ def test_progress_finds_the_scheduled_original_without_a_human_submit_or_retry_b
 
 
 def test_a_run_needing_attention_is_listed_in_the_approval_conversation_pointing_to_its_own(routine_console, signing_key):
-    """Review 2026-10-23: a run waiting on its approval card (or with no final state yet) shows only inside its own new
+    """A run waiting on its approval card (or with no final state yet) shows only inside its own new
     conversation, and the list imports runs only on Agent open. The conversation the routine was approved in keeps a
     reminder naming the run, which also brings the run's conversation into the list."""
     case = routine_console
@@ -100,7 +100,7 @@ def test_a_run_needing_attention_is_listed_in_the_approval_conversation_pointing
         "scheduled_for": due.isoformat(), "local_time": f"{due:%m-%d %H:%M}", "label": label}]
     assert not any(item["task_id"] == rid for item in home.json()["tasks"])
     assert next(thread for thread in home.json()["composer"]["threads"] if thread["thread_id"] == rid)["label"] == label
-    # Review 2026-10-23 (P3-4): a row the previous head wrote has no routine_id in its intent; it still lists.
+    # A row the previous head wrote has no routine_id in its intent; it still lists.
     journal = case.ui.console.journal
     saved = journal.get(rid, RECEIVED_PHASE)
     del saved["intent"]["routine"]["routine_id"]

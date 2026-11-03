@@ -109,7 +109,7 @@ def test_started_response_id_and_run_token_are_one_cas(responses, monkeypatch, a
         assert saved.value["run_token"] == attempted[0]["run_token"]
         assert original.response_id == created.json()["id"]
     else:
-        assert original.failure_code == "NATIVE_STATE_STORE_UNKNOWN"
+        assert original.failure_code == "NATIVE_TURN_NOT_STARTED"
         assert original.response_id is None and saved.value["run_token"] is None
     replay = responses.respond(accepted)
     responses.response_result(replay.json()["id"])

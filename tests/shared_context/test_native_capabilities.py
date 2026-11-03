@@ -16,6 +16,7 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_wire import WireModel
 from shared_context.m2_copilot import ToolOutput, ToolSpec
 from shared_context.native_turns import TURNS_STORE, NativeTurnRuntime, _json, _Rid
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_turn_wire import capture, submit
 from test_native_turns import Harness, IDENTITY, local_env
 
@@ -90,7 +91,7 @@ def test_selected_consumer_runs_on_original_native_turn_and_releases_after_sdk(l
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "original RID result",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -149,7 +150,7 @@ def test_only_actual_selected_tools_are_bound_and_misconfigured_consumers_never_
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE no capability",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     provider = NativeCapabilityProvider(accepts=lambda grant: grant.entry_id == "fa-shell-v1", bind=bind)
     executor = native_sdk.NativeSdkExecutor(
@@ -210,7 +211,7 @@ def test_factory_passes_native_consumers_without_changing_original_private_root(
     )
     # Hosted settings for the factory only; the turn then uses local_env's offline state store (ee8ef6b7 reads it).
     with monkeypatch.context() as environment:
-        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+        environment.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-hosted-config-only")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
@@ -236,7 +237,7 @@ def test_factory_passes_native_consumers_without_changing_original_private_root(
             "workspace.yaml": "id: " + scope.sdk_session_id + "\n",
         })
         return {"final_message": "OFFLINE factory",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     async def execute():
@@ -286,7 +287,7 @@ def test_consumer_close_failure_keeps_parent_model_usage_and_does_not_replay(loc
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "not yet publishable",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

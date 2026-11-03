@@ -15,6 +15,7 @@ from .behavior_workers import JobRecord, worker_key
 from .errors import Problem
 from .models import Identifier
 from .source_materials import digest
+from .behavior_wire import same_but_release
 from .behavior_skill_prompt import SKILL_PROFILES, AssemblyRecord, assemble_prompt
 from .behavior_capability_prompt import CapabilityAssemblyRecord, capability_record
 from .m3_skills import ApprovedSkillCatalog
@@ -506,7 +507,7 @@ def validate_turn_skills(authority, session, saved):
         if saved.skill_catalog != session.skill_catalog:
             prior = authority.runtime.dep.workers.inspect(saved.job_id)
             if (task is None
-                    or saved.prompt_assembly != assemble_prompt(task.prompt_profile).record
+                    or not same_but_release(saved.prompt_assembly, assemble_prompt(task.prompt_profile).record)
                     or prior.state not in {"succeeded", "failed", "cancelled"} or not prior.result_forwarded
                     or not saved.sdk_stop.graceful):
                 raise Problem(403, "SKILL_SOURCE_CHANGED",

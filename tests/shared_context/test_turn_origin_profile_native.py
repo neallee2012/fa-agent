@@ -21,6 +21,7 @@ from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_assistant_wire import InstructionContextOrigin, InstructionSubmit
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
 from test_instruction_flow import instruction_models
@@ -59,12 +60,12 @@ class ConfinedOriginHandler(CopilotRequestHandler):
 @pytest.mark.skipif(os.environ.get("FA_ORIGIN_NATIVE_SCOPE") != "approved",
                     reason="explicit isolated native origin qualification only")
 def test_native_origin_tool_result_reaches_the_next_provider_request(assistant, runtime_path, tmp_path, monkeypatch):
-    assert metadata.version("github-copilot-sdk") == "1.0.13"
+    assert metadata.version("github-copilot-sdk") == SDK_VERSION
     root = tmp_path / "origin-native"
     root.mkdir()
     env = child_environment(root)
     proof = {
-        "status": "FAILED", "sdk_version": "1.0.13", "runtime_version": "1.0.83",
+        "status": "FAILED", "sdk_version": SDK_VERSION, "runtime_version": RUNTIME_VERSION,
         "runtime_sha256": hashlib.sha256(runtime_path.read_bytes()).hexdigest(),
         "runtime_starts": [], "runtime_stops": [], "force_stop_calls": 0,
         "session_creates": 0, "session_resumes": 0, "sdk_sends": 0,
@@ -235,7 +236,7 @@ def test_native_origin_tool_result_reaches_the_next_provider_request(assistant, 
             assert proof["proxy_requests"] == proof["provider_requests"] == 2
             assert proof["tool_starts"] == proof["tool_completions"] == 1
             assert not proof["violations"] and proof["model_facing_origin_matched"]
-            assert bridges[0]._sdk_stop.graceful and bridges[0]._sdk_stop.runtime_version == "1.0.83"
+            assert bridges[0]._sdk_stop.graceful and bridges[0]._sdk_stop.runtime_version == RUNTIME_VERSION
             proof["reply_sha256"] = hashlib.sha256(reply.text.encode("utf-8")).hexdigest()
             proof["status"] = "SUBSET_PASS"
     finally:

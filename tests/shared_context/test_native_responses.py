@@ -425,7 +425,7 @@ def test_a_precondition_failure_after_our_own_write_is_read_back_not_redone(resp
 
 
 def test_an_accepted_response_waits_for_an_earlier_unexited_cli_before_it_starts(responses):
-    """Review P3 on #903: as on the Invocations chain, a Responses turn whose slot opens while an earlier turn's CLI
+    """#903: as on the Invocations chain, a Responses turn whose slot opens while an earlier turn's CLI
     still runs stays accepted (no SDK call, so no NATIVE_EXECUTION_UNAVAILABLE after started) and runs once it exits."""
     unexited = [True]
     responses.sdk.runtime_unexited = lambda: unexited[0]
@@ -440,7 +440,7 @@ def test_an_accepted_response_waits_for_an_earlier_unexited_cli_before_it_starts
 
 
 def test_a_tail_append_on_responses_is_resent_after_the_original_ends_and_runs(responses):
-    """Review P1 on #916: Responses refuses a human turn while the slot holder runs (no queue), so the workbench resends
+    """#916: Responses refuses a human turn while the slot holder runs (no queue), so the workbench resends
     a turn_finished append only after the original ends; that resend then runs."""
     from test_native_turns import append_command, read_append, steer
 
@@ -465,7 +465,7 @@ def test_a_tail_append_on_responses_is_resent_after_the_original_ends_and_runs(r
 
 
 def test_a_response_waiting_on_a_cli_that_never_exits_ends_resendable_within_the_bound(responses, monkeypatch):
-    """Review P2-1 on #903: the wait is bounded in every case. A CLI that never exits and a recovery restart that never
+    """#903: the wait is bounded in every case. A CLI that never exits and a recovery restart that never
     comes end the accepted Responses turn as NATIVE_TURN_NOT_STARTED (resendable) without any SDK call."""
     from shared_context import native_turns
 
@@ -476,3 +476,69 @@ def test_a_response_waiting_on_a_cli_that_never_exits_ends_resendable_within_the
     assert responses.respond(accepted).status_code == 200
     settled = responses.wait("rid-1", "unknown")
     assert settled.failure_code == "NATIVE_TURN_NOT_STARTED" and not responses.sdk.calls
+
+
+@pytest.mark.parametrize("lands_late", [False, True])
+def test_a_response_start_write_read_back_unchanged_ends_resendable(responses, monkeypatch, lands_late):
+    """The started write failed and its read-back found the accepted receipt as it was: the SDK never ran, also
+    when that write lands only after the read-back."""
+    from azure.ai.agentserver.core.storage import FoundryStateStore
+
+    attempts, original = [], FoundryStateStore.set_item
+
+    async def not_applied(self, key, value, *args, **kwargs):
+        status = value.get("receipt", {}).get("status") if key == "rid:rid-1" else None
+        if status == "started" and not attempts:
+            attempts.append((value, args, kwargs))
+            raise PermissionError(13, "OFFLINE deterministic not-applied write")
+        if status == "unknown" and lands_late and len(attempts) == 1:
+            late, late_args, late_kwargs = attempts[0]
+            attempts.append(await original(self, key, late, *late_args, **late_kwargs))
+        return await original(self, key, value, *args, **kwargs)
+
+    monkeypatch.setattr(FoundryStateStore, "set_item", not_applied)
+    assert responses.invoke(response_submit()).status_code == 202
+    assert responses.respond(responses.call(responses.runtime.read, "rid-1")).status_code == 200
+    settled = responses.wait("rid-1", "unknown")
+    assert settled.failure_code == "NATIVE_TURN_NOT_STARTED" and not responses.sdk.calls
+    assert len(attempts) == (2 if lands_late else 1)
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+def test_a_response_reentry_of_a_start_nobody_numbered_ends_resendable(responses, monkeypatch, stopped):
+    """The late start write landed and the write closing it failed too: the retried response finds a started receipt
+    that was never numbered, so the SDK never ran (issue #1147)."""
+    from azure.ai.agentserver.core.storage import FoundryStateStore
+
+    attempts, original = [], FoundryStateStore.set_item
+
+    async def not_applied(self, key, value, *args, **kwargs):
+        status = value.get("receipt", {}).get("status") if key == "rid:rid-1" else None
+        if status == "started" and not attempts:
+            attempts.append((value, args, kwargs))
+            raise PermissionError(13, "OFFLINE deterministic not-applied write")
+        if status == "unknown" and len(attempts) == 1:
+            late, late_args, late_kwargs = attempts[0]
+            attempts.append(await original(self, key, late, *late_args, **late_kwargs))
+        elif status == "unknown" and len(attempts) == 2:
+            attempts.append(None)
+            raise PermissionError(13, "OFFLINE deterministic not-applied close")
+        return await original(self, key, value, *args, **kwargs)
+
+    monkeypatch.setattr(FoundryStateStore, "set_item", not_applied)
+    assert responses.invoke(response_submit()).status_code == 202
+    accepted = responses.call(responses.runtime.read, "rid-1")
+    responses.respond(accepted)
+    deadline = time.monotonic() + 8
+    while len(attempts) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    left = responses.call(responses.runtime.read, "rid-1")
+    assert left.status == "started" and left.turn_number is None and len(attempts) == 3
+    if stopped:
+        cancel = responses.invoke(NativeCancel(request_id="rid-1", conversation_id=left.conversation_id))
+        assert cancel.status_code == 200, cancel.text
+        assert responses.call(responses.runtime.read, "rid-1").cancel_requested
+    assert responses.respond(accepted).status_code == 200
+    settled = responses.wait("rid-1", "unknown")
+    expected = "NATIVE_TURN_CANCELLED" if stopped else "NATIVE_TURN_NOT_STARTED"
+    assert settled.failure_code == expected and not responses.sdk.calls

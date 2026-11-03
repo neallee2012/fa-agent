@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from test_conversation_routing import conversation_view, read_reply
@@ -122,14 +123,14 @@ def test_fixed_sdk_keeps_interleaved_conversations_and_follow_up_separate(assist
     assert [prompt for _, prompt in sends] == [bravo_text, alpha_text, follow_text]
     assert sends[0][0] != sends[1][0] == sends[2][0]
     assert len(requests) == len(stopped) == 3 and forced == []
-    assert runtime_versions and set(runtime_versions) == {"1.0.83"}
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert runtime_versions and set(runtime_versions) == {RUNTIME_VERSION}
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     if output := os.environ.get("FA_CONVERSATION_ROUTING_EVIDENCE_DIR"):
         destination = Path(output)
         destination.mkdir(parents=True, exist_ok=True)
         (destination / "conversation-routing-native.json").write_text(json.dumps({
             "evidence": "Fixed SDK, real FA HTTP authority, explicit offline provider transport.",
-            "sdk_version": "1.0.13",
+            "sdk_version": SDK_VERSION,
             "runtime_versions": runtime_versions,
             "model_requests": requests,
             "sdk_user_text_exact": True,

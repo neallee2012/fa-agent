@@ -10,14 +10,19 @@ from pydantic import ValidationError
 from shared_context import behavior_wire as wire
 
 
-def test_wire_has_only_standard_library_and_pydantic_imports():
-    tree = ast.parse(Path(wire.__file__).read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
+def _imports(path):
+    for node in ast.walk(ast.parse(Path(path).read_text(encoding="utf-8"))):
         if isinstance(node, ast.ImportFrom):
-            assert node.level == 0
-            assert node.module in {"__future__", "datetime", "typing", "pydantic"}
+            yield node.level, node.module
         elif isinstance(node, ast.Import):
-            assert all(name.name.split(".")[0] in {"json", "base64", "hashlib"} for name in node.names)
+            yield from ((0, name.name.split(".")[0]) for name in node.names)
+
+
+def test_wire_has_only_standard_library_and_pydantic_imports():
+    stdlib = {"__future__", "datetime", "typing", "json", "base64", "hashlib"}
+    allowed = {(0, name) for name in stdlib}
+    assert set(_imports(wire.__file__)) - allowed - {(0, "pydantic"), (1, "sdk_pin")} == set()
+    assert set(_imports(Path(wire.__file__).with_name("sdk_pin.py"))) - allowed == set()
 
 
 @pytest.mark.parametrize("authority", ["actor", "approved", "context", "grant_id", "owner", "root_budget_id", "clock", "adapter"])

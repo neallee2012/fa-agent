@@ -19,6 +19,7 @@ from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_skill_copy import SopCopyReceipt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.behavior_sdk_compaction import events_from
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from web_test_console.freeform import ConversationProjection
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
@@ -31,7 +32,7 @@ from test_sop_skill_copy import approved_sop, change_source, copy_scope, configu
 def test_fixed_sdk_cancel_after_known_copy_keeps_historical_effect_and_real_stop(
         assistant, signing_key, jwk_client, monkeypatch):
     h = assistant
-    source_http, agent, human_headers, source = approved_sop(h, signing_key, jwk_client)
+    artifacts, agent, approver, source = approved_sop(h, signing_key, jwk_client)
     h, control, _ = configured_copy(h, copy_scope(source))
     bridges, requests, receipts, forced, aborts = [], [], [], [], []
     initialize, force_stop, abort = hosted.AssistantSession.__init__, CopilotClient.force_stop, CopilotSession.abort
@@ -65,7 +66,7 @@ def test_fixed_sdk_cancel_after_known_copy_keeps_historical_effect_and_real_stop
         receipt = SopCopyReceipt.model_validate_json(text)
         assert receipt.state_scope == "at-original-copy-write" and receipt.approved is False
         receipts.append(receipt)
-        change_source(source_http, agent, human_headers)
+        change_source(artifacts, agent, approver)
         binding_id = bridges[0].client.assignment.binding_id
         cancelled = h.client.post("/work-policy/v1/bindings/" + binding_id + "/cancel",
             headers=h.headers(), json={"request_id": "native-original-copy-cancel"})
@@ -101,7 +102,7 @@ def test_fixed_sdk_cancel_after_known_copy_keeps_historical_effect_and_real_stop
         assert result.state == "cancelled" and not result.passed_checks
         assert archive.sop_copy_receipt == receipts[0] and archive.sop_copy_outcome.stage == "saved"
         assert archive.sdk_stop == bridges[0]._sdk_stop and archive.sdk_stop.graceful
-        assert archive.sdk_stop.runtime_version == "1.0.83" and not forced and aborts
+        assert archive.sdk_stop.runtime_version == RUNTIME_VERSION and not forced and aborts
         events = events_from(bridges[0]._session_files.snapshot().files)
         assert [event["data"]["content"] for event in events if event["type"] == "user.message"] == [original]
         response = h.client.get("/work-policy/v1/conversations/" + accepted["conversation_id"], headers=h.headers())
@@ -112,7 +113,7 @@ def test_fixed_sdk_cancel_after_known_copy_keeps_historical_effect_and_real_stop
         target.mkdir(parents=True, exist_ok=True)
         (target / "fixed-sdk-copy-cancel.json").write_text(json.dumps({
             "scope": "One real fixed SDK with signed copy, signed source update and signed cancellation; offline provider",
-            "runtime_mode": h.runtime.mode, "sdk_version": "1.0.13", "runtime_version": "1.0.83",
+            "runtime_mode": h.runtime.mode, "sdk_version": SDK_VERSION, "runtime_version": RUNTIME_VERSION,
             "offline_requests": len(requests), "original_target_creates": len(target_creates),
             "original_target_uploads": len(target_uploads), "official_abort_calls": len(aborts),
             "sdk_stop": archive.sdk_stop.model_dump(mode="json"), "force_stop_calls": len(forced),

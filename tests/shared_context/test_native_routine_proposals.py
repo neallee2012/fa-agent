@@ -20,18 +20,18 @@ from shared_context.native_hitl_wire import (
 from shared_context.m2_copilot import ToolFailure
 from shared_context.native_routine_proposal_tool import propose_routine_tool
 from shared_context.native_routine_wire import NativeRoutineProposalResult, next_daily_run, routine_proposal_change
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_hitl import change, hitl, post  # noqa: F401
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
+from test_native_hitl import change, hitl, post
 from test_native_hitl_h2 import SID, human_decide, pending_view, permit, setup_gate, verdict
-from test_native_routine_api import routine_api  # noqa: F401
+from test_native_routine_api import routine_api
 from test_native_routine_context import routine_client, sdk_answer
 from test_native_routine_turns import routine_request
-from test_native_turn_api import native_api  # noqa: F401
+from test_native_turn_api import native_api
 from test_native_turn_wire import submit as native_submit
-from test_native_turns import harness, local_env, native_retry_policy  # noqa: F401
-from test_web_test_console_native import first, native_console, progress, send  # noqa: F401
+from test_native_turns import harness, local_env, native_retry_policy
+from test_web_test_console_native import first, native_console, progress, send
 
 HITL = "/native-hitl/v1"
 CONTENT = "Check the Foundry what's new page and tell me about new articles."
@@ -380,7 +380,7 @@ def test_a_scheduled_turn_that_calls_propose_routine_is_refused_before_any_card(
 
 
 @pytest.fixture
-def routine_console(request, monkeypatch, signing_key):  # noqa: F811
+def routine_console(request, monkeypatch, signing_key):
     for name, value in FLAGS.items():
         monkeypatch.setenv(name, value)
     c = request.getfixturevalue("native_console")
@@ -473,7 +473,7 @@ def test_console_disable_refuses_a_version_the_owner_did_not_see(routine_console
     assert c.ui.client.get("/api/routines").json()["routines"][0]["definition"]["enabled"] is True
 
 
-def test_console_routines_are_unavailable_without_native_routines(native_console):  # noqa: F811
+def test_console_routines_are_unavailable_without_native_routines(native_console):
     c = native_console
     assert c.ui.client.get("/api/state").json()["routines_available"] is False
     response = c.ui.client.get("/api/routines")

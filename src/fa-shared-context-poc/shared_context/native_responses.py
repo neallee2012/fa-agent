@@ -277,7 +277,7 @@ class NativeResponsesHandler:
         if turn.receipt.status != "accepted":
             turn.receipt = await self.runtime._reenter(
                 turn.original, failure_code="NATIVE_TURN_UNKNOWN" if turn.fenced() else None,
-                recovered=context.is_recovery and not context.client_cancelled)
+                recovered=context.is_recovery and not context.client_cancelled, cancelled=control.cancelled)
         elif not exited:
             turn.receipt = await self.runtime._close_unstarted(turn.original)
         elif turn.fenced():
@@ -300,7 +300,7 @@ class NativeResponsesHandler:
         try:
             turn.original, ours = await runtime._cas(turn.original, started)
         except _UnchangedRidWrite:
-            turn.receipt = await runtime._unknown(turn.original, "NATIVE_STATE_STORE_UNKNOWN")
+            turn.receipt = await runtime._close_unstarted(turn.original, run_token=started.run_token)
         else:
             elapsed_timing("native_start", starting, job_id=timing_id(turn.rid))
             if ours:
@@ -320,7 +320,7 @@ class NativeResponsesHandler:
             elif turn.original.value.receipt.hosted_session_id != runtime.identity.session_id:
                 turn.receipt = turn.original.value.receipt
             else:
-                turn.receipt = await runtime._reenter(turn.original)
+                turn.receipt = await runtime._reenter(turn.original, cancelled=control.cancelled)
         turn.signals(control)
         if context.shutdown.is_set():
             await context.exit_for_recovery()

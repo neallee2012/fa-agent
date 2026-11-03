@@ -22,6 +22,7 @@ from shared_context.behavior_skill_copy import SopCopyReceipt
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from web_test_console.freeform import ConversationProjection
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
@@ -119,13 +120,13 @@ def test_fixed_sdk_copy_returns_only_one_unapproved_receipt_without_model_body_i
     assert len(bridges) == len(options) == 1 and len(requests) == 3 and not forced
     assert options[0]["enable_config_discovery"] is False and options[0]["mcp_servers"] == {}
     assert all(options[0][field] == [] for field in ("skill_directories", "plugin_directories", "custom_agents"))
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     if os.environ.get("FA_SOP_COPY_EVIDENCE_DIR"):
         destination = Path(os.environ["FA_SOP_COPY_EVIDENCE_DIR"])
         destination.mkdir(parents=True, exist_ok=True)
         (destination / "fixed-sdk-copy.json").write_text(json.dumps({
             "scope": "Signed local M3 and current Runtime ticket; fixed SDK with scripted offline provider",
-            "runtime_mode": h.runtime.mode, "sdk_version": "1.0.13", "runtime_version": "1.0.83",
+            "runtime_mode": h.runtime.mode, "sdk_version": SDK_VERSION, "runtime_version": RUNTIME_VERSION,
             "prefix_sha256": PREFIX_HASH, "prefix_utf8_bytes": prefix.record.prefix_utf8_bytes,
             "offline_requests": requests, "sdk_stop": archive.sdk_stop.model_dump(mode="json"),
             "force_stop_calls": len(forced), "artifact_creates": 1, "version_uploads": 1,

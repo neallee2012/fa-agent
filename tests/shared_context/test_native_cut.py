@@ -20,11 +20,11 @@ from shared_context.behavior_native_turn_api import agent_client
 from shared_context.behavior_native_turn_wire import NativeEnvironmentView, NativeSessionRead
 from shared_context.native_binding import NativeBindingStore
 from shared_context.native_turns import TURNS_STORE
-from test_native_abandon_source import binding_rows  # noqa: F401
+from test_native_abandon_source import binding_rows
 import test_native_abandon_source as abandon
-from test_native_binding import bound, declared  # noqa: F401
+from test_native_binding import bound, declared
 from test_native_environment import invoke
-from test_native_files_api import (  # noqa: F401
+from test_native_files_api import (
     PREFIX, file_api, file_loops, instruction_models, jwk_client, local_env, native_api, signing_key,
     synthetic_standing_v1, token,
 )
@@ -131,8 +131,6 @@ def finished(driver, agent_id, timeout=30):
         time.sleep(0.02)
 
 
-# --- the turn-end hook ---------------------------------------------------------------------------------------------
-
 def test_the_turn_end_hook_adds_no_reads_to_the_request_that_saw_it(file_api, monkeypatch):
     fixture = ready(file_api, monkeypatch)
     on_source_version(fixture, monkeypatch)
@@ -215,8 +213,6 @@ def test_busy_waits_for_the_next_turn_end_with_no_calls_meanwhile(file_api, monk
     assert "NATIVE_UPGRADE_CUT_API outcome=ready" in caplog.text
     assert abandon.row(fixture).hosted_session_id == fixture.destination.session_id
 
-
-# --- probe, list, cut ----------------------------------------------------------------------------------------------
 
 def test_a_turn_admitted_after_the_probe_makes_the_cut_busy_and_its_files_still_move(file_api, monkeypatch):
     fixture = file_api
@@ -312,8 +308,6 @@ def test_a_drift_the_row_never_recorded_is_refused_without_invoking_the_source(f
     row = abandon.row(fixture)
     assert row.hosted_session_id == fixture.source.session_id and row.upgrade is None
 
-
-# --- fence bound, crashes ------------------------------------------------------------------------------------------
 
 def test_a_fence_past_its_bound_is_withdrawn_and_the_old_sid_admits_again(file_api, monkeypatch):
     fixture = ready(file_api, monkeypatch)
@@ -750,7 +744,7 @@ def test_b_a_fence_whose_stopped_source_woke_on_the_selected_version_commits_wit
 ])
 def test_a_woken_code_while_the_source_stays_stopped_exits_through_the_bounded_pair(
         file_api, monkeypatch, caplog, status, code):
-    """Review P2: the code alone is not a wake. With the source still idle it is the destination's own failure, so it
+    """The code alone is not a wake. With the source still idle it is the destination's own failure, so it
     is confirmed like any unmovable error and the fence commits without files, instead of waiting forever."""
     fixture = ready(file_api, monkeypatch)
     failed = _failing_after_fas_stop(fixture, monkeypatch, status, code)
@@ -764,7 +758,7 @@ def test_a_woken_code_while_the_source_stays_stopped_exits_through_the_bounded_p
 
 
 def test_a_transient_destination_oserror_503_does_not_commit_without_files_after_five_seconds(file_api, monkeypatch):
-    """Review: a 503 ``NATIVE_FILES_UNAVAILABLE`` is the destination's staging OSError, which may clear. It waits under
+    """A 503 ``NATIVE_FILES_UNAVAILABLE`` is the destination's staging OSError, which may clear. It waits under
     the 30-minute drive bound instead of the 5-second unmovable pair, and the files arrive once it clears."""
     fixture = ready(file_api, monkeypatch)
     failed = _failing_after_fas_stop(fixture, monkeypatch, 503, "NATIVE_FILES_UNAVAILABLE", times=2)
@@ -801,7 +795,7 @@ def _woken_on(fixture, version):
 
 
 def test_errors_before_the_source_woke_on_another_version_do_not_count_toward_the_bound(file_api, monkeypatch):
-    """Review P1: the first pass that sees the source awake on another version clears the drive clocks, so a
+    """The first pass that sees the source awake on another version clears the drive clocks, so a
     transient error after the wake waits its own 30 minutes instead of committing without files at once."""
     fixture = ready(file_api, monkeypatch)
     _failing_after_fas_stop(fixture, monkeypatch, 503, "NATIVE_FILES_UNKNOWN", times=3)
@@ -898,7 +892,7 @@ def test_b_an_old_unmovable_clock_and_a_destination_read_error_on_the_woken_pass
 
 
 def test_b_a_wake_clear_whose_table_write_failed_is_retried_before_any_clock_is_read(file_api, monkeypatch):
-    """Review: the wake's clear goes through ``_binding``, which swallows a Table failure. Counted as done anyway, the
+    """The wake's clear goes through ``_binding``, which swallows a Table failure. Counted as done anyway, the
     pass's unmovable code would meet B's old 03:02 clock and commit without files at once. Unwritten, the pass waits
     and the next pass clears again before the destination is read, so the code starts a new pair."""
     from shared_context.behavior_session_files import FollowFiles
@@ -1361,7 +1355,7 @@ def test_j_a_crash_after_the_commit_is_recorded_by_the_rerun(file_api, monkeypat
 
 
 def test_j_a_commit_the_row_missed_is_recorded_while_the_source_is_idle(file_api, monkeypatch):
-    """Review P3: an idle source returns ``source_idle`` only after a commit the row missed is settled (§7a (j))."""
+    """An idle source returns ``source_idle`` only after a commit the row missed is settled (§7a (j))."""
     fixture = ready(file_api, monkeypatch, files=False)
 
     def crash(*_args, **_kwargs):
@@ -1380,7 +1374,7 @@ def test_j_a_commit_the_row_missed_is_recorded_while_the_source_is_idle(file_api
 
 
 def test_a_legacy_pending_with_fas_stop_is_driven_while_the_source_is_idle(file_api, monkeypatch, caplog):
-    """Review P3: with every follow entry off (2d-i), an older follow's pending whose files progress records FA's stop
+    """With every follow entry off (2d-i), an older follow's pending whose files progress records FA's stop
     is driven to its commit with the files by the cut even though the source is idle."""
     fixture = ready(file_api, monkeypatch)
     enforcing(fixture, monkeypatch)
@@ -1413,8 +1407,6 @@ def test_an_admission_stuck_past_five_minutes_takes_the_abandon_path(file_api, m
     assert source_calls(fixture) == ([], [], [])
     assert "admission_request_id" not in state(fixture)
 
-
-# --- durable bounds (2d-i P6) --------------------------------------------------------------------------------------
 
 def restarted(fixture):
     """Another API replica, or this one after a restart: no in-process memory of the earlier attempts."""
@@ -1488,8 +1480,6 @@ def test_without_the_flag_the_bounds_stay_in_memory_and_the_row_has_no_clocks(fi
     now[0] += behavior_native_sessions.STUCK_ADMISSION_SECONDS + 1
     assert cut(fixture) == ("busy", "admission_pending", None)
 
-
-# --- P9 hard gates, the P8 gap, the deploy hook (2d-i P6) ----------------------------------------------------------
 
 def _crashed_fence(fixture, monkeypatch):
     def crash(*_args, **_kwargs):
@@ -1746,8 +1736,6 @@ def test_the_deploy_follow_hook_verifies_only_and_calls_no_session(file_api, mon
     assert results[0]["state"] in {"ok", "pending"} and advanced == [] and len(fixture.controls) == start
 
 
-# --- repair-fallback profile ---------------------------------------------------------------------------------------
-
 def test_a_repair_fallback_profile_is_corrected_by_the_next_definition_read(bound, monkeypatch):
     from shared_context.errors import Problem
 
@@ -1775,8 +1763,6 @@ def test_a_repair_fallback_profile_is_corrected_by_the_next_definition_read(boun
     assert (corrected.state_profile, corrected.profile_unread) == ("foundry-native-v2", False)
     assert "profile_unread" not in corrected.model_dump(mode="json")
 
-
-# --- the destination create ------------------------------------------------------------------------------------------
 
 def real_create(fixture, monkeypatch, create, status=None):
     """The real ``create_session`` over the platform double: ``create(sid)`` answers the create call (raise to fail

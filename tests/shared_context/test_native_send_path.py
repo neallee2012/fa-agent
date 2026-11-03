@@ -24,16 +24,16 @@ from shared_context.behavior_native_turn_wire import (
     NativeEnvironmentNotice, NativeEnvironmentView, NativeReceipt, before_dispatch,
 )
 from shared_context.errors import Problem
-from test_native_binding import CountingRepository, bound, claim, declared, row  # noqa: F401
-from test_native_turn_api import PREFIX, NativeTransport, native_api, submit  # noqa: F401
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key, token  # noqa: F401
+from test_native_binding import CountingRepository, bound, claim, declared, row
+from test_native_turn_api import PREFIX, NativeTransport, native_api, submit
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key, token
 from test_native_session_prepare_api import project_client
 import test_native_abandon_source as abandon
-from test_native_abandon_source import binding_rows  # noqa: F401
+from test_native_abandon_source import binding_rows
 from test_native_automatic_environment import advance
-from test_native_files_api import file_api, file_loops, local_env  # noqa: F401
+from test_native_files_api import file_api, file_loops, local_env
 from test_native_follow_no_wake import source_calls
 
 
@@ -424,7 +424,7 @@ def _following(case, monkeypatch, state="pending", hosted_session_id="fa-native-
 
 
 def test_a_moved_selector_never_calls_the_rows_sid_before_the_follow(bound, monkeypatch):
-    """Review probe: the row's SID (created on 41, idle) is not the version the selector now picks (42). The
+    """Probe: the row's SID (created on 41, idle) is not the version the selector now picks (42). The
     follow-up's conversation prefetch (removed 2026-10-22) and the session read both used to reach it first,
     which wakes an idle source on the platform; the retained follow decides now, and nothing reaches that SID."""
     case = bound
@@ -653,7 +653,7 @@ def _failing_platform(monkeypatch, failure):
 
 @pytest.mark.parametrize("failure", [503, 500, 429, "timeout", "creating", "updating"])
 def test_a_warm_submit_whose_metadata_read_fails_is_sent_as_on_main(bound, monkeypatch, caplog, failure):
-    """Review probe: a warm process (main skipped this read for a day after a use) whose metadata read fails (5xx,
+    """Probe: a warm process (main skipped this read for a day after a use) whose metadata read fails (5xx,
     429, timeout) or finds the SID creating or updating sends anyway: one read, no retry, one warning (was 503)."""
     case = bound
     _warm(case, monkeypatch)

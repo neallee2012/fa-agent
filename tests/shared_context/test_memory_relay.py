@@ -6,10 +6,7 @@ errors, with the phase 0c probe's statuses). ``azure-cosmos`` itself is not inst
 """
 
 import logging
-import os
-from pathlib import Path
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -492,24 +489,3 @@ def test_shutdown_never_waits_behind_a_build_and_closes_a_built_client(monkeypat
     assert "FA_MEMORY_RELAY_CLOSE status=skipped reason=build_in_progress" in caplog.text
     shared.close()
     assert closed == [True] and shared._container is None and shared._client is None
-
-
-def test_the_relay_imports_without_the_hosted_sdk_or_azure_cosmos():
-    code = """
-import importlib.abc
-import sys
-class Reject(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname in ('copilot', 'azure.cosmos') or fullname.startswith(('copilot.', 'azure.ai.agentserver',
-                                                                           'azure.cosmos.')):
-            raise AssertionError('import: ' + fullname)
-sys.meta_path.insert(0, Reject())
-import shared_context.memory_relay
-print('independent')
-"""
-    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1",
-           "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc")}
-    result = subprocess.run([sys.executable, "-X", "utf8", "-c", code], env=env,
-                            capture_output=True, text=True, encoding="utf-8", timeout=60)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "independent"

@@ -29,6 +29,7 @@ from shared_context.native_agent_tools import NativeAgentRelayClient
 from shared_context.native_checkpoint import open_durable_store
 from shared_context.native_private_memory import NativePrivateMemory
 from shared_context.native_turns import EFFECTS_STORE, NativeTurnRuntime
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_capabilities import selected_capture
 from test_native_turn_wire import agent_receive, capture, receipt_for, submit
 from test_native_turns import Harness, IDENTITY, local_env
@@ -115,7 +116,7 @@ def run_turn(monkeypatch, tmp_path, sent, *, decision="candidate", scope=SCOPE, 
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE answer",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
@@ -202,7 +203,7 @@ def test_a_follow_up_with_the_scope_newly_enabled_continues_the_original_convers
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE answer",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(
         root=tmp_path / "native", runtime_path=tmp_path / "OFFLINE-not-executed", api_url="https://api.offline.invalid",
@@ -253,7 +254,7 @@ def test_the_factory_shares_before_private_memory_and_a_failure_never_blocks_the
         await current.on_terminal(receipt)  # the peer result goes out ahead of usage and memory
         await current.on_completed(receipt, None)
     with monkeypatch.context() as environment:
-        for name, value in {"FA_NATIVE_TURNS": "foundry-native-v1", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
+        for name, value in {"FA_NATIVE_TURNS": "foundry-native-v3", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
                             "AGENTSERVER_TASKS_BACKEND": "hosted", "HOME": str(home),
                             "BEHAVIOR_ASSISTANT_RUNTIME_PATH": str(runtime_path), "FOUNDRY_PROJECT_ENDPOINT": ENDPOINT,
                             "FOUNDRY_AGENT_NAME": "OFFLINE-agent", memory.STORE_ENV: "fa-memory-store",
@@ -302,7 +303,7 @@ def test_the_group_post_goes_first_then_the_team_note_then_private_memory(local_
     monkeypatch.setattr(NativePrivateMemory, "completed", remembered)
     monkeypatch.delenv("FA_NATIVE_HITL_ENABLED", raising=False)
     with monkeypatch.context() as environment:
-        for name, value in {"FA_NATIVE_TURNS": "foundry-native-v1", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
+        for name, value in {"FA_NATIVE_TURNS": "foundry-native-v3", "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
                             "AGENTSERVER_TASKS_BACKEND": "hosted", "HOME": str(home),
                             "BEHAVIOR_ASSISTANT_RUNTIME_PATH": str(runtime_path), "FOUNDRY_PROJECT_ENDPOINT": ENDPOINT,
                             "FOUNDRY_AGENT_NAME": "OFFLINE-agent", memory.STORE_ENV: "fa-memory-store",

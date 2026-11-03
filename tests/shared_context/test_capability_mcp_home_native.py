@@ -1,4 +1,4 @@
-"""Pinned SDK 1.0.13 / runtime 1.0.83: a Hosted MCP server gets a writable, FA-private HOME and a short TMPDIR.
+"""Pinned SDK 1.0.26 / runtime 1.0.103: a Hosted MCP server gets a writable, FA-private HOME and a short TMPDIR.
 
 The runtime passes MCP children no HOME, so tools fell back to the passwd home on the read-only Hosted rootfs
 (Playwright: mkdir '/home/app/.cache' ENOENT). Its TMPDIR under the long FA state dir made Chromium's

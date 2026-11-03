@@ -10,12 +10,13 @@ import pytest
 from shared_context import behavior_assistant_hosted as hosted
 from shared_context import behavior_assistant_wire as aw
 from shared_context.behavior_server import ServerComposition
+from shared_context.sdk_pin import RUNTIME_VERSION
 
 
 @pytest.mark.parametrize("failed", [False, True])
 def test_final_save_waits_for_inflight_public_progress(tmp_path, monkeypatch, failed):
     entered, release, finished = Event(), Event(), Event()
-    stop = aw.SdkStop(runtime_version="1.0.83", pid=42, exit_code=0, graceful=True)
+    stop = aw.SdkStop(runtime_version=RUNTIME_VERSION, pid=42, exit_code=0, graceful=True)
     saved = []
     def progress(_):
         entered.set()
@@ -161,7 +162,7 @@ def test_turn_end_progress_joins_the_final_save_without_a_separate_write(tmp_pat
 def test_progress_cannot_overlap_next_model_or_tool_authority(tmp_path, monkeypatch, operation):
     entered, release, finished = Event(), Event(), Event()
     calls = []
-    stop = aw.SdkStop(runtime_version="1.0.83", pid=42, exit_code=0, graceful=True)
+    stop = aw.SdkStop(runtime_version=RUNTIME_VERSION, pid=42, exit_code=0, graceful=True)
     source = aw.ExactSourceRef(source_id="reviewed-source", version=1, sha256="a"*64, byte_length=2)
     def progress(_):
         entered.set()

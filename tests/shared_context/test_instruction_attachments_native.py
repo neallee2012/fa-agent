@@ -16,6 +16,7 @@ from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_behavior_assistant import assistant
 from test_instruction_attachments import BODY, configured_attachments, post
 from test_instruction_flow import instruction_models
@@ -83,6 +84,6 @@ def test_fixed_sdk_selection_uses_exact_text_and_retains_it_on_cold_resume(assis
                            + m2_copilot._text_file_block("reference.txt", BODY), None)
         assert sent[1][1] is None
         assert bridges[0].client.assignment.sdk_session_id == bridges[1].client.assignment.sdk_session_id
-        assert all(item._sdk_stop.graceful and item._sdk_stop.runtime_version == "1.0.83" for item in bridges)
+        assert all(item._sdk_stop.graceful and item._sdk_stop.runtime_version == RUNTIME_VERSION for item in bridges)
         assert not any((item.root / "work" / "reference.txt").exists() for item in bridges)
         assert "Exception in callback" not in caplog.text

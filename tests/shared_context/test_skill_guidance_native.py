@@ -17,6 +17,7 @@ from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_skill_prompt import SKILL_CAPABILITIES
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
@@ -207,17 +208,17 @@ def test_loaded_malicious_guidance_is_data_for_the_fixed_sdk_and_cannot_execute_
     assert protected_rows(turn) == original_operation_rows
     assert observed_user == [True]
     stop = bridges[0]._sdk_stop
-    assert stop is not None and stop.graceful and stop.runtime_version == "1.0.83"
+    assert stop is not None and stop.graceful and stop.runtime_version == RUNTIME_VERSION
     assert stop.pid == processes[0].pid and processes[0].poll() is not None
     assert stop.exit_code == processes[0].returncode
     assert not any(event["type"] in {"skill.invoked", "newskill.invoked", "session.error",
                                    "session.compaction_start", "session.compaction_complete"} for event in safe_events)
     projection = h.client.get("/work-policy/v1/conversations/" + accepted["conversation_id"], headers=h.headers())
     assert projection.status_code == 200 and projection.json()["turns"][0]["reply_available"]
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     record("fixed-sdk-loaded-guidance", {
         "profile": PROFILES[1], "runtime_mode": h.runtime.mode, "layer": "fixed-sdk-offline-provider",
-        "sdk_version": "1.0.13", "runtime_version": stop.runtime_version,
+        "sdk_version": SDK_VERSION, "runtime_version": stop.runtime_version,
         "source_body_sha256": source["sha256"], "source_version": source["version_id"],
         "source_metadata_sha256": source["metadata_sha256"],
         "provider_requests": requests, "operation_attempts": operations,

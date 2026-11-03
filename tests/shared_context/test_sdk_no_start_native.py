@@ -18,6 +18,7 @@ from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_skill_prompt import SKILL_CAPABILITIES
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_approved_skill_api import add_skill
 from test_behavior_assistant import assistant
@@ -30,7 +31,7 @@ from test_sdk_no_start import configured_no_start
 
 def test_fixed_sdk_constructs_only_after_durable_entry_intent_and_keeps_real_stop(
         assistant, monkeypatch, *, profile="fa-sdk-start-gate-v1"):
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     if profile == "fa-sdk-start-gate-v1":
         add_skill(assistant)
         h, _, _ = configured_no_start(assistant)
@@ -110,7 +111,7 @@ def test_fixed_sdk_constructs_only_after_durable_entry_intent_and_keeps_real_sto
         events = events_from(bridges[0]._session_files.snapshot().files)
         assert [event["data"]["content"] for event in events if event["type"] == "user.message"] == [original]
     assert len(entries) == len(requests) == 1 and forced == []
-    assert bridges[0]._sdk_stop.runtime_version == "1.0.83" and bridges[0]._sdk_stop.graceful
+    assert bridges[0]._sdk_stop.runtime_version == RUNTIME_VERSION and bridges[0]._sdk_stop.graceful
     if os.environ.get("FA_NO_SDK_EVIDENCE_DIR"):
         destination = Path(os.environ["FA_NO_SDK_EVIDENCE_DIR"])
         destination.mkdir(parents=True, exist_ok=True)

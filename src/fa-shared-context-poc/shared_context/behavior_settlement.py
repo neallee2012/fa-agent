@@ -216,25 +216,35 @@ class RetainedResultSettlement:
         if registration is not None:
             self._installed()
 
+    def _contracts_differ(self):
+        """Whether the running delivery, worker and store parts stopped matching the original configuration."""
+        return (self.config.delivery != self.core.contract
+                or self.config.workers != self.workers.contract
+                or self.config.table.scope != self.store._scope
+                or self.core.contract.control_binding != self.store._binding
+                or self.workers.contract.control_binding != self.store._binding
+                or tuple(self.runtime.bindings.values()) != self.config.bindings)
+
+    def _identity_differs(self, binding):
+        return (self.config.identity.human_oid != binding.human_oid
+                or self.config.identity.tenant_id != binding.tenant_id
+                or self.config.identity.team_id != binding.team_id)
+
+    def _wiring_differs(self):
+        """Whether the runtime parts are not this exact inbox, core and store, all in one mode."""
+        return (self.config.authentication_version != self.inbox.registration.authentication_version
+                or self.inbox.core is not self.core or self.inbox.store is not self.store
+                or self.core.registration.channel_adapter is not self.inbox
+                or self.workers.store is not self.store
+                or self.runtime.mode != self.core.registration.mode or self.workers.mode != self.runtime.mode)
+
     def _installed(self):
         r, b = self.registration, self.binding
         if (r is None or b is None or r.protection_verifier is None
                 or r.binding_id != b.binding_id
                 or self.config.sha256 != self.configuration_sha256
                 or r.configuration_sha256 != self.configuration_sha256
-                or self.config.delivery != self.core.contract
-                or self.config.workers != self.workers.contract
-                or self.config.table.scope != self.store._scope
-                or self.core.contract.control_binding != self.store._binding
-                or self.workers.contract.control_binding != self.store._binding
-                or tuple(self.runtime.bindings.values()) != self.config.bindings
-                or self.config.identity.human_oid != b.human_oid
-                or self.config.identity.tenant_id != b.tenant_id or self.config.identity.team_id != b.team_id
-                or self.config.authentication_version != self.inbox.registration.authentication_version
-                or self.inbox.core is not self.core or self.inbox.store is not self.store
-                or self.core.registration.channel_adapter is not self.inbox
-                or self.workers.store is not self.store
-                or self.runtime.mode != self.core.registration.mode or self.workers.mode != self.runtime.mode):
+                or self._contracts_differ() or self._identity_differs(b) or self._wiring_differs()):
             raise Problem(403, "SETTLEMENT_DISABLED", "explicit original configuration and retained-result verifier are required")
         # Validate even server registrations; no malformed ID can select another namespace.
         from pydantic import TypeAdapter
@@ -295,44 +305,60 @@ class RetainedResultSettlement:
             raise Problem(403, "SETTLEMENT_OWNER_DENIED", "current owner or configured scope differs")
         return ExecutionContext(**{key: getattr(owner, key) for key in ExecutionContext.model_fields})
 
+    def _policy_differs(self, context, policy, old, budget):
+        """Whether the operation policy, original runtime policy or budget stopped applying."""
+        return (not policy.active or policy.policy_id != context.policy_id or not old.active
+                or old.binding_digest != self.runtime.binding_digest(self.binding)
+                or old.operation_policy_revision != policy.revision
+                or budget.root_budget_id != context.root_budget_id)
+
+    def _job_differs(self, job):
+        """Whether this is not the binding's original top-level job, now without children."""
+        b = self.binding
+        return (job.children or job.spec.parent_job_id is not None
+                or job.spec.job_id != b.job_id or job.spec.work_id != b.work.work_id
+                or job.spec.obligation_id != b.obligation_id or job.spec.input != self.runtime.job_input(b))
+
+    def _delivery_differs(self, ob, work):
+        """Whether the delivery rows stopped naming the binding's original work, result contract and route."""
+        b = self.binding
+        return (work.definition != b.work or work.result.work_revision != 1
+                or work.result.verifier_version != self.core.contract.verifier_version
+                or ob.event_id != b.event_id or ob.root_request_id != b.root_request_id
+                or ob.route != b.route or ob.required_confirmation_level != "client_received")
+
     def _state(self, rows):
         b, core = self.binding, self.core
         context = self._context(rows)
         policy = core._row(rows, control_key("policy", context.policy_id), PolicyRecord)
         old = core._row(rows, runtime_key("policy", b.binding_id), RuntimePolicy)
         budget = core._row(rows, control_key("budget", context.root_budget_id), BudgetRecord)
-        if (not policy.active or policy.policy_id != context.policy_id or not old.active
-                or old.binding_digest != self.runtime.binding_digest(b)
-                or old.operation_policy_revision != policy.revision
-                or budget.root_budget_id != context.root_budget_id):
+        if self._policy_differs(context, policy, old, budget):
             raise Problem(403, "SETTLEMENT_POLICY_DENIED", "current operation policy or original runtime scope differs")
         ob = core._obligation(rows, b.obligation_id, context)
         work = core._work(rows, ob)
         job = self.workers._row(rows, worker_key("job", b.job_id), JobRecord)
         if (work.result is None or work.state not in {"succeeded", "failed", "cancelled"}
                 or job.state != work.state or not job.result_forwarded or job.completion_credit != 0
-                or job.children or job.spec.parent_job_id is not None
-                or job.spec.job_id != b.job_id or job.spec.work_id != b.work.work_id
-                or job.spec.obligation_id != b.obligation_id or job.spec.input != self.runtime.job_input(b)
-                or work.definition != b.work or work.result.work_revision != 1
-                or work.result.verifier_version != core.contract.verifier_version
-                or ob.event_id != b.event_id or ob.root_request_id != b.root_request_id
-                or ob.route != b.route or ob.required_confirmation_level != "client_received"
+                or self._job_differs(job) or self._delivery_differs(ob, work)
                 or any(getattr(job.owner, key) != getattr(context, key)
                        for key in ExecutionContext.model_fields if key != "epoch")):
             raise Problem(403, "SETTLEMENT_RESULT_DENIED", "only the exact forwarded immutable terminal job/result is eligible")
         return context, ob, work, job, old
 
-    def _describe(self, rows):
-        context, ob, work, job, old = self._state(rows)
-        result = work.result
-        result_key = worker_key("work-result", result.evidence_id)
-        if result_key not in rows:
+    def _retained_result(self, rows, result):
+        """The result worker and delivery both retained, with its exact material."""
+        key = worker_key("work-result", result.evidence_id)
+        if key not in rows:
             raise Problem(403, "SETTLEMENT_RESULT_DENIED", "the original result reference changed")
-        retained = self.workers._row(rows, result_key, VerifiedWorkResult)
-        result_material = _material(result.model_dump(mode="json"))
-        if retained != result or _parse(rows[result_key].payload["material"], InlineMaterial) != result_material:
+        retained = self.workers._row(rows, key, VerifiedWorkResult)
+        material = _material(result.model_dump(mode="json"))
+        if retained != result or _parse(rows[key].payload["material"], InlineMaterial) != material:
             raise Problem(403, "SETTLEMENT_RESULT_DENIED", "worker and delivery retained results differ")
+        return key, material
+
+    def _final_outbox(self, rows, ob, work):
+        """The prepared final outbox, proven to hold exactly this terminal payload and version."""
         if ob.final_delivery_id is None:
             raise Problem(409, "SETTLEMENT_NOT_PREPARED", "no immutable terminal outbox is prepared")
         key = control_key("delivery-outbox", ob.final_delivery_id)
@@ -341,6 +367,7 @@ class RetainedResultSettlement:
         outbox = self.core._row(rows, key, _Outbox)
         material = _parse(rows[key].payload["material"], InlineMaterial)
         kind = "final" if work.state == "succeeded" else "failure"
+        result = work.result
         expected = _Payload(
             event_id=ob.event_id, root_request_id=ob.root_request_id, work_id=ob.work_id,
             message_kind=kind, work_state=work.state, result_evidence_id=result.evidence_id,
@@ -356,36 +383,51 @@ class RetainedResultSettlement:
                 or material != _material(expected.model_dump(mode="json"))
                 or material.sha256 != outbox.binding.payload_digest):
             raise Problem(403, "SETTLEMENT_PAYLOAD_DENIED", "only the original exact terminal payload/version may be settled")
-        launch_key, launch_digest, completion_key, completion_digest = None, None, None, None
-        if self.runtime.mode == "native":
-            if job.binding is None:
-                raise Problem(403, "SETTLEMENT_RESULT_DENIED", "a sealed original native execution is required")
-            launch_key = native_key("launch", native_key("launch-id", job.binding.start_request_id))
-            if launch_key not in rows:
-                raise Problem(403, "SETTLEMENT_RESULT_DENIED", "the original native execution changed")
-            launch = self.workers._row(rows, launch_key, _NativeLaunch)
-            completion_key = worker_key("completion", self.binding.job_id, str(job.generation))
-            if completion_key not in rows:
-                raise Problem(403, "SETTLEMENT_RESULT_DENIED", "the original completion reference changed")
-            completion = self.workers._row(rows, completion_key, ExecutorEvidence)
-            if (completion.binding != job.binding or completion.evidence_id != job.last_evidence_id
-                    or completion.sequence != job.last_sequence or completion.sequence > launch.evidence_sequence
-                    or completion.native_execution_id != launch.native_invocation_id
-                    or completion.state != ("stopped" if job.state == "cancelled" else job.state)
-                    or not completion.entire_tree_idle or not completion.all_inflight_starts_fenced
-                    or completion.result != result
-                    or _parse(rows[completion_key].payload["material"], InlineMaterial)
-                    != _material(completion.model_dump(mode="json"))):
-                raise Problem(403, "SETTLEMENT_RESULT_DENIED", "the retained completion does not prove this terminal result")
-            if (launch.phase != "sealed" or launch.sealed_evidence_id is None
-                    or launch.start.binding != job.binding
-                    or job.last_evidence_id != launch.sealed_evidence_id
-                    and job.last_evidence_id != native_key("terminal-verification-id", launch.launch_id, str(completion.sequence))
-                    or launch.definition != work.definition or launch.api_binding_id != self.binding.binding_id
-                    or launch.configuration_digest != self.workers.configuration_digest()):
-                raise Problem(403, "SETTLEMENT_RESULT_DENIED", "native execution is not the sealed terminal original")
-            launch_digest = _digest(launch.model_dump(mode="json"))
-            completion_digest = _digest(completion.model_dump(mode="json"))
+        return key, outbox, material
+
+    def _retained_completion(self, rows, job, launch, result):
+        """The saved completion, proven to be the one that closed this job with this result."""
+        key = worker_key("completion", self.binding.job_id, str(job.generation))
+        if key not in rows:
+            raise Problem(403, "SETTLEMENT_RESULT_DENIED", "the original completion reference changed")
+        completion = self.workers._row(rows, key, ExecutorEvidence)
+        if (completion.binding != job.binding or completion.evidence_id != job.last_evidence_id
+                or completion.sequence != job.last_sequence or completion.sequence > launch.evidence_sequence
+                or completion.native_execution_id != launch.native_invocation_id
+                or completion.state != ("stopped" if job.state == "cancelled" else job.state)
+                or not completion.entire_tree_idle or not completion.all_inflight_starts_fenced
+                or completion.result != result
+                or _parse(rows[key].payload["material"], InlineMaterial)
+                != _material(completion.model_dump(mode="json"))):
+            raise Problem(403, "SETTLEMENT_RESULT_DENIED", "the retained completion does not prove this terminal result")
+        return key, completion
+
+    def _native_origin(self, rows, work, job):
+        """Row ids and digests of the sealed launch and completion; all None outside native mode."""
+        if self.runtime.mode != "native":
+            return None, None, None, None
+        if job.binding is None:
+            raise Problem(403, "SETTLEMENT_RESULT_DENIED", "a sealed original native execution is required")
+        launch_key = native_key("launch", native_key("launch-id", job.binding.start_request_id))
+        if launch_key not in rows:
+            raise Problem(403, "SETTLEMENT_RESULT_DENIED", "the original native execution changed")
+        launch = self.workers._row(rows, launch_key, _NativeLaunch)
+        completion_key, completion = self._retained_completion(rows, job, launch, work.result)
+        if (launch.phase != "sealed" or launch.sealed_evidence_id is None
+                or launch.start.binding != job.binding
+                or job.last_evidence_id != launch.sealed_evidence_id
+                and job.last_evidence_id != native_key("terminal-verification-id", launch.launch_id, str(completion.sequence))
+                or launch.definition != work.definition or launch.api_binding_id != self.binding.binding_id
+                or launch.configuration_digest != self.workers.configuration_digest()):
+            raise Problem(403, "SETTLEMENT_RESULT_DENIED", "native execution is not the sealed terminal original")
+        return (launch_key, _digest(launch.model_dump(mode="json")),
+                completion_key, _digest(completion.model_dump(mode="json")))
+
+    def _describe(self, rows):
+        context, ob, work, job, old = self._state(rows)
+        result_key, result_material = self._retained_result(rows, work.result)
+        outbox_key, outbox, material = self._final_outbox(rows, ob, work)
+        launch_key, launch_digest, completion_key, completion_digest = self._native_origin(rows, work, job)
         return SettlementPlan(
             settlement_id=self.registration.settlement_id, configuration_sha256=self.configuration_sha256,
             control_binding=self.store._binding, runtime_binding_digest=self.runtime.binding_digest(self.binding),
@@ -394,12 +436,12 @@ class RetainedResultSettlement:
             job_id=self.binding.job_id, job_sha256=_digest(job.model_dump(mode="json")),
             work_id=work.definition.work_id, terminal_state=work.state, context=context,
             operation_policy_revision=old.operation_policy_revision,
-            runtime_policy_sha256=_digest(old.model_dump(mode="json")), result_evidence_id=result.evidence_id,
+            runtime_policy_sha256=_digest(old.model_dump(mode="json")), result_evidence_id=work.result.evidence_id,
             result_sha256=result_material.sha256, delivery=outbox.binding,
             retained_materials=(
                 RetainedMaterial(row_id=control_key("delivery-work-state", ob.obligation_id), sha256=result_material.sha256),
                 RetainedMaterial(row_id=result_key, sha256=result_material.sha256),
-                RetainedMaterial(row_id=key, sha256=material.sha256),
+                RetainedMaterial(row_id=outbox_key, sha256=material.sha256),
             ), launch_row_id=launch_key, launch_sha256=launch_digest,
             completion_row_id=completion_key, completion_sha256=completion_digest,
         )

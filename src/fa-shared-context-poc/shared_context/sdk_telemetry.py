@@ -5,7 +5,7 @@ platform-injected ``APPLICATIONINSIGHTS_CONNECTION_STRING`` nothing changes and 
 
 Official pieces, joined by a thin seam because none of them reaches the other:
 
-* The pinned Copilot SDK 1.0.13 / runtime 1.0.83 ``TelemetryConfig`` makes the runtime emit its own
+* The Copilot SDK ``TelemetryConfig`` (observed on SDK 1.0.13 / runtime 1.0.83) makes the runtime emit its own
   GenAI spans (``invoke_agent``, ``chat``, ``execute_tool``). It exports only OTLP/HTTP or a JSON-lines
   file, and its OTLP batch is not flushed before the SDK stops the runtime, so the file is used.
 * Microsoft's Azure Monitor trace exporter, already in the Hosted image through
@@ -42,7 +42,7 @@ SOURCE_PREFIX = "fa.copilot-sdk."
 # on Chat Completions the same parts carry the provider's raw reasoning text, so they are removed.
 SUMMARY_SOURCE = SOURCE_PREFIX + "responses"
 _MESSAGE_ATTRIBUTES = ("gen_ai.input.messages", "gen_ai.output.messages")
-# Raw reasoning text in a provider stream. Runtime 1.0.83 can surface Responses reasoning_text as assistant
+# Raw reasoning text in a provider stream. Runtime 1.0.83 was seen to surface Responses reasoning_text as assistant
 # text, which no part-type filter can tell apart, so seeing it stops message export (FA's models never send it).
 _RAW_REASONING = {
     "responses": re.compile(rb'"type"\s*:\s*"(?:response\.)?reasoning_text'),
@@ -394,7 +394,9 @@ def _build_processor():
 # fixed provider codes, counts and wait ms; NATIVE_UPGRADE_CUT codes, counts, ms, a RID prefix and session IDs;
 # FA_PRIVATE_MEMORY_* / FA_TEAM_MEMORY_* status, stage and reason codes, exception types, counts, official update or
 # memory IDs and a RID prefix; NATIVE_TOOLBOX_FAILED a toolbox failure's method, stage, codes, status and exception
-# type. Other lines of the same loggers (FA_MCP_SERVER_STATUS error text, FA_NATIVE_HTTP, ...) stay out.
+# type; FA_NATIVE_HTTP the handler's phase and action, fixed operation, status and code, exception type, ms, Agent ID
+# and version, session and invocation IDs and the RID's SHA-256. Other lines of the same loggers (FA_MCP_SERVER_STATUS
+# error text, ...) stay out.
 LOG_LOGGERS = ("shared_context.behavior_timing", "shared_context.behavior_hosted", "shared_context.m2_copilot",
                "shared_context.native_resident", "shared_context.native_sdk", "shared_context.native_turns",
                "shared_context.behavior_model_direct", "shared_context.native_environment_cut",
@@ -403,7 +405,7 @@ LOG_LOGGERS = ("shared_context.behavior_timing", "shared_context.behavior_hosted
                "shared_context.native_memory_candidate", "shared_context.native_toolbox")
 # Lines with these prefixes leave the container: their arguments must stay fixed codes, hashes or numbers, never text.
 LOG_PREFIXES = ("FA_TIMING ", "RESIDENT_SDK_", "FA_NATIVE_TURN_UNKNOWN ", "FA_MODEL_DIRECT_", "NATIVE_UPGRADE_CUT ",
-                "FA_PRIVATE_MEMORY_", "FA_TEAM_MEMORY_", "NATIVE_TOOLBOX_FAILED ")
+                "FA_PRIVATE_MEMORY_", "FA_TEAM_MEMORY_", "NATIVE_TOOLBOX_FAILED ", "FA_NATIVE_HTTP ")
 # The memory clients name their event as the first argument ("%s status=..."); only these exact names count.
 LOG_EVENTS = ("FA_PRIVATE_MEMORY_SEARCH", "FA_PRIVATE_MEMORY_UPDATE", "FA_TEAM_MEMORY_SEARCH", "FA_TEAM_MEMORY_CREATE")
 

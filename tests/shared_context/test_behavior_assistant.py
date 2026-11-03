@@ -480,7 +480,7 @@ def test_revoked_source_cannot_reenter_model_through_a_cold_sdk_checkpoint(assis
 
 def test_profile_cannot_be_enabled_by_model_payload_or_invalid_legacy_input():
     from shared_context.m2_assistant import AssistantEngine
-    engine = AssistantEngine(None, process_marker="profile-denied")
+    engine = AssistantEngine()
     with pytest.raises(Problem) as disabled:
         engine.dispatch({"operation": "assistant", "profile": "assistant-v1.2", "action": "start"})
     assert disabled.value.status == 403
@@ -488,3 +488,23 @@ def test_profile_cannot_be_enabled_by_model_payload_or_invalid_legacy_input():
         engine.dispatch(["SYNTHETIC_SECRET_CANARY"])
     assert invalid.value.status == 422
     assert "SYNTHETIC_SECRET_CANARY" not in str(invalid.value)
+
+
+@pytest.mark.parametrize("payload", [
+    {"operation": "assistant", "action": "start", "target_agent_id": "00000000-0000-4000-8000-000000000001",
+     "run_id": "run-1", "team": "team-one", "work": "task-1", "prompt": "SYNTHETIC_SECRET_CANARY",
+     "input_text": "SYNTHETIC_SECRET_CANARY"},
+    {"operation": "assistant", "profile": "assistant-v1.1", "action": "start"},
+    {"operation": "assistant", "action": "status", "target_agent_id": "00000000-0000-4000-8000-000000000001",
+     "run_id": "run-1"},
+])
+def test_retired_command_shapes_are_rejected_even_with_a_typed_session(payload):
+    from shared_context.behavior_assistant_hosted import AssistantSession
+    from shared_context.m2_assistant import AssistantEngine
+    session = AssistantSession.__new__(AssistantSession)
+    session.dispatch = lambda _payload: pytest.fail("a retired command shape must not reach the v1.2 session")
+    with pytest.raises(Problem) as rejected:
+        AssistantEngine(behavior=session).dispatch(payload)
+    assert rejected.value.status == 422
+    assert rejected.value.body["error"]["code"] == "INVALID_REQUEST"
+    assert "SYNTHETIC_SECRET_CANARY" not in str(rejected.value.body)

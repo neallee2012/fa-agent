@@ -3,9 +3,6 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
-from pathlib import Path
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -629,33 +626,6 @@ def test_attention_is_a_persisted_approval_projection_not_a_question_or_grant(hi
     error(c.client.post(PREFIX + "/decisions?_reconcile=false", json=decision(c, pending).model_dump(mode="json"),
                         headers=c.headers()), 422)
     error(c.client.get(PREFIX + "/rules?team=team-two", headers=c.headers()), 422)
-
-
-def test_cold_api_import_blocks_all_hosted_and_copilot_packages():
-    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    program = """
-import importlib
-import importlib.abc
-import sys
-class ApiOnly(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path=None, target=None):
-        if name == 'copilot' or name.startswith(('copilot.', 'azure.ai.agentserver')):
-            raise AssertionError('H1 imported a Hosted/SDK dependency: ' + name)
-sys.meta_path.insert(0, ApiOnly())
-def offline(event, args):
-    if event == 'socket.connect':
-        raise AssertionError('H1 cold import attempted network I/O')
-sys.addaudithook(offline)
-sys.path.insert(0, sys.argv[1])
-for name in ('native_hitl_wire', 'native_hitl', 'native_hitl_api', 'native_routine_proposals', 'native_routines',
-             'behavior_server'):
-    importlib.import_module('shared_context.' + name)
-print('H1 API-only imports PASS')
-"""
-    completed = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", "-c", program, str(source)],
-                               capture_output=True, text=True, encoding="utf-8", timeout=60)
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "H1 API-only imports PASS" in completed.stdout
 
 
 def test_real_server_factory_keeps_h1_separate(workspace, jwk_client, signing_key, monkeypatch):

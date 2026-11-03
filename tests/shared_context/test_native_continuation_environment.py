@@ -73,7 +73,7 @@ def test_invocations_expected_version_refusal_preserves_the_original_accepted_re
 
     original = accept_without_chain(harness).value.receipt
     result = harness.client.post("/invocations", json=NativeRead(request_id=original.request_id).model_dump(mode="json"),
-        headers={NATIVE_TURN_HEADER: "foundry-native-v1", "x-agent-session-id": IDENTITY.session_id,
+        headers={NATIVE_TURN_HEADER: "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
                  NATIVE_EXPECTED_VERSION_HEADER: "2"})
     assert result.status_code == 409 and result.json()["error"]["code"] == "NATIVE_SESSION_CHANGED"
     assert harness.call(harness.runtime.read, original.request_id) == original and harness.sdk.calls == []

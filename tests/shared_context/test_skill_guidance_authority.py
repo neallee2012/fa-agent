@@ -30,16 +30,19 @@ from shared_context.behavior_dispatch import ArtifactReadSpec, ArtifactRoute, Co
 from shared_context.behavior_operations import ToolBrokerCore, control_key
 from shared_context.behavior_sdk_state import SdkState
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.errors import Problem
+from shared_context.m3_models import CreateArtifact, VersionInput
 from shared_context.m3_skills import PurposeSkillReadResult, SkillReadResult
 from shared_context.source_materials import digest
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_approved_skill_api import configured as configured_skills, post_skill
 from test_behavior_api import METRICS
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key, token
 from test_sdk_compaction_product import event, open_turn, ordinary, settle
-from test_skill_purpose import signed_m3
 from test_skill_purpose_api import add_purpose_skill, configured_purpose
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 
 PROFILES = ("fa-instruction-skills-v1", "fa-instruction-skill-purpose-v1")
@@ -89,35 +92,35 @@ def load_guidance(turn, source, profile):
 
 
 def configure_read_operation(h, signing_key, jwk_client):
-    http, agent, _ = signed_m3(h.artifacts, signing_key, jwk_client)
-    path = "/teams/team-one/artifacts/sk06-metrics"
-    created = http.post(path, headers=agent, json={
-        "kind": "deliverable", "title": "Synthetic numeric read target", "source_work": "legacy-source",
-    })
-    assert created.status_code == 201
+    created = h.artifacts.create(A, A.team, "sk06-metrics", CreateArtifact(
+        kind="deliverable", title="Synthetic numeric read target", source_work="legacy-source",
+    ))
     version_id = "6" * 32
-    uploaded = http.put(path + "/versions/" + version_id, content=METRICS, headers={
-        **agent, "If-Match": created.headers["etag"], "Content-Type": "application/octet-stream",
-        "X-Artifact-Filename": "metrics.json", "X-Artifact-Media-Type": "application/json",
-        "X-Artifact-SHA256": hashlib.sha256(METRICS).hexdigest(),
-    })
-    assert uploaded.status_code == 200
-    version = http.get(path + "/versions/" + version_id, headers=agent).json()
+    h.artifacts.upload(A, A.team, "sk06-metrics", version_id, created.etag, VersionInput(
+        filename="metrics.json", media_type="application/json", sha256=hashlib.sha256(METRICS).hexdigest(),
+    ), METRICS)
+    version = h.artifacts.version(A, A.team, "sk06-metrics", version_id)
     route = ArtifactRoute(team=A.team, artifact_id="sk06-metrics", version_id=version_id)
-    spec = ArtifactReadSpec(**route.model_dump(), if_match=version["blob"]["etag"],
-                            sha256=version["sha256"], bytes=version["blob"]["bytes"])
+    spec = ArtifactReadSpec(**route.model_dump(), if_match=version.blob.etag,
+                            sha256=version.sha256, bytes=version.blob.bytes)
     external = []
 
     def local_dispatch(request):
+        # The destination answers from the in-process ArtifactService; production wires no HTTP route here.
         external.append("transport")
         assert request.method == "GET" and request.url.path == route.path()
-        response = http.get(request.url.path, headers=dict(request.headers))
-        return httpx.Response(response.status_code, headers=response.headers,
-                              stream=httpx.ByteStream(response.content))
+        try:
+            selected, data = h.artifacts.download(A, A.team, "sk06-metrics", version_id, request.headers.get("if-match"))
+        except Problem as error:
+            return httpx.Response(error.status, json=error.body)
+        return httpx.Response(200, stream=httpx.ByteStream(data), headers={
+            "content-type": "application/octet-stream", "content-length": str(len(data)),
+            "etag": selected.blob.etag, "x-artifact-sha256": selected.sha256,
+        })
 
     def credential():
         external.append("credential")
-        return agent["Authorization"].removeprefix("Bearer ")
+        return token(signing_key, {"oid": A.oid})
 
     adapter = ContextArtifactAdapter(
         ContextArtifactSettings(api_origin="https://sk06.invalid", principal_id=A.oid, routes=(route,)),
@@ -360,8 +363,9 @@ def test_loaded_guidance_cannot_replace_the_verified_actor_or_team(
                 "X-Actor-Id": A.oid,
             })
         else:
-            source_http, agent, _ = signed_m3(h.artifacts, signing_key, jwk_client)
-            denied = source_http.get("/teams/team-two/artifacts/" + NAME, headers=agent)
+            with pytest.raises(Problem) as refused:
+                h.artifacts.get(A, "team-two", NAME)
+            denied = SimpleNamespace(status_code=refused.value.status, text=str(refused.value.body))
         assert denied.status_code == 403 and NAME not in denied.text
         assert protected_rows(turn) == before and accounting(h) == money and h.store._guard() == guard
         assert turn.client.read_skill(NAME) == loaded
@@ -380,8 +384,9 @@ def run_reader_callbacks(turn, profile, callback, tmp_path, monkeypatch):
     sid = turn.assignment.sdk_session_id
     client = create_autospec(CopilotClient, instance=True)
     client._cli_process = SimpleNamespace(pid=42, poll=lambda: 0, returncode=0)
-    client.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+    client.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
     session = create_autospec(CopilotSession, instance=True)
+    session.rpc = OFFLINE_SESSION_RPC
     session.session_id = sid
     session.get_events.return_value = []
     reads, events = [], []
@@ -420,8 +425,8 @@ def run_reader_callbacks(turn, profile, callback, tmp_path, monkeypatch):
                                                 skill_access=True, skill_purpose=profile == PROFILES[1]),
         instruction=True,
     ))
-    client.start.assert_awaited_once()
-    client.stop.assert_awaited_once()
+    client.start.assert_awaited_once_with()
+    client.stop.assert_awaited_once_with()
     return reads, events
 
 
@@ -524,14 +529,13 @@ def test_historical_loaded_skill_does_not_bypass_current_model_source_or_read_au
                     h, signing_key, jwk_client, name=NAME, body=BODY, description=PURPOSE,
                     version="2" * 32, create=False,
                 )
-                source_http, agent, _ = signed_m3(h.artifacts, signing_key, jwk_client)
-                effective = source_http.get("/teams/team-one/artifacts/" + NAME + "/effective", headers=agent)
-                assert effective.status_code == 200 and effective.json()["version_id"] == revised["version_id"]
-                assert effective.json()["sha256"] == source["sha256"]
-                mutation.update(producer="signed-m3-new-version-and-human-approve",
+                effective = h.artifacts.effective(A, A.team, NAME)
+                assert effective.version_id == revised["version_id"]
+                assert effective.sha256 == source["sha256"]
+                mutation.update(producer="m3-service-new-version-and-human-approve",
                                 version_before=source["version_id"], version_after=revised["version_id"],
                                 same_body_sha256=revised["sha256"] == source["sha256"],
-                                effective_readback_status=effective.status_code)
+                                effective_readback_status=200)
             else:
                 revoked = h.client.post("/operator/v1/standing-work-policy/revoke", headers=h.headers(),
                     json={"decision_id": "sk06-original-read-policy-revoked"})

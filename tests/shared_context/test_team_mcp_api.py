@@ -26,7 +26,7 @@ from shared_context.team_mcp_api import PREFIX, install_team_mcp_routes
 from shared_context.team_mcp_wire import TEAM_MCP_ENABLED_ENV, TEAM_MCP_SINGLE_TEAM_ENV
 from shared_context.tool_catalog import parse_entry_file
 from test_behavior_store import FakeTable, SCOPE
-from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token  # noqa: F401
+from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token
 
 SECOND_OWNER = "99999999-9999-9999-9999-999999999999"
 WEBIQ_TOOLBOX_SHA = "e27ef360fe9cd94c6e45d26e0d9b753d64ca7b0d5f51917754c72c5ae3bbdb01"

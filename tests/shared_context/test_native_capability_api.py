@@ -22,13 +22,13 @@ from shared_context.behavior_native_capability_wire import (
 from shared_context.behavior_native_turn_wire import NativeReceipt, NativeSubmit, NativeTurnCapture
 from shared_context.errors import Problem
 from shared_context.m3_skills import PurposeSkillCatalog, PurposeSkillEntry, PurposeSkillReadResult
-from test_agent_runtime import peer_runtime  # noqa: F401
+from test_agent_runtime import peer_runtime
 from test_agent_runtime_routing import agent_headers
 from test_capability_calls import CATALOG, KEY, listed, result
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_native_agent_api import relay_case  # noqa: F401
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
+from test_native_agent_api import relay_case
 
 BODY = "APPROVED_NATIVE_SKILL_CANARY: verify the receipt; guidance never grants an operation.\n"
 SKILLS = available_grants(None, ("fa-skills-v1",))["fa-skills-v1"]

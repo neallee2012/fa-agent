@@ -22,6 +22,7 @@ from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_sdk_checkpoint import SdkStateUpload, checkpoint_key
 from shared_context.behavior_sdk_state import DIAG_ARCHIVE_CODEC
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
@@ -157,7 +158,7 @@ def test_short_native_compaction_preserves_signed_metadata_and_inherited_restore
             assert upload.reference is not None
             references.append(upload.reference)
             if phase != "first":
-                assert upload.source.execution.tokens_removed == -11
+                assert upload.source.execution.tokens_removed == 0  # runtime 1.0.103 reports 0 here (1.0.83: -11)
                 assert upload.source.execution.messages_removed == 3
             current = h.client.get("/work-policy/v1/conversations/" + cid, headers=h.headers())
             assert current.status_code == 200 and current.json()["can_follow_up"]
@@ -170,24 +171,24 @@ def test_short_native_compaction_preserves_signed_metadata_and_inherited_restore
         assert [item["kind"] for item in observations] == [
             "rpc.compact.call", "session.compaction_start", "session.compaction_complete", "rpc.compact.return"]
         for item in observations[-2:]:
-            assert item["success"] is True and item["tokens_removed"] == -11
+            assert item["success"] is True and item["tokens_removed"] == 0
             assert item["messages_removed"] == 3 and item["summary_present"]
         assert observations[1]["trigger"] == observations[2]["trigger"] == "manual"
         assert observations[2]["checkpoint_number"] == 1
         assert references[1].codec == references[2].codec == DIAG_ARCHIVE_CODEC
         assert references[1].source.execution == references[2].source.execution
         assert len({bridge._sdk_stop.pid for bridge in bridges}) == 3
-        assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == "1.0.83" for bridge in bridges)
-        assert not force_stops and importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+        assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == RUNTIME_VERSION for bridge in bridges)
+        assert not force_stops and importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
         for bridge in bridges[1:]:
             state = bridge._session_files.snapshot()
             complete = next(e for e in events_from(state.files) if e["type"] == "session.compaction_complete")
-            assert complete["data"]["tokensRemoved"] == -11
+            assert complete["data"]["tokensRemoved"] == 0
             assert all(secret not in state.encoded().decode() for secret in bridge.client._checkpoint_secrets)
         if os.environ.get("CTX03_SIGNED_EVIDENCE_DIR"):
             output = Path(os.environ["CTX03_SIGNED_EVIDENCE_DIR"])
             output.mkdir(parents=True, exist_ok=True)
-            proof = {"sdk_version": "1.0.13", "runtime_version": "1.0.83", "prefix": "unchanged legacy product",
+            proof = {"sdk_version": SDK_VERSION, "runtime_version": RUNTIME_VERSION, "prefix": "unchanged legacy product",
                 "fixture_source": "c5cc2846a418aa4af70ee7f76ecf80bcb108c1cd, legacy-short/padding=0 control",
                 "first_reply_bytes": 52, "first_reply_sha256": hashlib.sha256(FIRST_REPLY.encode()).hexdigest(),
                 "observations": observations, "calls": calls, "sdk_user_sends": len(prompts), "force_stop_calls": 0,

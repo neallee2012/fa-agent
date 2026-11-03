@@ -62,6 +62,15 @@ _GUIDANCE = {
 # Reviewed refusals that add no delivery; any other failure may have reached the recipient.
 _NOT_SENT = frozenset({"NATIVE_RELAY_REFUSED", "NATIVE_RELAY_RECIPIENT_UNAVAILABLE", "NATIVE_GROUP_REPLY_REQUIRED"})
 CAPABILITY_TOOL_GUIDANCE.update(_GUIDANCE)
+# Never reported as a refusal: the upstream cannot say the request had no effect.
+_UNCERTAIN_CODES = frozenset({
+    "NATIVE_RELAY_QUOTA_UNKNOWN", "FOUNDRY_INVOCATION_UNKNOWN", "NATIVE_RESPONSE_UNCONFIRMED",
+    "NATIVE_TURN_UNKNOWN", "NATIVE_POST_TURN_UNKNOWN", "NATIVE_STATE_STORE_UNKNOWN",
+})
+_LOGGED_ROUTES = frozenset({
+    "/send", "/environment", "/environment/observe", "/continue", "/result", "/outcome",
+    "/read-result", "/recipients", "/waiting-dispatch",
+})
 
 
 class NativeRecipientFollowing(Problem):
@@ -143,6 +152,78 @@ def _queued_input(value):
         return _FOLLOW_INPUT.validate_json(json.dumps(value, allow_nan=False))
     except (ValueError, TypeError):
         raise Problem(409, "NATIVE_RELAY_REFUSED", "the original relay task input is invalid") from None
+
+
+def _dispatched_send(record):
+    return (record.operation is not None and record.operation.tool_name == "send_agent_message"
+            and record.refusal_code is None and record.dispatch_started is True)
+
+
+def _indexed_send(receipt, record):
+    try:
+        return NativeRelaySend(
+            conversation_id=receipt.conversation_id, request_id=receipt.request_id,
+            tool_call_id=record.tool_call_id,
+            message=NativePeerRequest.model_validate_json(json.dumps(record.operation.arguments)))
+    except (ValueError, TypeError):
+        raise Problem(409, "NATIVE_STATE_SCOPE", "the indexed send input is invalid") from None
+
+
+def _is_original_task(saved, command):
+    """Whether this task row is the delivery task of exactly this command."""
+    return (isinstance(saved.source, dict)
+            and (saved.source.get("type"), saved.source.get("name")) == (
+                "agentserver.task", "fa-native-version-message-v1")
+            and isinstance(saved.payload, dict)
+            and saved.payload.get("input") in (
+                command.model_dump(mode="json"), _WaitingEnvironment(command=command).model_dump(mode="json")))
+
+
+def _environment_ready(command, view):
+    if view.agent_id != command.message.recipient_agent_id:
+        raise Problem(502, "NATIVE_STATE_SCOPE", "the environment belongs to another recipient")
+    if view.files_reconcile_required:
+        raise Problem(503, "NATIVE_FILES_UNKNOWN", "the original file effect requires reconciliation")
+    if view.reason == "task_access_denied":
+        raise Problem(403, "NATIVE_ENVIRONMENT_UNAVAILABLE", "the original task observation was denied")
+    return view.state in {"ready", "current"}
+
+
+async def _bounded_body(response):
+    raw = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(raw) + len(chunk) > _MAX_RESPONSE_BYTES:
+            raise Problem(502, "NATIVE_RELAY_OUTCOME_UNKNOWN", "the relay response exceeds its bound")
+        raw.extend(chunk)
+    return raw
+
+
+def _upstream_code(raw):
+    """The upstream error code when it is text, else None."""
+    try:
+        body = json.loads(raw)
+        code = body.get("error", {}).get("code") if isinstance(body, dict) else None
+    except (ValueError, AttributeError):
+        return None
+    return code if isinstance(code, str) else None
+
+
+def _route_keeps_code(suffix, status, upstream):
+    """Whether this route names the upstream refusal, instead of reporting it as refused or unconfirmed."""
+    from .native_continuation_wire import CONTINUATION_STOP_STATUS
+
+    if suffix.startswith("/environment"):
+        return upstream in NATIVE_TURN_ERRORS
+    if suffix == "/waiting-dispatch":
+        # Refused before anything was sent: the API has not caught up with a switch yet (asked
+        # again), or the owner's work policy is revoked (the message keeps waiting, logged).
+        return (status, upstream) in {(409, "NATIVE_SESSION_CHANGED"), (403, "WORK_POLICY_REVOKED")}
+    if suffix == "/continue":
+        return status == CONTINUATION_STOP_STATUS.get(upstream)
+    if suffix == "/send":
+        return (status == 409 and upstream == "NATIVE_GROUP_REPLY_REQUIRED"
+                or status in {403, 409, 503} and upstream == "NATIVE_RELAY_RECIPIENT_UNAVAILABLE")
+    return False
 
 
 class NativeAgentRelayClient:
@@ -285,39 +366,26 @@ class NativeAgentRelayClient:
             if error.body["error"]["code"] == "NATIVE_CONTINUATION_WATERMARK_UNAVAILABLE":
                 return
             raise
-        for record in records:
-            if (record.operation is None or record.operation.tool_name != "send_agent_message"
-                    or record.refusal_code is not None
-                    or record.dispatch_started is not True):
-                continue
-            try:
-                command = NativeRelaySend(
-                    conversation_id=receipt.conversation_id, request_id=receipt.request_id,
-                    tool_call_id=record.tool_call_id,
-                    message=NativePeerRequest.model_validate_json(json.dumps(record.operation.arguments)))
-            except (ValueError, TypeError):
-                raise Problem(409, "NATIVE_STATE_SCOPE", "the indexed send input is invalid") from None
+        for record in filter(_dispatched_send, records):
+            command = _indexed_send(receipt, record)
             identifier = relay_task_id(receipt.agent_id, command)
             saved = await get_task_manager().provider.get(identifier)
-            if saved is None:
-                continue
-            payload = saved.payload
-            if (saved.agent_name != runtime.identity.agent_name or saved.session_id != receipt.hosted_session_id
-                    or saved.session_id != runtime.identity.session_id
-                    or not isinstance(saved.source, dict) or (saved.source.get("type"), saved.source.get("name"))
-                    != ("agentserver.task", "fa-native-version-message-v1")
-                    or not isinstance(payload, dict) or payload.get("input") not in (
-                        command.model_dump(mode="json"), _WaitingEnvironment(command=command).model_dump(mode="json"))):
-                raise Problem(409, "NATIVE_STATE_SCOPE", "the queued send differs from its indexed original operation")
-            run = await self._following.get_active_run(identifier)
-            if run is None:
-                raise Problem(503, "NATIVE_RELAY_OUTCOME_UNKNOWN", "the original queued send result is unconfirmed")
-            accepted = await asyncio.shield(run.result())
-            if accepted.recipient_agent_id != command.message.recipient_agent_id:
-                raise Problem(409, "NATIVE_STATE_SCOPE", "the recovered acceptance names another recipient")
-            if accepted.status != "busy_refused":
-                await self._retain_queued_acceptance(runtime, original, accepted)
-            return
+            if saved is not None:
+                if (saved.agent_name != runtime.identity.agent_name or saved.session_id != receipt.hosted_session_id
+                        or saved.session_id != runtime.identity.session_id or not _is_original_task(saved, command)):
+                    raise Problem(409, "NATIVE_STATE_SCOPE", "the queued send differs from its indexed original operation")
+                await self._join_queued(runtime, original, identifier, command)
+                return
+
+    async def _join_queued(self, runtime, original, identifier, command):
+        run = await self._following.get_active_run(identifier)
+        if run is None:
+            raise Problem(503, "NATIVE_RELAY_OUTCOME_UNKNOWN", "the original queued send result is unconfirmed")
+        accepted = await asyncio.shield(run.result())
+        if accepted.recipient_agent_id != command.message.recipient_agent_id:
+            raise Problem(409, "NATIVE_STATE_SCOPE", "the recovered acceptance names another recipient")
+        if accepted.status != "busy_refused":
+            await self._retain_queued_acceptance(runtime, original, accepted)
 
     async def _wait(self, ctx, attempt):
         delay = self._follow_retry.compute_delay(min(max(1, attempt), self._follow_retry.max_attempts - 1))
@@ -330,55 +398,38 @@ class NativeAgentRelayClient:
             await asyncio.gather(*signals, return_exceptions=True)
         return _continuing(ctx)
 
+    async def _read_environment(self, ctx, suffix, command):
+        """(finished, view): finished is the follow's result, or None to keep following; view is None while not ready."""
+        try:
+            view = await self._request(suffix, NativeEnvironmentView, command)
+        except NativeRecipientNotReady:
+            return None, None
+        if not _continuing(ctx):
+            return False, view
+        return (True if _environment_ready(command, view) else None), view
+
     async def _follow_environment(self, ctx, command):
         attempts, baseline, observing = 0, None, False
-        while True:
-            if not _continuing(ctx):
-                return False
-            try:
-                view = await self._request(
-                    "/environment/observe" if observing else "/environment", NativeEnvironmentView, command)
-            except NativeRecipientNotReady:
-                if not await self._wait(ctx, attempts):
-                    return False
-                continue
-            if not _continuing(ctx):
-                return False
-            if view.agent_id != command.message.recipient_agent_id:
-                raise Problem(502, "NATIVE_STATE_SCOPE", "the environment belongs to another recipient")
-            if view.files_reconcile_required:
-                raise Problem(503, "NATIVE_FILES_UNKNOWN", "the original file effect requires reconciliation")
-            if view.reason == "task_access_denied":
-                raise Problem(403, "NATIVE_ENVIRONMENT_UNAVAILABLE", "the original task observation was denied")
-            if view.state in {"ready", "current"}:
-                return True
-            if observing:
+        while _continuing(ctx):
+            finished, view = await self._read_environment(
+                ctx, "/environment/observe" if observing else "/environment", command)
+            if finished is not None:
+                return finished
+            if view is not None and observing:
                 if view.progress_token is not None and view.progress_token != baseline:
                     baseline, attempts, observing = view.progress_token, 0, False
-            else:
+            elif view is not None:
                 attempts += 1
                 if attempts == 1 and baseline is None:
-                    try:
-                        observed = await self._request("/environment/observe", NativeEnvironmentView, command)
-                    except NativeRecipientNotReady:
-                        if not await self._wait(ctx, attempts):
-                            return False
-                        continue
-                    if not _continuing(ctx):
-                        return False
-                    if observed.agent_id != command.message.recipient_agent_id:
-                        raise Problem(502, "NATIVE_STATE_SCOPE", "the environment belongs to another recipient")
-                    if observed.files_reconcile_required:
-                        raise Problem(503, "NATIVE_FILES_UNKNOWN", "the original file effect requires reconciliation")
-                    if observed.reason == "task_access_denied":
-                        raise Problem(403, "NATIVE_ENVIRONMENT_UNAVAILABLE", "the original task observation was denied")
-                    if observed.state in {"ready", "current"}:
-                        return True
-                    baseline = observed.progress_token
+                    finished, observed = await self._read_environment(ctx, "/environment/observe", command)
+                    if finished is not None:
+                        return finished
+                    baseline = None if observed is None else observed.progress_token
                 if attempts == 10:
                     observing = True
             if not await self._wait(ctx, attempts):
                 return False
+        return False
 
     async def _follow_accepted(self, ctx, original):
         accepted, waiting = original.accepted, 0
@@ -422,7 +473,7 @@ class NativeAgentRelayClient:
             logging.getLogger(__name__).warning("NATIVE_RELAY_FOLLOW_UNCONFIRMED exception_type=%s", type(error).__name__)
             raise NativeFollowStartUnknown(accepted) from None
 
-    async def _request(self, suffix, model: type[_T], command=None) -> _T:
+    async def _bearer(self):
         try:
             token = await self.token_provider()
         except (AzureError, OSError) as error:
@@ -430,6 +481,28 @@ class NativeAgentRelayClient:
             raise Problem(503, "NATIVE_RELAY_OUTCOME_UNKNOWN", "the original relay credential is unavailable") from None
         if not isinstance(token, str) or not token or "\n" in token or "\r" in token:
             raise Problem(503, "NATIVE_RELAY_OUTCOME_UNKNOWN", "the original relay credential is unavailable")
+        return "Bearer " + token
+
+    def _refusal(self, suffix, status, raw):
+        """The Problem to raise for a response without a receipt."""
+        upstream = _upstream_code(raw)
+        if status == 503 and upstream in {"AGENT_VERSION_FOLLOWING", "NATIVE_ADMISSION_PENDING"}:
+            return NativeRecipientFollowing(admission_unconfirmed=upstream == "NATIVE_ADMISSION_PENDING")
+        if (self.runtime is not None and suffix in {"/send", "/environment", "/environment/observe"}
+                and status in {403, 409, 503}
+                and upstream in {"AGENT_MESSAGE_RECIPIENT_NOT_READY", "NATIVE_RELAY_RECIPIENT_UNAVAILABLE"}):
+            return NativeRecipientNotReady()
+        code = upstream if _route_keeps_code(suffix, status, upstream) else (
+            "NATIVE_RELAY_REFUSED" if status in {400, 401, 403, 409, 422}
+            and upstream is not None and upstream not in _UNCERTAIN_CODES
+            else "NATIVE_RELAY_OUTCOME_UNKNOWN")
+        logging.getLogger(__name__).warning(
+            "NATIVE_RELAY_REQUEST_FAILED route=%s status=%s code=%s",
+            suffix if suffix in _LOGGED_ROUTES else "unclassified", status, code)
+        return Problem(status, code, "the original relay request did not return its receipt")
+
+    async def _request(self, suffix, model: type[_T], command=None) -> _T:
+        authorization = await self._bearer()
         try:
             async with httpx.AsyncClient(
                 transport=self.transport, timeout=httpx.Timeout(90 if suffix.startswith("/environment") else 20, connect=5),
@@ -438,61 +511,14 @@ class NativeAgentRelayClient:
                 async with client.stream(
                     "GET" if command is None else "POST", self.api_url + NATIVE_AGENT_PREFIX + suffix,
                     content=None if command is None else command.model_dump_json().encode("utf-8"),
-                    headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                    headers={"Authorization": authorization, "Content-Type": "application/json",
                              "Accept": "application/json", "Accept-Encoding": "identity"},
                 ) as response:
                     if response.headers.get("content-encoding", "identity") != "identity":
                         raise Problem(502, "NATIVE_RELAY_OUTCOME_UNKNOWN", "the relay encoding is unsupported")
-                    raw = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        if len(raw) + len(chunk) > _MAX_RESPONSE_BYTES:
-                            raise Problem(502, "NATIVE_RELAY_OUTCOME_UNKNOWN", "the relay response exceeds its bound")
-                        raw.extend(chunk)
+                    raw = await _bounded_body(response)
                     if response.status_code not in {200, 202}:
-                        try:
-                            body = json.loads(raw)
-                            upstream = body.get("error", {}).get("code") if isinstance(body, dict) else None
-                        except (ValueError, AttributeError):
-                            upstream = None
-                        if response.status_code == 503 and upstream in {"AGENT_VERSION_FOLLOWING", "NATIVE_ADMISSION_PENDING"}:
-                            raise NativeRecipientFollowing(admission_unconfirmed=upstream == "NATIVE_ADMISSION_PENDING")
-                        if (self.runtime is not None and suffix in {"/send", "/environment", "/environment/observe"}
-                                and response.status_code in {403, 409, 503}
-                                and upstream in {"AGENT_MESSAGE_RECIPIENT_NOT_READY", "NATIVE_RELAY_RECIPIENT_UNAVAILABLE"}):
-                            raise NativeRecipientNotReady()
-                        uncertain = {
-                            "NATIVE_RELAY_QUOTA_UNKNOWN", "FOUNDRY_INVOCATION_UNKNOWN",
-                            "NATIVE_RESPONSE_UNCONFIRMED",
-                            "NATIVE_TURN_UNKNOWN", "NATIVE_POST_TURN_UNKNOWN", "NATIVE_STATE_STORE_UNKNOWN",
-                        }
-                        from .native_continuation_wire import CONTINUATION_STOP_STATUS
-                        if suffix.startswith("/environment") and isinstance(upstream, str) and upstream in NATIVE_TURN_ERRORS:
-                            code = upstream
-                        elif suffix == "/waiting-dispatch" and (response.status_code, upstream) in {
-                                (409, "NATIVE_SESSION_CHANGED"), (403, "WORK_POLICY_REVOKED")}:
-                            # Refused before anything was sent: the API has not caught up with a switch yet (asked
-                            # again), or the owner's work policy is revoked (the message keeps waiting, logged).
-                            code = upstream
-                        elif (suffix == "/continue" and isinstance(upstream, str)
-                                and response.status_code == CONTINUATION_STOP_STATUS.get(upstream)):
-                            code = upstream
-                        elif (suffix == "/send" and response.status_code == 409
-                                and upstream == "NATIVE_GROUP_REPLY_REQUIRED"):
-                            code = upstream
-                        elif (suffix == "/send" and response.status_code in {403, 409, 503}
-                                and upstream == "NATIVE_RELAY_RECIPIENT_UNAVAILABLE"):
-                            code = upstream
-                        else:
-                            code = ("NATIVE_RELAY_REFUSED" if response.status_code in {400, 401, 403, 409, 422}
-                                    and isinstance(upstream, str) and upstream not in uncertain
-                                    else "NATIVE_RELAY_OUTCOME_UNKNOWN")
-                        route = suffix if suffix in {
-                            "/send", "/environment", "/environment/observe", "/continue", "/result", "/outcome",
-                            "/read-result", "/recipients", "/waiting-dispatch"} else "unclassified"
-                        logging.getLogger(__name__).warning(
-                            "NATIVE_RELAY_REQUEST_FAILED route=%s status=%s code=%s",
-                            route, response.status_code, code)
-                        raise Problem(response.status_code, code, "the original relay request did not return its receipt")
+                        raise self._refusal(suffix, response.status_code, raw)
                     try:
                         return model.model_validate_json(raw)
                     except ValueError:
@@ -540,12 +566,7 @@ class NativeAgentRelayClient:
             return None
         if (self.runtime is not None and (saved.agent_name, saved.session_id) != (
                 self.runtime.identity.agent_name, self.runtime.identity.session_id)
-                or not isinstance(saved.source, dict)
-                or (saved.source.get("type"), saved.source.get("name")) != (
-                    "agentserver.task", "fa-native-version-message-v1")
-                or not isinstance(saved.payload, dict)
-                or saved.payload.get("input") not in (
-                    command.model_dump(mode="json"), _WaitingEnvironment(command=command).model_dump(mode="json"))):
+                or not _is_original_task(saved, command)):
             raise Problem(409, "NATIVE_STATE_SCOPE", "the original delivery task has different scope or input")
         return await self._following.get_active_run(identifier)
 

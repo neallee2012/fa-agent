@@ -132,8 +132,6 @@ def harness(monkeypatch):
     return lambda **options: Harness(monkeypatch, **options)
 
 
-# --- locating the session -------------------------------------------------------------------------------------------
-
 @pytest.mark.parametrize("status,code", [(409, CHANGED), (503, FOLLOWING), (503, "NATIVE_TURN_UNKNOWN")])
 def test_a_reconcile_of_an_accepted_rid_keeps_a_location_refusal_as_it_is(harness, status, code):
     error = problem(status, code, not_dispatched=True)
@@ -229,8 +227,6 @@ def test_a_version_this_build_does_not_serve_is_not_followed(harness, enforce, d
     assert case.calls == ["context:submit:False"]
 
 
-# --- refused before Hosted ------------------------------------------------------------------------------------------
-
 @pytest.mark.parametrize("status", [500, 503])
 def test_an_unknown_admission_refusal_is_raised_without_reading_the_rid(harness, status):
     error = problem(status, "NATIVE_STATE_STORE_UNKNOWN")
@@ -269,8 +265,6 @@ def test_an_agent_following_at_admission_runs_the_switch_for_a_new_rid(harness):
         case.submit()
     chosen(raised.value, "follow", error, refused=None)
 
-
-# --- refused by Hosted ----------------------------------------------------------------------------------------------
 
 def hosted_case(harness, error, **options):
     case = harness(hosted=error, **options)

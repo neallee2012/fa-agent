@@ -24,7 +24,7 @@ import httpx
 from azure.identity import AzureCliCredential
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shared-context"))
-from deployment_config import load_config  # noqa: E402
+from deployment_config import load_config
 
 STAGE = load_config(require_runtime=False)
 NAME = "fa-org-tools"

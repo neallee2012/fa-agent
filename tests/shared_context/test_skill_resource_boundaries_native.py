@@ -20,6 +20,7 @@ from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_skill_resources_prompt import SKILL_RESOURCES_CAPABILITIES
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
@@ -227,16 +228,16 @@ def test_fixed_sdk_refuses_path_unlisted_and_unregistered_actions_from_hostile_s
     assert not any(event["type"] in {"skill.invoked", "newskill.invoked", "session.error",
                                    "session.compaction_start", "session.compaction_complete"} for event in safe_events)
     stop = bridges[0]._sdk_stop
-    assert stop is not None and stop.graceful and stop.runtime_version == "1.0.83"
+    assert stop is not None and stop.graceful and stop.runtime_version == RUNTIME_VERSION
     assert stop.pid == processes[0].pid and processes[0].poll() is not None
     archive = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
     assert archive.prompt_assembly.declared_capabilities == SKILL_RESOURCES_CAPABILITIES
     after_turn = [artifact for artifact in reads if artifact != NAME][len(turn_reads):]
     assert isinstance(archive.archive, aw.StoredSdkArchive)
     assert after_turn and set(after_turn) == {archive.archive.artifact_id}
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     record("fixed-sdk-boundary", {
-        "layer": "fixed-sdk-offline-provider", "sdk_version": "1.0.13", "runtime_version": stop.runtime_version,
+        "layer": "fixed-sdk-offline-provider", "sdk_version": SDK_VERSION, "runtime_version": stop.runtime_version,
         "body_sha256": hashlib.sha256(HOSTILE_BODY).hexdigest(), "skill_version": V1,
         "provider_requests": requests, "refusals": refusals, "configurations": configurations,
         "permission_decisions": permissions, "public_tool_events": safe_events,

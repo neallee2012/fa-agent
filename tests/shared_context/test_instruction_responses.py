@@ -191,6 +191,36 @@ def test_unrecognized_or_child_reasoning_never_falls_back_to_raw_text(variant):
     assert public_event(message, 1, {}, model_provider="openai-responses", reasoning_summary=True) is None
 
 
+@pytest.mark.parametrize("ordered, projected", [(None, True), ([], False), ("x", False)])
+def test_the_newer_runtimes_empty_ordered_blocks_keeps_the_public_summary(ordered, projected):
+    from shared_context.behavior_assistant_progress import public_event
+    message = reasoning_message()
+    message["data"]["reasoning_blocks"]["ordered_blocks"] = ordered
+    event = public_event(message, 1, {}, model_provider="openai-responses", reasoning_summary=True)
+    assert (event is not None) is projected
+
+
+def ordered_blocks_files(ordered):
+    from shared_context.behavior_sdk_files import SdkSessionFiles
+    message = reasoning_message()
+    message["data"]["reasoning_blocks"]["ordered_blocks"] = ordered
+    files = SdkSessionFiles("ordered-blocks", model_provider="openai-responses")
+    files.files = {"workspace.yaml": "id: ordered-blocks\n", "events.jsonl": json.dumps({
+        "type": "session.start", "data": {"sessionId": "ordered-blocks"}}) + "\n" + json.dumps(message) + "\n"}
+    return files
+
+
+def test_the_responses_checkpoint_accepts_empty_ordered_blocks_and_drops_the_private_reasoning():
+    assert "PRIVATE_" not in ordered_blocks_files(None).snapshot().encoded().decode()
+
+
+@pytest.mark.parametrize("ordered", [[], [{"type": "reasoning"}]])
+def test_the_responses_checkpoint_refuses_ordered_blocks_that_carry_anything(ordered):
+    with pytest.raises(Problem) as error:
+        ordered_blocks_files(ordered).snapshot()
+    assert error.value.body["error"]["code"] == "SDK_STATE_UNSUPPORTED_FORMAT"
+
+
 def test_reasoning_summary_metadata_cannot_claim_a_missing_or_private_source():
     from pydantic import ValidationError
     for value in (

@@ -30,7 +30,8 @@ from test_conversation_transfer_startup import claimed_turn, synthetic_standing_
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
-STOP = aw.AssistantSdkStop(pid=99, exit_code=0, graceful=True)
+# The goldens below were written with runtime 1.0.83, still a known release; pinned here so they do not move with sdk_pin.
+STOP = aw.AssistantSdkStop(runtime_version="1.0.83", pid=99, exit_code=0, graceful=True)
 UNAVAILABLE = aw.ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE")
 TEXT = "Original saved answer. 原文"
 AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -229,12 +230,17 @@ def progress(*seqs):
         seq=seq, at=AT, kind="stage", status="started", summary="SDK turn started") for seq in seqs))
 
 
+def saved_progress(c, opened):
+    data = row(c, key("progress", opened.assignment.session_id)).payload["data"]
+    return aw.PublicProgress.model_validate_json(json.dumps(data["progress"]))
+
+
 def test_final_progress_is_saved_and_cannot_replace_newer_events(synthetic_standing_v1):
     c = synthetic_standing_v1
     opened = claimed_turn(c, "progress")
     progress_key = key("progress", opened.assignment.session_id)
     save_progress(c.authority, opened.session, aw.ProgressUpdate(request_id="progress-1", progress=progress(1, 2, 3)))
-    assert row(c, progress_key) is not None
+    assert saved_progress(c, opened) == progress(1, 2, 3)
     refused(c, opened, 409, "INSTRUCTION_PROGRESS_INVALID", progress=progress(1, 2))
     save(c, opened, progress=progress(1, 2, 3, 4))
     assert [event["seq"] for event in row(c, progress_key).payload["data"]["progress"]["events"]] == [1, 2, 3, 4]
@@ -244,7 +250,7 @@ def test_first_final_progress_creates_its_row(synthetic_standing_v1):
     c = synthetic_standing_v1
     opened = claimed_turn(c, "first-progress")
     save(c, opened, progress=progress(1))
-    assert row(c, key("progress", opened.assignment.session_id)) is not None
+    assert saved_progress(c, opened) == progress(1)
 
 
 def rows_of(c, opened):
@@ -509,8 +515,10 @@ def test_final_progress_may_repeat_the_saved_last_event(synthetic_standing_v1):
     c = synthetic_standing_v1
     opened = claimed_turn(c, "same-progress")
     save_progress(c.authority, opened.session, aw.ProgressUpdate(request_id="progress-1", progress=progress(1, 2)))
-    save(c, opened, progress=progress(1, 2))
-    assert row(c, key("result", opened.binding.work.work_id)) is not None
+    assert save(c, opened, progress=progress(1, 2)).work_outcome == "succeeded"
+    assert saved_progress(c, opened) == progress(1, 2)
+    result = VerifiedWorkResult.model_validate_json(json.dumps(rows_of(c, opened)["result"].payload["data"]))
+    assert result.state == "succeeded" and result.evidence_id == key("result", opened.binding.work.work_id)
 
 
 def test_read_set_lists_each_row_once(synthetic_standing_v1, monkeypatch):

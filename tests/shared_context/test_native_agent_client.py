@@ -6,12 +6,13 @@ import time
 
 import httpx
 import pytest
+from azure.ai.agentserver.core.tasks import RetryPolicy
 
 from shared_context.behavior_native_agent_wire import NativePeerRequest, NativeRelayAcceptance
 from shared_context.errors import Problem
 from shared_context.native_agent_tools import NativeAgentRelayClient
 from test_native_agent_relay import sender_case
-from test_native_turns import harness, local_env, native_retry_policy
+from test_native_turns import harness, local_env, native_retry_policy, until
 from test_native_turn_wire import agent_receive, submit
 from test_native_agent_tools import collaboration_turn
 
@@ -310,14 +311,30 @@ def test_cancel_after_child_acceptance_preserves_delegation_before_checkpoint_an
     assert stopped.result is None
 
 
+def fast_delays(monkeypatch, policy, scale=0.01):
+    """``policy``'s own (production) delays, waited ``scale`` times as long; returns each unscaled delay it asked for,
+    so a test counts production seconds without spending them."""
+    asked, production = [], RetryPolicy.compute_delay
+
+    def scaled(self, attempt):
+        delay = production(self, attempt)
+        if self is not policy:
+            return delay
+        asked.append(delay)
+        return delay * scale
+
+    monkeypatch.setattr(RetryPolicy, "compute_delay", scaled)  # the policy has __slots__: patch its class
+    return asked
+
+
 @pytest.mark.parametrize("native_retry_policy", [None], indirect=True)
-def test_ten_second_notification_outage_recovers_with_production_delays_without_replay(harness):
-    began = time.monotonic()
+def test_ten_second_notification_outage_recovers_with_production_delays_without_replay(harness, monkeypatch):
+    waited = fast_delays(monkeypatch, harness.runtime._notification_retry)
     delivered, calls = set(), []
 
     async def recovered(receipt, _reference):
         calls.append(receipt.request_id)
-        if time.monotonic() - began < 10:
+        if sum(waited) < 10:
             raise Problem(503, "NATIVE_RELAY_OUTCOME_UNKNOWN", "synthetic ten-second API outage")
         delivered.add(receipt.request_id)
 
@@ -325,16 +342,16 @@ def test_ten_second_notification_outage_recovers_with_production_delays_without_
     request = agent_receive("ten-second-outage")
     assert harness.invoke(request).status_code == 202
     original = harness.wait(request.command.request_id, "completed")
-    deadline = began + 30
-    while not delivered and time.monotonic() < deadline:
-        time.sleep(0.05)
+    until(lambda: delivered)
     assert delivered == {original.request_id}
+    assert waited[:3] == pytest.approx([1, 3, 9], rel=0.25)  # the production backoff, with its ±25 % jitter
     assert len(calls) >= 4 and len(harness.sdk.calls) == 1
     assert harness.call(harness.runtime.read, original.request_id).notification_error is None
 
 
 @pytest.mark.parametrize("native_retry_policy", [None], indirect=True)
-def test_ten_second_full_queue_eventually_executes_original_wake_once(harness):
+def test_ten_second_full_queue_eventually_executes_original_wake_once(harness, monkeypatch):
+    waited = fast_delays(monkeypatch, harness.runtime._queue_retry)
     harness.sdk.block = True
     harness.invoke(submit("ten-second-active"))
     active = harness.wait("ten-second-active", "started")
@@ -344,7 +361,8 @@ def test_ten_second_full_queue_eventually_executes_original_wake_once(harness):
             break
     request = agent_receive("ten-second-wake", active.conversation_id)
     assert harness.invoke(request).json()["status"] == "accepted"
-    time.sleep(10)
+    # Ten production seconds of looks at the full queue; the margin covers asked-for delays the peer wait caps at 2 s.
+    until(lambda: sum(waited) >= 12.5)
     assert harness.call(harness.runtime.read, request.command.request_id).status == "accepted"
     harness.sdk.block = False
     deadline = time.monotonic() + 20

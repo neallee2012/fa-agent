@@ -80,12 +80,12 @@ def evaluate(agents: Iterable, rows: Callable[[], Iterable[NativeBindingRow]],
     try:
         report["vetoed_versions"] = [{"agent_name": item.agent_name, "version": item.agent_version,
                                       "vetoed_at": item.vetoed_at} for item in vetoes()]
-    except Exception as error:  # noqa: BLE001 - an operator hint only: reported, never a refusal
+    except Exception as error:  # an operator hint only: reported, never a refusal
         code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
         report["vetoed_versions_unread"] = code
     try:
         found = {row.agent_id: row for row in rows()}
-    except Exception as error:  # noqa: BLE001 - an unreadable Table proves nothing: refused when armed
+    except Exception as error:  # an unreadable Table proves nothing: refused when armed
         code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
         report["refused"].append({"agent_id": None, "reason": "rows_unread", "code": code})
         return _decide(report, armed, override)
@@ -96,7 +96,7 @@ def evaluate(agents: Iterable, rows: Callable[[], Iterable[NativeBindingRow]],
         if key not in definitions:
             try:
                 definitions[key] = read_definition(target, version)
-            except Exception as error:  # noqa: BLE001 - unread is reported, and refused when it decides compatibility
+            except Exception as error:  # unread is reported, and refused when it decides compatibility
                 code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
                 definitions[key] = _Unread(code)
         return definitions[key]

@@ -594,3 +594,474 @@ def test_finish_records_every_running_child_even_when_one_write_fails():
             await bridge.finish()
         assert unknown == ["call-a", "call-b"]
     run(scenario())
+
+
+def _started(bridge, identity, child, event_id=None):
+    bridge.observe(event("subagent.started", event_id or "s-" + identity,
+                         {"toolCallId": identity, "agentName": "fa-delegate-v1"}, child))
+
+
+def _spy(bridge):
+    seen, inner = [], bridge.call
+
+    async def spy(action, command):
+        if action == "observe":
+            seen.append(command)
+        return await inner(action, command)
+
+    bridge.call = spy
+    return seen
+
+
+def test_an_event_is_saved_once_and_an_event_without_an_id_is_never_saved():
+    async def scenario():
+        bridge = _parallel_bridge({"call-a": TASK}, [])
+        seen = _spy(bridge)
+        assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "allow"
+        _started(bridge, "call-a", "child-a", "same-event")
+        _started(bridge, "call-a", "child-a", "same-event")
+        bridge.observe(event("subagent.completed", "", {"toolCallId": "call-a"}, "child-a"))
+        await bridge.drain()
+        assert [item.event_id for item in seen] == ["same-event"] and bridge.failure is None
+    run(scenario())
+
+
+def test_a_second_child_identity_for_one_call_is_an_invalid_observation():
+    async def scenario():
+        bridge = _parallel_bridge({"call-a": TASK}, [])
+        assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "allow"
+        _started(bridge, "call-a", "child-a")
+        _started(bridge, "call-a", "child-b", "s-second")
+        with pytest.raises(Problem) as caught:
+            await bridge.drain()
+        assert caught.value.body["error"]["code"] == "DELEGATION_OBSERVATION_INVALID"
+        assert bridge.children["call-a"].completion_observed.is_set()
+    run(scenario())
+
+
+def test_one_sdk_agent_cannot_be_the_child_of_two_calls():
+    async def scenario():
+        tasks = {"call-a": TASK, "call-b": {**TASK, "prompt": "Another subtask."}}
+        bridge = _parallel_bridge(tasks, [])
+        for task in tasks.values():
+            assert (await bridge.pre_tool(*_hook(task)))["permissionDecision"] == "allow"
+        _started(bridge, "call-a", "shared")
+        _started(bridge, "call-b", "shared")
+        with pytest.raises(Problem) as caught:
+            await bridge.drain()
+        assert caught.value.body["error"]["code"] == "DELEGATION_OBSERVATION_INVALID"
+    run(scenario())
+
+
+def test_a_start_event_must_name_the_delegate_agent_type():
+    async def scenario():
+        bridge = _parallel_bridge({"call-a": TASK}, [])
+        assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "allow"
+        bridge.observe(event("subagent.started", "s", {"toolCallId": "call-a", "agentName": "other-agent"}, "child-a"))
+        with pytest.raises(Problem) as caught:
+            await bridge.drain()
+        assert caught.value.body["error"]["code"] == "DELEGATION_OBSERVATION_INVALID"
+        assert bridge.children["call-a"].child_id is None
+    run(scenario())
+
+
+@pytest.mark.parametrize("requests, ended_in_tool_call", [
+    ({"toolRequests": [{"name": "read"}]}, True), ({"tool_requests": [{"name": "read"}]}, True),
+    ({"toolRequests": []}, False), ({}, False)])
+def test_the_result_observation_says_whether_the_childs_last_message_asked_for_tools(requests, ended_in_tool_call):
+    async def scenario():
+        bridge = _parallel_bridge({"call-a": TASK}, [])
+        seen = _spy(bridge)
+        assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "allow"
+        _started(bridge, "call-a", "child-a")
+        bridge.observe(event("assistant.message", "m", {"content": "partial", **requests}, "child-a"))
+        bridge.observe(event("subagent.completed", "c", {"toolCallId": "call-a"}, "child-a"))
+        await bridge.drain()
+        result = seen[-1]
+        assert (result.kind, result.text, result.ended_in_tool_call) == ("result", "partial", ended_in_tool_call)
+    run(scenario())
+
+
+def test_a_child_message_that_is_not_text_is_an_invalid_observation():
+    async def scenario():
+        bridge = _parallel_bridge({"call-a": TASK}, [])
+        assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "allow"
+        _started(bridge, "call-a", "child-a")
+        bridge.observe(event("assistant.message", "m", {"content": {"not": "text"}}, "child-a"))
+        with pytest.raises(Problem) as caught:
+            await bridge.drain()
+        assert caught.value.body["error"]["code"] == "DELEGATION_OBSERVATION_INVALID"
+    run(scenario())
+
+
+@pytest.mark.parametrize("kind, cancelled, outcome, failure_code", [
+    ("subagent.completed", False, "completed", None),
+    ("subagent.failed", False, "failed", "SDK_CHILD_FAILED"),
+    ("subagent.failed", True, "cancelled", None),
+    ("subagent.completed", True, "cancelled", None)])
+def test_the_result_observation_names_how_the_child_ended(kind, cancelled, outcome, failure_code):
+    async def scenario():
+        bridge = _parallel_bridge({"call-a": TASK}, [])
+        seen = _spy(bridge)
+        assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "allow"
+        _started(bridge, "call-a", "child-a")
+        bridge.observe(event("assistant.message", "m", {"content": "last words"}, "child-a"))
+        bridge.observe(event(kind, "end", {"toolCallId": "call-a", **({"cancelled": True} if cancelled else {})}, "child-a"))
+        await bridge.drain()
+        assert (seen[-1].kind, seen[-1].outcome, seen[-1].failure_code) == ("result", outcome, failure_code)
+        assert bridge.cancelled is cancelled and bridge.children["call-a"].finished is (not cancelled)
+        assert bridge.children["call-a"].completion_observed.is_set()
+    run(scenario())
+
+
+def test_a_child_cancelled_after_the_parent_went_idle_also_records_that_idle():
+    async def scenario():
+        bridge = _parallel_bridge({"call-a": TASK}, [])
+        seen, inner = [], bridge.call
+        final = DelegationReply(parent_job_id="parent-job", sdk_session_id="parent-sdk", delegation_id="d-call-a",
+                                tool_call_id="call-a", input_sha256=_digest(TASK), child_agent_id="child-a",
+                                status="completed", result="last words", failure_code=None)
+
+        async def record(action, command):
+            if action == "observe":
+                seen.append(command)
+                if command.kind == "parent_idle":
+                    return final
+            return await inner(action, command)
+
+        bridge.call = record
+        assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "allow"
+        _started(bridge, "call-a", "child-a")
+        bridge.observe(event("assistant.message", "m", {"content": "last words"}, "child-a"))
+        bridge.observe(event("session.idle", "parent-idle", {"aborted": True}))
+        await bridge.drain()
+        assert [item.kind for item in seen] == ["started"]
+        bridge.observe(event("subagent.completed", "end", {"toolCallId": "call-a", "cancelled": True}, "child-a"))
+        await bridge.drain()
+        assert [(item.kind, item.event_id) for item in seen[1:]] == [("result", "end"), ("parent_idle", "parent-idle")]
+    run(scenario())
+
+
+def test_a_parent_idle_that_is_not_an_abort_or_belongs_to_another_agent_records_nothing():
+    async def scenario():
+        bridge = _parallel_bridge({"call-a": TASK}, [])
+        seen = _spy(bridge)
+        assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "allow"
+        _started(bridge, "call-a", "child-a")
+        bridge.observe(event("session.idle", "plain-idle", {}))
+        bridge.observe(event("session.idle", "child-idle", {"aborted": True}, "child-a"))
+        await bridge.drain()
+        assert [item.kind for item in seen] == ["started"] and bridge.children["call-a"].idle_event_id is None
+    run(scenario())
+
+
+async def _running_child(read_user_files=True):
+    bridge = _parallel_bridge({"call-a": TASK}, [])
+    bridge.read_user_files = read_user_files
+    assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "allow"
+    _started(bridge, "call-a", "child-a")
+    await bridge.drain()
+    return bridge
+
+
+def _child_hook(session="child-a", tool="read_user_file"):
+    return {"sessionId": session, "toolName": tool}, {"session_id": "parent-sdk"}
+
+
+def test_the_running_child_may_read_user_files_when_its_original_call_is_still_current():
+    async def scenario():
+        bridge = await _running_child()
+        assert await bridge.pre_tool(*_child_hook()) == {"permissionDecision": "allow"}
+    run(scenario())
+
+
+@pytest.mark.parametrize("case, reason", [
+    ("lane_off", "child_tool_denied"), ("other_tool", "child_tool_denied"), ("unknown_child", "child_tool_denied"),
+    ("cancelled", "child_tool_denied"), ("not_running", "original_child_inactive"),
+    ("other_agent", "original_child_inactive"), ("not_current", "original_child_inactive"),
+    ("truthy_current", "original_child_inactive"), ("no_reply", "original_child_inactive"),
+    ("unconfirmed", "original_child_unconfirmed")])
+def test_a_child_file_read_is_refused_unless_the_original_child_is_running_and_current(case, reason, caplog):
+    async def scenario():
+        bridge = await _running_child(read_user_files=case != "lane_off")
+        child = bridge.children["call-a"]
+        hook = _child_hook("other-child" if case == "unknown_child" else "child-a",
+                           "write_file" if case == "other_tool" else "read_user_file")
+        if case == "cancelled":
+            bridge.cancelled = True
+        elif case == "not_running":
+            child.reply = child.reply.model_copy(update={"status": "completed"})
+        elif case == "other_agent":
+            child.reply = child.reply.model_copy(update={"child_agent_id": "child-b"})
+        elif case == "no_reply":
+            child.reply = None
+        elif case in {"not_current", "truthy_current", "unconfirmed"}:
+            async def current():
+                if case == "unconfirmed":
+                    raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "Synthetic.")
+                return False if case == "not_current" else "yes"
+            bridge.current = current
+        decision = await bridge.pre_tool(*hook)
+        assert decision["permissionDecision"] == "deny" and f"[{reason}]" in decision["permissionDecisionReason"]
+        assert f"reason={reason}" in caplog.text
+    run(scenario())
+
+
+def test_a_hook_from_another_session_is_refused_before_anything_else():
+    async def scenario():
+        bridge = await _running_child()
+        data, _ = _child_hook()
+        decision = await bridge.pre_tool(data, {"session_id": "other-session"})
+        assert decision["permissionDecision"] == "deny" and "[session_mismatch]" in decision["permissionDecisionReason"]
+        assert await bridge.pre_tool({"sessionId": "parent-sdk", "toolName": "other"}, {"session_id": "parent-sdk"}) is None
+    run(scenario())
+
+
+def _held_approval(bridge):
+    """before_prepare that parks the first call until released, like a human deciding."""
+    waiting, release = asyncio.Event(), asyncio.Event()
+
+    async def approve(command):
+        waiting.set()
+        await release.wait()
+
+    bridge.before_prepare = approve
+    return waiting, release
+
+
+def test_a_second_call_cannot_take_the_slot_of_a_call_still_waiting_for_approval():
+    async def scenario():
+        tasks = {"first-call": TASK, "second-call": {**TASK, "prompt": "Another subtask."}}
+        bridge = _parallel_bridge(tasks, [], limit=1)
+        waiting, release = _held_approval(bridge)
+        pending = asyncio.create_task(bridge.pre_tool(*_hook(tasks["first-call"])))
+        await waiting.wait()
+        second = await asyncio.wait_for(bridge.pre_tool(*_hook(tasks["second-call"])), 5)
+        assert second["permissionDecision"] == "deny" and "[child_limit]" in second["permissionDecisionReason"]
+        assert "second-call" not in bridge.starts
+        release.set()
+        assert (await pending)["permissionDecision"] == "allow"
+    run(scenario())
+
+
+def test_the_same_call_cannot_be_reserved_twice_while_its_first_hook_is_waiting():
+    async def scenario():
+        bridge = _parallel_bridge({"only-call": TASK}, [])
+        waiting, release = _held_approval(bridge)
+        pending = asyncio.create_task(bridge.pre_tool(*_hook(TASK)))
+        await waiting.wait()
+        repeat = await asyncio.wait_for(bridge.pre_tool(*_hook(TASK)), 5)
+        assert repeat["permissionDecision"] == "deny" and "[original_reserved_or_unknown]" in repeat["permissionDecisionReason"]
+        assert "only-call" in bridge.starts and bridge.failure is None
+        release.set()
+        assert (await pending)["permissionDecision"] == "allow"
+        assert list(bridge.children) == ["only-call"]
+    run(scenario())
+
+
+def test_a_task_start_is_recorded_only_when_it_comes_from_the_parent_session():
+    bridge = _parallel_bridge({}, [])
+    for identity, tool, agent in (("from-parent", "task", "parent-sdk"), ("from-nobody", "task", None),
+                                  ("from-child", "task", "child-x"), ("not-a-task", "read", None)):
+        bridge.observe(event("tool.execution_start", "e-" + identity,
+                             {"toolName": tool, "toolCallId": identity, "arguments": TASK}, agent))
+    assert set(bridge.starts) == {"from-parent", "from-nobody"}
+
+
+def test_a_completion_from_another_agent_is_an_invalid_observation():
+    async def scenario():
+        bridge = _parallel_bridge({"call-a": TASK}, [])
+        assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "allow"
+        _started(bridge, "call-a", "child-a")
+        bridge.observe(event("subagent.completed", "end", {"toolCallId": "call-a"}, "child-x"))
+        with pytest.raises(Problem) as caught:
+            await bridge.drain()
+        assert caught.value.body["error"]["code"] == "DELEGATION_OBSERVATION_INVALID"
+        assert bridge.children["call-a"].finished is False
+    run(scenario())
+
+
+def test_two_starts_with_the_same_arguments_are_ambiguous_and_never_dispatch():
+    async def scenario():
+        calls = []
+        bridge = _parallel_bridge({"call-a": TASK, "call-b": TASK}, calls)
+        decision = await bridge.pre_tool(*_hook(TASK))
+        assert decision["permissionDecision"] == "deny" and "[tool_call_ambiguous]" in decision["permissionDecisionReason"]
+        assert calls == [] and set(bridge.starts) == {"call-a", "call-b"}
+        unmatched = await _parallel_bridge({}, calls).pre_tool(*_hook(TASK))
+        assert "[tool_call_unmatched]" in unmatched["permissionDecisionReason"]
+    run(scenario())
+
+
+def test_a_cancelled_turn_starts_no_further_subtask_and_forgets_the_call():
+    async def scenario():
+        calls = []
+        bridge = _parallel_bridge({"call-a": TASK}, calls)
+        await bridge.request_cancel()
+        decision = await bridge.pre_tool(*_hook(TASK))
+        assert decision["permissionDecision"] == "deny" and decision["permissionDecisionReason"].startswith(
+            "Delegation not started [cancelled]")
+        assert calls == [] and "call-a" not in bridge.starts and not bridge.children
+    run(scenario())
+
+
+def test_a_call_after_an_unresolved_reservation_is_refused_before_anyone_is_asked():
+    async def scenario():
+        tasks = {"first-call": TASK, "second-call": {**TASK, "prompt": "Another subtask."}}
+        bridge = _parallel_bridge(tasks, [])
+
+        async def lost(action, command):
+            raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "Synthetic commit response loss.")
+
+        bridge.call = lost
+        assert (await bridge.pre_tool(*_hook(tasks["first-call"])))["permissionDecision"] == "deny"
+        asked = []
+
+        async def current():
+            asked.append("current")
+            return True
+
+        async def approve(command):
+            asked.append("approval")
+
+        bridge.current, bridge.before_prepare = current, approve
+        second = await bridge.pre_tool(*_hook(tasks["second-call"]))
+        assert second["permissionDecision"] == "deny" and "[original_reserved_or_unknown]" in second["permissionDecisionReason"]
+        assert asked == [] and "second-call" in bridge.starts
+    run(scenario())
+
+
+@pytest.mark.parametrize("outcome, reason", [
+    (RuntimeError("authority store down"), "authority_unavailable"), (False, "current_authority_denied"),
+    (None, "current_authority_denied"), ("yes", "current_authority_denied")])
+def test_a_call_whose_current_authority_is_not_exactly_true_is_not_started_and_is_forgotten(outcome, reason):
+    async def scenario():
+        calls = []
+        bridge = _parallel_bridge({"only-call": TASK}, calls)
+
+        async def current():
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        bridge.current = current
+        decision = await bridge.pre_tool(*_hook(TASK))
+        assert decision["permissionDecision"] == "deny"
+        assert decision["permissionDecisionReason"].startswith(f"Delegation not started [{reason}]")
+        assert calls == [] and "only-call" not in bridge.starts and bridge.failure is None and not bridge.children
+    run(scenario())
+
+
+def test_a_denied_approval_forgets_the_call_but_any_other_hook_error_leaves_it_unresolved():
+    async def scenario():
+        bridge = _parallel_bridge({"denied-call": TASK}, [])
+
+        async def refuse(command):
+            raise Problem(403, "NATIVE_HITL_DENIED", "the human said no")
+
+        bridge.before_prepare = refuse
+        decision = await bridge.pre_tool(*_hook(TASK))
+        assert decision["permissionDecision"] == "deny"
+        assert decision["permissionDecisionReason"] == "This original child action was not approved; do not resend it."
+        assert "denied-call" not in bridge.starts and bridge.failure is None and not bridge._pending
+
+        async def broken(command):
+            raise Problem(503, "NATIVE_EFFECT_UNKNOWN", "unconfirmed")
+
+        bridge.observe(event("tool.execution_start", "again", {"toolName": "task", "toolCallId": "again-call", "arguments": TASK}))
+        bridge.before_prepare = broken
+        assert (await bridge.pre_tool(*_hook(TASK)))["permissionDecision"] == "deny"
+        assert bridge.failure is not None and "again-call" in bridge.starts and not bridge._pending
+    run(scenario())
+
+
+def test_an_earlier_unresolved_reservation_is_not_replaced_by_a_later_hook_error():
+    async def scenario():
+        tasks = {"waiting-call": TASK, "lost-call": {**TASK, "prompt": "Another subtask."}}
+        bridge = _parallel_bridge(tasks, [])
+        waiting, release = asyncio.Event(), asyncio.Event()
+
+        async def approve(command):
+            if command.tool_call_id == "waiting-call":
+                waiting.set()
+                await release.wait()
+                raise RuntimeError("approval channel broke")
+
+        async def lost(action, command):
+            raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "Synthetic commit response loss.")
+
+        bridge.before_prepare, bridge.call = approve, lost
+        pending = asyncio.create_task(bridge.pre_tool(*_hook(tasks["waiting-call"])))
+        await waiting.wait()
+        assert (await bridge.pre_tool(*_hook(tasks["lost-call"])))["permissionDecision"] == "deny"
+        sibling_failure = bridge.failure
+        assert sibling_failure is not None
+        release.set()
+        assert (await pending)["permissionDecision"] == "deny"
+        assert bridge.failure is sibling_failure
+    run(scenario())
+
+
+def test_a_cancel_that_lands_while_the_reservation_is_written_denies_the_dispatch():
+    async def scenario():
+        bridge = _parallel_bridge({"only-call": TASK}, [])
+        inner = bridge.call
+
+        async def reserve_then_cancel(action, command):
+            value = await inner(action, command)
+            bridge.cancelled = True
+            return value
+
+        bridge.call = reserve_then_cancel
+        decision = await bridge.pre_tool(*_hook(TASK))
+        assert decision["permissionDecision"] == "deny" and "[cancelled]" in decision["permissionDecisionReason"]
+        assert bridge.children["only-call"].reply is not None and bridge.failure is None
+    run(scenario())
+
+
+def test_a_first_reservation_that_is_not_fresh_is_an_unresolved_failure():
+    async def scenario():
+        bridge = _parallel_bridge({"only-call": TASK}, [])
+        inner = bridge.call
+
+        async def reserve(action, command):
+            value = await inner(action, command)
+            return value.model_copy(update={"fresh": False})
+
+        bridge.call = reserve
+        decision = await bridge.pre_tool(*_hook(TASK))
+        assert decision["permissionDecision"] == "deny" and "[original_reserved_or_unknown]" in decision["permissionDecisionReason"]
+        assert bridge.failure.body["error"]["code"] == "DELEGATION_ORIGINAL_REQUIRED"
+        with pytest.raises(Problem):
+            await bridge.drain()
+    run(scenario())
+
+
+def test_a_server_size_refusal_on_the_reservation_leaves_nothing_behind_and_the_parent_usable():
+    from shared_context.behavior_delegation_wire import DELEGATION_SIZE_REFUSAL
+
+    async def scenario():
+        bridge = _parallel_bridge({"only-call": TASK}, [])
+
+        async def too_big(action, command):
+            raise Problem(413, DELEGATION_SIZE_REFUSAL, "Synthetic size refusal.")
+
+        bridge.call = too_big
+        decision = await bridge.pre_tool(*_hook(TASK))
+        assert decision["permissionDecision"] == "deny" and "size" in decision["permissionDecisionReason"].lower()
+        assert not bridge.children and "only-call" not in bridge.starts and bridge.failure is None
+        await bridge.drain()
+    run(scenario())
+
+
+def test_an_allowed_dispatch_hands_the_sdk_the_normalized_task_and_an_oversized_one_is_forgotten():
+    async def scenario():
+        bridge = _parallel_bridge({"only-call": TASK}, [])
+        decision = await bridge.pre_tool(*_hook(TASK))
+        assert decision == {"permissionDecision": "allow", "modifiedArgs": TASK}
+        big = {**TASK, "prompt": "x" * (200 * 1024)}
+        oversized = _parallel_bridge({"big-call": big}, [])
+        denied = await oversized.pre_tool(*_hook(big))
+        assert denied["permissionDecision"] == "deny" and "192 KiB" in denied["permissionDecisionReason"]
+        assert "big-call" not in oversized.starts and not oversized.children and oversized.failure is None
+    run(scenario())

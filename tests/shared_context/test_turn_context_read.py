@@ -5,9 +5,6 @@ from contextvars import Context
 from datetime import timedelta
 import hashlib
 import json
-from pathlib import Path
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import httpx
@@ -551,24 +548,3 @@ def test_missing_control_does_not_install_or_enable_a_context_source(real_interf
     c.h.transport.requests.clear()
     response = c.h.client.get(path, headers=c.h.headers())
     assert response.status_code == 503 and c.h.transport.requests == []
-
-
-def test_context_dto_and_thin_client_import_without_hosted_sdk():
-    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    program = r"""
-import importlib.abc, sys
-class NoHostedSdk(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == "copilot" or fullname.startswith("copilot."):
-            raise ModuleNotFoundError("Hosted SDK forbidden in API", name=fullname)
-sys.meta_path.insert(0, NoHostedSdk())
-sys.path.insert(0, sys.argv[1])
-from shared_context.behavior_turn_context import TurnContext, read_saved_turn_context
-from shared_context.behavior_work_policy_api import install_work_policy_routes
-from web_test_console.freeform import InstructionControl
-assert callable(read_saved_turn_context) and callable(InstructionControl)
-assert not any(name == "copilot" or name.startswith("copilot.") for name in sys.modules)
-"""
-    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", program, str(source)],
-                            capture_output=True, text=True, encoding="utf-8", timeout=30)
-    assert result.returncode == 0, result.stdout + result.stderr

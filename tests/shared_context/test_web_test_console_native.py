@@ -486,6 +486,107 @@ def test_b_lists_and_reads_a_conversation_another_agent_opened_without_sending(n
                    for _, command in c.api.remote.calls)
 
 
+def received_responses_conversation(c, monkeypatch):
+    """Agent two's read-only Responses conversation: its root is running when the page first reads it."""
+    from shared_context.behavior_native_turn_wire import NativeAgentReceive, NativeConversation
+    from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE
+    remote, native = c.api.remote, c.ui.console.native_instructions
+    target = remote.target
+
+    def receipt(rid, *, cid=None):
+        base = agent_receive(rid=rid, cid=cid, recipient=target.agent_id)
+        message = NativeAgentReceive(command=base.command, capture=base.capture, source=base.source,
+            state_profile=NATIVE_RESPONSES_PROFILE, new_conversation_id=None if cid else "received-cid")
+        remote.records[rid] = NativeReceipt(state_profile=NATIVE_RESPONSES_PROFILE, agent_id=target.agent_id,
+            hosted_session_id=target.session_id, request_id=rid, conversation_id="received-cid",
+            command=message.command, capture=message.capture, source=message.source, submit_digest=message.sha256,
+            capture_digest=message.capture.sha256, status="started", response_id="resp_" + rid)
+
+    receipt("message-from-a")
+    last = ["message-from-a"]
+    root = remote.records["message-from-a"]
+    monkeypatch.setattr(native.adapter, "conversation", lambda cid, token: NativeConversation(
+        state_profile=NATIVE_RESPONSES_PROFILE, agent_id=target.agent_id, hosted_session_id=root.hosted_session_id,
+        conversation_id=cid, last_turn=len(last), last_request_id=last[-1], capture=root.capture,
+        capture_digest=root.capture_digest))
+    return receipt, last
+
+
+def task_of(response, rid):
+    return next(task for task in response.json()["tasks"] if task["task_id"] == rid)
+
+
+def test_a_received_responses_turn_finishes_on_the_page_when_it_is_the_last_turn(native_console, monkeypatch):
+    c = native_console
+    received_responses_conversation(c, monkeypatch)
+    opened = progress(c, "message-from-a")
+    assert opened.status_code == 200, opened.text
+    assert task_of(opened, "message-from-a")["native_receipt"]["status"] == "started"
+    c.api.remote.completed("message-from-a")
+    assert task_of(progress(c, "message-from-a"), "message-from-a")["native_receipt"]["status"] == "completed"
+
+
+def test_a_received_responses_root_finishes_on_the_page_after_a_later_turn(native_console, monkeypatch):
+    """Dev 2026-11-02: B's read-only conversation stayed 「正在回覆」 with a stop button after the API said completed.
+
+    A received root has no local ``submit``, so only the conversation's last or in-flight turn was read again; a page
+    that first read it running never saw it finish, also after a reload, until one ``/status`` read.
+    """
+    c = native_console
+    receipt, last = received_responses_conversation(c, monkeypatch)
+    assert task_of(progress(c, "message-from-a"), "message-from-a")["native_receipt"]["status"] == "started"
+    c.api.remote.completed("message-from-a")
+    receipt("relay-turn", cid="received-cid")
+    last.append("relay-turn")
+    c.api.remote.completed("relay-turn")
+    update = progress(c, "message-from-a")
+    assert update.status_code == 200, update.text
+    root = task_of(update, "message-from-a")
+    assert root["native_receipt"]["status"] == "completed" and root["actions"]["cancel"]["enabled"] is False
+    # Its reply comes with the page's read of an older turn, as for any finished turn with no reply held yet.
+    assert root["reply"] is None and root["actions"]["read-reply"]["enabled"] is True
+
+
+def test_an_unreadable_older_received_turn_never_stops_the_rest_of_the_conversation(native_console, monkeypatch):
+    """Only the old turn is skipped; its siblings and every later step of the read still run."""
+    c = native_console
+    receipt, last = received_responses_conversation(c, monkeypatch)
+    native, remote = c.ui.console.native_instructions, c.api.remote
+    assert progress(c, "message-from-a").status_code == 200
+    for rid in ("relay-one", "relay-two"):
+        receipt(rid, cid="received-cid")
+        last.append(rid)
+        assert progress(c, "message-from-a").status_code == 200
+    for rid in ("message-from-a", "relay-one", "relay-two"):
+        remote.completed(rid)
+    later = []
+    monkeypatch.setattr(native, "_refresh_peer_replies", lambda thread, token: later.append("peer"))
+    monkeypatch.setattr(native.routines, "refresh", lambda thread, token: later.append("routines"))
+    monkeypatch.setattr(native.hitl, "refresh", lambda thread, token: later.append("hitl"))
+    status = [404]
+    c.mutate[0] = lambda request, response: (
+        httpx.Response(status[0], json={"error": {"code": "NATIVE_RID_MISSING"}})
+        if request.url.path.endswith("/requests/message-from-a") else response)
+    for status[0] in (404, 503):
+        native.observed.pop("message-from-a")
+        later.clear()
+        read = progress(c, "message-from-a")
+        assert read.status_code == 200, read.text
+        assert task_of(read, "relay-one")["native_receipt"]["status"] == "completed"
+        assert task_of(read, "relay-two")["native_receipt"]["status"] == "completed"
+        assert later == ["peer", "routines", "hitl"] and "message-from-a" in native.observed
+        root = task_of(read, "message-from-a")
+        assert root["native_receipt"]["status"] == "started" and root["error"] is not None
+
+    # A lapsed sign-in is the page's to handle, as on every other read.
+    status[0] = 401
+    assert progress(c, "message-from-a").status_code == 401
+
+    c.mutate[0] = lambda request, response: response
+    root = task_of(progress(c, "message-from-a"), "message-from-a")
+    assert root["native_receipt"]["status"] == "completed" and root["error"] is None
+
+
 def test_a_page_that_names_no_conversation_opens_the_owners_own_not_a_newer_agent_conversation(request):
     """Stage 38, 2026-10-31: the page opened on a read-only 「來自 B 的交辦」, because importing it made it the newest row."""
     reopened_loop = asyncio.new_event_loop()
@@ -581,7 +682,7 @@ def test_owner_finds_each_routine_run_as_its_own_dated_conversation_and_can_foll
 
 
 def test_received_import_follows_pages_to_a_known_run_and_lists_the_newest_30_runs(native_console):
-    """Review 2026-10-23: a daily run adds a conversation a day, so the first 50-key received page is not enough. The
+    """A daily run adds a conversation a day, so the first 50-key received page is not enough. The
     import reads on until a page holds a run it already has; the list shows the newest 30 runs (and the open one)."""
     from datetime import timedelta
     from web_test_console.native import RECEIVED_SECONDS
@@ -628,7 +729,7 @@ def test_received_import_follows_pages_to_a_known_run_and_lists_the_newest_30_ru
 
 
 def test_received_import_reads_one_page_for_an_agent_without_received_conversations(native_console):
-    """Review 2026-10-23 (P3-6): own turns fill the first page and none opened here, so nothing behind it is read."""
+    """Own turns fill the first page and none opened here, so nothing behind it is read."""
     from datetime import timedelta
     from web_test_console.native import RECEIVED_SECONDS
 
@@ -648,7 +749,7 @@ def test_received_import_reads_one_page_for_an_agent_without_received_conversati
 
 
 def test_received_import_imports_again_a_run_whose_finish_was_lost(native_console):
-    """Review 2026-10-23 (P3-2): a row begun but never finished (no ``native_receipt``) is not imported yet."""
+    """A row begun but never finished (no ``native_receipt``) is not imported yet."""
     from datetime import timedelta
     from web_test_console.native import RECEIVED_PHASE, RECEIVED_SECONDS
 
@@ -1133,7 +1234,7 @@ def test_while_the_first_message_is_unknown_the_next_one_waits_for_its_conversat
 
 
 def test_a_refusal_the_server_marks_not_dispatched_is_final_and_the_conversation_still_reads(native_console):
-    """#679 review: a submit refused before rid:<RID> exists (here the API's continuation_blocker 409) used to be stored
+    """#679: a submit refused before rid:<RID> exists (here the API's continuation_blocker 409) used to be stored
     as UNKNOWN, and every whole read then failed on NATIVE_RID_MISSING. The server now says not_dispatched (API line,
     released with this PR); a 5xx or uncertain answer never carries it and stays UNKNOWN."""
     c = native_console
@@ -1304,7 +1405,7 @@ def test_unflagged_native_errors_do_not_claim_the_message_was_not_sent(native_co
     assert saved["state"] == "UNKNOWN" and saved["code"] == code and saved.get("not_dispatched") is None
 
 def test_a_same_rid_resend_lost_before_hosted_created_it_does_not_break_later_reads(native_console):
-    """#679 review round 3: after a version refusal (REFUSED), the same-RID resend got an unflagged 5xx (UNKNOWN) and
+    """#679: after a version refusal (REFUSED), the same-RID resend got an unflagged 5xx (UNKNOWN) and
     Hosted never created the RID; every later whole read then failed on NATIVE_RID_MISSING."""
     c = native_console
     draft = first(c)
@@ -1347,7 +1448,7 @@ def test_a_version_refusal_holds_the_composer_until_its_same_rid_resend(native_c
 
 
 def test_a_send_lost_before_hosted_created_it_stays_unknown_and_the_conversation_still_reads(native_console):
-    """#679 review round 2: a 5xx before rid:<RID> exists stays UNKNOWN (never resent); reading it back says missing,
+    """#679: a 5xx before rid:<RID> exists stays UNKNOWN (never resent); reading it back says missing,
     which is shown on that turn instead of failing every later whole read of the conversation."""
     c = native_console
     draft = first(c)
@@ -1783,7 +1884,7 @@ def test_a_stop_for_a_turn_that_already_finished_records_the_api_answer(native_c
     assert c.ui.console.journal.get(rid, "cancel")["state"] == "CONFIRMED"
 
 
-# #804 review: only a completed receipt means "the work already finished, no stop needed". An unchanged receipt in
+# #804: only a completed receipt means "the work already finished, no stop needed". An unchanged receipt in
 # another state (busy_refused here) is not recorded as finished; the stop stays unknown and the page offers the check.
 def test_a_stop_answered_with_a_busy_refused_receipt_is_not_recorded_as_finished(native_console):
     c = native_console
@@ -1813,7 +1914,7 @@ def test_a_stop_answered_with_a_busy_refused_receipt_is_not_recorded_as_finished
     assert c.ui.console.journal.get(rid, "cancel")["state"] == "UNKNOWN"
 
 
-# #813 review round 3: during a deploy window the API may invoke no session for a stop (the turn's session is not
+# #813: during a deploy window the API may invoke no session for a stop (the turn's session is not
 # active). It says so (not_dispatched); the stop is recorded as not sent, and pressing it again sends the same stop.
 def test_a_stop_the_api_sent_nowhere_is_recorded_refused_and_the_same_stop_is_sent_again(native_console):
     c = native_console
@@ -1857,7 +1958,7 @@ def test_a_stop_the_api_sent_nowhere_is_recorded_refused_and_the_same_stop_is_se
     assert c.ui.console.journal.get(rid, "cancel")["state"] == "CONFIRMED"
 
 
-# #813 review round 4: the delivery acknowledgement the API sent nowhere is recorded REFUSED on its journal row, and
+# #813: the delivery acknowledgement the API sent nowhere is recorded REFUSED on its journal row, and
 # pressing 「確認收到」 again sends the same NativeDelivered (same RID, CID and digest) on that same row.
 def test_a_delivery_acknowledgement_the_api_sent_nowhere_is_recorded_refused_and_the_same_one_is_sent_again(
         native_console):
@@ -2209,7 +2310,7 @@ def test_this_bridge_on_an_api_before_4d_still_gets_and_clears_the_switch_notice
 
 
 def test_this_bridge_on_an_api_before_6a_c_still_gets_and_clears_the_switch_notice(native_console, monkeypatch):
-    """#908 review P2: the console may go live before the API. That API knows exactly ``X-FA-Notice-Kinds: 2`` and
+    """#908: the console may go live before the API. That API knows exactly ``X-FA-Notice-Kinds: 2`` and
     ignores the 6a (c) header, so the switch notice is shown and cleared as in phase 2c."""
     from shared_context import behavior_native_turn_api as api
 
@@ -2247,7 +2348,7 @@ def test_this_bridge_passes_the_waiting_note_to_the_page_once(native_console, mo
 
 
 def test_a_phase_2c_bridge_on_this_api_never_gets_the_waiting_note_and_nothing_is_cleared(native_console, monkeypatch):
-    """#908 review P2: the API may go live before the console. A phase 2c bridge sends ``X-FA-Notice-Kinds: 2`` only
+    """#908: the API may go live before the console. A phase 2c bridge sends ``X-FA-Notice-Kinds: 2`` only
     and decodes the receipt strictly, so the note is not sent to it and stays pending."""
     c = native_console
     state = waiting(c, monkeypatch)

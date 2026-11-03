@@ -320,3 +320,21 @@ def test_provider_context_limit_is_explicit_without_raw_error_or_retry():
                                  text_reply=True,model="configured-model"))
     assert failed.value.body["error"]["code"]=="ASSISTANT_CONTEXT_LIMIT" and len(sent)==1
     assert "PRIVATE_PROVIDER_ERROR" not in str(failed.value.body)
+
+
+@pytest.mark.parametrize("code", [["context_length_exceeded"], {"code": "context_length_exceeded"}], ids=["list", "dict"])
+def test_a_provider_code_that_is_not_text_is_an_unknown_outcome(code):
+    import asyncio
+    import httpx
+    from types import SimpleNamespace
+    from shared_context.behavior_assistant_gateway import AssistantProvider
+    from shared_context.errors import Problem
+    provider=AssistantProvider("https://provider.invalid/openai/v1/chat/completions",
+        SimpleNamespace(get_token=lambda _:SimpleNamespace(token="OFFLINE")),
+        transport=httpx.MockTransport(lambda _:httpx.Response(400,json={"error":{"code":code}})))
+    with pytest.raises(Problem) as failed:
+        asyncio.run(provider.send({"model":"configured-model","stream":True,"messages":[{"role":"user","content":"x"}]},
+                                 text_reply=True,model="configured-model"))
+    assert failed.value.status==503 and failed.value.body["error"]=={
+        "code":"ASSISTANT_MODEL_OUTCOME_UNKNOWN","message":"original model HTTP request is unresolved",
+        "upstream_error_code":"ASSISTANT_PROVIDER_HTTP_FAILURE","provider_status":400,"upstream_error_phase":"provider_response"}

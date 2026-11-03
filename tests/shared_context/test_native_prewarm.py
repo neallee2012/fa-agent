@@ -17,7 +17,7 @@ from shared_context.behavior_native_turn_wire import NativePrewarm, NativePrewar
 from shared_context.native_capabilities import bind_capabilities
 from shared_context.native_turns import TURNS_STORE
 from test_native_toolbox import ENDPOINT, Toolbox, bind_on, context, methods
-from test_native_turns import IDENTITY, harness, local_env, native_retry_policy, submit  # noqa: F401
+from test_native_turns import IDENTITY, harness, local_env, native_retry_policy, submit
 
 ORG = NativePrewarmToolbox(toolbox="fa-org-tools")
 

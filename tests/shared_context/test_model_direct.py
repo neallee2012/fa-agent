@@ -16,6 +16,7 @@ from shared_context import behavior_assistant_hosted as hosted
 from shared_context import behavior_assistant_wire as aw
 from shared_context import behavior_model_direct as direct
 from shared_context.errors import Problem
+from shared_context.sdk_pin import RUNTIME_VERSION
 
 URL = "https://fa-acct.services.ai.azure.com/api/projects/fa-project/openai/v1/responses"
 TOKEN = "direct-secret-token"
@@ -119,6 +120,14 @@ def test_unknown_outcomes_are_counted_but_never_measured():
         assert usage.requests == requests and usage.measured_requests == 0 and usage.input_tokens is None
 
 
+@pytest.mark.parametrize("code", [["context_length_exceeded"], {"code": "context_length_exceeded"}], ids=["list", "dict"])
+def test_a_provider_code_that_is_not_text_is_an_unknown_outcome(code):
+    sender = direct.DirectResponses(URL, lambda: TOKEN, MODEL, transport=provider([], status=400, content=code))
+    with pytest.raises(Problem) as failed:
+        asyncio.run(send(sender, body()))
+    assert (failed.value.status, failed.value.body["error"]["code"]) == (503, "ASSISTANT_MODEL_OUTCOME_UNKNOWN")
+
+
 def test_each_direct_request_times_its_first_byte_and_end_under_the_turn_timing_id(caplog):
     from shared_context.behavior_timing import work_timing
 
@@ -178,7 +187,7 @@ def test_reasoning_is_summed_only_when_every_measured_request_reported_it():
 
 
 def _turn(tmp_path, monkeypatch, calls, *, enabled, peer=False):
-    stop = aw.SdkStop(runtime_version="1.0.83", pid=42, exit_code=0, graceful=True)
+    stop = aw.SdkStop(runtime_version=RUNTIME_VERSION, pid=42, exit_code=0, graceful=True)
 
     async def send_model(request, **options):
         calls.append(("api", options))

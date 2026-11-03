@@ -36,8 +36,6 @@ DEPLOYMENTS = "Microsoft.Resources/deployments"
 PINNED_DEFAULTS = {"createNetwork", "vnetResourceId", "apiSubnetName", "agentSubnetName", "privateEndpointSubnetName",
                    "dnsMode", "apiSubnetResourceId", "privateEndpointSubnetResourceId", "privateDnsZones"}
 
-# ---- ARM expressions -> canonical JSON ------------------------------------------------------------------------------
-
 TOKEN = re.compile(r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<num>-?\d+)|(?P<name>[A-Za-z_$][\w$#]*)|(?P<op>[(),.\[\]]))\s*")
 
 
@@ -278,8 +276,6 @@ def leaves(template, mode="public", bindings=None):
     found["outputs"] = {name: root.value(spec["value"]) for name, spec in template.get("outputs", {}).items()}
     return json.loads(json.dumps(found, sort_keys=True))
 
-
-# ---- compiled templates ---------------------------------------------------------------------------------------------
 
 ENTRIES = ("infra/azd/main.bicep", "infra/shared-context/foundation.bicep", "infra/shared-context/foundry.bicep")
 

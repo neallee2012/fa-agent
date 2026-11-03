@@ -11,6 +11,7 @@ from shared_context import m2_copilot
 from shared_context.behavior_native_turn_wire import NATIVE_REQUEST, NativeReceipt, NativeResult
 from shared_context.native_delegation import NativeDelegationReply
 from shared_context.native_sdk import NativeSdkExecutor, native_capability_providers
+from shared_context.sdk_pin import SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_m2_copilot import runtime_path
 from test_native_delegation import TASK, delegate_request
@@ -24,7 +25,7 @@ def test_responses_parent_keeps_its_original_sdk_child_across_reentry_and_follow
 ):
     import _socket
 
-    assert version("github-copilot-sdk") == "1.0.13"
+    assert version("github-copilot-sdk") == SDK_VERSION
 
     def loopback_only(sock, address):
         assert isinstance(address, tuple) and address[0] in {"127.0.0.1", "::1"}

@@ -1,8 +1,36 @@
 # FA 進度與交接狀態
 
-更新日期：2026-10-31。
+更新日期：2026-11-02。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="stage-v39-1102"></a>
+## 2026-11-02：stage 第 39 版部署、dev 測試與冒煙
+
+- **範圍**：release PR #1116（`2026.11.02-39`），Neal 00:57:31Z 合併，merge commit `c1e3cf4c`。內容是第八到第十輪程式整理與工作台修正 #1093。變更清單、stage 準備度與第一道審查都在 PR 本文。證據是總協調的唯讀讀回，原始輸出不在 repo。
+- **結果**：deploy-staging run 41369919821 成功，約 13 分鐘。gate armed、pass、0 拒絕。API、console、feed 都是 `…--c1e3cf4-r127-1`，API Healthy、流量 100%，image `sha256:554908bf…`。API 01:08:25Z 開機完成，`FA_NATIVE_ROUTINE_CLOCK_STARTED` 正常；讀回時沒有 Traceback。`AGENT_SCOPE_MISSING` 兩筆是 C、D，與前幾版相同。
+- **public-sync**：run 41371118985 成功，第二道檢查通過。公開 `v2026.11.02-39` 的 tree 讀回是 `830df019`，等於第一道審查的 fingerprint。
+- **weekly CI**：Neal 同意後，合併前手動跑在 `50c162a3`（run 41367949685），8 個分片全綠，約 19 分鐘。前兩次排程（10-19、10-26）是紅的，這次全綠。`ci-quarantine.txt` 與 `known-failing-on-main.txt` 共 462 個 id 照舊排除，`tests/infra` 不在範圍內。
+- **dev 測試**（08:08～08:25 台北，main `50c162a3`，API `ca-fa-behavior-poc--50c162a-r4101-1`，Hosted image `sha256:f29031fb621a`，A v180、B v140，真 bridge、真模型 gpt-5.4-mini）：
+  - 通過：A、B 真回合，B 的 Connect 卡按「先不用」，網路搜尋工具，第三回合逐字引用第一則訊息，回合中停止，A 交辦 B 再回到 A 的來回，B 的批准卡（總協調核對內容後按「允許這次」），重新整理，切到 B 時模型清單約 3.5 秒載入。
+  - log：API 327 筆，Traceback、ERROR 都是 0，Hosted `AppExceptions` 0。API 與工作台關閉 access log，這些 log 算不出 5xx。`NATIVE_INVOCATION_FAILURE` 16 筆都判明：2 筆是換版第一次的 409 `NATIVE_SESSION_CHANGED`，14 筆是停止後查詢沒有恢復工作的 404 `NATIVE_CONTINUATION_MISSING`，第 38 版與 10-30 的舊版也有。
+- **已知問題，歸因未驗證**：B 的唯讀交辦對話裡，回合已 `completed`，畫面第一個氣泡仍是「正在回覆」，停止按鈕也還在，重新載入也一樣。讀過一次 status 後，第 38 版與 `50c162a3` 的工作台讀同一份本機資料都顯示正確。用第 38 版重走時，B 沒有用工具就回覆，沒走到同一條路，所以不知道是不是 #1113 帶來的。
+- **stage 冒煙**（01:38～01:45Z，Neal 操作 stage console，模型 `gpt-6.1-sol`，A、B 都是 Hosted v90）：6 個回合都跑完，畫面都顯示「已完成」。4 個是主人發給 A 的，1 個是 A 交辦給 B，1 個是 B 回覆後 A 的處理。用到 Team feed、WebIQ、playwright、`ask_user`、`send_agent_message`，批准卡有按過。A 有一次 `playwright-browser_fill_form` 失敗，該回合仍完成。API、console、feed 的 Traceback、ERROR 都是 0，`AppExceptions` 0。API 與 console 關閉 access log，算不出 5xx，下面的逾時依程式回 503。
+  - **預期內的 log**：換版第一次碰到時，A 01:38:54、B 01:44:26 各一筆 409 `NATIVE_SESSION_CHANGED`（6.8、6.5 秒）。`NATIVE_STREAM_NOT_STARTED` 3 筆，舊版也有。`NATIVE_RID_MISSING` 8 筆，是 B 回覆前工作台輪詢交辦。
+  - **要留意**：A 約 01:43:16 起的一次 `turn_status` 30 秒 `ReadTimeout`，記 `FOUNDRY_INVOCATION_UNKNOWN`，依程式回 503。串流 01:43:36 已結束，01:43:48 讀到結果，畫面是「已完成」。**已查（11-02）：** 不是 Hosted 忙著跑工具或收尾。click 那 34 秒內 9 次讀取都成功；Hosted 01:43:39 後已無工作紀錄卻仍沒回，逾時後 0.8 秒的下一個請求 158 毫秒就回。請求停在 `phase=request`，30 秒內沒收到回應標頭，平台也沒有 `invoke_agent` span（10-28 起成功的 136 次 `api_status` 都對得到）。40 天 2,567 次讀取，排除這 3 次最慢 11.8 秒，中間是空的。**未定：** 是平台或網路，還是 Hosted 內單筆 State store 讀取卡住；也不知道平台會不會記客戶端先斷線的請求。`FA_NATIVE_HTTP` 當時不進 App Insights，stderr 只留 300 行、最早到 01:44:56，差約 70 秒。本批把它加進匯出，下一版 Hosted 起，只要那段時間的 log 有送到就分得出來。同一個代碼在 stage 前 30 天另有 10-14 A 的 `turn_status`、10-15 **B 的 `read`**（不是 `turn_status`），兩筆都沒有平台 span；10-15 那次 B 同時正常回應另外 8 個請求，所以不是 `turn_status` 處理函式特有的問題。10-13 另有一筆 `session_follow` ReadTimeout，情境不同，未深查。
+  - **#1093**（總協調在 stage 唯讀核對）：開頁停在 A 可輸入的對話。用 B 的身分不指定對話讀取，開到可輸入的對話，不是唯讀對話。讀取失敗後重讀沒有驗到。
+  - **交辦對話**：實際按 B 時走另一條路徑，`agentThreads` 記住背景活動，所以開在剛才的交辦對話。這是既有設計，不是 #1093 修的預設路徑。這次顯示「已完成」，沒有「正在回覆」也沒有停止按鈕，dev 的氣泡問題沒有重現，但總協調是回合結束後才開頁，不能算修好。
+  - **標頭文字**：唯讀交辦對話的標頭寫「需要處理」，待處理項目其實是 0。不擋發布，下次改工作台時處理。
+- **沒有驗證**：#1093 的讀取失敗重讀，回合中停止（stage 這版沒按），Teams OAuth 與 relay 實際收發，Team MCP／Connectors 寫入，圖片上傳，排程實際到期觸發，`tests/infra`，stage Table 內容（gate pass 不能證明 fresh 列）。
+- **送出 RTT**（stage 冒煙，毫秒，nearest-rank，算法同第 36 版；樣本少只供參考）：
+
+  | 指標 | n | p50 | p95 |
+  |---|---|---|---|
+  | `api_submit` | 4 | 2,142 | 2,545 |
+  | `api_submit_session` | 4 | 288 | 357 |
+  | `api_submit_context` | 4 | 83 | 102 |
+  | `api_submit_capture` | 4 | 0 | 166 |
+  | `api_submit_hosted` | 4 | 655 | 775 |
 
 <a id="stage-v38-verify-1031"></a>
 ## 2026-10-31：stage 第 38 版冒煙、停止與每日排程讀回

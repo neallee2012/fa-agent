@@ -26,8 +26,10 @@ from shared_context import m2_copilot, native_sdk
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import NativeCancel, NativeResult, NativeSubmit, NativeTurnCapture
 from shared_context.native_turns import NativeTurnRuntime, timing_id
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_turn_wire import capture, submit
-from test_native_turns import Harness, IDENTITY, local_env  # noqa: F401
+from test_native_turns import Harness, IDENTITY, local_env
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 EVENTS = "/session-state/events.jsonl"
 MODEL_ROOT = "https://offline-fixture.services.ai.azure.com/api/projects/offline/openai/v1"
@@ -38,7 +40,7 @@ def line(event):
 
 
 class PinnedSdk:
-    """Pinned SDK 1.0.13 double: one session per client, SessionFs writes, then idle."""
+    """Pinned SDK 1.0.26 double: one session per client, SessionFs writes, then idle."""
 
     def __init__(self, monkeypatch, *, during_send=None, on_disconnect=None):
         self.clients, self.sends, self.stopped, self.during_send = [], [], [], during_send
@@ -64,7 +66,7 @@ class PinnedSdk:
             self.stopped.append(client)
 
         client.stop.side_effect = stop
-        client.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+        client.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
 
         async def create(**options):
             return await self.session(client, options["session_id"], options, False)
@@ -83,6 +85,7 @@ class PinnedSdk:
             await fs.write_file(EVENTS, line({"type": "session.start", "data": {"sessionId": sid}}))
             await fs.write_file("/session-state/workspace.yaml", "id: " + sid + "\n")
         session = create_autospec(CopilotSession, instance=True)
+        session.rpc = OFFLINE_SESSION_RPC
         session.session_id = sid
         session.get_events.return_value = []
         handlers = []
@@ -545,6 +548,7 @@ def test_an_auto_compaction_still_open_at_idle_stops_the_sdk(local_env, monkeypa
                 "success": True, "summaryContent": "OFFLINE summary"})))
 
     sdk = PinnedSdk(monkeypatch, during_send=start, on_disconnect=finish)
+    monkeypatch.setattr(m2_copilot, "COMPACTION_SETTLE_SECONDS", 0.2)  # this compaction only ends when stopped
     executor, runtime = offline_runtime(tmp_path)
     selected = auto_capture()
     client, h = serve(runtime)
@@ -553,12 +557,14 @@ def test_an_auto_compaction_still_open_at_idle_stops_the_sdk(local_env, monkeypa
         second = turn(h, "rid-2", first.conversation_id, selected=selected)
         assert text(h, second) == "OFFLINE answer 2"
     assert "sdk_process_stop" in phases(caplog, "rid-1")
+    stopped = [r.getMessage() for r in caplog.records if r.getMessage().startswith("RESIDENT_SDK_STOPPED")]
+    assert stopped == ["RESIDENT_SDK_STOPPED reason=compaction_running"]
     assert len(sdk.clients) == 2 and sdk.sends[1].resume
     assert "session.compaction_complete" in sdk.sends[1].fs.files["events.jsonl"]
 
 
 def stuck_cli(monkeypatch, *, dies_on_kill):
-    """#874 P3 / #903: the first turn's CLI ignores the abort, stop and force_stop (item 2's bounded path); FA's own
+    """#874 / #903: the first turn's CLI ignores the abort, stop and force_stop (item 2's bounded path); FA's own
     kill of its PID either ends it or (an uninterruptible kernel wait) does not."""
     exited, alive_at_start, kills = Event(), [], []
 
@@ -605,7 +611,7 @@ def start_and_cancel_first(h, sdk, server):
 
 
 def test_a_cli_that_outlives_force_stop_is_killed_again_before_the_next_sdk(local_env, monkeypatch, tmp_path):
-    """#903 P2-1: FA kills the force-stopped CLI's own PID once more; it exits, so the next message runs normally (no
+    """#903: FA kills the force-stopped CLI's own PID once more; it exits, so the next message runs normally (no
     503, no recovery restart) and its SDK starts only after the first CLI exited."""
     sdk, exited, alive_at_start, kills = stuck_cli(monkeypatch, dies_on_kill=True)
     executor, runtime = offline_runtime(tmp_path)
@@ -621,12 +627,12 @@ def test_a_cli_that_outlives_force_stop_is_killed_again_before_the_next_sdk(loca
 
 @pytest.mark.parametrize("ends", ["cli_exits", "recovery_shutdown", "close_unconfirmed"])
 def test_an_unkillable_cli_keeps_queued_work_and_leaves_by_recovery(local_env, monkeypatch, tmp_path, caplog, ends):
-    """#903 P2-1/P2-2/P2-3: the CLI survives FA's own kill too. NATIVE_CLI_UNKILLABLE is logged and a recovery restart
+    """#903: the CLI survives FA's own kill too. NATIVE_CLI_UNKILLABLE is logged and a recovery restart
     requested (once). A message queued meanwhile stays accepted (no second SDK, never unknown); a new one gets a
     not_dispatched 503 with a retry hint. The queued one then runs once the CLI exits, or the platform shutdown the
-    executor asked for settles it as NATIVE_TURN_NOT_STARTED and leaves by exit_for_recovery. close_unconfirmed
-    (review P3-1): that settle fails, so core's real re-entry (payload.input=None, steering.active_input=rid-2) settles
-    it after the restart."""
+    executor asked for settles it as NATIVE_TURN_NOT_STARTED and leaves by exit_for_recovery. close_unconfirmed:
+    that settle fails, so core's real re-entry (payload.input=None, steering.active_input=rid-2) settles it after
+    the restart."""
     from azure.ai.agentserver.core.tasks._local_provider import LocalFileTaskProvider
     from shared_context.errors import Problem
     from test_native_binding_tasks import observer
@@ -653,7 +659,7 @@ def test_an_unkillable_cli_keeps_queued_work_and_leaves_by_recovery(local_env, m
         assert h.invoke(NativeSubmit(command=submit("rid-2").command, capture=capture())).status_code == 202
         cancel()
         assert h.wait("rid-1", "unknown").failure_code == "NATIVE_TURN_CANCELLED"
-        recovery_requested(server, executor)  # once rid-1's own execution ended (round 11)
+        recovery_requested(server, executor)  # once rid-1's own execution ended
         assert kills == [4242] and executor.recoveries == ["SIGTERM"]
         assert "NATIVE_CLI_UNKILLABLE pid=4242" in caplog.text
         server.portal.call(asyncio.sleep, 1)
@@ -671,7 +677,7 @@ def test_an_unkillable_cli_keeps_queued_work_and_leaves_by_recovery(local_env, m
         assert left == ["rid-2"] and len(sdk.sends) == 1
         if ends == "close_unconfirmed":
             assert "FA_NATIVE_UNSTARTED_CLOSE_UNCONFIRMED" in caplog.text  # rid-2 left this lifetime accepted
-        # Review P2: core already dropped the drained input, so a restart could never run rid-2; it is settled
+        # Core already dropped the drained input, so a restart could never run rid-2; it is settled
         # (resendable) before the recovery exit, or by the restart's re-entry, and stays settled.
         _, restarted = offline_runtime(tmp_path)
         reads = []
@@ -691,7 +697,7 @@ def test_an_unkillable_cli_keeps_queued_work_and_leaves_by_recovery(local_env, m
 
 
 def test_a_turn_whose_own_cli_survives_saves_its_result_before_the_recovery_restart(local_env, monkeypatch, tmp_path):
-    """Review P2 (round 11) on #903: a cancelled turn's own CLI survives stop, force_stop and FA's own kill. The
+    """#903: a cancelled turn's own CLI survives stop, force_stop and FA's own kill. The
     recovery restart it asks for waits for that turn's own execution too: SIGTERM (which sets every active task's
     shutdown, as core's TaskManager.shutdown does first) comes only after the turn saved its final status, so the
     restart finds it settled and never re-runs it as a continuation."""
@@ -726,9 +732,9 @@ def test_a_turn_whose_own_cli_survives_saves_its_result_before_the_recovery_rest
 
 @pytest.mark.parametrize("dies_on_kill", [True, False])
 def test_an_idle_resident_stop_kills_a_cli_that_outlives_force_stop(monkeypatch, caplog, dies_on_kill):
-    """#903 P3: an evicted (idle) SDK whose CLI ignores stop and force_stop is killed by its own PID too; one that
+    """#903: an evicted (idle) SDK whose CLI ignores stop and force_stop is killed by its own PID too; one that
     survives that is logged, never raised (no turn and no slot: no recovery restart from here), and the pool registers
-    it as unexited (review P3), so no SDK starts beside it."""
+    it as unexited, so no SDK starts beside it."""
     from shared_context.native_resident import NativeResidentPool
 
     exited, kills, unexited = Event(), [], []
@@ -758,7 +764,7 @@ def test_an_idle_resident_stop_kills_a_cli_that_outlives_force_stop(monkeypatch,
 
 
 def test_an_evicted_idle_sdk_whose_cli_survives_requests_the_recovery_restart(local_env, monkeypatch, tmp_path):
-    """Review P2-1 on #903: an idle SDK evicted from the pool whose CLI survives stop, force_stop and FA's own kill is
+    """#903: an idle SDK evicted from the pool whose CLI survives stop, force_stop and FA's own kill is
     registered on the executor and asks for the same recovery restart a turn's survivor does (once), so the 503s it
     causes end with that restart instead of lasting until the CLI exits."""
     from shared_context.errors import Problem
@@ -794,7 +800,7 @@ def test_an_evicted_idle_sdk_whose_cli_survives_requests_the_recovery_restart(lo
 
 
 def recovery_requested(server, executor):
-    """The recovery restart a registration asked for, once any other started turn's execution ended (round 9)."""
+    """The recovery restart a registration asked for, once any other started turn's execution ended."""
     for _ in range(500):
         if executor.recoveries:
             return
@@ -804,7 +810,7 @@ def recovery_requested(server, executor):
 @pytest.mark.parametrize("force_stop", ["returns", "times_out"])
 def test_a_replaced_kept_sdk_whose_cli_outlives_its_stop_starts_no_second_sdk(local_env, monkeypatch, tmp_path,
                                                                              force_stop):
-    """Review P3 on #903: a kept SDK replaced for changed settings whose CLI survives stop, force_stop and FA's own
+    """#903: a kept SDK replaced for changed settings whose CLI survives stop, force_stop and FA's own
     kill is registered as unexited; the turn starts no second SDK beside it and asks for the recovery restart."""
     sdk, kills = PinnedSdk(monkeypatch), []
 
@@ -836,7 +842,7 @@ def test_a_replaced_kept_sdk_whose_cli_outlives_its_stop_starts_no_second_sdk(lo
 
 def test_a_turn_cancelled_while_its_replaced_sdk_stops_still_registers_the_surviving_cli(local_env, monkeypatch,
                                                                                          tmp_path):
-    """Review P2-2 on #903: the turn's run_copilot is cancelled (e.g. its Responses stream closed) while the replaced
+    """#903: the turn's run_copilot is cancelled (e.g. its Responses stream closed) while the replaced
     kept SDK's shielded stop is still running; that stop finds the CLI alive after FA's own kill later, in the
     background, and registers it itself, so no second SDK starts beside it and the recovery restart is requested
     once."""
@@ -895,8 +901,9 @@ def test_a_turn_cancelled_while_its_replaced_sdk_stops_still_registers_the_survi
 
 def test_a_message_sent_while_a_cancelled_turns_replaced_sdk_still_stops_starts_no_second_sdk(local_env, monkeypatch,
                                                                                                tmp_path):
-    """Review P2 (round 5) on #903: the turn's run_copilot is cancelled (as in the P2-2 test) while its replaced kept
-    SDK's shielded stop is still running. Until that stop ends no SDK starts. Round 6: a new RID is taken (202, no
+    """#903: the turn's run_copilot is cancelled (as in
+    test_a_turn_cancelled_while_its_replaced_sdk_stops_still_registers_the_surviving_cli) while its replaced kept
+    SDK's shielded stop is still running. Until that stop ends no SDK starts. A new RID is taken (202, no
     resend) and waits accepted; it runs once after the stop ends, its SDK starting only after the first CLI exited."""
     entered, release, alive_at_start = Event(), Event(), []
 
@@ -978,7 +985,7 @@ def _evict_idle(server, pool):
 
 def test_messages_sent_while_an_idle_eviction_stops_are_taken_and_answered_in_send_order(local_env, monkeypatch,
                                                                                         tmp_path):
-    """Review P2 (round 6) on #903: an ordinary idle eviction's stop no longer refuses a send (it was a 503 that the
+    """#903: an ordinary idle eviction's stop no longer refuses a send (it was a 503 that the
     workbench resent 3 s later, so B, sent after A, ran first). A, sent while the stop runs, and B, sent after it,
     are both taken; A waits accepted only until the stop ends, starts no client beside the old CLI, and the replies
     come back in send order."""
@@ -1008,7 +1015,7 @@ def test_messages_sent_while_an_idle_eviction_stops_are_taken_and_answered_in_se
 
 def test_a_conversation_continuing_its_own_kept_sdk_is_not_held_by_another_conversations_stop(local_env, monkeypatch,
                                                                                              tmp_path):
-    """Review P3 (round 6) on #903: while conversation X's evicted SDK still stops, conversation Y continues on its own
+    """#903: while conversation X's evicted SDK still stops, conversation Y continues on its own
     live kept SDK and starts no client, so it neither waits for nor is refused by X's stop."""
     sdk, hold, release, _ = _held_stops(monkeypatch)
     executor, runtime = offline_runtime(tmp_path)
@@ -1025,7 +1032,7 @@ def test_a_conversation_continuing_its_own_kept_sdk_is_not_held_by_another_conve
 
 
 def test_a_cold_turn_that_evicts_another_conversations_idle_sdk_starts_at_once(local_env, monkeypatch, tmp_path):
-    """Review P2 (round 7) on #903: with the pool full, a new conversation's turn evicts another conversation's idle
+    """#903: with the pool full, a new conversation's turn evicts another conversation's idle
     kept SDK in continue_live. That stop shares nothing with the new client (ADR-0005 keeps two CLIs alive), so the
     turn starts and completes while the evicted CLI is still stopping, with no wait."""
     sdk, hold, release, alive_at_start = _held_stops(monkeypatch)
@@ -1043,8 +1050,8 @@ def test_a_cold_turn_that_evicts_another_conversations_idle_sdk_starts_at_once(l
 
 def test_a_cold_turn_whose_eviction_leaves_an_unkillable_cli_finishes_once_before_the_recovery_restart(
         local_env, monkeypatch, tmp_path):
-    """Review P3 (round 6) / P2 (round 9) on #903, in the real order: a new conversation's turn B evicts conversation
-    A's idle kept SDK in continue_live. settle does not wait for another conversation's stop (round 7), so B's client
+    """#903, in the real order: a new conversation's turn B evicts conversation
+    A's idle kept SDK in continue_live. settle does not wait for another conversation's stop, so B's client
     starts while A's stop still runs; only then is A's CLI found to survive stop, force_stop and FA's own kill, and
     registered. The recovery restart it asks for waits for B, which is in flight: B finishes and is saved once (never
     cut, so never re-run as a continuation), and then the restart is requested once. The recovery here does what the
@@ -1099,9 +1106,9 @@ def test_a_cold_turn_whose_eviction_leaves_an_unkillable_cli_finishes_once_befor
 
 
 def test_a_recovery_restart_sends_sigterm_only_after_another_started_turn_finishes(monkeypatch, caplog):
-    """Review P1 (round 10) on #903: a CLI registered from outside a started turn asks for the recovery restart only
+    """#903: a CLI registered from outside a started turn asks for the recovery restart only
     after that turn's execution ends, however long it runs (a cut turn would re-run as a continuation); with no turn
-    in flight it asks at once. Round 11: one registered from the turn itself returns at once (the turn never waits
+    in flight it asks at once. One registered from the turn itself returns at once (the turn never waits
     for itself) and asks once that turn's own execution ended, or not at all when the CLI exited meanwhile."""
     from shared_context import native_turns
 
@@ -1154,7 +1161,7 @@ def test_a_recovery_restart_sends_sigterm_only_after_another_started_turn_finish
 
 
 def test_a_vm_serving_many_conversations_keeps_their_sdk_session_ids_only_while_needed():
-    """Review P3 (round 9) on #903: a conversation's SDK session ID is kept while its holder or a stop of its SDK is,
+    """#903: a conversation's SDK session ID is kept while its holder or a stop of its SDK is,
     so 1000 conversations leave only those, and an evicted conversation whose stop still runs is still found."""
     from shared_context.native_resident import NativeResidentPool
 

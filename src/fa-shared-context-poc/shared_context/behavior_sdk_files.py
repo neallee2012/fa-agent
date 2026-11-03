@@ -369,7 +369,7 @@ class SdkSessionFiles(SessionFsProvider):
         return not name or name in self.files or name in self.directories
 
     async def stat(self, path):
-        # Runtime 1.0.83 stats the saved cwd before applying resume's override.
+        # Observed on runtime 1.0.83: it stats the saved cwd before applying resume's override.
         # This alias supplies virtual directory metadata, never host filesystem access.
         if (isinstance(path, str) and not ("/" in path and "\\" in path)
                 and path.replace("\\", "/") == self._workspace_stat_alias):

@@ -20,8 +20,7 @@
   "compatibility_gate_armed": true,
   "assistant_environment": {
     "BEHAVIOR_ASSISTANT_PROFILE": "assistant-v1.2",
-    "BEHAVIOR_ASSISTANT_RUNTIME_PATH": "/opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime",
-    "FA_NATIVE_TURNS": "foundry-native-v1",
+    "FA_NATIVE_TURNS": "foundry-native-v3",
     "FA_PRIVATE_MEMORY_STORE": "poc-team-memory",
     "FA_TEAM_MEMORY_ENABLED": "1",
     "TZ": "Asia/Taipei"
@@ -103,7 +102,7 @@
     "FA_CAPABILITY_TOOLBOX_ENTRIES": "WebIQ",
     "FA_DELIVERY_PENDING_INDEX_WRITER": "true",
     "FA_WORK_REGISTRY_WRITER": "true",
-    "FA_NATIVE_TURNS": "foundry-native-v1",
+    "FA_NATIVE_TURNS": "foundry-native-v2",
     "FA_NATIVE_HITL_ENABLED": "1",
     "FA_NATIVE_HITL_TTL_SECONDS": "600",
     "FA_NATIVE_GROUPS_ENABLED": "1",

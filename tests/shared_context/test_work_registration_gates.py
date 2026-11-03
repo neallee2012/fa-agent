@@ -26,16 +26,16 @@ from shared_context.behavior_routine_wire import RoutineOccurrence
 from shared_context.behavior_runtime import runtime_key
 from shared_context.behavior_work_policy import WorkRegistration, derive_work, work_policy_key
 from shared_context.errors import Problem
-from test_agent_message_api import message_turn  # noqa: F401
-from test_agent_runtime import peer_runtime  # noqa: F401
-from test_agent_runtime_routing import routing_peer  # noqa: F401
-from test_behavior_assistant import assistant  # noqa: F401
-from test_behavior_store import store  # noqa: F401
+from test_agent_message_api import message_turn
+from test_agent_runtime import peer_runtime
+from test_agent_runtime_routing import routing_peer
+from test_behavior_assistant import assistant
+from test_behavior_store import store
 from test_conversation_profile_selection import template
-from test_conversation_transfer_startup import SyntheticSessionClient, saved_turn, synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models, runtime_path, sdk_io  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
-from test_routine_producer import routine_owner  # noqa: F401
+from test_conversation_transfer_startup import SyntheticSessionClient, saved_turn, synthetic_standing_v1
+from test_instruction_flow import instruction_models, runtime_path, sdk_io
+from test_m3_auth import jwk_client, signing_key
+from test_routine_producer import routine_owner
 from test_work_result_access import DIGEST, Reads
 
 ADMISSION_CONFLICT = (412, "BEHAVIOR_CONFLICT")
@@ -65,7 +65,7 @@ def bypass_peer_check(monkeypatch, root=None):
 
 
 @pytest.fixture
-def structured(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def structured(synthetic_standing_v1, monkeypatch):
     # The reviewed source fact belongs to `source_ready`; these cases are about what follows it.
     c = synthetic_standing_v1
     monkeypatch.setattr(c.control, "source_ready", lambda principal, policy: None)
@@ -73,21 +73,21 @@ def structured(synthetic_standing_v1, monkeypatch):  # noqa: F811
 
 
 @pytest.mark.parametrize("command", [instruction("routine-source"), AssistantSubmit(request_id="routine-source")])
-def test_a_routine_needs_a_typed_occurrence(synthetic_standing_v1, command):  # noqa: F811
+def test_a_routine_needs_a_typed_occurrence(synthetic_standing_v1, command):
     c = synthetic_standing_v1
     assert code(c.control.register, c.human, command.request_id, sha(command),
                 instruction=command if type(command) is InstructionSubmit else None, routine="an-occurrence")[:2] == (
         403, "ROUTINE_SOURCE_CHANGED")
 
 
-def test_a_routine_needs_an_instruction(synthetic_standing_v1):  # noqa: F811
+def test_a_routine_needs_an_instruction(synthetic_standing_v1):
     c = synthetic_standing_v1
     occurrence = RoutineOccurrence.model_construct()
     assert code(c.control.register, c.human, "routine-source", DIGEST, routine=occurrence)[:2] == (
         403, "ROUTINE_SOURCE_CHANGED")
 
 
-def test_a_routine_cannot_be_peer_work(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_a_routine_cannot_be_peer_work(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     bypass_peer_check(monkeypatch)
     command = instruction("routine-peer")
@@ -96,7 +96,7 @@ def test_a_routine_cannot_be_peer_work(synthetic_standing_v1, monkeypatch):  # n
 
 
 @pytest.fixture
-def admitted(synthetic_standing_v1):  # noqa: F811
+def admitted(synthetic_standing_v1):
     c = synthetic_standing_v1
     command = instruction("registered-once")
     c.record = register(c, command)
@@ -163,7 +163,7 @@ def vm_of(c, hosted_session_id="server-agent-session", hosted_agent_version="41"
                           hosted_session_id=hosted_session_id, hosted_agent_version=hosted_agent_version)
 
 
-def test_a_replay_without_a_vm_still_returns_the_turn_saved_on_one(synthetic_standing_v1):  # noqa: F811
+def test_a_replay_without_a_vm_still_returns_the_turn_saved_on_one(synthetic_standing_v1):
     c = synthetic_standing_v1
     command = instruction("a-turn-on-a-vm")
     saved = register(c, command, agent_vm=vm_of(c))
@@ -179,7 +179,7 @@ def test_a_structured_replay_has_no_peer_source(structured, monkeypatch):
                 instruction=None)[:2] == (409, "AGENT_MESSAGE_ASSIGNMENT_DENIED")
 
 
-def test_an_instruction_must_be_the_typed_original(synthetic_standing_v1):  # noqa: F811
+def test_an_instruction_must_be_the_typed_original(synthetic_standing_v1):
     c = synthetic_standing_v1
     command = instruction("the-original")
     assert code(c.control.register, c.human, "another-request", sha(command), instruction=command)[:2] == (
@@ -188,7 +188,7 @@ def test_an_instruction_must_be_the_typed_original(synthetic_standing_v1):  # no
         422, "WORK_POLICY_COMMAND")
 
 
-def test_a_mismatched_instruction_stops_before_any_conversation_read(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_a_mismatched_instruction_stops_before_any_conversation_read(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     monkeypatch.setattr(behavior_instruction, "instruction_state", lambda *a, **k: pytest.fail("read a conversation"))
     command = instruction("the-original")
@@ -196,13 +196,13 @@ def test_a_mismatched_instruction_stops_before_any_conversation_read(synthetic_s
         422, "WORK_POLICY_COMMAND")
 
 
-def test_images_are_refused_here_and_never_dropped(synthetic_standing_v1):  # noqa: F811
+def test_images_are_refused_here_and_never_dropped(synthetic_standing_v1):
     c = synthetic_standing_v1
     command = instruction("with-images").model_copy(update={"images": ("an-image",)})
     assert code(register, c, command) == (422, "WORK_POLICY_COMMAND", "attached images need a native Agent turn")
 
 
-def test_a_new_conversation_refuses_a_profile_head_that_moved(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_a_new_conversation_refuses_a_profile_head_that_moved(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     policy = c.control.policy
     head = SimpleNamespace(payload={"data": ConversationProfileHead(selection_id="a-new-selection").model_dump(mode="json")})
@@ -213,7 +213,7 @@ def test_a_new_conversation_refuses_a_profile_head_that_moved(synthetic_standing
         409, "PROFILE_SELECTION_CONFLICT", "the new-conversation profile changed during admission")
 
 
-def test_capabilities_only_come_from_a_human_selection(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_capabilities_only_come_from_a_human_selection(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     installed = c.control.installed
     grants = (available_grants(None, ("fa-agent-collaboration-v1",))["fa-agent-collaboration-v1"].ref,)
@@ -228,7 +228,7 @@ def test_capabilities_only_come_from_a_human_selection(synthetic_standing_v1, mo
 
 
 @pytest.fixture
-def continuing(synthetic_standing_v1):  # noqa: F811
+def continuing(synthetic_standing_v1):
     c = synthetic_standing_v1
     first = saved_turn(c, "first-turn")
     c.first = c.control.records[first.binding.binding_id]
@@ -284,17 +284,19 @@ def test_a_continuation_needs_a_session_that_is_still_active(continuing, monkeyp
 def test_a_continuation_on_a_vm_does_not_read_the_session(continuing, monkeypatch):
     c = continuing
     real = behavior_instruction.instruction_state
+    vms = []
 
     def on_a_vm(control, command, **kwargs):
         conversation, row = real(control, command, **kwargs)
-        vm = vm_of(c, conversation.hosted_session_id, conversation.hosted_agent_version)
-        return conversation.model_copy(update={"agent_vm": vm}), row
+        vms.append(vm_of(c, conversation.hosted_session_id, conversation.hosted_agent_version))
+        return conversation.model_copy(update={"agent_vm": vms[-1]}), row
     monkeypatch.setattr(behavior_instruction, "instruction_state", on_a_vm)
     monkeypatch.setattr(SyntheticSessionClient, "verify_session", lambda *a, **k: pytest.fail("read the VM session"))
-    assert register(c, c.next).agent_vm is not None
+    vm = register(c, c.next).agent_vm
+    assert vm == vms[-1] and vm.vm_generation == "generation-one"
 
 
-def test_a_continuation_refuses_a_current_selection_that_moved(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_a_continuation_refuses_a_current_selection_that_moved(synthetic_standing_v1, monkeypatch):
     from shared_context import behavior_profile_selection as selection
     c = synthetic_standing_v1
     grants = available_grants(None, ("fa-agent-collaboration-v1",))
@@ -335,7 +337,7 @@ def test_a_native_runtime_without_its_launch_authority_is_refused(structured):
     assert code(c.control.register, c.human, command.request_id, sha(command))[:2] == (403, "WORK_POLICY_NATIVE_DISABLED")
 
 
-def test_new_paid_work_needs_the_cost_decision_to_allow_it(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_new_paid_work_needs_the_cost_decision_to_allow_it(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     real = behavior_work_policy.cumulative_decision
 
@@ -347,7 +349,7 @@ def test_new_paid_work_needs_the_cost_decision_to_allow_it(synthetic_standing_v1
         403, "WORK_POLICY_CUMULATIVE_BUDGET_EXHAUSTED", "new paid work is not authorized")
 
 
-def test_a_structured_turn_needs_its_reviewed_source(synthetic_standing_v1):  # noqa: F811
+def test_a_structured_turn_needs_its_reviewed_source(synthetic_standing_v1):
     c = synthetic_standing_v1
     command = AssistantSubmit(request_id="no-reviewed-source")
     assert code(c.control.register, c.human, command.request_id, sha(command))[:2] == (409, "MEMORY_REQUIRED_FACT_MISSING")
@@ -371,7 +373,7 @@ def raced(monkeypatch, edit):
     return seen
 
 
-def test_a_first_turn_writes_and_reads_in_its_original_order(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_a_first_turn_writes_and_reads_in_its_original_order(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     seen = raced(monkeypatch, lambda rows: None)
     record = register(c, instruction("write-order"))
@@ -426,7 +428,7 @@ def test_a_continuation_conflicts_with_a_registry_that_moved(continuing, monkeyp
     assert code(register, c, c.next) == (*ADMISSION_CONFLICT, "the continuation registry changed before admission")
 
 
-def test_a_new_conversation_ignores_a_registry_that_moved(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_a_new_conversation_ignores_a_registry_that_moved(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     store, control = c.h.runtime.store, c.control
     head = registry.head_key(control.registry_key)
@@ -443,7 +445,7 @@ def test_a_new_conversation_ignores_a_registry_that_moved(synthetic_standing_v1,
     assert register(c, instruction("unrelated-registry-move")).profile.instruction.turn_number == 1
 
 
-def test_a_profile_head_that_moved_is_a_conflict(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_a_profile_head_that_moved_is_a_conflict(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     policy = c.control.policy
     key = head_key(policy.authority_domain, policy.agent_id)
@@ -455,7 +457,7 @@ def test_a_profile_head_that_moved_is_a_conflict(synthetic_standing_v1, monkeypa
         *ADMISSION_CONFLICT, "approved profile selection changed before admission")
 
 
-def test_a_memory_row_that_moved_is_a_conflict(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_a_memory_row_that_moved_is_a_conflict(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
 
     def edit(rows):
@@ -470,7 +472,7 @@ def existing_row(rows):
 
 
 @pytest.mark.parametrize("index", range(5))
-def test_a_row_this_registration_creates_must_not_exist(synthetic_standing_v1, monkeypatch, index):  # noqa: F811
+def test_a_row_this_registration_creates_must_not_exist(synthetic_standing_v1, monkeypatch, index):
     c = synthetic_standing_v1
     command = instruction("exact-new-rows")
     policy = c.control.policy
@@ -486,7 +488,7 @@ def test_a_row_this_registration_creates_must_not_exist(synthetic_standing_v1, m
     assert code(register, c, command) == (409, "WORK_POLICY_SCOPE_CHANGED", "exact new registration changed")
 
 
-def test_a_policy_that_changed_during_admission_is_refused(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_a_policy_that_changed_during_admission_is_refused(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     installed = c.control.installed
     calls = []
@@ -515,14 +517,14 @@ def test_structured_work_has_a_bounded_registry(structured, monkeypatch, count, 
         assert c.control.register(c.human, command.request_id, sha(command)).request_id == command.request_id
 
 
-def test_instructions_are_not_bound_by_the_structured_registry_limit(synthetic_standing_v1, monkeypatch):  # noqa: F811
+def test_instructions_are_not_bound_by_the_structured_registry_limit(synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     monkeypatch.setattr(registry, "count_registry", lambda store, policy, rows=None: 32)
     assert register(c, instruction("unbounded-instruction")).request_id == "unbounded-instruction"
 
 
 @pytest.fixture
-def peer_work(message_turn, monkeypatch):  # noqa: F811
+def peer_work(message_turn, monkeypatch):
     from shared_context.behavior_agent_message_api import _read_root
     m = message_turn
     sent = m.client.post(m.path, json=m.command, headers=m.headers)
@@ -619,7 +621,7 @@ def test_a_peer_registration_rechecks_its_parent_inside_the_transaction(peer_wor
     assert origins == [p.root.origin]
 
 
-def test_a_routine_is_checked_again_inside_the_transaction(routine_owner, monkeypatch):  # noqa: F811
+def test_a_routine_is_checked_again_inside_the_transaction(routine_owner, monkeypatch):
     from shared_context import behavior_routine
     c = routine_owner
     state = SimpleNamespace(inside=False, checks=[])

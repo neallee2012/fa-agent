@@ -103,7 +103,7 @@ class NativeUpgradeReconciler(NativeSessionPatrol):
                 counts["noted"] += 1
                 _LOG.warning("NATIVE_UPGRADE_WAITING_NOTED agent=%s target=%s", agent_id[:8], target)
                 return written
-        except Exception as error:  # noqa: BLE001 - the note is made again at the next pass; (a) and (b) go on
+        except Exception as error:  # the note is made again at the next pass; (a) and (b) go on
             _LOG.warning("NATIVE_UPGRADE_RECONCILER_NOTE_FAILED agent=%s code=%s", agent_id[:8], _code(error))
         return row
 
@@ -157,7 +157,7 @@ class NativeUpgradeReconciler(NativeSessionPatrol):
                     # (a). shortcut: ``cut`` carries a written decision out but makes none, so an unsupported row
                     # nobody decided yet comes back "unbound"; the coordinator keeps it that way until phase 4b.
                     kind = "incompatible"
-            except Exception as error:  # noqa: BLE001 - 5xx, timeout, a bad registration, an unread selector: next pass
+            except Exception as error:  # 5xx, timeout, a bad registration, an unread selector: next pass
                 counts["unread"] += 1
                 _LOG.warning("NATIVE_UPGRADE_RECONCILER_UNREAD agent=%s code=%s", agent_id[:8], _code(error))
                 continue

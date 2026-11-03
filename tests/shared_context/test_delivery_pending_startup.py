@@ -7,9 +7,9 @@ from shared_context.behavior_delivery_pending import (
     WRITER_ENV, PendingHead, PendingMember, PendingPage, head_key, member_key, page_key,
 )
 from shared_context.behavior_operations import control_key
-from test_conversation_transfer_startup import read_startup, saved_turn, synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_conversation_transfer_startup import read_startup, saved_turn, synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
 
 PENDING_KINDS = {"delivery_pending_head_v1", "delivery_pending_page_v1", "delivery_pending_member_v1"}
 

@@ -28,7 +28,7 @@ def test_fixed_sdk_note_and_cold_route_survive_same_source_observer_updates(assi
         destination = Path(os.environ["FA_MEMORY_OBSERVER_EVIDENCE_DIR"])
         destination.mkdir(parents=True, exist_ok=True)
         (destination / "native-observer-interleavings.json").write_text(json.dumps({
-            "scope": "One existing fixed SDK1.0.13/runtime1.0.83 local tool/cold-route case with real query reservation races",
+            "scope": "One existing fixed SDK1.0.26/runtime1.0.103 local tool/cold-route case with real query reservation races",
             "observations": observations[0], "generic_source_refusals": failures[0],
             "same_claim_review_manifest_and_originals": True, "completed_sdk_turns": 2,
             "offline_requests": 6, "paid_requests": 0, "cloud_requests": 0,

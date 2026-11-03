@@ -21,7 +21,9 @@ from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.errors import Problem
 from shared_context.source_materials import digest
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_approved_skill_api import post_skill
 from test_behavior_assistant import assistant
@@ -34,27 +36,19 @@ from test_skill_guidance_authority import (
     BODY, NAME, PROFILES, PURPOSE, approval_command, configure_guidance,
     configure_read_operation, load_guidance, operation_path, prepare_operation, protected_rows,
 )
-from test_skill_purpose import signed_m3
+from test_skill_purpose import deactivate
 from test_skill_purpose_api import add_purpose_skill
 
 
 def deactivate_original(h, signing_key, jwk_client, source):
-    http, agent, human = signed_m3(h.artifacts, signing_key, jwk_client)
-    path = "/teams/" + A.team + "/artifacts/" + NAME
-    try:
-        before = http.get(path, headers=human)
-        response = http.post(path + "/deactivations", headers={**human, "If-Match": before.headers["etag"]}, json={
-            "schema_version": "fa-skill-deactivation-v1", "decision_id": "d" * 32,
-            "version_id": source["version_id"], "sha256": source["sha256"],
-            "metadata_sha256": source["metadata_sha256"],
-        })
-        assert response.status_code == 200, response.text
-        assert response.json()["effective_version_id"] is None
-        assert response.json()["versions"] == before.json()["versions"]
-        assert http.get(path + "/effective", headers=agent).status_code == 404
-        return response.json()["deactivations"][0]
-    finally:
-        http.close()
+    before = h.artifacts.get(A, A.team, NAME)
+    saved = deactivate(h.artifacts, NAME, source).payload
+    assert saved["effective_version_id"] is None
+    assert saved["versions"] == before.payload["versions"]
+    with pytest.raises(Problem) as inactive:
+        h.artifacts.effective(A, A.team, NAME)
+    assert inactive.value.status == 404
+    return saved["deactivations"][0]
 
 
 @pytest.mark.parametrize("profile", PROFILES)
@@ -242,8 +236,8 @@ def test_fixed_sdk_deactivation_keeps_history_but_requires_a_new_approved_versio
             archives[archive_key] = h.store.read_snapshot((archive_key,))[archive_key]
             assert h.store.read_snapshot(tuple(archives)) == archives
     assert len(calls) == 6 and len(bridges) == 3 and len(receipts) == 1 and not forced
-    assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == "1.0.83" for bridge in bridges)
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert all(bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == RUNTIME_VERSION for bridge in bridges)
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     if os.environ.get("FA_SKILL_DEACTIVATION_EVIDENCE_DIR"):
         target = Path(os.environ["FA_SKILL_DEACTIVATION_EVIDENCE_DIR"])
         target.mkdir(parents=True, exist_ok=True)

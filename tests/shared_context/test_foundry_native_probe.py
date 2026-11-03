@@ -206,8 +206,8 @@ def test_write_uses_real_sdk_create_get_conditional_set_and_closes_clients(offli
     assert body["cross_version_verified"] is False
     assert [call[0] for call in offline.storage.calls] == ["GET", "POST", "GET", "POST", "GET", "PUT", "GET"]
     assert offline.storage.calls[5][3]["If-Match"] == body["created_etag"]
-    offline.managers[0].startup.assert_awaited_once()
-    offline.managers[0].shutdown.assert_awaited_once()
+    offline.managers[0].startup.assert_awaited_once_with()
+    offline.managers[0].shutdown.assert_awaited_once_with()
     assert len(offline.credentials) == 1 and offline.credentials[0].closed
     offline.runtime.start.assert_not_called()
 
@@ -349,6 +349,10 @@ def test_normal_invocation_uses_original_runtime_even_when_probe_is_available(of
         result = client.post("/invocations", headers=headers, json={"binding_id": "original", "launch_id": "launch"})
     assert result.status_code == 202 and result.json() == {"status": "accepted"}
     offline.runtime.start.assert_called_once()
+    invocation, *ids = offline.runtime.start.call_args.args
+    assert (invocation.binding_id, invocation.launch_id, invocation.launch_permit.get_secret_value()) == (
+        "original", "launch", "a" * 64)
+    assert ids == ["OFFLINE-invocation", "OFFLINE-session"]
     assert not offline.storage.calls and not offline.credentials
 
 
@@ -371,8 +375,8 @@ def test_sdk_startup_failure_cleans_manager_and_fails_host_lifespan(offline):
     with pytest.raises(RuntimeError, match="OFFLINE startup failed"):
         with TestClient(create_host(offline.runtime)):
             pytest.fail("host must not start without its requested manager")
-    offline.managers[0].startup.assert_awaited_once()
-    offline.managers[0].shutdown.assert_awaited_once()
+    offline.managers[0].startup.assert_awaited_once_with()
+    offline.managers[0].shutdown.assert_awaited_once_with()
     with pytest.raises(TaskManagerNotInitialized):
         get_task_manager()
     assert not offline.storage.calls

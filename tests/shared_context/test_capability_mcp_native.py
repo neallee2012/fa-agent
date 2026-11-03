@@ -1,4 +1,4 @@
-"""One pinned SDK 1.0.13 / runtime 1.0.83 run with an offline stdio MCP server and a scripted provider."""
+"""One pinned SDK 1.0.26 / runtime 1.0.103 run with an offline stdio MCP server and a scripted provider."""
 
 import asyncio
 import os

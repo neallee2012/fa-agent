@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "public_export"))
-from fingerprint import parse_fingerprint  # noqa: E402
+from fingerprint import parse_fingerprint
 
 RELEASE_FILE = "deploy/stage/release.json"
 LIVE_CHANGES = {"ADDED", "MODIFIED", "RENAMED", "COPIED", "CHANGED"}  # GraphQL PatchStatus minus DELETED

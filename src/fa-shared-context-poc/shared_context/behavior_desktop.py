@@ -288,8 +288,6 @@ class OwnedDesktop:
         self._halt = None
         self._browser = self._cdp = None
 
-    # Lifecycle -------------------------------------------------------------------------
-
     @_serialized
     def start(self):
         if self._started or self._closed:
@@ -436,8 +434,6 @@ class OwnedDesktop:
             raise Problem(422, "DESKTOP_INPUT", "pid must be a process identifier")
         self._owners[pid] = "adopted"
 
-    # Files -----------------------------------------------------------------------------
-
     @_serialized
     def open_file(self, name: str, *, create: bool = False) -> dict:
         self._require_active()
@@ -476,8 +472,6 @@ class OwnedDesktop:
         except UnicodeDecodeError as exc:
             raise Problem(422, "DESKTOP_FILE_ENCODING", "only UTF-8 text files can be read back") from exc
         return {"name": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "text": text}
-
-    # Pixels and input ------------------------------------------------------------------
 
     @_serialized
     def observe(self) -> dict:
@@ -519,8 +513,6 @@ class OwnedDesktop:
                 self._halt_with("no_progress")
                 observation["halted"] = dict(self._halt)
         return observation
-
-    # Internals -------------------------------------------------------------------------
 
     def _check_root(self, uid):
         try:

@@ -15,10 +15,12 @@ from .behavior_instruction_prompt import (
     V3_FORMS, V3_PURCHASES, V4_CLARIFY, V4_CURRENT_TOOLS, V4_FACT_SOURCES, V4_FORMS, V4_PURCHASES,
     assemble_instruction_prompt,
 )
-from .behavior_wire import Digest, WireModel
+from .behavior_wire import Digest, WireModel, exact_prefix, known_release
+from .native_responses_wire import SENT_RELEASE
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 # The text travels inside the task. Next to an up to 8 KiB user message, the worker dispatch-permission row stores
-# the task as base64 inside base64 material (~3.1 bytes per role byte) under the 48 KiB Table row limit.
+# the task as base64 inside base64 material (~3.1 bytes per role byte) under FA's 48 KiB ``MAX_PAYLOAD_BYTES``.
 ROLE_PROMPT_MAX_BYTES = 2048
 
 ROLE_PLATFORM_PROMPT = HISTORY_PROMPT.replace(
@@ -92,17 +94,14 @@ class RolePromptAssemblyRecord(WireModel):
     prefix_sha256: Digest
     prefix_utf8_bytes: Annotated[int, Field(gt=0)]
     prefix_tokens: None = None
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]
+    runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
+    _release = model_validator(mode="after")(known_release)
     omissions: tuple[str, ...] = _OMISSIONS
 
     @model_validator(mode="after")
     def exact(self):
-        raw = ROLE_FIXED_PROMPT.encode("utf-8")
-        if (self.prefix_sha256 != hashlib.sha256(raw).hexdigest()
-                or self.prefix_utf8_bytes != len(raw) or self.omissions != _OMISSIONS):
-            raise ValueError("Agent-role assembly differs from its fixed source")
-        return self
+        return exact_prefix(self, ROLE_FIXED_PROMPT, _OMISSIONS, "Agent-role assembly differs from its fixed source")
 
 
 @dataclass(frozen=True)
@@ -288,17 +287,15 @@ class RoleV2PromptAssemblyRecord(WireModel):
     prefix_sha256: Digest
     prefix_utf8_bytes: Annotated[int, Field(gt=0)]
     prefix_tokens: None = None
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]
+    runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
+    _release = model_validator(mode="after")(known_release)
     omissions: tuple[str, ...] = _V2_OMISSIONS
 
     @model_validator(mode="after")
     def exact(self):
-        raw = _SHARED_ROLE_PROMPTS[self.profile].encode("utf-8")
-        if (self.prefix_sha256 != hashlib.sha256(raw).hexdigest()
-                or self.prefix_utf8_bytes != len(raw) or self.omissions != _V2_OMISSIONS):
-            raise ValueError("Agent-role v2 assembly differs from its fixed source")
-        return self
+        return exact_prefix(
+            self, _SHARED_ROLE_PROMPTS[self.profile], _V2_OMISSIONS, "Agent-role v2 assembly differs from its fixed source")
 
 
 @dataclass(frozen=True)

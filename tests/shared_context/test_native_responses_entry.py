@@ -72,7 +72,7 @@ def test_responses_flag_alone_explicitly_refuses_the_missing_native_control_runt
 
 def test_both_flags_build_the_real_original_executor_and_one_runtime(assistant_environment, monkeypatch):
     monkeypatch.setenv("FA_RESPONSES_ENABLED", "1")
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     app = entry.create_assistant_host()
     assert isinstance(app, ResponsesAgentServerHost)
     assert len(assistant_environment) == 1
@@ -84,7 +84,7 @@ def test_both_flags_build_the_real_original_executor_and_one_runtime(assistant_e
 
 
 def test_responses_off_keeps_the_existing_invocations_entry(assistant_environment, monkeypatch):
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v1")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     app = entry.create_assistant_host()
     assert isinstance(app, InvocationAgentServerHost) and not isinstance(app, ResponsesAgentServerHost)
     assert assistant_environment == []

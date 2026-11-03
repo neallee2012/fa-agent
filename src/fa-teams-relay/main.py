@@ -94,7 +94,7 @@ async def acknowledge(api, turn, request_ids):
     try:
         await api.post({"chat_id": turn["chat_id"], "user_oid": turn["user_oid"], "request_ids": request_ids},
                        timeout=ACK_SECONDS, path=ACKS_PATH, ack=True)
-    except Exception:  # noqa: BLE001 - token or network: the text still goes to Teams, the records stay
+    except Exception:  # token or network: the text still goes to Teams, the records stay
         pass
 
 

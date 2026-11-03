@@ -22,7 +22,7 @@ from shared_context.native_turns import TURNS_STORE, NativeTurnRuntime, _changed
 from test_native_environment import invoke
 from test_native_session_bootstrap import prepare
 from test_native_turn_wire import submit
-from test_native_turns import IDENTITY, Harness, OfflineSdk, local_env  # noqa: F401 - fixture
+from test_native_turns import IDENTITY, Harness, OfflineSdk, local_env  # fixture
 
 HISTORY = 40
 V2 = IDENTITY.model_copy(update={"session_id": "offline-v2-session", "agent_version": "2"})
@@ -70,7 +70,7 @@ def reads(monkeypatch):
 
 
 @pytest.fixture
-def history(local_env, monkeypatch):  # noqa: F811
+def history(local_env, monkeypatch):
     """Version 1 with one real turn and ``HISTORY`` more finished receipts, plus one receipt a retired SID left
     accepted; no open-RID set (an image before it)."""
     sdk = OfflineSdk()
@@ -270,7 +270,7 @@ def test_the_removal_runs_beside_the_chain_and_shutdown_waits_for_it(history, mo
     assert set(_open_set(V2, monkeypatch).rids) == {"ghost-accepted"}
 
 
-def test_shutdown_drains_a_removal_a_turn_starts_while_the_executor_closes(local_env, monkeypatch):  # noqa: F811
+def test_shutdown_drains_a_removal_a_turn_starts_while_the_executor_closes(local_env, monkeypatch):
     """A turn the executor stops at shutdown ends after the first drain: its removal is drained too (bounded)."""
     sdk = OfflineSdk()
     runtime = _runtime(IDENTITY, monkeypatch, sdk)
@@ -363,7 +363,7 @@ def test_a_failed_add_keeps_the_admission_open_until_the_same_rid_records_it(his
     assert ready["state"] == "ready", ready
 
 
-def test_a_send_reads_the_set_with_its_first_reads_and_adds_with_one_cas(local_env, monkeypatch):  # noqa: F811
+def test_a_send_reads_the_set_with_its_first_reads_and_adds_with_one_cas(local_env, monkeypatch):
     """No extra send-path latency (Neal): the set is read together with the admission's other first reads, before the
     admission mark, so adding the RID beside the receipt create is one CAS and no read waits behind the mark."""
     sdk = OfflineSdk()
@@ -395,7 +395,7 @@ def test_a_send_reads_the_set_with_its_first_reads_and_adds_with_one_cas(local_e
     assert admission[0][0] < mark < admission[1][0]
 
 
-def test_an_unconfirmed_set_read_is_retried_like_an_unconfirmed_write(local_env, monkeypatch):  # noqa: F811
+def test_an_unconfirmed_set_read_is_retried_like_an_unconfirmed_write(local_env, monkeypatch):
     """A lost read (first or after a lost write) is read again within the bounded attempts, not the end of the update;
     when every read is lost the update ends as the 503 the best-effort callers already absorb."""
     sdk = OfflineSdk()

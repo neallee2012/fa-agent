@@ -15,6 +15,7 @@ from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_skill_prompt import SKILL_CAPABILITIES
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
@@ -90,7 +91,7 @@ def test_fixed_sdk_reads_an_omitted_authorized_name_under_the_description_budget
         assert h.runtime.controller.step(accepted["binding_id"]).state == "succeeded"
         assert len(calls) == 2 and len(bridges) == 1
         bridge = bridges[0]
-        assert bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == "1.0.83"
+        assert bridge._sdk_stop.graceful and bridge._sdk_stop.runtime_version == RUNTIME_VERSION
         archive = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
         assert tuple(entry.name for entry in archive.skill_catalog.entries) == NAMES
         events = events_from(bridge._session_files.snapshot().files)

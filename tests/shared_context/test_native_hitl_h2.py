@@ -31,6 +31,7 @@ from shared_context.native_hitl_wire import (
     NativeHitlReadback, NativeHitlReview, NativeHitlRule, NativeHitlRules, NativeHitlTurn,
 )
 from shared_context.native_turns import NativeTurnControl
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_instruction_tool_feedback import run_callbacks
 from test_m3_auth import jwk_client, signing_key
 from test_native_hitl import hitl, change, decision, error, fail_apply, inventory, post, proposal, read, create_pending
@@ -776,7 +777,7 @@ def test_both_native_lanes_use_one_original_executor_and_off_keeps_no_review(
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE H2 result",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

@@ -16,6 +16,7 @@ from shared_context.behavior_assistant_hosted import AssistantClient, AssistantS
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_text_files import UserFileRead, UserTextFile
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_behavior_assistant import assistant
 from test_conversation_routing import conversation_view
 from test_instruction_flow import instruction_models
@@ -110,7 +111,7 @@ def test_native_tool_reads_exact_past_file_after_compaction_without_promoting_fi
         assert h.runtime.controller.step(second["binding_id"]).state == "succeeded"
         assert [phase for phase, _ in requests] == ["normal", "compaction", "normal", "normal"]
         assert len(session_ids) == len(stops) == 2 and session_ids[0] == session_ids[1]
-        assert all(stop.graceful and stop.runtime_version == "1.0.83" for stop in stops)
+        assert all(stop.graceful and stop.runtime_version == RUNTIME_VERSION for stop in stops)
         projected = conversation_view(h, second)
         events = projected["turns"][-1]["progress"]["events"]
         starts = [event for event in events if event["kind"] == "tool_started" and event["tool_name"] == "read_user_file"]

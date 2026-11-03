@@ -23,6 +23,7 @@ from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_skill_prompt import SKILL_CAPABILITIES
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_approved_skill_api import BODY, add_skill, configured
 from test_behavior_assistant import assistant
@@ -89,7 +90,7 @@ def child_environment(root):
 class IsolationObservation:
     def __init__(self, root, *, denied_skill_probe=False):
         self.sdk_version = metadata.version("github-copilot-sdk")
-        require(self.sdk_version == "1.0.13", "SDK_VERSION_DIFFERS")
+        require(self.sdk_version == SDK_VERSION, "SDK_VERSION_DIFFERS")
         self.root, self.env = root, child_environment(root)
         self.phase = "witness"
         self.starts, self.stops, self.force_stops, self.sessions = [], [], [], []
@@ -200,7 +201,7 @@ class IsolationObservation:
                 started_clients[client] = process
                 self.starts.append({"phase": self.phase, "runtime_ordinal": len(self.starts) + 1, "pid": process.pid})
             status = await client.get_status()
-            require(status.version == "1.0.83", "RUNTIME_VERSION_DIFFERS")
+            require(status.version == RUNTIME_VERSION, "RUNTIME_VERSION_DIFFERS")
             return result
 
         async def stopped(client, *args, **kwargs):
@@ -289,7 +290,7 @@ class IsolationObservation:
             data = {
                 "status": status, "blocker": self.blocker if status == "BLOCKED" else None,
                 "diagnostic_hint": self.diagnostic_hint,
-                "sdk_version": self.sdk_version, "runtime_version": "1.0.83",
+                "sdk_version": self.sdk_version, "runtime_version": RUNTIME_VERSION,
                 "runtime_starts": self.starts, "runtime_stops": self.stops, "force_stops": self.force_stops,
                 "stop_without_runtime": self.stop_without_runtime,
                 "sessions": self.sessions, "requests": self.requests, "events": self.events,

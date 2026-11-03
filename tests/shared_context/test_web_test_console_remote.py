@@ -15,8 +15,8 @@ from web_test_console.adapter import ConsoleError
 from web_test_console.remote import (
     EasyAuthTokenProvider, LeasedArchive, RemoteBoundary, pack, unpack,
 )
-from test_m3_auth import jwk_client, signing_key  # noqa: F401 - fixtures used by real_interface
-from test_web_test_console_frozen_interface import real_interface  # noqa: F401
+from test_m3_auth import jwk_client, signing_key  # fixtures used by real_interface
+from test_web_test_console_frozen_interface import real_interface
 
 OWNER = "00000000-0000-0000-0000-00000000001b"
 ORIGIN = "https://ca-fa-console-stage.example.westus3.azurecontainerapps.io"

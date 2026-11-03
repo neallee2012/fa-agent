@@ -20,6 +20,7 @@ from shared_context.m2_copilot import run_copilot, ToolSpec, ToolOutput
 from shared_context.m3_models import BlobReceipt
 from shared_context.m3_store import _validate_upload, _match_receipt, _verify_content
 from shared_context.errors import Problem
+from shared_context.sdk_pin import RUNTIME_VERSION
 
 
 class LocalArtifactStore:
@@ -141,7 +142,7 @@ async def execute(root, phase, runtime):
         try:
             await client.start()
             status = await client.get_status()
-            assert status.version == "1.0.83"
+            assert status.version == RUNTIME_VERSION
             process = client._cli_process
             session = await client.resume_session(sid, continue_pending_work=False, model="gpt-4.1-mini",
                 available_tools=ToolSet().add_custom("read_context"), enable_config_discovery=False,
@@ -158,7 +159,7 @@ async def execute(root, phase, runtime):
                 await session.disconnect()
             await client.stop()
         result = {"final_message": "Native compaction completed", "sdk_stop":
-                  {"runtime_version": "1.0.83", "pid": process.pid, "exit_code": process.returncode, "graceful": True}}
+                  {"runtime_version": RUNTIME_VERSION, "pid": process.pid, "exit_code": process.returncode, "graceful": True}}
         native_compaction = [e.data.to_dict() for e in compaction]
     else:
         result = await run_copilot(state_dir=root / ("sdk-" + phase), working_directory=work, sdk_session_id=sid,

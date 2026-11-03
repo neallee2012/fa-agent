@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from shared_context.m2_copilot import ToolOutput, ToolSpec, run_copilot
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -50,11 +51,11 @@ SCHEMA = {
 def runtime_path():
     supplied = os.environ.get("M2_TEST_RUNTIME")
     path = Path(supplied) if supplied else (
-        ROOT / ".azure" / "m2-runtime-1.0.83" / "prebuilds" / "win32-x64"
+        ROOT / ".azure" / f"m2-runtime-{RUNTIME_VERSION}" / "prebuilds" / "win32-x64"
         / "copilot-runtime.exe"
     )
     if not path.is_file():
-        pytest.fail("Provision pinned runtime 1.0.83 and set M2_TEST_RUNTIME; no auto-download.")
+        pytest.fail(f"Provision pinned runtime {RUNTIME_VERSION} and set M2_TEST_RUNTIME; no auto-download.")
     return path
 
 
@@ -88,6 +89,8 @@ class ScriptedEndpoint:
         assert request.method == "POST"
         body = json.loads(request.content)
         assert body["model"] == self.expected_model
+        # Guard, not proof of the fix: a Chat Completions model has no verbosity, so the session's medium is not sent.
+        assert "verbosity" not in body and "text" not in body
         if not self.unbounded:
             assert body.get("max_tokens", body.get("max_completion_tokens")) == 1024
         self.requests.append(body)
@@ -186,7 +189,7 @@ def tool_call(name, arguments, call_id="call-screenshot"):
 
 
 def test_real_sdk_tool_image_and_rotating_tokens(workspace, runtime_path, monkeypatch):
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     for key in ("GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN"):
         monkeypatch.setenv(key, "poisoned-host-auth")
     for key in ("HTTP_PROXY", "HTTPS_PROXY"):

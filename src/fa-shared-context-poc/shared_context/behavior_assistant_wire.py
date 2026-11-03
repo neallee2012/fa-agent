@@ -8,7 +8,7 @@ from pydantic import Field, JsonValue, TypeAdapter, field_validator, model_valid
 
 from .behavior_wire import (
     AssistantExecutionResult, AssistantSdkStop, Command, Digest, ExactSourceRef, Identifier, ModelDeployment,
-    SdkStartBinding, SdkStartProfile, WireModel, WorkerProfile,
+    SdkStartBinding, SdkStartProfile, WireModel, WorkerProfile, known_release,
 )
 from .behavior_sdk_state import StoredSdkArchive, CheckpointProfile, ModelProvider, validate_provider_checkpoint
 from .behavior_skill_prompt import InstructionPromptProfile as PromptProfile, SKILL_PROFILES
@@ -26,6 +26,7 @@ from .behavior_capabilities import CAPABILITY_BASE_PROFILES, CapabilityCapture, 
 from .behavior_agent_role_prompt import RolePromptCapture, role_text_mismatch
 from .behavior_delegation_wire import DelegationModelRef
 from .behavior_agent_message_wire import AgentMessageRecipient
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion, RUNTIME_VERSION, SDK_VERSION
 
 PROFILE = "assistant-v1.2"
 CHECKS = ("answer_verified", "artifact_verified", "finish_verified")
@@ -349,8 +350,9 @@ class EffectResult(WireModel):
 
 
 class SdkArchive(WireModel):
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SDK_VERSION
+    runtime_version: KnownRuntimeVersion = RUNTIME_VERSION
+    _release = model_validator(mode="after")(known_release)
     sdk_session_id: Identifier
     codec: Literal["zlib-v1"] = "zlib-v1"
     data: Annotated[bytes, Field(min_length=1, max_length=16000)]

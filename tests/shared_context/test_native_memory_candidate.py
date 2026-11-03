@@ -22,6 +22,7 @@ from shared_context.m2_copilot import ToolFailure
 from shared_context.memory_candidate_wire import CandidateCommand, NativeCandidateView
 from shared_context.native_checkpoint import conversation_store_name, open_durable_store
 from shared_context.native_turns import NativeTurnRuntime
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_native_capabilities import selected_capture
 from test_native_turn_wire import agent_receive, receipt_for, submit
 from test_native_turns import Harness, IDENTITY, local_env
@@ -62,7 +63,7 @@ def run_turn(local_env, monkeypatch, tmp_path, calls, *, text=TEXT):
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n",
         })
         return {"final_message": "OFFLINE answer",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

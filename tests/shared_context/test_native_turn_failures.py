@@ -10,7 +10,7 @@ from azure.ai.agentserver.core.tasks import TaskContext
 from azure.core.exceptions import ServiceResponseError
 from starlette.testclient import TestClient
 
-from shared_context import native_continuations
+from shared_context import native_continuations, native_turns
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import NativeCancel, NativeRead
 from shared_context.errors import Problem
@@ -18,6 +18,7 @@ from shared_context.native_turns import NativePostTurnPending, NativeTaskInput, 
 from test_native_turn_wire import agent_receive, submit
 from test_native_turns import (
     Harness, IDENTITY, OfflineSdk, accept_without_chain, harness, local_env, native_retry_policy, seed_started,
+    task_context,
 )
 
 
@@ -176,7 +177,7 @@ def test_not_applied_cas_is_unknown_not_successful_pending_task(local_env, monke
         receipt = client.portal.call(after_chain)
         assert receipt.status == ("unknown" if transition == "started" else "completed")
         if transition == "started":
-            assert receipt.failure_code == "NATIVE_STATE_STORE_UNKNOWN"
+            assert receipt.failure_code == "NATIVE_TURN_NOT_STARTED"
             assert not sdk.calls
         else:
             assert receipt.result is not None and len(sdk.calls) == 1
@@ -185,6 +186,43 @@ def test_not_applied_cas_is_unknown_not_successful_pending_task(local_env, monke
         assert harness.call(runtime.read, "rid-1") == retained
         assert len(sdk.calls) == (0 if transition == "started" else 1)
         assert attempts == ([transition] if transition == "started" else [transition, transition])
+
+
+@pytest.mark.parametrize("writer", ["ours", "another-session"])
+def test_a_start_write_that_lands_after_its_unchanged_read_back_still_ends_resendable(harness, monkeypatch, writer):
+    # Nothing runs a started receipt whose own start was reported unwritten; keeping it would leave it started.
+    # Another session's started is kept: that session may be running it.
+    write, attempts, runs = FoundryStateStore.set_item, [], []
+
+    async def lands_late(store, key, value, **options):
+        status = value.get("receipt", {}).get("status") if key == "rid:rid-1" else None
+        if status == "started" and not attempts:
+            attempts.append((value, options))
+            raise PermissionError(13, "OFFLINE deterministic not-applied write")
+        if status == "unknown" and len(attempts) == 1:
+            late, late_options = attempts[0]
+            if writer == "another-session":
+                late = {**late, "run_token": "OFFLINE-other-session-run",
+                        "receipt": {**late["receipt"], "hosted_session_id": "OFFLINE-other-session"}}
+            attempts.append(await write(store, key, late, **late_options))
+        return await write(store, key, value, **options)
+
+    start = harness.runtime.chain.start
+
+    async def capture_run(**kwargs):
+        runs.append(await start(**kwargs))
+        return runs[-1]
+
+    monkeypatch.setattr(FoundryStateStore, "set_item", lands_late)
+    monkeypatch.setattr(harness.runtime.chain, "start", capture_run)
+    assert harness.invoke(submit()).status_code == 202
+    harness.call(runs[0].result)
+    stored = harness.call(harness.runtime._rid, "rid-1").value
+    if writer == "ours":
+        assert (stored.receipt.status, stored.receipt.failure_code) == ("unknown", "NATIVE_TURN_NOT_STARTED")
+    else:
+        assert (stored.receipt.status, stored.run_token) == ("started", "OFFLINE-other-session-run")
+    assert stored.receipt.turn_number is None and len(attempts) == 2 and not harness.sdk.calls
 
 
 @pytest.mark.parametrize("race", ["applied-ack-lost", "other-writer"])
@@ -268,8 +306,8 @@ def test_started_cas_lost_to_another_session_keeps_its_started_receipt_unrun(loc
 
 @pytest.mark.parametrize("original_status", ["accepted", "started"])
 @pytest.mark.parametrize("write_outcome", ["not-applied", "applied-ack-lost"])
-def test_unknown_write_is_confirmed_or_a_task_error_without_restart(
-        local_env, monkeypatch, original_status, write_outcome):
+def test_unknown_write_is_confirmed_or_a_task_error_after_core_retries_without_restart(
+        local_env, monkeypatch, native_retry_policy, original_status, write_outcome):
     from azure.ai.agentserver.core.tasks import TaskFailed
 
     write = FoundryStateStore.set_item
@@ -294,7 +332,8 @@ def test_unknown_write_is_confirmed_or_a_task_error_without_restart(
         raise OSError("OFFLINE SDK outcome unconfirmed")
 
     monkeypatch.setattr(FoundryStateStore, "set_item", failed_write)
-    runtime = NativeTurnRuntime(IDENTITY, sdk)
+    monkeypatch.setattr(native_turns, "OUTAGE_CLOSE_SECONDS", (0.01,) * 3)
+    runtime = NativeTurnRuntime(IDENTITY, sdk, delivery_retry=native_retry_policy)
     start = runtime.chain.start
 
     async def observed_start(**kwargs):
@@ -319,19 +358,23 @@ def test_unknown_write_is_confirmed_or_a_task_error_without_restart(
         if write_outcome == "applied-ack-lost":
             assert returned == receipt
             assert receipt.failure_code == (
-                "NATIVE_STATE_STORE_UNKNOWN" if original_status == "accepted" else "NATIVE_TURN_UNKNOWN")
+                "NATIVE_TURN_NOT_STARTED" if original_status == "accepted" else "NATIVE_TURN_UNKNOWN")
             assert harness.invoke(submit()).json() == receipt.model_dump(mode="json")
             assert harness.invoke(NativeCancel(
                 conversation_id=receipt.conversation_id, request_id="rid-1")).json() == receipt.model_dump(mode="json")
         assert len(runs) == 1
-        assert transitions == (["started", "unknown"] if original_status == "accepted"
-                               else ["started", "started", "unknown"])
+        # Not applied: every core attempt writes ``unknown`` again; a started RID's retry only re-enters it, and once
+        # core gives up its closer (#1146) tries once per post-turn attempt while the write still never applies.
+        client.portal.call(asyncio.gather, *runtime._outage_closes.values())
+        attempts = 1 if write_outcome == "applied-ack-lost" else native_retry_policy.max_attempts
+        closer = 3 if (original_status, write_outcome) == ("started", "not-applied") else 0
+        assert transitions == (["started", "unknown"] * attempts if original_status == "accepted"
+                               else ["started", "started", *["unknown"] * (attempts + closer)])
         assert sdk_calls == ([] if original_status == "accepted" else ["rid-1"])
 
 
-def test_applied_started_with_lost_ack_and_failed_readback_is_a_task_error(local_env, monkeypatch):
-    from azure.ai.agentserver.core.tasks import TaskFailed
-
+def test_applied_started_with_lost_ack_and_failed_readback_ends_not_started_on_retry(
+        local_env, monkeypatch, native_retry_policy):
     write, read = FoundryStateStore.set_item, FoundryStateStore.get_item
     transitions, runs = [], []
     fail_readback = False
@@ -356,7 +399,7 @@ def test_applied_started_with_lost_ack_and_failed_readback_is_a_task_error(local
     monkeypatch.setattr(FoundryStateStore, "set_item", lose_ack)
     monkeypatch.setattr(FoundryStateStore, "get_item", lose_readback)
     sdk = OfflineSdk()
-    runtime = NativeTurnRuntime(IDENTITY, sdk)
+    runtime = NativeTurnRuntime(IDENTITY, sdk, delivery_retry=native_retry_policy)
     start = runtime.chain.start
 
     async def observed_start(**kwargs):
@@ -368,13 +411,141 @@ def test_applied_started_with_lost_ack_and_failed_readback_is_a_task_error(local
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
         harness = Harness(runtime, sdk, client)
         assert harness.invoke(submit()).status_code == 202
-        with pytest.raises(TaskFailed):
-            client.portal.call(runs[0].result)
+        returned = client.portal.call(runs[0].result)
         receipt = harness.call(runtime.read, "rid-1")
-        assert receipt.status == "started" and receipt.result is None
+        assert returned == receipt and receipt.result is None
+        assert (receipt.status, receipt.failure_code) == ("unknown", "NATIVE_TURN_NOT_STARTED")
         assert harness.invoke(NativeRead(request_id="rid-1")).json() == receipt.model_dump(mode="json")
-        assert transitions == ["started"] and len(runs) == 1
+        assert transitions == ["started", "unknown"] and len(runs) == 1
         assert not sdk.calls
+
+
+def test_a_store_outage_between_the_start_and_the_sdk_ends_a_follow_up_resendable(harness, monkeypatch):
+    runtime = harness.runtime
+    assert harness.invoke(submit()).status_code == 202
+    cid = harness.wait("rid-1", "completed").conversation_id
+    down, raised = {"on": False}, []
+
+    def failing(name):
+        original = getattr(FoundryStateStore, name)
+
+        async def call(self, *args, **kwargs):
+            if down["on"]:
+                raise ServiceResponseError("OFFLINE State store outage")
+            return await original(self, *args, **kwargs)
+
+        monkeypatch.setattr(FoundryStateStore, name, call)
+
+    for name in ("get_item", "set_item", "create_item"):
+        failing(name)
+    allocate, handle = runtime._allocate_timed, runtime.handle_turn
+
+    async def outage_from_here(original):
+        down["on"] = not raised
+        return await allocate(original)
+
+    async def heal_after_the_first_failure(ctx):
+        try:
+            return await handle(ctx)
+        except NativePostTurnPending:
+            raised.append(ctx.retry_attempt)
+            down["on"] = False
+            raise
+
+    runtime._allocate_timed, runtime.handle_turn = outage_from_here, heal_after_the_first_failure
+    assert harness.invoke(submit("rid-2", cid, text="next")).status_code == 202
+    closed = harness.wait("rid-2", "unknown")
+    assert raised == [0] and (closed.turn_number, closed.failure_code) == (None, "NATIVE_TURN_NOT_STARTED")
+    assert len(harness.sdk.calls) == 1
+    assert harness.invoke(submit("rid-3", cid, text="again")).status_code == 202
+    assert harness.wait("rid-3", "completed").turn_number == 2 and len(harness.sdk.calls) == 2
+
+
+@pytest.mark.parametrize(("failure", "stopped_by", "code"), [
+    (Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "OFFLINE one unconfirmed store step"), None, "NATIVE_TURN_NOT_STARTED"),
+    (OSError("OFFLINE one transport failure"), None, "NATIVE_TURN_NOT_STARTED"),
+    (Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "OFFLINE one unconfirmed store step"), "receipt", "NATIVE_TURN_CANCELLED"),
+    (Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "OFFLINE one unconfirmed store step"), "core", "NATIVE_TURN_CANCELLED"),
+    (Problem(409, "NATIVE_CAPTURE_CHANGED", "OFFLINE a definite refusal"), None, "NATIVE_CAPTURE_CHANGED"),
+])
+def test_one_failed_step_before_the_sdk_ends_resendable_only_when_it_was_transient(harness, failure, stopped_by, code):
+    runtime, failed = harness.runtime, []
+    allocate = runtime._allocate_timed
+
+    async def fail_once(original):
+        if not failed:
+            failed.append(True)
+            if stopped_by == "receipt":
+                await runtime.cancel(NativeCancel(conversation_id=original.value.receipt.conversation_id,
+                                                  request_id="rid-1"))
+            elif stopped_by == "core":
+                runtime.running_controls["rid-1"].cancelled = True
+            raise failure
+        return await allocate(original)
+
+    runtime._allocate_timed = fail_once
+    assert harness.invoke(submit()).status_code == 202
+    closed = harness.wait("rid-1", "unknown")
+    assert (closed.turn_number, closed.failure_code) == (None, code) and not harness.sdk.calls
+
+
+def test_a_core_timeout_with_one_failed_step_before_the_sdk_still_says_resend(harness):
+    # The SDK never ran, so "resend" tells the user more than a timeout would.
+    runtime = harness.runtime
+    accepted = accept_without_chain(harness)
+    ctx = task_context(accepted)
+    allocate = runtime._allocate_timed
+
+    async def times_out_then_fails(original):
+        ctx.timeout_exceeded = True
+        runtime._allocate_timed = allocate
+        raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "OFFLINE one unconfirmed store step")
+
+    runtime._allocate_timed = times_out_then_fails
+    returned = harness.call(runtime.handle_turn, ctx)
+    assert (returned.status, returned.turn_number, returned.failure_code) == ("unknown", None, "NATIVE_TURN_NOT_STARTED")
+    assert not harness.sdk.calls
+
+
+def test_a_transient_failure_after_the_turn_was_numbered_still_says_the_sdk_may_have_run(harness):
+    runtime = harness.runtime
+
+    async def fails_inside_the_sdk(receipt, scope, previous, control):
+        raise OSError("OFFLINE transport failure during the SDK turn")
+
+    runtime.executor = fails_inside_the_sdk
+    assert harness.invoke(submit()).status_code == 202
+    closed = harness.wait("rid-1", "unknown")
+    assert (closed.turn_number, closed.failure_code) == (1, "NATIVE_TURN_UNKNOWN")
+
+
+@pytest.mark.parametrize(("entry_mode", "stopped_by", "code"), [
+    ("recovered", None, "NATIVE_TURN_NOT_STARTED"),
+    ("fresh", "receipt", "NATIVE_TURN_CANCELLED"),
+    ("fresh", "core", "NATIVE_TURN_CANCELLED"),
+])
+def test_a_started_receipt_never_numbered_ends_without_running_on_reentry(harness, entry_mode, stopped_by, code):
+    accepted, started = seed_started(harness)
+    if stopped_by == "receipt":
+        stopped = _changed(started.value, receipt=_changed(started.value.receipt, cancel_requested=True))
+        _, saved = harness.call(harness.runtime._cas, started, stopped)
+        assert saved
+    ctx = task_context(accepted, entry_mode=entry_mode)
+    ctx.cancel_requested = stopped_by == "core"
+    returned = harness.call(harness.runtime.handle_turn, ctx)
+    assert (returned.status, returned.turn_number, returned.failure_code) == ("unknown", None, code)
+    assert not harness.sdk.calls
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_a_not_started_close_merged_onto_a_numbered_receipt_says_it_may_have_run(harness, cancelled):
+    _, started = seed_started(harness)
+    numbered = _changed(started.value, receipt=_changed(
+        started.value.receipt, turn_number=1, cancel_requested=cancelled))
+    _, saved = harness.call(harness.runtime._cas, started, numbered)
+    assert saved
+    closed = harness.call(harness.runtime._unknown, started, "NATIVE_TURN_NOT_STARTED")
+    assert (closed.status, closed.turn_number, closed.failure_code) == ("unknown", 1, "NATIVE_TURN_UNKNOWN")
 
 
 # The enqueue task (``fa-native-agent-enqueue-v1``) puts an accepted input on the Agent chain once the chain has room;

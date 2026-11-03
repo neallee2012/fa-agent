@@ -33,6 +33,7 @@ from .behavior_sdk_state import (
     AUTO_PROFILE, NativeCheckpointSource, NativeCheckpointTurn, NativeCompactionExecution, SdkState,
 )
 from .errors import Problem
+from .sdk_pin import KNOWN_RELEASES
 
 SEGMENT_KIND = "fa-native-checkpoint-segment-v1"
 # Segment (and result part) writes and reads in flight at once; keys are content-addressed, so order does not matter.
@@ -132,6 +133,7 @@ def _state_from(raw: bytes, ref: NativeCheckpointRef) -> SdkState:
     try:
         state = SdkState.model_validate_json(raw)
         if (state.encoded() != raw or state.sdk_session_id != ref.sdk_session_id
+                or (state.sdk_version, state.runtime_version) != (ref.sdk_version, ref.runtime_version)
                 or state.model_provider != ref.model_provider or NATIVE_CODECS.get(state.codec) != ref.codec):
             raise ValueError()
     except ValueError:
@@ -252,7 +254,7 @@ def _require_profile(ref, profile):
 
 def _reference(ref):
     if (ref.codec not in NATIVE_CODECS.values()
-            or ref.sdk_version != "1.0.13" or ref.runtime_version != "1.0.83"):
+            or (ref.sdk_version, ref.runtime_version) not in KNOWN_RELEASES):
         raise Problem(409, "SDK_STATE_UNSUPPORTED_FORMAT", "the native checkpoint format or version is unsupported")
     try:
         return NativeCheckpointRef.model_validate_json(ref.model_dump_json())
@@ -315,6 +317,7 @@ async def save_checkpoint(store, scope: NativeCheckpointScope, state: SdkState, 
     raw = state.encoded()
     chunks = _chunks(raw)
     ref = NativeCheckpointRef(
+        sdk_version=state.sdk_version, runtime_version=state.runtime_version,
         codec=NATIVE_CODECS[state.codec], model_provider=state.model_provider, agent_id=scope.agent_id,
         conversation_id=scope.conversation_id, sdk_session_id=scope.sdk_session_id,
         sha256=hashlib.sha256(raw).hexdigest(), byte_length=len(raw), segments=len(chunks),

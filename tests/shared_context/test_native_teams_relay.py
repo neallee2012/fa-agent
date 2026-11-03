@@ -17,11 +17,11 @@ from shared_context.native_teams_relay import (
     ACKS_PATH, AGENTS_ENV, DECISIONS_PATH, ENABLED_ENV, PATH, install_teams_relay_routes,
 )
 from test_m3_auth import token
-from test_native_responses_api import responses_api  # noqa: F401
-from test_native_turn_api import native_api  # noqa: F401
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_native_responses_api import responses_api
+from test_native_turn_api import native_api
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
 
 RELAY = "0e0e0e0e-0000-4000-8000-000000000001"
 STRANGER = "0e0e0e0e-0000-4000-8000-000000000002"
@@ -399,7 +399,7 @@ def test_a_message_while_the_selected_version_has_no_session_waits_and_is_sent_w
     waiting = relay.post()
     assert followed == ["42"]
     # The receipt read and the submit both invoke nothing; the relay's next poll sends the same RID again. Nothing
-    # ran, so the relay never counts this as running: on every poll for 110 s it ends unconfirmed (#903 round 9).
+    # ran, so the relay never counts this as running: on every poll for 110 s it ends unconfirmed (#903).
     assert waiting.status_code == 200, waiting.text
     assert waiting.json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。", "not_dispatched": True}
     assert [call for call in env.calls[before:] if call.url.path.endswith("/invocations")] == []
@@ -445,7 +445,7 @@ def test_a_message_whose_rid_is_missing_and_whose_send_was_not_dispatched_is_nev
 
     monkeypatch.setattr(NativeTurnGateway, "submit", refused_once)
     # NATIVE_RID_MISSING does not prove nonacceptance (an earlier poll's send may still be taken), so this never says
-    # to resend; the relay shows it unconfirmed if no later poll confirms the RID (#903 round 9).
+    # to resend; the relay shows it unconfirmed if no later poll confirms the RID (#903).
     assert relay.post().json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。", "not_dispatched": True}
     assert rid("act-1") not in relay.env.case.remote.records
     assert relay.post().json() == {"state": "running", "text": "這一輪還在跑，完成後結果在工作台。"}
@@ -717,7 +717,7 @@ def test_section_8_sentences_are_the_adr_literals_in_the_api_and_the_workbench()
 
 
 def test_a_submit_refused_while_an_earlier_sdk_runtime_exits_is_polled_again():
-    """#903 P2-2: the API's server_following 503 NATIVE_EXECUTION_UNAVAILABLE admitted nothing, so the relay answers
+    """#903: the API's server_following 503 NATIVE_EXECUTION_UNAVAILABLE admitted nothing, so the relay answers
     "running" and its next poll sends the same deterministic RID again."""
     from shared_context.behavior_native_turn_api import _BeforeAdmission
     from shared_context.native_teams_relay import TeamsRelay

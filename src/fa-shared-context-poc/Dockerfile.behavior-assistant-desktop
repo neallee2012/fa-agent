@@ -16,7 +16,7 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
 
 FROM python:3.11.14-slim-bookworm
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HOME=/home/session
-ENV COPILOT_CLI_EXTRACT_DIR=/opt/copilot/1.0.83
+ENV COPILOT_CLI_EXTRACT_DIR=/opt/copilot/1.0.103
 WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
@@ -32,14 +32,14 @@ RUN node /opt/fa-tools/playwright-mcp/node_modules/playwright-core/cli.js instal
 COPY requirements-hosted.txt .
 RUN pip install --no-cache-dir -r requirements-hosted.txt \
     && python -m copilot download-runtime \
-    && chmod -R a+rX /opt/copilot/1.0.83 \
-    && test -x /opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime \
+    && chmod -R a+rX /opt/copilot/1.0.103 \
+    && test -x /opt/copilot/1.0.103/prebuilds/linux-x64/copilot-runtime \
     && useradd --create-home --uid 10001 app \
     && install -d -m 0755 /home/session
 COPY shared_context ./shared_context
 COPY hosted_bootstrap.py behavior_server_main.py behavior_assistant_main.py runtime_probe.py ./
 ENV COPILOT_SKIP_CLI_DOWNLOAD=1
-ENV BEHAVIOR_ASSISTANT_RUNTIME_PATH=/opt/copilot/1.0.83/prebuilds/linux-x64/copilot-runtime
+ENV BEHAVIOR_ASSISTANT_RUNTIME_PATH=/opt/copilot/1.0.103/prebuilds/linux-x64/copilot-runtime
 USER 10001
 # fa-shell-v1 commands run as this UID: every code and tool path must stay read-only for it.
 RUN python -c "import os,sys; bad=[p for r in ('/app','/usr/local','/opt/copilot','/opt/fa-tools') for d,_,fs in os.walk(r) for p in (d,*(os.path.join(d,f) for f in fs)) if os.access(p,os.W_OK)]; sys.exit('writable by UID10001: '+' '.join(bad[:5]) if bad else 0)" \

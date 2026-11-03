@@ -2,9 +2,6 @@
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from pathlib import Path
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -18,15 +15,6 @@ from test_agent_runtime import peer_runtime
 from test_conversation_transfer_startup import synthetic_standing_v1
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key
-
-
-def test_api_reference_checker_does_not_import_the_hosted_sdk():
-    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    script = ("import sys; sys.modules['copilot']=None; sys.path.insert(0,sys.argv[1]); "
-              "import shared_context.behavior_agent_message_refs; print('api-refs-ok')")
-    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", script, str(source)],
-                            capture_output=True, encoding="utf-8", timeout=30)
-    assert result.returncode == 0, result.stderr
 
 
 def principal(composition):

@@ -12,13 +12,14 @@ from copilot.session import ModelCapabilitiesOverride, ModelLimitsOverride, Mode
 from copilot.tools import Tool, ToolResult
 
 from shared_context.behavior_delegation_wire import child_configuration
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_m2_copilot import runtime_path
 from test_skill_isolation_native import child_environment
 
 
 def test_zero_tool_child_cannot_execute_the_parents_effect_handler(tmp_path, runtime_path):
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     async def run():
         model, endpoint = "gpt-4.1-mini", "https://scripted.invalid/openai/v1/chat/completions"
         calls, effects, permissions, child_attempts = [], [], [], []
@@ -71,7 +72,7 @@ def test_zero_tool_child_cannot_execute_the_parents_effect_handler(tmp_path, run
         try:
             await client.start()
             owned = client._cli_process
-            assert (await client.get_status()).version == "1.0.83"
+            assert (await client.get_status()).version == RUNTIME_VERSION
             session = await client.create_session(model=model, streaming=True,
                 tools=[Tool(name="parent_effect", description="Only increments a synthetic in-memory counter.",
                     parameters={"type": "object", "properties": {"tag": {"type": "string"}},

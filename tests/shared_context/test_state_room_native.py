@@ -1,4 +1,4 @@
-"""Pinned SDK 1.0.13 / runtime 1.0.83: screenshots near the SDK state bound are refused before they run.
+"""Pinned SDK 1.0.26 / runtime 1.0.103: screenshots near the SDK state bound are refused before they run.
 
 The SDK keeps every screenshot's base64 in events.jsonl. Without the refusal, about 8 MiB of screenshots makes
 the SDK filesystem write fail: the turn's answer is lost and no checkpoint can be saved, so the conversation

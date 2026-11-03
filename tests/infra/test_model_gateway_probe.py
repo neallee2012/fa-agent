@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 PROBE_DIR = ROOT / "scripts" / "model-gateway-probe"
 sys.path.insert(0, str(PROBE_DIR))
 
-import mock_openai  # noqa: E402
-import probe  # noqa: E402
+import mock_openai
+import probe
 
 KEY = "local-test-key"
 

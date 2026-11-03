@@ -20,8 +20,9 @@ from .behavior_wire import Digest, Identifier, WireModel
 USER_IMAGE_ERRORS = frozenset({
     "NATIVE_IMAGE_INVALID", "NATIVE_IMAGE_MISSING", "NATIVE_IMAGE_STATE_FULL", "NATIVE_IMAGE_UNSUPPORTED"})
 EncodedPng = Annotated[str, Field(min_length=32, max_length=(MAX_IMAGE_BYTES + 2) // 3 * 4)]
-# Pinned runtime 1.0.83 re-encodes an image with a side over 2000 px, and the result can exceed the model gateway's
-# PNG bound, which would replace it with a placeholder; within this side the exact uploaded bytes reach the model.
+# Observed on runtime 1.0.83: it re-encodes an image with a side over 2000 px, and the result can exceed the model
+# gateway's PNG bound, which would replace it with a placeholder; within this side the exact uploaded bytes reach the
+# model.
 MAX_USER_IMAGE_SIDE = 2000
 
 

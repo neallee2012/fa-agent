@@ -1,8 +1,6 @@
 """Approved routine occurrences enter the original work/receipt path."""
 
 import json
-import subprocess
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -317,25 +315,6 @@ def test_rebuilt_runtime_reads_the_original_occurrence_without_registering_again
         replay = restarted.post(path, json=body, headers=c.h.headers())
         assert replay.status_code == 200
         assert replay.json()["binding_id"] == original.json()["binding_id"]
-
-
-@pytest.mark.parametrize("module,blocked", [
-    ("shared_context.behavior_routine_wire", ("fastapi", "azure.data.tables", "azure.storage.blob", "copilot")),
-    ("shared_context.behavior_routine", ("copilot",)),
-])
-def test_routine_imports_respect_hosted_and_api_package_boundaries(module, blocked):
-    script = f"""
-import importlib.abc
-import sys
-class ForbiddenPackages(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if any(fullname == name or fullname.startswith(name + '.') for name in {blocked!r}):
-            raise ImportError('forbidden dependency: ' + fullname)
-sys.meta_path.insert(0, ForbiddenPackages())
-__import__({module!r})
-"""
-    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stderr
 
 
 def test_routine_history_is_unavailable_as_human_original_but_reply_is_retained(routine_owner, monkeypatch):

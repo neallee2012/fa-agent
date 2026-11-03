@@ -20,7 +20,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
-from deployment_config import load_config, write_x as _write_x  # noqa: E402
+from deployment_config import load_config, write_x as _write_x
 
 DEFINITION = {
     "kind": "default", "chat_model": "gpt-4.1-mini", "embedding_model": "text-embedding-3-small",

@@ -17,11 +17,11 @@ from shared_context.errors import Problem
 from shared_context.native_binding import NativeBindingStore
 from shared_context.native_teams_relay import notice_text
 import test_native_abandon_source as abandon
-from test_native_abandon_source import binding_rows  # noqa: F401
+from test_native_abandon_source import binding_rows
 import test_native_crash_loop as crash_loop
 from test_native_crash_loop import veto
-from test_native_cut import cut, operations, ready, replace_retried, sessions, state  # noqa: F401
-from test_native_files_api import (  # noqa: F401
+from test_native_cut import cut, operations, ready, replace_retried, sessions, state
+from test_native_files_api import (
     file_api, file_loops, instruction_models, jwk_client, local_env, native_api, signing_key, synthetic_standing_v1,
 )
 
@@ -255,7 +255,7 @@ def test_an_image_that_refuses_every_conversation_its_scope_is_vetoed_and_never_
 
 
 def test_a_single_known_conversation_refused_by_scope_is_never_the_images_veto(file_api, monkeypatch):
-    """#912 review P3: right after an API restart the kept list holds one CID. Its refusal proves no image-wide scope
+    """#912: right after an API restart the kept list holds one CID. Its refusal proves no image-wide scope
     regression, so it stays ``health_unread`` (no failure, no veto) however often it repeats."""
     fixture = file_api
     reads = idle(fixture, monkeypatch, conversations=("conv-1",))

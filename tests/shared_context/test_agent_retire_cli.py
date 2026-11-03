@@ -17,15 +17,15 @@ from shared_context.behavior_agent_setup import FOUNDRY_USER, OPENAI_USER
 from shared_context.behavior_migration import MigrationStore, installed_origin
 from shared_context.behavior_team_registry import registered_agent_ids, retired_agent_ids
 from shared_context.errors import Problem
-from test_agent_onboarding import FakeFoundry as OnboardingFoundry, team  # noqa: F401  (fixture)
+from test_agent_onboarding import FakeFoundry as OnboardingFoundry, team  # fixture
 from test_agent_retire import NOW, _code
 from test_conversation_transfer_startup import read_startup
 from test_resident_worker_poc import outcome_of
-from test_behavior_server import workspace  # noqa: F401  (fixture)
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401  (fixture)
-from test_instruction_flow import instruction_models  # noqa: F401  (fixture)
-from test_m3_auth import jwk_client, signing_key  # noqa: F401  (fixtures)
-from test_team_agent_routing import register_more_agents, team_agent  # noqa: F401  (fixture)
+from test_behavior_server import workspace  # fixture
+from test_conversation_transfer_startup import synthetic_standing_v1  # fixture
+from test_instruction_flow import instruction_models  # fixture
+from test_m3_auth import jwk_client, signing_key  # fixture
+from test_team_agent_routing import register_more_agents, team_agent  # fixture
 from test_team_registry import AGENT_OID, OTHER_AGENT_OID
 
 SCOPE = ("/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-fa"
@@ -307,7 +307,7 @@ def test_a_stuck_registered_onboarding_is_retired_and_frees_its_pending_slot(tea
     with pytest.raises(Problem) as recent:  # its create was just claimed: it may still be finishing
         retire(composition, team.c.human, now=team.clock.wall, **kwargs)
     assert _code(recent) == (409, "AGENT_ONBOARDING_IN_PROGRESS") and store._guard() == guard
-    later = lambda: team.clock.wall() + timedelta(seconds=STUCK_ONBOARDING_SECONDS)  # noqa: E731
+    later = lambda: team.clock.wall() + timedelta(seconds=STUCK_ONBOARDING_SECONDS)
     assert preview(composition, agent_id, now=later)["stuck_onboarding"] == {
         "request_id": "onboard-one", "state": "registered"}
     assert store._guard() == guard
@@ -405,7 +405,7 @@ def test_the_stuck_hour_counts_from_entering_registered_not_from_the_create_clai
     with pytest.raises(Problem) as recent:  # its create claim is over an hour old, but it registered just now
         retire(composition, team.c.human, now=team.clock.wall, **kwargs)
     assert _code(recent) == (409, "AGENT_ONBOARDING_IN_PROGRESS") and store._guard() == guard
-    later = lambda: team.clock.wall() + timedelta(seconds=STUCK_ONBOARDING_SECONDS)  # noqa: E731
+    later = lambda: team.clock.wall() + timedelta(seconds=STUCK_ONBOARDING_SECONDS)
     assert retire(composition, team.c.human, now=later, **kwargs)["tombstone"]["outcome"] == "written"
     assert _pending(team) == []
 

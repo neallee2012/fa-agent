@@ -24,6 +24,7 @@ from shared_context.behavior_sdk_compaction import events_from
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy import work_policy_key
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
 from test_instruction_prompt import saved_turn, submit
@@ -203,7 +204,7 @@ def test_fixed_sdk_catalog_discloses_approved_purpose_then_reads_exact_body_acro
             assert bridge._sdk_stop.graceful
     assert prompts == list(texts) and len(calls) == 5 and not forced
     assert set(checkpoint_reads) == checkpoint_artifacts
-    assert importlib.metadata.version("github-copilot-sdk") == "1.0.13"
+    assert importlib.metadata.version("github-copilot-sdk") == SDK_VERSION
     projection = h.client.get("/work-policy/v1/conversations/" + conversation, headers=h.headers())
     assert projection.status_code == 200 and projection.json()["can_follow_up"]
     assert [turn["prompt_assembly"] for turn in projection.json()["turns"]] == [expected.record.model_dump(mode="json")] * 2
@@ -211,7 +212,7 @@ def test_fixed_sdk_catalog_discloses_approved_purpose_then_reads_exact_body_acro
         target = Path(os.environ["FA_SKILL_PURPOSE_EVIDENCE_DIR"])
         target.mkdir(parents=True, exist_ok=True)
         (target / "skill-purpose-native.json").write_text(json.dumps({
-            "profile": PROFILE, "sdk_version": "1.0.13", "runtime_version": "1.0.83",
+            "profile": PROFILE, "sdk_version": SDK_VERSION, "runtime_version": RUNTIME_VERSION,
             "prefix_sha256": PREFIX_SHA256, "prefix_utf8_bytes": PREFIX_BYTES,
             "metadata_sha256": [version["metadata_sha256"] for version in versions],
             "body_sha256": [version["sha256"] for version in versions],

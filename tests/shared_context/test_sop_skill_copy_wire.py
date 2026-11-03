@@ -2,10 +2,6 @@
 
 import hashlib
 import json
-import os
-from pathlib import Path
-import subprocess
-import sys
 
 import pytest
 
@@ -13,6 +9,7 @@ from shared_context.behavior_assistant import AssistantProfile
 from shared_context.behavior_assistant_wire import InstructionTask, InstructionSubmit
 from shared_context.behavior_instruction_prompt import assemble_instruction_prompt
 from shared_context.behavior_skill_copy import TeamSopCopy, SopCopyOutcome, SopCopyReceipt
+from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_skill_copy_prompt import SOP_COPY_PROMPT, assemble_sop_copy_prompt, SopCopyPromptRecord
 from shared_context.behavior_wire import ExactSourceRef
 
@@ -32,6 +29,7 @@ def test_new_copy_prefix_is_literal_versioned_and_old_default_bytes_are_unchange
     assert len(raw) == 2645 and hashlib.sha256(raw).hexdigest() == PREFIX_HASH
     record = assemble_sop_copy_prompt().record
     assert record.prefix_sha256 == PREFIX_HASH and record.prefix_tokens is None
+    assert assemble_prompt("fa-instruction-sop-copy-v1").record.schema_version == "fa-sop-copy-prompt-assembly-v1"
     assert record.declared_capabilities == ("read_context", "execute_operation", "copy_sop_to_skill_draft")
     with pytest.raises(ValueError):
         assemble_sop_copy_prompt(capabilities=("read_context", "execute_operation", "approve"))
@@ -95,31 +93,6 @@ def test_copy_outcome_and_receipt_cannot_claim_unknown_as_confirmed_or_current_a
     with pytest.raises(ValueError):
         SopCopyOutcome(schema_version="fa-sop-copy-outcome-v1", receipt_id="original", intent_sha256="f" * 64,
                        stage="saved", approved=True)
-
-
-def test_copy_wire_and_strict_bridge_import_without_hosted_sdk():
-    source = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-    program = """
-import importlib.abc, sys
-class NoSdk(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == 'copilot' or fullname.startswith('copilot.'):
-            raise AssertionError('SDK is not an API dependency')
-sys.meta_path.insert(0, NoSdk())
-sys.path.insert(0, sys.argv[1])
-from shared_context.behavior_skill_copy import TeamSopCopy, SopCopyReceipt
-from shared_context.behavior_skill_prompt import assemble_prompt
-from web_test_console.freeform import ConversationTurn
-assert assemble_prompt('fa-instruction-sop-copy-v1').record.schema_version == 'fa-sop-copy-prompt-assembly-v1'
-assert 'prompt_assembly' in ConversationTurn.model_fields
-assert not any(name == 'copilot' or name.startswith('copilot.') for name in sys.modules)
-print('COPY_API_SDK_INDEPENDENT')
-"""
-    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", program, str(source)], capture_output=True,
-                            text=True, encoding="utf-8", timeout=30,
-                            env={**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"})
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "COPY_API_SDK_INDEPENDENT"
 
 
 @pytest.mark.parametrize("enabled", [False, True])

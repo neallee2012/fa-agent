@@ -18,6 +18,8 @@ from shared_context.behavior_assistant_boundary import AssistantModelBoundary
 from shared_context.behavior_assistant_wire import Empty, InstructionContext, SkillName
 from shared_context.behavior_work_memory import WorkMemoryName
 from shared_context.m2_copilot import ToolFailure, ToolOutput, ToolSpec
+from shared_context.sdk_pin import RUNTIME_VERSION
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 
 def run_callbacks(
@@ -28,8 +30,9 @@ def run_callbacks(
     sid = "offline-instruction-feedback"
     client = create_autospec(CopilotClient, instance=True)
     client._cli_process = SimpleNamespace(pid=42, poll=lambda: 0, returncode=0)
-    client.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+    client.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
     session = create_autospec(CopilotSession, instance=True)
+    session.rpc = OFFLINE_SESSION_RPC
     session.session_id = sid
     session.get_events.return_value = []
 
@@ -68,8 +71,8 @@ def run_callbacks(
         instruction=instruction,
         **runner_options,
     ))
-    client.start.assert_awaited_once()
-    client.stop.assert_awaited_once()
+    client.start.assert_awaited_once_with()
+    client.stop.assert_awaited_once_with()
     return events
 
 

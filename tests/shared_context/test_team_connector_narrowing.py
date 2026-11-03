@@ -23,9 +23,9 @@ from shared_context.team_connector_wire import (
 )
 from shared_context.team_mcp_wire import TeamMcpServer, toolbox_grant
 from test_agent_scope_registry import peer_policy
-from test_conversation_transfer_startup import synthetic_standing_v1  # noqa: F401
-from test_instruction_flow import instruction_models  # noqa: F401
-from test_m3_auth import jwk_client, signing_key  # noqa: F401
+from test_conversation_transfer_startup import synthetic_standing_v1
+from test_instruction_flow import instruction_models
+from test_m3_auth import jwk_client, signing_key
 
 ROUTE = "/work-policy/v1/agent-connectors"
 ON_V1 = {"connector-teams_read": "v1", "connector-teams_write": "v1"}

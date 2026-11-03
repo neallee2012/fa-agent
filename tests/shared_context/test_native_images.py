@@ -16,6 +16,7 @@ from shared_context import native_sdk
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import NativeSubmit
 from shared_context.native_turns import NativeTurnRuntime
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_assistant_images import png
 from test_m2_copilot import runtime_path
 from test_native_capabilities import selected_capture
@@ -55,7 +56,7 @@ def image_turn(monkeypatch, tmp_path, calls, *, parallel_tail=0):
             "events.jsonl": json.dumps({"type": "session.start", "data": {"sessionId": options["sdk_session_id"]}}) + "\n",
             "workspace.yaml": "id: " + options["sdk_session_id"] + "\n"})
         return {"final_message": "The original screenshot is saved for this conversation's owner.",
-                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"}}
+                "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION}}
 
     monkeypatch.setattr(native_sdk, "run_copilot", sdk)
     executor = native_sdk.NativeSdkExecutor(

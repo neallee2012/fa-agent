@@ -1,4 +1,4 @@
-"""B1 PA-11 on the pinned SDK 1.0.13 / runtime 1.0.83: ask_user reaches the turn's wait and its answer the model."""
+"""B1 PA-11 on the pinned SDK 1.0.26 / runtime 1.0.103: ask_user reaches the turn's wait and its answer the model."""
 
 import asyncio
 import json
@@ -10,7 +10,7 @@ from shared_context.behavior_assistant_boundary import AssistantModelBoundary
 from shared_context.behavior_sdk_files import SdkSessionFiles
 from shared_context.m2_copilot import run_copilot
 from test_instruction_responses_native import response_bytes
-from test_m2_copilot import ScriptedEndpoint, runtime_path, workspace  # noqa: F401
+from test_m2_copilot import ScriptedEndpoint, runtime_path, workspace
 
 QUESTION = {"question": "Which colour should the chart use?", "choices": ["red", "blue"]}
 

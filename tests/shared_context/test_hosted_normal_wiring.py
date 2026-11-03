@@ -16,6 +16,8 @@ from shared_context.behavior_assistant_hosted import AssistantSession
 from shared_context.behavior_assistant_wire import ContextResult, ToolReceipt
 from shared_context.behavior_wire import ExactSourceRef
 from shared_context.errors import Problem
+from shared_context.sdk_pin import RUNTIME_VERSION
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 
 @pytest.mark.parametrize("fault", ["none", "finish-error"])
@@ -57,11 +59,12 @@ def test_hosted_normal_tool_sequence_requires_finish_and_owned_sdk_stop(tmp_path
         stopped=lambda reason: stopped.append(reason),
     )
     sdk_session = create_autospec(CopilotSession, instance=True)
+    sdk_session.rpc = OFFLINE_SESSION_RPC
     sdk_session.session_id = sid
     sdk_session.get_events.return_value = []
     sdk = create_autospec(CopilotClient, instance=True)
     sdk._cli_process = SimpleNamespace(pid=999, poll=lambda: 0, returncode=0)
-    sdk.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+    sdk.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
     async def create(**options):
         tools = {tool.name: tool for tool in options["tools"]}
         assert tools["finish_task"].is_terminal
@@ -95,6 +98,6 @@ def test_hosted_normal_tool_sequence_requires_finish_and_owned_sdk_stop(tmp_path
         assert unknown.value.body["error"]["code"] == "ASSISTANT_SDK_UNKNOWN"
         assert not finished and stopped == ["sdk_failed"]
     assert methods == ["read_context", "save_result", "finish_task"]
-    sdk.stop.assert_awaited_once()
+    sdk.stop.assert_awaited_once_with()
     sdk.force_stop.assert_not_awaited()
     sdk.resume_session.assert_not_awaited()

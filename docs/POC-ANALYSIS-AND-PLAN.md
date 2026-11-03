@@ -50,10 +50,10 @@ Git發布不擴張雲端／模型／權限額度，不把新來源回讀機制�
 | 單一編輯者與發布 | owner／handoff 有正負向結果；發布後八種修改被拒。[ContextService](../src/fa-shared-context-poc/shared_context/service.py) 凍結整個 published work | 不再從零設計 owner／CAS；但目前沒有完整版本歷史，`publish` 是 agent 操作，不是人類批准 SOP／skills 的流程 |
 | 長期記憶 | Team `sepia`、私人 `indigo`、idle 期間 `coral` 偏好被找回；opaque verification-code 曾被抽取省略 | Memory 用於語意知識／偏好；精確值、批准、版本、hash 與工作進度仍由權威狀態保存，不能把更換 fixture 後的 PASS 當成無損記憶 |
 | 本輪 context | [assemble](../src/fa-shared-context-poc/shared_context/service.py) 取完整 work、goal 前 2048 字，依序搜尋 Team 與本人記憶；[adapter](../src/fa-shared-context-poc/shared_context/memory.py) 每次最多 10 筆 | 已有按需組裝的接線；10＋10 是筆數限制，不是 token 預算、相關性品質或效能驗收 |
-| 恢復 | [resume_gate](../scripts/validate-shared-hosted.py) 明確 stop A、讀回 idle、由 B 更新，再以同 session 呼叫 A；boot marker 改變後可重載狀態／偏好 | 外部狀態不依賴原程序是重要成果；沒有驗完整 SDK checkpoint、突然故障、自然 idle timeout、HOME 或 browser profile |
-| GUI | A 非 root、headed Chromium、OS 視窗聚焦／鍵盤輸入、截圖、下載及清理通過；[實作](../src/fa-shared-context-poc/shared_context/gui.py) 呼叫固定的 xdotool 序列，使用 ephemeral temporary directory | 已證明部分 OS UI 操作鏈，不是 SDK 自主看畫面／決策；本 gate 未驗滑鼠定位／點擊／拖曳、一般桌面應用或私人 profile 持久性 |
+| 恢復 | `resume_gate`（`scripts/validate-shared-hosted.py`，2026-11-03 已移除，見 `0330d456`） 明確 stop A、讀回 idle、由 B 更新，再以同 session 呼叫 A；boot marker 改變後可重載狀態／偏好 | 外部狀態不依賴原程序是重要成果；沒有驗完整 SDK checkpoint、突然故障、自然 idle timeout、HOME 或 browser profile |
+| GUI | A 非 root、headed Chromium、OS 視窗聚焦／鍵盤輸入、截圖、下載及清理通過；實作（`shared_context/gui.py`，2026-11-03 已移除，見 `0330d456`）呼叫固定的 xdotool 序列，使用 ephemeral temporary directory | 已證明部分 OS UI 操作鏈，不是 SDK 自主看畫面／決策；本 gate 未驗滑鼠定位／點擊／拖曳、一般桌面應用或私人 profile 持久性 |
 | 身份與原生存取 | API 驗 token／OID allowlist；跨 Team、私人 target／receipt 被拒；直接 Table／Memory 為 403 | 保留先授權再選 scope 的邊界；scope 不是 ACL，Storage 網路拒絕不能單獨證明 RBAC，靜態 A/B allowlist 不是完整組織治理 |
-| Session 控制 | service-name 模式曾增建額外 sessions；50 筆額外 active 被 stop。endpoint-only 回歸未新增記錄 | 修正方向保留；[Controller.invoke](../scripts/validate-shared-hosted.py) 的兩個明確 ID 不等於平台全量實際並行上限，後續須比對 inventory |
+| Session 控制 | service-name 模式曾增建額外 sessions；50 筆額外 active 被 stop。endpoint-only 回歸未新增記錄 | 修正方向保留；`Controller.invoke`（`scripts/validate-shared-hosted.py`，2026-11-03 已移除，見 `0330d456`） 的兩個明確 ID 不等於平台全量實際並行上限，後續須比對 inventory |
 | 真正的 AI 助理 | hosted_main.invoke 呼叫 HostedClient.dispatch（兩者已於 2026-10 移除），執行已指定的 API／GUI／runtime 探針 | A/B 尚不是由 Copilot SDK 自主推理、選工具、分工的助理；Memory 內部使用模型也不等於已接上 agent harness |
 | 檔案成果 | [models](../src/fa-shared-context-poc/shared_context/models.py) 只支援 tiny artifact text；Table 工作 JSON 上限 48 KiB | 不把這個 payload 擴充成任意文件庫；正式檔案傳遞、版本歷史、來源及發布要另定合約 |
 | 費用 | 最後成功的延遲讀值約 US$1.32；較新查詢為 HTTP429，總額及剩餘額未知 | US$100 符合性仍 UNKNOWN。18688 個已回報 tokens、session 記錄數及零 active 都不是帳單 |
@@ -138,7 +138,7 @@ A9沿用同一image，僅新增明確`PYTHONUTF8=1`設定；同設定deploy重�
 
 **最新自主UI已實際執行，但未通過。** A13能填字與開啟native file chooser，仍未完成正確欄位／選檔／下載；另一版面未跑，見[M2結果](M2-ASSISTANT-POC.md)。以下A5／M1內容保留為較早的底層能力證據。
 
-[原GUI摘要](POC-GATE-RESULTS.json)記載A5／UID10001、Xvfb／Openbox／headed Chromium通過。輸入由[desktop_smoke._send_gui_input](../src/fa-hosted-sandbox-poc/desktop_smoke.py)執行固定OS鍵盤步驟，前後PNG與下載由controller核對；不把它改寫成自主決策成功。
+[原GUI摘要](POC-GATE-RESULTS.json)記載A5／UID10001、Xvfb／Openbox／headed Chromium通過。輸入由`desktop_smoke._send_gui_input`（2026-11-03 已移除，見 `0330d456`）執行固定OS鍵盤步驟，前後PNG與下載由controller核對；不把它改寫成自主決策成功。
 
 原A5的PASS沒有涵蓋滑鼠定位／點擊／拖曳、一般桌面應用、模型辨識畫面並決定動作或持久profile。
 後續M1已在真正A8／B6／A9驗持久profile及固定OS輸入，保留14份PNG；它們仍是腳本探針，
@@ -387,6 +387,6 @@ Neal 要求把 README 刪掉的「目前還做不到的事」列入待辦、排�
 | [Memory 概念](https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/what-is-memory) | 語意抽取／合併、Preview、無 VNet integration；目前每 store 最多 100 scopes，4 active 不等於可建立無限私人 scopes |
 | [Copilot SDK](https://github.com/github/copilot-sdk)、[Azure MI 指引](https://github.com/github/copilot-sdk/blob/main/docs/setup/azure-managed-identity.md) | SDK 驅動 CLI agent runtime；有 bearer-token provider 接法，但需固定實際版本及驗證，此 POC 尚未整合 |
 | [VM 狀態與計費](https://learn.microsoft.com/en-us/azure/virtual-machines/states-billing) | 只用於歷史 controller 的費用判讀；deallocated 不代表磁碟／網路停止計費，不是新增 VM 的理由 |
-| [共享 Context 實作](../src/fa-shared-context-poc/README.md)、[controller](../tests/shared_controller/README.md) | 延續已存在的介面、錯誤、身份與測試邊界；不將探針當成完整產品 |
+| [共享 Context 實作](../src/fa-shared-context-poc/README.md)、controller（2026-11-03 已移除，見 `0330d456`） | 延續已存在的介面、錯誤、身份與測試邊界；不將探針當成完整產品 |
 
 官方文件於 2026-09-14 讀取。Memory 最新文件另列 item CRUD、TTL 與直接 remember／forget；本 POC 的 2.3.0 adapter 未覆蓋這些路徑。若後續需要，應另核對精確版本與權限，不以新功能宣告推翻既有 extraction 失敗，也不自動更新已固定依賴。

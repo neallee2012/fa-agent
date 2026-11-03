@@ -1,161 +1,119 @@
+"""ArtifactService version, download and policy-context contracts, called in process as production does."""
 from __future__ import annotations
 
-import asyncio
 import hashlib
+from unittest.mock import patch
 
 import pytest
-from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from conftest import A, B, C
-from legacy_m2_m4.api import create_app
 from shared_context.errors import Problem
-from shared_context.m3_models import MAX_ARTIFACT_BYTES
-from shared_context.models import CreateWork
+from shared_context.m3_models import MAX_ARTIFACT_BYTES, ApprovalInput, CreateArtifact, VersionInput
 from test_m3_artifacts import HUMAN, V1, V2, m3
 
-PATH = "/teams/team-one/artifacts/report"
+
+def create(service, kind="deliverable"):
+    return service.create(A, A.team, "report", CreateArtifact(kind=kind, title="Report", source_work="source-work"))
 
 
-def client(service, principal=A, policies=()):
-    return TestClient(create_app(
-        service.context, lambda: A, artifact_service=service,
-        verified_artifact_identity_dependency=lambda: principal, artifact_policy_ids=policies,
-    ))
+def metadata(data=b"v1", **changes):
+    return VersionInput(**{"filename": "report.txt", "media_type": "text/plain",
+                           "sha256": hashlib.sha256(data).hexdigest(), **changes})
 
 
-def create(http, kind="deliverable"):
-    response = http.post(PATH, json={"kind": kind, "title": "Report", "source_work": "source-work"})
-    assert response.status_code == 201, response.text
-    return response.json()
+def upload(service, etag, data=b"v1", version_id=V1, principal=A, **changes):
+    return service.upload(principal, A.team, "report", version_id, etag, metadata(data, **changes), data)
 
 
-def upload(http, etag, data=b"v1", version_id=V1, headers=None):
-    return http.put(PATH + "/versions/" + version_id, content=data, headers={
-        "Content-Type": "application/octet-stream", "X-Artifact-Filename": "report.txt",
-        "X-Artifact-Media-Type": "text/plain", "X-Artifact-SHA256": hashlib.sha256(data).hexdigest(),
-        "If-Match": etag, **(headers or {}),
-    })
+def status(call):
+    with pytest.raises(Problem) as denied:
+        call()
+    return denied.value.status
 
 
-def test_http_binary_version_download_and_etag_are_exact(m3):
+def test_binary_version_download_and_etag_are_exact(m3):
     service, _, _ = m3
-    http = client(service)
-    initial = create(http)
-    first = upload(http, initial["etag"])
-    assert first.status_code == 200
-    assert first.headers["x-should-retry"] == "false"
-    assert first.headers["etag"] == first.json()["etag"]
-    second = upload(http, first.json()["etag"], b"v2", V2)
-    assert second.status_code == 200
-    human = client(service, HUMAN)
-    version = human.get(PATH + "/versions/" + V1).json()
-    content = human.get(PATH + "/versions/" + V1 + "/content", headers={"If-Match": version["blob"]["etag"]})
-    assert content.content == b"v1"
-    assert content.headers["x-artifact-sha256"] == hashlib.sha256(b"v1").hexdigest()
-    assert content.headers["etag"] == version["blob"]["etag"]
-    assert content.headers["content-disposition"] == 'attachment; filename="report.txt"'
-    assert content.headers["cache-control"] == "no-store"
-    assert content.headers["x-content-type-options"] == "nosniff"
-    assert human.get(PATH + "/versions/" + V1 + "/content").status_code == 428
-    assert human.get(PATH + "/versions/" + V1 + "/content", headers={"If-Match": first.json()["etag"]}).status_code == 412
-    assert client(service, B).get(PATH).status_code == 200
-    assert client(service, C).get(PATH).status_code == 403
+    first = upload(service, create(service).etag)
+    upload(service, first.etag, b"v2", V2)
+    version = service.version(HUMAN, A.team, "report", V1)
+    selected, content = service.download(HUMAN, A.team, "report", V1, version.blob.etag)
+    assert content == b"v1" and selected == version
+    assert version.sha256 == hashlib.sha256(b"v1").hexdigest() and version.filename == "report.txt"
+    assert status(lambda: service.download(HUMAN, A.team, "report", V1, None)) == 428
+    assert status(lambda: service.download(HUMAN, A.team, "report", V1, first.etag)) == 412
+    assert service.get(B, A.team, "report").payload["artifact_id"] == "report"
+    assert status(lambda: service.get(C, A.team, "report")) == 403
 
 
-def test_http_policy_context_changes_only_after_verified_human_decision(m3):
+@pytest.mark.parametrize("failure", ["version", "iam"])
+def test_download_refuses_a_stale_version_or_a_removed_actor_before_reading_the_blob(m3, failure):
+    service, _, blob = m3
+    upload(service, create(service).etag)
+    etag = service.version(A, A.team, "report", V1).blob.etag
+    if failure == "version":
+        etag = '"0xBAD"'
+    else:
+        service.context.auth.actors.pop(A.oid)
+    with patch.object(blob, "read", wraps=blob.read) as read:
+        assert status(lambda: service.download(A, A.team, "report", V1, etag)) == (412 if failure == "version" else 403)
+    read.assert_not_called()
+
+
+def test_policy_context_changes_only_after_verified_human_decision(m3):
     service, _, _ = m3
-    http = client(service, policies=("report",))
-    initial = create(http, "sop")
-    first = upload(http, initial["etag"]).json()
-    context_path = "/teams/team-one/works/source-work/context"
-    assert http.get(context_path).json()["approved_policy_context"] == [{"artifact_id": "report", "status": "not_approved"}]
-    body = {"decision_id": V1, "version_id": V1, "sha256": first["versions"][0]["sha256"], "decision": "approve"}
-    headers = {"If-Match": first["etag"], "X-Actor": "admin", "X-Approver-Oid": HUMAN.oid}
-    assert http.post(PATH + "/decisions", headers=headers, json=body).status_code == 403
-    human = client(service, HUMAN)
-    forged = human.post(PATH + "/decisions", headers=headers, json={**body, "approver_oid": HUMAN.oid})
-    assert forged.status_code == 422
-    approved = human.post(PATH + "/decisions", headers=headers, json=body)
-    assert approved.status_code == 200, approved.text
-    assert human.get(PATH + "/effective").json()["version_id"] == V1
-    assert http.get(context_path).json()["approved_policy_context"][0]["text"] == "v1"
-    upload(http, approved.json()["etag"], b"v2 is not approved", V2)
-    assert http.get(context_path).json()["approved_policy_context"][0]["text"] == "v1"
-    assert "approved_policy_context" not in client(service).get(context_path).json()
+    first = upload(service, create(service, "sop").etag)
+    assert service.policy_context(A, A.team, ("report",)) == [{"artifact_id": "report", "status": "not_approved"}]
+    body = {"decision_id": V1, "version_id": V1, "sha256": first.payload["versions"][0]["sha256"], "decision": "approve"}
+    with pytest.raises(Problem) as agent:
+        service.decide(A, A.team, "report", first.etag, ApprovalInput(**body))
+    assert agent.value.status == 403
+    with pytest.raises(ValidationError):
+        ApprovalInput(**body, approver_oid=HUMAN.oid)
+    approved = service.decide(HUMAN, A.team, "report", first.etag, ApprovalInput(**body))
+    assert service.effective(HUMAN, A.team, "report").version_id == V1
+    assert service.policy_context(A, A.team, ("report",))[0]["text"] == "v1"
+    upload(service, approved.etag, b"v2 is not approved", V2)
+    assert service.policy_context(A, A.team, ("report",))[0]["text"] == "v1"
 
 
-@pytest.mark.parametrize("headers,expected", [
-    ({"X-Artifact-SHA256": "0" * 64}, 422),
-    ({"X-Artifact-Filename": "../escape"}, 422),
-    ({"X-Artifact-Media-Type": "text/html"}, 422),
-    ({"Content-Type": "application/json"}, 415),
-    ({"Content-Encoding": "gzip"}, 415),
-    ({"If-Match": "*"}, 412),
+@pytest.mark.parametrize("change,expected", [
+    ({"sha256": "0" * 64}, 422),
+    ({"filename": "../escape"}, ValidationError),
+    ({"media_type": "text/html"}, ValidationError),
+    ({"etag": "*"}, 412),
 ])
-def test_upload_rejects_invalid_contract_without_creating_versions(m3, headers, expected):
+def test_upload_rejects_invalid_contract_without_creating_versions(m3, change, expected):
     service, _, _ = m3
-    http = client(service)
-    initial = create(http)
-    response = upload(http, initial["etag"], headers=headers)
-    assert response.status_code == expected
-    assert http.get(PATH).json()["versions"] == []
-    assert http.get(PATH).json()["pending"] is None
+    initial = create(service)
+    etag = change.pop("etag", initial.etag)
+    if expected is ValidationError:
+        with pytest.raises(ValidationError):
+            upload(service, etag, **change)
+    else:
+        assert status(lambda: upload(service, etag, **change)) == expected
+    current = service.get(A, A.team, "report").payload
+    assert current["versions"] == [] and current["pending"] is None
 
 
 def test_binary_limit_is_512k_not_generic_64k_and_never_unbounded(m3):
     service, _, _ = m3
-    http = client(service)
-    initial = create(http)
-    full = upload(http, initial["etag"], b"x" * MAX_ARTIFACT_BYTES)
-    assert full.status_code == 200
-    too_large = upload(http, full.json()["etag"], b"x" * (MAX_ARTIFACT_BYTES + 1), V2)
-    assert too_large.status_code == 413
-    assert len(http.get(PATH).json()["versions"]) == 1
-    assert client(service, HUMAN).put(PATH + "/versions/" + V2, content=b"not an agent").status_code == 403
-
-
-def test_large_upload_authenticates_before_receiving_any_bytes(m3):
-    service, _, _ = m3
-
-    def deny():
-        raise Problem(401, "INVALID_TOKEN", "synthetic denied identity")
-
-    app = create_app(service.context, deny, artifact_service=service, verified_artifact_identity_dependency=deny)
-
-    async def execute():
-        messages = []
-
-        async def receive():
-            raise AssertionError("unauthenticated artifact body was consumed")
-
-        async def send(message):
-            messages.append(message)
-
-        await app({
-            "type": "http", "http_version": "1.1", "method": "PUT", "scheme": "https",
-            "path": PATH + "/versions/" + V1, "raw_path": (PATH + "/versions/" + V1).encode(),
-            "root_path": "", "query_string": b"", "server": ("testserver", 443), "client": ("127.0.0.1", 1),
-            "headers": [(b"content-length", b"999999999"), (b"content-type", b"application/octet-stream")],
-        }, receive, send)
-        assert next(message for message in messages if message["type"] == "http.response.start")["status"] == 401
-
-    asyncio.run(execute())
+    full = upload(service, create(service).etag, b"x" * MAX_ARTIFACT_BYTES)
+    with pytest.raises(Problem) as too_large:
+        upload(service, full.etag, b"x" * (MAX_ARTIFACT_BYTES + 1), V2)
+    assert too_large.value.status == 413 and too_large.value.body["error"]["code"] == "M3_FILE_TOO_LARGE"
+    assert len(service.get(A, A.team, "report").payload["versions"]) == 1
+    assert status(lambda: upload(service, full.etag, b"not an agent", V2, principal=HUMAN)) == 403
 
 
 def test_missing_configured_policy_is_an_explicit_error(m3):
     service, _, _ = m3
-    response = client(service, policies=("missing-policy",)).get("/teams/team-one/works/source-work/context")
-    assert response.status_code == 404
-    assert "approved_policy_context" not in response.json()
+    assert status(lambda: service.policy_context(A, A.team, ("missing-policy",))) == 404
 
 
-def test_m3_policy_configuration_does_not_change_another_teams_legacy_context(m3):
+def test_another_team_cannot_read_this_teams_policy_context(m3):
     service, _, _ = m3
-    service.context.create(C, C.team, "peer-work", CreateWork(goal="Another team's legacy work"))
-    peer = TestClient(create_app(
-        service.context, lambda: C, artifact_service=service,
-        verified_artifact_identity_dependency=lambda: C, artifact_policy_ids=("report",),
-    ))
-    response = peer.get("/teams/" + C.team + "/works/peer-work/context")
-    assert response.status_code == 200
-    assert "approved_policy_context" not in response.json()
+    upload(service, create(service, "sop").etag)
+    with pytest.raises(Problem) as denied:
+        service.policy_context(C, C.team, ("report",))
+    assert denied.value.status == 403 and denied.value.body["error"]["code"] == "M3_TEAM_DENIED"

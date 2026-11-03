@@ -182,8 +182,15 @@ azd ai agent monitor <agent> --session-id <sid>
 
 **現行方案已完成：** 依 [ADR-0002](adr/0002-shared-context-without-file-share.md)，共享 Context API、
 Non-VNet Foundry 與 Memory Store 已部署，17 項 Hosted 功能驗收通過；執行控制缺口與費用未知
-見 [POC-RESULTS.md](../POC-RESULTS.md)。新方案入口為 [controller 手冊](../tests/shared_controller/README.md)，
-必須使用已驗證的 endpoint 與 session。以下 SMB／VNet 命令只供歷史重現，不是後續預設流程。
+見 [POC-RESULTS.md](../POC-RESULTS.md)。當時的雲端驗收入口是 `scripts/validate-shared-hosted.py`
+（controller 手冊在 `tests/shared_controller/README.md`）。以下 SMB／VNet 命令只供歷史重現，不是後續預設流程。
+
+> **已移除（2026-11-03）：** 本節以下命令用到的 POC 程式已從 repo 刪除，命令無法直接執行：
+> 整個 `src/fa-hosted-sandbox-poc`（含 `desktop_smoke.py`）、`controller/run_poc.py`、
+> `g3_only.py`、`private_controller.py`、`controller/requirements.txt`、`scripts/invoke-private-controller.ps1`、
+> `deploy-poc-infra.ps1`、`grant-agent-key-vault-access.ps1`、`validate-shared-hosted.py`、`tests/shared_controller/`、
+> `infra/poc`、`infra/mi-smb-role.bicep`，以及 `infra/vnet` 除 `project-access.bicep`、`registry-connection.bicep`
+> 以外的模板。需要重現時從 git 歷史 `0330d456` 取回。
 
 **後續主線：** 依 [ADR-0003](adr/0003-hosted-environment-continuity.md) 維持 Hosted，驗收完整必要環境／工作恢復，不要求固定 VM。下一階段依 [分析與計畫](POC-ANALYSIS-AND-PLAN.md) 的 M0–M5 另行批准；不要為閱讀或整理本手冊重跑以下付費命令。
 

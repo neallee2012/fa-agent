@@ -15,6 +15,7 @@ from shared_context.behavior_assistant_wire import InstructionSubmit, Instructio
 from shared_context.behavior_hosted import LocalExecution
 from shared_context.behavior_instruction import TurnArchive
 from shared_context.behavior_assistant import key
+from shared_context.errors import Problem
 from shared_context.m2_copilot import ResidentHolder, ResidentSdk
 
 from test_behavior_assistant import assistant, runtime_path
@@ -232,7 +233,7 @@ def test_cancel_after_idle_before_the_save_still_seals_and_drops_the_sdk(assista
     assert len(calls) == 2 and len(h.endpoint.requests) == 2
 
 
-def test_revocation_after_the_light_restore_blocks_the_next_model_write(assistant, monkeypatch):
+def test_revocation_after_the_light_restore_blocks_the_next_model_write(assistant, monkeypatch, caplog):
     h, control, human = resident_enabled(assistant)
     calls = sdk_io(monkeypatch)
     h.endpoint.unbounded = True
@@ -247,10 +248,11 @@ def test_revocation_after_the_light_restore_blocks_the_next_model_write(assistan
     monkeypatch.setattr(h.assistant, "resident_restore", revoke_after)
     binding, _ = control.submit(human, InstructionSubmit(
         request_id="revoke-two", conversation_id=conversation(h, first), content="Second."))
-    try:
+    with pytest.raises(Problem) as stopped:
         h.runtime.controller.step(binding.binding_id)
-    except Exception:
-        pass
+    # The worker hides the adapter's own error; the refused model write's reason is in the API log.
+    assert stopped.value.body["error"]["code"] == "WORKER_START_UNKNOWN"
+    assert '"code":"WORK_POLICY_SCOPE_CHANGED"' in caplog.text
     assert len(h.endpoint.requests) == 1, "a revoked follow-up must not reach the model"
     assert len(calls) == 1
 

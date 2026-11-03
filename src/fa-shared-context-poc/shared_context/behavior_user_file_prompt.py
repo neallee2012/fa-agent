@@ -12,7 +12,9 @@ from .behavior_history_prompt import (
 )
 from .behavior_skill_draft import HISTORY_SKILL_DRAFT_MEMORY_PROFILE, HISTORY_SKILL_DRAFT_PROFILE
 from .behavior_user_turn_prompt import USER_TURN_PROMPT
-from .behavior_wire import Digest, WireModel
+from .behavior_wire import Digest, WireModel, exact_prefix, known_release
+from .native_responses_wire import SENT_RELEASE
+from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 USER_FILE_PROFILE = "fa-instruction-user-files-v1"
 FILE_READ_PROFILES = (USER_FILE_PROFILE, HISTORY_PROFILE, HISTORY_SKILL_DRAFT_PROFILE, HISTORY_SKILL_DRAFT_MEMORY_PROFILE,
@@ -61,17 +63,15 @@ class UserFilePromptAssemblyRecord(WireModel):
     prefix_sha256: Digest
     prefix_utf8_bytes: Annotated[int, Field(gt=0)]
     prefix_tokens: None = None
-    sdk_version: Literal["1.0.13"] = "1.0.13"
-    runtime_version: Literal["1.0.83"] = "1.0.83"
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]
+    runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
+    _release = model_validator(mode="after")(known_release)
     omissions: tuple[str, ...] = _OMISSIONS
 
     @model_validator(mode="after")
     def exact(self):
-        raw = USER_FILE_PROMPT.encode("utf-8")
-        if (self.prefix_sha256 != hashlib.sha256(raw).hexdigest()
-                or self.prefix_utf8_bytes != len(raw) or self.omissions != _OMISSIONS):
-            raise ValueError("Original-user-file assembly differs from its fixed source")
-        return self
+        return exact_prefix(
+            self, USER_FILE_PROMPT, _OMISSIONS, "Original-user-file assembly differs from its fixed source")
 
 
 @dataclass(frozen=True)

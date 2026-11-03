@@ -804,7 +804,7 @@ class NativeSessions:
             if claimed_version is None and version not in (None, target.agent_version):
                 try:
                     return self._row_profile(target, version)
-                except Exception:  # noqa: BLE001 - the claim falls back as before; the turn end's heal reads again
+                except Exception:  # the claim falls back as before; the turn end's heal reads again
                     pass
             return self._row_profile(target, target.agent_version)
 
@@ -845,7 +845,7 @@ class NativeSessions:
         def switching(store):
             try:
                 profile, unread = self._row_profile(client.target, value.hosted_agent_version), False
-            except Exception as error:  # noqa: BLE001 - only the repair falls back; see the docstring
+            except Exception as error:  # only the repair falls back; see the docstring
                 if not repairing:
                     raise
                 code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
@@ -1241,7 +1241,7 @@ class NativeSessions:
         as supported, and the row keeps its profile)."""
         try:
             profile = _native_profile(client.for_target(_target(client.target, agent_version=version)))
-        except Exception as error:  # noqa: BLE001 - an unreadable definition decides nothing
+        except Exception as error:  # an unreadable definition decides nothing
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
             logging.getLogger(__name__).warning("NATIVE_VERSION_PROFILE_UNREAD code=%s version=%s", code, version)
             return None
@@ -1262,7 +1262,7 @@ class NativeSessions:
             return reader.target.agent_version, "vm"
         try:
             metadata = _session_metadata(reader)
-        except Exception as unread:  # noqa: BLE001 - an unread version is "not known", never a new failure
+        except Exception as unread:  # an unread version is "not known", never a new failure
             code = unread.body["error"]["code"] if isinstance(unread, Problem) else type(unread).__name__
             logging.getLogger(__name__).warning("NATIVE_VERSION_METADATA_UNREAD code=%s", code)
             return None
@@ -1977,7 +1977,7 @@ class NativeSessions:
         try:
             store = binding_store(self.composition)
             return store, store.read(agent_id)
-        except Exception as error:  # noqa: BLE001 - an unreadable row only means no abandon decision
+        except Exception as error:  # an unreadable row only means no abandon decision
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
             logging.getLogger(__name__).warning("NATIVE_BINDING_UNRECORDED operation=abandon code=%s", code)
             return None
@@ -1990,7 +1990,7 @@ class NativeSessions:
             return False
         try:
             profile = _native_profile(source, floor=True)
-        except Exception as error:  # noqa: BLE001 - an unreadable definition decides nothing
+        except Exception as error:  # an unreadable definition decides nothing
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
             logging.getLogger(__name__).warning("NATIVE_ENVIRONMENT_SOURCE_PROFILE_UNREAD code=%s", code)
             return True
@@ -2002,7 +2002,7 @@ class NativeSessions:
     def _idle_timeout(self, source):
         try:
             return source.session_idle_timeout()
-        except Exception:  # noqa: BLE001 - the documented maximum stands in for an unreadable setting
+        except Exception:  # the documented maximum stands in for an unreadable setting
             return _IDLE_TIMEOUT_FALLBACK_SECONDS
 
     def _observe_active(self, source, status, now):
@@ -2918,7 +2918,7 @@ class NativeSessions:
         def logged(step, call):
             try:
                 return call()
-            except Exception as error:  # noqa: BLE001 - after the commit nothing here may fail the cut
+            except Exception as error:  # after the commit nothing here may fail the cut
                 code = (error.body["error"]["code"] if isinstance(error, Problem) else
                         "fence_overrun" if isinstance(error, _FenceOverrun) else type(error).__name__)
                 log.warning("NATIVE_UPGRADE_FINISH_FAILED step=%s code=%s session_id=%s", step, code, sid,
@@ -3524,7 +3524,7 @@ class NativeSessions:
                 waited = (now - datetime.fromisoformat(kept.since)).total_seconds()
                 if restart_after is None or waited <= restart_after:
                     return waited
-        except Exception as error:  # noqa: BLE001 - an unrecorded clock falls back to memory; see the docstring
+        except Exception as error:  # an unrecorded clock falls back to memory; see the docstring
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
             logging.getLogger(__name__).warning("NATIVE_BINDING_CLOCK_UNRECORDED kind=%s code=%s", kind, code)
         return None
@@ -3564,7 +3564,7 @@ class NativeSessions:
         version = row.observed.agent_version
         try:
             profile = resolver.profile(client.target, version)
-        except Exception as error:  # noqa: BLE001 - still unreadable: the next attempt reads again
+        except Exception as error:  # still unreadable: the next attempt reads again
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
             logging.getLogger(__name__).warning("NATIVE_BINDING_PROFILE_UNREAD code=%s version=%s", code, version)
             if send:

@@ -32,6 +32,31 @@ NESTED_KEYS = {
     "responseUsage": {"prompt_tokens", "completion_tokens", "total_tokens",
                       "prompt_cache_frontier_source", "prompt_cache_details_reported"},
 }
+
+
+def _count(value):
+    return type(value) is int and value >= 0
+
+
+def _text(value):
+    return isinstance(value, str)
+
+
+def _feature_flags(value):
+    return (isinstance(value, dict) and set(value) == {"enabledFeatureFlags"}
+            and isinstance(value["enabledFeatureFlags"], list) and all(map(_text, value["enabledFeatureFlags"])))
+
+
+# Optional metadata runtime 1.0.103 adds; each shape is exact, so any other drift is still refused (CTX-03 §6.4).
+CALL_OPTIONAL = {
+    "customToolCallCount": _count, "orphanToolCallCount": _count, "unmatchedToolResultCount": _count,
+    "maxOutputTokens": _count, "modelDisplayName": _text, "requestSettings": _feature_flags,
+}
+MODEL_CALL_OPTIONAL = {"request_body_bytes": _count, "request_body_wire_bytes": _count, "request_body_encoding": _text}
+
+
+def _known_optional(value, extras, checks):
+    return extras <= checks.keys() and all(checks[key](value[key]) for key in extras)
 CHUNK_METADATA = frozenset({
     "system_fingerprint", "service_tier", "prompt_filter_results",
     "latency_checkpoint", "routing", "obfuscation",
@@ -161,12 +186,13 @@ def _shape_warning(message, event, unknown=None):
         "event_type": kind, "unknown_metadata_keys": names(unknown or {}),
         "unknown_metadata_types": {safe_key(key): value for key, value in list((unknown or {}).items())[:32]},
         "envelope": describe(event, ENVELOPE),
-        "data": describe(data, CALL_KEYS if kind == "model.model_call_success" else {"kind", "messages"}),
+        "data": (describe(data, CALL_KEYS, CALL_OPTIONAL) if kind == "model.model_call_success"
+                 else describe(data, {"kind", "messages"})),
     }
     if kind == "model.model_call_success" and isinstance(data, dict):
+        optional = {"modelCall": MODEL_CALL_OPTIONAL, "responseChunk": CHUNK_METADATA, "responseUsage": USAGE_DETAILS}
         report["provider"] = {
-            name: describe(data.get(name), required,
-                           CHUNK_METADATA if name == "responseChunk" else USAGE_DETAILS if name == "responseUsage" else ())
+            name: describe(data.get(name), required, optional[name])
             for name, required in NESTED_KEYS.items()
         }
     logging.getLogger(__name__).warning("%s %s", message, json.dumps(report, ensure_ascii=True, sort_keys=True))
@@ -179,31 +205,46 @@ def _provider_objects(data):
         if not isinstance(value, dict) or not required <= value.keys():
             unsupported()
         extras = value.keys() - required
-        if name == "modelCall" and extras:
+        if name == "modelCall" and not _known_optional(value, extras, MODEL_CALL_OPTIONAL):
             unsupported()
         if name == "responseChunk":
-            for key in extras - {"system_fingerprint", "service_tier", "prompt_filter_results"}:
-                metadata[name + "." + key] = value[key]
-                if key not in CHUNK_METADATA:
-                    unknown[name + "." + key] = type(value[key]).__name__
+            _chunk_extras(value, extras, metadata, unknown)
         if name == "responseUsage":
-            for key in extras:
-                item = value[key]
-                if key not in USAGE_DETAILS:
-                    metadata[name + "." + key] = item
-                    unknown[name + "." + key] = type(item).__name__
-                elif item is not None:
-                    if not isinstance(item, dict):
+            _usage_extras(value, extras, metadata, unknown)
+    _chunk_fields(data["responseChunk"])
+    _provider_metadata(metadata)
+    return unknown
+
+
+def _chunk_extras(value, extras, metadata, unknown):
+    name = "responseChunk"
+    for key in extras - {"system_fingerprint", "service_tier", "prompt_filter_results"}:
+        metadata[name + "." + key] = value[key]
+        if key not in CHUNK_METADATA:
+            unknown[name + "." + key] = type(value[key]).__name__
+
+
+def _usage_extras(value, extras, metadata, unknown):
+    name = "responseUsage"
+    for key in extras:
+        item = value[key]
+        if key not in USAGE_DETAILS:
+            metadata[name + "." + key] = item
+            unknown[name + "." + key] = type(item).__name__
+        elif item is not None:
+            if not isinstance(item, dict):
+                unsupported()
+            for counter, count in item.items():
+                if counter in TOKEN_COUNTERS:
+                    if count is not None and (type(count) is not int or count < 0):
                         unsupported()
-                    for counter, count in item.items():
-                        if counter in TOKEN_COUNTERS:
-                            if count is not None and (type(count) is not int or count < 0):
-                                unsupported()
-                        else:
-                            path = name + "." + key + "." + counter
-                            metadata[path] = count
-                            unknown[path] = type(count).__name__
-    chunk = data["responseChunk"]
+                else:
+                    path = name + "." + key + "." + counter
+                    metadata[path] = count
+                    unknown[path] = type(count).__name__
+
+
+def _chunk_fields(chunk):
     for key in ("system_fingerprint", "service_tier", "obfuscation"):
         if chunk.get(key) is not None and not isinstance(chunk[key], str):
             unsupported()
@@ -218,8 +259,6 @@ def _provider_objects(data):
             or not isinstance(item["content_filter_results"], dict) for item in filters)
     ):
         unsupported()
-    _provider_metadata(metadata)
-    return unknown
 
 
 def raw_shape(event, *, model_provider=None):
@@ -243,19 +282,25 @@ def _raw_shape(event, *, model_provider=None):
                        for m in data["messages"])):
             unsupported()
     elif event["type"] == "model.model_call_success":
-        optional = {"reasoningSummary"} if model_provider == "openai-responses" else set()
-        if (not CALL_KEYS <= data.keys() or data.keys()-CALL_KEYS-optional
-                or data.get("reasoningSummary") not in (None, "none", "concise", "detailed")
-                or data["kind"] != "model_call_success"
-                or any(type(data[key]) is not int for key in ("turn", "modelCallDurationMs", "toolCount"))
-                or any(type(data[key]) not in (int, float) or not math.isfinite(data[key])
-                       for key in ("ttftMs", "outputTtftMs", "interTokenLatencyMs"))
-                or type(data["rte"]) is not bool or not isinstance(data["reasoningEffort"], str)
-                or data["quotaSnapshots"] != {} or not isinstance(data["requestMessages"], str)
-                or not isinstance(parse_json(data["requestMessages"]), list)):
-            unsupported()
+        _call_shape(data, model_provider)
         return _provider_objects(data)
     else:
+        unsupported()
+
+
+def _call_shape(data, model_provider):
+    optional = {"reasoningSummary"} if model_provider == "openai-responses" else set()
+    if (not CALL_KEYS <= data.keys() or not _known_optional(data, data.keys()-CALL_KEYS-optional, CALL_OPTIONAL)
+            or data.get("reasoningSummary") not in (None, "none", "concise", "detailed")
+            or data["kind"] != "model_call_success"):
+        unsupported()
+    if (any(type(data[key]) is not int for key in ("turn", "modelCallDurationMs", "toolCount"))
+            or any(type(data[key]) not in (int, float) or not math.isfinite(data[key])
+                   for key in ("ttftMs", "outputTtftMs", "interTokenLatencyMs"))):
+        unsupported()
+    if (type(data["rte"]) is not bool or not isinstance(data["reasoningEffort"], str)
+            or data["quotaSnapshots"] != {} or not isinstance(data["requestMessages"], str)
+            or not isinstance(parse_json(data["requestMessages"]), list)):
         unsupported()
 
 
@@ -408,14 +453,37 @@ def validate_projected_state(state):
 
 
 def validate_native_files(files, events, *, model_provider=None):
-    from .behavior_sdk_state import checked_path
     _, complete = native_pair(events)
+    name = _checkpoint_name(files, complete)
+    match = _index_row(files)
+    number = complete["data"]["checkpointNumber"]
+    if (match is None or int(match[1]) != number or not match[2].strip()
+            or "checkpoints/" + match[3] != name or not match[3].startswith(f"{number:03d}-")
+            or not name.endswith(".md")):
+        incomplete()
+    summary = complete["data"]["summaryContent"]
+    titles = list(re.finditer(r"<checkpoint_title>(.*?)</checkpoint_title>", summary, re.DOTALL))
+    fallback_titles = _fallback_titles(events, number)
+    responses_title = model_provider == "openai-responses" and (match[2], match[3]) in fallback_titles
+    if len(titles) != 1 or titles[0][1].strip() != match[2] and not responses_title:
+        incomplete()
+    body = (summary[:titles[0].start()] + summary[titles[0].end():]).strip()
+    if files[name] != body:
+        incomplete()
+
+
+def _checkpoint_name(files, complete):
+    from .behavior_sdk_state import checked_path
     path = complete["data"].get("checkpointPath")
     if not isinstance(path, str) or not path.startswith("/session-state/checkpoints/"):
         incomplete()
     name = checked_path(path.removeprefix("/session-state/"))
     if not files.get(name, "").strip() or not files.get("workspace.yaml", "").strip():
         incomplete()
+    return name
+
+
+def _index_row(files):
     header = ("# Checkpoint History\n\nCheckpoints are listed in chronological order. "
               "Checkpoint 1 is the oldest, higher numbers are more recent.\n\n"
               "| # | Title | File |\n|---|-------|------|\n")
@@ -425,28 +493,21 @@ def validate_native_files(files, events, *, model_provider=None):
     rows = jsonl_lines(index[len(header):])
     if len(rows) != 1:
         incomplete()
-    match = re.fullmatch(r"\| ([1-9][0-9]*) \| ([^|\r\n]+) \| ([^|/\r\n]+) \|", rows[0])
-    number = complete["data"]["checkpointNumber"]
-    if (match is None or int(match[1]) != number or not match[2].strip()
-            or "checkpoints/" + match[3] != name or not match[3].startswith(f"{number:03d}-")
-            or not name.endswith(".md")):
-        incomplete()
-    summary = complete["data"]["summaryContent"]
-    titles = list(re.finditer(r"<checkpoint_title>(.*?)</checkpoint_title>", summary, re.DOTALL))
-    # Runtime 1.0.83's fallback title uses the first eight SDK-session characters, not the summary title.
+    return re.fullmatch(r"\| ([1-9][0-9]*) \| ([^|\r\n]+) \| ([^|/\r\n]+) \|", rows[0])
+
+
+def _fallback_titles(events, number):
+    # Observed on runtime 1.0.83: the fallback title uses the first eight SDK-session characters, not the summary title.
     starts = [event for event in events if event["type"] == "session.start"]
-    start = starts[0]["data"] if len(starts) == 1 else {}
+    start = starts[0].get("data") if len(starts) == 1 else {}
+    if not isinstance(start, dict):
+        unsupported()
     session_id = start.get("sessionId", start.get("session_id"))
     prefix = session_id[:8] if isinstance(session_id, str) else ""
     fallback_titles = {("Session response", f"{number:03d}-session-response.md")}
     if re.fullmatch(r"[A-Za-z0-9-]{1,8}", prefix):
         fallback_titles.add((f"Session {prefix}", f"{number:03d}-session-{prefix.lower()}.md"))
-    responses_title = model_provider == "openai-responses" and (match[2], match[3]) in fallback_titles
-    if len(titles) != 1 or titles[0][1].strip() != match[2] and not responses_title:
-        incomplete()
-    body = (summary[:titles[0].start()] + summary[titles[0].end():]).strip()
-    if files[name] != body:
-        incomplete()
+    return fallback_titles
 
 
 def project_files(original, *, previous, forbidden_values=(), directories=(), model_provider=None):

@@ -153,6 +153,34 @@ def _team_scope(principal):
     return dict(tenant_id=principal.tenant_id, team_id=principal.team)
 
 
+def _owner_registration(principal, teams, rows):
+    """The live registry outside a transaction; in one, its row, where a row-less legacy owner keeps its registration."""
+    if rows is None:
+        return teams.owner(principal.oid)
+    key = identity_key(principal.tenant_id, principal.oid)
+    if rows[key] is not None:
+        return _record(rows, key, IdentityRegistration)
+    return teams.legacy_owner if principal.oid == teams.legacy_owner.oid else None
+
+
+def _readback_conflict(principal, pending, state, decision, grant, grant_key, reference):
+    """What differs between a card's saved rows, or None; when several differ, the last comparison names it."""
+    pid = pending.pending_id
+    invalid = None
+    if (state.tenant_id, state.team_id, state.pending_id) != (principal.tenant_id, principal.team, pid):
+        invalid = "the state differs from the pending call"
+    if decision is not None and (
+            decision.tenant_id != principal.tenant_id or decision.team_id != principal.team
+            or decision.command.pending_id != pid or decision.command.pending_digest != pending.sha256):
+        invalid = "the saved decision differs from the pending call"
+    if grant is not None and (grant.grant_id != grant_key or grant.approval != reference
+            or grant.action_digest != pending.command.action_digest or grant.expires_at != pending.expires_at
+            or grant.decision_id != state.decision_id or grant.tenant_id != principal.tenant_id
+            or grant.team_id != principal.team or decision is None or decision.command.choice == "deny"):
+        invalid = "the saved grant differs from the original human choice"
+    return invalid
+
+
 def _unknown():
     return Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "read the original HITL command; do not resubmit an unknown write")
 
@@ -188,36 +216,34 @@ class NativeHitlService:
             raise Problem(403, "NATIVE_HITL_OWNER_ONLY", "only the delegated Team owner may record rules or decisions")
         teams = self.verifier.teams
         if principal.kind == "human":
-            if teams is None:
-                valid = (principal.actor_id is None and principal.oid == self.verifier.settings.human_oid
-                         and principal.team == self.verifier.settings.team)
-            else:
-                key = identity_key(principal.tenant_id, principal.oid)
-                value = (teams.owner(principal.oid) if rows is None else
-                         teams.legacy_owner if rows[key] is None and principal.oid == teams.legacy_owner.oid else
-                         None if rows[key] is None else _record(rows, key, IdentityRegistration))
-                valid = (principal.actor_id is None and value is not None and value.active and value.kind == "owner"
-                         and (value.tenant_id, value.oid, value.team_id)
-                         == (principal.tenant_id, principal.oid, principal.team))
-            if not valid:
+            if not self._is_current_owner(principal, teams, rows):
                 raise Problem(403, "NATIVE_HITL_OWNER_ONLY", "the current original Team owner is required")
         elif principal.kind == "agent":
-            actor = self.verifier.auth.actors.get(principal.oid)
-            if actor is not None:
-                valid = (actor.actor, actor.team) == (principal.actor_id, principal.team)
-            elif teams is not None:
-                key = identity_key(principal.tenant_id, principal.oid)
-                value = teams.lookup(principal.oid) if rows is None else (
-                    None if rows[key] is None else _record(rows, key, IdentityRegistration))
-                valid = (value is not None and value.active and value.kind == "agent"
-                         and (value.tenant_id, value.oid, value.team_id, value.agent_id)
-                         == (principal.tenant_id, principal.oid, principal.team, principal.actor_id))
-            else:
-                valid = False
-            if not valid:
+            if not self._is_registered_agent(principal, teams, rows):
                 raise Problem(403, "NATIVE_HITL_AGENT_ONLY", "an active registered Agent of this Team is required")
         else:
             raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "a verified Team identity is required")
+
+    def _is_current_owner(self, principal, teams, rows):
+        if teams is None:
+            return (principal.actor_id is None and principal.oid == self.verifier.settings.human_oid
+                    and principal.team == self.verifier.settings.team)
+        value = _owner_registration(principal, teams, rows)
+        return (principal.actor_id is None and value is not None and value.active and value.kind == "owner"
+                and (value.tenant_id, value.oid, value.team_id) == (principal.tenant_id, principal.oid, principal.team))
+
+    def _is_registered_agent(self, principal, teams, rows):
+        actor = self.verifier.auth.actors.get(principal.oid)
+        if actor is not None:
+            return (actor.actor, actor.team) == (principal.actor_id, principal.team)
+        if teams is None:
+            return False
+        key = identity_key(principal.tenant_id, principal.oid)
+        value = teams.lookup(principal.oid) if rows is None else (
+            None if rows[key] is None else _record(rows, key, IdentityRegistration))
+        return (value is not None and value.active and value.kind == "agent"
+                and (value.tenant_id, value.oid, value.team_id, value.agent_id)
+                == (principal.tenant_id, principal.oid, principal.team, principal.actor_id))
 
     def _agent(self, principal, call):
         if principal.kind != "agent":
@@ -317,49 +343,64 @@ class NativeHitlService:
         if pid is not None:
             reads.extend((pid, hitl_key("state", principal.tenant_id, principal.team, pid),
                           hitl_key("grant", principal.tenant_id, principal.team, pid)))
-        if isinstance(command, NativeHitlQuestionCreate):
-            qid = question_id(principal.tenant_id, principal.team, command.question.call)
-            reads.extend((qid, hitl_key("answer", principal.tenant_id, principal.team, qid),
-                          self._index_key(principal, self._turn(command.question.call))))
-        elif isinstance(command, NativeHitlAnswer):
-            reads.extend((command.question_id, hitl_key("answer", principal.tenant_id, principal.team, command.question_id)))
-            row = self.store.read_record(command.question_id)
-            if row is not None:
-                question = self._load(row, command.question_id, NativeHitlQuestionPending)
-                reads.append(self._index_key(principal, self._turn(question.command.question.call)))
-        elif isinstance(command, ConnectorConsentCreate):
-            cid = consent_id(principal.tenant_id, principal.team, command.consent.call)
-            reads.extend((cid, hitl_key("consent-decision", principal.tenant_id, principal.team, cid),
-                          self._index_key(principal, self._turn(command.consent.call))))
-            if not legacy:
-                reads.append(self._declined_key(principal, command.consent.call, command.consent.toolbox_name))
-        elif isinstance(command, ConnectorConsentDecision):
-            reads.extend((command.consent_id,
-                          hitl_key("consent-decision", principal.tenant_id, principal.team, command.consent_id)))
-            row = self.store.read_record(command.consent_id)
-            if row is not None:
-                consent = self._load(row, command.consent_id, ConnectorConsentPending)
-                reads.append(self._index_key(principal, self._turn(consent.command.consent.call)))
-                if not legacy:
-                    reads.append(self._declined_key(
-                        principal, consent.command.consent.call, consent.command.consent.toolbox_name))
+        reads.extend(self._wait_reads(principal, command, legacy))
         if not legacy:
-            if pid is not None:
-                reads.append(hitl_key("authorization", principal.tenant_id, principal.team, pid))
-            if isinstance(command, NativeHitlEnd):
-                reads.append(self._index_key(principal, command.turn))
-            elif isinstance(command, (NativeHitlPendingCreate, NativeHitlAuthorize)):
-                reads.append(self._index_key(principal, self._turn(command.action.call)))
-            elif isinstance(command, (NativeHitlDecision, NativeHitlClose)):
-                pending_row = self.store.read_record(pid)
-                if pending_row is not None:
-                    pending = self._load(pending_row, pid, NativeHitlPending)
-                    reads.append(self._index_key(principal, self._turn(pending.command.action.call)))
+            reads.extend(self._current_reads(principal, command, pid))
         return ControlRequest(
             request_id=hitl_key("apply", principal.tenant_id, principal.team, key),
             request_digest=digest([principal.tenant_id, principal.team, principal.oid, command.model_dump(mode="json")]),
             read_set=tuple(reads),
         )
+
+    def _wait_reads(self, principal, command, legacy):
+        """Keys of a question or Connect card. A saved intent keeps this order: _original compares it again."""
+        if isinstance(command, NativeHitlQuestionCreate):
+            qid = question_id(principal.tenant_id, principal.team, command.question.call)
+            return (qid, hitl_key("answer", principal.tenant_id, principal.team, qid),
+                    self._index_key(principal, self._turn(command.question.call)))
+        if isinstance(command, NativeHitlAnswer):
+            return self._answer_reads(principal, command)
+        if isinstance(command, ConnectorConsentCreate):
+            cid = consent_id(principal.tenant_id, principal.team, command.consent.call)
+            reads = (cid, hitl_key("consent-decision", principal.tenant_id, principal.team, cid),
+                     self._index_key(principal, self._turn(command.consent.call)))
+            return reads if legacy else (
+                *reads, self._declined_key(principal, command.consent.call, command.consent.toolbox_name))
+        if isinstance(command, ConnectorConsentDecision):
+            return self._click_reads(principal, command, legacy)
+        return ()
+
+    def _answer_reads(self, principal, command):
+        reads = (command.question_id, hitl_key("answer", principal.tenant_id, principal.team, command.question_id))
+        row = self.store.read_record(command.question_id)
+        if row is None:
+            return reads
+        question = self._load(row, command.question_id, NativeHitlQuestionPending)
+        return (*reads, self._index_key(principal, self._turn(question.command.question.call)))
+
+    def _click_reads(self, principal, command, legacy):
+        reads = (command.consent_id,
+                 hitl_key("consent-decision", principal.tenant_id, principal.team, command.consent_id))
+        row = self.store.read_record(command.consent_id)
+        if row is None:
+            return reads
+        asked = self._load(row, command.consent_id, ConnectorConsentPending).command.consent
+        reads = (*reads, self._index_key(principal, self._turn(asked.call)))
+        return reads if legacy else (*reads, self._declined_key(principal, asked.call, asked.toolbox_name))
+
+    def _current_reads(self, principal, command, pid):
+        """Keys an intent saved before the claim point and the turn index existed never read (legacy)."""
+        reads = () if pid is None else (hitl_key("authorization", principal.tenant_id, principal.team, pid),)
+        if isinstance(command, NativeHitlEnd):
+            return (*reads, self._index_key(principal, command.turn))
+        if isinstance(command, (NativeHitlPendingCreate, NativeHitlAuthorize)):
+            return (*reads, self._index_key(principal, self._turn(command.action.call)))
+        if isinstance(command, (NativeHitlDecision, NativeHitlClose)):
+            row = self.store.read_record(pid)
+            if row is not None:
+                pending = self._load(row, pid, NativeHitlPending)
+                return (*reads, self._index_key(principal, self._turn(pending.command.action.call)))
+        return reads
 
     def _original(self, principal, command, record):
         value = self._load(record, self._intent_key(principal, command), _Intent)
@@ -875,6 +916,45 @@ class NativeHitlService:
             **result, "pending_id": pending.pending_id, "status": status, "rules_revision": revision,
         })
 
+    @staticmethod
+    def _review_asks(command, rules):
+        """Whether a passing review still needs the owner; raises when the current review refuses the action."""
+        matched = {rule.rule_id: rule for rule in rules.rules}
+        review = command.review
+        if (not set(review.matched_rule_ids) <= set(matched) or review.outcome == "deny" or review.takeover_required):
+            raise Problem(403, "NATIVE_HITL_REVIEW_DENIED", "current review or human takeover refuses this action")
+        return (review.outcome == "ask" or command.action.category == "routine"
+                or any(matched[key].behavior == "ask_first" for key in review.matched_rule_ids))
+
+    def _live_wait_status(self, principal, command, pid, rows, now):
+        """The status of a saved card for this exact action; a terminal or expired wait cannot be claimed."""
+        previous = self._pending(principal, pid, rows)
+        if previous.command.action != command.action or previous.command.action_digest != command.action_digest:
+            raise Problem(409, "NATIVE_HITL_ACTION_CHANGED", "the original pending call cannot authorize different input")
+        status = _record(rows, hitl_key("state", principal.tenant_id, principal.team, pid), _State).status
+        if status not in {"pending", "allow"} or now >= previous.expires_at:
+            raise Problem(403, "NATIVE_HITL_PERMISSION_REQUIRED", "a terminal original wait cannot be reopened by another rule")
+        return status
+
+    def _once_grant(self, principal, command, pid, rows, now):
+        """The (grant ID, deadline) of the owner's once decision this claim names."""
+        if command.approval is None:
+            raise Problem(403, "NATIVE_HITL_PERMISSION_REQUIRED", "a current original human once decision is required")
+        pending = self._pending(principal, pid, rows)
+        if (command.approval != self._reference(pending)
+                or pending.command.action != command.action or pending.command.action_digest != command.action_digest):
+            raise Problem(409, "NATIVE_HITL_ACTION_CHANGED", "approval cannot authorize different original input")
+        state = _record(rows, hitl_key("state", principal.tenant_id, principal.team, pid), _State)
+        if state.status != "allow":
+            raise Problem(403, "NATIVE_HITL_PERMISSION_REQUIRED", "the original human did not allow this live call")
+        grant_id = hitl_key("grant", principal.tenant_id, principal.team, pid)
+        grant = _record(rows, grant_id, NativeHitlOnceGrant)
+        if grant.approval != command.approval or grant.action_digest != command.action_digest:
+            raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the once grant names another action")
+        if now >= grant.expires_at:
+            raise Problem(410, "NATIVE_HITL_EXPIRED", "the original once decision has expired")
+        return grant_id, grant.expires_at
+
     def _authorize_effect(self, principal, intent, rows, now, result):
         command = intent.command
         principal.require(principal.team, "consume")
@@ -883,45 +963,20 @@ class NativeHitlService:
         _, index = self._index(principal, self._turn(command.action.call), rows)
         if index.closed:
             raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn is closed")
-        matched = {rule.rule_id: rule for rule in rules.rules}
-        review = command.review
-        if (not set(review.matched_rule_ids) <= set(matched) or review.outcome == "deny" or review.takeover_required):
-            raise Problem(403, "NATIVE_HITL_REVIEW_DENIED", "current review or human takeover refuses this action")
-        ask = (review.outcome == "ask" or command.action.category == "routine"
-               or any(matched[key].behavior == "ask_first" for key in review.matched_rule_ids))
+        ask = self._review_asks(command, rules)
         pid = pending_id(principal.tenant_id, principal.team, command.action.call)
         akey = hitl_key("authorization", principal.tenant_id, principal.team, pid)
         if rows[akey] is not None:
             raise Problem(409, "NATIVE_HITL_ALREADY_AUTHORIZED", "read the original authorization; never acquire another claim")
         grant_id, expires = None, now + timedelta(seconds=self.ttl_seconds)
         if rows[pid] is not None:
-            previous = self._pending(principal, pid, rows)
-            if previous.command.action != command.action or previous.command.action_digest != command.action_digest:
-                raise Problem(409, "NATIVE_HITL_ACTION_CHANGED", "the original pending call cannot authorize different input")
-            status = _record(rows, hitl_key("state", principal.tenant_id, principal.team, pid), _State).status
-            if status not in {"pending", "allow"} or now >= previous.expires_at:
-                raise Problem(403, "NATIVE_HITL_PERMISSION_REQUIRED", "a terminal original wait cannot be reopened by another rule")
+            status = self._live_wait_status(principal, command, pid, rows, now)
             ask = ask or status == "allow"
         if ask or command.approval is not None:
-            if command.approval is None:
-                raise Problem(403, "NATIVE_HITL_PERMISSION_REQUIRED", "a current original human once decision is required")
-            pending = self._pending(principal, pid, rows)
-            if (command.approval != self._reference(pending)
-                    or pending.command.action != command.action or pending.command.action_digest != command.action_digest):
-                raise Problem(409, "NATIVE_HITL_ACTION_CHANGED", "approval cannot authorize different original input")
-            state = _record(rows, hitl_key("state", principal.tenant_id, principal.team, pid), _State)
-            if state.status != "allow":
-                raise Problem(403, "NATIVE_HITL_PERMISSION_REQUIRED", "the original human did not allow this live call")
-            grant_id = hitl_key("grant", principal.tenant_id, principal.team, pid)
-            grant = _record(rows, grant_id, NativeHitlOnceGrant)
-            if grant.approval != command.approval or grant.action_digest != command.action_digest:
-                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the once grant names another action")
-            expires = grant.expires_at
-            if now >= expires:
-                raise Problem(410, "NATIVE_HITL_EXPIRED", "the original once decision has expired")
+            grant_id, expires = self._once_grant(principal, command, pid, rows, now)
         authorization = NativeHitlAuthorization(
             authorization_id=akey, call=command.action.call, action_digest=command.action_digest,
-            review=review, effect_token=command.effect_token, approval=command.approval, grant_id=grant_id,
+            review=command.review, effect_token=command.effect_token, approval=command.approval, grant_id=grant_id,
             expires_at=expires)
         record = _Authorization(tenant_id=principal.tenant_id, team_id=principal.team,
                                 authorization=authorization, intent_id=intent.intent_id)
@@ -954,18 +1009,7 @@ class NativeHitlService:
             grant_row = self.store.read_record(grant_key)
             grant = None if grant_row is None else _parse(grant_row.payload["data"], NativeHitlOnceGrant)
             reference = self._reference(pending)
-            invalid = None
-            if (state.tenant_id, state.team_id, state.pending_id) != (principal.tenant_id, principal.team, pid):
-                invalid = "the state differs from the pending call"
-            if decision is not None and (
-                    decision.tenant_id != principal.tenant_id or decision.team_id != principal.team
-                    or decision.command.pending_id != pid or decision.command.pending_digest != pending.sha256):
-                invalid = "the saved decision differs from the pending call"
-            if grant is not None and (grant.grant_id != grant_key or grant.approval != reference
-                    or grant.action_digest != pending.command.action_digest or grant.expires_at != pending.expires_at
-                    or grant.decision_id != state.decision_id or grant.tenant_id != principal.tenant_id
-                    or grant.team_id != principal.team or decision is None or decision.command.choice == "deny"):
-                invalid = "the saved grant differs from the original human choice"
+            invalid = _readback_conflict(principal, pending, state, decision, grant, grant_key, reference)
             now = self._now()
             expired = now >= pending.expires_at
             ikey = self._index_key(principal, self._turn(pending.command.action.call))

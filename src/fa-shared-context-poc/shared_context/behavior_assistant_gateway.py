@@ -29,7 +29,7 @@ _CHAT_FIELDS = frozenset({
 })
 _RESPONSES_FIELDS = frozenset({
     "model", "input", "instructions", "tools", "tool_choice", "stream", "store", "reasoning",
-    "max_output_tokens", "temperature", "top_p", "parallel_tool_calls", "prompt_cache_key", "include",
+    "max_output_tokens", "temperature", "top_p", "parallel_tool_calls", "prompt_cache_key", "include", "text",
 })
 _BASE_TOOLS = frozenset({"read_context", "save_result", "finish_task", "execute_operation"})
 
@@ -89,6 +89,13 @@ def _check_reasoning(reasoning):
         raise Problem(422, "ASSISTANT_MODEL_REQUEST_INVALID", "unsupported Responses reasoning options")
 
 
+def _check_text(body):
+    # Runtime 1.0.103 sends only {"verbosity": ...}, valued from SDK 1.0.26's Verbosity enum; formats stay out.
+    if "text" in body and (not isinstance(body["text"], dict) or set(body["text"]) != {"verbosity"}
+                           or body["text"]["verbosity"] not in ("low", "medium", "high")):
+        raise Problem(422, "ASSISTANT_MODEL_REQUEST_INVALID", "unsupported Responses text options")
+
+
 def _check_past_turn_reads(user_file_access, assistant_reply_access, user_turn):
     if user_file_access and not user_turn:
         raise Problem(403, "ASSISTANT_TOOLS_DENIED", "original user-turn capability is required for file reads")
@@ -105,11 +112,17 @@ def _tool_names(grants, capability_tools):
     return names
 
 
+def _tool_name(tool, responses):
+    """The tool's name when it is text, else None; Chat Completions nests it under ``function``."""
+    holder = tool if responses else tool.get("function")
+    name = holder.get("name") if isinstance(holder, dict) else None
+    return name if isinstance(name, str) else None
+
+
 def _check_tools(tools, names, *, text_reply, responses):
     if not isinstance(tools, list) or not text_reply and len(tools) > 4 or any(
         not isinstance(tool, dict) or tool.get("type") != "function"
-        or responses and not isinstance(tool.get("name"), str)
-        or (tool.get("name") if responses else tool.get("function", {}).get("name")) not in names for tool in tools
+        or _tool_name(tool, responses) not in names for tool in tools
     ):
         raise Problem(403, "ASSISTANT_TOOLS_DENIED", "only the bounded assistant tool catalog is allowed")
 
@@ -141,6 +154,7 @@ class AssistantProvider:
         if responses:
             _check_local_input(body, messages)
             _check_reasoning(body.get("reasoning"))
+            _check_text(body)
         _check_images(messages, allow_images)
         _check_past_turn_reads(user_file_access, assistant_reply_access, text_reply and user_turn_access)
         names = _tool_names((
@@ -214,6 +228,7 @@ class AssistantProvider:
                             code=value.get("error",{}).get("code") if isinstance(value,dict) else None
                         except (ValueError,TypeError,AttributeError):
                             code=None
+                    code=code if isinstance(code,str) else None
                     await response.aclose()
                     if code in {"context_length_exceeded","context_window_exceeded"}:
                         raise Problem(413,"ASSISTANT_CONTEXT_LIMIT","selected provider rejected this context; no truncation or retry",

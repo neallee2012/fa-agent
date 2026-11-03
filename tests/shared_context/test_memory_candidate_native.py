@@ -20,6 +20,7 @@ from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES, HISTORY
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.memory_candidate_wire import CandidateReceipt
 from shared_context.memory_candidates import MemoryCandidates
+from shared_context.sdk_pin import RUNTIME_VERSION
 from test_behavior_assistant import assistant
 from test_conversation_profile_selection import configured, select, template
 from test_instruction_flow import instruction_models
@@ -135,6 +136,6 @@ def test_sdk_candidate_receipt_reaches_the_next_request_then_becomes_reviewable(
                 assert value.text == (None if invalid_quote else quote) and value.effective is False
                 assert counts == {"violations": [], "proxy_requests": 2, "provider_requests": 2, "stage_posts": 1}
                 assert len(bridges) == len(processes) == 1
-                assert bridges[0]._sdk_stop.graceful and bridges[0]._sdk_stop.runtime_version == "1.0.83"
+                assert bridges[0]._sdk_stop.graceful and bridges[0]._sdk_stop.runtime_version == RUNTIME_VERSION
         finally:
             assert all(process is not None and process.poll() is not None for process in processes)

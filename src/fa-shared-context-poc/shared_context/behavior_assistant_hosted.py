@@ -987,7 +987,8 @@ class AssistantSession:
                 if self.client.assignment.task.instruction is not None:
                     from .behavior_assistant_checkpoint import unpack
                     state=(recovered if isinstance(recovered,SdkState) else
-                           SdkState(sdk_session_id=recovered.sdk_session_id,files=unpack(recovered)))
+                           SdkState(sdk_version=recovered.sdk_version,runtime_version=recovered.runtime_version,
+                                    sdk_session_id=recovered.sdk_session_id,files=unpack(recovered)))
                     self._session_files=SdkSessionFiles(self.client.assignment.sdk_session_id,state,
                         checkpoint_profile=self.client.assignment.task.instruction.checkpoint_profile,
                         model_provider=self.client.assignment.task.instruction.model_provider)
@@ -1615,7 +1616,7 @@ class AssistantSupervisor:
             with self.lock:
                 self.sessions[assignment.launch_id]=session
                 if assignment.launch_id in self.cancelled:session.request_cancel()
-            engine = AssistantEngine(None, process_marker=self.supervisor_id, behavior=session)
+            engine = AssistantEngine(behavior=session)
             phase = "dispatch"
             result = engine.dispatch({"operation": "assistant", "profile": aw.PROFILE,
                                       "action": "resume" if client.assignment.resume else "start"})

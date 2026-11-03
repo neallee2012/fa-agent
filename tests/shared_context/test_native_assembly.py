@@ -19,9 +19,10 @@ from shared_context.m2_copilot import ToolFailure
 from shared_context.m3_skills import PurposeSkillCatalog, PurposeSkillEntry, PurposeSkillReadResult
 from shared_context.native_capability_tools import approved_skills_provider
 from shared_context.native_private_memory import NativePrivateMemory
-from test_native_responses import response_submit, responses  # noqa: F401
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
+from test_native_responses import response_submit, responses
 from test_native_turn_wire import agent_receive, submit
-from test_native_turns import local_env  # noqa: F401
+from test_native_turns import local_env
 
 
 async def offline_sdk(**options):
@@ -38,7 +39,7 @@ async def offline_sdk(**options):
         })
     return {
         "final_message": "OFFLINE complete answer",
-        "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": "1.0.83"},
+        "sdk_stop": {"pid": 123, "exit_code": 0, "graceful": True, "runtime_version": RUNTIME_VERSION},
     }
 
 
@@ -84,8 +85,8 @@ def test_each_native_lane_saves_the_bound_assembly_without_prompt_content(
     assert assembly["capture_digest"] == request.capture.sha256
     assert assembly["selection"]["base"] == request.capture.template.role.model_dump(mode="json")
     assert assembly["selection"]["role_version"] == 1
-    assert assembly["selection"]["sdk_version"] == "1.0.13"
-    assert assembly["selection"]["runtime_version"] == "1.0.83"
+    assert assembly["selection"]["sdk_version"] == SDK_VERSION
+    assert assembly["selection"]["runtime_version"] == RUNTIME_VERSION
     parts = {part["name"]: part for part in assembly["parts"]}
     system = observed[0]["system_message"].encode("utf-8")
     assert parts["system_message"]["utf8_bytes"] == len(system)
@@ -890,7 +891,7 @@ def test_reminders_overlap_capability_binding_and_keep_their_failure_handling(re
 @pytest.mark.parametrize("failing", ["bind", "reminders"])
 def test_an_early_reminders_read_stops_with_a_failed_bind_and_its_own_failure_still_fails_the_turn(
         responses, monkeypatch, tmp_path, failing):
-    """#942 review: a bind that fails first cancels the reminders read still in flight and waits for it to end (so
+    """#942: a bind that fails first cancels the reminders read still in flight and waits for it to end (so
     nothing outlives the turn or leaves "Task exception was never retrieved"); a reminders failure that is not a
     ``Problem`` still fails the turn, as when the read ran after the bindings."""
     import time

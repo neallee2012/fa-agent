@@ -7,30 +7,27 @@
 
 From 2d-ii ``NATIVE_STATE_PROFILE`` (the send profile) is v2, while every DTO default
 (``default=UNLABELED_STATE_PROFILE, exclude_if=unlabeled_profile``) stays the unlabeled v1 profile, so stored v1 and
-unlabeled items still read as v1 and keep their bytes; 2d-i moved ``_Meta``'s label, and this snapshot's key, to v2.
+unlabeled items still read as v1 and keep their bytes; 2d-i moved ``_Meta``'s label, and this snapshot's key, to v2,
+and 3d-i (SDK 1.0.26 / runtime 1.0.103) moves both to v3 while the send profile stays v2 until 3d-ii. From then the
+v2 baseline below compares only the wire, (a) and (b); this snapshot pins (c) and (d) (ADR-0009 §3).
 
 JSON schema does not see ``exclude_if`` (which fields a dump leaves out); the profile-label tests below pin that part.
 
-ADR-0009 M1 "v1 wire 凍結": ``fixtures/native_v1_wire_h0.json`` is the H0 baseline (stage release 30, ``fb8941f2``)
-the v1 wire may only grow from while Hosted accepts the v1 alias (2d-ii still resends v1 originals; it retires with the
-alias, the first Hosted image after convergence): full schemas (prose dropped as above), how each field is written, the
-NATIVE_REQUEST union, the SDK/runtime pins, the codec list and the canonical bytes of v1 items. Nothing in pytest
-writes it and ``FA_REGENERATE_PROFILE_SNAPSHOT`` does not touch it. It was produced once from H0 code with this file
-copied into ``git archive fb8941f2 src/fa-shared-context-poc tests/shared_context``, run there with
-``PYTHONPATH=src/fa-shared-context-poc;tests/shared_context`` and pydantic 2.12.5:
-``python -c "import test_native_profile_snapshot as t; t.H0_FIXTURE.write_text(t.h0_fixture_text(), encoding='utf-8',
-newline='\\n')"``.
+``fixtures/native_v1_wire_h0.json`` is the H0 baseline (stage release 30, ``fb8941f2``, pinned by its SHA). ADR-0009
+M1: the "v1 wire 凍結" comparison against it retired with the v1 alias (2026-11-02, stage converged on v2); the fixture
+stays only as the source of the stored v1 items whose canonical bytes must not move.
 
 Coordinator decision 2026-10-17 (ADR-0009 §3, M7), two rules:
 
 - Only models Hosted reads or writes are pinned. ``API_ONLY_MODULES`` are left out of the profile snapshot and of both
-  baselines' comparison (H0's fixture still lists their models, unchanged); ``test_no_pinned_module_imports_an_api_only
+  v2 baseline's comparison (H0's fixture still lists their models, unchanged); ``test_no_pinned_module_imports_an_api_only
   _one`` keeps that list honest.
 - From stage release 31 the v2 wire may only grow: ``V2_BASELINE`` (``fixtures/native_v2_wire_<commit>.json``, named
-  after the commit whose code built it) is that baseline. ``v2_drift`` is H0's comparator made stricter, because a
+  after the commit whose code built it) is that baseline. ``v2_drift`` is the H0 comparator made stricter, because a
   release 31 image rejects what it does not know: it also fails on an enum / Literal value, a request variant or a
   model added since the baseline. What passes: a new optional field a dump leaves out by default, and anything listed
-  in ``V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE`` (empty). A change that passes needs no new profile: regenerate the
+  in ``V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE`` and 3d-i's v3 values where no v2 image receives them
+  (``_v3_value_old_images_never_receive``). A change that passes needs no new profile: regenerate the
   profile snapshot (above) and review the diff. ``FA_REGENERATE_PROFILE_SNAPSHOT`` does not touch the baseline; it is
   written only by ``python -c "import test_native_profile_snapshot as t; c='<commit>'; t.SNAPSHOT.with_name(
   f'native_v2_wire_{c}.json').write_text(t.v2_baseline_text(c), encoding='utf-8', newline='\\n')"`` (same
@@ -63,8 +60,10 @@ from shared_context import behavior_native_turn_wire, native_responses_wire, nat
 from shared_context.behavior_native_turn_wire import (
     NATIVE_REQUEST, NATIVE_STATE_PROFILE, NativeRequest, canonical_bytes)
 from shared_context.behavior_sdk_state import AUTO_PROFILE, NATIVE_CODECS, CheckpointProfile, NativeCheckpointRef
-from shared_context.native_responses_wire import NATIVE_V2_PROFILE, UNLABELED_STATE_PROFILE, unlabeled_profile
+from shared_context.native_responses_wire import (
+    NATIVE_V2_PROFILE, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE, unlabeled_profile)
 from shared_context.native_turns import _decode, _json, _Meta
+from shared_context.sdk_pin import PROFILE_RELEASES
 from test_native_turn_wire import capture, submit
 
 SNAPSHOT = Path(__file__).parent / "fixtures" / "native_profile_snapshot.json"
@@ -78,9 +77,9 @@ API_ONLY_MODULES = frozenset({"native_binding", "native_cut", "native_deploy_gat
                               "native_relay_quota", "native_groups", "native_hitl", "native_hitl_material",
                               "native_routines", "native_teams_relay", "native_version_veto"})
 PINNED_PACKAGES = re.compile(r"^(github-copilot-sdk|azure-ai-agentserver-[a-z]+)==\S+$")
-# What an H2d runtime declares (``FA_NATIVE_TURNS``) and labels ``_Meta`` with; ``_Meta``'s default stays v1 (unlabeled
-# items read as v1), so the label is written explicitly by the runtime.
-RUNTIME_PROFILE = NATIVE_V2_PROFILE
+# What this image's runtime declares (``FA_NATIVE_TURNS``) and labels ``_Meta`` with, v3 from ADR-0009 3d-i; ``_Meta``'s
+# default stays v1 (unlabeled items read as v1), so the label is written explicitly by the runtime.
+RUNTIME_PROFILE = NATIVE_V3_PROFILE
 
 
 def _shape(node, *, schema=True):
@@ -197,7 +196,7 @@ def test_an_api_only_model_changes_without_a_new_profile(monkeypatch):
     monkeypatch.setattr(native_binding, "NativeBindingRow", _widened(
         native_binding.NativeBindingRow, extra_field=(str | None, None)))  # written by default: refused on Hosted
     test_profile_snapshot_matches_the_current_profile()
-    assert v1_drift() == [] and v2_drift() == []
+    assert v2_drift() == []
 
 
 # ADR-0009 §3: every state store item written from now on carries its profile; an unlabeled one is v1-era.
@@ -223,7 +222,7 @@ def test_a_v1_submit_digest_does_not_follow_the_profile_constant(monkeypatch):
     The DTO defaults were built from the constant at import, so patching it here cannot reach them: the models are
     checked directly. Every ``exclude_if=unlabeled_profile`` default is the unlabeled profile, also after 2d-ii flips
     the constant, and the H0 v1 items keep their bytes (module docstring)."""
-    from shared_context import behavior_agent_template  # noqa: F401  TemplateSettings carries such a default too
+    from shared_context import behavior_agent_template  # TemplateSettings carries such a default too
 
     def subclasses(cls):
         for sub in cls.__subclasses__():
@@ -248,11 +247,9 @@ def test_a_v1_submit_digest_does_not_follow_the_profile_constant(monkeypatch):
     assert not unlabeled_profile("foundry-responses-v1")
 
 
-# ADR-0009 M1 "v1 wire 凍結": additive-only over the H0 fixture while Hosted keeps the v1 alias (2d-ii still resends
-# v1 originals, ``turn_profile``); the fixture retires with the alias. Allowed: new models, new request/command variants
-# (a discriminated union or a union of models only), wider enums (the v2 profile value), new optional fields a dump
-# leaves out by default. Refused: anything else that differs, a field widened into a union or gaining a variant H0
-# cannot read, and a new default for a field a dump leaves out.
+# The v2 wire is compared with the comparator first written for H0 (ADR-0009 M1 "v1 wire 凍結", retired with the v1
+# alias): a field widened into a union or gaining a variant the baseline cannot read, a new default for a field a dump
+# leaves out, and anything else that differs is refused. The H0 fixture now only supplies the stored v1 items.
 
 H0_FIXTURE = Path(__file__).parent / "fixtures" / "native_v1_wire_h0.json"
 RELEASE_30_SNAPSHOT_SHA256 = "bd3ec14e413dd560e4a71f85e5ec9af07e5e767525edcdac1e633e18dbe2797d"  # fb8941f2's snapshot
@@ -260,8 +257,8 @@ H0_FIXTURE_SHA256 = "d60a8a8adebc9a290ab6155fd63c35f2a45c4026e8a50d3f80df2aa166d
 V2_BASELINE = Path(__file__).parent / "fixtures" / "native_v2_wire_8a8608dd.json"  # stage release 31 (docstring)
 # _digest of the whole fixture; moves only with v2_baseline_text (module docstring)
 V2_BASELINE_SHA256 = "9bf0627d7b4af50c6f74f96739dad0d95900ce502bdb208cb5a30bcbf3eb6e09"
-# The only exception to "nothing may be added under v2": an exact ``... added`` problem of v2_drift for a value release
-# 31 images provably never receive, each with that proof in a comment.
+# An exception to "nothing may be added under v2" (the other is ``_v3_value_old_images_never_receive``): an exact
+# ``... added`` problem of v2_drift for a value release 31 images provably never receive, each with its proof.
 V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE = frozenset({
     # ADR-0009 4d's 已退回 notice kind. No Hosted image ever receives or stores it: (a) no NATIVE_REQUEST variant
     # carries a receipt or a notice (this change leaves the snapshot's ``native_request`` part unchanged); (b) Hosted
@@ -343,27 +340,13 @@ def _with_defs(schema, defs):
     return {**schema, "$defs": needed} if needed else schema
 
 
-def _h0_items():
-    from test_native_turn_wire import agent_receive, receipt_for, submit
-
-    original = submit("h0-rid", text="H0 frozen v1 submit")
-    return {"submit": original, "agent_receive": agent_receive("h0-message"),
-            "receipt": receipt_for(original, "completed")}
-
-
-def h0_fixture_text():
-    """The H0 fixture from the code imported now; run once against fb8941f2 (module docstring). Never from pytest."""
-    return _fixture_text("h0_fixture_text", {"commit": "fb8941f2", "release": "2026.10.15-30"}, NATIVE_STATE_PROFILE,
-                         _collected(hosted_only=False), _h0_items())
-
-
 def v2_baseline_text(commit):
     """The v2 baseline from the code imported now, which is ``commit``'s (module docstring). Never from pytest. No v1
     items: nothing sends v2 yet and H0 pins the v1 bytes."""
-    return _fixture_text("v2_baseline_text", {"commit": commit}, RUNTIME_PROFILE, _collected(), None)
+    return _fixture_text("v2_baseline_text", {"commit": commit}, NATIVE_V2_PROFILE, _collected())
 
 
-def _fixture_text(how, produced_from, state_profile, collected, items):
+def _fixture_text(how, produced_from, state_profile, collected):
     defs, def_fields = {}, {}
 
     def hoist(schema, classes):
@@ -386,8 +369,6 @@ def _fixture_text(how, produced_from, state_profile, collected, items):
         "native_request": hoist(NATIVE_REQUEST.json_schema(), _request_classes()),
         "defs": defs, "def_fields": def_fields, **_pins_and_codecs(),
     }
-    if items:
-        fixture["v1_items"] = {name: canonical_bytes(item).decode("utf-8") for name, item in items.items()}
     lines = []  # one def / model per line: small and greppable
     for key, value in sorted(fixture.items()):
         if key in {"defs", "def_fields", "models"}:
@@ -407,11 +388,10 @@ def _v2_baseline():
     return json.loads(V2_BASELINE.read_text(encoding="utf-8"))
 
 
-def wire_drift(h0, schema, classes, root_fields, root, may_grow=True, prefix=""):
-    """How ``schema`` (current, with its own ``$defs``) is not additive over the H0 schema ``root``.
-
-    ``may_grow``: whether an enum / Literal may gain values and a union of models (the request) may gain models. H0:
-    yes (M1). v2: no, a release 31 image rejects the value it does not know (literal_error / union_tag_invalid).
+def wire_drift(h0, schema, classes, root_fields, root, prefix=""):
+    """How ``schema`` (current, with its own ``$defs``) is not additive over the baseline schema ``root``. No enum /
+    Literal value or union variant may be added: a release 31 image rejects what it does not know (literal_error /
+    union_tag_invalid).
     ``prefix``: what the caller puts before each problem, so a listed value is recognised inside a union too."""
     new_defs = schema.get("$defs", {})
 
@@ -430,8 +410,8 @@ def wire_drift(h0, schema, classes, root_fields, root, may_grow=True, prefix="")
             mapping, now = old["discriminator"]["mapping"], new.get("discriminator", {}).get("mapping", {})
             return [problem for tag, ref in sorted(mapping.items())
                     for problem in (walk({"$ref": ref}, {"$ref": now[tag]}, f"{where}[{tag}]", owner, path)
-                                    if tag in now else [f"{where}[{tag}]: union variant removed"])] + (
-                [] if may_grow else [f"{where}[{tag}]: union variant added" for tag in sorted(now.keys() - mapping)])
+                                    if tag in now else [f"{where}[{tag}]: union variant removed"])] + [
+                f"{where}[{tag}]: union variant added" for tag in sorted(now.keys() - mapping)]
         old_variants, new_variants = old.get("anyOf") or old.get("oneOf"), new.get("anyOf") or new.get("oneOf")
         if old_variants or new_variants:  # each H0 variant must still be accepted by some variant now
             if not old_variants:  # e.g. ``str`` -> ``str | None``: H0 reads one shape only
@@ -439,13 +419,10 @@ def wire_drift(h0, schema, classes, root_fields, root, may_grow=True, prefix="")
             problems = [problem for variant in old_variants
                         for problem in min((walk(variant, candidate, where, owner, path)
                                             for candidate in new_variants or [new]), key=len)]
-            # a union of models only (the request/command level) may gain models; any other new variant H0 must read
-            models = all("$ref" in variant for variant in old_variants)
             # A candidate whose only differences are listed added values is the old variant, not a new one.
             return problems + [f"{where}: new union variant {json.dumps(candidate, sort_keys=True)} H0 cannot read"
                                for candidate in new_variants or [new]
-                               if not (may_grow and models and "$ref" in candidate)
-                               and all(_unlisted([prefix + problem for problem in walk(
+                               if all(_unlisted([prefix + problem for problem in walk(
                                    variant, candidate, where, owner, path)]) for variant in old_variants)]
         kinds = root_fields if owner is None else h0["def_fields"].get(owner, {})
         live = classes.get(owner)
@@ -457,8 +434,7 @@ def wire_drift(h0, schema, classes, root_fields, root, may_grow=True, prefix="")
                 continue
             if key == "enum" and a is not None and b is not None:
                 problems += [f"{where}: enum value {value!r} removed" for value in a if value not in b]
-                if not may_grow:
-                    problems += [f"{where}: enum value {value!r} added" for value in b if value not in a]
+                problems += [f"{where}: enum value {value!r} added" for value in b if value not in a]
             elif key == "properties":
                 for name in a or {}:
                     if name not in (b or {}):
@@ -489,26 +465,45 @@ def wire_drift(h0, schema, classes, root_fields, root, may_grow=True, prefix="")
     return walk(root, schema, "", None, frozenset())
 
 
-def v1_drift():
-    """Every way the code imported now is not additive over H0 (ADR-0009 M1)."""
-    return _drift(_h0())
+# ADR-0009 3d-i's v3 values: 'foundry-native-v3' and SDK 1.0.26 / runtime 1.0.103.
+V3_ADDED = frozenset(f"enum value {value!r} added" for value in (NATIVE_V3_PROFILE, *PROFILE_RELEASES[NATIVE_V3_PROFILE]))
+SENT_TEMPLATE_SETTINGS = re.compile(r"\.settings<TemplateSettings>\.(sdk_version|runtime_version|state_profile)$")
+SENT_BODY_PROFILE = re.compile(r"NATIVE_REQUEST\[\w+\]<\w+>\.state_profile")
+
+
+def _v3_value_old_images_never_receive(problem):
+    """A v2 image never receives a v3 value outside NATIVE_REQUEST: it is what a 3d-i image writes about its own run
+    (``_Meta``, receipts, checkpoint references, SDK state), kept in that Agent's state store or sent Hosted -> API; a v2
+    SID reads it only if the Agent is routed back after its move, which is not supported (ADR-0009 3d-i).
+
+    Under NATIVE_REQUEST only a template's settings may carry one: ``TemplateSettings`` defaults to ``SENT_RELEASE`` and
+    ``select_profile`` admits only ``SENT_RELEASE`` and ``SENT_STATE_PROFILES``. A request's own ``state_profile`` may
+    gain 'foundry-native-v3' too (a 3d-i image must accept 3d-ii's v3 bodies, ADR-0009 3d-i): the API sends
+    ``NATIVE_STATE_PROFILE`` (v2) or a stored original's label (``behavior_native_responses_api.turn_profile``,
+    ``native_agent_relay``, ``native_routines``), never v3 before 3d-ii. Any other request position fails."""
+    where, _, change = problem.partition(": ")
+    if change not in V3_ADDED:
+        return False
+    return (not where.startswith("NATIVE_REQUEST") or SENT_TEMPLATE_SETTINGS.search(where) is not None
+            or SENT_BODY_PROFILE.fullmatch(where) is not None and change == f"enum value {NATIVE_V3_PROFILE!r} added")
 
 
 def _unlisted(problems):
     return [problem for problem in problems
-            if not (problem.endswith(" added") and problem in V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE)]
+            if not (problem.endswith(" added") and (problem in V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE
+                                                     or _v3_value_old_images_never_receive(problem)))]
 
 
 def v2_drift():
     """Every way the code imported now is not additive over the v2 baseline (2026-10-17 rule): H0's comparator, but no
     enum / Literal value, request variant or model may be added either; a new optional field left out by default may."""
-    return _unlisted(_drift(_v2_baseline(), may_grow=False))
+    return _unlisted(_drift(_v2_baseline()))
 
 
-def _drift(baseline, may_grow=True):
+def _drift(baseline):
     problems, current = [], _collected()
-    if not may_grow:  # e.g. a model the baseline was built without: none of its fields would ever be compared
-        problems += [f"{key}: model not in the baseline" for key in sorted(current.keys() - baseline["models"].keys())]
+    # e.g. a model the baseline was built without: none of its fields would ever be compared
+    problems += [f"{key}: model not in the baseline" for key in sorted(current.keys() - baseline["models"].keys())]
     for key, entry in sorted(baseline["models"].items()):
         if key.partition(".")[0] in API_ONLY_MODULES:  # H0's fixture lists them; no Hosted image reads them
             continue
@@ -522,19 +517,16 @@ def _drift(baseline, may_grow=True):
             if schema not in seen:
                 seen.append(schema)
                 problems += [key + problem for problem in
-                             wire_drift(baseline, schema, classes, entry["fields"], entry["schema"], may_grow, key)]
+                             wire_drift(baseline, schema, classes, entry["fields"], entry["schema"], key)]
     problems += ["NATIVE_REQUEST" + problem for problem in wire_drift(
-        baseline, _shape(NATIVE_REQUEST.json_schema()), _request_classes(), {}, baseline["native_request"], may_grow,
+        baseline, _shape(NATIVE_REQUEST.json_schema()), _request_classes(), {}, baseline["native_request"],
         "NATIVE_REQUEST")]
-    snapshot = _pins_and_codecs()
-    problems += [f"{part} changed: {baseline[part]} -> {snapshot[part]}" for part in ("sdk", "checkpoint")
-                 if snapshot[part] != baseline[part]]
-    for name, text in sorted(baseline.get("v1_items", {}).items()):
-        try:
-            if canonical_bytes(V1_ITEMS[name](text)).decode("utf-8") != text:
-                problems.append(f"v1 item {name}: canonical bytes changed")
-        except ValueError as error:
-            problems.append(f"v1 item {name}: no longer decodes ({type(error).__name__})")
+    # ADR-0009 §3 "v2 快照基準在 3d-i 的規則": (c) SDK/runtime and (d) codecs are why a newer profile exists, so once this
+    # image declares one the baseline compares wire only; the profile snapshot and the resume test pin them.
+    if baseline["state_profile"] == RUNTIME_PROFILE:
+        snapshot = _pins_and_codecs()
+        problems += [f"{part} changed: {baseline[part]} -> {snapshot[part]}" for part in ("sdk", "checkpoint")
+                     if snapshot[part] != baseline[part]]
     return problems
 
 
@@ -551,7 +543,6 @@ def test_h0_fixture_is_the_release_30_profile_snapshot():
     assert hashlib.sha256(text.encode("utf-8")).hexdigest() == RELEASE_30_SNAPSHOT_SHA256
     # the parts release 30's snapshot does not cover (fields, def_fields, v1_items) are pinned with the rest
     assert _digest(h0) == H0_FIXTURE_SHA256
-    assert pydantic.VERSION == h0["produced_from"]["pydantic"], "the schemas are pydantic's output; frozen with H0"
 
 
 def _widened(model, name=None, **fields):
@@ -571,71 +562,41 @@ def test_v1_and_unlabeled_items_still_read():
         assert canonical_bytes(item).decode("utf-8") == text, name
 
 
-def test_v1_wire_is_additive_over_h0(monkeypatch):
-    assert v1_drift() == []
-    # the allowed growth: a new optional field left out by default, the v2 profile value, a new request variant
-    monkeypatch.setattr(behavior_native_turn_wire, "NativeSessionState", _widened(
-        behavior_native_turn_wire.NativeSessionState,
-        reserved=(str | None, Field(default=None, exclude_if=lambda value: value is None))))
-    profile = typing.Literal["foundry-native-v1", "foundry-responses-v1", "foundry-native-v2"]
-    monkeypatch.setattr(native_turns, "_Meta", _widened(
-        _Meta, state_profile=(profile, _Meta.model_fields["state_profile"])))
-    # an operation name no real command takes (2d-i adds ``session_cut`` itself)
-    probe = _widened(behavior_native_turn_wire.NativeSessionRead, "NativeH0AdditiveProbe",
-                     operation=(typing.Literal["h0_additive_probe"], ...))
-    monkeypatch.setitem(globals(), "NATIVE_REQUEST", _request(*typing.get_args(NativeRequest.__origin__), probe))
-    assert v1_drift() == []
-
-
-def test_a_retyped_v1_field_fails(monkeypatch):
-    monkeypatch.setattr(behavior_native_turn_wire, "NativeSessionState", _widened(
-        behavior_native_turn_wire.NativeSessionState, etag=(int, ...)))
-    assert any(problem.startswith("behavior_native_turn_wire.NativeSessionState.etag: type 'string' -> 'integer'")
-               for problem in v1_drift())
-
-
-def test_a_v1_field_widened_into_a_union_fails(monkeypatch):
+def test_a_v2_field_widened_into_a_union_fails(monkeypatch):
     state = behavior_native_turn_wire.NativeSessionState
     etag = state.model_fields["etag"]  # same constraints, now also null
     monkeypatch.setattr(behavior_native_turn_wire, "NativeSessionState", _widened(
         state, etag=(typing.Annotated[etag.annotation, *etag.metadata] | None, ...)))
-    assert v1_drift() == ["behavior_native_turn_wire.NativeSessionState.etag: widened into a union"]
+    assert v2_drift() == ["behavior_native_turn_wire.NativeSessionState.etag: widened into a union"]
 
 
-def test_a_new_variant_in_a_v1_field_union_fails(monkeypatch):
+def test_a_new_variant_in_a_v2_field_union_fails(monkeypatch):
     monkeypatch.setattr(native_turns, "_Meta", _widened(_Meta, rid=(_Meta.model_fields["rid"].annotation | int, None)))
-    assert v1_drift() == ['native_turns._Meta.rid: new union variant {"type": "integer"} H0 cannot read']
+    assert v2_drift() == ['native_turns._Meta.rid: new union variant {"type": "integer"} H0 cannot read']
 
 
-def test_a_new_default_for_an_omitted_v1_field_fails(monkeypatch):
+def test_a_new_default_for_an_omitted_v2_field_fails(monkeypatch):
     rid = _Meta.model_fields["inflight_rid"].annotation  # still left out at its (new) default
     monkeypatch.setattr(native_turns, "_Meta", _widened(
         _Meta, inflight_rid=(rid, Field(default="h0", exclude_if=lambda value: value in (None, "h0")))))
-    assert v1_drift() == ["native_turns._Meta.inflight_rid: omitted default None -> 'h0'"]
+    assert v2_drift() == ["native_turns._Meta.inflight_rid: omitted default None -> 'h0'"]
 
 
-def test_a_new_required_v1_field_fails(monkeypatch):
+def test_a_new_required_v2_field_fails(monkeypatch):
     monkeypatch.setattr(behavior_native_turn_wire, "NativeSessionState", _widened(
         behavior_native_turn_wire.NativeSessionState, extra_field=(str, ...)))
-    assert "behavior_native_turn_wire.NativeSessionState.extra_field: new required field" in v1_drift()
+    assert "behavior_native_turn_wire.NativeSessionState.extra_field: new required field" in v2_drift()
 
 
-def test_a_new_default_emitted_v1_field_fails(monkeypatch):
-    monkeypatch.setattr(behavior_native_turn_wire, "NativeSessionState", _widened(
-        behavior_native_turn_wire.NativeSessionState, extra_field=(str | None, None)))
-    assert v1_drift() == ["behavior_native_turn_wire.NativeSessionState.extra_field: new field is emitted, "
-                          "not omitted by default"]
-
-
-def test_an_h0_field_now_written_by_default_fails_with_its_v1_bytes(monkeypatch):
+def test_a_field_now_written_by_default_fails_and_moves_the_v1_bytes(monkeypatch):
     original = behavior_native_turn_wire.NativeSubmit
     submit = _widened(original, new_conversation_id=(str | None, None))
     monkeypatch.setattr(behavior_native_turn_wire, "NativeSubmit", submit)
     monkeypatch.setitem(globals(), "NATIVE_REQUEST", _request(
         *(submit if variant is original else variant for variant in typing.get_args(NativeRequest.__origin__))))
-    problems = v1_drift()
-    assert "behavior_native_turn_wire.NativeSubmit.new_conversation_id: written omitted in H0, emitted now" in problems
-    assert "v1 item submit: canonical bytes changed" in problems
+    assert "behavior_native_turn_wire.NativeSubmit.new_conversation_id: written omitted in H0, emitted now" in v2_drift()
+    text = _h0()["v1_items"]["submit"]  # the stored v1 submit would no longer keep its bytes (or its digest)
+    assert canonical_bytes(NATIVE_REQUEST.validate_json(text)).decode("utf-8") != text
 
 
 def test_the_h0_and_v2_baselines_ignore_the_regenerate_flag(monkeypatch, tmp_path):
@@ -644,20 +605,32 @@ def test_the_h0_and_v2_baselines_ignore_the_regenerate_flag(monkeypatch, tmp_pat
     monkeypatch.setitem(globals(), "SNAPSHOT", tmp_path / "snapshot.json")
     with pytest.raises(pytest.fail.Exception, match="snapshot regenerated"):
         test_profile_snapshot_matches_the_current_profile()
-    test_a_retyped_v1_field_fails(monkeypatch)  # still refused with the flag set
-    test_a_changed_v2_field_fails(monkeypatch)
+    test_a_changed_v2_field_fails(monkeypatch)  # still refused with the flag set
     assert (H0_FIXTURE.read_bytes(), V2_BASELINE.read_bytes()) == before
 
 
 def test_a_pin_or_codec_change_fails(monkeypatch, tmp_path):
+    """Under the baseline's own profile ``v2_drift`` refuses it; once the image declares a newer profile (ADR-0009
+    3d-i) the baseline compares wire only and the profile snapshot refuses it instead."""
+    monkeypatch.delenv("FA_REGENERATE_PROFILE_SNAPSHOT", raising=False)
     bumped = tmp_path / "requirements-hosted.txt"
     bumped.write_text(re.sub(r"(?m)^(github-copilot-sdk==)\S+", r"\g<1>0.0.0",
                              HOSTED_REQUIREMENTS.read_text(encoding="utf-8")), encoding="utf-8")
+
+    def refused(part):
+        with pytest.raises(AssertionError, match=f"'{part}'"):
+            test_profile_snapshot_matches_the_current_profile()
+        assert v2_drift() == []
+        monkeypatch.setitem(globals(), "RUNTIME_PROFILE", NATIVE_V2_PROFILE)
+        # The bumped pin itself differs from the v2 baseline, so "sdk changed" may come with it.
+        assert f"{part} changed" in [problem.partition(":")[0] for problem in v2_drift()]
+
     monkeypatch.setitem(globals(), "HOSTED_REQUIREMENTS", bumped)
-    assert [problem.partition(":")[0] for problem in v1_drift()] == ["sdk changed"]
+    refused("sdk")
     monkeypatch.undo()
+    monkeypatch.delenv("FA_REGENERATE_PROFILE_SNAPSHOT", raising=False)
     monkeypatch.setitem(NATIVE_CODECS, "fa-h0-extra-codec", next(iter(NATIVE_CODECS.values())))
-    assert [problem.partition(":")[0] for problem in v1_drift()] == ["checkpoint changed"]
+    refused("checkpoint")
 
 
 # 2026-10-17 (ADR-0009 §3, M7): the v2 wire is additive-only over its baseline, by H0's comparator made stricter.
@@ -666,7 +639,7 @@ def test_v2_baseline_is_pinned():
     baseline = _v2_baseline()
     assert _digest(baseline) == V2_BASELINE_SHA256
     assert V2_BASELINE.name == f"native_v2_wire_{baseline['produced_from']['commit']}.json"
-    assert baseline["state_profile"] == RUNTIME_PROFILE == NATIVE_V2_PROFILE and "v1_items" not in baseline
+    assert baseline["state_profile"] == NATIVE_V2_PROFILE and "v1_items" not in baseline
     assert not {key.partition(".")[0] for key in baseline["models"]} & API_ONLY_MODULES
     assert pydantic.VERSION == baseline["produced_from"]["pydantic"], "the schemas are pydantic's output"
 
@@ -719,7 +692,34 @@ def test_a_new_v2_request_variant_or_model_fails(monkeypatch):
                      operation=(typing.Literal["v2_additive_probe"], ...))
     monkeypatch.setitem(globals(), "NATIVE_REQUEST", _request(*typing.get_args(NativeRequest.__origin__), probe))
     assert v2_drift() == ["NATIVE_REQUEST[v2_additive_probe]: union variant added"]
-    assert v1_drift() == []  # H0 allows it (M1)
     monkeypatch.undo()
     monkeypatch.setattr(behavior_native_turn_wire, "NativeV2AdditiveProbe", probe, raising=False)
     assert v2_drift() == ["behavior_native_turn_wire.NativeV2AdditiveProbe: model not in the baseline"]
+
+
+def test_a_v3_value_passes_only_where_no_v2_image_receives_it(monkeypatch):
+    """3d-i's v3 values pass outside NATIVE_REQUEST, in a request's template settings, and as a request's own v3
+    ``state_profile``; anywhere else a v2 image would receive one and refuse it (``_v3_value_old_images_never_receive``)."""
+    request = "NATIVE_REQUEST[submit]<NativeSubmit>"
+    settings = f"{request}.capture<NativeTurnCapture>.template<AgentTemplate>.settings<TemplateSettings>"
+    passing = ["native_turns._Meta.state_profile: enum value 'foundry-native-v3' added",
+               "behavior_sdk_state.SdkState.sdk_version: enum value '1.0.26' added",
+               f"{settings}.sdk_version: enum value '1.0.26' added",
+               f"{settings}.runtime_version: enum value '1.0.103' added",
+               f"{settings}.state_profile: enum value 'foundry-native-v3' added",
+               f"{request}.state_profile: enum value 'foundry-native-v3' added"]
+    failing = [f"{request}.state_profile: enum value '1.0.26' added",
+               f"{settings}.checkpoint_profile<CheckpointProfile>.name: enum value 'foundry-native-v3' added",
+               f"{request}.capture<NativeTurnCapture>.sdk_version: enum value '1.0.103' added",
+               f"{request}.source<NativeAgentOrigin>.state_profile: enum value 'foundry-native-v3' added",
+               "behavior_sdk_state.SdkState.sdk_version: enum value '1.0.27' added"]
+    assert _unlisted(passing + failing) == failing
+    # A real widening: a request's own state_profile gaining an SDK version string is caught.
+    submit_model = behavior_native_turn_wire.NativeSubmit
+    widened = _widened(submit_model, state_profile=(
+        typing.Literal[(*typing.get_args(submit_model.model_fields["state_profile"].annotation), "1.0.26")],
+        Field(default=UNLABELED_STATE_PROFILE, exclude_if=unlabeled_profile)))
+    variants = tuple(widened if variant is submit_model else variant
+                     for variant in typing.get_args(NativeRequest.__origin__))
+    monkeypatch.setitem(globals(), "NATIVE_REQUEST", _request(*variants))
+    assert v2_drift() == [f"{request}.state_profile: enum value '1.0.26' added"]

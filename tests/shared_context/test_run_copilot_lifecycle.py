@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import logging
+import time
 from types import SimpleNamespace
 from unittest.mock import create_autospec
 
@@ -22,6 +23,8 @@ from shared_context.behavior_sdk_files import SESSION_FS, SdkSessionFiles
 from shared_context.behavior_sdk_state import DIAG_CODECS
 from shared_context.errors import Problem
 from shared_context.m2_copilot import MAX_OUTPUT_TOKENS, MAX_PROMPT_TOKENS, ResidentHolder, ToolOutput, ToolSpec
+from shared_context.sdk_pin import RUNTIME_VERSION
+from sdk_session_stub import OFFLINE_SESSION_RPC
 
 SID = "lifecycle-contract"
 MODEL = "fixture-model"
@@ -71,11 +74,12 @@ def session_files(**changes):
 @pytest.fixture
 def sdk(tmp_path, monkeypatch):
     session = create_autospec(CopilotSession, instance=True)
+    session.rpc = OFFLINE_SESSION_RPC
     session.session_id = SID
     session.get_events.return_value = []
     session.send_and_wait.return_value = None
     client = create_autospec(CopilotClient, instance=True)
-    client.get_status.return_value = GetStatusResponse(version="1.0.83", protocol_version=2)
+    client.get_status.return_value = GetStatusResponse(version=RUNTIME_VERSION, protocol_version=2)
     client.create_session.return_value = session
     client.resume_session.return_value = session
     client._cli_process = SimpleNamespace(pid=7, returncode=0, poll=lambda: 0, kill=lambda: None)
@@ -322,7 +326,7 @@ def test_a_clean_idle_turn_keeps_its_sdk_and_publishes_the_files_it_checked(runn
     assert running.timeline == ["forward final=False"]
     live = holder.live
     assert (live.client, live.session, live.process, live.turn) == (running.client, running.session, running.process, None)
-    expected = {"runtime_version": "1.0.83", "pid": 7, "graceful": True, "release": "fa-resident-worker-poc-v1"}
+    expected = {"runtime_version": RUNTIME_VERSION, "pid": 7, "graceful": True, "release": "fa-resident-worker-poc-v1"}
     assert outcome["sdk_stop"] == expected and stopped == [expected]
     assert stopped[0] is not outcome["sdk_stop"]
     assert outcome["release_state"] == (files.snapshot.return_value, hashlib.sha256(b"[]").hexdigest())
@@ -339,7 +343,8 @@ def test_a_clean_idle_turn_keeps_its_sdk_and_publishes_the_files_it_checked(runn
     ({"automatic_open": True}, "compaction_running"),
     ({"checkpoint_profile": "auto", "automatic": True, "failed": True}, "checkpoint_failed"),
 ], ids=["manual", "diag", "error", "failed", "compacting", "auto-open", "auto-failed"])
-def test_a_turn_with_unsafe_files_stops_its_sdk_flushing_them_first(running, caplog, changes, reason):
+def test_a_turn_with_unsafe_files_stops_its_sdk_flushing_them_first(running, caplog, monkeypatch, changes, reason):
+    monkeypatch.setattr(m2_copilot, "COMPACTION_SETTLE_SECONDS", 0.05)
     stopped = []
     holder, options = resident_turn(running, session_files(**changes), on_sdk_stopped=stopped.append)
     with caplog.at_level(logging.WARNING):
@@ -347,7 +352,7 @@ def test_a_turn_with_unsafe_files_stops_its_sdk_flushing_them_first(running, cap
     assert stop_reasons(caplog) == [reason]
     assert running.timeline == ["disconnect", "stop", "forward final=True"]
     assert holder.live is None
-    expected = {"runtime_version": "1.0.83", "pid": 7, "exit_code": 0, "graceful": True}
+    expected = {"runtime_version": RUNTIME_VERSION, "pid": 7, "exit_code": 0, "graceful": True}
     assert outcome["sdk_stop"] == expected and stopped == [expected]
     assert "release_state" not in outcome
 
@@ -511,24 +516,119 @@ def test_a_real_timeout_aborts_and_reports_a_timeout(running):
     assert running.timeline == ["abort", "stop", "forward final=True"]
 
 
-def test_a_cancel_during_the_stop_still_seals_telemetry_and_forces_nothing(running):
+def cancel_while_hung(running, step, options):
+    """Runs a turn, cancels it once ``step`` (an autospecced SDK call) is awaiting, and ends with the task's outcome."""
     async def scenario():
         reached = asyncio.Event()
 
         async def hang():
-            running.timeline.append("stop")
+            running.timeline.append(step._mock_name)
             reached.set()
             await asyncio.Event().wait()
 
-        running.client.stop.side_effect = hang
-        task = asyncio.ensure_future(m2_copilot.run_copilot(**running.defaults))
+        step.side_effect = hang
+        task = asyncio.ensure_future(m2_copilot.run_copilot(**options))
         await reached.wait()
         task.cancel()
         await task
 
+    asyncio.run(scenario())
+
+
+def forced_exit_ends_the_cli(running):
+    def forced():
+        running.timeline.append("force_stop")
+        running.process.returncode = -9
+
+    running.client.force_stop.side_effect = forced
+
+
+def stop_fails(running):
+    def fail():
+        running.timeline.append("stop")
+        raise ValueError("private")
+
+    running.client.stop.side_effect = fail
+
+
+def cli_survives_every_kill(monkeypatch):
+    monkeypatch.setattr(m2_copilot, "EXIT_CONFIRM_SECONDS", 0)
+    monkeypatch.setattr(m2_copilot, "KILL_CONFIRM_SECONDS", 0)
+
+
+async def cancel_at_the_release_check(_parts):
+    asyncio.current_task().cancel()
+
+
+def test_a_cancel_during_the_stop_forces_the_exit_and_stays_cancelled(running):
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(scenario())
-    assert running.timeline == ["stop", "forward final=True"]
+        cancel_while_hung(running, running.client.stop, running.defaults)
+    assert running.timeline == ["stop", "force_stop", "forward final=True"]
+
+
+@pytest.mark.parametrize("hung", ["disconnect", "stop"])
+def test_a_cancel_during_an_unkept_turns_stop_leaves_no_cli_running(running, hung):
+    forced_exit_ends_the_cli(running)
+    stopped = []
+    holder, options = resident_turn(running, session_files(failed=True), on_sdk_stopped=stopped.append)
+    step = running.session.disconnect if hung == "disconnect" else running.client.stop
+    with pytest.raises(asyncio.CancelledError):
+        cancel_while_hung(running, step, {**running.defaults, **options})
+    assert running.process.returncode == -9 and holder.live is None
+    assert running.timeline[-2:] == ["force_stop", "forward final=True"]
+    assert stopped == [], "a forced exit is no graceful stop evidence"
+    assert options["behavior_boundary"].failure["exception_type"] == "CancelledError"
+
+
+def test_a_cancel_during_the_stop_leaves_delegation_unfinished_like_any_unverified_stop(running):
+    forced_exit_ends_the_cli(running)
+    runtime = delegation()
+    with pytest.raises(asyncio.CancelledError):
+        cancel_while_hung(running, running.client.stop, {**running.defaults, **delegated(running, runtime)})
+    runtime.finish.assert_not_awaited()
+
+
+def test_a_cancel_during_the_stop_hands_a_surviving_cli_to_the_owner_and_stays_cancelled(running, monkeypatch, caplog):
+    cli_survives_every_kill(monkeypatch)
+    holder, options = resident_turn(running, session_files(failed=True))
+    survivors = []
+    holder.on_unexited = survivors.append
+    with pytest.raises(asyncio.CancelledError):
+        cancel_while_hung(running, running.client.stop, {**running.defaults, **options})
+    assert survivors == [running.process] and running.process.killed == 1
+    assert "NATIVE_CLI_UNKILLABLE pid=7 path=turn" in caplog.text
+
+
+def test_a_cancel_at_the_release_check_outranks_a_stop_failure_once_the_exit_is_confirmed(running):
+    forced_exit_ends_the_cli(running)
+    stop_fails(running)
+    holder, options = resident_turn(running, on_reply=cancel_at_the_release_check)
+    with pytest.raises(asyncio.CancelledError):
+        running.run(**options)
+    assert holder.live is None and running.process.returncode == -9
+    assert running.timeline == ["disconnect", "stop", "force_stop", "forward final=True"]
+    assert options["behavior_boundary"].failure["exception_type"] == "ValueError"
+
+
+def test_a_cancel_at_the_release_check_hands_a_surviving_cli_to_the_owner_and_stays_cancelled(running, monkeypatch, caplog):
+    cli_survives_every_kill(monkeypatch)
+    stop_fails(running)
+    holder, options = resident_turn(running, on_reply=cancel_at_the_release_check)
+    survivors = []
+    holder.on_unexited = survivors.append
+    with pytest.raises(asyncio.CancelledError):
+        running.run(**options)
+    assert survivors == [running.process] and running.process.killed == 1 and holder.live is None
+    assert "NATIVE_CLI_UNKILLABLE pid=7 path=turn" in caplog.text
+
+
+def test_a_surviving_cli_nobody_registers_outranks_the_cancel(running, monkeypatch):
+    cli_survives_every_kill(monkeypatch)
+    stop_fails(running)
+    _, options = resident_turn(running, on_reply=cancel_at_the_release_check)
+    with pytest.raises(m2_copilot.SdkRuntimeStillRunning) as caught:
+        running.run(**options)
+    assert caught.value.process is running.process
 
 
 @pytest.mark.parametrize("first_true", [True, False], ids=["before-compaction", "after-compaction"])
@@ -629,7 +729,8 @@ def test_the_next_turn_reaches_a_kept_sdk_through_its_own_handlers(running):
     later = []
     running.run(**{**options, "on_event": later.append})
     running.client.create_session.assert_awaited_once()
-    running.client.start.assert_awaited_once()
+    assert running.client.create_session.await_args.kwargs["session_id"] == SID
+    running.client.start.assert_awaited_once_with()
     registered["on_event"]({"type": "after.release"})
     assert running.events == first_events and later == []
     assert isinstance(registered["on_permission_request"](None, {}), PermissionDecisionReject)
@@ -659,9 +760,10 @@ def test_changed_tools_restart_a_kept_sdk_from_its_live_files(running, caplog):
     with caplog.at_level(logging.WARNING):
         running.run(**{**options, "tools": tools})
     assert "RESIDENT_SDK_RESTARTED reason=settings_changed" in caplog.text
-    running.session.disconnect.assert_awaited()
+    running.session.disconnect.assert_awaited_once_with()
     assert running.client.resume_session.await_args.kwargs["continue_pending_work"] is False
     running.client.create_session.assert_awaited_once()
+    assert running.client.create_session.await_args.kwargs["session_id"] == SID
     assert holder.live is not kept
 
 
@@ -677,7 +779,7 @@ def test_a_cli_that_outlives_its_replacement_stop_starts_no_second_sdk(running):
     kept.digest = "other settings"
     with pytest.raises(m2_copilot.SdkRuntimeStillRunning):
         running.run(**options)
-    running.client.start.assert_awaited_once()
+    running.client.start.assert_awaited_once_with()
     assert holder.live is None
 
 
@@ -694,16 +796,69 @@ def test_a_new_client_waits_for_the_conversations_earlier_stops(running):
     assert order == ["settle", "start"]
 
 
-def test_a_compaction_starting_right_after_idle_stops_the_sdk(running, caplog):
+def test_a_compaction_that_never_ends_after_idle_stops_the_sdk_once_the_wait_runs_out(running, caplog, monkeypatch):
+    monkeypatch.setattr(m2_copilot, "COMPACTION_SETTLE_SECONDS", 0.2)
     files = session_files()
 
     async def on_reply(_parts):
-        asyncio.get_running_loop().call_soon(setattr, files, "automatic_open", True)
+        files.automatic_open = True
 
     holder, options = resident_turn(running, files, on_reply=on_reply)
+    started = time.monotonic()
     with caplog.at_level(logging.WARNING):
         running.run(**options)
     assert stop_reasons(caplog) == ["compaction_running"] and holder.live is None
+    assert time.monotonic() - started >= 0.2
+
+
+@pytest.mark.parametrize("resident", [True, False])
+def test_the_runtimes_own_compaction_still_running_at_idle_is_awaited_before_the_sdk_is_kept_or_stopped(
+        running, caplog, resident):
+    # Runtime 1.0.103 reports idle before its threshold compaction completes; stopping then refuses the checkpoint.
+    files = session_files(checkpoint_profile="auto", automatic=True)
+    seen_at_stop = []
+
+    async def on_reply(_parts):
+        files.automatic_open = True  # already started when idle arrives (observed on 1.0.103)
+        asyncio.get_running_loop().call_later(0.2, setattr, files, "automatic_open", False)
+
+    running.client.stop.side_effect = lambda: (seen_at_stop.append(files.automatic_open),
+                                               setattr(running.process, "returncode", 0))
+    if resident:
+        holder, options = resident_turn(running, files, on_reply=on_reply)
+    else:
+        holder, options = None, running.instruction(session_files=files, timeout_seconds=None, on_reply=on_reply)
+    with caplog.at_level(logging.WARNING):
+        running.run(**options)
+    assert files.automatic_open is False
+    if resident:
+        assert stop_reasons(caplog) == [] and holder.live is not None
+        files.snapshot.assert_called_once_with(freeze=False)
+    else:
+        assert seen_at_stop == [False]
+
+
+@pytest.mark.parametrize("cause, reason", [("failed", "checkpoint_failed"), ("dead", "turn_incomplete"),
+                                           ("stop", "compaction_running")])
+def test_a_compaction_that_can_no_longer_finish_or_a_user_stop_is_not_waited_for(running, caplog, cause, reason):
+    files = session_files(checkpoint_profile="auto", automatic=True)
+    stopped = []
+
+    async def on_reply(_parts):
+        files.automatic_open = True
+        if cause == "failed":
+            files.failed = True
+        elif cause == "dead":
+            running.process.returncode = 1
+        else:
+            stopped.append(True)
+
+    holder, options = resident_turn(running, files, on_reply=on_reply)
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        running.run(cancel_requested=lambda: bool(stopped), **options)
+    assert time.monotonic() - started < 5
+    assert stop_reasons(caplog) == [reason] and holder.live is None
 
 
 def test_a_later_turn_that_fails_empties_the_slot_of_its_kept_sdk(running, caplog):
@@ -714,4 +869,4 @@ def test_a_later_turn_that_fails_empties_the_slot_of_its_kept_sdk(running, caplo
     with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="^Copilot turn failed"):
         running.run(**options)
     assert stop_reasons(caplog) == ["turn_incomplete"] and holder.live is None
-    running.client.stop.assert_awaited_once()
+    running.client.stop.assert_awaited_once_with()

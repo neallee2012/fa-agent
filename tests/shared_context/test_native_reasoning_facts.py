@@ -17,7 +17,7 @@ from shared_context.behavior_native_turn_wire import NativeSubmit, NativeTurnCap
 from shared_context.m2_copilot import _ModelGateway
 from shared_context.native_sdk import NativeSdkExecutor
 from shared_context.native_turns import NativeTurnRuntime
-from test_m2_copilot import runtime_path  # noqa: F401
+from test_m2_copilot import runtime_path
 from test_native_turn_wire import capture, submit
 from test_native_turns import IDENTITY
 
@@ -145,7 +145,7 @@ def test_pinned_runtime_native_turns_never_send_reasoning_effort_to_a_model_decl
                 return receipt
             await asyncio.sleep(0.02)
 
-    headers = {"x-client-fa-state-profile": "foundry-native-v1", "x-agent-session-id": IDENTITY.session_id,
+    headers = {"x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
                "x-agent-invocation-id": "reasoning-facts", "x-agent-foundry-call-id": "reasoning-facts"}
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
         first = NativeSubmit(command=submit(text="Reply ok.").command, capture=selected)

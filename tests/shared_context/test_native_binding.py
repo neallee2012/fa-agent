@@ -30,7 +30,7 @@ from test_conversation_transfer_startup import synthetic_standing_v1
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 from test_native_environment_api import environment_at
-from test_native_responses_api import responses_api  # noqa: F401
+from test_native_responses_api import responses_api
 from test_native_session_prepare_api import project_client
 
 NOW = datetime(2026, 10, 13, 9, 30, tzinfo=timezone.utc)
@@ -806,13 +806,13 @@ def test_a_profile_refusal_naming_the_version_the_vm_woke_on_records_that_versio
         agent_id=case.agent_id, request_id=command.request_id, state="pending", reason="source_active",
         previous_hosted_session_id=case.sid, previous_agent_version="41", hosted_session_id="fa-native-next",
         hosted_agent_version="41"))
-    declares(monkeypatch, {"40": "foundry-native-v3"})
+    declares(monkeypatch, {"40": "foundry-native-v4"})
     refusal = before_dispatch(Problem(403, "NATIVE_TURNS_DISABLED", "private"), "profile", "40")
     refusing_submit(case, monkeypatch, refusal.body["error"], status=403)
     submit(case)
     recorded = row(case)
     assert (recorded.observed.agent_version, recorded.drift, recorded.state_profile) == (
-        "40", True, "foundry-native-v3")
+        "40", True, "foundry-native-v4")
     assert not recorded.supported()
 
 
@@ -1042,7 +1042,7 @@ def test_owner_submit_carries_the_switch_notice_once_and_clears_it_after_writing
 
 
 def test_the_switch_notice_is_not_sent_again_when_the_clock_does_not_tick_between_two_submits(bound, monkeypatch):
-    """#912 review P3: ``clear_notice`` must refresh the kept row as ``clear_waiting`` does; a tied monotonic() tick
+    """#912: ``clear_notice`` must refresh the kept row as ``clear_waiting`` does; a tied monotonic() tick
     (Windows, 15.6 ms) otherwise reuses the stale row that still holds the notice."""
     case = bound
     for module in (behavior_native_sessions, behavior_native_turn_api):  # the submit's start and the kept row's tick
@@ -1233,7 +1233,7 @@ def test_the_waiting_note_reaches_only_a_6a_c_bridge_once_and_never_teams(bound)
 
 
 def test_no_waiting_note_once_the_platform_already_runs_the_target(bound):
-    """#908 review P3: ``record_observed`` keeps ``idle_upgrade`` when the platform moves the VM to v42 itself, so the
+    """#908: ``record_observed`` keeps ``idle_upgrade`` when the platform moves the VM to v42 itself, so the
     page must not say "有新版本 v42" while the Agent already runs v42."""
     case = bound
     claim(case)
@@ -1259,7 +1259,7 @@ def test_a_slot_notice_takes_the_status_line_before_the_waiting_note_and_a_2c_br
 
 
 def test_clearing_a_lost_fence_never_clears_the_newer_one_that_replaced_it():
-    """#858 review P3: ``record_upgrade(upgrade=None, lost=...)`` clears only that lost fence."""
+    """#858: ``record_upgrade(upgrade=None, lost=...)`` clears only that lost fence."""
     from shared_context.native_binding import NativeBindingUpgrade
 
     store = NativeBindingStore(InMemoryRepository(), tenant_id="tenant", team_id="team", clock=lambda: NOW)
