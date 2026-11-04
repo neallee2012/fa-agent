@@ -67,8 +67,8 @@ from .native_markers import (
     _Deferred, _Refused,
 )
 
-# ADR-0009 §3 v2→v3 3d-i: a runtime also admits the v2 header as an alias of its own profile while the API still sends
-# v2. Temporary: the first image after 3d-ii removes it.
+# ADR-0009 §3 v2→v3 3d-i: a runtime also admits the v2 header as an alias of its own profile, for a 3d-i API that sends
+# v2 (from 3d-ii the API sends v3). Temporary: the first image after 3d-ii removes it.
 HEADER_ALIAS_PROFILES = frozenset({NATIVE_V2_PROFILE})
 # Body Invocations profiles a runtime admits besides its own: an unlabeled v1 or a v2 original resent with its own
 # digest. Permanent, unlike the header alias (stored originals keep their profile).

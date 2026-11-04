@@ -404,6 +404,9 @@ class _ModelGateway(CopilotRequestHandler):
             body["max_tokens"] = MAX_OUTPUT_TOKENS
         elif self.supports_reasoning_effort is False:
             _drop_reasoning(body)
+        elif self.supports_reasoning_effort and "max_tokens" in body:
+            # Reasoning models reject max_tokens on Chat Completions (400 unsupported_parameter); same value, new name.
+            body["max_completion_tokens"] = body.pop("max_tokens")
 
     def _limit_images(self, body, ctx):
         unsendable = _omit_unsendable_images(body) if self.instruction else 0

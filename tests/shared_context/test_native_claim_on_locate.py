@@ -14,7 +14,7 @@ import pytest
 
 from shared_context import behavior_native_sessions
 from shared_context.behavior_native_sessions import NativeSessions, native_sessions
-from shared_context.native_responses_wire import NATIVE_V2_PROFILE
+from shared_context.native_responses_wire import NATIVE_V3_PROFILE
 from test_native_binding import CountingRepository, bound, claim, row
 from test_native_turn_api import PREFIX, native_api, submit
 from test_conversation_transfer_startup import synthetic_standing_v1
@@ -49,8 +49,8 @@ def test_an_unclaimed_compatible_session_of_another_version_is_claimed_and_serve
     enforce(case.composition, monkeypatch)
     no_follow(monkeypatch)
     # The located version's definition declares v2 (any supported profile is served; the API still sends v1).
-    monkeypatch.setattr(behavior_native_sessions, "_native_profile", lambda client, **_: NATIVE_V2_PROFILE)
-    monkeypatch.setattr(NativeSessions, "_row_profile", lambda self, target, version: NATIVE_V2_PROFILE)
+    monkeypatch.setattr(behavior_native_sessions, "_native_profile", lambda client, **_: NATIVE_V3_PROFILE)
+    monkeypatch.setattr(NativeSessions, "_row_profile", lambda self, target, version: NATIVE_V3_PROFILE)
     platform.version = "42"  # The selector moved; only the 41 session exists and this Agent has no binding row.
     assert row(case) is None
     served = submit(case, rid="p7-served")
@@ -60,7 +60,7 @@ def test_an_unclaimed_compatible_session_of_another_version_is_claimed_and_serve
     claimed = row(case)
     assert (claimed.hosted_session_id, claimed.created_agent_version, claimed.observed.agent_version) == (
         case.sid, "41", "41")
-    assert (claimed.observed.source, claimed.state_profile, claimed.drift) == ("claim", NATIVE_V2_PROFILE, False)
+    assert (claimed.observed.source, claimed.state_profile, claimed.drift) == ("claim", NATIVE_V3_PROFILE, False)
     assert [kind for kind, _ in case.repository.writes] == ["create"]
 
 

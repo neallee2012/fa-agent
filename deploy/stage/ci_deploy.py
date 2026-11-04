@@ -76,17 +76,17 @@ VERSIONS = APP / "shared_context" / "behavior_agent_versions.py"
 # Overlay keys sync checks by value, not as "0"/"1" switches (behavior_agent_versions._check_environment).
 HOSTED_VALUE_KEYS = frozenset({"FA_NATIVE_TURNS", "FA_NATIVE_HITL_TTL_SECONDS", "FA_PRIVATE_MEMORY_STORE", "TZ",
                                "FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL"})
-# native_responses_wire.ACCEPTED_STATE_PROFILES, copied: meta cannot import shared_context. ADR-0009 3d-i: {v2, v3}
-# (the v1 alias retired with M1).
-HOSTED_STATE_PROFILES = frozenset({"foundry-native-v2", "foundry-native-v3"})
+# native_responses_wire.ACCEPTED_STATE_PROFILES, copied: meta cannot import shared_context. v3 only from ADR-0009 3d-ii.
+HOSTED_STATE_PROFILES = frozenset({"foundry-native-v3"})
 # ADR-0009 2d-i's one switch (src README#native-2di-switch): the API's FA_NATIVE_SESSION_GUARD_ENFORCE="1" also makes
 # every assistant's Hosted definition declare the Hosted profile (v3 from 3d-i); one is never deployed without the other.
 SESSION_GUARD = "FA_NATIVE_SESSION_GUARD_ENFORCE"
 # ADR-0009 phase 4 idle upgrade (src README#native-2di-switch): only on top of the 2d-i switch, so its single revision
 # mode and serving-revision checks hold too; the API itself also refuses to start with it alone.
 IDLE_UPGRADE = "FA_NATIVE_IDLE_UPGRADE"
-NATIVE_V2 = "foundry-native-v2"  # what the API declares and sends (native_responses_wire.NATIVE_STATE_PROFILE)
-NATIVE_V3 = "foundry-native-v3"  # what assistants' Hosted definitions declare from ADR-0009 3d-i
+# What the API declares and sends from ADR-0009 3d-ii (native_responses_wire.NATIVE_STATE_PROFILE), and what
+# assistants' Hosted definitions declare from 3d-i.
+NATIVE_V3 = "foundry-native-v3"
 # The installed behavior configuration: the operator sets it at W7; a CI image update only checks it (api).
 API_CONFIG_ENV = "BEHAVIOR_SERVER_CONFIG_JSON"
 # The native_binding.NATIVE_2DI_SCHEMA the API must declare before the switch goes on: 2 = P5's background cut plus
@@ -508,7 +508,7 @@ def hosted_environment():
         environment = agent.get("hosted_environment") or {}
         turns, assistant = environment.get("FA_NATIVE_TURNS"), agent["kind"] == "assistant"
         # A native profile only on assistants and only through the switch: an executor never runs the turn the API
-        # moves. ADR-0009 3d-i: assistants declare v3 while the API still sends v2 (the Hosted v2 header alias).
+        # moves. ADR-0009 3d-ii: assistants declare v3, the profile the API sends.
         if turns in HOSTED_STATE_PROFILES and not assistant or assistant and turns not in {None, NATIVE_V3}:
             raise SystemExit(f"{agent['name']}: FA_NATIVE_TURNS in hosted_environment must match the 2d-i switch "
                              f"(api_environment {SESSION_GUARD}); leave it out, the switch sets {NATIVE_V3} on "
@@ -538,7 +538,7 @@ def api_routines():
     if routines not in {None, "0", "1"} or clock not in {None, "0", "api"} or proposals not in {None, "0", "1"}:
         raise SystemExit("api_environment: FA_NATIVE_ROUTINES_ENABLED and FA_NATIVE_ROUTINE_PROPOSALS accept only "
                          "\"0\" or \"1\", FA_NATIVE_ROUTINE_CLOCK only \"0\" or \"api\"")
-    if clock == "api" and (routines != "1" or environment.get("FA_NATIVE_TURNS") != NATIVE_V2):
+    if clock == "api" and (routines != "1" or environment.get("FA_NATIVE_TURNS") != NATIVE_V3):
         raise SystemExit("api_environment: FA_NATIVE_ROUTINE_CLOCK=api needs FA_NATIVE_ROUTINES_ENABLED=1 and "
                          "FA_NATIVE_TURNS (the API refuses to start or never starts its clock)")
     if proposals == "1" and (clock != "api" or environment.get("FA_NATIVE_HITL_ENABLED") != "1"):
@@ -601,11 +601,11 @@ def missing_idle(commit=None):
 
 def native_2di():
     """True, or stops: from ADR-0009 2d-ii api_environment must switch 2d-i on (src README#native-2di-switch), since
-    the API sends foundry-native-v2 (3d-i supports v2 and v3). The Hosted half (assistants declare v3) is
+    the API sends foundry-native-v3 (from 3d-ii; v3 only). The Hosted half (assistants declare v3) is
     derived from it in hosted_environment(), so the two never part."""
     if STAGE["api_environment"].get(SESSION_GUARD, "0") != "1":
         raise SystemExit(f"api_environment {SESSION_GUARD}=\"1\" is required from ADR-0009 2d-ii (this API sends "
-                         f"{NATIVE_V2} only); the 2d-i switch cannot be off")
+                         f"{NATIVE_V3} only); the 2d-i switch cannot be off")
     if STAGE["api_environment"].get(IDLE_UPGRADE, "0") not in {"0", "1"}:
         raise SystemExit(f"api_environment: {IDLE_UPGRADE} accepts only \"0\" or \"1\"")
     missing = missing_2di()
@@ -698,8 +698,8 @@ def _sync_script(hosted_ref, *, follow=False):
     argv = ["sync", "--config", f"{runtime_root}/config.json", "--image", hosted_ref, "--core", core(), "--route",
             "--hosted-environment", f"{runtime_root}/hosted-environment.json",
             "--idle-timeout-seconds", str(STAGE["hosted_idle_timeout_seconds"]),
-            # Onboarded Agents are not in STAGE["agents"]: sync gives the registered assistants the same v2 (2d-ii
-            # drops v1); hosted_environment() above already stopped a profile with the 2d-i switch off.
+            # Onboarded Agents are not in STAGE["agents"]: sync gives the registered assistants the same v3 (the flag
+            # keeps its 2d-i name); hosted_environment() above already stopped a profile with the 2d-i switch off.
             "--native-v2-registered"]
     if not follow:
         argv.append("--defer-follow")

@@ -1,6 +1,6 @@
 """ADR-0009 2d-i's one deploy switch (P9, src README#native-2di-switch): api_environment
 FA_NATIVE_SESSION_GUARD_ENFORCE="1" also makes every assistant's Hosted definition declare the Hosted profile
-(foundry-native-v3 from ADR-0009 3d-i, as the assistant seed does; the API stays v2), the
+(foundry-native-v3 from ADR-0009 3d-i, as the assistant seed does; the API too from 3d-ii), the
 deploy follow only reports, and guard, sync, api and follow let it on only over one serving revision that already
 runs P5+P6.
 
@@ -47,10 +47,10 @@ def test_stage_and_a_new_azd_environment_are_on(ci):
     for path in (ROOT / "deploy" / "stage" / "stage.json", ROOT / "deploy" / "azd" / "profile.defaults.json"):
         profile = json.loads(path.read_text(encoding="utf-8"))
         assert profile["api_environment"][GUARD] == "1" and profile["api_environment"][IDLE] == "0", path
-        # ADR-0009 3d-i: the assistant seed declares the image's v3 (a v3 image refuses v2: native_sdk), the API v2;
-        # the deploy overlay still derives the assistants' value from the switch.
+        # ADR-0009 3d-ii: the assistant seed and the API both declare v3 (a v3 image refuses v2: native_sdk); the
+        # deploy overlay still derives the assistants' value from the switch.
         assert profile["assistant_environment"]["FA_NATIVE_TURNS"] == V3
-        assert profile["api_environment"]["FA_NATIVE_TURNS"] == V2
+        assert profile["api_environment"]["FA_NATIVE_TURNS"] == V3
         assert all("FA_NATIVE_TURNS" not in (agent.get("hosted_environment") or {})
                    for agent in profile.get("agents", []))
         assert "FA_NATIVE_TURNS" not in profile.get("assistant_hosted_environment", {})
@@ -85,7 +85,7 @@ def test_the_real_stage_profile_passes_every_offline_turn_on_precondition(monkey
     ci.release = lambda: "test"
     api = ci.STAGE["api_environment"]
     assert ci.native_2di() is True and ci.missing_2di() == []
-    assert api[IDLE] == "0" and api["FA_NATIVE_UPGRADE_RECONCILER"] == "0" and api["FA_NATIVE_TURNS"] == V2
+    assert api[IDLE] == "0" and api["FA_NATIVE_UPGRADE_RECONCILER"] == "0" and api["FA_NATIVE_TURNS"] == V3
     assert "FA_UPGRADE_SNAPSHOT_CONTAINER_URL" not in api
     ci.check()
     overlay = ci.hosted_environment()
@@ -110,7 +110,7 @@ def test_switch_on_sets_both_and_the_follow_only_reports(ci):
     for agent in assistants(ci):
         environment = overlay[agent["agent_id"]]
         assert versions._check_environment(environment, ci.STAGE["hosted_idle_timeout_seconds"]) == environment
-    assert ci.STAGE["api_environment"][GUARD] == "1" and ci.STAGE["api_environment"]["FA_NATIVE_TURNS"] == V2
+    assert ci.STAGE["api_environment"][GUARD] == "1" and ci.STAGE["api_environment"]["FA_NATIVE_TURNS"] == V3
     script = ci._sync_script("registry/hosted@sha256:" + "a" * 64, follow=True)
     assert "'--verify-follow'" in script and "--defer-follow" not in script
     assert "--verify-follow" not in ci._sync_script("registry/hosted@sha256:" + "a" * 64)  # the sync step
@@ -135,10 +135,10 @@ def test_one_without_the_other_is_refused(ci, case):
         ci.check()
 
 
-def test_an_executor_never_declares_v2_even_with_the_switch_on(ci):
+def test_an_executor_never_declares_v3_even_with_the_switch_on(ci):
     switch_on(ci)
     executor = next(item for item in ci.STAGE["agents"] if item["kind"] != "assistant")
-    executor["hosted_environment"] = {**(executor.get("hosted_environment") or {}), "FA_NATIVE_TURNS": V2}
+    executor["hosted_environment"] = {**(executor.get("hosted_environment") or {}), "FA_NATIVE_TURNS": V3}
     with pytest.raises(SystemExit, match="assistants only"):
         ci.check()
 
@@ -426,15 +426,15 @@ def test_a_registered_agent_declaring_no_native_profile_is_untouched(monkeypatch
 
 @pytest.mark.parametrize("on", [True, False])
 def test_after_the_release_the_2dii_gate_no_longer_lists_the_registered_agent_as_v1(monkeypatch, on):
-    """2d-ii supports v2 only. The 2d-i cut binds the Agent to the version sync published and records the profile
-    that version declares (``record_switch``); with the switch's v2 the gate finds no v1 row."""
+    """3d-ii supports v3 only. The 2d-i cut binds the Agent to the version sync published and records the profile
+    that version declares (``record_switch``); with the switch's v3 the gate finds no v1 row."""
     from shared_context import native_deploy_gate as gate
     from test_native_deploy_gate import read_with, row, store_with
     foundry, registered, created = _sync_registered(monkeypatch, SERVED, native_v2_registered=on)
     version = foundry.selectors[registered.agent_name]
     store, _ = store_with(row(registered.agent_id, "sid-r", version,
                               profile=gate.definition_profile(created[registered.agent_name])))
-    report = gate.evaluate([registered], store.rows, read_with(foundry), armed=True, supported=frozenset({V2, V3}))
+    report = gate.evaluate([registered], store.rows, read_with(foundry), armed=True)  # the API's own set: v3
     if on:
         assert (report["decision"], report["refused"]) == ("pass", [])
     else:

@@ -45,7 +45,7 @@
     "FA_CAPABILITY_BUILTINS": "fa-desktop-v1,fa-delegate-v1,fa-delegate-reader-v1,fa-skills-v1,fa-skill-resources-v1,fa-memory-candidate-v1,fa-skillify-v1,fa-image-delivery-v1,fa-shell-v1,fa-agent-collaboration-v1",
     "FA_DELIVERY_PENDING_INDEX_WRITER": "true",
     "FA_WORK_REGISTRY_WRITER": "true",
-    "FA_NATIVE_TURNS": "foundry-native-v2",
+    "FA_NATIVE_TURNS": "foundry-native-v3",
     "FA_NATIVE_HITL_ENABLED": "1",
     "FA_NATIVE_HITL_TTL_SECONDS": "600",
     "FA_NATIVE_GROUPS_ENABLED": "1",

@@ -21,15 +21,15 @@ from test_native_session_patrol import own_loop, patrol  # fixture
 from test_native_session_patrol import bind as bind_row, roster as roster_rows
 from test_native_turn_api import native_api  # fixture
 
-V2 = "foundry-native-v2"  # ADR-0009 2d-ii: the one supported profile, so a "compatible" row is v2 (v1 is incompatible)
+V3 = "foundry-native-v3"  # ADR-0009 3d-ii: the one supported profile, so a "compatible" row is v3 (v1, v2 are not)
 
 
-def bind(case, profile=V2):
+def bind(case, profile=V3):
     return bind_row(case, profile=profile)
 
 
 def roster(case, monkeypatch, n, status):
-    return roster_rows(case, monkeypatch, n, status, profile=V2)
+    return roster_rows(case, monkeypatch, n, status, profile=V3)
 
 
 def reconciler(case, **options):

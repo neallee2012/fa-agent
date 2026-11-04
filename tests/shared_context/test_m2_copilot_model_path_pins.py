@@ -204,6 +204,14 @@ def test_an_instruction_body_keeps_its_reasoning_unless_the_deployment_declares_
     assert wire.body == body(**fields)
 
 
+@pytest.mark.parametrize("supports, limit", [(True, "max_completion_tokens"), (None, "max_tokens")])
+def test_a_reasoning_model_instruction_gets_its_output_limit_as_max_completion_tokens(supports, limit):
+    # Runtime 1.0.103 sends the declared max output as max_tokens for every model on this wire API.
+    wire = Wire(instruction=True, supports_reasoning_effort=supports)
+    wire.post(body(max_tokens=128000, reasoning_effort="medium", temperature=1))
+    assert wire.body == body(**{limit: 128000}, reasoning_effort="medium", temperature=1)
+
+
 @pytest.mark.parametrize("include, kept", [
     (["reasoning.encrypted_content"], None),
     (["reasoning.encrypted_content", "other"], ["other"]),

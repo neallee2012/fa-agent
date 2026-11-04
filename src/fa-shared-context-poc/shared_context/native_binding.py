@@ -19,7 +19,7 @@ from pydantic import Field, model_validator
 from .behavior_native_turn_wire import NATIVE_STATE_PROFILE, NativeEnvironmentNotice, material_digest
 from .behavior_wire import Identifier, WireModel
 from .errors import Problem
-from .native_responses_wire import NATIVE_V2_PROFILE, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE
+from .native_responses_wire import NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE
 from .storage import Repository, TableRepository, serialize
 
 # ADR-0009 2d-i parts this API code carries, read by the deploy's switch check (ci_deploy.API_2DI_SCHEMA, by AST):
@@ -38,10 +38,10 @@ MAX_BINDING_BYTES = 16 * 1024
 MAX_PREVIOUS_SESSIONS = 64
 # One row per Agent of one Team; the deploy gate refuses rather than stopping its read early.
 MAX_BINDING_ROWS = 10000
-# ADR-0009 §3: 3d-i's relaxation (like 2d-i's {v1, v2}) supports {v2, v3} while the API still sends v2, so the armed
-# gate passes v2 rows and the background cut moves them to v3; 3d-ii narrows it to v3. A SID whose recorded profile is
-# outside it is never invoked, read through Session Files or stopped by this API (§7a zero-call need, ``SessionGuard``).
-SUPPORTED_STATE_PROFILES = frozenset({NATIVE_V2_PROFILE, NATIVE_V3_PROFILE})
+# ADR-0009 3d-ii: v3 only, so the armed deploy gate refuses while any served row or its recorded version still
+# records v2. A SID whose recorded profile is outside it is never invoked, read through Session Files or stopped by
+# this API (§7a zero-call need, ``SessionGuard``).
+SUPPORTED_STATE_PROFILES = frozenset({NATIVE_V3_PROFILE})
 # Recorded for a source found incompatible whose own profile is undeclared or unreadable: in no supported set, so
 # every guard and the deploy gate treat the SID as incompatible.
 INCOMPATIBLE_STATE_PROFILE = "incompatible"

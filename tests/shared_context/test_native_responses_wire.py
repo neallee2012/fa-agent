@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from shared_context.behavior_native_turn_wire import NATIVE_REQUEST, NativeConversation, NativeReceipt
 from shared_context.behavior_native_agent_wire import NativeRelayAcceptance
+from shared_context.sdk_pin import OLDER_RELEASES
 from test_native_turn_wire import agent_receive, submit
 
 
@@ -63,8 +64,16 @@ def test_server_selected_new_cid_does_not_rewrite_the_original_command():
             NATIVE_REQUEST.validate_json(json.dumps({**values, **changes}))
 
 
+def recorded_release(value):
+    # The baseline was recorded when API-written material carried the v2 pair; from 3d-ii the default is the v3 pair
+    # (ADR-0009 §3 (c)), so pin the recorded pair and keep this test about the wire shape only.
+    data = value.model_dump(mode="json")
+    data["capture"]["template"]["settings"].update(zip(("sdk_version", "runtime_version"), OLDER_RELEASES[0]))
+    return type(value).model_validate_json(json.dumps(data))
+
+
 def test_legacy_public_wire_bytes_keep_the_recorded_baseline_hashes():
-    request = submit("rid-original", "cid-original")
+    request = recorded_release(submit("rid-original", "cid-original"))
     receipt = NativeReceipt(state_profile=request.state_profile,
         agent_id="OFFLINE-agent", hosted_session_id="OFFLINE-session",
         request_id="rid-original", conversation_id="cid-original",
@@ -79,7 +88,7 @@ def test_legacy_public_wire_bytes_keep_the_recorded_baseline_hashes():
     # Recorded from 713b7d9b before adding any N6 fields.
     for value, expected in (
         (request, "2ee790c8e154b4ad80542ee09e424e6426bc6724aa9ee71b8442d44733640c71"),
-        (agent_receive(), "d50ba91843b50466796bc760eb972b57da8a806a94c22df14d287c03278cd770"),
+        (recorded_release(agent_receive()), "d50ba91843b50466796bc760eb972b57da8a806a94c22df14d287c03278cd770"),
         (receipt, "cee0d404d84fc698999ba9590c83a5afb28a5ffec05784e015255e7512984180"),
         (conversation, "dedf5c300064dc184ed39969658a1f1f01ce0a5e02951407c2239ffaf0fe7f55"),
     ):

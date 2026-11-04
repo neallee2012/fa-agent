@@ -15,18 +15,18 @@ UNLABELED_STATE_PROFILE = "foundry-native-v1"
 NATIVE_V2_PROFILE = "foundry-native-v2"
 # ADR-0009 §3 v2→v3 (SDK 1.0.26 / runtime 1.0.103): what a 3d-i Hosted image declares and labels new _Meta with.
 NATIVE_V3_PROFILE = "foundry-native-v3"
-# ADR-0009 M1 2d-ii: the profile the API sends (and labels new v2 material with) is v2; it stays v2 through 3d-i.
-NATIVE_STATE_PROFILE = NATIVE_V2_PROFILE
+# ADR-0009 3d-ii: the profile the API sends (and labels new material with) is v3; every 3d-i image accepts it.
+NATIVE_STATE_PROFILE = NATIVE_V3_PROFILE
 # ADR-0009 §3 (c): the (sdk, runtime) pair API-written material names follows the send profile, not this process's
-# pin, so a v2 image (which decodes only its own pair) keeps accepting it until 3d-ii flips NATIVE_STATE_PROFILE.
+# pin: (1.0.26, 1.0.103) from 3d-ii. Records saved under the v2 pair still match (``behavior_wire.same_but_release``).
 SENT_RELEASE = PROFILE_RELEASES[NATIVE_STATE_PROFILE]
 NATIVE_RESPONSES_PROFILE = "foundry-responses-v1"
-# The template ``state_profile`` values sent material may carry: a v2 image's NativeStateProfile is {v1, responses-v1,
-# v2}, so a new owner selection naming v3 would reach it in every capture until 3d-ii flips NATIVE_STATE_PROFILE.
+# The template ``state_profile`` values a new selection may carry. A stored selection naming v2 is unaffected: its
+# same-RID replay and its stored template come before this check (``behavior_profile_selection``).
 SENT_STATE_PROFILES = frozenset({UNLABELED_STATE_PROFILE, NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE})
-# What a Hosted runtime or the API may declare (FA_NATIVE_TURNS): ADR-0009 3d-i expands it to {v2, v3} (assistants
-# declare v3, the API still v2); 3d-ii narrows it to v3. Stored v1 and unlabeled items still read as v1.
-ACCEPTED_STATE_PROFILES = frozenset({NATIVE_V2_PROFILE, NATIVE_V3_PROFILE})
+# What a Hosted runtime or the API may declare (FA_NATIVE_TURNS): v3 only from ADR-0009 3d-ii. Hosted still admits
+# the v2 header (``native_turns.HEADER_ALIAS_PROFILES``) and stored v1/v2 bodies; unlabeled items read as v1.
+ACCEPTED_STATE_PROFILES = frozenset({NATIVE_V3_PROFILE})
 NativeStateProfile = Literal["foundry-native-v1", "foundry-responses-v1", "foundry-native-v2", "foundry-native-v3"]
 
 

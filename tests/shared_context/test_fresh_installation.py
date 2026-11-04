@@ -94,7 +94,7 @@ def fresh_case(tmp_path, jwk_client, monkeypatch):
         pytest.fail("fresh offline initialization must not open an external connection")
     monkeypatch.setattr(socket.socket, "connect", external)
     monkeypatch.setattr("test_behavior_server.WireTransport", FreshTableTransport)
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     monkeypatch.delenv("FA_WORK_COST_OBSERVATION_FILE", raising=False)
     h = AssistantHarness(tmp_path, jwk_client)
     config = h.config
@@ -460,7 +460,7 @@ def test_fresh_native_peer_requires_its_own_explicit_template_selection(
         )
         assert refused.status_code == 403
         assert h.table.backing.rows == before
-        monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+        monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
         selected = client.post(
             base + "/select", json=command,
             headers=h.headers(signing_key, "Behavior.Read Behavior.Approve"),

@@ -1,5 +1,22 @@
 # Shared Context POC
 
+<a id="sdk-1026-3dii"></a>
+## 3d-ii：API 改送 v3，支援集合只剩 v3（2026-11-03，CODE/offline，未部署）
+
+- **改了什麼**：`NATIVE_STATE_PROFILE` 改成 `foundry-native-v3`，`SENT_RELEASE` 隨 `PROFILE_RELEASES` 變成 1.0.26／1.0.103；
+  `ACCEPTED_STATE_PROFILES`、`native_binding.SUPPORTED_STATE_PROFILES` 與 `ci_deploy` 的副本只剩 v3；三份部署設定的
+  `api_environment` `FA_NATIVE_TURNS` 改 v3（[ADR-0009 §3](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md) 3d-ii）。
+  Hosted 的 v2 header 別名留到下一個 image；body 的沒標 v1 與 v2 是永久的（存著的原件照原 profile 重送）。
+- **部署前閘門**：沿用 2d-ii 起一律武裝的相容閘門（`native_deploy_gate`），它讀新 API 的支援集合，所以只要還有綁定列
+  或它記的版本是 v2，部署就停下。先讓 3d-i 上線，每位助理都至少用過一次、被背景切換搬到 v3，才部署 3d-ii。
+- **同 RID 重送**：Hosted 在 `admitting` 後、`rid:<RID>` 前當掉時，留著 3d-i API 送的 v2 digest；3d-ii API 以 v3 重送會被
+  409 `NATIVE_RID_CONFLICT`。`submit_native_turn` 這時以同內容、template 標 v2 那一組版本、body 標 v2 再送一次；第二次也是衝突才回原本的
+  409，逾時或 503 照實回。下一個 image 拿掉 v2 別名時一起拿掉。
+- **不變的**：存著的 v2 選擇（template 標 1.0.13／1.0.83）照樣以同 request ID 重送讀回，`KNOWN_RELEASES` 仍含這一組；
+  新選擇的版本組只收 v3 那一組，`state_profile` 不再收 v2。`sync` 仍把還宣告 v1 或 v2 的已登記助理定義改成 v3。
+  `PublicReasoningSummary.source` 的 `"copilot-sdk-1.0.13"` 定為「沒有公開摘要」的歷史標記，wire 不動。
+- **證據**：Windows 本機、離線替身與真 runtime 1.0.103 的相關測試。**未驗證**：dev／stage 部署、真模型。
+
 <a id="sdk-1026-3di"></a>
 ## 3d-i：Hosted 換到 SDK 1.0.26／runtime 1.0.103，宣告 v3（2026-11-03，CODE/offline，未部署）
 
@@ -162,17 +179,17 @@
 ## ADR-0009 2d-i 開關（P9，2026-10-16；stage 第 32 版起打開；2d-ii 起一律打開）
 
 **一個開關：** 部署 profile 的 `api_environment` `FA_NATIVE_SESSION_GUARD_ENFORCE`。`"1"` 時 `ci_deploy.py`
-同時把每位助理（`kind=assistant`）的 Hosted overlay 設成 `FA_NATIVE_TURNS=foundry-native-v2`（sync 建出宣告 v2 的
-H2d 定義），API 打開 P5～P7 的背景切換與送出路徑。**2d-ii（#891）起 API 只送、只支援 v2，開關必須是 `"1"`：**
+同時把每位助理（`kind=assistant`）的 Hosted overlay 設成 `FA_NATIVE_TURNS=foundry-native-v3`（3d-i 起；之前是 v2。sync 建出宣告
+這個 profile 的定義），API 打開 P5～P7 的背景切換與送出路徑。**2d-ii（#891）起開關必須是 `"1"`，API 只送、只支援一個 profile（3d-ii 起 v3，之前 v2）：**
 `"0"`、沒寫或其他值在 `meta`／`check` 就停下，什麼都沒建、沒寫；P8 的每日巡查不再排程（只剩下面的單次指令）。
-API 自己的 `FA_NATIVE_TURNS` 只當 native 的開關，送出的 profile 是程式常數 v2。
-**v1 別名退役（2026-11-02，ADR-0009 M1）起：** API 與 Hosted 的 `FA_NATIVE_TURNS` 一律寫 `foundry-native-v2`，API 寫 v1 時 native 請求一律回 503
+API 自己的 `FA_NATIVE_TURNS` 只當 native 的開關，送出的 profile 是程式常數（3d-ii 起 v3）。
+**v1 別名退役（2026-11-02，ADR-0009 M1）起：** API 與 Hosted 的 `FA_NATIVE_TURNS` 一律寫 native profile（當時 v2，3d-ii 起都是 `foundry-native-v3`），API 寫 v1 時 native 請求一律回 503
 `NATIVE_TURNS_DISABLED`，Hosted 不收 v1 header；存著的 v1 與沒標 profile 的項目照舊讀成 v1。本檔較早段落裡寫 `FA_NATIVE_TURNS=foundry-native-v1` 的是當時的歷史紀錄。
 onboarding 加的 Agent 不在 profile 的 `agents` 裡：sync 一律帶 `--native-v2-registered`（fresh initialization 例外，見 `run_fresh_job.py` 註解），已登記、服務中
-定義宣告 native profile 的 Agent（助理）只把 `FA_NATIVE_TURNS` 改成 v2，其他 ENV 照舊（ADR-0009 M1，2026-10-20）。
+定義宣告 native profile 的 Agent（助理）只把 `FA_NATIVE_TURNS` 改成 v3（3d-i 前是 v2；旗標保留舊名），其他 ENV 照舊（ADR-0009 M1，2026-10-20）。
 `deploy/stage/stage.json` 與 `deploy/azd/profile.defaults.json` 都寫 `"1"`（azd 以前的 `FA_NATIVE_2DI` 已不讀）。
-`meta`／`check` 也拒絕開關以外的 v2：executor 等非助理不能寫 v2（它們不跑 API 搬移的 2d-i 回合），助理 overlay
-也不能另寫 v1。部署時 `follow` 步驟改成只報告（sync 帶
+`meta`／`check` 也拒絕開關以外的 native profile：executor 等非助理不能寫 v3（它們不跑 API 搬移的 2d-i 回合），助理 overlay
+也不能另寫 v3 以外的值。部署時 `follow` 步驟改成只報告（sync 帶
 `--verify-follow`：P6 的 `follow_all(verify_only=True)` 對每個 Agent 呼叫 `verify_agent`，只讀 metadata，不叫醒 VM，
 每個 Agent 回 `ok` 或 `pending`＝下一次回合結束才換，不算失敗；沒有 scope 的 executor 與 `follow` 一樣回 `skipped`）。這份逐 Agent 報告印在 sync job 的輸出裡：在 Log
 Analytics 該 job execution 的 log 看，部署腳本本身只印 `sync <execution> Succeeded`。部署前相容閘門照舊；stage 照舊拒絕

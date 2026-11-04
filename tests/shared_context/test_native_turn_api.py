@@ -288,16 +288,16 @@ def test_restart_reads_original_capture_and_completed_submit_never_restarts(nati
     before = len(case.remote.calls)
     retained, _ = gateway.submit(case.c.human, original.command)
     assert retained.capture == original.capture
-    # No same-material v1 resend after the conflict (ADR-0009 M1 retired it with the v1 alias).
+    # The second submit is the one v2-labelled resend a conflict gets (ADR-0009 3d-ii, a crashed v2 admission).
     assert [command.operation for _, command in case.remote.calls[before:]
-            if command.operation != "session_read"] == ["submit", "read", "submit"]
+            if command.operation != "session_read"] == ["submit", "submit", "read", "submit"]
     assert case.remote.calls[-1][1].capture == original.capture
     case.remote.completed("native-rid")
     before = len(case.remote.calls)
     completed, _ = NativeTurnGateway(case.composition, enabled=True).submit(case.c.human, original.command)
     assert completed.status == "completed"
     assert [command.operation for _, command in case.remote.calls[before:]
-            if command.operation != "session_read"] == ["submit", "read"]
+            if command.operation != "session_read"] == ["submit", "submit", "read"]
     conflict = case.client.post(PREFIX + "/submit", headers=case.headers,
                                json={"request_id": "native-rid", "content": "Changed original"})
     assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "NATIVE_RID_CONFLICT"

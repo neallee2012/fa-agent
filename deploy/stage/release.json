@@ -1,1 +1,1 @@
-{"version":"2026.11.03-40","milestone":"第 40 版：Hosted 換到 Copilot SDK 1.0.26／runtime 1.0.103，API 下一版再換；資料庫長時間斷線、開工那一刻按停止、壓縮未完成時的回合收尾修正；工作台唯讀交辦與開頁的畫面修正；第十一、十二輪程式整理（使用者行為不變），刪掉退休的 POC 與舊命令路徑"}
+{"version":"2026.11.04-41","milestone":"第 41 版：Copilot SDK 1.0.26 升級完成最後一步，API 改送 foundry-native-v3（stage 的 FA_NATIVE_TURNS 從 v2 改成 v3）；修正用一般聊天介面連線的推理模型（gpt-5.4-mini、gpt-6.1-sol 等）因 max_tokens 被模型拒絕、每則訊息都失敗的問題；stage 的資源與權限沒有變動"}

@@ -47,7 +47,7 @@ def binding_rows(monkeypatch):
     return repository
 
 
-def platform(fixture, monkeypatch, *, status=None, profile="foundry-native-v2", idle_timeout=3600, created_at=None):
+def platform(fixture, monkeypatch, *, status=None, profile="foundry-native-v3", idle_timeout=3600, created_at=None):
     """The offline platform: ``status`` (a value or a callable) overrides the source's metadata status
     ("missing" is 404, "unavailable" a 503); ``profile`` is the source version definition's ``FA_NATIVE_TURNS`` and
     ``created_at`` its ``AgentVersionDetails.created_at`` (None: not reported)."""
@@ -73,7 +73,7 @@ def platform(fixture, monkeypatch, *, status=None, profile="foundry-native-v2", 
             "kind": "hosted", "session_configuration": {"idle_timeout_seconds": idle_timeout},
             "environment_variables": {
                 # ADR-0009 2d-ii: the selected version declares v2 (the only supported profile)
-                "FA_NATIVE_TURNS": profile if version == source.agent_version else "foundry-native-v2"}})
+                "FA_NATIVE_TURNS": profile if version == source.agent_version else "foundry-native-v3"}})
 
     project_client(
         monkeypatch, get_session=get_session, get_version=get_version, stop_session=files.stop_session,

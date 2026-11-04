@@ -14,7 +14,7 @@ from test_native_agent_api import (
 
 def test_original_b_relay_groups_under_a_root_without_new_writes(relay_case, monkeypatch):
     case = relay_case
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     gateway = NativeAgentRelayGateway(case.base.a, enabled=True, repository=case.repository)
     accepted = gateway.send(case.principal, send_command(case))
     b = case.remotes[1].records[accepted.message_id]
@@ -40,7 +40,7 @@ def test_original_b_relay_groups_under_a_root_without_new_writes(relay_case, mon
 
 def test_direct_human_turn_uses_its_own_verified_address(relay_case, monkeypatch):
     case = relay_case
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     address = NativeTurnAddress(
         agent_id=case.sender.agent_id, conversation_id=case.sender.conversation_id, request_id=case.sender.request_id)
     resolved = owner_origin_reader(case.base.a, case.base.c.human)(address)
@@ -50,7 +50,7 @@ def test_direct_human_turn_uses_its_own_verified_address(relay_case, monkeypatch
 @pytest.mark.parametrize("damage", ["root_team", "root_id", "sender", "recipient", "unreadable", "cid"])
 def test_unverified_sources_never_guess_an_a_root(relay_case, monkeypatch, caplog, damage):
     case = relay_case
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     gateway = NativeAgentRelayGateway(case.base.a, enabled=True, repository=case.repository)
     accepted = gateway.send(case.principal, send_command(case))
     original = case.remotes[1].records[accepted.message_id]

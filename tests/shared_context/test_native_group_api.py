@@ -16,7 +16,7 @@ def test_group_start_uses_one_original_responses_root_and_never_launches_other_m
     from shared_context.native_group_wire import NativeGroupOpen
 
     env = responses_relay
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     gateway = NativeGroupGateway(env.case.base.a, enabled=True, repository=env.case.repository)
     owner = env.case.base.c.human
     command = NativeGroupOpen(
@@ -45,7 +45,7 @@ def test_group_context_uses_the_original_native_root_not_a_model_supplied_group(
     from shared_context.native_group_wire import NativeGroupOpen
 
     env = responses_relay
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     gateway = NativeGroupGateway(env.case.base.a, enabled=True, repository=env.case.repository)
     group = gateway.open(env.case.base.c.human, NativeGroupOpen(
         request_id="bound-context", orchestrator_agent_id=env.case.base.b.agent_id,
@@ -77,7 +77,7 @@ def test_original_t5_group_request_publishes_once_and_keeps_its_original_root_qu
     from shared_context.native_group_wire import NativeGroupOpen
 
     env = responses_relay
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     monkeypatch.setenv("FA_NATIVE_GROUPS_ENABLED", "1")
     control = env.case.base.a.runtime.work_policy
     selection = current_selection(control.store, control.policy)
@@ -126,7 +126,7 @@ def test_pending_group_reply_keeps_its_round_and_slot_until_the_original_result_
     from test_native_agent_api import send_command
 
     env = responses_relay
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     monkeypatch.setenv("FA_NATIVE_GROUPS_ENABLED", "1")
     groups = NativeGroupGateway(env.case.base.a, enabled=True, repository=env.case.repository)
     # Use the already started A turn as the original human root, with a real group ID.
@@ -290,7 +290,7 @@ def test_a_definite_unaccepted_member_refusal_settles_only_its_original_group_sl
 
     env = responses_relay
     definite = refusal != "UPSTREAM_UNKNOWN"
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     monkeypatch.setenv("FA_NATIVE_GROUPS_ENABLED", "1")
     groups = NativeGroupGateway(env.case.base.a, enabled=True, repository=env.case.repository)
     group = groups.open(env.case.base.c.human, NativeGroupOpen(
@@ -373,7 +373,7 @@ def test_group_final_is_published_from_the_saved_native_result_not_model_supplie
     from shared_context.native_group_wire import NativeGroupOpen
 
     env = responses_relay
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     groups = NativeGroupGateway(env.case.base.a, enabled=True, repository=env.case.repository)
     group = groups.open(env.case.base.c.human, NativeGroupOpen(
         request_id="original-final", orchestrator_agent_id=env.case.base.b.agent_id,

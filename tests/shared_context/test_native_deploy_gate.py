@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 V1, V2, V3 = "foundry-native-v1", "foundry-native-v2", "foundry-native-v3"
 A = SimpleNamespace(agent_id="agent-a", agent_name="fa-stage-a", project_endpoint="https://project.example/a")
 B = SimpleNamespace(agent_id="agent-b", agent_name="fa-stage-b", project_endpoint="https://project.example/a")
+C = SimpleNamespace(agent_id="agent-c", agent_name="fa-stage-c", project_endpoint="https://project.example/a")
 IMAGE = "cr.example.azurecr.io/fa-behavior-assistant-desktop@sha256:"
 
 
@@ -114,15 +115,21 @@ def test_armed_gate_refuses_a_session_whose_recorded_version_declares_an_unsuppo
     assert report["refused"] == [{"agent_id": "agent-b", "reason": "definition_profile_unsupported"}]
 
 
-def test_the_2dii_api_reports_v1_rows_incompatible_and_v2_rows_compatible():
-    # ADR-0009 M1 2d-ii: the new API's own supported set (no override), {v2, v3} from 3d-i; unarmed it only reports.
-    store, _ = store_with(row("agent-a", "sid-a", "141"), row("agent-b", "sid-b", "150", profile=V2))
-    foundry = RecordingFoundry({("fa-stage-a", "141"): definition(V1, "a"), ("fa-stage-b", "150"): definition(V2, "c")})
-    report = gate.evaluate([A, B], store.rows, read_with(foundry), armed=True)
-    assert report["supported"] == [V2, V3] and report["decision"] == "refuse"
-    assert report["refused"] == [{"agent_id": "agent-a", "reason": "row_profile_unsupported"}]
+def test_the_3dii_api_refuses_v2_rows_and_passes_v3_rows():
+    # ADR-0009 3d-ii: the new API's own supported set (no override) is v3 only, so the armed gate refuses while a row,
+    # or the version it records, is still v2; unarmed it only reports.
+    store, _ = store_with(row("agent-a", "sid-a", "150", profile=V2), row("agent-b", "sid-b", "160", profile=V3),
+                          row("agent-c", "sid-c", "160", "150", profile=V3))
+    foundry = RecordingFoundry({("fa-stage-a", "150"): definition(V2, "c"), ("fa-stage-b", "160"): definition(V3, "d"),
+                                ("fa-stage-c", "160"): definition(V3, "d"), ("fa-stage-c", "150"): definition(V2, "c")})
+    report = gate.evaluate([A, B, C], store.rows, read_with(foundry), armed=True)
+    assert report["supported"] == [V3] and report["decision"] == "refuse"
+    assert report["refused"] == [{"agent_id": "agent-a", "reason": "row_profile_unsupported"},
+                                 {"agent_id": "agent-c", "reason": "definition_profile_unsupported"}]
     assert [entry["verdict"] for entry in report["agents"]][1] == "compatible"
-    assert gate.evaluate([A, B], store.rows, read_with(foundry), armed=False)["decision"] == "observe"
+    converged, _ = store_with(row("agent-b", "sid-b", "160", profile=V3))
+    assert gate.evaluate([B], converged.rows, read_with(foundry), armed=True)["decision"] == "pass"
+    assert gate.evaluate([A, B, C], store.rows, read_with(foundry), armed=False)["decision"] == "observe"
 
 
 def test_unarmed_gate_reports_what_it_would_refuse_and_passes():
@@ -183,9 +190,9 @@ def test_an_approved_override_passes_an_armed_refusal_and_is_kept_in_the_report(
 
 
 def test_the_gate_reads_binding_rows_and_definitions_only_and_never_a_session(monkeypatch):
-    store, repository = store_with(row("agent-a", "sid-a", "150", "145", profile=V2,
+    store, repository = store_with(row("agent-a", "sid-a", "150", "145", profile=V3,
                                        previous=[NativeBindingSession(hosted_session_id="sid-old", agent_version="141")]))
-    foundry = RecordingFoundry({("fa-stage-a", v): definition(V2, d) for v, d in (("150", "c"), ("145", "b"),
+    foundry = RecordingFoundry({("fa-stage-a", v): definition(V3, d) for v, d in (("150", "c"), ("145", "b"),
                                                                                   ("141", "a"))})
     monkeypatch.setattr(behavior_agent_versions, "_agents", lambda value: (A, [(A, "configured")]))
     monkeypatch.setattr(behavior_team_registry, "retired_agent_ids", lambda store, config: ())
@@ -199,13 +206,13 @@ def test_the_gate_reads_binding_rows_and_definitions_only_and_never_a_session(mo
 
 def test_the_gate_report_lists_project_vetoed_versions_and_never_refuses_for_them(monkeypatch, capsys):
     # ADR-0009 4d (Neal 2026-10-20): an in-place drift's crash-loop only vetoes the version; the operator reads it here.
-    store, repository = store_with(row("agent-a", "sid-a", "150", profile=V2))  # 2d-ii: a compatible row is v2
+    store, repository = store_with(row("agent-a", "sid-a", "150", profile=V3))  # 3d-ii: a compatible row is v3
     vetoes = NativeVersionVetoStore(repository, clock=lambda: datetime(2026, 10, 20, 1, tzinfo=timezone.utc))
     vetoes.veto("fa-stage-a", "151")
     # One malformed row (listed before 151) is skipped and logged; it never hides the others.
     repository.create(VETO_PARTITION, "version:fa-stage-a:150", {"schema_version": "fa-native-version-veto-v0"})
     repository.calls.clear()
-    foundry = RecordingFoundry({("fa-stage-a", "150"): definition(V2, "c")})
+    foundry = RecordingFoundry({("fa-stage-a", "150"): definition(V3, "c")})
     monkeypatch.setattr(behavior_agent_versions, "_agents", lambda value: (A, [(A, "configured")]))
     monkeypatch.setattr(behavior_team_registry, "retired_agent_ids", lambda store, config: ())
     monkeypatch.setattr(gate, "deploy_binding_store", lambda value: store)

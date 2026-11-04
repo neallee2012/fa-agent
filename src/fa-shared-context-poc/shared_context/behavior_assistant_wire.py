@@ -210,6 +210,8 @@ class PublicProgressEvent(WireModel):
 
 class PublicReasoningSummary(WireModel):
     availability: Literal["not_provided", "provided"] = "not_provided"
+    # "copilot-sdk-1.0.13" is a fixed historical marker for "no public summary", not the SDK this image runs (ADR-0009
+    # 3d-ii): stored receipts, the workbench and the frozen v2 and v3 wire carry it, so it never changes with the pin.
     source: Literal["copilot-sdk-1.0.13", "openai-responses"] = "copilot-sdk-1.0.13"
     text: Annotated[str, Field(min_length=1, max_length=256)] | None = None
 

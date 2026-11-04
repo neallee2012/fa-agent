@@ -5,7 +5,7 @@
 ``_Meta`` with (``RUNTIME_PROFILE``): a profile bump (ADR-0009 phase 2d) regenerates it by running only
 ``test_profile_snapshot_matches_the_current_profile`` with ``FA_REGENERATE_PROFILE_SNAPSHOT=1``, then reviews the diff.
 
-From 2d-ii ``NATIVE_STATE_PROFILE`` (the send profile) is v2, while every DTO default
+``NATIVE_STATE_PROFILE`` (the send profile) is v2 from 2d-ii and v3 from 3d-ii, while every DTO default
 (``default=UNLABELED_STATE_PROFILE, exclude_if=unlabeled_profile``) stays the unlabeled v1 profile, so stored v1 and
 unlabeled items still read as v1 and keep their bytes; 2d-i moved ``_Meta``'s label, and this snapshot's key, to v2,
 and 3d-i (SDK 1.0.26 / runtime 1.0.103) moves both to v3 while the send profile stays v2 until 3d-ii. From then the
@@ -478,9 +478,10 @@ def _v3_value_old_images_never_receive(problem):
 
     Under NATIVE_REQUEST only a template's settings may carry one: ``TemplateSettings`` defaults to ``SENT_RELEASE`` and
     ``select_profile`` admits only ``SENT_RELEASE`` and ``SENT_STATE_PROFILES``. A request's own ``state_profile`` may
-    gain 'foundry-native-v3' too (a 3d-i image must accept 3d-ii's v3 bodies, ADR-0009 3d-i): the API sends
-    ``NATIVE_STATE_PROFILE`` (v2) or a stored original's label (``behavior_native_responses_api.turn_profile``,
-    ``native_agent_relay``, ``native_routines``), never v3 before 3d-ii. Any other request position fails."""
+    gain 'foundry-native-v3' too (a 3d-i image must accept 3d-ii's v3 bodies, ADR-0009 3d-i). The 3d-i API sent v2 or
+    a stored original's label (``behavior_native_responses_api.turn_profile``, ``native_agent_relay``,
+    ``native_routines``); the 3d-ii API sends v3, but only once its deploy gate finds no v2 SID serving, so no v2 image
+    receives it. Any other request position fails."""
     where, _, change = problem.partition(": ")
     if change not in V3_ADDED:
         return False

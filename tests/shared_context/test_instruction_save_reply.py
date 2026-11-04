@@ -340,7 +340,8 @@ def sha(record):
     return hashlib.sha256(json.dumps(record.payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-# Hashes captured from the composition before save_reply was split.
+# Hashes captured from the composition before save_reply was split. The archive row's prompt assembly names the send
+# profile's (sdk, runtime) pair, so its hash moved once at ADR-0009 3d-ii (v2 pair -> v3 pair); the rest did not.
 GOLDEN = {
     "cancelled": (
         "3d9fc7e717d4cc8096c62777c8b60a1b1abd29b48187f8804b49b2806082fa2b",
@@ -348,7 +349,7 @@ GOLDEN = {
         {
             "result": "a6258a366c27aa1bee0bcae2685b45c7d64495f31373727aa581bb0bb8eb5a7f",
             "reply": "1eb7fe3770f6c0a05872f9164727f49994908dc55ff16d4d7efd922e50fd3300",
-            "archive": "d7bde8a8fb8f57b578645c1e79da5b20cceb02f329848ee112c3db7195e2b122",
+            "archive": "446efe67124b7c7f2c67da2f2fd4ffa989cc7709110e6c97c27a764130d393fb",
         },
     ),
     "failure": (
@@ -357,7 +358,7 @@ GOLDEN = {
         {
             "result": "371f725559b75004be8275d6ca066662bc149b8ad977d07603c992cf9f6bb1f4",
             "reply": None,
-            "archive": "4e705f09c4714765ad6dab16a00a2b80a86e7c0c11508c766c4f6d86274c2b2c",
+            "archive": "e24de8fb8ff8510c0061084e2ddfa851646153d97645ff32c21d106a05c6db28",
         },
     ),
     "reply": (
@@ -366,7 +367,7 @@ GOLDEN = {
         {
             "result": "6484a112c6b4a78ba2ca379ca127a223d7a16cbbd01eb8a2aa96672167bc75ac",
             "reply": "bec2a107514331108c072e52b23b8b6d6b5f85aef968134cad9ebb97f64ff603",
-            "archive": "10757004d62402db3cc89a3c7ba7f47f9ded61f5611cce4677f618074788e52e",
+            "archive": "b56733d4263b3af29752f7d3eca3095fa32aec1f1bff46cb714127788380acd7",
         },
     ),
 }

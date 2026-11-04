@@ -309,11 +309,13 @@ def test_legacy_m3_catalog_and_archive_bytes_match_exact_2f33_base():
         (catalog, 459, "cf2e5a4fbbd1c2f6f21c6170790532cb7ee9b0185953d32dbe27be5224e3ec17"),
         (SkillReadResult(skill=entry, text=body.decode()), 360,
          "47f082617f21c99e3b1d3bad7fa8afa42c5a32f7a7d4a0366cb4642df497baa8"),
-        # The 2f33 base ran runtime 1.0.83 (still a known release): pinned so the bytes do not move with sdk_pin.
+        # The 2f33 base ran SDK 1.0.13 / runtime 1.0.83 (still a known release): pinned so the bytes do not move with
+        # sdk_pin or the send profile's pair (SENT_RELEASE).
         (TurnArchive(conversation_id="conversation", job_id="job", turn_number=1,
             archive=ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE"),
             sdk_stop=SdkStop(runtime_version="1.0.83", pid=7, exit_code=0, graceful=True),
-            prompt_assembly=assemble_prompt("fa-instruction-skills-v1").record, skill_catalog=catalog), 1658,
+            prompt_assembly=assemble_prompt("fa-instruction-skills-v1").record.model_copy(
+                update={"sdk_version": "1.0.13", "runtime_version": "1.0.83"}), skill_catalog=catalog), 1658,
          "564c9e68c989857b22ba2e9fd7a10412e9fe35581f356481e8f4ac04f9453cfa"),
     )
     for value, length, expected_sha in cases:

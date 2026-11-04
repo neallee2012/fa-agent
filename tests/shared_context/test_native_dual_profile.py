@@ -152,7 +152,8 @@ def test_a_v2_conversation_continues_on_a_v3_runtime(local_env):
 
 
 def test_official_recovery_continues_a_v1_root_in_a_v2_labelled_conversation(local_env):
-    """The API copies the conversation's v2 label into the continuation (``turn_profile``); the v1 root still owns it."""
+    """The API copies the conversation's v2 label into the continuation (``turn_profile``); the v1 root still owns it.
+    Recovery runs on the v3 runtime the conversation moved to (ADR-0009 3d-ii: the API reaches no v2 runtime)."""
     from shared_context.behavior_native_turn_wire import NativeContinuationRead, NativeContinuationSubmit
     from shared_context.native_effects import NativeEffects
 
@@ -174,7 +175,7 @@ def test_official_recovery_continues_a_v1_root_in_a_v2_labelled_conversation(loc
     assert root.state_profile == V1
 
     sdk = OfflineSdk()
-    runtime = NativeTurnRuntime(IDENTITY, sdk, state_profile=V2)
+    runtime = NativeTurnRuntime(IDENTITY, sdk, state_profile=V3)
     refused = []
 
     async def deliver(view):
@@ -271,12 +272,11 @@ def test_the_runtime_declares_the_environment_profile_and_refuses_any_other(loca
     monkeypatch.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
     monkeypatch.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://offline-fixture.services.ai.azure.com/api/projects/offline")
-    # ADR-0009 M1: v1 is no longer declarable; 3d-i: v2 is accepted but names SDK 1.0.13 / runtime 1.0.83, not the
-    # release this image runs, so only v3 starts (a v3 image declaring v2 would lose its work files at 3d-ii).
+    # ADR-0009 M1: v1 is no longer declarable; 3d-ii: nor is v2, so only v3 starts.
     if profile == NATIVE_V3_PROFILE:
         assert native_sdk.native_runtime_from_environment(hosted).state_profile == profile
         return
     with pytest.raises(Problem) as refused:
         native_sdk.native_runtime_from_environment(hosted)
     assert refused.value.body["error"]["code"] == "NATIVE_TURNS_DISABLED"
-    assert ("another SDK/runtime release" in refused.value.body["error"]["message"]) is (profile == V2)
+    assert "must be explicitly enabled" in refused.value.body["error"]["message"]

@@ -90,7 +90,7 @@ def test_selector_controls_the_version_and_is_read_again_after_publication(selec
     for version in (4, 5):  # from ADR-0009 2d-ii only a v2 definition is followed, whatever its build
         foundry.add(R.agent_name, version, "same-build", definition={
             "kind": "hosted", "image": f"{R.agent_name}:same-build",
-            "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2"}})
+            "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v3"}})
     route = {"version": selector, "latest": "5"}
 
     def get_agent(name):
@@ -238,7 +238,7 @@ def test_a_new_image_runs_its_own_runtime_not_the_one_the_old_definition_named()
     assert desired["environment_variables"] == {"TZ": "Asia/Taipei"}
 
 
-NATIVE_GROUPS = {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_NATIVE_GROUPS_ENABLED": "1"}  # ADR-0009 M1: v1 retired
+NATIVE_GROUPS = {"FA_NATIVE_TURNS": "foundry-native-v3", "FA_NATIVE_GROUPS_ENABLED": "1"}  # ADR-0009 3d-ii: v3 only
 
 
 @pytest.mark.parametrize("served,expected", [

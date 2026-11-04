@@ -124,7 +124,7 @@ def test_startup_reads_and_writes_in_one_fixed_order(local, monkeypatch):
         events.append("guard")
         guarded(*paths)
 
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     monkeypatch.setenv("FA_RESPONSES_ENABLED", "1")
     monkeypatch.setattr(native_sdk, "native_runtime_from_environment", seen("native", native))
     monkeypatch.setattr(NativeStateProbe, "from_environment", seen("state-probe"))
@@ -141,7 +141,7 @@ def test_startup_reads_and_writes_in_one_fixed_order(local, monkeypatch):
 
 
 def test_an_explicit_native_runtime_is_not_replaced_by_the_environment(local, monkeypatch):
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     monkeypatch.setattr(native_sdk, "native_runtime_from_environment", lambda _: pytest.fail("replaced"))
     create_host(local, native_runtime=SimpleNamespace(identity=IDENTITY))
 

@@ -129,7 +129,7 @@ def file_api(local_env, file_loops, native_api, monkeypatch, tmp_path, request):
     lane = setting["lane"] if isinstance(setting, dict) else setting
     recover = isinstance(setting, dict) and setting.get("recover") is True
     api_capture = isinstance(setting, dict) and not recover
-    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v2")
+    monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
     monkeypatch.setenv("FA_RESPONSES_ENABLED", "1")
     source = case.remote.target
     source_version = options.get("source_version", source.agent_version)

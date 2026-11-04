@@ -385,30 +385,32 @@ def test_impossible_default_model_catalog_budget_is_refused_before_selection(ass
     assert h.store._guard() == before and not control.records
 
 
-@pytest.mark.parametrize("settings", [{"sdk_version": "1.0.26", "runtime_version": "1.0.103"},
-                                      {"state_profile": "foundry-native-v3"}], ids=["v3-pair", "v3-state-profile"])
+@pytest.mark.parametrize("settings", [{"sdk_version": "1.0.13", "runtime_version": "1.0.83"},
+                                      {"state_profile": "foundry-native-v2"}], ids=["v2-pair", "v2-state-profile"])
 def test_a_new_selection_names_only_what_the_send_profiles_images_read(assistant, monkeypatch, settings):
-    """ADR-0009 §3 (c): a selection reaches every new conversation's capture, so while the API sends v2 a v3 pair or a
-    v3 state profile (which a v2 image refuses) is 422; a same-ID resend of an already stored one still returns it."""
+    """ADR-0009 §3 (c): a selection reaches every new conversation's capture, so once the API sends v3 (3d-ii) a new
+    selection naming the v2 pair or the v2 state profile is 422; a same-ID resend of one stored while the API sent v2
+    (3d-i) still returns it, unchanged."""
     from shared_context import behavior_profile_selection
-    from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE
+    from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_V2_PROFILE, UNLABELED_STATE_PROFILE
 
     h, control, _ = configured(assistant)
     before = h.store._guard()
-    refused, _ = select(h, request_id="v3-choice", value=template(**settings))
+    refused, _ = select(h, request_id="v2-choice", value=template(**settings))
     assert refused.status_code == 422 and refused.json()["error"]["code"] == "PROFILE_SELECTION_UNSUPPORTED"
     assert h.store._guard() == before
-    # Stored under a later send profile (3d-ii), then resent with the same request ID by an image that still sends v2.
-    with monkeypatch.context() as later:
-        later.setattr(behavior_profile_selection, "SENT_RELEASE", ("1.0.26", "1.0.103"))
-        later.setattr(behavior_profile_selection, "SENT_STATE_PROFILES",
-                      frozenset({UNLABELED_STATE_PROFILE, NATIVE_RESPONSES_PROFILE, NATIVE_V3_PROFILE}))
-        stored, _ = select(h, request_id="v3-choice", value=template(
-            **{"sdk_version": "1.0.26", "runtime_version": "1.0.103", **settings}))
+    # Stored by a 3d-i API (it sent v2), then resent with the same request ID by this 3d-ii API.
+    v2_pair = {"sdk_version": "1.0.13", "runtime_version": "1.0.83", **settings}
+    with monkeypatch.context() as earlier:
+        earlier.setattr(behavior_profile_selection, "SENT_RELEASE", ("1.0.13", "1.0.83"))
+        earlier.setattr(behavior_profile_selection, "SENT_STATE_PROFILES",
+                        frozenset({UNLABELED_STATE_PROFILE, NATIVE_RESPONSES_PROFILE, NATIVE_V2_PROFILE}))
+        stored, _ = select(h, request_id="v2-choice", value=template(**v2_pair))
     assert stored.status_code == 200, stored.text
-    again, _ = select(h, request_id="v3-choice", value=template(
-        **{"sdk_version": "1.0.26", "runtime_version": "1.0.103", **settings}))
+    again, _ = select(h, request_id="v2-choice", value=template(**v2_pair))
     assert again.status_code == 200 and again.json() == stored.json()
+    kept = h.client.get(PATH + "/selection", headers=h.headers("read-only")).json()["template"]["settings"]
+    assert (kept["sdk_version"], kept["runtime_version"]) == ("1.0.13", "1.0.83")
     assert not control.records
 
 

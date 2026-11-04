@@ -598,7 +598,7 @@ def test_existing_invocations_cid_is_not_moved_by_a_new_responses_template(nativ
     continued = case.client.post(NATIVE_PREFIX + "/submit", headers=case.headers,
                                 json={**body, "request_id": "native-follow"})
     # ADR-0009 2d-ii: the v1 Invocations conversation continues, sent (and so received) as v2
-    assert continued.status_code == 202 and continued.json()["state_profile"] == "foundry-native-v2"
+    assert continued.status_code == 202 and continued.json()["state_profile"] == "foundry-native-v3"
     assert case.remote.records["native-original"] == original
 
 
@@ -705,7 +705,7 @@ def options_version(options_api, monkeypatch):
     foundry = Foundry(target)
     foundry.add(target.agent_name, target.agent_version, "options-build", definition={
         "kind": "hosted", "protocol_versions": [{"protocol": "responses", "version": "2.0.0"}],
-        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v2", "FA_RESPONSES_ENABLED": "1"},
+        "environment_variables": {"FA_NATIVE_TURNS": "foundry-native-v3", "FA_RESPONSES_ENABLED": "1"},
     })
     monkeypatch.setattr(case.composition, "hosted_versions",
                         HostedVersions(lambda _: foundry, build="options-build"), raising=False)

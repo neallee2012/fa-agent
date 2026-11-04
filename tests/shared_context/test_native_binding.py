@@ -371,19 +371,19 @@ def declared(case, monkeypatch, **profiles):
 
 
 def test_claim_and_switch_rows_record_the_profile_each_version_declares(bound, monkeypatch):
-    """ADR-0009 2d-i: 2d-ii supports only v2, so a row never records the API's own v1 for a v2 session."""
+    """ADR-0009 2d-i: 3d-ii supports only v3, so a row never records the API's own v1 for a v3 session."""
     case = bound
-    declared(case, monkeypatch, **{"41": "foundry-native-v2", "42": "foundry-native-v2"})
+    declared(case, monkeypatch, **{"41": "foundry-native-v3", "42": "foundry-native-v3"})
     sessions = native_sessions(case.composition)
     client = case.foundry.for_target(case.remote.target)
-    assert sessions.observed_binding(client, version="41").state_profile == "foundry-native-v2"
+    assert sessions.observed_binding(client, version="41").state_profile == "foundry-native-v3"
     view = NativeEnvironmentView(
         agent_id=case.agent_id, request_id="follow", state="ready", previous_hosted_session_id=case.sid,
         previous_agent_version="41", hosted_session_id="fa-native-next", hosted_agent_version="42")
     sessions._switched(client, view)
     moved = row(case)
-    assert (moved.hosted_session_id, moved.state_profile) == ("fa-native-next", "foundry-native-v2")
-    assert moved.model_dump(mode="json")["state_profile"] == "foundry-native-v2" and moved.supported()
+    assert (moved.hosted_session_id, moved.state_profile) == ("fa-native-next", "foundry-native-v3")
+    assert moved.model_dump(mode="json")["state_profile"] == "foundry-native-v3" and moved.supported()
 
 
 def test_v1_definitions_write_the_same_row_bytes_as_before_2d_i(bound, monkeypatch):
@@ -427,7 +427,7 @@ def test_an_existing_row_records_a_drift_even_when_no_definition_is_readable(bou
     assert resolver.reads == []
 
 
-V1, V2 = "foundry-native-v1", "foundry-native-v2"
+V1, V3 = "foundry-native-v1", "foundry-native-v3"  # ADR-0009 3d-ii: v3 is the one supported profile
 
 
 def declares(monkeypatch, profiles):
@@ -450,11 +450,11 @@ def drift_in_place(case, monkeypatch, to, declared_profile, *, before=V1):
     return submit(case)
 
 
-@pytest.mark.parametrize("before,to,declared_profile", [(V2, "42", V2)])
+@pytest.mark.parametrize("before,to,declared_profile", [(V3, "42", V3)])
 def test_a_same_sid_drift_records_the_profile_the_observed_version_declares(bound, monkeypatch, before, to,
                                                                             declared_profile):
     """Onto a newer image: the drift CAS itself writes the profile, so ``supported()``, the cut and the deploy gate
-    judge the image the SID now runs, not the one it was created on. 2d-ii sends only to a v2 row; a drift back onto
+    judge the image the SID now runs, not the one it was created on. 3d-ii sends only to a v3 row; a drift back onto
     a v1 image (the 82→81 case) takes the incompatible path (``test_a_drift_onto_an_unsupported_profile_...``)."""
     case = bound
     writes = len(case.repository.writes) + 1
@@ -470,18 +470,18 @@ def test_an_old_images_drift_records_the_profile_once_the_vm_accepts_the_version
     monkeypatch.setattr(behavior_native_sessions, "_session_metadata", lambda _client: SimpleNamespace(
         status="active", version_indicator=SimpleNamespace(agent_version="42")))
     case.remote.old_image = True
-    assert drift_in_place(case, monkeypatch, "42", V2, before=V2).status_code == 202
+    assert drift_in_place(case, monkeypatch, "42", V3, before=V3).status_code == 202
     drifted = row(case)
     assert (drifted.observed.agent_version, drifted.observed.source, drifted.state_profile) == (
-        "42", "metadata-active", V2)
+        "42", "metadata-active", V3)
 
 
 def test_a_drift_onto_an_unreadable_definition_keeps_the_rows_profile_and_logs_it(bound, monkeypatch, caplog):
     case = bound
     unreadable = Problem(503, "NATIVE_BOOTSTRAP_SOURCE_UNAVAILABLE", "unreadable")
-    assert drift_in_place(case, monkeypatch, "42", unreadable, before=V2).status_code == 202
+    assert drift_in_place(case, monkeypatch, "42", unreadable, before=V3).status_code == 202
     drifted = row(case)
-    assert (drifted.observed.agent_version, drifted.drift, drifted.state_profile) == ("42", True, V2)
+    assert (drifted.observed.agent_version, drifted.drift, drifted.state_profile) == ("42", True, V3)
     assert "NATIVE_VERSION_PROFILE_UNREAD code=NATIVE_BOOTSTRAP_SOURCE_UNAVAILABLE version=42" in caplog.text
 
 
@@ -504,7 +504,7 @@ def test_a_drift_onto_an_unsupported_profile_leaves_the_row_saying_so(bound, mon
 
 def test_an_fa_switch_still_records_the_new_sids_profile_without_a_drift_read(bound, monkeypatch):
     case = bound
-    declared(case, monkeypatch, **{"41": V1, "42": V2})
+    declared(case, monkeypatch, **{"41": V1, "42": V3})
     monkeypatch.setattr(behavior_native_sessions, "_native_profile",
                         lambda *_a, **_k: pytest.fail("an FA switch is not a drift: no drift definition read"))
     sessions = native_sessions(case.composition)
@@ -515,23 +515,23 @@ def test_an_fa_switch_still_records_the_new_sids_profile_without_a_drift_read(bo
         previous_agent_version="41", hosted_session_id="fa-native-next", hosted_agent_version="42"))
     moved = row(case)
     assert (moved.hosted_session_id, moved.created_agent_version, moved.drift, moved.state_profile) == (
-        "fa-native-next", "42", False, V2)
+        "fa-native-next", "42", False, V3)
 
 
-def test_a_v1_row_drifted_onto_a_v2_image_is_no_v1_row_for_the_2d_ii_gate(bound, monkeypatch):
+def test_a_v1_row_drifted_onto_a_v3_image_is_no_v1_row_for_the_2d_ii_gate(bound, monkeypatch):
     from shared_context.native_deploy_gate import evaluate
 
     case = bound
     # The drift CAS a 2d-i send ran (2d-ii never sends to a v1 row, so it is driven directly, as the 409 does).
     claimed = case.store.claim(case.agent_id, hosted_session_id=case.sid, created_agent_version="41", state_profile=V1)
-    declares(monkeypatch, {"42": V2})
+    declares(monkeypatch, {"42": V3})
     refusal = before_dispatch(Problem(409, "NATIVE_SESSION_CHANGED", "private"), "version", "42")
     assert native_sessions(case.composition)._drifted(case.foundry.for_target(case.remote.target), refusal,
                                                       claimed) is not None
     target = SimpleNamespace(agent_id=case.agent_id, agent_name="fa-agent", project_endpoint="https://project")
     report = evaluate([target], case.store.rows, lambda _target, _version: {"environment_variables": {
-        "FA_NATIVE_TURNS": V2}}, armed=True, supported=frozenset({V2}))
-    assert [(item["row_profile"], item["verdict"]) for item in report["agents"]] == [(V2, "compatible")]
+        "FA_NATIVE_TURNS": V3}}, armed=True, supported=frozenset({V3}))
+    assert [(item["row_profile"], item["verdict"]) for item in report["agents"]] == [(V3, "compatible")]
     assert report["refused"] == []
 
 
@@ -550,12 +550,12 @@ def turn_end(case, monkeypatch, selected="42"):
 
 
 def gate(case):
-    """The 2d-ii gate's verdict on the row (v2 only), every definition declaring v2."""
+    """The 2d-ii gate's verdict on the row (v3 only from 3d-ii), every definition declaring v3."""
     from shared_context.native_deploy_gate import evaluate
 
     target = SimpleNamespace(agent_id=case.agent_id, agent_name="fa-agent", project_endpoint="https://project")
     report = evaluate([target], case.store.rows, lambda _target, _version: {"environment_variables": {
-        "FA_NATIVE_TURNS": V2}}, armed=True, supported=frozenset({V2}))
+        "FA_NATIVE_TURNS": V3}}, armed=True, supported=frozenset({V3}))
     return [(item["row_profile"], item["verdict"]) for item in report["agents"]]
 
 
@@ -566,14 +566,14 @@ def test_a_row_that_drifted_before_the_fix_is_corrected_at_its_next_turn_end_onc
     case = bound
     drifted_before_the_fix(case)
     assert row(case).state_profile == V1 and gate(case) == [(V1, "row_profile_unsupported")]
-    resolver = declared(case, monkeypatch, **{"42": V2})
+    resolver = declared(case, monkeypatch, **{"42": V3})
     assert submit(case).status_code == 202
     healed = row(case)
     assert (healed.hosted_session_id, healed.observed.agent_version, healed.drift, healed.state_profile) == (
-        case.sid, "42", True, V2)
+        case.sid, "42", True, V3)
     assert (healed.abandon, healed.last_switch, healed.previous_sessions) == (None, None, ())  # no switch: files stay
     assert {request.url.params["agent_session_id"] for request, _ in case.remote.calls} == {case.sid}
-    assert gate(case) == [(V2, "compatible")] and "NATIVE_SESSION_CALL_INCOMPATIBLE" not in caplog.text
+    assert gate(case) == [(V3, "compatible")] and "NATIVE_SESSION_CALL_INCOMPATIBLE" not in caplog.text
     no_session_calls(monkeypatch)
     writes = len(case.repository.writes)
     assert turn_end(case, monkeypatch) == ("current", None, None)
@@ -603,17 +603,17 @@ def test_an_unreadable_definition_on_send_is_a_503_and_the_same_rid_resend_heals
     assert row(case).state_profile == V1 and "NATIVE_SESSION_CALL_INCOMPATIBLE" not in caplog.text
     assert "NATIVE_BINDING_PROFILE_UNREAD code=AGENT_VERSION_FOLLOWING version=42" in caplog.text
     assert native_sessions(case.composition).guard.refused == set() and case.remote.calls == []
-    declared(case, monkeypatch, **{"42": V2})
+    declared(case, monkeypatch, **{"42": V3})
     again = submit(case)
     assert again.status_code == 202, again.text
-    assert (row(case).hosted_session_id, row(case).state_profile) == (case.sid, V2)
+    assert (row(case).hosted_session_id, row(case).state_profile) == (case.sid, V3)
     assert {request.url.params["agent_session_id"] for request, _ in case.remote.calls} == {case.sid}
 
 
 def test_a_heal_the_table_does_not_take_is_a_503_too(bound, monkeypatch):
     case = bound
     drifted_before_the_fix(case)
-    declared(case, monkeypatch, **{"42": V2})
+    declared(case, monkeypatch, **{"42": V3})
     case.repository.fail_writes = 1
     assert submit(case).json()["error"]["code"] == "AGENT_VERSION_FOLLOWING"
     assert row(case).state_profile == V1 and native_sessions(case.composition).guard.refused == set()
@@ -621,9 +621,9 @@ def test_a_heal_the_table_does_not_take_is_a_503_too(bound, monkeypatch):
 
 def test_a_supported_row_costs_the_send_no_definition_read(bound, monkeypatch):
     case = bound
-    case.store.claim(case.agent_id, hosted_session_id=case.sid, created_agent_version="41", state_profile=V2)
+    case.store.claim(case.agent_id, hosted_session_id=case.sid, created_agent_version="41", state_profile=V3)
     case.store.record_observed(case.agent_id, hosted_session_id=case.sid, agent_version="42", source="vm",
-                               state_profile=V2)
+                               state_profile=V3)
     case.remote.vm_version = "42"
     resolver = declared(case, monkeypatch)
     assert submit(case).status_code == 202
@@ -634,14 +634,14 @@ def test_a_drifted_row_no_send_reached_is_corrected_at_its_turn_end_once(bound, 
     """The turn end's own heal (``cut``), when no send healed the row first: one CAS, no session call, then nothing."""
     case = bound
     drifted_before_the_fix(case)
-    resolver = declared(case, monkeypatch, **{"42": V2})
+    resolver = declared(case, monkeypatch, **{"42": V3})
     no_session_calls(monkeypatch)
     writes = len(case.repository.writes)
     assert turn_end(case, monkeypatch) == ("current", None, None)
     healed = row(case)
     assert (healed.hosted_session_id, healed.observed.agent_version, healed.drift, healed.state_profile) == (
-        case.sid, "42", True, V2)
-    assert len(case.repository.writes) == writes + 1 and gate(case) == [(V2, "compatible")]
+        case.sid, "42", True, V3)
+    assert len(case.repository.writes) == writes + 1 and gate(case) == [(V3, "compatible")]
     assert turn_end(case, monkeypatch) == ("current", None, None)
     assert len(case.repository.writes) == writes + 1 and row(case) == healed
     assert caplog.text.count("NATIVE_BINDING_PROFILE_CORRECTED") == 1
@@ -663,11 +663,11 @@ def test_a_drifted_row_whose_version_definition_is_unreadable_or_undeclared_is_l
 
 
 def test_a_heal_racing_a_drift_back_writes_nothing_over_the_older_version(bound, monkeypatch, caplog):
-    """The heal read the row at V_rec 42 (v1) and 42's v2; a send's 409 then records the drift back to 41 (v1) before
-    the heal's CAS. 41 never declared v2, so the CAS (SID and V_rec still those?) writes nothing."""
+    """The heal read the row at V_rec 42 (v1) and 42's v3; a send's 409 then records the drift back to 41 (v1) before
+    the heal's CAS. 41 never declared v3, so the CAS (SID and V_rec still those?) writes nothing."""
     case = bound
     drifted_before_the_fix(case)
-    declared(case, monkeypatch, **{"42": V2})
+    declared(case, monkeypatch, **{"42": V3})
     case.repository.before_write = lambda: case.store.record_observed(
         case.agent_id, hosted_session_id=case.sid, agent_version="41", source="vm", state_profile=V1)
     writes = len(case.repository.writes)
@@ -684,7 +684,7 @@ def test_a_heal_racing_an_fa_switch_writes_nothing_on_the_new_sid(bound, monkeyp
     heal's CAS: the old SID's read decides nothing for the new SID, whose own correction is left to its next read."""
     case = bound
     drifted_before_the_fix(case)
-    declared(case, monkeypatch, **{"42": V2})
+    declared(case, monkeypatch, **{"42": V3})
     view = NativeEnvironmentView(
         agent_id=case.agent_id, request_id="repair", state="ready", previous_hosted_session_id=case.sid,
         previous_agent_version="42", hosted_session_id="fa-native-next", hosted_agent_version="42")
@@ -746,7 +746,7 @@ def test_a_recorded_fence_settles_even_when_the_heal_finds_v_rec_unsupported(bou
 
 
 def test_without_a_version_resolver_a_drifted_row_is_never_given_the_apis_own_profile(bound, monkeypatch):
-    """An offline harness's ``_row_profile`` stands in the send profile (v2 from 2d-ii) without reading anything:
+    """An offline harness's ``_row_profile`` stands in the send profile (v3 from 3d-ii) without reading anything:
     never written over a v1 row, which stays unsupported."""
     case = bound
     drifted_before_the_fix(case, profile=V1)
@@ -767,19 +767,19 @@ def test_a_drift_recorded_outside_the_bound_path_records_the_profile_too(bound, 
     """``observed_binding``: a reported version on a send the row did not locate, or a legacy-located send."""
     case = bound
     claim(case)
-    declares(monkeypatch, {"40": V2})
+    declares(monkeypatch, {"40": V3})
     moved = case.foundry.for_target(case.remote.target.model_copy(update={"agent_version": "40"}))
     recorded = native_sessions(case.composition).observed_binding(moved, version="40")
-    assert (recorded.observed.agent_version, recorded.drift, recorded.state_profile) == ("40", True, V2)
+    assert (recorded.observed.agent_version, recorded.drift, recorded.state_profile) == ("40", True, V3)
 
 
-@pytest.mark.parametrize("seen,profile,reads", [("version", V2, ["42"]), ("claimed_version", V1, ["41"])])
+@pytest.mark.parametrize("seen,profile,reads", [("version", V3, ["42"]), ("claimed_version", V1, ["41"])])
 def test_a_claim_records_a_vm_reported_drifts_profile_and_never_unconfirmed_metadatas(bound, monkeypatch, seen,
                                                                                        profile, reads):
     """A VM's report (``version``) on an Agent with no row records the profile of the version the SID runs; a
     follow's source metadata (``claimed_version``) is no VM fact, so the claim keeps the creation version's."""
     case = bound
-    resolver = declared(case, monkeypatch, **{"41": V1, "42": V2})
+    resolver = declared(case, monkeypatch, **{"41": V1, "42": V3})
     client = case.foundry.for_target(case.remote.target)
     claimed = native_sessions(case.composition).observed_binding(client, **{seen: "42"})
     assert (claimed.created_agent_version, claimed.observed.agent_version, claimed.drift, claimed.state_profile) == (

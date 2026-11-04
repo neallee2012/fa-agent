@@ -24,7 +24,9 @@ import time
 from .behavior_agent_onboarding import _PROBE_ENV, FoundryCallError, _list
 from .behavior_code_identity import code_sha256
 from .errors import Problem
-from .native_responses_wire import ACCEPTED_STATE_PROFILES, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE
+from .native_responses_wire import (
+    ACCEPTED_STATE_PROFILES, NATIVE_V2_PROFILE, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE,
+)
 
 log = logging.getLogger(__name__)
 
@@ -659,8 +661,9 @@ def _sync_target(foundry, target, *, upgrade, image, set_route, build, overlay, 
 
 def _v3_overlay(overlay, details, target):
     declared = _declared_profile(details)
-    # ADR-0009 3d-i: a served definition declaring v1 (stored before M1 retired the alias) or v2 is moved to v3 here
-    if declared in ACCEPTED_STATE_PROFILES or declared == UNLABELED_STATE_PROFILE:
+    # ADR-0009 3d-i: a served definition declaring v1 (stored before M1 retired the alias) or v2 (stored before 3d-ii
+    # narrowed the accepted set to v3) is moved to v3 here
+    if declared in {UNLABELED_STATE_PROFILE, NATIVE_V2_PROFILE, NATIVE_V3_PROFILE}:
         return {**(overlay or {}), "FA_NATIVE_TURNS": NATIVE_V3_PROFILE}
     # no accepted profile (an executor declares none): its ENV carries over, no v3
     log.info("agent version sync %s: registered, served FA_NATIVE_TURNS=%s is no native profile; "
