@@ -173,7 +173,7 @@ def test_hosted_text_policy_race_cannot_report_a_generic_no_sdk_failure(native_m
     observations, failures, constructors = observe_job_during_context(
         c.h, monkeypatch, local=False, revoke_text_policy=True)
     c.h.workers.start(c.binding.job_id, c.binding.owner)
-    c.supervisor.join(timeout=5)
+    c.supervisor.join()
     state = c.supervisor.observe(c.starts[0].launch_id)
     c.h.workers.reconcile(c.binding.job_id, c.binding.owner)
     evidence = conflict_evidence("hosted-query-update-text-policy-revocation", c.h, c.binding, c.supervisor.journal,

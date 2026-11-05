@@ -220,7 +220,7 @@ def test_a_recovery_turn_gets_the_continuation_reader_and_the_operation_guard(lo
     assert "Never resend append commands or treat unknown appends as already applied." in options["system_message"]
     assert derived.continuation.continuation_of == source.request_id
     assert sorted(options["native_operations"].bindings) == [
-        "execute_operation", "read_context", "read_continuation_context", "read_tool_output"]
+        "execute_operation", "read_context", "read_continuation_context", "read_tool_output", "read_user_file"]
     assert json.loads(page["text"])["command"]["content"] == "Continue the original work."
     assert page["authorization"] is False
 
@@ -285,7 +285,7 @@ def test_a_recovery_with_delegation_binds_task_and_its_completion_check(local_en
     options = seen[0]
     assert options["delegation_runtime"] is delegation
     assert sorted(options["native_operations"].bindings) == [
-        "execute_operation", "read_context", "read_continuation_context", "read_tool_output", "task"]
+        "execute_operation", "read_context", "read_continuation_context", "read_tool_output", "read_user_file", "task"]
     assert options["native_operations"].completion_checks == {"task": delegation.read}
     assert delegation.cancels == 0
 

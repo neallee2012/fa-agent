@@ -16,7 +16,7 @@ from shared_context.behavior_operations import _write
 from shared_context.behavior_peer_runtime import install_peer_routing
 from shared_context.behavior_store import ControlChanges, ControlRequest
 from shared_context.behavior_team_registry import (
-    TeamAgent, TeamRegistry, agent_key, inventory_agent_scope, registered_agent_ids, resolve_agent_scope,
+    TeamAgent, TeamRegistry, agent_key, registered_agent_ids, resolve_agent_scope,
 )
 from shared_context.behavior_work_target import instruction_hosted_version
 from shared_context.errors import Problem
@@ -94,7 +94,6 @@ def test_seam_keeps_configured_agents_at_zero_reads_and_registered_agents_at_two
     assert (scope.configuration_sha256, scope.authority_domain, scope.human_oid) == (
         config.sha256, config.table.scope.authority_domain, config.identity.human_oid)
     assert registered_agent_ids(store, config) == (case.target.agent_id,)
-    assert inventory_agent_scope(store.read_inventory(), config, case.target.agent_id) == scope
     for unknown in ("unknown-agent", "bad/agent"):
         with pytest.raises(Problem) as denied:
             resolve_agent_scope(store, config, unknown)
@@ -241,8 +240,6 @@ def test_registered_agent_scope_passes_the_real_startup_readers_and_a_missing_ta
     _register_scope(case)
     case.a.for_agent(case.target.agent_id)
     assert readers() == baseline
-    inventory = case.a.runtime.store.read_inventory()
-    assert inventory_agent_scope(inventory, config, case.target.agent_id).target == case.target
 
 
 def test_a_binding_path_finds_its_peer_without_rescanning_the_team(team_agent, signing_key, monkeypatch):

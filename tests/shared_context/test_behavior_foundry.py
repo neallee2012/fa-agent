@@ -21,7 +21,7 @@ from shared_context import behavior_wire as wire
 from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_delivery import VerifiedWorkResult
 from shared_context.behavior_foundry import (
-    FoundryExecutor, NativeExecutionGrant, NativeJobRoute, NativeLaunchAuthority, controller_process_entry, native_key,
+    FoundryExecutor, NativeExecutionGrant, NativeJobRoute, NativeLaunchAuthority, native_key,
 )
 from shared_context.behavior_hosted import BehaviorExecutorClient, ChecksumSupervisor, HostedInvocation, HostedRuntime
 from shared_context.behavior_workers import JobSpec, WorkerContract, WorkerCore
@@ -629,15 +629,6 @@ def test_capabilities_never_enter_api_json_authority_rows_or_private_child_state
         assert h.data("budget", "root")["remaining_attempts"] == 19
     finally:
         h.close()
-
-
-def test_generic_agent_consume_and_human_cannot_supply_a_server_controller():
-    agent = BehaviorPrincipal("tenant", TARGET.agent_oid, "team", "agent", "agent", frozenset({"consume"}))
-    human = BehaviorPrincipal("tenant", TARGET.agent_oid, "team", "human", None, frozenset({"read", "submit", "acknowledge"}))
-    for principal in (agent, human):
-        with pytest.raises(Problem) as denied:
-            controller_process_entry(lambda: principal)
-        assert code(denied) == "NATIVE_CONTROLLER_REQUIRED"
 
 
 def test_native_adoption_refuses_running_predecessor_even_with_a_new_epoch(tmp_path):

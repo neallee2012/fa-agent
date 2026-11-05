@@ -7,3 +7,4 @@ httpx==0.28.1
 pydantic==2.12.5
 github-copilot-sdk==1.0.26
 jsonschema==4.25.1
+pypdf==6.21.4

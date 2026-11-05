@@ -13,7 +13,7 @@ Units are integer reservation units, NOT a provider billing cap.
 Accounting adapter callbacks resolve compliant content or VERIFY previously obtained
 destination evidence. They must return the narrow models below or a safe Problem;
 no accounting callback executes a tool, shell or arbitrary HTTP request.
-Concrete execution and its credential boundary live in behavior_dispatch.
+Concrete execution lives in behavior_effects (WorkStateEffectAdapter); the arm/consume base is behavior_dispatch.
 No adapter is installed by default. Evidence-contract options default to disabled;
 registering a boolean in ToolIntent cannot enable them or supply approval.
 
@@ -28,7 +28,7 @@ fresh last gate, one-attempt delivery, clock window and destination conditions.
 After conflict/unknown, do not blindly resubmit: use reconciliation_request()
 with BehaviorStore.reconcile(). A missing receipt remains unknown. A successful
 reconciliation is historical read-back, never permission to dispatch again.
-The optional behavior_dispatch adapter adds a durable one-consume lifecycle.
+The optional behavior_effects adapter (on behavior_dispatch) adds a durable one-consume lifecycle.
 Without it execute() remains disabled. Authorization receipts remain accounting
 only; they never confer permission to send, including after reconciliation.
 Callbacks inside transact are side-effect-free. There are no locks, refunds,
@@ -56,7 +56,6 @@ from .models import Identifier, StrictModel
 from .records import Record
 
 if TYPE_CHECKING:
-    from .behavior_dispatch import ContextArtifactAdapter
     from .behavior_effects import WorkStateEffectAdapter
 
 CANONICALIZATION_VERSION = "fa-operation-v1"
@@ -458,18 +457,17 @@ class ToolBrokerCore:
     def __init__(
         self, store: BehaviorStore, *, clock: Callable[[], datetime],
         adapter: RegisteredAdapter | None = None,
-        execution_adapter: ContextArtifactAdapter | WorkStateEffectAdapter | None = None,
+        execution_adapter: WorkStateEffectAdapter | None = None,
     ):
         self.store, self.clock = store, clock
         self._adapter = adapter
         self._contract = None if adapter is None else _checked(adapter.contract, AdapterContract)
         self.dispatcher = None
         if execution_adapter is not None:
-            from .behavior_dispatch import BehaviorDispatcher
-            from .behavior_effects import WorkStateDispatcher, WorkStateEffectAdapter
+            from .behavior_effects import WorkStateDispatcher
 
-            dispatcher = WorkStateDispatcher if type(execution_adapter) is WorkStateEffectAdapter else BehaviorDispatcher
-            self.dispatcher = dispatcher(self, execution_adapter)
+            # Any other adapter type is refused by BehaviorDispatcher.__init__ (403 OPERATION_EXECUTION_DISABLED).
+            self.dispatcher = WorkStateDispatcher(self, execution_adapter)
 
     def _enabled(self) -> tuple[RegisteredAdapter, AdapterContract]:
         if self._adapter is None or self._contract is None:

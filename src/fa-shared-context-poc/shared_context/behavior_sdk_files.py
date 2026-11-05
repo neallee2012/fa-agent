@@ -91,7 +91,8 @@ class SdkSessionFiles(SessionFsProvider):
         self.failed = False
         self.frozen = False
         self._forbidden_values = set()
-        # tool_call_id -> None while an approved large call runs, then its estimated bytes until they are written.
+        # tool_call_id -> [reserved bytes, None] while an approved large call runs, then [reserved, its estimated
+        # bytes] until they are written.
         self._unwritten_large = {}
         self.stamp = datetime.now(timezone.utc)
 
@@ -128,7 +129,7 @@ class SdkSessionFiles(SessionFsProvider):
             return False
         return relative == "temp" or relative.startswith("temp/")
 
-    def reserve_large_result(self, tool_call_id):
+    def reserve_large_result(self, tool_call_id, reserve_bytes=LARGE_RESULT_RESERVE_BYTES):
         """Reserve room for one more screenshot or browser result; the SDK files themselves are not changed.
 
         The SDK approves parallel calls before any of them completes, and writes results to events.jsonl later,
@@ -137,20 +138,20 @@ class SdkSessionFiles(SessionFsProvider):
         so this call may fit after they finish; or "full" when written and completed results leave no room.
         """
         size = sum(len(content.encode("utf-8")) for content in self.files.values())
-        running = sum(1 for value in self._unwritten_large.values() if value is None)
-        completed = sum(value for value in self._unwritten_large.values() if value is not None)
+        running = sum(reserved for reserved, done in self._unwritten_large.values() if done is None)
+        completed = sum(done for _, done in self._unwritten_large.values() if done is not None)
         # "full" when the written state plus results that are certain to be written leaves no room; "busy" only
         # when calls still running may finish smaller.
-        if size + completed + LARGE_RESULT_RESERVE_BYTES > MAX_BACKUP_BYTES:
+        if size + completed + reserve_bytes > MAX_BACKUP_BYTES:
             return "full"
-        if size + completed + (running + 1) * LARGE_RESULT_RESERVE_BYTES > MAX_BACKUP_BYTES:
+        if size + completed + running + reserve_bytes > MAX_BACKUP_BYTES:
             return "busy"
-        self._unwritten_large[tool_call_id] = None
+        self._unwritten_large[tool_call_id] = [reserve_bytes, None]
         return "reserved"
 
     def large_result_completed(self, tool_call_id, estimated_bytes):
         if tool_call_id in self._unwritten_large:
-            self._unwritten_large[tool_call_id] = estimated_bytes
+            self._unwritten_large[tool_call_id][1] = estimated_bytes
 
     def reset_reservations(self):
         """A new turn: calls of an earlier turn are either written or will never complete."""

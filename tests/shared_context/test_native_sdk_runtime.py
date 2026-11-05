@@ -12,8 +12,9 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
+from conftest import require_cold_resume_paths
 from shared_context.behavior_hosted import create_host
-from shared_context.behavior_native_turn_wire import NativeResult, NativeSubmit, NativeTurnCapture
+from shared_context.behavior_native_turn_wire import NATIVE_STATE_PROFILE, NativeResult, NativeSubmit, NativeTurnCapture
 from shared_context.native_checkpoint import open_durable_store, verify_checkpoint, conversation_store_name
 from shared_context.native_sdk import NativeSdkExecutor
 from shared_context.native_turns import NativeTurnRuntime
@@ -130,7 +131,7 @@ def test_pinned_sdk_executes_one_native_completions_turn_and_saves_original_resu
 
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
         accepted = client.post("/invocations", json=request.model_dump(mode="json"), headers={
-            "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
+            "x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": IDENTITY.session_id,
             "x-agent-invocation-id": "OFFLINE-native-platform", "x-agent-foundry-call-id": "OFFLINE-native-call",
         })
         assert accepted.status_code == 202, accepted.text
@@ -164,7 +165,7 @@ def test_pinned_sdk_executes_one_native_completions_turn_and_saves_original_resu
             other = NativeSubmit(command=submit(rid="rid-2", text="Second conversation question.").command,
                                  capture=selected)
             assert client.post("/invocations", json=other.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-native-platform-2", "x-agent-foundry-call-id": "OFFLINE-native-call-2",
             }).status_code == 202
 
@@ -270,7 +271,7 @@ def test_pinned_sdk_resume_replaces_the_previous_role_in_the_same_conversation(m
         def post(rid, cid, text, chosen):
             request = NativeSubmit(command=submit(rid=rid, cid=cid, text=text).command, capture=chosen)
             return client.post("/invocations", json=request.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-" + rid, "x-agent-foundry-call-id": "OFFLINE-call-" + rid,
             })
 
@@ -382,7 +383,7 @@ def test_pinned_sdk_sends_agent_role_v2_with_native_tools_and_the_role_text_last
         for rid, text in (("rid-role", "ROLE-ALPHA keeps answers short."), ("rid-plain", None)):
             request = NativeSubmit(command=submit(rid=rid, text="Hello.").command, capture=selection(text))
             assert client.post("/invocations", json=request.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-" + rid, "x-agent-foundry-call-id": "OFFLINE-call-" + rid,
             }).status_code == 202
 
@@ -417,6 +418,7 @@ def test_pinned_sdk_carries_the_first_turns_static_profile_only_in_history(monke
     if not root_value:
         pytest.fail("Set a session-private N1_NATIVE_WORKSPACE; never use the real user HOME.")
     root = Path(root_value).resolve() / "memory-tiers"
+    require_cold_resume_paths(root)  # past MAX_PATH the local State store writes fail mid-turn
     root.mkdir(parents=True, exist_ok=False)
     for key in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"):
         isolated = root / key.lower()
@@ -489,7 +491,7 @@ def test_pinned_sdk_carries_the_first_turns_static_profile_only_in_history(monke
         def turn(rid, cid, text):
             request = NativeSubmit(command=submit(rid=rid, cid=cid, text=text).command, capture=chosen)
             assert client.post("/invocations", json=request.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-" + rid, "x-agent-foundry-call-id": "OFFLINE-call-" + rid,
             }).status_code == 202
 

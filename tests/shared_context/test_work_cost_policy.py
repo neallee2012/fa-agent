@@ -153,8 +153,3 @@ def test_accounting_only_reports_no_budget_numbers_and_never_exhausts(assistant)
     assert (late.decision,late.remaining_microusd,late.safety_reserve_microusd,late.cumulative_ceiling_microusd,
             late.budget_enforced,late.required_microusd)==("allow",None,None,None,False,2_000_000)
     assert late.model_dump(mode="json")["budget_enforced"] is False
-
-
-def test_delayed_native_usd_observation_is_rounded_up_not_reset():
-    from shared_context.behavior_work_policy import microusd_from_decimal
-    assert microusd_from_decimal("47.11268605947896027")==47_112_687

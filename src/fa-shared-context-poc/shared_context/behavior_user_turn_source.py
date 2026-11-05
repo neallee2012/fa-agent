@@ -76,17 +76,8 @@ def _scope(authority, session, principal):
     return control, binding, task, conversation, {ckey: row}
 
 
-def _read(authority, session, principal, turn_number):
-    from .behavior_assistant import _Session, key
-    from .behavior_assistant_wire import SdkArchive, StoredSdkArchive
-    from .behavior_assistant_checkpoint import unpack
-    from .behavior_sdk_checkpoint import SdkStateUpload, checkpoint_key
-    from .behavior_skill_prompt import assemble_prompt
-    from .behavior_work_policy import (
-        WorkRegistration, registered_instruction, registration_request_digest, work_policy_key,
-    )
-
-    control, current_binding, current_task, conversation, snapshot = _scope(authority, session, principal)
+def _registered_turn(authority, principal, control, current_binding, current_task, conversation, turn_number):
+    """The one original human registration of a completed past turn in this conversation, for this identity."""
     if not 1 <= turn_number < current_task.turn_number:
         raise Problem(403, "USER_TURN_SCOPE_DENIED", "only a completed past turn number in this conversation may be read")
     job_id = conversation.jobs[turn_number - 1]
@@ -104,6 +95,43 @@ def _read(authority, session, principal, turn_number):
             or (binding.tenant_id, binding.team_id, binding.human_oid, binding.agent_oid)
             != (current_binding.tenant_id, current_binding.team_id, current_binding.human_oid, current_binding.agent_oid)):
         raise Problem(403, "USER_TURN_SCOPE_DENIED", "the original user turn belongs to another conversation or identity")
+    return job_id, registered
+
+
+def _published_checkpoint(authority, archive, job_id, conversation, current_task):
+    """The original checkpoint publication behind a stored archive; an inline archive must unpack instead."""
+    from .behavior_assistant_wire import SdkArchive
+    from .behavior_assistant_checkpoint import unpack
+    from .behavior_sdk_checkpoint import SdkStateUpload, checkpoint_key
+
+    if isinstance(archive.archive, SdkArchive):
+        unpack(archive.archive)
+        return {}
+    ckey = checkpoint_key(job_id)
+    uploaded = authority.store.read_snapshot((ckey,))[ckey]
+    if uploaded is None:
+        raise Problem(409, "USER_TURN_SOURCE_INVALID", "original checkpoint publication is missing")
+    checkpoint = _record(uploaded.payload["data"], SdkStateUpload)
+    archive.archive.require_profile(current_task.checkpoint_profile, model_provider=current_task.model_provider)
+    if (checkpoint.reference != archive.archive or checkpoint.job_id != job_id
+            or checkpoint.sdk_stop != archive.sdk_stop or checkpoint.conversation_id != conversation.conversation_id):
+        raise Problem(409, "USER_TURN_SOURCE_CHANGED", "original checkpoint publication differs")
+    return {ckey: uploaded}
+
+
+def _read(authority, session, principal, turn_number):
+    from .behavior_assistant import _Session, key
+    from .behavior_assistant_wire import SdkArchive, StoredSdkArchive
+    from .behavior_skill_prompt import assemble_prompt
+    from .behavior_work_policy import (
+        WorkRegistration, registered_instruction, registration_request_digest, work_policy_key,
+    )
+
+    control, current_binding, current_task, conversation, snapshot = _scope(authority, session, principal)
+    job_id, registered = _registered_turn(
+        authority, principal, control, current_binding, current_task, conversation, turn_number)
+    binding = registered.binding
+    task = registered.profile.instruction
     rkey = work_policy_key("registration", registered.admission_id)
     jkey, akey, result_key = worker_key("job", job_id), key("text-archive", job_id), key("result", binding.work.work_id)
     rows = authority.store.read_snapshot(tuple(dict.fromkeys((
@@ -149,19 +177,7 @@ def _read(authority, session, principal, turn_number):
         request_digest=registration_request_digest(record))
     _original_write(authority.store, key("text-reply", sid),
                     {akey: rows[akey], result_key: rows[result_key], skey: state})
-    if isinstance(archive.archive, SdkArchive):
-        unpack(archive.archive)
-    else:
-        ckey = checkpoint_key(job_id)
-        uploaded = authority.store.read_snapshot((ckey,))[ckey]
-        if uploaded is None:
-            raise Problem(409, "USER_TURN_SOURCE_INVALID", "original checkpoint publication is missing")
-        checkpoint = _record(uploaded.payload["data"], SdkStateUpload)
-        archive.archive.require_profile(current_task.checkpoint_profile, model_provider=current_task.model_provider)
-        if (checkpoint.reference != archive.archive or checkpoint.job_id != job_id
-                or checkpoint.sdk_stop != archive.sdk_stop or checkpoint.conversation_id != conversation.conversation_id):
-            raise Problem(409, "USER_TURN_SOURCE_CHANGED", "original checkpoint publication differs")
-        snapshot[ckey] = uploaded
+    snapshot.update(_published_checkpoint(authority, archive, job_id, conversation, current_task))
     snapshot.update(rows)
     snapshot[skey] = state
     if record.routine is not None:

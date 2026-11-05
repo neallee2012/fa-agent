@@ -1010,6 +1010,140 @@ def test_attached_images_are_stored_first_and_the_send_carries_only_their_refere
     assert len(submitted) == 1 and "png_base64" not in json.dumps(submitted[0])
 
 
+def enable_user_files(c):
+    from shared_context.behavior_agent_template import AgentTemplate, TemplateSettings, export_template
+    from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
+    original = export_template(c.c.control, c.c.authority, c.c.human)
+    template = AgentTemplate.model_validate({**original.model_dump(), "settings": TemplateSettings(
+        **{**original.settings.model_dump(), "user_text_file_profile": "fa-user-text-files-v1"})})
+    select_profile(c.c.control, c.c.authority, c.c.human, SelectConversationProfile(
+        request_id="native-ui-uploads", expected_selection_id=None, template=template))
+
+
+def put_file(c, rid, data, name="sales.csv", **headers):
+    from urllib.parse import quote
+    return c.ui.client.put("/api/instructions/" + rid + "/file-upload", content=data, headers={
+        **c.ui.headers, "Content-Type": "application/octet-stream", "X-FA-File-Name": quote(name), **headers})
+
+
+def test_a_large_text_file_is_stored_raw_first_and_the_send_carries_only_its_reference(native_console, monkeypatch):
+    """ADR-0013 slice 1: the workbench PUTs the raw bytes, then submits name, digest, length and type in `uploads`."""
+    from shared_context import behavior_session_files
+
+    c = native_console
+    puts = []
+    monkeypatch.setattr(behavior_session_files.SessionFiles, "put_new",
+                        lambda self, sid, path, data: puts.append((path, data)) or len(data))
+    enable_user_files(c)
+    draft = first(c)
+    data = "名稱,數量\n".encode() + b"a,1\n" * 4096
+    digest = hashlib.sha256(data).hexdigest()
+    stored = put_file(c, draft["request_id"], data)
+    assert stored.status_code == 200, stored.text
+    reference = stored.json()
+    assert reference == {"name": "sales.csv", "sha256": digest, "byte_length": len(data), "media_type": "text/csv"}
+    assert puts == [(".fa-attachments/" + digest, data)]
+    sent = post(c, "/api/instructions/" + draft["request_id"] + "/submit",
+                {"content": "Sum column b", "model": "gpt-4.1-mini", "uploads": [reference]})
+    assert sent.status_code == 200, sent.text
+    original = c.api.remote.records[draft["request_id"]]
+    assert [item.model_dump(mode="json") for item in original.command.uploads] == [reference]
+    assert sent.json()["task"]["user_uploads"] == [reference], "the sent turn shows which large files it carried"
+    submitted = [body for method, path, body in c.calls if method == "POST" and path.endswith("/native-turns/submit")]
+    assert len(submitted) == 1 and b"a,1" not in submitted[0]
+
+
+def test_an_unconfirmed_upload_tells_the_user_sending_the_same_file_again_is_safe(native_console, monkeypatch):
+    from shared_context import behavior_session_files
+    from shared_context.errors import Problem
+    from web_test_console.adapter import ConsoleError, PullAdapter
+
+    c = native_console
+    enable_user_files(c)
+    rid = first(c)["request_id"]
+
+    def lost(*_a):
+        raise Problem(503, "NATIVE_FILES_UNKNOWN", "OFFLINE lost ack")
+    monkeypatch.setattr(behavior_session_files.SessionFiles, "put_new", lost)
+    unknown = put_file(c, rid, b"a,b;" * 3000)
+    assert (unknown.status_code, unknown.json()["error"]["code"]) == (503, "USER_FILE_UPLOAD_UNKNOWN")
+    # No answer at all from the API (a timeout on 10 MiB) is the same unconfirmed upload, not "backend offline".
+    send = PullAdapter.send
+
+    def offline(self, method, path, *args, **kwargs):
+        if path.endswith("/native-turns/files"):
+            raise ConsoleError("BACKEND_OFFLINE", 503)
+        return send(self, method, path, *args, **kwargs)
+    monkeypatch.setattr(PullAdapter, "send", offline)
+    timed_out = put_file(c, rid, b"a,b;" * 3000)
+    assert (timed_out.status_code, timed_out.json()["error"]["code"]) == (503, "USER_FILE_UPLOAD_UNKNOWN")
+
+
+@pytest.mark.parametrize("name, media_type", [
+    ("Report.PDF", "application/pdf"),
+    ("Report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+])
+def test_a_pdf_or_office_file_is_stored_as_its_exact_bytes_without_a_text_check(native_console, monkeypatch, name,
+                                                                                media_type):
+    """ADR-0013 slices 3 and 4: a PDF or Office file is binary; Hosted extracts its text when the model reads it."""
+    from shared_context import behavior_session_files
+
+    c = native_console
+    puts = []
+    monkeypatch.setattr(behavior_session_files.SessionFiles, "put_new",
+                        lambda self, sid, path, data: puts.append(data) or len(data))
+    enable_user_files(c)
+    data = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n" + b"\xff\x00" * 64
+    stored = put_file(c, first(c)["request_id"], data, name=name)
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["media_type"] == media_type and puts == [data]
+
+
+def test_a_text_file_upload_refuses_bad_names_types_sizes_and_bytes_before_any_write(native_console, monkeypatch):
+    from shared_context import behavior_session_files
+
+    c = native_console
+    monkeypatch.setattr(behavior_session_files.SessionFiles, "put_new",
+                        lambda *_a: pytest.fail("a refused file must not reach Session Files"))
+    rid = first(c)["request_id"]
+    before = len(c.calls)
+    for data, name, status, code in (
+        (b"a,b\n", "report.doc", 400, "USER_FILE_TYPE_UNSUPPORTED"),
+        (b"a,b\n", "noext", 400, "USER_FILE_TYPE_UNSUPPORTED"),
+        (b"a,b\n", "../x.csv", 400, "USER_FILE_INPUT_INVALID"),
+        (b"a,b\n", "銷售.csv", 400, "USER_FILE_INPUT_INVALID"),
+        (b"\xff\xfe\x00", "x.csv", 400, "USER_FILE_INPUT_INVALID"),
+        (b"", "x.csv", 400, "USER_FILE_INPUT_INVALID"),
+        (b"x" * (10 * 1024 * 1024 + 1), "x.txt", 413, "USER_FILE_TOO_LARGE"),
+    ):
+        refused = put_file(c, rid, data, name=name)
+        assert (refused.status_code, refused.json()["error"]["code"]) == (status, code), name
+    assert not [call for call in c.calls[before:] if call[0] == "PUT"]
+    # Only the file route takes a PUT with an octet-stream body, and only with the page's CSRF token.
+    assert put_file(c, rid, b"a,b\n", **{"Content-Type": "application/json"}).status_code == 403
+    assert put_file(c, rid, b"a,b\n", **{"X-Console-CSRF": "wrong"}).status_code == 403
+    other = c.ui.client.put("/api/instructions/" + rid + "/submit", content=b"x", headers={
+        **c.ui.headers, "Content-Type": "application/octet-stream"})
+    assert other.status_code in {403, 405}
+
+
+def test_uploads_are_refused_locally_on_the_job_bound_lane_before_any_write(native_console, monkeypatch):
+    c = native_console
+    draft = first(c)
+    monkeypatch.setattr(c.ui.console, "native_request", lambda _rid: None)
+    monkeypatch.setattr(c.ui.console.instructions, "prepare",
+                        lambda *_a, **_k: pytest.fail("uploads must be refused before the job-bound lane writes"))
+    before = len(c.calls)
+    refused = put_file(c, draft["request_id"], b"a,b\n")
+    assert refused.status_code == 409 and refused.json()["error"]["code"] == "USER_UPLOADS_UNSUPPORTED"
+    reference = {"name": "x.csv", "sha256": hashlib.sha256(b"a,b\n").hexdigest(), "byte_length": 4,
+                 "media_type": "text/csv"}
+    sent = post(c, "/api/instructions/" + draft["request_id"] + "/submit",
+                {"content": "Read it.", "model": "gpt-4.1-mini", "uploads": [reference]})
+    assert sent.status_code == 409 and sent.json()["error"]["code"] == "USER_UPLOADS_UNSUPPORTED"
+    assert not [call for call in c.calls[before:] if call[0] in {"POST", "PUT"}]
+
+
 def test_a_declared_image_model_reaches_the_composer_and_others_stay_unchanged(native_console):
     """The picker depends on this flag: it must survive the real /models response and the workbench DTO."""
     c = native_console

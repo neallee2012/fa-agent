@@ -572,6 +572,8 @@ class WorkStateDispatcher(BehaviorDispatcher):
         operation, material, description = self.core._operation(
             rows, command.operation_id, context,
         )
+        if operation.human_rejection is not None:
+            raise Problem(409, "OPERATION_HUMAN_REJECTED", "the original operation was declined by its human")
         if operation.current_attempt_id is not None:
             return
         self.core._grant_budget(rows, command, context, material.sha256, self.core._now(),

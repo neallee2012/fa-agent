@@ -60,6 +60,37 @@ def _unique(pairs):
     return value
 
 
+async def _octets(request: Request, *, max_body_bytes):
+    """One raw ``application/octet-stream`` body with an exact Content-Length; never decoded or parsed."""
+    if request.query_params:
+        raise Problem(422, "BEHAVIOR_INVALID_REQUEST", "query parameters are not supported")
+    for name in ("content-length", "content-type", "content-encoding"):
+        if len(request.headers.getlist(name)) > 1:
+            raise Problem(422, "BEHAVIOR_INVALID_REQUEST", "duplicate request headers")
+    if request.headers.get("content-type") != "application/octet-stream":
+        raise Problem(415, "BEHAVIOR_INVALID_REQUEST", "an octet-stream content type is required")
+    if request.headers.get("content-encoding", "identity") != "identity":
+        raise Problem(415, "BEHAVIOR_INVALID_REQUEST", "encoded bodies are unsupported")
+    length = request.headers.get("content-length")
+    if length is None or not re.fullmatch(r"[0-9]{1,9}", length):
+        raise Problem(411 if length is None else 422, "BEHAVIOR_INVALID_REQUEST", "an exact length is required")
+    if int(length) > max_body_bytes:
+        raise Problem(413, "BEHAVIOR_BODY_LIMIT", "request exceeds the byte limit")
+    chunks, total = [], 0
+    try:
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > int(length):
+                raise Problem(400, "BEHAVIOR_INVALID_REQUEST", "request length differs")
+            chunks.append(chunk)
+    except ClientDisconnect:
+        raise Problem(400, "BEHAVIOR_INVALID_REQUEST", "incomplete request") from None
+    if total != int(length):
+        raise Problem(400, "BEHAVIOR_INVALID_REQUEST", "request length differs")
+    request.state.behavior_body_bytes = total
+    return b"".join(chunks)
+
+
 def _nonfinite(_):
     raise ValueError("non-finite JSON value")
 

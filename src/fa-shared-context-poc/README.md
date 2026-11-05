@@ -1,17 +1,63 @@
 # Shared Context POC
 
+<a id="runtime-wire-diff"></a>
+## 升 runtime 前：比對兩個 runtime 實際送給模型的 body（離線，2026-11-04）
+
+- **用途**：1.0.83 → 1.0.103 的 `text.verbosity`（#1166）與推理模型的 `max_tokens`（#1169）都是部署後接真模型才發現。
+  [`tests/shared_context/runtime_wire_diff.py`](../../tests/shared_context/runtime_wire_diff.py) 讓兩個 runtime 跑同一組 FA 回合，
+  模型是本機假端點（沒有真模型、沒有 Azure），逐欄位列出差異。
+- **回合**：legacy completions（gpt-4.1-mini）；instruction 的 completions 與 responses × gpt-4.1-mini、gpt-5.4-mini、gpt-6.1-sol，
+  model facts 取自 `model-facts.json`。每個回合呼叫一次 `read_context`，所以第 1 個請求帶工具清單、第 2 個帶工具結果。
+- **三個記錄點**：`runtime`（runtime 組好的 body，`_ModelGateway._shape_fields` 之前）、`gateway`（FA 改寫後的）、
+  `sent`（真正到模型端點的）。instruction 回合照 native 路徑（`FA_NATIVE_TURNS`，`native_sdk.py`）由 `DirectResponses`／`DirectCompletions`
+  直接送出，**沒有** API 的 allowlist，所以 runtime 多送的新欄位會直達模型；legacy 回合經 API 的 `AssistantProvider.send`，
+  被 allowlist 擋下時記 `refused` 的錯誤碼。回合失敗時，`session.error` 與 `m2.*_failed`／`m2.network_denied` 事件留在錄製檔的 `failure_events`。
+- **怎麼跑**（Windows，`PYTHONPATH`、`PYTHONUTF8`、`TIKTOKEN_CACHE_DIR` 同其他真 runtime 測試）：
+  `python tests/shared_context/runtime_wire_diff.py record <copilot-runtime.exe> a.json`，另一個 runtime 錄成 `b.json`，
+  再 `python tests/shared_context/runtime_wire_diff.py diff a.json b.json`。錄製檔記下 runtime 的 sha256、SDK 版本、Python 與原始碼樹，
+  所以需要另一版 SDK 套件的 runtime 可以在它自己的環境錄，再拿到這裡比；這時 `gateway`／`sent` 也含那棵樹的 FA 改寫，只有 `runtime` 是純 runtime 差異。
+  例：1.0.83 要用裝 SDK 1.0.13 的 Python，`PYTHONPATH` 指向 `git archive 849f78bc src/fa-shared-context-poc` 解開的 src（3d-i 之前）；
+  用本樹驅動 1.0.83 時，instruction 回合會被 FA 自己的版本檢查擋下（`Assistant requires runtime release 1.0.103`）。
+  instruction 回合照 native 傳 `timeout_seconds=None`（送到 idle），legacy 回合帶 timeout（`send_and_wait`）；失敗時 `error` 附上原始原因。
+- **驗收（2026-11-04，1.0.83 對 1.0.103）**：列出了已知的兩項——Responses 多了 `text.verbosity`（FA 設的 `"medium"`），
+  completions 多了 `max_tokens`（推理模型經 FA 改成 `max_completion_tokens`）；另有 Responses 多了 `max_output_tokens`、
+  gpt-6.1-sol 的系統提示從 `instructions` 移到 `input[0]`（role `system`，帶 `prompt_cache_breakpoint`）、completions 的 runtime 不再送 `snippy`（FA 本來就拿掉）。
+- **1.0.103 對 SDK 1.0.28 候選（runtime 1.0.105，2026-11-04）**：no field differs；逐字比對三個記錄點，只有 `<current_datetime>` 不同。
+  錄法：另建一個只裝 SDK 1.0.28 的 venv，本樹匯出後只把 `sdk_pin` 改成 1.0.28／1.0.105。
+- **怎麼讀**：超過 80 字的文字只比長度（提示含時間戳記，系統提示由 runtime 決定），`prompt_cache_key` 每個 session 都不同，只比有沒有；
+  同一 runtime 錄兩次比對結果是「no field differs」。FA 在 session 上設 `verbosity=medium`，所以看到的是 `text.verbosity` 從無到 `"medium"`，
+  不是 runtime 自己的 `"low"`。`messages`／`input` 依位置比，前面插入一項會讓後面每一項都顯示變動。
+  `error` 那行附的原因可能含每次執行都不同的值，只當線索；兩邊是否同樣失敗以 `failure_events` 的種類為準。
+  instruction 回合一律帶 model facts 的容量（部署設定的 `model_capacity_profile` 都是 `fa-model-capacity-v1`），輸出上限欄位才會出現。
+  推理模型（gpt-5.4-mini、gpt-6.1-sol）的 instruction completions 案例只對應改版前已受理的工作與重播；
+  新工作在受理時就被導到 Responses（422 `REASONING_MODEL_REQUIRES_RESPONSES`）。
+  `test_runtime_wire_diff.py` 只驗比對邏輯；錄製要真 runtime，不在 CI。
+
+<a id="sdk-1026-3d-step3"></a>
+## 3d 第 3 步：拿掉 v2 header 別名和 v2 重送（2026-11-04，CODE/offline，未部署）
+
+- **改了什麼**：Hosted 的 `x-client-fa-state-profile` 只接受自己宣告的 profile，v2 header 回 403 `NATIVE_TURNS_DISABLED`
+  （`native_turns` 拿掉 `HEADER_ALIAS_PROFILES`）；`submit_native_turn` 不再在 409 `NATIVE_RID_CONFLICT` 後以 v2 再送
+  （[ADR-0009 §3](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md) 第 3 步）。
+- **不變的**：body 的沒標 v1 與 v2 照收（`STORED_BODY_PROFILES`，存著的原件照原 profile 重送）；`PublicReasoningSummary.source`
+  的 `"copilot-sdk-1.0.13"` 歷史標記；`OLDER_RELEASES` 仍有 (1.0.13, 1.0.83)，3d-ii 之前開始的對話還要讀它。
+- **為什麼可以拿掉**：API 一律送自己的 profile 當 header，送 v2 給 v3 Hosted 的只有 stage 第 40 版 API（3d-i）。stage 從第 40 版部署到第 41 版 API 上線，
+  每一筆接單都回 202、沒有進了 Hosted 卻沒回應的呼叫，所以沒有 v2 `admitting` 留著（證據見 ADR）。萬一留了，同 RID 重送是 409，
+  別的 RID 在 `STUCK_ADMISSION_SECONDS` 後換新 SID。
+- **證據**：Windows 本機、離線替身與真 runtime 1.0.103 的相關測試。**未驗證**：dev／stage 部署、真模型。
+
 <a id="sdk-1026-3dii"></a>
 ## 3d-ii：API 改送 v3，支援集合只剩 v3（2026-11-03，CODE/offline，未部署）
 
 - **改了什麼**：`NATIVE_STATE_PROFILE` 改成 `foundry-native-v3`，`SENT_RELEASE` 隨 `PROFILE_RELEASES` 變成 1.0.26／1.0.103；
   `ACCEPTED_STATE_PROFILES`、`native_binding.SUPPORTED_STATE_PROFILES` 與 `ci_deploy` 的副本只剩 v3；三份部署設定的
   `api_environment` `FA_NATIVE_TURNS` 改 v3（[ADR-0009 §3](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md) 3d-ii）。
-  Hosted 的 v2 header 別名留到下一個 image；body 的沒標 v1 與 v2 是永久的（存著的原件照原 profile 重送）。
+  Hosted 的 v2 header 別名留到下一個 image（已在[第 3 步](#sdk-1026-3d-step3)拿掉）；body 的沒標 v1 與 v2 是永久的（存著的原件照原 profile 重送）。
 - **部署前閘門**：沿用 2d-ii 起一律武裝的相容閘門（`native_deploy_gate`），它讀新 API 的支援集合，所以只要還有綁定列
   或它記的版本是 v2，部署就停下。先讓 3d-i 上線，每位助理都至少用過一次、被背景切換搬到 v3，才部署 3d-ii。
-- **同 RID 重送**：Hosted 在 `admitting` 後、`rid:<RID>` 前當掉時，留著 3d-i API 送的 v2 digest；3d-ii API 以 v3 重送會被
-  409 `NATIVE_RID_CONFLICT`。`submit_native_turn` 這時以同內容、template 標 v2 那一組版本、body 標 v2 再送一次；第二次也是衝突才回原本的
-  409，逾時或 503 照實回。下一個 image 拿掉 v2 別名時一起拿掉。
+- **同 RID 重送（已在[第 3 步](#sdk-1026-3d-step3)拿掉）**：Hosted 在 `admitting` 後、`rid:<RID>` 前當掉時，留著 3d-i API 送的 v2 digest；3d-ii API 以 v3 重送會被
+  409 `NATIVE_RID_CONFLICT`。當時 `submit_native_turn` 以同內容、template 標 v2 那一組版本、body 標 v2 再送一次；第二次也是衝突才回原本的
+  409，逾時或 503 照實回。
 - **不變的**：存著的 v2 選擇（template 標 1.0.13／1.0.83）照樣以同 request ID 重送讀回，`KNOWN_RELEASES` 仍含這一組；
   新選擇的版本組只收 v3 那一組，`state_profile` 不再收 v2。`sync` 仍把還宣告 v1 或 v2 的已登記助理定義改成 v3。
   `PublicReasoningSummary.source` 的 `"copilot-sdk-1.0.13"` 定為「沒有公開摘要」的歷史標記，wire 不動。
@@ -1535,7 +1581,9 @@ selector 移動已不再讓綁定列的 SID 失效，2d-i P7）。**打開這個
   就是如此，當時慢下載報 `NATIVE_FILES_CONFLICT`）。不變式放在權威那一端：Hosted 的 `NativeSessionWithdraw` 看到柵欄的檔案進度已記
   FA 的停止（`stop_started`）就拒絕撤回（記 `NATIVE_UPGRADE_WITHDRAW_REFUSED`），原樣回 `pending`，API 改成往前推，
   不管是哪個 API 副本或版本來要。剩下的窗口：平台已接受停止、檔案進度還沒記下的那一下，只靠綁定列的標記。
-  忙碌就等下一次回合結束，不輪詢；`admitting` 卡住超過
+  忙碌就等下一次回合結束，不輪詢；唯一例外是 Hosted 回 `scan_pending`（一次呼叫讀不完全部回條）：同一次嘗試裡還容得下
+  一次呼叫（30 秒）就立刻以同 RID 重送，Hosted 在 ETag 沒變時接著讀；重送的 probe 帶切換前讀到的 ETag，期間有人接單就照忙碌等下一次回合結束，不重頭掃（`_scanned`，2026-11-04；原本下一個回合的接單改了 ETag，
+  每次都從頭掃，回條多的 Agent 永遠切不成）。`admitting` 卡住超過
   `STUCK_ADMISSION_SECONDS`（300 秒）改走 §7a 棄用（`stuck_admission`）。等新建的目的 session 就緒（平台一直停在
   `creating`／`updating`）以 `CUT_DESTINATION_SECONDS`（120 秒）為限，關機也會停：回 `destination_unready`（`fence_overrun`／`shutdown`），已送出的
   建立不重送，下一次觸發照常讀回。每次一行
@@ -2112,6 +2160,34 @@ bridge／共用DOM先重現確認後無續做，再核同RID、10次總窗口、
 讀取期限由Python原生asyncio處理，不另做agent loop／storage server／恢復框架。
 本機使用具名storage替身，不代表dev／stage服務已正常；新版診斷才能核原現場失敗位置。
 未改release.json、未部署，也未重試現場A。
+
+<a id="user-file-uploads"></a>
+## 聊天附檔 10 MiB（ADR-0013 切片 1 文字檔、切片 3 PDF；CODE/offline，PDF dev 未驗）
+
+設計見 [ADR-0013](../../docs/adr/0013-chat-file-attachments-10mb.md)。
+
+- **上傳：** `PUT /work-policy/v1/native-turns/files`，body 是原始 bytes（`application/octet-stream`、必帶
+  `Content-Length`、上限 10,485,760 bytes），header `x-fa-content-sha256` 是 bytes 的 sha256。API 只核 Team 主人
+  （`_context(principal, "submit")`）、長度與 hash，用官方 Session Files API（`upload_session_file`）寫到該 Agent
+  session 的 `$HOME/.fa-attachments/<sha256>`，不讀內容。路徑已存在（409）就當同一份（平台 409 的確切意義待 dev 實測，見 ADR 風險 3；錯了也由 Hosted 核對擋下）；寫入未確認或寫入長度不符回 503
+  `USER_FILE_UPLOAD_UNKNOWN`，同一個檔案可以原樣再傳。
+- **指令：** `InstructionSubmit.uploads` 只帶 `{name, sha256, byte_length, media_type}`，和行內檔案、附件合計最多 4 份、名稱不重複；
+  沒附檔時不出現，舊 digest 不變。類型：txt／md／csv／json／pdf／docx／xlsx／pptx。job lane 拒收（`WORK_POLICY_COMMAND`），
+  `user_text_file_profile` 未設時 403 `USER_TEXT_FILES_DISABLED`。
+- **Hosted 接單：** 建立回條前核對每份檔案存在、長度與 sha256 相符；缺檔回 409 `NATIVE_FILE_MISSING`。半份或被改過的檔案
+  先移到 `.fa-attachments/bad/<sha256>.<n>` 再回 409，下一次上傳可寫回原路徑。
+- **模型讀檔：** 訊息只列檔名、類型與大小；收附檔的對話每回合都掛 `read_user_file`（v3／v4 這類沒宣告它的 profile 也一樣）。
+  每次最多回 32 KiB、兩端對齊 UTF-8 字元，用 `next_offset` 接著讀，也可以跳到任一 offset；每份檔案每回合只驗一次 hash。每次讀先預留 512 KiB
+  對話存檔空間（截圖仍是 3 MiB），存不下時拒絕並請模型用已讀內容回答。之後的回合照名稱讀之前回合的附檔；
+  檔案已不在時，工具回 `USER_FILE_GONE`，請模型告訴使用者重新附加（保存期限等同 session，見 ADR-0013）。
+  這類失敗一定要帶登記過的 `public_code`；沒帶代碼的工具失敗，模型只會看到「Authority refused the action」。
+- **PDF：** Hosted 核過原檔 hash 後用 `pypdf`（只在 `requirements-hosted.txt`）抽文字層，每頁前標 `--- 第 N 頁 ---`，
+  再用同一個工具分段讀；`byte_length`／`offset` 算的是抽出的文字。抽出的文字最多 10 MiB，最近 4 份留在程序記憶體，不寫磁碟。
+  抽不出文字（掃描、加密、損壞）時，工具回 `USER_FILE_NO_TEXT`，請模型照實告訴使用者，不猜內容。
+- **Office：** docx／xlsx／pptx 用標準庫 `zipfile`＋`ElementTree` 串流抽文字，和 PDF 共用上限、快取與 `USER_FILE_NO_TEXT`。
+  docx 一段一行；xlsx 照活頁簿順序逐表輸出 CSV 列（標 `--- 工作表 名稱 ---`）；pptx 照簡報順序逐張（標 `--- 第 N 張投影片 ---`）。
+  一份檔案解壓後最多讀 64 MiB，超過就標明停在哪；壞掉的工作表或投影片標記後照讀其他部分（細節見 ADR-0013 §5、§6）。
+- **測試：** `tests/shared_context/test_user_uploads.py`。
 
 <a id="native-routines"></a>
 ## Native routines／reminders（PA-09、PA-10、WAKE-05；CODE/offline，預設關閉）
@@ -3146,11 +3222,14 @@ API-only DTO／codec 不匯入 Hosted SDK；正常同 build 配對新版 reader�
 - **Windows 長路徑**：`test_behavior_assistant.py` 的三則 cold-resume 測試，會在測試目錄下建立約 200 字元的
   離線 SDK checkpoint 路徑。Windows 沒開 `LongPathsEnabled=1` 時，請改用短的 `--basetemp`（例如 `C:\t`）；
   否則這三則會顯示 SKIPPED（原本是 `WinError 206`），不算通過。Hosted 跑在 Linux，沒有這個限制。
+  用真 runtime 的 `test_native_reasoning_facts.py`、`test_native_auto_compaction.py` 與 `test_native_sdk_runtime.py`
+  的 memory-tiers 測試也一樣：`N1_NATIVE_WORKSPACE` 太長時顯示同樣的 SKIPPED，不算通過，請改用 `C:\t` 底下的短路徑。
   長 `--basetemp` 也可能讓 `test_native_cut.py`、`test_native_turns.py`、`test_native_abandon_source.py` 等用本機
   Hosted State store 的測試大量出現 setup ERROR：`NATIVE_STATE_STORE_UNKNOWN`（`the State store could not be confirmed`）。
   先換短路徑重跑；短路徑仍失敗才當產品問題：SDK 本機 State store 把每個 store 寫成 `state_stores/<編碼後名稱>.json`，路徑太長的
   `OSError` 被 `native_checkpoint.open_durable_store` 回報成這個碼。請用很短的專用路徑，例如 `--basetemp C:\t\pt`。
-  （#880 在本機看過這批錯誤，基準版本同樣出現；「長路徑造成」是由程式路徑推得，尚未在同一台機器以長、短路徑對照重現。）
+  （2026-11-04 在同一台機器、同一份 main 與 runtime 1.0.103 對照過：`N1_NATIVE_WORKSPACE` 放在長路徑時，State store
+  暫存檔路徑達 266 字元，`test_native_reasoning_facts.py` 回條變 `unknown`；改用 `C:\t` 底下的短路徑就通過。）
 
 CI（`.github/workflows/shared-context-tests.yml`）只在 Linux 上跳過兩份清單裡的測試，本機照跑：
 `tests/shared_context/ci-quarantine.txt` 是缺上面這類前提（固定 Windows runtime 或原件）的測試，
@@ -7366,7 +7445,7 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
   S5 用這份建新 Agent 的第一份 selection；沒選 skills 工具就不帶（預算要有 skills 目錄才成立）。skill 仍經 `fa-skills-v1` 生效。
   S5 續做時，同一 rid 已寫入的選版指令原樣重送，不依目前 build 重算（避免部署前後模板算法不同而永遠 409）。
   新對話的 lane 也沿用 A：S0 在 onboarding 記錄寫入 A 目前選版的 `state_profile`（只有不是 native 時才寫，例如 Responses），
-  S5 建新 Agent 自己的選版時帶入；A 沒切就維持 native。A 有 `skill_artifacts` 時，帶選擇的請求不再受影響。若 S0 到 S5 之間 Team 目錄變了，S5 回 409
+  S5 建新 Agent 自己的選版時帶入；A 沒切就維持 native。Responses lane 的 `model_provider`（SDK 走 Responses 還是 chat completions）同樣照 A 目前選版記進 onboarding 紀錄的 `model_provider`，自動 checkpoint 的 provider 隨之一致；2026-11-04 前漏了這一項，A 在 Responses 時新 Agent 拿到 Responses lane 卻走 completions。舊紀錄沒有這個欄位，照原本沿用 standing 值。A 有 `skill_artifacts` 時，帶選擇的請求不再受影響。若 S0 到 S5 之間 Team 目錄變了，S5 回 409
     `AGENT_ONBOARDING_SELECTION_STALE`（`cause` 附原選擇拒絕碼；刻意不沿用 S0 前的拒絕碼，以免 client 誤以為沒寫入而換新 rid 再建一個），
     onboarding 停在 `registered`，依 `cause` 排除差異後用同一 rid 續做；API 對每次 STALE 記一行 `AGENT_ONBOARDING_SELECTION_STALE request_id=… cause=…`。
     S5 在新 Agent 的 peer runtime 上核對，peer 建立時即沿用 A 的 Team MCP／Team connector 服務（Team 範圍、依 peer 自己 binding 的 Team 讀），
@@ -15556,6 +15635,10 @@ API 讀到結束回條後，**先**呼叫 `record_turn_usage(control, job_id=…
     native 回合把 capture 的 `model.supports_reasoning_effort` 傳進去；**只有宣告為 `false`** 時，才移除 completions 的 `reasoning_effort`，
     以及 Responses 的 `reasoning` 和 `include` 裡的 `reasoning.encrypted_content`。沒宣告（`null`）或 `true` 的部署不變。移除發生在重送指紋檢查之前，指紋以實際送出的 body 計算。
   - 測試：`test_native_reasoning_facts.py`（gateway 兩種 wire、真 runtime 兩回合 resume）；拿掉移除、拿掉 native 傳入或 gateway 傳入，對應測試都會失敗。
+  - **推理模型只走 Responses**（Neal 2026-11-04）：facts 宣告 `supports_reasoning_effort: true` 的模型，在 `model_provider` 不是 `openai-responses` 的選版或對話裡，
+    送出時就回 422 `REASONING_MODEL_REQUIRES_RESPONSES`，不送 Hosted、不改原選版或對話。原因：Chat Completions 帶 function tools 時，gpt-6.x 拒收推理
+    （不送 `reasoning_effort` 也一樣，因為預設不是 `none`；gpt-6.1-sol 也不收 `none`），見 [Tool calling with reasoning models](https://learn.microsoft.com/azure/foundry/openai/how-to/reasoning#tool-calling-with-reasoning-models)。
+    檢查在 `InstructionModel.require_provider`，native 的 `project_capture` 與 job lane 的 `_instruction_model`／`_peer_work` 都會呼叫；facts 沒有的模型（`null`）照舊放行。
 - **限流重試（429）**：依[官方 quota 文件](https://learn.microsoft.com/azure/foundry/openai/how-to/quota#understanding-rate-limits)，429 時先看 `retry-after-ms`，再看 `retry-after`；兩者都沒有時用指數退避加隨機延遲。最多重試 2 次（和官方 SDK 預設相同），每次最多等 30 秒，超過就不等直接失敗。
   - 重送的是同一個 HTTP 請求、同一份 body，發生在 `_ModelGateway` 的重送指紋檢查之後，不是重送回合，也不會產生第二個結果。
   - 每次 log 一行 `FA_MODEL_DIRECT_RETRY status=429 attempt=N wait_ms=… source=retry-after-ms|retry-after|backoff`。等待可以被取消。

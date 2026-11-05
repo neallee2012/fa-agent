@@ -3,7 +3,8 @@
 A turn end (``NativeTurnGateway._accounted`` sees a completed or unknown receipt) hands the Agent to an in-process
 worker; the request that saw it reads, writes and waits for nothing more. The worker runs ``NativeSessions.cut`` at
 most once at a time per Agent and logs one ``NATIVE_UPGRADE_CUT_API`` line. A busy store waits for the next turn end:
-there is no timer and no poll. Off unless ``FA_NATIVE_SESSION_GUARD_ENFORCE=1`` (2d-i's one switch, Q9), so nothing
+there is no timer and no poll, except that a scan one Hosted call can not finish (``scan_pending``) is resent within
+the same attempt's bound (``_scanned``). Off unless ``FA_NATIVE_SESSION_GUARD_ENFORCE=1`` (2d-i's one switch, Q9), so nothing
 changes until P9 turns it on. SDK-independent: the API never imports the Hosted runtime.
 """
 

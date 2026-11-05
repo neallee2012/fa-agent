@@ -97,6 +97,7 @@ ROUTES = [
     ("GET", "/api/instructions/{task_id}/cancel-receipt"),
     ("POST", "/api/instructions/{request_id}/submit"),
     ("POST", "/api/instructions/{request_id}/image-upload"),
+    ("PUT", "/api/instructions/{request_id}/file-upload"),
     ("POST", "/api/instructions/{request_id}/append"),
     ("GET", "/api/instructions/{request_id}/appends"),
     ("GET", "/api/instructions/{request_id}/status"),

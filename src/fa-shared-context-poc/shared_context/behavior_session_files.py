@@ -81,6 +81,16 @@ class SessionFiles:
         with self._project(sid) as agents:
             agents.upload_session_file(self.client.target.agent_name, sid, data, path=path)
 
+    def put_new(self, sid, path, data):
+        """ADR-0013: one write of a content-addressed path; the platform's ``bytes_written``, or None when it reports
+        the path already exists (Hosted checks those bytes before any turn uses them)."""
+        from azure.core.exceptions import ResourceExistsError
+        with self._project(sid) as agents:
+            try:
+                return agents.upload_session_file(self.client.target.agent_name, sid, data, path=path).bytes_written
+            except ResourceExistsError:
+                return None
+
     def has_files(self, sid):
         """ADR-0009 M1 2d-i step 2: the workspace root of ``sid`` (an active source) lists anything; a missing root
         has none. Read only, one page."""

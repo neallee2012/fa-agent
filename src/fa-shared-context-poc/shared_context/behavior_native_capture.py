@@ -46,6 +46,7 @@ def project_capture(template, selection_id, model, *, head_refs=(), head_selecti
         validate_catalog_budget(capacity, len(template.skills), count_tokens)
     if grants is not None and grants.vision and model.supports_image_input is not True:
         raise Problem(422, "CAPABILITY_MODEL_UNSUPPORTED", "a selected capability needs a model that accepts images")
+    model.require_provider(settings.model_provider)
     try:
         return NativeTurnCapture(
             template=template, profile_selection_id=selection_id, model=model, model_capacity=capacity,
@@ -230,7 +231,7 @@ def _resolve_capture(control, authority, principal, command, *, conversation, re
         settings = template.settings
         if command.attachments and settings.text_attachment_profile is None:
             raise Problem(403, "ATTACHMENTS_DISABLED", "the original settings do not enable source attachments")
-        if command.files and settings.user_text_file_profile is None:
+        if (command.files or getattr(command, "uploads", ())) and settings.user_text_file_profile is None:
             raise Problem(403, "USER_TEXT_FILES_DISABLED", "the original settings do not enable literal files")
         attached = None
         if command.attachments:

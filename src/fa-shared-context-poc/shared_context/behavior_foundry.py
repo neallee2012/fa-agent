@@ -2277,30 +2277,3 @@ class FoundryExecutor:
         if evidence.state != "parked" or evidence.checkpoint != job.checkpoint:
             raise Problem(403, "NATIVE_ADOPTION_UNCERTAIN", "retained native park/checkpoint binding differs")
         return self.authority.workers.adopt(job_id, context)
-
-
-def controller_process_entry(factory, *, ticks: int = 1, limit: int = 4, interval_seconds: float = 1):
-    """Bounded process entry for a TRUSTED, code-supplied controller factory.
-
-    A parent-owned entrypoint constructs dependencies/credentials in this process
-    and returns BehaviorRuntime.controller. No module/command is selected from
-    JSON, and no HTTP principal can supply this handle. This entry can be the
-    target of a supervised process independent of the API request process.
-    """
-    from .behavior_runtime import RuntimeController
-
-    if (
-        type(ticks) is not int or not 1 <= ticks <= 100 or type(limit) is not int or not 1 <= limit <= 16
-        or type(interval_seconds) not in (int, float) or not math.isfinite(interval_seconds)
-        or not 0 <= interval_seconds <= 30 or not callable(factory)
-    ):
-        raise Problem(422, "NATIVE_CONTROLLER_LIMIT", "controller process limits/factory are invalid")
-    controller = factory()
-    if not isinstance(controller, RuntimeController):
-        raise Problem(403, "NATIVE_CONTROLLER_REQUIRED", "an opaque configured server controller is required")
-    results = []
-    for tick in range(ticks):
-        results.append(controller.drain(limit=limit))
-        if tick + 1 < ticks and interval_seconds:
-            time.sleep(interval_seconds)
-    return tuple(results)

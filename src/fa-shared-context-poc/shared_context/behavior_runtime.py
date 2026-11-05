@@ -64,7 +64,6 @@ from .behavior_delivery import (
     admission_digest, obligation_id_for,
 )
 from .behavior_dispatch import ArtifactMetrics
-from .behavior_effects import WorkStateDispatcher
 from .behavior_ingress import METRICS_SCHEMA, TEXT_SCHEMA, checked_human_text, require_text_consent
 from .behavior_foundry import FoundryExecutor, NativeLaunchAuthority, native_key
 from .behavior_inbox import (
@@ -73,7 +72,7 @@ from .behavior_inbox import (
 from .behavior_operations import (
     AuthorizationRequest, BudgetRecord, ExecutionContext, GrantRecord, GrantSubject,
     HumanOperationRejection, HumanOperationRejectionIntent,
-    OutcomeRequest, OwnerRecord, PolicyRecord, ToolBrokerCore, ToolIntent, _Model, _checked, _digest,
+    OwnerRecord, PolicyRecord, ToolBrokerCore, ToolIntent, _Model, _checked, _digest,
     _json, _parse, _row, _updated, _utc, _write, control_key,
 )
 from .behavior_store import BehaviorStore, ControlChanges, ControlRequest, Digest, InlineMaterial
@@ -519,13 +518,6 @@ class BehaviorRuntime:
     def refresh_bindings(self,binding_id=None):
         if self.work_policy is not None:
             self.work_policy.refresh(binding_id)
-
-    def delivery_for_obligation(self, obligation_id):
-        key = control_key("delivery-obligation", obligation_id)
-        ob = self.dep.delivery._row(self.store.read_snapshot((key,)), key, _Obligation)
-        if ob.route.channel_id == INBOX_CHANNEL_ID:
-            return self.dep.delivery
-        raise Problem(403, "DELIVERY_CHANNEL_MISMATCH", "交付責任不屬於已安裝通道")
 
     def resolve_owner(self, owner_record_id: str, *, binding_id=None) -> ExecutionContext:
         """Server supervisor seam for existing WorkerConsumer/DeliveryConsumer."""
@@ -1260,25 +1252,18 @@ class BehaviorRuntime:
         if dispatcher is None:
             raise Problem(403, "OPERATION_EXECUTION_DISABLED", "no concrete adapter is configured")
         if reconcile:
-            if hasattr(dispatcher, "receiver"):
-                try:
-                    return dispatcher.reconcile(binding.operation_id, binding.attempt_id, context)
-                except Problem as exc:
-                    if exc.body["error"]["code"] == "OPERATION_RECORD_MISSING":
-                        raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "original dispatch evidence is unavailable") from None
-                    raise
-            outcome = OutcomeRequest(
-                operation_id=binding.operation_id, attempt_id=binding.attempt_id,
-                evidence_id=control_key("dispatch-result", binding.operation_id, binding.attempt_id),
-            )
-            return self.store.reconcile(dispatcher.completion_request(outcome, context))
+            try:
+                return dispatcher.reconcile(binding.operation_id, binding.attempt_id, context)
+            except Problem as exc:
+                if exc.body["error"]["code"] == "OPERATION_RECORD_MISSING":
+                    raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "original dispatch evidence is unavailable") from None
+                raise
         authorization = AuthorizationRequest(operation_id=binding.operation_id, attempt_id=binding.attempt_id, grant_id=binding.grant_id)
-        if isinstance(dispatcher, WorkStateDispatcher):
-            dispatcher.check_mutable_target(
-                authorization, context,
-                fixed_work_ids=tuple(job.work.work_id for registered in self.bindings.values()
-                                     for job in registered.registered_jobs),
-            )
+        dispatcher.check_mutable_target(
+            authorization, context,
+            fixed_work_ids=tuple(job.work.work_id for registered in self.bindings.values()
+                                 for job in registered.registered_jobs),
+        )
         plan = self._save_plan(
             binding, "operation-execute", principal, command, context,
             {"authorization": authorization.model_dump(mode="json")},

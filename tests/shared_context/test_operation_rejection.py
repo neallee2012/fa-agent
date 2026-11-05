@@ -132,7 +132,7 @@ def test_original_rejection_replay_is_readback_not_a_second_decision(rejection_c
     assert protected_rows(c.turn) == rows and c.effects == []
 
 
-def test_rejection_blocks_new_approval_and_core_authorization_without_model_authority(rejection_case):
+def test_rejection_blocks_new_approval_and_core_authorization_without_model_authority(rejection_case, caplog):
     c = rejection_case
     assert reject(c).status_code == 200
     before = protected_rows(c.turn)
@@ -140,9 +140,13 @@ def test_rejection_blocks_new_approval_and_core_authorization_without_model_auth
     approved = c.h.client.post(operation_path(c.turn) + "/approve",
         content=body.model_dump_json(), headers=c.h.headers())
     assert approved.status_code == 409
+    caplog.clear()
     executed = c.h.client.post(operation_path(c.turn) + "/execute",
         content=wire.Command(request_id="attempt-after-rejection").model_dump_json(), headers=c.h.headers("agent"))
     assert executed.status_code == 409
+    # The wire keeps one public 409 code; the operator log names the exact refusal.
+    assert executed.json()["error"]["code"] == "BEHAVIOR_CONFLICT"
+    assert '"code":"OPERATION_HUMAN_REJECTED"' in caplog.text
     direct = AuthorizationRequest(operation_id=c.turn.binding.operation_id,
         attempt_id="another-model-attempt", grant_id=c.turn.binding.grant_id)
     with pytest.raises(Problem) as denied:
@@ -161,7 +165,7 @@ def test_rejection_does_not_replace_existing_approval_or_effect_history(rejectio
     if stage == "applied":
         response = c.turn.client.operation()
         assert response.effect_state == "applied"
-        assert c.effects == ["credential", "transport"]
+        assert c.effects == ["transport"] and c.effects.changed
     before, effects = protected_rows(c.turn), list(c.effects)
     response = reject(c)
     assert response.status_code == 409

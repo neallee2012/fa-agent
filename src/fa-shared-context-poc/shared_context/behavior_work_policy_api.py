@@ -58,6 +58,7 @@ _SAFE_WORK_ERRORS={
     "CAPABILITY_SOURCES_CHANGED":"A selected capability is not in the current organization catalog.",
     "CAPABILITY_SELECTION_REQUIRED":"Capabilities apply only through a human profile selection.",
     "CAPABILITY_MODEL_UNSUPPORTED":"A selected capability needs a model that accepts images.",
+    "REASONING_MODEL_REQUIRES_RESPONSES":"A reasoning model needs a Responses conversation; choose a non-reasoning model.",
     "ATTACHMENTS_DISABLED":"The original server profile does not enable source attachments.",
     "USER_TEXT_FILES_DISABLED":"The original server profile does not enable literal UTF-8 file input.",
     "USER_FILE_NAME_INVALID":"Use one exact logical filename from the original instruction.",

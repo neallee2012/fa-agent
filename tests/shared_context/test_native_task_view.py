@@ -24,8 +24,8 @@ KEYS = ["state_profile", "task_id", "submit_request_id", "thread_id", "label", "
         "agent_text", "continuation", "continuation_text", "continuation_state", "continuation_error",
         "continuation_usage", "source", "admission", "requested_model", "status", "native_receipt", "not_accepted",
         "progress", "progress_error", "result", "reply", "submission", "submission_observation", "cancellation",
-        "acknowledgment", "user_files", "user_images", "attachments", "actions", "error", "response_reconciliation",
-        "appends", "append_error"]
+        "acknowledgment", "user_files", "user_images", "user_uploads", "attachments", "actions", "error",
+        "response_reconciliation", "appends", "append_error"]
 
 
 class Dump:
@@ -106,7 +106,7 @@ def test_accepted_receipt_full_view(sent):
                                   "method": "POST", "path": "/work-policy/v1/native-turns/submit",
                                   "state_profile": "foundry-native-v1"}},
         "submission_observation": None, "cancellation": None, "acknowledgment": None,
-        "user_files": [], "user_images": [], "attachments": [],
+        "user_files": [], "user_images": [], "user_uploads": [], "attachments": [],
         "actions": view["actions"], "error": None, "response_reconciliation": None, "appends": [],
         "append_error": None,
     }

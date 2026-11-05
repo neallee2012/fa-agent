@@ -485,16 +485,6 @@ def resolve_agent_scope(store, config, agent_id):
     return scope
 
 
-def inventory_agent_scope(inventory, config, agent_id):
-    """History readers resolve from the retained startup inventory, never from live rows."""
-    key = _registered_key(config, agent_id)
-    if key is None:
-        return config.agent_scope(agent_id)
-    if key not in inventory.rows:
-        raise Problem(409, "AGENT_SCOPE_INVALID", "retained work names an Agent without its original registration")
-    return _scope(config, key, _parse(inventory.rows[key].payload["data"], TeamAgent))
-
-
 def _roster_ids(store, config):
     """Every registered Agent in registration order, retired ones included (one read)."""
     tenant = config.identity.tenant_id

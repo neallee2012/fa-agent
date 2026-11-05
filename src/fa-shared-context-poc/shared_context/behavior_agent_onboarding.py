@@ -25,6 +25,7 @@ from .behavior_agent_template import TemplateSkill
 from .behavior_capabilities import CapabilityRefs, SKILLS_ENTRY_ID, check_selectable, runtime_grants, skills_selected
 from .behavior_foundry import PLATFORM_NO_RETRY, PLATFORM_READ_RETRY, FoundryTarget, _upstream_status
 from .behavior_operations import _Model, _parse, _row, _write, control_key
+from .behavior_sdk_state import ModelProvider
 from .behavior_skill_catalog import CatalogBudgetProfile
 from .behavior_store import ControlChanges, ControlRequest
 from .behavior_team_authority import TeamAuthority, team_authority_key
@@ -116,6 +117,9 @@ class TeamAgentOnboarding(_Model):
     turn_origin_profile: TurnOriginProfile | None = Field(default=None, exclude_if=lambda value: value is None)
     # A's new-conversation lane at admission when it is not the native default (Responses); absent stays native.
     state_profile: Literal["foundry-responses-v1"] | None = Field(default=None, exclude_if=lambda value: value is None)
+    # A's new-conversation model provider at admission (the Responses lane's wire API); absent keeps the standing value.
+    # shortcut: None (completions) also keeps the standing value; fine while no standing profile sets Responses.
+    model_provider: ModelProvider | None = Field(default=None, exclude_if=lambda value: value is None)
     # A's new-conversation catalog budget at admission when the owner chose the skills tool (SK-03/SK-04).
     skill_catalog_budget_profile: CatalogBudgetProfile | None = Field(default=None, exclude_if=lambda value: value is None)
     # When it entered 'registered' (same CAS); absent on onboardings registered before it was kept.
@@ -378,6 +382,17 @@ def _effective_state_profile(composition, original):
     return None if value == UNLABELED_STATE_PROFILE else value
 
 
+def _with_provider(profile, model_provider):
+    return profile if model_provider is None else profile.model_copy(update={"model_provider": model_provider})
+
+
+def _effective_model_provider(composition, original):
+    """A's model provider for new conversations: its current human selection, else its standing profile."""
+    from .behavior_profile_selection import current_selection
+    head = current_selection(composition.runtime.store, original)
+    return original.profile.model_provider if head is None else head.command.template.settings.model_provider
+
+
 def _effective_catalog_budget(composition, original, selection):
     """A's catalog budget for new conversations, kept only when the owner's choice has a skills catalog to present."""
     from .behavior_profile_selection import current_selection
@@ -437,7 +452,8 @@ def _check_selection(composition, original, selection):
     if names and not skills_selected(selection.capabilities):
         raise Problem(422, "AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED",
                       f"approved skills need the {SKILLS_ENTRY_ID} capability on the agent-role profile")
-    base = _with_origin(_role_profile(original.profile, selection), _effective_turn_origin(composition, original))
+    origin, provider = _effective_turn_origin(composition, original), _effective_model_provider(composition, original)
+    base = _with_provider(_with_origin(_role_profile(original.profile, selection), origin), provider)
     profile = profile_from_template(SimpleNamespace(profile=base), _selection_template(
         base, selection, _effective_state_profile(composition, original),
         _effective_catalog_budget(composition, original, selection)))
@@ -757,7 +773,8 @@ def _select_tools(composition, principal, value):
         # A resumed S5 resends exactly what it saved, even if this build would build the template differently.
         command = saved_selection_command(control, value.request_id) or SelectConversationProfile(
             request_id=value.request_id, expected_selection_id=None,
-            template=_selection_template(control.policy.profile, value.selection, value.state_profile,
+            template=_selection_template(_with_provider(control.policy.profile, value.model_provider),
+                                         value.selection, value.state_profile,
                                          value.skill_catalog_budget_profile))
         select_profile(control, getattr(getattr(peer, "assistant", None), "authority", None), principal, command)
     except Problem as error:
@@ -796,6 +813,7 @@ def onboard(composition, principal, body, *, foundry=None, setup=None, deadline_
             agent_name=derived_names(tenant, team, body.request_id)["agent_name"], state="admitted",
             selection=body.selection, turn_origin_profile=_effective_turn_origin(composition, original),
             state_profile=_effective_state_profile(composition, original),
+            model_provider=_effective_model_provider(composition, original),
             skill_catalog_budget_profile=None if body.selection is None else _effective_catalog_budget(
                 composition, original, body.selection),
         ))

@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from shared_context import behavior_wire as wire
-from shared_context.behavior_operations import ToolBrokerCore, control_key
+from shared_context.behavior_effects import WorkStateDispatcher
+from shared_context.behavior_operations import control_key
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
@@ -20,8 +21,9 @@ import test_skill_guidance_native as guidance
 @pytest.mark.parametrize("disposition", ["revoked", "expired"])
 def test_fixed_sdk_checks_the_current_grant_after_later_claimed_approval(
         assistant, signing_key, jwk_client, monkeypatch, native_parent, disposition):
-    prepare, authorize, mkdtemp = guidance.prepare_operation, ToolBrokerCore.authorize, guidance.tempfile.mkdtemp
-    operations, denials, roots = [], [], []
+    prepare, mkdtemp = guidance.prepare_operation, guidance.tempfile.mkdtemp
+    operations, roots, gates = [], [], []
+    gate = WorkStateDispatcher.check_mutable_target
     record = guidance.record
 
     def scoped_record(name, data):
@@ -62,12 +64,13 @@ def test_fixed_sdk_checks_the_current_grant_after_later_claimed_approval(
         })
         return prepared, preview
 
-    def observe_authorization(core, command, context):
+    def observe_gate(dispatcher, command, context, **kwargs):
+        # The server's work-state dispatcher refuses here, before ToolBrokerCore.authorize is reached.
         try:
-            return authorize(core, command, context)
+            return gate(dispatcher, command, context, **kwargs)
         except Problem as error:
             if command.operation_id in operations:
-                denials.append(error.body["error"]["code"])
+                gates.append(error.body["error"]["code"])
             raise
 
     def owned_directory(*args, **kwargs):
@@ -81,15 +84,15 @@ def test_fixed_sdk_checks_the_current_grant_after_later_claimed_approval(
 
     monkeypatch.setattr(guidance, "record", scoped_record)
     monkeypatch.setattr(guidance, "prepare_operation", change_current_grant)
-    monkeypatch.setattr(ToolBrokerCore, "authorize", observe_authorization)
+    monkeypatch.setattr(WorkStateDispatcher, "check_mutable_target", observe_gate)
     monkeypatch.setattr(guidance.tempfile, "mkdtemp", owned_directory)
     guidance.test_loaded_malicious_guidance_is_data_for_the_fixed_sdk_and_cannot_execute_an_unapproved_operation(
         assistant, signing_key, jwk_client, monkeypatch, expected_denial_status=403,
     )
     assert len(operations) == len(roots) == 1
-    assert denials == ["OPERATION_GRANT_DENIED"]
+    assert gates == ["OPERATION_GRANT_DENIED"]
     scoped_record("current-grant-denial", {
-        "current_disposition": disposition, "observed_core_denials": denials,
+        "current_disposition": disposition, "observed_gate_denials": gates,
         "driver": "existing-fixed-sdk-guidance-load-deny-read-finish",
         "scope": "one runtime and four scripted provider requests per disposition",
         "limitation": "Grant denial is not evidence of rollback, refund, arbitrary-adapter or natural-model behavior.",

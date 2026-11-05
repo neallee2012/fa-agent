@@ -1,7 +1,7 @@
 """ADR-0009 M1: a runtime declaring foundry-native-v2 accepts only the v2 header (the v1 alias is retired), still
 admits an unlabeled v1 body (a stored v1 original resent with its digest), labels new conversations' ``_Meta`` with v2
 and keeps v1 items unlabeled and byte-identical; a v1 runtime (no longer declarable) accepts only v1. ADR-0009 3d-i:
-a v3 runtime also admits the v2 header (a temporary alias) and v1/v2 bodies (permanent), and labels new ``_Meta`` v3.
+a v3 runtime admits v1/v2 bodies (permanent) and labels new ``_Meta`` v3; 3d step 3 retired its v2 header alias.
 
 Official local task/store and host; only SDK/model I/O is synthetic (``test_native_turns``)."""
 
@@ -58,8 +58,8 @@ def item(harness, store_name, key):
 
 @pytest.mark.parametrize("declared, header, admitted", [
     (V2, V1, False), (V2, V2, True), (V2, NATIVE_RESPONSES_PROFILE, False), (V2, V3, False),
-    # ADR-0009 3d-i: a v3 runtime also admits the v2 header as an alias while the API still sends v2
-    (V3, V3, True), (V3, V2, True), (V3, V1, False), (V3, NATIVE_RESPONSES_PROFILE, False),
+    # ADR-0009 3d step 3: the v2 header alias 3d-i added is retired with the v2-sending API
+    (V3, V3, True), (V3, V2, False), (V3, V1, False), (V3, NATIVE_RESPONSES_PROFILE, False),
 ], indirect=["declared"])
 def test_each_runtime_accepts_only_its_own_header(declared, header, admitted):
     response = post(declared, submit("dual-header"), header)
@@ -120,9 +120,9 @@ def test_a_v1_conversation_continues_under_a_v2_body_on_a_v2_runtime(local_env):
     (V3, V1, True), (V3, V2, True), (V3, V3, True), (V2, V3, False),
 ], indirect=["declared"])
 def test_stored_v1_and_v2_bodies_stay_admitted_on_a_v3_runtime(declared, body, admitted):
-    """ADR-0009 3d-i: body profiles are separate from the header alias; a stored v1 or v2 original keeps its own."""
+    """ADR-0009 3d-i: body profiles are separate from the header; a stored v1 or v2 original keeps its own."""
     request = submit("body-" + body[-2:]).model_copy(update={"state_profile": body})
-    response = post(declared, request, V2)
+    response = post(declared, request, declared.runtime.state_profile)
     if not admitted:
         assert response.status_code == 403 and response.json()["error"]["reason"] == "profile", response.text
         return
@@ -144,7 +144,7 @@ def test_a_v2_conversation_continues_on_a_v3_runtime(local_env):
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=second)) as client:
         harness = Harness(second, second.executor, client)
         request = submit("v2-next", cid, "Continue").model_copy(update={"state_profile": V2})
-        assert post(harness, request, V2).status_code == 202
+        assert post(harness, request, V3).status_code == 202
         assert harness.wait("v2-next", "completed").state_profile == V2
         assert item(harness, conversation_store_name(cid), "meta")["state_profile"] == V2
         assert second.executor.calls[0][2] is not None  # the v2 checkpoint was restored

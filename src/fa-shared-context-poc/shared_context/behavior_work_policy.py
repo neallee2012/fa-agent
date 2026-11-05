@@ -342,20 +342,6 @@ def cumulative_decision(policy,ledger,observation,now,*,read_id,mode,instruction
         cumulative_ceiling_microusd=policy.cumulative_ceiling_microusd if ledger.budget_enforced else None)
 
 
-def microusd_from_decimal(value):
-    from decimal import Decimal,InvalidOperation,ROUND_CEILING
-    if type(value) is not str:
-        raise Problem(422,"WORK_COST_INVALID","reported USD must retain its decimal text, not a binary float")
-    try:
-        amount=Decimal(value)
-        if not amount.is_finite() or amount<0:raise ValueError()
-        micro=int((amount*Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING))
-    except (InvalidOperation,ValueError,OverflowError):
-        raise Problem(422,"WORK_COST_INVALID","finite nonnegative decimal USD required") from None
-    if micro>2**63-1:raise Problem(422,"WORK_COST_INVALID","reported cost exceeds its representable bound")
-    return micro
-
-
 class StandingPolicyInstallation(_Model):
     schema_version:Literal["fa-steady-policy-installation-v1"]="fa-steady-policy-installation-v1"
     policy:SteadyWorkPolicy
@@ -1553,9 +1539,9 @@ class WorkPolicyControl:
     def _instruction_conversation(self,request_id,instruction,rows,agent_vm):
         if type(instruction) is not InstructionSubmit or instruction.request_id!=request_id:
             raise Problem(422,"WORK_POLICY_COMMAND","original typed instruction required")
-        if instruction.images:
-            # Attached images reach the model only on native turns; never drop them silently here.
-            raise Problem(422,"WORK_POLICY_COMMAND","attached images need a native Agent turn")
+        if instruction.images or instruction.uploads:
+            # Attached images and files reach the model only on native turns; never drop them silently here.
+            raise Problem(422,"WORK_POLICY_COMMAND","attached images and files need a native Agent turn")
         from .behavior_instruction import instruction_state
         conversation,conversation_row=instruction_state(self,instruction,registry_rows=rows)
         if agent_vm is not None:
@@ -1625,6 +1611,7 @@ class WorkPolicyControl:
         selected_model=self.models.select(instruction.model)
         if capability_capture is not None and capability_capture.vision and selected_model.supports_image_input is not True:
             raise Problem(422,"CAPABILITY_MODEL_UNSUPPORTED","a selected capability needs a model that accepts images")
+        selected_model.require_provider(effective_profile.model_provider)
         selected_capacity=_model_capacity(effective_profile,selected_model)
         if (effective_profile.skill_catalog_budget_profile is not None
                 and skill_access(effective_profile.prompt_profile,capability_capture)):
@@ -1648,6 +1635,7 @@ class WorkPolicyControl:
             raise Problem(409,"AGENT_MESSAGE_HANDOFF_EXISTS","this root already has its original receiver conversation")
         selected_model=self.models.select(instruction.model)
         effective_profile=narrow_profile(policy.profile)
+        selected_model.require_provider(effective_profile.model_provider)
         admission,binding,profile=derive_work(policy,request_id,self.runtime.mode,instruction=instruction,
             model=selected_model.id,hosted_agent_version=peer_root.recipient_hosted_version,
             model_capacity=_model_capacity(effective_profile,selected_model),peer_work=peer_work,

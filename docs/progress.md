@@ -1,8 +1,33 @@
 # FA 進度與交接狀態
 
-更新日期：2026-11-02。
+更新日期：2026-11-04。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="stage-v40-v41-1104"></a>
+## 2026-11-03～04：stage 第 40、41 版（Copilot SDK 1.0.26 升級）與 Agent E 的模型拒絕
+
+- **範圍**：SDK 1.0.13／runtime 1.0.83 → 1.0.26／1.0.103，依 [ADR-0009 §3](adr/0009-version-model-g-actual-version-idle-upgrade.md) 分兩次上線。變更清單、dev 測試報告與第一道審查都在各 release PR 本文。證據是總協調的唯讀讀回，原始輸出不在 repo。
+  - **第 40 版**（#1168，`2026.11.03-40`，Neal 11-03 14:16Z 合併，merge `6f764334`）：3d-i，Hosted 換 SDK 並宣告 `foundry-native-v3`、暫時接受 v2 header；API `FA_NATIVE_TURNS` 從 v1 改 v2（#1144）；verbosity 設 medium（#1166）。
+  - **第 41 版**（#1171，`2026.11.04-41`，Neal 11-04 02:06Z 合併，merge `731d6b65`）：3d-ii，API 改送 v3、支援集合只剩 v3（#1167）；推理模型在 Chat Completions 改送 `max_completion_tokens`（#1169）。
+- **部署結果**：
+
+  | 版本 | deploy-staging | gate | API revision | Hosted | public-sync |
+  |---|---|---|---|---|---|
+  | 40 | run 41652030602 成功 | armed、pass、0 拒絕 | `…--6f76433-r128-1`，`FA_NATIVE_TURNS=foundry-native-v2` | A～D v91，E v39；定義讀回 403，沒有讀 | run 41654478340，第二道通過 |
+  | 41 | run 41758592177 成功 | armed、pass、0 拒絕；A、B 的列與定義都是 v3、`compatible` | `…--731d6b6-r129-1`，`foundry-native-v3` | A～D v92，E v40，route／state 都 ok | run 41760195386，第二道通過，公開 repo 的 tree `d8de3861` |
+
+  兩版 API 開機都沒有 Traceback、ERROR；`AGENT_SCOPE_MISSING` 兩筆仍是 C、D。
+- **stage 測試**（Neal 操作 stage console）：11-04 早上在第 40 版、中午在第 41 版，A、B 真回合與 A→B 交辦都通過。
+- **Agent E 的模型拒絕**（E 是用「＋」建的助理，`fa-agent-f167185a…`）：
+  1. 第 40 版後，E 的每則訊息都回 400 `unsupported_parameter`、`error_param=max_tokens`（11-04 00:50～00:51Z，gpt-5.4-mini 兩次、gpt-6.1-sol 一次）。runtime 1.0.103 在 Chat Completions 上對每個模型都送 `max_tokens=宣告的最大輸出`（本機真 runtime 實錄），推理模型只收 `max_completion_tokens`。#1169 修正，隨第 41 版上線。
+  2. 第 41 版後，E 的舊對話改回 400 `error_param=reasoning_effort`（03:09:36Z，gpt-6.1-sol，tools=28）。dev 直接打模型端點重現：gpt-6.x 在 Chat Completions 上不能同時帶 function tools 與推理，不送 `reasoning_effort` 也一樣，gpt-6.1-sol 不收 `none`；gpt-5.4-mini 可以。官方建議改用 Responses（[reasoning models](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning)）。
+  3. **E 為什麼走 Chat Completions**：onboarding 只有 `model_provider` 取 A 的常設 profile，不是 A 目前的選版。#1170 修正，之後用「＋」建的助理照 A 的選版。
+  4. **Neal 11-04 決定**：推理模型一律走 Responses。#1174 在送出前擋下「completions 選版＋推理模型」，回 422 與中文提示；已存的選版與對話不改。dev（API revision `ca-fa-behavior-poc--f311899-r4712-1`）驗過：A 用 gpt-6.1-sol、gpt-6-luna 在 Responses 帶工具都完成真回合，A、B 沒有退步。
+  5. E 本身的選版改成 Responses，由 Neal 用工作台範本頁以主人身分換新選版（只影響新對話），尚未做。
+- **Neal 11-04 決定**：不出第 42 版，#1170、#1174 與後續的 v2 過渡程式清理、ub-mode 第十三輪一起放第 43 版。
+- **沒有驗證**：Hosted 定義在 stage 的讀回（403）；stage Table 內容；completions 助理收到 422 的畫面（dev 沒有這種助理，只有離線測試）；用「＋」新建助理照 A 選版（沒有新建）；Linux 全量測試（這兩版都沒跑 weekly CI）。
+- **後續**：第 43 版的 image 依 ADR-0009 §3 第 3 步拿掉 Hosted 的 v2 header 別名與 API 同 RID 的 v2 重送；`OLDER_RELEASES` 的 (1.0.13, 1.0.83) 要等 3d-ii 前開始的對話遷移完、或確認已經沒有，才能拿掉。runtime 送給模型內容的離線比對工具（#1173）與 SDK 版本移出 profile 的調查已在進行，1.0.28 的比對結果出來後再決定 ADR 修訂。
 
 <a id="stage-v39-1102"></a>
 ## 2026-11-02：stage 第 39 版部署、dev 測試與冒煙

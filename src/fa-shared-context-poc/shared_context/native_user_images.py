@@ -95,7 +95,10 @@ async def _conversation_state_bytes(runtime, conversation_id) -> int:
 
 
 async def check_user_images(runtime, request) -> None:
-    """Before a new RID is accepted: a model that reads images, their uploaded bytes and room in the conversation."""
+    """Before a new RID is accepted: attached files whole in this session's home (ADR-0013), then a model that
+    reads images, their uploaded bytes and room in the conversation."""
+    from .native_user_uploads import check_user_uploads
+    await check_user_uploads(request.command)
     images = _images(request.command)
     if not images:
         return

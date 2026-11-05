@@ -133,6 +133,19 @@ def test_responses_reasoning_mode_is_captured_without_reloading_current_model_fa
     assert control.records[second.binding_id].profile.instruction.reasoning_summary is None
 
 
+def test_a_completions_selection_refuses_a_reasoning_model_at_admission(assistant):
+    h, control, human = configured(assistant)
+    control.models.models["configured-second-model"] = control.models.models["configured-second-model"].model_copy(
+        update={"supports_reasoning_effort": True})
+    assert select(h, value=template())[0].status_code == 200
+    before = h.store._guard()
+    with pytest.raises(Problem) as refused:
+        control.submit(human, InstructionSubmit(request_id="completions-reasoning-model",
+            content="Use the declared reasoning model.", model="configured-second-model"))
+    assert refused.value.body["error"]["code"] == "REASONING_MODEL_REQUIRES_RESPONSES"
+    assert h.store._guard() == before and control.records == {}
+
+
 @pytest.mark.parametrize("identity", ["agent", "read-only"])
 def test_nonapprovers_cannot_select_even_a_valid_template(assistant, identity):
     h, control, _ = configured(assistant)

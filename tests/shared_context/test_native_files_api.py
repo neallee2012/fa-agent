@@ -14,7 +14,7 @@ from starlette.testclient import TestClient
 
 from shared_context.behavior_foundry import FoundryHttpClient
 from shared_context.behavior_native_sessions import NativeSessions, fresh_session_id, native_session_id
-from shared_context.behavior_native_turn_wire import NativeRead, NativeSessionRead
+from shared_context.behavior_native_turn_wire import NATIVE_STATE_PROFILE, NativeRead, NativeSessionRead
 from shared_context.behavior_wire import HostedIdentity
 from shared_context.native_files_wire import WORKSPACE_ROOT
 from shared_context.native_turns import NativeTurnRuntime
@@ -301,7 +301,7 @@ def file_api(local_env, file_loops, native_api, monkeypatch, tmp_path, request):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://offline") as client:
                     return await client.post("/responses" if is_response else "/invocations", content=packet.content, headers={
                         **{name: value for name, value in packet.headers.items() if name.startswith("x-client-")},
-                        "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": sid,
+                        "x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": sid,
                         "x-agent-invocation-id": "offline-files", "x-agent-foundry-call-id": "offline-control",
                     })
 

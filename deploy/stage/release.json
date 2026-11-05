@@ -1,1 +1,1 @@
-{"version":"2026.11.04-41","milestone":"第 41 版：Copilot SDK 1.0.26 升級完成最後一步，API 改送 foundry-native-v3（stage 的 FA_NATIVE_TURNS 從 v2 改成 v3）；修正用一般聊天介面連線的推理模型（gpt-5.4-mini、gpt-6.1-sol 等）因 max_tokens 被模型拒絕、每則訊息都失敗的問題；stage 的資源與權限沒有變動"}
+{"version":"2026.11.05-43","milestone":"第 43 版：聊天可以附 10 MB 以內的文字檔、PDF、Office（docx／xlsx／pptx）與圖片，助理讀抽出的文字回答；附件已不在或讀不出文字時，助理會清楚說明並請使用者改傳；新建的助理照 A 目前選的模型連線方式；修正換版時平台還在掃描、FA 沒有重試就放棄的問題；stage 的資源、權限與部署設定沒有變動"}

@@ -11,8 +11,7 @@ from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_instruction import instruction_state
 from shared_context.behavior_operations import _row, _write
 from shared_context.behavior_store import ControlChanges, ControlRequest
-from shared_context.behavior_turn_ticket import TurnTicketIndex, restore_turn_tickets
-from shared_context.behavior_work_policy import WorkRegistration, WorkRegistry, work_policy_key
+from shared_context.behavior_work_policy import WorkRegistration, WorkRegistry
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
@@ -90,21 +89,6 @@ def test_a_changed_stored_ticket_is_not_hidden_by_the_index(assistant, field):
     with pytest.raises(Problem) as failure:
         turn.h.assistant.model_session(turn.binding.binding_id, turn.sid, turn.ticket, turn.principal)
     assert failure.value.body["error"]["code"] == "ASSISTANT_TICKET_DENIED"
-
-
-def test_startup_rebuilds_ticket_index_from_existing_validated_rows_without_reads(assistant, monkeypatch):
-    turn = _opened(assistant)
-    record = turn.control.records[turn.binding.binding_id]
-    keys = (work_policy_key("registration", record.admission_id), key("session", turn.sid))
-    inventory = SimpleNamespace(rows=turn.h.store.read_snapshot(keys))
-    index = TurnTicketIndex()
-    monkeypatch.setattr(turn.h.store, "_turn_ticket_index", index)
-    monkeypatch.setattr(turn.h.store, "_read_physical",
-                        lambda *_: pytest.fail("the startup inventory already contains these rows"))
-    restore_turn_tickets(turn.h.store, inventory)
-    captured = index.authenticate(turn.binding.binding_id, turn.sid, turn.ticket, turn.principal)
-    assert captured.authorization_digest == digest(record.model_dump(mode="json"))
-    assert captured.ticket_digest != turn.ticket.get_secret_value()
 
 
 def test_legacy_registration_and_session_bytes_do_not_gain_ticket_fields(assistant):

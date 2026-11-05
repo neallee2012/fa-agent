@@ -12,7 +12,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import A
+from conftest import A, require_cold_resume_paths
 from shared_context import behavior_wire as wire
 from shared_context.behavior_assistant import (
     AssistantAuthority, AssistantProfile, AssistantRuntime, LocalAssistantExecutor,
@@ -27,22 +27,6 @@ from shared_context.errors import Problem
 from test_behavior_api import BASE, METRICS, RuntimeHarness
 from test_m2_copilot import ScriptedEndpoint, runtime_path
 from test_m3_auth import HUMAN_OID, CLIENT_ID, jwk_client, signing_key
-
-
-def require_cold_resume_paths(root):
-    """The offline SDK cold-resume checkpoint nests about 200 characters of session-state below the test root."""
-    import os
-    if os.name != "nt" or len(str(root)) + 200 < 260:
-        return
-    import winreg
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\FileSystem") as key:
-            if winreg.QueryValueEx(key, "LongPathsEnabled")[0] == 1:
-                return
-    except OSError:
-        pass
-    pytest.skip("needs Windows LongPathsEnabled=1 or a short --basetemp (e.g. C:\\t): the offline SDK checkpoint "
-                "path below the test root exceeds MAX_PATH 260")
 
 
 def call(name, args, number):

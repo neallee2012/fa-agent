@@ -732,16 +732,18 @@ class InstructionControl:
         self.projections[conversation_id], self.observed[conversation_id] = value, self.clock().isoformat()
         return value
 
-    def validate_input(self, request_id, content, model, attachments=(), files=(), *, conversation_id=None, images=()):
+    def validate_input(self, request_id, content, model, attachments=(), files=(), *, conversation_id=None, images=(),
+                       uploads=()):
         require(type(model) is str and self.models is not None
                 and model in {v.id for v in self.models.models}, "MODEL_NOT_AVAILABLE", 409)
         try:
             command = InstructionSubmit.model_validate_json(canonical({
                 "request_id": request_id, "content": content, "conversation_id": conversation_id,
                 "model": model, "attachments": attachments, "files": files, "images": images,
+                "uploads": uploads,
             }))
         except (ValueError, TypeError):
-            raise ConsoleError("USER_IMAGE_INPUT_INVALID" if images else "USER_FILE_INPUT_INVALID" if files else
+            raise ConsoleError("USER_IMAGE_INPUT_INVALID" if images else "USER_FILE_INPUT_INVALID" if files or uploads else
                                "ATTACHMENT_SELECTION_INVALID" if attachments else "INSTRUCTION_INVALID", 400) from None
         require(all("." in item.name and item.name.rsplit(".", 1)[1].lower() in {"txt", "md", "csv", "json"}
                     for item in command.files), "USER_FILE_INPUT_INVALID", 400)

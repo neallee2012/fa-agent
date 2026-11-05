@@ -638,6 +638,121 @@ CC ≥ 20 少了 48 個。CC ≥ 10 反而多 8 個：拆出來的函式有幾�
 - #1131 留下的 P3：`HostedRuntime` 那層 2 秒逾時的路徑現在沒有測試；沒有「子程序還在 import 時就 park」的測試；10 秒上限只剩約 3 秒餘裕；5 處重複的 `children[...].wait(timeout=15)` 可以抽成 helper。
 - 各 PR 列出的其他 P3 沒有補。
 
+## 第十二輪結果（2026-11-03）
+
+這輪先收第十一輪留下的既有問題，再拆那一輪沒碰的 4 個函式。修 bug 的理由是它們真的會出錯或漏測；拆函式只是讓程式好讀，所以排在後面。
+
+| 項目 | PR | 內容 |
+|---|---|---|
+| 上游錯誤 code 型別 | #1148 | 6 處收到 list／dict 形式的錯誤 code 或格式不對的資料就丟例外，改成明確的錯誤：relay `_upstream_code`、checkpoint `_fallback_titles`、gateway `_check_tools`／`send`、HITL `_request`、`behavior_model_direct`。前 3 處是第十一輪記下的，後 3 處是審查時順著同一個原因找到的 |
+| 半段走不到的測試 | #1148 | `test_only_a_newer_sequence_moves_the_job` 先送一筆較新的回報，再測較舊的 sequence |
+| toolbox JSON-RPC code | #1149 | `native_toolbox._post` 的 error code 只認 int；list／dict 或 `-32700.0` 都當沒有 code，不會算成明確拒絕 |
+| 啟動授權 | #1153 | `_current` 25 → 2（`_require_associated` 13、`_require_dispatchable` 12）；`claim` 25 → 8（`_launch_to_claim` 8、`_unclaimed_launch` 5、`_committed_claim` 5、`_claim_assignment` 2） |
+| 工作政策 | #1154 | `derive_work` 35 → 12；`cumulative_decision` 34 → 12。另刪掉 `derive_work` 裡走不到的第二次指令型別檢查 |
+
+### 測試整理
+
+全量測試要跑約 3 小時 15 分，所以這一輪盤點了每個測試是否必要、是否有效率。原則是：留下的測試都要守著會上線的程式；必須真等的時間才等。
+
+| 項目 | PR | 內容 |
+|---|---|---|
+| 退休的 POC | #1156 | 刪掉 hosted-sandbox／SMB／controller POC 與只測它的測試（-9,224 行）；還被 `foundation.bicep`、`foundry.bicep` 用到的兩個 `infra/vnet` 模組留下 |
+| 永遠不跑的測試 | #1157 | 刪掉要讀 repo 外擷取檔或私有 `.azure` 快照才會跑的 7 個測試（-443 行）；守 AGENTS.md 第 8 條的遺留列拒絕測試留下 |
+| 舊命令路徑 | #1158 | `AssistantEngine.dispatch` 只接 `assistant-v1.2`，其他形狀回 422；刪掉 M2～M4 舊命令路徑、GUI 探針與只測它們的 15 個測試檔（約 -8,850 行、淨減 161 個測試函式） |
+| 匯入界線與弱斷言 | #1159 | AGENTS.md 第 9 條的匯入界線檢查從 20 個子程序收成 2 個，涵蓋模組不變、禁用清單只變嚴；`is not None` 與只數次數的 mock 斷言改成比對實際值 |
+| 真實等待 | #1160 | 重試延遲、模型 deadline、控制輪詢改成按比例縮短，仍斷言生產值（退避 1、3、9 秒；各 hop read timeout > 20 s）；三組測試約 27 → 5 s、47 → 7 s、9 → 3 s。新增 `tests/shared_context/fast_lane.py`，用 CI 的清單跳過 461 個要真 runtime 的測試 |
+| main 上壞掉的測試 | #1161 | #1141 讓收尾多讀 `checkpoint_error` 等欄位，`create_autospec` 看不到 `__init__` 才設的屬性，4 個 state 空間拒絕測試一直失敗；改用現成的 `session_files()` 替身 |
+| 測試專用 HTTP 殼 | #1163 | `legacy_m2_m4` 退休，約 27 個檔改成直接呼叫 `ArtifactService`、`JwtVerifier`；刪掉只有它在用的 `ContextService` 方法、`MemoryInput`、`config.BackupSettings` 與 3 個 model（約 −1,280 行、淨少 8 個只驗 HTTP 殼的案例）。`ContextArtifactAdapter` 打的路由只存在於這個殼，現在沒有伺服器提供，列為後續 |
+| 本機 State store | #1164 | 量過每回合的 store 操作：慢在 Windows 上 `os.replace` 之後的下一次存取（13～18 ms），不在重複讀取。產品程式只有一處可安全省掉的重讀（每個新對話約 0.8 ms），不改。改在 `conftest.py` 加只限 Windows、比對 (inode, mtime, size) 的讀取快取，存 JSON 文字、命中時照檔案的方式解析，檔案仍是唯一依據；`test_native_assembly.py` 交替量測三組，約 31 s → 17 s |
+
+### 重新量（main `b7ee1f05`）
+
+| 項目 | 第十一輪後（`a2738763`） | 第十二輪後（`b7ee1f05`） |
+|---|---|---|
+| 函式（不含 novnc） | 6,460 | 6,483 |
+| CC ≥ 10 | 966 | 969 |
+| CC ≥ 20 | 199 | 196 |
+| CC ≥ 30 | 64 | 62 |
+| CC ≥ 50 | 6 | 6 |
+| CC ≥ 100 | 2 | 2 |
+| dryer 重複（≥ 0.8，至少 4 行） | 174 對，126 對完全相同 | 174 對，126 對完全相同 |
+
+兩次之間另外合併了 #1141、#1144、#1150 等 PR，增減沒有和這輪分開算。這一輪沒有量覆蓋率。
+
+### 驗證
+
+- #1148 部署到 dev（API revision `ca-fa-behavior-poc--26e16a7-r4300-1`）：7 項真人路徑全過，log 沒有新的錯誤類別。六個防呆分支只在上游送出格式錯誤的 code 時才會走到，真服務不會送，所以 dev 只證明正常路徑沒有退步，分支本身由離線測試涵蓋。#1149、#1153、#1154 沒有單獨在 dev 驗，已隨 stage 第 40 版上線。
+- 每處修正都先寫測試，在修改前的程式上看到預期的失敗再修。拆函式的兩條線先釘住原本行為（#1153 新增 43 個、#1154 新增 29 個），在 main `f6856a69` 上通過後才動程式；各 6 個 mutant 全部被抓到。
+- 每個 PR 的 poteto 與 ponytail 兩軸審查 P1／P2 都清零。
+- 全量 `tests/shared_context`（Windows、離線、真 runtime 1.0.83，main `b7ee1f05`）：17,116 passed、5 failed、30 skipped、2 xfailed，4 小時 17 分（同機另有其他測試在跑）。其中 4 個是 #1141 之後一直壞的 state 空間拒絕測試（#1161 修好）；`test_vm_sdk_start.py::test_a_completed_vm_turn_can_prove_closed_entry_while_its_queue_thread_stays_alive` 單獨重跑 3 次都通過，推測是負載造成，沒在無負載時重現。
+- 全量第二次（Windows、離線、SDK 1.0.26／真 runtime 1.0.103，main `4f735edf`，含 #1156～#1164）：16,671 passed、2 failed＋2 errors、22 skipped、2 xfailed，3 小時 14 分，比上一次少約 1 小時；兩次的 main 不同，少掉的時間沒有逐項歸因。失敗的是 `test_memory_no_sdk.py::test_v2_native_report_refuses_unbound_or_mixed_version_proof` 的 2 個參數：測試只等 SDK 停下 5 秒，整個函式單獨重跑 3 次都過；#1172 改用預設的 60 秒，修後沒有重跑全量。
+- 沒有在 Linux 上跑。
+
+### 做法與教訓
+
+- 審查者的環境沒有 `fastapi` 時跑不了測試，只能讀程式下判斷。合併前由協調的工作階段在專案 venv 上自己跑一次新測試。
+- 拆函式時用整份輸出的 hash 證明前後一樣很方便，但拆完就該拿掉：模型多一個有預設值的欄位就會失敗，失敗時也看不出差異。逐欄位比對留下。
+- 部署到 dev 時要設 `GITHUB_SHA`，否則 revision 名稱會是 `local`（image digest 仍正確）。`meta` 步驟只在 CI 跑。
+- 盤點時「看起來沒用」的判斷錯了兩次：`infra/vnet` 有兩個模組還被正式 bicep 引用；遺留列的拒絕分支守著 AGENTS.md 第 8 條。刪之前先 grep 全樹、暫時拿掉後跑測試，不要只靠讀程式判斷。
+- 重型測試不在 PR 上跑，#1141 讓 4 個測試壞掉也沒人看到（#1161 才修）。PR 至少要跑改到的模組的測試檔，回合結束跑全量。
+- 慢的原因要先量再修：本來以為是 State store 重複讀取，量了才知道是 Windows 寫檔後的下一次存取。
+
+### 未處理／後續
+
+- `derive_registered_work` CC 18；`_require_associated` 仍是 11 項的 `or`，兩位審查者都認為它是同一條規則，不再拆。
+- `derive_work` 的 `mode` 參數沒用到，它是公開的位置參數，這次不動。
+- `_instruction_task`（13 個參數）與 `_peer_work_scope`（9 個參數）主要是轉手；`expires_at is None` 且有 instruction 時允許的那一側，沒在 `test_native_launch_gates.py` 釘住。
+- 綁工作狀態的一批與 CC ≥ 50 的 6 個，理由同第十輪，仍不動。
+
+## 第十三輪結果（2026-11-04）
+
+這輪先量，再挑最能降低風險或閱讀負擔的幾件事做，行為不變。順序是：刪掉證明沒有正式呼叫者的程式，補上沒測到的錯誤碼，最後拆 CC 49 的 `_read`。每個刪除都先 grep 全樹（測試、fixture、設定、字串引用），再暫時拿掉跑 `--collect-only` 和相關測試。
+
+| 項目 | PR | 內容 |
+|---|---|---|
+| 沒有入口的驗證器與寫入端 | #1177 | 刪掉 `m3_auth.M3JwtVerifier`、`m3_auth.APPROVAL_SCOPE`（`behavior_auth` 的同名常數還在用），以及 `behavior_result_delivery` 的 `append_saved_result`（CC 28）、`_terminal`、`_stale`、`_payload`（-367 行）。兩個 bearer／kid 測試先改打 `JwtVerifier`，再刪；oversized 的案例改用簽好的大 token，才真的走到長度檢查 |
+| `M3_UPLOAD_NOT_PENDING` | #1178 | 新增 `test_only_the_pending_version_id_can_be_reconciled`（別的版本、沒有 pending 都回 409）；`_finish_upload` 裡同一個錯誤碼的第二個拋出點前面已經擋掉，走不到，刪掉 |
+| 再刪 8 個符號 | #1180 | `private_files`、`auth`、`behavior_runtime`、`behavior_work_policy`、`behavior_foundry`、`behavior_turn_ticket`、`behavior_workers`、`behavior_team_registry` 中沒有正式呼叫者的 8 個函式與方法（-185 行） |
+| 讀取過去回合 | #1181 | 先釘住 `behavior_user_turn_source` 每種拒絕的狀態碼與錯誤碼（10 種登記／對話拒絕、4 種缺件、5 種內容被改或尚未轉交），8 個 mutant 全部被抓到（含審查後補的 Team／Agent 檢查）；再把 `_read` 49 拆成 34，抽出 `_registered_turn` 和 `_published_checkpoint` |
+| 記憶的舊接線 | #1183 | 刪掉 `memory.FoundryMemory`、`models.SyntheticMemory`、`config.native_memory_scope` 與只測它們的 4 個測試；正式的 `ContextService` 用的是 `_DisabledLegacyMemory`，從沒用到 `FoundryMemory`。錯誤去敏測試改成直接測 `errors.upstream_problem`。`docs/FA-AGENT-BEHAVIOR-DESIGN.md` 三處標明已移除 |
+
+### 重新量
+
+| 項目 | 起點 `f3118993` | #1177、#1178 後 `6276d91a` | #1180 後 `caa5e4ba` | #1181 後 `2c6c58b3` | #1183 後 `40e5046d` |
+|---|---|---|---|---|---|
+| 函式（不含 novnc） | 6,352 | 6,346 | 6,337 | 6,339 | 6,348 |
+| CC ≥ 10 | 946 | 942 | 940 | 941 | 945 |
+| CC ≥ 20 | 189 | 187 | 187 | 187 | 187 |
+| CC ≥ 30 | 56 | 55 | 55 | 55 | 56 |
+| CC ≥ 50 | 4 | 4 | 4 | 4 | 5 |
+| CC ≥ 100 | 2 | 2 | 2 | 2 | 2 |
+| dryer 重複（≥ 0.8，至少 4 行） | 166 對，125 對完全相同 | 同左 | 同左 | 同左 | 同左 |
+
+`6276d91a` 到 `caa5e4ba` 之間另外合併了 #1179（`07c008ad`：6,345／942／187／55／4／2），#1181 到 #1183 之間合併了附件 10 MB 那條線的 #1182（只有 ADR）、#1184、#1185（合併後 `6799ad86`：6,354／945／187／56／5／2），所以最後一欄 CC ≥ 10／≥ 30／≥ 50 變多是 #1184、#1185 帶來的；#1183 本身只讓函式少 6 個，CC 各級不變。表上其他差額也沒有扣掉這些 PR。#1181 讓函式多 2 個、CC ≥ 10 多 1 個：`_read` 49 → 34，抽出的 `_registered_turn` 本身是 CC 10。這一輪只對 `behavior_user_turn_source` 量了覆蓋率。dryer 沒有變：剩下的高分重複（`skill_copy_source`／`skill_draft_source`、agent／team registry 的 operator `main`）錯誤碼和訊息各不相同，合併反而要多加參數，不值得。
+
+### 驗證
+
+- 每個 PR 都在 Windows、離線上跑改到的模組的測試檔（測試腳本設 `M2_TEST_RUNTIME` 指到真 runtime 1.0.103）；#1183 另外跑 `--collect-only tests/shared_context`（16,632 個，0 errors）。找測試引用要搜 repo 根目錄的 `tests/`：這輪一度搜錯成 `src/` 底下，誤以為 `ContextArtifactAdapter` 沒有測試在用，審查時才更正。
+- 突變測試用手寫的 runner，每個 mutant 都確認 pytest 真的有跑：#1177 oversized 的 mutant 被抓到，kid 那個與原程式等價；#1178 兩個都被抓到；#1181 八個都被抓到；#1183 的 `safe_text` mutant 與原程式等價（`Problem` 建構時自己會再套一次 `safe_text`）。
+- 每個 PR 的 poteto 與 ponytail 兩軸審查 P1／P2 都清零才合併。
+- 沒有部署：五個 PR 都沒改 Hosted 或 API 的對外行為。沒有跑全量 `tests/shared_context`，也沒在 Linux 上跑。
+
+### 做法與教訓
+
+- 測試模組也會被當成 fixture 匯入：`test_m3_auth` 被約 370 個檔用到，`test_adapters` 的 `ENDPOINT`、`Credential`、`WireTransport`、`WireResponse` 被 4 個檔用到。刪測試裡的東西之後一定要跑 `--collect-only`，#1183 就是靠它抓到 `ENDPOINT` 不能刪。
+- wire snapshot（`test_native_profile_snapshot`、`v1-wire-snapshot.yml`）不准刪 `behavior_wire` 的 model，所以沒人用的 `ExecutorJobResult`、`SdkVmNoStart` 留下。
+- 改寫測試前先確認新測試真的會殺掉 mutant：#1177 原本的 oversized 字串在解析 header 時就失敗，根本沒走到長度檢查；#1183 commit 訊息一度寫「mutant 被抓到」，實際是等價，推送前改正。
+
+### 未處理／後續
+
+- `behavior_dispatch.ContextArtifactAdapter`：正式程式沒有地方建構它，只有 `test_behavior_dispatch.py`、`test_behavior_api.py`、`test_skill_guidance_authority.py` 三個測試檔還在建構，另外 `BehaviorDispatcher` 與 `ToolBrokerCore` 會檢查它的型別，`behavior_runtime` 會讀它的 `execution_contract`；它打的路由在 #1163 後也沒有伺服器提供。要刪的不只這個類別：`WorkStateDispatcher` 繼承 `BehaviorDispatcher`，`DispatchRecord.execution_contract` 也還收 `fa-context-one-send-1`，而這是會存下來的紀錄格式，要先確認沒有舊紀錄或保留讀取。這會動到一次性送出的核心，連同那三個測試檔一起處理，留到下一輪單獨做。
+- `behavior_result_delivery` 只剩讀取端：沒有東西再寫入取消結果的接續，continue／reconcile 的讀取路由現在一律 409。要不要整條拿掉需要決定。
+- `_published_checkpoint` 把 checkpoint 另外上傳的那條路沒有測試（fixture 都是 inline）；`tenant_id` 不同的拒絕沒釘住；`UNCLASSIFIED` 那幾格釘的是現況（工作政策登記先拒絕），不是理想行為。
+- `_finish_upload` 可以直接接收已確認的 pending 參數；`test_m3_consent_is_not_silently_broadened` 的名字已經和內容不符。
+- 其他可能沒用的候選，這輪沒動：`DeliveryCore.scan_due`／`mark_due`／`complete_due` 與對應的 command model、`record_projection`、`unmark`、`public_desktop_failure`、`conversation_items`／`response_items`、`load_runtime_grants`、`from_response`；`InMemoryBackupStore`、`install_offline`、`_reset_forced_refresh_window` 只有測試在用，可以搬到測試。`observe_turn_closed` 不確定；`TurnReceiptStore` 等是 ADR 規劃的 T2，保留。
+- 刻意不碰：`SourceMaterials.prepare_large` 與 `compose_attachment`（`prepare_large` 從 09-18 起就沒有正式呼叫者，只有測試在呼叫，大於 `MAX_INLINE_BYTES` 的原件會在 commit 時失敗成 `SOURCE_PREPARATION_UNKNOWN`；由 10 MB 檔案那條線處理）、`sdk_pin.py` 的 `OLDER_RELEASES`、CI 上被跳過的 release-28 測試（由 SDK v2 那條線處理）。
+- `README.md` 還有幾行描述已刪的東西（`inventory_agent_scope`、`CONTEXT_ACTORS_JSON`），ADR-0012 也還提到 `restore_turn_tickets`；這頁前面第七、八輪列的 `append_saved_result` 已在 #1177 刪掉。
+
 ## 重新量
 
 ```powershell

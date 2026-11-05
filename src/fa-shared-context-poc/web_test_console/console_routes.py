@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import unquote
 
 from fastapi import Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from shared_context.assistant_image_wire import MAX_IMAGE_BYTES as _MAX_USER_IMAGE_BYTES
+from shared_context.behavior_user_uploads import MAX_UPLOAD_BYTES
 
 from .adapter import ConsoleError, require, sha, strict_json
 from .agent_connections import read_messages
@@ -44,7 +46,7 @@ async def read_json_input(request, limit, valid_shape, invalid_code):
 
 def is_submit_shape(body):
     return (type(body) is dict and {"content", "model"} <= set(body)
-            and set(body) <= {"content", "model", "attachments", "files", "images"})
+            and set(body) <= {"content", "model", "attachments", "files", "images", "uploads"})
 
 
 def is_image_upload_shape(body):
@@ -348,7 +350,8 @@ def install_turn_routes(app, scope, boundary):
     async def submit_instruction(request_id: str, request: Request, console=Depends(requested_console)):
         body = await read_json_input(request, 32768, is_submit_shape, "INSTRUCTION_INVALID")
         return await run_in_threadpool(console.submit_instruction, request_id, body["content"], body["model"],
-                                       body.get("attachments", ()), body.get("files", ()), body.get("images", ()))
+                                       body.get("attachments", ()), body.get("files", ()), body.get("images", ()),
+                                       body.get("uploads", ()))
 
     @app.post("/api/instructions/{request_id}/image-upload")
     async def upload_instruction_image(request_id: str, request: Request, console=Depends(requested_console)):
@@ -356,6 +359,16 @@ def install_turn_routes(app, scope, boundary):
         body = await read_json_input(request, MAX_IMAGE_UPLOAD_BODY_BYTES, is_image_upload_shape,
                                      "USER_IMAGE_INPUT_INVALID")
         return await run_in_threadpool(console.upload_instruction_image, request_id, body["name"], body["png_base64"])
+
+    @app.put("/api/instructions/{request_id}/file-upload")
+    async def upload_instruction_file(request_id: str, request: Request, console=Depends(requested_console)):
+        """ADR-0013: one text file (at most 10 MiB) as raw bytes; its name rides in X-FA-File-Name, percent-encoded."""
+        try:
+            name = unquote(request.headers.get("x-fa-file-name", ""), errors="strict")
+        except UnicodeDecodeError:
+            raise ConsoleError("USER_FILE_INPUT_INVALID", 400) from None
+        data = await read_bounded(request, MAX_UPLOAD_BYTES, "USER_FILE_TOO_LARGE", 413)
+        return await run_in_threadpool(console.upload_instruction_file, request_id, name, data)
 
     @app.post("/api/instructions/{request_id}/append")
     async def append_instruction(request_id: str, request: Request, console=Depends(requested_console)):

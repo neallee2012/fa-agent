@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 
 from .behavior_auth import BehaviorPrincipal
-from .behavior_operations import _Model, _parse
+from .behavior_operations import _Model
 from .behavior_server_config import ServerAgentScope
 from .errors import Problem
 from .source_materials import digest
@@ -111,29 +111,3 @@ def ticket_index(store):
         index = TurnTicketIndex()
         store._turn_ticket_index = index
     return index
-
-
-def restore_turn_tickets(store, inventory):
-    """Use the already validated startup inventory, not per-request Table lookups."""
-    from .behavior_assistant import _Session, key
-    from .behavior_work_policy import WorkRegistration
-
-    records = {}
-    for row in inventory.rows.values():
-        data = row.payload["data"]
-        if data.get("kind") == "steady_work_registration" and data.get("turn_authorization") is not None:
-            record = _parse(data, WorkRegistration)
-            records[record.binding.binding_id] = record
-    captured = []
-    for row_id, row in inventory.rows.items():
-        data = row.payload["data"]
-        if data.get("turn_authorization_digest") is None or data.get("vm_turn_ticket_id") is not None:
-            continue
-        session = _parse(data, _Session)
-        record = records.get(session.binding_id)
-        if record is None or row_id != key("session", session.assignment.session_id):
-            raise Problem(403, "ASSISTANT_TICKET_DENIED", "the retained turn ticket has no original admission")
-        captured.append((record, session))
-    index = ticket_index(store)
-    for record, session in captured:
-        index.publish(record, session)

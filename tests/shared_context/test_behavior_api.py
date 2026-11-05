@@ -558,44 +558,6 @@ def test_human_can_revoke_only_exact_current_grant_without_releasing_reservation
     assert h.adapter.inspect("work-one", CTX).definition_digest == version.definition_digest
 
 
-def test_metrics_http_adapter_is_usable_and_replays_only_completed_evidence(h):
-    import httpx
-    from shared_context.behavior_dispatch import ArtifactReadSpec, ArtifactRoute, ContextArtifactAdapter, ContextArtifactSettings
-    from test_behavior_dispatch import Chunks
-
-    route = ArtifactRoute(team=A.team, artifact_id="metrics", version_id="1" * 32)
-    spec = ArtifactReadSpec(**route.model_dump(), if_match='"0xABC"', sha256=hashlib.sha256(METRICS).hexdigest(), bytes=len(METRICS))
-    calls = []
-
-    def read(request):
-        calls.append(request)
-        assert request.method == "GET" and request.headers["if-match"] == spec.if_match
-        return httpx.Response(200, headers={
-            "content-type": "application/octet-stream", "etag": spec.if_match, "x-artifact-sha256": spec.sha256,
-        }, stream=Chunks([METRICS]))
-
-    adapter = ContextArtifactAdapter(
-        ContextArtifactSettings(api_origin="https://context.example", principal_id=A.oid, routes=(route,)),
-        references={"goal": spec}, token=lambda: "SYNTHETIC_CREDENTIAL",
-        clock=lambda: h.time, transport=httpx.MockTransport(read),
-    )
-    broker = ToolBrokerCore(h.store, clock=lambda: h.time, adapter=adapter.registration, execution_adapter=adapter)
-    h.runtime = BehaviorRuntime(replace(h.dep, broker=broker), (h.binding,), clock=lambda: h.time, mode="offline_contract")
-    h.client = TestClient(create_behavior_app(h.runtime, h.verifier))
-    prepared = h.post("/operation/prepare", wire.OperationPrepare(request_id="p", input_ref="goal"), "agent").json()["result"]
-    approval = wire.OperationApproval(
-        request_id="a", decision_id="a", description_digest=prepared["description_digest"],
-        adapter_contract_digest=prepared["adapter_contract_digest"], expires_at=NOW + timedelta(minutes=1),
-    )
-    assert h.post("/operation/approve", approval).status_code == 200
-    command = wire.Command(request_id="execute")
-    first = h.post("/operation/execute", command, "agent")
-    assert first.status_code == 200 and first.json()["result"]["safe_result"]["data"]["item_count"] == 3
-    assert h.post("/operation/execute", command, "agent").json() == first.json()
-    assert h.post("/operation/reconcile", command, "agent").json() == first.json()
-    assert len(calls) == 1
-
-
 def test_worker_start_response_loss_reconciles_same_job_without_second_start(h):
     h.submit()
     h.executor.fail_after_apply = True

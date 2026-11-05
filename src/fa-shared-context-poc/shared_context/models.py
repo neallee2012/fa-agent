@@ -23,18 +23,3 @@ class CreateWork(StrictModel):
 
 class Handoff(StrictModel):
     to_actor: Identifier
-
-
-class SyntheticMemory(StrictModel):
-    marker: Identifier
-    value: Identifier
-
-    def chat(self) -> list[dict]:
-        return [{
-            "role": "user", "type": "message",
-            "content": [{"type": "input_text", "text": (
-                f"My preferred color theme for the dashboard named {self.marker} is {self.value}. "
-                f"This is a long-term appearance preference specific to that dashboard."
-            )}],
-        }]
-

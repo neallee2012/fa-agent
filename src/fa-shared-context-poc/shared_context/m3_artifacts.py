@@ -254,8 +254,6 @@ class ArtifactService:
 
     def _finish_upload(self, record: Record, document: ArtifactDocument, receipt: BlobReceipt) -> Record:
         pending = document.pending
-        if pending is None:
-            raise Problem(409, "M3_UPLOAD_NOT_PENDING", "there is no reserved upload to finalize")
         self._verify_blob(document, pending.version_id, receipt, pending.sha256, pending.bytes)
         fields = {**pending.model_dump(mode="json", exclude={"bytes", "status"}),
                   "blob": receipt.model_dump(mode="json"), "number": len(document.versions) + 1}

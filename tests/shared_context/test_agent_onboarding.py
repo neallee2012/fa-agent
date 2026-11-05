@@ -1173,3 +1173,26 @@ def test_a_new_agent_starts_new_conversations_on_the_lane_a_uses(team, monkeypat
     assert stored.get("state_profile") == (lane if a_lane == "responses" else None)
     assert current_selection(control.runtime.store, control.policy) == a_head
 
+
+
+@pytest.mark.parametrize("a_provider", ["openai-responses", None], ids=["a-responses", "a-completions"])
+def test_a_new_agent_takes_the_model_provider_a_uses(team, monkeypatch, a_provider):
+    """A on stage/dev conversation_defaults (Responses): the new Agent's selection is Responses, not A's standing None."""
+    from shared_context.behavior_sdk_state import local_platform
+    grants = _grants(team, SKILLS_ENTRY_ID)
+    _approved(monkeypatch, SKILL)
+    assert team.a.runtime.work_policy.policy.profile.model_provider is None
+    checkpoint = {"name": "auto-no-custom-v1", "platform": local_platform(),
+                  "provider": a_provider or "openai-completions"}
+    _a_selects(team, "a-provider", state_profile="foundry-responses-v1", model_provider=a_provider,
+               checkpoint_profile=checkpoint)
+    finished, value = team.run(selection=(_refs(grants, SKILLS_ENTRY_ID), (SKILL,)))
+    assert finished and value["state"] == "ready"
+    control, head, profile = _selected(team, value["agent_id"])
+    assert head.command.template.settings.model_provider == a_provider
+    assert head.command.template.settings.checkpoint_profile.model_dump(mode="json") == checkpoint
+    assert profile.model_provider == a_provider
+    stored = team.a.runtime.store.read_record(onboarding_key(
+        team.config.identity.tenant_id, team.config.identity.team_id, "onboard-one")).payload["data"]
+    assert stored.get("model_provider") == a_provider
+    assert control.policy.profile.model_provider is None

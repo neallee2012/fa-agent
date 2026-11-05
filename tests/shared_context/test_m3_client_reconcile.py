@@ -147,3 +147,19 @@ def test_unavailable_blob_receipt_remains_pending_without_retrying_upload(pendin
         c.service.reconcile(A, A.team, "report", V2, c.snapshot.etag)
     assert failure.value.body["error"]["code"] == "M3_BLOB_UNKNOWN"
     assert calls == [True] and c.puts == [True] and c.repository.data == before
+
+
+@pytest.mark.parametrize("finished", [False, True], ids=["other-version", "nothing-pending"])
+def test_only_the_pending_version_id_can_be_reconciled(pending_upload, monkeypatch, finished):
+    c = pending_upload
+    asked, etag = V1, c.snapshot.etag
+    if finished:
+        asked, etag = V2, c.service.reconcile(A, A.team, "report", V2, etag).etag
+    before = copy.deepcopy(c.repository.data)
+    stats = []
+    monkeypatch.setattr(c.store, "stat", lambda *args, **kwargs: stats.append(args))
+    with pytest.raises(Problem) as failure:
+        c.service.reconcile(A, A.team, "report", asked, etag)
+    assert failure.value.status == 409
+    assert failure.value.body["error"]["code"] == "M3_UPLOAD_NOT_PENDING"
+    assert stats == [] and c.repository.data == before and c.puts == [True]

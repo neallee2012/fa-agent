@@ -562,18 +562,18 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <div id="attachment-selected"></div>
 <p id="attachment-selection-note" class="reason" role="status"></p>
 </details>
-<details id="user-file-picker" class="attachment-panel" aria-label="選取文字檔" hidden><summary>選取小型 UTF-8 文字檔</summary>
+<details id="user-file-picker" class="attachment-panel" aria-label="選取文字檔、PDF 或 Office 檔" hidden><summary>選取文字檔、PDF 或 Office 檔</summary>
 <button id="read-user-file-capability" disabled>讀取本對話的文字檔設定</button>
 <p id="user-file-note" class="reason" role="status"></p>
-<label for="user-text-files">選取 txt／md／csv／json（與來源附件合計最多 4 份）</label>
-<input id="user-text-files" type="file" accept=".txt,.md,.csv,.json" multiple disabled>
+<label for="user-text-files">選取 txt／md／csv／json／pdf／docx／xlsx／pptx（每份最多 10 MB，與來源附件合計最多 4 份）；超過 8192 bytes 的文字檔和所有 PDF、Office 檔會在選取後立刻上傳給這位助理</label>
+<input id="user-text-files" type="file" accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx,.pptx" multiple disabled>
 <button id="clear-user-files" disabled>清除此回合文字檔選擇</button>
 <div id="user-file-selected"></div>
 <p id="user-file-limit" class="reason" role="status"></p>
 <small>只有你選取的檔案才在本機讀取；按「送出」前不傳本文。保留 BOM／CRLF 原字，不解析或執行內容。未送草稿只在本頁記憶體。</small>
 </details>
 <details id="user-image-picker" class="attachment-panel" aria-label="附加圖片" hidden><summary>附加圖片（png／jpg／webp，最多 4 張）</summary>
-<label for="user-images">選取圖片；會在本機轉成 PNG（邊長最多 2000 px、每張最多 512 KiB）再上傳給這位助理</label>
+<label for="user-images">選取圖片（原圖每張最多 10 MB）；會在本機轉成 PNG（邊長最多 2000 px、每張最多 512 KiB）再上傳給這位助理</label>
 <input id="user-images" type="file" accept="image/png,image/jpeg,image/webp" multiple disabled>
 <button id="clear-user-images" disabled>清除此回合圖片</button>
 <div id="user-image-selected"></div>
@@ -766,7 +766,7 @@ const userFileDrafts=new Map(),userFileDownloads=new Set(),userFileDownloadError
 // B1 PA-08: images already stored with the Agent; a draft keeps only their references plus a local preview.
 const userImageDrafts=new Map();
 let userImageBusy=false,userImageError=null,userImageRevision=0,userImageScope=null,userImageRenderKey=null;
-let userFileRevision=0,userFileScope=null,userFileReading=false,userFileError=null,userFileRenderKey=null;
+let userFileRevision=0,userFileScope=null,userFileReading=false,userFileUploading=null,userFileError=null,userFileRenderKey=null;
 let userFileCapability=null,userFileCapabilityBusy=false,userFileCapabilityError=null,userFileDownloadRevision=0;
 const pendingCancellations=new Set();
 const cancellationObservations=new Map(),cancellationReadErrors=new Map(),cancellationReads=new Set();
@@ -1159,6 +1159,7 @@ function friendlyError(error){
     BEHAVIOR_UNSAFE_CONTENT:"這份來源的內容不符合輸出政策，請移除後再送。",
     NATIVE_IMAGE_UNSUPPORTED:"目前的模型不能讀圖片，請移除圖片或換模型。",
     CAPABILITY_MODEL_UNSUPPORTED:"目前的模型不能讀圖片，請移除圖片或換模型。",
+    REASONING_MODEL_REQUIRES_RESPONSES:"這位助理目前的設定不能用推理模型（gpt-5.4-mini、gpt-6 系列），訊息沒有送出；請改選 gpt-4.1-mini，或請管理員把這位助理改成 Responses。",
     NATIVE_IMAGE_MISSING:"圖片沒有上傳成功，請重新附加後再送。",
     NATIVE_IMAGE_INVALID:"圖片沒有上傳成功，請重新附加後再送。",
     NATIVE_IMAGE_STATE_FULL:"這段對話的圖片已達上限，請開新對話再附圖。",
@@ -1225,7 +1226,7 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     NATIVE_FILES_SOURCE_CHANGED:"原工作檔在保存期間有變動；沒有發布不完整的新環境。",
     NATIVE_FILES_CONFLICT:"檔案與原保存清單不同；不覆寫目的檔案，也不重傳。",
     NATIVE_FILES_UNAVAILABLE:"原工作檔尚無法完整讀取；不當成空目錄，草稿保留。",
-    NATIVE_FILES_ACCESS_DENIED:"目前身分無法存取原工作檔；不增加權限或換儲存繞過。",
+    NATIVE_FILES_ACCESS_DENIED:"平台拒絕存取檔案（上傳附件或搬移工作檔）。請稍後再試；若持續發生，請聯絡管理員。",
     NATIVE_FILES_CONFIRMATION_UNSUPPORTED:"傳送結果尚未確認；保留原請求，不會自動重送。",
     NATIVE_FILES_CONFIRMATION_REQUIRED:"傳送結果尚未確認；保留原請求，不會自動重送。",
     NATIVE_ENVIRONMENT_CONFLICT:"傳送結果尚未確認；保留原請求，不會自動重送。",
@@ -1247,9 +1248,15 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     ATTACHMENT_SELECTION_INVALID:"請使用最多4份完整參照及不重複的 logical filename；不接受路徑或URL。",
     USER_FILE_CAPABILITY_INVALID:"文字檔設定回應缺欄或與原對話不符；不當成停用，也不改查目前新對話設定。",
     USER_FILE_CAPABILITY_UNAVAILABLE:"原對話的文字檔設定目前不可用；不改查global或自動啟用。",
-    USER_FILE_INPUT_INVALID:"檔案需為小型UTF-8 txt／md／csv／json，名稱不是路徑或URL；總附件最多4份且不重名，原文加檔案JSON最多8192 bytes。",
+    USER_FILE_INPUT_INVALID:"文字檔要是 UTF-8；檔名只能用英文字母、數字、點、底線和連字號（第一個字是英數字），請先改名再選；每則訊息最多 4 份且不重名；8192 bytes 以內的檔案連同訊息原文合計也不能超過 8192 bytes。",
+    USER_FILE_TOO_LARGE:"檔案超過 10 MB，沒有加入。請分割或壓縮後再試。",
+    USER_FILE_TYPE_UNSUPPORTED:"目前支援 txt／md／csv／json／pdf／docx／xlsx／pptx（舊版 doc／xls／ppt 請先另存新格式）。這份沒有加入。",
+    USER_FILE_UPLOAD_UNKNOWN:"上傳結果不確定。再傳一次同一個檔案是安全的，不會變成兩份。",
+    NATIVE_FILE_MISSING:"助理目前的環境找不到這份附件（可能剛換過環境）。請移除後重新附加。",
+    USER_UPLOADS_UNSUPPORTED:"這段對話的路徑不支援大檔、PDF 或 Office 檔；請在原生對話中附檔，或把內容貼進訊息。",
     USER_FILE_UTF8_INVALID:"選取的檔案不是有效UTF-8或含NUL；整批未採用，不替換成�、截斷或上傳。",
-    USER_IMAGE_INPUT_INVALID:"只接受 png／jpg／webp；轉成 PNG 後每張最多 512 KiB、邊長最多 2000 px，一次最多 4 張。這批沒有加入。",
+    USER_IMAGE_INPUT_INVALID:"只接受 png／jpg／webp；轉成 PNG 後每張最多 512 KiB、邊長最多 2000 px，一次最多 4 張。沒通過的那張和之後選的都沒有加入。",
+    USER_IMAGE_TOO_LARGE:"有原圖超過 10 MB，這次選的都沒有加入。請先縮小或另存成較小的檔案再選。",
     USER_IMAGES_UNSUPPORTED:"這段對話的路徑不支援附圖；請在原生對話中附圖。",
     USER_FILE_READ_FAILED:"選取檔案的本機讀取失敗；整批未採用，也沒有傳送本文。",
     USER_FILE_UNAVAILABLE:"原交辦的檔案目前不可讀或reader未部署；不以空內容代替。",
@@ -1424,23 +1431,29 @@ function clearUserFileObservation(){
 function userFileLive(revision,scope){
   return revision===userFileRevision&&scope===userFileScopeKey()&&state.authentication==="AVAILABLE";
 }
-function literalFilesBody(files){return files.map(file=>({name:file.name,text:file.text}))}
+// Files over 8192 bytes are drafts with upload:true (a reference to bytes already stored with the Agent), sent as `uploads`.
+function literalFilesBody(files){return files.filter(file=>!file.upload).map(file=>({name:file.name,text:file.text}))}
+function uploadsBody(files){
+  return files.filter(file=>file.upload).map(({name,sha256,byte_length,media_type})=>({name,sha256,byte_length,media_type}));
+}
 function literalInputBytes(content,files){
   return new TextEncoder().encode(JSON.stringify({content,files:literalFilesBody(files)})).length;
 }
+// Files Hosted reads as their extracted text, never decoded or inlined here (ADR-0013 §5).
+const BINARY_USER_FILE=/\.(pdf|docx|xlsx|pptx)$/i;
 function validUserFilename(name){
-  return typeof name==="string"&&/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)&&/\.(txt|md|csv|json)$/i.test(name);
+  return typeof name==="string"&&/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)&&/\.(txt|md|csv|json|pdf|docx|xlsx|pptx)$/i.test(name);
 }
 function invalidLiteralInput(content,files,refs){
-  const names=[...refs.map(item=>item.name),...files.map(item=>item.name)];
-  return names.length>4||new Set(names).size!==names.length||files.some(item=>
-    !validUserFilename(item.name)||typeof item.text!=="string"||item.text.includes("\0"))
-    ||Boolean(files.length&&literalInputBytes(content,files)>8192);
+  const names=[...refs.map(item=>item.name),...files.map(item=>item.name)],inline=files.filter(item=>!item.upload);
+  return names.length>4||new Set(names).size!==names.length||files.some(item=>!validUserFilename(item.name))
+    ||inline.some(item=>typeof item.text!=="string"||item.text.includes("\0"))
+    ||Boolean(inline.length&&literalInputBytes(content,inline)>8192);
 }
 function userFileIssue(){
   const c=state?.composer,files=selectedUserFiles();
   if(!(c?.editable||c?.can_follow_up))return "";
-  if(userFileReading)return "正在讀取你選取的文字檔；完成核對前不能送出。";
+  if(userFileReading)return userFileUploading?`正在上傳 ${userFileUploading}；完成前不能送出。`:"正在讀取你選取的文字檔；完成核對前不能送出。";
   if(userFileError)return friendlyError(userFileError);
   if(!files.length)return "";
   if(invalidLiteralInput(el("instruction").value,files,selectedAttachments()))return friendlyError({code:"USER_FILE_INPUT_INVALID"});
@@ -1467,7 +1480,7 @@ function userImageIssue(){
 }
 async function pngForUpload(file){
   if(!["image/png","image/jpeg","image/webp"].includes(file.type))throw {code:"USER_IMAGE_INPUT_INVALID"};
-  const bitmap=await createImageBitmap(file);
+  const bitmap=await createImageBitmap(file).catch(()=>{throw {code:"USER_IMAGE_INPUT_INVALID"}});
   try{
     let scale=Math.min(1,2000/Math.max(bitmap.width,bitmap.height));
     for(let attempt=0;attempt<8;attempt++){
@@ -1541,13 +1554,14 @@ function renderUserFiles(){
   text("user-file-note",c?.command_incomplete?friendlyError({code:"INSTRUCTION_INCOMPLETE"}):
     userFileCapabilityError?friendlyError(userFileCapabilityError):
     userFileCapabilityBusy?"正在唯讀核對原對話設定，不傳本文或探測preflight。":
-    userFileReading?"正在本機讀取你選取的檔案；尚未傳送。":
+    userFileReading?(userFileUploading?`上傳中：${userFileUploading}…`:"正在本機讀取你選取的檔案；尚未傳送。"):
     !editable?"這回合的原檔已隨command凍結，只顯示metadata；新追問不自動繼承附件。":
     !userFileCapability?"先讀取本對話設定；不從reference附件目錄猜測literal能力。":
     userFileCapability.user_text_file_profile===null?"本對話捕獲的設定未啟用文字檔；不借目前新對話profile啟用。":
     `設定觀察於 ${userFileCapability.read_at}；不是授權，送出時仍由後端核對原profile與目前權限。`);
   text("user-file-limit",userFileIssue()||(files.length?
-    `原文＋檔案JSON：${literalInputBytes(el("instruction").value,files)}／8192 bytes（包含JSON escaping）；附件合計 ${files.length+selectedAttachments().length}／4。`:
+    `${files.some(item=>!item.upload)?`原文＋檔案JSON：${literalInputBytes(el("instruction").value,files)}／8192 bytes（包含JSON escaping）；`:""}${
+      files.some(item=>item.upload)?"大檔已上傳，送出時只帶名稱與雜湊；":""}附件合計 ${files.length+selectedAttachments().length}／4。`:
     "本回合沒有選取文字檔；普通文字與來源附件行為不變。"));
   const key=JSON.stringify([scope,ready,editable,metadata]);
   if(key===userFileRenderKey)return;
@@ -1555,22 +1569,23 @@ function renderUserFiles(){
   const panel=el("user-file-selected");panel.replaceChildren();
   for(const item of metadata){
     const row=document.createElement("div"),name=document.createElement("input"),info=document.createElement("p");
-    name.value=name.defaultValue=item.name;name.disabled=!ready||!editable;
+    name.value=name.defaultValue=item.name;name.disabled=!ready||!editable||Boolean(item.upload);
     name.setAttribute("aria-label","文字檔 logical filename");name.setAttribute("maxlength","128");
     const generation=userFileRevision;
     name.addEventListener("change",()=>{
       if(!userFileLive(generation,scope)||name.disabled||messagePending(state.composer?.request_id))return;
-      userFileRevision++;userFileReading=false;userFileCapabilityBusy=false;userFileError=null;userFileRenderKey=null;
+      userFileRevision++;userFileReading=false;userFileUploading=null;userFileCapabilityBusy=false;userFileError=null;userFileRenderKey=null;
       userFileDrafts.set(attachmentDraftKey(),selectedUserFiles().map(value=>value===item?{...value,name:name.value}:value));
       renderComposer();
     });
-    info.textContent=`${item.utf8_bytes} bytes${item.sha256?` · SHA256 ${item.sha256}`:" · 本機草稿，未提交"}`;
+    info.textContent=`${item.utf8_bytes} bytes${item.sha256?` · SHA256 ${item.sha256}`:" · 本機草稿，未提交"}${
+      item.upload?" · 已上傳，隨訊息送出":""}`;
     row.append(name,info);
     if(editable){
       const remove=document.createElement("button");remove.textContent="移除此文字檔";remove.disabled=!ready;
       remove.addEventListener("click",()=>{
         if(!userFileLive(generation,scope)||remove.disabled||messagePending(state.composer?.request_id))return;
-        userFileRevision++;userFileReading=false;userFileCapabilityBusy=false;userFileError=null;userFileRenderKey=null;
+        userFileRevision++;userFileReading=false;userFileUploading=null;userFileCapabilityBusy=false;userFileError=null;userFileRenderKey=null;
         userFileDrafts.set(attachmentDraftKey(),selectedUserFiles().filter(value=>value!==item));renderComposer();
       });
       row.append(remove);
@@ -6642,7 +6657,7 @@ function renderConversation(tasks){
     task.response_reconciliation,task.appends,task.append_error,
     agentMessageViews.get(task.task_id),agentMessageErrors.get(task.task_id),agentMessageReads.has(task.task_id),
     nativeDraftViews.get(scopeKey(task.task_id)),task.actions?.["read-skill-draft"]?.enabled,
-    task.user_files,task.user_files?.map(file=>{const k=JSON.stringify([task.task_id,file.name]);
+    task.user_files,task.user_uploads,task.user_files?.map(file=>{const k=JSON.stringify([task.task_id,file.name]);
       return [userFileDownloads.has(k),userFileDownloadErrors.get(k),userFileDownloadNotes.get(k)]}),
     cancellationObservations.get(task.task_id),cancellationReadErrors.get(task.task_id),cancellationReads.has(task.task_id),
     answerDownloads.has(task.task_id),answerDownloadErrors.get(task.task_id),answerDownloadNotes.get(task.task_id),
@@ -6919,6 +6934,11 @@ function renderConversation(tasks){
       note.textContent=`附圖：${image.name}`;
       turn.append(note);
     }
+    for(const upload of task.user_uploads||[]){
+      const note=document.createElement("p");note.className="reason";
+      note.textContent=`附檔：${upload.name}（${upload.byte_length} bytes，已上傳）`;
+      turn.append(note);
+    }
     for(const file of task.user_files||[]){
       const key=JSON.stringify([task.task_id,file.name]),error=userFileDownloadErrors.get(key);
       const note=document.createElement("p");note.className="reason";
@@ -7141,7 +7161,7 @@ function render(){
     native_receipt:t.native_receipt,not_accepted:t.not_accepted,submission_observation:t.submission_observation,
     response_reconciliation:t.response_reconciliation,cancellation:t.cancellation,continuation:t.continuation,
     continuation_state:t.continuation_state,continuation_error:t.continuation_error,continuation_usage:t.continuation_usage,
-    appends:t.appends,append_error:t.append_error,user_files:t.user_files,user_images:t.user_images,
+    appends:t.appends,append_error:t.append_error,user_files:t.user_files,user_images:t.user_images,user_uploads:t.user_uploads,
     delegation:delegationViews.get(t.task_id)?.value?.delegation,delegation_error:delegationErrors.get(t.task_id),
     cancellation_read_error:cancellationReadErrors.get(t.task_id),
     agent_messages:agentMessageViews.get(t.task_id)?.messages,agent_messages_error:agentMessageErrors.get(t.task_id)}},null,2));
@@ -7605,7 +7625,7 @@ async function sendChat(){
   const originAgent=selectedAgent,scope=agentRevision;
   const content=el("instruction").value,model=el("model").value,csrf=state.csrf;
   const attachments=JSON.parse(JSON.stringify(selectedAttachments())),originalAttachmentKey=attachmentDraftKey(composer);
-  const files=literalFilesBody(selectedUserFiles());
+  const fileDrafts=[...selectedUserFiles()],files=literalFilesBody(fileDrafts),uploads=uploadsBody(fileDrafts);
   const imageDrafts=[...selectedUserImages()];
   const images=imageDrafts.map(({name,sha256,byte_length,media_type})=>({name,sha256,byte_length,media_type}));
   const authRevision=attachmentAuthRevision;
@@ -7648,9 +7668,7 @@ async function sendChat(){
       userImageDrafts.delete(originalAttachmentKey);
       userImageDrafts.set(attachmentDraftKey(next.composer,originAgent),imageDrafts);
       userFileDrafts.delete(originalAttachmentKey);
-      userFileDrafts.set(attachmentDraftKey(next.composer,originAgent),files.map(file=>({
-        ...file,utf8_bytes:new TextEncoder().encode(file.text).length,
-      })));
+      userFileDrafts.set(attachmentDraftKey(next.composer,originAgent),fileDrafts);
       optimisticMessages.delete(scopeKey(optimisticId,originAgent));optimisticId=requestId;
       optimisticMessages.set(scopeKey(optimisticId,originAgent),{
         agent_id:originAgent,request_id:requestId,thread_id:originThread,text:content,sendToken});
@@ -7668,7 +7686,7 @@ async function sendChat(){
       modelSwitchNotice={agent:originAgent,thread:originThread,request_id:requestId,model};renderModelSwitchNotice();
     }
     const value=await post(`/api/instructions/${encodeURIComponent(requestId)}/submit`,{
-      content,model,...(attachments.length?{attachments}:{}),...(files.length?{files}:{}),...(images.length?{images}:{}),
+      content,model,...(attachments.length?{attachments}:{}),...(files.length?{files}:{}),...(uploads.length?{uploads}:{}),...(images.length?{images}:{}),
     });
     if(value.task?.task_id!==requestId||value.task.submission?.state!=="CONFIRMED")
       throw {code:"RECONCILE_REQUIRED",message:"尚未取得接單確認，保留原訊息，不會重送。"};
@@ -8113,7 +8131,7 @@ async function readNativeProgress(task){
 
 el("clear-user-files").addEventListener("click",()=>{
   if(el("clear-user-files").disabled)return;
-  userFileRevision++;userFileReading=false;userFileCapabilityBusy=false;userFileError=null;userFileRenderKey=null;
+  userFileRevision++;userFileReading=false;userFileUploading=null;userFileCapabilityBusy=false;userFileError=null;userFileRenderKey=null;
   userFileDrafts.delete(attachmentDraftKey());el("user-text-files").value="";renderComposer();
 });
 el("read-user-file-capability").addEventListener("click",async()=>{
@@ -8146,32 +8164,70 @@ el("user-text-files").addEventListener("change",async()=>{
   if(input.disabled)return;
   const selected=Array.from(input.files||[]);if(!selected.length)return;
   const scope=userFileScopeKey(),revision=++userFileRevision,draft=attachmentDraftKey();
-  userFileReading=true;userFileError=null;userFileRenderKey=null;renderComposer();
+  const csrf=state.csrf,agent=selectedAgent,rid=state.composer.request_id;
+  userFileReading=true;userFileUploading=null;userFileError=null;userFileRenderKey=null;renderComposer();
   try{
     const names=[...selectedAttachments().map(item=>item.name),...selected.map(item=>item.name)];
-    if(names.length>4||new Set(names).size!==names.length||selected.some(file=>
-        !validUserFilename(file.name)||!Number.isSafeInteger(file.size)||file.size<0||file.size>8192))
-      throw {code:"USER_FILE_INPUT_INVALID"};
+    if(names.length>4||new Set(names).size!==names.length)throw {code:"USER_FILE_INPUT_INVALID"};
+    for(const file of selected){
+      if(!/\.(txt|md|csv|json|pdf|docx|xlsx|pptx)$/i.test(file.name))throw {code:"USER_FILE_TYPE_UNSUPPORTED"};
+      if(file.size>10*1024*1024)throw {code:"USER_FILE_TOO_LARGE"};
+      if(!validUserFilename(file.name)||!Number.isSafeInteger(file.size)||file.size<0)throw {code:"USER_FILE_INPUT_INVALID"};
+      // A PDF or Office file is binary: it always goes up as a large file, read as its text by the assistant
+      // (ADR-0013 §5).
+      if((file.size>8192||BINARY_USER_FILE.test(file.name))&&!nativeProfile(state.composer?.state_profile))
+        throw {code:"USER_UPLOADS_UNSUPPORTED"};
+    }
     const decoded=[];
     for(const file of selected){
       if(!userFileLive(revision,scope))return;
       const raw=await file.arrayBuffer();
       if(!userFileLive(revision,scope))return;
-      if(raw.byteLength!==file.size||raw.byteLength>8192)throw {code:"USER_FILE_INPUT_INVALID"};
+      if(raw.byteLength!==file.size||raw.byteLength>10*1024*1024)throw {code:"USER_FILE_INPUT_INVALID"};
+      const bytes=new Uint8Array(raw),binary=BINARY_USER_FILE.test(file.name);
+      if(binary&&!bytes.length)throw {code:"USER_FILE_INPUT_INVALID"};
       let text;
-      try{text=new TextDecoder("utf-8",{fatal:true,ignoreBOM:true}).decode(raw)}
-      catch{throw {code:"USER_FILE_UTF8_INVALID"}}
-      const encoded=new TextEncoder().encode(text),bytes=new Uint8Array(raw);
-      if(text.includes("\0")||encoded.length!==bytes.length||!encoded.every((value,index)=>value===bytes[index]))
-        throw {code:"USER_FILE_UTF8_INVALID"};
-      decoded.push({name:file.name,text,utf8_bytes:bytes.length});
+      if(!binary){
+        try{text=new TextDecoder("utf-8",{fatal:true,ignoreBOM:true}).decode(raw)}
+        catch{throw {code:"USER_FILE_UTF8_INVALID"}}
+        if(text.includes("\0"))throw {code:"USER_FILE_UTF8_INVALID"};
+      }
+      if(!binary&&bytes.length<=8192){
+        const encoded=new TextEncoder().encode(text);
+        if(encoded.length!==bytes.length||!encoded.every((value,index)=>value===bytes[index]))
+          throw {code:"USER_FILE_UTF8_INVALID"};
+        const candidate={name:file.name,text,utf8_bytes:bytes.length},inline=decoded.filter(item=>!item.upload);
+        // Inline only while the inline files and the message so far fit the 8192-byte literal input with 1 KiB left
+        // to type (JSON escaping grows short-line CSVs); anything else goes up as a large file on a native turn.
+        if(!nativeProfile(state.composer?.state_profile)||bytes.length===0
+            ||literalInputBytes(el("instruction").value,[...inline,candidate])<=8192-1024){
+          decoded.push(candidate);continue;
+        }
+      }
+      // A text file's fatal UTF-8 decoding already proved it is text (a 10 MiB re-encode compare would only stall the
+      // page); a PDF or Office file goes as is and Hosted extracts its text. A text file over 8192 bytes or any PDF
+      // or Office file is stored with the Agent now; the send then carries name, digest, length and type only.
+      const digest=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",raw)),
+        value=>value.toString(16).padStart(2,"0")).join("");
+      if(!userFileLive(revision,scope))return;
+      userFileUploading=file.name;userFileRenderKey=null;renderComposer();
+      const response=await agentFetch(`/api/instructions/${encodeURIComponent(rid)}/file-upload`,{
+        method:"PUT",headers:{"Content-Type":"application/octet-stream","X-Console-CSRF":csrf,
+          "X-FA-File-Name":encodeURIComponent(file.name)},credentials:"same-origin",cache:"no-store",body:raw},agent);
+      const value=await response.json();
+      if(!userFileLive(revision,scope))return;
+      if(!response.ok)throw value.error||{code:"LOCAL_FAILURE"};
+      if(value?.name!==file.name||value.sha256!==digest||value.byte_length!==bytes.length
+          ||typeof value.media_type!=="string")throw {code:"USER_FILE_INPUT_INVALID"};
+      decoded.push({name:file.name,sha256:digest,byte_length:bytes.length,media_type:value.media_type,upload:true,
+        utf8_bytes:bytes.length});
     }
     if(invalidLiteralInput(el("instruction").value,decoded,selectedAttachments()))throw {code:"USER_FILE_INPUT_INVALID"};
     userFileDrafts.set(draft,decoded);
   }catch(error){
-    if(userFileLive(revision,scope))userFileError={code:error?.code||"USER_FILE_READ_FAILED"};
+    if(userFileLive(revision,scope))userFileError=error?.code?error:{code:"USER_FILE_READ_FAILED"};
   }finally{
-    if(userFileLive(revision,scope)){userFileReading=false;input.value="";renderComposer()}
+    if(userFileLive(revision,scope)){userFileReading=false;userFileUploading=null;input.value="";renderComposer()}
   }
 });
 el("user-images").addEventListener("change",async()=>{
@@ -8185,6 +8241,7 @@ el("user-images").addEventListener("change",async()=>{
   try{
     const images=[...selectedUserImages()];
     if(images.length+selected.length>4)throw {code:"USER_IMAGE_INPUT_INVALID"};
+    if(selected.some(file=>file.size>10*1024*1024))throw {code:"USER_IMAGE_TOO_LARGE"};
     const taken=new Set(images.map(item=>item.name));
     for(const file of selected){
       const converted=await pngForUpload(file);

@@ -21,6 +21,7 @@ from .behavior_attachments import TextAttachmentProfile, TextAttachments, valida
 from .behavior_turn_origin import InstructionTurnOrigin, TurnOriginProfile
 from .behavior_text_files import UserTextFileProfile, UserTextFiles, validate_user_files
 from .behavior_user_images import UserImages, validate_user_images
+from .behavior_user_uploads import UserUploads
 from .behavior_user_file_prompt import FILE_READ_PROFILES
 from .behavior_capabilities import CAPABILITY_BASE_PROFILES, CapabilityCapture, TurnGrants, skills_granted
 from .behavior_agent_role_prompt import RolePromptCapture, role_text_mismatch
@@ -49,13 +50,16 @@ class InstructionSubmit(Command):
     files: UserTextFiles = Field(default=(), exclude_if=lambda value: not value)
     # Native turns only (B1 PA-08); omitted when empty, so earlier commands keep their digest.
     images: UserImages = Field(default=(), exclude_if=lambda value: not value)
+    # Native turns only (ADR-0013): references to bytes already in the Agent's session; omitted when empty.
+    uploads: UserUploads = Field(default=(), exclude_if=lambda value: not value)
 
     _attachments = field_validator("attachments")(validate_attachments)
     _images = field_validator("images")(validate_user_images)
 
     @model_validator(mode="after")
     def original_file_input(self):
-        validate_user_files(self.content, self.files, reference_names=tuple(item.name for item in self.attachments))
+        validate_user_files(self.content, self.files, reference_names=tuple(
+            item.name for item in (*self.attachments, *self.uploads)))
         return self
 
     @field_validator("content")

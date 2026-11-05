@@ -749,3 +749,148 @@ def test_receiver_receipt_records_exactly_what_it_checked():
     assert (proof["grant_revocation_revision"], proof["policy_revision"]) == (0, 1)
     assert proof["receiver_checked_at"] == NOW.isoformat().replace("+00:00", "Z")
     assert proof["receiver_not_after"] == dispatch["not_after"]
+
+
+# The dispatcher's own gates, between arming and consuming, on the work-state path the server runs.
+OTHER_SUBJECT = [{"principal_id": "someone-else", "conversation_id": CONTEXT.conversation_id}]
+
+
+@pytest.mark.parametrize("kind,ids,updates,expected", [
+    ("grant", ("grant",), {"revoked": True, "revocation_revision": 1}, "OPERATION_GRANT_DENIED"),
+    ("grant", ("grant",), {"revoked": True}, "OPERATION_GRANT_DENIED"),
+    ("grant", ("grant",), {"revocation_revision": 1}, "OPERATION_GRANT_DENIED"),
+    ("grant", ("grant",), {"subjects": OTHER_SUBJECT}, "OPERATION_GRANT_DENIED"),
+    ("grant", ("grant",), {"expires_at": (NOW - timedelta(seconds=1)).isoformat()}, "OPERATION_GRANT_DENIED"),
+    ("policy", (CONTEXT.policy_id,), {"active": False}, "OPERATION_GRANT_DENIED"),
+    ("policy", (CONTEXT.policy_id,), {"revision": 2}, "OPERATION_GRANT_DENIED"),
+    ("budget", (CONTEXT.root_budget_id,), {"active": False}, "OPERATION_BUDGET_DENIED"),
+    ("attempt", ("op-a", "a"), {"reserved_units": 2}, "OPERATION_BUDGET_DENIED"),
+    ("owner", ("owner-one",), {"epoch": 2}, "OPERATION_OWNER_DENIED"),
+    ("owner", ("owner-one",), {"active": False}, "OPERATION_OWNER_DENIED"),
+])
+def test_consume_rechecks_current_owner_grant_policy_and_budget_before_the_receiver(kind, ids, updates, expected):
+    h = EffectHarness()
+    h.effects.authorize(h.command, CONTEXT)
+    h.effects.dispatcher._arm(h.command, CONTEXT)
+    before = h.work()
+    h.mutate(kind, *ids, **updates)
+    with pytest.raises(Problem) as error:
+        h.effects.dispatcher._consume(h.command, CONTEXT)
+    assert code(error) == expected
+    assert h.data("dispatch", "op-a", "a")["phase"] == "armed"
+    assert h.work() == before
+
+
+@pytest.mark.parametrize("kind,updates", [
+    ("dispatch", {"consume_request_id": DIGEST}),
+    ("dispatch-obligation", {"consume_request_id": DIGEST}),
+    ("dispatch-obligation", {"state": "resolved"}),
+])
+def test_consume_requires_the_dispatch_and_responsibility_it_armed(kind, updates):
+    h = EffectHarness()
+    h.effects.authorize(h.command, CONTEXT)
+    h.effects.dispatcher._arm(h.command, CONTEXT)
+    before = h.work()
+    h.mutate(kind, "op-a", "a", **updates)
+    with pytest.raises(Problem) as error:
+        h.effects.dispatcher._consume(h.command, CONTEXT)
+    assert code(error) == "OPERATION_DISPATCH_CONSUMED"
+    assert h.data("dispatch", "op-a", "a")["phase"] == "armed"
+    assert h.work() == before
+
+
+def test_consume_refuses_a_dispatch_that_is_no_longer_armed():
+    done = EffectHarness()
+    done.effects.authorize(done.command, CONTEXT)
+    done.effects.dispatcher._arm(done.command, CONTEXT)
+    done.effects.dispatcher._consume(done.command, CONTEXT)
+    consumed = done.data("dispatch", "op-a", "a")
+    assert consumed["phase"] == "consumed"
+    gate = {field: consumed[field] for field in ("phase", "gated_at", "not_after", "policy_revision", "grant_revocation_revision")}
+    h = EffectHarness()
+    h.effects.authorize(h.command, CONTEXT)
+    h.effects.dispatcher._arm(h.command, CONTEXT)
+    h.mutate("dispatch", "op-a", "a", **gate)
+    stored, before = h.data("dispatch", "op-a", "a"), h.work()
+    with pytest.raises(Problem) as error:
+        h.effects.dispatcher._consume(h.command, CONTEXT)
+    assert code(error) == "OPERATION_DISPATCH_CONSUMED"
+    assert h.data("dispatch", "op-a", "a") == stored and h.work() == before
+
+
+def test_a_window_that_closes_while_consume_commits_never_returns_permission_to_send():
+    h = EffectHarness()
+    h.effects.authorize(h.command, CONTEXT)
+    h.effects.dispatcher._arm(h.command, CONTEXT)
+    before = h.work()
+    native = h.client.submit_transaction
+
+    def late(*args, **kwargs):
+        result = native(*args, **kwargs)
+        h.time = NOW + timedelta(seconds=2)
+        return result
+
+    h.client.submit_transaction = late
+    with pytest.raises(Problem) as error:
+        h.effects.dispatcher._consume(h.command, CONTEXT)
+    assert code(error) == "OPERATION_DISPATCH_WINDOW_CLOSED"
+    assert h.data("dispatch", "op-a", "a")["phase"] == "consumed"
+    assert h.data("dispatch-obligation", "op-a", "a")["state"] == "pending_reconciliation"
+    assert h.work() == before
+
+
+def test_a_competing_consume_from_another_broker_wins_once_and_the_loser_gets_no_send():
+    h = EffectHarness()
+    h.effects.authorize(h.command, CONTEXT)
+    h.effects.dispatcher._arm(h.command, CONTEXT)
+    peer = h.peer()
+    winners = []
+    h.client.before_submit = lambda: winners.append(peer.dispatcher._consume(h.command, CONTEXT))
+    with pytest.raises(Problem) as error:
+        h.effects.dispatcher._consume(h.command, CONTEXT)
+    assert code(error) == "BEHAVIOR_CONFLICT"
+    assert len(winners) == 1
+    assert h.data("dispatch", "op-a", "a")["phase"] == "consumed"
+
+
+def test_a_revocation_between_consume_snapshot_and_commit_conflicts():
+    h = EffectHarness()
+    h.effects.authorize(h.command, CONTEXT)
+    h.effects.dispatcher._arm(h.command, CONTEXT)
+    before = h.work()
+    h.client.before_submit = lambda: h.mutate("grant", "grant", revoked=True, revocation_revision=1)
+    with pytest.raises(Problem) as error:
+        h.effects.dispatcher._consume(h.command, CONTEXT)
+    assert code(error) == "BEHAVIOR_CONFLICT"
+    assert h.data("dispatch", "op-a", "a")["phase"] == "armed"
+    assert h.data("dispatch-obligation", "op-a", "a")["state"] == "pending_reconciliation"
+    assert h.work() == before
+
+
+def test_a_replayed_arm_is_never_permission_to_send():
+    h = EffectHarness()
+    h.effects.authorize(h.command, CONTEXT)
+    h.effects.dispatcher._arm(h.command, CONTEXT)
+    armed, before = h.data("dispatch", "op-a", "a"), h.work()
+    with pytest.raises(Problem) as error:
+        h.execute()
+    assert code(error) == "OPERATION_DISPATCH_CONSUMED"
+    assert h.data("dispatch", "op-a", "a") == armed and h.work() == before
+
+
+@pytest.mark.parametrize("failure", ["before", "malformed"])
+def test_an_uncertain_consume_commit_never_sends_on_replay(failure):
+    h = EffectHarness()
+    h.effects.authorize(h.command, CONTEXT)
+    h.effects.dispatcher._arm(h.command, CONTEXT)
+    before = h.work()
+    h.client.failure = failure
+    with pytest.raises(Problem) as error:
+        h.effects.dispatcher._consume(h.command, CONTEXT)
+    assert code(error) == "BEHAVIOR_COMMIT_UNKNOWN"
+    h.client.failure = None
+    with pytest.raises(Problem) as replay:
+        h.execute()
+    assert code(replay) == "OPERATION_DISPATCH_CONSUMED"
+    assert h.data("dispatch-obligation", "op-a", "a")["state"] == "pending_reconciliation"
+    assert h.work() == before

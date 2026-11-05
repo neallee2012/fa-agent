@@ -288,16 +288,16 @@ def test_restart_reads_original_capture_and_completed_submit_never_restarts(nati
     before = len(case.remote.calls)
     retained, _ = gateway.submit(case.c.human, original.command)
     assert retained.capture == original.capture
-    # The second submit is the one v2-labelled resend a conflict gets (ADR-0009 3d-ii, a crashed v2 admission).
+    # No same-material resend after the conflict (ADR-0009 retired the v1 one in M1, the v2 one in 3d step 3).
     assert [command.operation for _, command in case.remote.calls[before:]
-            if command.operation != "session_read"] == ["submit", "submit", "read", "submit"]
+            if command.operation != "session_read"] == ["submit", "read", "submit"]
     assert case.remote.calls[-1][1].capture == original.capture
     case.remote.completed("native-rid")
     before = len(case.remote.calls)
     completed, _ = NativeTurnGateway(case.composition, enabled=True).submit(case.c.human, original.command)
     assert completed.status == "completed"
     assert [command.operation for _, command in case.remote.calls[before:]
-            if command.operation != "session_read"] == ["submit", "submit", "read"]
+            if command.operation != "session_read"] == ["submit", "read"]
     conflict = case.client.post(PREFIX + "/submit", headers=case.headers,
                                json={"request_id": "native-rid", "content": "Changed original"})
     assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "NATIVE_RID_CONFLICT"
@@ -671,6 +671,7 @@ def test_a_reconcile_of_an_accepted_responses_rid_is_neither_followed_nor_marked
     (502, "SOURCE_INTEGRITY_ERROR"), (503, "SOURCE_BLOB_UNAVAILABLE"), (422, "BEHAVIOR_UNSAFE_CONTENT"),
     (422, "CAPABILITY_MODEL_UNSUPPORTED"), (422, "INSTRUCTION_MODEL_UNAVAILABLE"), (503, "MODEL_CAPACITY_INVALID"),
     (503, "SKILL_CATALOG_CAPACITY_UNKNOWN"), (413, "SKILL_CATALOG_BUDGET_TOO_SMALL"), (422, "NATIVE_PROFILE_UNSUPPORTED"),
+    (422, "REASONING_MODEL_REQUIRES_RESPONSES"),
 ])
 def test_admission_refusals_keep_a_fixed_code_for_plain_language(native_api, monkeypatch, status, code):
     """P03: attachment, source, text-file and model refusals are not a 500 or a generic code."""
@@ -688,6 +689,28 @@ def test_admission_refusals_keep_a_fixed_code_for_plain_language(native_api, mon
     assert error.get("not_dispatched") is (True if status < 500 else None)
     assert error.get("request_id") == ("refused-input" if status < 500 else None)
     assert "refused-input" not in case.remote.records
+
+
+@pytest.mark.parametrize("supports", [True, False, None])
+def test_a_completions_conversation_refuses_a_reasoning_model_before_hosted(native_api, supports):
+    """Neal 2026-11-04: reasoning models run on Responses; the original completions selection is not rewritten."""
+    case = native_api
+    models = case.c.control.models
+    models.models[models.default] = models.models[models.default].model_copy(
+        update={"supports_reasoning_effort": supports})
+    response = submit(case)
+    if supports is True:
+        assert (response.status_code, response.json()["error"]["code"]) == (
+            422, "REASONING_MODEL_REQUIRES_RESPONSES"), response.text
+        assert "submit" not in [command.operation for _, command in case.remote.calls]
+    else:
+        assert response.status_code == 202, response.text
+
+
+def test_a_responses_conversation_keeps_its_reasoning_model():
+    from shared_context.behavior_instruction_models import InstructionModel
+    model = InstructionModel(id="gpt-5.4-mini", display_name="gpt-5.4-mini", supports_reasoning_effort=True)
+    assert model.require_provider("openai-responses") is None
 
 
 def test_attached_source_codes_are_not_widened_on_reads(native_api, monkeypatch):

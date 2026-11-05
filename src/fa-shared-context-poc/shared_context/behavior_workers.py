@@ -940,26 +940,6 @@ class WorkerCore:
             (self._write(key, evidence, material=_material(evidence.model_dump(mode="json"))),),
         )
 
-    def reconcile_inactive_cancellation(self, job_id: str, context: ExecutionContext) -> Record:
-        """Complete a legacy cancelled admission; never start, stop or re-run work."""
-        context = _check(context, ExecutionContext)
-        job_key, pool_key = worker_key("job", job_id), self.pool_key(job_id)
-        request = self._request("complete-inactive-cancel", (job_id,), context.model_dump(mode="json"),
-                                (job_key, pool_key, *self._owner_keys(context)))
-
-        def decide(rows):
-            self._owner(rows, context, policy=False)
-            job, pool = self._row(rows, job_key, JobRecord), self._pool(rows)
-            self._scope(job, context)
-            if job.state != "cancelled" or not job.cancel_requested or job.cancel_credit:
-                raise Problem(409, "WORKER_CANCELLATION_UNVERIFIED", "an accepted inactive cancellation is required")
-            job, pool, completion = self._inactive_cancellation(job, pool)
-            return ControlChanges(writes=(
-                self._write(job_key, job, rows), self._write(pool_key, pool, rows), *completion,
-            ), result=self._result(status="cancelled", completion_retained=True, executor_started=False))
-
-        return self.store.transact(request, decide)
-
     def stop(self, job_id: str, context: ExecutionContext) -> Record:
         if self.adapter is None:
             raise Problem(403, "WORKER_DISABLED", "executor stop adapter is missing")

@@ -32,6 +32,12 @@ class InstructionModel(WireModel):
         except ValueError:
             raise Problem(503, "MODEL_CAPACITY_INVALID", "selected server-declared model capacity is invalid or contradictory") from None
 
+    def require_provider(self, model_provider):
+        # Neal 2026-11-04: reasoning models run on Responses (Chat Completions rejects gpt-6.x tools with reasoning).
+        if self.supports_reasoning_effort is True and model_provider != "openai-responses":
+            raise Problem(422, "REASONING_MODEL_REQUIRES_RESPONSES",
+                          "a reasoning model needs this conversation's Responses provider")
+
     def public(self):
         # Only an explicit image fact adds the key, so the response for every other deployment stays unchanged.
         return {"id":self.id,"display_name":self.display_name,

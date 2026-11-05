@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTasks
 from starlette.concurrency import run_in_threadpool
 
-from .behavior_api import _body, _nonfinite, _principal_dependency, _response, _unique
+from .behavior_api import _body, _octets, _nonfinite, _principal_dependency, _response, _unique
 from .behavior_assistant_wire import InstructionSubmit
 from .behavior_foundry import FoundryHttpClient, MAX_NATIVE_TURN_HTTP_BYTES
 from .behavior_instruction import conversation_key
@@ -1372,6 +1372,25 @@ class NativeTurnGateway:
             raise Problem(502, "NATIVE_STATE_INVALID", "the stored image differs from the uploaded bytes")
         return value, response
 
+    def upload_file(self, principal, data, sha256):
+        """ADR-0013: the exact bytes, once, into the Agent's current session at the path their digest names. Only
+        identity, length and digest are checked here; Hosted checks the bytes before a turn uses them."""
+        from .behavior_session_files import SessionFiles
+        from .behavior_user_uploads import NativeUserUploadStored, upload_path
+        if not data or hashlib.sha256(data).hexdigest() != sha256:
+            raise Problem(422, "USER_FILE_INPUT_INVALID", "the body differs from its declared sha256")
+        _, client = self._context(principal, "submit")
+        try:
+            written = SessionFiles(client).put_new(client.target.session_id, upload_path(sha256), data)
+        except Problem as error:
+            if error.body["error"]["code"] != "NATIVE_FILES_UNKNOWN":
+                raise
+            written = -1
+        if written is not None and written != len(data):
+            # Unlike a follow step, an unconfirmed attachment write is safely repeated: same path, same bytes.
+            raise Problem(503, "USER_FILE_UPLOAD_UNKNOWN", "the upload is unconfirmed; sending the same file again is safe")
+        return NativeUserUploadStored(agent_id=client.target.agent_id, sha256=sha256, byte_length=len(data)), None
+
     def change(self, principal, command):
         try:
             command = NATIVE_REQUEST.validate_json(command.model_dump_json())
@@ -1630,6 +1649,12 @@ def install_native_turn_routes(app, composition, *, enabled):
     async def upload_image(request: Request, principal=Depends(identity)):
         command = await _body(request, NativeUserImageUpload, max_body_bytes=MAX_IMAGE_UPLOAD_BODY_BYTES)
         return await reply(lambda: gateway.upload_image(principal, command))
+
+    @app.put(PREFIX + "/files")
+    async def upload_file(request: Request, principal=Depends(identity)):
+        from .behavior_user_uploads import MAX_UPLOAD_BYTES, UPLOAD_SHA256_HEADER
+        data = await _octets(request, max_body_bytes=MAX_UPLOAD_BYTES)
+        return await reply(lambda: gateway.upload_file(principal, data, request.headers.get(UPLOAD_SHA256_HEADER, "")))
 
     @app.post(PREFIX + "/reconcile")
     async def reconcile(request: Request, principal=Depends(identity)):

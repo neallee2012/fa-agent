@@ -68,12 +68,13 @@ def test_a_queued_input_cannot_start_sdk_in_another_execution_version(harness):
 
 
 def test_invocations_expected_version_refusal_preserves_the_original_accepted_record(harness):
-    from shared_context.behavior_native_turn_wire import NATIVE_EXPECTED_VERSION_HEADER, NATIVE_TURN_HEADER, NativeRead
+    from shared_context.behavior_native_turn_wire import (
+        NATIVE_EXPECTED_VERSION_HEADER, NATIVE_STATE_PROFILE, NATIVE_TURN_HEADER, NativeRead)
     from test_native_turns import IDENTITY, accept_without_chain
 
     original = accept_without_chain(harness).value.receipt
     result = harness.client.post("/invocations", json=NativeRead(request_id=original.request_id).model_dump(mode="json"),
-        headers={NATIVE_TURN_HEADER: "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
+        headers={NATIVE_TURN_HEADER: NATIVE_STATE_PROFILE, "x-agent-session-id": IDENTITY.session_id,
                  NATIVE_EXPECTED_VERSION_HEADER: "2"})
     assert result.status_code == 409 and result.json()["error"]["code"] == "NATIVE_SESSION_CHANGED"
     assert harness.call(harness.runtime.read, original.request_id) == original and harness.sdk.calls == []

@@ -11,7 +11,8 @@ from azure.core.exceptions import ServiceResponseError
 
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_agent_wire import NativePeerRequest, NativeRelayAcceptance
-from shared_context.behavior_native_turn_wire import NativeConversationRead, NativeHistory, NativeRead, NativeSessionRead
+from shared_context.behavior_native_turn_wire import (
+    NATIVE_STATE_PROFILE, NativeConversationRead, NativeHistory, NativeRead, NativeSessionRead)
 from shared_context.errors import Problem
 from shared_context.native_agent_tools import NativeAgentRelayClient
 from shared_context.native_turns import NativeTurnRuntime
@@ -24,7 +25,7 @@ from test_native_turns import IDENTITY, Harness, OfflineSdk, local_env
 def invoke(client, identity, command):
     body = command.model_dump(mode="json") if hasattr(command, "model_dump") else command
     return client.post("/invocations", json=body, headers={
-        "x-client-fa-state-profile": "foundry-native-v2",
+        "x-client-fa-state-profile": NATIVE_STATE_PROFILE,
         "x-agent-session-id": identity.session_id,
         "x-agent-invocation-id": "offline-environment",
         "x-agent-foundry-call-id": "offline-original-caller",
@@ -221,7 +222,7 @@ def test_t5_refused_while_following_retries_same_input_after_ready_without_loss(
         async def relay(packet):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://offline") as hosted:
                 headers = {
-                    "x-client-fa-state-profile": "foundry-native-v2",
+                    "x-client-fa-state-profile": NATIVE_STATE_PROFILE,
                     "x-agent-session-id": identity.session_id, "x-agent-invocation-id": "offline-peer",
                     "x-agent-foundry-call-id": "offline-original-peer-caller",
                 }

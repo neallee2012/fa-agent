@@ -193,66 +193,23 @@ def _crashed_admission(case, monkeypatch):
     return admitting, digests
 
 
-def _as_3di_sent(capture):
-    """The same capture as a 3d-i API built it: its ``TemplateSettings`` default named the v2 pair (``SENT_RELEASE``)."""
-    settings = capture.template.settings.model_copy(update={"sdk_version": "1.0.13", "runtime_version": "1.0.83"})
-    return capture.model_copy(update={"template": capture.template.model_copy(update={"settings": settings})})
-
-
-def test_a_v2_admission_a_crashed_hosted_left_is_admitted_under_its_digest_on_resend(native_api, monkeypatch):
-    """The 3d-i API sent v2; Hosted marked ``admitting`` and crashed before ``rid:<RID>``. The 3d-ii API's same-RID
-    resend (v3, with the v3 pair) conflicts with that digest, so it resends the same material as a 3d-i API built it,
-    labelled v2, once: 202, receipt under the original digest, and the RID is admitted once."""
-    from shared_context import behavior_native_capture, behavior_native_responses_api as responses
-
-    case = native_api
-    admitting, digests = _crashed_admission(case, monkeypatch)
-    real_profile, real_pinned = responses.turn_profile, behavior_native_capture.start_pinned
-    monkeypatch.setattr(responses, "turn_profile", lambda capture, **kw: V2)  # the 3d-i API sent v2
-    monkeypatch.setattr(behavior_native_capture, "start_pinned", lambda *args: _as_3di_sent(real_pinned(*args)))
-    assert submit(case).status_code == 503
-    monkeypatch.setattr(responses, "turn_profile", real_profile)
-    monkeypatch.setattr(behavior_native_capture, "start_pinned", real_pinned)
-    again = submit(case)
-    assert again.status_code == 202, again.text
-    assert again.json()["submit_digest"] == admitting["native-rid"] and again.json()["state_profile"] == V2
-    assert len(digests) == 3 and digests[1] != digests[0] == digests[2]  # v2 (crash), v3 (409), v2 again
-
-
-@pytest.mark.parametrize("status, code", [(503, "NATIVE_STATE_STORE_UNKNOWN"), (504, "NATIVE_UPSTREAM_TIMEOUT")])
-def test_an_unknown_answer_to_the_v2_resend_is_not_reported_as_a_conflict(monkeypatch, status, code):
-    """AGENTS rule 7: only a second NATIVE_RID_CONFLICT says "not accepted"; a 503 or timeout stays retryable."""
-    from shared_context.errors import Problem
-
-    answers = [Problem(409, "NATIVE_RID_CONFLICT", "v3 digest"), Problem(status, code, "unknown")]
-
-    def invoke(client, request):
-        raise answers.pop(0)
-
-    monkeypatch.setattr(NativeTurnGateway, "_invoke", staticmethod(invoke))
-    client = SimpleNamespace(target=SimpleNamespace(agent_id=AGENT))
-    with pytest.raises(Problem) as raised:
-        submit_native_turn(SimpleNamespace(runtime=None), client,
-                           InstructionSubmit(request_id="native-rid", content="Original text"), capture())
-    assert (raised.value.status, raised.value.body["error"]["code"]) == (status, code) and answers == []
-
-
-def test_a_v1_admission_a_crashed_hosted_left_stays_a_conflict_on_resend(native_api, monkeypatch):
-    """The API before 2d-ii sent v1; Hosted marked ``admitting`` and crashed before ``rid:<RID>``. The same-RID
-    resend (v3) and its one v2 resend both conflict with that digest. ADR-0009 M1 retired the v1 alias and its v1
-    resend, so the first 409 stands."""
+@pytest.mark.parametrize("sent", [V1, V2])
+def test_an_older_admission_a_crashed_hosted_left_stays_a_conflict_on_resend(native_api, monkeypatch, sent):
+    """An older API sent v1 (before 2d-ii) or v2 (3d-i); Hosted marked ``admitting`` and crashed before
+    ``rid:<RID>``. The same-RID resend (v3) conflicts with that digest. ADR-0009 retired the one-time resend with the
+    v1 alias (M1) and the v2 one with the v2 header alias (3d step 3), so the 409 stands and nothing else is sent."""
     from shared_context import behavior_native_responses_api as responses
 
     case = native_api
     admitting, digests = _crashed_admission(case, monkeypatch)
     real = responses.turn_profile
-    monkeypatch.setattr(responses, "turn_profile", lambda capture, **kw: V1)  # the release-33 API sent v1
+    monkeypatch.setattr(responses, "turn_profile", lambda capture, **kw: sent)
     assert submit(case).status_code == 503
     monkeypatch.setattr(responses, "turn_profile", real)
     again = submit(case)
     assert again.status_code == 409, again.text
     assert again.json()["error"]["code"] == "NATIVE_RID_CONFLICT"
-    assert len(digests) == 3 and len(set(digests)) == 3 and digests[0] == admitting["native-rid"]  # v1, v3, v2
+    assert len(digests) == 2 and digests[1] != digests[0] == admitting["native-rid"]  # the older send (crash), v3 (409)
 
 
 def test_a_resend_with_different_material_still_conflicts_and_is_tried_once(native_api, monkeypatch):
@@ -262,4 +219,4 @@ def test_a_resend_with_different_material_still_conflicts_and_is_tried_once(nati
     from test_native_turn_api import PREFIX
     body = InstructionSubmit(request_id="native-rid", content="Other user text").model_dump(mode="json")
     changed = case.client.post(PREFIX + "/submit", json=body, headers=case.headers)
-    assert changed.status_code == 409 and len(digests) == 3  # the v3 resend and one v2 resend, both refused
+    assert changed.status_code == 409 and len(digests) == 2  # the v3 resend only, refused

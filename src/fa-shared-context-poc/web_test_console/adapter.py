@@ -636,7 +636,8 @@ class PullAdapter:
             return "POST", root+"/delivery/pull", wire.Command(request_id=task.fetch_request_id).model_dump(mode="json")
         raise ConsoleError("ACTION_NOT_ALLOWED", 403)
 
-    def send(self, method, path, body, token, *, limit=131072, params=None, if_match=None):
+    def send(self, method, path, body, token, *, limit=131072, params=None, if_match=None, raw=None, raw_headers=None):
+        """``raw`` (bytes) replaces the JSON ``body`` with an octet-stream upload plus ``raw_headers`` (ADR-0013)."""
         url = self.config.backend_origin+self.api_prefix+path
         _check_origin(url, self.config.backend_origin, path)
         _check_if_match(method, path, if_match)
@@ -644,10 +645,13 @@ class PullAdapter:
             _check_params(method, path, body, params)
         delegation_read = _is_delegation_read(method, path, body)
         retry_hint = False
+        headers = _request_headers(token, if_match)
+        if raw is not None:
+            headers = {**headers, "Content-Type": "application/octet-stream", **(raw_headers or {})}
         try:
             start = time.monotonic()
-            with self.client.stream(method, url, params=params, content=None if body is None else canonical(body),
-                                    headers=_request_headers(token, if_match), follow_redirects=False) as response:
+            with self.client.stream(method, url, params=params, content=raw if raw is not None else None if body is None else canonical(body),
+                                    headers=headers, follow_redirects=False) as response:
                 data = _read_limited(response, token, limit, start)
                 status = response.status_code
                 if status == 204 and delegation_read:

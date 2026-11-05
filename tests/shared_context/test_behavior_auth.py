@@ -8,9 +8,8 @@ from shared_context.behavior_auth import (
     AGENT_ROLE, APPROVAL_SCOPE, BACKUP_SCOPE, READ_SCOPE, RESTORE_SCOPE, BehaviorAuthSettings, BehaviorJwtVerifier,
 )
 from shared_context.errors import Problem
-from shared_context.m3_auth import HumanApprover, M3JwtVerifier
 from test_m3_auth import (
-    CLIENT_ID, HUMAN_OID, UNKNOWN_OID, approval, jwk_client, request, signing_key, token,
+    CLIENT_ID, HUMAN_OID, UNKNOWN_OID, jwk_client, request, signing_key, token,
 )
 
 
@@ -50,9 +49,8 @@ def test_read_consent_does_not_grant_approval(verifier, signing_key):
         principal.require("team-one", "approve")
 
 
-def test_m3_consent_is_not_silently_broadened(auth, approval, jwk_client, verifier, signing_key):
+def test_m3_consent_is_not_silently_broadened(verifier, signing_key):
     value = request(token(signing_key))
-    assert M3JwtVerifier(auth, approval, jwk_client)(value) == HumanApprover(HUMAN_OID, "team-one")
     with pytest.raises(Problem) as denied:
         verifier(value)
     assert denied.value.body["error"]["code"] == "BEHAVIOR_HUMAN_NOT_ALLOWED"

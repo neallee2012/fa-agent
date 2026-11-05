@@ -25,7 +25,7 @@ NATIVE_RESPONSES_PROFILE = "foundry-responses-v1"
 # same-RID replay and its stored template come before this check (``behavior_profile_selection``).
 SENT_STATE_PROFILES = frozenset({UNLABELED_STATE_PROFILE, NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE})
 # What a Hosted runtime or the API may declare (FA_NATIVE_TURNS): v3 only from ADR-0009 3d-ii. Hosted still admits
-# the v2 header (``native_turns.HEADER_ALIAS_PROFILES``) and stored v1/v2 bodies; unlabeled items read as v1.
+# stored v1/v2 bodies (``native_turns.STORED_BODY_PROFILES``); unlabeled items read as v1.
 ACCEPTED_STATE_PROFILES = frozenset({NATIVE_V3_PROFILE})
 NativeStateProfile = Literal["foundry-native-v1", "foundry-responses-v1", "foundry-native-v2", "foundry-native-v3"]
 

@@ -82,6 +82,23 @@ def _cache_windows_local_state_reads():
     LocalStateStoreBackend._read, LocalStateStoreBackend._write = read, write
 
 
+def require_cold_resume_paths(root):
+    """The offline SDK cold-resume checkpoint nests about 200 characters below the test root; the local State store's
+    temporary files about 130 (measured on runtime 1.0.103)."""
+    import os
+    if os.name != "nt" or len(str(root)) + 200 < 260:
+        return
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\FileSystem") as key:
+            if winreg.QueryValueEx(key, "LongPathsEnabled")[0] == 1:
+                return
+    except OSError:
+        pass
+    pytest.skip("needs Windows LongPathsEnabled=1 or a short test root (--basetemp or N1_NATIVE_WORKSPACE, e.g. "
+                "under C:\\t): the SDK checkpoint and State store paths below it exceed MAX_PATH 260")
+
+
 if os.name == "nt":
     _retry_windows_local_state_replace()
     _cache_windows_local_state_reads()

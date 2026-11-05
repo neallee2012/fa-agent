@@ -17,7 +17,7 @@ from shared_context import behavior_native_sessions, behavior_native_turn_api, n
 from shared_context.behavior_foundry import FoundryHttpClient
 from shared_context.behavior_native_sessions import NativeSessions, native_sessions
 from shared_context.behavior_native_turn_api import agent_client
-from shared_context.behavior_native_turn_wire import NativeEnvironmentView, NativeSessionRead
+from shared_context.behavior_native_turn_wire import NativeEnvironmentView, NativeSessionCut, NativeSessionRead
 from shared_context.native_binding import NativeBindingStore
 from shared_context.native_turns import TURNS_STORE
 from test_native_abandon_source import binding_rows
@@ -212,6 +212,109 @@ def test_busy_waits_for_the_next_turn_end_with_no_calls_meanwhile(file_api, monk
     finished(driver, agent_id)
     assert "NATIVE_UPGRADE_CUT_API outcome=ready" in caplog.text
     assert abandon.row(fixture).hosted_session_id == fixture.destination.session_id
+
+
+def one_page_per_call(monkeypatch):
+    """Each Hosted call's scan deadline passes after one receipt page of one key: a store with more receipts than one
+    call's ``_SCAN_SECONDS`` reads (dev fa-context-a, 2026-11-04: 120-131 receipts per call, never finishing). The
+    returned switches: ``stall`` makes the next call read no page at all, ``off`` ends the throttle."""
+    from shared_context import native_environment
+
+    drain, scan_page, pages = native_environment._drain_pages, native_environment._scan_page, []
+    switches = {"stall": False, "off": False}
+
+    async def drained(*args, **kwargs):
+        pages[:] = [1] if switches["stall"] else []
+        switches["stall"] = False
+        return await drain(*args, **kwargs)
+
+    async def one_page(*args, **kwargs):
+        if switches["off"]:
+            return await scan_page(*args, **kwargs)
+        if pages:
+            raise TimeoutError  # this call's scan deadline
+        pages.append(1)
+        return await scan_page(*args, **{**kwargs, "page_limit": 1})
+
+    monkeypatch.setattr(native_environment, "_drain_pages", drained)
+    monkeypatch.setattr(native_environment, "_scan_page", one_page)
+    return switches
+
+
+def cut_lines(caplog):
+    return [record.getMessage() for record in caplog.records if record.getMessage().startswith("NATIVE_UPGRADE_CUT ")]
+
+
+def test_a_scan_longer_than_one_call_goes_on_within_the_same_attempt(file_api, monkeypatch, caplog):
+    fixture = ready(file_api, monkeypatch, files=False)
+    one_page_per_call(monkeypatch)
+    caplog.set_level(logging.WARNING)
+    start = len(fixture.controls)
+    assert cut(fixture) == ("ready", None, None)
+    assert abandon.row(fixture).hosted_session_id == fixture.destination.session_id
+    assert operations(fixture, start).count(("session_cut", "probe")) > 1
+    lines = cut_lines(caplog)
+    assert "outcome=scanning" in lines[0] and "scan=full" in lines[0] and "calls=1 " in lines[0]
+    assert "outcome=ready" in lines[-1] and "calls=1 " not in lines[-1]
+
+
+@pytest.mark.parametrize("files", [True, False])
+def test_a_cut_that_needs_another_call_goes_on(file_api, monkeypatch, files):
+    """The cut goes on from the last scanning probe's record, so it may read past its own deadline too: resent, under
+    the files fence or the cut's bound."""
+    fixture = ready(file_api, monkeypatch, files=files)
+    throttle = one_page_per_call(monkeypatch)
+    sent, cuts = behavior_native_turn_api.NativeTurnGateway._invoke, []
+
+    def stalled_cut(client, command, timeout=None):
+        cutting = isinstance(command, NativeSessionCut) and command.mode == "cut"
+        if cutting and not cuts:
+            throttle["stall"] = True  # the cut's first call reads nothing within its deadline
+        value = sent(client, command, timeout=timeout)
+        if cutting:
+            cuts.append(value[0].state)
+            throttle["off"] = value[0].state != "current"  # the follow steps after the fence read as usual
+        return value
+
+    with monkeypatch.context() as patch:
+        patch.setattr(behavior_native_turn_api.NativeTurnGateway, "_invoke", staticmethod(stalled_cut))
+        outcome, reason, fence = cut(fixture)
+    assert (outcome, reason, fence is not None) == ("ready", None, files)
+    assert cuts == ["current", "pending" if files else "ready"]
+    assert abandon.row(fixture).hosted_session_id == fixture.destination.session_id
+    if files:
+        assert (fixture.target_workspace.root / "nested" / "draft.txt").read_bytes() == b"uncommitted original\n"
+
+
+def test_a_scan_stops_at_a_busy_answer_or_when_no_call_fits_in_the_bound(file_api, monkeypatch):
+    fixture = ready(file_api, monkeypatch, files=False)
+    one_page_per_call(monkeypatch)
+    sent = behavior_native_turn_api.NativeTurnGateway._invoke
+
+    def admitted_after_the_first_probe(client, command, timeout=None, *, cleared):
+        value = sent(client, command, timeout=timeout)
+        if getattr(command, "mode", None) == "probe":
+            set_admitting(fixture, "late-rid")
+            if cleared:
+                set_admitting(fixture, None)  # admitted meanwhile: the ETag moved, nothing is admitting now
+        return value
+
+    for cleared in (False, True):
+        with monkeypatch.context() as patch:
+            patch.setattr(behavior_native_turn_api.NativeTurnGateway, "_invoke", staticmethod(
+                lambda client, command, timeout=None: admitted_after_the_first_probe(
+                    client, command, timeout, cleared=cleared)))
+            start = len(fixture.controls)
+            # Never a new scan from the start while the user's turn runs: busy until the next turn end.
+            assert cut(fixture) == ("busy", "admission_pending", None)
+            assert operations(fixture, start).count(("session_cut", "probe")) == 2
+        set_admitting(fixture, None)
+    # Under one call's worth of the bound left after a ``scan_pending``: busy until the next turn end.
+    monkeypatch.setattr(behavior_native_sessions, "CUT_DESTINATION_SECONDS", behavior_native_sessions._CALL_SECONDS - 1)
+    start = len(fixture.controls)
+    assert cut(fixture) == ("busy", "scan_pending", None)
+    assert operations(fixture, start).count(("session_cut", "probe")) == 1
+    assert abandon.row(fixture).hosted_session_id == fixture.source.session_id
 
 
 def test_a_turn_admitted_after_the_probe_makes_the_cut_busy_and_its_files_still_move(file_api, monkeypatch):
@@ -1160,8 +1263,6 @@ def test_a_files_commit_after_a_failed_no_files_attempt_records_the_moved_files(
 
 
 def test_two_replicas_cut_the_same_rid_and_only_one_drives(file_api, monkeypatch):
-    from shared_context.behavior_native_turn_wire import NativeSessionCut
-
     fixture = ready(file_api, monkeypatch)
 
     def crash(*_args, **_kwargs):

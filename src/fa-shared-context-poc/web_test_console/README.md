@@ -2153,7 +2153,8 @@ Standards於`d2675692`為0 P1／0 P2；原Spec複核`d2675692→ba242609`關閉�
 這個旗標來自 API `/work-policy/v1/models`：只有模型事實宣告 `supports_image_input` 時才多帶 `supports_image_input: true`，
 其他部署的回應不變。
 - **本機轉檔**：png／jpg／webp 先在瀏覽器裡轉成 PNG，長邊縮到最多 2000 px；超過 512 KiB 時再逐步縮小，直到放得下。
-  一回合最多 4 張，檔名換成 `.png`，必要時加數字避免重名。轉檔失敗或超過上限時，這批不加入，也不送出任何東西。
+  這次選的原圖只要有一張超過 10 MiB，整批在解碼前就拒絕（`USER_IMAGE_TOO_LARGE`，ADR-0013 第 7 節）；原圖本身從不上傳。
+  一回合最多 4 張，檔名換成 `.png`，必要時加數字避免重名。超過 4 張時整批不加入；某張轉檔或上傳失敗時，那張和之後選的不加入，前面已上傳的照留；都不會自動送出。
 - **先上傳**：每張圖用 `POST /api/instructions/{rid}/image-upload`（`{name, png_base64}`，本機 body 上限 = 一張圖的 base64 加 4 KiB）
   經 API 的 `/work-policy/v1/native-turns/images` 存到這位助理那邊。這個存放以內容雜湊為 key，重傳同一張圖不會多一份，
   回應不明時可以直接重傳。bridge 會核對助理回報的雜湊和長度等於本機那份 PNG。
@@ -2163,6 +2164,25 @@ Standards於`d2675692`為0 P1／0 P2；原Spec複核`d2675692→ba242609`關閉�
   `/work-policy/v1/responses-turns/submit`，同樣只帶 `images` 參照。
 - **不支援的路徑會明確拒絕**：舊的 job-bound 路徑會在本機回 409 `USER_IMAGES_UNSUPPORTED`，不上傳也不送出；
   模型不讀圖時按鈕停用。助理端的其他拒絕（沒上傳、空間不足、模型不支援）照原錯誤碼顯示，原草稿保留。
+
+## 文字檔上傳到 10 MB（ADR-0013 第一片）
+
+「選取文字檔、PDF 或 Office 檔」的 txt／md／csv／json 現在每份可到 10 MB（10 MiB）。8192 bytes 以內的文字檔照舊：全文放進訊息的 `files`。
+PDF（第三片）和 docx／xlsx／pptx（第四片）不論大小都走下面的上傳：瀏覽器不做 UTF-8 檢查、不放進訊息，只在原生對話開放（其他路徑回 `USER_UPLOADS_UNSUPPORTED`）；
+bridge 也不對這些檔案做 UTF-8 檢查。舊版 doc／xls／ppt 回 `USER_FILE_TYPE_UNSUPPORTED`。助理讀的是 Hosted 抽出的文字。
+更大的檔案在選取當下就上傳，不必等送出：
+- **瀏覽器**：照 `files` 同一套規則檢查（UTF-8、檔名、合計最多 4 份且不重名），算 `crypto.subtle` SHA-256，再用
+  `PUT /api/instructions/{rid}/file-upload` 送原始 bytes（`Content-Type: application/octet-stream`；檔名放 `X-FA-File-Name`，百分比編碼）。
+  這是唯一收非 JSON body 的寫入路由，仍要 Origin、頁面 cookie 與 `X-Console-CSRF`；本機 body 上限 10 MiB，超過回 413 `USER_FILE_TOO_LARGE`。
+  上傳期間畫面顯示「上傳中」並擋住送出；完成後以名稱、大小列在清單，可逐一移除（只影響草稿）。
+- **bridge**：只轉送，不拆內容。核對副檔名（`USER_FILE_TYPE_UNSUPPORTED`）、UTF-8 與檔名（`USER_FILE_INPUT_INVALID`），
+  經 API 的 `PUT /work-policy/v1/native-turns/files` 存進助理自己的 session，並核對回報的 `sha256`／`byte_length` 等於本機那份。
+  重傳同一份是安全的（路徑只由 sha256 組成）。
+- **送出只帶參照**：body 多一個 `uploads`（name、sha256、byte_length、media_type），與 `files`、來源附件合計最多 4 份。
+  非原生（job-bound）路徑在本機回 409 `USER_UPLOADS_UNSUPPORTED`，不上傳也不送出。換對話再追問時草稿的參照一併帶到下一則。
+- **錯誤文案**依 ADR-0013 第 9 節：`USER_FILE_TOO_LARGE`、`USER_FILE_TYPE_UNSUPPORTED`、`USER_FILE_UPLOAD_UNKNOWN`（可重傳同一份）、
+  `NATIVE_FILE_MISSING`（移除後重新附加）、`USER_TEXT_FILES_DISABLED`、`NATIVE_FILES_ACCESS_DENIED`。
+  已上傳的參照只在本頁記憶體；重新整理後要重新選檔。
 
 ## 需要處理：助理在問你（B1 PA-11，預設關閉）
 

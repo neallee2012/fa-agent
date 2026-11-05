@@ -27,6 +27,7 @@ from .behavior_skill_draft import SKILL_DRAFT_ERRORS
 from .assistant_image_wire import IMAGE_DELIVERY_ERRORS
 from .native_image_wire import NativeImageRead, NativeImagesRead
 from .behavior_user_images import NativeUserImageUpload, USER_IMAGE_ERRORS
+from .behavior_user_uploads import USER_UPLOAD_ERRORS
 from .native_responses_wire import (
     NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, UNLABELED_STATE_PROFILE, NativeResponseDispatch, NativeResponseId,
     NativeStateProfile, channel, check_response_state, unlabeled_profile,
@@ -92,7 +93,7 @@ def require_expected_version(expected: str | None, actual: str) -> None:
         raise Problem(409, "NATIVE_SESSION_CHANGED", "the actual Hosted version differs; no operation was dispatched")
 
 
-NATIVE_TURN_ERRORS = SKILL_DRAFT_ERRORS | IMAGE_DELIVERY_ERRORS | USER_IMAGE_ERRORS | FILES_ERRORS | CONTINUATION_ERRORS | NATIVE_ROUTINE_ERRORS | frozenset({
+NATIVE_TURN_ERRORS = SKILL_DRAFT_ERRORS | IMAGE_DELIVERY_ERRORS | USER_IMAGE_ERRORS | USER_UPLOAD_ERRORS | FILES_ERRORS | CONTINUATION_ERRORS | NATIVE_ROUTINE_ERRORS | frozenset({
     "NATIVE_TURNS_DISABLED", "NATIVE_ROUTINES_DISABLED", "NATIVE_REQUEST_INVALID", "NATIVE_REQUEST_TOO_LARGE",
     "NATIVE_STATE_STORE_MISSING", "NATIVE_STATE_STORE_TTL", "NATIVE_STATE_STORE_UNKNOWN",
     "NATIVE_STATE_SCOPE", "NATIVE_STATE_INVALID", "NATIVE_RID_MISSING",
@@ -244,7 +245,7 @@ def _check_input_capture(command, capture):
     entries = () if capture.attached_text is None else capture.attached_text.entries
     if tuple(e.attachment for e in entries) != command.attachments:
         raise ValueError("The captured text must cover all and only the original attachments")
-    if command.files and capture.template.settings.user_text_file_profile is None:
+    if (command.files or getattr(command, "uploads", ())) and capture.template.settings.user_text_file_profile is None:
         raise ValueError("Literal files require the original server-selected file profile")
 
 

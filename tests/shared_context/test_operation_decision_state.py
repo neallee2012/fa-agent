@@ -74,7 +74,7 @@ def test_snapshot_keeps_real_decision_and_allowance_states_separate(rejection_ca
             c.h.time += timedelta(seconds=3)
         elif state == "applied":
             assert c.turn.client.operation().effect_state == "applied"
-            assert c.effects == ["credential", "transport"]
+            assert c.effects == ["transport"] and c.effects.changed
     before, guard, effects = protected_rows(c.turn), c.h.store._guard(), list(c.effects)
     result = observe(c)
     assert result.status_code == 200

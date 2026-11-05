@@ -260,6 +260,10 @@ class AssistantModelBoundary:
                 return f"File not found [{code}]{_manifest_aliases(detail)}. {guidance}"
             if guidance is not None and (name, code) == ("read_user_file", "USER_FILE_NOT_FOUND"):
                 return f"File not found [{code}]. {guidance}"
+            if guidance is not None and (name, code) == ("read_user_file", "USER_FILE_OFFSET"):
+                return f"Invalid arguments [{code}]. {guidance}"
+            if guidance is not None and name == "read_user_file" and code in {"USER_FILE_GONE", "USER_FILE_NO_TEXT"}:
+                return f"File unreadable [{code}]. {guidance}"
             return None if guidance is None else (
                 f"Authority refused the action [{code}]. {guidance} Do not claim completion or resend unknown effects.")
         if not (self.text_reply and self.user_turn_access

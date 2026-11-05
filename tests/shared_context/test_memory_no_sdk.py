@@ -247,7 +247,7 @@ def native_memory_no_start(assistant, tmp_path, request, monkeypatch):
             invocation=invocation, starts=starts, api=api, provider_hooks=provider_hooks, provider_requests=provider_requests)
     finally:
         if supervisor is not None:
-            supervisor.join(timeout=5)
+            supervisor.join()
         if api is not None:
             api.close()
         first.client.close()
@@ -296,7 +296,7 @@ def close_memory_entry(c, monkeypatch, *, change="withdrawn", join=True):
     monkeypatch.setattr(m2_copilot, "CopilotClient", forbidden)
     c.h.workers.start(c.binding.job_id, c.binding.owner)
     if join:
-        c.supervisor.join(timeout=5)
+        c.supervisor.join()
     return c.supervisor.observe(c.starts[0].launch_id), constructors
 
 
@@ -537,7 +537,7 @@ def test_memory_refusal_after_sdk_entry_attempt_is_not_no_sdk_even_without_pid(n
         return SimpleNamespace(start=start, stop=no_process_cleanup, force_stop=no_process_cleanup, _cli_process=None)
     monkeypatch.setattr(m2_copilot, "CopilotClient", construct)
     c.h.workers.start(c.binding.job_id, c.binding.owner)
-    c.supervisor.join(timeout=5)
+    c.supervisor.join()
     observed = c.supervisor.observe(c.starts[0].launch_id)
     assert observed.phase == "spawn_unknown" and observed.sdk_no_start is None and observed.sdk_stop is None
     assert observed.child_pid is None and c.provider_requests == []
@@ -569,12 +569,12 @@ def test_closed_memory_gate_still_requires_its_original_thread_to_join(native_me
         observed = c.supervisor.observe(c.starts[0].launch_id)
         assert observed.phase == "spawn_unknown" and observed.sdk_no_start is None
         release.set()
-        c.supervisor.join(timeout=5)
+        c.supervisor.join()
         observed = c.supervisor.observe(c.starts[0].launch_id)
         assert observed.phase == "sdk_not_started" and observed.sdk_no_start.owned_thread_completed is True
     finally:
         release.set()
-        c.supervisor.join(timeout=5)
+        c.supervisor.join()
 
 
 @pytest.mark.parametrize("transition", ["reserve", "close", "observer"])
@@ -649,7 +649,7 @@ def test_unacknowledged_original_claim_or_acquire_does_not_authorize_memory_clos
         assert start.value.body["error"]["code"] == "WORKER_START_UNKNOWN"
     else:
         c.h.workers.start(c.binding.job_id, c.binding.owner)
-    c.supervisor.join(timeout=5)
+    c.supervisor.join()
     if lost_at == "assistant-claim":
         with pytest.raises(Problem) as observation:
             c.supervisor.observe(c.starts[0].launch_id)
@@ -699,7 +699,7 @@ def test_missing_or_unknown_memory_evidence_does_not_become_a_definite_no_sdk_re
     monkeypatch.setattr(hosted.AssistantClient, "acquire", after_ack)
     monkeypatch.setattr(m2_copilot, "CopilotClient", forbidden)
     c.h.workers.start(c.binding.job_id, c.binding.owner)
-    c.supervisor.join(timeout=5)
+    c.supervisor.join()
     observed = c.supervisor.observe(c.starts[0].launch_id)
     assert observed.phase == "spawn_unknown" and observed.sdk_no_start is None
     with c.supervisor.journal.connect() as db:
@@ -739,7 +739,7 @@ def test_closed_memory_gate_cannot_erase_reserved_or_consumed_model_intent(nativ
         return catalog(client)
     monkeypatch.setattr(hosted.AssistantClient, "work_memory_catalog", reserved_then_revoked)
     c.h.workers.start(c.binding.job_id, c.binding.owner)
-    c.supervisor.join(timeout=5)
+    c.supervisor.join()
     observed = c.supervisor.observe(c.starts[0].launch_id)
     assert observed.phase == "sdk_not_started"
     sid = observed.sdk_no_start.gate.binding.session_id

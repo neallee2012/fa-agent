@@ -159,7 +159,7 @@ def test_hosted_restore_read_and_signed_result_continue_after_job_observation(na
     c.h.endpoint.unbounded = True
     c.supervisor.model_transport = c.h.endpoint.transport
     c.h.workers.start(c.binding.job_id, c.binding.owner)
-    c.supervisor.join(timeout=10)
+    c.supervisor.join()
     state = c.supervisor.observe(c.starts[0].launch_id)
     assert state.phase == "sealed" and state.sdk_no_start is None and state.outcome == "succeeded"
     assert len(observations) == len(calls) == len(reads) == 1 and not failures

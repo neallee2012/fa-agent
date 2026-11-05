@@ -279,25 +279,7 @@ def test_start_winning_cancel_race_cannot_create_an_inactive_completion():
         h.workers.cancel("racing", CONTEXT)
     assert code(conflict) == "BEHAVIOR_CONFLICT"
     h.workers.cancel("racing", CONTEXT)
-    with pytest.raises(Problem) as denied:
-        h.workers.reconcile_inactive_cancellation("racing", CONTEXT)
-    assert code(denied) == "WORKER_CANCELLATION_UNVERIFIED"
     assert h.workers.completions() == () and len(h.occupied()) == 1
-
-
-def test_legacy_inactive_cancel_reconciles_existing_reservation_without_execution():
-    h = WorkerHarness()
-    ob, command, _ = h.admit()
-    h.workers.enqueue(JobSpec(job_id="legacy", work_id=command.work.work_id, input=b"saved",
-                             obligation_id=ob), CONTEXT)
-    h.mutate("worker-job", "legacy", state="cancelled", cancel_requested=True, cancel_credit=0)
-    h.mutate("worker-pool", h.worker_contract.workspace_id, pending=[])
-    receipt = h.workers.reconcile_inactive_cancellation("legacy", CONTEXT)
-    assert h.workers.reconcile_inactive_cancellation("legacy", CONTEXT) == receipt
-    delivery = h.broker(h.store, replace(h.registration, verify_work_result=h.workers.verify_work_result))
-    h.workers.forward_result("legacy", CONTEXT, delivery)
-    assert h.data("delivery-work-state", ob)["state"] == "cancelled"
-    assert h.workers.completions() == () and h.executor.starts == []
 
 
 def test_saved_stop_without_business_result_can_forward_explicit_cancellation_only():

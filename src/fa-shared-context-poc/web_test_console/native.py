@@ -1,6 +1,7 @@
 """Native conversation client. Local records pin routing and requests, never execution authority."""
 
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from shared_context.behavior_assistant_wire import InstructionSubmit
@@ -12,6 +13,9 @@ from shared_context.behavior_native_turn_wire import (
 )
 from shared_context.behavior_text_files import file_reference
 from shared_context.behavior_user_images import NativeUserImageStored, NativeUserImageUpload, UserImage, canonical_png
+from shared_context.behavior_user_uploads import (
+    MAX_UPLOAD_BYTES, MEDIA_TYPES, TEXT_MEDIA_TYPES, UPLOAD_SHA256_HEADER, NativeUserUploadStored, UserUpload,
+)
 from shared_context.behavior_attachment_catalog import AttachmentSourceCatalog
 from shared_context.native_skill_draft_wire import NativeSkillDraftView
 from shared_context.behavior_system_prompt_view import TurnSystemPrompt, check_turn_view
@@ -73,7 +77,7 @@ MESSAGES.update({
     "NATIVE_FILES_CONFLICT": "原檔案與保存清單不同；不覆寫目的檔案，也不重傳。",
     "NATIVE_FILES_UNKNOWN": "傳送結果尚未確認；保留原請求，不會自動重送。",
     "NATIVE_FILES_UNAVAILABLE": "原工作檔尚無法完整讀取；不當成空目錄，草稿保留。",
-    "NATIVE_FILES_ACCESS_DENIED": "目前身分無法存取原工作檔；不增加權限或改走其他儲存。",
+    "NATIVE_FILES_ACCESS_DENIED": "平台拒絕存取檔案（上傳附件或搬移工作檔）。請稍後再試；若持續發生，請聯絡管理員。",
     "NATIVE_FILES_CONFIRMATION_UNSUPPORTED": "傳送結果尚未確認；保留原請求，不會自動重送。",
     "NATIVE_FILES_CONFIRMATION_REQUIRED": "傳送結果尚未確認；保留原請求，不會自動重送。",
     "NATIVE_ENVIRONMENT_CHECKPOINT_UNAVAILABLE": "這段原對話沒有可恢復的成功保存狀態；保留原紀錄，不會用空白前文接續。",
@@ -90,6 +94,10 @@ MESSAGES.update({
     "NATIVE_BOOTSTRAP_UNKNOWN": "傳送結果尚未確認；保留原請求，不會自動重送。",
     "ATTACHMENTS_DISABLED": "這位助理目前不能附加來源，請移除附件後再送。",
     "USER_TEXT_FILES_DISABLED": "這位助理目前不能附加文字檔，請移除檔案後再送。",
+    "USER_FILE_TOO_LARGE": "檔案超過 10 MB，沒有加入。請分割或壓縮後再試。",
+    "USER_FILE_TYPE_UNSUPPORTED": "目前支援 txt／md／csv／json／pdf／docx／xlsx／pptx（舊版 doc／xls／ppt 請先另存新格式）。這份沒有加入。",
+    "USER_FILE_UPLOAD_UNKNOWN": "上傳結果不確定。再傳一次同一個檔案是安全的，不會變成兩份。",
+    "NATIVE_FILE_MISSING": "助理目前的環境找不到這份附件（可能剛換過環境）。請移除後重新附加。",
     "ATTACHMENT_SOURCE_DENIED": "這段對話不能附這份來源，請移除後再送。",
     "BEHAVIOR_SOURCE_DENIED": "這段對話不能附這份來源，請移除後再送。",
     "SOURCE_SCOPE_DENIED": "這段對話不能附這份來源，請移除後再送。",
@@ -110,6 +118,7 @@ MESSAGES.update({
     "SOURCE_BLOB_UNAVAILABLE": "這份來源目前無法讀取或驗證，訊息沒有送出；請稍後再試，或先移除附件。",
     "BEHAVIOR_UNSAFE_CONTENT": "這份來源的內容不符合輸出政策，請移除後再送。",
     "CAPABILITY_MODEL_UNSUPPORTED": "目前的模型不能讀圖片，請移除圖片或換模型。",
+    "REASONING_MODEL_REQUIRES_RESPONSES": "這位助理目前的設定不能用推理模型（gpt-5.4-mini、gpt-6 系列），訊息沒有送出；請改選 gpt-4.1-mini，或請管理員把這位助理改成 Responses。",
     "INSTRUCTION_MODEL_UNAVAILABLE": "選的模型目前不能用，請換一個模型。",
     "MODEL_CAPACITY_INVALID": "這位助理的模型容量設定有問題，訊息沒有送出；請聯絡管理員。",
     "SKILL_CATALOG_CAPACITY_UNKNOWN": "這位助理的模型容量設定有問題，訊息沒有送出；請聯絡管理員。",
@@ -303,9 +312,10 @@ def _task_texts(task, local):
 
 def _command_views(command):
     if command is None:
-        return {"user_files": [], "user_images": [], "attachments": []}
+        return {"user_files": [], "user_images": [], "user_uploads": [], "attachments": []}
     return {"user_files": [file_reference(item).model_dump(mode="json") for item in command.files],
             "user_images": [item.model_dump(mode="json") for item in getattr(command, "images", ())],
+            "user_uploads": [item.model_dump(mode="json") for item in getattr(command, "uploads", ())],
             "attachments": [item.model_dump(mode="json") for item in command.attachments]}
 
 
@@ -474,6 +484,19 @@ class NativeAdapter(PullAdapter):
         value = _decode(NativeUserImageStored, raw)
         data = canonical_png(command.png_base64)
         require((value.sha256, value.byte_length) == (sha(data), len(data)), "NATIVE_STATE_INVALID", 502)
+        return value
+
+    def upload_file(self, data, digest, token):
+        """ADR-0013: the raw bytes, once; the API checks them against ``digest`` and answers with what it stored."""
+        try:
+            raw, _ = self.send("PUT", PREFIX + "/files", None, token, raw=data, raw_headers={UPLOAD_SHA256_HEADER: digest})
+        except ConsoleError as error:
+            # No answer from the API is an unconfirmed upload; sending the same bytes again is safe (content-addressed).
+            if error.code == "BACKEND_OFFLINE":
+                raise ConsoleError("USER_FILE_UPLOAD_UNKNOWN", 503) from None
+            raise
+        value = _decode(NativeUserUploadStored, raw)
+        require((value.sha256, value.byte_length) == (digest, len(data)), "NATIVE_STATE_INVALID", 502)
         return value
 
 
@@ -915,7 +938,24 @@ class NativeInstructionControl:
         self.adapter.upload_image(command, token)
         return reference.model_dump(mode="json")
 
-    def submit(self, rid, content, model, attachments, files, token, images=()):
+    def upload_file(self, rid, name, data, token):
+        """ADR-0013: store one text, PDF or Office file (up to 10 MiB) with this Agent; content-addressed, so a repeat
+        is the same item."""
+        thread_id = self.store.get(rid)["thread_id"]
+        require(self.handles(thread_id), "INSTRUCTION_ROUTE_CHANGED")
+        require(len(data) <= MAX_UPLOAD_BYTES, "USER_FILE_TOO_LARGE", 413)
+        media_type = MEDIA_TYPES.get(PurePosixPath(name).suffix.lower()) if type(name) is str else None
+        require(media_type is not None, "USER_FILE_TYPE_UNSUPPORTED", 400)
+        try:
+            if media_type in TEXT_MEDIA_TYPES:
+                data.decode("utf-8")
+            reference = UserUpload(name=name, sha256=sha(data), byte_length=len(data), media_type=media_type)
+        except (ValueError, TypeError):
+            raise ConsoleError("USER_FILE_INPUT_INVALID", 400) from None
+        self.adapter.upload_file(data, reference.sha256, token)
+        return reference.model_dump(mode="json")
+
+    def submit(self, rid, content, model, attachments, files, token, images=(), uploads=()):
         local = self.store.get(rid)
         thread_id = local["thread_id"]
         require(self.handles(thread_id), "INSTRUCTION_ROUTE_CHANGED")
@@ -929,10 +969,11 @@ class NativeInstructionControl:
         try:
             command = InstructionSubmit.model_validate_json(canonical({
                 "request_id": rid, "conversation_id": self._cid(thread_id), "content": content,
-                "model": model, "attachments": attachments, "files": files, "images": images,
+                "model": model, "attachments": attachments, "files": files, "images": images, "uploads": uploads,
             }))
         except (ValueError, TypeError):
-            raise ConsoleError("USER_IMAGE_INPUT_INVALID" if images else "INSTRUCTION_INVALID", 400) from None
+            raise ConsoleError("USER_IMAGE_INPUT_INVALID" if images else "USER_FILE_INPUT_INVALID" if uploads
+                               else "INSTRUCTION_INVALID", 400) from None
         adapter = self.turn_adapter(thread_id)
         self.store.prepare(command.model_dump(mode="json"), freeze=True, state_profile=profile)
         self.journal.begin(rid, "submit", {

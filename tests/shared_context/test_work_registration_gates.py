@@ -199,7 +199,7 @@ def test_a_mismatched_instruction_stops_before_any_conversation_read(synthetic_s
 def test_images_are_refused_here_and_never_dropped(synthetic_standing_v1):
     c = synthetic_standing_v1
     command = instruction("with-images").model_copy(update={"images": ("an-image",)})
-    assert code(register, c, command) == (422, "WORK_POLICY_COMMAND", "attached images need a native Agent turn")
+    assert code(register, c, command) == (422, "WORK_POLICY_COMMAND", "attached images and files need a native Agent turn")
 
 
 def test_a_new_conversation_refuses_a_profile_head_that_moved(synthetic_standing_v1, monkeypatch):

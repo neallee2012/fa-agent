@@ -67,11 +67,8 @@ from .native_markers import (
     _Deferred, _Refused,
 )
 
-# ADR-0009 §3 v2→v3 3d-i: a runtime also admits the v2 header as an alias of its own profile, for a 3d-i API that sends
-# v2 (from 3d-ii the API sends v3). Temporary: the first image after 3d-ii removes it.
-HEADER_ALIAS_PROFILES = frozenset({NATIVE_V2_PROFILE})
 # Body Invocations profiles a runtime admits besides its own: an unlabeled v1 or a v2 original resent with its own
-# digest. Permanent, unlike the header alias (stored originals keep their profile).
+# digest. Permanent (stored originals keep their profile); the header names only this runtime's profile.
 STORED_BODY_PROFILES = frozenset({UNLABELED_STATE_PROFILE, NATIVE_V2_PROFILE})
 TURNS_STORE = "fa/v1/turns"
 EFFECTS_STORE = "fa/v1/effects"
@@ -450,7 +447,7 @@ class NativeTurnRuntime:
                  state_profile=NATIVE_STATE_PROFILE):
         self.identity, self.executor = identity, executor
         # ADR-0009 M1 2d-i: the profile this runtime declares (FA_NATIVE_TURNS); it labels new conversations' _Meta
-        # and is the header it admits (with 3d-i's v2 alias). Digest-bearing items keep the profile of their request.
+        # and is the only header it admits. Digest-bearing items keep the profile of their request.
         self.state_profile = state_profile
         self.credential_factory, self.cache_root, self.preflight = credential_factory, cache_root, preflight
         self._agent_session = None
@@ -2920,9 +2917,9 @@ async def native_response(request, runtime: NativeTurnRuntime | None, *, action=
 
     diagnostic("entered")
     try:
-        # ADR-0009 §3: one header naming this runtime's own profile, or 3d-i's v2 alias (``HEADER_ALIAS_PROFILES``).
+        # ADR-0009 §3: one header naming this runtime's own profile (3d step 3 retired the v2 alias).
         profiles = request.headers.getlist(NATIVE_TURN_HEADER)
-        if runtime is None or len(profiles) != 1 or profiles[0] not in {runtime.state_profile, *HEADER_ALIAS_PROFILES}:
+        if runtime is None or len(profiles) != 1 or profiles[0] != runtime.state_profile:
             raise refused(Problem(403, "NATIVE_TURNS_DISABLED", "the Hosted native path is not enabled"),
                           "runtime" if runtime is None else "profile")
         if request.state.session_id != runtime.identity.session_id:

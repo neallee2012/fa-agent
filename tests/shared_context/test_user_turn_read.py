@@ -241,7 +241,11 @@ def test_missing_original_lineage_never_falls_back_to_summary(user_history, monk
 
     monkeypatch.setattr(c.h.store, "read_snapshot", omit)
     response = read_original(c.second, 1)
-    assert response.status_code in {403, 404, 409}
+    # UNCLASSIFIED: the work-policy registry refuses first (WORK_POLICY_REGISTRY_INVALID), outside this reader.
+    assert (response.status_code, response.headers.get("x-behavior-assistant-error-code")) == {
+        "registration": (409, "UNCLASSIFIED"), "archive": (404, "USER_TURN_NOT_AVAILABLE"),
+        "saved-session": (409, "USER_TURN_SOURCE_INVALID"), "result": (404, "USER_TURN_NOT_AVAILABLE"),
+    }[missing]
     assert "8ef55d7a9c3b" not in response.text and "text" not in response.json()
     assert c.h.endpoint.requests == []
 
@@ -268,11 +272,12 @@ def test_original_source_mutation_or_unfinished_state_is_rejected(user_history, 
         c.h.mutate(rowkey, archive=archive)
     guard = c.h.store._guard()
     response = read_original(c.second, 1)
-    if change == "archive-version":
-        assert response.status_code == 502
-        assert response.headers["x-behavior-assistant-error-code"] == "USER_TURN_SOURCE_INVALID"
-    else:
-        assert response.status_code in {403, 409, 422}
+    # UNCLASSIFIED: the work-policy registry refuses first (WORK_POLICY_REGISTRY_INVALID), outside this reader.
+    assert (response.status_code, response.headers.get("x-behavior-assistant-error-code")) == {
+        "body": (409, "UNCLASSIFIED"), "submit-hash": (409, "UNCLASSIFIED"),
+        "archive-hash": (409, "USER_TURN_SOURCE_CHANGED"), "archive-version": (502, "USER_TURN_SOURCE_INVALID"),
+        "not-forwarded": (403, "USER_TURN_NOT_AVAILABLE"),
+    }[change]
     assert "CANARY" not in response.text and "text" not in response.json()
     assert c.h.store._guard() == guard and c.h.endpoint.requests == []
 
@@ -549,3 +554,66 @@ def test_model_request_cannot_enable_or_change_the_server_reader_capability(assi
         assert h.endpoint.requests == []
     finally:
         turn.client.close()
+
+
+def _registration(c, **updates):
+    record = c.control.records[c.first.binding.binding_id]
+    task = updates.pop("instruction", None)
+    if task is not None:
+        updates["profile"] = record.profile.model_copy(
+            update={"instruction": record.profile.instruction.model_copy(update=task)})
+    return record.model_copy(update=updates)
+
+
+@pytest.mark.parametrize("fault,status,code", [
+    ("no-registration", 404, "USER_TURN_NOT_AVAILABLE"),
+    ("two-registrations", 404, "USER_TURN_NOT_AVAILABLE"),
+    ("agent-origin", 404, "USER_TURN_NOT_AVAILABLE"),
+    ("other-human", 403, "USER_TURN_SCOPE_DENIED"),
+    ("other-turn-number", 403, "USER_TURN_SCOPE_DENIED"),
+    ("other-conversation-id", 403, "USER_TURN_SCOPE_DENIED"),
+    ("other-team", 403, "USER_TURN_SCOPE_DENIED"),
+    ("other-agent", 403, "USER_TURN_SCOPE_DENIED"),
+    ("no-conversation", 404, "USER_TURN_NOT_AVAILABLE"),
+    ("other-active-job", 403, "USER_TURN_SCOPE_DENIED"),
+])
+def test_each_registration_and_conversation_refusal_keeps_its_exact_code(user_history, monkeypatch, fault, status, code):
+    c = user_history
+    bid = c.first.binding.binding_id
+    if fault == "no-registration":
+        monkeypatch.delitem(c.control.records, bid)
+    elif fault == "two-registrations":
+        monkeypatch.setitem(c.control.records, "duplicate-registration", c.control.records[bid])
+    elif fault == "agent-origin":
+        monkeypatch.setitem(c.control.records, bid, _registration(c, agent_origin=object()))
+    elif fault == "other-human":
+        monkeypatch.setitem(c.control.records, bid, _registration(c, principal_oid="other-human"))
+    elif fault == "other-turn-number":
+        monkeypatch.setitem(c.control.records, bid, _registration(c, instruction={"turn_number": 2}))
+    elif fault == "other-conversation-id":
+        monkeypatch.setitem(c.control.records, bid, _registration(c, instruction={"conversation_id": "other-conversation"}))
+    elif fault in {"other-team", "other-agent"}:
+        record = c.control.records[bid]
+        field, value = ("team_id", C.team) if fault == "other-team" else ("agent_oid", B.oid)
+        monkeypatch.setitem(c.control.records, bid, _registration(
+            c, binding=record.binding.model_copy(update={field: value})))
+    elif fault == "other-active-job":
+        from shared_context.behavior_instruction import conversation_key
+        c.h.mutate(conversation_key(c.first.assignment.task.instruction.conversation_id), active_job_id="other-job")
+    else:
+        from shared_context.behavior_instruction import conversation_key
+        hidden = conversation_key(c.first.assignment.task.instruction.conversation_id)
+        read = c.h.store.read_snapshot
+
+        def omit(keys):
+            rows = read(keys)
+            if tuple(keys) == (hidden,):
+                rows[hidden] = None
+            return rows
+
+        monkeypatch.setattr(c.h.store, "read_snapshot", omit)
+    guard = c.h.store._guard()
+    response = read_original(c.second, 1)
+    assert (response.status_code, response.headers.get("x-behavior-assistant-error-code")) == (status, code)
+    assert "8ef55d7a9c3b" not in response.text and "text" not in response.json()
+    assert c.h.store._guard() == guard and c.h.endpoint.requests == []

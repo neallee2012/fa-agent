@@ -6,7 +6,8 @@ import tempfile
 import pytest
 
 from shared_context import behavior_wire as wire
-from shared_context.behavior_operations import ToolBrokerCore, control_key
+from shared_context.behavior_effects import WorkStateDispatcher
+from shared_context.behavior_operations import control_key
 from shared_context.errors import Problem
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
@@ -25,9 +26,10 @@ def native_parent():
 
 def test_fixed_sdk_honors_the_original_signed_human_rejection(
         assistant, signing_key, jwk_client, monkeypatch, native_parent):
-    prepare, authorize = guidance.prepare_operation, ToolBrokerCore.authorize
+    prepare = guidance.prepare_operation
     mkdtemp = guidance.tempfile.mkdtemp
-    rejected, denials, roots = [], [], []
+    rejected, roots, gates = [], [], []
+    gate = WorkStateDispatcher.check_mutable_target
     owned = native_parent
 
     def reject_prepared(turn):
@@ -53,12 +55,13 @@ def test_fixed_sdk_honors_the_original_signed_human_rejection(
         })
         return prepared, preview
 
-    def observe_authorization(core, command, context):
+    def observe_gate(dispatcher, command, context, **kwargs):
+        # The server's work-state dispatcher refuses here, before ToolBrokerCore.authorize is reached.
         try:
-            return authorize(core, command, context)
+            return gate(dispatcher, command, context, **kwargs)
         except Problem as error:
             if command.operation_id in rejected:
-                denials.append(error.body["error"]["code"])
+                gates.append(error.body["error"]["code"])
             raise
 
     def owned_directory(*args, **kwargs):
@@ -71,15 +74,19 @@ def test_fixed_sdk_honors_the_original_signed_human_rejection(
         return result
 
     monkeypatch.setattr(guidance, "prepare_operation", reject_prepared)
-    monkeypatch.setattr(ToolBrokerCore, "authorize", observe_authorization)
+    monkeypatch.setattr(WorkStateDispatcher, "check_mutable_target", observe_gate)
     monkeypatch.setattr(guidance.tempfile, "mkdtemp", owned_directory)
     guidance.test_loaded_malicious_guidance_is_data_for_the_fixed_sdk_and_cannot_execute_an_unapproved_operation(
         assistant, signing_key, jwk_client, monkeypatch,
     )
     assert len(rejected) == len(roots) == 1
-    assert denials == ["OPERATION_HUMAN_REJECTED"]
+    assert gates == ["OPERATION_HUMAN_REJECTED"]
+    key = control_key("operation", rejected[0])
+    data = assistant.store.read_snapshot((key,))[key].payload["data"]
+    assert data["human_rejection"] is not None and data["current_attempt_id"] is None
+    assert data["effect_state"] == "unknown" and data["successful_result"] is None
     guidance.record("fixed-sdk-human-rejection", {
-        "original_human_rejections": len(rejected), "observed_core_denials": denials,
+        "original_human_rejections": len(rejected), "observed_gate_denials": gates,
         "driver": "existing-fixed-sdk-guidance-load-deny-read-finish",
         "scope": "one runtime, four scripted provider requests, no new capability or native loader",
         "original_operation_and_accounting_preserved": True,

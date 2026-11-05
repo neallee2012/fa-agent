@@ -55,7 +55,7 @@ def test_a_responses_conversation_saved_by_runtime_1_0_83_continues_on_the_pinne
 
     executor = ObserveStop(root=root / "run", runtime_path=runtime_path, api_url="https://api.offline.invalid",
                            model_url=URL, token_provider=token, model_transport=httpx.MockTransport(provider))
-    # The v3 image; the API still sends v2 (header alias and body label).
+    # The v3 image; the header is its own v3 (3d step 3 retired the v2 alias), the body keeps a stored v2 label.
     runtime = NativeTurnRuntime(IDENTITY, executor, preflight=executor.preflight, state_profile=NATIVE_V3_PROFILE)
     executor.reader = runtime
 
@@ -86,7 +86,7 @@ def test_a_responses_conversation_saved_by_runtime_1_0_83_continues_on_the_pinne
         request = NativeSubmit(command=submit(rid="rid-2", cid=first.conversation_id, text=FOLLOW_UP).command,
                                capture=first.capture, state_profile=NATIVE_V2_PROFILE)
         accepted = client.post("/invocations", json=request.model_dump(mode="json"), headers={
-            "x-client-fa-state-profile": NATIVE_V2_PROFILE, "x-agent-session-id": IDENTITY.session_id,
+            "x-client-fa-state-profile": NATIVE_V3_PROFILE, "x-agent-session-id": IDENTITY.session_id,
             "x-agent-invocation-id": "OFFLINE-platform-2", "x-agent-foundry-call-id": "OFFLINE-call-2"})
         assert accepted.status_code == 202, accepted.text
         receipt = client.portal.call(bounded)

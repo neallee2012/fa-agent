@@ -205,11 +205,30 @@ class _CutFence:
         self.stopped = True
 
 
-def _left(bound, cap=30):
+_CALL_SECONDS = 30
+
+
+def _left(bound, cap=_CALL_SECONDS):
     """Seconds one background call may take: what is left of the cut's ``bound``, at most ``cap``; ``bound()`` raises
     ``_FenceOverrun`` past it or on shutdown."""
     bound()
     return min(cap, bound.deadline - monotonic())
+
+
+def _scanned(invoke, command, bound, *, again=None):
+    """``invoke(command)`` (a ``NativeSessionCut``), then ``again`` (default ``command``) while Hosted answers
+    ``scan_pending`` and a whole call still fits in ``bound``: the same RID resent at an unmoved Agent ETag goes on from
+    the receipt the last call stopped at (its ``following:`` record; stage 41's image too), so a store one call can not
+    read through is read over several. ``again`` carries an ``expected_etag``, so an admission since makes it busy
+    instead of a new scan from the start. Any other answer, or shutdown, returns at once, for the next turn end. Never
+    raises itself: the files fence's caller clears its record from the returned answer."""
+    # shortcut: a scan longer than one bound (~6-9 calls) still restarts at the next turn end, and a resend after a
+    # set-mode timeout or a changed page makes no progress; carry E0 across attempts if either is seen.
+    value = invoke(command)
+    while (value.reason == "scan_pending" and not bound.stop.is_set()
+           and bound.deadline - monotonic() >= _CALL_SECONDS):
+        value = invoke(command if again is None else again)
+    return value
 
 
 def cut_request_id(agent_id, source_session_id, session_id):
@@ -2403,7 +2422,8 @@ class NativeSessions:
         the source and commit within ``CUT_FENCE_SECONDS``; an overrun or a failure before FA's stop of the source
         withdraws the fence, and after its marker (``stop_started``) the fence is only ever driven forward, at its own
         destination whatever the selector names by then. Busy waits for the next turn end: nothing here loops or polls
-        outside that fence. Only 5b's snapshot (both flags on, an ``active`` source; ``upgrade_snapshot_flow``)
+        outside that fence, except that a ``scan_pending`` answer is resent at once while a call fits (``_scanned``).
+        Only 5b's snapshot (both flags on, an ``active`` source; ``upgrade_snapshot_flow``)
         invokes the source; with it the files are restored on the destination before a no-fence commit that records
         them. A fence the row records (left by a crash or an ended job) is
         settled at its own destination before the selector is read (``_converge``, as every send's ``advance`` does
@@ -2520,7 +2540,9 @@ class NativeSessions:
         settled_ids = self._settled(found, destination)
         asked = NativeSessionCut(request_id=request_id, expected_session_id=source_sid, mode="probe",
                                  settled_session_ids=settled_ids)
-        probe, _ = NativeTurnGateway._invoke(destination, asked, timeout=_left(bound))
+        # Resent at the ETag read before it (the first probe carries none: a write since only means busy, as before).
+        probe = _scanned(lambda value: NativeTurnGateway._invoke(destination, value, timeout=_left(bound))[0], asked,
+                         bound, again=asked.model_copy(update={"expected_etag": state.etag}))
         if probe.quiet_etag is None:
             return "busy", probe.reason, None
         # Read after the probe (probe, then list): a source that turned active before the quiet point is listed.
@@ -2550,7 +2572,9 @@ class NativeSessions:
                 self._finish(None, destination, bound=bound)  # the fence already stopped the source
             return fenced
         try:
-            value, _ = NativeTurnGateway._invoke(destination, command, timeout=_left(bound))
+            # The cut goes on from the last scanning call's record, so it may read the probe's last stretch again.
+            value = _scanned(lambda value: NativeTurnGateway._invoke(destination, value, timeout=_left(bound))[0],
+                             command, bound)
         except Problem as error:
             if carried is None:
                 raise
@@ -2973,7 +2997,7 @@ class NativeSessions:
                 fence_.hosted_session_id, fence_.request_id) == (sid, command.request_id)
 
         fence = _CutFence(CUT_FENCE_SECONDS, stop or Event(), mark)
-        value, _ = NativeTurnGateway._invoke(destination, command)
+        value = _scanned(lambda value: NativeTurnGateway._invoke(destination, value)[0], command, fence)
         if value.state != "pending":
             # Another replica's same fence (same RID) may hold the pending: its record is cleared only once it is gone.
             if self._settle(client, destination, self._state(destination), written, stop=stop) is None:

@@ -14,9 +14,10 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
+from conftest import require_cold_resume_paths
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_instruction_models import InstructionModel
-from shared_context.behavior_native_turn_wire import NativeSubmit, NativeTurnCapture
+from shared_context.behavior_native_turn_wire import NATIVE_STATE_PROFILE, NativeSubmit, NativeTurnCapture
 from shared_context.native_sdk import NativeSdkExecutor
 from shared_context.native_checkpoint import conversation_store_name, open_durable_store, verify_checkpoint
 from shared_context.native_turns import NativeTurnRuntime
@@ -33,6 +34,7 @@ def isolated(monkeypatch, name):
     if not root_value:
         pytest.fail("Set a session-private N1_NATIVE_WORKSPACE; never use the real user HOME.")
     root = Path(root_value).resolve() / name
+    require_cold_resume_paths(root)  # past MAX_PATH the local State store writes fail mid-turn
     root.mkdir(parents=True, exist_ok=False)
     for key in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"):
         (root / key.lower()).mkdir()
@@ -115,7 +117,7 @@ def run_turns(monkeypatch, runtime_path, name, selected, turns=7, paragraphs=60,
             text = ("MARK-TURN-1 " if n == 1 else "") + "".join(FILLER.format(i=n * 1000 + j) for j in range(paragraphs))
             request = NativeSubmit(command=submit(rid=rid, cid=cid, text=text).command, capture=selected)
             response = client.post("/invocations", json=request.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-" + rid, "x-agent-foundry-call-id": "OFFLINE-call-" + rid,
             })
             if response.status_code != 202:
@@ -413,7 +415,7 @@ def test_after_compaction_the_original_wording_is_read_back_exactly_and_history_
             text = ((KEEP + " ") if n == 1 else "") + "".join(FILLER.format(i=n * 1000 + j) for j in range(100))
             request = NativeSubmit(command=submit(rid=rid, cid=cid, text=text).command, capture=selected)
             response = client.post("/invocations", json=request.model_dump(mode="json"), headers={
-                "x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
+                "x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": IDENTITY.session_id,
                 "x-agent-invocation-id": "OFFLINE-" + rid, "x-agent-foundry-call-id": "OFFLINE-call-" + rid,
             })
             assert response.status_code == 202, response.text

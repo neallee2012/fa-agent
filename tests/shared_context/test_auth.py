@@ -68,17 +68,20 @@ def test_signed_allowed_actor(authenticated, private_key, issuer):
 
 
 @pytest.mark.parametrize("change", [
-    {"exp": int(time.time()) - 30},
     {"aud": "https://ai.azure.com"},
     {"aud": [AUDIENCE, "other-audience"]},
     {"tid": "99999999-9999-9999-9999-999999999999"},
     {"iss": "https://evil.example/"},
     {"iss": f"https://sts.windows.net/{TENANT}"},
-    {"nbf": int(time.time()) + 3600},
     {"oid": 123},
 ])
 def test_reject_bad_claims(authenticated, private_key, change):
     assert status(authenticated, bearer(signed(private_key, change))) == 401
+
+
+@pytest.mark.parametrize("claim, offset", [("exp", -30), ("nbf", 3600)])
+def test_reject_bad_time_claims(authenticated, private_key, claim, offset):
+    assert status(authenticated, bearer(signed(private_key, {claim: int(time.time()) + offset}))) == 401
 
 
 @pytest.mark.parametrize("claim", ["exp", "iss", "aud", "tid", "oid"])

@@ -11,9 +11,10 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
+from conftest import require_cold_resume_paths
 from shared_context.behavior_assistant_boundary import AssistantModelBoundary
 from shared_context.behavior_hosted import create_host
-from shared_context.behavior_native_turn_wire import NativeSubmit, NativeTurnCapture
+from shared_context.behavior_native_turn_wire import NATIVE_STATE_PROFILE, NativeSubmit, NativeTurnCapture
 from shared_context.m2_copilot import _ModelGateway
 from shared_context.native_sdk import NativeSdkExecutor
 from shared_context.native_turns import NativeTurnRuntime
@@ -96,6 +97,7 @@ def test_pinned_runtime_native_turns_never_send_reasoning_effort_to_a_model_decl
     if not root_value:
         pytest.fail("Set a session-private N1_NATIVE_WORKSPACE; never use the real user HOME.")
     root = Path(root_value).resolve() / "reasoning-facts"
+    require_cold_resume_paths(root)  # past MAX_PATH the local State store writes fail mid-turn
     root.mkdir(parents=True, exist_ok=False)
     for key in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"):
         isolated = root / key.lower()
@@ -145,7 +147,7 @@ def test_pinned_runtime_native_turns_never_send_reasoning_effort_to_a_model_decl
                 return receipt
             await asyncio.sleep(0.02)
 
-    headers = {"x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": IDENTITY.session_id,
+    headers = {"x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": IDENTITY.session_id,
                "x-agent-invocation-id": "reasoning-facts", "x-agent-foundry-call-id": "reasoning-facts"}
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
         first = NativeSubmit(command=submit(text="Reply ok.").command, capture=selected)

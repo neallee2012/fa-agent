@@ -931,6 +931,43 @@ test("attached images are converted, uploaded once each and sent as references o
     images:[{name:"My-Photo.png",sha256:sha,byte_length:png.length,media_type:"image/png"}]});
 });
 
+test("an original image over 10 MiB is refused before it is decoded or uploaded",async()=>{
+  const data=imageChat(),ui=await open(data),{sizes}=imageSupport(ui),decoded=[];
+  const decode=ui.context.createImageBitmap;
+  ui.context.createImageBitmap=async file=>{decoded.push(file.name);return decode(file)};
+  const input=ui.nodes.get("user-images");
+  input.files=[{name:"ok.jpg",type:"image/jpeg",size:1024},{name:"huge.jpg",type:"image/jpeg",size:10*1024*1024+1}];
+  input.events.change();
+  for(let i=0;i<5;i++)await ui.tick();
+  assert.deepEqual(decoded,[]);
+  assert.equal(ui.holder.pendingPosts.length,0);
+  assert.match(ui.text("user-image-note"),/有原圖超過 10 MB，這次選的都沒有加入/);
+  input.files=[{name:"edge.jpg",type:"image/jpeg",size:10*1024*1024}];
+  input.events.change();
+  for(let i=0;i<5&&!ui.holder.pendingPosts.length;i++)await ui.tick();
+  assert.deepEqual(decoded,["edge.jpg"]);
+  assert.deepEqual(sizes,[[2000,500]]);
+  assert.equal(ui.holder.pendingPosts.at(-1).url,"/api/instructions/attachment-draft/image-upload");
+});
+
+test("an image the browser cannot decode keeps earlier images and shows the image copy",async()=>{
+  const data=imageChat(),ui=await open(data),{png}=imageSupport(ui);
+  const decode=ui.context.createImageBitmap;
+  ui.context.createImageBitmap=async file=>{
+    if(file.name==="bad.jpg")throw Object.assign(new Error("The source image could not be decoded."),{name:"InvalidStateError",code:11});
+    return decode(file);
+  };
+  const input=ui.nodes.get("user-images");
+  input.files=[{name:"ok.jpg",type:"image/jpeg"},{name:"bad.jpg",type:"image/jpeg"}];
+  const changed=input.events.change();
+  for(let i=0;i<5&&!ui.holder.pendingPosts.length;i++)await ui.tick();
+  ui.holder.pendingPosts.at(-1).resolve({name:"ok.png",sha256:"f".repeat(64),byte_length:png.length,media_type:"image/png"});
+  await changed;await ui.tick();
+  assert.equal(ui.holder.pendingPosts.length,1);
+  assert.deepEqual(ui.nodes.get("user-image-selected").children.map(figure=>figure.children[0].alt),["ok.png"]);
+  assert.match(ui.text("user-image-note"),/沒通過的那張和之後選的都沒有加入/);
+});
+
 test("images follow the model's declared support on both native lanes and stay off elsewhere",async()=>{
   const data=imageChat();data.composer.models.models[0].supports_image_input=false;
   const ui=await open(data);
@@ -2553,25 +2590,50 @@ for(const [label,file] of [
   });
 }
 
-for(const [label,name,size] of [
-  ["File.size","input.txt",8193],["path","../input.txt",3],["URL","https://x/input.txt",3],
-  ["extension","input.exe",3],["nonlogical-name","原件.txt",3],["long-name","x".repeat(129)+".txt",3],
+// A large file goes to the native upload lane (ADR-0013); this lane is not native, so it says where large files go.
+const badName=/檔名只能用英文字母、數字、點、底線和連字號/;
+for(const [label,name,size,message] of [
+  ["File.size","input.txt",8193,/這段對話的路徑不支援大檔/],["path","../input.txt",3,badName],
+  ["URL","https://x/input.txt",3,badName],["extension","input.exe",3,/目前支援 txt／md／csv／json／pdf／docx／xlsx／pptx/],["old Office","input.doc",3,/舊版 doc／xls／ppt 請先另存新格式/],
+  ["nonlogical-name","原件.txt",3,badName],["long-name","x".repeat(129)+".txt",3,badName],
+  ["small PDF","report.pdf",3,/這段對話的路徑不支援大檔、PDF 或 Office 檔/],
+  ["small xlsx","report.xlsx",3,/這段對話的路徑不支援大檔、PDF 或 Office 檔/],
 ]){
   test(`literal ${label} is rejected before reading any user File`,async()=>{
     const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
     let reads=0;
     await chooseLiteral(ui,[{name,size,arrayBuffer:async()=>{reads++;return new Uint8Array(3).buffer}}]);
     assert.equal(reads,0);assert.equal(ui.nodes.get("user-file-selected").children.length,0);
-    assert.match(ui.text("user-file-limit"),/名稱不是路徑或URL/);
+    assert.match(ui.text("user-file-limit"),message);
     assert.equal(ui.calls.some(call=>call.method==="POST"),false);
   });
 }
+
+for(const [name,mediaType] of [["report.pdf","application/pdf"],
+  ["report.docx","application/vnd.openxmlformats-officedocument.wordprocessingml.document"]])
+test(`${name} is never decoded or inlined and goes up as a large file on a native conversation`,async()=>{
+  const data=attachmentChat();data.composer.state_profile="foundry-native-v1";
+  const ui=await open(data);await readyFileInput(ui,data);
+  ui.context.crypto??=globalThis.crypto;
+  // "%PDF-" then binary bytes, a NUL among them: never UTF-8 checked, never sent as message text.
+  const bytes=[0x25,0x50,0x44,0x46,0x2d,0xe2,0xe3,0x00,0xff];
+  const sha256=require("crypto").createHash("sha256").update(Buffer.from(bytes)).digest("hex");
+  ui.holder.templateResponses={"/api/instructions/attachment-draft/file-upload":{ok:true,
+    json:async()=>({name,sha256,byte_length:bytes.length,media_type:mediaType})}};
+  await chooseLiteral(ui,[binaryFile(name,bytes)]);
+  for(let i=0;i<5;i++)await ui.tick();
+  const puts=ui.calls.filter(call=>call.method==="PUT");
+  assert.deepEqual(puts.map(call=>call.url),["/api/instructions/attachment-draft/file-upload"]);
+  assert.equal(ui.nodes.get("user-file-selected").children.length,1);
+  assert.match(ui.nodes.get("user-file-selected").children[0].children[1].textContent,new RegExp(sha256));
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
 
 test("literal actual bytes are checked independently of declared File.size",async()=>{
   const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
   await chooseLiteral(ui,[{name:"input.txt",size:1,arrayBuffer:async()=>new Uint8Array(8193).buffer}]);
   assert.equal(ui.nodes.get("user-file-selected").children.length,0);
-  assert.match(ui.text("user-file-limit"),/最多8192 bytes/);
+  assert.match(ui.text("user-file-limit"),/8192 bytes 以內/);
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
 });
 

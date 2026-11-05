@@ -167,7 +167,8 @@ MESSAGES = {
     "ATTACHMENT_SELECTION_INVALID": "附件需為最多4份完整來源參照及不重複的 logical filename；名稱最多128個英數字、點、底線或連字號，不接受路徑或URL。",
     "USER_FILE_CAPABILITY_INVALID": "原文字檔能力回應缺欄、格式或對話不符；不當成停用或改查目前新對話設定。",
     "USER_FILE_CAPABILITY_UNAVAILABLE": "原對話的文字檔能力目前無法核對；不改查global設定，也不自動啟用。",
-    "USER_FILE_INPUT_INVALID": "只接受小型UTF-8 txt／md／csv／json文字檔；檔名不可是路徑或URL，總附件最多4份且不重名，原文加檔案JSON最多8192 bytes。",
+    "USER_FILE_INPUT_INVALID": "文字檔要是 UTF-8；檔名只能用英文字母、數字、點、底線和連字號（第一個字是英數字），請先改名再選；每則訊息最多 4 份且不重名；8192 bytes 以內的檔案連同訊息原文合計也不能超過 8192 bytes。",
+    "USER_UPLOADS_UNSUPPORTED": "這段對話的路徑不支援大檔；請在原生對話中附檔，或把內容貼進訊息。",
     "USER_FILE_UNAVAILABLE": "找不到這筆原交辦的文字檔，或後端尚未提供原件讀取；不以空內容代替。",
     "USER_FILE_RESPONSE_INVALID": "原件bytes、hash或header核對失敗；沒有產生下載檔，不會用本機快照繞過讀權。",
     "INSTRUCTION_PENDING": "原對話仍有未確認或未完成的交辦；請先更新進度或核對原接單，不會換 ID 跳過。",
@@ -664,21 +665,23 @@ class Console:
                         "observed_at": self.clock().isoformat(), "automatic_retry": False})
                 raise
 
-    def submit_instruction(self, request_id, content, model, attachments=(), files=(), images=()):
+    def submit_instruction(self, request_id, content, model, attachments=(), files=(), images=(), uploads=()):
         require(self.instructions is not None, "ACTION_NOT_ALLOWED", 403)
         local = self.instructions.store.get(request_id)
         with self.message_lock(request_id):
             self.active()
             require(self.instructions is not None, "ACTION_NOT_ALLOWED", 403)
             token = self.vault.get()
-            self.instructions.validate_input(request_id, content, model, attachments, files, images=images)
+            self.instructions.validate_input(request_id, content, model, attachments, files, images=images, uploads=uploads)
             self.native_instructions.refresh_routing(token, thread_id=local["thread_id"])
             thread = self.native_request(request_id)
             if thread is not None:
-                self.native_instructions.submit(request_id, content, model, attachments, files, token, images=images)
+                self.native_instructions.submit(request_id, content, model, attachments, files, token, images=images,
+                                                uploads=uploads)
                 return {"task": self.native_instructions.task_view(request_id, thread, self.instructions.store.get(request_id))}
             # Attached images are a native-lane input; the job-bound lane refuses them before any write.
             require(not images, "USER_IMAGES_UNSUPPORTED", 409)
+            require(not uploads, "USER_UPLOADS_UNSUPPORTED", 409)
             task = self.instructions.prepare(request_id, content, model, attachments, files)
             return self.run(task.task_id, "submit")
 
@@ -690,6 +693,15 @@ class Console:
         self.native_instructions.refresh_routing(token, thread_id=local["thread_id"])
         require(self.native_request(request_id) is not None, "USER_IMAGES_UNSUPPORTED", 409)
         return self.native_instructions.upload_image(request_id, name, png_base64, token)
+
+    def upload_instruction_file(self, request_id, name, data):
+        require(self.instructions is not None, "ACTION_NOT_ALLOWED", 403)
+        local = self.instructions.store.get(request_id)
+        self.active()
+        token = self.vault.get()
+        self.native_instructions.refresh_routing(token, thread_id=local["thread_id"])
+        require(self.native_request(request_id) is not None, "USER_UPLOADS_UNSUPPORTED", 409)
+        return self.native_instructions.upload_file(request_id, name, data, token)
 
     def instruction_attachment_sources(self, request_id):
         self.active()
@@ -1232,15 +1244,23 @@ def check_browser_request(request, boundary):
 
 
 def check_write_request(request, boundary):
-    require(request.method == "POST" and request.headers.get("origin") == boundary.origin
+    # The one non-JSON write: a raw file upload (ADR-0013), a PUT with an octet-stream body.
+    upload = request.method == "PUT" and is_file_upload(request.url.path)
+    require((request.method == "POST" or upload) and request.headers.get("origin") == boundary.origin
             and secrets.compare_digest(request.headers.get("x-console-csrf", ""), boundary.csrf)
-            and request.headers.get("content-type", "").split(";")[0] == "application/json"
+            and request.headers.get("content-type", "").split(";")[0] == (
+                "application/octet-stream" if upload else "application/json")
             and not request.query_params, "LOCAL_REQUEST_DENIED", 403)
+
+
+def is_file_upload(path):
+    return path.startswith("/api/instructions/") and path.count("/") == 4 and path.endswith("/file-upload")
 
 
 def is_instruction_input(path):
     if path.startswith("/api/instructions/"):
-        return path.endswith("/submit") or (path.count("/") == 4 and path.endswith(("/append", "/image-upload")))
+        return path.endswith("/submit") or (
+            path.count("/") == 4 and path.endswith(("/append", "/image-upload", "/file-upload")))
     if path.startswith("/api/native-hitl/"):
         return path.count("/") == 4 and path.rsplit("/", 1)[1] in {
             "rules", "decisions", "reconcile", "answers", "answer-reconcile", "consents", "consent-reconcile"}

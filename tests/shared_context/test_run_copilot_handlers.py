@@ -157,6 +157,7 @@ def harness(tmp_path, monkeypatch):
         return captured["result"], outcome
 
     state.run = run
+    state.session = session
     state.capabilities = capabilities
     return state
 

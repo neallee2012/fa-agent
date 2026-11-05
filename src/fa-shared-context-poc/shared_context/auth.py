@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
 import threading
 import time
@@ -60,19 +58,6 @@ class AuthSettings:
             identities.add((actor.team, actor.actor))
             if not actor.role_instruction or len(actor.role_instruction) > 4096:
                 raise ValueError("role_instruction must contain 1..4096 characters")
-
-    @classmethod
-    def from_env(cls) -> "AuthSettings":
-        tenant = os.environ["CONTEXT_TENANT_ID"]
-        raw = json.loads(os.environ["CONTEXT_ACTORS_JSON"])
-        if not isinstance(raw, dict):
-            raise ValueError("CONTEXT_ACTORS_JSON must be an object keyed by oid")
-        actors = {oid: Actor(oid=oid, **entry) for oid, entry in raw.items()}
-        issuers = json.loads(os.environ.get("CONTEXT_ISSUERS_JSON", json.dumps([
-            f"https://sts.windows.net/{tenant}/",
-            f"https://login.microsoftonline.com/{tenant}/v2.0",
-        ])))
-        return cls(tenant, os.environ["CONTEXT_API_AUDIENCE"], tuple(issuers), actors)
 
 
 # An unknown ``kid`` arrives before any signature check, so anyone can send one. The pinned PyJWT 2.13.0

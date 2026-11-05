@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import stat
 from pathlib import Path
@@ -45,13 +44,3 @@ def write(home: Path, path: Path, data: bytes) -> None:
             os.fsync(stream.fileno())
     finally:
         os.close(descriptor)
-
-
-def load_json(data: bytes) -> dict:
-    try:
-        value = json.loads(data)
-        if not isinstance(value, dict):
-            raise ValueError("expected object")
-        return value
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise Problem(409, "INVALID_ENVIRONMENT_STATE", "private fixture contains invalid JSON") from exc

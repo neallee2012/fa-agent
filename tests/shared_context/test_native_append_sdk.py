@@ -18,7 +18,7 @@ from azure.ai.agentserver.core.storage import FoundryStateStore
 
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_sessions import native_sessions
-from shared_context.behavior_native_turn_wire import NativeSessionPreparation
+from shared_context.behavior_native_turn_wire import NATIVE_STATE_PROFILE, NativeSessionPreparation
 from shared_context.behavior_wire import HostedIdentity
 from shared_context.native_sdk import NativeSdkExecutor
 from shared_context.native_turns import NativeTurnRuntime
@@ -127,7 +127,7 @@ def append_sdk(native_api, monkeypatch, runtime_path, tmp_path, request, signing
         host.supervisor = SimpleNamespace(journal=SimpleNamespace(root=journal))
         host_options["responses_handler_factory"] = native_responses_handler_factory
     with TestClient(create_host(host, native_runtime=runtime, **host_options)) as hosted:
-        headers = {"x-client-fa-state-profile": "foundry-native-v2", "x-agent-session-id": identity.session_id,
+        headers = {"x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": identity.session_id,
                    "x-agent-invocation-id": "OFFLINE-control", "x-agent-foundry-call-id": "OFFLINE-owner"}
         state = hosted.post("/invocations", json={"operation": "session_read"}, headers=headers).json()
         prepared = hosted.post("/invocations", json={
