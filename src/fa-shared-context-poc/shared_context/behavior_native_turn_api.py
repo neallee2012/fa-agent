@@ -1086,7 +1086,13 @@ class NativeTurnGateway:
                 # A newer image names the version it woke on: a VM fact, recorded as drift (§4 step 6), with the
                 # profile that version declares in the same CAS, as ``_drifted`` does.
                 moved = client.for_target(client.target.model_copy(update={"agent_version": actual}))
-                moved._drift_profile = sessions._version_profile(client, actual)
+                try:
+                    moved._drift_profile = sessions._version_profile(client, actual, row)
+                except Problem as error:
+                    from .behavior_native_sessions import release_unknown
+                    if release_unknown(error):  # Guard B: a newer API records and follows it
+                        raise resend_later(conflict) from None
+                    raise
                 sessions._observe_drift(moved, row, "vm")
             sessions.guard.mark_incompatible(client.target.agent_id, client.target.session_id)
             logging.getLogger(__name__).warning(

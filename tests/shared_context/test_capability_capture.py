@@ -9,7 +9,7 @@ from shared_context.behavior_agent_template import TemplateSettings
 from shared_context.behavior_assistant_wire import InstructionTask
 from shared_context.behavior_capabilities import (
     CapabilityCapture, CapabilityRef, available_grants, capture, check_captured, enabled_toolboxes,
-    load_runtime_grants,
+    load_runtime_capabilities,
 )
 from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES, HISTORY_PROFILE
 from shared_context.errors import Problem
@@ -226,7 +226,7 @@ def test_capture_rules_are_intersection_and_record_only_checks():
 def test_startup_loads_the_configured_catalog_and_builtins(tmp_path, monkeypatch):
     monkeypatch.delenv("FA_TOOL_CATALOG_DIR", raising=False)
     monkeypatch.delenv("FA_CAPABILITY_BUILTINS", raising=False)
-    assert dict(load_runtime_grants()) == {}
+    assert dict(load_runtime_capabilities()[0]) == {}
     directory = tmp_path / "catalog"
     directory.mkdir()
     (directory / "websearch.json").write_text(json.dumps({"mcpServers": {"WebSearch-MCP": {
@@ -234,13 +234,13 @@ def test_startup_loads_the_configured_catalog_and_builtins(tmp_path, monkeypatch
         "headers": {"x-apikey": "${secret:websearch-api-key}"}, "tools": ["web", "browse"]}}}), encoding="utf-8")
     monkeypatch.setenv("FA_TOOL_CATALOG_DIR", str(directory))
     monkeypatch.setenv("FA_CAPABILITY_BUILTINS", "fa-desktop-v1")
-    grants = load_runtime_grants()
+    grants = load_runtime_capabilities()[0]
     assert sorted(grants) == ["WebSearch-MCP", "fa-desktop-v1"] and grants["WebSearch-MCP"] == GRANTS["WebSearch-MCP"]
     with pytest.raises(TypeError):
         grants["x"] = grants["WebSearch-MCP"]
     monkeypatch.setenv("FA_CAPABILITY_BUILTINS", "fa-unknown-v1")
     with pytest.raises(Problem) as error:
-        load_runtime_grants()
+        load_runtime_capabilities()[0]
     assert error.value.body["error"]["code"] == "CAPABILITY_CONFIGURATION"
 
 

@@ -5,6 +5,7 @@ import pytest
 from shared_context.behavior_agent_versions import HostedVersions, route, sync_all
 from shared_context.behavior_agent_onboarding import FoundryCallError
 from shared_context.errors import Problem
+from shared_context.sdk_pin import PINNED_RELEASE_TEXT
 from test_agent_versions import A, Clock, Foundry, R, _sync
 
 
@@ -147,9 +148,9 @@ def test_sync_preserves_each_agents_flags_and_applies_explicit_overlay_without_r
     assert [item["state"] for item in result] == ["ok", "ok"]
     a = foundry.creates(A.agent_name)[0][2]
     r = foundry.creates(R.agent_name)[0][2]
-    assert a["environment_variables"] == {"FA_NATIVE_HITL_ENABLED": "1"}
+    assert a["environment_variables"] == {"FA_NATIVE_HITL_ENABLED": "1", **PIN}
     assert r["environment_variables"] == {
-        "FA_NATIVE_GROUPS_ENABLED": "1", "FA_NATIVE_HITL_ENABLED": "1", "FA_NATIVE_HITL_TTL_SECONDS": "600"}
+        "FA_NATIVE_GROUPS_ENABLED": "1", "FA_NATIVE_HITL_ENABLED": "1", "FA_NATIVE_HITL_TTL_SECONDS": "600", **PIN}
     assert a["session_configuration"]["idle_timeout_seconds"] == r["session_configuration"]["idle_timeout_seconds"] == 900
     assert (A.model_dump_json(), R.model_dump_json()) == (before_a, before_r)
 
@@ -219,7 +220,7 @@ def test_new_definition_inherits_the_agents_served_flags_not_an_unpublished_cand
     foundry.add(R.agent_name, 5, "candidate", definition=candidate)
     foundry.selectors[R.agent_name] = "4"
     desired, label = desired_source(image_source(foundry, R, "next:image"))()
-    assert desired["environment_variables"] == {"FA_NATIVE_HITL_ENABLED": "0"}
+    assert desired["environment_variables"] == {"FA_NATIVE_HITL_ENABLED": "0", **PIN}
     assert label == "agent-r:4"
     assert foundry.versions[R.agent_name][1]["definition"] == candidate
 
@@ -235,9 +236,11 @@ def test_a_new_image_runs_its_own_runtime_not_the_one_the_old_definition_named()
     foundry.add(R.agent_name, 4, "old", definition=served)
     foundry.selectors[R.agent_name] = "4"
     desired, _ = desired_source(image_source(foundry, R, "next:image"))()
-    assert desired["environment_variables"] == {"TZ": "Asia/Taipei"}
+    assert desired["environment_variables"] == {"TZ": "Asia/Taipei", **PIN}
 
 
+# ADR-0009 §3 (c): sync writes the pair the new image runs next to the image.
+PIN = {"FA_SDK_RELEASE": PINNED_RELEASE_TEXT}
 NATIVE_GROUPS = {"FA_NATIVE_TURNS": "foundry-native-v3", "FA_NATIVE_GROUPS_ENABLED": "1"}  # ADR-0009 3d-ii: v3 only
 
 
@@ -265,7 +268,7 @@ def test_registered_group_agent_gets_the_responses_lane_once_and_explicit_values
                           sleep=clock.sleep, clock=clock)
         assert [item["state"] for item in result] == ["ok", "ok"]
     assert len(foundry.creates(R.agent_name)) == 1
-    assert foundry.creates(R.agent_name)[0][2]["environment_variables"] == expected
+    assert foundry.creates(R.agent_name)[0][2]["environment_variables"] == {**expected, **PIN}
 
 
 @pytest.mark.parametrize("responses,expected", [(None, "1"), ("0", "0"), ("1", "1")])
@@ -309,12 +312,12 @@ def test_tracing_default_is_never_overwritten_by_sync_or_onboarding(monkeypatch,
     clock = Clock()
     sync_all(SimpleNamespace(), lambda _: foundry, image="new:image", build="new", sleep=clock.sleep, clock=clock,
              hosted_environment=None if overlay is None else {R.agent_id: overlay})
-    assert foundry.creates(R.agent_name)[0][2]["environment_variables"] == expected
+    assert foundry.creates(R.agent_name)[0][2]["environment_variables"] == {**expected, **PIN}
     monkeypatch.setattr(behavior_work_target, "selected_targets", lambda store, config: [R])
     monkeypatch.setattr(versions, "current_hosted_version", lambda runtime, target: "2")
     composition = SimpleNamespace(runtime=SimpleNamespace(store=object()), config=object())
     copied, _label = versions.original_source(composition, foundry)
-    assert copied["environment_variables"] == expected
+    assert copied["environment_variables"] == {**expected, **PIN}  # the synced source's pair comes along
 
 
 def test_tracing_overlay_accepts_only_zero_or_one(monkeypatch):
@@ -354,7 +357,7 @@ def test_identical_historical_definition_does_not_switch_away_from_the_served_ve
     from shared_context import behavior_agent_versions as versions
 
     foundry = Foundry(R)
-    desired = {"kind": "hosted", "image": "same:image", "environment_variables": {},
+    desired = {"kind": "hosted", "image": "same:image", "environment_variables": dict(PIN),
                "session_configuration": {"idle_timeout_seconds": 900}}
     foundry.add(R.agent_name, 4, "same", definition=desired)
     foundry.add(R.agent_name, 5, "same", definition=desired)

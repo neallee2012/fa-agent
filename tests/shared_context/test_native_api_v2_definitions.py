@@ -116,3 +116,23 @@ def test_a_v3_row_is_supported_and_the_guard_neither_logs_nor_refuses(monkeypatc
         guard.check("agent-a", "sid-a", operation="invoke")
     assert guard.refused == set()
     assert "NATIVE_SESSION_CALL_INCOMPATIBLE" not in caplog.text
+
+
+@pytest.mark.parametrize("declared,readable", [("1.0.99/1.0.199", False), ("1.0.26/1.0.103", True), (None, True)])
+def test_a_version_running_a_release_this_api_cannot_read_decides_nothing(monkeypatch, declared, readable):
+    """ADR-0009 §3 (c) Guard B on the session-side definition read: a pair outside this API's ``KNOWN_RELEASES`` is
+    "not readable yet" (503), which every caller treats as deciding nothing, never as incompatible: an older API
+    revision still serving during a deploy must not mark a newer image's SID incompatible for the newer API."""
+    from test_native_session_prepare_api import project_client
+
+    environment = {} if declared is None else {"FA_SDK_RELEASE": declared}
+    project_client(monkeypatch, get_version=lambda name, version: SimpleNamespace(
+        name=name, version=version, created_at=None, definition=hosted(V3, **environment)))
+    client = SimpleNamespace(credential=None, target=SimpleNamespace(
+        project_endpoint="https://project.example", agent_name="agent-r", agent_version="5"))
+    if readable:
+        assert behavior_native_sessions._native_profile(client) == V3
+        return
+    with pytest.raises(Problem) as unread:
+        behavior_native_sessions._native_profile(client)
+    assert unread.value.status == 503

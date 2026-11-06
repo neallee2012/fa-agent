@@ -17,7 +17,7 @@ from .native_hitl_wire import (
     MAX_RULES, HitlStatus, NativeAttentionItem, NativeHitlApprovalReference, NativeHitlClose,
     NativeHitlCommand, NativeHitlDecision, NativeHitlOnceGrant, NativeHitlPending,
     NativeHitlPendingCreate, NativeHitlReadback, NativeHitlRule, NativeHitlRuleChange,
-    NativeHitlRules, Revision, NativeHitlAuthorize, NativeHitlAuthorization, NativeHitlEnd,
+    NativeHitlRuleInput, NativeHitlRules, Revision, NativeHitlAuthorize, NativeHitlAuthorization, NativeHitlEnd,
     NativeHitlTurn, NativeHitlPendingQuery, NativeHitlPendingPage, hitl_key, pending_id,
     NativeHitlAnswer, NativeHitlQuestionCreate, NativeHitlQuestionPage, NativeHitlQuestionPending,
     NativeHitlQuestionReadback, NativeHitlQuestionReference, NativeQuestionRequiredItem, question_id,
@@ -25,6 +25,7 @@ from .native_hitl_wire import (
     ConnectorConsentReadback, ConnectorConsentReference, NativeConnectRequiredItem, consent_id,
 )
 from .source_materials import digest
+from .native_hitl_audit_wire import MAX_RULE_HISTORY_PAGE, NativeHitlRuleHistoryPage, NativeHitlRuleRevision
 from .native_hitl_material import HitlPackedRecord, material_writes, pending_summary, unpack
 from .native_routine_wire import routine_proposal_change
 
@@ -179,6 +180,25 @@ def _readback_conflict(principal, pending, state, decision, grant, grant_key, re
             or grant.team_id != principal.team or decision is None or decision.command.choice == "deny"):
         invalid = "the saved grant differs from the original human choice"
     return invalid
+
+
+def _next_rules(principal, rules, intent_id, operation, rule_id=None, rule=None):
+    """The rule list one change leaves and the stable ID it touched; the writer and the history reader share it."""
+    current = list(rules)
+    found = next((index for index, value in enumerate(current) if value.rule_id == rule_id), None)
+    if operation == "add":
+        if len(current) >= MAX_RULES:
+            raise Problem(409, "NATIVE_HITL_RULE_LIMIT", "the Team already has 20 rules; allow once or edit a rule")
+        rule_id = hitl_key("rule", principal.tenant_id, principal.team, intent_id)
+        current.append(NativeHitlRule(rule_id=rule_id, **rule.model_dump()))
+    else:
+        if found is None:
+            raise Problem(409, "NATIVE_HITL_RULE_MISSING", "the selected stable rule ID is not current")
+        if operation == "delete":
+            current.pop(found)
+        else:
+            current[found] = NativeHitlRule(rule_id=rule_id, **rule.model_dump())
+    return tuple(current), rule_id
 
 
 def _unknown():
@@ -481,23 +501,10 @@ class NativeHitlService:
         return self._rules(principal, rows)
 
     def _rule_writes(self, principal, rules, intent_id, *, operation, rule_id=None, rule=None):
-        current = list(rules.rules)
-        found = next((index for index, value in enumerate(current) if value.rule_id == rule_id), None)
-        if operation == "add":
-            if len(current) >= MAX_RULES:
-                raise Problem(409, "NATIVE_HITL_RULE_LIMIT", "the Team already has 20 rules; allow once or edit a rule")
-            rule_id = hitl_key("rule", principal.tenant_id, principal.team, intent_id)
-            current.append(NativeHitlRule(rule_id=rule_id, **rule.model_dump()))
-        else:
-            if found is None:
-                raise Problem(409, "NATIVE_HITL_RULE_MISSING", "the selected stable rule ID is not current")
-            if operation == "delete":
-                current.pop(found)
-            else:
-                current[found] = NativeHitlRule(rule_id=rule_id, **rule.model_dump())
+        current, rule_id = _next_rules(principal, rules.rules, intent_id, operation, rule_id, rule)
         revision = rules.revision + 1
         scope = _team_scope(principal)
-        snapshot = _RulesSnapshot(**scope, revision=revision, rules=tuple(current), intent_id=intent_id)
+        snapshot = _RulesSnapshot(**scope, revision=revision, rules=current, intent_id=intent_id)
         return (
             _write(self._snapshot_key(principal, revision), snapshot, "create"),
             _write(self._head_key(principal), _RulesHead(**scope, revision=revision),
@@ -721,7 +728,8 @@ class NativeHitlService:
         ikey, index = self._index(principal, self._turn(command.action.call), rows)
         if index.closed:
             raise Problem(409, "NATIVE_HITL_TURN_CLOSED", "the original turn no longer has a live approval wait")
-        if not set(command.review.matched_rule_ids) <= {rule.rule_id for rule in rules.rules}:
+        current = {rule.rule_id for rule in rules.rules}
+        if not set(command.review.matched_rule_ids) <= current or not command.review.rule_reasons.keys() <= current:
             raise Problem(409, "NATIVE_HITL_RULES_CHANGED", "reviewed rule IDs must exist in the current revision")
         pid = pending_id(principal.tenant_id, principal.team, command.action.call)
         if command.action.category == "routine":
@@ -921,6 +929,8 @@ class NativeHitlService:
         """Whether a passing review still needs the owner; raises when the current review refuses the action."""
         matched = {rule.rule_id: rule for rule in rules.rules}
         review = command.review
+        if not review.rule_reasons.keys() <= matched.keys():
+            raise Problem(409, "NATIVE_HITL_RULES_CHANGED", "reviewed rule IDs must exist in the current revision")
         if (not set(review.matched_rule_ids) <= set(matched) or review.outcome == "deny" or review.takeover_required):
             raise Problem(403, "NATIVE_HITL_REVIEW_DENIED", "current review or human takeover refuses this action")
         return (review.outcome == "ask" or command.action.category == "routine"
@@ -1032,6 +1042,93 @@ class NativeHitlService:
             raise Problem(409, "NATIVE_HITL_RECORD_INVALID", invalid)
         return value
 
+    def _pending_projection(self, principal, pid, row):
+        """One card's attention item from its own row; a packed card's checked projection, never its material parts."""
+        if row is not None and row.payload["data"].get("kind") == "native_hitl_packed_record":
+            packed = _parse(row.payload["data"], HitlPackedRecord)
+            item = packed.pending
+            if (packed.tenant_id, packed.team_id, packed.record_id, packed.record_kind) != (
+                    principal.tenant_id, principal.team, pid, "native_hitl_pending") or item is None:
+                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the pending projection belongs to another scope")
+            if (item.item_id != pid or item.approval.pending_digest != packed.sha256
+                    or item.approval.pending_id != pending_id(
+                        principal.tenant_id, principal.team, item.approval.call)):
+                raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the pending projection reference differs")
+            if principal.kind == "agent":
+                self._agent(principal, item.approval.call)
+                if packed.agent_oid != principal.oid:
+                    raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "the original Agent must read its own pending call")
+            return item
+        return pending_summary(self._pending(principal, pid, {pid: row}))
+
+    def _snapshot(self, principal, revision):
+        key = self._snapshot_key(principal, revision)
+        row = self.store.read_record(key)
+        if row is None:
+            raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "a saved rule revision is missing")
+        snapshot = _parse(row.payload["data"], _RulesSnapshot)
+        if (snapshot.tenant_id, snapshot.team_id, snapshot.revision) != (principal.tenant_id, principal.team, revision):
+            raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the saved rule revision has another scope or number")
+        return snapshot
+
+    def _revision_entry(self, principal, snapshot, previous):
+        """Replays the saved intent on the previous list; any difference from the saved snapshot is invalid, not guessed."""
+        invalid = Problem(409, "NATIVE_HITL_RECORD_INVALID", "the saved rule revision differs from its original change")
+        row = self.store.read_record(snapshot.intent_id)
+        if row is None:
+            raise invalid
+        intent = self._load(row, snapshot.intent_id, _Intent)
+        command = intent.command
+        if (intent.intent_id != snapshot.intent_id or (intent.tenant_id, intent.team_id) != (
+                principal.tenant_id, principal.team) or intent.principal_kind != "human"
+                or not isinstance(command, (NativeHitlRuleChange, NativeHitlDecision))
+                or command.expected_rules_revision != snapshot.revision - 1):
+            raise invalid
+        allow_rule = isinstance(command, NativeHitlDecision)
+        if allow_rule and command.choice != "allow_rule":
+            raise invalid
+        operation, rule_id = ("add", None) if allow_rule else (command.operation, command.rule_id)
+        try:
+            expected, rule_id = _next_rules(principal, previous, intent.intent_id, operation, rule_id, command.rule)
+        except Problem:
+            raise invalid from None
+        if expected != snapshot.rules:
+            raise invalid
+        before = next((NativeHitlRuleInput(text=value.text, behavior=value.behavior)
+                       for value in previous if value.rule_id == rule_id), None)
+        source = {}
+        if allow_rule:
+            card = self.store.read_record(command.pending_id)
+            if card is None:
+                raise invalid
+            source = dict(source_pending_id=command.pending_id,
+                          source_call=self._pending_projection(principal, command.pending_id, card).approval.call)
+        return NativeHitlRuleRevision(
+            revision=snapshot.revision, intent_id=intent.intent_id, changed_at=intent.created_at,
+            changed_by_oid=intent.principal_oid, change="allow_rule" if allow_rule else operation, rule_id=rule_id,
+            rule=command.rule, previous_rule=before, **source)
+
+    def rule_history(self, principal, *, before=None, limit=MAX_RULE_HISTORY_PAGE):
+        """Owner-only, newest first: each saved revision with who changed what, when, and from which card."""
+        if (type(limit) is not int or not 1 <= limit <= MAX_RULE_HISTORY_PAGE
+                or before is not None and (type(before) is not int or before < 1)):
+            raise Problem(422, "NATIVE_HITL_INVALID_REQUEST", "rule history takes a bounded page before one revision")
+
+        def read():
+            self._authorize(principal, owner=True)
+            head = self._rules(principal).revision
+            if before is not None and before > head + 1:
+                raise Problem(422, "NATIVE_HITL_INVALID_REQUEST", "rule history starts at a saved revision")
+            start = head if before is None else before - 1
+            end = max(0, start - limit)
+            snapshots = {revision: self._snapshot(principal, revision) for revision in range(start, max(end, 1) - 1, -1)}
+            entries = tuple(self._revision_entry(
+                principal, snapshots[revision], snapshots[revision - 1].rules if revision > 1 else ())
+                for revision in range(start, end, -1))
+            return NativeHitlRuleHistoryPage(team_id=principal.team, head_revision=head, entries=entries,
+                                             next_before=end + 1 if end else None)
+        return self.store.consistent_read(read)
+
     def pending(self, principal, query: NativeHitlPendingQuery):
         def read():
             self._authorize(principal)
@@ -1045,23 +1142,7 @@ class NativeHitlService:
             end = query.after + query.limit
             references, attention = [], []
             for pid in index.pending_ids[query.after:end]:
-                row = self.store.read_record(pid)
-                if row is not None and row.payload["data"].get("kind") == "native_hitl_packed_record":
-                    packed = _parse(row.payload["data"], HitlPackedRecord)
-                    item = packed.pending
-                    if (packed.tenant_id, packed.team_id, packed.record_id, packed.record_kind) != (
-                            principal.tenant_id, principal.team, pid, "native_hitl_pending") or item is None:
-                        raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the pending projection belongs to another scope")
-                    if (item.item_id != pid or item.approval.pending_digest != packed.sha256
-                            or item.approval.pending_id != pending_id(
-                                principal.tenant_id, principal.team, item.approval.call)):
-                        raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the pending projection reference differs")
-                    if principal.kind == "agent":
-                        self._agent(principal, item.approval.call)
-                        if packed.agent_oid != principal.oid:
-                            raise Problem(403, "NATIVE_HITL_SCOPE_DENIED", "the original Agent must read its own pending call")
-                else:
-                    item = pending_summary(self._pending(principal, pid, {pid: row}))
+                item = self._pending_projection(principal, pid, self.store.read_record(pid))
                 if self._turn(item.approval.call) != query.turn:
                     raise Problem(409, "NATIVE_HITL_RECORD_INVALID", "the pending index names another original turn")
                 skey = hitl_key("state", principal.tenant_id, principal.team, pid)

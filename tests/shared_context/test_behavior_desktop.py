@@ -606,8 +606,8 @@ def test_renew_counts_only_editors_still_open(desktop):
     with pytest.raises(Problem) as full:
         owned.open_file("third.txt", create=True)
     assert full.value.body["error"]["code"] == "DESKTOP_EDITORS_OPEN"
-    from shared_context.behavior_desktop_tools import public_desktop_failure
-    assert "ctrl+q" in public_desktop_failure("DESKTOP_EDITORS_OPEN")
+    from shared_context.behavior_desktop_tools import DESKTOP_GUIDANCE
+    assert "ctrl+q" in DESKTOP_GUIDANCE["DESKTOP_EDITORS_OPEN"]
     assert owned.renew() is True
     with pytest.raises(Problem):
         owned.open_file("third.txt", create=True)

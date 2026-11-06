@@ -260,6 +260,14 @@ def _omit_unsendable_images(body):
         "If deliver_image is available, the latest PNG screenshot can still be delivered to the user.]"))
 
 
+def _omit_non_page_images(body, pages):
+    """Vision that only PDF pages turned on admits only those pages; any other image stays out as before."""
+    others = [(content, index) for content, index, url in _image_parts(body)
+              if not (_is_inline_png(url) and url.removeprefix("data:image/png;base64,") in pages)]
+    return _replace_with_text(body, others, (
+        "[Image omitted from model context: this assistant sees only attached PDF pages read in this turn.]"))
+
+
 def _retain_latest_inline_png(body, keep=1):
     pngs = [(content, index) for content, index, url in _image_parts(body) if _is_inline_png(url)]
     return _replace_with_text(body, pngs[keep:], (
@@ -267,7 +275,7 @@ def _retain_latest_inline_png(body, keep=1):
         "desktop screenshot is included. Original image remains in session history.]"
         if keep == 1 else
         f"[Earlier inline PNG omitted from model context; only the latest {keep} "
-        "screenshots are included. Original image remains in session history.]"))
+        "images are included. Original image remains in session history.]"))
 
 
 def _task_tool_description(runtime):
@@ -338,8 +346,9 @@ class _FailureAwareStream(httpx.AsyncByteStream):
 class _ModelGateway(CopilotRequestHandler):
     def __init__(self, endpoint, http, emit, *, boundary=None, private_token=None, model=MODEL, instruction=False,
                  session_files=None, image_limit=1, delegation_runtime=None, model_call_limit=None,
-                 supports_reasoning_effort=None, inference=None):
+                 supports_reasoning_effort=None, inference=None, page_images=None):
         self.endpoint, self.http, self.emit = endpoint, http, emit
+        self.page_images = page_images
         self.image_limit = image_limit
         self.delegation_runtime = delegation_runtime
         self.boundary, self.private_token = boundary, private_token
@@ -414,6 +423,8 @@ class _ModelGateway(CopilotRequestHandler):
 
     def _limit_images(self, body, ctx):
         unsendable = _omit_unsendable_images(body) if self.instruction else 0
+        if self.page_images is not None:
+            unsendable += _omit_non_page_images(body, self.page_images)
         older = _retain_latest_inline_png(body, self.image_limit)
         omitted = unsendable + older
         if omitted:
@@ -902,12 +913,21 @@ class _TurnRequest:
     mcp_display_env: dict[str, str] | None
     user_images: tuple[tuple[str, str], ...]
     user_uploads: Any
+    pdf_page_images: bool
     on_tool_image: Callable[[str], None] | None
     resident: ResidentHolder | None
     on_reply: Callable[[list], Awaitable[None]] | None
 
     @property
     def vision_granted(self):
+        return self._images_granted or self.pdf_page_images
+
+    @property
+    def pages_only_vision(self):
+        return self.pdf_page_images and not self._images_granted
+
+    @property
+    def _images_granted(self):
         return (self.capability_session is not None and self.capability_session.vision) or bool(self.user_images)
 
 
@@ -1350,7 +1370,7 @@ class _TurnHandlers:
         self.turn, self.prepared = turn, prepared
         self.events, self.secrets = [], set()
         self.public_sequence, self.public_tools = 0, {}
-        self.mcp_calls = {}
+        self.mcp_calls, self.page_images = {}, set()
         session = turn.capability_session
         # Captured Hosted MCP tools are SDK tools too; their calls appear in public progress like custom tools.
         self.public_names = set(prepared.specs) | (set() if session is None else
@@ -1383,7 +1403,8 @@ class _TurnHandlers:
             turn.session_files.large_result_completed(data.get("tool_call_id"), _written_estimate(value))
         if turn.on_tool_image is not None:
             image = _latest_tool_image(value)
-            if image is not None:
+            # A PDF page is the user's own file, never the screenshot deliver_image sends.
+            if image is not None and image not in self.page_images:
                 turn.on_tool_image(image)
         for observer in (turn.delegation_runtime, turn.native_hitl, turn.native_operations):
             if observer is not None:
@@ -1665,9 +1686,10 @@ class _TurnHandlers:
 
     def _tool_result(self, name, output):
         turn = self.turn
+        page = name == "read_user_file" and turn.pdf_page_images
         if turn.behavior_boundary is not None:
             session = turn.capability_session
-            if output.png_base64 is not None and not (session is not None and name in session.image_tools):
+            if output.png_base64 is not None and not (page or session is not None and name in session.image_tools):
                 raise ValueError("The finite assistant profile does not admit images")
             output = ToolOutput(turn.behavior_boundary.tool_result(name, output.text), png_base64=output.png_base64)
         binary = None
@@ -1677,7 +1699,7 @@ class _TurnHandlers:
                 raise ValueError("Tool image must be PNG")
             binary = [ToolBinaryResult(
                 data=output.png_base64, mime_type="image/png", type="image",
-                description="Tool screenshot",
+                description="Attached PDF page" if page else "Tool screenshot",
             )]
         return ToolResult(text_result_for_llm=output.text, binary_results_for_llm=binary)
 
@@ -1694,6 +1716,8 @@ class _TurnHandlers:
         output = await handler(packet) if operations is None else await operations.invoke(packet, handler)
         if not isinstance(output, ToolOutput) or not isinstance(output.text, str):
             raise ValueError("Tool handler must return ToolOutput")
+        if name == "read_user_file" and output.png_base64 is not None:
+            self.page_images.add(output.png_base64)
         return self._tool_result(name, output)
 
     async def invoke(self, invocation):
@@ -1838,7 +1862,8 @@ def _model_gateway(turn, prepared, http, handlers):
                          image_limit=max(CAPABILITY_IMAGE_LIMIT if turn.vision_granted else 1, len(turn.user_images)),
                          delegation_runtime=turn.delegation_runtime, model_call_limit=turn.model_call_limit,
                          supports_reasoning_effort=turn.supports_reasoning_effort,
-                         inference=None if assembly is None else assembly.inference)
+                         inference=None if assembly is None else assembly.inference,
+                         page_images=handlers.page_images if turn.pages_only_vision else None)
 
 
 def _listed_models(turn, prepared):
@@ -2427,6 +2452,7 @@ async def run_copilot(
     mcp_display_env: dict[str, str] | None = None,
     user_images: tuple[tuple[str, str], ...] = (),
     user_uploads=(),
+    pdf_page_images: bool = False,
     on_tool_image: Callable[[str], None] | None = None,
     resident: ResidentHolder | None = None,
     on_reply: Callable[[list], Awaitable[None]] | None = None,

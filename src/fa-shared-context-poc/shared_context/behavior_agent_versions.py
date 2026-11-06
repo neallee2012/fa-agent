@@ -27,6 +27,7 @@ from .errors import Problem
 from .native_responses_wire import (
     ACCEPTED_STATE_PROFILES, NATIVE_V2_PROFILE, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE,
 )
+from .sdk_pin import PINNED_RELEASE_TEXT, RELEASE_ENV
 
 log = logging.getLogger(__name__)
 
@@ -158,6 +159,18 @@ def _declared_profile(item):
     return definition_profile(item.get("definition"))
 
 
+def _declared_release(item):
+    """The (sdk, runtime) pair ``item``'s image runs (ADR-0009 §3 (c)); None when its definition says none."""
+    from .native_deploy_gate import definition_release
+    return definition_release(item.get("definition"))
+
+
+def _release_unknown(item):
+    """Guard B: this build cannot decode what the version's image writes until its ``KNOWN_RELEASES`` has the pair."""
+    from .native_deploy_gate import release_known
+    return not release_known(_declared_release(item))
+
+
 def _build(item):
     """The installed code identity (``code_sha256()``) the version was published for (``fa_build``), or None."""
     metadata = item.get("metadata") if isinstance(item, dict) else None
@@ -185,6 +198,7 @@ class HostedVersions:
         # (endpoint, agent, version) -> the profile its definition declares, and its ``fa_build``; both immutable.
         self._profiles = {}
         self._builds = {}
+        self._releases = {}
         # (endpoint, agent, version) -> the snapshot of a selected version's definition that passed every check in
         # ``current``. FA assumes a published version's definition does not change (not verified against official
         # docs), so each selection reads only the selector and checks the snapshot again; a version not yet active
@@ -199,6 +213,7 @@ class HostedVersions:
 
     def _keep(self, key, observed):
         self._profiles[key], self._builds[key] = _declared_profile(observed), _build(observed)
+        self._releases[key] = _declared_release(observed)
 
     def profile(self, target, version):
         """The native state profile ``version``'s definition declares (None: none), for the binding row (ADR-0009
@@ -212,8 +227,16 @@ class HostedVersions:
             if not isinstance(observed, dict) or (observed.get("name"), observed.get("version")) != (
                     target.agent_name, version):
                 raise Problem(503, FOLLOWING, "the version's definition is invalid")
+            if _release_unknown(observed):  # not ready rather than incompatible: nothing is kept or recorded
+                raise Problem(503, FOLLOWING, "the version runs an SDK release this API build does not know",
+                              sdk_release_unknown=True)
             self._keep(key, observed)
         return self._profiles[key]
+
+    def release(self, target, version):
+        """The (sdk, runtime) pair ``version``'s image runs, read and kept with ``profile`` (whose 503s it raises)."""
+        self.profile(target, version)
+        return self._releases[(target.project_endpoint, target.agent_name, version)]
 
     def build_of(self, target, version):
         """``version``'s ``fa_build``: the ``code_sha256()`` of the image it runs (sync publishes it from that build).
@@ -242,6 +265,13 @@ class HostedVersions:
             refusal = (SelectorUnreadable if error.status is None or error.status in _TRANSIENT_STATUSES
                        or error.status >= 500 else Problem)
             raise refusal(503, FOLLOWING, "this Agent's Hosted version for the deployed build is not readable yet") from None
+        if isinstance(observed, dict) and _release_unknown(observed):
+            log.warning("agent endpoint version runs an SDK release this API build does not know agent=%s version=%s",
+                        target.agent_name, version)
+            with self._definitions_lock:
+                self._definitions.pop(key, None)
+            raise Problem(503, FOLLOWING, "the endpoint's selected version is not ready for this API build",
+                          sdk_release_unknown=True)
         if (not isinstance(observed, dict) or observed.get("name") != target.agent_name or observed.get("version") != version
                 or not _same_identity(observed, target)
                 or _declared_profile(observed) not in ACCEPTED_STATE_PROFILES
@@ -432,6 +462,11 @@ def image_source(foundry, target, image):
         else:
             raise Problem(409, "SOURCE_IMAGE_FIELD_MISSING", "the source definition has no image field")
         _declare_host_protocols(definition)
+        # ADR-0009 §3 (c): the pair this build's image runs, written with the image (a copy keeps its source's).
+        environment = definition.get("environment_variables")
+        if environment is not None and not isinstance(environment, dict):
+            raise Problem(409, "HOSTED_DEFINITION_INVALID", "the original Hosted environment is invalid")
+        definition["environment_variables"] = {**(environment or {}), RELEASE_ENV: PINNED_RELEASE_TEXT}
         return definition, f"{target.agent_name}:{version}"
     return source
 

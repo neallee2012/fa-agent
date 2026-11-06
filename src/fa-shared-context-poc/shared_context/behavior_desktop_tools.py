@@ -204,14 +204,6 @@ DESKTOP_GUIDANCE = {
 }
 
 
-def public_desktop_failure(code) -> str | None:
-    """Safe model-facing guidance for known desktop refusals; None keeps the generic failure."""
-    guidance = DESKTOP_GUIDANCE.get(code) if isinstance(code, str) else None
-    if guidance is None:
-        return None
-    return f"Desktop refused the action [{code}]. {guidance} Do not claim completion."
-
-
 # desktop_act raises these only before any input is sent (the observation is not even consumed), so the action
 # certainly did not happen. DESKTOP_LIMIT and the *_FAILED codes can follow input and stay unknown.
 ACT_REFUSED_BEFORE_INPUT = frozenset({"DESKTOP_OBSERVATION_STALE", "DESKTOP_HALTED", "DESKTOP_ACTION"})

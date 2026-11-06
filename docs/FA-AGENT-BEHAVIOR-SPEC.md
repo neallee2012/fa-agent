@@ -561,6 +561,33 @@ Published base `78c1d5ecc58426fb499d01387bff10b4c472995b`，程式 WIP tree
 原 RED 與 SDK 訊息接點見 [Shared Context](../src/fa-shared-context-poc/README.md#relay-vm-context)。
 只驗送出的框架與原材料未改，不當真模型理解保證；未部署。
 
+## 2026-11-05 HITL：放行紀錄（API CODE/offline，未部署）
+
+`GET /native-hitl/v1/allowed?since=<UTC>&cursor=<opaque>` 只給 Team 主人（`Behavior.Read`）。列出這個 Team 實際執行的受管呼叫：
+照 Team attention 的唯讀分區掃描，只挑 `native_hitl_authorization` 列，再讀它的 Agent intent 拿完整 action。
+`since` 預設 24 小時前（Table 伺服器 `Timestamp`），寫進 cursor，續頁沿用，續頁不能再帶 `since`。
+回 `NativeHitlAllowedPage{team_id, since, entries, next_cursor, observed_at}`；每筆 `NativeHitlAllowedEntry` 有
+`authorization_id`、`intent_id`、`authorized_at`（intent 的 `created_at`）、完整 `action`、`review`、`approval` 與
+`by=rule|default|toolbox|human_once`（只是把 review／approval 分組，原欄位照回）。卡片上選 `allow_rule` 的那一次記成 `human_once`，
+之後的呼叫才是 `rule`。authorization 與 intent 對不上回 `NATIVE_HITL_RECORD_INVALID`。一個 action 最大約
+`NATIVE_HITL_BODY_BYTES`，所以一頁累積到約 480 KiB 就停，cursor 記住同一個掃描頁裡最後一筆，下次從它之後接著讀；
+約 190 KB 的 action 一頁兩筆，整頁小於 `NATIVE_HITL_HTTP_BYTES`，測試鎖住。空頁仍可能有 `next_cursor`，不能當成沒有紀錄。
+不新增列、欄位或索引（決策 D3）；自動拒絕不在這裡（D6）。掃描在 Azure Table 上的頁數與延遲只能在 dev 量，尚未量。
+`NativeHitlRuleHistoryPage` 與這兩個 DTO 都在 API 專用的 `native_hitl_audit_wire`，Hosted 不讀，不在固定的 wire 快照裡。
+
+## 2026-11-05 HITL：規則歷史（API CODE/offline，未部署）
+
+`GET /native-hitl/v1/rules/history?before=<revision>&limit=20` 只給 Team 主人（`Behavior.Read`，Agent principal 403）。
+回 `NativeHitlRuleHistoryPage{team_id, head_revision, entries[≤20], next_before}`，新到舊；`before` 省略時從目前版本開始，
+`next_before` 是這頁最舊的版本，`null` 表示已讀到第 1 版。每筆 `NativeHitlRuleRevision` 有 `revision`、`intent_id`、
+`changed_at`（intent 的 `created_at`，API 時鐘）、`changed_by_oid`、`change=add|update|delete|allow_rule`、`rule_id`、
+這版之後的 `rule` 與上一版的 `previous_rule`，`allow_rule` 另帶來源卡 `source_pending_id` 與 `source_call`。
+不新增列或欄位：讀既有 create-only 的 `_RulesSnapshot` 與 `_Intent`，用寫入時同一個 `_next_rules` 把 intent 重放在上一版上，
+結果和保存的 snapshot 不同（含 `hitl_key("rule", …, intent_id) != rule_id`）回 `NATIVE_HITL_RECORD_INVALID`，不猜。
+被 `NATIVE_HITL_RULES_CHANGED` 擋下的 intent 沒有 snapshot，不會出現在歷史裡。來源卡只讀卡片本列（packed 卡用已核對的投影），
+整頁在一次 `consistent_read` 裡最多 63 個 key（上限 98，測試鎖住）。回應刻意不是 `NativeHitlRules`，沒有 ETag，不能當寫入基準。
+純讀，不是批准，也不代表效果已完成。
+
 ## 2026-10-04 HITL：Team 待處理發現與原回合來源（API CODE/offline）
 
 `GET /native-hitl/v1/attention?cursor=<opaque>&limit=20` 由既有 Entra Team owner＋
@@ -1228,6 +1255,26 @@ fresh／queued錯版不啟SDK；官方recovery只可讀原材料交接，不在�
 原 SP16-02 的 `AUTHORITY_UNAVAILABLE` 仍未定位唯一原因；reader 修正不是該等待中斷的根因證明。
 未重送原 RID、未執行模型／SDK runtime／live 或部署。
 
+<a id="hitl-rule-reasons"></a>
+## 2026-11-05 HITL：自動審查逐條規則的說明（D2，Neal 決定，CODE/offline，未部署）
+
+Neal 2026-11-05 決定 D2＝要：自動審查對這一版的每條規則各回一句說明，跟著審查結果保存，工作台「為什麼問你」逐條顯示。
+這段說明是模型寫的參考文字，**不影響**允許／先問／拒絕：結果仍只由 `matched_rule_ids`、`uncertain`、`takeover_required` 和「先問我」規則決定。
+
+分兩個 PR 上線，因為部署時 Hosted 版本比 API 先換：
+
+1. **第 1 步，欄位與顯示：** API、bridge 收得下帶說明的審查，工作台會顯示；Hosted 還不送說明，所以畫面上暫時看不到。
+2. **第 2 步，Hosted 送說明：** 自動審查向模型要說明並保存。第 1 步部署到 stage 之後才合併；合併、部署後真的卡片才會有說明。
+
+- **欄位：** `NativeHitlReview.rule_reasons`，`{rule_id: reason}`，最多 20 條、每條 1–200 字（Hosted 依該版規則順序產生，wire 不檢查順序）。
+  適用與否不另存：`rule_id` 在 `matched_rule_ids` 裡就是適用。空的時候不輸出（同 `reviewed_at`），所以舊審查的 bytes、
+  digest、pending ID／digest 都不變；舊資料不回填。wire 檢查：`unavailable`／`toolbox` 不能帶說明；有說明時每個命中規則都要有說明。API 建 pending 與 authorize 時，說明的規則也要在目前這一版。
+- **相容與上線順序：** 所有 decoder 都是 `extra="forbid"`。新 API 收得下有或沒有這個欄位的審查；舊 image 不送這個欄位，照常運作。
+  反過來，帶說明的審查送到舊 API 會被拒，舊 bridge 讀到帶說明的卡片會回 `NATIVE_HITL_RECORD_INVALID`。
+  deploy-staging 和 dev 的 ci_deploy 先同步 Hosted 版本、後更新 API，所以 Hosted 送說明的改動要等 API 與工作台已在這一版以上才合併。
+  v2 additive 檢查通過（新欄位預設不輸出），只重產 profile 快照。`NATIVE_HITL_BODY_BYTES` 的餘裕由 24 KiB 加到 40 KiB，放得下 20 條說明。
+- 驗證與限制見 [Shared Context README](../src/fa-shared-context-poc/README.md#hitl-rule-reasons)。
+
 ## 2026-10-03 HITL：owner 事後讀自動審查原文（CODE/offline）
 
 SP-30 的操作說明不只限出卡的 Ask。原 Team owner 可沿既有 native 歷史入口
@@ -1458,6 +1505,11 @@ H1～H3 CODE 接線齊不等於已獲准啟用；產品 reviewer 模型、live�
   已保存參照另放規則區的純讀歷史，不因有歷史就假稱仍待處理。回答問題沒有批准權。
 - 原動作完整參數以安全文字顯示，不縮為舊 64 KiB preview。三選為 `allow_once/allow_rule/deny`；
   allow_rule 先由人編輯、檢視範圍並確認，滿 20 不覆蓋、不自動改成 once。
+  2026-11-05 Neal 決定（D1＝C）：卡片給兩個規則草稿讓人選一個再改。「只這次」照原本寫死這次的命令或完整參數；
+  「這類動作」由工作台照固定規則產生、不呼叫模型：開網頁的工具只留網站（網址的 origin），shell 只留程式名稱和原資料夾，
+  其他工具只留工具和目標、不限參數。網址解析不出 http／https 網站、命令有串接／重導／引號／展開，
+  或程式本身能再執行任何命令（如 bash、sudo、python）時，只給「只這次」並寫明原因。選草稿不是決定，
+  仍按「確認規則並允許」一次才送；Auto Review、規則格式與 API 都不變。
   期限、closed、expired、deny、interrupted、effect_unknown、原放行資料依 readback 顯示；
   允許、grant、authorization 與 control receipt 都不是效果已完成。
 - 每次新決定／規則修改重讀當前材料與規則，保存完整原 command、控制 RID、revision／ETag、

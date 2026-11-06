@@ -132,6 +132,77 @@ def test_the_3dii_api_refuses_v2_rows_and_passes_v3_rows():
     assert gate.evaluate([A, B, C], store.rows, read_with(foundry), armed=False)["decision"] == "observe"
 
 
+def declaring(release, digest="e"):
+    """A v3 definition whose sync recorded the SDK/runtime pair its image runs (ADR-0009 §3 (c) Guard A/B)."""
+    item = definition(V3, digest)
+    item["environment_variables"]["FA_SDK_RELEASE"] = release
+    return item
+
+
+def test_the_release_a_definition_declares_and_the_pair_every_earlier_v3_image_ran():
+    assert gate.definition_release(declaring("1.0.28/1.0.105")) == ("1.0.28", "1.0.105")
+    # Stage 40-43 published v3 versions before the declaration existed; all of them run 1.0.26/1.0.103.
+    assert gate.definition_release(definition(V3, "d")) == ("1.0.26", "1.0.103")
+    assert gate.definition_release(definition(V2, "c")) is None
+    assert gate.definition_release(None) is None
+
+
+def test_releases_compare_by_number_not_by_text():
+    # "1.0.103" < "1.0.83" as text; a lexicographic compare would call the 3d-ii runtime older than 3d-i's.
+    assert gate.release_older(("1.0.26", "1.0.83"), ("1.0.26", "1.0.103"))
+    assert not gate.release_older(("1.0.26", "1.0.103"), ("1.0.26", "1.0.83"))
+    assert gate.release_older(("1.0.9", "1.0.103"), ("1.0.26", "1.0.103"))
+    assert not gate.release_older(("1.0.26", "1.0.103"), ("1.0.26", "1.0.103"))
+
+
+def test_armed_gate_refuses_a_row_whose_version_runs_a_release_this_api_cannot_read():
+    # Guard B: an API that does not know a pair cannot decode the receipts such an image writes (rolling back below it).
+    store, _ = store_with(row("agent-a", "sid-a", "170", profile=V3), row("agent-b", "sid-b", "160", profile=V3))
+    foundry = RecordingFoundry({("fa-stage-a", "170"): declaring("1.0.99/1.0.199"),
+                                ("fa-stage-b", "160"): declaring("1.0.26/1.0.103")})
+    report = gate.evaluate([A, B], store.rows, read_with(foundry), armed=True)
+    assert report["decision"] == "refuse"
+    assert report["refused"] == [{"agent_id": "agent-a", "reason": "definition_release_unknown"}]
+    assert gate.evaluate([A, B], store.rows, read_with(foundry), armed=True,
+                         known=(("1.0.99", "1.0.199"), ("1.0.26", "1.0.103")),
+                         release=("1.0.99", "1.0.199"))["decision"] == "pass"
+
+
+def test_armed_gate_refuses_to_deploy_an_older_release_than_a_sid_already_runs():
+    # Guard A: a deploy that moves the selector back to an older SDK would send Agents to images that cannot read the
+    # checkpoints their current SID wrote. The drifted row counts its creation version too.
+    store, _ = store_with(row("agent-a", "sid-a", "170", profile=V3), row("agent-b", "sid-b", "170", "160", profile=V3))
+    known = (("1.0.28", "1.0.105"), ("1.0.26", "1.0.103"))
+    foundry = RecordingFoundry({("fa-stage-a", "170"): declaring("1.0.28/1.0.105"),
+                                ("fa-stage-b", "170"): declaring("1.0.28/1.0.105"),
+                                ("fa-stage-b", "160"): definition(V3, "d")})
+    report = gate.evaluate([A, B], store.rows, read_with(foundry), armed=True, known=known,
+                           release=("1.0.26", "1.0.103"))
+    assert report["refused"] == [{"agent_id": "agent-a", "reason": "release_older_than_row"},
+                                 {"agent_id": "agent-b", "reason": "release_older_than_row"}]
+    assert gate.evaluate([A, B], store.rows, read_with(foundry), armed=True, known=known,
+                         release=("1.0.28", "1.0.105"))["decision"] == "pass"
+
+
+def test_armed_gate_refuses_a_drifted_row_whose_creation_version_is_unreadable():
+    # Guard A compares against the SID's creation release too; not reading it never passes as compatible.
+    store, _ = store_with(row("agent-b", "sid-b", "170", "160", profile=V3))
+    foundry = RecordingFoundry({("fa-stage-b", "170"): declaring("1.0.26/1.0.103")})
+    report = gate.evaluate([B], store.rows, read_with(foundry), armed=True)
+    assert [item["reason"] for item in report["refused"]] == ["definition_unread"]
+
+
+def test_armed_gate_counts_the_first_drift_of_a_sid_that_drifted_again():
+    # 160 (older) -> 170 (newer, first drift) -> 180 (older): the row names 160, 170 (notice_to_version) and 180.
+    drifted = row("agent-b", "sid-b", "160", "180", profile=V3).model_copy(update={"notice_to_version": "170"})
+    store, _ = store_with(drifted)
+    known = (("1.0.28", "1.0.105"), ("1.0.26", "1.0.103"))
+    foundry = RecordingFoundry({("fa-stage-b", "160"): definition(V3, "d"), ("fa-stage-b", "180"): definition(V3, "f"),
+                                ("fa-stage-b", "170"): declaring("1.0.28/1.0.105")})
+    report = gate.evaluate([B], store.rows, read_with(foundry), armed=True, known=known, release=("1.0.26", "1.0.103"))
+    assert report["refused"] == [{"agent_id": "agent-b", "reason": "release_older_than_row"}]
+
+
 def test_unarmed_gate_reports_what_it_would_refuse_and_passes():
     store, _ = store_with(row("agent-a", "sid-a", "141"))
     foundry = RecordingFoundry({("fa-stage-a", "141"): definition(V1, "a")})

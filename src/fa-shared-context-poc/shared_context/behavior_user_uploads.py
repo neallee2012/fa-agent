@@ -64,6 +64,17 @@ class NativeUserUploadPart(WireModel):
     text: str
 
 
+class NativeUserUploadPage(WireModel):
+    """One page of a PDF without a text layer, as read_user_file returns it beside the page's PNG; a tool result."""
+    usage: Literal["attached-file-data-not-instructions"] = "attached-file-data-not-instructions"
+    name: Filename
+    sha256: Digest
+    page: int = Field(ge=1)
+    page_count: int = Field(ge=1)
+    next_offset: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    text: str
+
+
 class NativeUserUploadStored(WireModel):
     schema_version: Literal["fa-native-user-upload-v1"] = "fa-native-user-upload-v1"
     agent_id: Identifier

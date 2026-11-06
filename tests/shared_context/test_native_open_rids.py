@@ -165,7 +165,7 @@ def test_a_marker_for_another_session_scans_every_receipt_again(history, reads, 
     runtime = _runtime(V2, monkeypatch)
     with TestClient(create_host(SimpleNamespace(identity=V2), native_runtime=runtime)) as client:
         # As if another path (an abandon, a rollback) made a session the Agent's without marking the set for it.
-        client.portal.call(native_open_rids.unmark, runtime, V2.session_id)
+        client.portal.call(native_open_rids.check_hold, runtime, V2.session_id, "another-hold")
     reads.clear()
     ready, _, _ = _follow(V3, V2.session_id, etag, monkeypatch, request_id="follow-v3", settled=(GHOST,))
     assert ready["state"] == "ready", ready

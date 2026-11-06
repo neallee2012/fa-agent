@@ -17,7 +17,7 @@ from shared_context import native_toolbox
 from shared_context.behavior_agent_template import TemplateCapabilityOption
 from shared_context.behavior_capabilities import (
     TOOLBOX_NOT_RUN, TOOLBOX_OUTCOME_UNKNOWN, CapabilityCapture, CapabilityGrant, McpToolResult, available_grants,
-    enabled_toolboxes, load_runtime_grants,
+    enabled_toolboxes, load_runtime_capabilities,
 )
 from shared_context.behavior_capability_prompt import addendum, session_needs
 from shared_context.behavior_sdk_state import NativeCheckpointScope
@@ -65,15 +65,15 @@ def test_toolbox_entries_stay_unloaded_until_the_deployment_names_them(monkeypat
     monkeypatch.setenv("FA_TOOL_CATALOG_DIR", str(CATALOG_DIR))
     monkeypatch.delenv("FA_CAPABILITY_BUILTINS", raising=False)
     monkeypatch.delenv("FA_CAPABILITY_TOOLBOX_ENTRIES", raising=False)
-    off = load_runtime_grants()
+    off = load_runtime_capabilities()[0]
     assert sorted(off) == ["playwright"]
     monkeypatch.setenv("FA_CAPABILITY_TOOLBOX_ENTRIES", "WebIQ")
-    on = load_runtime_grants()
+    on = load_runtime_capabilities()[0]
     assert on["WebIQ"] == GRANT and on["playwright"] == off["playwright"] and "WebIQ-MCP" not in on
     for names in ("WebIQ-MCP", "playwright", "Missing", "WebIQ,WebIQ"):
         monkeypatch.setenv("FA_CAPABILITY_TOOLBOX_ENTRIES", names)
         with pytest.raises(Problem) as error:
-            load_runtime_grants()
+            load_runtime_capabilities()[0]
         assert error.value.body["error"]["code"] == "CAPABILITY_CONFIGURATION"
     with pytest.raises(Problem):
         enabled_toolboxes(None, ("WebIQ",))

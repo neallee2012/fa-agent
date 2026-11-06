@@ -1015,6 +1015,11 @@ API 只有在**沒有任何綁定列還記著舊 profile、也沒有 session 還
   讀不到綁定列。(c) 證明不了收斂條件，所以閘門打開時一律算拒絕（fail closed）。已不在服務清單的 Agent 留下的列只檢查 (a)。
   退回較舊的 API image 也算：例如 phase 2c 之前的 image 讀不了還帶著未送出 `switch_notice` 的列，打開時就以 `rows_unread`
   拒絕（[共用 README](../src/fa-shared-context-poc/README.md#g-phase2c-clear)）。
+- **SDK／runtime 組合（[ADR-0009 M11](../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#m11-sdk-out-of-profile)
+  的 Guard A／B）：** profile 都相容時，再看目前 SID 的建立版本與紀錄版本各自的 definition 宣告的 `FA_SDK_RELEASE`
+  （沒宣告的 v3 是 1.0.26／1.0.103）：新 API 的 `KNOWN_RELEASES` 沒有它，算 `definition_release_unknown`（新 API
+  解不開那個 image 的回條，例如 API 退版）；新 build 的 pin 比它舊，算 `release_older_than_row`（等於把 Agent 送回
+  讀不了自己 checkpoint 的舊 SDK）。
 - **還沒有綁定列的 Agent（`unclaimed`）只報告、不拒絕：** ADR 第 7 點檢查的是綁定列**紀錄的** profile，沒有列就沒有
   紀錄可查（剛 onboarding 的 Agent、stage C／D 這類還沒被 API 觀察過的 Agent）；否則每次打開後的部署都會被它們擋住。
   它們第一次被觀察時才認領綁定列（`NativeBindingStore.claim`）。閘門不能判斷它的 session 是不是所選版本推導出的

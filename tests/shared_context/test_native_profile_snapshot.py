@@ -74,7 +74,8 @@ WIRE_MODULES = ("behavior_wire", "behavior_native_turn_wire", "behavior_native_a
 # ``native_*`` modules only the API runs (Context Table / API routes): all but native_cut need azure-data-tables or
 # fastapi, which requirements-hosted.txt does not install; native_cut is the API's turn-end trigger.
 API_ONLY_MODULES = frozenset({"native_binding", "native_cut", "native_deploy_gate", "native_session_patrol",
-                              "native_relay_quota", "native_groups", "native_hitl", "native_hitl_material",
+                              "native_relay_quota", "native_groups", "native_hitl", "native_hitl_allowed", "native_hitl_audit_wire",
+                              "native_hitl_material",
                               "native_routines", "native_teams_relay", "native_version_veto"})
 PINNED_PACKAGES = re.compile(r"^(github-copilot-sdk|azure-ai-agentserver-[a-z]+)==\S+$")
 # What this image's runtime declares (``FA_NATIVE_TURNS``) and labels ``_Meta`` with, v3 from ADR-0009 3d-i; ``_Meta``'s

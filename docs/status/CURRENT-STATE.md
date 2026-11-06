@@ -1,7 +1,7 @@
 # CURRENT-STATE — FA 開工摘要
 
 > **非權威快照**；先讀 AGENTS 與本檔，再按需讀來源。[維護規範](../CONVENTIONS.md#8-current-state)：60行／UTF-8 8KiB內。
-> 2026-11-04（+08）；核對origin/main `f3118993`；stage是第41版（2026.11.04-41，#1171，[紀錄](../progress.md#stage-v40-v41-1104)）：SDK 1.0.26／runtime 1.0.103，API只送v3（3d-ii）、閘門武裝，GUARD="1"（不能關、不退版）。
+> 2026-11-05（+08）；核對origin/main `e7876a5d`；stage是第43版（2026.11.05-43，#1202，[紀錄](../progress.md#stage-v43-1105)）：10 MB附件，SDK 1.0.26／runtime 1.0.103，API只送v3、閘門武裝，GUARD="1"（不能關、不退版）。
 > 本文不是操作批准；原資料、回條、unknown與費用上限保持，部署與帳本細節以來源為準。
 
 ## 現在在哪
@@ -10,9 +10,9 @@
 
 **環境（[ADR-0008](../adr/0008-environment-tiers-staging-cicd.md)）：** dev＝`faexample`；stage月USD200獨立[預算](../fa-cloud-budget-status.md)，只在改`deploy/stage/release.json`或手動時部署，**每次都需Neal核准；release PR流程（dev測試報告、免退版演練）依AGENTS**。合併者靠流程遵守（無branch protection，見ADR-0008 10-16）。
 
-**進行中（11-04）：** 3d-ii（#1167）已在stage：API只送`foundry-native-v3`、支援集合只剩v3；v2別名與v2重送已拿掉（#1179，ADR-0009 §3③），隨第43版上stage。`stage.json`與dev都武裝相容閘門（#934）；IDLE、RECONCILER仍"0"，快照URL未設。**ADR-0009前提重核（[ADR註記](../adr/0009-version-model-g-actual-version-idle-upgrade.md#platform-in-place-resume-2026-10-20)）：平台原地接續是主路徑，FA的換版（`cut`）是備援。** dev走`ci_deploy`（#919，`deploy/dev/`不匯出公開repo）。
+**進行中（11-05）：** 3d-ii（#1167）已在stage：API只送`foundry-native-v3`、支援集合只剩v3；v2別名與重送已隨第43版拿掉（#1179）。`stage.json`與dev都武裝相容閘門（#934）；IDLE、RECONCILER仍"0"，快照URL未設。**ADR-0009前提重核（[ADR註記](../adr/0009-version-model-g-actual-version-idle-upgrade.md#platform-in-place-resume-2026-10-20)）：平台原地接續是主路徑，FA的換版（`cut`）是備援。** dev走`ci_deploy`（#919，`deploy/dev/`不匯出公開repo）。
 
-**GitHub Actions：** repo為private、free方案（2000 Linux分鐘／月），Neal設USD10預算；11-04第41版deploy與public-sync跑成功，10-28原因未查明。重型套件不跑PR／push。
+**GitHub Actions：** repo為private、free方案（2000 Linux分鐘／月），Neal設USD10預算；11-05第43版deploy與public-sync跑成功，10-28原因未查明。重型套件不跑PR／push。
 
 **沿用設定（[第23版紀錄](../progress.md#stage-v23-1008)）：** 排程開（API時鐘＋對話提案）、打字預熱開、stage閒置逾時3600；feed app與工作台常駐；HITL A／B／t4開；A／B對話中換模型開；Teams connector第1波（Work IQ）旗標開；Teams逾時回覆補送（#827）仍關，需Neal。
 
@@ -26,13 +26,13 @@
 
 | 批次 | 結果 |
 |---|---|
-| stage第40、41版（11-03～04） | SDK 1.0.26上stage；閘門pass、公開第二道通過；Neal實測A、B、交辦通過。E的模型拒絕見[紀錄](../progress.md#stage-v40-v41-1104)。 |
+| stage第43版（11-05） | 附件上stage；公開第二道通過；Neal實測A、交辦、超過10 MB被擋。列印成PDF的郵件沒有文字層，照設計回「抽不到文字」（[紀錄](../progress.md#stage-v43-1105)）。 |
 | dev全新安裝（10-30） | 新表`workstatefresh`；本機bridge要開HITL才有Connect卡（[紀錄](../progress.md#r7-close-1031)）。 |
-| 品質整理二至十三輪 | 第十三輪見[基準頁](../code-quality-baseline.md#第十三輪結果2026-11-04)：刪死碼、補測、拆`_read`；第十二輪全量的失敗#1172已修，未重跑。 |
+| 品質整理二至十四輪 | 第十四輪見[基準頁](../code-quality-baseline.md#第十四輪結果2026-11-04-至-05)：刪舊adapter等死碼、補關卡測試；#1203～#1205待下一版上stage。 |
 
 ## 下一步
 
-0. **第43版**（Neal 11-04：不出42版）：#1170新助理照A選版、#1174推理模型只走Responses、拿掉v2別名與重送（#1179；`OLDER_RELEASES`的1.0.13／1.0.83要等3d-ii前的對話遷移完或確認沒有）、ub-mode第十三輪。M11核准：Guard隨44版，一步升SDK最早45版。
+0. **第44版**：Guard #1191（M11），一步升SDK最早45版；HITL規則可審計（#1206、#1207已合，Neal 11-05：卡片給兩個草稿、存逐條判斷，另做規則歷史與放行紀錄）；PDF沒有文字層時轉圖給模型；附件只留一顆上傳鈕。`OLDER_RELEASES`的1.0.13／1.0.83待確認。
 1. **送出延遲**：剩換版後首次listing、開頁扣2～4秒（[觀察](../progress.md#stage-v35-1022)）。
 2. **其他**：azd端到端（`v2026.10.21-34`前10分鐘PASS、#936未重跑，[紀錄](../progress.md#azd-e2e-public-1021)）；私有化（[ADR-0010](../adr/0010-azd-private-network-option.md)／[0011](../adr/0011-private-mode-cosmos-memory.md)，Neal 10-26決定stage改private，[dev演練](../progress.md#stage-private-rehearsal-1026)、[10-28 7/8](../progress.md#startup-private-1028)；未收DNS existing、延遲及格線、費用）；4a一半、6b、5c、開IDLE延後；Teams relay runbook。
 

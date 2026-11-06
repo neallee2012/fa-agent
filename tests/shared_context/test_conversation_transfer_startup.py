@@ -48,13 +48,36 @@ class StartupTableTransport(WireTransport):
     def send(self, request, **kwargs):
         if request.method == "GET" and urlsplit(request.url).path.rstrip("()") == "/Behavior":
             self.requests.append(request)
-            assert parse_qs(urlsplit(request.url).query)["$filter"] == ["PartitionKey eq 'authority'"]
+            query = parse_qs(urlsplit(request.url).query)
+            if query["$filter"][0].startswith(DISCOVERY_FILTER):
+                return self._discovery_page(request, query)
+            assert query["$filter"] == ["PartitionKey eq 'authority'"]
             items = [{**entity, "Payload": base64.b64encode(entity["Payload"]).decode(),
                       "Payload@odata.type": "Edm.Binary", "odata.etag": entity.metadata["etag"]}
                      for (table, partition, _), entity in sorted(self.backing.rows.items())
                      if table == "Behavior" and partition == "authority"]
             return json_response(request, 200, {"value": items}, {})
         return super().send(request, **kwargs)
+
+    def _discovery_page(self, request, query):
+        # shortcut: the `Timestamp ge` bound is not applied (no server stamps here); window tests use the
+        # test_native_hitl_attention fixture.
+        start = query.get("NextRowKey", [None])[0]
+        keys = sorted(key for table, partition, key in self.backing.rows if table == "Behavior"
+                      and partition == "authority" and "behavior:v1:row:" <= key < "behavior:v1:row;"
+                      and (start is None or key >= start))
+        top = int(query["$top"][0])
+        items = []
+        for key in keys[:top]:
+            entity = self.backing.rows[("Behavior", "authority", key)]
+            items.append({**entity, "Payload": base64.b64encode(entity["Payload"]).decode(),
+                          "Payload@odata.type": "Edm.Binary", "odata.etag": entity.metadata["etag"]})
+        more = {"x-ms-continuation-NextPartitionKey": "authority",
+                "x-ms-continuation-NextRowKey": keys[top]} if len(keys) > top else {}
+        return json_response(request, 200, {"value": items}, more)
+
+
+DISCOVERY_FILTER = "PartitionKey eq 'authority' and RowKey ge 'behavior:v1:row:' and RowKey lt 'behavior:v1:row;'"
 
 
 class SyntheticSessionClient:

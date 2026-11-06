@@ -2,6 +2,159 @@
 
 第一次用工作台：部署後怎麼打開、送第一則訊息、看批准卡和回條，見根目錄 README 的 [前 10 分鐘](../../../README.md#first-10-minutes)。本頁下面是逐次變更紀錄。
 
+<a id="hitl-rule-reasons"></a>
+## 「為什麼問你」逐條顯示自動審查的說明（Neal 2026-11-05 D2，CODE/offline，未部署）
+
+原卡片讀回的 `review.rule_reasons` 有內容時，「為什麼問你」先寫一行
+「以下是自動審查模型對每條規則的說明，只供參考，不一定正確，也不影響這次是否要問你：」，再每條規則一行
+`「規則原文」（先問我／自動允許）：適用／不適用。模型說明：…`，取代原本的「命中的規則」或逐條規則原文，同一條不寫兩次。
+適用與否看 `matched_rule_ids`，不看模型的字；審查沒把握（`uncertain`）時每條寫「沒有判定」，也不寫「規則都沒有套用」。審查用的不是目前這一版時，
+不拿目前的規則原文冒充：改用已讀到的規則歷史裡那一版當時的原文，歷史還沒讀到那一版就寫 `ID` 前 8 碼。沒有這個欄位（舊卡片、Toolbox、排程、審查失敗）就照舊顯示。
+
+分兩步上線（見[行為規格](../../../docs/FA-AGENT-BEHAVIOR-SPEC.md#hitl-rule-reasons)）：這一版只讓工作台看得懂說明，Hosted 還不送，
+所以畫面上暫時看不到；Hosted 送說明的改動要等這一版部署到 stage 之後才合併。bridge 用同一份 DTO 解碼，
+舊版 bridge 讀到帶說明的卡片會回 `NATIVE_HITL_RECORD_INVALID`，所以自己在本機跑工作台的人，到時要先更新到這一版以上。
+
+### Verified against（逐條說明）
+
+- 程式：`index.html` 的 `hitlWhyLines`；bridge `native_hitl.py` 的 `pending` 原樣轉送 `NativeHitlReadback`（沒有改）。
+- DOM：`node --test tests/shared_context/test_web_test_console_workbench.cjs` 新增 5 案：同一版命中規則一行寫原文、「適用」與說明
+  （說明裡的 HTML 只當文字），不再另列「命中的規則」；舊版沒命中的規則寫 `ID qqqqqqqq：不適用`；`uncertain` 寫「沒有判定」；
+  沒有欄位時不出現「自動審查模型」；舊版規則從規則歷史取當時原文（第 1 版的「shell 先問我」，不是今天的「執行 shell 前先問我」）。
+- standin：`standin.sh start <port> --hitl` 多種一張帶說明、已「允許這次」的卡（見 `verify-workbench` 的 hitl-approval）。
+  畫面上「為什麼問你」顯示 `「允許助理用 playwright 開 https://example.com/a。」（自動允許）：不適用。模型說明：…`。
+  層級：standin，假 Hosted，說明是種進去的，不是模型寫的；真模型寫的說明要第二步部署到 dev 後才看得到。
+
+
+<a id="hitl-allowed"></a>
+## 批准規則分頁加放行紀錄，可依規則篩選（Neal 2026-11-05，CODE/offline，未部署）
+
+- 新區塊「放行紀錄（實際執行的受管呼叫；純讀，不是批准）」。按「讀取最近 24 小時的放行紀錄」才讀（掃描 Team 的資料列，
+  速度未在 Azure 量過，所以不自動讀）。bridge `GET /api/native-hitl/team/allowed` 只放行 `cursor`，轉送
+  `GET /native-hitl/v1/allowed`；API 回應屬於別的 Team 回 `NATIVE_HITL_SCOPE_DENIED`。
+- 每筆一行，新到舊：`時間（台灣時間） · 助理 · tool（target）或「執行：shell 指令」 · 依規則「原文」自動允許（第 N 版規則）／
+  你（Team 主人）在批准卡上允許了這次／Toolbox 設定為不用批准／審查允許，沒有規則套用`。規則原文取目前清單，被刪的取規則歷史，都沒有時寫短 ID。
+- 一次點擊最多讀 10 個掃描頁；還有 `next_cursor` 時寫「已讀到 N 筆，還沒讀完；按「繼續讀取」。不能當成只有這些。」，
+  不寫「沒有放行紀錄」。
+- 「只看這條規則放行的」下拉選單：選一條規則只留 `by=rule` 且 `review.matched_rule_ids` 含它的那幾筆（規則命中後你在卡上允許的不算）；沒有時寫「這條規則在讀到的範圍內沒有放行紀錄」。
+- 說明寫明：卡片上「允許並新增規則」的那一次記成「你允許了這次」，之後的呼叫才算依規則；自動拒絕不在這裡（D6）。
+- 不在這一步：合併「控制紀錄」與「已保存的原操作參照」兩份清單（§4.5 第 6 項，改動不小，留待之後）；dev 掃描速度。
+
+### Verified against（放行紀錄）
+
+- API：`tests/shared_context/test_native_hitl_allowed.py` 18 passed：規則／真人一次／Toolbox 三種 `by`、原 action 與 review 逐字相符；
+  別 Team 的不出現、另一位 owner 只看到自己的；預設 24 小時與 `since`；空頁帶 cursor 不是結尾；三個約 190 KB 的 action 每頁小於
+  512 KiB、一頁最多 2 筆並從同一掃描頁接著讀；Agent 403；偽造或多餘參數 422；cursor 綁 Team 與時間窗；authorization 被改回 409；續讀時掃描頁被新列推移也不重複列出。
+- bridge：`test_web_test_console_hitl.py` 新增 2 案；本機 Table 替身（`StartupTableTransport`）補上分區掃描與續頁
+  （不套用 `Timestamp` 下限，時間窗由 attention fixture 驗）。
+- DOM：`test_web_test_console_workbench.cjs` 新增 3 案（按了才讀、空頁跟著 cursor、新到舊文字；沒讀完不說沒有；依規則篩選）。
+- standin：`standin.sh start 8799 --hitl`（替身的 Team 掃描只放行 authorization，待辦卡照舊不列），連線後打開「批准規則」→「放行紀錄」→ 按讀取，
+  列出種子那一筆「… · browser_navigate（playwright） · 你（Team 主人）在批准卡上允許了這次」；篩選那條規則時寫「這條規則在讀到的範圍內沒有放行紀錄」。
+- 未驗：Azure Table 上掃描的頁數與延遲（D3，只能在 dev 量）。
+
+<a id="hitl-rule-history"></a>
+## 批准規則顯示建立／修改時間、來源卡與規則歷史（Neal 2026-11-05，CODE/offline，未部署）
+
+- **規則列**多一行：`建立於 時間（台灣時間） · 最後修改於 …`（沒改過寫「建立後沒有修改」）· 來源。從卡片建立的寫
+  「由<助理>的批准卡建立（卡片 前 8 碼）」，這台工作台的 journal 有那張卡的顯示欄位時再接「：助理要使用：tool（target）」；
+  在分頁裡新增的寫「你（Team 主人）在這裡新增」。時間與來源來自 API 規則歷史（`GET /api/native-hitl/team/rule-history`，
+  bridge 轉送 `GET /native-hitl/v1/rules/history`，只放行 `before`，其他參數回 `LOCAL_REQUEST_DENIED`；API 回應屬於別的 Team 時回 `NATIVE_HITL_SCOPE_DENIED`）。
+- **規則歷史**（新區塊，新到舊）：`第 N 版 · 時間 · 你（Team 主人） · 新增／修改／刪除／從批准卡建立 · 「原文」（先問我／自動允許）`，
+  修改寫「舊 → 新」，刪除寫被刪的原文。標題與說明寫「純讀，不是批准」。
+- 讀完規則自動讀最新一頁（20 版）；更早的按「讀取更早的歷史」才讀。規則的建立在還沒讀到的頁裡時寫
+  「建立時間在更早的歷史裡，尚未讀到」；歷史讀不到時規則照常列出，寫「建立時間尚未讀到」與「規則歷史讀不到：原因」，不當成沒有紀錄。
+- 不在這一步：點開來源卡讀原卡片；「為什麼問你」改用歷史顯示舊版規則原文（那段仍寫「要等規則歷史可以讀取後才看得到」，
+  屬 D2 的函式，之後再接）；依規則自動放行的紀錄（PR3）；合併兩份清單。
+
+### Verified against（規則歷史）
+
+- API：`tests/shared_context/test_native_hitl_rule_history.py` 16 passed。add → update → delete → allow_rule 回 4,3,2,1 與
+  allow_rule,delete,update,add，原文、時間、`source_pending_id`、`source_call` 逐字相符；Agent／別 Team 403；改壞 snapshot 或
+  intent_id、intent 列不見都回 `NATIVE_HITL_RECORD_INVALID`；被搶先的 intent 不出現；20 張 packed 卡的 allow_rule 整頁 63 key、回應小於 512 KiB。
+- bridge：`test_web_test_console_hitl.py` 37 passed、`test_web_test_console_routes.py` 路由表加一列。
+- DOM：`test_web_test_console_workbench.cjs` 新增 5 案（規則列與歷史文字、分頁讀更早、讀更早途中重讀規則會丟掉舊頁、讀不到、形狀不符被拒），改 3 案（讀取清單多一筆 `team/rule-history`）。
+- standin：`standin.sh start 8798 --hitl`，按「連線」後打開「批准規則」，規則列顯示「建立於 2026/9/16 09:00:00（台灣時間） · 建立後沒有修改 ·
+  由<Agent ID>的批准卡建立（卡片 74b7632e）：助理要使用：browser_navigate（playwright）」，歷史區塊列出第 1 版「從批准卡建立」。
+  資料走真 bridge＋真 H1 API＋本機 Table 替身；替身沒有助理名稱，所以顯示 Agent ID。
+- 未驗：Azure Table 上的讀取延遲；真 dev 的資料。
+
+<a id="one-attachment-button"></a>
+## 附件只剩一顆按鈕，打開對話就讀附件設定（Neal 2026-11-05，看 stage 第 43 版，CODE/offline，未部署）
+
+Neal：輸入框下方的迴紋針、文字檔、圖片三顆合成一顆；「選擇檔案」不要先按「讀取本對話的文字檔設定」才能按；說明精簡成一兩句。
+
+- **一顆按鈕**：工具列只剩迴紋針「附加檔案」，打開同一個面板。面板裡一個 `<input type=file multiple>`（`#attachment-files`），
+  接受 txt／md／csv／json／pdf／docx／xlsx／pptx 與 png／jpg／webp。選完依類型分流：MIME 是 png／jpeg／webp 的走原本的圖片路徑，
+  其他走原本的文字檔／大檔路徑，兩邊的檢查與錯誤碼都沒改。規則照舊：每份 10 MB；文字檔、PDF、Office 與來源附件合計 4 份，圖片另計 4 張。
+  原本的「文字來源附件」不是從電腦選檔，改成面板裡「從這段對話的來源附加」一段，仍要按「讀取本對話的來源候選」。
+- **自動讀設定**：對話的輸入框可編輯或可續問時，就讀一次 `user-text-file-capability`（GET，唯讀），讀完「選擇檔案」直接可按。
+  這份設定綁回合的 request ID，和以前一樣每個新回合要重讀，現在是自動的：每次打開對話、每個回合結束後各多一次 GET
+  （推送 session 表：120 秒 25→26、600 秒 73→74 次；有推送 12→13、26→27）。讀失敗才顯示原因與「重試」，不自動重讀；
+  對話沒開附檔時寫「這段對話沒有開啟附檔。」；圖片仍可用時寫「這段對話只能附圖片。」，只擋文字檔。讀設定時「選擇檔案」暫時停用，圖片轉檔上傳中也停用。
+- **圖片限制改成選了才說**：以前模型不讀圖片時圖片選擇器直接停用；現在一顆按鈕要給文字檔用，改成選了圖片才顯示
+  「目前的模型不能讀圖片，請移除圖片或換模型。」（或「這段對話的路徑不支援附圖…」），不上傳。
+- **文案**：面板一行「可以附文字檔、PDF、Word、Excel、PowerPoint 或圖片，每份最多 10 MB。」；BOM／CRLF、不解析或執行、何時上傳、
+  圖片轉 PNG、份數規則收進「詳細」。狀態列改成「訊息和小檔共 N／8192 bytes；附件合計 n／4。」；讀設定失敗的兩個錯誤碼改成白話並指向「重試」。
+  沒事時不顯示「本回合沒有附圖」之類的句子，清除按鈕有東西可清才出現。
+
+### Verified against（一顆附件按鈕）
+
+- 程式基準：`origin/main` `3d4f81dd`。已讀 `index.html` 的 `renderUserFiles`、`renderUserImages`、`renderAttachmentToolbar`、
+  `renderAttachmentPicker`、`userFileIssue`、讀設定與兩個 change 處理程式。
+- DOM：`node --test tests/shared_context/test_web_test_console_workbench.cjs` 749 passed（基準 744）。新增 5 案：一次選圖片＋PDF＋txt 各走各的路、
+  開對話只讀一次設定且不用按、讀失敗顯示原因與「重試」且重試再讀一次、沒開附檔寫一行、面板文案與「詳細」。改寫：工具列只剩一顆、
+  模型不讀圖片時選了才拒、`重試` 讀取中清除檔案會重讀而不卡住、晚到的設定結果不能開放新草稿；其餘檔案測試改用 `#attachment-files`，
+  harness 沒指定時回合法設定。7 個讀取次數的測試加上回合結束後那一次設定讀取（`failed` 結束不能續問，所以不讀）。
+- standin：`standin.sh start 8797 --files`（新旗標：新對話選 `user_text_file_profile`）。連線後不按按鈕就能選檔；一次選三種檔案，
+  圖片因模型不讀圖片被擋、PDF 上傳替身回 503（假 Hosted 不收上傳）；只選 note.txt 送出，journal 有 `files`；回合結束後不用按就能再選。
+  選檔用 DataTransfer 放進 `#attachment-files`（沒辦法開系統檔案對話框）。沒有 dev 證據：真上傳 PDF／Office／圖片要到 dev 驗。
+
+<a id="hitl-records"></a>
+## 批准規則分頁自動讀取，控制紀錄寫明是誰、做了什麼、為什麼問你（Neal 2026-11-04，CODE/offline，未部署）
+
+Neal：在「Agent Team 設定 → 批准規則」看不到規則細節，控制紀錄只寫「原 allow_rule 決定已保存」，HITL 要可驗證、可追蹤、可審計。
+這一步只用已經保存的資料（目前那一版規則、這台工作台的 journal、原卡片讀回），不加 API 欄位。
+
+- **打開分頁就讀**：切到「批准規則」時讀一次 Team 規則（`GET /api/native-hitl/team/rules`，bridge 呼叫既有的 `rules(None)`），
+  按鈕改名「重新讀取」。讀規則不必先選對話：分頁、讀取與控制紀錄只看這個環境有沒有開真人批准（`native_hitl.enabled`）；
+  新增、修改、刪除規則仍走原本的對話路由，沒有原生對話時分頁寫明「要新增或修改規則，請先在左側選好一段原生對話」。
+  同一個範圍內讀過或讀失敗，就不自動再讀；登入、助理或對話一變，照舊清空後再讀一次。
+- **控制紀錄一筆一張小卡**：`送出於 時間（台灣時間） · 助理 · 對話名稱`（這台工作台送出的時間，不是 API Table 的決定時間）、
+  `助理要使用：tool（target）` 或 `助理要執行：shell 指令`、`你（Team 主人）允許了，並新增規則「原文」`（規則新增／修改寫原文與
+  「先問我／自動允許」；刪除只寫「從目前清單移除了一條規則」與規則 ID，journal 沒有保存被刪規則的原文）、`規則 ID` 前 8 碼與保存狀態。
+  結果未確認（`UNKNOWN`）的請求寫成「你（Team 主人）的請求結果未確認：允許這次」，不寫成已做的決定。
+  沒有選原生對話時，要走對話路由的「只核對原控制請求」按不了。規則清單的 ID 也只顯示前 8 碼。
+  欄位都來自 journal 已有的 `created_at`、`selection.call`、`display`、`command`、`receipt.result.rule_id`。清單標明
+  「這台工作台送出的控制紀錄：純讀，不是批准，也不代表效果已完成」；Team 的權威紀錄是 API Table（D4），
+  別的工作台或 Teams relay 做的決定不在這份清單。「誰」顯示「你（Team 主人）」（D7），沒有新增欄位。
+- **為什麼問你**：決定類的小卡可以展開，展開時讀原卡片（用決定送出時的對話路由；從 Team 清單做的決定用 `team` 路由）。顯示原來的
+  理由（`hitlReason`）、當時審查用第幾版規則、目前是第幾版。只要 `outcome=ask` 且 `matched_rule_ids=[]`（`source` 是 `default` 或
+  `uncertain` 都算；Toolbox 與排程不算），就寫「當時第 N 版的規則都沒有套用到這個動作」：第 N 版就是目前這一版時列出每條規則原文；
+  第 0 版時說明那是還沒有規則的初始版本；第 N 版已不是目前這一版時，說明舊版原文要等規則歷史可以讀取後才看得到，
+  不拿目前的規則冒充舊版。「目前」取上方清單與這張卡讀回的規則中較新的一版（新增規則後重讀清單，下方跟著改）。最後附這次動作的 tool、target 和完整參數。
+  讀回被拒時顯示原因，退回只用 journal 保存的欄位；收起再展開會重讀一次，畫面重畫不會自己重讀。要走對話路由但沒有選原生對話時，
+  寫「要看原卡片，請先在左側選好原對話。」
+- 不在這一步：規則的建立／修改時間與來源、規則歷史、依規則自動放行的紀錄、合併兩份清單（之後的 PR2／PR3）；
+  規則建議的寬度（D1）與逐條審查結果（D2）等 Neal 決定。
+
+### Verified against（批准規則與控制紀錄）
+
+- 程式基準：`origin/main` `116d8161`，疊在替身 `--hitl` 的分支上。已讀 `index.html` 的 `renderSettings`、`requestNativeHitl`／`hitlLive`、
+  `readNativeHitlRules`、`readNativeHitlPending`、`renderNativeHitlRules`、`hitlReason`、`hitlActionText`、`hitlDecisionText`、
+  `hitlEntryTarget`；bridge `native_hitl.py` 的 `rules`、`pending`、`call_scope`、`history`、`install_hitl_routes`。
+- DOM：`node --test tests/shared_context/test_web_test_console_workbench.cjs` 736 passed。新增 5 案：打開分頁不按按鈕只讀一次
+  `team/rules`、切走再切回不重讀、沒有原生對話也能讀；控制紀錄的時間（`09:02:03（台灣時間）`）、助理、對話、tool、選擇、規則原文、
+  規則 ID；`source=default` 與 `uncertain` 沒有命中時寫「當時第 3 版的規則都沒有套用到這個動作」並列規則原文與參數；讀回被拒時退回
+  journal 欄位。改 2 案：legacy 對話也顯示規則面板（D5）；控制紀錄改成小卡後用 `shownText` 找那一筆。
+  複審後 744 passed，再加 8 案：清單比卡片舊時以卡片讀回的較新版為準；讀回被拒的完整原因文字、重畫不重讀而收起再展開重讀一次；審查用第 2 版（目前第 3 版）、第 0 版、
+  第 2 版命中規則時只寫 `ID rrrrrrrr`，三案都不出現目前的規則原文；重讀清單到第 4 版後下方改寫「目前是第 4 版」；沒有原生對話時
+  寫「要看原卡片，請先在左側選好原對話」且核對按鈕按不了；Team 清單做的決定走 `team/pending/<pid>`；`UNKNOWN` 寫成「的請求結果未確認：…」。
+- bridge：`test_web_test_console_hitl.py` 35 passed（新增：`team/rules` 不需對話、帶參數回 `LOCAL_REQUEST_DENIED`、別的 team_id 回
+  `NATIVE_HITL_SCOPE_DENIED`）；`test_web_test_console_routes.py` 149 passed（路由順序表加一列）。
+- standin：`standin.sh start 8797 --hitl`，打開「批准規則」不按按鈕就讀到第 1 版規則；控制紀錄小卡與「為什麼問你」顯示第 0 版、
+  目前第 1 版、沒有規則套用。替身是單一助理 console，助理名稱顯示成原生回合的 Agent ID，時間是 fixture 的固定時鐘。
+  沒有 dev 證據：真 Auto Review、agent mode 與 Team 清單的決定要到 dev 驗。
+
 ## 唯讀交辦與開頁讀取的四個修正（stage 第 38 版 2026-11-01、dev 2026-11-02 現場，CODE/offline，未部署）
 
 - **唯讀交辦的標頭**：其他助理交辦來的唯讀對話，標頭不再因為「不能續問」顯示「需要處理」，改回「可以聊天」；不能續問的原因仍在輸入框下方。
@@ -1370,6 +1523,29 @@ API 太舊（404）時顯示「後端還沒有提供」，不改用其他來源�
 （2026-10-07 起卡片按鈕不再跳確認視窗，「確認規則並允許」一按就送，見[卡片一按就送](#hitl-one-click)。）
 建議只取原助理、命令／參數與位置，不自行概括成所有shell或聲稱任意命令唯讀；人可以直接修改。
 過長的建議不截斷、不改成較寬的空泛規則，留空讓人寫原本就必要的範圍；人清空後不自動補回。
+2026-11-05 起（Neal D1＝C）草稿上方有兩個按鈕，見[兩個規則草稿](#hitl-rule-drafts)；展開時仍先填「只這次」。
+
+<a id="hitl-rule-drafts"></a>
+### 兩個規則草稿（CODE/offline）
+
+按「以後允許這類」後，規則框上方有「只這次」「這類動作」兩個按鈕，按哪個就把那份草稿填進框裡（蓋掉框裡原有文字），
+人再改、再按「確認規則並允許」送一次。選草稿不送任何請求，也不算決定。兩份都由 `hitlRuleDrafts` 照固定規則產生，不呼叫模型：
+
+| 動作 | 只這次 | 這類動作 |
+|---|---|---|
+| shell | `允許 {助理} 在 "{cwd}" 執行指定命令 "{完整命令}"。` | `允許 {助理} 在 "{cwd}" 執行 {第一個詞} 程式（參數不限）。` |
+| 名稱含 navigate、參數有 `url` | `允許 {助理} 使用 {tool}，目標限於 "{target}"，參數限定為 {完整參數 JSON}。` | `允許 {助理} 用 {MCP server} 的 {tool} 開啟 {網址 origin} 網站的網頁。` |
+| 其他工具 | 同上 | `允許 {助理} 使用 {tool}，目標限於 "{target}"，參數不限。` |
+
+沒有 `cwd` 時用卡片的 target。以下情況不給「這類動作」，按鈕下方寫原因：網址不是字串或不是 http／https（含 `javascript:`、
+`data:`、解析失敗）；開網頁動作除了 `url` 還有其他參數；命令含 `; & | < > $ ( ) \` 反引號、引號、`*`、`?`、一般空格以外的空白字元
+（tab、換行、全形空白等）或以 `X=…` 開頭；第一個詞去掉路徑、大小寫、`.exe` 等副檔名與版本號後是 bash、sh、pwsh、cmd、
+sudo、env、xargs、find、awk、ssh、npx、python、node 等能再執行任何命令的程式（這份清單擋不完，寬草稿仍寫明「參數不限」，
+由人看過再確認）；草稿超過 512 字。「只這次」超過 512 字時沒有按鈕，框留空讓人寫。
+Toolbox 與排程卡仍沒有「以後允許這類」。
+
+驗證：`tests/shared_context/test_web_test_console_workbench.cjs` 的 `rule drafts:` 十一案寫死兩份草稿原文，並核對選草稿、
+修改後 `allow_rule` body 的 `rule.text` 就是改過的文字。測試替身的 `URL` 改成繼承 Node 真 `URL`，才解析得了網址。
 平常的登入／付款接手提醒、viewer入口、「不是效果已完成」與重讀按鈕收進「詳細」；
 原review帶`takeover_required`／`human_takeover`時才將接手提醒放在主畫面，不另造客戶端權限分類器。
 

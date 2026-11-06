@@ -1210,6 +1210,26 @@ API 端每輪要讀的頁數因此取決於最近約 24 小時又 5 分鐘寫入
   固定 SDK 把 `datetime` 參數轉成 `datetime'…Z'`
   （[`_serialize.py`](https://github.com/Azure/azure-sdk-for-python/blob/azure-data-tables_12.7.0/sdk/tables/azure-data-tables/azure/data/tables/_serialize.py)）。
 
+<a id="hitl-rule-reasons"></a>
+## HITL 自動審查逐條規則的說明：欄位與顯示（D2 第一步，CODE/offline，未部署）
+
+契約與兩步上線見[行為規格](../../docs/FA-AGENT-BEHAVIOR-SPEC.md#hitl-rule-reasons)。這一步只讓 API、bridge 和工作台收得下、看得到說明；
+Hosted 的自動審查還不向模型要說明，所以部署後真的卡片暫時都沒有說明。接點：
+
+- wire：`native_hitl_wire.py` 的 `NativeHitlReview.rule_reasons`（空時不輸出）與 `exact_source` 的兩條檢查；
+  API（`native_hitl.py`）、State store 的 reviews（`native_effects.py`）、`hitl-reviews` 讀回與 bridge 都用同一個 DTO，沒有另改。
+- 快照：`test_native_profile_snapshot.py` 的 v2 additive 檢查通過，`native_profile_snapshot.json` 依檔頭指令重產。
+- 本機工作台：舊 checkout 的 bridge 讀到帶說明的卡片會回 `NATIVE_HITL_RECORD_INVALID`；第二步部署後，本機接 dev／stage 的工作台要先更新到這一版以上。
+
+### Verified against（欄位與顯示）
+
+- `tests/shared_context/test_native_hitl_rule_reasons.py`：沒有欄位的審查 bytes 與 digest 等於加欄位前同一份審查的值（`0bbf0056…`）；
+  wire 拒絕 Toolbox／unavailable 帶說明、命中規則沒說明、空字串與 201 字；API 收有、沒有欄位的 pending 都 200 並原樣讀回，
+  說明的規則不在目前這一版，pending 與 authorize 都回 409 `NATIVE_HITL_RULES_CHANGED`；
+  最大的 delegation 卡加 20 條 200 字說明（Hosted 送 UTF-8；控制字元仍跳脫成每字 6 bytes，是最長的情況）在 `NATIVE_HITL_BODY_BYTES` 內且 API 收下，舊的 24 KiB 餘裕放不下。
+- `test_web_test_console_hitl.py`：bridge 讀回有、沒有說明的卡片都 200，說明原樣轉送。
+- 回歸範圍與結果見 PR 說明。未跑真模型、真 SDK runtime、Hosted 或 dev。
+
 <a id="relay-not-sent"></a>
 ## HITL 傳訊未送出分類（CODE/offline，未部署）
 
@@ -2184,6 +2204,10 @@ bridge／共用DOM先重現確認後無續做，再核同RID、10次總窗口、
 - **PDF：** Hosted 核過原檔 hash 後用 `pypdf`（只在 `requirements-hosted.txt`）抽文字層，每頁前標 `--- 第 N 頁 ---`，
   再用同一個工具分段讀；`byte_length`／`offset` 算的是抽出的文字。抽出的文字最多 10 MiB，最近 4 份留在程序記憶體，不寫磁碟。
   抽不出文字（掃描、加密、損壞）時，工具回 `USER_FILE_NO_TEXT`，請模型照實告訴使用者，不猜內容。
+- **沒有文字層的 PDF（2026-11-05，CODE/offline，dev 未驗）：** 每頁都抽不出字、且模型宣告能讀圖時，`read_user_file` 改用
+  `pypdfium2==5.14.0`（只在 `requirements-hosted.txt`）一次畫一頁，回 `NativeUserUploadPage` 和一張 PNG（走截圖同一條工具圖片路徑），
+  `next_offset` 是下一頁。預設最多前 10 頁、長邊 1600 px、每張 PNG 最多 300 KiB（超過改 16 階灰階、再改 1000 px、768 px），pdfium 只在子程序裡跑，Linux 上限位址空間（`RLIMIT_AS` 512 MiB）並設 30 秒逾時，子程序失敗或逾時的頁不給圖，模型只看得到最近 3 張；
+  細節與理由見 [ADR-0013 第 5 節](../../docs/adr/0013-chat-file-attachments-10mb.md)。模型不能讀圖，或 pdfium 也打不開（要密碼、損壞）時照舊回 `USER_FILE_NO_TEXT`。
 - **Office：** docx／xlsx／pptx 用標準庫 `zipfile`＋`ElementTree` 串流抽文字，和 PDF 共用上限、快取與 `USER_FILE_NO_TEXT`。
   docx 一段一行；xlsx 照活頁簿順序逐表輸出 CSV 列（標 `--- 工作表 名稱 ---`）；pptx 照簡報順序逐張（標 `--- 第 N 張投影片 ---`）。
   一份檔案解壓後最多讀 64 MiB，超過就標明停在哪；壞掉的工作表或投影片標記後照讀其他部分（細節見 ADR-0013 §5、§6）。
@@ -18592,7 +18616,7 @@ route；所有資料服務使用 fake transport，**不是 Azure、Memory 相容
   `desktop_act`、`desktop_read_file`，對應同一個 Agent 私人 root 的 `OwnedDesktop`；不依賴 SDK。參數為 strict
   discriminated model；公布的 JSON schema 已含 handler 的欄位、範圍、按鍵（一個 key＋不重複的 ctrl／shift／alt）
   與控制字元規則，少數更嚴的檢查（例如檔名含 `..`）仍由 handler 拒絕；結果為 typed JSON（`DesktopObservation`／
-  `DesktopFileRead`）加至多一張 PNG；`public_desktop_failure(code)` 提供已知拒絕的安全說明。桌面在 granted 回合
+  `DesktopFileRead`）加至多一張 PNG；已知拒絕的安全說明在 `DESKTOP_GUIDANCE`，由 capability 工具失敗的共用說明送給模型。桌面在 granted 回合
   開始（`start`）或第一次呼叫時啟動，且主程序必須已是 non-dumpable；同一回合 halt 後不自動恢復。
 - `behavior_process_hardening.py` 的 `disable_dumpable()` 設定 `PR_SET_DUMPABLE=0`（Linux 失敗即 raise），讓同 UID
   的桌面 app 讀不到主程序的 `/proc/<pid>/environ` 與記憶體。exec 會重設此旗標，所以執行的子程序仍只拿白名單環境。

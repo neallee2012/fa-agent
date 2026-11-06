@@ -9,7 +9,7 @@ from jsonschema import Draft202012Validator
 
 from shared_context.behavior_desktop import DESKTOP_LOCK, OwnedDesktop
 from shared_context.behavior_desktop_tools import (
-    DESKTOP_TOOLS, DesktopFileRead, DesktopObservation, DesktopToolbox, public_desktop_failure, tool_schema,
+    DESKTOP_GUIDANCE, DESKTOP_TOOLS, DesktopFileRead, DesktopObservation, DesktopToolbox, tool_schema,
 )
 from shared_context.errors import Problem
 from test_behavior_desktop import FakeRunner, private_root
@@ -117,17 +117,15 @@ def test_tool_definitions_are_unique_and_objects():
         assert tool_schema(tool.name)["type"] == "object" and tool.description
 
 
-def test_known_refusals_give_guidance_and_unknown_codes_stay_generic(toolbox):
+def test_known_refusals_have_guidance_and_unknown_tools_are_denied(toolbox):
     tools, _, _ = toolbox
     first = DesktopObservation.model_validate_json(tools.call("desktop_observe", {}).text)
     tools.call("desktop_act", {"observation_id": first.observation_id, "action": {"type": "wait"}})
     with pytest.raises(Problem) as error:
         tools.call("desktop_act", {"observation_id": first.observation_id, "action": {"type": "wait"}})
-    message = public_desktop_failure(code(error))
+    message = DESKTOP_GUIDANCE[code(error)]
     assert code(error) == "DESKTOP_OBSERVATION_STALE" and "desktop_observe" in message
     assert "do not resend" in message
-    assert public_desktop_failure("DESKTOP_HALTED").startswith("Desktop refused the action [DESKTOP_HALTED]")
-    assert public_desktop_failure("SOMETHING_ELSE") is None and public_desktop_failure(None) is None
     with pytest.raises(Problem) as error:
         tools.call("desktop_shell", {})
     assert code(error) == "DESKTOP_TOOL_DENIED"
@@ -144,7 +142,7 @@ def test_close_is_final_and_nothing_restarts_or_replays(toolbox):
             tools.call(name, arguments)
         assert code(error) == "DESKTOP_CLOSED"
     assert runner.inputs == [] and not DESKTOP_LOCK.locked()
-    assert "stop desktop work" in public_desktop_failure("DESKTOP_CLOSED")
+    assert "stop desktop work" in DESKTOP_GUIDANCE["DESKTOP_CLOSED"]
 
 
 def test_halt_is_reported_and_blocks_further_input(toolbox):

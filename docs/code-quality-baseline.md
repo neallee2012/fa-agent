@@ -753,6 +753,62 @@ CC ≥ 20 少了 48 個。CC ≥ 10 反而多 8 個：拆出來的函式有幾�
 - 刻意不碰：`SourceMaterials.prepare_large` 與 `compose_attachment`（`prepare_large` 從 09-18 起就沒有正式呼叫者，只有測試在呼叫，大於 `MAX_INLINE_BYTES` 的原件會在 commit 時失敗成 `SOURCE_PREPARATION_UNKNOWN`；由 10 MB 檔案那條線處理）、`sdk_pin.py` 的 `OLDER_RELEASES`、CI 上被跳過的 release-28 測試（由 SDK v2 那條線處理）。
 - `README.md` 還有幾行描述已刪的東西（`inventory_agent_scope`、`CONTEXT_ACTORS_JSON`），ADR-0012 也還提到 `restore_turn_tickets`；這頁前面第七、八輪列的 `append_saved_result` 已在 #1177 刪掉。
 
+## 第十四輪結果（2026-11-04 至 05）
+
+這輪接第十三輪留下的 `ContextArtifactAdapter`，再做幾個基準後續，行為只改一處（#1198）。順序是：先補測試，讓刪除前後都有東西在保護一次性送出的關卡，再刪；改 fixture 時發現的問題（被拒絕的操作回錯碼）另開 PR 先寫失敗測試再修；最後清掉第十三輪列的其他沒用候選。
+
+| 項目 | PR | 內容 |
+|---|---|---|
+| 一次性送出的關卡測試 | #1188 | 對 `WorkStateDispatcher` 的 `_arm`／`_consume` 手寫 14 個關卡 mutant，原本 work-state 的測試只殺得掉 2 個；在 `test_behavior_effects.py` 補 owner、grant（含過期）、policy、budget、派送／責任列換手、重複 arm、commit 不明等案例後，依 #1188 的說明殺掉 12 個（只加測試；送出窗口重查由 #1194 補） |
+| 伺服器層 fixture 改走正式 adapter | #1190 | `test_operation_decision_state`、`test_operation_rejection` 等借用 `ContextArtifactAdapter` 的伺服器層測試，改用正式的 `WorkStateEffectAdapter`；兩個原生測試改釘真實的關卡錯誤碼（只動測試） |
+| 刪 `ContextArtifactAdapter` | #1194 | 刪掉 `behavior_dispatch` 的 `ContextArtifactAdapter` 和它那條 HTTP GET 一次送出路徑、`BehaviorDispatcher` 只給它用的方法、`behavior_runtime` reconcile 的對應分支、`test_behavior_dispatch.py`（正式程式 +51／−449）。刪除前先補 2 個測試（consume 時派送已不在 `armed`、提交期間送出窗口關閉），並把被刪檔裡 2 個 consume 競態測試移到 work-state 路徑；14 個關卡 mutant 殺 13 個，剩下的 `_arm`「派送列已存在」在目前儲存契約下打不到（等價），留著當防線。`DispatchRecord.execution_contract` 仍接受 `fa-context-one-send-1`，舊列讀得回 |
+| 被拒絕的操作回對的錯誤碼 | #1198 | 真人拒絕過的操作再執行時，`check_mutable_target` 原本落到 `OPERATION_RECORD_MISSING`；改成在讀到 operation 列後直接拒絕 `OPERATION_HUMAN_REJECTED`。對外仍是 `BEHAVIOR_CONFLICT`（API 把所有 409 收成同一碼），精確碼只出現在操作紀錄 `BEHAVIOR_REQUEST_FAILED`；Hosted 的 `execute_operation` 工具訊息不變（agent-role v2～v4 沒宣告這個工具） |
+| 停用的重試 | #1203 | 補 `test_execute_refuses_a_retry_before_any_write_or_send`：帶 `previous_attempt_id` 的重試在寫入或送出前就回 403 `OPERATION_RETRY_DISABLED`；修正 `behavior_assistant_hosted` 裡漏寫 v4 的註解 |
+| 再刪 4 個沒有呼叫者的函式 | #1204 | `native_open_rids.unmark`、`behavior_capabilities.load_runtime_grants`、`FoundryResponsesClient.conversation_items`／`response_items`、`behavior_desktop_tools.public_desktop_failure`（刪 30 行）。每個先把測試改打正式路徑再刪；README 改指 `DESKTOP_GUIDANCE`。`DeliveryCore.scan_due`／`mark_due`／`complete_due` 是 BC-02 逾期重審唯一的草稿，依協調者決定保留，加 `shortcut:` 註解 |
+| 記憶治理沒啟用的 projection | #1205 | 刪掉 `memory_governance` 的 `record_projection`、`assemble` 的 `projection_id` 分支與 `ProjectionInput`／`ProjectionRecord`／`ProjectionVerifier`（淨 −114 行，`assemble` CC 25 → 12）。正式的 Memory Store projection（`memory_projection.py`，TC-15）是另一個東西，沒動 |
+
+### 重新量
+
+| 項目 | 起點 `60a3a210` | 結束 `3d4f81dd` | 本輪 PR | 同期其他 PR |
+|---|---|---|---|---|
+| 函式（不含 novnc） | 6,348 | 6,342 | −22 | +16 |
+| CC ≥ 10 | 945 | 944 | −5 | +4 |
+| CC ≥ 20 | 187 | 184 | −3 | 0 |
+| CC ≥ 30 | 56 | 55 | −1 | 0 |
+| CC ≥ 50 | 5 | 5 | 0 | 0 |
+| CC ≥ 100 | 2 | 2 | 0 | 0 |
+| dryer 重複（≥ 0.8，至少 4 行） | 166 對，125 對完全相同 | 165 對，124 對完全相同 | −1 | 0 |
+
+起點和第十三輪結束的 `40e5046d` 的 `src` 相同（之間只改 README；測試另有 #1176 的小修）。後兩欄是把兩次 crapper 輸出逐函式比對、依所在檔分給 PR 算出來的，不是每個 PR 前後各量一次。本輪 PR：`behavior_dispatch` 少 16 個函式（`_execute` 31、`_complete` 20、`validate` 13、`fixed_origin` 12），`memory_governance` 少 `record_projection` 11、`assemble` 25 → 12，其他刪除都是 CC 1～7（最大是 `_OneSendTransport.handle_request` 的 7）；`check_mutable_target` 4 → 5（#1198 加的檢查）。同期其他 PR 是附件 10 MB 那條線（#1187、#1193、#1195、#1196）、#1199、#1207：`native_user_uploads` 多 14 個函式（其中 `_rows` 17、`_lines` 16、`_office_text` 15、`events` 13），`public_tool_failure` 30 → 35；另 `native_sdk._reads_uploads`（#1187）、`behavior_native_sessions._scanned`（#1199）各 +1。
+
+少掉的那對 dryer 重複是 `behavior_dispatch`／`behavior_operations` 之間完全相同的一段，隨 #1194 消失。
+
+### 驗證
+
+- 每個 PR 都在 Windows、離線上跑改到的模組的測試檔（#1190、#1194、#1198 用真 runtime 1.0.103）；#1194 另外確認 #1188 的測試在刪除前後都過（193 → 127 passed，少的是被刪的 `test_behavior_dispatch.py`）。#1204、#1205 各跑 `--collect-only tests/shared_context`（16,640、16,633 個，0 errors）；#1203～#1205 合併後在 `3d4f81dd` 再跑一次（16,636 個，0 errors）。
+- #1198 先寫失敗測試：修改前兩個測試都拿到 `OPERATION_RECORD_MISSING`。#1203 的 `previous_attempt_id` 案例殺得掉拿掉重試檢查的 mutant；`idempotency_evidence_id` 案例在核心先被同一個 403 擋下，對這個 mutant 是多餘的，PR 有寫明。
+- 每個 PR 都跑 poteto 與 ponytail 兩軸審查（結果多半記在各 PR 說明或工作階段），P1／P2 清零、`gh pr checks` 全過、CLEAN 才合併。mutant 都是手寫、沒有 commit，數字以各 PR 說明為準。#1203、#1204、#1205 在第 43 版測試期間 main 凍結，解凍後才合。
+- 部署：#1188、#1190、#1194、#1198 隨第 43 版（#1202）先上 dev、再部署到 stage。#1198 的精確碼因此在 stage 生效；對外的碼、Hosted 和工作台不變，其他 PR 沒有行為變更。
+- 全量：第 43 版在 `ee0dc0c7`（含上面四個 PR）跑過 Windows 全量，16,997 passed、33 failed；33 項依 #1202 逐項歸因（25 項真 SDK 測試缺工作資料夾變數沒跑，其餘是本機環境、附件期望值、測試本身或早就存在），沒有一項指向本輪 PR。#1203、#1204、#1205 沒有部署、沒跑全量。全部都沒在 Linux 上跑。
+
+### 做法與教訓
+
+- 刪除前先量刪掉後誰還在保護：#1188 之前，14 個手寫關卡 mutant 只有 2 個會讓 work-state 的測試失敗，其餘只有舊 adapter 的測試抓得到幾個，多數連它也抓不到（只在 work-state 8 個測試檔和 `test_behavior_dispatch.py` 裡找過）。先在正式路徑補測試，再刪。
+- 刪測試 harness 會連帶拿掉伺服器層情境：第一次刪除時有 4 個測試檔失去「已套用」的情境，所以先把 fixture 改走正式 adapter（#1190），刪除 PR 才只剩刪除。
+- 改錯誤碼前先確認對外看得到什麼：#1198 第一版測試以為 HTTP 回應會變，實際上 API 把 409 全收成 `BEHAVIOR_CONFLICT`，改成驗操作紀錄；Hosted 工具也只回通用訊息。
+- 子 agent 的分類要自己再 grep 一次：分類時漏了 `test_native_toolbox`、`test_native_skill_resources` 兩個用到 `load_runtime_grants` 的測試檔，全 repo grep 才抓到。
+
+### 未處理／後續
+
+- `behavior_result_delivery` 只剩讀取端，要不要整條拿掉仍待決定（同第十三輪）。
+- `_published_checkpoint` 另外上傳的那條路仍沒有測試；`InMemoryBackupStore`、`install_offline`、`_reset_forced_refresh_window` 只有測試在用，可以搬到測試。
+- `ContextResult.summary` 與 `exact_source_fallback` 現在恆為常數，可以再收；`_consume_changes` 的 hook 可以併回；#1188 PR 列的 consume 讀回、policy 與 grant revision 檢查兩項後續還沒做。
+- 第十三輪列的候選中，`unmark`、`public_desktop_failure`、`conversation_items`／`response_items`、`load_runtime_grants`、`record_projection` 已刪，`scan_due`／`mark_due`／`complete_due` 保留；`from_response` 屬於 `source_materials`，這輪不碰。
+- 第十三輪其餘後續不變：`_finish_upload`、`test_m3_consent_is_not_silently_broadened`、`observe_turn_closed`、`tenant_id`／`UNCLASSIFIED` 的釘法，以及 README（`inventory_agent_scope`、`CONTEXT_ACTORS_JSON`）與 ADR-0012（`restore_turn_tickets`）的過時描述；`src/fa-shared-context-poc/README.md:9920`、`:9976`、`:9992` 還在描述已刪的 `ContextArtifactAdapter`，一起列入。
+- 會變成過時、這輪不改的引用（都沒有程式檢查 selector 是否存在）：
+  - `controller/progress_b1_b2_build.py:951` 指向已刪的 `test_behavior_dispatch.py`，`:1115`、`:1137`（MEM-02／06）指向被 #1205 改名的兩個 `memory_governance` 測試；這是歷史驗收工具，依協調者指示不改。
+  - 當時的驗收紀錄照原樣保留：`docs/status/PROGRESS-B1-B2.json:1832`、`.md:198` 與 `docs/agent-runtime-evaluation-baseline.json:19-21`、`.md:1437`、`:1906`（已刪的 `test_behavior_dispatch.py`），`docs/agent-runtime-evaluation-baseline.json:74-75`（同樣被改名的兩個測試）。
+
 ## 重新量
 
 ```powershell

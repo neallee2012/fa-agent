@@ -70,7 +70,7 @@ def rule_input(rules, *, operation="add", rule_id=None, text="Ask before changin
     }
 
 
-def pending_call(c, *, call_id="original-call", arguments=None, text="Original native instruction"):
+def pending_call(c, *, call_id="original-call", arguments=None, text="Original native instruction", rule_reasons=None):
     draft = first(c)
     if draft["request_id"] not in c.api.remote.records:
         assert send(c, draft, text=text).status_code == 200
@@ -90,7 +90,8 @@ def pending_call(c, *, call_id="original-call", arguments=None, text="Original n
     rules = c.hitl.service.rules(c.hitl.owner)
     command = NativeHitlPendingCreate(
         request_id="pending-" + call_id, action=action, action_digest=action.sha256,
-        review=NativeHitlReview(rules_revision=rules.revision, source="default", outcome="ask"))
+        review=NativeHitlReview(rules_revision=rules.revision, source="default", outcome="ask",
+                                rule_reasons=rule_reasons or {}))
     receipt = c.hitl.service.submit(agent, command)
     return draft, receipt.payload["result"]["pending_id"]
 
@@ -193,6 +194,18 @@ def test_persisted_native_pending_joins_attention_and_three_owner_choices_keep_o
     assert len([item for item in c.calls if item[0] == "POST" and item[1] == "/native-hitl/v1/decisions"]) == 1
     assert len(c.hitl.service.rules(c.hitl.owner).rules) == int(choice == "allow_rule")
     assert progress(c, draft["thread_id"]).json()["composer"]["attention"] == []
+
+
+@pytest.mark.parametrize("reason", [None, "這次是 shell 指令，和這條規則無關。"])
+def test_the_bridge_reads_back_a_card_with_and_without_rule_reasons(hitl_console, reason):
+    c = hitl_console
+    pending_call(c)
+    assert ui_post(c, route(c, "rules"), rule_input(c.ui.client.get(route(c, "rules")).json()["rules"])).status_code == 200
+    rule_reasons = {c.hitl.service.rules(c.hitl.owner).rules[0].rule_id: reason} if reason else None
+    _, pid = pending_call(c, call_id="explained-call", rule_reasons=rule_reasons)
+    read = c.ui.client.get(route(c, "pending/" + pid))
+    assert read.status_code == 200, read.text
+    assert read.json()["readback"]["pending"]["command"]["review"].get("rule_reasons") == rule_reasons
 
 
 def test_a_decision_keeps_what_its_card_showed_for_the_record_after_a_reload(hitl_console):
@@ -490,3 +503,119 @@ def test_rules_from_another_team_cannot_be_presented_as_this_agents_policy(hitl_
     c.mutate[0] = another_team
     result = c.ui.client.get(route(c, "rules"))
     assert result.status_code == 403 and result.json()["error"]["code"] == "NATIVE_HITL_SCOPE_DENIED"
+
+
+def test_team_rules_need_no_conversation_and_refuse_another_team(hitl_console):
+    c = hitl_console
+    assert ui_post(c, route(c, "rules"), rule_input(c.ui.client.get(route(c, "rules")).json()["rules"])).status_code == 200
+    read = c.ui.client.get("/api/native-hitl/team/rules")
+    assert read.status_code == 200, read.text
+    rules = read.json()["rules"]
+    assert rules["revision"] == 1 and [rule["text"] for rule in rules["rules"]] == [
+        "Ask before changing the synthetic workspace."]
+    assert c.ui.client.get("/api/native-hitl/team/rules?thread_id=x").json()["error"]["code"] == "LOCAL_REQUEST_DENIED"
+
+    def another_team(request, response):
+        if request.url.path == "/native-hitl/v1/rules":
+            data = response.json()
+            data["team_id"] = "another-team"
+            return httpx.Response(200, json=data, headers=response.headers)
+        return response
+
+    c.mutate[0] = another_team
+    refused = c.ui.client.get("/api/native-hitl/team/rules")
+    assert refused.status_code == 403 and refused.json()["error"]["code"] == "NATIVE_HITL_SCOPE_DENIED"
+
+
+def test_team_rule_history_needs_no_conversation_passes_only_before_and_refuses_another_team(hitl_console):
+    c = hitl_console
+    for text in ("First synthetic rule.", "Second synthetic rule."):
+        rules = c.ui.client.get("/api/native-hitl/team/rules").json()["rules"]
+        assert ui_post(c, route(c, "rules"), rule_input(rules, text=text)).status_code == 200
+    read = c.ui.client.get("/api/native-hitl/team/rule-history")
+    assert read.status_code == 200, read.text
+    page = read.json()
+    assert page["schema_version"] == "fa-native-hitl-rule-history-v1" and page["head_revision"] == 2
+    assert [(entry["revision"], entry["change"], entry["rule"]["text"]) for entry in page["entries"]] == [
+        (2, "add", "Second synthetic rule."), (1, "add", "First synthetic rule.")]
+    before = c.ui.client.get("/api/native-hitl/team/rule-history?before=2")
+    assert [entry["revision"] for entry in before.json()["entries"]] == [1]
+    assert c.calls[-1][:2] == ("GET", "/native-hitl/v1/rules/history")
+    for query, code in (("?thread_id=x", "LOCAL_REQUEST_DENIED"), ("?limit=1", "LOCAL_REQUEST_DENIED"),
+                        ("?before=1&before=2", "LOCAL_REQUEST_DENIED"), ("?before=0", "NATIVE_HITL_INVALID_REQUEST"),
+                        ("?before=-1", "NATIVE_HITL_INVALID_REQUEST"), ("?before=x", "NATIVE_HITL_INVALID_REQUEST"),
+                        ("?before=" + "9" * 5000, "NATIVE_HITL_INVALID_REQUEST")):
+        calls = len(c.calls)
+        assert c.ui.client.get("/api/native-hitl/team/rule-history" + query).json()["error"]["code"] == code, query
+        assert len(c.calls) == calls, query
+
+    def another_team(request, response):
+        if request.url.path == "/native-hitl/v1/rules/history":
+            data = response.json()
+            data["team_id"] = "another-team"
+            return httpx.Response(200, json=data, headers=response.headers)
+        return response
+
+    c.mutate[0] = another_team
+    refused = c.ui.client.get("/api/native-hitl/team/rule-history")
+    assert refused.status_code == 403 and refused.json()["error"]["code"] == "NATIVE_HITL_SCOPE_DENIED"
+
+
+def test_the_adapter_lets_only_bounded_history_selectors_reach_the_api():
+    from web_test_console.adapter import _check_params
+    _check_params("GET", "/native-hitl/v1/rules/history", None, {"before": 3, "limit": 20})
+    for params in ({"before": 0}, {"limit": 21}, {"before": "3"}, {"cursor": "x"}):
+        with pytest.raises(ConsoleError):
+            _check_params("GET", "/native-hitl/v1/rules/history", None, params)
+    with pytest.raises(ConsoleError):
+        _check_params("POST", "/native-hitl/v1/rules/history", {}, {})
+
+
+def test_team_allowed_log_needs_no_conversation_passes_only_a_cursor_and_refuses_another_team(hitl_console):
+    from shared_context.native_hitl_wire import NativeHitlAuthorize
+    c = hitl_console
+    _draft, pid = pending_call(c)
+    action = c.hitl.service.read(c.hitl.owner, pid).pending.command.action
+    action = action.model_copy(update={"call": action.call.model_copy(update={"tool_call_id": "toolbox-call"})})
+    rules = c.hitl.service.rules(c.hitl.owner)
+    c.hitl.service.submit(c.hitl.agent, NativeHitlAuthorize(
+        request_id="claim-toolbox", action=action, action_digest=action.sha256, expected_rules_etag=rules.etag,
+        review=NativeHitlReview(rules_revision=rules.revision, source="toolbox", reason="toolbox_never", outcome="allow"),
+        effect_token="effect-toolbox"))
+    entries, cursor = [], None
+    for _ in range(200):
+        read = c.ui.client.get("/api/native-hitl/team/allowed", params={} if cursor is None else {"cursor": cursor})
+        assert read.status_code == 200, read.text
+        assert read.json()["schema_version"] == "fa-native-hitl-allowed-v1"
+        entries += read.json()["entries"]
+        cursor = read.json()["next_cursor"]
+        if cursor is None:
+            break
+    assert [(entry["by"], entry["action"]["call"]["tool_call_id"]) for entry in entries] == [("toolbox", "toolbox-call")]
+    assert c.calls[-1][:2] == ("GET", "/native-hitl/v1/allowed")
+    for query, code in (("?since=2026-01-01T00:00:00%2B00:00", "LOCAL_REQUEST_DENIED"),
+                        ("?thread_id=x", "LOCAL_REQUEST_DENIED"), ("?cursor=a&cursor=b", "LOCAL_REQUEST_DENIED"),
+                        ("?cursor=not%20a%20cursor", "NATIVE_HITL_INVALID_REQUEST")):
+        calls = len(c.calls)
+        assert c.ui.client.get("/api/native-hitl/team/allowed" + query).json()["error"]["code"] == code, query
+        assert len(c.calls) == calls, query
+
+    def another_team(request, response):
+        if request.url.path == "/native-hitl/v1/allowed":
+            data = response.json()
+            data["team_id"] = "another-team"
+            return httpx.Response(200, json=data, headers=response.headers)
+        return response
+
+    c.mutate[0] = another_team
+    refused = c.ui.client.get("/api/native-hitl/team/allowed")
+    assert refused.status_code == 403 and refused.json()["error"]["code"] == "NATIVE_HITL_SCOPE_DENIED"
+
+
+def test_the_adapter_lets_only_a_cursor_reach_the_allowed_log():
+    from web_test_console.adapter import _check_params
+    _check_params("GET", "/native-hitl/v1/allowed", None, {"cursor": "abc_-"})
+    _check_params("GET", "/native-hitl/v1/allowed", None, {})
+    for params in ({"limit": 5}, {"cursor": "not a cursor"}, {"before": 1}):
+        with pytest.raises(ConsoleError):
+            _check_params("GET", "/native-hitl/v1/allowed", None, params)

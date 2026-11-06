@@ -248,14 +248,6 @@ class FoundryResponsesClient:
             raise Problem(502, "NATIVE_STATE_INVALID", "the platform history page or cursor is incomplete") from None
         return page
 
-    def conversation_items(self, conversation_id, *, after=None, limit=20):
-        self.history_record("conversation", conversation_id)
-        return self.history_items("conversation", conversation_id, after=after, limit=limit)
-
-    def response_items(self, response_id, *, after=None, limit=20):
-        value = self.history_record("response", response_id)
-        return value, self.history_items("response", response_id, after=after, limit=limit)
-
     @staticmethod
     def _history_path(kind: HistoryKind, identifier):
         if kind not in {"conversation", "response"}:

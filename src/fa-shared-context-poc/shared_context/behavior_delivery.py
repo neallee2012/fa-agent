@@ -1173,6 +1173,8 @@ class DeliveryCore:
         writes.extend(self._index_writes(snapshot, context, ob))
         return ob, writes
 
+    # shortcut: scan_due/mark_due/complete_due have no production caller yet; they are the only draft of BC-02
+    # overdue re-review (FA-AGENT-BEHAVIOR-SPEC), kept on purpose. Wire them when BC-02 is implemented.
     def scan_due(self, command: ScanRequest, context: ExecutionContext) -> Record:
         command, context = _command(command, ScanRequest), _check(context, ExecutionContext)
         request = self.request_for(command, context)

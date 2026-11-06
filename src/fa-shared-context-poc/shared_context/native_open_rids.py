@@ -139,15 +139,6 @@ async def mark_complete(runtime, session_id, since, *, responses=False):
         log.warning("FA_NATIVE_OPEN_RIDS_UNMARKED code=%s", error.body["error"]["code"])
 
 
-async def unmark(runtime, session_id):
-    """Never trust the marker for ``session_id`` again (its next follow scans every receipt). Raises when it can not
-    be cleared."""
-    def change(value):
-        return value if value.complete_for != session_id else _with(value, complete_for=None, complete_since=None)
-
-    await _update(runtime, change)
-
-
 async def check_hold(runtime, session_id, since):
     """At a follow's start, while the Agent record still holds the source's own environment (``since``: the request
     that made ``session_id`` the Agent's, None without one): a marker an earlier hold of the same SID wrote is cleared.

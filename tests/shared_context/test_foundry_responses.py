@@ -81,7 +81,8 @@ def test_conversation_creation_and_scoped_history_use_only_the_platform_and_orig
         client = FoundryResponsesClient(native, team_id="team-one", conversation_mode="conversation")
         cid = client.create_conversation(before_send=lambda: None)
         assert cid == "conv-platform"
-        page = client.conversation_items(cid, after="msg-before", limit=2)
+        client.history_record("conversation", cid)
+        page = client.history_items("conversation", cid, after="msg-before", limit=2)
         assert page["last_id"] == "msg-answer" and page["has_more"] is True
         assert len(calls) == 3
         assert all("/invocations" not in call.url.path and "/endpoint/sessions/" not in call.url.path for call in calls)
@@ -94,7 +95,7 @@ def test_conversation_creation_and_scoped_history_use_only_the_platform_and_orig
     {"fa_agent_id": TARGET.agent_id, "fa_team_id": "another-team"},
     {},
 ])
-def test_history_refuses_scope_mismatch_before_reading_items(changed):
+def test_history_record_refuses_scope_mismatch(changed):
     calls = []
 
     def server(request):
@@ -104,8 +105,8 @@ def test_history_refuses_scope_mismatch_before_reading_items(changed):
     native = FoundryHttpClient(TARGET, Credential(), transport=httpx.MockTransport(server))
     try:
         with pytest.raises(Problem) as denied:
-            FoundryResponsesClient(native, team_id="team-one", conversation_mode="conversation").conversation_items(
-                "conv-platform", limit=20)
+            FoundryResponsesClient(native, team_id="team-one", conversation_mode="conversation").history_record(
+                "conversation", "conv-platform")
         assert denied.value.status == 403 and denied.value.body["error"]["code"] == "NATIVE_STATE_SCOPE"
         assert len(calls) == 1 and calls[0].url.path.endswith("/conversations/conv-platform")
     finally:
@@ -133,7 +134,8 @@ def test_chain_history_and_cancel_address_the_original_response_without_a_vm_rea
     native = FoundryHttpClient(TARGET, Credential(), transport=httpx.MockTransport(server))
     try:
         client = FoundryResponsesClient(native, team_id="team-one", conversation_mode="previous_response_id")
-        response, page = client.response_items("resp-original")
+        response = client.history_record("response", "resp-original")
+        page = client.history_items("response", "resp-original")
         assert response["previous_response_id"] == "resp-previous" and page["has_more"] is False
         cancelled = client.cancel("resp-original", before_send=lambda: None)
         assert cancelled.id == "resp-original" and cancelled.status == "cancelled"

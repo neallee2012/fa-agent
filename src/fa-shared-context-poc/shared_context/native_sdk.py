@@ -38,7 +38,7 @@ from .behavior_skill_prompt import assemble_prompt
 from .behavior_turn_usage import AGENT_TURN_USAGE_PATH, AgentTurnUsageReport
 from .behavior_user_turn import TurnNumber as UserTurn, UserTurnNumber
 from .behavior_wire import AssistantSdkStop, Identifier, WireModel
-from .behavior_user_uploads import NativeUserUploadPart
+from .behavior_user_uploads import NativeUserUploadPage, NativeUserUploadPart
 from .native_user_uploads import turn_uploads
 from .errors import Problem
 from .m3_models import Filename
@@ -53,7 +53,8 @@ from .native_capability_tools import approved_skills_provider, mcp_api_provider
 from .native_sdk_profiles import NativeSdkStart, ORIGIN_ADDENDUM, check_start_capture, native_context
 from .native_assembly import NativeAssemblyCollector
 from .native_inference import NativeInferenceCollector
-from .sdk_pin import PROFILE_RELEASES, RUNTIME_VERSION, SDK_VERSION
+from .sdk_pin import (PINNED_RELEASE_TEXT, PROFILE_RELEASES, RELEASE_ENV, RUNTIME_VERSION, SDK_VERSION,
+                      UNDECLARED_RELEASE)
 
 _PROFILES = frozenset({
     "fa-instruction-v1", "fa-instruction-v2", "fa-instruction-v3", "fa-instruction-v4",
@@ -153,12 +154,13 @@ class NativeHistoricalText(WireModel):
     attached_files: tuple[Filename, ...] | None = Field(default=None, max_length=4, exclude_if=lambda value: value is None)
 
 
-_USER_FILE_READ = TypeAdapter(NativeHistoricalText | NativeUserUploadPart)
+_USER_FILE_READ = TypeAdapter(NativeHistoricalText | NativeUserUploadPart | NativeUserUploadPage)
 
 
 class NativeUserFileRead:
-    """The model-boundary check for read_user_file: an earlier turn's literal file, or one part of a large attached
-    file. A tool result inside this process, not wire, so not a new pinned model."""
+    """The model-boundary check for read_user_file: an earlier turn's literal file, one part of a large attached
+    file, or one page of a PDF without a text layer. A tool result inside this process, not wire, so not a new
+    pinned model."""
 
     @staticmethod
     def model_validate_json(text):
@@ -172,7 +174,7 @@ class NativeUserFileName(WireModel):
         "Optional completed user turn that attached it; omit it to read the latest earlier turn with this exact name."))
     offset: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None, description=(
         "For a large attached file only: a byte offset below its byte_length, such as the next_offset of the part "
-        "read before; omit it to start at the beginning."))
+        "read before (for a PDF shown as page images, a page index from 0); omit it to start at the beginning."))
 
 
 # TC-06: the pinned runtime keeps the first and the latest user messages verbatim after compacting, so an earlier
@@ -199,6 +201,12 @@ def _reads_uploads(receipt):
     return receipt.capture.template.settings.user_text_file_profile is not None
 
 
+def _reads_pdf_pages(receipt):
+    """A PDF without a text layer is read as page images only by a model that reads images; the SDK session must
+    admit images from its start, before any read shows whether a PDF needs them."""
+    return _reads_uploads(receipt) and receipt.capture.model.supports_image_input is True
+
+
 def _remove_turn_dir(root, turn_root):
     """A turn's own files (SDK config, runtime-work, MCP homes, work) and its short MCP TMPDIR beside the job lane's."""
     from .native_local_capabilities import mcp_temp_path
@@ -218,13 +226,15 @@ CAPABILITY_TOOL_GUIDANCE[USER_FILE_GONE] = (
     "it again (in Chinese: 「附件已不在，請重新附加」); do not guess its content.")
 USER_FILE_NO_TEXT = "USER_FILE_NO_TEXT"
 CAPABILITY_TOOL_GUIDANCE[USER_FILE_NO_TEXT] = (
-    "This file has no text that can be extracted (it may be a scanned PDF, or password-protected or damaged). Tell "
+    "This file has no text that can be extracted (a scanned PDF this assistant cannot view as images, or a "
+    "password-protected or damaged file). Tell "
     "the user it cannot be read as text and that attaching the same file again will not help; do not guess its "
     "content.")
 USER_FILE_OFFSET = "USER_FILE_OFFSET"
 CAPABILITY_TOOL_GUIDANCE[USER_FILE_OFFSET] = (
     "The offset is outside this file. Use a byte offset from 0 to below its byte_length (the length of the text "
-    "this tool returns), or omit it to read from the start.")
+    "this tool returns), or for a PDF shown as page images the next_offset of a page read before, or omit it to "
+    "read from the start.")
 
 
 def turn_text(parts, handoffs=()):
@@ -673,15 +683,25 @@ class NativeSdkExecutor:
             if accounting is not None:
                 accounting.history_read(kind, turn_number, outcome)
 
-        uploads = turn_uploads(receipt.command)
+        uploads, page_images = turn_uploads(receipt.command), _reads_pdf_pages(receipt)
         loaded = {}  # ADR-0013: the file last read this turn, its bytes checked once
 
         async def upload_part(upload, offset, turn_number):
-            from .native_user_uploads import NoText, load_upload, read_part, readable
+            from .native_user_uploads import NoText, PdfPages, load_upload, pdf_pages, read_page, read_part, readable
             key = upload.sha256, upload.media_type  # the same bytes as .txt and .pdf read differently
+
+            def content():
+                data = load_upload(upload)
+                try:
+                    return readable(upload, data)
+                except NoText:
+                    if not (page_images and upload.media_type == "application/pdf"):
+                        raise
+                    return pdf_pages(data)
+
             if key not in loaded:
                 try:
-                    data = await asyncio.to_thread(lambda: readable(upload, load_upload(upload)))
+                    data = await asyncio.to_thread(content)
                 except Problem as error:
                     if error.body["error"]["code"] != "NATIVE_FILE_MISSING":
                         raise
@@ -692,6 +712,9 @@ class NativeSdkExecutor:
                 loaded[key] = data
                 observed("read_user_file", turn_number, "read")
             try:
+                if isinstance(loaded[key], PdfPages):
+                    page, png = await asyncio.to_thread(read_page, upload, loaded[key], offset or 0)
+                    return ToolOutput(page.model_dump_json(), png_base64=png)
                 part = read_part(upload, loaded[key], offset or 0)
             except ValueError:
                 raise ToolFailure("The offset is outside the file.", public_code=USER_FILE_OFFSET) from None
@@ -814,8 +837,10 @@ class NativeSdkExecutor:
                  + (" Files the user attached are kept by FA, not on the computer's disk; read them here. A large "
                     "file returns one part at a time: call again with its next_offset, or jump to any byte offset "
                     "to find a later part. A PDF, docx, xlsx or pptx returns its extracted text with page, sheet "
-                    "or slide markers (a sheet as CSV rows), so its byte_length and offsets count that text. "
-                    "Never estimate content you have not read."
+                    "or slide markers (a sheet as CSV rows), so its byte_length and offsets count that text."
+                    + (" A PDF with no text layer instead returns one page image per call; its next_offset is "
+                       "the next page index, from 0." if _reads_pdf_pages(receipt) else "")
+                    + " Never estimate content you have not read."
                     if name == "read_user_file" else "")
                  if name.startswith("read_") and name != "read_context" else
                  "Legacy job-bound source/operation is unavailable in native turns; report this limitation, never claim success."),
@@ -1208,6 +1233,8 @@ class NativeSdkExecutor:
             options["user_images"] = images
         if turn_uploads(receipt.command):
             options["user_uploads"] = receipt.command.uploads
+        if _reads_pdf_pages(receipt):
+            options["pdf_page_images"] = True
         if receipt.routine is not None:
             from .native_routine_wire import NativeRoutineTurnSource
             source = NativeRoutineTurnSource(
@@ -1333,6 +1360,10 @@ def native_runtime_from_environment(hosted):
     # with a pair this runtime does not write (a v3 image declaring v2 loses its work files at 3d-ii).
     if PROFILE_RELEASES[state_profile] != (SDK_VERSION, RUNTIME_VERSION):
         raise Problem(403, "NATIVE_TURNS_DISABLED", "the native state profile names another SDK/runtime release")
+    # Guard A/B: the API reads this image's pair from the definition's declaration, so it must be this image's;
+    # undeclared is what the API takes it for (a newer image under a definition that says nothing does not start).
+    if os.environ.get(RELEASE_ENV, "/".join(UNDECLARED_RELEASE)) != PINNED_RELEASE_TEXT:
+        raise Problem(403, "NATIVE_TURNS_DISABLED", "the version declares another SDK/runtime release than this image")
     if (not os.environ.get("FOUNDRY_HOSTING_ENVIRONMENT")
             or os.environ.get("AGENTSERVER_TASKS_BACKEND", "").strip().lower() not in {"", "hosted"}):
         raise Problem(403, "NATIVE_TURNS_DISABLED", "the deployed native path requires the official Hosted backend")

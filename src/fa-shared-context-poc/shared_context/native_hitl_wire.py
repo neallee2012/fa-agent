@@ -17,11 +17,14 @@ from .connector_registry import ConnectorId
 from .tool_catalog import _TOOLBOX_NAME
 
 MAX_RULES = 20
+RULE_REASON_CHARS = 200
+RuleReason = Annotated[str, Field(min_length=1, max_length=RULE_REASON_CHARS)]
 NATIVE_HITL_PREFIX = "/native-hitl/v1"
 ENABLED_ENV = "FA_NATIVE_HITL_ENABLED"
 TTL_ENV = "FA_NATIVE_HITL_TTL_SECONDS"
 INTERACTIVE_TTL_ENV = "FA_NATIVE_HITL_INTERACTIVE_TTL_SECONDS"
-NATIVE_HITL_BODY_BYTES = DELEGATION_PREPARE_BYTES + 24 * 1024
+# The margin also holds a full rule_reasons map (20 reasons of 200 characters in UTF-8).
+NATIVE_HITL_BODY_BYTES = DELEGATION_PREPARE_BYTES + 40 * 1024
 NATIVE_HITL_HTTP_BYTES = 512 * 1024
 NATIVE_HITL_ERRORS = frozenset({
     "NATIVE_HITL_SCOPE_DENIED", "NATIVE_HITL_OWNER_ONLY", "NATIVE_HITL_AGENT_ONLY",
@@ -246,11 +249,18 @@ class NativeHitlReview(WireModel):
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     takeover_required: bool = Field(default=False, exclude_if=lambda value: not value)
     reviewed_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
+    # The model's one-line reason per rule, for the owner to read; never an input to outcome (Neal 2026-11-05 D2).
+    # A rule applies exactly when its ID is in matched_rule_ids, so no second verdict is stored.
+    rule_reasons: dict[Identifier, RuleReason] = Field(
+        default_factory=dict, max_length=MAX_RULES, exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def exact_source(self):
         if len(set(self.matched_rule_ids)) != len(self.matched_rule_ids):
             raise ValueError("matched rule IDs must be unique")
+        if self.rule_reasons and (self.source in {"unavailable", "toolbox"}
+                                  or not set(self.matched_rule_ids) <= self.rule_reasons.keys()):
+            raise ValueError("rule reasons come from a model review and explain every matched rule")
         if (self.source == "rules") != bool(self.matched_rule_ids):
             raise ValueError("retain matched rules or the explicit default/fallback source")
         if self.source in {"unavailable", "uncertain"} and self.outcome != "ask":

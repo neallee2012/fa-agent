@@ -867,6 +867,16 @@ def test_a_revocation_between_consume_snapshot_and_commit_conflicts():
     assert h.work() == before
 
 
+@pytest.mark.parametrize("retry", [{"previous_attempt_id": "earlier"}, {"idempotency_evidence_id": "evidence"}])
+def test_execute_refuses_a_retry_before_any_write_or_send(retry):
+    h = EffectHarness()
+    before, count = copy.deepcopy(h.work()), h.submissions()
+    with pytest.raises(Problem) as error:
+        h.effects.dispatcher.execute(h.command.model_copy(update=retry), CONTEXT)
+    assert (error.value.status, code(error)) == (403, "OPERATION_RETRY_DISABLED")
+    assert h.submissions() == count and h.work() == before
+
+
 def test_a_replayed_arm_is_never_permission_to_send():
     h = EffectHarness()
     h.effects.authorize(h.command, CONTEXT)

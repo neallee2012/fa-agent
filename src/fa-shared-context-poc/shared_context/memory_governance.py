@@ -6,23 +6,21 @@ records. Neither an HTTP reviewer_id nor finding an existing source is approval.
 ReviewVerifier.verify must look up the exact prior decision from its trusted
 review authority; do not implement it as a model-supplied boolean check.
 
-Rows use control_key("memory-subject", scope.key, subject), "memory-claim",
-"memory-revocation" and "memory-projection". Subject state is a bounded (24 claim)
-current-head directory, not semantic search. Claim versions/revocations and
-projection coverage are immutable and share the BehaviorStore guard. Revoke
-advances subject sequence immediately; old projections cannot reactivate a head.
+Rows use control_key("memory-subject", scope.key, subject), "memory-claim"
+and "memory-revocation". Subject state is a bounded (24 claim)
+current-head directory, not semantic search. Claim versions/revocations are
+immutable and share the BehaviorStore guard. Revoke advances subject sequence
+immediately.
 Source current versions are checked again inside each mutation's EGT.
 
 No Foundry Memory calls, native extraction receipts, deployment or policy
-publication occur here. An external projection consumer must preserve this
-lineage and separately verify native receipts. Missing required facts, stale
+publication occur here. Missing required facts, stale
 sources, unknown token counts and incomplete necessary graphs fail closed.
 ContextResult includes real original bytes, never just a hash-only manifest.
 """
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -47,8 +45,7 @@ MAX_SUBJECT_CLAIMS = 24
 __all__ = [
     "ClaimCandidate", "ClaimPlan", "ClaimReference", "ClaimRevocation", "ContextManifest",
     "ContextResult", "ContextSection", "ContextVersions", "MemoryGovernance",
-    "ProjectionInput", "ProjectionRecord", "ProjectionVerifier", "ReviewAttestation",
-    "ReviewedClaim", "ReviewVerifier", "SubjectState", "claim_digest",
+    "ReviewAttestation", "ReviewedClaim", "ReviewVerifier", "SubjectState", "claim_digest",
 ]
 
 
@@ -177,29 +174,6 @@ class ClaimRevocation(SourceModel):
     revoked_at: datetime
 
 
-class ProjectionInput(SourceModel):
-    projection_id: Identifier
-    subject: Identifier
-    visibility: Literal["team", "private"] = "private"
-    covered_sequence: Annotated[int, Field(ge=1)]
-    claims: Annotated[tuple[ClaimReference, ...], Field(min_length=1, max_length=MAX_SUBJECT_CLAIMS)]
-    sources: Annotated[tuple[SourceReference, ...], Field(min_length=1, max_length=24)]
-    projector_version: Identifier
-    model_version: Identifier
-    schema_id: Identifier
-    text: Annotated[str, Field(min_length=1, max_length=16384)]
-
-
-class ProjectionRecord(SourceModel):
-    schema_version: Literal[1] = 1
-    scope: SourceScope
-    projection: ProjectionInput
-    source_fingerprint: Digest
-    token_count: Annotated[int, Field(ge=1)]
-    byte_length: Annotated[int, Field(ge=1)]
-    request: ControlRequest
-
-
 class ContextVersions(SourceModel):
     work_revision: Annotated[int, Field(ge=1)]
     release_version: Identifier
@@ -244,9 +218,6 @@ class ContextResult:
     summary: str | None
 
 
-ProjectionVerifier = Callable[[ProjectionInput, tuple[ReviewedClaim, ...], Mapping[str, ExactSource]], None]
-
-
 def claim_digest(candidate: ClaimCandidate, scope: SourceScope) -> str:
     return digest({"scope": scope.model_dump(mode="json"), "candidate": candidate.model_dump(mode="json")})
 
@@ -254,14 +225,13 @@ def claim_digest(candidate: ClaimCandidate, scope: SourceScope) -> str:
 class MemoryGovernance:
     def __init__(self, sources: SourceMaterials, *, clock: Callable[[], datetime],
                  token_counter: Callable[[bytes], int | None], review_verifier: ReviewVerifier | None = None,
-                 projection_verifier: ProjectionVerifier | None = None,
                  max_context_tokens: int = 8192, max_context_bytes: int = 1024 * 1024):
         if (type(max_context_tokens) is not int or max_context_tokens < 1
                 or type(max_context_bytes) is not int or max_context_bytes < 1):
             raise Problem(422, "MEMORY_INVALID_BUDGET", "positive explicit context bounds are required")
         self.sources, self.store, self.read_snapshot = sources, sources.store, sources.read_snapshot
         self._clock, self._count = clock, token_counter
-        self._review, self._projection_review = review_verifier, projection_verifier
+        self._review = review_verifier
         self._max_tokens, self._max_bytes = max_context_tokens, max_context_bytes
 
     def _state(self, context, scope, subject, rows=None) -> SubjectState:
@@ -478,57 +448,8 @@ class MemoryGovernance:
     def _projection_sources(self, originals):
         return tuple(item.event.reference for _, item in sorted(originals.items()))
 
-    def record_projection(self, context: AuthenticatedSourceContext, projection: ProjectionInput) -> Record:
-        projection = checked(projection, ProjectionInput)
-        scope = context.scope(projection.visibility)
-        state = self._state(context, scope, projection.subject)
-        if state.sequence != projection.covered_sequence:
-            raise Problem(409, "MEMORY_PROJECTION_STALE", "late projection cannot replace newer authority")
-        active = tuple(head.reference for head in state.heads if head.status == "active")
-        if (len(set(item.key for item in projection.claims)) != len(projection.claims)
-                or sorted(item.key for item in active) != sorted(item.key for item in projection.claims)):
-            raise Problem(409, "MEMORY_PROJECTION_LINEAGE", "projection must cover the current active claim set")
-        rows = self.read_snapshot(tuple([state.key] + [item.key for item in active]))
-        if self._state(context, scope, projection.subject, rows) != state:
-            raise Problem(409, "MEMORY_PROJECTION_STALE", "projection authority changed")
-        claims = tuple(self._claim(context, rows, self._active(state, item.claim_id)) for item in active)
-        if sorted(item.model_dump_json() for item in projection.claims) != sorted(
-                item.reference.model_dump_json() for item in claims):
-            raise Problem(409, "MEMORY_PROJECTION_LINEAGE", "fabricated or superseded claim citation")
-        originals = self._source_set(context, tuple(ref for claim in claims for ref in claim.candidate.supporting), scope)
-        expected_sources = self._projection_sources(originals)
-        if sorted(item.model_dump_json() for item in projection.sources) != sorted(
-                item.model_dump_json() for item in expected_sources):
-            raise Problem(409, "MEMORY_PROJECTION_LINEAGE", "projection source versions are incomplete or fabricated")
-        if self._projection_review is None:
-            raise Problem(503, "MEMORY_PROJECTION_REVIEW_UNAVAILABLE", "trusted summary support validation is required")
-        self._projection_review(projection, claims, MappingProxyType(originals))
-        text = projection.text.encode("utf-8")
-        tokens = self._tokens(text)
-        key = control_key("memory-projection", scope.key, projection.subject, projection.projection_id)
-        review_keys = [key for claim in claims for key in self._review_keys(context, claim.candidate, claim.review)]
-        request = ControlRequest(
-            request_id=control_key("memory-project", key), request_digest=digest(projection.model_dump(mode="json")),
-            read_set=tuple(dict.fromkeys([state.key, key] + self._source_keys(originals) + review_keys)),
-        )
-        record = ProjectionRecord(scope=scope, projection=projection,
-                                  source_fingerprint=self.sources.evidence_digest(originals),
-                                  token_count=tokens, byte_length=len(text), request=request)
-
-        def decide(snapshot):
-            if self._state(context, scope, projection.subject, snapshot) != state:
-                raise Problem(409, "MEMORY_PROJECTION_STALE", "claim revocation/correction won the projection race")
-            self._source_predicates(snapshot, originals)
-            for claim in claims:
-                self._review_predicates(context, snapshot, claim.candidate, claim.review)
-            return ControlChanges(writes=(control_write(key, record),),
-                                  result={"projection_key": key, "covered_sequence": state.sequence})
-
-        return self.store.transact(request, decide)
-
     def assemble(self, context: AuthenticatedSourceContext, *, scope: SourceScope, subject: str,
-                 required_claim_ids: tuple[str, ...], versions: ContextVersions,
-                 projection_id: str | None = None) -> ContextResult:
+                 required_claim_ids: tuple[str, ...], versions: ContextVersions) -> ContextResult:
         versions = checked(versions, ContextVersions)
         if (not required_claim_ids or len(required_claim_ids) > MAX_SUBJECT_CLAIMS
                 or len(set(required_claim_ids)) != len(required_claim_ids)):
@@ -540,7 +461,7 @@ class MemoryGovernance:
             raise Problem(409, "MEMORY_CLAIM_STALE", "context authority changed")
         claims = tuple(self._claim(context, rows, head) for head in heads)
         originals = self._source_set(context, tuple(ref for claim in claims for ref in claim.candidate.supporting), scope)
-        sections, omissions, summary = [], [], None
+        sections, omissions = [], []
         for claim in claims:
             data = canonical(claim.candidate.model_dump(mode="json"))
             sections.append(ContextSection(kind="claim", key=claim.reference.key, sha256=digest(
@@ -548,45 +469,10 @@ class MemoryGovernance:
         for key, exact in sorted(originals.items()):
             sections.append(ContextSection(kind="original", key=key, sha256=exact.event.reference.sha256,
                                            byte_length=len(exact.original), token_count=self._tokens(exact.original)))
-        if projection_id is not None:
-            key = control_key("memory-projection", scope.key, subject, projection_id)
-            projection_rows = self.read_snapshot((key,))
-            if projection_rows[key] is None:
-                omissions.append("projection-missing: using exact reviewed claims and original sources")
-            else:
-                projection = control_row(projection_rows, key, ProjectionRecord)
-                refs = self._projection_sources(originals)
-                if (projection.scope != scope or projection.projection.subject != subject):
-                    raise Problem(403, "MEMORY_SCOPE_DENIED", "projection scope differs")
-                if projection.projection.covered_sequence != state.sequence:
-                    omissions.append("projection-stale: using exact reviewed claims and original sources")
-                elif (sorted(item.model_dump_json() for item in projection.projection.claims)
-                      != sorted(head.reference.model_dump_json() for head in heads)
-                      or projection.source_fingerprint != self.sources.evidence_digest(originals)
-                      or sorted(item.model_dump_json() for item in projection.projection.sources)
-                      != sorted(item.model_dump_json() for item in refs)):
-                    omissions.append("projection-coverage-mismatch: using exact sources")
-                else:
-                    self.sources.verify_receipt(projection_rows[key], projection.request, key)
-                    summary = projection.projection.text
-                    data = summary.encode("utf-8")
-                    tokens = self._tokens(data)
-                    if tokens != projection.token_count or len(data) != projection.byte_length:
-                        raise Problem(409, "MEMORY_PROJECTION_STALE", "projection tokenization or bytes changed")
-                    sections.append(ContextSection(kind="projection", key=key, sha256=hashlib.sha256(data).hexdigest(),
-                                                   byte_length=len(data), token_count=tokens))
         total_tokens = sum(section.token_count for section in sections)
         total_bytes = sum(section.byte_length for section in sections)
         if total_tokens > self._max_tokens or total_bytes > self._max_bytes:
-            # A projection is the only optional section in this bounded slice.
-            if summary is not None:
-                optional = sections.pop()
-                total_tokens -= optional.token_count
-                total_bytes -= optional.byte_length
-                summary = None
-                omissions.append("projection-budget: preserved necessary originals and claims")
-            if total_tokens > self._max_tokens or total_bytes > self._max_bytes:
-                raise Problem(413, "MEMORY_REQUIRED_CONTEXT_TOO_LARGE", "necessary facts do not fit; no truncation")
+            raise Problem(413, "MEMORY_REQUIRED_CONTEXT_TOO_LARGE", "necessary facts do not fit; no truncation")
         review_keys = [key for claim in claims for key in self._review_keys(context, claim.candidate, claim.review)]
         final = self.read_snapshot(tuple(dict.fromkeys([state.key] + self._source_keys(originals) + review_keys)))
         if self._state(context, scope, subject, final) != state:
@@ -603,7 +489,7 @@ class MemoryGovernance:
                 if other.event.reference.scope == item.event.reference.scope) for item in originals.values()},
             source_access_revisions={key: item.access_revision for key, item in originals.items()},
             sections=tuple(sections), total_tokens=total_tokens, total_bytes=total_bytes,
-            omissions=tuple(omissions), exact_source_fallback=summary is None,
+            omissions=tuple(omissions), exact_source_fallback=True,
         )
         return ContextResult(manifest, claims, MappingProxyType({key: item.original for key, item in originals.items()}),
-                             summary)
+                             None)

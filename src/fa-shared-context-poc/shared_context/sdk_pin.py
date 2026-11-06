@@ -24,3 +24,9 @@ KnownRuntimeVersion = Literal[tuple(runtime for _, runtime in KNOWN_RELEASES)]
 # profile it sends (``native_responses_wire.SENT_RELEASE``), not the release this process runs. Plain strings, since
 # this module imports nothing of FA's; ``test_sdk_pin`` holds the keys to ``native_responses_wire``'s constants.
 PROFILE_RELEASES = {"foundry-native-v2": OLDER_RELEASES[0], "foundry-native-v3": (SDK_VERSION, RUNTIME_VERSION)}
+# ADR-0009 §3 (c) Guard A/B: the Hosted definition ENV naming the pair its image runs ("<sdk>/<runtime>"). Sync writes
+# it where it writes the image; the image refuses to start under another pair, so the API may trust it.
+RELEASE_ENV = "FA_SDK_RELEASE"
+PINNED_RELEASE_TEXT = f"{SDK_VERSION}/{RUNTIME_VERSION}"
+# Every v3 version published before the declaration existed (stage 40-43) runs this pair; fixed, not the pin.
+UNDECLARED_RELEASE = ("1.0.26", "1.0.103")

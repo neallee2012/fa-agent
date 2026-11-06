@@ -446,6 +446,9 @@ class NativeBindingStore:
                 return None
             first = not row.drift and agent_version != row.created_agent_version
             profile = {} if state_profile is None else {"state_profile": state_profile, "profile_unread": False}
+            if state_profile is None and row.state_profile == INCOMPATIBLE_STATE_PROFILE:
+                # Not read: a kept incompatible is another version's, and the heal keeps only one read for this one.
+                profile = {"profile_unread": True}
             written.append(row.model_copy(update={
                 "observed": NativeBindingObservation(agent_version=agent_version, observed_at=self._now(), source=source),
                 "drift": row.drift or first, "notice_pending": row.notice_pending or first,

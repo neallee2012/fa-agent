@@ -363,6 +363,9 @@ class DeclaredProfiles:
             raise value
         return value
 
+    def release(self, target, version):
+        return None  # undeclared: Guard A decides nothing (``releases`` sets pairs)
+
 
 def declared(case, monkeypatch, **profiles):
     resolver = DeclaredProfiles(**profiles)
@@ -502,6 +505,158 @@ def test_a_drift_onto_an_unsupported_profile_leaves_the_row_saying_so(bound, mon
     assert not drifted.supported()
 
 
+NEWER, OLDER = ("1.0.28", "1.0.105"), ("1.0.26", "1.0.103")
+
+
+def releases(monkeypatch, pairs):
+    """The SDK/runtime pair each version's definition declares (``HostedVersions.release``); an Exception: unreadable."""
+    def release_of(runtime, target, version):
+        value = pairs.get(version)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(behavior_native_sessions, "_release_of", release_of)
+
+
+@pytest.mark.parametrize("to,recorded", [(OLDER, native_binding.INCOMPATIBLE_STATE_PROFILE), (NEWER, V3),
+                                         (Problem(503, "AGENT_VERSION_FOLLOWING", "unreadable"), V3)])
+def test_a_drift_onto_an_older_sdk_release_leaves_the_row_incompatible(bound, monkeypatch, to, recorded):
+    """ADR-0009 §3 (c) Guard A: the SID's checkpoints were written by the newer runtime; an older image refuses them
+    one conversation at a time, so the drift takes the incompatible path a v2 drift took. Newer, or unreadable
+    (which decides nothing), stays supported."""
+    case = bound
+    claimed = claim(case)
+    declares(monkeypatch, {"42": V3})
+    releases(monkeypatch, {"41": NEWER, "42": to})
+    refusal = before_dispatch(Problem(409, "NATIVE_SESSION_CHANGED", "private"), "version", "42")
+    client = case.foundry.for_target(case.remote.target)
+    drifted = native_sessions(case.composition)._drifted(client, refusal, claimed)
+    assert (drifted is None) == (recorded != V3)
+    assert (row(case).observed.agent_version, row(case).state_profile) == ("42", recorded)
+
+
+def test_a_heal_never_turns_a_drift_onto_an_older_release_supported_again(bound, monkeypatch):
+    """The send's heal (``_correct_profile``) reads V_rec's profile again; v3 alone would undo Guard A."""
+    case = bound
+    drifted_before_the_fix(case)
+    declared(case, monkeypatch, **{"42": V3})
+    releases(monkeypatch, {"41": NEWER, "42": OLDER})
+    sessions = native_sessions(case.composition)
+    healed = sessions._correct_profile(case.foundry.for_target(case.remote.target), row(case))
+    assert healed.state_profile == native_binding.INCOMPATIBLE_STATE_PROFILE and not row(case).supported()
+
+
+def test_a_heal_keeps_guard_a_after_the_sid_drifted_newer_then_back(bound, monkeypatch):
+    """41 (older) -> 42 (newer, its runtime writes checkpoints) -> 43 (older): the drift CAS saw 42 and wrote
+    incompatible; the row then names only 41 and 43, so a heal that read the releases again would call 43 fine."""
+    case = bound
+    case.store.claim(case.agent_id, hosted_session_id=case.sid, created_agent_version="41", state_profile=V3)
+    case.store.record_observed(case.agent_id, hosted_session_id=case.sid, agent_version="42", source="vm",
+                               state_profile=V3)
+    case.store.record_observed(case.agent_id, hosted_session_id=case.sid, agent_version="43", source="vm",
+                               state_profile=native_binding.INCOMPATIBLE_STATE_PROFILE)
+    declared(case, monkeypatch, **{"43": V3})
+    releases(monkeypatch, {"41": OLDER, "42": NEWER, "43": OLDER})
+    native_sessions(case.composition)._correct_profile(case.foundry.for_target(case.remote.target), row(case))
+    assert not row(case).supported()
+
+
+def test_guard_a_remembers_the_first_drift_when_the_drift_back_was_not_read(bound, monkeypatch):
+    """41 (older) -> 42 (newer) -> 43 (older, its definition unreadable at that drift, so the row kept v3): the first
+    drift's version stays on the row (``notice_to_version``), so the next heal still finds 43 older."""
+    case = bound
+    case.store.claim(case.agent_id, hosted_session_id=case.sid, created_agent_version="41", state_profile=V3)
+    case.store.record_observed(case.agent_id, hosted_session_id=case.sid, agent_version="42", source="vm",
+                               state_profile=V3)
+    case.store.record_observed(case.agent_id, hosted_session_id=case.sid, agent_version="43", source="vm")
+    declared(case, monkeypatch, **{"43": V3})
+    releases(monkeypatch, {"41": OLDER, "42": NEWER, "43": OLDER})
+    native_sessions(case.composition)._correct_profile(case.foundry.for_target(case.remote.target), row(case))
+    assert not row(case).supported()
+
+
+@pytest.mark.parametrize("path", ["send", "observe"])
+def test_an_api_never_calls_or_records_a_drift_onto_a_release_it_does_not_know(bound, monkeypatch, path):
+    """Guard B on the drift paths: mid-deploy the old API revision sees the VM woken on the new image. Unreadable
+    would count as a compatible drift (relocate and send there); an unknown release is neither called nor recorded."""
+    case = bound
+    unknown = Problem(503, "NATIVE_BOOTSTRAP_SOURCE_UNAVAILABLE", "unknown release", sdk_release_unknown=True)
+    declares(monkeypatch, {"41": V3, "42": unknown})
+    claimed = claim(case)
+    sessions = native_sessions(case.composition)
+    client = case.foundry.for_target(case.remote.target)
+    if path == "send":
+        refusal = before_dispatch(Problem(409, "NATIVE_SESSION_CHANGED", "private"), "version", "42")
+        assert sessions._drifted(client, refusal, claimed) is None
+    else:
+        sessions.observed_binding(client, version="42")
+    assert row(case) == claimed
+
+
+UNKNOWN_RELEASE = Problem(503, "AGENT_VERSION_FOLLOWING", "unknown release", sdk_release_unknown=True)
+
+
+@pytest.mark.parametrize("selector", ["43", "41-unknown", "unreadable", "41"])
+@pytest.mark.parametrize("sid_known", [True, False])
+def test_locate_never_sends_to_a_sid_on_a_release_this_api_does_not_know(bound, monkeypatch, selector, sid_known):
+    """Mid-deploy the newer API revision moved the Agent to a SID on an image whose release this one cannot decode:
+    whatever the selector says (a known version after a rollback, Guard B's refusal, unreadable), the send is a
+    same-RID resend, never sent there. A SID on a known release goes on by the row, and when the selector picks the
+    SID's own version no definition is read."""
+    case = bound
+    claimed = claim(case)
+    resolver = declared(case, monkeypatch, **{"41": V3 if sid_known else UNKNOWN_RELEASE, "43": V3})
+    sessions = native_sessions(case.composition)
+    client = case.foundry.for_target(case.remote.target)
+
+    def checked(*_a, **_k):
+        if selector == "41-unknown":
+            raise UNKNOWN_RELEASE
+        if selector == "unreadable":
+            raise Problem(503, "AGENT_VERSION_FOLLOWING", "selector unreadable")
+        return selector
+    monkeypatch.setattr(sessions, "_checked_version", checked)
+    if sid_known or selector == "41":
+        assert sessions._located(client, claimed, None)[0] == (selector if selector in {"41", "43"} else None)
+        assert resolver.reads == ([] if selector == "41" else ["41"])
+    else:
+        with pytest.raises(Problem) as error:
+            sessions._located(client, claimed, None)
+        assert error.value.status == 503 and error.value.body["error"]["code"] == "AGENT_VERSION_FOLLOWING"
+
+
+def test_a_repair_or_claim_never_records_a_version_on_a_release_this_api_does_not_know(bound, monkeypatch):
+    """Guard B on M3 and the claim: mid-deploy the newer revision moved the Agent to a SID on the new image (repair),
+    or the VM reports that version before any row exists (claim). Falling back to the send profile would record it
+    as supported and send there; neither is written, so the caller resends the same RID later."""
+    case = bound
+    unknown = Problem(503, "AGENT_VERSION_FOLLOWING", "unknown release", sdk_release_unknown=True)
+    declared(case, monkeypatch, **{"41": V3, "42": unknown})
+    sessions = native_sessions(case.composition)
+    client = case.foundry.for_target(case.remote.target)
+    assert sessions.observed_binding(client, version="42") is None and row(case) is None
+    sessions.observed_binding(client, version="41")
+    view = NativeEnvironmentView(
+        agent_id=case.agent_id, request_id="follow", state="ready", previous_hosted_session_id=case.sid,
+        previous_agent_version="41", hosted_session_id="fa-native-next", hosted_agent_version="42")
+    assert sessions._record_switch(client, view, repairing=True) is None
+    assert row(case).hosted_session_id == case.sid
+
+
+def test_a_drift_recorded_without_its_profile_is_corrected_by_the_next_read(bound, monkeypatch):
+    """An incompatible row that drifted while the new version was unreadable keeps another version's profile; it is
+    marked unread, so the heal still reads the version the SID now runs (only a read incompatible is kept)."""
+    case = bound
+    case.store.claim(case.agent_id, hosted_session_id=case.sid, created_agent_version="41",
+                     state_profile=native_binding.INCOMPATIBLE_STATE_PROFILE)
+    case.store.record_observed(case.agent_id, hosted_session_id=case.sid, agent_version="42", source="vm")
+    assert row(case).profile_unread
+    declared(case, monkeypatch, **{"42": V3})
+    native_sessions(case.composition)._correct_profile(case.foundry.for_target(case.remote.target), row(case))
+    assert row(case).supported() and not row(case).profile_unread
+
+
 def test_an_fa_switch_still_records_the_new_sids_profile_without_a_drift_read(bound, monkeypatch):
     case = bound
     declared(case, monkeypatch, **{"41": V1, "42": V3})
@@ -619,15 +774,17 @@ def test_a_heal_the_table_does_not_take_is_a_503_too(bound, monkeypatch):
     assert row(case).state_profile == V1 and native_sessions(case.composition).guard.refused == set()
 
 
-def test_a_supported_row_costs_the_send_no_definition_read(bound, monkeypatch):
+def test_a_supported_row_costs_the_send_only_guard_b_on_the_version_its_sid_runs(bound, monkeypatch):
+    """No heal read for a supported row; the one read is Guard B on the SID's own version, which the selector does
+    not name after an in-place drift (``HostedVersions`` keeps it per version and process)."""
     case = bound
     case.store.claim(case.agent_id, hosted_session_id=case.sid, created_agent_version="41", state_profile=V3)
     case.store.record_observed(case.agent_id, hosted_session_id=case.sid, agent_version="42", source="vm",
                                state_profile=V3)
     case.remote.vm_version = "42"
-    resolver = declared(case, monkeypatch)
+    resolver = declared(case, monkeypatch, **{"42": V3})
     assert submit(case).status_code == 202
-    assert resolver.reads == []
+    assert resolver.reads == ["42"]
 
 
 def test_a_drifted_row_no_send_reached_is_corrected_at_its_turn_end_once(bound, monkeypatch, caplog):

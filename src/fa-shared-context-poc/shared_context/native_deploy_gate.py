@@ -28,7 +28,9 @@ from typing import Callable, Iterable
 
 from .errors import Problem
 from .native_binding import SUPPORTED_STATE_PROFILES, NativeBindingRow, NativeBindingStore
+from .native_responses_wire import NATIVE_V3_PROFILE
 from .native_version_veto import NativeVersionVetoStore
+from .sdk_pin import KNOWN_RELEASES, RELEASE_ENV, RUNTIME_VERSION, SDK_VERSION, UNDECLARED_RELEASE
 
 # v2: the report also lists the project vetoes (``vetoed_versions``).
 GATE_SCHEMA = "fa-deploy-compat-gate-v2"
@@ -42,6 +44,35 @@ def definition_profile(definition) -> str | None:
     return value if isinstance(value, str) else None
 
 
+# Every v3 image published before the definition declared its pair (stage releases 40-43) runs this one; fixed here so
+# a later pin never relabels them.
+_UNDECLARED_RELEASES = {NATIVE_V3_PROFILE: UNDECLARED_RELEASE}
+
+
+def definition_release(definition) -> tuple[str, str] | None:
+    """ADR-0009 §3 (c): the (sdk, runtime) pair a Hosted definition's image runs (``RELEASE_ENV``, else the pair every
+    undeclared v3 image ran); None when it says neither."""
+    environment = definition.get("environment_variables") if isinstance(definition, dict) else None
+    value = environment.get(RELEASE_ENV) if isinstance(environment, dict) else None
+    if isinstance(value, str):
+        sdk, _, runtime = value.partition("/")
+        return sdk, runtime
+    return _UNDECLARED_RELEASES.get(definition_profile(definition))
+
+
+def release_known(release, known=KNOWN_RELEASES) -> bool:
+    """Guard B: this build decodes what that image writes (its receipts' ``assembly``); undeclared claims nothing."""
+    return release is None or tuple(release) in known
+
+
+def release_older(release, than) -> bool:
+    """Guard A: ``release`` runs an older SDK or runtime than ``than``. Known pairs only: versions compare as numbers
+    ("1.0.103" is newer than "1.0.83")."""
+    def number(text):
+        return tuple(int(part) for part in text.split("."))
+    return any(number(mine) < number(other) for mine, other in zip(release, than))
+
+
 def definition_image(definition) -> str | None:
     """The container image a Hosted definition runs (the field ``image_source`` replaces)."""
     if not isinstance(definition, dict):
@@ -52,8 +83,9 @@ def definition_image(definition) -> str | None:
 
 
 def referenced_versions(row: NativeBindingRow) -> tuple[str, ...]:
-    """ADR §7: the current SID's versions (created and recorded actual) and the previous SID's version."""
-    versions = [row.created_agent_version, row.observed.agent_version]
+    """ADR §7: the current SID's versions (created, first drift and recorded actual) and the previous SID's version.
+    Guard A reads each of the current SID's, so none may be deleted while the row names it."""
+    versions = [row.created_agent_version, row.notice_to_version or row.created_agent_version, row.observed.agent_version]
     if row.previous_sessions and row.previous_sessions[-1].agent_version is not None:
         versions.append(row.previous_sessions[-1].agent_version)
     return tuple(dict.fromkeys(versions))
@@ -66,11 +98,14 @@ class _Unread(str):
 def evaluate(agents: Iterable, rows: Callable[[], Iterable[NativeBindingRow]],
              read_definition: Callable[[object, str], dict], *, armed: bool, override: dict | None = None,
              supported: frozenset[str] = SUPPORTED_STATE_PROFILES, retired: Iterable[str] = (),
-             vetoes: Callable[[], Iterable] = tuple) -> dict:
+             vetoes: Callable[[], Iterable] = tuple, known=KNOWN_RELEASES,
+             release=(SDK_VERSION, RUNTIME_VERSION)) -> dict:
     """The gate's report. ``agents`` are the served targets (``agent_id``, ``agent_name``, ``project_endpoint``);
     ``rows()`` reads every binding row; ``read_definition(target, version)`` is one ``get_version`` read and returns
     the version's definition; ``retired`` are tombstoned Agent IDs, whose rows no turn reaches; ``vetoes()`` reads
-    every project veto (ADR-0009 4d), listed for the operator and never a refusal. No other I/O."""
+    every project veto (ADR-0009 4d), listed for the operator and never a refusal. No other I/O. ``known`` and
+    ``release`` are the new build's ``KNOWN_RELEASES`` and pin: ADR-0009 §3 (c) refuses a row whose current SID runs a
+    pair this API cannot decode (Guard B) or a newer one than this deploy's image (Guard A)."""
     agents = list(agents)
     by_id = {target.agent_id: target for target in agents}
     retired = frozenset(retired)
@@ -126,8 +161,19 @@ def evaluate(agents: Iterable, rows: Callable[[], Iterable[NativeBindingRow]],
             entry.update(verdict="definition_unread", code=str(current))
         elif declared not in supported:
             entry["verdict"] = "definition_profile_unsupported"
+        elif isinstance(created := definition(target, row.created_agent_version), _Unread):
+            entry.update(verdict="definition_unread", code=str(created))  # Guard A needs the SID's first release too
+        elif isinstance(first := (None if row.notice_to_version in {None, version, row.created_agent_version}
+                                   else definition(target, row.notice_to_version)), _Unread):
+            entry.update(verdict="definition_unread", code=str(first))  # the first drift, as Guard A at run time
         else:
-            entry["verdict"] = "compatible"
+            runs = [definition_release(item) for item in (created, current, first) if item is not None]
+            if not all(release_known(item, known) for item in runs):
+                entry["verdict"] = "definition_release_unknown"
+            elif any(item is not None and release_older(release, item) for item in runs):
+                entry["verdict"] = "release_older_than_row"
+            else:
+                entry["verdict"] = "compatible"
         report["agents"].append(entry)
         if entry["verdict"] != "compatible":
             report["refused"].append({"agent_id": target.agent_id, "reason": entry["verdict"]})

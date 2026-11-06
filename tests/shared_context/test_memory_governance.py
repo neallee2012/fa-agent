@@ -13,10 +13,10 @@ from test_behavior_store import FakeTable, SCOPE
 from shared_context.behavior_store import BehaviorStore
 from shared_context.errors import Problem
 from shared_context.memory_governance import (
-    ClaimCandidate, ClaimPlan, ContextVersions, MemoryGovernance, ProjectionInput,
+    ClaimCandidate, ClaimPlan, ContextVersions, MemoryGovernance,
     ReviewAttestation, claim_digest,
 )
-from shared_context.source_materials import SourceMaterials, control_key, digest
+from shared_context.source_materials import SourceMaterials, digest
 
 CHECKS = ("necessity", "support", "contradiction", "sensitivity", "consent")
 VERSIONS = ContextVersions(work_revision=1, release_version="release-v1", catalog_version="catalog-v1",
@@ -74,7 +74,7 @@ def memory_service(source_service):
     sources, table = source_service
     review = ReviewAuthority()
     memory = MemoryGovernance(sources, clock=lambda: NOW, token_counter=lambda data: len(data),
-                              review_verifier=review, projection_verifier=lambda *_: None)
+                              review_verifier=review)
     source, _ = admitted(sources, b"The dashboard preference is cobalt.\r\n")
     return memory, source, table, review
 
@@ -89,15 +89,6 @@ def assembled(memory, **changes):
     return memory.assemble(CONTEXT, **{
         "scope": CONTEXT.scope("private"), "subject": "human-one",
         "required_claim_ids": ("dashboard-color",), "versions": VERSIONS, **changes,
-    })
-
-
-def projection(memory, plan, **changes):
-    return ProjectionInput(**{
-        "projection_id": "summary-one", "subject": plan.candidate.subject, "covered_sequence": 1,
-        "claims": (plan.reference,), "sources": plan.candidate.supporting,
-        "projector_version": "projector-v1", "model_version": "offline-v1", "schema_id": "summary-v1",
-        "text": "A dashboard color preference exists.", **changes,
     })
 
 
@@ -162,14 +153,12 @@ def test_fake_citation_and_private_scope_leak_fail_before_review(memory_service)
     assert code(leak) == "MEMORY_SCOPE_DENIED"
 
 
-def test_source_correction_rejects_stale_claim_and_stale_summary(memory_service):
+def test_source_correction_rejects_stale_claim_and_context(memory_service):
     memory, source, _, _ = memory_service
     plan, _ = reviewed(memory, source)
-    memory.record_projection(CONTEXT, projection(memory, plan))
     admitted(memory.sources, b"Now the preference is amber.", version=2)
     for operation in (
-        lambda: assembled(memory, projection_id="summary-one"),
-        lambda: memory.record_projection(CONTEXT, projection(memory, plan, projection_id="late")),
+        lambda: assembled(memory),
         lambda: memory.get_current(CONTEXT, scope=plan.reference.scope, subject="human-one", claim_id="dashboard-color"),
     ):
         with pytest.raises(Problem) as stale:
@@ -191,21 +180,16 @@ def test_supersession_preserves_history_and_only_new_version_is_current(memory_s
     assert code(old) == "MEMORY_CLAIM_STALE"
 
 
-def test_revocation_blocks_context_and_late_projection_cannot_reinstate(memory_service):
+def test_revocation_blocks_context_and_keeps_the_original_readable(memory_service):
     memory, source, table, _ = memory_service
     plan, _ = reviewed(memory, source)
-    old = projection(memory, plan)
-    memory.record_projection(CONTEXT, old)
     receipt = memory.revoke(CONTEXT, plan.reference, reason="consent withdrawn")
     count = len(table.submissions)
     assert memory.revoke(CONTEXT, plan.reference, reason="consent withdrawn") == receipt
     assert len(table.submissions) == count
     with pytest.raises(Problem) as revoked:
-        assembled(memory, projection_id="summary-one")
+        assembled(memory)
     assert code(revoked) == "MEMORY_CLAIM_REVOKED"
-    with pytest.raises(Problem) as late:
-        memory.record_projection(CONTEXT, old.model_copy(update={"projection_id": "late"}))
-    assert code(late) == "MEMORY_PROJECTION_STALE"
     assert memory.sources.read_exact(CONTEXT, source.reference).original == source.original
 
 
@@ -230,34 +214,13 @@ def test_expired_claim_can_still_be_immutably_revoked(memory_service):
     assert code(revoked) == "MEMORY_CLAIM_REVOKED"
 
 
-def test_compaction_losing_cobalt_never_loses_original_claim_or_exact_fallback(memory_service):
+def test_context_always_carries_original_claim_and_exact_fallback(memory_service):
     memory, source, _, _ = memory_service
     plan, _ = reviewed(memory, source)
-    memory.record_projection(CONTEXT, projection(memory, plan))
-    compacted = assembled(memory, projection_id="summary-one")
-    assert "cobalt" not in compacted.summary
-    assert "cobalt" in compacted.claims[0].candidate.text
-    assert b"cobalt" in compacted.originals[source.reference.key]
-    missing = assembled(memory, projection_id="projection-was-lost")
-    assert missing.summary is None and missing.manifest.exact_source_fallback
-    assert missing.manifest.omissions and b"cobalt" in missing.originals[source.reference.key]
-
-
-@pytest.mark.parametrize("mode", ["fake-source", "fake-claim", "missing-source"])
-def test_summary_rejects_fabricated_or_incomplete_source_claim_coverage(memory_service, mode):
-    memory, source, _, _ = memory_service
-    plan, _ = reviewed(memory, source)
-    changes = {}
-    if mode == "fake-source":
-        changes["sources"] = (source.reference.model_copy(update={"sha256": "f" * 64}),)
-    elif mode == "fake-claim":
-        changes["claims"] = (plan.reference.model_copy(update={"sha256": "f" * 64}),)
-    else:
-        missing = source.reference.model_copy(update={"source_id": "does-not-exist"})
-        changes["sources"] = (missing,)
-    with pytest.raises(Problem) as invalid:
-        memory.record_projection(CONTEXT, projection(memory, plan, **changes))
-    assert code(invalid) == "MEMORY_PROJECTION_LINEAGE"
+    context = assembled(memory)
+    assert "cobalt" in context.claims[0].candidate.text
+    assert b"cobalt" in context.originals[source.reference.key]
+    assert context.summary is None and context.manifest.exact_source_fallback
 
 
 def test_required_fact_absence_wrong_actor_and_unknown_token_count_are_not_empty_success(memory_service):
@@ -276,9 +239,6 @@ def test_required_fact_absence_wrong_actor_and_unknown_token_count_are_not_empty
         with pytest.raises(Problem) as unknown:
             assembled(memory)
         assert code(unknown) == "MEMORY_TOKEN_COUNT_UNKNOWN"
-        with pytest.raises(Problem) as summary:
-            memory.record_projection(CONTEXT, projection(memory, plan))
-        assert code(summary) == "MEMORY_TOKEN_COUNT_UNKNOWN"
 
 
 def test_unknown_claim_commit_only_reconciles_same_original_identity(memory_service):
@@ -294,22 +254,6 @@ def test_unknown_claim_commit_only_reconciles_same_original_identity(memory_serv
     assert len(table.submissions) == count
 
 
-def test_revocation_wins_shared_guard_projection_race_without_partial_projection(memory_service):
-    memory, source, table, review = memory_service
-    plan, _ = reviewed(memory, source)
-    other_sources = SourceMaterials(BehaviorStore(FakeTable(table.backing), SCOPE))
-    other = MemoryGovernance(other_sources, clock=lambda: NOW, token_counter=len, review_verifier=review)
-    table.before_submit = lambda: other.revoke(CONTEXT, plan.reference, reason="raced revocation")
-    with pytest.raises(Problem) as race:
-        memory.record_projection(CONTEXT, projection(memory, plan))
-    assert code(race) == "BEHAVIOR_CONFLICT"
-    key = control_key("memory-projection", plan.reference.scope.key, "human-one", "summary-one")
-    assert memory.read_snapshot((key,))[key] is None
-    with pytest.raises(Problem) as revoked:
-        assembled(memory)
-    assert code(revoked) == "MEMORY_CLAIM_REVOKED"
-
-
 def test_source_changes_during_claim_commit_are_guard_fenced(memory_service):
     memory, source, table, _ = memory_service
     plan = memory.plan_claim(CONTEXT, candidate(source.reference))
@@ -323,13 +267,10 @@ def test_source_changes_during_claim_commit_are_guard_fenced(memory_service):
 
 def test_context_does_not_truncate_required_facts_for_budget(memory_service):
     memory, source, _, _ = memory_service
-    plan, _ = reviewed(memory, source)
-    memory.record_projection(CONTEXT, projection(memory, plan))
+    reviewed(memory, source)
     exact = assembled(memory)
     memory._max_tokens = exact.manifest.total_tokens
-    without_optional = assembled(memory, projection_id="summary-one")
-    assert without_optional.summary is None
-    assert any("projection-budget" in item for item in without_optional.manifest.omissions)
+    assert assembled(memory).manifest.total_tokens == exact.manifest.total_tokens
     memory._max_tokens = 1
     with pytest.raises(Problem) as too_large:
         assembled(memory)
@@ -363,7 +304,7 @@ def test_context_detects_missing_transitive_necessary_original(memory_service):
     assert code(missing) == "SOURCE_REQUIRED_MISSING"
 
 
-def test_required_memory_is_unchanged_by_long_unrelated_history_and_optional_summary_omission(memory_service):
+def test_required_memory_is_unchanged_by_long_unrelated_history(memory_service):
     memory, source, _, _ = memory_service
     selected, _ = reviewed(memory, source)
     short = assembled(memory)
@@ -375,11 +316,10 @@ def test_required_memory_is_unchanged_by_long_unrelated_history_and_optional_sum
             supersedes=None if previous is None else previous.reference.sha256,
             expires_at=NOW + timedelta(seconds=1))
     memory._clock = lambda: NOW + timedelta(seconds=1)
-    long = assembled(memory, projection_id="not-recorded")
+    long = assembled(memory)
     assert long.claims == short.claims and long.manifest.claims == (selected.reference,)
     assert dict(long.originals) == dict(short.originals)
     assert long.manifest.total_tokens == short.manifest.total_tokens
     assert long.manifest.total_bytes == short.manifest.total_bytes
     assert long.manifest.exact_source_fallback
-    assert any("projection-missing" in reason for reason in long.manifest.omissions)
     assert all(b"Unrelated" not in raw for raw in long.originals.values())

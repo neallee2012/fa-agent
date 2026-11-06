@@ -62,19 +62,19 @@ def test_no_grant_leaves_legacy_session_and_prompt_unchanged():
 
 
 def test_reader_is_explicit_and_old_zero_tool_material_is_unchanged(monkeypatch):
-    from shared_context.behavior_capabilities import load_runtime_grants
+    from shared_context.behavior_capabilities import load_runtime_capabilities
     from shared_context.behavior_delegation_wire import child_configuration
 
     monkeypatch.delenv("FA_TOOL_CATALOG_DIR", raising=False)
     monkeypatch.delenv("FA_CAPABILITY_TOOLBOX_ENTRIES", raising=False)
     monkeypatch.setenv("FA_CAPABILITY_BUILTINS", "fa-delegate-v1")
-    grants = load_runtime_grants()
+    grants = load_runtime_capabilities()[0]
     assert tuple(grants) == ("fa-delegate-v1",)
     assert grants["fa-delegate-v1"].entry_sha256 == "f4adfc2afebb4799fa919817e1faef1ab69827e49b60afc0bd430dc42c91f711"
     raw = json.dumps(child_configuration(), sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(raw).hexdigest() == "ad9c5aa78a41e663b25d2435fafc01880893f7a2d8a626f2c1bd678dd55860eb"
     monkeypatch.setenv("FA_CAPABILITY_BUILTINS", "fa-delegate-v1,fa-delegate-reader-v1")
-    assert set(load_runtime_grants()) == {"fa-delegate-v1", "fa-delegate-reader-v1"}
+    assert set(load_runtime_capabilities()[0]) == {"fa-delegate-v1", "fa-delegate-reader-v1"}
     capture = captured("fa-delegate-v1", "fa-delegate-reader-v1")
     needs = session_needs(capture)
     assert needs.custom_agents[0]["tools"] == ["read_user_file"]

@@ -1,8 +1,23 @@
 # FA 進度與交接狀態
 
-更新日期：2026-11-04。
+更新日期：2026-11-05。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="stage-v43-1105"></a>
+## 2026-11-05：stage 第 43 版（10 MB 附件）部署與實測
+
+- **範圍**：release PR #1202（`2026.11.05-43`），Neal 00:26:04Z 合併，merge `116d8161`。內容是 10 MB 以內的文字、PDF、Office、圖片附件（Hosted 加 `pypdf==6.21.4`，#1200），新助理照 A 的選版（#1170），推理模型只走 Responses（#1174），拿掉 v2 別名與重送（#1179），換版時平台還在掃描就重送（#1199），以及 ub-mode 第十三輪。變更清單、dev 測試報告（dev API `ca-fa-behavior-poc--ee0dc0c-r4761-1`）與第一道審查都在 PR 本文。證據是總協調的唯讀讀回，原始輸出不在 repo。
+- **部署**：deploy-staging run 41941290883 成功（00:26～00:39Z）。release-gate、相容閘門、助理版本同步、跟進所有助理都過了。API `…--116d816-r130-1`，Healthy、流量 100%、1 個 replica。API image `sha256:7bf8573e…`，Hosted `sha256:cb486777…`。
+- **public-sync**：run 41943063019 成功。推送前比對指紋 `66d7dc02…` 相符，第二道檢查通過，公開 tag `v2026.11.05-43`。
+- **stage 實測**（Neal 操作 stage console）：
+  - A 的純文字回合與 A 交辦 B 都完成。B 用 playwright 時出了批准卡，原因見下面「HITL 規則」。
+  - PDF：Neal 附了一份 Outlook 郵件用「Microsoft Print to PDF」印成的檔案，助理回「沒有可抽取的文字」。總協調用 pypdf 在本機讀同一份檔案：3 頁、0 個字型、抽到 0 字，第 1 頁是 13 張圖片，第 2、3 頁全是向量路徑。助理的判斷正確。Neal 要求這類 PDF 可讀，另開一條線做「沒有文字層時把頁面轉成圖片給模型」。
+  - 大檔：Neal 回報測試完成，超過 10 MB 會被擋下。
+- **log**（API stderr 只能讀最後 300 行，從 01:56:58Z 起，Neal 01:54Z 的第一個回合不在範圍內）：`NATIVE_UPGRADE_CUT_API` 80 筆都是 `outcome=current`，沒有切換、延後或失敗。推定是平台已原地換好版本，#1199 的重送路徑和 dev 一樣沒有走到。`NATIVE_RID_ABSENT`／`NATIVE_RID_MISSING` 是工作台輪詢交辦（既有設計）。`NATIVE_STREAM_NOT_STARTED` 1 筆，舊版也有。Traceback、ERROR 都是 0。
+- **送出 RTT**（毫秒；只有 1 個樣本，不算 p95）：`api_submit` 2,347，`api_submit_session` 362，`api_submit_conversation` 364，`api_submit_context` 81，`api_submit_capture` 0，`api_submit_hosted` 820。
+- **HITL 規則**：Neal 前一天批准過 B 用 playwright 開網頁的規則，這次又出卡。卡片預設的規則草稿把完整網址寫死，推測是換了網址就對不上（沒有讀 stage 資料核對）。規則與紀錄的細節也看不到。之後的改善：#1206、#1207 已合併（分頁自動讀規則，控制紀錄寫出時間、助理、工具、規則原文與為什麼問你）；Neal 決定卡片給「只這次／這類動作」兩個草稿（D1=C），並保存審查模型逐條的判斷（D2），連同規則歷史與放行紀錄還在做。
+- **沒有驗證**：「附件已不在，請重新附加」的畫面；B、C、D 個別的換版時刻；Hosted log（stage 的 Log Analytics 查不到 Hosted 紀錄）；本機沒跑的 25 項真 SDK 測試。
 
 <a id="stage-v40-v41-1104"></a>
 ## 2026-11-03～04：stage 第 40、41 版（Copilot SDK 1.0.26 升級）與 Agent E 的模型拒絕

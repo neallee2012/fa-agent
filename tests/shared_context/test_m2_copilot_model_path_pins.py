@@ -290,6 +290,30 @@ def test_each_instruction_request_reports_both_kinds_of_omitted_image():
     assert [part["type"] for part in wire.body["messages"][0]["content"]] == ["text", "text", "image_url", "image_url"]
 
 
+def test_vision_that_only_pdf_pages_opened_sends_only_those_pages():
+    wire = Wire(instruction=True, image_limit=3, page_images={"AAAA2"})
+    wire.post(body(messages=chat_images(PNG + "1", JPEG, PNG + "2")))
+    sent = urls(wire.body["messages"][0]["content"])
+    assert sent[0] == "[Image omitted from model context: this assistant sees only attached PDF pages read in this turn.]"
+    assert sent[1].startswith("[Screenshot omitted") and sent[2] == PNG + "2"
+
+
+@pytest.mark.parametrize("capture_vision, user_images, pages_only", [
+    (False, (), True), (True, (), False), (False, (("image/png", "AAAA"),), False)])
+def test_only_vision_opened_for_pdf_pages_limits_the_gateway_to_pages(capture_vision, user_images, pages_only):
+    from shared_context import m2_copilot
+    turn = SimpleNamespace(capability_session=SimpleNamespace(vision=capture_vision), user_images=user_images,
+                           pdf_page_images=True, native_assembly=None, behavior_boundary=None, model="m",
+                           instruction=True, session_files=None, delegation_runtime=None, model_call_limit=None,
+                           supports_reasoning_effort=None)
+    turn._images_granted = m2_copilot._TurnRequest._images_granted.fget(turn)
+    turn.vision_granted = m2_copilot._TurnRequest.vision_granted.fget(turn)
+    turn.pages_only_vision = m2_copilot._TurnRequest.pages_only_vision.fget(turn)
+    handlers = SimpleNamespace(emit=None, get_token=None, page_images={"page"})
+    gateway = m2_copilot._model_gateway(turn, SimpleNamespace(endpoint=COMPLETIONS), None, handlers)
+    assert gateway.page_images is (handlers.page_images if pages_only else None)
+
+
 def test_a_legacy_request_keeps_an_unsendable_image_and_counts_only_older_ones():
     wire = Wire()
     wire.post(body(messages=chat_images(PNG + "1", JPEG, PNG + "2")))
@@ -346,7 +370,7 @@ def test_nothing_to_scan_is_nothing_omitted():
 ONE = ("[Earlier inline PNG omitted from model context; only the latest "
        "desktop screenshot is included. Original image remains in session history.]")
 THREE = ("[Earlier inline PNG omitted from model context; only the latest 3 "
-         "screenshots are included. Original image remains in session history.]")
+         "images are included. Original image remains in session history.]")
 
 
 def urls(content):

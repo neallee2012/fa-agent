@@ -122,8 +122,8 @@ async function open(initial=fixture(),responses={}){
   let timerId=0;
   const context={console,URLSearchParams,TextEncoder,TextDecoder,Blob,Response,crypto:require("node:crypto").webcrypto,
     Date:class extends Date{static now(){return holder.now??super.now()}},
-    URL:{createObjectURL(blob){holder.downloaded=blob;return "blob:offline-template"},
-      revokeObjectURL(url){holder.revoked=url}},
+    URL:class extends URL{static createObjectURL(blob){holder.downloaded=blob;return "blob:offline-template"}
+      static revokeObjectURL(url){holder.revoked=url}},
     setTimeout(fn,delay){timers.set(++timerId,fn);timerDelays.set(timerId,delay);return timerId},
     clearTimeout(id){timers.delete(id);timerDelays.delete(id)},
     // Native dialogs fail the test: embedded browsers answer them with false and show nothing, so the page asks in
@@ -184,7 +184,10 @@ async function open(initial=fixture(),responses={}){
       if(url.endsWith("/skill-draft.md")&&holder.skillDraftDownloadResponse)return holder.skillDraftDownloadResponse;
       if(url.endsWith("/summary")&&holder.summaryResponse)return holder.summaryResponse;
       if(url.endsWith("/attachment-sources")&&holder.attachmentResponse)return holder.attachmentResponse;
-      if(url.endsWith("/user-text-file-capability")&&holder.fileCapabilityResponse)return holder.fileCapabilityResponse;
+      if(url.endsWith("/user-text-file-capability")){
+        const answer=typeof holder.fileCapabilityResponse==="function"?holder.fileCapabilityResponse():holder.fileCapabilityResponse;
+        return answer??{ok:true,json:async()=>fileCapability(holder.current)};
+      }
       if(url.includes("/files/")&&holder.userFileResponse)return holder.userFileResponse;
       if(url==="/api/agent-template"&&holder.agentTemplates)return holder.agentTemplates(options.headers?.["X-Console-Agent"]);
       if(holder.templateResponses?.[url])return holder.templateResponses[url];
@@ -850,16 +853,13 @@ function selectedFile(name,text){
   const bytes=new TextEncoder().encode(text);
   return {name,size:bytes.byteLength,arrayBuffer:async()=>bytes.buffer,text:()=>{throw Error("Do not replace malformed UTF8")}};
 }
-async function readyFileInput(ui,data){
-  ui.holder.fileCapabilityResponse={ok:true,json:async()=>fileCapability(data)};
-  ui.click("read-user-file-capability");await ui.tick();
-}
+// The conversation's file settings are read on open; this waits for that read to finish.
+async function readyFileInput(ui){await ui.tick()}
 
 test("literal selected file preserves BOM CRLF and U+FFFD and is never posted before Send",async()=>{
   const data=attachmentChat(),ui=await open(data),text="\ufeff  Name,Value\r\nsample,\ufffd🙂\r\n";
-  assert.equal(ui.calls.some(call=>call.url.endsWith("/user-text-file-capability")),false);
-  await readyFileInput(ui,data);
-  const input=ui.nodes.get("user-text-files");
+  await readyFileInput(ui);
+  const input=ui.nodes.get("attachment-files");
   assert.equal(input.disabled,false);
   input.files=[selectedFile("selected.csv",text)];input.events.change();await ui.tick();
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
@@ -897,8 +897,9 @@ function imageSupport(ui){
 
 test("attached images are converted, uploaded once each and sent as references only",async()=>{
   const data=imageChat(),ui=await open(data),{png,sizes}=imageSupport(ui),sha="f".repeat(64);
-  const input=ui.nodes.get("user-images");
-  assert.equal(ui.nodes.get("user-image-picker").hidden,false);
+  await readyFileInput(ui);
+  const input=ui.nodes.get("attachment-files");
+  assert.equal(ui.nodes.get("attachment-panel").hidden,false);
   assert.equal(input.disabled,false);
   input.files=[{name:"My Photo.jpg",type:"image/jpeg"}];
   const changed=input.events.change();
@@ -935,7 +936,8 @@ test("an original image over 10 MiB is refused before it is decoded or uploaded"
   const data=imageChat(),ui=await open(data),{sizes}=imageSupport(ui),decoded=[];
   const decode=ui.context.createImageBitmap;
   ui.context.createImageBitmap=async file=>{decoded.push(file.name);return decode(file)};
-  const input=ui.nodes.get("user-images");
+  await readyFileInput(ui);
+  const input=ui.nodes.get("attachment-files");
   input.files=[{name:"ok.jpg",type:"image/jpeg",size:1024},{name:"huge.jpg",type:"image/jpeg",size:10*1024*1024+1}];
   input.events.change();
   for(let i=0;i<5;i++)await ui.tick();
@@ -957,7 +959,8 @@ test("an image the browser cannot decode keeps earlier images and shows the imag
     if(file.name==="bad.jpg")throw Object.assign(new Error("The source image could not be decoded."),{name:"InvalidStateError",code:11});
     return decode(file);
   };
-  const input=ui.nodes.get("user-images");
+  await readyFileInput(ui);
+  const input=ui.nodes.get("attachment-files");
   input.files=[{name:"ok.jpg",type:"image/jpeg"},{name:"bad.jpg",type:"image/jpeg"}];
   const changed=input.events.change();
   for(let i=0;i<5&&!ui.holder.pendingPosts.length;i++)await ui.tick();
@@ -968,18 +971,96 @@ test("an image the browser cannot decode keeps earlier images and shows the imag
   assert.match(ui.text("user-image-note"),/沒通過的那張和之後選的都沒有加入/);
 });
 
-test("images follow the model's declared support on both native lanes and stay off elsewhere",async()=>{
+test("images follow the model's declared support on both native lanes and are refused with the reason elsewhere",async()=>{
   const data=imageChat();data.composer.models.models[0].supports_image_input=false;
-  const ui=await open(data);
-  assert.equal(ui.nodes.get("user-images").disabled,true);
-  assert.match(ui.text("user-image-note"),/不讀圖片/);
+  const ui=await open(data),{png}=imageSupport(ui);await readyFileInput(ui);
+  const pick=async()=>{
+    const input=ui.nodes.get("attachment-files");
+    input.files=[{name:"photo.jpg",type:"image/jpeg",size:10}];
+    const changed=input.events.change();
+    for(let i=0;i<5&&!ui.holder.pendingPosts.length;i++)await ui.tick();
+    ui.holder.pendingPosts.at(-1)?.resolve({name:"photo.png",sha256:"f".repeat(64),byte_length:png.length,media_type:"image/png"});
+    await changed;await ui.tick();
+  };
+  assert.equal(ui.text("user-image-note"),"");
+  await pick();
+  assert.equal(ui.text("user-image-note"),"目前的模型不能讀圖片，請移除圖片或換模型。");
+  assert.equal(ui.holder.pendingPosts.length,0);
   const responses=imageChat();responses.composer.state_profile="foundry-responses-v1";
-  ui.render(responses);
-  assert.equal(ui.nodes.get("user-images").disabled,false);
-  assert.equal(ui.nodes.get("user-image-picker").hidden,false);
-  const legacy=imageChat();delete legacy.composer.state_profile;
-  ui.render(legacy);
-  assert.equal(ui.nodes.get("user-images").disabled,true);
+  ui.render(responses);await ui.tick();
+  await pick();
+  assert.deepEqual(ui.holder.pendingPosts.map(post=>post.url),["/api/instructions/attachment-draft/image-upload"]);
+  assert.equal(ui.text("user-image-note"),"已附 1／4 張圖片。");
+  const legacy=imageChat();delete legacy.composer.state_profile;legacy.composer.request_id="legacy-draft";
+  ui.render(legacy);await ui.tick();
+  await pick();
+  assert.equal(ui.holder.pendingPosts.length,1);
+  assert.equal(ui.text("user-image-note"),"這段對話的路徑不支援附圖；請在原生對話中附圖。");
+});
+
+test("one file picker sends an image, a PDF and a text file down their own paths",async()=>{
+  const data=imageChat(),ui=await open(data),{png}=imageSupport(ui);await readyFileInput(ui);
+  ui.context.crypto??=globalThis.crypto;
+  const pdf=[0x25,0x50,0x44,0x46,0x2d,0x00],sha256=require("crypto").createHash("sha256").update(Buffer.from(pdf)).digest("hex");
+  ui.holder.templateResponses={"/api/instructions/attachment-draft/file-upload":{ok:true,
+    json:async()=>({name:"report.pdf",sha256,byte_length:pdf.length,media_type:"application/pdf"})}};
+  assert.match(html,/<input id="attachment-files" type="file" accept="\.txt,\.md,\.csv,\.json,\.pdf,\.docx,\.xlsx,\.pptx,\.png,\.jpg,\.jpeg,\.webp,image\/png,image\/jpeg,image\/webp" aria-describedby="user-file-note" multiple disabled>/);
+  const input=ui.nodes.get("attachment-files");
+  assert.equal(input.disabled,false);
+  input.files=[{name:"Photo.jpg",type:"image/jpeg",size:10},binaryFile("report.pdf",pdf),selectedFile("note.txt","hello")];
+  const changed=input.events.change();
+  for(let i=0;i<5&&!ui.holder.pendingPosts.length;i++)await ui.tick();
+  ui.holder.pendingPosts.at(-1).resolve({name:"Photo.png",sha256:"f".repeat(64),byte_length:png.length,media_type:"image/png"});
+  await changed;await ui.tick();
+  assert.deepEqual(ui.calls.filter(call=>call.method==="PUT").map(call=>call.url),["/api/instructions/attachment-draft/file-upload"]);
+  assert.deepEqual(ui.calls.filter(call=>call.method==="POST").map(call=>call.url),["/api/instructions/attachment-draft/image-upload"]);
+  assert.deepEqual(ui.nodes.get("user-file-selected").children.map(row=>row.children[0].value),["report.pdf","note.txt"]);
+  assert.deepEqual(ui.nodes.get("user-image-selected").children.map(figure=>figure.children[0].alt),["Photo.png"]);
+});
+
+test("opening a conversation reads its file settings once and the picker is ready without a click",async()=>{
+  const data=attachmentChat(),ui=await open(data);await readyFileInput(ui);
+  const reads=ui.calls.filter(call=>call.url.endsWith("/user-text-file-capability"));
+  assert.deepEqual(reads.map(call=>[call.url,call.method]),[["/api/instructions/attachment-draft/user-text-file-capability",undefined]]);
+  assert.equal(ui.nodes.get("attachment-files").disabled,false);
+  assert.equal(ui.nodes.get("read-user-file-capability").hidden,true);
+  assert.equal(ui.text("user-file-note"),"");
+  ui.click("attachment-panel-toggle");await ui.tick();ui.click("attachment-panel-toggle");await ui.tick();
+  assert.equal(ui.calls.filter(call=>call.url.endsWith("/user-text-file-capability")).length,1);
+  assert.equal(ui.calls.some(call=>call.method==="POST"||call.method==="PUT"),false);
+});
+
+test("a failed settings read shows why with 重試, and 重試 reads it once more",async()=>{
+  const data=attachmentChat();
+  const ui=await open(data,{fileCapabilityResponse:{ok:false,json:async()=>({error:{code:"USER_FILE_CAPABILITY_UNAVAILABLE"}})}});
+  await readyFileInput(ui);
+  assert.equal(ui.text("user-file-note"),"這段對話的附件設定目前讀不到，請按「重試」。");
+  assert.equal(ui.nodes.get("read-user-file-capability").hidden,false);
+  assert.match(html,/<button id="read-user-file-capability" type="button" hidden>重試<\/button>/);
+  assert.equal(ui.nodes.get("attachment-files").disabled,true);
+  ui.holder.fileCapabilityResponse=null;
+  ui.click("read-user-file-capability");await ui.tick();
+  assert.equal(ui.calls.filter(call=>call.url.endsWith("/user-text-file-capability")).length,2);
+  assert.equal(ui.nodes.get("read-user-file-capability").hidden,true);
+  assert.equal(ui.nodes.get("attachment-files").disabled,false);
+});
+
+test("a conversation without attached files says so in one line and keeps the picker closed to files",async()=>{
+  const data=attachmentChat(),ui=await open(data,{fileCapabilityResponse:{ok:true,json:async()=>fileCapability(data,null)}});
+  await readyFileInput(ui);
+  assert.equal(ui.text("user-file-note"),"這段對話沒有開啟附檔。");
+  assert.equal(ui.nodes.get("read-user-file-capability").hidden,true);
+  assert.equal(ui.nodes.get("attachment-files").disabled,true);
+  const images=imageChat();images.composer.request_id="image-draft";
+  ui.holder.fileCapabilityResponse=()=>({ok:true,json:async()=>fileCapability(images,null)});
+  ui.render(images);await ui.tick();
+  assert.equal(ui.text("user-file-note"),"這段對話只能附圖片。");
+  assert.equal(ui.nodes.get("attachment-files").disabled,false);
+});
+
+test("the attachment panel says what it takes in one line and keeps the details folded",async()=>{
+  assert.match(html,/<label for="attachment-files">可以附文字檔、PDF、Word、Excel、PowerPoint 或圖片，每份最多 10 MB。<\/label>/);
+  assert.match(html,/<details id="attachment-details"><summary>詳細<\/summary><small>[^<]*BOM／CRLF[^<]*<\/small><\/details>/);
 });
 
 function questionItem(thread,{freeform=true}={}){
@@ -1123,6 +1204,10 @@ function hitlRead(data=hitlChat()){
         command:{action_digest:"c".repeat(64),review:{rules_revision:0,source:"default",outcome:"ask",matched_rule_ids:[]},
           action:{call:item.approval.call,category:"shell",tool:"run_command",target:"<b>original workspace</b>",
             arguments:{command:"echo <script>do not execute this HTML</script>",payload:"x".repeat(70*1024)}}}}}};
+}
+function ruleHistoryPage(entries,{head=entries[0]?.revision??0,next_before=null}={}){
+  return {schema_version:"fa-native-hitl-rule-history-v1",team_id:"team-one",head_revision:head,entries,next_before,
+    purpose:"readback-only-not-execution-permission"};
 }
 function hitlNodes(ui,attribute,value){
   const found=[],walk=node=>{
@@ -1328,7 +1413,7 @@ test("with push a running turn is read every 3 seconds, and at once when it ends
   pushEvent(socket,{type:"turn.finished",agent_id:"configured-agent",request_id:rid,at:"2026-01-01T00:00:01Z"});
   await ui.tick();await ui.tick();await ui.tick();
   assert.deepEqual(ui.calls.slice(before).map(call=>call.url).filter(url=>url.startsWith("/api/instructions")),
-    [`/api/instructions/${rid}/status`],"the end event reads that turn once");
+    [`/api/instructions/${rid}/status`,`/api/instructions/${rid}/user-text-file-capability`],"the end event reads that turn once, then its file settings");
   assert.match(JSON.stringify(ui.nodes.get("conversation-history").children,(key,value)=>key==="events"?undefined:value),
     /推送後的回覆/);
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
@@ -1491,7 +1576,7 @@ test("a push hint reads once even while progress is paused, and a good answer re
   const before=ui.calls.length;
   pushEvent(socket,{type:"turn.finished",agent_id:"configured-agent",request_id:rid});
   for(let i=0;i<4;i++)await ui.tick();
-  assert.deepEqual(ui.calls.slice(before).map(call=>call.url),[`/api/instructions/${rid}/status`]);
+  assert.deepEqual(ui.calls.slice(before).map(call=>call.url),[`/api/instructions/${rid}/status`,`/api/instructions/${rid}/user-text-file-capability`]);
   assert.equal(vm.runInContext("progressPaused",ui.context),false);
   assert.match(JSON.stringify(ui.nodes.get("conversation-history").children),/推送後讀到的回覆/);
 });
@@ -1650,8 +1735,8 @@ async function countedSession(push,turnMs,endMs){
 test("push lowers the request count of the same session (the PR's table)",async()=>{
   const short=[await countedSession(false,20000,120000),await countedSession(true,20000,120000)];
   const long=[await countedSession(false,60000,600000),await countedSession(true,60000,600000)];
-  assert.deepEqual(short,[{total:25,team:3,status:20},{total:12,team:2,status:7}]);
-  assert.deepEqual(long,[{total:73,team:11,status:60},{total:26,team:3,status:20}]);
+  assert.deepEqual(short,[{total:26,team:3,status:20},{total:13,team:2,status:7}]);
+  assert.deepEqual(long,[{total:74,team:11,status:60},{total:27,team:3,status:20}]);
 });
 
 test("push about another Agent only marks its sidebar; a conversation opened here is imported once",async()=>{
@@ -1879,7 +1964,7 @@ for(const following of ["C-read","A-rules","C-same-id"]){
     await vm.runInContext("readTeamAttention()",ui.context);await ui.tick();
     assert.equal(hitlNodes(ui,"data-hitl-card",c.reference.pending_id).length,0);
     const rows=ui.nodes.get("hitl-command-list").children;
-    const row=rows.find(entry=>entry.textContent.includes("第二位助理"));
+    const row=rows.find(entry=>shownText(entry).includes("第二位助理"));
     assert.ok(row,"B's original UNKNOWN observation must remain available after another console returns");
     const button=row.children.find(child=>child.attributes["data-hitl-reconcile"]===rid);
     assert.ok(button);
@@ -2029,6 +2114,95 @@ test("allow this kind first opens an editable scoped suggestion and only 確認�
   assert.equal(posts[0].body.rule.text,"只允許第一位助理查詢這個 VM 的記憶體資訊");
   assert.deepEqual(posts[0].body.approval,view.readback.approval);
 });
+
+const ruleDraftCases=[
+  {name:"a navigate call widens to the URL's website",
+    action:{category:"mcp",tool:"browser_navigate",target:"playwright/browser_navigate",
+      arguments:{url:"https://www.cwa.gov.tw/V8/C/W/County/County.html?CID=63"}},
+    exact:'允許 第一位助理 使用 browser_navigate，目標限於 "playwright/browser_navigate"，參數限定為 {"url":"https://www.cwa.gov.tw/V8/C/W/County/County.html?CID=63"}。',
+    kind:"允許 第一位助理 用 playwright 的 browser_navigate 開啟 https://www.cwa.gov.tw 網站的網頁。"},
+  {name:"a shell command widens to its program in the same folder",
+    action:{category:"shell",tool:"run_command",target:"/home/agent/desktop/files",arguments:{command:"  free -h ",cwd:"/workspace"}},
+    exact:'允許 第一位助理 在 "/workspace" 執行指定命令 "  free -h "。',
+    kind:'允許 第一位助理 在 "/workspace" 執行 free 程式（參數不限）。'},
+  {name:"another tool widens to the tool and target without its arguments",
+    action:{category:"mcp",tool:"search_docs",target:"team-Docs/search_docs",arguments:{query:"Q3",limit:3}},
+    exact:'允許 第一位助理 使用 search_docs，目標限於 "team-Docs/search_docs"，參數限定為 {"query":"Q3","limit":3}。',
+    kind:'允許 第一位助理 使用 search_docs，目標限於 "team-Docs/search_docs"，參數不限。'},
+  {name:"a navigate call without a website URL offers only the exact draft",
+    action:{category:"mcp",tool:"browser_navigate",target:"playwright/browser_navigate",arguments:{url:"javascript:alert(1)"}},
+    exact:'允許 第一位助理 使用 browser_navigate，目標限於 "playwright/browser_navigate"，參數限定為 {"url":"javascript:alert(1)"}。',
+    why:"沒有「這類動作」草稿：網址不是可解析的 http／https 網站，無法歸成一個網站。"},
+  {name:"a chained shell command offers only the exact draft",
+    action:{category:"shell",tool:"run_command",target:"/w",arguments:{command:"echo ok && rm -rf /tmp/x"}},
+    exact:'允許 第一位助理 在 "/w" 執行指定命令 "echo ok && rm -rf /tmp/x"。',
+    why:"沒有「這類動作」草稿：這條命令有串接、重導、引號或展開，無法安全歸成一個程式。"},
+  {name:"a shell interpreter offers only the exact draft",
+    action:{category:"shell",tool:"run_command",target:"/w",arguments:{command:"bash deploy.sh"}},
+    exact:'允許 第一位助理 在 "/w" 執行指定命令 "bash deploy.sh"。',
+    why:"沒有「這類動作」草稿：bash 可以再執行任何命令，不能只看程式名稱放行。"},
+  {name:"an interpreter named by path, case and version offers only the exact draft",
+    action:{category:"shell",tool:"run_command",target:"/w",arguments:{command:"/usr/bin/Python3.12 job.py"}},
+    exact:'允許 第一位助理 在 "/w" 執行指定命令 "/usr/bin/Python3.12 job.py"。',
+    why:"沒有「這類動作」草稿：/usr/bin/Python3.12 可以再執行任何命令，不能只看程式名稱放行。"},
+  {name:"a Windows interpreter file name offers only the exact draft",
+    action:{category:"shell",tool:"run_command",target:"/w",arguments:{command:"PWSH.EXE job.ps1"}},
+    exact:'允許 第一位助理 在 "/w" 執行指定命令 "PWSH.EXE job.ps1"。',
+    why:"沒有「這類動作」草稿：PWSH.EXE 可以再執行任何命令，不能只看程式名稱放行。"},
+  {name:"a command with a tab offers only the exact draft",
+    action:{category:"shell",tool:"run_command",target:"/w",arguments:{command:"ls\t-la"}},
+    exact:'允許 第一位助理 在 "/w" 執行指定命令 "ls\\t-la"。',
+    why:"沒有「這類動作」草稿：這條命令有串接、重導、引號或展開，無法安全歸成一個程式。"},
+  {name:"a navigate call with more than a URL offers only the exact draft",
+    action:{category:"mcp",tool:"browser_navigate",target:"playwright/browser_navigate",
+      arguments:{url:"https://example.com/",script:"x"}},
+    exact:'允許 第一位助理 使用 browser_navigate，目標限於 "playwright/browser_navigate"，參數限定為 {"url":"https://example.com/","script":"x"}。',
+    why:"沒有「這類動作」草稿：這個開網頁動作除了網址還有其他參數，不能只看網站放行。"},
+  {name:"a navigate call too long to pin starts empty and still offers its website",
+    action:{category:"mcp",tool:"browser_navigate",target:"playwright/browser_navigate",
+      arguments:{url:"https://www.cwa.gov.tw/?q="+"x".repeat(600)}},
+    exact:"",kind:"允許 第一位助理 用 playwright 的 browser_navigate 開啟 https://www.cwa.gov.tw 網站的網頁。",
+    why:"「只這次」的草稿超過 512 字，請自己寫範圍。"},
+];
+for(const c of ruleDraftCases){
+  test(`rule drafts: ${c.name}${c.kind?"; the picked and edited text is exactly what allow_rule sends":""}`,async()=>{
+    const data=hitlAgent("agent-one"),view=hitlRead(data),pid=view.readback.approval.pending_id,posts=[];
+    Object.assign(view.readback.pending.command.action,c.action);
+    const ui=await open(data,{now:Date.parse(when),hitl:async(url,options)=>{
+      if(options.method==="POST"){
+        posts.push(JSON.parse(options.body));
+        return {ok:true,json:async()=>hitlCommandReply(posts.at(-1))};
+      }
+      return {ok:true,json:async()=>copy(view)};
+    }});
+    await ui.tick();
+    assert.equal(hitlNodes(ui,"data-hitl-rule-drafts",pid).length,0,"no draft picker before 以後允許這類");
+    hitlNodes(ui,"data-hitl-choice","allow_rule")[0].events.click();await ui.tick();
+    const note=hitlNodes(ui,"data-hitl-rule-drafts-note",pid)[0];
+    assert.equal(hitlNodes(ui,"data-hitl-rule",pid)[0].value,c.exact,"the exact draft is filled first");
+    assert.deepEqual(hitlNodes(ui,"data-hitl-draft","exact").map(node=>node.textContent),c.exact?["只這次"]:[]);
+    assert.equal(note.hidden,!c.why);assert.equal(note.textContent,c.why||"");
+    const kind=hitlNodes(ui,"data-hitl-draft","kind");
+    if(!c.kind){assert.equal(kind.length,0);return}
+    assert.equal(kind[0].textContent,"這類動作");
+    const shown=hitlNodes(ui,"data-hitl-rule",pid)[0];
+    kind[0].events.click();await ui.tick();
+    assert.equal(posts.length,0,"picking a draft is not a decision");
+    assert.equal(shown.value,c.kind,"the box the owner sees shows the picked draft");
+    if(c.exact){
+      hitlNodes(ui,"data-hitl-draft","exact")[0].events.click();await ui.tick();
+      assert.equal(shown.value,c.exact);
+      hitlNodes(ui,"data-hitl-draft","kind")[0].events.click();await ui.tick();
+    }
+    ui.render(data);await ui.tick();
+    const input=hitlNodes(ui,"data-hitl-rule",pid)[0],edited=c.kind.replace("。","，平日才可以。");
+    assert.equal(input.value,c.kind,"the picked draft survives a redraw");
+    input.value=edited;input.events.input();
+    hitlNodes(ui,"data-hitl-choice","allow_rule")[0].events.click();await ui.tick();await ui.tick();
+    assert.equal(posts.length,1);assert.equal(posts[0].choice,"allow_rule");
+    assert.deepEqual(posts[0].rule,{text:edited,behavior:"allow_automatically"});
+  });
+}
 
 test("a toolbox tool set to always shows its name and exact arguments and is approved once, never as a rule",async()=>{
   const data=hitlAgent("agent-one"),view=hitlRead(data),pid=view.readback.approval.pending_id,posts=[];
@@ -2324,6 +2498,7 @@ for(const boundary of ["thread","config","logout","reconnect","edit"]){
       const pending=[];
       const ui=await open(data,{now:Date.parse(when),hitl:url=>url.endsWith("/rules")?
         Promise.resolve({ok:true,json:async()=>({rules:copy(view.rules),commands:[],can_approve:true,read_at:when})}):
+        url.endsWith("/rule-history")?Promise.resolve({ok:true,json:async()=>ruleHistoryPage([])}):
         new Promise((resolve,reject)=>pending.push({resolve,reject}))});
       if(boundary==="edit"){ui.click("read-hitl-rules");await ui.tick();await ui.tick()}
       hitlNodes(ui,"data-hitl-read",pid)[0].events.click();await ui.tick();
@@ -2359,7 +2534,8 @@ test("native HITL absent or legacy does not request or render native approval co
     const data=hitlChat();
     if(off==="flag")delete data.composer.native_hitl;else delete data.composer.state_profile;
     const ui=await open(data,{now:Date.parse(when)});
-    assert.equal(ui.nodes.get("hitl-rules-panel").hidden,true);
+    // The Team rules do not belong to a conversation (D5): a legacy one still shows the panel, unread.
+    assert.equal(ui.nodes.get("hitl-rules-panel").hidden,off==="flag");
     assert.equal(ui.nodes.get("attention-panel").hidden,true);
     assert.equal(ui.calls.some(call=>call.url.startsWith("/api/native-hitl/")),false);
   }
@@ -2566,8 +2742,8 @@ test("literal empty original file downloads verified raw bytes instead of becomi
 });
 
 async function chooseLiteral(ui,files){
-  ui.nodes.get("user-text-files").files=files;
-  await ui.nodes.get("user-text-files").events.change();
+  ui.nodes.get("attachment-files").files=files;
+  await ui.nodes.get("attachment-files").events.change();
 }
 function binaryFile(name,bytes){
   return {name,size:bytes.length,arrayBuffer:async()=>Uint8Array.from(bytes).buffer};
@@ -2579,7 +2755,7 @@ for(const [label,file] of [
   ["invalid-tail",binaryFile("input.txt",[0xef,0xbb,0xbf,0xf0,0x9f])],
 ]){
   test(`literal ${label} is rejected as a batch without replacement text or a POST`,async()=>{
-    const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
+    const data=attachmentChat(),ui=await open(data);await readyFileInput(ui);
     await chooseLiteral(ui,[file]);
     assert.equal(ui.nodes.get("user-file-selected").children.length,0);
     assert.match(ui.text("user-file-limit"),/不是有效UTF-8或含NUL/);
@@ -2600,7 +2776,7 @@ for(const [label,name,size,message] of [
   ["small xlsx","report.xlsx",3,/這段對話的路徑不支援大檔、PDF 或 Office 檔/],
 ]){
   test(`literal ${label} is rejected before reading any user File`,async()=>{
-    const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
+    const data=attachmentChat(),ui=await open(data);await readyFileInput(ui);
     let reads=0;
     await chooseLiteral(ui,[{name,size,arrayBuffer:async()=>{reads++;return new Uint8Array(3).buffer}}]);
     assert.equal(reads,0);assert.equal(ui.nodes.get("user-file-selected").children.length,0);
@@ -2613,7 +2789,7 @@ for(const [name,mediaType] of [["report.pdf","application/pdf"],
   ["report.docx","application/vnd.openxmlformats-officedocument.wordprocessingml.document"]])
 test(`${name} is never decoded or inlined and goes up as a large file on a native conversation`,async()=>{
   const data=attachmentChat();data.composer.state_profile="foundry-native-v1";
-  const ui=await open(data);await readyFileInput(ui,data);
+  const ui=await open(data);await readyFileInput(ui);
   ui.context.crypto??=globalThis.crypto;
   // "%PDF-" then binary bytes, a NUL among them: never UTF-8 checked, never sent as message text.
   const bytes=[0x25,0x50,0x44,0x46,0x2d,0xe2,0xe3,0x00,0xff];
@@ -2630,7 +2806,7 @@ test(`${name} is never decoded or inlined and goes up as a large file on a nativ
 });
 
 test("literal actual bytes are checked independently of declared File.size",async()=>{
-  const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
+  const data=attachmentChat(),ui=await open(data);await readyFileInput(ui);
   await chooseLiteral(ui,[{name:"input.txt",size:1,arrayBuffer:async()=>new Uint8Array(8193).buffer}]);
   assert.equal(ui.nodes.get("user-file-selected").children.length,0);
   assert.match(ui.text("user-file-limit"),/8192 bytes 以內/);
@@ -2638,12 +2814,12 @@ test("literal actual bytes are checked independently of declared File.size",asyn
 });
 
 test("literal exact JSON escaped UTF8 limit includes content and file names and updates on typing",async()=>{
-  const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
+  const data=attachmentChat(),ui=await open(data);await readyFileInput(ui);
   typeAttachmentText(ui,"Read.");
   const overhead=Buffer.byteLength('{"content":"Read.","files":[{"name":"one.txt","text":""}]}');
   const text="x".repeat(8192-overhead);
   await chooseLiteral(ui,[selectedFile("one.txt",text)]);
-  assert.match(ui.text("user-file-limit"),/8192／8192/);
+  assert.equal(ui.text("user-file-limit"),"訊息和小檔共 8192／8192 bytes；附件合計 1／4。");
   assert.equal(ui.nodes.get("send-instruction").disabled,false);
   typeAttachmentText(ui,"Read.\n");
   assert.equal(ui.nodes.get("send-instruction").disabled,true);
@@ -2656,7 +2832,7 @@ test("literal exact JSON escaped UTF8 limit includes content and file names and 
 });
 
 test("literal empty local File is retained and safe json content is never rendered",async()=>{
-  const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
+  const data=attachmentChat(),ui=await open(data);await readyFileInput(ui);
   await chooseLiteral(ui,[selectedFile("empty.txt",""),selectedFile("data.json","<script>unsafe()</script>\r\n=FORMULA()")]);
   assert.equal(ui.nodes.get("user-file-selected").children.length,2);
   assert.match(ui.nodes.get("user-file-selected").children[0].children[1].textContent,/0 bytes/);
@@ -2668,7 +2844,7 @@ test("literal empty local File is retained and safe json content is never render
 
 test("literal and reference attachments share the four-name bound without silently renaming a file",async()=>{
   const data=attachmentChat(),ui=await open(data);await readAttachments(ui,data);selectAttachment(ui);
-  await readyFileInput(ui,data);
+  await readyFileInput(ui);
   await chooseLiteral(ui,[selectedFile("a.txt","A"),selectedFile("b.md","B"),selectedFile("c.csv","C")]);
   typeAttachmentText(ui);
   assert.equal(ui.nodes.get("send-instruction").disabled,false);
@@ -2684,7 +2860,7 @@ test("literal and reference attachments share the four-name bound without silent
 });
 
 test("literal duplicate File names fail before reading and do not use file positions as identity",async()=>{
-  const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
+  const data=attachmentChat(),ui=await open(data);await readyFileInput(ui);
   let reads=0;
   const file={name:"same.txt",size:0,arrayBuffer:async()=>{reads++;return new ArrayBuffer(0)}};
   await chooseLiteral(ui,[file,file]);
@@ -2693,16 +2869,16 @@ test("literal duplicate File names fail before reading and do not use file posit
 
 for(const failure of ["missing-profile","missing-auth","unknown-profile","wrong-cid","null-profile","404"]){
   test(`literal capability ${failure} never enables File reads or falls back to references`,async()=>{
-    const data=attachmentChat(),ui=await open(data),value=fileCapability(data);
+    const data=attachmentChat(),value=fileCapability(data);
     if(failure==="missing-profile")delete value.user_text_file_profile;
     if(failure==="missing-auth")delete value.authorization;
     if(failure==="unknown-profile")value.user_text_file_profile="unrecognized";
     if(failure==="wrong-cid")value.conversation_id="other-cid";
     if(failure==="null-profile")value.user_text_file_profile=null;
-    ui.holder.fileCapabilityResponse=failure==="404"?
-      {ok:false,json:async()=>({error:{code:"USER_FILE_CAPABILITY_UNAVAILABLE"}})}:{ok:true,json:async()=>value};
-    ui.click("read-user-file-capability");await ui.tick();
-    assert.equal(ui.nodes.get("user-text-files").disabled,true);
+    const ui=await open(data,{fileCapabilityResponse:failure==="404"?
+      {ok:false,json:async()=>({error:{code:"USER_FILE_CAPABILITY_UNAVAILABLE"}})}:{ok:true,json:async()=>value}});
+    await readyFileInput(ui);
+    assert.equal(ui.nodes.get("attachment-files").disabled,true);
     let reads=0;
     await chooseLiteral(ui,[{name:"a.txt",size:0,arrayBuffer:async()=>{reads++;return new ArrayBuffer(0)}}]);
     assert.equal(reads,0);
@@ -2713,9 +2889,9 @@ for(const failure of ["missing-profile","missing-auth","unknown-profile","wrong-
 
 for(const outcome of ["success","error"]){
   test(`literal late File ${outcome} cannot replace a newer chosen file or clear its busy state`,async()=>{
-    const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
+    const data=attachmentChat(),ui=await open(data);await readyFileInput(ui);
     let oldResolve,oldReject,newResolve;
-    const input=ui.nodes.get("user-text-files");
+    const input=ui.nodes.get("attachment-files");
     input.files=[{name:"old.txt",size:3,arrayBuffer:()=>new Promise((resolve,reject)=>{oldResolve=resolve;oldReject=reject})}];
     const oldRead=input.events.change();await ui.tick();
     input.files=[{name:"new.txt",size:3,arrayBuffer:()=>new Promise(resolve=>{newResolve=resolve})}];
@@ -2733,10 +2909,10 @@ for(const outcome of ["success","error"]){
 
 for(const change of ["thread","draft","login","lost-login"]){
   test(`literal late decode after ${change} cannot publish or POST original file contents`,async()=>{
-    const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
+    const data=attachmentChat(),ui=await open(data);await readyFileInput(ui);
     let finish;
-    ui.nodes.get("user-text-files").files=[{name:"old.txt",size:3,arrayBuffer:()=>new Promise(resolve=>{finish=resolve})}];
-    const pending=ui.nodes.get("user-text-files").events.change();await ui.tick();
+    ui.nodes.get("attachment-files").files=[{name:"old.txt",size:3,arrayBuffer:()=>new Promise(resolve=>{finish=resolve})}];
+    const pending=ui.nodes.get("attachment-files").events.change();await ui.tick();
     if(change==="login"){
       ui.holder.response={ok:true,json:async()=>({})};ui.click("login");await ui.tick();await ui.tick();
     }else{
@@ -2753,39 +2929,40 @@ for(const change of ["thread","draft","login","lost-login"]){
 }
 
 test("literal late capability result cannot enable a new draft and its finally cannot end a newer read",async()=>{
-  const data=attachmentChat(),ui=await open(data);let oldRead,newRead;
-  ui.holder.fileCapabilityResponse=new Promise(resolve=>{oldRead=resolve});
-  ui.click("read-user-file-capability");await ui.tick();
-  const next=copy(data);next.composer.request_id="next-rid";ui.render(next);
-  ui.holder.fileCapabilityResponse=new Promise(resolve=>{newRead=resolve});
-  ui.click("read-user-file-capability");await ui.tick();
+  const data=attachmentChat();let oldRead,newRead;
+  const answers=[new Promise(resolve=>{oldRead=resolve}),new Promise(resolve=>{newRead=resolve})];
+  const ui=await open(data,{fileCapabilityResponse:()=>answers.shift()});await ui.tick();
+  const next=copy(data);next.composer.request_id="next-rid";ui.render(next);await ui.tick();
   oldRead({ok:true,json:async()=>fileCapability(data)});await ui.tick();
-  assert.equal(ui.nodes.get("read-user-file-capability").disabled,true);
-  assert.equal(ui.nodes.get("user-text-files").disabled,true);
+  assert.equal(ui.text("user-file-note"),"正在讀取這段對話的附件設定…");
+  assert.equal(ui.nodes.get("attachment-files").disabled,true);
   newRead({ok:true,json:async()=>fileCapability(next)});await ui.tick();
-  assert.equal(ui.nodes.get("user-text-files").disabled,false);
+  assert.equal(ui.nodes.get("attachment-files").disabled,false);
+  assert.equal(ui.calls.filter(call=>call.url.endsWith("/user-text-file-capability")).length,2);
 });
 
-test("literal clearing a draft during a capability refresh cannot leave that observation stuck busy",async()=>{
-  const data=attachmentChat(),ui=await open(data);await readyFileInput(ui,data);
-  await chooseLiteral(ui,[selectedFile("draft.txt","local")]);
-  let oldRead;
-  ui.holder.fileCapabilityResponse=new Promise(resolve=>{oldRead=resolve});
+test("literal clearing files while 重試 is reading restarts that read instead of leaving it stuck busy",async()=>{
+  const data=imageChat();let retried;
+  const answers=[{ok:false,json:async()=>({error:{code:"USER_FILE_CAPABILITY_UNAVAILABLE"}})},new Promise(resolve=>{retried=resolve})];
+  const ui=await open(data,{fileCapabilityResponse:()=>answers.shift()});await readyFileInput(ui);
+  let reads=0;
+  await chooseLiteral(ui,[{name:"draft.txt",size:5,arrayBuffer:async()=>{reads++;return new ArrayBuffer(5)}}]);
+  assert.equal(reads,0);
+  assert.equal(ui.text("user-file-limit"),"這段對話的附件設定目前讀不到，請按「重試」。");
   ui.click("read-user-file-capability");await ui.tick();
-  ui.click("clear-user-files");
-  assert.equal(ui.nodes.get("user-file-selected").children.length,0);
-  assert.equal(ui.nodes.get("read-user-file-capability").disabled,false);
-  oldRead({ok:true,json:async()=>fileCapability(data)});await ui.tick();
-  assert.equal(ui.nodes.get("user-text-files").disabled,true);
-  await readyFileInput(ui,data);
-  assert.equal(ui.nodes.get("user-text-files").disabled,false);
+  ui.click("clear-user-files");await ui.tick();
+  assert.equal(ui.text("user-file-limit"),"");
+  retried({ok:true,json:async()=>fileCapability(data,null)});await ui.tick();
+  assert.equal(ui.calls.filter(call=>call.url.endsWith("/user-text-file-capability")).length,3);
+  assert.equal(ui.text("user-file-note"),"");
+  assert.equal(ui.nodes.get("attachment-files").disabled,false);
 });
 
 test("literal and refs follow-up snapshots move together to the returned new RID only",async()=>{
   const data=attachmentChat();
   data.composer.editable=false;data.composer.can_submit=false;data.composer.can_follow_up=true;
   data.composer.conversation_id="captured-cid";data.composer.user_files=[{name:"previous.txt",sha256:"b".repeat(64),utf8_bytes:9}];
-  const ui=await open(data);await readAttachments(ui,data);selectAttachment(ui);await readyFileInput(ui,data);
+  const ui=await open(data);await readAttachments(ui,data);selectAttachment(ui);await readyFileInput(ui);
   await chooseLiteral(ui,[selectedFile("next.csv","\ufeffnext\r\n")]);typeAttachmentText(ui,"Next exact turn");
   ui.click("send-instruction");await ui.tick();
   assert.equal(ui.calls.at(-1).url,"/api/instructions/attachment-thread/next");
@@ -2804,7 +2981,7 @@ test("literal prepared metadata is read-only and never becomes the next turn fil
   data.composer.editable=false;data.composer.can_submit=false;
   data.composer.user_files=[{name:"frozen.md",sha256:"b".repeat(64),utf8_bytes:12}];
   const ui=await open(data);
-  assert.equal(ui.nodes.get("user-text-files").disabled,true);
+  assert.equal(ui.nodes.get("attachment-files").disabled,true);
   assert.equal(ui.nodes.get("user-file-selected").children[0].children[0].disabled,true);
   data.composer.can_follow_up=true;ui.render(data);
   assert.equal(ui.nodes.get("user-file-selected").children.length,0);
@@ -2813,7 +2990,7 @@ test("literal prepared metadata is read-only and never becomes the next turn fil
 
 test("literal follow-up stops before submit when authentication changes while next is pending",async()=>{
   const data=attachmentChat();data.composer.editable=false;data.composer.can_follow_up=true;
-  const ui=await open(data);await readyFileInput(ui,data);await chooseLiteral(ui,[selectedFile("safe.txt","original")]);
+  const ui=await open(data);await readyFileInput(ui);await chooseLiteral(ui,[selectedFile("safe.txt","original")]);
   typeAttachmentText(ui);ui.click("send-instruction");await ui.tick();const finish=ui.holder.pending;
   const expired=copy(data);expired.authentication="LOGIN_EXPIRED";ui.render(expired);
   const next=copy(data);next.composer.request_id="new-rid";next.composer.editable=true;next.composer.can_follow_up=false;
@@ -3233,7 +3410,7 @@ test("final_answer ends live text and reads the saved reply at once, which repla
   const before=ui.calls.length;
   ui.timers.delete(now[0]);await now[1]();await liveSettle(ui);
   assert.deepEqual(ui.calls.slice(before).map(call=>call.url).filter(url=>url.startsWith("/api/instructions")),
-    [`/api/instructions/${rid}/status`]);
+    [`/api/instructions/${rid}/status`,`/api/instructions/${rid}/user-text-file-capability`]);
   assert.match(shown(),/保存的回覆/);
   assert.doesNotMatch(shown(),/預覽文字/);
   assert.equal(streams.length,1,"the stream is not reopened after its end");
@@ -3327,7 +3504,7 @@ test("the reply arrives with the status read that sees the finish, without a sep
   const done=nativeChat("completed");
   done.tasks[0].reply={data:{text:"完成的回覆"},sha256:"a".repeat(64),byte_length:15,observed_at:when};
   ui.holder.progressResponse={ok:true,json:async()=>copy(done)};
-  assert.deepEqual(await fireProgress(ui),[`/api/instructions/${rid}/status`]);
+  assert.deepEqual(await fireProgress(ui),[`/api/instructions/${rid}/status`,`/api/instructions/${rid}/user-text-file-capability`]);
   await ui.tick();
   const text=JSON.stringify(ui.nodes.get("conversation-history").children,(key,value)=>key==="events"?undefined:value);
   assert.match(text,/完成的回覆/);
@@ -3341,7 +3518,9 @@ for(const end of ["unknown","failed"]){
     const ui=await open(data);await ui.tick();
     const ended=nativeChat(end);ended.tasks[0].native_receipt.status=end;ended.tasks[0].reply=null;
     ui.holder.progressResponse={ok:true,json:async()=>copy(ended)};
-    assert.deepEqual(await fireProgress(ui),[`/api/instructions/${rid}/status`]);
+    // An unknown end leaves a composer that can follow up, so it reads that conversation's file settings once.
+    assert.deepEqual(await fireProgress(ui),[`/api/instructions/${rid}/status`,
+      ...end==="unknown"?[`/api/instructions/${rid}/user-text-file-capability`]:[]]);
     const next=[...ui.timers.entries()].find(([id])=>ui.timerDelays.get(id)===0);
     assert.ok(next,"one whole read follows at once");
     const before=ui.calls.length;
@@ -3402,7 +3581,7 @@ function seeTurns(ui,rids){
     if(entries.length)observer.callback(entries);
   }
 }
-test("after a bridge restart any conversation can be written to at once, and opening it sends one read",async()=>{
+test("after a bridge restart any conversation can be written to at once, and opening it sends one status read",async()=>{
   const {data,answered}=restartedConversation(3),rid="rid-2";
   const ready=answered("2026-01-01T00:00:02.000000+00:00",true);
   ready.tasks=copy(data.tasks);ready.tasks[2].reply={data:{text:"最新一則的回覆"},sha256:"a".repeat(64),byte_length:21,observed_at:when};
@@ -3416,10 +3595,12 @@ test("after a bridge restart any conversation can be written to at once, and ope
     !url.startsWith("/api/state")&&!url.startsWith("/api/agents"));
   const first=[...ui.timers.entries()].find(([id])=>ui.timerDelays.get(id)===0);
   ui.timers.delete(first[0]);first[1]();await ui.tick();
-  assert.deepEqual(reads(),[`/api/instructions/${rid}/status`],"one read: the latest turn's status");
+  assert.deepEqual(reads(),[`/api/instructions/${rid}/user-text-file-capability`,`/api/instructions/${rid}/status`],
+    "two reads: the composer's file settings and the latest turn's status");
   finish({ok:true,json:async()=>copy(ready)});await ui.tick();await ui.tick();await ui.tick();
   for(const [id,fn] of [...ui.timers]){ui.timers.delete(id);await fn();await ui.tick()}
-  assert.deepEqual(reads(),[`/api/instructions/${rid}/status`],"no reply, progress, environment or whole read on open");
+  assert.deepEqual(reads(),[`/api/instructions/${rid}/user-text-file-capability`,`/api/instructions/${rid}/status`],
+    "no reply, progress, environment or whole read on open");
   assert.match(JSON.stringify(ui.nodes.get("conversation-history").children),/最新一則的回覆/);
   assertNothingSent(ui);
 });
@@ -4134,43 +4315,35 @@ test("an older A conversation opened later does not replace B's preview or the B
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
 });
 
-test("attachment toolbar icons disclose only the selected original picker without sending",async()=>{
-  const ui=await open(imageChat()),before=ui.calls.length;
-  for(const [id,label] of [
-    ["attachment-picker","文字來源附件"],["user-file-picker","選取文字檔"],["user-image-picker","附加圖片"],
-  ]){
-    const toggle=ui.nodes.get(id+"-toggle");
-    assert.ok(toggle,"The attachment picker needs an accessible toolbar icon");
-    assert.match(html,new RegExp(`<button[^>]*id="${id}-toggle"[^>]*aria-label="${label}"[^>]*title="${label}"`));
-    assert.equal(ui.nodes.get(id).open,false);
-    ui.click(id+"-toggle");await ui.tick();
-    assert.equal(ui.nodes.get(id).open,true);
-    assert.equal(toggle.getAttribute("aria-expanded"),"true");
-    for(const other of ["attachment-picker","user-file-picker","user-image-picker"]){
-      if(other!==id)assert.equal(ui.nodes.get(other).open,false);
-    }
-    ui.click(id+"-toggle");await ui.tick();
-    assert.equal(ui.nodes.get(id).open,false);
-    assert.equal(toggle.getAttribute("aria-expanded"),"false");
-  }
+test("one attachment button opens the one attachment panel without sending",async()=>{
+  const ui=await open(imageChat());await ui.tick();const before=ui.calls.length;
+  assert.match(html,/<button id="attachment-panel-toggle"[^>]*aria-label="附加檔案"[^>]*title="附加檔案"/);
+  for(const old of ["attachment-picker-toggle","user-file-picker-toggle","user-image-picker-toggle","user-file-picker",
+    "user-image-picker","user-text-files","user-images"])assert.equal(ui.nodes.has(old),false,old);
+  const toggle=ui.nodes.get("attachment-panel-toggle"),panel=ui.nodes.get("attachment-panel");
+  assert.equal(toggle.hidden,false);assert.equal(panel.open,false);
+  ui.click("attachment-panel-toggle");await ui.tick();
+  assert.equal(panel.open,true);assert.equal(toggle.getAttribute("aria-expanded"),"true");
+  ui.click("attachment-panel-toggle");await ui.tick();
+  assert.equal(panel.open,false);assert.equal(toggle.getAttribute("aria-expanded"),"false");
   assert.equal(ui.calls.length,before);
 });
 
 test("attachment picker disclosure preserves text and selected files and closes on thread change",async()=>{
   const data=imageChat(),ui=await open(data);
   ui.nodes.get("instruction").value="保留未送文字";ui.nodes.get("instruction").events.input();
-  ui.nodes.get("user-text-files").value="pending-original.txt";
-  assert.ok(ui.nodes.get("user-file-picker-toggle"));
-  ui.click("user-file-picker-toggle");await ui.tick();
-  assert.equal(ui.nodes.get("user-file-picker").open,true);
-  ui.click("user-file-picker-toggle");await ui.tick();
+  ui.nodes.get("attachment-files").value="pending-original.txt";
+  assert.ok(ui.nodes.get("attachment-panel-toggle"));
+  ui.click("attachment-panel-toggle");await ui.tick();
+  assert.equal(ui.nodes.get("attachment-panel").open,true);
+  ui.click("attachment-panel-toggle");await ui.tick();
   assert.equal(ui.nodes.get("instruction").value,"保留未送文字");
-  assert.equal(ui.nodes.get("user-text-files").value,"pending-original.txt");
-  ui.click("user-file-picker-toggle");await ui.tick();
+  assert.equal(ui.nodes.get("attachment-files").value,"pending-original.txt");
+  ui.click("attachment-panel-toggle");await ui.tick();
   const changed=copy(data);changed.composer.thread_id="another-thread";changed.composer.request_id="another-draft";
   ui.render(changed);
-  assert.equal(ui.nodes.get("user-file-picker").open,false);
-  assert.equal(ui.nodes.get("user-file-picker-toggle").getAttribute("aria-expanded"),"false");
+  assert.equal(ui.nodes.get("attachment-panel").open,false);
+  assert.equal(ui.nodes.get("attachment-panel-toggle").getAttribute("aria-expanded"),"false");
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
 });
 
@@ -9708,6 +9881,409 @@ test("Team rules moved into settings while approval and question cards stay on t
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
   ui.documentEvents.keydown({key:"Escape"});
   assert.equal(ui.nodes.get("settings-page").hidden,true);
+});
+
+function rulesRevision3(){
+  return {schema_version:"fa-native-hitl-rules-v1",team_id:"team-one",revision:3,etag:"rules-v3",
+    rules:[{rule_id:"r".repeat(64),text:"執行 shell 前先問我",behavior:"ask_first"}]};
+}
+async function openRulesTab(ui){
+  ui.click("open-settings");ui.click("settings-tab-rules");await ui.tick();await ui.tick();
+}
+test("opening the rules tab reads the Team rules once without a click or a native conversation",async()=>{
+  const data=hitlChat();delete data.composer.state_profile;
+  const ui=await open(data,{now:Date.parse(when),hitl:async()=>({ok:true,json:async()=>({
+    rules:rulesRevision3(),commands:[],can_approve:true,read_at:when})})});
+  const reads=()=>ui.calls.filter(call=>call.url.startsWith("/api/native-hitl/")).map(call=>call.url);
+  assert.deepEqual(reads(),[]);
+  await openRulesTab(ui);
+  assert.deepEqual(reads(),["/api/native-hitl/team/rules","/api/native-hitl/team/rule-history"]);
+  assert.equal(ui.text("hitl-rules-note"),"已讀規則版本 3；不是操作批准。");
+  assert.equal(ui.text("settings-rules-note"),"規則不用選對話就能讀；要新增或修改規則，請先在左側選好一段原生對話。");
+  assert.ok(html.includes('<button id="read-hitl-rules">重新讀取</button>'));
+  ui.click("settings-tab-team-skills");await ui.tick();ui.click("settings-tab-rules");await ui.tick();await ui.tick();
+  assert.deepEqual(reads(),["/api/native-hitl/team/rules","/api/native-hitl/team/rule-history"]);
+});
+function controlRecordCase(review){
+  const data=hitlChat(),view=hitlRead(data),approval=view.readback.approval,rid="e".repeat(64);
+  data.composer.attention=[];data.composer.native_hitl.references=[];
+  data.composer.threads=[{thread_id:"attachment-thread",label:"查網站"}];
+  data.composer.native_hitl.commands=[{request_id:rid,kind:"decision",state:"CONFIRMED",thread_id:"attachment-thread",
+    command:{kind:"decision",request_id:rid,pending_id:approval.pending_id,pending_digest:approval.pending_digest,
+      choice:"allow_rule",rule:{text:"允許 B 開 https://example.com/a",behavior:"allow_automatically"},
+      expected_rules_revision:3,expected_rules_etag:"rules-v3"},
+    selection:approval,receipt:{result:{rule_id:"f".repeat(64)}},observation:null,code:null,
+    display:{tool:"browser_navigate",category:"mcp",target:"playwright",command:null,toolbox:false},
+    created_at:"2026-11-04T01:02:03Z"}];
+  view.rules=rulesRevision3();
+  view.readback.pending.command.review={rules_revision:3,matched_rule_ids:[],outcome:"ask",...review};
+  return {data,view,rid};
+}
+const recordText=(ui,rid)=>shownText(hitlNodes(ui,"data-hitl-record",rid)[0]);
+const whyText=(ui,rid)=>shownText(hitlNodes(ui,"data-hitl-why",rid)[0]);
+async function openWhy(ui,rid){
+  const details=hitlNodes(ui,"data-hitl-why",rid)[0];
+  details.open=true;details.events.toggle();await ui.tick();await ui.tick();
+}
+test("a control record shows its time, Agent, conversation, tool, choice, saved rule text and short rule ID",async()=>{
+  const {data,view,rid}=controlRecordCase({source:"default"});
+  const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async()=>({ok:true,json:async()=>copy(view)})});
+  await openRulesTab(ui);
+  const text=recordText(ui,rid);
+  assert.match(text,/09:02:03（台灣時間） · FA 助理 · 對話「查網站」/);
+  assert.ok(text.includes("助理要使用：browser_navigate（playwright）"),text);
+  assert.ok(text.includes("你（Team 主人）允許了，並新增規則「允許 B 開 https://example.com/a」"),text);
+  assert.ok(text.includes("規則 ID ffffffff · 已保存；不代表效果已完成。"),text);
+  assert.ok(shownText(ui.nodes.get("hitl-command-list")).includes("純讀，不是批准，也不代表效果已完成"));
+  assert.equal(whyText(ui,rid),"為什麼問你展開時讀取原卡片；純讀，不是批准。");
+});
+for(const source of ["default","uncertain"]){
+  test(`為什麼問你 (${source}, no rule matched) names the revision, its rules and this action`,async()=>{
+    const {data,view,rid}=controlRecordCase(source==="uncertain"?{source,reason:"review_uncertain"}:{source});
+    const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async()=>({ok:true,json:async()=>copy(view)})});
+    await openRulesTab(ui);
+    await openWhy(ui,rid);
+    assert.ok(ui.calls.some(call=>call.url===`/api/native-hitl/attachment-thread/pending/${"a".repeat(64)}`));
+    const text=whyText(ui,rid);
+    assert.ok(text.includes("當時審查用的是第 3 版規則，就是目前這一版。"),text);
+    assert.ok(text.includes("當時第 3 版的規則都沒有套用到這個動作。"),text);
+    assert.ok(text.includes("第 3 版規則：「執行 shell 前先問我」（先問我）"),text);
+    assert.ok(text.includes("這次的動作：run_command（shell，目標 <b>original workspace</b>）"),text);
+    assert.ok(text.includes("echo <script>do not execute this HTML</script>"),text);
+    assert.ok(text.includes(source==="uncertain"?"系統無法確定這個動作是否在你原本的要求範圍內":
+      "這個動作需要先取得你的同意"),text);
+  });
+}
+test("為什麼問你 falls back to this workbench's saved fields when the original card cannot be read",async()=>{
+  const {data,rid}=controlRecordCase({source:"default"});
+  const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async url=>url.endsWith("/rules")?
+    {ok:true,json:async()=>({rules:rulesRevision3(),commands:[],can_approve:true,read_at:when})}:
+    {ok:false,status:403,json:async()=>({error:{code:"NATIVE_HITL_SCOPE_DENIED",message:"原操作或規則未通過核對。"}})}});
+  await openRulesTab(ui);
+  await openWhy(ui,rid);
+  const text=whyText(ui,rid);
+  assert.equal(text,"為什麼問你讀不到原卡片：這不是目前助理／對話與 Team 的原操作；不會替別的範圍批准。"+
+    "以下只根據這台工作台保存的紀錄：助理要使用：browser_navigate（playwright）");
+  const reads=()=>ui.calls.filter(call=>call.url.includes("/pending/")).length;
+  assert.equal(reads(),1);
+  vm.runInContext("render()",ui.context);
+  const again=hitlNodes(ui,"data-hitl-why",rid)[0];
+  assert.equal(again.open,true);
+  again.events.toggle();await ui.tick();await ui.tick();
+  assert.equal(reads(),1,"a render re-applying open must not read the card again");
+  assert.ok(whyText(ui,rid).includes("讀不到原卡片"),"the error stays shown across a render");
+  again.open=false;again.events.toggle();await ui.tick();
+  await openWhy(ui,rid);
+  assert.equal(reads(),2,"collapsing and expanding again retries the read once");
+});
+const unmatchedOldRevision=["當時審查用的是第 2 版規則；目前是第 3 版。",
+  "當時第 2 版的規則都沒有套用到這個動作。","第 2 版的規則原文要等規則歷史可以讀取後才看得到；目前是第 3 版。"];
+for(const [name,review,expected] of [
+  ["an older revision",{source:"default",rules_revision:2},unmatchedOldRevision],
+  ["revision 0",{source:"default",rules_revision:0},["當時審查用的是第 0 版規則；目前是第 3 版。","第 0 版是還沒有任何規則的初始版本。"]],
+  ["an older revision with a matched rule",{source:"model",rules_revision:2,matched_rule_ids:["r".repeat(64)]},
+    ["當時審查用的是第 2 版規則；目前是第 3 版。","命中的規則：ID rrrrrrrr"]],
+]){
+  test(`為什麼問你 for ${name} never shows the current rule texts as that revision`,async()=>{
+    const {data,view,rid}=controlRecordCase(review);
+    const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async()=>({ok:true,json:async()=>copy(view)})});
+    await openRulesTab(ui);
+    await openWhy(ui,rid);
+    const text=whyText(ui,rid);
+    for(const line of expected)assert.ok(text.includes(line),text);
+    assert.equal(text.includes("執行 shell 前先問我"),false,text);
+  });
+}
+test("為什麼問你 compares with the rules list above after it is read again",async()=>{
+  const {data,view,rid}=controlRecordCase({source:"default"});
+  let current=rulesRevision3();
+  const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async url=>url.endsWith("/rules")?
+    {ok:true,json:async()=>({rules:copy(current),commands:[],can_approve:true,read_at:when})}:{ok:true,json:async()=>copy(view)}});
+  await openRulesTab(ui);
+  await openWhy(ui,rid);
+  assert.ok(whyText(ui,rid).includes("當時審查用的是第 3 版規則，就是目前這一版。"));
+  current={...rulesRevision3(),revision:4,etag:"rules-v4"};
+  ui.click("read-hitl-rules");await ui.tick();await ui.tick();
+  const text=whyText(ui,rid);
+  assert.ok(text.includes("當時審查用的是第 3 版規則；目前是第 4 版。"),text);
+  assert.ok(text.includes("第 3 版的規則原文要等規則歷史可以讀取後才看得到；目前是第 4 版。"),text);
+  assert.equal(text.includes("執行 shell 前先問我"),false,text);
+});
+test("為什麼問你 keeps the card's own newer revision when the rules list above is older",async()=>{
+  const {data,view,rid}=controlRecordCase({source:"default",rules_revision:4});
+  view.rules={...rulesRevision3(),revision:4,etag:"rules-v4"};
+  const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async url=>url.endsWith("/rules")?
+    {ok:true,json:async()=>({rules:rulesRevision3(),commands:[],can_approve:true,read_at:when})}:{ok:true,json:async()=>copy(view)}});
+  await openRulesTab(ui);
+  await openWhy(ui,rid);
+  const text=whyText(ui,rid);
+  assert.ok(text.includes("當時審查用的是第 4 版規則，就是目前這一版。"),text);
+  assert.ok(text.includes("第 4 版規則：「執行 shell 前先問我」（先問我）"),text);
+});
+const MODEL_LABEL="以下是自動審查模型對每條規則的說明，只供參考，不一定正確，也不影響這次是否要問你：";
+for(const [name,review,expected] of [
+  ["a matched rule of this revision",{source:"rules",matched_rule_ids:["r".repeat(64)],
+    rule_reasons:{["r".repeat(64)]:"這是 <b>shell</b> 指令"}},"「執行 shell 前先問我」（先問我）：適用。模型說明：這是 <b>shell</b> 指令"],
+  ["an older revision's unmatched rule",{source:"default",rules_revision:2,rule_reasons:{["q".repeat(64)]:"和寄信無關"}},
+    "ID qqqqqqqq：不適用。模型說明：和寄信無關"],
+  ["an uncertain review, which decided no rule",{source:"uncertain",rule_reasons:{["r".repeat(64)]:"看不出要做什麼"}},
+    "「執行 shell 前先問我」（先問我）：沒有判定。模型說明：看不出要做什麼"],
+]){
+  test(`為什麼問你 shows the model's reason for ${name}, labelled as the model's explanation`,async()=>{
+    const {data,view,rid}=controlRecordCase(review);
+    const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async()=>({ok:true,json:async()=>copy(view)})});
+    await openRulesTab(ui);
+    await openWhy(ui,rid);
+    const text=whyText(ui,rid);
+    assert.ok(text.includes(MODEL_LABEL+expected+"這次的動作："),text);
+    assert.equal(/命中的規則|版規則：「/.test(text),false,text);
+    if(review.source==="uncertain")assert.equal(text.includes("都沒有套用"),false,text);
+  });
+}
+test("為什麼問你 shows no model explanation when the review has none",async()=>{
+  const {data,view,rid}=controlRecordCase({source:"rules",matched_rule_ids:["r".repeat(64)]});
+  const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async()=>({ok:true,json:async()=>copy(view)})});
+  await openRulesTab(ui);
+  await openWhy(ui,rid);
+  const text=whyText(ui,rid);
+  assert.ok(text.includes("命中的規則：「執行 shell 前先問我」（先問我）這次的動作："),text);
+  assert.equal(text.includes("自動審查模型"),false,text);
+});
+test("without a native conversation a thread-route record says to pick it and its reconcile button is off",async()=>{
+  const {data,view,rid}=controlRecordCase({source:"default"});
+  delete data.composer.state_profile;
+  const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async()=>({ok:true,json:async()=>copy(view)})});
+  await openRulesTab(ui);
+  await openWhy(ui,rid);
+  assert.equal(whyText(ui,rid),"為什麼問你要看原卡片，請先在左側選好原對話。");
+  assert.deepEqual(ui.calls.filter(call=>call.url.startsWith("/api/native-hitl/")).map(call=>call.url),
+    ["/api/native-hitl/team/rules","/api/native-hitl/team/rule-history"]);
+  const button=hitlNodes(ui,"data-hitl-reconcile",rid)[0];
+  assert.equal(shownText(button),"只核對原控制請求");
+  assert.equal(button.disabled,true);
+});
+test("a decision sent from the Team list reads its original card on the team route",async()=>{
+  const {data,view,rid}=controlRecordCase({source:"default"});
+  data.composer.native_hitl.commands[0].thread_id=null;
+  const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async()=>({ok:true,json:async()=>copy(view)})});
+  await openRulesTab(ui);
+  assert.ok(recordText(ui,rid).includes("FA 助理 · Team 待處理清單"),recordText(ui,rid));
+  await openWhy(ui,rid);
+  assert.ok(ui.calls.some(call=>call.url===`/api/native-hitl/team/pending/${"a".repeat(64)}`));
+  assert.ok(whyText(ui,rid).includes("當時審查用的是第 3 版規則，就是目前這一版。"));
+});
+test("an UNKNOWN control request is written as sent with an unconfirmed result, not as a decision made",async()=>{
+  const {data,view,rid}=controlRecordCase({source:"default"});
+  Object.assign(data.composer.native_hitl.commands[0],{state:"UNKNOWN",receipt:null,
+    command:{...data.composer.native_hitl.commands[0].command,choice:"allow_once",rule:null}});
+  const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async()=>({ok:true,json:async()=>copy(view)})});
+  await openRulesTab(ui);
+  const text=recordText(ui,rid);
+  assert.ok(text.includes("你（Team 主人）的請求結果未確認：允許這次"),text);
+  assert.equal(text.includes("你（Team 主人）允許了這次"),false,text);
+});
+
+const ruleR={rule_id:"r".repeat(64),text:"執行 shell 前先問我",behavior:"ask_first"};
+const ruleF={rule_id:"f".repeat(64),text:"允許 B 開 https://example.com/a",behavior:"allow_automatically"};
+function revision(revision,changed_at,change,rule_id,rule,previous_rule,source=false){
+  return {schema_version:"fa-native-hitl-rule-revision-v1",revision,intent_id:String(revision).repeat(64),changed_at,
+    changed_by_oid:"owner-oid",change,rule_id,rule,previous_rule,
+    source_pending_id:source?"a".repeat(64):null,
+    source_call:source?{agent_id:"configured-agent",conversation_id:"original-cid",request_id:"original-rid",
+      sdk_session_id:"original-sdk",tool_call_id:"original-call"}:null,
+    purpose:"readback-only-not-execution-permission"};
+}
+const strip=({rule_id,...rule})=>rule;
+const fourRevisions=[
+  revision(4,"2026-11-04T02:02:03Z","allow_rule",ruleF.rule_id,strip(ruleF),null,true),
+  revision(3,"2026-11-04T01:45:00Z","delete","d".repeat(64),null,{text:"刪掉的規則",behavior:"ask_first"}),
+  revision(2,"2026-11-04T01:30:00Z","update",ruleR.rule_id,strip(ruleR),{text:"shell 先問我",behavior:"ask_first"}),
+  revision(1,"2026-11-04T01:00:00Z","add",ruleR.rule_id,{text:"shell 先問我",behavior:"ask_first"},null),
+];
+function historyCase(pages){
+  const {data}=controlRecordCase({source:"default"});
+  const rules={...rulesRevision3(),revision:4,etag:"rules-v4",rules:[ruleR,ruleF]},seen=[];
+  const hitl=async url=>{
+    seen.push(url);
+    if(url.endsWith("/rules"))return {ok:true,json:async()=>({rules:copy(rules),commands:[],can_approve:true,read_at:when})};
+    const page=pages[url];
+    return page?{ok:true,json:async()=>copy(page)}:
+      {ok:false,status:409,json:async()=>({error:{code:"NATIVE_HITL_RECORD_INVALID",message:"原操作或規則未通過核對。"}})};
+  };
+  return {data,hitl,seen};
+}
+const originText=(ui,rule)=>shownText(hitlNodes(ui,"data-hitl-rule-origin",rule.rule_id)[0]);
+test("為什麼問你 quotes an older revision's rule text from the read rule history, not today's text",async()=>{
+  const {data,view,rid}=controlRecordCase({source:"default",rules_revision:1,rule_reasons:{[ruleR.rule_id]:"不是 shell"}});
+  const rules={...rulesRevision3(),revision:4,etag:"rules-v4",rules:[ruleR,ruleF]};
+  const hitl=async url=>url.endsWith("/rules")?{ok:true,json:async()=>({rules:copy(rules),commands:[],can_approve:true,read_at:when})}:
+    url.endsWith("/rule-history")?{ok:true,json:async()=>ruleHistoryPage(fourRevisions)}:{ok:true,json:async()=>copy(view)};
+  const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl});
+  await openRulesTab(ui);
+  await openWhy(ui,rid);
+  assert.ok(whyText(ui,rid).includes("「shell 先問我」（先問我）：不適用。模型說明：不是 shell"),whyText(ui,rid));
+});
+async function whyWithHistory(review,historyPage){
+  const {data,view,rid}=controlRecordCase({source:"default",...review});
+  const rules={...rulesRevision3(),revision:4,etag:"rules-v4",rules:[ruleR,ruleF]};
+  const hitl=async url=>url.endsWith("/rules")?{ok:true,json:async()=>({rules:copy(rules),commands:[],can_approve:true,read_at:when})}:
+    url.endsWith("/rule-history")?(historyPage?{ok:true,json:async()=>historyPage}:
+      {ok:false,status:409,json:async()=>({error:{code:"NATIVE_HITL_RECORD_INVALID",message:"原操作或規則未通過核對。"}})}):
+    {ok:true,json:async()=>copy(view)};
+  const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl});
+  await openRulesTab(ui);
+  await openWhy(ui,rid);
+  return whyText(ui,rid);
+}
+test("為什麼問你 shows only the rule ID when the rule history could not be read",async()=>{
+  const text=await whyWithHistory({rules_revision:1,rule_reasons:{[ruleR.rule_id]:"不是 shell"}},null);
+  assert.ok(text.includes("ID rrrrrrrr：不適用。模型說明：不是 shell"),text);
+});
+test("為什麼問你 shows only the rule ID when the read history stops before the card's revision",async()=>{
+  const text=await whyWithHistory({rules_revision:3,rule_reasons:{[ruleR.rule_id]:"不是 shell"}},
+    ruleHistoryPage(fourRevisions.slice(2)));
+  assert.ok(text.includes("ID rrrrrrrr：不適用。模型說明：不是 shell"),text);
+});
+test("為什麼問你 names a matched older-revision rule by its text from the rule history",async()=>{
+  const text=await whyWithHistory({rules_revision:1,matched_rule_ids:[ruleR.rule_id]},ruleHistoryPage(fourRevisions));
+  assert.ok(text.includes("命中的規則：「shell 先問我」（先問我）"),text);
+});
+const revisionTexts=ui=>ui.nodes.get("hitl-rule-history").children.map(shownText);
+test("rule rows show when each rule was created and changed and the card it came from; history lists newest first",async()=>{
+  const {data,hitl,seen}=historyCase({"/api/native-hitl/team/rule-history":ruleHistoryPage(fourRevisions)});
+  const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
+  await openRulesTab(ui);
+  assert.deepEqual(seen,["/api/native-hitl/team/rules","/api/native-hitl/team/rule-history"]);
+  assert.match(originText(ui,ruleR),/^建立於 .*09:00:00（台灣時間） · 最後修改於 .*09:30:00（台灣時間） · 你（Team 主人）在這裡新增$/);
+  assert.match(originText(ui,ruleF),/^建立於 .*10:02:03（台灣時間） · 建立後沒有修改 · 由FA 助理的批准卡建立（卡片 aaaaaaaa）：助理要使用：browser_navigate（playwright）$/);
+  const rows=revisionTexts(ui);
+  assert.equal(rows.length,4);
+  assert.match(rows[0],/^第 4 版 · .*10:02:03（台灣時間） · 你（Team 主人） · 從批准卡建立 · 「允許 B 開 https:\/\/example.com\/a」（自動允許） · 由FA 助理的批准卡建立（卡片 aaaaaaaa）：助理要使用：browser_navigate（playwright）$/);
+  assert.match(rows[1],/^第 3 版 · .*09:45:00（台灣時間） · 你（Team 主人） · 刪除 · 「刪掉的規則」（先問我）$/);
+  assert.match(rows[2],/^第 2 版 · .*09:30:00（台灣時間） · 你（Team 主人） · 修改 · 「shell 先問我」（先問我） → 「執行 shell 前先問我」（先問我）$/);
+  assert.match(rows[3],/^第 1 版 · .*09:00:00（台灣時間） · 你（Team 主人） · 新增 · 「shell 先問我」（先問我）$/);
+  assert.equal(ui.text("hitl-rule-history-note"),"目前是第 4 版；已讀到第 1 到第 4 版的變更。純讀，不是批准。");
+  assert.ok(html.includes("<summary>規則歷史（新到舊；純讀，不是批准）</summary>"));
+  assert.equal(ui.nodes.get("read-hitl-rule-history-more").hidden,true);
+});
+test("an older rule's creation waits for the next history page, read only on a click",async()=>{
+  const {data,hitl,seen}=historyCase({
+    "/api/native-hitl/team/rule-history":ruleHistoryPage(fourRevisions.slice(0,2),{next_before:3}),
+    "/api/native-hitl/team/rule-history?before=3":ruleHistoryPage(fourRevisions.slice(2),{head:4})});
+  const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
+  await openRulesTab(ui);
+  assert.equal(originText(ui,ruleR),"建立時間在更早的歷史裡，尚未讀到");
+  assert.equal(ui.text("hitl-rule-history-note"),"目前是第 4 版；已讀到第 3 到第 4 版的變更。純讀，不是批准。");
+  const more=ui.nodes.get("read-hitl-rule-history-more");
+  assert.equal(more.hidden,false);assert.equal(more.disabled,false);
+  assert.equal(seen.filter(url=>url.includes("rule-history")).length,1);
+  ui.click("read-hitl-rule-history-more");await ui.tick();await ui.tick();
+  assert.equal(seen.at(-1),"/api/native-hitl/team/rule-history?before=3");
+  assert.match(originText(ui,ruleR),/^建立於 .*09:00:00（台灣時間） · 最後修改於 .*09:30:00（台灣時間）/);
+  assert.equal(revisionTexts(ui).length,4);
+  assert.equal(more.hidden,true);
+});
+test("reading the rules again while an older history page is in flight drops that page and reads the newest one",async()=>{
+  const {data,hitl:base,seen}=historyCase({
+    "/api/native-hitl/team/rule-history":ruleHistoryPage(fourRevisions.slice(0,2),{next_before:3})});
+  let held=null;
+  const hitl=url=>url.endsWith("?before=3")?(seen.push(url),new Promise(resolve=>{held=resolve})):base(url);
+  const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
+  await openRulesTab(ui);
+  ui.click("read-hitl-rule-history-more");await ui.tick();
+  assert.ok(held,"the older page is in flight");
+  ui.click("read-hitl-rules");await ui.tick();await ui.tick();await ui.tick();
+  held({ok:true,json:async()=>ruleHistoryPage(fourRevisions.slice(2),{head:4})});await ui.tick();await ui.tick();
+  assert.deepEqual(seen.filter(url=>url.includes("rule-history")),["/api/native-hitl/team/rule-history",
+    "/api/native-hitl/team/rule-history?before=3","/api/native-hitl/team/rule-history"]);
+  assert.deepEqual(ui.nodes.get("hitl-rule-history").children.map(node=>node.attributes["data-hitl-revision"]),["4","3"]);
+  assert.equal(originText(ui,ruleR),"建立時間在更早的歷史裡，尚未讀到");
+});
+test("an unreadable rule history keeps the rules and says the times are not read, never that none exist",async()=>{
+  const {data,hitl}=historyCase({});
+  const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
+  await openRulesTab(ui);
+  assert.equal(ui.text("hitl-rules-note"),"已讀規則版本 4；不是操作批准。");
+  assert.equal(originText(ui,ruleR),"建立時間尚未讀到");
+  assert.match(ui.text("hitl-rule-history-note"),/^規則歷史讀不到：/);
+  assert.equal(revisionTexts(ui).length,0);
+});
+test("a rule history entry whose texts do not fit its change is refused, not shown",async()=>{
+  const broken=copy(fourRevisions);broken[1].rule={text:"刪除卻還有新原文",behavior:"ask_first"};
+  const {data,hitl}=historyCase({"/api/native-hitl/team/rule-history":ruleHistoryPage(broken)});
+  const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
+  await openRulesTab(ui);
+  assert.match(ui.text("hitl-rule-history-note"),/^規則歷史讀不到：/);
+  assert.equal(revisionTexts(ui).length,0);
+});
+
+function allowedEntry(id,authorized_at,by,{tool="browser_navigate",target="playwright",matched=[],shell=null}={}){
+  return {authorization_id:id.repeat(64),intent_id:"9".repeat(64),authorized_at,by,
+    action:{call:{agent_id:"configured-agent",conversation_id:"original-cid",request_id:"original-rid",
+      sdk_session_id:"original-sdk",tool_call_id:"call-"+id},category:shell===null?"mcp":"shell",tool:shell===null?tool:"shell",
+      target,arguments:shell===null?{url:"https://example.com/a"}:{command:shell}},
+    review:{rules_revision:4,matched_rule_ids:matched,source:by==="rule"?"rules":by==="toolbox"?"toolbox":"default",
+      outcome:by==="human_once"?"ask":"allow"},
+    approval:by==="human_once"?{pending_id:"a".repeat(64),pending_digest:"b".repeat(64),call:{}}:null};
+}
+function allowedPage(entries,next_cursor=null){
+  return {schema_version:"fa-native-hitl-allowed-v1",team_id:"team-one",since:"2026-11-03T03:00:00Z",entries,next_cursor,
+    observed_at:"2026-11-04T03:00:00Z",purpose:"readback-only-not-execution-permission"};
+}
+const allowedThree=[
+  allowedEntry("1","2026-11-04T02:10:00Z","rule",{matched:[ruleF.rule_id]}),
+  allowedEntry("2","2026-11-04T02:30:00Z","human_once",{shell:"echo 只這次",matched:[ruleR.rule_id]}),
+  allowedEntry("3","2026-11-04T01:00:00Z","toolbox",{tool:"search",target:"webiq"}),
+];
+const allowedTexts=ui=>ui.nodes.get("hitl-allowed-list").children.map(shownText);
+async function readAllowed(ui){ui.click("read-hitl-allowed");for(let i=0;i<30;i++)await ui.tick()}
+test("the allowed log is read on a click, follows empty pages with a cursor and lists newest first",async()=>{
+  const {data,hitl,seen}=historyCase({"/api/native-hitl/team/rule-history":ruleHistoryPage(fourRevisions),
+    "/api/native-hitl/team/allowed":allowedPage([],"c1"),
+    "/api/native-hitl/team/allowed?cursor=c1":allowedPage(allowedThree)});
+  const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
+  await openRulesTab(ui);
+  assert.equal(seen.some(url=>url.includes("/allowed")),false,"opening the tab does not scan");
+  assert.equal(ui.text("hitl-allowed-note"),"還沒讀取。按上面的按鈕會掃描這個 Team 最近 24 小時寫入的資料列，可能要一點時間。");
+  await readAllowed(ui);
+  assert.deepEqual(seen.filter(url=>url.includes("/allowed")),["/api/native-hitl/team/allowed","/api/native-hitl/team/allowed?cursor=c1"]);
+  const rows=allowedTexts(ui);
+  assert.equal(rows.length,3);
+  assert.match(rows[0],/^.*10:30:00（台灣時間） · FA 助理 · 執行：echo 只這次 · 你（Team 主人）在批准卡上允許了這次$/);
+  assert.match(rows[1],/^.*10:10:00（台灣時間） · FA 助理 · browser_navigate（playwright） · 依規則「允許 B 開 https:\/\/example.com\/a」自動允許（第 4 版規則）$/);
+  assert.match(rows[2],/^.*09:00:00（台灣時間） · FA 助理 · search（webiq） · Toolbox 設定為不用批准$/);
+  assert.match(ui.text("hitl-allowed-note"),/^自 .*11:00:00（台灣時間） 起共 3 筆。純讀，不是批准，也不代表效果已完成。$/);
+  assert.ok(html.includes("<summary>放行紀錄（實際執行的受管呼叫；純讀，不是批准）</summary>"));
+});
+test("an unfinished scan never says there are no allowed calls",async()=>{
+  const pages={"/api/native-hitl/team/rule-history":ruleHistoryPage(fourRevisions),
+    "/api/native-hitl/team/allowed":allowedPage([],"c0")};
+  for(let i=0;i<12;i++)pages[`/api/native-hitl/team/allowed?cursor=c${i}`]=allowedPage([],`c${i+1}`);
+  const {data,hitl,seen}=historyCase(pages);
+  const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
+  await openRulesTab(ui);
+  await readAllowed(ui);
+  assert.equal(seen.filter(url=>url.includes("/allowed")).length,10);
+  assert.match(ui.text("hitl-allowed-note"),/已讀到 0 筆，還沒讀完；按「繼續讀取」。不能當成只有這些。$/);
+  assert.equal(ui.text("hitl-allowed-note").includes("沒有放行紀錄"),false);
+  assert.equal(ui.nodes.get("read-hitl-allowed-more").hidden,false);
+  ui.click("read-hitl-allowed-more");for(let i=0;i<30;i++)await ui.tick();
+  assert.equal(seen.filter(url=>url.includes("/allowed"))[10],"/api/native-hitl/team/allowed?cursor=c9","繼續讀取 resumes at the saved cursor");
+});
+test("the allowed log filters by rule and says when that rule allowed nothing in the read range",async()=>{
+  const {data,hitl}=historyCase({"/api/native-hitl/team/rule-history":ruleHistoryPage(fourRevisions),
+    "/api/native-hitl/team/allowed":allowedPage(allowedThree)});
+  const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
+  await openRulesTab(ui);
+  await readAllowed(ui);
+  const select=ui.nodes.get("hitl-allowed-rule");
+  assert.deepEqual(select.children.map(option=>option.textContent),["全部","「執行 shell 前先問我」","「允許 B 開 https://example.com/a」"]);
+  select.value=ruleF.rule_id;select.events.change();await ui.tick();
+  assert.equal(allowedTexts(ui).length,1);
+  assert.ok(allowedTexts(ui)[0].includes("依規則「允許 B 開 https://example.com/a」自動允許"));
+  select.value=ruleR.rule_id;select.events.change();await ui.tick();
+  assert.equal(allowedTexts(ui).length,0);
+  assert.match(ui.text("hitl-allowed-note"),/，這條規則在讀到的範圍內沒有放行紀錄。$/);
 });
 
 test("another Agent's ⚙ selects that Agent first and opens its settings; remote re-sign-in stays in the account menu",async()=>{

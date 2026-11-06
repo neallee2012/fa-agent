@@ -563,6 +563,49 @@ def test_sources_copy_a_build_version_with_only_the_original_formal_flag(monkeyp
     assert _code(no_image) == (400, "IMAGE_REQUIRED")
 
 
+def test_sync_declares_the_release_its_image_runs_and_a_copy_keeps_its_sources():
+    """ADR-0009 §3 (c) Guard A/B: the pair is written where the image is, never carried onto another image."""
+    from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
+
+    foundry = Foundry(A, R)
+    older = {**V3_TURNS, "FA_SDK_RELEASE": "1.0.13/1.0.83"}
+    foundry.add(A.agent_name, 1, "old", definition={
+        "kind": "hosted", "container_configuration": {"image": "a:old"}, "environment_variables": older})
+    pin = f"{SDK_VERSION}/{RUNTIME_VERSION}"
+    definition, _ = versions.image_source(foundry, A, "a:new")()
+    assert definition["environment_variables"]["FA_SDK_RELEASE"] == pin
+    desired, _ = versions.desired_source(versions.image_source(foundry, A, "a:new"), {"TZ": "Asia/Taipei"})()
+    assert desired["environment_variables"]["FA_SDK_RELEASE"] == pin
+    with pytest.raises(Problem) as overlay:
+        versions.desired_source(versions.image_source(foundry, A, "a:new"), {"FA_SDK_RELEASE": pin})
+    assert _code(overlay) == (409, "HOSTED_ENVIRONMENT_INVALID")
+    foundry.add(A.agent_name, 2, "new", definition={
+        "kind": "hosted", "container_configuration": {"image": "a:src"}, "environment_variables": older})
+    copied, _ = versions.copy_source(foundry, A, "new")()
+    assert copied["container_configuration"]["image"] == "a:src"
+    assert copied["environment_variables"]["FA_SDK_RELEASE"] == "1.0.13/1.0.83"
+
+
+def test_the_resolver_never_follows_or_keeps_a_release_this_api_cannot_read():
+    """Guard B: until this API knows a pair it cannot decode that image's receipts, so the version is "not ready"
+    (503, written nowhere) rather than incompatible; the next read, by a newer API, decides again."""
+    foundry = Foundry(A, R)
+    foundry.add(R.agent_name, 5, "new", definition={
+        "kind": "hosted", "image": "r:5", "environment_variables": {**V3_TURNS, "FA_SDK_RELEASE": "1.0.99/1.0.199"}})
+    resolver = HostedVersions(lambda endpoint: foundry, build="new")
+    with pytest.raises(Problem) as selected:
+        resolver.current(R)
+    assert _code(selected) == (503, FOLLOWING)
+    for _ in range(2):
+        reads = len(foundry.calls)
+        with pytest.raises(Problem) as profile:
+            resolver.profile(R, "5")
+        assert _code(profile) == (503, FOLLOWING) and len(foundry.calls) == reads + 1  # never kept
+    foundry.add(R.agent_name, 6, "new")  # a v3 version published before the declaration existed
+    assert resolver.current(R) == "6"
+    assert resolver.release(R, "6") == ("1.0.26", "1.0.103")
+
+
 def test_configured_agents_declare_ws_and_responses_once_and_copies_inherit_them():
     foundry = Foundry(A, R)
     invocations = {"protocol": "invocations", "version": "2.0.0"}

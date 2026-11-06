@@ -280,3 +280,36 @@ def test_the_runtime_declares_the_environment_profile_and_refuses_any_other(loca
         native_sdk.native_runtime_from_environment(hosted)
     assert refused.value.body["error"]["code"] == "NATIVE_TURNS_DISABLED"
     assert "must be explicitly enabled" in refused.value.body["error"]["message"]
+
+
+@pytest.mark.parametrize("declared", [None, "pin", "1.0.13/1.0.83", "1.0.26", "undeclared-newer"])
+def test_the_runtime_refuses_a_version_that_declares_another_sdk_release(local_env, monkeypatch, tmp_path, declared):
+    """ADR-0009 §3 (c): the API trusts the pair a version's definition declares (FA_SDK_RELEASE) for Guard A/B, so an
+    image under a definition naming another pair never starts; an undeclared one (published before it) still does."""
+    from shared_context.behavior_assistant_hosted import AssistantSupervisor
+    from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
+
+    runtime_path = tmp_path / "OFFLINE-not-executed"
+    runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
+    hosted = SimpleNamespace(
+        identity=IDENTITY, supervisor=AssistantSupervisor(tmp_path / ".fa-assistant-v12", runtime_path=runtime_path),
+        api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"))
+    monkeypatch.setattr("azure.identity.aio.ManagedIdentityCredential", lambda client_id=None: None)
+    for key, value in {"FA_NATIVE_TURNS": NATIVE_V3_PROFILE, "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
+                       "AGENTSERVER_TASKS_BACKEND": "hosted", "BEHAVIOR_ASSISTANT_RUNTIME_PATH": str(runtime_path),
+                       "FOUNDRY_PROJECT_ENDPOINT": "https://offline-fixture.services.ai.azure.com/api/projects/offline"
+                       }.items():
+        monkeypatch.setenv(key, value)
+    if declared in {None, "undeclared-newer"}:
+        monkeypatch.delenv("FA_SDK_RELEASE", raising=False)
+        if declared:  # a newer image under a definition that declares nothing: the API takes it for 1.0.26/1.0.103
+            monkeypatch.setattr(native_sdk, "PINNED_RELEASE_TEXT", "1.0.28/1.0.105")
+    else:
+        monkeypatch.setenv("FA_SDK_RELEASE", f"{SDK_VERSION}/{RUNTIME_VERSION}" if declared == "pin" else declared)
+    if declared in {None, "pin"}:
+        assert native_sdk.native_runtime_from_environment(hosted).state_profile == NATIVE_V3_PROFILE
+        return
+    with pytest.raises(Problem) as refused:
+        native_sdk.native_runtime_from_environment(hosted)
+    assert refused.value.body["error"]["code"] == "NATIVE_TURNS_DISABLED"
+    assert "another SDK/runtime release" in refused.value.body["error"]["message"]

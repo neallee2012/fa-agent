@@ -153,14 +153,14 @@ def test_native_sdk_reads_the_exact_approved_manifest_resource(integrated):
 
 
 def test_resource_capability_stays_off_and_requires_the_original_skill_reader(native_api, signing_key, monkeypatch):
-    from shared_context.behavior_capabilities import load_runtime_grants
+    from shared_context.behavior_capabilities import load_runtime_capabilities
     from test_conversation_profile_selection import template
 
     monkeypatch.delenv("FA_TOOL_CATALOG_DIR", raising=False)
     monkeypatch.delenv("FA_CAPABILITY_TOOLBOX_ENTRIES", raising=False)
     monkeypatch.setenv("FA_CAPABILITY_BUILTINS", "fa-skills-v1")
-    assert tuple(load_runtime_grants()) == ("fa-skills-v1",)
-    assert load_runtime_grants()["fa-skills-v1"].entry_sha256 == (
+    assert tuple(load_runtime_capabilities()[0]) == ("fa-skills-v1",)
+    assert load_runtime_capabilities()[0]["fa-skills-v1"].entry_sha256 == (
         "a82ccd4890a37a413b7443488d929cbe643d738360e6b24002a21e6eed66db59")
     case = native_api
     grants = available_grants(None, ("fa-skills-v1", RESOURCES))

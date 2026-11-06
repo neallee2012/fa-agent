@@ -43,7 +43,8 @@ ENV BEHAVIOR_ASSISTANT_RUNTIME_PATH=/opt/copilot/1.0.103/prebuilds/linux-x64/cop
 USER 10001
 # fa-shell-v1 commands run as this UID: every code and tool path must stay read-only for it.
 RUN python -c "import os,sys; bad=[p for r in ('/app','/usr/local','/opt/copilot','/opt/fa-tools') for d,_,fs in os.walk(r) for p in (d,*(os.path.join(d,f) for f in fs)) if os.access(p,os.W_OK)]; sys.exit('writable by UID10001: '+' '.join(bad[:5]) if bad else 0)" \
-    && python -c "import behavior_assistant_main" && python runtime_probe.py \
+    && python -c "import behavior_assistant_main, pypdfium2" && python runtime_probe.py \
+    && python -c "import hashlib, io, sys; from pypdf import PdfWriter; from shared_context.behavior_user_uploads import UserUpload; from shared_context.native_user_uploads import pdf_pages, read_page; w=PdfWriter(); w.add_blank_page(72, 72); b=io.BytesIO(); w.write(b); d=b.getvalue(); n=pdf_pages(d); u=UserUpload(name='a.pdf', sha256=hashlib.sha256(d).hexdigest(), byte_length=len(d), media_type='application/pdf'); sys.exit(0 if n.count == 1 and read_page(u, n, 0)[1] else 'pdfium renders no page under PAGE_ADDRESS_SPACE')" \
     && python -c "from shared_context.behavior_desktop import prerequisites; prerequisites()" \
     && command -v x11vnc > /dev/null \
     && git --version > /dev/null \

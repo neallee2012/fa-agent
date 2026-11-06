@@ -255,11 +255,6 @@ def load_runtime_capabilities():
     return MappingProxyType(available_grants(catalog, builtins)), catalog
 
 
-def load_runtime_grants():
-    """API startup: the organization catalog directory and enabled FA builtins; unset means none."""
-    return load_runtime_capabilities()[0]
-
-
 def runtime_grants(runtime) -> dict[str, CapabilityGrant]:
     result = dict(getattr(runtime, "capability_grants", None) or {})
     from .team_mcp_wire import team_mcp_settings

@@ -288,7 +288,7 @@ button.deny:hover:not(:disabled){background:color-mix(in srgb,var(--cp-danger) 1
 .attachment-tools .icon-button{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:4px}
 .attachment-tools .icon-button[aria-expanded="true"]{background:var(--cp-accent-soft);color:var(--cp-accent)}
 .attachment-panel:not([open]),.attachment-panel>summary{display:none}
-#attachment-picker,#user-file-picker,#user-image-picker{margin:8px 0;max-height:min(32vh,30dvh);overflow:auto;overflow-wrap:anywhere}
+#attachment-panel{margin:8px 0;max-height:min(32vh,30dvh);overflow:auto;overflow-wrap:anywhere}
 #attachment-options label{display:flex;align-items:flex-start;gap:8px;margin:8px 0;font-size:12px}
 #attachment-selected input,#user-file-selected input{max-width:100%;padding:4px 8px;border:1px solid var(--cp-border);border-radius:.625rem;background:var(--cp-surface);color:var(--cp-text)}
 #attachment-selected p,#user-file-selected p{font-size:12px;color:var(--cp-text-muted);margin:4px 0 8px}
@@ -478,8 +478,16 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <div id="settings-rules" role="tabpanel" hidden>
 <p id="settings-rules-note" class="reason"></p>
 <details id="hitl-rules-panel" hidden><summary>Team 真人批准規則（所有助理共用，最多 20 條）</summary>
-<button id="read-hitl-rules">讀取最新規則與原控制紀錄</button>
+<button id="read-hitl-rules">重新讀取</button>
 <p id="hitl-rules-note" class="reason" role="status"></p><div id="hitl-rule-list"></div>
+<details id="hitl-rule-history-panel" hidden><summary>規則歷史（新到舊；純讀，不是批准）</summary>
+<p id="hitl-rule-history-note" class="reason" role="status"></p><div id="hitl-rule-history"></div>
+<button id="read-hitl-rule-history-more" hidden>讀取更早的歷史</button></details>
+<details id="hitl-allowed-panel" hidden><summary>放行紀錄（實際執行的受管呼叫；純讀，不是批准）</summary>
+<small>依規則自動允許只算之後的呼叫；你在卡片上選「允許並新增規則」的那一次記成「你允許了這次」。自動拒絕不在這裡。</small>
+<div class="settings-tools"><button id="read-hitl-allowed">讀取最近 24 小時的放行紀錄</button><button id="read-hitl-allowed-more" hidden>繼續讀取</button></div>
+<label for="hitl-allowed-rule">只看這條規則放行的</label><select id="hitl-allowed-rule"></select>
+<p id="hitl-allowed-note" class="reason" role="status"></p><div id="hitl-allowed-list"></div></details>
 <button id="new-hitl-rule">新增一條規則</button>
 <label for="hitl-rule-text">規則的自然語言描述與範圍（最多 512 字）</label>
 <textarea id="hitl-rule-text" rows="3"></textarea>
@@ -555,42 +563,32 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <div class="composer-surface">
 <label for="instruction" class="sr-only">訊息</label>
 <textarea id="instruction" rows="1" placeholder="傳送訊息…" aria-describedby="instruction-reason input-capacity" disabled></textarea>
-<details id="attachment-picker" class="attachment-panel" aria-label="文字來源附件" hidden><summary>文字來源附件（最多 4 份）</summary>
+<details id="attachment-panel" class="attachment-panel" aria-label="附加檔案" hidden><summary>附加檔案</summary>
+<label for="attachment-files">可以附文字檔、PDF、Word、Excel、PowerPoint 或圖片，每份最多 10 MB。</label>
+<input id="attachment-files" type="file" accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx,.pptx,.png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" aria-describedby="user-file-note" multiple disabled>
+<p id="user-file-note" class="reason" role="status"></p>
+<button id="read-user-file-capability" type="button" hidden>重試</button>
+<div id="user-file-selected"></div>
+<p id="user-file-limit" class="reason" role="status"></p>
+<button id="clear-user-files" hidden disabled>清除這次選的檔案</button>
+<div id="user-image-selected"></div>
+<p id="user-image-note" class="reason" role="status"></p>
+<button id="clear-user-images" hidden disabled>清除這次選的圖片</button>
+<details id="attachment-details"><summary>詳細</summary><small>只有你選的檔案會在本機讀取。8192 bytes 以內的文字檔按「送出」才傳；更大的文字檔、PDF、Office 檔和圖片會在選好後立刻上傳給這位助理，送出時只帶名稱與雜湊。文字照原樣保留（含 BOM／CRLF），不解析或執行內容。圖片會在本機轉成 PNG（邊長最多 2000 px、每張最多 512 KiB）。檔案和來源附件合計最多 4 份，圖片另計最多 4 張。還沒送出的選擇只存在這個頁面。</small></details>
+<details id="attachment-picker" aria-label="文字來源附件" hidden><summary>從這段對話的來源附加</summary>
 <button id="read-attachment-sources" disabled>讀取本對話的來源候選</button>
 <p id="attachment-note" class="reason" role="status"></p>
 <div id="attachment-options"></div>
 <div id="attachment-selected"></div>
 <p id="attachment-selection-note" class="reason" role="status"></p>
 </details>
-<details id="user-file-picker" class="attachment-panel" aria-label="選取文字檔、PDF 或 Office 檔" hidden><summary>選取文字檔、PDF 或 Office 檔</summary>
-<button id="read-user-file-capability" disabled>讀取本對話的文字檔設定</button>
-<p id="user-file-note" class="reason" role="status"></p>
-<label for="user-text-files">選取 txt／md／csv／json／pdf／docx／xlsx／pptx（每份最多 10 MB，與來源附件合計最多 4 份）；超過 8192 bytes 的文字檔和所有 PDF、Office 檔會在選取後立刻上傳給這位助理</label>
-<input id="user-text-files" type="file" accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx,.pptx" multiple disabled>
-<button id="clear-user-files" disabled>清除此回合文字檔選擇</button>
-<div id="user-file-selected"></div>
-<p id="user-file-limit" class="reason" role="status"></p>
-<small>只有你選取的檔案才在本機讀取；按「送出」前不傳本文。保留 BOM／CRLF 原字，不解析或執行內容。未送草稿只在本頁記憶體。</small>
-</details>
-<details id="user-image-picker" class="attachment-panel" aria-label="附加圖片" hidden><summary>附加圖片（png／jpg／webp，最多 4 張）</summary>
-<label for="user-images">選取圖片（原圖每張最多 10 MB）；會在本機轉成 PNG（邊長最多 2000 px、每張最多 512 KiB）再上傳給這位助理</label>
-<input id="user-images" type="file" accept="image/png,image/jpeg,image/webp" multiple disabled>
-<button id="clear-user-images" disabled>清除此回合圖片</button>
-<div id="user-image-selected"></div>
-<p id="user-image-note" class="reason" role="status"></p>
 </details>
 <div class="composer-actions">
 <label for="model" class="sr-only">模型</label>
 <select id="model" aria-label="模型" disabled><option>載入模型…</option></select>
 <div class="attachment-tools" role="group" aria-label="附件工具">
-<button id="attachment-picker-toggle" type="button" class="icon-button" aria-label="文字來源附件" title="文字來源附件" aria-controls="attachment-picker" aria-expanded="false" hidden disabled>
+<button id="attachment-panel-toggle" type="button" class="icon-button" aria-label="附加檔案" title="附加檔案" aria-controls="attachment-panel" aria-expanded="false" hidden disabled>
 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21 11-8.5 8.5a6 6 0 0 1-8.5-8.5l9-9a4 4 0 0 1 5.7 5.7l-9 9a2 2 0 0 1-2.8-2.8l8.5-8.5"/></svg>
-</button>
-<button id="user-file-picker-toggle" type="button" class="icon-button" aria-label="選取文字檔" title="選取文字檔" aria-controls="user-file-picker" aria-expanded="false" hidden disabled>
-<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M8 13h8M8 17h6"/></svg>
-</button>
-<button id="user-image-picker-toggle" type="button" class="icon-button" aria-label="附加圖片" title="附加圖片" aria-controls="user-image-picker" aria-expanded="false" hidden disabled>
-<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8" cy="8" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
 </button>
 </div>
 <button id="cancel-instruction" hidden disabled>停止這次回覆</button>
@@ -825,6 +823,7 @@ function unavailableSourceText(item){
   return `這次沒用到 ${item.source}：工具清單讀不到（${UNAVAILABLE_SOURCE_REASONS[item.reason]||"原因不明"}），其他功能照常。`;
 }
 let hitlGeneration=0,hitlObservationScope=null,hitlRulesView=null,hitlCommands=[],hitlRulesNote="";
+let hitlRuleHistory=null,hitlAllowed=null,hitlAllowedRule="";
 const hitlRequests=new Map(),hitlViews=new Map(),hitlErrors=new Map(),hitlDrafts=new Map(),hitlAllowDrafts=new Map();
 const hitlEditors=new Map(),hitlReaders=new Map();
 const hitlDetailsOpen=new Set();
@@ -1246,11 +1245,12 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     ATTACHMENT_CATALOG_UNAVAILABLE:"本對話的來源目錄目前不可用；不改查新對話目錄、不替換原來源。",
     ATTACHMENT_CATALOG_INVALID:"來源目錄與原草稿／對話或格式不符；不替換選擇。",
     ATTACHMENT_SELECTION_INVALID:"請使用最多4份完整參照及不重複的 logical filename；不接受路徑或URL。",
-    USER_FILE_CAPABILITY_INVALID:"文字檔設定回應缺欄或與原對話不符；不當成停用，也不改查目前新對話設定。",
-    USER_FILE_CAPABILITY_UNAVAILABLE:"原對話的文字檔設定目前不可用；不改查global或自動啟用。",
+    USER_FILE_CAPABILITY_INVALID:"讀不到這段對話的附件設定，請按「重試」。",
+    USER_FILE_CAPABILITY_UNAVAILABLE:"這段對話的附件設定目前讀不到，請按「重試」。",
+    USER_FILES_DISABLED:"這段對話沒有開啟附檔。",
     USER_FILE_INPUT_INVALID:"文字檔要是 UTF-8；檔名只能用英文字母、數字、點、底線和連字號（第一個字是英數字），請先改名再選；每則訊息最多 4 份且不重名；8192 bytes 以內的檔案連同訊息原文合計也不能超過 8192 bytes。",
     USER_FILE_TOO_LARGE:"檔案超過 10 MB，沒有加入。請分割或壓縮後再試。",
-    USER_FILE_TYPE_UNSUPPORTED:"目前支援 txt／md／csv／json／pdf／docx／xlsx／pptx（舊版 doc／xls／ppt 請先另存新格式）。這份沒有加入。",
+    USER_FILE_TYPE_UNSUPPORTED:"目前支援 txt／md／csv／json／pdf／docx／xlsx／pptx 和 png／jpg／webp 圖片（舊版 doc／xls／ppt 請先另存新格式）。這份沒有加入。",
     USER_FILE_UPLOAD_UNKNOWN:"上傳結果不確定。再傳一次同一個檔案是安全的，不會變成兩份。",
     NATIVE_FILE_MISSING:"助理目前的環境找不到這份附件（可能剛換過環境）。請移除後重新附加。",
     USER_UPLOADS_UNSUPPORTED:"這段對話的路徑不支援大檔、PDF 或 Office 檔；請在原生對話中附檔，或把內容貼進訊息。",
@@ -1457,8 +1457,9 @@ function userFileIssue(){
   if(userFileError)return friendlyError(userFileError);
   if(!files.length)return "";
   if(invalidLiteralInput(el("instruction").value,files,selectedAttachments()))return friendlyError({code:"USER_FILE_INPUT_INVALID"});
-  if(userFileCapabilityBusy||userFileCapability?.user_text_file_profile!=="fa-user-text-files-v1")
-    return "原檔草稿保留；請重新讀取本對話的文字檔設定。能力觀察不是提交許可。";
+  if(userFileCapabilityError)return friendlyError({code:"USER_FILE_CAPABILITY_UNAVAILABLE"});
+  if(userFileCapabilityBusy||!userFileCapability)return "正在讀取這段對話的附件設定，完成後才能送出。";
+  if(userFileCapability.user_text_file_profile!=="fa-user-text-files-v1")return "這段對話沒有開啟附檔，請移除已選的檔案。";
   return "";
 }
 function selectedUserImages(){
@@ -1512,13 +1513,10 @@ function renderUserImages(){
   if(scope!==userImageScope){userImageScope=scope;userImageRevision++;userImageBusy=false;userImageError=null;userImageRenderKey=null}
   const editable=Boolean(c?.editable||c?.can_follow_up);
   const ready=scopeAvailable()&&state.authentication==="AVAILABLE"&&!busy&&!threadLoading&&!messagePending(c?.request_id);
-  const images=selectedUserImages(),allowed=imagesAllowed();
-  el("user-image-picker").hidden=!c||!nativeProfile(c.state_profile);
-  el("user-images").disabled=!ready||!editable||userImageBusy||!allowed||images.length>=4;
+  const images=selectedUserImages();
+  el("clear-user-images").hidden=!images.length&&!userImageError;
   el("clear-user-images").disabled=!ready||!editable||(!images.length&&!userImageError);
-  text("user-image-note",userImageIssue()||(!allowed?(nativeProfile(c?.state_profile)?
-    "目前選的模型不讀圖片；換成支援圖片的模型才能附圖。":"這段對話的路徑不支援附圖。"):
-    images.length?`已附 ${images.length}／4 張；送出時只帶圖片名稱與雜湊，原圖已存在助理那邊。`:"本回合沒有附圖。"));
+  text("user-image-note",userImageIssue()||(images.length?`已附 ${images.length}／4 張圖片。`:""));
   const key=JSON.stringify([scope,ready,editable,images.map(item=>[item.name,item.sha256])]);
   if(key===userImageRenderKey)return;
   userImageRenderKey=key;
@@ -1546,23 +1544,28 @@ function renderUserFiles(){
   const editable=Boolean(c?.editable||c?.can_follow_up);
   const ready=scopeAvailable()&&state.authentication==="AVAILABLE"&&!busy&&!threadLoading&&!messagePending(c?.request_id);
   const files=selectedUserFiles(),metadata=editable?files:c?.user_files||[];
-  el("user-file-picker").hidden=!c;
+  if(c&&editable&&ready&&!userFileCapability&&!userFileCapabilityBusy&&!userFileCapabilityError){
+    userFileCapabilityBusy=true;Promise.resolve().then(readUserFileCapability);
+  }
+  const filesUsable=!userFileCapabilityBusy&&userFileCapability?.user_text_file_profile==="fa-user-text-files-v1";
+  el("attachment-panel").hidden=!c;
+  el("read-user-file-capability").hidden=!editable||!userFileCapabilityError;
   el("read-user-file-capability").disabled=!ready||!editable||userFileCapabilityBusy;
-  el("user-text-files").disabled=!ready||!editable||userFileCapabilityBusy
-    ||userFileCapability?.user_text_file_profile!=="fa-user-text-files-v1";
+  el("attachment-files").disabled=!ready||!editable||userFileCapabilityBusy||userImageBusy
+    ||!(filesUsable||imagesAllowed()&&selectedUserImages().length<4);
+  el("clear-user-files").hidden=!files.length&&!userFileReading&&!userFileError;
   el("clear-user-files").disabled=!ready||!editable||(!files.length&&!userFileReading&&!userFileError);
   text("user-file-note",c?.command_incomplete?friendlyError({code:"INSTRUCTION_INCOMPLETE"}):
     userFileCapabilityError?friendlyError(userFileCapabilityError):
-    userFileCapabilityBusy?"正在唯讀核對原對話設定，不傳本文或探測preflight。":
     userFileReading?(userFileUploading?`上傳中：${userFileUploading}…`:"正在本機讀取你選取的檔案；尚未傳送。"):
-    !editable?"這回合的原檔已隨command凍結，只顯示metadata；新追問不自動繼承附件。":
-    !userFileCapability?"先讀取本對話設定；不從reference附件目錄猜測literal能力。":
-    userFileCapability.user_text_file_profile===null?"本對話捕獲的設定未啟用文字檔；不借目前新對話profile啟用。":
-    `設定觀察於 ${userFileCapability.read_at}；不是授權，送出時仍由後端核對原profile與目前權限。`);
+    !editable?"這則訊息的附件已送出，不能更換；下一則可以另選。":
+    userFileCapabilityBusy||!userFileCapability?"正在讀取這段對話的附件設定…":
+    userFileCapability.user_text_file_profile===null?
+      (imagesAllowed()?"這段對話只能附圖片。":friendlyError({code:"USER_FILES_DISABLED"})):"");
   text("user-file-limit",userFileIssue()||(files.length?
-    `${files.some(item=>!item.upload)?`原文＋檔案JSON：${literalInputBytes(el("instruction").value,files)}／8192 bytes（包含JSON escaping）；`:""}${
-      files.some(item=>item.upload)?"大檔已上傳，送出時只帶名稱與雜湊；":""}附件合計 ${files.length+selectedAttachments().length}／4。`:
-    "本回合沒有選取文字檔；普通文字與來源附件行為不變。"));
+    `${files.some(item=>!item.upload)?`訊息和小檔共 ${literalInputBytes(el("instruction").value,files)}／8192 bytes；`:""}${
+      files.some(item=>item.upload)?"大檔已上傳；":""}附件合計 ${files.length+selectedAttachments().length}／4。`:
+    ""));
   const key=JSON.stringify([scope,ready,editable,metadata]);
   if(key===userFileRenderKey)return;
   userFileRenderKey=key;
@@ -1609,7 +1612,7 @@ function attachmentIssue(){
     return "已選原版本不在目前可選候選中；尚未替換。請移除失效項目，再明確重新選擇。";
   return "";
 }
-const attachmentPickerIds=["attachment-picker","user-file-picker","user-image-picker"];
+const attachmentPickerIds=["attachment-panel"];
 let activeAttachmentPicker=null,attachmentPickerScope=null;
 function renderAttachmentToolbar(){
   const c=state.composer;
@@ -2285,8 +2288,9 @@ function renderSettings(){
   }
   if(rules){
     el("hitl-rules-panel").open=true;
-    text("settings-rules-note",hitlSupported()?"":
-      "批准規則要在一段原生對話裡讀取，而且這個環境要開啟真人批准。請先在左側選好助理和對話。");
+    text("settings-rules-note",!teamRouteSupported()?"這個環境沒有開啟真人批准，沒有批准規則可讀。":
+      hitlSupported()?"":"規則不用選對話就能讀；要新增或修改規則，請先在左側選好一段原生對話。");
+    if(teamRouteReady()&&hitlRulesView===null&&!hitlActive("rules-read")&&!hitlErrors.has("rules-read"))readNativeHitlRules();
     return;
   }
   if(team){
@@ -4191,9 +4195,12 @@ function clearNativeHitlObservation(){
   hitlGeneration++;hitlRequests.clear();hitlViews.clear();hitlErrors.clear();hitlEditors.clear();hitlReaders.clear();
   hitlDetailsOpen.clear();
   hitlRuleEditorsOpen.clear();hitlChosen.clear();
-  hitlRulesView=null;hitlCommands=[];hitlRulesNote="";questionCommands=[];consentViews.clear();consentCommands=[];
+  hitlRulesView=null;hitlRuleHistory=null;hitlAllowed=null;hitlAllowedRule="";hitlCommands=[];hitlRulesNote="";questionCommands=[];consentViews.clear();consentCommands=[];
 }
 function teamHitlSupported(){return hitlSupported()&&state.composer.native_hitl.team_attention_available===true}
+// A Team route (the rules, a Team card) needs H1 on, not a native conversation; writing a rule still goes through one.
+function teamRouteSupported(){return state?.composer?.native_hitl?.enabled===true}
+function teamRouteReady(){return teamRouteSupported()&&scopeAvailable()&&state.authentication==="AVAILABLE"&&!busy&&!threadLoading}
 function attentionRef(item){return item.approval||item.question||item.consent}
 function attentionCall(entry){return attentionRef(entry.item).call}
 function attentionIdentity(entry){return entry.item.type+":"+entry.item.item_id}
@@ -4519,10 +4526,11 @@ function validHitlRules(value){return value?.schema_version==="fa-native-hitl-ru
   &&Number.isInteger(value.revision)&&value.revision>=0&&("etag" in value)&&Array.isArray(value.rules)&&value.rules.length<=20}
 function hitlLive(ticket){return hitlRequests.get(ticket.key)===ticket&&ticket.generation===hitlGeneration
   &&ticket.scope===hitlObservationScope&&ticket.viewAgent===selectedAgent&&ticket.auth===attachmentAuthRevision
-  &&ticket.thread===selectedThread&&state.authentication==="AVAILABLE"&&hitlSupported()}
+  &&ticket.thread===selectedThread&&state.authentication==="AVAILABLE"&&(ticket.team?teamRouteSupported():hitlSupported())}
 async function requestNativeHitl(key,path,body,accept,target=null){
-  if(!hitlReady()||!hitlTargetReady(target)||hitlActive(key))return;
-  const ticket={key,generation:hitlGeneration,scope:hitlObservationScope,viewAgent:selectedAgent,
+  const team=target?.route==="team";
+  if(!(team?teamRouteReady():hitlReady())||!hitlTargetReady(target)||hitlActive(key))return;
+  const ticket={key,team,generation:hitlGeneration,scope:hitlObservationScope,viewAgent:selectedAgent,
     agent:target?target.agent:selectedAgent,route:target?.route||selectedThread,
     thread:selectedThread,auth:attachmentAuthRevision};
   hitlRequests.set(key,ticket);hitlErrors.delete(key);render();
@@ -4551,21 +4559,153 @@ function readNativeHitlRules(){
   return requestNativeHitl("rules-read","rules",null,value=>{
     if(!validHitlRules(value.rules)||typeof value.can_approve!=="boolean"||!Array.isArray(value.commands))
       throw {code:"NATIVE_HITL_RECORD_INVALID"};
-    hitlRulesView=value;hitlCommands=mergeControlObservations(hitlCommands,value.commands);
+    // Each journal entry keeps the route it was sent on; this Team read is not that route.
+    hitlRulesView=value;hitlCommands=mergeControlObservations(hitlCommands,value.commands.map(({ui_target,...entry})=>entry));
     hitlRulesNote=`已讀規則版本 ${value.rules.revision}；不是操作批准。`;
     const draft=hitlDraft();
     if(draft.base===null&&!draft.text)draft.base={revision:value.rules.revision,etag:value.rules.etag};
-  });
+    // An older page still in flight belongs to the old list; drop it and read the newest page again.
+    hitlRuleHistory=null;hitlRequests.delete("rule-history");hitlErrors.delete("rule-history");readNativeHitlRuleHistory();
+  },{agent:agentMode?selectedAgent:null,route:"team"});
+}
+const HITL_CHANGES={add:"新增",update:"修改",delete:"刪除",allow_rule:"從批准卡建立"};
+function validHitlRuleText(rule){return typeof rule?.text==="string"&&["ask_first","allow_automatically"].includes(rule.behavior)}
+function validHitlRevision(entry){
+  return entry?.schema_version==="fa-native-hitl-rule-revision-v1"&&entry.purpose==="readback-only-not-execution-permission"
+    &&Number.isInteger(entry.revision)&&typeof entry.rule_id==="string"&&Number.isFinite(Date.parse(entry.changed_at))
+    &&Object.hasOwn(HITL_CHANGES,entry.change)
+    &&(entry.change==="delete"?entry.rule===null:validHitlRuleText(entry.rule))
+    &&(["add","allow_rule"].includes(entry.change)?entry.previous_rule===null:validHitlRuleText(entry.previous_rule))
+    &&(entry.change==="allow_rule"?/^[a-f0-9]{64}$/.test(entry.source_pending_id)&&typeof entry.source_call?.agent_id==="string":
+      entry.source_pending_id===null);
+}
+function validHitlRuleHistory(value){
+  return value?.schema_version==="fa-native-hitl-rule-history-v1"&&value.purpose==="readback-only-not-execution-permission"
+    &&Number.isInteger(value.head_revision)&&Array.isArray(value.entries)&&value.entries.every(validHitlRevision)
+    &&(value.next_before===null||Number.isInteger(value.next_before));
+}
+// Only the newest page is read on its own; an older Team's full history is read one page per click.
+function readNativeHitlRuleHistory(more=false){
+  const before=more?hitlRuleHistory?.next_before:null;
+  if(more&&!Number.isInteger(before))return;
+  return requestNativeHitl("rule-history","rule-history"+(more?"?before="+before:""),null,value=>{
+    if(!validHitlRuleHistory(value)||value.team_id!==hitlRulesView?.rules.team_id)throw {code:"NATIVE_HITL_RECORD_INVALID"};
+    if(more&&hitlRuleHistory?.next_before!==before)return;
+    hitlRuleHistory=more?{...value,head_revision:hitlRuleHistory.head_revision,
+      entries:[...hitlRuleHistory.entries,...value.entries]}:value;
+  },{agent:agentMode?selectedAgent:null,route:"team"});
+}
+function hitlRuleQuote(rule){return `「${rule.text}」（${rule.behavior==="ask_first"?"先問我":"自動允許"}）`}
+function hitlRuleSource(entry){
+  const saved=mergeControlObservations(state.composer?.native_hitl?.commands||[],hitlCommands)
+    .find(item=>item.selection?.pending_id===entry.source_pending_id&&item.display);
+  return `由${attentionAgentName(entry.source_call.agent_id)}的批准卡建立（卡片 ${entry.source_pending_id.slice(0,8)}）`+
+    (saved?"："+hitlActionText(saved.display):"");
+}
+// Pages run newest first from the head, so once a rule's creation is read every later change to it is read too.
+function hitlRuleOrigin(rule){
+  if(!hitlRuleHistory)return hitlActive("rule-history")?"正在讀取建立時間…":"建立時間尚未讀到";
+  const mine=hitlRuleHistory.entries.filter(entry=>entry.rule_id===rule.rule_id);
+  const created=mine.find(entry=>entry.change==="add"||entry.change==="allow_rule"),updated=mine.find(entry=>entry.change==="update");
+  return [created?"建立於 "+hitlTime(created.changed_at):"建立時間在更早的歷史裡，尚未讀到",
+    updated?"最後修改於 "+hitlTime(updated.changed_at):created?"建立後沒有修改":null,
+    created?.change==="allow_rule"?hitlRuleSource(created):created?"你（Team 主人）在這裡新增":null].filter(Boolean).join(" · ");
+}
+function hitlRevisionText(entry){
+  const what=entry.change==="update"?`${hitlRuleQuote(entry.previous_rule)} → ${hitlRuleQuote(entry.rule)}`:
+    hitlRuleQuote(entry.rule??entry.previous_rule);
+  return [`第 ${entry.revision} 版`,hitlTime(entry.changed_at),"你（Team 主人）",HITL_CHANGES[entry.change],what,
+    ...(entry.change==="allow_rule"?[hitlRuleSource(entry)]:[])].join(" · ");
+}
+const HITL_ALLOWED_BY=["rule","default","toolbox","human_once"];
+// One click reads at most this many scan pages; the rest stays behind 「繼續讀取」, never an empty claim.
+const HITL_ALLOWED_PAGES=10;
+function validHitlAllowed(value){
+  return value?.schema_version==="fa-native-hitl-allowed-v1"&&value.purpose==="readback-only-not-execution-permission"
+    &&typeof value.team_id==="string"&&Number.isFinite(Date.parse(value.since))&&Array.isArray(value.entries)
+    &&(value.next_cursor===null||typeof value.next_cursor==="string")
+    &&value.entries.every(entry=>HITL_ALLOWED_BY.includes(entry?.by)&&/^[a-f0-9]{64}$/.test(entry.authorization_id)
+      &&Number.isFinite(Date.parse(entry.authorized_at))&&typeof entry.action?.tool==="string"
+      &&typeof entry.action?.call?.agent_id==="string"&&Array.isArray(entry.review?.matched_rule_ids));
+}
+async function readNativeHitlAllowed(more=false){
+  const generation=hitlGeneration,target={agent:agentMode?selectedAgent:null,route:"team"};
+  if(!more)hitlAllowed=null;
+  for(let page=0;page<HITL_ALLOWED_PAGES&&generation===hitlGeneration;page++){
+    const cursor=hitlAllowed?.next_cursor;
+    if(hitlAllowed&&!cursor)return;
+    let accepted=false;
+    await requestNativeHitl("allowed-read","allowed"+(cursor?"?cursor="+encodeURIComponent(cursor):""),null,value=>{
+      if(!validHitlAllowed(value)||value.team_id!==(hitlRulesView?.rules.team_id??value.team_id))
+        throw {code:"NATIVE_HITL_RECORD_INVALID"};
+      hitlAllowed={since:hitlAllowed?.since??value.since,next_cursor:value.next_cursor,
+        entries:[...(hitlAllowed?.entries||[]),...value.entries]};
+      accepted=true;
+    },target);
+    if(!accepted)return;
+  }
+}
+// Rule text from the current list, else from the read history (a deleted rule), else only its short ID.
+function hitlRuleLabel(ruleId){
+  const saved=hitlRuleHistory?.entries.find(entry=>entry.rule_id===ruleId);
+  const rule=hitlRulesView?.rules.rules.find(item=>item.rule_id===ruleId)??saved?.rule??saved?.previous_rule;
+  return rule?`「${rule.text}」`:`ID ${ruleId.slice(0,8)}`;
+}
+function hitlAllowedText(entry){
+  const action=entry.action,command=action.category==="shell"&&typeof action.arguments?.command==="string"?action.arguments.command:null;
+  const by=entry.by==="rule"?`依規則${entry.review.matched_rule_ids.map(hitlRuleLabel).join("、")}自動允許（第 ${entry.review.rules_revision} 版規則）`:
+    entry.by==="human_once"?"你（Team 主人）在批准卡上允許了這次":entry.by==="toolbox"?"Toolbox 設定為不用批准":"審查允許，沒有規則套用";
+  return [hitlTime(entry.authorized_at),attentionAgentName(action.call.agent_id),
+    command===null?`${action.tool}（${action.target}）`:`執行：${command}`,by].join(" · ");
+}
+function renderNativeHitlAllowed(teamReady){
+  const view=hitlAllowed,error=hitlErrors.get("allowed-read"),busy=hitlActive("allowed-read");
+  el("hitl-allowed-panel").hidden=!teamRouteSupported();
+  el("read-hitl-allowed").disabled=!teamReady||busy;
+  const more=el("read-hitl-allowed-more");more.hidden=!view?.next_cursor;more.disabled=!teamReady||busy;
+  const ids=[...new Set([...(hitlRulesView?.rules.rules||[]).map(rule=>rule.rule_id),
+    ...(view?.entries||[]).flatMap(entry=>entry.review.matched_rule_ids)])];
+  if(hitlAllowedRule&&!ids.includes(hitlAllowedRule))hitlAllowedRule="";
+  const select=el("hitl-allowed-rule");select.replaceChildren();
+  for(const [value,label] of [["","全部"],...ids.map(id=>[id,hitlRuleLabel(id)])]){
+    const option=document.createElement("option");option.value=value;option.textContent=label;select.append(option);
+  }
+  select.value=hitlAllowedRule;select.disabled=!view;
+  const shown=(view?.entries||[]).filter(entry=>!hitlAllowedRule||entry.by==="rule"&&entry.review.matched_rule_ids.includes(hitlAllowedRule))
+    .sort((a,b)=>Date.parse(b.authorized_at)-Date.parse(a.authorized_at));
+  const span=view?`自 ${hitlTime(view.since)} 起`:"";
+  text("hitl-allowed-note",error?"放行紀錄讀不到："+friendlyError(error)+(view?`；已讀到的 ${view.entries.length} 筆保留。`:""):
+    busy?"正在讀取放行紀錄…":!view?"還沒讀取。按上面的按鈕會掃描這個 Team 最近 24 小時寫入的資料列，可能要一點時間。":
+    view.next_cursor?`${span}已讀到 ${view.entries.length} 筆${hitlAllowedRule?`（這條規則 ${shown.length} 筆）`:""}，還沒讀完；按「繼續讀取」。不能當成只有這些。`:
+    hitlAllowedRule&&!shown.length?`${span}，這條規則在讀到的範圍內沒有放行紀錄。`:
+    !view.entries.length?`${span}沒有放行紀錄。`:
+    `${span}共 ${shown.length} 筆。純讀，不是批准，也不代表效果已完成。`);
+  const list=el("hitl-allowed-list");list.replaceChildren();
+  for(const entry of shown){
+    const row=document.createElement("p");row.setAttribute("data-hitl-allowed",entry.authorization_id);
+    row.style.overflowWrap="anywhere";row.textContent=hitlAllowedText(entry);list.append(row);
+  }
+}
+function renderNativeHitlRuleHistory(teamReady){
+  const view=hitlRuleHistory,error=hitlErrors.get("rule-history"),list=el("hitl-rule-history");
+  el("hitl-rule-history-panel").hidden=!teamRouteSupported();
+  text("hitl-rule-history-note",error?"規則歷史讀不到："+friendlyError(error):
+    hitlActive("rule-history")?"正在讀取規則歷史…":!view?"尚未讀取規則歷史。":
+    !view.entries.length?"還沒有任何規則變更。":
+    `目前是第 ${view.head_revision} 版；已讀到第 ${view.entries.at(-1).revision} 到第 ${view.entries[0].revision} 版的變更。純讀，不是批准。`);
+  list.replaceChildren();
+  for(const entry of view?.entries||[]){
+    const row=document.createElement("p");row.setAttribute("data-hitl-revision",String(entry.revision));
+    row.style.overflowWrap="anywhere";row.textContent=hitlRevisionText(entry);list.append(row);
+  }
+  const more=el("read-hitl-rule-history-more");
+  more.hidden=!Number.isInteger(view?.next_before);more.disabled=!teamReady||hitlActive("rule-history");
 }
 function readNativeHitlPending(reference,target=null){
   if(!validHitlRef(reference)||!teamReferenceCurrent(reference,target))return;
   const pid=reference.pending_id;
   return requestNativeHitl("pending:"+pid,"pending/"+encodeURIComponent(pid),null,value=>{
-    const view=value.readback;
-    if(view?.schema_version!=="fa-native-hitl-readback-v1"||view.purpose!=="readback-only-not-execution-permission"
-        ||!sameHitlRef(view.approval,reference)||!sameHitlRef({...reference,call:view.pending?.command?.action?.call},reference)
-        ||!validHitlRules(value.rules)||typeof value.can_approve!=="boolean"||!Array.isArray(value.commands))
-      throw {code:"NATIVE_HITL_RECORD_INVALID"};
+    if(!validPendingRead(value,reference))throw {code:"NATIVE_HITL_RECORD_INVALID"};
     hitlViews.set(pid,value);hitlCommands=mergeControlObservations(hitlCommands,value.commands);
   },target);
 }
@@ -4583,6 +4723,27 @@ function autoReadNativeHitl(items){
     if(!sameHitlRef(hitlViews.get(reference.pending_id)?.readback?.approval,reference)&&!hitlActive(key)&&!hitlErrors.has(key))
       readNativeHitlPending(reference,hitlTarget(entry));
   }
+}
+function validPendingRead(value,reference){
+  const view=value?.readback;
+  return view?.schema_version==="fa-native-hitl-readback-v1"&&view.purpose==="readback-only-not-execution-permission"
+    &&sameHitlRef(view.approval,reference)&&sameHitlRef({...reference,call:view.pending?.command?.action?.call},reference)
+    &&Number.isInteger(view.pending.command.review?.rules_revision)&&typeof view.pending.command.action?.tool==="string"
+    &&validHitlRules(value.rules)&&typeof value.can_approve==="boolean"&&Array.isArray(value.commands);
+}
+// A decided card is no longer in the Team list, so it is read on the route its decision was sent on.
+function hitlWhyTarget(entry){
+  return entry.thread_id===null?{agent:agentMode?entry.selection.call.agent_id:null,route:"team"}:
+    {agent:entry.ui_agent??(agentMode?selectedAgent:null),route:entry.thread_id};
+}
+function hitlRouteReady(target){return target?.route==="team"?teamRouteReady():hitlReady()}
+function readHitlWhy(entry){
+  const reference=entry.selection;
+  if(!validHitlRef(reference))return;
+  requestNativeHitl("why:"+reference.pending_id,"pending/"+encodeURIComponent(reference.pending_id),null,value=>{
+    if(!validPendingRead(value,reference))throw {code:"NATIVE_HITL_RECORD_INVALID"};
+    hitlViews.set(reference.pending_id,value);
+  },hitlWhyTarget(entry));
 }
 function hitlCommandResult(value){
   if(value?.purpose!=="readback-only-not-execution-permission"||value.original_request_resent!==false
@@ -4632,10 +4793,10 @@ function reconcileNativeHitl(entry){
   },target);
 }
 function renderNativeHitlRules(){
-  const supported=hitlSupported(),ready=hitlReady(),view=hitlRulesView,draft=hitlDraft();
+  const supported=hitlSupported(),ready=hitlReady(),teamReady=teamRouteReady(),view=hitlRulesView,draft=hitlDraft();
   el("open-hitl-rules").hidden=!supported;el("open-hitl-rules").disabled=!ready;
-  el("hitl-rules-panel").hidden=!supported;
-  el("read-hitl-rules").disabled=!ready||hitlActive("rules-read")||hitlActive("rule-write");
+  el("hitl-rules-panel").hidden=!teamRouteSupported();
+  el("read-hitl-rules").disabled=!teamReady||hitlActive("rules-read")||hitlActive("rule-write");
   el("new-hitl-rule").disabled=!ready||!view?.can_approve||hitlActive("rules-read")||hitlActive("rule-write");
   const sameBase=Boolean(view&&draft.base?.revision===view.rules.revision&&draft.base?.etag===view.rules.etag);
   const editable=ready&&Boolean(view?.can_approve)&&!hitlActive("rules-read")&&!hitlActive("rule-write");
@@ -4654,7 +4815,9 @@ function renderNativeHitlRules(){
   const list=el("hitl-rule-list");list.replaceChildren();
   for(const rule of view?.rules.rules||[]){
     const row=document.createElement("article"),content=document.createElement("p"),note=document.createElement("small");
-    content.textContent=rule.text;note.textContent=`${rule.behavior==="ask_first"?"先問我":"自動允許"} · ${rule.rule_id}`;
+    content.textContent=rule.text;note.textContent=`${rule.behavior==="ask_first"?"先問我":"自動允許"} · ID ${rule.rule_id.slice(0,8)}`;
+    const origin=document.createElement("small");origin.setAttribute("data-hitl-rule-origin",rule.rule_id);
+    origin.style.display="block";origin.style.overflowWrap="anywhere";origin.textContent=hitlRuleOrigin(rule);
     const edit=document.createElement("button"),remove=document.createElement("button");
     edit.textContent="編輯";remove.textContent="刪除";
     edit.disabled=remove.disabled=!editable;
@@ -4665,28 +4828,121 @@ function renderNativeHitlRules(){
       sendNativeHitlRule({operation:"delete",rule_id:rule.rule_id,rule:null,
         expected_rules_revision:view.rules.revision,expected_rules_etag:view.rules.etag});
     });
-    row.append(content,note,edit,remove);list.append(row);
+    row.append(content,note,origin,edit,remove);list.append(row);
   }
+  renderNativeHitlRuleHistory(teamReady);renderNativeHitlAllowed(teamReady);
   const commands=el("hitl-command-list");commands.replaceChildren();
   const records=mergeControlObservations(state.composer?.native_hitl?.commands||[],hitlCommands);
-  for(const entry of ready?records:[]){
-    const row=document.createElement("p"),button=document.createElement("button"),error=hitlErrors.get("reconcile:"+entry.request_id);
-    row.textContent=error?friendlyError(error):entry.state==="UNKNOWN"?
-      `原 ${entry.command?.choice||entry.command?.operation||"控制"} 請求 UNKNOWN 保留${entry.observation?"；另已讀回原回條":""}。不是執行結果。`:
-      `原 ${entry.command?.choice||entry.command?.operation||"控制"} 決定已保存；不代表效果已完成。`;
-    if(agentMode&&entry.ui_agent&&entry.ui_agent!==selectedAgent)
-      row.textContent=attentionAgentName(entry.ui_agent)+"："+row.textContent;
-    const otherThread=entry.kind==="decision"&&!hitlEntryTarget(entry)&&entry.thread_id!==selectedThread;
-    button.textContent=otherThread?"前往原對話核對":"只核對原控制請求";button.setAttribute("data-hitl-reconcile",entry.request_id);
-    button.disabled=hitlActive("reconcile:"+entry.request_id)||!hitlTargetReady(hitlEntryTarget(entry));
-    const generation=hitlGeneration;
-    button.addEventListener("click",()=>{
-      if(button.disabled||generation!==hitlGeneration)return;
-      if(otherThread){if(typeof entry.thread_id==="string")switchThread(entry.thread_id)}
-      else reconcileNativeHitl(entry);
-    });
-    row.append(button);commands.append(row);
+  if(teamReady&&records.length){
+    const intro=document.createElement("p");intro.className="reason";
+    intro.textContent="這台工作台送出的控制紀錄：純讀，不是批准，也不代表效果已完成。";commands.append(intro);
   }
+  for(const entry of teamReady?records:[])commands.append(hitlRecordCard(entry));
+}
+function hitlRecordThread(entry){
+  if(entry.thread_id===null)return "Team 待處理清單";
+  const thread=state.composer?.threads?.find(item=>item.thread_id===entry.thread_id);
+  return thread?`對話「${thread.label}」`:`對話 ${String(entry.selection?.call?.conversation_id||entry.thread_id).slice(0,8)}`;
+}
+function hitlRecordChoice(command){
+  if(command?.kind==="decision")return hitlDecisionText(command).replace(/^你/,"");
+  if(command?.operation==="delete")return "從目前清單移除了一條規則";
+  return `${command?.operation==="update"?"修改":"新增"}了規則「${command?.rule?.text??""}」（${
+    command?.rule?.behavior==="ask_first"?"先問我":"自動允許"}）`;
+}
+// An UNKNOWN request may never have reached the API, so it is written as sent, not as a decision made.
+function hitlRecordSentence(entry){
+  const done=hitlRecordChoice(entry.command);
+  return "你（Team 主人）"+(entry.state==="UNKNOWN"?`的請求結果未確認：${done.replace(/了/,"")}`:done);
+}
+function hitlRecordCard(entry){
+  const card=document.createElement("article"),head=document.createElement("small"),choice=document.createElement("p");
+  card.setAttribute("data-hitl-record",entry.request_id);
+  const call=entry.selection?.call;
+  head.textContent=[Number.isFinite(Date.parse(entry.created_at))?"送出於 "+hitlTime(entry.created_at):"送出時間未保存",
+    ...(entry.kind==="decision"?[attentionAgentName(call?.agent_id??entry.ui_agent),hitlRecordThread(entry)]:["Team 規則"])].join(" · ");
+  card.append(head);
+  if(entry.kind==="decision"){
+    const action=document.createElement("p");action.style.overflowWrap="anywhere";
+    action.textContent=hitlActionText(entry.display);card.append(action);
+  }
+  choice.style.overflowWrap="anywhere";choice.textContent=hitlRecordSentence(entry);
+  card.append(choice);
+  const ruleId=entry.receipt?.result?.rule_id??entry.command?.rule_id;
+  const status=document.createElement("small"),button=document.createElement("button"),error=hitlErrors.get("reconcile:"+entry.request_id);
+  status.textContent=(typeof ruleId==="string"?`規則 ID ${ruleId.slice(0,8)} · `:"")+(error?friendlyError(error):
+    entry.state==="UNKNOWN"?`原請求 UNKNOWN 保留${entry.observation?"；另已讀回原回條":""}。不是執行結果。`:"已保存；不代表效果已完成。");
+  const target=hitlEntryTarget(entry),otherThread=entry.kind==="decision"&&!target&&entry.thread_id!==selectedThread;
+  button.textContent=otherThread?"前往原對話核對":"只核對原控制請求";button.setAttribute("data-hitl-reconcile",entry.request_id);
+  button.disabled=hitlActive("reconcile:"+entry.request_id)||!hitlTargetReady(target)||!otherThread&&!hitlRouteReady(target);
+  const generation=hitlGeneration;
+  button.addEventListener("click",()=>{
+    if(button.disabled||generation!==hitlGeneration)return;
+    if(otherThread){if(typeof entry.thread_id==="string")switchThread(entry.thread_id)}
+    else reconcileNativeHitl(entry);
+  });
+  card.append(status,button);
+  if(entry.kind==="decision"&&validHitlRef(entry.selection))card.append(hitlWhyDetails(entry));
+  return card;
+}
+function hitlWhyDetails(entry){
+  const pid=entry.selection.pending_id,key="why:"+entry.request_id,details=document.createElement("details");
+  const caption=document.createElement("summary");caption.textContent="為什麼問你";
+  details.setAttribute("data-hitl-why",entry.request_id);details.append(caption);details.open=hitlDetailsOpen.has(key);
+  const scope=hitlObservationScope;
+  // Render re-applies open, which also queues a toggle; only a change the owner made reads again.
+  details.addEventListener("toggle",()=>{
+    if(scope!==hitlObservationScope||details.open===hitlDetailsOpen.has(key))return;
+    if(!details.open){hitlDetailsOpen.delete(key);hitlErrors.delete("why:"+pid);return}
+    hitlDetailsOpen.add(key);
+    if(!hitlViews.has(pid)&&!hitlActive("why:"+pid))readHitlWhy(entry);
+  });
+  for(const line of hitlWhyLines(entry)){
+    const node=document.createElement(typeof line==="string"?"p":"pre");node.className="reason";
+    node.style.whiteSpace="pre-wrap";node.style.overflowWrap="anywhere";node.textContent=typeof line==="string"?line:line.pre;
+    details.append(node);
+  }
+  return details;
+}
+function hitlWhyLines(entry){
+  const pid=entry.selection.pending_id,value=hitlViews.get(pid),error=hitlErrors.get("why:"+pid);
+  if(hitlActive("why:"+pid))return ["正在讀取原卡片…"];
+  if(!value)return error?[`讀不到原卡片：${friendlyError(error)}`,
+    `以下只根據這台工作台保存的紀錄：${hitlActionText(entry.display)}`]:
+    hitlWhyTarget(entry)?.route!=="team"&&!hitlSupported()?["要看原卡片，請先在左側選好原對話。"]:["展開時讀取原卡片；純讀，不是批准。"];
+  // "Current" is the newer of the list above (a rule write rereads it) and the rules this card's own read returned.
+  const command=value.readback.pending.command,review=command.review,action=command.action,
+    rules=hitlRulesView&&hitlRulesView.rules.revision>=value.rules.revision?hitlRulesView.rules:value.rules;
+  const revision=review.rules_revision,same=revision===rules.revision,matched=review.matched_rule_ids||[];
+  const behavior=rule=>rule.behavior==="ask_first"?"先問我":"自動允許";
+  const lines=[action.category==="routine"?ROUTINE_CARD_REASON:hitlReason(review,{revision,rules:same?rules.rules:[]}),
+    `當時審查用的是第 ${revision} 版規則`+(same?"，就是目前這一版。":`；目前是第 ${rules.revision} 版。`)];
+  // D2 (Neal 2026-11-05): the model's own words, labelled as such, replace the plain rule list; applies comes from
+  // matched_rule_ids, never from the text, and an uncertain review decided nothing per rule.
+  const reasons=Object.entries(review.rule_reasons||{});
+  // An older revision's text comes from the newest read history entry at or before it (newest first, one change each);
+  // history read before that revision existed may miss a later change, so it shows only the ID.
+  const known=hitlRuleHistory&&revision<=hitlRuleHistory.head_revision;
+  const ruleText=id=>{
+    const rule=same?rules.rules.find(item=>item.rule_id===id):
+      known&&hitlRuleHistory.entries.find(item=>item.rule_id===id&&item.revision<=revision)?.rule;
+    return rule?hitlRuleQuote(rule):`ID ${id.slice(0,8)}`;
+  };
+  const unmatchedAsk=review.source!=="toolbox"&&action.category!=="routine"&&review.outcome==="ask"&&!matched.length;
+  if(unmatchedAsk&&!(reasons.length&&review.source==="uncertain"))lines.push(`當時第 ${revision} 版的規則都沒有套用到這個動作。`);
+  if(reasons.length){
+    lines.push("以下是自動審查模型對每條規則的說明，只供參考，不一定正確，也不影響這次是否要問你：");
+    const verdict=id=>review.source==="uncertain"?"沒有判定":matched.includes(id)?"適用":"不適用";
+    for(const [id,reason] of reasons)lines.push(`${ruleText(id)}：${verdict(id)}。模型說明：${reason}`);
+  }else if(unmatchedAsk){
+    if(revision===0)lines.push("第 0 版是還沒有任何規則的初始版本。");
+    else if(!same)lines.push(`第 ${revision} 版的規則原文要等規則歷史可以讀取後才看得到；目前是第 ${rules.revision} 版。`);
+    else if(!rules.rules.length)lines.push(`第 ${revision} 版沒有任何規則。`);
+    else for(const rule of rules.rules)lines.push(`第 ${revision} 版規則：「${rule.text}」（${behavior(rule)}）`);
+  }else if(matched.length)lines.push("命中的規則："+matched.map(ruleText).join("、"));
+  lines.push(`這次的動作：${action.tool}（${action.category}，目標 ${action.target}）`,{pre:JSON.stringify(action.arguments,null,2)},
+    "純讀，不是批准，也不代表效果已完成。");
+  return lines;
 }
 function hitlCanDecide(value,target=null){
   const view=value?.readback;
@@ -4698,13 +4954,40 @@ function hitlTime(value){return new Date(value).toLocaleString("zh-TW",{timeZone
 function hitlShortTime(value){
   return new Date(value).toLocaleTimeString("zh-TW",{timeZone:"Asia/Taipei",hour12:false,hour:"2-digit",minute:"2-digit"});
 }
-function hitlRuleSuggestion(action){
+// With any arguments, these programs can run any other command, so their name alone is not a scope.
+// Matched after dropping the folder, case, a Windows extension and a version suffix (python3.12.exe -> python).
+const HITL_WRAPPER_PROGRAMS=new Set(["sh","bash","zsh","dash","ksh","fish","busybox","pwsh","powershell","cmd","iex",
+  "invoke-expression","invoke-command","start-process","sudo","su","doas","runuser","env","xargs","find","awk","nohup",
+  "timeout","nice","watch","time","setsid","strace","chroot","exec","eval","source",".","ssh","npx","python","node",
+  "perl","ruby","php","lua","py","pythonw","wsl"]);
+// Two deterministic drafts for allow_rule (Neal 2026-11-05, D1=C): exact pins this call, kind widens it; no model call.
+function hitlRuleDrafts(action){
   const name=attentionAgentName(action.call.agent_id),arguments_=action.arguments;
   const location=typeof arguments_?.cwd==="string"?arguments_.cwd:action.target;
-  const suggestion=action.category==="shell"&&typeof arguments_?.command==="string"?
-    `允許 ${name} 在 ${JSON.stringify(location)} 執行指定命令 ${JSON.stringify(arguments_.command)}。`:
+  const shell=action.category==="shell"&&typeof arguments_?.command==="string";
+  const exact=shell?`允許 ${name} 在 ${JSON.stringify(location)} 執行指定命令 ${JSON.stringify(arguments_.command)}。`:
     `允許 ${name} 使用 ${action.tool}，目標限於 ${JSON.stringify(action.target)}，參數限定為 ${JSON.stringify(arguments_)}。`;
-  return [...suggestion].length<=512?suggestion:"";
+  const kind=(()=>{
+    if(shell){
+      const command=arguments_.command.trim(),program=command.split(/ +/)[0];
+      if(!program)return {why:"命令是空的，無法歸成一個程式。"};
+      if(/[;&|<>`$()\\'"*?]|[^\S ]/.test(command)||program.includes("="))
+        return {why:"這條命令有串接、重導、引號或展開，無法安全歸成一個程式。"};
+      const base=program.split(/[\\/]/).pop().toLowerCase().replace(/\.(exe|cmd|bat|com|ps1)$/,"").replace(/[-_]?[\d.]+$/,"");
+      if(HITL_WRAPPER_PROGRAMS.has(base||program))return {why:`${program} 可以再執行任何命令，不能只看程式名稱放行。`};
+      return {text:`允許 ${name} 在 ${JSON.stringify(location)} 執行 ${program} 程式（參數不限）。`};
+    }
+    if(/navigate/i.test(action.tool)&&arguments_?.url!==undefined){
+      if(Object.keys(arguments_).some(key=>key!=="url"))return {why:"這個開網頁動作除了網址還有其他參數，不能只看網站放行。"};
+      let url=null;try{url=typeof arguments_.url==="string"?new URL(arguments_.url):null}catch{}
+      if(!url||!["http:","https:"].includes(url.protocol))return {why:"網址不是可解析的 http／https 網站，無法歸成一個網站。"};
+      const server=action.target.endsWith("/"+action.tool)?action.target.slice(0,-action.tool.length-1):action.target;
+      return {text:`允許 ${name} 用 ${server} 的 ${action.tool} 開啟 ${url.origin} 網站的網頁。`};
+    }
+    return {text:`允許 ${name} 使用 ${action.tool}，目標限於 ${JSON.stringify(action.target)}，參數不限。`};
+  })();
+  const fits=text=>[...text].length<=512,tooLong=kind.text&&!fits(kind.text);
+  return {exact:fits(exact)?exact:"",kind:tooLong?"":kind.text||"",why:tooLong?"較寬的草稿超過 512 字。":kind.why||""};
 }
 // A routine card (propose_routine) shows the exact daily draft an allow saves; only the owner's click schedules it.
 const ROUTINE_CARD_REASON="排程一律要你在這張卡上按「允許這次」；助理說的話或你在對話裡的回覆都不算批准。"+
@@ -4865,13 +5148,32 @@ function renderHitlCard(reference,label,thread,item=null,entry=null){
     !ruleOpen?"":
     !input.value.trim()?"以後允許這類：請先填明未來允許的範圍，再確認。":
     [...input.value].length>512?"以後允許這類：規則文字超過 512 字。":"";
-  input.addEventListener("input",()=>{
+  const ruleEdited=()=>{
     if(!ruleOpen||input.disabled)return;
     hitlAllowDrafts.set(draftKey,input.value);hitlEditing();
     for(const [choice,button] of decisionButtons)button.disabled=!hitlCanDecide(value,target)||choice==="allow_rule"&&
       (!input.value.trim()||[...input.value].length>512||value.rules.rules.length>=20);
     choiceNote.textContent=ruleReason();choiceNote.hidden=!choiceNote.textContent;
-  });
+  };
+  input.addEventListener("input",ruleEdited);
+  if(ruleOpen){
+    const drafts=hitlRuleDrafts(action),picker=document.createElement("div");
+    picker.className="hitl-actions";picker.setAttribute("data-hitl-rule-drafts",pid);
+    for(const [kind,label,text] of [["exact","只這次",drafts.exact],["kind","這類動作",drafts.kind]]){
+      if(!text)continue;
+      const button=document.createElement("button");button.className="secondary";button.textContent=label;
+      button.setAttribute("data-hitl-draft",kind);button.disabled=input.disabled;
+      button.addEventListener("click",()=>{
+        if(button.disabled||scopeAtRender!==hitlObservationScope)return;
+        // The redraw keeps this card's own textarea (typed text is not part of its shape), so fill that node.
+        input.value=text;ruleEdited();input.focus?.();
+      });
+      picker.append(button);
+    }
+    const missing=[!drafts.exact&&"「只這次」的草稿超過 512 字，請自己寫範圍。",drafts.why&&`沒有「這類動作」草稿：${drafts.why}`];
+    const note=document.createElement("p");note.className="reason";note.textContent=missing.filter(Boolean).join("");
+    note.setAttribute("data-hitl-rule-drafts-note",pid);picker.append(note);note.hidden=!note.textContent;row.append(picker);
+  }
   scope.append(input);row.append(scope);
   const actions=document.createElement("div");actions.className="hitl-actions";
   for(const [choice,label] of [["allow_once","允許這次"],["allow_rule","以後允許這類"],["deny","拒絕"]]){
@@ -4888,7 +5190,7 @@ function renderHitlCard(reference,label,thread,item=null,entry=null){
       if(choice==="allow_rule"&&!ruleOpen){
         if(!hitlCanDecide(value,target))return;
         hitlRuleEditorsOpen.add(pid);
-        if(!hitlAllowDrafts.has(draftKey))hitlAllowDrafts.set(draftKey,hitlRuleSuggestion(action));
+        if(!hitlAllowDrafts.has(draftKey))hitlAllowDrafts.set(draftKey,hitlRuleDrafts(action).exact);
         render();hitlEditors.get(pid)?.focus?.();return;
       }
       // Every button of this card is disabled in the same redraw (the card becomes its record).
@@ -8132,11 +8434,14 @@ async function readNativeProgress(task){
 el("clear-user-files").addEventListener("click",()=>{
   if(el("clear-user-files").disabled)return;
   userFileRevision++;userFileReading=false;userFileUploading=null;userFileCapabilityBusy=false;userFileError=null;userFileRenderKey=null;
-  userFileDrafts.delete(attachmentDraftKey());el("user-text-files").value="";renderComposer();
+  userFileDrafts.delete(attachmentDraftKey());el("attachment-files").value="";renderComposer();
 });
-el("read-user-file-capability").addEventListener("click",async()=>{
-  if(el("read-user-file-capability").disabled)return;
+el("read-user-file-capability").addEventListener("click",()=>{
+  if(!el("read-user-file-capability").disabled)readUserFileCapability();
+});
+async function readUserFileCapability(){
   const c=state.composer,scope=userFileScopeKey(),revision=++userFileRevision;
+  if(!c?.request_id){userFileCapabilityBusy=false;return}
   const cid=c.conversation_id??c.conversation?.conversation_id??null;
   userFileReading=false;userFileCapabilityBusy=true;userFileCapability=null;userFileCapabilityError=null;userFileRenderKey=null;
   renderComposer();
@@ -8158,15 +8463,23 @@ el("read-user-file-capability").addEventListener("click",async()=>{
   }finally{
     if(userFileLive(revision,scope)){userFileCapabilityBusy=false;renderComposer()}
   }
-});
-el("user-text-files").addEventListener("change",async()=>{
-  const input=el("user-text-files");
+}
+function isUserImage(file){return ["image/png","image/jpeg","image/webp"].includes(file.type)}
+el("attachment-files").addEventListener("change",async()=>{
+  const input=el("attachment-files");
   if(input.disabled)return;
   const selected=Array.from(input.files||[]);if(!selected.length)return;
+  const images=selected.filter(isUserImage),files=selected.filter(file=>!isUserImage(file));
+  await Promise.all([files.length?addUserFiles(files):null,images.length?addUserImages(images):null]);
+});
+async function addUserFiles(selected){
+  const input=el("attachment-files");
   const scope=userFileScopeKey(),revision=++userFileRevision,draft=attachmentDraftKey();
   const csrf=state.csrf,agent=selectedAgent,rid=state.composer.request_id;
   userFileReading=true;userFileUploading=null;userFileError=null;userFileRenderKey=null;renderComposer();
   try{
+    if(userFileCapability?.user_text_file_profile!=="fa-user-text-files-v1")
+      throw {code:userFileCapability?"USER_FILES_DISABLED":"USER_FILE_CAPABILITY_UNAVAILABLE"};
     const names=[...selectedAttachments().map(item=>item.name),...selected.map(item=>item.name)];
     if(names.length>4||new Set(names).size!==names.length)throw {code:"USER_FILE_INPUT_INVALID"};
     for(const file of selected){
@@ -8229,16 +8542,15 @@ el("user-text-files").addEventListener("change",async()=>{
   }finally{
     if(userFileLive(revision,scope)){userFileReading=false;userFileUploading=null;input.value="";renderComposer()}
   }
-});
-el("user-images").addEventListener("change",async()=>{
-  const input=el("user-images");
-  if(input.disabled)return;
-  const selected=Array.from(input.files||[]);if(!selected.length)return;
+}
+async function addUserImages(selected){
+  const input=el("attachment-files");
   const c=state.composer,draft=attachmentDraftKey(),scope=userFileScopeKey(),revision=++userImageRevision;
   const csrf=state.csrf,agent=selectedAgent;
   const live=()=>revision===userImageRevision&&scope===userFileScopeKey()&&state.authentication==="AVAILABLE";
   userImageBusy=true;userImageError=null;userImageRenderKey=null;renderComposer();
   try{
+    if(!imagesAllowed())throw {code:nativeProfile(c?.state_profile)?"NATIVE_IMAGE_UNSUPPORTED":"USER_IMAGES_UNSUPPORTED"};
     const images=[...selectedUserImages()];
     if(images.length+selected.length>4)throw {code:"USER_IMAGE_INPUT_INVALID"};
     if(selected.some(file=>file.size>10*1024*1024))throw {code:"USER_IMAGE_TOO_LARGE"};
@@ -8263,7 +8575,7 @@ el("user-images").addEventListener("change",async()=>{
   }finally{
     if(live()){userImageBusy=false;userImageRenderKey=null;input.value="";renderComposer()}
   }
-});
+}
 el("clear-user-images").addEventListener("click",()=>{
   if(el("clear-user-images").disabled)return;
   userImageRevision++;userImageBusy=false;userImageError=null;userImageRenderKey=null;
@@ -8686,6 +8998,12 @@ for(const id of ["team-mcp-connection","team-mcp-approval"])el(id).addEventListe
 el("team-mcp-save").addEventListener("click",()=>{if(!el("team-mcp-save").disabled)saveTeamMcp()});
 el("team-mcp-cancel").addEventListener("click",()=>{resetTeamMcpForm();renderSettings()});
 el("read-hitl-rules").addEventListener("click",()=>{if(!el("read-hitl-rules").disabled)readNativeHitlRules()});
+el("read-hitl-allowed").addEventListener("click",()=>{if(!el("read-hitl-allowed").disabled)readNativeHitlAllowed()});
+el("read-hitl-allowed-more").addEventListener("click",()=>{
+  if(!el("read-hitl-allowed-more").disabled)readNativeHitlAllowed(true)});
+el("hitl-allowed-rule").addEventListener("change",()=>{hitlAllowedRule=el("hitl-allowed-rule").value;render()});
+el("read-hitl-rule-history-more").addEventListener("click",()=>{
+  if(!el("read-hitl-rule-history-more").disabled)readNativeHitlRuleHistory(true)});
 el("read-team-attention").addEventListener("click",()=>{
   if(el("read-team-attention").disabled)return;
   // A background read already running becomes the owner's read: show its loading line instead of dropping the click.

@@ -1258,7 +1258,7 @@ class AssistantSession:
                 attached = take("attached")
                 if attached.entries:
                     options["attached_text"] = attached
-            # agent-role v2/v3 declare no execute_operation; the other profiles keep their fixed pair.
+            # agent-role v2/v3/v4 declare no execute_operation; the other profiles keep their fixed pair.
             tools = [tools[0]] if instruction.prompt_profile in SHARED_ROLE_PROFILES else [tools[0], tools[3]]
             tools[0] = ToolSpec("read_context",
                 "Read the separately reviewed task source, not chat history. "

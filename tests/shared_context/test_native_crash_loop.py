@@ -463,6 +463,23 @@ def counted_veto_writes(monkeypatch, fail_first=False):
     return writes
 
 
+def test_a_rollback_onto_an_older_sdk_release_is_blocked_once(file_api, monkeypatch, caplog):
+    """ADR-0009 §3 (c) Guard A: 41 has the same profile but an older runtime, which would refuse every checkpoint 42
+    wrote and be judged a crash loop itself; the Agent keeps serving on 42."""
+    fixture = file_api
+    switched(fixture, monkeypatch, vetoed=("42",))
+    pairs = {"41": ("1.0.26", "1.0.103"), "42": ("1.0.28", "1.0.105")}
+    monkeypatch.setattr(behavior_native_sessions, "_release_of", lambda runtime, target, version: pairs.get(version))
+    writes, stops = counted_veto_writes(monkeypatch), len(fixture.files.calls)
+    with caplog.at_level("WARNING"):
+        assert cut(fixture) == (
+            "crash_loop", f"target_incompatible:{behavior_native_sessions.OLDER_SDK_RELEASE}", None)
+    row = abandon.row(fixture)
+    assert row.hosted_session_id == fixture.source.session_id and row.idle_upgrade.rollback_blocked
+    assert len(writes) == 1 and cut(fixture) == ("current", None, None)
+    assert not [call for call in fixture.files.calls[stops:] if call[0] == "create"]
+
+
 def test_back_on_the_vetoed_version_an_incompatible_rollback_target_is_blocked_once(file_api, monkeypatch, caplog):
     # The state after the carry-out above: on 42 again, 42 in this Agent's vetoes, 41 now incompatible.
     from shared_context.native_binding import INCOMPATIBLE_STATE_PROFILE

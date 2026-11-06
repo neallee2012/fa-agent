@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from shared_context import behavior_agent_versions as versions
+from shared_context.sdk_pin import PINNED_RELEASE_TEXT
 from test_stage_ci_routines import load_ci
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -396,7 +397,14 @@ def _sync_registered(monkeypatch, served, **options):
     results = versions.sync_all(SimpleNamespace(), lambda _: foundry, image="new:image", build="new", set_route=True,
                                 sleep=clock.sleep, clock=clock, **options)
     assert [item["state"] for item in results] == ["ok", "ok"]
-    return foundry, R, {target.agent_name: foundry.creates(target.agent_name)[0][2] for target in (A, R)}
+    created = {}
+    for target in (A, R):
+        definition = foundry.creates(target.agent_name)[0][2]
+        # ADR-0009 §3 (c): sync writes the new image's pair next to the image; the checks below are about the rest.
+        environment = dict(definition["environment_variables"])
+        assert environment.pop("FA_SDK_RELEASE") == PINNED_RELEASE_TEXT
+        created[target.agent_name] = {**definition, "environment_variables": environment}
+    return foundry, R, created
 
 
 @pytest.mark.parametrize("served", [V1, V2])

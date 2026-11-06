@@ -368,6 +368,11 @@ def _native_profile(client, *, floor=False):
                       "the selected Hosted version could not be read") from None
     definition = version.definition
     environment = definition.get("environment_variables") if definition is not None else None
+    from .native_deploy_gate import definition_release, release_known
+    if isinstance(environment, dict) and not release_known(definition_release({"environment_variables": environment})):
+        # Guard B: not readable yet (decides nothing), never incompatible: a newer API reads it again
+        raise Problem(503, "NATIVE_BOOTSTRAP_SOURCE_UNAVAILABLE", "the version runs an SDK release this API does not know",
+                      sdk_release_unknown=True)
     if (version.name != client.target.agent_name or version.version != client.target.agent_version
             or definition is None or definition.get("kind") != "hosted" or not isinstance(environment, dict)):
         return None
@@ -381,6 +386,39 @@ def _native_profile(client, *, floor=False):
 def _require_native_version(client):
     if _native_profile(client) not in SUPPORTED_STATE_PROFILES:
         raise Problem(409, "NATIVE_TURNS_DISABLED", "the selected build version must explicitly enable native turns")
+
+
+# ADR-0009 §3 (c) Guard A: the reason a cut gives for a target older than the SID (in place of a target's profile).
+OLDER_SDK_RELEASE = "older-sdk-release"
+
+
+def _release_of(runtime, target, version):
+    """The (sdk, runtime) pair ``version``'s image runs (``HostedVersions.release``); None without a resolver (an
+    offline harness) or when the definition declares none."""
+    from .behavior_agent_versions import _resolver
+    resolver = _resolver(runtime)
+    return None if resolver is None else resolver.release(target, version)
+
+
+def release_unknown(error):
+    """Guard B's refusal: the version's image runs a pair this API cannot decode, so this API must not call it."""
+    return isinstance(error, Problem) and error.body["error"].get("sdk_release_unknown") is True
+
+
+def _older_than_sid(runtime, target, version, row):
+    """Guard A: ``version`` runs an older SDK or runtime than a version ``row``'s current SID ran. That SID's
+    checkpoints were written by the newer runtime, which the older one refuses one conversation at a time (409, each
+    counted as a crash), so the profile alone no longer keeps an Agent off it. An unreadable release raises the
+    resolver's ``Problem``: each caller decides what not knowing means where it stands."""
+    from .native_deploy_gate import release_older
+    if row is None:
+        return False
+    release = _release_of(runtime, target, version)
+    # shortcut: the SID's created, first-drift and current versions, not every version it ran; a third in-place
+    # drift can hide a newer one, upgrade to a high-water pair on the row (a new field) if that ever happens.
+    ran = [_release_of(runtime, target, item) for item in
+           {row.created_agent_version, row.notice_to_version or row.created_agent_version, row.observed.agent_version}]
+    return release is not None and any(item is not None and release_older(release, item) for item in ran)
 
 
 def _latest_version_reader(client, client_id, selected):
@@ -823,8 +861,9 @@ class NativeSessions:
             if claimed_version is None and version not in (None, target.agent_version):
                 try:
                     return self._row_profile(target, version)
-                except Exception:  # the claim falls back as before; the turn end's heal reads again
-                    pass
+                except Exception as error:  # the claim falls back as before; the turn end's heal reads again
+                    if release_unknown(error):
+                        raise  # Guard B: no claim on an image this API cannot decode
             return self._row_profile(target, target.agent_version)
 
         def observing(store):
@@ -838,7 +877,13 @@ class NativeSessions:
                 return row
             # A drift no bound path recorded (a reported version, a legacy-located send): its profile too, as
             # ``_drifted``'s CAS does (one ``get_version``, only when this CAS is about to write).
-            profile = self._version_profile(client, version) if row.hosted_session_id == target.session_id else None
+            try:
+                profile = (self._version_profile(client, version, row) if row.hosted_session_id == target.session_id
+                           else None)
+            except Problem as error:
+                if release_unknown(error):
+                    return row  # Guard B: a newer API records it; this one would send to an image it cannot decode
+                raise
             return store.record_observed(target.agent_id, hosted_session_id=target.session_id,
                                          agent_version=version, source="vm", state_profile=profile)
 
@@ -865,7 +910,7 @@ class NativeSessions:
             try:
                 profile, unread = self._row_profile(client.target, value.hosted_agent_version), False
             except Exception as error:  # only the repair falls back; see the docstring
-                if not repairing:
+                if not repairing or release_unknown(error):  # Guard B: never record or send to that image
                     raise
                 code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
                 logging.getLogger(__name__).warning("NATIVE_BINDING_SWITCH_PROFILE_UNREAD code=%s", code)
@@ -1126,17 +1171,30 @@ class NativeSessions:
         self._keep_row(client, row)
         return row
 
-    def _selected_or_none(self, client, checked_since, stale_read=False):
+    def _selected_or_none(self, client, checked_since, stale_read=False, row=None):
         """The selected version, or None when the selector is unreadable or names a version this API build does not
         serve: with a binding row the send goes on by the row (ADR-0009 §1: the selector only picks the next new
-        session's version), so neither refuses it."""
+        session's version), so neither refuses it. Unless the row's SID runs a release this API build does not know
+        (Guard B): mid-deploy the newer API revision moved the Agent there, and this one cannot decode what that image
+        writes. Read only when the selector does not name the SID's version (that version just passed Guard B)."""
         try:
-            return self._checked_version(client, checked_since, stale_read=stale_read)
+            selected = self._checked_version(client, checked_since, stale_read=stale_read)
         except Problem as error:
             if error.body["error"]["code"] != "AGENT_VERSION_FOLLOWING":
                 raise
             logging.getLogger(__name__).warning("NATIVE_SELECTOR_UNSERVED_BOUND code=%s", error.body["error"]["code"])
-            return None
+            selected = None
+        if row is not None and selected != row.observed.agent_version:
+            from .behavior_agent_versions import _resolver
+            resolver = _resolver(self.composition.runtime)
+            try:
+                if resolver is not None:
+                    resolver.profile(client.target, row.observed.agent_version)
+            except Exception as error:  # an unreadable definition decides nothing: the send goes on by the row
+                if release_unknown(error):
+                    raise Problem(503, "AGENT_VERSION_FOLLOWING", "this Agent's session runs an SDK release this API "
+                                  "build does not know; nothing was sent") from None
+        return selected
 
     def _located(self, client, row, checked_since, *, stale_read=False):
         """(selected version or None, usable) before anything calls the row's SID; this invokes no session.
@@ -1159,14 +1217,14 @@ class NativeSessions:
         ours = checked is not None and checked[:2] == (scope, sid)
         kept = ours and now - checked[2] < METADATA_REUSE_SECONDS
         if kept:
-            selected, live = self._selected_or_none(client, checked_since, stale_read), True
+            selected, live = self._selected_or_none(client, checked_since, stale_read, row), True
         else:
             warm = ours and now - checked[3] < READER_IDLE_SECONDS
             budget = METADATA_BUDGET_SECONDS
             options = {**PLATFORM_NO_RETRY, "connection_timeout": budget, "read_timeout": budget} if warm else {}
             reading = _LOCATE.submit(copy_context().run, _read_platform_session, self._bound_client(client, row),
                                      **options)
-            selected = self._selected_or_none(client, checked_since, stale_read)
+            selected = self._selected_or_none(client, checked_since, stale_read, row)
             try:
                 live = reading.result(timeout=max(0.0, now + budget - monotonic()) if warm else None) is not None
             except _RetiredSession:
@@ -1254,13 +1312,19 @@ class NativeSessions:
         reader._binding_row = written
         return written
 
-    def _version_profile(self, client, version):
+    def _version_profile(self, client, version, row=None):
         """ADR-0009 §3: the profile ``version``'s definition enables (one ``get_version`` read, only on the drift
-        path), ``INCOMPATIBLE_STATE_PROFILE`` when it enables none. None: unreadable, which decides nothing (counted
-        as supported, and the row keeps its profile)."""
+        path), ``INCOMPATIBLE_STATE_PROFILE`` when it enables none or (Guard A) runs an older release than ``row``'s
+        SID did. None: unreadable, which decides nothing (counted as supported, and the row keeps its profile). A Guard B
+        refusal (``release_unknown``) raises: the caller must neither call nor record that version."""
         try:
             profile = _native_profile(client.for_target(_target(client.target, agent_version=version)))
+            if profile in SUPPORTED_STATE_PROFILES and _older_than_sid(
+                    self.composition.runtime, client.target, version, row):
+                profile = INCOMPATIBLE_STATE_PROFILE
         except Exception as error:  # an unreadable definition decides nothing
+            if release_unknown(error):
+                raise
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
             logging.getLogger(__name__).warning("NATIVE_VERSION_PROFILE_UNREAD code=%s version=%s", code, version)
             return None
@@ -1299,7 +1363,15 @@ class NativeSessions:
         if observed is None or observed[0] == reader.target.agent_version:
             return None
         version, source = observed
-        profile = self._version_profile(reader, version)
+        try:
+            profile = self._version_profile(reader, version, row)
+        except Problem as error:
+            if not release_unknown(error):
+                raise
+            # Guard B: the VM woke on an image newer than this API (a deploy in progress): neither call nor record it.
+            logging.getLogger(__name__).warning("NATIVE_DRIFT_RELEASE_UNKNOWN session_id=%s version=%s",
+                                                reader.target.session_id, version)
+            return None
         moved = reader.for_target(_target(reader.target, agent_version=version))
         moved._binding_row, moved._drift_profile = row, profile
         if source == "vm":
@@ -1567,6 +1639,19 @@ class NativeSessions:
             raise
         if actual is None:
             _require_native_version(destination)
+            # ``candidate`` read the row when the caller did not, but ``bound_row`` hides an unsupported one: read it
+            # unfiltered (one Table read, only before a create). A row-less Agent has no history to compare.
+            history = getattr(destination, "_binding_row", None)
+            if history is None:
+                found = self._binding_row(client.target.agent_id)
+                if found is None:  # an unreadable Table is not "no history": Guard A cannot be checked
+                    raise Problem(503, "NATIVE_ENVIRONMENT_UNAVAILABLE", "the binding row is not readable; nothing "
+                                  "was created")
+                history = found[1]
+            if _older_than_sid(self.composition.runtime, client.target, version, history):
+                # Guard A at the one place a SID is created: the new SID would read the Agent's newer checkpoints.
+                raise Problem(409, "NATIVE_TURNS_DISABLED", "the selected version runs an older SDK/runtime release "
+                              "than this Agent's session")
             if destination.target.session_id in self.environment_creates:
                 raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original version session create is unconfirmed")
 
@@ -2505,6 +2590,12 @@ class NativeSessions:
             return "target_unread", error.body["error"]["code"], None
         if profile not in SUPPORTED_STATE_PROFILES:
             return "target_incompatible", profile, None
+        try:
+            older = _older_than_sid(self.composition.runtime, client.target, selected, row)
+        except Problem as error:
+            return "target_unread", error.body["error"]["code"], None
+        if older:
+            return "target_incompatible", OLDER_SDK_RELEASE, None
         if self.idle_upgrade:
             self._record_due(row, selected)  # U0 held: target compatible, compatible source active, not vetoed
             waiting = self._health_wait(row, selected)  # before any destination is created or woken
@@ -3585,9 +3676,16 @@ class NativeSessions:
         resolver = _resolver(self.composition.runtime)
         if resolver is None:
             return row  # an offline harness: ``_row_profile``'s send-profile stand-in is no definition read
+        if row.state_profile == INCOMPATIBLE_STATE_PROFILE and not row.profile_unread:
+            # Written from a definition read of this very version (a definition never changes); Guard A's verdict
+            # needs the SID's earlier versions, which the row no longer names once it drifted again.
+            return row
         version = row.observed.agent_version
         try:
             profile = resolver.profile(client.target, version)
+            if profile in SUPPORTED_STATE_PROFILES and _older_than_sid(
+                    self.composition.runtime, client.target, version, row):
+                profile = INCOMPATIBLE_STATE_PROFILE  # Guard A: a drift onto an older release stays off the SID
         except Exception as error:  # still unreadable: the next attempt reads again
             code = error.body["error"]["code"] if isinstance(error, Problem) else type(error).__name__
             logging.getLogger(__name__).warning("NATIVE_BINDING_PROFILE_UNREAD code=%s version=%s", code, version)

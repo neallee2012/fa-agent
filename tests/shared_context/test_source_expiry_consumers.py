@@ -9,7 +9,7 @@ from shared_context.errors import Problem
 from shared_context.memory_governance import MemoryGovernance
 from shared_context.memory_projection import NativeMemoryProjection
 from shared_context.source_reviews import DurableHumanReviewVerifier
-from test_memory_governance import VERSIONS, candidate, projection
+from test_memory_governance import VERSIONS, candidate
 from test_memory_projection import QUERY, Transport, client, completed, setup
 from test_source_expiry import expiring_service
 from test_source_materials import CONTEXT, code, input_source
@@ -31,10 +31,10 @@ def governance(*, token_counter=len, transitive=False):
     return sources, table, clock, expiry, reviewer, memory, proposed, claim
 
 
-def assemble(memory, proposed, **options):
+def assemble(memory, proposed):
     return memory.assemble(
         CONTEXT, scope=CONTEXT.scope("team"), subject=proposed.subject,
-        required_claim_ids=(proposed.claim_id,), versions=VERSIONS, **options,
+        required_claim_ids=(proposed.claim_id,), versions=VERSIONS,
     )
 
 
@@ -65,7 +65,7 @@ def test_same_authority_review_snapshot_rechecks_source_expiry():
     assert code(expired) == "SOURCE_EXPIRED"
 
 
-@pytest.mark.parametrize("operation", ["current", "context", "claim-plan", "claim-commit", "review", "projection"])
+@pytest.mark.parametrize("operation", ["current", "context", "claim-plan", "claim-commit", "review"])
 def test_expired_source_invalidates_even_a_claim_without_its_own_expiry(operation):
     sources, _, clock, expiry, reviewer, memory, proposed, claim = governance()
     assert proposed.expires_at is None
@@ -77,22 +77,11 @@ def test_expired_source_invalidates_even_a_claim_without_its_own_expiry(operatio
         "claim-plan": lambda: memory.plan_claim(CONTEXT, proposed),
         "claim-commit": lambda: memory.commit_claim(CONTEXT, claim),
         "review": lambda: reviewer.preview(HUMAN, HUMAN_CONTEXT, proposed),
-        "projection": lambda: memory.record_projection(CONTEXT, projection(memory, claim, visibility="team")),
     }
     with pytest.raises(Problem) as expired:
         actions[operation]()
     assert code(expired) == "SOURCE_EXPIRED"
     assert memory.reconcile_claim(CONTEXT, claim).payload["result"]["claim"] == claim.reference.model_dump(mode="json")
-
-
-def test_missing_optional_projection_never_hides_an_expired_necessary_source():
-    _, _, clock, expiry, _, memory, proposed, claim = governance()
-    summary = projection(memory, claim, visibility="team")
-    assert assemble(memory, proposed, projection_id=summary.projection_id).originals
-    clock.value = expiry
-    with pytest.raises(Problem) as expired:
-        assemble(memory, proposed, projection_id=summary.projection_id)
-    assert code(expired) == "SOURCE_EXPIRED"
 
 
 def test_nonexpiring_claim_and_root_cannot_skip_expired_transitive_support():

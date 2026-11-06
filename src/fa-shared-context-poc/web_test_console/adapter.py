@@ -490,6 +490,11 @@ def _check_params(method, path, body, params):
     get_only = method == "GET" and body is None
     if path == "/native-hitl/v1/attention":
         _check_attention_params(get_only, params)
+    elif path == "/native-hitl/v1/allowed":
+        _check_attention_params(get_only and "limit" not in params, params)
+    elif path == "/native-hitl/v1/rules/history":
+        _allow(get_only and set(params) <= {"before", "limit"} and _int_within(params, "limit", 20)
+               and _int_within(params, "before", 2**31 - 1))
     elif path.startswith("/team-skills/v1/"):
         _allow(get_only and path == "/team-skills/v1/reviews" and _only_after_id(params))
     elif _ROUTINE_DEFINITIONS.fullmatch(path):

@@ -2028,6 +2028,103 @@ def test_with_the_idle_flag_a_compatible_idle_source_is_left_and_records_nothing
     _switched_at_only(fixture)  # U8: the switch rebuilt the row with its switch time
 
 
+@pytest.mark.parametrize("idle_upgrade", [False, True])
+def test_a_cut_never_moves_an_agent_onto_an_older_sdk_release(file_api, monkeypatch, idle_upgrade):
+    """ADR-0009 §3 (c) Guard A: the selector moved back to an older SDK image (same profile) leaves the Agent on its
+    SID; a version's release never changes, so every turn end gives the same answer and creates nothing."""
+    fixture = ready(file_api, monkeypatch)
+    sessions(fixture).idle_upgrade = idle_upgrade
+    newer, older = ("1.0.28", "1.0.105"), ("1.0.26", "1.0.103")
+    pairs = {fixture.source.agent_version: newer, fixture.destination.agent_version: older}
+    monkeypatch.setattr(behavior_native_sessions, "_release_of", lambda runtime, target, version: pairs.get(version))
+    before = abandon.row(fixture)
+    for _ in range(2):
+        assert cut(fixture) == ("target_incompatible", behavior_native_sessions.OLDER_SDK_RELEASE, None)
+        assert abandon.row(fixture) == before
+    assert fixture.destination.session_id not in fixture.files.targets
+
+
+def test_a_cut_that_cannot_read_a_release_decides_nothing(file_api, monkeypatch):
+    """Guard A guards an irreversible move: a release read that fails waits for the next turn end."""
+    from shared_context.errors import Problem
+    fixture = ready(file_api, monkeypatch)
+
+    def unreadable(runtime, target, version):
+        raise Problem(503, "AGENT_VERSION_FOLLOWING", "unreadable")
+    monkeypatch.setattr(behavior_native_sessions, "_release_of", unreadable)
+    before = abandon.row(fixture)
+    assert cut(fixture) == ("target_unread", "AGENT_VERSION_FOLLOWING", None)
+    assert abandon.row(fixture) == before and fixture.destination.session_id not in fixture.files.targets
+
+
+def test_a_decided_switch_never_creates_a_sid_on_an_older_sdk_release(file_api, monkeypatch):
+    """Guard A where every new SID is created (``_destination``): the cut carrying out a written §7a decision (the
+    source retired) onto a selector moved back would start an older runtime on the Agent's newer checkpoints."""
+    fixture = ready(file_api, monkeypatch)
+    enforcing(fixture, monkeypatch)
+    del fixture.files.targets[fixture.source.session_id]
+    abandon.store(fixture).decide_abandon(
+        fixture.source.agent_id, hosted_session_id=fixture.source.session_id, basis="retired",
+        source_status="missing", created_agent_version=fixture.source.agent_version)
+    pairs = {fixture.source.agent_version: ("1.0.28", "1.0.105"), fixture.destination.agent_version: ("1.0.26", "1.0.103")}
+    monkeypatch.setattr(behavior_native_sessions, "_release_of", lambda runtime, target, version: pairs.get(version))
+    from shared_context.errors import Problem
+    with pytest.raises(Problem) as refused:  # the cut worker logs the code and the next turn end tries again
+        cut(fixture)
+    assert refused.value.body["error"]["code"] == "NATIVE_TURNS_DISABLED"
+    assert abandon.row(fixture).hosted_session_id == fixture.source.session_id
+    assert fixture.destination.session_id not in fixture.files.targets
+
+
+def test_a_caller_that_passes_no_row_still_gets_guard_a_at_creation(file_api, monkeypatch):
+    """``follow``, ``retarget`` and the legacy locators call ``_destination`` without the row; ``candidate`` reads it."""
+    from shared_context.errors import Problem
+    fixture = ready(file_api, monkeypatch)
+    pairs = {fixture.source.agent_version: ("1.0.28", "1.0.105"), fixture.destination.agent_version: ("1.0.26", "1.0.103")}
+    monkeypatch.setattr(behavior_native_sessions, "_release_of", lambda runtime, target, version: pairs.get(version))
+    client = agent_client(fixture.case.composition, control(fixture))
+    with pytest.raises(Problem) as refused:
+        sessions(fixture)._destination(client, fixture.destination.agent_version, lambda: None, mark=False)
+    assert refused.value.body["error"]["code"] == "NATIVE_TURNS_DISABLED"
+    assert fixture.destination.session_id not in fixture.files.targets
+
+
+def test_an_incompatible_row_still_gets_guard_a_at_creation(file_api, monkeypatch):
+    """Counterexample 2 goes on: the SID drifted onto an older image and the row says incompatible, which
+    ``bound_row`` hides from row-less callers; the new SID must not land on that older release either."""
+    from shared_context import native_binding
+    from shared_context.errors import Problem
+    fixture = ready(file_api, monkeypatch)
+    src, dst = fixture.source.agent_version, fixture.destination.agent_version
+    abandon.store(fixture).record_observed(fixture.source.agent_id, hosted_session_id=fixture.source.session_id,
+                                           agent_version="43", source="vm",
+                                           state_profile=native_binding.INCOMPATIBLE_STATE_PROFILE)
+    pairs = {src: ("1.0.28", "1.0.105"), dst: ("1.0.26", "1.0.103"), "43": ("1.0.26", "1.0.103")}
+    monkeypatch.setattr(behavior_native_sessions, "_release_of", lambda runtime, target, version: pairs.get(version))
+    client = agent_client(fixture.case.composition, control(fixture))
+    with pytest.raises(Problem) as refused:
+        sessions(fixture)._destination(client, dst, lambda: None, mark=False)
+    assert refused.value.body["error"]["code"] == "NATIVE_TURNS_DISABLED"
+    assert not [sid for sid in fixture.files.targets if sid not in {fixture.source.session_id}]
+
+
+def test_a_creation_whose_binding_row_cannot_be_read_creates_nothing(file_api, monkeypatch):
+    """Guard A needs the row's history: an unreadable Table is not a row-less Agent, so no SID is created."""
+    from shared_context import native_binding
+    from shared_context.errors import Problem
+    fixture = ready(file_api, monkeypatch)
+    abandon.store(fixture).record_observed(fixture.source.agent_id, hosted_session_id=fixture.source.session_id,
+                                           agent_version="43", source="vm",
+                                           state_profile=native_binding.INCOMPATIBLE_STATE_PROFILE)
+    run = sessions(fixture)
+    monkeypatch.setattr(run, "_binding_row", lambda agent_id: None)
+    client = agent_client(fixture.case.composition, control(fixture))
+    with pytest.raises(Problem) as refused:
+        run._destination(client, fixture.destination.agent_version, lambda: None, mark=False)
+    assert (refused.value.status, refused.value.body["error"]["code"]) == (503, "NATIVE_ENVIRONMENT_UNAVAILABLE")
+    assert not [sid for sid in fixture.files.targets if sid not in {fixture.source.session_id}]
+
+
 def test_with_the_idle_flag_an_incompatible_target_records_nothing(file_api, monkeypatch):
     fixture = ready(file_api, monkeypatch)
     sessions(fixture).idle_upgrade = True

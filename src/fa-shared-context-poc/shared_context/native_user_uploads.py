@@ -6,6 +6,7 @@ the model then reads it in bounded parts, so a large file never enters the promp
 """
 
 import asyncio
+import base64
 import csv
 import hashlib
 import io
@@ -13,16 +14,19 @@ import itertools
 import logging
 import os
 import posixpath
+import subprocess
+import sys
 import threading
 import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import OrderedDict
 from pathlib import Path
+from typing import NamedTuple
 
 from .behavior_assistant_wire import InstructionSubmit
 from .behavior_user_uploads import (
-    DOCX, MAX_UPLOAD_BYTES, PPTX, TEXT_MEDIA_TYPES, NativeUserUploadPart, UserUpload, upload_path)
+    DOCX, MAX_UPLOAD_BYTES, PPTX, TEXT_MEDIA_TYPES, NativeUserUploadPage, NativeUserUploadPart, UserUpload, upload_path)
 from .errors import Problem
 
 _LOG = logging.getLogger(__name__)
@@ -52,8 +56,30 @@ _RADICALS = {code: unicodedata.normalize("NFKC", chr(code)) for code in range(0x
              if unicodedata.normalize("NFKC", chr(code)) != chr(code)}
 
 
+# A PDF without a text layer is shown page by page as PNGs, at most this many pages, each within the long side the
+# runtime passes on unchanged (behavior_user_images) and a size whose base64 still fits PART_RESERVE_BYTES.
+PDF_PAGE_LIMIT = 10
+PAGE_PNG_BYTES = 300 * 1024
+# pdfium runs only in this child, which caps its own address space on Linux and is killed after PAGE_SECONDS.
+_RENDERER = Path(__file__).with_name("native_pdf_render.py")
+# Child VmPeak on Linux (ADR-0013 §5): 26 MiB after import, 43 MiB a real scan page, 70-115 MiB A3 to A1 600 dpi
+# color scans; review attacks that inflate image decoding 593-1916 MiB. The cap sits between the two.
+# A soft mask over the cap is left out of the page silently; many images together fail the page.
+# shortcut: measured with pypdfium2 added by hand to an earlier local Hosted image, not one built from this code;
+# re-measure on dev if pages come back without their images.
+PAGE_ADDRESS_SPACE = 512 * 1024 * 1024
+PAGE_SECONDS = 30
+_PDFIUM = threading.Lock()  # one child at a time, so their caps never add up
+
+
 class NoText(Exception):
     """A PDF with no text this reader can extract: scanned, encrypted or damaged."""
+
+
+class PdfPages(NamedTuple):
+    """A PDF with no text layer whose pages pdfium can count: its checked bytes and page count."""
+    data: bytes
+    count: int
 
 
 def turn_uploads(command) -> tuple[UserUpload, ...]:
@@ -361,6 +387,87 @@ def readable(upload: UserUpload, data: bytes) -> bytes:
         while len(_TEXTS) > 4:
             _TEXTS.popitem(last=False)
     return text
+
+
+def pdf_pages(data: bytes) -> PdfPages:
+    """The checked bytes and page count of a PDF with no text layer, when pdfium can open it; NoText otherwise."""
+    count = _pdfium(data, 16, "count")  # nothing on a password, damage, the cap or output that is not a count
+    if not (count and count.isdigit() and int(count) > 0):
+        raise NoText
+    return PdfPages(data, int(count))
+
+
+def _pdfium(data: bytes, limit: int, *args) -> bytes | None:
+    """At most `limit` bytes the renderer child prints for `args`; None when it fails, prints more, exceeds its cap
+    or runs out of time."""
+    # Only the PDF on stdin and the page in argv: an exec'd child is dumpable again, so it gets no secrets.
+    env = {name: os.environ[name] for name in ("SYSTEMROOT",) if name in os.environ}  # Windows Python needs it
+    command = [sys.executable, "-I", "-B", str(_RENDERER), str(PAGE_ADDRESS_SPACE), *map(str, args)]
+    failed, err = [], b""
+    try:
+        with _PDFIUM, subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, env=env) as child:
+            def feed():
+                try:
+                    child.stdin.write(data)
+                    child.stdin.close()
+                except OSError:  # the child exited or was killed before reading it all
+                    pass
+
+            def drain():  # read to the end so the child never blocks on stderr, keeping only its tail
+                nonlocal err
+                for chunk in iter(lambda: child.stderr.read1(65536), b""):
+                    err = (err + chunk)[-4096:]
+
+            timer = threading.Timer(PAGE_SECONDS, lambda: (failed.append("TimeoutExpired"), child.kill()))
+            threads = [threading.Thread(target=feed, daemon=True), threading.Thread(target=drain, daemon=True)]
+            try:
+                for thread in (timer, *threads):
+                    thread.start()
+                # The child is untrusted: never hold more than one byte past what is kept.
+                out = child.stdout.read(limit + 1)
+                if len(out) > limit:
+                    failed.append(f"output over {limit} bytes")
+                    child.kill()
+                child.wait()
+            finally:  # also when a thread would not start: the child is never left running
+                timer.cancel()
+                child.kill()
+            for thread in threads:
+                thread.join()
+    except (OSError, subprocess.SubprocessError) as error:
+        _LOG.warning("PDF_RENDER_FAILED %s", type(error).__name__)
+        return None
+    if failed or child.returncode:
+        # The last stderr line names what pypdfium2 or Python raised (MemoryError, PdfiumError); no PDF text.
+        last = err.decode("utf-8", "replace").strip().rsplit("\n", 1)[-1][:200]
+        _LOG.warning("PDF_RENDER_FAILED %s", failed[0] if failed else f"exit={child.returncode} {last}")
+        return None
+    return out
+
+
+def read_page(upload: UserUpload, pages: PdfPages, index: int) -> tuple[NativeUserUploadPage, str | None]:
+    """Page `index` (from 0) as the model reads it: a note, and the page as a base64 PNG unless it cannot be shown."""
+    shown = min(pages.count, PDF_PAGE_LIMIT)
+    if not 0 <= index < shown:
+        raise ValueError("the page is outside the pages shown")
+    png = _pdfium(pages.data, PAGE_PNG_BYTES, "render", index, PAGE_PNG_BYTES) or None
+    if png and not png.startswith(b"\x89PNG\r\n\x1a\n"):  # m2_copilot refuses the whole tool result otherwise
+        _LOG.warning("PDF_RENDER_FAILED output is not a PNG")
+        png = None
+    number = index + 1
+    note = [f"--- 第 {number} 頁（共 {pages.count} 頁）---",
+            "This PDF has no text layer, so this page is attached as an image; read it from the image and do not "
+            "guess what it does not show. Only the latest few page images stay visible to you, so note what you "
+            "need from this page before reading the next."]
+    if png is None:
+        note.append(f"This page could not be shown as an image; tell the user page {number} was not read.")
+    if pages.count > shown:
+        note.append(f"Only the first {shown} of its {pages.count} pages are shown; tell the user pages "
+                    f"{shown + 1}-{pages.count} were not read.")
+    return (NativeUserUploadPage(name=upload.name, sha256=upload.sha256, page=number, page_count=pages.count,
+                                 next_offset=number if number < shown else None, text="\n".join(note)),
+            None if png is None else base64.b64encode(png).decode("ascii"))
 
 
 async def check_user_uploads(command) -> None:

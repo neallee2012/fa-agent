@@ -8,6 +8,7 @@ from .behavior_api import _body, _log_request_failure, _principal_dependency, _r
 from .behavior_team_registry import resolve_agent_scope
 from .errors import Problem
 from .native_hitl import NativeHitlService
+from .native_hitl_allowed import read_team_allowed
 from .native_hitl_attention import owner_origin_reader, read_team_attention
 from .native_hitl_wire import (
     NATIVE_HITL_ERRORS, NativeHitlClose, NativeHitlDecision, NativeHitlPendingCreate, NativeHitlRuleChange,
@@ -15,6 +16,7 @@ from .native_hitl_wire import (
     hitl_settings, NativeHitlAnswer, NativeHitlQuestionCreate, ConnectorConsentCreate, ConnectorConsentDecision,
     NATIVE_HITL_BODY_BYTES, NATIVE_HITL_HTTP_BYTES,
 )
+from .native_hitl_audit_wire import MAX_RULE_HISTORY_PAGE
 from .native_routine_wire import NATIVE_ROUTINE_ERRORS
 from .records import Record
 
@@ -114,6 +116,24 @@ def install_native_hitl_routes(app, composition, *, environ=None):
         service._authorize(principal)
         await no_body(request)
         return await reply(request, lambda: service.rules(principal))
+
+    @router.get(PREFIX + "/allowed")
+    async def allowed(
+        request: Request, since: str | None = Query(None, max_length=64),
+        cursor: str | None = Query(None, max_length=4096), principal=Depends(identity),
+    ):
+        service._authorize(principal, owner=True)
+        await no_body(request, queries=("since", "cursor"))
+        return await reply(request, lambda: read_team_allowed(service, principal, since=since, cursor=cursor))
+
+    @router.get(PREFIX + "/rules/history")
+    async def rule_history(
+        request: Request, before: int | None = Query(None, ge=1, le=2**31 - 1),
+        limit: int = Query(MAX_RULE_HISTORY_PAGE, ge=1, le=MAX_RULE_HISTORY_PAGE), principal=Depends(identity),
+    ):
+        service._authorize(principal, owner=True)
+        await no_body(request, queries=("before", "limit"))
+        return await reply(request, lambda: service.rule_history(principal, before=before, limit=limit))
 
     @router.get(PREFIX + "/pending/{pending_id}")
     async def pending(request: Request, pending_id: str, principal=Depends(identity)):

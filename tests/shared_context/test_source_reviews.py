@@ -17,7 +17,7 @@ from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_operations import control_key
 from shared_context.behavior_store import BehaviorStore
 from shared_context.errors import Problem
-from shared_context.memory_governance import MemoryGovernance, ProjectionInput
+from shared_context.memory_governance import MemoryGovernance
 from shared_context.source_materials import (
     AuthenticatedSourceContext, SourceMaterials, SourceWithdrawalInput, canonical,
 )
@@ -39,8 +39,7 @@ def reviews(source_service):
     sources, table = source_service
     source, _ = admitted(sources, b"The dashboard preference is cobalt.\r\n")
     verifier = DurableHumanReviewVerifier(sources, POLICY, clock=lambda: NOW)
-    memory = MemoryGovernance(sources, clock=lambda: NOW, token_counter=len, review_verifier=verifier,
-                              projection_verifier=lambda *_: None)
+    memory = MemoryGovernance(sources, clock=lambda: NOW, token_counter=len, review_verifier=verifier)
     proposed = candidate(source.reference, visibility="team")
     return sources, table, source, verifier, memory, proposed
 
@@ -65,9 +64,9 @@ def current(memory, proposed):
                               claim_id=proposed.claim_id)
 
 
-def assembled(memory, proposed, projection_id=None):
+def assembled(memory, proposed):
     return memory.assemble(CONTEXT, scope=CONTEXT.scope("team"), subject=proposed.subject,
-                           required_claim_ids=(proposed.claim_id,), versions=VERSIONS, projection_id=projection_id)
+                           required_claim_ids=(proposed.claim_id,), versions=VERSIONS)
 
 
 def claimed(verifier, memory, proposed):
@@ -75,14 +74,6 @@ def claimed(verifier, memory, proposed):
     plan = memory.plan_claim(CONTEXT, proposed)
     memory.commit_claim(CONTEXT, plan)
     return plan
-
-
-def projected(plan):
-    return ProjectionInput(
-        projection_id="projection-one", subject=plan.candidate.subject, visibility="team", covered_sequence=1,
-        claims=(plan.reference,), sources=plan.candidate.supporting, projector_version="projector-v1",
-        model_version="offline", schema_id="schema-v1", text="Dashboard preference is cobalt.",
-    )
 
 
 def withdrawal(source, *, withdrawal_id="withdraw-one"):
@@ -259,7 +250,6 @@ def test_policy_change_and_new_source_version_invalidate_current_reviewed_claims
 def test_human_revocation_is_durable_and_blocks_claims_before_head_projection_catches_up(reviews):
     sources, table, _, verifier, memory, proposed = reviews
     plan = claimed(verifier, memory, proposed)
-    memory.record_projection(CONTEXT, projected(plan))
     revoke = verifier.plan_decision(HUMAN, HUMAN_CONTEXT, decision(
         verifier, proposed, decision="revoke", review_id="human-revoke", reason="Consent withdrawn"))
     receipt = verifier.commit_decision(HUMAN, HUMAN_CONTEXT, revoke)
@@ -268,8 +258,7 @@ def test_human_revocation_is_durable_and_blocks_claims_before_head_projection_ca
     assert len(table.submissions) == count
     state_key = control_key("memory-subject", plan.reference.scope.key, proposed.subject)
     assert sources.store.read_snapshot((state_key,))[state_key].payload["data"]["heads"][0]["status"] == "active"
-    for action in (lambda: current(memory, proposed), lambda: assembled(memory, proposed, "projection-one"),
-                   lambda: memory.record_projection(CONTEXT, projected(plan))):
+    for action in (lambda: current(memory, proposed), lambda: assembled(memory, proposed)):
         with pytest.raises(Problem) as denied:
             action()
         assert code(denied) == "HUMAN_REVIEW_REVOKED"
@@ -309,26 +298,6 @@ def test_unknown_human_revocation_blocks_use_and_reconciles_without_resending(re
     assert len(table.submissions) == count
 
 
-def test_revocation_before_projection_transaction_is_rechecked_in_shared_snapshot(reviews):
-    sources, _, _, verifier, memory, proposed = reviews
-    plan = claimed(verifier, memory, proposed)
-    revoke = verifier.plan_decision(HUMAN, HUMAN_CONTEXT, decision(
-        verifier, proposed, decision="revoke", review_id="revoke-race"))
-    done = False
-    def count(data):
-        nonlocal done
-        if not done:
-            done = True
-            verifier.commit_decision(HUMAN, HUMAN_CONTEXT, revoke)
-        return len(data)
-    memory._count = count
-    with pytest.raises(Problem) as denied:
-        memory.record_projection(CONTEXT, projected(plan))
-    assert code(denied) == "HUMAN_REVIEW_REVOKED"
-    key = control_key("memory-projection", plan.reference.scope.key, proposed.subject, "projection-one")
-    assert sources.store.read_snapshot((key,))[key] is None
-
-
 def test_revocation_during_context_assembly_does_not_return_stale_facts(reviews):
     _, _, _, verifier, memory, proposed = reviews
     claimed(verifier, memory, proposed)
@@ -359,10 +328,9 @@ def test_guard_race_between_review_and_source_withdrawal_has_no_partial_approval
     assert sources.store.read_snapshot((key,))[key] is None
 
 
-def test_withdrawal_invalidates_old_versions_claims_projections_and_snapshot_restore(reviews):
+def test_withdrawal_invalidates_old_versions_claims_and_snapshot_restore(reviews):
     sources, table, source, verifier, memory, proposed = reviews
-    plan = claimed(verifier, memory, proposed)
-    memory.record_projection(CONTEXT, projected(plan))
+    claimed(verifier, memory, proposed)
     snapshot = sources.capture_snapshot(CONTEXT, snapshot_id="snapshot-one", scope=source.reference.scope,
                                         conversation_id="conversation-one", runtime_version="runtime-one",
                                         roots=(source.reference,))
@@ -377,8 +345,7 @@ def test_withdrawal_invalidates_old_versions_claims_projections_and_snapshot_res
         lambda: sources.read_exact(CONTEXT, source.reference),
         lambda: sources.read_exact(CONTEXT, source.reference, require_current=True),
         lambda: current(memory, proposed),
-        lambda: assembled(memory, proposed, "projection-one"),
-        lambda: memory.record_projection(CONTEXT, projected(plan)),
+        lambda: assembled(memory, proposed),
         lambda: sources.restore_snapshot(CONTEXT, scope=source.reference.scope,
                                           snapshot_id="snapshot-one", receipt=snapshot),
         lambda: admitted(sources, b"attempted reactivation", version=2),

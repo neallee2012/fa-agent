@@ -5,6 +5,7 @@ from functools import partial
 from pydantic import TypeAdapter
 
 from shared_context.behavior_wire import Digest
+from shared_context.native_hitl_audit_wire import NativeHitlAllowedPage, NativeHitlRuleHistoryPage
 from shared_context.native_hitl_wire import (
     MAX_RULES, NATIVE_HITL_ERRORS, NATIVE_HITL_HTTP_BYTES, NATIVE_HITL_PREFIX,
     NativeHitlControlReceipt, NativeHitlDecision, NativeHitlRuleChange, NativeHitlRules,
@@ -122,6 +123,26 @@ class NativeHitlControl:
             except ValueError:
                 raise ConsoleError("NATIVE_HITL_INVALID_REQUEST", 400) from None
         value = self.adapter.read("/attention", NativeHitlTeamAttentionPage, token, params=params)
+        self.native._current(token)
+        require(value.team_id == self.team_id, "NATIVE_HITL_SCOPE_DENIED", 403)
+        return value.model_dump(mode="json")
+
+    def team_allowed(self, cursor=None):
+        from shared_context.native_hitl_wire import AttentionCursor
+        token = self.token(None)
+        try:
+            params = {} if cursor is None else {"cursor": TypeAdapter(AttentionCursor).validate_python(cursor, strict=True)}
+        except ValueError:
+            raise ConsoleError("NATIVE_HITL_INVALID_REQUEST", 400) from None
+        value = self.adapter.read("/allowed", NativeHitlAllowedPage, token, params=params)
+        self.native._current(token)
+        require(value.team_id == self.team_id, "NATIVE_HITL_SCOPE_DENIED", 403)
+        return value.model_dump(mode="json")
+
+    def rule_history(self, before=None):
+        token = self.token(None)
+        value = self.adapter.read("/rules/history", NativeHitlRuleHistoryPage, token,
+                                  params={} if before is None else {"before": before})
         self.native._current(token)
         require(value.team_id == self.team_id, "NATIVE_HITL_SCOPE_DENIED", 403)
         return value.model_dump(mode="json")
@@ -414,6 +435,30 @@ def install_hitl_routes(app, requested_console):
         async for chunk in request.stream():
             require(not chunk, "LOCAL_REQUEST_DENIED", 403)
         return await run_in_threadpool(control(console).team_attention, request.query_params.get("cursor"))
+
+    @app.get("/api/native-hitl/team/rules")
+    async def team_rules(request: Request, console=Depends(requested_console)):
+        await body(request, read=True)
+        return await run_in_threadpool(control(console).rules, None)
+
+    @app.get("/api/native-hitl/team/allowed")
+    async def team_allowed(request: Request, console=Depends(requested_console)):
+        require(set(request.query_params) <= {"cursor"}
+                and len(request.query_params.getlist("cursor")) <= 1, "LOCAL_REQUEST_DENIED", 403)
+        async for chunk in request.stream():
+            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
+        return await run_in_threadpool(control(console).team_allowed, request.query_params.get("cursor"))
+
+    @app.get("/api/native-hitl/team/rule-history")
+    async def team_rule_history(request: Request, console=Depends(requested_console)):
+        require(set(request.query_params) <= {"before"}
+                and len(request.query_params.getlist("before")) <= 1, "LOCAL_REQUEST_DENIED", 403)
+        async for chunk in request.stream():
+            require(not chunk, "LOCAL_REQUEST_DENIED", 403)
+        before = request.query_params.get("before")
+        require(before is None or len(before) <= 10 and before.isascii() and before.isdecimal() and 1 <= int(before) <= 2**31 - 1,
+                "NATIVE_HITL_INVALID_REQUEST", 400)
+        return await run_in_threadpool(control(console).rule_history, None if before is None else int(before))
 
     @app.get("/api/native-hitl/team/pending/{pending_id}")
     async def team_pending(pending_id: str, request: Request, console=Depends(requested_console)):

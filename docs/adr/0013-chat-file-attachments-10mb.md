@@ -1,6 +1,6 @@
 # 聊天附件：使用者傳給助理不超過 10 MB 的檔案
 
-狀態：accepted（切片 1 文字檔、切片 2 圖片、切片 3 PDF 已合併並在 dev 驗證，PDF 抽不出文字的說明另由 #1195 修正；切片 4 Office 實作中，未部署）｜決策日期：2026-11-04（+08）。
+狀態：accepted（切片 1 文字檔、切片 2 圖片、切片 3 PDF 已合併並在 dev 驗證，PDF 抽不出文字的說明另由 #1195 修正；切片 4 Office 實作中，未部署；沒有文字層的 PDF 改給頁面圖片 2026-11-05 實作中，未部署）｜決策日期：2026-11-04（+08）。
 
 本 ADR 只決定做法與切片順序，不授權部署、新雲端資源、新 IAM 或支出。
 
@@ -174,13 +174,55 @@ Files 呼叫會把閒置的 session 叫醒，而且可能綁到另一個版本�
   - pptx 照 `ppt/presentation.xml` 的 `sldIdLst` 順序讀投影片（重新排序後檔名編號不一定對），每張標 `--- 第 N 張投影片 ---`。備忘稿不讀。
   - 某張工作表或投影片壞掉時，標「（工作表 X 無法抽取文字）」，其他照讀；PDF 的壞頁同樣改成「（第 N 頁無法抽取文字）」。整份打不開（不是 zip、缺主要部分）時就是抽不出文字。只記錯誤類別（`OFFICE_TEXT_UNREADABLE`、`OFFICE_PARTS_UNREADABLE`）。
   - 有密碼的 Office 檔是 OLE2 容器，不是 zip，所以當成抽不出文字。舊版 doc／xls／ppt 不支援，文案請使用者先另存新格式。
+- **沒有文字層的 PDF 改給頁面圖片（2026-11-05，Neal「go」；CODE/offline，dev 未驗）：**
+  - 起因：Neal 用 Microsoft Print to PDF 印出的 Outlook 郵件，3 頁、沒有字型，抽出 0 字，助理只能說讀不到。
+  - 什麼時候改給圖片：整份 PDF 每一頁都抽不出字（和原本 `USER_FILE_NO_TEXT` 的條件相同），**而且**這個對話的模型宣告能讀圖（`supports_image_input`）。有任何一頁有字的 PDF 照舊走文字，行為不變。模型不能讀圖時，照舊回 `USER_FILE_NO_TEXT`。
+  - 不另開圖片路徑：沿用截圖工具的同一條路，工具結果帶一張 PNG（SDK 的 `binary_results_for_llm`），經同一個模型 gateway 的 PNG 規則、最近 3 張保留與 6 MiB 請求上限。能收附檔、模型又能讀圖的對話，回合一開始就開 vision（runtime 不會等到讀檔才補開；前面回合的附件也能重讀，所以不能只看這回合有沒有 PDF）。只因為這項才開 vision 的對話，gateway 只放行這回合讀出的頁面圖片，其他圖片（例如 Playwright 等 MCP 截圖、舊回合的圖）照舊換成文字，所以沒讀 PDF 的對話送給模型的內容和以前一樣，只差請求上限從 4 MiB 變 6 MiB。
+  - 上線時的一次性影響：vision 是常駐 SDK session digest 的一部分，所以上線後每個能收附檔、模型能讀圖的對話，下一個回合會換一次常駐 session（記一筆 `RESIDENT_SDK_RESTARTED`），之後不再換。
+  - 只在助理讀這份附件時才算圖：一次 `read_user_file` 回一頁，`next_offset` 是下一頁（從 0 起算），和文字分段用同一個欄位。結果是新的 `NativeUserUploadPage`（頁碼、總頁數、說明文字），列進模型邊界的檢查。
+  - 預設值（Neal 可改）：
+    - 最多給前 10 頁。超過時，每頁的說明都寫「只給前 10 頁，請告訴使用者第 11 到 N 頁沒讀」。
+    - 每頁長邊 1600 px（小於 runtime 會重新編碼的 2000 px），先彩色；PNG 超過 300 KiB 就改灰階，再超過就改長邊 1000 px 灰階，再改 768 px 灰階；灰階一律降成 16 階（掃描雜訊讓不分 filter 的 PNG 壓不下來；本機用合成的 150 dpi 雜訊掃描頁量，1600 px 灰階從 1275 KiB 降到 247 KiB）。都超過時那頁不給圖，說明寫「請告訴使用者第 N 頁沒讀」。300 KiB 轉成 base64 約 400 KiB，放得進每次讀檔原本預留的 512 KiB，所以存檔預留不變。
+    - pdfium 只在子程序裡跑（`native_pdf_render.py`，數頁數和算圖都是），一次一個。
+      - **機制：** 做法比照截圖縮圖呼叫 ImageMagick（最小環境、同一個 UID 10001），但用 `subprocess.Popen` 自己讀輸出。
+        - 子程序只從 stdin 拿 PDF bytes、從 argv 拿頁碼，不繼承環境變數。
+        - 在 Linux 先自己設 `RLIMIT_AS`（位址空間，不是 RSS）再載入 pypdfium2。超過 30 秒由父程序殺掉；父程序中途出例外（例如開不了執行緒）也一定殺掉子程序。
+        - stdout 只讀到 300 KiB 多一個 byte（數頁數 16 bytes），超過就殺掉子程序。stderr 讀到底，但只留最後 4 KiB，log 只記最後一行的前 200 字。
+        - 算圖結果不是 PNG 開頭，那頁不給圖；數頁數輸出不是數字，整份回 `USER_FILE_NO_TEXT`。
+        - 子程序失敗、被殺、`MemoryError` 或逾時，那頁不給圖：說明照舊請模型告訴使用者那頁沒讀，log 記 `PDF_RENDER_FAILED`。數頁數失敗整份回 `USER_FILE_NO_TEXT`。
+        - 改灰階重畫時畫進灰階 bitmap（`FPDFBitmap_Gray`），不開 pdfium 的灰階模式（`FPDF_GRAYSCALE`）。那個模式會把整張圖一次解開；畫進灰階 bitmap 和彩色一樣逐行讀圖。
+      - **原因：** 審查實測 pdfium 會把 soft mask 整張解開（1×1 圖掛 24000² 的 soft mask，547 KiB 的檔案吃到約 657 MiB），一頁 40 張 7000² 的 Flate 圖吃到約 1.9 GiB。
+        - 先前改用另一個解析器（pypdf）在算圖前估算像素，五輪審查累積 7 個繞過：soft mask 不列成頁面物件、共用 mask、自稱 `/Type /Page` 的字典、資源取名 `/P`／`/Parent`、`/Resources` 指向頁面、兩邊認頁方式不同、自我參照讓走訪爆量。
+        - pypdf 和 pdfium 對同一份 bytes 解析不同（例如損壞的 xref），這一類無法用靜態檢查關掉，所以改成在算圖當下限制。
+      - **實測數字（2026-11-05，本機 Linux 容器 x86_64，子程序 VmPeak）：**
+        - 第一輪在 `python:3.11.14-slim-bookworm`，只裝 pypdfium2 5.14.0。載入 pypdfium2 後 26 MiB。Neal 那份 3 頁每頁約 43 MiB，上限下 3 頁都畫得出來，PNG 與不設上限時逐 byte 相同，每頁約 0.2 秒。
+        - 同一輪程式產生的整頁掃描（當時灰階重畫用 `FPDF_GRAYSCALE`）：A4 600 dpi 彩色 151 MiB、A4 1200 dpi 灰階 215 MiB、A3 600 dpi 彩色 261 MiB。256 MiB 時 A3 那頁的圖已經不見。
+        - 審查用過、會把解圖記憶體撐大的攻擊檔，不設上限時 593～1916 MiB。其餘結構類攻擊檔本來就在 153 MiB 以下，或 pdfium 直接拒載。
+        - 第二輪在本機較早建的 Hosted image（`fa-behavior-assistant-desktop`，手動裝同一個 pypdfium2 wheel），改成灰階 bitmap 之後：A3 600 dpi 彩色 70 MiB、A2 600 dpi 彩色 84 MiB。一頁 A1 600 dpi 彩色掃描（14034×19866，解開約 800 MiB，色塊多到要改灰階）115 MiB、約 4 秒，畫得出來；改之前灰階那次要 908 MiB，上限下回一張空白頁。Neal 那份 3 頁的 PNG 和第一輪逐 byte 相同。JPX 的 A3 600 dpi 彩色 143 MiB、JPEG 的 A1 600 dpi 彩色 127 MiB，都畫得出來。
+        - 512 MiB 介於正常頁的峰值和這類攻擊檔最小的峰值之間。
+      - **超過上限時的兩種結果**（兩種父程序記憶體都沒有增加；只在 Linux 跑的測試照這兩種寫）：
+        - soft mask 解不開時，pdfium 略過它、照樣回一張缺 mask 的頁面，**模型不會被告知**（審查的攻擊檔大多是這種）。pypdfium2 查不到 soft mask 的大小，pdfium 也不回報略過，所以偵測不到。
+        - 多張圖合計超過（例如一頁 40 張 7000²）時子程序 `MemoryError`，那頁不給圖。
+      - **殘留：**
+        - 量測不是在這份程式建好的 Hosted image 上做的，dev 上若看到缺圖的頁就重量。
+        - Windows 沒有 `rlimit`，本機子程序不設上限，本機測試綠不代表上限有效。
+        - 上限內的大圖照樣會畫；每頁多一次 Python 啟動（本機 Windows 約 0.3 秒）。
+        - 頁面一次畫一頁，平行讀檔要排隊；取消停不了正在畫的那頁，最多等到逾時。
+        - JBIG2 圖片沒測過。
+    - 頁面圖片和截圖一樣永久留在對話存檔。讀完 10 頁最多約 4 MiB（上限 8 MiB），所以同一份整讀約兩次就會滿，之後這個對話再讀檔或截圖會收到 `FILE_STATE_FULL_FEEDBACK`。不另做重讀快取；說明已請模型讀下一頁前先記下這頁內容。Neal 那份實測 3 頁各 1132×1600、PNG 76～121 KB，每頁約 0.15 秒（本機 Windows，16 階灰階後重量：74～118 KiB、0.11～0.15 秒；改成子程序後 74～118 KiB、每頁約 0.45 秒）。
+    - 模型只看得到最近 3 張圖，所以說明請模型讀下一頁前先記下這頁要用的內容。要一次看更多頁，得放寬 gateway 的保留張數與請求上限，另案決定。
+  - 加密要密碼或損壞、pdfium 也打不開的 PDF，照舊回 `USER_FILE_NO_TEXT`；某一頁畫不出來時那頁不給圖，其他頁照給。
+  - PNG 用標準庫 `zlib` 在子程序裡自己編，不加 Pillow 或 numpy。
+  - 頁面圖片是使用者自己的附件，不當成 `deliver_image` 可送出的「最新截圖」；用圖片內容辨認，不靠 tool call id，所以委派子代理讀的頁也一樣。
+  - 讀滿 3 頁後，使用者這回合自己附的圖片也可能被擠出模型看得到的範圍（gateway 只保留最近 3 張）。
+  - 費用：每頁是一張送給模型的圖片輸入，之後同一回合的每次模型呼叫都會再帶最近 3 張。實際每頁 token 與讀圖品質要在 dev 用真模型量。
 
 ### 6. 抽文字放在 Hosted，API 保持輕
 
 | 類型 | 做法 | 相依 |
 |---|---|---|
 | 文字檔 | 嚴格 UTF-8 解碼，拒絕 NUL | 無 |
-| PDF | `pypdf` 抽文字層 | 只加進 `requirements-hosted.txt`。pypdf 是純 Python，在 Python 3.11 上沒有必要相依。固定 `pypdf==6.21.4`（PyPI 2026-10-28） |
+| PDF | `pypdf` 抽文字層；沒有文字層時用 `pypdfium2` 畫成頁面圖片 | 只加進 `requirements-hosted.txt`。pypdf 是純 Python，在 Python 3.11 上沒有必要相依。固定 `pypdf==6.21.4`（PyPI 2026-10-28）。`pypdfium2==5.14.0`（[PyPI](https://pypi.org/project/pypdfium2/5.14.0/) 2026-10-04，BSD-3-Clause／Apache-2.0，沒有必要相依，有 manylinux x86_64 wheel；PyMuPDF 是 AGPL，不用） |
 | docx／xlsx／pptx | 標準庫 `zipfile`＋`xml.etree.ElementTree`，讀 `word/document.xml`、`xl/sharedStrings.xml`＋活頁簿列出的工作表、簡報列出的投影片的文字節點 | 無新相依 |
 
 - **XML 安全：** OOXML 不用 DTD，所以任何部分出現 `<!DOCTYPE`（UTF-8 或 UTF-16）就當損壞，任何實體都不展開。
@@ -224,7 +266,7 @@ Files 呼叫會把閒置的 session 叫醒，而且可能綁到另一個版本�
 |---|---|
 | `USER_FILE_TOO_LARGE` | 檔案超過 10 MB，沒有加入。請分割或壓縮後再試。 |
 | `USER_FILE_TYPE_UNSUPPORTED` | 目前支援 txt／md／csv／json／pdf／docx／xlsx／pptx（舊版 doc／xls／ppt 請先另存新格式）。這份沒有加入。 |
-| PDF 抽不出文字（給模型的 `USER_FILE_NO_TEXT` 固定說明，不是畫面代碼） | 助理會說明這份 PDF 讀不到文字（可能是掃描檔、加密或損壞），不會猜內容。 |
+| PDF 抽不出文字（給模型的 `USER_FILE_NO_TEXT` 固定說明，不是畫面代碼） | 助理會說明這份 PDF 讀不到文字（可能是掃描檔、加密或損壞），不會猜內容。2026-11-05 起，模型能讀圖時，沒有文字層的 PDF 改給頁面圖片，只剩加密、損壞或模型不能讀圖時才有這句。 |
 | 之後的回合附件已不在（給模型的 `USER_FILE_GONE` 固定說明，不是畫面代碼） | 助理會說附件已不在，請重新附加。 |
 | `USER_FILE_INPUT_INVALID` | 沿用：文字檔要是 UTF-8、檔名不能是路徑或網址，每則訊息最多 4 份且不重名。 |
 | `USER_FILE_UPLOAD_UNKNOWN` | 上傳結果不確定。再傳一次同一個檔案是安全的，不會變成兩份。 |
@@ -243,7 +285,7 @@ Files 呼叫會把閒置的 session 叫醒，而且可能綁到另一個版本�
 - Teams relay 的附件。
 - 從歷史畫面下載原檔。
 - 附件總量上限與清理。
-- 掃描 PDF 的 OCR。
+- 掃描 PDF 的 OCR（2026-11-05 起改給模型頁面圖片，見第 5 節，仍不做 OCR 文字層）。
 - PDF 與 Office 內嵌圖片。
 - 舊 Table lane 的支援（帶 `uploads` 的指令在舊 lane 會回 422，不會默默丟掉）。
 
