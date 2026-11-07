@@ -188,6 +188,38 @@ def test_an_unconfirmed_open_is_unknown_and_closes_its_client(monkeypatch, error
     assert len(closed) == 2
 
 
+class _UnknownSubclass(ServiceRequestError):
+    pass
+
+
+@pytest.mark.parametrize(("stage", "error", "logged"), [
+    ("get", ServiceRequestError("CANARY https://canary.example/fa/v1/conv/cid-1"), "ServiceRequestError status=-"),
+    ("get", FoundryStorageApiError("CANARY https://canary.example", status_code=503), "FoundryStorageApiError status=503"),
+    ("get", ClientAuthenticationError("CANARY token"), "ClientAuthenticationError status=-"),
+    ("get", OSError("CANARY"), "OSError status=-"),
+    ("get", _UnknownSubclass("CANARY"), "ServiceRequestError status=-"),
+    ("get", ConnectionResetError("CANARY"), "ConnectionResetError status=-"),
+    ("get_or_create", ServiceResponseError("CANARY"), "ServiceResponseError status=-"),
+], ids=lambda value: value if isinstance(value, str) else type(value).__name__)
+def test_an_unconfirmed_open_logs_an_exportable_class_and_no_message_url_or_store_name(monkeypatch, caplog, stage,
+                                                                                       error, logged):
+    from shared_context import sdk_telemetry
+
+    async def unreachable(*_args, **_kwargs):
+        raise error
+
+    run(opened())
+    monkeypatch.setattr(FoundryStateStore, "get_or_create" if stage == "get_or_create" else "get",
+                        classmethod(unreachable) if stage == "get_or_create" else unreachable)
+    with caplog.at_level(logging.WARNING, logger="shared_context.native_checkpoint"):
+        assert problem(native.open_durable_store(STORE, create=stage == "get_or_create")) == (
+            503, "NATIVE_STATE_STORE_UNKNOWN")
+    [record] = [item for item in caplog.records if item.name == "shared_context.native_checkpoint"]
+    assert record.getMessage() == f"NATIVE_STATE_STORE_UNKNOWN stage={stage} exception_type={logged}"
+    assert record.name in sdk_telemetry.LOG_LOGGERS and sdk_telemetry._exportable(record)
+    assert "CANARY" not in caplog.text and "cid-1" not in caplog.text and STORE not in caplog.text
+
+
 def test_a_matching_hot_copy_saves_store_reads_but_never_replaces_verification(tmp_path):
     cache = tmp_path / "home" / "native-checkpoints"
     store = run(opened())

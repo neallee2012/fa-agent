@@ -552,6 +552,17 @@ def test_hosted_log_export_sends_only_the_listed_prefixes_of_the_listed_loggers(
                         "NATIVE_CAPABILITY_UNKNOWN", "deadline;call_id=absent")
         toolbox.warning("FA_NATIVE_TOOL_SOURCE_UNAVAILABLE agent_id=%s", LOG_CANARY)  # names the Agent and the turn
         toolbox.warning("NATIVE_TOOLBOX_CALL_FAILED agent_id=%s", LOG_CANARY)  # the prefix ends with its space
+        hitl = logging.getLogger("shared_context.native_hitl_runtime")
+        hitl.warning("NATIVE_HITL_REVIEW_INVALID reason=%s terminal=%s incomplete=%s",
+                     "no_completed_output", "response.incomplete", "max_output_tokens")
+        hitl.warning("NATIVE_HITL_REVIEW_UNAVAILABLE exception_type=%s", "ConnectError")
+        hitl.warning("NATIVE_HITL_AUTHORITY_FAILURE %s", json.dumps({"operation": "rules_read", "status": 503}))
+        hitl.warning("NATIVE_HITL_REVIEW_REASONS_DROPPED problem=%s", "ids")
+        hitl.warning("NATIVE_HITL_REFUSED code=%s", LOG_CANARY)  # same logger, an unlisted line
+        checkpoint = logging.getLogger("shared_context.native_checkpoint")
+        checkpoint.warning("NATIVE_STATE_STORE_UNKNOWN stage=%s exception_type=%s status=%s",
+                           "get", "ServiceRequestError", "-")
+        checkpoint.warning("FA_NATIVE_CHECKPOINT_CACHE status=write_failed %s", LOG_CANARY)  # same logger, unlisted
         assert provider.force_flush(10000)
     finally:
         provider and provider.shutdown()
@@ -561,7 +572,7 @@ def test_hosted_log_export_sends_only_the_listed_prefixes_of_the_listed_loggers(
 
     logs = [item for item in telemetry.items if item["data"]["baseType"] == "MessageData"]
     messages = [item["data"]["baseData"]["message"] for item in logs]
-    assert len(messages) == 14, messages
+    assert len(messages) == 19, messages
     timing = json.loads(messages[0].removeprefix("FA_TIMING "))
     assert (timing["phase"], timing["job_id"], timing["outcome"]) == ("sdk_process_start", "0123456789ab", "returned")
     assert messages[1:] == [
@@ -580,7 +591,13 @@ def test_hosted_log_export_sends_only_the_listed_prefixes_of_the_listed_loggers(
         "FA_PRIVATE_MEMORY_USAGE_UNREPORTED rid_prefix=0123abcd reason=no_reporter",
         "FA_TEAM_MEMORY_INACTIVE reason=store_unavailable",
         "NATIVE_TOOLBOX_FAILED method=tools/list stage=request code=NATIVE_CAPABILITY_UNKNOWN "
-        "reason=deadline;call_id=absent"]
+        "reason=deadline;call_id=absent",
+        "NATIVE_HITL_REVIEW_INVALID reason=no_completed_output terminal=response.incomplete "
+        "incomplete=max_output_tokens",
+        "NATIVE_HITL_REVIEW_UNAVAILABLE exception_type=ConnectError",
+        'NATIVE_HITL_AUTHORITY_FAILURE {"operation": "rules_read", "status": 503}',
+        "NATIVE_HITL_REVIEW_REASONS_DROPPED problem=ids",
+        "NATIVE_STATE_STORE_UNKNOWN stage=get exception_type=ServiceRequestError status=-"]
     assert {item["tags"]["ai.cloud.role"] for item in logs} == {"fa-test-agent"}
     assert LOG_CANARY not in json.dumps(telemetry.items)
 

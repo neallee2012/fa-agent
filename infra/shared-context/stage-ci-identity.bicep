@@ -2,7 +2,8 @@ targetScope = 'resourceGroup'
 
 // GitHub Actions deploy identity for staging (ADR-0008, #415 W11). OIDC only; no client secret.
 // Least privilege: push stage images, update the stage API app and sync job, read the stage RG and its logs.
-// No Contributor, no role-assignment rights, nothing outside this RG.
+// No Contributor, no role-assignment rights, nothing outside this RG. Jobs Contributor on the sync job also lets it
+// change or delete that one job (image, secrets); starting it already grants use of the job's secrets and identity.
 // https://learn.microsoft.com/azure/developer/github/connect-from-azure-openid-connect
 param location string = 'westus3'
 param identityName string = 'id-fa-stage-deploy'
@@ -24,9 +25,10 @@ param tags object = {
 var roles = {
   acrPush: '8311e382-0749-4cb8-b61a-304f252e45ec'
   containerAppsContributor: '358470bc-b998-42bd-ab17-a7e34c199c0f'
-  // Container Apps Contributor has no Microsoft.App/jobs/* actions; starting the job (with image/args
-  // overrides) needs Microsoft.App/jobs/*/action from Container Apps Jobs Operator.
-  containerAppsJobsOperator: 'b9a307c4-5aa3-4b52-ba60-2b17c136cd7b'
+  // Container Apps Contributor has no Microsoft.App/jobs/* actions. Starting the job with image/args overrides needs
+  // jobs/start/action and, since 2026-11-06 (JobStartOverrideAuthorizationFailed), also Microsoft.App/jobs/write:
+  // Container Apps Jobs Contributor, scoped to the sync job only.
+  containerAppsJobsContributor: '4e3d2b60-56ae-4dc6-a233-09c8e5a82e68'
   managedIdentityOperator: 'f1a07417-d97a-45cb-824c-7a7467783830'
   reader: 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
   logAnalyticsReader: '73c42c96-874c-492b-b04d-ab87d138a893'
@@ -88,12 +90,12 @@ resource apiUpdate 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 resource jobRun 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(syncJob.id, identityName, roles.containerAppsJobsOperator)
+  name: guid(syncJob.id, identityName, roles.containerAppsJobsContributor)
   scope: syncJob
   properties: {
     principalId: identity.outputs.principalId
     principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.containerAppsJobsOperator)
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.containerAppsJobsContributor)
   }
 }
 resource apiIdentityUse 'Microsoft.Authorization/roleAssignments@2022-04-01' = {

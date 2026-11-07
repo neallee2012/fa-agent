@@ -1492,7 +1492,9 @@ def _refusal_message(code, *, following, retry):
 def _refusal_response(error, *, read, rid):
     from .behavior_native_sessions import _RetiredSession
     code = error.body["error"]["code"]
-    logging.getLogger(__name__).warning("NATIVE_TURN_REFUSED code=%s rid=%s", code, timing_id(rid) if rid else "-")
+    # A read of a RID not there yet is an answer (the workbench polls A for B's RID), not a refusal worth a warning.
+    level = logging.INFO if read and code == "NATIVE_RID_MISSING" else logging.WARNING
+    logging.getLogger(__name__).log(level, "NATIVE_TURN_REFUSED code=%s rid=%s", code, timing_id(rid) if rid else "-")
     before_admission = isinstance(error, _BeforeAdmission)
     following = before_admission and error.server_following
     # A disabled lane or a retired session does not clear by reading again. A 412 is a read that lost its

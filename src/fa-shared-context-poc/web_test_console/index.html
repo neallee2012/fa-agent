@@ -493,7 +493,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <textarea id="hitl-rule-text" rows="3"></textarea>
 <label for="hitl-rule-behavior">遇到符合的動作時</label>
 <select id="hitl-rule-behavior"><option value="ask_first">先問我</option><option value="allow_automatically">自動允許</option></select>
-<button id="save-hitl-rule">確認並新增規則</button><p id="hitl-rule-draft-note" class="reason"></p>
+<button id="save-hitl-rule">確認並新增規則</button><p id="hitl-rule-draft-note" class="reason" role="status"></p>
 <small>先問我優先；自動允許不放寬原能力上限或審查拒絕，也不替舊的待批操作作決定。</small>
 <small data-hitl-rules-scope>這些規則管 shell、助理電腦（桌面）、交辦、助理之間傳話，以及不在 Toolbox 裡的 MCP。Toolbox 裡的 MCP 不看這裡：在「Team MCP」分頁替每個 MCP 設定「每次呼叫都要我批准」或「不用批准」。</small>
 <div id="hitl-command-list"></div>
@@ -4618,8 +4618,6 @@ function hitlRevisionText(entry){
     ...(entry.change==="allow_rule"?[hitlRuleSource(entry)]:[])].join(" · ");
 }
 const HITL_ALLOWED_BY=["rule","default","toolbox","human_once"];
-// One click reads at most this many scan pages; the rest stays behind 「繼續讀取」, never an empty claim.
-const HITL_ALLOWED_PAGES=10;
 function validHitlAllowed(value){
   return value?.schema_version==="fa-native-hitl-allowed-v1"&&value.purpose==="readback-only-not-execution-permission"
     &&typeof value.team_id==="string"&&Number.isFinite(Date.parse(value.since))&&Array.isArray(value.entries)
@@ -4631,13 +4629,16 @@ function validHitlAllowed(value){
 async function readNativeHitlAllowed(more=false){
   const generation=hitlGeneration,target={agent:agentMode?selectedAgent:null,route:"team"};
   if(!more)hitlAllowed=null;
-  for(let page=0;page<HITL_ALLOWED_PAGES&&generation===hitlGeneration;page++){
+  const seen=new Set();
+  // Table pages run in RowKey (digest) order, not time: newest-first holds only once the whole window is read.
+  while(generation===hitlGeneration){
     const cursor=hitlAllowed?.next_cursor;
     if(hitlAllowed&&!cursor)return;
-    let accepted=false;
+    let accepted=false;seen.add(cursor);
     await requestNativeHitl("allowed-read","allowed"+(cursor?"?cursor="+encodeURIComponent(cursor):""),null,value=>{
-      if(!validHitlAllowed(value)||value.team_id!==(hitlRulesView?.rules.team_id??value.team_id))
-        throw {code:"NATIVE_HITL_RECORD_INVALID"};
+      // A cursor seen before would loop forever now that one click reads to the end.
+      if(!validHitlAllowed(value)||value.team_id!==(hitlRulesView?.rules.team_id??value.team_id)
+        ||seen.has(value.next_cursor))throw {code:"NATIVE_HITL_RECORD_INVALID"};
       hitlAllowed={since:hitlAllowed?.since??value.since,next_cursor:value.next_cursor,
         entries:[...(hitlAllowed?.entries||[]),...value.entries]};
       accepted=true;
@@ -4675,7 +4676,7 @@ function renderNativeHitlAllowed(teamReady){
     .sort((a,b)=>Date.parse(b.authorized_at)-Date.parse(a.authorized_at));
   const span=view?`自 ${hitlTime(view.since)} 起`:"";
   text("hitl-allowed-note",error?"放行紀錄讀不到："+friendlyError(error)+(view?`；已讀到的 ${view.entries.length} 筆保留。`:""):
-    busy?"正在讀取放行紀錄…":!view?"還沒讀取。按上面的按鈕會掃描這個 Team 最近 24 小時寫入的資料列，可能要一點時間。":
+    busy?`正在讀取放行紀錄…${view?`已讀到 ${view.entries.length} 筆，讀完才能確定最新的是哪幾筆。`:""}`:!view?"還沒讀取。按上面的按鈕會掃描這個 Team 最近 24 小時寫入的資料列，可能要一點時間。":
     view.next_cursor?`${span}已讀到 ${view.entries.length} 筆${hitlAllowedRule?`（這條規則 ${shown.length} 筆）`:""}，還沒讀完；按「繼續讀取」。不能當成只有這些。`:
     hitlAllowedRule&&!shown.length?`${span}，這條規則在讀到的範圍內沒有放行紀錄。`:
     !view.entries.length?`${span}沒有放行紀錄。`:
@@ -4772,6 +4773,8 @@ function newNativeHitlRule(rule=null){
   hitlDrafts.set(hitlDraftKey(),{text:rule?.text||"",behavior:rule?.behavior||"ask_first",rule_id:rule?.rule_id??null,
     base:{revision:hitlRulesView.rules.revision,etag:hitlRulesView.rules.etag}});
   renderNativeHitlRules();
+  // The editor sits below the list and the clicked row was just rebuilt: bring the editor to the owner.
+  el("hitl-rule-text").scrollIntoView?.({block:"center"});el("hitl-rule-text").focus();
 }
 async function saveNativeHitlRule(){
   if(el("save-hitl-rule").disabled)return;
@@ -4811,6 +4814,7 @@ function renderNativeHitlRules(){
     hitlActive("rule-write")?"已保存原請求，正在送出一次；回應未知時不重送。":hitlRulesNote||"尚未讀取，不以空清單當成沒有規則。");
   text("hitl-rule-draft-note",full?"已達 20 條；不能新增或自動覆蓋，批准卡仍可另外明選「允許這次」。":
     view&&!sameBase?"規則版本已變；請重新選擇要編輯的規則，或明選新增，再確認原文。":
+    view&&draft.rule_id!==null?`正在編輯規則 ID ${draft.rule_id.slice(0,8)}；要改成新增，按「新增一條規則」。`:
     view?`${count} / 20 條；${view.can_approve?"僅真人 owner 可以寫入。":"目前只有讀取權限。"}`:"先讀取規則。");
   const list=el("hitl-rule-list");list.replaceChildren();
   for(const rule of view?.rules.rules||[]){
@@ -4918,8 +4922,10 @@ function hitlWhyLines(entry){
   const lines=[action.category==="routine"?ROUTINE_CARD_REASON:hitlReason(review,{revision,rules:same?rules.rules:[]}),
     `當時審查用的是第 ${revision} 版規則`+(same?"，就是目前這一版。":`；目前是第 ${rules.revision} 版。`)];
   // D2 (Neal 2026-11-05): the model's own words, labelled as such, replace the plain rule list; applies comes from
-  // matched_rule_ids, never from the text, and an uncertain review decided nothing per rule.
-  const reasons=Object.entries(review.rule_reasons||{});
+  // matched_rule_ids, never from the text, and an uncertain (or invalid) review decided nothing per rule, so it never
+  // says no rule applied.
+  // Matched rules first (Neal 2026-11-06: an automatic allow explains only those); sort is stable, so revision order stays.
+  const reasons=Object.entries(review.rule_reasons||{}).sort(([a],[b])=>matched.includes(b)-matched.includes(a));
   // An older revision's text comes from the newest read history entry at or before it (newest first, one change each);
   // history read before that revision existed may miss a later change, so it shows only the ID.
   const known=hitlRuleHistory&&revision<=hitlRuleHistory.head_revision;
@@ -4929,9 +4935,9 @@ function hitlWhyLines(entry){
     return rule?hitlRuleQuote(rule):`ID ${id.slice(0,8)}`;
   };
   const unmatchedAsk=review.source!=="toolbox"&&action.category!=="routine"&&review.outcome==="ask"&&!matched.length;
-  if(unmatchedAsk&&!(reasons.length&&review.source==="uncertain"))lines.push(`當時第 ${revision} 版的規則都沒有套用到這個動作。`);
+  if(unmatchedAsk&&review.source==="default")lines.push(`當時第 ${revision} 版的規則都沒有套用到這個動作。`);
   if(reasons.length){
-    lines.push("以下是自動審查模型對每條規則的說明，只供參考，不一定正確，也不影響這次是否要問你：");
+    lines.push("以下是自動審查模型對規則的說明，只供參考，不一定正確，也不影響這次是否要問你：");
     const verdict=id=>review.source==="uncertain"?"沒有判定":matched.includes(id)?"適用":"不適用";
     for(const [id,reason] of reasons)lines.push(`${ruleText(id)}：${verdict(id)}。模型說明：${reason}`);
   }else if(unmatchedAsk){

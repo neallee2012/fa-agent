@@ -6,6 +6,7 @@ import copy
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import random
 import struct
 from types import SimpleNamespace
@@ -100,7 +101,7 @@ def api_client(c):
     return client
 
 
-def model_sender(answers, *, responses=True, reasoning=False):
+def model_sender(answers, *, responses=True, reasoning=False, truncated=False):
     requests = []
     answer_list = list(answers)
 
@@ -118,9 +119,12 @@ def model_sender(answers, *, responses=True, reasoning=False):
                 "usage": {"input_tokens": 10, "output_tokens": 3}}}
             if reasoning:
                 event["response"]["output"].insert(0, {"type": "reasoning", "summary": []})
+            if truncated:  # the output cap (reasoning included) ran out
+                event["type"] = "response.incomplete"
+                event["response"].update(status="incomplete", incomplete_details={"reason": "max_output_tokens"})
             raw = "data: " + json.dumps(event) + "\n\n"
         else:
-            event = {"choices": [{"delta": {"content": text}, "finish_reason": "stop"}],
+            event = {"choices": [{"delta": {"content": text}, "finish_reason": "length" if truncated else "stop"}],
                      "usage": {"prompt_tokens": 10, "completion_tokens": 3}}
             raw = "data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n"
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=raw.encode())
@@ -132,8 +136,16 @@ def model_sender(answers, *, responses=True, reasoning=False):
     return sender
 
 
-def verdict(outcome="ask", matched=(), *, uncertain=False, takeover=False):
-    return {"outcome": outcome, "matched_rule_ids": list(matched), "uncertain": uncertain, "takeover_required": takeover}
+def verdict(outcome="ask", matched=(), *, uncertain=False, takeover=False, results=None):
+    """The model's strict answer: ``results`` replaces an allow's ``matched_reasons`` (one per matched rule by
+    default) and is the ask/deny ``rule_results`` map (left out when None)."""
+    decision = {"outcome": outcome, "matched_rule_ids": list(matched), "uncertain": uncertain,
+                "takeover_required": takeover}
+    if outcome == "allow":
+        decision["matched_reasons"] = ["適用"] * len(matched) if results is None else results
+    elif results is not None:
+        decision["rule_results"] = results
+    return {"decision": decision}
 
 
 def setup_gate(c, tmp_path, answers=(None,), *, entries=("fa-shell-v1",), responses=True):
@@ -210,6 +222,97 @@ def test_independent_review_has_strict_output_no_tools_and_retains_usage(hitl, t
         assert usage.requests == 1
         assert usage.measured_requests == (0 if answer == 503 else 1)
         assert result.takeover_required is (reason == "human_takeover")
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("responses", [True, False])
+def test_a_review_cut_off_by_its_output_cap_never_allows(hitl, tmp_path, responses):
+    case = setup_gate(hitl, tmp_path)
+    # Even a whole allow verdict counts for nothing when the model stopped at the cap.
+    sender = model_sender((verdict("allow"),), responses=responses, truncated=True)
+
+    async def check():
+        result = await NativeAutoReview(sender)(case.gate._action(case.packet), await case.client.rules(),
+                                                {"initial": "Original human request"})
+        assert (result.outcome, result.reason, result.takeover_required) == ("ask", "review_invalid", False)
+        assert sender.observed[0]["max_output_tokens" if responses else "max_completion_tokens"] == 16000
+    asyncio.run(check())
+
+
+MODEL_CANARY = "ModelTextCanary7f3a"
+
+
+@pytest.mark.parametrize("responses", [True, False])
+@pytest.mark.parametrize("answer,truncated,code", [
+    ("not JSON " + MODEL_CANARY, False, "not_json"),
+    (verdict(MODEL_CANARY), False, "schema"),
+    (verdict("allow", [MODEL_CANARY]), False, "unknown_rule"),
+    (verdict("allow", [MODEL_CANARY]), True, "no_completed_output"),
+])
+def test_an_invalid_review_logs_an_exportable_code_and_no_model_text(hitl, tmp_path, caplog, responses, answer,
+                                                                     truncated, code):
+    from shared_context import sdk_telemetry
+
+    case = setup_gate(hitl, tmp_path)
+    sender = model_sender((answer,), responses=responses, truncated=truncated)
+
+    async def check():
+        return await NativeAutoReview(sender)(case.gate._action(case.packet), await case.client.rules(),
+                                              {"initial": "Original human request"})
+    with caplog.at_level(logging.WARNING, logger="shared_context.native_hitl_runtime"):
+        assert asyncio.run(check()).reason == "review_invalid"
+    [record] = [item for item in caplog.records if item.getMessage().startswith("NATIVE_HITL_REVIEW_INVALID")]
+    terminal = ("response.incomplete" if truncated else "response.completed") if responses else (
+        "length" if truncated else "stop")
+    incomplete = "max_output_tokens" if truncated and responses else "none"
+    assert record.getMessage() == (
+        f"NATIVE_HITL_REVIEW_INVALID reason={code} terminal={terminal} incomplete={incomplete}")
+    assert record.name in sdk_telemetry.LOG_LOGGERS and sdk_telemetry._exportable(record)
+    assert MODEL_CANARY not in caplog.text
+
+
+def sent_format(sender, responses):
+    body = sender.observed[0]
+    return body["text"]["format"] if responses else body["response_format"]["json_schema"]
+
+
+@pytest.mark.parametrize("responses", [True, False])
+def test_strict_review_schema_lists_only_this_revisions_rule_ids(hitl, tmp_path, responses):
+    c = hitl
+    for number in range(2):
+        command = change(c, f"enum-rule-{number}", behavior="allow_automatically")
+        assert post(c, "/rules", command).status_code == 200
+    ids = [rule.rule_id for rule in c.service.rules(c.owner).rules]
+    # A repeated known ID names the same rule set, so it is kept once instead of failing the review.
+    case = setup_gate(c, tmp_path, (verdict("allow", (ids[0], ids[0])),), responses=responses)
+
+    async def check():
+        result = await case.gate.reviewer(case.gate._action(case.packet), await case.client.rules(),
+                                          {"initial": "Original request"})
+        assert (result.outcome, result.reason, result.matched_rule_ids) == ("allow", "reviewed", (ids[0],))
+        sent = sent_format(case.sender, responses)
+        assert sent["strict"] is True
+        allow, held = (branch["properties"] for branch in sent["schema"]["properties"]["decision"]["anyOf"])
+        assert held["matched_rule_ids"]["items"]["enum"] == ids
+        assert allow["matched_rule_ids"]["items"]["enum"] == ids and allow["matched_reasons"]["maxItems"] == 20
+        assert held["rule_results"]["required"] == ids
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("responses", [True, False])
+def test_strict_review_schema_allows_no_rule_ids_without_rules(hitl, tmp_path, responses):
+    case = setup_gate(hitl, tmp_path, responses=responses)
+
+    async def check():
+        rules = await case.client.rules()
+        assert rules.rules == ()
+        await case.gate.reviewer(case.gate._action(case.packet), rules, {"initial": "Original request"})
+        decision = sent_format(case.sender, responses)["schema"]["properties"]["decision"]
+        allow, held = (branch["properties"] for branch in decision["anyOf"])
+        matched = held["matched_rule_ids"]
+        assert matched["maxItems"] == 0 and "enum" not in matched["items"]
+        assert allow["matched_rule_ids"]["maxItems"] == allow["matched_reasons"]["maxItems"] == 0
+        assert held["rule_results"]["properties"] == {} and held["rule_results"]["required"] == []
     asyncio.run(check())
 
 
@@ -1103,10 +1206,22 @@ def test_p2_legal_desktop_png_survives_one_effect_and_reads_back_exactly(hitl, t
 
 @pytest.mark.parametrize("size", [30 * 1024, "maximum"])
 @pytest.mark.parametrize("outcome", ["allow", "ask"])
-def test_p2_original_delegation_capacity_keeps_complete_control_material(hitl, tmp_path, size, outcome):
+@pytest.mark.parametrize("reasons", [False, True])
+def test_p2_original_delegation_capacity_keeps_complete_control_material(hitl, tmp_path, size, outcome, reasons):
     from shared_context.behavior_delegation_wire import DelegationPrepare, DelegationTask, DELEGATION_PREPARE_BYTES
     from shared_context.native_delegation import NativeDelegationRuntime
-    case = setup_gate(hitl, tmp_path, (verdict(outcome),), entries=("fa-delegate-v1",))
+    answer, texts = verdict(outcome), {}
+    if reasons:  # D2: the most rules, all matched (so allow keeps them too), each with its own longest reason
+        behavior = "allow_automatically" if outcome == "allow" else "ask_first"
+        for number in range(20):
+            assert post(hitl, "/rules", change(hitl, f"cap-{number}", text=f"rule {number}",
+                                               behavior=behavior)).status_code == 200
+        ids = [rule.rule_id for rule in hitl.service.rules(hitl.owner).rules]
+        texts = {key: f"{number:02d}" + "長" * 198 for number, key in enumerate(ids)}
+        # An allow lists its matches in reverse, so a reason paired with the wrong rule shows.
+        answer = (verdict(outcome, ids[::-1], results=[texts[key] for key in ids[::-1]]) if outcome == "allow" else
+                  verdict(outcome, ids, results=texts))
+    case = setup_gate(hitl, tmp_path, (answer,), entries=("fa-delegate-v1",))
     delegate = NativeDelegationRuntime(case.context)
     arguments = {"name": "large-child", "description": "Read complete original material", "prompt": "q",
                  "agent_type": "fa-delegate-v1", "mode": "sync"}
@@ -1125,6 +1240,7 @@ def test_p2_original_delegation_capacity_keeps_complete_control_material(hitl, t
         if outcome == "ask":
             view = await pending_view(case)
             assert view.pending.command.action.arguments == arguments
+            assert view.pending.command.review.rule_reasons == texts
             # Reopening the original RID must not need the large body in its projection.
             page = await case.client.pending(NativeHitlPendingQuery(turn=case.gate.turn))
             assert page.references == (view.approval,) and len(page.model_dump_json().encode()) < 4096
@@ -1132,6 +1248,7 @@ def test_p2_original_delegation_capacity_keeps_complete_control_material(hitl, t
         result = await waiting
         assert result["permissionDecision"] == "allow"
         assert delegate.claims["large-call"].record.hitl.action.arguments == arguments
+        assert delegate.claims["large-call"].record.hitl.reviews[0].rule_reasons == texts
         await case.gate.close()
     asyncio.run(check())
 

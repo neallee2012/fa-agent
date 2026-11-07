@@ -65,23 +65,45 @@ def _unconfirmed():
     return (_storage().FoundryStorageError, AzureError, OSError)
 
 
+def _unconfirmed_type(error):
+    """The nearest listed class of what ``_unconfirmed`` catches (so a ConnectionResetError still names itself and an
+    unknown SDK subclass names its listed parent). Only listed names: storage errors carry response bodies and URLs."""
+    import ssl
+    from azure.core import exceptions as azure
+    from azure.identity import CredentialUnavailableError
+    storage = _storage()
+    known = (storage.FoundryStorageApiError, storage.FoundryStorageBadRequestError, storage.FoundryStorageConflictError,
+             storage.FoundryStoragePreconditionError, storage.FoundryStorageError, azure.ServiceRequestError,
+             azure.ServiceRequestTimeoutError, azure.ServiceResponseError, azure.ServiceResponseTimeoutError,
+             azure.ClientAuthenticationError, azure.HttpResponseError, azure.DecodeError, azure.AzureError,
+             CredentialUnavailableError, ssl.SSLError, ConnectionResetError, ConnectionRefusedError,
+             ConnectionAbortedError, BrokenPipeError, ConnectionError, TimeoutError, OSError)
+    return next(cls.__name__ for cls in type(error).__mro__ if cls in known)
+
+
 async def open_durable_store(name, *, create, credential=None, endpoint=None, item_ttl_seconds=-1):
     """An open store whose items never expire (or, when given, expire after exactly ``item_ttl_seconds``).
     ``create=False`` only opens an existing store (404 when missing)."""
     storage = _storage()
     store = None
+    stage = "get_or_create" if create else "get"
     try:
         if create:
             store = await storage.FoundryStateStore.get_or_create(
                 name, credential, endpoint, item_ttl_seconds=item_ttl_seconds)
         else:
             store = storage.FoundryStateStore(name, credential, endpoint)
+        stage = "get"
         ttl = (await store.get()).item_ttl_seconds
     except storage.FoundryStorageNotFoundError:
         await _close(store)
         raise Problem(404, "NATIVE_STATE_STORE_MISSING", "the State store does not exist; nothing was created") from None
-    except _unconfirmed():
+    except _unconfirmed() as error:
         await _close(store)
+        status = getattr(error, "status_code", None)
+        # The store name carries the CID: only the stage, the class and an HTTP status leave the container.
+        logging.getLogger(__name__).warning("NATIVE_STATE_STORE_UNKNOWN stage=%s exception_type=%s status=%s",
+                                            stage, _unconfirmed_type(error), status if type(status) is int else "-")
         raise Problem(503, "NATIVE_STATE_STORE_UNKNOWN", "the State store could not be confirmed") from None
     except asyncio.CancelledError:
         await _close(store)

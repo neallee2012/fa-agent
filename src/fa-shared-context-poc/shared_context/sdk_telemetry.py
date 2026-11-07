@@ -395,17 +395,24 @@ def _build_processor():
 # FA_PRIVATE_MEMORY_* / FA_TEAM_MEMORY_* status, stage and reason codes, exception types, counts, official update or
 # memory IDs and a RID prefix; NATIVE_TOOLBOX_FAILED a toolbox failure's method, stage, codes, status and exception
 # type; FA_NATIVE_HTTP the handler's phase and action, fixed operation, status and code, exception type, ms, Agent ID
-# and version, session and invocation IDs and the RID's SHA-256. Other lines of the same loggers (FA_MCP_SERVER_STATUS
-# error text, ...) stay out.
+# and version, session and invocation IDs and the RID's SHA-256; NATIVE_HITL_REVIEW_INVALID a fixed step code and
+# allowlisted terminal/incomplete wire values, NATIVE_HITL_REVIEW_UNAVAILABLE an exception type, and
+# NATIVE_HITL_AUTHORITY_FAILURE a fixed operation, status, allowlisted code and exception class; NATIVE_STATE_STORE_UNKNOWN
+# a fixed stage, exception class and HTTP status. Other lines of the same loggers (FA_MCP_SERVER_STATUS error text,
+# FA_NATIVE_CHECKPOINT_CACHE, ...) stay out.
 LOG_LOGGERS = ("shared_context.behavior_timing", "shared_context.behavior_hosted", "shared_context.m2_copilot",
                "shared_context.native_resident", "shared_context.native_sdk", "shared_context.native_turns",
                "shared_context.behavior_model_direct", "shared_context.native_environment_cut",
                "shared_context.behavior_private_memory", "shared_context.cosmos_private_memory",
                "shared_context.native_private_memory", "shared_context.native_team_memory",
-               "shared_context.native_memory_candidate", "shared_context.native_toolbox")
+               "shared_context.native_memory_candidate", "shared_context.native_toolbox",
+               "shared_context.native_hitl_runtime", "shared_context.native_checkpoint")
 # Lines with these prefixes leave the container: their arguments must stay fixed codes, hashes or numbers, never text.
 LOG_PREFIXES = ("FA_TIMING ", "RESIDENT_SDK_", "FA_NATIVE_TURN_UNKNOWN ", "FA_MODEL_DIRECT_", "NATIVE_UPGRADE_CUT ",
-                "FA_PRIVATE_MEMORY_", "FA_TEAM_MEMORY_", "NATIVE_TOOLBOX_FAILED ", "FA_NATIVE_HTTP ")
+                "FA_PRIVATE_MEMORY_", "FA_TEAM_MEMORY_", "NATIVE_TOOLBOX_FAILED ", "FA_NATIVE_HTTP ",
+                "NATIVE_HITL_REVIEW_INVALID ", "NATIVE_HITL_REVIEW_UNAVAILABLE ", "NATIVE_HITL_AUTHORITY_FAILURE ",
+                "NATIVE_HITL_REVIEW_REASONS_DROPPED ",
+                "NATIVE_STATE_STORE_UNKNOWN ")
 # The memory clients name their event as the first argument ("%s status=..."); only these exact names count.
 LOG_EVENTS = ("FA_PRIVATE_MEMORY_SEARCH", "FA_PRIVATE_MEMORY_UPDATE", "FA_TEAM_MEMORY_SEARCH", "FA_TEAM_MEMORY_CREATE")
 

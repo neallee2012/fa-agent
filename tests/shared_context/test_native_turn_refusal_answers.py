@@ -3,6 +3,8 @@
 The shared handler (``_install_error_handlers``) replaces a route's ``Problem`` code and message, so a selector
 refusal is visible as that handler's generic answer; FastAPI's own validation would answer another message."""
 
+import logging
+
 import pytest
 
 from shared_context.behavior_native_sessions import _RetiredSession
@@ -114,11 +116,20 @@ def test_a_refused_read_logs_only_a_hashed_rid_or_none(native_api, monkeypatch, 
     def refuse(*_args, **_kwargs):
         raise Problem(404, "NATIVE_RID_MISSING", "private")
     monkeypatch.setattr(GATEWAY + "read", refuse)
+    caplog.set_level(logging.INFO, logger="shared_context.behavior_native_turn_api")
     native_api.client.get(PREFIX + "/requests/native-rid", headers=native_api.headers)
     native_api.client.get(PREFIX + "/conversations/native-cid", headers=native_api.headers)
-    logged = [r.getMessage() for r in caplog.records if "NATIVE_TURN_REFUSED" in r.getMessage()]
-    assert logged == ["NATIVE_TURN_REFUSED code=NATIVE_RID_MISSING rid=" + timing_id("native-rid"),
-                      "NATIVE_TURN_REFUSED code=NATIVE_RID_MISSING rid=-"]
+    logged = [(r.levelno, r.getMessage()) for r in caplog.records if "NATIVE_TURN_REFUSED" in r.getMessage()]
+    # Not there yet is an answer while the workbench polls for a peer's RID: INFO, below what the API prints.
+    assert logged == [(logging.INFO, "NATIVE_TURN_REFUSED code=NATIVE_RID_MISSING rid=" + timing_id("native-rid")),
+                      (logging.INFO, "NATIVE_TURN_REFUSED code=NATIVE_RID_MISSING rid=-")]
+
+
+@pytest.mark.parametrize(("method", "code"), [("read", "BEHAVIOR_READ_FAILED"), ("submit", "NATIVE_RID_MISSING")])
+def test_other_refusals_still_log_a_warning(native_api, monkeypatch, caplog, method, code):
+    refused(native_api, monkeypatch, method, Problem(503 if method == "read" else 404, code, "private"))
+    assert [(r.levelno, r.getMessage().split(" rid=")[0]) for r in caplog.records
+            if "NATIVE_TURN_REFUSED" in r.getMessage()] == [(logging.WARNING, "NATIVE_TURN_REFUSED code=" + code)]
 
 
 @pytest.mark.parametrize("path", [

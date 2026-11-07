@@ -1211,23 +1211,45 @@ API 端每輪要讀的頁數因此取決於最近約 24 小時又 5 分鐘寫入
   （[`_serialize.py`](https://github.com/Azure/azure-sdk-for-python/blob/azure-data-tables_12.7.0/sdk/tables/azure-data-tables/azure/data/tables/_serialize.py)）。
 
 <a id="hitl-rule-reasons"></a>
-## HITL 自動審查逐條規則的說明：欄位與顯示（D2 第一步，CODE/offline，未部署）
+## HITL 自動審查逐條規則的說明（D2 兩步，CODE/offline，未部署）
 
-契約與兩步上線見[行為規格](../../docs/FA-AGENT-BEHAVIOR-SPEC.md#hitl-rule-reasons)。這一步只讓 API、bridge 和工作台收得下、看得到說明；
-Hosted 的自動審查還不向模型要說明，所以部署後真的卡片暫時都沒有說明。接點：
+契約與兩步上線見[行為規格](../../docs/FA-AGENT-BEHAVIOR-SPEC.md#hitl-rule-reasons)。第 1 步讓 API、bridge 和工作台收得下、看得到說明；
+第 2 步讓 Hosted 的自動審查向模型要說明，要等第 1 步部署到 stage 才合併。接點：
 
 - wire：`native_hitl_wire.py` 的 `NativeHitlReview.rule_reasons`（空時不輸出）與 `exact_source` 的兩條檢查；
   API（`native_hitl.py`）、State store 的 reviews（`native_effects.py`）、`hitl-reviews` 讀回與 bridge 都用同一個 DTO，沒有另改。
 - 快照：`test_native_profile_snapshot.py` 的 v2 additive 檢查通過，`native_profile_snapshot.json` 依檔頭指令重產。
+- Hosted（第 2 步）：`native_hitl_runtime.py` 的 `NativeAutoReview` 送 `_review_schema()`：`decision` 以 `anyOf` 分成
+  `allow`（`matched_rule_ids` 加 `matched_reasons`，後者是不帶規則 ID、依位置對應的說明清單）與 `ask`／`deny`（`matched_rule_ids` 加 `rule_results`，後者是每條規則 ID 都必填的物件）；兩種形狀都在說明之前先寫 `uncertain`、`takeover_required`，
+  所以 Neal 2026-11-06 的「`allow` 只要命中規則的說明，`ask`／`deny` 要每條」由 schema 形狀保證，不靠提示。回答攤平回 `_ReviewOutput` 照舊驗，
+  再由 `_rule_reasons` 依模型自己的 `outcome` 決定保留或丟掉說明；結果判斷的程式沒有改，輸出上限跟著規則數走，串流大小上限改成固定 3.5 MiB（sender 本身限 4 MiB）。
+  說明先合成 `{rule_id: reason}`（allow 依位置配對），保留前用 wire 的 `RuleReason` 驗一次；不另設釘住的 wire model。
 - 本機工作台：舊 checkout 的 bridge 讀到帶說明的卡片會回 `NATIVE_HITL_RECORD_INVALID`；第二步部署後，本機接 dev／stage 的工作台要先更新到這一版以上。
 
-### Verified against（欄位與顯示）
+### Verified against（逐條說明）
 
 - `tests/shared_context/test_native_hitl_rule_reasons.py`：沒有欄位的審查 bytes 與 digest 等於加欄位前同一份審查的值（`0bbf0056…`）；
   wire 拒絕 Toolbox／unavailable 帶說明、命中規則沒說明、空字串與 201 字；API 收有、沒有欄位的 pending 都 200 並原樣讀回，
   說明的規則不在目前這一版，pending 與 authorize 都回 409 `NATIVE_HITL_RULES_CHANGED`；
   最大的 delegation 卡加 20 條 200 字說明（Hosted 送 UTF-8；控制字元仍跳脫成每字 6 bytes，是最長的情況）在 `NATIVE_HITL_BODY_BYTES` 內且 API 收下，舊的 24 KiB 餘裕放不下。
 - `test_web_test_console_hitl.py`：bridge 讀回有、沒有說明的卡片都 200，說明原樣轉送。
+- 第 2 步：同一檔說明經 Hosted 審查存進 pending 並經 API 讀回；allow 只帶命中規則、ask／deny 帶每條規則時依規則順序保存，
+  模型回 allow 但命中「先問我」而變成先問時，命中規則的說明照樣保存；strict schema 的 allow 形狀是 `matched_rule_ids` 加字串清單 `matched_reasons`、ask／deny 形狀才有 `rule_results`，兩種形狀都把決定結果的欄位排在說明之前；
+  allow 的 9 種壞 `matched_reasons`（多一句、沒有說明、沒命中卻有說明、命中 ID 重複、空白、落單 surrogate、不是字串、不是清單、null）與 ask／deny 的 7 種壞 `rule_results`（空白、落單 surrogate、不是字串、不明 ID、少一條、不是物件、null）都只丟說明，
+  結果與 reason 不變、log 帶 `problem=`、沒有 `NATIVE_HITL_REVIEW_INVALID`；
+  ask／deny 沒有清單照舊；超過 200 字截斷；`uncertain` 不保存說明；
+  回答被截斷（Responses `response.incomplete` 且原因是 `max_output_tokens`、chat `length`）時是 `review_invalid`（`NATIVE_HITL_REVIEW_INVALID` 的 terminal／incomplete 已標出截斷），送出的上限是 `16000 + 260 × 規則數`。
+  allow 命中兩條、依相反順序回兩句不同的說明，依位置配回正確的規則再照規則順序保存。
+  `test_native_hitl_h2.py` 的最大 delegation 卡加 20 條都命中、各 200 字且互不相同的說明（allow 依相反順序列出命中），allow／ask 兩條路都過，保存的 20 條逐條對上規則。
+- 第 2 步：命中全部 20 條的 ask、20 條 200 字說明拆成每字一個 SSE 事件（Responses delta 與帶 content filter 的 chat chunk 兩種）仍保留 20 條說明；
+  超過串流上限是 `review_invalid` 並記 `reason=too_large`；舊的 256 KiB 串流上限在前兩案都會讓審查變成 `review_invalid`。
+- `maxItems`：Azure 的 structured outputs 文件把它列為不支援，但 `matched_rule_ids` 從 `823913ef` 起就在 strict schema 送 `maxItems`，
+  dev 2026-10-03 已經看到真模型審查命中規則（[progress](../../docs/progress.md)），所以說明清單沒有帶進新種類的陣列關鍵字；`minItems` 沒有用。
+  `anyOf`（非根層）兩份官方文件都列為支援。
+- `test_sdk_telemetry.py`：`NATIVE_HITL_REVIEW_REASONS_DROPPED` 會匯出。
+- dev 量測（run 4841，gpt-5.4-mini，20 條規則，改成只在出卡時寫全部說明之前）：每次審查輸出 191 → 1228 token、1.6 → 5.0 秒、
+  USD 0.0018 → 0.0086，第一個 byte 的時間不變。改了之後自動允許省多少還沒在 dev 重量。
+- 第 2 步未驗：真模型的說明品質與長度、上限夠不夠（含推理 token），以及真模型會不會照 allow／ask 兩種形狀回清單，都要 dev 看。
 - 回歸範圍與結果見 PR 說明。未跑真模型、真 SDK runtime、Hosted 或 dev。
 
 <a id="relay-not-sent"></a>
@@ -7591,8 +7613,8 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
 - 後加的記憶行（2026-10-24）：`private` 模式 e2e（`fa-priv-1024`）的 `AppTraces` 只有 `FA_TIMING`、少數 `RESIDENT_SDK_CONTINUED` 與 SDK 事件，看不到 `FA_PRIVATE_MEMORY_UPDATE status=401 stage=embedding`、`status=skipped reason=embedding_unavailable`、`FA_PRIVATE_MEMORY_USAGE_UNREPORTED`、`FA_PRIVATE_MEMORY_INACTIVE` 與 Team 記憶的同類行，embedding 的 404／401 只能從 `FA_TIMING` 的耗時推測。`private` 模式從 VNet 外讀不到 Hosted logstream，所以這些行也要送。API 端的 `FA_MEMORY_RELAY_*`（`memory_relay`）本來就在 API console log，不在這裡。
 - 後加的 `FA_NATIVE_HTTP`（2026-11-02）：stage 第 39 版冒煙有一次 `turn_status` 等滿 30 秒 `ReadTimeout`，平台沒有對應的 `invoke_agent` span，而 Hosted stderr 只留最後 300 行，分不出請求沒進 Hosted，還是進來後卡住。有 `entered` 沒 `returned`／`raised` 是卡在 Hosted，連 `entered` 都沒有是沒進來；`invocation_id` 可對平台 span 的 `azure.ai.agentserver.invocation_id`。這些行是批次送出、不落盤，容器回收、佇列滿、送出失敗或啟動後約 1 秒內的行都可能沒到，所以少一行時先確認同一段時間、同一位 Agent 的 `FA_TIMING` 有到，再下判斷（丟棄筆數看 SDKStats）。每次呼叫多兩行。
 - 做法：Hosted 入口（`behavior_assistant_main.main`）在背景執行緒呼叫 `sdk_telemetry.attach_log_export()`，用官方 exporter 範例的接法（私有 `LoggerProvider`＋`BatchLogRecordProcessor`＋`AzureMonitorLogExporter`＋`LoggingHandler`），送到與 SDK span 相同、平台注入連線字串的 App Insights，`AppRoleName` 一樣是 `FOUNDRY_AGENT_NAME`。開關與 tracing 相同：`FA_SDK_TELEMETRY=0` 或沒有連線字串就不送；建不起來記 `FA_SDK_TELEMETRY_INACTIVE reason=log_exporter_unavailable`，不影響啟動。背景建立是為了不讓約 0.9 秒的 exporter 匯入（本機 Windows 量測）算進容器啟動；啟動後最前面約 1 秒內的行只在 stderr。
-- 只送哪些：handler 只掛在 `shared_context.behavior_timing`、`behavior_hosted`、`m2_copilot`、`native_resident`、`native_sdk`、`native_turns`、`behavior_model_direct`、`native_environment_cut`、`behavior_private_memory`、`cosmos_private_memory`、`native_private_memory`、`native_team_memory`、`native_memory_candidate`、`native_toolbox` 十四個 logger（不掛 root，也避免 exporter 自己的 azure-core log 迴圈），而且只放行**格式字串**以 `FA_TIMING `、`RESIDENT_SDK_`、`FA_NATIVE_TURN_UNKNOWN `、`FA_MODEL_DIRECT_`、`NATIVE_UPGRADE_CUT `、`FA_PRIVATE_MEMORY_`、`FA_TEAM_MEMORY_`、`NATIVE_TOOLBOX_FAILED ` 或 `FA_NATIVE_HTTP ` 開頭、沒有例外資訊的行。記憶模組多數行寫成 `"%s status=…"`、事件名稱放在第一個參數，所以另外放行以 `%s ` 開頭、第一個參數**完全等於** `FA_PRIVATE_MEMORY_SEARCH`、`FA_PRIVATE_MEMORY_UPDATE`、`FA_TEAM_MEMORY_SEARCH`、`FA_TEAM_MEMORY_CREATE` 之一的行（`sdk_telemetry.LOG_EVENTS`；只是以事件名稱開頭的參數不算）。`FA_TIMING` 只有 phase、雜湊過的回合 ID 或 binding ID、毫秒、outcome 與 Table 讀取次數；`RESIDENT_SDK_*` 只有固定原因碼或 hash 前 12 碼；`FA_NATIVE_TURN_UNKNOWN` 只有固定 failure code 與例外類型名稱；`FA_MODEL_DIRECT_*`（`RETRY`、`HTTP_FAILURE`、`INACTIVE`）只有狀態碼、通過識別字檢查的 provider 代碼與 deployment 名稱、次數、等待毫秒與 request 的項目數；`NATIVE_UPGRADE_CUT`（ADR-0009 gate 7）只有固定代碼、次數、毫秒、RID 前 8 碼與 Hosted session ID；`FA_PRIVATE_MEMORY_*`／`FA_TEAM_MEMORY_*` 只有 HTTP 狀態碼、固定的 status／stage／reason／mode 代碼、例外類型名稱（`_exception_type` 的固定對照或類別名稱）、筆數與 token 數、官方 kind 名稱的計數（其他 kind 記成 `unknown`）、通過 `_OFFICIAL_ID` 檢查的 `update_id`／`memory_id`，以及 RID 前 8 碼；`NATIVE_TOOLBOX_FAILED` 只有 method、stage、代碼、狀態碼與例外類型名稱；`FA_NATIVE_HTTP` 只有階段與 action、固定 operation／status／code、例外類型名稱、毫秒、Agent ID 與版本、session／invocation ID 與 RID 的 SHA-256；都沒有對話內容、記憶內容、scope、token 或個資。同一批 logger 的其他行（例如可能帶 runtime 錯誤文字的 `FA_MCP_SERVER_STATUS`、`FA_HOSTED_DISPATCH`，以及記憶 logger 上的 `FA_NATIVE_ASSEMBLY_PARTIAL`）不送。這十四個 logger 改成 INFO 等級，`RESIDENT_SDK_CONTINUED`（INFO，沿用常駐 SDK）才會送。
-- stderr 不變：logger 一旦有 handler，Python 就不再用 `logging.lastResort` 印到 stderr，所以同時把 `logging.lastResort` 本身掛上這十四個 logger（只在 root 沒有 handler 時，也就是 Hosted 入口現況）；stderr 照舊只印 WARNING 以上。
+- 只送哪些：handler 只掛在 `shared_context.behavior_timing`、`behavior_hosted`、`m2_copilot`、`native_resident`、`native_sdk`、`native_turns`、`behavior_model_direct`、`native_environment_cut`、`behavior_private_memory`、`cosmos_private_memory`、`native_private_memory`、`native_team_memory`、`native_memory_candidate`、`native_toolbox`、`native_hitl_runtime`、`native_checkpoint` 十六個 logger（不掛 root，也避免 exporter 自己的 azure-core log 迴圈），而且只放行**格式字串**以 `FA_TIMING `、`RESIDENT_SDK_`、`FA_NATIVE_TURN_UNKNOWN `、`FA_MODEL_DIRECT_`、`NATIVE_UPGRADE_CUT `、`FA_PRIVATE_MEMORY_`、`FA_TEAM_MEMORY_`、`NATIVE_TOOLBOX_FAILED `、`FA_NATIVE_HTTP `、`NATIVE_HITL_REVIEW_INVALID `、`NATIVE_HITL_REVIEW_UNAVAILABLE `、`NATIVE_HITL_AUTHORITY_FAILURE `、`NATIVE_HITL_REVIEW_REASONS_DROPPED ` 或 `NATIVE_STATE_STORE_UNKNOWN ` 開頭、沒有例外資訊的行。記憶模組多數行寫成 `"%s status=…"`、事件名稱放在第一個參數，所以另外放行以 `%s ` 開頭、第一個參數**完全等於** `FA_PRIVATE_MEMORY_SEARCH`、`FA_PRIVATE_MEMORY_UPDATE`、`FA_TEAM_MEMORY_SEARCH`、`FA_TEAM_MEMORY_CREATE` 之一的行（`sdk_telemetry.LOG_EVENTS`；只是以事件名稱開頭的參數不算）。`FA_TIMING` 只有 phase、雜湊過的回合 ID 或 binding ID、毫秒、outcome 與 Table 讀取次數；`RESIDENT_SDK_*` 只有固定原因碼或 hash 前 12 碼；`FA_NATIVE_TURN_UNKNOWN` 只有固定 failure code 與例外類型名稱；`FA_MODEL_DIRECT_*`（`RETRY`、`HTTP_FAILURE`、`INACTIVE`）只有狀態碼、通過識別字檢查的 provider 代碼與 deployment 名稱、次數、等待毫秒與 request 的項目數；`NATIVE_UPGRADE_CUT`（ADR-0009 gate 7）只有固定代碼、次數、毫秒、RID 前 8 碼與 Hosted session ID；`FA_PRIVATE_MEMORY_*`／`FA_TEAM_MEMORY_*` 只有 HTTP 狀態碼、固定的 status／stage／reason／mode 代碼、例外類型名稱（`_exception_type` 的固定對照或類別名稱）、筆數與 token 數、官方 kind 名稱的計數（其他 kind 記成 `unknown`）、通過 `_OFFICIAL_ID` 檢查的 `update_id`／`memory_id`，以及 RID 前 8 碼；`NATIVE_TOOLBOX_FAILED` 只有 method、stage、代碼、狀態碼與例外類型名稱；`NATIVE_HITL_REVIEW_INVALID`／`UNAVAILABLE` 只有固定原因碼、terminal／incomplete 代碼與例外類型名稱，`NATIVE_HITL_AUTHORITY_FAILURE` 只有 operation、狀態碼、固定代碼與例外類型名稱，`NATIVE_HITL_REVIEW_REASONS_DROPPED` 只有固定的 problem 代碼；`NATIVE_STATE_STORE_UNKNOWN` 只有 stage（`get_or_create`／`get`）、表內例外類別名稱與 HTTP 狀態碼，不含 store 名稱（內含 CID）；`FA_NATIVE_HTTP` 只有階段與 action、固定 operation／status／code、例外類型名稱、毫秒、Agent ID 與版本、session／invocation ID 與 RID 的 SHA-256；都沒有對話內容、記憶內容、scope、token 或個資。同一批 logger 的其他行（例如可能帶 runtime 錯誤文字的 `FA_MCP_SERVER_STATUS`、`FA_HOSTED_DISPATCH`，以及記憶 logger 上的 `FA_NATIVE_ASSEMBLY_PARTIAL`）不送。這十六個 logger 改成 INFO 等級，`RESIDENT_SDK_CONTINUED`（INFO，沿用常駐 SDK）才會送。
+- stderr 不變：logger 一旦有 handler，Python 就不再用 `logging.lastResort` 印到 stderr，所以同時把 `logging.lastResort` 本身掛上這十六個 logger（只在 root 沒有 handler 時，也就是 Hosted 入口現況）；stderr 照舊只印 WARNING 以上。
 - 讀回（`log-fa-stage`／`log-fa-dev` 的 Log Analytics；換成要查的 Agent 名稱）：
 
   ```kusto
@@ -7761,7 +7783,7 @@ Team 主人按確認後，API 自動建立一個 Foundry Hosted agent 並登錄�
 
 **CI／CD（`.github/workflows/deploy-staging.yml`＋`deploy/stage/ci_deploy.py`，W13）**：push 到 main 且改到 `deploy/stage/release.json`，或手動觸發；`concurrency` 不取消執行中的部署；job 綁 Environment `staging`、以 OIDC 登入（沒有 GitHub secret），actions 以 SHA 固定。步驟：核對服務中API的commit差異，sync核完整definition而不只看core → 同checkout建API／Hosted／console image → 第一次sync明確defer follow、發布版本 → API更新並等新revision Healthy／healthz → 更新console → `ci_deploy.py follow`重驗版本並等待全部Agent原follow。console 排在 follow 之前（2026-10-05）：API 只讀與自己同 build 的 Hosted 版本，所以 follow 之前，新 build 的 Hosted 回覆只會出現在已被個別跟版的 Agent 上（工作台、排程或 peer 傳話觸發）。先換 console，舊 bridge 就不會讀到它不認得的新欄位（`WireModel` 拒收不認識的欄位）；新 bridge 的新欄位都是選填，可以讀舊回覆。反過來，console 更新失敗時 CI 會停在 follow 之前：新 API 對還沒跟版的 Agent 回 409 `NATIVE_SESSION_CHANGED`，送出在接單前就被擋下，不會遺失或重送，重跑部署即可。原config/ENV核對、未知不盲重試及失敗停止不rollback保持。普通開發PR不觸發部署；只調整既有sync job尾端，不新增Job或權限。Docker push的原三次有界重試與content-addressed內容契約不變。
 
-**CI 身分的權限（全部在 stage RG）**：stage ACR 的 AcrPush；`ca-fa-behavior-stage`、`ca-fa-console-stage` 的 Container Apps Contributor；`job-fa-agent-sync-stage` 的 Container Apps Jobs Operator（Container Apps Contributor 沒有任何 `Microsoft.App/jobs/*` 動作，啟動 job 要 Jobs Operator 的 `jobs/*/action`）；`id-facontext-api-stage`、`id-fa-console-stage` 的 Managed Identity Operator；RG 的 Reader 與 Log Analytics Reader。沒有 Contributor、不能改權限、碰不到 dev。
+**CI 身分的權限（全部在 stage RG）**：stage ACR 的 AcrPush；`ca-fa-behavior-stage`、`ca-fa-console-stage` 的 Container Apps Contributor；`job-fa-agent-sync-stage` 的 Container Apps Jobs Contributor（Container Apps Contributor 沒有任何 `Microsoft.App/jobs/*` 動作；帶 image／args 覆寫啟動 job 要 `jobs/*/action`，2026-11-06 起還要 `jobs/write`，Jobs Operator 不夠）；`id-facontext-api-stage`、`id-fa-console-stage` 的 Managed Identity Operator；RG 的 Reader 與 Log Analytics Reader。沒有 Contributor、不能改權限、碰不到 dev。
 
 ### Verified against（stage Bicep）
 

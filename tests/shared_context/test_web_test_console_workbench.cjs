@@ -2462,6 +2462,29 @@ test("native HITL rule CRUD shows exact text and uses the observed revision",asy
   assert.deepEqual(posts.map(body=>body.expected_rules_revision),[0,1,2]);
 });
 
+test("native HITL 編輯 and 新增一條規則 bring the editor below the list to the owner and name the rule",async()=>{
+  const data=hitlChat(),rules=hitlRead(data).rules;
+  rules.revision=1;rules.etag="etag-1";rules.rules=[{rule_id:"abcdef0123456789",text:"Existing scope",behavior:"allow_automatically"}];
+  const ui=await open(data,{now:Date.parse(when),hitl:async()=>
+    ({ok:true,json:async()=>({rules:copy(rules),commands:[],can_approve:true,read_at:when})})});
+  ui.click("read-hitl-rules");await ui.tick();await ui.tick();
+  const input=ui.nodes.get("hitl-rule-text"),note=ui.nodes.get("hitl-rule-draft-note"),scrolled=[];
+  input.scrollIntoView=()=>scrolled.push("editor");
+  assert.match(note.textContent,/^1 \/ 20 條/);
+  ui.nodes.get("hitl-rule-list").children[0].children.find(node=>node.textContent==="編輯").events.click();
+  assert.equal(input.value,"Existing scope");
+  assert.equal(input.focused,true,"focus moves to the editor, not lost with the rebuilt row");
+  assert.deepEqual(scrolled,["editor"]);
+  assert.equal(note.textContent,"正在編輯規則 ID abcdef01；要改成新增，按「新增一條規則」。");
+  assert.equal(ui.nodes.get("save-hitl-rule").textContent,"確認並更新規則");
+  input.focused=false;
+  ui.click("new-hitl-rule");
+  assert.equal(input.value,"");assert.equal(input.focused,true);assert.deepEqual(scrolled,["editor","editor"]);
+  assert.match(note.textContent,/^1 \/ 20 條/);
+  assert.equal(ui.nodes.get("save-hitl-rule").textContent,"確認並新增規則");
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
+
 for(const editing of [false,true]){
   test(`native HITL deleting another rule preserves the unsent ${editing?"edit":"new"} draft and its revision`,async()=>{
     const data=hitlChat(),rules=hitlRead(data).rules,posts=[];
@@ -9937,21 +9960,23 @@ test("a control record shows its time, Agent, conversation, tool, choice, saved 
   assert.ok(shownText(ui.nodes.get("hitl-command-list")).includes("純讀，不是批准，也不代表效果已完成"));
   assert.equal(whyText(ui,rid),"為什麼問你展開時讀取原卡片；純讀，不是批准。");
 });
-for(const source of ["default","uncertain"]){
-  test(`為什麼問你 (${source}, no rule matched) names the revision, its rules and this action`,async()=>{
-    const {data,view,rid}=controlRecordCase(source==="uncertain"?{source,reason:"review_uncertain"}:{source});
+for(const [source,reason] of [["default"],["uncertain","review_uncertain"],["uncertain","review_invalid"],["unavailable","review_unavailable"]]){
+  test(`為什麼問你 (${reason||source}, no rule matched) names the revision, its rules and this action`,async()=>{
+    const {data,view,rid}=controlRecordCase(reason?{source,reason}:{source});
     const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async()=>({ok:true,json:async()=>copy(view)})});
     await openRulesTab(ui);
     await openWhy(ui,rid);
     assert.ok(ui.calls.some(call=>call.url===`/api/native-hitl/attachment-thread/pending/${"a".repeat(64)}`));
     const text=whyText(ui,rid);
     assert.ok(text.includes("當時審查用的是第 3 版規則，就是目前這一版。"),text);
-    assert.ok(text.includes("當時第 3 版的規則都沒有套用到這個動作。"),text);
+    // Only a completed review decided that no rule applied; uncertain, invalid or unavailable decided nothing.
+    assert.equal(text.includes("當時第 3 版的規則都沒有套用到這個動作。"),source==="default",text);
     assert.ok(text.includes("第 3 版規則：「執行 shell 前先問我」（先問我）"),text);
     assert.ok(text.includes("這次的動作：run_command（shell，目標 <b>original workspace</b>）"),text);
     assert.ok(text.includes("echo <script>do not execute this HTML</script>"),text);
-    assert.ok(text.includes(source==="uncertain"?"系統無法確定這個動作是否在你原本的要求範圍內":
-      "這個動作需要先取得你的同意"),text);
+    assert.ok(text.includes({review_uncertain:"系統無法確定這個動作是否在你原本的要求範圍內",
+      review_invalid:"這次自動判斷的結果不完整，所以請你決定。",
+      review_unavailable:"這次自動判斷沒有得到可用的結果，所以請你決定。"}[reason]||"這個動作需要先取得你的同意"),text);
   });
 }
 test("為什麼問你 falls back to this workbench's saved fields when the original card cannot be read",async()=>{
@@ -10020,7 +10045,7 @@ test("為什麼問你 keeps the card's own newer revision when the rules list ab
   assert.ok(text.includes("當時審查用的是第 4 版規則，就是目前這一版。"),text);
   assert.ok(text.includes("第 4 版規則：「執行 shell 前先問我」（先問我）"),text);
 });
-const MODEL_LABEL="以下是自動審查模型對每條規則的說明，只供參考，不一定正確，也不影響這次是否要問你：";
+const MODEL_LABEL="以下是自動審查模型對規則的說明，只供參考，不一定正確，也不影響這次是否要問你：";
 for(const [name,review,expected] of [
   ["a matched rule of this revision",{source:"rules",matched_rule_ids:["r".repeat(64)],
     rule_reasons:{["r".repeat(64)]:"這是 <b>shell</b> 指令"}},"「執行 shell 前先問我」（先問我）：適用。模型說明：這是 <b>shell</b> 指令"],
@@ -10038,6 +10063,21 @@ for(const [name,review,expected] of [
     assert.ok(text.includes(MODEL_LABEL+expected+"這次的動作："),text);
     assert.equal(/命中的規則|版規則：「/.test(text),false,text);
     if(review.source==="uncertain")assert.equal(text.includes("都沒有套用"),false,text);
+  });
+}
+for(const [name,reasons,expected] of [
+  ["lists the matched rule first",{["q".repeat(64)]:"不是 echo",["r".repeat(64)]:"這是 shell 指令"},
+    "「執行 shell 前先問我」（先問我）：適用。模型說明：這是 shell 指令「可以執行 echo」（自動允許）：不適用。模型說明：不是 echo"],
+  ["shows only the matched rule an allow explained",{["r".repeat(64)]:"這是 shell 指令"},
+    "「執行 shell 前先問我」（先問我）：適用。模型說明：這是 shell 指令"],
+]){
+  test(`為什麼問你 ${name}`,async()=>{
+    const {data,view,rid}=controlRecordCase({source:"rules",matched_rule_ids:["r".repeat(64)],rule_reasons:reasons});
+    view.rules.rules.push({rule_id:"q".repeat(64),text:"可以執行 echo",behavior:"allow_automatically"});
+    const ui=await open(data,{now:Date.parse("2026-11-04T02:00:00Z"),hitl:async()=>({ok:true,json:async()=>copy(view)})});
+    await openRulesTab(ui);
+    await openWhy(ui,rid);
+    assert.ok(whyText(ui,rid).includes(MODEL_LABEL+expected+"這次的動作："),whyText(ui,rid));
   });
 }
 test("為什麼問你 shows no model explanation when the review has none",async()=>{
@@ -10255,20 +10295,50 @@ test("the allowed log is read on a click, follows empty pages with a cursor and 
   assert.match(ui.text("hitl-allowed-note"),/^自 .*11:00:00（台灣時間） 起共 3 筆。純讀，不是批准，也不代表效果已完成。$/);
   assert.ok(html.includes("<summary>放行紀錄（實際執行的受管呼叫；純讀，不是批准）</summary>"));
 });
-test("an unfinished scan never says there are no allowed calls",async()=>{
+// Scan pages come in RowKey (digest) order, so the newest call can sit on the last page of the window.
+function scanPages(last,lastEntries,{broken=null}={}){
   const pages={"/api/native-hitl/team/rule-history":ruleHistoryPage(fourRevisions),
-    "/api/native-hitl/team/allowed":allowedPage([],"c0")};
-  for(let i=0;i<12;i++)pages[`/api/native-hitl/team/allowed?cursor=c${i}`]=allowedPage([],`c${i+1}`);
+    "/api/native-hitl/team/allowed":allowedPage([allowedThree[2]],"c0")};
+  for(let i=0;i<last;i++)if(i!==broken)pages[`/api/native-hitl/team/allowed?cursor=c${i}`]=allowedPage([],`c${i+1}`);
+  pages[`/api/native-hitl/team/allowed?cursor=c${last}`]=allowedPage(lastEntries);
+  return pages;
+}
+test("one click reads the whole window, so the newest call on the last scan page is listed first",async()=>{
+  const {data,hitl,seen}=historyCase(scanPages(11,[allowedThree[1]]));
+  const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
+  await openRulesTab(ui);
+  ui.click("read-hitl-allowed");for(let i=0;i<80;i++)await ui.tick();
+  assert.equal(seen.filter(url=>url.includes("/allowed")).length,13);
+  const rows=allowedTexts(ui);
+  assert.equal(rows.length,2);
+  assert.match(rows[0],/10:30:00（台灣時間） · FA 助理 · 執行：echo 只這次/);
+  assert.match(ui.text("hitl-allowed-note"),/起共 2 筆。純讀，不是批准，也不代表效果已完成。$/);
+  assert.equal(ui.nodes.get("read-hitl-allowed-more").hidden,true);
+});
+test("an unfinished scan never says there are no allowed calls and 繼續讀取 resumes at the saved cursor",async()=>{
+  const pages=scanPages(11,[allowedThree[1]],{broken:5});
   const {data,hitl,seen}=historyCase(pages);
   const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
   await openRulesTab(ui);
-  await readAllowed(ui);
-  assert.equal(seen.filter(url=>url.includes("/allowed")).length,10);
-  assert.match(ui.text("hitl-allowed-note"),/已讀到 0 筆，還沒讀完；按「繼續讀取」。不能當成只有這些。$/);
+  ui.click("read-hitl-allowed");for(let i=0;i<80;i++)await ui.tick();
+  assert.equal(seen.filter(url=>url.includes("/allowed")).length,7);
+  assert.match(ui.text("hitl-allowed-note"),/^放行紀錄讀不到：.*；已讀到的 1 筆保留。$/);
   assert.equal(ui.text("hitl-allowed-note").includes("沒有放行紀錄"),false);
   assert.equal(ui.nodes.get("read-hitl-allowed-more").hidden,false);
-  ui.click("read-hitl-allowed-more");for(let i=0;i<30;i++)await ui.tick();
-  assert.equal(seen.filter(url=>url.includes("/allowed"))[10],"/api/native-hitl/team/allowed?cursor=c9","繼續讀取 resumes at the saved cursor");
+  pages["/api/native-hitl/team/allowed?cursor=c5"]=allowedPage([],"c6");
+  ui.click("read-hitl-allowed-more");for(let i=0;i<80;i++)await ui.tick();
+  assert.equal(seen.filter(url=>url.includes("/allowed"))[7],"/api/native-hitl/team/allowed?cursor=c5");
+  assert.match(allowedTexts(ui)[0],/執行：echo 只這次/);
+  assert.equal(ui.nodes.get("read-hitl-allowed-more").hidden,true);
+});
+test("a cursor seen before stops the scan as an invalid record instead of looping",async()=>{
+  const pages=scanPages(11,[]);pages["/api/native-hitl/team/allowed?cursor=c3"]=allowedPage([],"c1");
+  const {data,hitl,seen}=historyCase(pages);
+  const ui=await open(data,{now:Date.parse("2026-11-04T03:00:00Z"),hitl});
+  await openRulesTab(ui);
+  ui.click("read-hitl-allowed");for(let i=0;i<80;i++)await ui.tick();
+  assert.equal(seen.filter(url=>url.includes("/allowed")).length,5);
+  assert.match(ui.text("hitl-allowed-note"),/^放行紀錄讀不到：.*；已讀到的 1 筆保留。$/);
 });
 test("the allowed log filters by rule and says when that rule allowed nothing in the read range",async()=>{
   const {data,hitl}=historyCase({"/api/native-hitl/team/rule-history":ruleHistoryPage(fourRevisions),

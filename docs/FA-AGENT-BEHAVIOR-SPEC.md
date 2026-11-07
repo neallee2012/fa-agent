@@ -572,6 +572,7 @@ Published base `78c1d5ecc58426fb499d01387bff10b4c472995b`，程式 WIP tree
 之後的呼叫才是 `rule`。authorization 與 intent 對不上回 `NATIVE_HITL_RECORD_INVALID`。一個 action 最大約
 `NATIVE_HITL_BODY_BYTES`，所以一頁累積到約 480 KiB 就停，cursor 記住同一個掃描頁裡最後一筆，下次從它之後接著讀；
 約 190 KB 的 action 一頁兩筆，整頁小於 `NATIVE_HITL_HTTP_BYTES`，測試鎖住。空頁仍可能有 `next_cursor`，不能當成沒有紀錄。
+`entries` 依掃描的 RowKey（digest）順序，不是時間序；client 要讀到 `next_cursor=null` 才能排新到舊（工作台一次點擊讀完，2026-11-06）。
 不新增列、欄位或索引（決策 D3）；自動拒絕不在這裡（D6）。掃描在 Azure Table 上的頁數與延遲只能在 dev 量，尚未量。
 `NativeHitlRuleHistoryPage` 與這兩個 DTO 都在 API 專用的 `native_hitl_audit_wire`，Hosted 不讀，不在固定的 wire 快照裡。
 
@@ -1259,6 +1260,15 @@ fresh／queued錯版不啟SDK；官方recovery只可讀原材料交接，不在�
 ## 2026-11-05 HITL：自動審查逐條規則的說明（D2，Neal 決定，CODE/offline，未部署）
 
 Neal 2026-11-05 決定 D2＝要：自動審查對這一版的每條規則各回一句說明，跟著審查結果保存，工作台「為什麼問你」逐條顯示。
+Neal 2026-11-06 改成**只在出卡時寫全部說明**：模型自己判定先問或拒絕時，每條規則各一句；自動允許時只寫命中的規則（沒命中就不寫）。
+原因是 dev 量測（run 4841，gpt-5.4-mini，20 條規則）：每次審查的輸出由 191 增到 1228 token、1.6 秒變 5.0 秒、USD 0.0018 變 0.0086，
+全花在寫 20 條說明，自動允許時也一樣，但沒有人會看；第一個 byte 的時間不變。
+只靠提示要求時，dev 重量（run 4851）看到模型自動允許時仍寫 20 條說明（輸出 1136 token），檢查把說明整份丟掉，自動允許反而存 0 條；
+所以改成由 strict schema 的形狀本身表達：自動允許只能在命中的規則旁邊寫說明。
+第一版只改了自動允許的形狀，dev（run 4861，`405141db`）看到出卡時模型反而只寫很少幾條（輸出 126 token），清單少了規則而被丟掉；
+所以出卡的形狀也改成每條規則一個必填欄位。
+目前形狀（run 4863，`858c0115`）：自動允許輸出 89 token、總時間 p50 1.4 秒／最大 1.5 秒、每次約 USD 0.0041，各存 1 條說明；
+出卡 985／1013 token、4.6／4.3 秒，各存 20 條，命中的規則排第一。
 這段說明是模型寫的參考文字，**不影響**允許／先問／拒絕：結果仍只由 `matched_rule_ids`、`uncertain`、`takeover_required` 和「先問我」規則決定。
 
 分兩個 PR 上線，因為部署時 Hosted 版本比 API 先換：
@@ -1266,6 +1276,41 @@ Neal 2026-11-05 決定 D2＝要：自動審查對這一版的每條規則各回�
 1. **第 1 步，欄位與顯示：** API、bridge 收得下帶說明的審查，工作台會顯示；Hosted 還不送說明，所以畫面上暫時看不到。
 2. **第 2 步，Hosted 送說明：** 自動審查向模型要說明並保存。第 1 步部署到 stage 之後才合併；合併、部署後真的卡片才會有說明。
 
+- **模型回什麼（第 2 步）：** structured output 外層只有 `decision`，它是兩種形狀二選一（`anyOf`）。
+  `allow` 依序有 `outcome`、`matched_rule_ids`、`uncertain`、`takeover_required` 與 `matched_reasons`：`matched_reasons` 是字串清單，依位置對應 `matched_rule_ids`，說明裡沒有規則 ID，
+  所以說明加不出命中規則；沒命中的規則在 schema 裡沒有位置。dev run 4862 曾讓每項同時帶 `rule_id` 與 `reason`，模型把一條自己寫「不適用」的
+  「先問我」規則也列進來，允許因此變成先問，說明改變了結果，所以拆開。
+  `ask`／`deny` 依序有 `outcome`、`matched_rule_ids`、`uncertain`、`takeover_required` 與 `rule_results`；`rule_results` 是物件，本版每條規則的 ID 都是必填的 key，值是說明，
+  所以出卡時不能漏寫任何一條（依規則順序）。
+  兩種形狀都把 `outcome` 放第一個，`matched_rule_ids`、`uncertain`、`takeover_required` 放在任何說明之前；輸出照 schema 的 key 順序，所以會影響結果的欄位都在說明之前寫完（原本 `uncertain`、`takeover_required` 在外層、排在 `decision` 後面，模型要先寫完最多 20 條說明才決定）。
+  Azure（[structured outputs](https://learn.microsoft.com/azure/foundry/openai/how-to/structured-outputs)，2026-08-24 版）與
+  OpenAI（[structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)）的 strict 模式都支援非根層的 `anyOf` 與 `enum`，
+  兩條 wire（Responses、Chat Completions）共用同一套限制；Azure 把陣列的 `minItems`／`maxItems` 列為不支援，
+  所以「每條一項」用必填的 key 表達，不用 `minItems`；Hosted 讀回時把物件轉回清單，照舊檢查。
+  `matched_rule_ids` 只能填本版規則 ID（strict schema 的 `enum`；沒有規則時它和 `matched_reasons` 都是 `maxItems: 0`）。
+  `_ReviewOutput`（釘住的 wire model）不變：Hosted 把 `decision` 攤平回它再照舊驗，`allow` 的 `matched_reasons` 依位置配回 `matched_rule_ids`。
+  代價：`decision` 兩種形狀各帶一份規則 ID，schema 比原本長，每次審查的輸入多約 800 token（dev 量到 4058（run 4851）→ 約 4910（run 4863））；
+  說明另外檢查；strict 模式不支援 `maxLength`，所以 200 字的上限寫在提示裡，
+  保存時截到 200 字，提示請模型只寫一句 60 字以內的短話。輸出上限由固定 16000 改成 `16000 + 260 × 規則數`（20 條時 21200 token）：
+  260 是一條 200 字中文說明連同 64 字元 ID 用 o200k 量到約 257 token，16000 沿用 main 給推理模型的值；整個上限仍是估計，不是量測值。
+  上限跟著規則數走，因為 Azure 會把上限算進 TPM 配額，規則少的 Team 不必每次先佔最大值。
+  審查用的是這一回合的模型，推理模型的推理 token 也算在同一個上限裡；超過上限回答不完整，整個審查變成 `review_invalid`（先問你）。
+  串流回答的大小上限原本固定 256 KiB，一個 token 一個事件時幾條最長的說明就會超過（推算）；改成固定 3.5 MiB：
+  20 條都命中、每條 200 字中文、拆成每字一個事件（每字在事件裡跳脫成 `\uXXXX`），量到 chat chunk 3.3 MiB、Responses 1.8 MiB。
+  送模型的 sender 本來就把每個串流限在 4 MiB（`BoundedStream`，超過是 `review_unavailable`，也是先問），所以這個上限要比它小才有作用；
+  原本的公式在 15 條以上時已經超過 4 MiB，其實沒有作用。
+  適用與否只看 `matched_rule_ids`，所以清單不再另帶 `verdict`（原本跟 `matched_rule_ids` 重複）。
+  回答因上限被截斷時，`NATIVE_HITL_REVIEW_INVALID` 的 `terminal`／`incomplete`（`length` 或 `max_output_tokens`）已標出；
+  它和 `NATIVE_HITL_REVIEW_REASONS_DROPPED` 都在 `sdk_telemetry.LOG_PREFIXES`，會匯出到 AppTraces，dev 可以直接算截斷率與丟說明的次數。
+  代價：會出卡的審查要等模型把每條說明寫完才繼續；自動允許只多寫命中規則的說明。
+- **什麼時候保存（第 2 步）：** 以模型自己回的 `outcome` 為準（不是之後因「先問我」規則或接手改過的結果）。`allow` 的 `matched_reasons` 要跟 `matched_rule_ids` 一樣多條
+  （多一句、少一句，包括沒命中卻寫了說明，或命中 ID 重複，都只丟說明，`problem=ids`；不是清單或缺少也只丟說明）。`ask`／`deny` 的 `rule_results` 要剛好是這一版每條規則各一次（不是物件、少一條或多出不明 ID 都只丟說明）；說明不能是空白，
+  也要通過 wire 的同一個檢查（例如落單的 UTF-16 surrogate 會被擋）。不符合就只丟掉說明、留 log
+  `NATIVE_HITL_REVIEW_REASONS_DROPPED problem=missing|type|blank|ids`，審查本身照常，不會變成 `review_invalid`。
+  例外：回答 JSON 任何一層有重複的 key（包括 `rule_results` 裡），整份回答照舊視為無效，變成 `review_invalid`（先問你）；
+  另外兩種說明的問題也讓整份審查變成 `review_invalid`：一種形狀帶了另一種的說明欄位（例如 `allow` 帶 `rule_results`），被 `extra="forbid"` 擋下（`reason=schema`）；串流超過 3.5 MiB（`reason=too_large`）。
+  這三種都只會把允許變成先問，不會把先問或拒絕變成允許。`uncertain` 審查不保存說明（它沒有判定任何規則），
+  所以卡片只列規則，不會出現模型的字。
 - **欄位：** `NativeHitlReview.rule_reasons`，`{rule_id: reason}`，最多 20 條、每條 1–200 字（Hosted 依該版規則順序產生，wire 不檢查順序）。
   適用與否不另存：`rule_id` 在 `matched_rule_ids` 裡就是適用。空的時候不輸出（同 `reviewed_at`），所以舊審查的 bytes、
   digest、pending ID／digest 都不變；舊資料不回填。wire 檢查：`unavailable`／`toolbox` 不能帶說明；有說明時每個命中規則都要有說明。API 建 pending 與 authorize 時，說明的規則也要在目前這一版。
@@ -1273,7 +1318,7 @@ Neal 2026-11-05 決定 D2＝要：自動審查對這一版的每條規則各回�
   反過來，帶說明的審查送到舊 API 會被拒，舊 bridge 讀到帶說明的卡片會回 `NATIVE_HITL_RECORD_INVALID`。
   deploy-staging 和 dev 的 ci_deploy 先同步 Hosted 版本、後更新 API，所以 Hosted 送說明的改動要等 API 與工作台已在這一版以上才合併。
   v2 additive 檢查通過（新欄位預設不輸出），只重產 profile 快照。`NATIVE_HITL_BODY_BYTES` 的餘裕由 24 KiB 加到 40 KiB，放得下 20 條說明。
-- 驗證與限制見 [Shared Context README](../src/fa-shared-context-poc/README.md#hitl-rule-reasons)。
+- 驗證與限制見 [Shared Context README](../src/fa-shared-context-poc/README.md#hitl-rule-reasons)；真模型寫得好不好、多花多少 token 要在 dev 看。
 
 ## 2026-10-03 HITL：owner 事後讀自動審查原文（CODE/offline）
 

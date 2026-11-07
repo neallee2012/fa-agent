@@ -538,7 +538,7 @@ Neal 2026-10-23 的決定：「長期記憶是一個重要的元素，不能沒�
 | api／console／feed | ARM PATCH（`ci_deploy.py:907-952`）、API `/healthz`（`ci_deploy.py:1023-1032`） | 無 | 無（API 入口維持公網＋Entra） |
 | public-sync | 不登入 Azure（只有 checkout、gitleaks、scrub、push） | 無 | 無；但見阻礙 5 |
 
-- CI 身分只有 stage RG 內的 AcrPush、Container Apps Contributor、Jobs Operator、Managed Identity Operator、Reader＋Log Analytics Reader，沒有任何 Foundry 角色（`stage-ci-identity.bicep:3-5`、`24-32`）。
+- CI 身分只有 stage RG 內的 AcrPush、Container Apps Contributor、Jobs Contributor、Managed Identity Operator、Reader＋Log Analytics Reader，沒有任何 Foundry 角色（`stage-ci-identity.bicep:3-5`、`24-32`）。
 - azd 的後續部署 `upgrade()` 就是同一組步驟（`fa_azd.py:1506-1519`），只有要設定 WebIQ 時才開部署者 IP 窗口（`fa_azd.py:1050-1065`）。
 - **結論**：本 ADR 第 5 節的備案「資料面步驟進 VNet 內的 Job」，對例行 CI 部署早已是現況。從 VNet 外打資料面的只剩一次性步驟：建 seed Agent 版本（`fa_azd.py:1172-1184`）、WebIQ connection 與 toolbox（`fa_azd.py:1438-1444`）、WebIQ 金鑰輪替（`deploy/README.md:251-259`）。
 - [實測] 間接證據：`fa-priv-1024` 以 #971 重新部署過一次（升級路徑，progress.md:78）。從 GitHub runner 對 `private` 環境跑完整 CI 沒有做過。
@@ -571,7 +571,7 @@ Neal 2026-10-23 的決定：「長期記憶是一個重要的元素，不能沒�
 |---|---|---|---|
 | 要改什麼 | `ci_deploy.py` 新增開窗、關窗、讀回，搬 `fa_azd.py` 的 `patch_window`／`close_window`／`window_closed`（`fa_azd.py:916`、`929-1007`）；CI 身分要帳號的 `Microsoft.CognitiveServices/accounts/write`（自訂角色也等於能改帳號任何屬性）；`confirm_window` 要求輸入的 IP 等於當下讀到的 IP（`fa_azd.py:1020`），runner 的 IP 事前不知道，CI 只能自我確認，等於拿掉本 ADR 第 5 節的人為確認 | 例行步驟不用改（第 2 節）；要有新 VNet 的 Foundry private endpoint 與三個 DNS zone（azd `private` 已建），以及 API 身分在新 project 的 Foundry User＋OpenAI User（azd 給）。若要把一次性步驟也搬進去：內嵌 seed／WebIQ 腳本、改用受控身分、intent 檔改存 Table／Blob、結果經 Log Analytics 傳回（第 5 節備案清單）；WebIQ 金鑰要經 job secret | 新 VM 或 Container Apps job runner（GitHub runner scaler）、註冊用 PAT 或 GitHub App；workflow 改 `runs-on`。Container Apps job 不能跑 Docker [文件]，`build` 要留在 GitHub runner 或改 `az acr build`；GitHub 的 Azure private networking 只支援 larger runners、在組織層設定 [文件]，本 repo 是個人帳號的免費 private repo（ADR-0008 §2） |
 | 費用 | 0 | job 按執行秒計，近 0 | VM 約 USD 30–40／月 [推論]，或 job 按秒計；維護另計 |
-| 風險 | GitHub 不建議拿 runner IP 當允許清單；Ubuntu runner 用 Azure 資料中心的 IP 範圍 [文件]，窗口開著時同一出口的其他工作也能進來；job 被取消時關窗可能沒跑到，要靠下一次部署先關 | 例行路徑不變。能 start job 的身分可讀 job secret、用 job 的受控身分 [文件]：CI 身分已有 Jobs Operator，範圍維持只限 sync job | 自架 runner 可能被 workflow 程式持續入侵，要用 JIT runner [文件]；多一套要修補、輪替的東西 |
+| 風險 | GitHub 不建議拿 runner IP 當允許清單；Ubuntu runner 用 Azure 資料中心的 IP 範圍 [文件]，窗口開著時同一出口的其他工作也能進來；job 被取消時關窗可能沒跑到，要靠下一次部署先關 | 例行路徑不變。能 start job 的身分可讀 job secret、用 job 的受控身分 [文件]：CI 身分已有 Jobs Contributor，範圍維持只限 sync job | 自架 runner 可能被 workflow 程式持續入侵，要用 JIT runner [文件]；多一套要修補、輪替的東西 |
 | dev 可測 | 可，要新的 dev CI 身分與 FIC（IAM） | 可，現有 azd 環境即可 | 可，要新資源 |
 | 結論 | 例行部署不需要。只留給操作者在筆電跑一次性步驟（今天的 fa_azd 窗口，有確認與讀回） | **採用**（現況） | 目前不需要；之後 `isolated`（ACR 改私有）才要重新評估 |
 
@@ -634,7 +634,7 @@ Neal 2026-10-23 的決定：「長期記憶是一個重要的元素，不能沒�
 ### 7. WAF 五大支柱（A2＋B1）
 
 - **可靠性**：stage 有自己的帳號，故障範圍與各部署的 TPM 不再和 dev 共用；模型配額仍以「訂閱＋區域」合計（stage 與 dev 同一個訂閱），見阻礙 1；例行部署路徑不變，失敗就停、往前修；agent subnet /24；Cosmos 單一區域、不開 AZ（ADR-0011）。
-- **安全性**：Foundry 入站私有；CI 身分不拿 Foundry 帳號寫入權；能 start job 等於能用 job 的 secret 與受控身分 [文件]，所以 Jobs Operator 維持只限 sync job；Work IQ 由 API 拒絕；Team 資料仍經公網 TLS 到 API（本 ADR 範圍，不宣稱全私有）。
+- **安全性**：Foundry 入站私有；CI 身分不拿 Foundry 帳號寫入權；能 start job 等於能用 job 的 secret 與受控身分 [文件]；Jobs Contributor 另外能持久修改或刪除這個 job（帶覆寫啟動自 2026-11-06 起要 `jobs/write`，內建角色只有它同時有 start 與 write），所以維持只限 sync job；Work IQ 由 API 拒絕；Team 資料仍經公網 TLS 到 API（本 ADR 範圍，不宣稱全私有）。
 - **成本**：每月加價約 USD 58 [推論]，加上並存期的重複費用；不買 runner VM，不加 Firewall。
 - **營運卓越**：`deploy-staging.yml` 不改；同一份 azd Bicep 服務 dev 演練與 stage；一次性步驟留在有確認與讀回的 azd 窗口；`private` 擋住外部 logstream，靠 Log Analytics 與 App Insights。
 - **效能**：Hosted 出站多一段 NAT（探針 68–292 ms）；記憶延遲及格線未判定；API 每次新 revision 約 5–6 分鐘才開好 port（progress.md:32，與網路無關）。
