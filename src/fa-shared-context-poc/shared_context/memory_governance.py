@@ -215,7 +215,6 @@ class ContextResult:
     manifest: ContextManifest
     claims: tuple[ReviewedClaim, ...]
     originals: Mapping[str, bytes]
-    summary: str | None
 
 
 def claim_digest(candidate: ClaimCandidate, scope: SourceScope) -> str:
@@ -491,5 +490,4 @@ class MemoryGovernance:
             sections=tuple(sections), total_tokens=total_tokens, total_bytes=total_bytes,
             omissions=tuple(omissions), exact_source_fallback=True,
         )
-        return ContextResult(manifest, claims, MappingProxyType({key: item.original for key, item in originals.items()}),
-                             None)
+        return ContextResult(manifest, claims, MappingProxyType({key: item.original for key, item in originals.items()}))

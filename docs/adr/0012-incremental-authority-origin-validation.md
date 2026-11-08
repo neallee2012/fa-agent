@@ -1,6 +1,8 @@
 # 已安裝來源的增量核對：啟動與逐請求只驗新寫入的部分
 
 > 2026-10-30 註：本文提到的 `validate_additions`、`_quiescence`、`behavior_migration_cli`、rotation 與 transition 程式已刪除；內容保留為當時紀錄，不改寫。
+>
+> 2026-11-07 註：`behavior_turn_ticket.restore_turn_tickets` 也已在 `a86c8f7b`（2026-11-04）刪除，開機不再從既有列重建 ticket index；`ticket_index` 保留。下文提到它的地方同樣是當時紀錄。
 
 狀態：**已撤回**（2026-10-29，Neal）｜原狀態：**提案（待審）**｜提出日期：2026-10-28 +08｜第 1 版｜Neal 2026-10-28 同意先修（「這三個問題可以先修嗎」）；本文只是設計，尚未實作。
 

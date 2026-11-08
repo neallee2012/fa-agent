@@ -766,6 +766,217 @@ def test_usage_is_recorded_once_after_a_ten_minute_api_outage(local_env):
     assert current.status == "completed" and current.notification_error is None and len(sdk.calls) == 1
 
 
+def test_native_tool_list_is_pinned_for_every_profile_and_flag(tmp_path):
+    """The tools handed to the SDK: names in order, description and schema, per declared set and turn flags."""
+    import hashlib
+
+    def digest(value):
+        return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+    executor = native_sdk.NativeSdkExecutor(
+        root=tmp_path, runtime_path=tmp_path / "OFFLINE-not-executed", api_url="https://api.offline.invalid",
+        model_url=MODEL_ROOT, token_provider=lambda: "OFFLINE",
+    )
+    table = {}
+    for caps in sorted({native_sdk.assemble_prompt(p).record.declared_capabilities for p in native_sdk._PROFILES}):
+        for origin in (None, "fa-turn-origin-v1"):
+            for files, images in ((None, False), ("fa-user-text-files-v1", False), ("fa-user-text-files-v1", True)):
+                settings = SimpleNamespace(turn_origin_profile=origin, user_text_file_profile=files)
+                receipt = SimpleNamespace(command=None, capture=SimpleNamespace(
+                    template=SimpleNamespace(settings=settings), model=SimpleNamespace(supports_image_input=images)))
+                names = caps if files is None or "read_user_file" in caps else (*caps, "read_user_file")
+                table["|".join((",".join(caps), str(origin), str(files), str(images)))] = [
+                    (tool.name, digest(tool.description), digest(json.dumps(tool.parameters, sort_keys=True)))
+                    for tool in executor._tools(receipt, names, None)]
+    assert len(table) == 30
+    assert sorted({tool for tools in table.values() for tool in tools}) == [
+        ("execute_operation", "9696b913b21b0685", "28db59f168f9851b"),
+        ("read_assistant_reply", "6e10b2e762e20034", "25e61affe6f66972"),
+        ("read_context", "9696b913b21b0685", "28db59f168f9851b"),
+        ("read_context", "d7a5127701249a89", "28db59f168f9851b"),
+        ("read_user_file", "26aada9286cef0ea", "0258c300f9867ed5"),
+        ("read_user_file", "8a0d7a92b2b36982", "0258c300f9867ed5"),
+        ("read_user_turn", "6e10b2e762e20034", "25e61affe6f66972"),
+    ]
+    whole = hashlib.sha256(json.dumps(table, sort_keys=True).encode()).hexdigest()
+    assert whole == "d283fd553343f20c30ccb6ee26943f7a4c25bb2baab1d52be90708e4a3df50f2", table
+
+
+def _past(n, *, human=True, source=None, continuation=None, turn_number="same", files=()):
+    command = SimpleNamespace(content=f"text {n}", files=tuple(SimpleNamespace(name=f, text=f"{f} body") for f in files))
+    return SimpleNamespace(request_id=f"rid-{n}", turn_number=n if turn_number == "same" else turn_number,
+                           human_origin=human, source=source, continuation=continuation, routine=None, command=command)
+
+
+class _HistoryReader:
+    def __init__(self, *turns, parts=("whole",), failure=None):
+        self.turns, self.parts, self.failure = {turn.request_id: turn for turn in turns}, parts, failure
+
+    async def history(self, query):
+        if self.failure is not None:
+            raise self.failure
+        return SimpleNamespace(turns=[
+            SimpleNamespace(turn_number=n, request_id=turn.request_id, source=turn.source, routine=None)
+            for turn in self.turns.values()
+            if query.after_turn < (n := int(turn.request_id[4:])) <= query.after_turn + query.limit])
+
+    async def read(self, request_id):
+        return self.turns[request_id]
+
+    async def result(self, query):
+        last = query.part == len(self.parts) - 1
+        return SimpleNamespace(text=self.parts[query.part], next_part=None if last else query.part + 1)
+
+
+@pytest.mark.parametrize(("name", "args", "reader", "origin", "stops", "refusal", "outcome"), [
+    ("execute_operation", {}, _HistoryReader(), None, 0, "This native turn has no job-bound", None),
+    ("read_context", {}, _HistoryReader(), None, 0, "This native turn has no job-bound", None),
+    ("read_context", {}, _HistoryReader(), "fa-turn-origin-v1", 1, "The original native turn is no longer", None),
+    ("read_user_turn", {"turn_number": 1}, _HistoryReader(_past(1)), None, 1,
+     "The original native turn is no longer", "unavailable"),
+    ("read_user_turn", {"turn_number": 1}, None, None, 0, "The original native turn is no longer", "unavailable"),
+    ("read_user_turn", {"turn_number": 3}, _HistoryReader(), None, 0, "Only completed past turns", "unavailable"),
+    ("read_user_turn", {"turn_number": 2}, _HistoryReader(_past(1)), None, 0,
+     "The original completed turn is unavailable", "unavailable"),
+    ("read_user_turn", {"turn_number": 1}, _HistoryReader(_past(1, human=False)), None, 0,
+     "This was an Agent, scheduled or continuation", "unavailable"),
+    ("read_user_turn", {"turn_number": 1}, _HistoryReader(_past(1, continuation="c")), None, 0,
+     "This was an Agent, scheduled or continuation", "unavailable"),
+    ("read_assistant_reply", {"turn_number": 1},
+     _HistoryReader(failure=Problem(503, "NATIVE_OFFLINE_X", "offline")), None, 0,
+     "Original native history is unavailable [NATIVE_OFFLINE_X].", "unavailable"),
+    ("read_user_file", {"name": "a.txt", "turn_number": 1}, _HistoryReader(_past(1, human=False, files=["a.txt"])),
+     None, 0, "This was Agent-provided or scheduled data", "unavailable"),
+    ("read_user_file", {"name": "a.txt", "turn_number": 1},
+     _HistoryReader(_past(1, turn_number=None, files=["a.txt"])), None, 0, "The original human attachment has no verified", "unavailable"),
+    ("read_user_file", {"name": "a.txt"}, _HistoryReader(_past(1, turn_number=None, files=["a.txt"])), None, 0,
+     "The original human attachment has no verified", "unavailable"),
+    ("read_user_file", {"name": "a.txt"}, _HistoryReader(_past(1, source="agent", files=["a.txt"])), None, 0,
+     "No earlier user turn in this conversation attached", "not_found"),
+    ("read_user_file", {"name": "a.txt"}, _HistoryReader(_past(1, files=["a.txt"])), None, 2,
+     "The original native turn is no longer", "unavailable"),
+])
+def test_a_native_history_tool_refuses_by_name_and_counts_the_read(
+        tmp_path, name, args, reader, origin, stops, refusal, outcome):
+    """Each refusal reaches the model as its own message; a history read is counted with its outcome."""
+    from shared_context.m2_copilot import ToolFailure
+
+    executor = native_sdk.NativeSdkExecutor(
+        root=tmp_path, runtime_path=tmp_path / "OFFLINE-not-executed", api_url="https://api.offline.invalid",
+        model_url=MODEL_ROOT, token_provider=lambda: "OFFLINE",
+    )
+    executor.reader = reader
+    calls = iter(range(1, 100))
+    control = SimpleNamespace(stop_requested=lambda: next(calls) == stops, checkpoint_turn=None)
+    seen = []
+    settings = SimpleNamespace(turn_origin_profile=origin, user_text_file_profile=None)
+    receipt = SimpleNamespace(command=None, conversation_id="cid-1", turn_number=3, capture=SimpleNamespace(
+        template=SimpleNamespace(settings=settings), model=SimpleNamespace(supports_image_input=False)))
+    (tool,) = executor._tools(receipt, (name,), control, SimpleNamespace(history_read=lambda *a: seen.append(a)))
+    with pytest.raises(ToolFailure) as refused:
+        asyncio.run(tool.handler({"arguments": args}))
+    assert str(refused.value).startswith(refusal)
+    assert seen == ([] if outcome is None else [(name, args.get("turn_number"), outcome)])
+
+
+def test_a_native_assistant_reply_is_read_whole_across_its_parts(tmp_path):
+    executor = native_sdk.NativeSdkExecutor(
+        root=tmp_path, runtime_path=tmp_path / "OFFLINE-not-executed", api_url="https://api.offline.invalid",
+        model_url=MODEL_ROOT, token_provider=lambda: "OFFLINE",
+    )
+    executor.reader = _HistoryReader(_past(1), _past(2), parts=("first ", "second ", "third"))
+    seen = []
+    receipt = SimpleNamespace(command=None, conversation_id="cid-1", turn_number=3, capture=SimpleNamespace(
+        template=SimpleNamespace(settings=SimpleNamespace(turn_origin_profile=None, user_text_file_profile=None)),
+        model=SimpleNamespace(supports_image_input=False)))
+    control = SimpleNamespace(stop_requested=lambda: False, checkpoint_turn=None)
+    (tool,) = executor._tools(receipt, ("read_assistant_reply",), control,
+                              SimpleNamespace(history_read=lambda *a: seen.append(a)))
+    read = json.loads(asyncio.run(tool.handler({"arguments": {"turn_number": 2}})).text)
+    assert (read["role"], read["text"], read["request_id"], read["turn_number"]) == (
+        "assistant", "first second third", "rid-2", 2)
+    assert seen == [("read_assistant_reply", 2, "read")]
+
+
+def _upload_tool(tmp_path, monkeypatch, reader, uploads, *, images=False, stored=None):
+    from shared_context import behavior_assistant_wire as aw, native_user_uploads
+
+    blobs = stored if stored is not None else {}
+    monkeypatch.setattr(native_user_uploads, "load_upload", lambda upload: blobs[upload.name])
+    executor = native_sdk.NativeSdkExecutor(
+        root=tmp_path, runtime_path=tmp_path / "OFFLINE-not-executed", api_url="https://api.offline.invalid",
+        model_url=MODEL_ROOT, token_provider=lambda: "OFFLINE",
+    )
+    executor.reader = reader
+    seen = []
+    settings = SimpleNamespace(turn_origin_profile=None, user_text_file_profile="fa-user-text-files-v1")
+    receipt = SimpleNamespace(
+        command=aw.InstructionSubmit(request_id="rid-3", content="Read it", uploads=uploads),
+        conversation_id="cid-1", turn_number=3, capture=SimpleNamespace(
+            template=SimpleNamespace(settings=settings), model=SimpleNamespace(supports_image_input=images)))
+    control = SimpleNamespace(stop_requested=lambda: False, checkpoint_turn=None)
+    (tool,) = executor._tools(receipt, ("read_user_file",), control,
+                              SimpleNamespace(history_read=lambda *a: seen.append(a)))
+    return (lambda **args: asyncio.run(tool.handler({"arguments": args}))), seen
+
+
+def _text_upload(name, data=b"plain text"):
+    from shared_context.behavior_user_uploads import UserUpload
+    import hashlib
+    return UserUpload(name=name, sha256=hashlib.sha256(data).hexdigest(), byte_length=len(data),
+                      media_type="text/plain")
+
+
+def test_a_current_turn_upload_is_read_by_its_own_turn_number_and_each_new_file_is_counted_once(
+        tmp_path, monkeypatch):
+    """The file last read stays checked: reading it again is not a new read; another file replaces it."""
+    files = (_text_upload("a.txt"), _text_upload("b.txt", b"other text"))
+    read, seen = _upload_tool(tmp_path, monkeypatch, _HistoryReader(), files,
+                              stored={"a.txt": b"plain text", "b.txt": b"other text"})
+    assert json.loads(read(name="a.txt", turn_number=3).text)["text"] == "plain text"
+    read(name="a.txt")
+    assert json.loads(read(name="b.txt").text)["text"] == "other text"
+    read(name="a.txt")
+    assert seen == [("read_user_file", 3, "read")] * 3
+
+
+def test_an_upload_load_problem_other_than_a_missing_file_is_named_not_called_gone(tmp_path, monkeypatch):
+    from shared_context.m2_copilot import ToolFailure
+
+    def refuse(_upload):
+        raise Problem(503, "NATIVE_OFFLINE_STORE", "offline")
+
+    read, _ = _upload_tool(tmp_path, monkeypatch, _HistoryReader(), (_text_upload("a.txt"),))
+    from shared_context import native_user_uploads
+    monkeypatch.setattr(native_user_uploads, "load_upload", refuse)
+    with pytest.raises(ToolFailure) as refused:
+        read(name="a.txt")
+    assert str(refused.value) == "Original native history is unavailable [NATIVE_OFFLINE_STORE]."
+
+
+def test_a_text_upload_without_text_is_refused_even_for_a_model_that_reads_page_images(tmp_path, monkeypatch):
+    from shared_context import native_user_uploads
+    from shared_context.m2_copilot import ToolFailure
+
+    def no_text(_upload, _data):
+        raise native_user_uploads.NoText
+
+    read, _ = _upload_tool(tmp_path, monkeypatch, _HistoryReader(), (_text_upload("a.txt"),), images=True,
+                           stored={"a.txt": b"plain text"})
+    monkeypatch.setattr(native_user_uploads, "readable", no_text)
+    with pytest.raises(ToolFailure) as refused:
+        read(name="a.txt")
+    assert refused.value.public_code == "USER_FILE_NO_TEXT"
+
+
+def test_the_latest_file_skips_a_non_human_turn_that_attached_the_same_name(tmp_path, monkeypatch):
+    reader = _HistoryReader(_past(1, files=["a.txt"]), _past(2, human=False, files=["a.txt"]))
+    read, seen = _upload_tool(tmp_path, monkeypatch, reader, ())
+    found = json.loads(read(name="a.txt").text)
+    assert (found["text"], found["turn_number"], found["request_id"]) == ("a.txt body", 1, "rid-1")
+    assert seen == [("read_user_file", 1, "read")]
+
+
 def test_native_history_tools_consume_the_actual_runner_invocation_packet(local_env, tmp_path):
     from shared_context.behavior_text_files import UserTextFile
     from shared_context.native_turns import NativeTurnControl

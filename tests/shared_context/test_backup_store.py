@@ -378,7 +378,7 @@ class NoBlobSDK(importlib.abc.MetaPathFinder):
             raise AssertionError('shared imports must not require the Blob SDK')
 sys.meta_path.insert(0, NoBlobSDK())
 from shared_context.backup_models import BackupReceipt
-from shared_context.backup_store import InMemoryBackupStore
+from shared_context.backup_store import BackupStore
 assert 'azure.storage.blob' not in sys.modules
 """], env={**os.environ, "PYTHONPATH": str(source)}, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr

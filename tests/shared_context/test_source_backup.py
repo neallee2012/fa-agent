@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import threading
 from dataclasses import replace
 from datetime import timedelta
 from urllib.parse import parse_qs, unquote, urlsplit
+from uuid import uuid4
 
 import pytest
 from azure.core.exceptions import ServiceRequestError
@@ -18,8 +20,11 @@ from test_backup_store import BlobTransport, Credential
 from test_behavior_store import FakeTable, SCOPE
 from test_source_materials import CONTEXT, NOW, admitted, code, native_state, source_service
 from test_source_reviews import AGENT, HUMAN, HUMAN_CONTEXT
-from shared_context.backup_models import MAX_BACKUP_BYTES
-from shared_context.backup_store import BlobBackupStore, InMemoryBackupStore
+from shared_context.auth import Actor
+from shared_context.backup_models import MAX_BACKUP_BYTES, BackupReceipt, canonical_oid
+from shared_context.backup_store import (
+    BackupDownload, BlobBackupStore, not_found, require_etag, validate_lookup, validate_upload, verify_content,
+)
 from shared_context.behavior_store import BehaviorStore, ControlChanges, ControlRequest
 from shared_context.source_materials import (
     InventoryProtectionVerifier, NoAutoGCConfiguration, SnapshotNode, SourceMaterials, SourceReference,
@@ -74,6 +79,47 @@ class RecoveryCatalog:
         if proof is None:
             raise Problem(403, "TEST_RECOVERY_DENIED", "no current independent recovery decision")
         return proof
+
+
+class InMemoryBackupStore:
+    """Local adapter for the same contract, not evidence of Azure persistence."""
+
+    def __init__(self, tenant_id: str):
+        self.tenant_id = canonical_oid(tenant_id)
+        self._lock = threading.Lock()
+        self._backups: dict[tuple[str, str], tuple[BackupReceipt, bytes]] = {}
+
+    def create(self, actor: Actor, backup_id: str, data: bytes, sha256: str) -> BackupReceipt:
+        validate_upload(backup_id, data, sha256)
+        owner = canonical_oid(actor.oid)
+        with self._lock:
+            key = (owner, backup_id)
+            if key in self._backups:
+                raise Problem(409, "BACKUP_EXISTS", "backup already exists")
+            receipt = BackupReceipt(
+                backup_id=backup_id, owner_oid=owner, sha256=sha256, bytes=len(data),
+                version_id="memory-" + uuid4().hex, etag=f'"memory-{uuid4().hex}"',
+            )
+            self._backups[key] = (receipt, data)
+            return receipt.model_copy()
+
+    def receipt(self, actor: Actor, backup_id: str, version_id: str | None = None) -> BackupReceipt:
+        validate_lookup(backup_id, version_id)
+        with self._lock:
+            result = self._backups.get((canonical_oid(actor.oid), backup_id))
+            if result is None or (version_id is not None and result[0].version_id != version_id):
+                raise not_found()
+            return result[0].model_copy()
+
+    def download(self, actor: Actor, backup_id: str, version_id: str, etag: str | None) -> BackupDownload:
+        if version_id is None:
+            raise Problem(422, "BACKUP_VERSION_REQUIRED", "version_id is required for download")
+        receipt = self.receipt(actor, backup_id, version_id)
+        require_etag(receipt, etag)
+        with self._lock:
+            data = self._backups[(actor.oid, backup_id)][1]
+        verify_content(receipt, data)
+        return BackupDownload(receipt, data)
 
 
 class CountedBackupStore(InMemoryBackupStore):

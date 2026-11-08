@@ -3,6 +3,7 @@
 import hashlib
 import json
 from datetime import timedelta
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ from test_behavior_assistant_server import assistant_configuration
 from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key
+from test_work_cost_policy import install_offline
 from hosted_versions_stub import deployed_versions
 
 
@@ -191,7 +193,7 @@ def test_registered_peer_cannot_attach_to_a_runtime_or_initialize_another_cost_l
         with pytest.raises(Problem) as denied:
             action()
         assert denied.value.body["error"]["code"] == "AGENT_RUNTIME_SCOPE_NOT_WIRED"
-    for action in (control.initial_records, control.install_offline):
+    for action in (control.initial_records, partial(install_offline, control)):
         with pytest.raises(Problem):
             action(c.human, "no-second-ledger", c.h.time + timedelta(minutes=5))
     assert read_startup(c).entity_sha256 == before.entity_sha256

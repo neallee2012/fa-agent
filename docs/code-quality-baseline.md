@@ -809,6 +809,74 @@ CC ≥ 20 少了 48 個。CC ≥ 10 反而多 8 個：拆出來的函式有幾�
   - `controller/progress_b1_b2_build.py:951` 指向已刪的 `test_behavior_dispatch.py`，`:1115`、`:1137`（MEM-02／06）指向被 #1205 改名的兩個 `memory_governance` 測試；這是歷史驗收工具，依協調者指示不改。
   - 當時的驗收紀錄照原樣保留：`docs/status/PROGRESS-B1-B2.json:1832`、`.md:198` 與 `docs/agent-runtime-evaluation-baseline.json:19-21`、`.md:1437`、`:1906`（已刪的 `test_behavior_dispatch.py`），`docs/agent-runtime-evaluation-baseline.json:74-75`（同樣被改名的兩個測試）。
 
+## 第十五輪結果（2026-11-07 至 08）
+
+這輪不改行為，專拆 CC 最高的幾個函式：`_run_turn`、`_post`、`install_assistant_routes`、`_tools`、`cut`／`follow`／`_settle`；另外清掉第十四輪列的三項小後續。做法是先補測試釘住現況、再拆、最後手寫 mutant 補洞。起點是 `014ee8b3`，結束是 `c10b01e5`。
+
+| 項目 | PR | 前 → 後 | mutant |
+|---|---|---|---|
+| 第十四輪小後續 | #1227 | 測試專用的 `_reset_forced_refresh_window`、`InMemoryBackupStore`、`install_offline` 搬進測試；`ContextResult.summary` 拿掉（`exact_source_fallback` 保留：原先寫它恆為常數不準確，`memory_projection` 會設成 True 或 False）；README、ADR-0012 加註已刪的東西。6 個改到的檔函式 209 → 203，CC > 9 仍是 32；`behavior_work_memory_source.load`、`resolve_reviewed_note` 各 20 → 19。沒量覆蓋率 | 3 個殺 3 個 |
+| `_tools` | #1228 | `NativeSdkExecutor._tools` CC 65／覆蓋 85.3%／CRAP 78.4 → CC 1／100%／1；拆出的函式最高是 `_upload_part` CC 9／91.3%／9.05 | 35 個殺 32，3 個等價 |
+| `_run_turn`、`_post` | #1229 | `_run_turn` CC 148／97.1%／148.5 → 7／100%／7；`_post` 46／98.1%／46.0 → 8／100%／8；拆出的函式最高 CC 9（`_grant_tools` CRAP 9.01） | 64 個殺 63，1 個等價 |
+| `install_assistant_routes` | #1230 | CC 100／92.7%／103.9 → 6／100%／6；拆出的函式最高 CRAP 約 7.1（`_model_send`） | 24 個殺 24 |
+| `cut`、`follow`、`_settle` | #1231 | `cut` 64／100%／64.0 → 9／100%／9.0；`follow` 56／96.7%／56.1 → 8／100%／8.0；`_settle` 48／92.7%／48.9 → 8／100%／8.0；整個檔函式 158 → 187，CC ≥ 10 的 39 → 36，最高 64 → 30（`_advance`） | 164 個殺 138，8 個等價，18 個沒殺（量的時候排除了 89 個假失敗，只有 3 個用短 basetemp 重跑，所以 18 是上限） |
+
+各 PR 的覆蓋率是只跑相關測試檔量的，前後用的測試檔不一定相同，量法也不同（#1229 是行加分支，#1231 是行，#1230 的 92.7% 是 45 檔子集、99 檔是 90.4%），所以「前 → 後」不能嚴格比較；量法與數字以各 PR 說明為準。
+
+### 重新量
+
+crapper 加 `--no-coverage`，只有 CC（含 `deploy`、`scripts`，去掉 novnc）；dryer 同上。「前」是 `014ee8b3`，「後」是 `c10b01e5`。
+
+| 項目 | 前 `014ee8b3` | 後 `c10b01e5` |
+|---|---|---|
+| 函式（不含 novnc） | 6,382 | 6,483 |
+| CC ≥ 10 | 954 | 947 |
+| CC ≥ 20 | 186 | 177 |
+| CC ≥ 30 | 57 | 50 |
+| CC ≥ 50 | 5 | 0 |
+| CC ≥ 100 | 2 | 0 |
+| 最高 CC | 148（`_run_turn`） | 49（`native_environment_cut._cut`） |
+| dryer 重複（≥ 0.8，至少 4 行） | 165 對，124 對完全相同 | 165 對，124 對完全相同 |
+
+前面 CC ≥ 50 的 5 個是 `_run_turn` 148、`install_assistant_routes` 100、`_tools` 65、`cut` 64、`follow` 56，其中前兩個也是 CC ≥ 100 的 2 個；全部拆掉了。`_settle`（48）和 `_post`（46）本來就不到 50。函式變多是拆出來的小函式（`shared_context` 加 `web_test_console` 部分 5,975 → 6,076）；CC ≥ 10 只少 7，沒有逐項歸因。第十四輪結束時（`3d4f81dd`）是 6,342／944，到 `014ee8b3` 之間其他 PR 也加了函式，沒有扣掉。
+
+**第一次全 repo 覆蓋率與 CRAP**（只有「後」；「前」沒有量，見下）：
+
+- 測試：`tests/shared_context` 全套，用 repo venv（coverage 7.16.2，`COVERAGE_CORE=sysmon`，只看行覆蓋）的 python，PYTHONPATH 最前面放 `C:/t/sxv/Lib/site-packages`（SDK 1.0.26），真 runtime 1.0.103，短 `--basetemp`。17,328 passed、44 failed、24 skipped、2 xfailed，3 小時 8 分。
+- 行覆蓋：`shared_context` 加 `web_test_console` 70,723／75,910 = 93.2%；再加上 `deploy`、`scripts`（只有被匯入的部分有資料）共 80,081 行、92.4%。`tests/infra` 在這台機器缺 `yaml`，收集時就失敗，沒跑，所以 `deploy`、`scripts` 的覆蓋偏低，不要拿來比。
+- CRAP（`shared_context` 加 `web_test_console` 的 6,076 個函式，6,070 個對得上覆蓋率；對不上的 6 個是巢狀類別的 `__aiter__`／`aclose`，CC 1～8）：CRAP ≥ 10 有 948 個、≥ 30 有 92 個、≥ 100 有 6 個。最高 380.0 是 `behavior_agent_retire.main`（CC 19，覆蓋 0%，沒有測試的 CLI），其次是 `behavior_hosted.run_checksum_child`（CC 13，0%，182.0）、`FoundryExecutor._cleanup_instruction_session`（CC 14，15.4%，132.7）、`NativeEnvironmentView.original_transition`（CC 40，63.0%，121.3）、`bridge.Console.reset_conversation`（CC 10，0%，110.0）、`AssistantAuthority.model_session`（CC 18，36.0%，102.9）。
+- 這輪的目標函式在全套跑下來都是 100% 覆蓋，CRAP 等於 CC：`_run_turn` 7、`_post` 8、`_tools` 1、`install_assistant_routes` 6、`cut` 9、`follow` 8、`_settle` 8。
+- CRAP ≥ 10 的 948 比同範圍 CC ≥ 10 的 885 多 63：這些函式 CC < 10，但覆蓋率不夠。
+- 「前」沒有全 repo 覆蓋率，所以沒有 CRAP 的前後對照。CRAP 恆 ≥ CC，所以「前」同範圍的 CRAP ≥ 10 至少有 892 個、最高 CRAP 至少 148；實際數字沒量。
+
+算法：每個函式的行覆蓋率取自 `coverage json` 的 `functions` 欄位，CC 取自 crapper，套 CRAP = CC² × (1 − 覆蓋)³ ＋ CC；函式以「檔案＋類別.名稱」對應。這個腳本沒有進 repo，也沒有用 crapper 自己的覆蓋模式（它會自己再跑一次測試）。
+
+### 驗證
+
+- 除了 #1227（刪除與搬移，只寫了 3 個 mutant），每個 PR 都是先補釘住測試（在 base 上跑過），再重構，再用手寫 mutant 補洞，也都跑過 poteto 與 ponytail 兩軸審查；細節以各 PR 說明為準。
+- 全套跑到的 44 個失敗，在 `014ee8b3`（同環境，只跑這 44 個所在的 8 個測試檔）重現同樣的 44 個，兩邊失敗清單逐行相同，所以不是這輪造成的：`test_user_uploads.py` 18 個、`test_native_auto_compaction.py` 8 個、`test_native_response_sdk.py` 7 個、`test_native_sdk_runtime.py` 7 個，其餘 `test_behavior_assistant_entry.py`、`test_native_reasoning_facts.py`、`test_native_resident_ask_user_runtime.py`、`test_native_responses_cross_version_native.py` 各 1 個。各自的根因沒有再查（#1228 的說明歸為本機 PDF renderer 與真 SDK 測試缺 `N1_NATIVE_WORKSPACE`）。
+- 沒有部署，沒在 Linux 上跑，沒有雲端驗證。
+
+### 做法與教訓
+
+- **Windows MAX_PATH。** pytest 預設的 basetemp 在 `%TEMP%` 底下，路徑太長時，responses lane 的 fixture 在本機回 500，一批測試假失敗。這批假失敗會被當成「既有失敗」排除，排除之後它們守的路徑沒人守，mutant 就看起來存活；沒排除的話，ERROR 又會讓 mutant 看起來被殺掉。#1231 的 89 個「本機環境既有失敗」就是這樣，查明後改用短 `--basetemp`（例如 `--basetemp=C:/t/bt15`）全部通過。本機跑測試一律加短 basetemp。
+- **mutant 不能被既有失敗或 ERROR「殺掉」。** 只有斷言失敗（FAILED）才算殺掉；ERROR、collection error、base 上本來就失敗的測試都不算。#1228 第一輪有 8 個 mutant 看起來被殺，其實撞到本來就會失敗的 `[pdf-pages]`，排除後都活下來，補測試才殺掉其中 5 個；#1229 的 P08 同樣是被既有失敗「殺掉」的。mutant 腳本要先 parse，語法錯的標 invalid（#1231 的 `followed_expected` 少一個括號）。
+- **偶發失敗，歸因未驗證。** `test_native_cut.py::test_an_overrun_after_fas_stop_never_withdraws_and_the_files_arrive` 在 #1231 head 的一次整組 coverage 執行失敗過（cut 回 `stopping`）；base 與 head 之後各重跑多次（同順序、加壓、短 basetemp）都重現不出來，歸因沒有驗證。這次全套跑它通過。再出現時用 `--show-capture=log` 抓 log。
+- 全套覆蓋率用 `COVERAGE_CORE=sysmon`，只量行。`.coveragerc` 的 `data_file` 在 Git Bash 下要寫 `C:/...`，寫成 `/c/...` 會落到 `C:\c\...`。
+- 拆函式用查表與提早 return，不拆成只有一個呼叫者的 helper：#1229 的 `_TYPED_REFUSALS`、#1230 的 `_MODEL_ACCESS` 與 `_COMMAND_IDS` 等常數表都是這樣。
+
+### 未處理／後續
+
+不擋合併的 P3，下一輪可以挑：
+
+- #1227：本文沒有列 P3。沒動的文件：README「API 設定」表裡多數變數已沒有程式讀取；`docs/context-evaluation-status.json`、`docs/runtime-skills-evaluation.md`、`docs/ctx03-local-acceptance.md`、`docs/context-implementation-status.md` 還提到 `ContextArtifactAdapter`。
+- #1228：`_human_turn_in` 只有一個呼叫者；`native_sdk.py:627` 又寫了一次 `_check_active` 的同一句訊息；`stop_requested` 測試綁定檢查次數；整張表的 sha256 快照不透明；`PdfPages` 路徑沒有直接測試。
+- #1229：沒有測試守「`_model_options` 拒絕時 `_delegation` 仍被設好」；一個測試釘了 kwargs 順序與私有欄位；mutant 腳本寫死 scratchpad 的 TIKTOKEN 路徑；`codes=None` 當隱含標記；幾個只有一個呼叫者的 helper；`EXPECTED` 重述常數。
+- #1230：`_BODY_BYTES` 改成 import 時固定；一個 request 經過約 5 層；每個 suffix 的規則散在 7 張表；36 組比對腳本與 mutant 沒進 PR；本文寫「3 failed」卻列了 4 個；本文的 repo venv SDK 版本說法沒核對。
+- #1231：`_cut_row` 結果類回傳帶了沒人用的 row；`_settle_fence` 重讀 `row.upgrade`；`_settle_legacy`／`_settle_fence`／`_withdraw*` 帶 9～11 個參數，`again` 閉包又傳一次；新測試直接呼叫私有 `_settle` 並 monkeypatch 私有函式（下輪改名就會壞）；`test_native_cut_outcomes.py` stub `_settle`／`_finish` 的測試；18 個存活 mutant 與 8 個等價（理由見 PR）。
+- 剩下最高的 CC：`native_environment_cut._cut` 49、`freeform.InstructionControl.view` 45、`ToolBrokerCore._record_verified_outcome` 44、`read_saved_turn_context` 43、`native_environment._scan_page` 41、`NativeEnvironmentView.original_transition` 40（CRAP 121.3，覆蓋 63%）、`NativeSkillDraftGateway._resources` 40。CRAP 最高的幾個是沒有測試的 CLI `main`（`behavior_agent_retire`、`behavior_agent_registry_operator`、`behavior_team_authority_operator`）與 `run_checksum_child`。
+- 下一輪要有「前」的全 repo 覆蓋率對照，就在起點同樣跑一次；`tests/infra` 要先在本機 venv 裝 `yaml`（不進相依清單）才收集得起來。
+
 ## 重新量
 
 ```powershell

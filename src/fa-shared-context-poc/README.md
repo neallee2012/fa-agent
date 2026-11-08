@@ -9932,6 +9932,8 @@ Behavior.Read，不要求再取得Behavior.Approve。外層仍是既有`result`�
 
 #### 2026-09-27：目前操作決定觀察快照（LOCAL，未部署）
 
+> 2026-11-07 註：下文的 `ContextArtifactAdapter` 是只有測試組合會建構的 adapter，已在 `4c1a933e`（2026-11-04）刪除；以下保留當時紀錄，不改寫。
+
 `GET /behavior/v1/bindings/{binding_id}/operation/decision-state`是human-only的Behavior.Read
 純讀接點，不接受body或query。只在原prepared operation存在、ownership／content／adapter
 可核對時返回；grant另核原grant ID、root scope、subject、policy及兩個digest，不能串別人的grant。
@@ -10013,6 +10015,8 @@ API reader尚未部署時保持不可用，不因此發出另一個請求或變�
   不升完整SP-20／PA-11或人審gold，後續docs／mergehead也不是新受測來源。
 
 ### Verified against
+
+> 2026-11-07 註：下文的 `ContextArtifactAdapter` 是只有測試組合會建構的 adapter，已在 `4c1a933e`（2026-11-04）刪除；以下保留當時紀錄，不改寫。
 
 - `behavior_wire.OperationRejection`、`behavior_runtime.reject_operation/approve_operation/operation_preview`、
   `behavior_operations.HumanOperationRejection/HumanOperationRejectionIntent/_Operation/ToolBrokerCore.authorize`及原API route。
@@ -17124,7 +17128,7 @@ CLI 的唯讀動作仍驗原組織 operator 的有效 JWT 與 scope，不以 Tea
 ### CAP-06 PR3a Agent 身分登錄與門禁 C（LOCAL）
 
 依 ADR-0006 選項 C：API 只認 registry 登錄的 Agent oid，不要求 `Behavior.Agent` app role，
-也不給 API Graph 權限。設定檔 actor（`CONTEXT_ACTORS_JSON`）同樣只核 oid：app-only token（無 `scp`、
+也不給 API Graph 權限。設定檔 actor（當時的 `CONTEXT_ACTORS_JSON`；現在是 server 設定的 `identity.agents`）同樣只核 oid：app-only token（無 `scp`、
 `idtyp` 缺或為 `app`）即接受，不看 `roles`；簽章、issuer、tenant、audience 與 actor→Team 對應照舊。
 `Behavior.Agent` 角色與既有指派保留在 API app 上，只是不再作為門禁，新環境不必先指派、也不必等受控身分
 token 快取（約 24 小時）過期。Agent 被拒時 API 只記一行固定代碼 `BEHAVIOR_AGENT_AUTH_DENIED reason=`
@@ -17164,6 +17168,7 @@ roster 只列已登錄的 Agent。當時的開機歷史驗證（`validate_team_r
 identity=AgentIdentity(oid, actor=agent_id))`，其餘欄位沿用 config authority。未登錄、別的 Team、
 oid 撞到 config actor／human，一律 403 `AGENT_SCOPE_DENIED`。history 類讀取改用 `inventory_agent_scope`，
 從同一份 inventory 解析，不讀 live；缺列回 409 `AGENT_SCOPE_INVALID`。
+（2026-11-07 註：`inventory_agent_scope` 已在 `a86c8f7b` 刪除；它服務的 history 核對先在 `0c827e15` 拿掉，現在沒有從 inventory 解析 Agent 的路徑。）
 
 改用此入口的呼叫點：`for_agent`、`resolve_agent_policy`、`read_agent_registry`、`register_agent_scope`
 （`_check_policy` 另核 `target.agent_id`）、`selected_targets`、work policy 及其 history、peer router、
@@ -17381,6 +17386,9 @@ M1 舊 GUI fixture 也使用此 loopback host。這不是整個 sandbox 的網�
 保持 root 擁有及不可由 agent 改寫；不修改整個 HOME。Image 必須以 UID10001 通過
 `runtime_probe.py` 的 SDK 協定啟動／停止；此檢查不請求模型，也不代表 Hosted 持久化驗收。
 Linux hostless runtime 不支援 `--version`，版本來源與 native session 回報仍分開記錄。
+Hosted 與 API image 建置時另跑 `python -m shared_context.image_import_check`：在 image 的 Python 3.11 上匯入該 image
+套件裝得起的每個 `shared_context` 模組（含只在函式內載入的），只略過缺第三方套件的另一邊模組；
+測試與 CI 用 3.12，這道檢查讓「只在 3.11 匯入失敗」的模組在建置時就擋下，而不是 dev 上才起不來。
 
 ## M3 成果與批准
 
@@ -17765,6 +17773,8 @@ M4更新僅寫`artifact_text`，保留權威`progress`；resume沿用SDK session
 - 私人記憶是 `private:<team>:<actor>`，Team 記憶是 `team:<team>`。API 先授權才選 scope；scope 本身**不是 ACL**。
 
 ## API 設定
+
+> 2026-11-07 註：下表是 2026-09 POC API 的環境變數，讀取它們的 `AuthSettings.from_env` 已在 `3050d940` 刪除，現在的程式不讀 `CONTEXT_ACTORS_JSON`；設定檔 actor 改由 server 設定的 `identity.agents`（`behavior_server_config.IdentityConfiguration`）提供。表中其他變數多數也已沒有程式讀取，這裡保留當時紀錄。
 
 | 環境變數 | 值／用途 |
 |---|---|

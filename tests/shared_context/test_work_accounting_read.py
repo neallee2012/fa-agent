@@ -23,6 +23,7 @@ from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_api import RuntimeHarness
 from test_m3_auth import UNKNOWN_OID, jwk_client, signing_key, token
+from test_work_cost_policy import install_offline
 
 PATH = "/work-policy/v1/accounting"
 
@@ -60,7 +61,7 @@ def accounting(auth, jwk_client, signing_key):
         frozenset({"read", "approve"}),
     )
     h.control = WorkPolicyControl(h.runtime, policy, lambda: observation)
-    h.control.install_offline(h.human, "synthetic-install", h.time + timedelta(minutes=10))
+    install_offline(h.control, h.human, "synthetic-install", h.time + timedelta(minutes=10))
     h.mutate(
         h.control.cost_key, work_reservations_microusd=2_000_000, reservation_count=1,
         model_pending_microusd=750_000, model_metered_microusd=125_000, budget_enforced=False,

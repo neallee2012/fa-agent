@@ -21,7 +21,7 @@ from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import CLIENT_ID, jwk_client, signing_key
 from test_memory_note_proposals import install_case
 from test_sdk_compaction_product import open_turn, ordinary, settle
-from test_work_cost_policy import standing
+from test_work_cost_policy import standing, install_offline
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def bridge_case(assistant):
              binding_digest=h.policy.binding_digest, human_text_enabled=True, text_policy_version="human-text-policy-v1")
     _, policy, observation, _, human = standing(h)
     control = WorkPolicyControl(h.runtime, policy, lambda: observation)
-    control.install_offline(human, "note-bridge-configured-slot", h.time + timedelta(minutes=10))
+    install_offline(control, human, "note-bridge-configured-slot", h.time + timedelta(minutes=10))
     readiness = h.readiness()
     h.delivery.registration = replace(h.delivery.registration, verify_readiness=lambda: readiness)
     install_work_policy_routes(h.app, SimpleNamespace(

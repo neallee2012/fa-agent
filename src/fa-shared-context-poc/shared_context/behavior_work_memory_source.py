@@ -51,7 +51,7 @@ def load(authority, session, principal):
                    for ref in context.manifest.sources)):
         raise Problem(403, "WORK_MEMORY_SCOPE_DENIED", "reviewed material does not match this assigned Team knowledge view")
     claim = claims[0]
-    if claim.review.authority_record_sha256 is None or context.summary is not None:
+    if claim.review.authority_record_sha256 is None:
         raise Problem(409, "WORK_MEMORY_NOT_AVAILABLE", "an exact durable human-reviewed claim is required, not a projection")
     refs = tuple(sorted(context.manifest.sources, key=lambda ref: (ref.source_id, ref.version)))
     try:

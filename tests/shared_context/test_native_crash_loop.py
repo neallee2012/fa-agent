@@ -628,3 +628,19 @@ def test_a_drift_back_that_crash_loops_rolls_back_as_an_fa_switch_does(file_api,
     for n in (1, 2, 3):
         crash(fixture, f"rid-{n}", f"cid-{n}")
     rolled_back(fixture, cut(fixture))
+
+
+def test_a_decided_abandon_is_carried_out_and_never_judged_a_crash_loop(file_api, monkeypatch):
+    # ADR-0009 §7a: a decided Agent's switch is the background job's to carry out; its crashes veto nothing.
+    fixture = file_api
+    switched(fixture, monkeypatch)
+    for n in (1, 2, 3):
+        crash(fixture, f"rid-{n}", f"cid-{n}")
+    row = abandon.row(fixture)
+    assert abandon.store(fixture).decide_abandon(
+        row.agent_id, hosted_session_id=row.hosted_session_id, basis="retired", source_status="failed",
+        created_agent_version="42") is not None
+    carried = []
+    monkeypatch.setattr(sessions(fixture), "_carry_out", lambda client, version, before_send: carried.append(version))
+    assert cut(fixture) == ("abandon_pending", None, None)
+    assert carried == ["42"] and veto(fixture) is None and abandon.row(fixture).abandon is not None

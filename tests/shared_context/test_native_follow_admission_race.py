@@ -3,6 +3,7 @@
 import httpx
 import pytest
 
+from shared_context.behavior_native_turn_api import NativeTurnGateway
 from shared_context.behavior_native_turn_wire import NATIVE_REQUEST, NativeEnvironmentView, NativeSubmit, canonical_bytes
 from shared_context.errors import Problem
 from shared_context.native_environment_sync import follow_agent
@@ -63,9 +64,17 @@ def test_automatic_follow_waits_when_original_admission_changes_the_etag_before_
             prepared.append((command, response.status_code, response.json()))
         return response
 
+    checked, context = [], NativeTurnGateway._context
+
+    def recorded(self, principal, action, **options):
+        checked.append(len(prepared))
+        return context(self, principal, action, **options)
+
     monkeypatch.setattr(fixture.case.foundry.http, "_transport", httpx.MockTransport(crossing))
+    monkeypatch.setattr(NativeTurnGateway, "_context", recorded)
     result = advance(fixture)
     assert result.status_code == 200, (result.text, prepared)
+    assert 1 in checked  # the owner is checked again before the prepare is resent at the new ETag
     assert result.json()["state"] == "pending"
     assert result.json()["reason"] == ("accepted_or_started" if settled else "admission_pending")
     assert not fixture.files.stopped and not fixture.runtime.executor.calls
@@ -166,6 +175,7 @@ def test_prepare_recheck_is_bounded_and_never_rebinds_a_changed_environment(file
         "files_check": {"category": "page_changed", "stage": "list", "key_category": "receipt", "cursor_source": "none"}}),
     (503, "NATIVE_ENVIRONMENT_UNKNOWN", {}),
     (403, "NATIVE_FILES_ACCESS_DENIED", {}),
+    (409, "NATIVE_SESSION_CHANGED", {}),  # another 409 is not the admission's conflict either
 ])
 def test_changed_etag_does_not_retry_file_checks_unknown_results_or_denied_access(
     file_api, monkeypatch, status, code, detail,

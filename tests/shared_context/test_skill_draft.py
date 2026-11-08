@@ -27,7 +27,7 @@ from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import signing_key, token, jwk_client
 from test_sdk_compaction_product import open_turn, ordinary, settle
-from test_work_cost_policy import standing
+from test_work_cost_policy import standing, install_offline
 
 PURPOSE = "Procedure for preserving operator handoff steps."
 BODY = "## Procedure\n\n1. Confirm the original request.\n2. Save only non-secret team guidance.\n"
@@ -68,7 +68,7 @@ def configured_draft(h):
     _, policy, observation, _, _ = standing(h)
     human = h.verifier(h.client.build_request("GET", "/", headers=h.headers()))
     control = WorkPolicyControl(h.runtime, policy, lambda: observation)
-    control.install_offline(human, "signed-skill-draft-installation", h.time + timedelta(minutes=10))
+    install_offline(control, human, "signed-skill-draft-installation", h.time + timedelta(minutes=10))
     readiness = h.readiness()
     from dataclasses import replace
     h.delivery.registration = replace(h.delivery.registration, verify_readiness=lambda: readiness.model_copy(update={

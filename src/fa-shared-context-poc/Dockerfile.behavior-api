@@ -18,7 +18,8 @@ RUN python -c "import os,tiktoken; from shared_context.behavior_server import Se
     && find /opt/fa-catalog -type f -exec chmod 0444 {} + \
     && find /opt/fa-catalog -type d -exec chmod 0555 {} + \
     && FA_INSTRUCTION_MODEL_CATALOG_FILE=/app/model-catalog.json FA_INSTRUCTION_MODEL_FACTS_FILE=/app/model-facts.json FA_INSTRUCTION_DEFAULT_MODEL=gpt-4.1-mini python -c "from shared_context.behavior_instruction_models import InstructionModels as M; m=M.from_environment(); s=m.select('gpt-5.4-mini'); assert s.supports_image_input is True and m.select('gpt-4.1-mini').supports_image_input is True and m.default=='gpt-4.1-mini'; print('FA_MODELS_OK', sorted(m.models))" \
-    && python -c "import mcp, shared_context.mcp_client, shared_context.behavior_server; from shared_context.behavior_code_identity import code_sha256; print('FA_DEPLOYED_CORE=' + code_sha256())"
+    && python -c "import mcp, shared_context.mcp_client, shared_context.behavior_server; from shared_context.behavior_code_identity import code_sha256; print('FA_DEPLOYED_CORE=' + code_sha256())" \
+    && python -m shared_context.image_import_check
 USER 10001
 EXPOSE 8080
 ENTRYPOINT ["python", "-m", "shared_context.behavior_server"]

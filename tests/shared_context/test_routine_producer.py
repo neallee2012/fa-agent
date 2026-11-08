@@ -21,7 +21,7 @@ from shared_context.behavior_assistant_hosted import AssistantClient
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models, runtime_path, sdk_io
 from test_m3_auth import jwk_client, signing_key
-from test_work_cost_policy import standing
+from test_work_cost_policy import standing, install_offline
 from test_work_policy_lifecycle import enabled
 
 
@@ -45,7 +45,7 @@ def routine_owner(assistant, request):
     control = WorkPolicyControl(
         h.runtime, configured, lambda: observed.model_copy(update={"observed_at": h.time}),
     )
-    control.install_offline(human, "routine-owner-approval", h.time + timedelta(minutes=10))
+    install_offline(control, human, "routine-owner-approval", h.time + timedelta(minutes=10))
     install_work_policy_routes(h.app, SimpleNamespace(
         runtime=h.runtime, verifier=h.verifier, assistant=SimpleNamespace(authority=h.assistant),
         installation=lambda: None, require_current_native_evidence=lambda: None,

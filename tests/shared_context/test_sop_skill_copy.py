@@ -24,7 +24,7 @@ from test_instruction_flow import instruction_inventory, instruction_models, run
 from test_m3_auth import jwk_client, signing_key, token
 from test_sdk_compaction_product import open_turn, ordinary, settle
 from test_work_policy_lifecycle import enabled
-from test_work_cost_policy import standing
+from test_work_cost_policy import standing, install_offline
 from shared_context.behavior_work_policy import WorkPolicyControl, work_policy_key
 
 PROFILE = "fa-instruction-sop-copy-v1"
@@ -75,7 +75,7 @@ def configured_copy(h, scope):
     _, policy, observation, _, _ = standing(h)
     human = h.verifier(h.client.build_request("GET", "/", headers=h.headers()))
     control = WorkPolicyControl(h.runtime, policy, lambda: observation)
-    control.install_offline(human, "signed-copy-scope-installation", h.time + timedelta(minutes=10))
+    install_offline(control, human, "signed-copy-scope-installation", h.time + timedelta(minutes=10))
     readiness = h.readiness()
     h.delivery.registration = replace(h.delivery.registration, verify_readiness=lambda: readiness.model_copy(update={
         "observed_at": h.time, "expires_at": h.time + timedelta(minutes=5)}))

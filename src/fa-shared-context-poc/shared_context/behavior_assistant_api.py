@@ -203,13 +203,20 @@ def _deliver_image(authority, session, command, principal):
     return deliver_image(authority, session, command, principal)
 
 
-def install_assistant_routes(app, authority: AssistantAuthority, verifier, *, provider=None, on_result_ready=None):
-    if not isinstance(authority, AssistantAuthority):
-        raise Problem(503, "ASSISTANT_CONFIGURATION", "concrete assistant authority is required")
-    identity = _principal_dependency(verifier)
-    if authority.runtime.mode == "native" and provider is None:
-        raise Problem(503, "ASSISTANT_MODEL_DISABLED", "native assistant requires an explicit one-send model provider")
+def _private_header(request, name):
+    """The single 64-hex private header value, or None."""
+    values = request.headers.getlist(name)
+    return values[0] if len(values) == 1 and re.fullmatch(r"[a-f0-9]{64}", values[0]) else None
 
+
+def _bound_ticket(request, session_id):
+    ticket = _private_header(request, TICKET_HEADER)
+    if ticket is None or re.fullmatch(r"[a-f0-9]{64}", session_id) is None:
+        raise Problem(403, "ASSISTANT_TICKET_DENIED", "one private server-issued binding ticket is required")
+    return SecretStr(ticket)
+
+
+def _install_entry_routes(app, authority, identity):
     @app.post(PREFIX + "/submit")
     async def submit(request: Request, binding_id: str, principal=Depends(identity)):
         authority.runtime.authorize(binding_id, principal, "submit")
@@ -219,11 +226,11 @@ def install_assistant_routes(app, authority: AssistantAuthority, verifier, *, pr
 
     @app.post(PREFIX + "/launches/{launch_id}/claim")
     async def native_claim(request: Request, binding_id: str, launch_id: str, principal=Depends(identity)):
-        values = request.headers.getlist("x-behavior-report-token")
-        if len(values) != 1 or re.fullmatch(r"[a-f0-9]{64}", values[0]) is None:
+        token = _private_header(request, "x-behavior-report-token")
+        if token is None:
             raise Problem(403, "ASSISTANT_TICKET_DENIED", "original native process capability is required")
         body = await _body(request, wire.HostedProbeBody)
-        command = wire.HostedProbeRequest(**body.model_dump(), report_token=SecretStr(values[0]))
+        command = wire.HostedProbeRequest(**body.model_dump(), report_token=SecretStr(token))
         try:
             assignment, ticket = await run_in_threadpool(authority.native_claim, binding_id, launch_id, command, principal)
         except Problem as error:
@@ -233,171 +240,212 @@ def install_assistant_routes(app, authority: AssistantAuthority, verifier, *, pr
         response.headers[TICKET_HEADER] = ticket.get_secret_value()
         return response
 
-    def operation(session, command, principal):
-        binding = authority.runtime.bindings[session.binding_id]
-        authority.runtime.execute_operation(session.binding_id, wire.Command(request_id="assistant-operation"), principal)
-        op_key = control_key("operation", binding.operation_id)
-        saved = _row(authority.store.read_snapshot((op_key,)), op_key, _Operation)
-        return aw.EffectResult(operation_id=binding.operation_id, effect_state=saved.effect_state,
-                               business_state=saved.business_state)
-
-    def status(session, command, principal):
-        digest = None
-        outcome=None
-        if session.state == "ready_to_finalize":
-            result=authority.result(session.execution)
-            digest = _digest(result.model_dump(mode="json"))
-            if session.assignment.task.instruction is not None:outcome=result.state
-        return aw.ToolReceipt(state=session.state, reason=session.reason, result_digest=digest,work_outcome=outcome)
-
     @app.post(PREFIX + "/sessions/{session_id}/acquire")
     async def acquire(request: Request, binding_id: str, session_id: str, principal=Depends(identity)):
         try:
-            values = request.headers.getlist(TICKET_HEADER)
-            if (len(values) != 1 or re.fullmatch(r"[a-f0-9]{64}", values[0]) is None
-                    or re.fullmatch(r"[a-f0-9]{64}", session_id) is None):
-                raise Problem(403, "ASSISTANT_TICKET_DENIED", "one private server-issued binding ticket is required")
+            ticket = _bound_ticket(request, session_id)
             command = await _body(request, wire.Command)
-            result = await run_in_threadpool(
-                authority.acquire_current, binding_id, session_id, SecretStr(values[0]), command, principal)
+            result = await run_in_threadpool(authority.acquire_current, binding_id, session_id, ticket, command, principal)
             return _response(result)
         except Problem as error:
             raise acquire_http_error(error, "acquire_authority") from None
 
-    if provider is not None:
-        from .behavior_assistant_gateway import AssistantProvider
-        if not isinstance(provider, AssistantProvider):
-            raise Problem(503, "ASSISTANT_MODEL_DISABLED", "concrete bounded model provider required")
 
-        model_routes = APIRouter(route_class=_ModelRoute)
+# Free-instruction model options, in the order the provider receives them; several profile sets may match at once.
+_MODEL_ACCESS = (
+    ("skill_access", lambda instruction: skill_access(instruction.prompt_profile, instruction.capabilities)),
+    ("skill_resource_access", lambda instruction: instruction.prompt_profile == SKILL_RESOURCES_PROFILE),
+    ("user_turn_access", lambda instruction: instruction.prompt_profile in USER_INPUT_READ_PROFILES),
+    ("user_file_access", lambda instruction: instruction.prompt_profile in FILE_READ_PROFILES),
+    ("assistant_reply_access", lambda instruction: instruction.prompt_profile in REPLY_READ_PROFILES),
+    ("work_memory_access", lambda instruction: instruction.prompt_profile == WORK_MEMORY_PROFILE),
+    ("reviewed_note_access", lambda instruction: instruction.prompt_profile == REVIEWED_NOTE_PROFILE),
+    ("sop_copy_access", lambda instruction: instruction.prompt_profile == SOP_COPY_PROFILE),
+    ("skill_draft_access", lambda instruction: skill_draft_enabled(instruction.prompt_profile, instruction.capabilities)),
+)
 
-        @model_routes.post(PREFIX + "/sessions/{session_id}/model")
-        async def model(request: Request, binding_id: str, session_id: str, principal=Depends(identity)):
-            phase = "model_authority"
-            session = None
-            consumed_at = None
-            started=perf_counter()
+
+def _model_options(instruction):
+    if instruction is None:
+        return {}
+    options = {"text_reply": True, "model": instruction.model}
+    if instruction.model_provider is not None:
+        options["model_provider"] = instruction.model_provider
+    options.update((key, True) for key, allowed in _MODEL_ACCESS if allowed(instruction))
+    return options
+
+
+class _ModelAttempt:
+    """What the model route's failure answer reports: the phase reached, the session and the consume time."""
+
+    def __init__(self):
+        self.phase = "model_authority"
+        self.session = None
+        self.consumed_at = None
+        self.started = perf_counter()
+
+
+async def _model_turn(request, authority, provider, binding_id, session_id, principal):
+    attempt = _ModelAttempt()
+    try:
+        return await _model_send(attempt, request, authority, provider, binding_id, session_id, principal)
+    except HTTPException:
+        raise
+    except Exception as error:
+        if isinstance(error, Problem) and error.body["error"]["code"] == "ASSISTANT_EXECUTION_FENCED":
+            _log_model_fence(attempt.session, None, "authority_gate", attempt.phase, attempt.consumed_at)
+        _log_assistant_exception(error, attempt.phase, attempt.session)
+        return await model_http_error(request, error, attempt.phase)
+
+
+async def _model_send(attempt, request, authority, provider, binding_id, session_id, principal):
+    value = _private_header(request, TICKET_HEADER)
+    if value is None:
+        raise Problem(403, "ASSISTANT_TICKET_DENIED", "private assistant ticket is required")
+    ticket = SecretStr(value)
+    with phase_timing("model_authority",job_id=binding_id):
+        session = attempt.session = await model_sync(authority.model_session, binding_id, session_id, ticket, principal)
+    if session.binding_id != binding_id:
+        raise Problem(403, "ASSISTANT_BINDING_DENIED", "model request is outside its assignment")
+    authority.record_instruction_activity(session)
+    attempt.phase = "model_request"
+    command, options = await _model_request(request, authority, provider, session)
+    attempt.phase = "model_consume"
+    with phase_timing("model_consume",job_id=session.execution.job_id):
+        await model_sync(authority.consume_model, session, command, principal)
+        attempt.consumed_at = perf_counter()
+        if command.delegation is not None:
+            await model_sync(delegation.link_model, authority, session, command.delegation, command.request_id)
+    attempt.phase = "provider_request"
+    free = session.assignment.task.instruction is not None
+    # consume's CAS gate is the last authority check before send: a revocation, cancel or source
+    # change after it is refused at this job's next reserve, never by re-reading it here.
+    with phase_timing("model_to_headers",job_id=session.execution.job_id):
+        result = await provider.send(command.body,
+            diagnostic_keys=_assistant_diagnostic_keys(session),
+            **options, **({"stream_response": True} if free else {}))
+    if free:
+        return _instruction_stream(request, authority, session, command, result, attempt.started)
+    return Response(result.content, media_type="text/event-stream", headers={"Cache-Control": "no-store"})
+
+
+async def _model_request(request, authority, provider, session):
+    free = session.assignment.task.instruction is not None
+    capability_options, images = gateway_options(session)
+    command = await _body(request, aw.ModelRequest, **(
+        {"max_body_bytes": CAPABILITY_IMAGE_BODY_BYTES + 64*1024} if images
+        else {"max_body_bytes": 192*1024} if free else {}))
+    options = _model_options(session.assignment.task.instruction)
+    options.update(capability_options)
+    provider.validate(command.body, **options)
+    if command.delegation is not None:
+        if command.body.get("tools"):
+            raise Problem(403, "DELEGATION_MODEL_DENIED", "the fixed child has zero tools")
+        await model_sync(delegation.validate_model, authority, session, command.delegation)
+    return command, options
+
+
+def _instruction_stream(request, authority, session, command, result, started):
+    from . import behavior_instruction_cost as cost
+    wire_api = "responses" if session.assignment.task.instruction.model_provider == "openai-responses" else "completions"
+    job_id = session.execution.job_id
+    events = None
+    if not command.checkpoint_compaction and command.delegation is None:
+        events = AnswerEvents(_live_reply(request.app, job_id, command.request_id, started), wire_api=wire_api)
+    return _ModelStream(_model_chunks(authority, session, command, result, events, wire_api, cost), _server_call.get())
+
+
+def _live_reply(app, job_id, request_id, started):
+    if not hasattr(app.state,"instruction_live_replies"):
+        app.state.instruction_live_replies=LiveReplies()
+    live = app.state.instruction_live_replies
+    live.begin(job_id, request_id)
+    first=True
+    def append(text):
+        nonlocal first
+        if first:
+            elapsed_timing("model_first_content",started,job_id=job_id)
+            first=False
+        live.append(job_id,request_id,text)
+    return append
+
+
+async def _model_chunks(authority, session, command, result, events, wire_api, cost):
+    job_id = session.execution.job_id
+    raw=bytearray()
+    try:
+        with work_timing(job_id),phase_timing("model_stream"):
+            async for chunk in result.aiter_bytes():
+                raw.extend(chunk)
+                if events is not None:
+                    events.feed(chunk)
+                yield chunk
+        # Observability only (TOOL-07): tokens, cached prompt tokens and tool calls per request.
+        logging.getLogger(__name__).warning("FA_MODEL_USAGE %s", json.dumps({
+            "job_id": job_id, "session_id": session.assignment.session_id,
+            "request_sha256": command.request_id, **cost.usage_facts(bytes(raw), wire_api=wire_api),
+        }, sort_keys=True))
+        usage=cost.usage_from_sse(bytes(raw), wire_api=wire_api)
+        if usage is not None:
             try:
-                values = request.headers.getlist(TICKET_HEADER)
-                if len(values) != 1 or re.fullmatch(r"[a-f0-9]{64}", values[0]) is None:
-                    raise Problem(403, "ASSISTANT_TICKET_DENIED", "private assistant ticket is required")
-                ticket = SecretStr(values[0])
-                with phase_timing("model_authority",job_id=binding_id):
-                    session = await model_sync(authority.model_session, binding_id, session_id, ticket, principal)
-                if session.binding_id != binding_id:
-                    raise Problem(403, "ASSISTANT_BINDING_DENIED", "model request is outside its assignment")
-                authority.record_instruction_activity(session)
-                phase = "model_request"
-                free = session.assignment.task.instruction is not None
-                capability_options, images = gateway_options(session)
-                command = await _body(request, aw.ModelRequest, **(
-                    {"max_body_bytes": CAPABILITY_IMAGE_BODY_BYTES + 64*1024} if images
-                    else {"max_body_bytes": 192*1024} if free else {}))
-                selected=session.assignment.task.instruction.model if free else None
-                options = {"text_reply": True, "model": selected} if free else {}
-                if free and session.assignment.task.instruction.model_provider is not None:
-                    options["model_provider"] = session.assignment.task.instruction.model_provider
-                if free and skill_access(session.assignment.task.instruction.prompt_profile,
-                                         session.assignment.task.instruction.capabilities):
-                    options["skill_access"] = True
-                if free and session.assignment.task.instruction.prompt_profile == SKILL_RESOURCES_PROFILE:
-                    options["skill_resource_access"] = True
-                if free and session.assignment.task.instruction.prompt_profile in USER_INPUT_READ_PROFILES:
-                    options["user_turn_access"] = True
-                if free and session.assignment.task.instruction.prompt_profile in FILE_READ_PROFILES:
-                    options["user_file_access"] = True
-                if free and session.assignment.task.instruction.prompt_profile in REPLY_READ_PROFILES:
-                    options["assistant_reply_access"] = True
-                if free and session.assignment.task.instruction.prompt_profile == WORK_MEMORY_PROFILE:
-                    options["work_memory_access"] = True
-                if free and session.assignment.task.instruction.prompt_profile == REVIEWED_NOTE_PROFILE:
-                    options["reviewed_note_access"] = True
-                if free and session.assignment.task.instruction.prompt_profile == SOP_COPY_PROFILE:
-                    options["sop_copy_access"] = True
-                if free and skill_draft_enabled(session.assignment.task.instruction.prompt_profile,
-                                                session.assignment.task.instruction.capabilities):
-                    options["skill_draft_access"] = True
-                options.update(capability_options)
-                provider.validate(command.body, **options)
-                if command.delegation is not None:
-                    if command.body.get("tools"):
-                        raise Problem(403, "DELEGATION_MODEL_DENIED", "the fixed child has zero tools")
-                    await model_sync(delegation.validate_model, authority, session, command.delegation)
-                phase = "model_consume"
-                with phase_timing("model_consume",job_id=session.execution.job_id):
-                    await model_sync(authority.consume_model, session, command, principal)
-                    consumed_at = perf_counter()
-                    if command.delegation is not None:
-                        await model_sync(delegation.link_model, authority, session, command.delegation, command.request_id)
-                phase = "provider_request"
-                # consume's CAS gate is the last authority check before send: a revocation, cancel or source
-                # change after it is refused at this job's next reserve, never by re-reading it here.
-                with phase_timing("model_to_headers",job_id=session.execution.job_id):
-                    result = await provider.send(command.body,
-                        diagnostic_keys=_assistant_diagnostic_keys(session),
-                        **options, **({"stream_response": True} if free else {}))
-                if free:
-                    from .behavior_instruction_cost import usage_facts,usage_from_sse,record_usage
-                    wire_api = "responses" if session.assignment.task.instruction.model_provider == "openai-responses" else "completions"
-                    job_id = session.execution.job_id
-                    first=True
-                    def append(text):
-                        nonlocal first
-                        if first:
-                            elapsed_timing("model_first_content",started,job_id=job_id)
-                            first=False
-                        live.append(job_id,command.request_id,text)
-                    events = None
-                    if not command.checkpoint_compaction and command.delegation is None:
-                        if not hasattr(request.app.state,"instruction_live_replies"):
-                            request.app.state.instruction_live_replies=LiveReplies()
-                        live = request.app.state.instruction_live_replies
-                        live.begin(job_id, command.request_id)
-                        events = AnswerEvents(append, wire_api=wire_api)
-                    async def chunks():
-                        raw=bytearray()
-                        try:
-                            with work_timing(job_id),phase_timing("model_stream"):
-                                async for chunk in result.aiter_bytes():
-                                    raw.extend(chunk)
-                                    if events is not None:
-                                        events.feed(chunk)
-                                    yield chunk
-                            # Observability only (TOOL-07): tokens, cached prompt tokens and tool calls per request.
-                            logging.getLogger(__name__).warning("FA_MODEL_USAGE %s", json.dumps({
-                                "job_id": job_id, "session_id": session.assignment.session_id,
-                                "request_sha256": command.request_id, **usage_facts(bytes(raw), wire_api=wire_api),
-                            }, sort_keys=True))
-                            usage=usage_from_sse(bytes(raw), wire_api=wire_api)
-                            if usage is not None:
-                                try:
-                                    with phase_timing("model_usage_save",job_id=job_id):
-                                        await model_sync(record_usage,authority,session,command.request_id,usage)
-                                except Problem as error:
-                                    logging.getLogger(__name__).warning(
-                                        "INSTRUCTION_USAGE_UNRECORDED code=%s pending_cost_not_refunded=true",
-                                        error.body["error"]["code"])
-                            else:
-                                logging.getLogger(__name__).warning("INSTRUCTION_USAGE_UNKNOWN pending_cost_retained=true")
-                        except Problem as error:
-                            logging.getLogger(__name__).warning(
-                                "INSTRUCTION_STREAM_UNRESOLVED code=%s pending_cost_not_refunded=true",
-                                error.body["error"]["code"])
-                            raise
-                        finally:
-                            await result.aclose()
-                    return _ModelStream(chunks(),_server_call.get())
-                return Response(result.content, media_type="text/event-stream", headers={"Cache-Control": "no-store"})
-            except HTTPException:
-                raise
-            except Exception as error:
-                if isinstance(error, Problem) and error.body["error"]["code"] == "ASSISTANT_EXECUTION_FENCED":
-                    _log_model_fence(session, None, "authority_gate", phase, consumed_at)
-                _log_assistant_exception(error, phase, session)
-                return await model_http_error(request, error, phase)
+                with phase_timing("model_usage_save",job_id=job_id):
+                    await model_sync(cost.record_usage,authority,session,command.request_id,usage)
+            except Problem as error:
+                logging.getLogger(__name__).warning(
+                    "INSTRUCTION_USAGE_UNRECORDED code=%s pending_cost_not_refunded=true",
+                    error.body["error"]["code"])
+        else:
+            logging.getLogger(__name__).warning("INSTRUCTION_USAGE_UNKNOWN pending_cost_retained=true")
+    except Problem as error:
+        logging.getLogger(__name__).warning(
+            "INSTRUCTION_STREAM_UNRESOLVED code=%s pending_cost_not_refunded=true",
+            error.body["error"]["code"])
+        raise
+    finally:
+        await result.aclose()
 
-        app.include_router(model_routes)
 
+def _install_model_route(app, authority, identity, provider):
+    from .behavior_assistant_gateway import AssistantProvider
+    if not isinstance(provider, AssistantProvider):
+        raise Problem(503, "ASSISTANT_MODEL_DISABLED", "concrete bounded model provider required")
+
+    model_routes = APIRouter(route_class=_ModelRoute)
+
+    @model_routes.post(PREFIX + "/sessions/{session_id}/model")
+    async def model(request: Request, binding_id: str, session_id: str, principal=Depends(identity)):
+        return await _model_turn(request, authority, provider, binding_id, session_id, principal)
+
+    app.include_router(model_routes)
+
+
+def _operation(authority, session, principal):
+    binding = authority.runtime.bindings[session.binding_id]
+    authority.runtime.execute_operation(session.binding_id, wire.Command(request_id="assistant-operation"), principal)
+    op_key = control_key("operation", binding.operation_id)
+    saved = _row(authority.store.read_snapshot((op_key,)), op_key, _Operation)
+    return aw.EffectResult(operation_id=binding.operation_id, effect_state=saved.effect_state,
+                           business_state=saved.business_state)
+
+
+def _status(authority, session):
+    digest = None
+    outcome=None
+    if session.state == "ready_to_finalize":
+        result=authority.result(session.execution)
+        digest = _digest(result.model_dump(mode="json"))
+        if session.assignment.task.instruction is not None:outcome=result.state
+    return aw.ToolReceipt(state=session.state, reason=session.reason, result_digest=digest,work_outcome=outcome)
+
+
+def _execution_ready(authority, session):
+    if session.assignment.task.instruction is None or session.state != "ready_to_finalize":
+        raise Problem(409, "INSTRUCTION_RESULT_FENCED", "only the saved original result can signal completion")
+    return _status(authority, session)
+
+
+def _session_handlers(authority, on_result_ready):
+    """Each suffix's body model and handler(session, command, principal), in registration order."""
     routes = {
         "context": (wire.Command, authority.context),
         "context-origin": (wire.Command, authority.context_origin),
@@ -432,118 +480,175 @@ def install_assistant_routes(app, authority: AssistantAuthority, verifier, *, pr
         "finish": (wire.Command, authority.finish),
         "save-text-reply": (aw.SaveTextReply, authority.save_text_reply),
         "progress": (aw.ProgressUpdate,lambda s,c,p:save_progress(authority,s,c)),
-        "operation": (wire.Command, operation),
+        "operation": (wire.Command, lambda s, c, p: _operation(authority, s, p)),
         "stopped": (aw.TurnStopped, lambda s, c, p: authority.stopped(s, c)),
-        "status": (wire.Command, status),
+        "status": (wire.Command, lambda s, c, p: _status(authority, s)),
         "checkpoint": (aw.SaveCheckpoint, lambda s, c, p: authority.checkpoint(s, c)),
         "restore": (wire.Command, lambda s, c, p: authority.restore(s, p)),
         "resident-restore": (aw.ResidentRestore, lambda s, c, p: authority.resident_restore(s, c, p)),
         "sdk-state": (SaveSdkState, lambda s,c,p:save_state(authority,s,c)),
     }
     if on_result_ready is not None:
-        def execution_ready(session, command, principal):
-            if session.assignment.task.instruction is None or session.state != "ready_to_finalize":
-                raise Problem(409, "INSTRUCTION_RESULT_FENCED", "only the saved original result can signal completion")
-            return status(session, command, principal)
-        routes["execution-ready"] = (wire.Command, execution_ready)
-    command_ids = {
-        "context": "current-context", "save": "own-result",
-        "context-origin": "current-context",
-        "attached-text": "current-attachments",
-        "reconcile": "artifact-reconcile", "finish": "finish-task", "operation": "operation",
-        "stopped": "turn-stopped", "status": "status", "checkpoint": "sdk-checkpoint", "restore": "sdk-restore",
-        "resident-restore": "sdk-resident-restore",
-        "save-text-reply": "save-text-reply",
-        "execution-ready": "execution-ready",
-        "sdk-state": "sdk-state",
-        "skill-catalog": "current-skills", "read-skill": "read-skill",
-        "read-skill-resource": "read-skill-resource",
-        "skill-catalog-presentation": "skill-catalog-presentation",
-        "read-user-turn": "read-user-turn",
-        "read-user-file": "read-user-file",
-        "read-assistant-reply": "read-assistant-reply",
-        "work-memory-catalog": "current-work-memory", "read-work-memory": "read-work-memory",
-        "copy-sop-draft": "copy-sop-draft",
-        "save-skill-draft": "save-skill-draft",
-        "capability-catalog": "capability-catalog", "capability-call": "capability-call",
-        "capability-current": "capability-current",
-        "stage-memory-candidate": "stage-memory-candidate", "memory-candidate-reconcile": "stage-memory-candidate",
-        "deliver-image": "deliver-image",
-        "delegation-prepare": "delegation-prepare", "delegation-observe": "delegation-observe",
-        "delegation-read": "delegation-read",
-        "agent-message-send": "agent-message-send", "agent-message-read": "agent-message-read",
-    }
-    for suffix, (model, handler) in routes.items():
-        # sdk-state gates inside its own transactions, where a cancelled turn may still save its stopped SDK state.
-        def endpoint(model=model, handler=handler, active=suffix not in {
-                         "status","save-text-reply","execution-ready","delegation-observe","delegation-read",
-                         "agent-message-read", "sdk-state"},
-                     expected_id=command_ids.get(suffix), notify=suffix=="execution-ready", suffix_name=suffix):
-            async def invoke(request: Request, binding_id: str, session_id: str, principal=Depends(identity)):
-                values = request.headers.getlist(TICKET_HEADER)
-                if (len(values) != 1 or re.fullmatch(r"[a-f0-9]{64}", values[0]) is None
-                        or re.fullmatch(r"[a-f0-9]{64}", session_id) is None):
-                    raise Problem(403, "ASSISTANT_TICKET_DENIED", "one private server-issued binding ticket is required")
-                try:
-                    if suffix_name in {"reserve-model", "progress"}:
-                        # Both handlers write through _command, whose CAS _gate is the full check.
-                        session = await run_in_threadpool(authority.model_session, binding_id, session_id,
-                                                         SecretStr(values[0]), principal)
-                    else:
-                        session = await run_in_threadpool(authority.current_session, binding_id, session_id,
-                                                         SecretStr(values[0]), principal, active=active)
-                except Exception as error:
-                    if suffix_name in {"reserve-model", "restore"}:
-                        _log_assistant_exception(error, "session_authority", None)
-                    raise
-                if session.binding_id != binding_id:
-                    raise Problem(403, "ASSISTANT_BINDING_DENIED", "ticket is bound to another assignment")
-                limits=({"max_body_bytes":SDK_STATE_HTTP_BYTES} if model is SaveSdkState else
-                        {"max_body_bytes":AGENT_MESSAGE_HTTP_BYTES} if model in {AgentMessageSend,AgentMessageReadCommand} else
-                        {"max_body_bytes":DELEGATION_PREPARE_BYTES} if model is DelegationPrepare else
-                        {"max_body_bytes":MAX_DELEGATION_BYTES} if model is DelegationObservation else
-                        {"max_body_bytes":4*1024*1024} if model is aw.SaveTextReply else
-                        {"max_body_bytes":MAX_IMAGE_BYTES*4//3+4096} if model is DeliverImageCommand else {})
-                try:
-                    command = await _body(request, model, **limits)
-                except Problem as error:
-                    if (model is DelegationPrepare and error.status == 413
-                            and error.body["error"]["code"] == "BEHAVIOR_BODY_LIMIT"):
-                        raise HTTPException(413, detail="Delegation material size exceeds 192 KiB; no intent was reserved.",
-                            headers={"Cache-Control": "no-store", "x-behavior-assistant-error-code": DELEGATION_SIZE_REFUSAL,
-                                     "x-behavior-delegation-stage": "before-reservation"}) from None
-                    if model is SaveSdkState and error.body["error"]["code"] in SDK_STATE_ERRORS:
-                        raise acquire_http_error(error, "assistant_authority") from None
-                    raise
-                if expected_id is not None and command.request_id != expected_id:
-                    raise Problem(422, "ASSISTANT_COMMAND_ID", "the fixed bounded command ID is required")
-                try:
-                    result = await run_in_threadpool(handler, session, command, principal)
-                    if suffix_name in {"progress", "agent-message-send", "agent-message-read"}:
-                        authority.record_instruction_activity(session)
-                    if notify:on_result_ready(binding_id)
-                    if (on_result_ready is not None and suffix_name in {"agent-message-send", "agent-message-read"}
-                            and result.message.kind in {"request", "handoff"}):
-                        on_result_ready(binding_id)
-                    response_limits = ({"max_bytes": SDK_STATE_HTTP_BYTES} if isinstance(result, SdkState)
-                                       else {"max_bytes": AGENT_MESSAGE_HTTP_BYTES} if suffix_name.startswith("agent-message-")
-                                       else {"max_bytes": MAX_DELEGATION_BYTES} if suffix_name.startswith("delegation-")
-                                       else {"max_bytes": ATTACHMENT_RESPONSE_BYTES} if isinstance(result, AttachedTexts)
-                                       else {"max_bytes": CAPABILITY_RESPONSE_BYTES} if suffix_name in {
-                                           "capability-catalog", "capability-call"} else {})
-                    return _response(result, **response_limits)
-                except Problem as error:
-                    response_error = acquire_http_error(error, "assistant_authority",
-                                                        sdk_start_binding=session.assignment.sdk_start_binding)
-                    if suffix_name in {"agent-message-send", "agent-message-read", "reserve-model"}:
-                        _log_request_failure(request, error.body["error"].get("code"))
-                    raise response_error from None
-                except Exception as error:
-                    if suffix_name in {"reserve-model", "restore"}:
-                        _log_assistant_exception(error, suffix_name, session)
-                    # Only the route and exception class; messages may carry request data.
-                    logging.getLogger(__name__).warning("ASSISTANT_DEPENDENCY_FAILED %s", json.dumps(
-                        {"action": suffix_name, "exception_type": type(error).__name__}, sort_keys=True))
-                    raise Problem(503, "ASSISTANT_DEPENDENCY_FAILED", "typed assistant operation failed") from None
-            return invoke
-        app.add_api_route(PREFIX + "/sessions/{session_id}/" + suffix, endpoint(), methods=["POST"])
+        routes["execution-ready"] = (wire.Command, lambda s, c, p: _execution_ready(authority, s))
+    return routes
+
+
+# The fixed request_id each suffix requires; a suffix without an entry accepts any.
+_COMMAND_IDS = {
+    "context": "current-context", "save": "own-result",
+    "context-origin": "current-context",
+    "attached-text": "current-attachments",
+    "reconcile": "artifact-reconcile", "finish": "finish-task", "operation": "operation",
+    "stopped": "turn-stopped", "status": "status", "checkpoint": "sdk-checkpoint", "restore": "sdk-restore",
+    "resident-restore": "sdk-resident-restore",
+    "save-text-reply": "save-text-reply",
+    "execution-ready": "execution-ready",
+    "sdk-state": "sdk-state",
+    "skill-catalog": "current-skills", "read-skill": "read-skill",
+    "read-skill-resource": "read-skill-resource",
+    "skill-catalog-presentation": "skill-catalog-presentation",
+    "read-user-turn": "read-user-turn",
+    "read-user-file": "read-user-file",
+    "read-assistant-reply": "read-assistant-reply",
+    "work-memory-catalog": "current-work-memory", "read-work-memory": "read-work-memory",
+    "copy-sop-draft": "copy-sop-draft",
+    "save-skill-draft": "save-skill-draft",
+    "capability-catalog": "capability-catalog", "capability-call": "capability-call",
+    "capability-current": "capability-current",
+    "stage-memory-candidate": "stage-memory-candidate", "memory-candidate-reconcile": "stage-memory-candidate",
+    "deliver-image": "deliver-image",
+    "delegation-prepare": "delegation-prepare", "delegation-observe": "delegation-observe",
+    "delegation-read": "delegation-read",
+    "agent-message-send": "agent-message-send", "agent-message-read": "agent-message-read",
+}
+# sdk-state gates inside its own transactions, where a cancelled turn may still save its stopped SDK state.
+_INACTIVE_SESSION = frozenset({"status", "save-text-reply", "execution-ready", "delegation-observe", "delegation-read",
+                               "agent-message-read", "sdk-state"})
+# Both handlers write through _command, whose CAS _gate is the full check.
+_MODEL_SESSION = frozenset({"reserve-model", "progress"})
+_EXCEPTION_LOGGED = frozenset({"reserve-model", "restore"})
+_AGENT_MESSAGES = frozenset({"agent-message-send", "agent-message-read"})
+_ACTIVITY = _AGENT_MESSAGES | {"progress"}
+_FAILURE_LOGGED = _AGENT_MESSAGES | {"reserve-model"}
+_BODY_BYTES = {
+    SaveSdkState: SDK_STATE_HTTP_BYTES, AgentMessageSend: AGENT_MESSAGE_HTTP_BYTES,
+    AgentMessageReadCommand: AGENT_MESSAGE_HTTP_BYTES, DelegationPrepare: DELEGATION_PREPARE_BYTES,
+    DelegationObservation: MAX_DELEGATION_BYTES, aw.SaveTextReply: 4*1024*1024,
+    DeliverImageCommand: MAX_IMAGE_BYTES*4//3+4096,
+}
+
+
+def _body_refusal(model, error):
+    if (model is DelegationPrepare and error.status == 413
+            and error.body["error"]["code"] == "BEHAVIOR_BODY_LIMIT"):
+        return HTTPException(413, detail="Delegation material size exceeds 192 KiB; no intent was reserved.",
+            headers={"Cache-Control": "no-store", "x-behavior-assistant-error-code": DELEGATION_SIZE_REFUSAL,
+                     "x-behavior-delegation-stage": "before-reservation"})
+    if model is SaveSdkState and error.body["error"]["code"] in SDK_STATE_ERRORS:
+        return acquire_http_error(error, "assistant_authority")
+    return None
+
+
+def _response_limits(suffix, result):
+    if isinstance(result, SdkState):
+        return {"max_bytes": SDK_STATE_HTTP_BYTES}
+    if suffix.startswith("agent-message-"):
+        return {"max_bytes": AGENT_MESSAGE_HTTP_BYTES}
+    if suffix.startswith("delegation-"):
+        return {"max_bytes": MAX_DELEGATION_BYTES}
+    if isinstance(result, AttachedTexts):
+        return {"max_bytes": ATTACHMENT_RESPONSE_BYTES}
+    if suffix in {"capability-catalog", "capability-call"}:
+        return {"max_bytes": CAPABILITY_RESPONSE_BYTES}
+    return {}
+
+
+class _SessionRoute:
+    """One ticketed /sessions/{session_id}/<suffix> route: session, body, handler and its answer."""
+
+    def __init__(self, authority, on_result_ready, suffix, model, handler):
+        self.authority, self.on_result_ready = authority, on_result_ready
+        self.suffix, self.model, self.handler = suffix, model, handler
+
+    async def __call__(self, request, binding_id, session_id, principal):
+        ticket = _bound_ticket(request, session_id)
+        session = await self._session(binding_id, session_id, ticket, principal)
+        command = await self._command(request)
+        return await self._answer(request, binding_id, session, command, principal)
+
+    async def _session(self, binding_id, session_id, ticket, principal):
+        try:
+            if self.suffix in _MODEL_SESSION:
+                session = await run_in_threadpool(self.authority.model_session, binding_id, session_id,
+                                                 ticket, principal)
+            else:
+                session = await run_in_threadpool(self.authority.current_session, binding_id, session_id,
+                                                 ticket, principal, active=self.suffix not in _INACTIVE_SESSION)
+        except Exception as error:
+            if self.suffix in _EXCEPTION_LOGGED:
+                _log_assistant_exception(error, "session_authority", None)
+            raise
+        if session.binding_id != binding_id:
+            raise Problem(403, "ASSISTANT_BINDING_DENIED", "ticket is bound to another assignment")
+        return session
+
+    async def _command(self, request):
+        limit = _BODY_BYTES.get(self.model)
+        try:
+            command = await _body(request, self.model, **({} if limit is None else {"max_body_bytes": limit}))
+        except Problem as error:
+            refusal = _body_refusal(self.model, error)
+            if refusal is None:
+                raise
+            raise refusal from None
+        expected_id = _COMMAND_IDS.get(self.suffix)
+        if expected_id is not None and command.request_id != expected_id:
+            raise Problem(422, "ASSISTANT_COMMAND_ID", "the fixed bounded command ID is required")
+        return command
+
+    async def _answer(self, request, binding_id, session, command, principal):
+        try:
+            result = await run_in_threadpool(self.handler, session, command, principal)
+            self._notify(binding_id, session, result)
+            return _response(result, **_response_limits(self.suffix, result))
+        except Problem as error:
+            response_error = acquire_http_error(error, "assistant_authority",
+                                                sdk_start_binding=session.assignment.sdk_start_binding)
+            if self.suffix in _FAILURE_LOGGED:
+                _log_request_failure(request, error.body["error"].get("code"))
+            raise response_error from None
+        except Exception as error:
+            if self.suffix in _EXCEPTION_LOGGED:
+                _log_assistant_exception(error, self.suffix, session)
+            # Only the route and exception class; messages may carry request data.
+            logging.getLogger(__name__).warning("ASSISTANT_DEPENDENCY_FAILED %s", json.dumps(
+                {"action": self.suffix, "exception_type": type(error).__name__}, sort_keys=True))
+            raise Problem(503, "ASSISTANT_DEPENDENCY_FAILED", "typed assistant operation failed") from None
+
+    def _notify(self, binding_id, session, result):
+        if self.suffix in _ACTIVITY:
+            self.authority.record_instruction_activity(session)
+        if self.suffix == "execution-ready":
+            self.on_result_ready(binding_id)
+        if (self.on_result_ready is not None and self.suffix in _AGENT_MESSAGES
+                and result.message.kind in {"request", "handoff"}):
+            self.on_result_ready(binding_id)
+
+
+def _add_session_route(app, identity, route):
+    async def invoke(request: Request, binding_id: str, session_id: str, principal=Depends(identity)):
+        return await route(request, binding_id, session_id, principal)
+    app.add_api_route(PREFIX + "/sessions/{session_id}/" + route.suffix, invoke, methods=["POST"])
+
+
+def install_assistant_routes(app, authority: AssistantAuthority, verifier, *, provider=None, on_result_ready=None):
+    if not isinstance(authority, AssistantAuthority):
+        raise Problem(503, "ASSISTANT_CONFIGURATION", "concrete assistant authority is required")
+    identity = _principal_dependency(verifier)
+    if authority.runtime.mode == "native" and provider is None:
+        raise Problem(503, "ASSISTANT_MODEL_DISABLED", "native assistant requires an explicit one-send model provider")
+    _install_entry_routes(app, authority, identity)
+    if provider is not None:
+        _install_model_route(app, authority, identity, provider)
+    for suffix, (model, handler) in _session_handlers(authority, on_result_ready).items():
+        _add_session_route(app, identity, _SessionRoute(authority, on_result_ready, suffix, model, handler))

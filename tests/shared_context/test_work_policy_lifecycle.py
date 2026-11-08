@@ -8,7 +8,7 @@ from shared_context import behavior_wire as wire
 from shared_context.behavior_assistant_wire import AssistantSubmit
 from shared_context.behavior_work_policy import WorkPolicyControl
 from test_behavior_assistant import assistant,runtime_path
-from test_work_cost_policy import standing
+from test_work_cost_policy import standing,install_offline
 from test_m3_auth import jwk_client,signing_key
 
 
@@ -17,7 +17,7 @@ def enabled(assistant,*,after_global=False):
     if after_global:h.time=h.policy.valid_until+timedelta(seconds=1)
     facts=[observed.model_copy(update={"observed_at":h.time})]
     control=WorkPolicyControl(h.runtime,policy,lambda:facts[0])
-    control.install_offline(human,"offline-once-standing-policy",h.time+timedelta(minutes=10))
+    install_offline(control,human,"offline-once-standing-policy",h.time+timedelta(minutes=10))
     initial=h.readiness()
     h.delivery.registration=replace(h.delivery.registration,verify_readiness=lambda:initial.model_copy(update={
         "observed_at":h.time,"expires_at":h.time+timedelta(minutes=5)}))

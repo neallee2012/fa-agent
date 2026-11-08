@@ -363,6 +363,8 @@ def test_sources_snapshot_review_claim_current_and_exact_context_use_real_module
     assembled = h.post("/context", wire.ContextRequest(request_id="context", required_claim_ids=("claim-one",)))
     assert assembled.status_code == 200, assembled.text
     assert METRICS in [base64.b64decode(value) for value in assembled.json()["originals"].values()]
+    assert assembled.json().keys() == {"manifest", "claims", "originals"}
+    assert assembled.json()["manifest"]["exact_source_fallback"] is True
     withdrawal = wire.SourceWithdrawal(request_id="withdraw", withdrawal_id="withdraw-one", reference=ref, expected_access_revision=1)
     assert h.post("/sources/metrics/withdraw", withdrawal).status_code == 200
     assert h.client.get(BASE + "/sources/metrics/versions/1", headers=h.headers()).status_code == 403

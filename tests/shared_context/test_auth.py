@@ -163,11 +163,11 @@ class _CountingKeys:
 
 @pytest.fixture
 def clock():
-    from shared_context.auth import _reset_forced_refresh_window
-    _reset_forced_refresh_window()
+    from shared_context.auth import _tenant_forced_refresh
+    _tenant_forced_refresh.reset()
     now = SimpleNamespace(value=1000.0)
     yield now
-    _reset_forced_refresh_window()
+    _tenant_forced_refresh.reset()
 
 
 def test_unknown_kids_force_at_most_one_key_download_per_window(auth, private_key, monkeypatch, clock):

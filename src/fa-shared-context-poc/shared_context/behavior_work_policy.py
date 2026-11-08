@@ -845,28 +845,6 @@ class WorkPolicyControl:
             approved_at=now,change_expires_at=change_expires_at,initial_observation=observation)
         return installation,ledger,WorkRegistry(policy_id=policy.policy_id)
 
-    def install_offline(self,principal,decision_id,change_expires_at):
-        if self.runtime.mode!="offline_contract":
-            raise Problem(403,"WORK_POLICY_NATIVE_INSTALLER_REQUIRED","native requires its exact historical cutover")
-        values=self.initial_records(principal,decision_id,change_expires_at)
-        keys=(self.policy_key,self.cost_key,self.registry_key)
-        request=ControlRequest(request_id=work_policy_key("install",self.policy.authority_domain),
-            request_digest=digest([v.model_dump(mode="json") for v in values]),read_set=keys)
-        def decide(rows):
-            if any(rows[k] is not None for k in keys):
-                raise Problem(409,"WORK_POLICY_ALREADY_INSTALLED","standing scope and cumulative cost cannot reset")
-            if self.runtime._now()>=change_expires_at:
-                raise Problem(403,"WORK_POLICY_CHANGE_EXPIRED","initial control transaction expired")
-            return ControlChanges(writes=tuple(_write(k,v,"create",material(v.model_dump(mode="json")) if k==self.policy_key else None)
-                for k,v in zip(keys,values)),result={"policy_id":self.policy.policy_id,"installed":True,"business_deadline":None})
-        result=self.store.transact(request,decide)
-        self.runtime.work_policy=self
-        self.runtime.historical_binding_ids=frozenset((*self.runtime.historical_binding_ids,*self.base_bindings))
-        self.runtime.dep.inbox.register_work_policy(self)
-        self.runtime.dep.delivery.work_policy=self
-        self.runtime.dep.workers.work_policy=self
-        return result
-
     def attach(self):
         self._runtime_scope()
         self.installed()

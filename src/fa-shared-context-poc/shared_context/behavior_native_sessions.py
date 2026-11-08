@@ -329,6 +329,71 @@ def _read_platform_session(client, **options):
     return _target(client.target, agent_version=session.version_indicator.agent_version)
 
 
+def _source_status(source):
+    """The platform status of the cut's source (metadata wakes nothing); ``missing`` when it is gone. Read afresh at
+    each point the cut asks."""
+    metadata = _session_metadata(source)
+    return "missing" if metadata is None else metadata.status
+
+
+def _require_files_profile(destination, state, command):
+    """``follow`` moves workspace files: the destination must declare the files profile, unless this very follow's
+    omission of them is confirmed."""
+    from .native_files_wire import FILES_PROFILE
+
+    omitted = state.following
+    confirmed_omission = (omitted is not None and omitted.request_id == command.request_id
+                          and omitted.hosted_session_id == destination.target.session_id
+                          and omitted.files_migrated is False and omitted.files_skip_request_id is not None)
+    if state.files_profile != FILES_PROFILE and not confirmed_omission:
+        raise Problem(409, "NATIVE_FILES_UNSUPPORTED", "the selected environment cannot safely migrate workspace files")
+
+
+def _admission_conflict(command, state, error):
+    """An idle-only ``prepare`` refused 409 ``NATIVE_ENVIRONMENT_CONFLICT`` with no files check, while nothing else
+    of the environment's intent was recorded: only the Agent ETag may have moved."""
+    return (command.idle_only and error.status == 409
+            and error.body["error"]["code"] == "NATIVE_ENVIRONMENT_CONFLICT"
+            and error.body["error"].get("files_check") is None and state.following is None
+            and (state.environment is None or state.environment.state == "ready"))
+
+
+def _follow_source_version(found, value):
+    """Hosted's view names the version the source SID was created on; a drift the binding row recorded for that
+    SID (ADR-0009 §2, §9) is the same source, any other version is still refused before the source is called."""
+    row = None if found is None else found[1]
+    return (row.observed.agent_version if row is not None
+            and row.hosted_session_id == value.previous_hosted_session_id else None)
+
+
+def _precheck_source(files, value, command, before_send):
+    """Today's follow outside a fence, unchanged: a source on another version is refused (the owner's omission, the
+    source drift exit). A denied (fixable role assignment) or unconfirmed metadata read waits like `source_status`;
+    a proven drift (409) is still refused. None: go on."""
+    if isinstance(before_send, _CutFence):
+        return None
+    try:
+        files.require_source_version(active=False)
+    except Problem as error:
+        if error.status not in {401, 403} and not isinstance(error, _MetadataUnconfirmed):
+            raise
+        logging.getLogger(__name__).warning(
+            "NATIVE_ENVIRONMENT_PENDING stage=precheck status=%s code=%s rid=%s",
+            error.status, error.body["error"]["code"], timing_id(command.request_id))
+        return value.model_copy(update={"reason": "source_unavailable"})
+    return None
+
+
+def _names(fence):
+    """The (SID, request ID) a fence record or a ``pending`` view names."""
+    return fence.hosted_session_id, fence.request_id
+
+
+def _same_pending(environment, pending):
+    """``environment`` (a state's) is still that ``pending``."""
+    return environment is not None and environment.state == "pending" and _names(environment) == _names(pending)
+
+
 def _active_session(client):
     """Platform metadata (it wakes nothing) says ``client``'s session is active on the version it was recorded with."""
     session = _session_metadata(client)
@@ -537,6 +602,18 @@ class _OmissionCall:
     observe_only: bool
     refusal_code: str | None
     system_policy: bool
+
+
+@dataclass(frozen=True)
+class _CutCall:
+    """What one background ``cut`` holds once the target passed U0; it never changes during that cut."""
+    client: object
+    found: tuple | None  # the binding row as read: its previous SIDs are the settled ones
+    row: object  # after its recorded fence settled and its profile was corrected
+    selected: str
+    source: object  # the row's SID on its recorded version
+    bound: _CutFence
+    stop: Event | None
 
 
 @dataclass(frozen=True)
@@ -1724,144 +1801,148 @@ class NativeSessions:
         caller only carries out a decision already written.
         ``destination``: the background cut's fence after FA's stop of the source, driven at its own session whatever
         the selector names now (no ``_destination`` read)."""
-        from .behavior_native_turn_api import NativeTurnGateway
         from .behavior_session_files import FollowFiles
-        from .native_files_wire import FILES_PROFILE
 
         with self._changing():
             if destination is None:
                 destination = self._destination(client, command.expected_agent_version, before_send)
             state = self._state(destination)
-            existing = state.environment
-            if (existing is not None and existing.hosted_session_id == destination.target.session_id
-                    and existing.state == "ready" and (command.expected_session_id is None
-                    or existing.previous_hosted_session_id == command.expected_session_id)):
-                self._remember_state(destination, state)
-                # A rerun after a crash between the commit and the binding write completes that write.
-                return self._switched_and_checked(destination, existing)
-            current = self._current_environment(destination, state, command)
-            if current is not None:
-                return current
+            done = self._followed(destination, state, command)
+            if done is not None:
+                return done
             found = self._binding_row(client.target.agent_id)
             switched = self._abandon_source(client, command, destination, state, before_send,
                                             decide=self._deciding_abandon,
                                             found=found)
             if switched is not None:
                 return switched
-            omitted = state.following
-            confirmed_omission = (omitted is not None and omitted.request_id == command.request_id
-                                  and omitted.hosted_session_id == destination.target.session_id
-                                  and omitted.files_migrated is False and omitted.files_skip_request_id is not None)
-            if state.files_profile != FILES_PROFILE and not confirmed_omission:
-                raise Problem(409, "NATIVE_FILES_UNSUPPORTED", "the selected environment cannot safely migrate workspace files")
+            _require_files_profile(destination, state, command)
             before_send()
             internal = NativeSessionFollow(
                 request_id=command.request_id,
                 expected_session_id=command.expected_session_id or state.hosted_session_id,
                 expected_etag=state.etag, stage="prepare", idle_only=command.idle_only, files_required=True,
                 settled_session_ids=self._settled(found, destination))
-            try:
-                value, _ = self._follow_invoke(destination, internal)
-            except Problem as error:
-                if (not command.idle_only or error.status != 409
-                        or error.body["error"]["code"] != "NATIVE_ENVIRONMENT_CONFLICT"
-                        or error.body["error"].get("files_check") is not None or state.following is not None
-                        or state.environment is not None and state.environment.state != "ready"):
-                    raise
-                observed = self._state(destination)
-                # Admission may mark and clear the Agent ETag after the read; no environment intent may change.
-                fields = {"etag", "admission_request_id"}
-                if (observed.etag == state.etag or observed.hosted_session_id != internal.expected_session_id
-                        or observed.model_dump(exclude=fields) != state.model_dump(exclude=fields)
-                        or self.selected_version(client) != command.expected_agent_version):
-                    raise
-                before_send()
-                internal = internal.model_copy(update={"expected_etag": observed.etag})
-                value, _ = self._follow_invoke(destination, internal)
+            value, internal = self._follow_prepare(client, destination, state, command, internal, before_send)
             if value.state == "ready":
                 return self._confirm_environment(destination, value)
-            # Hosted's view names the version the source SID was created on; a drift the binding row recorded for that
-            # SID (ADR-0009 §2, §9) is the same source, any other version is still refused before the source is called.
-            row = None if found is None else found[1]
-            source_version = (row.observed.agent_version if row is not None
-                              and row.hosted_session_id == value.previous_hosted_session_id else None)
+            source_version = _follow_source_version(found, value)
             if value.reason == "files_pending":
                 FollowFiles(destination, value, before_send, source_version=source_version).copy_step()
                 before_send()
                 value, _ = self._follow_invoke(destination, internal)
             if value.reason != "source_stop_required":
                 return value
-            skip_files = value.files_migrated is False and value.files_skip_request_id is not None
-            if value.files_manifest_sha256 is None and not skip_files:
-                raise Problem(409, "NATIVE_FILES_UNSUPPORTED", "the original follow has no verified workspace manifest")
-            files = None if skip_files else FollowFiles(destination, value, before_send, source_version=source_version)
-            stop_recorded = False
-            if files is not None:
-                if not isinstance(before_send, _CutFence):
-                    # Today's follow outside a fence, unchanged: a source on another version is refused (the owner's
-                    # omission, the source drift exit).
-                    try:
-                        files.require_source_version(active=False)
-                    except Problem as error:
-                        # A denied (fixable role assignment) or unconfirmed metadata read waits like `source_status`;
-                        # a proven drift (409) is still refused.
-                        if error.status not in {401, 403} and not isinstance(error, _MetadataUnconfirmed):
-                            raise
-                        logging.getLogger(__name__).warning(
-                            "NATIVE_ENVIRONMENT_PENDING stage=precheck status=%s code=%s rid=%s",
-                            error.status, error.body["error"]["code"], timing_id(command.request_id))
-                        return value.model_copy(update={"reason": "source_unavailable"})
-                # The fence: before FA's recorded stop `before_stop` refuses a source not active on its version; after
-                # it a source awake on any version was woken, so it is stopped again below and the files are
-                # published from the verified staging (ADR-0009 §10 check ②, dev 2026-10-16).
-                stop_recorded = files.before_stop()
-            source = client.for_target(_target(
-                client.target, session_id=value.previous_hosted_session_id, agent_version=value.previous_agent_version))
+            return self._follow_stop(client, destination, command, internal, value, before_send, source_version)
+
+    def _followed(self, destination, state, command):
+        """The environment ``follow`` already reached (a committed switch, or no switch needed); else None."""
+        existing = state.environment
+        if (existing is not None and existing.hosted_session_id == destination.target.session_id
+                and existing.state == "ready" and (command.expected_session_id is None
+                or existing.previous_hosted_session_id == command.expected_session_id)):
+            self._remember_state(destination, state)
+            # A rerun after a crash between the commit and the binding write completes that write.
+            return self._switched_and_checked(destination, existing)
+        return self._current_environment(destination, state, command)
+
+    def _follow_prepare(self, client, destination, state, command, internal, before_send):
+        """The follow's ``prepare``, as (value, the command it was sent as): an idle-only conflict whose Agent ETag
+        moved under admission alone is sent once more at the new ETag."""
+        try:
+            value, _ = self._follow_invoke(destination, internal)
+        except Problem as error:
+            if not _admission_conflict(command, state, error):
+                raise
+            observed = self._state(destination)
+            # Admission may mark and clear the Agent ETag after the read; no environment intent may change.
+            fields = {"etag", "admission_request_id"}
+            if (observed.etag == state.etag or observed.hosted_session_id != internal.expected_session_id
+                    or observed.model_dump(exclude=fields) != state.model_dump(exclude=fields)
+                    or self.selected_version(client) != command.expected_agent_version):
+                raise
             before_send()
-            phase = "source_status"
-            try:
-                # The source is the Agent's current SID until this follow commits; an unclaimed Agent claims it
-                # with the version this metadata read already shows (ADR-0009 §2), outside any owner request.
-                status = _source_session_status(source, phase, observe=lambda session: self.observed_binding(
-                    source, claimed_version=session.version_indicator.agent_version,
-                    created_at=getattr(session, "created_at", None)))
-                # ADR-0009 §10: stop only an active source. Idle or terminal has no compute to stop; creating,
-                # updating or deleting is left alone and reported below as `source_active` for a later retry.
-                if status == "active":
-                    if isinstance(before_send, _CutFence):
-                        # The background cut's reserve and durable marker, before every stop until it is marked.
-                        before_send.stopping()
-                    phase = "stop_session"
-                    accepted = source.stop_session()
-                    # `is not False` on purpose: only an explicit False (`session_already_stopped`, not FA's stop) skips the record;
-                    # clients and test doubles that return None are treated as accepted.
-                    if files is not None and not stop_recorded and accepted is not False:
-                        # `stop_started` is written only after the platform accepted FA's own stop: a source found
-                        # inactive without it was reclaimed and its staging is not published.
-                        phase = "stop_record"
-                        files.record_stop()
-                        stop_recorded = True
-                phase = "source_readback"
-                status = _source_session_status(source, phase)
-            except Problem as error:
-                upstream = error.body["error"].get("upstream_status")
-                logging.getLogger(__name__).warning(
-                    "NATIVE_ENVIRONMENT_PENDING stage=%s status=%s code=%s upstream_status=%s",
-                    phase, error.status, error.body["error"]["code"], upstream if type(upstream) is int else None)
-                return value.model_copy(update={"reason": "source_unavailable"})
-            if status not in {"idle", "failed", "deleted", "expired"}:
-                return value.model_copy(update={"reason": "source_active"})
-            if files is not None and not stop_recorded:
-                # Inactive although FA never had its own stop accepted: the platform reclaimed it (ADR-0009 §10).
-                raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE",
-                              "the original source became inactive without FA's stop; its files are not read")
-            if files is not None and not files.stopped_step():
-                return value.model_copy(update={"reason": "files_pending"})
-            before_send()
-            value, _ = self._follow_invoke(destination, internal.model_copy(update={"stage": "commit"}))
-            if value.state == "ready":
-                return self._confirm_environment(destination, value)
-            return value
+            internal = internal.model_copy(update={"expected_etag": observed.etag})
+            value, _ = self._follow_invoke(destination, internal)
+        return value, internal
+
+    def _follow_stop(self, client, destination, command, internal, value, before_send, source_version):
+        """``source_stop_required``: the files are checked against the source, the source is stopped (ADR-0009 §10)
+        and, once it reads back inactive, the follow commits."""
+        from .behavior_session_files import FollowFiles
+
+        skip_files = value.files_migrated is False and value.files_skip_request_id is not None
+        if value.files_manifest_sha256 is None and not skip_files:
+            raise Problem(409, "NATIVE_FILES_UNSUPPORTED", "the original follow has no verified workspace manifest")
+        files = None if skip_files else FollowFiles(destination, value, before_send, source_version=source_version)
+        stop_recorded = False
+        if files is not None:
+            waiting = _precheck_source(files, value, command, before_send)
+            if waiting is not None:
+                return waiting
+            # The fence: before FA's recorded stop `before_stop` refuses a source not active on its version; after
+            # it a source awake on any version was woken, so it is stopped again below and the files are
+            # published from the verified staging (ADR-0009 §10 check ②, dev 2026-10-16).
+            stop_recorded = files.before_stop()
+        status, stop_recorded = self._stop_source(client, value, files, stop_recorded, before_send)
+        if status is None:
+            return value.model_copy(update={"reason": "source_unavailable"})
+        if status not in {"idle", "failed", "deleted", "expired"}:
+            return value.model_copy(update={"reason": "source_active"})
+        return self._follow_commit(destination, internal, value, files, stop_recorded, before_send)
+
+    def _stop_source(self, client, value, files, stop_recorded, before_send):
+        """The follow's source stopped while ``active``, as (status read back, stop_recorded); status None: a read or
+        the stop failed (logged), and the follow waits as ``source_unavailable``."""
+        source = client.for_target(_target(
+            client.target, session_id=value.previous_hosted_session_id, agent_version=value.previous_agent_version))
+        before_send()
+        phase = "source_status"
+        try:
+            # The source is the Agent's current SID until this follow commits; an unclaimed Agent claims it
+            # with the version this metadata read already shows (ADR-0009 §2), outside any owner request.
+            status = _source_session_status(source, phase, observe=lambda session: self.observed_binding(
+                source, claimed_version=session.version_indicator.agent_version,
+                created_at=getattr(session, "created_at", None)))
+            # ADR-0009 §10: stop only an active source. Idle or terminal has no compute to stop; creating,
+            # updating or deleting is left alone and reported below as `source_active` for a later retry.
+            if status == "active":
+                if isinstance(before_send, _CutFence):
+                    # The background cut's reserve and durable marker, before every stop until it is marked.
+                    before_send.stopping()
+                phase = "stop_session"
+                accepted = source.stop_session()
+                # `is not False` on purpose: only an explicit False (`session_already_stopped`, not FA's stop) skips the record;
+                # clients and test doubles that return None are treated as accepted.
+                if files is not None and not stop_recorded and accepted is not False:
+                    # `stop_started` is written only after the platform accepted FA's own stop: a source found
+                    # inactive without it was reclaimed and its staging is not published.
+                    phase = "stop_record"
+                    files.record_stop()
+                    stop_recorded = True
+            phase = "source_readback"
+            status = _source_session_status(source, phase)
+        except Problem as error:
+            upstream = error.body["error"].get("upstream_status")
+            logging.getLogger(__name__).warning(
+                "NATIVE_ENVIRONMENT_PENDING stage=%s status=%s code=%s upstream_status=%s",
+                phase, error.status, error.body["error"]["code"], upstream if type(upstream) is int else None)
+            return None, stop_recorded
+        return status, stop_recorded
+
+    def _follow_commit(self, destination, internal, value, files, stop_recorded, before_send):
+        """The follow's commit once its source reads back inactive."""
+        if files is not None and not stop_recorded:
+            # Inactive although FA never had its own stop accepted: the platform reclaimed it (ADR-0009 §10).
+            raise Problem(409, "NATIVE_FILES_SOURCE_UNAVAILABLE",
+                          "the original source became inactive without FA's stop; its files are not read")
+        if files is not None and not files.stopped_step():
+            return value.model_copy(update={"reason": "files_pending"})
+        before_send()
+        value, _ = self._follow_invoke(destination, internal.model_copy(update={"stage": "commit"}))
+        if value.state == "ready":
+            return self._confirm_environment(destination, value)
+        return value
 
     def _automatic_decision(self, client, command, destination, state):
         from .behavior_native_turn_wire import NativeEnvironmentWithoutFiles, automatic_omission_id
@@ -2519,29 +2600,16 @@ class NativeSessions:
         from the cut's start or on shutdown: ``_FenceOverrun`` is raised (5b's carry falls back to the fence instead).
 
         ``target``: 4d's rollback (``_crash_loop``), the version this cut goes to instead of the selector's."""
-        from .behavior_native_turn_api import NativeTurnGateway
-        from .behavior_native_turn_wire import NativeSessionCut
-        from .behavior_session_files import SessionFiles
-
         if target is not None:
             token = _ROLLBACK.set(target)
             try:
                 return self.cut(client, stop=stop)
             finally:
                 _ROLLBACK.reset(token)
-        agent_id = client.target.agent_id
-        found = self._binding_row(agent_id)
-        row = None if found is None else found[1]
-        # A recorded fence settles first, as every send's ``advance`` does: a heal that finds V_rec unsupported (the
-        # row then ``unbound``) must not leave it unsettled.
-        if row is not None and row.upgrade is not None:
-            settled, row = self._converge(client, row, stop=stop)
-            if settled is not None:
-                return settled, None, None
-        if row is not None and (row.profile_unread or row.drift):
-            row = self._correct_profile(client, row)
-        if row is None or not row.supported() and row.abandon is None:
-            return "unbound", None, None
+        found = self._binding_row(client.target.agent_id)
+        outcome, row = self._cut_row(client, found, stop)
+        if outcome is not None:
+            return outcome
         if self.idle_upgrade and row.abandon is None and _ROLLBACK.get() is None:
             rolled = self._crash_loop(client, row, stop)
             if rolled is not None:
@@ -2550,40 +2618,69 @@ class NativeSessions:
         # The wait for a new destination (``create_session`` polls while it is creating/updating) and any send after
         # it end at the bound or on shutdown: ``_FenceOverrun`` leaves the cut, the next trigger tries again.
         bound = _CutFence(CUT_DESTINATION_SECONDS, stop or Event())
+        outcome, source = self._cut_source(client, row, selected, bound)
+        if outcome is not None:
+            return outcome
+        return self._cut_to(_CutCall(client, found, row, selected, source, bound, stop))
+
+    def _cut_row(self, client, found, stop):
+        """``cut``'s binding row as (outcome, row): ``unbound`` without a row or with one whose profile is unsupported
+        and no abandon decided; outcome None: the cut goes on with the row."""
+        row = None if found is None else found[1]
+        if row is None:
+            return ("unbound", None, None), None
+        # A recorded fence settles first, as every send's ``advance`` does: a heal that finds V_rec unsupported (the
+        # row then ``unbound``) must not leave it unsettled.
+        if row.upgrade is not None:
+            settled, row = self._converge(client, row, stop=stop)
+            if settled is not None:
+                return (settled, None, None), row
+        if row.profile_unread or row.drift:
+            row = self._correct_profile(client, row)
+        if not row.supported() and row.abandon is None:
+            return ("unbound", None, None), row
+        return None, row
+
+    def _cut_source(self, client, row, selected, bound):
+        """``cut``'s checks before any destination is created or woken, as (outcome, source); outcome None: the cut
+        goes on from ``source``, the row's SID on its recorded version."""
         if row.abandon is not None:
             # ADR-0009 M1 step 4(b) (P8 gap): a decided Agent with no sends (the patrol's retired SID, an
             # incompatible claim) is switched by the background job, so it never holds the 2d-ii gate.
             switched = self._carry_out(client, selected, bound)
             self.forget()
-            return ("abandoned" if switched is not None else "abandon_pending"), None, None
+            return (("abandoned" if switched is not None else "abandon_pending"), None, None), None
         if row.observed.agent_version == selected:
-            return "current", None, None
+            return ("current", None, None), None
         if self.idle_upgrade:
             # Before the source and target are read (no extra read without the flag); the deferral start is recorded
             # only once both pass (U0).
             refused = self._idle_due(client, row, selected)
             if refused is not None:
-                return refused
-        source_sid = row.hosted_session_id
-        source = client.for_target(_target(client.target, session_id=source_sid, agent_version=row.observed.agent_version))
-
-        def source_status():
-            metadata = _session_metadata(source)
-            return "missing" if metadata is None else metadata.status
-
-        status = source_status()
+                return refused, None
+        source = client.for_target(_target(client.target, session_id=row.hosted_session_id,
+                                           agent_version=row.observed.agent_version))
+        status = _source_status(source)
         # ADR-0009 U0 (Neal decision 5): with the idle upgrade a compatible source moves only while ``active``.
         if status == "idle" or self.idle_upgrade and status != "active":
-            # Coordinator 2026-10-16: an idle source's files can not be copied without waking it, so no session is
-            # created and the source is not read; the Agent moves at its next real turn end (a stale receipt read is
-            # harmless). What an existing destination holds (a legacy pending, a commit the row missed) still settles.
-            existing = self.candidate(client, version=selected, row=row, located=True)
-            metadata = None if existing.target.session_id == source_sid else _session_metadata(existing)
-            if metadata is not None and metadata.status in {"active", "idle"}:
-                settled = self._settle(client, existing, self._state(existing), row)
-                if settled is not None:
-                    return settled, None, None
-            return ("source_idle", None, None) if status == "idle" else ("source_unavailable", status, None)
+            return self._source_waits(client, row, selected, status), source
+        return self._target_refused(client, row, selected), source
+
+    def _source_waits(self, client, row, selected, status):
+        """Coordinator 2026-10-16: an idle source's files can not be copied without waking it, so no session is
+        created and the source is not read; the Agent moves at its next real turn end (a stale receipt read is
+        harmless). What an existing destination holds (a legacy pending, a commit the row missed) still settles."""
+        existing = self.candidate(client, version=selected, row=row, located=True)
+        metadata = None if existing.target.session_id == row.hosted_session_id else _session_metadata(existing)
+        if metadata is not None and metadata.status in {"active", "idle"}:
+            settled = self._settle(client, existing, self._state(existing), row)
+            if settled is not None:
+                return settled, None, None
+        return ("source_idle", None, None) if status == "idle" else ("source_unavailable", status, None)
+
+    def _target_refused(self, client, row, selected):
+        """``cut``'s outcome when the selected version can not take this Agent, or (idle upgrade) its health check
+        waits; else None."""
         try:
             profile = _native_profile(client.for_target(_target(client.target, agent_version=selected)))
         except Problem as error:
@@ -2598,84 +2695,116 @@ class NativeSessions:
             return "target_incompatible", OLDER_SDK_RELEASE, None
         if self.idle_upgrade:
             self._record_due(row, selected)  # U0 held: target compatible, compatible source active, not vetoed
-            waiting = self._health_wait(row, selected)  # before any destination is created or woken
-            if waiting is not None:
-                return waiting
-        destination = self._destination(client, selected, bound, mark=False, row=row)
-        sid = destination.target.session_id
-        if sid == source_sid:
+            return self._health_wait(row, selected)  # before any destination is created or woken
+        return None
+
+    def _cut_to(self, cut):
+        """``cut`` from its destination on: the destination's own state settles first, then admission, then (idle
+        upgrade) U3 and U9's pre-restore, then the probe."""
+        client, row = cut.client, cut.row
+        destination = self._destination(client, cut.selected, cut.bound, mark=False, row=row)
+        if destination.target.session_id == row.hosted_session_id:
             # The row's own SID was created on the selected version and woke on another: the §7a drift path.
             return "same_session", None, None
         state = self._state(destination)
         settled = self._settle(client, destination, state, row)
         if settled is not None:
             if settled == "repaired" and self.idle_upgrade:
-                self._finish(source, destination, bound=bound)  # U9 for a commit the row missed, once recorded
+                self._finish(cut.source, destination, bound=cut.bound)  # U9 for a commit the row missed, once recorded
             return settled, None, None
-        if state.admission_request_id is None:
-            self._admitting_seen.pop(agent_id, None)
-            self._stop_durable(row, "admitting")
-        else:
-            if self._admitting_for(agent_id, row, state.admission_request_id) < STUCK_ADMISSION_SECONDS:
-                return "busy", "admission_pending", None
-            status = source_status()
-            if status not in {"active", "idle"}:
-                return "source_unavailable", status, None
-            return self._abandon_stuck(client, row, status, selected, bound), "stuck_admission", None
+        waiting = self._cut_admission(cut, state)
+        if waiting is not None:
+            return waiting
         if self.idle_upgrade:
-            unhealthy = self._health(destination, row, selected, bound)  # U3, before the probe
+            unhealthy = self._health(destination, row, cut.selected, cut.bound)  # U3, before the probe
             if unhealthy is not None:
                 return unhealthy
-            self._prerestore(destination, row, bound)  # U9's pre-restore: after U3, before U5
-        request_id = cut_request_id(agent_id, source_sid, sid)
-        settled_ids = self._settled(found, destination)
+            self._prerestore(destination, row, cut.bound)  # U9's pre-restore: after U3, before U5
+        return self._cut_probe(cut, destination, state)
+
+    def _cut_admission(self, cut, state):
+        """``cut``'s outcome while the destination records an admission (§7a: abandoned once it is stuck); else None,
+        and the admitting clock is cleared."""
+        agent_id = cut.client.target.agent_id
+        if state.admission_request_id is None:
+            self._admitting_seen.pop(agent_id, None)
+            self._stop_durable(cut.row, "admitting")
+            return None
+        if self._admitting_for(agent_id, cut.row, state.admission_request_id) < STUCK_ADMISSION_SECONDS:
+            return "busy", "admission_pending", None
+        status = _source_status(cut.source)
+        if status not in {"active", "idle"}:
+            return "source_unavailable", status, None
+        return self._abandon_stuck(cut.client, cut.row, status, cut.selected, cut.bound), "stuck_admission", None
+
+    def _cut_probe(self, cut, destination, state):
+        """Probe, list, cut (#856): the quiet probe, the source read after it, 5b's carry or the file listing, then the
+        cut with or without the fence."""
+        from .behavior_native_turn_api import NativeTurnGateway
+        from .behavior_native_turn_wire import NativeSessionCut
+        from .behavior_session_files import SessionFiles
+
+        source_sid = cut.row.hosted_session_id
+        request_id = cut_request_id(cut.client.target.agent_id, source_sid, destination.target.session_id)
+        settled_ids = self._settled(cut.found, destination)
         asked = NativeSessionCut(request_id=request_id, expected_session_id=source_sid, mode="probe",
                                  settled_session_ids=settled_ids)
         # Resent at the ETag read before it (the first probe carries none: a write since only means busy, as before).
-        probe = _scanned(lambda value: NativeTurnGateway._invoke(destination, value, timeout=_left(bound))[0], asked,
-                         bound, again=asked.model_copy(update={"expected_etag": state.etag}))
+        probe = _scanned(lambda value: NativeTurnGateway._invoke(destination, value, timeout=_left(cut.bound))[0],
+                         asked, cut.bound, again=asked.model_copy(update={"expected_etag": state.etag}))
         if probe.quiet_etag is None:
             return "busy", probe.reason, None
         # Read after the probe (probe, then list): a source that turned active before the quiet point is listed.
-        status = source_status()
+        status = _source_status(cut.source)
         if status not in {"active", "idle"}:
             return "source_unavailable", status, None
         if status == "idle":
             return "source_idle", None, None
         # ADR-0009 5b U1/U4 (flags off: no call): the workspace snapshot and its restore, between E0 and the cut, within
         # what is left of the cut's ``bound``.
-        carried = upgrade_snapshot_flow.carry(self, client, source, destination, asked, probe.quiet_etag, bound)
+        carried = upgrade_snapshot_flow.carry(self, cut.client, cut.source, destination, asked, probe.quiet_etag,
+                                              cut.bound)
         if isinstance(carried, tuple):
             return carried
         try:
             # ADR-0009 §10: only an active source is listed; an idle one was reclaimed and is never woken.
-            files = carried is None and SessionFiles(client).has_files(source_sid)
+            files = carried is None and SessionFiles(cut.client).has_files(source_sid)
         except Problem as error:
             return "files_unknown", error.body["error"]["code"], None
         command = NativeSessionCut(request_id=request_id, expected_session_id=source_sid,
                                    expected_etag=probe.quiet_etag, files_required=files,
                                    settled_session_ids=settled_ids, files_restore=carried)
         if files:
-            fenced = self._fenced(client, destination, command, row, selected, stop)
-            if fenced[0] == "ready":
-                upgrade_snapshot_flow.switched(self, destination, failed=False)
-            if self.idle_upgrade and fenced[0] == "ready":
-                self._finish(None, destination, bound=bound)  # the fence already stopped the source
-            return fenced
+            return self._cut_fenced(cut, destination, command)
+        return self._cut_switch(cut, destination, command, carried)
+
+    def _cut_fenced(self, cut, destination, command):
+        """With files the row records the fence and today's follow steps move them (``_fenced``)."""
+        fenced = self._fenced(cut.client, destination, command, cut.row, cut.selected, cut.stop)
+        if fenced[0] == "ready":
+            upgrade_snapshot_flow.switched(self, destination, failed=False)
+            if self.idle_upgrade:
+                self._finish(None, destination, bound=cut.bound)  # the fence already stopped the source
+        return fenced
+
+    def _cut_switch(self, cut, destination, command, carried):
+        """Without files (or with 5b's restore) Hosted commits directly; U9 follows the switch."""
+        from .behavior_native_turn_api import NativeTurnGateway
+
         try:
             # The cut goes on from the last scanning call's record, so it may read the probe's last stretch again.
-            value = _scanned(lambda value: NativeTurnGateway._invoke(destination, value, timeout=_left(bound))[0],
-                             command, bound)
+            value = _scanned(lambda value: NativeTurnGateway._invoke(destination, value, timeout=_left(cut.bound))[0],
+                             command, cut.bound)
         except Problem as error:
             if carried is None:
                 raise
             code = error.body["error"]["code"]
             if code == "FOUNDRY_INVOCATION_UNKNOWN":
                 # Unknown, not failed (rule 7): read back; a commit the row missed is recorded (§7a (j)), never counted.
-                settled = self._settle(client, destination, self._state(destination), row)
+                settled = self._settle(cut.client, destination, self._state(destination), cut.row)
                 if settled == "repaired":
                     upgrade_snapshot_flow.switched(self, destination, failed=False)
-                    self._finish(source, destination, bound=bound)  # U9, after U8 (carried implies idle_upgrade)
+                    self._finish(cut.source, destination, bound=cut.bound)  # U9, after U8 (carried implies idle_upgrade)
                 return settled or "busy", code, None
             # The staged restore did not commit (a staged file differs, or the publish is unconfirmed): no switch; the
             # third such failure in a row for this target sends the next attempt through the fence.
@@ -2687,7 +2816,7 @@ class NativeSessions:
         self.forget()
         upgrade_snapshot_flow.switched(self, destination, failed=False)
         if self.idle_upgrade:
-            self._finish(source, destination, bound=bound)  # U9, after U8
+            self._finish(cut.source, destination, bound=cut.bound)  # U9, after U8
         return "ready", None if carried is None else "snapshot", None
 
     def _idle_due(self, client, row, selected):
@@ -3353,90 +3482,135 @@ class NativeSessions:
         ``pending`` belongs to the follow that wrote it. A commit the row missed is recorded (§7a (j)). A marked fence
         whose ``pending`` is gone while the source is still current never committed ("fence_lost"): an anomaly, since
         Hosted refuses that withdraw; only here is its record cleared, with no other change. None: nothing to settle."""
+        pending = state.environment
+        if state.hosted_session_id != row.hosted_session_id:
+            return self._repaired(destination, state, row)
+        if pending is None or pending.state != "pending":
+            return self._fence_lost(row, marked)
+
+        def again(fresh):
+            return self._settle(client, destination, fresh, row, own=own, marked=marked, stop=stop, once=once,
+                                broken=broken)
+
+        fence = row.upgrade
+        if fence is None and self.guard.enforce:
+            return self._settle_legacy(client, destination, state, row, pending, again, stop=stop, once=once,
+                                       broken=broken)
+        if fence is None or _names(fence) != _names(pending):
+            return "pending_other"
+        return self._settle_fence(client, destination, state, row, pending, again, own=own, marked=marked, stop=stop,
+                                  once=once, broken=broken)
+
+    def _settle_legacy(self, client, destination, state, row, pending, again, *, stop, once, broken):
+        """``_settle`` for a ``pending`` no fence on the row records, while the guard is enforced."""
+        # 2d-i P6: with every follow entry off, a pending no fence recorded is an older follow's that nothing
+        # moves on any more (ADR M1 "舊式 follow 留下的 pending"): withdrawn by default, driven to its commit at
+        # its own target once its files progress records FA's stop (Hosted refuses that withdraw too).
+        stopped, fresh = self._stop_or_fresh(destination, pending)
+        if fresh is not None:
+            return again(fresh)
+        if stopped:
+            logging.getLogger(__name__).warning(
+                "NATIVE_UPGRADE_LEGACY_PENDING_DRIVEN session_id=%s", pending.hosted_session_id)
+            return self._drive(client, self._fence_reader(client, pending), pending, stop, once=once)
+        return self._withdraw_unless_marked(client, destination, state, row, pending, legacy=True, broken=broken,
+                                            stop=stop, once=once)
+
+    def _settle_fence(self, client, destination, state, row, pending, again, *, own, marked, stop, once, broken):
+        """``_settle`` for the ``pending`` of the row's own recorded fence."""
+        fence = row.upgrade
+        if marked or fence.stop_started:
+            # ``broken``: that progress is read through the fence's own SID, which does not answer; Hosted's
+            # withdraw CAS below reads the same progress.
+            return self._drive_unless_broken(client, destination, pending, stop, once, broken)
+        if not broken:
+            stopped, fresh = self._stop_or_fresh(destination, pending)
+            if fresh is not None:
+                return again(fresh)
+            if stopped:
+                return self._drive(client, destination, pending, stop, once=once)
+        if not own and (binding_store(self.composition).clock() - datetime.fromisoformat(
+                fence.started_at)).total_seconds() < CUT_FENCE_SECONDS:
+            return "fence_live"
+        return self._withdraw_unless_marked(client, destination, state, row, pending, legacy=False, broken=broken,
+                                            stop=stop, once=once)
+
+    def _stop_or_fresh(self, destination, pending):
+        """Whether the ``pending``'s files progress records FA's stop, as (stopped, None); or (None, a fresh state)
+        once that progress names no pending any more."""
+        try:
+            return self._stop_started(destination, pending), None
+        except Problem as error:
+            if error.status != 409 or error.body["error"]["code"] != "NATIVE_ENVIRONMENT_CONFLICT":
+                raise
+            # The files progress names no pending: another job withdrew or committed it after ``state`` was read
+            # (dev 2026-10-18, a send's pass against the job's withdraw at its bound). Settled again from a fresh
+            # read; the same pending still there is a conflict of its own.
+            fresh = self._state(destination)
+            if _same_pending(fresh.environment, pending):
+                raise
+        logging.getLogger(__name__).warning(
+            "NATIVE_UPGRADE_CUT_FENCE_SETTLED_MEANWHILE session_id=%s request_id=%s",
+            pending.hosted_session_id, pending.request_id)
+        return None, fresh
+
+    def _withdraw_unless_marked(self, client, destination, state, row, pending, *, legacy, broken, stop, once):
+        """The fence's withdraw, after reading the row once more: another replica may have marked its stop since
+        ``row`` was read."""
+        found = self._binding_row(row.agent_id)
+        latest = None if found is None or found[1] is None else found[1].upgrade
+        if latest is not None and latest.stop_started and _names(latest) == _names(pending):
+            return self._drive_unless_broken(client, destination, pending, stop, once, broken)
+        if latest != row.upgrade or legacy and found is None:
+            return "fence_live"  # unreadable, or another job's record of it: that job settles it
+        return self._withdraw(client, destination, state, row, pending, legacy=legacy, broken=broken, stop=stop,
+                              once=once)
+
+    def _withdraw(self, client, destination, state, row, pending, *, legacy, broken, stop, once):
+        """Hosted's withdraw of ``pending`` (a CAS at ``state``'s ETag), then what it left."""
         from .behavior_native_turn_api import NativeTurnGateway
         from .behavior_native_turn_wire import NativeSessionWithdraw
 
-        pending = state.environment
-        if state.hosted_session_id == row.hosted_session_id and (pending is None or pending.state != "pending"):
-            fence = row.upgrade
-            if fence is None or not (marked or fence.stop_started):
-                return None
-            logging.getLogger(__name__).warning(
-                "NATIVE_UPGRADE_CUT_FENCE_LOST session_id=%s request_id=%s source_session_id=%s",
-                fence.hosted_session_id, fence.request_id, row.hosted_session_id)
+        state, _ = NativeTurnGateway._invoke(destination, NativeSessionWithdraw(
+            request_id=material_digest({"kind": "fa-native-withdraw-v1", "agent": row.agent_id,
+                                        "pending": pending.request_id, "target": pending.hosted_session_id}),
+            expected_etag=state.etag, pending_request_id=pending.request_id,
+            pending_session_id=pending.hosted_session_id))
+        self.forget()
+        if _same_pending(state.environment, pending):
+            # Hosted refused: the fence's files progress records FA's stop of the source (any replica's).
+            if broken:
+                return "refused"
+            return self._drive(client, self._fence_reader(client, pending) if legacy else destination, pending,
+                               stop, once=once)
+        if state.hosted_session_id != row.hosted_session_id:
+            return self._repaired(destination, state, row)
+        if legacy:
+            logging.getLogger(__name__).warning("NATIVE_UPGRADE_LEGACY_PENDING_WITHDRAWN session_id=%s",
+                                                pending.hosted_session_id)
+        else:
             self._binding("upgrade", lambda store: store.record_upgrade(
-                row.agent_id, hosted_session_id=row.hosted_session_id, upgrade=None, lost=fence))
-            return "fence_lost"
-        if state.hosted_session_id == row.hosted_session_id:
-            fence = row.upgrade
-            # 2d-i P6: with every follow entry off, a pending no fence recorded is an older follow's that nothing
-            # moves on any more (ADR M1 "舊式 follow 留下的 pending"): withdrawn by default, driven to its commit at
-            # its own target once its files progress records FA's stop (Hosted refuses that withdraw too).
-            legacy = fence is None and self.guard.enforce
-            if not legacy and (fence is None or (fence.hosted_session_id, fence.request_id) != (
-                    pending.hosted_session_id, pending.request_id)):
-                return "pending_other"
-            try:
-                stopped = (self._stop_started(destination, pending)
-                           if legacy or not (marked or fence.stop_started or broken) else False)
-            except Problem as error:
-                if error.status != 409 or error.body["error"]["code"] != "NATIVE_ENVIRONMENT_CONFLICT":
-                    raise
-                # The files progress names no pending: another job withdrew or committed it after ``state`` was read
-                # (dev 2026-10-18, a send's pass against the job's withdraw at its bound). Settled again from a fresh
-                # read; the same pending still there is a conflict of its own.
-                fresh = self._state(destination)
-                left = fresh.environment
-                if left is not None and left.state == "pending" and (left.hosted_session_id, left.request_id) == (
-                        pending.hosted_session_id, pending.request_id):
-                    raise
-                logging.getLogger(__name__).warning(
-                    "NATIVE_UPGRADE_CUT_FENCE_SETTLED_MEANWHILE session_id=%s request_id=%s",
-                    pending.hosted_session_id, pending.request_id)
-                return self._settle(client, destination, fresh, row, own=own, marked=marked, stop=stop, once=once,
-                                    broken=broken)
-            if legacy:
-                if stopped:
-                    logging.getLogger(__name__).warning(
-                        "NATIVE_UPGRADE_LEGACY_PENDING_DRIVEN session_id=%s", pending.hosted_session_id)
-                    return self._drive(client, self._fence_reader(client, pending), pending, stop, once=once)
-            elif marked or fence.stop_started or stopped:
-                # ``broken``: that progress is read through the fence's own SID, which does not answer; Hosted's
-                # withdraw CAS below reads the same progress.
-                return "refused" if broken else self._drive(client, destination, pending, stop, once=once)
-            if not own and not legacy and (binding_store(self.composition).clock() - datetime.fromisoformat(
-                    fence.started_at)).total_seconds() < CUT_FENCE_SECONDS:
-                return "fence_live"
-            # Another replica may have marked its stop since ``row`` was read: read the row right before the withdraw.
-            found = self._binding_row(row.agent_id)
-            latest = None if found is None or found[1] is None else found[1].upgrade
-            if latest is not None and latest.stop_started and (latest.hosted_session_id, latest.request_id) == (
-                    pending.hosted_session_id, pending.request_id):
-                return "refused" if broken else self._drive(client, destination, pending, stop, once=once)
-            if latest != fence or legacy and found is None:
-                return "fence_live"  # unreadable, or another job's record of it: that job settles it
-            state, _ = NativeTurnGateway._invoke(destination, NativeSessionWithdraw(
-                request_id=material_digest({"kind": "fa-native-withdraw-v1", "agent": row.agent_id,
-                                            "pending": pending.request_id, "target": pending.hosted_session_id}),
-                expected_etag=state.etag, pending_request_id=pending.request_id,
-                pending_session_id=pending.hosted_session_id))
-            self.forget()
-            left = state.environment
-            if left is not None and left.state == "pending" and (left.hosted_session_id, left.request_id) == (
-                    pending.hosted_session_id, pending.request_id):
-                # Hosted refused: the fence's files progress records FA's stop of the source (any replica's).
-                if broken:
-                    return "refused"
-                return self._drive(client, self._fence_reader(client, pending) if legacy else destination, pending,
-                                   stop, once=once)
-            if state.hosted_session_id == row.hosted_session_id:
-                if legacy:
-                    logging.getLogger(__name__).warning("NATIVE_UPGRADE_LEGACY_PENDING_WITHDRAWN session_id=%s",
-                                                        pending.hosted_session_id)
-                else:
-                    self._binding("upgrade", lambda store: store.record_upgrade(
-                        row.agent_id, hosted_session_id=row.hosted_session_id, upgrade=None))
-                return "withdrawn"
+                row.agent_id, hosted_session_id=row.hosted_session_id, upgrade=None))
+        return "withdrawn"
+
+    def _drive_unless_broken(self, client, destination, pending, stop, once, broken):
+        return "refused" if broken else self._drive(client, destination, pending, stop, once=once)
+
+    def _fence_lost(self, row, marked):
+        """A marked fence whose ``pending`` is gone while the source is still current never committed: an anomaly,
+        since Hosted refuses that withdraw; only its record is cleared. None: nothing to settle."""
+        fence = row.upgrade
+        if fence is None or not (marked or fence.stop_started):
+            return None
+        logging.getLogger(__name__).warning(
+            "NATIVE_UPGRADE_CUT_FENCE_LOST session_id=%s request_id=%s source_session_id=%s",
+            fence.hosted_session_id, fence.request_id, row.hosted_session_id)
+        self._binding("upgrade", lambda store: store.record_upgrade(
+            row.agent_id, hosted_session_id=row.hosted_session_id, upgrade=None, lost=fence))
+        return "fence_lost"
+
+    def _repaired(self, destination, state, row):
+        """A commit the row missed is recorded (§7a (j))."""
         repaired = self._repair(destination, state, row)
         self.forget()
         return "conflict" if repaired is None else "repaired"

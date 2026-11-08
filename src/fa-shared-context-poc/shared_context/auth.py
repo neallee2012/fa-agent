@@ -95,11 +95,6 @@ class ForcedRefreshWindow:
 _tenant_forced_refresh = ForcedRefreshWindow()
 
 
-def _reset_forced_refresh_window() -> None:
-    """Test seam: forget the last forced refresh."""
-    _tenant_forced_refresh.reset()
-
-
 class ThrottledJWKClient(jwt.PyJWKClient):
     """PyJWKClient whose unknown-kid refresh is bounded process-wide; the cached set's TTL is unchanged."""
 

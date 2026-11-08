@@ -28,7 +28,7 @@ def resolve_reviewed_note(runtime, principal, origin_binding_id, claim_id, desti
         raise Problem(403, "MEMORY_RECALL_SCOPE_DENIED", "the original note is outside this human, agent or work purpose")
     context = runtime.context(origin_binding_id, ContextRequest(
         request_id="selected-reviewed-note", required_claim_ids=(claim_id,)), principal)
-    if len(context.claims) != 1 or context.summary is not None:
+    if len(context.claims) != 1:
         raise Problem(409, "MEMORY_RECALL_UNAVAILABLE", "one exact reviewed note is required")
     claim = context.claims[0]
     scope = claim.reference.scope

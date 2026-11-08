@@ -1,8 +1,12 @@
 from datetime import timedelta
 from shared_context.behavior_work_policy import (
-    SteadyWorkPolicy,CostObservation,CostLedger,cumulative_decision,WorkPolicyControl,
+    SteadyWorkPolicy,CostObservation,CostLedger,cumulative_decision,WorkPolicyControl,work_policy_key,
 )
 from shared_context.behavior_auth import BehaviorPrincipal
+from shared_context.behavior_operations import _write
+from shared_context.behavior_runtime import material
+from shared_context.behavior_store import ControlChanges,ControlRequest
+from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant,runtime_path
 from test_m3_auth import jwk_client,signing_key
@@ -30,6 +34,29 @@ def standing(assistant):
     human=BehaviorPrincipal(b.tenant_id,b.human_oid,b.team_id,"human",None,
         frozenset({"read","submit","approve","acknowledge"}))
     return h,p,o,ledger,human
+
+
+def install_offline(control,principal,decision_id,change_expires_at):
+    if control.runtime.mode!="offline_contract":
+        raise Problem(403,"WORK_POLICY_NATIVE_INSTALLER_REQUIRED","native requires its exact historical cutover")
+    values=control.initial_records(principal,decision_id,change_expires_at)
+    keys=(control.policy_key,control.cost_key,control.registry_key)
+    request=ControlRequest(request_id=work_policy_key("install",control.policy.authority_domain),
+        request_digest=digest([v.model_dump(mode="json") for v in values]),read_set=keys)
+    def decide(rows):
+        if any(rows[k] is not None for k in keys):
+            raise Problem(409,"WORK_POLICY_ALREADY_INSTALLED","standing scope and cumulative cost cannot reset")
+        if control.runtime._now()>=change_expires_at:
+            raise Problem(403,"WORK_POLICY_CHANGE_EXPIRED","initial control transaction expired")
+        return ControlChanges(writes=tuple(_write(k,v,"create",material(v.model_dump(mode="json")) if k==control.policy_key else None)
+            for k,v in zip(keys,values)),result={"policy_id":control.policy.policy_id,"installed":True,"business_deadline":None})
+    result=control.store.transact(request,decide)
+    control.runtime.work_policy=control
+    control.runtime.historical_binding_ids=frozenset((*control.runtime.historical_binding_ids,*control.base_bindings))
+    control.runtime.dep.inbox.register_work_policy(control)
+    control.runtime.dep.delivery.work_policy=control
+    control.runtime.dep.workers.work_policy=control
+    return result
 
 
 def test_budget_is_one_cumulative_usd_authority_not_abstract_root_units(assistant):

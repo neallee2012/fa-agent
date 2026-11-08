@@ -40,7 +40,7 @@ def observe_job_during_context(h, monkeypatch, *, local, allow_sdk=False, revoke
             assert before.binding == after.binding and before.spec == after.spec
             assert after.queries_reserved == before.queries_reserved + 1
             assert current.manifest == result.manifest and current.claims == result.claims
-            assert current.originals == result.originals and current.summary == result.summary
+            assert current.originals == result.originals
             mutations = ["job-query-observation"]
             text_policy_transition = None
             observed_bindings.add(binding_id)

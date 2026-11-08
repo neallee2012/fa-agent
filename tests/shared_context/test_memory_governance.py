@@ -220,7 +220,7 @@ def test_context_always_carries_original_claim_and_exact_fallback(memory_service
     context = assembled(memory)
     assert "cobalt" in context.claims[0].candidate.text
     assert b"cobalt" in context.originals[source.reference.key]
-    assert context.summary is None and context.manifest.exact_source_fallback
+    assert context.manifest.exact_source_fallback
 
 
 def test_required_fact_absence_wrong_actor_and_unknown_token_count_are_not_empty_success(memory_service):
