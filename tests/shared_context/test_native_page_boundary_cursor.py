@@ -573,3 +573,192 @@ def test_confirmation_metadata_restarts_only_the_mutable_follow_page(boundary_hi
     assert retained["page_offset"] > 0 and retained["page_digest"], "The immutable original must remain partial"
     assert sum(command.get("stage") == "confirm" for command, _ in case.fixture.controls) == 1
     assert not case.fixture.runtime.executor.calls
+
+
+def test_a_receipt_key_without_its_cursor_id_stops_the_check_unknown(boundary_history):
+    """The scan resumes from a key's ID; one the store did not give cannot be a resume point, so the check stops."""
+    case = boundary_history
+    case.items[0].id = ""
+    response = omit(case.fixture, preview=True)
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "NATIVE_ENVIRONMENT_UNKNOWN"
+    assert case.reads == ["rid:boundary-0000"]
+    assert not case.fixture.runtime.executor.calls
+
+
+@pytest.mark.parametrize("stuck", ["no_cursor", "same_cursor"])
+def test_a_receipt_page_that_does_not_advance_stops_the_check_unknown(boundary_history, monkeypatch, stuck):
+    """A page that says more follow but names no new cursor would rescan or skip work forever; the check stops."""
+    case = boundary_history
+    case.tick = 0  # no read deadline: each scan reaches its page end
+    listed = FoundryStateStore.list_keys
+
+    async def not_advancing(store, *, limit=None, after=None, **kwargs):
+        page = await listed(store, limit=limit, after=after, **kwargs)
+        if store._name == TURNS_STORE and stuck == "no_cursor":
+            page.last_id = None
+        elif store._name == TURNS_STORE and after is not None:
+            page.last_id = after
+        return page
+
+    monkeypatch.setattr(FoundryStateStore, "list_keys", not_advancing)
+    response = omit(case.fixture, preview=True)
+    if stuck == "same_cursor":
+        assert response.status_code == 200 and response.json()["reason"] == "scan_pending", response.text
+        response = omit(case.fixture, preview=True)
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "NATIVE_ENVIRONMENT_UNKNOWN"
+    assert case.calls == ([None] if stuck == "no_cursor" else [None, case.page_rows[0][-1]])
+    assert not case.fixture.runtime.executor.calls
+
+
+def test_a_deadline_on_a_page_last_key_moves_the_cursor_instead_of_relisting_the_page(boundary_history):
+    """The read deadline passes exactly on a page's last key: that page is finished, so the next call lists the next
+    page instead of the same page again."""
+    from shared_context import native_environment
+
+    case = boundary_history
+    case.tick = native_environment._SCAN_SECONDS / native_environment._CHECK_PAGE_KEYS
+    first = omit(case.fixture, preview=True)
+    assert first.status_code == 200 and first.json()["reason"] == "scan_pending", first.text
+    assert len(case.reads) == native_environment._CHECK_PAGE_KEYS
+    second = omit(case.fixture, preview=True)
+    assert second.status_code == 200, second.text
+    assert case.calls[:2] == [None, case.page_rows[0][-1]]
+    assert not case.fixture.runtime.executor.calls
+
+
+def test_a_failed_receipt_read_names_that_key_and_not_the_previous_conversation(boundary_history, monkeypatch):
+    """The diagnostic for a receipt that could not be read names only that key: the previous receipt's conversation
+    prefix is not carried over to it."""
+    case = boundary_history
+    read = FoundryStateStore.get_item
+
+    async def second_fails(store, key, **kwargs):
+        if key == "rid:boundary-0001":
+            raise ServiceResponseError("OFFLINE receipt read failed")
+        return await read(store, key, **kwargs)
+
+    monkeypatch.setattr(FoundryStateStore, "get_item", second_fails)
+    response = omit(case.fixture, preview=True)
+    assert response.status_code == 503, response.text
+    check = response.json()["error"]["files_check"]
+    assert (check["category"], check["stage"], check["key_category"], check["request_id_prefix"]) == (
+        "storage_read_failed", "read", "receipt", "boundary")
+    assert "conversation_id_prefix" not in check
+    assert case.reads == ["rid:boundary-0000"]
+
+
+def test_a_changed_page_reports_where_its_cursor_came_from(boundary_history):
+    case = boundary_history
+    first = omit(case.fixture, preview=True)
+    assert first.status_code == 200 and first.json()["reason"] == "scan_pending", first.text
+    case.change = "order"
+    second = omit(case.fixture, preview=True)
+    assert second.status_code == 409, second.text
+    assert second.json()["error"]["files_check"] == {
+        "category": "page_changed", "stage": "list", "key_category": "receipt", "cursor_source": "none"}
+
+
+def test_a_partial_check_reports_the_last_receipt_and_the_unknowns_it_kept(boundary_history, caplog):
+    """A check that stops at its deadline says which receipt it reached and how many unknown outcomes it left
+    unchanged (all of them here)."""
+    import logging
+
+    case = boundary_history
+    caplog.set_level(logging.INFO)
+    response = omit(case.fixture, preview=True)
+    assert response.status_code == 200 and response.json()["reason"] == "scan_pending", response.text
+    assert response.json()["files_check"]["request_id_prefix"] == "boundary"
+    assert response.json()["files_check"]["conversation_id_prefix"] == case.fixture.saved.conversation_id[:8]
+    lines = [record.getMessage() for record in caplog.records
+             if record.getMessage().startswith("FA_NATIVE_FILES_CHECK category=scan_pending ")]
+    assert lines == [f"FA_NATIVE_FILES_CHECK category=scan_pending request_id_prefix=boundary "
+                     f"terminal_unknowns_preserved={len(case.reads)}"]
+
+
+def _checked_with_follow_draining(case):
+    """A complete no-files check while the follow is still draining: the follow after the confirmation reads every
+    receipt again with the check's rules, page after page in one call."""
+    from shared_context import native_environment
+
+    async def draining():
+        async with case.fixture.runtime._store(TURNS_STORE) as store:
+            key = native_environment._key(case.fixture.runtime)
+            item = await store.get_item(key)
+            await store.set_item(key, {**item.value, "phase": "draining"}, if_match=item.etag)
+
+    case.fixture.hosted.portal.call(draining)
+    case.tick = 0
+    for _ in range(5):
+        preview = omit(case.fixture, preview=True)
+        assert preview.status_code == 200, preview.text
+        if preview.json()["reason"] is None:
+            break
+    assert preview.json()["reason"] is None, preview.text
+    case.reads.clear()
+    return len(case.calls)
+
+
+def test_a_confirmed_follow_whose_deadline_lands_on_a_page_end_resumes_on_the_next_page(boundary_history):
+    """The read deadline passes on the last key of a follow page (16 keys): that follow stops there instead of listing
+    another page, and the next follow starts on the next page."""
+    from shared_context import native_environment
+
+    case = boundary_history
+    del case.items[48:]
+    listed = _checked_with_follow_draining(case)
+    case.tick = native_environment._SCAN_SECONDS / 16
+    confirmed = omit(case.fixture)
+    assert confirmed.status_code == 200 and confirmed.json()["reason"] == "scan_pending", confirmed.text
+    assert case.calls[listed:] == [None]
+    assert case.reads == [item.key for item in case.items[:16]]
+    resumed = follow(case.fixture)
+    assert resumed.status_code == 200, resumed.text
+    assert case.calls[listed:] == [None, case.items[15].id]
+    assert not case.fixture.runtime.executor.calls
+
+
+def test_a_confirmed_follow_failing_on_a_later_page_reports_the_page_cursor(boundary_history, monkeypatch):
+    """A follow that moved past its first page in the same call and then cannot list the next one says the failed
+    cursor came from the previous page."""
+    case = boundary_history
+    del case.items[48:]
+    listed = _checked_with_follow_draining(case)
+    page = FoundryStateStore.list_keys
+
+    async def later_pages_fail(store, *, limit=None, after=None, **kwargs):
+        case.fail_cursor = store._name == TURNS_STORE and after is not None
+        return await page(store, limit=limit, after=after, **kwargs)
+
+    monkeypatch.setattr(FoundryStateStore, "list_keys", later_pages_fail)
+    confirmed = omit(case.fixture)
+    assert case.calls[listed:] == [None, case.items[15].id], confirmed.text
+    assert confirmed.status_code == 503, confirmed.text
+    check = confirmed.json()["error"]["files_check"]
+    assert (check["category"], check["stage"], check["cursor_source"]) == ("storage_read_failed", "list", "page_last_id")
+    assert not case.fixture.runtime.executor.calls
+
+
+def test_a_page_of_settled_receipts_still_ends_the_check_at_its_deadline(boundary_history, monkeypatch):
+    """Unfinished receipts of a SID the binding row lists as previous are not waited for (ADR-0009 §7a (i)), but each
+    one still counts toward the read deadline: a page made only of them ends the check where the deadline passes, and
+    the next check resumes on the same page right after the last receipt read."""
+    from shared_context import native_environment
+    from shared_context.behavior_native_sessions import NativeSessions
+
+    case = boundary_history
+    retired = "offline-retired-session"
+    monkeypatch.setattr(NativeSessions, "_settled", staticmethod(lambda *_args: (retired,)))
+    for settled in case.items[:native_environment._CHECK_PAGE_KEYS]:
+        settled.value = {**settled.value, "receipt": {
+            **settled.value["receipt"], "status": "started", "hosted_session_id": retired}}
+    case.tick = native_environment._SCAN_SECONDS / 8
+    first = omit(case.fixture, preview=True)
+    assert first.status_code == 200 and first.json()["reason"] == "scan_pending", first.text
+    assert case.reads == [item.key for item in case.items[:8]]
+    second = omit(case.fixture, preview=True)
+    assert second.status_code == 200 and second.json()["reason"] == "scan_pending", second.text
+    assert case.calls == [None, None]
+    assert case.reads == [item.key for item in case.items[:16]]
+    assert not case.fixture.runtime.executor.calls

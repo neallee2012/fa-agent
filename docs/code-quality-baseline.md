@@ -877,6 +877,72 @@ crapper 加 `--no-coverage`，只有 CC（含 `deploy`、`scripts`，去掉 novn
 - 剩下最高的 CC：`native_environment_cut._cut` 49、`freeform.InstructionControl.view` 45、`ToolBrokerCore._record_verified_outcome` 44、`read_saved_turn_context` 43、`native_environment._scan_page` 41、`NativeEnvironmentView.original_transition` 40（CRAP 121.3，覆蓋 63%）、`NativeSkillDraftGateway._resources` 40。CRAP 最高的幾個是沒有測試的 CLI `main`（`behavior_agent_retire`、`behavior_agent_registry_operator`、`behavior_team_authority_operator`）與 `run_checksum_child`。
 - 下一輪要有「前」的全 repo 覆蓋率對照，就在起點同樣跑一次；`tests/infra` 要先在本機 venv 裝 `yaml`（不進相依清單）才收集得起來。
 
+## 第十六輪結果（2026-11-08 至 12）
+
+這輪不改行為，專拆第十五輪留下的最高 CC 函式，並補測試給覆蓋率近 0 的高 CRAP 函式。起點是 `ba392020`，結束是 `23b348d0`（#1241 合併）。做法同前幾輪：先補測試釘住現況、再拆、最後手寫 mutant 補洞；每個 PR 合併前都經 poteto 與 ponytail 兩軸審查到沒有 P1／P2（#1240 有一個 P2 修正後才合併）；審查紀錄在總協調的工作階段，PR 本文沒有全記。下面數字取自各 PR 本文，覆蓋率只跑相關測試檔，量法不一，前後不能嚴格比較。
+
+| PR | 函式 | 前 → 後（CC／覆蓋／CRAP） | mutant |
+|---|---|---|---|
+| #1235 | `ToolBrokerCore._record_verified_outcome` | 44／94.1%／44.4 → 4／100%／4（拆出的最高 CC 7） | 51 個殺 50，1 個等價 |
+| #1236 | `NativeEnvironmentView.original_transition` | 40／63.0%／121.3 → 拆成六個 validator，最高 9／100%／9 | 57 個殺 55，2 個等價 |
+| #1237 | `read_saved_turn_context`、`ArchiveMetrics.measurement_basis` | 43／93.8%／43.45 → 9／100%／9；16／90.0%／16.26 → 7／100%／7 | 54 個殺 54；10 個殺 10 |
+| #1238 | 5 個低覆蓋高 CRAP 函式：`behavior_agent_retire.main` 19、`AssistantAuthority.model_session` 18、`_cleanup_instruction_session` 14、`run_checksum_child` 13、`Console.reset_conversation` 10 | 覆蓋 0%～36.0%、CRAP 102.9～380.0（第十五輪全套實測，見上方「重新量」）→ 全部 CC ≤ 8、100%、CRAP 等於 CC | 78 個殺 73，4 個等價，1 個（M14）原判等價、審查後撤回，見 P3 |
+| #1239 | `native_environment_cut._cut`、`withdraw_session` | 49／94.4%／49.4 → 9／100%／9.0；29／87.8%／30.5 → 9／100%／9.0 | `_cut` 62 個殺 60，`withdraw_session` 27 個殺 23，各剩等價（數字是工作者自報） |
+| #1240 | `native_environment._scan_page`、`retarget_session` | 41／95.9%／41.12 → 9／100%／9.00；38／98.1%／38.01 → 9／100%／9.00 | 76 個殺 64，9 個等價或近乎等價，3 個存活 |
+
+另列 #1241：重構 `_scan_page` 時發現既有行為問題，settled 收據會跳過 omission 檢查的讀取期限，一整頁 settled 收據要讀完 100 筆才停，store 很慢時請求會先逾時。這**不是**重構，是行為改變，所以另開 PR：總協調先在 repo 外用 TLA+ 狀態模型檢查（模型檔不在 repo，之後沒有重跑），模型顯示問題路徑（讀一筆 settled 收據時期限到、接著又讀下一筆），且修正後規則成立；再寫失敗測試重現（改前讀了整頁 100 筆），修正後 omission 檢查在期限到時回 `scan_pending`、下次接著掃，不漏不重複。15 個相關測試檔 373 passed。
+
+### 重新量
+
+crapper 加 `--no-coverage`，只有 CC；dryer 同上。「前」是第十五輪結束時的 `c10b01e5`，「後」是 `23b348d0`。兩者之間還有第十六輪以外的 PR，沒有逐一歸因。
+
+| 項目 | 第十五輪後 `c10b01e5` | 第十六輪後 `23b348d0` |
+|---|---|---|
+| 函式（不含 novnc） | 6,483 | 6,533 |
+| CC ≥ 10 | 947 | 934 |
+| CC ≥ 20 | 177 | 170 |
+| CC ≥ 30 | 50 | 44 |
+| 最高 CC | 49（`native_environment_cut._cut`） | 45（`freeform.InstructionControl.view`） |
+| dryer 重複（≥ 0.8，至少 4 行） | 165 對，124 對完全相同 | 165 對，124 對完全相同 |
+
+**全 repo 覆蓋率與 CRAP（第二次）**：做法同第十五輪（`tests/shared_context` 全套、`COVERAGE_CORE=sysmon`、只量行、短 `--basetemp`、真 runtime 1.0.103）。差別是這次直接用 repo venv 的 python（coverage 7.16.2，github-copilot-sdk 已升到 1.0.26），沒有在 PYTHONPATH 前面放 `C:/t/sxv`。17,590 passed、58 failed、25 skipped、2 xfailed，3 小時 18 分。
+
+| 項目 | 第十五輪 | 第十六輪 |
+|---|---|---|
+| 行覆蓋：`shared_context` 加 `web_test_console` | 70,723／75,910 = 93.2% | 71,058／76,043 = 93.4% |
+| 行覆蓋：再加 `deploy`、`scripts`（被匯入的部分） | 80,081 行、92.4% | 80,214 行、92.6% |
+| CRAP ≥ 10 | 948 | 932 |
+| CRAP ≥ 30 | 92 | 79 |
+| CRAP ≥ 100 | 6 | 0 |
+| 最高 CRAP | 380.0（`behavior_agent_retire.main`） | 72.0（三個沒有測試的 operator CLI `main`，CC 8、覆蓋 0%） |
+
+CRAP 範圍與算法同第十五輪（6,126 個函式，6,120 個對得上覆蓋率，對不上的 6 個同樣是巢狀類別的 `__aiter__`／`aclose`）。接下來幾個：`behavior_sdk_files.SdkSessionFiles.rm` 65.9（CC 9、覆蓋 11.1%）、`AssistantRuntime.__init__` 60.1（CC 29）、`NativeFilesProgress.ordered` 57.0（CC 28）、`NativeRoutineControl.refresh` 56.3（CC 31）。`tests/infra` 仍因本機缺 `yaml` 沒跑，`deploy`、`scripts` 的覆蓋偏低，不要拿來比。
+
+**58 個失敗**：`test_user_uploads.py` 32、`test_native_auto_compaction.py` 8、`test_native_response_sdk.py` 7、`test_native_sdk_runtime.py` 7，其餘 `test_behavior_assistant_entry.py`、`test_native_reasoning_facts.py`、`test_native_resident_ask_user_runtime.py`、`test_native_responses_cross_version_native.py` 各 1 個。在第十五輪的 `c10b01e5`（同一個 repo venv、同樣參數、只跑這 8 個測試檔）重跑，失敗清單逐行相同，所以不是第十六輪造成的。看到的錯誤包括缺 `pypdfium2` 套件 metadata、`N1_NATIVE_WORKSPACE` 沒設，各自的根因沒有再查。比第十五輪的 44 個多 14 個，全在 `test_user_uploads.py`（18 → 32）；推測是這次沒有用 `C:/t/sxv` 的環境，沒有驗證。
+
+沒有部署，沒在 Linux 上跑，沒有雲端驗證，第十六輪的程式沒有上 stage。
+
+### 做法與教訓
+
+- 重構時讀到的「看起來是順帶造成」的行為（#1240 的 settled 收據跳過期限）要原樣保留、另開 PR 改，不在重構裡順手修；#1240 照做，#1241 才改。
+- 同一個 409 碼有好幾層檢查時，前面一層漏掉，後面一層照樣擋下，只核狀態碼的測試抓不到；#1240 改成核對訊息。
+- 覆蓋率近 0 的函式先確認還有沒有人用再決定刪不刪；#1238 的 5 個都還有呼叫者，所以補測試保留。
+- 兩個 mutant runner 不能同時就地改同一個檔（#1239）。
+
+### 未處理／後續
+
+不擋合併的 P3，下一輪可以挑：
+
+- #1235：`record_outcome`（沒有 dispatcher 的 `ToolBrokerCore.record_outcome`）只有測試會呼叫到，正式程式沒有呼叫者，可考慮刪。
+- #1236：本文沒有列 P3；`r9-off` 第一次 ERROR 的原因未查。
+- #1237：`measurement_basis` 用 `.get(codec, _STORED_BASIS)`，日後 codec 加新值時拒絕訊息不會明說「不在表上」。
+- #1238：M14 對應的測試缺口（`ticket_digest=None` 的 session 走到 `_listed_session` 時，拿掉 `is None` 會變成 500；等價理由不成立，這條路徑走不走得到未驗證）；部分 mutant 數無法重現核對；`run_checksum_child` 沒有部署中的 image 在用，要不要刪等決定。
+- #1239：`_busy` 命名誤導（它經 `_scan` 寫 progress）；`_CutAttempt` 隱含的呼叫順序只靠 `_attempt` 保證；`_committed` 判為等價的理由只靠讀程式；mutant 數字只能當自報。
+- 下面 #1240、#1241 兩項取自總協調的審查紀錄，PR 本文沒有。
+- #1240：`_resumed_page_digest` 名字看不出會丟 409；`progress` 分散在五個函式修改，多數 helper 只有一個呼叫者；`_selected_retarget` 一個函式做兩件事；等滿 10 秒的測試（可改注入時鐘；審查時看到兩個，本文只提一個）；本文「94／101 passed」兩個數字並列易混淆；R11、R23、R32 三個可觀察的存活 mutant 未補測試。
+- #1241：測試沒驗證 settled RID 有寫進 open-RID 集合、收據仍是 `started`；沒涵蓋 settled 與一般收據混合的頁。
+- 剩下最高的 CC：`InstructionControl.view` 45、`NativeSkillDraftGateway._resources` 40、`discover.main` 39、`approved_skills_provider` 38、`Console.task_view` 37、`NativeBindingStore.record_switch` 37。CRAP 最高的是三個沒有測試的 operator CLI `main`（72.0）。
+
 ## 重新量
 
 ```powershell

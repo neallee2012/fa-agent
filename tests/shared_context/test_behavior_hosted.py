@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from shared_context.behavior_hosted import (
-    BehaviorExecutorClient, ChecksumCheckpoint, ChecksumSupervisor, HostedInvocationBody, HostedRuntime, LocalAssignment, LocalJournal,
+    BehaviorExecutorClient, ChecksumCheckpoint, ChecksumResult, ChecksumSupervisor, HostedInvocationBody, HostedRuntime, LocalAssignment, LocalJournal,
 )
 from shared_context.errors import Problem
 from shared_context.behavior_wire import HostedIdentity
@@ -226,3 +226,94 @@ def test_native_hosted_entry_is_disabled_without_explicit_configuration(monkeypa
     with pytest.raises(Problem) as disabled:
         HostedRuntime.from_environment()
     assert code(disabled) == "HOSTED_RUNTIME_DISABLED"
+
+
+# The real child runs in another process, where coverage.py cannot see it. These call the same child entry in-process:
+# enter_child stamps this process's PID, so the journal fences behave exactly as for the spawned child.
+def _child(tmp_path, task, *controls):
+    from shared_context.behavior_hosted import run_checksum_child
+    root = tmp_path / "child"
+    journal = LocalJournal(root)
+    assert journal.reserve(task, "in-process-supervisor")
+    for action in controls:
+        journal.control(task.launch_id, action, "control-" + action)
+    run_checksum_child(root, task.launch_id, journal.execution(task.launch_id).child_nonce)
+    with sqlite3.connect(journal.path) as db:
+        chunks = db.execute("SELECT start_offset,end_offset FROM chunks WHERE launch_id=? ORDER BY start_offset",
+                            (task.launch_id,)).fetchall()
+    return journal.execution(task.launch_id), chunks
+
+
+def _envelope(content, prefix, **checkpoint):
+    from shared_context.behavior_hosted import NativeCheckpoint
+    body = {"input_digest": hashlib.sha256(content).hexdigest(), "processed_bytes": len(prefix),
+            "prefix_digest": hashlib.sha256(prefix).hexdigest(), "newline_count": prefix.count(b"\n"), **checkpoint}
+    envelope = NativeCheckpoint(
+        predecessor_launch_id="predecessor", predecessor_evidence_id="evidence", predecessor_binding_digest="b" * 64,
+        predecessor_identity=assignment().identity, predecessor_process_generation=1,
+        predecessor_process_id="old-process", child_pid=1, checkpoint=ChecksumCheckpoint(**body))
+    raw = envelope.model_dump_json().encode()
+    return {"checkpoint": raw, "checkpoint_digest": hashlib.sha256(raw).hexdigest(),
+            "previous_launch_id": "predecessor"}
+
+
+def test_in_process_child_counts_the_original_bytes_chunk_by_chunk(tmp_path):
+    task = assignment(content=b"ab\ncd\n\nefg", chunk_bytes=4)
+    state, chunks = _child(tmp_path, task)
+    assert (state.phase, state.outcome, state.checkpoint) == ("result_saved", "succeeded", None)
+    assert state.result == ChecksumResult(input_digest=hashlib.sha256(task.input).hexdigest(), byte_count=10,
+                                          newline_count=3)
+    assert chunks == [(0, 4), (4, 8), (8, 10)]
+
+
+def test_in_process_child_stops_on_cancel_before_counting_even_when_park_was_asked_first(tmp_path):
+    state, chunks = _child(tmp_path, assignment(), "park", "cancel")
+    assert (state.outcome, state.result, state.checkpoint, chunks) == ("stopped", None, None, [])
+
+
+def test_in_process_child_parks_on_request_with_a_checkpoint_of_nothing_processed(tmp_path):
+    task = assignment()
+    state, chunks = _child(tmp_path, task, "park")
+    assert state.outcome == "parked" and state.result is None and chunks == []
+    assert ChecksumCheckpoint.model_validate_json(state.checkpoint) == ChecksumCheckpoint(
+        input_digest=task.input_digest, processed_bytes=0, prefix_digest=hashlib.sha256(b"").hexdigest(),
+        newline_count=0)
+
+
+def test_in_process_child_parks_exactly_at_the_assigned_boundary(tmp_path):
+    content = b"a\nb\nc\nd\ne\n"
+    state, chunks = _child(tmp_path, assignment(content=content, chunk_bytes=4, checkpoint_after_bytes=6))
+    assert state.outcome == "parked" and chunks == [(0, 4), (4, 6)]
+    checkpoint = ChecksumCheckpoint.model_validate_json(state.checkpoint)
+    assert (checkpoint.processed_bytes, checkpoint.newline_count) == (6, 3)
+    assert checkpoint.prefix_digest == hashlib.sha256(content[:6]).hexdigest()
+
+
+def test_in_process_child_resumes_after_the_checkpoint_without_recounting_its_prefix(tmp_path):
+    content = b"a\nb\nc\nd\ne\n"
+    task = assignment(content=content, chunk_bytes=3, **_envelope(content, content[:4]))
+    state, chunks = _child(tmp_path, task)
+    assert state.outcome == "succeeded" and chunks == [(4, 7), (7, 10)]
+    assert state.result == ChecksumResult(input_digest=hashlib.sha256(content).hexdigest(), byte_count=10,
+                                          newline_count=5)
+
+
+def test_in_process_child_finishes_at_once_from_a_checkpoint_of_every_byte(tmp_path):
+    content = b"a\nb\nc\nd\ne\n"
+    state, chunks = _child(tmp_path, assignment(content=content, **_envelope(content, content)))
+    assert state.outcome == "succeeded" and chunks == []
+    assert (state.result.byte_count, state.result.newline_count) == (10, 5)
+
+
+@pytest.mark.parametrize("prefix, change", [
+    (4, {"prefix_digest": "0" * 64}), (4, {"newline_count": 1}),
+    (10, {"processed_bytes": 11}),  # digest and newlines of all 10 bytes match; only the length is past the end
+], ids=["prefix", "newlines", "past-end"])
+def test_in_process_child_refuses_a_checkpoint_that_does_not_bind_the_assigned_bytes(tmp_path, prefix, change):
+    content = b"a\nb\nc\nd\ne\n"
+    task = assignment(content=content, **_envelope(content, content[:prefix], **change))
+    with pytest.raises(Problem) as error:
+        _child(tmp_path, task)
+    assert code(error) == "HOSTED_CHECKPOINT_INVALID"
+    state = LocalJournal(tmp_path / "child").execution(task.launch_id)
+    assert state.phase == "running" and state.outcome is None

@@ -453,6 +453,61 @@ def _updated(value: M, **updates: object) -> M:
     return type(value).model_validate({**value.model_dump(), **updates})
 
 
+_OBSERVED_EFFECT: dict[str, Effect] = {"applied": "applied", "partial": "partial"}
+# The effects that may follow an attempt's recorded effect; known effects never move back.
+_LATER_EFFECTS: dict[str, frozenset[str]] = {
+    "unknown": frozenset({"unknown", "not_applied", "applied", "partial"}),
+    "not_applied": frozenset({"not_applied"}), "applied": frozenset({"applied"}),
+    "partial": frozenset({"partial", "applied"}),
+}
+
+
+def _verified_effect(contract: AdapterContract, command: OutcomeRequest, evidence: VerifiedOutcome) -> Effect:
+    if (
+        evidence.evidence_id != command.evidence_id or evidence.source != contract.evidence_source
+        or evidence.contract_version != contract.outcome_contract_version
+    ):
+        raise Problem(403, "OPERATION_EVIDENCE_DENIED", "outcome source or contract differs")
+    if evidence.observation not in TERMINAL:
+        return _OBSERVED_EFFECT.get(evidence.observation, "unknown")
+    if (
+        contract.terminality_contract_version is None
+        or evidence.terminality_contract_version != contract.terminality_contract_version
+    ):
+        raise Problem(403, "OPERATION_EVIDENCE_DENIED", "destination terminality has not been established")
+    return "not_applied"
+
+
+def _settled(operation: _Operation, attempt_id: str, effect: Effect, evidence: VerifiedOutcome) -> _Operation:
+    unsettled = operation.unsettled_attempt_ids
+    if effect in {"applied", "not_applied"}:
+        unsettled = tuple(item for item in unsettled if item != attempt_id)
+    aggregate = operation.effect_state
+    if effect in {"applied", "partial"}:
+        aggregate = effect
+    elif aggregate not in {"applied", "partial"}:
+        aggregate = "unknown" if unsettled else "not_applied"
+    successful_result = evidence.result if evidence.business_result == "succeeded" else operation.successful_result
+    return _updated(
+        operation, effect_state=aggregate,
+        business_state=_business_state(operation, evidence, aggregate, unsettled, successful_result),
+        unsettled_attempt_ids=unsettled, successful_result=successful_result,
+    )
+
+
+def _business_state(
+    operation: _Operation, evidence: VerifiedOutcome, aggregate: Effect,
+    unsettled: tuple[str, ...], successful_result: ReceiptResult | None,
+) -> str:
+    if unsettled or aggregate in {"unknown", "partial"}:
+        return "pending"
+    if aggregate == "applied" and successful_result is not None:
+        return "succeeded"
+    if evidence.business_result == "failed" or operation.business_state == "failed":
+        return "failed"
+    return "pending"
+
+
 class ToolBrokerCore:
     def __init__(
         self, store: BehaviorStore, *, clock: Callable[[], datetime],
@@ -689,11 +744,7 @@ class ToolBrokerCore:
             if basis == "whole_unit_idempotency":
                 assert evidence is not None
                 not_after = min(not_after, evidence.expires_at)
-            binding = AttemptBinding(
-                operation_id=command.operation_id, attempt_id=command.attempt_id,
-                description_digest=material.sha256, adapter_contract_digest=self._contract_digest(),
-                target=description.target, idempotency_key=control_key("idempotency", command.operation_id, material.sha256),
-            )
+            binding = self._binding(command.operation_id, command.attempt_id, material, description)
             if previous is not None and binding.idempotency_key != previous.binding.idempotency_key:
                 raise Problem(409, "OPERATION_ATTEMPT_CONFLICT", "retry key differs")
             attempt = _Attempt(
@@ -730,6 +781,30 @@ class ToolBrokerCore:
                 )
         return receipt
 
+    def _binding(
+        self, operation_id: str, attempt_id: str, material: InlineMaterial, description: OperationDescription,
+    ) -> AttemptBinding:
+        return AttemptBinding(
+            operation_id=operation_id, attempt_id=attempt_id,
+            description_digest=material.sha256, adapter_contract_digest=self._contract_digest(),
+            target=description.target, idempotency_key=control_key("idempotency", operation_id, material.sha256),
+        )
+
+    def _bound_attempt(
+        self, snapshot: Snapshot, command: OutcomeRequest, evidence: VerifiedOutcome,
+        material: InlineMaterial, description: OperationDescription,
+    ) -> _Attempt:
+        attempt = _row(snapshot, control_key("attempt", command.operation_id, command.attempt_id), _Attempt)
+        expected = self._binding(command.operation_id, command.attempt_id, material, description)
+        if (
+            evidence.binding != attempt.binding or attempt.binding != expected
+            # The clock is read only after the binding and sequence checks pass.
+            or evidence.sequence <= attempt.observation_sequence or evidence.observed_at > self._now()
+            or evidence.result is not None and evidence.result.resource not in description.resources
+        ):
+            raise Problem(409, "OPERATION_EVIDENCE_DENIED", "outcome is stale or bound to a different attempt")
+        return attempt
+
     def record_outcome(self, command: OutcomeRequest, context: ExecutionContext) -> Record:
         if self.dispatcher is not None:
             return self.dispatcher.record_outcome(command, context)
@@ -743,30 +818,12 @@ class ToolBrokerCore:
 
     def _record_verified_outcome(
         self, command: OutcomeRequest, context: ExecutionContext, evidence: VerifiedOutcome,
-        *, extra_reads: tuple[str, ...] = (),
-        extend: Callable[[Snapshot, ControlChanges], ControlChanges] | None = None,
     ) -> Record:
         """Internal credential-boundary handoff; callers cannot submit raw evidence."""
         request = self.reconciliation_request(command, context)
         command, context = _checked(command, OutcomeRequest), _checked(context, ExecutionContext)
         evidence = _checked(evidence, VerifiedOutcome)
-        contract = self._enabled()[1]
-        if extra_reads:
-            request = _updated(request, read_set=tuple(sorted(set((*request.read_set, *extra_reads)))))
-        if (
-            evidence.evidence_id != command.evidence_id or evidence.source != contract.evidence_source
-            or evidence.contract_version != contract.outcome_contract_version
-        ):
-            raise Problem(403, "OPERATION_EVIDENCE_DENIED", "outcome source or contract differs")
-        terminal = evidence.observation in TERMINAL
-        if terminal and (
-            contract.terminality_contract_version is None
-            or evidence.terminality_contract_version != contract.terminality_contract_version
-        ):
-            raise Problem(403, "OPERATION_EVIDENCE_DENIED", "destination terminality has not been established")
-        effect: Effect = "not_applied" if terminal else (
-            "applied" if evidence.observation == "applied" else "partial" if evidence.observation == "partial" else "unknown"
-        )
+        effect = _verified_effect(self._enabled()[1], command, evidence)
         data = _json(evidence.model_dump(mode="json"))
         proof_material = InlineMaterial(data=data, sha256=hashlib.sha256(data).hexdigest())
 
@@ -774,63 +831,28 @@ class ToolBrokerCore:
             self._owner(snapshot, context, command.operation_id)
             operation, material, description = self._operation(snapshot, command.operation_id, context)
             attempt_key = control_key("attempt", command.operation_id, command.attempt_id)
-            attempt = _row(snapshot, attempt_key, _Attempt)
-            if (
-                evidence.binding != attempt.binding
-                or attempt.binding.operation_id != command.operation_id
-                or attempt.binding.attempt_id != command.attempt_id
-                or attempt.binding.description_digest != material.sha256
-                or attempt.binding.adapter_contract_digest != self._contract_digest()
-                or attempt.binding.target != description.target
-                or attempt.binding.idempotency_key != control_key("idempotency", command.operation_id, material.sha256)
-                or evidence.sequence <= attempt.observation_sequence or evidence.observed_at > self._now()
-                or evidence.result is not None and evidence.result.resource not in description.resources
-            ):
-                raise Problem(409, "OPERATION_EVIDENCE_DENIED", "outcome is stale or bound to a different attempt")
-            if (
-                attempt.effect_state == "applied" and effect != "applied"
-                or attempt.effect_state == "not_applied" and effect != "not_applied"
-                or attempt.effect_state == "partial" and effect not in {"partial", "applied"}
-            ):
+            attempt = self._bound_attempt(snapshot, command, evidence, material, description)
+            if effect not in _LATER_EFFECTS[attempt.effect_state]:
                 raise Problem(409, "OPERATION_EVIDENCE_CONFLICT", "outcome contradicts already recorded effects")
             attempt_record = snapshot[attempt_key]
             assert attempt_record is not None
             old_material = attempt_record.payload["material"]
             retained = None if old_material is None else _parse(old_material, InlineMaterial)
-            unsettled = operation.unsettled_attempt_ids
-            if effect in {"applied", "not_applied"}:
-                unsettled = tuple(item for item in unsettled if item != command.attempt_id)
-            aggregate = operation.effect_state
-            if effect in {"applied", "partial"}:
-                aggregate = effect
-            elif aggregate not in {"applied", "partial"}:
-                aggregate = "unknown" if unsettled else "not_applied"
-            successful_result = operation.successful_result
-            if evidence.business_result == "succeeded":
-                successful_result = evidence.result
-            business = "pending"
-            if not unsettled and aggregate not in {"unknown", "partial"}:
-                if aggregate == "applied" and successful_result is not None:
-                    business = "succeeded"
-                elif evidence.business_result == "failed" or operation.business_state == "failed":
-                    business = "failed"
-            changes = ControlChanges(writes=(
-                _write(control_key("operation", command.operation_id), _updated(
-                    operation, effect_state=aggregate, business_state=business,
-                    unsettled_attempt_ids=unsettled, successful_result=successful_result,
-                ), "replace", material),
+            settled = _settled(operation, command.attempt_id, effect, evidence)
+            return ControlChanges(writes=(
+                _write(control_key("operation", command.operation_id), settled, "replace", material),
                 _write(attempt_key, _updated(
                     attempt, effect_state=effect, observation_sequence=evidence.sequence,
-                    terminality_contract_version=evidence.terminality_contract_version if terminal else None,
+                    # None unless terminal: VerifiedOutcome.result_contract refuses it on other observations.
+                    terminality_contract_version=evidence.terminality_contract_version,
                 ), "replace", retained),
                 _write(control_key("outcome", command.operation_id, command.attempt_id, command.evidence_id), evidence, "create", proof_material),
             ), result={
                 "operation_id": command.operation_id, "attempt_id": command.attempt_id,
                 "effect_state": effect, "business_result": evidence.business_result,
-                "operation_effect_state": aggregate, "operation_business_state": business,
+                "operation_effect_state": settled.effect_state, "operation_business_state": settled.business_state,
                 "evidence_digest": proof_material.sha256, "execution_enabled": False,
             })
-            return changes if extend is None else extend(snapshot, changes)
 
         receipt = self.store.transact(request, decide)
         if receipt.payload["result"]["evidence_digest"] != proof_material.sha256:

@@ -324,6 +324,17 @@ def _carried(previous, prior_turn, name, default):
     return default if prior_turn is None else getattr(prior_turn, name)
 
 
+def _require_assigned(binding, principal):
+    """A legacy instruction's principal: a verified identity that may execute and is this binding's own human or agent."""
+    from .behavior_auth import BehaviorPrincipal
+    if not isinstance(principal, BehaviorPrincipal):
+        raise Problem(403, "BEHAVIOR_BINDING_DENIED", "unknown authorized binding")
+    principal.require(binding.team_id, "execute")
+    if (principal.tenant_id != binding.tenant_id
+            or principal.oid != (binding.human_oid if principal.kind == "human" else binding.agent_oid)):
+        raise Problem(403, "BEHAVIOR_BINDING_DENIED", "principal is not assigned to this binding")
+
+
 class AssistantAuthority:
     def __init__(self, runtime: AssistantRuntime, artifacts: ArtifactService, actors: tuple[Actor, ...], *,
                  require_legacy_sources=True):
@@ -620,20 +631,18 @@ class AssistantAuthority:
         """
         if self._has_turn_ticket(binding_id, sid):
             return self.turn_session(binding_id, sid, ticket, principal)
-        from .behavior_auth import BehaviorPrincipal
-        from .behavior_work_registry import head_key
         control = self.runtime.work_policy
         record = None if control is None else control.records.get(binding_id)
         binding = self.runtime.bindings.get(binding_id)
         if (record is None or record.profile.instruction is None or binding is None or binding != record.binding
                 or binding_id in self.runtime.historical_binding_ids):
             return self.current_session(binding_id, sid, ticket, principal)
-        if not isinstance(principal, BehaviorPrincipal):
-            raise Problem(403, "BEHAVIOR_BINDING_DENIED", "unknown authorized binding")
-        principal.require(binding.team_id, "execute")
-        if (principal.tenant_id != binding.tenant_id
-                or principal.oid != (binding.human_oid if principal.kind == "human" else binding.agent_oid)):
-            raise Problem(403, "BEHAVIOR_BINDING_DENIED", "principal is not assigned to this binding")
+        _require_assigned(binding, principal)
+        return self._listed_session(control, binding_id, sid, ticket, principal)
+
+    def _listed_session(self, control, binding_id, sid, ticket, principal):
+        """Legacy instruction: the registry still lists the work and the server-issued ticket matches its session."""
+        from .behavior_work_registry import head_key
         registry, session_key = control.registry_key, key("session", sid)
 
         def read():

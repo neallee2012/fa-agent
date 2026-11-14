@@ -796,12 +796,7 @@ class Console:
             else:self.journal.finish(thread_id,"reset",{"state":"UNKNOWN","previous_refusal":prior["code"]})
             try:
                 raw,_=self.instructions.adapter.send("POST","/work-policy/v1/conversations/"+cid+"/reset",body,token)
-                reply=ResetReply.model_validate_json(raw)
-                require(reply.conversation_id==cid and reply.reset_request_id==request_id
-                        and reply.hosted_session_id==projection.hosted_session_id,"RESET_UNKNOWN")
-                draft=self.instructions.store.complete_reset(thread_id,reply.model_dump(mode="json"))
-                self.instructions.projections[cid]=projection.model_copy(update={
-                    "archived":True,"can_reset":False,"can_follow_up":False,"follow_up_blocker":"CONVERSATION_ARCHIVED"})
+                reply,draft=self._complete_reset(thread_id,cid,projection,request_id,ResetReply.model_validate_json(raw))
             except ConsoleError as error:
                 if error.code in {"CONVERSATION_TURN_UNRESOLVED","CONVERSATION_ARCHIVED"}:
                     self.journal.finish(thread_id,"reset",{"state":"REFUSED","code":error.code})
@@ -809,6 +804,15 @@ class Console:
             except ValueError:
                 raise ConsoleError("RESET_UNKNOWN",502) from None
             return {**self.state(draft["thread_id"]),"reset":reply.model_dump(mode="json")}
+
+    def _complete_reset(self,thread_id,cid,projection,request_id,reply):
+        """Only this reset's own receipt archives the conversation and opens the one new thread."""
+        require(reply.conversation_id==cid and reply.reset_request_id==request_id
+                and reply.hosted_session_id==projection.hosted_session_id,"RESET_UNKNOWN")
+        draft=self.instructions.store.complete_reset(thread_id,reply.model_dump(mode="json"))
+        self.instructions.projections[cid]=projection.model_copy(update={
+            "archived":True,"can_reset":False,"can_follow_up":False,"follow_up_blocker":"CONVERSATION_ARCHIVED"})
+        return reply,draft
 
     def instruction_models(self, thread_id=None):
         with self.lock:

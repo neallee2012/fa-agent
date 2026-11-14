@@ -566,3 +566,111 @@ def test_retarget_reads_all_pages_before_switching_the_original_operation(pendin
     assert second.status_code == 200 and second.json() == first.json()
     assert case.client.portal.call(case.pending.session_state).following.model_dump(mode="json") == case.old_view
     assert not case.current.executor.calls
+
+
+@pytest.mark.parametrize("held", ["another_operation", "another_destination", "another_request"])
+def test_a_retarget_progress_record_naming_another_operation_is_refused(pending_retarget, held):
+    """Its progress key already holds another operation's following record: the retarget never adopts it."""
+    from shared_context.behavior_native_turn_wire import NativeEnvironmentView
+    from shared_context.native_environment import _Following, _retarget_keys
+    from shared_context.native_turns import TURNS_STORE, _json
+
+    case = pending_retarget
+    _, progress_key = _retarget_keys(case.command["request_id"])
+    view = {"another_operation": {}, "another_destination": {"request_id": case.command["request_id"]},
+            "another_request": {"hosted_session_id": case.identity.session_id}}[held]
+    other = _Following(view=NativeEnvironmentView.model_validate({**case.old_view, **view}), responses=False)
+
+    async def plant():
+        async with case.current._store(TURNS_STORE) as store:
+            await store.create_item(progress_key, _json(other))
+
+    case.client.portal.call(plant)
+    response = invoke(case.client, case.identity, case.command)
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "NATIVE_ENVIRONMENT_CONFLICT"
+    assert response.json()["error"]["message"] == "the new environment is reserved by another operation"
+    assert invoke(case.client, case.identity, NativeSessionRead()).json()["environment"] == case.before["environment"]
+    assert case.client.portal.call(case.pending.session_state).following.model_dump(mode="json") == case.old_view
+    assert not case.current.executor.calls
+
+
+@pytest.mark.parametrize("changes", [{"pending_request_id": "different-pending"},
+                                     {"pending_session_id": "different-pending-session"}])
+def test_a_first_retarget_naming_another_pending_operation_saves_no_intent(pending_retarget, changes):
+    """The first call checks the pending transition before it saves anything, so the same retarget ID still works
+    with the right pending operation afterwards."""
+    case = pending_retarget
+    refused = invoke(case.client, case.identity, {**case.command, **changes})
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["message"] == "the original pending transition or new version changed"
+    accepted = invoke(case.client, case.identity, case.command)
+    assert accepted.status_code == 200, accepted.text
+
+
+@pytest.mark.parametrize("session,version", [("offline-other-session", "2"), ("offline-pending-session", "3")])
+def test_a_retarget_from_a_session_that_cannot_be_the_new_destination_is_refused(pending_retarget, monkeypatch,
+                                                                                session, version):
+    """Only a newer version on a session that is neither the source nor the pending destination may retarget."""
+    case = pending_retarget
+    other_id = IDENTITY.model_copy(update={"session_id": session, "agent_version": version})
+    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", session)
+    other = NativeTurnRuntime(other_id, OfflineSdk(), bootstrap_source_inactive=inactive,
+                              task_observer=SimpleNamespace(quiet=inactive, suspended_input=no_suspended_input))
+    with TestClient(create_host(SimpleNamespace(identity=other_id), native_runtime=other)) as client:
+        response = invoke(client, other_id, {**case.command, "expected_agent_version": version})
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["message"] == "the original pending transition or new version changed"
+    assert invoke(case.client, case.identity, NativeSessionRead()).json() == case.before
+    assert not other.executor.calls
+
+
+def test_a_saved_retarget_cannot_be_reused_from_another_expected_source(pending_retarget):
+    case = pending_retarget
+    initial = invoke(case.client, case.identity, case.command)
+    assert initial.status_code == 200, initial.text
+    response = invoke(case.client, case.identity, {**case.command, "expected_session_id": "another-source"})
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["message"] == "this retarget ID already names another original operation"
+
+
+@pytest.mark.parametrize("marked", ["agent", "retarget_progress"])
+def test_a_refusal_seen_on_either_record_carries_into_the_selected_retarget(pending_retarget, monkeypatch, marked):
+    """A source refusal recorded after the retarget's first call on only the Agent's pending binding, or only on this
+    retarget's own progress record, still marks the selected destination."""
+    from shared_context import native_environment as environment
+    from shared_context.native_turns import TURNS_STORE, _changed, _json
+
+    case = pending_retarget
+    drain = environment._drain_pages
+    _, progress_key = environment._retarget_keys(case.command["request_id"])
+
+    async def scan_pending(*_args, **_kwargs):
+        return "scan_pending", None, False
+
+    monkeypatch.setattr(environment, "_drain_pages", scan_pending)
+    first = invoke(case.client, case.identity, case.command)
+    assert first.status_code == 200 and first.json()["reason"] == "scan_pending", first.text
+    assert not first.json().get("source_invocation_refused", False)
+
+    async def mark():
+        async with case.current._store(TURNS_STORE) as store:
+            if marked == "agent":
+                current, etag = await case.current._agent_record()
+                await store.set_item("agent", _json(_changed(
+                    current, environment=_changed(current.environment, source_invocation_refused=True))), if_match=etag)
+            else:
+                record, etag = await environment._read(case.current, key=progress_key)
+                await store.set_item(progress_key, _json(_changed(
+                    record, view=_changed(record.view, source_invocation_refused=True))), if_match=etag)
+
+    case.client.portal.call(mark)
+    monkeypatch.setattr(environment, "_drain_pages", drain)
+    selected = invoke(case.client, case.identity, case.command)
+    assert selected.status_code == 200 and selected.json()["reason"] == "source_stop_required", selected.text
+    assert selected.json()["source_invocation_refused"] is True
+    state = invoke(case.client, case.identity, NativeSessionRead()).json()
+    assert state["environment"]["request_id"] == case.command["request_id"]
+    assert state["environment"]["source_invocation_refused"] is True
+    assert case.client.portal.call(case.pending.session_state).following.model_dump(mode="json") == case.old_view
+    assert not case.current.executor.calls

@@ -1,6 +1,7 @@
 """The retire operator command: read-only preview, confirmed Foundry/ARM cleanup, convergent reruns. Local fakes."""
 
 from datetime import timedelta
+import json
 import logging
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import httpx
 import pytest
 
 import shared_context.behavior_agent_onboarding as onboarding
+import shared_context.behavior_agent_retire as retire_cli
 from shared_context.behavior_agent_message_api import public_agents
 from shared_context.behavior_agent_onboarding import FoundryCallError, derived_names, onboarding_status, pending_key
 from shared_context.behavior_agent_retire import (
@@ -474,3 +476,248 @@ def test_a_leftover_whose_versions_name_another_onboarding_is_refused(team):
     with pytest.raises(Problem) as mismatch:
         preview_failed(_operator(team), name, foundry=foundry)
     assert _code(mismatch) == (409, "FAILED_ONBOARDING_MISMATCH") and foundry.deleted == []
+
+
+# --- The command line itself: `python -m shared_context.behavior_agent_retire ...` with the server's own verifier.
+
+def _cli(monkeypatch, case, *, token=None, teams=True):
+    """main() on the case's real composition: the config path read once, the bearer token checked by its JWT verifier."""
+    from contextlib import nullcontext
+    import shared_context.behavior_server as server
+    import shared_context.behavior_server_config as server_config
+    loads = []
+    monkeypatch.setattr(server_config, "load_configuration", lambda path: loads.append(path) or case.config)
+    monkeypatch.setattr(server, "build_server", lambda config: nullcontext(case.a) if config is case.config
+                        else pytest.fail("main must build the server from the loaded configuration"))
+    monkeypatch.setattr(case.a.verifier, "teams", case.teams if teams else None, raising=False)
+    installs = []  # as _operator(): this harness is not a fresh installation, so its origin check is replaced
+    monkeypatch.setattr(case.a, "installation", lambda: installs.append(True))
+    if token is False:
+        monkeypatch.delenv("FA_TEAM_OPERATOR_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("FA_TEAM_OPERATOR_TOKEN", token or case.authorization.removeprefix("Bearer "))
+
+    def run(*argv):
+        return retire_cli.main([*argv, "--config", "current-config.json"])
+    run.loads, run.installs = loads, installs
+    return run
+
+
+def _printed(capsys):
+    out, err = capsys.readouterr()
+    return (json.loads(out) if out else None), (json.loads(err) if err else None)
+
+
+def _refused(capsys):
+    out, err = _printed(capsys)
+    assert out is None
+    return err["error"]["status"], err["error"]["code"]
+
+
+def test_cli_preview_writes_nothing_and_retire_prints_the_tombstone_once(team_agent, monkeypatch, capsys):
+    case = team_agent
+    run = _cli(monkeypatch, case)
+    store, agent_id = case.a.runtime.store, case.target.agent_id
+    guard = store._guard()
+    assert run("preview", "--agent-id", agent_id) == 0
+    out, err = _printed(capsys)
+    assert err is None and out["state"] == "preview" and out["tombstone"] is None and out["agent_oid"] == AGENT_OID
+    assert "foundry_agent" not in out and store._guard() == guard and run.loads == ["current-config.json"]
+    assert run.installs == []
+    argv = ("retire", "--agent-id", agent_id, "--request-id", "retire-cli-main", "--reason", "dev test",
+            "--confirm", agent_id)
+    assert run(*argv) == 0
+    first, _ = _printed(capsys)
+    assert first["state"] == "ok" and first["tombstone"]["outcome"] == "written"
+    assert first["tombstone"]["request_id"] == "retire-cli-main" and first["tombstone"]["reason"] == "dev test"
+    assert retired_agent_ids(store, case.config) == (agent_id,)
+    assert run.installs == [True]
+    assert run(*argv) == 0
+    again, _ = _printed(capsys)
+    assert again == {**first, "tombstone": {**first["tombstone"], "outcome": "already_retired"}}
+
+
+def test_cli_delete_foundry_cleans_up_through_the_agents_own_clients_and_exits_1_while_partial(
+        team_agent, monkeypatch, capsys):
+    case = team_agent
+    run = _cli(monkeypatch, case)
+    foundry = FakeFoundry()
+    arm = FakeArm(_arm_items(), fail={_assignment("fa-openai", AGENT_OID, OPENAI_USER)["id"]})
+    cleanups = []
+
+    def cleanup(composition, agent_id, role_scope, *, stuck=False):
+        cleanups.append((composition, agent_id, role_scope, stuck))
+        return foundry, _roles(arm)
+    monkeypatch.setattr(retire_cli, "_cleanup", cleanup)
+    agent_id = case.target.agent_id
+    assert run("preview", "--agent-id", agent_id, "--delete-foundry", "--role-scope", SCOPE) == 0
+    previewed, _ = _printed(capsys)
+    assert previewed["state"] == "preview" and previewed["foundry_agent"]["state"] == "present"
+    assert foundry.deleted == [] and arm.deletes == []
+    assert run("retire", "--agent-id", agent_id, "--request-id", "retire-cli-main", "--reason", "dev test",
+               "--confirm", agent_id, "--delete-foundry", "--stuck-onboarding") == 1
+    partial, err = _printed(capsys)
+    assert err is None and partial["state"] == "partial" and foundry.deleted == [case.target.agent_name]
+    assert [entry[1:] for entry in cleanups] == [(agent_id, SCOPE, False), (agent_id, None, True)]
+    assert all(entry[0] is case.a for entry in cleanups)
+
+
+def test_cli_without_delete_foundry_never_builds_cleanup_clients(team_agent, monkeypatch, capsys):
+    case = team_agent
+    run = _cli(monkeypatch, case)
+    monkeypatch.setattr(retire_cli, "_cleanup", lambda *args, **kwargs: pytest.fail("no Foundry/ARM client"))
+    assert run("preview", "--agent-id", case.target.agent_id, "--stuck-onboarding") == 0
+    assert _printed(capsys)[0]["state"] == "preview"
+
+
+def test_cli_failed_agent_name_uses_the_default_project_and_needs_no_request_id(team, monkeypatch, capsys):
+    foundry = LeftoverFoundry(team.config.targets[0])
+    team.foundry.versions = foundry.versions
+    team.foundry.final_status = "failed"
+    finished, failed = team.run()
+    assert finished and failed["state"] == "failed"
+    case = SimpleNamespace(**vars(team), authorization=team.c.h.headers(
+        team.signing_key, "Behavior.Read Behavior.Approve")["Authorization"])
+    run = _cli(monkeypatch, case)
+    opened = []
+    monkeypatch.setattr(retire_cli, "RetiringFoundry", lambda endpoint, credential: opened.append(
+        (endpoint, credential)) or foundry)
+    name = failed["agent_name"]
+    assert run("preview", "--failed-agent-name", name) == 0
+    previewed, _ = _printed(capsys)
+    assert previewed["state"] == "preview" and previewed["agent_name"] == name and foundry.deleted == []
+    assert run("retire", "--failed-agent-name", name, "--confirm", name) == 0
+    done, _ = _printed(capsys)
+    assert done["state"] == "ok" and done["foundry_agent"]["outcome"] == "deleted" and foundry.deleted == [name]
+    assert opened == [(team.config.targets[0].project_endpoint, team.a.clients[0].credential)] * 2
+
+
+@pytest.mark.parametrize("argv", [
+    ("retire", "--agent-id", "agent", "--request-id", "r", "--reason", "x"),
+    ("retire", "--agent-id", "agent", "--confirm", "agent", "--reason", "x"),
+    ("retire", "--agent-id", "agent", "--confirm", "agent", "--request-id", "r"),
+    ("retire", "--failed-agent-name", "fa-agent-x"),
+], ids=["no-confirm", "no-request-id", "no-reason", "failed-no-confirm"])
+def test_cli_retire_without_its_confirmation_material_stops_before_any_read(argv, monkeypatch, capsys):
+    import shared_context.behavior_server_config as server_config
+    monkeypatch.setattr(server_config, "load_configuration", lambda path: pytest.fail("nothing is read"))
+    monkeypatch.setenv("FA_TEAM_OPERATOR_TOKEN", "never-used")
+    with pytest.raises(SystemExit) as stopped:
+        retire_cli.main([*argv, "--config", "never-read.json"])
+    assert stopped.value.code == 2
+    assert "retire requires --confirm, and with --agent-id also --request-id and --reason" in capsys.readouterr().err
+
+
+def test_cli_without_a_token_and_no_terminal_is_refused_before_the_server_starts(team_agent, monkeypatch, capsys):
+    run = _cli(monkeypatch, team_agent, token=False)
+    monkeypatch.setattr(retire_cli.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(retire_cli.getpass, "getpass", lambda prompt: pytest.fail("no prompt without a terminal"))
+    assert run("preview", "--agent-id", team_agent.target.agent_id) == 1
+    assert _refused(capsys) == (401, "TEAM_OPERATOR_TOKEN_REQUIRED") and run.loads == []
+
+
+@pytest.mark.parametrize("typed, code", [
+    (None, None), ("", "TEAM_OPERATOR_TOKEN_INVALID"), ("two words", "TEAM_OPERATOR_TOKEN_INVALID"),
+    ("x" * 16385, "TEAM_OPERATOR_TOKEN_INVALID"),
+], ids=["typed-original", "empty", "whitespace", "too-long"])
+def test_cli_asks_for_the_token_on_a_terminal_and_checks_its_shape(team_agent, monkeypatch, capsys, typed, code):
+    case = team_agent
+    run = _cli(monkeypatch, case, token=False)
+    prompts = []
+    monkeypatch.setattr(retire_cli.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(retire_cli.getpass, "getpass", lambda prompt: prompts.append(prompt) or (
+        case.authorization.removeprefix("Bearer ") if typed is None else typed))
+    status = run("preview", "--agent-id", case.target.agent_id)
+    assert prompts == ["Original operator bearer token (hidden): "]
+    if code is None:
+        assert status == 0 and _printed(capsys)[0]["state"] == "preview"
+    else:
+        assert status == 1 and _refused(capsys) == (401, code) and run.loads == []
+
+
+def test_cli_refuses_a_token_from_the_environment_with_whitespace(team_agent, monkeypatch, capsys):
+    run = _cli(monkeypatch, team_agent, token="Bearer two")
+    assert run("preview", "--agent-id", team_agent.target.agent_id) == 1
+    assert _refused(capsys) == (401, "TEAM_OPERATOR_TOKEN_INVALID") and run.loads == []
+
+
+def test_cli_needs_the_servers_team_registry(team_agent, monkeypatch, capsys):
+    run = _cli(monkeypatch, team_agent, teams=False)
+    assert run("preview", "--agent-id", team_agent.target.agent_id) == 1
+    assert _refused(capsys) == (503, "TEAM_REGISTRY_UNAVAILABLE")
+
+
+def test_cli_read_scope_may_preview_but_not_retire(team_agent, signing_key, monkeypatch, capsys):
+    case = team_agent
+    read_only = case.c.h.headers(signing_key, "Behavior.Read")["Authorization"]
+    run = _cli(monkeypatch, case, token=read_only.removeprefix("Bearer "))
+    agent_id = case.target.agent_id
+    assert run("preview", "--agent-id", agent_id) == 0
+    assert _printed(capsys)[0]["state"] == "preview"
+    guard = case.a.runtime.store._guard()
+    assert run("retire", "--agent-id", agent_id, "--request-id", "r", "--reason", "x", "--confirm", agent_id) == 1
+    assert _refused(capsys)[0] == 403 and case.a.runtime.store._guard() == guard
+
+
+@pytest.mark.parametrize("error", [ValueError("bad config"), OSError("missing config")], ids=["value", "os"])
+def test_cli_reports_an_unreadable_configuration_without_its_detail(team_agent, monkeypatch, capsys, error):
+    import shared_context.behavior_server_config as server_config
+    _cli(monkeypatch, team_agent)
+
+    def unreadable(path):
+        raise error
+    monkeypatch.setattr(server_config, "load_configuration", unreadable)
+    assert retire_cli.main(["preview", "--agent-id", team_agent.target.agent_id, "--config", "x.json"]) == 1
+    out, err = capsys.readouterr()
+    assert out == "" and err == '{"error":{"code":"AGENT_RETIRE_CONFIGURATION_INVALID"}}\n'
+
+
+def _team_cli(team, monkeypatch):
+    case = SimpleNamespace(**vars(team), authorization=team.c.h.headers(
+        team.signing_key, "Behavior.Read Behavior.Approve")["Authorization"])
+    return _cli(monkeypatch, case)
+
+
+def test_cli_stuck_onboarding_flag_reaches_preview_and_retire(team, monkeypatch, capsys):
+    agent_id = _stuck(team, monkeypatch)
+
+    class TeamClock(retire_cli.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return team.clock.wall()  # the onboarding entered 'registered' moments ago on this clock
+    monkeypatch.setattr(retire_cli, "datetime", TeamClock)
+    run = _team_cli(team, monkeypatch)
+    retire_argv = ("retire", "--agent-id", agent_id, "--request-id", "retire-stuck-cli", "--reason", "stuck",
+                   "--confirm", agent_id)
+    for argv in (("preview", "--agent-id", agent_id), retire_argv):
+        assert run(*argv) == 1
+        assert _refused(capsys) == (409, "AGENT_ONBOARDING_IN_PROGRESS")
+    assert run("preview", "--agent-id", agent_id, "--stuck-onboarding") == 0
+    assert _printed(capsys)[0]["state"] == "preview"
+    assert run(*retire_argv, "--stuck-onboarding") == 0
+    done, _ = _printed(capsys)
+    assert done["state"] == "ok" and done["tombstone"]["onboarding_request_id"] == "onboard-one"
+    assert _pending(team) == []
+
+
+def test_cli_read_scope_retire_is_refused_before_any_foundry_client(team_agent, signing_key, monkeypatch, capsys):
+    case = team_agent
+    read_only = case.c.h.headers(signing_key, "Behavior.Read")["Authorization"]
+    run = _cli(monkeypatch, case, token=read_only.removeprefix("Bearer "))
+    monkeypatch.setattr(retire_cli, "_cleanup", lambda *args, **kwargs: pytest.fail("refused before Foundry/ARM"))
+    agent_id = case.target.agent_id
+    assert run("retire", "--agent-id", agent_id, "--request-id", "r", "--reason", "x", "--confirm", agent_id,
+               "--delete-foundry") == 1
+    assert _refused(capsys)[0] == 403
+
+
+def test_cli_failed_agent_name_retire_needs_the_same_name_confirmed(team, monkeypatch, capsys):
+    foundry = LeftoverFoundry(team.config.targets[0])
+    team.foundry.versions = foundry.versions
+    team.foundry.final_status = "failed"
+    finished, failed = team.run()
+    assert finished
+    run = _team_cli(team, monkeypatch)
+    monkeypatch.setattr(retire_cli, "RetiringFoundry", lambda endpoint, credential: foundry)
+    assert run("retire", "--failed-agent-name", failed["agent_name"], "--confirm", "fa-agent-another") == 1
+    assert _refused(capsys) == (409, "RETIRE_CONFIRMATION_REQUIRED") and foundry.deleted == []

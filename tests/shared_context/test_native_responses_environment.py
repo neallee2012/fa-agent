@@ -433,3 +433,56 @@ def test_retarget_keeps_old_pending_and_responses_checkpoint_until_source_tasks_
         accepted = invoke(client, identity, response_submit("after-retarget", source.receipt.conversation_id))
         assert accepted.status_code == 202 and accepted.json()["dispatch"]["state"] == "needs_response", accepted.text
         assert not runtime.executor.calls and not pending.executor.calls
+
+
+def test_paged_retarget_remembers_responses_after_their_receipt_page(original_response, monkeypatch):
+    """A retarget that stopped after the page holding a Responses receipt still waits for the source's Responses tasks
+    when it resumes on a later page."""
+    import asyncio
+
+    source = original_response
+    monkeypatch.setattr(native_responses_wire, "RESPONSES_ENVIRONMENT_MODE", "retain-cid")
+    pending_id = IDENTITY.model_copy(update={"session_id": "offline-pending-destination", "agent_version": "2"})
+    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", pending_id.session_id)
+    pending = NativeTurnRuntime(pending_id, OfflineSdk(), task_observer=OriginalTasks(pending_id).observer())
+    with TestClient(responses_host(pending_id, pending, source.root)) as client:
+        initial = invoke(client, pending_id, {
+            "operation": "session_follow", "request_id": "original-pending",
+            "expected_session_id": IDENTITY.session_id, "expected_etag": source.state["etag"], "stage": "prepare"})
+        assert initial.status_code == 200 and initial.json()["reason"] == "source_stop_required", initial.text
+    identity = IDENTITY.model_copy(update={"session_id": "offline-current-destination", "agent_version": "3"})
+    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", identity.session_id)
+    tasks = OriginalTasks(identity, blocked="responses_resilient_multi_turn")
+    runtime = NativeTurnRuntime(identity, OfflineSdk(), task_observer=tasks.observer())
+    with TestClient(responses_host(identity, runtime, source.root)) as client:
+        original = invoke(client, identity, NativeSessionRead()).json()
+        list_keys, receipt_page, paused = FoundryStateStore.list_keys, [], []
+
+        async def delayed_page(store, **kwargs):
+            # The listing right after the page holding the original receipt outlives the call's scan deadline.
+            if receipt_page and not paused:
+                paused.append(kwargs.get("after"))
+                await asyncio.sleep(30)
+            page = await list_keys(store, **kwargs)
+            keys = [key.key for key in page.keys]
+            if store._name == TURNS_STORE and "rid:original-response" in keys and not receipt_page:
+                # A page may hold fewer keys than its limit: this one ends at the receipt, with older keys after it.
+                page = await list_keys(store, **{**kwargs, "limit": keys.index("rid:original-response") + 1})
+                assert page.keys[-1].key == "rid:original-response" and page.has_more
+                receipt_page.append(page.last_id)
+            return page
+
+        monkeypatch.setattr(FoundryStateStore, "list_keys", delayed_page)
+        command = {
+            "operation": "session_retarget", "request_id": "retarget-responses",
+            "expected_session_id": IDENTITY.session_id, "expected_etag": original["etag"],
+            "expected_agent_version": identity.agent_version,
+            "pending_request_id": "original-pending", "pending_session_id": pending_id.session_id,
+        }
+        first = invoke(client, identity, command)
+        assert first.status_code == 200 and first.json()["reason"] == "scan_pending", first.text
+        assert paused == receipt_page and tasks.calls == []
+        second = invoke(client, identity, command)
+        assert second.status_code == 200 and second.json()["reason"] == "task_active", second.text
+        assert invoke(client, identity, NativeSessionRead()).json()["environment"] == original["environment"]
+        assert not runtime.executor.calls and not pending.executor.calls

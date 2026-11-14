@@ -7,7 +7,7 @@ from pydantic import AwareDatetime, Field, model_validator
 
 from .backup_models import MAX_BACKUP_BYTES
 from .behavior_agent_template import TemplateSkill
-from .behavior_assistant_wire import ArchiveUnavailable, ModelDeployment, SdkArchive, StoredSdkArchive
+from .behavior_assistant_wire import ArchiveUnavailable, ModelDeployment, StoredSdkArchive
 from .behavior_model_capacity import ModelCapacitySnapshot
 from .behavior_sdk_state import DIAG_ARCHIVE_CODECS
 from .behavior_attachments import TextAttachments, validate_attachments
@@ -22,6 +22,10 @@ from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 MAX_TURN_CONTEXT_BYTES = 16384
 PositiveBytes = Annotated[int, Field(ge=1, le=MAX_BACKUP_BYTES)]
+_ARCHIVE_MEASUREMENTS = ("unavailable", "sha256", "encoded_state_bytes", "inline_zlib_bytes", "part_count")
+# codec -> exactly the measurements its storage records; every artifact-session codec is stored in parts
+_ARCHIVE_BASIS = {None: {"unavailable"}, "zlib-v1": {"sha256", "inline_zlib_bytes"}}
+_STORED_BASIS = {"sha256", "encoded_state_bytes", "part_count"}
 
 
 class ArchiveMetrics(WireModel):
@@ -38,19 +42,12 @@ class ArchiveMetrics(WireModel):
 
     @model_validator(mode="after")
     def measurement_basis(self):
-        if self.codec is None:
-            valid = self.unavailable is not None and all(value is None for value in (
-                self.sdk_version, self.runtime_version, self.sha256,
-                self.encoded_state_bytes, self.inline_zlib_bytes, self.part_count))
-        elif self.codec == "zlib-v1":
-            valid = (self.unavailable is None and self.sha256 is not None and self.inline_zlib_bytes is not None
-                     and self.encoded_state_bytes is None and self.part_count is None)
-        else:
-            valid = (self.unavailable is None and self.sha256 is not None and self.encoded_state_bytes is not None
-                     and self.part_count is not None and self.inline_zlib_bytes is None)
-        if not valid:
+        recorded = {name for name in _ARCHIVE_MEASUREMENTS if getattr(self, name) is not None}
+        versions = (self.sdk_version, self.runtime_version)
+        if (recorded != _ARCHIVE_BASIS.get(self.codec, _STORED_BASIS)
+                or (self.codec is None and versions != (None, None))):
             raise ValueError("Archive byte measurements must retain their exact storage basis")
-        if self.codec is not None and (self.sdk_version is None or self.runtime_version is None):
+        if self.codec is not None and None in versions:
             raise ValueError("Available archive metadata must retain its recorded SDK/runtime versions")
         return self
 
@@ -172,10 +169,10 @@ class TurnContext(WireModel):
 def read_saved_turn_context(control, principal, identifier, turn_number):
     from .behavior_assistant import key
     from .behavior_delivery import _parse
-    from .behavior_instruction import SavedReply, TurnArchive, sdk_session_id, turn_material
+    from .behavior_instruction import TurnArchive, turn_material
 
     record = control._instruction_record(principal, identifier, turn_number)
-    binding = record.binding
+    binding, instruction = record.binding, record.profile.instruction
     akey, rkey = key("text-archive", binding.job_id), key("reply", binding.job_id)
     rows = control.store.read_snapshot((akey, rkey))
     if rows[akey] is None:
@@ -183,87 +180,23 @@ def read_saved_turn_context(control, principal, identifier, turn_number):
     raw = rows[akey].payload["data"]
     saved = _parse(raw, TurnArchive)
     retained = turn_material(saved)
-    if (saved.conversation_id != identifier or saved.job_id != binding.job_id or saved.turn_number != turn_number
-            or not same_but_release(saved.prompt_assembly, assemble_prompt(record.profile.instruction.prompt_profile).record)
-            or saved.capability_assembly != capability_record(record.profile.instruction.prompt_profile,
-                                                              record.profile.instruction.capabilities)
+    if ((saved.conversation_id, saved.job_id, saved.turn_number) != (identifier, binding.job_id, turn_number)
+            or not same_but_release(saved.prompt_assembly, assemble_prompt(instruction.prompt_profile).record)
+            or saved.capability_assembly != capability_record(instruction.prompt_profile, instruction.capabilities)
             or rows[akey].payload["material"] != retained.model_dump(mode="json")
             or any(source.conversation_id != identifier for source in saved.user_turn_sources)):
         raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "original saved turn metadata differs")
-    archive = saved.archive
-    if isinstance(archive, (SdkArchive, StoredSdkArchive)) and archive.sdk_session_id != sdk_session_id(identifier):
-        raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "original saved SDK identity differs")
-    if isinstance(archive, StoredSdkArchive) and (
-        archive.conversation_id, archive.job_id, archive.tenant_id, archive.team_id, archive.agent_oid,
-    ) != (identifier, binding.job_id, binding.tenant_id, binding.team_id, binding.agent_oid):
-        raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "recorded checkpoint belongs to another scope")
-    metrics = ArchiveMetrics(
-        codec=None if isinstance(archive, ArchiveUnavailable) else archive.codec,
-        sdk_version=None if isinstance(archive, ArchiveUnavailable) else archive.sdk_version,
-        runtime_version=None if isinstance(archive, ArchiveUnavailable) else archive.runtime_version,
-        sha256=None if isinstance(archive, ArchiveUnavailable) else archive.sha256,
-        encoded_state_bytes=archive.byte_length if isinstance(archive, StoredSdkArchive) else None,
-        inline_zlib_bytes=len(archive.data) if isinstance(archive, SdkArchive) else None,
-        part_count=len(archive.parts) if isinstance(archive, StoredSdkArchive) else None,
-        unavailable=archive if isinstance(archive, ArchiveUnavailable) else None, content_reverified=False,
-    )
-    reply = None
-    if rows[rkey] is not None:
-        original = _parse(rows[rkey].payload["data"], SavedReply)
-        verified = control.read_reply(principal, identifier, turn_number)
-        encoded = verified.model_dump_json().encode("utf-8")
-        reply = ReplyMetrics(json_utf8_bytes=len(encoded), text_utf8_bytes=len(verified.text.encode("utf-8")),
-                             stored_zlib_bytes=len(original.data), sha256=hashlib.sha256(encoded).hexdigest())
-    catalog = None if saved.skill_catalog is None else HistoricalSkillCatalog(
-        catalog_schema=saved.skill_catalog.schema_version,
-        entries=tuple(TemplateSkill(name=entry.name, version_id=entry.version_id, sha256=entry.sha256,
-                                   metadata_sha256=entry.metadata_sha256 if isinstance(entry, PurposeSkillEntry) else None)
-                      for entry in saved.skill_catalog.entries),
-        unavailable_count=saved.skill_catalog.unavailable_count,
-        usage="historical-catalog-not-load-or-permission-proof",
-    )
+    metrics = _archive_metrics(saved.archive, binding, identifier)
+    reply = _reply_metrics(control, principal, identifier, turn_number, rows[rkey])
+    catalog = _historical_catalog(saved.skill_catalog)
     memory = saved.work_memory_source
-    compaction = None
-    if isinstance(archive, StoredSdkArchive) and archive.source is not None:
-        observed = archive.source.execution
-        if (observed.conversation_id, observed.sdk_session_id) != (identifier, archive.sdk_session_id):
-            raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "recorded compaction belongs to another conversation")
-        observation_source = "stored-checkpoint-observation"
-        if observed.job_id != binding.job_id:
-            previous_key = record.profile.instruction.previous_archive_id
-            if previous_key != key("text-archive", archive.source.previous_job_id):
-                raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "inherited compaction has a different registered source")
-            previous_row = control.store.read_snapshot((previous_key,))[previous_key]
-            if previous_row is None:
-                raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "inherited compaction source is unavailable")
-            previous = _parse(previous_row.payload["data"], TurnArchive)
-            prior = previous.archive
-            if (previous.conversation_id != identifier or previous.turn_number != turn_number - 1
-                    or previous.job_id != archive.source.previous_job_id
-                    or previous_row.payload["material"] != turn_material(previous).model_dump(mode="json")
-                    or not isinstance(prior, StoredSdkArchive) or prior.source is None
-                    or prior.sha256 != archive.source.previous_sha256
-                    or prior.source.execution != observed
-                    or prior.source.profile != archive.source.profile
-                    or archive.source.profile != record.profile.instruction.checkpoint_profile
-                    or (prior.conversation_id, prior.job_id, prior.sdk_session_id,
-                        prior.tenant_id, prior.team_id, prior.agent_oid) != (
-                        identifier, previous.job_id, archive.sdk_session_id,
-                        binding.tenant_id, binding.team_id, binding.agent_oid)):
-                raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "inherited compaction source metadata differs")
-            observation_source = "inherited-checkpoint-observation"
-        compaction = RecordedCompaction(
-            source=observation_source, observation_job_id=observed.job_id, trigger=observed.trigger,
-            checkpoint_number=observed.checkpoint_number, summary_sha256=observed.summary_sha256,
-            messages_removed=observed.messages_removed, tokens_removed=observed.tokens_removed,
-            previous_state_sha256=archive.source.previous_sha256,
-        )
+    compaction = _recorded_compaction(control, record, saved.archive, identifier, turn_number)
     return TurnContext(
         schema_version="fa-turn-context-v1", request_id=record.request_id, job_id=binding.job_id,
-        conversation_id=identifier, turn_number=turn_number, model=record.profile.instruction.model,
-        model_capacity=record.profile.instruction.model_capacity,
-        attachments=record.profile.instruction.attachments,
-        user_files=tuple(file_reference(item) for item in record.profile.instruction.files),
+        conversation_id=identifier, turn_number=turn_number, model=instruction.model,
+        model_capacity=instruction.model_capacity,
+        attachments=instruction.attachments,
+        user_files=tuple(file_reference(item) for item in instruction.files),
         read_at=control.runtime._now(), source="saved-turn-metadata", turn_material_sha256=retained.sha256,
         prompt_assembly=saved.prompt_assembly, capability_assembly=saved.capability_assembly,
         context_read=raw.get("context_read"), skill_catalog=catalog,
@@ -280,3 +213,96 @@ def read_saved_turn_context(control, principal, identifier, turn_number):
                                   reason="complete-turn-usage-not-recorded"),
         wall_clock_seconds=None, ui_rendered_bytes=None, authorization=False, read_is_acknowledgment=False,
     )
+
+
+def _archive_metrics(archive, binding, identifier):
+    from .behavior_instruction import sdk_session_id
+
+    if isinstance(archive, ArchiveUnavailable):
+        return ArchiveMetrics(codec=None, sdk_version=None, runtime_version=None, sha256=None,
+                              encoded_state_bytes=None, inline_zlib_bytes=None, part_count=None,
+                              unavailable=archive, content_reverified=False)
+    if archive.sdk_session_id != sdk_session_id(identifier):
+        raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "original saved SDK identity differs")
+    stored = isinstance(archive, StoredSdkArchive)
+    if stored and (
+        archive.conversation_id, archive.job_id, archive.tenant_id, archive.team_id, archive.agent_oid,
+    ) != (identifier, binding.job_id, binding.tenant_id, binding.team_id, binding.agent_oid):
+        raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "recorded checkpoint belongs to another scope")
+    return ArchiveMetrics(
+        codec=archive.codec, sdk_version=archive.sdk_version, runtime_version=archive.runtime_version,
+        sha256=archive.sha256, encoded_state_bytes=archive.byte_length if stored else None,
+        inline_zlib_bytes=None if stored else len(archive.data),
+        part_count=len(archive.parts) if stored else None, unavailable=None, content_reverified=False,
+    )
+
+
+def _reply_metrics(control, principal, identifier, turn_number, row):
+    from .behavior_delivery import _parse
+    from .behavior_instruction import SavedReply
+
+    if row is None:
+        return None
+    original = _parse(row.payload["data"], SavedReply)
+    verified = control.read_reply(principal, identifier, turn_number)
+    encoded = verified.model_dump_json().encode("utf-8")
+    return ReplyMetrics(json_utf8_bytes=len(encoded), text_utf8_bytes=len(verified.text.encode("utf-8")),
+                        stored_zlib_bytes=len(original.data), sha256=hashlib.sha256(encoded).hexdigest())
+
+
+def _historical_catalog(saved):
+    if saved is None:
+        return None
+    return HistoricalSkillCatalog(
+        catalog_schema=saved.schema_version,
+        entries=tuple(TemplateSkill(name=entry.name, version_id=entry.version_id, sha256=entry.sha256,
+                                   metadata_sha256=entry.metadata_sha256 if isinstance(entry, PurposeSkillEntry) else None)
+                      for entry in saved.entries),
+        unavailable_count=saved.unavailable_count,
+        usage="historical-catalog-not-load-or-permission-proof",
+    )
+
+
+def _recorded_compaction(control, record, archive, identifier, turn_number):
+    if not isinstance(archive, StoredSdkArchive) or archive.source is None:
+        return None
+    observed = archive.source.execution
+    if (observed.conversation_id, observed.sdk_session_id) != (identifier, archive.sdk_session_id):
+        raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "recorded compaction belongs to another conversation")
+    observation_source = "stored-checkpoint-observation"
+    if observed.job_id != record.binding.job_id:
+        _require_inherited_source(control, record, archive, identifier, turn_number)
+        observation_source = "inherited-checkpoint-observation"
+    return RecordedCompaction(
+        source=observation_source, observation_job_id=observed.job_id, trigger=observed.trigger,
+        checkpoint_number=observed.checkpoint_number, summary_sha256=observed.summary_sha256,
+        messages_removed=observed.messages_removed, tokens_removed=observed.tokens_removed,
+        previous_state_sha256=archive.source.previous_sha256,
+    )
+
+
+def _require_inherited_source(control, record, archive, identifier, turn_number):
+    from .behavior_assistant import key
+    from .behavior_delivery import _parse
+    from .behavior_instruction import TurnArchive, turn_material
+
+    binding, source = record.binding, archive.source
+    previous_key = record.profile.instruction.previous_archive_id
+    if previous_key != key("text-archive", source.previous_job_id):
+        raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "inherited compaction has a different registered source")
+    previous_row = control.store.read_snapshot((previous_key,))[previous_key]
+    if previous_row is None:
+        raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "inherited compaction source is unavailable")
+    previous = _parse(previous_row.payload["data"], TurnArchive)
+    prior = previous.archive
+    if ((previous.conversation_id, previous.turn_number, previous.job_id)
+            != (identifier, turn_number - 1, source.previous_job_id)
+            or previous_row.payload["material"] != turn_material(previous).model_dump(mode="json")
+            or not isinstance(prior, StoredSdkArchive) or prior.source is None
+            or (prior.sha256, prior.source.execution, prior.source.profile, source.profile,
+                prior.conversation_id, prior.job_id, prior.sdk_session_id,
+                prior.tenant_id, prior.team_id, prior.agent_oid)
+            != (source.previous_sha256, source.execution, source.profile, record.profile.instruction.checkpoint_profile,
+                identifier, previous.job_id, archive.sdk_session_id,
+                binding.tenant_id, binding.team_id, binding.agent_oid)):
+        raise Problem(409, "CONVERSATION_CONTEXT_CHANGED", "inherited compaction source metadata differs")

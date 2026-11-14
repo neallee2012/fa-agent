@@ -486,20 +486,26 @@ class ChecksumSupervisor:
             return self.observe(launch_id)
 
 
+def _resume_point(assignment: LocalAssignment) -> tuple[int, int]:
+    """The (processed bytes, newline count) the assigned checkpoint proves; the start without one."""
+    if assignment.checkpoint is None:
+        return 0, 0
+    content = assignment.input
+    checkpoint, _ = decode_checkpoint(assignment.checkpoint)
+    if (
+        checkpoint.input_digest != assignment.input_digest or checkpoint.processed_bytes > len(content)
+        or checkpoint.prefix_digest != hashlib.sha256(content[:checkpoint.processed_bytes]).hexdigest()
+        or checkpoint.newline_count != content[:checkpoint.processed_bytes].count(b"\n")
+    ):
+        raise Problem(409, "HOSTED_CHECKPOINT_INVALID", "required checkpoint does not bind the assigned original bytes")
+    return checkpoint.processed_bytes, checkpoint.newline_count
+
+
 def run_checksum_child(root: Path, launch_id: str, nonce: str) -> None:
     journal = LocalJournal(root)
     assignment = journal.enter_child(launch_id, nonce)
     content = assignment.input
-    offset, newline_count = 0, 0
-    if assignment.checkpoint is not None:
-        checkpoint, _ = decode_checkpoint(assignment.checkpoint)
-        if (
-            checkpoint.input_digest != assignment.input_digest or checkpoint.processed_bytes > len(content)
-            or checkpoint.prefix_digest != hashlib.sha256(content[:checkpoint.processed_bytes]).hexdigest()
-            or checkpoint.newline_count != content[:checkpoint.processed_bytes].count(b"\n")
-        ):
-            raise Problem(409, "HOSTED_CHECKPOINT_INVALID", "required checkpoint does not bind the assigned original bytes")
-        offset, newline_count = checkpoint.processed_bytes, checkpoint.newline_count
+    offset, newline_count = _resume_point(assignment)
     hasher = hashlib.sha256(content[:offset])
     while True:
         current = journal.execution(launch_id)

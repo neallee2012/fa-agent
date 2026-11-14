@@ -655,6 +655,7 @@ class NativeEnvironmentView(WireModel):
     original_work_replayed: Literal[False] = False
     scope: Literal["entire-agent"] = "entire-agent"
 
+    # Pydantic runs these validators in definition order and stops at the first error: the order is the contract.
     @model_validator(mode="after")
     def original_transition(self):
         if self.previous_hosted_session_id == self.hosted_session_id and self.state != "current":
@@ -664,28 +665,48 @@ class NativeEnvironmentView(WireModel):
         if self.state == "ready" and self.reason is not None:
             raise ValueError("a ready environment has no unresolved transition reason")
         if self.files_check is not None and (
-                self.state != "pending" or self.reason != "scan_pending" or self.files_check.category != "scan_pending"):
+                self.state, self.reason, self.files_check.category) != ("pending", "scan_pending", "scan_pending"):
             raise ValueError("an environment check detail is only progress, not a ready or confirmed result")
+        return self
+
+    @model_validator(mode="after")
+    def original_files_omission(self):
         if self.files_migrated is False:
             if self.files_skip_request_id is None or self.files_manifest_sha256 is not None:
                 raise ValueError("omitted files require the original explicit confirmation, not a migration manifest")
         elif self.files_skip_request_id is not None:
             raise ValueError("only an explicit file omission names its confirmation")
+        return self
+
+    @model_validator(mode="after")
+    def original_files_basis(self):
         if self.files_omission_basis is not None or self.files_omission_reason is not None:
             if self.files_migrated is not False or self.files_omission_basis is None or self.files_omission_reason is None:
                 raise ValueError("an automatic omission retains its policy basis, reason and original decision")
         if self.files_migrated is True and self.files_manifest_sha256 is None:
             raise ValueError("migrated files require their original manifest")
+        return self
+
+    @model_validator(mode="after")
+    def saved_confirmation(self):
         if self.files_confirmation_saved is not None and (
                 self.state != "pending" or self.files_migrated is not None or self.files_skip_request_id is not None):
             raise ValueError("a saved but inactive confirmation cannot claim migration or an active omission")
         if self.files_confirmation_reason is not None and self.files_confirmation_saved is None:
             raise ValueError("an original omission reason requires its saved confirmation reference")
+        return self
+
+    @model_validator(mode="after")
+    def absent_confirmation(self):
         if self.files_confirmation_absent is not None and (
                 self.state != "pending" or self.files_migrated is not None
                 or self.files_confirmation_saved is not None
                 or self.files_confirmation_pending is not None):
             raise ValueError("an absent confirmation observation cannot grant or claim file migration")
+        return self
+
+    @model_validator(mode="after")
+    def pending_confirmation(self):
         if self.files_confirmation_pending is not None and (
                 self.state != "pending" or self.reason not in {
                     "scan_pending", "accepted_or_started", "admission_pending",

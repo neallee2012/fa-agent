@@ -114,9 +114,9 @@ class Harness:
     def material(self, kind, *ids):
         return InlineMaterial.model_validate_json(json.dumps(self.raw(kind, *ids)["material"]))
 
-    def mutate(self, kind, identifier, **updates):
+    def mutate(self, kind, *identifiers, **updates):
         self.seed_number += 1
-        key = control_key(kind, identifier)
+        key = control_key(kind, *identifiers)
         name = f"synthetic-update-{self.seed_number}"
         request = ControlRequest(request_id=name, request_digest=hashlib.sha256(name.encode()).hexdigest(), read_set=(key,))
 
@@ -799,3 +799,208 @@ def test_oversized_canonical_material_is_rejected_before_control_persistence():
     with pytest.raises(Problem) as error:
         h.prepare()
     assert code(error) == "OPERATION_CONTENT_LIMIT" and h.submissions() == count
+
+
+def problem(error):
+    return error.value.status, code(error), error.value.body["error"]["message"]
+
+
+def outcome(h, evidence_id, **updates):
+    h.outcomes[evidence_id] = h.outcomes["proof-one"].model_copy(update={"evidence_id": evidence_id, **updates})
+    return h.core.record_outcome(OutcomeRequest(operation_id="op-a", attempt_id="a", evidence_id=evidence_id), CONTEXT)
+
+
+def test_outcome_batch_writes_operation_attempt_then_evidence_and_keeps_attempt_material():
+    h = ready(terminal=True, idempotent=True)
+    h.authorize()
+    h.authorize(attempt="b", previous="a", evidence=h.idem())
+    retained = h.material("attempt", "op-a", "b")
+    receipt = h.observe("terminal_rejection", attempt="b", evidence_id="terminal-b", business="failed")
+    proof = h.outcomes["terminal-b"]
+    proof_data = json.dumps(
+        proof.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()
+    assert receipt.payload["result"] == {
+        "operation_id": "op-a", "attempt_id": "b", "effect_state": "not_applied", "business_result": "failed",
+        "operation_effect_state": "unknown", "operation_business_state": "pending",
+        "evidence_digest": hashlib.sha256(proof_data).hexdigest(), "execution_enabled": False,
+    }
+    batch = h.client.submissions[-1]
+    assert [(entry[0], entry[1]["RowKey"]) for entry in batch[2:]] == [
+        ("update", "behavior:v1:row:" + control_key("operation", "op-a")),
+        ("update", "behavior:v1:row:" + control_key("attempt", "op-a", "b")),
+        ("create", "behavior:v1:row:" + control_key("outcome", "op-a", "b", "terminal-b")),
+    ]
+    operation = h.data("operation", "op-a")
+    assert (operation["current_attempt_id"], operation["unsettled_attempt_ids"]) == ("b", ["a"])
+    assert (operation["effect_state"], operation["business_state"], operation["successful_result"]) == (
+        "unknown", "pending", None)
+    assert h.material("operation", "op-a") == canonical_material(DESCRIPTION)
+    attempt = h.data("attempt", "op-a", "b")
+    assert (attempt["effect_state"], attempt["observation_sequence"], attempt["terminality_contract_version"]) == (
+        "not_applied", 1, "terminal-1")
+    assert h.material("attempt", "op-a", "b") == retained
+    assert h.data("outcome", "op-a", "b", "terminal-b") == proof.model_dump(mode="json")
+    assert h.material("outcome", "op-a", "b", "terminal-b") == InlineMaterial(
+        data=proof_data, sha256=hashlib.sha256(proof_data).hexdigest())
+
+    h.observe("negative_query", evidence_id="unknown-a")
+    assert h.data("attempt", "op-a", "a")["terminality_contract_version"] is None
+    assert h.raw("attempt", "op-a", "a")["material"] is None
+    assert h.data("operation", "op-a")["unsettled_attempt_ids"] == ["a"]
+    result = h.observe("applied", evidence_id="applied-a", sequence=2, business="succeeded").payload["result"]
+    assert (result["effect_state"], result["operation_effect_state"], result["operation_business_state"]) == (
+        "applied", "applied", "succeeded")
+    operation = h.data("operation", "op-a")
+    assert operation["unsettled_attempt_ids"] == [] and operation["successful_result"]["receipt_id"] == "synthetic-result"
+
+
+@pytest.mark.parametrize("updates", [
+    {"evidence_id": "another-proof"}, {"source": "untrusted-destination"}, {"contract_version": "outcome-2"},
+])
+def test_outcome_from_another_source_or_contract_is_denied_before_any_write(updates):
+    h = ready()
+    h.authorize()
+    h.observe("negative_query")
+    count = h.submissions()
+    h.outcomes["claimed"] = h.outcomes["proof-one"].model_copy(update={"evidence_id": "claimed", "sequence": 2, **updates})
+    with pytest.raises(Problem) as error:
+        h.core.record_outcome(OutcomeRequest(operation_id="op-a", attempt_id="a", evidence_id="claimed"), CONTEXT)
+    assert problem(error) == (403, "OPERATION_EVIDENCE_DENIED", "outcome source or contract differs")
+    assert h.submissions() == count
+
+
+def test_terminal_outcome_under_another_terminality_contract_is_denied():
+    h = ready(terminal=True)
+    h.authorize()
+    h.observe("negative_query")
+    count = h.submissions()
+    with pytest.raises(Problem) as error:
+        outcome(h, "terminal", sequence=2, observation="effect_fenced", terminality_contract_version="terminal-2",
+                terminality_scope="entire_attempt_all_in_flight_deliveries", terminality_reference="synthetic")
+    assert problem(error) == (403, "OPERATION_EVIDENCE_DENIED", "destination terminality has not been established")
+    assert h.submissions() == count and h.data("attempt", "op-a", "a")["effect_state"] == "unknown"
+
+
+STALE = (409, "OPERATION_EVIDENCE_DENIED", "outcome is stale or bound to a different attempt")
+OTHER_RESULT = ReceiptResult(
+    receipt_id="other", resource=ResolvedResource(resource_id="other", version="v1"), status="completed",
+)
+
+
+@pytest.mark.parametrize("where", ["stored-attempt", "evidence"])
+@pytest.mark.parametrize("field,value", [
+    ("operation_id", "op-other"), ("attempt_id", "other"), ("description_digest", "0" * 64),
+    ("adapter_contract_digest", "0" * 64), ("target", "other-target"), ("idempotency_key", "0" * 64),
+])
+def test_outcome_must_match_the_exact_attempt_binding(where, field, value):
+    h = ready()
+    h.authorize()
+    h.observe("negative_query")
+    proof = h.outcomes["proof-one"]
+    if where == "stored-attempt":
+        h.mutate("attempt", "op-a", "a", binding={**h.data("attempt", "op-a", "a")["binding"], field: value})
+        binding = h.binding()  # The evidence matches the stored row, which no longer matches the operation.
+    else:
+        binding = proof.binding.model_copy(update={field: value})
+    count = h.submissions()
+    with pytest.raises(Problem) as error:
+        outcome(h, "replayed", sequence=2, binding=binding)
+    assert problem(error) == STALE and h.submissions() == count
+
+
+@pytest.mark.parametrize("updates", [
+    {"sequence": 1}, {"observed_at": NOW + timedelta(seconds=1)},
+    {"business_result": "succeeded", "observation": "applied", "result": OTHER_RESULT},
+])
+def test_stale_future_or_foreign_resource_outcome_is_denied(updates):
+    h = ready()
+    h.authorize()
+    h.observe("negative_query")
+    count = h.submissions()
+    with pytest.raises(Problem) as error:
+        outcome(h, "later", **{"sequence": 2, **updates})
+    assert problem(error) == STALE and h.submissions() == count
+    assert h.data("attempt", "op-a", "a")["observation_sequence"] == 1
+
+
+CLOCK = (503, "OPERATION_CLOCK_INVALID", "trusted UTC is unavailable")
+
+
+@pytest.mark.parametrize("bad,expected", [
+    ({}, CLOCK), ({"sequence": 1}, STALE), ({"target": "other-target"}, STALE), ({"result": OTHER_RESULT}, CLOCK),
+])
+def test_outcome_reads_the_clock_after_binding_and_sequence_but_before_the_result_resource(bad, expected):
+    h = ready()
+    h.authorize()
+    h.observe("negative_query")
+    if "target" in bad:
+        bad = {"binding": h.outcomes["proof-one"].binding.model_copy(update=bad)}
+    h.time = NOW.replace(tzinfo=None)
+    count = h.submissions()
+    with pytest.raises(Problem) as error:
+        outcome(h, "later", **{"sequence": 2, **bad})
+    assert problem(error) == expected and h.submissions() == count
+
+
+PARTIAL = (EffectPart(unit_id="one", effect="applied"), EffectPart(unit_id="two", effect="unknown"))
+OBSERVED = {
+    "unknown": ("negative_query", ()), "applied": ("applied", ()),
+    "partial": ("partial", PARTIAL), "not_applied": ("terminal_rejection", ()),
+}
+LATER = {"applied": {"applied"}, "not_applied": {"not_applied"}, "partial": {"partial", "applied"}}
+
+
+@pytest.mark.parametrize("first", list(OBSERVED))
+@pytest.mark.parametrize("second", list(OBSERVED))
+def test_recorded_attempt_effect_only_moves_forward(first, second):
+    h = ready(terminal=True)
+    h.authorize()
+    h.observe(OBSERVED[first][0], parts=OBSERVED[first][1])
+    count = h.submissions()
+    observation, parts = OBSERVED[second]
+    if second in LATER.get(first, OBSERVED):
+        result = h.observe(observation, parts=parts, evidence_id="second", sequence=2).payload["result"]
+        assert result["effect_state"] == h.data("attempt", "op-a", "a")["effect_state"] == second
+        return
+    with pytest.raises(Problem) as error:
+        h.observe(observation, parts=parts, evidence_id="second", sequence=2)
+    assert problem(error) == (409, "OPERATION_EVIDENCE_CONFLICT", "outcome contradicts already recorded effects")
+    assert h.submissions() == count and h.data("attempt", "op-a", "a")["effect_state"] == first
+
+
+@pytest.mark.parametrize("observation,business,expected", [
+    ("applied", "succeeded", ("applied", "succeeded")),
+    ("applied", "failed", ("applied", "failed")),
+    ("applied", "unknown", ("applied", "pending")),
+    ("terminal_rejection", "failed", ("not_applied", "failed")),
+    ("terminal_rejection", "unknown", ("not_applied", "pending")),
+    ("negative_query", "failed", ("unknown", "pending")),
+    ("partial", "failed", ("partial", "pending")),
+])
+def test_settled_attempt_sets_the_operation_business_state(observation, business, expected):
+    h = ready(terminal=True)
+    h.authorize()
+    result = h.observe(observation, business=business, parts=PARTIAL if observation == "partial" else ()).payload["result"]
+    assert (result["operation_effect_state"], result["operation_business_state"]) == expected
+    operation = h.data("operation", "op-a")
+    assert (operation["effect_state"], operation["business_state"]) == expected
+    assert operation["unsettled_attempt_ids"] == ([] if expected[0] in {"applied", "not_applied"} else ["a"])
+
+
+def test_operation_already_partial_stays_pending_when_its_last_attempt_settles():
+    h = ready(terminal=True)
+    h.authorize()
+    h.mutate("operation", "op-a", effect_state="partial")
+    result = h.observe("terminal_rejection", business="failed").payload["result"]
+    assert (result["operation_effect_state"], result["operation_business_state"]) == ("partial", "pending")
+    assert h.data("operation", "op-a")["unsettled_attempt_ids"] == []
+
+
+def test_failed_operation_stays_failed_after_later_terminal_evidence_without_a_business_result():
+    h = ready(terminal=True)
+    h.authorize()
+    h.observe("terminal_rejection", business="failed")
+    result = h.observe("terminal_withdrawal", evidence_id="later", sequence=2).payload["result"]
+    assert (result["business_result"], result["operation_business_state"]) == ("unknown", "failed")
+    assert h.data("operation", "op-a")["business_state"] == "failed"

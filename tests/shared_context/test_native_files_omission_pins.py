@@ -305,3 +305,29 @@ def test_retarget_that_leaves_another_follow_selected_reports_it(file_api, monke
     assert response.json()["request_id"] == "older-follow" and response.json()["files_confirmation_pending"] == RID
     assert response.json()["reason"] == "scan_pending" and response.json()["files_check"] == {
         "category": "scan_pending", "request_id_prefix": None, "conversation_id_prefix": None}
+
+
+def test_policy_check_saves_the_receipt_it_waits_for(file_api):
+    """A system-policy check that meets an executing original request answers "accepted_or_started" and saves that
+    request as the one it waits for, so the next check knows what to watch."""
+    from shared_context.native_turns import _changed
+
+    fixture = file_api
+    command = _check_command(fixture)
+
+    async def accepted_again():
+        original = await fixture.runtime._rid("original-rid")
+        receipt = _changed(original.value.receipt, status="accepted", result=None, turn_number=None)
+        current, etag = await fixture.runtime._agent_record()
+        async with fixture.runtime._store(TURNS_STORE) as store:
+            await store.set_item("rid:original-rid", _json(_changed(original.value, receipt=receipt, run_token=None)),
+                                 if_match=original.etag)
+            await store.set_item("agent", _json(current), if_match=etag)  # a new ETag starts a new check
+
+    fixture.hosted.portal.call(accepted_again)
+    waiting = _send(fixture, command, decision_basis="system_policy")
+    assert waiting.status_code == 200, waiting.text
+    assert waiting.json()["reason"] == "accepted_or_started" and waiting.json()["state"] == "pending"
+    record, _ = fixture.hosted.portal.call(_read, fixture.runtime)
+    scan = fixture.hosted.portal.call(scan_observation, fixture.runtime, record.view, RID)
+    assert (scan["waiting_request_id"], scan["waiting_status"], scan["complete"]) == ("original-rid", "accepted", False)

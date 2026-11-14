@@ -305,10 +305,7 @@ def _cleanup(composition, agent_id, role_scope, *, stuck=False):
         credential, checked.role_scope, account=checked.account_role)
 
 
-def main(argv=None):
-    from starlette.requests import Request
-    from .behavior_server import build_server
-    from .behavior_server_config import load_configuration
+def _arguments(argv):
     parser = argparse.ArgumentParser(prog="agent-retire", description=(
         "Retire one registered Team Agent: an append-only tombstone; with --delete-foundry also its Foundry agent "
         "(force=true) and its identity's FA role assignments. Run preview first."))
@@ -330,14 +327,43 @@ def main(argv=None):
     if args.action == "retire" and (args.confirm is None or args.agent_id is not None and (
             args.request_id is None or args.reason is None)):
         parser.error("retire requires --confirm, and with --agent-id also --request-id and --reason")
+    return args
+
+
+def _operator_token():
+    token = os.environ.get("FA_TEAM_OPERATOR_TOKEN")
+    if not token:
+        if not sys.stdin.isatty():
+            raise Problem(401, "TEAM_OPERATOR_TOKEN_REQUIRED", "the original delegated operator token is required")
+        token = getpass.getpass("Original operator bearer token (hidden): ")
+    if not token or len(token) > 16384 or any(character.isspace() for character in token):
+        raise Problem(401, "TEAM_OPERATOR_TOKEN_INVALID", "one original bearer token is required")
+    return token
+
+
+def _run(composition, principal, args):
+    if args.failed_agent_name is not None:
+        # Onboarding creates every agent in A's project (default_foundry).
+        foundry = RetiringFoundry(composition.config.targets[0].project_endpoint, composition.clients[0].credential)
+        return ({"state": "preview", **preview_failed(composition, args.failed_agent_name, foundry=foundry)}
+                if args.action == "preview" else retire_failed(
+                    composition, principal, agent_name=args.failed_agent_name, confirm=args.confirm, foundry=foundry))
+    stuck = args.stuck_onboarding
+    foundry, roles = (_cleanup(composition, args.agent_id, args.role_scope, stuck=stuck)
+                      if args.delete_foundry else (None, None))
+    if args.action == "preview":
+        return {"state": "preview", **preview(composition, args.agent_id, foundry=foundry, roles=roles, stuck=stuck)}
+    return retire(composition, principal, agent_id=args.agent_id, request_id=args.request_id, reason=args.reason,
+                  confirm=args.confirm, foundry=foundry, roles=roles, stuck=stuck)
+
+
+def main(argv=None):
+    from starlette.requests import Request
+    from .behavior_server import build_server
+    from .behavior_server_config import load_configuration
+    args = _arguments(argv)
     try:
-        token = os.environ.get("FA_TEAM_OPERATOR_TOKEN")
-        if not token:
-            if not sys.stdin.isatty():
-                raise Problem(401, "TEAM_OPERATOR_TOKEN_REQUIRED", "the original delegated operator token is required")
-            token = getpass.getpass("Original operator bearer token (hidden): ")
-        if not token or len(token) > 16384 or any(character.isspace() for character in token):
-            raise Problem(401, "TEAM_OPERATOR_TOKEN_INVALID", "one original bearer token is required")
+        token = _operator_token()
         with build_server(load_configuration(args.config)) as composition:
             principal = composition.verifier(Request({
                 "type": "http", "headers": [(b"authorization", ("Bearer " + token).encode("ascii"))]}))
@@ -345,25 +371,7 @@ def main(argv=None):
             if teams is None:
                 raise Problem(503, "TEAM_REGISTRY_UNAVAILABLE", "the server Team registry is not configured")
             teams.require_operator(principal, write=args.action == "retire")
-            if args.failed_agent_name is not None:
-                # Onboarding creates every agent in A's project (default_foundry).
-                foundry = RetiringFoundry(composition.config.targets[0].project_endpoint,
-                                          composition.clients[0].credential)
-                result = ({"state": "preview", **preview_failed(composition, args.failed_agent_name, foundry=foundry)}
-                          if args.action == "preview" else retire_failed(
-                              composition, principal, agent_name=args.failed_agent_name, confirm=args.confirm,
-                              foundry=foundry))
-            else:
-                stuck = args.stuck_onboarding
-                foundry, roles = (_cleanup(composition, args.agent_id, args.role_scope, stuck=stuck)
-                                  if args.delete_foundry else (None, None))
-                if args.action == "preview":
-                    result = {"state": "preview", **preview(composition, args.agent_id, foundry=foundry, roles=roles,
-                                                            stuck=stuck)}
-                else:
-                    result = retire(composition, principal, agent_id=args.agent_id, request_id=args.request_id,
-                                    reason=args.reason, confirm=args.confirm, foundry=foundry, roles=roles,
-                                    stuck=stuck)
+            result = _run(composition, principal, args)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result["state"] in {"ok", "preview"} else 1
     except Problem as error:

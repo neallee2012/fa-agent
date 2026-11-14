@@ -8,17 +8,23 @@ import json
 from types import SimpleNamespace
 
 import httpx
+from pydantic import ValidationError
 import pytest
 
 from conftest import A
-from shared_context import behavior_assistant_hosted as hosted
+from shared_context import behavior_assistant_hosted as hosted, behavior_turn_context
 from shared_context.behavior_assistant import key
 from shared_context.behavior_assistant_checkpoint import export
 from shared_context.behavior_assistant_wire import ArchiveUnavailable, SdkArchive, StoredSdkArchive
+from shared_context.behavior_capability_prompt import CapabilityAssemblyRecord
 from shared_context.behavior_instruction import SavedReply, TurnArchive, turn_material
 from shared_context.behavior_skill_prompt import assemble_prompt
+from shared_context.behavior_turn_context import ArchiveMetrics
+from shared_context.behavior_user_turn import UserTurnSource
 from shared_context.behavior_work_policy_api import install_work_policy_routes
+from shared_context.errors import Problem
 from shared_context.records import Record
+from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import UNKNOWN_OID, token
@@ -211,7 +217,62 @@ def test_context_read_rechecks_revocation_in_the_consistent_snapshot(real_interf
         assert injected == [True]
 
 
-@pytest.mark.parametrize("change", ["material", "turn", "conversation", "archive_scope", "reply_hash"])
+def refusals(monkeypatch):
+    """The API returns one generic message per code, so spy on the module entry for the exact refusal."""
+    original, seen = behavior_turn_context.read_saved_turn_context, []
+
+    def spy(*args):
+        try:
+            return original(*args)
+        except Problem as error:
+            seen.append(error.body["error"]["message"])
+            raise
+
+    monkeypatch.setattr(behavior_turn_context, "read_saved_turn_context", spy)
+    return seen
+
+
+SAVED_TURN_DIFFERS = "original saved turn metadata differs"
+SAVED_CHANGES = {
+    "material": SAVED_TURN_DIFFERS, "turn": SAVED_TURN_DIFFERS, "conversation": SAVED_TURN_DIFFERS,
+    "job": SAVED_TURN_DIFFERS, "prompt": SAVED_TURN_DIFFERS, "capability": SAVED_TURN_DIFFERS,
+    "user_source": SAVED_TURN_DIFFERS, "sdk_session": "original saved SDK identity differs",
+    **{"archive_" + field: "recorded checkpoint belongs to another scope"
+       for field in ("conversation_id", "job_id", "tenant_id", "team_id", "agent_oid")},
+    "reply_hash": "complete saved response bytes differ",
+}
+
+
+def _changed_saved_turn(saved, change):
+    if change == "turn":
+        return saved.model_copy(update={"turn_number": 2})
+    if change == "conversation":
+        return saved.model_copy(update={"conversation_id": "another-conversation"})
+    if change == "job":
+        return saved.model_copy(update={"job_id": "another-job"})
+    if change == "prompt":
+        other = next(record for record in (assemble_prompt(profile).record for profile in ASSEMBLY_PROFILES)
+                     if record != saved.prompt_assembly)
+        return saved.model_copy(update={"prompt_assembly": other})
+    if change == "capability":
+        assert saved.capability_assembly is None
+        return saved.model_copy(update={"capability_assembly": CapabilityAssemblyRecord(
+            base_profile="fa-instruction-v2", base_prefix_sha256="a" * 64, base_capability_catalog_version="v",
+            capability_set_sha256="b" * 64, prefix_sha256="c" * 64, prefix_utf8_bytes=1,
+            declared_capabilities=(), capability_catalog_version="v+caps-" + "b" * 16)})
+    if change == "user_source":
+        return saved.model_copy(update={"user_turn_sources": (UserTurnSource(
+            schema_version="fa-user-turn-source-v1", conversation_id="another-conversation",
+            request_id="another-request", job_id="another-job", turn_number=1, sha256="a" * 64, utf8_bytes=1,
+            submit_sha256="b" * 64, registration_sha256="c" * 64, turn_archive_sha256="d" * 64),)})
+    assert isinstance(saved.archive, StoredSdkArchive)
+    if change == "sdk_session":
+        return saved.model_copy(update={"archive": saved.archive.model_copy(update={"sdk_session_id": "another-session"})})
+    field = change.removeprefix("archive_")
+    return saved.model_copy(update={"archive": saved.archive.model_copy(update={field: "another-" + field})})
+
+
+@pytest.mark.parametrize("change", SAVED_CHANGES)
 def test_changed_saved_material_is_not_projected_as_metrics(real_interface, monkeypatch, change):
     c = real_interface
     _, task, path = saved_turn(c)
@@ -224,13 +285,7 @@ def test_changed_saved_material_is_not_projected_as_metrics(real_interface, monk
     else:
         row = c.h.store.read_snapshot((akey,))[akey]
         saved = TurnArchive.model_validate_json(json.dumps(row.payload["data"]))
-        if change == "turn":
-            changed = saved.model_copy(update={"turn_number": 2})
-        elif change == "conversation":
-            changed = saved.model_copy(update={"conversation_id": "another-conversation"})
-        else:
-            assert isinstance(saved.archive, StoredSdkArchive)
-            changed = saved.model_copy(update={"archive": saved.archive.model_copy(update={"team_id": "another-team"})})
+        changed = _changed_saved_turn(saved, change)
         snapshot = c.h.store.read_snapshot
 
         def wrong_returned_record(keys):
@@ -244,8 +299,10 @@ def test_changed_saved_material_is_not_projected_as_metrics(real_interface, monk
 
         monkeypatch.setattr(c.h.store, "read_snapshot", wrong_returned_record)
     before = copy.deepcopy(c.h.transport.backing.rows)
+    seen = refusals(monkeypatch)
     denied = c.h.client.get(path, headers=c.h.headers())
     assert denied.status_code == 409, denied.text
+    assert seen == [SAVED_CHANGES[change]]
     assert "token_usage" not in denied.json() and c.h.transport.backing.rows == before
 
 
@@ -297,7 +354,7 @@ def test_bridge_rejects_bad_context_without_losing_saved_results(real_interface,
     assert len(c.starts) == len(c.sdk_calls) == 1
 
 
-@pytest.mark.parametrize("kind", ["inline", "unavailable"])
+@pytest.mark.parametrize("kind", ["inline", "unavailable", "failed"])
 def test_legacy_and_unavailable_archives_keep_distinct_measurements(assistant, tmp_path, kind):
     h, control, human, _ = enabled(assistant)
     install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier,
@@ -313,14 +370,20 @@ def test_legacy_and_unavailable_archives_keep_distinct_measurements(assistant, t
             archive = export(tmp_path, original.sdk_session_id)
         else:
             archive = ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE")
-        turn.client.save_text_reply("Public reply keeps exact UTF-8 bytes. 原文🙂", archive, turn.stop)
+        if kind == "failed":
+            turn.client.finish_failed(archive, turn.stop, "sdk_failed")
+        else:
+            turn.client.save_text_reply("Public reply keeps exact UTF-8 bytes. 原文🙂", archive, turn.stop)
         path = f"/work-policy/v1/conversations/{turn.assignment.task.instruction.conversation_id}/turns/1/context"
         before = copy.deepcopy(h.transport.backing.rows)
         result = h.client.get(path, headers=h.headers())
         assert result.status_code == 200, result.text
         data = result.json()
         assert data["archive"]["encoded_state_bytes"] is None and data["archive"]["part_count"] is None
-        assert data["reply"]["text_utf8_bytes"] == len("Public reply keeps exact UTF-8 bytes. 原文🙂".encode())
+        if kind == "failed":
+            assert data["reply"] is None
+        else:
+            assert data["reply"]["text_utf8_bytes"] == len("Public reply keeps exact UTF-8 bytes. 原文🙂".encode())
         if kind == "inline":
             assert data["archive"]["inline_zlib_bytes"] == len(archive.data)
             assert data["archive"]["unavailable"] is None
@@ -423,56 +486,98 @@ def test_later_turn_context_retains_inherited_compaction_without_claiming_a_new_
             turn.client.close()
 
 
-@pytest.mark.parametrize("change", [
-    "previous_job", "previous_hash", "execution", "previous_material", "previous_identity",
-])
+def _archive(change):
+    return lambda saved: saved.model_copy(update={"archive": change(saved.archive)})
+
+
+def _source(**update):
+    return _archive(lambda archive: archive.model_copy(update={"source": archive.source.model_copy(update=update)}))
+
+
+def _execution(**update):
+    return _archive(lambda archive: archive.model_copy(update={"source": archive.source.model_copy(update={
+        "execution": archive.source.execution.model_copy(update=update)})}))
+
+
+def _other_profile(archive):
+    return archive.source.profile.model_copy(update={"platform": "linux-x64"})
+
+
+_profile = _archive(lambda archive: archive.model_copy(update={
+    "source": archive.source.model_copy(update={"profile": _other_profile(archive)})}))
+INHERITED_DIFFERS = "inherited compaction source metadata differs"
+ANOTHER_CONVERSATION = "recorded compaction belongs to another conversation"
+# change -> (refusal message, {"current" | "previous": saved-turn rewrite, None for a missing row, "material"})
+INHERITED_CHANGES = {
+    "previous_job": ("inherited compaction has a different registered source",
+                     {"current": _source(previous_job_id="other-job")}),
+    "observed_conversation": (ANOTHER_CONVERSATION, {"current": _execution(conversation_id="another-conversation")}),
+    "observed_session": (ANOTHER_CONVERSATION, {"current": _execution(sdk_session_id="another-session")}),
+    "previous_missing": ("inherited compaction source is unavailable", {"previous": None}),
+    "previous_hash": (INHERITED_DIFFERS, {"current": _source(previous_sha256="f" * 64)}),
+    "execution": (INHERITED_DIFFERS, {"current": _execution(summary_sha256="f" * 64)}),
+    "current_profile": (INHERITED_DIFFERS, {"current": _profile}),
+    "checkpoint_profile": (INHERITED_DIFFERS, {"current": _profile, "previous": _profile}),
+    "previous_material": (INHERITED_DIFFERS, {"previous": "material"}),
+    "previous_identity": (INHERITED_DIFFERS,
+                          {"previous": lambda saved: saved.model_copy(update={"turn_number": saved.turn_number - 1})}),
+    "previous_conversation": (INHERITED_DIFFERS,
+                              {"previous": lambda saved: saved.model_copy(update={"conversation_id": "another"})}),
+    # the row registered under the source's job key, claiming another job for itself and its checkpoint
+    "previous_job_id": (INHERITED_DIFFERS, {"previous": lambda saved: saved.model_copy(update={
+        "job_id": "another", "archive": saved.archive.model_copy(update={"job_id": "another"})})}),
+    "prior_profile": (INHERITED_DIFFERS, {"previous": _profile}),
+    "prior_unavailable": (INHERITED_DIFFERS, {"previous": lambda saved: saved.model_copy(update={
+        "archive": ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE")})}),
+    "prior_without_source": (INHERITED_DIFFERS, {"previous": _archive(lambda archive: archive.model_copy(update={
+        "source": None, "codec": "artifact-session-fs-v1"}))}),
+    **{"prior_" + field: (INHERITED_DIFFERS, {"previous": _archive(
+        lambda archive, field=field: archive.model_copy(update={field: "another-" + field}))})
+       for field in ("conversation_id", "job_id", "sdk_session_id", "tenant_id", "team_id", "agent_oid")},
+}
+
+
+@pytest.mark.parametrize("change", INHERITED_CHANGES)
 def test_inherited_compaction_requires_the_registered_original_source(checkpoint_case, monkeypatch, change):
     c = checkpoint_case
     settle(c, c.fs.snapshot(), compaction=c.fs.compaction)
     third = open_turn(c.h, c.control, c.human, "inherited-context-negative",
                       c.assignment.task.instruction.conversation_id)
     try:
-        reference = settle(third, third.client.restore())
+        settle(third, third.client.restore())
         task = third.assignment.task.instruction
         path = f"/work-policy/v1/conversations/{task.conversation_id}/turns/{task.turn_number}/context"
         assert c.h.client.get(path, headers=c.h.headers()).status_code == 200
-        current_key = key("text-archive", third.binding.job_id)
-        previous_key = task.previous_archive_id
+        message, rewrites = INHERITED_CHANGES[change]
+        keys = {"current": key("text-archive", third.binding.job_id), "previous": task.previous_archive_id}
         snapshot = c.h.store.read_snapshot
 
-        def incoherent_source(keys):
-            result = dict(snapshot(keys))
-            target = previous_key if change in {"previous_material", "previous_identity"} else current_key
-            if target not in result or result[target] is None:
-                return result
-            original = result[target]
-            saved = TurnArchive.model_validate_json(json.dumps(original.payload["data"]))
-            if change == "previous_identity":
-                changed = saved.model_copy(update={"turn_number": saved.turn_number - 1})
-            elif change == "previous_material":
-                result[target] = Record({**original.payload, "material": None}, original.etag)
-                return result
-            else:
-                source = reference.source
-                if change == "previous_job":
-                    source = source.model_copy(update={"previous_job_id": "other-job"})
-                elif change == "previous_hash":
-                    source = source.model_copy(update={"previous_sha256": "f" * 64})
-                else:
-                    source = source.model_copy(update={
-                        "execution": source.execution.model_copy(update={"summary_sha256": "f" * 64}),
-                    })
-                changed = saved.model_copy(update={"archive": reference.model_copy(update={"source": source})})
-            result[target] = Record({
-                **original.payload, "data": changed.model_dump(mode="json"),
-                "material": turn_material(changed).model_dump(mode="json"),
-            }, original.etag)
+        def incoherent_source(read_keys):
+            result = dict(snapshot(read_keys))
+            for target, rewrite in rewrites.items():
+                row_key = keys[target]
+                if row_key not in result or result[row_key] is None:
+                    continue
+                original = result[row_key]
+                if rewrite is None:
+                    result[row_key] = None
+                    continue
+                if rewrite == "material":
+                    result[row_key] = Record({**original.payload, "material": None}, original.etag)
+                    continue
+                changed = rewrite(TurnArchive.model_validate_json(json.dumps(original.payload["data"])))
+                result[row_key] = Record({
+                    **original.payload, "data": changed.model_dump(mode="json"),
+                    "material": turn_material(changed).model_dump(mode="json"),
+                }, original.etag)
             return result
 
         before = copy.deepcopy(c.h.transport.backing.rows)
         monkeypatch.setattr(c.h.store, "read_snapshot", incoherent_source)
+        seen = refusals(monkeypatch)
         denied = c.h.client.get(path, headers=c.h.headers())
         assert denied.status_code == 409 and denied.json()["error"]["code"] == "CONVERSATION_CONTEXT_CHANGED"
+        assert seen == [message]
         assert "compaction" not in denied.json() and c.h.transport.backing.rows == before
     finally:
         third.client.close()
@@ -548,3 +653,48 @@ def test_missing_control_does_not_install_or_enable_a_context_source(real_interf
     c.h.transport.requests.clear()
     response = c.h.client.get(path, headers=c.h.headers())
     assert response.status_code == 503 and c.h.transport.requests == []
+
+
+BASIS = "Archive byte measurements must retain their exact storage basis"
+VERSIONS = "Available archive metadata must retain its recorded SDK/runtime versions"
+RELEASE = {"sdk_version": SDK_VERSION, "runtime_version": RUNTIME_VERSION}
+UNAVAILABLE = {"unavailable": ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE")}
+INLINE = {**RELEASE, "sha256": "a" * 64, "inline_zlib_bytes": 1}
+STORED = {**RELEASE, "sha256": "a" * 64, "encoded_state_bytes": 1, "part_count": 1}
+
+
+@pytest.mark.parametrize("codec,fields,refusal", [
+    (None, UNAVAILABLE, None),
+    ("zlib-v1", INLINE, None),
+    ("artifact-session-fs-v1", STORED, None),
+    ("artifact-session-fs-responses-diag-v1", STORED, None),
+    (None, {}, BASIS),
+    (None, {**UNAVAILABLE, "sdk_version": SDK_VERSION}, BASIS),
+    (None, {**UNAVAILABLE, "runtime_version": RUNTIME_VERSION}, BASIS),
+    (None, {**UNAVAILABLE, "sha256": "a" * 64}, BASIS),
+    ("zlib-v1", {**INLINE, **UNAVAILABLE}, BASIS),
+    ("zlib-v1", {**INLINE, "sha256": None}, BASIS),
+    ("zlib-v1", {**INLINE, "inline_zlib_bytes": None}, BASIS),
+    ("zlib-v1", {**INLINE, "encoded_state_bytes": 1}, BASIS),
+    ("zlib-v1", {**INLINE, "part_count": 1}, BASIS),
+    ("artifact-session-fs-v1", INLINE, BASIS),
+    ("artifact-session-fs-v1", {**STORED, **UNAVAILABLE}, BASIS),
+    ("artifact-session-fs-v1", {**STORED, "sha256": None}, BASIS),
+    ("artifact-session-fs-v1", {**STORED, "encoded_state_bytes": None}, BASIS),
+    ("artifact-session-fs-v1", {**STORED, "part_count": None}, BASIS),
+    ("artifact-session-fs-v1", {**STORED, "inline_zlib_bytes": 1}, BASIS),
+    ("zlib-v1", {**INLINE, "sdk_version": None}, VERSIONS),
+    ("artifact-session-fs-v1", {**STORED, "runtime_version": None}, VERSIONS),
+    ("zlib-v1", {**INLINE, "sdk_version": None, "encoded_state_bytes": 1}, BASIS),
+])
+def test_archive_metrics_keep_their_exact_storage_basis(codec, fields, refusal):
+    values = {name: None for name in (
+        "sdk_version", "runtime_version", "sha256", "encoded_state_bytes", "inline_zlib_bytes", "part_count",
+        "unavailable")}
+    values.update(fields)
+    if refusal is None:
+        assert ArchiveMetrics(codec=codec, content_reverified=False, **values).codec == codec
+        return
+    with pytest.raises(ValidationError) as raised:
+        ArchiveMetrics(codec=codec, content_reverified=False, **values)
+    assert [error["msg"] for error in raised.value.errors()] == ["Value error, " + refusal]

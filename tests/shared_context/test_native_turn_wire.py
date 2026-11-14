@@ -205,3 +205,101 @@ def test_native_hop_is_provenance_not_the_legacy_two_hop_limit(hop):
     values["source"]["hop"] = -1
     with pytest.raises(ValidationError):
         NATIVE_REQUEST.validate_json(json.dumps(values))
+
+
+_PENDING = {
+    "agent_id": "agent", "request_id": "original-follow", "previous_hosted_session_id": "source",
+    "previous_agent_version": "41", "hosted_session_id": "destination", "hosted_agent_version": "43",
+    "state": "pending", "reason": "task_active",
+}
+_SCAN = {"reason": "scan_pending", "files_check": {"category": "scan_pending"}}
+_OMITTED = {"files_migrated": False, "files_skip_request_id": "original-confirmation"}
+_MIGRATED = {"files_migrated": True, "files_manifest_sha256": "a" * 64}
+_READY = {"state": "ready", "reason": None}
+_DISTINCT = "version following requires a distinct execution session"
+_REQUEST = "a persisted transition retains its original request"
+_READY_REASON = "a ready environment has no unresolved transition reason"
+_CHECK = "an environment check detail is only progress, not a ready or confirmed result"
+_OMISSION_CONFIRMATION = "omitted files require the original explicit confirmation, not a migration manifest"
+_SKIP_ONLY_OMISSION = "only an explicit file omission names its confirmation"
+_POLICY = "an automatic omission retains its policy basis, reason and original decision"
+_MANIFEST = "migrated files require their original manifest"
+_SAVED = "a saved but inactive confirmation cannot claim migration or an active omission"
+_SAVED_REASON = "an original omission reason requires its saved confirmation reference"
+_ABSENT = "an absent confirmation observation cannot grant or claim file migration"
+_PENDING_CONFIRMATION = "a pending confirmation is unactivated progress, not an omission or ready state"
+
+
+@pytest.mark.parametrize("change", [
+    {"state": "current", "hosted_session_id": "source", "request_id": None, "reason": None},
+    {"state": "available", "request_id": None, "reason": "source_active"},
+    _READY, _SCAN, _OMITTED, _MIGRATED,
+    {**_OMITTED, "files_omission_basis": "system_policy", "files_omission_reason": "source_changed"},
+    {"files_confirmation_saved": "original-confirmation", "files_confirmation_reason": "destination"},
+    {"files_confirmation_absent": "original-confirmation"},
+    *({"reason": reason, "files_confirmation_pending": "original-confirmation"}
+      for reason in ("accepted_or_started", "admission_pending", "task_active", "task_unconfirmed")),
+    {**_SCAN, "files_confirmation_pending": "original-confirmation"},
+])
+def test_environment_view_accepts_each_consistent_transition(change):
+    from shared_context.behavior_native_turn_wire import NativeEnvironmentView
+
+    raw = {**_PENDING, **change}
+    view = NativeEnvironmentView.model_validate_json(json.dumps(raw))
+    assert view.model_dump(mode="json", exclude_defaults=True) == {
+        key: value for key, value in raw.items() if value is not None}
+
+
+@pytest.mark.parametrize("message,change", [
+    (_DISTINCT, {"hosted_session_id": "source"}),
+    (_DISTINCT, {**_READY, "hosted_session_id": "source", "request_id": None}),
+    (_REQUEST, {"request_id": None}),
+    (_REQUEST, {**_READY, "request_id": None}),
+    (_REQUEST, {"state": "ready", "reason": "task_active", "request_id": None}),
+    (_READY_REASON, {"state": "ready", "reason": "task_active"}),
+    (_READY_REASON, {"state": "ready", "reason": "task_active", "files_check": {"category": "scan_pending"}}),
+    (_CHECK, {"files_check": {"category": "scan_pending"}}),
+    (_CHECK, {**_READY, "files_check": {"category": "scan_pending"}}),
+    (_CHECK, {"reason": "scan_pending", "files_check": {"category": "active_waiting"}}),
+    (_CHECK, {**_SCAN, "state": "available"}),
+    (_CHECK, {"files_check": {"category": "scan_pending"}, "files_migrated": False}),
+    (_OMISSION_CONFIRMATION, {"files_migrated": False}),
+    (_OMISSION_CONFIRMATION, {**_OMITTED, "files_manifest_sha256": "a" * 64}),
+    (_OMISSION_CONFIRMATION, {"files_migrated": False, "files_omission_basis": "system_policy"}),
+    (_SKIP_ONLY_OMISSION, {"files_skip_request_id": "original-confirmation"}),
+    (_SKIP_ONLY_OMISSION, {**_MIGRATED, "files_skip_request_id": "original-confirmation"}),
+    (_SKIP_ONLY_OMISSION, {"files_skip_request_id": "original-confirmation", "files_omission_basis": "system_policy"}),
+    (_POLICY, {"files_omission_basis": "system_policy", "files_omission_reason": "source"}),
+    (_POLICY, {**_MIGRATED, "files_omission_basis": "system_policy", "files_omission_reason": "source"}),
+    (_POLICY, {**_OMITTED, "files_omission_basis": "system_policy"}),
+    (_POLICY, {**_OMITTED, "files_omission_reason": "source"}),
+    (_POLICY, {"files_migrated": True, "files_omission_reason": "source"}),
+    (_MANIFEST, {"files_migrated": True}),
+    (_MANIFEST, {"files_migrated": True, "files_confirmation_saved": "original-confirmation"}),
+    (_SAVED, {**_READY, "files_confirmation_saved": "original-confirmation"}),
+    (_SAVED, {**_MIGRATED, "files_confirmation_saved": "original-confirmation"}),
+    (_SAVED, {**_OMITTED, "files_confirmation_saved": "original-confirmation"}),
+    (_SAVED, {"state": "available", "files_confirmation_saved": "c", "files_confirmation_reason": "source"}),
+    (_SAVED_REASON, {"files_confirmation_reason": "source"}),
+    (_SAVED_REASON, {**_READY, "files_confirmation_reason": "source", "files_confirmation_absent": "c"}),
+    (_ABSENT, {**_READY, "files_confirmation_absent": "c"}),
+    (_ABSENT, {**_MIGRATED, "files_confirmation_absent": "c"}),
+    (_ABSENT, {**_OMITTED, "files_confirmation_absent": "c"}),
+    (_ABSENT, {"files_confirmation_saved": "c", "files_confirmation_absent": "c"}),
+    (_ABSENT, {"files_confirmation_absent": "c", "files_confirmation_pending": "c"}),
+    (_ABSENT, {**_READY, "files_confirmation_absent": "c", "files_confirmation_pending": "c"}),
+    (_PENDING_CONFIRMATION, {**_READY, "files_confirmation_pending": "c"}),
+    (_PENDING_CONFIRMATION, {"state": "available", "files_confirmation_pending": "c"}),
+    (_PENDING_CONFIRMATION, {"reason": "task_access_denied", "files_confirmation_pending": "c"}),
+    (_PENDING_CONFIRMATION, {"reason": None, "files_confirmation_pending": "c"}),
+    (_PENDING_CONFIRMATION, {"reason": "scan_pending", "files_confirmation_pending": "c"}),
+    (_PENDING_CONFIRMATION, {**_MIGRATED, "files_confirmation_pending": "c"}),
+    (_PENDING_CONFIRMATION, {**_OMITTED, "files_confirmation_pending": "c"}),
+    (_PENDING_CONFIRMATION, {"files_confirmation_saved": "c", "files_confirmation_pending": "c"}),
+])
+def test_environment_view_names_the_first_broken_transition_rule(message, change):
+    from shared_context.behavior_native_turn_wire import NativeEnvironmentView
+
+    with pytest.raises(ValidationError) as caught:
+        NativeEnvironmentView.model_validate_json(json.dumps({**_PENDING, **change}))
+    assert [error["msg"] for error in caught.value.errors()] == [f"Value error, {message}"]

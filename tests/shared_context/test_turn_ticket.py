@@ -131,3 +131,125 @@ def test_completed_turn_cannot_use_a_withdrawn_registry_for_a_new_admission(synt
         c.control.submit(c.human, command)
     assert failure.value.body["error"]["code"] == "BEHAVIOR_BINDING_DENIED"
     assert c.control.store._guard() == guard
+
+
+# --- Work admitted before turn tickets: no turn_authorization and no cached ticket, so model_session keeps the light
+# principal/registry/ticket check (the docstring's "legacy instructions").
+
+def _legacy(assistant, monkeypatch):
+    turn = _opened(assistant)
+    record = turn.control.records[turn.binding.binding_id]
+    monkeypatch.setitem(turn.control.records, turn.binding.binding_id,
+                        record.model_copy(update={"turn_authorization": None}))
+    monkeypatch.delitem(turn.h.assistant.turn_tickets._tickets, turn.sid)
+    monkeypatch.setattr(turn.h.assistant.turn_tickets, "authenticate",
+                        lambda *args, **kwargs: pytest.fail("legacy work has no turn ticket to authenticate"))
+    return turn
+
+
+def _legacy_session(turn, *, binding_id=None, ticket=None, principal=None):
+    return turn.h.assistant.model_session(binding_id or turn.binding.binding_id, turn.sid,
+                                          turn.ticket if ticket is None else ticket, principal or turn.principal)
+
+
+def _denied(call):
+    with pytest.raises(Problem) as failure:
+        call()
+    return failure.value.status, failure.value.body["error"]["code"], failure.value.body["error"]["message"]
+
+
+UNKNOWN = (403, "BEHAVIOR_BINDING_DENIED", "unknown authorized binding")
+UNASSIGNED = (403, "BEHAVIOR_BINDING_DENIED", "principal is not assigned to this binding")
+NO_TICKET = (403, "ASSISTANT_TICKET_DENIED", "server-issued binding ticket is required")
+
+
+def test_legacy_work_reads_its_session_with_the_light_registry_check(assistant, monkeypatch):
+    turn = _legacy(assistant, monkeypatch)
+    monkeypatch.setattr(turn.h.assistant, "current_session", lambda *args, **kwargs: pytest.fail("light check only"))
+    reads = []
+    original = turn.h.store._read_physical
+
+    def read(row_key, model):
+        reads.append(row_key)
+        return original(row_key, model)
+    monkeypatch.setattr(turn.h.store, "_read_physical", read)
+    session = _legacy_session(turn)
+    assert session.binding_id == turn.binding.binding_id and session.state == "running"
+    assert "behavior:v1:row:" + key("session", turn.sid) in reads
+    assert "behavior:v1:row:" + turn.control.registry_key in reads
+
+
+@pytest.mark.parametrize("change", ["no-record", "not-instruction", "other-binding", "historical", "no-work-policy"])
+def test_work_outside_the_light_check_keeps_the_full_current_session_check(assistant, monkeypatch, change):
+    turn = _legacy(assistant, monkeypatch)
+    binding_id, records = turn.binding.binding_id, turn.control.records
+    if change == "no-record":
+        monkeypatch.delitem(records, binding_id)
+    elif change == "not-instruction":
+        record = records[binding_id]
+        monkeypatch.setitem(records, binding_id, record.model_copy(update={
+            "profile": record.profile.model_copy(update={"instruction": None})}))
+    elif change == "other-binding":
+        changed = turn.h.runtime.bindings[binding_id].model_copy(update={"event_id": "another"})
+        monkeypatch.setattr(turn.h.runtime, "bindings", {**turn.h.runtime.bindings, binding_id: changed})
+    elif change == "historical":
+        monkeypatch.setattr(turn.h.runtime, "historical_binding_ids", frozenset({binding_id}))
+    else:
+        monkeypatch.setattr(turn.h.runtime, "work_policy", None)
+    full = []
+    monkeypatch.setattr(turn.h.assistant, "current_session", lambda *args: full.append(args) or "full check")
+    assert _legacy_session(turn) == "full check"
+    assert full == [(binding_id, turn.sid, turn.ticket, turn.principal)]
+
+
+def test_legacy_work_without_its_binding_keeps_the_full_current_session_check(assistant, monkeypatch):
+    turn = _legacy(assistant, monkeypatch)
+    monkeypatch.setattr(turn.h.runtime, "bindings", {
+        binding_id: binding for binding_id, binding in turn.h.runtime.bindings.items()
+        if binding_id != turn.binding.binding_id})
+    monkeypatch.setattr(turn.h.assistant, "current_session", lambda *args: "full check")
+    assert _legacy_session(turn) == "full check"
+
+
+@pytest.mark.parametrize("change, refusal", [
+    ("not-a-principal", UNKNOWN),
+    ("no-execute", (403, "BEHAVIOR_ACCESS_DENIED", "principal cannot perform this action in the requested team")),
+    ("other-team", (403, "BEHAVIOR_ACCESS_DENIED", "principal cannot perform this action in the requested team")),
+    ("other-tenant", UNASSIGNED), ("other-agent", UNASSIGNED), ("human-with-agent-oid", UNASSIGNED),
+    ("human", NO_TICKET),
+])
+def test_legacy_work_refuses_a_principal_not_assigned_to_it_before_any_read(assistant, monkeypatch, change, refusal):
+    turn = _legacy(assistant, monkeypatch)
+    principal, binding = turn.principal, turn.binding
+    changes = {"no-execute": {"actions": frozenset({"read", "submit"})}, "other-team": {"team": "another-team"},
+               "other-tenant": {"tenant_id": "another-tenant"}, "other-agent": {"oid": "another-agent"},
+               "human-with-agent-oid": {"kind": "human", "actor_id": None},
+               "human": {"kind": "human", "actor_id": None, "oid": binding.human_oid}}
+    principal = (SimpleNamespace(**vars(principal)) if change == "not-a-principal"
+                 else replace(principal, **changes[change]))
+    if change != "human":
+        monkeypatch.setattr(turn.h.store, "_read_physical", lambda *_: pytest.fail("refused before Table"))
+    assert _denied(lambda: _legacy_session(turn, principal=principal)) == refusal
+
+
+def test_legacy_work_removed_from_the_registry_is_refused(assistant, monkeypatch):
+    turn = _legacy(assistant, monkeypatch)
+    admission = turn.control.records[turn.binding.binding_id].admission_id
+    listed = turn.h.store.read_snapshot((turn.control.registry_key,))[turn.control.registry_key]
+    turn.h.mutate(turn.control.registry_key,
+                  entries=[entry for entry in listed.payload["data"]["entries"] if entry != admission])
+    assert _denied(lambda: _legacy_session(turn)) == UNKNOWN
+
+
+@pytest.mark.parametrize("change", ["wrong-ticket", "plain-string"])
+def test_legacy_work_needs_the_server_issued_ticket(assistant, monkeypatch, change):
+    turn = _legacy(assistant, monkeypatch)
+    ticket = SecretStr("0" * 64) if change == "wrong-ticket" else turn.ticket.get_secret_value()
+    assert _denied(lambda: _legacy_session(turn, ticket=ticket)) == NO_TICKET
+
+
+def test_legacy_ticket_bound_to_another_assignment_is_refused(assistant, monkeypatch):
+    turn = _legacy(assistant, monkeypatch)
+    turn.h.mutate(key("session", turn.sid), binding_id="another-assignment")
+    assert _denied(lambda: _legacy_session(turn)) == (
+        403, "ASSISTANT_BINDING_DENIED", "ticket is bound to another assignment")

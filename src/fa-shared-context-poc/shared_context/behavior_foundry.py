@@ -2025,19 +2025,19 @@ class FoundryExecutor:
         if any(client.credential is None for client in self.clients.values()):
             raise Problem(403, "NATIVE_CREDENTIAL_DISABLED", "all exact native executor transports require server credentials")
 
-    def _cleanup_instruction_session(self,launch,*,retire=False):
-        if not self.authority.workers.instruction(launch.start.binding.job_id):return
+    def _stops_instruction_session(self,launch,retire):
+        """An instruction's session stops after its work, except a conversation's (only on reset) or a version refusal's."""
+        if not self.authority.workers.instruction(launch.start.binding.job_id):return False
         if launch.native_invocation_id is None:
             fence_key = native_key("unclaimed-fence", launch.launch_id)
             fence = self.authority.store.read_snapshot((fence_key,))[fence_key]
             if fence is not None and fence.payload["data"].get("failure_code") == SESSION_VERSION_CHANGED:
-                return
+                return False
         record=self.authority.workers.work_policy._job_record(launch.start.binding.job_id)
-        if record.hosted_session_id is not None and not retire:return
-        import logging
-        store=self.authority.store
-        key=native_key("instruction-session-stop",launch.launch_id)
-        value=InstructionSessionStop(launch_id=launch.launch_id,job_id=launch.start.binding.job_id,target=launch.target)
+        return record.hosted_session_id is None or retire
+
+    def _reserve_session_stop(self,launch,key,value):
+        """True only for the one commit that reserves this stop; a replay reads the original reservation."""
         request=ControlRequest(request_id=key,request_digest=_digest(value.model_dump(mode="json")),
                                read_set=(native_key("launch",launch.launch_id),key))
         fresh=False
@@ -2048,8 +2048,16 @@ class FoundryExecutor:
                 raise Problem(409,"NATIVE_SESSION_CLEANUP_FENCED","only this completed original work's session may stop")
             fresh=True
             return ControlChanges(writes=(self.authority._write(key,value),),result={"reserved":True})
-        store.transact(request,decide)
-        if not fresh:return
+        self.authority.store.transact(request,decide)
+        return fresh
+
+    def _cleanup_instruction_session(self,launch,*,retire=False):
+        if not self._stops_instruction_session(launch,retire):return
+        import logging
+        store=self.authority.store
+        key=native_key("instruction-session-stop",launch.launch_id)
+        value=InstructionSessionStop(launch_id=launch.launch_id,job_id=launch.start.binding.job_id,target=launch.target)
+        if not self._reserve_session_stop(launch,key,value):return
         original=self.clients[launch.target.executor_id]
         client=original if original.target==launch.target else original.for_target(launch.target)
         try:client.stop_session()

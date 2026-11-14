@@ -370,7 +370,8 @@ def test_a_rerun_after_the_commit_writes_the_marker_a_crash_left_out(source, mon
     monkeypatch.setattr(native_open_rids, "mark_complete", mark)
     assert source.call(cut_session, probe(), command).state == "ready"
     marked = _open_set(V2, monkeypatch)
-    assert (marked.complete_for, marked.complete_since) == (V2.session_id, "cut-crash")
+    # The rerun does not keep the scan's Responses finding, so it marks the set as if it had seen one.
+    assert (marked.complete_for, marked.complete_since, marked.responses) == (V2.session_id, "cut-crash", True)
 
 
 def test_a_files_cut_without_a_destination_helper_is_refused_and_writes_nothing(source):
@@ -425,7 +426,109 @@ def test_a_full_scan_goes_on_across_calls_from_its_first_etag(history, reads, mo
     lines = cut_lines(caplog)
     assert "outcome=scanning" in lines[0] and "scan=full" in lines[0] and "calls=1" in lines[0]
     assert "outcome=ready" in lines[1] and "scan=full" in lines[1] and "calls=2" in lines[1]
+    assert f" total_receipts={HISTORY + 2} " in lines[1], "Every receipt the full scan read is counted once"
     assert _open_set(V2, monkeypatch).complete_for == V2.session_id
+
+
+def _fields(line):
+    return dict(part.split("=", 1) for part in line.split() if "=" in part)
+
+
+def test_a_resumed_scan_logs_this_calls_numbers_and_the_attempts_totals(history, reads, monkeypatch, caplog):
+    """Gate 7: ``receipts``/``scan_ms`` are this call's; ``total_*`` add the earlier calls' kept in ``following:``."""
+    _not_adopting(monkeypatch)
+    caplog.set_level(logging.WARNING)
+    _partial_cut(monkeypatch, request_id="cut-v2", expected_etag=history.etag)
+    kept = items()[following_key(V2.session_id)][0]["cut"]
+    assert _cut(V2, monkeypatch, request_id="cut-v2", settled_session_ids=[GHOST],
+                expected_etag=history.etag)["state"] == "ready"
+    first, second = (_fields(line) for line in cut_lines(caplog))
+    assert int(first["receipts"]) > 0 and int(second["receipts"]) > 0
+    assert (first["total_receipts"], first["total_scan_ms"]) == (first["receipts"], first["scan_ms"])
+    assert (kept["calls"], kept["receipts"], kept["scan_ms"]) == (
+        1, int(first["receipts"]), int(first["total_scan_ms"]))
+    assert int(second["total_receipts"]) == int(first["receipts"]) + int(second["receipts"])
+    assert int(second["total_scan_ms"]) == int(first["total_scan_ms"]) + int(second["scan_ms"])
+    assert (first["outcome"], first["reason"], first["mode"], first["calls"]) == (
+        "scanning", "scan_pending", "cut", "1")
+    assert (second["outcome"], second["reason"], second["calls"], second["source_session_id"],
+            second["session_id"], second["files_required"]) == ("ready", "None", "2", SOURCE, V2.session_id, "False")
+    assert second["request_id_prefix"] == "cut-v2"
+
+
+def _refused(call):
+    with pytest.raises(Problem) as refused:
+        call()
+    return refused.value.status, refused.value.body["error"]["code"], str(refused.value)
+
+
+def test_a_cut_naming_another_source_than_the_agents_is_refused_and_writes_nothing(source):
+    before = items()
+    assert _refused(lambda: source.call(cut_session, probe(), NativeSessionCut(
+        request_id="cut-other", expected_session_id="offline-other-source", expected_etag=before["agent"][1]))) == (
+        409, "NATIVE_ENVIRONMENT_CONFLICT", "the original Agent environment comparison changed")
+    assert items() == before
+
+
+def test_a_rerun_from_another_source_than_the_commits_is_refused(source):
+    e0 = items()["agent"][1]
+    assert source.call(cut_session, probe(), NativeSessionCut(
+        request_id="cut-direct", expected_session_id=SOURCE, expected_etag=e0)).state == "ready"
+    after = items()
+    assert _refused(lambda: source.call(cut_session, probe(), NativeSessionCut(
+        request_id="cut-direct", expected_session_id="offline-other-source", expected_etag=e0))) == (
+        409, "NATIVE_ENVIRONMENT_CONFLICT", "this session already holds the Agent from another source")
+    assert items() == after
+
+
+@pytest.mark.parametrize("other", ["request", "destination"])
+def test_another_pending_than_this_cuts_own_fence_is_refused(source, tmp_path, other):
+    files = NativeWorkspaceFiles(tmp_path / "destination-files")
+    source.call(cut_session, probe(workspace_files=files), NativeSessionCut(
+        request_id="cut-files", expected_session_id=SOURCE, files_required=True))
+    fenced = items()
+    identity, request_id = (V2, "cut-again") if other == "request" else (V3, "cut-files")
+    assert _refused(lambda: source.call(cut_session, probe(identity, workspace_files=files), NativeSessionCut(
+        request_id=request_id, expected_session_id=SOURCE, files_required=True))) == (
+        409, "NATIVE_ENVIRONMENT_CONFLICT", "another environment transition is pending")
+    assert items() == fenced
+
+
+@pytest.mark.parametrize("lost", ["deleted", "another_request"])
+def test_a_rerun_of_the_fence_without_its_own_progress_is_unknown(source, tmp_path, lost):
+    destination = probe(workspace_files=NativeWorkspaceFiles(tmp_path / "destination-files"))
+    command = NativeSessionCut(request_id="cut-files", expected_session_id=SOURCE, files_required=True)
+    source.call(cut_session, destination, command)
+
+    async def lose():
+        async with FoundryStateStore(TURNS_STORE) as store:
+            key = following_key(V2.session_id)
+            if lost == "deleted":
+                await store.delete_item(key)
+            else:
+                item = await store.get_item(key)
+                value = json.loads(json.dumps(item.value))
+                value["view"]["request_id"] = "cut-another"
+                await store.set_item(key, value, if_match=item.etag)
+
+    asyncio.run(lose())
+    before = items()
+    assert _refused(lambda: source.call(cut_session, destination, command)) == (
+        503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original cut progress is missing")
+    assert items() == before
+
+
+def test_a_commit_failure_other_than_a_lost_cas_is_raised_not_answered_busy(source, monkeypatch, caplog):
+    async def failed(*args, **kwargs):
+        raise Problem(503, "NATIVE_STATE_UNAVAILABLE", "the store is down")
+
+    monkeypatch.setattr(native_environment, "_save_agent", failed)
+    caplog.set_level(logging.WARNING)
+    before = items()
+    assert _refused(lambda: source.call(cut_session, probe(), NativeSessionCut(
+        request_id="cut-down", expected_session_id=SOURCE, expected_etag=before["agent"][1]))) == (
+        503, "NATIVE_STATE_UNAVAILABLE", "the store is down")
+    assert items()["agent"] == before["agent"] and not cut_lines(caplog)
 
 
 def _withdraw(etag, pending_request_id, pending_session_id=V2.session_id, *, request_id="withdraw-one"):
@@ -636,3 +739,332 @@ def test_the_commit_adopts_what_a_previous_sid_never_started(history, monkeypatc
     adopted = items()["rid:ghost-accepted"][0]
     assert adopted["adopted_from"] == GHOST and adopted["receipt"]["hosted_session_id"] == V2.session_id
     assert _open_set(V2, monkeypatch).complete_for == V2.session_id
+
+
+def _not_adopting(monkeypatch):
+    monkeypatch.setattr(native_left_receipts, "adopt_left", lambda runtime, source=None, rids=None: asyncio.sleep(0))
+
+
+def _partial_cut(monkeypatch, **fields):
+    """One ``_cut`` call whose scan reads one page, then meets its deadline (``scan_pending``)."""
+    scan_page, pages = native_environment._scan_page, []
+
+    async def one_page(*args, **kwargs):
+        if pages:
+            raise TimeoutError
+        pages.append(1)
+        return await scan_page(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(native_environment, "_scan_page", one_page)
+        answer = _cut(V2, monkeypatch, settled_session_ids=[GHOST], **fields)
+    assert (answer["state"], answer["reason"]) == ("current", "scan_pending"), answer
+    return answer
+
+
+@pytest.mark.parametrize("change", ["request", "etag"])
+def test_a_cut_after_another_attempts_partial_scan_starts_its_own(history, reads, monkeypatch, caplog, change):
+    """Another request, or an ``agent`` ETag moved since that scan's E0: a new attempt that scans from the start."""
+    _not_adopting(monkeypatch)
+    caplog.set_level(logging.WARNING)
+    _partial_cut(monkeypatch, request_id="cut-v2", expected_etag=history.etag)
+    etag, request_id = history.etag, "cut-v2-again"
+    if change == "etag":
+        async def touch():
+            async with FoundryStateStore(TURNS_STORE) as store:
+                item = await store.get_item("agent")
+                await store.set_item("agent", item.value, if_match=item.etag)
+                return (await store.get_item("agent")).etag
+
+        etag, request_id = asyncio.run(touch()), "cut-v2"
+        assert etag != history.etag
+    reads.clear()
+    assert _cut(V2, monkeypatch, request_id=request_id, settled_session_ids=[GHOST],
+                expected_etag=etag)["state"] == "ready"
+    assert len(set(reads)) == HISTORY + 2  # every receipt again, from the first page
+    second = _fields(cut_lines(caplog)[1])
+    assert (second["outcome"], second["calls"], second["total_receipts"]) == ("ready", "1", second["receipts"])
+    assert _open_set(V2, monkeypatch).responses is False
+
+
+def test_a_resumed_scan_keeps_the_responses_its_earlier_calls_saw(history, monkeypatch):
+    _not_adopting(monkeypatch)
+    _partial_cut(monkeypatch, request_id="cut-v2", expected_etag=history.etag)
+    key = following_key(V2.session_id)
+    assert items()[key][0]["responses"] is False
+
+    async def seen():  # as if that first page had held a Responses receipt
+        async with FoundryStateStore(TURNS_STORE) as store:
+            item = await store.get_item(key)
+            await store.set_item(key, {**item.value, "responses": True}, if_match=item.etag)
+
+    asyncio.run(seen())
+    asked = []
+
+    class Recording(Quiet):
+        async def quiet(self, sid, *, task_id=None, include_responses=False):
+            asked.append(include_responses)
+            return True
+
+    runtime = _runtime(V2, monkeypatch)
+    runtime.task_observer = Recording()
+    assert _cut(V2, monkeypatch, request_id="cut-v2", settled_session_ids=[GHOST], expected_etag=history.etag,
+                runtime=runtime)["state"] == "ready"
+    assert asked and all(asked)
+    assert _open_set(V2, monkeypatch).responses is True
+
+
+def test_a_files_cut_scanning_across_calls_keeps_its_files_requirement(history, tmp_path, monkeypatch):
+    runtime = _runtime(V2, monkeypatch)
+    runtime.workspace_files = NativeWorkspaceFiles(tmp_path / "destination-files")
+    _partial_cut(monkeypatch, request_id="cut-files", files_required=True, runtime=runtime)
+    kept = items()[following_key(V2.session_id)][0]
+    assert (kept["files_required"], kept["cut"]["calls"]) == (True, 1)
+
+
+def test_a_rerun_after_the_commit_adopts_what_the_commit_left_unadopted(history, monkeypatch):
+    command = {"request_id": "cut-adopt", "settled_session_ids": [GHOST], "expected_etag": history.etag}
+    with monkeypatch.context() as patch:
+        _not_adopting(patch)
+        assert _cut(V2, monkeypatch, **command)["state"] == "ready"
+    assert "adopted_from" not in items()["rid:ghost-accepted"][0]
+    assert _cut(V2, monkeypatch, **command)["state"] == "ready"
+    adopted = items()["rid:ghost-accepted"][0]
+    assert adopted["adopted_from"] == GHOST and adopted["receipt"]["hosted_session_id"] == V2.session_id
+
+
+def test_the_cut_names_the_files_profile_of_the_environment_it_replaces(source, tmp_path):
+    preparation, files = items()["agent"][0]["preparation"], NativeWorkspaceFiles(tmp_path / "v2-files")
+    assert not files.root.exists()
+    first = source.call(cut_session, probe(workspace_files=files),
+                        NativeSessionCut(request_id="cut-v2", expected_session_id=SOURCE,
+                                         expected_etag=items()["agent"][1]))
+    assert (first.state, first.files_profile, files.root.is_dir()) == ("ready", "fa-workspace-files-v1", True)
+    assert first.previous_files_profile == preparation.get("files_profile") != first.files_profile
+    second = source.call(cut_session, probe(V3), NativeSessionCut(
+        request_id="cut-v3", expected_session_id=V2.session_id, expected_etag=items()["agent"][1]))
+    assert (second.state, second.previous_hosted_session_id, second.previous_files_profile, second.files_profile) == (
+        "ready", V2.session_id, "fa-workspace-files-v1", None)
+
+
+def test_a_files_cut_answers_its_fence_and_adopts_nothing_yet(source, tmp_path, monkeypatch, caplog):
+    adopted = []
+
+    async def recorded(runtime, source=None, rids=None):
+        adopted.append(source)
+
+    monkeypatch.setattr(native_left_receipts, "adopt_left", recorded)
+    caplog.set_level(logging.WARNING)
+    view = source.call(cut_session, probe(workspace_files=NativeWorkspaceFiles(tmp_path / "destination-files")),
+                       NativeSessionCut(request_id="cut-files", expected_session_id=SOURCE, files_required=True))
+    assert (view.state, adopted) == ("pending", [])
+    assert items()[following_key(V2.session_id)][0]["responses"] is False
+    [line] = cut_lines(caplog)
+    assert _fields(line)["outcome"] == "files_pending"
+
+
+def test_a_files_cut_of_an_agent_record_without_following_support_is_refused(source, tmp_path):
+    async def older():
+        async with FoundryStateStore(TURNS_STORE) as store:
+            item = await store.get_item("agent")
+            assert item.value["following_supported"] is True
+            await store.set_item("agent", {key: value for key, value in item.value.items()
+                                           if key != "following_supported"}, if_match=item.etag)
+
+    asyncio.run(older())
+    before = items()
+    view = source.call(cut_session, probe(workspace_files=NativeWorkspaceFiles(tmp_path / "destination-files")),
+                       NativeSessionCut(request_id="cut-old", expected_session_id=SOURCE, files_required=True))
+    assert (view.state, view.reason) == ("current", "files_unsupported")
+    assert items() == before
+    ready = source.call(cut_session, probe(), NativeSessionCut(
+        request_id="cut-old-direct", expected_session_id=SOURCE, expected_etag=before["agent"][1]))
+    assert ready.state == "ready" and items()["agent"][0]["following_supported"] is True
+
+
+def test_a_restore_probe_without_a_destination_helper_is_refused_and_writes_nothing(source):
+    from shared_context.native_files_wire import NativeFilesManifest
+
+    manifest = NativeFilesManifest(
+        agent_id=IDENTITY.agent_id, request_id="restore-offline", source_session_id=SOURCE,
+        source_agent_version=IDENTITY.agent_version, target_session_id=V2.session_id,
+        target_agent_version=V2.agent_version, root_mode=0o755, entries=())
+    before = items()
+    view = source.call(cut_session, probe(), NativeSessionCut(
+        request_id="cut-restore", expected_session_id=SOURCE, mode="probe", files_restore=manifest))
+    assert (view.state, view.reason) == ("current", "files_unsupported")
+    assert items() == before
+
+
+def test_each_partial_call_adds_its_numbers_to_the_kept_totals(history, monkeypatch, caplog):
+    _not_adopting(monkeypatch)
+    caplog.set_level(logging.WARNING)
+    for _ in range(2):
+        _partial_cut(monkeypatch, request_id="cut-v2", expected_etag=history.etag)
+    kept = items()[following_key(V2.session_id)][0]["cut"]
+    first, second = (_fields(line) for line in cut_lines(caplog))
+    assert int(first["receipts"]) > 0 and int(second["receipts"]) > 0 and second["calls"] == "2"
+    assert (kept["calls"], kept["receipts"], kept["scan_ms"]) == (
+        2, int(first["receipts"]) + int(second["receipts"]), int(first["scan_ms"]) + int(second["scan_ms"]))
+
+
+def test_a_cut_whose_deadline_falls_mid_page_keeps_its_place_in_the_page(history, monkeypatch):
+    _not_adopting(monkeypatch)
+    item_reader, list_keys, page = FoundryStateStore.get_item, FoundryStateStore.list_keys, []
+
+    async def listed(store, **kwargs):
+        page.clear()
+        return await list_keys(store, **kwargs)
+
+    async def deadline_at_the_third(store, key, **kwargs):
+        if store._name == TURNS_STORE and key.startswith("rid:"):
+            page.append(key)
+            if len(page) == 3:
+                await asyncio.sleep(5)  # the scan's deadline cancels this read, the third of its page
+        return await item_reader(store, key, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(native_environment, "_SCAN_SECONDS", 1.0)
+        patch.setattr(FoundryStateStore, "list_keys", listed)
+        patch.setattr(FoundryStateStore, "get_item", deadline_at_the_third)
+        first = _cut(V2, monkeypatch, request_id="cut-v2", settled_session_ids=[GHOST], expected_etag=history.etag)
+    assert (first["state"], first["reason"]) == ("current", "scan_pending"), first
+    kept = items()[following_key(V2.session_id)][0]
+    assert kept["page_offset"] >= 2 and kept["page_digest"]
+
+
+def test_a_files_cut_writes_its_record_then_the_saved_environment_then_the_fence(source, tmp_path, monkeypatch):
+    written, set_item, create_item = [], FoundryStateStore.set_item, FoundryStateStore.create_item
+
+    async def set_recorded(store, key, value, **kwargs):
+        if store._name == TURNS_STORE:
+            written.append(key)
+        return await set_item(store, key, value, **kwargs)
+
+    async def create_recorded(store, key, value, **kwargs):
+        if store._name == TURNS_STORE:
+            written.append(key)
+        return await create_item(store, key, value, **kwargs)
+
+    monkeypatch.setattr(FoundryStateStore, "set_item", set_recorded)
+    monkeypatch.setattr(FoundryStateStore, "create_item", create_recorded)
+    source.call(cut_session, probe(workspace_files=NativeWorkspaceFiles(tmp_path / "destination-files")),
+                NativeSessionCut(request_id="cut-files", expected_session_id=SOURCE, files_required=True))
+    assert [key for key in written if key in {following_key(V2.session_id), "environment-before:cut-files", "agent"}] == [
+        following_key(V2.session_id), "environment-before:cut-files", "agent"]
+
+
+def _fenced(source, tmp_path):
+    source.call(cut_session, probe(workspace_files=NativeWorkspaceFiles(tmp_path / "destination-files")),
+                NativeSessionCut(request_id="cut-files", expected_session_id=SOURCE, files_required=True))
+    return items()
+
+
+def test_a_withdraw_naming_no_pending_of_the_agents_is_refused_and_writes_nothing(source):
+    before = items()
+    assert _refused(lambda: source.call(withdraw_session, probe(V3), _withdraw(before["agent"][1], "cut-none"))) == (
+        409, "NATIVE_ENVIRONMENT_CONFLICT", "the named pending transition is not the Agent's")
+    assert items() == before
+
+
+def test_a_withdraw_at_an_older_etag_is_refused_and_writes_nothing(source, tmp_path):
+    fenced = _fenced(source, tmp_path)
+    assert _refused(lambda: source.call(withdraw_session, probe(V3), _withdraw("OFFLINE-older", "cut-files"))) == (
+        409, "NATIVE_ENVIRONMENT_CONFLICT", "the pending transition changed; read it again")
+    assert items() == fenced
+
+
+def test_a_withdraw_whose_saved_environment_names_another_session_is_unavailable(source, tmp_path):
+    fenced = _fenced(source, tmp_path)
+
+    async def retarget():
+        async with FoundryStateStore(TURNS_STORE) as store:
+            item = await store.get_item("environment-before:cut-files")
+            await store.set_item("environment-before:cut-files",
+                                 {**item.value, "hosted_session_id": "offline-other-source"}, if_match=item.etag)
+
+    asyncio.run(retarget())
+    before = items()
+    assert _refused(lambda: source.call(withdraw_session, probe(V3), _withdraw(fenced["agent"][1], "cut-files"))) == (
+        409, "NATIVE_ENVIRONMENT_UNAVAILABLE", "the environment before this pending transition can not be restored")
+    assert items() == before
+
+
+@pytest.mark.parametrize("step", ["progress", "save"])
+def test_a_withdraw_raises_a_store_failure_it_does_not_recognize(source, tmp_path, monkeypatch, step):
+    fenced = _fenced(source, tmp_path)
+
+    async def failed(*args, **kwargs):
+        raise Problem(503, "NATIVE_STATE_UNAVAILABLE", "the store is down")
+
+    monkeypatch.setattr(native_environment, "_original_progress" if step == "progress" else "_save_agent", failed)
+    assert _refused(lambda: source.call(withdraw_session, probe(V3), _withdraw(fenced["agent"][1], "cut-files"))) == (
+        503, "NATIVE_STATE_UNAVAILABLE", "the store is down")
+    assert items() == fenced
+
+
+def test_a_withdraw_whose_cas_lost_to_another_write_than_the_commit_is_refused(source, tmp_path, monkeypatch, caplog):
+    fenced = _fenced(source, tmp_path)
+
+    async def lost(*args, **kwargs):
+        raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original environment update is unconfirmed")
+
+    monkeypatch.setattr(native_environment, "_save_agent", lost)
+    caplog.set_level(logging.WARNING)
+    assert _refused(lambda: source.call(withdraw_session, probe(V3), _withdraw(fenced["agent"][1], "cut-files"))) == (
+        409, "NATIVE_ENVIRONMENT_CONFLICT", "the pending transition changed; read it again")
+    assert items() == fenced and "NATIVE_UPGRADE_WITHDRAWN" not in caplog.text
+
+
+@pytest.mark.parametrize("held", ["ready", "pending"])
+def test_a_withdraw_naming_another_request_than_the_agents_transition_is_refused(source, tmp_path, held):
+    if held == "ready":
+        source.call(cut_session, probe(), NativeSessionCut(
+            request_id="cut-direct", expected_session_id=SOURCE, expected_etag=items()["agent"][1]))
+        before = items()
+    else:
+        before = _fenced(source, tmp_path)
+    assert _refused(lambda: source.call(withdraw_session, probe(V3), _withdraw(before["agent"][1], "cut-other"))) == (
+        409, "NATIVE_ENVIRONMENT_CONFLICT", "the named pending transition is not the Agent's")
+    assert items() == before
+
+
+def test_a_withdraw_answer_names_the_admission_the_agent_holds(source, tmp_path):
+    fenced = _fenced(source, tmp_path)
+    state = source.call(withdraw_session, probe(V3), _withdraw(fenced["agent"][1], "cut-files"))
+
+    async def reserve():
+        async with FoundryStateStore(TURNS_STORE) as store:
+            item = await store.get_item("agent")
+            await store.set_item("agent", {**item.value, "admitting": {
+                "request_id": "admitting-rid", "submit_digest": source.base.submit_digest}}, if_match=item.etag)
+
+    asyncio.run(reserve())
+    again = source.call(withdraw_session, probe(V3), _withdraw(fenced["agent"][1], "cut-files"))
+    assert (state.admission_request_id, again.admission_request_id) == (None, "admitting-rid")
+
+
+def test_a_rebuilt_ready_view_keeps_what_the_pending_kept_and_a_resend_answers_it(source, caplog):
+    legacy = NativeEnvironmentView(
+        agent_id=IDENTITY.agent_id, request_id="legacy-follow", previous_hosted_session_id=SOURCE,
+        previous_agent_version=IDENTITY.agent_version, previous_files_profile="fa-workspace-files-v1",
+        hosted_session_id="offline-legacy-target", hosted_agent_version="2", state="pending",
+        reason="source_stop_required")
+
+    async def left_by_an_older_follow():
+        async with FoundryStateStore(TURNS_STORE) as store:
+            item = await store.get_item("agent")
+            await store.set_item("agent", {**item.value, "environment": _json(legacy)}, if_match=item.etag)
+            return (await store.get_item("agent")).etag
+
+    command = _withdraw(asyncio.run(left_by_an_older_follow()), "legacy-follow", "offline-legacy-target",
+                        request_id="withdraw-legacy")
+    caplog.set_level(logging.WARNING)
+    state = source.call(withdraw_session, probe(V3), command)
+    view = state.environment
+    assert (view.state, view.hosted_session_id, view.previous_hosted_session_id, view.previous_agent_version,
+            view.files_profile) == ("ready", SOURCE, "offline-legacy-target", "2", "fa-workspace-files-v1")
+    assert "restored=rebuilt" in caplog.text
+    restored = items()["agent"]
+    again = source.call(withdraw_session, probe(V3), command)
+    assert (again.environment, again.etag) == (view, restored[1]) and items()["agent"] == restored

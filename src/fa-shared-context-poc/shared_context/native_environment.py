@@ -354,7 +354,7 @@ async def _drain_pages(runtime, after, source_sid, task_id, *, responses=False, 
                     options["settled"] = settled
                 reason, after, responses = await _scan_page(
                     runtime, after, source_sid, task_id, responses=responses, progress=progress, **options)
-                if single_page or reason != "scan_pending" or deadline is not None and monotonic() >= deadline:
+                if single_page or reason != "scan_pending" or _deadline_passed(deadline):
                     return reason, after, responses
                 await asyncio.sleep(0)
     except Problem as error:
@@ -373,8 +373,17 @@ async def _drain_pages(runtime, after, source_sid, task_id, *, responses=False, 
         return "scan_pending", progress.after, progress.responses
 
 
+def _deadline_passed(deadline):
+    return deadline is not None and monotonic() >= deadline
+
+
+async def _receipt_read(operation, require_complete, progress, stage="read"):
+    """An omission check bounds and classifies each receipt store read; the other scans await it as is."""
+    return await (_check_read(operation, "receipt", progress=progress, stage=stage) if require_complete else operation)
+
+
 async def _scan_page(runtime, after, source_sid, task_id, *, responses=False, idle_only=False, require_complete=False,
-                     progress=None, deadline=None, page_limit=16, settled=frozenset()):
+                     progress, deadline=None, page_limit=16, settled=frozenset()):
     """``settled``: SIDs the API lists as previous (ADR-0009 §7a (i)); their unfinished receipts are not waited for
     and stay unchanged."""
     from .native_turns import TURNS_STORE
@@ -382,94 +391,100 @@ async def _scan_page(runtime, after, source_sid, task_id, *, responses=False, id
     manager = (_check_store(runtime, TURNS_STORE, "receipt", progress=progress)
                if require_complete else runtime._store(TURNS_STORE))
     async with manager as store:
-        page_read = store.list_keys(limit=page_limit, after=after)
-        page = (await _check_read(page_read, "receipt", progress=progress, stage="list")
-                if require_complete else await page_read)
-        page_digest = material_digest({
-            "entries": [(key.id, key.key) for key in page.keys],
-            "last_id": page.last_id, "has_more": page.has_more, "limit": page_limit})
-        offset = 0 if progress is None else progress.page_offset
-        if (offset > len(page.keys) or progress is not None and progress.page_digest is not None
-                and progress.page_digest != page_digest):
-            raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original receipt page changed before it was fully checked",
-                          files_check=NativeFilesCheckDetail(
-                              category="page_changed", stage="list", key_category="receipt",
-                              cursor_source=None if progress is None else progress.cursor_source).model_dump(exclude_none=True))
-        for index, key in enumerate(page.keys):
-            if index < offset:
-                continue
+        page = await _receipt_read(store.list_keys(limit=page_limit, after=after), require_complete, progress, stage="list")
+        page_digest = _resumed_page_digest(page, page_limit, progress)
+        for index, key in enumerate(page.keys[progress.page_offset:], progress.page_offset):
             if key.key.startswith("rid:"):
-                if progress is not None:
-                    progress.request_id_prefix = key.key[4:12]
-                    progress.conversation_id_prefix = None
-                receipt_read = store.get_item(key.key)
-                item = (await _check_read(receipt_read, "receipt", progress=progress)
-                        if require_complete else await receipt_read)
-                if progress is not None:
-                    progress.receipts += 1
-                original = runtime._check_rid(item, key.key[4:])
-                if _settled_open(original, settled):
-                    # It stays open: keep it in the open-RID set, so a later follow reading only the set still sees it.
-                    from .native_open_rids import add as add_open
-                    await add_open(runtime, (original.value.receipt.request_id,))
-                    if progress is not None:
-                        if not key.id:
-                            raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original receipt cursor is missing")
-                        progress.page_offset = index + 1
-                        progress.page_digest = page_digest
-                    continue
-                if original.value.receipt.state_profile == NATIVE_RESPONSES_PROFILE:
-                    responses = _responses_seen(progress)
-                receipt = (original.value.receipt if idle_only else
-                           await runtime.close_suspended_start(original, source_sid, task_id))
-                if progress is not None:
-                    progress.request_id_prefix = receipt.request_id[:8]
-                    progress.conversation_id_prefix = receipt.conversation_id[:8]
-                if receipt.status in {"accepted", "started"}:
-                    if progress is not None:
-                        progress.waiting_request_id = receipt.request_id
-                    if require_complete:
-                        raise Problem(409, "NATIVE_FILES_CONFIRMATION_REQUIRED",
-                                      "the original request is executing or waiting for input",
-                                      files_check=NativeFilesCheckDetail(
-                                          category="active_waiting", request_id_prefix=receipt.request_id[:8],
-                                          conversation_id_prefix=receipt.conversation_id[:8]).model_dump(exclude_none=True))
-                    return "accepted_or_started", after, responses
-                if require_complete:
-                    if receipt.status == "unknown":
-                        if progress is not None:
-                            progress.terminal_unknowns += 1
-                    if receipt.status == "completed":
-                        from .native_files_omission import check_latest_checkpoint
-                        try:
-                            await check_latest_checkpoint(runtime, receipt, progress=progress)
-                        except Problem as error:
-                            if "files_check" in error.body["error"]:
-                                raise
-                            raise Problem(error.status, error.body["error"]["code"],
-                                          "the original conversation checkpoint could not be verified",
-                                          files_check=NativeFilesCheckDetail(
-                                              category="checkpoint_unconfirmed", request_id_prefix=receipt.request_id[:8],
-                                              conversation_id_prefix=receipt.conversation_id[:8]).model_dump(exclude_none=True)) from None
-            if progress is not None:
-                if not key.id:
-                    raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original receipt cursor is missing")
-                progress.page_offset = index + 1
-                progress.page_digest = page_digest
-            if deadline is not None and monotonic() >= deadline and index + 1 < len(page.keys):
+                outcome, responses = await _scan_receipt(
+                    runtime, store, key.key, source_sid, task_id, responses=responses, idle_only=idle_only,
+                    require_complete=require_complete, progress=progress, settled=settled)
+                if outcome == "accepted_or_started":
+                    return outcome, after, responses
+            if not key.id:
+                raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original receipt cursor is missing")
+            progress.page_offset, progress.page_digest = index + 1, page_digest
+            if _deadline_passed(deadline) and index + 1 < len(page.keys):
                 return "scan_pending", after, responses
-        if progress is not None:
-            progress.page_offset, progress.page_digest = 0, None
-        if not page.has_more:
-            if progress is not None:
-                progress.after = None
-            return None, None, responses
-        if not page.last_id or page.last_id == after:
-            raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original receipt page did not advance")
-        if progress is not None:
-            progress.after = page.last_id
-            progress.cursor_source = "page_last_id"
-        return "scan_pending", page.last_id, responses
+        return _next_page(page, after, progress, responses)
+
+
+def _resumed_page_digest(page, page_limit, progress):
+    """The page's digest, once it is the page a resumed scan stopped on."""
+    page_digest = material_digest({
+        "entries": [(key.id, key.key) for key in page.keys],
+        "last_id": page.last_id, "has_more": page.has_more, "limit": page_limit})
+    if progress.page_offset > len(page.keys) or progress.page_digest not in (None, page_digest):
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original receipt page changed before it was fully checked",
+                      files_check=NativeFilesCheckDetail(
+                          category="page_changed", stage="list", key_category="receipt",
+                          cursor_source=progress.cursor_source).model_dump(exclude_none=True))
+    return page_digest
+
+
+def _next_page(page, after, progress, responses):
+    progress.page_offset, progress.page_digest = 0, None
+    if not page.has_more:
+        progress.after = None
+        return None, None, responses
+    if not page.last_id or page.last_id == after:
+        raise Problem(503, "NATIVE_ENVIRONMENT_UNKNOWN", "the original receipt page did not advance")
+    progress.after, progress.cursor_source = page.last_id, "page_last_id"
+    return "scan_pending", page.last_id, responses
+
+
+async def _scan_receipt(runtime, store, key, source_sid, task_id, *, responses, idle_only, require_complete, progress,
+                        settled):
+    """One ``rid:`` key: ``"accepted_or_started"`` or None, with ``responses``."""
+    progress.request_id_prefix, progress.conversation_id_prefix = key[4:12], None
+    item = await _receipt_read(store.get_item(key), require_complete, progress)
+    progress.receipts += 1
+    original = runtime._check_rid(item, key[4:])
+    if _settled_open(original, settled):
+        # It stays open: keep it in the open-RID set, so a later follow reading only the set still sees it.
+        from .native_open_rids import add as add_open
+        await add_open(runtime, (original.value.receipt.request_id,))
+        return None, responses
+    receipt, responses = await _decided_receipt(runtime, original, source_sid, task_id, idle_only=idle_only,
+                                                progress=progress, responses=responses)
+    if receipt.status in {"accepted", "started"}:
+        if require_complete:
+            raise Problem(409, "NATIVE_FILES_CONFIRMATION_REQUIRED", "the original request is executing or waiting for input",
+                          files_check=NativeFilesCheckDetail(
+                              category="active_waiting", request_id_prefix=receipt.request_id[:8],
+                              conversation_id_prefix=receipt.conversation_id[:8]).model_dump(exclude_none=True))
+        return "accepted_or_started", responses
+    if require_complete and receipt.status == "unknown":
+        progress.terminal_unknowns += 1
+    if require_complete and receipt.status == "completed":
+        await _checkpoint_verified(runtime, receipt, progress)
+    return None, responses
+
+
+async def _checkpoint_verified(runtime, receipt, progress):
+    from .native_files_omission import check_latest_checkpoint
+
+    try:
+        await check_latest_checkpoint(runtime, receipt, progress=progress)
+    except Problem as error:
+        if "files_check" in error.body["error"]:
+            raise
+        raise Problem(error.status, error.body["error"]["code"], "the original conversation checkpoint could not be verified",
+                      files_check=NativeFilesCheckDetail(
+                          category="checkpoint_unconfirmed", request_id_prefix=receipt.request_id[:8],
+                          conversation_id_prefix=receipt.conversation_id[:8]).model_dump(exclude_none=True)) from None
+
+
+async def _decided_receipt(runtime, original, source_sid, task_id, *, idle_only, progress, responses):
+    """The receipt a scan decides on (a suspended start closed first, unless the scan only reads), with
+    ``responses``; an accepted or started one becomes ``progress.waiting_request_id``."""
+    if original.value.receipt.state_profile == NATIVE_RESPONSES_PROFILE:
+        responses = _responses_seen(progress)
+    receipt = original.value.receipt if idle_only else await runtime.close_suspended_start(original, source_sid, task_id)
+    progress.request_id_prefix = receipt.request_id[:8]
+    progress.conversation_id_prefix = receipt.conversation_id[:8]
+    if receipt.status in {"accepted", "started"}:
+        progress.waiting_request_id = receipt.request_id
+    return receipt, responses
 
 
 def _settled_open(original, settled):
@@ -508,14 +523,9 @@ async def _scan_open(runtime, open_set, source_sid, task_id, *, responses, idle_
             original = runtime._check_rid(item, rid)
             if _settled_open(original, settled):
                 continue
-            if original.value.receipt.state_profile == NATIVE_RESPONSES_PROFILE:
-                responses = _responses_seen(progress)
-            receipt = (original.value.receipt if idle_only else
-                       await runtime.close_suspended_start(original, source_sid, task_id))
-            progress.request_id_prefix = receipt.request_id[:8]
-            progress.conversation_id_prefix = receipt.conversation_id[:8]
+            receipt, responses = await _decided_receipt(runtime, original, source_sid, task_id, idle_only=idle_only,
+                                                        progress=progress, responses=responses)
             if receipt.status in {"accepted", "started"}:
-                progress.waiting_request_id = receipt.request_id
                 return "accepted_or_started", None, responses
             # Terminal, still listed: its own removal failed or never ran (a crash in between, an older writer).
             await remove_open(runtime, rid)
@@ -594,48 +604,45 @@ async def _freeze_files_for_retarget(runtime, original, request_id):
     return record.view.source_invocation_refused
 
 
-async def retarget_session(runtime, command):
-    from .native_turns import TURNS_STORE, _changed, _decode
+async def _retarget_intent(runtime, command, current, etag, key):
+    """The saved intent of ``command.request_id``; its first call checks the pending transition and saves one."""
+    from .native_turns import TURNS_STORE, _decode
 
-    if runtime.identity.agent_version != command.expected_agent_version:
-        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the destination is not the explicitly selected version")
-    current, etag = await runtime._agent_record()
-    key, progress_key = _retarget_keys(command.request_id)
     async with runtime._store(TURNS_STORE) as store:
         saved = await store.get_item(key)
-    if saved is None:
-        original = current.environment
-        if (original is None or original.state != "pending"
-                or original.request_id != command.pending_request_id
-                or original.hosted_session_id != command.pending_session_id
-                or original.previous_hosted_session_id != command.expected_session_id
-                or current.hosted_session_id != command.expected_session_id
-                or etag != command.expected_etag or command.request_id == original.request_id
-                or runtime.identity.session_id in {original.previous_hosted_session_id, original.hosted_session_id}
-                or int(runtime.identity.agent_version) <= int(original.hosted_agent_version)):
-            raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original pending transition or new version changed")
-        original_progress, _, _ = await _original_progress(runtime, original)
-        target = NativeEnvironmentView(
-            agent_id=runtime.identity.agent_id, request_id=command.request_id,
-            previous_hosted_session_id=original.previous_hosted_session_id,
-            previous_agent_version=original.previous_agent_version,
-            previous_files_profile=original.previous_files_profile,
-            source_invocation_refused=original.source_invocation_refused or original_progress.view.source_invocation_refused,
-            hosted_session_id=runtime.identity.session_id, hosted_agent_version=runtime.identity.agent_version,
-            state="pending", reason="source_stop_required",
-        )
-        intent = _Retarget(original=original, target=target)
-        async with runtime._store(TURNS_STORE) as store:
-            await runtime._immutable(store, key, intent)
-    else:
-        intent = _decode(saved.value, _Retarget)
-    target, original = intent.target, intent.original
-    if ((target.agent_id, target.hosted_session_id, target.hosted_agent_version, target.request_id)
-            != (runtime.identity.agent_id, runtime.identity.session_id, runtime.identity.agent_version, command.request_id)
-            or original.request_id != command.pending_request_id
-            or original.hosted_session_id != command.pending_session_id
-            or target.previous_hosted_session_id != command.expected_session_id):
-        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "this retarget ID already names another original operation")
+    if saved is not None:
+        return _decode(saved.value, _Retarget)
+    original = current.environment
+    if (original is None
+            or (original.state, original.request_id, original.hosted_session_id, original.previous_hosted_session_id,
+                current.hosted_session_id, etag)
+            != ("pending", command.pending_request_id, command.pending_session_id, command.expected_session_id,
+                command.expected_session_id, command.expected_etag)
+            or command.request_id == original.request_id
+            or runtime.identity.session_id in {original.previous_hosted_session_id, original.hosted_session_id}
+            or int(runtime.identity.agent_version) <= int(original.hosted_agent_version)):
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original pending transition or new version changed")
+    original_progress, _, _ = await _original_progress(runtime, original)
+    target = NativeEnvironmentView(
+        agent_id=runtime.identity.agent_id, request_id=command.request_id,
+        previous_hosted_session_id=original.previous_hosted_session_id,
+        previous_agent_version=original.previous_agent_version,
+        previous_files_profile=original.previous_files_profile,
+        source_invocation_refused=original.source_invocation_refused or original_progress.view.source_invocation_refused,
+        hosted_session_id=runtime.identity.session_id, hosted_agent_version=runtime.identity.agent_version,
+        state="pending", reason="source_stop_required",
+    )
+    intent = _Retarget(original=original, target=target)
+    async with runtime._store(TURNS_STORE) as store:
+        await runtime._immutable(store, key, intent)
+    return intent
+
+
+def _selected_retarget(current, original, target):
+    """The view to answer when the Agent already selected ``target``, else None; the original pending operation must
+    still be the Agent's."""
+    from .native_turns import _changed
+
     selected = current.environment
     if selected is not None and (
             selected.request_id, selected.hosted_session_id, selected.hosted_agent_version,
@@ -648,41 +655,73 @@ async def retarget_session(runtime, command):
             != original.model_dump(exclude={"source_invocation_refused"})
             or current.hosted_session_id != original.previous_hosted_session_id):
         raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the original pending operation is no longer current")
+    return None
+
+
+async def _retarget_record(runtime, command, target, progress_key):
+    """This retarget's own following record (written by its first call) with its cursor, and its ETag."""
     record, record_etag = await _read(runtime, key=progress_key)
     if record is None:
         record = _Following(view=target, responses=False, files_required=runtime.workspace_files is not None,
                             idle_only=command.idle_only)
         await _progress(runtime, record, None, key=progress_key)
         record, record_etag = await _read(runtime, key=progress_key)
-    if (record is None or record.view.request_id != target.request_id
-            or record.view.hosted_session_id != target.hosted_session_id):
+    if (record is None or (record.view.request_id, record.view.hosted_session_id)
+            != (target.request_id, target.hosted_session_id)):
         raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the new environment is reserved by another operation")
-    record = _with_cursor(record)
+    return _with_cursor(record), record_etag
+
+
+async def _retarget_scan(runtime, current, original, record):
+    """The reason the source still holds the retarget back (None when quiet), the cursor, and ``record`` with the
+    scan's progress."""
+    from .native_turns import _changed
+
     if current.admitting is not None:
-        reason, after, responses = "admission_pending", record.after, record.responses
-    else:
-        progress = _ScanProgress.from_record(record)
-        reason, after, responses = await _drain_pages(
-            runtime, record.after, original.previous_hosted_session_id, current.task_id,
-            responses=record.responses, idle_only=record.idle_only or record.files_required, progress=progress,
-            restart_changed_page=record.idle_only)
-        record = _changed(record, page_offset=progress.page_offset, page_digest=progress.page_digest,
-                          waiting_request_id=progress.waiting_request_id)
-        if reason is None:
-            reason = await _tasks_pending(runtime, current, original.previous_hosted_session_id, responses=responses)
-    record = _changed(record, responses=responses)
+        return "admission_pending", record.after, record
+    progress = _ScanProgress.from_record(record)
+    reason, after, responses = await _drain_pages(
+        runtime, record.after, original.previous_hosted_session_id, current.task_id,
+        responses=record.responses, idle_only=record.idle_only or record.files_required, progress=progress,
+        restart_changed_page=record.idle_only)
+    record = _changed(record, page_offset=progress.page_offset, page_digest=progress.page_digest,
+                      waiting_request_id=progress.waiting_request_id)
+    if reason is None:
+        reason = await _tasks_pending(runtime, current, original.previous_hosted_session_id, responses=responses)
+    return reason, after, _changed(record, responses=responses)
+
+
+async def retarget_session(runtime, command):
+    from .native_turns import _changed
+
+    if runtime.identity.agent_version != command.expected_agent_version:
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "the destination is not the explicitly selected version")
+    current, etag = await runtime._agent_record()
+    key, progress_key = _retarget_keys(command.request_id)
+    intent = await _retarget_intent(runtime, command, current, etag, key)
+    target, original = intent.target, intent.original
+    if ((target.agent_id, target.hosted_session_id, target.hosted_agent_version, target.request_id,
+         original.request_id, original.hosted_session_id, target.previous_hosted_session_id)
+            != (runtime.identity.agent_id, runtime.identity.session_id, runtime.identity.agent_version, command.request_id,
+                command.pending_request_id, command.pending_session_id, command.expected_session_id)):
+        raise Problem(409, "NATIVE_ENVIRONMENT_CONFLICT", "this retarget ID already names another original operation")
+    reentered = _selected_retarget(current, original, target)
+    if reentered is not None:
+        return reentered
+    record, record_etag = await _retarget_record(runtime, command, target, progress_key)
+    reason, after, record = await _retarget_scan(runtime, current, original, record)
     if reason is not None:
         pending = _changed(record, view=_changed(target, reason=reason), after=after)
         await _progress(runtime, pending, record_etag, key=progress_key)
         return pending.view
     await _compatible_retarget_following(runtime, target)
     refused = await _freeze_files_for_retarget(runtime, original, command.request_id)
-    if refused or selected.source_invocation_refused or record.view.source_invocation_refused:
+    if refused or current.environment.source_invocation_refused or record.view.source_invocation_refused:
         target = _changed(target, source_invocation_refused=True)
     await _save_agent(runtime, current, etag, _changed(current, environment=target))
-    target = _changed(target, reason="files_pending" if record.files_required else "source_stop_required")
-    await _progress(runtime, _changed(record, phase="files" if record.files_required else "stopping",
-                                      after=None, view=target), record_etag, key=progress_key)
+    reason, phase = ("files_pending", "files") if record.files_required else ("source_stop_required", "stopping")
+    target = _changed(target, reason=reason)
+    await _progress(runtime, _changed(record, phase=phase, after=None, view=target), record_etag, key=progress_key)
     return target
 
 

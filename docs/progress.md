@@ -1,8 +1,29 @@
 # FA 進度與交接狀態
 
-更新日期：2026-11-07。
+更新日期：2026-11-12。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="r16-close-1112"></a>
+## 2026-11-12：第十六輪品質整理完成與環境整理
+
+- 第十六輪品質整理完成（#1235～#1241），數字見[基準頁](code-quality-baseline.md#第十六輪結果2026-11-08-至-12)；其中 #1241 是行為改變（settled 收據也照讀取期限停下），其餘不改行為。
+- stage 刪掉多餘的 Jobs Operator 角色指派（Neal 11-12 同意），只保留 Jobs Contributor。
+- CI 部署只用 ARM 的 start／read／stop 與 Log Analytics，下次 stage 部署才算實證。
+- stage 與 dev 的 WebIQ 連線金鑰已輪替（`deploy/<env>/new_webiq_connection.py --rotate`）。
+- 輪替後 Neal 在 stage 送了一則會用到 WebIQ 的回合，總協調唯讀查 log：工具呼叫成功、回合完成（原始輸出不在 repo）。先前的 -32006 推測來自過期金鑰；`-32006` 也是要 Connect 卡時的錯誤碼（見 [connector-design](connector-design.md)），沒有逐一核對。dev 的 WebIQ 在 dev 部署 run 4892（main `23b348d0`）的測試用一則回合確認，沒有 -32006；測試報告會附在下一個 stage release PR 本文，目前不在 repo。
+- stage 第 46 版：上面那則 Neal 送的回合即為第 46 版的真實回合，完成正常（同樣只有總協調的 log 讀回）。
+- 本機 repo venv 的 github-copilot-sdk 已升到 1.0.26（先前 1.0.13 造成 7 個本機假失敗）。
+- 第十六輪沒有部署，也沒有上 stage。
+
+<a id="stage-v46-1108"></a>
+## 2026-11-08：stage 第 46 版（建置時匯入檢查與第十五輪品質整理）
+
+- **第 46 版**（#1233，`2026.11.08-46`，Neal 台灣時間 11-08 14:24 合併，merge `8542bd5a`）：建置時用 3.11 逐一匯入 shared_context 模組（缺套件的略過）（#1221）；第十五輪品質整理（#1227～#1231）；文件（#1226、#1232）。使用者看不到新功能。
+  - **部署**：deploy-staging run 42454601811 成功（release-gate 14:24、deploy 14:25～14:37）。
+  - **public-sync**：run 42455534492 成功（14:37～14:44），第二道 `gate 2: PASS`，公開 tag `v2026.11.08-46`。
+  - **dev 測試**：run 4891，main `68c2370d`，報告在 #1233 本文。
+  - **沒有驗證**（11-08 當時；11-12 已補，見 [r16-close-1112](#r16-close-1112)）：stage 上沒有人實際送過回合測第 46 版；第 45 版的 stage 真人回合也還在等 Neal。stage Jobs Contributor、Jobs Operator 兩筆指派刪不刪，仍等 Neal。
 
 <a id="stage-v44-v45-1107"></a>
 ## 2026-11-06～07：stage 第 44、45 版（掃描 PDF、批准規則可審計、自動允許修正）
