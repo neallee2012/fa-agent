@@ -2,23 +2,21 @@
 
 import copy
 from contextvars import Context
-from dataclasses import replace
 
 import httpx
 import pytest
 
-from shared_context.behavior_assistant import _LocalHttp
-from shared_context.behavior_assistant_hosted import AssistantClient
 from shared_context.behavior_capabilities import available_grants
 from shared_context.behavior_delegation import delegation_key, state_key
-from shared_context.behavior_delegation_wire import DelegationObservation, DelegationReply
+from shared_context.behavior_delegation_wire import DelegationReply
 from test_behavior_assistant import assistant
-from test_conversation_profile_selection import select, template
-from test_delegation_api import preparation
-from test_instruction_flow import instruction_models, runtime_path
+from conversation_profile_selection_helpers import select, template
+from instruction_flow_helpers import instruction_models, runtime_path
+from legacy_console_rows_helpers import load_rows, stored_console
 from test_m3_auth import jwk_client, signing_key
-from test_web_test_console_attachments import draft, picker, submit
-from test_web_test_console_frozen_interface import open_ui
+from test_web_test_console_attachments import picker
+from web_test_console_attachments_helpers import draft
+from web_test_console_frozen_interface_helpers import open_ui
 from web_test_console.adapter import ConsoleError, canonical, sha
 
 
@@ -31,34 +29,30 @@ def delegated_console(picker):
         user_text_file_profile="fa-user-text-files-v1", capabilities=(grants["fa-delegate-v1"].ref,)))
     assert selected.status_code == 200, selected.text
     c.selection_id = selected.json()["result"]["selection_id"]
+    # The retired submit admitted this work; its job started under an issued assignment.
+    c.task = stored_console(c, "console-delegation-base")["task"]
     c.original = draft(c)
-    accepted = submit(c)
-    assert accepted.status_code == 200, accepted.text
-    c.task = accepted.json()["task"]
     c.binding = c.h.runtime.bindings[c.task["binding_id"]]
     c.cid = c.task["admission"]["conversation_id"]
     c.remote = f"/work-policy/v1/conversations/{c.cid}/turns/1/delegation"
     c.local = f"/api/instructions/{c.task['task_id']}/delegation"
-    starts = []
-    c.h.workers.adapter = replace(c.h.workers.adapter, start=lambda value: starts.append(value))
-    c.h.workers.start(c.binding.job_id, c.binding.owner)
-    c.assignment, ticket = c.h.assistant.issue(starts[0])
-    c.agent = AssistantClient("https://context.invalid", c.assignment, ticket,
-        token_provider=lambda: c.h.headers("agent")["Authorization"][7:], transport=_LocalHttp(c.h.client))
-    c.agent.acquire()
-    try:
-        yield c
-    finally:
-        c.agent.close()
+    return c
+
+
+def ledger(c, event, **call):
+    """The stored rows once the retired agent session sent `event` (`call`) to the delegation ledger; its reply."""
+    facts = load_rows(c.h, "console-delegation-" + event)
+    c.control.refresh()
+    assert facts["call"] == call
+    return DelegationReply.model_validate_json(canonical(facts["reply"]))
 
 
 def prepare(c):
-    return c.agent.delegation("prepare", preparation())
+    return ledger(c, "prepared")
 
 
 def observe(c, event_id, kind, **fields):
-    return c.agent.delegation("observe", DelegationObservation(event_id=event_id,
-        tool_call_id=preparation().tool_call_id, kind=kind, **fields))
+    return ledger(c, event_id, kind=kind, **fields)
 
 
 def started(c):

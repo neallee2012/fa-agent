@@ -27,7 +27,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
 from deployment_config import config_path, load_config
 
-STAGE = load_config()
+STAGE = None  # the selected profile, loaded by main() from --config or FA_DEPLOY_CONFIG
 RUNTIME = HERE / "runtime"
 API = "api-version=2025-01-01"
 REQUEST_ID, INSTALLATION_ID = "stage-fresh-001", "stage-native-v1"
@@ -231,7 +231,7 @@ def rebuild_plan(runtime_dir, scalars, planned):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", help="environment profile; defaults to FA_DEPLOY_CONFIG or the checked-in stage profile")
+    parser.add_argument("--config", help="environment profile; required unless FA_DEPLOY_CONFIG is set")
     parser.add_argument("--runtime-dir", type=Path,
                         help="generated runtime directory; defaults to <config>/runtime")
     parser.add_argument("--work", type=Path, required=True)

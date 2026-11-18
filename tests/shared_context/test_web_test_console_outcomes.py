@@ -10,16 +10,17 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
-from test_web_test_console_attachments import draft, picker, submit
+from legacy_console_rows_helpers import stored_console
+from test_web_test_console_attachments import picker
 
 
 @pytest.mark.parametrize("stage", [None, "create_unknown", "created", "upload_unknown", "saved"])
 def test_skill_draft_outcome_wire_does_not_block_original_conversation_progress(picker, stage):
     c = picker
-    original = draft(c)
-    accepted = submit(c)
-    assert accepted.status_code == 200, accepted.text
-    cid = accepted.json()["task"]["admission"]["conversation_id"]
+    # One old conversation whose work the retired submit admitted.
+    facts = stored_console(c, "console-picker-submitted")
+    original = facts["draft"]
+    cid = facts["task"]["admission"]["conversation_id"]
     outcome = None if stage is None else SkillDraftOutcome(
         schema_version="fa-skill-draft-outcome-v1",
         receipt_id="a" * 64, intent_sha256="b" * 64, stage=stage,
@@ -59,8 +60,8 @@ def test_skill_draft_outcome_wire_does_not_block_original_conversation_progress(
 
 def test_invalid_skill_draft_wire_preserves_the_original_readable_projection(picker):
     c = picker
-    original = draft(c)
-    accepted = submit(c).json()["task"]
+    facts = stored_console(c, "console-picker-submitted")
+    original, accepted = facts["draft"], facts["task"]
     cid = accepted["admission"]["conversation_id"]
     url, params = "/api/instructions/progress", {"thread_id": original["thread_id"]}
     assert c.browser.ui.get(url, params=params).status_code == 200

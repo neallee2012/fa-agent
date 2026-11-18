@@ -136,7 +136,6 @@ def test_group_failure_guidance_requires_the_registered_tool_and_known_code(name
 @pytest.mark.parametrize("outcome", ["completed", "unconfirmed"])
 def test_group_publication_failure_never_prevents_the_original_peer_notification(tmp_path, monkeypatch, outcome):
     from shared_context import native_sdk
-    from shared_context.behavior_assistant_hosted import AssistantSupervisor
     from shared_context.errors import Problem
     from shared_context.native_agent_tools import NativeAgentRelayClient
     from shared_context.native_group_tools import NativeGroupClient
@@ -172,7 +171,7 @@ def test_group_publication_failure_never_prevents_the_original_peer_notification
     }.items():
         monkeypatch.setenv(name, value)
     runtime = native_sdk.native_runtime_from_environment(SimpleNamespace(
-        identity=IDENTITY, supervisor=AssistantSupervisor(home / ".fa-assistant-v12", runtime_path=runtime_path),
+        identity=IDENTITY, root=home / ".fa-assistant-v12",
         api=SimpleNamespace(api_url="https://api.invalid", audience="api://OFFLINE")))
     async def settled(*_args):
         return None
@@ -199,7 +198,6 @@ def test_a_refused_peer_rids_notice_also_posts_its_group_completion(tmp_path, mo
     """#915: every notification of a RID refused by version (``refused:<RID>``) runs ``on_unconfirmed``, so it also
     posts the group ``/complete`` for that RID after the peer notice (the API publishes once per RID)."""
     from shared_context import native_sdk
-    from shared_context.behavior_assistant_hosted import AssistantSupervisor
     from shared_context.behavior_private_memory import STORE_ENV
     from shared_context.native_agent_tools import NativeAgentRelayClient
     from shared_context.native_group_tools import NativeGroupClient
@@ -236,7 +234,7 @@ def test_a_refused_peer_rids_notice_also_posts_its_group_completion(tmp_path, mo
     }.items():
         monkeypatch.setenv(name, value)
     runtime = native_sdk.native_runtime_from_environment(SimpleNamespace(
-        identity=IDENTITY, supervisor=AssistantSupervisor(home / ".fa-assistant-v12", runtime_path=runtime_path),
+        identity=IDENTITY, root=home / ".fa-assistant-v12",
         api=SimpleNamespace(api_url="https://api.invalid", audience="api://OFFLINE")))
     _, _, _, _, root = sender_case()
     # The read-time view the notification task hands over (``_refused_final``; its shape is pinned in

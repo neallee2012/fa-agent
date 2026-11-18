@@ -24,7 +24,7 @@ from shared_context.behavior_delivery import (
     ChannelContract, DeliveryCore, PendingIndexRecord, QuotaRecord, ReadinessEvidence,
     Route, RuntimeContract, RuntimeRegistration, VerifiedWorkResult, WorkDefinition,
 )
-from shared_context.behavior_effects import GOAL_REVIEW, WorkGoalUpdate, WorkStateEffectAdapter
+from shared_context.behavior_effects import WorkStateEffectAdapter
 from shared_context.behavior_inbox import INBOX_CHANNEL_ID, INBOX_VERSION, InboxRegistration, PullInbox
 from shared_context.behavior_operations import (
     BudgetRecord, ExecutionContext, OwnerRecord, PolicyRecord, ToolBrokerCore, control_key,
@@ -226,6 +226,11 @@ class RuntimeHarness:
         assert response.status_code == 200, response.text
         return response
 
+    def submit_direct(self, request_id="submit-one"):
+        """Same admission as submit(), entering through BehaviorRuntime.submit instead of the HTTP route."""
+        principal = self.verifier(self.client.build_request("GET", "/", headers=self.headers()))
+        return self.runtime.submit(self.binding.binding_id, wire.SubmitWork(request_id=request_id), principal)
+
 
 @pytest.fixture
 def h(auth, jwk_client, signing_key):
@@ -233,7 +238,7 @@ def h(auth, jwk_client, signing_key):
 
 
 def test_full_authenticated_submit_worker_result_exact_pull_and_ack(h):
-    assert h.submit().json()["state"] == "queued"
+    assert h.submit_direct().state == "queued"
     result = h.runtime.controller.step("binding-one")
     assert result.state == "succeeded" and result.result_forwarded
     assert len(h.executor.starts) == 1
@@ -254,7 +259,7 @@ def test_full_authenticated_submit_worker_result_exact_pull_and_ack(h):
     assert ack.json()["result"]["channel_version"] == binding.channel_version
     assert ack.json()["result"]["fulfillment_receipt_id"]
     assert h.post("/delivery/acknowledge", acknowledgment).json() == ack.json()
-    assert h.post("/work/submit", wire.SubmitWork(request_id="submit-one")).json()["obligation_fulfilled"]
+    assert h.submit_direct().obligation_fulfilled
     assert len(h.executor.starts) == 1
 
 
@@ -373,45 +378,9 @@ def test_sources_snapshot_review_claim_current_and_exact_context_use_real_module
     assert h.post("/snapshots/snapshot-one/verify", wire.Command(request_id="snapshot")).status_code == 403
 
 
-def test_exact_human_approval_does_not_allow_rewriting_an_enqueued_work(h):
-    h.submit()
-    grant_key = control_key("grant", "grant")
-    assert h.store.read_snapshot((grant_key,))[grant_key] is None
-    inspected = h.adapter.inspect("work-one", CTX)
-    h.references["goal"] = WorkGoalUpdate(
-        work_id="work-one", obligation_id=h.binding.obligation_id, expected_etag=inspected.etag,
-        expected_definition_digest=inspected.definition_digest, goal=GOAL_REVIEW,
-    )
-    prepared = h.post("/operation/prepare", wire.OperationPrepare(request_id="prepare", input_ref="goal"), "agent")
-    assert prepared.status_code == 200, prepared.text
-    result = prepared.json()["result"]
-    preview = h.client.get(BASE + "/operation", headers=h.headers())
-    assert preview.status_code == 200
-    assert preview.json()["content"] == result["content"]
-    assert preview.json()["execution_window_contract"] == "fa-table-work-effect-1"
-    assert preview.json()["strict_service_commit_time_expiry_supported"] is False
-    approval = wire.OperationApproval(
-        request_id="approval", decision_id="decision", description_digest=result["description_digest"],
-        adapter_contract_digest=result["adapter_contract_digest"], expires_at=NOW + timedelta(minutes=2),
-    )
-    assert h.post("/operation/approve", approval, "agent").status_code == 403
-    assert h.post("/operation/approve", approval, "read-only-human").status_code == 403
-    granted = h.post("/operation/approve", approval)
-    assert granted.status_code == 200, granted.text
-    assert h.post("/operation/approve", approval).json() == granted.json()
-    executed = h.post("/operation/execute", wire.Command(request_id="execute"), "agent")
-    assert executed.status_code == 409, executed.text
-    assert executed.json()["error"]["code"] == "BEHAVIOR_CONFLICT"
-    assert executed.json()["error"]["reconcile_original"] is False
-    assert h.post("/operation/execute", wire.Command(request_id="execute"), "agent").json() == executed.json()
-    assert h.adapter.inspect("work-one", CTX) == inspected
-    assert h.store.read_snapshot((grant_key,))[grant_key].payload["data"]["remaining_uses"] == 1
-    assert h.runtime.controller.step("binding-one").state == "succeeded"
-
-
 @pytest.mark.parametrize("identity,path", [
-    ("old-m3", "/work/submit"), ("human", "/jobs/job-one/consume"),
-    ("agent", "/delivery/acknowledge"), ("read-only-human", "/operation/approve"),
+    ("old-m3", "/sources/metrics/commit"), ("human", "/jobs/job-one/consume"),
+    ("agent", "/delivery/acknowledge"),
 ])
 def test_route_grants_are_not_inferred_from_json_or_old_m3_consent(h, identity, path):
     count = len(h.transport.requests)
@@ -429,7 +398,7 @@ def test_route_grants_are_not_inferred_from_json_or_old_m3_consent(h, identity, 
     b'{"request_id":"one","clock":"2099-01-01"}',
 ])
 def test_duplicate_unknown_or_authority_fields_rejected_without_echoing_raw_input(h, raw):
-    response = h.client.post(BASE + "/work/submit", content=raw, headers=h.headers())
+    response = h.client.post(BASE + "/sources/metrics/commit", content=raw, headers=h.headers())
     assert response.status_code == 422
     assert "SYNTHETIC_SECRET" not in response.text
 
@@ -447,8 +416,8 @@ def test_authentication_precedes_stream_reads_even_for_oversized_body(h):
 
         await h.app({
             "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
-            "method": "POST", "scheme": "https", "path": BASE + "/work/submit",
-            "raw_path": (BASE + "/work/submit").encode(), "query_string": b"",
+            "method": "POST", "scheme": "https", "path": BASE + "/sources/metrics/commit",
+            "raw_path": (BASE + "/sources/metrics/commit").encode(), "query_string": b"",
             "headers": [(b"content-type", b"application/json"), (b"content-length", b"100000")],
             "client": ("local", 1), "server": ("local", 443), "root_path": "",
         }, receive, send)
@@ -462,7 +431,9 @@ def test_current_policy_revocation_blocks_normal_and_replayed_access(h):
     h.mutate(control_key("policy", "policy"), active=False)
     assert h.client.get(BASE + "/sources/metrics/versions/1", headers=h.headers()).status_code == 403
     assert h.post("/sources/metrics/commit", wire.Command(request_id="source-one")).status_code == 403
-    assert h.post("/work/submit", wire.SubmitWork(request_id="new")).status_code == 403
+    with pytest.raises(Problem) as refused:
+        h.submit_direct("new")
+    assert refused.value.status == 403
 
 
 def test_unknown_source_commit_reconciles_original_without_resubmission(h):
@@ -506,14 +477,13 @@ def test_applied_source_response_loss_reads_original_receipt_and_exact_bytes(h):
 
 def test_admission_plan_and_authenticated_evidence_are_atomic_across_lost_ack(h):
     h.transport.after_apply = "lost"
-    result = h.post("/work/submit", wire.SubmitWork(request_id="original"))
-    assert result.status_code == 503
+    with pytest.raises(Problem) as lost:
+        h.submit_direct("original")
+    assert lost.value.status == 503
     h.transport.after_apply = None
     # The captured admission/evidence time must survive a restart/retry.
     h.time += timedelta(seconds=1)
-    result = h.post("/work/submit", wire.SubmitWork(request_id="original"))
-    assert result.status_code == 200, result.text
-    assert result.json()["state"] == "queued" and len(h.executor.starts) == 0
+    assert h.submit_direct("original").state == "queued" and len(h.executor.starts) == 0
 
 
 @pytest.mark.parametrize("original", [
@@ -529,39 +499,19 @@ def test_unsafe_original_never_enters_plan_checkpoint_or_normal_output(h, origin
 
 
 def test_authenticated_body_bounds_duplicate_headers_and_wrong_binding_are_explicit(h):
-    response = h.client.post(BASE + "/work/submit", content=b"x" * (24 * 1024 + 1), headers=h.headers())
+    response = h.client.post(BASE + "/sources/metrics/commit", content=b"x" * (24 * 1024 + 1), headers=h.headers())
     assert response.status_code == 413
     headers = list(h.headers().items())
     headers.append(("Authorization", h.headers()["Authorization"]))
-    assert h.client.post(BASE + "/work/submit", content="{}", headers=headers).status_code == 401
-    assert h.client.post(BASE.replace("binding-one", "other") + "/work/submit",
-                         content=wire.SubmitWork(request_id="x").model_dump_json(), headers=h.headers()).status_code == 403
+    assert h.client.post(BASE + "/sources/metrics/commit", content="{}", headers=headers).status_code == 401
+    assert h.client.post(BASE.replace("binding-one", "other") + "/sources/metrics/commit",
+                         content=wire.Command(request_id="x").model_dump_json(), headers=h.headers()).status_code == 403
     assert h.client.get(BASE + "/jobs/other-job", headers=h.headers()).status_code == 403
-    assert h.client.post(BASE + "/work/submit?approved=true", content="{}", headers=h.headers()).status_code == 422
-
-
-def test_human_can_revoke_only_exact_current_grant_without_releasing_reservations(h):
-    h.submit()
-    version = h.adapter.inspect("work-one", CTX)
-    h.references["goal"] = WorkGoalUpdate(work_id="work-one", obligation_id=h.binding.obligation_id,
-                                         expected_etag=version.etag, expected_definition_digest=version.definition_digest,
-                                         goal=GOAL_REVIEW)
-    prepared = h.post("/operation/prepare", wire.OperationPrepare(request_id="p", input_ref="goal"), "agent").json()["result"]
-    approval = wire.OperationApproval(request_id="a", decision_id="a", description_digest=prepared["description_digest"],
-                                      adapter_contract_digest=prepared["adapter_contract_digest"], expires_at=NOW + timedelta(minutes=1))
-    assert h.post("/operation/approve", approval).status_code == 200
-    revoke = wire.OperationRevocation(request_id="r", decision_id="r", description_digest=approval.description_digest,
-                                     expected_revocation_revision=0)
-    assert h.post("/operation/revoke", revoke, "agent").status_code == 403
-    accepted = h.post("/operation/revoke", revoke)
-    assert accepted.status_code == 200
-    assert h.post("/operation/revoke", revoke).json() == accepted.json()
-    assert h.post("/operation/execute", wire.Command(request_id="x"), "agent").status_code == 403
-    assert h.adapter.inspect("work-one", CTX).definition_digest == version.definition_digest
+    assert h.client.post(BASE + "/sources/metrics/commit?approved=true", content="{}", headers=h.headers()).status_code == 422
 
 
 def test_worker_start_response_loss_reconciles_same_job_without_second_start(h):
-    h.submit()
+    h.submit_direct()
     h.executor.fail_after_apply = True
     with pytest.raises(Problem):
         h.runtime.controller.step("binding-one")

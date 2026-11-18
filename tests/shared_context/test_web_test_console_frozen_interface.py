@@ -13,8 +13,10 @@ from fastapi.testclient import TestClient
 from conftest import A, TENANT
 from test_m3_auth import signing_key, jwk_client
 from test_web_test_console_browser_fixture import assistant_harness
-from test_work_policy_lifecycle import enabled
-from test_web_test_console_standing import configuration
+from assistant_api_helpers import assistant_api, picker_api
+from instruction_flow_helpers import instruction_models
+from work_policy_lifecycle_helpers import enabled
+from web_test_console_standing_helpers import configuration
 from shared_context import behavior_assistant_wire as aw
 from shared_context.behavior_assistant import _LocalHttp
 from shared_context.behavior_assistant_hosted import AssistantClient, AssistantSession
@@ -29,24 +31,14 @@ from web_test_console.adapter import parse_config, canonical, sha
 from web_test_console.bridge import create_app
 from web_test_console.instructions import InstructionConnection
 from web_test_console.freeform import InstructionReply, ConversationProjection, AvailableModels
+from web_test_console_frozen_interface_helpers import open_ui, post, complete
 
 
 FIXTURES=Path(__file__).parent/"fixtures"/"web_test_console"
 
 
-def open_ui(c):
-    app=create_app(c.config,c.journal,backend=c.backend,token_provider=lambda:c.h.headers()["Authorization"][7:],
-        clock=lambda:c.h.time,environment="OFFLINE_TEST",instruction_connection=c.connection)
-    ui=TestClient(app,base_url="http://127.0.0.1:8765")
-    ui.get("/")
-    headers={"Origin":"http://127.0.0.1:8765","X-Console-CSRF":ui.get("/api/state").json()["csrf"]}
-    authenticated=ui.post("/api/authenticate",json={},headers=headers)
-    assert authenticated.status_code==200,authenticated.text
-    return SimpleNamespace(app=app,ui=ui,headers=headers)
-
-
-def test_sidebar_agent_is_derived_from_the_actual_bound_configuration(real_interface):
-    c = real_interface
+def test_sidebar_agent_is_derived_from_the_actual_bound_configuration(picker_api):
+    c = picker_api
     state = c.browser.ui.get("/api/state").json()
     assert state["agents"] == [{"id": c.config.standing_policy.template.agent_oid,
                                "name": "FA 助理", "description": "目前配置的工作助理"}]
@@ -155,84 +147,6 @@ def real_interface(auth,jwk_client,signing_key,tmp_path,tmp_path_factory,monkeyp
     c.browser.ui.close();c.backend.close();h.client.close()
 
 
-def post(c,path,body=None):
-    return c.browser.ui.post(path,json=body or {},headers=c.browser.headers)
-
-
-def complete(c,binding_id):
-    try:
-        state=c.h.runtime.controller.step(binding_id)
-    except Problem:
-        if c.sdk_errors:raise c.sdk_errors[0]
-        if c.errors:raise c.errors[0]
-        raise
-    if c.errors:raise c.errors[0]
-    assert state.state=="succeeded" and state.result_forwarded
-    return state
-
-
-@pytest.mark.parametrize("separator", ["\n", "\u0085", "\u2028", "\u2029"],
-                         ids=["lf", "next-line", "line-separator", "paragraph-separator"])
-def test_frozen_http_table_two_turns_cold_archive_original_text_model_and_repeatable_reply(real_interface, separator):
-    c=real_interface
-    first=c.browser.ui.get("/api/state").json()["composer"]
-    text="  請以白話描述雨聲。"+separator+"原文不截斷🙂  "
-    sent=post(c,"/api/instructions/"+first["request_id"]+"/submit",{"content":text,"model":"gpt-4.1-mini"})
-    assert sent.status_code==200,sent.text
-    one=sent.json()["task"]
-    complete(c,one["binding_id"])
-    before=copy.deepcopy(c.h.transport.backing.rows)
-    journal_before=c.journal.read_bytes()
-    observed=c.browser.ui.get("/api/instructions/progress?thread_id="+first["thread_id"])
-    assert observed.status_code==200,observed.text
-    assert c.h.transport.backing.rows==before and c.journal.read_bytes()==journal_before
-    state=observed.json()
-    item=next(t for t in state["tasks"] if t["task_id"]==first["request_id"])
-    assert item["reply"]["data"]["text"]=="OFFLINE SDK I/O substitute reply 1"
-    assert item["acknowledgment"]["state"]=="NOT_SENT" and state["composer"]["can_follow_up"]
-    second=post(c,"/api/instructions/"+first["thread_id"]+"/next").json()["composer"]
-    follow=post(c,"/api/instructions/"+second["request_id"]+"/submit",
-                {"content":"請補充前文的節奏。","model":"configured-second-model"})
-    assert follow.status_code==200,follow.text
-    two=follow.json()["task"]
-    pending=c.browser.ui.get("/api/state?thread_id="+first["thread_id"]).json()["composer"]
-    assert pending["can_follow_up"] is False
-    assert pending["can_reset"] is False
-    complete(c,two["binding_id"])
-    outcome=c.browser.ui.get("/api/instructions/progress?thread_id="+first["thread_id"])
-    assert outcome.status_code==200,outcome.text
-    first_io,second_io=c.sdk_calls
-    assert first_io["prompt"]==text and not first_io["resume"]
-    assert second_io["resume"] and second_io["prior_user_messages"]==[text]
-    assert first_io["sid"]==second_io["sid"]
-    assert second_io["model"]=="configured-second-model"
-    assert first_io["timeout_seconds"] is None and second_io["timeout_seconds"] is None
-    stable=copy.deepcopy(c.h.transport.backing.rows)
-    for _ in range(10):
-        read=c.browser.ui.get("/api/instructions/"+second["request_id"]+"/reply")
-        assert read.status_code==200,read.text
-    assert c.h.transport.backing.rows==stable
-    assert len(c.starts)==2 and len(c.sdk_calls)==2
-    assert not any(v["path"].endswith(("/delivery/pull","/acknowledge")) for v in c.calls)
-    confirmed=post(c,"/api/instructions/"+second["request_id"]+"/confirm-reply")
-    assert confirmed.status_code==200,confirmed.text
-    assert confirmed.json()["task"]["acknowledgment"]["confirmation_level"]=="client_received"
-    count=len(c.calls)
-    assert post(c,"/api/instructions/"+second["request_id"]+"/confirm-reply").status_code==200
-    assert len(c.calls)==count
-    assert len([v for v in c.calls if v["path"].endswith("/delivery/pull")])==1
-    assert len([v for v in c.calls if v["path"].endswith("/acknowledge")])==1
-    if folder:=os.environ.get("FA_UI_INTERFACE_RESULTS"):
-        target=Path(folder);target.mkdir(parents=True,exist_ok=True)
-        filename="two-turn-proof.json" if separator=="\n" else f"two-turn-proof-{ord(separator):04x}.json"
-        (target/filename).write_text(json.dumps({
-            "actual_environment":"NOT_RUN","interface_core":c.core,"real_http_table_producers":True,
-            "sdk_io_substituted":True,"sdk_calls":c.sdk_calls,"pure_reply_reads":10,"inventory_unchanged":True,
-            "first_ack_not_required_for_follow_up":True,"calls":c.calls,
-            "second_manual_ack":confirmed.json()["task"]["acknowledgment"],
-        },ensure_ascii=False,indent=2),encoding="utf-8")
-
-
 def test_frozen_examples_and_public_progress_dto_match_exact_not_private_shapes():
     root=Path(os.environ.get("FA_UI_INTERFACE_ART",FIXTURES))
     raw=(root/"interface-producer-examples.json").read_bytes()
@@ -259,59 +173,3 @@ def test_frozen_examples_and_public_progress_dto_match_exact_not_private_shapes(
         aw.PublicProgressEvent.model_validate_json(json.dumps({
             "seq":2,"at":"2026-09-15T10:00:00Z","kind":"reasoning_delta","summary":"PRIVATE"}))
 
-
-def test_frozen_lost_admission_restart_reconciles_original_without_new_submit(real_interface):
-    c=real_interface
-    draft=c.browser.ui.get("/api/state").json()["composer"]
-    path="/api/instructions/"+draft["request_id"]+"/submit"
-    c.lost=True
-    lost=post(c,path,{"content":"OFFLINE 原回應遺失，不重送","model":"gpt-4.1-mini"})
-    assert lost.status_code==503,lost.text
-    with sqlite3.connect(c.journal) as db:
-        original=db.execute("SELECT intent,outcome FROM intents WHERE task_id=? AND phase='submit'",
-                            (draft["request_id"],)).fetchone()
-    c.browser.ui.close();c.browser=open_ui(c)
-    count=len(c.calls)
-    assert post(c,path,{"content":"OFFLINE 原回應遺失，不重送","model":"gpt-4.1-mini"}).status_code==200
-    assert len(c.calls)==count
-    before=copy.deepcopy(c.h.transport.backing.rows)
-    reconciled=post(c,"/api/tasks/"+draft["request_id"]+"/submit-reconcile")
-    assert reconciled.status_code==200,reconciled.text
-    assert c.h.transport.backing.rows==before
-    assert reconciled.json()["task"]["submission"]["state"]=="UNKNOWN"
-    assert reconciled.json()["task"]["admission"]["model"]=="gpt-4.1-mini"
-    with sqlite3.connect(c.journal) as db:
-        assert db.execute("SELECT intent,outcome FROM intents WHERE task_id=? AND phase='submit'",
-                          (draft["request_id"],)).fetchone()==original
-    assert len([r for r in c.calls if r["path"]=="/work-policy/v1/submit"])==1
-    assert not c.starts and not c.sdk_calls
-
-
-def test_direct_submit_model_binding_and_pure_reply_digest_fail_closed(real_interface):
-    c=real_interface
-    draft=c.browser.ui.get("/api/state").json()["composer"]
-    path="/api/instructions/"+draft["request_id"]+"/submit"
-    text="OFFLINE model binding"
-    def wrong_model(req,response):
-        if req.url.path.endswith("/submit") and response.status_code==200:
-            data=response.json();data["model"]="configured-second-model"
-            return httpx.Response(200,json=data)
-        return response
-    c.mutate=wrong_model
-    refused=post(c,path,{"content":text,"model":"gpt-4.1-mini"})
-    assert refused.status_code==502,refused.text
-    assert sum(r["path"]=="/work-policy/v1/submit" for r in c.calls)==1
-    c.mutate=lambda req,response:response
-    submitted=post(c,"/api/tasks/"+draft["request_id"]+"/submit-reconcile")
-    assert submitted.status_code==200,submitted.text
-    assert sum(r["path"]=="/work-policy/v1/submit" for r in c.calls)==1
-    complete(c,submitted.json()["task"]["binding_id"])
-    c.mutate=lambda req,response:(httpx.Response(200,content=response.content,
-        headers={**response.headers,"x-content-sha256":"f"*64}) if req.url.path.endswith("/reply") else response)
-    before=copy.deepcopy(c.h.transport.backing.rows)
-    read=c.browser.ui.get("/api/instructions/progress?thread_id="+draft["thread_id"])
-    assert read.status_code==502,read.text
-    assert c.h.transport.backing.rows==before
-    state=c.browser.ui.get("/api/state?thread_id="+draft["thread_id"]).json()
-    item=next(t for t in state["tasks"] if t["task_id"]==draft["request_id"])
-    assert item["reply"] is None and item["acknowledgment"]["state"]=="NOT_SENT"

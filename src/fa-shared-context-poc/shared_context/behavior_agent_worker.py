@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from pydantic import Field, SecretBytes
+from pydantic import Field
 
 from . import behavior_wire as wire
 
@@ -31,7 +31,3 @@ class AgentTurnAddress(wire.WireModel):
     sdk_session_id: wire.Identifier
     request_id: wire.Identifier
 
-
-class AgentTurnDelivery(wire.WireModel):
-    address: AgentTurnAddress
-    payload: Annotated[SecretBytes, Field(min_length=1, max_length=65536)]

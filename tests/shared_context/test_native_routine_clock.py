@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from test_conversation_transfer_startup import synthetic_standing_v1  # fixture
-from test_instruction_flow import instruction_models  # fixture
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key  # fixture
 from test_native_turn_api import native_api  # fixture
 from test_native_routine_api import daily_definition, routine_api  # fixture

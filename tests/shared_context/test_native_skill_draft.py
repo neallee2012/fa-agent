@@ -114,7 +114,7 @@ def test_real_sdk_native_skillify_keeps_one_original_draft_across_tool_calls(
     from copilot import CopilotClient
     from shared_context import m2_copilot
     from sdk_checkpoint_local import sse
-    from test_skill_isolation_native import child_environment
+    from skill_isolation_native_helpers import child_environment
 
     requests, writes, api_calls = [], [], []
 

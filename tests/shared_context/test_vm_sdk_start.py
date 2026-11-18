@@ -10,19 +10,13 @@ from pydantic import ValidationError
 
 from shared_context import behavior_wire as wire
 from shared_context.behavior_assistant_hosted import AssistantSession
-from shared_context.behavior_code_identity import code_sha256
 from shared_context.behavior_hosted import LocalJournal
-from shared_context.behavior_sdk_start import SdkStartGate, sdk_owner_for_started_turn
-from shared_context.behavior_turn_receipts import ticket_handle
-from shared_context.behavior_turn_wire import BeginTurn
-from shared_context.behavior_vm_assignment import prepare_vm_assignment
+from shared_context.behavior_sdk_start import SdkStartGate
 from shared_context.errors import Problem
-from shared_context.source_materials import digest
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_sdk_start_gate import binding
-from test_turn_receipts import case, ticket_for
 from shared_context.behavior_agent_worker import AgentVmBinding
 
 
@@ -119,64 +113,11 @@ def test_existing_dispatch_finalizes_the_turn_without_claiming_the_queue_thread_
         assert gate.observe_turn_closed().gate.state == "closed_before_entry"
 
 
-def test_vm_owner_comes_from_the_started_turn_not_fake_native_identifiers(case):
-    c = case
-    ticket = ticket_for(c.vm, rid="sdk-owner")
-    task = ticket.assignment.task.model_copy(update={
-        "instruction": ticket.assignment.task.instruction.model_copy(update={"sdk_start_profile": "fa-sdk-start-gate-v1"})})
-    assigned = ticket.assignment.model_copy(update={"task": task})
-    sdk = wire.SdkStartBinding(
-        schema_version="fa-sdk-start-binding-v1", profile="fa-sdk-start-gate-v1",
-        session_id=assigned.session_id, sdk_session_id=assigned.sdk_session_id, job_id=task.job_id,
-        task_digest=digest(task.model_dump(mode="json")), profile_digest=task.profile_digest,
-        execution_digest="d" * 64, worker_configuration_digest="e" * 64, code_sha256=code_sha256())
-    ticket = ticket.model_copy(update={"assignment": assigned.model_copy(update={"sdk_start_binding": sdk})})
-    c.receipts.issue(ticket, c.human, expected_vm=c.vm)
-    started = c.receipts.begin(c.agent, c.context, BeginTurn(address=ticket.address, ticket=ticket_handle(ticket)))
-    selected = sdk_owner_for_started_turn(started)
-    assert selected.kind == "vm-turn"
-    assert selected.supervisor_id == c.context.process_id
-    assert selected.ticket_id == started.start.ticket.ticket_id
-    assert selected.start_receipt_sha256 == started.start.sha256
-    assert "claim_id" not in selected.model_dump()
-
-
-def test_assignment_builder_uses_the_actual_registered_job_without_io_or_claim(synthetic_standing_v1, monkeypatch):
-    from shared_context.behavior_assistant_wire import InstructionSubmit
-    from shared_context.behavior_workers import worker_key, JobRecord
-    from shared_context.behavior_operations import _row
-
-    c = synthetic_standing_v1
-    bound, _ = c.control.submit(c.human, InstructionSubmit(request_id="pure-assignment", content="OFFLINE prepare only."))
-    worker = c.h.runtime.dep.workers
-    starts = []
-    original = worker.adapter
-    worker.adapter = replace(original, start=lambda start: starts.append(start))
-    try:
-        worker.start(bound.job_id, bound.owner)
-    finally:
-        worker.adapter = original
-    start, = starts
-    jkey = worker_key("job", bound.job_id)
-    job = _row(c.control.store.read_snapshot((jkey,)), jkey, JobRecord)
-    record = c.control.records[bound.binding_id]
-    expected, _ = c.authority.issue(start)
-    monkeypatch.setattr(c.control.store, "_read_physical", lambda *_: pytest.fail("the assignment builder must be pure"))
-    actual = prepare_vm_assignment(record, job, start, worker_configuration_digest=worker.configuration_digest(),
-                                   installed_code_sha256=code_sha256(),
-                                   agent_message_recipient=expected.agent_message_recipient)
-    assert actual == expected
-    with pytest.raises(Problem):
-        prepare_vm_assignment(record, job.model_copy(update={"binding": None}), start,
-                              worker_configuration_digest=worker.configuration_digest(),
-                              installed_code_sha256=code_sha256())
-
-
 def test_new_conversations_capture_one_agent_vm_before_their_first_write(synthetic_standing_v1):
     from shared_context.behavior_assistant_wire import InstructionSubmit
     from shared_context.behavior_instruction import Conversation, conversation_key
     from shared_context.behavior_operations import _row
-    from test_conversation_transfer_startup import read_startup
+    from legacy_turn_rows_helpers import read_startup
 
     c = synthetic_standing_v1
     target = c.native.targets[0]

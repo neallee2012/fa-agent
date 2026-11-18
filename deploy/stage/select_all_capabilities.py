@@ -24,13 +24,13 @@ nothing) and stops if this run's template differs. A selection equal to the curr
 whose outcome is unknown is never repeated. Success means the read-back selection equals this run's template.
 
 usage: PYTHONPATH=src/fa-shared-context-poc python deploy/stage/select_all_capabilities.py \
-           --out <private dir> --request-id <new id per change> [--config <profile.json>] \
+           --config <profile.json> --out <private dir> --request-id <new id per change> \
            [--agent <name> ...] [--dry-run] [--keep-capabilities] [--initial-template <owner-reviewed.json>]
 (run from a checkout of the deployed commit: the role digest is computed from this checkout and the API refuses a
 different one with 422, writing nothing)
---config selects the environment profile (default FA_DEPLOY_CONFIG, else deploy/stage/stage.json); without --agent
+--config (or FA_DEPLOY_CONFIG) selects the environment profile; without --agent
 every `kind=assistant` Agent of that profile is selected. The profile's own `conversation_defaults` are used; a
-profile without them uses the checked-in stage.json defaults (the reference new-conversation lane) and says so.
+profile without them is refused.
 --keep-capabilities keeps each Agent's current selection (capabilities, skills, role) and applies only the
 `conversation_defaults` settings, e.g. the checkpoint or state profile. An Agent that has never been selected (a
 freshly seeded one) needs an explicit --initial-template selected by its owner; the authenticated /select endpoint
@@ -58,26 +58,23 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
 from deployment_config import config_path, load_config, write_x as _write_x
 
-STAGE = json.loads((HERE / "stage.json").read_text(encoding="utf-8"))
-DEFAULTS = STAGE["conversation_defaults"]
 MAX_SKILLS = 4
 TEMPLATE_KEYS = ("schema_version", "role", "settings", "skills", "unavailable_skills")
 
 
 def conversation_defaults(profile):
-    """(defaults, source): the profile's own new-conversation defaults, else the checked-in stage ones."""
+    """The selected profile's own new-conversation defaults; a profile without them is an error, never stage's."""
     own = profile.get("conversation_defaults")
-    if isinstance(own, dict) and isinstance(own.get("settings"), dict):
-        return own, "profile"
-    return DEFAULTS, "stage.json"
+    if not (isinstance(own, dict) and isinstance(own.get("settings"), dict)):
+        raise SystemExit(f"deployment config {profile['environment']} has no conversation_defaults with settings")
+    return own
 
 
 def assistant_names(profile):
     return [agent["name"] for agent in profile["agents"] if agent["kind"] == "assistant"]
 
 
-def template(options, defaults=None):
-    defaults = DEFAULTS if defaults is None else defaults
+def template(options, defaults):
     profile = defaults["prompt_profile"]
     role = assemble_prompt(profile).record
     capabilities = sorted(({"entry_id": item["entry_id"], "entry_sha256": item["entry_sha256"]}
@@ -95,13 +92,12 @@ def template(options, defaults=None):
             "skills": skills, "unavailable_skills": []}
 
 
-def keep_current(current, initial_template=None, defaults=None):
+def keep_current(current, initial_template, defaults):
     """The owner's current choice with only the conversation_defaults settings applied; capabilities, skills, role kept.
 
     For a settings-only change (2026-10-06: checkpoint profile manual → auto): "all" can exceed the 12-capability limit
     once Team MCP servers are offered, and the owner's own capability choice must not be widened or narrowed here.
     An unselected Agent requires a template explicitly supplied by its owner; scoped Agents may not export a default."""
-    defaults = DEFAULTS if defaults is None else defaults
     if current.get("selection_id") is not None:
         if not isinstance(current.get("template"), dict):
             raise SystemExit("the current selection has no readable template; do not replace it with an initial template")
@@ -136,7 +132,7 @@ def _same(left, right):
             == AgentTemplate.model_validate_json(json.dumps(right)))
 
 
-def select(client, headers, out, agent, request_id, dry_run, keep=False, defaults=None, initial_template=None):
+def select(client, headers, out, agent, request_id, dry_run, keep, defaults, initial_template=None):
     """(result, wanted template); wanted is what the current selection must equal afterwards."""
     base = f"/agents/{agent['agent_id']}/work-policy/v1/agent-template"
     intent = out / f"select-{agent['name']}-{request_id}-intent.json"
@@ -183,7 +179,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--request-id", required=True)
-    parser.add_argument("--config", help="deployment profile (default: FA_DEPLOY_CONFIG, else deploy/stage/stage.json)")
+    parser.add_argument("--config", help="deployment profile (required unless FA_DEPLOY_CONFIG is set)")
     parser.add_argument("--agent", action="append", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-capabilities", action="store_true",
@@ -196,14 +192,14 @@ def main():
         parser.error("--initial-template requires --keep-capabilities")
     initial_template = None if args.initial_template is None else load_initial_template(args.initial_template)
     profile = load_config(args.config)
-    defaults, source = conversation_defaults(profile)
+    defaults = conversation_defaults(profile)
     agents = {agent["name"]: agent for agent in profile["agents"]}
     names = args.agent or assistant_names(profile)
     unknown = [name for name in names if name not in agents]
     if unknown:
         raise SystemExit(f"not Agents of {config_path(args.config)}: {', '.join(unknown)}")
     print(json.dumps({"config": str(config_path(args.config)), "environment": profile["environment"],
-                      "conversation_defaults": source, "agents": names}))
+                      "agents": names}))
     args.out.mkdir(parents=True, exist_ok=True)
     with AzureCliCredential(subscription=profile["subscription_id"], process_timeout=30) as credential:
         token = credential.get_token(profile["api_audience"] + "/.default").token

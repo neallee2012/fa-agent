@@ -57,7 +57,7 @@ dev 2026-10-28：32,693 個 entity、88 MB；讀取約 7～13 秒，核對約 15
 - 舊版 FA 寫的列，形狀和規則可能不同。例如 `_legacy_cursor_row`（`behavior_work_policy_installation.py:39`）處理舊 catalog 的 cursor。
 - 不經 FA 的寫入：有 Table 資料寫入權的人或工具（Storage Explorer、腳本）。程式看不出有這類寫入，屬 [推論] 的防線。
 
-**完整核對不是防惡意寫入者的簽章。** 列和回條都沒有 MAC；有 Table 寫入權的人可以寫出一組互相一致、能通過核對的列與回條。另外 `receipt_catalog`／`_checked_receipts`（`behavior_recovery_history.py:56-86`）只檢查 revision 不重複，**沒有檢查 1..R 連續**，所以「連列帶回條一起刪掉」今天的完整核對也抓不到（我讀程式看到的現況，不是本設計的主張）。它防的是寫錯、舊版、型別不明和 FA 以外的寫入。
+**完整核對不是防惡意寫入者的簽章。** 列和回條都沒有 MAC；有 Table 寫入權的人可以寫出一組互相一致、能通過核對的列與回條。另外 `receipt_catalog`／`_checked_receipts`（`behavior_recovery_history.py:56-86`）只檢查 revision 不重複，**沒有檢查 1..R 連續**，所以「連列帶回條一起刪掉」今天的完整核對也抓不到（我讀程式看到的現況，不是本設計的主張；2026-11 更新：`behavior_recovery_history.py` 已移出正式程式，這條現況描述只留作歷史紀錄）。它防的是寫錯、舊版、型別不明和 FA 以外的寫入。
 
 ## 結論
 

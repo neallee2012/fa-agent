@@ -11,8 +11,9 @@ from shared_context.errors import Problem
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from test_agent_scope_registry import peer_policy
 from assistant_sdk_fixture import review_source
-from test_conversation_transfer_startup import read_startup, saved_turn, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from hosted_versions_stub import deployed_versions
 
@@ -96,7 +97,7 @@ def test_two_agents_can_register_the_same_request_id_against_one_cost_observatio
 
 def test_peer_current_policy_reads_its_own_profile_selection(peer_runtime):
     from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
-    from test_conversation_profile_selection import template
+    from conversation_profile_selection_helpers import template
     c, b = peer_runtime.c, peer_runtime.b
     selected = select_profile(b.runtime.work_policy, b.assistant.authority, c.human,
         SelectConversationProfile(request_id="b-profile", expected_selection_id=None, template=template()))
@@ -200,25 +201,6 @@ def test_b_new_version_is_captured_without_borrowing_a_version(peer_runtime, mon
     deployed_versions(monkeypatch, {c.h.config.targets[0].agent_id: "999", b.agent_id: "47"})
     assert instruction_hosted_version(b.runtime.work_policy, None, existing=False) == "47"
     assert instruction_hosted_version(c.control, None, existing=False) == "999"
-
-
-def test_real_b_admission_and_cold_refresh_capture_only_its_saved_memory_settings(peer_runtime):
-    from shared_context.memory_bridge_settings import MemoryBridgeSettingsService
-    from test_memory_agent_scope import command as memory_command
-    c, a, b = peer_runtime.c, peer_runtime.a, peer_runtime.b
-    aid = MemoryBridgeSettingsService(a.runtime).select(c.human, memory_command()).payload["result"]["settings_id"]
-    service = MemoryBridgeSettingsService(b.runtime)
-    bid = service.select(c.human, memory_command()).payload["result"]["settings_id"]
-    command = InstructionSubmit(request_id="b-own-memory", content="Capture only B's own settings.")
-    record = b.runtime.work_policy.register(c.human, command.request_id,
-        hashlib.sha256(command.model_dump_json().encode()).hexdigest(), instruction=command)
-    assert record.profile.memory_scope.settings_id == bid and bid != aid
-    service.select(c.human, memory_command("b-now-disabled", previous=bid, enabled=False))
-    b.runtime.work_policy.records.clear()
-    b.runtime.work_policy.refresh()
-    restored = b.runtime.work_policy.records[record.binding.binding_id]
-    assert restored == record and restored.profile.memory_scope.enabled
-    read_startup(c)
 
 
 def test_a_and_b_model_usage_share_one_nonresetting_ledger(peer_runtime, monkeypatch):

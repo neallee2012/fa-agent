@@ -23,10 +23,10 @@ from shared_context.behavior_native_turn_wire import NativeReceipt, NativeSubmit
 from shared_context.errors import Problem
 from shared_context.m3_skills import PurposeSkillCatalog, PurposeSkillEntry, PurposeSkillReadResult
 from test_agent_runtime import peer_runtime
-from test_agent_runtime_routing import agent_headers
+from agent_runtime_routing_helpers import agent_headers
 from test_capability_calls import CATALOG, KEY, listed, result
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_native_agent_api import relay_case
 
@@ -246,3 +246,23 @@ def test_signed_routes_accept_only_the_verified_agent_and_strict_bodies(skilled_
     install_native_capability_routes(disabled, case.base.a, enabled=False)
     with TestClient(disabled, backend_options={"loop_factory": lambda: other_loop}) as client:
         assert client.post(NATIVE_CAPABILITY_PREFIX + "/skill-catalog", json=body, headers=agent).status_code == 503
+
+
+def test_signed_read_returns_the_exact_8k_body_even_when_json_escaping_doubles_it(skilled_http, signing_key):
+    from shared_context.native_capability_api import install_native_capability_routes
+    (case, _), (loop, _) = skilled_http
+    text = '"\\' * 4096
+    case.skills.approve("1" * 32, text)
+    entry = case.skills._entry(case.base.a.runtime.work_policy.policy.template.team_id)
+    refs = (TemplateSkill(name=entry.name, version_id=entry.version_id, sha256=entry.sha256,
+                          metadata_sha256=entry.metadata_sha256),)
+    scope = started(case, (SKILLS,), skills=refs)
+    app = FastAPI()
+    _install_error_handlers(app)
+    install_native_capability_routes(app, case.base.a, enabled=True)
+    with TestClient(app, backend_options={"loop_factory": lambda: loop}) as client:
+        read = client.post(NATIVE_CAPABILITY_PREFIX + "/read-skill", json={
+            **scope.model_dump(mode="json"), "name": "receipt-guide"}, headers=agent_headers(case.base.c, signing_key, 0))
+    assert read.status_code == 200, read.text
+    assert read.json()["text"] == text and len(text.encode("utf-8")) == 8192
+    assert len(read.content) > 16384

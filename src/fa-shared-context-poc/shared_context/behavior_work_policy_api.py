@@ -1,25 +1,19 @@
 """Stable work entry/read decisions."""
 import os
-import asyncio
 from dataclasses import dataclass
-from time import monotonic
 from fastapi import Depends,Request
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.responses import Response
-from pydantic import Field,RootModel
 import hashlib
 from .behavior_api import _body,_response,_principal_dependency
-from .behavior_assistant_wire import AssistantSubmit,InstructionSubmit
-from .behavior_routine_wire import RoutineTrigger
-from .behavior_wire import Command
 from .behavior_operations import _Model
-from .behavior_work_policy import WorkPreflightQuery,WorkSubmitObservation
 from .models import Identifier
 from .errors import Problem
 
 
 _SAFE_WORK_ERRORS={
+    "JOB_LANE_RETIRED":"The legacy job lane is retired; this request was not processed.",
     "AGENT_USAGE_SCOPE":"Only the verified Agent of this policy may report its own turn usage.",
     "AGENT_USAGE_INVALID":"A typed turn usage report or an explicit unknown is required.",
     "AGENT_USAGE_CONFLICT":"This turn's usage is already recorded differently; do not resend another report.",
@@ -168,6 +162,13 @@ async def _safe_refusal(error):
     return await work_response(failed)
 
 
+def _retired(app,deps,path):
+    """Serves a legacy job entry as 410 after authentication, before its body is read."""
+    @app.post(deps.prefix+path)
+    async def retired(principal=Depends(deps.identity)):
+        return await _safe_refusal(Problem(410,"JOB_LANE_RETIRED","the legacy job lane is retired"))
+
+
 class RevokeStandingPolicy(_Model):
     decision_id:Identifier
 
@@ -239,11 +240,6 @@ def _install_onboarding_routes(app,deps):
             deps.controller()
             return True,console_connection(deps.composition,principal,agent_id)
         return await onboarding_response(read)
-
-
-class _SubmitBody(RootModel[AssistantSubmit|InstructionSubmit]):
-    # Preserve the old undiscriminated body; model/conversation fields select instructions.
-    root:AssistantSubmit|InstructionSubmit=Field(union_mode="left_to_right")
 
 
 @dataclass(frozen=True)
@@ -509,75 +505,12 @@ def _install_catalog_routes(app,deps):
         return _no_store(await work_response(read))
 
 
-def _work_unfinished(status):
-    return not (status.state in {"succeeded","failed","cancelled"} and status.result_forwarded)
-
-
-def _install_admission_routes(app,deps,start_work):
-    @app.post(deps.prefix+"/preflight")
-    async def preflight(request:Request,principal=Depends(deps.identity)):
-        query=await _body(request,WorkPreflightQuery)
-        def read():return deps.controller().preflight(principal,query)
-        try:
-            return _response(await run_in_threadpool(deps.read_current, read))
-        except Problem as error:
-            if error.body["error"]["code"] not in {"AGENT_ROLE_PROMPT_MISSING","AGENT_ROLE_PROMPT_INVALID"}:raise
-            return await _safe_refusal(error)
-
-    @app.post(deps.prefix+"/submit")
-    async def submit(request:Request,principal=Depends(deps.identity)):
-        command=(await _body(request,_SubmitBody)).root
-        loop=asyncio.get_running_loop()
-        def accepted():
-            from .behavior_timing import phase_timing
-            control=deps.controller(refresh=False)
-            control._human(principal,"submit")
-            with phase_timing("admission",job_id=command.request_id):
-                actual,status=control.submit(principal,command)
-            if (start_work is not None and control.records[actual.binding_id].profile.instruction is not None
-                    and _work_unfinished(status)):
-                loop.call_soon_threadsafe(start_work,actual.binding_id)
-            return control.submission_result(actual,status)
-        return await work_response(accepted)
-
-    @app.post(deps.prefix+"/routines/{routine_id}/trigger")
-    async def routine_trigger(routine_id:str,request:Request,principal=Depends(deps.identity)):
-        command=await _body(request,RoutineTrigger)
-        loop=asyncio.get_running_loop()
-        def accepted():
-            from .behavior_routine import trigger
-            control=deps.controller(refresh=False)
-            actual,status=trigger(control,principal,routine_id,command)
-            if start_work is not None and _work_unfinished(status):
-                loop.call_soon_threadsafe(start_work,actual.binding_id)
-            return control.submission_result(actual,status)
-        return await work_response(accepted)
-
-
-def _reconciled_submission(control,original):
-    if isinstance(original,WorkSubmitObservation):
-        return original
-    binding,status=original
-    return control.submission_result(binding,status)
-
-
-def _install_reconcile_routes(app,deps):
-    @app.post(deps.prefix+"/routines/{routine_id}/trigger-reconcile")
-    async def routine_reconcile(routine_id:str,request:Request,principal=Depends(deps.identity)):
-        command=await _body(request,RoutineTrigger)
-        def read():
-            from .behavior_routine import reconcile
-            control=deps.standing_control()
-            return _reconciled_submission(control,reconcile(control,principal,routine_id,command))
-        return await work_response(lambda:deps.read_current(read))
-
-    @app.post(deps.prefix+"/submit-reconcile")
-    async def reconcile(request:Request,principal=Depends(deps.identity)):
-        command=await _body(request,InstructionSubmit)
-        def read():
-            control=deps.standing_control()
-            return _reconciled_submission(control,control.submit_reconcile(principal,command))
-        return await work_response(lambda:deps.read_current(read))
+_RETIRED_ENTRIES=(
+    "/preflight","/submit","/routines/{routine_id}/trigger","/routines/{routine_id}/trigger-reconcile",
+    "/submit-reconcile","/conversations/{conversation_id}/environment",
+    "/conversations/{conversation_id}/environment-reconcile","/bindings/{binding_id}/cancel",
+    "/conversations/{conversation_id}/reset",
+)
 
 
 def _attach_live_previews(projection,live):
@@ -588,53 +521,15 @@ def _attach_live_previews(projection,live):
             if preview is not None:turn["stream"]=preview
 
 
-def _pending_observers(composition,projection,start_work):
-    """(binding_id, is_completion) for the turns whose Hosted outcome only an observer run can settle."""
-    native=composition.runtime.dep.native_launches
-    if start_work is None or native is None:return []
-    observers=[]
-    for turn in projection["turns"]:
-        if turn["state"] in {"starting","capacity_uncertain","failed"}:
-            job=composition.runtime.dep.workers.inspect(turn["job_id"])
-            if native.pending_version_observation(job) or native.pending_lost_observation(job):
-                observers.append((turn["binding_id"],False))
-            elif native.pending_completion_observation(job):
-                observers.append((turn["binding_id"],True))
-    return observers
-
-
-def _claim_completion_wake(observed_completions,binding_id,interval):
-    """At most two wakes per binding, spaced by interval; a granted claim is recorded here."""
-    previous=observed_completions.get(binding_id)
-    now=monotonic()
-    if previous is None or previous[0]<2 and now-previous[1]>=interval:
-        observed_completions[binding_id]=(1 if previous is None else previous[0]+1,now)
-        return True
-    return False
-
-
-def _install_conversation_route(app,deps,start_work,wake_work):
-    composition=deps.composition
-    observed_completions={}
-
+def _install_conversation_route(app,deps):
     @app.get(deps.prefix+"/conversations/{conversation_id}")
     async def conversation(conversation_id:str,principal=Depends(deps.identity)):
         def read():
             control=deps.controller(refresh=False)
             projection=control.conversation(principal,conversation_id)
             _attach_live_previews(projection,getattr(app.state,"instruction_live_replies",None))
-            pending[:]=_pending_observers(composition,projection,start_work)
             return projection
-        pending=[]
-        response=await work_response(lambda:deps.read_current(read))
-        if response.status_code==200:
-            for binding_id,completion in pending:
-                if not completion:
-                    start_work(binding_id)
-                elif _claim_completion_wake(observed_completions,binding_id,
-                                            composition.runtime.dep.delivery.contract.review_interval_seconds):
-                    wake_work(binding_id)
-        return response
+        return await work_response(lambda:deps.read_current(read))
 
 
 def _install_environment_routes(app,deps):
@@ -646,21 +541,6 @@ def _install_environment_routes(app,deps):
             from .behavior_conversation_transfer import preview
             return preview(deps.controller(refresh=False),deps.authority(),principal,conversation_id)
         return await work_response(lambda:deps.read_current(read))
-
-    async def prepare_environment(conversation_id,request,principal,*,reconcile):
-        from .behavior_conversation_transfer import prepare,TransferCommand
-        command=await _body(request,TransferCommand)
-        def apply():
-            return prepare(deps.controller(),deps.authority(),principal,conversation_id,command,reconcile=reconcile)
-        return await work_response(apply)
-
-    @app.post(deps.prefix+"/conversations/{conversation_id}/environment")
-    async def new_environment(conversation_id:str,request:Request,principal=Depends(deps.identity)):
-        return await prepare_environment(conversation_id,request,principal,reconcile=False)
-
-    @app.post(deps.prefix+"/conversations/{conversation_id}/environment-reconcile")
-    async def reconcile_environment(conversation_id:str,request:Request,principal=Depends(deps.identity)):
-        return await prepare_environment(conversation_id,request,principal,reconcile=True)
 
 
 def _install_saved_turn_routes(app,deps):
@@ -724,21 +604,7 @@ def _install_saved_turn_routes(app,deps):
         })
 
 
-def _install_cancel_and_reset_routes(app,deps,wake_work):
-    @app.post(deps.prefix+"/bindings/{binding_id}/cancel")
-    async def cancel(binding_id:str,request:Request,principal=Depends(deps.identity)):
-        await _body(request,Command)
-        loop=asyncio.get_running_loop()
-        def accepted():
-            control=deps.controller()
-            receipt=control.cancel(principal,binding_id)
-            if (wake_work is not None and control.records[binding_id].profile.instruction is not None
-                    and receipt.payload["result"].get("cancel_accepted")
-                    and not receipt.payload["result"].get("executor_stopped")):
-                loop.call_soon_threadsafe(wake_work,binding_id)
-            return receipt
-        return _response(await run_in_threadpool(accepted))
-
+def _install_cancel_receipt_route(app,deps):
     @app.get(deps.prefix+"/bindings/{binding_id}/cancel-receipt/{generation}")
     async def cancellation_receipt(binding_id:str,generation:int,request:Request,principal=Depends(deps.identity)):
         await _refuse_query_then_body(request,"cancellation receipt reads do not accept query parameters",
@@ -746,11 +612,6 @@ def _install_cancel_and_reset_routes(app,deps,wake_work):
         def read():
             return deps.standing_control().cancellation_receipt(principal,binding_id,generation)
         return _digest_when_ok(await work_response(lambda:deps.read_current(read)))
-
-    @app.post(deps.prefix+"/conversations/{conversation_id}/reset")
-    async def reset(conversation_id:str,request:Request,principal=Depends(deps.identity)):
-        command=await _body(request,Command)
-        return await work_response(lambda:deps.controller().reset_conversation(principal,conversation_id,command))
 
 
 def _install_operator_routes(app,deps):
@@ -767,11 +628,9 @@ def _install_operator_routes(app,deps):
         return await work_response(lambda:set_budget_enforcement(deps.controller(),principal,command))
 
 
-def install_work_policy_routes(app,composition,*,start_work=None,wake_work=None):
+def install_work_policy_routes(app,composition):
     deps=_RouteDeps(composition,_principal_dependency(composition.verifier))
     _install_native_routes(app,composition)
-    wake_work=start_work if wake_work is None else wake_work
-    if start_work is not None:app.state.instruction_runner=True
     _install_agent_directory_route(app,deps)
     if getattr(composition,"agent_id",None) is None:
         _install_onboarding_routes(app,deps)
@@ -783,10 +642,10 @@ def install_work_policy_routes(app,composition,*,start_work=None,wake_work=None)
     _install_profile_selection_routes(app,deps)
     _install_connector_routes(app,deps)
     _install_catalog_routes(app,deps)
-    _install_admission_routes(app,deps,start_work)
-    _install_reconcile_routes(app,deps)
-    _install_conversation_route(app,deps,start_work,wake_work)
+    for path in _RETIRED_ENTRIES:
+        _retired(app,deps,path)
+    _install_conversation_route(app,deps)
     _install_environment_routes(app,deps)
     _install_saved_turn_routes(app,deps)
-    _install_cancel_and_reset_routes(app,deps,wake_work)
+    _install_cancel_receipt_route(app,deps)
     _install_operator_routes(app,deps)

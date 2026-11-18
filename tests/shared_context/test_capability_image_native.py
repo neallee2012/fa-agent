@@ -14,7 +14,7 @@ from shared_context.behavior_capabilities import CapabilityCapture, CapabilityGr
 from shared_context.behavior_capability_prompt import session_needs
 from shared_context.m2_copilot import ToolOutput, ToolSpec, run_copilot
 from shared_context.tool_catalog import StdioEntry
-from test_assistant_images import png
+from assistant_images_helpers import png
 from test_m2_copilot import ScriptedEndpoint, runtime_path, tool_call, workspace
 
 SERVER = Path(__file__).with_name("fake_playwright_stdio_server.py")

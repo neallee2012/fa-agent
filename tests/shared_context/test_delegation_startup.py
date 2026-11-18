@@ -12,9 +12,10 @@ from shared_context.behavior_instruction_cost import record_usage
 from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
-from test_behavior_delegation import TASK
-from test_conversation_transfer_startup import read_startup, saved_turn, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from behavior_delegation_helpers import TASK
+from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 
@@ -86,7 +87,7 @@ def test_captured_delegation_api_and_child_model_link_remain_readable_at_startup
     from shared_context.behavior_capabilities import available_grants
     from shared_context.behavior_delegation_wire import DelegationModelRef, DelegationObservation, DelegationPrepare
     from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
-    from test_conversation_profile_selection import template
+    from conversation_profile_selection_helpers import template
     c = synthetic_standing_v1
     grants = available_grants(None, ("fa-delegate-v1",))
     c.h.runtime.capability_grants = grants

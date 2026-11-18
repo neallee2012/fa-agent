@@ -13,6 +13,8 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.errors import Problem
 
 ROOT = Path(__file__).resolve().parents[2]
+STAGE = json.loads((ROOT / "deploy" / "stage" / "stage.json").read_text(encoding="utf-8"))
+DEFAULTS = STAGE["conversation_defaults"]
 
 
 @pytest.fixture(scope="module")
@@ -33,8 +35,8 @@ def options():
 
 def test_template_leaves_out_what_the_profile_cannot_compose_and_keeps_the_state_profile(script):
     offered, grants = options()
-    wanted = script.template(offered)
-    profile = script.DEFAULTS["prompt_profile"]
+    wanted = script.template(offered, DEFAULTS)
+    profile = DEFAULTS["prompt_profile"]
     chosen = [item["entry_id"] for item in wanted["settings"]["capabilities"]]
     # fa-delegate-reader-v1 needs read_user_file, which fa-instruction-v3/v4 do not declare (422 before this fix).
     assert "fa-delegate-reader-v1" not in chosen and "WebIQ-MCP" not in chosen
@@ -49,24 +51,24 @@ def test_template_leaves_out_what_the_profile_cannot_compose_and_keeps_the_state
 
 def test_a_profile_that_declares_the_reader_keeps_it(script, monkeypatch):
     offered, grants = options()
-    monkeypatch.setitem(script.DEFAULTS, "prompt_profile", "fa-instruction-agent-role-v4")
-    template = AgentTemplate.model_validate_json(json.dumps(script.template(offered)))
+    monkeypatch.setitem(DEFAULTS, "prompt_profile", "fa-instruction-agent-role-v4")
+    template = AgentTemplate.model_validate_json(json.dumps(script.template(offered, DEFAULTS)))
     assert "fa-delegate-reader-v1" in [ref.entry_id for ref in template.settings.capabilities]
     assert check_selectable(template.settings.capabilities, "fa-instruction-agent-role-v4", grants)
 
 
 def test_keep_capabilities_changes_only_the_stage_settings(script, monkeypatch):
     offered, _ = options()
-    owner = script.template(offered)
+    owner = script.template(offered, DEFAULTS)
     # The owner's own narrower choice on the old manual profile, as stage A/B had before 2026-10-06.
     owner["settings"]["capabilities"] = owner["settings"]["capabilities"][:3]
     owner["settings"]["checkpoint_profile"] = {"name": "manual-no-custom-v1", "platform": "linux-x64",
                                                "provider": "openai-responses"}
     current = {"selection_id": "s" * 64, "template": owner}
-    wanted = script.keep_current(current)
+    wanted = script.keep_current(current, None, DEFAULTS)
     assert wanted["settings"]["capabilities"] == owner["settings"]["capabilities"]
     assert wanted["skills"] == owner["skills"] and wanted["role"] == owner["role"]
-    assert wanted["settings"]["checkpoint_profile"] == script.DEFAULTS["settings"]["checkpoint_profile"]
+    assert wanted["settings"]["checkpoint_profile"] == DEFAULTS["settings"]["checkpoint_profile"]
     assert wanted["settings"]["checkpoint_profile"]["name"] == "auto-no-custom-v1"
     changed = [key for key, value in wanted["settings"].items() if owner["settings"].get(key) != value]
     assert changed == ["checkpoint_profile"]
@@ -76,17 +78,21 @@ def test_keep_capabilities_changes_only_the_stage_settings(script, monkeypatch):
 
 def test_keep_capabilities_needs_an_existing_selection(script):
     with pytest.raises(SystemExit):
-        script.keep_current({"selection_id": None})
+        script.keep_current({"selection_id": None}, None, DEFAULTS)
 
 
 def test_profile_defaults_and_assistants_come_from_the_selected_profile(script):
-    assert script.conversation_defaults(script.STAGE) == (script.STAGE["conversation_defaults"], "profile")
-    bare = {key: value for key, value in script.STAGE.items() if key != "conversation_defaults"}
-    assert script.conversation_defaults(bare) == (script.DEFAULTS, "stage.json")
-    assert script.assistant_names(script.STAGE) == ["fa-stage-a", "fa-stage-b"]
+    assert script.conversation_defaults(STAGE) == STAGE["conversation_defaults"]
+    bare = {key: value for key, value in STAGE.items() if key != "conversation_defaults"}
+    assert script.assistant_names(STAGE) == ["fa-stage-a", "fa-stage-b"]
     own = {"prompt_profile": "fa-instruction-v4", "excluded_capabilities": [],
            "settings": {"state_profile": "foundry-responses-v1"}}
-    assert script.conversation_defaults({**bare, "conversation_defaults": own}) == (own, "profile")
+    assert script.conversation_defaults({**bare, "conversation_defaults": own}) == own
+
+
+def test_dev_profile_keeps_the_conversation_defaults_it_borrowed_from_stage_before_the_profile_was_required(script):
+    dev = json.loads((ROOT / "deploy" / "dev" / "dev.json").read_text(encoding="utf-8"))
+    assert script.conversation_defaults(dev) == STAGE["conversation_defaults"]
 
 
 def _owner_template(script):
@@ -100,7 +106,7 @@ def _owner_template(script):
 
 def test_keep_capabilities_without_a_selection_requires_an_explicit_owner_template(script):
     with pytest.raises(SystemExit, match="--initial-template"):
-        script.keep_current({"selection_id": None})
+        script.keep_current({"selection_id": None}, None, DEFAULTS)
 
 
 def test_initial_template_loader_preserves_exact_source_references(script, tmp_path):
@@ -116,12 +122,12 @@ def test_initial_template_loader_preserves_exact_source_references(script, tmp_p
 
 def test_keep_capabilities_applies_settings_to_an_explicit_owner_template(script):
     initial = _owner_template(script)
-    wanted = script.keep_current({"selection_id": None}, initial)
+    wanted = script.keep_current({"selection_id": None}, initial, DEFAULTS)
     assert wanted["role"] == initial["role"]
     assert wanted["settings"]["capabilities"] == initial["settings"]["capabilities"]
     assert wanted["skills"] == initial["skills"]
     assert wanted["settings"]["state_profile"] == "foundry-responses-v1"
-    for key, value in script.DEFAULTS["settings"].items():
+    for key, value in DEFAULTS["settings"].items():
         assert wanted["settings"][key] == value
     assert "state_profile" not in initial["settings"]
     AgentTemplate.model_validate_json(json.dumps(wanted))
@@ -175,7 +181,7 @@ def test_fresh_scoped_agent_without_initial_template_makes_no_export_or_post(scr
     stage = _Unselected()
     agent = {"name": "fa-v18-b", "agent_id": "b"}
     with pytest.raises(SystemExit, match="--initial-template"):
-        script.select(stage, {}, tmp_path, agent, "r1", False, True)
+        script.select(stage, {}, tmp_path, agent, "r1", False, True, DEFAULTS)
     assert stage.gets == ["selection"]
     assert stage.posts == []
 
@@ -188,7 +194,7 @@ def test_unknown_fresh_selection_reconciles_its_saved_template_without_resending
     intent.write_text(json.dumps({"body": {
         "request_id": "r1-fa-v18-b", "expected_selection_id": None, "template": initial,
     }}), encoding="utf-8")
-    result, wanted = script.select(stage, {}, tmp_path, agent, "r1", False, True)
+    result, wanted = script.select(stage, {}, tmp_path, agent, "r1", False, True, DEFAULTS)
     assert result["outcome"] == "intent-exists-reconciled"
     assert script._same(wanted, initial)
     assert stage.posts == ["selection-reconcile"]
@@ -200,11 +206,11 @@ def test_owner_bootstrap_selects_explicit_template_once_and_preserves_capabiliti
     initial = _owner_template(script)
     stage = _Unselected()
     agent = {"name": "fa-v18-a", "agent_id": "a"}
-    dry, _ = script.select(stage, {}, tmp_path, agent, "r1", True, True, initial_template=initial)
+    dry, _ = script.select(stage, {}, tmp_path, agent, "r1", True, True, DEFAULTS, initial_template=initial)
     assert dry["outcome"] == "dry-run" and dry["would_replace"] is None
     assert dry["capabilities"] == [item["entry_id"] for item in initial["settings"]["capabilities"]]
     assert "state_profile" in dry["changed_settings"] and stage.posts == []
-    result, wanted = script.select(stage, {}, tmp_path, agent, "r1", False, True, initial_template=initial)
+    result, wanted = script.select(stage, {}, tmp_path, agent, "r1", False, True, DEFAULTS, initial_template=initial)
     assert result["outcome"] == "http_200" and stage.posts == ["select"]
     assert script._same(stage.selection["template"], wanted)
     assert stage.selection["template"]["settings"]["state_profile"] == "foundry-responses-v1"
@@ -212,7 +218,7 @@ def test_owner_bootstrap_selects_explicit_template_once_and_preserves_capabiliti
     assert stage.selection["template"]["role"] == initial["role"]
     assert stage.selection["template"]["settings"]["capabilities"] == initial["settings"]["capabilities"]
     assert stage.selection["template"]["skills"] == initial["skills"]
-    again, _ = script.select(stage, {}, tmp_path, agent, "r1", False, True)
+    again, _ = script.select(stage, {}, tmp_path, agent, "r1", False, True, DEFAULTS)
     assert again["outcome"] == "intent-exists-reconciled" and stage.posts == ["select", "selection-reconcile"]
 
 
@@ -252,7 +258,7 @@ class _Stage:
 
 def _manual_owner(script, capabilities):
     offered, _ = options()
-    owner = script.template(offered)
+    owner = script.template(offered, DEFAULTS)
     owner["settings"]["capabilities"] = capabilities(owner["settings"]["capabilities"])
     owner["settings"]["checkpoint_profile"] = {"name": "manual-no-custom-v1", "platform": "linux-x64",
                                                "provider": "openai-responses"}
@@ -262,7 +268,7 @@ def _manual_owner(script, capabilities):
 @pytest.mark.parametrize("capabilities", [lambda caps: caps[:3], lambda caps: []], ids=["some", "none"])
 def test_keep_capabilities_dry_run_reads_the_server_form(script, tmp_path, capabilities):
     stage = _Stage(_manual_owner(script, capabilities))
-    result, wanted = script.select(stage, {}, tmp_path, {"name": "fa-stage-a", "agent_id": "a"}, "r1", True, True)
+    result, wanted = script.select(stage, {}, tmp_path, {"name": "fa-stage-a", "agent_id": "a"}, "r1", True, True, DEFAULTS)
     assert result["changed_settings"] == ["checkpoint_profile"] and wanted is None
     assert result["capabilities"] == [item["entry_id"] for item in
                                       stage.selection["template"]["settings"].get("capabilities", [])]
@@ -272,10 +278,10 @@ def test_keep_capabilities_dry_run_reads_the_server_form(script, tmp_path, capab
 def test_keep_capabilities_writes_once_and_a_rerun_only_reconciles(script, tmp_path):
     stage = _Stage(_manual_owner(script, lambda caps: caps[:3]))
     agent = {"name": "fa-stage-a", "agent_id": "a"}
-    result, wanted = script.select(stage, {}, tmp_path, agent, "r1", False, True)
+    result, wanted = script.select(stage, {}, tmp_path, agent, "r1", False, True, DEFAULTS)
     assert result["outcome"] == "http_200" and stage.posts == ["select"]
     assert script._same(stage.selection["template"], wanted)
     assert stage.selection["template"]["settings"]["checkpoint_profile"]["name"] == "auto-no-custom-v1"
-    again, _ = script.select(stage, {}, tmp_path, agent, "r1", False, True)
+    again, _ = script.select(stage, {}, tmp_path, agent, "r1", False, True, DEFAULTS)
     assert again["outcome"] == "intent-exists-reconciled" and stage.posts == ["select", "selection-reconcile"]
 

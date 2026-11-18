@@ -43,18 +43,10 @@ server owns authentication, supervision, and native adapter installation.
 New public Interfaces:
   authority_snapshot(store, keys) -> Mapping[str, Record | None]
   DeliveryConsumer(core).consume(obligation_id, context, worker_id) -> dict
-  DeliveryConsumer(core).drain(root_budget_id, resolve_context, worker_id,
-                               limit=4) -> tuple[dict, ...]
-  The server may pass its exact pending_binding for the native assistant C1
-  pull profile. A complete current eligibility read can defer a new nonready
-  page without writing or consuming scan quota. It never caches that decision,
-  suppresses errors, fulfills an obligation, or changes an existing page.
 New keys (all passed through control_key, inside the existing authority):
   delivery-consumer-plan(obligation_id): immutable original final command/request
-  delivery-consumer-cursor(root_budget_id): resumable, rotating active page
-  delivery-consumer-page(root_budget_id, sequence): retained scan intent
 Existing admission intent, result, obligation, outbox and receipt rows remain the
-authorities. A page consumes one existing root scans_remaining reservation.
+authorities.
 Native and offline configurations have distinct configuration digests; synthetic
 rows cannot be relabelled native by changing RuntimeRegistration.mode.
 """
@@ -66,7 +58,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Annotated, Literal, TypeVar
+from typing import Annotated, Literal, TypeVar
 
 from pydantic import ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -75,9 +67,6 @@ from .behavior_store import BehaviorStore, ControlChanges, ControlRequest, Contr
 from .errors import Problem
 from .models import Identifier, StrictModel
 from .records import Record
-
-if TYPE_CHECKING:
-    from .behavior_runtime import RuntimeBinding
 
 RUNTIME_VERSION = "fa-delivery-contract-v1"
 Count = Annotated[int, Field(ge=0, le=2**63 - 1)]
@@ -1306,90 +1295,7 @@ class _ConsumerPlan(_Bound):
     request: ControlRequest
 
 
-class _ConsumerPage(_Bound):
-    kind: Literal["delivery_consumer_page"] = "delivery_consumer_page"
-    root_budget_id: Identifier
-    sequence: Count = 0
-    offset: Annotated[int, Field(ge=0, le=32)] = 0
-    selected: Annotated[tuple[Identifier, ...], Field(max_length=16)] = ()
-    active: bool = False
-
-
 _C1_JOB_STATES = frozenset({"queued", "starting", "running", "capacity_uncertain"})
-
-
-def _require_defer_scope(binding: RuntimeBinding, root_budget_id: str, registration, contract: RuntimeContract) -> None:
-    from .behavior_assistant_wire import CHECKS
-    if (registration.mode != "native" or set(binding.work.required_checks) != set(CHECKS)
-            or binding.child_jobs or binding.owner.root_budget_id != root_budget_id
-            or binding.team_id != contract.team_id):
-        raise Problem(403, "DELIVERY_DEFER_SCOPE_DENIED", "one exact native assistant pull binding is required")
-
-
-def _require_defer_policy(policy, current_policy: PolicyRecord, owner: OwnerRecord, context: ExecutionContext,
-                          binding: RuntimeBinding, now: datetime) -> None:
-    from .behavior_runtime import RUNTIME_VERSION
-    if (policy.binding_digest != _digest([RUNTIME_VERSION, "native", binding.model_dump(mode="json")])
-            or not policy.active or not current_policy.active or current_policy.policy_id != context.policy_id
-            or policy.operation_policy_revision != current_policy.revision or now >= policy.valid_until
-            or binding.operation_id not in owner.operation_ids):
-        raise Problem(403, "BEHAVIOR_CURRENT_POLICY_DENIED", "current owner, policy or binding is unavailable")
-
-
-def _require_defer_readiness(current, published, readiness: ReadinessEvidence, now: datetime) -> None:
-    if current != published or not readiness.observed_at <= now < readiness.expires_at:
-        raise Problem(403, "DELIVERY_PREREQUISITES_MISSING", "current readiness is unavailable")
-
-
-def _require_defer_quota(quota: QuotaRecord, index: PendingIndexRecord, root_budget_id: str, binding: RuntimeBinding) -> None:
-    if (quota.scope_id != root_budget_id or quota.root_request_id != binding.root_request_id
-            or quota.pending != sum(not entry.instruction for entry in index.entries)):
-        raise Problem(403, "DELIVERY_SCOPE_DENIED", "root index/quota binding differs")
-
-
-def _require_defer_job(pool, job, published, context: ExecutionContext, binding: RuntimeBinding) -> None:
-    if (pool.workspace_id != published.worker_workspace_id
-            or pool.configuration_digest != published.worker_configuration_digest
-            or job.configuration_digest != pool.configuration_digest or job.owner != context
-            or job.spec.job_id != binding.job_id or job.spec.work_id != binding.work.work_id
-            or job.spec.obligation_id != binding.obligation_id):
-        raise Problem(403, "DELIVERY_SCOPE_DENIED", "original worker/job binding differs")
-
-
-def _require_defer_slot(pool, job) -> None:
-    if len(pool.slots) == 1 and (pool.slots[0].number != 0 or
-            pool.slots[0].binding != job.binding and job.state in _C1_JOB_STATES):
-        raise Problem(403, "DELIVERY_SCOPE_DENIED", "original C1 reservation differs from its job")
-
-
-def _require_defer_delivery(obligation: _Obligation, work: _Work, binding: RuntimeBinding) -> None:
-    # _work already tied obligation.work_id to work.definition, so the definition covers both.
-    if (obligation.route != binding.route or obligation.event_id != binding.event_id
-            or obligation.root_request_id != binding.root_request_id
-            or work.definition != binding.work):
-        raise Problem(403, "DELIVERY_SCOPE_DENIED", "exact original delivery binding differs")
-
-
-def _defer_entry(obligation: _Obligation, index: PendingIndexRecord) -> PendingEntry:
-    """The pending entry C1 expects; a lone entry for this obligation must match it."""
-    expected = PendingEntry(
-        obligation_id=obligation.obligation_id, owner_record_id=obligation.owner_record_id,
-        conversation_id=obligation.conversation_id, review_at=obligation.review_at,
-        generation=obligation.generation, automation=obligation.automation, due_pending=obligation.due_pending)
-    if (len(index.entries) == 1 and index.entries[0].obligation_id == obligation.obligation_id
-            and index.entries[0] != expected):
-        raise Problem(409, "DELIVERY_INDEX_INVALID", "original pending entry differs from its obligation")
-    return expected
-
-
-def _worker_moved_on(pool, job, binding: RuntimeBinding) -> bool:
-    return (len(pool.slots) != 1 or pool.pending != (binding.job_id,) or pool.completions != ()
-            or job.state not in _C1_JOB_STATES or job.cancel_requested)
-
-
-def _delivery_moved_on(obligation: _Obligation, work: _Work, plan: Record | None) -> bool:
-    return (obligation.fulfillment != "pending" or obligation.final_delivery_id is not None
-            or plan is not None or work.state != "queued")
 
 
 class DeliveryConsumer:
@@ -1428,77 +1334,6 @@ class DeliveryConsumer:
             (self.core._now() if now is None else now) < current.deadline and budget.active and budget.remaining_attempts
             and budget.remaining_units and current.automation == "active"
         )
-
-    def _defer_page(self, rows, page_key: str, root_budget_id: str) -> _ConsumerPage | None:
-        page = None if rows[page_key] is None else self.core._row(rows, page_key, _ConsumerPage)
-        if page is not None and page.root_budget_id != root_budget_id:
-            raise Problem(403, "DELIVERY_SCOPE_DENIED", "consumer page belongs to another root")
-        return page
-
-    def _defer_pending(self, root_budget_id: str, resolve_context: Callable[[str], ExecutionContext],
-                       binding: RuntimeBinding) -> bool:
-        """Read-only, exact native C1 eligibility; no remembered scheduling decision."""
-        from .behavior_inbox import InboxDeploymentEvidence
-        from .behavior_runtime import RuntimeBinding, RuntimePolicy, runtime_key
-        from .behavior_workers import JobRecord, _Pool, worker_key
-
-        core = self.core
-        binding = _check(binding, RuntimeBinding)
-        registration, contract = core._enabled()
-        _require_defer_scope(binding, root_budget_id, registration, contract)
-        before = core.store._guard()
-        readiness = core._readiness()
-        inbox_key = control_key("inbox-readiness", core.configuration_digest())
-        published = core._row(authority_snapshot(core.store, (inbox_key,)), inbox_key, InboxDeploymentEvidence)
-        context = _check(resolve_context(binding.owner.owner_record_id), ExecutionContext)
-        if context != binding.owner:
-            raise Problem(403, "DELIVERY_OWNER_DENIED", "deferral requires the exact configured owner")
-        index_key = control_key("delivery-index", root_budget_id)
-        page_key = control_key("delivery-consumer-cursor", root_budget_id)
-        quota_key = control_key("delivery-quota", "root", root_budget_id)
-        pool_key = worker_key("pool", published.worker_workspace_id)
-        job_key = worker_key("job", binding.job_id)
-        policy_key = runtime_key("policy", binding.binding_id)
-        intent_id = control_key("delivery-intent-id", binding.event_id)
-        plan_key = control_key("delivery-consumer-plan", binding.obligation_id)
-        keys = (
-            index_key, page_key, quota_key, inbox_key, pool_key, job_key, policy_key,
-            control_key("owner", context.owner_record_id), control_key("policy", context.policy_id),
-            control_key("delivery-conversation", context.conversation_id),
-            control_key("delivery-obligation", binding.obligation_id),
-            control_key("delivery-work-state", binding.obligation_id),
-            control_key("budget", root_budget_id), control_key("delivery-intent", intent_id), plan_key,
-        )
-        rows = authority_snapshot(core.store, keys)
-        core._owner(rows, context)
-        core._row(rows, control_key("delivery-conversation", context.conversation_id), _Conversation)
-        owner = core._row(rows, control_key("owner", context.owner_record_id), OwnerRecord)
-        current_policy = core._row(rows, control_key("policy", context.policy_id), PolicyRecord)
-        policy = core._row(rows, policy_key, RuntimePolicy)
-        now = core._now()
-        _require_defer_policy(policy, current_policy, owner, context, binding, now)
-        _require_defer_readiness(core._row(rows, inbox_key, InboxDeploymentEvidence), published, readiness, now)
-        index = core._index(rows, context)
-        _require_defer_quota(core._row(rows, quota_key, QuotaRecord), index, root_budget_id, binding)
-        page = self._defer_page(rows, page_key, root_budget_id)
-        pool = core._row(rows, pool_key, _Pool)
-        job = core._row(rows, job_key, JobRecord)
-        _require_defer_job(pool, job, published, context, binding)
-        _require_defer_slot(pool, job)
-        obligation = core._obligation(rows, binding.obligation_id, context)
-        work = core._work(rows, obligation)
-        _require_defer_delivery(obligation, work, binding)
-        expected_entry = _defer_entry(obligation, index)
-        if (index.entries != (expected_entry,) or page is not None and page.active
-                or _worker_moved_on(pool, job, binding) or _delivery_moved_on(obligation, work, rows[plan_key])):
-            return False
-        current, work, budget = self._original_work(rows, binding.obligation_id, context, intent_id)
-        if core.store._guard() != before:
-            raise Problem(412, "BEHAVIOR_CONFLICT", "authority changed during delivery eligibility")
-        now = core._now()
-        if now >= policy.valid_until or not readiness.observed_at <= now < readiness.expires_at:
-            raise Problem(403, "BEHAVIOR_CURRENT_POLICY_DENIED", "delivery eligibility expired during validation")
-        return bool(self._business_pending(current, work, budget, now=now))
 
     def consume(self, obligation_id: str, context: ExecutionContext, worker_id: str) -> dict:
         core = self.core
@@ -1560,84 +1395,3 @@ class DeliveryConsumer:
         receipt = core.prepare_message(plan.command, plan.context)
         return core._result(status="awaiting_client_ack", **receipt.payload["result"])
 
-    def drain(
-        self, root_budget_id: str, resolve_context: Callable[[str], ExecutionContext],
-        worker_id: str, *, limit: int = 4,
-        pending_binding: RuntimeBinding | None = None,
-    ) -> tuple[dict, ...]:
-        if type(limit) is not int or not 1 <= limit <= 16:
-            raise Problem(422, "DELIVERY_SCAN_LIMIT", "drain limit must be 1..16")
-        core = self.core
-        if pending_binding is not None:
-            if self._defer_pending(root_budget_id, resolve_context, pending_binding):
-                return ()
-        index_key = control_key("delivery-index", root_budget_id)
-        page_key = control_key("delivery-consumer-cursor", root_budget_id)
-        quota_key = control_key("delivery-quota", "root", root_budget_id)
-        keys = (index_key, page_key, quota_key)
-        rows = authority_snapshot(core.store, keys)
-        previous = None if rows[page_key] is None else core._row(rows, page_key, _ConsumerPage)
-        sequence = 0 if previous is None else previous.sequence
-        if previous is None or not previous.active:
-            request = ControlRequest(
-                request_id=control_key("delivery-consumer-scan", root_budget_id, str(sequence)),
-                request_digest=_digest([root_budget_id, sequence, limit, core.configuration_digest()]),
-                read_set=keys,
-            )
-
-            def select(snapshot):
-                from .behavior_delivery_pending import read
-                index = read(core, snapshot, root_budget_id)
-                quota = core._row(snapshot, quota_key, QuotaRecord)
-                current = None if snapshot[page_key] is None else core._row(snapshot, page_key, _ConsumerPage)
-                if (
-                    index.root_budget_id != root_budget_id or quota.scope_id != root_budget_id
-                    or quota.scope_kind != "root"
-                    or quota.pending != sum(not entry.instruction for entry in index.entries)
-                ):
-                    raise Problem(403, "DELIVERY_SCOPE_DENIED", "root index/quota binding differs")
-                if current != previous:
-                    raise Problem(409, "DELIVERY_CURSOR_STALE", "another consumer advanced the durable page")
-                if quota.scans_remaining < 1:
-                    raise Problem(429, "DELIVERY_SCAN_LIMIT", "finite consumer scan budget is exhausted")
-                entries = sorted(index.entries, key=lambda entry: entry.obligation_id)
-                offset = 0 if current is None or current.offset >= len(entries) else current.offset
-                selected = tuple(entry.obligation_id for entry in entries[offset:offset + limit])
-                page = _ConsumerPage(
-                    configuration_digest=core.configuration_digest(), evidence_mode=core.registration.mode,
-                    root_budget_id=root_budget_id, sequence=sequence + 1,
-                    offset=offset + len(selected), selected=selected, active=True,
-                )
-                return ControlChanges(writes=(
-                    core._write(page_key, page, "create" if current is None else "replace"),
-                    core._write(control_key("delivery-consumer-page", root_budget_id, str(page.sequence)),
-                                page, "create", _material(page.model_dump(mode="json"))),
-                    core._write(quota_key, _update(quota, scans_remaining=quota.scans_remaining - 1)),
-                ), result=core._result(page=page.model_dump(mode="json")))
-
-            from .behavior_delivery_pending import transact
-            transact(core, request, select, root_budget_id)
-        page = core._row(authority_snapshot(core.store, (page_key,)), page_key, _ConsumerPage)
-        results = []
-        for obligation_id in page.selected:
-            try:
-                ob_key = control_key("delivery-obligation", obligation_id)
-                ob = core._row(authority_snapshot(core.store, (ob_key,)), ob_key, _Obligation)
-                results.append(DeliveryConsumer(core).consume(
-                    obligation_id, resolve_context(ob.owner_record_id), worker_id))
-            except Problem as exc:
-                results.append(core._result(obligation_id=obligation_id, problem=exc.body["error"]["code"]))
-        done = ControlRequest(
-            request_id=control_key("delivery-consumer-page-done", root_budget_id, str(page.sequence)),
-            request_digest=_digest(page.model_dump(mode="json")), read_set=(page_key,),
-        )
-
-        def complete(snapshot):
-            current = core._row(snapshot, page_key, _ConsumerPage)
-            if current != page:
-                raise Problem(409, "DELIVERY_CURSOR_STALE", "the active consumer page differs")
-            return ControlChanges(writes=(core._write(page_key, _update(page, active=False)),),
-                                  result=core._result(page_completed=page.sequence))
-
-        core.store.transact(done, complete)
-        return tuple(results)

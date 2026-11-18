@@ -10,7 +10,7 @@ from shared_context.errors import Problem
 from shared_context import native_binding
 from shared_context.native_binding import NativeBindingStore
 from test_conversation_transfer_startup import synthetic_standing_v1  # fixture
-from test_instruction_flow import instruction_models  # fixture
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key  # fixture
 from test_native_binding import CountingRepository
 from test_native_turn_api import native_api  # fixture

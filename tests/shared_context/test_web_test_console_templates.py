@@ -11,21 +11,20 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from shared_context.behavior_assistant import _LocalHttp
+from local_http_helpers import _LocalHttp
 from shared_context.behavior_agent_template import AgentTemplate, TemplateRole
 from shared_context.behavior_profile_selection import SelectConversationProfile
 from shared_context.behavior_skill_prompt import assemble_prompt
-from test_agent_template import PATH, template_case
-from test_behavior_assistant import assistant
-from test_instruction_flow import runtime_path
+from assistant_api_helpers import assistant_api, template_case_api
+from agent_template_helpers import PATH
 from test_m3_auth import jwk_client, signing_key
-from test_web_test_console_standing import configuration, open_ui
+from web_test_console_standing_helpers import configuration, open_ui
 from web_test_console.adapter import parse_config
 
 
 @pytest.fixture
-def template_console(template_case, tmp_path):
-    h, control, human, source, _ = template_case
+def template_console(template_case_api, tmp_path):
+    h, control, human, source, _ = template_case_api
     local = _LocalHttp(h.client)
     case = SimpleNamespace(h=h, control=control, human=human, source=source,
                            calls=[], mutate=lambda request, response: response,
@@ -68,7 +67,6 @@ def test_download_and_inspection_use_original_bytes_without_changing_state(templ
     assert c.calls == [("GET", PATH), ("POST", PATH + "/inspect")]
     assert c.h.transport.backing.rows == rows and c.h.artifacts.repository.data == artifacts
     assert c.journal.read_bytes() == journal and c.control.records == {}
-    assert c.h.endpoint.requests == []
 
 
 def test_current_selection_is_a_pure_signed_read_without_changing_config_or_journal(template_console):
@@ -83,7 +81,7 @@ def test_current_selection_is_a_pure_signed_read_without_changing_config_or_jour
     assert response.headers["cache-control"] == "no-store"
     assert c.calls == [("GET", PATH + "/selection")]
     assert c.h.transport.backing.rows == rows and c.journal.read_bytes() == journal
-    assert c.config.model_dump_json() == config and not c.control.records and not c.h.endpoint.requests
+    assert c.config.model_dump_json() == config and not c.control.records
 
 
 def selection_command(c, *, request_id="ui-select-original", previous=None, profile="fa-instruction-v1"):
@@ -146,7 +144,7 @@ def test_a_different_readonly_profile_is_selected_once_with_its_full_original_co
         reopened.ui.close()
     assert len(saved) == 1 and c.calls.count(("POST", PATH + "/select")) == 1
     assert c.control.policy.model_dump_json() == original_policy and c.config.model_dump_json() == config
-    assert not c.control.records and not c.h.endpoint.requests
+    assert not c.control.records
 
 
 def test_lost_selection_response_reconciles_saved_command_after_restart_without_rewriting_unknown(template_console):
@@ -187,7 +185,7 @@ def test_lost_selection_response_reconciles_saved_command_after_restart_without_
     original_body = next(body for path, body in bodies if path == PATH + "/select")
     assert [body for path, body in bodies if path == PATH + "/selection-reconcile"] == [original_body]
     assert c.calls.count(("POST", PATH + "/select")) == 1
-    assert c.h.transport.backing.rows == rows and not c.h.endpoint.requests and not c.control.records
+    assert c.h.transport.backing.rows == rows and not c.control.records
 
 
 def test_unknown_uncommitted_selection_never_becomes_permission_to_resubmit(template_console):
@@ -343,7 +341,7 @@ def test_server_cas_rejects_stale_choice_and_fresh_distinct_choice_keeps_old_int
     with sqlite3.connect(c.journal) as db:
         assert db.execute("SELECT task_id, phase, intent, outcome FROM intents ORDER BY rowid").fetchall()[:2] == originals
     assert len(c.browser.ui.get("/api/state").json()["template_selections"]) == 3
-    assert not c.control.records and not c.h.endpoint.requests
+    assert not c.control.records
 
 
 @pytest.mark.parametrize("authority", ["read-only", "revoked", "forged-role", "missing-skill"])
@@ -376,7 +374,7 @@ def test_inspection_does_not_replace_current_server_selection_authority(template
     expected = "REJECTED" if rejected_before_write(error["code"], error["upstream_status"]) else "UNKNOWN"
     assert expected == "REJECTED"
     assert c.browser.ui.get("/api/state").json()["template_selections"][0]["state"] == expected
-    assert c.h.transport.backing.rows == before and not c.h.endpoint.requests
+    assert c.h.transport.backing.rows == before
     assert choose(c, command).status_code == 409 and c.calls.count(("POST", PATH + "/select")) == 1
 
 
@@ -552,7 +550,7 @@ def test_older_selection_readers_are_unavailable_without_fallback(template_conso
     assert response.status_code == 409 and response.json()["error"]["code"] == "TEMPLATE_SELECTION_UNAVAILABLE"
     assert response.json()["error"]["upstream_status"] == 404
     assert c.calls == [("GET" if reader == "selection" else "POST", PATH + "/" + reader)]
-    assert c.h.transport.backing.rows == rows and not c.h.endpoint.requests
+    assert c.h.transport.backing.rows == rows
 
 
 def test_reconciliation_never_accepts_a_replacement_command_from_the_browser(template_console):
@@ -746,7 +744,7 @@ def test_template_options_are_a_pure_signed_read_through_the_local_console(templ
     assert c.calls == [("GET", PATH + "/options")]
     assert c.h.transport.backing.rows == rows and c.h.artifacts.repository.data == artifacts
     assert c.journal.read_bytes() == journal and c.config.model_dump_json() == config
-    assert not c.control.records and not c.h.endpoint.requests
+    assert not c.control.records
     for bad in ({"params": {"x": "1"}},):
         assert c.browser.ui.get("/api/agent-template/options", **bad).status_code == 403
 
@@ -783,7 +781,7 @@ def test_system_prompt_is_a_pure_signed_read_of_the_server_rebuild(template_cons
     assert c.calls == [("GET", PATH + "/system-prompt")]
     assert c.h.transport.backing.rows == rows and c.h.artifacts.repository.data == artifacts
     assert c.journal.read_bytes() == journal and c.config.model_dump_json() == config
-    assert not c.control.records and not c.h.endpoint.requests
+    assert not c.control.records
     assert c.browser.ui.get("/api/agent-template/system-prompt", params={"x": "1"}).status_code == 403
 
 

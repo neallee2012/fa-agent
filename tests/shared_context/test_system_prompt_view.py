@@ -30,7 +30,7 @@ from test_native_turn_wire import receipt_for, submit
 from test_native_turns import local_env
 from test_conversation_transfer_startup import synthetic_standing_v1
 from test_m3_auth import jwk_client, signing_key
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 
 ROLE_TEXT = "你是 Team 的會計助理，回覆用繁體中文。"
 

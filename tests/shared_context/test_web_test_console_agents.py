@@ -15,8 +15,9 @@ from web_test_console.adapter import ConsoleError, canonical, parse_config, sha
 from web_test_console.bridge import create_app
 from web_test_console.instructions import InstructionConnection
 from test_m3_auth import jwk_client, signing_key
-from test_web_test_console_frozen_interface import real_interface
-from test_web_test_console_standing import configuration
+from assistant_api_helpers import assistant_api, picker_api
+from instruction_flow_helpers import instruction_models
+from web_test_console_standing_helpers import configuration
 
 
 def directory_payload():
@@ -79,9 +80,9 @@ def supplied_peer(c, manifest):
 
 
 def test_launcher_accepts_only_the_pinned_agent_connections_without_touching_original_journal(
-    real_interface, tmp_path, monkeypatch,
+    picker_api, tmp_path, monkeypatch,
 ):
-    c = real_interface
+    c = picker_api
     manifest = connection_file(c, tmp_path)
     calls = []
     monkeypatch.setattr(launcher, "create_app", lambda *args, **kwargs: calls.append((args, kwargs)) or object())
@@ -99,8 +100,8 @@ def test_launcher_accepts_only_the_pinned_agent_connections_without_touching_ori
     assert len(calls) == 1
 
 
-def test_server_directory_selects_ids_without_falling_back_for_a_missing_peer_config(real_interface, tmp_path):
-    c = real_interface
+def test_server_directory_selects_ids_without_falling_back_for_a_missing_peer_config(picker_api, tmp_path):
+    c = picker_api
     manifest = connection_file(c, tmp_path)
     connections = AgentConnections.model_validate_json(manifest.path.read_bytes())
     calls = []
@@ -149,12 +150,12 @@ def test_server_directory_selects_ids_without_falling_back_for_a_missing_peer_co
     assert all(method == "GET" for method, _ in calls)
 
 
-def test_directory_beyond_two_agents_lists_every_usable_entry_without_local_fallback(real_interface, tmp_path):
+def test_directory_beyond_two_agents_lists_every_usable_entry_without_local_fallback(picker_api, tmp_path):
     from shared_context.behavior_agent_message_wire import MAX_TEAM_AGENTS
 
     page = Path(create_app.__code__.co_filename).with_name("index.html").read_text(encoding="utf-8")
     assert f"value.agents.length>{MAX_TEAM_AGENTS}" in page
-    c = real_interface
+    c = picker_api
     manifest = connection_file(c, tmp_path)
     connections = AgentConnections.model_validate_json(manifest.path.read_bytes())
     directory = directory_payload()
@@ -222,10 +223,10 @@ def test_directory_beyond_two_agents_lists_every_usable_entry_without_local_fall
     assert not (tmp_path / "peer.sqlite3").exists()
 
 
-def test_page_load_rereads_a_directory_older_than_a_minute_so_a_retired_agent_disappears(real_interface, tmp_path):
+def test_page_load_rereads_a_directory_older_than_a_minute_so_a_retired_agent_disappears(picker_api, tmp_path):
     from datetime import timedelta
 
-    c = real_interface
+    c = picker_api
     connections = AgentConnections.model_validate_json(connection_file(c, tmp_path).path.read_bytes())
     listed = directory_payload()
     listed["agents"][1].update(state="unavailable", reason="AGENT_SCOPE_MISSING")
@@ -270,9 +271,9 @@ def test_page_load_rereads_a_directory_older_than_a_minute_so_a_retired_agent_di
 
 
 def test_two_clients_keep_agent_models_drafts_and_fixed_task_ids_in_separate_journals(
-    real_interface, tmp_path,
+    picker_api, tmp_path,
 ):
-    c = real_interface
+    c = picker_api
     manifest = connection_file(c, tmp_path)
     peer = supplied_peer(c, manifest)
     links = AgentConnections.model_validate_json(manifest.path.read_bytes())
@@ -339,9 +340,9 @@ def test_two_clients_keep_agent_models_drafts_and_fixed_task_ids_in_separate_jou
 
 
 def test_directory_failures_and_changed_peer_config_never_use_cached_routes_or_rewrite_journals(
-    real_interface, tmp_path,
+    picker_api, tmp_path,
 ):
-    c = real_interface
+    c = picker_api
     manifest = connection_file(c, tmp_path)
     supplied_peer(c, manifest)
     links = AgentConnections.model_validate_json(manifest.path.read_bytes())
@@ -400,9 +401,9 @@ def test_directory_failures_and_changed_peer_config_never_use_cached_routes_or_r
 
 
 def test_a_peer_pointing_at_another_configurations_journal_is_disabled_without_opening_it_for_write(
-    real_interface, tmp_path,
+    picker_api, tmp_path,
 ):
-    c = real_interface
+    c = picker_api
     manifest = connection_file(c, tmp_path)
     supplied_peer(c, manifest)
     peer_journal = Path(manifest.second["journal_path"])

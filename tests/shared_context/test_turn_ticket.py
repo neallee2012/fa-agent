@@ -15,10 +15,11 @@ from shared_context.behavior_work_policy import WorkRegistration, WorkRegistry
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models
-from test_light_route_authority import _agent, _session_id
+from instruction_flow_helpers import instruction_models
+from light_route_authority_helpers import _agent, _session_id
 from test_m3_auth import jwk_client, signing_key
-from test_session_authority_read import _fresh_turn_beside_uncertain_work, runtime_path
+from test_session_authority_read import _fresh_turn_beside_uncertain_work
+from session_authority_read_helpers import runtime_path
 from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1
 
 

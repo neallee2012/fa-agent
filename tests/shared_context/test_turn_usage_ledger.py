@@ -12,8 +12,10 @@ from shared_context.behavior_operations import _row
 from shared_context.behavior_turn_usage import TURN_USAGE_SCHEMA, ModelUsage, TurnModelUsage
 from shared_context.behavior_work_policy import CostLedger
 from shared_context.errors import Problem
-from test_conversation_transfer_startup import claimed_turn, read_startup, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from test_conversation_transfer_startup import claimed_turn, synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from legacy_turn_rows_helpers import stored_turn
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 
@@ -32,9 +34,9 @@ def ledger(c):
     return _row(rows, c.control.cost_key, CostLedger)
 
 
-def test_turn_usage_is_metered_once_and_replays_through_startup(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    job_id = claimed_turn(c, "usage-turn").binding.job_id
+def test_turn_usage_is_metered_once_and_replays_through_startup(stored_turn):
+    c = stored_turn("usage-turn")
+    job_id = c.turn.binding.job_id
     read_startup(c)
     before = ledger(c)
     usage = report(group())

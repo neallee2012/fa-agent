@@ -6714,6 +6714,18 @@ test("failed original result still awaiting forwarding is visible without implyi
   assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
 });
 
+test("a conversation on the retired job-bound lane shows one read-only sentence and no input, send, stop or reset",async()=>{
+  const data=blockedConversation();
+  Object.assign(data.composer,{read_only_legacy:true,editable:false,can_submit:false,can_follow_up:false,can_reset:false,
+    message:"這是舊版對話，只能查看，不能再送出。"});
+  const ui=await open(data);
+  for(const id of ["composer-surface","composer-shortcut","reset-session"])assert.equal(ui.nodes.get(id).hidden,true,id);
+  assert.equal(ui.text("instruction-reason"),"這是舊版對話，只能查看，不能再送出。");
+  assert.equal(ui.calls.filter(call=>call.method==="POST").length,0);
+  const native=await open(blockedConversation());
+  for(const id of ["composer-surface","composer-shortcut","reset-session"])assert.equal(native.nodes.get(id).hidden,false,id);
+});
+
 test("blocked continuation with an unknown or missing reason never echoes or guesses it",async()=>{
   for(const code of ["PRIVATE_BLOCKER_CANARY","toString",null]){
     const ui=await open(blockedConversation(code));
@@ -11644,10 +11656,17 @@ function inlineQuestionChat(lane="foundry-responses-v1"){
 }
 const shownNode=node=>JSON.stringify(node,(key,value)=>key==="events"?undefined:value);
 // stage 2026-10-10: a turn held by an approval card kept saying 「正在準備回覆…」 as if it were simply running.
-for(const kind of ["approval","question"]){
+// dev r47 2026-11-12: by the code, a turn held by a Connect card would say 「正在等你回答」, though nothing was asked.
+const HELD_REPLY={approval:"這個回合正在等你批准",question:"這個回合正在等你回答",connect:"這個回合正在等你連線"};
+for(const kind of ["approval","question","connect"]){
   test(`a running turn held by the owner's ${kind} card says so in its reply`,async()=>{
     let data;
     if(kind==="question")data=inlineQuestionChat("foundry-native-v1").data;
+    else if(kind==="connect"){
+      ({data}=inlineQuestionChat("foundry-native-v1"));const task=data.tasks[0],entry=consentItem(data.composer.thread_id);
+      Object.assign(entry.item.consent.call,{conversation_id:task.admission.conversation_id,request_id:task.task_id});
+      data.composer.attention=[entry];
+    }
     else{
       data=nativeChat("started");const task=data.tasks[0],pid="a".repeat(64);
       const approval={pending_id:pid,pending_digest:"b".repeat(64),call:{agent_id:"configured-agent",
@@ -11656,10 +11675,14 @@ for(const kind of ["approval","question"]){
       data.composer.attention=[{thread_id:data.composer.thread_id,label:"原工作",item:{
         schema_version:"fa-native-attention-v1",type:"approval_required",item_id:pid,approval,
         created_at:when,expires_at:"2026-01-01T00:10:00Z",purpose:"attention-only-not-approval"}}];
+      // An approval is named before a Connect card on the same turn, even when the Connect card is listed first.
+      const connect=consentItem(data.composer.thread_id);
+      Object.assign(connect.item.consent.call,{conversation_id:task.admission.conversation_id,request_id:task.task_id});
+      data.composer.attention.unshift(connect);
     }
     const ui=await open(data,{now:Date.parse(when)});
     const reply=turnNode(ui).children.find(node=>String(node.className).startsWith("assistant-message"));
-    assert.equal(reply.textContent,kind==="approval"?"這個回合正在等你批准":"這個回合正在等你回答");
+    assert.equal(reply.textContent,HELD_REPLY[kind]);
     const running=nativeChat("started");ui.render(running);
     assert.equal(turnNode(ui).children.find(node=>String(node.className).startsWith("assistant-message")).textContent,
       "正在準備回覆…","without a card it is the usual running line");
@@ -12545,6 +12568,27 @@ test("HITL dock: a Connect card of the open conversation shows in the dock with 
   consentOpen[0].children.find(node=>node.textContent==="查看原回合").events.click();
   const focusedConsent=[];walkNodes(dock.children[0],node=>{if(node.tagName==="BUTTON"&&node.focused)focusedConsent.push(node)});
   assert.deepEqual(focusedConsent.map(node=>node.textContent),["我連好了，繼續"]);
+});
+// dev r47 2026-11-12: a card that reached the page while the tab was hidden was not missing, only unread; it is read
+// the moment the tab is shown again.
+test("HITL dock: a Connect card that reaches the page while the tab is hidden is read once the tab is shown",async()=>{
+  const {data,task}=inlineQuestionChat("foundry-native-v1");
+  const c=consentCase("consent"),entry=c.entry;
+  Object.assign(entry.item.consent.call,{conversation_id:task.admission.conversation_id,request_id:task.task_id});
+  entry.thread_id=data.composer.thread_id;data.composer.attention=[];
+  const held=copy(data);held.composer.attention=[entry];
+  const ui=await open(data,{now:Date.parse(when),hitl:c.hitl});
+  await ui.tick();await ui.tick();
+  ui.context.document.hidden=true;ui.documentEvents.visibilitychange();
+  ui.render(held);await ui.tick();await ui.tick();
+  assert.deepEqual(c.reads,[],"the card is not read while the tab is hidden");
+  ui.context.document.hidden=false;ui.documentEvents.visibilitychange();await ui.tick();await ui.tick();
+  assert.deepEqual(c.reads,[`/api/native-hitl/${data.composer.thread_id}/consents/${c.cid}`]);
+  const dock=ui.nodes.get("attention-dock");
+  assert.equal(dock.hidden,false);
+  assert.equal(dock.children[0].attributes["data-consent-card"],c.cid);
+  assert.equal(turnNode(ui).children.find(node=>String(node.className).startsWith("assistant-message")).textContent,
+    "這個回合正在等你連線");
 });
 
 test("HITL dock: two pending cards sit oldest first under a count line, and 查看原回合 goes to the dock",async()=>{

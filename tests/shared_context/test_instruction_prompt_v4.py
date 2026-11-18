@@ -25,10 +25,9 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.native_local_capabilities import local_capability_provider
 from shared_context.native_turns import NativeTurnRuntime
 from shared_context.sdk_pin import RUNTIME_VERSION
-from test_behavior_assistant import assistant
-from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import instruction_models, runtime_path
-from test_instruction_prompt import saved_turn, sdk_options, submit
+from conversation_profile_selection_helpers import configured, template
+from instruction_flow_helpers import instruction_models, runtime_path
+from test_instruction_prompt import submit
 from test_m3_auth import jwk_client, signing_key
 from test_native_local_capabilities import MODEL_ROOT, Handlers, browser_grant, with_grants
 from test_native_turn_wire import submit as native_submit
@@ -123,31 +122,6 @@ def test_v4_is_selectable_and_composes_like_v3():
 def test_stage_new_conversations_default_to_v4():
     stage = json.loads((ROOT / "deploy" / "stage" / "stage.json").read_text(encoding="utf-8"))
     assert stage["conversation_defaults"]["prompt_profile"] == PROFILE
-
-
-def test_selected_v4_starts_new_conversations_and_old_v3_conversations_keep_v3(assistant, monkeypatch):
-    h, control, _ = configured(assistant)
-    chosen, _ = select(h, request_id="choose-v3", value=template(V3))
-    assert chosen.status_code == 200, chosen.text
-    calls, options = sdk_options(monkeypatch)
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "v3 answer."}, {"content": "v3 follow-up."}, {"content": "v4 answer."}])
-    first, _ = submit(h, "v3-original", "Find the 11:00 to 12:00 trains.")
-    assert h.runtime.controller.step(first["binding_id"]).state == "succeeded"
-    changed, _ = select(h, request_id="choose-v4", previous=chosen.json()["result"]["selection_id"],
-                        value=template(PROFILE))
-    assert changed.status_code == 200, changed.text
-    assert changed.json()["result"]["existing_conversations_changed"] is False
-    second, _ = submit(h, "v3-followup", "Book train 1313, aisle seat.", first["conversation_id"])
-    third, _ = submit(h, "v4-new", "Book train 1313, aisle seat.")
-    for accepted in (second, third):
-        assert h.runtime.controller.step(accepted["binding_id"]).state == "succeeded"
-    assert control.records[second["binding_id"]].profile.prompt_profile == V3
-    assert control.records[third["binding_id"]].profile.prompt_profile == PROFILE
-    assert len(calls) == 3
-    for configuration, profile in zip(options, (V3, V3, PROFILE), strict=True):
-        assert configuration["system_message"] == {"mode": "replace", "content": assemble_prompt(profile).system_message}
-    assert saved_turn(h, h.runtime.bindings[third["binding_id"]].job_id).prompt_assembly == assemble_prompt(PROFILE).record
 
 
 def test_native_turn_sends_v4_before_the_desktop_and_browser_handover(local_env, monkeypatch, tmp_path):

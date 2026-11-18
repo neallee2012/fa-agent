@@ -77,7 +77,7 @@ def build_responses_host(runtime, journal_root, contexts):
         return observed
 
     hosted = SimpleNamespace(
-        identity=IDENTITY, supervisor=SimpleNamespace(journal=SimpleNamespace(root=journal_root)))
+        identity=IDENTITY, root=journal_root)
     return create_host(hosted, native_runtime=runtime, responses_handler_factory=factory)
 
 

@@ -20,7 +20,7 @@ from shared_context.native_files_wire import WORKSPACE_ROOT
 from shared_context.native_turns import NativeTurnRuntime
 from shared_context.native_workspace_files import NativeWorkspaceFiles
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 from test_native_environment import invoke
 from test_native_responses import response_submit

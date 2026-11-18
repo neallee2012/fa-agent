@@ -2,8 +2,6 @@
 
 ``check`` runs on small fakes so each of its refusals is one line. ``preflight`` and ``refresh`` run on real synthetic
 turns; only what a case names is replaced, and no gate is reached through a private helper."""
-import hashlib
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -12,18 +10,17 @@ from shared_context import behavior_work_policy as work
 from shared_context import behavior_work_registry as registry
 from shared_context.behavior_agent_worker import AgentVmBinding
 from shared_context.behavior_assistant_wire import AssistantSubmit
-from shared_context.behavior_operations import control_key
 from shared_context.behavior_profile_selection import selection_key
-from shared_context.behavior_runtime import runtime_key
 from shared_context.behavior_work_policy import (
-    BudgetRecord, CostLedger, PerWorkRuntimePolicy, WorkPolicyControl, WorkPreflightQuery, refresh_once, work_policy_key,
+    WorkPolicyControl, refresh_once, work_policy_key,
 )
-from shared_context.behavior_workers import _Pool
 from shared_context.errors import Problem
 from test_conversation_transfer_startup import synthetic_standing_v1  # fixture
-from test_instruction_flow import instruction_models  # fixture
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key  # fixture
-from test_work_registration_gates import admitted, code, instruction, register, structured  # fixture
+from legacy_submit_rows_helpers import admitted, admitted_twice, fixed_work  # fixture
+from legacy_turn_rows_helpers import stored_turn  # fixture
+from test_work_registration_gates import code, instruction, structured  # fixture
 from test_work_result_access import Reads
 
 
@@ -232,20 +229,6 @@ def test_an_instruction_has_no_execution_deadline(monkeypatch):
 
 # preflight
 
-def sha(command):
-    return hashlib.sha256(command.model_dump_json().encode()).hexdigest()
-
-
-def fixed(rid="fixed-work", **changes):
-    command = AssistantSubmit(request_id=rid)
-    return WorkPreflightQuery(read_id="read", request_id=rid, submit_body_sha256=sha(command), **changes)
-
-
-def asked(command, **changes):
-    return WorkPreflightQuery(read_id="read", request_id=command.request_id, submit_body_sha256=sha(command),
-                              content=command.content, **{**({"conversation_id": command.conversation_id}
-                                                             if command.conversation_id else {}), **changes})
-
 
 def replaced(monkeypatch, **models):
     """``_row`` of one model answers with these fields changed."""
@@ -259,130 +242,10 @@ def replaced(monkeypatch, **models):
     monkeypatch.setattr(work, "_row", row)
 
 
-def test_preflight_asks_for_the_human_before_it_reads_the_query(synthetic_standing_v1, monkeypatch):
-    c = synthetic_standing_v1
-
-    def refused_human(principal, *args):
-        raise Problem(403, "OFFLINE_HUMAN", "OFFLINE")
-
-    monkeypatch.setattr(c.control, "_human", refused_human)
-    assert code(c.control.preflight, c.human, "not a query")[:2] == (403, "OFFLINE_HUMAN")
-
-
-def test_preflight_needs_the_exact_typed_query(synthetic_standing_v1):
-    c = synthetic_standing_v1
-
-    class Other(WorkPreflightQuery):
-        pass
-
-    assert code(c.control.preflight, c.human, Other(**fixed().model_dump()))[:2] == (422, "WORK_POLICY_QUERY")
-
-
-def test_preflight_refuses_attachments_without_an_instruction_before_comparing_bytes(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    query = WorkPreflightQuery.model_construct(
-        read_id="read", request_id="fixed-work", submit_body_sha256="f" * 64, content=None, conversation_id=None,
-        model=None, attachments=("anything",), files=())
-    assert code(c.control.preflight, c.human, query)[:2] == (422, "ATTACHMENT_FORMAT")
-
-
-def test_preflight_with_other_bytes_is_refused_before_any_refresh(synthetic_standing_v1, monkeypatch):
-    c = synthetic_standing_v1
-    monkeypatch.setattr(c.control, "refresh", lambda: pytest.fail("no refresh for other bytes"))
-    query = fixed().model_copy(update={"submit_body_sha256": "f" * 64})
-    assert code(c.control.preflight, c.human, query) == (
-        409, "WORK_POLICY_REQUEST_CONFLICT", "canonical fixed submission bytes differ")
-
-
-def test_preflight_hashes_the_instruction_with_all_its_fields(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    command = instruction("instruction-bytes", conversation_id="some-conversation", model="gpt-4o")
-    query = asked(command, model="gpt-4o")
-    assert c.control.preflight(c.human, query).submit_body_sha256 == sha(command)
-    other = query.model_copy(update={"model": None})
-    assert code(c.control.preflight, c.human, other)[:2] == (409, "WORK_POLICY_REQUEST_CONFLICT")
-
-
-def test_a_snapshot_that_moved_during_preflight_is_not_permission(synthetic_standing_v1, monkeypatch):
-    c = synthetic_standing_v1
-    store = c.control.store
-    real, seen = store._guard, []
-
-    def guard():
-        value, etag = real()
-        if not sys._getframe(1).f_code.co_filename.endswith("behavior_work_policy.py"):
-            return value, etag  # The store's own reads keep their guard.
-        seen.append(True)
-        return value, etag + "-moved" if len(seen) == 2 else etag
-
-    monkeypatch.setattr(store, "_guard", guard)
-    assert code(c.control.preflight, c.human, asked(instruction("guard-moved"))) == (
-        412, "WORK_POLICY_READ_CONFLICT", "pure preflight snapshot changed; it is not permission")
-
-
-def test_new_fixed_work_is_denied_by_a_source_that_is_not_ready(structured, monkeypatch):
-    c = structured
-
-    def not_ready(principal, policy):
-        raise Problem(403, "WORK_POLICY_SOURCE_UNAVAILABLE", "OFFLINE")
-
-    monkeypatch.setattr(c.control, "source_ready", not_ready)
-    result = c.control.preflight(c.human, fixed())
-    assert (result.decision, result.reason) == ("deny", "WORK_POLICY_SOURCE_UNAVAILABLE")
-    assert result.monetary_budget.decision == "allow"
-
-
-def test_a_money_refusal_stands_without_asking_the_source(structured, monkeypatch):
-    c = structured
-    monkeypatch.setattr(c.control, "source_ready", lambda *_: pytest.fail("the money decision already refused"))
-
-    def decision(*args, **kwargs):
-        return work.WorkPolicyDecision(
-            read_id="read", policy_id=c.control.policy.policy_id, policy_revision=c.control.policy.revision,
-            decision="deny", reason="cumulative_budget_exhausted", observed_at=c.h.time, budget_id=c.control.cost_key,
-            remaining_microusd=None, required_microusd=0, observed_high_water_microusd=0, reserved_microusd=0,
-            budget_enforced=False)
-
-    monkeypatch.setattr(work, "cumulative_decision", decision)
-    result = c.control.preflight(c.human, fixed())
-    assert (result.decision, result.reason) == ("deny", "cumulative_budget_exhausted")
-
-
 def root_fields(c):
     worker = c.control.runtime.dep.workers.contract.reservation_units
     requests = c.control.policy.max_model_requests
     return requests, worker
-
-
-@pytest.mark.parametrize("attempts,units,active,denied", [
-    (3, 2, True, False), (2, 2, True, True), (3, 1, True, True), (3, 2, False, True)])
-def test_the_abstract_root_budget_refuses_new_fixed_work(structured, monkeypatch, attempts, units, active, denied):
-    c = structured
-    requests, worker = root_fields(c)
-    replaced(monkeypatch, models=(BudgetRecord,), fields=({
-        "active": active, "remaining_attempts": requests + attempts, "remaining_units": requests + units + worker},))
-    result = c.control.preflight(c.human, fixed())
-    assert (result.decision, result.reason) == (
-        ("deny", "abstract_root_budget_exhausted") if denied else ("allow", "allowed"))
-    assert result.abstract_attempts_remaining == requests + attempts
-
-
-def test_the_root_budget_outranks_the_source_reason(structured, monkeypatch):
-    c = structured
-
-    def not_ready(principal, policy):
-        raise Problem(403, "WORK_POLICY_SOURCE_UNAVAILABLE", "OFFLINE")
-
-    monkeypatch.setattr(c.control, "source_ready", not_ready)
-    replaced(monkeypatch, models=(BudgetRecord,), fields=({"active": False},))
-    assert c.control.preflight(c.human, fixed()).reason == "abstract_root_budget_exhausted"
-
-
-def test_an_instruction_is_not_held_to_the_root_budget_or_the_source(structured, monkeypatch):
-    c = structured
-    monkeypatch.setattr(c.control, "source_ready", lambda *_: pytest.fail("an instruction has no reviewed source"))
-    replaced(monkeypatch, models=(BudgetRecord,), fields=({"active": False},))
-    assert c.control.preflight(c.human, asked(instruction("free-of-root"))).decision == "allow"
 
 
 @pytest.fixture
@@ -402,180 +265,6 @@ def replay(structured, monkeypatch):
 
     monkeypatch.setattr(c.control.runtime, "authorize", spy)
     return c
-
-
-def test_an_admitted_work_replays_without_a_new_decision(replay, monkeypatch):
-    c = replay
-    replaced(monkeypatch, models=(BudgetRecord,), fields=({"active": False},))
-    result = c.control.preflight(c.human, fixed())
-    money = result.monetary_budget
-    assert (result.decision, result.reason, result.already_admitted) == ("allow", "original_admission_replay_only", True)
-    assert (money.required_microusd, money.budget_id) == (0, c.control.cost_key)
-    assert c.authorized == [(c.bound.binding_id, "read")]
-
-
-def test_an_enforced_replay_reports_what_remains(replay, monkeypatch):
-    c = replay
-    values = {"budget_enforced": True, "observed_high_water_microusd": 10, "legacy_unresolved_reserve_microusd": 20,
-              "work_reservations_microusd": 30}
-    replaced(monkeypatch, models=(CostLedger,), fields=(values,))
-    money = c.control.preflight(c.human, fixed()).monetary_budget
-    policy_now = c.control.policy
-    assert money.remaining_microusd == max(0, policy_now.cumulative_ceiling_microusd - policy_now.safety_reserve_microusd - 60)
-    assert (money.reserved_microusd, money.observed_high_water_microusd) == (50, 10)
-    assert money.safety_reserve_microusd == policy_now.safety_reserve_microusd
-    assert money.cumulative_ceiling_microusd == policy_now.cumulative_ceiling_microusd
-
-
-def test_an_overspent_replay_has_nothing_left_not_a_negative(replay, monkeypatch):
-    c = replay
-    replaced(monkeypatch, models=(CostLedger,), fields=({
-        "budget_enforced": True, "observed_high_water_microusd": 10 ** 15},))
-    assert c.control.preflight(c.human, fixed()).monetary_budget.remaining_microusd == 0
-
-
-def test_an_unenforced_replay_reports_no_budget(replay, monkeypatch):
-    c = replay
-    replaced(monkeypatch, models=(CostLedger,), fields=({"budget_enforced": False},))
-    money = c.control.preflight(c.human, fixed()).monetary_budget
-    assert (money.remaining_microusd, money.safety_reserve_microusd, money.cumulative_ceiling_microusd,
-            money.budget_enforced) == (None, None, None, False)
-
-
-def test_a_preview_reports_the_queue_of_its_work(replay):
-    c = replay
-    result = c.control.preflight(c.human, fixed())
-    saved = c.control.records[c.bound.binding_id].runtime_policy
-    assert (result.queue_deadline, result.execution_deadline) == (saved.queue_deadline, None)
-
-
-def test_a_dispatched_work_reports_its_execution_deadline(replay, monkeypatch):
-    c = replay
-    saved = c.control.records[c.bound.binding_id].runtime_policy
-    replaced(monkeypatch, models=(PerWorkRuntimePolicy,), fields=({"stage": "dispatched"},))
-    assert c.control.preflight(c.human, fixed()).execution_deadline == saved.valid_until
-
-
-def test_work_with_no_runtime_policy_reports_no_deadline(structured):
-    result = structured.control.preflight(structured.human, fixed())
-    assert (result.queue_deadline, result.execution_deadline, result.already_admitted) == (None, None, False)
-    assert (result.conversation_id, result.turn_number, result.model) == (None, None, None)
-
-
-@pytest.mark.parametrize("busy,available", [(True, False), (False, True)])
-def test_a_preview_reports_whether_a_slot_is_free(structured, monkeypatch, busy, available):
-    c = structured
-    real = work._row
-
-    def row(rows, key, model):
-        value = real(rows, key, model)
-        if model is _Pool:
-            return SimpleNamespace(slots=tuple(SimpleNamespace(binding="taken" if busy else None) for _ in value.slots))
-        return value
-
-    monkeypatch.setattr(work, "_row", row)
-    assert c.control.preflight(c.human, fixed()).capacity_available is available
-
-
-def test_a_new_instruction_previews_its_turn_and_model(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    result = c.control.preflight(c.human, asked(instruction("first-preview")))
-    assert (result.decision, result.turn_number, result.already_admitted) == ("allow", 1, False)
-    assert result.conversation_id
-    assert result.model == c.control.models.select(None).id
-
-
-def test_a_saved_instruction_previews_what_was_saved(admitted, monkeypatch):
-    from shared_context import behavior_instruction
-
-    c = admitted
-    monkeypatch.setattr(behavior_instruction, "instruction_state", lambda *_: pytest.fail("a saved turn reads no conversation"))
-    result = c.control.preflight(c.human, asked(c.command))
-    assert (result.binding, result.already_admitted) == (c.record.binding, False)
-    assert result.conversation_id == c.record.profile.instruction.conversation_id
-    assert result.turn_number == c.record.profile.instruction.turn_number
-
-
-def test_a_saved_instruction_with_other_bytes_is_a_conflict(admitted, monkeypatch):
-    c = admitted
-    monkeypatch.setattr(c.control, "refresh", lambda: None)
-    saved = c.control.records[c.record.binding.binding_id]
-    c.control.records[c.record.binding.binding_id] = saved.model_copy(update={"submit_sha256": "f" * 64})
-    assert code(c.control.preflight, c.human, asked(c.command)) == (
-        409, "WORK_POLICY_REQUEST_CONFLICT", "original input differs")
-
-
-def test_a_saved_instruction_whose_job_is_not_there_yet_is_still_authorized(admitted, monkeypatch):
-    from shared_context.behavior_workers import worker_key
-
-    c = admitted
-    binding = c.record.binding
-    Reads(c.control.store, monkeypatch).row(worker_key("job", binding.job_id), None)
-    authorized = []
-    authorize = c.control.runtime.authorize
-
-    def spy(binding_id, principal, use, **kwargs):
-        authorized.append((binding_id, use))
-        return authorize(binding_id, principal, use, **kwargs)
-
-    monkeypatch.setattr(c.control.runtime, "authorize", spy)
-    result = c.control.preflight(c.human, asked(c.command))
-    assert authorized == [(binding.binding_id, "read")] and result.already_admitted is False
-
-
-def test_an_admitted_instruction_is_authorized_once(admitted, monkeypatch):
-    from shared_context.behavior_workers import worker_key
-
-    c = admitted
-    binding = c.record.binding
-    Reads(c.control.store, monkeypatch).row(worker_key("job", binding.job_id), SimpleNamespace())
-    authorized = []
-    monkeypatch.setattr(c.control.runtime, "authorize", lambda binding_id, _principal, use: authorized.append((binding_id, use)))
-    result = c.control.preflight(c.human, asked(c.command))
-    assert authorized == [(binding.binding_id, "read")] and result.already_admitted is True
-    assert result.reason == "original_admission_replay_only"
-
-
-@pytest.mark.parametrize("failure", ["AGENT_ROLE_PROMPT_MISSING", "AGENT_ROLE_PROMPT_INVALID"])
-def test_a_role_agent_with_no_saved_role_is_a_clear_refusal(synthetic_standing_v1, monkeypatch, failure):
-    from shared_context import behavior_agent_role_prompt_versions as versions
-
-    c = synthetic_standing_v1
-
-    def missing(*_args):
-        raise Problem(409, failure, "OFFLINE")
-
-    monkeypatch.setattr(versions, "captured_role_prompt", missing)
-    assert code(c.control.preflight, c.human, asked(instruction("no-role")))[:2] == (409, failure)
-
-
-def test_a_turn_that_can_not_be_derived_is_a_deny_with_its_code(synthetic_standing_v1, monkeypatch):
-    from shared_context import behavior_instruction
-
-    c = synthetic_standing_v1
-
-    def refused_state(*_args):
-        raise Problem(409, "OFFLINE_CONVERSATION", "OFFLINE")
-
-    monkeypatch.setattr(behavior_instruction, "instruction_state", refused_state)
-    result = c.control.preflight(c.human, asked(instruction("no-conversation")))
-    assert (result.decision, result.reason) == ("deny", "OFFLINE_CONVERSATION")
-    assert (result.conversation_id, result.turn_number, result.model, result.memory_setting_ref) == (None, None, None, None)
-
-
-def test_a_failure_late_in_the_derivation_keeps_the_binding_it_reached(synthetic_standing_v1, monkeypatch):
-    from shared_context.behavior_work_policy import derive_work_binding
-
-    c = synthetic_standing_v1
-    command = instruction("late-failure")
-    expected = derive_work_binding(c.control.policy, command.request_id, instruction=command)[1]
-
-    def refused_work(*_args, **_kwargs):
-        raise Problem(409, "OFFLINE_DERIVE", "OFFLINE")
-
-    monkeypatch.setattr(work, "derive_work", refused_work)
-    result = c.control.preflight(c.human, asked(command))
-    assert (result.reason, result.binding) == ("OFFLINE_DERIVE", expected)
 
 
 # refresh
@@ -623,9 +312,9 @@ def test_outside_a_phase_every_refresh_reads(admitted, monkeypatch):
     assert seen != []
 
 
-def test_a_scoped_refresh_reads_only_its_own_registration(admitted, monkeypatch):
-    c = admitted
-    other = register(c, instruction("second-registered"))
+def test_a_scoped_refresh_reads_only_its_own_registration(admitted_twice, monkeypatch):
+    c = admitted_twice
+    other = c.other
     seen = reads_of(c.control, monkeypatch)
     c.control.refresh(c.record.binding.binding_id)
     registrations = [keys for keys in seen if keys == (c.registration,)]
@@ -633,9 +322,9 @@ def test_a_scoped_refresh_reads_only_its_own_registration(admitted, monkeypatch)
     assert (work_policy_key("registration", other.admission_id),) not in seen
 
 
-def test_a_binding_the_index_does_not_list_reads_every_registration(admitted, monkeypatch):
-    c = admitted
-    other = register(c, instruction("second-registered"))
+def test_a_binding_the_index_does_not_list_reads_every_registration(admitted_twice, monkeypatch):
+    c = admitted_twice
+    other = c.other
     c.control.records.pop(other.binding.binding_id)
     seen = reads_of(c.control, monkeypatch)
     c.control.refresh(other.binding.binding_id)
@@ -757,9 +446,9 @@ def test_a_vm_or_a_transfer_explains_another_session(admitted, monkeypatch, chan
     assert c.control.refresh() is None
 
 
-def test_a_session_on_a_turn_with_no_conversation_is_refused(structured, monkeypatch):
-    c = structured
-    bound, _ = c.control.submit(c.human, AssistantSubmit(request_id="fixed-work"))
+def test_a_session_on_a_turn_with_no_conversation_is_refused(fixed_work, monkeypatch):
+    c = fixed_work
+    bound = c.bound
     c.registration = work_policy_key("registration", c.control.records[bound.binding_id].admission_id)
     session_case(c, monkeypatch, transfer=object())
     assert code(c.control.refresh) == (
@@ -904,14 +593,3 @@ def test_the_phase_mark_is_set_only_for_a_finished_scoped_refresh(admitted, monk
         c.control.refresh(binding_id)
         assert seen != []
 
-
-def test_runtime_key_is_the_policy_row_preflight_reads(replay, monkeypatch):
-    c = replay
-    seen = reads_of(c.control, monkeypatch)
-    c.control.preflight(c.human, fixed())
-    read = next(keys for keys in seen if c.control.cost_key in keys and len(keys) == 8)
-    binding = c.bound
-    assert read == (c.control.policy_key, c.control.revocation_key, c.control.cost_key,
-                    control_key("budget", binding.owner.root_budget_id), read[4], read[5],
-                    work_policy_key("registration", c.control.records[binding.binding_id].admission_id),
-                    runtime_key("policy", binding.binding_id))

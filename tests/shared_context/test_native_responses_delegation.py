@@ -17,7 +17,7 @@ from test_m2_copilot import runtime_path
 from test_native_delegation import TASK, delegate_request
 from test_native_responses import responses
 from test_native_turns import IDENTITY, local_env
-from test_skill_isolation_native import child_environment
+from skill_isolation_native_helpers import child_environment
 
 
 def test_responses_parent_keeps_its_original_sdk_child_across_reentry_and_followup(

@@ -24,6 +24,7 @@ from shared_context.behavior_settlement import (
 from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
 from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
+from legacy_submit_rows_helpers import seed_submitted
 from test_behavior_api import CTX, RuntimeHarness
 from test_behavior_store import code
 from test_m3_auth import CLIENT_ID, jwk_client, signing_key
@@ -115,7 +116,7 @@ def configured(h, observer=None, *, register=True, settlement_id="one-settlement
 @pytest.fixture
 def retained(auth, jwk_client, signing_key):
     h = RuntimeHarness(auth, jwk_client, signing_key, native_wire=False)
-    h.submit()
+    seed_submitted(h)
     terminal(h.runtime, h.binding)
     h.mutate(control_key("budget", "root"), remaining_attempts=993, remaining_units=9993)
     h.mutate(control_key("delivery-quota", "root", "root"), scans_remaining=981)
@@ -395,7 +396,7 @@ def test_public_commands_forbid_authority_injection(extra):
 @pytest.mark.parametrize("state", ["succeeded", "failed"])
 def test_other_verified_terminal_results_use_existing_final_preparation(auth, jwk_client, signing_key, state):
     h = RuntimeHarness(auth, jwk_client, signing_key, native_wire=False)
-    h.submit()
+    seed_submitted(h)
     result = terminal(h.runtime, h.binding, state)
     h.time += timedelta(hours=2)
     service, _ = configured(h)
@@ -411,7 +412,7 @@ def test_other_verified_terminal_results_use_existing_final_preparation(auth, jw
 
 def test_queued_work_does_not_become_an_eligible_failure_when_old_policy_expires(auth, jwk_client, signing_key):
     h = RuntimeHarness(auth, jwk_client, signing_key, native_wire=False)
-    h.submit()
+    seed_submitted(h)
     h.time += timedelta(hours=2)
     service, _ = configured(h)
     before = copy.deepcopy(h.transport.backing.rows)

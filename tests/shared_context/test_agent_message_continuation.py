@@ -14,66 +14,16 @@ from shared_context.behavior_sdk_state import SaveSdkState, SdkState
 from shared_context.behavior_sdk_checkpoint import save_state
 from shared_context.source_materials import digest
 from shared_context.errors import Problem
-from test_agent_message_api import message_turn, shared_message_turn
+from test_agent_message_api import message_turn
+from agent_message_api_helpers import shared_message_turn
 from test_agent_runtime import peer_runtime
-from test_agent_runtime_routing import agent_headers, routing_peer
-from test_conversation_transfer_startup import claimed_turn, read_startup, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from agent_runtime_routing_helpers import agent_headers, routing_peer
+from test_conversation_transfer_startup import claimed_turn, synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_m2_copilot import runtime_path, workspace
-
-
-def start_peer(m):
-    response = m.client.post(m.path, json=m.command, headers=m.headers)
-    assert response.status_code == 200, response.text
-    receiver = next(iter(m.b.runtime.work_policy.records.values()))
-    m.c.authority.record_instruction_activity(m.turn.session)
-    starts = []
-    workers = m.b.runtime.dep.workers
-    original = workers.adapter
-    def start(command):
-        starts.append(m.b.runtime.dep.native_launches.prepare(command))
-    workers.adapter = replace(original, start=start)
-    try:
-        status = m.a.runtime.controller.step(m.turn.binding.binding_id)
-    finally:
-        workers.adapter = original
-    assert len(starts) == 1
-    return SimpleNamespace(receiver=receiver, launch=starts[0][0], permit=starts[0][1], status=status)
-
-
-def claim_peer(m, started, signing_key, *, acquire=True):
-    native = m.b.runtime.dep.native_launches
-    receiver, launch = started.receiver, started.launch
-    actor = m.c.h.config.identity.auth().actors[receiver.binding.agent_oid]
-    from shared_context.behavior_auth import BehaviorPrincipal
-    principal = BehaviorPrincipal(receiver.binding.tenant_id, actor.oid, actor.team, "agent", actor.actor,
-                                  frozenset({"read", "consume", "execute"}))
-    identity = wire.HostedIdentity(**{name: getattr(launch.target, name)
-                                    for name in ("agent_id", "agent_name", "agent_version", "session_id")})
-    claimed = native.claim(receiver.binding.binding_id, launch.launch_id, wire.HostedClaimRequest(
-        request_id="original-b-native-claim", invocation_id="original-b-invocation",
-        identity=identity, process_id="synthetic-b-process", launch_permit=started.permit), principal)
-    headers = {**agent_headers(m.c, signing_key, 1),
-               "x-behavior-report-token": claimed.report_token.get_secret_value()}
-    command = wire.HostedProbeBody(request_id="assistant-native-claim", invocation_id=claimed.assignment.invocation_id,
-        identity=identity, process_id=claimed.assignment.process_id, claim_id=claimed.assignment.claim_id)
-    prefix = f"/behavior/v1/bindings/{receiver.binding.binding_id}/assistant"
-    response = m.client.post(prefix + f"/launches/{launch.launch_id}/claim",
-                             content=command.model_dump_json(), headers=headers)
-    assert response.status_code == 200, response.text
-    assignment = aw.NativeClaimReceipt.model_validate_json(response.content).assignment
-    headers = {**agent_headers(m.c, signing_key, 1),
-               "x-behavior-assistant-ticket": response.headers["x-behavior-assistant-ticket"]}
-    if acquire:
-        acquired = m.client.post(prefix + f"/sessions/{assignment.session_id}/acquire",
-                                 json={"request_id": "sdk-start"}, headers=headers)
-        assert acquired.status_code == 200, acquired.text
-    session = m.b.assistant.authority.session(
-        assignment.session_id, SecretStr(headers["x-behavior-assistant-ticket"]), principal)
-    return SimpleNamespace(assignment=assignment, headers=headers, principal=principal, claimed=claimed,
-                           session=session,
-                           claim=wire.HostedProbeRequest(**command.model_dump(), report_token=claimed.report_token))
+from agent_message_continuation_helpers import claim_peer, start_peer
 
 
 def save_peer(m, started, peer, text="Synthetic B review: 530 items remain.", *, composition=None, failure=None):
@@ -325,85 +275,6 @@ def test_later_unstarted_peer_work_does_not_block_the_first_queue_item(message_t
         workers.adapter = original
     assert starts == [first.json()["message"]["to_work_id"]]
     assert starts != [second.json()["message"]["to_work_id"]]
-
-
-def test_cancelled_origin_retires_an_unstarted_peer_message_without_a_b_job(message_turn):
-    m = message_turn
-    response = m.client.post(m.path, json=m.command, headers=m.headers)
-    assert response.status_code == 200, response.text
-    receiver = next(iter(m.b.runtime.work_policy.records.values()))
-    m.c.control.cancel(m.c.human, m.turn.binding.binding_id)
-    workers = m.a.runtime.dep.workers
-    original = workers.adapter
-    workers.adapter = replace(original, stop=lambda command: None)
-    try:
-        status = m.a.runtime.controller.step(m.turn.binding.binding_id)
-    finally:
-        workers.adapter = original
-    assert status.obligation_fulfilled is False
-    key = worker_key("job", receiver.binding.job_id)
-    assert m.a.runtime.store.read_snapshot((key,))[key] is None
-    listing = m.client.get(f"/work-policy/v1/bindings/{m.turn.binding.binding_id}/agent-messages",
-                           headers=m.human_headers)
-    assert listing.status_code == 200, listing.text
-    assert listing.json()["messages"][0]["status"] == "completed"
-    assert listing.json()["messages"][0]["decision"]["reason"] == "original_sender_stopped_before_dispatch"
-    read_startup(m.c)
-
-
-def test_origin_cancel_targets_the_existing_b_execution_without_claiming_it_stopped(message_turn, signing_key):
-    m = message_turn
-    started = start_peer(m)
-    peer = claim_peer(m, started, signing_key)
-    m.b.assistant.authority.record_instruction_activity(peer.session)
-    m.c.control.cancel(m.c.human, m.turn.binding.binding_id)
-    a_workers, b_workers = m.a.runtime.dep.workers, m.b.runtime.dep.workers
-    a_original, b_original = a_workers.adapter, b_workers.adapter
-    stops = []
-    a_workers.adapter = replace(a_original, stop=lambda command: None)
-    b_workers.adapter = replace(b_original, stop=lambda command: stops.append(command.binding))
-    try:
-        m.a.runtime.controller.step(m.turn.binding.binding_id)
-    finally:
-        a_workers.adapter, b_workers.adapter = a_original, b_original
-    original = b_workers.inspect(started.receiver.binding.job_id)
-    assert original.cancel_requested and original.state not in {"succeeded", "failed", "cancelled"}
-    assert stops == [started.launch.start.binding]
-    result = save_peer(m, started, peer, text="The peer work was cancelled.", failure="cancelled")
-    assert result.state == "cancelled"
-    m.b.runtime.controller.step(started.receiver.binding.binding_id)
-    assert b_workers.inspect(started.receiver.binding.job_id).result_forwarded
-    assert not m.a.runtime.job_status(m.turn.binding.binding_id, m.c.human).obligation_fulfilled
-    read_startup(m.c)
-
-
-def test_cancel_after_enqueue_but_before_start_keeps_a_verified_no_sdk_result(message_turn, monkeypatch):
-    m = message_turn
-    response = m.client.post(m.path, json=m.command, headers=m.headers)
-    assert response.status_code == 200, response.text
-    receiver = next(iter(m.b.runtime.work_policy.records.values()))
-    def interrupted(*args, **kwargs):
-        raise Problem(503, "SYNTHETIC_CONSUMER_INTERRUPTION", "Injected interruption after enqueue")
-    with monkeypatch.context() as fault:
-        fault.setattr(m.b.runtime.dep.workers, "start", interrupted)
-        status = m.a.runtime.controller.step(m.turn.binding.binding_id)
-        assert status.state in {"starting", "running"}
-    m.c.control.cancel(m.c.human, m.turn.binding.binding_id)
-    workers = m.a.runtime.dep.workers
-    original = workers.adapter
-    workers.adapter = replace(original, stop=lambda command: None)
-    try:
-        m.a.runtime.controller.step(m.turn.binding.binding_id)
-    finally:
-        workers.adapter = original
-    job = m.b.runtime.dep.workers.inspect(receiver.binding.job_id)
-    assert job.state == "cancelled" and job.generation == 0 and job.binding is None and job.result_forwarded
-    listing = m.client.get(f"/work-policy/v1/bindings/{m.turn.binding.binding_id}/agent-messages",
-                           headers=m.human_headers)
-    assert listing.status_code == 200, listing.text
-    assert listing.json()["messages"][-1]["kind"] == "blocked"
-    assert m.c.sessions.calls == []
-    read_startup(m.c)
 
 
 def test_lost_result_response_reconciles_the_same_message_without_reexecuting_b(message_turn, signing_key, monkeypatch):
@@ -680,62 +551,6 @@ def test_uncertain_b_start_keeps_its_claim_and_exposes_unknown_without_restartin
     assert result.json()["message"]["status"] == "unknown"
     assert result.json()["message"]["decision"]["action"] == "needs_attention"
     assert len(calls) == 1 and workers.inspect(receiver.binding.job_id).generation == 1
-    read_startup(m.c)
-
-
-def test_peer_ready_and_restart_signal_only_the_original_a_observer(message_turn, monkeypatch):
-    import threading
-    m = message_turn
-    response = m.client.post(m.path, json=m.command, headers=m.headers)
-    assert response.status_code == 200, response.text
-    receiver = next(iter(m.b.runtime.work_policy.records.values()))
-    calls = []
-    event = threading.Event()
-    m.a._instruction_wakes[m.turn.binding.binding_id] = event
-    monkeypatch.setattr(m.a, "launch_instruction", calls.append)
-    before = m.a.runtime.store._guard()
-    m.b.instruction_ready(receiver.binding.binding_id)
-    assert calls == [m.turn.binding.binding_id] and event.is_set()
-    calls.clear()
-    m.a.resume_instructions()
-    assert calls and set(calls) == {m.turn.binding.binding_id}
-    assert m.a.runtime.store._guard() == before
-    key = worker_key("job", receiver.binding.job_id)
-    assert m.a.runtime.store.read_snapshot((key,))[key] is None
-
-
-def test_unknown_b_stop_does_not_block_original_a_cancel_or_its_final(message_turn, signing_key, caplog):
-    m = message_turn
-    started = start_peer(m)
-    claim_peer(m, started, signing_key)
-    m.c.control.cancel(m.c.human, m.turn.binding.binding_id)
-    a_workers, b_workers = m.a.runtime.dep.workers, m.b.runtime.dep.workers
-    a_original, b_original = a_workers.adapter, b_workers.adapter
-    a_stops = []
-    def unknown(*args):
-        raise Problem(503, "SYNTHETIC_PEER_RESPONSE_LOSS", "Injected peer transport failure")
-    a_workers.adapter = replace(a_original, stop=lambda command: a_stops.append(command.binding))
-    b_workers.adapter = replace(b_original, stop=unknown, query=unknown)
-    try:
-        status = m.a.runtime.controller.step(m.turn.binding.binding_id)
-        assert status.state == "capacity_uncertain" and a_stops == [m.turn.launch.start.binding]
-        original = SimpleNamespace(receiver=m.a.runtime.work_policy.records[m.turn.binding.binding_id], launch=m.turn.launch)
-        a_turn = SimpleNamespace(assignment=m.turn.assignment, session=m.turn.session, headers=m.headers,
-                                principal=m.turn.agent, claim=m.turn.claim, claimed=m.turn.claimed)
-        save_peer(m, original, a_turn, "A was cancelled; the peer remains unconfirmed.",
-                  composition=m.a, failure="cancelled")
-        final = m.a.runtime.controller.step(m.turn.binding.binding_id)
-        assert final.state == "cancelled" and final.result_forwarded and final.delivery_id is not None
-        assert final.obligation_fulfilled is False
-    finally:
-        a_workers.adapter, b_workers.adapter = a_original, b_original
-    b = b_workers.inspect(started.receiver.binding.job_id)
-    assert b.state == "capacity_uncertain" and b.cancel_requested and not b.result_forwarded
-    message = m.client.get(f"/work-policy/v1/bindings/{m.turn.binding.binding_id}/agent-messages",
-                          headers=m.human_headers)
-    assert message.status_code == 200, message.text
-    assert message.json()["messages"][0]["status"] == "unknown"
-    assert "AGENT_MESSAGE_ADVANCE_UNRESOLVED" in caplog.text
     read_startup(m.c)
 
 

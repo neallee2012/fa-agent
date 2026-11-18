@@ -2,34 +2,22 @@
 reach the pinned runtime and API gateway with screenshots, and a turn without the grant closes the desktop."""
 
 import asyncio
-import json
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-import httpx
 import pytest
-from fastapi.testclient import TestClient
 
 from shared_context import behavior_assistant_hosted as hosted
 from shared_context import behavior_desktop_capability as capability
-from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_assistant_boundary import AssistantModelBoundary
-from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_capabilities import BUILTIN_CAPABILITIES
 from shared_context.behavior_desktop import DESKTOP_LOCK, OwnedDesktop
 from shared_context.behavior_desktop_tools import DesktopFileRead, DesktopObservation, DesktopToolbox
-from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES
-from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from shared_context.m2_copilot import ToolFailure
-from sdk_checkpoint_local import sse
 from test_behavior_assistant import assistant
 from test_behavior_desktop import FakeRunner
-from test_capability_capture import GRANTS, choose
-from test_conversation_profile_selection import configured
-from test_instruction_flow import instruction_models
-from test_instruction_prompt import submit
+from capability_capture_helpers import GRANTS
+from instruction_flow_helpers import instruction_models
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
 
@@ -104,90 +92,6 @@ def test_release_closes_the_desktop_and_is_idempotent(tmp_path, fake_desktop):
     assert DESKTOP_LOCK.locked()
     assert capability.DESKTOP_CAPABILITY.release(session(tmp_path))["closed"] is True
     assert not DESKTOP_LOCK.locked() and capability.DESKTOP_CAPABILITY.release(session(tmp_path)) is None
-
-
-def test_pinned_runtime_edits_a_private_file_and_a_turn_without_the_grant_closes_it(
-        assistant, monkeypatch, fake_desktop):
-    h, control, _ = configured(assistant)
-    h.runtime.capability_grants = GRANTS
-    name = control.models.default
-    control.models.models[name] = control.models.models[name].model_copy(update={"supports_image_input": True})
-    chosen, _ = choose(h, "choose-desktop", ("fa-desktop-v1",))
-    assert chosen.status_code == 200, chosen.text
-    requests, released = [], []
-    release = capability.DESKTOP_CAPABILITY.release
-    monkeypatch.setattr(capability.DESKTOP_CAPABILITY, "release",
-                        lambda owner: released.append(release(owner)) or released[-1])
-
-    def tool_text(body):
-        tool = [item for item in body["messages"] if item["role"] == "tool"][-1]
-        return tool["content"] if isinstance(tool["content"], str) else "".join(
-            part.get("text", "") for part in tool["content"])
-
-    def images(body):
-        return [part for item in body["messages"] if isinstance(item.get("content"), list)
-                for part in item["content"] if part.get("type") == "image_url"]
-
-    def call(name, arguments):
-        return {"tool_calls": [{"index": 0, "id": f"call-{len(requests)}", "type": "function",
-                                "function": {"name": name, "arguments": json.dumps(arguments)}}]}
-
-    def provider(request):
-        body = json.loads(request.content)
-        requests.append(body)
-        number = len(requests)
-        tools = {item["function"]["name"] for item in body.get("tools", [])}
-        if number <= 5:
-            assert tools == {*HISTORY_CAPABILITIES, *DESKTOP_TOOLS}
-        else:
-            assert tools == set(HISTORY_CAPABILITIES)
-        if number == 1:
-            delta = call("desktop_open_file", {"name": "notes.txt", "create": True})
-        elif number in (2, 3):
-            shown = images(body)
-            assert shown and shown[-1]["image_url"]["url"].startswith("data:image/png;base64,")
-            seen = DesktopObservation.model_validate_json(tool_text(body))
-            action = ({"type": "type", "text": "hello desktop"} if number == 2
-                      else {"type": "keypress", "key": "s", "modifiers": ["ctrl"]})
-            delta = call("desktop_act", {"observation_id": seen.observation_id, "action": action})
-        elif number == 4:
-            delta = call("desktop_read_file", {"name": "notes.txt"})
-        elif number == 5:
-            assert DesktopFileRead.model_validate_json(tool_text(body)).text == "hello desktop"
-            delta = {"content": "Saved notes.txt."}
-        else:
-            delta = {"content": "No desktop this turn."}
-        assert number <= 6
-        return sse(request, delta, number)
-
-    gateway = AssistantProvider("https://provider.invalid/openai/v1/chat/completions",
-        SimpleNamespace(get_token=lambda _: SimpleNamespace(token="OFFLINE_DESKTOP_PROVIDER")),
-        transport=httpx.MockTransport(provider))
-    h.app = create_assistant_app(h.assistant, h.verifier, provider=gateway)
-    install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier,
-        assistant=SimpleNamespace(authority=h.assistant),
-        installation=lambda: None, require_current_native_evidence=lambda: None))
-    parent = Path(__file__).resolve().parents[2] / ".azure"
-    parent.mkdir(exist_ok=True)
-    with TestClient(h.app) as client, TemporaryDirectory(prefix="desktop-", dir=parent) as directory:
-        h.client = client
-        h.executor.http_client, h.executor.model_transport = client, None
-        h.executor.root = Path(directory)
-        accepted, _ = submit(h, "desktop-edit", "Create notes.txt with 'hello desktop', save it and read it back.")
-        first = h.runtime.controller.step(accepted["binding_id"])
-        assert first.state == "succeeded" and first.result_forwarded
-        saved = list(Path(directory).rglob("desktop/files/notes.txt"))
-        assert len(saved) == 1 and saved[0].read_bytes() == b"hello desktop"
-        assert DESKTOP_LOCK.locked() and released == []
-
-        narrowed, _ = choose(h, "choose-no-desktop", (), previous=chosen.json()["result"]["selection_id"])
-        assert narrowed.status_code == 200, narrowed.text
-        followed, _ = submit(h, "desktop-gone", "Anything else?", accepted["conversation_id"])
-        assert h.runtime.controller.step(followed["binding_id"]).state == "succeeded"
-        assert released and released[0]["closed"] is True and not DESKTOP_LOCK.locked()
-        task = control.records[followed["binding_id"]].profile.instruction
-        assert task.capabilities is None or task.capabilities.grants == ()
-    assert len(requests) == 6
 
 
 def test_a_release_during_another_desktop_turn_never_leaves_an_untracked_desktop(tmp_path, fake_desktop):

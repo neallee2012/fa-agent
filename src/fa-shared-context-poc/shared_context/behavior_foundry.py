@@ -1161,17 +1161,9 @@ class NativeLaunchAuthority:
             return session.state
         return None
 
-    def pending_completion_observation(self, job):
-        """A retained final can wake the original observer without trusting a notification."""
-        return self.instruction_session_state(job) == "ready_to_finalize"
-
     def instruction_recently_active(self, job):
         return (self.assistant is not None and self.instruction_session_state(job) == "running"
                 and self.assistant.instruction_recently_active(job.binding))
-
-    def pending_lost_observation(self, job):
-        """A sealed lost-session failure still owes its forwarding; the observer delivers the original notice."""
-        return job is not None and not job.result_forwarded and lost_session_failure(self.store, job) is not None
 
     def pending_version_observation(self, job):
         if job is not None and job.state == "failed":
@@ -1822,12 +1814,8 @@ class NativeLaunchAuthority:
             # No deployed producer wrote this closure (#1051); its reader is gone, so never fall through to accept it.
             raise Problem(403, "NATIVE_EVIDENCE_INVALID", "original stop closures are retired and cannot be verified")
         elif launch.sealed_evidence_id == native_key("platform-stop-evidence", launch.launch_id):
-            from .behavior_recovery import verify_platform_stop
-            proof_key = native_key("platform-stop", launch.launch_id)
-            proof = self.store.read_snapshot((proof_key,))[proof_key]
-            if proof is None:
-                raise Problem(403, "NATIVE_EVIDENCE_INVALID", "original platform-stop provenance is missing")
-            verify_platform_stop(self, launch, saved, proof)
+            # Only the removed operator recovery wrote this closure; its reader is gone, so never fall through to accept it.
+            raise Problem(403, "NATIVE_EVIDENCE_INVALID", "platform stop closures are retired and cannot be verified")
         if (
             saved.evidence.evidence_id != evidence_id or saved.evidence.binding != launch.start.binding
             or not saved.observed_at <= self._now() < saved.expires_at
@@ -1934,13 +1922,14 @@ class NativeLaunchAuthority:
             raise Problem(409, "NATIVE_TERMINAL_UNKNOWN", "no verified permanently fenced native completion exists")
         original_key = native_key("evidence", launch.sealed_evidence_id)
         unclaimed = launch.native_invocation_id is None
-        platform_stopped = launch.sealed_evidence_id == native_key("platform-stop-evidence", launch_id)
         if launch.sealed_evidence_id == native_key("original-stop-close-evidence", launch_id):
             # No deployed producer wrote this closure (#1051); its reader is gone, so never reconcile it as terminal.
             raise Problem(403, "NATIVE_TERMINAL_INVALID", "original stop closures are retired and cannot be reconciled")
+        if launch.sealed_evidence_id == native_key("platform-stop-evidence", launch_id):
+            # Only the removed operator recovery wrote this closure; its reader is gone, so never reconcile it as terminal.
+            raise Problem(403, "NATIVE_TERMINAL_INVALID", "platform stop closures are retired and cannot be reconciled")
         lost = launch.sealed_evidence_id == native_key("lost-session-evidence", launch_id)
         proof_key = (native_key("unclaimed-fence", launch_id) if unclaimed
-                     else native_key("platform-stop", launch_id) if platform_stopped
                      else original_key if lost
                      else native_key("report", launch.sealed_evidence_id))
         sequence = launch.evidence_sequence + 1
@@ -1964,11 +1953,6 @@ class NativeLaunchAuthority:
                 self._verify_unclaimed_fence(current, original, rows[proof_key])
             elif lost:
                 self._verify_lost_session(current, original)
-            elif platform_stopped:
-                from .behavior_recovery import verify_platform_stop
-                if rows[proof_key] is None:
-                    raise Problem(403, "NATIVE_TERMINAL_INVALID", "platform stop provenance is missing")
-                verify_platform_stop(self, current, original, rows[proof_key])
             else:
                 self._verify_claimed_report(rows, proof_key, current, original)
             now = self._now()

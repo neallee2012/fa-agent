@@ -9,7 +9,7 @@ from shared_context.assistant_image_wire import ImageEntry
 from shared_context.behavior_native_turn_api import PREFIX
 from shared_context.behavior_native_turn_wire import NativeReceipt
 from shared_context.native_image_wire import NativeImageContent, NativeTurnImages
-from test_assistant_images import png
+from assistant_images_helpers import png
 from test_native_turn_api import instruction_models, jwk_client, native_api, signing_key, submit, synthetic_standing_v1
 
 

@@ -33,12 +33,12 @@ def numbered(harness, started):
 
 def test_production_factory_binds_queue_recovery_to_its_own_sender(local_env, tmp_path, monkeypatch):
     from shared_context import native_sdk
-    from test_native_sdk import AssistantSupervisor, MODEL_ROOT
+    from test_native_sdk import MODEL_ROOT
 
     executable = tmp_path / "OFFLINE-not-executed"
     executable.write_text("OFFLINE factory only", encoding="utf-8")
     hosted = SimpleNamespace(
-        identity=IDENTITY, supervisor=AssistantSupervisor(tmp_path / "owned", runtime_path=executable),
+        identity=IDENTITY, root=tmp_path / "owned",
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"))
     calls = []
 

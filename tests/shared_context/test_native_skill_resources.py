@@ -154,7 +154,7 @@ def test_native_sdk_reads_the_exact_approved_manifest_resource(integrated):
 
 def test_resource_capability_stays_off_and_requires_the_original_skill_reader(native_api, signing_key, monkeypatch):
     from shared_context.behavior_capabilities import load_runtime_capabilities
-    from test_conversation_profile_selection import template
+    from conversation_profile_selection_helpers import template
 
     monkeypatch.delenv("FA_TOOL_CATALOG_DIR", raising=False)
     monkeypatch.delenv("FA_CAPABILITY_TOOLBOX_ENTRIES", raising=False)
@@ -572,3 +572,70 @@ def test_sk03_a_budgeted_native_sdk_turn_reads_through_the_75_catalog_view(integ
     assert [(skill.catalogued, skill.catalog_reason) for skill in saved.assembly.skills] == [(True, None)]
     assert [path for path, _, _ in h.api_calls if path.endswith("/skill-catalog-presentation")] == [
         "/work-policy/v1/native-capabilities/skill-catalog-presentation"]
+
+
+@pytest.mark.parametrize("alias", ["other.json", "reference.json"])
+def test_a_new_approved_manifest_mid_native_turn_reads_neither_the_old_nor_the_new_resource(
+    integrated, monkeypatch, alias,
+):
+    """The legacy SK-07 version race, natively: once V2 is approved, neither alias reaches a blob for the V1 turn."""
+    h = integrated
+    captured, reference = resource_capture(h)
+    artifacts = h.case.authority.artifacts
+    actor = h.case.authority.actors[h.case.control.policy.template.agent_oid]
+    reads, requests = [], []
+    original_read = artifacts.store.read
+
+    def blob_read(*args):
+        reads.append(args[1])
+        return original_read(*args)
+
+    monkeypatch.setattr(artifacts.store, "read", blob_read)
+
+    def approve_v2():
+        raw = b'{"value":7}\n'
+        created = artifacts.create(actor, actor.team, "other-data", CreateArtifact(
+            kind="deliverable", title="Synthetic other data", source_work="legacy-source"))
+        artifacts.upload(actor, actor.team, "other-data", "2" * 32, created.etag, VersionInput(
+            filename="other.json", media_type="application/json", sha256=hashlib.sha256(raw).hexdigest()), raw)
+        other = SkillResourceReference(name=alias, artifact_id="other-data", version_id="2" * 32,
+                                       sha256=hashlib.sha256(raw).hexdigest())
+        body = BODY + b"Version two.\n"
+        uploaded = artifacts.upload(actor, actor.team, NAME, "2" * 32, artifacts.get(actor, actor.team, NAME).etag,
+            VersionInput(filename="guide.md", media_type="text/markdown", sha256=hashlib.sha256(body).hexdigest(),
+                         skill_purpose=SkillPurpose(schema_version="fa-skill-purpose-v1",
+                                                    description="Read the supplied reference."),
+                         skill_resources=SkillResources(entries=[other])), body)
+        version = uploaded.payload["versions"][-1]
+        artifacts.decide(HumanApprover(artifacts.approval.approver_oid, actor.team), actor.team, NAME, uploaded.etag,
+                         ApprovalInput(decision_id="2" * 32, version_id="2" * 32, sha256=version["sha256"],
+                                       metadata_sha256=version["metadata_sha256"], decision="approve"))
+
+    async def model(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        count = len(requests)
+        assert count <= 2
+        if count == 2:
+            assert tool_result(body, "call_1")["text"] == '{"value":42}\n'
+            approve_v2()
+            receipt = await h.runtime.read("resource-version-race")
+            token = await h.runtime.executor.api_token_provider()
+            async with httpx.AsyncClient(headers={"Authorization": "Bearer " + token}) as api:
+                before = len(reads)
+                for name in sorted({reference.name, alias}):
+                    denied = await api.post(
+                        "https://api.offline.invalid/work-policy/v1/native-capabilities/read-skill-resource",
+                        json={"conversation_id": receipt.conversation_id, "request_id": receipt.request_id,
+                              "name": NAME, "resource": name})
+                    # The public envelope says BEHAVIOR_CONFLICT; the logged code is SKILL_SOURCE_CHANGED.
+                    assert denied.status_code == 409, denied.text
+                assert len(reads) == before
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=response_bytes(
+            count, tool="read_skill_resource" if count == 1 else None,
+            arguments={"name": NAME, "resource": reference.name},
+            text="Only the originally approved resource was read." if count == 2 else None))
+
+    h.runtime.executor.model_transport = httpx.MockTransport(model)
+    execute(h, captured, "resource-version-race")
+    assert len(requests) == 2 and reads.count(reference.artifact_id) == 1

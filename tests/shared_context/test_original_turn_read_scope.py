@@ -2,43 +2,30 @@
 
 import pytest
 
-from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_operations import control_key
-from shared_context.behavior_text_files import UserTextFile
 from shared_context.behavior_work_policy import work_policy_key
 from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path, sdk_io
-from test_instruction_text_files import configured_files, post
+from test_instruction_flow import instruction_models, runtime_path
+from test_instruction_text_files import configured_files
 from test_m3_auth import jwk_client, signing_key
+from stored_turn_context_helpers import load_case
 
 
-def prepared(h):
+def stored_prepared(h, saved=False):
+    """One admitted file turn and 8 unrelated instructions (`saved`: the target also completed), as stored."""
     h, control, _ = configured_files(h)
-    command = InstructionSubmit(request_id="original-file-read", content="Keep the original input.",
-                                files=(UserTextFile(name="input.txt", text="Original file bytes."),))
-    accepted = post(h, command)
-    assert accepted.status_code == 200, accepted.text
-    value = accepted.json()
-    target = control.records[value["binding_id"]]
-    unrelated = []
-    for index in range(8):
-        response = post(h, InstructionSubmit(request_id=f"unrelated-file-read-{index}",
-                                             content="Unrelated retained instruction."))
-        assert response.status_code == 200
-        record = control.records[response.json()["binding_id"]]
-        unrelated.append(work_policy_key("registration", record.admission_id))
-    route = f"/work-policy/v1/conversations/{value['conversation_id']}/turns/1/files/input.txt"
-    return h, control, target, unrelated, route
+    route = load_case(h, "context-read-scope-" + ("saved" if saved else "admitted"))["route"]
+    control.refresh()
+    by_request = {record.request_id: record for record in control.records.values()}
+    unrelated = [work_policy_key("registration", by_request[f"unrelated-file-read-{index}"].admission_id)
+                 for index in range(8)]
+    return h, control, by_request["original-file-read"], unrelated, route
 
 
 @pytest.mark.parametrize("kind", ["file", "reply", "context"])
 def test_warm_file_read_uses_one_original_registration_and_no_unrelated_work(assistant, monkeypatch, kind):
-    h, _, target, unrelated, route = prepared(assistant)
+    h, _, target, unrelated, route = stored_prepared(assistant, saved=kind != "file")
     if kind != "file":
-        sdk_io(monkeypatch)
-        h.endpoint.unbounded = True
-        h.endpoint.replies = iter([{"content": "Original saved result."}])
-        assert h.runtime.controller.step(target.binding.binding_id).state == "succeeded"
         route = route.rsplit("/files/", 1)[0] + "/" + kind
     h.transport.requests.clear()
     result = h.client.get(route, headers=h.headers("read-only"))
@@ -54,7 +41,7 @@ def test_warm_file_read_uses_one_original_registration_and_no_unrelated_work(ass
 
 @pytest.mark.parametrize("change", ["owner", "registration", "registry"])
 def test_cached_original_work_is_never_cached_read_authority(assistant, change):
-    h, control, target, _, route = prepared(assistant)
+    h, control, target, _, route = stored_prepared(assistant)
     assert h.client.get(route, headers=h.headers("read-only")).status_code == 200
     if change == "owner":
         h.mutate(control_key("owner", target.binding.owner.owner_record_id), active=False)
@@ -76,7 +63,7 @@ def test_cached_original_work_is_never_cached_read_authority(assistant, change):
 
 
 def test_cold_cache_loads_original_registration_without_inventing_a_replacement(assistant):
-    h, control, _, _, route = prepared(assistant)
+    h, control, _, _, route = stored_prepared(assistant)
     control.records.clear()
     result = h.client.get(route, headers=h.headers("read-only"))
     assert result.status_code == 200 and result.content == b"Original file bytes."

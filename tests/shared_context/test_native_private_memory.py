@@ -16,7 +16,6 @@ import httpx
 
 from shared_context import behavior_private_memory as memory
 from shared_context import native_sdk
-from shared_context.behavior_assistant_hosted import AssistantSupervisor
 from shared_context.native_agent_tools import NativeAgentRelayClient
 from shared_context.native_checkpoint import open_durable_store
 from shared_context.native_private_memory import NativePrivateMemory
@@ -82,7 +81,7 @@ def test_the_native_factory_runs_private_memory_after_the_original_completion_re
     runtime_path = tmp_path / "OFFLINE-not-executed"
     runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
     hosted = SimpleNamespace(
-        identity=IDENTITY, supervisor=AssistantSupervisor(home / ".fa-assistant-v12", runtime_path=runtime_path),
+        identity=IDENTITY, root=home / ".fa-assistant-v12",
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
     )
     order = []
@@ -132,7 +131,7 @@ def test_the_native_factory_passes_the_api_connection_and_names_why_memory_is_of
     runtime_path = tmp_path / "OFFLINE-not-executed"
     runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
     hosted = SimpleNamespace(
-        identity=IDENTITY, supervisor=AssistantSupervisor(home / ".fa-assistant-v12", runtime_path=runtime_path),
+        identity=IDENTITY, root=home / ".fa-assistant-v12",
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
     )
     runtimes = {}

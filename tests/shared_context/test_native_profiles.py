@@ -84,7 +84,7 @@ def test_original_a_profiles_reach_sdk_start_and_native_origin_without_clearing_
 async def controlled_compaction(files, turn, pid=123):
     from copilot.rpc import HistoryCompactResult
     from shared_context.behavior_sdk_compaction import events_from
-    from test_sdk_compaction_product import SUMMARY, raw_files
+    from sdk_compaction_product_helpers import SUMMARY, raw_files
 
     handlers = []
 
@@ -121,7 +121,7 @@ def test_manual_checkpoint_and_cold_followup_retain_original_native_rid_lineage(
         local_env, monkeypatch, tmp_path, provider, codec):
     from shared_context import behavior_sdk_files
     from shared_context.behavior_sdk_state import SdkState
-    from test_sdk_compaction_product import event, ordinary
+    from sdk_compaction_product_helpers import event, ordinary
 
     monkeypatch.setattr(behavior_sdk_files, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(behavior_sdk_files, "platform", SimpleNamespace(machine=lambda: "x86_64"))
@@ -190,7 +190,7 @@ def test_manual_checkpoint_and_cold_followup_retain_original_native_rid_lineage(
 def test_fixed_runtime_responses_checkpoint_title_is_bound_to_session_identity(prefix, provider, accepted):
     from shared_context.behavior_sdk_compaction import events_from, validate_native_files
     from shared_context.errors import Problem
-    from test_sdk_compaction_product import ordinary, raw_files
+    from sdk_compaction_product_helpers import ordinary, raw_files
 
     files = raw_files(ordinary("sdk-1234" + "a" * 44))
     filename = f"001-session-{prefix}.md"

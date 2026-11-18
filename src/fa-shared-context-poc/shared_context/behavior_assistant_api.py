@@ -40,7 +40,7 @@ from starlette.responses import Response, StreamingResponse
 from . import behavior_assistant_wire as aw
 from . import behavior_wire as wire
 from .behavior_api import _body, _diagnostic_request_id, _log_request_failure, _principal_dependency, _response, create_behavior_app
-from .behavior_assistant import AssistantAuthority, _Operation, _row, _digest, control_key
+from .behavior_assistant import AssistantAuthority, _digest
 from .errors import Problem
 from .behavior_http_diagnostics import model_failure, _ACQUIRE_CODES, _MODEL_CODES, _exception_type, safe_key_error
 from .behavior_assistant_deadlines import SERVER_MODEL_SECONDS, ModelCall, _server_call, model_sync
@@ -419,15 +419,6 @@ def _install_model_route(app, authority, identity, provider):
     app.include_router(model_routes)
 
 
-def _operation(authority, session, principal):
-    binding = authority.runtime.bindings[session.binding_id]
-    authority.runtime.execute_operation(session.binding_id, wire.Command(request_id="assistant-operation"), principal)
-    op_key = control_key("operation", binding.operation_id)
-    saved = _row(authority.store.read_snapshot((op_key,)), op_key, _Operation)
-    return aw.EffectResult(operation_id=binding.operation_id, effect_state=saved.effect_state,
-                           business_state=saved.business_state)
-
-
 def _status(authority, session):
     digest = None
     outcome=None
@@ -480,7 +471,6 @@ def _session_handlers(authority, on_result_ready):
         "finish": (wire.Command, authority.finish),
         "save-text-reply": (aw.SaveTextReply, authority.save_text_reply),
         "progress": (aw.ProgressUpdate,lambda s,c,p:save_progress(authority,s,c)),
-        "operation": (wire.Command, lambda s, c, p: _operation(authority, s, p)),
         "stopped": (aw.TurnStopped, lambda s, c, p: authority.stopped(s, c)),
         "status": (wire.Command, lambda s, c, p: _status(authority, s)),
         "checkpoint": (aw.SaveCheckpoint, lambda s, c, p: authority.checkpoint(s, c)),
@@ -498,7 +488,7 @@ _COMMAND_IDS = {
     "context": "current-context", "save": "own-result",
     "context-origin": "current-context",
     "attached-text": "current-attachments",
-    "reconcile": "artifact-reconcile", "finish": "finish-task", "operation": "operation",
+    "reconcile": "artifact-reconcile", "finish": "finish-task",
     "stopped": "turn-stopped", "status": "status", "checkpoint": "sdk-checkpoint", "restore": "sdk-restore",
     "resident-restore": "sdk-resident-restore",
     "save-text-reply": "save-text-reply",

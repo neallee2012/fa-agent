@@ -58,7 +58,7 @@ def local(monkeypatch, tmp_path):
     owned = tmp_path / "journal"
     owned.mkdir()
     yield SimpleNamespace(identity=IDENTITY, start=Mock(return_value={"status": "accepted"}),
-                          supervisor=SimpleNamespace(journal=SimpleNamespace(root=owned)))
+                          root=owned)
     set_resilient_tasks_enabled(before)
 
 
@@ -173,7 +173,7 @@ def test_real_dual_host_uses_bootstrap_owned_root_when_home_mkdir_is_denied(loca
     executable = tmp_path / "OFFLINE-never-executed"
     executable.write_text("synthetic", encoding="utf-8")
     supervisor = AssistantSupervisor(owned, runtime_path=executable)
-    hosted = SimpleNamespace(identity=IDENTITY, supervisor=supervisor)
+    hosted = SimpleNamespace(identity=IDENTITY, root=owned)
     journal_before = supervisor.journal.path.read_bytes()
     mode_before = home.stat().st_mode
     monkeypatch.delenv("AGENTSERVER_STATE_ROOT")

@@ -1,9 +1,7 @@
 """Controlled C1 runtime composition over local SDK/HTTP transports, not Azure proof."""
 
 import json
-import base64
 import hashlib
-import time
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -14,7 +12,7 @@ from pydantic import SecretStr
 from shared_context import behavior_wire as wire
 from shared_context.behavior_foundry import NativeExecutionGrant, native_key
 from shared_context.behavior_hosted import BehaviorExecutorClient, ChecksumSupervisor, HostedInvocation, HostedRuntime
-from shared_context.behavior_server import application, bootstrap, run_controller
+from shared_context.behavior_server import application, bootstrap
 from shared_context.behavior_server_config import BootstrapAuthorization
 from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite, InlineMaterial
 from shared_context.behavior_workers import worker_key
@@ -166,194 +164,6 @@ def c1(workspace, jwk_client, signing_key):
         h.close()
 
 
-def test_authenticated_child_enqueue_requires_started_parent_and_replays_one_registered_job(c1):
-    assert c1.post("/work/submit", {"request_id": "root-submit"}).status_code == 200
-    assert c1.post("/children/child-job-1/enqueue", {"request_id": "child-enqueue"}).status_code == 409
-    assert c1.runtime.controller.step("binding-1").state == "starting"
-    first = c1.post("/children/child-job-1/enqueue", {"request_id": "child-enqueue"})
-    assert first.status_code == 200, first.text
-    assert first.json()["state"] == "queued"
-    assert first.json()["parent_job_id"] == "job-1"
-    assert first.json()["has_delivery_obligation"] is False
-    assert c1.post("/children/child-job-1/enqueue", {"request_id": "child-enqueue"}).json() == first.json()
-    assert c1.status("/children/child-job-1").status_code == 200
-    assert c1.runtime.dep.workers.inspect("job-1").children == ("child-job-1",)
-    assert len(c1.calls) == 1
-
-
-def test_native_style_c1_parent_park_child_completion_exact_checkpoint_resume_and_delivery(c1):
-    workers = c1.runtime.dep.workers
-    assert c1.post("/work/submit", {"request_id": "root-submit"}).status_code == 200
-    assert c1.runtime.controller.step("binding-1").state == "starting"
-    assert c1.post("/children/child-job-1/enqueue", {"request_id": "child-enqueue"}).status_code == 200
-    first_launch = c1.wait_child_exit("job-1")
-    with pytest.raises(Problem) as full:
-        workers.start("child-job-1", c1.config.bindings[0].owner)
-    assert full.value.body["error"]["code"] == "WORKER_CAPACITY_FULL"
-    parked = c1.runtime.controller.park("binding-1")
-    assert parked.state == "waiting_dependency"
-    checkpoint = workers.inspect("job-1").checkpoint
-    assert checkpoint is not None
-    assert c1.status().json()["obligation_fulfilled"] is False
-    c1.runtime.controller.drain(limit=4)
-    assert c1.status("/children/child-job-1").json()["state"] == "starting"
-    child_launch = c1.wait_child_exit("child-job-1")
-    c1.runtime.controller.drain(limit=4)
-    assert c1.status("/children/child-job-1").json()["state"] == "succeeded"
-    assert c1.status().json()["state"] == "waiting_dependency"
-    assert c1.status().json()["obligation_fulfilled"] is False
-    assert workers.inspect("child-job-1").spec.obligation_id is None
-    assert "child-job-1" not in workers.completions()
-    with pytest.raises(Problem):
-        workers.observe("job-1", workers.inspect("child-job-1").last_evidence_id, c1.config.bindings[0].owner)
-    with pytest.raises(Problem):
-        workers.forward_result("child-job-1", c1.config.bindings[0].owner, c1.runtime.dep.delivery)
-    c1.runtime.controller.drain(limit=4)
-    parent = workers.inspect("job-1")
-    assert parent.state == "starting" and parent.generation == 2
-    resumed_launch = c1.runtime.dep.native_launches.launch(native_key("launch-id", parent.binding.start_request_id))
-    assert resumed_launch.start.checkpoint == checkpoint
-    assert parent.binding.checkpoint_digest == hashlib.sha256(checkpoint).hexdigest()
-    assert c1.supervisor.journal.assignment(resumed_launch.launch_id).previous_launch_id == first_launch
-    assert resumed_launch.launch_id not in {first_launch, child_launch}
-    c1.wait_child_exit("job-1")
-    assert c1.runtime.controller.step("binding-1").state == "succeeded"
-    pull = c1.post("/delivery/pull", {"request_id": "root-pull"})
-    assert pull.status_code == 200, pull.text
-    delivery = wire.DeliveryBinding.model_validate_json(base64.urlsafe_b64decode(pull.headers["x-behavior-binding"]))
-    acknowledged = c1.post("/delivery/acknowledge", {
-        "request_id": "root-ack", "exchange_id": pull.headers["x-behavior-exchange"],
-        "acknowledgment_token": pull.headers["x-behavior-ack-token"], "binding": delivery.model_dump(mode="json"),
-    })
-    assert acknowledged.status_code == 200
-    assert c1.status().json()["obligation_fulfilled"] is True
-    starts = [call for call in c1.calls if call.method == "POST" and call.url.path.endswith("/invocations")]
-    assert len(starts) == 3
-
-
-def test_controller_tick_requests_registered_parent_park_through_bounded_query_lane(c1):
-    c1.post("/work/submit", {"request_id": "root-submit"})
-    c1.runtime.controller.step("binding-1")
-    c1.post("/children/child-job-1/enqueue", {"request_id": "child-enqueue"})
-    c1.wait_child_exit("job-1")
-    result = c1.runtime.controller.drain(limit=1)
-    assert result[0]["status"] == "waiting_dependency"
-    assert c1.probe_directives == ["park"]
-    assert c1.runtime.dep.workers.inspect("job-1").queries_reserved == 1
-    assert c1.status("/children/child-job-1").json()["state"] == "queued"
-
-
-@pytest.mark.parametrize("extra", [
-    {"owner": {}}, {"parent_job_id": "child-job-1"}, {"script": "run"},
-    {"grant_id": "caller-grant"}, {"clock": "2026-09-16T00:00:00Z"}, {"input": "arbitrary"},
-])
-def test_child_http_cannot_supply_execution_authority_or_raw_work(c1, extra):
-    assert c1.post("/children/child-job-1/enqueue", {"request_id": "bad", **extra}).status_code == 422
-    assert not c1.calls
-
-
-def test_unknown_child_root_selector_and_foreign_actor_are_denied(c1):
-    assert c1.post("/children/unknown-child/enqueue", {"request_id": "bad"}).status_code == 403
-    assert c1.client.post("/behavior/v1/bindings/binding-1/children/unknown-child/enqueue",
-                         content=b"x" * 100000, headers=c1.headers(c1.signing_key)).status_code == 403
-    assert c1.status("/jobs/child-job-1").status_code == 403
-    agent = c1.config.identity.agents[1]
-    headers = {"Authorization": "Bearer " + token(c1.signing_key, {
-        "oid": agent.oid, "idtyp": "app", "roles": ["Behavior.Agent"],
-    }, remove=("scp",))}
-    assert c1.client.post("/behavior/v1/bindings/binding-1/children/child-job-1/enqueue",
-                         json={"request_id": "bad"}, headers=headers).status_code == 403
-    with pytest.raises(Problem):
-        c1.runtime._controller_park("binding-1", RuntimeController(c1.runtime, c1.config.controller_id))
-    assert not c1.calls
-
-
-@pytest.mark.parametrize("failure", ["lost-ack", "no-commit"])
-def test_child_enqueue_unknown_reconciles_exact_core_egt_without_resending(c1, failure):
-    c1.post("/work/submit", {"request_id": "root-submit"})
-    c1.runtime.controller.step("binding-1")
-    original_submit = c1.runtime.store._submit
-    request_id = worker_key("enqueue", "child-job-1")
-    observed = []
-
-    def fault(operations, request):
-        if request is not None and request.request_id == request_id:
-            observed.append(request)
-            if failure == "lost-ack":
-                c1.table.after_apply = "lost"
-            else:
-                c1.table.fail_post = True
-            try:
-                return original_submit(operations, request)
-            finally:
-                c1.table.after_apply = None
-                c1.table.fail_post = False
-        return original_submit(operations, request)
-
-    c1.runtime.store._submit = fault
-    first = c1.post("/children/child-job-1/enqueue", {"request_id": "one-child"})
-    assert first.status_code == 503 and first.json()["error"]["automatic_retry"] is False
-    assert len(observed) == 1
-    owner = c1.config.bindings[0].owner
-    assert set(observed[0].read_set) == {
-        worker_key("pool", c1.config.workers.workspace_id), worker_key("job", "child-job-1"),
-        worker_key("job", "job-1"), *c1.runtime.dep.workers._owner_keys(owner),
-    }
-    count = len(c1.table.parts)
-    repeated = c1.post("/children/child-job-1/enqueue", {"request_id": "one-child"})
-    reconciled = c1.post("/children/child-job-1/reconcile", {"request_id": "one-child"})
-    assert repeated.status_code == reconciled.status_code == (200 if failure == "lost-ack" else 503)
-    assert len(observed) == 1 and len(c1.table.parts) == count
-    assert c1.runtime.dep.workers.inspect("job-1").children == (("child-job-1",) if failure == "lost-ack" else ())
-    assert len(c1.calls) == 1
-
-
-def test_lost_native_park_and_expired_lease_never_start_child_or_release_parent_slot(c1):
-    c1.post("/work/submit", {"request_id": "root-submit"})
-    c1.runtime.controller.step("binding-1")
-    c1.post("/children/child-job-1/enqueue", {"request_id": "child-enqueue"})
-    c1.wait_child_exit("job-1")
-    c1.time += timedelta(seconds=c1.config.workers.lease_seconds + 1)
-    c1.fail_observe = True
-    result = c1.runtime.controller.drain(limit=1)
-    assert result[0]["problem"] == "WORKER_QUERY_UNKNOWN"
-    with pytest.raises(Problem) as full:
-        c1.runtime.dep.workers.start("child-job-1", c1.config.bindings[0].owner)
-    assert full.value.body["error"]["code"] == "WORKER_CAPACITY_FULL"
-    assert c1.status("/children/child-job-1").json()["generation"] == 0
-    assert len([call for call in c1.calls if call.method == "POST"]) == 1
-    c1.fail_observe = False
-    assert c1.runtime.controller.drain(limit=1)[0]["status"] == "waiting_dependency"
-    c1.runtime.controller.drain(limit=1)
-    assert c1.status("/children/child-job-1").json()["state"] == "starting"
-
-
-@pytest.mark.parametrize("tamper", ["parent", "work", "owner"])
-def test_native_callback_rejects_registered_child_with_mismatched_saved_job(c1, tamper):
-    c1.post("/work/submit", {"request_id": "root-submit"})
-    c1.runtime.controller.step("binding-1")
-    c1.post("/children/child-job-1/enqueue", {"request_id": "child-enqueue"})
-    c1.wait_child_exit("job-1")
-    c1.runtime.controller.park("binding-1")
-
-    def corrupt():
-        job = c1.runtime.dep.workers.inspect("child-job-1")
-        if tamper == "owner":
-            c1.mutate_job("child-job-1", owner={**job.owner.model_dump(mode="json"),
-                                               "principal_id": c1.config.identity.agents[1].oid})
-        else:
-            field, value = ("parent_job_id", "unregistered-root") if tamper == "parent" else ("work_id", "work-1")
-            c1.mutate_job("child-job-1", spec={**job.spec.model_dump(mode="json"), field: value})
-
-    c1.before_claim = corrupt
-    result = c1.runtime.controller.drain(limit=1)
-    assert result[0]["problem"] == "WORKER_START_UNKNOWN"
-    job = c1.runtime.dep.workers.inspect("child-job-1")
-    launch = c1.runtime.dep.native_launches.launch(native_key("launch-id", job.binding.start_request_id))
-    assert launch.claim_id is None and launch.native_invocation_id is None
-    assert launch.launch_id not in c1.supervisor.children
-
-
 @pytest.mark.parametrize("change", [
     {"job_id": "job-1"}, {"work": None}, {"parent_job_id": "child-job-1"},
     {"owner": {}}, {"child_jobs": []},
@@ -396,31 +206,6 @@ def test_c1_grants_require_parent_checkpoint_resume_and_nonparking_leaf(c1, inde
     approval = c1.approval.model_copy(update={"native_grants": tuple(grants)})
     with pytest.raises(Problem):
         bootstrap(c1.composition, approval, stage="records")
-
-def test_c1_manual_foreground_controller_uses_same_runtime_tick_without_request_daemon(c1):
-    c1.post("/work/submit", {"request_id": "root-submit"})
-    c1.runtime.controller.step("binding-1")
-    c1.post("/children/child-job-1/enqueue", {"request_id": "child-enqueue"})
-    c1.wait_child_exit("job-1")
-    result = run_controller(c1.composition)
-    assert result["ticks"] == 1 and c1.composition.closed
-    assert c1.probe_directives == ["park"]
-    assert c1.runtime.dep.workers.inspect("job-1").state == "waiting_dependency"
-    assert c1.runtime.dep.workers.inspect("child-job-1").state == "queued"
-
-
-def test_parent_park_respects_finite_worker_query_budget_without_native_dispatch(c1):
-    c1.post("/work/submit", {"request_id": "root-submit"})
-    c1.runtime.controller.step("binding-1")
-    c1.post("/children/child-job-1/enqueue", {"request_id": "child-enqueue"})
-    c1.wait_child_exit("job-1")
-    c1.mutate_job("job-1", queries_reserved=c1.config.workers.queries_per_generation)
-    before = len(c1.calls)
-    result = c1.runtime.controller.drain(limit=1)
-    assert result[0]["problem"] == "WORKER_QUERY_EXHAUSTED"
-    assert len(c1.calls) == before
-    assert c1.runtime.dep.workers.inspect("child-job-1").generation == 0
-
 
 def test_c4_minimum_and_cross_binding_child_identity_remain_strict():
     c1 = c1_config_data()

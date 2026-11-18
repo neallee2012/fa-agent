@@ -10,7 +10,8 @@ from web_test_console.adapter import ConsoleError
 from web_test_console.team_mcp import TeamMcp, install_team_mcp_routes, is_team_mcp_write
 from test_m3_auth import jwk_client, signing_key  # fixtures used by team_mcp
 from test_team_mcp_api import SECRET, team_mcp
-from test_web_test_console_frozen_interface import real_interface
+from assistant_api_helpers import assistant_api, picker_api
+from instruction_flow_helpers import instruction_models
 
 
 def console_for(api, identity="owner"):
@@ -97,8 +98,8 @@ def test_read_only_and_invalid_changes_are_not_sent(team_mcp):
     assert all(method == "GET" for method, _, _ in sent + owner_sent)
 
 
-def test_bridge_admits_only_bounded_csrf_checked_team_mcp_writes(real_interface):
-    c = real_interface
+def test_bridge_admits_only_bounded_csrf_checked_team_mcp_writes(picker_api):
+    c = picker_api
     ui, headers = c.browser.ui, c.browser.headers
     body = add_command({"default_version": None})
     path = "/api/team-mcp/changes"

@@ -23,8 +23,9 @@ from shared_context.errors import Problem
 from shared_context.source_materials import digest
 import test_conversation_transfer_startup as startup
 from test_agent_registry_operator import OperatorTableTransport
-from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from test_conversation_transfer_startup import synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 from test_team_registry import AGENT_OID, OTHER_AGENT_OID, _target
 

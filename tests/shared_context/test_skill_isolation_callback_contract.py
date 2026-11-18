@@ -15,8 +15,14 @@ from copilot.session_events import (
     ToolExecutionCompleteError, ToolExecutionStartData,
 )
 
-from test_skill_isolation_native import (
-    CANARY_MARKER, CANARY_NAME, IsolationObservation, ProbeBlocked, WITNESS_URL, WitnessProvider, owned_path,
+from test_skill_isolation_native import IsolationObservation
+from skill_isolation_native_helpers import (
+    CANARY_MARKER,
+    CANARY_NAME,
+    ProbeBlocked,
+    WITNESS_URL,
+    WitnessProvider,
+    owned_path,
 )
 
 

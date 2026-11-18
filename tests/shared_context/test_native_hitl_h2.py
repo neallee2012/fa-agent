@@ -186,12 +186,10 @@ async def permit(case, packet=None, **kwargs):
 
 
 async def pending_view(case):
-    for _ in range(100):
-        page = await case.client.pending(NativeHitlPendingQuery(turn=case.gate.turn))
-        if page.references:
-            return await case.client.read(page.references[-1].pending_id)
-        await asyncio.sleep(0.005)
-    pytest.fail("HITL did not retain an original pending reference")
+    async with asyncio.timeout(10):
+        while not (page := await case.client.pending(NativeHitlPendingQuery(turn=case.gate.turn))).references:
+            await asyncio.sleep(0.005)
+    return await case.client.read(page.references[-1].pending_id)
 
 
 def human_decide(case, view, choice="allow_once", request_id="human-one"):
@@ -994,6 +992,111 @@ def test_rule_change_at_authorization_cas_reassesses_the_same_claim(hitl, tmp_pa
         assert retained.token == token and len(case.runtime.store.items) == 1
         assert [review.rules_revision for review in retained.hitl.reviews] == [0, 1]
         assert retained.hitl.authorization.review.rules_revision == 1 and calls == ["sent"]
+        await case.gate.close()
+    asyncio.run(check())
+
+
+def rules_change_at(case, path, edits):
+    """The owner edits the Team rules just before each of the first ``edits`` writes to ``path``, so the API refuses
+    each of those writes with NATIVE_HITL_RULES_CHANGED. Returns the list of writes to ``path``."""
+    original, writes = case.client.write, []
+
+    async def writing(written, command):
+        if written == path:
+            writes.append(written)
+            assert len(writes) <= 10, "the runtime retried a rules change without end"
+            if len(writes) <= edits:
+                assert post(case.c, "/rules", change(case.c, f"owner-edit-{len(writes)}")).status_code == 200
+        await asyncio.sleep(0)
+        return await original(written, command)
+    case.client.write = writing
+    return writes
+
+
+@pytest.mark.parametrize("edits", [2, 100], ids=["settles", "never_settles"])
+def test_a_rules_change_at_the_card_write_is_reassessed_a_few_times_then_refused(hitl, tmp_path, edits):
+    case = setup_gate(hitl, tmp_path)
+    writes = rules_change_at(case, "/pending", edits)
+
+    async def check():
+        waiting = asyncio.create_task(permit(case))
+        if edits < 3:
+            human_decide(case, await pending_view(case))
+            assert await asyncio.wait_for(waiting, 10) == (True, None)
+        else:
+            assert await asyncio.wait_for(waiting, 10) == (False, "NATIVE_HITL_RULES_CHANGED")
+            assert not (await case.client.pending(NativeHitlPendingQuery(turn=case.gate.turn))).references
+        assert len(writes) == 3
+        await case.gate.close()
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("edits", [2, 100], ids=["settles", "never_settles"])
+def test_a_rules_change_at_authorization_is_reassessed_a_few_times_then_refused(hitl, tmp_path, edits):
+    case = setup_gate(hitl, tmp_path, (verdict("allow"),))
+    writes = rules_change_at(case, "/authorize", edits)
+    calls = []
+
+    async def tool(_):
+        calls.append("sent")
+        return ToolOutput("one")
+
+    async def check():
+        assert await permit(case) == (True, None)
+        if edits < 3:
+            assert (await asyncio.wait_for(case.gate.invoke(case.packet, tool), 10)).text == "one"
+            assert calls == ["sent"]
+        else:
+            with pytest.raises(ToolFailure) as refused:
+                await asyncio.wait_for(case.gate.invoke(case.packet, tool), 10)
+            assert refused.value.public_code == "NATIVE_HITL_RULES_CHANGED" and calls == []
+            told = refused.value.public_message
+            assert "工具沒有執行" in told and "規則" in told and "不要重送" not in told and "do not resend" not in told
+        assert len(writes) == 3
+        await case.gate.close()
+    asyncio.run(check())
+
+
+def test_the_sdk_is_told_a_never_settling_rules_change_ran_nothing_and_may_be_called_anew(hitl, tmp_path, monkeypatch):
+    case = setup_gate(hitl, tmp_path)
+    writes = rules_change_at(case, "/pending", 100)
+    told = []
+
+    async def callback(options, sid):
+        request = permission_request(case.packet)
+        told.append(await asyncio.wait_for(options["on_permission_request"](request, {"session_id": sid}), 10))
+        await case.gate.close()
+
+    async def no_tool(_):
+        pytest.fail("a refused permission must not execute the provider")
+    run_callbacks(
+        tmp_path, monkeypatch, callback, no_tool, tool_name="run_command",
+        parameters={"type": "object", "properties": {"command": {"type": "string"}},
+                    "required": ["command"], "additionalProperties": False}, native_hitl=case.gate)
+    [decision] = told
+    assert isinstance(decision, PermissionDecisionReject) and len(writes) == 3
+    assert decision.feedback.startswith("[NATIVE_HITL_RULES_CHANGED]")
+    assert "工具沒有執行" in decision.feedback and "規則" in decision.feedback and "不要重送" not in decision.feedback
+
+
+def test_an_owner_allowed_card_is_interrupted_when_its_authorization_never_settles(hitl, tmp_path):
+    case = setup_gate(hitl, tmp_path)
+    writes = rules_change_at(case, "/authorize", 100)
+    calls = []
+
+    async def tool(_):
+        calls.append("sent")
+        return ToolOutput("one")
+
+    async def check():
+        waiting = asyncio.create_task(permit(case))
+        original = await pending_view(case)
+        human_decide(case, original)
+        assert await asyncio.wait_for(waiting, 10) == (True, None)
+        with pytest.raises(ToolFailure) as refused:
+            await asyncio.wait_for(case.gate.invoke(case.packet, tool), 10)
+        assert refused.value.public_code == "NATIVE_HITL_RULES_CHANGED" and calls == [] and len(writes) == 3
+        assert (await case.client.read(original.approval.pending_id)).status == "interrupted"
         await case.gate.close()
     asyncio.run(check())
 

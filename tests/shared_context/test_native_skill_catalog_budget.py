@@ -20,7 +20,7 @@ from shared_context.m3_skills import PurposeSkillCatalog, PurposeSkillEntry, Pur
 from shared_context.native_assembly import NativeAssemblyCollector
 from test_agent_runtime import peer_runtime
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_native_agent_api import relay_case
 from test_native_capability_api import SKILLS, code, gateway, skilled, skilled_http
@@ -179,7 +179,7 @@ def test_an_unknown_token_count_is_refused_not_counted_as_zero(budgeted, monkeyp
     assert code(unknown) == "SKILL_CATALOG_TOKEN_COUNT_UNKNOWN"
 
 
-@pytest.mark.parametrize("change", ["capacity", "catalog", "omitted"])
+@pytest.mark.parametrize("change", ["capacity", "catalog", "omitted", "input-limit", "unavailable"])
 def test_hosted_refuses_a_presentation_that_differs_from_its_capture(budgeted, change):
     case, refs, _, _ = budgeted
     loop = case.loop
@@ -191,7 +191,11 @@ def test_hosted_refuses_a_presentation_that_differs_from_its_capture(budgeted, c
         view = served(principal, command)
         update = {"capacity": {"capacity_sha256": "0" * 64}, "catalog": {"catalog_sha256": "0" * 64},
                   "omitted": {"description": DESCRIPTION_PREFIX + json.dumps({
-                      "entries": [], "omitted_count": 0, "unavailable_count": 0, "lookup": "x"})}}[change]
+                      "entries": [], "omitted_count": 0, "unavailable_count": 0, "lookup": "x"})},
+                  # Still a valid presentation: the two-percent budget follows the declared limit.
+                  "input-limit": {"input_limit_tokens": view.input_limit_tokens + 50,
+                                  "budget_tokens": (view.input_limit_tokens + 50) // 50},
+                  "unavailable": {"unavailable_count": view.unavailable_count + 1}}[change]
         return SkillCatalogPresentation.model_validate({**view.model_dump(), **update})
 
     upstream.routes["/skill-catalog-presentation"] = (NativeTurnScope, tampered)

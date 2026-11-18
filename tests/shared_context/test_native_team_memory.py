@@ -20,7 +20,6 @@ from shared_context import behavior_private_memory as memory
 from shared_context import native_memory_candidate as candidates
 from shared_context import native_sdk
 from shared_context import native_team_memory as team
-from shared_context.behavior_assistant_hosted import AssistantSupervisor
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_capture import TEAM_MEMORY_ENV, team_memory_capture
 from shared_context.behavior_native_turn_wire import NativeSubmit, NativeTurnCapture, TeamMemoryCapture, team_memory_scope
@@ -226,7 +225,7 @@ def test_the_factory_shares_before_private_memory_and_a_failure_never_blocks_the
     runtime_path = tmp_path / "OFFLINE-not-executed"
     runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
     hosted = SimpleNamespace(
-        identity=IDENTITY, supervisor=AssistantSupervisor(home / ".fa-assistant-v12", runtime_path=runtime_path),
+        identity=IDENTITY, root=home / ".fa-assistant-v12",
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
     )
     order = []
@@ -283,7 +282,7 @@ def test_the_group_post_goes_first_then_the_team_note_then_private_memory(local_
     runtime_path = tmp_path / "OFFLINE-not-executed"
     runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
     hosted = SimpleNamespace(
-        identity=IDENTITY, supervisor=AssistantSupervisor(home / ".fa-assistant-v12", runtime_path=runtime_path),
+        identity=IDENTITY, root=home / ".fa-assistant-v12",
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
     )
     order = []

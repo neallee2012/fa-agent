@@ -9,7 +9,7 @@ from pydantic import Field, field_validator, model_validator
 
 from . import behavior_assistant_wire as aw
 from .behavior_delivery import _Model, _parse, _material, _update, _utc, VerifiedWorkResult
-from .behavior_operations import control_key
+from .behavior_operations import control_key, conversation_key
 from .behavior_store import ControlChanges, ControlRequest, ControlWrite
 from .behavior_workers import JobRecord, worker_key
 from .errors import Problem
@@ -24,10 +24,6 @@ from .behavior_work_memory import WorkMemorySource
 from .behavior_skill_copy import SopCopyOutcome, SopCopyReceipt
 from .behavior_skill_draft import SkillDraftOutcome, SkillDraftReceipt, skill_draft_enabled
 from .behavior_agent_worker import AgentVmBinding
-
-
-def conversation_key(conversation_id):
-    return control_key("assistant-conversation", conversation_id)
 
 
 def conversation_id(policy, command):
@@ -200,47 +196,6 @@ def registration_write(conversation, job_id):
     next_value = conversation.model_copy(update={"jobs": (*conversation.jobs, job_id), "active_job_id": job_id})
     return ControlWrite(row_id=conversation_key(conversation.conversation_id),
         mode="replace" if conversation.jobs else "create", data=next_value.model_dump(mode="json"))
-
-
-def reset_request(control, conversation, request_id):
-    last=conversation.jobs[-1] if conversation.jobs else None
-    return ControlRequest(request_id=control_key("conversation-reset",conversation.conversation_id,request_id),
-        request_digest=digest([conversation.conversation_id,request_id,conversation.human_oid]),
-        read_set=(control.policy_key,control.revocation_key,conversation_key(conversation.conversation_id),
-                  *((worker_key("job",last),) if last is not None else ())))
-
-
-def reset_result(conversation):
-    return {"conversation_id":conversation.conversation_id,"archived":True,
-        "reset_request_id":conversation.reset_request_id,"hosted_session_id":conversation.hosted_session_id,
-        "job_id":conversation.jobs[-1] if conversation.jobs else None}
-
-
-def archive_conversation(control,principal,identifier,command):
-    control._human(principal,"submit")
-    control.refresh()
-    key=conversation_key(identifier)
-    row=control.store.read_snapshot((key,))[key]
-    if row is None:raise Problem(404,"CONVERSATION_NOT_FOUND","original conversation is unavailable")
-    original=_parse(row.payload["data"],Conversation)
-    if (original.human_oid,original.team_id,original.agent_oid)!=(principal.oid,principal.team,control.policy.template.agent_oid):
-        raise Problem(403,"CONVERSATION_SCOPE_DENIED","only this conversation's original human may reset it")
-    request=reset_request(control,original,command.request_id)
-    def decide(rows):
-        control.installed(rows)
-        current=_parse(rows[key].payload["data"],Conversation)
-        if current.reset_request_id is not None:
-            raise Problem(409,"CONVERSATION_ARCHIVED","this conversation already has an original reset")
-        if current!=original or current.active_job_id not in {None,current.jobs[-1] if current.jobs else None}:
-            raise Problem(409,"CONVERSATION_TURN_UNRESOLVED","finish or reconcile the original work before reset")
-        if current.jobs:
-            job=_parse(rows[worker_key("job",current.jobs[-1])].payload["data"],JobRecord)
-            if job.state not in {"succeeded","failed","cancelled"} or not job.result_forwarded:
-                raise Problem(409,"CONVERSATION_TURN_UNRESOLVED","reset does not discard running or unknown work")
-        archived=_update(current,active_job_id=None,reset_request_id=command.request_id,archived_at=control.runtime._now())
-        return ControlChanges(writes=(ControlWrite(row_id=key,mode="replace",data=archived.model_dump(mode="json")),),
-                              result=reset_result(archived))
-    return control.store.transact(request,decide)
 
 
 @dataclass(frozen=True)

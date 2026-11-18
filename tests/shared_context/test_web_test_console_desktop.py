@@ -11,7 +11,8 @@ from web_test_console.bridge import create_app
 from test_desktop_view_api import FakeUpstream
 from test_m3_auth import jwk_client, signing_key
 from test_web_test_console_agents import connection_file, directory_payload
-from test_web_test_console_frozen_interface import real_interface
+from assistant_api_helpers import assistant_api, picker_api
+from instruction_flow_helpers import instruction_models
 
 ORIGIN = "http://127.0.0.1:8873"
 SESSION = "fa-chat-" + "b" * 48
@@ -19,8 +20,8 @@ PATH = f"/api/agents/agent-one/desktop?session={SESSION}"
 
 
 @pytest.fixture
-def console(real_interface, tmp_path, monkeypatch):
-    c = real_interface
+def console(picker_api, tmp_path, monkeypatch):
+    c = picker_api
     manifest = connection_file(c, tmp_path)
     connections = AgentConnections.model_validate_json(manifest.path.read_bytes())
     opened = []

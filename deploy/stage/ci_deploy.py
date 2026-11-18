@@ -66,12 +66,18 @@ APP = ROOT / "src" / "fa-shared-context-poc"
 sys.path.insert(0, str(ROOT / "deploy" / "shared-context"))
 from deployment_config import config_path, load_config
 
-# Replaced in main() by the selected profile; build only needs the registry, so the import itself never requires the
-# runtime fields (a new azd environment builds its images before its Agents exist).
-STAGE = load_config(require_runtime=False)
-CONFIG = config_path()
+STAGE = CONFIG = TOKEN = None  # the selected profile, set by use_profile(); importing reads no profile
 RUNTIME = ROOT / "deploy" / "stage" / "runtime"
-TOKEN = re.sub(r"[^a-z0-9-]+", "-", STAGE["environment"].lower()).strip("-") or "environment"
+
+
+def use_profile(config, *, require_runtime=True):
+    """Select the environment profile: main() does it once from --config or FA_DEPLOY_CONFIG, tests pass a path."""
+    global STAGE, CONFIG, TOKEN
+    STAGE = load_config(config, require_runtime=require_runtime)
+    CONFIG = config_path(config)
+    TOKEN = re.sub(r"[^a-z0-9-]+", "-", STAGE["environment"].lower()).strip("-") or "environment"
+
+
 VERSIONS = APP / "shared_context" / "behavior_agent_versions.py"
 # Overlay keys sync checks by value, not as "0"/"1" switches (behavior_agent_versions._check_environment).
 HOSTED_VALUE_KEYS = frozenset({"FA_NATIVE_TURNS", "FA_NATIVE_HITL_TTL_SECONDS", "FA_PRIVATE_MEMORY_STORE", "TZ",
@@ -1046,22 +1052,17 @@ def _healthz(url):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", help="environment profile; defaults to FA_DEPLOY_CONFIG or the checked-in stage profile")
+    parser.add_argument("--config", help="environment profile (required unless FA_DEPLOY_CONFIG is set)")
     parser.add_argument("--runtime-dir", type=Path,
                         help="generated runtime directory; defaults to <config>/runtime")
     parser.add_argument("command", choices=("meta", "check", "guard", "build", "gate", "sync", "api", "console", "feed",
                                             "follow"))
     parser.add_argument("args", nargs="*")
     parsed = parser.parse_args()
-    global CONFIG, RUNTIME, STAGE, TOKEN
+    global RUNTIME
     # build only needs the registry: a new azd environment builds its images before its Agents exist (deploy/azd).
-    STAGE = load_config(parsed.config, require_runtime=parsed.command != "build")
-    CONFIG = config_path(parsed.config)
-    TOKEN = re.sub(r"[^a-z0-9-]+", "-", STAGE["environment"].lower()).strip("-") or "environment"
-    if parsed.runtime_dir is not None:
-        RUNTIME = parsed.runtime_dir
-    else:
-        RUNTIME = config_path(parsed.config).parent / "runtime"
+    use_profile(parsed.config, require_runtime=parsed.command != "build")
+    RUNTIME = parsed.runtime_dir if parsed.runtime_dir is not None else CONFIG.parent / "runtime"
     command, args = parsed.command, parsed.args
     {"meta": meta, "check": check, "guard": guard, "build": build, "gate": gate, "sync": sync, "api": api, "console": console, "feed": feed,
      "follow": lambda api_ref, hosted_ref: sync(api_ref, hosted_ref, follow=True)}[command](*args)

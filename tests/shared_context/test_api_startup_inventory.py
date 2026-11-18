@@ -74,7 +74,7 @@ def test_work_policy_lifespan_does_not_reread_the_whole_work_registry(fresh_case
     monkeypatch.setattr(WorkPolicyControl, "refresh", counted)
     app = application(h.composition)
     built = len(full)
-    assert h.runtime.work_policy is not None and app.state.instruction_runner
+    assert h.runtime.work_policy is not None
     with TestClient(app) as client:
         started = len(full)
         assert client.get("/healthz").status_code == 200

@@ -155,8 +155,6 @@ class _PeerRouting:
             if peer.agent_id not in self.apps:
                 app = await run_in_threadpool(self.factory, peer)
                 self.apps[peer.agent_id] = app
-                if getattr(app.state, "instruction_runner", False):
-                    peer.resume_instructions()
             return self.apps[peer.agent_id]
 
     async def prepare(self):

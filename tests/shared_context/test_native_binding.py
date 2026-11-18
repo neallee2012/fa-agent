@@ -27,7 +27,7 @@ from shared_context.errors import Problem
 from shared_context.native_binding import NativeBindingStore, binding_store
 from test_native_turn_api import PREFIX, NativeTransport, native_api, submit
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 from test_native_environment_api import environment_at
 from test_native_responses_api import responses_api

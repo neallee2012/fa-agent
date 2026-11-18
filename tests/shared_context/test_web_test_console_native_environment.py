@@ -11,7 +11,7 @@ from test_native_environment_api import environment_at
 from test_web_test_console_native import native_console, first, post
 from test_native_turn_api import native_api
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 

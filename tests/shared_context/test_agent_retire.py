@@ -23,7 +23,7 @@ from shared_context.errors import Problem
 from shared_context.native_routine_clock import NativeRoutineClock
 from test_behavior_server import workspace  # fixture
 from test_conversation_transfer_startup import synthetic_standing_v1  # fixture
-from test_instruction_flow import instruction_models  # fixture
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import HUMAN_OID, jwk_client, signing_key  # fixture
 from test_team_agent_routing import _register_scope, register_more_agents, team_agent  # fixture
 from test_team_registry import AGENT_OID, OTHER_AGENT_OID, _app, _target, _verifier, activated, registry
@@ -106,7 +106,7 @@ def _retire(case, agent_id=None):
 def test_a_fully_onboarded_agent_retired_still_passes_the_real_startup_readers(team_agent):
     """The dev case: the retired Agent also has its runtime registration, policy and a built peer."""
     from shared_context.behavior_migration import MigrationStore, installed_origin
-    from test_conversation_transfer_startup import read_startup
+    from legacy_turn_rows_helpers import read_startup
     from test_resident_worker_poc import outcome_of
     case = team_agent
     config = case.config
@@ -288,20 +288,3 @@ def test_the_teams_relay_answers_a_retired_agent_in_words(team_agent):
     assert sent == decided and (sent.state, sent.text) == ("refused", TEXT["retired"]) and sent.confirm is None
     assert case.c.sessions.calls == []
 
-
-def test_the_keepalive_skips_a_retired_peer_and_says_so_once(caplog):
-    from shared_context.behavior_session_keepalive import InstructionSessionKeepalive
-    from shared_context.behavior_team_registry import agent_retired
-
-    def peer_read(*args, **kwargs):
-        raise agent_retired()  # what for_agent() raises for the retired peer inside the peer read
-
-    composition = SimpleNamespace(config=object(), runtime=SimpleNamespace(
-        mode="native", store=SimpleNamespace(consistent_read=peer_read)))
-    keepalive = InstructionSessionKeepalive(composition, "binding-1")
-    keepalive._tick = lambda: None
-    with caplog.at_level(logging.INFO):
-        for _ in range(3):
-            keepalive.tick()
-    lines = [record.getMessage() for record in caplog.records if "HOSTED_SESSION_KEEPALIVE" in record.getMessage()]
-    assert lines == ["HOSTED_SESSION_KEEPALIVE_PEER_RETIRED binding_id=binding-1 skipped"]

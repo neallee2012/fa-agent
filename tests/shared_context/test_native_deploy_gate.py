@@ -413,7 +413,7 @@ def load_ci():
     spec = importlib.util.spec_from_file_location("offline_stage_ci_gate", ROOT / "deploy" / "stage" / "ci_deploy.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.STAGE = copy.deepcopy(module.STAGE)
+    module.use_profile(ROOT / "deploy" / "stage" / "stage.json")
     module.STAGE["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] = "1"  # ADR-0009 2d-ii: the switch is on
     return module
 

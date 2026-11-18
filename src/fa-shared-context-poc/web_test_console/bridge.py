@@ -15,14 +15,12 @@ from threading import RLock
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import SecretStr
 
 from .adapter import (
     CliTokenProvider, ConsoleConfig, SteadyConsoleConfig, ConsoleError, PullAdapter, TokenVault,
     canonical, now_utc, require, sha, strict_json,
 )
-from .standing import StandingConsoleConfig, StandingWorkObservation
-from .work_policy import checked_observation
+from .standing import StandingConsoleConfig
 from .pull_continuation import PullContinuationSidecar
 from .instructions import NATIVE_LANE, InstructionConnection
 from .agent_connections import AgentConnections, AgentConsoles, MESSAGES as AGENT_MESSAGES, validate_default
@@ -41,11 +39,14 @@ from .console_routes import (
     install_reply_read_routes, install_task_routes, install_template_routes, install_session_routes, install_turn_routes,
 )
 from . import realtime
+from .instructions import LEGACY_READ_ONLY
 from . import prewarm as typing_prewarm
 
 # A conversation's progress reads take turns. One that does not come back must not hold the next ones (a reload's first
 # read included) forever: a read waits this long for its turn, then answers retryable and the page reads again.
 PROGRESS_LOCK_WAIT_SECONDS = 25
+# The job-bound lane is retired: a conversation still on it stays readable and takes no new write.
+LEGACY_WRITE_ACTIONS = ("submit", "submit-reconcile", "submit-retry", "cancel")
 
 MESSAGES = {
     **AGENT_MESSAGES,
@@ -283,8 +284,6 @@ class Console:
         self.adapter = None if config is None else PullAdapter(config, self.backend, api_prefix=api_prefix)
         self.groups = None if config is None else GroupControl(self)
         self.results, self.statuses, self.errors = {}, {}, {}
-        self.instruction_observations = {}
-        self.instruction_observation_errors = {}
         self.observed_here = set()
         self.instructions = None
         self.native_instructions = None
@@ -337,12 +336,9 @@ class Console:
         self.active()
         permission = phase
         if phase in {"read-reply", "read-context", "read-delegation", "read-agent-messages",
-                     "confirm-reply", "cancel", "read-cancel-receipt", "read-files"}:
+                     "confirm-reply", "read-cancel-receipt", "read-files"}:
             require(self.instruction_task(task), "ACTION_NOT_ALLOWED", 403)
             permission = "acknowledge" if phase == "confirm-reply" else "status"
-        if phase in {"submit-reconcile","submit-retry"}:
-            require(self.instruction_task(task), "ACTION_NOT_ALLOWED", 403)
-            permission = "submit" if phase=="submit-retry" else "status"
         require(permission in task.allowed_actions, "ACTION_NOT_ALLOWED", 403)
         token = self.vault.get()
         return token
@@ -351,48 +347,6 @@ class Console:
         if self.instruction_task(task):
             return self.instructions.adapter
         return self.adapter
-
-    def refresh_instruction_work(self, task, token):
-        require(self.instruction_task(task), "ACTION_NOT_ALLOWED", 403)
-        self.instruction_observations.pop(task.task_id, None)
-        self.instruction_observation_errors[task.task_id] = "WORK_POLICY_UNAVAILABLE"
-        query = self.instructions.query(task)
-        try:
-            observation = self.instructions.reader.read(query, SecretStr(token))
-            observation = checked_observation(observation, query, self.clock(), instruction=True)
-        except (httpx.HTTPError, OSError, ValueError, TypeError):
-            raise ConsoleError("WORK_POLICY_UNAVAILABLE", 503) from None
-        self.instruction_observations[task.task_id] = observation
-        self.instruction_observation_errors.pop(task.task_id, None)
-        return observation
-
-    def instruction_execution_view(self, task):
-        observation = self.instruction_observations.get(task.task_id)
-        if observation is None:
-            code = self.instruction_observation_errors.get(task.task_id)
-            if code is not None:
-                return {"connection": "AWAITING_OBSERVATION", "blocking_code": code,
-                        "message": MESSAGES.get(code, MESSAGES["WORK_POLICY_UNAVAILABLE"]), "observation": None}
-            return None
-        view = {"connection": "OBSERVED", "blocking_code": None, "message": "",
-                "observation": {
-                    "decision": observation.decision, "reason": observation.reason, "revision": observation.revision,
-                    "observed_at": observation.observed_at.isoformat(),
-                    "execution_deadline": (None if observation.execution_deadline is None
-                                           else observation.execution_deadline.isoformat()),
-                    "budget": observation.budget.model_dump(mode="json"),
-                    "not_current_live_permission": True, "rechecked_before_submit": False}}
-        if type(observation) is StandingWorkObservation:
-            p = observation.preflight
-            view["observation"]["standing"] = {
-                "already_admitted": p.already_admitted, "capacity_available": p.capacity_available,
-                "queue_deadline": None if p.queue_deadline is None else p.queue_deadline.isoformat(),
-                "guard_revision": p.guard_revision, "reason": p.reason,
-                "monetary_budget": p.monetary_budget.model_dump(mode="json"),
-                "abstract_attempts_remaining": p.abstract_attempts_remaining,
-                "abstract_units_remaining": p.abstract_units_remaining,
-            }
-        return view
 
     def phase(self, task, name):
         value = self.journal.get(task.task_id, name)
@@ -408,15 +362,12 @@ class Console:
     def task_view(self, task):
         actions = {}
         result = self.results.get(task.task_id)
-        for action in ("submit", "status", "fetch", "acknowledge", "submit-reconcile", "submit-retry", "read-reply", "read-context", "read-delegation", "confirm-reply", "cancel", "read-cancel-receipt", "read-files"):
+        # A legacy (job-bound) conversation is read-only: its writes are never offered.
+        for action in LEGACY_WRITE_ACTIONS:
+            actions[action] = {"enabled": False, "reason": LEGACY_READ_ONLY}
+        for action in ("status", "fetch", "acknowledge", "read-reply", "read-context", "read-delegation", "confirm-reply", "read-cancel-receipt", "read-files"):
             try:
                 self.gate(task, action)
-                if action == "submit-reconcile":
-                    pending = self.journal.get(task.task_id, "submit")
-                    require(pending is not None and pending["state"] == "UNKNOWN"
-                            and self.instructions.admission(task) is None, "INSTRUCTION_PENDING")
-                if action == "submit-retry":
-                    require(self.instructions.retry_observation(task) is not None,"SUBMISSION_RECONCILE_REQUIRED")
                 if action == "read-reply":
                     progress = self.instructions.progress(task)
                     require(progress is not None and progress["data"]["reply_available"], "NO_RESULT")
@@ -425,8 +376,6 @@ class Console:
                 if action == "read-files":
                     require(self.instructions.admission(task) is not None, "INSTRUCTION_PENDING")
                     require(bool(self.instructions.command(task.task_id).files), "USER_FILE_UNAVAILABLE")
-                if action == "cancel":
-                    self.instructions.require_cancellable(task)
                 if action == "read-cancel-receipt":
                     self.instructions.cancellation_intent(task)
                 if action == "confirm-reply":
@@ -435,10 +384,9 @@ class Console:
                             and progress["data"]["delivery_id"] is not None, "NO_RESULT")
                     require(self.journal.get(task.task_id, "acknowledge") is None, "ALREADY_ACKNOWLEDGED")
                     require(result is not None or self.journal.get(task.task_id, "fetch") is None, "CHALLENGE_LOST")
-                if action in {"submit", "fetch", "acknowledge"}:
+                if action in {"fetch", "acknowledge"}:
                     prior = self.journal.get(task.task_id, action)
-                    code = ({"submit": "ALREADY_SUBMITTED", "fetch": "ALREADY_FETCHED",
-                             "acknowledge": "ALREADY_ACKNOWLEDGED"}[action]
+                    code = ({"fetch": "ALREADY_FETCHED", "acknowledge": "ALREADY_ACKNOWLEDGED"}[action]
                             if prior is not None and prior["state"] in {"CONFIRMED", "VERIFIED"}
                             else "RECONCILE_REQUIRED")
                     if action == "fetch" and prior is not None and result is None:
@@ -469,7 +417,7 @@ class Console:
             "submission": self.phase(task, "submit"), "fetch": self.phase(task, "fetch"),
             "cancellation": self.phase(task, "cancel") if self.instruction_task(task) else None,
             "acknowledgment": self.phase(task, "acknowledge"), "actions": actions,
-            "execution": self.instruction_execution_view(task) if self.instruction_task(task) else None,
+            "execution": None,
             "error": self.errors.get(task.task_id),
         }
 
@@ -562,17 +510,9 @@ class Console:
                 else:
                     self.native_instructions.refresh(thread, self.vault.get())
                 return {"task": self.native_instructions.task_view(task_id, thread)}
+            # A legacy (job-bound) conversation is read-only: its submit, reconcile and retry never reach the API.
+            require(action in {"status", "fetch", "acknowledge"}, "ACTION_NOT_ALLOWED", 403)
             task = self.task(task_id)
-            if action == "submit-reconcile":
-                self.gate(task, action)
-                self.instructions.reconcile(task)
-                self.errors.pop(task_id,None)
-                return {"task": self.task_view(task)}
-            if action == "submit-retry":
-                self.instructions.retry_submission(task)
-                self.errors.pop(task_id,None)
-                return {"task": self.task_view(task)}
-            require(action in {"submit", "status", "fetch", "acknowledge"}, "ACTION_NOT_ALLOWED", 403)
             # Repeated clicks observe this client's original attempt, never re-POST.
             prior = None if action == "status" else self.journal.get(task_id, action)
             if prior is not None:
@@ -585,17 +525,6 @@ class Console:
             intent_started = False
             try:
                 if action == "status":
-                    if self.instruction_task(task):
-                        try:
-                            observation = self.refresh_instruction_work(task, token)
-                            if type(observation) is StandingWorkObservation and not observation.preflight.already_admitted:
-                                self.statuses[task_id] = {"data": None, "admission": "not_admitted",
-                                    "observed_at": observation.observed_at.isoformat(), "not_current_live_result": True}
-                                self.errors.pop(task_id, None)
-                                return {"task": self.task_view(task)}
-                        except ConsoleError as error:
-                            code = error.code if error.code in MESSAGES else "WORK_POLICY_UNAVAILABLE"
-                            self.instruction_observation_errors[task_id] = code
                     value = adapter.status(task, token)
                     self.statuses[task_id] = {"data": value.model_dump(mode="json"), "observed_at": created,
                                              "not_current_live_result": True}
@@ -637,14 +566,7 @@ class Console:
                     intent.update(exchange_id=result.exchange_id, binding=result.binding.model_dump(mode="json"))
                 self.journal.begin(task_id, action, intent)
                 intent_started = True
-                if action == "submit":
-                    value = adapter.submit(task, token)
-                    self.statuses[task_id] = {"data": value.model_dump(mode="json"), "observed_at": created,
-                                             "not_current_live_result": True}
-                    saved = {"state": "CONFIRMED", "observed_at": self.clock().isoformat()}
-                    if self.instruction_task(task):
-                        saved["admission"] = adapter.admissions[task.task_id].model_dump(mode="json")
-                elif action == "fetch":
+                if action == "fetch":
                     value = adapter.fetch(task, token, status.delivery_id)
                     self.results[task_id] = value
                     saved = {"state": "VERIFIED", "sha256": value.binding.payload_digest,
@@ -679,11 +601,7 @@ class Console:
                 self.native_instructions.submit(request_id, content, model, attachments, files, token, images=images,
                                                 uploads=uploads)
                 return {"task": self.native_instructions.task_view(request_id, thread, self.instructions.store.get(request_id))}
-            # Attached images are a native-lane input; the job-bound lane refuses them before any write.
-            require(not images, "USER_IMAGES_UNSUPPORTED", 409)
-            require(not uploads, "USER_UPLOADS_UNSUPPORTED", 409)
-            task = self.instructions.prepare(request_id, content, model, attachments, files)
-            return self.run(task.task_id, "submit")
+            raise ConsoleError("ACTION_NOT_ALLOWED", 403)  # a legacy (job-bound) conversation is read-only
 
     def upload_instruction_image(self, request_id, name, png_base64):
         require(self.instructions is not None, "ACTION_NOT_ALLOWED", 403)
@@ -762,8 +680,7 @@ class Console:
             if self.native_thread(thread_id):
                 self.native_instructions.follow_up(thread_id, self.vault.get())
                 return self.state(thread_id)
-            self.instructions.follow_up(self.vault.get(), thread_id)
-            return self.state(thread_id)
+            raise ConsoleError("ACTION_NOT_ALLOWED", 403)  # a legacy (job-bound) conversation is read-only
 
     def new_conversation(self):
         with self.lock:
@@ -774,45 +691,9 @@ class Console:
             return self.state(draft["thread_id"])
 
 
-    def reset_conversation(self,thread_id):
-        from .freeform import ResetReply
-        require(self.instructions is not None,"ACTION_NOT_ALLOWED",403)
-        require(not self.native_thread(thread_id), "ACTION_NOT_ALLOWED", 403)
-        with self.message_lock("thread:"+thread_id):
-            self.active()
-            token=self.vault.get()
-            prior=self.journal.get(thread_id,"reset")
-            if prior is not None and prior["state"]=="CONFIRMED":
-                return self.state(prior["new_thread_id"])
-            require(prior is None or prior["state"]=="REFUSED","RESET_UNKNOWN")
-            cid=self.instructions.progress_conversation(thread_id)
-            require(cid is not None,"ACTION_NOT_ALLOWED",403)
-            projection=self.instructions.refresh_conversation(token,cid)
-            require(projection.can_reset,"CONVERSATION_TURN_UNRESOLVED")
-            request_id=sha(canonical(["reset",self.config.console_id,thread_id,cid]))
-            body={"request_id":request_id}
-            intent={"conversation_id":cid,"body":body,"created_at":self.clock().isoformat()}
-            if prior is None:self.journal.begin(thread_id,"reset",intent)
-            else:self.journal.finish(thread_id,"reset",{"state":"UNKNOWN","previous_refusal":prior["code"]})
-            try:
-                raw,_=self.instructions.adapter.send("POST","/work-policy/v1/conversations/"+cid+"/reset",body,token)
-                reply,draft=self._complete_reset(thread_id,cid,projection,request_id,ResetReply.model_validate_json(raw))
-            except ConsoleError as error:
-                if error.code in {"CONVERSATION_TURN_UNRESOLVED","CONVERSATION_ARCHIVED"}:
-                    self.journal.finish(thread_id,"reset",{"state":"REFUSED","code":error.code})
-                raise
-            except ValueError:
-                raise ConsoleError("RESET_UNKNOWN",502) from None
-            return {**self.state(draft["thread_id"]),"reset":reply.model_dump(mode="json")}
-
-    def _complete_reset(self,thread_id,cid,projection,request_id,reply):
-        """Only this reset's own receipt archives the conversation and opens the one new thread."""
-        require(reply.conversation_id==cid and reply.reset_request_id==request_id
-                and reply.hosted_session_id==projection.hosted_session_id,"RESET_UNKNOWN")
-        draft=self.instructions.store.complete_reset(thread_id,reply.model_dump(mode="json"))
-        self.instructions.projections[cid]=projection.model_copy(update={
-            "archived":True,"can_reset":False,"can_follow_up":False,"follow_up_blocker":"CONVERSATION_ARCHIVED"})
-        return reply,draft
+    def reset_conversation(self, thread_id):
+        # Reset belongs to the retired job-bound lane; native conversations never had it.
+        raise ConsoleError("ACTION_NOT_ALLOWED", 403)
 
     def instruction_models(self, thread_id=None):
         with self.lock:
@@ -1032,11 +913,7 @@ class Console:
                 self.active()
                 self.native_instructions.change(task_id, "cancel", self.vault.get())
                 return {"task": self.native_instructions.task_view(task_id, thread)}
-        task = self.task(task_id)
-        with self.operation_lock(task_id):
-            token = self.gate(task, "cancel")
-            self.instructions.cancel(task, token)
-            return {"task": self.task_view(task)}
+        raise ConsoleError("ACTION_NOT_ALLOWED", 403)  # a legacy (job-bound) conversation is read-only
 
     def read_cancellation_receipt(self, task_id):
         thread = self.native_request(task_id)

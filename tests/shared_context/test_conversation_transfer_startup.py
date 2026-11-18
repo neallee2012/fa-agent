@@ -8,14 +8,12 @@ reconstructed here. SDK states/exits are synthetic, Table/Blob/platform I/O is
 local, and no SDK process, model or Azure execution is claimed.
 """
 
-import base64
 from dataclasses import replace
 from datetime import timedelta
 import json
 import socket
 import subprocess
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -38,46 +36,10 @@ from shared_context.m3_store import InMemoryArtifactStore
 from shared_context.source_materials import digest
 from test_behavior_assistant_server import AssistantHarness
 from assistant_sdk_fixture import review_source
-from test_behavior_store import WireTransport, json_response
-from test_instruction_flow import instruction_models
+from legacy_turn_rows_helpers import StartupTableTransport, read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from hosted_versions_stub import deployed_versions
-
-
-class StartupTableTransport(WireTransport):
-    def send(self, request, **kwargs):
-        if request.method == "GET" and urlsplit(request.url).path.rstrip("()") == "/Behavior":
-            self.requests.append(request)
-            query = parse_qs(urlsplit(request.url).query)
-            if query["$filter"][0].startswith(DISCOVERY_FILTER):
-                return self._discovery_page(request, query)
-            assert query["$filter"] == ["PartitionKey eq 'authority'"]
-            items = [{**entity, "Payload": base64.b64encode(entity["Payload"]).decode(),
-                      "Payload@odata.type": "Edm.Binary", "odata.etag": entity.metadata["etag"]}
-                     for (table, partition, _), entity in sorted(self.backing.rows.items())
-                     if table == "Behavior" and partition == "authority"]
-            return json_response(request, 200, {"value": items}, {})
-        return super().send(request, **kwargs)
-
-    def _discovery_page(self, request, query):
-        # shortcut: the `Timestamp ge` bound is not applied (no server stamps here); window tests use the
-        # test_native_hitl_attention fixture.
-        start = query.get("NextRowKey", [None])[0]
-        keys = sorted(key for table, partition, key in self.backing.rows if table == "Behavior"
-                      and partition == "authority" and "behavior:v1:row:" <= key < "behavior:v1:row;"
-                      and (start is None or key >= start))
-        top = int(query["$top"][0])
-        items = []
-        for key in keys[:top]:
-            entity = self.backing.rows[("Behavior", "authority", key)]
-            items.append({**entity, "Payload": base64.b64encode(entity["Payload"]).decode(),
-                          "Payload@odata.type": "Edm.Binary", "odata.etag": entity.metadata["etag"]})
-        more = {"x-ms-continuation-NextPartitionKey": "authority",
-                "x-ms-continuation-NextRowKey": keys[top]} if len(keys) > top else {}
-        return json_response(request, 200, {"value": items}, more)
-
-
-DISCOVERY_FILTER = "PartitionKey eq 'authority' and RowKey ge 'behavior:v1:row:' and RowKey lt 'behavior:v1:row;'"
 
 
 class SyntheticSessionClient:
@@ -179,10 +141,6 @@ def synthetic_standing_v1(tmp_path, jwk_client, monkeypatch, request):
         yield case
     finally:
         h.composition.close()
-
-
-def read_startup(c):
-    return MigrationStore(c.h.composition.clients[0], c.h.config.table.scope).read_inventory()
 
 
 def claimed_turn(c, request_id, conversation_id=None, *, acquire=True):

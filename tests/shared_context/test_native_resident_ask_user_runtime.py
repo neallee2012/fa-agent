@@ -43,7 +43,7 @@ def test_a_turn_that_asked_the_owner_keeps_the_pinned_runtime_for_the_next_turn(
 
     hitls = track_hitl(monkeypatch, user_input)
     requests, receipts, _, _ = run_turns(
-        monkeypatch, runtime_path, "resident-ask-user", small_capture(prompt=20000), turns=2, paragraphs=1,
+        monkeypatch, runtime_path, "resident-ask-user", [small_capture(prompt=20000)] * 2, paragraphs=1,
         provider=asking_provider, hitl_client=SimpleNamespace())
     assert [status for status, _, _ in receipts] == ["completed"] * 2, receipts
 

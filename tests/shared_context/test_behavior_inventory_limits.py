@@ -18,8 +18,9 @@ from shared_context.behavior_store import GUARD_KEY, ControlChanges, ControlRequ
 from shared_context.errors import Problem
 from test_behavior_migration_store import store_with_row
 from test_behavior_store import NativeEntity, SCOPE, json_response
-from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from test_conversation_transfer_startup import synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 

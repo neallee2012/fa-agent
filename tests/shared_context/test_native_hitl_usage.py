@@ -17,7 +17,7 @@ from shared_context.native_assembly import NativeAssembly
 from shared_context.native_inference import NativeInferenceCollector
 from test_agent_turn_usage_ledger import saved
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 from test_native_hitl_h2 import MODEL_ROOT, verdict
 from test_native_turn_api import PREFIX, native_api, submit

@@ -125,7 +125,7 @@ def test_an_upload_is_one_supported_text_type_within_ten_mib():
 
 def test_the_job_lane_refuses_uploads_instead_of_dropping_them(sdk_assistant):
     from shared_context.errors import Problem
-    from test_work_policy_lifecycle import enabled
+    from work_policy_lifecycle_helpers import enabled
     _, control, human, _ = enabled(sdk_assistant)
     with pytest.raises(Problem) as refused:
         control.submit(human, aw.InstructionSubmit(request_id="legacy-upload", content="See", uploads=(upload(),)))

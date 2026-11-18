@@ -546,32 +546,6 @@ def advance(runtime, binding):
     return None
 
 
-def resume_peer_messages(composition):
-    from .behavior_agent_messages import _ReceiverQueue, queue_key
-    runtime = composition.runtime
-    controls = runtime.work_policy.records
-    origins = {record.admission_id: record for record in controls.values()
-               if record.profile.instruction is not None and record.profile.instruction.peer_work is None}
-    keys = tuple(queue_key(target.agent_id) for target in composition.config.targets[:2])
-    queues = runtime.store.read_snapshot(keys)
-    for key in keys:
-        if queues[key] is None:
-            continue
-        queue = _row(queues, key, _ReceiverQueue)
-        rows = runtime.store.read_snapshot(queue.pending)
-        for identifier in queue.pending:
-            message = _row(rows, identifier, MessageEnvelope)
-            original = origins.get(message.root_request_id)
-            if original is None:
-                raise Problem(503, "AGENT_MESSAGE_UNKNOWN", "the pending message lost its original A work")
-            root = _read_root(runtime.store, collaboration_key(original.binding.binding_id))
-            ledger = AgentMessageLedger(runtime.store, root.directory, clock=runtime._now)
-            verified = ledger.read(_controller_principal(root.directory.resolve(queue.agent_id)), identifier)
-            if verified.message != message:
-                raise Problem(409, "AGENT_MESSAGE_RECORD_INVALID", "the original queued message changed during restart")
-            composition.launch_instruction(original.binding.binding_id)
-
-
 def complete_origin(runtime, binding):
     """Consume internal results only after their original A work has forwarded its own final."""
     profile = getattr(runtime, "profiles", {}).get(binding.binding_id)

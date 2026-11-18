@@ -7,17 +7,14 @@ import json
 import httpx
 import pytest
 
+from legacy_console_rows_helpers import stored_console
 from test_m3_auth import jwk_client, signing_key
-from test_web_test_console_frozen_interface import complete, open_ui, post, real_interface
+from test_web_test_console_frozen_interface import open_ui, real_interface
 
 
 def saved(c):
-    composer = c.browser.ui.get("/api/state").json()["composer"]
-    response = post(c, "/api/instructions/" + composer["request_id"] + "/submit",
-                    {"content": "Return the original saved answer.", "model": "gpt-4.1-mini"})
-    assert response.status_code == 200, response.text
-    task = response.json()["task"]
-    complete(c, task["binding_id"])
+    """An old conversation's work that ran and saved its reply (`c.reply_text` when set), read once."""
+    task = stored_console(c, "console-reply-saved" if c.reply_text is None else "console-reply-saved-text")["task"]
     assert c.browser.ui.get("/api/instructions/progress").status_code == 200
     return task
 
@@ -64,7 +61,6 @@ def test_reply_download_after_restart_reloads_the_saved_answer_without_a_new_sub
         assert response.content == expected
         assert all(call["method"] == "GET" for call in c.calls)
         assert c.h.transport.backing.rows == before and c.journal.read_bytes() == journal
-        assert len(c.starts) == len(c.sdk_calls) == 1
     finally:
         restarted.ui.close()
 
@@ -81,15 +77,12 @@ def test_download_does_not_use_cached_reply_after_current_read_access_is_revoked
     assert response.json()["error"]["code"] == "BACKEND_DENIED"
     assert "content-disposition" not in response.headers
     assert c.h.transport.backing.rows == before and c.journal.read_bytes() == journal
-    assert len(c.starts) == len(c.sdk_calls) == 1
 
 
 def test_an_unsaved_preview_cannot_be_downloaded_as_an_answer(real_interface):
     c = real_interface
-    composer = c.browser.ui.get("/api/state").json()["composer"]
-    response = post(c, "/api/instructions/" + composer["request_id"] + "/submit",
-                    {"content": "An unexecuted work.", "model": "gpt-4.1-mini"})
-    task = response.json()["task"]
+    # The retired submit admitted this work; it never ran.
+    task = stored_console(c, "console-reply-unexecuted")["task"]
     before, journal = copy.deepcopy(c.h.transport.backing.rows), c.journal.read_bytes()
     result = c.browser.ui.get(download_path(task))
     assert result.status_code == 409
@@ -143,4 +136,3 @@ def test_unverified_backend_reply_never_becomes_a_text_download(real_interface, 
     assert "content-disposition" not in result.headers
     assert c.browser.app.state.console.instructions.replies[task["task_id"]] == original
     assert c.h.transport.backing.rows == before and c.journal.read_bytes() == journal
-    assert len(c.starts) == len(c.sdk_calls) == 1

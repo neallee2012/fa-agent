@@ -22,7 +22,7 @@ from test_native_turns import Harness, IDENTITY, OfflineSdk, local_env
 
 def responses_host(identity, runtime, root):
     root.mkdir(exist_ok=True)
-    hosted = SimpleNamespace(identity=identity, supervisor=SimpleNamespace(journal=SimpleNamespace(root=root)))
+    hosted = SimpleNamespace(identity=identity, root=root)
     return create_host(hosted, native_runtime=runtime, responses_handler_factory=native_responses_handler_factory)
 
 

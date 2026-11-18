@@ -656,6 +656,10 @@ class HostedRuntime:
         self.report_tokens: dict[str, SecretStr] = {}
         self.lock = RLock()
 
+    @property
+    def root(self):
+        return self.supervisor.journal.root
+
     @classmethod
     def from_environment(cls):
         if os.environ.get("BEHAVIOR_HOSTED_ENABLED") != "true":
@@ -786,7 +790,7 @@ def _responses_enabled():
 
 def _responses_state_root(runtime):
     try:
-        owned_root = runtime.supervisor.journal.root
+        owned_root = runtime.root
         if not owned_root.is_absolute():
             raise ValueError()
     except (AttributeError, ValueError):

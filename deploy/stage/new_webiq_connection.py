@@ -144,7 +144,7 @@ def ask_key():
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", help="environment profile; defaults to FA_DEPLOY_CONFIG or deploy/stage/stage.json")
+    parser.add_argument("--config", help="environment profile; required unless FA_DEPLOY_CONFIG is set")
     parser.add_argument("--rotate", action="store_true",
                         help="replace the key of the existing connection (always asks; needs a terminal)")
     args = parser.parse_args(argv)

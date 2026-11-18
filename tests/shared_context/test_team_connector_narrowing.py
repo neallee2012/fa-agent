@@ -24,7 +24,7 @@ from shared_context.team_connector_wire import (
 from shared_context.team_mcp_wire import TeamMcpServer, toolbox_grant
 from test_agent_scope_registry import peer_policy
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 ROUTE = "/work-policy/v1/agent-connectors"
@@ -200,7 +200,7 @@ def test_the_agent_settings_api_saves_one_owner_choice_per_request_with_compare_
 
 def test_saved_choices_pass_the_real_startup_and_migration_readers(team):
     from shared_context.behavior_migration import MigrationStore, installed_origin
-    from test_conversation_transfer_startup import read_startup
+    from legacy_turn_rows_helpers import read_startup
     from test_resident_worker_poc import outcome_of
 
     c, config = team.c, team.c.h.config

@@ -1,23 +1,13 @@
 """Bridge a fresh VM begin to the original SDK session and data helpers, without a bearer ticket."""
 
-from dataclasses import dataclass
 
-from . import behavior_assistant_wire as aw
-from .behavior_assistant import _Session, key, material
+from .behavior_assistant import _Session, key
 from .behavior_auth import BehaviorPrincipal
-from .behavior_code_identity import code_sha256
-from .behavior_operations import ExecutionContext, OwnerRecord, _row, _write, control_key
+from .behavior_operations import ExecutionContext, OwnerRecord, _row, control_key
 from .behavior_turn_receipts import TurnStartRecord, TurnTicketRecord, start_key, ticket_handle, turn_key
-from .behavior_vm_assignment import prepare_vm_assignment
-from .behavior_workers import JobRecord, _Attempt, worker_key
+from .behavior_workers import JobRecord, worker_key
 from .errors import Problem
 from .source_materials import digest
-
-
-@dataclass(frozen=True)
-class PreparedVmSession:
-    session: _Session
-    restore_archive: aw.SdkArchive | None
 
 
 def vm_session_keys(authority, session):
@@ -68,49 +58,6 @@ def vm_session_state(authority, session, rows, *, executing):
     if executing and ticket.ticket.relay is not None and authority.runtime._now() >= ticket.ticket.relay.deadline:
         raise Problem(409, "TURN_DEADLINE_EXPIRED", "the original relay turn deadline has passed")
     return _execution_state(authority, session, rows, executing=executing)
-
-
-def prepare_vm_session(authority, ticket):
-    control = authority.runtime.work_policy
-    record = None if control is None else control.records.get(ticket.assignment.binding_id)
-    if (record is None or record.agent_vm != ticket.vm or record.request_id != ticket.address.request_id
-            or record.submit_sha256 != ticket.request_sha256
-            or record.binding.agent_oid != ticket.agent_oid or record.binding.human_oid != ticket.owner_oid):
-        raise Problem(403, "ASSISTANT_ASSIGNMENT_DENIED", "the ticket must retain its actual VM admission")
-    jkey = worker_key("job", record.binding.job_id)
-    job = _row(authority.store.read_snapshot((jkey,)), jkey, JobRecord)
-    if job.binding is None:
-        raise Problem(409, "ASSISTANT_ASSIGNMENT_DENIED", "the original worker start has not been committed")
-    akey = worker_key("attempt", job.spec.job_id, str(job.binding.generation))
-    rows = authority.store.read_snapshot((akey,))
-    attempt = _row(rows, akey, _Attempt)
-    if rows[akey].payload["material"] != material(attempt.start.model_dump(mode="json")).model_dump(mode="json"):
-        raise Problem(409, "ASSISTANT_ASSIGNMENT_DENIED", "the original worker start material differs")
-    expected = prepare_vm_assignment(
-        record, job, attempt.start, worker_configuration_digest=authority.runtime.dep.workers.configuration_digest(),
-        installed_code_sha256=code_sha256(),
-        agent_message_recipient=ticket.assignment.agent_message_recipient,
-    )
-    if expected != ticket.assignment:
-        raise Problem(403, "ASSISTANT_ASSIGNMENT_DENIED", "the VM ticket differs from its original SDK assignment")
-    session, restored = authority.prepare_session(attempt.start, ticket_digest=None,
-                                                  vm_turn_ticket_id=ticket_handle(ticket).ticket_id)
-    if session.assignment != ticket.assignment:
-        raise Problem(403, "ASSISTANT_ASSIGNMENT_DENIED", "the SDK data helpers require the original assignment")
-    return PreparedVmSession(session, restored)
-
-
-def vm_begin_writes(authority, prepared, rows):
-    session = prepared.session
-    _execution_state(authority, session, rows, executing=True)
-    sid = session.assignment.session_id
-    if rows[key("session", sid)] is not None:
-        raise Problem(409, "ASSISTANT_START_UNKNOWN", "the original SDK session was already issued")
-    writes = [_write(key("session", sid), session, "create")]
-    if prepared.restore_archive is not None:
-        writes.append(_write(key("restore", sid), prepared.restore_archive, "create",
-                             material(prepared.restore_archive.model_dump(mode="json"))))
-    return tuple(writes)
 
 
 def read_vm_session(authority, principal, context, handle):

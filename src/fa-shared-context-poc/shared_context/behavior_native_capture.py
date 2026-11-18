@@ -197,7 +197,7 @@ def system_prompt_inputs(control, authority, principal):
         role = captured_role_prompt(control.store, policy, template.role.profile)
         return template, None if head is None else head.selection_id, grants, role
 
-    from .behavior_assistant import _read_conflicts
+    from .behavior_operations import _read_conflicts
     return _read_conflicts(lambda: control.store.consistent_read(read), phase="system_prompt")
 
 

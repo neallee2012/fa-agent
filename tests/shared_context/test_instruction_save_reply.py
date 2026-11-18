@@ -27,7 +27,7 @@ from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_conversation_transfer_startup import claimed_turn, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 # The goldens below were written with runtime 1.0.83, still a known release; pinned here so they do not move with sdk_pin.
@@ -313,20 +313,6 @@ def test_saved_failure_keeps_the_notice_and_no_reply(synthetic_standing_v1):
     assert result.proof == reply_proof(opened.assignment.sdk_session_id, UNAVAILABLE, STOP, "sdk_failed")
 
 
-def test_accepted_cancel_wins_over_a_saved_reply(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    opened = claimed_turn(c, "exact-cancel")
-    c.control.cancel(c.human, opened.binding.binding_id)
-    receipt = save(c, opened)
-    saved = rows_of(c, opened)
-    assert receipt.work_outcome == "cancelled" and saved["reply"] is not None
-    result = VerifiedWorkResult.model_validate_json(json.dumps(saved["result"].payload["data"]))
-    assert result.state == "cancelled" and result.passed_checks == ()
-    assert result.proof == reply_proof(opened.assignment.sdk_session_id, UNAVAILABLE, STOP, "cancelled")
-    archive = TurnArchive.model_validate_json(json.dumps(saved["archive"].payload["data"]))
-    assert archive.failure is None
-
-
 def test_a_replay_of_the_same_save_returns_the_original_receipt(synthetic_standing_v1):
     c = synthetic_standing_v1
     opened = claimed_turn(c, "replay")
@@ -371,19 +357,6 @@ GOLDEN = {
         },
     ),
 }
-
-
-@pytest.mark.parametrize("scenario", ["reply", "failure", "cancelled"])
-def test_saved_bytes_are_exactly_the_original_composition(synthetic_standing_v1, scenario):
-    c = synthetic_standing_v1
-    opened = claimed_turn(c, "golden-" + scenario)
-    if scenario == "cancelled":
-        c.control.cancel(c.human, opened.binding.binding_id)
-    sent = command(opened, **({"failure": "sdk_failed", "reply": None} if scenario == "failure" else {}))
-    receipt = c.authority.save_text_reply(opened.session, sent, opened.agent)
-    saved = rows_of(c, opened)
-    assert (receipt.result_digest, digest(sent.model_dump(mode="json")),
-            {name: None if value is None else sha(value) for name, value in saved.items()}) == GOLDEN[scenario]
 
 
 def past_the_limit_check(c, opened):

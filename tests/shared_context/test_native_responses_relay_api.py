@@ -26,7 +26,7 @@ from test_native_agent_api import (
     instruction_models, jwk_client, peer_runtime, relay_case, send_command, signing_key, synthetic_standing_v1,
 )
 from test_native_agent_relay import capture, sender_case
-from test_agent_runtime_routing import agent_headers
+from agent_runtime_routing_helpers import agent_headers
 
 
 class ResponsesPeerTransport:

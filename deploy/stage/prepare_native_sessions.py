@@ -104,7 +104,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--request-id", required=True)
-    parser.add_argument("--config", help="deployment profile (default: FA_DEPLOY_CONFIG, else deploy/stage/stage.json)")
+    parser.add_argument("--config", help="deployment profile (required unless FA_DEPLOY_CONFIG is set)")
     parser.add_argument("--agent", action="append", default=None)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

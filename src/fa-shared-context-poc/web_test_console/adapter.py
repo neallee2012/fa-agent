@@ -19,7 +19,6 @@ import httpx
 from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 
 from shared_context import behavior_wire as wire
-from shared_context.behavior_assistant_wire import AssistantSubmit
 from shared_context.behavior_delivery import _Payload
 from shared_context.behavior_inbox import INBOX_CHANNEL_ID, INBOX_VERSION
 # This bridge decodes the ADR-0009 phase 2c notice kinds; the API adds them (and clears the slot) only when told.
@@ -633,10 +632,6 @@ class PullAdapter:
         root = "/behavior/v1/bindings/"+task.binding_id
         if action == "status":
             return "GET", root+"/jobs/"+task.job_id, None
-        if action == "submit":
-            model = AssistantSubmit if task.submission == "assistant" else wire.SubmitWork
-            return "POST", root+("/assistant/submit" if task.submission == "assistant" else "/work/submit"), model(
-                request_id=task.submit_request_id).model_dump(mode="json")
         if action == "fetch":
             return "POST", root+"/delivery/pull", wire.Command(request_id=task.fetch_request_id).model_dump(mode="json")
         raise ConsoleError("ACTION_NOT_ALLOWED", 403)
@@ -683,9 +678,6 @@ class PullAdapter:
 
     def status(self, task, token):
         return self._job_status(task, "status", token)
-
-    def submit(self, task, token):
-        return self._job_status(task, "submit", token)
 
     def fetch(self, task, token, delivery_id):
         data, headers = self.send(*self.request(task, "fetch"), token, limit=task.max_payload_bytes)

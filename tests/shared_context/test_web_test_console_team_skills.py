@@ -10,7 +10,8 @@ from web_test_console.adapter import ConsoleError, PullAdapter
 from web_test_console.team_skills import TeamSkills, install_team_skill_routes, is_team_skill_write
 from test_m3_auth import jwk_client, signing_key  # fixtures used by team_skills
 from test_team_skills_api import SKILL, SKILL_TEXT, RESOURCE_TEXT, owner_draft, team_skills, upload_skill
-from test_web_test_console_frozen_interface import real_interface
+from assistant_api_helpers import assistant_api, picker_api
+from instruction_flow_helpers import instruction_models
 
 
 def console_for(api, identity="owner"):
@@ -100,8 +101,8 @@ def test_if_match_and_review_cursor_are_limited_to_team_skill_routes():
     assert not is_team_skill_write("/api/team-skills/drafts/x")
 
 
-def test_bridge_admits_only_bounded_csrf_checked_team_skill_writes(real_interface):
-    c = real_interface
+def test_bridge_admits_only_bounded_csrf_checked_team_skill_writes(picker_api):
+    c = picker_api
     ui, headers = c.browser.ui, c.browser.headers
     path = "/api/team-skills/skills/receipt-guide/decisions"
     body = {"decision_id": "d" * 32, "version_id": "1" * 32, "sha256": "e" * 64, "decision": "approve", "etag": '"x"'}
@@ -154,8 +155,8 @@ def test_owner_draft_input_is_checked_before_sending_and_read_only_cannot_write(
     assert denied.value.code == "TEAM_SKILLS_OWNER_ONLY" and sent == []
 
 
-def test_bridge_admits_the_bounded_owner_draft_and_nothing_larger(real_interface):
-    c = real_interface
+def test_bridge_admits_the_bounded_owner_draft_and_nothing_larger(picker_api):
+    c = picker_api
     ui, headers = c.browser.ui, c.browser.headers
     path = "/api/team-skills/drafts"
     assert ui.post(path, json=owner_draft(), headers={"Origin": headers["Origin"]}).json()["error"]["code"] == "LOCAL_REQUEST_DENIED"

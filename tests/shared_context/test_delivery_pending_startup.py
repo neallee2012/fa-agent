@@ -7,7 +7,8 @@ from shared_context.behavior_delivery_pending import (
     WRITER_ENV, PendingHead, PendingMember, PendingPage, head_key, member_key, page_key,
 )
 from shared_context.behavior_operations import control_key
-from test_conversation_transfer_startup import read_startup, saved_turn, synthetic_standing_v1
+from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key
 

@@ -185,7 +185,7 @@ class Context:
         base = {"PYTHONPATH": str(APP), "PYTHONDONTWRITEBYTECODE": "1"}
         profile = self.state_root / self.get("AZURE_ENV_NAME", "-") / "fa" / "profile.json"  # no mkdir here
         if profile.exists():
-            base["FA_DEPLOY_CONFIG"] = str(profile)  # the scripts' import-time default, never deploy/stage/stage.json
+            base["FA_DEPLOY_CONFIG"] = str(profile)  # for a script run without --config; there is no stage default
         result = self.run([self.python, "-X", "utf8", *target, *args], capture=capture, cwd=ROOT,
                           env={**base, **(env or {})})
         if check and result.code != 0:
@@ -1432,15 +1432,7 @@ def fresh_install(ctx: Context, api_image: str, runtime_dir: Path) -> Path:
     """run_fresh_job plan -> local rebuild with the same hash -> owner approval -> apply -> reconcile."""
     sys.path.insert(0, str(STAGE_DIR))
     sys.path.insert(0, str(APP))
-    previous = os.environ.get("FA_DEPLOY_CONFIG")
-    os.environ["FA_DEPLOY_CONFIG"] = str(ctx.profile)  # run_fresh_job loads its profile at import
-    try:
-        import run_fresh_job
-    finally:
-        if previous is None:
-            os.environ.pop("FA_DEPLOY_CONFIG", None)
-        else:
-            os.environ["FA_DEPLOY_CONFIG"] = previous
+    import run_fresh_job  # plan_from_log and rebuild_plan read no profile; the Job steps run as subprocesses with --config
 
     work = ctx.work / "fresh"
     work.mkdir(exist_ok=True)

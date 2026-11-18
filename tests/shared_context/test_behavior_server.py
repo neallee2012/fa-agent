@@ -31,11 +31,11 @@ from shared_context.behavior_inbox import InboxDeploymentEvidence
 from shared_context.behavior_operations import control_key
 from shared_context.behavior_server import (
     COVERAGE, _authority_probe_readback, _probe_layout,
-    ServerTokenizer, TOKENIZER_CACHE_KEY, application, bootstrap, build_server, recovery_application, run_controller,
+    ServerTokenizer, TOKENIZER_CACHE_KEY, application, bootstrap, build_server, recovery_application,
 )
 from shared_context.behavior_server_config import (
     BootstrapAuthorization, NativeEvidenceBundle, ProtectionObservation, RecoveryCatalog,
-    ProjectionInstallationEvidence, RecoveryConfiguration, ServerConfiguration, SupervisorLimits,
+    ProjectionInstallationEvidence, RecoveryConfiguration, ServerConfiguration,
     TokenizerConfiguration, load_configuration, synthetic_configuration,
 )
 from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
@@ -343,8 +343,9 @@ def test_probe_has_no_admission_approval_or_initialization_routes_and_auth_is_fi
         assert response.json()["actual_environment"] == "NOT_RUN"
         for suffix in ("work/submit", "initialize", "operation/approve"):
             assert client.post("/behavior/v1/bindings/binding-1/" + suffix, json={}, headers=h.headers(signing_key)).status_code == 404
+        # The retired Hosted callback is not served: an unauthenticated large body meets no handler at all.
         callback = "/behavior/v1/bindings/binding-1/hosted/launches/launch/claim"
-        assert client.post(callback, content=b"x" * 100000).status_code == 401
+        assert client.post(callback, content=b"x" * 100000).status_code == 404
     assert not h.table.backing.rows
 
 
@@ -471,34 +472,6 @@ def test_native_gate_refuses_incomplete_expired_or_mismatched_catalog(h, change)
     assert not h.table.requests
 
 
-def test_actual_no_etag_fingerprint_and_staged_readiness_publication(h, signing_key):
-    partial = h.bundle.model_copy(update={"inbox": None, "delivery": None})
-    h.save(partial)
-    bootstrap(h.composition, h.approval, stage="worker")
-    assert h.runtime.dep.workers.pending() == ()
-    assert h.sources.blob_service.etag is None and h.sources.management_policy.kind == "absence"
-    with pytest.raises(Problem):
-        h.runtime.validate_startup()
-    h.save()
-    result = bootstrap(h.composition, h.approval, stage="activate")
-    assert result["full_scenario_pass"] is False and result["actual_environment"] == "NOT_RUN"
-    rows = len(h.table.parts)
-    app = application(h.composition)
-    assert len(h.table.parts) == rows
-    with TestClient(app) as client:
-        assert client.post("/behavior/v1/bindings/binding-1/work/submit", json={"request_id": "first"},
-                           headers=h.headers(signing_key)).status_code == 200
-        assert h.calls == []  # request handler never launches the controller
-        h.time += timedelta(hours=2)
-        count = len(h.table.requests)
-        health = client.get("/healthz")
-        assert health.status_code == 200 and health.json()["operational_readiness"] == "NOT_EVALUATED"
-        assert len(h.table.requests) == count
-        assert client.post("/behavior/v1/bindings/binding-2/work/submit", json={"request_id": "second"},
-                           headers=h.headers(signing_key)).status_code == 503
-    assert h.composition.closed
-
-
 def test_four_exact_targets_fifth_queue_and_query_before_start_local_only(h):
     h.activate()
     h.submit()
@@ -513,60 +486,6 @@ def test_four_exact_targets_fifth_queue_and_query_before_start_local_only(h):
     h.runtime.controller.drain(limit=5)
     assert len([r for r in h.calls if r.method == "POST"]) == 4
     assert all(r.method == "GET" for r in h.calls[4:])
-
-
-def test_controller_tick_lifecycle_close_scan_budget_and_no_background_thread(h):
-    h.activate()
-    h.submit()
-    result = run_controller(h.composition, limits=SupervisorLimits(ticks=2, page_limit=5, interval_seconds=0.0))
-    assert result["ticks"] == 2 and result["actual_environment"] == "NOT_RUN"
-    assert result["problem_counts"]["DELIVERY_RESULT_PENDING"] == 10
-    assert h.composition.closed and len([r for r in h.calls if r.method == "POST"]) == 4
-    key = control_key("delivery-quota", "root", "root")
-    assert h.runtime.store.read_snapshot((key,))[key].payload["data"]["scans_remaining"] == 62
-    assert not hasattr(h.composition, "thread")
-
-
-def test_empty_delivery_index_does_not_create_guard_writes_or_consume_scan_quota(h):
-    h.activate()
-    before = len(h.table.parts)
-    result = run_controller(h.composition, limits=SupervisorLimits(ticks=3, page_limit=5, interval_seconds=0.0))
-    assert result["ticks"] == 3 and result["worker_items"] == result["delivery_items"] == 0
-    assert result["problem_counts"] == {}
-    assert len(h.table.parts) == before
-
-
-def test_controller_preactivation_lifecycle_and_missing_evidence_cleanup(h):
-    h.save(h.bundle.model_copy(update={"inbox": None, "delivery": None}))
-    bootstrap(h.composition, h.approval, stage="worker")
-    result = run_controller(h.composition, preactivation=True, stop_requested=lambda: True)
-    assert result["ticks"] == 0 and h.calls == [] and h.composition.closed
-    second = build_server(h.config, **h.options)
-    Path(h.config.evidence.path).unlink()
-    with pytest.raises(Problem):
-        run_controller(second)
-    assert second.closed
-
-
-def test_controller_invalid_limits_also_close_resources(h):
-    invalid = SupervisorLimits().model_copy(update={"ticks": 0})
-    with pytest.raises(ValidationError):
-        run_controller(h.composition, limits=invalid)
-    assert h.composition.closed
-
-
-def test_controller_checks_wall_limit_between_ticks_and_does_not_sleep_past_it(h):
-    h.activate()
-    counter = [0]
-    sleeps = []
-
-    def clock():
-        counter[0] += 1
-        return float(counter[0])
-
-    result = run_controller(h.composition, limits=SupervisorLimits(
-        ticks=10, max_run_seconds=3.0, interval_seconds=30.0), monotonic=clock, sleep=sleeps.append)
-    assert result["ticks"] == 1 and sum(sleeps) <= 3 and h.composition.closed
 
 
 def test_configured_operation_alias_resolves_only_its_native_current_work_etag(h):

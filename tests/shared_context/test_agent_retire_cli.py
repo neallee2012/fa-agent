@@ -21,11 +21,11 @@ from shared_context.behavior_team_registry import registered_agent_ids, retired_
 from shared_context.errors import Problem
 from test_agent_onboarding import FakeFoundry as OnboardingFoundry, team  # fixture
 from test_agent_retire import NOW, _code
-from test_conversation_transfer_startup import read_startup
+from legacy_turn_rows_helpers import read_startup
 from test_resident_worker_poc import outcome_of
 from test_behavior_server import workspace  # fixture
 from test_conversation_transfer_startup import synthetic_standing_v1  # fixture
-from test_instruction_flow import instruction_models  # fixture
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key  # fixture
 from test_team_agent_routing import register_more_agents, team_agent  # fixture
 from test_team_registry import AGENT_OID, OTHER_AGENT_OID

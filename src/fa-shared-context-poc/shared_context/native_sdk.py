@@ -1412,7 +1412,7 @@ def native_runtime_from_environment(hosted):
 
     try:
         runtime_path = Path(os.environ["BEHAVIOR_ASSISTANT_RUNTIME_PATH"])
-        root = hosted.supervisor.journal.root / "native-turns"
+        root = hosted.root / "native-turns"
         endpoint = os.environ["FOUNDRY_PROJECT_ENDPOINT"].rstrip("/")
         if not root.is_absolute() or not runtime_path.is_file() or "/api/projects/" not in endpoint:
             raise ValueError()

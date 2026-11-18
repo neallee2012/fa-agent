@@ -18,7 +18,7 @@ from shared_context.behavior_native_turn_api import NativeTurnGateway, PREFIX
 from shared_context.behavior_native_turn_wire import NATIVE_REQUEST, NativePrewarmToolbox, NativePrewarmView
 from shared_context.tool_catalog import ToolboxEntry
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_native_turn_api import native_api, submit
 

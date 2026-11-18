@@ -4,8 +4,9 @@ import json
 import pytest
 from pathlib import Path
 from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from test_m3_auth import jwk_client, signing_key
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from hosted_versions_stub import deployed_versions
 
 
@@ -30,11 +31,11 @@ def test_free_input_preserves_original_text_and_legacy_submit_shape():
         InstructionSubmit(request_id="blank", content=" \r\n\t ")
 
 
-def test_free_admission_binds_original_task_and_does_not_repeat_unknown(assistant):
-    from test_work_policy_lifecycle import enabled
+def test_free_admission_binds_original_task_and_does_not_repeat_unknown(assistant_api):
+    from work_policy_lifecycle_helpers import enabled
     from shared_context.behavior_assistant_wire import InstructionSubmit, Task
     from shared_context.errors import Problem
-    h, control, human, _ = enabled(assistant)
+    h, control, human, _ = enabled(assistant_api)
     command = InstructionSubmit(request_id="free-original", content="  Explain why a rainbow is curved.\n")
     binding, status = control.submit(human, command)
     from shared_context.source_materials import digest
@@ -43,19 +44,19 @@ def test_free_admission_binds_original_task_and_does_not_repeat_unknown(assistan
     assert task.instruction.content == command.content and task.instruction.turn_number == 1
     writes = h.store._guard()
     assert control.submit(human, command)[0] == binding
-    assert h.store._guard() == writes and h.endpoint.requests == []
+    assert h.store._guard() == writes
     with pytest.raises(Problem):
         control.submit(human, command.model_copy(update={"content": "a different original intent"}))
     with pytest.raises(Problem):
         control.submit(human, InstructionSubmit(request_id="second-pending", content="Make that shorter.",
                         conversation_id=task.instruction.conversation_id))
-    assert h.store._guard() == writes and h.endpoint.requests == []
+    assert h.store._guard() == writes
 
 
-def test_hosted_upgrade_pins_only_new_work_and_preserves_old_registration(assistant, monkeypatch):
-    from test_work_policy_lifecycle import enabled
+def test_hosted_upgrade_pins_only_new_work_and_preserves_old_registration(assistant_api, monkeypatch):
+    from work_policy_lifecycle_helpers import enabled
     from shared_context.behavior_assistant_wire import InstructionSubmit
-    h, control, human, _ = enabled(assistant)
+    h, control, human, _ = enabled(assistant_api)
     old, _ = control.submit(human, InstructionSubmit(request_id="old-version", content="Original work."))
     original = control.records[old.binding_id].model_dump_json()
     assert "hosted_agent_version" not in original
@@ -177,32 +178,9 @@ def test_production_provider_uses_declared_reasoning_support_without_changing_re
     assert sent == [{k: v for k, v in original.items() if supported is not False or k != "reasoning_effort"}]
 
 
-def test_new_instruction_is_not_a_six_call_two_dollar_timed_work(assistant):
-    from datetime import timedelta
-    from test_work_policy_lifecycle import enabled
-    from shared_context.behavior_assistant_wire import InstructionSubmit
-    from shared_context.behavior_work_policy import WorkPreflightQuery,CostLedger
-    from shared_context.behavior_operations import _row
-    import hashlib
-    h,control,human,_=enabled(assistant)
-    original=_row(h.store.read_snapshot((control.cost_key,)),control.cost_key,CostLedger)
-    h.time+=timedelta(hours=2)
-    command=InstructionSubmit(request_id="untimed-original",content="Explain a rainbow.")
-    preview=control.preflight(human,WorkPreflightQuery(read_id="new-read",request_id=command.request_id,
-        submit_body_sha256=hashlib.sha256(command.model_dump_json().encode()).hexdigest(),content=command.content))
-    assert preview.decision=="allow" and preview.monetary_budget.required_microusd==0
-    binding,status=control.submit(human,command)
-    assert status.state=="queued"
-    policy=control.records[binding.binding_id].runtime_policy
-    assert policy.valid_until is None and policy.queue_deadline is None
-    actual=_row(h.store.read_snapshot((control.cost_key,)),control.cost_key,CostLedger)
-    assert actual.work_reservations_microusd==original.work_reservations_microusd
-    assert actual.legacy_unresolved_reserve_microusd==original.legacy_unresolved_reserve_microusd
-
-
 def test_independent_instructions_reserve_distinct_live_slots_without_touching_old_pool(assistant):
     from dataclasses import replace
-    from test_work_policy_lifecycle import enabled
+    from work_policy_lifecycle_helpers import enabled
     from shared_context.behavior_assistant_wire import InstructionSubmit
     from shared_context.behavior_workers import worker_key
     h,control,human,_=enabled(assistant)
@@ -228,7 +206,7 @@ def test_independent_instructions_reserve_distinct_live_slots_without_touching_o
 
 def test_current_session_reads_each_registered_work_once_without_caching_authority_between_calls(assistant):
     from dataclasses import replace
-    from test_work_policy_lifecycle import enabled
+    from work_policy_lifecycle_helpers import enabled
     from shared_context.behavior_assistant_wire import InstructionSubmit
     from shared_context.behavior_work_policy import work_policy_key
     from shared_context.errors import Problem
@@ -259,7 +237,7 @@ def test_current_session_reads_each_registered_work_once_without_caching_authori
 @pytest.mark.parametrize("revoke", [None, "registration", "owner"])
 def test_instruction_effect_uses_its_transaction_snapshot_not_repeated_registration_reads(assistant,revoke):
     from dataclasses import replace
-    from test_work_policy_lifecycle import enabled
+    from work_policy_lifecycle_helpers import enabled
     from shared_context.behavior_assistant_wire import InstructionSubmit,Reservation
     from shared_context.behavior_work_policy import work_policy_key
     from shared_context.behavior_wire import Command
@@ -293,7 +271,7 @@ def test_instruction_effect_uses_its_transaction_snapshot_not_repeated_registrat
 
 def test_public_progress_is_bound_and_pure_to_read(assistant):
     from dataclasses import replace
-    from test_work_policy_lifecycle import enabled
+    from work_policy_lifecycle_helpers import enabled
     from shared_context.behavior_assistant_wire import InstructionSubmit,ProgressUpdate,PublicProgress
     from shared_context.behavior_assistant_progress import public_event
     from shared_context.behavior_wire import Command
@@ -320,41 +298,10 @@ def test_public_progress_is_bound_and_pure_to_read(assistant):
     assert "NEVER_EXPORT" not in json.dumps(result) and h.store._guard()==guard
 
 
-def test_api_startup_resumes_only_admitted_original_work_once(assistant):
-    import asyncio
-    from contextlib import ExitStack
-    from dataclasses import replace
-    from test_work_policy_lifecycle import enabled
-    from shared_context.behavior_assistant_wire import InstructionSubmit
-    from shared_context.behavior_server import ServerComposition
-    h,control,human,_=enabled(assistant)
-    one,_=control.submit(human,InstructionSubmit(request_id="resume-one",content="Explain a rainbow."))
-    two,_=control.submit(human,InstructionSubmit(request_id="resume-two",content="Write a short poem."))
-    starts=[]
-    h.workers.adapter=replace(h.workers.adapter,start=lambda command:starts.append(command))
-    from types import SimpleNamespace
-    # Startup also resumes queued peer messages for the configured targets (b156341e); this Agent has none queued.
-    config=SimpleNamespace(targets=(SimpleNamespace(agent_id="00000001-1111-1111-1111-111111111111"),))
-    composition=ServerComposition(config,h.runtime,h.verifier,None,(),ExitStack())
-    async def run():
-        composition.resume_instructions()
-        composition.resume_instructions()
-        for _ in range(100):
-            if len(starts)==2:break
-            await asyncio.sleep(.02)
-        assert {start.binding.job_id for start in starts}=={one.job_id,two.job_id}
-        assert len(starts)==2
-        await composition.stop_instruction_observers()
-        composition.close()
-    asyncio.run(run())
-    assert h.endpoint.requests==[]
-    assert h.workers.inspect(one.job_id).generation==1 and h.workers.inspect(two.job_id).generation==1
-
-
-def test_exact_instruction_storage_boundary_does_not_impose_old_character_cap(assistant):
-    from test_work_policy_lifecycle import enabled
+def test_exact_instruction_storage_boundary_does_not_impose_old_character_cap(assistant_api):
+    from work_policy_lifecycle_helpers import enabled
     from shared_context.behavior_assistant_wire import InstructionSubmit,Task
-    h,control,human,_=enabled(assistant)
+    h,control,human,_=enabled(assistant_api)
     command=InstructionSubmit(request_id="exact-8192",content="A"*8190)
     assert len(json.dumps(command.content,ensure_ascii=False).encode())==8192
     binding,_=control.submit(human,command)
@@ -369,7 +316,7 @@ def test_seven_real_model_http_requests_keep_selected_deployment_and_original_mo
     from datetime import timedelta
     from types import SimpleNamespace
     from fastapi.testclient import TestClient
-    from test_work_policy_lifecycle import enabled
+    from work_policy_lifecycle_helpers import enabled
     from shared_context.behavior_assistant_api import create_assistant_app
     from shared_context.behavior_assistant_gateway import AssistantProvider
     from shared_context.behavior_assistant_wire import InstructionSubmit,Reservation,ModelRequest

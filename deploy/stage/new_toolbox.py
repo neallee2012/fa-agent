@@ -3,7 +3,7 @@
 Operator tool, run once with the project-specific AZURE_CONFIG_DIR login. The official prerequisite for the identity
 that creates toolbox versions is Foundry User on the project (W1 gave the operator that role). The WebIQ key lives
 only in the project connection `<environment>-webiq-key` or the profile's `webiq_connection` (dev: `webiq-key`)
-(deploy/stage/new_webiq_connection.py; stage keeps `stage-webiq-key`); nothing here reads it. --config selects the profile (default FA_DEPLOY_CONFIG, else stage.json),
+(deploy/stage/new_webiq_connection.py; stage keeps `stage-webiq-key`); nothing here reads it. --config (or FA_DEPLOY_CONFIG) selects the profile,
 so azd environments (deploy/azd) use the same script.
 
 Safety (no blind resend): the create writes an intent file first (open mode "x"); an existing intent or an existing
@@ -26,7 +26,7 @@ from azure.identity import AzureCliCredential
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shared-context"))
 from deployment_config import load_config
 
-STAGE = load_config(require_runtime=False)
+STAGE = None  # the selected profile, loaded by main() from --config or FA_DEPLOY_CONFIG
 NAME = "fa-org-tools"
 
 
@@ -39,7 +39,7 @@ def definition(profile):
                                "tools": tools}
 
 
-CONNECTION, TOOLS, BODY = definition(STAGE)
+CONNECTION = TOOLS = BODY = None  # definition(STAGE), set by main()
 EXPECTED = {"WebIQ___web", "WebIQ___browse"}
 SCOPE = "https://ai.azure.com/.default"
 # Same preview feature header as shared_context.native_toolbox (the official BYO toolbox sample).
@@ -106,7 +106,7 @@ def _list(client, url, token):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--config", help="environment profile; defaults to FA_DEPLOY_CONFIG or deploy/stage/stage.json")
+    parser.add_argument("--config", help="environment profile; required unless FA_DEPLOY_CONFIG is set")
     args = parser.parse_args()
     global STAGE, CONNECTION, TOOLS, BODY
     STAGE = load_config(args.config, require_runtime=False)

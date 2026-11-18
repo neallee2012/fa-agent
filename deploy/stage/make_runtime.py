@@ -26,9 +26,8 @@ from shared_context.behavior_server_config import ServerConfiguration
 from shared_context.behavior_work_policy import SteadyWorkPolicy
 from shared_context.source_materials import digest
 
-STAGE = load_config()
+STAGE = TOKEN = SOURCE_NOTE = None  # the selected profile, set by main(); importing reads no profile
 OUT = HERE / "runtime"
-TOKEN = re.sub(r"[^a-z0-9-]+", "-", STAGE["environment"].lower()).strip("-") or "environment"
 
 
 def _version(name):
@@ -46,8 +45,6 @@ POLICY = {
 OPENING_BALANCE_MICROUSD = 0
 # Neal 2026-10-02 17:29: the stage USD200/month cap is tracked, not an automatic gate.
 BUDGET_ENFORCED = False
-# A fixed note instead of a reviewed metrics source: stage has none, and nothing may treat it as reviewed.
-SOURCE_NOTE = f"fa-{TOKEN}-v1: no reviewed metrics source is installed in this environment (ADR-0008).".encode()
 # The legacy one-shot binding intake is closed from the start; native turns use the standing policy.
 LEGACY_INTAKE_VALID_UNTIL = datetime(2026, 10, 2, 0, 0, tzinfo=timezone.utc)
 
@@ -209,12 +206,13 @@ def _write(name, text):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", help="environment profile; defaults to FA_DEPLOY_CONFIG or stage.json")
+    parser.add_argument("--config", help="environment profile; required unless FA_DEPLOY_CONFIG is set")
     parser.add_argument("--out", type=Path, help="runtime output directory; defaults to <config>/runtime")
     args = parser.parse_args()
     global OUT, STAGE, TOKEN, SOURCE_NOTE
     STAGE = load_config(args.config)
     TOKEN = re.sub(r"[^a-z0-9-]+", "-", STAGE["environment"].lower()).strip("-") or "environment"
+    # A fixed note instead of a reviewed metrics source: stage has none, and nothing may treat it as reviewed.
     SOURCE_NOTE = f"fa-{TOKEN}-v1: no reviewed metrics source is installed in this environment (ADR-0008).".encode()
     OUT = args.out or config_path(args.config).parent / "runtime"
     config = configuration()

@@ -13,7 +13,7 @@ from shared_context.behavior_native_sessions import (
 from shared_context.errors import Problem
 from test_native_turn_api import native_api, PREFIX, submit
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 from test_behavior_foundry import TARGET, Credential
 

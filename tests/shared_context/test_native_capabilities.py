@@ -206,7 +206,7 @@ def test_factory_passes_native_consumers_without_changing_original_private_root(
     provider = NativeCapabilityProvider(accepts=lambda grant: grant.entry_id == "fa-shell-v1", bind=bind)
     monkeypatch.setattr(native_sdk, "native_capability_providers", lambda *_: (provider,))
     hosted = SimpleNamespace(
-        identity=IDENTITY, supervisor=SimpleNamespace(journal=SimpleNamespace(root=owned)),
+        identity=IDENTITY, root=owned,
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"),
     )
     # Hosted settings for the factory only; the turn then uses local_env's offline state store (ee8ef6b7 reads it).

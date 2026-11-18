@@ -13,10 +13,11 @@ from shared_context.behavior_work_policy import SteadyWorkPolicy, WorkPolicyCont
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_assistant_server import assistant_configuration
-from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from test_conversation_transfer_startup import synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
-from test_work_cost_policy import install_offline
+from work_cost_policy_helpers import install_offline
 from hosted_versions_stub import deployed_versions
 
 
@@ -227,7 +228,7 @@ def test_peer_profile_selection_uses_its_own_head_and_keeps_a_selection_bytes(sy
     from shared_context.behavior_profile_selection import (
         SelectConversationProfile, current_selection, head_key, select_profile, selection_key,
     )
-    from test_conversation_profile_selection import template
+    from conversation_profile_selection_helpers import template
     c = synthetic_standing_v1
     policy = peer_policy(c.h.config, c.control.policy)
     register_agent_scope(c.h.runtime.store, c.h.config, policy, c.human, now=c.h.time)

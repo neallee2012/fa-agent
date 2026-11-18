@@ -8,17 +8,20 @@ import pytest
 
 from shared_context.behavior_capabilities import available_grants
 from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
+from shared_context.behavior_api import create_behavior_app
 from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_peer_runtime import install_peer_routing
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from test_agent_runtime import peer_runtime
-from test_agent_runtime_routing import agent_headers, routing_peer
-from test_conversation_transfer_startup import claimed_turn, read_startup, synthetic_standing_v1
-from test_conversation_profile_selection import template
-from test_instruction_flow import instruction_models
+from agent_runtime_routing_helpers import agent_headers, routing_peer
+from test_conversation_transfer_startup import claimed_turn, synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from conversation_profile_selection_helpers import template
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_behavior_store import store
 from hosted_versions_stub import deployed_versions
+from agent_message_api_helpers import shared_message_turn
 
 
 def application(composition):
@@ -28,12 +31,19 @@ def application(composition):
     return app
 
 
+def directory_application(composition):
+    """The work-policy routes without the legacy assistant session routes."""
+    app = create_behavior_app(composition.runtime, composition.verifier)
+    install_work_policy_routes(app, composition)
+    return app
+
+
 def test_signed_directory_lists_registered_agents_without_exposing_credentials_or_starting_work(
         routing_peer, signing_key):
     peers, loop = routing_peer
     c, a, b = peers.c, peers.a, peers.b
-    app = application(a)
-    install_peer_routing(app, a, application)
+    app = directory_application(a)
+    install_peer_routing(app, a, directory_application)
     before = a.runtime.store._guard()
     with TestClient(app, backend_options={"loop_factory": lambda: loop}) as client:
         response = client.get("/work-policy/v1/agents", headers=c.h.headers(signing_key, "Behavior.Read"))
@@ -63,7 +73,7 @@ def test_unavailable_b_stays_explicit_without_becoming_the_default_agent(routing
     peers, loop = routing_peer
     original = peers.c.h.config.targets[0]
     deployed_versions(monkeypatch, {original.agent_id: original.agent_version})
-    with TestClient(application(peers.a), backend_options={"loop_factory": lambda: loop}) as client:
+    with TestClient(directory_application(peers.a), backend_options={"loop_factory": lambda: loop}) as client:
         result = client.get("/work-policy/v1/agents", headers=peers.c.h.headers(signing_key, "Behavior.Read"))
     assert result.status_code == 200, result.text
     value = result.json()
@@ -101,24 +111,6 @@ def message_turn(routing_peer, signing_key, request):
     with TestClient(app, backend_options={"loop_factory": lambda: loop}) as client:
         yield SimpleNamespace(c=c, a=a, b=b, turn=turn, path=path, headers=headers, command=command,
                               client=client, human_headers=c.h.headers(signing_key, "Behavior.Read"))
-
-
-@pytest.fixture
-def shared_message_turn(request, monkeypatch):
-    import test_agent_runtime
-    from shared_context.behavior_work_policy import SteadyWorkPolicy
-    from shared_context.source_materials import digest
-    original = test_agent_runtime.peer_policy
-    def shared_policy(config, policy):
-        peer = original(config, policy)
-        binding = peer.template.model_copy(update={"source_ids": policy.template.source_ids})
-        profile = peer.profile.model_copy(update={"source": policy.profile.source})
-        runtime_policy = peer.legacy_template_policy.model_copy(update={
-            "binding_digest": digest(["fa-behavior-api-v1", peer.evidence_mode, binding.model_dump(mode="json")])})
-        return SteadyWorkPolicy.model_validate_json(peer.model_copy(update={
-            "template": binding, "profile": profile, "legacy_template_policy": runtime_policy}).model_dump_json())
-    monkeypatch.setattr(test_agent_runtime, "peer_policy", shared_policy)
-    return request.getfixturevalue("message_turn")
 
 
 @pytest.mark.parametrize("message_turn", [None, "v2-responses"], indirect=True)
@@ -394,7 +386,7 @@ def test_receiver_registration_without_a_job_keeps_the_new_handoff_queued(messag
 def test_message_listing_does_not_read_every_other_registered_turn(message_turn, monkeypatch):
     import hashlib
     from shared_context.behavior_assistant_wire import InstructionSubmit
-    from test_assistant_images import _read_bytes
+    from assistant_images_helpers import _read_bytes
     m = message_turn
     path = f"/work-policy/v1/bindings/{m.turn.binding.binding_id}/agent-messages"
     first, used = _read_bytes(monkeypatch, lambda: m.client.get(path, headers=m.human_headers))

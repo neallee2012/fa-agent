@@ -22,12 +22,12 @@ from shared_context.behavior_profile_selection import SelectConversationProfile,
 from shared_context.errors import Problem
 from test_agent_runtime import peer_runtime
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_conversation_profile_selection import template
-from test_instruction_flow import instruction_models
+from conversation_profile_selection_helpers import template
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_native_turn_api import Credential, NativeTransport
 from test_agent_onboarding import team
-from test_agent_runtime_routing import agent_headers
+from agent_runtime_routing_helpers import agent_headers
 
 
 class AgentTransport(NativeTransport):

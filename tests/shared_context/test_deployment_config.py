@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 import pytest
@@ -385,3 +386,111 @@ def test_without_require_runtime_no_runtime_rule_applies(config):
         del agent["agent_id"], agent["agent_oid"]
     assert config.validate_config(profile, require_runtime=False) is None
     assert rejection(config, profile) == "deployment config agents[0].agent_id must be a UUID"
+
+
+def test_config_path_refuses_when_no_profile_is_named(monkeypatch):
+    module = load("deployment_config_required", ROOT / "deploy" / "shared-context" / "deployment_config.py")
+    monkeypatch.delenv("FA_DEPLOY_CONFIG", raising=False)
+    with pytest.raises(SystemExit, match="--config.*FA_DEPLOY_CONFIG"):
+        module.config_path()
+    with pytest.raises(SystemExit, match="--config.*FA_DEPLOY_CONFIG"):
+        module.load_config()
+    monkeypatch.setenv("FA_DEPLOY_CONFIG", "deploy/dev/dev.json")
+    assert module.config_path().parts[-3:] == ("deploy", "dev", "dev.json")
+    assert module.config_path("x/other.json").name == "other.json"
+
+
+@pytest.mark.parametrize("script", ["ci_deploy", "make_runtime", "new_toolbox", "run_fresh_job", "seed_agents",
+                                    "select_all_capabilities"])
+def test_deploy_scripts_import_without_any_profile(script, monkeypatch):
+    """--config can only take effect if importing the script needs no profile: with no FA_DEPLOY_CONFIG it must not fail."""
+    monkeypatch.delenv("FA_DEPLOY_CONFIG", raising=False)
+    load(f"offline_import_{script}", ROOT / "deploy" / "stage" / f"{script}.py")
+
+
+def _env_value(lines, indent):
+    """FA_DEPLOY_CONFIG set by the `env:` block at this indent in these lines (None: not set there)."""
+    inside = False
+    for line in lines:
+        if re.match(rf"{' ' * indent}env:\s*$", line):
+            inside = True
+        elif inside and line.strip() and len(line) - len(line.lstrip()) <= indent:
+            inside = False
+        elif inside and (found := re.match(r"\s+FA_DEPLOY_CONFIG:\s*(\S+)", line)):
+            return found.group(1).strip("\"'")
+    return None
+
+
+def _deploy_script_steps(text):
+    """(job name, effective FA_DEPLOY_CONFIG, step text) of every step that runs a deploy/stage script but release_gate."""
+    head, jobs = text.split("\njobs:\n", 1)
+    workflow = _env_value(head.splitlines(), 0)
+    found = []
+    for job in re.split(r"(?m)^  (?=[\w-]+:\s*$)", jobs)[1:]:
+        header, _, body = job.partition("\n    steps:\n")
+        job_value = _env_value(header.splitlines(), 4) or workflow
+        for step in re.split(r"(?m)^      - ", body):
+            if re.search(r"deploy/stage/(?!release_gate)\w+\.py", step):
+                found.append((header.split(":", 1)[0], _env_value(step.splitlines(), 8) or job_value, step))
+    return found
+
+
+def test_every_workflow_step_that_runs_a_deploy_script_gets_the_stage_profile():
+    """A step, its job or the workflow must set FA_DEPLOY_CONFIG, and no step may set it to anything else."""
+    workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+    if not workflows:
+        pytest.skip("no .github/workflows in this copy")
+    steps = [step for workflow in workflows for step in _deploy_script_steps(workflow.read_text(encoding="utf-8"))]
+    assert steps
+    for job, value, step in steps:
+        assert value == "deploy/stage/stage.json", (job, step.splitlines()[0])
+
+
+@pytest.mark.parametrize("script, args", [
+    ("ci_deploy", ["meta"]),
+    ("make_runtime", []),
+    ("select_all_capabilities", ["--out", "o", "--request-id", "r"]),
+])
+def test_a_deploy_command_without_a_profile_stops_before_doing_anything(script, args, tmp_path):
+    """The user-visible rule: forget --config (and FA_DEPLOY_CONFIG) and the command refuses instead of using stage."""
+    env = {key: value for key, value in os.environ.items() if key != "FA_DEPLOY_CONFIG"}
+    env["PYTHONPATH"] = str(ROOT / "src" / "fa-shared-context-poc")
+    done = subprocess.run([sys.executable, str(ROOT / "deploy" / "stage" / f"{script}.py"), *args], cwd=tmp_path,
+                          env=env, capture_output=True, text=True, timeout=120)
+    assert done.returncode != 0 and "no deployment config" in done.stderr and "--config" in done.stderr
+    assert not any(tmp_path.iterdir())
+
+
+def test_a_profile_without_new_conversation_defaults_is_refused_not_given_stage_s():
+    spec = importlib.util.spec_from_file_location("select_defaults", ROOT / "deploy" / "stage" / "select_all_capabilities.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for own in ({}, {"conversation_defaults": {"prompt_profile": "fa-instruction-v4"}}, {"conversation_defaults": []}):
+        with pytest.raises(SystemExit, match="no conversation_defaults"):
+            module.conversation_defaults({"environment": "dev", **own})
+
+
+def test_ci_deploy_main_selects_the_named_profile_and_its_runtime_dir(monkeypatch, tmp_path):
+    module = load("offline_ci_deploy_main", ROOT / "deploy" / "stage" / "ci_deploy.py")
+    stage = ROOT / "deploy" / "stage" / "stage.json"
+    seen = []
+    monkeypatch.setattr(module, "meta", lambda: seen.append((module.CONFIG, module.RUNTIME, module.TOKEN)))
+    monkeypatch.setattr(sys, "argv", ["ci_deploy.py", "--config", str(stage), "meta"])
+    module.main()
+    monkeypatch.setattr(sys, "argv", ["ci_deploy.py", "--config", str(stage), "--runtime-dir", str(tmp_path), "meta"])
+    module.main()
+    assert seen == [(stage, stage.parent / "runtime", "stage"), (stage, tmp_path, "stage")]
+
+
+def test_use_profile_derives_the_token_and_only_build_may_skip_the_runtime_fields(tmp_path):
+    module = load("offline_ci_deploy_profile", ROOT / "deploy" / "stage" / "ci_deploy.py")
+    profile = json.loads((ROOT / "deploy" / "stage" / "stage.json").read_text(encoding="utf-8"))
+    profile["environment"] = "Dev_X"
+    for agent in profile["agents"]:
+        agent.pop("agent_id")
+    path = tmp_path / "early.json"
+    path.write_text(json.dumps(profile), encoding="utf-8")
+    with pytest.raises(SystemExit, match="agent_id"):
+        module.use_profile(path)
+    module.use_profile(path, require_runtime=False)
+    assert module.TOKEN == "dev-x" and module.CONFIG == path

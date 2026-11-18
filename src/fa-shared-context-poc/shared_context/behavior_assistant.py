@@ -32,7 +32,7 @@ from .behavior_delivery import ArtifactVersion, VerifiedWorkResult, _Obligation,
 from .behavior_dispatch import ArtifactMetrics
 from .behavior_operations import (
     BudgetRecord, OperationDescription, ResolvedResource,
-    _Model, _Operation, _digest, _json, _parse, _row, _updated, _write, control_key,
+    _Model, _Operation, _digest, _json, _parse, _read_conflicts, _row, _updated, _write, control_key,
 )
 from .behavior_runtime import BehaviorRuntime, material
 from .behavior_store import ControlChanges, ControlRequest, InlineMaterial
@@ -70,17 +70,6 @@ def task_for_profile(binding, profile):
         source=profile.source, artifact_id=profile.artifact_id, artifact_version=profile.artifact_version,
         operation_id=binding.operation_id, instruction=profile.instruction,
     )
-
-
-def _read_conflicts(read, *, phase):
-    """Only explicitly selected read-only gates may repeat; never a tool/dispatch."""
-    for attempt in range(3):
-        try:
-            return read()
-        except Problem as error:
-            if error.status != 412 or error.body["error"]["code"] != "BEHAVIOR_CONFLICT" or attempt == 2:
-                raise
-            logging.getLogger(__name__).warning("ASSISTANT_READ_CONFLICT phase=%s attempt=%s maximum=3", phase, attempt + 1)
 
 
 def _ledger_conflicts(store, request, decide):

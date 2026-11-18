@@ -587,7 +587,7 @@ def test_member_circular_request_explains_original_result_return_through_signed_
     from shared_context.behavior_native_agent_wire import NativePeerRequest, NativeRelayAcceptance, NativeRelayResult
     from shared_context.behavior_native_turn_wire import NativeReceipt
     from shared_context.native_agent_tools import NativeAgentRelayClient
-    from test_agent_runtime_routing import agent_headers
+    from agent_runtime_routing_helpers import agent_headers
     from test_native_agent_api import send_command
 
     env = group_tool_http

@@ -59,6 +59,9 @@ _APPROVAL_WRITE_FAILED = frozenset({"BEHAVIOR_CONFLICT", "BEHAVIOR_COMMIT_UNKNOW
 SLOW_POLL_AFTER = timedelta(seconds=60)
 # Before a wait's first readback there is no deadline yet: this many doubling retries (0.25 s .. 2 s by default).
 FIRST_READ_RETRIES = 4
+# A card or authorization write refused with NATIVE_HITL_RULES_CHANGED is reviewed again under the rules read anew;
+# past this many writes the API and this VM keep disagreeing, so the call is refused rather than reviewed forever.
+RULES_CHANGED_ATTEMPTS = 3
 
 _AUTHORITY_WRITE_OPERATIONS = {
     "/rules": "rules_write", "/pending": "pending_create", "/decisions": "decision_write",
@@ -624,7 +627,7 @@ class NativeHitlRuntime:
         return view
 
     async def _allowed(self, call):
-        since = None
+        since, attempts = None, 0
         while True:
             await self._active()
             if call.pending_expires_at is not None and self.clock() >= call.pending_expires_at:
@@ -654,7 +657,8 @@ class NativeHitlRuntime:
                 try:
                     result = await self._write("/pending", command)
                 except Problem as error:
-                    if error.body["error"]["code"] == "NATIVE_HITL_RULES_CHANGED":
+                    attempts += 1
+                    if error.body["error"]["code"] == "NATIVE_HITL_RULES_CHANGED" and attempts < RULES_CHANGED_ATTEMPTS:
                         continue
                     raise
                 view = await self.client.read(result["pending_id"])
@@ -667,6 +671,7 @@ class NativeHitlRuntime:
             await asyncio.sleep(self._poll_delay(since))
 
     async def _authorize(self, call):
+        attempts = 0
         while True:
             rules, review, view = await self._allowed(call)
             command = NativeHitlAuthorize(
@@ -678,7 +683,8 @@ class NativeHitlRuntime:
             try:
                 result = await self._write("/authorize", command)
             except Problem as error:
-                if error.body["error"]["code"] == "NATIVE_HITL_RULES_CHANGED":
+                attempts += 1
+                if error.body["error"]["code"] == "NATIVE_HITL_RULES_CHANGED" and attempts < RULES_CHANGED_ATTEMPTS:
                     continue
                 raise
             authorization = NativeHitlAuthorization.model_validate_json(json.dumps(result["authorization"]))

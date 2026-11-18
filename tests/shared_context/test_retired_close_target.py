@@ -1,7 +1,8 @@
-"""Target selection and original-stop closure readers: what callers see without any such row.
+"""Target selection and retired stop-closure readers: what callers see without any such row.
 
 No deployed producer ever wrote a ``standing-target`` or ``original_sdk_stop_closed`` row (``select_target`` and
-``close_original`` were never called by product code, #1041/#1051). These tests pin what the kept readers return
+``close_original`` were never called by product code, #1041/#1051), and ``platform-stop`` rows came only from the
+removed operator recovery (``ClaimedSdkRecovery``, no entry point in the tree). These tests pin what the kept readers return
 when no selection row exists, and that registration receipts with and without the old target read are both
 accepted. Offline: synthetic Foundry client, local Table I/O, no SDK or model.
 """
@@ -21,7 +22,7 @@ from history_forgery import Forgery
 from test_behavior_store import FakeTable, SCOPE
 from test_conversation_transfer_startup import synthetic_standing_v1
 from test_fresh_installation import fresh_case, initialize
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 
@@ -125,9 +126,14 @@ def _claimed(c, request_id):
     return c.native.launch(launch.launch_id)
 
 
-@pytest.fixture(params=["without-proof-row", "with-proof-row"])
+RETIRED_CLOSURES = {"original-stop-close": ("original stop closures", "original_sdk_stop_closed"),
+                    "platform-stop": ("platform stop closures", "native_platform_stop")}
+
+
+@pytest.fixture(params=[(name, proof) for name in RETIRED_CLOSURES for proof in ("without-proof-row", "with-proof-row")],
+                ids=lambda param: "-".join(param))
 def closed_launch(synthetic_standing_v1, request):
-    """A claimed launch sealed on original-stop-close evidence, written the way the removed close_original sealed it.
+    """A claimed launch sealed on retired closure evidence, written the way the removed closers sealed it.
 
     The saved evidence is otherwise fresh and coherent, so only the retired-closure rule can refuse it."""
     from datetime import timedelta
@@ -138,8 +144,10 @@ def closed_launch(synthetic_standing_v1, request):
     c = synthetic_standing_v1
     native, store, now = c.native, c.h.runtime.store, c.h.time
     launch = _claimed(c, "retired-original-close")
-    eid = native_key("original-stop-close-evidence", launch.launch_id)
-    proof_key = native_key("original-stop-close", launch.launch_id)
+    name, with_proof = request.param
+    phrase, kind = RETIRED_CLOSURES[name]
+    eid = native_key(name + "-evidence", launch.launch_id)
+    proof_key = native_key(name, launch.launch_id)
     evidence = ExecutorEvidence(evidence_id=eid, binding=launch.start.binding, sequence=launch.evidence_sequence + 1,
         native_execution_id=launch.native_invocation_id, state="stopped", entire_tree_idle=True,
         all_inflight_starts_fenced=True, proof=b'{"original_stop_close":"retired"}')
@@ -147,8 +155,8 @@ def closed_launch(synthetic_standing_v1, request):
         configuration_digest=c.h.runtime.dep.workers.configuration_digest(), probe_id=proof_key, evidence=evidence,
         observed_at=now, expires_at=now + timedelta(seconds=60), report_digest="d" * 64)
     launchkey = native_key("launch", launch.launch_id)
-    proof = (() if request.param == "without-proof-row" else
-             (ControlWrite(row_id=proof_key, mode="create", data={"kind": "original_sdk_stop_closed"}),))
+    proof = (() if with_proof == "without-proof-row" else
+             (ControlWrite(row_id=proof_key, mode="create", data={"kind": kind}),))
     store.transact(ControlRequest(request_id="retired-close-seal", request_digest="a" * 64, read_set=(launchkey,)),
                    lambda current: ControlChanges(writes=(
                        native._write(native_key("evidence", eid), saved, material=_material(saved.model_dump(mode="json"))),
@@ -157,7 +165,7 @@ def closed_launch(synthetic_standing_v1, request):
                            "pending_control": "cancel"}), current),
                        *proof,
                    ), result={}))
-    return SimpleNamespace(native=native, eid=eid, binding=launch.start.binding)
+    return SimpleNamespace(native=native, eid=eid, binding=launch.start.binding, phrase=phrase)
 
 
 def _denied(call, status, code, message):
@@ -168,16 +176,16 @@ def _denied(call, status, code, message):
     assert denied.value.body["error"]["message"] == message
 
 
-def test_verify_refuses_a_launch_sealed_on_a_retired_original_stop_closure(closed_launch):
+def test_verify_refuses_a_launch_sealed_on_a_retired_stop_closure(closed_launch):
     h = closed_launch
     _denied(lambda: h.native.verify(h.eid), 403, "NATIVE_EVIDENCE_INVALID",
-            "original stop closures are retired and cannot be verified")
+            h.phrase + " are retired and cannot be verified")
 
 
-def test_sealed_reconcile_refuses_a_retired_original_stop_closure(closed_launch):
+def test_sealed_reconcile_refuses_a_retired_stop_closure(closed_launch):
     h = closed_launch
     _denied(lambda: h.native.reconcile_sealed(h.binding), 403, "NATIVE_TERMINAL_INVALID",
-            "original stop closures are retired and cannot be reconciled")
+            h.phrase + " are retired and cannot be reconciled")
 
 
 def _late_row(store, row_id, data):

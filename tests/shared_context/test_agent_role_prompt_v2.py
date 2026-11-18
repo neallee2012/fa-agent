@@ -9,7 +9,11 @@ import json
 import pytest
 
 from shared_context.behavior_agent_role_prompt import (
-    AGENT_ROLE_V2_PROFILE, ROLE_FIXED_PROMPT, ROLE_SECTION, ROLE_V2_CAPABILITIES, ROLE_V2_PROMPT, RolePromptCapture,
+    AGENT_ROLE_V2_PROFILE,
+    ROLE_FIXED_PROMPT,
+    ROLE_V2_CAPABILITIES,
+    ROLE_V2_PROMPT,
+    RolePromptCapture,
     assemble_role_v2_prompt,
     with_role_text,
 )
@@ -17,8 +21,7 @@ from shared_context.behavior_instruction_prompt import assemble_instruction_prom
 from shared_context.behavior_native_turn_wire import NativeTurnCapture
 from shared_context.behavior_skill_prompt import assemble_prompt
 from test_native_turn_wire import capture
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 
 V3 = assemble_instruction_prompt("fa-instruction-v3", capabilities=()).system_message
@@ -122,29 +125,3 @@ def test_v2_stays_selectable_for_existing_agents():
 
     # New Agents use agent-role v4 since 2026-10-04 (test_agent_role_prompt_v4); v2 selections keep working.
     assert AGENT_ROLE_V2_PROFILE in SELECTABLE_PROFILES
-
-
-@pytest.mark.parametrize("profile", ["fa-instruction-agent-role-v2", "fa-instruction-agent-role-v3",
-                                     "fa-instruction-agent-role-v4"])
-def test_the_job_bound_lane_runs_v2_without_execute_operation_and_with_optional_role_text(assistant, monkeypatch,
-                                                                                            profile):
-    """8765 sidecars without a native state profile (new + Agents, deploy windows) keep working on v2."""
-    from shared_context.behavior_agent_role_prompt import _SHARED_ROLE_PROMPTS
-    from test_agent_role_prompt import FILES, save
-    from test_conversation_profile_selection import configured, select, template
-    from test_instruction_prompt import sdk_options, submit
-
-    h, control, human = configured(assistant)
-    selected, _ = select(h, value=template(profile, user_text_file_profile=FILES))
-    assert selected.status_code == 200, selected.text
-    _, options = sdk_options(monkeypatch, expected_tools=ROLE_V2_CAPABILITIES)
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "one"}, {"content": "two"}])
-    first, _ = submit(h, "v2-plain", "Start.")
-    assert h.runtime.controller.step(first["binding_id"]).state == "succeeded"
-    save(control, human, "v2-role", "You are the release notes Agent.")
-    second, _ = submit(h, "v2-role-turn", "Continue.", first["conversation_id"])
-    assert h.runtime.controller.step(second["binding_id"]).state == "succeeded"
-    prompt = _SHARED_ROLE_PROMPTS[profile]
-    assert [value["system_message"]["content"] for value in options] == [
-        prompt, prompt + ROLE_SECTION + "\n\nYou are the release notes Agent."]

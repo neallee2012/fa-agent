@@ -24,7 +24,7 @@ from shared_context.native_sdk import NativeSdkExecutor
 from shared_context.native_turns import NativeTurnRuntime
 from shared_context.sdk_pin import RUNTIME_VERSION
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key, token
 from test_native_turn_api import native_api, PREFIX
@@ -124,7 +124,7 @@ def append_sdk(native_api, monkeypatch, runtime_path, tmp_path, request, signing
         from shared_context.native_responses import native_responses_handler_factory
         journal = root / "journal"
         journal.mkdir()
-        host.supervisor = SimpleNamespace(journal=SimpleNamespace(root=journal))
+        host.root = journal
         host_options["responses_handler_factory"] = native_responses_handler_factory
     with TestClient(create_host(host, native_runtime=runtime, **host_options)) as hosted:
         headers = {"x-client-fa-state-profile": NATIVE_STATE_PROFILE, "x-agent-session-id": identity.session_id,

@@ -16,13 +16,14 @@ import pytest
 from conftest import A, TENANT
 from shared_context import behavior_wire as wire
 from shared_context.behavior_runtime import runtime_key
+from shared_context.errors import Problem
 from shared_context.memory_governance import ReviewedClaim, claim_digest
 from test_behavior_api import METRICS
 from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token
-from test_operation_rejection_cli import cold_cli
-from test_reviewed_work_memory import NOTE, reviewed_note
+from cold_cli_helpers import cold_cli
+from reviewed_work_memory_helpers import NOTE, reviewed_note
 
 
 @pytest.fixture
@@ -547,5 +548,33 @@ def test_memory_inspection_cli_help_loads_without_the_hosted_sdk():
         "runpy.run_module('shared_context.behavior_memory_cli',run_name='__main__')"
     )
     assert result.returncode == 0, result.stderr
-    assert "{show,candidate,propose,proposal-reconcile,proposal,bridge,memory-settings,select-memory-settings,memory-settings-reconcile}" in result.stdout
+    assert "{show,candidate}" in result.stdout
     assert result.stderr == ""
+
+
+def test_redirect_cannot_forward_the_delegated_credential():
+    cli = importlib.import_module("shared_context.behavior_memory_cli")
+    observed = []
+
+    def redirect(request):
+        observed.append(request.url.host)
+        return httpx.Response(307, headers={"Location": "https://outside.invalid"},
+                              json={"error": {"code": "REDIRECT_DENIED"}})
+
+    with httpx.Client(base_url="https://original.invalid", transport=httpx.MockTransport(redirect),
+                      follow_redirects=True) as http:
+        with pytest.raises(Problem):
+            cli._request(http, lambda: "SYNTHETIC_TOKEN", "GET", "/memory-candidate")
+    assert observed == ["original.invalid"]
+
+
+def test_remote_error_fields_are_not_a_channel_for_secret_values():
+    cli = importlib.import_module("shared_context.behavior_memory_cli")
+    secret = "OPERATOR_PRIVATE_TOKEN"
+    with httpx.Client(base_url="https://original.invalid", transport=httpx.MockTransport(
+        lambda request: httpx.Response(503, json={"error": {"code": secret, "message": secret}}),
+    )) as http:
+        with pytest.raises(Problem) as denied:
+            cli._request(http, lambda: secret, "POST", "/claims/original/review", {"request_id": "original"})
+    assert denied.value.status == 503
+    assert secret not in json.dumps(denied.value.body)

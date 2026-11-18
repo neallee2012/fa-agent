@@ -367,7 +367,7 @@ def test_closing_the_stream_early_stops_the_sdk_turn_and_frees_the_slot_at_once(
 
         return closing_early
 
-    hosted = SimpleNamespace(identity=IDENTITY, supervisor=SimpleNamespace(journal=SimpleNamespace(root=root)))
+    hosted = SimpleNamespace(identity=IDENTITY, root=root)
     with TestClient(create_host(hosted, native_runtime=runtime, responses_handler_factory=factory)) as client:
         harness = ResponsesHarness(runtime, sdk, client, {})
         assert harness.invoke(response_submit()).status_code == 202

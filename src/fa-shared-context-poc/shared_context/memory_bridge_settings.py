@@ -8,7 +8,7 @@ from pydantic import Field, model_validator
 
 from .behavior_operations import control_key
 from .behavior_runtime import material
-from .behavior_store import ControlChanges, ControlRequest, ControlWrite
+from .behavior_store import ControlRequest
 from .behavior_wire import Command, Digest, Identifier, WireModel
 from .behavior_work_memory import WorkMemorySource
 from .behavior_reviewed_note_source import resolve_reviewed_note
@@ -78,49 +78,10 @@ class ConversationMemoryCapture(WireModel):
         return self
 
 
-class MemorySettingReference(WireModel):
-    admission_id: Digest
-    settings_id: Digest
-    capture_sha256: Digest
-    enabled: Literal[True] = True
-    state: Literal["candidate", "captured"]
-
-
-def memory_setting_reference(admission_id, capture, *, captured):
-    if capture is None or not capture.enabled:
-        return None
-    return MemorySettingReference(admission_id=admission_id, settings_id=capture.settings_id,
-        capture_sha256=digest(capture.model_dump(mode="json")), state="captured" if captured else "candidate")
-
-
 @dataclass(frozen=True)
 class MemoryAdmissionCapture:
     value: ConversationMemoryCapture | None
     predicates: dict
-
-
-class MemoryRecallSelectionView(WireModel):
-    origin_binding_id: Identifier
-    claim_id: Identifier
-    version_policy: Literal["current-human-reviewed-version-at-new-conversation"]
-
-
-class MemoryBridgeSettingsView(WireModel):
-    settings_id: Identifier | None
-    revision: Annotated[int, Field(ge=1)] | None = None
-    enabled: bool
-    recall: MemoryRecallSelectionView | None
-    applies_to: Literal["new-conversations-only"]
-    data_scope_change: bool
-
-    @model_validator(mode="after")
-    def explicit_setting(self):
-        if ((self.settings_id is None) != (self.revision is None)
-                or self.data_scope_change != (self.settings_id is not None)
-                or self.enabled and self.settings_id is None
-                or not self.enabled and self.recall is not None):
-            raise ValueError("the new-conversation setting is incomplete")
-        return self
 
 
 def _memory_scope_ids(domain, agent_scope):
@@ -133,19 +94,6 @@ def settings_key(domain, request_id, agent_scope=None):
 
 def settings_head_key(domain, agent_scope=None):
     return control_key("memory-bridge-settings-head", *_memory_scope_ids(domain, agent_scope))
-
-
-def settings_result(record):
-    choice = record.command.recall
-    return {
-        "settings_id": record.settings_id, "revision": record.revision,
-        "enabled": record.command.enabled, "applies_to": "new-conversations-only",
-        "data_scope_change": True,
-        "recall": None if choice is None else {
-            "origin_binding_id": choice.origin_binding_id, "claim_id": choice.claim_id,
-            "version_policy": "current-human-reviewed-version-at-new-conversation",
-        },
-    }
 
 
 def read_memory_settings(store, policy, identifier):
@@ -324,118 +272,3 @@ def human_memory_source_write(runtime, binding, source_id, principal):
     if capture is not None and capture.enabled and source_id == memory_slot_ids(record.admission_id)[0]:
         control._human(principal, "approve")
 
-
-class MemoryBridgeSettingsService:
-    def __init__(self, runtime):
-        self.runtime, self.store = runtime, runtime.store
-
-    def _authorize(self, principal, *, approve=False):
-        control = self.runtime.work_policy
-        if control is None:
-            raise Problem(403, "MEMORY_SETTINGS_DISABLED", "the original standing work authority is required")
-        control._human(principal)
-        if approve:
-            control._human(principal, "approve")
-        policy = control.installed()
-        if not policy.active or not policy.read_enabled:
-            raise Problem(403, "WORK_POLICY_REVOKED", "current standing Read authority is required")
-        return control, policy
-
-    def _selection(self, policy, command, principal):
-        if command.recall is None:
-            return None
-        choice = command.recall
-        result = resolve_reviewed_note(
-            self.runtime, principal, choice.origin_binding_id, choice.claim_id,
-            policy.template, policy.legacy_template_policy.purpose,
-        )
-        source = result.value.source
-        if (source.claim_version != choice.expected_claim_version
-                or source.claim_sha256 != choice.expected_claim_sha256):
-            raise Problem(409, "MEMORY_RECALL_CHANGED", "select the exact current reviewed note, not a stale preview")
-        return result
-
-    def current(self, principal):
-        def read():
-            _, policy = self._authorize(principal)
-            record = current_memory_settings(self.store, policy)
-            return ({"settings_id": None, "enabled": False, "recall": None,
-                     "applies_to": "new-conversations-only", "data_scope_change": False}
-                    if record is None else settings_result(record))
-        return self.store.consistent_read(read)
-
-    def preview(self, principal, command):
-        def read():
-            _, policy = self._authorize(principal)
-            current = current_memory_settings(self.store, policy)
-            if (None if current is None else current.settings_id) != command.expected_settings_id:
-                raise Problem(409, "MEMORY_SETTINGS_CONFLICT", "the selected memory setting changed")
-            note = self._selection(policy, command, principal)
-            return {
-                "command": command.model_dump(mode="json"), "applies_to": "new-conversations-only",
-                "data_scope_change": True, "submitted": False,
-                "note": None if note is None else {
-                    "origin_binding_id": note.origin_binding_id, "text": note.value.text,
-                    "source": note.value.source.model_dump(mode="json"),
-                    "usage": "knowledge-data-not-permission",
-                },
-            }
-        return self.store.consistent_read(read)
-
-    def select(self, principal, command):
-        control, policy = self._authorize(principal, approve=True)
-        identifier = settings_key(policy.authority_domain, command.request_id, policy.agent_scope)
-        if self.store.read_snapshot((identifier,))[identifier] is not None:
-            return self.reconcile(principal, command)
-
-        def inspect():
-            self._authorize(principal, approve=True)
-            current = current_memory_settings(self.store, policy)
-            if (None if current is None else current.settings_id) != command.expected_settings_id:
-                raise Problem(409, "MEMORY_SETTINGS_CONFLICT", "the selected memory setting changed; read before deciding")
-            note = self._selection(policy, command, principal)
-            keys = tuple(dict.fromkeys((
-                control.policy_key, control.revocation_key, identifier,
-                settings_head_key(policy.authority_domain, policy.agent_scope),
-                *(() if note is None else note.predicates),
-            )))
-            return current, note, keys, self.store.read_snapshot(keys)
-
-        previous, note, keys, observed = self.store.consistent_read(inspect)
-        request = ControlRequest(
-            request_id=identifier, request_digest=digest([policy.sha256, principal.oid, command.model_dump(mode="json")]),
-            read_set=keys,
-        )
-        record = MemoryBridgeSettingsRecord(
-            settings_id=identifier, revision=1 if previous is None else previous.revision + 1,
-            policy_sha256=policy.sha256, selected_by=principal.oid, selected_at=self.runtime._now(),
-            command=command, selected_source=None if note is None else note.value.source, request=request,
-        )
-        head_key = settings_head_key(policy.authority_domain, policy.agent_scope)
-
-        def decide(rows):
-            control._human(principal, "approve")
-            current = control.installed(rows)
-            if not current.active or not current.read_enabled or current != policy:
-                raise Problem(403, "WORK_POLICY_REVOKED", "the original work scope changed")
-            if any(rows[key] != observed[key] for key in keys):
-                raise Problem(412, "MEMORY_SETTINGS_CONFLICT", "the setting, note or read authority changed")
-            return ControlChanges(writes=(
-                ControlWrite(row_id=identifier, mode="create", data=record.model_dump(mode="json"),
-                             material=material(record.model_dump(mode="json"))),
-                ControlWrite(row_id=head_key, mode="create" if previous is None else "replace",
-                             data=MemoryBridgeSettingsHead(settings_id=identifier).model_dump(mode="json")),
-            ), result=settings_result(record))
-        return self.store.transact(request, decide)
-
-    def reconcile(self, principal, command):
-        def read():
-            _, policy = self._authorize(principal)
-            identifier = settings_key(policy.authority_domain, command.request_id, policy.agent_scope)
-            if self.store.read_snapshot((identifier,))[identifier] is None:
-                raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "the original memory setting is not confirmed")
-            record = read_memory_settings(self.store, policy, identifier)
-            if record.command != command:
-                raise Problem(409, "MEMORY_SETTINGS_CONFLICT", "the original setting request has different content")
-            return self.store.reconcile(record.request)
-        return self.store.consistent_read(read)

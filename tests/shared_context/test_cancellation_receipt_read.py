@@ -9,34 +9,37 @@ import json
 import httpx
 import pytest
 
+from legacy_console_rows_helpers import stored_console
 from test_m3_auth import jwk_client, signing_key, token
-from test_web_test_console_cancel import admitted, cancellation_path, sent_cancellations
-from test_web_test_console_frozen_interface import post, real_interface
+from test_web_test_console_frozen_interface import real_interface
 
 
 def receipt_path(task, generation=0):
     return f"/work-policy/v1/bindings/{task['binding_id']}/cancel-receipt/{generation}"
 
 
+def admitted(c):
+    """An old conversation's admitted work, before any cancellation."""
+    return stored_console(c, "console-cancel-admitted")["task"]
+
+
+def confirmed_cancel(c):
+    """`admitted`, then the retired cancel whose receipt came back."""
+    return stored_console(c, "console-cancel-confirmed")["task"]
+
+
+def sent_cancellations(c):
+    """The cancellation the stored journal records as dispatched, then every cancel POST seen since."""
+    seeded = [entry["intent"] for _, entry in c.browser.app.state.console.journal.entries("cancel")]
+    return seeded + [call for call in c.calls if call["path"].endswith("/cancel")]
+
+
 @pytest.mark.parametrize("active", [False, True])
 def test_lost_cancel_response_can_be_read_without_mutation_or_another_dispatch(real_interface, active):
     c = real_interface
-    task = admitted(c)
-    starts, original = [], []
-    if active:
-        c.h.workers.adapter = replace(c.h.workers.adapter, start=lambda value: starts.append(value))
-        binding = c.h.runtime.bindings[task["binding_id"]]
-        c.h.workers.start(binding.job_id, binding.owner)
-
-    def lose_response(request, response):
-        if request.url.path.endswith("/cancel"):
-            original.append(json.loads(response.content))
-            raise httpx.ReadTimeout("synthetic cancellation response loss")
-        return response
-
-    c.mutate = lose_response
-    assert post(c, cancellation_path(task)).status_code == 503
-    c.mutate = lambda request, response: response
+    # The retired cancel ran once (on a started job when active) and its response was lost.
+    facts = stored_console(c, "console-cancel-lost-" + ("active" if active else "idle"))
+    task, original = facts["task"], [facts["original_receipt"]]
     before, journal = copy.deepcopy(c.h.transport.backing.rows), c.journal.read_bytes()
     result = c.h.client.get(receipt_path(task, int(active)), headers=c.h.headers())
     assert result.status_code == 200, result.text
@@ -45,7 +48,7 @@ def test_lost_cancel_response_can_be_read_without_mutation_or_another_dispatch(r
     assert result.headers["x-content-sha256"] == hashlib.sha256(result.content).hexdigest()
     assert c.h.client.get(receipt_path(task, int(active)), headers=c.h.headers()).content == result.content
     assert c.h.transport.backing.rows == before and c.journal.read_bytes() == journal
-    assert len(sent_cancellations(c)) == 1 and len(starts) == int(active)
+    assert len(sent_cancellations(c)) == 1
     assert c.sdk_calls == []
     saved = c.browser.app.state.console.journal.get(task["task_id"], "cancel")
     assert saved["state"] == "UNKNOWN"
@@ -81,17 +84,8 @@ def test_receipt_read_does_not_guess_a_new_generation(real_interface):
 
 
 def unknown_cancel(c):
-    task = admitted(c)
-
-    def lost(request, response):
-        if request.url.path.endswith("/cancel"):
-            raise httpx.ReadTimeout("synthetic original cancellation response loss")
-        return response
-
-    c.mutate = lost
-    assert post(c, cancellation_path(task)).status_code == 503
-    c.mutate = lambda request, response: response
-    return task
+    """`admitted`, then the retired cancel whose response was lost."""
+    return stored_console(c, "console-cancel-unknown")["task"]
 
 
 def test_bridge_receipt_lookup_is_repeatable_get_only_and_keeps_original_unknown(real_interface):
@@ -151,9 +145,8 @@ def test_bridge_cannot_change_the_original_cancellation_intent_to_select_a_recei
 @pytest.mark.parametrize("fault", ["missing", "confirmed", "query", "body", "logged-out"])
 def test_bridge_needs_the_original_unknown_and_current_login_before_reading(real_interface, fault):
     c = real_interface
-    task = unknown_cancel(c) if fault not in {"missing", "confirmed"} else admitted(c)
-    if fault == "confirmed":
-        assert post(c, cancellation_path(task)).status_code == 200
+    task = (unknown_cancel(c) if fault not in {"missing", "confirmed"}
+            else confirmed_cancel(c) if fault == "confirmed" else admitted(c))
     path = "/api/instructions/" + task["task_id"] + "/cancel-receipt"
     if fault == "query":
         path += "?generation=1"
@@ -166,7 +159,10 @@ def test_bridge_needs_the_original_unknown_and_current_login_before_reading(real
     assert c.calls == [] and c.h.transport.backing.rows == before and c.journal.read_bytes() == journal
 
 
-@pytest.mark.parametrize("fault", ["sha", "wrong-receipt", "duplicate-key", "unavailable"])
+@pytest.mark.parametrize("fault", [
+    "sha", "wrong-receipt", "duplicate-key", "unavailable", "invalid-digest", "unknown-status",
+    "accepted-string", "contradictory-stop", "missing-accepted", "extra-field",
+])
 def test_bridge_rejects_unverifiable_receipts_without_changing_the_original_unknown(real_interface, fault):
     c = real_interface
     task = unknown_cancel(c)
@@ -180,6 +176,18 @@ def test_bridge_rejects_unverifiable_receipts_without_changing_the_original_unkn
         data = json.loads(response.content)
         if fault == "wrong-receipt":
             data["control_request_id"] = "f" * 64
+        elif fault == "invalid-digest":
+            data["control_request_digest"] = "invalid"
+        elif fault == "unknown-status":
+            data["result"]["status"] = "unknown-future-state"
+        elif fault == "accepted-string":
+            data["result"]["cancel_accepted"] = "true"
+        elif fault == "contradictory-stop":
+            data["result"]["executor_stopped"] = False
+        elif fault == "missing-accepted":
+            data["result"].pop("cancel_accepted")
+        elif fault == "extra-field":
+            data["result"]["refunded"] = True
         raw = json.dumps(data).encode()
         if fault == "duplicate-key":
             raw = b'{"result":' + json.dumps(data["result"]).encode() + b"," + raw[1:]

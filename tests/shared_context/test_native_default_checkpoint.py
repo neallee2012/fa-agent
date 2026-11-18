@@ -17,7 +17,7 @@ from shared_context.behavior_sdk_state import (
 )
 from test_conversation_transfer_startup import synthetic_standing_v1
 from test_m3_auth import jwk_client, signing_key
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 
 AUTO = {"name": AUTO_PROFILE, "platform": local_platform(), "provider": "openai-completions"}
 

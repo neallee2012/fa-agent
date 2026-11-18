@@ -18,7 +18,7 @@ from shared_context.native_responses_wire import NATIVE_V3_PROFILE
 from test_native_binding import CountingRepository, bound, claim, row
 from test_native_turn_api import PREFIX, native_api, submit
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 import test_native_abandon_source as abandon
 from test_native_abandon_source import binding_rows

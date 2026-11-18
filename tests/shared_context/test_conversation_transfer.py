@@ -22,20 +22,6 @@ from test_sdk_compaction_product import checkpoint_case, open_turn, settle
 from hosted_versions_stub import deployed_versions
 
 
-def retained_history(c):
-    from shared_context.behavior_migration import MigrationStore
-    from shared_context.behavior_recovery_history import _Inventory
-    from test_behavior_migration_store import InventoryTable
-    table = InventoryTable()
-    table.backing = c.h.transport.backing
-    table.page_size = 1000
-    store = MigrationStore(table, c.h.store._scope)
-    inventory = store.read_inventory()
-    config = SimpleNamespace(table=SimpleNamespace(scope=store._scope), workers=c.h.workers.contract,
-                             delivery=c.h.config, sha256="0" * 64)
-    return _Inventory(inventory, config)
-
-
 @pytest.fixture
 def compacted_transfer_source(monkeypatch, request):
     deployed_versions(monkeypatch, TARGET.agent_version)
@@ -220,74 +206,6 @@ def test_unreadable_prepared_environment_never_changes_conversation_or_recreates
     assert len(c.creates) == 1 and len(c.reads) == 3
     assert all(value == c.creates[0] for value in c.reads)
     assert len(c.io) == 1
-
-
-def test_environment_http_routes_only_prepare_after_explicit_post_and_reconcile_the_original(transfer_case):
-    from shared_context.behavior_work_policy_api import install_work_policy_routes
-    c = transfer_case
-    install_work_policy_routes(c.h.app, SimpleNamespace(
-        runtime=c.h.runtime, verifier=c.h.verifier, installation=lambda: None,
-        assistant=SimpleNamespace(authority=c.h.assistant),
-    ))
-    path = f"/work-policy/v1/conversations/{c.cid}/environment"
-    viewed = c.h.client.get(path, headers=c.h.headers())
-    assert viewed.status_code == 200, viewed.text
-    assert viewed.json()["state"] == "available" and c.creates == c.reads == []
-    command = {"request_id": "explicit-http-transfer", "failed_job_id": c.failed.job_id, "expected_agent_version": "42"}
-    c.platform["lose_create"] = True
-    result = c.h.client.post(path, json=command, headers=c.h.headers())
-    assert result.status_code == 409
-    assert result.json()["error"]["code"] == "CONVERSATION_TRANSFER_UNKNOWN"
-    assert result.json()["error"]["reconcile_original"] is True
-    response = c.h.client.post(path + "-reconcile", json=command, headers=c.h.headers())
-    assert response.status_code == 200, response.text
-    assert response.json()["state"] == "ready" and response.json()["sdk_restored"] is False
-    assert len(c.creates) == 1 and len(c.reads) == 1 and len(c.io) == 1
-
-
-def test_changed_destination_and_client_authority_fields_cannot_select_the_environment(transfer_case, monkeypatch):
-    from shared_context.behavior_work_policy_api import install_work_policy_routes
-    c = transfer_case
-    install_work_policy_routes(c.h.app, SimpleNamespace(
-        runtime=c.h.runtime, verifier=c.h.verifier, installation=lambda: None,
-        assistant=SimpleNamespace(authority=c.h.assistant),
-    ))
-    path = f"/work-policy/v1/conversations/{c.cid}/environment"
-    command = {"request_id": "displayed-old-version", "failed_job_id": c.failed.job_id, "expected_agent_version": "42"}
-    before = c.h.transport.backing.rows.copy()
-    deployed_versions(monkeypatch, "43")
-    changed = c.h.client.post(path, json=command, headers=c.h.headers())
-    assert changed.status_code == 409 and changed.json()["error"]["code"] == "CONVERSATION_TRANSFER_CHANGED"
-    for extra in ("agent_oid", "hosted_session_id", "archive_id"):
-        denied = c.h.client.post(path, json={**command, extra: "untrusted-choice"}, headers=c.h.headers())
-        assert denied.status_code == 422
-    assert c.h.transport.backing.rows == before and c.creates == c.reads == []
-
-
-def test_transferred_compacted_archive_keeps_its_original_compaction_lineage(compacted_transfer_source, monkeypatch):
-    from shared_context.behavior_conversation_transfer import prepare, TransferCommand
-    from shared_context.behavior_sdk_files import SdkSessionFiles
-    from shared_context.behavior_sdk_state import CheckpointProfile, local_platform
-    original = compacted_transfer_source
-    state = original.fs.snapshot()
-    reference = settle(original, state, compaction=original.fs.compaction)
-    cid = original.assignment.task.instruction.conversation_id
-    c = failed_environment(original.h, original.control, original.human, cid, monkeypatch)
-    prepared = prepare(c.control, c.h.assistant, c.human, cid, TransferCommand(
-        request_id="preserve-compacted-context", failed_job_id=c.failed.job_id, expected_agent_version="42"))
-    assert prepared.archive_turn_number == 2
-    c.h.workers.adapter = c.h.executor.adapter()
-    following = open_turn(c.h, c.control, c.human, "new-human-after-compacted-transfer", cid)
-    try:
-        restored = following.client.restore()
-        assert restored == state
-        fs = SdkSessionFiles(restored.sdk_session_id, restored, checkpoint_profile=CheckpointProfile(platform=local_platform()))
-        saved = settle(following, fs.snapshot())
-        assert saved.source.execution == reference.source.execution
-        assert saved.source.previous_job_id == original.binding.job_id
-        assert saved.source.execution.job_id != following.binding.job_id
-    finally:
-        following.client.close()
 
 
 def test_two_clients_cannot_create_two_environments_for_the_same_failed_turn(transfer_case):

@@ -1,7 +1,7 @@
 # CURRENT-STATE — FA 開工摘要
 
 > **非權威快照**；先讀 AGENTS 與本檔，再按需讀來源。[維護規範](../CONVENTIONS.md#8-current-state)：60行／UTF-8 8KiB內。
-> 2026-11-12（+08）；核對origin/main `23b348d0`；stage是第46版（2026.11.08-46，#1233，[紀錄](../progress.md#stage-v46-1108)）：建置時匯入檢查、品質整理，無新功能，11-12 Neal送一則回合、總協調查log完成；SDK 1.0.26／runtime 1.0.103，API只送v3、閘門武裝，GUARD="1"（不能關、不退版）。
+> 2026-11-17（+08）；核對origin/main `c3ec087a`；stage是第47版（2026.11.12-47，#1246，[紀錄](../progress.md#stage-v47-1114)）：第十六輪整理＋settled掃描期限（#1241行為改變）；11-16 Neal送一回合完成（[讀回](../progress.md#stage-v47-turn-1116)）；SDK 1.0.26／runtime 1.0.103，API只送v3、閘門武裝，GUARD="1"（不能關、不退版）。
 > 本文不是操作批准；原資料、回條、unknown與費用上限保持，部署與帳本細節以來源為準。
 
 ## 現在在哪
@@ -10,9 +10,9 @@
 
 **環境（[ADR-0008](../adr/0008-environment-tiers-staging-cicd.md)）：** dev＝`faexample`；stage月USD200獨立[預算](../fa-cloud-budget-status.md)，只在改`deploy/stage/release.json`或手動時部署，**每次都需Neal核准；release PR流程（dev測試報告、免退版演練）依AGENTS**。合併者靠流程遵守（無branch protection，見ADR-0008 10-16）。
 
-**進行中（11-07起）：** API只送`foundry-native-v3`（v2別名與重送第43版已拿掉）。`stage.json`與dev都武裝相容閘門（#934）；IDLE、RECONCILER仍"0"，快照URL未設。**ADR-0009前提重核（[ADR註記](../adr/0009-version-model-g-actual-version-idle-upgrade.md#platform-in-place-resume-2026-10-20)）：平台原地接續是主路徑，FA的換版（`cut`）是備援。** dev走`ci_deploy`（#919，`deploy/dev/`不匯出公開repo）。
+**進行中：** 第十八輪安全部分已合併（#1248～#1250，不在stage）；其餘等Neal（[紀錄](../progress.md#stage-v47-turn-1116)）。舊job lane退役：PR-D刪舊程式進行中，合併後部署dev再開release PR（[紀錄](../progress.md#legacy-job-lane-retire-1117)）。11-07起，API只送`foundry-native-v3`。`stage.json`與dev都武裝相容閘門（#934）；IDLE、RECONCILER仍"0"，快照URL未設。**ADR-0009前提重核（[ADR註記](../adr/0009-version-model-g-actual-version-idle-upgrade.md#platform-in-place-resume-2026-10-20)）：平台原地接續是主路徑，FA的換版（`cut`）是備援。** dev走`ci_deploy`（#919，`deploy/dev/`不匯出公開repo）。
 
-**GitHub Actions：** repo為private、free方案（2000 Linux分鐘／月），Neal設USD10預算；11-08第46版deploy與public-sync跑成功，10-28原因未查明。重型套件不跑PR／push。
+**GitHub Actions：** repo為private、free方案（2000 Linux分鐘／月），Neal設USD10預算；11-14第47版deploy與public-sync跑成功。重型套件不跑PR／push。
 
 **沿用設定（[第23版紀錄](../progress.md#stage-v23-1008)）：** 排程開（API時鐘＋對話提案）、打字預熱開、stage閒置逾時3600；feed app與工作台常駐；HITL A／B／t4開；A／B對話中換模型開；Teams connector第1波（Work IQ）旗標開；Teams逾時回覆補送（#827）仍關，需Neal。
 
@@ -26,9 +26,9 @@
 
 | 批次 | 結果 |
 |---|---|
-| stage第44～46版（11-06～08） | 掃描PDF轉圖、規則草稿與放行紀錄（44）；gpt-5.4-mini自動允許（45）；建置時匯入檢查、十五輪整理（46）。46版stage已有一則Neal的回合（總協調查log）完成，44、45版真人回合仍待Neal（[44、45](../progress.md#stage-v44-v45-1107)、[46](../progress.md#stage-v46-1108)）。 |
-| 第十六輪與環境整理（11-12） | 第十六輪完成（#1235～#1241，#1241是行為改變）；stage刪掉多餘Jobs Operator指派（Neal同意）、只留Jobs Contributor，CI部署權限縮減、下次stage部署才算實證；stage、dev的WebIQ連線金鑰已輪替，stage、dev（run 4892）各一則回合WebIQ呼叫成功（先前-32006推測來自過期金鑰，未逐一核對）；本機venv SDK升到1.0.26（[紀錄](../progress.md#r16-close-1112)）。 |
-| 品質整理二至十六輪 | 見[基準頁](../code-quality-baseline.md#第十六輪結果2026-11-08-至-12)；十四輪隨第44版、十五輪隨第46版上stage，十六輪未上stage。 |
+| stage第47版（11-14）與第44～46版 | 第47版11-16真人回合完成（首次409是換版偵測，照設計）。44～46版細節見[44、45](../progress.md#stage-v44-v45-1107)、[46](../progress.md#stage-v46-1108)；44、45版真人回合仍待Neal。 |
+| 第十七輪與第十八輪安全部分（11-14～16，不在stage） | #1242沒給`--config`就停下、#1243 HITL重試有上限、#1244刪`ClaimedSdkRecovery`；#1248連線卡顯示，#1249／#1250 native不直接借舊路模組；main `33423978`（[紀錄](../progress.md#stage-v47-turn-1116)）。品質整理二至十六輪見[基準頁](../code-quality-baseline.md#第十六輪結果2026-11-08-至-12)。 |
+| 舊Hosted job lane退役（11-16～17，不在stage、dev未部署） | Neal 11-16決定舊路由擋掉並刪除，五個舊能力不在native重做；#1261～#1267已合併（舊路由410／404、工作台舊對話唯讀）；PR-D刪舊程式進行中（[紀錄](../progress.md#legacy-job-lane-retire-1117)）。 |
 
 ## 下一步
 
@@ -40,15 +40,14 @@
 
 | 項目 | 界線／來源 |
 |---|---|
-| 待Neal | E改Responses選版；stage加Teams與relay、Entra redirect-URI租用戶寫入、Teams登入、PG稿`5055d28c`送否。Teams批准只收allow_once／deny，以主人oid為依據。排程時鐘在API、stage已開。stage A重建session要Neal核准。 |
+| 待Neal | 雲端Table裡未完成／UNKNOWN的舊job數量未核（本機連Table被擋；放行Table主機或Neal自跑查詢，[紀錄](../progress.md#legacy-job-lane-retire-1117)）；E改Responses選版；stage加Teams與relay、Entra redirect-URI租用戶寫入、Teams登入、PG稿`5055d28c`送否。Teams批准只收allow_once／deny，以主人oid為依據。排程時鐘在API、stage已開。stage A重建session要Neal核准。 |
 | WebIQ只留toolbox | dev三步都做完（[步驟](../../deploy/README.md#dev-webiq-env-removal)）；stage沒有這些步驟。 |
 | 接手必知（未修） | `native_turns.py`回合尾巴：Hosted存檔後才標completed（manual／diag／委派等回合會先停SDK，上限約15秒，auto不停）；#916已合併但dev沒碰到競態，completed時間不變。 |
 | 每日routine | #957後10-26起completed；TPM仍dev／stage共用（[根因](../progress.md#stage-v35-1022)）。 |
-| 開放項目 | stage A一次`turn_status`逾時30秒（未定因）；B唯讀交辦已completed仍顯示「正在回覆」（推定已修，待dev實看）；dev B未連Teams，等Connect卡要不要擋整個回合待決（[10-30](../progress.md#fa-context-b-connect-wait-1030)）；A「超過2小時」橫幅疑似誤報；A重複404是bridge輪詢交辦（設計行為），WARNING要不要降級待決；stage `desktop_act`卡住；azd eastus2（[10-11](../progress.md#azd-eastus2-1011)）Portal未驗收；ADR-0009 §8其餘文案待Neal確認；每次發布要在progress記send RTT p50／p95。 |
+| 開放項目 | 較早9項（A `turn_status`逾時、B「正在回覆」、Connect卡、2小時橫幅、404 WARNING、`desktop_act`、azd eastus2、ADR-0009 §8文案、10-28 Actions job未啟動）見[清單](../progress.md#current-state-trim-1116)；每次發布要在progress記send RTT p50／p95。 |
 | stage「＋」IAM | #468：Neal本人實測「＋」仍待。風險#469，見[ADR-0008 §6](../adr/0008-environment-tiers-staging-cicd.md)。 |
 | ADR-0007／0006 | [Hosted原生優先](../adr/0007-foundry-hosted-native-first.md)：N0～N3與用量已合，live PASS；#306記憶風險例外不變；#284仍draft。ADR-0006 T1～T5已部署；T6a／T6b已實作未部署，私人記憶用量未入帳是已知缺口。 |
-| 退役Agent | #867已合併，未完成onboarding由`team-agent-retire-release`釋出（[deploy](../../deploy/README.md#retire-agent)）。只有operator CLI能退役，名額與顯示名稱不釋出。dev `fa-agent-cc96…`補tombstone需批准。 |
-| SP v2／v3／role | 都不升全域SP acceptance（v2：6 PASS、第3則FAIL；v3：①FAIL；role-v2 9 PASS／3 FAIL，role v3 3則PASS）。 |
+| 退役Agent、SP v2／v3／role | 退役只有operator CLI（[deploy](../../deploy/README.md#retire-agent)）；SP都不升全域acceptance；dev tombstone待批。細節見[清單](../progress.md#current-state-trim-1116)。 |
 | 費用 | dev上限**USD900／停損880**（10-25，[紀錄](../fa-cloud-budget-status.md#dev-api-scale-zero-1025)）；stage月USD200另列。 |
 
 ## 來源入口

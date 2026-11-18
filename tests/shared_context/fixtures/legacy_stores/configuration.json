@@ -1,0 +1,312 @@
+{
+ "configuration": {
+  "api_resource_id": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/synthetic/providers/Microsoft.App/containerApps/api",
+  "assistant": {
+   "artifact_container_url": "https://synthetic.blob.core.windows.net/sources",
+   "credential_binding": "server-api-uami",
+   "m3_context": {
+    "account_resource_id": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/synthetic/providers/Microsoft.Storage/storageAccounts/synthetic",
+    "endpoint": "https://synthetic.table.core.windows.net",
+    "table_name": "Behavior"
+   },
+   "model": "gpt-4.1-mini",
+   "profiles": [
+    {
+     "artifact_id": "assistant-report",
+     "artifact_version": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "binding_id": "binding-1",
+     "claim_id": "claim-1",
+     "legacy_source_work": "legacy-source",
+     "max_model_requests": 6,
+     "policy_version": "assistant-own-result-v1",
+     "require_operation": false,
+     "source": {
+      "byte_length": 86,
+      "sha256": "946d14607fc23ba54924cea720fe2413336f7d3dcbc07db10a03ccafd63de6ee",
+      "source_id": "metrics-1",
+      "version": 1
+     }
+    }
+   ],
+   "provider_endpoint": "https://synthetic.services.ai.azure.com/api/projects/project/openai/v1/chat/completions"
+  },
+  "authentication_version": "behavior-jwt-v1",
+  "automatic_model_repairs": 0,
+  "backups": {
+   "account_resource_id": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/synthetic/providers/Microsoft.Storage/storageAccounts/synthetic",
+   "protection": {
+    "authority_domain": "synthetic-behavior",
+    "configuration_version": "retention-v1",
+    "container_url": "https://synthetic.blob.core.windows.net/source-backups",
+    "evidence_sha256": "9b3b08232b0d8edec19e0558199f050c887bc4d8f9518aad3298f8515e475a87",
+    "generation": "retention-generation-1",
+    "mode": "no-auto-gc",
+    "protected_prefix": "v1/11111111-1111-1111-1111-111111111111/"
+   }
+  },
+  "bindings": [
+   {
+    "agent_oid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "allowed_input_refs": [
+     "review-goal-1"
+    ],
+    "attempt_id": "attempt-1",
+    "binding_id": "binding-1",
+    "claim_ids": [
+     "claim-1"
+    ],
+    "context_versions": {
+     "catalog_version": "catalog-v1",
+     "memory_schema_version": "memory-v1",
+     "release_version": "release-v1",
+     "work_revision": 1
+    },
+    "event_id": "event-1",
+    "grant_id": "operation-grant-1",
+    "human_oid": "99999999-9999-9999-9999-999999999999",
+    "ingress_id": "authenticated-api",
+    "job_id": "job-1",
+    "operation_id": "operation-1",
+    "owner": {
+     "conversation_id": "conversation-1",
+     "epoch": 1,
+     "owner_record_id": "owner-1",
+     "policy_id": "policy-1",
+     "principal_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+     "root_budget_id": "root"
+    },
+    "root_request_id": "six-gap-validation",
+    "route": {
+     "account_id": "synthetic-account",
+     "channel_id": "authenticated-pull",
+     "recipient_id": "99999999-9999-9999-9999-999999999999",
+     "tenant_id": "11111111-1111-1111-1111-111111111111",
+     "thread_id": "thread-1"
+    },
+    "source_ids": [
+     "metrics-1"
+    ],
+    "subject": "subject-1",
+    "team_id": "team-one",
+    "tenant_id": "11111111-1111-1111-1111-111111111111",
+    "work": {
+     "criteria_version": "assistant-criteria-v1",
+     "goal": "Use the reviewed metrics to compute remaining items and save my result.",
+     "human_checks": [],
+     "required_checks": [
+      "answer_verified",
+      "artifact_verified",
+      "finish_verified"
+     ],
+     "result_kind": "answer",
+     "work_id": "work-1"
+    }
+   }
+  ],
+  "controller_id": "controller",
+  "controller_resource_id": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/synthetic/providers/Microsoft.App/containerApps/controller",
+  "delivery": {
+   "channel": {
+    "channel_id": "authenticated-pull",
+    "max_confirmation_level": "client_received",
+    "supported_levels": [
+     "client_received"
+    ],
+    "version": "fa-pull-inbox-v1"
+   },
+   "consumer_version": "behavior-controller-v1",
+   "control_binding": "72bd0a7934c306cd9bddcc965d10180103eb7b88e6a3452af830cf1bcc79f3c7",
+   "entry_id": "behavior-api",
+   "max_delivery_versions": 4,
+   "max_due_generations": 4,
+   "max_queue_seconds": 300,
+   "max_receipts_per_delivery": 4,
+   "model_repair_contract": null,
+   "model_repair_units": 1,
+   "normal_control_units": 8,
+   "protection_version": "assistant-inline-and-m3-retention-v1",
+   "review_interval_seconds": 10,
+   "runtime_version": "fa-delivery-contract-v1",
+   "scan_page_size": 4,
+   "team_id": "team-one",
+   "timer_version": "bounded-tick-v1",
+   "verifier_version": "checksum-verifier-v1"
+  },
+  "deployment_id": "synthetic-deployment",
+  "entry_pending_limit": 32,
+  "evidence": {
+   "catalog_id": "native-catalog",
+   "inventory_scopes": [
+    "storage-lifecycle",
+    "scheduled-jobs",
+    "application-gc",
+    "operator-automation"
+   ],
+   "max_age_seconds": 3600,
+   "minimum_revision": 1,
+   "observer_oid": "88888888-8888-8888-8888-888888888888",
+   "path": "evidence.json"
+  },
+  "identity": {
+   "admin_client_id": "33333333-3333-3333-3333-333333333333",
+   "agents": [
+    {
+     "actor": "agent-1",
+     "oid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    },
+    {
+     "actor": "agent-2",
+     "oid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    },
+    {
+     "actor": "agent-3",
+     "oid": "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    },
+    {
+     "actor": "agent-4",
+     "oid": "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    }
+   ],
+   "audience": "api://22222222-2222-2222-2222-222222222222",
+   "human_oid": "99999999-9999-9999-9999-999999999999",
+   "managed_identity_client_id": "33333333-3333-3333-3333-333333333333",
+   "team_id": "team-one",
+   "tenant_id": "11111111-1111-1111-1111-111111111111"
+  },
+  "max_context_bytes": 1048576,
+  "max_context_tokens": 8192,
+  "memory_projections": [],
+  "operations": [
+   {
+    "binding_id": "binding-1",
+    "goal": "Review the prepared result against the pinned work requirements.",
+    "input_ref": "review-goal-1"
+   }
+  ],
+  "policies": [
+   {
+    "binding_id": "binding-1",
+    "policy": {
+     "active": true,
+     "allowed_purposes": [
+      "metrics"
+     ],
+     "binding_digest": "6e0a5b77e582332f8a42a682d188dfb15fad03ffde3d9e2c4b4a909a4fa24c1b",
+     "human_text_enabled": false,
+     "max_commands": 64,
+     "max_grant_seconds": 300,
+     "operation_policy_revision": 1,
+     "purpose": "metrics",
+     "source_visibility": "team",
+     "text_policy_version": null,
+     "valid_until": "2026-09-16T08:00:00Z"
+    }
+   }
+  ],
+  "review_policy_version": "human-review-v1",
+  "roots": [
+   {
+    "attempts": 100,
+    "control_units": 1000,
+    "pending_limit": 32,
+    "root_budget_id": "root",
+    "root_request_id": "six-gap-validation",
+    "scans": 64,
+    "units": 1000
+   }
+  ],
+  "schema_version": "fa-behavior-server-v1",
+  "sources": {
+   "account_resource_id": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/synthetic/providers/Microsoft.Storage/storageAccounts/synthetic",
+   "protection": {
+    "authority_domain": "synthetic-behavior",
+    "configuration_version": "retention-v1",
+    "container_url": "https://synthetic.blob.core.windows.net/sources",
+    "evidence_sha256": "9b3b08232b0d8edec19e0558199f050c887bc4d8f9518aad3298f8515e475a87",
+    "generation": "retention-generation-1",
+    "mode": "no-auto-gc",
+    "protected_prefix": "m3/v1/11111111-1111-1111-1111-111111111111/"
+   }
+  },
+  "supervisor": {
+   "interval_seconds": 1.0,
+   "max_run_seconds": 120.0,
+   "page_limit": 4,
+   "ticks": 1
+  },
+  "table": {
+   "account_resource_id": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/synthetic/providers/Microsoft.Storage/storageAccounts/synthetic",
+   "endpoint": "https://synthetic.table.core.windows.net",
+   "scope": {
+    "authority_domain": "synthetic-behavior",
+    "max_batch_bytes": 4194304,
+    "max_operations": 100,
+    "max_payload_bytes": 49152,
+    "partition_key": "authority",
+    "table_name": "Behavior"
+   }
+  },
+  "targets": [
+   {
+    "agent_id": "00000001-1111-1111-1111-111111111111",
+    "agent_name": "checksum-1",
+    "agent_oid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "agent_version": "1",
+    "executor_id": "executor-1",
+    "project_endpoint": "https://synthetic.services.ai.azure.com/api/projects/project",
+    "session_id": "session-1"
+   },
+   {
+    "agent_id": "00000002-1111-1111-1111-111111111111",
+    "agent_name": "checksum-2",
+    "agent_oid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "agent_version": "1",
+    "executor_id": "executor-2",
+    "project_endpoint": "https://synthetic.services.ai.azure.com/api/projects/project",
+    "session_id": "session-2"
+   },
+   {
+    "agent_id": "00000003-1111-1111-1111-111111111111",
+    "agent_name": "checksum-3",
+    "agent_oid": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    "agent_version": "1",
+    "executor_id": "executor-3",
+    "project_endpoint": "https://synthetic.services.ai.azure.com/api/projects/project",
+    "session_id": "session-3"
+   },
+   {
+    "agent_id": "00000004-1111-1111-1111-111111111111",
+    "agent_name": "checksum-4",
+    "agent_oid": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+    "agent_version": "1",
+    "executor_id": "executor-4",
+    "project_endpoint": "https://synthetic.services.ai.azure.com/api/projects/project",
+    "session_id": "session-4"
+   }
+  ],
+  "team_pending_limit": 32,
+  "tokenizer": {
+   "accounting_scope": "context-text-sections-only",
+   "cache_directory": "tokenizer-cache",
+   "encoding": "o200k_base",
+   "version": "0.11.0"
+  },
+  "total_poc_budget_usd": 100,
+  "workers": {
+   "capacity": 1,
+   "control_binding": "72bd0a7934c306cd9bddcc965d10180103eb7b88e6a3452af830cf1bcc79f3c7",
+   "control_units": 8,
+   "executor_id": "native-pool",
+   "executor_version": "assistant-sdk-1-0-13-runtime-1-0-83",
+   "lease_seconds": 60,
+   "max_generations": 4,
+   "pending_limit": 16,
+   "protection_version": "assistant-inline-and-m3-retention-v1",
+   "queries_per_generation": 8,
+   "reservation_units": 1,
+   "workspace_id": "workspace"
+  },
+  "workload_version": "assistant-v1.2"
+ },
+ "sha256": "5aff3df3eb52f34557586b1677999682a9b5c0cbdc3411fd0d66ff86fa7799d9"
+}

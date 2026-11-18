@@ -15,7 +15,7 @@ from shared_context.behavior_native_turn_wire import NativeEnvironmentNotice, Na
 from shared_context.errors import Problem
 from shared_context.native_upgrade_reconciler import RECONCILE_BACKOFF_SECONDS, RECONCILE_SECONDS, NativeUpgradeReconciler
 from test_conversation_transfer_startup import synthetic_standing_v1  # fixture
-from test_instruction_flow import instruction_models  # fixture
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key  # fixture
 from test_native_session_patrol import own_loop, patrol  # fixture
 from test_native_session_patrol import bind as bind_row, roster as roster_rows

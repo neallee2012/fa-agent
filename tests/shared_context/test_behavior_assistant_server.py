@@ -5,16 +5,13 @@ import hashlib
 import json
 from pathlib import Path
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 from shared_context.behavior_assistant import AssistantAuthority, AssistantRuntime
 from shared_context.behavior_foundry import NativeExecutionGrant, native_key
 from shared_context.behavior_server import application, bootstrap, build_server
-from shared_context.behavior_assistant_wire import AssistantSubmit, Task
-from shared_context import behavior_assistant_wire as aw, behavior_wire as wire
+from shared_context.behavior_assistant_wire import Task
 from shared_context.behavior_runtime import executor_job_input
-from shared_context.behavior_operations import control_key
 from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
 from shared_context.errors import Problem
 from shared_context.behavior_server_config import ServerConfiguration, synthetic_configuration
@@ -25,8 +22,8 @@ from shared_context.storage import TableRepository, serialize
 from shared_context.source_materials import digest
 from test_behavior_server import Harness, NOW, workspace
 from test_behavior_api import METRICS
-from test_behavior_store import parse_batch
-from test_m3_auth import jwk_client, signing_key, token
+from test_m3_auth import jwk_client
+from test_m3_auth import signing_key
 
 
 def assistant_configuration():
@@ -198,40 +195,6 @@ def test_installation_initializes_concrete_authority_on_the_original_pool(assist
     assert any("work%3Alegacy-source" in r.url or "work:legacy-source" in r.url for r in h.table.requests)
 
 
-def test_production_assistant_routes_share_auth_current_catalog_and_installation_gates(assistant_server, signing_key):
-    h = assistant_server
-    h.legacy()
-    h.activate()
-    assert isinstance(h.composition.assistant.authority, AssistantAuthority)
-    with TestClient(application(h.composition)) as client:
-        prefix = "/behavior/v1/bindings/binding-1/assistant"
-        command = AssistantSubmit(request_id="production-assistant-submit")
-        headers = {**h.headers(signing_key), "Content-Type": "application/json"}
-        assert client.post(prefix + "/submit", content=b"x" * 100000).status_code == 401
-        accepted = client.post(prefix + "/submit", content=command.model_dump_json(), headers=headers)
-        assert accepted.status_code == 200, accepted.text
-        assert accepted.json()["state"] == "queued"
-        h.runtime.controller.step("binding-1")
-        assert len(h.calls) == 1
-        assert h.runtime.dep.workers.inspect("job-1").spec.input == h.runtime.job_input(h.config.bindings[0])
-        grant_key = native_key("grant", h.approval.native_grants[0].grant_id)
-        assert h.runtime.store.read_snapshot((grant_key,))[grant_key].payload["data"]["remaining_uses"] == 3
-        h.save(h.bundle.model_copy(update={"worker": None}))
-        endpoints = ["/submit", "/launches/launch/claim"] + [
-            "/sessions/" + "a" * 64 + "/" + suffix for suffix in (
-                "model", "acquire", "context", "reserve-model", "save", "reconcile", "finish",
-                "operation", "stopped", "status", "checkpoint", "restore",
-            )
-        ]
-        before = len(h.table.parts)
-        for endpoint in endpoints:
-            response = client.post(prefix + endpoint, content=b"x" * 100000, headers=headers)
-            assert response.status_code == 503, (endpoint, response.text)
-        assert len(h.table.parts) == before and len(h.calls) == 1
-        assert client.get("/healthz").status_code == 200
-    assert h.composition.closed
-
-
 def test_probe_keeps_assistant_admission_model_and_tools_closed_without_io(assistant_server):
     h = assistant_server
     with TestClient(application(h.composition, preactivation=True)) as client:
@@ -364,23 +327,6 @@ def test_assistant_lifespan_rechecks_evidence_and_closes_on_failure(assistant_se
     assert h.composition.closed and not h.calls
 
 
-def test_assistant_routes_recheck_missing_installation_after_startup(assistant_server, signing_key):
-    from shared_context.behavior_migration import installation_record
-
-    h = assistant_server
-    h.legacy()
-    h.activate()
-    with TestClient(application(h.composition)) as client:
-        key, _ = installation_record(h.config)
-        h.table.backing.rows.pop(("Behavior", h.config.table.scope.partition_key, "behavior:v1:row:" + key))
-        response = client.post("/behavior/v1/bindings/binding-1/assistant/submit",
-                               json={"request_id": "fenced"}, headers=h.headers(signing_key))
-        assert response.status_code >= 400
-        assert response.json()["error"]["code"] == "BEHAVIOR_CONFLICT"
-        assert response.json()["error"]["automatic_retry"] is False
-    assert not h.calls
-
-
 def test_assistant_bootstrap_still_refuses_a_migrated_authority(assistant_server):
     from shared_context.behavior_migration import MigrationStore, migration_key
 
@@ -400,94 +346,3 @@ def test_assistant_bootstrap_still_refuses_a_migrated_authority(assistant_server
         bootstrap(h.composition, h.approval, stage="records")
     assert error.value.body["error"]["code"] == "MIGRATION_BOOTSTRAP_DISABLED"
     assert len(h.table.parts) == before and not h.calls
-
-
-@pytest.mark.parametrize("revocation", ["catalog", "installation"])
-def test_model_last_gate_rechecks_authority_after_consumption_without_refund_or_send(
-    assistant_server, signing_key, monkeypatch, revocation,
-):
-    from shared_context.behavior_migration import installation_record
-
-    h = assistant_server
-    h.legacy()
-    h.activate()
-    provider_requests = []
-
-    def forbidden_send(request):
-        provider_requests.append(request)
-        raise AssertionError("revoked authority must not send any model request")
-
-    h.composition.assistant.provider.transport = httpx.MockTransport(forbidden_send)
-    prefix = "/behavior/v1/bindings/binding-1"
-    agent_headers = {"Authorization": "Bearer " + token(signing_key, {
-        "oid": h.config.bindings[0].agent_oid, "idtyp": "app", "roles": ["Behavior.Agent"],
-    }, remove=("scp",)), "Content-Type": "application/json"}
-    human_headers = {**h.headers(signing_key, "Behavior.Read Behavior.Approve"), "Content-Type": "application/json"}
-    with TestClient(application(h.composition)) as client:
-        def post(suffix, command, headers=human_headers):
-            response = client.post(prefix + suffix, content=command.model_dump_json(), headers=headers)
-            assert response.status_code == 200, (suffix, response.text)
-            return response
-
-        prepare = wire.SourcePrepare(request_id="source", version=1, original=METRICS)
-        post("/sources/metrics-1/prepare", prepare)
-        post("/sources/metrics-1/commit", wire.Command(request_id="source"))
-        draft = wire.ClaimDraft(
-            request_id="review", version=1, text="The accepted metrics source has been reviewed.",
-            supporting=(h.config.assistant.profiles[0].source,), effective_from=NOW,
-        )
-        preview = post("/claims/claim-1/preview", draft).json()
-        post("/claims/claim-1/review", wire.ClaimReview(
-            **draft.model_dump(), decision_id="explicit-review",
-            **{field: preview[field] for field in ("candidate_sha256", "evidence_sha256", "policy_version")},
-            reviewed_checks=("necessity", "support", "contradiction", "sensitivity", "consent"),
-        ))
-        post("/claims/claim-1/commit", wire.Command(request_id="review"))
-        post("/assistant/submit", AssistantSubmit(request_id="human-admission"))
-        h.runtime.controller.step("binding-1")
-        launch_id = json.loads(h.calls[0].content)["launch_id"]
-        native = h.runtime.dep.native_launches
-        assignment, ticket = h.composition.assistant.authority.issue(native.launch(launch_id).start)
-        headers = {**agent_headers, "x-behavior-assistant-ticket": ticket.get_secret_value()}
-        session = "/assistant/sessions/" + assignment.session_id
-        post(session + "/acquire", wire.Command(request_id="sdk-start"), headers)
-        body = {"model": "gpt-4.1-mini", "messages": [{"role": "user", "content": "Count remaining items."}],
-                "max_tokens": 1024, "stream": True}
-        request_id = digest(body)
-        post(session + "/reserve-model", aw.Reservation(request_id=request_id, request_sha256=request_id), headers)
-        budget_key = control_key("budget", h.config.bindings[0].owner.root_budget_id)
-        budget = h.runtime.store.read_snapshot((budget_key,))[budget_key].payload["data"]
-        assert budget["remaining_attempts"] == h.config.roots[0].attempts - 2
-        assert budget["remaining_units"] == h.config.roots[0].units - 2
-        installation_key, _ = installation_record(h.config)
-        physical_key = ("Behavior", h.config.table.scope.partition_key, "behavior:v1:row:" + installation_key)
-        installed = h.table.backing.rows[physical_key]
-        original_send = h.table.send
-        revoked = False
-
-        def revoke_after_commit(request, **kwargs):
-            nonlocal revoked
-            response = original_send(request, **kwargs)
-            if request.method == "POST" and not revoked:
-                operations, _ = parse_batch(request)
-                if any(b'"consumed":true' in op[1]["Payload"] for op in operations):
-                    revoked = True
-                    if revocation == "catalog":
-                        h.save(h.bundle.model_copy(update={"worker": None}))
-                    else:
-                        h.table.backing.rows.pop(physical_key)
-            return response
-
-        monkeypatch.setattr(h.table, "send", revoke_after_commit)
-        command = aw.ModelRequest(request_id=request_id, body=body)
-        response = client.post(prefix + session + "/model", content=command.model_dump_json(), headers=headers)
-        assert revoked and response.status_code in {403, 409, 503}, response.text
-        assert not provider_requests
-        h.save()
-        h.table.backing.rows[physical_key] = installed
-        replay = client.post(prefix + session + "/model", content=command.model_dump_json(), headers=headers)
-        assert replay.status_code == 409, replay.text
-        assert replay.json()["error"]["code"] == "BEHAVIOR_CONFLICT"
-        assert replay.json()["error"]["automatic_retry"] is False
-        assert h.runtime.store.read_snapshot((budget_key,))[budget_key].payload["data"] == budget
-        assert not provider_requests

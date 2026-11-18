@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 from test_native_turn_api import native_api, submit
 
@@ -457,7 +457,7 @@ def test_a_run_keeps_the_approval_conversations_settings_after_the_team_template
 
 @pytest.mark.parametrize("routine_api", ["clock"], indirect=True)
 def test_saved_definitions_and_occurrence_intents_survive_the_existing_startup_reader(routine_api):
-    from test_conversation_transfer_startup import read_startup
+    from legacy_turn_rows_helpers import read_startup
 
     case = routine_api
     due = case.c.h.time.replace(second=0, microsecond=0) + timedelta(minutes=1)
@@ -551,7 +551,7 @@ def test_an_intent_saved_before_the_change_still_continues_its_original_conversa
 def test_a_run_naming_another_conversation_is_refused_not_skipped(routine_api):
     """A run's command CID is empty or its definition's; anything else is a 409, as before, not a
     reference silently left out."""
-    from test_conversation_transfer_startup import read_startup
+    from legacy_turn_rows_helpers import read_startup
 
     case = routine_api
     due = case.c.h.time.replace(second=0, microsecond=0) + timedelta(minutes=1)

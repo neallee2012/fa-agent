@@ -15,7 +15,7 @@ def load_ci():
     spec = importlib.util.spec_from_file_location("offline_stage_ci_deploy", ROOT / "deploy" / "stage" / "ci_deploy.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.STAGE = copy.deepcopy(module.STAGE)
+    module.use_profile(ROOT / "deploy" / "stage" / "stage.json")
     return module
 
 

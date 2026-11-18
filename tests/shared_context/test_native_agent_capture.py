@@ -10,7 +10,7 @@ from shared_context.behavior_native_turn_wire import NativeAgentCommand
 from shared_context.errors import Problem
 from test_agent_runtime import peer_runtime
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 
@@ -26,7 +26,7 @@ def test_verified_agent_capture_reads_receiver_settings_without_a_human_or_new_j
     command = NativeAgentCommand(request_id="original-peer-input", content="Read the original public sample.")
     control, authority = case.b.runtime.work_policy, case.b.assistant.authority
     from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
-    from test_conversation_profile_selection import template
+    from conversation_profile_selection_helpers import template
     select_profile(control, authority, case.c.human, SelectConversationProfile(
         request_id="choose-native-peer", expected_selection_id=None, template=template("fa-instruction-v2")))
     before = control.store._guard()

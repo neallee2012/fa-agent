@@ -21,7 +21,7 @@ from shared_context.m2_copilot import ToolFailure
 from shared_context.native_routine_proposal_tool import propose_routine_tool
 from shared_context.native_routine_wire import NativeRoutineProposalResult, next_daily_run, routine_proposal_change
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_native_hitl import change, hitl, post
 from test_native_hitl_h2 import SID, human_decide, pending_view, permit, setup_gate, verdict

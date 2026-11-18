@@ -13,16 +13,11 @@ from shared_context.behavior_capability_prompt import (
     assemble_capabilities, capability_record, session_needs,
 )
 from shared_context.behavior_history_prompt import HISTORY_PROFILE
-from shared_context.behavior_instruction_prompt import INSTRUCTION_CAPABILITIES
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.errors import Problem
 from shared_context.m2_copilot import _retain_latest_inline_png
 from shared_context.tool_catalog import build_catalog, parse_entry_file
-from test_behavior_assistant import assistant
-from test_capability_capture import WEB_TOOLS, choose, enabled, turn
-from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES
-from test_instruction_flow import instruction_models, runtime_path
-from test_instruction_prompt import saved_turn, sdk_options
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 
 WEBIQ = parse_entry_file("websearch.json", json.dumps({"mcpServers": {"WebSearch-MCP": {
@@ -138,26 +133,3 @@ def test_image_retention_keeps_the_old_single_image_default_and_three_for_grants
     three = body(5)
     assert _retain_latest_inline_png(three, 3) == 2
     assert [m["content"][0]["type"] for m in three["messages"]] == ["text", "text", "image_url", "image_url", "image_url"]
-
-
-@pytest.mark.parametrize("profile,base_tools", [
-    (HISTORY_PROFILE, HISTORY_CAPABILITIES), ("fa-instruction-v2", INSTRUCTION_CAPABILITIES),
-])
-def test_archive_saves_and_rebuilds_the_capability_record(assistant, monkeypatch, profile, base_tools):
-    h, control = enabled(assistant, monkeypatch, grants=GRANTS, catalog=build_catalog([WEBIQ, PLAYWRIGHT]),
-                         tools=(*base_tools, *WEB_TOOLS))
-    calls, options = sdk_options(monkeypatch, expected_tools=(*base_tools, *WEB_TOOLS))
-    choice, _ = choose(h, "choose-web", ("WebSearch-MCP",), profile=profile)
-    assert choice.status_code == 200, choice.text
-    accepted, task = turn(h, control, "capability-archive")
-    saved = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
-    assert saved.capability_assembly == capability_record(task.prompt_profile, task.capabilities)
-    assert saved.prompt_assembly == assemble_prompt(task.prompt_profile).record
-    assert len(calls) == 1
-    assert options[0]["system_message"] == {
-        "mode": "replace", "content": assemble_capabilities(profile, task.capabilities).system_message,
-    }
-    context = h.client.get(f"/work-policy/v1/conversations/{accepted['conversation_id']}/turns/1/context",
-                           headers=h.headers())
-    assert context.status_code == 200, context.text
-    assert context.json()["capability_assembly"] == saved.capability_assembly.model_dump(mode="json")

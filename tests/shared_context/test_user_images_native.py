@@ -131,7 +131,7 @@ def test_upload_is_content_addressed_and_a_turn_is_accepted_only_with_its_images
 
 
 def test_the_job_lane_refuses_images_instead_of_dropping_them(sdk_assistant):
-    from test_work_policy_lifecycle import enabled
+    from work_policy_lifecycle_helpers import enabled
     _, control, human, _ = enabled(sdk_assistant)
     with pytest.raises(Problem) as refused:
         control.submit(human, aw.InstructionSubmit(request_id="legacy-image", content="See", images=(reference(),)))

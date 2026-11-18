@@ -24,16 +24,10 @@ from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_assistant import assistant
 from test_behavior_store import FakeTable, SCOPE, changes, code, request, seed, store, write
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
-from test_sdk_compaction_product import settle
-from test_user_turn_read import user_history
-from test_work_policy_lifecycle import enabled
-
-
-@pytest.fixture
-def runtime_path():
-    return Path(__file__)
+from work_policy_lifecycle_helpers import enabled
+from session_authority_read_helpers import runtime_path
 
 
 def _in_other_thread(action):
@@ -323,102 +317,6 @@ def test_plain_snapshot_accepts_unrelated_guard_writer_only_after_rereading_its_
     assert committed.payload["guard_revision"] == adapter._guard()[0].revision
 
 
-def _race_every_pure_read(h, monkeypatch, writer):
-    """Commit from another thread between each read's rows and its final guard read.
-
-    This includes the predicate reads inside transact; a decision and its EGT are not raced.
-    """
-    local = threading.local()
-    physical, transact = h.store._read_physical, h.store.transact
-    fired = []
-
-    def racing(key, model):
-        if not threading.current_thread().name.startswith("race-writer") and not getattr(local, "deciding", False):
-            if key != GUARD_KEY:
-                local.rows = True
-            elif getattr(local, "rows", False):
-                local.rows = False
-                committed = threading.Thread(target=writer, name=f"race-writer-{len(fired)}")
-                committed.start()
-                committed.join()
-                fired.append(key)
-        return physical(key, model)
-
-    def transacting(request, decide, **kwargs):
-        def deciding(rows):
-            local.deciding = True
-            try:
-                return decide(rows)
-            finally:
-                local.deciding = False
-        return transact(request, deciding, **kwargs)
-
-    monkeypatch.setattr(h.store, "_read_physical", racing)
-    monkeypatch.setattr(h.store, "transact", transacting)
-    return fired
-
-
-@pytest.mark.parametrize("change", ["unrelated-writer", "owner-revoked"])
-def test_model_authority_reads_only_refuse_changes_to_what_they_read(user_history, monkeypatch, change):
-    import hashlib
-    import httpx
-    from shared_context.behavior_assistant import _LocalHttp
-    from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
-    from shared_context.behavior_work_policy_api import install_work_policy_routes
-    c = user_history
-    h = c.h
-    h.endpoint.expected_url = "https://provider.invalid/openai/v1/chat/completions"
-    h.endpoint.expected_model = "gpt-4.1-mini"
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "OFFLINE response"}] * 2)
-    provider = AssistantProvider(h.endpoint.expected_url, SimpleNamespace(
-        get_token=lambda _: SimpleNamespace(token="OFFLINE-not-a-credential")), transport=h.endpoint.transport)
-    h.app = create_assistant_app(h.assistant, h.verifier, provider=provider)
-    install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier,
-        installation=lambda: None, require_current_native_evidence=lambda: None))
-    h.client = TestClient(h.app)
-    c.second.client.http._transport = _LocalHttp(h.client)
-    body = {"model": "gpt-4.1-mini", "stream": True,
-            "messages": [{"role": "user", "content": "OFFLINE model authority under unrelated writers"}]}
-    request_hash = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
-                                             ensure_ascii=False).encode()).hexdigest()
-    owner = control_key("owner", c.second.binding.owner.owner_record_id)
-    written = []
-
-    def unrelated():
-        row = control_key("unrelated-writer", str(len(written)))
-        written.append(row)
-        h.store.transact(ControlRequest(request_id=row, request_digest=hashlib.sha256(row.encode()).hexdigest(),
-            read_set=(row,)), lambda _: ControlChanges(writes=(ControlWrite(row_id=row, mode="create", data={}),),
-            result={"unrelated": True}))
-
-    fired = _race_every_pure_read(h, monkeypatch, unrelated if change == "unrelated-writer"
-                                  else lambda: written or (written.append(owner), h.mutate(owner, active=False)))
-    if change == "unrelated-writer":
-        assert c.second.client.read_user_turn(1).text
-        c.second.client.reserve_model(request_hash)
-        response = c.second.client.model(httpx.Request(
-            "POST", "https://context.invalid/model/v1/chat/completions", json=body))
-        assert response.status_code == 200 and fired and len(h.endpoint.requests) == 1
-        settle(c.second, c.state)
-        path = "/behavior/v1/bindings/" + c.second.binding.binding_id
-        pulled = h.client.post(path + "/delivery/pull", content=Command(request_id="pull-under-writers")
-                               .model_dump_json(), headers=h.headers())
-        assert pulled.status_code == 200, pulled.text
-        from shared_context import behavior_wire as wire
-        import base64
-        delivery = wire.DeliveryBinding.model_validate_json(base64.urlsafe_b64decode(pulled.headers["x-behavior-binding"]))
-        acked = h.client.post(path + "/delivery/acknowledge", content=wire.PullAcknowledgment(
-            request_id="ack-under-writers", exchange_id=pulled.headers["x-behavior-exchange"],
-            acknowledgment_token=pulled.headers["x-behavior-ack-token"], binding=delivery).model_dump_json(),
-            headers=h.headers())
-        assert acked.status_code == 200 and acked.json()["result"]["fulfillment"] == "fulfilled", acked.text
-    else:
-        with pytest.raises(Problem):
-            c.second.client.reserve_model(request_hash)
-            c.second.client.model(httpx.Request("POST", "https://context.invalid/model/v1/chat/completions", json=body))
-        assert written == [owner] and h.endpoint.requests == []
-
 @pytest.mark.parametrize("revocation", ["owner", "standing-policy"])
 def test_view_refresh_keeps_cache_but_revoked_binding_is_still_refused(assistant, revocation):
     h, _, fresh, root, headers, control, human = _fresh_turn_beside_uncertain_work(assistant)
@@ -437,60 +335,3 @@ def test_view_refresh_keeps_cache_but_revoked_binding_is_still_refused(assistant
     refused = _reserve(h, root, headers, "OFFLINE revoked after view refresh")
     assert refused.status_code == 403, refused.text
     assert h.endpoint.requests == []
-
-def test_result_pull_decision_does_not_scan_other_registered_work(user_history, monkeypatch):
-    """The fetch EGT decision re-checks only its reader; a scan of every registration widened the
-    write window so any other turn's write refused the pull (live 412 before the ACK challenge)."""
-    import base64
-    from shared_context import behavior_wire as wire
-    from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
-    from shared_context.behavior_work_policy import work_policy_key
-    from test_instruction_prompt import submit
-    c = user_history
-    h, control = c.h, c.control
-    settle(c.second, c.state)
-    for number in range(3):
-        submit(h, f"other-registered-{number}", "Other registered work.")
-    own = work_policy_key("registration", control.records[c.second.binding.binding_id].admission_id)
-    others = {"behavior:v1:row:" + work_policy_key("registration", record.admission_id)
-              for record in control.records.values()} - {"behavior:v1:row:" + own}
-    local, physical, transact, fired = threading.local(), h.store._read_physical, h.store.transact, []
-
-    def unrelated():
-        row = control_key("unrelated-during-fetch", str(len(fired)))
-        h.store.transact(ControlRequest(request_id=row, request_digest="c" * 64, read_set=(row,)),
-                         lambda _: ControlChanges(writes=(ControlWrite(row_id=row, mode="create", data={}),),
-                                                  result={"unrelated": True}))
-
-    def racing(key, model):
-        if getattr(local, "fetching", False) and key in others and not fired:
-            fired.append(key)
-            writer = threading.Thread(target=unrelated)
-            writer.start()
-            writer.join()
-        return physical(key, model)
-
-    def transacting(request, decide, **kwargs):
-        if not decide.__qualname__.endswith("_fetch.<locals>.decide"):
-            return transact(request, decide, **kwargs)
-
-        def deciding(rows):
-            local.fetching = True
-            try:
-                return decide(rows)
-            finally:
-                local.fetching = False
-        return transact(request, deciding, **kwargs)
-
-    monkeypatch.setattr(h.store, "_read_physical", racing)
-    monkeypatch.setattr(h.store, "transact", transacting)
-    path = "/behavior/v1/bindings/" + c.second.binding.binding_id
-    pulled = h.client.post(path + "/delivery/pull", content=Command(request_id="pull-without-scan")
-                           .model_dump_json(), headers=h.headers())
-    assert pulled.status_code == 200 and fired == [], (pulled.text, fired)
-    delivery = wire.DeliveryBinding.model_validate_json(base64.urlsafe_b64decode(pulled.headers["x-behavior-binding"]))
-    acked = h.client.post(path + "/delivery/acknowledge", content=wire.PullAcknowledgment(
-        request_id="ack-without-scan", exchange_id=pulled.headers["x-behavior-exchange"],
-        acknowledgment_token=pulled.headers["x-behavior-ack-token"], binding=delivery).model_dump_json(),
-        headers=h.headers())
-    assert acked.status_code == 200 and acked.json()["result"]["fulfillment"] == "fulfilled", acked.text

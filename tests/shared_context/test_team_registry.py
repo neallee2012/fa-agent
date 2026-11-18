@@ -21,7 +21,8 @@ from shared_context.errors import Problem
 from test_behavior_store import FakeTable, SCOPE
 from shared_context.behavior_store import BehaviorStore
 from test_behavior_server import workspace
-from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
+from test_conversation_transfer_startup import synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
 from test_m3_auth import CLIENT_ID, HUMAN_OID, UNKNOWN_OID, jwk_client, request, signing_key, token
 
 SECOND_OWNER = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"

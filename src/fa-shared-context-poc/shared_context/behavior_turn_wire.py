@@ -9,11 +9,8 @@ from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from .behavior_agent_worker import AgentTurnAddress, AgentVmBinding, AgentWorkerContext
 from .behavior_agent_message_wire import PeerTeamReference
-from .behavior_assistant_wire import ArchiveUnavailable, Assignment, SdkStop
-from .behavior_sdk_state import StoredSdkArchive
-from .behavior_turn_usage import TurnModelUsage
+from .behavior_assistant_wire import Assignment
 from .behavior_wire import Digest, Identifier, WireModel
-from .m3_models import BlobReceipt, ETag, VersionId
 
 DEFAULT_RELAY_MODEL_REQUESTS = 100
 
@@ -88,11 +85,6 @@ class TurnHandle(WireModel):
     ticket_sha256: Digest
 
 
-class BeginTurn(WireModel):
-    address: AgentTurnAddress
-    ticket: TurnHandle
-
-
 class TurnStartReceipt(WireModel):
     schema_version: Literal["fa-vm-turn-start-v1"] = "fa-vm-turn-start-v1"
     ticket: TurnHandle
@@ -111,52 +103,3 @@ class StartedTurn(WireModel):
     ticket: TurnTicket
     start: TurnStartReceipt
 
-
-class TurnObjectReference(WireModel):
-    kind: Literal["result", "memory"]
-    object_id: Identifier
-    version_id: VersionId
-    receipt: BlobReceipt
-
-
-class TurnEnd(WireModel):
-    schema_version: Literal["fa-vm-turn-end-v1"] = "fa-vm-turn-end-v1"
-    ticket: TurnHandle
-    address: AgentTurnAddress
-    start_sha256: Digest
-    outcome: Literal["succeeded", "failed", "cancelled"]
-    result: TurnObjectReference | None
-    checkpoint: StoredSdkArchive | ArchiveUnavailable | None
-    sdk_stop: SdkStop | None
-    memory: tuple[TurnObjectReference, ...] = ()
-    model_usage: TurnModelUsage | None
-
-    @model_validator(mode="after")
-    def saved_materials(self):
-        if (self.result is not None and self.result.kind != "result"
-                or any(reference.kind != "memory" for reference in self.memory)):
-            raise ValueError("result and memory references must retain their original purpose")
-        if self.outcome == "succeeded" and (
-                self.result is None or self.sdk_stop is None or not self.sdk_stop.graceful):
-            raise ValueError("success requires the saved result and original SDK stop")
-        if self.sdk_stop is not None and (not self.sdk_stop.graceful or self.checkpoint is None):
-            raise ValueError("a stopped SDK must retain its checkpoint or an explicit archive failure")
-        if isinstance(self.checkpoint, StoredSdkArchive) and (
-                self.sdk_stop is None or not self.sdk_stop.graceful):
-            raise ValueError("a checkpoint requires its original SDK stop")
-        return self
-
-
-class TurnEndReceipt(WireModel):
-    ticket: TurnHandle
-    address: AgentTurnAddress
-    end_sha256: Digest
-    etag: ETag
-
-
-class TurnObservation(WireModel):
-    ticket: TurnHandle
-    address: AgentTurnAddress
-    state: Literal["issued", "started_or_unknown", "cancel_requested", "completed"]
-    start: TurnStartReceipt | None = None
-    end: TurnEnd | None = None

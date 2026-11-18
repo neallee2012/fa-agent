@@ -20,7 +20,8 @@ from test_agent_runtime import peer_runtime
 from test_agent_runtime_routing import agent_headers, scoped_app
 from shared_context.behavior_assistant import _LocalHttp
 from test_conversation_profile_selection import template
-from test_conversation_transfer_startup import claimed_turn, read_startup, synthetic_standing_v1
+from test_conversation_transfer_startup import claimed_turn, synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
 from test_instruction_flow import instruction_models
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key

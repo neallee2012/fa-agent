@@ -16,20 +16,9 @@ from shared_context.errors import Problem
 from test_agent_scope_registry import peer_policy
 from test_agent_runtime import peer_runtime
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
-
-
-@pytest.fixture
-def routing_peer(request):
-    # Windows creates its internal loop wakeup pipe with a local socket pair.
-    # Create only that loop before the startup fixture forbids every network connect.
-    loop = asyncio.new_event_loop()
-    try:
-        yield request.getfixturevalue("peer_runtime"), loop
-    finally:
-        if not loop.is_closed():
-            loop.close()
+from agent_runtime_routing_helpers import routing_peer, agent_headers
 
 
 @pytest.fixture
@@ -52,12 +41,6 @@ def scoped_app(composition):
         runtime=composition.runtime, verifier=composition.verifier, assistant=composition.assistant,
         installation=lambda: None, require_current_native_evidence=lambda: None))
     return app
-
-
-def agent_headers(c, key, agent):
-    return {"Authorization": "Bearer " + token(key, {
-        "oid": c.h.config.targets[agent].agent_oid, "idtyp": "app", "roles": ["Behavior.Agent"],
-    }, remove=("scp",)), "Content-Type": "application/json"}
 
 
 def test_flat_binding_callbacks_route_by_verified_identity_and_refuse_other_agent_path(routing_peer, signing_key):

@@ -17,7 +17,7 @@ from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import NativeSubmit
 from shared_context.native_turns import NativeTurnRuntime
 from shared_context.sdk_pin import RUNTIME_VERSION
-from test_assistant_images import png
+from assistant_images_helpers import png
 from test_m2_copilot import runtime_path
 from test_native_capabilities import selected_capture
 from test_native_turn_wire import submit
@@ -193,7 +193,7 @@ def test_real_sdk_image_callback_reaches_native_store_and_does_not_leak_into_the
     from sdk_checkpoint_local import sse
     from test_instruction_responses_native import response_bytes
     from test_native_local_capabilities import with_grants
-    from test_skill_isolation_native import child_environment
+    from skill_isolation_native_helpers import child_environment
 
     requests = []
 

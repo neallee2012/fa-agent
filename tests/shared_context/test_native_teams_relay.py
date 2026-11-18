@@ -20,7 +20,7 @@ from test_m3_auth import token
 from test_native_responses_api import responses_api
 from test_native_turn_api import native_api
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 RELAY = "0e0e0e0e-0000-4000-8000-000000000001"

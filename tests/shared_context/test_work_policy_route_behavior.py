@@ -12,7 +12,6 @@ from fastapi.testclient import TestClient
 import pytest
 
 from shared_context import behavior_work_policy_api as api
-from shared_context.behavior_work_policy import WorkSubmitObservation
 from shared_context.errors import Problem
 
 
@@ -23,24 +22,15 @@ AUTH = {"Authorization": "Bearer stand-in"}
 SHA = "a" * 64
 
 
-class Receipt(dict):
-    def __init__(self, result):
-        super().__init__(result)
-        self.payload = {"result": result}
-
-
 class Control:
     """Records each call; a raised Problem or a return value is chosen per test."""
 
     def __init__(self):
         self.calls = []
         self.outcome = {"ok": True}
-        self.records = {"b-1": SimpleNamespace(profile=SimpleNamespace(instruction="instruction"))}
         self.policy = SimpleNamespace(template=SimpleNamespace(team_id="team-1"))
         self.models = SimpleNamespace(public=lambda: {"models": ["m"]})
         self.turns = []
-        self.status = SimpleNamespace(state="running", result_forwarded=False)
-        self.cancel_result = {}
         self.delegation = {"delegated": True}
 
     def _answer(self, name, *args):
@@ -62,19 +52,6 @@ class Control:
     def accounting(self, principal):
         return self._answer("accounting")
 
-    def preflight(self, principal, query):
-        return self._answer("preflight", query.request_id)
-
-    def submit(self, principal, command):
-        self._answer("submit", command.request_id)
-        return SimpleNamespace(binding_id="b-1"), self.status
-
-    def submission_result(self, binding, status):
-        return {"binding": binding.binding_id, "state": status.state}
-
-    def submit_reconcile(self, principal, command):
-        return self._answer("submit_reconcile", command.request_id)
-
     def conversation(self, principal, conversation_id):
         self._answer("conversation", conversation_id)
         return {"turns": [dict(turn) for turn in self.turns]}
@@ -87,15 +64,8 @@ class Control:
         self._answer("read_reply", conversation_id, turn_number)
         return SimpleNamespace(model_dump_json=lambda: '{"reply":"saved"}')
 
-    def cancel(self, principal, binding_id):
-        self._answer("cancel", binding_id)
-        return Receipt(self.cancel_result)
-
     def cancellation_receipt(self, principal, binding_id, generation):
         return self._answer("cancellation_receipt", binding_id, generation)
-
-    def reset_conversation(self, principal, conversation_id, command):
-        return self._answer("reset", conversation_id, command.request_id)
 
     def revoke(self, principal, decision_id):
         return self._answer("revoke", decision_id)
@@ -108,11 +78,7 @@ def control():
 
 @pytest.fixture
 def composition(control):
-    native = SimpleNamespace(
-        pending_version_observation=lambda job: job == "version",
-        pending_lost_observation=lambda job: job == "lost",
-        pending_completion_observation=lambda job: job == "completion",
-    )
+    native = SimpleNamespace()
     dep = SimpleNamespace(native_launches=native, workers=SimpleNamespace(inspect=lambda job_id: job_id),
                           delivery=SimpleNamespace(contract=SimpleNamespace(review_interval_seconds=10)))
     store = SimpleNamespace(consistent_read=lambda call, max_keys, row_scoped: call())
@@ -123,11 +89,11 @@ def composition(control):
     )
 
 
-def client_for(composition, *, start_work=None, wake_work=None, live=None):
+def client_for(composition, *, live=None):
     app = FastAPI()
     if live is not None:
         app.state.instruction_live_replies = live
-    api.install_work_policy_routes(app, composition, start_work=start_work, wake_work=wake_work)
+    api.install_work_policy_routes(app, composition)
     return TestClient(app)
 
 
@@ -191,9 +157,6 @@ def test_reads_refuse_query_and_body_with_their_own_messages(client, path, query
     ("GET", WP + "/conversations/c-1/turns/1/context", None, "a configured standing scope is required"),
     ("GET", WP + "/conversations/c-1/turns/1/delegation", None, "a configured standing scope is required"),
     ("GET", WP + "/bindings/b-1/cancel-receipt/1", None, "a configured standing scope is required"),
-    ("POST", WP + "/submit-reconcile", '{"request_id":"r-1","content":"x"}', "a configured standing scope is required"),
-    ("POST", WP + "/routines/daily/trigger-reconcile", '{"scheduled_for":"2026-10-30T00:00:00Z"}',
-     "a configured standing scope is required"),
 ])
 def test_reads_without_a_policy_refuse_instead_of_installing_one(composition, client, method, path, body, message):
     installed = []
@@ -334,95 +297,22 @@ def test_file_capability_is_uncached(client, monkeypatch):
     assert response.headers["cache-control"] == "no-store"
 
 
-PREFLIGHT = {"read_id": "read-1", "request_id": "r-1", "submit_body_sha256": SHA}
+RETIRED = [
+    WP + "/preflight", WP + "/submit", WP + "/submit-reconcile", WP + "/routines/daily/trigger",
+    WP + "/routines/daily/trigger-reconcile", WP + "/conversations/c-1/environment",
+    WP + "/conversations/c-1/environment-reconcile", WP + "/bindings/b-1/cancel", WP + "/conversations/c-1/reset",
+]
 
 
-def test_preflight_shows_only_role_prompt_refusals(client, control):
-    assert client.post(WP + "/preflight", json=PREFLIGHT, headers=AUTH).json() == {"ok": True}
-    control.outcome = Problem(409, "AGENT_ROLE_PROMPT_MISSING", "internal")
-    refused = client.post(WP + "/preflight", json=PREFLIGHT, headers=AUTH)
-    assert refused.status_code == 409
-    assert refused.json() == {"error": {
-        "code": "AGENT_ROLE_PROMPT_MISSING",
-        "message": "This agent's role profile has no saved role prompt yet. No work was accepted.",
+@pytest.mark.parametrize("path", RETIRED)
+def test_a_retired_job_entry_answers_410_without_reading_the_body_or_calling_the_control(composition, control, path):
+    with client_for(composition) as client:
+        response = client.post(path, content=b"{not json", headers=JSON_HEADERS)
+    assert response.status_code == 410
+    assert response.json() == {"error": {
+        "code": "JOB_LANE_RETIRED", "message": "The legacy job lane is retired; this request was not processed.",
         "reconcile_original": False, "automatic_retry": False}}
-    control.outcome = Problem(409, "WORK_SUBMIT_UNKNOWN", "internal")
-    assert error_of(client, "POST", WP + "/preflight", json=PREFLIGHT, headers=AUTH) == (
-        409, "WORK_SUBMIT_UNKNOWN", "internal")
-
-
-FINISHED = SimpleNamespace(state="succeeded", result_forwarded=True)
-SAVED_NOT_FORWARDED = SimpleNamespace(state="failed", result_forwarded=False)
-RUNNING = SimpleNamespace(state="running", result_forwarded=False)
-
-
-@pytest.mark.parametrize("status,instruction,started", [
-    (RUNNING, "instruction", ["b-1"]),
-    (SAVED_NOT_FORWARDED, "instruction", ["b-1"]),
-    (FINISHED, "instruction", []),
-    (RUNNING, None, []),
-])
-def test_submit_starts_only_unfinished_instruction_work(composition, control, status, instruction, started):
-    calls = []
-    control.status = status
-    control.records["b-1"].profile.instruction = instruction
-    with client_for(composition, start_work=calls.append) as client:
-        response = client.post(WP + "/submit", json={"request_id": "r-1", "content": "hello"}, headers=AUTH)
-    assert response.json() == {"binding": "b-1", "state": status.state}
-    assert calls == started
-    assert control.calls == [("human", "submit"), ("submit", "r-1")]
-
-
-def test_submit_without_a_starter_only_admits(client, control):
-    response = client.post(WP + "/submit", json={"request_id": "r-1", "content": "hello"}, headers=AUTH)
-    assert response.status_code == 200
-
-
-def test_unknown_submit_reconciles_the_same_request_and_starts_nothing(composition, control):
-    calls = []
-    control.outcome = Problem(503, "WORK_SUBMIT_UNKNOWN", "internal")
-    with client_for(composition, start_work=calls.append) as client:
-        response = client.post(WP + "/submit", json={"request_id": "r-1", "content": "hello"}, headers=AUTH)
-    assert response.status_code == 503
-    assert response.json()["error"]["reconcile_original"] is True
-    assert response.json()["error"]["automatic_retry"] is False
-    assert calls == []
-
-
-@pytest.mark.parametrize("status,started", [(RUNNING, ["b-1"]), (FINISHED, [])])
-def test_routine_trigger_starts_only_unfinished_work(composition, control, monkeypatch, status, started):
-    calls = []
-    monkeypatch.setattr("shared_context.behavior_routine.trigger",
-                        lambda c, p, routine_id, command: (SimpleNamespace(binding_id="b-1"), status))
-    with client_for(composition, start_work=calls.append) as client:
-        response = client.post(WP + "/routines/daily/trigger", json={"scheduled_for": "2026-10-30T00:00:00Z"},
-                               headers=AUTH)
-    assert response.json() == {"binding": "b-1", "state": status.state}
-    assert calls == started
-
-
-OBSERVATION = WorkSubmitObservation(schema_version="fa-work-submit-observation-v1", request_id="r-1",
-                                    submit_sha256=SHA, state="not_admitted", retry_same_request=True)
-
-
-def test_submit_reconcile_returns_the_observation_or_the_original_result(client, control):
-    body = {"request_id": "r-1", "content": "hello"}
-    control.outcome = OBSERVATION
-    assert client.post(WP + "/submit-reconcile", json=body, headers=AUTH).json()["state"] == "not_admitted"
-    control.outcome = (SimpleNamespace(binding_id="b-1"), RUNNING)
-    assert client.post(WP + "/submit-reconcile", json=body, headers=AUTH).json() == {
-        "binding": "b-1", "state": "running"}
-    assert ("refresh",) not in control.calls
-
-
-@pytest.mark.parametrize("original,expected", [
-    (OBSERVATION, "not_admitted"), ((SimpleNamespace(binding_id="b-1"), RUNNING), "running"),
-])
-def test_routine_reconcile_returns_the_observation_or_the_original_result(client, monkeypatch, original, expected):
-    monkeypatch.setattr("shared_context.behavior_routine.reconcile", lambda c, p, routine_id, command: original)
-    response = client.post(WP + "/routines/daily/trigger-reconcile",
-                           json={"scheduled_for": "2026-10-30T00:00:00Z"}, headers=AUTH)
-    assert response.json()["state"] == expected
+    assert control.calls == []
 
 
 def test_conversation_adds_live_text_only_to_unfinished_turns(composition, control):
@@ -438,93 +328,12 @@ def test_conversation_adds_live_text_only_to_unfinished_turns(composition, contr
     ]}
 
 
-def test_conversation_read_restarts_version_and_lost_observers_every_time(composition, control):
-    started, woken = [], []
-    control.turns = [
-        {"job_id": "version", "state": "starting", "binding_id": "b-1"},
-        {"job_id": "lost", "state": "failed", "binding_id": "b-2"},
-        {"job_id": "lost", "state": "running", "binding_id": "b-3"},
-        {"job_id": "none", "state": "starting", "binding_id": "b-4"},
-    ]
-    client = client_for(composition, start_work=started.append, wake_work=woken.append)
-    for _ in range(2):
-        assert client.get(WP + "/conversations/c-1", headers=AUTH).status_code == 200
-    assert started == ["b-1", "b-2", "b-1", "b-2"]
-    assert woken == []
-
-
-def test_conversation_read_wakes_completion_observers_twice_spaced_by_the_review_interval(
-        composition, control, monkeypatch):
-    clock, woken = [100.0], []
-    monkeypatch.setattr(api, "monotonic", lambda: clock[0])
-    control.turns = [{"job_id": "completion", "state": "capacity_uncertain", "binding_id": "b-1"}]
-    client = client_for(composition, start_work=lambda binding_id: None, wake_work=woken.append)
-    for now, expected in ((100.0, 1), (105.0, 1), (110.0, 2), (500.0, 2)):
-        clock[0] = now
-        assert client.get(WP + "/conversations/c-1", headers=AUTH).status_code == 200
-        assert len(woken) == expected
-
-
-def test_refused_conversation_read_wakes_nothing(composition, control):
-    started = []
-    control.outcome = Problem(404, "CONVERSATION_NOT_FOUND", "internal")
-    control.turns = [{"job_id": "version", "state": "starting", "binding_id": "b-1"}]
-    response = client_for(composition, start_work=started.append).get(WP + "/conversations/c-1", headers=AUTH)
-    assert response.status_code == 404
-    assert response.json()["error"]["message"] == "The original conversation was not found."
-    assert started == []
-
-
-def test_a_retried_conversation_read_only_acts_on_its_last_attempt(composition, control):
-    started, attempts = [], []
-    control.turns = [{"job_id": "version", "state": "starting", "binding_id": "b-1"}]
-    def conflict_once(call, max_keys, row_scoped):
-        value = call()
-        attempts.append(True)
-        if len(attempts) == 1:
-            raise Problem(412, "BEHAVIOR_CONFLICT", "changed")
-        return value
-    composition.runtime.store.consistent_read = conflict_once
-    response = client_for(composition, start_work=started.append).get(WP + "/conversations/c-1", headers=AUTH)
-    assert response.status_code == 200
-    assert started == ["b-1"]
-
-
-def test_conversation_without_a_native_launcher_observes_nothing(composition, control):
-    started = []
-    composition.runtime.dep.native_launches = None
-    control.turns = [{"job_id": "version", "state": "starting", "binding_id": "b-1"}]
-    assert client_for(composition, start_work=started.append).get(
-        WP + "/conversations/c-1", headers=AUTH).status_code == 200
-    assert started == []
-
-
-def test_environment_preview_and_prepare_share_one_reconcile_switch(client, control, monkeypatch):
-    seen = []
+def test_environment_preview_reads_without_refreshing(client, control, monkeypatch):
     monkeypatch.setattr("shared_context.behavior_conversation_transfer.preview",
                         lambda c, authority, p, conversation_id: {"preview": conversation_id, "authority": authority})
-    def prepare(c, authority, p, conversation_id, command, reconcile):
-        seen.append((authority, conversation_id, command.request_id, reconcile))
-        return {"ok": True}
-    monkeypatch.setattr("shared_context.behavior_conversation_transfer.prepare", prepare)
     assert client.get(WP + "/conversations/c-1/environment", headers=AUTH).json() == {
         "preview": "c-1", "authority": "authority"}
     assert ("refresh",) not in control.calls
-    body = {"request_id": "r-1", "failed_job_id": "j-1", "expected_agent_version": "2"}
-    assert client.post(WP + "/conversations/c-1/environment", json=body, headers=AUTH).status_code == 200
-    assert client.post(WP + "/conversations/c-1/environment-reconcile", json=body, headers=AUTH).status_code == 200
-    assert seen == [("authority", "c-1", "r-1", False), ("authority", "c-1", "r-1", True)]
-    assert control.calls.count(("refresh",)) == 2
-
-
-def test_transfer_refusal_keeps_only_its_bounded_detail(client, monkeypatch):
-    def refuse(*args, **kwargs):
-        raise Problem(409, "CONVERSATION_TRANSFER_CHANGED", "internal", transfer_refusal={
-            "stage": "before-reservation", "reserved": False})
-    monkeypatch.setattr("shared_context.behavior_conversation_transfer.prepare", refuse)
-    body = {"request_id": "r-1", "failed_job_id": "j-1", "expected_agent_version": "2"}
-    response = client.post(WP + "/conversations/c-1/environment", json=body, headers=AUTH)
-    assert response.json()["error"]["transfer_refusal"] == {"stage": "before-reservation", "reserved": False}
 
 
 def test_turn_context_digests_only_a_successful_read(client, control, monkeypatch):
@@ -584,29 +393,6 @@ def test_original_file_downloads_as_inert_text(client, monkeypatch):
     assert refused.json()["error"]["code"] == "USER_FILE_NOT_FOUND"
 
 
-@pytest.mark.parametrize("result,instruction,woken", [
-    ({"cancel_accepted": True}, "instruction", ["b-1"]),
-    ({"cancel_accepted": True, "executor_stopped": True}, "instruction", []),
-    ({"cancel_accepted": False}, "instruction", []),
-    ({"cancel_accepted": True}, None, []),
-])
-def test_cancel_wakes_only_a_still_running_instruction(composition, control, result, instruction, woken):
-    calls = []
-    control.cancel_result = result
-    control.records["b-1"].profile.instruction = instruction
-    with client_for(composition, start_work=calls.append) as client:
-        client.post(WP + "/bindings/b-1/cancel", json={"request_id": "r-1"}, headers=AUTH)
-    assert calls == woken
-
-
-def test_cancel_prefers_the_explicit_wake_hook(composition, control):
-    started, woken = [], []
-    control.cancel_result = {"cancel_accepted": True}
-    with client_for(composition, start_work=started.append, wake_work=woken.append) as client:
-        client.post(WP + "/bindings/b-1/cancel", json={"request_id": "r-1"}, headers=AUTH)
-    assert woken == ["b-1"] and started == []
-
-
 def test_cancellation_receipt_digests_only_a_successful_read(client, control):
     response = client.get(WP + "/bindings/b-1/cancel-receipt/3", headers=AUTH)
     assert response.headers["x-content-sha256"] == hashlib.sha256(b'{"ok":true}').hexdigest()
@@ -616,16 +402,15 @@ def test_cancellation_receipt_digests_only_a_successful_read(client, control):
     assert refused.status_code == 409 and "x-content-sha256" not in refused.headers
 
 
-def test_reset_revoke_and_budget_refresh_their_control(client, control, monkeypatch):
+def test_revoke_and_budget_refresh_their_control(client, control, monkeypatch):
     monkeypatch.setattr("shared_context.behavior_work_budget.set_budget_enforcement",
                         lambda actual, principal, command: {"enforced": command.enforced})
-    assert client.post(WP + "/conversations/c-1/reset", json={"request_id": "r-1"}, headers=AUTH).status_code == 200
     assert client.post("/operator/v1/standing-work-policy/revoke", json={"decision_id": "d-1"},
                        headers=AUTH).status_code == 200
     budget = client.post("/operator/v1/standing-work-policy/budget-enforcement", json={
         "request_id": "r-2", "policy_sha256": SHA, "enforced": False}, headers=AUTH)
     assert budget.json() == {"enforced": False}
-    assert control.calls == [("refresh",), ("reset", "c-1", "r-1"), ("refresh",), ("revoke", "d-1"), ("refresh",)]
+    assert control.calls == [("refresh",), ("revoke", "d-1"), ("refresh",)]
 
 
 def test_revoke_keeps_internal_problems_unfiltered(client, control):
@@ -639,15 +424,17 @@ def test_a_missing_policy_is_installed_once_by_routes_that_may_install(compositi
         composition.runtime.work_policy = control
     composition.runtime.work_policy = None
     composition.installation = install
-    assert client.post(WP + "/conversations/c-1/reset", json={"request_id": "r-1"}, headers=AUTH).status_code == 200
-    assert control.calls == [("reset", "c-1", "r-1")]
+    assert client.post("/operator/v1/standing-work-policy/revoke", json={"decision_id": "d-1"},
+                       headers=AUTH).status_code == 200
+    assert control.calls == [("revoke", "d-1")]
 
 
 def test_native_mode_activates_the_target_on_each_control_read(composition, client, control, monkeypatch):
     seen = []
     composition.runtime.mode = "native"
     monkeypatch.setattr("shared_context.behavior_work_target.activate_target", seen.append)
-    assert client.post(WP + "/conversations/c-1/reset", json={"request_id": "r-1"}, headers=AUTH).status_code == 200
+    assert client.post("/operator/v1/standing-work-policy/revoke", json={"decision_id": "d-1"},
+                       headers=AUTH).status_code == 200
     assert seen == [composition]
 
 

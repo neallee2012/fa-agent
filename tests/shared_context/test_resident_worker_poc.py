@@ -18,11 +18,12 @@ from shared_context.behavior_assistant import key
 from shared_context.errors import Problem
 from shared_context.m2_copilot import ResidentHolder, ResidentSdk
 
-from test_behavior_assistant import assistant, runtime_path
+from test_behavior_assistant import assistant
+from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
-from test_instruction_flow import sdk_io, instruction_models
-from test_work_policy_lifecycle import enabled
-from test_conversation_transfer_startup import synthetic_standing_v1
+from instruction_flow_helpers import sdk_io, instruction_models
+from work_policy_lifecycle_helpers import enabled
+from legacy_turn_rows_helpers import outcome_of, stored_turn
 
 POC = wire.RESIDENT_WORKER_PROFILE
 
@@ -133,104 +134,32 @@ def test_files_changed_after_release_force_the_published_restore(assistant, monk
     assert calls[1]["resume"] is True and len(h.endpoint.requests) == 2
 
 
-def outcome_of(call):
-    from shared_context.errors import Problem
-    try:
-        call()
-        return "ok"
-    except Problem as error:
-        return error.body["error"]["code"]
-
-
-def test_saved_release_passes_the_real_native_startup_readers(synthetic_standing_v1):
+def test_saved_release_passes_the_real_native_startup_readers(stored_turn):
     """Coordinator condition: after saving a release the API still starts (no new record kind).
 
-    The PoC template is selected the same way the operator will select it on agent B.
+    Both old turns ran on the PoC template, selected the same way the operator will select it on agent B.
     """
-    from test_conversation_transfer_startup import read_startup, saved_turn
-    from test_conversation_profile_selection import template
+    from legacy_turn_rows_helpers import read_startup
     from shared_context.behavior_migration import MigrationStore, installed_origin
     from shared_context.behavior_operations import _parse
-    from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
-    c = synthetic_standing_v1
-    config = c.h.config
-    select_profile(c.control, c.authority, c.human, SelectConversationProfile(
-        request_id="select-resident-poc", expected_selection_id=None, template=template(worker_profile=POC)))
+    from shared_context.behavior_profile_selection import current_selection, profile_from_template
 
-    def readers():
-        store = MigrationStore(c.h.composition.clients[0], config.table.scope)
-        return (outcome_of(lambda: read_startup(c)), outcome_of(lambda: installed_origin(store, config)))
-    exited = saved_turn(c, "synthetic-exit")
-    assert exited.assignment.task.instruction.worker_profile == POC
-    after_exit = readers()
+    def readers(c):
+        store = MigrationStore(c.h.composition.clients[0], c.h.config.table.scope)
+        return (outcome_of(lambda: read_startup(c)), outcome_of(lambda: installed_origin(store, c.h.config)))
+    c = stored_turn("synthetic-exit")
+    selected = current_selection(c.control.store, c.control.policy)
+    assert profile_from_template(c.control.policy, selected.command.template).worker_profile == POC
+    after_exit = readers(c)
     assert after_exit[0] == "ok"
     released = wire.AssistantSdkStop(pid=99, release=POC)
-    kept = saved_turn(c, "synthetic-release", stop=released)
-    row_key = key("text-archive", kept.binding.job_id)
+    # The release turn followed the exit turn on the same store.
+    c = stored_turn("synthetic-release")
+    row_key = key("text-archive", c.turn.binding.job_id)
     saved = _parse(c.h.runtime.store.read_snapshot((row_key,))[row_key].payload["data"], TurnArchive)
     assert saved.sdk_stop == released
     # Release records are classified exactly as ordinary exit records by every startup reader.
-    assert readers() == after_exit
-
-
-def test_cancel_on_a_resident_turn_stops_the_sdk_with_exit_evidence(assistant, monkeypatch):
-    h, control, human = resident_enabled(assistant)
-    calls = sdk_io(monkeypatch)
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "first"}, {"content": "must not be sent"}])
-    sessions = []
-    original_init = hosted.AssistantSession.__init__
-
-    def tracked(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        sessions.append(self)
-    monkeypatch.setattr(hosted.AssistantSession, "__init__", tracked)
-    first, _ = turn(h, control, human, "cancel-one", "First.")
-    binding, _ = control.submit(human, InstructionSubmit(
-        request_id="cancel-two", conversation_id=conversation(h, first), content="Second."))
-    original = h.assistant.resident_restore
-
-    def cancel_after(*args, **kwargs):
-        result = original(*args, **kwargs)
-        Context().run(control.cancel, human, binding.binding_id)
-        sessions[-1].request_cancel()
-        return result
-    monkeypatch.setattr(h.assistant, "resident_restore", cancel_after)
-    status = h.runtime.controller.step(binding.binding_id)
-    assert status.state == "cancelled" and len(calls) == 1 and len(h.endpoint.requests) == 1
-    stop = archive(h, binding).sdk_stop
-    assert stop.release is None and stop.exit_code is not None
-    assert h.executor.resident.holder(sessions[-1].client.assignment.sdk_session_id).live is None
-
-
-def test_cancel_after_idle_before_the_save_still_seals_and_drops_the_sdk(assistant, monkeypatch, caplog):
-    from shared_context.behavior_instruction import sdk_session_id
-    h, control, human = resident_enabled(assistant)
-    calls = sdk_io(monkeypatch)
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "done before cancel"}, {"content": "next"}])
-    binding, _ = control.submit(human, InstructionSubmit(request_id="late-cancel", content="First."))
-    original = hosted.AssistantClient.save_text_reply
-
-    def cancel_then_save(self, *args, **kwargs):
-        Context().run(control.cancel, human, binding.binding_id)
-        return original(self, *args, **kwargs)
-    monkeypatch.setattr(hosted.AssistantClient, "save_text_reply", cancel_then_save)
-    status = h.runtime.controller.step(binding.binding_id)
-    monkeypatch.setattr(hosted.AssistantClient, "save_text_reply", original)
-    assert status.state == "cancelled"
-    released = archive(h, binding).sdk_stop
-    assert released.release == POC
-    # The API's cancelled outcome still seals with the saved release, as the Hosted journal reports it.
-    assert native_plan(h, binding, released, exited=False, outcome="stopped")[0].state == "cancelled"
-    base = dict(launch_id="launch", assignment_digest="a" * 64, supervisor_id="sup", child_nonce="nonce",
-                phase="sealed", child_pid=released.pid, outcome="stopped", sdk_stop=released)
-    assert LocalExecution(**base).outcome == "stopped"
-    cid = conversation(h, binding)
-    assert h.executor.resident.holder(sdk_session_id(cid)).live is None, "a cancelled turn must not keep its SDK"
-    second, status2 = turn(h, control, human, "after-late-cancel", "Second.", cid)
-    assert status2.state == "succeeded" and "sdk_restore" in phases(caplog, second.job_id)
-    assert len(calls) == 2 and len(h.endpoint.requests) == 2
+    assert readers(c) == after_exit
 
 
 def test_revocation_after_the_light_restore_blocks_the_next_model_write(assistant, monkeypatch, caplog):
@@ -349,28 +278,15 @@ def test_native_report_refuses_a_release_for_an_ordinary_task(assistant, monkeyp
     assert denied.value.body["error"]["code"] == "ASSISTANT_NATIVE_IDLE"
 
 
-def test_poc_template_applies_only_to_new_conversations_and_refuses_checkpoint_profiles(assistant, monkeypatch):
+def test_poc_template_selection_refuses_checkpoint_profiles(assistant):
     from shared_context.behavior_sdk_state import CheckpointProfile
-    from test_conversation_profile_selection import configured, select, template
-    from test_instruction_prompt import submit
-    h, control, _ = configured(assistant)
-    sdk_io(monkeypatch)
-    h.executor.resident = hosted.ResidentPool()
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "old"}, {"content": "poc one"}, {"content": "old follow-up"}])
-    old, _ = submit(h, "before-poc", "Original settings.")
-    assert h.runtime.controller.step(old["binding_id"]).state == "succeeded"
+    from conversation_profile_selection_helpers import configured, select, template
+    h, _, _ = configured(assistant)
     refused, _ = select(h, request_id="poc-with-checkpoint",
                         value=template(worker_profile=POC, checkpoint_profile=CheckpointProfile()))
     assert refused.status_code == 422
     selected, _ = select(h, request_id="poc", value=template(worker_profile=POC))
     assert selected.status_code == 200, selected.text
-    new, _ = submit(h, "poc-new", "Resident conversation.")
-    assert control.records[new["binding_id"]].profile.instruction.worker_profile == POC
-    assert h.runtime.controller.step(new["binding_id"]).state == "succeeded"
-    follow, _ = submit(h, "old-follow", "Old conversation continues.", old["conversation_id"])
-    assert control.records[follow["binding_id"]].profile.instruction.worker_profile is None
-    assert h.runtime.controller.step(follow["binding_id"]).state == "succeeded"
 
 
 def test_an_unbound_resident_sdk_fails_closed():

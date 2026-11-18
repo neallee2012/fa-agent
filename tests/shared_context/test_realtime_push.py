@@ -19,8 +19,8 @@ from shared_context.realtime_push import ENDPOINT_ENV, HUB_ENV, hint, realtime_p
 from test_m3_auth import jwk_client, signing_key
 from test_native_hitl import create_pending, decision, hitl, post
 from test_native_hitl_questions import answer, create_question
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path
+from assistant_api_helpers import assistant_api
+from instruction_flow_helpers import instruction_models, runtime_path
 
 ENDPOINT = "https://wps-fa-test.webpubsub.azure.com"
 URL = "wss://wps-fa-test.webpubsub.azure.com/client/hubs/fa?access_token=synthetic"
@@ -223,11 +223,11 @@ def test_relay_hints_name_the_recipient_turn_and_the_verified_sender(realtime, m
          "request_id": "rid-wake", "source_request_id": "rid-a"},
     ]
 
-def test_turn_end_hint_follows_the_recorded_usage_and_negotiate_is_owner_only(realtime, assistant):
+def test_turn_end_hint_follows_the_recorded_usage_and_negotiate_is_owner_only(realtime, assistant_api):
     from shared_context.behavior_turn_usage import AGENT_TURN_USAGE_PATH, AgentTurnUsageReport
-    from test_sdk_compaction_product import configured
+    from sdk_compaction_product_helpers import configured
     from test_turn_usage_ledger import group, report
-    h, control, human = configured(assistant)
+    h, control, human = configured(assistant_api)
     team = control.policy.template.team_id
     agent = h.verifier(h.client.build_request("GET", "/", headers=h.headers("agent")))
     body = AgentTurnUsageReport(request_id="vm-turn", usage=report(group())).model_dump(mode="json")
@@ -255,10 +255,10 @@ def test_turn_end_hint_follows_the_recorded_usage_and_negotiate_is_owner_only(re
     assert len(realtime.tokens) == 1
 
 
-def test_negotiate_says_disabled_when_realtime_is_not_configured(assistant, monkeypatch):
-    from test_sdk_compaction_product import configured
+def test_negotiate_says_disabled_when_realtime_is_not_configured(assistant_api, monkeypatch):
+    from sdk_compaction_product_helpers import configured
     monkeypatch.delenv(ENDPOINT_ENV, raising=False)
-    h, _, _ = configured(assistant)
+    h, _, _ = configured(assistant_api)
     refused = h.client.get("/work-policy/v1/realtime/negotiate", headers=h.headers())
     assert refused.status_code == 503 and refused.json()["error"] == {
         "code": "REALTIME_DISABLED", "message": "Realtime hints are not configured; keep polling.",

@@ -67,9 +67,8 @@ def test_written_profile_passes_the_ci_checks_and_finds_the_copied_runtime(stage
     (runtime / "fresh-inputs.json").write_bytes(b"{}\n")
     path = stage_profile.write(tmp_path / "stage", BASE.values(**PRIVATE, **CI_FIELDS), runtime)
     assert path == tmp_path / "stage" / "stage.json"
-    monkeypatch.setenv("FA_DEPLOY_CONFIG", str(path))
     ci = load("ci_deploy_azd_stage", ROOT / "deploy" / "stage" / "ci_deploy.py")
-    ci.STAGE, ci.CONFIG = ci.load_config(path), ci.config_path(path)
+    ci.use_profile(path)
     ci.RUNTIME = ci.CONFIG.parent / "runtime"  # main()'s default without --runtime-dir, as in deploy-staging.yml
     # The api step compares the deployed configuration with these bytes, so they are azd's own, not regenerated.
     assert ci._config_bytes() == b'{"deployed": "bytes"}\n'
@@ -88,7 +87,7 @@ def test_a_laptop_profile_without_the_ci_identity_passes_check_but_not_meta(stag
     values = BASE.values(**PRIVATE, FA_FEED_APP="ca-feed-dev", FA_FEED_PUBLIC_KEY=PUBLIC)
     path = stage_profile.write(tmp_path / "stage", values, runtime)
     ci = load("ci_deploy_azd_laptop", ROOT / "deploy" / "stage" / "ci_deploy.py")
-    ci.STAGE = ci.load_config(path)
+    ci.use_profile(path)
     ci.check()
     with pytest.raises(SystemExit, match="no deploy_client_id"):
         ci.meta()

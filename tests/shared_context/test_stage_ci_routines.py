@@ -26,7 +26,7 @@ def load_ci():
     spec = importlib.util.spec_from_file_location("offline_stage_ci_routines", ROOT / "deploy" / "stage" / "ci_deploy.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.STAGE = copy.deepcopy(module.STAGE)
+    module.use_profile(ROOT / "deploy" / "stage" / "stage.json")
     # ADR-0009 2d-ii deploys only with the 2d-i switch on (2d-ii merges after stage has it on); a test of the off
     # profile sets "0" itself.
     module.STAGE["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] = "1"

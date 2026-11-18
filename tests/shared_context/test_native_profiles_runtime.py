@@ -17,7 +17,7 @@ from test_m2_copilot import runtime_path
 from test_native_profiles import profile_capture
 from test_native_turn_wire import submit
 from test_native_turns import Harness, IDENTITY, local_env
-from test_sdk_compaction_product import SUMMARY
+from sdk_compaction_product_helpers import SUMMARY
 
 
 def test_real_sdk_native_responses_origin_manual_checkpoint_and_three_cold_turns(

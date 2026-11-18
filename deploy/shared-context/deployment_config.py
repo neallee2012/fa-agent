@@ -1,9 +1,8 @@
 """Load and validate an environment-specific FA deployment profile.
 
 The profile is intentionally JSON so it can be generated outside the repository and
-passed to every deployment step.  The checked-in stage profile remains the default
-for backwards compatibility; callers can select another profile with ``--config``
-or ``FA_DEPLOY_CONFIG``.
+passed to every deployment step.  There is no default: every caller names its profile
+with ``--config`` or ``FA_DEPLOY_CONFIG``, so a forgotten flag cannot touch stage.
 """
 
 from __future__ import annotations
@@ -18,8 +17,6 @@ UUID = re.compile(r"^[0-9a-fA-F-]{36}$")
 RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 HTTPS_URL = re.compile(r"^https://\S+$")
 
-ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = ROOT / "deploy" / "stage" / "stage.json"
 CONFIG_ENV = "FA_DEPLOY_CONFIG"
 
 COMMON_REQUIRED = (
@@ -50,10 +47,11 @@ def write_x(path: Path, value: Any) -> None:
 
 
 def config_path(value: str | os.PathLike[str] | None = None) -> Path:
-    """Resolve an explicit path, the environment override, or the stage default."""
+    """Resolve an explicit path or the environment override; naming none is an error, never stage."""
     selected = value or os.environ.get(CONFIG_ENV)
-    path = Path(selected) if selected else DEFAULT_CONFIG
-    path = path.expanduser()
+    if not selected:
+        raise SystemExit(f"no deployment config: pass --config <profile.json> or set {CONFIG_ENV}")
+    path = Path(selected).expanduser()
     if not path.is_absolute():
         path = (Path.cwd() / path).resolve()
     return path

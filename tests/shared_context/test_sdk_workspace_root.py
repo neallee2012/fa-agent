@@ -1,18 +1,14 @@
 """The SDK's logical working directory never grants access to a prior host path."""
 import asyncio
 import json
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from shared_context import m2_copilot
-from shared_context.behavior_sdk_files import SESSION_FS, STATE_PATH, SdkSessionFiles
+from shared_context.behavior_sdk_files import STATE_PATH, SdkSessionFiles
 from shared_context.behavior_sdk_state import SdkState
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path
-from test_instruction_prompt import configured, sdk_options, submit
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import signing_key, jwk_client
 
 
@@ -104,26 +100,3 @@ def test_recorded_internal_file_is_not_misrepresented_as_a_directory():
     result = asyncio.run(fs.stat(STATE_PATH + "/events.jsonl"))
     assert result.is_file and not result.is_directory
     assert result.size == len(saved.files["events.jsonl"].encode())
-
-
-def test_session_options_use_virtual_cwd_while_runtime_process_keeps_its_private_directory(assistant, monkeypatch):
-    h, _, _ = configured(assistant)
-    _, options = sdk_options(monkeypatch)
-    factory = m2_copilot.CopilotClient.side_effect
-    connections = []
-
-    def capture(**values):
-        connections.append(values)
-        return factory(**values)
-
-    m2_copilot.CopilotClient.side_effect = capture
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "First original reply."}, {"content": "Second original reply."}])
-    first, _ = submit(h, "virtual-cwd-first", "First task.")
-    assert h.runtime.controller.step(first["binding_id"]).state == "succeeded"
-    second, _ = submit(h, "virtual-cwd-second", "Continue the same task.", first["conversation_id"])
-    assert h.runtime.controller.step(second["binding_id"]).state == "succeeded"
-    assert len(options) == len(connections) == 2
-    assert all(value["working_directory"] == SESSION_FS["initial_working_directory"] for value in options)
-    assert all(value["working_directory"] != SESSION_FS["initial_working_directory"]
-               and Path(value["working_directory"]).is_dir() for value in connections)

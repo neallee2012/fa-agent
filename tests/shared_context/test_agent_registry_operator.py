@@ -10,8 +10,9 @@ import pytest
 from shared_context.errors import Problem
 import test_conversation_transfer_startup as startup
 from test_behavior_store import WireResponse
-from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from test_conversation_transfer_startup import synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 
 

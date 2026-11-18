@@ -13,9 +13,10 @@ from shared_context.behavior_instruction_cost import (
 )
 from shared_context.behavior_operations import _row
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
-from test_conversation_transfer_startup import claimed_turn, read_startup, synthetic_standing_v1
-from test_instruction_flow import instruction_models, runtime_path
+from assistant_api_helpers import assistant_api
+from test_conversation_transfer_startup import claimed_turn, synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 from test_turn_usage_ledger import group, ledger, report
 
@@ -155,10 +156,10 @@ def test_only_a_typed_report_or_explicit_unknown_is_accepted(synthetic_standing_
     assert invalid.value.body["error"]["code"] == "AGENT_USAGE_INVALID"
 
 
-def test_the_verified_agent_reports_its_own_final_turn_usage_once_over_the_api(assistant):
+def test_the_verified_agent_reports_its_own_final_turn_usage_once_over_the_api(assistant_api):
     from shared_context.behavior_turn_usage import AGENT_TURN_USAGE_PATH, AgentTurnUsageReport
-    from test_sdk_compaction_product import configured
-    h, control, human = configured(assistant)
+    from sdk_compaction_product_helpers import configured
+    h, control, human = configured(assistant_api)
     body = AgentTurnUsageReport(request_id="vm-turn", usage=report(group())).model_dump(mode="json")
     first = h.client.post(AGENT_TURN_USAGE_PATH, json=body, headers=h.headers("agent"))
     assert first.status_code == 200, first.text

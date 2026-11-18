@@ -1,6 +1,5 @@
 """Completion ordering and wakeups; no network, runtime process, or model call."""
 import asyncio
-from contextlib import ExitStack
 from datetime import datetime, timezone
 from threading import Event, Timer
 from types import SimpleNamespace
@@ -9,7 +8,6 @@ import pytest
 
 from shared_context import behavior_assistant_hosted as hosted
 from shared_context import behavior_assistant_wire as aw
-from shared_context.behavior_server import ServerComposition
 from shared_context.sdk_pin import RUNTIME_VERSION
 
 
@@ -56,67 +54,6 @@ def test_final_save_waits_for_inflight_public_progress(tmp_path, monkeypatch, fa
         release.set()
         for timer in timers:
             timer.join(2)
-
-
-def test_ready_notification_wakes_one_existing_observer_without_timer_delay(monkeypatch):
-    import starlette.concurrency
-    calls = []
-    async def inline(call, *args, **kwargs):
-        return call(*args, **kwargs)
-    monkeypatch.setattr(starlette.concurrency, "run_in_threadpool", inline)
-    async def run():
-        started = asyncio.Event()
-        def step(binding_id):
-            calls.append(binding_id)
-            started.set()
-            return SimpleNamespace(state="starting" if len(calls) == 1 else "succeeded",
-                                   result_forwarded=len(calls) > 1)
-        runtime = SimpleNamespace(controller=SimpleNamespace(step=step), work_policy=None,
-            dep=SimpleNamespace(delivery=SimpleNamespace(contract=SimpleNamespace(review_interval_seconds=60))))
-        composition = ServerComposition(None, runtime, None, None, (), ExitStack())
-        composition.launch_instruction("original")
-        task = composition._instruction_tasks["original"]
-        try:
-            await started.wait()
-            composition.instruction_ready("original")
-            composition.instruction_ready("original")
-            await asyncio.wait_for(asyncio.shield(task), 0.5)
-            assert calls == ["original", "original"]
-        finally:
-            await composition.stop_instruction_observers()
-            composition.close()
-    asyncio.run(run())
-
-
-def test_ready_during_an_uncertain_query_is_not_lost_when_the_observer_pauses(monkeypatch):
-    import starlette.concurrency
-    calls = []
-
-    async def inline(call, *args, **kwargs):
-        return call(*args, **kwargs)
-
-    monkeypatch.setattr(starlette.concurrency, "run_in_threadpool", inline)
-
-    async def run():
-        def step(binding_id):
-            calls.append(binding_id)
-            if len(calls) == 1:
-                composition.instruction_ready(binding_id)
-            return SimpleNamespace(state="capacity_uncertain" if len(calls) == 1 else "succeeded",
-                                   result_forwarded=len(calls) > 1)
-
-        runtime = SimpleNamespace(controller=SimpleNamespace(step=step), work_policy=None,
-            dep=SimpleNamespace(delivery=SimpleNamespace(contract=SimpleNamespace(review_interval_seconds=60))))
-        composition = ServerComposition(None, runtime, None, None, (), ExitStack())
-        try:
-            composition.launch_instruction("original")
-            await asyncio.wait_for(asyncio.shield(composition._instruction_tasks["original"]), 0.5)
-            assert calls == ["original", "original"]
-        finally:
-            await composition.stop_instruction_observers()
-            composition.close()
-
-    asyncio.run(run())
 
 
 def test_pending_progress_snapshots_are_coalesced_without_losing_events(tmp_path):

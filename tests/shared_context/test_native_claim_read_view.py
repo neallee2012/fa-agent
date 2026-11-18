@@ -16,7 +16,7 @@ from shared_context.behavior_timing import phase_timing
 from shared_context.errors import Problem
 from test_behavior_store import NativeEntity
 from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 

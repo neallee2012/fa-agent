@@ -19,8 +19,8 @@ from starlette.concurrency import run_in_threadpool
 from .behavior_api import _body, _octets, _nonfinite, _principal_dependency, _response, _unique
 from .behavior_assistant_wire import InstructionSubmit
 from .behavior_foundry import FoundryHttpClient, MAX_NATIVE_TURN_HTTP_BYTES
-from .behavior_instruction import conversation_key
 from .behavior_native_capture import resolve_capture
+from .behavior_operations import conversation_key
 from .behavior_timing import phase_timing, timing_id
 from .behavior_wire import WireModel
 from .native_responses_wire import channel

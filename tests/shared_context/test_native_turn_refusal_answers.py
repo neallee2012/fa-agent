@@ -18,7 +18,7 @@ from test_native_turn_api import native_api, submit
 from test_native_turns import local_env
 from test_conversation_transfer_startup import synthetic_standing_v1
 from test_m3_auth import jwk_client, signing_key
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 
 GATEWAY = "shared_context.behavior_native_turn_api.NativeTurnGateway."
 SHARED_HANDLER = "The bounded operation could not be completed."

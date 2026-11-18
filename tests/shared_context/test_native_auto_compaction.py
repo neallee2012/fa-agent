@@ -9,9 +9,11 @@ import os
 from pathlib import Path
 import socket
 from types import SimpleNamespace
+import uuid
 
 import httpx
 import pytest
+from copilot._jsonrpc import JsonRpcClient
 from starlette.testclient import TestClient
 
 from conftest import require_cold_resume_paths
@@ -58,10 +60,10 @@ def isolated(monkeypatch, name):
     return root
 
 
-def small_capture(checkpoint_profile=None, prompt=5000, model_provider=None):
+def small_capture(checkpoint_profile=None, prompt=5000, model_provider=None, model_id="OFFLINE-model", **limits):
     values = capture().model_dump(mode="json")
-    model = InstructionModel(id="OFFLINE-model", display_name="OFFLINE model", context_window_tokens=prompt + 1000,
-                             max_prompt_tokens=prompt, max_output_tokens=512)
+    model = InstructionModel(id=model_id, display_name="OFFLINE model", **(limits or {
+        "context_window_tokens": prompt + 1000, "max_prompt_tokens": prompt, "max_output_tokens": 512}))
     values["model"] = model.model_dump(mode="json")
     values["model_capacity"] = model.capacity_snapshot().model_dump(mode="json")
     settings = values["template"]["settings"]
@@ -97,7 +99,8 @@ def completion_stream(number, delta, finish_reason, *, prompt_tokens):
     return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=raw.encode())
 
 
-def run_turns(monkeypatch, runtime_path, name, selected, turns=7, paragraphs=60, provider=None, hitl_client=None):
+def run_turns(monkeypatch, runtime_path, name, captures, paragraphs=60, provider=None, hitl_client=None):
+    """One conversation, one turn per capture; a different capture on a later turn is a model switch."""
     root = isolated(monkeypatch, name)
     requests, receipts, saved = [], [], []
 
@@ -112,7 +115,7 @@ def run_turns(monkeypatch, runtime_path, name, selected, turns=7, paragraphs=60,
     executor.reader = runtime
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
         cid = None
-        for n in range(1, turns + 1):
+        for n, selected in enumerate(captures, 1):
             rid = f"rid-{n}"
             text = ("MARK-TURN-1 " if n == 1 else "") + "".join(FILLER.format(i=n * 1000 + j) for j in range(paragraphs))
             request = NativeSubmit(command=submit(rid=rid, cid=cid, text=text).command, capture=selected)
@@ -160,7 +163,7 @@ AUTO = {"name": "auto-no-custom-v1", "platform": PLATFORM, "provider": "openai-c
 
 def test_auto_profile_keeps_a_long_conversation_going_after_the_runtime_compacts(monkeypatch, runtime_path):
     requests, receipts, saved, originals = run_turns(
-        monkeypatch, runtime_path, "auto", small_capture(AUTO, prompt=20000), turns=13, paragraphs=100)
+        monkeypatch, runtime_path, "auto", [small_capture(AUTO, prompt=20000)] * 13, paragraphs=100)
     assert [status for status, _, _ in receipts] == ["completed"] * 13, receipts
     compacted = [request["turn"] for request in requests if request["compaction"]]
     assert compacted and compacted[0] < 13, "the declared 20000-token prompt limit must make the pinned runtime compact"
@@ -221,8 +224,8 @@ def test_the_runtime_compacts_at_the_declared_input_limit_even_above_its_128000_
         values["model_capacity"] = model.capacity_snapshot().model_dump(mode="json")
         settings["model_capacity_profile"] = "fa-model-capacity-v1"
     selected = NativeTurnCapture.model_validate_json(json.dumps(values))
-    requests, receipts, _, _ = run_turns(monkeypatch, runtime_path, f"declared-{declared}", selected,
-                                         turns=first, paragraphs=5, provider=large_replies)
+    requests, receipts, _, _ = run_turns(monkeypatch, runtime_path, f"declared-{declared}", [selected] * first,
+                                         paragraphs=5, provider=large_replies)
     assert [status for status, _, _ in receipts] == ["completed"] * first, receipts
     # Without a declaration runtime 1.0.103's 128000 default compacts at turn 4 (1.0.83: turn 5, ~120k); 272000
     # waits until ~240k.
@@ -231,13 +234,13 @@ def test_the_runtime_compacts_at_the_declared_input_limit_even_above_its_128000_
 
 def test_auto_profile_turns_still_complete_when_the_runtime_truncates_a_tiny_window(monkeypatch, runtime_path):
     """With a window the verbatim user messages alone fill, the runtime truncates; nothing fails or is lost."""
-    _, receipts, _, originals = run_turns(monkeypatch, runtime_path, "auto-tiny", small_capture(AUTO), turns=7)
+    _, receipts, _, originals = run_turns(monkeypatch, runtime_path, "auto-tiny", [small_capture(AUTO)] * 7)
     assert [status for status, _, _ in receipts] == ["completed"] * 7, receipts
     assert originals["rid-1"].startswith("MARK-TURN-1 ")
 
 
 def test_without_the_profile_a_runtime_compaction_is_refused_and_the_last_checkpoint_stays(monkeypatch, runtime_path):
-    requests, receipts, saved, _ = run_turns(monkeypatch, runtime_path, "none", small_capture(), turns=6)
+    requests, receipts, saved, _ = run_turns(monkeypatch, runtime_path, "none", [small_capture()] * 6)
     assert receipts[-1][:2] == ("unknown", "NATIVE_TURN_UNKNOWN") and len(saved) == len(receipts) - 1
     assert not any(request["compaction"] for request in requests)
 
@@ -467,3 +470,42 @@ def test_after_compaction_the_original_wording_is_read_back_exactly_and_history_
         assert reads[turn.request_id].model_dump(mode="json") == receipt
         assert turn == public and results[turn.request_id] == result
 
+
+def test_each_turn_of_one_native_conversation_sends_its_own_models_declared_capacity(monkeypatch, runtime_path):
+    """The retired lane's fixed-SDK capacity case: a model switch inside one conversation sends that model's limits."""
+    monkeypatch.setenv("FA_NATIVE_MODEL_SWITCH", "1")  # a model change after a completed native turn is opt-in
+    sent, wire, rpc_request = [], [], JsonRpcClient.request
+
+    async def observe_wire(instance, method, params=None, **kwargs):
+        if method in {"session.create", "session.resume"}:
+            wire.append((params.get("model"), params.get("modelCapabilities")))
+        return await rpc_request(instance, method, params, **kwargs)
+
+    monkeypatch.setattr(JsonRpcClient, "request", observe_wire)
+
+    def capped(requests, turn):
+        inner = provider_double(requests, turn)
+
+        def provider(request):
+            body = json.loads(request.content)
+            sent.append((turn(), body["model"], body.get("max_tokens", body.get("max_completion_tokens"))))
+            return inner(request)
+        return provider
+
+    turns = [small_capture(model_id="OFFLINE-first", context_window_tokens=70000, max_prompt_tokens=60000,
+                           max_output_tokens=512),
+             small_capture(model_id="OFFLINE-second", context_window_tokens=20000, max_prompt_tokens=14000,
+                           max_output_tokens=1024),
+             small_capture(model_id="OFFLINE-unknown-context", max_output_tokens=768)]
+    _, receipts, _, _ = run_turns(monkeypatch, runtime_path, f"capacity-switch-{uuid.uuid4().hex[:8]}", turns,
+                                  paragraphs=1, provider=capped)
+    assert receipts == [("completed", None, number) for number in (1, 2, 3)]
+    assert sent == [(1, "OFFLINE-first", 512), (2, "OFFLINE-second", 1024), (3, "OFFLINE-unknown-context", 768)]
+    # What each turn hands the SDK: that model's own prompt and context limits, none carried over from the last model.
+    assert wire == [
+        ("OFFLINE-first", {"limits": {"maxPromptTokens": 60000, "maxOutputTokens": 512,
+                                      "maxContextWindowTokens": 70000}}),
+        ("OFFLINE-second", {"limits": {"maxPromptTokens": 14000, "maxOutputTokens": 1024,
+                                       "maxContextWindowTokens": 20000}}),
+        ("OFFLINE-unknown-context", {"limits": {"maxOutputTokens": 768}}),
+    ]

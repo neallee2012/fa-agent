@@ -54,6 +54,9 @@ NATIVE_HITL_FAILURE_GUIDANCE = {
     "NATIVE_HITL_NOT_STARTED": (
         "批准步驟沒有完成（例如批准紀錄寫入時與其他寫入衝突），這次呼叫在執行前就停止，工具沒有執行，也沒有任何效果；"
         "不是人類否決，也不是權限拒絕。若仍需要，可以用新的呼叫再做一次（會重新經過批准）；使用者要求重試時照做。"),
+    "NATIVE_HITL_RULES_CHANGED": (
+        "審查用的 Team 規則剛被修改，重新審查幾次後仍對不上，這次呼叫在執行前就停止，工具沒有執行，也沒有任何效果；"
+        "不是人類否決。若仍需要，可以用新的呼叫再做一次（會依目前規則重新審查）；使用者要求重試時照做。"),
     "NATIVE_HITL_ROUTINE_HUMAN_ONLY": (
         "排程只能由真人在對話裡請求後提出；這次是排程觸發或其他助理的回合，沒有出卡，也沒有建立排程。"
         "不要在這個回合再呼叫 propose_routine；需要時請在回覆裡說明，等使用者自己提出。"),
@@ -63,7 +66,7 @@ NATIVE_HITL_FAILURE_GUIDANCE = {
 def native_hitl_failure_feedback(code: str | None) -> str:
     if not isinstance(code, str) or code not in NATIVE_HITL_FAILURE_GUIDANCE:
         code = "NATIVE_HITL_AUTHORITY_UNAVAILABLE"
-    if code in {"NATIVE_HITL_NOT_STARTED", "NATIVE_HITL_ROUTINE_HUMAN_ONLY"}:
+    if code in {"NATIVE_HITL_NOT_STARTED", "NATIVE_HITL_RULES_CHANGED", "NATIVE_HITL_ROUTINE_HUMAN_ONLY"}:
         # Nothing ran, so a new call is not a resend of an unknown effect.
         return f"[{code}] {NATIVE_HITL_FAILURE_GUIDANCE[code]}"
     if code == "NATIVE_HITL_AUTHORITY_UNAVAILABLE":

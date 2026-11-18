@@ -18,8 +18,7 @@ from shared_context.behavior_capability_calls import (
 )
 from shared_context.errors import Problem
 from shared_context.tool_catalog import build_catalog, parse_entry_file
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 
 KEY = "Zx9Qm2Lp7Rt4Vw8Ky3Nb6Hc1Jd5Fg0Sa"
@@ -262,89 +261,6 @@ def test_same_tool_call_id_with_different_content_is_refused_not_resent(monkeypa
     assert calls == [{"query": "fa"}]
 
 
-def test_hosted_proxy_reaches_the_api_route_once_per_tool_call_and_keeps_refusal_codes(assistant, monkeypatch):
-    from shared_context import behavior_assistant_hosted as hosted
-    from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES
-    from shared_context.m2_copilot import ToolFailure
-    from test_capability_capture import WEB_TOOLS, choose, enabled, turn
-    h, control = enabled(assistant, monkeypatch, tools=(*HISTORY_CAPABILITIES, *WEB_TOOLS))
-    calls = []
-
-    async def service(entry, lookup, tool, arguments, **_):
-        calls.append((tool, arguments))
-        if arguments["query"] == "no-key":
-            raise Problem(503, "CAPABILITY_NEEDS_AUTH", "credential missing")
-        return McpToolResult(entry_id=entry.entry_id, entry_sha256=entry.entry_sha256, tool=tool,
-                             is_error=False, text="offline " + arguments["query"], truncated=False)
-    monkeypatch.setattr(mcp_client, "call_tool", service)
-    original, seen = hosted.run_copilot, []
-
-    async def call_then_reply(**options):
-        tool = next(spec for spec in options["tools"] if spec.name == "WebSearch-MCP-web")
-        packet = {"session_id": options["sdk_session_id"], "tool_call_id": "proxy-call", "arguments": {"query": "fa"}}
-        seen.append((await tool.handler(packet)).text)
-        seen.append((await tool.handler(packet)).text)
-        with pytest.raises(ToolFailure) as refused:
-            await tool.handler({**packet, "tool_call_id": "proxy-no-key", "arguments": {"query": "no-key"}})
-        seen.append(refused.value.public_code)
-        return await original(**options)
-    monkeypatch.setattr(hosted, "run_copilot", call_then_reply)
-    choice, _ = choose(h, "choose-web", ("WebSearch-MCP",))
-    assert choice.status_code == 200, choice.text
-    turn(h, control, "proxy-call")
-    assert calls == [("web", {"query": "fa"}), ("web", {"query": "no-key"})]
-    assert seen[0] == seen[1] and McpToolResult.model_validate_json(seen[0]).text == "offline fa"
-    assert seen[2] == "CAPABILITY_NEEDS_AUTH"
-
-
-def test_mcp_permission_rechecks_current_work_and_a_cancelled_job_is_refused(assistant, monkeypatch):
-    import inspect
-    from copilot.generated.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
-    from shared_context import m2_copilot
-    from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES
-    from test_capability_capture import choose, enabled
-    from test_instruction_prompt import submit
-    h, control = enabled(assistant, monkeypatch, tools=HISTORY_CAPABILITIES)
-    choice, _ = choose(h, "choose-browser", ("playwright",))
-    assert choice.status_code == 200, choice.text
-    offline_client, decisions, binding = m2_copilot.CopilotClient, [], {}
-
-    def client(**connection):
-        sdk = offline_client(**connection)
-        opened = sdk.create_session.side_effect
-
-        async def checked(*args, **options):
-            permission = options["on_permission_request"]
-            invocation = {"session_id": options["session_id"]}
-
-            def request(call_id, tool="playwright-browser_navigate"):
-                return SimpleNamespace(kind="mcp", server_name="playwright", tool_name=tool,
-                                       tool_call_id=call_id, managed_approval_required=False)
-            outside = permission(request("hidden", "playwright-browser_click"), invocation)
-            assert not inspect.isawaitable(outside)
-            decisions.append(outside)
-            pending = permission(request("current"), invocation)
-            assert inspect.isawaitable(pending)
-            decisions.append(await pending)
-            cancelled = h.client.post(f"/work-policy/v1/bindings/{binding['id']}/cancel",
-                                      json={"request_id": "cancel-during-mcp"}, headers=h.headers())
-            assert cancelled.status_code == 200, cancelled.text
-            decisions.append(await permission(request("after-cancel"), invocation))
-            return await opened(*args, **options)
-        sdk.create_session.side_effect = checked
-        return sdk
-    monkeypatch.setattr(m2_copilot, "CopilotClient", client)
-    accepted, _ = submit(h, "mcp-current-work", "Open the page.")
-    binding["id"] = accepted["binding_id"]
-    try:
-        h.runtime.controller.step(accepted["binding_id"])
-    except Problem:
-        pass
-    assert [type(item) for item in decisions] == [
-        PermissionDecisionReject, PermissionDecisionApproveOnce, PermissionDecisionReject]
-    assert "no longer current" in decisions[2].feedback
-
-
 def test_mcp_tools_cannot_start_without_a_current_work_check(tmp_path):
     import asyncio
     from shared_context.behavior_capability_prompt import session_needs
@@ -463,67 +379,3 @@ def test_the_native_listing_names_a_grant_that_cannot_list_and_still_lists_the_o
         with pytest.raises(Problem) as refused:
             list_grant_tools(runtime, both, **kwargs)
         assert refused.value.body["error"]["code"] == code
-
-
-def test_a_browser_grant_on_an_image_without_its_command_is_refused_before_the_sdk_starts(assistant, monkeypatch):
-    from shared_context import behavior_assistant_hosted as hosted
-    from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES
-    from test_capability_capture import choose, enabled
-    from test_instruction_prompt import submit
-    h, control = enabled(assistant, monkeypatch, tools=HISTORY_CAPABILITIES, image_tools=False)
-    choice, _ = choose(h, "choose-browser-on-slim", ("playwright",))
-    assert choice.status_code == 200, choice.text
-    started = []
-
-    async def never(**options):
-        started.append(options)
-        raise AssertionError("the SDK must not start without the captured tool's command")
-    monkeypatch.setattr(hosted, "run_copilot", never)
-    refusals = []
-    original = hosted.AssistantSession._run_turn
-
-    async def observed(self, work):
-        try:
-            return await original(self, work)
-        except Problem as error:
-            refusals.append(error.body["error"])
-            raise
-    monkeypatch.setattr(hosted.AssistantSession, "_run_turn", observed)
-    accepted, _ = submit(h, "browser-on-slim", "Open the page.")
-    try:
-        h.runtime.controller.step(accepted["binding_id"])
-    except Problem:
-        pass
-    assert started == [] and [item["code"] for item in refusals] == ["CAPABILITY_UNAVAILABLE"]
-    assert refusals[0]["capability"] == "playwright"
-
-
-def test_an_unexpected_route_failure_logs_its_action_and_exception_type_only(assistant, monkeypatch, caplog):
-    from shared_context import behavior_assistant_api as api
-    from shared_context import behavior_assistant_hosted as hosted
-    from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES
-    from shared_context.m2_copilot import ToolFailure
-    from test_capability_capture import WEB_TOOLS, choose, enabled, turn
-    h, control = enabled(assistant, monkeypatch, tools=(*HISTORY_CAPABILITIES, *WEB_TOOLS))
-
-    def broken(*args, **kwargs):
-        raise RuntimeError("PRIVATE_FAILURE_DETAIL " + KEY)
-    monkeypatch.setattr(api, "capability_call", broken)
-    original, codes = hosted.run_copilot, []
-
-    async def call_then_reply(**options):
-        tool = next(spec for spec in options["tools"] if spec.name == "WebSearch-MCP-web")
-        with pytest.raises(ToolFailure) as refused:
-            await tool.handler({"session_id": options["sdk_session_id"], "tool_call_id": "broken-call",
-                                "arguments": {"query": "fa"}})
-        codes.append(refused.value.public_code)
-        return await original(**options)
-    monkeypatch.setattr(hosted, "run_copilot", call_then_reply)
-    choice, _ = choose(h, "choose-web", ("WebSearch-MCP",))
-    assert choice.status_code == 200, choice.text
-    with caplog.at_level(logging.WARNING, logger="shared_context.behavior_assistant_api"):
-        turn(h, control, "broken-route")
-    logged = [json.loads(r.getMessage().split(" ", 1)[1]) for r in caplog.records
-              if r.getMessage().startswith("ASSISTANT_DEPENDENCY_FAILED ")]
-    assert logged == [{"action": "capability-call", "exception_type": "RuntimeError"}]
-    assert "PRIVATE_FAILURE_DETAIL" not in caplog.text and KEY not in caplog.text and codes

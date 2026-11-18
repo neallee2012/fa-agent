@@ -650,10 +650,10 @@ def retired_or_platform(held, name):
     held.set_launch(sealed_evidence_id=sealed)
 
 
-def test_a_platform_stop_needs_its_provenance_row(held):
+def test_a_retired_platform_stop_is_never_reconciled(held):
     reported(held)
     retired_or_platform(held, "platform-stop-evidence")
-    rejected(held, *TERMINAL, "platform stop provenance is missing")
+    rejected(held, *TERMINAL, "platform stop closures are retired and cannot be reconciled")
 
 
 def test_a_retired_stop_closure_is_never_reconciled(held):
@@ -662,11 +662,13 @@ def test_a_retired_stop_closure_is_never_reconciled(held):
     rejected(held, *TERMINAL, "original stop closures are retired and cannot be reconciled")
 
 
-def test_the_closure_id_outranks_a_missing_invocation(held):
+@pytest.mark.parametrize("name, phrase", [("original-stop-close", "original stop closures"),
+                                          ("platform-stop", "platform stop closures")])
+def test_the_closure_id_outranks_a_missing_invocation(held, name, phrase):
     reported(held)
-    retired_or_platform(held, "original-stop-close-evidence")
+    retired_or_platform(held, name + "-evidence")
     held.set_launch(native_invocation_id=None)
-    rejected(held, *TERMINAL, "original stop closures are retired and cannot be reconciled")
+    rejected(held, *TERMINAL, phrase + " are retired and cannot be reconciled")
 
 
 def released_report(held, monkeypatch, *, profile=POC, instruction=True):

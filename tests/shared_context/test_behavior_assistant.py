@@ -4,7 +4,6 @@ import base64
 import hashlib
 import json
 import asyncio
-from dataclasses import replace
 from types import SimpleNamespace
 from datetime import timedelta
 
@@ -27,11 +26,7 @@ from shared_context.errors import Problem
 from test_behavior_api import BASE, METRICS, RuntimeHarness
 from test_m2_copilot import ScriptedEndpoint, runtime_path
 from test_m3_auth import HUMAN_OID, CLIENT_ID, jwk_client, signing_key
-
-
-def call(name, args, number):
-    return {"tool_calls": [{"index": 0, "id": f"call_{number}", "type": "function",
-                           "function": {"name": name, "arguments": json.dumps(args)}}]}
+from behavior_assistant_helpers import call
 
 
 @pytest.fixture
@@ -180,108 +175,6 @@ def test_only_explicit_human_admission_can_delegate_own_result(assistant, identi
     assert assistant.endpoint.requests == []
 
 
-@pytest.mark.parametrize("pause", [False, True])
-def test_native_protocol_reaches_actual_assistant_sdk_not_checksum(assistant, tmp_path, runtime_path, pause):
-    if pause:
-        require_cold_resume_paths(tmp_path)
-    from shared_context.behavior_assistant_hosted import AssistantHostedRuntime, AssistantSupervisor
-    from shared_context.behavior_foundry import (
-        FoundryExecutor, FoundryHttpClient, FoundryTarget, NativeExecutionGrant, NativeJobRoute,
-        NativeLaunchAuthority, native_key,
-    )
-    from shared_context.behavior_hosted import BehaviorExecutorClient, HostedInvocation
-    from shared_context.behavior_assistant import _LocalHttp
-    from pydantic import SecretStr
-
-    h = assistant
-    target = FoundryTarget(
-        executor_id=h.workers.contract.executor_id, project_endpoint="https://native.example/api/projects/test",
-        agent_id="11111111-1111-1111-1111-111111111111", agent_name="assistant",
-        agent_version="8", session_id="assistant-native-session", agent_oid=A.oid,
-    )
-    native = NativeLaunchAuthority(
-        h.workers, team_id=A.team, controller_id="internal-controller", targets=(target,),
-        jobs=(NativeJobRoute(job_id="job-one", api_binding_id="binding-one", grant_id="native-grant"),),
-        verifier_version=h.config.verifier_version, clock=lambda: h.time,
-    )
-    provider_id = None
-    native_starts = 0
-    host = None
-    if pause:
-        h.endpoint.replies = iter([
-            call("read_context", {}, 1),
-            call("save_result", {"item_count": 3, "completed_count": 2, "remaining_count": 1}, 2), {},
-            call("read_context", {}, 4),
-            call("save_result", {"item_count": 3, "completed_count": 2, "remaining_count": 1}, 5),
-            call("finish_task", {}, 6),
-        ])
-    def native_http(request):
-        nonlocal provider_id, native_starts
-        if request.method == "POST" and "x-client-behavior-launch-permit" in request.headers:
-            native_starts += 1
-            provider_id = f"inv_assistant_sdk_local_{native_starts}"
-            body = json.loads(request.content)
-            result = host.start(HostedInvocation(**body, launch_permit=SecretStr(
-                request.headers["x-client-behavior-launch-permit"])), provider_id, target.session_id)
-            return httpx.Response(202, json=result, headers={
-                "x-agent-invocation-id": provider_id, "x-agent-session-id": target.session_id,
-            })
-        report = host.observe(provider_id, target.session_id, request.headers["x-client-behavior-probe-id"])
-        return httpx.Response(200, json=report.model_dump(mode="json"), headers={
-            "x-agent-invocation-id": provider_id, "x-agent-session-id": target.session_id,
-        })
-    native_client = FoundryHttpClient(target, SimpleNamespace(get_token=lambda _: SimpleNamespace(token="SYNTHETIC_NATIVE")),
-                                     transport=httpx.MockTransport(native_http))
-    executor = FoundryExecutor(native, (native_client,))
-    h.workers.adapter = executor.adapter()
-    h.dep = replace(h.dep, native_launches=native)
-    h.runtime = AssistantRuntime(h.dep, (h.binding,), profiles=tuple(h.runtime.profiles.values()),
-                                 clock=lambda: h.time, mode="offline_contract", controller_id="internal-controller")
-    h.assistant = AssistantAuthority(h.runtime, h.artifacts, (A,))
-    h.app = create_assistant_app(h.assistant, h.verifier)
-    h.client = TestClient(h.app)
-    api = BehaviorExecutorClient(
-        "https://context.invalid", h.verifier.auth.audience,
-        SimpleNamespace(get_token=lambda _: SimpleNamespace(token=h.headers("agent")["Authorization"].removeprefix("Bearer "))),
-        transport=_LocalHttp(h.client),
-    )
-    supervisor = AssistantSupervisor(tmp_path / "native-host", runtime_path=runtime_path, model_transport=h.endpoint.transport)
-    host = AssistantHostedRuntime(wire.HostedIdentity(
-        agent_id=target.agent_id, agent_name=target.agent_name, agent_version=target.agent_version,
-        session_id=target.session_id,
-    ), supervisor, api, clock=lambda: h.time)
-    submit(h)
-    job = h.workers.inspect("job-one")
-    h.seed([(native_key("grant", "native-grant"), NativeExecutionGrant(
-        grant_id="native-grant", controller_id="internal-controller", owner=job.owner,
-        policy_revision=1, job_id="job-one", definition=h.binding.work,
-        input_digest=hashlib.sha256(job.spec.input).hexdigest(), targets=(target,),
-        active=True, remaining_uses=4, not_before=h.time - timedelta(minutes=1),
-        expires_at=h.time + timedelta(minutes=5), workload_version="assistant-v1.2",
-    ))])
-    try:
-        first = h.runtime.controller.step("binding-one")
-        assert first.state in {"starting", "running"}
-        supervisor.join(timeout=45)
-        complete = h.runtime.controller.step("binding-one")
-        if pause:
-            assert complete.state == "waiting_dependency"
-            original = h.artifacts.get(A, A.team, "assistant-report")
-            # A replacement supervisor has no private SDK files or old ticket.
-            supervisor = AssistantSupervisor(tmp_path / "replacement-native-host", runtime_path=runtime_path,
-                                             model_transport=h.endpoint.transport)
-            host = AssistantHostedRuntime(host.identity, supervisor, api, clock=lambda: h.time)
-            assert h.runtime.controller.step("binding-one").state == "starting"
-            supervisor.join(timeout=45)
-            complete = h.runtime.controller.step("binding-one")
-            assert h.artifacts.get(A, A.team, "assistant-report") == original
-        assert complete.state == "succeeded" and not complete.obligation_fulfilled
-        assert len(h.endpoint.requests) == (6 if pause else 3)
-    finally:
-        api.close()
-        native_client.close()
-
-
 def test_real_sdk_uses_ticket_bound_server_model_proxy_and_shared_root_budget(assistant):
     from shared_context.behavior_assistant_gateway import AssistantProvider
     h = assistant
@@ -412,37 +305,6 @@ def test_changed_result_cannot_replace_saved_artifact_on_resume(assistant, tmp_p
     h.executor.root = tmp_path / "replacement"
     assert h.runtime.controller.step("binding-one").state == "waiting_dependency"
     assert h.artifacts.get(A, A.team, "assistant-report") == original
-
-
-def test_real_sdk_rejects_self_goal_edits_and_can_finish_the_original_work(assistant):
-    from shared_context.behavior_effects import GOAL_REVIEW, WorkGoalUpdate
-    from test_behavior_api import CTX
-    h = assistant
-    submit(h)
-    before = h.adapter.inspect("work-one", CTX)
-    h.references["goal"] = WorkGoalUpdate(
-        work_id="work-one", obligation_id=h.binding.obligation_id, expected_etag=before.etag,
-        expected_definition_digest=before.definition_digest, goal=GOAL_REVIEW,
-    )
-    prepared = h.post("/operation/prepare", wire.OperationPrepare(request_id="prepare", input_ref="goal"), "agent")
-    assert prepared.status_code == 200, prepared.text
-    descriptor = prepared.json()["result"]
-    approval = wire.OperationApproval(
-        request_id="human-approval", decision_id="human-operation", description_digest=descriptor["description_digest"],
-        adapter_contract_digest=descriptor["adapter_contract_digest"], expires_at=h.time + timedelta(minutes=2),
-    )
-    assert h.post("/operation/approve", approval, "agent").status_code == 403
-    assert h.post("/operation/approve", approval).status_code == 200
-    h.endpoint.replies = iter([
-        call("execute_operation", {}, 1), call("execute_operation", {}, 2),
-        call("read_context", {}, 3),
-        call("save_result", {"item_count": 3, "completed_count": 2, "remaining_count": 1}, 4),
-        call("finish_task", {}, 5),
-    ])
-    assert h.runtime.controller.step("binding-one").state == "succeeded"
-    after = h.adapter.inspect("work-one", CTX)
-    assert after.definition_digest == before.definition_digest
-    assert len(h.endpoint.requests) == 5
 
 
 def test_revoked_source_cannot_reenter_model_through_a_cold_sdk_checkpoint(assistant, tmp_path):

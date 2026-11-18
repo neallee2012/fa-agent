@@ -512,3 +512,125 @@ def test_pinned_sdk_carries_the_first_turns_static_profile_only_in_history(monke
     # Turn 2 sends no second static read: the profile is present once, in turn 1's resumed user message.
     assert second_request.count("PROFILE-LIMA") == 1 and second_request.count(episode) == 2
     assert second_request.index("PROFILE-LIMA") < second_request.index("REPLY-1") < second_request.index("Second question.")
+
+
+def _offline_runtime(monkeypatch, runtime_path, name, answers):
+    """The isolation of the cases above (private HOME, loopback only), with one scripted completion per answer."""
+    root_value = os.environ.get("N1_NATIVE_WORKSPACE")
+    if not root_value:
+        pytest.fail("Set a session-private N1_NATIVE_WORKSPACE; never use the real user HOME.")
+    root = Path(root_value).resolve() / name
+    root.mkdir(parents=True, exist_ok=False)
+    for key in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"):
+        isolated = root / key.lower()
+        isolated.mkdir()
+        monkeypatch.setenv(key, str(isolated))
+    for key in ("GH_TOKEN", "GITHUB_TOKEN", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH",
+                "FOUNDRY_HOSTING_ENVIRONMENT", "FA_N0_STATE_PROBE", "FA_NATIVE_TURNS"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("COPILOT_SKIP_CLI_DOWNLOAD", "1")
+    monkeypatch.setenv("AGENTSERVER_TASKS_BACKEND", "local")
+    monkeypatch.setenv("AGENTSERVER_STATE_ROOT", str(root / "state"))
+    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", IDENTITY.session_id)
+    monkeypatch.setenv("FOUNDRY_AGENT_NAME", IDENTITY.agent_name)
+    import _socket
+
+    def deny_external(sock, address):
+        if not isinstance(address, tuple) or address[0] not in {"127.0.0.1", "::1"}:
+            raise AssertionError("The N1 native case may not open external network connections")
+        return _socket.socket.connect(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", deny_external)
+    url = "https://offline-fixture.services.ai.azure.com/api/projects/offline/openai/v1"
+    requests = []
+
+    def provider(request):
+        requests.append(json.loads(request.content))
+        assert len(requests) <= len(answers), "Only the planned model exchanges are allowed"
+        common = {"id": f"offline-{len(requests)}", "object": "chat.completion.chunk", "created": 1,
+                  "model": "OFFLINE-model"}
+        events = [
+            {**common, "choices": [{"index": 0, "delta": {"role": "assistant", "content": answers[len(requests) - 1]},
+                                    "finish_reason": None}]},
+            {**common, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {**common, "choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 2, "total_tokens": 11}},
+        ]
+        raw = "".join("data: " + json.dumps(event) + "\n\n" for event in events) + "data: [DONE]\n\n"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=raw.encode())
+
+    async def token():
+        return "OFFLINE-native-MI"
+
+    executor = NativeSdkExecutor(root=root / "run", runtime_path=runtime_path, api_url="https://api.offline.invalid",
+                                 model_url=url, token_provider=token, model_transport=httpx.MockTransport(provider))
+    runtime = NativeTurnRuntime(IDENTITY, executor, preflight=executor.preflight)
+    executor.reader = runtime
+    return runtime, requests
+
+
+def _native_turns(runtime):
+    """`turn(client, rid, cid, text, files=())` posts one native submit and returns its completed receipt."""
+    from shared_context.behavior_assistant_wire import InstructionSubmit
+    selected = capture().model_dump(mode="json")
+    selected["template"]["settings"]["model_provider"] = None
+    selected = NativeTurnCapture.model_validate_json(json.dumps(selected))
+
+    async def finished(rid):
+        while (value := await runtime.read(rid)).status not in {"completed", "unknown", "busy_refused"}:
+            await asyncio.sleep(0.02)
+        return value
+
+    def turn(client, rid, cid, text, files=()):
+        command = InstructionSubmit(request_id=rid, conversation_id=cid, content=text, files=files)
+        posted = client.post("/invocations", json=NativeSubmit(command=command, capture=selected).model_dump(mode="json"),
+                             headers={"x-client-fa-state-profile": NATIVE_STATE_PROFILE,
+                                      "x-agent-session-id": IDENTITY.session_id,
+                                      "x-agent-invocation-id": "OFFLINE-" + rid,
+                                      "x-agent-foundry-call-id": "OFFLINE-call-" + rid})
+        assert posted.status_code == 202, posted.text
+
+        async def bounded():
+            return await asyncio.wait_for(finished(rid), timeout=60)
+
+        receipt = client.portal.call(bounded)
+        assert receipt.status == "completed", receipt.failure_code
+        return receipt
+
+    return turn
+
+
+def test_pinned_sdk_keeps_interleaved_conversations_and_a_follow_up_separate(monkeypatch, runtime_path):
+    alpha_text, bravo_text, follow_text = "ROUTING_ALPHA_QUESTION", "ROUTING_BRAVO_QUESTION", "ROUTING_ALPHA_FOLLOW_UP"
+    alpha_answer, bravo_answer, follow_answer = "ROUTING_ALPHA_ANSWER", "ROUTING_BRAVO_ANSWER", "ROUTING_FOLLOW_UP_ANSWER"
+    runtime, requests = _offline_runtime(monkeypatch, runtime_path, "interleaved",
+                                         [alpha_answer, bravo_answer, follow_answer])
+    turn = _native_turns(runtime)
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
+        alpha = turn(client, "rid-alpha", None, alpha_text)
+        bravo = turn(client, "rid-bravo", None, bravo_text)
+        follow = turn(client, "rid-follow", alpha.conversation_id, follow_text)
+    assert len({alpha.conversation_id, bravo.conversation_id}) == 2 and follow.conversation_id == alpha.conversation_id
+    seen = [json.dumps(body["messages"], ensure_ascii=False) for body in requests]
+    assert alpha_text in seen[0] and bravo_text in seen[1] and follow_text in seen[2]
+    assert alpha_text not in seen[1] and alpha_answer not in seen[1]
+    assert alpha_text in seen[2] and alpha_answer in seen[2]
+    assert bravo_text not in seen[2] and bravo_answer not in seen[2]
+
+
+def test_pinned_sdk_sends_a_literal_file_as_user_data_and_resumes_it(monkeypatch, runtime_path):
+    from shared_context import m2_copilot
+    from shared_context.behavior_text_files import UserTextFile
+    file = UserTextFile(name="data.csv", text="  USER_FILE_CANARY\r\n名稱,數值\n範例,42\n")
+    runtime, requests = _offline_runtime(monkeypatch, runtime_path, "literal-file", ["Value is 42.", "It was 42."])
+    turn = _native_turns(runtime)
+    with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
+        first = turn(client, "rid-file", None, "Read the uploaded text without using tools.", (file,))
+        second = turn(client, "rid-file-follow", first.conversation_id, "What value was in the original file?")
+    assert second.conversation_id == first.conversation_id
+    block = m2_copilot._TEXT_FILES_HEADER + "\n" + m2_copilot._text_file_block(file.name, file.text)
+    seen = [json.dumps(body["messages"], ensure_ascii=False) for body in requests]
+    assert json.dumps(block, ensure_ascii=False)[1:-1] in seen[0]
+    for body in requests:
+        carrying = [m for m in body["messages"] if "USER_FILE_CANARY" in json.dumps(m, ensure_ascii=False)]
+        assert carrying and all(m["role"] == "user" for m in carrying)
+    assert "What value was in the original file?" in seen[1] and "Value is 42." in seen[1]

@@ -4,7 +4,9 @@ The provider is scripted. This is not a Hosted deployment or real-model quality 
 """
 
 import asyncio
+import copy
 from dataclasses import replace
+import hashlib
 import json
 import threading
 import time
@@ -22,7 +24,7 @@ from sdk_checkpoint_local import sse
 from test_m2_copilot import runtime_path
 from test_native_turn_wire import capture, submit
 from test_native_turns import harness, local_env, native_retry_policy
-from test_skill_isolation_native import child_environment
+from skill_isolation_native_helpers import child_environment
 from test_instruction_responses_native import response_bytes
 
 
@@ -666,3 +668,151 @@ def test_a_task_call_denied_before_it_started_says_so_and_its_same_retry_runs(
     assert receipt.status == "completed", receipt.failure_code
     assert harness.call(bridges[0].read, "call-teas-2").result == ANSWERS["teas"]
     assert len(parents) == 3 and len(children) == 1
+
+
+# The native event seam for one original child (no SDK process): the SDK events FA observes, the original effect store.
+CHILD_CALL, CHILD_AGENT = "native-child-call", "native-child-agent"
+
+
+def child_case(tmp_path):
+    from types import SimpleNamespace
+
+    from shared_context.behavior_native_turn_wire import NativeReceipt
+    from shared_context.native_capabilities import NativeCapabilityContext
+    from shared_context.native_delegation import NativeDelegationRuntime
+    from shared_context.native_turns import NativeTurnControl
+    from test_native_capabilities import selected_capture
+    from test_native_hitl_h2 import SID, EffectRuntime
+
+    command = submit("rid-one").command
+    captured = selected_capture(CAPABILITY_ID)
+    submitted = NativeSubmit(command=command, capture=captured)
+    receipt = NativeReceipt(state_profile=submitted.state_profile, agent_id="native-a", hosted_session_id="hosted-one",
+                            conversation_id="cid-one", request_id="rid-one", command=command, capture=captured,
+                            submit_digest=submitted.sha256, capture_digest=captured.sha256, status="started",
+                            turn_number=1)
+    runtime = EffectRuntime(receipt)
+    context = NativeCapabilityContext(
+        receipt=receipt, scope=SimpleNamespace(sdk_session_id=SID, agent_id="native-a", conversation_id="cid-one"),
+        control=NativeTurnControl(), root=tmp_path, turn_root=tmp_path, runtime=runtime, model=None,
+        api_url="https://api.offline.invalid", api_token_provider=None, model_token_provider=lambda: "OFFLINE")
+    return runtime, NativeDelegationRuntime(context), SID
+
+
+def task_start(delegate, arguments):
+    delegate.observe({"type": "tool.execution_start", "data": {
+        "tool_name": "task", "tool_call_id": CHILD_CALL, "arguments": arguments}})
+
+
+async def running_child(delegate, sid):
+    task_start(delegate, TASK)
+    allowed = await delegate.pre_tool({"toolName": "task", "toolArgs": TASK, "sessionId": sid}, {"session_id": sid})
+    assert allowed["permissionDecision"] == "allow"
+    delegate.observe({"type": "subagent.started", "id": "child-start", "agentId": CHILD_AGENT,
+                      "data": {"toolCallId": CHILD_CALL, "agentName": CAPABILITY_ID}})
+    await delegate.drain()
+    return await delegate.read(CHILD_CALL)
+
+
+def child_message(delegate, text, *, tool_requests=()):
+    delegate.observe({"type": "assistant.message", "id": "child-message", "agentId": CHILD_AGENT,
+                      "data": {"content": text, "toolRequests": list(tool_requests)}})
+
+
+@pytest.mark.parametrize(("text", "ended_in_tool_call"), [
+    (None, False), (" \n", False), ("Only the unfinished tool call.", True),
+])
+def test_an_empty_or_tool_ending_child_completion_is_incomplete_not_completed(tmp_path, text, ended_in_tool_call):
+    runtime, delegate, sid = child_case(tmp_path)
+
+    async def check():
+        await running_child(delegate, sid)
+        child_message(delegate, text, tool_requests=[{"name": "read_user_turn"}] if ended_in_tool_call else ())
+        delegate.observe({"type": "subagent.completed", "id": "child-end", "agentId": CHILD_AGENT,
+                          "data": {"toolCallId": CHILD_CALL}})
+        await delegate.drain()
+        return await delegate.read(CHILD_CALL)
+
+    value = asyncio.run(check())
+    assert (value.status, value.failure_code, value.result) == ("incomplete", "DELEGATION_RESULT_INCOMPLETE", text)
+    [record] = runtime.store.items.values()
+    assert record.value["status"] == "done"
+
+
+@pytest.mark.parametrize("override", [
+    {"agent_type": "general-purpose"}, {"mode": "background"}, {"model": "configured-second-model"},
+    {"model": None}, {"reasoning_effort": "high"}, {"context_tier": "long_context"}, {"prompt": " \n"},
+])
+def test_a_task_call_with_extra_capabilities_is_refused_before_any_child_reservation(tmp_path, override):
+    runtime, delegate, sid = child_case(tmp_path)
+    arguments = {**TASK, **override}
+
+    async def check():
+        task_start(delegate, arguments)
+        return await delegate.pre_tool({"toolName": "task", "toolArgs": arguments, "sessionId": sid},
+                                       {"session_id": sid})
+
+    refusal = asyncio.run(check())
+    assert refusal["permissionDecision"] == "deny"
+    assert "[unsupported_arguments]" in refusal["permissionDecisionReason"]
+    assert runtime.store.items == {} and not delegate.children
+
+
+@pytest.mark.parametrize("text", [
+    "x" * (4 * 1024 * 1024 + 1),
+    "".join(hashlib.sha256(str(number).encode()).hexdigest() for number in range(1400)),
+], ids=["raw-byte-limit", "compressed-byte-limit"])
+def test_an_oversized_child_result_is_refused_without_truncation_or_a_completed_state(tmp_path, text):
+    from shared_context.behavior_delegation_wire import DelegationObservation
+    from shared_context.errors import Problem
+
+    runtime, delegate, sid = child_case(tmp_path)
+
+    async def check():
+        original = await running_child(delegate, sid)
+        before = copy.deepcopy(runtime.store.items)
+        with pytest.raises(Problem) as denied:
+            await delegate.call("observe", DelegationObservation(
+                event_id="child-end", tool_call_id=CHILD_CALL, kind="result", child_agent_id=CHILD_AGENT,
+                outcome="completed", text=text))
+        assert runtime.store.items == before
+        return original, denied.value, await delegate.read(CHILD_CALL)
+
+    original, denied, after = asyncio.run(check())
+    assert (denied.status, denied.body["error"]["code"]) == (413, "DELEGATION_RESULT_LIMIT")
+    assert after == original and after.status == "running" and after.result is None
+
+
+@pytest.mark.parametrize("first_proof", ["child", "parent"])
+def test_a_native_child_stop_is_confirmed_only_by_both_the_cancelled_child_and_the_idle_parent(tmp_path, first_proof):
+    runtime, delegate, sid = child_case(tmp_path)
+    child = {"type": "subagent.completed", "id": "child-cancelled", "agentId": CHILD_AGENT,
+             "data": {"toolCallId": CHILD_CALL, "cancelled": True}}
+    parent = {"type": "session.idle", "id": "parent-idle", "data": {"aborted": True}}
+    first, second = (child, parent) if first_proof == "child" else (parent, child)
+
+    async def check():
+        await running_child(delegate, sid)
+        child_message(delegate, "Original partial public output.")
+        await delegate.request_cancel()
+        ack = await delegate.read(CHILD_CALL)
+        assert ack.status == "unknown" and ack.cancel_requested and not ack.stop_confirmed
+        delegate.observe(first)
+        await delegate.drain()
+        pending = await delegate.read(CHILD_CALL)
+        assert pending.status == "unknown" and not pending.stop_confirmed
+        assert (pending.child_cancelled, pending.parent_idle) == (first is child, first is parent)
+        delegate.observe(second)
+        await delegate.drain()
+        stopped = await delegate.read(CHILD_CALL)
+        saved = copy.deepcopy(runtime.store.items)
+        delegate.observe(child)
+        delegate.observe(parent)
+        await delegate.drain()
+        assert runtime.store.items == saved
+        return stopped, await delegate.read(CHILD_CALL)
+
+    stopped, again = asyncio.run(check())
+    assert stopped.status == "cancelled" and stopped.stop_confirmed
+    assert stopped.child_cancelled and stopped.parent_idle and stopped.cancel_requested
+    assert stopped.result == "Original partial public output." and again == stopped

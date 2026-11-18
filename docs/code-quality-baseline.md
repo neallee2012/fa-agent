@@ -173,7 +173,7 @@ Neal 2026-10-28 核准一次做完第二輪「未處理／後續」的前 6 項�
 
 **保留不刪的（#1038；`RuntimeTransition` 與 `original_failure` mode 已在第四輪處理）**：
 
-- `ClaimedSdkRecovery`：正式程式沒有建立點，但 7 個不被跳過的測試檔建立它，產出的資料交給正式程式會跑的 `validate_recovery_history` 驗證。
+- `ClaimedSdkRecovery`：（第十七輪已刪）原先的保留理由是它的產出要交給正式驗證器 `validate_recovery_history`，但那個驗證器已在 #1089 刪掉；之後只剩 `verify_platform_stop` 會讀它寫的列。第十七輪第一個 commit 先把它和 `behavior_recovery_history.py` 搬到測試輔助（正式程式 −881 行），第二個 commit 讓 `verify_platform_stop` 的兩個呼叫點（`NativeLaunchAuthority.verify`、`reconcile_sealed`）對 `platform-stop-evidence` 改成和 #1062 相同的明確拒絕（403 `NATIVE_EVIDENCE_INVALID`／`NATIVE_TERMINAL_INVALID`），並刪掉整支 `behavior_recovery.py`、測試輔助與 10 個只測它的測試檔。這種列只可能來自 2026-09 的手動 recovery；stage 是 10-04 建的、dev 在 10-30 全新安裝，所以推測沒有，但沒有查表確認。
 - `RuntimeTransition`：當時正式的 `RuntimeRotation` 借用它的 `_parse`／`_operator`／`_changes`／`_fresh`（第四輪 #1046 改成模組函式，類別已移出正式碼）。
 - adapter 的 `original_failure` mode：當時 `web_test_console/bridge.py:288` 還會建立 `OriginalFailureAdapter`（第四輪 #1044 已刪）。
 
@@ -197,7 +197,7 @@ Neal 2026-10-28 核准一次做完第二輪「未處理／後續」的前 6 項�
 
 - **`pytest --collect-only` 的 SKIPPED 行會揭露從沒跑過的測試**：#1037 就是由 `SKIPPED [7] test_web_first_backend.py:5` 看出 7 個模組只因為 import 一個不存在的模組而整個被跳過。
 - **歷史驗證的竄改測試要連 hash 一起偽造**：直接改一列已保存的 row，只會被通用的 row／receipt hash 檢查擋下，測試名稱看起來像在測規則，其實一直停在那一關（#1039 的 `history_forgery`）。
-- **「正式程式不建立」不等於可刪**：產出被正式驗證器讀取、或被正式類別借用的，要保留（`ClaimedSdkRecovery`；`RuntimeTransition` 當時也屬此類，第四輪先把借用的方法改成模組函式才移出）；#1038 只刪確認沒有任何建立點、也沒有驗證器依賴的。
+- **「正式程式不建立」不等於可刪**：產出被正式驗證器讀取、或被正式類別借用的，要保留（`ClaimedSdkRecovery` 當時屬此類，#1089 刪掉驗證器後就不再成立；`RuntimeTransition` 當時也屬此類，第四輪先把借用的方法改成模組函式才移出）；#1038 只刪確認沒有任何建立點、也沒有驗證器依賴的。
 
 ## 第四輪結果（2026-10-29）
 

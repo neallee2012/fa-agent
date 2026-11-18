@@ -13,7 +13,8 @@ from test_agent_message_api import message_turn
 from test_agent_message_continuation import save_peer
 from test_agent_runtime import peer_runtime
 from test_agent_runtime_routing import agent_headers, routing_peer
-from test_conversation_transfer_startup import claimed_turn, read_startup, synthetic_standing_v1
+from test_conversation_transfer_startup import claimed_turn, synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
 from test_instruction_flow import instruction_models
 from test_lost_session_closure import LostHostedClient
 from test_m3_auth import jwk_client, signing_key

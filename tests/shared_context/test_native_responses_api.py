@@ -15,7 +15,7 @@ from shared_context.errors import Problem
 from test_agent_versions import Foundry, REAL_CURRENT
 from test_native_turn_api import native_api, PREFIX as NATIVE_PREFIX
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 
 

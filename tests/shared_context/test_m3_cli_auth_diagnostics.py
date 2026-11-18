@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from test_operation_rejection_cli import cold_cli
+from cold_cli_helpers import cold_cli
 
 
 @pytest.mark.parametrize("namespace", ["azure", "msal"])

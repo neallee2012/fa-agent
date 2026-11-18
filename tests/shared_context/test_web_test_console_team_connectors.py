@@ -13,7 +13,8 @@ from web_test_console.adapter import ConsoleError, PullAdapter
 from web_test_console.team_connectors import TeamConnectors, install_team_connector_routes, is_connector_write
 from test_m3_auth import jwk_client, signing_key  # fixtures used by connectors
 from test_team_connector_api import SECRET, connectors
-from test_web_test_console_frozen_interface import real_interface
+from assistant_api_helpers import assistant_api, picker_api
+from instruction_flow_helpers import instruction_models
 
 DISCLOSURE = "Microsoft Teams 經 Work IQ 連線。Agent 能讀取的不只 Teams，也可能包含你的 Microsoft 365 郵件與檔案。"
 AGENT_ORIGIN = "http://agent-api.test"
@@ -219,8 +220,8 @@ def test_an_agent_switch_is_read_only_without_approve_and_refuses_a_reply_for_an
     assert mismatch.value.code == "AGENT_CONNECTORS_RESPONSE_INVALID"
 
 
-def test_bridge_admits_only_bounded_csrf_checked_connector_writes(real_interface):
-    c = real_interface
+def test_bridge_admits_only_bounded_csrf_checked_connector_writes(picker_api):
+    c = picker_api
     ui, headers = c.browser.ui, c.browser.headers
     for path, body, code in (("/api/team-connectors/changes", command("f" * 32, None), "TEAM_CONNECTOR_INPUT_INVALID"),
                              ("/api/agent-connectors", switch("f" * 32, 0, ["teams"]), "AGENT_CONNECTORS_INPUT_INVALID")):

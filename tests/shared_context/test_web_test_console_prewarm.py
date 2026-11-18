@@ -13,7 +13,8 @@ from web_test_console.agent_connections import AgentConnections
 from web_test_console.bridge import create_app
 from test_m3_auth import jwk_client, signing_key
 from test_web_test_console_agents import connection_file, directory_payload
-from test_web_test_console_frozen_interface import real_interface
+from assistant_api_helpers import assistant_api, picker_api
+from instruction_flow_helpers import instruction_models
 
 ORIGIN = "http://127.0.0.1:8875"
 AGENT = {"X-Console-Agent": "agent-one"}
@@ -21,8 +22,8 @@ PATH = "/agents/agent-one/work-policy/v1/native-turns/prewarm"
 
 
 @pytest.fixture
-def console(real_interface, tmp_path):
-    c = real_interface
+def console(picker_api, tmp_path):
+    c = picker_api
     connections = AgentConnections.model_validate_json(connection_file(c, tmp_path).path.read_bytes())
     replies, seen = {"status": 200, "body": {"state": "sent", "toolboxes": 2}}, []
 

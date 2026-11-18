@@ -275,9 +275,8 @@ def test_before_the_seed_only_runtime_fields_may_be_missing(azd_profile):
 
 
 def test_profile_passes_the_ci_pre_build_checks(profile_file, monkeypatch):
-    monkeypatch.setenv("FA_DEPLOY_CONFIG", str(profile_file))
     ci = load("ci_deploy_azd", ROOT / "deploy" / "stage" / "ci_deploy.py")
-    ci.STAGE = ci.load_config(profile_file)
+    ci.use_profile(profile_file)
     overlay = ci.hosted_environment()
     assert set(overlay) == {ci.STAGE["agents"][0]["agent_id"], ci.STAGE["agents"][1]["agent_id"]}
     # Mid-conversation model switch on for both assistants, like stage A/B since release 29 (coordinator 2026-10-15).
@@ -293,8 +292,7 @@ def test_profile_passes_the_ci_pre_build_checks(profile_file, monkeypatch):
         agent.pop("agent_id"), agent.pop("agent_oid")
     early_file = profile_file.with_name("early.json")
     early_file.write_text(json.dumps(early), encoding="utf-8")
-    monkeypatch.setenv("FA_DEPLOY_CONFIG", str(early_file))
-    load("ci_deploy_azd_early", ROOT / "deploy" / "stage" / "ci_deploy.py")
+    load("ci_deploy_azd_early", ROOT / "deploy" / "stage" / "ci_deploy.py").use_profile(early_file, require_runtime=False)
 
 
 def test_a_first_install_passes_the_2di_turn_on_checks_and_a_serving_api_without_p6_does_not(profile_file,
@@ -304,9 +302,8 @@ def test_a_first_install_passes_the_2di_turn_on_checks_and_a_serving_api_without
     whose revision never got ready. An environment that already serves an API without P5+P6 is still refused.
     The expected not-found prints nothing (the azd e2e run 2026-10-21 showed az's raw "ERROR: Not Found" line); a
     failed read of an app that exists still shows az's error."""
-    monkeypatch.setenv("FA_DEPLOY_CONFIG", str(profile_file))
     ci = load("ci_deploy_azd_first", ROOT / "deploy" / "stage" / "ci_deploy.py")
-    ci.STAGE = ci.load_config(profile_file)
+    ci.use_profile(profile_file)
     assert ci.STAGE["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] == "1"
     ci.check()
 
@@ -350,7 +347,6 @@ def test_a_first_install_passes_the_2di_turn_on_checks_and_a_serving_api_without
 
 
 def runtime(profile_file, tmp_path, monkeypatch):
-    monkeypatch.setenv("FA_DEPLOY_CONFIG", str(profile_file))
     make_runtime = load("make_runtime_azd", ROOT / "deploy" / "stage" / "make_runtime.py")
     monkeypatch.setattr(sys, "argv", ["make_runtime.py", "--config", str(profile_file),
                                       "--out", str(tmp_path / "runtime")])
@@ -410,8 +406,8 @@ def test_plan_rebuilt_from_the_job_log_has_the_jobs_hash(profile_file, tmp_path,
 
 def test_the_log_wait_says_it_is_waiting_and_keeps_saying_so(profile_file, tmp_path, monkeypatch, capsys):
     # azd new-user test 2026-10-15 #6: a new workspace took 5-15 min to ingest and the wait printed nothing.
-    monkeypatch.setenv("FA_DEPLOY_CONFIG", str(profile_file))
     fresh = load("run_fresh_job_wait", ROOT / "deploy" / "stage" / "run_fresh_job.py")
+    fresh.STAGE = fresh.load_config(profile_file)
     clock = [0.0]
     monkeypatch.setattr(fresh.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(fresh.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))

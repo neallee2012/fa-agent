@@ -1,18 +1,15 @@
 """A saved original final wakes a paused observer; no native process or model."""
 
 import asyncio
-from types import SimpleNamespace
 
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
 from shared_context import behavior_assistant_wire as aw
-from shared_context.behavior_api import _install_error_handlers
-from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.sdk_pin import RUNTIME_VERSION
-from test_conversation_transfer_startup import claimed_turn, read_startup, saved_turn, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from test_conversation_transfer_startup import claimed_turn, saved_turn, synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 
@@ -24,81 +21,6 @@ def observer_case(request):
     finally:
         if not loop.is_closed():
             loop.close()
-
-
-def test_progress_only_restarts_original_observer_when_its_final_is_saved(observer_case, signing_key, monkeypatch):
-    from shared_context import behavior_work_policy_api
-    clock = [1000.0]
-    monkeypatch.setattr(behavior_work_policy_api, "monotonic", lambda: clock[0], raising=False)
-    c, loop = observer_case
-    opened = claimed_turn(c, "paused-original-turn")
-    binding = opened.binding
-    calls = []
-    app = FastAPI()
-    _install_error_handlers(app)
-    composition = SimpleNamespace(runtime=c.h.runtime, verifier=c.h.composition.verifier,
-        config=c.h.config, assistant=SimpleNamespace(authority=c.authority), installation=lambda: None)
-    install_work_policy_routes(app, composition, start_work=calls.append)
-    cid = opened.assignment.task.instruction.conversation_id
-    path = f"/work-policy/v1/conversations/{cid}"
-    headers = c.h.headers(signing_key, "Behavior.Read")
-    with TestClient(app, backend_options={"loop_factory": lambda: loop}) as client:
-        before = c.h.runtime.store._guard()
-        current = client.get(path, headers=headers)
-        assert current.status_code == 200, current.text
-        assert calls == [] and c.h.runtime.store._guard() == before
-        stop = aw.SdkStop(runtime_version=RUNTIME_VERSION, pid=99, exit_code=0, graceful=True)
-        c.authority.save_text_reply(opened.session, aw.SaveTextReply(
-            request_id="save-text-reply", sdk_stop=stop,
-            archive=aw.ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE"),
-            reply=aw.TextReply(text="Original saved answer.", sdk_session_id=opened.assignment.sdk_session_id,
-                conversation_id=cid, turn_number=1)), opened.agent)
-        job = c.h.runtime.dep.workers.inspect(binding.job_id)
-        assert not job.result_forwarded and c.native.pending_completion_observation(job)
-        wrong = job.model_copy(update={"binding": job.binding.model_copy(update={"job_id": "other-original-job"})})
-        assert not c.native.pending_completion_observation(wrong)
-        before = c.h.runtime.store._guard()
-        current = client.get(path, headers=headers)
-        assert current.status_code == 200, current.text
-        assert calls == [binding.binding_id] and c.h.runtime.store._guard() == before
-        for _ in range(4):
-            assert client.get(path, headers=headers).status_code == 200
-        assert calls == [binding.binding_id] and c.h.runtime.store._guard() == before
-        interval = c.h.runtime.dep.delivery.contract.review_interval_seconds
-        clock[0] += interval - 1
-        assert client.get(path, headers=headers).status_code == 200
-        assert calls == [binding.binding_id]
-        clock[0] += 1
-        assert client.get(path, headers=headers).status_code == 200
-        assert calls == [binding.binding_id, binding.binding_id]
-        clock[0] += 2 * interval
-        for _ in range(4):
-            assert client.get(path, headers=headers).status_code == 200
-        assert calls == [binding.binding_id, binding.binding_id]
-        assert c.h.runtime.store._guard() == before
-        assert not c.native.pending_completion_observation(job.model_copy(update={"result_forwarded": True}))
-    assert c.sessions.calls == []
-
-
-def test_accepted_cancel_wakes_the_original_paused_observer(observer_case, signing_key):
-    c, loop = observer_case
-    opened = claimed_turn(c, "cancel-paused-original")
-    binding = opened.binding
-    calls = []
-    app = FastAPI()
-    _install_error_handlers(app)
-    composition = SimpleNamespace(runtime=c.h.runtime, verifier=c.h.composition.verifier,
-        config=c.h.config, assistant=SimpleNamespace(authority=c.authority), installation=lambda: None)
-    install_work_policy_routes(app, composition, start_work=calls.append)
-    with TestClient(app, backend_options={"loop_factory": lambda: loop}) as client:
-        result = client.post(f"/work-policy/v1/bindings/{binding.binding_id}/cancel",
-            json={"request_id": "cancel-this-original"}, headers=c.h.headers(signing_key, "Behavior.Read"))
-        assert result.status_code == 200, result.text
-        assert result.json()["result"]["cancel_accepted"] is True
-        assert calls == [binding.binding_id]
-        job = c.h.runtime.dep.workers.inspect(binding.job_id)
-        assert job.cancel_requested and job.stop_credit
-    assert c.sessions.calls == []
 
 
 def test_ready_callback_can_observe_only_the_persisted_original_result(observer_case, signing_key):
@@ -121,7 +43,7 @@ def test_ready_callback_can_observe_only_the_persisted_original_result(observer_
         notifications.append((binding_id, reply.sha256))
     app = create_assistant_app(c.authority, c.h.composition.verifier,
                                provider=c.h.composition.assistant.provider, on_result_ready=ready)
-    from test_agent_runtime_routing import agent_headers
+    from agent_runtime_routing_helpers import agent_headers
     headers = {**agent_headers(c, signing_key, 0),
                "x-behavior-assistant-ticket": opened.ticket.get_secret_value()}
     prefix = f"/behavior/v1/bindings/{opened.binding.binding_id}/assistant/sessions/{opened.assignment.session_id}"

@@ -10,7 +10,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from shared_context.behavior_assistant import _LocalHttp
+from local_http_helpers import _LocalHttp
 from shared_context.behavior_inbox import INBOX_VERSION
 from shared_context.behavior_native_turn_wire import NativeReceipt
 from web_test_console.instructions import NATIVE_LANE as NATIVE_STATE_PROFILE  # the lane label
@@ -18,11 +18,11 @@ from shared_context.behavior_assistant_wire import InstructionSubmit
 from web_test_console.adapter import ConsoleError, canonical, parse_config, sha
 from web_test_console.bridge import Journal, create_app
 from web_test_console.instructions import InstructionConnection, InstructionStore
-from test_web_test_console_standing import configuration
+from web_test_console_standing_helpers import configuration
 from test_native_turn_api import native_api
 from test_native_turn_wire import agent_receive
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 
@@ -1131,8 +1131,6 @@ def test_uploads_are_refused_locally_on_the_job_bound_lane_before_any_write(nati
     c = native_console
     draft = first(c)
     monkeypatch.setattr(c.ui.console, "native_request", lambda _rid: None)
-    monkeypatch.setattr(c.ui.console.instructions, "prepare",
-                        lambda *_a, **_k: pytest.fail("uploads must be refused before the job-bound lane writes"))
     before = len(c.calls)
     refused = put_file(c, draft["request_id"], b"a,b\n")
     assert refused.status_code == 409 and refused.json()["error"]["code"] == "USER_UPLOADS_UNSUPPORTED"
@@ -1140,7 +1138,7 @@ def test_uploads_are_refused_locally_on_the_job_bound_lane_before_any_write(nati
                  "media_type": "text/csv"}
     sent = post(c, "/api/instructions/" + draft["request_id"] + "/submit",
                 {"content": "Read it.", "model": "gpt-4.1-mini", "uploads": [reference]})
-    assert sent.status_code == 409 and sent.json()["error"]["code"] == "USER_UPLOADS_UNSUPPORTED"
+    assert sent.status_code == 403 and sent.json()["error"]["code"] == "ACTION_NOT_ALLOWED"
     assert not [call for call in c.calls[before:] if call[0] in {"POST", "PUT"}]
 
 
@@ -1167,8 +1165,6 @@ def test_images_are_refused_locally_on_the_job_bound_lane_before_any_write(nativ
     draft = first(c)
     # The job-bound lane: this request is not routed to a native thread.
     monkeypatch.setattr(c.ui.console, "native_request", lambda _rid: None)
-    monkeypatch.setattr(c.ui.console.instructions, "prepare",
-                        lambda *_a, **_k: pytest.fail("images must be refused before the job-bound lane writes"))
     before = len(c.calls)
     upload = post(c, "/api/instructions/" + draft["request_id"] + "/image-upload",
                   {"name": "photo.png", "png_base64": encoded()})
@@ -1178,7 +1174,7 @@ def test_images_are_refused_locally_on_the_job_bound_lane_before_any_write(nativ
                  "media_type": "image/png"}
     sent = post(c, "/api/instructions/" + draft["request_id"] + "/submit",
                 {"content": "Describe it.", "model": "gpt-4.1-mini", "images": [reference]})
-    assert sent.status_code == 409 and sent.json()["error"]["code"] == "USER_IMAGES_UNSUPPORTED"
+    assert sent.status_code == 403 and sent.json()["error"]["code"] == "ACTION_NOT_ALLOWED"
     assert not [call for call in c.calls[before:] if call[0] == "POST"]
 
 

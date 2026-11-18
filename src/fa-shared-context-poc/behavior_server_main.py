@@ -2,7 +2,7 @@
 
 Mount BEHAVIOR_SERVER_CONFIG and its current evidence catalog as trusted
 read-only files. Recovery uses BEHAVIOR_RECOVERY_CONFIG and a separate identity.
-The API image accepts serve/probe/recovery/controller/bootstrap. The Hosted image
+The API image accepts serve/probe/recovery/bootstrap. The Hosted image
 uses hosted-bootstrap, then execs the existing constrained serve module.
 """
 
@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import sys
 from pathlib import Path
 
@@ -80,11 +79,11 @@ def main():
         return
     from shared_context.behavior_server_config import (
         BootstrapAuthorization, NativeEvidenceBundle, RecoveryCatalog, RecoveryConfiguration,
-        ProjectionInstallationEvidence, ServerConfiguration, SupervisorLimits, TokenizerConfiguration,
+        ProjectionInstallationEvidence, ServerConfiguration, TokenizerConfiguration,
         load_configuration, read_document, synthetic_configuration,
     )
     from shared_context.memory_projection import ProjectionSetup
-    from shared_context.behavior_server import bootstrap, build_server, run_controller
+    from shared_context.behavior_server import bootstrap, build_server
     from shared_context.errors import Problem
 
     parser = argparse.ArgumentParser(description="FA native behavior composition (no resource/RBAC provisioning)")
@@ -103,12 +102,6 @@ def main():
     boot = sub.add_parser("bootstrap")
     boot.add_argument("--stage", choices=("records", "worker", "activate"), required=True)
     boot.add_argument("--authorization", type=Path, required=True)
-    controller = sub.add_parser("controller")
-    controller.add_argument("--preactivation", action="store_true")
-    controller.add_argument("--ticks", type=int)
-    controller.add_argument("--page-limit", type=int)
-    controller.add_argument("--interval-seconds", type=float)
-    controller.add_argument("--max-run-seconds", type=float)
     for command in sub.choices.values():
         command.add_argument("--config", type=Path, default=argparse.SUPPRESS)
         command.add_argument("--evidence", type=Path, default=argparse.SUPPRESS,
@@ -145,29 +138,6 @@ def main():
             approval = read_document(args.authorization, BootstrapAuthorization)
             with build_server(config) as composition:
                 print(json.dumps(bootstrap(composition, approval, stage=args.stage), separators=(",", ":")))
-        else:
-            config = load_configuration()
-            values = config.supervisor.model_dump()
-            for field in values:
-                value = getattr(args, field)
-                if value is not None:
-                    values[field] = value
-            limits = SupervisorLimits(**values)
-            stopped = False
-
-            def stop(_signum, _frame):
-                nonlocal stopped
-                stopped = True
-
-            prior = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
-            try:
-                with build_server(config) as composition:
-                    result = run_controller(composition, limits=limits, preactivation=args.preactivation,
-                                            stop_requested=lambda: stopped)
-                print(json.dumps(result, separators=(",", ":")))
-            finally:
-                for sig, handler in prior.items():
-                    signal.signal(sig, handler)
     except (Problem, ValueError, OSError):
         # Raw provider/config payloads can contain secrets; CLI failures never echo them.
         raise SystemExit("BEHAVIOR_SERVER_CONFIGURATION_OR_DEPENDENCY_UNAVAILABLE") from None

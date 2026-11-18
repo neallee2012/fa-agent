@@ -10,7 +10,6 @@ from datetime import timedelta
 
 import pytest
 
-from shared_context import behavior_wire as wire
 from shared_context.behavior_delivery import _digest, _material
 from shared_context.behavior_foundry import _NativeLaunch, native_key
 from shared_context.behavior_inbox import InboxFetch, VerifiedInboxAccess
@@ -21,21 +20,17 @@ from shared_context.behavior_settlement import (
 from shared_context.behavior_store import ControlRequest
 from shared_context.behavior_workers import ExecutorBinding, ExecutorEvidence, ExecutorStart, worker_key
 from shared_context.errors import Problem
-from test_behavior_server import Harness as NativeHarness
+from legacy_submit_rows_helpers import native_submitted
 from test_behavior_settlement import OfflineProtection, ack_command, approve, fetch_command, human, terminal, write
 from test_m3_auth import jwk_client, signing_key
 
 
 @pytest.fixture
-def native_retained(tmp_path, jwk_client, request):
-    h = NativeHarness(tmp_path, jwk_client)
+def native_retained(tmp_path, jwk_client, request, monkeypatch):
+    h = native_submitted(tmp_path, jwk_client, monkeypatch)
     try:
-        h.activate()
         runtime, binding = h.runtime, h.config.bindings[0]
         principal = human(binding)
-        from dataclasses import replace
-        runtime.submit(binding.binding_id, wire.SubmitWork(request_id="existing-job"),
-                       replace(principal, actions=principal.actions | {"submit"}))
         result = terminal(runtime, binding)
         job_key = worker_key("job", binding.job_id)
         job = runtime.store.read_snapshot((job_key,))[job_key].payload["data"]

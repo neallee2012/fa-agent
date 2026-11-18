@@ -19,7 +19,7 @@ from shared_context.native_files_wire import (
 from shared_context.errors import Problem
 from test_native_turn_api import PREFIX, NativeTransport, native_api
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 from test_native_session_prepare_api import project_client
 

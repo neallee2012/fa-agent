@@ -14,6 +14,8 @@ import pytest
 
 from shared_context.behavior_api import _install_error_handlers
 from shared_context.behavior_assistant_wire import InstructionSubmit
+from shared_context.behavior_instruction import Conversation, conversation_key
+from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
 from shared_context.behavior_foundry import FoundryHttpClient, FOUNDRY_TOKEN_SCOPE
 from shared_context.behavior_native_sessions import _RetiredSession
 from shared_context.behavior_native_turn_api import NativeTurnGateway, PREFIX
@@ -25,8 +27,9 @@ from shared_context.behavior_native_turn_wire import (
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from test_conversation_transfer_startup import synthetic_standing_v1
+from untrusted_headers_helpers import UNTRUSTED_CONTEXT_HEADERS
 from test_m3_auth import jwk_client, signing_key, token
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_team_agent_routing import team_agent, _register_scope, _agent
 from test_native_turn_wire import submit as original_submit
 
@@ -842,7 +845,7 @@ def test_vm_primary_and_terminal_read_use_the_same_real_ledger_record(native_api
     from shared_context.behavior_turn_usage import AGENT_TURN_USAGE_PATH, AgentTurnUsageReport
     from test_agent_turn_usage_ledger import METERED, saved
     from test_turn_usage_ledger import group, ledger, report
-    from test_conversation_transfer_startup import read_startup
+    from legacy_turn_rows_helpers import read_startup
     case, c = native_api, native_api.c
     template = export_template(c.control, c.authority, c.human)
     template = AgentTemplate.model_validate({
@@ -1173,6 +1176,11 @@ def test_one_complete_page_must_match_original_text_hash(native_api):
 @pytest.mark.parametrize("field,value", [
     ("capture", {}), ("call_id", "caller-forged"), ("team_id", "other-team"),
     ("binding_id", "fake-binding"),
+    # The retired Table submit refused these too (422): what a client may not pick, attest or approve.
+    ("approved", True), ("prompt_profile", "fa-instruction-v1"), ("capabilities", "fa-instruction-v2"),
+    ("skill_catalog", "fa-instruction-skills-v1"), ("memory_scope", {"enabled": True, "settings_id": "model-selected"}),
+    ("location", {"label": "BODY_LOCATION_CANARY", "device_id": "BODY_DEVICE_CANARY"}),
+    ("model_capacity", 1000),
 ])
 def test_public_submit_rejects_server_owned_fields(native_api, field, value):
     case = native_api
@@ -1212,10 +1220,14 @@ def test_current_owner_can_read_and_cancel_when_new_admission_is_revoked(native_
 
 def test_legacy_cid_is_not_rehomed_or_readmitted(native_api):
     case = native_api
-    record, _ = case.c.control.submit(
-        case.c.human, InstructionSubmit(request_id="legacy-original", content="Legacy"),
-    )
-    cid = case.c.control.records[record.binding_id].profile.instruction.conversation_id
+    cid, store = "legacy-original-cid", case.c.control.store
+    old = Conversation(conversation_id=cid, human_oid=case.c.human.oid, team_id=case.c.human.team,
+                       agent_oid="legacy-agent-oid", sdk_session_id="legacy-sdk-session",
+                       hosted_session_id="legacy-hosted-session")
+    store.transact(
+        ControlRequest(request_id="legacy-conversation-row", request_digest="c" * 64),
+        lambda _: ControlChanges(writes=(ControlWrite(
+            row_id=conversation_key(cid), mode="create", data=old.model_dump(mode="json")),), result={}))
     result = submit(case, rid="native-cannot-take-old", conversation_id=cid)
     assert result.status_code == 409 and result.json()["error"]["code"] == "NATIVE_STATE_SCOPE"
     assert case.remote.calls == []
@@ -1402,3 +1414,105 @@ def test_a_prefetched_capture_is_used_only_when_it_equals_the_ordinary_read():
     changed = SimpleNamespace(conversation_id="cid-a", capture=SimpleNamespace(template="template-b"))
     assert _SubmitPrefetch(done("captured"), conversation).capture(changed) is None
     assert _SubmitPrefetch(done(Problem(403, "WORK_POLICY_REVOKED", "x")), conversation).capture(conversation) is None
+
+
+@pytest.mark.parametrize("raw,query,status,code", [
+    (b'{"request_id":"one","request_id":"two","content":"x"}', "", 422, "BEHAVIOR_INVALID_REQUEST"),
+    (b'{"request_id":"one","content":"x","context":{"principal_id":"SYNTHETIC_SECRET"}}', "", 422,
+     "BEHAVIOR_INVALID_REQUEST"),
+    (b'{"request_id":"one","content":"x"}', "?approved=true", 422, "BEHAVIOR_INVALID_REQUEST"),
+    (b"x" * (200 * 1024), "", 413, "BEHAVIOR_BODY_LIMIT"),
+], ids=["duplicate-key", "authority-field", "authority-query", "oversized"])
+def test_public_submit_body_is_one_bounded_command_and_never_echoed(native_api, raw, query, status, code):
+    case = native_api
+    response = case.client.post(PREFIX + "/submit" + query, content=raw,
+                                headers={**case.headers, "content-type": "application/json"})
+    assert (response.status_code, response.json()["error"]["code"]) == (status, code)
+    assert "SYNTHETIC_SECRET" not in response.text and case.remote.calls == []
+
+
+def test_public_submit_refuses_an_original_over_the_quoted_byte_bound_instead_of_truncating(native_api):
+    """Native twin of test_user_turn_read's oversized case: 8191 x quote to 8193 bytes, one over 8192."""
+    case = native_api
+    response = case.client.post(PREFIX + "/submit", json={"request_id": "oversize-original", "content": "x" * 8191},
+                                headers=case.headers)
+    assert response.status_code == 422 and case.remote.calls == []
+
+
+def test_public_submit_authenticates_before_reading_the_body_and_refuses_a_repeated_credential(native_api):
+    case = native_api
+    received, output = [], []
+
+    async def receive():
+        received.append(True)
+        return {"type": "http.request", "body": b"x" * (200 * 1024), "more_body": False}
+
+    async def send(message):
+        output.append(message)
+
+    path = PREFIX + "/submit"
+    case.client.portal.call(case.client.app, {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST", "scheme": "https",
+        "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+        "headers": [(b"content-type", b"application/json"), (b"content-length", str(200 * 1024).encode())],
+        "client": ("local", 1), "server": ("local", 443)}, receive, send)
+    assert received == [] and output[0]["status"] == 401
+    repeated = [*case.headers.items(), ("Authorization", case.headers["Authorization"])]
+    assert case.client.post(path, content=b"{}", headers=repeated).status_code == 401
+    assert case.remote.calls == []
+
+
+@pytest.mark.parametrize("extra", [
+    {"files": [{"name": "one.txt", "text": "x" * 4500}, {"name": "two.txt", "text": "y" * 4500}]},
+    {"files": [{"name": "same.txt", "text": "body"}],
+     "attachments": [{"name": "same.txt", "source": {"source_id": "s", "version": 1, "sha256": "a" * 64,
+                                                      "byte_length": 1}}]},
+], ids=["combined-limit", "duplicate-name"])
+def test_invalid_file_input_is_a_client_error_before_any_call(native_api, extra):
+    case = native_api
+    response = case.client.post(PREFIX + "/submit", headers=case.headers, json={
+        "request_id": "invalid-file-input", "content": "Read the files.", **extra})
+    assert response.status_code == 422 and case.remote.calls == []
+
+
+def test_metadata_headers_cannot_promote_an_agent_to_the_human_owner(native_api, signing_key):
+    case, c = native_api, native_api.c
+    agent = {"Authorization": "Bearer " + token(signing_key, {
+        "oid": c.control.policy.template.agent_oid, "idtyp": "app", "roles": ["Behavior.Agent"]}, remove=("scp",))}
+    forged = {**agent, **UNTRUSTED_CONTEXT_HEADERS, "X-Actor-Id": c.human.source_actor_id,
+              "X-MS-CLIENT-PRINCIPAL-ID": c.human.oid, "X-Recipient-Id": c.human.oid, "X-Source-Kind": "human"}
+    response = case.client.post(PREFIX + "/submit", headers=forged, json={
+        "request_id": "header-human-spoof", "content": "A header is not delegated human identity."})
+    assert (response.status_code, response.json()["error"]["code"]) == (403, "WORK_POLICY_HUMAN_REQUIRED")
+    assert case.remote.calls == []
+
+
+def test_metadata_headers_do_not_replace_the_verified_human_context(native_api):
+    case = native_api
+    headers = {**case.headers, **UNTRUSTED_CONTEXT_HEADERS}
+    body = InstructionSubmit(request_id="header-context", content="Original user text").model_dump(mode="json")
+    accepted = case.client.post(PREFIX + "/submit", json=body, headers=headers)
+    assert accepted.status_code == 202, accepted.text
+    sent = json.dumps([command.model_dump(mode="json") for _, command in case.remote.calls])
+    assert [command.operation for _, command in case.remote.calls if command.operation != "session_read"] == ["submit"]
+    for canary in UNTRUSTED_CONTEXT_HEADERS.values():
+        assert canary not in sent and canary not in accepted.text
+
+
+def test_a_refused_attachment_or_file_over_http_is_never_dispatched(native_api, monkeypatch):
+    case = native_api
+    source = {"source_id": "s", "version": 1, "sha256": "a" * 64, "byte_length": 1}
+    for rid, extra, code in (
+            ("no-files", {"files": [{"name": "data.csv", "text": "a,b"}]}, "USER_TEXT_FILES_DISABLED"),
+            ("no-attachments", {"attachments": [{"name": "s.json", "source": source}]}, "ATTACHMENTS_DISABLED")):
+        refused = case.client.post(PREFIX + "/submit", headers=case.headers, json={
+            "request_id": rid, "content": "Original user text", **extra})
+        assert (refused.status_code, refused.json()["error"]["code"]) == (403, code), refused.text
+    # A server default that is not a known profile refuses new work; a POST is never marked for automatic retry.
+    monkeypatch.setenv("FA_INSTRUCTION_DEFAULT_PROMPT_PROFILE", "PRIVATE_PROMPT_CONFIG_CANARY")
+    refused = submit(case, rid="bad-default")
+    error = refused.json()["error"]
+    assert (refused.status_code, error["code"], error["automatic_retry"]) == (
+        503, "INSTRUCTION_DEFAULT_PROMPT_CONFIGURATION", False), refused.text
+    assert "PRIVATE_PROMPT_CONFIG_CANARY" not in refused.text
+    assert "submit" not in [command.operation for _, command in case.remote.calls]

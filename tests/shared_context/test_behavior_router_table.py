@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel
 
 from shared_context import behavior_api
 from shared_context import behavior_wire as wire
@@ -22,7 +22,7 @@ W = object()  # the verified principal
 C = SimpleNamespace(request_id="rid-1")  # the parsed command
 BINDING = SimpleNamespace(job_id="job-1", child_jobs=(SimpleNamespace(job_id="child-1"),))
 IDS = {"binding_id": "b-1", "source_id": "s-1", "version": "3", "snapshot_id": "n-1", "backup_id": "a" * 32,
-       "claim_id": "c-1", "job_id": "job-1", "child_id": "child-1"}
+       "claim_id": "c-1", "job_id": "job-1"}
 AUTH = {"authorization": "Bearer stand-in"}
 
 
@@ -39,7 +39,6 @@ def stages(paths, grants, model, call, args):
 SOURCE = "/sources/{source_id}"
 CLAIM = "/claims/{claim_id}"
 BACKUP = "/backups/{backup_id}"
-CHILD = "/children/{child_id}"
 ROUTES = [
     *stages((SOURCE + "/commit", SOURCE + "/reconcile"), ("submit", "read"), wire.Command, "commit_source",
             ("b-1", "s-1", C, W)),
@@ -59,25 +58,9 @@ ROUTES = [
             ("b-1", "c-1", C, W)),
     route("GET", CLAIM, "read", None, "current_claim", ("b-1", "c-1", W)),
     route("POST", "/context", "read", wire.ContextRequest, "context", ("b-1", C, W)),
-    route("POST", "/operation/prepare", "read", wire.OperationPrepare, "prepare_operation", ("b-1", C, W)),
     route("GET", "/operation", "read", None, "operation_preview", ("b-1", W)),
     route("GET", "/operation/decision-state", "read", None, "operation_decision_state", ("b-1", W)),
-    route("POST", "/operation/approve", "approve", wire.OperationApproval, "approve_operation", ("b-1", C, W)),
-    route("POST", "/operation/approval-reconcile", "read", wire.OperationApproval, "reconcile_operation_approval",
-          ("b-1", C, W)),
-    route("POST", "/operation/revoke", "approve", wire.OperationRevocation, "revoke_operation", ("b-1", C, W)),
-    route("POST", "/operation/revocation-reconcile", "read", wire.OperationRevocation,
-          "reconcile_operation_revocation", ("b-1", C, W)),
-    route("POST", "/operation/reject", "approve", wire.OperationRejection, "reject_operation", ("b-1", C, W)),
-    route("POST", "/operation/rejection-reconcile", "read", wire.OperationRejection,
-          "reconcile_operation_rejection", ("b-1", C, W)),
-    *stages(("/operation/execute", "/operation/reconcile"), ("execute", "read"), wire.Command, "execute_operation",
-            ("b-1", C, W)),
-    *stages(("/work/submit", "/work/reconcile"), ("submit", "read"), wire.SubmitWork, "submit", ("b-1", C, W)),
     route("GET", "/jobs/{job_id}", "read", None, "job_status", ("b-1", W)),
-    *stages((CHILD + "/enqueue", CHILD + "/reconcile"), ("submit", "read"), wire.Command, "enqueue_child",
-            ("b-1", "child-1", C, W)),
-    route("GET", CHILD, "read", None, "child_status", ("b-1", "child-1", W)),
     route("POST", "/memory/plan", "submit", wire.Command, "memory_projection", ("b-1", C, W), action="plan"),
     route("POST", "/memory/start", "submit", wire.MemoryProjectionCommand, "memory_projection", ("b-1", C, W),
           action="start"),
@@ -93,11 +76,6 @@ ROUTES = [
     route("POST", "/delivery/pull-continue", "read", wire.Command, "continue_fetch", ("b-1", C, W)),
     route("POST", "/delivery/pull-reconcile", "read", wire.Command, "reconcile_fetch", ("b-1", C, W)),
     route("POST", "/delivery/acknowledge", "acknowledge", wire.PullAcknowledgment, "acknowledge", ("b-1", C, W)),
-]
-CALLBACKS = [
-    ("/hosted/launches/{launch_id}/claim", "assigned-native-claim"),
-    ("/hosted/launches/{launch_id}/probes/{probe_id}/resolve", "assigned-native-resolve"),
-    ("/hosted/launches/{launch_id}/probes/{probe_id}/report", "assigned-native-report"),
 ]
 
 
@@ -176,19 +154,15 @@ def expected(item):
     return ([item.method], PREFIX + item.path, "behavior-" + item.path.replace("/", "-") + item.method)
 
 
-def callback_rows():
-    return [(["POST"], PREFIX + path, name) for path, name in CALLBACKS]
-
-
 def test_every_route_keeps_its_order_method_and_name():
-    assert registered(behavior_router(Runtime(), Verifier())) == [*map(expected, ROUTES), *callback_rows()]
+    """No retired legacy job route (work submit, child jobs, operation prepare/decisions/execute, Hosted callbacks) is in the table."""
+    assert registered(behavior_router(Runtime(), Verifier())) == [*map(expected, ROUTES)]
 
 
-@pytest.mark.parametrize("optional", ["backups", "memory", "launches"])
+@pytest.mark.parametrize("optional", ["backups", "memory"])
 def test_a_missing_optional_dependency_only_drops_its_own_routes(optional):
-    rows = [*map(expected, ROUTES), *callback_rows()]
-    gone = {"backups": lambda row: "/backups/" in row[1], "memory": lambda row: "/memory/" in row[1],
-            "launches": lambda row: "/hosted/" in row[1]}[optional]
+    rows = [*map(expected, ROUTES)]
+    gone = {"backups": lambda row: "/backups/" in row[1], "memory": lambda row: "/memory/" in row[1]}[optional]
     assert registered(behavior_router(Runtime(**{optional: False}), Verifier())) == [
         row for row in rows if not gone(row)]
 
@@ -212,7 +186,7 @@ def test_the_runtime_method_is_looked_up_at_request_time(body):
 @pytest.mark.parametrize("path", [
     "/sources/bad.id/commit", "/sources/s-1/versions/0", "/sources/s-1/versions/01", "/sources/s-1/versions/2147483648",
     "/sources/s-1/versions/12345678901", "/sources/s-1/versions/x", "/backups/" + "A" * 32 + "/upload",
-    "/backups/s-1/upload", "/jobs/job-2", "/children/child-2", "/children/child-2/enqueue",
+    "/backups/s-1/upload", "/jobs/job-2",
 ])
 def test_a_path_outside_the_binding_is_denied_after_authorize_and_before_anything_else(body, path):
     runtime = Runtime()
@@ -238,7 +212,7 @@ def test_authorize_runs_before_the_path_is_read():
     assert serve(runtime).get(url("/jobs/not.an.id")).status_code == 404
 
 
-@pytest.mark.parametrize("method,path", [("POST", "/work/submit"), ("GET", "/operation")])
+@pytest.mark.parametrize("method,path", [("POST", "/delivery/pull"), ("GET", "/operation")])
 def test_query_parameters_are_refused_before_the_body_or_handler(body, method, path):
     runtime = Runtime()
     response = serve(runtime).request(method, url(path) + "?x=1")
@@ -395,176 +369,3 @@ def test_a_registered_actor_never_replaces_a_configured_one():
         behavior_router(runtime, Verifier(ACTORS), registered_actor=SimpleNamespace(oid="agent", team="team"))
     assert error.value.body["error"] == {
         "code": "BEHAVIOR_CONFIGURATION", "message": "a registered agent cannot reuse a configured actor"}
-
-
-class ClaimResult(BaseModel):
-    claim_state: str = "fresh"
-    report_token: SecretStr | None = None
-
-
-class Native:
-    def __init__(self, result=None):
-        self.calls, self.result = [], result
-
-    def claim(self, *args, **options):
-        self.calls.append(("claim", args, options))
-        return self.result
-
-    def resolve_probe(self, *args):
-        self.calls.append(("resolve", args, {}))
-        return {"resolved": True}
-
-    def report(self, *args):
-        self.calls.append(("report", args, {}))
-        return {"reported": True}
-
-
-class CallbackBody:
-    def model_dump(self):
-        return {"request_id": "rid-1"}
-
-
-@pytest.fixture
-def callbacks(monkeypatch):
-    """Real capability and path checks; the wire models are recorders, so the command's fields can be asserted."""
-    async def parsed(_request, model):
-        parsed.models.append(model)
-        return CallbackBody()
-
-    parsed.models = []
-    monkeypatch.setattr(behavior_api, "_body", parsed)
-    for name, label in (("HostedClaimRequest", "claim"), ("HostedProbeRequest", "resolve"), ("HostedReport", "report")):
-        monkeypatch.setattr(wire, name, lambda label=label, **fields: {label: fields})
-    runtime, native = Runtime(), Native(ClaimResult(report_token="report-1"))
-    runtime.result = native
-    return SimpleNamespace(runtime=runtime, native=native, client=serve(runtime), models=parsed.models)
-
-
-LAUNCH = PREFIX.format(binding_id="b-1") + "/hosted/launches/launch-1"
-PERMIT = {"x-behavior-launch-permit": "a" * 64}
-REPORT = {"x-behavior-report-token": "b" * 64}
-
-
-def test_claim_authorizes_reads_its_permit_and_returns_the_token_only_in_a_header(callbacks):
-    response = callbacks.client.post(LAUNCH + "/claim", headers=PERMIT)
-    assert response.status_code == 200 and response.json() == {"claim_state": "fresh"}
-    assert response.headers["x-behavior-report-token"] == "report-1"
-    assert callbacks.models == [wire.HostedClaimBody]
-    assert callbacks.runtime.calls == [("executor_callback", ("b-1", "launch-1", W), {"claim": True})]
-    (name, args, options), = callbacks.native.calls
-    assert (name, args[:2], args[3], options) == ("claim", ("b-1", "launch-1"), W, {})
-    fields = args[2]["claim"]
-    assert fields["request_id"] == "rid-1" and fields["launch_permit"].get_secret_value() == "a" * 64
-
-
-@pytest.mark.parametrize("result", [ClaimResult(claim_state="replayed", report_token="report-1"), ClaimResult()])
-def test_only_a_fresh_claim_with_a_token_sets_the_header(callbacks, result):
-    callbacks.native.result = result
-    response = callbacks.client.post(LAUNCH + "/claim", headers=PERMIT)
-    assert response.status_code == 200 and "x-behavior-report-token" not in response.headers
-
-
-@pytest.mark.parametrize("suffix,name,model,reply", [
-    ("resolve", "resolve", wire.HostedProbeBody, {"resolved": True}),
-    ("report", "report", wire.HostedReportBody, {"reported": True}),
-])
-def test_probe_callbacks_use_the_report_token_and_their_own_operation(callbacks, suffix, name, model, reply):
-    response = callbacks.client.post(LAUNCH + "/probes/probe-1/" + suffix, headers=REPORT)
-    assert response.status_code == 200 and response.json() == reply
-    assert callbacks.models == [model]
-    assert callbacks.runtime.calls == [("executor_callback", ("b-1", "launch-1", W), {"claim": False})]
-    (called, args, _), = callbacks.native.calls
-    assert called == name and args[:3] == ("b-1", "launch-1", "probe-1") and args[4] is W
-    assert args[3][name]["report_token"].get_secret_value() == "b" * 64
-
-
-@pytest.mark.parametrize("headers", [{}, {"x-behavior-launch-permit": "A" * 64},
-                                     {"x-behavior-launch-permit": "a" * 63}, REPORT])
-def test_a_missing_or_malformed_permit_is_denied_before_the_body(callbacks, headers):
-    response = callbacks.client.post(LAUNCH + "/claim", headers=headers)
-    assert (response.status_code, response.json()["error"]["code"]) == (403, "BEHAVIOR_ACCESS_DENIED")
-    assert not callbacks.models and not callbacks.native.calls
-
-
-def test_a_repeated_permit_is_denied(callbacks):
-    response = callbacks.client.post(LAUNCH + "/claim", headers=[
-        ("authorization", "Bearer stand-in"), ("x-behavior-launch-permit", "a" * 64),
-        ("x-behavior-launch-permit", "b" * 64)])
-    assert response.status_code == 403 and not callbacks.models
-
-
-def test_the_executor_is_checked_before_the_capability(callbacks):
-    def denied(*_, **__):
-        raise Problem(404, "BEHAVIOR_NOT_FOUND", "unknown launch")
-
-    callbacks.runtime.executor_callback = denied
-    assert callbacks.client.post(LAUNCH + "/claim").status_code == 404
-
-
-def test_an_invalid_probe_id_is_a_dependency_answer_and_runs_no_operation(callbacks):
-    response = callbacks.client.post(LAUNCH + "/probes/bad.id/report", headers=REPORT)
-    assert response.status_code == 503 and not callbacks.native.calls
-    assert response.json()["error"]["message"] == "The bounded operation could not be completed."
-
-
-def test_callback_failures_stay_opaque(callbacks):
-    def broken(*_, **__):
-        raise RuntimeError("SYNTHETIC private detail")
-
-    callbacks.runtime.executor_callback = broken
-    response = callbacks.client.post(LAUNCH + "/claim", headers=PERMIT)
-    assert response.status_code == 503 and "SYNTHETIC" not in response.text
-    assert response.json()["error"]["message"] == "The bounded operation could not be completed."
-
-
-def test_a_plain_runtime_never_takes_the_assistant_claim_lane(callbacks, monkeypatch):
-    """Native mode without a profile for this binding keeps the ordinary claim path and its Problem body."""
-    from shared_context import behavior_assistant, behavior_assistant_api
-    monkeypatch.setattr(behavior_assistant, "_read_conflicts", lambda *_a, **_k: pytest.fail("assistant lane"))
-    monkeypatch.setattr(behavior_assistant_api, "acquire_http_error", lambda *_a, **_k: pytest.fail("assistant lane"))
-    assert callbacks.client.post(LAUNCH + "/claim", headers=PERMIT).status_code == 200
-
-
-def test_a_profiled_binding_claims_through_the_assistant_conflict_read(callbacks, monkeypatch):
-    from shared_context import behavior_assistant
-    phases = []
-
-    def conflicts(read, *, phase):
-        phases.append(phase)
-        return read()
-
-    monkeypatch.setattr(behavior_assistant, "_read_conflicts", conflicts)
-    callbacks.runtime.profiles = {"b-1": object()}
-    assert callbacks.client.post(LAUNCH + "/claim", headers=PERMIT).status_code == 200
-    assert phases == ["hosted_claim_authority"]
-    assert callbacks.runtime.calls == [("executor_callback", ("b-1", "launch-1", W), {"claim": True})]
-    assert callbacks.native.calls[0][2] == {"assistant_conflicts": True}
-
-
-def test_a_profiled_binding_outside_native_mode_stays_ordinary(callbacks, monkeypatch):
-    from shared_context import behavior_assistant
-    monkeypatch.setattr(behavior_assistant, "_read_conflicts", lambda *_a, **_k: pytest.fail("assistant lane"))
-    callbacks.runtime.profiles, callbacks.runtime.mode = {"b-1": object()}, "offline"
-    assert callbacks.client.post(LAUNCH + "/claim", headers=PERMIT).status_code == 200
-    assert callbacks.native.calls[0][2] == {}
-
-
-def test_only_the_claim_uses_the_assistant_lane(callbacks, monkeypatch):
-    from shared_context import behavior_assistant
-    monkeypatch.setattr(behavior_assistant, "_read_conflicts", lambda *_a, **_k: pytest.fail("assistant lane"))
-    callbacks.runtime.profiles = {"b-1": object()}
-    assert callbacks.client.post(LAUNCH + "/probes/probe-1/report", headers=REPORT).status_code == 200
-
-
-def test_assistant_claim_problems_use_the_assistant_answer(callbacks, monkeypatch):
-    from shared_context import behavior_assistant_api
-    seen = []
-
-    def translated(error, phase):
-        seen.append((error.body["error"]["code"], phase))
-        return Problem(409, "BEHAVIOR_CONFLICT", "translated")
-
-    monkeypatch.setattr(behavior_assistant_api, "acquire_http_error", translated)
-    callbacks.runtime.profiles = {"b-1": object()}
-    response = callbacks.client.post(LAUNCH + "/claim")  # no permit
-    assert response.status_code == 409 and seen == [("BEHAVIOR_EXECUTOR_DENIED", "hosted_claim")]

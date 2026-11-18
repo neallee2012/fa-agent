@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 from test_native_routine_api import clock_call, daily_definition
 from test_native_turn_api import native_api

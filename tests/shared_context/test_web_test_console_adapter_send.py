@@ -54,7 +54,6 @@ TASK = SimpleNamespace(binding_id="binding-1", job_id="job-1", work_id="work-1",
                        submission="work")
 JOB_REQUESTS = {
     "status": ("GET", "/behavior/v1/bindings/binding-1/jobs/job-1", b""),
-    "submit": ("POST", "/behavior/v1/bindings/binding-1/work/submit", None),
 }
 # Pydantic alone would take the last value; only the strict parse refuses a repeated key.
 REPEATED_KEY = b'{"job_id": "job-1", "job_id": "job-1", "work_id": "work-1", "state": "running", "generation": 1,' \
@@ -75,10 +74,7 @@ def test_a_job_reply_comes_back_parsed_from_the_actions_own_request(action):
     method, path, content = JOB_REQUESTS[action]
     assert [(request.method, request.url.path) for request in seen] == [(method, path)]
     assert seen[0].headers["authorization"] == "Bearer " + TOKEN
-    if content is None:
-        assert json.loads(seen[0].content)["request_id"] == "request-1"
-    else:
-        assert seen[0].content == content
+    assert seen[0].content == content
 
 
 @pytest.mark.parametrize("action", JOB_REQUESTS)
@@ -97,6 +93,26 @@ def test_a_reply_for_another_job_is_a_binding_mismatch(action, field):
     with pytest.raises(ConsoleError) as error:
         call()
     assert (error.value.code, error.value.status) == ("STATUS_BINDING_MISMATCH", 502)
+
+
+@pytest.mark.parametrize("adapter_type", ["pull", "instruction"])
+@pytest.mark.parametrize("submission", ["assistant", "lifecycle"])
+def test_a_pull_task_submit_is_refused_without_a_backend_call(adapter_type, submission):
+    """The job-bound lane is retired: the workbench never builds a pull task's submit."""
+    from web_test_console.freeform import InstructionAdapter
+
+    adapter, seen = make(lambda request: httpx.Response(200, content=json.dumps(JOB).encode()))
+    if adapter_type == "instruction":
+        adapter = InstructionAdapter(adapter.config, adapter.client, None)
+    task = SimpleNamespace(**{**vars(TASK), "submission": submission})
+    refused = None
+    try:
+        # The adapter's one path from a job action to a backend request whose job reply it parses.
+        adapter._job_status(task, "submit", TOKEN)
+    except ConsoleError as error:
+        refused = (error.code, error.status)
+    assert [(request.method, request.url.path) for request in seen] == []
+    assert refused == ("ACTION_NOT_ALLOWED", 403)
 
 
 # ---------------------------------------------------------------- request guards

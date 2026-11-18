@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from shared_context.behavior_delivery import DeliveryConsumer, ScanCursor, ScanRequest
+from shared_context.behavior_delivery import ScanCursor, ScanRequest
 from shared_context.behavior_delivery_pending import (
     PAGE_SIZE, WRITER_ENV, PendingHead, PendingMember, PendingPage, head_key, member_key, page_key,
 )
@@ -129,7 +129,7 @@ def test_reader_rollback_reads_pages_and_acknowledges_but_never_writes_new_legac
     assert h.data("delivery-index", "root")["entries"] == []
 
 
-def test_scan_cursor_and_consumer_pages_keep_original_pending_responsibility(monkeypatch):
+def test_scan_cursor_keeps_original_pending_responsibility(monkeypatch):
     monkeypatch.setenv(WRITER_ENV, "true")
     h = instruction_harness()
     obligations = [admit_instruction(h, number)[0] for number in range(6)]
@@ -142,11 +142,6 @@ def test_scan_cursor_and_consumer_pages_keep_original_pending_responsibility(mon
     second = h.core.scan_due(ScanRequest(scan_id="next-page", cursor=cursor), CONTEXT)
     found = [entry["obligation_id"] for page in (first, second) for entry in page.payload["result"]["due"]]
     assert set(found) == set(obligations)
-    consumer = DeliveryConsumer(h.core)
-    results = [result for _ in range(3) for result in consumer.drain("root", lambda _: CONTEXT, "offline-consumer", limit=2)]
-    assert len(results) == 6
-    assert len({result["binding"]["obligation_id"] for result in results}) == 6
-    assert all(h.data("delivery-obligation", ob)["fulfillment"] == "pending" for ob in obligations)
     admit_instruction(h, 6)
     with pytest.raises(Problem) as stale:
         h.core.scan_due(ScanRequest(scan_id="stale-original-page", cursor=cursor), CONTEXT)

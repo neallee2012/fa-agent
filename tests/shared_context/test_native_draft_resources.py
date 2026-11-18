@@ -24,7 +24,7 @@ from shared_context.native_skill_draft_api import NativeSkillDraftGateway, PREFI
 from shared_context.native_skill_draft_wire import (
     NativeSkillDraftArgs, NativeSkillDraftReceipt, NativeSkillDraftWrite, artifact_id, draft_material,
 )
-from test_agent_runtime_routing import agent_headers
+from agent_runtime_routing_helpers import agent_headers
 from test_native_skill_draft_api import (
     draft_case, relay_case, peer_runtime, synthetic_standing_v1, instruction_models, signing_key, jwk_client,
 )

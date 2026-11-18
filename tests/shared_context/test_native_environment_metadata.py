@@ -10,7 +10,7 @@ from shared_context.behavior_native_sessions import (
     _latest_version_reader as sdk_latest_reader, native_session_id,
 )
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_native_session_prepare_api import project_client
 from test_native_environment_api import environment_at

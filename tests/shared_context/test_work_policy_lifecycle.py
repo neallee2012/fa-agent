@@ -7,21 +7,11 @@ from shared_context.errors import Problem
 from shared_context import behavior_wire as wire
 from shared_context.behavior_assistant_wire import AssistantSubmit
 from shared_context.behavior_work_policy import WorkPolicyControl
-from test_behavior_assistant import assistant,runtime_path
-from test_work_cost_policy import standing,install_offline
+from test_behavior_assistant import assistant
+from test_m2_copilot import runtime_path
+from work_cost_policy_helpers import standing, install_offline
 from test_m3_auth import jwk_client,signing_key
-
-
-def enabled(assistant,*,after_global=False):
-    h,policy,observed,_,human=standing(assistant)
-    if after_global:h.time=h.policy.valid_until+timedelta(seconds=1)
-    facts=[observed.model_copy(update={"observed_at":h.time})]
-    control=WorkPolicyControl(h.runtime,policy,lambda:facts[0])
-    install_offline(control,human,"offline-once-standing-policy",h.time+timedelta(minutes=10))
-    initial=h.readiness()
-    h.delivery.registration=replace(h.delivery.registration,verify_readiness=lambda:initial.model_copy(update={
-        "observed_at":h.time,"expires_at":h.time+timedelta(minutes=5)}))
-    return h,control,human,facts
+from work_policy_lifecycle_helpers import enabled
 
 
 def test_new_work_is_not_bound_to_one_global_test_deadline(assistant):
@@ -50,7 +40,7 @@ def test_saved_result_and_ack_are_not_execution_deadline_permissions(assistant):
 
 
 def test_terminal_unacknowledged_work_does_not_hold_capacity_or_block_next_work(assistant):
-    from test_behavior_assistant import call
+    from behavior_assistant_helpers import call
     from shared_context.behavior_workers import worker_key
     from shared_context.behavior_operations import control_key
     h,control,human,facts=enabled(assistant,after_global=True)
@@ -92,39 +82,6 @@ def test_uncertain_original_executor_keeps_its_slot_and_next_work_stays_queued(a
     assert h.workers.inspect(second.job_id).state=="queued" and h.workers.inspect(second.job_id).generation==0
     assert h.store.read_snapshot((poolkey,))[poolkey].payload["data"]["slots"]==before
     assert h.endpoint.requests==[]
-
-
-def test_cost_stale_blocks_new_paid_work_but_not_safe_cancellation(assistant):
-    h,control,human,facts=enabled(assistant,after_global=True)
-    binding,_=control.submit(human,AssistantSubmit(request_id="accepted-but-not-started"))
-    h.time+=timedelta(days=1)
-    with pytest.raises(Problem) as denied:control.submit(human,AssistantSubmit(request_id="unfunded-new-work"))
-    assert "COST_OBSERVATION_STALE" in denied.value.body["error"]["code"]
-    result=control.cancel(human,binding.binding_id)
-    assert result.payload["result"]["cancel_accepted"]
-    assert h.runtime.job_status(binding.binding_id,human).state=="cancelled"
-    assert h.endpoint.requests==[]
-
-
-def test_current_preflight_is_pure_exact_and_existing_work_does_not_need_new_cost(assistant):
-    import hashlib
-    from shared_context.behavior_work_policy import WorkPreflightQuery
-    h,control,human,facts=enabled(assistant,after_global=True)
-    command=AssistantSubmit(request_id="same-original-paid-work")
-    query=WorkPreflightQuery(read_id="read-before-submit",request_id=command.request_id,
-        submit_body_sha256=hashlib.sha256(command.model_dump_json().encode()).hexdigest())
-    before=h.store._guard()
-    result=control.preflight(human,query)
-    assert result.decision=="allow" and not result.authorization and h.store._guard()==before
-    assert result.execution_deadline is None and result.monetary_budget.unit=="USD-micro"
-    binding,_=control.submit(human,command)
-    h.time+=timedelta(days=1)
-    control.cost_reader=lambda:pytest.fail("existing original work must not request fresh paid-work approval")
-    duplicate,status=control.submit(human,command)
-    assert duplicate==binding and status.state=="queued"
-    current=control.preflight(human,query.model_copy(update={"read_id":"fresh-original-read"}))
-    assert current.decision=="allow" and current.already_admitted and current.monetary_budget.required_microusd==0
-    with pytest.raises(Problem):control.preflight(human,query.model_copy(update={"submit_body_sha256":"f"*64}))
 
 
 def test_wrong_human_budget_high_water_and_revoked_cached_read_deny(assistant):

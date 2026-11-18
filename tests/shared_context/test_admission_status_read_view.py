@@ -13,7 +13,7 @@ from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
 from test_behavior_store import NativeEntity
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 

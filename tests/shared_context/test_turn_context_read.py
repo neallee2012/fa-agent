@@ -12,9 +12,8 @@ from pydantic import ValidationError
 import pytest
 
 from conftest import A
-from shared_context import behavior_assistant_hosted as hosted, behavior_turn_context
+from shared_context import behavior_turn_context
 from shared_context.behavior_assistant import key
-from shared_context.behavior_assistant_checkpoint import export
 from shared_context.behavior_assistant_wire import ArchiveUnavailable, SdkArchive, StoredSdkArchive
 from shared_context.behavior_capability_prompt import CapabilityAssemblyRecord
 from shared_context.behavior_instruction import SavedReply, TurnArchive, turn_material
@@ -26,33 +25,23 @@ from shared_context.errors import Problem
 from shared_context.records import Record
 from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import UNKNOWN_OID, token
-from test_reviewed_work_memory import NOTE, configured_memory, reviewed_note
-from test_sdk_compaction_product import checkpoint_case, open_turn, ordinary, settle
+from reviewed_work_memory_helpers import NOTE, configured_memory, reviewed_note
 from test_skill_purpose import BODY, PURPOSE
-from test_skill_purpose_api import add_purpose_skill, configured_purpose
-from test_web_test_console_frozen_interface import complete, post, real_interface, signing_key, jwk_client
+from skill_purpose_api_helpers import configured_purpose
+from test_web_test_console_frozen_interface import real_interface
+from assistant_api_helpers import assistant_api, picker_api
+from test_m3_auth import signing_key, jwk_client
 from test_web_test_console_prompt_assembly import ASSEMBLY_PROFILES, profile_interface
-from test_work_policy_lifecycle import enabled
-
-
-def saved_turn(case):
-    draft = case.browser.ui.get("/api/state").json()["composer"]
-    sent = post(case, "/api/instructions/" + draft["request_id"] + "/submit",
-                {"content": "Read only this turn's saved metadata. 原文🙂", "model": draft["model"]})
-    assert sent.status_code == 200, sent.text
-    task = sent.json()["task"]
-    complete(case, task["binding_id"])
-    cid = task["admission"]["conversation_id"]
-    path = f"/work-policy/v1/conversations/{cid}/turns/1/context"
-    return draft, task, path
+from work_policy_lifecycle_helpers import enabled
+from stored_turn_context_helpers import load_case, pinned_artifact_clock, stored_checkpoint, stored_saved_turn, stored_turn
 
 
 @pytest.mark.parametrize("profile_interface", [None, *ASSEMBLY_PROFILES], indirect=True)
-def test_context_read_reports_recorded_bytes_and_explicit_unknown_tokens(profile_interface):
+def test_context_read_reports_recorded_bytes_and_explicit_unknown_tokens(pinned_artifact_clock, profile_interface):
     c = profile_interface
-    _, task, path = saved_turn(c)
+    _, task, path = stored_saved_turn(c, "context-saved-" + (c.control.policy.profile.prompt_profile or "none"))
     rows, journal = copy.deepcopy(c.h.transport.backing.rows), c.journal.read_bytes()
     result = c.h.client.get(path, headers=c.h.headers())
     assert result.status_code == 200, result.text
@@ -98,14 +87,14 @@ def test_context_read_reports_recorded_bytes_and_explicit_unknown_tokens(profile
     assert data["prompt_assembly"] == (None if expected is None else expected.model_dump(mode="json"))
     assert c.h.client.get(path, headers=c.h.headers()).content == result.content
     assert c.h.transport.backing.rows == rows and c.journal.read_bytes() == journal
-    assert len(c.starts) == len(c.sdk_calls) == 1
+    assert not c.starts and not c.sdk_calls
     assert "OFFLINE SDK I/O substitute reply" not in result.text
     assert "原文" not in result.text and "events.jsonl" not in result.text
 
 
 def test_bridge_reads_only_the_original_admitted_turn_without_acknowledgment(real_interface):
     c = real_interface
-    _, task, _ = saved_turn(c)
+    _, task, _ = stored_saved_turn(c)
     rows, journal = copy.deepcopy(c.h.transport.backing.rows), c.journal.read_bytes()
     c.calls.clear()
     response = c.browser.ui.get("/api/instructions/" + task["task_id"] + "/context")
@@ -116,7 +105,7 @@ def test_bridge_reads_only_the_original_admitted_turn_without_acknowledgment(rea
     assert data["context"]["read_is_acknowledgment"] is False
     assert len(c.calls) == 1 and c.calls[0]["method"] == "GET" and c.calls[0]["path"].endswith("/context")
     assert c.h.transport.backing.rows == rows and c.journal.read_bytes() == journal
-    assert len(c.starts) == len(c.sdk_calls) == 1
+    assert not c.starts and not c.sdk_calls
 
 
 @pytest.mark.parametrize("claims,remove,status", [
@@ -129,7 +118,7 @@ def test_bridge_reads_only_the_original_admitted_turn_without_acknowledgment(rea
 ])
 def test_context_read_requires_the_current_designated_human(real_interface, signing_key, claims, remove, status):
     c = real_interface
-    _, _, path = saved_turn(c)
+    _, _, path = stored_saved_turn(c)
     assert c.h.client.get(path, headers=c.h.headers("read-only")).status_code == 200
     rows = copy.deepcopy(c.h.transport.backing.rows)
     encoded = token(signing_key, {"scp": "Behavior.Read", **claims}, remove=remove)
@@ -145,7 +134,7 @@ def test_context_read_requires_the_current_designated_human(real_interface, sign
 ])
 def test_context_read_cannot_select_scope_or_return_bodies(real_interface, query, body):
     c = real_interface
-    _, _, path = saved_turn(c)
+    _, _, path = stored_saved_turn(c)
     assert c.h.client.get(path, headers=c.h.headers()).status_code == 200
     c.h.transport.requests.clear()
     denied = c.h.client.request("GET", path + query, content=body, headers=c.h.headers())
@@ -153,8 +142,8 @@ def test_context_read_cannot_select_scope_or_return_bodies(real_interface, query
     assert c.h.transport.requests == [] and "CONTEXT_INPUT_CANARY" not in denied.text
 
 
-def test_context_authentication_precedes_input_and_storage(real_interface):
-    c = real_interface
+def test_context_authentication_precedes_input_and_storage(picker_api):
+    c = picker_api
     c.h.transport.requests.clear()
     denied = c.h.client.request("GET", "/work-policy/v1/conversations/unknown/turns/1/context?include_body=true",
                                content=b"CONTEXT_INPUT_CANARY")
@@ -166,7 +155,7 @@ def test_context_authentication_precedes_input_and_storage(real_interface):
 ])
 def test_bridge_context_inputs_cannot_select_another_scope(real_interface, query, body):
     c = real_interface
-    _, task, _ = saved_turn(c)
+    _, task, _ = stored_saved_turn(c)
     path = "/api/instructions/" + task["task_id"] + "/context"
     assert c.browser.ui.get(path).status_code == 200
     c.calls.clear()
@@ -177,11 +166,8 @@ def test_bridge_context_inputs_cannot_select_another_scope(real_interface, query
 
 def test_unsaved_context_is_not_zero_usage_or_a_new_execution(real_interface):
     c = real_interface
-    draft = c.browser.ui.get("/api/state").json()["composer"]
-    sent = post(c, "/api/instructions/" + draft["request_id"] + "/submit",
-                {"content": "This turn is still queued.", "model": draft["model"]})
-    assert sent.status_code == 200
-    cid = sent.json()["task"]["admission"]["conversation_id"]
+    _, task, _ = stored_saved_turn(c, "context-queued")
+    cid = task["admission"]["conversation_id"]
     rows, journal = copy.deepcopy(c.h.transport.backing.rows), c.journal.read_bytes()
     read = c.h.client.get(f"/work-policy/v1/conversations/{cid}/turns/1/context", headers=c.h.headers())
     assert read.status_code == 404 and read.json()["error"]["code"] == "TURN_CONTEXT_NOT_READY"
@@ -193,7 +179,7 @@ def test_unsaved_context_is_not_zero_usage_or_a_new_execution(real_interface):
 @pytest.mark.parametrize("during_read", [False, True])
 def test_context_read_rechecks_revocation_in_the_consistent_snapshot(real_interface, monkeypatch, during_read):
     c = real_interface
-    _, task, path = saved_turn(c)
+    _, task, path = stored_saved_turn(c)
     assert c.h.client.get(path, headers=c.h.headers()).status_code == 200
     human = c.h.verifier(c.h.client.build_request("GET", "/", headers=c.h.headers()))
     if not during_read:
@@ -212,7 +198,7 @@ def test_context_read_rechecks_revocation_in_the_consistent_snapshot(real_interf
     denied = c.h.client.get(path, headers=c.h.headers())
     assert denied.status_code == 403, denied.text
     assert "token_usage" not in denied.json() and denied.json()["error"]["automatic_retry"] is False
-    assert len(c.starts) == len(c.sdk_calls) == 1
+    assert not c.starts and not c.sdk_calls
     if during_read:
         assert injected == [True]
 
@@ -275,7 +261,7 @@ def _changed_saved_turn(saved, change):
 @pytest.mark.parametrize("change", SAVED_CHANGES)
 def test_changed_saved_material_is_not_projected_as_metrics(real_interface, monkeypatch, change):
     c = real_interface
-    _, task, path = saved_turn(c)
+    _, task, path = stored_saved_turn(c)
     assert c.h.client.get(path, headers=c.h.headers()).status_code == 200
     akey = key("text-archive", task["job_id"])
     if change == "reply_hash":
@@ -312,7 +298,7 @@ def test_changed_saved_material_is_not_projected_as_metrics(real_interface, monk
 ])
 def test_bridge_rejects_bad_context_without_losing_saved_results(real_interface, change):
     c = real_interface
-    draft, task, api_path = saved_turn(c)
+    draft, task, api_path = stored_saved_turn(c)
     progress = c.browser.ui.get("/api/instructions/progress", params={"thread_id": draft["thread_id"]})
     assert progress.status_code == 200
     bridge_path = "/api/instructions/" + task["task_id"] + "/context"
@@ -351,82 +337,62 @@ def test_bridge_rejects_bad_context_without_losing_saved_results(real_interface,
     assert "PRIVATE_CONTEXT_BODY_CANARY" not in denied.text
     assert instructions.replies == replies and instructions.projections == projections
     assert c.h.transport.backing.rows == rows and c.journal.read_bytes() == journal
-    assert len(c.starts) == len(c.sdk_calls) == 1
+    assert not c.starts and not c.sdk_calls
 
 
 @pytest.mark.parametrize("kind", ["inline", "unavailable", "failed"])
-def test_legacy_and_unavailable_archives_keep_distinct_measurements(assistant, tmp_path, kind):
+def test_legacy_and_unavailable_archives_keep_distinct_measurements(assistant, kind):
     h, control, human, _ = enabled(assistant)
     install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier,
         installation=lambda: None, require_current_native_evidence=lambda: None))
-    turn = open_turn(h, control, human, "context-" + kind)
-    try:
-        if kind == "inline":
-            original = ordinary(turn.assignment.sdk_session_id)
-            folder = tmp_path / "config" / "session-state" / original.sdk_session_id
-            folder.mkdir(parents=True)
-            for name, text in original.files.items():
-                (folder / name).write_text(text, encoding="utf-8")
-            archive = export(tmp_path, original.sdk_session_id)
-        else:
-            archive = ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE")
-        if kind == "failed":
-            turn.client.finish_failed(archive, turn.stop, "sdk_failed")
-        else:
-            turn.client.save_text_reply("Public reply keeps exact UTF-8 bytes. 原文🙂", archive, turn.stop)
-        path = f"/work-policy/v1/conversations/{turn.assignment.task.instruction.conversation_id}/turns/1/context"
-        before = copy.deepcopy(h.transport.backing.rows)
-        result = h.client.get(path, headers=h.headers())
-        assert result.status_code == 200, result.text
-        data = result.json()
-        assert data["archive"]["encoded_state_bytes"] is None and data["archive"]["part_count"] is None
-        if kind == "failed":
-            assert data["reply"] is None
-        else:
-            assert data["reply"]["text_utf8_bytes"] == len("Public reply keeps exact UTF-8 bytes. 原文🙂".encode())
-        if kind == "inline":
-            assert data["archive"]["inline_zlib_bytes"] == len(archive.data)
-            assert data["archive"]["unavailable"] is None
-        else:
-            assert data["archive"]["unavailable"] == {"error": "SDK_ARCHIVE_UNAVAILABLE"}
-            assert data["archive"]["inline_zlib_bytes"] is None and data["archive"]["sha256"] is None
-            assert data["archive"]["sdk_version"] is None and data["archive"]["runtime_version"] is None
-        assert h.transport.backing.rows == before and "原文" not in result.text
-    finally:
-        turn.client.close()
+    path = load_case(h, "context-archive-" + kind)["path"]
+    if kind == "inline":
+        archive = stored_turn(control, "context-inline").reference
+    before = copy.deepcopy(h.transport.backing.rows)
+    result = h.client.get(path, headers=h.headers())
+    assert result.status_code == 200, result.text
+    data = result.json()
+    assert data["archive"]["encoded_state_bytes"] is None and data["archive"]["part_count"] is None
+    if kind == "failed":
+        assert data["reply"] is None
+    else:
+        assert data["reply"]["text_utf8_bytes"] == len("Public reply keeps exact UTF-8 bytes. 原文🙂".encode())
+    if kind == "inline":
+        assert data["archive"]["inline_zlib_bytes"] == len(archive.data)
+        assert data["archive"]["unavailable"] is None
+    else:
+        assert data["archive"]["unavailable"] == {"error": "SDK_ARCHIVE_UNAVAILABLE"}
+        assert data["archive"]["inline_zlib_bytes"] is None and data["archive"]["sha256"] is None
+        assert data["archive"]["sdk_version"] is None and data["archive"]["runtime_version"] is None
+    assert h.transport.backing.rows == before and "原文" not in result.text
 
 
-def test_saved_catalog_is_references_not_body_purpose_or_load_proof(assistant, signing_key, jwk_client, monkeypatch):
-    version = add_purpose_skill(assistant, signing_key, jwk_client)
+def test_saved_catalog_is_references_not_body_purpose_or_load_proof(assistant, monkeypatch):
     h, control, human = configured_purpose(assistant)
-    turn = open_turn(h, control, human, "catalog-context")
-    try:
-        settle(turn, ordinary(turn.assignment.sdk_session_id))
-        before = copy.deepcopy(h.transport.backing.rows)
+    facts = load_case(h, "context-catalog")
+    version, path = facts["version"], facts["path"]
+    before = copy.deepcopy(h.transport.backing.rows)
 
-        def no_blob(*args, **kwargs):
-            raise AssertionError("Context metadata must not download checkpoint or skill bodies")
+    def no_blob(*args, **kwargs):
+        raise AssertionError("Context metadata must not download checkpoint or skill bodies")
 
-        monkeypatch.setattr(h.assistant.artifacts.store, "read", no_blob)
-        path = f"/work-policy/v1/conversations/{turn.assignment.task.instruction.conversation_id}/turns/1/context"
-        result = h.client.get(path, headers=h.headers())
-        assert result.status_code == 200, result.text
-        assert result.json()["skill_catalog"] == {
-            "catalog_schema": "fa-approved-skill-catalog-v2",
-            "entries": [{"name": "receipt-guide", "version_id": version["version_id"],
-                         "sha256": version["sha256"], "metadata_sha256": version["metadata_sha256"]}],
-            "unavailable_count": 0, "usage": "historical-catalog-not-load-or-permission-proof",
-        }
-        for private in (BODY.decode(), PURPOSE, "Not the approved purpose", h.binding.tenant_id, h.binding.agent_oid):
-            assert private not in result.text
-        assert h.transport.backing.rows == before
-    finally:
-        turn.client.close()
+    monkeypatch.setattr(h.assistant.artifacts.store, "read", no_blob)
+    result = h.client.get(path, headers=h.headers())
+    assert result.status_code == 200, result.text
+    assert result.json()["skill_catalog"] == {
+        "catalog_schema": "fa-approved-skill-catalog-v2",
+        "entries": [{"name": "receipt-guide", "version_id": version["version_id"],
+                     "sha256": version["sha256"], "metadata_sha256": version["metadata_sha256"]}],
+        "unavailable_count": 0, "usage": "historical-catalog-not-load-or-permission-proof",
+    }
+    for private in (BODY.decode(), PURPOSE, "Not the approved purpose", h.binding.tenant_id, h.binding.agent_oid):
+        assert private not in result.text
+    assert h.transport.backing.rows == before
 
 
-def test_saved_compaction_observation_is_not_a_new_execution_or_provider_usage(checkpoint_case, monkeypatch):
-    c = checkpoint_case
-    reference = settle(c, c.fs.snapshot(), compaction=c.fs.compaction)
+def test_saved_compaction_observation_is_not_a_new_execution_or_provider_usage(assistant, monkeypatch):
+    c = stored_checkpoint(assistant, "context-compaction-observed")
+    reference = c.reference
     before = copy.deepcopy(c.h.transport.backing.rows)
 
     def no_blob(*args, **kwargs):
@@ -453,37 +419,27 @@ def test_saved_compaction_observation_is_not_a_new_execution_or_provider_usage(c
 
 @pytest.mark.parametrize("followups", [1, 2])
 def test_later_turn_context_retains_inherited_compaction_without_claiming_a_new_execution(
-        checkpoint_case, monkeypatch, followups):
-    c = checkpoint_case
-    settle(c, c.fs.snapshot(), compaction=c.fs.compaction)
-    opened = []
-    try:
-        for index in range(followups):
-            turn = open_turn(c.h, c.control, c.human, "context-followup-" + str(index),
-                             c.assignment.task.instruction.conversation_id)
-            opened.append(turn)
-            turn.stop = turn.stop.model_copy(update={"pid": 100 + index})
-            reference = settle(turn, turn.client.restore())
-        assert reference.source.execution == c.fs.compaction
-        assert reference.job_id != reference.source.execution.job_id
-        def no_blob(*args, **kwargs):
-            raise AssertionError("Inherited metadata must not download or decode SDK state")
-        monkeypatch.setattr(c.h.assistant.artifacts.store, "read", no_blob)
-        before = copy.deepcopy(c.h.transport.backing.rows)
-        task = turn.assignment.task.instruction
-        response = c.h.client.get(
-            f"/work-policy/v1/conversations/{task.conversation_id}/turns/{task.turn_number}/context",
-            headers=c.h.headers())
-        assert response.status_code == 200, response.text
-        observed = response.json()["compaction"]
-        assert observed["source"] == "inherited-checkpoint-observation"
-        assert observed["observation_job_id"] == c.binding.job_id
-        assert observed["summary_sha256"] == c.fs.compaction.summary_sha256
-        assert observed["tokens_removed"] == c.fs.compaction.tokens_removed
-        assert c.h.transport.backing.rows == before
-    finally:
-        for turn in opened:
-            turn.client.close()
+        assistant, monkeypatch, followups):
+    c = stored_checkpoint(assistant, f"context-compaction-followup-{followups}")
+    turn = c.turns[-1]
+    reference = turn.reference
+    assert reference.source.execution == c.fs.compaction
+    assert reference.job_id != reference.source.execution.job_id
+    def no_blob(*args, **kwargs):
+        raise AssertionError("Inherited metadata must not download or decode SDK state")
+    monkeypatch.setattr(c.h.assistant.artifacts.store, "read", no_blob)
+    before = copy.deepcopy(c.h.transport.backing.rows)
+    task = turn.assignment.task.instruction
+    response = c.h.client.get(
+        f"/work-policy/v1/conversations/{task.conversation_id}/turns/{task.turn_number}/context",
+        headers=c.h.headers())
+    assert response.status_code == 200, response.text
+    observed = response.json()["compaction"]
+    assert observed["source"] == "inherited-checkpoint-observation"
+    assert observed["observation_job_id"] == c.binding.job_id
+    assert observed["summary_sha256"] == c.fs.compaction.summary_sha256
+    assert observed["tokens_removed"] == c.fs.compaction.tokens_removed
+    assert c.h.transport.backing.rows == before
 
 
 def _archive(change):
@@ -538,117 +494,72 @@ INHERITED_CHANGES = {
 
 
 @pytest.mark.parametrize("change", INHERITED_CHANGES)
-def test_inherited_compaction_requires_the_registered_original_source(checkpoint_case, monkeypatch, change):
-    c = checkpoint_case
-    settle(c, c.fs.snapshot(), compaction=c.fs.compaction)
-    third = open_turn(c.h, c.control, c.human, "inherited-context-negative",
-                      c.assignment.task.instruction.conversation_id)
-    try:
-        settle(third, third.client.restore())
-        task = third.assignment.task.instruction
-        path = f"/work-policy/v1/conversations/{task.conversation_id}/turns/{task.turn_number}/context"
-        assert c.h.client.get(path, headers=c.h.headers()).status_code == 200
-        message, rewrites = INHERITED_CHANGES[change]
-        keys = {"current": key("text-archive", third.binding.job_id), "previous": task.previous_archive_id}
-        snapshot = c.h.store.read_snapshot
+def test_inherited_compaction_requires_the_registered_original_source(assistant, monkeypatch, change):
+    c = stored_checkpoint(assistant, "context-compaction-inherited")
+    (third,) = c.turns
+    task = third.assignment.task.instruction
+    path = f"/work-policy/v1/conversations/{task.conversation_id}/turns/{task.turn_number}/context"
+    assert c.h.client.get(path, headers=c.h.headers()).status_code == 200
+    message, rewrites = INHERITED_CHANGES[change]
+    keys = {"current": key("text-archive", third.binding.job_id), "previous": task.previous_archive_id}
+    snapshot = c.h.store.read_snapshot
 
-        def incoherent_source(read_keys):
-            result = dict(snapshot(read_keys))
-            for target, rewrite in rewrites.items():
-                row_key = keys[target]
-                if row_key not in result or result[row_key] is None:
-                    continue
-                original = result[row_key]
-                if rewrite is None:
-                    result[row_key] = None
-                    continue
-                if rewrite == "material":
-                    result[row_key] = Record({**original.payload, "material": None}, original.etag)
-                    continue
-                changed = rewrite(TurnArchive.model_validate_json(json.dumps(original.payload["data"])))
-                result[row_key] = Record({
-                    **original.payload, "data": changed.model_dump(mode="json"),
-                    "material": turn_material(changed).model_dump(mode="json"),
-                }, original.etag)
-            return result
+    def incoherent_source(read_keys):
+        result = dict(snapshot(read_keys))
+        for target, rewrite in rewrites.items():
+            row_key = keys[target]
+            if row_key not in result or result[row_key] is None:
+                continue
+            original = result[row_key]
+            if rewrite is None:
+                result[row_key] = None
+                continue
+            if rewrite == "material":
+                result[row_key] = Record({**original.payload, "material": None}, original.etag)
+                continue
+            changed = rewrite(TurnArchive.model_validate_json(json.dumps(original.payload["data"])))
+            result[row_key] = Record({
+                **original.payload, "data": changed.model_dump(mode="json"),
+                "material": turn_material(changed).model_dump(mode="json"),
+            }, original.etag)
+        return result
 
-        before = copy.deepcopy(c.h.transport.backing.rows)
-        monkeypatch.setattr(c.h.store, "read_snapshot", incoherent_source)
-        seen = refusals(monkeypatch)
-        denied = c.h.client.get(path, headers=c.h.headers())
-        assert denied.status_code == 409 and denied.json()["error"]["code"] == "CONVERSATION_CONTEXT_CHANGED"
-        assert seen == [message]
-        assert "compaction" not in denied.json() and c.h.transport.backing.rows == before
-    finally:
-        third.client.close()
+    before = copy.deepcopy(c.h.transport.backing.rows)
+    monkeypatch.setattr(c.h.store, "read_snapshot", incoherent_source)
+    seen = refusals(monkeypatch)
+    denied = c.h.client.get(path, headers=c.h.headers())
+    assert denied.status_code == 409 and denied.json()["error"]["code"] == "CONVERSATION_CONTEXT_CHANGED"
+    assert seen == [message]
+    assert "compaction" not in denied.json() and c.h.transport.backing.rows == before
 
 
 def test_reviewed_memory_metadata_never_returns_the_note_or_its_private_scope(assistant):
     h = assistant
     reviewed_note(h)
     h, control, human = configured_memory(h)
-    turn = open_turn(h, control, human, "context-work-memory")
-    try:
-        catalog = turn.client.work_memory_catalog()
-        settle(turn, ordinary(turn.assignment.sdk_session_id))
-        before = copy.deepcopy(h.transport.backing.rows)
-        task = turn.assignment.task.instruction
-        response = h.client.get(
-            f"/work-policy/v1/conversations/{task.conversation_id}/turns/{task.turn_number}/context",
-            headers=h.headers())
-        assert response.status_code == 200, response.text
-        source = catalog.source
-        assert response.json()["work_memory_source"] == {
-            "claim_id": source.claim_id, "claim_version": source.claim_version,
-            "claim_sha256": source.claim_sha256, "text_sha256": source.text_sha256,
-            "text_utf8_bytes": len(NOTE.encode("utf-8")), "manifest_sha256": source.manifest_sha256,
-            "usage": "historical-reference-not-current-authority",
-        }
-        for private in (NOTE, "TEAM_MEMORY_CANARY", h.binding.tenant_id, h.binding.agent_oid):
-            assert private not in response.text
-        assert h.transport.backing.rows == before
-    finally:
-        turn.client.close()
-
-
-@pytest.mark.parametrize("profile_interface", ["fa-instruction-user-turns-v1"], indirect=True)
-def test_user_source_metadata_refers_to_the_previous_exact_turn_not_its_body(profile_interface, monkeypatch):
-    c = profile_interface
-    original_io, reads = hosted.run_copilot, []
-
-    async def read_then_reply(**options):
-        if options["resume"]:
-            tool = next(value for value in options["tools"] if value.name == "read_user_turn")
-            result = await tool.handler({"arguments": {"turn_number": 1}})
-            reads.append(json.loads(result.text))
-        return await original_io(**options)
-
-    monkeypatch.setattr(hosted, "run_copilot", read_then_reply)
-    draft, first, first_path = saved_turn(c)
-    assert c.browser.ui.get("/api/instructions/progress", params={"thread_id": draft["thread_id"]}).status_code == 200
-    next_draft = post(c, "/api/instructions/" + draft["thread_id"] + "/next").json()["composer"]
-    follow = post(c, "/api/instructions/" + next_draft["request_id"] + "/submit",
-                  {"content": "A second saved turn.", "model": next_draft["model"]})
-    assert follow.status_code == 200, follow.text
-    second = follow.json()["task"]
-    complete(c, second["binding_id"])
-    cid = first["admission"]["conversation_id"]
-    rows = copy.deepcopy(c.h.transport.backing.rows)
-    response = c.h.client.get(f"/work-policy/v1/conversations/{cid}/turns/2/context", headers=c.h.headers())
+    facts = load_case(h, "context-reviewed-memory")
+    turn = stored_turn(control, facts["request_id"])
+    before = copy.deepcopy(h.transport.backing.rows)
+    task = turn.assignment.task.instruction
+    response = h.client.get(
+        f"/work-policy/v1/conversations/{task.conversation_id}/turns/{task.turn_number}/context",
+        headers=h.headers())
     assert response.status_code == 200, response.text
-    original = "Read only this turn's saved metadata. 原文🙂".encode("utf-8")
-    assert len(reads) == 1 and reads[0]["text"].encode("utf-8") == original
-    assert response.json()["user_turn_sources"] == [{
-        "turn_number": 1, "sha256": hashlib.sha256(original).hexdigest(), "utf8_bytes": len(original),
-    }]
-    assert c.h.client.get(first_path, headers=c.h.headers()).json()["user_turn_sources"] is None
-    assert "原文" not in response.text and c.h.transport.backing.rows == rows
-    assert len(c.starts) == len(c.sdk_calls) == 2
+    source = SimpleNamespace(**facts["source"])
+    assert response.json()["work_memory_source"] == {
+        "claim_id": source.claim_id, "claim_version": source.claim_version,
+        "claim_sha256": source.claim_sha256, "text_sha256": source.text_sha256,
+        "text_utf8_bytes": len(NOTE.encode("utf-8")), "manifest_sha256": source.manifest_sha256,
+        "usage": "historical-reference-not-current-authority",
+    }
+    for private in (NOTE, "TEAM_MEMORY_CANARY", h.binding.tenant_id, h.binding.agent_oid):
+        assert private not in response.text
+    assert h.transport.backing.rows == before
 
 
 def test_missing_control_does_not_install_or_enable_a_context_source(real_interface):
     c = real_interface
-    _, _, path = saved_turn(c)
+    _, _, path = stored_saved_turn(c)
     c.h.runtime.work_policy = None
     c.h.transport.requests.clear()
     response = c.h.client.get(path, headers=c.h.headers())

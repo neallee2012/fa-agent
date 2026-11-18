@@ -926,40 +926,6 @@ def test_consumer_does_not_turn_missing_business_result_into_a_retry():
     assert h.data("delivery-obligation", ob)["last_version"] == 0
 
 
-def test_consumer_durable_pages_do_not_starve_later_obligations_behind_unacked_final():
-    from shared_context.behavior_delivery import DeliveryConsumer
-
-    h = Harness()
-    obligations = []
-    for number in range(3):
-        ob, _, _ = h.admit(f"page-{number}", sequence=number)
-        h.work_result(ob, evidence_id=f"result-{number}")
-        obligations.append(ob)
-    consumer = DeliveryConsumer(h.core)
-    for _ in range(3):
-        consumer.drain("root", lambda _: CONTEXT, "worker", limit=1)
-    assert all(h.data("delivery-obligation", ob)["final_delivery_id"] for ob in obligations)
-    assert all(h.data("delivery-obligation", ob)["fulfillment"] == "pending" for ob in obligations)
-    assert h.data("delivery-quota", "root", "root")["scans_remaining"] == 97
-
-
-def test_consumer_page_claim_response_loss_resumes_same_persisted_page():
-    from shared_context.behavior_delivery import DeliveryConsumer
-
-    h = Harness()
-    ob, _, _ = h.admit()
-    h.work_result(ob)
-    h.client.failure = "after"
-    with pytest.raises(Problem):
-        DeliveryConsumer(h.core).drain("root", lambda _: CONTEXT, "first", limit=1)
-    cursor = h.data("delivery-consumer-cursor", "root")
-    assert cursor["active"] and cursor["selected"] == [ob]
-    rebuilt = DeliveryConsumer(h.broker(BehaviorStore(FakeTable(h.client.backing), SCOPE)))
-    rebuilt.drain("root", lambda _: CONTEXT, "restarted", limit=1)
-    assert h.data("delivery-quota", "root", "root")["scans_remaining"] == 99
-    assert h.data("delivery-obligation", ob)["final_delivery_id"]
-
-
 def test_authority_snapshot_delegates_to_public_store_reader(monkeypatch):
     from shared_context.behavior_delivery import authority_snapshot
 

@@ -28,7 +28,7 @@ from shared_context.native_turns import NativeTurnControl
 from test_agent_runtime import peer_runtime
 from test_capability_calls import KEY, listed, result
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_native_agent_api import relay_case
 from test_native_capability_api import BODY, SKILLS, WEB, skilled, skilled_http, started
@@ -377,3 +377,50 @@ def test_an_mcp_api_scope_refusal_still_refuses_the_turn(skilled_http, offline_m
     with pytest.raises(Problem) as failed:
         bind(loop, context_for(case, started(case, (WEB,), rid="scope-rid")), upstream)
     assert failed.value.body["error"]["code"] == REFUSED
+
+
+class _Counted(httpx.AsyncBaseTransport):
+    def __init__(self, inner):
+        self.inner, self.paths = inner, []
+
+    async def handle_async_request(self, request):
+        self.paths.append(request.url.path)
+        return await self.inner.handle_async_request(request)
+
+
+@pytest.mark.parametrize("failure", ["source-exception", "schema-spoof"])
+def test_a_failed_or_schema_spoofed_skill_read_never_discloses_the_body_or_the_private_error(
+        skilled_http, signing_key, monkeypatch, failure):
+    """The signed API route itself answers; a source exception gets its own unexpected-error reply, not a stand-in."""
+    from fastapi import FastAPI
+    from shared_context.behavior_api import _install_error_handlers
+    from shared_context.native_capability_api import install_native_capability_routes
+    from agent_runtime_routing_helpers import agent_headers
+
+    (case, refs), (loop, _) = skilled_http
+    app = FastAPI()
+    _install_error_handlers(app)
+    install_native_capability_routes(app, case.base.a, enabled=True)
+    transport = _Counted(httpx.ASGITransport(app=app, raise_app_exceptions=False))
+    token = agent_headers(case.base.c, signing_key, 0)["Authorization"].removeprefix("Bearer ")
+    context = context_for(case, started(case, (SKILLS,), skills=refs), token=lambda: token)
+
+    async def run():
+        async with AsyncExitStack() as stack:
+            return await bind_capabilities(context, (approved_skills_provider(transport=transport),), stack)
+    skill = next(spec for binding in loop.run_until_complete(run()) for spec in binding.tools)
+    arguments = {"name": "receipt-guide"}
+    if failure == "schema-spoof":
+        arguments["path"] = "../SKILL.md"
+    else:
+        def unavailable(*_args, **_kwargs):
+            raise RuntimeError("PRIVATE_SOURCE_EXCEPTION_CANARY")
+        monkeypatch.setattr(case.skills, "read", unavailable)
+    served = list(transport.paths)
+    with pytest.raises(ToolFailure) as failed:
+        loop.run_until_complete(skill.handler(packet("read_skill", arguments, "refused-read")))
+    assert failed.value.public_code == (REFUSED if failure == "schema-spoof" else UNKNOWN)
+    shown = json.dumps([str(failed.value), *map(str, failed.value.args)])
+    assert BODY not in shown and "PRIVATE_SOURCE_EXCEPTION_CANARY" not in shown
+    assert transport.paths[len(served):] == ([] if failure == "schema-spoof" else
+                                             ["/work-policy/v1/native-capabilities/read-skill"])

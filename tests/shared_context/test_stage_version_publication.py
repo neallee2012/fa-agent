@@ -18,7 +18,11 @@ def stage_module(filename="ci_deploy.py"):
     spec = importlib.util.spec_from_file_location("offline_stage_publication", ROOT / "deploy" / "stage" / filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    if filename == "ci_deploy.py":  # ADR-0009 2d-ii deploys only with the 2d-i switch on
+    stage_json = ROOT / "deploy" / "stage" / "stage.json"
+    if filename != "ci_deploy.py":
+        module.STAGE = module.load_config(stage_json)
+    else:  # ADR-0009 2d-ii deploys only with the 2d-i switch on
+        module.use_profile(stage_json)
         module.STAGE["api_environment"]["FA_NATIVE_SESSION_GUARD_ENFORCE"] = "1"
         module.switch_preconditions = lambda *args, **kwargs: None  # its own tests: test_stage_ci_native_2di.py
     return module
@@ -440,7 +444,8 @@ def test_seed_cli_rejects_invalid_core_or_image_digest_before_credentials_and_in
     monkeypatch.setattr(state.module, "AzureCliCredential",
                         lambda **_k: pytest.fail("invalid --core must stop before credentials"))
     monkeypatch.setattr(state.module.sys, "argv", [
-        "seed_agents.py", "--out", str(out), "--image", state.image, "--core", core])
+        "seed_agents.py", "--config", str(ROOT / "deploy" / "stage" / "stage.json"),
+        "--out", str(out), "--image", state.image, "--core", core])
     with pytest.raises(SystemExit, match="code identity"):
         state.module.main()
     assert not out.exists() and state.reads == []

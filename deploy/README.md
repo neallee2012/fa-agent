@@ -1,17 +1,18 @@
 # FA deployment profiles
 
 The deployment scripts use one environment profile instead of embedding a
-subscription, resource group, or endpoint in each script. The checked-in
-`deploy/stage/stage.json` remains the default, while another environment can be
-selected with `--config` or `FA_DEPLOY_CONFIG`.
+subscription, resource group, or endpoint in each script. There is no default
+profile: every script needs `--config` or `FA_DEPLOY_CONFIG` and stops without
+one, so a forgotten flag cannot write to stage. The stage deploy workflow sets
+`FA_DEPLOY_CONFIG: deploy/stage/stage.json` on its deploy job.
 
 <a id="deploying-dev"></a>
 ## Deploying dev
 
 Neal 2026-10-19 決定：dev（`faexample`，RG `rg-faexample`）改走
 `deploy/stage/ci_deploy.py` 加 `deploy/dev/dev.json`，用同一套檢查，取代部署線的 Git 外工具。
-**每一個命令都要帶 `--config deploy/dev/dev.json`**：不帶時用 `FA_DEPLOY_CONFIG`，再沒有就是
-`deploy/stage/stage.json`，也就是對 stage 寫入。`deploy/dev/` 不進公開匯出（[public-sync](../docs/public-sync.md#不會同步的檔案)），
+**每一個命令都要帶 `--config deploy/dev/dev.json`**：不帶時用 `FA_DEPLOY_CONFIG`，兩者都沒有就拒絕執行
+（2026-11-12 起沒有預設；以前會落到 `deploy/stage/stage.json`，也就是對 stage 寫入）。`deploy/dev/` 不進公開匯出（[public-sync](../docs/public-sync.md#不會同步的檔案)），
 所以這裡的 `deploy/dev/...` 路徑只寫成文字，不做連結。
 
 **一次性轉換（W1、W2）先做完才能跑 `guard` 以後的步驟**（Neal 2026-10-19 批准，只限 dev）。共同設定：
@@ -269,7 +270,7 @@ The input also carries three options learned from the 2026-10-07 deployment:
     | dev | `webiq-key`（profile 的 `webiq_connection`） | `python deploy/stage/new_webiq_connection.py --config deploy/dev/dev.json --rotate` |
     | azd 環境 | `<env>-webiq-key` | `python deploy/stage/new_webiq_connection.py --config .azure/<env>/fa/profile.json --rotate` |
 
-    一定帶 `--config`（不帶時用 `FA_DEPLOY_CONFIG`，再沒有就是 stage）。需要 `httpx` 與 `azure-identity`，可用 deploy 建好的
+    一定帶 `--config`（不帶時用 `FA_DEPLOY_CONFIG`，再沒有就拒絕執行）。需要 `httpx` 與 `azure-identity`，可用 deploy 建好的
     `.azure/<env>/fa/venv`，或 `pip install -r src/fa-shared-context-poc/requirements.txt`。`--rotate` 先唯讀確認連線已存在
     且 target 是 WebIQ（不存在或不是就停下、什麼都不寫），再隱藏輸入新金鑰、對同一條連線做一次 PUT、讀回要 200。同一條連線的 PUT 是冪等的，結果不明時重跑
     `--rotate` 是安全的。FA 的 image 與 profile 都沒有這把 key，所以換完不用重新部署 FA。Foundry 端在每次呼叫時讀取連線的行為待 live 換 key 後確認。
@@ -926,7 +927,7 @@ against the matching image's code identity, not a different checkout.
 Version sync derives `fa_build` from its installed `code_sha256()`; its optional
 `--core` checks that exact value before configuration/credentials are loaded.
 CI passes the checkout code identity explicitly and keeps its existing runtime
-identity assertion. The default stage profile is unchanged.
+identity assertion.
 
 For definition readback, only the service-added top-level
 `container_protocol_versions: []` is equivalent to an omitted field.

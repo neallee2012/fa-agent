@@ -565,7 +565,6 @@ def test_an_authorization_for_another_plan_is_never_reused(hooks, tmp_path, monk
     ctx = context(hooks, tmp_path, {})
     with pytest.raises(SystemExit, match="approves another plan"):
         hooks.fresh_install(ctx, "img", tmp_path / "runtime")
-    assert "FA_DEPLOY_CONFIG" not in os.environ  # set only for run_fresh_job's import
 
 
 @pytest.mark.parametrize("answer", ["y", "yes", " Y ", "YES"])

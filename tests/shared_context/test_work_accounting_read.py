@@ -23,7 +23,7 @@ from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from test_behavior_api import RuntimeHarness
 from test_m3_auth import UNKNOWN_OID, jwk_client, signing_key, token
-from test_work_cost_policy import install_offline
+from work_cost_policy_helpers import install_offline
 
 PATH = "/work-policy/v1/accounting"
 
@@ -67,10 +67,7 @@ def accounting(auth, jwk_client, signing_key):
         model_pending_microusd=750_000, model_metered_microusd=125_000, budget_enforced=False,
     )
     h.app = create_behavior_app(h.runtime, h.verifier)
-    h.starts = []
-    install_work_policy_routes(
-        h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier), start_work=h.starts.append,
-    )
+    install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier))
     with TestClient(h.app) as client:
         h.client = client
         yield h
@@ -259,7 +256,7 @@ def test_read_only_snapshot_keeps_unknown_model_cost_and_every_original_record(a
     response = h.client.get(PATH, headers=h.headers())
     assert response.status_code == 200, response.text
     assert h.transport.backing.rows == before
-    assert h.starts == [] and h.executor.starts == [] and h.control.records == {}
+    assert h.executor.starts == [] and h.control.records == {}
     assert all(request.method == "GET" for request in h.transport.requests)
     keys = Counter(unquote(request.url).split("RowKey='")[1].split("'")[0] for request in h.transport.requests)
     assert keys == {
@@ -373,7 +370,7 @@ def test_unreadable_storage_errors_are_sanitized_and_do_not_reset_anything(accou
     assert response.status_code == 503, response.text
     assert response.json()["error"]["code"] == "BEHAVIOR_DEPENDENCY_UNAVAILABLE"
     assert "SYNTHETIC_STORAGE_SECRET" not in response.text and "private row" not in response.text
-    assert h.transport.backing.rows == before and h.starts == []
+    assert h.transport.backing.rows == before
 
 
 @pytest.mark.parametrize("query,body", [

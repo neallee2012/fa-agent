@@ -1,6 +1,7 @@
 """Every refusal of the saved-result reader, on the rows of a real synthetic native turn.
 
-The turn runs the real submit, claim, save, forward and fetch path. Each case then edits what the
+The finished turn is the whole stored Table and Blob the old submit, claim, save and forward path left
+(legacy_turn_rows_helpers); the fetch is real. Each case then edits what the
 reader sees, nothing is written, and a forged row must still parse through its real model. A branch
 a model already refuses (`work_revision`, a terminal evidence that is not idle) has no case here.
 """
@@ -10,15 +11,14 @@ from types import SimpleNamespace
 import pytest
 
 from shared_context import behavior_wire as wire
-from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_delivery import ArtifactVersion, VerifiedWorkResult, _Payload
 from shared_context.behavior_foundry import native_key
 from shared_context.behavior_operations import _parse, control_key
 from shared_context.behavior_runtime import material
 from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
-from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from legacy_turn_rows_helpers import stored_turn
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 DIGEST = "0" * 64
@@ -104,11 +104,9 @@ def reading(c, monkeypatch, binding, request_id):
 
 
 @pytest.fixture
-def finished(synthetic_standing_v1, monkeypatch):
-    c = synthetic_standing_v1
-    turn = saved_turn(c, "result-access-finished")
-    c.h.runtime.controller.step(turn.binding.binding_id)
-    t = reading(c, monkeypatch, turn.binding, "result-access-fetch")
+def finished(stored_turn, monkeypatch):
+    c = stored_turn("result-access-finished")
+    t = reading(c, monkeypatch, c.turn.binding, "result-access-fetch")
     row = c.h.runtime.store.read_snapshot((t.job,))[t.job].payload["data"]
     t.launch = native_key("launch", native_key("launch-id", row["binding"]["start_request_id"]))
     t.completion = worker_key("completion", t.binding.job_id, str(row["generation"]))
@@ -116,10 +114,9 @@ def finished(synthetic_standing_v1, monkeypatch):
 
 
 @pytest.fixture
-def cancelled(synthetic_standing_v1, monkeypatch):
-    c = synthetic_standing_v1
-    binding, _ = c.control.submit(c.human, InstructionSubmit(request_id="result-access-cancelled", content="Never started."))
-    c.control.cancel(c.human, binding.binding_id)
+def cancelled(stored_turn, monkeypatch):
+    c = stored_turn("result-access-cancelled")
+    binding = c.turn.binding
     assert c.h.runtime.dep.workers.inspect(binding.job_id).binding is None
     t = reading(c, monkeypatch, binding, "result-access-cancelled-fetch")
     t.completion = worker_key("completion", binding.job_id, "0")

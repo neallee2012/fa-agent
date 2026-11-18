@@ -15,7 +15,7 @@ from shared_context.behavior_delegation_wire import child_configuration
 from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from sdk_checkpoint_local import sse
 from test_m2_copilot import runtime_path
-from test_skill_isolation_native import child_environment
+from skill_isolation_native_helpers import child_environment
 
 
 def test_zero_tool_child_cannot_execute_the_parents_effect_handler(tmp_path, runtime_path):

@@ -18,13 +18,13 @@ from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.native_responses_wire import SENT_RELEASE
 from test_behavior_assistant import assistant
-from test_instruction_flow import runtime_path
+from instruction_flow_helpers import runtime_path
 from test_m3_auth import UNKNOWN_OID, jwk_client, signing_key, token
 from test_skill_purpose import BODY, PROFILE, PURPOSE, deactivate as deactivate_skill
-from test_skill_purpose_api import add_purpose_skill
-from test_work_policy_lifecycle import enabled
+from skill_purpose_api_helpers import add_purpose_skill
+from work_policy_lifecycle_helpers import enabled
+from agent_template_helpers import PATH
 
-PATH = "/work-policy/v1/agent-template"
 NAME = "receipt-guide"
 PROMPT_DEFAULT_ENV = "FA_INSTRUCTION_DEFAULT_PROMPT_PROFILE"
 

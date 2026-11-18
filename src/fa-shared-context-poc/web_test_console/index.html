@@ -560,7 +560,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <div id="error" role="alert" hidden><p id="error-message"></p><div class="error-actions">
 <button id="copy-error-request" type="button" hidden>複製 request ID</button>
 <button id="open-error-details" type="button">詳情</button></div></div>
-<div class="composer-surface">
+<div class="composer-surface" id="composer-surface">
 <label for="instruction" class="sr-only">訊息</label>
 <textarea id="instruction" rows="1" placeholder="傳送訊息…" aria-describedby="instruction-reason input-capacity" disabled></textarea>
 <details id="attachment-panel" class="attachment-panel" aria-label="附加檔案" hidden><summary>附加檔案</summary>
@@ -600,7 +600,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <p id="environment-note" class="reason" role="status" hidden></p>
 <p id="peer-wait-note" class="reason" role="status" hidden></p>
 <p id="model-lock-note" class="reason" role="status" hidden><span id="model-lock-text"></span> <button id="model-lock-new-conversation" type="button"></button></p>
-<div class="composer-meta"><p id="instruction-reason" role="status">連線後即可聊天</p><span class="composer-shortcut">Enter 送出 · Shift + Enter 換行</span><p id="input-capacity" hidden></p></div>
+<div class="composer-meta"><p id="instruction-reason" role="status">連線後即可聊天</p><span class="composer-shortcut" id="composer-shortcut">Enter 送出 · Shift + Enter 換行</span><p id="input-capacity" hidden></p></div>
 </div>
 </div></div>
 <aside class="diagnostics" id="diagnostics" aria-label="支援明細" hidden>
@@ -5978,6 +5978,10 @@ function renderComposer(){
     !composer?(threadLoading?"正在讀取這位助理的對話…":"這位助理的對話還沒讀到，請從選單更新清單"):
     !models.length?"尚無可用模型，請從選單更新清單":"正在準備對話…";
   text("instruction-reason",reason||(openingKept?"剛才在新對話打的字已保留；新對話開好後會自動帶回，不會自動送出。":""));
+  // A conversation still on the retired job-bound lane is read-only: no input, send, stop or reset, one plain sentence.
+  const legacyReadOnly=composer?.read_only_legacy===true&&!opening;
+  for(const id of ["composer-surface","composer-shortcut","reset-session"])el(id).hidden=legacyReadOnly;
+  if(legacyReadOnly)text("instruction-reason",composer.message);
   // Read-only is why this conversation takes no message, not something the owner has to do; a card here still asks.
   renderPresence(resumeBlocked&&composer?.agent_conversation?.read_only!==true||appendUnknown||Boolean(unresolvedSentDraft)||
     Boolean(composer?.command_incomplete)||Boolean(composer&&!opening&&!models.length));
@@ -6225,12 +6229,14 @@ function processingLine(event,events,active,now){
 }
 // What the assistant is doing right now, in the words of the main screen.
 // A running native turn held by the owner's card says so instead of a generic running line (stage 2026-10-10).
-const HELD_TURN_TEXT={"正在等你批准":"這個回合正在等你批准","正在等你回答":"這個回合正在等你回答"};
+// The cards that hold a turn, first named first, and what the main screen says for each.
+const HELD_ACTIVITY=[["approval_required","正在等你批准"],["connect_required","正在等你連線"],["question_required","正在等你回答"]];
+const heldTurnText=activity=>HELD_ACTIVITY.some(([,words])=>words===activity)?"這個回合"+activity:null;
 function processingActivity(task,events){
   // A card answered a moment ago no longer holds the turn: what the assistant does next shows at once.
   const waiting=currentAttention().filter(entry=>attentionTurn(entry)===task.task_id&&!hitlSettled(entry));
-  if(waiting.some(entry=>entry.item.type==="approval_required"))return "正在等你批准";
-  if(waiting.length)return "正在等你回答";
+  const held=HELD_ACTIVITY.find(([type])=>waiting.some(entry=>entry.item.type===type));
+  if(held)return held[1];
   const open=events.filter(event=>event.kind==="tool_started"&&!events.some(other=>other.kind==="tool_completed"&&
     publicToolStart(event)!==null&&publicToolStart(other)===publicToolStart(event)));
   const tool=open.at(-1)?.tool_name||"";
@@ -7034,7 +7040,7 @@ function renderConversation(tasks){
       progress?.stream?.durable===false&&progress.stream.text?{stream:progress.stream.text}:
       liveTextFor(task)?{stream:liveTextFor(task),live:true}:
       ["queued","starting","running","capacity_uncertain","waiting_dependency","accepted","started"].includes(progress?.state||task.status?.data?.state)?
-        {wait:nativeProfile(task.state_profile)&&HELD_TURN_TEXT[processingActivity(task,[])]||"正在準備回覆…"}:
+        {wait:nativeProfile(task.state_profile)&&heldTurnText(processingActivity(task,[]))||"正在準備回覆…"}:
       olderTurnNeedsRead(task)||olderTurnReads.has(scopeKey(task.task_id))?{wait:"正在載入回覆…"}:
         "尚未載入回覆，可從選單更新。");
     if(typeof content==="string"||typeof content.wait==="string"){
@@ -7384,8 +7390,8 @@ function render(){
   text("submission-reconcile-note",responseAccepted?
     "工作台按原 RID 自動有限核回，可能接續原工作；不是新交辦。達上限仍可取消，原未確認紀錄保留。":
     "核對不會送出工作。確認尚未完成接單後，可明確以完整原請求重試；不換 RID 或內容，原未確認紀錄保留。");
-  el("submission-reconcile-panel").hidden=!(t?.instruction&&t.submission.state==="UNKNOWN"&&!t.admission)
-    &&!nativeAccepted&&!nativeRefused;
+  el("submission-reconcile-panel").hidden=(!(t?.instruction&&t.submission.state==="UNKNOWN"&&!t.admission)
+    &&!nativeAccepted&&!nativeRefused)||state.composer?.read_only_legacy===true;
   if(responseAccepted){
     text("submit-retry","不另行重送");
     text("submit-retry-reason","此路徑由原 RID 的有限自動核回處理；已開始、排隊或未知終態不會重送。");

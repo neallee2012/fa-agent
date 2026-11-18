@@ -17,7 +17,7 @@ from .behavior_native_turn_wire import (
     NativeAgentCommand, NativeConversationRead, NativeRead, NativeRoutineSubmit, material_digest,
 )
 from .behavior_operations import control_key
-from .behavior_routine import _occurrence, latest_occurrence
+from .behavior_routine_wire import _occurrence, latest_occurrence
 from .behavior_store import ControlChanges, ControlRequest, ControlWrite
 from .behavior_team_registry import IdentityRegistration, identity_key
 from .behavior_wire import Identifier, WireModel

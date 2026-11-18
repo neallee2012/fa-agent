@@ -9,7 +9,7 @@ import pytest
 from shared_context.behavior_native_turn_wire import NATIVE_REQUEST
 from shared_context.native_append_wire import NativeAppend, NativeAppendRead, NativeAppendReceipt, NativeAppends
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_native_turn_api import native_api
 from test_web_test_console_native import first, native_console, post, progress, send

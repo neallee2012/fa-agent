@@ -32,7 +32,7 @@ from deployment_config import load_config, write_x as _write_x
 sys.path.insert(0, str(HERE.parents[1] / "src" / "fa-shared-context-poc"))
 from shared_context.behavior_agent_versions import METADATA_DEFINITION, definition_matches, definition_sha256
 
-STAGE = load_config(require_runtime=False)
+STAGE = None  # the selected profile, loaded by main() from --config or FA_DEPLOY_CONFIG
 PROTOCOLS = [{"protocol": name, "version": "2.0.0"} for name in ("invocations", "invocations_ws", "responses")]
 ENDPOINT_KEYS = ("invocations", "invocations_ws")
 
@@ -147,7 +147,7 @@ def patch_endpoint(client, headers, out, name):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", help="environment profile; defaults to FA_DEPLOY_CONFIG or the checked-in stage profile")
+    parser.add_argument("--config", help="environment profile; required unless FA_DEPLOY_CONFIG is set")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--core", required=True, help="64-hex code_sha256() printed by the matching API/Hosted image")

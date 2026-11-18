@@ -12,7 +12,7 @@ from shared_context.behavior_wire import AssistantSdkStop
 from shared_context.errors import Problem
 from test_native_profiles import controlled_compaction
 from test_native_turns import local_env
-from test_sdk_compaction_product import ordinary
+from sdk_compaction_product_helpers import ordinary
 
 
 @pytest.mark.parametrize("changed", [

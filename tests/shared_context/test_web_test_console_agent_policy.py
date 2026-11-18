@@ -4,6 +4,7 @@ Second-hop projection fixtures do not execute the B consumer or claim an A SDK c
 """
 
 import asyncio
+import hashlib
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from shared_context.behavior_code_identity import code_sha256 as core_code_sha25
 from shared_context.behavior_assistant import _LocalHttp
 from shared_context.behavior_profile_selection import SelectConversationProfile
 from shared_context.behavior_peer_runtime import install_peer_routing
+from shared_context.behavior_server_config import ServerConfiguration
 from web_test_console.adapter import canonical, parse_config, sha
 from web_test_console.agent_connections import AgentConnections
 from web_test_console.bridge import create_app
@@ -27,10 +29,16 @@ from test_conversation_transfer_startup import synthetic_standing_v1
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_web_test_console_standing import configuration
+from legacy_console_rows_helpers import load_rows, seed_journal
+
+
+STORED_SHA256 = hashlib.sha256(b"fa-test-stored-peer-configuration").hexdigest()
 
 
 @pytest.fixture
 def peer_console(request, tmp_path, signing_key):
+    # Pinned so the stored peer rows (stored_peer) keep verifying: they are bound to this configuration digest.
+    request.getfixturevalue("monkeypatch").setattr(ServerConfiguration, "sha256", property(lambda _: STORED_SHA256))
     api_loop, ui_loop, restart_loop = (asyncio.new_event_loop() for _ in range(3))
     try:
         peer = request.getfixturevalue("peer_runtime")
@@ -119,6 +127,17 @@ def test_peer_template_selection_uses_its_original_scope_and_journal_once(peer_c
     assert c.a.runtime.work_policy is c.c.control and c.c.sessions.calls == []
 
 
+def stored_peer(c, name, agent_id):
+    """The shared Table over the stored rows of `name`, and the journal of `agent_id`'s console (opened by a prior
+    read) holding the work the retired submit admitted there; returns facts."""
+    facts = load_rows(SimpleNamespace(transport=SimpleNamespace(backing=c.c.h.table.backing), assistant=c.a.assistant),
+                      name)
+    for composition in (c.a, c.b):
+        composition.runtime.work_policy.refresh()
+    seed_journal(c.app.state.agent_consoles.consoles[agent_id], facts)
+    return facts
+
+
 def test_published_directory_and_both_prefixes_reach_only_the_original_agent(peer_console):
     c = peer_console
     listed = c.ui.get("/api/agents").json()
@@ -127,11 +146,8 @@ def test_published_directory_and_both_prefixes_reach_only_the_original_agent(pee
     a_headers = {**c.headers, "X-Console-Agent": c.aid}
     state = c.ui.get("/api/instructions/models", headers=a_headers)
     assert state.status_code == 200, state.text
-    request_id = state.json()["composer"]["request_id"]
-    submitted = c.ui.post("/api/instructions/" + request_id + "/submit",
-        json={"content": "Only this original A work.", "model": "gpt-4.1-mini"}, headers=a_headers)
-    assert submitted.status_code == 200, submitted.text
-    task = submitted.json()["task"]
+    facts = stored_peer(c, "console-peer-a-directory", c.aid)
+    request_id, task = facts["request_id"], facts["task"]
     messages = c.ui.get("/api/instructions/" + request_id + "/agent-messages", headers=a_headers)
     assert messages.status_code == 200, messages.text
     assert messages.json() == {
@@ -212,82 +228,11 @@ def test_native_connection_without_a_versioned_template_still_refuses_before_any
     assert not [call for call in c.calls if call[0] == "POST"]
 
 
-@pytest.mark.parametrize("memory", [False, True], ids=["ordinary", "own-memory"])
-def test_peer_submission_keeps_its_declared_preflight_scope_and_original_request(peer_console, memory):
-    c = peer_console
-    if memory:
-        from shared_context.memory_bridge_settings import MemoryBridgeSettingsService, SelectMemoryBridgeSettings
-        MemoryBridgeSettingsService(c.b.runtime).select(c.c.human, SelectMemoryBridgeSettings(
-            schema_version="fa-memory-bridge-settings-command-v1", request_id="peer-memory-choice",
-            expected_settings_id=None, enabled=True))
-    state = c.ui.get("/api/instructions/models", headers=c.headers)
-    assert state.status_code == 200, state.text
-    request_id = state.json()["composer"]["request_id"]
-    before = Path(c.entries[0]["journal_path"]).read_bytes()
-    body = {"content": "Keep this original peer request.", "model": "gpt-4.1-mini"}
-    path = "/api/instructions/" + request_id + "/submit"
-    accepted = c.ui.post(path, json=body, headers=c.headers)
-    assert accepted.status_code == 200, accepted.text
-    task = accepted.json()["task"]
-    assert task["task_id"] == request_id
-    assert task["binding_id"] in c.b.runtime.bindings and task["binding_id"] not in c.a.runtime.bindings
-    inspected = c.ui.post("/api/tasks/" + request_id + "/status", json={}, headers=c.headers)
-    assert inspected.status_code == 200, inspected.text
-    assert inspected.json()["task"]["execution"]["observation"] is not None, inspected.text
-    if memory:
-        assert c.b.runtime.work_policy.records[task["binding_id"]].profile.memory_scope.enabled is True
-    repeated = c.ui.post(path, json=body, headers=c.headers)
-    assert repeated.status_code == 200, repeated.text
-    assert len([call for call in c.calls if call[0] == "POST"
-                and call[1] == "/agents/" + c.bid + "/work-policy/v1/submit"]) == 1
-    assert Path(c.entries[0]["journal_path"]).read_bytes() == before
-    assert c.c.sessions.calls == []
-
-
-def test_peer_unknown_submission_survives_a_new_bridge_and_reconciles_only_its_original_command(peer_console):
-    c = peer_console
-    state = c.ui.get("/api/instructions/models", headers=c.headers).json()
-    request_id = state["composer"]["request_id"]
-    path = "/api/instructions/" + request_id + "/submit"
-    body = {"content": "Preserve the original B intent.", "model": "gpt-4.1-mini"}
-    a_before = Path(c.entries[0]["journal_path"]).read_bytes()
-    c.faults.lose_submit = True
-    failed = c.ui.post(path, json=body, headers=c.headers)
-    assert failed.status_code == 503
-    original = c.app.state.agent_consoles.resolve(c.bid).journal.get(request_id, "submit")
-    assert original["state"] == "UNKNOWN"
-    c.faults.lose_submit = False
-    app = create_app(c.configs[0], c.entries[0]["journal_path"], agent_connections=c.manifest,
-        instruction_connection=c.connections[0], port=8875, backend=c.backend, clock=lambda: c.c.h.time,
-        token_provider=lambda: c.c.h.headers(c.signing_key, "Behavior.Read Behavior.Approve")["Authorization"][7:])
-    with TestClient(app, base_url="http://127.0.0.1:8875",
-                    backend_options={"loop_factory": lambda: c.restart_loop}) as ui:
-        ui.get("/")
-        headers = {"Origin": "http://127.0.0.1:8875", "X-Console-CSRF": ui.get("/api/state").json()["csrf"],
-                   "X-Console-Agent": c.bid}
-        assert ui.post("/api/authenticate", json={}, headers=headers).status_code == 200
-        assert ui.get("/api/instructions/models", headers=headers).status_code == 200
-        repeated = ui.post(path, json=body, headers=headers)
-        assert repeated.status_code == 200, repeated.text
-        assert repeated.json()["task"]["submission"]["state"] == "UNKNOWN"
-        reconciled = ui.post("/api/tasks/" + request_id + "/submit-reconcile", json={}, headers=headers)
-        assert reconciled.status_code == 200, reconciled.text
-        assert reconciled.json()["task"]["admission"] is not None
-        assert app.state.agent_consoles.resolve(c.bid).journal.get(request_id, "submit") == original
-    assert len([call for call in c.calls if call[0] == "POST"
-                and call[1] == "/agents/" + c.bid + "/work-policy/v1/submit"]) == 1
-    assert Path(c.entries[0]["journal_path"]).read_bytes() == a_before
-    assert c.c.sessions.calls == []
-
-
 def test_agent_message_projection_is_bound_to_original_work_and_never_a_human_receipt(peer_console):
     c = peer_console
-    state = c.ui.get("/api/instructions/models", headers=c.headers).json()
-    request_id = state["composer"]["request_id"]
-    submitted = c.ui.post("/api/instructions/" + request_id + "/submit",
-        json={"content": "Original peer work.", "model": "gpt-4.1-mini"}, headers=c.headers)
-    assert submitted.status_code == 200, submitted.text
-    task = submitted.json()["task"]
+    c.ui.get("/api/instructions/models", headers=c.headers)
+    facts = stored_peer(c, "console-peer-b-original", c.bid)
+    request_id, task = facts["request_id"], facts["task"]
     cid = task["admission"]["conversation_id"]
     c.messages.body = {
         "schema_version": "fa-agent-message-list-v1", "agent_id": c.bid,
@@ -327,12 +272,11 @@ def test_agent_message_projection_is_bound_to_original_work_and_never_a_human_re
 def test_second_hop_projection_keeps_original_a_pending_and_never_creates_b_submission(peer_console, kind, status):
     c = peer_console
     a_headers = {**c.headers, "X-Console-Agent": c.aid}
-    draft = c.ui.get("/api/instructions/models", headers=a_headers).json()["composer"]
-    request_id = draft["request_id"]
-    admitted = c.ui.post("/api/instructions/" + request_id + "/submit", headers=a_headers,
-        json={"content": "Keep the original A result and delivery obligation.", "model": "gpt-4.1-mini"})
-    assert admitted.status_code == 200, admitted.text
-    task = admitted.json()["task"]
+    c.ui.get("/api/instructions/models", headers=a_headers)
+    request_id = stored_peer(c, "console-peer-a-handoff", c.aid)["request_id"]
+    # This console did not send the stored work, so its view of it is the one read back from the journal.
+    task = next(item for item in c.ui.get("/api/state", headers=a_headers).json()["tasks"]
+                if item["task_id"] == request_id)
     cid = task["admission"]["conversation_id"]
     b_state = c.ui.get("/api/state", headers=c.headers).json()
     assert all(item["instruction"] is None for item in b_state["tasks"])

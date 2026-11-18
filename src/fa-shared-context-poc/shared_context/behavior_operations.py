@@ -1,46 +1,17 @@
-"""Bounded operation preparation/accounting core; execution is opt-in.
+"""Operation records, canonical operation material and the broker's read side.
 
-The embedding server supplies an authenticated ExecutionContext, a trusted UTC
-clock and one version-pinned RegisteredAdapter. None comes from model arguments.
-Only a trusted approval/control writer may provision Owner/Policy/Grant/Budget
-records, using control_key() and the SAME BehaviorStore authority/guard. This
-module provides no human-grant creation endpoint or out-of-band predicate writer.
-Owner records contain server-assigned stable operation IDs for logical actions;
-models cannot mint a replacement ID to retry an unresolved action. The embedding
-server must preserve that identity across resumes, rather than assign a new ID.
-Units are integer reservation units, NOT a provider billing cap.
-
-Accounting adapter callbacks resolve compliant content or VERIFY previously obtained
-destination evidence. They must return the narrow models below or a safe Problem;
-no accounting callback executes a tool, shell or arbitrary HTTP request.
-Concrete execution lives in behavior_effects (WorkStateEffectAdapter); the arm/consume base is behavior_dispatch.
-No adapter is installed by default. Evidence-contract options default to disabled;
-registering a boolean in ToolIntent cannot enable them or supply approval.
-
-prepare() resolves aliases once and returns the retained canonical bytes for an
-approval preview; the caller must not resolve the alias again. authorize() reads
-those bytes and all current predicates in one guard-protected transaction. Its
-receipt is an accounting fact, NOT a reusable dispatch ticket. Replaying it
-returns the original receipt without another reservation. execute() requires an
-explicit concrete adapter; its dispatcher consumes saved bytes and enforces a
-fresh last gate, one-attempt delivery, clock window and destination conditions.
-
-After conflict/unknown, do not blindly resubmit: use reconciliation_request()
-with BehaviorStore.reconcile(). A missing receipt remains unknown. A successful
-reconciliation is historical read-back, never permission to dispatch again.
-The optional behavior_effects adapter (on behavior_dispatch) adds a durable one-consume lifecycle.
-Without it execute() remains disabled. Authorization receipts remain accounting
-only; they never confer permission to send, including after reconciliation.
-Callbacks inside transact are side-effect-free. There are no locks, refunds,
-deletions, Blob pointers or GC. Inline operation/evidence material is retained,
-including when commit/outcome is unknown; deployment retention protection still
-requires independent verification. actual_environment=NOT_RUN.
+The embedding server supplies an authenticated ExecutionContext, a trusted UTC clock and one version-pinned
+RegisteredAdapter; none comes from model arguments. Owner records contain server-assigned stable operation IDs.
+prepare/authorize/execute and outcome recording were retired with the legacy job lane (2026-11-17,
+DECISIONS §12): no route or runtime caller remains. The record models stay so stored rows still parse, and the
+GET operation preview and decision state read them. actual_environment=NOT_RUN.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -48,9 +19,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, TypeVar
 
 from pydantic import ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from .behavior_store import (
-    BehaviorStore, ControlChanges, ControlRequest, ControlWrite, Digest, InlineMaterial,
-)
+from .behavior_store import BehaviorStore, ControlWrite, Digest, InlineMaterial
 from .errors import Problem
 from .models import Identifier, StrictModel
 from .records import Record
@@ -117,11 +86,6 @@ class OperationDescription(_Model):
             if len({item.resource_id for item in items}) != len(items):
                 raise ValueError("duplicate resolved resource")
         return self
-
-
-class ToolIntent(_Model):
-    operation_id: Identifier
-    input_ref: Identifier
 
 
 class ExecutionContext(_Model):
@@ -306,31 +270,6 @@ class RegisteredAdapter:
     verify_idempotency: Callable[[str], IdempotencyEvidence] | None = None
 
 
-class AuthorizationRequest(_Model):
-    operation_id: Identifier
-    attempt_id: Identifier
-    grant_id: Identifier
-    previous_attempt_id: Identifier | None = None
-    idempotency_evidence_id: Identifier | None = None
-
-
-class OutcomeRequest(_Model):
-    operation_id: Identifier
-    attempt_id: Identifier
-    evidence_id: Identifier
-
-
-class HumanOperationRejectionIntent(_Model):
-    schema_version: Literal["fa-operation-rejection-intent-v1"] = "fa-operation-rejection-intent-v1"
-    binding_id: Identifier
-    binding_digest: Digest
-    operation_id: Identifier
-    decision_id: Identifier
-    request_id: Identifier
-    principal_oid: Identifier
-    input_digest: Digest
-
-
 class HumanOperationRejection(_Model):
     schema_version: Literal["fa-operation-rejection-v1"]
     operation_id: Identifier
@@ -426,6 +365,21 @@ def control_key(kind: str, *identifiers: str) -> str:
     return _digest(["fa-operation-control-v1", kind, *identifiers])
 
 
+def conversation_key(conversation_id):
+    return control_key("assistant-conversation", conversation_id)
+
+
+def _read_conflicts(read, *, phase):
+    """Only explicitly selected read-only gates may repeat; never a tool/dispatch."""
+    for attempt in range(3):
+        try:
+            return read()
+        except Problem as error:
+            if error.status != 412 or error.body["error"]["code"] != "BEHAVIOR_CONFLICT" or attempt == 2:
+                raise
+            logging.getLogger(__name__).warning("ASSISTANT_READ_CONFLICT phase=%s attempt=%s maximum=3", phase, attempt + 1)
+
+
 def canonical_material(description: OperationDescription) -> InlineMaterial:
     description = _checked(description, OperationDescription)
     value = description.model_dump(mode="json")
@@ -460,22 +414,6 @@ _LATER_EFFECTS: dict[str, frozenset[str]] = {
     "not_applied": frozenset({"not_applied"}), "applied": frozenset({"applied"}),
     "partial": frozenset({"partial", "applied"}),
 }
-
-
-def _verified_effect(contract: AdapterContract, command: OutcomeRequest, evidence: VerifiedOutcome) -> Effect:
-    if (
-        evidence.evidence_id != command.evidence_id or evidence.source != contract.evidence_source
-        or evidence.contract_version != contract.outcome_contract_version
-    ):
-        raise Problem(403, "OPERATION_EVIDENCE_DENIED", "outcome source or contract differs")
-    if evidence.observation not in TERMINAL:
-        return _OBSERVED_EFFECT.get(evidence.observation, "unknown")
-    if (
-        contract.terminality_contract_version is None
-        or evidence.terminality_contract_version != contract.terminality_contract_version
-    ):
-        raise Problem(403, "OPERATION_EVIDENCE_DENIED", "destination terminality has not been established")
-    return "not_applied"
 
 
 def _settled(operation: _Operation, attempt_id: str, effect: Effect, evidence: VerifiedOutcome) -> _Operation:
@@ -581,292 +519,3 @@ class ToolBrokerCore:
             raise Problem(502, "OPERATION_CONTENT_INVALID", "saved description digest differs")
         return operation, material, self._description(material)
 
-    def reconciliation_request(
-        self, request: ToolIntent | AuthorizationRequest | OutcomeRequest, context: ExecutionContext,
-    ) -> ControlRequest:
-        """Persist this stable request BEFORE calling a transition; read-back only."""
-        context = _checked(context, ExecutionContext)
-        self._enabled()
-        if isinstance(request, ToolIntent):
-            request = _checked(request, ToolIntent)
-            action, identity = "prepare", (request.operation_id,)
-            reads = [control_key("operation", request.operation_id), control_key("owner", context.owner_record_id)]
-        elif isinstance(request, AuthorizationRequest):
-            request = _checked(request, AuthorizationRequest)
-            action, identity = "authorize", (request.operation_id, request.attempt_id)
-            reads = [
-                control_key("operation", request.operation_id),
-                control_key("attempt", request.operation_id, request.attempt_id),
-                control_key("owner", context.owner_record_id), control_key("grant", request.grant_id),
-                control_key("policy", context.policy_id), control_key("budget", context.root_budget_id),
-            ]
-            if request.previous_attempt_id is not None:
-                reads.append(control_key("attempt", request.operation_id, request.previous_attempt_id))
-        elif isinstance(request, OutcomeRequest):
-            request = _checked(request, OutcomeRequest)
-            action, identity = "outcome", (request.operation_id, request.attempt_id, request.evidence_id)
-            reads = [
-                control_key("operation", request.operation_id),
-                control_key("attempt", request.operation_id, request.attempt_id),
-                control_key("owner", context.owner_record_id),
-            ]
-        else:
-            raise Problem(422, "OPERATION_INVALID_DATA", "unknown operation transition")
-        return ControlRequest(
-            request_id=control_key(action, *identity),
-            request_digest=_digest([action, request.model_dump(mode="json"), context.model_dump(mode="json"), self._contract_digest()]),
-            read_set=tuple(sorted(set(reads))),
-        )
-
-    def prepare(self, intent: ToolIntent, context: ExecutionContext) -> Record:
-        request = self.reconciliation_request(intent, context)
-        intent, context = _checked(intent, ToolIntent), _checked(context, ExecutionContext)
-        material = canonical_material(self._enabled()[0].resolve(intent.input_ref))
-        self._description(material)
-        key = control_key("operation", intent.operation_id)
-
-        def decide(snapshot: Snapshot) -> ControlChanges:
-            self._owner(snapshot, context, intent.operation_id)
-            if snapshot[key] is not None:
-                raise Problem(409, "OPERATION_ID_CONFLICT", "operation ID is already bound")
-            operation = _Operation(
-                operation_id=intent.operation_id, owner_record_id=context.owner_record_id,
-                conversation_id=context.conversation_id, root_budget_id=context.root_budget_id,
-                description_digest=material.sha256, adapter_contract_digest=self._contract_digest(),
-            )
-            return ControlChanges(writes=(_write(key, operation, "create", material),), result={
-                "operation_id": intent.operation_id, "description_digest": material.sha256,
-                "adapter_contract_digest": operation.adapter_contract_digest,
-                "content": material.model_dump(mode="json"),
-                "canonicalization_version": CANONICALIZATION_VERSION, "execution_enabled": False,
-            })
-
-        receipt = self.store.transact(request, decide)
-        if receipt.payload["result"]["description_digest"] != material.sha256:
-            raise Problem(409, "OPERATION_ID_CONFLICT", "operation ID is bound to different resolved content")
-        return receipt
-
-    def _idempotency(self, evidence_id: str | None) -> IdempotencyEvidence | None:
-        if evidence_id is None:
-            return None
-        adapter, contract = self._enabled()
-        if contract.idempotency_contract_version is None or adapter.verify_idempotency is None:
-            raise Problem(403, "OPERATION_RETRY_DISABLED", "destination idempotency verification is not installed")
-        evidence = _checked(adapter.verify_idempotency(evidence_id), IdempotencyEvidence)
-        if (
-            evidence.evidence_id != evidence_id or evidence.source != contract.evidence_source
-            or evidence.contract_version != contract.idempotency_contract_version
-        ):
-            raise Problem(403, "OPERATION_EVIDENCE_DENIED", "destination idempotency contract differs")
-        return evidence
-
-    def _retry(
-        self, previous: _Attempt | None, operation: _Operation,
-        evidence: IdempotencyEvidence | None, now: datetime,
-    ) -> Literal["first_attempt", "terminal_not_applied", "whole_unit_idempotency"]:
-        if previous is None:
-            if operation.current_attempt_id is not None or evidence is not None:
-                raise Problem(409, "OPERATION_ATTEMPT_CONFLICT", "original attempt must be identified")
-            return "first_attempt"
-        if previous.effect_state in {"applied", "partial"} or operation.effect_state in {"applied", "partial"}:
-            raise Problem(409, "OPERATION_RETRY_UNSAFE", "known effects cannot be replayed as a whole operation")
-        contract = self._enabled()[1]
-        if previous.effect_state == "not_applied" and not operation.unsettled_attempt_ids:
-            if contract.terminality_contract_version is not None and previous.terminality_contract_version == contract.terminality_contract_version:
-                return "terminal_not_applied"
-            raise Problem(403, "OPERATION_RETRY_DISABLED", "terminality contract is unavailable")
-        if evidence is None or evidence.binding != previous.binding:
-            raise Problem(409, "OPERATION_RETRY_UNSAFE", "original delivery may still apply")
-        if not evidence.not_before <= now < evidence.expires_at:
-            raise Problem(409, "OPERATION_RETRY_UNSAFE", "destination idempotency window is not valid")
-        return "whole_unit_idempotency"
-
-    def _grant_budget(self, snapshot: Snapshot, command: AuthorizationRequest, context: ExecutionContext,
-                      description_digest: Digest, now: datetime, units: int) -> tuple[GrantRecord, PolicyRecord, BudgetRecord]:
-        grant = _row(snapshot, control_key("grant", command.grant_id), GrantRecord)
-        policy = _row(snapshot, control_key("policy", context.policy_id), PolicyRecord)
-        budget = _row(snapshot, control_key("budget", context.root_budget_id), BudgetRecord)
-        if (
-            grant.grant_id != command.grant_id or grant.revoked
-            or GrantSubject(principal_id=context.principal_id, conversation_id=context.conversation_id) not in grant.subjects
-            or grant.root_budget_id != context.root_budget_id or grant.description_digest != description_digest
-            or grant.adapter_contract_digest != self._contract_digest()
-            or grant.policy_id != context.policy_id or policy.policy_id != context.policy_id
-            or not policy.active or grant.policy_revision != policy.revision
-            or not grant.not_before <= now < grant.expires_at
-        ):
-            raise Problem(403, "OPERATION_GRANT_DENIED", "current human grant or policy does not permit this operation")
-        if budget.root_budget_id != context.root_budget_id or not budget.active or (
-            min(grant.remaining_uses, budget.remaining_attempts) < 1
-            or min(grant.remaining_units, budget.remaining_units) < units
-        ):
-            raise Problem(403, "OPERATION_BUDGET_DENIED", "shared grant or root budget is exhausted")
-        return grant, policy, budget
-
-    def authorize(self, command: AuthorizationRequest, context: ExecutionContext) -> Record:
-        request = self.reconciliation_request(command, context)
-        command, context = _checked(command, AuthorizationRequest), _checked(context, ExecutionContext)
-        evidence = self._idempotency(command.idempotency_evidence_id)
-        contract = self._enabled()[1]
-        fresh = False
-
-        def decide(snapshot: Snapshot) -> ControlChanges:
-            nonlocal fresh
-            fresh = True  # Response classification only, NOT a concurrency authority.
-            self._owner(snapshot, context, command.operation_id)
-            operation, material, description = self._operation(snapshot, command.operation_id, context)
-            if operation.human_rejection is not None:
-                raise Problem(409, "OPERATION_HUMAN_REJECTED", "the original operation was declined by its human")
-            if operation.current_attempt_id != command.previous_attempt_id or command.attempt_id == command.previous_attempt_id:
-                raise Problem(409, "OPERATION_ATTEMPT_CONFLICT", "attempt chain differs")
-            attempt_key = control_key("attempt", command.operation_id, command.attempt_id)
-            if snapshot[attempt_key] is not None:
-                raise Problem(409, "OPERATION_ATTEMPT_CONFLICT", "attempt ID is already bound")
-            previous = None
-            if command.previous_attempt_id is not None:
-                previous = _row(snapshot, control_key("attempt", command.operation_id, command.previous_attempt_id), _Attempt)
-                if (
-                    previous.binding.operation_id != command.operation_id
-                    or previous.binding.attempt_id != command.previous_attempt_id
-                    or previous.binding.description_digest != material.sha256
-                    or previous.binding.adapter_contract_digest != self._contract_digest()
-                    or previous.binding.target != description.target
-                ):
-                    raise Problem(409, "OPERATION_ATTEMPT_CONFLICT", "previous attempt binding differs")
-            now = self._now()
-            basis = self._retry(previous, operation, evidence, now)
-            if len(operation.unsettled_attempt_ids) >= 16:
-                raise Problem(409, "OPERATION_ATTEMPT_LIMIT", "unsettled attempt capacity is exhausted")
-            grant_key, budget_key = control_key("grant", command.grant_id), control_key("budget", context.root_budget_id)
-            units = contract.reservation_units
-            grant, policy, budget = self._grant_budget(snapshot, command, context, material.sha256, now, units)
-            not_after = grant.expires_at
-            if basis == "whole_unit_idempotency":
-                assert evidence is not None
-                not_after = min(not_after, evidence.expires_at)
-            binding = self._binding(command.operation_id, command.attempt_id, material, description)
-            if previous is not None and binding.idempotency_key != previous.binding.idempotency_key:
-                raise Problem(409, "OPERATION_ATTEMPT_CONFLICT", "retry key differs")
-            attempt = _Attempt(
-                binding=binding, context=context, grant_id=command.grant_id,
-                grant_revocation_revision=grant.revocation_revision, policy_revision=policy.revision,
-                reserved_units=units, authorized_at=now, not_after=not_after, basis=basis,
-            )
-            evidence_material = None
-            if evidence is not None:
-                data = _json(evidence.model_dump(mode="json"))
-                evidence_material = InlineMaterial(data=data, sha256=hashlib.sha256(data).hexdigest())
-            return ControlChanges(writes=(
-                _write(control_key("operation", command.operation_id), _updated(
-                    operation, current_attempt_id=command.attempt_id, effect_state="unknown", business_state="pending",
-                    unsettled_attempt_ids=(*operation.unsettled_attempt_ids, command.attempt_id),
-                ), "replace", material),
-                _write(attempt_key, attempt, "create", evidence_material),
-                _write(grant_key, _updated(grant, remaining_uses=grant.remaining_uses - 1, remaining_units=grant.remaining_units - units), "replace"),
-                _write(budget_key, _updated(budget, remaining_attempts=budget.remaining_attempts - 1, remaining_units=budget.remaining_units - units), "replace"),
-            ), result={
-                "attempt": attempt.model_dump(mode="json"), "content": material.model_dump(mode="json"),
-                "execution_enabled": False,
-            })
-
-        receipt = self.store.transact(request, decide)
-        if fresh:
-            attempt = _parse(receipt.payload["result"]["attempt"], _Attempt)
-            after_commit = self._now()
-            if not attempt.authorized_at <= after_commit < attempt.not_after:
-                raise Problem(
-                    409, "OPERATION_AUTHORIZATION_WINDOW_CLOSED",
-                    "reservation remains held; no dispatch permitted after an uncertain authorization window",
-                    request_id=request.request_id, request_digest=request.request_digest,
-                )
-        return receipt
-
-    def _binding(
-        self, operation_id: str, attempt_id: str, material: InlineMaterial, description: OperationDescription,
-    ) -> AttemptBinding:
-        return AttemptBinding(
-            operation_id=operation_id, attempt_id=attempt_id,
-            description_digest=material.sha256, adapter_contract_digest=self._contract_digest(),
-            target=description.target, idempotency_key=control_key("idempotency", operation_id, material.sha256),
-        )
-
-    def _bound_attempt(
-        self, snapshot: Snapshot, command: OutcomeRequest, evidence: VerifiedOutcome,
-        material: InlineMaterial, description: OperationDescription,
-    ) -> _Attempt:
-        attempt = _row(snapshot, control_key("attempt", command.operation_id, command.attempt_id), _Attempt)
-        expected = self._binding(command.operation_id, command.attempt_id, material, description)
-        if (
-            evidence.binding != attempt.binding or attempt.binding != expected
-            # The clock is read only after the binding and sequence checks pass.
-            or evidence.sequence <= attempt.observation_sequence or evidence.observed_at > self._now()
-            or evidence.result is not None and evidence.result.resource not in description.resources
-        ):
-            raise Problem(409, "OPERATION_EVIDENCE_DENIED", "outcome is stale or bound to a different attempt")
-        return attempt
-
-    def record_outcome(self, command: OutcomeRequest, context: ExecutionContext) -> Record:
-        if self.dispatcher is not None:
-            return self.dispatcher.record_outcome(command, context)
-        self.reconciliation_request(command, context)
-        command, context = _checked(command, OutcomeRequest), _checked(context, ExecutionContext)
-        adapter, _ = self._enabled()
-        if adapter.verify_outcome is None:
-            raise Problem(403, "OPERATION_EVIDENCE_DISABLED", "destination outcome verification is not installed")
-        evidence = _checked(adapter.verify_outcome(command.evidence_id), VerifiedOutcome)
-        return self._record_verified_outcome(command, context, evidence)
-
-    def _record_verified_outcome(
-        self, command: OutcomeRequest, context: ExecutionContext, evidence: VerifiedOutcome,
-    ) -> Record:
-        """Internal credential-boundary handoff; callers cannot submit raw evidence."""
-        request = self.reconciliation_request(command, context)
-        command, context = _checked(command, OutcomeRequest), _checked(context, ExecutionContext)
-        evidence = _checked(evidence, VerifiedOutcome)
-        effect = _verified_effect(self._enabled()[1], command, evidence)
-        data = _json(evidence.model_dump(mode="json"))
-        proof_material = InlineMaterial(data=data, sha256=hashlib.sha256(data).hexdigest())
-
-        def decide(snapshot: Snapshot) -> ControlChanges:
-            self._owner(snapshot, context, command.operation_id)
-            operation, material, description = self._operation(snapshot, command.operation_id, context)
-            attempt_key = control_key("attempt", command.operation_id, command.attempt_id)
-            attempt = self._bound_attempt(snapshot, command, evidence, material, description)
-            if effect not in _LATER_EFFECTS[attempt.effect_state]:
-                raise Problem(409, "OPERATION_EVIDENCE_CONFLICT", "outcome contradicts already recorded effects")
-            attempt_record = snapshot[attempt_key]
-            assert attempt_record is not None
-            old_material = attempt_record.payload["material"]
-            retained = None if old_material is None else _parse(old_material, InlineMaterial)
-            settled = _settled(operation, command.attempt_id, effect, evidence)
-            return ControlChanges(writes=(
-                _write(control_key("operation", command.operation_id), settled, "replace", material),
-                _write(attempt_key, _updated(
-                    attempt, effect_state=effect, observation_sequence=evidence.sequence,
-                    # None unless terminal: VerifiedOutcome.result_contract refuses it on other observations.
-                    terminality_contract_version=evidence.terminality_contract_version,
-                ), "replace", retained),
-                _write(control_key("outcome", command.operation_id, command.attempt_id, command.evidence_id), evidence, "create", proof_material),
-            ), result={
-                "operation_id": command.operation_id, "attempt_id": command.attempt_id,
-                "effect_state": effect, "business_result": evidence.business_result,
-                "operation_effect_state": settled.effect_state, "operation_business_state": settled.business_state,
-                "evidence_digest": proof_material.sha256, "execution_enabled": False,
-            })
-
-        receipt = self.store.transact(request, decide)
-        if receipt.payload["result"]["evidence_digest"] != proof_material.sha256:
-            raise Problem(409, "OPERATION_EVIDENCE_CONFLICT", "evidence ID is bound to different verified content")
-        return receipt
-
-    def execute(
-        self, operation_id: str, attempt_id: str, *,
-        context: ExecutionContext | None = None, grant_id: str | None = None,
-    ) -> Record:
-        if self.dispatcher is None:
-            raise Problem(403, "OPERATION_EXECUTION_DISABLED", "no concrete execution adapter is configured")
-        if context is None or grant_id is None:
-            raise Problem(403, "OPERATION_EXECUTION_CONTEXT_REQUIRED", "server identity and a grant reference are required")
-        return self.dispatcher.execute(AuthorizationRequest(
-            operation_id=operation_id, attempt_id=attempt_id, grant_id=grant_id,
-        ), context)

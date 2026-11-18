@@ -1,6 +1,6 @@
 """What `WorkPolicyControl.conversation` shows, and which gate decides `follow_up_blocker`.
 
-One real synthetic native turn is saved first. Each case then edits what the reader sees and
+The whole stored Table and Blob of one old synthetic native turn is loaded first. Each case then edits what the reader sees and
 nothing is written. Later gates replace earlier reasons, so the order cases matter here.
 """
 from types import SimpleNamespace
@@ -17,8 +17,8 @@ from shared_context.behavior_skill_copy import SopCopyOutcome
 from shared_context.behavior_skill_draft import SkillDraftOutcome
 from shared_context.behavior_workers import worker_key
 from shared_context.errors import Problem
-from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from legacy_turn_rows_helpers import stored_turn
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_work_result_access import DIGEST, Reads
 
@@ -26,9 +26,9 @@ RESET = {"reset_request_id": "a-reset", "archived_at": "2026-10-31T00:00:00+00:0
 
 
 @pytest.fixture
-def turn(synthetic_standing_v1, monkeypatch):
-    c = synthetic_standing_v1
-    saved = saved_turn(c, "conversation-view")
+def turn(stored_turn, monkeypatch):
+    c = stored_turn("conversation-view")
+    saved = c.turn
     store = c.h.runtime.store
     cid = saved.assignment.task.instruction.conversation_id
     job = saved.binding.job_id

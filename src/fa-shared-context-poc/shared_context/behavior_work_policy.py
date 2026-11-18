@@ -19,11 +19,8 @@ from .behavior_operations import OwnerRecord,PolicyRecord,BudgetRecord,_row,_wri
 from .behavior_runtime import runtime_key,material,_PlanIndex
 from .behavior_store import ControlRequest,ControlChanges,_READ_VIEW
 from .behavior_workers import worker_key,JobRecord,ExecutorStart
-from .behavior_assistant_wire import InstructionSubmit, InstructionTask, TEXT_CHECKS, ModelDeployment
+from .behavior_assistant_wire import InstructionSubmit, InstructionTask, TEXT_CHECKS
 from .behavior_instruction_prompt import PromptProfile
-from .behavior_attachments import TextAttachments, validate_attachments
-from .behavior_text_files import UserTextFiles
-from .memory_bridge_settings import MemorySettingReference, memory_setting_reference
 from .behavior_turn_ticket import TurnAuthorization
 from .behavior_agent_worker import AgentVmBinding
 from .behavior_agent_message_wire import PeerTeamReference
@@ -212,68 +209,6 @@ class WorkPolicyDecision(_Model):
     budget_enforced:bool=Field(default=True,exclude_if=lambda v:v)
     authorization:Literal[False]=False
     provider_hard_cap:Literal[False]=False
-    _time=field_validator("observed_at")(_utc)
-
-
-class WorkSubmitObservation(_Model):
-    schema_version:Literal["fa-work-submit-observation-v1"]
-    request_id:Identifier
-    submit_sha256:Digest
-    state:Literal["not_admitted","admission_incomplete"]
-    retry_same_request:Literal[True]
-
-
-class WorkPreflightQuery(_Model):
-    read_id:Identifier
-    request_id:Identifier
-    submit_body_sha256:Digest
-    content:str|None=Field(default=None,exclude_if=lambda v:v is None)
-    conversation_id:Identifier|None=Field(default=None,exclude_if=lambda v:v is None)
-    model:ModelDeployment|None=Field(default=None,exclude_if=lambda v:v is None)
-    attachments:TextAttachments=Field(default=(),exclude_if=lambda v:not v)
-    files:UserTextFiles=Field(default=(),exclude_if=lambda v:not v)
-
-    _attachments=field_validator("attachments")(validate_attachments)
-
-    @model_validator(mode="after")
-    def original_input(self):
-        if self.content is None:
-            if self.files or self.attachments:
-                raise ValueError("Attachments require the original instruction text")
-        else:
-            InstructionSubmit(request_id=self.request_id,content=self.content,
-                conversation_id=self.conversation_id,model=self.model,attachments=self.attachments,files=self.files)
-        return self
-
-
-class WorkPreflight(_Model):
-    schema_version:Literal["fa-steady-work-preflight-v1"]="fa-steady-work-preflight-v1"
-    read_id:Identifier
-    request_id:Identifier
-    submit_body_sha256:Digest
-    configuration_sha256:Digest
-    policy_sha256:Digest
-    tenant_id:Identifier
-    team_id:Identifier
-    human_oid:Identifier
-    template_binding_id:Identifier
-    binding:RuntimeBinding
-    decision:Literal["allow","deny"]
-    reason:Identifier
-    observed_at:datetime
-    guard_revision:Annotated[int,Field(ge=0)]
-    execution_deadline:datetime|None
-    queue_deadline:datetime|None
-    already_admitted:bool
-    capacity_available:bool
-    monetary_budget:WorkPolicyDecision
-    abstract_attempts_remaining:Annotated[int,Field(ge=0)]
-    abstract_units_remaining:Annotated[int,Field(ge=0)]
-    authorization:Literal[False]=False
-    conversation_id:Identifier|None=Field(default=None,exclude_if=lambda v:v is None)
-    turn_number:int|None=Field(default=None,exclude_if=lambda v:v is None)
-    model:ModelDeployment|None=Field(default=None,exclude_if=lambda v:v is None)
-    memory_setting_ref:MemorySettingReference|None=Field(default=None,exclude_if=lambda v:v is None)
     _time=field_validator("observed_at")(_utc)
 
 
@@ -758,21 +693,6 @@ def _reasoning_summary(profile,model):
     return "detailed" if supported else None
 
 
-def _preflight_submission(query):
-    """The submission a preflight query names and the digest of its exact bytes."""
-    import hashlib
-    from .behavior_assistant_wire import AssistantSubmit
-    submitted=(AssistantSubmit(request_id=query.request_id) if query.content is None else InstructionSubmit(
-        request_id=query.request_id,content=query.content,conversation_id=query.conversation_id,model=query.model,
-        attachments=query.attachments,files=query.files))
-    if query.content is None and (query.attachments or query.files):
-        raise Problem(422,"ATTACHMENT_FORMAT","attachments require an original instruction")
-    expected=hashlib.sha256(submitted.model_dump_json().encode()).hexdigest()
-    if query.submit_body_sha256!=expected:
-        raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","canonical fixed submission bytes differ")
-    return submitted,expected
-
-
 class WorkPolicyControl:
     """One registered standing scope; returned decisions are never write grants."""
     def __init__(self,runtime,policy,cost_reader):
@@ -880,18 +800,6 @@ class WorkPolicyControl:
             return record.binding,self.runtime.job_status(record.binding.binding_id,principal)
         return record.binding,self.runtime.submit(record.binding.binding_id,checked,principal)
 
-    def cancel(self,principal,binding_id):
-        self._human(principal)
-        self.refresh()
-        if binding_id not in self.records:
-            raise Problem(403,"WORK_POLICY_SCOPE_CHANGED","only this standing policy's original work may be cancelled")
-        binding,_,context=self.runtime.authorize(binding_id,principal,"read")
-        job=self.runtime.dep.workers.inspect(binding.job_id)
-        receipt=self.runtime.dep.workers.cancel(binding.job_id,context,expected_binding=job.binding)
-        if self.runtime.dep.workers.inspect(binding.job_id).state=="cancelled":
-            self.runtime.controller.step(binding_id)
-        return receipt
-
     def cancellation_receipt(self, principal, binding_id, generation):
         self._human(principal)
         self.refresh()
@@ -899,42 +807,6 @@ class WorkPolicyControl:
             raise Problem(403, "WORK_POLICY_SCOPE_CHANGED", "only this standing policy's original work may be read")
         binding, _, context = self.runtime.authorize(binding_id, principal, "read")
         return self.runtime.dep.workers.read_cancellation_receipt(binding.job_id, context, generation)
-
-    def submit_reconcile(self,principal,command):
-        import hashlib
-        self._human(principal)
-        self.refresh()
-        _,binding=derive_work_binding(self.policy,command.request_id,
-            instruction=command if type(command) is InstructionSubmit else None)
-        saved=self.records.get(binding.binding_id)
-        command_sha=hashlib.sha256(command.model_dump_json().encode()).hexdigest()
-        if saved is not None and saved.submit_sha256!=command_sha:
-            raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","original submission bytes differ")
-        if saved is None:
-            policy=self.installed()
-            if not policy.active or not policy.read_enabled:
-                raise Problem(403,"WORK_POLICY_REVOKED","current original rights are revoked")
-            state="not_admitted"
-        else:
-            self.runtime.authorize(saved.binding.binding_id,principal,"read")
-            key=worker_key("job",binding.job_id)
-            if self.store.read_snapshot((key,))[key] is not None:
-                return saved.binding,self.runtime.job_status(saved.binding.binding_id,principal)
-            plan=self.runtime._existing(saved.binding,"admission",principal,command)
-            receipt=None if plan is None else self.store._receipt(plan.request)
-            event=control_key("delivery-event",binding.event_id)
-            obligation=control_key("delivery-obligation",binding.obligation_id)
-            effects=self.store.read_snapshot((event,obligation))
-            if receipt is None and any(value is not None for value in effects.values()):
-                raise Problem(503,"WORK_SUBMIT_UNKNOWN","admission material lacks its original receipt; do not resend")
-            state="not_admitted" if receipt is None else "admission_incomplete"
-        return WorkSubmitObservation(schema_version="fa-work-submit-observation-v1",
-            request_id=command.request_id,submit_sha256=command_sha,state=state,retry_same_request=True)
-
-    def submission_result(self,binding,status):
-        turn=self.records[binding.binding_id].profile.instruction
-        return {"binding_id":binding.binding_id,"status":status,**({} if turn is None else {
-            "conversation_id":turn.conversation_id,"turn_number":turn.turn_number,"model":turn.model})}
 
     def _instruction_record(self,principal,identifier,turn_number):
         self._human(principal)
@@ -1295,120 +1167,6 @@ class WorkPolicyControl:
     def conversation_memory(self,principal,conversation):
         from .memory_bridge_settings import memory_for_conversation
         return memory_for_conversation(self,principal,conversation)
-
-    def preflight(self,principal,query):
-        from .behavior_workers import _Pool
-        self._human(principal)
-        if type(query) is not WorkPreflightQuery:
-            raise Problem(422,"WORK_POLICY_QUERY","typed exact preflight query required")
-        submitted,expected=_preflight_submission(query)
-        self.refresh()
-        instruction=submitted if type(submitted) is InstructionSubmit else None
-        admission,binding=derive_work_binding(self.policy,query.request_id,instruction=instruction)
-        keys=(self.policy_key,self.revocation_key,self.cost_key,control_key("budget",binding.owner.root_budget_id),
-              worker_key("pool",self.runtime.dep.workers.contract.workspace_id),worker_key("job",binding.job_id),
-              work_policy_key("registration",admission),runtime_key("policy",binding.binding_id))
-        guard=self.store._guard()
-        rows=self.store.read_snapshot(keys)
-        policy=self.installed(rows);ledger=_row(rows,self.cost_key,CostLedger)
-        root=_row(rows,control_key("budget",binding.owner.root_budget_id),BudgetRecord)
-        pool=_row(rows,worker_key("pool",self.runtime.dep.workers.contract.workspace_id),_Pool)
-        existing=rows[worker_key("job",binding.job_id)] is not None
-        if existing:
-            self.runtime.authorize(binding.binding_id,principal,"read")
-            money=self._replay_decision(query,policy,ledger)
-        else:
-            money=cumulative_decision(policy,ledger,self.cost_reader(),self.runtime._now(),read_id=query.read_id,
-                                      mode=self.runtime.mode,instruction=instruction is not None)
-        allowed,reason=money.decision,money.reason
-        denied=None
-        turn=None
-        memory_ref=None
-        if instruction is None:
-            if not existing:
-                denied=self._fixed_work_denial(principal,policy,root,allowed)
-        elif rows[work_policy_key("registration",admission)] is not None:
-            binding,turn,memory_ref=self._saved_turn(principal,binding,admission,expected,existing)
-        else:
-            binding,turn,memory_ref,denied=self._candidate_turn(principal,query,instruction,admission,binding)
-        if denied is not None:
-            allowed,reason="deny",denied
-        scoped=(_row(rows,runtime_key("policy",binding.binding_id),PerWorkRuntimePolicy)
-                if rows[runtime_key("policy",binding.binding_id)] is not None else None)
-        if self.store._guard()!=guard:
-            raise Problem(412,"WORK_POLICY_READ_CONFLICT","pure preflight snapshot changed; it is not permission")
-        return WorkPreflight(read_id=query.read_id,request_id=query.request_id,submit_body_sha256=expected,
-            configuration_sha256=policy.configuration_sha256,policy_sha256=policy.sha256,
-            tenant_id=binding.tenant_id,team_id=binding.team_id,human_oid=binding.human_oid,
-            template_binding_id=policy.template.binding_id,binding=binding,decision=allowed,reason=reason,
-            observed_at=self.runtime._now(),guard_revision=guard[0].revision,already_admitted=existing,
-            capacity_available=any(slot.binding is None for slot in pool.slots),monetary_budget=money,
-            execution_deadline=None if scoped is None or scoped.stage!="dispatched" else scoped.valid_until,
-            queue_deadline=None if scoped is None else scoped.queue_deadline,
-            abstract_attempts_remaining=root.remaining_attempts,abstract_units_remaining=root.remaining_units,
-            memory_setting_ref=memory_ref,**self._previewed_turn(turn,instruction))
-
-    def _replay_decision(self,query,policy,ledger):
-        """Admitted work needs no new money decision: what it reports is what is left."""
-        remaining=max(0,policy.cumulative_ceiling_microusd-policy.safety_reserve_microusd-
-                      ledger.observed_high_water_microusd-ledger.legacy_unresolved_reserve_microusd-ledger.work_reservations_microusd)
-        return WorkPolicyDecision(read_id=query.read_id,policy_id=policy.policy_id,policy_revision=policy.revision,
-            decision="allow",reason="original_admission_replay_only",observed_at=self.runtime._now(),
-            budget_id=self.cost_key,remaining_microusd=remaining if ledger.budget_enforced else None,required_microusd=0,
-            observed_high_water_microusd=ledger.observed_high_water_microusd,
-            reserved_microusd=ledger.legacy_unresolved_reserve_microusd+ledger.work_reservations_microusd,
-            budget_enforced=ledger.budget_enforced,
-            safety_reserve_microusd=policy.safety_reserve_microusd if ledger.budget_enforced else None,
-            cumulative_ceiling_microusd=policy.cumulative_ceiling_microusd if ledger.budget_enforced else None)
-
-    def _fixed_work_denial(self,principal,policy,root,allowed):
-        """Why new fixed work is denied beyond its money decision; None when it is not."""
-        denied=None
-        if allowed=="allow":
-            try:self.source_ready(principal,policy)
-            except Problem as error:
-                denied=error.body["error"]["code"]
-        if (not root.active or root.remaining_attempts<policy.max_model_requests+3
-                or root.remaining_units<policy.max_model_requests+2+self.runtime.dep.workers.contract.reservation_units):
-            denied="abstract_root_budget_exhausted"
-        return denied
-
-    def _saved_turn(self,principal,binding,admission,expected,existing):
-        saved=self.records[binding.binding_id]
-        if saved.submit_sha256!=expected:
-            raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","original input differs")
-        if not existing:
-            self.runtime.authorize(binding.binding_id,principal,"read")
-        return (saved.binding,saved.profile.instruction,
-                memory_setting_reference(admission,saved.profile.memory_scope,captured=True))
-
-    def _candidate_turn(self,principal,query,instruction,admission,binding):
-        """The binding, turn and memory reference a new instruction would get, and the code that denies it (if any)."""
-        from .behavior_instruction import instruction_state
-        try:
-            conversation,_=instruction_state(self,instruction)
-            from .behavior_profile_selection import choice_for_conversation
-            choice=choice_for_conversation(self,conversation)
-            memory=self.conversation_memory(principal,conversation)
-            from .behavior_agent_role_prompt_versions import captured_role_prompt
-            from .behavior_profile_selection import profile_from_template
-            selected=self.policy.profile if choice is None else profile_from_template(self.policy,choice.command.template)
-            role_prompt=captured_role_prompt(self.store,self.policy,selected.prompt_profile)
-            _,binding,profile=derive_work(self.policy,query.request_id,self.runtime.mode,instruction=instruction,
-                turn_number=len(conversation.jobs)+1,profile_template=None if choice is None else choice.command.template,
-                memory_capture=memory.value,role_prompt=role_prompt)
-            return binding,profile.instruction,memory_setting_reference(admission,memory.value,captured=False),None
-        except Problem as error:
-            # A role Agent without a saved role is a clear 409, not a deny the workbench cannot place.
-            if error.body["error"]["code"] in {"AGENT_ROLE_PROMPT_MISSING","AGENT_ROLE_PROMPT_INVALID"}:
-                raise
-            return binding,None,None,error.body["error"]["code"]
-
-    def _previewed_turn(self,turn,instruction):
-        if turn is None:
-            return {"conversation_id":None,"turn_number":None,"model":None}
-        return {"conversation_id":turn.conversation_id,"turn_number":turn.turn_number,
-                "model":turn.model or self.models.select(instruction.model).id}
 
     def register(self,principal,request_id,submit_sha256,*,instruction=None,peer_work=None,routine=None,agent_vm=None):
         from .behavior_work_registry import head_key
@@ -2104,24 +1862,6 @@ class WorkPolicyControl:
         if type(executor) is not FoundryExecutor or executor.authority is not self.runtime.dep.native_launches:
             raise Problem(503,"INSTRUCTION_HOSTED_CONFIGURATION","the original concrete session executor is required")
         return executor
-
-    def reset_conversation(self,principal,identifier,command):
-        from .behavior_instruction import archive_conversation
-        receipt=archive_conversation(self,principal,identifier,command)
-        result=receipt.payload["result"]
-        state="not_run"
-        if self.runtime.mode=="native" and result["job_id"] is not None:
-            from .behavior_foundry import native_key,InstructionSessionStop
-            job=self.runtime.dep.workers.inspect(result["job_id"])
-            if job.binding is not None:
-                executor=self._session_executor()
-                launch=executor.authority.launch(native_key("launch-id",job.binding.start_request_id))
-                executor._cleanup_instruction_session(launch,retire=True)
-                key=native_key("instruction-session-stop",launch.launch_id)
-                row=self.store.read_snapshot((key,))[key]
-                stopped=None if row is None else _parse(row.payload["data"],InstructionSessionStop)
-                state="confirmed" if stopped is not None and stopped.confirmed else "unknown"
-        return {**result,"session_stop":state}
 
     def start_keys(self,job_id):
         record=self._job_record(job_id)

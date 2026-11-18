@@ -9,9 +9,9 @@ All IDs are selectors within immutable server bindings. JSON cannot supply an
 ExecutionContext, source owner/scope, grant identity, policy, adapter or clock.
 Pull returns the EXACT saved payload bytes with exchange metadata in headers.
 Its explicit client_received acknowledgment is not a human-read/UI receipt.
-Controller start/adopt/drain are intentionally absent. Optional assigned Hosted
-callbacks live under /hosted/launches/{launch_id}; launch/report capabilities
-are private headers, rejected in JSON and never returned in ordinary bodies.
+Controller start/adopt/drain are intentionally absent. The legacy job lane is
+retired: work submit, child jobs, operation prepare/decisions/execute and the
+assigned Hosted callbacks under /hosted/launches/{launch_id} are not served.
 Optional backup prepare/upload/reconcile routes require Behavior.Backup.
 create_source_recovery_app is a SEPARATE recovery-only factory with no live
 BehaviorRuntime/source Table dependency. It requires Behavior.Restore plus a
@@ -31,7 +31,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, SecretStr, TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
@@ -348,41 +348,14 @@ def _add_claim_routes(add, runtime):
 
 
 def _add_operation_routes(add, runtime):
-    add("/operation/prepare", wire.OperationPrepare, "read",
-        lambda p, c, who: runtime.prepare_operation(p["binding_id"], c, who))
     add("/operation", None, "read", lambda p, _, who: runtime.operation_preview(p["binding_id"], who), method="GET")
     add("/operation/decision-state", None, "read",
         lambda p, _, who: runtime.operation_decision_state(p["binding_id"], who), method="GET")
-    add("/operation/approve", wire.OperationApproval, "approve",
-        lambda p, c, who: runtime.approve_operation(p["binding_id"], c, who))
-    add("/operation/approval-reconcile", wire.OperationApproval, "read",
-        lambda p, c, who: runtime.reconcile_operation_approval(p["binding_id"], c, who))
-    add("/operation/revoke", wire.OperationRevocation, "approve",
-        lambda p, c, who: runtime.revoke_operation(p["binding_id"], c, who))
-    add("/operation/revocation-reconcile", wire.OperationRevocation, "read",
-        lambda p, c, who: runtime.reconcile_operation_revocation(p["binding_id"], c, who))
-    add("/operation/reject", wire.OperationRejection, "approve",
-        lambda p, c, who: runtime.reject_operation(p["binding_id"], c, who))
-    add("/operation/rejection-reconcile", wire.OperationRejection, "read",
-        lambda p, c, who: runtime.reconcile_operation_rejection(p["binding_id"], c, who))
-    for stage in ("execute", "reconcile"):
-        add("/operation/" + stage, wire.Command, "execute" if stage == "execute" else "read",
-            lambda p, c, who, reconcile=stage == "reconcile": runtime.execute_operation(p["binding_id"], c, who, reconcile=reconcile))
 
 
 def _add_work_routes(add, runtime):
-    for stage in ("submit", "reconcile"):
-        add("/work/" + stage, wire.SubmitWork, "submit" if stage == "submit" else "read",
-            lambda p, c, who, reconcile=stage == "reconcile": runtime.submit(p["binding_id"], c, who, reconcile=reconcile))
     add("/jobs/{job_id}", None, "read",
         lambda p, _, who: runtime.job_status(p["binding_id"], who), method="GET")
-    for stage in ("enqueue", "reconcile"):
-        add("/children/{child_id}/" + stage, wire.Command, "submit" if stage == "enqueue" else "read",
-            lambda p, c, who, reconcile=stage == "reconcile": runtime.enqueue_child(
-                p["binding_id"], p["child_id"], c, who, reconcile=reconcile,
-            ))
-    add("/children/{child_id}", None, "read",
-        lambda p, _, who: runtime.child_status(p["binding_id"], p["child_id"], who), method="GET")
 
 
 def _add_memory_routes(add, runtime):
@@ -428,76 +401,6 @@ def _add_delivery_routes(add, runtime):
         lambda p, c, who: runtime.acknowledge(p["binding_id"], c, who))
 
 
-def _private_capability(request, name):
-    values = request.headers.getlist(name)
-    if len(values) != 1 or re.fullmatch(r"[a-f0-9]{64}", values[0]) is None:
-        raise Problem(403, "BEHAVIOR_EXECUTOR_DENIED", "one private native capability is required")
-    return SecretStr(values[0])
-
-
-def _assigned_executor(runtime, binding_id, launch_id, principal, *, claim, assistant_claim):
-    if not assistant_claim:
-        return runtime.executor_callback(binding_id, launch_id, principal, claim=claim)
-    from .behavior_assistant import _read_conflicts
-    return _read_conflicts(lambda: runtime.executor_callback(
-        binding_id, launch_id, principal, claim=True), phase="hosted_claim_authority")
-
-
-async def _claim_response(native, binding_id, launch_id, command, principal, *, assistant_claim):
-    options = {"assistant_conflicts": True} if assistant_claim else {}
-    result = await run_in_threadpool(native.claim, binding_id, launch_id, command, principal, **options)
-    response = _response(result.model_dump(mode="json", exclude={"report_token"}))
-    if result.claim_state == "fresh" and result.report_token is not None:
-        response.headers["X-Behavior-Report-Token"] = result.report_token.get_secret_value()
-    return response
-
-
-async def _probe_response(native, method, request, binding_id, launch_id, command, principal):
-    probe_id = request.path_params["probe_id"]
-    _id.validate_python(probe_id, strict=True)
-    operation = native.resolve_probe if method == "resolve" else native.report
-    result = await run_in_threadpool(operation, binding_id, launch_id, probe_id, command, principal)
-    return _response(result)
-
-
-def _add_native_callback(router, runtime, identity, path, body_model, credential_model, header, method):
-    async def endpoint(
-        request: Request, binding_id: str, launch_id: str,
-        principal: BehaviorPrincipal = Depends(identity),
-    ):
-        assistant_claim = (method == "claim" and runtime.mode == "native"
-                           and binding_id in getattr(runtime, "profiles", {}))
-        try:
-            native = _assigned_executor(runtime, binding_id, launch_id, principal,
-                                        claim=method == "claim", assistant_claim=assistant_claim)
-            capability = _private_capability(request, header)
-            body = await _body(request, body_model)
-            field = "launch_permit" if method == "claim" else "report_token"
-            command = credential_model(**body.model_dump(), **{field: capability})
-            if method == "claim":
-                return await _claim_response(native, binding_id, launch_id, command, principal,
-                                             assistant_claim=assistant_claim)
-            return await _probe_response(native, method, request, binding_id, launch_id, command, principal)
-        except Problem as error:
-            if assistant_claim:
-                from .behavior_assistant_api import acquire_http_error
-                raise acquire_http_error(error, "hosted_claim") from None
-            raise
-        except Exception:
-            raise Problem(503, "BEHAVIOR_DEPENDENCY_UNAVAILABLE", "native callback failed") from None
-
-    router.add_api_route(PREFIX + path, endpoint, methods=["POST"], name="assigned-native-" + method)
-
-
-def _add_native_callbacks(router, runtime, identity):
-    _add_native_callback(router, runtime, identity, "/hosted/launches/{launch_id}/claim",
-                         wire.HostedClaimBody, wire.HostedClaimRequest, "x-behavior-launch-permit", "claim")
-    _add_native_callback(router, runtime, identity, "/hosted/launches/{launch_id}/probes/{probe_id}/resolve",
-                         wire.HostedProbeBody, wire.HostedProbeRequest, "x-behavior-report-token", "resolve")
-    _add_native_callback(router, runtime, identity, "/hosted/launches/{launch_id}/probes/{probe_id}/report",
-                         wire.HostedReportBody, wire.HostedReport, "x-behavior-report-token", "report")
-
-
 def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, registered_actor=None) -> APIRouter:
     if not isinstance(verifier, BehaviorJwtVerifier):
         raise Problem(503, "BEHAVIOR_CONFIGURATION", "the explicit behavior JWT verifier is required")
@@ -520,8 +423,6 @@ def behavior_router(runtime: BehaviorRuntime, verifier: BehaviorJwtVerifier, *, 
     if runtime.dep.memory_projections:
         _add_memory_routes(add, runtime)
     _add_delivery_routes(add, runtime)
-    if runtime.dep.native_launches is not None:
-        _add_native_callbacks(router, runtime, identity)
     return router
 
 

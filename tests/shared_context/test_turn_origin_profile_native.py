@@ -23,11 +23,11 @@ from shared_context.behavior_assistant_wire import InstructionContextOrigin, Ins
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 from test_behavior_assistant import assistant
-from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import instruction_models
+from conversation_profile_selection_helpers import configured, select, template
+from instruction_flow_helpers import instruction_models
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
-from test_skill_isolation_native import child_environment, owned_path
+from skill_isolation_native_helpers import child_environment, owned_path
 
 
 PROFILE = "fa-instruction-context-origin-v1"

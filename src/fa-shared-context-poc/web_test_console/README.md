@@ -2,6 +2,22 @@
 
 第一次用工作台：部署後怎麼打開、送第一則訊息、看批准卡和回條，見根目錄 README 的 [前 10 分鐘](../../../README.md#first-10-minutes)。本頁下面是逐次變更紀錄。
 
+<a id="legacy-readonly"></a>
+## 舊版（job-bound）對話在工作台改成唯讀（Neal 2026-11-16，CODE/offline，未部署）
+
+舊 Hosted job 路徑退役（API 端另案回 410 `JOB_LANE_RETIRED`）。工作台把還停在這條路上的對話當成只能查看：
+
+- **怎麼認定**：沿用程式現有的判斷——對話的 lane 已固定、而且是 `None`（`InstructionStore.lane`，原生對話是 `foundry-native-v*` 或 `foundry-responses-v1`）。
+  新對話一律由 server 選路走 native；只有 Agent 沒有版本化 profile、也沒有 selection（例如還沒寫 selection 的 peer）時，舊程式才會沿 job-bound 送出，這條現在直接回 403。
+- **擋掉的寫入**（入口回 403 `ACTION_NOT_ALLOWED`，不打後端）：`submit`、`submit-reconcile`、`submit-retry`、`cancel`、`reset`、「追問」（`/next`）。
+  工作台不再呼叫 `/work-policy/v1/submit`、`/preflight`、`/submit-reconcile`、`bindings/{b}/cancel`、`conversations/{c}/reset`。
+- **照常可讀**：`status`、`fetch`、`acknowledge`／`confirm-reply`、`read-reply`、`read-context`、`read-delegation`、`read-cancel-receipt`、`read-files`、進度與回覆下載。
+  `status` 不再先打 preflight，直接讀原狀態。
+- **畫面**：`composer.read_only_legacy=true` 時不顯示輸入框、送出、停止、重設，改寫「這是舊版對話，只能查看，不能再送出。」；任務的 `submit`、`submit-reconcile`、`submit-retry`、`cancel` 一律 `enabled:false`。
+- **相容保留**：`InstructionConnection`、`StandingConsoleConfig`、`instruction_lanes`／`instruction_commands`／journal 的 `submit`／`cancel` 列，以及 `InstructionReply` 等讀舊資料用的型別都在，舊資料照常載入。
+  拿掉的是只服務送出的程式：`PullAdapter` 的 submit（`/assistant/submit`、`/work/submit`）、`StandingPullAdapter`／`StandingSubmitReply`（`/work-policy/v1/submit`）、`InstructionAdapter` 的 submit／reconcile／cancel、`InstructionReader`（preflight）、`InstructionControl` 的 prepare／follow_up／reconcile／retry／cancel、`ResetReply`、bridge 的 reset 與狀態前的 preflight。
+- 測試：新增 `test_web_test_console_legacy_readonly.py`（9 案）；`test_web_test_console_workbench.cjs` 新增唯讀畫面 1 案。只測舊送件的案例已刪或改成斷言 403。
+
 <a id="hitl-rule-reasons"></a>
 ## 「為什麼問你」逐條顯示自動審查的說明（Neal 2026-11-05 D2，CODE/offline，未部署）
 
@@ -261,6 +277,7 @@ Neal：在「Agent Team 設定 → 批准規則」看不到規則細節，控制
   「停止這次回覆」。」；重按在同一筆 journal 上先記回未確認，再送同一個 `NativeCancel`（同一個 RID 與 CID）。送達回條同樣記
   `REFUSED`、可再送，錯誤寫「確認收到沒有送出，請稍後再按一次。」（不用送訊息的說法）。
 - **等批准時講明**：回合被主人的批准卡／提問卡擋住時，回覆泡泡寫「這個回合正在等你批准」／「這個回合正在等你回答」。卡片的畫法與位置不變。
+  Teams 等連線卡擋住時寫「這個回合正在等你連線」（改前依程式會寫成「正在等你回答」；第 47 版 dev 截圖當時卡片還沒讀到，畫面寫的是「正在準備回覆…」）；同一回合有批准卡時仍先寫批准。
 
 還要雲端核對：stage bridge 對那個 RID 的 `/status` 是哪一步失敗（回覆讀取？）、15:15:34 那次進度讀取花了多久、
 停止時 bridge 有沒有發出 `GET /requests/<rid>` 及何時回來。`/api/state` 直接在網址列打開（沒有 `X-Console-Agent`）會回 agent 模式的 bootstrap，
@@ -853,11 +870,11 @@ equivalent to 320 CSS pixels」；表格與程式碼區塊屬原文例外的二�
 | normal_pull 專用原操作讀取／拒絕／批准卡 | Grok Bot 的 approval/attention 顯示在正式 bot 對話與通知設定，不掛在固定工作診斷區（[settings and notifications](https://docs.x.ai/grok-bot/settings-and-notifications)）。 | 正式 CLI 仍可呼叫 operation routes；工作台 normal task route 不再暴露這些控制。native HITL／Team attention 仍各自由 server 核對原 pending id 與權限。 | `/api/tasks/<id>/operation*` 本機 route 與 `operation_review.py` 移除；native HITL 與 Team approval UI 不受影響。 |
 
 **伺服器 route 變成沒人呼叫（之後另行清理）**
-- legacy 固定工作 submit：`POST /behavior/v1/bindings/{binding_id}/assistant/submit` 與 lifecycle `POST /behavior/v1/bindings/{binding_id}/work/submit`。`adapter.py` 仍保留 request helper 給舊型別相容，但 bridge 不再讓 `normal_pull` task 到達它。
+- legacy 固定工作 submit：`POST /behavior/v1/bindings/{binding_id}/assistant/submit` 與 lifecycle `POST /behavior/v1/bindings/{binding_id}/work/submit`。`adapter.py` 已拿掉這兩條的 request helper：`PullAdapter.request(task, "submit")` 一律回 403 `ACTION_NOT_ALLOWED`，不打後端。
 - legacy 原取件續接：`POST /behavior/v1/bindings/{binding_id}/delivery/pull-reconcile`、`POST /behavior/v1/bindings/{binding_id}/delivery/pull-continue`。
 
 **仍有人呼叫，不列入清理**
-- `/work-policy/v1/preflight`、`/work-policy/v1/submit`、`/work-policy/v1/submit-reconcile`：job-bound instruction lane 使用。
+- `/work-policy/v1/preflight`、`/work-policy/v1/submit`、`/work-policy/v1/submit-reconcile`：job-bound instruction lane 使用（工作台已不再呼叫，見上方「舊版對話在工作台改成唯讀」）。
 - `/behavior/v1/bindings/{binding_id}/delivery/pull` 與 `/delivery/acknowledge`：instruction delivery 仍使用。
 - `GET /behavior/v1/bindings/{binding_id}/operation`、`GET /operation/decision-state`、`POST /operation/approve`、`POST /operation/reject`、`POST /operation/approval-reconcile`、`POST /operation/rejection-reconcile`：`shared_context.behavior_operation_cli` 的 show/state/approve/reject/reconcile 仍使用（reconcile 走 `_RECONCILE_PATHS`），不能列為沒人呼叫。
 
@@ -2505,7 +2522,7 @@ GET與晚到ACK都保留下一筆草稿，UNKNOWN原journal不改，已核投影
 已固定Responses只查必要Options，不藉最新模板改路。真正新對話仍須server選路，不能因模板故障降級。
 唯一例外是job-bound連線（未設`state_profile`）遇到API明確回409 `AGENT_TEMPLATE_PROFILE_UNSUPPORTED`
 （Agent沒有prompt profile也沒有selection，例如尚未寫selection的peer）：server本來就沒有選路，
-新對話沿原job-bound submit；模板面板仍顯示`TEMPLATE_UNAVAILABLE`。native連線照舊在寫入前拒絕，
+新對話原本沿job-bound submit，現在回403 `ACTION_NOT_ALLOWED`（舊版對話唯讀）；模板面板仍顯示`TEMPLATE_UNAVAILABLE`。native連線照舊在寫入前拒絕，
 因為native capture同樣拒絕這種Agent；其他模板錯誤（含404或其他409錯碼）也照舊拒絕。
 `InstructionConnection` 只保留舊 Table／Invocations 部署接線，不能替新 lane 擴權。
 
@@ -3531,8 +3548,7 @@ HTTP 沿 SDK 正式契約：
 
 - 一般文字送出不先呼叫獨立 `preflight`：先保存原 ID、內容、預期 conversation／turn／model，
   再一次 `POST /work-policy/v1/submit`，由後端核對目前權限及對話順序。
-  預期識別只供回應核對，不是本機自授權。工作台的狀態讀取仍可對 job-bound instruction 做純讀
-  `POST /work-policy/v1/preflight`；legacy fixed work 不再用它當 UI gate。
+  預期識別只供回應核對，不是本機自授權。工作台已不再呼叫 `/work-policy/v1/preflight`（舊版對話唯讀）。
 
   新memory對話的preflight可帶`memory_setting_ref`，綁原admission、不可變settings ID及capture摘要。
   `candidate`是該request的候選設定，`captured`是原registration已保存的設定；原CID／重送不重讀
@@ -4113,8 +4129,8 @@ node --test .\tests\shared_context\test_web_test_console_workbench.cjs
 P05 後，工作台不再提供 legacy `normal_pull` 固定工作、預算／期限 gate、原取件續接或 normal 專用操作批准。舊段落保留為本摘要，避免讀者誤以為這些診斷入口仍可用。
 
 - `fa-web-test-console-v1`、`fa-web-test-console-steady-v2`、`fa-web-test-console-standing-v3` 仍可解析舊 tasks 與 standing policy 欄位；這是部署／退版相容，不是 UI 可執行工作。
-- `work_policy.py` 只保留 job-bound instruction lane 需要的 typed observation DTO 與核對 helper；不再提供 normal fixed-work `query_for` 或 `blocking_code` gate。
-- `standing.py` 的 preflight checker 仍供 `InstructionReader` 使用；normal `AssistantSubmit` 固定工作不再由 bridge 建立、顯示或送出。
+- `work_policy.py` 已刪除（舊 job lane 退役，PR-D）。
+- `standing.py` 只剩 standing config；`StandingPullAdapter`／`StandingSubmitReply` 與 preflight checker 都已拿掉，工作台不再建立或送出 `AssistantSubmit`。
 - `pull_continuation.py` 只剩 sidecar schema，CLI 參數仍接受；runtime 不再讀取、核對或續接 normal pull。
 - `original_failure` 模式已於 2026-10 移除：後端 `/web/v1/original-failure/*` 路由早已不存在（`OriginalFailureWebHandoff` 已移除），呼叫必然 404。task `mode` 只剩 `normal_pull`，因此 `tasks` 目前只是舊配置 schema，工作台不會列出任何設定的 task。
 
@@ -4209,7 +4225,7 @@ submit、cancel、fetch、ACK 或其他工作 POST；只恢復之後正常使用
 
 | 操作 | 真正呼叫與限制 |
 |---|---|
-| 固定測試 | 普通助理 `POST /behavior/v1/bindings/{binding_id}/assistant/submit`；lifecycle 則既有 `/work/submit`。先用 SQLite FULL transaction 保存原 request ID／body SHA／非 secret intent，再只 POST 一次。 |
+| 固定測試 | 已退役：工作台不再送出 `/assistant/submit` 或 `/work/submit`，submit 在入口回 403 `ACTION_NOT_ALLOWED`（見「舊版對話在工作台改成唯讀」）。 |
 | 純讀核對 | `GET /behavior/v1/bindings/{binding_id}/jobs/{job_id}`。不呼 controller、`workers.reconcile`、callback、model 或任何 query reservation。沒有自動輪詢。 |
 | 取得原結果 | 先純讀 status 確認有 delivery ID，再由使用者手動 `POST /delivery/pull` 一次。不是每次重整 fetch；保留原八次配額，client 自己只用一次。 |
 | 顯示 | 先核原 bytes 長度／SHA、五個 headers、typed `DeliveryBinding`、原 task/work/event/root/owner/recipient/channel 與 payload artifacts，再以 `textContent` 顯示。失敗仍顯示失敗；空內容不填 dummy metrics。 |

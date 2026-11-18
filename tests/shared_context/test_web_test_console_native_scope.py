@@ -8,14 +8,14 @@ import pytest
 from fastapi.testclient import TestClient
 from azure.ai.projects.models import AgentSessionResource
 
-from shared_context.behavior_assistant import _LocalHttp
+from local_http_helpers import _LocalHttp
 from web_test_console.agent_connections import AgentConnections
 from web_test_console.bridge import create_app
 from test_web_test_console_agents import connection_file, directory_payload
 from test_web_test_console_native import native_console
 from test_native_turn_api import native_api
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_native_session_prepare_api import project_client
 

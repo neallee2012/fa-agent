@@ -16,6 +16,7 @@ STATE_PROFILES = (None, NATIVE_LANE, NATIVE_RESPONSES_PROFILE)
 # A conversation another Agent or a routine run (2026-10-23) opened here: its thread is its first RID, read back from
 # this Agent's receipts.
 RECEIVED_PHASE = "agent-received"
+LEGACY_READ_ONLY = "這是舊版對話，只能查看，不能再送出。"
 
 
 def lane_of(profile):

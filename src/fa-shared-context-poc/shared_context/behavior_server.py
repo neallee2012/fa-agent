@@ -83,7 +83,7 @@ from azure.ai.projects import AIProjectClient
 from azure.data.tables import TableClient
 from azure.identity import ManagedIdentityCredential
 from azure.storage.blob import ContainerClient
-from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 
 from . import behavior_wire as wire
 from .behavior_api import (
@@ -91,8 +91,7 @@ from .behavior_api import (
     create_source_recovery_app,
 )
 from .behavior_auth import BehaviorAuthSettings, BehaviorJwtVerifier
-from .behavior_delivery import DeliveryCore, DeliveryConsumer, PendingIndexRecord, QuotaRecord, RuntimeRegistration
-from .behavior_delivery_pending import counts as pending_counts, head_key as pending_head_key
+from .behavior_delivery import DeliveryCore, PendingIndexRecord, QuotaRecord, RuntimeRegistration
 from .behavior_effects import WorkGoalUpdate, WorkStateEffectAdapter
 from .behavior_foundry import FoundryExecutor, FoundryHttpClient, NativeJobRoute, NativeLaunchAuthority, NativeRecoveryBinding, native_key
 from .behavior_inbox import InboxRegistration, PullInbox
@@ -100,7 +99,7 @@ from .behavior_operations import BudgetRecord, OwnerRecord, PolicyRecord, ToolBr
 from .behavior_runtime import BehaviorRuntime, RuntimeDependencies, RuntimeEvidenceAuthority, executor_job_input
 from .behavior_server_config import (
     BootstrapAuthorization, NativeEvidenceBundle, RecoveryCatalog, RecoveryConfiguration,
-    ServerConfiguration, SupervisorLimits, TokenizerConfiguration, load_configuration, read_document,
+    ServerConfiguration, TokenizerConfiguration, load_configuration, read_document,
 )
 from .behavior_store import BehaviorStore, ControlChanges, ControlRequest, ControlWrite
 from .behavior_workers import WorkerCore
@@ -122,8 +121,6 @@ COVERAGE = {"atomic_control", "inline_retention", "durable_consumer", "timer_red
 TOKENIZER_URL = "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
 TOKENIZER_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
 TOKENIZER_CACHE_KEY = hashlib.sha1(TOKENIZER_URL.encode()).hexdigest()
-# Longest wait between read-only session checks of an instruction whose Hosted stopped answering.
-LOST_WAIT_MAX_SECONDS = 900
 
 
 @lru_cache(maxsize=1)
@@ -347,11 +344,6 @@ class ServerComposition:
         self.clients, self._resources, self.closed = clients, resources, False
         self._probe_transport = probe_transport
         self.assistant = None
-        self._instruction_tasks = {}
-        self._instruction_wakes = {}
-        # Bindings whose original Hosted did not answer; the keepalive must not wake their session.
-        self._instruction_lost = set()
-        self._instruction_stopping = False
         self.agent_id = agent_id
         # behavior_agent_versions.HostedVersions in production; None keeps each target's configured version offline.
         self.hosted_versions = None
@@ -371,7 +363,6 @@ class ServerComposition:
         with self._peer_lock:
             if not self.closed:
                 self.closed = True
-                for task in self._instruction_tasks.values():task.cancel()
                 for peer in self._peers.values():peer.close()
                 self._resources.close()
 
@@ -477,142 +468,6 @@ class ServerComposition:
             record=None if control is None else control.records.get(binding_id)
             return record is not None and record.profile.instruction is not None
         return _read_conflicts(read, phase="instruction_route")
-
-    def _instruction_target(self,binding_id):
-        control=self.runtime.work_policy
-        record=None if control is None else control.records.get(binding_id)
-        task=None if record is None else record.profile.instruction
-        if task is None or task.peer_work is None:
-            return self,binding_id
-        from .behavior_agent_message_api import _read_root
-        owner=getattr(self,"_agent_message_owner",None)
-        if owner is None:
-            raise Problem(503,"AGENT_MESSAGE_UNAVAILABLE","the original peer controller is unavailable")
-        root=control.peer_roots.get(task.peer_work.root_id)
-        if root is None:root=_read_root(self.runtime.store,task.peer_work.root_id)
-        return owner,root.origin.binding_id
-
-    def launch_instruction(self,binding_id):
-        import asyncio
-        target,original=self._instruction_target(binding_id)
-        if target is not self:return target.launch_instruction(original)
-        if self.closed or self._instruction_stopping:raise _denied("server instruction observer is stopping")
-        prior=self._instruction_tasks.get(binding_id)
-        if prior is not None and not prior.done():return
-        interval=self.runtime.dep.delivery.contract.review_interval_seconds
-        wake=asyncio.Event()
-        self._instruction_wakes[binding_id]=wake
-        from .behavior_session_keepalive import InstructionSessionKeepalive
-        keepalive=InstructionSessionKeepalive(self,binding_id)
-        lost_codes={"WORKER_QUERY_UNKNOWN","WORKER_STOP_UNKNOWN"}
-        def session_stopped():
-            check=getattr(self.runtime.dep.workers.adapter,"stopped_session",None)
-            record=self.runtime.work_policy.records.get(binding_id)
-            if check is None or record is None:return None
-            job=self.runtime.dep.workers.inspect(record.binding.job_id)
-            return None if job.binding is None else check(job.binding)
-        async def lost_wait():
-            """The original Hosted did not answer: read only its session until it is proven stopped or woken.
-
-            Reads back off from the review interval to LOST_WAIT_MAX_SECONDS, so a turn that never closes on its
-            own (its session status unreadable, never stopped) costs a few reads an hour; a cancel still wakes it.
-            """
-            from starlette.concurrency import run_in_threadpool
-            self._instruction_lost.add(binding_id)
-            delay=interval
-            while not self.closed and not self._instruction_stopping:
-                if wake.is_set():return "woken"
-                try:await asyncio.wait_for(wake.wait(),timeout=delay)
-                except TimeoutError:pass
-                if wake.is_set():return "woken"
-                try:stopped=await run_in_threadpool(session_stopped)
-                except Exception:stopped=None
-                if stopped is not None:return "stopped"
-                delay=min(delay*2,max(interval,LOST_WAIT_MAX_SECONDS))
-            return None
-        async def follow():
-            from starlette.concurrency import run_in_threadpool
-            import logging
-            proven=False
-            try:
-                while not self.closed and not self._instruction_stopping:
-                    wake.clear()
-                    try:
-                        await run_in_threadpool(keepalive.tick)
-                        status=await run_in_threadpool(self.runtime.controller.step,binding_id)
-                    except Problem as error:
-                        if error.status==412 and error.body["error"]["code"]=="BEHAVIOR_CONFLICT":
-                            logging.getLogger(__name__).warning("INSTRUCTION_OBSERVATION_CONFLICT original_work=true")
-                            await asyncio.sleep(1)
-                            continue
-                        if error.body["error"]["code"] in lost_codes and not proven:
-                            logging.getLogger(__name__).warning("INSTRUCTION_OBSERVATION_LOST_PENDING code=%s",
-                                                                error.body["error"]["code"])
-                            outcome=await lost_wait()
-                            if outcome is None:return
-                            proven=outcome=="stopped"
-                            continue
-                        raise
-                    if status.state in {"succeeded","failed","cancelled"} and status.result_forwarded:return
-                    if status.state == "capacity_uncertain" and not wake.is_set():
-                        if binding_id in self._instruction_lost and not proven:
-                            outcome=await lost_wait()
-                            if outcome is None:return
-                            proven=outcome=="stopped"
-                            continue
-                        logging.getLogger(__name__).warning("INSTRUCTION_OBSERVATION_PAUSED original_work=true state=capacity_uncertain")
-                        return
-                    try:await asyncio.wait_for(wake.wait(),timeout=interval)
-                    except TimeoutError:pass
-            except Problem as error:
-                logging.getLogger(__name__).warning("INSTRUCTION_OBSERVATION_UNRESOLVED code=%s",error.body["error"]["code"])
-            except Exception as error:
-                logging.getLogger(__name__).error("INSTRUCTION_OBSERVATION_FAILED exception_type=%s",type(error).__name__)
-                raise
-        task=asyncio.create_task(follow())
-        self._instruction_tasks[binding_id]=task
-        def finished(done):
-            if self._instruction_tasks.get(binding_id) is done:
-                self._instruction_tasks.pop(binding_id,None)
-                self._instruction_wakes.pop(binding_id,None)
-                self._instruction_lost.discard(binding_id)
-            if not done.cancelled():done.exception()
-        task.add_done_callback(finished)
-
-    def instruction_ready(self,binding_id):
-        target,original=self._instruction_target(binding_id)
-        target.launch_instruction(original)
-        target._instruction_wakes[original].set()
-
-    async def stop_instruction_observers(self):
-        import asyncio
-        self._instruction_stopping=True
-        tasks=tuple(self._instruction_tasks.values())
-        for task in tasks:task.cancel()
-        await asyncio.gather(*tasks,return_exceptions=True)
-        for peer in self._peers.values():
-            await peer.stop_instruction_observers()
-
-    def resume_instructions(self):
-        from .behavior_workers import worker_key,JobRecord
-        from .behavior_operations import _parse
-        control=self.runtime.work_policy
-        if control is None:return
-        # Both callers run right after application()'s validate_startup() refreshed every registered work row.
-        if getattr(self,"_agent_message_owner",None) is None:
-            from .behavior_agent_message_runtime import resume_peer_messages
-            resume_peer_messages(self)
-        for record in control.records.values():
-            if record.profile.instruction is None:continue
-            key=worker_key("job",record.binding.job_id)
-            row=self.runtime.store.read_snapshot((key,))[key]
-            if row is None:continue
-            job=_parse(row.payload["data"],JobRecord)
-            if job.state in {"succeeded","failed","cancelled"} and job.result_forwarded:
-                from .behavior_agent_message_runtime import complete_origin
-                complete_origin(self.runtime,record.binding)
-                continue
-            self.launch_instruction(record.binding.binding_id)
 
 
 def _installation(config):
@@ -831,7 +686,6 @@ def _lifespan(app, composition, validate):
             validate()
             if memory is not None:
                 await asyncio.to_thread(memory.warm)
-            if getattr(_app.state,"instruction_runner",False):composition.resume_instructions()
             if composition._peer_router is not None:
                 await composition._peer_router.prepare()
             if clock is not None:
@@ -844,7 +698,6 @@ def _lifespan(app, composition, validate):
                 await patrol.stop()
             if clock is not None:
                 await clock.stop()
-            if getattr(_app.state,"instruction_runner",False):await composition.stop_instruction_observers()
             # ADR-0009 2d-i background cuts: a running files fence is withdrawn before the clients close.
             from .native_cut import close_cut_drivers
             await asyncio.to_thread(close_cut_drivers, composition)
@@ -895,24 +748,8 @@ def _native_evidence_dependency(composition, identity):
     return current_native_evidence
 
 
-def _install_assistant_api(app, composition, identity):
-    from .behavior_assistant_api import install_assistant_routes
-
-    def current_assistant_evidence(request: Request, _principal=Depends(identity)):
-        if composition.instruction_request(request):
-            return
-        if composition.assistant.bounded_route(composition, request):
-            composition.assistant.acquire_evidence(composition)
-        else:
-            composition.require_current_native_evidence()
-
-    routes = APIRouter(dependencies=[Depends(current_assistant_evidence)])
-    install_assistant_routes(
-        routes, composition.assistant.authority, composition.verifier,
-        provider=composition.assistant.provider,
-        on_result_ready=composition.instruction_ready,
-    )
-    app.include_router(routes)
+def _install_assistant_api(app, composition):
+    """Only the Team data relay: the legacy /assistant/* session routes are retired and not served."""
     from .team_data_relay import TeamDataRelay, install_team_data_routes
     artifacts = composition.assistant.artifacts
     app.state.team_data = TeamDataRelay(
@@ -922,13 +759,8 @@ def _install_assistant_api(app, composition, identity):
 
 def _install_work_policy_api(app, composition):
     from .behavior_work_policy_api import install_work_policy_routes
-    from .memory_note_proposal_api import install_note_proposal_routes
-    from .memory_bridge_settings_api import install_memory_bridge_settings_routes
     from .memory_candidate_api import install_memory_candidate_routes
-    install_work_policy_routes(app,composition,start_work=composition.launch_instruction,
-                               wake_work=composition.instruction_ready)
-    install_note_proposal_routes(app, composition.runtime, composition.verifier)
-    install_memory_bridge_settings_routes(app, composition.runtime, composition.verifier)
+    install_work_policy_routes(app,composition)
     install_memory_candidate_routes(app, composition.runtime, composition.verifier)
     if composition.assistant is not None:
         from .assistant_image_api import install_image_routes
@@ -973,7 +805,7 @@ def _operational_application(composition):
                                        registered_actor=composition.registered_actor),
                        dependencies=[Depends(current_native_evidence)])
     if composition.assistant is not None:
-        _install_assistant_api(app, composition, identity)
+        _install_assistant_api(app, composition)
     if composition.runtime.work_policy is not None:
         _install_work_policy_api(app, composition)
     _health(app, preactivation=False)
@@ -1360,107 +1192,6 @@ def recovery_application(config: RecoveryConfiguration, *, credential=None, back
 
 def create_recovery_app():
     return recovery_application(load_configuration(recovery=True))
-
-
-def _count_problems(problems, results):
-    """Count each item's problem code in ``problems``: at most 32 distinct codes, then ``OTHER_PROBLEMS``."""
-    for item in results:
-        code = item.get("problem")
-        if code is None:
-            continue
-        if not isinstance(code, str) or re.fullmatch(r"[A-Z0-9_]{1,96}", code) is None:
-            code = "BEHAVIOR_DEPENDENCY_UNAVAILABLE"
-        if code not in problems and len(problems) >= 32:
-            code = "OTHER_PROBLEMS"
-        problems[code] = problems.get(code, 0) + 1
-
-
-def _start_controller(composition, runtime, preactivation):
-    composition.installation()
-    if preactivation:
-        composition.catalog.worker()
-        runtime.dep.workers._ready()
-        runtime.dep.workers.pending()
-    else:
-        composition.catalog.require_activation()
-        runtime.validate_startup()
-
-
-def _pending_binding(composition, runtime, root):
-    """The one authenticated-pull binding of this root that may defer a nonready new delivery page, else None."""
-    if not (composition.config.workload_version == "assistant-v1.2"
-            and composition.assistant is not None and composition.config.workers.capacity == 1
-            and len(runtime.bindings) == 1):
-        return None
-    candidate = next(iter(runtime.bindings.values()))
-    if (candidate.binding_id in runtime.profiles and candidate.route.channel_id == "authenticated-pull"
-            and candidate.owner.root_budget_id == root.root_budget_id):
-        return candidate
-    return None
-
-
-def _drain_deliveries(composition, runtime, limits, problems, stopping):
-    """One delivery page per root that has pending deliveries; the number of items drained."""
-    items = 0
-    for root in composition.config.roots:
-        if stopping():
-            break
-        index_key = control_key("delivery-index", root.root_budget_id)
-        rows = runtime.store.read_snapshot((index_key, pending_head_key(root.root_budget_id)))
-        if not pending_counts(runtime.dep.delivery, rows, root.root_budget_id)[0]:
-            continue
-        pending_binding = _pending_binding(composition, runtime, root)
-        page = DeliveryConsumer(runtime.dep.delivery).drain(
-            root.root_budget_id, runtime.resolve_owner, composition.config.controller_id, limit=limits.page_limit,
-            **({"pending_binding": pending_binding} if pending_binding is not None else {}),
-        )
-        items += len(page)
-        _count_problems(problems, page)
-    return items
-
-
-def run_controller(composition, *, limits=None, preactivation=False, stop_requested=lambda: False,
-                   monotonic=time.monotonic, sleep=time.sleep):
-    """Foreground bounded ticks. No threads, models, HTTP-selected code or blind resend.
-
-    RuntimeController.drain uses the existing WorkerConsumer query/stop-before-
-    start and completion generation lanes. Delivery pages reserve durable scans.
-    An exact native assistant C1 pull binding may defer only a freshly verified
-    nonready new delivery page; query/stop order and all loop bounds are unchanged.
-    The wall limit is checked between ticks; an in-flight bounded SDK operation
-    is not killed/retried. A service supervisor owns termination/restart.
-    """
-    try:
-        limits = composition.config.supervisor if limits is None else SupervisorLimits.model_validate_json(limits.model_dump_json())
-        runtime = composition.runtime
-        if runtime.controller is None or runtime.dep.native_launches is None or runtime.mode != "native":
-            raise Problem(403, "BEHAVIOR_CONTROLLER_REQUIRED", "native internal controller is required")
-        began, ticks, worker_items, delivery_items = monotonic(), 0, 0, 0
-        problems = {}
-
-        def stopping():
-            return stop_requested() or monotonic() - began >= limits.max_run_seconds
-
-        _start_controller(composition, runtime, preactivation)
-        for tick in range(limits.ticks):
-            if stopping():
-                break
-            composition.catalog.worker() if preactivation else composition.catalog.require_activation()
-            result = runtime.controller.drain(limit=limits.page_limit)
-            worker_items += len(result)
-            _count_problems(problems, result)
-            if not preactivation:
-                delivery_items += _drain_deliveries(composition, runtime, limits, problems, stopping)
-            ticks += 1
-            if tick + 1 < limits.ticks and not stop_requested():
-                remaining = limits.max_run_seconds - (monotonic() - began)
-                if remaining > 0:
-                    sleep(min(limits.interval_seconds, remaining))
-        return {"ticks": ticks, "worker_items": worker_items, "delivery_items": delivery_items,
-                "problem_counts": problems, "preactivation": preactivation,
-                "actual_environment": "NOT_RUN", "full_scenario_pass": False}
-    finally:
-        composition.close()
 
 
 if __name__ == "__main__":

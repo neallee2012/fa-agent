@@ -18,7 +18,7 @@ from test_native_routine_api import routine_api
 from test_native_responses_api import PREFIX as RESPONSES_PREFIX, responses_api
 from test_native_turn_api import PREFIX, NativeTransport, in_flight, native_api, submit
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key, token
 
 

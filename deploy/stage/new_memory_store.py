@@ -80,7 +80,7 @@ def ensure(stores, out, name, not_found=LookupError, expected=DEFINITION):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--config", help="environment profile; defaults to FA_DEPLOY_CONFIG or deploy/stage/stage.json")
+    parser.add_argument("--config", help="environment profile; required unless FA_DEPLOY_CONFIG is set")
     parser.add_argument("--chat-model", default=DEFINITION["chat_model"], help="a chat deployment of the project")
     args = parser.parse_args(argv)
     from azure.ai.projects import AIProjectClient

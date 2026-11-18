@@ -100,7 +100,7 @@ def test_reader_selection_requires_delegation_and_the_parents_existing_reader(pr
 def test_native_reader_selection_and_current_capture_can_remove_it(state_profile):
     from shared_context.behavior_capabilities import capture as capture_grants
     from shared_context.behavior_profile_selection import profile_values_from_template
-    from test_conversation_profile_selection import template
+    from conversation_profile_selection_helpers import template
 
     names = ("fa-delegate-reader-v1", "fa-delegate-v1")
     grants = available_grants(None, names)

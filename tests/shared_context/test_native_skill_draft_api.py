@@ -25,9 +25,9 @@ from shared_context.native_skill_draft_wire import (
     NativeSkillDraftProof, NativeSkillDraftWrite, draft_material,
 )
 from test_agent_runtime import peer_runtime
-from test_agent_runtime_routing import agent_headers
+from agent_runtime_routing_helpers import agent_headers
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_native_agent_api import relay_case
 from test_native_capabilities import selected_capture

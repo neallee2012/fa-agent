@@ -259,12 +259,11 @@ def test_a_responses_v1_conversation_continues_on_a_v2_runtime(responses_v2):
 @pytest.mark.parametrize("profile", [V1, V2, NATIVE_V3_PROFILE, NATIVE_RESPONSES_PROFILE, "foundry-native-v4"])
 def test_the_runtime_declares_the_environment_profile_and_refuses_any_other(local_env, monkeypatch, tmp_path,
                                                                             profile):
-    from shared_context.behavior_assistant_hosted import AssistantSupervisor
 
     runtime_path = tmp_path / "OFFLINE-not-executed"
     runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
     hosted = SimpleNamespace(
-        identity=IDENTITY, supervisor=AssistantSupervisor(tmp_path / ".fa-assistant-v12", runtime_path=runtime_path),
+        identity=IDENTITY, root=tmp_path / ".fa-assistant-v12",
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"))
     monkeypatch.setattr("azure.identity.aio.ManagedIdentityCredential", lambda client_id=None: None)
     monkeypatch.setenv("FA_NATIVE_TURNS", profile)
@@ -286,13 +285,12 @@ def test_the_runtime_declares_the_environment_profile_and_refuses_any_other(loca
 def test_the_runtime_refuses_a_version_that_declares_another_sdk_release(local_env, monkeypatch, tmp_path, declared):
     """ADR-0009 §3 (c): the API trusts the pair a version's definition declares (FA_SDK_RELEASE) for Guard A/B, so an
     image under a definition naming another pair never starts; an undeclared one (published before it) still does."""
-    from shared_context.behavior_assistant_hosted import AssistantSupervisor
     from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
 
     runtime_path = tmp_path / "OFFLINE-not-executed"
     runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
     hosted = SimpleNamespace(
-        identity=IDENTITY, supervisor=AssistantSupervisor(tmp_path / ".fa-assistant-v12", runtime_path=runtime_path),
+        identity=IDENTITY, root=tmp_path / ".fa-assistant-v12",
         api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"))
     monkeypatch.setattr("azure.identity.aio.ManagedIdentityCredential", lambda client_id=None: None)
     for key, value in {"FA_NATIVE_TURNS": NATIVE_V3_PROFILE, "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",

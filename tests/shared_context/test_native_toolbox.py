@@ -30,7 +30,7 @@ from shared_context.native_turns import NativeTurnControl
 from shared_context.tool_catalog import CatalogError, build_catalog, load_catalog, parse_entry_file
 from test_behavior_assistant import assistant
 from test_capability_calls import WEBIQ
-from test_instruction_flow import instruction_models, runtime_path
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 
 CATALOG_DIR = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc" / "tool_catalog"
@@ -85,43 +85,6 @@ def test_a_toolbox_grant_is_a_custom_tool_set_with_its_own_guidance():
     assert needs.custom_tools == GRANT.tools and needs.mcp_servers == {} and needs.mcp_tools == ()
     text = addendum(capture.grants)
     assert "Foundry project toolbox" in text and "WebIQ-web, WebIQ-browse" in text
-
-
-def test_the_job_path_refuses_a_toolbox_grant_before_the_sdk_starts(assistant, monkeypatch):
-    from shared_context import behavior_assistant_hosted as hosted
-    from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES
-    from test_capability_capture import CATALOG, FILES, enabled
-    from test_conversation_profile_selection import select, template
-    from test_instruction_prompt import submit
-    from shared_context.behavior_history_prompt import HISTORY_PROFILE
-    catalog = build_catalog([*CATALOG.entries, TOOLBOX])
-    h, _ = enabled(assistant, monkeypatch, grants=available_grants(catalog, ("fa-desktop-v1",)), catalog=catalog,
-                   tools=HISTORY_CAPABILITIES, image_tools=False)
-    choice, _ = select(h, request_id="choose-toolbox", previous=None, value=template(
-        HISTORY_PROFILE, user_text_file_profile=FILES, capabilities=(GRANT.ref,)))
-    assert choice.status_code == 200, choice.text
-    started, refusals = [], []
-
-    async def never(**options):
-        started.append(options)
-        raise AssertionError("the job path must not start the SDK for a toolbox grant")
-    monkeypatch.setattr(hosted, "run_copilot", never)
-    original = hosted.AssistantSession._run_turn
-
-    async def observed(self, work):
-        try:
-            return await original(self, work)
-        except Problem as error:
-            refusals.append(error.body["error"])
-            raise
-    monkeypatch.setattr(hosted.AssistantSession, "_run_turn", observed)
-    accepted, _ = submit(h, "toolbox-on-job-path", "Search the web.")
-    try:
-        h.runtime.controller.step(accepted["binding_id"])
-    except Problem:
-        pass
-    assert started == [] and [(item["code"], item["capability"]) for item in refusals] == [
-        ("CAPABILITY_UNAVAILABLE", "WebIQ")]
 
 
 class Toolbox:

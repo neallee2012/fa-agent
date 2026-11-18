@@ -28,8 +28,9 @@ import shared_context.behavior_agent_versions as onboarding_versions
 from shared_context.errors import Problem
 import test_conversation_transfer_startup as startup
 from test_agent_registry_operator import OperatorTableTransport
-from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from test_conversation_transfer_startup import synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_team_registry import OTHER_AGENT_OID
 
@@ -918,7 +919,7 @@ ORIGIN = "fa-instruction-context-origin-v1"
 
 def _a_selects(team, rid, **settings):
     from shared_context.behavior_profile_selection import SelectConversationProfile, current_selection, select_profile
-    from test_conversation_profile_selection import template
+    from conversation_profile_selection_helpers import template
     control = team.a.runtime.work_policy
     head = current_selection(control.runtime.store, control.policy)
     select_profile(control, getattr(getattr(team.a, "assistant", None), "authority", None), team.c.human,

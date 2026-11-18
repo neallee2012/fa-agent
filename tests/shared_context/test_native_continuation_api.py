@@ -118,7 +118,7 @@ def test_a_continued_peer_result_returns_under_the_original_message_without_anot
     from shared_context.behavior_native_turn_wire import NativeContinuationSubmit, NativeReceipt, NativeResultReference
     from shared_context.native_continuation_wire import NativeContinuation
     from shared_context.native_continuations import continuation_request_id
-    from test_agent_runtime_routing import agent_headers
+    from agent_runtime_routing_helpers import agent_headers
     from test_native_agent_api import send_command
     from shared_context.native_relay_quota import NativeRelayQuota
 

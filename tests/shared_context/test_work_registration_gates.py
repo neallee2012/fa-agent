@@ -28,14 +28,13 @@ from shared_context.behavior_work_policy import WorkRegistration, derive_work, w
 from shared_context.errors import Problem
 from test_agent_message_api import message_turn
 from test_agent_runtime import peer_runtime
-from test_agent_runtime_routing import routing_peer
+from agent_runtime_routing_helpers import routing_peer
 from test_behavior_assistant import assistant
 from test_behavior_store import store
-from test_conversation_profile_selection import template
+from conversation_profile_selection_helpers import template
 from test_conversation_transfer_startup import SyntheticSessionClient, saved_turn, synthetic_standing_v1
-from test_instruction_flow import instruction_models, runtime_path, sdk_io
+from instruction_flow_helpers import instruction_models, runtime_path, sdk_io
 from test_m3_auth import jwk_client, signing_key
-from test_routine_producer import routine_owner
 from test_work_result_access import DIGEST, Reads
 
 ADMISSION_CONFLICT = (412, "BEHAVIOR_CONFLICT")
@@ -619,22 +618,3 @@ def test_a_peer_registration_rechecks_its_parent_inside_the_transaction(peer_wor
     monkeypatch.setattr(behavior_delegation, "_current_parent", parent_gone)
     assert second_receiver(p)[:2] == (409, "A_PARENT_GONE")
     assert origins == [p.root.origin]
-
-
-def test_a_routine_is_checked_again_inside_the_transaction(routine_owner, monkeypatch):
-    from shared_context import behavior_routine
-    c = routine_owner
-    state = SimpleNamespace(inside=False, checks=[])
-    real = behavior_routine.validate_submission
-
-    def checked(*args, **kwargs):
-        state.checks.append(state.inside)
-        return real(*args, **kwargs)
-
-    def edit(rows):
-        state.inside = True
-    monkeypatch.setattr(behavior_routine, "validate_submission", checked)
-    raced(monkeypatch, edit)
-    response = c.h.client.post("/work-policy/v1/routines/daily-check/trigger", json={"scheduled_for": c.scheduled_for},
-                               headers=c.h.headers())
-    assert response.status_code == 200 and state.checks[-1] is True

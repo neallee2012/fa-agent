@@ -5,14 +5,12 @@ import base64
 import json
 import logging
 from types import SimpleNamespace
-from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from azure.data.tables import TableClient
 
-from shared_context.behavior_store import BehaviorStore as BaseStore, ControlChanges, ControlRequest, ControlWrite
-from shared_context.behavior_effects import _DeadlineClient
+from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
 from shared_context import behavior_migration as migration
 from shared_context.behavior_migration import MigrationStore as BehaviorStore
 from shared_context.behavior_migration import DEFAULT_INVENTORY_MAX_BYTES, DEFAULT_INVENTORY_MAX_ENTITIES
@@ -206,29 +204,6 @@ def test_installation_fence_rejects_old_configuration_writes_and_reads():
             operation()
         assert fenced.value.body["error"]["code"] == "MIGRATION_INSTALLATION_CHANGED"
     assert len(table.submissions) == before
-
-
-def test_existing_deadline_receiver_wrapper_cannot_bypass_installation_fence():
-    store, table = store_with_row()
-    store.transact(ControlRequest(request_id="install-receiver", request_digest="a" * 64),
-                   lambda _: ControlChanges(writes=(ControlWrite(
-                       row_id="installation", mode="create", data={"configuration_sha256": "a" * 64},
-                   ),), result={}))
-    store.bind_installation("installation", "a" * 64)
-    now = datetime.now(timezone.utc)
-    receiver = BaseStore(_DeadlineClient(store._client, lambda: now,
-                                        [(now - timedelta(seconds=1), now + timedelta(seconds=1))]), SCOPE)
-    operator = BehaviorStore(table, SCOPE)
-    operator.transact(ControlRequest(request_id="replace-installation", request_digest="b" * 64, read_set=("installation",)),
-                      lambda _: ControlChanges(writes=(ControlWrite(
-                          row_id="installation", mode="replace", data={"configuration_sha256": "b" * 64},
-                      ),), result={}))
-    before = dict(operator.read_inventory().entity_sha256)
-    with pytest.raises(Problem) as rejected:
-        receiver.transact(ControlRequest(request_id="stale-receiver", request_digest="c" * 64),
-                          lambda _: ControlChanges(writes=(), result={}))
-    assert rejected.value.body["error"]["code"] == "MIGRATION_INSTALLATION_CHANGED"
-    assert dict(operator.read_inventory().entity_sha256) == before
 
 
 def test_complete_inventory_uses_real_Table_SDK_serialization_with_local_transport():

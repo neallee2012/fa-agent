@@ -69,26 +69,6 @@ def _journal(case):
     return case.console.journal.get(case.thread, "reset")
 
 
-def test_a_confirmed_reset_archives_the_conversation_and_opens_one_new_thread(legacy):
-    legacy.answers.append(_reply(legacy.request_id))
-    response = legacy.reset()
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["reset"] == _reply(legacy.request_id)
-    assert legacy.sent == [("POST", f"/work-policy/v1/conversations/{CID}/reset", {"request_id": legacy.request_id})]
-    saved = _journal(legacy)
-    assert saved["state"] == "CONFIRMED" and saved["intent"]["conversation_id"] == CID
-    assert saved["intent"]["body"] == {"request_id": legacy.request_id}
-    fresh = saved["new_thread_id"]
-    assert fresh != legacy.thread and body["composer"]["thread_id"] == fresh
-    archived = legacy.console.instructions.projections[CID]
-    assert (archived.archived, archived.can_reset, archived.can_follow_up, archived.follow_up_blocker) == (
-        True, False, False, "CONVERSATION_ARCHIVED")
-    again = legacy.reset()
-    assert again.status_code == 200 and "reset" not in again.json() and again.json()["composer"]["thread_id"] == fresh
-    assert len(legacy.sent) == 1
-
-
 def test_a_native_thread_cannot_be_reset_here(native_console):
     c = native_console
     thread = c.ui.console.instructions.store.current()["thread_id"]
@@ -101,55 +81,6 @@ def test_a_thread_without_a_conversation_has_nothing_to_reset(legacy):
     legacy.conversation.clear()
     assert _error(legacy.reset()) == (403, "ACTION_NOT_ALLOWED")
     assert _journal(legacy) is None and legacy.sent == []
-
-
-def test_a_conversation_the_server_does_not_offer_to_reset_is_refused_before_any_post(legacy):
-    legacy.projection = legacy.projection.model_copy(update={"can_reset": False})
-    status, code = _error(legacy.reset())
-    assert code == "CONVERSATION_TURN_UNRESOLVED" and _journal(legacy) is None and legacy.sent == []
-
-
-@pytest.mark.parametrize("code", ["CONVERSATION_TURN_UNRESOLVED", "CONVERSATION_ARCHIVED"])
-def test_a_server_refusal_is_journaled_and_the_same_reset_may_be_sent_again(legacy, code):
-    legacy.answers.append(ConsoleError(code, 409))
-    assert _error(legacy.reset()) == (409, code)
-    assert _journal(legacy)["state"] == "REFUSED" and _journal(legacy)["code"] == code
-    legacy.answers.append(_reply(legacy.request_id))
-    response = legacy.reset()
-    assert response.status_code == 200, response.text
-    assert response.json()["reset"] == _reply(legacy.request_id)
-    assert [body for _, _, body in legacy.sent] == [{"request_id": legacy.request_id}] * 2
-    assert _journal(legacy)["state"] == "CONFIRMED"
-
-
-def test_any_other_failure_leaves_the_reset_unknown_and_never_resends_it(legacy):
-    legacy.answers.append(ConsoleError("BACKEND_UNAVAILABLE", 503))
-    assert _error(legacy.reset()) == (503, "BACKEND_UNAVAILABLE")
-    assert _journal(legacy)["state"] == "UNKNOWN"
-    assert _error(legacy.reset()) == (409, "RESET_UNKNOWN")
-    assert len(legacy.sent) == 1
-
-
-def test_a_refused_reset_whose_retry_is_lost_stays_unknown(legacy):
-    legacy.answers.extend([ConsoleError("CONVERSATION_TURN_UNRESOLVED", 409), ConsoleError("BACKEND_UNAVAILABLE", 503)])
-    legacy.reset()
-    legacy.reset()
-    saved = _journal(legacy)
-    assert (saved["state"], saved["previous_refusal"]) == ("UNKNOWN", "CONVERSATION_TURN_UNRESOLVED")
-    assert _error(legacy.reset()) == (409, "RESET_UNKNOWN") and len(legacy.sent) == 2
-
-
-@pytest.mark.parametrize("answer, status", [
-    (b"not json", 502), ({"conversation_id": CID}, 502),
-    ("other-conversation", 409), ("other-request", 409), ("other-session", 409),
-], ids=["not-json", "incomplete", "other-conversation", "other-request", "other-session"])
-def test_a_reply_that_is_not_this_resets_receipt_is_unknown(legacy, answer, status):
-    changes = {"other-conversation": {"conversation_id": "another-conversation"},
-               "other-request": {"reset_request_id": "another-request"},
-               "other-session": {"hosted_session_id": "fa-chat-another"}}
-    legacy.answers.append(_reply(legacy.request_id, **changes[answer]) if isinstance(answer, str) else answer)
-    assert _error(legacy.reset()) == (status, "RESET_UNKNOWN")
-    assert _journal(legacy)["state"] == "UNKNOWN" and legacy.console.instructions.projections.get(CID) is None
 
 
 def test_a_console_without_instructions_offers_no_reset(legacy, monkeypatch):

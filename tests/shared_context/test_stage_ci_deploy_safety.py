@@ -3,7 +3,6 @@
 A throwaway git repository stands in for the checkout; `az` and `docker` are fakes. Standard library + pytest only.
 """
 
-import copy
 import importlib.util
 import os
 import subprocess
@@ -22,7 +21,7 @@ def load_ci():
                                                   ROOT / "deploy" / "stage" / "ci_deploy.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.STAGE = copy.deepcopy(module.STAGE)
+    module.use_profile(ROOT / "deploy" / "stage" / "stage.json")
     return module
 
 

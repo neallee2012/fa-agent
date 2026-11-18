@@ -93,7 +93,7 @@ def test_an_unimportable_native_wire_refuses_before_any_startup_write(local, mon
     with pytest.raises(ImportError):
         create_host(local, native_runtime=SimpleNamespace(identity=IDENTITY), responses_handler_factory=factory)
     assert core.tasks.resilient_tasks_enabled() is False
-    assert not (local.supervisor.journal.root / "agentserver").exists()
+    assert not (local.root / "agentserver").exists()
 
 
 def test_startup_reads_and_writes_in_one_fixed_order(local, monkeypatch):
@@ -109,7 +109,7 @@ def test_startup_reads_and_writes_in_one_fixed_order(local, monkeypatch):
     host_init = ResponsesAgentServerHost.__init__
 
     def built(self, *args, **kwargs):
-        assert (local.supervisor.journal.root / "agentserver").is_dir()
+        assert (local.root / "agentserver").is_dir()
         events.append(("host", os.environ["AGENTSERVER_STATE_ROOT"]))
         host_init(self, *args, **kwargs)
 
@@ -133,7 +133,7 @@ def test_startup_reads_and_writes_in_one_fixed_order(local, monkeypatch):
     monkeypatch.setattr(behavior_hosted, "guard", guard)
     monkeypatch.setattr(ResponsesAgentServerHost, "__init__", built)
     create_host(local, responses_handler_factory=handler_factory)
-    state_root = local.supervisor.journal.root / "agentserver"
+    state_root = local.root / "agentserver"
     # First occurrences: the Responses host also turns resilient tasks on for itself.
     assert list(dict.fromkeys(events)) == [
         "native", "state-probe", "resilient", "n6-probe", "guard", ("host", str(state_root)), "handler"]
@@ -172,19 +172,28 @@ def test_only_the_interrupt_session_refuses_native_turns(local, monkeypatch, int
         create_host(local, native_runtime=native)
 
 
-@pytest.mark.parametrize("supervisor", ["missing", "relative"])
-def test_the_responses_state_root_must_be_the_absolute_owned_root(local, monkeypatch, supervisor):
+@pytest.mark.parametrize("root", ["missing", "relative"])
+def test_the_responses_state_root_must_be_the_absolute_owned_root(local, monkeypatch, root):
     monkeypatch.setenv("FA_RESPONSES_ENABLED", "1")
     before = os.environ["AGENTSERVER_STATE_ROOT"]
-    runtime = (SimpleNamespace(identity=IDENTITY) if supervisor == "missing" else SimpleNamespace(
-        identity=IDENTITY, supervisor=SimpleNamespace(journal=SimpleNamespace(root=type(
-            local.supervisor.journal.root)("relative")))))
+    runtime = (SimpleNamespace(identity=IDENTITY) if root == "missing" else SimpleNamespace(
+        identity=IDENTITY, root=type(local.root)("relative")))
     assert code(refused(runtime, responses_handler_factory=factory)) == "RESPONSES_STATE_ROOT_UNAVAILABLE"
     assert os.environ["AGENTSERVER_STATE_ROOT"] == before
 
 
 def middleware(app):
     return {item.cls for item in app.user_middleware}
+
+
+def test_a_real_runtime_root_is_its_private_journal_root(local, monkeypatch, tmp_path):
+    """Built the production way: native state shares the job lane's guarded root under the platform HOME."""
+    for name, value in {"BEHAVIOR_HOSTED_ENABLED": "true", "HOME": str(tmp_path), "FOUNDRY_AGENT_ID": IDENTITY.agent_id,
+                        "FOUNDRY_AGENT_VERSION": IDENTITY.agent_version, "BEHAVIOR_API_URL": "https://api.offline.invalid",
+                        "BEHAVIOR_API_AUDIENCE": "api://00000000-0000-4000-8000-000000000000"}.items():
+        monkeypatch.setenv(name, value)
+    runtime = behavior_hosted.HostedRuntime.from_environment()
+    assert runtime.root == runtime.supervisor.journal.root == tmp_path / ".fa-behavior-checksum-v1"
 
 
 def test_the_production_handler_gets_no_probe_middleware(local, monkeypatch):

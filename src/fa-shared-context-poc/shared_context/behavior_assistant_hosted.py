@@ -84,18 +84,19 @@ CAPABILITY_CLIENT_TIMEOUT = httpx.Timeout(CAPABILITY_CLIENT_SECONDS, connect=5)
 # FA builtin capability kinds register here: entry_id -> factory(assistant_session, grant) returning
 # (tool specs, {tool name: result model}). An unregistered builtin grant refuses the turn at its start.
 # A factory may also offer release(assistant_session), called when a turn starts without its grant.
-from .behavior_desktop_capability import DESKTOP_CAPABILITY, ENTRY_ID as DESKTOP_ENTRY_ID, browser_executable
+from .behavior_desktop_capability import ENTRY_ID as DESKTOP_ENTRY_ID, browser_executable
 from .memory_candidate_capability import memory_candidate_capability, ENTRY_ID as MEMORY_CANDIDATE_ENTRY_ID
 from .assistant_image_capability import image_delivery_capability, ENTRY_ID as IMAGE_DELIVERY_ENTRY_ID
 from .behavior_agent_message_tools import agent_message_capability
 from .behavior_agent_message_wire import AGENT_MESSAGE_ERRORS, CAPABILITY_ID as AGENT_MESSAGE_ENTRY_ID
-from .behavior_shell_capability import shell_capability, ENTRY_ID as SHELL_ENTRY_ID
+from .behavior_shell_capability import ENTRY_ID as SHELL_ENTRY_ID
+from .native_local_capabilities import LOCAL_HANDLERS
 CAPABILITY_HANDLERS = {
-    DESKTOP_ENTRY_ID: DESKTOP_CAPABILITY,
+    DESKTOP_ENTRY_ID: LOCAL_HANDLERS[DESKTOP_ENTRY_ID],
     MEMORY_CANDIDATE_ENTRY_ID: memory_candidate_capability,
     IMAGE_DELIVERY_ENTRY_ID: image_delivery_capability,
     AGENT_MESSAGE_ENTRY_ID: agent_message_capability,
-    SHELL_ENTRY_ID: shell_capability,
+    SHELL_ENTRY_ID: LOCAL_HANDLERS[SHELL_ENTRY_ID],
 }
 # fa-skillify-v1 replaces the base "this turn's user message only" description of save_skill_draft.
 SKILLIFY_DRAFT_DESCRIPTION = (

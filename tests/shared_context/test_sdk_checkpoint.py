@@ -19,9 +19,9 @@ from shared_context.behavior_operations import _row
 from shared_context.errors import Problem
 from shared_context.m3_store import InMemoryArtifactStore
 from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import signing_key, jwk_client
-from test_work_policy_lifecycle import enabled
+from work_policy_lifecycle_helpers import enabled
 
 
 def state(sid="sdk-original"):

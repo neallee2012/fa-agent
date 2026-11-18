@@ -1,15 +1,63 @@
 # FA 進度與交接狀態
 
-更新日期：2026-11-12。
+更新日期：2026-11-17。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="legacy-job-lane-retire-1117"></a>
+## 2026-11-16～17：舊 Hosted job lane 退役（main `c3ec087a`）
+
+- **決定**：Neal 11-16 決定舊 Hosted job 路由擋掉並刪除；`read_work_memory`、`read_reviewed_note`、SOP copy、`execute_operation`、`finish_task` 五個舊能力不在 native 重做。總協調 11-17 補兩項：操作決策組（prepare／approve／reject／revoke 與 `behavior_operation_cli`）的程式隨 PR-D 刪，它的測試已在 #1267 刪（事後告知 Neal）；PR-C1 同時停掉舊 instruction 工作的啟動入口。
+- **已合併（都還沒上 stage，也沒部署 dev）**：
+  - #1261～#1265：留存測試改成不經舊路（讀完整 store 快照，或補 native 等價測試），只改測試。
+  - #1266：工作台舊版對話唯讀，pull 任務不再送件。
+  - #1267：`/work-policy/v1/` 下的 submit、preflight、submit-reconcile、routines 觸發、environment、reset、cancel 回 410 `JOB_LANE_RETIRED`；`/assistant/*`、`/hosted/launches/*`、`work/submit`、`work/reconcile`、`children/*`、`operation/execute`、`operation/reconcile` 不註冊（404）。不擋 `operation/approval-reconcile`、`operation/rejection-reconcile` 與 `native-turns/*`。開機不 resume 舊 job，GET 舊對話不再觀察 Hosted；刪掉只測舊路的測試（collect 17,610 變 16,046 案）。
+- **過渡期**：操作決策組、記憶筆記寫入鏈、`controller` 子命令仍在服務，但沒有行為測試，PR-D 刪。`behavior_server_main.py controller` 若有人手動執行，仍會 drain 排隊中的舊 job；它不是開機流程，deploy／infra／scripts 都沒有使用者。
+- **未驗證**：雲端 Table 裡未完成或 UNKNOWN 的舊 job 數量（本機連 Table 被擋）。擋路由後它們保持原狀態、唯讀可見。
+- **下一步**：PR-D 刪舊程式本體（進行中）；合併後部署 dev 測試，再由總協調開 stage release PR 給 Neal 決定。
+
+<a id="current-state-trim-1116"></a>
+## 2026-11-16：CURRENT-STATE 篇幅整理（移出的待核對細節）
+
+CURRENT-STATE 只剩 9 bytes 空間，依 [CONVENTIONS](CONVENTIONS.md#8-current-state)「超出時把細節放回對應文件」，把下列較早項目原文移到這裡；狀態沒有因此改變，仍是未結案。
+
+- **較早的開放項目（原文）**：stage A一次`turn_status`逾時30秒（未定因）；B唯讀交辦已completed仍顯示「正在回覆」（推定已修，待dev實看）；dev B未連Teams，等Connect卡要不要擋整個回合待決（[10-30](#fa-context-b-connect-wait-1030)）；A「超過2小時」橫幅疑似誤報；A重複404是bridge輪詢交辦（設計行為），WARNING要不要降級待決；stage `desktop_act`卡住；azd eastus2（[10-11](#azd-eastus2-1011)）Portal未驗收；ADR-0009 §8其餘文案待Neal確認。
+- **退役 Agent（原文）**：#867已合併，未完成onboarding由`team-agent-retire-release`釋出（[deploy](../deploy/README.md#retire-agent)）。只有operator CLI能退役，名額與顯示名稱不釋出。dev `fa-agent-cc96…`補tombstone需批准。
+- **SP v2／v3／role（原文）**：都不升全域SP acceptance（v2：6 PASS、第3則FAIL；v3：①FAIL；role-v2 9 PASS／3 FAIL，role v3 3則PASS）。
+- **GitHub Actions（原文）**：「11-14第47版deploy與public-sync跑成功，10-28原因未查明。」CURRENT-STATE 只保留前半；當時寫的是 10-28 public-sync 與 PR CI 的 job 沒啟動（推定付款或上限，待 Neal），原因仍未查明。
+
+<a id="stage-v47-turn-1116"></a>
+## 2026-11-16：stage 第 47 版真人回合、第十八輪安全部分合併
+
+- **stage 第 47 版真人回合**：Neal 台灣時間 11-16 09:42 在 stage 對 A 送一個回合，總協調唯讀查 log（Hosted 的 App Insights trace、API 容器 stderr 最後 300 行，從 09:41:59 起；原始輸出不在 repo）。
+  - 回合完成：送出 09:42:33，第一段文字約 25 秒後（09:42:58），存檔 09:43:14（約 40 秒）；三次模型呼叫；私人與團隊記憶都有召回，記憶更新回條 `recorded`，用量回報完成。
+  - A、B 各自第一次被呼叫時回 409 `NATIVE_SESSION_CHANGED`：API 帶的預期版本是 96，VM 已經在 97（`NATIVE_VERSION_OBSERVED` drift=True）。API 讀到 97 後改用它，之後全是 200；這一次各約 6～7 秒（含喚醒）。`NATIVE_UPGRADE_CUT_API` 26 筆都是 `current`。API 為什麼還停在 96 沒有查。
+  - Traceback、ERROR、AppExceptions 都是 0；`AGENT_DIRECTORY_UNAVAILABLE`（`AGENT_SCOPE_MISSING`）4 筆，和先前相同。5xx 無法計數（access log 關閉）。Log Analytics 從 11-14 起沒有 API 容器的 console 紀錄，原因沒查。
+- **追查（同日）：上面兩件「沒有查」都已查明。**
+  - **API 帶 96 是換版後的版本偵測，照設計。** 第 47 版部署 11-14 02:03 把 A、B 發布成 97；收尾的 follow 是 `verify_only`，只回報、不搬：97 的目標 session 還不存在，所以 A、B 都是 `needs_follow`／`pending`，綁定仍指向原 SID（`8efce15e…`、`ad2abcf2…`，在 82 建立，上次記下的漂移版本是 96）。11-16 開頁時平台把同一個 SID 原地用 97 叫醒（ADR-0009 註記的主路徑），API 第一次呼叫帶預期 96 → 409 → 記下漂移 → 用 97 重送。之前各版的讀回也記過同樣的「換版第一次各一筆 409」（例如 v82→v87）。證據：stage Log Analytics 的部署 job log（02:03 版本 97、02:05 follow 結果）與 API log。
+  - **成本（推算，沒另外量）：** 409 那次 6.65 秒大多是叫醒 VM，本來就要花；從 409 到 `api_received` 完成（9.2 秒）多出約 2.5 秒，每次發版後每位助理只有第一次開頁會碰到。要省這段得改部署或 API 的版本來源、牽動 ADR-0009，暫不改。
+  - **更正：Log Analytics 一直有 API log。** `ContainerAppConsoleLogs` 裡 `ca-fa-behavior-stage--40698ea-r134-1` 從 11-14 02:03 起有 130 筆，含 11-16 01:42 的兩筆 409。先前說「從 11-14 起沒有」是總協調判斷錯誤，可能是查得太早、LA 還沒寫入（推測，沒有重現）。
+- **第十八輪安全部分合併（不在 stage；dev 未核對）**：#1248（行為改變：回合在等 Teams 連線卡時，工作台顯示「正在等你連線」；背景分頁不讀卡的設計補了測試；剛登入時卡片閃一下的原因未確認）、#1249、#1250（不改行為：`HostedRuntime.root`、`LOCAL_HANDLERS`、排程時間函式、`_read_conflicts`、`conversation_key` 搬出舊路模組）。合併後 main `33423978`。
+  - 日後刪舊路要先處理的間接牽連：native 附件路由經 `behavior_attachment_catalog` 在執行時才 import `behavior_instruction` 與 `behavior_assistant`；`behavior_foundry` 在載入時 import `behavior_workers`。
+  - 舊路五個能力與舊路由的處置，Neal 11-16 已決定（見[舊 job lane 退役](#legacy-job-lane-retire-1117)）。
+
+<a id="stage-v47-1114"></a>
+## 2026-11-14：stage 第 47 版（第十六輪品質整理與 settled 掃描期限）
+
+- **第 47 版**（#1246，`2026.11.12-47`，Neal 台灣時間 11-14 09:50 合併，merge `40698ea4`）：第十六輪不改行為的拆分與補測試（#1235～#1240）；#1241 是行為改變：omission 檢查遇到整頁 settled 收據時，在讀取期限停下、分次掃完；文件（#1234、#1245）。
+  - **部署**：deploy-staging run 43542941337 成功（release-gate 09:50、deploy 09:51～10:06）。
+  - **public-sync**：run 43544397357 成功（10:06～10:11），`gate 2: PASS`，公開 repo `fa-agent` 的 release `v2026.11.12-47`（Latest）。
+  - **dev 測試**：run 4892，main `23b348d0`，報告在 #1246 本文。
+  - **沒有驗證**：stage 上還沒有人送回合測第 47 版（等 Neal）。
+- **第 47 版之後合併（第十七輪，不在 stage 上）**：#1242（部署設定不再預設 stage，沒給 `--config` 就停下）、#1243（HITL 規則變動的重試有上限）、#1244（刪除 `ClaimedSdkRecovery`；`platform-stop-evidence` 改成明確拒絕）。合併後 main `13cf84d0`；總協調在這個 commit 上跑三個 PR 動到的 15 個測試檔，1054 passed。
+- **第十八輪開工**：Neal 11-12 選「先做安全部分」：只做不改行為的搬移（PR-1a／1b）和工作台連線卡顯示。11-14 開工：PR-1a 與連線卡各一個 PR；PR-1b 會動到和 PR-1a 相同的模組，排在 PR-1a 合併後。舊路徑那五個只有舊路有的能力（`read_work_memory`、`read_reviewed_note`、SOP copy、`execute_operation`、`finish_task`）要不要在 native 重建、舊路由拒絕與刪除，等 Neal 決定。
 
 <a id="r16-close-1112"></a>
 ## 2026-11-12：第十六輪品質整理完成與環境整理
 
 - 第十六輪品質整理完成（#1235～#1241），數字見[基準頁](code-quality-baseline.md#第十六輪結果2026-11-08-至-12)；其中 #1241 是行為改變（settled 收據也照讀取期限停下），其餘不改行為。
 - stage 刪掉多餘的 Jobs Operator 角色指派（Neal 11-12 同意），只保留 Jobs Contributor。
-- CI 部署只用 ARM 的 start／read／stop 與 Log Analytics，下次 stage 部署才算實證。
+- CI 部署只用 ARM 的 start／read／stop 與 Log Analytics，下次 stage 部署才算實證（11-14 第 47 版 CI 部署成功，見 [stage-v47-1114](#stage-v47-1114)）。
 - stage 與 dev 的 WebIQ 連線金鑰已輪替（`deploy/<env>/new_webiq_connection.py --rotate`）。
 - 輪替後 Neal 在 stage 送了一則會用到 WebIQ 的回合，總協調唯讀查 log：工具呼叫成功、回合完成（原始輸出不在 repo）。先前的 -32006 推測來自過期金鑰；`-32006` 也是要 Connect 卡時的錯誤碼（見 [connector-design](connector-design.md)），沒有逐一核對。dev 的 WebIQ 在 dev 部署 run 4892（main `23b348d0`）的測試用一則回合確認，沒有 -32006；測試報告會附在下一個 stage release PR 本文，目前不在 repo。
 - stage 第 46 版：上面那則 Neal 送的回合即為第 46 版的真實回合，完成正常（同樣只有總協調的 log 讀回）。

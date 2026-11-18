@@ -15,57 +15,22 @@ from shared_context.behavior_delivery import (
 )
 from shared_context.behavior_operations import control_key
 from shared_context.behavior_store import _json
-from shared_context.behavior_work_policy import WorkPreflightQuery
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
+from legacy_submit_rows_helpers import load_store
 from test_behavior_assistant import assistant
 from test_instruction_flow import instruction_models
 from test_m3_auth import jwk_client, signing_key
-from test_work_policy_submit_compatibility import post, route
+from test_work_policy_submit_compatibility import route
+
+
+PAGED = ("9f994b00fdb80614adc6b559bd45954381dedda573aa51844180247535368bd0",
+         "cfdd8b2c843c3d00c18f838596031679beb3a9a1d41a0fdbfb6aadedf95ee717")
 
 
 @pytest.fixture
 def runtime_path():
     return Path(__file__)
-
-
-def test_new_admission_crosses_legacy_pending_row_limit_without_ack_or_losing_backlog(assistant, monkeypatch):
-    monkeypatch.setenv("FA_DELIVERY_PENDING_INDEX_WRITER", "false")
-    h, control, _, starts = route(assistant)
-    index_key = control_key("delivery-index", control.policy.template.owner.root_budget_id)
-    original_entity = h.store._entity
-    rejected = []
-
-    def entity(key, value):
-        try:
-            return original_entity(key, value)
-        except Problem as error:
-            if error.status == 413:
-                rejected.append((getattr(value, "row_id", None), len(_json(value)), error.body["error"]["code"]))
-            raise
-
-    monkeypatch.setattr(h.store, "_entity", entity)
-    for number in range(1, 134):
-        if number == 133:
-            before = h.store.read_snapshot((index_key,))[index_key]
-            monkeypatch.setenv("FA_DELIVERY_PENDING_INDEX_WRITER", "true")
-        command = InstructionSubmit(request_id=f"pending-capacity-{number:03}", content="Retain this original delivery.")
-        if number >= 131:
-            preflight = post(h, "preflight", WorkPreflightQuery(
-                read_id=f"before-{number}", request_id=command.request_id,
-                submit_body_sha256=hashlib.sha256(command.model_dump_json().encode()).hexdigest(),
-                content=command.content,
-            ))
-            assert preflight.status_code == 200 and not preflight.json()["already_admitted"], preflight.text
-        response = post(h, "submit", command)
-        if number >= 131 or response.status_code != 200:
-            retained = h.store.read_snapshot((index_key,))[index_key]
-            index = PendingIndexRecord.model_validate_json(json.dumps(retained.payload["data"]))
-            print({"admission": number, "status": response.status_code, "pending_retained": len(index.entries),
-                   "rejected": rejected}, flush=True)
-        assert response.status_code == 200, (number, response.text, rejected)
-    assert len(starts) == 133 and not h.endpoint.requests
-    assert h.store.read_snapshot((index_key,))[index_key] == before
 
 
 def test_new_pending_members_keep_legacy_bytes_and_only_exact_receipt_fulfills(assistant, monkeypatch):
@@ -75,12 +40,11 @@ def test_new_pending_members_keep_legacy_bytes_and_only_exact_receipt_fulfills(a
     root = control.policy.template.owner.root_budget_id
     index_key = control_key("delivery-index", root)
     before = h.store.read_snapshot((index_key,))[index_key]
-    tasks = []
-    for number in range(2):
-        accepted = post(h, "submit", InstructionSubmit(request_id=f"paged-{number}", content="Retain until received."))
-        assert accepted.status_code == 200, accepted.text
-        tasks.append(h.runtime.bindings[accepted.json()["binding_id"]])
-    first, second = tasks
+    # The two instructions "paged-0" and "paged-1" the retiring submit admitted with the pending writer on: the whole
+    # stored table, then a restart's refresh installs their bindings.
+    load_store(h.transport.backing, "pending-members")
+    control.refresh()
+    first, second = (h.runtime.bindings[binding] for binding in PAGED)
     h.time += timedelta(seconds=core.contract.review_interval_seconds)
     scan = core.scan_due(ScanRequest(scan_id="first-paged-scan"), first.owner)
     assert [entry["obligation_id"] for entry in scan.payload["result"]["due"]] == [first.obligation_id]

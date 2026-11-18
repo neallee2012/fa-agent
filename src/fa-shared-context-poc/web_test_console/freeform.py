@@ -3,16 +3,15 @@
 Requires the matching frozen backend InstructionSubmit implementation. Old
 console modes do not import this module or acquire new submission rights.
 """
-import secrets
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, TypeAdapter, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
 from shared_context import behavior_wire as wire
 from shared_context.behavior_assistant_wire import (
     InstructionSubmit, ModelDeployment as ModelDeploymentId, PublicProgress, TextReply,
 )
-from shared_context.behavior_work_policy import WorkPreflight, WorkPreflightQuery, WorkSubmitObservation, derive_work_binding
+from shared_context.behavior_work_policy import derive_work_binding
 from shared_context.behavior_model_capacity import ModelCapacitySnapshot
 from shared_context.behavior_skill_prompt import AssemblyRecord
 from shared_context.behavior_skill_copy import SopCopyOutcome
@@ -23,12 +22,9 @@ from shared_context.behavior_attachment_catalog import AttachmentSourceCatalog
 from shared_context.behavior_text_files import MAX_USER_INPUT_BYTES, UserTextFileCapability, file_reference
 from shared_context.m3_models import Filename
 from shared_context.behavior_workers import TERMINAL_STATES, worker_key
-from .adapter import FixedTask, canonical, require, sha, strict_json, ConsoleError
-from .instructions import InstructionStore, InstructionConnection, INSTRUCTION_QUOTED_UTF8_LIMIT
-from .standing import (
-    StandingConsoleConfig, StandingPreflightCheck, StandingPullAdapter,
-)
-from .work_policy import WorkPolicyQuery
+from .adapter import FixedTask, PullAdapter, canonical, require, sha, strict_json, ConsoleError
+from .instructions import InstructionStore, InstructionConnection, INSTRUCTION_QUOTED_UTF8_LIMIT, LEGACY_READ_ONLY
+from .standing import StandingConsoleConfig
 
 
 
@@ -114,15 +110,6 @@ class ConversationProjection(wire.WireModel):
     can_reset: bool = False
 
 
-class ResetReply(wire.WireModel):
-    conversation_id: wire.Identifier
-    archived: Literal[True]
-    reset_request_id: wire.Identifier
-    hosted_session_id: wire.Identifier | None
-    job_id: wire.Identifier | None
-    session_stop: Literal["confirmed","unknown","not_run"]
-
-
 class CancellationResult(wire.WireModel):
     actual_environment: Literal["NOT_RUN"]
     status: Literal["queued", "starting", "running", "capacity_uncertain", "waiting_dependency",
@@ -163,11 +150,10 @@ class AvailableModels(wire.WireModel):
     models: tuple[ModelDeployment, ...]
 
 
-class InstructionAdapter(StandingPullAdapter):
+class InstructionAdapter(PullAdapter):
     def __init__(self, config, client, store, *, api_prefix=""):
         super().__init__(config, client, api_prefix=api_prefix)
         self.store = store
-        self.preflights, self.admissions = {}, {}
         self.control = None
 
     def instruction(self, task):
@@ -179,62 +165,6 @@ class InstructionAdapter(StandingPullAdapter):
             raise ConsoleError("INSTRUCTION_CHANGED") from None
         require(value.content == self.store.get(task.submit_request_id)["content"], "INSTRUCTION_CHANGED")
         return value
-
-    def request(self, task, action):
-        if action == "submit" and self.store.command(task.submit_request_id) is not None:
-            return "POST", "/work-policy/v1/submit", self.instruction(task).model_dump(mode="json")
-        return super().request(task, action)
-
-    def checked_reply(self, task, raw):
-        try:
-            strict_json(raw)
-            reply = InstructionReply.model_validate_json(raw)
-        except (ValueError, TypeError):
-            raise ConsoleError("STATUS_INVALID", 502) from None
-        expected = self.preflights.get(task.task_id)
-        instruction = self.instruction(task)
-        if expected is None:
-            prior = self.store.journal.get(task.task_id, "submit")
-            require(prior is not None and prior["intent"]["body_sha256"] ==
-                    sha(canonical(instruction.model_dump(mode="json"))), "INSTRUCTION_CHANGED")
-            try:
-                expected = InstructionContext.model_validate_json(canonical(prior["intent"]["instruction_context"]))
-            except (KeyError, ValueError, TypeError):
-                raise ConsoleError("WORK_POLICY_INVALID", 502) from None
-        require(reply.binding_id == task.binding_id and reply.status.job_id == task.job_id
-                and reply.status.work_id == task.work_id
-                and (instruction.conversation_id is None or instruction.conversation_id == reply.conversation_id)
-                and (instruction.model is None or reply.model == instruction.model)
-                and (instruction.conversation_id is not None or reply.turn_number == 1)
-                and (reply.conversation_id, reply.turn_number) ==
-                     (expected.conversation_id, expected.turn_number)
-                and (expected.model is None or reply.model == expected.model), "STATUS_BINDING_MISMATCH", 502)
-        self.admissions[task.task_id] = reply
-        return reply
-
-    def submit(self, task, token):
-        raw, _ = self.send(*self.request(task, "submit"), token)
-        return self.checked_reply(task, raw).status
-
-    def reconcile(self, task, token):
-        raw, _ = self.send("POST", "/work-policy/v1/submit-reconcile",
-                           self.instruction(task).model_dump(mode="json"), token)
-        try:
-            body=strict_json(raw)
-            if type(body) is dict and body.get("schema_version")=="fa-work-submit-observation-v1":
-                require(body.get("retry_same_request") is True,"SUBMISSION_OBSERVATION_INVALID",502)
-                value=WorkSubmitObservation.model_validate_json(raw)
-                require(value.request_id==task.task_id
-                        and value.submit_sha256==sha(self.instruction(task).model_dump_json().encode("utf-8")),
-                        "SUBMISSION_OBSERVATION_INVALID",502)
-                return value
-        except (ValueError,TypeError):
-            raise ConsoleError("SUBMISSION_OBSERVATION_INVALID",502) from None
-        return self.checked_reply(task, raw)
-
-    def cancel(self, task, body, generation, token):
-        raw, _ = self.send("POST", f"/work-policy/v1/bindings/{task.binding_id}/cancel", body, token)
-        return self.checked_cancellation(task, generation, raw)
 
     def read_cancellation(self, task, generation, token):
         try:
@@ -281,8 +211,7 @@ class InstructionAdapter(StandingPullAdapter):
         result = super().fetch(task, token, delivery_id)
         if result.parsed.work_state == "succeeded" and result.parsed.message_kind == "final":
             expected = self.control.admission(task)
-            if expected is None:
-                expected = self.control.reader.read(self.control.query(task), SecretStr(token)).preflight
+            require(expected is not None, "INSTRUCTION_PENDING")
             projection = self.control.refresh_conversation(token, expected.conversation_id)
             turn = next((turn for turn in projection.turns if turn.request_id == task.task_id), None)
             require(turn is not None and turn.turn_number == expected.turn_number, "RESULT_BINDING_MISMATCH", 502)
@@ -296,40 +225,6 @@ class InstructionAdapter(StandingPullAdapter):
         checked_delivery_reference(result.parsed.content, raw)
 
 
-class InstructionReader(StandingPreflightCheck):
-    def __init__(self, config, adapter, clock, control):
-        require(type(config) is StandingConsoleConfig and type(adapter) is InstructionAdapter, "WORK_POLICY_INVALID")
-        self.config, self.adapter, self.clock, self.control = config, adapter, clock, control
-        self.last_guard_revision = None
-        self.guard_by_request = {}
-
-    def read(self, query, bearer):
-        task = self.control.task(query.submit_request_id)
-        command = self.adapter.instruction(task)
-        expected_query = self.control.query(task).model_copy(update={"read_id": query.read_id})
-        require(query == expected_query and query.submit_body_sha256 ==
-                sha(command.model_dump_json().encode("utf-8")), "WORK_POLICY_INVALID", 502)
-        body = WorkPreflightQuery(read_id=query.read_id, request_id=command.request_id,
-            submit_body_sha256=query.submit_body_sha256, content=command.content,
-            conversation_id=command.conversation_id, model=command.model, attachments=command.attachments, files=command.files)
-        raw, _ = self.adapter.send("POST", "/work-policy/v1/preflight", body.model_dump(mode="json"),
-                                   bearer.get_secret_value())
-        _, binding = derive_work_binding(self.config.standing_policy, command.request_id, instruction=command)
-        observation = self.checked(query, task, binding, raw, instruction=True,
-                                   previous_guard=self.guard_by_request.get(task.task_id))
-        result = observation.preflight
-        require(result.conversation_id is not None and result.turn_number >= 1
-                and (command.model is None or result.model == command.model)
-                and (command.conversation_id is None and result.turn_number == 1
-                     or command.conversation_id == result.conversation_id), "WORK_POLICY_INVALID", 502)
-        previous = self.adapter.preflights.get(task.task_id)
-        require(previous is None or (previous.conversation_id, previous.turn_number) ==
-                (result.conversation_id, result.turn_number), "WORK_POLICY_INVALID", 502)
-        self.adapter.preflights[task.task_id] = result
-        self.guard_by_request[task.task_id] = result.guard_revision
-        return observation
-
-
 class InstructionControl:
     def __init__(self, console, connection):
         self.console = console
@@ -340,7 +235,6 @@ class InstructionControl:
         self.store = InstructionStore(self.journal, self.clock)
         self.adapter = InstructionAdapter(self.config, console.backend, self.store, api_prefix=console.api_prefix)
         self.adapter.control = self
-        self.reader = InstructionReader(self.config, self.adapter, self.clock, self)
         self.projections, self.observed, self.replies, self.reply_bytes = {}, {}, {}, {}
         self.models, self.models_observed_at = None, None
 
@@ -377,7 +271,7 @@ class InstructionControl:
             owner_record_id=binding.owner.owner_record_id,
             route=wire.DeliveryRoute.model_validate_json(binding.route.model_dump_json()), channel_version="fa-pull-inbox-v1",
             submit_request_id=request_id, fetch_request_id=request_id+"-pull", ack_request_id=request_id+"-ack",
-            allowed_actions=("submit", "status", "fetch", "acknowledge"), max_payload_bytes=131072)
+            allowed_actions=("status", "fetch", "acknowledge"), max_payload_bytes=131072)
 
     def tasks(self, thread_id=None):
         return [self.task(row["request_id"]) for row in self.store.all(thread_id)
@@ -396,15 +290,6 @@ class InstructionControl:
             if outcome.get("state") == "CONFIRMED":
                 return InstructionReply.model_validate_json(canonical(outcome["admission"]))
         return None
-
-    def query(self, task):
-        c = self.config
-        return WorkPolicyQuery(read_id=secrets.token_hex(16), backend_origin=c.backend_origin,
-            backend_configuration_sha256=c.backend_configuration_sha256, backend_core_sha256=c.backend_core_sha256,
-            tenant_id=c.tenant_id, human_oid=c.human_oid, client_id=c.client_id,
-            binding_id=task.binding_id, job_id=task.job_id, work_id=task.work_id, root_request_id=task.root_request_id,
-            route=task.route, submit_request_id=task.submit_request_id,
-            submit_body_sha256=sha(self.command(task.task_id).model_dump_json().encode("utf-8")))
 
     def current_conversation(self, thread_id):
         tasks = self.tasks(thread_id)
@@ -593,50 +478,6 @@ class InstructionControl:
                 "DELEGATION_RESPONSE_INVALID", 502)
         return value
 
-    def require_cancellable(self, task):
-        admission = self.admission(task)
-        require(admission is not None, "INSTRUCTION_PENDING")
-        require(self.journal.get(task.task_id, "cancel") is None, "CANCELLATION_ALREADY_ATTEMPTED")
-        progress = self.progress(task)
-        status = self.console.statuses.get(task.task_id)
-        observations = [admission.status.model_dump(mode="json"),
-                        None if progress is None else progress["data"],
-                        None if status is None else status.get("data")]
-        require(not any(value is not None and value["state"] in TERMINAL_STATES for value in observations),
-                "CANCELLATION_NOT_NEEDED")
-
-    def cancel(self, task, token):
-        require(self.admission(task) is not None, "INSTRUCTION_PENDING")
-        if self.journal.get(task.task_id, "cancel") is not None:
-            return
-        current = self.adapter.status(task, token)
-        self.console.statuses[task.task_id] = {
-            "data": current.model_dump(mode="json"), "observed_at": self.clock().isoformat(),
-            "not_current_live_result": True,
-        }
-        require(current.state not in TERMINAL_STATES, "CANCELLATION_NOT_NEEDED")
-        token = self.console.gate(task, "cancel")
-        command = wire.Command(request_id=sha(canonical(["instruction-cancel", self.config.console_id, task.task_id])))
-        body = command.model_dump(mode="json")
-        self.journal.begin(task.task_id, "cancel", {
-            "method": "POST", "path": f"/work-policy/v1/bindings/{task.binding_id}/cancel",
-            "request_id": command.request_id, "body": body, "body_sha256": sha(canonical(body)),
-            "job_id": task.job_id, "generation": current.generation, "created_at": self.clock().isoformat(),
-        })
-        self.console.observed_here.add((task.task_id, "cancel"))
-        try:
-            receipt = self.adapter.cancel(task, body, current.generation, token)
-            self.journal.finish(task.task_id, "cancel", {
-                "state": "CONFIRMED", "receipt": receipt.model_dump(mode="json"),
-                "observed_at": self.clock().isoformat(), "automatic_retry": False,
-            })
-        except ConsoleError as error:
-            self.journal.finish(task.task_id, "cancel", {
-                "state": "UNKNOWN", "code": error.code, "observed_at": self.clock().isoformat(),
-                "automatic_retry": False,
-            })
-            raise
-
     def cancellation_intent(self, task):
         require(self.admission(task) is not None, "INSTRUCTION_PENDING")
         original = self.journal.get(task.task_id, "cancel")
@@ -749,33 +590,6 @@ class InstructionControl:
                     for item in command.files), "USER_FILE_INPUT_INVALID", 400)
         return command
 
-    def prepare(self, request_id, content, model, attachments=(), files=()):
-        require(type(model) is str and self.models is not None
-                and model in {v.id for v in self.models.models}, "MODEL_NOT_AVAILABLE", 409)
-        original = self.store.get(request_id)
-        saved_command = self.store.command(request_id)
-        if saved_command is None:
-            require(not self.store.has_submission(request_id), "INSTRUCTION_INCOMPLETE")
-            conversation_id = self.current_conversation(original["thread_id"])
-        else:
-            conversation_id = self.command(request_id).conversation_id
-        command = self.validate_input(
-            request_id, content, model, attachments, files, conversation_id=conversation_id)
-        self.store.prepare(command.model_dump(mode="json"), freeze=True)
-        return self.task(request_id)
-
-    def follow_up(self, token, thread_id):
-        draft = self.store.current(thread_id)
-        if draft["content"] is None:
-            return draft
-        cid = self.current_conversation(thread_id)
-        projection = self.projections.get(cid)
-        if (projection is None or not projection.turns
-                or projection.turns[-1].request_id != draft["request_id"] or not projection.can_follow_up):
-            projection = self.refresh_conversation(token, cid, thread_id=thread_id)
-        require(projection.can_follow_up, "INSTRUCTION_PENDING")
-        return self.store.new(thread_id)
-
     def view(self, thread_id=None):
         draft = self.store.current(thread_id)
         thread_id = draft["thread_id"]
@@ -788,14 +602,17 @@ class InstructionControl:
         can_follow = (current and projection.can_follow_up
                       and task is not None and self.admission(task) is not None)
         authenticated = self.console.vault.state() == "AVAILABLE"
+        # A conversation fixed on the job-bound lane (a lane of None) is read-only; native ones never come through here.
+        legacy = self.store.has_fixed_lane(thread_id) and self.store.lane(thread_id) is None
+        authenticated_to_write = authenticated and not legacy
         command = None if task is None else self.command(task.task_id)
         incomplete = command is None and self.store.has_submission(draft["request_id"])
         model = command.model if command is not None else (None if self.models is None else self.models.default_model)
-        return {**draft, "editable": authenticated and not incomplete and draft["content"] is None,
-            "command_incomplete": incomplete,
-            "can_submit": authenticated and not incomplete and submitted is None and self.models is not None and bool(self.models.models),
-            "can_follow_up": authenticated and can_follow,
-            "message": ("請先讀取既有登入，再輸入指令。" if not authenticated else
+        return {**draft, "editable": authenticated_to_write and not incomplete and draft["content"] is None,
+            "command_incomplete": incomplete, "read_only_legacy": legacy,
+            "can_submit": authenticated_to_write and not incomplete and submitted is None and self.models is not None and bool(self.models.models),
+            "can_follow_up": authenticated_to_write and can_follow,
+            "message": (LEGACY_READ_ONLY if legacy else "請先讀取既有登入，再輸入指令。" if not authenticated else
                         "原交辦缺少完整 command；已有送出意圖，不能補造附件或重送。" if incomplete else
                         "這段對話已封存，請開始新的 session。" if projection is not None and projection.archived else
                         "這是舊式對話；請明確 reset 或開始新的 session。" if projection is not None
@@ -816,7 +633,7 @@ class InstructionControl:
             "progress_available": authenticated and conversation_id is not None,
             "threads": self.store.threads(),
             "can_new_conversation": authenticated,
-            "can_reset": authenticated and current and projection.can_reset,
+            "can_reset": False,
             "hosted_session_id": None if projection is None else projection.hosted_session_id,
             "hosted_agent_version": None if projection is None else projection.hosted_agent_version,
             "models": None if self.models is None else self.models.model_dump(mode="json"),
@@ -827,80 +644,3 @@ class InstructionControl:
             "progress_polling": {"method":"GET","interval_ms":1000,"model_or_reserve":False},
             "connection_metadata": self.connection.model_dump(mode="json"),
             "connection_metadata_is_not_live_attestation": True}
-
-    def reconcile(self, task):
-        prior = self.journal.get(task.task_id, "submit")
-        require(prior is not None and prior["state"] == "UNKNOWN", "INSTRUCTION_PENDING")
-        body = self.command(task.task_id).model_dump(mode="json")
-        require(prior["intent"]["body_sha256"] == sha(canonical(body)), "INSTRUCTION_CHANGED")
-        with self.journal.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            count = db.execute("SELECT COUNT(*) FROM intents WHERE task_id=? AND phase LIKE 'submit-reconcile-%'",
-                               (task.task_id,)).fetchone()[0]
-            phase = f"submit-reconcile-{count+1:08d}"
-            intent = {"method":"POST","path":"/work-policy/v1/submit-reconcile","body":body,
-                "request_id":task.task_id,"body_sha256":sha(canonical(body)),
-                "created_at":self.clock().isoformat(),"original_intent_sha256":sha(canonical(prior["intent"]))}
-            db.execute("INSERT INTO intents VALUES (?,?,?,?)", (task.task_id, phase, canonical(intent).decode(),
-                       canonical({"state":"UNKNOWN","observed_at":intent["created_at"],"automatic_retry":False}).decode()))
-        try:
-            reply = self.adapter.reconcile(task, self.console.gate(task, "status"))
-            if isinstance(reply,WorkSubmitObservation):
-                self.journal.finish(task.task_id,phase,{"state":"RETRYABLE","observed_at":self.clock().isoformat(),
-                    "observation":reply.model_dump(mode="json"),"automatic_retry":False})
-                return
-            self.journal.finish(task.task_id, phase, {"state":"CONFIRMED","observed_at":self.clock().isoformat(),
-                                                     "admission":reply.model_dump(mode="json")})
-            self.console.statuses[task.task_id] = {"data":reply.status.model_dump(mode="json"),
-                "observed_at":self.clock().isoformat(),"not_current_live_result":True}
-        except ConsoleError as error:
-            self.journal.finish(task.task_id, phase, {"state":"UNKNOWN","code":error.code,
-                                                     "observed_at":self.clock().isoformat(),"automatic_retry":False})
-            raise
-
-    def retry_observation(self,task):
-        if self.admission(task) is not None:
-            return None
-        original=self.journal.get(task.task_id,"submit")
-        if original is None or original["state"]!="UNKNOWN":
-            return None
-        with self.journal.connect() as db:
-            row=db.execute("SELECT phase,outcome FROM intents WHERE task_id=? AND phase LIKE 'submit-reconcile-%' "
-                           "ORDER BY phase DESC LIMIT 1",(task.task_id,)).fetchone()
-        if row is None:
-            return None
-        outcome=strict_json(row[1])
-        if outcome.get("state")!="RETRYABLE":
-            return None
-        try:
-            value=WorkSubmitObservation.model_validate_json(canonical(outcome["observation"]))
-        except (KeyError,ValueError,TypeError):
-            raise ConsoleError("SUBMISSION_OBSERVATION_INVALID",502) from None
-        command=self.command(task.task_id)
-        require(value.request_id==task.task_id
-                and value.submit_sha256==sha(command.model_dump_json().encode("utf-8"))
-                and original["intent"]["body_sha256"]==sha(canonical(command.model_dump(mode="json"))),
-                "SUBMISSION_OBSERVATION_INVALID",502)
-        phase=row[0].replace("submit-reconcile-","submit-retry-",1)
-        return None if self.journal.get(task.task_id,phase) is not None else (phase,value)
-
-    def retry_submission(self,task):
-        token=self.console.gate(task,"submit-retry")
-        observation=self.retry_observation(task)
-        require(observation is not None,"SUBMISSION_RECONCILE_REQUIRED")
-        phase,value=observation
-        original=self.journal.get(task.task_id,"submit")
-        self.journal.begin(task.task_id,phase,{
-            **original["intent"],"created_at":self.clock().isoformat(),
-            "reconciliation":value.model_dump(mode="json"),
-        })
-        try:
-            status=self.adapter.submit(task,token)
-            self.journal.finish(task.task_id,phase,{"state":"CONFIRMED","observed_at":self.clock().isoformat(),
-                "admission":self.adapter.admissions[task.task_id].model_dump(mode="json")})
-            self.console.statuses[task.task_id]={"data":status.model_dump(mode="json"),
-                "observed_at":self.clock().isoformat(),"not_current_live_result":True}
-        except ConsoleError as error:
-            self.journal.finish(task.task_id,phase,{"state":"UNKNOWN","code":error.code,
-                "observed_at":self.clock().isoformat(),"automatic_retry":False})
-            raise

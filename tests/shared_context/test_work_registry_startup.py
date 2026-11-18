@@ -14,8 +14,9 @@ from shared_context.behavior_work_registry import WRITER_ENV, head_key, read_reg
 from shared_context.behavior_work_registry import PAGE_SIZE, page_key
 from shared_context.errors import Problem
 from test_agent_runtime import peer_runtime
-from test_conversation_transfer_startup import read_startup, synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from test_conversation_transfer_startup import synthetic_standing_v1
+from legacy_turn_rows_helpers import read_startup
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 
 

@@ -283,6 +283,24 @@ def test_same_rid_different_content_or_capture_is_refused(harness):
     assert len(harness.sdk.calls) == 1
 
 
+def test_original_request_cannot_be_replayed_into_another_conversation(harness):
+    harness.invoke(submit(rid="rid-1", text="Alpha exact question."))
+    alpha = harness.wait("rid-1", "completed")
+    harness.invoke(submit(rid="rid-2", text="Bravo exact question."))
+    bravo = harness.wait("rid-2", "completed")
+    assert alpha.conversation_id != bravo.conversation_id
+
+    def views():
+        return [harness.call(harness.runtime.history, NativeHistory(conversation_id=cid)).model_dump_json()
+                for cid in (alpha.conversation_id, bravo.conversation_id)]
+
+    before = views()
+    rerouted = harness.invoke(submit(rid="rid-1", cid=bravo.conversation_id, text="Alpha exact question."))
+    assert rerouted.status_code == 409 and rerouted.json()["error"]["code"] == "NATIVE_RID_CONFLICT"
+    assert views() == before and len(harness.sdk.calls) == 2
+    assert harness.invoke(submit(rid="rid-1", text="Alpha exact question.")).json()["conversation_id"] == alpha.conversation_id
+
+
 def test_lost_acceptance_ack_reads_original_cid_and_does_not_repeat_sdk(harness, monkeypatch):
     create = FoundryStateStore.create_item
     lost = False

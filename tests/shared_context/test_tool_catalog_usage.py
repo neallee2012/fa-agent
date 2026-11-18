@@ -1,27 +1,19 @@
 """TOOL-01 declared tools match handlers and disabled capabilities are refused; TOOL-07 per-request usage facts."""
 
-import asyncio
 from dataclasses import replace
-import hashlib
 import json
 import logging
 from types import SimpleNamespace
 
 import httpx
-import pytest
 from fastapi.testclient import TestClient
 
-from shared_context import behavior_assistant_hosted as hosted
 from shared_context.behavior_assistant_api import create_assistant_app
 from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_assistant_hosted import TICKET_HEADER
-from shared_context.behavior_history_prompt import HISTORY_CAPABILITIES
 from shared_context.behavior_instruction_cost import usage_facts
-from shared_context.errors import Problem
 from test_behavior_assistant import assistant
-from test_capability_capture import WEB_TOOLS, choose, enabled, fake_services
-from test_instruction_flow import instruction_models, runtime_path, sdk_io
-from test_instruction_prompt import saved_turn, submit
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 
 
@@ -48,69 +40,11 @@ def test_usage_facts_report_tokens_cache_and_tool_calls_without_raising():
         "prompt_tokens": None, "completion_tokens": None, "cached_tokens": None, "tool_calls": 0}
 
 
-def test_disabled_capability_tools_are_refused_by_gateway_and_capability_call(assistant, monkeypatch):
-    h, control = enabled(assistant, monkeypatch, tools=(*HISTORY_CAPABILITIES, *WEB_TOOLS))
-    service_calls = fake_services(monkeypatch)
-    first_choice, _ = choose(h, "choose-web", ("WebSearch-MCP",))
-    assert first_choice.status_code == 200, first_choice.text
-    sessions, registered, refusals = [], [], {}
-    # The real API model route; its upstream fails the test if a refused request ever reaches it.
-    gateway = create_assistant_app(h.assistant, h.verifier, provider=AssistantProvider(
-        URL, SimpleNamespace(get_token=lambda _: SimpleNamespace(token="OFFLINE")),
-        transport=httpx.MockTransport(lambda _: pytest.fail("a refused model request reached the provider"))))
-    initialize, original = hosted.AssistantSession.__init__, hosted.run_copilot
-
-    def bridge(instance, *args, **kwargs):
-        initialize(instance, *args, **kwargs)
-        sessions.append(instance)
-    monkeypatch.setattr(hosted.AssistantSession, "__init__", bridge)
-
-    async def observe(**options):
-        registered.append(sorted(tool.name for tool in options["tools"]))
-        if len(registered) == 2:
-            client = sessions[-1].client
-            body = {"model": client.assignment.task.instruction.model, "stream": True,
-                    "messages": [{"role": "user", "content": "Search again."}],
-                    "tools": [{"type": "function", "function": {"name": "WebSearch-MCP-web", "parameters": {}}}]}
-            digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
-                                               ensure_ascii=False).encode()).hexdigest()
-            path = (f"/behavior/v1/bindings/{client.assignment.binding_id}/assistant"
-                    f"/sessions/{client.assignment.session_id}/model")
-
-            def old_model_request():
-                return TestClient(gateway).post(path, content=json.dumps({"request_id": digest, "body": body}), headers={
-                    "Authorization": "Bearer " + client._token(), "Content-Type": "application/json",
-                    TICKET_HEADER: client.ticket.get_secret_value()})
-            response = await asyncio.to_thread(old_model_request)
-            refusals["gateway"] = (response.status_code, response.headers.get("x-behavior-model-upstream-error-code"))
-            try:
-                await asyncio.to_thread(client.call_capability, "old-call", "WebSearch-MCP-web", {"query": "fa"}, "1" * 64)
-            except Problem as error:
-                refusals["capability_call"] = (error.status, error.body["error"]["code"])
-        return await original(**options)
-    monkeypatch.setattr(hosted, "run_copilot", observe)
-
-    accepted, _ = submit(h, "tool-catalog-first", "Compare the two sources.")
-    assert h.runtime.controller.step(accepted["binding_id"]).state == "succeeded"
-    first = saved_turn(h, h.runtime.bindings[accepted["binding_id"]].job_id)
-    assert set(first.capability_assembly.declared_capabilities) == set(registered[0])
-    assert sorted((*HISTORY_CAPABILITIES, *WEB_TOOLS)) == registered[0]
-
-    narrowed, _ = choose(h, "choose-none", (), previous=first_choice.json()["result"]["selection_id"])
-    assert narrowed.status_code == 200, narrowed.text
-    sdk_io(monkeypatch, expected_tools=HISTORY_CAPABILITIES)
-    followed, _ = submit(h, "tool-catalog-follow", "Continue.", accepted["conversation_id"])
-    assert h.runtime.controller.step(followed["binding_id"]).state == "succeeded"
-    assert registered[1] == sorted(HISTORY_CAPABILITIES)
-    assert refusals == {"gateway": (403, "ASSISTANT_TOOLS_DENIED"), "capability_call": (403, "CAPABILITY_TOOL_DENIED")}
-    assert service_calls == []
-
-
 def test_model_route_logs_usage_facts_once_per_stream_without_content(assistant, caplog):
     from shared_context.behavior_assistant_wire import InstructionSubmit, ModelRequest, Reservation
     from shared_context.behavior_wire import Command
     from shared_context.source_materials import digest
-    from test_work_policy_lifecycle import enabled as policy_enabled
+    from work_policy_lifecycle_helpers import enabled as policy_enabled
     h, control, human, _ = policy_enabled(assistant)
     upstream = stream({"choices": [{"index": 0, "delta": {"content": "PRIVATE-VISIBLE-TEXT"}}]},
                       {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},

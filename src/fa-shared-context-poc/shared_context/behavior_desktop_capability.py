@@ -1,6 +1,6 @@
 """Hosted handler for the FA builtin capability ``fa-desktop-v1`` (CAP-05).
 
-``behavior_assistant_hosted`` registers ``DESKTOP_CAPABILITY`` in ``CAPABILITY_HANDLERS``. For a turn whose
+``native_local_capabilities`` registers ``DESKTOP_CAPABILITY`` in ``LOCAL_HANDLERS``. For a turn whose
 captured grants include the desktop, the factory checks this Hosted environment first (desktop image and a
 non-dumpable main process); otherwise the turn is refused before the model sees any desktop tool (E-10).
 For a turn without the grant, ``release`` closes a desktop left running by an earlier turn.

@@ -5,9 +5,9 @@ capture (`session_needs`: MCP servers, custom tools, vision, image tools), guard
 and SDK session, and passes images and the MCP temp directory to `run_copilot`. This consumer supplies only what the
 job lane used to take from its session:
 
-* The existing `CAPABILITY_HANDLERS` factories (`run_command`, the four desktop tools), called with a native
-  owner. They read only `owner.root`. The native root is `journal.root/native-turns`, which sits beside the job
-  lane's launch roots, so `desktop/` and `shell/` are the same Agent-private directories in both lanes.
+* The existing shell and desktop factories (`run_command`, the four desktop tools) in `LOCAL_HANDLERS`, called
+  with a native owner. They read only `owner.root`. The native root is `<Hosted root>/native-turns`, which sits
+  beside the job lane's launch roots, so `desktop/` and `shell/` are the same Agent-private directories in both lanes.
 * A private TMPDIR for the image-pinned Hosted MCP child: one per RID, under the Agent's journal root like the
   job lane's (Chromium's SingletonSocket path must fit in 107 bytes). The launch command must exist in this image,
   or the turn is refused before the SDK starts.
@@ -25,11 +25,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .behavior_desktop_capability import DESKTOP_CAPABILITY, ENTRY_ID as DESKTOP
+from .behavior_shell_capability import shell_capability, ENTRY_ID as SHELL
 from .errors import Problem
 from .native_capabilities import NativeCapabilityBinding, NativeCapabilityProvider
 
-DESKTOP = "fa-desktop-v1"
-LOCAL_BUILTINS = frozenset({"fa-shell-v1", DESKTOP})
+LOCAL_HANDLERS = {DESKTOP: DESKTOP_CAPABILITY, SHELL: shell_capability}
+LOCAL_BUILTINS = frozenset(LOCAL_HANDLERS)
 
 
 @dataclass(frozen=True)
@@ -51,7 +53,7 @@ def accepts(grant) -> bool:
 
 async def bind_local(context, grants, *, handlers=None) -> NativeCapabilityBinding:
     if handlers is None:
-        from .behavior_assistant_hosted import CAPABILITY_HANDLERS as handlers
+        handlers = LOCAL_HANDLERS
     owner = NativeOwner(Path(context.root))
     desktop = handlers.get(DESKTOP)
     if desktop is not None and hasattr(desktop, "release") and all(grant.entry_id != DESKTOP for grant in grants):

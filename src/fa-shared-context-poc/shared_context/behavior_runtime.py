@@ -70,9 +70,8 @@ from .behavior_inbox import (
     INBOX_CHANNEL_ID, INBOX_VERSION, InboxAcknowledgment, InboxFetch, PullInbox, VerifiedInboxAccess,CurrentWorkInboxAccess,
 )
 from .behavior_operations import (
-    AuthorizationRequest, BudgetRecord, ExecutionContext, GrantRecord, GrantSubject,
-    HumanOperationRejection, HumanOperationRejectionIntent,
-    OwnerRecord, PolicyRecord, ToolBrokerCore, ToolIntent, _Model, _checked, _digest,
+    BudgetRecord, ExecutionContext, GrantRecord, GrantSubject,
+    OwnerRecord, PolicyRecord, ToolBrokerCore, _Model, _checked, _digest,
     _json, _parse, _row, _updated, _utc, _write, control_key,
 )
 from .behavior_store import BehaviorStore, ControlChanges, ControlRequest, Digest, InlineMaterial
@@ -532,37 +531,6 @@ class BehaviorRuntime:
         if self.controller is None or controller is not self.controller:
             raise Problem(403, "BEHAVIOR_CONTROLLER_REQUIRED", "a configured internal controller handle is required")
 
-    def executor_callback(self, binding_id: str, launch_id: str, principal: BehaviorPrincipal, *, claim=False):
-        """Assigned executor callback gate, NOT supervisor start/claim/adopt/drain."""
-        self.refresh_bindings(binding_id)
-        binding = self.bindings.get(binding_id)
-        native = self.dep.native_launches
-        if binding is None or native is None or not isinstance(principal, BehaviorPrincipal):
-            raise Problem(403, "BEHAVIOR_EXECUTOR_DENIED", "no configured native callback binding")
-        principal.require(binding.team_id, "consume")
-        launch = native.launch(launch_id)
-        registered = next((job for job in binding.registered_jobs if job.job_id == launch.start.binding.job_id), None)
-        if (
-            registered is None
-            or principal.kind != "agent" or principal.tenant_id != binding.tenant_id
-            or principal.oid != launch.target.agent_oid or launch.target not in native.targets_for(registered.job_id)
-            or launch.api_binding_id != binding_id
-            or launch.start.binding.work_id != registered.work.work_id or launch.definition != registered.work
-            or any(
-                getattr(launch.start.binding.owner, name) != getattr(binding.owner, name)
-                for name in ExecutionContext.model_fields if name != "epoch"
-            )
-        ):
-            raise Problem(403, "BEHAVIOR_EXECUTOR_DENIED", "native callback belongs to another assigned job/attempt")
-        if registered.job_id != binding.job_id:
-            child = self.dep.workers.inspect(registered.job_id)
-            self._child_record(binding, registered, child)
-            if child.owner != launch.start.binding.owner or launch.start.input != child.spec.input:
-                raise Problem(403, "BEHAVIOR_EXECUTOR_DENIED", "child callback owner/input differs from its saved assignment")
-        if claim:
-            self._state(binding, self.store.read_snapshot(self._gate_keys(binding)))
-        return native
-
     def bootstrap(self, policies: Mapping[str, RuntimePolicy]) -> None:
         """Explicit server initialization only; NOT an HTTP route or native proof."""
         if set(policies) != set(self.bindings):
@@ -631,16 +599,6 @@ class BehaviorRuntime:
         ):
             raise Problem(409, "BEHAVIOR_COMMAND_CONFLICT", "original command ID is bound to different bytes or identity")
         return plan
-
-    def _decision_plan_index(self, binding, kind, command, request):
-        index_key = runtime_key("plan-index", binding.binding_id)
-        index = _row(self.store.read_snapshot((index_key,)), index_key, _PlanIndex)
-        for key in index.keys:
-            original = _row(self.store.read_snapshot((key,)), key, CommandPlan)
-            if (original.kind == kind and original.request.request_id == request.request_id
-                    and original.request_id != command.request_id):
-                raise Problem(409, "BEHAVIOR_DECISION_CONFLICT", "the decision ID belongs to its original command request")
-        return index
 
     def _save_plan(self, binding, kind, principal, command, context, data, request, *,
                    extra_writes=(), expected_index: _PlanIndex | None = None):
@@ -1009,19 +967,6 @@ class BehaviorRuntime:
             return method(source_context, command.projection_id, query).payload
         return getattr(projection, action)(source_context, command.projection_id).payload
 
-    def prepare_operation(self, binding_id, command: wire.OperationPrepare, principal):
-        binding, _, context = self.authorize(binding_id, principal, "approve" if principal.kind == "human" else "execute")
-        if self.dep.broker.dispatcher is None:
-            raise Problem(403, "OPERATION_EXECUTION_DISABLED", "only a concrete bounded adapter may prepare API operations")
-        if command.input_ref not in binding.allowed_input_refs:
-            raise Problem(403, "BEHAVIOR_OPERATION_DENIED", "input alias is not in this binding")
-        intent = ToolIntent(operation_id=binding.operation_id, input_ref=command.input_ref)
-        original = self.dep.broker.reconciliation_request(intent, context)
-        plan = self._save_plan(binding, "operation-prepare", principal, command, context,
-                               {"intent": intent.model_dump(mode="json")}, original)
-        saved = _parse(plan.data["intent"], ToolIntent)
-        return self._run(binding, plan, lambda: self.dep.broker.prepare(saved, plan.context))
-
     def operation_preview(self, binding_id, principal):
         binding, _, context = self.authorize(binding_id, principal, "read")
         if self.dep.broker.dispatcher is None:
@@ -1043,73 +988,6 @@ class BehaviorRuntime:
                 mode="json", exclude={"rejected_by_oid"},
             )
         return result
-
-    def approve_operation(self, binding_id, command: wire.OperationApproval, principal):
-        binding, _, context = self.authorize(binding_id, principal, "approve")
-        op_key, grant_key = control_key("operation", binding.operation_id), control_key("grant", binding.grant_id)
-        intent_key = runtime_key("human-operation-rejection-intent", binding.binding_id, command.decision_id)
-        current = self.store.read_snapshot((op_key, intent_key))
-        operation, _, _ = self.dep.broker._operation(current, binding.operation_id, context)
-        prior = self._existing(binding, "operation-approve", principal, command)
-        if prior is not None and (
-            operation.human_rejection is not None
-            or intent_key not in prior.request.read_set or current[intent_key] is not None
-        ):
-            return self.store.reconcile(prior.request)
-        if operation.human_rejection is not None:
-            raise Problem(409, "OPERATION_HUMAN_REJECTED", "the original declined operation cannot be approved again")
-        if current[intent_key] is not None:
-            raise Problem(409, "BEHAVIOR_DECISION_CONFLICT", "the decision ID belongs to an original rejection request")
-        decision_key = runtime_key("human-operation-decision", binding.binding_id, command.decision_id)
-        request = ControlRequest(
-            request_id=runtime_key("operation-approve", binding.binding_id, command.decision_id),
-            request_digest=_digest([principal.oid, command.model_dump(mode="json"), self.binding_digest(binding)]),
-            read_set=(*self._gate_keys(binding), op_key, grant_key, intent_key),
-        )
-        plan = prior
-        if plan is None:
-            index = self._decision_plan_index(binding, "operation-approve", command, request)
-            plan = self._save_plan(binding, "operation-approve", principal, command, context,
-                                  {"approval": command.model_dump(mode="json")}, request, expected_index=index)
-
-        def commit():
-            def decide(rows):
-                policy, current_context = self._state(binding, rows)
-                operation, prepared, _ = self.dep.broker._operation(rows, binding.operation_id, current_context)
-                if operation.human_rejection is not None:
-                    raise Problem(409, "OPERATION_HUMAN_REJECTED", "the original declined operation cannot be approved again")
-                if rows[intent_key] is not None:
-                    raise Problem(409, "BEHAVIOR_DECISION_CONFLICT", "the decision ID belongs to an original rejection request")
-                now = self._now()
-                expiry = _utc(command.expires_at)
-                if (
-                    command.description_digest != prepared.sha256
-                    or command.adapter_contract_digest != self.dep.broker._contract_digest()
-                    or not now < expiry <= (now + timedelta(seconds=policy.max_grant_seconds) if policy.valid_until is None
-                                           else min(policy.valid_until, now + timedelta(seconds=policy.max_grant_seconds)))
-                    or command.units != self.dep.broker._enabled()[1].reservation_units
-                ):
-                    raise Problem(403, "BEHAVIOR_APPROVAL_DENIED", "human decision must pin current exact material and limits")
-                grant = GrantRecord(
-                    grant_id=binding.grant_id, approval_source="human", approval_id=command.decision_id,
-                    subjects=(GrantSubject(principal_id=current_context.principal_id, conversation_id=current_context.conversation_id),),
-                    root_budget_id=current_context.root_budget_id, description_digest=prepared.sha256,
-                    adapter_contract_digest=command.adapter_contract_digest, policy_id=current_context.policy_id,
-                    policy_revision=policy.operation_policy_revision, revocation_revision=0, revoked=False,
-                    not_before=now, expires_at=expiry, remaining_uses=1, remaining_units=command.units,
-                )
-                return ControlChanges(writes=(
-                    _write(grant_key, grant, "create"),
-                    _write(decision_key, grant, "create", material({
-                        "authenticated_human_oid": principal.oid, "binding_id": binding.binding_id,
-                        "decision": command.model_dump(mode="json"), "prepared": prepared.model_dump(mode="json"),
-                    })),
-                ), result={"approval_id": command.decision_id, "grant_id": binding.grant_id,
-                           "description_digest": prepared.sha256, "approved_uses": 1})
-
-            return self.store.transact(plan.request, decide)
-
-        return self._run(binding, plan, commit)
 
     def operation_decision_state(self, binding_id, principal):
         def read():
@@ -1149,167 +1027,6 @@ class BehaviorRuntime:
             )
 
         return self.store.consistent_read(read)
-
-    def reject_operation(self, binding_id, command: wire.OperationRejection, principal):
-        binding, _, context = self.authorize(binding_id, principal, "approve")
-        if principal.kind != "human" or principal.actor_id is not None:
-            raise Problem(403, "BEHAVIOR_REJECTION_DENIED", "a configured human decision is required")
-        op_key, grant_key = control_key("operation", binding.operation_id), control_key("grant", binding.grant_id)
-        decision_key = runtime_key("human-operation-decision", binding.binding_id, command.decision_id)
-        request = ControlRequest(
-            request_id=runtime_key("operation-reject", binding.binding_id, command.decision_id),
-            request_digest=_digest([principal.oid, command.model_dump(mode="json"), self.binding_digest(binding)]),
-            read_set=(*self._gate_keys(binding), op_key, grant_key),
-        )
-
-        def pending(rows, current_context):
-            operation, prepared, _ = self.dep.broker._operation(rows, binding.operation_id, current_context)
-            if (command.description_digest != prepared.sha256
-                    or command.adapter_contract_digest != operation.adapter_contract_digest):
-                raise Problem(403, "BEHAVIOR_REJECTION_DENIED", "human rejection must pin the original exact material")
-            if (operation.human_rejection is not None or rows[grant_key] is not None
-                    or operation.current_attempt_id is not None or operation.unsettled_attempt_ids
-                    or operation.effect_state != "unknown" or operation.business_state != "pending"
-                    or operation.successful_result is not None):
-                raise Problem(409, "BEHAVIOR_REJECTION_CONFLICT", "only an unapproved, unattempted operation may be declined")
-            return operation, prepared
-
-        intent_key = runtime_key("human-operation-rejection-intent", binding.binding_id, command.decision_id)
-        intent = HumanOperationRejectionIntent(
-            binding_id=binding.binding_id, binding_digest=self.binding_digest(binding),
-            operation_id=binding.operation_id, decision_id=command.decision_id,
-            request_id=command.request_id, principal_oid=principal.oid,
-            input_digest=_digest(command.model_dump(mode="json")),
-        )
-        intent_rows = self.store.read_snapshot((intent_key,))
-        if intent_rows[intent_key] is not None and _row(intent_rows, intent_key, HumanOperationRejectionIntent) != intent:
-            raise Problem(409, "BEHAVIOR_COMMAND_CONFLICT", "the rejection decision is bound to its original request")
-        prior = self._existing(binding, "operation-reject", principal, command)
-        if prior is not None and intent_rows[intent_key] is None:
-            # Older plans without the decision binding may only read their original receipt.
-            return self.store.reconcile(prior.request)
-        if prior is None:
-            if intent_rows[intent_key] is not None:
-                raise Problem(409, "BEHAVIOR_REJECTION_CONFLICT", "the original rejection intent is missing its command plan")
-            pending(self.store.read_snapshot((op_key, grant_key)), context)
-        plan = prior or self._save_plan(
-            binding, "operation-reject", principal, command, context,
-            {"rejection": command.model_dump(mode="json")}, request,
-            extra_writes=(_write(intent_key, intent, "create", material(intent.model_dump(mode="json"))),),
-        )
-
-        def commit():
-            def decide(rows):
-                _, current_context = self._state(binding, rows)
-                operation, prepared = pending(rows, current_context)
-                rejection = HumanOperationRejection(
-                    schema_version=command.schema_version, operation_id=binding.operation_id,
-                    decision_id=command.decision_id, description_digest=prepared.sha256,
-                    adapter_contract_digest=operation.adapter_contract_digest,
-                    rejected_by_oid=principal.oid, rejected_at=self._now(),
-                )
-                return ControlChanges(writes=(
-                    _write(op_key, _updated(operation, human_rejection=rejection), "replace", prepared),
-                    _write(decision_key, rejection, "create", material({
-                        "authenticated_human_oid": principal.oid, "binding_id": binding.binding_id,
-                        "decision": command.model_dump(mode="json"), "prepared": prepared.model_dump(mode="json"),
-                    })),
-                ), result={"operation_id": binding.operation_id, "decision_id": command.decision_id,
-                           "description_digest": prepared.sha256, "rejected": True})
-
-            return self.store.transact(plan.request, decide)
-
-        return self._run(binding, plan, commit)
-
-    def _reconcile_operation_decision(self, binding_id, command, principal, *, kind):
-        def read():
-            binding, _, _ = self.authorize(binding_id, principal, "read")
-            if principal.kind != "human" or principal.actor_id is not None:
-                code = "BEHAVIOR_REJECTION_DENIED" if kind == "operation-reject" else "BEHAVIOR_OPERATION_READ_DENIED"
-                raise Problem(403, code, "only the original configured human may reconcile")
-            plan = self._existing(binding, kind, principal, command)
-            if plan is None:
-                subject = "rejection" if kind == "operation-reject" else "operation decision"
-                raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN",
-                              f"original {subject} plan is unavailable; lookup does not submit a decision",
-                              original_request_id=command.request_id, automatic_retry=False)
-            return self.store.reconcile(plan.request)
-
-        return self.store.consistent_read(read)
-
-    def reconcile_operation_rejection(self, binding_id, command: wire.OperationRejection, principal):
-        return self._reconcile_operation_decision(binding_id, command, principal, kind="operation-reject")
-
-    def reconcile_operation_approval(self, binding_id, command: wire.OperationApproval, principal):
-        return self._reconcile_operation_decision(binding_id, command, principal, kind="operation-approve")
-
-    def reconcile_operation_revocation(self, binding_id, command: wire.OperationRevocation, principal):
-        return self._reconcile_operation_decision(binding_id, command, principal, kind="operation-revoke")
-
-    def execute_operation(self, binding_id, command: wire.Command, principal, *, reconcile=False):
-        binding, _, context = self.authorize(binding_id, principal, "read" if reconcile else "execute")
-        dispatcher = self.dep.broker.dispatcher
-        if dispatcher is None:
-            raise Problem(403, "OPERATION_EXECUTION_DISABLED", "no concrete adapter is configured")
-        if reconcile:
-            try:
-                return dispatcher.reconcile(binding.operation_id, binding.attempt_id, context)
-            except Problem as exc:
-                if exc.body["error"]["code"] == "OPERATION_RECORD_MISSING":
-                    raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "original dispatch evidence is unavailable") from None
-                raise
-        authorization = AuthorizationRequest(operation_id=binding.operation_id, attempt_id=binding.attempt_id, grant_id=binding.grant_id)
-        dispatcher.check_mutable_target(
-            authorization, context,
-            fixed_work_ids=tuple(job.work.work_id for registered in self.bindings.values()
-                                 for job in registered.registered_jobs),
-        )
-        plan = self._save_plan(
-            binding, "operation-execute", principal, command, context,
-            {"authorization": authorization.model_dump(mode="json")},
-            dispatcher.reconciliation_request(authorization, context, stage="consume"),
-        )
-        return self._run(
-            binding, plan, lambda: dispatcher.execute(authorization, plan.context),
-            lambda: self.execute_operation(binding_id, command, principal, reconcile=True),
-        )
-
-    def revoke_operation(self, binding_id, command: wire.OperationRevocation, principal):
-        binding, _, context = self.authorize(binding_id, principal, "approve")
-        grant_key = control_key("grant", binding.grant_id)
-        decision_key = runtime_key("human-operation-revocation", binding.binding_id, command.decision_id)
-        request = ControlRequest(
-            request_id=runtime_key("operation-revoke", binding.binding_id, command.decision_id),
-            request_digest=_digest([principal.oid, command.model_dump(mode="json"), self.binding_digest(binding)]),
-            read_set=(*self._gate_keys(binding), grant_key),
-        )
-        plan = self._existing(binding, "operation-revoke", principal, command)
-        if plan is None:
-            index = self._decision_plan_index(binding, "operation-revoke", command, request)
-            plan = self._save_plan(binding, "operation-revoke", principal, command, context,
-                                  {"revocation": command.model_dump(mode="json")}, request, expected_index=index)
-
-        def commit():
-            def decide(rows):
-                self._state(binding, rows)
-                grant = _row(rows, grant_key, GrantRecord)
-                if (
-                    grant.grant_id != binding.grant_id or grant.revoked
-                    or grant.description_digest != command.description_digest
-                    or grant.revocation_revision != command.expected_revocation_revision
-                ):
-                    raise Problem(409, "BEHAVIOR_REVOCATION_CONFLICT", "revocation must identify the exact current grant")
-                revoked = _updated(grant, revoked=True, revocation_revision=grant.revocation_revision + 1)
-                return ControlChanges(writes=(
-                    _write(grant_key, revoked, "replace"),
-                    _write(decision_key, revoked, "create", material({
-                        "authenticated_human_oid": principal.oid, "decision": command.model_dump(mode="json"),
-                    })),
-                ), result={"grant_id": binding.grant_id, "revoked": True, "revocation_revision": revoked.revocation_revision})
-
-            return self.store.transact(plan.request, decide)
-
-        return self._run(binding, plan, commit)
 
     def submit(self, binding_id, command: wire.SubmitWork, principal, *, reconcile=False):
         binding, policy, context = self.authorize(binding_id, principal, "read" if reconcile else "submit")
@@ -1392,43 +1109,6 @@ class BehaviorRuntime:
                 getattr(job.owner, name) != getattr(binding.owner, name)
                 for name in ExecutionContext.model_fields if name != "epoch")):
             raise Problem(403, "BEHAVIOR_CHILD_DENIED", "saved child parent/work/owner/input differs from server configuration")
-
-    def enqueue_child(self, binding_id, child_id, command: wire.Command, principal, *, reconcile=False):
-        binding, _, context = self.authorize(binding_id, principal, "read" if reconcile else "submit")
-        child = self._registered_child(binding, child_id)
-        worker = self.dep.workers
-        kind = "child-enqueue-" + child_id
-        plan = self._existing(binding, kind, principal, command)
-        if plan is None:
-            if reconcile:
-                raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "original child enqueue plan is missing")
-            parent = worker.inspect(binding.job_id)
-            worker._scope(parent, context, exact=True)
-            if parent.state not in {"starting", "running"} or parent.binding is None or parent.cancel_requested:
-                raise Problem(409, "BEHAVIOR_PARENT_UNAVAILABLE", "only an already-started parent may accept a child")
-            spec = self._child_spec(binding, child)
-            reads = (worker_key("pool", worker.contract.workspace_id), worker_key("job", child_id),
-                     *worker._owner_keys(context), worker_key("job", binding.job_id))
-            request = worker._request("enqueue", (child_id,), [spec.model_dump(mode="json"), context.model_dump(mode="json")], reads)
-            plan = self._save_plan(binding, kind, principal, command, context, {"job": spec.model_dump(mode="json")}, request)
-        if _parse(plan.data["job"], JobSpec) != self._child_spec(binding, child):
-            raise Problem(403, "BEHAVIOR_CHILD_DENIED", "child plan no longer matches its configured definition")
-        if reconcile:
-            self.store.reconcile(plan.request)
-        else:
-            self._run(binding, plan, lambda: worker.enqueue(_parse(plan.data["job"], JobSpec), plan.context))
-        return self.child_status(binding_id, child_id, principal)
-
-    def child_status(self, binding_id, child_id, principal):
-        binding, _, context = self.authorize(binding_id, principal, "read")
-        child = self._registered_child(binding, child_id)
-        job = self.dep.workers.inspect(child_id)
-        self.dep.workers._scope(job, context)
-        self._child_record(binding, child, job)
-        return wire.ChildJobStatus(
-            job_id=child_id, work_id=child.work.work_id, parent_job_id=binding.job_id,
-            state=job.state, generation=job.generation,
-        )
 
     def job_status(self, binding_id, principal):
         binding, _, context = self.authorize(binding_id, principal, "read", historical_status=True)

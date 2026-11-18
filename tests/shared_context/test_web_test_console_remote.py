@@ -15,8 +15,9 @@ from web_test_console.adapter import ConsoleError
 from web_test_console.remote import (
     EasyAuthTokenProvider, LeasedArchive, RemoteBoundary, pack, unpack,
 )
-from test_m3_auth import jwk_client, signing_key  # fixtures used by real_interface
-from test_web_test_console_frozen_interface import real_interface
+from test_m3_auth import jwk_client, signing_key  # fixtures used by picker_api
+from assistant_api_helpers import assistant_api, picker_api
+from instruction_flow_helpers import instruction_models
 
 OWNER = "00000000-0000-0000-0000-00000000001b"
 ORIGIN = "https://ca-fa-console-stage.example.westus3.azurecontainerapps.io"
@@ -268,8 +269,8 @@ def _remote_ui(c, monkeypatch, persisted, journal, *, backend=None, prewarm=Fals
 
 
 def test_remote_console_needs_the_platform_principal_and_reads_its_token_per_request(
-        real_interface, monkeypatch, tmp_path):
-    c, persisted, journal = real_interface, [], tmp_path / "remote" / "console.sqlite3"
+        picker_api, monkeypatch, tmp_path):
+    c, persisted, journal = picker_api, [], tmp_path / "remote" / "console.sqlite3"
     ui = _remote_ui(c, monkeypatch, persisted, journal)
     assert set(persisted) == {journal.resolve()}
     signed_in = {"x-ms-client-principal-id": c.config.human_oid, "x-ms-client-principal-idp": "aad"}
@@ -312,10 +313,10 @@ def test_remote_console_needs_the_platform_principal_and_reads_its_token_per_req
 
 
 def test_remote_console_sends_a_signed_in_owner_without_a_stored_token_to_re_sign_in(
-        real_interface, monkeypatch, tmp_path):
+        picker_api, monkeypatch, tmp_path):
     # The token-store entry is gone (rotated or cleared) while the sign-in cookie still holds: the page still loads
     # and answers 401 LOGIN_REQUIRED, which shows 重新登入; only another identity is 403.
-    c = real_interface
+    c = picker_api
     ui = _remote_ui(c, monkeypatch, [], tmp_path / "remote" / "console.sqlite3")
     signed_in = {"x-ms-client-principal-id": c.config.human_oid, "x-ms-client-principal-idp": "aad"}
     assert ui.get("/", headers=signed_in).status_code == 200
@@ -334,10 +335,10 @@ def test_remote_console_sends_a_signed_in_owner_without_a_stored_token_to_re_sig
     assert wrong.status_code == 403 and wrong.json()["error"]["code"] == "REMOTE_PRINCIPAL_DENIED"
 
 
-def test_remote_console_stops_when_a_commit_cannot_be_kept(real_interface, monkeypatch, tmp_path):
+def test_remote_console_stops_when_a_commit_cannot_be_kept(picker_api, monkeypatch, tmp_path):
     from web_test_console.bridge import Journal
 
-    c, persisted = real_interface, []
+    c, persisted = picker_api, []
     ui = _remote_ui(c, monkeypatch, persisted, tmp_path / "remote" / "console.sqlite3")
     signed_in = {"x-ms-client-principal-id": c.config.human_oid, "x-ms-client-principal-idp": "aad"}
     ui.get("/", headers=signed_in)
@@ -355,12 +356,12 @@ def test_remote_console_stops_when_a_commit_cannot_be_kept(real_interface, monke
 
 
 def test_remote_console_forwards_the_typing_prewarm_with_the_owners_saved_sign_in_token(
-        real_interface, monkeypatch, tmp_path):
+        picker_api, monkeypatch, tmp_path):
     # README#typing-prewarm-stage: the same Easy Auth admission as every other POST, and like them it forwards the
     # token the console kept at sign-in (TokenVault), not a token this request names.
     import httpx
 
-    c, seen, persisted = real_interface, [], []
+    c, seen, persisted = picker_api, [], []
 
     def backend(request):
         if request.url.path == "/work-policy/v1/native-turns/prewarm":
@@ -396,11 +397,11 @@ def test_remote_console_forwards_the_typing_prewarm_with_the_owners_saved_sign_i
         upstream.close()
 
 
-def test_local_console_keeps_its_loopback_cookie_and_never_calls_the_remote_hook(real_interface):
+def test_local_console_keeps_its_loopback_cookie_and_never_calls_the_remote_hook(picker_api):
     from fastapi.testclient import TestClient
     from web_test_console.bridge import Journal, create_app
 
-    c = real_interface
+    c = picker_api
     assert Journal.after_commit is None
     app = create_app(c.config, c.journal, backend=c.backend, token_provider=lambda: c.h.headers()["Authorization"][7:],
                      clock=lambda: c.h.time, environment="OFFLINE_TEST", instruction_connection=c.connection)
@@ -416,13 +417,13 @@ def test_local_console_keeps_its_loopback_cookie_and_never_calls_the_remote_hook
     assert remote_host.get("/").status_code == 403
 
 
-def test_serve_remote_pins_owner_and_state_root_before_it_starts(real_interface, tmp_path, monkeypatch):
+def test_serve_remote_pins_owner_and_state_root_before_it_starts(picker_api, tmp_path, monkeypatch):
     from web_test_console import __main__ as launcher
     from web_test_console import remote
     from web_test_console.adapter import canonical, sha
     from web_test_console.bridge import Journal
 
-    c = real_interface
+    c = picker_api
     config = tmp_path / "config" / "console.json"
     config.parent.mkdir()
     config.write_bytes(canonical(c.config.model_dump(mode="json")))
@@ -497,14 +498,14 @@ def test_serve_remote_pins_owner_and_state_root_before_it_starts(real_interface,
     assert events[-2:] == ["start", "release"] and len(calls) == 1
 
 
-def test_remote_bundle_changes_only_the_client_and_paths_and_pins_new_bytes(real_interface, tmp_path):
+def test_remote_bundle_changes_only_the_client_and_paths_and_pins_new_bytes(picker_api, tmp_path):
     import json
     from web_test_console import __main__ as launcher
     from web_test_console.adapter import parse_config, sha
     from web_test_console.instructions import InstructionConnection
     from test_web_test_console_agents import connection_file, supplied_peer
 
-    c = real_interface
+    c = picker_api
     manifest = connection_file(c, tmp_path)
     peer = supplied_peer(c, manifest)
     out = tmp_path / "bundle"

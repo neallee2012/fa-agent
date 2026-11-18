@@ -1,70 +1,16 @@
-"""Conversation-owned Hosted identities and explicit reset; offline SDK/HTTP only."""
+"""Conversation-owned Hosted identities; offline SDK/HTTP only."""
 from types import SimpleNamespace
 import json
 
 import httpx
 import pytest
 
-from shared_context.behavior_assistant_wire import InstructionSubmit
-from shared_context.behavior_wire import Command
 from shared_context.behavior_foundry import FoundryExecutor, FoundryHttpClient, instruction_target
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path, sdk_io
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
-from test_work_policy_lifecycle import enabled
 from test_foundry_start_diagnostics import Credential, SessionTransport, inject_sdk
 from test_behavior_foundry import TARGET, PERMIT
-from hosted_versions_stub import deployed_versions
-
-
-def test_followups_keep_hosted_identity_version_and_reset_preserves_old_results(assistant, monkeypatch):
-    h, control, human, _ = enabled(assistant)
-    calls = sdk_io(monkeypatch)
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "First retained answer"}, {"content": "Second retained answer"}])
-    deployed_versions(monkeypatch, "33")
-    first, _ = control.submit(human, InstructionSubmit(request_id="shared-first", content="Remember a code."))
-    assert h.runtime.controller.step(first.binding_id).state == "succeeded"
-    one = control.records[first.binding_id]
-    cid = one.profile.instruction.conversation_id
-    sid = one.hosted_session_id
-    assert sid.startswith("fa-chat-")
-    deployed_versions(monkeypatch, "34")
-    second, _ = control.submit(human, InstructionSubmit(request_id="shared-second",
-        content="What did I ask?", conversation_id=cid))
-    assert h.runtime.controller.step(second.binding_id).state == "succeeded"
-    two = control.records[second.binding_id]
-    assert two.hosted_session_id == sid
-    assert two.profile.instruction.hosted_agent_version == one.profile.instruction.hosted_agent_version == "33"
-    assert calls[0]["sdk_session_id"] == calls[1]["sdk_session_id"]
-    before = control.read_reply(human, cid, 1).model_dump_json()
-    reset = control.reset_conversation(human, cid, Command(request_id="explicit-reset"))
-    assert reset["archived"] and reset["hosted_session_id"] == sid and reset["session_stop"] == "not_run"
-    guard = h.store._guard()
-    assert control.reset_conversation(human, cid, Command(request_id="explicit-reset")) == reset
-    assert h.store._guard() == guard
-    assert control.read_reply(human, cid, 1).model_dump_json() == before
-    assert control.conversation(human, cid)["archived"]
-    assert not control.conversation(human, cid)["can_follow_up"]
-    with pytest.raises(Problem) as archived:
-        control.submit(human, InstructionSubmit(request_id="no-hidden-restart", content="Continue.", conversation_id=cid))
-    assert archived.value.body["error"]["code"] == "CONVERSATION_ARCHIVED"
-    fresh, _ = control.submit(human, InstructionSubmit(request_id="new-session", content="Fresh context."))
-    assert control.records[fresh.binding_id].hosted_session_id != sid
-    assert control.records[fresh.binding_id].profile.instruction.hosted_agent_version == "34"
-    assert len(calls) == 2
-
-
-def test_reset_refuses_running_or_unknown_work_without_erasing_it(assistant):
-    h, control, human, _ = enabled(assistant)
-    binding, _ = control.submit(human, InstructionSubmit(request_id="unfinished", content="Pending work."))
-    cid = control.records[binding.binding_id].profile.instruction.conversation_id
-    before = h.store._guard()
-    with pytest.raises(Problem) as blocked:
-        control.reset_conversation(human, cid, Command(request_id="reset-while-pending"))
-    assert blocked.value.body["error"]["code"] == "CONVERSATION_TURN_UNRESOLVED"
-    assert h.store._guard() == before and h.endpoint.requests == []
 
 
 @pytest.mark.parametrize("missing", [False, True])

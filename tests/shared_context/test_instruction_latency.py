@@ -8,39 +8,19 @@ import httpx
 import pytest
 
 from shared_context.behavior_assistant_gateway import AssistantProvider
-from test_web_test_console_frozen_interface import real_interface, post
+from test_web_test_console_frozen_interface import real_interface
+from web_test_console_frozen_interface_helpers import post
 from test_m3_auth import signing_key, jwk_client
 from test_behavior_assistant import assistant
-from test_instruction_flow import runtime_path, instruction_models
-
-
-def test_chat_submission_needs_only_one_backend_post_and_keeps_a_durable_intent(real_interface):
-    c = real_interface
-    draft = c.browser.ui.get("/api/state").json()["composer"]
-    c.calls.clear()
-    response = post(c, f"/api/instructions/{draft['request_id']}/submit",
-                    {"content": "One original message.", "model": draft["model"]})
-    assert response.status_code == 200, response.text
-    # A new conversation reads its server-selected template once (fae25c09), then writes exactly one submit.
-    expected = [("GET", "/work-policy/v1/agent-template"), ("POST", "/work-policy/v1/submit")]
-    assert [(call["method"], call["path"]) for call in c.calls] == expected
-    saved = c.browser.app.state.console.journal.get(draft["request_id"], "submit")
-    assert saved["state"] == "CONFIRMED"
-    assert saved["intent"]["instruction_context"]["conversation_id"] == saved["admission"]["conversation_id"]
-    assert saved["intent"]["body"]["content"] == "One original message."
-    assert post(c, f"/api/instructions/{draft['request_id']}/submit",
-                {"content": "One original message.", "model": draft["model"]}).status_code == 200
-    assert [(call["method"], call["path"]) for call in c.calls] == expected
+from instruction_flow_helpers import runtime_path, instruction_models
+from legacy_console_rows_helpers import stored_console
 
 
 def test_state_only_builds_message_views_for_the_selected_conversation(real_interface,monkeypatch):
     c=real_interface
-    first=c.browser.ui.get("/api/state").json()["composer"]
-    assert post(c,f"/api/instructions/{first['request_id']}/submit",
-                {"content":"First thread","model":first["model"]}).status_code==200
-    second=post(c,"/api/instructions/conversations/new").json()["composer"]
-    assert post(c,f"/api/instructions/{second['request_id']}/submit",
-                {"content":"Second thread","model":second["model"]}).status_code==200
+    # Two old conversations, each with one work the retired submit admitted.
+    facts=stored_console(c,"console-two-threads")
+    first,second=facts["first"],facts["second"]
     console=c.browser.app.state.console
     viewed=[]
     original=console.task_view
@@ -102,7 +82,7 @@ def test_real_http_stream_yields_preview_before_done_and_never_replays(assistant
     from shared_context.behavior_work_policy import CostLedger
     from shared_context.behavior_operations import _row
     from shared_context.source_materials import digest
-    from test_work_policy_lifecycle import enabled
+    from work_policy_lifecycle_helpers import enabled
     from test_behavior_model_deadlines import asgi_server
     h, control, human, _ = enabled(assistant)
     released, closed = Event(), Event()

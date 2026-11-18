@@ -12,13 +12,8 @@ from pydantic import ValidationError
 from shared_context import behavior_assistant_wire as aw
 from shared_context.behavior_assistant_progress import public_event as project_event
 from shared_context.behavior_assistant_hosted import AssistantSession
-from shared_context.behavior_work_policy_api import install_work_policy_routes
-from web_test_console.freeform import ConversationProjection
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
-from test_sdk_compaction_product import open_turn, ordinary
-from test_work_policy_lifecycle import enabled
 
 AT = "2026-09-25T10:00:00Z"
 public_event = partial(project_event, allowed_tools=("read_context", "execute_operation", "read_user_turn", "read_skill"))
@@ -244,57 +239,6 @@ def test_hosted_snapshot_retains_correlation_when_old_start_is_pruned(tmp_path):
     assert "PRIVATE_" not in final.model_dump_json()
 
 
-@pytest.mark.parametrize("with_public_note", [False, True])
-def test_signed_progress_and_thin_client_preserve_pairs_without_new_authority(assistant, with_public_note):
-    h, control, human, _ = enabled(assistant)
-    install_work_policy_routes(h.app, SimpleNamespace(
-        runtime=h.runtime, verifier=h.verifier, installation=lambda: None,
-        require_current_native_evidence=lambda: None,
-    ))
-    turn = open_turn(h, control, human, "public-tool-pairs")
-    try:
-        progress = aw.PublicProgress(events=paired())
-        if with_public_note:
-            note = public_event({"type": "assistant.message", "timestamp": AT, "data": {
-                "content": "I will check the next source.", "phase": "commentary",
-                "reasoning_text": "PRIVATE_REASONING",
-            }}, 5, {})
-            progress = aw.PublicProgress(events=(*progress.events, note))
-        assert turn.client.progress(progress).state == "accepted"
-        guard = h.store._guard()
-        raw = control.conversation(human, turn.assignment.task.instruction.conversation_id)
-        parsed = ConversationProjection.model_validate_json(json.dumps(raw))
-        assert [e.tool_start_seq for e in parsed.turns[0].progress.events
-                if e.kind.startswith("tool_")] == [1, 2, 2, 1]
-        assert parsed.turns[0].progress == progress
-        assert not parsed.can_follow_up
-        assert not parsed.turns[0].reply_available
-        assert parsed.turns[0].delivery_id is None
-        assert h.store._guard() == guard
-        assert h.endpoint.requests == []
-        assert "PRIVATE_" not in json.dumps(raw)
-        reference = turn.client.save_sdk_state(ordinary(turn.assignment.sdk_session_id), turn.stop)
-        ended = aw.PublicProgressEvent(
-            seq=progress.events[-1].seq+1, at=datetime.fromisoformat(AT.replace("Z", "+00:00")), kind="stage",
-            status="succeeded", summary="SDK turn ended",
-        )
-        final_progress = aw.PublicProgress(events=(*progress.events, ended))
-        saved = turn.client.save_text_reply(
-            "Original inventory response.", reference, turn.stop, progress=final_progress,
-        )
-        h.executor._complete(turn.start, saved.model_dump(mode="json"))
-        status = h.runtime.controller.step(turn.binding.binding_id)
-        assert status.state == "succeeded" and status.result_forwarded
-        assert not status.obligation_fulfilled
-        archived = ConversationProjection.model_validate_json(json.dumps(
-            control.conversation(human, turn.assignment.task.instruction.conversation_id),
-        ))
-        assert archived.turns[0].progress == final_progress
-        assert h.endpoint.requests == []
-    finally:
-        turn.client.close()
-
-
 def test_capability_tool_calls_are_public_with_the_stored_name_format():
     tools, allowed = {}, {"WebIQ-MCP-web", "playwright-browser_navigate", "read_context"}
     opened = public_event(start("PRIVATE_WEB", "WebIQ-MCP-web"), 1, tools, allowed_tools=allowed)
@@ -308,33 +252,3 @@ def test_capability_tool_calls_are_public_with_the_stored_name_format():
     lookalike = public_event(start("PRIVATE_LOOKALIKE", "read-context"), 4, tools, allowed_tools={"read-context"})
     ended = public_event(complete("PRIVATE_LOOKALIKE"), 5, tools, allowed_tools={"read-context"})
     assert lookalike.tool_name == "read_context" and ended.source is None
-
-
-@pytest.mark.parametrize("code", ["MODEL_CALL_LIMIT_REACHED", "AGENT_MESSAGE_RESULT_UNCONFIRMED"])
-def test_fixed_failure_code_survives_signed_progress_and_thin_client(assistant, code):
-    h, control, human, _ = enabled(assistant)
-    install_work_policy_routes(h.app, SimpleNamespace(
-        runtime=h.runtime, verifier=h.verifier, installation=lambda: None,
-        require_current_native_evidence=lambda: None,
-    ))
-    turn = open_turn(h, control, human, "public-failure-code")
-    try:
-        if code == "MODEL_CALL_LIMIT_REACHED":
-            event = project_event({"type": "m2.provider_failed", "timestamp": AT,
-                "data": {"message": "PRIVATE_DETAIL"}}, 1, {}, model_failure_code=code)
-        else:
-            event = project_event({"type": "m2.tool_failure", "timestamp": AT, "data": {
-                "tool_name": "send_agent_message", "code": code, "error": "PRIVATE_DETAIL"}},
-                1, {}, allowed_tools=("send_agent_message",))
-        progress = aw.PublicProgress(events=(event,))
-        assert turn.client.progress(progress).state == "accepted"
-        before = h.store._guard()
-        assert turn.client.progress(progress).state == "accepted"
-        parsed = ConversationProjection.model_validate_json(json.dumps(
-            control.conversation(human, turn.assignment.task.instruction.conversation_id)))
-        assert parsed.turns[0].progress.events[0].summary == code
-        assert not parsed.turns[0].reply_available and not parsed.can_follow_up
-        assert "PRIVATE_" not in parsed.model_dump_json()
-        assert h.store._guard() == before and h.endpoint.requests == []
-    finally:
-        turn.client.close()

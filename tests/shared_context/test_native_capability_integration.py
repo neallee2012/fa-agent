@@ -56,11 +56,11 @@ from shared_context.tool_catalog import build_catalog, load_catalog
 from hosted_versions_stub import deployed_versions
 from sdk_checkpoint_local import sse
 from test_agent_runtime import peer_runtime
-from test_agent_runtime_routing import agent_headers
-from test_approved_skill_api import BODY as SKILL_BODY
+from agent_runtime_routing_helpers import agent_headers
+from approved_skill_api_helpers import BODY as SKILL_BODY
 from test_capability_calls import WEBIQ
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_instruction_responses_native import response_bytes
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -68,8 +68,8 @@ from test_native_delegation import TASK
 from test_native_session_prepare_api import platform_sessions
 from test_native_turn_api import Credential
 from test_native_turns import local_env
-from test_skill_isolation_native import child_environment
-from test_sdk_compaction_product import SUMMARY
+from skill_isolation_native_helpers import child_environment
+from sdk_compaction_product_helpers import SUMMARY
 
 
 API_URL = "https://api.offline.invalid"
@@ -157,7 +157,7 @@ def integrated(request, local_env, monkeypatch, tmp_path, runtime_path, signing_
     monkeypatch.setattr("azure.identity.aio.ManagedIdentityCredential", lambda **_: OfflineCredential())
     hosted = SimpleNamespace(
         identity=identity, api=SimpleNamespace(api_url=API_URL, audience="api://OFFLINE"),
-        supervisor=SimpleNamespace(journal=SimpleNamespace(root=tmp_path / "agent")),
+        root=tmp_path / "agent",
     )
     with monkeypatch.context() as environment:
         environment.setenv("FA_NATIVE_TURNS", NATIVE_V3_PROFILE)
@@ -220,7 +220,7 @@ def integrated(request, local_env, monkeypatch, tmp_path, runtime_path, signing_
         if getattr(request, "param", None) == "responses":
             from shared_context.native_responses import native_responses_handler_factory
             monkeypatch.setenv("FA_RESPONSES_ENABLED", "1")
-            hosted.supervisor.journal.root.mkdir(parents=True, exist_ok=True)
+            hosted.root.mkdir(parents=True, exist_ok=True)
             host_options["responses_handler_factory"] = native_responses_handler_factory
         client = host_lifetime.enter_context(TestClient(create_host(hosted, native_runtime=runtime, **host_options)))
         servers = {identity.session_id: (client, identity)}
@@ -421,12 +421,12 @@ def original_peer_transport(h, monkeypatch):
 
 @contextmanager
 def original_native_console(h, tmp_path, signing_key):
-    from shared_context.behavior_assistant import _LocalHttp
+    from local_http_helpers import _LocalHttp
     from shared_context.behavior_inbox import INBOX_VERSION
     from web_test_console.adapter import parse_config
     from web_test_console.bridge import create_app as console_app
     from web_test_console.instructions import InstructionConnection
-    from test_web_test_console_standing import configuration
+    from web_test_console_standing_helpers import configuration
 
     state = h.invoke(NativeSessionRead()).json()
     prepared = h.invoke(NativeSessionPrepare(
@@ -724,7 +724,7 @@ def test_followed_a_cid_restores_manual_responses_and_keeps_last_good_checkpoint
     })
     identity = h.identity.model_copy(update={"session_id": next_target.session_id, "agent_version": version})
     hosted = SimpleNamespace(identity=identity, api=h.hosted.api,
-                             supervisor=SimpleNamespace(journal=SimpleNamespace(root=tmp_path / "new-agent")))
+                             root=tmp_path / "new-agent")
     monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", identity.session_id)
     with monkeypatch.context() as environment:
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-next-factory")
@@ -853,8 +853,8 @@ def test_a_all_ten_capabilities_share_original_ui_turn_and_image_readback(
     from shared_context import behavior_shell_capability as shell
     from shared_context.native_local_capabilities import NativeOwner
     from test_behavior_desktop import FakeRunner
-    from test_capability_live_mix_native import live_like_catalog
-    from test_capability_proxy_native import KEY, served
+    from capability_live_mix_native_helpers import live_like_catalog
+    from capability_proxy_native_helpers import KEY, served
     from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
     from shared_context.native_image_wire import NativeImageContent, NativeImageRead, NativeImageReceipt, NativeImagesRead
     from shared_context.native_skill_draft_wire import NativeSkillDraftReceipt
@@ -1405,14 +1405,14 @@ def test_native_console_reads_real_skill_draft_bytes_and_refuses_a_replaced_sour
     """A separate minimal UI configuration, not an A/B equivalence or browser-rendering claim."""
     from azure.ai.projects.models import VersionRefIndicator
     from azure.core.exceptions import ResourceNotFoundError
-    from shared_context.behavior_assistant import _LocalHttp
+    from local_http_helpers import _LocalHttp
     from shared_context.behavior_inbox import INBOX_VERSION
     from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
     from web_test_console.adapter import parse_config
     from web_test_console.bridge import create_app as console_app
     from web_test_console.instructions import InstructionConnection
-    from test_conversation_profile_selection import template
-    from test_web_test_console_standing import configuration
+    from conversation_profile_selection_helpers import template
+    from web_test_console_standing_helpers import configuration
 
     h = integrated
     state = h.invoke(NativeSessionRead()).json()
@@ -1555,8 +1555,8 @@ def test_saved_image_survives_original_child_cancel_and_remains_read_only_in_nat
     from shared_context.native_image_wire import NativeImageRead, NativeImageReceipt
     from shared_context.native_local_capabilities import NativeOwner
     from test_behavior_desktop import FakeRunner
-    from test_capability_live_mix_native import live_like_catalog
-    from test_conversation_profile_selection import template
+    from capability_live_mix_native_helpers import live_like_catalog
+    from conversation_profile_selection_helpers import template
 
     h = integrated
     catalog = live_like_catalog()
@@ -1658,3 +1658,66 @@ def test_saved_image_survives_original_child_cancel_and_remains_read_only_in_nat
         assert ui.get(path + "/" + entry["version_id"]).content == image.content
         assert h.call(h.runtime.read, rid) == receipt
         assert h.case.control.records == {}
+
+
+def test_cancelling_a_native_turn_aborts_its_running_shell_tool_and_the_conversation_goes_on(integrated, monkeypatch):
+    """Legacy shell cancel, natively: a cancel aborts the running run_command, the RID ends NATIVE_TURN_CANCELLED, and
+    a text-only follow-up in the same conversation completes.
+
+    The tool is a stand-in, so this does not prove the real shell stops its process or keeps its files."""
+    from shared_context import behavior_shell_capability as shell
+    from shared_context import native_local_capabilities
+    from shared_context.m2_copilot import ToolSpec
+
+    h = integrated
+    started, cancelled, requests = threading.Event(), [], []
+
+    def stand_in(owner, grant):
+        async def handle(packet):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+        tool = ToolSpec("run_command", "Run one bash command.", shell.RunCommandArguments.model_json_schema(), handle)
+        return (tool,), {tool.name: shell.CommandResult}
+
+    monkeypatch.setitem(native_local_capabilities.LOCAL_HANDLERS, shell.ENTRY_ID, stand_in)
+    grants = available_grants(None, (shell.ENTRY_ID,))
+    h.case.h.runtime.capability_grants = grants
+    role = assemble_prompt("fa-instruction-v3").record
+    refs = tuple(grants[name].ref for name in sorted(grants))
+    template = AgentTemplate(
+        role=TemplateRole(profile=role.profile, prefix_sha256=role.prefix_sha256,
+                          capability_catalog_version=role.capability_catalog_version),
+        settings=TemplateSettings(model_provider="openai-responses", capabilities=refs))
+    captured = project_capture(template, "selected-shell", h.case.control.models.select("gpt-4.1-mini"),
+                               head_refs=refs, head_selection_id="selected-shell", available=grants,
+                               count_tokens=lambda _: 0)
+
+    async def model(request):
+        requests.append(json.loads(request.content))
+        count = len(requests)
+        assert count <= 2
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=response_bytes(
+            count, tool="run_command" if count == 1 else None, arguments={"command": "sleep 60"}))
+
+    h.runtime.executor.model_transport = httpx.MockTransport(model)
+    first = NativeSubmit(command=InstructionSubmit(request_id="shell-long", content="Start the long command."),
+                         capture=captured)
+    assert h.invoke(first).status_code == 202
+    assert started.wait(60), (len(requests), h.errors, h.api_calls)
+    active = h.call(h.runtime.read, "shell-long")
+    assert h.invoke(NativeCancel(conversation_id=active.conversation_id, request_id="shell-long")).status_code == 200
+    stopped = h.call(h.finished, "shell-long")
+    assert stopped.status == "unknown" and stopped.failure_code == "NATIVE_TURN_CANCELLED"
+    assert cancelled == [True] and len(requests) == 1
+
+    follow = NativeSubmit(command=InstructionSubmit(request_id="after-cancel", conversation_id=active.conversation_id,
+                                                    content="Carry on."), capture=captured)
+    assert h.invoke(follow).status_code == 202
+    after = h.call(h.finished, "after-cancel")
+    assert after.status == "completed" and after.conversation_id == active.conversation_id, (
+        after.failure_code, h.errors)
+    assert len(requests) == 2
