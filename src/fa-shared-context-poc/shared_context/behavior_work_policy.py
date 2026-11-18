@@ -2,7 +2,6 @@
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass,field
 from datetime import datetime,timedelta
 from typing import Annotated,Literal
 from pydantic import Field,field_validator,model_validator
@@ -15,8 +14,8 @@ from .models import Identifier
 from .errors import Problem
 from .source_materials import digest
 from .behavior_auth import BehaviorPrincipal
-from .behavior_operations import OwnerRecord,PolicyRecord,BudgetRecord,_row,_write,_parse
-from .behavior_runtime import runtime_key,material,_PlanIndex
+from .behavior_operations import BudgetRecord, _row, _write, _parse
+from .behavior_runtime import runtime_key, material
 from .behavior_store import ControlRequest,ControlChanges,_READ_VIEW
 from .behavior_workers import worker_key,JobRecord,ExecutorStart
 from .behavior_assistant_wire import InstructionSubmit, InstructionTask, TEXT_CHECKS
@@ -342,16 +341,6 @@ class WorkRegistration(_Model):
         return self
 
 
-def registration_request_digest(record):
-    instruction=record.profile.instruction
-    peer=None if instruction is None else instruction.peer_work
-    return digest([record.request_id,record.submit_sha256,record.policy_sha256,
-        *(() if peer is None else (peer.model_dump(mode="json"),)),
-        *(() if record.routine is None else (record.routine.model_dump(mode="json"),)),
-        *(() if record.agent_vm is None else (record.agent_vm.model_dump(mode="json"),)),
-        *(() if record.agent_origin is None else (record.agent_origin.model_dump(mode="json"),))])
-
-
 def registered_instruction(record):
     task=record.profile.instruction
     return None if task is None else InstructionSubmit(request_id=record.request_id,content=task.content,
@@ -551,57 +540,6 @@ def derive_registered_work(policy,record,mode,*,profile_template=None):
         role_prompt=None if turn is None else turn.role_prompt,agent_origin=record.agent_origin)
 
 
-def check_dispatch_row(control,admission,binding,profile,work_policy,observation):
-    """Refuse an instruction before any write if its later worker dispatch row cannot fit one Table row.
-
-    Builds the WorkDispatchPermission row that WorkerCore.start writes, with the same models and store encoding,
-    the real task bytes and read-set shape, and every value that may still grow (generation, owner epoch, cost
-    counters, timestamps, evidence ID) at its maximum. The task (message, files, role text, capabilities) never changes.
-    """
-    import hashlib
-    from datetime import timezone
-    from .behavior_assistant_wire import Task
-    from .behavior_foundry import native_key
-    from .behavior_operations import ExecutionContext
-    from .behavior_store import _Row,_json
-    from .behavior_workers import ExecutorBinding,ExecutorStart
-    if type(observation) is not CostObservation:
-        return
-    raw=Task(job_id=binding.job_id,work_id=binding.work.work_id,definition_digest=digest(binding.work.model_dump(mode="json")),
-             profile_digest=digest(profile.model_dump(mode="json")),source=profile.source,artifact_id=profile.artifact_id,
-             artifact_version=profile.artifact_version,operation_id=binding.operation_id,
-             instruction=profile.instruction).model_dump_json().encode()
-    contract=control.runtime.dep.workers.contract
-    latest=datetime(9999,12,31,23,59,59,999999,tzinfo=timezone.utc)
-    owner=ExecutionContext(**{**{name:getattr(binding.owner,name) for name in ExecutionContext.model_fields},"epoch":2**63-1})
-    start_id=worker_key("start",binding.job_id,"8")
-    reads=(worker_key("pool",contract.workspace_id,binding.job_id),worker_key("job",binding.job_id),
-           control_key("budget",binding.owner.root_budget_id),control_key("owner",binding.owner.owner_record_id),
-           control_key("policy",binding.owner.policy_id),control.policy_key,control.revocation_key,control.cost_key,
-           work_policy_key("reservation",admission),work_policy_key("registration",admission),
-           runtime_key("policy",binding.binding_id),work_policy_key("dispatch",admission),
-           native_key("grant",native_key("bootstrap-grant",binding.job_id)))
-    start=ExecutorStart(binding=ExecutorBinding(job_id=binding.job_id,work_id=binding.work.work_id,generation=8,owner=owner,
-        executor_id=contract.executor_id,executor_version=contract.executor_version,
-        input_digest=hashlib.sha256(raw).hexdigest(),start_request_id=start_id),
-        request=ControlRequest(request_id=start_id,request_digest="f"*64,read_set=tuple(sorted(set(reads)))),input=raw)
-    most=2**63-1
-    permission=WorkDispatchPermission(admission_id=admission,start=start,
-        policy_after=PerWorkRuntimePolicy.model_validate({**work_policy.model_dump(),"stage":"dispatched",
-            "accepted_at":latest,"dispatched_at":latest,"valid_until":None}),
-        observation=observation.model_copy(update={"evidence_id":"E"*64,"observed_cumulative_microusd":most,
-            "legacy_unresolved_reserve_microusd":most,"observed_at":latest}))
-    data=permission.model_dump(mode="json")
-    size=len(_json(_Row(binding=control.store._binding,row_id=work_policy_key("dispatch",admission),
-                        data=data,material=material(data))))
-    limit=control.store._scope.max_payload_bytes
-    if size>limit:
-        raise Problem(413,"INSTRUCTION_TASK_TOO_LARGE",
-                      "the complete turn would not fit its stored dispatch record; no work was accepted",
-                      max_bytes=limit,actual_bytes=size)
-    return size
-
-
 # Standing-work and channel refreshes publish into the same runtime binding caches.
 _REFRESH_LOCK = threading.Lock()
 _REFRESHED = ContextVar("work_policy_refreshed_in_phase", default=None)
@@ -643,49 +581,6 @@ def _terminal_proof_differs(completed,job,launch):
     return (completed.state!=("stopped" if job.state=="cancelled" else job.state)
             or not completed.entire_tree_idle or not completed.all_inflight_starts_fenced
             or completed.evidence_id!=job.last_evidence_id or completed.native_execution_id!=launch.native_invocation_id)
-
-
-@dataclass(frozen=True)
-class _NewWork:
-    """What one new registration captured; its transaction rechecks every row read here."""
-    admission:str
-    binding:RuntimeBinding
-    profile:AssistantProfile
-    conversation:object=None
-    conversation_row:object=None
-    conversation_reads:tuple=()
-    environment_transfer:object=None
-    profile_choice:object=None
-    profile_reads:tuple=()
-    profile_snapshot:dict=field(default_factory=dict)
-    memory_snapshot:dict=field(default_factory=dict)
-    peer_snapshot:dict=field(default_factory=dict)
-    captured_vm:AgentVmBinding|None=None
-
-
-def _require_profile_head(snapshot,policy,expected,message):
-    from .behavior_profile_selection import ConversationProfileHead,head_key
-    row=snapshot[head_key(policy.authority_domain,policy.agent_id)]
-    selected=None if row is None else _parse(row.payload["data"],ConversationProfileHead).selection_id
-    if selected!=(None if expected is None else expected.selection_id):
-        raise Problem(409,"PROFILE_SELECTION_CONFLICT",message)
-
-
-def _require_admission_reads(current,work,admission_registry):
-    if work.conversation_reads and current[work.conversation_reads[0]]!=work.conversation_row:
-        raise Problem(412,"BEHAVIOR_CONFLICT","original conversation changed before admission")
-    if work.conversation is not None and work.conversation.jobs and any(
-            current[name]!=value for name,value in admission_registry.items()):
-        raise Problem(412,"BEHAVIOR_CONFLICT","the continuation registry changed before admission")
-    for snapshot,message in ((work.profile_snapshot,"approved profile selection changed before admission"),
-                             (work.memory_snapshot,"memory setting or selected note changed before admission"),
-                             (work.peer_snapshot,"the original peer assignment changed before registration")):
-        if any(current[key]!=value for key,value in snapshot.items()):
-            raise Problem(412,"BEHAVIOR_CONFLICT",message)
-
-
-def _model_capacity(profile,model):
-    return None if profile.model_capacity_profile is None else model.capacity_snapshot()
 
 
 def _reasoning_summary(profile,model):
@@ -785,20 +680,6 @@ class WorkPolicyControl:
                 and request.path_params.get("job_id")==self.records[binding].binding.job_id or
                 request.method=="POST" and path in {root+"/delivery/pull",root+"/delivery/acknowledge",
                     root+"/delivery/pull-continue",root+"/delivery/pull-reconcile"})
-
-
-    def submit(self,principal,command,*,routine=None,agent_vm=None):
-        import hashlib
-        from .behavior_assistant_wire import AssistantSubmit
-        if type(command) not in {AssistantSubmit,InstructionSubmit}:
-            raise Problem(422,"WORK_POLICY_COMMAND","original typed human submission required")
-        checked=type(command).model_validate_json(command.model_dump_json())
-        record=self.register(principal,checked.request_id,hashlib.sha256(checked.model_dump_json().encode()).hexdigest(),
-                             instruction=checked if type(checked) is InstructionSubmit else None,                             routine=routine,agent_vm=agent_vm)
-        jobkey=worker_key("job",record.binding.job_id)
-        if self.store.read_snapshot((jobkey,))[jobkey] is not None:
-            return record.binding,self.runtime.job_status(record.binding.binding_id,principal)
-        return record.binding,self.runtime.submit(record.binding.binding_id,checked,principal)
 
     def cancellation_receipt(self, principal, binding_id, generation):
         self._human(principal)
@@ -1156,318 +1037,6 @@ class WorkPolicyControl:
         policy=self.installed(rows)
         return cumulative_decision(policy,_row(rows,self.cost_key,CostLedger),self.cost_reader(),self.runtime._now(),
                                    read_id=read_id,mode=self.runtime.mode)
-
-    def source_ready(self,principal,policy):
-        context=self.runtime._reviewed_context(policy.template,policy.legacy_template_policy,principal,(policy.profile.claim_id,))
-        expected=self.runtime._reference(policy.profile.source,policy.template,policy.legacy_template_policy,principal)
-        if expected not in context.manifest.sources or not all(claim.human_reviewed for claim in context.claims):
-            raise Problem(403,"WORK_POLICY_SOURCE_UNAVAILABLE","the exact standing source needs its original human review")
-        return context
-
-    def conversation_memory(self,principal,conversation):
-        from .memory_bridge_settings import memory_for_conversation
-        return memory_for_conversation(self,principal,conversation)
-
-    def register(self,principal,request_id,submit_sha256,*,instruction=None,peer_work=None,routine=None,agent_vm=None):
-        from .behavior_work_registry import head_key
-        self._runtime_scope()
-        peer_root=None
-        if peer_work is None:
-            self._human(principal,"submit")
-        else:
-            from .behavior_agent_peer_work import authorize_registration
-            peer_root=authorize_registration(self,principal,peer_work,request_id,instruction)
-        registry_head=head_key(self.registry_key)
-        rows=self.store.read_snapshot((self.policy_key,self.revocation_key,self.cost_key,self.registry_key,registry_head))
-        admission_registry={name:rows[name] for name in (self.registry_key,registry_head)}
-        policy=self.installed(rows)
-        if routine is not None and (type(routine) is not RoutineOccurrence or peer_work is not None
-                                    or type(instruction) is not InstructionSubmit):
-            raise Problem(403,"ROUTINE_SOURCE_CHANGED","a routine requires its original owner instruction")
-        admission,binding,profile=derive_work(policy,request_id,self.runtime.mode)
-        key=work_policy_key("registration",admission)
-        prior=self.store.read_snapshot((key,))[key]
-        if prior is not None:
-            return self._replayed(prior,policy,principal,request_id,submit_sha256,peer_work,routine,agent_vm)
-        if routine is not None:
-            from .behavior_routine import validate_submission
-            validate_submission(policy,principal.oid,instruction,routine,now=self.runtime._now())
-        work=_NewWork(admission,binding,profile)
-        if instruction is not None and peer_work is None:
-            work=self._instruction_work(principal,policy,request_id,instruction,binding,rows,agent_vm)
-        elif peer_work is not None:
-            work=self._peer_work(policy,request_id,instruction,peer_work,peer_root)
-        policy=self._paid_policy(principal,policy,request_id,instruction,work)
-        now=self.runtime._now()
-        work_policy=self._per_work_policy(policy,work.admission,work.binding,work.profile,now,instruction is not None)
-        registered=WorkRegistration(admission_id=work.admission,request_id=request_id,submit_sha256=submit_sha256,
-            policy_id=policy.policy_id,policy_revision=policy.revision,policy_sha256=policy.sha256,
-            principal_oid=principal.oid,binding=work.binding,profile=work.profile,runtime_policy=work_policy,
-            hosted_session_id=None if work.conversation is None else work.conversation.hosted_session_id,
-            profile_selection_id=None if work.profile_choice is None else work.profile_choice.selection_id,
-            environment_transfer_id=None if work.environment_transfer is None else work.environment_transfer.transfer_id,
-            agent_scope=policy.agent_scope,routine=routine,
-            turn_authorization=None if instruction is None else TurnAuthorization(),agent_vm=work.captured_vm)
-        self._transact_registration(principal,policy,registered,work,instruction=instruction,routine=routine,
-            admission_registry=admission_registry,grant_writes=self._native_grant_writes(registered,now,instruction),
-            peer_root=peer_root)
-        self.records[registered.binding.binding_id]=registered
-        self.refresh(registered.binding.binding_id)
-        return registered
-
-    def _replayed(self,prior,policy,principal,request_id,submit_sha256,peer_work,routine,agent_vm):
-        """The same original request returns its saved work; anything that differs is refused."""
-        if not policy.active or not policy.read_enabled:
-            raise Problem(403,"WORK_POLICY_REVOKED","current original rights are revoked")
-        saved=_parse(prior.payload["data"],WorkRegistration)
-        if saved.request_id!=request_id or saved.submit_sha256!=submit_sha256 or saved.principal_oid!=principal.oid:
-            raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","same work ID has different original input")
-        if saved.routine!=routine:
-            raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","the original work has a different occurrence source")
-        if agent_vm is not None and saved.agent_vm!=agent_vm:
-            raise Problem(409,"WORK_POLICY_REQUEST_CONFLICT","the original request cannot be rebound to another VM")
-        if peer_work is not None and (saved.profile.instruction is None or saved.profile.instruction.peer_work!=peer_work):
-            raise Problem(409,"AGENT_MESSAGE_ASSIGNMENT_DENIED","the original receiver work has a different peer source")
-        self.records[saved.binding.binding_id]=saved
-        self.refresh(saved.binding.binding_id)
-        return saved
-
-    def _instruction_work(self,principal,policy,request_id,instruction,binding,rows,agent_vm):
-        """Capture one human turn: its conversation, profile, memory, capabilities, model and role prompt."""
-        from .behavior_agent_role_prompt_versions import captured_role_prompt
-        from .behavior_attachment_source import validate_admission
-        from .behavior_conversation_transfer import current_transfer
-        from .behavior_instruction import conversation_key
-        from .behavior_work_target import instruction_hosted_version
-        conversation,conversation_row=self._instruction_conversation(request_id,instruction,rows,agent_vm)
-        captured_vm=conversation.agent_vm
-        environment_transfer=current_transfer(self,conversation)
-        profile_choice,effective_profile,profile_reads,profile_snapshot=self._instruction_profile(policy,conversation)
-        captured=self.store.consistent_read(lambda:self.conversation_memory(principal,conversation))
-        if not conversation.jobs:
-            _require_profile_head(profile_snapshot,policy,profile_choice,"the new-conversation profile changed during admission")
-        capability_capture=None
-        if effective_profile.capabilities:
-            capability_capture,profile_reads,profile_snapshot=self._instruction_capabilities(
-                policy,conversation,effective_profile,profile_choice,profile_reads,profile_snapshot)
-        prompt_override=self._instruction_prompt_override(policy,conversation,profile_choice)
-        validate_admission(self,policy.model_copy(update={"profile":effective_profile}),principal,instruction,conversation)
-        if conversation_row is not None and captured_vm is None and self.runtime.mode=="native":
-            self._require_active_session(principal,conversation,binding)
-        selected_model,selected_capacity=self._instruction_model(instruction,effective_profile,capability_capture)
-        hosted_version=(captured_vm.hosted_agent_version if captured_vm is not None else
-                        instruction_hosted_version(self,conversation,existing=conversation_row is not None))
-        conversation=conversation.model_copy(update={"hosted_agent_version":hosted_version})
-        # Each turn captures the head at its own admission; later versions apply from the next turn on.
-        role_prompt=self.store.consistent_read(
-            lambda:captured_role_prompt(self.store,policy,effective_profile.prompt_profile))
-        admission,binding,profile=derive_work(policy,request_id,self.runtime.mode,instruction=instruction,
-            turn_number=len(conversation.jobs)+1,previous_archive_id=conversation.archive_id,model=selected_model.id,
-            hosted_agent_version=hosted_version,model_capacity=selected_capacity,prompt_override=prompt_override,
-            reasoning_summary=_reasoning_summary(effective_profile,selected_model),
-            profile_template=None if profile_choice is None else profile_choice.command.template,
-            memory_capture=captured.value,capability_capture=capability_capture,role_prompt=role_prompt)
-        return _NewWork(admission,binding,profile,conversation=conversation,conversation_row=conversation_row,
-            conversation_reads=(conversation_key(conversation.conversation_id),),
-            environment_transfer=environment_transfer,profile_choice=profile_choice,profile_reads=profile_reads,
-            profile_snapshot=profile_snapshot,memory_snapshot=captured.predicates,captured_vm=captured_vm)
-
-    def _instruction_conversation(self,request_id,instruction,rows,agent_vm):
-        if type(instruction) is not InstructionSubmit or instruction.request_id!=request_id:
-            raise Problem(422,"WORK_POLICY_COMMAND","original typed instruction required")
-        if instruction.images or instruction.uploads:
-            # Attached images and files reach the model only on native turns; never drop them silently here.
-            raise Problem(422,"WORK_POLICY_COMMAND","attached images and files need a native Agent turn")
-        from .behavior_instruction import instruction_state
-        conversation,conversation_row=instruction_state(self,instruction,registry_rows=rows)
-        if agent_vm is not None:
-            agent_vm=AgentVmBinding.model_validate_json(agent_vm.model_dump_json())
-            from .behavior_vm_assignment import capture_agent_vm
-            conversation=capture_agent_vm(self,conversation,conversation_row,agent_vm)
-        return conversation,conversation_row
-
-    def _instruction_profile(self,policy,conversation):
-        from .behavior_profile_selection import choice_for_conversation,head_key,selection_key,profile_from_template
-        profile_choice=self.store.consistent_read(lambda:choice_for_conversation(self,conversation))
-        effective_profile=policy.profile if profile_choice is None else profile_from_template(policy,profile_choice.command.template)
-        profile_reads=(() if conversation.jobs else (head_key(policy.authority_domain,policy.agent_id),)) + (
-            () if profile_choice is None else (selection_key(policy.authority_domain,profile_choice.selection_id,policy.agent_id),))
-        return profile_choice,effective_profile,profile_reads,self.store.read_snapshot(profile_reads)
-
-    def _instruction_capabilities(self,policy,conversation,effective_profile,profile_choice,profile_reads,profile_snapshot):
-        from .behavior_capabilities import capture as capture_capabilities,runtime_grants
-        from .behavior_profile_selection import current_selection,head_key,selection_key,profile_from_template
-        if profile_choice is None:
-            raise Problem(403,"CAPABILITY_SELECTION_REQUIRED","capabilities apply only through a human profile selection")
-        head=profile_choice
-        if conversation.jobs:
-            head=self.store.consistent_read(lambda:current_selection(self.store,policy))
-            extra=(head_key(policy.authority_domain,policy.agent_id),)+(
-                () if head is None or head.selection_id==profile_choice.selection_id
-                else (selection_key(policy.authority_domain,head.selection_id,policy.agent_id),))
-            profile_reads=tuple(dict.fromkeys((*profile_reads,*extra)))
-            profile_snapshot=self.store.read_snapshot(profile_reads)
-            _require_profile_head(profile_snapshot,policy,head,"the current profile selection changed during admission")
-        head_refs=() if head is None else profile_from_template(policy,head.command.template).capabilities
-        capture=capture_capabilities(effective_profile.capabilities,head_refs,
-            None if head is None else head.selection_id,runtime_grants(self.runtime))
-        return capture,profile_reads,profile_snapshot
-
-    def _instruction_prompt_override(self,policy,conversation,profile_choice):
-        if profile_choice is not None:
-            return None
-        if not conversation.jobs:
-            return configured_prompt_override(policy)
-        previous=self._job_record(conversation.jobs[-1])
-        if previous is None:
-            self.refresh()
-            previous=self._job_record(conversation.jobs[-1])
-        if (previous is None or previous.profile.instruction is None
-                or previous.profile.instruction.conversation_id!=conversation.conversation_id
-                or previous.profile.instruction.turn_number!=len(conversation.jobs)):
-            raise Problem(409,"CONVERSATION_CONTEXT_CHANGED","original conversation profile is unavailable")
-        return registered_prompt_override(policy,previous.profile)
-
-    def _require_active_session(self,principal,conversation,binding):
-        from .behavior_foundry import instruction_target
-        executor=self._session_executor()
-        target=instruction_target(self.runtime.dep.native_launches.targets[0],binding.job_id,
-            agent_version=conversation.hosted_agent_version,session_id=conversation.hosted_session_id)
-        original=executor.clients[target.executor_id]
-        client=original if original.target==target else original.for_target(target)
-        session=client.verify_session(before_send=lambda:self._human(principal,"submit"))
-        if session.status!="active":
-            # ADR-0009 §10: the metadata read wakes nothing, but a turn sent to an idle (reclaimed) SID makes
-            # the platform re-create it on an arbitrary version; reset or a new conversation stays explicit.
-            raise Problem(409,"CONVERSATION_SESSION_UNAVAILABLE",
-                "the original session is not active and is not woken; reset or new session must be explicit")
-
-    def _instruction_model(self,instruction,effective_profile,capability_capture):
-        from .behavior_capability_prompt import skill_access
-        selected_model=self.models.select(instruction.model)
-        if capability_capture is not None and capability_capture.vision and selected_model.supports_image_input is not True:
-            raise Problem(422,"CAPABILITY_MODEL_UNSUPPORTED","a selected capability needs a model that accepts images")
-        selected_model.require_provider(effective_profile.model_provider)
-        selected_capacity=_model_capacity(effective_profile,selected_model)
-        if (effective_profile.skill_catalog_budget_profile is not None
-                and skill_access(effective_profile.prompt_profile,capability_capture)):
-            from .behavior_skill_catalog import validate_catalog_budget
-            if selected_capacity is None:
-                raise Problem(503,"SKILL_CATALOG_CAPACITY_UNKNOWN","catalog budgeting requires declared model capacity")
-            validate_catalog_budget(selected_capacity,len(effective_profile.skill_artifacts),self.runtime.dep.memory._count)
-        return selected_model,selected_capacity
-
-    def _peer_work(self,policy,request_id,instruction,peer_work,peer_root):
-        from .behavior_agent_peer_work import peer_reads,narrow_profile
-        from .behavior_instruction import Conversation,conversation_key
-        peer_snapshot=self.store.read_snapshot(peer_reads(peer_root))
-        route=peer_root.directory.agents[1]
-        conversation=Conversation(conversation_id=route.conversation_id,human_oid=policy.template.human_oid,
-            team_id=policy.template.team_id,agent_oid=policy.template.agent_oid,sdk_session_id=route.sdk_session_id,
-            hosted_session_id=route.hosted_session_id,hosted_agent_version=peer_root.recipient_hosted_version)
-        conversation_reads=(conversation_key(route.conversation_id),)
-        conversation_row=self.store.read_snapshot(conversation_reads)[conversation_reads[0]]
-        if conversation_row is not None:
-            raise Problem(409,"AGENT_MESSAGE_HANDOFF_EXISTS","this root already has its original receiver conversation")
-        selected_model=self.models.select(instruction.model)
-        effective_profile=narrow_profile(policy.profile)
-        selected_model.require_provider(effective_profile.model_provider)
-        admission,binding,profile=derive_work(policy,request_id,self.runtime.mode,instruction=instruction,
-            model=selected_model.id,hosted_agent_version=peer_root.recipient_hosted_version,
-            model_capacity=_model_capacity(effective_profile,selected_model),peer_work=peer_work,
-            reasoning_summary=_reasoning_summary(effective_profile,selected_model))
-        return _NewWork(admission,binding,profile,conversation=conversation,conversation_reads=conversation_reads,
-            peer_snapshot=peer_snapshot)
-
-    def _paid_policy(self,principal,policy,request_id,instruction,work):
-        """The current policy, once a fresh cost observation allows this new paid work."""
-        observation=self.cost_reader()
-        if instruction is not None:
-            # Before the first write (the cost observation below): the later dispatch row must fit one Table row.
-            check_dispatch_row(self,work.admission,work.binding,work.profile,
-                self._per_work_policy(policy,work.admission,work.binding,work.profile,self.runtime._now(),True),observation)
-        self.observe_cost(observation,instruction=instruction is not None)
-        rows=self.store.read_snapshot((self.policy_key,self.revocation_key,self.cost_key,self.registry_key))
-        policy=self.installed(rows)
-        decision=cumulative_decision(policy,_row(rows,self.cost_key,CostLedger),observation,self.runtime._now(),
-                                     read_id=request_id,mode=self.runtime.mode,instruction=instruction is not None)
-        if decision.decision!="allow":
-            raise Problem(403,"WORK_POLICY_"+decision.reason.upper(),"new paid work is not authorized")
-        if instruction is None:self.source_ready(principal,policy)
-        return policy
-
-    def _native_grant_writes(self,registered,now,instruction):
-        if self.runtime.mode!="native":
-            return ()
-        import hashlib
-        from .behavior_foundry import NativeExecutionGrant,native_key,instruction_target
-        from .behavior_assistant_wire import Task
-        binding,profile,work_policy=registered.binding,registered.profile,registered.runtime_policy
-        native=self.runtime.dep.native_launches
-        if native is None:raise Problem(403,"WORK_POLICY_NATIVE_DISABLED","existing original native authority required")
-        task=Task(job_id=binding.job_id,work_id=binding.work.work_id,
-            definition_digest=digest(binding.work.model_dump(mode="json")),profile_digest=digest(profile.model_dump(mode="json")),
-            source=profile.source,artifact_id=profile.artifact_id,artifact_version=profile.artifact_version,
-            operation_id=binding.operation_id,instruction=profile.instruction)
-        gid=native_key("bootstrap-grant",binding.job_id)
-        grant=NativeExecutionGrant(grant_id=gid,controller_id=native.controller_id,owner=binding.owner,
-            policy_revision=work_policy.operation_policy_revision,job_id=binding.job_id,definition=binding.work,
-            input_digest=hashlib.sha256(task.model_dump_json().encode()).hexdigest(),
-            targets=tuple(instruction_target(t,binding.job_id,agent_version=profile.instruction.hosted_agent_version,
-                                            session_id=registered.hosted_session_id)
-                          for t in native.targets) if instruction is not None else native.targets,
-            active=True,remaining_uses=1,not_before=now,expires_at=work_policy.queue_deadline,workload_version="assistant-v1.2")
-        return (_write(native_key("grant",gid),grant,"create"),)
-
-    def _transact_registration(self,principal,policy,registered,work,*,instruction,routine,admission_registry,grant_writes,peer_root):
-        from .behavior_work_registry import transact
-        binding,admission,work_policy=registered.binding,registered.admission_id,registered.runtime_policy
-        key=work_policy_key("registration",admission)
-        ownerkey=control_key("owner",binding.owner.owner_record_id)
-        opkey=control_key("policy",binding.owner.policy_id)
-        rpkey=runtime_key("policy",binding.binding_id)
-        indexkey=runtime_key("plan-index",binding.binding_id)
-        request=ControlRequest(request_id=key,request_digest=registration_request_digest(registered),
-            read_set=tuple(dict.fromkeys((self.policy_key,self.revocation_key,self.cost_key,self.registry_key,key,
-                      ownerkey,opkey,rpkey,indexkey,*work.profile_reads,*work.conversation_reads,
-                      *work.memory_snapshot,*work.peer_snapshot))))
-        def changes(current):
-            from .behavior_work_registry import append_writes, count_registry
-            active=self.installed(current)
-            if routine is not None:
-                from .behavior_routine import validate_submission
-                validate_submission(active,principal.oid,instruction,routine,now=self.runtime._now())
-            _require_admission_reads(current,work,admission_registry)
-            if peer_root is not None:
-                from .behavior_delegation import _current_parent
-                _current_parent(current,peer_root.origin)
-            if active!=policy or any(current[k] is not None for k in (key,ownerkey,opkey,rpkey,indexkey)):
-                raise Problem(409,"WORK_POLICY_SCOPE_CHANGED","exact new registration changed")
-            if instruction is None and count_registry(self.store,policy,current)>=32:
-                raise Problem(429,"WORK_POLICY_CATALOG_CAPACITY","bounded retained registry capacity is exhausted")
-            from .behavior_instruction import registration_write
-            conversation_writes=() if work.conversation is None else (registration_write(work.conversation,binding.job_id),)
-            return ControlChanges(writes=(
-                _write(key,registered,"create",material(registered.model_dump(mode="json"))),
-                _write(ownerkey,OwnerRecord(**binding.owner.model_dump(),active=True,operation_ids=(binding.operation_id,)),"create"),
-                _write(opkey,PolicyRecord(policy_id=binding.owner.policy_id,revision=work_policy.operation_policy_revision,active=True),"create"),
-                _write(rpkey,work_policy,"create"),_write(indexkey,_PlanIndex(),"create"),
-                *append_writes(policy,current,admission),
-                *grant_writes,*conversation_writes,
-            ),result={"admission_id":admission,"binding_id":binding.binding_id,"not_yet_admitted":True})
-        transact(self.store,policy,request,changes,append=True)
-
-    def _per_work_policy(self,policy,admission,binding,profile,now,instruction):
-        fields=policy.legacy_template_policy.model_dump()
-        from .memory_bridge_settings import captured_policy_fields
-        fields.update(captured_policy_fields(profile.memory_scope))
-        fields.update(binding_digest=self.runtime.binding_digest(binding),valid_until=now+timedelta(seconds=policy.queue_seconds),
-            schema_version="fa-per-work-runtime-policy-v1",policy_id=policy.policy_id,policy_revision=policy.revision,
-            admission_id=admission,job_id=binding.job_id,stage="queued",accepted_at=now,
-            queue_deadline=now+timedelta(seconds=policy.queue_seconds),dispatched_at=None)
-        if instruction:
-            fields.update(instruction=True,valid_until=None,queue_deadline=None)
-        return PerWorkRuntimePolicy(**fields)
 
     def observe_cost(self,observation,*,instruction=False):
         self._runtime_scope()

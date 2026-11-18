@@ -9,7 +9,7 @@ import pytest
 from shared_context.behavior_capabilities import available_grants
 from shared_context.behavior_delegation import delegation_key, state_key
 from shared_context.behavior_delegation_wire import DelegationReply
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from conversation_profile_selection_helpers import select, template
 from instruction_flow_helpers import instruction_models, runtime_path
 from legacy_console_rows_helpers import load_rows, stored_console

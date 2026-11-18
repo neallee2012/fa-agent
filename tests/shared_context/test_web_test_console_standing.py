@@ -15,7 +15,7 @@ from conftest import TENANT
 from test_m3_auth import signing_key, jwk_client
 from test_web_test_console_browser_fixture import assistant_harness
 from work_policy_lifecycle_helpers import enabled
-from shared_context.behavior_assistant import _LocalHttp
+from local_http_helpers import _LocalHttp
 from shared_context.behavior_assistant_wire import AssistantSubmit
 from shared_context.behavior_work_policy import derive_work, CostLedger
 from shared_context.behavior_work_policy_api import install_work_policy_routes
@@ -34,14 +34,12 @@ def standing_client(auth, jwk_client, signing_key, tmp_path, monkeypatch):
     monkeypatch.setattr(assistant_sdk_fixture, "TENANT", TENANT)
     original = assistant_harness(auth, jwk_client, signing_key)
     h, control, human, observations = enabled(original, after_global=True)
-    executor = assistant_sdk_fixture.SdkProtocolExecutor(h)
-    h.workers.adapter = executor.adapter()
     composition = SimpleNamespace(runtime=h.runtime, verifier=h.verifier,
         installation=lambda: control.installed(),
         require_current_native_evidence=lambda: h.delivery._readiness())
     install_work_policy_routes(h.app, composition)
     local = _LocalHttp(h.client)
-    case = SimpleNamespace(h=h, control=control, human=human, facts=observations, executor=executor,
+    case = SimpleNamespace(h=h, control=control, human=human, facts=observations,
         calls=[], preflights=[], mutate=lambda path, response: response, lost=False, tmp=tmp_path)
     def send(request):
         assert request.url.host == "standing.example.org"

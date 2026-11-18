@@ -59,9 +59,9 @@ from pydantic import Field, JsonValue, TypeAdapter, ValidationError, field_valid
 from . import behavior_wire as wire
 from .behavior_auth import Action, BehaviorPrincipal
 from .behavior_delivery import (
-    AdmissionRequest, DeliveryBinding, DeliveryConsumer, DeliveryCore, IncomingEvent,
+    DeliveryBinding, DeliveryConsumer, DeliveryCore,
     Route, VerifiedIngress, WorkDefinition, _Obligation, _Outbox,
-    admission_digest, obligation_id_for,
+    obligation_id_for,
 )
 from .behavior_dispatch import ArtifactMetrics
 from .behavior_ingress import METRICS_SCHEMA, TEXT_SCHEMA, checked_human_text, require_text_consent
@@ -1028,68 +1028,6 @@ class BehaviorRuntime:
 
         return self.store.consistent_read(read)
 
-    def submit(self, binding_id, command: wire.SubmitWork, principal, *, reconcile=False):
-        binding, policy, context = self.authorize(binding_id, principal, "read" if reconcile else "submit")
-        plan = self._existing(binding, "admission", principal, command)
-        if plan is None:
-            if reconcile:
-                raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "original admission plan is missing")
-            now = self._now()
-            deadline = (None if getattr(policy,"instruction",False) else
-                        min(policy.valid_until, now + timedelta(seconds=self.dep.delivery.contract.max_queue_seconds)))
-            ingress_id = runtime_key("authenticated-ingress", binding.binding_id, command.request_id)
-            admission = AdmissionRequest(
-                event=IncomingEvent(event_id=binding.event_id, root_request_id=binding.root_request_id,
-                                    conversation_id=context.conversation_id, content=command.content.encode()),
-                work=binding.work, route=binding.route, required_confirmation_level="client_received",
-                deadline=deadline, expected_sequence=0, ingress_evidence_id=ingress_id,
-            )
-            registered = None if self.work_policy is None else self.work_policy.records.get(binding_id)
-            routine = None if registered is None else registered.routine
-            proof = VerifiedIngress(
-                evidence_id=ingress_id, admission_digest=admission_digest(admission),
-                verifier_version=self.dep.delivery.contract.verifier_version, actor_id=principal.source_actor_id,
-                on_behalf_of_principal_id=context.principal_id,
-                source_kind="routine" if routine is not None else "human" if principal.kind == "human" else "agent",
-                policy_revision=policy.operation_policy_revision, observed_at=now,
-                expires_at=deadline if deadline is not None else now+timedelta(seconds=self.dep.delivery.contract.max_queue_seconds),
-                proof=_json({"oid": principal.oid, "tenant_id": principal.tenant_id,
-                    "authentication": self.dep.evidence.authentication_version,
-                    **({} if routine is None else {"routine":routine.model_dump(mode="json")})}),
-            )
-            plan = self._save_plan(binding, "admission", principal, command, context,
-                                   {"admission": admission.model_dump(mode="json")}, self.dep.delivery.request_for(admission, context),
-                                   extra_writes=(_write(runtime_key("ingress", ingress_id), proof, "create",
-                                                        material(proof.model_dump(mode="json"))),))
-        admission = _parse(plan.data["admission"], AdmissionRequest)
-        if reconcile:
-            self.store.reconcile(plan.request)
-        else:
-            admit=lambda:self.dep.delivery.admit(admission,plan.context)
-            # An explicit same-command submit may complete its local admission EGT.
-            # This does not repeat a worker start, model call, or external effect.
-            original=(lambda:self.store._receipt(plan.request) or admit()) if getattr(policy,"instruction",False) else None
-            self._run(binding,plan,admit,reconcile=original)
-        self._enqueue(binding,principal,command,plan.context,
-                      retry_original=not reconcile and getattr(policy,"instruction",False))
-        return self.store.consistent_read(lambda: self.job_status(binding_id, principal), max_keys=None)
-
-    def _enqueue(self, binding, principal, command, context, *, retry_original=False):
-        worker = self.dep.workers
-        spec = JobSpec(job_id=binding.job_id, work_id=binding.work.work_id,
-                       input=self.job_input(binding), obligation_id=binding.obligation_id)
-        reads = (
-            worker_key("pool", worker.contract.workspace_id), worker_key("job", binding.job_id),
-            *worker._owner_keys(context), control_key("delivery-obligation", binding.obligation_id),
-            control_key("delivery-intent", control_key("delivery-intent-id", binding.event_id)),
-        )
-        request = worker._request("enqueue", (binding.job_id,), [spec.model_dump(mode="json"), context.model_dump(mode="json")], reads)
-        plan = self._save_plan(binding, "enqueue", principal, command, context,
-                               {"job": spec.model_dump(mode="json")}, request)
-        enqueue=lambda:worker.enqueue(_parse(plan.data["job"],JobSpec),plan.context)
-        original=(lambda:self.store._receipt(plan.request) or enqueue()) if retry_original else None
-        self._run(binding,plan,enqueue,reconcile=original)
-
     def job_input(self, binding: RuntimeBinding) -> bytes:
         """Server-only profile seam; the legacy checksum definition is unchanged."""
         return executor_job_input(binding.job_id, binding.work)
@@ -1154,9 +1092,7 @@ class BehaviorRuntime:
         elif job.state not in {"succeeded", "failed", "cancelled"}:
             if self.dep.workers.instruction(binding.job_id) and job.cancel_requested and job.stop_credit:
                 self.dep.workers.stop(binding.job_id,context)
-            elif not (self.dep.workers.instruction(binding.job_id) and not job.cancel_requested
-                      and job.owner == context and self.dep.native_launches is not None
-                      and self.dep.native_launches.instruction_recently_active(job)):
+            else:
                 self.dep.workers.reconcile(binding.job_id, context)
         job = self.dep.workers.inspect(binding.job_id)
         if job.state in {"succeeded", "failed", "cancelled"}:

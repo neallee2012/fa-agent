@@ -1,27 +1,19 @@
 """Trusted peer-message entry points; credentials and assignments stay server-side."""
 
 import logging
-from datetime import timedelta
 from typing import Literal
 
-from .behavior_agent_message_wire import (
-    CAPABILITY_ID, AgentMessageList, AgentMessageProjection, AgentMessageRead, AgentMessageRecipient,
-    PeerTeamReference, PublicAgentDirectory, PublicAgentEntry,
-)
-from .behavior_agent_messages import (
-    AgentAssignment, AgentDirectory, AgentMessageLedger, AgentRoute, RootSpec, root_key, root_state_key, _RootState,
-    message_key,
-)
+from .behavior_agent_message_wire import CAPABILITY_ID, AgentMessageList, AgentMessageProjection, AgentMessageRead, PeerTeamReference, PublicAgentDirectory, PublicAgentEntry
+from .behavior_agent_messages import AgentDirectory, AgentMessageLedger, AgentRoute, RootSpec, root_key, root_state_key, _RootState
 from .behavior_auth import BehaviorPrincipal
 from .behavior_capabilities import BUILTIN_CAPABILITIES, runtime_grants
-from .behavior_delegation import capture_parent, _current_parent, _parent_keys
-from .behavior_operations import _Model, _row, _write, control_key
+from .behavior_operations import _Model, _row, control_key
 from .behavior_runtime import material
-from .behavior_store import ControlChanges, ControlRequest, Digest
+from .behavior_store import ControlRequest, Digest
 from .behavior_wire import Identifier
 from .behavior_workers import ExecutorBinding
 from .errors import Problem
-from .source_materials import _payload_hash, digest
+from .source_materials import _payload_hash
 
 
 class AgentMessageOrigin(_Model):
@@ -52,24 +44,6 @@ class AgentCollaborationRoot(_Model):
 
 def collaboration_key(binding_id):
     return control_key("agent-collaboration-root", binding_id)
-
-
-def _composition(authority):
-    composition = getattr(authority.runtime, "agent_message_composition", None)
-    if composition is None:
-        raise Problem(503, "AGENT_MESSAGE_UNAVAILABLE", "the original peer composition is unavailable")
-    return getattr(composition, "_agent_message_owner", composition)
-
-
-def assignment_recipient(authority, binding, task):
-    capture = None if task.instruction is None else task.instruction.capabilities
-    if capture is None or not any(grant.entry_id == CAPABILITY_ID for grant in capture.grants):
-        return None
-    owner = _composition(authority)
-    if binding.agent_oid != owner.config.targets[0].agent_oid:
-        raise Problem(403, "AGENT_MESSAGE_ROUTE_DENIED", "only the original A assignment may address B")
-    target = owner.config.targets[1]
-    return AgentMessageRecipient(agent_id=target.agent_id, display_name=target.agent_name)
 
 
 def _captured(authority, session, *, current=True):
@@ -120,99 +94,6 @@ def _route(config, policy, *, conversation_id, hosted_session_id, sdk_session_id
         credential_binding_id=control_key("agent-credential-binding", target.agent_oid))
 
 
-def _new_root(authority, session, principal, recipient_agent_id):
-    from .behavior_instruction import hosted_session_id, sdk_session_id
-    from .behavior_work_target import instruction_hosted_version
-    owner = _composition(authority)
-    grant = _captured(authority, session)
-    binding, _, _ = authority.runtime.authorize(session.binding_id, principal, "execute")
-    origin = AgentMessageOrigin(**{
-        **capture_parent(authority, session, capability_sha256=grant.entry_sha256).model_dump(),
-        "capability_id": CAPABILITY_ID,
-    })
-    if (binding.agent_oid != owner.config.targets[0].agent_oid
-            or recipient_agent_id != owner.config.targets[1].agent_id):
-        raise Problem(403, "AGENT_MESSAGE_ROUTE_DENIED", "this scope permits only the original A-to-B-to-A pair")
-    control = authority.runtime.work_policy
-    record = control.records[binding.binding_id]
-    peer = owner.for_agent(recipient_agent_id)
-    recipient = peer.runtime.work_policy
-    recipient_policy = recipient.installed()
-    if not recipient_policy.active or not recipient_policy.read_enabled:
-        raise Problem(403, "AGENT_MESSAGE_ROUTE_DENIED", "the recipient has no current registered work/read authority")
-    version = instruction_hosted_version(recipient, None, existing=False)
-    if record.hosted_session_id is None:
-        raise Problem(403, "AGENT_MESSAGE_ASSIGNMENT_DENIED", "the original Hosted conversation is required")
-    cid = control_key("agent-collaboration-conversation", record.admission_id, recipient_agent_id)
-    directory = AgentDirectory(agents=(
-        _route(owner.config, control.policy, conversation_id=record.profile.instruction.conversation_id,
-               hosted_session_id=record.hosted_session_id, sdk_session_id=origin.sdk_session_id,
-               profile_sha256=origin.profile_sha256),
-        _route(owner.config, recipient_policy, conversation_id=cid, hosted_session_id=hosted_session_id(cid),
-               sdk_session_id=sdk_session_id(cid), profile_sha256=digest(recipient_policy.profile.model_dump(mode="json"))),
-    ))
-    source = record.profile.source
-    spec = RootSpec(
-        root_request_id=record.admission_id, origin_agent_id=directory.agents[0].agent_id,
-        origin_work_id=binding.work.work_id, origin_attempt_id=binding.attempt_id,
-        root_budget_id=binding.owner.root_budget_id, human_obligation_id=binding.obligation_id,
-        deadline=record.runtime_policy.accepted_at + timedelta(seconds=control.policy.queue_seconds),
-        max_messages=8, max_hops=2,
-        allowed_refs=(PeerTeamReference(resource_kind="source", tenant_id=binding.tenant_id, team_id=binding.team_id,
-                                       resource_id=source.source_id, version=str(source.version), sha256=source.sha256),))
-    if authority.runtime._now() >= spec.deadline:
-        raise Problem(403, "AGENT_MESSAGE_ROOT_EXPIRED", "the original peer work allowance has expired")
-    key = collaboration_key(binding.binding_id)
-    request = ControlRequest(
-        request_id=key, request_digest=digest([origin.model_dump(mode="json"), directory.model_dump(mode="json"),
-                                             spec.model_dump(mode="json"), recipient_policy.sha256, version]),
-        read_set=tuple(dict.fromkeys((*authority._keys(session), *_parent_keys(origin),
-                                    recipient.policy_key, recipient.revocation_key, key))))
-    value = AgentCollaborationRoot(origin=origin, directory=directory, spec=spec,
-                                  recipient_policy_sha256=recipient_policy.sha256, recipient_hosted_version=version,
-                                  request=request)
-
-    def decide(rows):
-        authority._gate(session, rows)
-        _current_parent(rows, origin)
-        if authority.runtime._now() >= spec.deadline:
-            raise Problem(403, "AGENT_MESSAGE_ROOT_EXPIRED", "the original peer work allowance has expired")
-        if recipient.installed(rows) != recipient_policy:
-            raise Problem(409, "AGENT_MESSAGE_ROUTE_DENIED", "the original recipient policy changed")
-        return ControlChanges(writes=(_write(key, value, "create", material(value.model_dump(mode="json"))),),
-                              result={"root_request_id": spec.root_request_id, "model_started": False})
-    authority.store.transact(request, decide)
-    return _read_root(authority.store, key)
-
-
-def _original_root(authority, session, principal, *, recipient_agent_id=None, new_message=None):
-    _captured(authority, session, current=recipient_agent_id is not None)
-    key = collaboration_key(session.binding_id)
-    row = authority.store.read_snapshot((key,))[key]
-    if row is None:
-        if recipient_agent_id is None:
-            raise Problem(503, "AGENT_MESSAGE_UNKNOWN", "the original message root has not been confirmed")
-        if new_message is None or new_message.in_reply_to is not None or new_message.kind not in {"request", "handoff", "fyi"}:
-            raise Problem(403, "AGENT_MESSAGE_REPLY_DENIED", "a reply requires this assignment's existing original root")
-        root = _new_root(authority, session, principal, recipient_agent_id)
-    else:
-        root = _read_root(authority.store, key)
-    if (root.origin.binding_id != session.binding_id or root.origin.session_id != session.assignment.session_id
-            or root.origin.execution != session.execution):
-        raise Problem(403, "AGENT_MESSAGE_ASSIGNMENT_DENIED", "the message root belongs to another original assignment")
-    peer = _composition(authority).for_agent(root.directory.agents[1].agent_id)
-    policy = peer.runtime.work_policy.installed()
-    if not policy.active or not policy.read_enabled or policy.sha256 != root.recipient_policy_sha256:
-        raise Problem(403, "AGENT_MESSAGE_ROUTE_DENIED", "the original recipient's current read/work authority differs")
-    ledger = AgentMessageLedger(authority.store, root.directory, clock=authority.runtime._now)
-    ledger_key = root_key(root.spec.root_request_id)
-    if authority.store.read_snapshot((ledger_key,))[ledger_key] is None:
-        if recipient_agent_id is None:
-            raise Problem(503, "AGENT_MESSAGE_UNKNOWN", "the original ledger root has not been confirmed")
-        ledger.register_root(root.spec)
-    return root, ledger, peer
-
-
 def _receiver_record(root, ledger, peer, *, identifier=None):
     from .behavior_work_policy import WorkRegistration, derive_work_binding, work_policy_key
     if identifier is None:
@@ -225,31 +106,6 @@ def _receiver_record(root, ledger, peer, *, identifier=None):
     key = work_policy_key("registration", admission)
     rows = peer.runtime.store.read_snapshot((key,))
     return None if rows[key] is None else _row(rows, key, WorkRegistration)
-
-
-def _prepare_receiver(authority, session, principal, root, ledger, peer, command):
-    from .behavior_assistant_wire import InstructionSubmit, PeerWorkReference
-    if command.kind not in {"request", "handoff"}:
-        return _receiver_record(root, ledger, peer)
-    identifier = message_key(root.spec.root_request_id, root.spec.origin_agent_id, command.message_id)
-    state, _ = ledger._verified(root_state_key(root.spec.root_request_id), _RootState)
-    if state.handoff_message_id is not None and state.handoff_message_id != identifier:
-        raise Problem(409, "AGENT_MESSAGE_HANDOFF_EXISTS", "the original receiver work is already retained")
-    existing = _receiver_record(root, ledger, peer, identifier=identifier)
-    if existing is not None:
-        if existing.submit_sha256 != digest(command.model_dump(mode="json")):
-            raise Problem(409, "AGENT_MESSAGE_ORIGINAL_REQUIRED", "the original peer work has different input")
-        return existing
-    reference = PeerWorkReference(
-        root_id=root.request.request_id, message_id=command.message_id, message_key=identifier,
-        message_sha256=digest(command.model_dump(mode="json")), content_sha256=digest(command.content),
-        sender_agent_id=root.spec.origin_agent_id, recipient_agent_id=command.recipient_agent_id,
-        recipient_work_id=control_key("agent-message-contract-work", identifier, command.recipient_agent_id),
-        conversation_id=root.directory.agents[1].conversation_id)
-    instruction = InstructionSubmit(request_id=identifier, content=command.content,
-                                    model=session.assignment.task.instruction.model)
-    return peer.runtime.work_policy.register(principal, identifier, reference.message_sha256,
-                                            instruction=instruction, peer_work=reference)
 
 
 def _references(authority, session, principal, root, peer, refs, receiver):
@@ -315,53 +171,6 @@ def _receiver_busy(peer, receiver, *, for_dispatch=False):
             if rows[key] is None or _row(rows, key, JobRecord).state not in {"succeeded", "failed", "cancelled"}:
                 return True
     return False
-
-
-def send(authority, session, command, principal):
-    from .behavior_assistant import _read_conflicts
-    root, ledger, peer = _original_root(authority, session, principal,
-                                        recipient_agent_id=command.message.recipient_agent_id, new_message=command.message)
-    assignment = AgentAssignment(
-        root_request_id=root.spec.root_request_id, agent_id=root.spec.origin_agent_id,
-        work_id=session.execution.work_id, attempt_id=root.spec.origin_attempt_id)
-    if any(ref not in root.spec.allowed_refs for ref in command.message.refs):
-        raise Problem(403, "AGENT_MESSAGE_SHARE_DENIED", "the message cannot add sources to the original approved root")
-    if any(ref.resource_kind == "source" and ref.resource_id not in peer.runtime.work_policy.policy.template.source_ids
-           for ref in command.message.refs):
-        raise Problem(403, "AGENT_MESSAGE_SHARE_DENIED", "the original receiver policy does not include this source")
-    if command.message.kind in {"request", "handoff"}:
-        ledger.check_handoff(principal, assignment, command.message)
-    if command.message.refs:
-        from .behavior_agent_message_refs import preflight_team_refs
-        _read_conflicts(lambda: preflight_team_refs(
-            sender_authority=authority, sender_binding=authority._binding(session), sender_principal=principal,
-            receiver_authority=peer.assistant.authority, receiver_policy=peer.runtime.work_policy.installed(),
-            refs=command.message.refs, allowed_refs=root.spec.allowed_refs), phase="peer_reference_preflight")
-    identifier = (message_key(root.spec.root_request_id, root.spec.origin_agent_id, command.message.message_id)
-                  if command.message.kind in {"request", "handoff"} else None)
-    existing = _receiver_record(root, ledger, peer, identifier=identifier)
-    busy = _receiver_busy(peer, existing)
-    receiver = _prepare_receiver(authority, session, principal, root, ledger, peer, command.message)
-
-    def current():
-        _captured(authority, session)
-        authority._gate(session, authority.store.read_snapshot(authority._keys(session)))
-        _references(authority, session, principal, root, peer, command.message.refs, receiver)
-        if peer.runtime.work_policy.installed().sha256 != root.recipient_policy_sha256:
-            raise Problem(403, "AGENT_MESSAGE_ROUTE_DENIED", "the recipient policy changed before saving")
-    _read_conflicts(current, phase="peer_reference_current")
-    result = authority.store.validated_writes(
-        lambda: ledger.send_recorded(principal, assignment, command.message, receiver_busy=busy), current)
-    return _result(root, ledger, result.view, fresh=result.fresh)
-
-
-def read(authority, session, command, principal):
-    root, ledger, peer = _original_root(authority, session, principal)
-    result = ledger.read(principal, command.message_key)
-    if result.message.root_request_id != root.spec.root_request_id:
-        raise Problem(403, "AGENT_MESSAGE_ASSIGNMENT_DENIED", "the requested message belongs to another root")
-    _references(authority, session, principal, root, peer, result.command.refs, _receiver_record(root, ledger, peer))
-    return _result(root, ledger, result)
 
 
 def public_messages(composition, principal, binding_id):

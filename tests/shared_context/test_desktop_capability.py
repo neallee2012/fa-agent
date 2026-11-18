@@ -14,7 +14,7 @@ from shared_context.behavior_desktop import DESKTOP_LOCK, OwnedDesktop
 from shared_context.behavior_desktop_tools import DesktopFileRead, DesktopObservation, DesktopToolbox
 from shared_context.errors import Problem
 from shared_context.m2_copilot import ToolFailure
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from test_behavior_desktop import FakeRunner
 from capability_capture_helpers import GRANTS
 from instruction_flow_helpers import instruction_models

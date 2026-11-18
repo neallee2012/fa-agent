@@ -4,8 +4,8 @@ import pytest
 
 from shared_context.behavior_operations import control_key
 from shared_context.behavior_work_policy import work_policy_key
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path
+from assistant_api_helpers import assistant_api
+from instruction_flow_helpers import instruction_models
 from test_instruction_text_files import configured_files
 from test_m3_auth import jwk_client, signing_key
 from stored_turn_context_helpers import load_case
@@ -23,8 +23,8 @@ def stored_prepared(h, saved=False):
 
 
 @pytest.mark.parametrize("kind", ["file", "reply", "context"])
-def test_warm_file_read_uses_one_original_registration_and_no_unrelated_work(assistant, monkeypatch, kind):
-    h, _, target, unrelated, route = stored_prepared(assistant, saved=kind != "file")
+def test_warm_file_read_uses_one_original_registration_and_no_unrelated_work(assistant_api, monkeypatch, kind):
+    h, _, target, unrelated, route = stored_prepared(assistant_api, saved=kind != "file")
     if kind != "file":
         route = route.rsplit("/files/", 1)[0] + "/" + kind
     h.transport.requests.clear()
@@ -40,8 +40,8 @@ def test_warm_file_read_uses_one_original_registration_and_no_unrelated_work(ass
 
 
 @pytest.mark.parametrize("change", ["owner", "registration", "registry"])
-def test_cached_original_work_is_never_cached_read_authority(assistant, change):
-    h, control, target, _, route = stored_prepared(assistant)
+def test_cached_original_work_is_never_cached_read_authority(assistant_api, change):
+    h, control, target, _, route = stored_prepared(assistant_api)
     assert h.client.get(route, headers=h.headers("read-only")).status_code == 200
     if change == "owner":
         h.mutate(control_key("owner", target.binding.owner.owner_record_id), active=False)
@@ -62,8 +62,8 @@ def test_cached_original_work_is_never_cached_read_authority(assistant, change):
     assert b"Original file bytes." not in denied.content and h.store._guard() == before
 
 
-def test_cold_cache_loads_original_registration_without_inventing_a_replacement(assistant):
-    h, control, _, _, route = stored_prepared(assistant)
+def test_cold_cache_loads_original_registration_without_inventing_a_replacement(assistant_api):
+    h, control, _, _, route = stored_prepared(assistant_api)
     control.records.clear()
     result = h.client.get(route, headers=h.headers("read-only"))
     assert result.status_code == 200 and result.content == b"Original file bytes."

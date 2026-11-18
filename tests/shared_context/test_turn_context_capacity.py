@@ -11,9 +11,9 @@ import pytest
 
 from shared_context.behavior_model_capacity import DeclaredModelLimits, ModelCapacitySnapshot
 from shared_context.behavior_turn_context import TurnContext
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from test_instruction_capacity import configured_capacity, declared_facts
-from test_instruction_flow import instruction_models, runtime_path
+from instruction_flow_helpers import instruction_models, runtime_path
 from instruction_prompt_helpers import sdk_options
 from test_m3_auth import jwk_client, signing_key
 from test_web_test_console_frozen_interface import real_interface
@@ -24,9 +24,9 @@ def context_path(conversation_id, turn):
     return f"/work-policy/v1/conversations/{conversation_id}/turns/{turn}/context"
 
 
-def test_context_reports_each_turns_registered_capacity_not_the_latest_model(assistant, monkeypatch):
+def test_context_reports_each_turns_registered_capacity_not_the_latest_model(assistant_api, monkeypatch):
     declared_facts(monkeypatch)
-    h, control, _ = configured_capacity(assistant)
+    h, control, _ = configured_capacity(assistant_api)
     calls, _ = sdk_options(monkeypatch)
     facts = load_case(h, "context-capacity-two-turns")
     first, second = facts["first"], facts["second"]
@@ -56,11 +56,11 @@ PARTIAL_LIMITS = ({}, {"max_prompt_tokens": 10000}, {"context_window_tokens": 12
 
 
 @pytest.mark.parametrize("limits", PARTIAL_LIMITS)
-def test_context_keeps_missing_declared_limits_unknown_without_estimation(assistant, monkeypatch, limits):
+def test_context_keeps_missing_declared_limits_unknown_without_estimation(assistant_api, monkeypatch, limits):
     Path(os.environ["FA_INSTRUCTION_MODEL_FACTS_FILE"]).write_text(
         json.dumps({"gpt-4.1-mini": limits}), encoding="utf-8",
     )
-    h, control, _ = configured_capacity(assistant)
+    h, control, _ = configured_capacity(assistant_api)
     accepted = load_case(h, f"context-capacity-partial-{PARTIAL_LIMITS.index(limits)}")["accepted"]
     control.refresh()
     response = h.client.get(context_path(accepted["conversation_id"], 1), headers=h.headers())

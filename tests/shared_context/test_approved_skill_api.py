@@ -17,7 +17,7 @@ from shared_context.behavior_native_capability_wire import NATIVE_CAPABILITY_PRE
 from shared_context.behavior_skill_prompt import SkillPromptAssemblyRecord, assemble_prompt
 from shared_context.errors import Problem
 from shared_context.m3_models import CreateArtifact
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key

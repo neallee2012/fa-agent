@@ -4967,10 +4967,12 @@ const HITL_WRAPPER_PROGRAMS=new Set(["sh","bash","zsh","dash","ksh","fish","busy
   "timeout","nice","watch","time","setsid","strace","chroot","exec","eval","source",".","ssh","npx","python","node",
   "perl","ruby","php","lua","py","pythonw","wsl"]);
 // Two deterministic drafts for allow_rule (Neal 2026-11-05, D1=C): exact pins this call, kind widens it; no model call.
+// A navigate call starts on its website draft (Neal 2026-11-18): its URL changes every time, so a pinned rule rarely matches again.
 function hitlRuleDrafts(action){
   const name=attentionAgentName(action.call.agent_id),arguments_=action.arguments;
   const location=typeof arguments_?.cwd==="string"?arguments_.cwd:action.target;
   const shell=action.category==="shell"&&typeof arguments_?.command==="string";
+  const navigate=!shell&&/navigate/i.test(action.tool)&&arguments_?.url!==undefined;
   const exact=shell?`允許 ${name} 在 ${JSON.stringify(location)} 執行指定命令 ${JSON.stringify(arguments_.command)}。`:
     `允許 ${name} 使用 ${action.tool}，目標限於 ${JSON.stringify(action.target)}，參數限定為 ${JSON.stringify(arguments_)}。`;
   const kind=(()=>{
@@ -4983,7 +4985,7 @@ function hitlRuleDrafts(action){
       if(HITL_WRAPPER_PROGRAMS.has(base||program))return {why:`${program} 可以再執行任何命令，不能只看程式名稱放行。`};
       return {text:`允許 ${name} 在 ${JSON.stringify(location)} 執行 ${program} 程式（參數不限）。`};
     }
-    if(/navigate/i.test(action.tool)&&arguments_?.url!==undefined){
+    if(navigate){
       if(Object.keys(arguments_).some(key=>key!=="url"))return {why:"這個開網頁動作除了網址還有其他參數，不能只看網站放行。"};
       let url=null;try{url=typeof arguments_.url==="string"?new URL(arguments_.url):null}catch{}
       if(!url||!["http:","https:"].includes(url.protocol))return {why:"網址不是可解析的 http／https 網站，無法歸成一個網站。"};
@@ -4993,7 +4995,8 @@ function hitlRuleDrafts(action){
     return {text:`允許 ${name} 使用 ${action.tool}，目標限於 ${JSON.stringify(action.target)}，參數不限。`};
   })();
   const fits=text=>[...text].length<=512,tooLong=kind.text&&!fits(kind.text);
-  return {exact:fits(exact)?exact:"",kind:tooLong?"":kind.text||"",why:tooLong?"較寬的草稿超過 512 字。":kind.why||""};
+  const drafts={exact:fits(exact)?exact:"",kind:tooLong?"":kind.text||"",why:tooLong?"較寬的草稿超過 512 字。":kind.why||""};
+  return {...drafts,first:navigate&&drafts.kind||drafts.exact};
 }
 // A routine card (propose_routine) shows the exact daily draft an allow saves; only the owner's click schedules it.
 const ROUTINE_CARD_REASON="排程一律要你在這張卡上按「允許這次」；助理說的話或你在對話裡的回覆都不算批准。"+
@@ -5196,7 +5199,7 @@ function renderHitlCard(reference,label,thread,item=null,entry=null){
       if(choice==="allow_rule"&&!ruleOpen){
         if(!hitlCanDecide(value,target))return;
         hitlRuleEditorsOpen.add(pid);
-        if(!hitlAllowDrafts.has(draftKey))hitlAllowDrafts.set(draftKey,hitlRuleDrafts(action).exact);
+        if(!hitlAllowDrafts.has(draftKey))hitlAllowDrafts.set(draftKey,hitlRuleDrafts(action).first);
         render();hitlEditors.get(pid)?.focus?.();return;
       }
       // Every button of this card is disabled in the same redraw (the card becomes its record).

@@ -9,10 +9,10 @@ import pytest
 from shared_context.behavior_assistant_wire import AssistantSubmit, InstructionSubmit, Task
 from shared_context.behavior_work_policy import derive_work
 from shared_context.behavior_work_policy_api import install_work_policy_routes
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models
+from assistant_api_helpers import assistant_api
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
-from test_work_policy_lifecycle import enabled
+from work_policy_lifecycle_helpers import enabled
 
 
 @pytest.fixture
@@ -20,8 +20,8 @@ def runtime_path():
     return Path(__file__)  # Admission only: no runtime, provider or model is started.
 
 
-def route(assistant):
-    h, control, human, _ = enabled(assistant)
+def route(assistant_api):
+    h, control, human, _ = enabled(assistant_api)
     install_work_policy_routes(h.app, SimpleNamespace(
         runtime=h.runtime, verifier=h.verifier, installation=lambda: None,
     ))

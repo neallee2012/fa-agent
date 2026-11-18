@@ -47,6 +47,7 @@ from shared_context.source_materials import NativeConfigurationEvidence, SourceS
 from test_backup_store import BlobTransport
 from test_behavior_store import Credential, WireTransport
 from test_m3_auth import jwk_client, signing_key, token
+from legacy_replay_helpers import legacy_tokens, pinned_configuration, replayed
 from test_memory_projection import Transport as MemoryTransport
 from test_source_backup import (
     BACKUP_HUMAN, ETAG, NATIVE_VERSION, SETTINGS, archive_from_plan,
@@ -218,13 +219,6 @@ class Harness:
     def headers(self, key, scopes="Behavior.Read"):
         c = self.config.identity
         return {"Authorization": "Bearer " + token(key, {"oid": c.human_oid, "appid": c.admin_client_id, "scp": scopes})}
-
-    def submit(self):
-        c = self.config.identity
-        principal = BehaviorPrincipal(c.tenant_id, c.human_oid, c.team_id, "human", None, frozenset({"read", "submit"}))
-        for binding in self.config.bindings:
-            status = self.runtime.submit(binding.binding_id, wire.SubmitWork(request_id="submit-" + binding.binding_id), principal)
-            assert status.state == "queued"
 
     def mutate(self, key, **updates):
         row = self.runtime.store.read_snapshot((key,))[key].payload
@@ -472,9 +466,9 @@ def test_native_gate_refuses_incomplete_expired_or_mismatched_catalog(h, change)
     assert not h.table.requests
 
 
-def test_four_exact_targets_fifth_queue_and_query_before_start_local_only(h):
+def test_four_exact_targets_fifth_queue_and_query_before_start_local_only(legacy_tokens, pinned_configuration, h):
     h.activate()
-    h.submit()
+    replayed(h)  # "submit-<binding>" of every configured binding, queued by the retired BehaviorRuntime.submit
     first = h.runtime.controller.drain(limit=5)
     assert len(first) == 5 and len(h.calls) == 4
     assert {r.url.path.split("/agents/")[1].split("/")[0] for r in h.calls} == {t.agent_name for t in h.config.targets}
@@ -488,9 +482,9 @@ def test_four_exact_targets_fifth_queue_and_query_before_start_local_only(h):
     assert all(r.method == "GET" for r in h.calls[4:])
 
 
-def test_configured_operation_alias_resolves_only_its_native_current_work_etag(h):
+def test_configured_operation_alias_resolves_only_its_native_current_work_etag(legacy_tokens, pinned_configuration, h):
     h.activate()
-    h.submit()
+    replayed(h)  # "submit-<binding>" of every configured binding, admitted by the retired BehaviorRuntime.submit
     adapter = h.runtime.dep.broker.dispatcher.adapter
     alias = h.config.operations[0]
     resolved = adapter.references[alias.input_ref]

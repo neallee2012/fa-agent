@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
-from .behavior_operations import _Model, _row, _write, control_key
+from .behavior_operations import _Model, _row, control_key
 from .behavior_store import Digest
 from .errors import Problem
 from .models import Identifier
@@ -97,11 +97,6 @@ def _basis(get_rows, policy, rows=None):
     return _parts(policy, rows)
 
 
-def count_registry(store, policy, rows=None):
-    legacy, head = _basis(store.read_snapshot, policy, rows)
-    return len(legacy.entries) + (0 if head is None else head.entry_count)
-
-
 def _read(get_rows, policy, rows=None):
     from .behavior_work_policy import WorkRegistry
     key = index_key(policy)
@@ -157,35 +152,4 @@ def append_read_keys(policy, rows):
         return (hkey,)
     number = 1 if head is None else head.page_count
     return (hkey, page_key(key, number), page_key(key, number + 1))
-
-
-def append_writes(policy, rows, admission):
-    key, hkey = index_key(policy), head_key(index_key(policy))
-    legacy, head = _parts(policy, rows)
-    if head is None and not writer_enabled():
-        return (_write(key, legacy.model_copy(update={"entries": (*legacy.entries, admission)}), "replace"),)
-    if not writer_enabled():
-        raise Problem(503, "WORK_REGISTRY_WRITER_DISABLED",
-                      "registry pages are retained; enable the compatible writer for new registration")
-    number = 1 if head is None else head.page_count
-    pkey = page_key(key, number)
-    page = None if rows[pkey] is None else _value(rows, pkey, WorkRegistryPage, policy)
-    if page is not None:
-        _require(head is not None and page.index_key == key and page.number == number
-                 and len(page.entries) == (head.entry_count - 1) % PAGE_SIZE + 1)
-        if len(page.entries) == PAGE_SIZE:
-            number += 1
-            pkey = page_key(key, number)
-            _require(rows[pkey] is None)
-            page = None
-    else:
-        _require(head is None)
-    entries = () if page is None else page.entries
-    _require(admission not in legacy.entries and admission not in entries)
-    page = WorkRegistryPage(index_key=key, number=number, entries=(*entries, admission))
-    head = WorkRegistryHead(index_key=key, policy_id=policy.policy_id, policy_sha256=policy.sha256,
-        legacy_sha256=_payload_hash(rows[key].payload), entry_count=1 if head is None else head.entry_count + 1,
-        page_count=number)
-    return (_write(pkey, page, "create" if rows[pkey] is None else "replace"),
-            _write(hkey, head, "create" if rows[hkey] is None else "replace"))
 

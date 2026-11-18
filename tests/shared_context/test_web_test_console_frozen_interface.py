@@ -18,13 +18,11 @@ from instruction_flow_helpers import instruction_models
 from work_policy_lifecycle_helpers import enabled
 from web_test_console_standing_helpers import configuration
 from shared_context import behavior_assistant_wire as aw
-from shared_context.behavior_assistant import _LocalHttp
-from shared_context.behavior_assistant_hosted import AssistantClient, AssistantSession
+from local_http_helpers import _LocalHttp
 from shared_context.behavior_assistant_checkpoint import unpack
-from shared_context.behavior_checkpoint_privacy import jsonl_lines
 from shared_context.behavior_instruction_models import InstructionModels
 from shared_context.behavior_operations import control_key
-from shared_context.behavior_workers import ExecutorAdapter, ExecutorEvidence
+from shared_context.behavior_workers import ExecutorAdapter
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from web_test_console.adapter import parse_config, canonical, sha
@@ -50,7 +48,7 @@ def test_sidebar_agent_is_derived_from_the_actual_bound_configuration(picker_api
 
 
 @pytest.fixture
-def real_interface(auth,jwk_client,signing_key,tmp_path,tmp_path_factory,monkeypatch):
+def real_interface(auth,jwk_client,signing_key,tmp_path,monkeypatch):
     from shared_context.behavior_code_identity import code_sha256 as core_code_sha256
     current_core=core_code_sha256()
     import assistant_sdk_fixture
@@ -70,64 +68,12 @@ def real_interface(auth,jwk_client,signing_key,tmp_path,tmp_path_factory,monkeyp
         mutate=lambda req,res:res,lost=False,reply_text=None)
     c.connection=InstructionConnection(schema_version="fa-console-instructions-connection-v1",
         configuration_sha256=c.config.sha256,backend_core_sha256=current_core)
-    # Keep the SDK's nested 64-character session path out of the long test-name directory.
-    sdk_root=tmp_path_factory.mktemp("sdk")
-
-    async def sdk_io_inner(**options):
-        # Actual AssistantSession chooses prompt/model/resume and restores the
-        # original archive before this I/O-only substitute is entered.
-        sid=options["sdk_session_id"];folder=options["state_dir"]/"config"/"session-state"/sid
-        fs=options.get("session_files")
-        prior=[]
-        if options["resume"]:
-            raw=await fs.read_file("/session-state/events.jsonl") if fs is not None else (folder/"events.jsonl").read_text(encoding="utf-8")
-            prior=[json.loads(line) for line in jsonl_lines(raw)]
-            assert prior[0]["data"]["sessionId"]==sid
-        else:
-            assert not folder.exists()
-            if fs is None:folder.mkdir(parents=True)
-            prior=[{"type":"session.start","data":{"sessionId":sid}}]
-        c.sdk_calls.append({"sid":sid,"resume":options["resume"],"model":options["model"],"prompt":options["prompt"],
-            "prior_user_messages":[e["data"]["content"] for e in prior if e["type"]=="user.message"],
-            "timeout_seconds":options["timeout_seconds"]})
-        text=c.reply_text if c.reply_text is not None else "OFFLINE SDK I/O substitute reply "+str(len(c.sdk_calls))
-        entries=prior+[{"type":"user.message","data":{"content":options["prompt"]}},
-                       {"type":"assistant.message","data":{"content":text}}]
-        serialized="\n".join(json.dumps(e,ensure_ascii=False) for e in entries)
-        if fs is not None:
-            await fs.write_file("/session-state/events.jsonl",serialized)
-            await fs.write_file("/session-state/workspace.yaml","offline: true\n")
-        else:
-            (folder/"events.jsonl").write_text(serialized,encoding="utf-8")
-            (folder/"workspace.yaml").write_text("offline: true\n",encoding="utf-8")
-        return {"final_message":text,"sdk_stop":aw.AssistantSdkStop(pid=123,exit_code=0,graceful=True)}
-    async def sdk_io(**options):
-        try:return await sdk_io_inner(**options)
-        except Exception as error:
-            c.sdk_errors.append(error)
-            raise
-    monkeypatch.setattr("shared_context.behavior_assistant_hosted.run_copilot",sdk_io)
-
     def start(request):
-        try:
-            c.starts.append(request)
-            assignment,ticket=h.assistant.issue(request)
-            client=AssistantClient("https://interface.example",assignment,ticket,
-                token_provider=lambda:h.headers("agent")["Authorization"][7:],transport=local)
-            try:
-                session=AssistantSession(client,root=sdk_root/str(len(c.starts)),
-                                         runtime_path=tmp_path/"OFFLINE-NOT-LAUNCHED.exe")
-                session.dispatch(aw.Start(action="resume" if assignment.resume else "start").model_dump(mode="json"))
-                result=h.assistant.result(request.binding)
-                eid=control_key("offline-ui-instruction-execution",request.binding.start_request_id)
-                c.evidence[eid]=ExecutorEvidence(evidence_id=eid,binding=request.binding,sequence=1,
-                    native_execution_id="OFFLINE-no-runtime",state="succeeded",result=result,
-                    entire_tree_idle=True,all_inflight_starts_fenced=True,proof=b"OFFLINE SDK I/O substitute, not native")
-                return eid
-            finally:client.close()
-        except Exception as error:
-            c.errors.append(error)
-            raise
+        # The retired Hosted job lane has no executor left; a retained test must never reach one.
+        c.starts.append(request)
+        error=AssertionError("old Hosted job lane retired: no executor start")
+        c.errors.append(error)
+        raise error
     h.workers.adapter=ExecutorAdapter(start=start,query=lambda binding:control_key(
         "offline-ui-instruction-execution",binding.start_request_id),stop=lambda _:None,verify=c.evidence.__getitem__)
 

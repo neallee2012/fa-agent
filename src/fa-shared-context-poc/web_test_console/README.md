@@ -1544,7 +1544,7 @@ API 太舊（404）時顯示「後端還沒有提供」，不改用其他來源�
 （2026-10-07 起卡片按鈕不再跳確認視窗，「確認規則並允許」一按就送，見[卡片一按就送](#hitl-one-click)。）
 建議只取原助理、命令／參數與位置，不自行概括成所有shell或聲稱任意命令唯讀；人可以直接修改。
 過長的建議不截斷、不改成較寬的空泛規則，留空讓人寫原本就必要的範圍；人清空後不自動補回。
-2026-11-05 起（Neal D1＝C）草稿上方有兩個按鈕，見[兩個規則草稿](#hitl-rule-drafts)；展開時仍先填「只這次」。
+2026-11-05 起（Neal D1＝C）草稿上方有兩個按鈕，見[兩個規則草稿](#hitl-rule-drafts)；展開時先填「只這次」，開網頁動作例外（見下）。
 
 <a id="hitl-rule-drafts"></a>
 ### 兩個規則草稿（CODE/offline）
@@ -1563,6 +1563,7 @@ API 太舊（404）時顯示「後端還沒有提供」，不改用其他來源�
 （tab、換行、全形空白等）或以 `X=…` 開頭；第一個詞去掉路徑、大小寫、`.exe` 等副檔名與版本號後是 bash、sh、pwsh、cmd、
 sudo、env、xargs、find、awk、ssh、npx、python、node 等能再執行任何命令的程式（這份清單擋不完，寬草稿仍寫明「參數不限」，
 由人看過再確認）；草稿超過 512 字。「只這次」超過 512 字時沒有按鈕，框留空讓人寫。
+2026-11-18 起（Neal）開網頁動作（名稱含 navigate、參數有 `url`）有「這類動作」草稿時，展開先填它，「只這次」按鈕照樣在：助理每次開的網址常不同（stage B 兩週三次天氣查詢，`TID` 三次都不一樣），綁死網址的規則幾乎不會再命中，還會佔掉 20 條規則的名額。沒有「這類動作」草稿時（網址不是 http／https、除了 `url` 還有其他參數）仍先填「只這次」。
 Toolbox 與排程卡仍沒有「以後允許這類」。
 
 驗證：`tests/shared_context/test_web_test_console_workbench.cjs` 的 `rule drafts:` 十一案寫死兩份草稿原文，並核對選草稿、
@@ -4255,14 +4256,7 @@ $env:PYTHONPATH = '<repo>\src\fa-shared-context-poc;<repo>\tests\shared_context'
 
 原本串接 handoff HTTP receiver 的正式慢 fixture，以及重播它的離線 producer 範例，已於 2026-10 移除。
 
-真 API／JWT／原 producer 的 browser fixture **只在 tests**，不由正式 launcher 匯入：
-
-```powershell
-& '<既有 Python interpreter>' -B '<repo>\tests\shared_context\test_web_test_console_browser_fixture.py' `
-  --journal '<全新 offline artifact>\fixture.sqlite3' --port 8766
-```
-
-此 fixture 明標 `OFFLINE_TEST`，以本機 HTTPX→ASGI、記憶體儲存與 SDK/model 替身跑原成果與 receipt。只有 fixture 的獨立 controller 完成工作，正式 console 沒有此能力。不得把它放進 native image 或當 live 配置。
+真 API／JWT／原 producer 的 browser fixture（`test_web_test_console_browser_fixture.py` 可直接執行的 `main()`，走舊 `/assistant/submit` 與獨立 controller）已隨舊 Hosted job lane 移除；該檔只剩測試用的 `assistant_harness`。
 
 ## 尚未證明
 

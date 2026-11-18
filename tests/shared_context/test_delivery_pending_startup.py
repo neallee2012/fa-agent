@@ -7,10 +7,11 @@ from shared_context.behavior_delivery_pending import (
     WRITER_ENV, PendingHead, PendingMember, PendingPage, head_key, member_key, page_key,
 )
 from shared_context.behavior_operations import control_key
-from test_conversation_transfer_startup import saved_turn, synthetic_standing_v1
+from test_conversation_transfer_startup import synthetic_standing_v1
 from legacy_turn_rows_helpers import read_startup
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
+from legacy_replay_helpers import legacy_tokens, pinned_configuration, replayed
 
 PENDING_KINDS = {"delivery_pending_head_v1", "delivery_pending_page_v1", "delivery_pending_member_v1"}
 
@@ -33,6 +34,13 @@ def typed_row(inventory, key, model):
     return model.model_validate_json(json.dumps(inventory.rows[key].payload["data"]))
 
 
+def saved(c):
+    """The next turn the retired lane admitted, ran and saved on 80ec0865 (`saved_turn`): its rows and binding."""
+    turn = replayed(c.h, c.authority.artifacts)
+    c.control.refresh()
+    return turn
+
+
 def acknowledge(c, binding, request_id):
     runtime = c.h.runtime
     runtime.controller.step(binding.binding_id)
@@ -43,10 +51,11 @@ def acknowledge(c, binding, request_id):
     assert runtime.job_status(binding.binding_id, c.human).obligation_fulfilled
 
 
-def test_new_members_and_original_entries_survive_cold_start_and_ack(synthetic_standing_v1, monkeypatch):
+def test_new_members_and_original_entries_survive_cold_start_and_ack(
+        legacy_tokens, pinned_configuration, synthetic_standing_v1, monkeypatch):
     c = synthetic_standing_v1
     monkeypatch.delenv(WRITER_ENV, raising=False)
-    original = saved_turn(c, "pending-original-entry")
+    original = saved(c)  # "pending-original-entry", saved before the pending writer existed
     root = original.binding.owner.root_budget_id
     index = control_key("delivery-index", root)
     before = read_startup(c)
@@ -54,7 +63,7 @@ def test_new_members_and_original_entries_survive_cold_start_and_ack(synthetic_s
     assert not pending_rows(before)
 
     monkeypatch.setenv(WRITER_ENV, "true")
-    new = saved_turn(c, "pending-new-member")
+    new = saved(c)  # "pending-new-member", saved with the pending writer on
     mkey = member_key(root, new.binding.obligation_id)
     pending = read_startup(c)
     assert index not in admission_writes(pending, new.binding)

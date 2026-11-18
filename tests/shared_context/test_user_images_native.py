@@ -17,7 +17,6 @@ from shared_context.behavior_user_images import (
 from shared_context.errors import Problem
 from shared_context.sdk_pin import RUNTIME_VERSION
 from test_m2_copilot import runtime_path, workspace
-from assistant_sdk_fixture import sdk_assistant
 from test_m3_auth import jwk_client, signing_key
 from test_native_turns import local_env
 
@@ -128,14 +127,6 @@ def test_upload_is_content_addressed_and_a_turn_is_accepted_only_with_its_images
     assert foreign.value.body["error"]["code"] == "NATIVE_IMAGE_INVALID"
     asyncio.run(images.check_user_images(host, SimpleNamespace(command=aw.InstructionSubmit(
         request_id="no-images", content="Hi"), capture=None)))
-
-
-def test_the_job_lane_refuses_images_instead_of_dropping_them(sdk_assistant):
-    from work_policy_lifecycle_helpers import enabled
-    _, control, human, _ = enabled(sdk_assistant)
-    with pytest.raises(Problem) as refused:
-        control.submit(human, aw.InstructionSubmit(request_id="legacy-image", content="See", images=(reference(),)))
-    assert refused.value.body["error"]["code"] == "WORK_POLICY_COMMAND"
 
 
 def test_pinned_runtime_sends_attached_images_to_the_model_as_inline_png(workspace, runtime_path):

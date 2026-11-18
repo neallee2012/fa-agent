@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from shared_context.behavior_code_identity import code_sha256 as core_code_sha256
-from shared_context.behavior_assistant import _LocalHttp
+from local_http_helpers import _LocalHttp
 from shared_context.behavior_profile_selection import SelectConversationProfile
 from shared_context.behavior_peer_runtime import install_peer_routing
 from shared_context.behavior_server_config import ServerConfiguration
@@ -23,10 +23,10 @@ from web_test_console.agent_connections import AgentConnections
 from web_test_console.bridge import create_app
 from web_test_console.instructions import InstructionConnection
 from test_agent_runtime import peer_runtime
-from test_agent_message_api import application as peer_application
+from test_agent_message_api import directory_application as peer_application
 from test_conversation_profile_selection import template
 from test_conversation_transfer_startup import synthetic_standing_v1
-from test_instruction_flow import instruction_models
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_web_test_console_standing import configuration
 from legacy_console_rows_helpers import load_rows, seed_journal

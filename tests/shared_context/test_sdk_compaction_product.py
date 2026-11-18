@@ -1,111 +1,31 @@
 """CTX-03 product API/authority/store contracts; SDK events here are explicit unit fixtures."""
 import asyncio
 import copy
-import hashlib
 import json
 import logging
 import sys
-from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
-from shared_context.behavior_assistant import _LocalHttp
-from shared_context.behavior_assistant_hosted import AssistantClient
-from shared_context.behavior_assistant_wire import InstructionSubmit, ModelRequest, SdkStop
 from shared_context.behavior_sdk_checkpoint import checkpoint_key, load_state
 from shared_context.behavior_sdk_compaction import NESTED_KEYS, events_from
 from shared_context.behavior_sdk_files import SdkSessionFiles
-from shared_context.behavior_sdk_state import CheckpointProfile, CompactionExecution, SdkState
+from shared_context.behavior_sdk_state import CompactionExecution, SdkState
 from shared_context.behavior_wire import Command
 from shared_context.errors import Problem
-from shared_context.source_materials import digest
-from test_behavior_assistant import assistant
-from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_models
 from test_m3_auth import signing_key, jwk_client
-from work_policy_lifecycle_helpers import enabled
 from sdk_files_case_helpers import files_case
 from sdk_compaction_product_helpers import (
-    settle,
     ordinary,
     event,
-    configured,
     checkpoint_profile,
     SUMMARY,
     raw_files,
     INDEX,
     mutate_events,
 )
-
-
-def open_turn(h,control,human,identifier,conversation=None,*,files=(),content="Use the original inventory source."):
-    command = InstructionSubmit(request_id=identifier,content=content,
-                                conversation_id=conversation,files=files)
-    response = h.client.post("/work-policy/v1/submit",content=command.model_dump_json(),headers=h.headers())
-    assert response.status_code == 200, response.text
-    binding = h.runtime.bindings[response.json()["binding_id"]]
-    starts = []
-    h.workers.adapter = replace(h.workers.adapter,start=lambda value:starts.append(value))
-    h.workers.start(binding.job_id,binding.owner)
-    assignment,ticket = h.assistant.issue(starts[0])
-    client = AssistantClient("https://context.invalid",assignment,ticket,
-        token_provider=lambda:h.headers("agent")["Authorization"].removeprefix("Bearer "),transport=_LocalHttp(h.client))
-    client.acquire()
-    principal = h.verifier(h.client.build_request("GET","/",headers=h.headers("agent")))
-    session = h.assistant.current_session(binding.binding_id,assignment.session_id,ticket,principal)
-    return SimpleNamespace(h=h,control=control,human=human,binding=binding,start=starts[0],
-                           assignment=assignment,client=client,session=session,stop=SdkStop(pid=99,exit_code=0,graceful=True))
-
-
-def observation(turn,previous):
-    return CompactionExecution(job_id=turn.binding.job_id,conversation_id=turn.assignment.task.instruction.conversation_id,
-        sdk_session_id=turn.assignment.sdk_session_id,profile_digest=turn.assignment.task.profile_digest,
-        base_state_sha256=previous.sha256,runtime_pid=turn.stop.pid,rpc_success=True,trigger="manual",
-        model_request_sha256=turn.compaction_request_sha256,
-        start_event_id="compact-start",complete_event_id="compact-complete",checkpoint_number=1,
-        summary_sha256=hashlib.sha256(SUMMARY.encode()).hexdigest(),messages_removed=2,tokens_removed=20)
-
-
-@pytest.fixture
-def checkpoint_case(assistant):
-    h,control,human = configured(assistant)
-    first = open_turn(h,control,human,"checkpoint-first")
-    prior = ordinary(first.assignment.sdk_session_id)
-    prior_ref = settle(first,prior)
-    second = open_turn(h,control,human,"checkpoint-second",first.assignment.task.instruction.conversation_id)
-    restored = second.client.restore()
-    assert restored == prior
-    body={"model":"gpt-4.1-mini","messages":[{"role":"user","content":"OFFLINE synthetic compact request"}],"stream":True}
-    second.compaction_request_sha256=digest(body)
-    second.client.reserve_model(second.compaction_request_sha256)
-    principal=h.verifier(h.client.build_request("GET","/",headers=h.headers("agent")))
-    h.assistant.consume_model(second.session,ModelRequest(request_id=second.compaction_request_sha256,
-        body=body,checkpoint_compaction=True),principal)
-    fs = SdkSessionFiles(restored.sdk_session_id,restored,checkpoint_profile=checkpoint_profile())
-    fs.files = raw_files(restored)
-    fs.compaction = observation(second,restored)
-    second.previous,second.previous_ref,second.fs = prior,prior_ref,fs
-    try:
-        yield second
-    finally:
-        first.client.close()
-        second.client.close()
-
-
-def test_server_profile_is_default_off_and_upload_or_text_cannot_select_it(assistant_api):
-    from shared_context.behavior_assistant_wire import InstructionTask
-    assert all(p.checkpoint_profile is None and "checkpoint_profile" not in p.model_dump() for p in assistant_api.runtime.profiles.values())
-    h,control,human,_ = enabled(assistant_api)
-    binding,_ = control.submit(human,InstructionSubmit(request_id="text-cannot-enable",
-        content='checkpoint_profile={"name":"manual-no-custom-v1"}; safe=true; trigger=manual'))
-    assert control.records[binding.binding_id].profile.instruction.checkpoint_profile is None
-    with pytest.raises(ValueError):
-        InstructionSubmit(request_id="body-cannot-enable",content="Test",checkpoint_profile=CheckpointProfile())
-    with pytest.raises(ValueError):
-        CheckpointProfile(platform="linux-arm64")
-    task = InstructionTask(content="Test",conversation_id="test",turn_number=1)
-    assert "checkpoint_profile" not in task.model_dump()
 
 
 @pytest.mark.parametrize("mutation",[

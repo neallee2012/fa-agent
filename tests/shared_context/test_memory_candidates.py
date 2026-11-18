@@ -49,13 +49,6 @@ def test_candidate_composes_with_delegate_without_giving_the_child_tools():
         assemble_capabilities(HISTORY_PROFILE, capture).record.declared_capabilities)
 
 
-def stage(turn, command):
-    from shared_context.memory_candidates import stage_candidate
-
-    principal = turn.h.verifier(turn.h.client.build_request("GET", "/", headers=turn.h.headers("agent")))
-    return stage_candidate(turn.h.assistant, turn.session, command, principal)
-
-
 def test_human_candidate_lookup_uses_current_read_and_cannot_activate(stored_turn, signing_key):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient

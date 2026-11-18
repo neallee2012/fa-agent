@@ -27,7 +27,6 @@ from shared_context.native_turns import NativeTurnRuntime
 from shared_context.sdk_pin import RUNTIME_VERSION
 from conversation_profile_selection_helpers import configured, template
 from instruction_flow_helpers import instruction_models, runtime_path
-from test_instruction_prompt import submit
 from test_m3_auth import jwk_client, signing_key
 from test_native_local_capabilities import MODEL_ROOT, Handlers, browser_grant, with_grants
 from test_native_turn_wire import submit as native_submit

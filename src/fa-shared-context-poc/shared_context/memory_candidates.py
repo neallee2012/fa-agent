@@ -5,9 +5,9 @@ from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
-from .behavior_capabilities import BUILTIN_CAPABILITIES, runtime_grants
+from .behavior_capabilities import BUILTIN_CAPABILITIES
 from .behavior_operations import control_key
-from .behavior_store import ControlChanges, ControlRequest, ControlWrite
+from .behavior_store import ControlRequest
 from .behavior_wire import Digest, Identifier, WireModel
 from .errors import Problem
 from .memory_source import ProposalSource, quote_source
@@ -118,23 +118,6 @@ def _original(runtime, binding_id):
     return record
 
 
-def _session_origin(authority, session, principal):
-    runtime = authority.runtime
-    binding, _, _ = runtime.authorize(session.binding_id, principal, "execute")
-    record = _original(runtime, binding.binding_id)
-    task = session.assignment.task.instruction
-    grants = () if task is None or task.capabilities is None else task.capabilities.grants
-    grant = next((item for item in grants if item.entry_id == CANDIDATE_CAPABILITY.entry_id), None)
-    if (principal.kind != "agent" or principal.oid != binding.agent_oid or session.state != "running"
-            or record.binding != binding or record.profile.instruction != task
-            or grant is None or grant.kind != "fa-builtin"
-            or grant.entry_sha256 != CANDIDATE_CAPABILITY.entry_sha256
-            or grant.tools != CANDIDATE_CAPABILITY.tools or grant.vision
-            or runtime_grants(runtime).get(grant.entry_id) != grant):
-        raise Problem(403, "MEMORY_CANDIDATE_DISABLED", "this original turn has no current candidate capability")
-    return record
-
-
 class MemoryCandidates:
     def __init__(self, runtime):
         self.runtime, self.store = runtime, runtime.store
@@ -220,56 +203,3 @@ class MemoryCandidates:
                                  text=record.command.quote, source=record.source)
         return self.store.consistent_read(current)
 
-
-def stage_candidate(authority, session, command, principal):
-    from .behavior_runtime import material
-    from .behavior_work_policy import work_policy_key
-
-    command = CandidateCommand.model_validate_json(command.model_dump_json())
-    original = _session_origin(authority, session, principal)
-    service = MemoryCandidates(authority.runtime)
-    existing = service._stored(original)
-    if existing is not None:
-        if existing.command != command:
-            raise Problem(409, "MEMORY_CANDIDATE_CONFLICT", "this turn already has its original suggestion decision")
-        return service._receipt(existing)
-    binding, task = original.binding, original.profile.instruction
-    key = candidate_key(service.store._scope.authority_domain, binding.binding_id)
-    registration = work_policy_key("registration", original.admission_id)
-    request = ControlRequest(
-        request_id=control_key("memory-candidate-write", key),
-        request_digest=_intent(binding.binding_id, command),
-        read_set=tuple(dict.fromkeys((*authority._keys(session), registration, key))),
-    )
-    record = MemoryCandidateRecord(
-        candidate_id=key, authority_domain=service.store._scope.authority_domain,
-        binding_id=binding.binding_id, admission_id=original.admission_id,
-        human_oid=binding.human_oid, agent_oid=binding.agent_oid, original_request_id=original.request_id,
-        conversation_id=task.conversation_id, turn_number=task.turn_number,
-        content_sha256=hashlib.sha256(task.content.encode("utf-8")).hexdigest(),
-        command=command, source=_source(task, original.request_id, command), request=request,
-    )
-    expected = service.store.read_snapshot((registration,))[registration]
-
-    def decide(rows):
-        authority._gate(session, rows)
-        if rows[registration] != expected:
-            raise Problem(409, "MEMORY_CANDIDATE_SOURCE_INVALID", "the original instruction changed before staging")
-        data = record.model_dump(mode="json")
-        return ControlChanges(writes=(ControlWrite(row_id=key, mode="create", data=data, material=material(data)),),
-                              result={"candidate_id": key, "decision": command.decision, "state": "staged",
-                                      "effective": False})
-
-    service.store.transact(request, decide)
-    return service._receipt(record)
-
-
-def reconcile_candidate(authority, session, command, principal):
-    original = _session_origin(authority, session, principal)
-    service = MemoryCandidates(authority.runtime)
-    record = service._stored(original)
-    if record is None:
-        raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "the original candidate receipt is not confirmed; do not resend")
-    if record.command != command:
-        raise Problem(409, "MEMORY_CANDIDATE_CONFLICT", "the lookup differs from this turn's original suggestion")
-    return service._receipt(record)

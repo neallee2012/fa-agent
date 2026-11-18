@@ -11,12 +11,10 @@ from shared_context.behavior_sdk_files import SdkSessionFiles
 from shared_context.behavior_sdk_state import CheckpointProfile
 from shared_context.behavior_work_policy import WorkPolicyControl
 from shared_context.source_materials import digest
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from test_conversation_profile_selection import PATH, configured, select, template
-from test_instruction_flow import instruction_inventory, instruction_models, runtime_path, sdk_io
-from test_instruction_prompt import submit
+from instruction_flow_helpers import instruction_inventory, instruction_models, sdk_io
 from test_m3_auth import signing_key, jwk_client
-from test_sdk_compaction_product import checkpoint_profile, event, observation, open_turn, ordinary, raw_files, settle
 
 
 def reconstruct(control):
@@ -41,16 +39,16 @@ def selection_history(h, control):
     {"sdk_start_profile": "fa-sdk-start-gate-v1"},
 ])
 @pytest.mark.parametrize("identity", ["agent", "read-only"])
-def test_nonapprovers_cannot_select_checkpoint_or_start_presets(assistant, settings, identity):
-    h, control, _ = configured(assistant)
+def test_nonapprovers_cannot_select_checkpoint_or_start_presets(assistant_api, settings, identity):
+    h, control, _ = configured(assistant_api)
     before = h.store._guard()
     response, _ = select(h, value=template(**settings), identity=identity)
     assert response.status_code == 403
     assert h.store._guard() == before and not control.records
 
 
-def test_start_v2_is_not_enabled_without_its_distinct_memory_profile(assistant):
-    h, control, _ = configured(assistant)
+def test_start_v2_is_not_enabled_without_its_distinct_memory_profile(assistant_api):
+    h, control, _ = configured(assistant_api)
     before = h.store._guard()
     response, _ = select(h, value=template(sdk_start_profile="fa-sdk-start-gate-v2"))
     assert response.status_code == 422
@@ -64,8 +62,8 @@ def test_start_v2_is_not_enabled_without_its_distinct_memory_profile(assistant):
     ("checkpoint_profile", {"name": "manual-no-custom-v1", "platform": "linux-x64", "provider": "openai-completions", "safe": True}),
     ("sdk_start_profile", "fa-sdk-start-gate-future"),
 ])
-def test_selection_accepts_only_the_fixed_typed_presets(assistant, setting, value):
-    h, control, _ = configured(assistant)
+def test_selection_accepts_only_the_fixed_typed_presets(assistant_api, setting, value):
+    h, control, _ = configured(assistant_api)
     command = SelectConversationProfile(request_id="unsupported-preset", expected_selection_id=None, template=template())
     packet = command.model_dump(mode="json")
     packet["template"]["settings"][setting] = value

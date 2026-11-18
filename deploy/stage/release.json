@@ -1,1 +1,1 @@
-{"version":"2026.11.18-48","milestone":"第 48 版：舊 Hosted job lane 退役——舊送件路由改回 410 JOB_LANE_RETIRED 或 404，開機不再恢復舊工作，工作台舊版對話改成唯讀，並刪掉不再被呼叫的舊程式；另含部署一定要指定設定、HITL 規則變動重試上限、native 內部拆分；這次部署不改 stage 的資源與權限"}
+{"version":"2026.11.18-49","milestone":"第 49 版：舊 Hosted job lane 退役收尾——刪掉剩下只剩測試在用的舊程式（API 與 Hosted 兩端），Hosted 收到沒帶 native 標記的請求改回 410 JOB_LANE_RETIRED；工作台開網頁的批准卡展開時先填「這類動作」（同網站），仍可改選只這次；這次部署不改 stage 的資源與權限"}

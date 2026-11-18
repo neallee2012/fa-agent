@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Annotated, Literal
 from pydantic import Field, model_validator
 
 from .behavior_wire import Identifier, WireModel
-from .errors import Problem
 
 if TYPE_CHECKING:
     from .behavior_assistant_wire import Task
@@ -48,35 +47,3 @@ class InstructionTurnOrigin(WireModel):
             raise ValueError("Only the original linear previous turn is described")
         return self
 
-
-def instruction_turn_origin(
-    task: Task, binding: RuntimeBinding, registration: WorkRegistration | None,
-) -> InstructionTurnOrigin:
-    instruction = task.instruction
-    if instruction is None:
-        raise Problem(409, "ASSISTANT_ORIGIN_UNAVAILABLE", "only an instruction turn has this origin view")
-    if (task.job_id, task.work_id) != (binding.job_id, binding.work.work_id):
-        raise Problem(403, "ASSISTANT_ORIGIN_DENIED", "turn origin differs from the assigned work")
-    source_kind, actor_role, request_id, reply_target = None, None, None, None
-    if registration is not None:
-        recorded = registration.profile.instruction
-        source = registration.agent_origin
-        expected_oid = binding.human_oid if source is None else source.sender.worker.caller_oid
-        if (registration.binding != binding or registration.principal_oid != expected_oid
-                or recorded is None
-                or (recorded.content, recorded.conversation_id, recorded.turn_number, recorded.files, recorded.attachments)
-                != (instruction.content, instruction.conversation_id, instruction.turn_number, instruction.files, instruction.attachments)):
-            raise Problem(403, "ASSISTANT_ORIGIN_DENIED", "recorded turn origin differs from the assignment")
-        source_kind, actor_role = (("agent", "sending-agent") if source is not None else
-                                  ("human", "original-requester") if registration.routine is None
-                                  else ("routine", "routine-owner"))
-        request_id, reply_target = registration.request_id, "original-conversation"
-    return InstructionTurnOrigin(
-        availability="recorded" if registration is not None else "not-recorded",
-        source_kind=source_kind, actor_role=actor_role, request_id=request_id,
-        binding_id=binding.binding_id, conversation_id=instruction.conversation_id,
-        turn_number=instruction.turn_number,
-        previous_turn_number=(instruction.turn_number - 1
-                              if instruction.previous_archive_id is not None and instruction.turn_number > 1 else None),
-        job_id=task.job_id, work_id=task.work_id, reply_target=reply_target, authorization=False,
-    )

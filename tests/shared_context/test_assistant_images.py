@@ -7,15 +7,9 @@ import zlib
 
 import pytest
 
-from shared_context.behavior_capabilities import CapabilityGrant
 from shared_context.behavior_history_prompt import HISTORY_PROFILE
-from shared_context.behavior_profile_selection import SelectConversationProfile, select_profile
-from test_behavior_assistant import assistant
-from conversation_profile_selection_helpers import template
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
-from test_sdk_compaction_product import open_turn
-from sdk_compaction_product_helpers import configured
 from assistant_images_helpers import png
 
 
@@ -69,29 +63,3 @@ def test_only_a_complete_png_within_the_bound_is_a_delivery_command():
         DeliverImageCommand(request_id="deliver-image", sha256="0" * 64, png_base64=base64.b64encode(data).decode())
     with pytest.raises(ValueError):
         command(data + b"\x00" * (MAX_IMAGE_BYTES - len(data) + 1))
-
-
-@pytest.fixture
-def image_turn(assistant):
-    from shared_context.assistant_images import IMAGE_CAPABILITY
-
-    h, control, human = configured(assistant)
-    builtin = IMAGE_CAPABILITY
-    grant = CapabilityGrant(entry_id=builtin.entry_id, entry_sha256=builtin.entry_sha256,
-                            kind="fa-builtin", tools=builtin.tools, vision=False)
-    h.runtime.capability_grants = {builtin.entry_id: grant}
-    select_profile(control, h.assistant, human, SelectConversationProfile(
-        request_id="select-image-delivery", expected_selection_id=None,
-        template=template(HISTORY_PROFILE, capabilities=(grant.ref,),
-                          user_text_file_profile="fa-user-text-files-v1",
-                          checkpoint_profile=control.policy.profile.checkpoint_profile,
-                          sdk_start_profile=control.policy.profile.sdk_start_profile)))
-    turn = open_turn(h, control, human, "image-delivery-turn")
-    try:
-        yield turn
-    finally:
-        turn.client.close()
-
-
-def agent(turn):
-    return turn.h.verifier(turn.h.client.build_request("GET", "/", headers=turn.h.headers("agent")))

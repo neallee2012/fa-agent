@@ -10,7 +10,7 @@ import pytest
 
 from shared_context.behavior_assistant import AssistantProfile
 from shared_context.behavior_model_capacity import DeclaredModelLimits, ModelCapacitySnapshot
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_models, runtime_path
 from instruction_prompt_helpers import configured as configured_prompt
 from test_m3_auth import signing_key, jwk_client
@@ -25,12 +25,12 @@ def declared_facts(monkeypatch):
     return facts
 
 
-def configured_capacity(assistant, prompt="fa-instruction-v1"):
-    assistant.runtime.profiles = MappingProxyType({
+def configured_capacity(assistant_api, prompt="fa-instruction-v1"):
+    assistant_api.runtime.profiles = MappingProxyType({
         name: AssistantProfile.model_validate({**profile.model_dump(), "model_capacity_profile": "fa-model-capacity-v1"})
-        for name, profile in assistant.runtime.profiles.items()
+        for name, profile in assistant_api.runtime.profiles.items()
     })
-    return configured_prompt(assistant, prompt)
+    return configured_prompt(assistant_api, prompt)
 
 
 def test_independent_input_and_output_maxima_are_not_forced_into_an_invented_sum():

@@ -13,9 +13,7 @@ from copilot.session import CopilotSession
 
 from shared_context import m2_copilot
 from shared_context.behavior_assistant_boundary import AssistantModelBoundary
-from shared_context.behavior_assistant_hosted import AssistantClient, AssistantSession
 from shared_context.behavior_http_diagnostics import AssistantModelFailure
-from shared_context.errors import Problem
 from shared_context.sdk_pin import RUNTIME_VERSION
 from sdk_session_stub import OFFLINE_SESSION_RPC
 
@@ -151,43 +149,6 @@ def test_ordinary_error_then_unverified_shutdown_preserves_first_diagnostic(
     adapter.session.send_and_wait.assert_awaited_once()
     adapter.session.abort.assert_not_awaited()
     adapter.session.get_events.assert_not_awaited()
-    assert_no_disclosure(adapter, caught.value, capsys, caplog)
-
-
-@pytest.mark.parametrize("exit_verified", [True, False])
-def test_hosted_caller_keeps_unknown_without_turn_or_shutdown_success(
-    adapter, exit_verified, capsys, caplog,
-):
-    fail_at(adapter, "send_and_wait")
-    if not exit_verified:
-        adapter.process.poll = lambda: None
-        adapter.process.returncode = None
-    caller = create_autospec(AssistantClient, instance=True)
-    caller.assignment = SimpleNamespace(sdk_session_id=SESSION, resume=False,
-                                        task=SimpleNamespace(instruction=None))
-    caller.api_url = adapter.options["api_url"]
-    caller.token_provider = adapter.forbidden
-    runner = AssistantSession(
-        caller, root=adapter.root, runtime_path=adapter.options["runtime_path"],
-        model_transport=adapter.options["http_transport"],
-    )
-    with pytest.raises(Problem) as caught:
-        asyncio.run(runner._run(adapter.options["working_directory"]))
-    assert caught.value.status == 503
-    assert caught.value.body["error"] == {
-        "code": "ASSISTANT_SDK_UNKNOWN",
-        "message": "SDK execution/shutdown is unresolved",
-        "upstream_error_phase": "sdk_turn", "exception_type": "ValueError",
-    }
-    caller.stopped.assert_called_once_with("sdk_failed")
-    for name in ("acquire", "reserve_model", "send_model", "context", "save",
-                 "finish", "operation", "status", "checkpoint", "restore"):
-        getattr(caller, name).assert_not_called()
-    adapter.client.stop.assert_awaited_once_with()
-    assert adapter.client.force_stop.await_count == (0 if exit_verified else 1)
-    adapter.session.send_and_wait.assert_awaited_once()
-    assert "sdk_stop" not in caught.value.body and "graceful" not in json.dumps(caught.value.body)
-    assert CANARY not in json.dumps(caught.value.body)
     assert_no_disclosure(adapter, caught.value, capsys, caplog)
 
 

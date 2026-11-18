@@ -3,14 +3,13 @@
 import asyncio
 import pytest
 
-from shared_context.behavior_assistant_wire import Task
 from shared_context.behavior_skill_prompt import SKILL_PROFILE
 from shared_context.behavior_work_policy import derive_registered_work
 from shared_context.behavior_work_policy_api import work_response
 from shared_context.errors import Problem
 from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_inventory, instruction_models, runtime_path
-from direct_submit_helpers import submit_direct
+from legacy_replay_helpers import legacy_tokens, replayed
 from instruction_prompt_helpers import configured
 from test_m3_auth import jwk_client, signing_key
 
@@ -21,14 +20,6 @@ ENV = "FA_INSTRUCTION_DEFAULT_PROMPT_PROFILE"
 @pytest.fixture(autouse=True)
 def isolated_default(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
-
-
-def profile_for(h, accepted):
-    binding = h.runtime.bindings[accepted["binding_id"]]
-    task = Task.model_validate_json(h.runtime.job_input(binding))
-    profile = h.runtime.profiles[binding.binding_id]
-    assert task.instruction.prompt_profile == profile.prompt_profile
-    return profile.prompt_profile
 
 
 def test_v2_human_selection_keeps_original_policy_and_write_profile_boundaries(assistant_api):
@@ -60,24 +51,14 @@ def test_post_admission_prompt_failure_is_not_reported_as_unaccepted_work():
     assert refused.value.body["error"]["code"] == "INSTRUCTION_PROMPT_CONFIGURATION"
 
 
-@pytest.mark.parametrize("profile", ["fa-instruction-v1", "fa-instruction-v2", "fa-instruction-v3", "fa-instruction-v4",
-                                     SKILL_PROFILE])
-@pytest.mark.parametrize("default", ["fa-instruction-v1", "fa-instruction-v2", "unknown"])
-def test_default_does_not_replace_an_explicit_server_policy_profile(assistant_api, monkeypatch, profile, default):
-    h, control, _ = configured(assistant_api, profile)
-    original = control.policy.model_dump_json()
-    monkeypatch.setenv(ENV, default)
-    accepted, _ = submit_direct(h, "explicit-policy", "Retain the configured policy.")
-    assert profile_for(h, accepted) == profile
-    assert control.policy.model_dump_json() == original
-
-
 @pytest.mark.parametrize("mode", ["offline_contract", "native"])
 @pytest.mark.parametrize("profile", ["fa-instruction-v1", "fa-instruction-v2"])
-def test_runtime_and_history_share_original_profile_reconstruction(assistant_api, monkeypatch, mode, profile):
+def test_runtime_and_history_share_original_profile_reconstruction(
+        legacy_tokens, assistant_api, monkeypatch, mode, profile):
     h, control, _ = configured(assistant_api, None)
     monkeypatch.setenv(ENV, profile)
-    accepted, _ = submit_direct(h, "reconstruct-default", "Capture the original server choice.")
+    accepted = replayed(h)  # "reconstruct-default" as the retired WorkPolicyControl.submit admitted it under ENV
+    control.refresh(accepted["binding_id"])
     record = control.records[accepted["binding_id"]]
     monkeypatch.setenv(ENV, "unknown")
     assert derive_registered_work(control.policy, record, mode) == (

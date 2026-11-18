@@ -9,7 +9,7 @@ from shared_context.behavior_assistant_reply_prompt import ASSISTANT_REPLY_CAPAB
 from shared_context.behavior_operations import _parse
 from shared_context.behavior_sdk_state import CheckpointProfile
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from conversation_profile_selection_helpers import configured, select, template
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key

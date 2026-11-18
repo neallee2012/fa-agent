@@ -44,10 +44,6 @@ def _material(value: object) -> InlineMaterial:
     return InlineMaterial(data=data, sha256=hashlib.sha256(data).hexdigest())
 
 
-def effect_key(kind: str, operation_id: str, attempt_id: str) -> str:
-    return control_key("work-effect-" + kind, operation_id, attempt_id)
-
-
 class WorkGoalUpdate(_Model):
     work_id: Identifier
     obligation_id: Identifier

@@ -187,7 +187,6 @@ def test_registered_peer_cannot_attach_to_a_runtime_or_initialize_another_cost_l
     for action in (
         control.attach,
         control.refresh,
-        lambda: control.register(c.human, "peer-request", "a" * 64),
         lambda: control.observe_cost(c.control.cost_reader()),
         lambda: attach_standing_policy(c.h.composition, agent_id=policy.agent_id),
     ):
@@ -284,39 +283,6 @@ def test_history_keys_rebuild_the_saved_peer_scope_not_current_environment(monke
     with pytest.raises(Problem) as denied:
         derive_registered_work(policy, saved.model_copy(update={"agent_scope": None}), "native")
     assert denied.value.body["error"]["code"] == "WORK_POLICY_REGISTRY_INVALID"
-
-
-def test_peer_conversation_cannot_reuse_a_cid_archive_or_private_memory_settings(synthetic_standing_v1, monkeypatch):
-    from shared_context.behavior_agent_registry import register_agent_scope
-    from shared_context.behavior_assistant_wire import InstructionSubmit
-    from shared_context.behavior_instruction import instruction_state
-    from shared_context.behavior_work_policy import configured_prompt_override
-    c = synthetic_standing_v1
-    policy = peer_policy(c.h.config, c.control.policy)
-    register_agent_scope(c.h.runtime.store, c.h.config, policy, c.human, now=c.h.time)
-    control = WorkPolicyControl(c.h.runtime, policy, c.control.cost_reader)
-    command = InstructionSubmit(request_id="same-human-request", content="Only the original assistant owns this.")
-    record = c.control.register(c.human, command.request_id, hashlib.sha256(command.model_dump_json().encode()).hexdigest(),
-                                instruction=command)
-    before = read_startup(c)
-    current, row = instruction_state(control, command)
-    assert row is None and current.agent_oid == policy.template.agent_oid
-    assert current.conversation_id != record.profile.instruction.conversation_id
-    assert current.archive_id is None and current.active_job_id is None and current.jobs == ()
-    with pytest.raises(Problem) as denied:
-        instruction_state(control, command.model_copy(update={"conversation_id": record.profile.instruction.conversation_id}))
-    assert denied.value.body["error"]["code"] == "CONVERSATION_SCOPE_DENIED"
-    with pytest.raises(Problem) as pending:
-        instruction_state(c.control, command)
-    assert pending.value.body["error"]["code"] == "CONVERSATION_TURN_UNRESOLVED"
-    captured = control.conversation_memory(c.human, current)
-    from shared_context.memory_bridge_settings import settings_head_key
-    assert captured.value is None and captured.predicates == {
-        settings_head_key(policy.authority_domain, policy.agent_scope): None}
-    monkeypatch.setenv("FA_INSTRUCTION_DEFAULT_PROMPT_PROFILE", "not-a-supported-default")
-    assert configured_prompt_override(policy) is None
-    assert read_startup(c).entity_sha256 == before.entity_sha256
-    assert c.sessions.calls == []
 
 
 def test_registry_unknown_reconciles_original_receipt_without_resend_or_new_ids(synthetic_standing_v1):

@@ -1,24 +1,19 @@
-"""Target selection and retired stop-closure readers: what callers see without any such row.
+"""Target selection readers: what callers see without any selection row.
 
 No deployed producer ever wrote a ``standing-target`` or ``original_sdk_stop_closed`` row (``select_target`` and
 ``close_original`` were never called by product code, #1041/#1051), and ``platform-stop`` rows came only from the
 removed operator recovery (``ClaimedSdkRecovery``, no entry point in the tree). These tests pin what the kept readers return
-when no selection row exists, and that registration receipts with and without the old target read are both
-accepted. Offline: synthetic Foundry client, local Table I/O, no SDK or model.
+when no selection row exists. Offline: synthetic Foundry client, local Table I/O, no SDK or model.
 """
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_foundry import FoundryExecutor, FoundryHttpClient, NativeJobRoute, NativeLaunchAuthority
-from shared_context.behavior_migration import MigrationStore
-from shared_context.behavior_work_policy import work_policy_key
 from shared_context.behavior_work_target import activate_target, selected_targets, target_key
 from shared_context.behavior_workers import WorkerContract
 from shared_context.errors import Problem
-from history_forgery import Forgery
 from test_behavior_store import FakeTable, SCOPE
 from test_conversation_transfer_startup import synthetic_standing_v1
 from test_fresh_installation import fresh_case, initialize
@@ -81,111 +76,12 @@ def test_activation_moves_a_drifted_native_target_back_to_the_configured_one():
         client.close()
 
 
-def _registration_read_set(c, change):
-    """A forged copy of one registration receipt whose read set is change(read set); hashes stay coherent."""
-    config = c.h.config
-    binding, _ = c.control.submit(c.human, InstructionSubmit(request_id="retired-target-read",
-                                                             content="Synthetic registration read set."))
-    key = work_policy_key("registration", c.control.records[binding.binding_id].admission_id)
-
-    def rewrite(payload):
-        return {**payload, "request": {**payload["request"], "read_set": list(change(payload["request"]["read_set"]))}}
-    inventory = MigrationStore(c.h.composition.clients[0], config.table.scope).read_inventory()
-    forged = Forgery(inventory).receipt(key, rewrite).inventory()
-    return binding, forged, forged.receipts[key].payload["request"]["read_set"]
-
-
-def _claimed(c, request_id):
-    """claimed_turn's path for a legacy AssistantSubmit: one claimed native launch of the C1 pool."""
-    from dataclasses import replace
-    from shared_context import behavior_wire as wire
-    from shared_context.behavior_assistant_wire import AssistantSubmit
-    from shared_context.behavior_auth import BehaviorPrincipal
-    from assistant_sdk_fixture import review_source
-    workers = c.h.runtime.dep.workers
-    review_source(c.h.runtime.store, c.h.config, review_id="retired-close-reviewed",
-                  claim_id=c.control.policy.profile.claim_id, text="The accepted metrics source has been reviewed.")
-    binding, _ = c.control.submit(c.human, AssistantSubmit(request_id=request_id))
-    reservations = []
-    original = workers.adapter
-    workers.adapter = replace(workers.adapter, start=lambda start: reservations.append(c.native.prepare(start)),
-                              verify=c.native.verify)
-    try:
-        workers.start(binding.job_id, binding.owner)
-    finally:
-        workers.adapter = original
-    launch, permit = reservations[0]
-    actor = c.h.config.identity.auth().actors[binding.agent_oid]
-    agent = BehaviorPrincipal(binding.tenant_id, binding.agent_oid, binding.team_id, "agent", actor.actor,
-                              frozenset({"read", "consume", "execute"}))
-    identity = wire.HostedIdentity(**{name: getattr(launch.target, name)
-                                    for name in ("agent_id", "agent_name", "agent_version", "session_id")})
-    c.native.claim(binding.binding_id, launch.launch_id, wire.HostedClaimRequest(
-        request_id="retired-native-claim", invocation_id="retired-original-invocation",
-        identity=identity, process_id="retired-no-process", launch_permit=permit), agent)
-    return c.native.launch(launch.launch_id)
-
-
-RETIRED_CLOSURES = {"original-stop-close": ("original stop closures", "original_sdk_stop_closed"),
-                    "platform-stop": ("platform stop closures", "native_platform_stop")}
-
-
-@pytest.fixture(params=[(name, proof) for name in RETIRED_CLOSURES for proof in ("without-proof-row", "with-proof-row")],
-                ids=lambda param: "-".join(param))
-def closed_launch(synthetic_standing_v1, request):
-    """A claimed launch sealed on retired closure evidence, written the way the removed closers sealed it.
-
-    The saved evidence is otherwise fresh and coherent, so only the retired-closure rule can refuse it."""
-    from datetime import timedelta
-    from shared_context.behavior_delivery import _material
-    from shared_context.behavior_foundry import _NativeEvidence, native_key
-    from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite
-    from shared_context.behavior_workers import ExecutorEvidence
-    c = synthetic_standing_v1
-    native, store, now = c.native, c.h.runtime.store, c.h.time
-    launch = _claimed(c, "retired-original-close")
-    name, with_proof = request.param
-    phrase, kind = RETIRED_CLOSURES[name]
-    eid = native_key(name + "-evidence", launch.launch_id)
-    proof_key = native_key(name, launch.launch_id)
-    evidence = ExecutorEvidence(evidence_id=eid, binding=launch.start.binding, sequence=launch.evidence_sequence + 1,
-        native_execution_id=launch.native_invocation_id, state="stopped", entire_tree_idle=True,
-        all_inflight_starts_fenced=True, proof=b'{"original_stop_close":"retired"}')
-    saved = _NativeEvidence(launch_id=launch.launch_id,
-        configuration_digest=c.h.runtime.dep.workers.configuration_digest(), probe_id=proof_key, evidence=evidence,
-        observed_at=now, expires_at=now + timedelta(seconds=60), report_digest="d" * 64)
-    launchkey = native_key("launch", launch.launch_id)
-    proof = (() if with_proof == "without-proof-row" else
-             (ControlWrite(row_id=proof_key, mode="create", data={"kind": kind}),))
-    store.transact(ControlRequest(request_id="retired-close-seal", request_digest="a" * 64, read_set=(launchkey,)),
-                   lambda current: ControlChanges(writes=(
-                       native._write(native_key("evidence", eid), saved, material=_material(saved.model_dump(mode="json"))),
-                       native._write(launchkey, launch.model_copy(update={
-                           "phase": "sealed", "sealed_evidence_id": eid, "evidence_sequence": evidence.sequence,
-                           "pending_control": "cancel"}), current),
-                       *proof,
-                   ), result={}))
-    return SimpleNamespace(native=native, eid=eid, binding=launch.start.binding, phrase=phrase)
-
-
 def _denied(call, status, code, message):
     with pytest.raises(Problem) as denied:
         call()
     assert denied.value.status == status
     assert denied.value.body["error"]["code"] == code
     assert denied.value.body["error"]["message"] == message
-
-
-def test_verify_refuses_a_launch_sealed_on_a_retired_stop_closure(closed_launch):
-    h = closed_launch
-    _denied(lambda: h.native.verify(h.eid), 403, "NATIVE_EVIDENCE_INVALID",
-            h.phrase + " are retired and cannot be verified")
-
-
-def test_sealed_reconcile_refuses_a_retired_stop_closure(closed_launch):
-    h = closed_launch
-    _denied(lambda: h.native.reconcile_sealed(h.binding), 403, "NATIVE_TERMINAL_INVALID",
-            h.phrase + " are retired and cannot be reconciled")
 
 
 def _late_row(store, row_id, data):
@@ -233,26 +129,22 @@ def unbuilt_peer(synthetic_standing_v1, monkeypatch):
     return SimpleNamespace(c=c, a=a, policy=policy, key=target_key(policy.authority_domain, policy.agent_id))
 
 
-def _peer_register(case, request_id):
-    """The official peer path (for_agent, as agent messages, native turns and routines take it), then register."""
-    import hashlib
-    command = InstructionSubmit(request_id=request_id, content="Synthetic peer B work.")
-    peer = case.a.for_agent(case.policy.agent_id)
-    return peer.runtime.work_policy.register(case.c.human, command.request_id,
-        hashlib.sha256(command.model_dump_json().encode()).hexdigest(), instruction=command)
+def _peer(case):
+    """The official peer path (for_agent), as agent messages, native turns and routines take it."""
+    return case.a.for_agent(case.policy.agent_id)
 
 
-def test_without_a_leftover_row_the_peer_builds_and_registers_as_before(unbuilt_peer, instruction_models):
+def test_without_a_leftover_row_the_peer_builds_as_before(unbuilt_peer):
     case = unbuilt_peer
-    record = _peer_register(case, "b-retired-target-none")
-    assert record.binding.agent_oid == case.policy.template.agent_oid
+    peer = _peer(case)
+    assert peer.runtime.work_policy.policy.template.agent_oid == case.policy.template.agent_oid
     assert case.policy.agent_id in case.a._peers
 
 
 def test_a_peer_init_failure_logs_the_problem_code_but_not_its_message(unbuilt_peer, instruction_models, caplog):
     case = unbuilt_peer
     _late_row(case.c.h.runtime.store, case.key, {"kind": "standing_hosted_target"})
-    _denied(lambda: _peer_register(case, "b-retired-target-log"), 503, "AGENT_RUNTIME_UNAVAILABLE",
+    _denied(lambda: _peer(case), 503, "AGENT_RUNTIME_UNAVAILABLE",
             "the selected peer runtime could not be initialized")
     assert "exception_type=Problem code=DELIVERY_RECORD_INVALID" in caplog.text
     assert "a retired standing target selection row is stored" not in caplog.text
@@ -280,6 +172,6 @@ def test_a_leftover_peer_selection_row_leaves_the_peer_unusable(unbuilt_peer, in
     _denied(lambda: case.a._peer_factory(case.policy), 502, "DELIVERY_RECORD_INVALID",
             "a retired standing target selection row is stored")
     for attempt in ("first", "second"):
-        _denied(lambda: _peer_register(case, "b-retired-target-" + attempt), 503, "AGENT_RUNTIME_UNAVAILABLE",
+        _denied(lambda: _peer(case), 503, "AGENT_RUNTIME_UNAVAILABLE",
                 "the selected peer runtime could not be initialized")
         assert case.policy.agent_id not in case.a._peers

@@ -116,19 +116,3 @@ def changes(authority, session, disposition, request, rows):
     )
     return result, writes
 
-
-def finish_local(authority, session, disposition):
-    from .behavior_assistant import key
-    from .behavior_store import ControlChanges
-    if authority.runtime.mode != "offline_contract" or disposition.gate.owner.kind != "local-offline":
-        raise Problem(403, "SDK_NO_START_SCOPE", "only the original offline executor can use local closure")
-    request = ControlRequest(request_id=key("no-sdk-finish", session.assignment.session_id),
-        request_digest=digest(disposition.model_dump(mode="json")), read_set=keys(authority, session))
-
-    def decide(rows):
-        result, writes = changes(authority, session, disposition, request, rows)
-        return ControlChanges(writes=writes, result={"state": "ready_to_finalize",
-            "result_digest": digest(result.model_dump(mode="json")), "work_outcome": "failed"})
-
-    return authority.store.transact(request, decide).payload["result"]
-

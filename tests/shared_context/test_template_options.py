@@ -6,19 +6,19 @@ import pytest
 
 from shared_context.behavior_agent_template import template_options
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from test_conversation_profile_selection import configured, select, template
-from test_instruction_flow import instruction_models, runtime_path
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 from test_skills_capability import FILES, GRANTS, SKILLS_REF
 
 
-def test_options_offer_effective_skills_and_capabilities_that_selection_accepts(assistant, signing_key, jwk_client):
+def test_options_offer_effective_skills_and_capabilities_that_selection_accepts(assistant_api, signing_key, jwk_client):
     from shared_context.behavior_skill_draft import HISTORY_SKILL_DRAFT_PROFILE
     from test_skill_purpose_api import add_purpose_skill
-    approved = add_purpose_skill(assistant, signing_key, jwk_client, name="approved-guide")
-    add_purpose_skill(assistant, signing_key, jwk_client, name="waiting-guide", approve=False)
-    h, control, human = configured(assistant)
+    approved = add_purpose_skill(assistant_api, signing_key, jwk_client, name="approved-guide")
+    add_purpose_skill(assistant_api, signing_key, jwk_client, name="waiting-guide", approve=False)
+    h, control, human = configured(assistant_api)
     h.runtime.capability_grants = GRANTS
     options = template_options(control, h.assistant, human)
     assert [item.name for item in options.skills] == ["approved-guide"] and not options.more_skills
@@ -34,8 +34,8 @@ def test_options_offer_effective_skills_and_capabilities_that_selection_accepts(
     assert selected.status_code == 200, selected.text
 
 
-def test_options_need_current_standing_read_scope(assistant):
-    h, control, human = configured(assistant)
+def test_options_need_current_standing_read_scope(assistant_api):
+    h, control, human = configured(assistant_api)
     control.revoke(human, "revoke-template-options")
     with pytest.raises(Problem) as error:
         template_options(control, h.assistant, human)
@@ -44,14 +44,14 @@ def test_options_need_current_standing_read_scope(assistant):
 
 @pytest.mark.parametrize("purpose_bytes", [179, 512])
 def test_native_drafts_never_block_team_options_or_hide_old_skills(
-    assistant, signing_key, jwk_client, purpose_bytes,
+    assistant_api, signing_key, jwk_client, purpose_bytes,
 ):
     from shared_context.m3_auth import HumanApprover
     from shared_context.m3_models import ApprovalInput, NativeArtifactSource, SkillPurpose, VersionInput
     from test_skill_purpose_api import add_purpose_skill
 
-    add_purpose_skill(assistant, signing_key, jwk_client, name="z-original-guide")
-    h, control, human = configured(assistant)
+    add_purpose_skill(assistant_api, signing_key, jwk_client, name="z-original-guide")
+    h, control, human = configured(assistant_api)
     h.runtime.capability_grants = GRANTS
     service = h.assistant.artifacts
     actor = h.assistant.actors[control.policy.template.agent_oid]

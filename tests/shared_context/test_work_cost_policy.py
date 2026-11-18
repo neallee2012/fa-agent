@@ -8,14 +8,14 @@ from shared_context.behavior_runtime import material
 from shared_context.behavior_store import ControlChanges,ControlRequest
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from test_m2_copilot import runtime_path
 from test_m3_auth import jwk_client,signing_key
 from work_cost_policy_helpers import install_offline, standing
 
 
-def test_budget_is_one_cumulative_usd_authority_not_abstract_root_units(assistant):
-    h,p,o,ledger,_=standing(assistant)
+def test_budget_is_one_cumulative_usd_authority_not_abstract_root_units(assistant_api):
+    h,p,o,ledger,_=standing(assistant_api)
     before=h.store.read_snapshot(())
     decision=cumulative_decision(p,ledger,o,h.time,read_id="one-read",mode=h.runtime.mode)
     assert decision.decision=="allow" and decision.unit=="USD-micro"
@@ -27,8 +27,8 @@ def test_budget_is_one_cumulative_usd_authority_not_abstract_root_units(assistan
     assert denied.decision=="deny" and denied.reason=="cumulative_budget_exhausted"
 
 
-def test_only_new_paid_decision_uses_cost_freshness_not_a_policy_deadline(assistant):
-    h,p,o,ledger,_=standing(assistant)
+def test_only_new_paid_decision_uses_cost_freshness_not_a_policy_deadline(assistant_api):
+    h,p,o,ledger,_=standing(assistant_api)
     h.time=p.legacy_template_policy.valid_until+timedelta(days=2)
     stale=cumulative_decision(p,ledger,o,h.time,read_id="old-cost",mode=h.runtime.mode)
     assert stale.reason=="cost_observation_stale"
@@ -40,8 +40,8 @@ def test_only_new_paid_decision_uses_cost_freshness_not_a_policy_deadline(assist
     assert revoked.reason=="policy_revoked"
 
 
-def test_original_scope_and_spent_high_water_cannot_regress(assistant):
-    h,p,o,ledger,_=standing(assistant)
+def test_original_scope_and_spent_high_water_cannot_regress(assistant_api):
+    h,p,o,ledger,_=standing(assistant_api)
     for changes,reason in (
         ({"observed_cumulative_microusd":0},"cost_observation_regressed"),
         ({"legacy_unresolved_reserve_microusd":0},"cost_observation_regressed"),
@@ -52,8 +52,8 @@ def test_original_scope_and_spent_high_water_cannot_regress(assistant):
         assert denied.decision=="deny" and denied.reason==reason
 
 
-def test_every_observation_scope_field_and_mode_must_match(assistant):
-    h,p,o,ledger,_=standing(assistant)
+def test_every_observation_scope_field_and_mode_must_match(assistant_api):
+    h,p,o,ledger,_=standing(assistant_api)
     decide=lambda observation,mode=h.runtime.mode:cumulative_decision(p,ledger,observation,h.time,read_id="scope",mode=mode)
     for changes in ({"observer_oid":"other-observer"},{"authority_domain":"other-domain"},
                     {"control_binding":"f"*64},{"legacy_liability_sha256":"f"*64}):
@@ -62,8 +62,8 @@ def test_every_observation_scope_field_and_mode_must_match(assistant):
     assert decide(o,"native").reason=="cost_observation_scope"
 
 
-def test_freshness_and_regression_edges(assistant):
-    h,p,o,ledger,_=standing(assistant)
+def test_freshness_and_regression_edges(assistant_api):
+    h,p,o,ledger,_=standing(assistant_api)
     decide=lambda observation,now=h.time,book=ledger:cumulative_decision(p,book,observation,now,read_id="edge",
                                                                          mode=h.runtime.mode)
     assert decide(o.model_copy(update={"observed_at":h.time+timedelta(seconds=1)})).reason=="cost_observation_stale"
@@ -76,10 +76,10 @@ def test_freshness_and_regression_edges(assistant):
         "cost_observation_regressed")
 
 
-def test_revocation_precedence_and_ledger_authority(assistant):
+def test_revocation_precedence_and_ledger_authority(assistant_api):
     import pytest
     from shared_context.errors import Problem
-    h,p,o,ledger,_=standing(assistant)
+    h,p,o,ledger,_=standing(assistant_api)
     decide=lambda policy,observation=o,book=ledger:cumulative_decision(policy,book,observation,h.time,read_id="order",
                                                                        mode=h.runtime.mode)
     assert decide(p.model_copy(update={"read_enabled":False})).reason=="result_access_revoked"
@@ -93,9 +93,9 @@ def test_revocation_precedence_and_ledger_authority(assistant):
         assert (denied.value.status,denied.value.body["error"]["code"])==(409,"WORK_POLICY_BUDGET_SCOPE")
 
 
-def test_amounts_use_only_a_matched_observation_and_every_held_amount(assistant):
+def test_amounts_use_only_a_matched_observation_and_every_held_amount(assistant_api):
     from shared_context.behavior_work_policy import work_policy_key
-    h,p,o,ledger,_=standing(assistant)
+    h,p,o,ledger,_=standing(assistant_api)
     grown=o.model_copy(update={"observed_cumulative_microusd":50_000_000,"legacy_unresolved_reserve_microusd":3_000_000})
     held=ledger.model_copy(update={"model_pending_microusd":1_000_000,"model_metered_microusd":500_000})
     decide=lambda book,observation=o,now=h.time:cumulative_decision(p,book,observation,now,read_id="amounts",
@@ -116,8 +116,8 @@ def test_amounts_use_only_a_matched_observation_and_every_held_amount(assistant)
     assert decide(short).reason=="cumulative_budget_exhausted"
 
 
-def test_an_instruction_needs_only_some_budget_and_no_fresh_cost(assistant):
-    h,p,o,ledger,_=standing(assistant)
+def test_an_instruction_needs_only_some_budget_and_no_fresh_cost(assistant_api):
+    h,p,o,ledger,_=standing(assistant_api)
     decide=lambda book,now=h.time:cumulative_decision(p,book,o,now,read_id="turn",mode=h.runtime.mode,instruction=True)
     late=decide(ledger,h.time+timedelta(days=1))
     assert (late.decision,late.required_microusd,late.remaining_microusd)==("allow",0,47_520_000)
@@ -128,8 +128,8 @@ def test_an_instruction_needs_only_some_budget_and_no_fresh_cost(assistant):
     assert decide(ledger,h.time-timedelta(seconds=1)).reason=="cost_observation_stale"
 
 
-def test_accounting_only_reports_no_budget_numbers_and_never_exhausts(assistant):
-    h,p,o,ledger,_=standing(assistant)
+def test_accounting_only_reports_no_budget_numbers_and_never_exhausts(assistant_api):
+    h,p,o,ledger,_=standing(assistant_api)
     off=ledger.model_copy(update={"budget_enforced":False,"work_reservations_microusd":200_000_000})
     late=cumulative_decision(p,off,o,h.time+timedelta(days=1),read_id="off",mode=h.runtime.mode)
     assert (late.decision,late.remaining_microusd,late.safety_reserve_microusd,late.cumulative_ceiling_microusd,

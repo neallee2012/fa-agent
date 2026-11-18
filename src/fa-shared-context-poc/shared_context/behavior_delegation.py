@@ -21,9 +21,7 @@ from .behavior_workers import ExecutorBinding, JobRecord, worker_key
 from .errors import Problem
 from .models import Identifier
 from .source_materials import digest
-from .behavior_delegation_wire import (
-    DelegationPublicText, DelegationStatus, DelegationTask, pack_delegation_text, unpack_delegation_text,
-)
+from .behavior_delegation_wire import DelegationPublicText, DelegationStatus, DelegationTask, unpack_delegation_text
 
 if TYPE_CHECKING:
     from .behavior_assistant import AssistantAuthority, _Session
@@ -49,24 +47,6 @@ class _Observation(_Model):
     event_id: Identifier
     tool_call_id: Identifier
     child_agent_id: Identifier | None = None
-
-
-class _ResultObservation(_Observation):
-    child_agent_id: Identifier
-    outcome: Literal["completed", "failed", "cancelled"]
-    text: str | None
-    ended_in_tool_call: bool = False
-    failure_code: Identifier | None = None
-
-    @model_validator(mode="after")
-    def failure(self):
-        if (self.outcome == "failed") != (self.failure_code is not None):
-            raise ValueError("only an explicit failed child supplies its public failure code")
-        return self
-
-
-class _UnknownObservation(_Observation):
-    reason_code: Identifier
 
 
 def _observation(model, **values):
@@ -129,20 +109,6 @@ class DelegationResult(_Model):
     request: ControlRequest
 
 
-class DelegationModelUsage(_Model):
-    kind: Literal["sdk_delegation_model_usage"] = "sdk_delegation_model_usage"
-    delegation_id: Identifier
-    child_agent_id: Identifier
-    parent_work_id: Identifier
-    root_request_id: Identifier
-    root_budget_id: Identifier
-    session_id: Identifier
-    job_id: Identifier
-    request_sha256: Digest
-    model_cost_id: Identifier
-    request: ControlRequest
-
-
 class DelegationView(_Model):
     delegation_id: Identifier
     parent: DelegationParent
@@ -174,10 +140,6 @@ def state_key(delegation_id):
 
 def result_key(delegation_id):
     return control_key("sdk-delegation-result", delegation_id)
-
-
-def usage_key(model_cost_id):
-    return control_key("sdk-delegation-model-usage", model_cost_id)
 
 
 def capture_parent(authority: "AssistantAuthority", session: "_Session", *, capability_sha256: str):
@@ -255,21 +217,6 @@ def _request(parent, tool_call_id, input_sha256):
     )
 
 
-def _parent_model_cost(rows, parent, request_sha256):
-    from .behavior_assistant import _ModelIntent, key
-    from .behavior_instruction_cost import ModelCost, cost_key
-    from .behavior_work_policy import WorkRegistration
-    cost = _row(rows, cost_key(parent.session_id, request_sha256), ModelCost)
-    intent = _row(rows, key("model-intent", parent.session_id, request_sha256), _ModelIntent)
-    registration = _row(rows, parent.registration_id, WorkRegistration)
-    if (cost.session_id != parent.session_id or cost.job_id != parent.execution.job_id
-            or cost.request_sha256 != request_sha256 or not intent.consumed
-            or intent.request_sha256 != request_sha256 or registration.profile.instruction is None
-            or cost.model != registration.profile.instruction.model):
-        raise Problem(409, "DELEGATION_USAGE_SCOPE", "child model use must remain on the original parent's model cost")
-    return cost
-
-
 class DelegationLedger:
     def __init__(self, store: BehaviorStore):
         self.store = store
@@ -330,31 +277,6 @@ class DelegationLedger:
         self.store.transact(request, decide)
         return self.read(parent)
 
-    def record_started(self, parent, tool_call_id, child_agent_id, *, event_id):
-        event = _observation(_Observation, event_id=event_id, tool_call_id=tool_call_id, child_agent_id=child_agent_id)
-        if event.child_agent_id is None:
-            raise Problem(422, "DELEGATION_OBSERVATION_INVALID", "the started child's original identity is required")
-        def change(state, rows, request):
-            if state.status not in {"unknown", "running"}:
-                raise Problem(409, "DELEGATION_TERMINAL", "a terminal child cannot be started again")
-            if state.child_cancelled_event_id is not None:
-                raise Problem(409, "DELEGATION_TERMINAL", "a cancelled child cannot be started again")
-            return _updated(state, status="unknown" if state.cancel_request_id is not None else "running",
-                            child_agent_id=child_agent_id, failure_code=state.failure_code
-                            if state.cancel_request_id is not None else None), ()
-        return self._record(parent, tool_call_id, child_agent_id, event_id, {"event": "started"}, change)
-
-    def record_unknown(self, parent, tool_call_id, *, event_id, reason_code, child_agent_id=None):
-        event = _observation(_UnknownObservation, event_id=event_id, tool_call_id=tool_call_id,
-                             child_agent_id=child_agent_id, reason_code=reason_code)
-        def change(state, rows, request):
-            if state.status not in {"unknown", "running"}:
-                raise Problem(409, "DELEGATION_TERMINAL", "uncertain transport cannot replace a saved child outcome")
-            return _updated(state, status="unknown", child_agent_id=child_agent_id or state.child_agent_id,
-                            failure_code=reason_code), ()
-        return self._record(parent, tool_call_id, child_agent_id, event_id,
-                            {"event": "unknown", **event.model_dump(mode="json")}, change)
-
     def request_cancel(self, parent, *, request_id):
         original = self.read(parent)
         event = _observation(_Observation, event_id=request_id, tool_call_id=original.tool_call_id)
@@ -367,122 +289,6 @@ class DelegationLedger:
         return self._record(parent, original.tool_call_id, None,
                             control_key("sdk-delegation-cancel", event.event_id),
                             {"event": "cancel_requested", "request_id": event.event_id}, change)
-
-    def record_parent_idle(self, parent, tool_call_id, child_agent_id, *, event_id):
-        event = _observation(_Observation, event_id=event_id, tool_call_id=tool_call_id, child_agent_id=child_agent_id)
-        def change(state, rows, request):
-            if (state.status not in {"unknown", "running"} or state.child_agent_id is None
-                    or event.child_agent_id != state.child_agent_id
-                    or state.cancel_request_id is None and state.child_cancelled_event_id is None):
-                raise Problem(409, "DELEGATION_STOP_SCOPE", "idle must follow this original child's cancellation")
-            stopped = state.child_cancelled_event_id is not None
-            return _updated(state, parent_idle_event_id=event.event_id,
-                            status="cancelled" if stopped else "unknown",
-                            failure_code=None if stopped else "DELEGATION_STOP_PENDING"), ()
-        return self._record(parent, tool_call_id, child_agent_id, event_id,
-                            {"event": "parent_idle"}, change)
-
-    def record_result(self, parent, tool_call_id, child_agent_id, *, event_id, outcome, text,
-                      ended_in_tool_call=False, failure_code=None):
-        event = _observation(_ResultObservation, event_id=event_id, tool_call_id=tool_call_id,
-                             child_agent_id=child_agent_id, outcome=outcome, text=text,
-                             ended_in_tool_call=ended_in_tool_call, failure_code=failure_code)
-        packed = pack_delegation_text(event.text)
-        identifier = delegation_key(parent.execution.work_id)
-        key = result_key(identifier)
-        result_sha256 = None if packed is None else packed.sha256
-        payload = {"event": "result", "outcome": event.outcome, "sha256": result_sha256,
-                   "byte_length": None if packed is None else packed.byte_length,
-                   "ended_in_tool_call": event.ended_in_tool_call, "failure_code": event.failure_code}
-        incomplete = event.outcome == "completed" and (event.ended_in_tool_call or not event.text or not event.text.strip())
-        status = "incomplete" if incomplete else event.outcome
-        public_failure = "DELEGATION_RESULT_INCOMPLETE" if incomplete else event.failure_code
-
-        def change(state, rows, request):
-            if (state.status not in {"unknown", "running"} or rows[key] is not None
-                    or state.child_cancelled_event_id is not None):
-                raise Problem(409, "DELEGATION_TERMINAL", "only the original running child may save its result")
-            writes = ()
-            if packed is not None:
-                result = DelegationResult(delegation_id=identifier, child_agent_id=child_agent_id,
-                                          data=packed.data, sha256=packed.sha256, byte_length=packed.byte_length, request=request)
-                writes = (_write(key, result, "create"),)
-            cancelled = event.outcome == "cancelled"
-            stopped = cancelled and state.parent_idle_event_id is not None
-            final_status = ("cancelled" if stopped else "unknown") if cancelled else status
-            final_failure = (None if stopped else "DELEGATION_STOP_PENDING") if cancelled else public_failure
-            return _updated(state, status=final_status, child_agent_id=child_agent_id,
-                            result_id=key if writes else None, failure_code=final_failure,
-                            child_cancelled_event_id=event.event_id if cancelled else None), writes
-
-        return self._record(parent, tool_call_id, child_agent_id, event_id, payload, change, extra=(key,))
-
-    def link_model_request(self, parent, tool_call_id, child_agent_id, request_sha256):
-        from .behavior_assistant import key
-        from .behavior_instruction_cost import cost_key
-        original = self.read(parent)
-        identifier = original.delegation_id
-        if original.tool_call_id != tool_call_id or original.child_agent_id != child_agent_id:
-            raise Problem(409, "DELEGATION_USAGE_SCOPE", "the original task and child must own the model request")
-        cost_id = cost_key(parent.session_id, request_sha256)
-        row_id = usage_key(cost_id)
-        reads = (*_parent_keys(parent), identifier, state_key(identifier), cost_id,
-                 key("model-intent", parent.session_id, request_sha256), row_id)
-        request = ControlRequest(request_id=row_id,
-            request_digest=digest([parent.model_dump(mode="json"), child_agent_id, request_sha256]),
-            read_set=reads)
-        linked = DelegationModelUsage(
-            delegation_id=identifier, child_agent_id=child_agent_id, parent_work_id=parent.execution.work_id,
-            root_request_id=parent.root_request_id, root_budget_id=parent.execution.owner.root_budget_id,
-            session_id=parent.session_id, job_id=parent.execution.job_id, request_sha256=request_sha256,
-            model_cost_id=cost_id, request=request,
-        )
-
-        def decide(rows):
-            _current_parent(rows, parent, executing=False)
-            intent = _row(rows, identifier, DelegationIntent)
-            state = _row(rows, state_key(identifier), DelegationState)
-            if intent.parent != parent or state.child_agent_id != child_agent_id:
-                raise Problem(409, "DELEGATION_USAGE_SCOPE", "parent or child changed before usage association")
-            _parent_model_cost(rows, parent, request_sha256)
-            if rows[row_id] is not None:
-                raise Problem(409, "DELEGATION_USAGE_SCOPE", "a paid model request already has its original association")
-            return ControlChanges(writes=(_write(row_id, linked, "create",
-                                                 material(linked.model_dump(mode="json"))),),
-                                  result={"delegation_id": identifier, "model_cost_id": cost_id,
-                                          "root_budget_id": parent.execution.owner.root_budget_id,
-                                          "new_charge": False})
-
-        self.store.transact(request, decide)
-        self.read_model_usage(parent, request_sha256)
-        return linked
-
-    def read_model_usage(self, parent, request_sha256):
-        from .behavior_assistant import key
-        from .behavior_instruction_cost import cost_key
-        from .source_materials import _payload_hash
-        parent = _checked(parent, DelegationParent)
-
-        def read():
-            delegation = self._read(parent)
-            cost_id = cost_key(parent.session_id, request_sha256)
-            row_id = usage_key(cost_id)
-            rows = self.store.read_snapshot((row_id, cost_id, parent.registration_id,
-                                            key("model-intent", parent.session_id, request_sha256)))
-            link = _row(rows, row_id, DelegationModelUsage)
-            if (link.delegation_id != delegation.delegation_id or link.child_agent_id != delegation.child_agent_id
-                    or link.parent_work_id != parent.execution.work_id or link.root_request_id != parent.root_request_id
-                    or link.root_budget_id != parent.execution.owner.root_budget_id
-                    or link.session_id != parent.session_id or link.job_id != parent.execution.job_id
-                    or link.request_sha256 != request_sha256 or link.model_cost_id != cost_id
-                    or link.request.request_id != row_id):
-                raise Problem(409, "DELEGATION_USAGE_SCOPE", "the retained model association belongs to another root")
-            receipt = self.store.reconcile(link.request)
-            if dict(receipt.payload["writes"]).get(row_id) != _payload_hash(rows[row_id].payload):
-                raise Problem(409, "DELEGATION_RECORD_INVALID", "the original model association receipt is required")
-            return _parent_model_cost(rows, parent, request_sha256)
-
-        return self.store.consistent_read(read)
 
     def read(self, parent: DelegationParent) -> DelegationView:
         parent = _checked(parent, DelegationParent)

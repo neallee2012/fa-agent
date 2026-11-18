@@ -28,9 +28,9 @@ LOST = "lost-session proof is inconsistent"
 SAVED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def fenced_launch(root, observed):
+def fenced_launch(observed):
     """A real unclaimed fence: the version refusal when observed is set, else the human's cancel."""
-    h = NativeHarness(root)
+    h = NativeHarness()
     h.hold_start = True
     job_id = h.specs[0].job_id
     h.workers.start(job_id, CONTEXT)
@@ -47,15 +47,15 @@ def fenced_launch(root, observed):
 
 
 @pytest.fixture(scope="module")
-def cancel_case(tmp_path_factory):
-    h, *case = fenced_launch(tmp_path_factory.mktemp("cancel"), None)
+def cancel_case():
+    h, *case = fenced_launch(None)
     yield h.native, *case
     h.close()
 
 
 @pytest.fixture(scope="module")
-def version_case(tmp_path_factory):
-    h, *case = fenced_launch(tmp_path_factory.mktemp("version"), "999")
+def version_case():
+    h, *case = fenced_launch("999")
     yield h.native, *case
     h.close()
 

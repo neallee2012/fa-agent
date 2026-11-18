@@ -1,6 +1,6 @@
 """The assistant composition without the legacy lane: no /assistant/* routes and no LocalAssistantExecutor.
 
-Same setup as `test_behavior_assistant.assistant`, for tests that only need the app or the runtime.
+The setup the retired legacy `assistant` fixture had, for tests that only need the app or the runtime.
 """
 
 import asyncio
@@ -69,8 +69,8 @@ def assistant_api(auth, jwk_client, signing_key, system):
     h.assistant = AssistantAuthority(h.runtime, h.artifacts, (A,))
     h.app = create_behavior_app(h.runtime, h.verifier)
     h.client = TestClient(h.app)
-    # Never called: helpers shared with the legacy `assistant` fixture (role_agent, capability_capture enabled)
-    # configure it. PR-D removes it with that fixture.
+    # Never called: tests assert it saw no model request, and shared helpers (role_agent, capability_capture
+    # enabled) still configure it.
     h.endpoint = ScriptedEndpoint([])
     return h
 

@@ -2,7 +2,6 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import copy
-from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 
@@ -14,8 +13,8 @@ from shared_context.behavior_migration import MigrationStore
 from shared_context.behavior_operations import control_key, _row
 from shared_context.behavior_work_policy import CostLedger, WorkPolicyControl, derive_work_binding
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models
+from assistant_api_helpers import assistant_api
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_web_test_console_attachments import draft, picker, submit as console_submit
 from test_web_test_console_frozen_interface import open_ui
@@ -23,10 +22,5 @@ from test_work_cost_policy import test_original_scope_and_spent_high_water_canno
 from web_test_console.adapter import canonical, sha
 
 
-@pytest.fixture
-def runtime_path():
-    return Path(__file__)
-
-
-def test_original_budget_scope_and_high_water_without_runtime(assistant):
-    check_high_water(assistant)
+def test_original_budget_scope_and_high_water_without_runtime(assistant_api):
+    check_high_water(assistant_api)

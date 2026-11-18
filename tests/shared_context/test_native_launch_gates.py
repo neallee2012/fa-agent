@@ -70,9 +70,9 @@ def trace(h, monkeypatch):
 
 
 @pytest.fixture
-def starting(tmp_path):
+def starting():
     """A job in `starting` with its saved attempt and slot, and no launch yet."""
-    h = NativeHarness(tmp_path)
+    h = NativeHarness()
     started = []
     adapter = h.workers.adapter
     h.workers.adapter = replace(adapter, start=started.append, verify=h.native.verify)
@@ -308,9 +308,9 @@ def test_each_refusal_waits_for_the_one_before_it(starting):
 
 
 @pytest.fixture
-def posted(tmp_path):
+def posted():
     """A posted launch nothing has claimed yet."""
-    h = NativeHarness(tmp_path)
+    h = NativeHarness()
     h.hold_start = True
     job_id = h.specs[0].job_id
     h.workers.start(job_id, CONTEXT)
@@ -529,196 +529,6 @@ def claim(h, launch, command=None, binding_id=None, principal=None, **kwargs):
                           command or claim_command(h, launch), principal or agent(launch), **kwargs)
 
 
-def test_a_fresh_claim_issues_the_saved_assignment_and_a_replay_gets_no_token(posted):
-    h, job_id, binding, launch = posted
-    fresh = claim(h, launch)
-    saved = h.native.launch(launch.launch_id)
-    assert (saved.phase, saved.process_id, saved.native_invocation_id) == (
-        "claimed", "original-supervisor", "original-native-invocation")
-    assert fresh.claim_state == "fresh" and fresh.report_token is not None
-    assignment = fresh.assignment
-    assert (assignment.launch_id, assignment.claim_id, assignment.invocation_id, assignment.process_id) == (
-        launch.launch_id, saved.claim_id, "original-native-invocation", "original-supervisor")
-    assert (assignment.process_generation, assignment.input, assignment.input_digest) == (
-        1, launch.start.input, binding.input_digest)
-    assert (assignment.previous_launch_id, assignment.checkpoint, assignment.checkpoint_after_bytes) == (
-        None, None, None)
-    assert assignment.identity == claim_command(h, launch).identity
-
-    replay = claim(h, launch)
-    assert replay.claim_state == "replay" and replay.report_token is None
-    assert replay.assignment == assignment
-
-
-def test_a_resumed_launch_names_the_launch_before_it(posted):
-    h, job_id, binding, launch = posted
-    key, job_key = native_key("launch", launch.launch_id), worker_key("job", job_id)
-    resumed = {**data(h, job_key)["binding"], "checkpoint_digest": hashlib.sha256(b"checkpoint").hexdigest()}
-    change(h, job_key, binding=resumed)
-    change(h, key, start={**data(h, key)["start"], "checkpoint": "Y2hlY2twb2ludA==", "binding": resumed})
-    assignment = claim(h, launch).assignment
-    assert (assignment.checkpoint, assignment.previous_launch_id) == (
-        b"checkpoint", native_key("launch-id", worker_key("start", job_id, "0")))
-
-
-def test_a_fresh_claim_reads_and_checks_in_this_order(posted, monkeypatch):
-    h, _, _, launch = posted
-    events = trace(h, monkeypatch)
-    claim(h, launch)
-    assert events == [
-        "read_snapshot", "row:_NativeLaunch", "transact", "row:_NativeLaunch", "_current", "row:OwnerRecord",
-        "row:NativeExecutionGrant", "row:PolicyRecord", "row:BudgetRecord", "row:JobRecord",
-        "row:_TargetReservation", "read_snapshot", "row:_NativeLaunch", "read_snapshot", "_current",
-        "row:OwnerRecord", "row:NativeExecutionGrant", "row:PolicyRecord", "row:BudgetRecord",
-    ]
-
-
-def test_a_replayed_claim_reads_and_checks_in_this_order(posted, monkeypatch):
-    """A replay never re-enters the decision, yet still re-checks the committed launch once."""
-    h, _, _, launch = posted
-    claim(h, launch)
-    events = trace(h, monkeypatch)
-    claim(h, launch)
-    assert events == [
-        "read_snapshot", "row:_NativeLaunch", "transact", "read_snapshot", "row:_NativeLaunch", "read_snapshot",
-        "_current", "row:OwnerRecord", "row:NativeExecutionGrant", "row:PolicyRecord", "row:BudgetRecord",
-    ]
-
-
-@pytest.mark.parametrize("workload_version,registered", [("checksum-count-v1", True), ("assistant-v1.2", False)])
-def test_a_bounded_claim_needs_the_registered_assistant_profile_before_anything_else(
-    posted, workload_version, registered,
-):
-    h, _, _, launch = posted
-    change(h, native_key("launch", launch.launch_id), workload_version=workload_version)
-    h.native.assistant = SimpleNamespace() if registered else None
-    other = BehaviorPrincipal("tenant", "another-oid", "team", "agent", "another", frozenset({"consume"}))
-    refuses_because(403, "NATIVE_ASSISTANT_DISABLED", "bounded claim requires the registered assistant profile",
-                    claim, h, launch, binding_id="another-binding", principal=other, assistant_conflicts=True)
-    assert h.native.launch(launch.launch_id).phase == "post_unknown"
-
-
-def test_the_agent_is_checked_before_the_assignment(posted):
-    h, _, _, launch = posted
-    other = BehaviorPrincipal("tenant", "another-oid", "team", "agent", "another", frozenset({"consume"}))
-    refuses(403, "NATIVE_EXECUTOR_IDENTITY_DENIED", claim, h, launch, binding_id="another-binding", principal=other)
-
-
-def test_a_claim_for_another_binding_is_refused_before_the_transaction(posted, monkeypatch):
-    h, _, _, launch = posted
-    events = trace(h, monkeypatch)
-    refuses_because(403, "NATIVE_CLAIM_DENIED", OUTSIDE, claim, h, launch, binding_id="another-binding")
-    assert "transact" not in events
-
-
-def test_a_claim_with_another_invocation_than_the_saved_one_is_refused_before_the_transaction(posted):
-    h, _, _, launch = posted
-    change(h, native_key("launch", launch.launch_id), native_invocation_id="saved-invocation")
-    refuses_because(403, "NATIVE_CLAIM_DENIED", OUTSIDE, claim, h, launch)
-    # The same invocation passes the early check, and the saved one still makes the permit used.
-    refuses_because(403, "NATIVE_CLAIM_DENIED", UNAVAILABLE, claim, h, launch,
-                    claim_command(h, launch, invocation_id="saved-invocation"))
-
-
-def test_a_claim_with_another_permit_is_refused(posted):
-    h, _, _, launch = posted
-    refuses_because(403, "NATIVE_CLAIM_DENIED", UNAVAILABLE, claim, h, launch,
-                    claim_command(h, launch, launch_permit=SecretStr("0" * 64)))
-    assert h.native.launch(launch.launch_id).phase == "post_unknown"
-
-
-@pytest.mark.parametrize("row,updates", [
-    ("launch", {"phase": "claimed"}),
-    ("job", {"cancel_requested": True}),
-    ("job_binding", {"generation": 2}),
-    ("target", {"active_launch_id": "another-launch"}),
-    ("target", {"generation": 2}),
-])
-def test_a_claim_once_its_permit_is_no_longer_usable_is_refused(posted, row, updates):
-    h, job_id, _, launch = posted
-    key = {"launch": native_key("launch", launch.launch_id), "job": worker_key("job", job_id),
-           "job_binding": worker_key("job", job_id), "target": h.native.target_key(launch.target, job_id)}[row]
-    if row == "job_binding":
-        updates = {"binding": {**data(h, key)["binding"], **updates}}
-    change(h, key, **updates)
-    refuses_because(403, "NATIVE_CLAIM_DENIED", UNAVAILABLE, claim, h, launch)
-
-
-@pytest.mark.parametrize("field,value", [("process_id", "another-process"), ("permit_digest", "a" * 64)])
-def test_a_replay_of_a_claim_another_process_holds_is_refused(posted, field, value):
-    h, _, _, launch = posted
-    claim(h, launch)
-    change(h, native_key("launch", launch.launch_id), **{field: value})
-    refuses_because(403, "NATIVE_CLAIM_DENIED", ANOTHER_PROCESS, claim, h, launch)
-
-
-def test_a_replay_with_another_invocation_than_the_claimed_one_is_refused_early(posted):
-    h, _, _, launch = posted
-    claim(h, launch)
-    change(h, native_key("launch", launch.launch_id), native_invocation_id="another-invocation")
-    refuses_because(403, "NATIVE_CLAIM_DENIED", OUTSIDE, claim, h, launch)
-
-
-def authority_change(h, launch, updates):
-    grant = data(h, native_key("grant", launch.grant_id))
-    if updates == "another_target":
-        return {"targets": [{**target, "session_id": "another-session"} for target in grant["targets"]]}
-    if updates == "another_definition":
-        return {"definition": {**grant["definition"], "work_id": "another-work"}}
-    if updates == "another_owner":
-        return {"owner": {**CONTEXT.model_dump(mode="json"), "epoch": 2}}
-    return updates
-
-
-@pytest.mark.parametrize("row,updates,message", [
-    ("grant", {"controller_id": "another-controller"}, ASSOCIATION),
-    ("grant", {"job_id": "another-job"}, ASSOCIATION),
-    ("grant", {"grant_id": "another-grant"}, ASSOCIATION),
-    ("grant", {"input_digest": "a" * 64}, ASSOCIATION),
-    ("grant", "another_definition", ASSOCIATION),
-    ("grant", "another_target", ASSOCIATION),
-    ("grant", {"workload_version": "assistant-v1.2"}, ASSOCIATION),
-    ("owner", {"active": False}, ASSOCIATION),
-    ("owner", {"principal_id": "another-person"}, ASSOCIATION),
-    ("owner", {"conversation_id": "another-conversation"}, ASSOCIATION),
-    ("policy", {"policy_id": "another-policy"}, ASSOCIATION),
-    ("budget", {"root_budget_id": "another-root"}, ASSOCIATION),
-    ("grant", {"active": False}, DISPATCH),
-    ("policy", {"active": False}, DISPATCH),
-    ("budget", {"active": False}, DISPATCH),
-    ("policy", {"revision": 2}, DISPATCH),
-    ("owner", {"epoch": 2}, DISPATCH),
-    ("grant", "another_owner", DISPATCH),
-    ("grant", {"expires_at": None}, DISPATCH),
-])
-def test_a_claim_outside_the_current_authority_is_refused_with_its_reason(posted, row, updates, message):
-    h, _, _, launch = posted
-    key = {"grant": native_key("grant", launch.grant_id), "owner": control_key("owner", CONTEXT.owner_record_id),
-           "policy": control_key("policy", CONTEXT.policy_id), "budget": control_key("budget", CONTEXT.root_budget_id)}[row]
-    change(h, key, **authority_change(h, launch, updates))
-    refuses_because(403, "NATIVE_AUTHORITY_FENCED", message, claim, h, launch)
-    assert h.native.launch(launch.launch_id).phase == "post_unknown"
-
-
-def test_an_association_problem_is_reported_before_a_dispatch_problem(posted):
-    h, _, _, launch = posted
-    change(h, native_key("grant", launch.grant_id), active=False, controller_id="another-controller")
-    refuses_because(403, "NATIVE_AUTHORITY_FENCED", ASSOCIATION, claim, h, launch)
-
-
-@pytest.mark.parametrize("offset,allowed", [
-    (timedelta(0), True), (-timedelta(microseconds=1), False),
-    (timedelta(hours=1) - timedelta(microseconds=1), True), (timedelta(hours=1), False),
-])
-def test_a_claim_needs_the_grant_window(posted, offset, allowed):
-    h, _, _, launch = posted
-    h.time = NOW + offset
-    if allowed:
-        assert claim(h, launch).claim_state == "fresh"
-    else:
-        refuses_because(403, "NATIVE_AUTHORITY_FENCED", DISPATCH, claim, h, launch)
-
-
 def test_a_probe_checks_only_the_association(posted):
     """Observing a launch never needs a dispatchable grant; it does need the same owner and grant."""
     h, _, binding, launch = posted
@@ -729,3 +539,11 @@ def test_a_probe_checks_only_the_association(posted):
     assert h.native.probe(binding).launch_id == launch.launch_id
     change(h, native_key("grant", launch.grant_id), controller_id="another-controller")
     refuses_because(403, "NATIVE_AUTHORITY_FENCED", ASSOCIATION, h.native.probe, binding)
+
+
+def test_an_unsealed_launch_has_no_terminal_proof(posted):
+    """Moved from test_native_report_gates, whose report-held launch came from the retired claim and probe."""
+    h, _, binding, launch = posted
+    refuses_because(409, "NATIVE_TERMINAL_UNKNOWN", "no verified permanently fenced native completion exists",
+                    h.native.reconcile_sealed, binding)
+    assert h.native.launch(launch.launch_id).evidence_sequence == launch.evidence_sequence

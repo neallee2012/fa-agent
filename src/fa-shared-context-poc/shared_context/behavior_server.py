@@ -740,8 +740,6 @@ def _native_evidence_dependency(composition, identity):
         if (composition.runtime.work_policy is not None
                 and composition.runtime.work_policy.result_route(request)):
             composition.installation()
-        elif composition.assistant is not None and composition.assistant.bounded_route(composition, request):
-            composition.assistant.acquire_evidence(composition)
         else:
             composition.require_current_native_evidence()
 

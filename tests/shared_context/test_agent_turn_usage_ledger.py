@@ -14,7 +14,7 @@ from shared_context.behavior_instruction_cost import (
 from shared_context.behavior_operations import _row
 from shared_context.errors import Problem
 from assistant_api_helpers import assistant_api
-from test_conversation_transfer_startup import claimed_turn, synthetic_standing_v1
+from test_conversation_transfer_startup import synthetic_standing_v1
 from legacy_turn_rows_helpers import read_startup
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
@@ -72,18 +72,6 @@ def test_an_unknown_native_turn_is_counted_never_zero_and_stays_final(synthetic_
     partial = record_agent_turn_usage(c.control, rid="native-partial", usage=report(
         group(requests=2, measured=0), group(model="unlisted-deployment", requests=1, measured=1))).payload["result"]
     assert partial == {"usage_recorded": True, "usage_known": True, "metered_microusd": 0, "unmetered_requests": 3}
-    read_startup(c)
-
-
-def test_native_and_job_usage_with_the_same_rid_stay_separate_and_job_path_is_unchanged(synthetic_standing_v1):
-    c = synthetic_standing_v1
-    job_id = claimed_turn(c, "shared-rid").binding.job_id
-    job = record_turn_usage(c.control, job_id=job_id, rid="shared-rid", usage=report(group()))
-    native = record_agent_turn_usage(c.control, rid="shared-rid", usage=report(group(requests=5, measured=5)))
-    assert job.payload["result"] == {"usage_recorded": True, "metered_microusd": METERED, "unmetered_requests": 1}
-    assert native.payload["result"]["usage_known"] is True
-    assert turn_usage_key(job_id, "shared-rid") != agent_turn_usage_key(c.control.policy.template.agent_oid,
-                                                                        "shared-rid")
     read_startup(c)
 
 

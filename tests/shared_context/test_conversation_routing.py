@@ -7,15 +7,15 @@ import pytest
 
 from shared_context import behavior_wire as wire
 from shared_context.behavior_work_policy_api import install_work_policy_routes
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path, sdk_io
+from assistant_api_helpers import assistant_api
+from instruction_flow_helpers import instruction_models, runtime_path, sdk_io
 from test_m3_auth import jwk_client, signing_key
-from test_work_policy_lifecycle import enabled
+from work_policy_lifecycle_helpers import enabled
 
 
 @pytest.fixture
-def conversations(assistant, monkeypatch):
-    h, _, _, _ = enabled(assistant)
+def conversations(assistant_api, monkeypatch):
+    h, _, _, _ = enabled(assistant_api)
     calls = sdk_io(monkeypatch)
     h.endpoint.unbounded = True
     install_work_policy_routes(h.app, SimpleNamespace(

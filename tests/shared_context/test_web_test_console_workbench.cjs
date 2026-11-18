@@ -2120,7 +2120,16 @@ const ruleDraftCases=[
     action:{category:"mcp",tool:"browser_navigate",target:"playwright/browser_navigate",
       arguments:{url:"https://www.cwa.gov.tw/V8/C/W/County/County.html?CID=63"}},
     exact:'允許 第一位助理 使用 browser_navigate，目標限於 "playwright/browser_navigate"，參數限定為 {"url":"https://www.cwa.gov.tw/V8/C/W/County/County.html?CID=63"}。',
-    kind:"允許 第一位助理 用 playwright 的 browser_navigate 開啟 https://www.cwa.gov.tw 網站的網頁。"},
+    kind:"允許 第一位助理 用 playwright 的 browser_navigate 開啟 https://www.cwa.gov.tw 網站的網頁。",
+    first:"允許 第一位助理 用 playwright 的 browser_navigate 開啟 https://www.cwa.gov.tw 網站的網頁。"},
+  {name:"a navigate tool whose address is not a url argument starts on the exact draft",
+    action:{category:"mcp",tool:"navigate_to",target:"other/navigate_to",arguments:{href:"https://example.com/"}},
+    exact:'允許 第一位助理 使用 navigate_to，目標限於 "other/navigate_to"，參數限定為 {"href":"https://example.com/"}。',
+    kind:'允許 第一位助理 使用 navigate_to，目標限於 "other/navigate_to"，參數不限。'},
+  {name:"a navigate tool without a URL starts on the exact draft, not the unbounded one",
+    action:{category:"mcp",tool:"browser_navigate_back",target:"playwright/browser_navigate_back",arguments:{}},
+    exact:'允許 第一位助理 使用 browser_navigate_back，目標限於 "playwright/browser_navigate_back"，參數限定為 {}。',
+    kind:'允許 第一位助理 使用 browser_navigate_back，目標限於 "playwright/browser_navigate_back"，參數不限。'},
   {name:"a shell command widens to its program in the same folder",
     action:{category:"shell",tool:"run_command",target:"/home/agent/desktop/files",arguments:{command:"  free -h ",cwd:"/workspace"}},
     exact:'允許 第一位助理 在 "/workspace" 執行指定命令 "  free -h "。',
@@ -2158,10 +2167,11 @@ const ruleDraftCases=[
       arguments:{url:"https://example.com/",script:"x"}},
     exact:'允許 第一位助理 使用 browser_navigate，目標限於 "playwright/browser_navigate"，參數限定為 {"url":"https://example.com/","script":"x"}。',
     why:"沒有「這類動作」草稿：這個開網頁動作除了網址還有其他參數，不能只看網站放行。"},
-  {name:"a navigate call too long to pin starts empty and still offers its website",
+  {name:"a navigate call too long to pin starts on its website draft and offers no exact one",
     action:{category:"mcp",tool:"browser_navigate",target:"playwright/browser_navigate",
       arguments:{url:"https://www.cwa.gov.tw/?q="+"x".repeat(600)}},
     exact:"",kind:"允許 第一位助理 用 playwright 的 browser_navigate 開啟 https://www.cwa.gov.tw 網站的網頁。",
+    first:"允許 第一位助理 用 playwright 的 browser_navigate 開啟 https://www.cwa.gov.tw 網站的網頁。",
     why:"「只這次」的草稿超過 512 字，請自己寫範圍。"},
 ];
 for(const c of ruleDraftCases){
@@ -2179,7 +2189,9 @@ for(const c of ruleDraftCases){
     assert.equal(hitlNodes(ui,"data-hitl-rule-drafts",pid).length,0,"no draft picker before 以後允許這類");
     hitlNodes(ui,"data-hitl-choice","allow_rule")[0].events.click();await ui.tick();
     const note=hitlNodes(ui,"data-hitl-rule-drafts-note",pid)[0];
-    assert.equal(hitlNodes(ui,"data-hitl-rule",pid)[0].value,c.exact,"the exact draft is filled first");
+    // Neal 2026-11-18: a navigate call's URL changes every time, so its website draft is filled first.
+    const first=c.first??c.exact;
+    assert.equal(hitlNodes(ui,"data-hitl-rule",pid)[0].value,first,"the website draft for a navigate call, else the exact one");
     assert.deepEqual(hitlNodes(ui,"data-hitl-draft","exact").map(node=>node.textContent),c.exact?["只這次"]:[]);
     assert.equal(note.hidden,!c.why);assert.equal(note.textContent,c.why||"");
     const kind=hitlNodes(ui,"data-hitl-draft","kind");

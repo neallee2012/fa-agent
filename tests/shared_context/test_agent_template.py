@@ -13,12 +13,11 @@ from fastapi.testclient import TestClient
 
 from conftest import A, C
 from shared_context.behavior_assistant import AssistantProfile
-from shared_context.behavior_assistant_api import create_assistant_app
+from shared_context.behavior_api import create_behavior_app
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.native_responses_wire import SENT_RELEASE
-from test_behavior_assistant import assistant
-from instruction_flow_helpers import runtime_path
+from assistant_api_helpers import assistant_api
 from test_m3_auth import UNKNOWN_OID, jwk_client, signing_key, token
 from test_skill_purpose import BODY, PROFILE, PURPOSE, deactivate as deactivate_skill
 from skill_purpose_api_helpers import add_purpose_skill
@@ -41,7 +40,7 @@ def configure(h, profile=PROFILE, selected=(NAME,)):
         }) for key, value in h.runtime.profiles.items()
     })
     h, control, human, _ = enabled(h)
-    h.app = create_assistant_app(h.assistant, h.verifier)
+    h.app = create_behavior_app(h.runtime, h.verifier)
     composition = SimpleNamespace(
         runtime=h.runtime, verifier=h.verifier,
         assistant=SimpleNamespace(authority=h.assistant),
@@ -51,9 +50,9 @@ def configure(h, profile=PROFILE, selected=(NAME,)):
 
 
 @pytest.fixture
-def template_case(assistant, signing_key, jwk_client):
-    source = add_purpose_skill(assistant, signing_key, jwk_client)
-    h, control, human, composition = configure(assistant)
+def template_case(assistant_api, signing_key, jwk_client):
+    source = add_purpose_skill(assistant_api, signing_key, jwk_client)
+    h, control, human, composition = configure(assistant_api)
     with TestClient(h.app) as http:
         h.client = http
         yield h, control, human, source, composition
@@ -276,8 +275,8 @@ def test_template_routes_reject_ambiguous_input(template_case, method, path, var
     assert response.status_code == 422
 
 
-def test_unconfigured_policy_exports_the_new_conversation_v2_default(assistant):
-    h, _, _, _ = configure(assistant, profile=None, selected=())
+def test_unconfigured_policy_exports_the_new_conversation_v2_default(assistant_api):
+    h, _, _, _ = configure(assistant_api, profile=None, selected=())
     with TestClient(h.app) as client:
         response = client.get(PATH, headers=h.headers())
     assert response.status_code == 200
@@ -285,8 +284,8 @@ def test_unconfigured_policy_exports_the_new_conversation_v2_default(assistant):
     assert response.json()["authorization"] is False
 
 
-def test_export_uses_current_new_conversation_default_without_changing_policy(assistant, monkeypatch):
-    h, control, _, _ = configure(assistant, profile=None, selected=())
+def test_export_uses_current_new_conversation_default_without_changing_policy(assistant_api, monkeypatch):
+    h, control, _, _ = configure(assistant_api, profile=None, selected=())
     monkeypatch.setenv(PROMPT_DEFAULT_ENV, "fa-instruction-v1")
     original = control.policy.model_dump_json()
     guard = h.store._guard()
@@ -324,8 +323,8 @@ def test_export_keeps_explicit_policy_ahead_of_default(template_case, monkeypatc
     assert inspect(h, json.loads(original)).json()["references_match"] is True
 
 
-def test_export_refuses_invalid_needed_default_without_effects(assistant, monkeypatch):
-    h, control, _, _ = configure(assistant, profile=None, selected=())
+def test_export_refuses_invalid_needed_default_without_effects(assistant_api, monkeypatch):
+    h, control, _, _ = configure(assistant_api, profile=None, selected=())
     guard = h.store._guard()
     monkeypatch.setenv(PROMPT_DEFAULT_ENV, "PRIVATE_TEMPLATE_DEFAULT_CANARY")
     with TestClient(h.app) as client:

@@ -7,7 +7,6 @@ from threading import RLock
 from time import monotonic
 
 import httpx
-import asyncio
 
 from .errors import Problem
 
@@ -40,25 +39,6 @@ class BoundedStream(httpx.AsyncByteStream):
             finally:
                 if self.close is not None:
                     await self.close()
-
-
-class AsyncFromSyncTransport(httpx.AsyncBaseTransport):
-    """Use the caller-supplied local transport without opening a real socket."""
-    def __init__(self, transport):
-        self.transport = transport
-
-    async def handle_async_request(self, request):
-        response = await asyncio.to_thread(self.transport.handle_request, request)
-        class Body(httpx.AsyncByteStream):
-            async def __aiter__(self):
-                iterator = response.iter_bytes()
-                while True:
-                    chunk = await asyncio.to_thread(next, iterator, None)
-                    if chunk is None:break
-                    yield chunk
-            async def aclose(self):
-                await asyncio.to_thread(response.close)
-        return httpx.Response(response.status_code,headers=response.headers,request=request,stream=Body())
 
 
 class LiveReplies:

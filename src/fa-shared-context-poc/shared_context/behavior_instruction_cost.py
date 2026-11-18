@@ -295,28 +295,6 @@ def price(input_tokens,output_tokens,input_rate,output_rate):
     return (input_tokens*input_rate+output_tokens*output_rate+999999)//1000000
 
 
-def reserve_writes(control,rows,value,*,admitted_policy=None):
-    ledger=_row(rows,control.cost_key,CostLedger)
-    if admitted_policy is None:
-        policy=control.installed(rows)
-    else:
-        record=_registered_instruction(control,value.job_id)
-        if (record.agent_vm is None or admitted_policy!=control.policy
-                or record.policy_sha256!=admitted_policy.sha256):
-            raise Problem(403,"INSTRUCTION_USAGE_SCOPE","the original admitted VM policy is required")
-        policy=admitted_policy
-    total=(ledger.observed_high_water_microusd+ledger.legacy_unresolved_reserve_microusd+
-        ledger.work_reservations_microusd+ledger.model_pending_microusd+ledger.model_metered_microusd+
-        value.pending_microusd+policy.safety_reserve_microusd)
-    if not policy.active or ledger.budget_enforced and total>policy.cumulative_ceiling_microusd:
-        raise Problem(403,"WORK_POLICY_CUMULATIVE_BUDGET_EXHAUSTED","original shared USD budget cannot cover this pending request")
-    key=cost_key(value.session_id,value.request_sha256)
-    if rows[key] is not None:
-        raise Problem(409,"ASSISTANT_MODEL_UNKNOWN","original paid request is already retained; do not send again")
-    return (_write(key,value,"create"),_write(control.cost_key,_updated(ledger,
-        model_pending_microusd=ledger.model_pending_microusd+value.pending_microusd),"replace"))
-
-
 def usage_facts(raw, *, wire_api="completions"):
     """Observability only: provider token counts, cached prompt tokens and tool calls in one model stream.
 
@@ -401,30 +379,4 @@ def usage_from_sse(raw, *, wire_api="completions"):
             raise Problem(503,"INSTRUCTION_USAGE_UNKNOWN","provider usage conflicts; original pending cost remains")
         found=counts
     return found
-
-
-def record_usage(authority,session,request_sha256,counts):
-    if len(counts) not in {2,3} or any(type(n) is not int or n<0 for n in counts) or len(counts)==3 and counts[2]>counts[1]:
-        raise Problem(503,"INSTRUCTION_USAGE_UNKNOWN","provider usage is invalid; original pending cost remains")
-    control=authority.runtime.work_policy
-    key=cost_key(session.assignment.session_id,request_sha256)
-    request=ControlRequest(request_id=control_key("instruction-model-usage",key),
-        request_digest=digest([key,*counts]),read_set=(control.cost_key,key))
-    def decide(rows):
-        original=_row(rows,key,ModelCost)
-        ledger=_row(rows,control.cost_key,CostLedger)
-        if (original.session_id!=session.assignment.session_id or original.job_id!=session.execution.job_id
-                or original.request_sha256!=request_sha256 or original.stage!="pending"
-                or ledger.model_pending_microusd<original.pending_microusd):
-            raise Problem(409,"INSTRUCTION_USAGE_UNKNOWN","original pending usage association differs")
-        measured=price(counts[0],counts[1],original.input_microusd_per_million,original.output_microusd_per_million)
-        updated=_updated(original,stage="usage",input_tokens=counts[0],output_tokens=counts[1],
-                         reasoning_tokens=counts[2] if len(counts)==3 else None,metered_microusd=measured)
-        return ControlChanges(writes=(_write(key,updated,"replace"),_write(control.cost_key,
-            _updated(ledger,model_pending_microusd=ledger.model_pending_microusd-original.pending_microusd,
-                     model_metered_microusd=ledger.model_metered_microusd+measured),"replace")),
-            result={"request_sha256":request_sha256,"usage_recorded":True,"retail_estimate_microusd":measured})
-    from .behavior_assistant import _ledger_conflicts
-    return (_ledger_conflicts(authority.store,request,decide) if authority.runtime.mode=="native"
-            else authority.store.transact(request,decide))
 

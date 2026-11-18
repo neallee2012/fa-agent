@@ -1,6 +1,5 @@
 """Human-approved future-conversation memory settings; never mutate standing policy."""
 
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -11,7 +10,6 @@ from .behavior_runtime import material
 from .behavior_store import ControlRequest
 from .behavior_wire import Command, Digest, Identifier, WireModel
 from .behavior_work_memory import WorkMemorySource
-from .behavior_reviewed_note_source import resolve_reviewed_note
 from .errors import Problem
 from .source_materials import canonical, digest
 
@@ -78,22 +76,12 @@ class ConversationMemoryCapture(WireModel):
         return self
 
 
-@dataclass(frozen=True)
-class MemoryAdmissionCapture:
-    value: ConversationMemoryCapture | None
-    predicates: dict
-
-
 def _memory_scope_ids(domain, agent_scope):
     return (domain,) if agent_scope is None else (domain, agent_scope.registry_id, agent_scope.agent_id)
 
 
 def settings_key(domain, request_id, agent_scope=None):
     return control_key("memory-bridge-settings", *_memory_scope_ids(domain, agent_scope), request_id)
-
-
-def settings_head_key(domain, agent_scope=None):
-    return control_key("memory-bridge-settings-head", *_memory_scope_ids(domain, agent_scope))
 
 
 def read_memory_settings(store, policy, identifier):
@@ -128,55 +116,6 @@ def read_memory_settings(store, policy, identifier):
     return record
 
 
-def current_memory_settings(store, policy):
-    from .source_materials import _payload_hash
-
-    key = settings_head_key(policy.authority_domain, policy.agent_scope)
-    row = store.read_snapshot((key,))[key]
-    if row is None:
-        return None
-    head = MemoryBridgeSettingsHead.model_validate_json(canonical(row.payload["data"]))
-    record = read_memory_settings(store, policy, head.settings_id)
-    receipt = store.reconcile(record.request)
-    if row.payload["material"] is not None or dict(receipt.payload["writes"]).get(key) != _payload_hash(row.payload):
-        raise Problem(409, "MEMORY_SETTINGS_INVALID", "the current pointer differs from its acknowledged setting")
-    return record
-
-
-def resolve_settings_note(runtime, principal, policy, record):
-    """Resolve a logical note afresh only for a new conversation, not an old captured session."""
-    choice = record.command.recall
-    if choice is None:
-        return None
-    if not record.command.enabled or record.policy_sha256 != policy.sha256:
-        raise Problem(403, "MEMORY_SETTINGS_INVALID", "the original selected memory scope is not enabled")
-    return resolve_reviewed_note(runtime, principal, choice.origin_binding_id, choice.claim_id,
-                                 policy.template, policy.legacy_template_policy.purpose)
-
-
-def capture_new_conversation_memory(control, principal):
-    """Pure admission input; callers must retain it and fence its predicates during the original admission."""
-    control._human(principal)
-    policy = control.installed()
-    if not policy.active or not policy.read_enabled:
-        raise Problem(403, "WORK_POLICY_REVOKED", "the original new-conversation scope is unavailable")
-    record = current_memory_settings(control.store, policy)
-    head_key = settings_head_key(policy.authority_domain, policy.agent_scope)
-    if record is None:
-        return MemoryAdmissionCapture(None, dict(control.store.read_snapshot((head_key,))))
-    selected = resolve_settings_note(control.runtime, principal, policy, record)
-    predicates = dict(control.store.read_snapshot((head_key, record.settings_id)))
-    if selected is not None:
-        predicates.update(selected.predicates)
-    return MemoryAdmissionCapture(
-        ConversationMemoryCapture(
-            settings_id=record.settings_id, enabled=record.command.enabled,
-            recall=None if selected is None else CapturedReviewedNote(
-                origin_binding_id=selected.origin_binding_id, source=selected.value.source),
-        ), predicates,
-    )
-
-
 def memory_slot_ids(admission_id):
     from .behavior_work_policy import work_policy_key
     return (work_policy_key("memory-note-source", admission_id),
@@ -206,42 +145,6 @@ def validate_capture_record(policy, capture, record):
             raise Problem(403, "MEMORY_RECALL_SCOPE_DENIED", "the captured note differs from the approved logical note")
 
 
-def validate_profile_memory(control, profile, binding):
-    capture = profile.memory_scope
-    if capture is None or not capture.enabled or capture.recall is None:
-        raise Problem(403, "MEMORY_RECALL_DISABLED", "the original conversation has no captured reviewed note")
-    record = read_memory_settings(control.store, control.policy, capture.settings_id)
-    validate_capture_record(control.policy, capture, record)
-    choice = record.command.recall
-    source = capture.recall.source
-    if (not record.command.enabled or choice is None
-            or capture.recall.origin_binding_id != choice.origin_binding_id
-            or source.claim_id != choice.claim_id or source.claim_version < choice.expected_claim_version
-            or source.team_id != binding.team_id or source.subject != binding.subject
-            or source.purpose != control.policy.legacy_template_policy.purpose):
-        raise Problem(403, "MEMORY_RECALL_SCOPE_DENIED", "the capture differs from its human-approved note scope")
-    return record
-
-
-def memory_for_conversation(control, principal, conversation):
-    if not conversation.jobs:
-        return capture_new_conversation_memory(control, principal)
-    previous = control._job_record(conversation.jobs[-1])
-    if previous is None:
-        control.refresh()
-        previous = control._job_record(conversation.jobs[-1])
-    if previous is None or previous.profile.instruction is None:
-        raise Problem(409, "MEMORY_SETTINGS_MISSING", "the original conversation capture is unavailable")
-    if previous.agent_scope != control.policy.agent_scope:
-        raise Problem(409, "MEMORY_SETTINGS_INVALID", "the original conversation belongs to another agent scope")
-    capture = previous.profile.memory_scope
-    if capture is None:
-        return MemoryAdmissionCapture(None, {})
-    record = read_memory_settings(control.store, control.policy, capture.settings_id)
-    validate_capture_record(control.policy, capture, record)
-    return MemoryAdmissionCapture(capture, dict(control.store.read_snapshot((record.settings_id,))))
-
-
 def apply_memory_capture(profile, binding, admission_id, capture, *, selected_template):
     from .behavior_skill_draft import HISTORY_SKILL_DRAFT_PROFILE, HISTORY_SKILL_DRAFT_MEMORY_PROFILE
 
@@ -258,11 +161,6 @@ def apply_memory_capture(profile, binding, admission_id, capture, *, selected_te
         updates["prompt_profile"] = HISTORY_SKILL_DRAFT_MEMORY_PROFILE
     profile = type(profile).model_validate_json(profile.model_copy(update=updates).model_dump_json())
     return profile, binding
-
-
-def captured_policy_fields(capture):
-    return ({"human_text_enabled": True, "text_policy_version": "human-text-policy-v1"}
-            if capture is not None and capture.enabled else {})
 
 
 def human_memory_source_write(runtime, binding, source_id, principal):

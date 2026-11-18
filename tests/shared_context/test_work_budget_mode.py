@@ -10,9 +10,9 @@ from shared_context.behavior_operations import _row
 from shared_context.behavior_work_policy import CostLedger, cumulative_decision
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from test_m3_auth import jwk_client, signing_key
-from test_work_policy_lifecycle import enabled
+from work_policy_lifecycle_helpers import enabled
 
 
 @pytest.fixture
@@ -20,8 +20,8 @@ def runtime_path():
     return Path(__file__)  # These authority tests never start an SDK process.
 
 
-def test_disable_budget_is_authorized_idempotent_and_preserves_every_counter(assistant):
-    h, control, human, facts = enabled(assistant)
+def test_disable_budget_is_authorized_idempotent_and_preserves_every_counter(assistant_api):
+    h, control, human, facts = enabled(assistant_api)
     install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier))
     before = _row(h.store.read_snapshot((control.cost_key,)), control.cost_key, CostLedger)
     command = {"request_id": "explicit-accounting-only", "policy_sha256": control.policy.sha256,
@@ -43,9 +43,9 @@ def test_disable_budget_is_authorized_idempotent_and_preserves_every_counter(ass
     assert h.store._guard() == guard
 
 
-def test_accounting_only_does_not_block_on_ceiling_or_staleness_but_keeps_revocation(assistant):
+def test_accounting_only_does_not_block_on_ceiling_or_staleness_but_keeps_revocation(assistant_api):
     from shared_context.behavior_work_budget import BudgetEnforcementCommand, set_budget_enforcement
-    h, control, human, facts = enabled(assistant)
+    h, control, human, facts = enabled(assistant_api)
     set_budget_enforcement(control, human, BudgetEnforcementCommand(
         request_id="disable-before-cost-growth", policy_sha256=control.policy.sha256, enforced=False))
     control.observe_cost(facts[0].model_copy(update={"observed_cumulative_microusd": 210_000_000}))

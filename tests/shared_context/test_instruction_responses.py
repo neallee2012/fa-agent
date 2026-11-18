@@ -9,7 +9,7 @@ import pytest
 from shared_context import behavior_assistant_wire as aw
 from shared_context.behavior_instruction_cost import usage_from_sse
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_inventory, instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 

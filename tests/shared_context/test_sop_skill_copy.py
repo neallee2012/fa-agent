@@ -19,10 +19,9 @@ from shared_context.models import CreateWork
 from shared_context.behavior_operations import control_key
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_inventory, instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key, token
-from test_sdk_compaction_product import open_turn
 from sdk_compaction_product_helpers import ordinary, settle
 from work_policy_lifecycle_helpers import enabled
 from work_cost_policy_helpers import standing, install_offline
@@ -75,8 +74,8 @@ def change_source(artifacts, agent, human, *, body=BODY, approve=True):
         sha256=hashlib.sha256(body).hexdigest(), decision="approve" if approve else "reject"))
 
 
-def test_old_installation_cannot_be_reinterpreted_as_team_copy_write_authority(assistant, signing_key, jwk_client):
-    h = assistant
+def test_old_installation_cannot_be_reinterpreted_as_team_copy_write_authority(assistant_api, signing_key, jwk_client):
+    h = assistant_api
     _, _, _, source = approved_sop(h, signing_key, jwk_client)
     h, control, human, _ = enabled(h)
     profile = AssistantProfile.model_validate({

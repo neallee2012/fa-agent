@@ -19,17 +19,17 @@ from shared_context.behavior_runtime import runtime_key
 from shared_context.errors import Problem
 from shared_context.memory_governance import ReviewedClaim, claim_digest
 from test_behavior_api import METRICS
-from test_behavior_assistant import assistant
-from instruction_flow_helpers import instruction_models, runtime_path
+from assistant_api_helpers import assistant_api
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token
 from cold_cli_helpers import cold_cli
 from reviewed_work_memory_helpers import NOTE, reviewed_note
 
 
 @pytest.fixture
-def note_case(assistant):
-    candidate = reviewed_note(assistant)
-    return SimpleNamespace(h=assistant, candidate=candidate)
+def note_case(assistant_api):
+    candidate = reviewed_note(assistant_api)
+    return SimpleNamespace(h=assistant_api, candidate=candidate)
 
 
 def arguments(case, *, claim_id="claim-one"):

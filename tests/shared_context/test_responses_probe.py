@@ -106,11 +106,11 @@ def test_default_off_never_initializes_responses_or_changes_native_platform_ids(
     with TestClient(create_host(local)) as client:
         response = client.post("/invocations", headers={**PLATFORM, NATIVE_LAUNCH_PERMIT_HEADER: "a" * 64},
                                json={"binding_id": "original", "launch_id": "original-launch"})
-        assert response.status_code == 202
+        assert response.status_code == 410
         assert client.post("/responses", json=payload()).status_code == 404
         disabled = client.post("/invocations", headers=headers(), json={"operation": "read_receipt", "request_id": RID})
         assert disabled.status_code == 403
-    assert local.start.call_args.args[1:] == ("n6-platform-invocation", IDENTITY.session_id)
+    local.start.assert_not_called()
     assert not resilient_tasks_enabled()
     assert os.environ.get("AGENTSERVER_STATE_ROOT") == original_state_root
 
@@ -165,14 +165,14 @@ def test_real_mixins_share_one_core_lifespan_and_injected_handler(local, monkeyp
 
 def test_real_dual_host_uses_bootstrap_owned_root_when_home_mkdir_is_denied(local, monkeypatch, tmp_path):
     import azure.identity.aio
-    from shared_context.behavior_assistant_hosted import AssistantSupervisor
+    from shared_context.behavior_hosted import ChecksumSupervisor
 
     home = tmp_path / "platform-home"
     home.mkdir()
     owned = home / ".fa-assistant-v12"
     executable = tmp_path / "OFFLINE-never-executed"
     executable.write_text("synthetic", encoding="utf-8")
-    supervisor = AssistantSupervisor(owned, runtime_path=executable)
+    supervisor = ChecksumSupervisor(owned)
     hosted = SimpleNamespace(identity=IDENTITY, root=owned)
     journal_before = supervisor.journal.path.read_bytes()
     mode_before = home.stat().st_mode

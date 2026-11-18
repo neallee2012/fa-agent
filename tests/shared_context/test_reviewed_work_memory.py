@@ -8,7 +8,7 @@ import pytest
 
 from shared_context.behavior_assistant import AssistantProfile
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client
 from reviewed_work_memory_helpers import reviewed_note, NOTE, configured_memory, PROFILE
@@ -40,34 +40,3 @@ def test_memory_prompt_record_is_exact_versioned_metadata_not_user_authority(fie
     with pytest.raises(ValueError):
         WorkMemoryPromptAssemblyRecord.model_validate_json(json.dumps(candidate))
 
-
-def test_memory_profile_does_not_apply_the_instruction_tool_to_structured_work(assistant):
-    from dataclasses import replace
-    from shared_context.behavior_assistant import _LocalHttp
-    from shared_context.behavior_assistant_hosted import AssistantClient
-    from shared_context.behavior_assistant_wire import AssistantSubmit
-    h = assistant
-    h.runtime.profiles = MappingProxyType({
-        name: AssistantProfile.model_validate({**profile.model_dump(), "prompt_profile": PROFILE})
-        for name, profile in h.runtime.profiles.items()
-    })
-    submitted = h.post("/assistant/submit", AssistantSubmit(request_id="structured-memory-off"))
-    assert submitted.status_code == 200
-    starts = []
-    h.workers.adapter = replace(h.workers.adapter, start=starts.append)
-    h.workers.start(h.binding.job_id, h.binding.owner)
-    assignment, ticket = h.assistant.issue(starts[0])
-    assert assignment.task.instruction is None and "work_memory_source" not in assignment.model_dump_json()
-    client = AssistantClient("https://context.invalid", assignment, ticket,
-        token_provider=lambda: h.headers("agent")["Authorization"].removeprefix("Bearer "),
-        transport=_LocalHttp(h.client))
-    try:
-        client.acquire()
-        result = client.context()
-        assert result.item_count == 3 and result.completed_count == 2
-        with pytest.raises(Problem) as disabled:
-            client.work_memory_catalog()
-        assert disabled.value.body["error"]["code"] == "WORK_MEMORY_READ_DISABLED"
-        assert h.endpoint.requests == []
-    finally:
-        client.close()

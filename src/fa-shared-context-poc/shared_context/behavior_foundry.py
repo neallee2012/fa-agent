@@ -33,7 +33,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 from dataclasses import dataclass
-from typing import Annotated, Literal, NamedTuple
+from typing import Annotated, Literal
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -479,7 +479,6 @@ class FoundryHttpClient:
         self, method: Literal["GET", "POST"], invocation_id: str | None, *,
         action: Literal["start", "observe", "cancel", "turn"], body: bytes | None = None,
         probe_id: str | None = None, launch_permit: SecretStr | None = None, before_send=None,
-        keepalive_launch_id: str | None = None,
         native_operation: str | None = None, native_stage: str | None = None, timeout: float | None = None,
     ) -> NativeResponse:
         native_turn = action == "turn"
@@ -491,7 +490,7 @@ class FoundryHttpClient:
         token = self._bearer_token()
         target = self.target
         url, params = self._route(target, action, invocation_id)
-        headers = self._headers(target, token, invocation_id, native_turn, probe_id, launch_permit, keepalive_launch_id)
+        headers = self._headers(target, token, invocation_id, native_turn, probe_id, launch_permit)
         if before_send is not None:
             before_send()
         attempt = _NativeAttempt(target=target, sent_at=monotonic(), deadline=deadline)
@@ -525,7 +524,7 @@ class FoundryHttpClient:
         url += "/" + quote(invocation_id, safe="")
         return url + "/cancel" if action == "cancel" else url, {"api-version": "v1"}
 
-    def _headers(self, target, token, invocation_id, native_turn, probe_id, launch_permit, keepalive_launch_id):
+    def _headers(self, target, token, invocation_id, native_turn, probe_id, launch_permit):
         headers = {
             "Authorization": "Bearer " + token, "Content-Type": "application/json",
             "Accept": "application/json", "Accept-Encoding": "identity",
@@ -540,10 +539,6 @@ class FoundryHttpClient:
             headers[wire.NATIVE_PROBE_HEADER] = probe_id
         if launch_permit is not None:
             headers[LAUNCH_PERMIT_HEADER] = launch_permit.get_secret_value()
-        if keepalive_launch_id is not None:
-            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", keepalive_launch_id) is None:
-                raise Problem(422, "FOUNDRY_KEEPALIVE_INVALID", "keepalive must name the original read-only launch")
-            headers[wire.NATIVE_KEEPALIVE_HEADER] = keepalive_launch_id
         return headers
 
     def _turn_headers(self, target):
@@ -649,18 +644,6 @@ class FoundryHttpClient:
 
     def observe(self, invocation_id: str, probe_id: str) -> NativeResponse:
         return self._request("GET", invocation_id, action="observe", probe_id=probe_id)
-
-    def keepalive(self, invocation_id: str, launch_id: str, *, before_send):
-        response = self._request("GET", invocation_id, action="observe", before_send=before_send,
-                                 keepalive_launch_id=launch_id)
-        try:
-            value = wire.HostedKeepalive.model_validate_json(response.body)
-        except ValueError:
-            raise Problem(502, "FOUNDRY_KEEPALIVE_INVALID", "the original read-only response differs") from None
-        if (response.status_code != 200 or value.session_id != self.target.session_id
-                or value.launch_id != launch_id or value.invocation_id != invocation_id):
-            raise Problem(502, "FOUNDRY_KEEPALIVE_INVALID", "keepalive response belongs to another launch or session")
-        return value
 
     def cancel(self, invocation_id: str, probe_id: str) -> NativeResponse:
         return self._request("POST", invocation_id, action="cancel", probe_id=probe_id, body=b"{}")
@@ -803,69 +786,6 @@ def _resident_release(report):
     stop = report.sdk_stop
     return (stop is not None and stop.release is not None and not report.child_exited
             and report.exit_code is None and report.child_pid == stop.pid)
-
-
-@dataclass(frozen=True)
-class _SubmittedReport:
-    """One Hosted report as fixed before its transaction, so every step of ``decide`` reads the same values."""
-    launch_id: str
-    probe_id: str
-    command: wire.HostedReport
-    body: dict
-    fingerprint: str
-    evidence_id: str
-    assistant_plan: tuple | None
-    no_sdk_context: tuple | None
-
-    @property
-    def sealed(self):
-        return self.command.phase in {"sealed", "sdk_not_started"}
-
-
-class _ReportOutcome(NamedTuple):
-    state: str
-    result: VerifiedWorkResult | None = None
-    checkpoint: bytes | None = None
-    completion_writes: tuple = ()
-
-
-def _same_process(current, command):
-    return (command.process_generation == current.process_generation
-            and command.binding_digest == _digest(current.start.binding.model_dump(mode="json"))
-            and command.supervisor_id == current.process_id
-            and (current.child_pid is None or command.child_pid == current.child_pid))
-
-
-def _in_sequence(current, report):
-    """A repeat of the last sequence is only the same report again."""
-    command = report.command
-    return command.sequence >= current.last_report_sequence and not (
-        command.sequence == current.last_report_sequence
-        and current.last_report_fingerprint is not None and current.last_report_fingerprint != report.fingerprint)
-
-
-def _require_owned_exit(report):
-    command = report.command
-    # The assistant plan already bound a release to its task's resident worker profile.
-    released = report.assistant_plan is not None and _resident_release(command)
-    if command.phase == "sealed" and (not (command.child_exited and command.exit_code is not None or released)
-                                       or command.child_pid is None or command.outcome is None):
-        raise Problem(403, "NATIVE_IDLE_UNVERIFIED", "owned child exit evidence is missing")
-
-
-def _assigned_checkpoint(current, command):
-    from .behavior_hosted import ChecksumCheckpoint
-    try:
-        parsed = ChecksumCheckpoint.model_validate_json(command.checkpoint)
-    except ValueError:
-        raise Problem(403, "NATIVE_CHECKPOINT_INVALID", "required checkpoint is invalid") from None
-    prefix = current.start.input[:parsed.processed_bytes]
-    if (
-        parsed.input_digest != current.start.binding.input_digest or parsed.processed_bytes > len(current.start.input)
-        or parsed.prefix_digest != hashlib.sha256(prefix).hexdigest() or parsed.newline_count != prefix.count(b"\n")
-    ):
-        raise Problem(403, "NATIVE_CHECKPOINT_INVALID", "checkpoint does not match the assigned original bytes")
-    return parsed
 
 
 def _retained_evidence_intact(current, original, row):
@@ -1147,47 +1067,6 @@ class NativeLaunchAuthority:
         key = native_key("launch", launch_id)
         return self._row(self.store.read_snapshot((key,)), key, _NativeLaunch)
 
-    def instruction_session_state(self, job):
-        """Stored state of this exact execution, not evidence that its process stopped."""
-        if job is None or job.binding is None or job.result_forwarded:
-            return None
-        from .behavior_assistant import _Session, key as assistant_key
-        key = assistant_key("session", assistant_key("session-id", job.binding.start_request_id))
-        rows = self.store.read_snapshot((key,))
-        if rows[key] is None:
-            return None
-        session = self._row(rows, key, _Session)
-        if session.execution == job.binding and session.assignment.task.instruction is not None:
-            return session.state
-        return None
-
-    def instruction_recently_active(self, job):
-        return (self.assistant is not None and self.instruction_session_state(job) == "running"
-                and self.assistant.instruction_recently_active(job.binding))
-
-    def pending_version_observation(self, job):
-        if job is not None and job.state == "failed":
-            return not job.result_forwarded and session_version_failure(self.store, job) == SESSION_VERSION_CHANGED
-        if (job is None or job.binding is None or job.generation != 1
-                or job.state not in {"starting", "capacity_uncertain"}):
-            return False
-        key = native_key("launch", native_key("launch-id", job.binding.start_request_id))
-        rows = self.store.read_snapshot((key,))
-        if rows[key] is None:
-            return False
-        launch = self._row(rows, key, _NativeLaunch)
-        if (launch.start.binding != job.binding or launch.native_invocation_id is not None
-                or launch.claim_id is not None or launch.process_id is not None
-                or launch.child_pid is not None or launch.report_token_digest is not None):
-            return False
-        if launch.phase == "post_unknown":
-            return not job.cancel_requested
-        if launch.phase == "sealed":
-            fence_key = native_key("unclaimed-fence", launch.launch_id)
-            fence = self.store.read_snapshot((fence_key,))[fence_key]
-            return fence is not None and fence.payload["data"].get("failure_code") == SESSION_VERSION_CHANGED
-        return False
-
     def _current(self, rows, launch, *, dispatch=False):
         context = launch.start.binding.owner
         owner = self._row(rows, control_key("owner", context.owner_record_id), OwnerRecord)
@@ -1357,101 +1236,6 @@ class NativeLaunchAuthority:
         if principal.kind != "agent" or principal.oid != launch.target.agent_oid or identity != _identity(launch.target):
             raise Problem(403, "NATIVE_EXECUTOR_IDENTITY_DENIED", "agent/native identity differs from the issued assignment")
 
-    def claim(self, binding_id, launch_id, command, principal, *, assistant_conflicts=False):
-        """Executor callback; MI alone NEVER consumes a launch."""
-        command = _check(command, wire.HostedClaimRequest)
-        launch = self._launch_to_claim(launch_id, assistant_conflicts)
-        self._agent(launch, principal, command.identity)
-        permit_digest = _secret_digest(command.launch_permit)
-        if (binding_id != launch.api_binding_id or not _valid_invocation_id(command.invocation_id)
-                or launch.native_invocation_id is not None and command.invocation_id != launch.native_invocation_id):
-            raise Problem(403, "NATIVE_CLAIM_DENIED", "native invocation is outside the assigned job/attempt")
-        token = SecretStr(secrets.token_hex(32))
-        claim_id = secrets.token_hex(32)
-        request = self._request("claim", (launch_id, command.request_id), {
-            "launch_id": launch_id, "process_id": command.process_id, "permit_digest": permit_digest,
-            "invocation_id": command.invocation_id, "identity": command.identity.model_dump(mode="json"),
-        }, self._keys(launch))
-        fresh = False
-
-        def decide(rows):
-            nonlocal fresh
-            current = _update(
-                self._unclaimed_launch(rows, launch_id, permit_digest),
-                phase="claimed", claim_id=claim_id, process_id=command.process_id,
-                report_token_digest=_secret_digest(token), native_invocation_id=command.invocation_id,
-            )
-            fresh = True
-            return ControlChanges(writes=(self._write(native_key("launch", launch_id), current, rows),),
-                                  result={"claim_id": claim_id})
-
-        if assistant_conflicts:
-            from .behavior_assistant import _ledger_conflicts
-            _ledger_conflicts(self.store, request, decide)
-        else:
-            self.store.transact(request, decide)
-        current = self._committed_claim(launch_id, command, permit_digest, assistant_conflicts)
-        return wire.HostedClaimReceipt(assignment=self._claim_assignment(launch_id, current),
-                                      claim_state="fresh" if fresh else "replay",
-                                      report_token=token if fresh else None)
-
-    def _launch_to_claim(self, launch_id, assistant_conflicts):
-        """The saved launch; a bounded assistant claim retries read conflicts and needs the registered profile."""
-        if not assistant_conflicts:
-            return self.launch(launch_id)
-        from .behavior_assistant import _read_conflicts
-        launch = _read_conflicts(lambda: self.launch(launch_id), phase="hosted_claim")
-        if launch.workload_version != "assistant-v1.2" or self.assistant is None:
-            raise Problem(403, "NATIVE_ASSISTANT_DISABLED", "bounded claim requires the registered assistant profile")
-        return launch
-
-    def _unclaimed_launch(self, rows, launch_id, permit_digest):
-        """The launch, still posted and unclaimed under this permit, for its current job and target generation."""
-        current = self._row(rows, native_key("launch", launch_id), _NativeLaunch)
-        self._current(rows, current, dispatch=True)
-        job = self.workers._row(rows, worker_key("job", current.start.binding.job_id), JobRecord)
-        reservation = self._row(rows,self.target_key(current.target,current.start.binding.job_id),_TargetReservation)
-        if (
-            current.phase != "post_unknown" or current.native_invocation_id is not None
-            or not secrets.compare_digest(current.permit_digest, permit_digest)
-            or job.cancel_requested or job.binding != current.start.binding
-            or reservation.active_launch_id != launch_id or reservation.generation != current.process_generation
-        ):
-            raise Problem(403, "NATIVE_CLAIM_DENIED", "one-use native launch permit is unavailable")
-        return current
-
-    def _committed_claim(self, launch_id, command, permit_digest, assistant_conflicts):
-        """The claimed launch read back under current authority; a replay must be this same process and permit."""
-        def read_current():
-            current = self.launch(launch_id)
-            self._current(self.store.read_snapshot(self._keys(current)), current, dispatch=True)
-            return current
-        if assistant_conflicts:
-            from .behavior_assistant import _read_conflicts
-            current = _read_conflicts(read_current, phase="hosted_claim_post_commit")
-        else:
-            current = read_current()
-        if (current.process_id != command.process_id or current.permit_digest != permit_digest
-                or current.native_invocation_id != command.invocation_id):
-            raise Problem(403, "NATIVE_CLAIM_DENIED", "claim replay belongs to another process/permit")
-        return current
-
-    def _claim_assignment(self, launch_id, current):
-        """What the executor runs from a claimed launch; a resumed one names the launch before it."""
-        previous = (
-            native_key("launch-id", worker_key("start", current.start.binding.job_id, str(current.start.binding.generation - 1)))
-            if current.start.checkpoint is not None else None
-        )
-        return wire.HostedAssignment(
-            launch_id=launch_id, claim_id=current.claim_id, invocation_id=current.native_invocation_id,
-            identity=_identity(current.target), process_id=current.process_id,
-            process_generation=current.process_generation, binding_digest=_digest(current.start.binding.model_dump(mode="json")),
-            input=current.start.input, input_digest=current.start.binding.input_digest,
-            checkpoint=current.start.checkpoint, checkpoint_digest=current.start.binding.checkpoint_digest,
-            previous_launch_id=previous, checkpoint_after_bytes=current.checkpoint_after_bytes,
-            workload_version=current.workload_version,
-        )
-
     def probe(self, binding: ExecutorBinding, directive="observe") -> _NativeProbe:
         """Internal controller only; a probe is persisted BEFORE native I/O."""
         launch_id = native_key("launch-id", binding.start_request_id)
@@ -1494,195 +1278,6 @@ class NativeLaunchAuthority:
 
         receipt = self.store.transact(request, decide)
         return _parse(receipt.payload["result"]["probe"], _NativeProbe)
-
-    def _reporter(self, launch, command, principal):
-        self._agent(launch, principal, command.identity)
-        if (
-            launch.claim_id is None or launch.process_id != command.process_id or launch.claim_id != command.claim_id
-            or launch.native_invocation_id is None or command.invocation_id != launch.native_invocation_id
-            or launch.report_token_digest is None
-            or not secrets.compare_digest(launch.report_token_digest, _secret_digest(command.report_token))
-        ):
-            raise Problem(403, "NATIVE_REPORTER_DENIED", "reporter lacks the original process-bound capability")
-
-    def resolve_probe(self, binding_id, launch_id, probe_id, command, principal):
-        command = _check(command, wire.HostedProbeRequest)
-        launch = self.launch(launch_id)
-        self._reporter(launch, command, principal)
-        key = native_key("probe", probe_id)
-        probe = self._row(self.store.read_snapshot((key,)), key, _NativeProbe)
-        if binding_id != launch.api_binding_id or probe.launch_id != launch_id or not probe.issued_at <= self._now() < probe.expires_at:
-            raise Problem(403, "NATIVE_PROBE_DENIED", "fresh assigned probe is unavailable")
-        return wire.HostedProbe(
-            probe_id=probe_id, launch_id=launch_id, claim_id=launch.claim_id, invocation_id=command.invocation_id,
-            identity=_identity(launch.target), process_id=launch.process_id,
-            process_generation=launch.process_generation, binding_digest=_digest(launch.start.binding.model_dump(mode="json")),
-            directive=probe.directive, control_request_id=probe.control_request_id, expires_at=probe.expires_at,
-        )
-
-    def report(self, binding_id, launch_id, probe_id, command, principal):
-        command = _check(command, wire.HostedReport)
-        launch = self.launch(launch_id)
-        self._reporter(launch, command, principal)
-        body = command.model_dump(mode="json", exclude={"report_token"})
-        probe_key = native_key("probe", probe_id)
-        assistant_plan, no_sdk_context = self._assistant_report_context(launch, command, principal)
-        extra_keys = () if assistant_plan is None else tuple(assistant_plan[2])
-        if no_sdk_context is not None:
-            extra_keys = (*extra_keys, *no_sdk_context[1])
-        request = self._request("report", (launch_id, probe_id), body,
-                                tuple(dict.fromkeys((*self._keys(launch), probe_key, *extra_keys))))
-        report = _SubmittedReport(
-            launch_id=launch_id, probe_id=probe_id, command=command, body=body,
-            fingerprint=_digest({key: value for key, value in body.items() if key not in {"request_id", "probe_id"}}),
-            evidence_id=native_key("evidence-id", launch_id, probe_id),
-            assistant_plan=assistant_plan, no_sdk_context=no_sdk_context,
-        )
-
-        def decide(rows):
-            current = self._row(rows, native_key("launch", launch_id), _NativeLaunch)
-            self._current(rows, current)
-            probe = self._row(rows, probe_key, _NativeProbe)
-            self._reporter(current, command, principal)
-            if not (self._probe_is_fresh(current, probe, binding_id, report)
-                    and _same_process(current, command) and _in_sequence(current, report)):
-                raise Problem(403, "NATIVE_REPORT_DENIED", "fresh native process/generation/probe binding differs")
-            _require_owned_exit(report)
-            if current.phase == "sealed":
-                raise Problem(409, "NATIVE_ALREADY_SEALED", "reconcile the retained terminal evidence; never execute again")
-            return self._record_report(rows, current, report, self._report_outcome(rows, current, probe, report, request))
-
-        receipt = self.store.transact(request, decide)
-        return wire.HostedEvidenceReceipt(**receipt.payload["result"])
-
-    def _assistant_report_context(self, launch, command, principal):
-        assistant_plan = None
-        no_sdk_context = None
-        if launch.workload_version == "assistant-v1.2" and command.phase == "sealed":
-            if self.assistant is None:
-                raise Problem(403, "NATIVE_ASSISTANT_DISABLED", "assistant verifier is not registered")
-            assistant_plan = self.assistant.native_report_plan(launch, command, principal)
-        if command.phase == "sdk_not_started":
-            if launch.workload_version != "assistant-v1.2" or self.assistant is None:
-                raise Problem(403, "SDK_NO_START_SCOPE", "no-SDK disposition requires its enabled assistant verifier")
-            no_sdk_context = self.assistant.no_sdk_report_context(launch, command)
-        return assistant_plan, no_sdk_context
-
-    def _probe_is_fresh(self, current, probe, binding_id, report):
-        return (binding_id == current.api_binding_id and probe.launch_id == report.launch_id
-                and report.command.probe_id == report.probe_id and probe.issued_at <= self._now() < probe.expires_at)
-
-    def _report_outcome(self, rows, current, probe, report, request):
-        """What this report proves. An assistant workload never reaches the checksum branches below it."""
-        command = report.command
-        if not report.sealed:
-            return _ReportOutcome("running" if command.phase == "running" else "unknown")
-        if command.phase == "sdk_not_started":
-            from .behavior_instruction_no_sdk import changes
-            result, completion_writes = changes(
-                self.assistant, report.no_sdk_context[0], command.sdk_no_start, request, rows)
-            return _ReportOutcome(command.outcome, result, completion_writes=completion_writes)
-        if current.workload_version == "assistant-v1.2":
-            if report.assistant_plan is None:
-                raise Problem(403, "NATIVE_ASSISTANT_DISABLED", "durable assistant result/checkpoint is required")
-            self.assistant.verify_native_report_snapshot(rows, report.assistant_plan[2])
-            return _ReportOutcome(command.outcome, *report.assistant_plan[:2])
-        if command.outcome == "succeeded":
-            return _ReportOutcome("succeeded", self._checksum_result(current, report))
-        if command.outcome == "parked":
-            return self._parked_outcome(rows, current, probe, report)
-        return _ReportOutcome(command.outcome, self._unfinished_result(rows, current, report))
-
-    def _work_result(self, current, report, state, passed_checks, content):
-        return VerifiedWorkResult(
-            evidence_id=native_key("result-id", report.launch_id), verifier_version=self.verifier_version,
-            work_id=current.start.binding.work_id, definition_digest=_digest(current.definition.model_dump(mode="json")),
-            state=state, passed_checks=passed_checks, content=content,
-            proof=_json({"native_evidence_id": report.evidence_id, "report_digest": _digest(report.body)}),
-        )
-
-    def _checksum_result(self, current, report):
-        command = report.command
-        expected = {
-            "workload_version": "checksum-count-v1", "input_digest": current.start.binding.input_digest,
-            "byte_count": len(current.start.input), "newline_count": current.start.input.count(b"\n"),
-        }
-        if command.exit_code != 0 or command.result is None or command.result.model_dump(mode="json") != expected:
-            raise Problem(403, "NATIVE_RESULT_INVALID", "saved checksum/count does not match the original assigned bytes")
-        return self._work_result(current, report, "succeeded", current.definition.required_checks, _json(expected))
-
-    def _parked_outcome(self, rows, current, probe, report):
-        from .behavior_hosted import NativeCheckpoint
-        command = report.command
-        job = self.workers._row(rows, worker_key("job", current.start.binding.job_id), JobRecord)
-        if (
-            command.exit_code != 0 or command.checkpoint is None
-            or not job.children and not job.cancel_requested
-            or probe.directive != "park" and current.checkpoint_after_bytes is None
-            and not job.cancel_requested
-        ):
-            raise Problem(403, "NATIVE_CHECKPOINT_INVALID", "parking requires an assigned control and owned exit")
-        checkpoint = _json(NativeCheckpoint(
-            predecessor_launch_id=report.launch_id, predecessor_evidence_id=report.evidence_id,
-            predecessor_binding_digest=_digest(current.start.binding.model_dump(mode="json")),
-            predecessor_identity=_identity(current.target), predecessor_process_generation=current.process_generation,
-            predecessor_process_id=current.process_id, child_pid=command.child_pid,
-            checkpoint=_assigned_checkpoint(current, command),
-        ).model_dump(mode="json"))
-        if job.cancel_requested:
-            return _ReportOutcome("stopped", self._work_result(
-                current, report, "cancelled", (), b"Constrained execution cancelled after its verified parked checkpoint."))
-        return _ReportOutcome("parked", checkpoint=checkpoint)
-
-    def _unfinished_result(self, rows, current, report):
-        command = report.command
-        if command.result is not None or command.checkpoint is not None:
-            raise Problem(403, "NATIVE_RESULT_INVALID", "failed/stopped execution cannot claim success material")
-        job = self.workers._row(rows, worker_key("job", current.start.binding.job_id), JobRecord)
-        if command.outcome == "stopped" and not job.cancel_requested:
-            raise Problem(403, "NATIVE_CONTROL_DENIED", "an executor cannot invent cancellation authority")
-        return self._work_result(current, report, "cancelled" if command.outcome == "stopped" else "failed", (),
-                                 b"Constrained checksum execution stopped without a completed result.")
-
-    def _record_report(self, rows, current, report, outcome):
-        command = report.command
-        launch_id, probe_id, evidence_id = report.launch_id, report.probe_id, report.evidence_id
-        evidence = ExecutorEvidence(
-            evidence_id=evidence_id, binding=current.start.binding, sequence=current.evidence_sequence + 1,
-            native_execution_id=current.native_invocation_id,
-            state=outcome.state, entire_tree_idle=report.sealed, all_inflight_starts_fenced=report.sealed,
-            checkpoint=outcome.checkpoint, result=outcome.result,
-            proof=_json({"launch_id": launch_id, "probe_id": probe_id, "report_digest": _digest(report.body),
-                         "native_identity": _identity(current.target).model_dump(mode="json")}),
-        )
-        now = self._now()
-        saved = _NativeEvidence(
-            launch_id=launch_id, probe_id=probe_id, evidence=evidence, observed_at=now,
-            configuration_digest=self.workers.configuration_digest(),
-            expires_at=now + timedelta(seconds=60), report_digest=_digest(report.body),
-        )
-        writes = [
-            *outcome.completion_writes,
-            self._write(native_key("evidence", evidence_id), saved, material=_material(saved.model_dump(mode="json"))),
-            ControlWrite(row_id=native_key("report", evidence_id), mode="create",
-                         data=report.body, material=_material(report.body)),
-        ]
-        current = _update(
-            current, last_report_sequence=command.sequence, evidence_sequence=evidence.sequence,
-            child_pid=command.child_pid or current.child_pid,
-            last_report_fingerprint=report.fingerprint,
-            **({"phase": "sealed", "sealed_evidence_id": evidence_id, "checkpoint": outcome.checkpoint}
-               if report.sealed else {}),
-        )
-        if report.sealed:
-            target_key = self.target_key(current.target,current.start.binding.job_id)
-            reservation = self._row(rows, target_key, _TargetReservation)
-            if reservation.active_launch_id != launch_id or reservation.generation != current.process_generation:
-                raise Problem(403, "NATIVE_PREDECESSOR_UNSETTLED", "the native target belongs to another execution")
-            writes.append(self._write(target_key, _update(reservation, active_launch_id=None), rows))
-        writes.append(self._write(native_key("launch", launch_id), current, rows))
-        return ControlChanges(writes=tuple(writes), result={"launch_id": launch_id, "probe_id": probe_id,
-                                                           "evidence_id": evidence_id, "state": outcome.state})
 
     def _verify_unclaimed_fence(self, launch, saved, fence):
         observed = _fence_observation(self, launch, saved, fence)

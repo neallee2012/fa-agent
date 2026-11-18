@@ -8,19 +8,18 @@ import httpx
 from fastapi.testclient import TestClient
 
 from conftest import A
-from shared_context.behavior_assistant import AssistantAuthority, AssistantRuntime, _LocalHttp
-from shared_context.behavior_assistant_api import create_assistant_app
+from shared_context.behavior_assistant import AssistantAuthority, AssistantRuntime
+from local_http_helpers import _LocalHttp
 from shared_context.behavior_inbox import PullInbox
 from shared_context.behavior_delivery import DeliveryCore
-from shared_context.behavior_assistant_hosted import AssistantClient
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_models, runtime_path, sdk_io
 from test_m3_auth import jwk_client, signing_key
 from work_cost_policy_helpers import standing
 
 
-def test_server_policy_retains_a_disabled_approved_daily_routine(assistant):
-    _, policy, _, _, human = standing(assistant)
+def test_server_policy_retains_a_disabled_approved_daily_routine(assistant_api):
+    _, policy, _, _, human = standing(assistant_api)
     document = policy.model_dump(mode="json")
     document["routines"] = [{
         "routine_id": "daily-check",

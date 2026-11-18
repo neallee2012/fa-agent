@@ -12,11 +12,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from shared_context import behavior_assistant_hosted as hosted
-from shared_context import behavior_assistant_wire as aw
 from shared_context import behavior_model_direct as direct
 from shared_context.errors import Problem
-from shared_context.sdk_pin import RUNTIME_VERSION
 
 URL = "https://fa-acct.services.ai.azure.com/api/projects/fa-project/openai/v1/responses"
 TOKEN = "direct-secret-token"
@@ -184,79 +181,6 @@ def test_reasoning_is_summed_only_when_every_measured_request_reported_it():
     assert both.usage().usage[0].reasoning_tokens == 20
     assert direct.responses_usage(completed(5, 3, reasoning=4)) is None
     assert direct.responses_usage(completed(5, 3) + completed(5, 4)) is None
-
-
-def _turn(tmp_path, monkeypatch, calls, *, enabled, peer=False):
-    stop = aw.SdkStop(runtime_version=RUNTIME_VERSION, pid=42, exit_code=0, graceful=True)
-
-    async def send_model(request, **options):
-        calls.append(("api", options))
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=completed(),
-                              request=request)
-    peer_work = None if not peer else aw.PeerWorkReference(
-        root_id="root", message_id="message", message_key="message-key", message_sha256="a" * 64,
-        content_sha256="b" * 64, sender_agent_id="agent-a", recipient_agent_id="agent-b",
-        recipient_work_id="work-b", conversation_id="conversation")
-    client = SimpleNamespace(
-        assignment=SimpleNamespace(task=SimpleNamespace(instruction=aw.InstructionTask(
-            content="OFFLINE", conversation_id="conversation", turn_number=2, model=MODEL,
-            model_provider="openai-responses", peer_work=peer_work)), sdk_session_id="sdk", resume=True),
-        api_url="https://offline.invalid", token_provider=lambda: "OFFLINE", model_token=lambda: TOKEN,
-        reserve_model=lambda digest: calls.append(("reserve", digest)), send_model=send_model,
-        save=lambda _: None, progress=lambda _: None,
-        save_text_reply=lambda *args: aw.ToolReceipt(state="ready_to_finalize", result_digest="a" * 64),
-        finish_failed=lambda *args: aw.ToolReceipt(state="ready_to_finalize", result_digest="a" * 64),
-    )
-    sent = []
-    monkeypatch.setenv(direct.URL_ENV, URL)
-    monkeypatch.setattr(direct, "TURN_USAGE_REPORTED", enabled)
-    original = direct.DirectResponses.from_environment.__func__
-    monkeypatch.setattr(direct.DirectResponses, "from_environment", classmethod(
-        lambda cls, token, model, **kw: original(cls, token, model, transport=provider(sent))))
-    session = hosted.AssistantSession(client, root=tmp_path, runtime_path=tmp_path / "not-executed")
-
-    async def sdk(**options):
-        boundary = options["behavior_boundary"]
-        for compacting in (False, True):
-            session._session_files = SimpleNamespace(compacting=compacting) if compacting else None
-            payload = body(n=int(compacting))
-            request = httpx.Request("POST", "https://offline.invalid/model/v1/responses", json=payload)
-            await boundary.before_request(direct.request_fingerprint(payload))
-            response = await boundary.response(await boundary.sender(request))
-            async for _ in response.aiter_bytes():
-                pass
-        session._session_files = None
-        options["on_sdk_stopped"](stop.model_dump())
-        return {"final_message": "OFFLINE answer", "sdk_stop": stop.model_dump()}
-    monkeypatch.setattr(hosted, "run_copilot", sdk)
-    monkeypatch.setattr(session, "_archive", lambda: aw.ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE"))
-    asyncio.run(session._run(tmp_path))
-    return session, sent
-
-
-def test_the_turn_sends_ordinary_requests_direct_and_compaction_through_the_api(tmp_path, monkeypatch):
-    calls = []
-    session, sent = _turn(tmp_path, monkeypatch, calls, enabled=True)
-    # The first request went direct with no API reserve or consume; the compaction kept the API path.
-    assert len(sent) == 1 and json.loads(sent[0].content)["n"] == 0
-    assert [kind for kind, _ in calls] == ["reserve", "api"] and calls[1][1] == {"checkpoint_compaction": True}
-    usage = session.turn_model_usage()
-    assert usage.state == "complete" and usage.usage[0].requests == 1
-
-
-def test_without_the_usage_report_the_whole_turn_keeps_the_api_path(tmp_path, monkeypatch):
-    calls = []
-    session, sent = _turn(tmp_path, monkeypatch, calls, enabled=False)
-    assert sent == [] and [kind for kind, _ in calls] == ["reserve", "api", "reserve", "api"]
-    assert session.turn_model_usage() is None
-
-
-def test_a_peer_turn_keeps_the_api_path_and_its_combined_allowance(tmp_path, monkeypatch):
-    # The API reserve still enforces the A/B combined model allowance until T5 replaces it.
-    calls = []
-    session, sent = _turn(tmp_path, monkeypatch, calls, enabled=True, peer=True)
-    assert sent == [] and [kind for kind, _ in calls] == ["reserve", "api", "reserve", "api"]
-    assert session.turn_model_usage() is None
 
 
 def test_only_responses_turns_outside_the_combined_allowance_are_eligible():

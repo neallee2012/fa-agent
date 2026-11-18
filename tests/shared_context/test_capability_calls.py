@@ -276,51 +276,6 @@ def test_mcp_tools_cannot_start_without_a_current_work_check(tmp_path):
             token_provider=lambda: "offline", on_event=lambda _: None, capability_session=needs))
 
 
-def test_builtin_capability_handlers_run_only_while_the_work_is_current():
-    import asyncio
-    from shared_context import behavior_assistant_hosted as hosted
-    from shared_context.m2_copilot import ToolFailure, ToolOutput, ToolSpec
-    effects = []
-
-    async def act(packet):
-        effects.append(packet["tool_call_id"])
-        return ToolOutput("done")
-    for current, expected in ((True, ["call-1"]), (False, [])):
-        effects.clear()
-
-        async def check(current=current):
-            return current
-        owner = SimpleNamespace(_capability_current=check)
-        wrapped = hosted.AssistantSession._current_first(owner, ToolSpec("desktop_act", "Act.", {"type": "object"}, act))
-        if current:
-            assert asyncio.run(wrapped.handler({"tool_call_id": "call-1"})).text == "done"
-        else:
-            with pytest.raises(ToolFailure):
-                asyncio.run(wrapped.handler({"tool_call_id": "call-1"}))
-        assert effects == expected
-
-
-def test_hosted_waits_longer_than_the_api_route_bound_so_completed_calls_are_not_reported_unknown(monkeypatch):
-    from shared_context import behavior_assistant_hosted as hosted
-    from shared_context.behavior_capabilities import CAPABILITY_CLIENT_SECONDS, CAPABILITY_ROUTE_SECONDS
-    seen, timeouts = [], []
-
-    def post(action, command, result, **options):
-        seen.append((action, options["timeout"]))
-    owner = SimpleNamespace(_post=post)
-    hosted.AssistantClient.capability_catalog(owner)
-    hosted.AssistantClient.call_capability(owner, "call-1", "WebSearch-MCP-web", {"query": "fa"}, "1" * 64)
-    assert [action for action, _ in seen] == ["capability-catalog", "capability-call"]
-    assert all(timeout.read == CAPABILITY_CLIENT_SECONDS > CAPABILITY_ROUTE_SECONDS for _, timeout in seen)
-
-    async def fake_call(entry, lookup, tool, arguments, *, timeout, **_):
-        timeouts.append(timeout)
-        return result()
-    monkeypatch.setattr(mcp_client, "call_tool", fake_call)
-    capability_call(authority(), session("WebSearch-MCP"), call("bounded"), None, once=_Once())
-    assert timeouts == [CAPABILITY_ROUTE_SECONDS]
-
-
 def test_catalog_reads_share_one_route_bound(monkeypatch):
     second = parse_entry_file("other.json", json.dumps({"mcpServers": {"Other-MCP": {
         "type": "http", "url": "https://other.test/mcp", "headers": {"x-apikey": "${secret:other-key}"},

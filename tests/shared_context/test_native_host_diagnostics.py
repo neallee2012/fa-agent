@@ -38,7 +38,7 @@ def test_native_missing_rid_has_dispatch_entry_and_return_logs(harness, caplog):
 def test_missing_native_marker_records_legacy_route_without_changing_it(harness, caplog):
     response = harness.client.post("/invocations", json={"operation": "read", "request_id": "original"},
         headers={"x-agent-session-id": IDENTITY.session_id, "x-agent-invocation-id": "platform-original"})
-    assert response.status_code == 422
+    assert (response.status_code, response.json()["error"]["code"]) == (410, "JOB_LANE_RETIRED")
     dispatch, = events(caplog, "FA_HOSTED_DISPATCH")
     assert dispatch["lane"] == "legacy" and dispatch["native_header_count"] == 0
     assert events(caplog, "FA_NATIVE_HTTP") == [] and not harness.sdk.calls

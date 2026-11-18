@@ -6,7 +6,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 from shared_context.behavior_assistant import AssistantProfile, key
-from shared_context.behavior_assistant_wire import InstructionSubmit, InstructionTask, SdkStop
+from shared_context.behavior_assistant_wire import InstructionTask, SdkStop
 from shared_context.behavior_instruction import TurnArchive, turn_material
 from shared_context.behavior_instruction_prompt import (
     INSTRUCTION_CAPABILITIES, PromptAssemblyRecord, assemble_instruction_prompt,
@@ -15,27 +15,11 @@ from shared_context.behavior_wire import ExactSourceRef
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_inventory, instruction_models, sdk_io
 from test_m3_auth import signing_key, jwk_client
 from work_policy_lifecycle_helpers import enabled
 from instruction_prompt_helpers import configured, saved_turn
-from instruction_flow_helpers import runtime_path
-
-
-def submit(h, request_id, text, conversation=None):
-    command = InstructionSubmit(request_id=request_id, content=text, conversation_id=conversation)
-    response = h.client.post("/work-policy/v1/submit", content=command.model_dump_json(), headers=h.headers())
-    assert response.status_code == 200, response.text
-    return response.json(), command
-
-
-def submit_legacy(h, request_id, text, monkeypatch):
-    """Seed a pre-v2 server choice; admission, receipts and subsequent reads stay real."""
-    from shared_context import behavior_work_policy
-    with monkeypatch.context() as original_server:
-        original_server.setattr(behavior_work_policy, "configured_prompt_override", lambda _: None)
-        return submit(h, request_id, text)
 
 
 def test_default_serialization_and_system_prefix_match_fixed_parent_bytes():
@@ -104,10 +88,10 @@ def test_safe_record_rejects_invented_source_counts_capabilities_or_private_fiel
         PromptAssemblyRecord.model_validate_json(json.dumps(record))
 
 
-def test_server_selector_changes_profile_digest_and_unknown_configuration_is_rejected(assistant):
+def test_server_selector_changes_profile_digest_and_unknown_configuration_is_rejected(assistant_api):
     from shared_context.behavior_server_config import ServerConfiguration
     from test_behavior_assistant_server import assistant_configuration
-    original = next(iter(assistant.runtime.profiles.values()))
+    original = next(iter(assistant_api.runtime.profiles.values()))
     selected = AssistantProfile.model_validate(original.model_copy(update={"prompt_profile": "fa-instruction-v1"}).model_dump())
     assert digest(original.model_dump(mode="json")) != digest(selected.model_dump(mode="json"))
     with pytest.raises(ValueError):
@@ -121,13 +105,3 @@ def test_server_selector_changes_profile_digest_and_unknown_configuration_is_rej
     assert before.sha256 != after.sha256
     assert before.resource_bindings()["assistant_sha256"] != after.resource_bindings()["assistant_sha256"]
 
-
-def test_prompt_configuration_error_has_safe_categorical_host_diagnostics(tmp_path, caplog):
-    from shared_context.behavior_assistant_hosted import AssistantSupervisor
-    supervisor = AssistantSupervisor(tmp_path/"diagnostics", runtime_path=tmp_path/"unused")
-    assert supervisor.record_failure("original-launch", "sdk_run", Problem(
-        503, "INSTRUCTION_PROMPT_CONFIGURATION", "PRIVATE_EXCEPTION_CANARY"))
-    with supervisor.journal.connect() as db:
-        raw, = db.execute("SELECT body FROM assistant_failures WHERE launch_id=?", ("original-launch",)).fetchone()
-    assert json.loads(raw)["code"] == "INSTRUCTION_PROMPT_CONFIGURATION"
-    assert "PRIVATE_EXCEPTION_CANARY" not in raw and "PRIVATE_EXCEPTION_CANARY" not in caplog.text

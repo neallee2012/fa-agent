@@ -9,7 +9,6 @@ import pytest
 from shared_context import behavior_work_policy as work
 from shared_context import behavior_work_registry as registry
 from shared_context.behavior_agent_worker import AgentVmBinding
-from shared_context.behavior_assistant_wire import AssistantSubmit
 from shared_context.behavior_profile_selection import selection_key
 from shared_context.behavior_work_policy import (
     WorkPolicyControl, refresh_once, work_policy_key,
@@ -20,7 +19,7 @@ from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key  # fixture
 from legacy_submit_rows_helpers import admitted, admitted_twice, fixed_work  # fixture
 from legacy_turn_rows_helpers import stored_turn  # fixture
-from test_work_registration_gates import code, instruction, structured  # fixture
+from work_registration_gates_helpers import code
 from test_work_result_access import Reads
 
 
@@ -225,46 +224,6 @@ def test_an_instruction_has_no_execution_deadline(monkeypatch):
     saved = record(instruction=SimpleNamespace(peer_work=None))
     control, rows = gated(monkeypatch, saved, now=1000)
     assert control.check(BINDING, policy(instruction=True, valid_until=None), rows, use="execute") is None
-
-
-# preflight
-
-
-def replaced(monkeypatch, **models):
-    """``_row`` of one model answers with these fields changed."""
-    real = work._row
-    changes = dict(zip(models["models"], models["fields"]))
-
-    def row(rows, key, model):
-        value = real(rows, key, model)
-        return value.model_copy(update=changes[model]) if model in changes else value
-
-    monkeypatch.setattr(work, "_row", row)
-
-
-def root_fields(c):
-    worker = c.control.runtime.dep.workers.contract.reservation_units
-    requests = c.control.policy.max_model_requests
-    return requests, worker
-
-
-@pytest.fixture
-def replay(structured, monkeypatch):
-    """Fixed work already admitted: only its replay decision counts."""
-    c = structured
-    c.command = AssistantSubmit(request_id="fixed-work")
-    c.bound, _ = c.control.submit(c.human, c.command)
-    monkeypatch.setattr(work, "cumulative_decision", lambda *_a, **_k: pytest.fail("a replay needs no new cost decision"))
-    monkeypatch.setattr(c.control, "source_ready", lambda *_: pytest.fail("a replay needs no source"))
-    c.authorized = []
-    authorize = c.control.runtime.authorize
-
-    def spy(binding_id, principal, use, **kwargs):
-        c.authorized.append((binding_id, use))
-        return authorize(binding_id, principal, use, **kwargs)
-
-    monkeypatch.setattr(c.control.runtime, "authorize", spy)
-    return c
 
 
 # refresh

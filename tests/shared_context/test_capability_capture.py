@@ -21,18 +21,10 @@ from shared_context.tool_catalog import build_catalog, parse_entry_file
 from assistant_api_helpers import assistant_api
 from conversation_profile_selection_helpers import configured, select, template
 from instruction_flow_helpers import instruction_models, runtime_path
-from test_instruction_prompt import submit
 from test_m3_auth import jwk_client, signing_key
-from direct_submit_helpers import submit_direct
 from capability_capture_helpers import fake_services, enabled, preinstalled, GRANTS, CATALOG, WEBIQ, choose, refs, FILES
 
 SOURCE = Path(__file__).resolve().parents[2] / "src" / "fa-shared-context-poc"
-
-
-def turn(h, control, request_id, conversation=None):
-    accepted, _ = submit(h, request_id, "Compare the two sources.", conversation)
-    assert h.runtime.controller.step(accepted["binding_id"]).state == "succeeded"
-    return accepted, control.records[accepted["binding_id"]].profile.instruction
 
 
 def test_no_capability_wire_template_and_profile_bytes_are_unchanged():
@@ -57,25 +49,6 @@ def test_selection_refuses_unknown_changed_or_non_composable_entries(assistant_a
                                         capabilities=refs("WebSearch-MCP")))
     assert response.status_code == 422
     assert h.store._guard() == before
-
-
-@pytest.mark.parametrize("image_input", [None, True])
-def test_vision_capabilities_need_an_image_model_at_admission(assistant_api, monkeypatch, image_input):
-    h, control = enabled(assistant_api, monkeypatch)
-    name = control.models.default
-    control.models.models[name] = control.models.models[name].model_copy(update={"supports_image_input": image_input})
-    choice, _ = choose(h, "choose-desktop", ("fa-desktop-v1",))
-    assert choice.status_code == 200, choice.text
-    before = h.store._guard()
-    if image_input is True:
-        accepted, _ = submit_direct(h, "desktop-turn", "Open my notes.")
-        task = control.records[accepted["binding_id"]].profile.instruction
-        assert task.capabilities.vision and task.capabilities.grants[0].tools[0] == "desktop_open_file"
-    else:
-        with pytest.raises(Problem) as refused:
-            submit_direct(h, "desktop-turn", "Open my notes.")
-        assert refused.value.status == 422 and refused.value.body["error"]["code"] == "CAPABILITY_MODEL_UNSUPPORTED"
-        assert h.store._guard() == before
 
 
 def test_capture_rules_are_intersection_and_record_only_checks():

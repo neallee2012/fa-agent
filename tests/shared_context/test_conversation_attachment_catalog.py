@@ -2,29 +2,24 @@
 
 import pytest
 
-from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_attachment_catalog import AttachmentSourceCatalog
 from shared_context.behavior_instruction import conversation_key
-from test_behavior_assistant import assistant
 from assistant_api_helpers import assistant_api
 from conversation_profile_selection_helpers import configured, select, template
 from instruction_flow_helpers import instruction_models, runtime_path, sdk_io
-from direct_submit_helpers import submit_direct
+from legacy_replay_helpers import legacy_tokens, replayed
 from test_m3_auth import jwk_client, signing_key
 
 GLOBAL = "/work-policy/v1/attachment-sources"
 
 
-def submit(h, request_id):
-    result = h.client.post("/work-policy/v1/submit", headers=h.headers(), content=InstructionSubmit(
-        request_id=request_id, content="Hold the original settings for this conversation.",
-    ).model_dump_json())
-    assert result.status_code == 200, result.text
-    return result.json()
-
-
 def admit(h, request_id):
-    return submit_direct(h, request_id, "Hold the original settings for this conversation.")[0]
+    """`request_id` as the retired WorkPolicyControl.submit admitted it on 80ec0865: its rows, then its own refresh."""
+    admitted = replayed(h)
+    control = h.runtime.work_policy
+    control.refresh(admitted["binding_id"])
+    assert control.records[admitted["binding_id"]].request_id == request_id
+    return admitted
 
 
 def path(conversation):
@@ -32,7 +27,8 @@ def path(conversation):
 
 
 @pytest.mark.parametrize("enabled_before", [False, True], ids=["old-disabled-new-enabled", "old-enabled-new-disabled"])
-def test_existing_conversation_uses_its_own_attachment_setting_after_selection_changes(assistant_api, enabled_before, monkeypatch):
+def test_existing_conversation_uses_its_own_attachment_setting_after_selection_changes(
+        legacy_tokens, assistant_api, enabled_before, monkeypatch):
     h, control, _ = configured(assistant_api)
     previous = None
     if enabled_before:
@@ -74,14 +70,14 @@ def test_unknown_conversation_does_not_fall_back_to_current_default(assistant_ap
 
 
 @pytest.mark.parametrize("identity", ["agent", "old-m3"])
-def test_conversation_catalogue_does_not_accept_other_principals(assistant_api, identity):
+def test_conversation_catalogue_does_not_accept_other_principals(legacy_tokens, assistant_api, identity):
     h, _, _ = configured(assistant_api)
     conversation = admit(h, "not-an-agent-catalogue")
     response = h.client.get(path(conversation), headers=h.headers(identity))
     assert response.status_code == 403
 
 
-def test_conversation_catalogue_rejects_extra_scope_and_revoked_read(assistant_api):
+def test_conversation_catalogue_rejects_extra_scope_and_revoked_read(legacy_tokens, assistant_api):
     h, control, human = configured(assistant_api)
     conversation = admit(h, "scope-catalogue")
     for suffix, body in (("?team=elsewhere", None), ("", b'{"profile":"other"}')):
@@ -94,7 +90,7 @@ def test_conversation_catalogue_rejects_extra_scope_and_revoked_read(assistant_a
 
 
 @pytest.mark.parametrize("field", ["human_oid", "team_id", "agent_oid"])
-def test_conversation_scope_cannot_be_substituted_before_metadata_read(assistant_api, field):
+def test_conversation_scope_cannot_be_substituted_before_metadata_read(legacy_tokens, assistant_api, field):
     h, _, _ = configured(assistant_api)
     conversation = admit(h, "original-scope-catalogue")
     h.mutate(conversation_key(conversation["conversation_id"]), **{field: "different-original-owner"})
@@ -105,7 +101,7 @@ def test_conversation_scope_cannot_be_substituted_before_metadata_read(assistant
     assert "entries" not in response.json() and h.store._guard() == before
 
 
-def test_legacy_conversation_without_hosted_identity_requires_explicit_reset(assistant_api):
+def test_legacy_conversation_without_hosted_identity_requires_explicit_reset(legacy_tokens, assistant_api):
     h, _, _ = configured(assistant_api)
     conversation = admit(h, "legacy-no-hosted-catalogue")
     h.mutate(conversation_key(conversation["conversation_id"]), hosted_session_id=None)

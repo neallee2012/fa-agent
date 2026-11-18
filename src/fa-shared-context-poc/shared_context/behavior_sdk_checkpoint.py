@@ -1,16 +1,12 @@
 """Immutable SDK checkpoints in the existing ArtifactStore; no new conversation engine."""
 import hashlib
-import json
 from typing import Literal
 from pydantic import Field
 
-from .behavior_operations import _Model, _row, _write, _updated
-from .behavior_store import ControlRequest, ControlChanges
+from .behavior_operations import _Model, _row
+from .behavior_store import ControlRequest
 from .behavior_wire import AssistantSdkStop, Digest, Identifier
-from .behavior_sdk_state import (
-    SdkState, StoredSdkArchive, SdkStatePart, SaveSdkState, CheckpointSource,
-    DIAG_CODECS, DIAG_ARCHIVE_CODECS, ARCHIVE_CODECS,
-)
+from .behavior_sdk_state import SdkState, StoredSdkArchive, SdkStatePart, CheckpointSource, DIAG_CODECS, DIAG_ARCHIVE_CODECS, ARCHIVE_CODECS
 from .errors import Problem
 from .m3_models import MAX_ARTIFACT_BYTES
 from .source_materials import digest
@@ -216,65 +212,6 @@ def _gate(authority, session, rows):
             or job.state not in {"starting", "running", "capacity_uncertain"}
             or current.state not in {"running", "waiting"} or current.execution != session.execution):
         raise Problem(403, "ASSISTANT_EXECUTION_FENCED", "the original cancelled turn execution is required")
-
-
-def save_state(authority, session, command):
-    task = session.assignment.task.instruction
-    if (task is None or command.request_id != "sdk-state"
-            or command.state.sdk_session_id != session.assignment.sdk_session_id or not command.sdk_stop.graceful
-            or command.sdk_stop.release is not None and command.sdk_stop.release != task.worker_profile):
-        raise Problem(403, "ASSISTANT_CHECKPOINT_SCOPE", "only the stopped original instruction SDK may checkpoint")
-    if command.state.model_provider != task.model_provider:
-        raise Problem(409, "SDK_STATE_UNSUPPORTED_FORMAT", "checkpoint provider differs from the original task")
-    binding = authority._binding(session)
-    # Validate source and state before reserving an intent or issuing any PUT.
-    command = SaveSdkState.model_validate_json(command.model_dump_json())
-    source, prior_rows = _source(authority, session, command)
-    key = checkpoint_key(binding.job_id)
-    reads = (*authority._keys(session), key, *prior_rows)
-    values = {"job_id": binding.job_id, "sdk_session_id": session.assignment.sdk_session_id,
-              "conversation_id": task.conversation_id, "sha256": command.state.sha256,
-              "byte_length": len(command.state.encoded()), "sdk_stop": command.sdk_stop.model_dump(mode="json")}
-    if source is not None:
-        values["source"] = source.model_dump(mode="json")
-    request = _request(session, reads, "prepare", values)
-    planned = SdkStateUpload(**values, prepare=request)
-    fresh = False
-
-    def prepare(rows):
-        nonlocal fresh
-        _gate(authority, session, rows)
-        if any(rows[k] != value for k, value in prior_rows.items()):
-            raise Problem(409, "SDK_STATE_SOURCE_UNVERIFIED", "prior published checkpoint changed")
-        if rows[key] is not None:
-            raise Problem(409, "SDK_STATE_UPLOAD_UNKNOWN", "original SDK state upload already exists")
-        fresh = True
-        return ControlChanges(writes=(_write(key, planned, "create"),), result={"upload_reserved": True})
-
-    authority.store.transact(request, prepare)
-    if not fresh:
-        row = authority.store.read_snapshot((key,))[key]
-        current = None if row is None else SdkStateUpload.model_validate_json(json.dumps(row.payload["data"]))
-        if current is not None and current.prepare == request and current.reference is not None:
-            load_state(authority, session, current.reference, job_id=binding.job_id)
-            return current.reference
-        raise Problem(409, "SDK_STATE_UPLOAD_UNKNOWN", "original upload may have occurred; do not repeat it")
-    reference = SdkCheckpointStore(authority.artifacts.store).save(command.state, binding,
-        conversation_id=task.conversation_id, source=source, checkpoint_profile=task.checkpoint_profile,
-        model_provider=task.model_provider)
-    committed = _updated(planned, reference=reference)
-    complete = _request(session, reads, "complete", reference.model_dump(mode="json"))
-
-    def finish(rows):
-        _gate(authority, session, rows)
-        if any(rows[k] != value for k, value in prior_rows.items()):
-            raise Problem(409, "SDK_STATE_SOURCE_UNVERIFIED", "prior published checkpoint changed")
-        if _row(rows, key, SdkStateUpload) != planned:
-            raise Problem(409, "SDK_STATE_UPLOAD_UNKNOWN", "original SDK upload changed")
-        return ControlChanges(writes=(_write(key, committed, "replace"),), result={"checkpoint_saved": True})
-
-    authority.store.transact(complete, finish)
-    return reference
 
 
 def published_record(authority, reference, *, job_id):

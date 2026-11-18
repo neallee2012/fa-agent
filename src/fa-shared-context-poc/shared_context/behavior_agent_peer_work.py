@@ -1,8 +1,7 @@
 """Unpaid receiver registration from one already-authorized peer assignment."""
 
 from .behavior_assistant_wire import InstructionSubmit, PeerWorkReference
-from .behavior_auth import BehaviorPrincipal
-from .behavior_delegation import _current_parent, _parent_keys
+from .behavior_delegation import _parent_keys
 from .behavior_operations import control_key
 from .errors import Problem
 from .source_materials import digest
@@ -27,22 +26,6 @@ def validate_reference(root, policy, reference, request_id, instruction):
             or reference.content_sha256 != digest(instruction.content)
             or instruction.conversation_id is not None or instruction.files or instruction.attachments):
         raise Problem(403, "AGENT_MESSAGE_ASSIGNMENT_DENIED", "the receiver work differs from the original peer assignment")
-
-
-def authorize_registration(control, principal, reference, request_id, instruction):
-    from .behavior_agent_message_api import _read_root
-    root = _read_root(control.store, reference.root_id)
-    validate_reference(root, control.policy, reference, request_id, instruction)
-    sender = root.directory.agents[0]
-    if (not isinstance(principal, BehaviorPrincipal) or principal.kind != "agent"
-            or (principal.tenant_id, principal.team, principal.oid, principal.actor_id)
-            != (sender.tenant_id, sender.team_id, sender.principal_oid, sender.actor_id)):
-        raise Problem(403, "AGENT_MESSAGE_IDENTITY_DENIED", "only the original verified sender may register this peer work")
-    principal.require(sender.team_id, "submit")
-    _current_parent(control.store.read_snapshot(_parent_keys(root.origin)), root.origin)
-    if control.runtime._now() >= root.spec.deadline:
-        raise Problem(403, "AGENT_MESSAGE_ROOT_EXPIRED", "the original peer work allowance has expired")
-    return root
 
 
 def narrow_profile(profile):

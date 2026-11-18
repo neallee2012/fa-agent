@@ -85,29 +85,6 @@ def test_legacy_event_transform_bytes_are_preserved(tmp_path):
     assert fs.snapshot().files["events.jsonl"]==legacy["events.jsonl"]
 
 
-def test_hosted_checkpoint_rejects_known_transport_credentials_before_upload(tmp_path):
-    from types import SimpleNamespace
-    from pydantic import SecretStr
-    from shared_context.behavior_assistant_hosted import AssistantClient,AssistantSession
-    from shared_context.behavior_assistant_wire import SdkStop
-    token="CTX03_REAL_CLIENT_TRANSPORT_CANARY"
-    def no_upload(_):
-        pytest.fail("private material must be rejected before any HTTP upload")
-    client=AssistantClient("https://offline.invalid",SimpleNamespace(task=SimpleNamespace(instruction=None)),SecretStr("a"*64),
-                           token_provider=lambda:token,transport=httpx.MockTransport(no_upload))
-    try:
-        assert client._token()==token
-        fs=SdkSessionFiles("private-test");fs.files=files_with_private_marker()
-        fs.files["temp/copied.txt"]=token
-        session=AssistantSession(client,root=tmp_path,runtime_path=tmp_path/"not-started")
-        session._session_files=fs
-        session._sdk_stop=SdkStop(pid=42,exit_code=0,graceful=True)
-        result=session._archive()
-        assert result.error=="SDK_STATE_PRIVATE_MATERIAL"
-    finally:
-        client.close()
-
-
 @pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\u0085"], ids=["u2028", "u2029", "u0085"])
 @pytest.mark.parametrize("line_ending", ["\n", "\r\n"], ids=["lf", "crlf"])
 def test_unicode_content_round_trips_ordinary_and_inline_jsonl(tmp_path, separator, line_ending):

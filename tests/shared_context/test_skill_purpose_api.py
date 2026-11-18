@@ -9,14 +9,14 @@ from fastapi.testclient import TestClient
 
 from conftest import A
 from shared_context.behavior_assistant import AssistantProfile
-from shared_context.behavior_assistant_api import create_assistant_app
+from shared_context.behavior_api import create_behavior_app
 from shared_context.behavior_assistant_gateway import AssistantProvider
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_skill_purpose_prompt import SkillPurposePromptAssemblyRecord
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from approved_skill_api_helpers import change_artifact
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_artifacts import V1
@@ -53,7 +53,7 @@ def test_revocation_during_read_never_returns_loaded_body_or_purpose(
 def gateway(h, token, send):
     provider = AssistantProvider("https://provider.invalid/openai/v1/chat/completions",
                                  SimpleNamespace(get_token=token), transport=httpx.MockTransport(send))
-    h.app = create_assistant_app(h.assistant, h.verifier, provider=provider)
+    h.app = create_behavior_app(h.runtime, h.verifier)
     install_work_policy_routes(h.app, SimpleNamespace(
         runtime=h.runtime, verifier=h.verifier, installation=lambda: None,
         require_current_native_evidence=lambda: None,
@@ -113,7 +113,7 @@ def test_new_skill_description_does_not_change_the_8192_byte_body_boundary(assis
             "read_skill", result.model_dump_json())
 
 
-def test_a_profile_cannot_name_an_unknown_purpose_profile_version(assistant):
-    original = next(iter(assistant.runtime.profiles.values())).model_dump()
+def test_a_profile_cannot_name_an_unknown_purpose_profile_version(assistant_api):
+    original = next(iter(assistant_api.runtime.profiles.values())).model_dump()
     with pytest.raises(ValueError):
         AssistantProfile.model_validate({**original, "prompt_profile": "fa-instruction-skill-purpose-v99"})

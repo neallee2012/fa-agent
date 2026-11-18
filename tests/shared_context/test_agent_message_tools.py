@@ -294,42 +294,6 @@ def test_known_route_rejection_keeps_its_code_and_cannot_be_reported_as_a_b_resu
     assert len(calls) == 1 and c.reads == []
 
 
-@pytest.mark.parametrize(("code", "expected"), [
-    ("AGENT_MESSAGE_ROUTE_DENIED", "AGENT_MESSAGE_ROUTE_DENIED"),
-    ("WORK_POLICY_SCOPE_CHANGED", "WORK_POLICY_SCOPE_CHANGED"),
-    ("BEHAVIOR_CURRENT_POLICY_DENIED", "BEHAVIOR_CURRENT_POLICY_DENIED"),
-    ("PRIVATE_UPSTREAM_CODE", "AGENT_MESSAGE_UNKNOWN"),
-])
-def test_hosted_peer_refusal_codes_are_allowlisted_without_reading_error_bodies(tool_case, caplog, code, expected):
-    import httpx
-    from pydantic import SecretStr
-    from shared_context.behavior_assistant_hosted import AssistantClient
-    c = tool_case
-    assignment = c.session.client.assignment
-    assignment.binding_id, assignment.session_id = "binding-a", "a" * 64
-    calls = []
-
-    def reject(request):
-        calls.append(request.url.path)
-        return httpx.Response(403, headers={"x-behavior-assistant-error-code": code},
-                              json={"error": "PRIVATE_UPSTREAM_BODY"})
-
-    client = AssistantClient("https://context.invalid", assignment, SecretStr("synthetic-ticket"),
-        token_provider=lambda: "synthetic-token", transport=httpx.MockTransport(reject))
-    try:
-        with pytest.raises(Problem) as refused:
-            client.send_agent_message(AgentMessage(message_id="original", recipient_agent_id="agent-b",
-                                                   kind="handoff", content="PRIVATE_BRIEF"))
-    finally:
-        client.close()
-    assert refused.value.body["error"]["code"] == expected and len(calls) == 1
-    assert any("AGENT_MESSAGE_REQUEST_FAILED" in record.message and expected in record.message
-               for record in caplog.records)
-    for value in ("PRIVATE_UPSTREAM_CODE", "PRIVATE_UPSTREAM_BODY", "PRIVATE_BRIEF",
-                  "synthetic-token", "synthetic-ticket"):
-        assert value not in str(refused.value.body) and value not in caplog.text
-
-
 def test_concurrent_same_sdk_call_does_not_send_the_peer_message_twice(tool_case):
     from shared_context.behavior_agent_message_tools import agent_message_capability
     c = tool_case

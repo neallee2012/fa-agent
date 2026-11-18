@@ -28,7 +28,7 @@ from shared_context.native_capability_tools import REFUSED, UNKNOWN
 from shared_context.native_sdk import native_capability_providers
 from shared_context.native_turns import NativeTurnControl
 from shared_context.tool_catalog import CatalogError, build_catalog, load_catalog, parse_entry_file
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from test_capability_calls import WEBIQ
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key

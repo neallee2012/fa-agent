@@ -3265,11 +3265,10 @@ API-only DTO／codec 不匯入 Hosted SDK；正常同 build 配對新版 reader�
   及匯入其 harness 的測試，會在 setup 停在 `the pinned offline tokenizer cache is required`。
   每個 shell 都要設 `TIKTOKEN_CACHE_DIR`，指向已用固定版 `tiktoken` 正式 loader 預先下載的 cache
   （預設位置是 `src/fa-shared-context-poc/.venv/fa-tokenizer-cache`，新建的 worktree 沒有這個目錄）。
-- **Windows 長路徑**：`test_behavior_assistant.py` 的三則 cold-resume 測試，會在測試目錄下建立約 200 字元的
-  離線 SDK checkpoint 路徑。Windows 沒開 `LongPathsEnabled=1` 時，請改用短的 `--basetemp`（例如 `C:\t`）；
-  否則這三則會顯示 SKIPPED（原本是 `WinError 206`），不算通過。Hosted 跑在 Linux，沒有這個限制。
-  用真 runtime 的 `test_native_reasoning_facts.py`、`test_native_auto_compaction.py` 與 `test_native_sdk_runtime.py`
-  的 memory-tiers 測試也一樣：`N1_NATIVE_WORKSPACE` 太長時顯示同樣的 SKIPPED，不算通過，請改用 `C:\t` 底下的短路徑。
+- **Windows 長路徑**：用真 runtime 的 `test_native_reasoning_facts.py`、`test_native_auto_compaction.py` 與
+  `test_native_sdk_runtime.py` 的 memory-tiers 測試，會在 `N1_NATIVE_WORKSPACE` 底下建立很長的 SDK 路徑。Windows 沒開
+  `LongPathsEnabled=1` 而路徑太長時，這些測試會顯示 SKIPPED（原本是 `WinError 206`），不算通過，請改用 `C:\t` 底下的
+  短路徑。Hosted 跑在 Linux，沒有這個限制。
   長 `--basetemp` 也可能讓 `test_native_cut.py`、`test_native_turns.py`、`test_native_abandon_source.py` 等用本機
   Hosted State store 的測試大量出現 setup ERROR：`NATIVE_STATE_STORE_UNKNOWN`（`the State store could not be confirmed`）。
   先換短路徑重跑；短路徑仍失敗才當產品問題：SDK 本機 State store 把每個 store 寫成 `state_stores/<編碼後名稱>.json`，路徑太長的
@@ -16051,10 +16050,6 @@ worker_configuration_digest, installed_code_sha256, ...)` 是純 builder：
 準備原 `Assignment`／`sdk_start_binding`，不做 Table／Blob I/O、不產生票或 Native claim。
 queued job 尚無真 binding 時明確拒絕，不從 config 造一份假的執行回條。
 普通追問保留原 CID 的 SDK session；舊 worker checkpoint resume 另須原 assignment／archive。
-
-`sdk_owner_for_started_turn(started)` 將成功 begin 的資料接為 `SdkVmStartOwner`，
-只保存原 ticket ID、開始回條 hash 和真 worker process ID；**不填 launch_id／claim_id**。
-SDK gate 仍核原 binding 與本機 code hash。此 owner 不是新的授權來源，caller 必須已取得 fresh begin。
 
 新 VM gate 以 `finish_turn()`／`observe_turn_closed()` 觀察**這次回合**，不等待長駐 queue thread 結束。
 `AssistantSession.dispatch` 的非 status 呼叫會在 finally 完成這個標記；

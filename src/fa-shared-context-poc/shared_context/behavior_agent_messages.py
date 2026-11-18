@@ -412,32 +412,6 @@ class AgentMessageLedger:
             raise Problem(409, "AGENT_MESSAGE_ROOT_DENIED", "original routes and the single control authority must match")
         return root
 
-    def check_handoff(self, principal, assignment: AgentAssignment, command: AgentMessage):
-        """Pure preflight before creating the receiver; send still rechecks its original transaction."""
-        assignment, command = _checked(assignment, AgentAssignment), _checked(command, AgentMessage)
-        sender = self.directory.authenticate(principal, "submit")
-        receiver = self.directory.resolve(command.recipient_agent_id)
-        root = self._root(assignment.root_request_id)
-        if (command.kind not in {"request", "handoff"} or command.in_reply_to is not None
-                or (assignment.agent_id, assignment.work_id, assignment.attempt_id) != (
-                    root.spec.origin_agent_id, root.spec.origin_work_id, root.spec.origin_attempt_id)
-                or sender.agent_id != assignment.agent_id or receiver.agent_id == sender.agent_id):
-            raise Problem(403, "AGENT_MESSAGE_ASSIGNMENT_DENIED", "only the original root may reserve its peer work")
-        identifier = message_key(assignment.root_request_id, sender.agent_id, command.message_id)
-        if self.store.read_snapshot((identifier,))[identifier] is not None:
-            prior = self.read(principal, identifier)
-            if (prior.command != command or prior.message.from_work_id != assignment.work_id
-                    or prior.message.from_attempt_id != assignment.attempt_id):
-                raise Problem(409, "AGENT_MESSAGE_ORIGINAL_REQUIRED", "the original message has different input")
-            return
-        counter, _ = self._verified(root_state_key(assignment.root_request_id), _RootState)
-        _require_allowance(root, counter, command, 1, _utc(self.clock()))
-        queue_id = queue_key(receiver.agent_id)
-        if self.store.read_snapshot((queue_id,))[queue_id] is not None:
-            queue, _ = self._verified(queue_id, _ReceiverQueue)
-            if len(queue.pending) >= 32:
-                raise Problem(429, "AGENT_MESSAGE_QUEUE_FULL", "the original receiver queue is full")
-
     def _require_reply(self, send):
         """Refuse a send that does not start from the origin or answer its original message and claim."""
         if send.prior is None:

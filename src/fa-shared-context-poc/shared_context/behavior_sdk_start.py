@@ -86,16 +86,6 @@ class SdkStartGate:
             raise
         return value
 
-    def allow_entry_from(self, thread):
-        """The owned dispatch runs its SDK on the resident loop thread it blocks on (ADR-0005 PoC).
-
-        Completion is still observed on the original owned dispatch thread.
-        """
-        if current_thread() is not self.thread:
-            raise Problem(403, "SDK_START_GATE_FENCED", "only the original owned dispatch may delegate its SDK entry")
-        self._active_turn()
-        self.entry_thread = thread
-
     def enter(self, sdk_session_id):
         if sdk_session_id != self.binding.sdk_session_id or current_thread() is not self.entry_thread:
             raise Problem(403, "SDK_START_GATE_FENCED", "only the original owned dispatch may enter its SDK")
@@ -138,22 +128,3 @@ class SdkStartGate:
         return SdkVmNoStart(gate=value, owned_turn_completed=True) if value.state == "closed_before_entry" else None
 
 
-def sdk_owner_for_started_turn(started):
-    """Use only a successful T1 begin reply; this DTO is not a substitute for that CAS."""
-    from .behavior_turn_wire import StartedTurn, wire_fingerprint
-
-    started = StartedTurn.model_validate_json(started.model_dump_json())
-    assignment = started.ticket.assignment
-    binding = assignment.sdk_start_binding
-    instruction = assignment.task.instruction
-    if (binding is None or instruction is None or binding.job_id != started.start.job_id
-            or binding.profile != instruction.sdk_start_profile
-            or binding.task_digest != wire_fingerprint(assignment.task)
-            or binding.profile_digest != assignment.task.profile_digest
-            or started.start.ticket.ticket_sha256 != started.ticket.sha256
-            or binding.session_id != assignment.session_id or binding.sdk_session_id != started.start.address.sdk_session_id
-            or started.start.address != started.ticket.address or started.start.worker.vm != started.ticket.vm
-            or started.start.worker.caller_oid != started.ticket.agent_oid):
-        raise Problem(403, "SDK_START_PROFILE_DENIED", "the real admitted turn and original SDK binding are required")
-    return SdkVmStartOwner(supervisor_id=started.start.worker.process_id, ticket_id=started.start.ticket.ticket_id,
-                           start_receipt_sha256=started.start.sha256)

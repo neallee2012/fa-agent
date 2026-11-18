@@ -4,7 +4,6 @@ import hashlib
 import json
 from dataclasses import replace
 from datetime import timedelta
-from pathlib import Path
 
 import pytest
 
@@ -18,8 +17,8 @@ from shared_context.behavior_store import _json
 from shared_context.errors import Problem
 from shared_context.source_materials import digest
 from legacy_submit_rows_helpers import load_store
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models
+from assistant_api_helpers import assistant_api
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_work_policy_submit_compatibility import route
 
@@ -28,14 +27,9 @@ PAGED = ("9f994b00fdb80614adc6b559bd45954381dedda573aa51844180247535368bd0",
          "cfdd8b2c843c3d00c18f838596031679beb3a9a1d41a0fdbfb6aadedf95ee717")
 
 
-@pytest.fixture
-def runtime_path():
-    return Path(__file__)
-
-
-def test_new_pending_members_keep_legacy_bytes_and_only_exact_receipt_fulfills(assistant, monkeypatch):
+def test_new_pending_members_keep_legacy_bytes_and_only_exact_receipt_fulfills(assistant_api, monkeypatch):
     monkeypatch.setenv("FA_DELIVERY_PENDING_INDEX_WRITER", "true")
-    h, control, _, _ = route(assistant)
+    h, control, _, _ = route(assistant_api)
     core = h.delivery
     root = control.policy.template.owner.root_budget_id
     index_key = control_key("delivery-index", root)

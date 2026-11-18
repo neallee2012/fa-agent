@@ -11,10 +11,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from pydantic import SecretStr
 
 from shared_context.behavior_assistant_gateway import AssistantProvider
-from shared_context.behavior_assistant_hosted import AssistantClient, AssistantSession
 from shared_context.behavior_assistant_boundary import AssistantModelBoundary
 from shared_context.m2_copilot import _ModelGateway
 from shared_context.errors import Problem
@@ -92,40 +90,6 @@ def send_bytes(handler, content, status=200, content_type="text/event-stream"):
     handler.end_headers()
     handler.wfile.write(content)
     handler.wfile.flush()
-
-
-@pytest.mark.parametrize("where", ["headers", "body"])
-def test_real_socket_model_timeout_keeps_first_safe_phase(where, monkeypatch):
-    from shared_context import behavior_assistant_hosted as hosted
-    monkeypatch.setattr(hosted, "CLIENT_MODEL_SECONDS", 0.1)
-    def handle(handler, release):
-        if where == "body":
-            handler.send_response(200)
-            handler.send_header("Content-Type", "text/event-stream")
-            handler.send_header("Content-Length", "100")
-            handler.end_headers()
-            handler.wfile.write(b"data: ")
-            handler.wfile.flush()
-        assert release.wait(3)
-    with socket_server(handle) as server:
-        client = AssistantClient("https://synthetic.invalid",
-            SimpleNamespace(binding_id="binding", session_id="a" * 64, task=SimpleNamespace(instruction=None)),
-            SecretStr("b" * 64),
-            token_provider=lambda: CANARY, transport=LocalHTTP(server.port))
-        client.http.timeout = httpx.Timeout(0.1)
-        started = time.monotonic()
-        try:
-            with pytest.raises(Problem) as unknown:
-                client.model(httpx.Request("POST", "https://synthetic.invalid/chat/completions", json=BODY))
-        finally:
-            client.close()
-        assert 0.07 <= time.monotonic() - started < 1.5
-        assert len(server.seen) == 1
-        error = unknown.value.body["error"]
-        assert error.get("upstream_phase") == ("request" if where == "headers" else "response_body")
-        assert error.get("upstream_status") == (None if where == "headers" else 200)
-        assert error.get("exception_type") == "ReadTimeout"
-        assert CANARY not in str(unknown.value.body)
 
 
 def test_provider_http_rejection_survives_real_socket_and_gateway():
@@ -207,47 +171,6 @@ def test_provider_current_evidence_does_not_block_event_loop(monkeypatch):
             assert (await task).status_code == 200
             assert entered.is_set() and elapsed < 0.3
         asyncio.run(run())
-
-
-def test_cancelled_model_sender_cannot_dispatch_after_late_token(monkeypatch, tmp_path):
-    from shared_context import behavior_assistant_hosted as hosted
-    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
-    def token():
-        entered.set()
-        assert release.wait(2)
-        return CANARY
-    def handle(handler, _):
-        send_bytes(handler, stream([{}], finish_reason="stop").content)
-    with socket_server(handle) as server:
-        client = AssistantClient("https://synthetic.invalid", SimpleNamespace(
-            binding_id="binding", session_id="a" * 64, sdk_session_id="a" * 64, resume=False,
-            task=SimpleNamespace(instruction=None)),
-            SecretStr("b" * 64), token_provider=token, transport=LocalHTTP(server.port))
-        original = client.model
-        def model(*args, **kwargs):
-            try:
-                return original(*args, **kwargs)
-            finally:
-                finished.set()
-        monkeypatch.setattr(client, "model", model)
-        monkeypatch.setattr(client, "stopped", lambda _: None)
-        async def sdk(**kwargs):
-            async with asyncio.timeout(0.1):
-                await kwargs["behavior_boundary"].sender(httpx.Request(
-                    "POST", "https://synthetic.invalid/chat/completions", json=BODY))
-        monkeypatch.setattr(hosted, "run_copilot", sdk)
-        async def run():
-            with pytest.raises(Problem):
-                await AssistantSession(client, root=tmp_path, runtime_path=tmp_path / "unused")._run(tmp_path)
-            assert entered.is_set()
-            release.set()
-            assert await asyncio.to_thread(finished.wait, 2)
-        try:
-            asyncio.run(run())
-        finally:
-            release.set()
-            client.close()
-        assert server.seen == [], "cancelled turn sent its first model HTTP request after token returned"
 
 
 def test_provider_stream_timeout_uses_real_socket_and_preserves_body_phase():

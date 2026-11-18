@@ -13,7 +13,7 @@ import pytest
 
 from shared_context.behavior_instruction import conversation_key
 from shared_context.behavior_text_files import UserTextFileCapability
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from assistant_api_helpers import assistant_api, picker_api
 from conversation_profile_selection_helpers import select, template
 from instruction_flow_helpers import instruction_models, runtime_path

@@ -7,20 +7,26 @@ from shared_context.behavior_work_policy import work_policy_key
 from assistant_api_helpers import assistant_api
 from conversation_profile_selection_helpers import configured
 from instruction_flow_helpers import instruction_models, runtime_path
-from direct_submit_helpers import submit_direct
+from legacy_replay_helpers import legacy_tokens, replayed
 from test_m3_auth import jwk_client, signing_key
 
 
-def admitted(h, control):
-    sdk_io(lambda *args, **kwargs: None) if False else None
-    first, _ = submit_direct(h, "refresh-first", "First turn.")
-    second, _ = submit_direct(h, "refresh-second", "Second turn.")
-    return first["binding_id"], second["binding_id"]
+def admit(h, request_id):
+    """`request_id` as the retired WorkPolicyControl.submit admitted it on 80ec0865: its rows, then its own refresh."""
+    admitted = replayed(h)
+    control = h.runtime.work_policy
+    control.refresh(admitted["binding_id"])
+    assert control.records[admitted["binding_id"]].request_id == request_id
+    return admitted["binding_id"]
 
 
-def test_a_stale_scoped_refresh_never_drops_a_binding_added_meanwhile(assistant_api):
+def admitted(h):
+    return admit(h, "refresh-first"), admit(h, "refresh-second")
+
+
+def test_a_stale_scoped_refresh_never_drops_a_binding_added_meanwhile(legacy_tokens, assistant_api):
     h, control, _ = configured(assistant_api)
-    old, new = admitted(h, control)
+    old, new = admitted(h)
     # The API process had cached only the older turn when the newer one arrived.
     control.records = {old: control.records[old]}
     old_key = work_policy_key("registration", control.records[old].admission_id)
@@ -50,10 +56,9 @@ def test_a_stale_scoped_refresh_never_drops_a_binding_added_meanwhile(assistant_
     assert h.runtime.profiles[new] == control.records[new].profile
 
 
-def test_a_full_refresh_from_an_older_registry_never_drops_a_newer_binding(assistant_api):
+def test_a_full_refresh_from_an_older_registry_never_drops_a_newer_binding(legacy_tokens, assistant_api):
     h, control, _ = configured(assistant_api)
-    old, _ = submit_direct(h, "refresh-older", "Older turn.")
-    old = old["binding_id"]
+    old = admit(h, "refresh-older")
     control.records = {}
     registry = control.registry_key
     read = control.store.read_snapshot
@@ -72,8 +77,7 @@ def test_a_full_refresh_from_an_older_registry_never_drops_a_newer_binding(assis
         stale.start()
         assert stale_started.wait(10)
         control.store.read_snapshot = read
-        newer, _ = submit_direct(h, "refresh-newer", "Newer turn.")
-        newer = newer["binding_id"]
+        newer = admit(h, "refresh-newer")
         assert newer in control.records
         control.store.read_snapshot = interleaved
         fresh_done.set()
@@ -108,17 +112,16 @@ def test_a_failure_inside_before_send_is_labelled_and_never_reaches_the_provider
     assert detail["upstream_error_phase"] == "before_send" and detail["exception_type"] == "KeyError"
     assert sent == []
 
-def test_a_second_refresh_inside_one_read_view_never_drops_a_binding_admitted_meanwhile(assistant_api):
+def test_a_second_refresh_inside_one_read_view_never_drops_a_binding_admitted_meanwhile(
+        legacy_tokens, assistant_api):
     """8765 conversation reads refresh twice in one consistent_read; the view caches the older registry."""
     h, control, _ = configured(assistant_api)
-    old, _ = submit_direct(h, "view-older", "Older turn.")
-    old = old["binding_id"]
+    old = admit(h, "view-older")
     admitted_meanwhile = []
 
     def read():
         control.refresh()
-        worker = threading.Thread(target=lambda: admitted_meanwhile.append(
-            submit_direct(h, "view-newer", "Newer turn.")[0]["binding_id"]))
+        worker = threading.Thread(target=lambda: admitted_meanwhile.append(admit(h, "view-newer")))
         worker.start()
         worker.join(10)
         control.refresh()

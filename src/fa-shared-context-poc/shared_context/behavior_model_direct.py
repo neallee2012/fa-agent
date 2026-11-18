@@ -20,7 +20,6 @@ ledger entry, so the switch stays inert even when the variable is set.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import json
 import logging
@@ -100,12 +99,6 @@ def _provider_error(value) -> dict:
         return {}
     found = {"provider_error_code": error.get("code"), "provider_error_param": error.get("param")}
     return {key: item for key, item in found.items() if isinstance(item, str) and _ERROR_FIELD.fullmatch(item)}
-
-
-def request_fingerprint(body) -> str:
-    """The same digest ``_ModelGateway`` reserves for this request body."""
-    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                          .encode()).hexdigest()
 
 
 def direct_eligible(instruction) -> bool:

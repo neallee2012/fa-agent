@@ -11,7 +11,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from shared_context import native_checkpoint, native_sdk
-from shared_context.behavior_assistant_hosted import AssistantSupervisor
+from shared_context.behavior_hosted import ChecksumSupervisor
 from shared_context.behavior_hosted import create_host
 from shared_context.behavior_native_turn_wire import (
     NativeCancel, NativeHistory, NativeReceipt, NativeResult, NativeSubmit, NativeTurnCapture,
@@ -433,7 +433,7 @@ def test_native_factory_runs_under_bootstrap_owned_root_when_home_is_not_writabl
     owned = home / ".fa-assistant-v12"
     runtime_path = tmp_path / "OFFLINE-not-executed"
     runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
-    supervisor = AssistantSupervisor(owned, runtime_path=runtime_path)
+    supervisor = ChecksumSupervisor(owned)
     journal_before = supervisor.journal.path.read_bytes()
     home_before = home.stat()
     hosted = SimpleNamespace(

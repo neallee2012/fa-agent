@@ -249,7 +249,7 @@ def test_read_only_snapshot_keeps_unknown_model_cost_and_every_original_record(a
         pytest.fail("An accounting read must not observe, refresh, admit, dispatch or write.")
     for target, name in (
         (h.control, "cost_reader"), (h.control, "observe_cost"), (h.control, "refresh"),
-        (h.control, "register"), (h.runtime, "submit"), (h.store, "transact"),
+        (h.store, "transact"),
     ):
         monkeypatch.setattr(target, name, forbidden)
     h.workers.adapter = replace(h.workers.adapter, start=forbidden, query=forbidden, stop=forbidden)

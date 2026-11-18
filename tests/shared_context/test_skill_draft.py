@@ -24,7 +24,7 @@ from shared_context.behavior_skill_draft_prompt import (
 )
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import signing_key
 from agent_runtime_routing_helpers import agent_headers

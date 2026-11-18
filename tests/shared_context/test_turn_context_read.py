@@ -24,7 +24,7 @@ from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
 from shared_context.records import Record
 from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import UNKNOWN_OID, token
 from reviewed_work_memory_helpers import NOTE, configured_memory, reviewed_note
@@ -341,8 +341,8 @@ def test_bridge_rejects_bad_context_without_losing_saved_results(real_interface,
 
 
 @pytest.mark.parametrize("kind", ["inline", "unavailable", "failed"])
-def test_legacy_and_unavailable_archives_keep_distinct_measurements(assistant, kind):
-    h, control, human, _ = enabled(assistant)
+def test_legacy_and_unavailable_archives_keep_distinct_measurements(assistant_api, kind):
+    h, control, human, _ = enabled(assistant_api)
     install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier,
         installation=lambda: None, require_current_native_evidence=lambda: None))
     path = load_case(h, "context-archive-" + kind)["path"]
@@ -367,8 +367,8 @@ def test_legacy_and_unavailable_archives_keep_distinct_measurements(assistant, k
     assert h.transport.backing.rows == before and "原文" not in result.text
 
 
-def test_saved_catalog_is_references_not_body_purpose_or_load_proof(assistant, monkeypatch):
-    h, control, human = configured_purpose(assistant)
+def test_saved_catalog_is_references_not_body_purpose_or_load_proof(assistant_api, monkeypatch):
+    h, control, human = configured_purpose(assistant_api)
     facts = load_case(h, "context-catalog")
     version, path = facts["version"], facts["path"]
     before = copy.deepcopy(h.transport.backing.rows)
@@ -390,8 +390,8 @@ def test_saved_catalog_is_references_not_body_purpose_or_load_proof(assistant, m
     assert h.transport.backing.rows == before
 
 
-def test_saved_compaction_observation_is_not_a_new_execution_or_provider_usage(assistant, monkeypatch):
-    c = stored_checkpoint(assistant, "context-compaction-observed")
+def test_saved_compaction_observation_is_not_a_new_execution_or_provider_usage(assistant_api, monkeypatch):
+    c = stored_checkpoint(assistant_api, "context-compaction-observed")
     reference = c.reference
     before = copy.deepcopy(c.h.transport.backing.rows)
 
@@ -419,8 +419,8 @@ def test_saved_compaction_observation_is_not_a_new_execution_or_provider_usage(a
 
 @pytest.mark.parametrize("followups", [1, 2])
 def test_later_turn_context_retains_inherited_compaction_without_claiming_a_new_execution(
-        assistant, monkeypatch, followups):
-    c = stored_checkpoint(assistant, f"context-compaction-followup-{followups}")
+        assistant_api, monkeypatch, followups):
+    c = stored_checkpoint(assistant_api, f"context-compaction-followup-{followups}")
     turn = c.turns[-1]
     reference = turn.reference
     assert reference.source.execution == c.fs.compaction
@@ -494,8 +494,8 @@ INHERITED_CHANGES = {
 
 
 @pytest.mark.parametrize("change", INHERITED_CHANGES)
-def test_inherited_compaction_requires_the_registered_original_source(assistant, monkeypatch, change):
-    c = stored_checkpoint(assistant, "context-compaction-inherited")
+def test_inherited_compaction_requires_the_registered_original_source(assistant_api, monkeypatch, change):
+    c = stored_checkpoint(assistant_api, "context-compaction-inherited")
     (third,) = c.turns
     task = third.assignment.task.instruction
     path = f"/work-policy/v1/conversations/{task.conversation_id}/turns/{task.turn_number}/context"
@@ -533,8 +533,8 @@ def test_inherited_compaction_requires_the_registered_original_source(assistant,
     assert "compaction" not in denied.json() and c.h.transport.backing.rows == before
 
 
-def test_reviewed_memory_metadata_never_returns_the_note_or_its_private_scope(assistant):
-    h = assistant
+def test_reviewed_memory_metadata_never_returns_the_note_or_its_private_scope(assistant_api):
+    h = assistant_api
     reviewed_note(h)
     h, control, human = configured_memory(h)
     facts = load_case(h, "context-reviewed-memory")

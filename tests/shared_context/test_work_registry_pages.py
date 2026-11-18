@@ -16,8 +16,8 @@ from shared_context.behavior_work_registry import (
 )
 from shared_context.errors import Problem
 from shared_context.source_materials import _payload_hash
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models
+from assistant_api_helpers import assistant_api
+from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
 from test_work_policy_submit_compatibility import route
 
@@ -27,9 +27,9 @@ def runtime_path():
     return Path(__file__)
 
 
-def test_registry_page_missing_or_wrong_scope_is_not_a_legacy_fallback(assistant, monkeypatch):
+def test_registry_page_missing_or_wrong_scope_is_not_a_legacy_fallback(assistant_api, monkeypatch):
     monkeypatch.setenv(WRITER_ENV, "true")
-    h, control, _, _ = route(assistant)
+    h, control, _, _ = route(assistant_api)
     legacy = h.store.read_snapshot((control.registry_key,))[control.registry_key]
     h.seed([
         (head_key(control.registry_key), WorkRegistryHead(

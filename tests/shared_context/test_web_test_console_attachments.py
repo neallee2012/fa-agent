@@ -14,11 +14,11 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from shared_context.behavior_assistant import _LocalHttp
-from shared_context.behavior_assistant_api import create_assistant_app
+from local_http_helpers import _LocalHttp
+from shared_context.behavior_api import create_behavior_app
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_work_policy_api import install_work_policy_routes
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from instruction_attachments_helpers import configured_attachments
 from conversation_profile_selection_helpers import select, template
 from instruction_flow_helpers import instruction_models, runtime_path
@@ -34,16 +34,16 @@ GLOBAL = "/work-policy/v1/attachment-sources"
 
 
 @pytest.fixture
-def picker(assistant, monkeypatch, tmp_path):
+def picker(assistant_api, monkeypatch, tmp_path):
     def forbidden(*args, **kwargs):
         pytest.fail("Attachment picker must not start runtime, model or real network")
 
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", forbidden)
-    h, control, human, attachment = configured_attachments(assistant)
+    h, control, human, attachment = configured_attachments(assistant_api)
     h.client.close()
-    h.app = create_assistant_app(h.assistant, h.verifier)
+    h.app = create_behavior_app(h.runtime, h.verifier)
     install_work_policy_routes(h.app, SimpleNamespace(
         runtime=h.runtime, verifier=h.verifier, assistant=SimpleNamespace(authority=h.assistant),
         installation=lambda: control.installed(), require_current_native_evidence=lambda: None,

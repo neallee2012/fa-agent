@@ -1,8 +1,21 @@
 # FA 進度與交接狀態
 
-更新日期：2026-11-17。
+更新日期：2026-11-18。
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
+
+<a id="stage-v48-1118"></a>
+## 2026-11-18：stage 第 48 版（舊 Hosted job lane 退役）
+
+- **第 48 版**（#1271，`2026.11.18-48`，Neal 台灣時間 11-18 09:31 合併，merge `d02db3d6`）：舊 Hosted job lane 退役，包括 #1261～#1267（留存測試換資料來源、舊路由 410／404、工作台舊對話唯讀）、#1269（刪舊程式本體）、#1270（public-export 收錄快照裡的假值）；另含第 47 版之後合併的 #1242～#1244（見[第 47 版](#stage-v47-1114)）與 #1248～#1250（見[11-16](#stage-v47-turn-1116)）。這次部署不改 stage 的資源與權限。
+  - **部署**：deploy-staging run 44216486141 成功（release-gate 09:31、deploy 09:32～09:46）。
+  - **public-sync**：run 44218307695 成功（09:46～10:03），`gate 2: PASS`，公開 release `v2026.11.18-48`，tree `ddaf2381`。
+  - **dev 測試**：run 4901，main `80ec0865`，報告在 #1271 本文。新路一般回合、追問、換模型、拒絕卡、WebIQ 一則、換版後新對話都正常；Traceback、AppExceptions 都是 0。沒測到：舊對話唯讀（dev 沒有 job-bound 舊對話）、410／404 路由（沒有現成的呼叫方式）、#1243、#1244。新出現一筆：A 換版後約 4 分鐘，API 讀 A 的模型清單 ReadTimeout 30 秒（`NATIVE_INVOCATION_FAILURE`）；推測是換版後 VM 還沒就緒，未查證。
+  - **stage 真人回合**：Neal 11-18 在 stage 送回合測第 48 版。總協調讀回 log：A 兩個回合、B 一個回合都正常完成，A、B 各有一次 409（設計行為），exceptions 是 0。
+  - **沒有驗證**：雲端 Table 裡未完成或 UNKNOWN 的舊 job 數量仍未核。
+- **PR-E（舊 lane 最後一段，#1274，11-18 合併，merge `45be29e6`）**：刪剩下的舊程式（src 約 −7,700 行、tests 約 −14,700 行），23 個留存測試改讀在 `80ec0865` 用舊流程錄的快照。全套 14144 passed，19 個是已知失敗。本機建 Hosted image，在無網路容器內跑 `from_environment` 成功。兩軸審查第 1 輪的兩個 P2 是守門測試被刪（Hosted 冷啟動依賴、`GET /jobs/{id}` 讀存檔列），已放回並證明拿掉檢查會失敗；第 2 輪沒有 P1／P2。還沒部署 dev。Hosted 端已沒有呼叫者的舊 lane 程式（`HostedRuntime.start／observe`、`BehaviorExecutorClient.claim` 等）另開小 PR：PR-F #1276，11-18 合併（merge `eaade8a4`），刪 Hosted 端舊 lane 殘留（src 約 −720 行、tests 約 −700 行）；Hosted 收到沒帶 native header 的請求改回 410 `JOB_LANE_RETIRED`（之前也走不完，回 503／409／403），拿掉只保護舊子程序的 Python 雜湊檢查。兩軸審查沒有 P1；P2 是 capability import 有副作用（登記 native 讀的工具錯誤指引），已加註保留。刻意保留、之後可刪：API 端 `FoundryHttpClient.start／observe／cancel` 與 `FoundryExecutor._observe`；為讀舊資料保留 `LocalAssignment`／`LocalExecution`、舊 journal 資料表與 `behavior_wire` 舊模型；診斷 log 對被 410 的請求仍印 `"lane": "legacy"`（P3 未處理）。還沒部署 dev；Foundry 平台會不會自己送不帶 native header 的 `/invocations` 沒有在雲端實測，判斷來自 SDK 原始碼與 deploy 設定。
+- **開網頁批准卡**（#1273，11-18 合併）：開網頁（navigate）的批准卡展開時先填「這類動作」（同網站），仍可改選「只這次」的完整網址；網址太長無法固定時只給同網站草稿。未上 stage。
+- **費用**（總協調 11-18 查 Cost Management，本月累計、分資源群組；原始輸出不在 repo）：11-18 01:46 量到訂用帳戶本月 USD 803.41（dev 停損 880 是看整個訂用帳戶）。比 11-12 多約 250，其中 FA 的 dev、stage 與兩個 Container Apps 環境約 67，其餘是同一訂用帳戶裡其他專案的資源。Neal 11-18 刪除其中一個其他專案的資源群組，並停掉另一個專案的兩個 Container Apps。Neal 11-18 決定停損維持看整個訂用帳戶。之後查到訂用帳戶到 11-17 為止累計 USD 814.56；依刪減後每日約 39 推算，11-19 當天的花費會超過 880，Cost Management 約晚一天才看得到（粗估，刪減後的實際日費率未量）；超過後付費 dev 工作暫停到 12-01，或等 Neal 調整。
 
 <a id="legacy-job-lane-retire-1117"></a>
 ## 2026-11-16～17：舊 Hosted job lane 退役（main `c3ec087a`）
@@ -14,7 +27,7 @@
   - #1267：`/work-policy/v1/` 下的 submit、preflight、submit-reconcile、routines 觸發、environment、reset、cancel 回 410 `JOB_LANE_RETIRED`；`/assistant/*`、`/hosted/launches/*`、`work/submit`、`work/reconcile`、`children/*`、`operation/execute`、`operation/reconcile` 不註冊（404）。不擋 `operation/approval-reconcile`、`operation/rejection-reconcile` 與 `native-turns/*`。開機不 resume 舊 job，GET 舊對話不再觀察 Hosted；刪掉只測舊路的測試（collect 17,610 變 16,046 案）。
 - **過渡期**：操作決策組、記憶筆記寫入鏈、`controller` 子命令仍在服務，但沒有行為測試，PR-D 刪。`behavior_server_main.py controller` 若有人手動執行，仍會 drain 排隊中的舊 job；它不是開機流程，deploy／infra／scripts 都沒有使用者。
 - **未驗證**：雲端 Table 裡未完成或 UNKNOWN 的舊 job 數量（本機連 Table 被擋）。擋路由後它們保持原狀態、唯讀可見。
-- **下一步**：PR-D 刪舊程式本體（進行中）；合併後部署 dev 測試，再由總協調開 stage release PR 給 Neal 決定。
+- **下一步**：PR-D 已合併（#1269），隨[第 48 版](#stage-v48-1118)上 stage；最後一段 PR-E 見同段。
 
 <a id="current-state-trim-1116"></a>
 ## 2026-11-16：CURRENT-STATE 篇幅整理（移出的待核對細節）

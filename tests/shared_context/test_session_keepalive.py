@@ -1,29 +1,16 @@
-"""Original-session keepalive uses read-only ingress; no SDK process or live service."""
+"""Original-session status reads use the platform session resource; no SDK process or live service."""
 
 from contextlib import contextmanager
-from pathlib import Path
-from threading import Event
 from types import SimpleNamespace
 
 from azure.ai.projects.models import AgentSessionResource, AgentVersionDetails
 from azure.core.exceptions import HttpResponseError
-from fastapi.testclient import TestClient
 import httpx
 import pytest
 
 from shared_context.behavior_foundry import FoundryHttpClient
-from shared_context import behavior_wire as wire
-from shared_context.behavior_assistant import _LocalHttp
-from shared_context.behavior_assistant_hosted import AssistantHostedRuntime, AssistantSupervisor
-from shared_context.behavior_hosted import LocalAssignment, create_host
 from shared_context.errors import Problem
 from test_behavior_foundry import TARGET, INVOCATION, Credential
-from test_conversation_transfer_startup import claimed_turn, synthetic_standing_v1
-from test_instruction_observer_resume import observer_case
-from instruction_flow_helpers import instruction_models
-from test_m3_auth import jwk_client, signing_key
-from test_agent_message_continuation import peer_runtime
-from agent_runtime_routing_helpers import routing_peer
 
 
 def platform_session(status="active", **changes):
@@ -118,168 +105,4 @@ def test_session_read_failure_and_mismatch_are_not_stopping_proof(monkeypatch, f
         assert "PRIVATE" not in str(error.value.body) and len(seen) == 1
     finally:
         client.close()
-
-
-def test_keepalive_reuses_original_get_invocation_without_a_probe_or_start():
-    requests = []
-
-    def receive(request):
-        requests.append(request)
-        return httpx.Response(200, headers={
-            "x-agent-invocation-id": INVOCATION, "x-agent-session-id": TARGET.session_id,
-        }, json={"launch_id": "original-launch", "invocation_id": INVOCATION,
-                 "session_id": TARGET.session_id, "read_only": True})
-
-    client = FoundryHttpClient(TARGET, Credential(), transport=httpx.MockTransport(receive))
-    checks = []
-    try:
-        client.keepalive(INVOCATION, "original-launch", before_send=lambda: checks.append(True))
-        request, = requests
-        assert request.method == "GET" and request.url.path.endswith("/invocations/" + INVOCATION)
-        assert request.content == b"" and dict(request.url.params) == {"api-version": "v1"}
-        assert request.headers[wire.NATIVE_KEEPALIVE_HEADER] == "original-launch"
-        assert wire.NATIVE_PROBE_HEADER not in request.headers
-        assert wire.NATIVE_LAUNCH_PERMIT_HEADER not in request.headers
-        assert checks == [True]
-        assert client.last_session_request() is not None
-        assert client.for_target(TARGET).last_session_request() == client.last_session_request()
-    finally:
-        client.close()
-
-
-@pytest.mark.parametrize("failure", ["lost-response", "http-error", "wrong-session", "wrong-launch", "not-readonly"])
-def test_keepalive_failure_never_resends_or_accepts_a_foreign_observation(failure):
-    requests = []
-
-    def receive(request):
-        requests.append(request)
-        if failure == "lost-response":
-            raise httpx.ReadTimeout("PRIVATE_RESPONSE_DETAILS")
-        value = {"launch_id": "original-launch", "invocation_id": INVOCATION,
-                 "session_id": TARGET.session_id, "read_only": True}
-        if failure == "wrong-session":
-            value["session_id"] = "different-session"
-        elif failure == "wrong-launch":
-            value["launch_id"] = "different-launch"
-        elif failure == "not-readonly":
-            value["read_only"] = False
-        return httpx.Response(503 if failure == "http-error" else 200, headers={
-            "x-agent-invocation-id": INVOCATION, "x-agent-session-id": TARGET.session_id,
-        }, json=value)
-
-    client = FoundryHttpClient(TARGET, Credential(), transport=httpx.MockTransport(receive))
-    try:
-        with pytest.raises(Problem) as refused:
-            client.keepalive(INVOCATION, "original-launch", before_send=lambda: None)
-        assert len(requests) == 1 and requests[0].method == "GET"
-        assert "PRIVATE_RESPONSE_DETAILS" not in str(refused.value.body)
-    finally:
-        client.close()
-
-
-@pytest.fixture
-def hosted_keepalive(observer_case, tmp_path, monkeypatch):
-    c, loop = observer_case
-    opened = claimed_turn(c, "original-kept-alive")
-    assignment = LocalAssignment.model_validate(opened.claimed.assignment.model_dump())
-    supervisor = AssistantSupervisor(tmp_path / "owned-hosted", runtime_path=Path(__file__))
-    supervisor.supervisor_id = assignment.process_id
-    supervisor.journal.reserve_claim(assignment.invocation_id, assignment.launch_id, opened.binding.binding_id,
-                                     assignment.process_id, "a" * 64)
-    supervisor.journal.reserve(assignment, supervisor.supervisor_id)
-    cancelled = Event()
-    supervisor.threads[assignment.launch_id] = SimpleNamespace(is_alive=lambda: True)
-    supervisor.clients[assignment.launch_id] = SimpleNamespace(assignment=opened.assignment)
-    supervisor.sessions[assignment.launch_id] = SimpleNamespace(_cancel_requested=cancelled)
-
-    def no_api(*args, **kwargs):
-        pytest.fail("keepalive must not resolve/report a probe, claim, control or start")
-
-    host = AssistantHostedRuntime(assignment.identity, supervisor,
-        SimpleNamespace(claim=no_api, resolve_probe=no_api, report=no_api))
-    host.report_tokens[assignment.launch_id] = opened.claimed.report_token
-    monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", assignment.identity.session_id)
-    monkeypatch.setenv("FOUNDRY_AGENT_ID", assignment.identity.agent_id)
-    monkeypatch.setenv("FOUNDRY_AGENT_NAME", assignment.identity.agent_name)
-    monkeypatch.setenv("FOUNDRY_AGENT_VERSION", assignment.identity.agent_version)
-    with TestClient(create_host(host), backend_options={"loop_factory": lambda: loop}) as client:
-        local = _LocalHttp(client)
-        ingress = []
-
-        def receive(request):
-            ingress.append(request)
-            headers = dict(request.headers)
-            headers["x-agent-invocation-id"] = assignment.invocation_id
-            headers["x-agent-session-id"] = assignment.identity.session_id
-            return local.handle_request(httpx.Request(
-                request.method, request.url.copy_with(path=request.url.path.split("/endpoint/protocols", 1)[1]),
-                headers=headers, content=request.content))
-
-        foundry = FoundryHttpClient(opened.launch.target, Credential(), transport=httpx.MockTransport(receive))
-        try:
-            yield SimpleNamespace(c=c, opened=opened, assignment=assignment, supervisor=supervisor,
-                host=host, client=client, foundry=foundry, ingress=ingress, cancelled=cancelled)
-        finally:
-            foundry.close()
-
-
-def test_actual_host_keepalive_reads_original_owner_without_writing_or_sending_a_report(hosted_keepalive):
-    h = hosted_keepalive
-    before = h.supervisor.journal.path.read_bytes()
-    guard = h.c.h.runtime.store._guard()
-    result = h.foundry.keepalive(h.assignment.invocation_id, h.assignment.launch_id, before_send=lambda: None)
-    assert result.model_dump() == {
-        "launch_id": h.assignment.launch_id, "invocation_id": h.assignment.invocation_id,
-        "session_id": h.assignment.identity.session_id, "read_only": True,
-    }
-    assert h.supervisor.journal.path.read_bytes() == before
-    assert h.c.h.runtime.store._guard() == guard
-    assert len(h.ingress) == 1 and h.ingress[0].method == "GET"
-    assert h.c.sessions.calls == []
-
-
-def test_host_keepalive_refuses_wrong_or_inactive_owners_without_control_writes(hosted_keepalive, monkeypatch):
-    h = hosted_keepalive
-    before = h.supervisor.journal.path.read_bytes()
-    guard = h.c.h.runtime.store._guard()
-    for condition in ("process", "thread", "claim", "engine", "cancel", "launch"):
-        with monkeypatch.context() as patch:
-            if condition == "process":
-                patch.setattr(h.supervisor, "supervisor_id", "replacement-process")
-            elif condition == "thread":
-                patch.setitem(h.supervisor.threads, h.assignment.launch_id, SimpleNamespace(is_alive=lambda: False))
-            elif condition == "claim":
-                patch.delitem(h.host.report_tokens, h.assignment.launch_id)
-            elif condition == "engine":
-                patch.delitem(h.supervisor.sessions, h.assignment.launch_id)
-            elif condition == "cancel":
-                h.cancelled.set()
-            with pytest.raises(Problem) as error:
-                h.foundry.keepalive(h.assignment.invocation_id,
-                    "another-launch" if condition == "launch" else h.assignment.launch_id, before_send=lambda: None)
-            assert error.value.body["error"]["code"] == "FOUNDRY_INVOCATION_UNKNOWN"
-            h.cancelled.clear()
-        assert h.supervisor.journal.path.read_bytes() == before
-        assert h.c.h.runtime.store._guard() == guard
-    assert h.c.sessions.calls == []
-
-
-def test_host_keepalive_rejects_control_headers_body_and_cancel_route(hosted_keepalive):
-    h = hosted_keepalive
-    path = "/invocations/" + h.assignment.invocation_id
-    headers = {
-        "x-agent-invocation-id": h.assignment.invocation_id,
-        "x-agent-session-id": h.assignment.identity.session_id,
-        wire.NATIVE_KEEPALIVE_HEADER: h.assignment.launch_id,
-    }
-    before = h.supervisor.journal.path.read_bytes()
-    for method, route, values, content in (
-        ("GET", path, {**headers, wire.NATIVE_PROBE_HEADER: "a" * 64}, b""),
-        ("GET", path, headers, b"{}"),
-        ("POST", path + "/cancel", headers, b"{}"),
-    ):
-        response = h.client.request(method, route, headers=values, content=content)
-        assert response.status_code == 403
-        assert response.json()["error"]["code"] == "HOSTED_KEEPALIVE_INVALID"
-    assert h.supervisor.journal.path.read_bytes() == before
 

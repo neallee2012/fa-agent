@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import sqlite3
 import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -212,115 +211,27 @@ def test_a_test_probe_adds_its_field_guard_and_only_interruption_adds_the_sessio
     assert (ProbeSessionOnlyMiddleware in installed) is interrupt
 
 
+RETIRED = {"error": {"code": "JOB_LANE_RETIRED", "message": "the legacy job lane is retired"}}
+
+
 @pytest.fixture
 def lanes(local):
-    local.start = Mock(return_value={"status": "accepted"})
-    local.observe, local.keepalive = Mock(return_value=IDENTITY), Mock(return_value=IDENTITY)
+    local.start, local.observe, local.keepalive = Mock(), Mock(), Mock()
     with TestClient(create_host(local)) as client:
         yield SimpleNamespace(runtime=local, client=client)
 
 
-def post(lanes, *, headers=None, **options):
-    return lanes.client.post("/invocations", headers={**PLATFORM, **PERMIT, **(headers or {})}, **options)
-
-
-def test_start_passes_the_typed_selector_and_the_platform_ids(lanes):
-    response = post(lanes, json=LAUNCH)
-    assert (response.status_code, response.json()) == (202, {"status": "accepted"})
-    payload, invocation_id, session_id = lanes.runtime.start.call_args.args
-    assert (payload.binding_id, payload.launch_id) == ("binding-1", "launch-1")
-    assert payload.launch_permit.get_secret_value() == "a" * 64
-    assert (invocation_id, session_id) == (PLATFORM["x-agent-invocation-id"], IDENTITY.session_id)
-
-
-@pytest.mark.parametrize("content,status,error", [
-    (b" " * 4097, 413, "HOSTED_INVOCATION_LIMIT"),
-    (b'{"binding_id":"a","binding_id":"b","launch_id":"c"}', 422, "HOSTED_INVOCATION_INVALID"),
-    (b'{"binding_id":"a"}', 422, "HOSTED_INVOCATION_INVALID"),
-    (b"\xff", 422, "HOSTED_INVOCATION_INVALID"),
-])
-def test_start_refuses_a_bad_body_before_the_runtime(lanes, content, status, error):
-    response = post(lanes, content=content)
-    assert (response.status_code, response.json()["error"]["code"]) == (status, error)
-    lanes.runtime.start.assert_not_called()
-
-
-def test_a_body_of_exactly_the_bound_is_read(lanes):
-    raw = b'{"binding_id":"binding-1","launch_id":"launch-1"}'
-    assert post(lanes, content=raw + b" " * (4096 - len(raw))).status_code == 202
-
-
-@pytest.mark.parametrize("permit", ["A" * 64, "a" * 63])
-def test_start_needs_one_well_formed_permit(lanes, permit):
-    response = post(lanes, json=LAUNCH, headers={wire.NATIVE_LAUNCH_PERMIT_HEADER: permit})
-    assert (response.status_code, response.json()["error"]["code"]) == (403, "HOSTED_CAPABILITY_INVALID")
-    lanes.runtime.start.assert_not_called()
-
-
-def test_start_refuses_a_repeated_permit(lanes):
-    response = lanes.client.post("/invocations", json=LAUNCH, headers=[
-        *PLATFORM.items(), (wire.NATIVE_LAUNCH_PERMIT_HEADER, "a" * 64), (wire.NATIVE_LAUNCH_PERMIT_HEADER, "a" * 64)])
-    assert (response.status_code, response.json()["error"]["code"]) == (403, "HOSTED_CAPABILITY_INVALID")
-
-
-@pytest.mark.parametrize("failure", [OSError("SYNTHETIC"), sqlite3.Error("SYNTHETIC"), ValueError("SYNTHETIC")])
-def test_a_local_failure_is_an_unknown_outcome_on_every_action(lanes, failure):
-    lanes.runtime.start.side_effect = lanes.runtime.observe.side_effect = failure
-    for response in (post(lanes, json=LAUNCH), lanes.client.get(INVOCATION, headers={**PLATFORM, **PROBE}),
-                     lanes.client.post(INVOCATION + "/cancel", headers={**PLATFORM, **PROBE})):
-        assert response.status_code == 503, response.text
-        assert response.json() == {"error": {"code": "HOSTED_EXECUTOR_UNKNOWN",
-                                             "message": "executor outcome remains unknown"}}
-
-
-def test_a_problem_keeps_its_status_and_body(lanes):
-    lanes.runtime.observe.side_effect = Problem(409, "HOSTED_PROCESS_UNOWNED", "kept")
-    response = lanes.client.get(INVOCATION, headers={**PLATFORM, **PROBE})
-    assert (response.status_code, response.json()["error"]["code"]) == (409, "HOSTED_PROCESS_UNOWNED")
-
-
-@pytest.mark.parametrize("path,cancellation", [(INVOCATION, False), (INVOCATION + "/cancel", True)])
-def test_observe_and_cancel_forward_one_fresh_probe(lanes, path, cancellation):
-    send = lanes.client.get if not cancellation else lanes.client.post
-    response = send(path, headers={**PLATFORM, **PROBE})
-    assert response.status_code == 200 and response.json() == IDENTITY.model_dump(mode="json")
-    lanes.runtime.observe.assert_called_once_with("inv-1", IDENTITY.session_id, PROBE_ID, cancellation=cancellation)
-
-
-@pytest.mark.parametrize("headers", [{}, {wire.NATIVE_PROBE_HEADER: "B" * 64}, {wire.NATIVE_PROBE_HEADER: "b" * 63}])
-def test_observe_needs_a_well_formed_probe(lanes, headers):
-    response = lanes.client.get(INVOCATION, headers={**PLATFORM, **headers})
-    assert (response.status_code, response.json()["error"]["code"]) == (403, "HOSTED_PROBE_INVALID")
-    lanes.runtime.observe.assert_not_called()
-
-
-def test_observe_refuses_a_repeated_probe(lanes):
-    response = lanes.client.get(INVOCATION, headers=[
-        *PLATFORM.items(), (wire.NATIVE_PROBE_HEADER, PROBE_ID), (wire.NATIVE_PROBE_HEADER, PROBE_ID)])
-    assert (response.status_code, response.json()["error"]["code"]) == (403, "HOSTED_PROBE_INVALID")
-
-
-def test_keepalive_reads_the_original_launch_without_a_probe(lanes):
-    response = lanes.client.get(INVOCATION, headers={**PLATFORM, wire.NATIVE_KEEPALIVE_HEADER: "launch-1"})
-    assert response.status_code == 200 and response.json() == IDENTITY.model_dump(mode="json")
-    lanes.runtime.keepalive.assert_called_once_with("inv-1", IDENTITY.session_id, "launch-1")
-    lanes.runtime.observe.assert_not_called()
-
-
-@pytest.mark.parametrize("send", ["cancel", "probe", "format", "repeat", "body"])
-def test_keepalive_is_only_the_read_only_observe(lanes, send):
-    headers = [*PLATFORM.items(), (wire.NATIVE_KEEPALIVE_HEADER, "-bad" if send == "format" else "launch-1")]
-    if send == "probe":
-        headers.append((wire.NATIVE_PROBE_HEADER, PROBE_ID))
-    if send == "repeat":
-        headers.append((wire.NATIVE_KEEPALIVE_HEADER, "launch-2"))
-    if send == "cancel":
-        response = lanes.client.post(INVOCATION + "/cancel", headers=headers)
-    else:
-        response = lanes.client.request("GET", INVOCATION, headers=headers,
-                                        content=b"x" if send == "body" else None)
-    assert (response.status_code, response.json()["error"]["code"]) == (403, "HOSTED_KEEPALIVE_INVALID")
-    lanes.runtime.keepalive.assert_not_called()
+@pytest.mark.parametrize("method,path,headers,options", [
+    ("POST", "/invocations", PERMIT, {"json": LAUNCH}),
+    ("POST", "/invocations", {}, {"content": b"\xff"}),
+    ("GET", INVOCATION, PROBE, {}),
+    ("POST", INVOCATION + "/cancel", PROBE, {}),
+    ("GET", INVOCATION, {wire.NATIVE_KEEPALIVE_HEADER: "launch-1"}, {}),
+], ids=["start", "bad-start", "observe", "cancel", "keepalive"])
+def test_a_request_without_the_native_header_is_refused_as_the_retired_lane(lanes, method, path, headers, options):
+    response = lanes.client.request(method, path, headers={**PLATFORM, **headers}, **options)
+    assert (response.status_code, response.json()) == (410, RETIRED)
+    assert not (lanes.runtime.start.called or lanes.runtime.observe.called or lanes.runtime.keepalive.called)
 
 
 @pytest.fixture
@@ -400,7 +311,7 @@ def dispatches(caplog):
 
 def test_legacy_traffic_without_a_native_runtime_writes_no_dispatch_log(lanes, caplog):
     caplog.set_level(logging.WARNING)
-    assert post(lanes, json=LAUNCH).status_code == 202
+    assert lanes.client.post("/invocations", headers={**PLATFORM, **PERMIT}, json=LAUNCH).status_code == 410
     assert dispatches(caplog) == []
 
 

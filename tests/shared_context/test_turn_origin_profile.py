@@ -9,9 +9,9 @@ from shared_context import m2_copilot
 from shared_context.behavior_agent_template import TemplateSettings
 from shared_context.behavior_assistant import AssistantProfile
 from shared_context.behavior_assistant_wire import InstructionTask
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from test_conversation_profile_selection import PATH, configured, select, template
-from test_instruction_flow import instruction_models, runtime_path, sdk_io
+from instruction_flow_helpers import instruction_models, runtime_path, sdk_io
 from test_m3_auth import jwk_client, signing_key
 
 
@@ -59,8 +59,8 @@ def sdk_context_reads(monkeypatch):
 
 
 @pytest.mark.parametrize("identity", ["agent", "read-only"])
-def test_origin_setting_does_not_relax_human_approval_requirements(assistant, identity):
-    h, control, _ = configured(assistant)
+def test_origin_setting_does_not_relax_human_approval_requirements(assistant_api, identity):
+    h, control, _ = configured(assistant_api)
     before = h.store._guard()
     response, _ = select(h, request_id="forbidden-origin-choice",
                          value=template(turn_origin_profile=ORIGIN_PROFILE), identity=identity)
@@ -69,8 +69,8 @@ def test_origin_setting_does_not_relax_human_approval_requirements(assistant, id
 
 
 @pytest.mark.parametrize("value", [True, "unknown-origin-version"])
-def test_unknown_origin_setting_is_rejected_without_creating_a_selection(assistant, value):
-    h, control, _ = configured(assistant)
+def test_unknown_origin_setting_is_rejected_without_creating_a_selection(assistant_api, value):
+    h, control, _ = configured(assistant_api)
     candidate = template().model_dump(mode="json")
     candidate["settings"]["turn_origin_profile"] = value
     before = h.store._guard()
@@ -81,8 +81,8 @@ def test_unknown_origin_setting_is_rejected_without_creating_a_selection(assista
     assert h.store._guard() == before and not control.records and not h.endpoint.requests
 
 
-def test_template_inspection_shows_origin_setting_differences_without_activating_them(assistant):
-    h, control, _ = configured(assistant)
+def test_template_inspection_shows_origin_setting_differences_without_activating_them(assistant_api):
+    h, control, _ = configured(assistant_api)
     selected, _ = select(h, request_id="baseline-profile")
     assert selected.status_code == 200
     original_policy = control.policy.model_dump_json()
@@ -103,8 +103,8 @@ def test_none_origin_setting_is_omitted_from_legacy_settings_and_work():
     assert TemplateSettings(turn_origin_profile=None).model_dump_json() == TemplateSettings().model_dump_json()
 
 
-def test_origin_setting_requires_an_explicit_instruction_prompt_profile(assistant):
-    _, control, _ = configured(assistant)
+def test_origin_setting_requires_an_explicit_instruction_prompt_profile(assistant_api):
+    _, control, _ = configured(assistant_api)
     with pytest.raises(ValueError):
         AssistantProfile.model_validate_json(control.policy.profile.model_copy(update={
             "turn_origin_profile": ORIGIN_PROFILE, "prompt_profile": None,
@@ -114,13 +114,13 @@ def test_origin_setting_requires_an_explicit_instruction_prompt_profile(assistan
                         turn_origin_profile=ORIGIN_PROFILE)
 
 
-def test_published_selector_parser_and_typed_receipts_preserve_captured_origin_settings(assistant):
+def test_published_selector_parser_and_typed_receipts_preserve_captured_origin_settings(assistant_api):
     from shared_context.behavior_profile_selection import (
         ConversationProfileReceipt, SelectedConversationProfile, SelectConversationProfile,
     )
     from web_test_console.agent_template import intent_key, parse_selection, parse_template
 
-    h, control, _ = configured(assistant)
+    h, control, _ = configured(assistant_api)
     original_policy = control.policy.model_dump_json()
     candidate = template(turn_origin_profile=ORIGIN_PROFILE)
     parsed = parse_template(candidate.model_dump_json().encode("utf-8"), code="TEMPLATE_INVALID", status=400)

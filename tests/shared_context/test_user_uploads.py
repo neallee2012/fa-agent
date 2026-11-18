@@ -12,7 +12,6 @@ import pytest
 from shared_context import behavior_assistant_wire as aw
 from shared_context.behavior_text_files import UserTextFile
 from shared_context.behavior_user_uploads import MAX_UPLOAD_BYTES, UserUpload, upload_path
-from assistant_sdk_fixture import sdk_assistant
 from test_m3_auth import jwk_client, signing_key
 from test_native_turn_api import native_api
 from test_conversation_transfer_startup import synthetic_standing_v1
@@ -121,15 +120,6 @@ def test_an_upload_is_one_supported_text_type_within_ten_mib():
             UserUpload(name="big.txt", sha256="0" * 64, byte_length=size, media_type="text/plain")
     assert MAX_UPLOAD_BYTES == 10 * 1024 * 1024
     assert upload_path("ab" * 32) == ".fa-attachments/" + "ab" * 32
-
-
-def test_the_job_lane_refuses_uploads_instead_of_dropping_them(sdk_assistant):
-    from shared_context.errors import Problem
-    from work_policy_lifecycle_helpers import enabled
-    _, control, human, _ = enabled(sdk_assistant)
-    with pytest.raises(Problem) as refused:
-        control.submit(human, aw.InstructionSubmit(request_id="legacy-upload", content="See", uploads=(upload(),)))
-    assert refused.value.body["error"]["code"] == "WORK_POLICY_COMMAND"
 
 
 def test_the_owner_uploads_raw_bytes_once_to_the_agent_session_at_their_digest_path(native_api, monkeypatch):

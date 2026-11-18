@@ -15,11 +15,10 @@ from shared_context.behavior_server_config import TokenizerConfiguration
 from shared_context.behavior_skill_catalog import DESCRIPTION_PREFIX, LOOKUP, present_catalog
 from shared_context.behavior_work_policy_api import install_work_policy_routes
 from shared_context.errors import Problem
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
-from direct_submit_helpers import submit_direct
 from test_skill_purpose import PROFILE
 from skill_purpose_api_helpers import add_purpose_skill
 from work_policy_lifecycle_helpers import enabled
@@ -38,9 +37,9 @@ def tokenizer():
     return ServerTokenizer(TokenizerConfiguration(version="0.11.0", encoding="o200k_base", cache_directory=str(cache)))
 
 
-def configure(assistant, signing_key, jwk_client, tokenizer, *, budgeted=True, budget=None):
+def configure(assistant_api, signing_key, jwk_client, tokenizer, *, budgeted=True, budget=None):
     for name in NAMES:
-        add_purpose_skill(assistant, signing_key, jwk_client, name=name,
+        add_purpose_skill(assistant_api, signing_key, jwk_client, name=name,
                           description="Use current approved receipts to explain the actual result. " * 4)
     if budget is None:
         text = DESCRIPTION_PREFIX + json.dumps({
@@ -51,14 +50,14 @@ def configure(assistant, signing_key, jwk_client, tokenizer, *, budgeted=True, b
     facts = json.loads(facts_path.read_text(encoding="utf-8"))
     facts["gpt-4.1-mini"].update(context_window_tokens=64000, max_prompt_tokens=budget * 50, max_output_tokens=1024)
     facts_path.write_text(json.dumps(facts), encoding="utf-8")
-    assistant.runtime.profiles = MappingProxyType({
+    assistant_api.runtime.profiles = MappingProxyType({
         key: AssistantProfile.model_validate({
             **value.model_dump(), "prompt_profile": PROFILE, "skill_artifacts": NAMES,
             "model_capacity_profile": "fa-model-capacity-v1",
             **({"skill_catalog_budget_profile": "fa-skill-catalog-budget-v1"} if budgeted else {}),
-        }) for key, value in assistant.runtime.profiles.items()
+        }) for key, value in assistant_api.runtime.profiles.items()
     })
-    h, control, human, _ = enabled(assistant)
+    h, control, human, _ = enabled(assistant_api)
     h.runtime.dep.memory._count = tokenizer.count
     install_work_policy_routes(h.app, SimpleNamespace(
         runtime=h.runtime, verifier=h.verifier, installation=lambda: None,
@@ -66,47 +65,6 @@ def configure(assistant, signing_key, jwk_client, tokenizer, *, budgeted=True, b
         require_current_native_evidence=lambda: None,
     ))
     return h, control, human, budget
-
-
-def test_missing_declared_capacity_is_refused_before_admission_or_reservation(
-    assistant_api, signing_key, jwk_client, tokenizer,
-):
-    h, control, human, _ = configure(assistant_api, signing_key, jwk_client, tokenizer)
-    model = control.models.models["gpt-4.1-mini"]
-    control.models.models[model.id] = model.model_copy(update={
-        "max_prompt_tokens": None, "context_window_tokens": None,
-    })
-    before = h.store._guard()
-    with pytest.raises(Problem) as refused:
-        submit_direct(h, "budget-unknown-capacity", "Read an approved skill.")
-    assert refused.value.status == 503
-    assert refused.value.body["error"]["code"] == "SKILL_CATALOG_CAPACITY_UNKNOWN"
-    assert h.store._guard() == before and not control.records
-
-
-def test_known_capacity_that_cannot_fit_lookup_is_refused_before_admission(
-    assistant_api, signing_key, jwk_client, tokenizer,
-):
-    h, control, _, _ = configure(assistant_api, signing_key, jwk_client, tokenizer, budget=1)
-    before = h.store._guard()
-    with pytest.raises(Problem) as refused:
-        submit_direct(h, "budget-too-small-at-entry", "Read an approved skill.")
-    assert refused.value.status == 413
-    assert refused.value.body["error"]["code"] == "SKILL_CATALOG_BUDGET_TOO_SMALL"
-    assert h.store._guard() == before and not control.records
-
-
-def test_unknown_configured_counter_is_refused_before_admission(
-    assistant_api, signing_key, jwk_client, tokenizer,
-):
-    h, control, _, _ = configure(assistant_api, signing_key, jwk_client, tokenizer)
-    h.runtime.dep.memory._count = lambda _: None
-    before = h.store._guard()
-    with pytest.raises(Problem) as refused:
-        submit_direct(h, "budget-counter-unknown-at-entry", "Read an approved skill.")
-    assert refused.value.status == 503
-    assert refused.value.body["error"]["code"] == "SKILL_CATALOG_TOKEN_COUNT_UNKNOWN"
-    assert h.store._guard() == before and not control.records
 
 
 def test_export_retains_budget_profile_as_a_reference_not_new_authority(

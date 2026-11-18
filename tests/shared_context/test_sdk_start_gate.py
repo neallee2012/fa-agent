@@ -155,33 +155,3 @@ def test_unknown_or_rebound_closed_journal_record_is_not_an_attestation(tmp_path
         result["gate"].observe_closed()
     assert denied.value.body["error"]["code"] in {"SDK_START_GATE_INVALID", "SDK_START_GATE_FENCED"}
 
-
-def test_changed_installed_code_is_logged_with_its_exact_gate_code(tmp_path, caplog):
-    from types import SimpleNamespace
-    from shared_context.behavior_assistant_hosted import AssistantSupervisor
-    supervisor = AssistantSupervisor(tmp_path, runtime_path=tmp_path / "never-started")
-    changed = binding().model_copy(update={"code_sha256": "6" * 64})
-    client = SimpleNamespace(assignment=SimpleNamespace(sdk_start_binding=changed, task=SimpleNamespace(
-        instruction=SimpleNamespace(sdk_start_profile="fa-sdk-start-gate-v1"))))
-    assignment = SimpleNamespace(launch_id="original-launch", claim_id="original-claim", process_generation=1)
-    caplog.set_level("WARNING")
-    supervisor._execute(assignment, client)
-    assert "phase=create_session code=SDK_START_GATE_CODE_CHANGED " in caplog.text
-    assert "UNCLASSIFIED" not in caplog.text
-    with supervisor.journal.connect() as db:
-        raw, = db.execute("SELECT body FROM assistant_failures WHERE launch_id='original-launch'").fetchone()
-        assert db.execute("SELECT name FROM sqlite_master WHERE name='assistant_sdk_start_gates'").fetchone() is None
-    assert json.loads(raw)["code"] == "SDK_START_GATE_CODE_CHANGED"
-    assert json.loads(raw)["phase"] == "create_session"
-
-
-@pytest.mark.parametrize("code", sorted(SDK_START_GATE_ERRORS))
-def test_every_start_gate_refusal_keeps_only_its_code(tmp_path, caplog, code):
-    from shared_context.behavior_assistant_hosted import AssistantSupervisor
-    supervisor = AssistantSupervisor(tmp_path, runtime_path=tmp_path / "never-started")
-    private = "SYNTHETIC_PRIVATE_GATE_CANARY"
-    assert supervisor.record_failure("original-launch", "create_session", Problem(403, code, private))
-    with supervisor.journal.connect() as db:
-        raw, = db.execute("SELECT body FROM assistant_failures WHERE launch_id='original-launch'").fetchone()
-    assert json.loads(raw)["code"] == code and "code=" + code + " " in caplog.text
-    assert private not in raw and private not in caplog.text

@@ -1,21 +1,20 @@
 """Unfinished old instruction work stays as stored: the served API neither resumes nor observes it (2026-11-17).
 
 The legacy job lane is retired, so a restart or a read of an old conversation must not send its work back to
-Hosted. Offline: a fresh installation under the real server factory with its startup lifespan; the old work is
-admitted in-process by the retiring WorkPolicyControl.submit (its route already answers 410).
+Hosted. Offline: a fresh installation under the real server factory with its startup lifespan; the old work is the
+state the retired WorkPolicyControl.submit left on main 80ec0865, replayed (legacy_replay_helpers).
 """
 from dataclasses import replace
 
 from fastapi.testclient import TestClient
 
-from shared_context.behavior_assistant_wire import InstructionSubmit
-from shared_context.behavior_auth import BehaviorPrincipal
 from shared_context.behavior_operations import _row
 from shared_context.behavior_server import application
 from shared_context.behavior_work_policy import CostLedger, CostObservation
 from instruction_flow_helpers import instruction_models
 from test_fresh_installation import fresh_case, initialize, writes
 from test_m3_auth import jwk_client, signing_key
+from legacy_replay_helpers import legacy_tokens, pinned_configuration, replayed
 
 
 def old_work(h, monkeypatch, *, started=False):
@@ -35,10 +34,8 @@ def old_work(h, monkeypatch, *, started=False):
         legacy_unresolved_reserve_microusd=ledger.legacy_unresolved_reserve_microusd,
         legacy_liability_sha256=ledger.legacy_liability_sha256, evidence_sha256="e" * 64, observed_at=h.time)
     control.cost_reader = lambda: observation
-    identity = h.config.identity
-    human = BehaviorPrincipal(identity.tenant_id, identity.human_oid, identity.team_id, "human", None,
-                              frozenset({"read", "submit"}))
-    binding, _ = control.submit(human, InstructionSubmit(request_id="old-work", content="Old work."))
+    binding = replayed(h)  # InstructionSubmit "old-work" as the retired WorkPolicyControl.submit admitted it
+    control.refresh(binding.binding_id)
     h.runtime.dep.workers.adapter = replace(h.runtime.dep.workers.adapter, start=starts.append)
     if started:
         h.runtime.dep.workers.start(binding.job_id, binding.owner)
@@ -50,7 +47,8 @@ def unchanged(h):
     return h.runtime.store._guard(), writes(h)
 
 
-def test_startup_does_not_resume_unfinished_old_instruction_work(fresh_case, monkeypatch):
+def test_startup_does_not_resume_unfinished_old_instruction_work(
+        legacy_tokens, pinned_configuration, fresh_case, monkeypatch):
     h = fresh_case
     app, binding, starts = old_work(h, monkeypatch)
     assert h.runtime.dep.workers.inspect(binding.job_id).state == "queued"
@@ -62,7 +60,8 @@ def test_startup_does_not_resume_unfinished_old_instruction_work(fresh_case, mon
     assert h.runtime.dep.workers.inspect(binding.job_id).state == "queued"
 
 
-def test_reading_an_old_conversation_does_not_observe_its_unfinished_work(fresh_case, signing_key, monkeypatch):
+def test_reading_an_old_conversation_does_not_observe_its_unfinished_work(
+        legacy_tokens, pinned_configuration, fresh_case, signing_key, monkeypatch):
     h = fresh_case
     app, binding, starts = old_work(h, monkeypatch, started=True)
     job = h.runtime.dep.workers.inspect(binding.job_id)

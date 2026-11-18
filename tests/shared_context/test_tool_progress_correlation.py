@@ -1,17 +1,13 @@
 """Public tool pairing through actual projection/DTO/API, with offline SDK events."""
 
-import asyncio
 import json
-from datetime import datetime
 from functools import partial
-from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
 from shared_context import behavior_assistant_wire as aw
 from shared_context.behavior_assistant_progress import public_event as project_event
-from shared_context.behavior_assistant_hosted import AssistantSession
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 
@@ -212,31 +208,6 @@ def test_sdk_emitter_uses_the_actual_registered_tools_and_preserves_public_pairs
         ("tool_started", 1, 1, "read_context"), ("tool_completed", 2, 1, "read_context"),
     ]
     assert "PRIVATE_" not in json.dumps(events)
-
-
-def test_hosted_snapshot_retains_correlation_when_old_start_is_pruned(tmp_path):
-    snapshots = []
-    session = AssistantSession(SimpleNamespace(
-        progress=snapshots.append, assignment=SimpleNamespace(task=SimpleNamespace(instruction=None)),
-    ), root=tmp_path, runtime_path=tmp_path / "not-executed")
-    tools = {}
-
-    async def run():
-        session._public_event({"public_progress": public_event(start("PRIVATE_PRUNED"), 1, tools).model_dump(mode="json")})
-        for seq in range(2, 50):
-            event = aw.PublicProgressEvent(seq=seq, at=datetime.fromisoformat(AT.replace("Z", "+00:00")),
-                                           kind="stage", status="started", summary="Safe public step. " * 12)
-            session._public_event({"public_progress": event.model_dump(mode="json")})
-        end = public_event(complete("PRIVATE_PRUNED"), 50, tools)
-        session._public_event({"public_progress": end.model_dump(mode="json")})
-        await session._progress_tail
-
-    asyncio.run(run())
-    final = snapshots[-1]
-    assert len(final.model_dump_json().encode()) <= 8192
-    assert final.events[0].seq > 1
-    assert final.events[-1].seq == 50 and final.events[-1].tool_start_seq == 1
-    assert "PRIVATE_" not in final.model_dump_json()
 
 
 def test_capability_tool_calls_are_public_with_the_stored_name_format():

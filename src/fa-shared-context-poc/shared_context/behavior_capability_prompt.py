@@ -21,7 +21,7 @@ from .behavior_capabilities import (
     CAPABILITY_BASE_PROFILES, SKILLIFY_ENTRY_ID, SKILLS_ENTRY_ID, SKILL_RESOURCES_ENTRY_ID, CapabilityCapture,
     CapabilityGrant, feature_tools, requires_base_tool, skills_granted,
 )
-from .behavior_skill_prompt import PURPOSE_SKILL_PROFILES, SKILL_PROFILES, assemble_prompt
+from .behavior_skill_prompt import SKILL_PROFILES, assemble_prompt
 from .behavior_agent_role_prompt import AGENT_ROLE_PROFILE, with_capabilities as with_role_capabilities
 from .behavior_wire import Digest, WireModel
 from .behavior_delegation_wire import CAPABILITY_ID, child_configuration
@@ -240,15 +240,6 @@ def capability_record(base_profile: str | None, capture: CapabilityCapture | Non
 def skill_access(prompt_profile: str | None, capture: CapabilityCapture | None) -> bool:
     """Approved-skill reads come from a skill profile or from this turn's captured fa-skills-v1 grant."""
     return prompt_profile in SKILL_PROFILES or skills_granted(capture)
-
-
-def skill_purpose_access(prompt_profile: str | None, capture: CapabilityCapture | None) -> bool:
-    """The catalog carries each skill's human-approved purpose (v2) for purpose profiles and fa-skills-v1.
-
-    Skill names are artifact IDs, so without the purpose the model cannot match a skill to the request.
-    The older fa-instruction-skills-v1 profile keeps its v1 catalog bytes.
-    """
-    return prompt_profile in PURPOSE_SKILL_PROFILES or skills_granted(capture)
 
 
 @dataclass(frozen=True)

@@ -12,8 +12,8 @@ from shared_context.behavior_profile_selection import SelectConversationProfile
 from shared_context.behavior_profile_selection import selection_key
 from shared_context.behavior_skill_prompt import assemble_prompt
 from shared_context.behavior_work_policy_api import install_work_policy_routes
-from test_behavior_assistant import assistant
-from instruction_flow_helpers import instruction_inventory, instruction_models, runtime_path
+from assistant_api_helpers import assistant_api
+from instruction_flow_helpers import instruction_inventory, instruction_models
 from shared_context.errors import Problem
 from shared_context.behavior_assistant_wire import InstructionSubmit
 from shared_context.behavior_attachments import TextAttachment
@@ -24,51 +24,18 @@ from test_stage_select_all_capabilities import script
 from conversation_profile_selection_helpers import template, configured, select, PATH
 from test_m3_auth import jwk_client
 
-def test_responses_reasoning_mode_is_captured_without_reloading_current_model_facts(assistant):
-    h, control, human = configured(assistant)
-    control.models.models["configured-second-model"] = control.models.models["configured-second-model"].model_copy(
-        update={"supports_reasoning_effort": True, "supports_reasoning_summary": True})
-    assert select(h, value=template(model_provider="openai-responses"))[0].status_code == 200
-    first, _ = control.submit(human, InstructionSubmit(request_id="responses-supported-model",
-        content="Use the declared reasoning model.", model="configured-second-model"))
-    record = control.records[first.binding_id]
-    assert record.profile.instruction.reasoning_summary == "detailed"
-    original = record.model_dump_json()
-    control.models.models["configured-second-model"] = control.models.models["configured-second-model"].model_copy(
-        update={"supports_reasoning_effort": True, "supports_reasoning_summary": False})
-    control.records.clear()
-    control.refresh()
-    assert control.records[first.binding_id].model_dump_json() == original
-    second, _ = control.submit(human, InstructionSubmit(request_id="responses-nonreasoning-model",
-        content="Use the normal model.", model="gpt-4.1-mini"))
-    assert control.records[second.binding_id].profile.instruction.model_provider == "openai-responses"
-    assert control.records[second.binding_id].profile.instruction.reasoning_summary is None
-
-
-def test_a_completions_selection_refuses_a_reasoning_model_at_admission(assistant):
-    h, control, human = configured(assistant)
-    control.models.models["configured-second-model"] = control.models.models["configured-second-model"].model_copy(
-        update={"supports_reasoning_effort": True})
-    assert select(h, value=template())[0].status_code == 200
-    before = h.store._guard()
-    with pytest.raises(Problem) as refused:
-        control.submit(human, InstructionSubmit(request_id="completions-reasoning-model",
-            content="Use the declared reasoning model.", model="configured-second-model"))
-    assert refused.value.body["error"]["code"] == "REASONING_MODEL_REQUIRES_RESPONSES"
-    assert h.store._guard() == before and control.records == {}
-
 
 @pytest.mark.parametrize("identity", ["agent", "read-only"])
-def test_nonapprovers_cannot_select_even_a_valid_template(assistant, identity):
-    h, control, _ = configured(assistant)
+def test_nonapprovers_cannot_select_even_a_valid_template(assistant_api, identity):
+    h, control, _ = configured(assistant_api)
     before = h.store._guard()
     result, _ = select(h, identity=identity)
     assert result.status_code == 403
     assert h.store._guard() == before and not control.records and not h.endpoint.requests
 
 
-def test_approve_without_current_read_is_not_a_profile_selection_permission(assistant, signing_key):
-    h, control, _ = configured(assistant)
+def test_approve_without_current_read_is_not_a_profile_selection_permission(assistant_api, signing_key):
+    h, control, _ = configured(assistant_api)
     before = h.store._guard()
     command = SelectConversationProfile(request_id="approve-without-read", expected_selection_id=None, template=template())
     response = h.client.post(PATH + "/select", content=command.model_dump_json(), headers={
@@ -78,8 +45,8 @@ def test_approve_without_current_read_is_not_a_profile_selection_permission(assi
     assert h.store._guard() == before and not control.records
 
 
-def test_selection_reconcile_and_export_use_the_original_approved_reference(assistant):
-    h, control, _ = configured(assistant)
+def test_selection_reconcile_and_export_use_the_original_approved_reference(assistant_api):
+    h, control, _ = configured(assistant_api)
     selected, command = select(h)
     assert selected.status_code == 200, selected.text
     before = h.store._guard()
@@ -95,8 +62,8 @@ def test_selection_reconcile_and_export_use_the_original_approved_reference(assi
     assert h.store._guard() == before and not control.records and not h.endpoint.requests
 
 
-def test_responses_state_profile_is_selected_by_the_owner_and_round_trips_without_changing_old_bytes(assistant):
-    h, control, _ = configured(assistant)
+def test_responses_state_profile_is_selected_by_the_owner_and_round_trips_without_changing_old_bytes(assistant_api):
+    h, control, _ = configured(assistant_api)
     original = template()
     assert "state_profile" not in original.settings.model_dump(mode="json")
     response_template = template(state_profile="foundry-responses-v1")
@@ -111,8 +78,8 @@ def test_responses_state_profile_is_selected_by_the_owner_and_round_trips_withou
     assert "state_profile" not in original.settings.model_dump(mode="json")
 
 
-def test_wrong_previous_selection_and_same_request_with_new_content_do_not_overwrite(assistant):
-    h, control, _ = configured(assistant)
+def test_wrong_previous_selection_and_same_request_with_new_content_do_not_overwrite(assistant_api):
+    h, control, _ = configured(assistant_api)
     selected, _ = select(h)
     assert selected.status_code == 200
     before = h.store._guard()
@@ -127,16 +94,16 @@ def test_wrong_previous_selection_and_same_request_with_new_content_do_not_overw
     assert h.client.get(PATH, headers=h.headers()).json()["settings"]["text_attachment_profile"] == "fa-source-text-attachments-v1"
 
 
-def test_unknown_original_selection_is_not_replayed_as_a_new_choice(assistant):
-    h, control, _ = configured(assistant)
+def test_unknown_original_selection_is_not_replayed_as_a_new_choice(assistant_api):
+    h, control, _ = configured(assistant_api)
     before = h.store._guard()
     result, _ = select(h, reconcile=True, identity="read-only")
     assert result.status_code == 503 and result.json()["error"]["code"] == "PROFILE_SELECTION_UNKNOWN"
     assert h.store._guard() == before and not control.records
 
 
-def test_imported_role_digest_cannot_invent_new_approved_instructions(assistant):
-    h, _, _ = configured(assistant)
+def test_imported_role_digest_cannot_invent_new_approved_instructions(assistant_api):
+    h, _, _ = configured(assistant_api)
     forged = template()
     forged = forged.model_copy(update={"role": forged.role.model_copy(update={"prefix_sha256": "f" * 64})})
     before = h.store._guard()
@@ -145,8 +112,8 @@ def test_imported_role_digest_cannot_invent_new_approved_instructions(assistant)
     assert h.store._guard() == before
 
 
-def test_lost_selection_ack_reconciles_the_original_once_without_new_writes(assistant, monkeypatch):
-    h, control, _ = configured(assistant)
+def test_lost_selection_ack_reconciles_the_original_once_without_new_writes(assistant_api, monkeypatch):
+    h, control, _ = configured(assistant_api)
     transact = h.store.transact
     calls = []
     def lost(request, decide, **kwargs):
@@ -167,8 +134,8 @@ def test_lost_selection_ack_reconciles_the_original_once_without_new_writes(assi
     assert h.store._guard() == before and calls == [True] and not h.endpoint.requests
 
 
-def test_template_cannot_select_unavailable_destination_skill_versions(assistant):
-    h, control, _ = configured(assistant)
+def test_template_cannot_select_unavailable_destination_skill_versions(assistant_api):
+    h, control, _ = configured(assistant_api)
     imported = template("fa-instruction-skill-purpose-v1").model_copy(update={"skills": (TemplateSkill(
         name="not-granted-by-template", version_id="a" * 32, sha256="a" * 64,
     ),)})
@@ -178,8 +145,8 @@ def test_template_cannot_select_unavailable_destination_skill_versions(assistant
     assert h.store._guard() == before and not control.records
 
 
-def test_revoked_standing_scope_cannot_select_or_reconcile_profile(assistant):
-    h, control, human = configured(assistant)
+def test_revoked_standing_scope_cannot_select_or_reconcile_profile(assistant_api):
+    h, control, human = configured(assistant_api)
     selected, _ = select(h)
     assert selected.status_code == 200
     control.revoke(human, "revoke-profile-scope")
@@ -193,8 +160,8 @@ def test_revoked_standing_scope_cannot_select_or_reconcile_profile(assistant):
 @pytest.mark.parametrize("max_prompt_tokens,expected", [
     (None, "SKILL_CATALOG_CAPACITY_UNKNOWN"), (50, "SKILL_CATALOG_BUDGET_TOO_SMALL"),
 ])
-def test_impossible_default_model_catalog_budget_is_refused_before_selection(assistant, max_prompt_tokens, expected):
-    h, control, _ = configured(assistant)
+def test_impossible_default_model_catalog_budget_is_refused_before_selection(assistant_api, max_prompt_tokens, expected):
+    h, control, _ = configured(assistant_api)
     current = control.models.select(None)
     control.models.models[current.id] = current.model_copy(update={"max_prompt_tokens": max_prompt_tokens})
     before = h.store._guard()
@@ -207,14 +174,14 @@ def test_impossible_default_model_catalog_budget_is_refused_before_selection(ass
 
 @pytest.mark.parametrize("settings", [{"sdk_version": "1.0.13", "runtime_version": "1.0.83"},
                                       {"state_profile": "foundry-native-v2"}], ids=["v2-pair", "v2-state-profile"])
-def test_a_new_selection_names_only_what_the_send_profiles_images_read(assistant, monkeypatch, settings):
+def test_a_new_selection_names_only_what_the_send_profiles_images_read(assistant_api, monkeypatch, settings):
     """ADR-0009 §3 (c): a selection reaches every new conversation's capture, so once the API sends v3 (3d-ii) a new
     selection naming the v2 pair or the v2 state profile is 422; a same-ID resend of one stored while the API sent v2
     (3d-i) still returns it, unchanged."""
     from shared_context import behavior_profile_selection
     from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_V2_PROFILE, UNLABELED_STATE_PROFILE
 
-    h, control, _ = configured(assistant)
+    h, control, _ = configured(assistant_api)
     before = h.store._guard()
     refused, _ = select(h, request_id="v2-choice", value=template(**settings))
     assert refused.status_code == 422 and refused.json()["error"]["code"] == "PROFILE_SELECTION_UNSUPPORTED"
@@ -234,13 +201,13 @@ def test_a_new_selection_names_only_what_the_send_profiles_images_read(assistant
     assert not control.records
 
 
-def test_the_scripts_templates_pass_the_real_selection(script, assistant):
+def test_the_scripts_templates_pass_the_real_selection(script, assistant_api):
     """The azd first install (select_defaults) and --keep-capabilities send these templates to the real select_profile,
     which refuses any pair but SENT_RELEASE (422): both name it, also over a base selected under another known pair."""
     from shared_context.native_responses_wire import SENT_RELEASE
     from shared_context.sdk_pin import KNOWN_RELEASES
 
-    h, _, _ = configured(assistant)
+    h, _, _ = configured(assistant_api)
     first = AgentTemplate.model_validate_json(json.dumps(script.template({"capabilities": [], "skills": []})))
     assert first.settings.state_profile == "foundry-responses-v1"
     selected, _ = select(h, request_id="script-template", value=first)

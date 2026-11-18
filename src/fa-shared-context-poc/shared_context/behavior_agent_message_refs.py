@@ -63,36 +63,6 @@ def _read_artifact(authority, binding, principal, reference):
         raise Problem(409, "AGENT_MESSAGE_REFS_CHANGED", "the shared artifact changed during its current read")
 
 
-def preflight_team_refs(*, sender_authority, sender_binding, sender_principal,
-                        receiver_authority, receiver_policy, refs, allowed_refs):
-    """Deny known-invalid input before registration; never substitute for the receiver's work gate."""
-    references, allowed = _references(refs), _references(allowed_refs)
-    receiver = receiver_policy.template
-    scope = (sender_binding.tenant_id, sender_binding.team_id)
-    policy = receiver_policy.legacy_template_policy
-    if (scope != (receiver.tenant_id, receiver.team_id) or policy.source_visibility != "team"
-            or any((ref.tenant_id, ref.team_id) != scope or ref not in allowed
-                   or ref.resource_kind != "source" or ref.resource_id not in receiver.source_ids for ref in references)):
-        raise Problem(403, "AGENT_MESSAGE_SHARE_DENIED", "the original receiver cannot read these root references")
-    store = sender_authority.runtime.store
-    if store is not receiver_authority.runtime.store:
-        raise Problem(403, "AGENT_MESSAGE_REFS_DENIED", "the original shared authority is required")
-
-    def read():
-        sender_policy = _gate(sender_authority, sender_binding, sender_principal)
-        observed = []
-        for reference in references:
-            source = _read_source(sender_authority, sender_binding, sender_principal, sender_policy, reference)
-            if source.event.purpose not in policy.allowed_purposes:
-                raise Problem(403, "AGENT_MESSAGE_REFS_DENIED", "the receiver policy does not allow the source purpose")
-            receiver_authority.runtime._validate_source_output(source, policy)
-            observed.append(source.event.expires_at)
-        _gate(sender_authority, sender_binding, sender_principal)
-        for expiry in observed:
-            sender_authority.runtime.dep.sources._require_unexpired(expiry)
-    return read() if store._read_view() is not None else store.consistent_read(read, max_keys=None)
-
-
 def validate_team_refs(*, sender_authority, sender_binding, sender_principal,
                        receiver_authority, receiver_binding, receiver_principal, refs, allowed_refs):
     """No writes or cached grants; receiver identity must come from the trusted assignment."""

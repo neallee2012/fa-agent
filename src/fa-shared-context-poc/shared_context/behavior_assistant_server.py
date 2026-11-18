@@ -20,9 +20,10 @@ from dataclasses import replace
 import httpx
 from fastapi import HTTPException
 
+from . import behavior_wire as wire
 from .behavior_assistant import AssistantAuthority
 from .behavior_assistant_gateway import AssistantProvider
-from .behavior_http_diagnostics import model_failure
+from .behavior_http_diagnostics import model_failure, _ACQUIRE_CODES
 from .behavior_assistant_deadlines import model_sync, check_server_model
 from .errors import Problem
 from .m3_artifacts import ArtifactService
@@ -30,6 +31,21 @@ from .m3_auth import ApprovalSettings
 from .m3_store import BlobArtifactStore
 from .service import ContextService
 from .storage import TableRepository
+
+
+def acquire_http_error(error, phase, *, sdk_start_binding=None):
+    code = error.body["error"].get("code")
+    allowed = _ACQUIRE_CODES
+    if sdk_start_binding is not None and sdk_start_binding.profile == "fa-sdk-start-gate-v2":
+        allowed |= wire.SDK_MEMORY_REFUSAL_CODES
+    code = code if type(code) is str and code in allowed else "UNCLASSIFIED"
+    phase = phase if phase in {"native_evidence", "acquire_authority", "native_claim", "hosted_claim", "assistant_authority"} else "unknown"
+    return HTTPException(
+        status_code=error.status, detail="The original assistant acquire could not be completed.",
+        headers={"Cache-Control": "no-store", "x-behavior-assistant-error-code": code,
+                 "x-behavior-assistant-error-phase": phase},
+    )
+
 
 
 class _DisabledLegacyMemory:
@@ -122,26 +138,8 @@ class AssistantServer:
         return self.authority
 
     @staticmethod
-    def bounded_route(composition, request):
-        binding = composition.runtime.bindings.get(request.path_params.get("binding_id"))
-        if (request.method != "POST" or binding is None
-                or binding.binding_id not in composition.runtime.profiles):
-            return False
-        path = getattr(request.scope.get("route"), "path", None)
-        root = "/behavior/v1/bindings/{binding_id}"
-        return path in {
-            root + "/hosted/launches/{launch_id}/claim", root + "/assistant/launches/{launch_id}/claim",
-            *(root + "/assistant/sessions/{session_id}/" + action for action in (
-                "acquire", "status", "context", "reserve-model", "model", "save", "reconcile", "finish",
-                "stopped", "checkpoint", "restore",
-                "skill-catalog", "skill-catalog-presentation", "read-skill", "read-skill-resource", "attached-text",
-            )),
-        }
-
-    @staticmethod
     def acquire_evidence(composition):
         """Re-read only registered assistant routes' side-effect-free evidence gate."""
-        from .behavior_assistant_api import acquire_http_error
         for attempt in range(3):
             try:
                 composition.require_current_native_evidence()

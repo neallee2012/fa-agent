@@ -41,6 +41,7 @@ from shared_context.source_reviews import DurableHumanReviewVerifier, HumanRevie
 from test_behavior_delivery import NOW
 from test_behavior_store import FakeTable, SCOPE, wire_store
 from test_m3_auth import CLIENT_ID, HUMAN_OID, jwk_client, signing_key, token
+from legacy_replay_helpers import legacy_tokens, replayed
 
 BASE = "/behavior/v1/bindings/binding-one"
 METRICS = b'{ "schema_version": "fa-artifact-metrics-v1", "item_count": 3, "completed_count": 2 }\n'
@@ -221,15 +222,6 @@ class RuntimeHarness:
         assert committed.status_code == 200, committed.text
         return wire.ExactSourceRef(source_id="metrics", version=1, sha256=hashlib.sha256(METRICS).hexdigest(), byte_length=len(METRICS))
 
-    def submit(self):
-        response = self.post("/work/submit", wire.SubmitWork(request_id="submit-one"))
-        assert response.status_code == 200, response.text
-        return response
-
-    def submit_direct(self, request_id="submit-one"):
-        """Same admission as submit(), entering through BehaviorRuntime.submit instead of the HTTP route."""
-        principal = self.verifier(self.client.build_request("GET", "/", headers=self.headers()))
-        return self.runtime.submit(self.binding.binding_id, wire.SubmitWork(request_id=request_id), principal)
 
 
 @pytest.fixture
@@ -237,8 +229,9 @@ def h(auth, jwk_client, signing_key):
     return RuntimeHarness(auth, jwk_client, signing_key)
 
 
-def test_full_authenticated_submit_worker_result_exact_pull_and_ack(h):
-    assert h.submit_direct().state == "queued"
+def test_full_authenticated_submit_worker_result_exact_pull_and_ack(legacy_tokens, h):
+    # "submit-one" as the retired BehaviorRuntime.submit queued it on 80ec0865 (legacy_replay_helpers).
+    assert replayed(h).state == "queued"
     result = h.runtime.controller.step("binding-one")
     assert result.state == "succeeded" and result.result_forwarded
     assert len(h.executor.starts) == 1
@@ -259,7 +252,6 @@ def test_full_authenticated_submit_worker_result_exact_pull_and_ack(h):
     assert ack.json()["result"]["channel_version"] == binding.channel_version
     assert ack.json()["result"]["fulfillment_receipt_id"]
     assert h.post("/delivery/acknowledge", acknowledgment).json() == ack.json()
-    assert h.submit_direct().obligation_fulfilled
     assert len(h.executor.starts) == 1
 
 
@@ -431,9 +423,6 @@ def test_current_policy_revocation_blocks_normal_and_replayed_access(h):
     h.mutate(control_key("policy", "policy"), active=False)
     assert h.client.get(BASE + "/sources/metrics/versions/1", headers=h.headers()).status_code == 403
     assert h.post("/sources/metrics/commit", wire.Command(request_id="source-one")).status_code == 403
-    with pytest.raises(Problem) as refused:
-        h.submit_direct("new")
-    assert refused.value.status == 403
 
 
 def test_unknown_source_commit_reconciles_original_without_resubmission(h):
@@ -475,17 +464,6 @@ def test_applied_source_response_loss_reads_original_receipt_and_exact_bytes(h):
     assert h.client.get(BASE + "/sources/metrics/versions/1", headers=h.headers()).content == METRICS
 
 
-def test_admission_plan_and_authenticated_evidence_are_atomic_across_lost_ack(h):
-    h.transport.after_apply = "lost"
-    with pytest.raises(Problem) as lost:
-        h.submit_direct("original")
-    assert lost.value.status == 503
-    h.transport.after_apply = None
-    # The captured admission/evidence time must survive a restart/retry.
-    h.time += timedelta(seconds=1)
-    assert h.submit_direct("original").state == "queued" and len(h.executor.starts) == 0
-
-
 @pytest.mark.parametrize("original", [
     b'{"schema_version":"SECRET_MARKER","schema_version":"fa-artifact-metrics-v1","item_count":1,"completed_count":0}',
     b'{"schema_version":"fa-artifact-metrics-v1","item_count":1,"completed_count":0,"token":"SECRET_MARKER"}',
@@ -510,8 +488,8 @@ def test_authenticated_body_bounds_duplicate_headers_and_wrong_binding_are_expli
     assert h.client.post(BASE + "/sources/metrics/commit?approved=true", content="{}", headers=h.headers()).status_code == 422
 
 
-def test_worker_start_response_loss_reconciles_same_job_without_second_start(h):
-    h.submit_direct()
+def test_worker_start_response_loss_reconciles_same_job_without_second_start(legacy_tokens, h):
+    replayed(h)  # "submit-one" as the retired BehaviorRuntime.submit queued it on 80ec0865
     h.executor.fail_after_apply = True
     with pytest.raises(Problem):
         h.runtime.controller.step("binding-one")

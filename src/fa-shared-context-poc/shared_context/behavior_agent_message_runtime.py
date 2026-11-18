@@ -95,15 +95,6 @@ def _status(job):
                      delivery_id=None, obligation_fulfilled=False)
 
 
-def check_model_time(authority, session, rows):
-    task = session.assignment.task.instruction
-    if task is not None and task.peer_work is not None:
-        from .behavior_agent_message_api import AgentCollaborationRoot
-        root = _row(rows, task.peer_work.root_id, AgentCollaborationRoot)
-        if authority.runtime._now() >= root.spec.deadline:
-            raise Problem(429, "AGENT_MESSAGE_ROOT_EXPIRED", "the original peer model allowance has expired")
-
-
 def session_keys(task):
     reference = task.peer_work
     return (reference.root_id, reference.message_key, message_state_key(reference.message_key),
@@ -473,8 +464,7 @@ def _step_peer(peer, receiver, root, ledger):
     elif job.state not in {"succeeded", "failed", "cancelled"} and job.cancel_requested and job.stop_credit:
         workers.stop(job.spec.job_id, job.owner)
     elif (job.state not in {"succeeded", "failed", "cancelled"}
-          and (job.cancel_requested or _has_assistant_claim(peer, job))) and not (
-            not job.cancel_requested and peer.runtime.dep.native_launches.instruction_recently_active(job)):
+          and (job.cancel_requested or _has_assistant_claim(peer, job))):
         workers.reconcile(job.spec.job_id, job.owner)
     observed = workers.inspect(receiver.binding.job_id)
     if observed.state == "capacity_uncertain":

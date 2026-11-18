@@ -3,15 +3,11 @@
 import json
 import hashlib
 from datetime import timedelta
-from types import SimpleNamespace
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import SecretStr
 from shared_context import behavior_wire as wire
 from shared_context.behavior_foundry import NativeExecutionGrant, native_key
-from shared_context.behavior_hosted import BehaviorExecutorClient, ChecksumSupervisor, HostedInvocation, HostedRuntime
 from shared_context.behavior_server import application, bootstrap
 from shared_context.behavior_server_config import BootstrapAuthorization
 from shared_context.behavior_store import ControlChanges, ControlRequest, ControlWrite, InlineMaterial
@@ -19,7 +15,7 @@ from shared_context.behavior_workers import worker_key
 from shared_context.behavior_runtime import RuntimeController
 from shared_context.errors import Problem
 from test_behavior_server import Harness, NOW, workspace
-from test_m3_auth import jwk_client, signing_key, token
+from test_m3_auth import jwk_client, signing_key
 
 from shared_context.behavior_server_config import ServerConfiguration, synthetic_configuration
 from shared_context.source_materials import digest
@@ -53,32 +49,9 @@ def test_c1_configuration_registers_separate_child_work_without_child_authority_
 class C1Harness(Harness):
     def __init__(self, workspace, key_client, signing_key):
         super().__init__(workspace, key_client, configuration_data=c1_config_data())
-        self.signing_key, self.native_error = signing_key, None
+        self.signing_key = signing_key
         self.activate()
         self.client = TestClient(application(self.composition))
-        self.probe_directives = []
-        self.before_claim, self.fail_observe = None, False
-        target = self.config.targets[0]
-        agent_token = token(signing_key, {"oid": target.agent_oid, "roles": ["Behavior.Agent"], "idtyp": "app"}, remove=("scp",))
-
-        def api_transport(request):
-            if request.url.path.endswith("/claim") and self.before_claim is not None:
-                callback, self.before_claim = self.before_claim, None
-                callback()
-            result = self.client.post(request.url.path, content=request.content, headers=dict(request.headers))
-            if request.url.path.endswith("/resolve") and result.status_code == 200:
-                self.probe_directives.append(result.json()["directive"])
-            return httpx.Response(result.status_code, headers=result.headers, content=result.content)
-
-        self.api = BehaviorExecutorClient(
-            "https://api.example", self.config.identity.audience,
-            SimpleNamespace(get_token=lambda _: SimpleNamespace(token=agent_token)),
-            transport=httpx.MockTransport(api_transport),
-        )
-        self.supervisor = ChecksumSupervisor(workspace / "hosted")
-        self.hosted = HostedRuntime(wire.HostedIdentity(**{
-            key: getattr(target, key) for key in ("agent_id", "agent_name", "agent_version", "session_id")
-        }), self.supervisor, self.api, clock=lambda: self.time)
 
     def authorization(self):
         binding = self.config.bindings[0]
@@ -102,39 +75,12 @@ class C1Harness(Harness):
             not_before=NOW, expires_at=NOW + timedelta(hours=1), native_grants=tuple(grants),
         )
 
-    def native(self, request):
-        self.calls.append(request)
-        target = self.config.targets[0]
-        start = request.method == "POST" and request.url.path.endswith("/invocations")
-        invocation = "inv_" + hashlib.sha256(request.content).hexdigest()[:48] if start else request.headers["x-agent-invocation-id"]
-        headers = {"x-agent-invocation-id": invocation, "x-agent-session-id": target.session_id}
-        try:
-            if not start and self.fail_observe:
-                raise httpx.ReadTimeout("OFFLINE unknown native park; keep the slot", request=request)
-            if start:
-                result = self.hosted.start(HostedInvocation(
-                    **json.loads(request.content), launch_permit=SecretStr(request.headers[wire.NATIVE_LAUNCH_PERMIT_HEADER]),
-                ), invocation, target.session_id)
-            else:
-                result = self.hosted.observe(invocation, target.session_id, request.headers[wire.NATIVE_PROBE_HEADER],
-                                             cancellation=request.url.path.endswith("/cancel")).model_dump(mode="json")
-            return httpx.Response(202 if start else 200, json=result, headers=headers)
-        except Exception as error:
-            self.native_error = error
-            raise
-
     def post(self, path, body):
         return self.client.post("/behavior/v1/bindings/binding-1" + path, json=body,
                                 headers=self.headers(self.signing_key))
 
     def status(self, path="/jobs/job-1"):
         return self.client.get("/behavior/v1/bindings/binding-1" + path, headers=self.headers(self.signing_key))
-
-    def wait_child_exit(self, job_id):
-        job = self.runtime.dep.workers.inspect(job_id)
-        launch_id = native_key("launch-id", job.binding.start_request_id)
-        self.supervisor.children[launch_id].wait(timeout=15)
-        return launch_id
 
     def mutate_job(self, job_id, **updates):
         key = worker_key("job", job_id)
@@ -146,11 +92,6 @@ class C1Harness(Harness):
         ),), result={"offline_test_mutation": True}))
 
     def close(self):
-        for child in self.supervisor.children.values():
-            if child.poll() is None:
-                child.terminate()
-                child.wait(timeout=10)
-        self.api.close()
         self.client.close()
         self.composition.close()
 

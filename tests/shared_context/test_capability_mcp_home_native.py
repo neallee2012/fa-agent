@@ -15,10 +15,8 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from shared_context.behavior_assistant_hosted import hosted_mcp_temp
 from shared_context.behavior_capabilities import CapabilityCapture, CapabilityGrant
 from shared_context.behavior_capability_prompt import session_needs
-from shared_context.errors import Problem
 from shared_context.m2_copilot import mcp_temp_dir, run_copilot, show_on_desktop
 from shared_context.tool_catalog import StdioEntry
 from test_m2_copilot import ScriptedEndpoint, runtime_path, tool_call, workspace
@@ -37,16 +35,6 @@ def test_hosted_mcp_temp_dir_fits_the_chromium_socket_path_limit():
     assert mcp_temp_dir(state.parent.parent / ("0" * 64) / "sdk", private) != temp
 
 
-def test_hosted_mcp_temp_is_made_under_the_private_root_or_refused_before_the_sdk(tmp_path):
-    root = tmp_path / "private" / ("5f4bc6ee" * 8)
-    temp = hosted_mcp_temp(root, "playwright")
-    assert temp == mcp_temp_dir(root / "sdk", root.parent) and temp.is_dir() and os.access(temp, os.W_OK)
-    (tmp_path / "blocked").write_text("not a directory")
-    with pytest.raises(Problem) as refused:
-        hosted_mcp_temp(tmp_path / "blocked" / "launch", "playwright")
-    assert refused.value.status == 503 and refused.value.body["error"]["code"] == "CAPABILITY_UNAVAILABLE"
-
-
 @pytest.mark.parametrize("catalog_home", [None, "catalog-home"], ids=["fa-home", "catalog-home-kept"])
 def test_hosted_mcp_server_gets_a_writable_private_home(workspace, runtime_path, catalog_home):
     env = {name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "PATH") if name in os.environ}
@@ -61,7 +49,9 @@ def test_hosted_mcp_server_gets_a_writable_private_home(workspace, runtime_path,
     async def current():
         return True
     state = workspace / "state"
-    temp = hosted_mcp_temp(workspace / "launch", "fake")
+    launch = workspace / "launch"
+    temp = mcp_temp_dir(launch / "sdk", launch.parent)
+    temp.mkdir(parents=True)
     result = asyncio.run(run_copilot(
         state_dir=state, working_directory=workspace / "work", sdk_session_id="mcp-home", resume=False,
         prompt="Report the environment.", tools=[], api_url="https://context.invalid", token_provider=endpoint.token,

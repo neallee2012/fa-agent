@@ -1,6 +1,5 @@
 """Complete SDK state outside inline rows; all model and Blob traffic is offline."""
 import asyncio
-from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -10,18 +9,11 @@ import pytest
 
 from shared_context.behavior_sdk_state import SdkState
 from shared_context.behavior_sdk_files import SdkSessionFiles, STATE_PATH
-from shared_context.behavior_sdk_checkpoint import (
-    SdkCheckpointStore, SaveSdkState, SdkStateUpload, checkpoint_key, save_state, load_state,
-)
-from shared_context.behavior_assistant_wire import InstructionSubmit, SdkStop
-from shared_context.behavior_wire import Command
-from shared_context.behavior_operations import _row
+from shared_context.behavior_sdk_checkpoint import SdkCheckpointStore
 from shared_context.errors import Problem
 from shared_context.m3_store import InMemoryArtifactStore
-from test_behavior_assistant import assistant
 from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import signing_key, jwk_client
-from work_policy_lifecycle_helpers import enabled
 
 
 def state(sid="sdk-original"):
@@ -80,66 +72,6 @@ def test_sdk_files_cannot_escape_or_publish_after_io_error():
         asyncio.run(clean.write_file(STATE_PATH+"/events.jsonl","replacement"))
     with pytest.raises(Problem):
         SdkSessionFiles("other",state())
-
-
-def assigned(assistant):
-    h,control,human,_=enabled(assistant)
-    b,_=control.submit(human,InstructionSubmit(request_id="state-checkpoint",content="OFFLINE source task"))
-    starts=[]
-    h.workers.adapter=replace(h.workers.adapter,start=lambda command:starts.append(command))
-    h.workers.start(b.job_id,b.owner)
-    assignment,ticket=h.assistant.issue(starts[0])
-    principal=h.verifier(h.client.build_request("GET","/",headers=h.headers("agent")))
-    h.assistant.acquire_current(b.binding_id,assignment.session_id,ticket,Command(request_id="sdk-start"),principal)
-    session=h.assistant.current_session(b.binding_id,assignment.session_id,ticket,principal)
-    return h,b,session
-
-
-@pytest.mark.parametrize("failure",["partial-put","commit-unknown"])
-def test_partial_or_unknown_checkpoint_never_reuploads_or_publishes_empty(assistant,monkeypatch,failure):
-    h,b,session=assigned(assistant)
-    previous_binding=SimpleNamespace(tenant_id=b.tenant_id,team_id=b.team_id,agent_oid=b.agent_oid,job_id="prior-job")
-    checkpoints=SdkCheckpointStore(h.assistant.artifacts.store)
-    previous=state(session.assignment.sdk_session_id)
-    prior_ref=checkpoints.save(previous,previous_binding,conversation_id=session.assignment.task.instruction.conversation_id)
-    original=state(session.assignment.sdk_session_id)
-    original.files["temp/tool-output.txt"]="".join(hashlib.sha256(str(i).encode()).hexdigest()+"\n" for i in range(9000))
-    command=SaveSdkState(request_id="sdk-state",state=original,sdk_stop=SdkStop(pid=42,exit_code=0,graceful=True))
-    artifacts=h.assistant.artifacts.store
-    put=artifacts.put;calls=[]
-    def broken_put(*args):
-        calls.append(args)
-        if failure=="partial-put" and len(calls)==2:
-            raise Problem(503,"ARTIFACT_UNKNOWN","OFFLINE response unknown")
-        return put(*args)
-    monkeypatch.setattr(artifacts,"put",broken_put)
-    transact=h.store.transact
-    def broken_commit(request,decide,**kwargs):
-        from shared_context.behavior_assistant import key
-        if failure=="commit-unknown" and request.request_id==key("sdk-state-complete",session.assignment.session_id):
-            raise Problem(503,"BEHAVIOR_COMMIT_UNKNOWN","OFFLINE commit response unknown")
-        return transact(request,decide,**kwargs)
-    monkeypatch.setattr(h.store,"transact",broken_commit)
-    with pytest.raises(Problem):save_state(h.assistant,session,command)
-    assert len(calls)==2
-    pending=_row(h.store.read_snapshot((checkpoint_key(b.job_id),)),checkpoint_key(b.job_id),SdkStateUpload)
-    assert pending.reference is None
-    before=len(calls)
-    with pytest.raises(Problem):save_state(h.assistant,session,command)
-    assert len(calls)==before
-    assert checkpoints.load(prior_ref,b,conversation_id=session.assignment.task.instruction.conversation_id,
-                            sdk_session_id=session.assignment.sdk_session_id,job_id="prior-job")==previous
-
-
-def test_checkpoint_completion_and_exact_readback_are_bound_to_original_job(assistant):
-    h,b,session=assigned(assistant)
-    original=state(session.assignment.sdk_session_id)
-    command=SaveSdkState(request_id="sdk-state",state=original,sdk_stop=SdkStop(pid=42,exit_code=0,graceful=True))
-    ref=save_state(h.assistant,session,command)
-    assert load_state(h.assistant,session,ref,job_id=b.job_id)==original
-    assert save_state(h.assistant,session,command)==ref
-    with pytest.raises(Problem):
-        load_state(h.assistant,session,ref.model_copy(update={"conversation_id":"wrong"}),job_id=b.job_id)
 
 
 def test_legacy_inline_archive_is_unchanged_and_importable_into_sdk_fs(tmp_path):

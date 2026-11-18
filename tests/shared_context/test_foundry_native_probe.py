@@ -340,19 +340,15 @@ def test_disabled_probe_keeps_default_host_inactive_and_refuses_probe_requests(o
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_normal_invocation_uses_original_runtime_even_when_probe_is_available(offline, monkeypatch, enabled):
+def test_an_invocation_without_the_probe_header_never_reaches_the_probe(offline, monkeypatch, enabled):
     if not enabled:
         monkeypatch.delenv("FA_N0_STATE_PROBE")
     headers = {key: value for key, value in HEADERS.items() if key != PROBE_HEADER}
     headers[NATIVE_LAUNCH_PERMIT_HEADER] = "a" * 64
     with TestClient(create_host(offline.runtime)) as client:
         result = client.post("/invocations", headers=headers, json={"binding_id": "original", "launch_id": "launch"})
-    assert result.status_code == 202 and result.json() == {"status": "accepted"}
-    offline.runtime.start.assert_called_once()
-    invocation, *ids = offline.runtime.start.call_args.args
-    assert (invocation.binding_id, invocation.launch_id, invocation.launch_permit.get_secret_value()) == (
-        "original", "launch", "a" * 64)
-    assert ids == ["OFFLINE-invocation", "OFFLINE-session"]
+    assert result.status_code == 410 and result.json()["error"]["code"] == "JOB_LANE_RETIRED"
+    offline.runtime.start.assert_not_called()
     assert not offline.storage.calls and not offline.credentials
 
 

@@ -5,14 +5,10 @@ from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
-from .behavior_wire import Command, Digest, Identifier, WireModel
-from .behavior_user_turn import TurnNumber, UserTurnSource, USER_TURN_ERRORS, USER_TURN_RESPONSE_BYTES
+from .behavior_wire import Digest, Identifier, WireModel
+from .behavior_user_turn import TurnNumber, USER_TURN_ERRORS, USER_TURN_RESPONSE_BYTES
 
 ASSISTANT_REPLY_READ_ERRORS = USER_TURN_ERRORS | {"ASSISTANT_REPLY_NOT_AVAILABLE", "ASSISTANT_REPLY_READ_DISABLED"}
-
-
-class ReadAssistantReply(Command):
-    turn_number: TurnNumber
 
 
 class AssistantReplyTurn(WireModel):
@@ -23,14 +19,6 @@ class AssistantReplyTurn(WireModel):
     turn_number: TurnNumber
     registration_sha256: Digest
     turn_archive_sha256: Digest
-
-
-def reply_turn(source: UserTurnSource):
-    return AssistantReplyTurn(
-        conversation_id=source.conversation_id, request_id=source.request_id, job_id=source.job_id,
-        turn_number=source.turn_number, registration_sha256=source.registration_sha256,
-        turn_archive_sha256=source.turn_archive_sha256,
-    )
 
 
 class AssistantReply(WireModel):

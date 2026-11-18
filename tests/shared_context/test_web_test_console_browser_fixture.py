@@ -1,26 +1,21 @@
 """Explicit OFFLINE-only browser fixture. Never used by the product launcher."""
-import argparse
 import json
 from datetime import timedelta
-from pathlib import Path
 
-import httpx
-import uvicorn
 from fastapi.testclient import TestClient
 
-from conftest import A, TENANT, auth, InMemoryRepository, FakeMemory
-from test_m3_auth import signing_key, jwk_client, HUMAN_OID, CLIENT_ID
+from conftest import A, TENANT, InMemoryRepository, FakeMemory
+from test_m3_auth import HUMAN_OID, CLIENT_ID
 from test_behavior_api import RuntimeHarness
 from shared_context import behavior_wire as wire
-from shared_context.behavior_assistant import AssistantAuthority, AssistantProfile, AssistantRuntime, _LocalHttp
-from shared_context.behavior_assistant_api import create_assistant_app
+from shared_context.behavior_api import create_behavior_app
+from shared_context.behavior_assistant import AssistantAuthority, AssistantProfile, AssistantRuntime
 from shared_context.m3_artifacts import ArtifactService
 from shared_context.m3_auth import ApprovalSettings
 from shared_context.m3_store import InMemoryArtifactStore
 from shared_context.models import CreateWork
 from shared_context.service import ContextService
 from web_test_console.adapter import ConsoleConfig
-from web_test_console.bridge import create_app
 
 
 def assistant_harness(settings, keys, signing):
@@ -47,7 +42,7 @@ def assistant_harness(settings, keys, signing):
                                  mode="offline_contract", controller_id="internal-controller")
     h.assistant = AssistantAuthority(h.runtime, artifacts, (A,))
     h.client.close()
-    h.app = create_assistant_app(h.assistant, h.verifier)
+    h.app = create_behavior_app(h.runtime, h.verifier)
     h.client = TestClient(h.app)
     return h
 
@@ -72,42 +67,3 @@ def configuration(h):
             "ack_request_id": "offline-fixed-ack", "allowed_actions": ["status", "submit", "fetch", "acknowledge"]
         }]
     }))
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--journal", required=True, type=Path)
-    parser.add_argument("--port", type=int, default=8766)
-    args = parser.parse_args()
-    key = signing_key.__wrapped__()
-    h = assistant_harness(auth.__wrapped__(), jwk_client.__wrapped__(key), key)
-    import assistant_sdk_fixture
-    assistant_sdk_fixture.TENANT = TENANT
-    executor = assistant_sdk_fixture.SdkProtocolExecutor(h)
-    h.workers.adapter = executor.adapter()
-    local = _LocalHttp(h.client)
-    trace = []
-    def send(request):
-        response = local.handle_request(request)
-        trace.append({"method": request.method, "path": request.url.path, "status": response.status_code})
-        if request.url.path.endswith("/assistant/submit") and response.status_code == 200:
-            result = h.runtime.controller.step(h.binding.binding_id)  # Only this offline fixture owns a controller.
-            if executor.error is not None:
-                raise executor.error
-            assert result.state == "succeeded"
-        args.journal.with_suffix(".http-summary.json").write_text(json.dumps(trace, indent=2), encoding="utf-8")
-        return response
-    backend = httpx.Client(transport=httpx.MockTransport(send), follow_redirects=False)
-    app = create_app(configuration(h), args.journal,
-        token_provider=lambda: h.headers()["Authorization"].removeprefix("Bearer "),
-        backend=backend, clock=lambda: h.time, port=args.port, environment="OFFLINE_TEST")
-    print("OFFLINE_TEST only; real ASGI producers behind a no-network HTTPX transport.")
-    try:
-        uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False, server_header=False)
-    finally:
-        backend.close()
-        h.client.close()
-
-
-if __name__ == "__main__":
-    main()

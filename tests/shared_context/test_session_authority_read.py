@@ -1,32 +1,17 @@
 """Row-scoped pure reads: unrelated writers may move the shared guard, read rows may not."""
 
 import json
-import logging
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 
-from shared_context import behavior_assistant
-from shared_context.behavior_assistant_api import create_assistant_app
-from shared_context.behavior_assistant_gateway import AssistantProvider
-from shared_context.behavior_assistant_wire import InstructionSubmit, Reservation
-from shared_context.behavior_operations import control_key
 from shared_context.behavior_store import GUARD_KEY, BehaviorStore
-from shared_context.behavior_wire import Command
-from shared_context.behavior_workers import ExecutorEvidence
 from shared_context.errors import Problem
-from shared_context.source_materials import digest
-from test_behavior_assistant import assistant
 from test_behavior_store import FakeTable, SCOPE, changes, code, request, seed, store, write
 from instruction_flow_helpers import instruction_models
 from test_m3_auth import jwk_client, signing_key
-from work_policy_lifecycle_helpers import enabled
 from session_authority_read_helpers import runtime_path
 
 
@@ -135,164 +120,6 @@ def test_row_scoped_migration_view_keeps_guard_epoch_and_installation_checks(fau
         adapter.consistent_read(read, row_scoped=True)
 
 
-def _fresh_turn_beside_uncertain_work(assistant):
-    h, control, human, _ = enabled(assistant)
-    uncertain, _ = control.submit(human, InstructionSubmit(request_id="old-uncertain", content="Old work."))
-    fresh, _ = control.submit(human, InstructionSubmit(request_id="fresh-turn", content="Explain recursion.",
-                                                       model="configured-second-model"))
-    starts, evidences = [], {}
-    h.workers.adapter = replace(h.workers.adapter, start=lambda start: starts.append(start))
-    h.workers.start(uncertain.job_id, uncertain.owner)
-    h.workers.start(fresh.job_id, fresh.owner)
-
-    def query(binding):
-        evidence = ExecutorEvidence(evidence_id=f"offline-unknown-{len(evidences) + 1}", binding=binding,
-            sequence=len(evidences) + 1, native_execution_id=None, state="unknown", entire_tree_idle=False,
-            all_inflight_starts_fenced=False, proof=b"OFFLINE observer: unknown; not a stop proof")
-        evidences[evidence.evidence_id] = evidence
-        return evidence.evidence_id
-
-    h.workers.adapter = replace(h.workers.adapter, query=query, verify=lambda value: evidences[value])
-    h.workers.reconcile(uncertain.job_id, uncertain.owner)
-    assert h.workers.inspect(uncertain.job_id).state == "capacity_uncertain"
-    h.endpoint.expected_url = "https://provider.invalid/openai/v1/chat/completions"
-    h.endpoint.expected_model = "configured-second-model"
-    h.endpoint.unbounded = True
-    h.endpoint.replies = iter([{"content": "OFFLINE response"}] * 2)
-    provider = AssistantProvider(h.endpoint.expected_url, SimpleNamespace(
-        get_token=lambda _: SimpleNamespace(token="OFFLINE-not-a-credential")), transport=h.endpoint.transport)
-    h.client = TestClient(create_assistant_app(h.assistant, h.verifier, provider=provider))
-    assignment, ticket = h.assistant.issue(next(item for item in starts if item.binding.job_id == fresh.job_id))
-    root = f"/behavior/v1/bindings/{fresh.binding_id}/assistant/sessions/{assignment.session_id}/"
-    headers = {**h.headers("agent"), "x-behavior-assistant-ticket": ticket.get_secret_value()}
-    assert h.client.post(root + "acquire", content=Command(request_id="sdk-start").model_dump_json(),
-                         headers=headers).status_code == 200
-    return h, uncertain, fresh, root, headers, control, human
-
-
-def _writer_inside_each_session_read(h, monkeypatch, writes, phase="session_authority"):
-    """Another thread commits inside the chosen query view or after the single session read."""
-    local, pending = threading.local(), list(writes)
-    conflicts, consistent_read = behavior_assistant._read_conflicts, h.store.consistent_read
-    read_record = h.store.read_record
-
-    def selected(read, **kwargs):
-        local.session = kwargs["phase"] == phase
-        try:
-            return conflicts(read, **kwargs)
-        finally:
-            local.session = False
-
-    def raced(callback, **kwargs):
-        if not getattr(local, "session", False) or not pending:
-            return consistent_read(callback, **kwargs)
-
-        def read():
-            result = callback()
-            writer = threading.Thread(target=pending.pop(0))
-            writer.start()
-            writer.join()
-            return result
-        return consistent_read(read, **kwargs)
-
-    def raced_record(key):
-        result = read_record(key)
-        if phase == "session_authority" and pending:
-            writer = threading.Thread(target=pending.pop(0))
-            writer.start()
-            writer.join()
-        return result
-
-    monkeypatch.setattr(behavior_assistant, "_read_conflicts", selected)
-    monkeypatch.setattr(h.store, "consistent_read", raced)
-    monkeypatch.setattr(h.store, "read_record", raced_record)
-    return pending
-
-
-def _reserve(h, root, headers, label):
-    body = {"model": "configured-second-model", "stream": True, "messages": [{"role": "user", "content": label}]}
-    request_hash = digest(body)
-    return h.client.post(root + "reserve-model", content=Reservation(
-        request_id=request_hash, request_sha256=request_hash).model_dump_json(), headers=headers)
-
-
-def test_unrelated_observer_writes_during_session_read_do_not_refuse_reserve(assistant, monkeypatch, caplog):
-    h, uncertain, _, root, headers, _, _ = _fresh_turn_beside_uncertain_work(assistant)
-    ticks = []
-
-    def tick():
-        h.time += timedelta(seconds=1)
-        ticks.append(h.runtime.controller.step(uncertain.binding_id).state)
-    pending = _writer_inside_each_session_read(h, monkeypatch, [tick] * 3)
-    guard = h.store._guard()[0].revision
-    with caplog.at_level(logging.WARNING):
-        reserved = _reserve(h, root, headers, "OFFLINE unrelated writers")
-    assert reserved.status_code == 200, reserved.text
-    assert ticks == ["capacity_uncertain"] and len(pending) == 2
-    assert h.store._guard()[0].revision == guard + 3
-    assert not [r for r in caplog.records if "READ_CONFLICT" in r.getMessage()]
-    assert h.endpoint.requests == []
-
-
-def test_revocation_inside_session_read_is_never_returned_as_current_authority(assistant, monkeypatch, caplog):
-    h, _, fresh, root, headers, _, _ = _fresh_turn_beside_uncertain_work(assistant)
-    owner = control_key("owner", fresh.owner.owner_record_id)
-    _writer_inside_each_session_read(h, monkeypatch, [lambda: h.mutate(owner, active=False)])
-    with caplog.at_level(logging.WARNING):
-        refused = _reserve(h, root, headers, "OFFLINE revoked owner")
-    assert refused.status_code == 403, refused.text
-    # Ticket identity is cached; the original CAS gate still sees the changed owner in this first slice.
-    assert [r.getMessage() for r in caplog.records if "READ_CONFLICT" in r.getMessage()] == []
-    assert h.endpoint.requests == []
-
-
-def test_standing_revocation_row_inserted_inside_session_read_still_refuses(assistant, monkeypatch, caplog):
-    h, _, _, root, headers, control, human = _fresh_turn_beside_uncertain_work(assistant)
-    assert h.store.read_snapshot((control.revocation_key,))[control.revocation_key] is None
-    _writer_inside_each_session_read(h, monkeypatch, [lambda: control.revoke(human, "revoke-during-session-read")])
-    with caplog.at_level(logging.WARNING):
-        refused = _reserve(h, root, headers, "OFFLINE inserted revocation")
-    assert refused.status_code == 403, refused.text
-    assert h.store.read_snapshot((control.revocation_key,))[control.revocation_key] is not None
-    # Refused by reserve-model's CAS gate, which reads the revocation row; the entry read does not.
-    assert [r.getMessage() for r in caplog.records if "READ_CONFLICT" in r.getMessage()] == []
-    assert h.endpoint.requests == []
-
-
-def _tick(h, uncertain, ticks):
-    def tick():
-        h.time += timedelta(seconds=1)
-        ticks.append(h.runtime.controller.step(uncertain.binding_id).state)
-    return tick
-
-
-@pytest.mark.parametrize("change", ["unrelated-observer", "inserted-revocation"])
-def test_instruction_query_only_refuses_changes_to_what_it_read(assistant, monkeypatch, caplog, change):
-    from shared_context.behavior_work_policy_api import install_work_policy_routes
-    h, uncertain, fresh, _, _, control, human = _fresh_turn_beside_uncertain_work(assistant)
-    install_work_policy_routes(h.app, SimpleNamespace(runtime=h.runtime, verifier=h.verifier, installation=lambda: None))
-    client = TestClient(h.app)
-    conversation = control.records[fresh.binding_id].profile.instruction.conversation_id
-
-    def observe():
-        response = client.get("/work-policy/v1/conversations/" + conversation, headers=h.headers())
-        return response.status_code, response.json().get("error", {}).get("code")
-
-    ticks = []
-    writer = (_tick(h, uncertain, ticks) if change == "unrelated-observer"
-              else lambda: control.revoke(human, "revoke-during-read"))
-    _writer_inside_each_session_read(h, monkeypatch, [writer] * 3, phase="instruction_query")
-    with caplog.at_level(logging.WARNING):
-        observed = observe()
-    conflicts = [r.getMessage() for r in caplog.records if "READ_CONFLICT" in r.getMessage()]
-    if change == "unrelated-observer":
-        assert observed == (200, None) and conflicts == [] and ticks, (observed, conflicts)
-    else:
-        assert conflicts == ["ASSISTANT_READ_CONFLICT phase=instruction_query attempt=1 maximum=3"]
-        assert h.store.read_snapshot((control.revocation_key,))[control.revocation_key] is not None
-        assert observed == observe()
-    assert h.endpoint.requests == []
-
 def test_plain_snapshot_accepts_unrelated_guard_writer_only_after_rereading_its_keys(store):
     adapter, client = store
     seed(adapter)
@@ -316,22 +143,3 @@ def test_plain_snapshot_accepts_unrelated_guard_writer_only_after_rereading_its_
     committed = adapter.transact(request("rebased-writer", ("grant",)), lambda _: changes(write("after", {})))
     assert committed.payload["guard_revision"] == adapter._guard()[0].revision
 
-
-@pytest.mark.parametrize("revocation", ["owner", "standing-policy"])
-def test_view_refresh_keeps_cache_but_revoked_binding_is_still_refused(assistant, revocation):
-    h, _, fresh, root, headers, control, human = _fresh_turn_beside_uncertain_work(assistant)
-
-    def read():
-        control.refresh()
-        control.refresh(fresh.binding_id)
-        return fresh.binding_id in control.records
-
-    assert h.store.consistent_read(read, max_keys=None)
-    if revocation == "owner":
-        h.mutate(control_key("owner", fresh.owner.owner_record_id), active=False)
-    else:
-        control.revoke(human, "revoke-after-view-refresh")
-    assert h.store.consistent_read(read, max_keys=None)
-    refused = _reserve(h, root, headers, "OFFLINE revoked after view refresh")
-    assert refused.status_code == 403, refused.text
-    assert h.endpoint.requests == []

@@ -17,7 +17,6 @@ from shared_context.errors import Problem
 from test_behavior_foundry import ACTUAL_INVOCATION, Credential, INVOCATION, PERMIT, PROBE, TARGET
 from test_behavior_store import code
 
-LAUNCH = "original-launch"
 ECHO = {"x-agent-invocation-id": ACTUAL_INVOCATION, "x-agent-session-id": TARGET.session_id}
 OBSERVED = {"x-agent-invocation-id": INVOCATION, "x-agent-session-id": TARGET.session_id}
 JSON = {"content-type": "application/json"}
@@ -129,14 +128,6 @@ def test_a_missing_credential_is_refused_before_a_bad_probe():
     assert code(caught) == "FOUNDRY_CREDENTIAL_DISABLED" and caught.value.status == 403
 
 
-@pytest.mark.parametrize("launch", ["", "not/a/launch", "x" * 65])
-def test_a_bad_keepalive_launch_stops_before_before_send(make, launch):
-    gate = []
-    with pytest.raises(Problem) as caught:
-        make(unsent).keepalive(INVOCATION, launch, before_send=lambda: gate.append(1))
-    assert code(caught) == "FOUNDRY_KEEPALIVE_INVALID" and caught.value.status == 422 and not gate
-
-
 def test_before_send_runs_once_after_the_local_checks_and_can_stop_the_send(make, caplog):
     order = []
     client = make(lambda _request: order.append("sent") or httpx.Response(200, json={}, headers=ECHO))
@@ -171,19 +162,15 @@ def test_each_action_sends_its_exact_url_and_headers_in_order(make):
     client = make(reply)
     client.observe(INVOCATION, PROBE)
     client.cancel(INVOCATION, PROBE)
-    client._request("GET", INVOCATION, action="observe", keepalive_launch_id=LAUNCH)
     client._request("POST", INVOCATION, action="start", body=b"{}", launch_permit=PERMIT)
     base = names(calls[0])[:4]
     assert sorted(base) == ["accept", "accept-encoding", "authorization", "content-type"]
-    observe, cancel, keepalive, start = calls
+    observe, cancel, start = calls
     assert str(observe.url) == f"{ROUTE}/{INVOCATION}?api-version=v1"
     assert str(cancel.url) == f"{ROUTE}/{INVOCATION}/cancel?api-version=v1"
-    assert str(keepalive.url) == f"{ROUTE}/{INVOCATION}?api-version=v1"
     assert str(start.url) == f"{ROUTE}?api-version=v1&agent_session_id={TARGET.session_id}"
     assert names(observe) == [*base, "x-agent-invocation-id", wire.NATIVE_PROBE_HEADER.lower()]
-    assert names(keepalive) == [*base, "x-agent-invocation-id", wire.NATIVE_KEEPALIVE_HEADER.lower()]
     assert names(start)[:len(base) + 2] == [*base, "x-agent-invocation-id", wire.NATIVE_LAUNCH_PERMIT_HEADER.lower()]
-    assert keepalive.headers[wire.NATIVE_KEEPALIVE_HEADER] == LAUNCH
     assert observe.headers["authorization"] == "Bearer synthetic-test-token-never-persist"
     assert observe.headers["accept-encoding"] == "identity"
 
@@ -504,6 +491,7 @@ def test_only_a_valid_reply_marks_the_session_and_with_the_send_time(make, monke
     client = make(lambda _request: httpx.Response(200, content=b"{}", headers={**OBSERVED, **JSON}))
     call(client)
     assert client.last_session_request() == 100
+    assert client.for_target(TARGET).last_session_request() == 100, "a selected target shares the session stamps"
     failed = make(lambda _request: httpx.Response(200, content=b"{}", headers=JSON))
     with pytest.raises(Problem):
         call(failed)

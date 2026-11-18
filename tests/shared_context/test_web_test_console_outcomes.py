@@ -7,8 +7,8 @@ import pytest
 
 from shared_context.behavior_skill_draft import SkillDraftOutcome
 from shared_context.behavior_skill_prompt import assemble_prompt
-from test_behavior_assistant import assistant
-from test_instruction_flow import instruction_models, runtime_path
+from assistant_api_helpers import assistant_api
+from instruction_flow_helpers import instruction_models, runtime_path
 from test_m3_auth import jwk_client, signing_key
 from legacy_console_rows_helpers import stored_console
 from test_web_test_console_attachments import picker

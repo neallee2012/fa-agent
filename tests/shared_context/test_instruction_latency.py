@@ -11,7 +11,7 @@ from shared_context.behavior_assistant_gateway import AssistantProvider
 from test_web_test_console_frozen_interface import real_interface
 from web_test_console_frozen_interface_helpers import post
 from test_m3_auth import signing_key, jwk_client
-from test_behavior_assistant import assistant
+from assistant_api_helpers import assistant_api
 from instruction_flow_helpers import runtime_path, instruction_models
 from legacy_console_rows_helpers import stored_console
 
@@ -72,86 +72,6 @@ def test_provider_first_chunk_does_not_wait_for_the_last_chunk():
     asyncio.run(run())
 
 
-def test_real_http_stream_yields_preview_before_done_and_never_replays(assistant):
-    from fastapi.testclient import TestClient
-    from fastapi import APIRouter
-    from shared_context.behavior_assistant_api import install_assistant_routes, TICKET_HEADER
-    from shared_context.behavior_api import create_behavior_app
-    from shared_context.behavior_assistant_wire import InstructionSubmit, Reservation, ModelRequest
-    from shared_context.behavior_wire import Command
-    from shared_context.behavior_work_policy import CostLedger
-    from shared_context.behavior_operations import _row
-    from shared_context.source_materials import digest
-    from work_policy_lifecycle_helpers import enabled
-    from test_behavior_model_deadlines import asgi_server
-    h, control, human, _ = enabled(assistant)
-    released, closed = Event(), Event()
-    calls=[]
-    first=b'data: {"choices":[{"index":0,"delta":{"content":"Visible","reasoning_content":"PRIVATE"}}]}\n\n'
-    class Body(httpx.AsyncByteStream):
-        async def __aiter__(self):
-            yield first
-            assert await asyncio.to_thread(released.wait,5)
-            yield (b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
-                   b'data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2}}\n\n'
-                   b'data: [DONE]\n\n')
-        async def aclose(self):
-            closed.set()
-    def send(request):
-        calls.append(request)
-        return httpx.Response(200,request=request,headers={"content-type":"text/event-stream"},stream=Body())
-    provider=AssistantProvider("https://provider.invalid/openai/v1/chat/completions",
-        SimpleNamespace(get_token=lambda _:SimpleNamespace(token="OFFLINE")),transport=httpx.MockTransport(send))
-    app=create_behavior_app(h.runtime,h.verifier)
-    routes=APIRouter()
-    install_assistant_routes(routes,h.assistant,h.verifier,provider=provider)
-    app.include_router(routes)
-    from shared_context.behavior_work_policy_api import install_work_policy_routes
-    install_work_policy_routes(app,SimpleNamespace(runtime=h.runtime,verifier=h.verifier))
-    binding,_=control.submit(human,InstructionSubmit(request_id="gated-stream",content="OFFLINE",model="gpt-4.1-mini"))
-    assigned=[]
-    h.workers.adapter=replace(h.workers.adapter,start=lambda start:assigned.append(h.assistant.issue(start)))
-    h.workers.start(binding.job_id,binding.owner)
-    assignment,ticket=assigned[0]
-    path=f"/behavior/v1/bindings/{binding.binding_id}/assistant/sessions/{assignment.session_id}/"
-    headers={**h.headers("agent"),TICKET_HEADER:ticket.get_secret_value()}
-    body={"model":"gpt-4.1-mini","stream":True,"messages":[{"role":"user","content":"OFFLINE"}]}
-    command=ModelRequest(request_id=digest(body),body=body)
-    with TestClient(app) as setup:
-        assert setup.post(path+"acquire",content=Command(request_id="sdk-start").model_dump_json(),
-                          headers=headers).status_code==200
-        assert setup.post(path+"reserve-model",content=Reservation(request_id=command.request_id,
-            request_sha256=command.request_id).model_dump_json(),headers=headers).status_code==200
-        try:
-            with asgi_server(app) as port,httpx.Client(base_url=f"http://127.0.0.1:{port}",trust_env=False,timeout=5) as client:
-                with client.stream("POST",path+"model",content=command.model_dump_json(),headers=headers) as response:
-                    assert response.status_code==200
-                    iterator=response.iter_bytes()
-                    assert next(iterator)==first
-                    assert not released.is_set()
-                    preview=app.state.instruction_live_replies.read(binding.job_id)
-                    assert preview["text"]=="Visible" and not preview["durable"] and not preview["complete"]
-                    cid=control.records[binding.binding_id].profile.instruction.conversation_id
-                    status=client.get("/work-policy/v1/conversations/"+cid,headers=h.headers())
-                    assert status.status_code==200,status.text
-                    assert status.json()["turns"][-1]["stream"]["text"]=="Visible"
-                    assert not status.json()["turns"][-1]["reply_available"]
-                    assert "PRIVATE" not in status.text
-                    unsaved=client.get(f"/work-policy/v1/conversations/{cid}/turns/1/reply",
-                                       headers=h.headers())
-                    assert unsaved.status_code==404
-                    forbidden=client.get("/work-policy/v1/conversations/"+cid,headers=h.headers("agent"))
-                    assert forbidden.status_code==403
-                    released.set()
-                    assert b"[DONE]" in b"".join(iterator)
-                repeated=client.post(path+"model",content=command.model_dump_json(),headers=headers)
-                assert repeated.status_code==409 and len(calls)==1
-        finally:
-            released.set()
-    ledger=_row(h.store.read_snapshot((control.cost_key,)),control.cost_key,CostLedger)
-    assert ledger.model_pending_microusd==0 and ledger.model_metered_microusd>0 and closed.is_set()
-
-
 def test_preview_is_bounded_transient_and_never_contains_reasoning_or_tools():
     from shared_context.behavior_instruction_stream import LiveReplies,AnswerEvents
     live=LiveReplies()
@@ -167,28 +87,3 @@ def test_preview_is_bounded_transient_and_never_contains_reasoning_or_tools():
     live.append("job","request","late old content")
     assert live.read("job") is None
 
-
-def test_stream_keeps_absolute_deadline_and_closes_on_partial_failure():
-    from shared_context.behavior_assistant_api import _ModelStream
-    from shared_context.behavior_assistant_deadlines import ModelCall,_server_call
-    async def run():
-        closed=[]
-        sent=[]
-        async def body():
-            try:
-                yield b"partial"
-                await asyncio.Event().wait()
-            finally:
-                closed.append(True)
-        call=ModelCall(0.05,"server_model_deadline")
-        response=_ModelStream(body(),call)
-        async def receive():
-            await asyncio.Event().wait()
-        async def send(packet):
-            sent.append(packet)
-        with pytest.raises(TimeoutError):
-            await response({"type":"http","asgi":{"spec_version":"2.4"}},receive,send)
-        assert closed and call.cancelled.is_set() and _server_call.get() is None
-        assert any(packet.get("body")==b"partial" for packet in sent)
-        assert not any(packet.get("type")=="http.response.body" and packet.get("more_body") is False for packet in sent)
-    asyncio.run(run())

@@ -10,15 +10,11 @@ import asyncio
 import json
 import logging
 import socket
-from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from shared_context import behavior_assistant_hosted as hosted
-from shared_context import behavior_assistant_wire as aw
 from shared_context import behavior_private_memory as memory
-from shared_context.sdk_pin import RUNTIME_VERSION
 
 ENDPOINT = "https://fa-acct.services.ai.azure.com/api/projects/fa-project"
 STORE = "fa-memory-store"
@@ -166,111 +162,3 @@ def test_remember_is_sent_once_and_never_retried(kwargs, outcome, caplog):
         "scope": memory.scope_for(AGENT), "update_delay": 0,
         "items": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "I am vegetarian"}]}]}
 
-
-def _turn(tmp_path, monkeypatch, *, outcome="succeeded", peer=False, configured=True, files=(), search=None,
-          content="ORIGINAL"):
-    stop = aw.SdkStop(runtime_version=RUNTIME_VERSION, pid=42, exit_code=0, graceful=True)
-    events, sent = [], []
-    peer_work = None if not peer else aw.PeerWorkReference(
-        root_id="root", message_id="message", message_key="message-key", message_sha256="a" * 64,
-        content_sha256="b" * 64, sender_agent_id="agent-a", recipient_agent_id="agent-b",
-        recipient_work_id="work-b", conversation_id="conversation")
-
-    def save_text_reply(*args, **kwargs):
-        events.append("save")
-        return aw.ToolReceipt(state="ready_to_finalize", result_digest="a" * 64, work_outcome=outcome)
-    client = SimpleNamespace(
-        assignment=SimpleNamespace(task=SimpleNamespace(instruction=aw.InstructionTask(
-            content=content, conversation_id="conversation", turn_number=2, model="gpt-5.4-mini",
-            peer_work=peer_work)), sdk_session_id="sdk", resume=True),
-        api_url="https://offline.invalid", token_provider=lambda: "OFFLINE", model_token=lambda: TOKEN,
-        save=lambda _: None, progress=lambda _: None, save_text_reply=save_text_reply,
-        finish_failed=lambda *args: aw.ToolReceipt(state="ready_to_finalize", result_digest="a" * 64),
-    )
-    if files:
-        # Only the Hosted hand-off of literal files matters here; their profile is validated elsewhere.
-        task = client.assignment.task
-        task.instruction = task.instruction.model_copy(update={"files": files})
-    for name, value in ENV.items():
-        if configured:
-            monkeypatch.setenv(name, value)
-        else:
-            monkeypatch.delenv(name, raising=False)
-    original = memory.PrivateMemory.from_environment.__func__
-    answer = handler(sent, search=search)
-
-    def recorded(request):
-        events.append(request.url.path.rsplit(":", 1)[1])
-        return answer(request)
-    monkeypatch.setattr(memory.PrivateMemory, "from_environment", classmethod(
-        lambda cls, token, **kw: original(cls, token, transport=httpx.MockTransport(recorded))))
-    session = hosted.AssistantSession(client, root=tmp_path, runtime_path=tmp_path / "not-executed")
-    prompts = []
-
-    async def sdk(**options):
-        prompts.append(options["prompt"])
-        events.append("sdk")
-        options["on_sdk_stopped"](stop.model_dump())
-        return {"final_message": "OFFLINE answer", "sdk_stop": stop.model_dump()}
-    monkeypatch.setattr(hosted, "run_copilot", sdk)
-    monkeypatch.setattr(session, "_archive", lambda: aw.ArchiveUnavailable(error="SDK_ARCHIVE_UNAVAILABLE"))
-    asyncio.run(session._run(tmp_path))
-    return prompts[0], events, sent
-
-
-def test_a_human_turn_recalls_first_and_remembers_only_after_a_succeeded_save(tmp_path, monkeypatch):
-    prompt, events, sent = _turn(tmp_path, monkeypatch)
-    assert prompt == memory.PREFIX + "\n- Prefers short answers\n- Works on FA\n\nORIGINAL"
-    assert events == ["search_memories", "sdk", "save", "update_memories"]
-    assert json.loads(sent[1].content)["items"][0]["content"][0]["text"] == "ORIGINAL"
-
-
-@pytest.mark.parametrize("outcome", ["failed", "cancelled", None])
-def test_an_unsucceeded_turn_is_not_remembered(tmp_path, monkeypatch, outcome):
-    _, events, _ = _turn(tmp_path, monkeypatch, outcome=outcome)
-    assert events == ["search_memories", "sdk", "save"]
-
-
-def test_a_peer_turn_and_an_unconfigured_agent_use_no_private_memory(tmp_path, monkeypatch):
-    prompt, events, _ = _turn(tmp_path, monkeypatch, peer=True)
-    assert prompt.startswith("Task brief from another Agent") and events == ["sdk", "save"]
-    prompt, events, _ = _turn(tmp_path, monkeypatch, configured=False)
-    assert prompt == "ORIGINAL" and events == ["sdk", "save"]
-
-
-def test_the_old_lane_has_no_memory_with_the_cosmos_backend(tmp_path, monkeypatch, caplog):
-    """ADR-0011: the old lane passes no API connection, so ``cosmos`` leaves it without long-term memory."""
-    monkeypatch.setenv(memory.BACKEND_ENV, "cosmos")
-    with caplog.at_level(logging.WARNING):
-        prompt, events, sent = _turn(tmp_path, monkeypatch)
-    assert prompt == "ORIGINAL" and events == ["sdk", "save"] and sent == []
-    assert "FA_PRIVATE_MEMORY_INACTIVE reason=api_unavailable" in caplog.text
-
-
-def test_a_turn_with_a_large_literal_file_keeps_its_original_prompt(tmp_path, monkeypatch):
-    from shared_context.behavior_text_files import UserTextFile
-    long = {"memories": [{"memory_item": {"content": "偏好" * 290}}] * 3}
-    prompt, events, _ = _turn(tmp_path, monkeypatch, files=(UserTextFile(name="note.txt", text="記" * 2400),),
-                              search=long)
-    assert prompt == "ORIGINAL" and events == ["search_memories", "sdk", "save", "update_memories"]
-
-
-def test_an_old_lane_turn_redacts_a_secret_before_its_update(tmp_path, monkeypatch, caplog):
-    # MEM-01 (live probe 2-c): the old lane uses the same fixed rules as the native lane; the model still sees
-    # the original words, only the memory update is masked.
-    words = "示範用的 API 金鑰是 FAKE-KEY-235fe2，我喜歡短答"
-    with caplog.at_level(logging.WARNING):
-        prompt, events, sent = _turn(tmp_path, monkeypatch, content=words)
-    assert prompt.endswith(words) and events == ["search_memories", "sdk", "save", "update_memories"]
-    sent_text = json.loads(sent[1].content)["items"][0]["content"][0]["text"]
-    assert "FAKE-KEY-235fe2" not in sent_text and "我喜歡短答" in sent_text
-    assert "FA_PRIVATE_MEMORY_UPDATE redacted=1" in caplog.text and "FAKE-KEY-235fe2" not in caplog.text
-
-
-@pytest.mark.parametrize("words", ["這個代號不要存：Q-1234", "Please don't remember this: Q-1234"])
-def test_an_old_lane_do_not_store_turn_sends_no_update(tmp_path, monkeypatch, caplog, words):
-    with caplog.at_level(logging.WARNING):
-        prompt, events, sent = _turn(tmp_path, monkeypatch, content=words)
-    assert prompt.endswith(words) and events == ["search_memories", "sdk", "save"] and len(sent) == 1
-    assert "FA_PRIVATE_MEMORY_UPDATE status=skipped reason=user_opt_out" in caplog.text
-    assert asyncio.run(private([]).remember(words)) == "skipped"
