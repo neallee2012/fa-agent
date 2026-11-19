@@ -4,6 +4,16 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="stage-v49-1118"></a>
+## 2026-11-18：stage 第 49 版（舊 Hosted job lane 退役收尾）
+
+- **第 49 版**（#1279，`2026.11.18-49`，Neal 台灣時間 11-18 17:55 合併，merge `8aa2eff9`）：#1273（開網頁批准卡預設「這類動作」）、#1274（PR-E）、#1276（PR-F）、#1278（公開白名單收錄冷啟動守門測試的兩個假 GUID）與文件 #1272、#1275、#1277。這次部署不改 stage 的資源與權限。
+  - **部署**：deploy-staging run 44280458465 成功（release-gate 17:55、deploy 17:56～18:10）。
+  - **public-sync**：run 44282898208 成功（18:10～18:31），`gate 2: PASS`，公開 release `v2026.11.18-49`，tree `13ab152d`。gate 1 第一次被 #1274 測試裡兩個假 GUID 擋下，#1278 收錄後通過。
+  - **dev 測試**：run 4902，main `2f4e11f0`，報告在 #1279 本文。B 換版後第一個回合（新 Hosted image 冷啟動）、追問、換模型、拒絕卡、WebIQ 一則都正常；Traceback、AppExceptions、`JOB_LANE_RETIRED`、`HOSTED_EXECUTABLE_INVALID` 都是 0。API 開機的 `AGENT_SCOPE_MISSING`（同一個非 A／B 的 agent）11-12 起就有，不是這版新出現。沒測到：#1273（dev Team 規則 20/20 已滿，開網頁也被自動審查直接放行）、舊對話唯讀、API 退役路由。
+  - **費用**：dev 部署前整個訂用帳戶本月 USD 829.51；Neal 11-18 下午把停損從 880 調到 950（仍看整個訂用帳戶）。
+  - **沒有驗證**：stage 上還沒有人送回合測第 49 版（等 Neal），#1273 也待 stage 上實際遇到開網頁批准卡時確認；雲端 Table 裡未完成或 UNKNOWN 的舊 job 數量仍未核。
+
 <a id="stage-v48-1118"></a>
 ## 2026-11-18：stage 第 48 版（舊 Hosted job lane 退役）
 

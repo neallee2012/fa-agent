@@ -193,8 +193,8 @@ class FoundryResponsesClient:
 
     def start(self, original: NativeResponseHeaders, input_text: str, *, previous_response_id=None, before_send=None,
               stream=False):
-        """``stream`` (owner sends only) makes the response replayable for the preview relay. A same-CID lock is
-        then raised inside the 200 stream and reads as unconfirmed, so callers that rely on 409 keep ``False``."""
+        """``stream`` (sends after a reply only) makes the response replayable for the preview relay. A same-CID lock
+        is then raised inside the 200 stream and reads as unconfirmed, so callers that rely on 409 keep ``False``."""
         from .behavior_native_turn_wire import NATIVE_EXPECTED_VERSION_HEADER
         original = NativeResponseHeaders.model_validate_json(original.model_dump_json())
         if not isinstance(input_text, str) or type(stream) is not bool:

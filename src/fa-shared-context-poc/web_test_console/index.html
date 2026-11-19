@@ -7612,25 +7612,32 @@ function runningOwnTurn(){
 // a second response.in_progress resets it (official recovery rule), and the final_answer item or a terminal event
 // ends it and reads /status at once, whose saved reply replaces it. Any failure just leaves the usual reads.
 const liveTexts=new Map(),liveBubbles=new Map();
-const LIVE_RETRY_MS=[500,1000,2000],LIVE_NOT_STARTED_MS=400,LIVE_NOT_STARTED_TRIES=25;
+// A peer return is asked only briefly: one resent by A's follow or queued behind another turn is not a stream, so
+// further asks only read Hosted; it gets the one fresh try once its receipt shows it started.
+const LIVE_RETRY_MS=[500,1000,2000],LIVE_NOT_STARTED_MS=400,LIVE_NOT_STARTED_TRIES=25,LIVE_PEER_NOT_STARTED_TRIES=5;
 function liveTextFor(task){return liveTexts.get(scopeKey(task.task_id))?.text||""}
 function fillLiveText(node,text){
   fillMarkdown(node,text);
   const note=document.createElement("p");note.className="reason";note.textContent="回覆中，尚未確認保存。";
   node.append(note);
 }
+// The turn a peer's result started in this conversation (Neal 2026-11-19): live text only, never the read pace.
+function runningPeerReturn(){
+  const latest=(state?.tasks||[]).filter(task=>task.thread_id===selectedThread&&task.source?.kind==="agent_result").at(-1);
+  return latest&&["accepted","started"].includes(latest.native_receipt?.status)?latest:null;
+}
 function syncLiveText(open=true){
-  const turn=runningOwnTurn();
+  const own=runningOwnTurn(),turn=own||runningPeerReturn();
   const key=turn&&turn.state_profile==="foundry-responses-v1"&&state.authentication==="AVAILABLE"?scopeKey(turn.task_id):null;
   for(const [k,live] of liveTexts){
     // A turn queued past the wait gets one fresh try once its receipt shows it started.
     if(k===key&&!(live.untilStarted&&turn.native_receipt?.status==="started"))continue;
     live.done=true;live.controller?.abort();liveTexts.delete(k);liveBubbles.delete(k);
   }
-  if(open&&key&&!liveTexts.has(key))openLiveText(turn.task_id,key);
+  if(open&&key&&!liveTexts.has(key))openLiveText(turn.task_id,key,own?LIVE_NOT_STARTED_TRIES:LIVE_PEER_NOT_STARTED_TRIES);
 }
 function liveWait(ms){return new Promise(resolve=>setTimeout(resolve,ms))}
-async function openLiveText(taskId,key){
+async function openLiveText(taskId,key,tries){
   const live={text:"",seq:null,items:new Map(),progressSeen:false,done:false,controller:null,agent:selectedAgent};
   liveTexts.set(key,live);
   let notStarted=0,drops=0;
@@ -7651,7 +7658,7 @@ async function openLiveText(taskId,key){
       try{error=(await response.json()).error}catch{}
       // The bridge marks only a turn the API has not started yet (NATIVE_RID_MISSING, NATIVE_STREAM_NOT_STARTED) to ask again.
       if(error?.automatic_retry===true){
-        if(++notStarted<=LIVE_NOT_STARTED_TRIES){await liveWait(LIVE_NOT_STARTED_MS);continue}
+        if(++notStarted<=tries){await liveWait(LIVE_NOT_STARTED_MS);continue}
         // Still queued behind another turn: wait for its receipt to show it started (only once, not while started).
         live.untilStarted=(state.tasks||[]).find(task=>task.task_id===taskId)?.native_receipt?.status!=="started";
       }

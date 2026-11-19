@@ -1,5 +1,6 @@
 """T5 producer uses the shared N6-2 admission/dispatch helper, not a second Responses client."""
 
+from contextlib import contextmanager
 from dataclasses import replace
 import asyncio
 import hashlib
@@ -12,15 +13,16 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from shared_context.behavior_agent_template import AgentTemplate
-from shared_context.behavior_native_agent_wire import NativeRelayResult
+from shared_context.behavior_native_agent_wire import NATIVE_AGENT_PREFIX, NativeRelayResult
 from shared_context.behavior_native_turn_wire import (
-    NATIVE_REQUEST, NativeAgentReceive, NativeConversation, NativeConversationRead, NativeRead,
-    NativeReceipt, NativeResult, NativeResultPage, NativeResultReference, NativeSubmit, NativeTurnCapture,
+    NATIVE_REQUEST, NativeAgentCommand, NativeAgentOrigin, NativeAgentReceive, NativeConversation,
+    NativeConversationRead, NativeRead, NativeReceipt, NativeResult, NativeResultPage, NativeResultReference,
+    NativeSubmit, NativeTurnAddress, NativeTurnCapture,
 )
 from shared_context.behavior_profile_selection import SelectConversationProfile, current_selection, select_profile
 from shared_context.errors import Problem
 from shared_context.native_agent_api import NativeAgentRelayGateway
-from shared_context.native_agent_relay import NativePeerRequest, prepare_request
+from shared_context.native_agent_relay import NativePeerRequest, _address, prepare_request
 from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NATIVE_STATE_PROFILE, NativeResponseDispatch
 from test_native_agent_api import (
     instruction_models, jwk_client, peer_runtime, relay_case, send_command, signing_key, synthetic_standing_v1,
@@ -35,7 +37,9 @@ class ResponsesPeerTransport:
     def __init__(self, native):
         self.native, self.calls, self.queued = native, [], set()
         self.conversations = []
-        self.failure = None
+        self.failure = self.holder = None
+        # holder: another RID holding the Responses slot; busy: a new admission behind it is refused, not queued.
+        self.busy = False
 
     def reply(self, value, *, status=200):
         return httpx.Response(status, content=value.model_dump_json().encode(), headers={
@@ -44,9 +48,10 @@ class ResponsesPeerTransport:
 
     def projected(self, value):
         if value.state_profile == NATIVE_RESPONSES_PROFILE and value.status == "accepted":
+            waits = self.holder not in {None, value.request_id}
             return value.model_copy(update={"dispatch": NativeResponseDispatch(
-                state="already_queued" if value.request_id in self.queued else "needs_response",
-                inflight_request_id=value.request_id)})
+                state="already_queued" if value.request_id in self.queued else "not_taken" if waits else "needs_response",
+                inflight_request_id=self.holder if waits else value.request_id)})
         return value
 
     def __call__(self, request):
@@ -78,7 +83,8 @@ class ResponsesPeerTransport:
                 state_profile=original.state_profile, agent_id=original.agent_id,
                 hosted_session_id=original.hosted_session_id, execution_hosted_session_id=original.hosted_session_id,
                 conversation_id=original.conversation_id, capture=original.capture, capture_digest=original.capture_digest,
-                last_turn=original.turn_number or 0, last_request_id=original.request_id if original.turn_number else None))
+                last_turn=original.turn_number or 0, last_request_id=original.request_id if original.turn_number else None,
+                inflight_request_id=self.holder))
         if isinstance(command, NativeResult):
             original = self.native.records[command.request_id]
             total = original.result.text_parts
@@ -99,6 +105,8 @@ class ResponsesPeerTransport:
                 conversation_id=command.command.conversation_id or command.new_conversation_id,
                 command=command.command, capture=command.capture, source=getattr(command, "source", None),
                 submit_digest=command.sha256, capture_digest=command.capture.sha256, status="accepted")
+            if original is None and self.busy:
+                value = value.model_copy(update={"status": "busy_refused", "failure_code": "NATIVE_TURN_BUSY"})
             self.native.records[value.request_id] = value
             if self.native.lose_submit:
                 raise httpx.ReadTimeout("OFFLINE accepted control response lost", request=request)
@@ -188,10 +196,11 @@ def test_signed_t5_http_preserves_temporary_unconfirmed_code_and_original_accept
         command = send_command(env.case).model_dump(mode="json")
         headers = agent_headers(env.case.base.c, signing_key, 0)
         with TestClient(app, backend_options={"loop_factory": lambda: loop}) as client:
+            # Set before the first send too: a platform failure there never refuses or changes the acceptance.
+            env.remotes[1].failure = 502
             accepted = client.post(NATIVE_AGENT_PREFIX + "/send", headers=headers, json=command)
             assert accepted.status_code == 202
             original = env.case.remotes[1].records[accepted.json()["message_id"]]
-            env.remotes[1].failure = 502
             uncertain = client.post(NATIVE_AGENT_PREFIX + "/send", headers=headers, json=command)
             assert uncertain.status_code == 503
             assert uncertain.json()["error"]["code"] == "NATIVE_RESPONSE_UNCONFIRMED"
@@ -200,6 +209,201 @@ def test_signed_t5_http_preserves_temporary_unconfirmed_code_and_original_accept
     finally:
         if not loop.is_closed():
             loop.close()
+
+
+@contextmanager
+def _relay_routes(request):
+    """(env, client) over the signed relay routes; the loop exists before the fixture forbids new sockets."""
+    from shared_context.behavior_api import _install_error_handlers
+    from shared_context.native_agent_api import install_native_agent_routes
+
+    loop = asyncio.new_event_loop()
+    try:
+        env = request.getfixturevalue("responses_relay")
+        app = FastAPI()
+        _install_error_handlers(app)
+        install_native_agent_routes(app, env.case.base.a, enabled=True, repository=env.case.repository)
+        with TestClient(app, backend_options={"loop_factory": lambda: loop}) as client:
+            yield env, client
+    finally:
+        if not loop.is_closed():
+            loop.close()
+
+
+def _after_reply_marks(monkeypatch, calls):
+    """How many calls a remote had seen each time Starlette ran a reply's after-reply tasks."""
+    from starlette.background import BackgroundTasks
+
+    marks, run = [], BackgroundTasks.__call__
+
+    async def after_reply(self):
+        marks.append(len(calls))
+        await run(self)
+
+    monkeypatch.setattr(BackgroundTasks, "__call__", after_reply)
+    return marks
+
+
+def _posts(remote):
+    return [call for call in remote.calls if call.url.path.endswith("/responses")]
+
+
+def test_t5_send_route_starts_the_recipient_right_after_its_acceptance_reply(request, signing_key, monkeypatch):
+    with _relay_routes(request) as (env, client):
+        peer = env.remotes[1]
+        marks = _after_reply_marks(monkeypatch, peer.calls)
+        command = send_command(env.case).model_dump(mode="json")
+        headers = agent_headers(env.case.base.c, signing_key, 0)
+        accepted = client.post(NATIVE_AGENT_PREFIX + "/send", headers=headers, json=command)
+        assert accepted.status_code == 202 and accepted.json()["dispatch"]["state"] == "needs_response"
+        # The acceptance is the reply; B's one Responses POST follows it, without stream (a lock stays a 409).
+        assert marks and peer.calls[marks[0]:] == _posts(peer)
+        (post,) = _posts(peer)
+        assert post.headers["x-client-fa-rid"] == accepted.json()["message_id"]
+        assert json.loads(post.content)["stream"] is False
+        # A's durable follow stays the fallback: its resend finds the message queued and sends nothing more.
+        again = client.post(NATIVE_AGENT_PREFIX + "/send", headers=headers, json=command)
+        assert again.status_code == 202 and again.json()["dispatch"]["state"] == "already_queued"
+        assert len(_posts(peer)) == 1
+
+
+@pytest.mark.parametrize("outcome", [False, True], ids=["result", "unknown-notice"])
+def test_peer_return_route_starts_the_woken_sender_right_after_its_acceptance_reply(
+    request, signing_key, monkeypatch, outcome,
+):
+    with _relay_routes(request) as (env, client):
+        handoff = _finished_handoff(env, NATIVE_RESPONSES_PROFILE, outcome)
+        origin = env.remotes[0]
+        marks = _after_reply_marks(monkeypatch, origin.calls)
+        route = NATIVE_AGENT_PREFIX + ("/outcome" if outcome else "/result")
+        body = handoff.command.model_dump(mode="json")
+        headers = agent_headers(env.case.base.c, signing_key, 1)
+        woke = client.post(route, headers=headers, json=body)
+        assert woke.status_code == 202 and woke.json()["dispatch"]["state"] == "needs_response"
+        assert marks and origin.calls[marks[0]:] == _posts(origin)
+        (post,) = _posts(origin)
+        assert post.headers["x-client-fa-rid"] == woke.json()["message_id"]
+        # Neal 2026-11-19: A's turn relaying B's result is replayable (RTT B live text); a notice stays plain.
+        assert json.loads(post.content)["stream"] is (not outcome)
+        again = client.post(route, headers=headers, json=body)
+        assert again.status_code == 202 and again.json()["dispatch"]["state"] == "already_queued"
+        assert len(_posts(origin)) == 1
+
+
+def _returning(env, signing_key):
+    """(remote, route, headers, body) for B returning its finished turn into A's original Responses CID."""
+    handoff = _finished_handoff(env, NATIVE_RESPONSES_PROFILE, False)
+    return (env.remotes[0], NATIVE_AGENT_PREFIX + "/result", agent_headers(env.case.base.c, signing_key, 1),
+            handoff.command.model_dump(mode="json"))
+
+
+def _a_slot_holder(remote, sender, *, returned=False):
+    """Another accepted message of A that holds A's original CID and still needs its own Responses POST.
+
+    ``returned``: the holder is a peer's result returned to A (an ``agent_result`` turn), not an owner message."""
+    rid = "rid-a-slot-holder"
+    command = sender.command.model_copy(update={"request_id": rid, "conversation_id": sender.conversation_id})
+    submitted = NativeSubmit(command=command, capture=sender.capture, state_profile=NATIVE_RESPONSES_PROFILE)
+    source = None
+    if returned:
+        peer = NativeTurnAddress(agent_id="agent-b", conversation_id="conv-b", request_id="rid-b")
+        source = NativeAgentOrigin(
+            kind="agent_result", message_kind="result", message_id=rid, sender=peer,
+            recipient_agent_id=remote.native.target.agent_id, root_id=rid, root=_address(sender), hop=0,
+            in_reply_to=rid, result=NativeResultReference(
+                turn_number=1, turn_key="turn:1", result_digest="a" * 64, text_sha256="c" * 64, text_bytes=1,
+                text_parts=1, checkpoint_sha256="b" * 64))
+        command = NativeAgentCommand(request_id=rid, conversation_id=sender.conversation_id, content="B returned.",
+                                     model=sender.capture.model.id)
+        submitted = NativeAgentReceive(command=command, capture=sender.capture, source=source,
+                                       state_profile=NATIVE_RESPONSES_PROFILE)
+    remote.native.records[rid] = NativeReceipt.model_validate_json(NativeReceipt(
+        state_profile=NATIVE_RESPONSES_PROFILE, agent_id=remote.native.target.agent_id,
+        hosted_session_id=remote.native.target.session_id, request_id=rid, conversation_id=sender.conversation_id,
+        command=command, capture=sender.capture, submit_digest=submitted.sha256, source=source,
+        capture_digest=sender.capture_digest, status="accepted").model_dump_json())
+    remote.holder = rid
+    return rid
+
+
+@pytest.mark.parametrize("route", ["/send", "/result"])
+def test_a_resend_of_the_same_rid_sends_before_its_reply_and_nothing_after_it(request, signing_key, monkeypatch, route):
+    with _relay_routes(request) as (env, client):
+        if route == "/send":
+            remote, path, headers, body = (env.remotes[1], NATIVE_AGENT_PREFIX + route,
+                                           agent_headers(env.case.base.c, signing_key, 0),
+                                           send_command(env.case).model_dump(mode="json"))
+        else:
+            remote, path, headers, body = _returning(env, signing_key)
+        marks = _after_reply_marks(monkeypatch, remote.calls)
+        remote.failure = 409  # the after-reply POST meets conversation_locked: the RID still needs its POST
+        first = client.post(path, headers=headers, json=body)
+        assert first.status_code == 202 and len(marks) == 1 and len(_posts(remote)) == 1
+        remote.failure = None
+        again = client.post(path, headers=headers, json=body)
+        # The follow's resend still sends and reads back before its reply, as before; nothing runs after that reply.
+        assert again.status_code == 202 and again.json()["dispatch"]["state"] == "already_queued"
+        assert len(marks) == 1
+        resent = _posts(remote)[1]
+        assert resent.headers["x-client-fa-rid"] == first.json()["message_id"]
+        assert json.loads(resent.content)["stream"] is False
+
+
+def test_a_refused_first_admission_starts_nothing_after_its_reply(request, signing_key, monkeypatch):
+    with _relay_routes(request) as (env, client):
+        remote, path, headers, body = _returning(env, signing_key)
+        _a_slot_holder(remote, env.case.sender)
+        remote.busy = True
+        marks = _after_reply_marks(monkeypatch, remote.calls)
+        refused = client.post(path, headers=headers, json=body)
+        assert refused.status_code == 202 and refused.json()["status"] == "busy_refused"
+        # Only an accepted first admission is sent after its reply; a refusal never advances the slot holder.
+        assert _posts(remote) == [] and marks == []
+
+
+def test_a_wake_waiting_for_its_slot_advances_the_slot_holder_right_after_its_reply(
+    request, signing_key, monkeypatch,
+):
+    with _relay_routes(request) as (env, client):
+        remote, path, headers, body = _returning(env, signing_key)
+        holder = _a_slot_holder(remote, env.case.sender)
+        marks = _after_reply_marks(monkeypatch, remote.calls)
+        woke = client.post(path, headers=headers, json=body)
+        assert woke.status_code == 202 and woke.json()["status"] == "accepted"
+        assert woke.json()["dispatch"]["state"] == "not_taken"
+        assert woke.json()["dispatch"]["inflight_request_id"] == holder
+        # As the follow's resend would: the holder gets its one POST after the reply; the wake waits behind it.
+        (post,) = _posts(remote)
+        assert len(marks) == 1 and remote.calls.index(post) >= marks[0]
+        assert post.headers["x-client-fa-rid"] == holder and json.loads(post.content)["stream"] is False
+
+
+def test_a_returned_result_holding_the_slot_is_advanced_as_a_replayable_stream(request, signing_key, monkeypatch):
+    with _relay_routes(request) as (env, client):
+        remote, path, headers, body = _returning(env, signing_key)
+        holder = _a_slot_holder(remote, env.case.sender, returned=True)
+        marks = _after_reply_marks(monkeypatch, remote.calls)
+        woke = client.post(path, headers=headers, json=body)
+        assert woke.status_code == 202 and woke.json()["dispatch"]["inflight_request_id"] == holder
+        # Only after the reply (a lock there is only logged): the holder relaying B's result shows live text too.
+        (post,) = _posts(remote)
+        assert len(marks) == 1 and remote.calls.index(post) >= marks[0]
+        assert post.headers["x-client-fa-rid"] == holder and json.loads(post.content)["stream"] is True
+
+
+def test_a_resend_advances_a_returned_result_holder_without_stream(request, signing_key, monkeypatch):
+    with _relay_routes(request) as (env, client):
+        remote, path, headers, body = _returning(env, signing_key)
+        holder = _a_slot_holder(remote, env.case.sender, returned=True)
+        remote.failure = 409  # the after-reply advance meets conversation_locked: the holder still needs its POST
+        first = client.post(path, headers=headers, json=body)
+        assert first.status_code == 202 and len(_posts(remote)) == 1
+        remote.failure = None
+        again = client.post(path, headers=headers, json=body)
+        # The follow's resend advances the holder synchronously and reads back: a lock must stay a 409, not a stream.
+        assert again.status_code == 202
+        resent = _posts(remote)[1]
+        assert resent.headers["x-client-fa-rid"] == holder and json.loads(resent.content)["stream"] is False
 
 
 def test_lost_first_peer_ack_reads_the_original_response_lane_without_allocating_a_second_cid(responses_relay):
@@ -338,12 +542,9 @@ def test_conflict_readback_uses_the_original_terminal_or_refuses_different_mater
     assert not any(call.url.path.endswith("/responses") for call in peer.calls)
 
 
-@pytest.mark.parametrize("origin_profile", [NATIVE_STATE_PROFILE, NATIVE_RESPONSES_PROFILE])
-@pytest.mark.parametrize("outcome", [False, True], ids=["result", "unknown-notice"])
-def test_peer_result_wake_retains_the_original_a_cid_lane_and_uses_the_same_helper(
-    responses_relay, origin_profile, outcome,
-):
-    env, case = responses_relay, responses_relay.case
+def _finished_handoff(env, origin_profile, outcome):
+    """A's handoff admitted by B, B's turn finished, and B's command that returns it to A's original CID."""
+    case = env.case
     if origin_profile == NATIVE_RESPONSES_PROFILE:
         values = case.sender.capture.model_dump(mode="json")
         values["template"]["settings"]["state_profile"] = origin_profile
@@ -373,6 +574,18 @@ def test_peer_result_wake_retains_the_original_a_cid_lane_and_uses_the_same_help
     scope = case.base.a.config.agent_scope(case.base.b.agent_id)
     peer = replace(case.principal, oid=str(scope.identity.oid), actor_id=scope.identity.actor)
     command = NativeRelayResult(conversation_id=finished.conversation_id, request_id=finished.request_id)
+    return SimpleNamespace(handed=handed, text=text, reference=reference, peer=peer, command=command)
+
+
+@pytest.mark.parametrize("origin_profile", [NATIVE_STATE_PROFILE, NATIVE_RESPONSES_PROFILE])
+@pytest.mark.parametrize("outcome", [False, True], ids=["result", "unknown-notice"])
+def test_peer_result_wake_retains_the_original_a_cid_lane_and_uses_the_same_helper(
+    responses_relay, origin_profile, outcome,
+):
+    env, case = responses_relay, responses_relay.case
+    handoff = _finished_handoff(env, origin_profile, outcome)
+    handed, text, reference, peer, command = (
+        handoff.handed, handoff.text, handoff.reference, handoff.peer, handoff.command)
     deliver = env.gateway.outcome if outcome else env.gateway.result
     first = deliver(peer, command)
     assert first.message_id == handed.message_id and first.conversation_id == case.sender.conversation_id

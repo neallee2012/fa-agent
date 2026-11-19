@@ -317,6 +317,13 @@ saying why the rule does or does not apply. The reasons are only an explanation.
 Default to ask when the intended scope or consequence cannot be determined. Do not invent a fixed blanket
 send/spend/delete policy: decide this action under the actual rules and blockers."""
 
+# Neal 2026-11-19: a same-Team Agent's handoff turn has no human words to quote (ADR-0006 mutual trust), so only rules decide.
+_REVIEW_TEAM_AGENT = """
+This turn was handed over by another Agent of the same Team, so verified_human_request is null and
+request_origin is team_agent. Decide from the rules alone: allow only when an automatic-allow rule covers this exact
+action and no Ask-first rule or other blocker matches. Do not allow because the action looks read-only or because
+it was requested; otherwise return ask. Takeover steps still require takeover_required=true and deny."""
+
 # The cap counts reasoning tokens too, and a review cut off by it returns no verdict (so it asks). The verdict is a few
 # dozen tokens; Microsoft's reasoning guide suggests reserving 25,000 for an unmeasured workload, and this smaller
 # bound still leaves reasoning models room while keeping one runaway review's cost bounded.
@@ -338,23 +345,25 @@ class NativeAutoReview:
     def __init__(self, sender):
         self.sender = sender
 
-    async def __call__(self, action, rules, human_request):
-        if human_request is None:
+    async def __call__(self, action, rules, human_request, origin=None):
+        if human_request is None and origin != "team_agent":
             return NativeHitlReview(rules_revision=rules.revision, source="unavailable", outcome="ask",
                                    reason="human_request_unavailable")
+        system = _REVIEW_SYSTEM + (_REVIEW_TEAM_AGENT if origin == "team_agent" else "")
         payload = json.dumps({"action": action.model_dump(mode="json"), "rules_revision": rules.revision,
                               "rules": [rule.model_dump(mode="json") for rule in rules.rules],
-                              "verified_human_request": human_request}, ensure_ascii=False, allow_nan=False)
+                              "verified_human_request": human_request,
+                              **({"request_origin": origin} if origin else {})}, ensure_ascii=False, allow_nan=False)
         schema = _review_schema(rules)
         output_tokens = _REVIEW_OUTPUT_TOKENS + _REASON_TOKENS * len(rules.rules)
         body = {"model": self.sender.model, "stream": True}
         if self.sender.wire_api == "responses":
             body.update(
-                instructions=_REVIEW_SYSTEM, input=[{"role": "user", "content": payload}],
+                instructions=system, input=[{"role": "user", "content": payload}],
                 text={"format": {"type": "json_schema", "name": "fa_auto_review", "strict": True, "schema": schema}},
                 max_output_tokens=output_tokens)
         else:
-            body.update(messages=[{"role": "system", "content": _REVIEW_SYSTEM}, {"role": "user", "content": payload}],
+            body.update(messages=[{"role": "system", "content": system}, {"role": "user", "content": payload}],
                         response_format={"type": "json_schema", "json_schema": {
                             "name": "fa_auto_review", "strict": True, "schema": schema}},
                         max_completion_tokens=output_tokens)
@@ -585,6 +594,7 @@ class NativeHitlRuntime:
         if prior.reviews and prior.reviews[-1].rules_revision == rules.revision:
             return rules, prior.reviews[-1]
         setting = self.toolbox_approvals.get(call.action.tool) if call.action.category == "mcp" else None
+        team_agent = False
         if call.action.category == "routine":
             # A schedule is always the owner's own click on its card; no Auto Review or Team rule can allow it.
             reviewed = NativeHitlReview(rules_revision=rules.revision, source="default", outcome="ask")
@@ -592,12 +602,18 @@ class NativeHitlRuntime:
             reviewed = NativeHitlReview(rules_revision=rules.revision, source="toolbox",
                                         outcome="ask" if setting == "always" else "allow", reason="toolbox_" + setting)
         else:
-            reviewed = await self.reviewer(call.action, rules, call.human_request)
+            team_agent = self.context.receipt.source is not None
+            reviewed = await (self.reviewer(call.action, rules, call.human_request, origin="team_agent")
+                              if team_agent else self.reviewer(call.action, rules, call.human_request))
         if not isinstance(reviewed, NativeHitlReview) or reviewed.rules_revision != rules.revision:
             raise Problem(503, "NATIVE_HITL_REVIEW_DENIED", "the review did not identify its original rule revision")
         known = {rule.rule_id: rule for rule in rules.rules}
         if not set(reviewed.matched_rule_ids) <= set(known):
             raise Problem(409, "NATIVE_HITL_RULES_CHANGED", "the reviewed rules are not current")
+        if team_agent and reviewed.outcome == "allow" and not any(
+                known[key].behavior == "allow_automatically" for key in reviewed.matched_rule_ids):
+            # No human words on this turn: an allow must rest on an automatic-allow rule, not the model's say-so.
+            reviewed = reviewed.model_copy(update={"outcome": "ask", "reason": "reviewed"})
         if (reviewed.outcome in {"allow", "deny"} and not reviewed.takeover_required
                 and any(known[key].behavior == "ask_first" for key in reviewed.matched_rule_ids)):
             reviewed = reviewed.model_copy(update={"outcome": "ask", "reason": "ask_rule"})

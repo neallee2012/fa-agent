@@ -11,8 +11,8 @@ from shared_context import native_relay_delivery
 from shared_context.behavior_native_agent_wire import NativePeerRequest, NativeRelayAcceptance, NativeRelaySend
 from shared_context.errors import Problem
 from shared_context.native_agent_tools import (
-    NativeAgentRelayClient, NativeRecipientFollowing, NativeRecipientNotReady, NativeResponseFollowFailure,
-    _AcceptedFollow, _WaitingEnvironment,
+    NativeAgentRelayClient, NativeFollowStartUnknown, NativeRecipientFollowing, NativeRecipientNotReady,
+    NativeResponseFollowFailure, _AcceptedFollow, _WaitingEnvironment,
 )
 from shared_context.native_responses_wire import NATIVE_RESPONSES_PROFILE, NativeResponseDispatch
 
@@ -225,6 +225,28 @@ def test_a_busy_refusal_is_never_retained_on_the_sender(monkeypatch):
     scene = Scene(monkeypatch, saved=False, sends=[busy])
     assert scene.run() == busy
     assert [entry[0] for entry in scene.effects()] == ["before_send", "request", "rid", "save", "start_follow"]
+
+
+@pytest.mark.parametrize("step", ["save", "start_follow"])
+def test_a_failure_after_the_acceptance_never_reads_as_undelivered(monkeypatch, step):
+    """The API may already have started the recipient when /send returned: a failed save stops the message as
+    unknown (not expired, so never not_delivered), and a failed follow start is retried with the same command."""
+    scene = Scene(monkeypatch)
+    failure = problem(503, "NATIVE_RELAY_OUTCOME_UNKNOWN") if step == "save" else NativeFollowStartUnknown(ACCEPTED)
+
+    async def fail(*_args):
+        scene.log.append(("failed", step))
+        raise failure
+
+    if step == "save":
+        monkeypatch.setattr(native_relay_delivery, "accepted", fail)
+    else:
+        scene.client._start_response_follow = fail
+    with pytest.raises(type(failure)):
+        scene.run()
+    stops = [entry for entry in scene.effects() if entry[0] == "stopped"]
+    assert stops == ([stopped_entry("NATIVE_RELAY_OUTCOME_UNKNOWN")] if step == "save" else [])
+    assert ("failed", step) in scene.effects() and [entry[0] for entry in scene.effects()].count("request") == 1
 
 
 def test_a_saved_busy_refusal_still_starts_only_its_own_follow(monkeypatch):

@@ -295,7 +295,7 @@ class Outcome:
         self.step("prepare_outcome", capture)
         return SimpleNamespace(command="outcome-command", capture=capture, source="outcome-source")
 
-    def submit(self, target, client, command, capture, *, source, original, conversation, before_send):
+    def submit(self, target, client, command, capture, *, source, original, conversation, before_send, defer=None):
         self.step("submit", client, command, capture, source, original, type(conversation).__name__)
         self.before_send = before_send
         if self.submit_error is not None:
@@ -564,7 +564,7 @@ class Send:
         self.step("prepare", scope, capture, tool_call_id, original)
         return self.message
 
-    def submit(self, peer, client, command, capture, *, source, original, before_send):
+    def submit(self, peer, client, command, capture, *, source, original, before_send, defer=None):
         self.step("submit", client, command, capture, original)
         self.before_send = before_send
         if self.conflict is not None:

@@ -1,5 +1,11 @@
 # FA 雲端授權與 USD150 成本 preflight
 
+<a id="dev-stop-loss-950-1118"></a>
+## 2026-11-18 dev 停損 USD880 → USD950（Neal 決定）
+
+- **結論**：Neal 11-18 下午說「停損先調高到 950，部署 dev 測試」。停損改為 **USD950**；量法不變，仍看 dev 所在**整個訂用帳戶**的本月累計（含其他專案的資源群組，Neal 11-18 上午選擇維持）。這次沒有重述 USD900 上限；付費 dev 工作以 950 為停止線。其他規則不變（`budget_enforced=false`、不清帳、stage 另列每月 USD200）。
+- **起因**：訂用帳戶到 11-17 為止累計 USD814.56，大部分是同一訂用帳戶裡其他專案的資源；依每日約 USD39 推算 11-19 會超過 880。11-18 dev 部署（run 4902）前量到 USD829.51。細節見 [progress](progress.md#stage-v49-1118)。
+
 <a id="dev-api-scale-zero-1025"></a>
 ## 2026-10-25 dev 上限 USD800 → USD900（Neal 決定；先試過 API 縮到 0，不可行）
 

@@ -1,5 +1,40 @@
 # FA Agent 行為控制規格 v1.2
 
+## 2026-11-19 轉述回合也即時顯示文字（Neal 決定；CODE/offline，未部署）
+
+A 收到 B 的結果後跑的轉述回合（`agent_result`），stage 實測要 10–21 秒才一次出現。
+
+- 取代下方「交辦與回報」的 `stream=false` 與 RTT B「T5…維持 `stream=false`」在這一種回合上的說法：`/result` 第一次接單、
+  回覆後送出的那一次 Responses POST 改用 `stream=true`；回覆後推進的 holder 若是 `agent_result` 也一樣。
+  這兩條路都不讀回條，串流裡的上鎖只寫 log、回條照舊停在 `needs_response` 由 follow 補送，所以語意不變。
+- 不變：`/send`（`agent_request`）、`/outcome`（`agent_notice`）、同 RID 重送、同步推進 holder、`/waiting-dispatch`
+  都維持 `stream=false`，保住 409 `conversation_locked` → `NATIVE_TURN_BUSY`。重送或排隊後才送出的轉述回合因此不能重播。
+- 工作台替這種回合開同一條即時文字串流；回條還沒開始時只再問 5 次（每 0.4 秒），之後等回條顯示開始再試一次，
+  回 `NATIVE_STREAM_UNAVAILABLE` 就停。
+
+細節見 [README RTT B](../src/fa-shared-context-poc/README.md#rtt-b-reply-preview)。
+
+## 2026-11-19 交辦與回報：接單回覆後就叫對方開跑（CODE/offline，未部署）
+
+stage 實測 A 交給 B、B 回給 A 各空等約 4–5 秒。原因：T5 第一次 `/send`、`/result`、`/outcome` 只接單就回 ACK，
+Responses POST（第二步）要等送方 VM 的 accepted follow（登錄官方 task、`RetryPolicy` 首次退避約 1 秒）再打一次同一路由，
+API 重核雙方並重送同一 admission 後才送出。
+
+- 取代 2026-10-06「Responses 送出改到背景」的「T5…不變」，以及「非同步交辦」的「後續原SDK follow…補第二步」
+  在**第一次接單**上的說法：Hosted 寫好 accepted 回條後照樣先回 ACK（A 不等 B）；同 RID、同 body 的 Responses POST
+  改在回覆送完後，由同一請求的 Starlette `BackgroundTasks` 送一次，`stream=false`（`/result` 自同日起改 `stream=true`，見上段），
+  不讀回條，錯誤只寫 log。
+- 原 accepted follow 不變，仍是保底：下一次同 RID 呼叫讀到 `already_queued`／started 就停；POST 失敗、結果未知或
+  API 程序被回收時回條停在 `needs_response`，由 follow 沿原有限預算補送與核對。背景那次不計入預算，持續失敗時
+  同 RID 最多 1＋10 次 POST；撞在一起的 POST 由官方 `conversation_locked`、Hosted `NATIVE_TURN_QUEUED` 與
+  `rid:<RID>` started CAS 擋下，不會執行兩次。
+- 只限第一次接單（原 RID 尚不存在）且回條為 `accepted`；同 RID 重送、`busy_refused`、continuation、routine 照舊。
+  wire、快照、錯誤碼與穩定 RID 不變。
+- 已知差異：B 可能在 A 的 VM 存好接單觀察（`native_relay_delivery.accepted`）之前就開跑。B 的結果要等它自己跑完
+  模型回合才回來，所以不新增排序控制。
+
+細節見 [README](../src/fa-shared-context-poc/README.md#relay-start-after-reply)。
+
 ## 2026-10-22 WebIQ 只走官方 toolbox（Neal 決定「只留 toolbox」；CODE/offline，未部署）
 
 - 出貨的組織 catalog 拿掉 API broker entry `WebIQ-MCP`；WebIQ 只剩 toolbox entry `WebIQ`（`fa-org-tools`，批准照它的
@@ -82,7 +117,8 @@ stage 第 18 版 Neal 實際使用：模型平行送 4 個 Team MCP `read_item`�
   只限上述預覽。2026-10-05「回覆預覽」（SDK 停止前寫一次）不變。
 - **送出**：只有 owner `/submit` 回覆後送出自己這一則時，以官方 `background+store+stream` 建立（重播必須建立時就開），
   讀到 `response.created` 即關閉連線（背景串流斷線不取消回合）；沒有 created 或中斷照舊 `NATIVE_RESPONSE_UNCONFIRMED`、不重送。
-  推進其他 holder、`/reconcile`、T5、routine、continuation 維持 `stream=false`，保住 409 `conversation_locked`。
+  推進其他 holder、`/reconcile`、T5、routine、continuation 維持 `stream=false`，保住 409 `conversation_locked`
+  （2026-11-19 起回覆後送出的 `agent_result` 例外，見最上段）。
 - **讀取**：新唯讀路由 `GET .../responses-turns/conversations/{cid}/requests/{rid}/stream?starting_after=N`，
   T1 後只重播原回條上的 `response_id`，用 API MI 呼叫官方重播，只轉白名單欄位；斷線以 `starting_after` 接續；
   回條未開始回 409 `NATIVE_STREAM_NOT_STARTED`、不可重播回 `NATIVE_STREAM_UNAVAILABLE`。
@@ -1585,6 +1621,8 @@ SDK child 先通過既有 typed task 驗證，再於原 pre-tool hook await 同�
 每新動作依最新 Team rules 做一筆、無 tools、非原 Agent session 的獨立 Auto Review；
 用原模型 transport／身分／同一回合用量。只信 typed action、owner-approved 規則與可核真人要求，
 不把模型／工具／外部內容當人類決定。schema／matched IDs／revision 不明、審查失敗或無可核真人要求均 ask，
+但同 Team Agent 轉交的回合（`receipt.source`）沒有真人原話時只依規則審查：要有 automatic allow 規則涵蓋才放行，
+否則 ask（Neal 2026-11-19，ADR-0006 互信；排程回合沒有追加輸入時仍 ask）；
 保公開原因；Ask 優先於 automatic allow，reviewer deny／takeover 與既有能力上限不能被 once 蓋過
 （例外：比對到 Ask first 的非 takeover deny 已改為 ask，同內容／同原 call 已有的有效真人 once 可接續）。
 比對到 Ask first 規則時，reviewer 的 allow 或非 takeover 的 deny 都改為 ask，由真人決定（2026-10-03 釐清，比照 grokbot）。

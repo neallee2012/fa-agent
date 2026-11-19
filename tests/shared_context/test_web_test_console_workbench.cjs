@@ -3428,6 +3428,62 @@ test("a second response.in_progress resets live text and other items never show"
   assert.match(shown(),/新的/);
 });
 
+// Neal 2026-11-19: the turn a peer's result starts here (A relays B's answer) shows its live text like an own turn.
+test("live text follows the running turn a peer result started, while the reply is still awaited",async()=>{
+  const data=nativeChat("completed"),first=data.tasks[0];
+  first.state_profile=data.composer.state_profile="foundry-responses-v1";
+  data.composer.awaiting_agent_reply=true;
+  const wake=copy(first);
+  Object.assign(wake,{task_id:"peer-return",submit_request_id:"peer-return",instruction:null,agent_text:"收到",
+    source:{kind:"agent_result",sender:{agent_id:"agent-two"},recipient_agent_id:"agent-one"},reply:null,
+    native_receipt:{...first.native_receipt,status:"started"},status:{data:{state:"started"},observed_at:when}});
+  data.tasks.push(wake);
+  const streams=[];
+  const ui=await open(data,{streamResponse:url=>{const stream=liveStream();streams.push({url,...stream});return stream.response}});
+  await ui.tick();
+  assert.deepEqual(streams.map(stream=>stream.url),["/api/instructions/peer-return/stream"]);
+  streams[0].send({type:"response.output_item.added",sequence_number:2,item_id:"msg_c",phase:"commentary"});
+  streams[0].send({type:"response.output_text.delta",sequence_number:3,item_id:"msg_c",delta:"B 說收到了"});
+  await liveSettle(ui);
+  assert.match(JSON.stringify(ui.nodes.get("conversation-history").children,(key,value)=>key==="events"?undefined:value),
+    /B 說收到了/);
+  // final_answer reads the whole conversation at once (no own turn runs), which brings the saved reply.
+  streams[0].send({type:"response.output_item.added",sequence_number:4,item_id:"msg_f",phase:"final_answer"});
+  await liveSettle(ui);
+  const now=[...ui.timers.entries()].find(([id])=>ui.timerDelays.get(id)===0);
+  assert.ok(now,"the saved reply is read at once");
+  const before=ui.calls.length;
+  ui.timers.delete(now[0]);await now[1]();await liveSettle(ui);
+  assert.ok(ui.calls.slice(before).some(call=>call.url.startsWith("/api/instructions/progress")));
+  assert.equal(ui.calls.some(call=>call.method==="POST"),false);
+});
+
+// A relay turn sent again by A's follow or queued behind another turn is not a stream: ask briefly, not 25 times.
+test("a peer return that has not started is asked a few times, then once when it starts, then left alone",async()=>{
+  const data=nativeChat("completed"),first=data.tasks[0];
+  first.state_profile=data.composer.state_profile="foundry-responses-v1";
+  data.composer.awaiting_agent_reply=true;
+  const wake=copy(first);
+  Object.assign(wake,{task_id:"peer-return",submit_request_id:"peer-return",instruction:null,agent_text:"收到",
+    source:{kind:"agent_result",sender:{agent_id:"agent-two"},recipient_agent_id:"agent-one"},reply:null,
+    native_receipt:{...first.native_receipt,status:"accepted"},status:{data:{state:"accepted"},observed_at:when}});
+  data.tasks.push(wake);
+  let started=false;
+  const ui=await open(data,{streamResponse:()=>new Response(JSON.stringify({error:started?
+    {code:"NATIVE_STREAM_UNAVAILABLE",automatic_retry:false}:{code:"NATIVE_STREAM_NOT_STARTED",automatic_retry:true}}),
+    {status:409})});
+  await liveSettle(ui);
+  const waits=()=>[...ui.timers.entries()].filter(([id])=>ui.timerDelays.get(id)===400);
+  for(let i=0;i<30&&waits().length;i++){const [wait]=waits();ui.timers.delete(wait[0]);wait[1]();await liveSettle(ui)}
+  const asked=()=>ui.calls.filter(call=>call.url.startsWith("/api/instructions/peer-return/stream")).length;
+  assert.equal(asked(),6,"the first ask and five short retries");
+  started=true;wake.native_receipt.status="started";wake.status.data.state="started";
+  ui.render(data);await liveSettle(ui);
+  assert.equal(asked(),7,"one fresh try once it started");
+  ui.render(data);await liveSettle(ui);
+  assert.equal(asked(),7,"not a stream: left alone");
+});
+
 test("final_answer ends live text and reads the saved reply at once, which replaces it",async()=>{
   const {ui,rid,streams,shown}=await liveTurn();
   const live=streams[0];

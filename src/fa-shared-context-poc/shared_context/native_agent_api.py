@@ -8,6 +8,7 @@ from time import monotonic
 
 from fastapi import Depends, Request
 from fastapi.responses import JSONResponse
+from starlette.background import BackgroundTasks
 from starlette.concurrency import run_in_threadpool
 
 from .behavior_api import _body, _log_request_failure, _principal_dependency, _response
@@ -263,8 +264,9 @@ class NativeAgentRelayGateway:
         from .native_binding import session_guard_enforced
         return wait_in_request(call, enforce=session_guard_enforced())
 
-    def send(self, principal: BehaviorPrincipal, command: NativeRelaySend) -> NativeRelayAcceptance:
-        return self._waiting(lambda: self._send(principal, command))
+    def send(self, principal: BehaviorPrincipal, command: NativeRelaySend, *, defer=None) -> NativeRelayAcceptance:
+        """``defer`` takes B's first Responses POST to run after this acceptance reply; A's follow stays the fallback."""
+        return self._waiting(lambda: self._send(principal, command, defer=defer))
 
     def _send_target(self, principal, command, sender, identifier):
         """This message's recipient and saved receipt. Every refusal here means nothing was delivered by this attempt."""
@@ -305,7 +307,7 @@ class NativeAgentRelayGateway:
         groups.relay_request(message)
         return groups
 
-    def _send(self, principal: BehaviorPrincipal, command: NativeRelaySend) -> NativeRelayAcceptance:
+    def _send(self, principal: BehaviorPrincipal, command: NativeRelaySend, *, defer=None) -> NativeRelayAcceptance:
         command = NativeRelaySend.model_validate_json(command.model_dump_json())
         sender_scope, sender_client, sender = self._sender_command(principal, command)
         identifier = message_identifier(principal, sender, command.tool_call_id)
@@ -335,6 +337,7 @@ class NativeAgentRelayGateway:
             try:
                 received, _ = submit_native_turn(
                     peer, client, message.command, message.capture, source=message.source, original=retained,
+                    defer=defer if retained is None else None,
                     before_send=lambda: principal.require(recipient.team_id, "submit"))
             except Problem as error:
                 code = error.body["error"]["code"]
@@ -449,14 +452,14 @@ class NativeAgentRelayGateway:
             raise
         return NativeTurnGateway._accounted(control, submitted, composition)[0]
 
-    def result(self, principal: BehaviorPrincipal, command: NativeRelayResult) -> NativeRelayAcceptance:
-        return self._return_outcome(principal, command, completed=True)
+    def result(self, principal: BehaviorPrincipal, command: NativeRelayResult, *, defer=None) -> NativeRelayAcceptance:
+        return self._return_outcome(principal, command, completed=True, defer=defer)
 
-    def outcome(self, principal: BehaviorPrincipal, command: NativeRelayResult) -> NativeRelayAcceptance:
-        return self._return_outcome(principal, command, completed=False)
+    def outcome(self, principal: BehaviorPrincipal, command: NativeRelayResult, *, defer=None) -> NativeRelayAcceptance:
+        return self._return_outcome(principal, command, completed=False, defer=defer)
 
-    def _return_outcome(self, principal, command, *, completed):
-        return self._waiting(lambda: self._returned(principal, command, completed=completed))
+    def _return_outcome(self, principal, command, *, completed, defer=None):
+        return self._waiting(lambda: self._returned(principal, command, completed=completed, defer=defer))
 
     def _admitted_request(self, principal, sender, sender_client):
         """The upstream request this turn answers, only if the relay really admitted that exact request."""
@@ -493,7 +496,7 @@ class NativeAgentRelayGateway:
             conversation=conversation)
         return client, conversation, capture
 
-    def _returned(self, principal, command, *, completed):
+    def _returned(self, principal, command, *, completed, defer=None):
         command = NativeRelayResult.model_validate_json(command.model_dump_json())
         scope = self._sender_scope(principal)
         sender_composition, sender_client = self._client(scope)
@@ -527,7 +530,7 @@ class NativeAgentRelayGateway:
         try:
             received, _ = submit_native_turn(
                 target, client, message.command, message.capture, source=message.source,
-                original=original, conversation=conversation,
+                original=original, conversation=conversation, defer=defer if original is None else None,
                 before_send=lambda: principal.require(recipient.team_id, "submit"))
         except Problem as error:
             follow_older_image(target, target.runtime.work_policy, client, error)
@@ -618,7 +621,7 @@ def install_native_agent_routes(app, composition, *, enabled, repository=None):
                 publisher.notify(principal.team, event_type, **ids, source_request_id=accepted.source_request_id)
         return after
 
-    async def reply(call, *, accepted=False, after=None):
+    async def reply(call, *, accepted=False, after=None, background=None):
         try:
             result = await run_in_threadpool(call)
         except Problem as error:
@@ -642,6 +645,9 @@ def install_native_agent_routes(app, composition, *, enabled, repository=None):
         response.status_code = 202 if accepted else 200
         if after is not None:
             after(result)
+        if background is not None and background.tasks:
+            # Starlette runs these only after the whole acceptance body was sent.
+            response.background = background
         return response
 
     @app.get(PREFIX + "/recipients")
@@ -651,9 +657,10 @@ def install_native_agent_routes(app, composition, *, enabled, repository=None):
     @app.post(PREFIX + "/send")
     async def send(request: Request, principal=Depends(identity)):
         command = await _body(request, NativeRelaySend, max_body_bytes=16 * 1024)
+        after_reply = BackgroundTasks()
         try:
-            return await reply(lambda: gateway.send(principal, command), accepted=True,
-                               after=relayed(principal, "agent.received"))
+            return await reply(lambda: gateway.send(principal, command, defer=after_reply.add_task), accepted=True,
+                               after=relayed(principal, "agent.received"), background=after_reply)
         except Problem as error:
             code = error.body["error"]["code"]
             if error.status == 409 and code == "NATIVE_GROUP_REPLY_REQUIRED":
@@ -701,14 +708,16 @@ def install_native_agent_routes(app, composition, *, enabled, repository=None):
     @app.post(PREFIX + "/result")
     async def result(request: Request, principal=Depends(identity)):
         command = await _body(request, NativeRelayResult)
-        return await reply(lambda: gateway.result(principal, command), accepted=True,
-                           after=relayed(principal, "agent.replied"))
+        after_reply = BackgroundTasks()
+        return await reply(lambda: gateway.result(principal, command, defer=after_reply.add_task), accepted=True,
+                           after=relayed(principal, "agent.replied"), background=after_reply)
 
     @app.post(PREFIX + "/outcome")
     async def outcome(request: Request, principal=Depends(identity)):
         command = await _body(request, NativeRelayResult)
-        return await reply(lambda: gateway.outcome(principal, command), accepted=True,
-                           after=relayed(principal, "agent.replied"))
+        after_reply = BackgroundTasks()
+        return await reply(lambda: gateway.outcome(principal, command, defer=after_reply.add_task), accepted=True,
+                           after=relayed(principal, "agent.replied"), background=after_reply)
 
     @app.post(PREFIX + "/read-result")
     async def read_result(request: Request, principal=Depends(identity)):

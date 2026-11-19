@@ -258,6 +258,22 @@ def test_duplicate_queued_response_keeps_the_original_receipt_etag_and_token(res
     assert [call[0] for call in responses.sdk.calls] == ["active", "queued"]
 
 
+def test_a_second_post_of_the_running_rid_never_runs_it_twice(responses):
+    """The API's after-reply POST and the sender's follow resend may both reach Hosted with the same RID."""
+    responses.sdk.block = True
+    assert responses.invoke(response_submit("only")).status_code == 202
+    accepted = responses.call(responses.runtime.read, "only")
+    first = responses.respond(accepted)
+    assert first.status_code == 200
+    responses.wait("only", "started")
+    repeated = responses.respond(accepted)
+    assert responses.response_result(repeated.json()["id"])["error"]["code"] == "NATIVE_TURN_QUEUED"
+    responses.sdk.block = False
+    completed = responses.wait("only", "completed")
+    assert completed.response_id == first.json()["id"]
+    assert [call[0] for call in responses.sdk.calls] == ["only"]
+
+
 def test_admission_reuses_what_it_just_read_or_wrote_under_the_admission_lock(responses, monkeypatch):
     """v17: one follow-up admission took about 1.1 s of sequential State store round trips (about 60 ms each)."""
     from collections import Counter

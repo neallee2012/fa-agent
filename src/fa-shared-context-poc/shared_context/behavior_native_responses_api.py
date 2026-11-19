@@ -152,22 +152,25 @@ def _advance_inflight(client, platform, receipt, *, before_send, confirm=True):
         logging.getLogger(__name__).info("NATIVE_RESPONSE_HOLDER_LEFT conversation_turn_waits=true")
         return
     NativeTurnGateway._same_session(client, holder)
-    _send_response(client, platform, holder, before_send=before_send, confirm=confirm)
+    # Unconfirmed (after a reply) a lock is only logged, so a holder relaying a peer's result can be a stream too.
+    _send_response(client, platform, holder, before_send=before_send, confirm=confirm,
+                   stream=not confirm and holder.source is not None and holder.source.kind == "agent_result")
 
 
-def _send_after_reply(client, platform, admitted, *, advance, before_send, refused=None):
-    """The owner already has Hosted's accepted receipt; the same RID/body is POSTed once after the reply.
+def _send_after_reply(client, platform, admitted, *, advance, before_send, refused=None, stream=True):
+    """The caller already has Hosted's accepted receipt; the same RID/body is POSTed once after the reply.
 
-    ``client`` is the one this admission confirmed. The workbench reads that receipt and reconciles the same RID if
-    it still needs its Responses POST. ``refused`` sees a refusal as the synchronous send's caller would.
-    Only the owner's own admitted turn is created as a replayable stream (RTT B live text); a lock inside that stream
-    reads as unconfirmed, which this path only logs while the receipt keeps the same RID for reconcile. Advancing
-    another holder (possibly a T5, routine or continuation turn) keeps ``stream: false``."""
+    ``client`` is the one this admission confirmed. The workbench (owner) or the sender's durable T5 follow reads
+    that receipt and reconciles the same RID if it still needs its Responses POST. ``refused`` sees a refusal as the
+    synchronous send's caller would. The owner's own admitted turn and a turn relaying a peer's result
+    (``agent_result``, Neal 2026-11-19) are created as a replayable stream (RTT B live text); a lock inside that stream
+    reads as unconfirmed, which this path only logs while the receipt keeps the same RID for reconcile. Other T5
+    turns (``stream=False``) and other advanced holders keep ``stream: false``."""
     try:
         if advance:
             _advance_inflight(client, platform, admitted, before_send=before_send, confirm=False)
         else:
-            _send_response(client, platform, admitted, before_send=before_send, confirm=False, stream=True)
+            _send_response(client, platform, admitted, before_send=before_send, confirm=False, stream=stream)
     except Problem as error:
         logging.getLogger(__name__).warning("NATIVE_RESPONSE_PENDING code=%s status=%s after_reply=true",
                                            error.body["error"]["code"], error.status)
@@ -186,7 +189,8 @@ def submit_native_turn(composition, client, command, capture, *, before_send=Non
     """One admitted original command, one CID slot, at most one Responses POST; no wait or new queue.
 
     ``before_send`` is an optional cheap producer check; the owner's entry check is not repeated per send.
-    ``defer`` (owner ``/submit`` only) takes the Responses POST and runs it after the accepted receipt is returned."""
+    ``defer`` (owner ``/submit`` and a T5 first admission) takes the Responses POST and runs it after the accepted
+    receipt is returned."""
     from .behavior_native_turn_api import NativeTurnGateway
 
     if (original is not None and original.agent_id != client.target.agent_id
@@ -225,10 +229,14 @@ def submit_native_turn(composition, client, command, capture, *, before_send=Non
     admitted, upstream = NativeTurnGateway._invoke(client, request)
     if channel(profile) == "invocations":
         return admitted, upstream
-    if source is not None and original is None and continuation is None:
-        # The existing durable T5 follow owns subsequent attempts, including their finite error budget.
-        return admitted, upstream
     advance = admitted.status == "busy_refused" or admitted.dispatch is not None and admitted.dispatch.state == "not_taken"
+    if source is not None and original is None and continuation is None:
+        # The sender's durable T5 follow still owns retries and their finite error budget. ``defer`` only makes the
+        # attempt that follow's next call would make (it follows accepted messages only) right after this reply.
+        if defer is not None and admitted.status == "accepted":
+            defer(partial(_send_after_reply, client, platform, admitted, advance=advance, before_send=before_send,
+                          stream=source.kind == "agent_result"))
+        return admitted, upstream
     if defer is not None:
         defer(partial(_send_after_reply, client, platform, admitted, advance=advance, before_send=before_send))
         return admitted, upstream

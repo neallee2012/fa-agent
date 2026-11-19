@@ -3573,7 +3573,7 @@ automation_write 有共用 action 類別，但本片不憑批准增生未實作 
 沿該回合現有 `DirectResponses/DirectCompletions` sender、身分、model 與用量紀錄；不另建 deployment 或第二個 judge。
 輸入是完整 typed action、當前 Team 規則及可核的真人原要求；已由 SDK 原 `user.message` 證實的追加文字
 只供**新動作**的要求脈絡，已開始的動作固定原脈絡。「同意」不是 `NativeHitlDecision`，不解鎖等待。
-Agent 來源不能冒充真人；沒有可核真人原要求時明確 ask（`human_request_unavailable`），不以 Agent 自評代填。
+Agent 來源不能冒充真人，payload 的 `verified_human_request` 不代填。**同 Team Agent 轉交的回合**（`receipt.source` 非 None，與排程互斥；Neal 2026-11-19 決定，依 ADR-0006 同 Team 互信）照樣呼叫審查模型，payload 另帶 `request_origin=team_agent`，system prompt 追加「只依規則」：只有某條 `allow_automatically` 規則涵蓋這個確切動作、且沒有比對到 Ask first 或其他阻擋才 allow，其餘 ask，takeover 照舊 deny。程式守門：這種回合模型回 allow 但 matched 裡沒有 `allow_automatically` 規則，改成 ask（reason `reviewed`，卡片顯示通用文案；不新增 wire 值）。原因：stage 上 A 請 B 查天氣，B 每次 `playwright-browser_click` 都出卡，Neal 存了三次「以後允許這類」仍每次都問，因為沒有真人原話就直接 ask、根本不看規則。排程回合沒有追加輸入時仍明確 ask（`human_request_unavailable`，排程不是永久批准）。
 回覆嚴格核 schema／matched IDs／revision，Ask 規則勝 automatic allow；不可用、無效或不確定都是 ask 並記原因。
 有比對到 Ask first 規則時，審查回 allow 或 deny 都改成 ask，交給真人決定；只有 takeover 維持 deny（7b3f SP16-04：審查對比對到 R1 的改檔直接 deny、沒出卡；總協調 10/03 依「不要比 grokbot 嚴格」修正，grokbot 的 Ask first 規則一律停下來問人）。
 takeover 判斷固定 deny；登入、密碼、2FA、CAPTCHA、付款確認轉真人 VM viewer，一次批准也不繞過。
@@ -4246,7 +4246,7 @@ caller先沿既有owner或Agent/Team規則核對scope與原材料；`before_send
 對話建立或第一步回應未知就停；`reconcile`讀不到原RID時不新建conversation。
 
 收到N1持久回條後，只有accepted／`dispatch.state=needs_response`才送一次
-`background=true,store=true`的Responses POST（owner回覆後那一次`stream=true`，其餘`stream=false`，
+`background=true,store=true`的Responses POST（owner回覆後那一次與回覆後送出的`agent_result`用`stream=true`，其餘`stream=false`，
 見[RTT B 回覆預覽串流](#rtt-b-reply-preview)），
 帶原`x-client-fa-rid/cid/submit-digest`及保存的SID。`already_queued`不補送，
 `not_taken`保留原RID；新請求busy時，只推進同CID的原accepted holder一次，不遞迴或另造queue。
@@ -4255,9 +4255,10 @@ caller先沿既有owner或Agent/Team規則核對scope與原材料；`before_send
 **owner `/submit`（2026-10-06）**：Hosted寫好accepted回條就回覆（`dispatch.state=needs_response`），
 這次POST（或busy時推進holder的那一次）用同RID／同body在回覆送完後才送，不再讀回條；結果只寫log。
 之後的確認由工作台既有`submit-reconcile`（`/reconcile`）負責，見[Responses 送出改到背景](#responses-submit-after-reply)。
-`/reconcile`、T5、routine、continuation與群組啟動仍同步送出並讀回條。
-T5第一次（source非空、原RID尚不存在）只持久接單／取名額，立即回原ACK；
-第二步由既有version-message follow的下一次同RID呼叫送出，不讓A等B，也不新增runner。
+`/reconcile`、T5同RID重送、routine、continuation與群組啟動仍同步送出並讀回條。
+T5第一次（source非空、原RID尚不存在）只持久接單／取名額，立即回原ACK；accepted時路由在回覆送完後
+用同RID／同body送一次第二步（2026-11-19起；`agent_result`用`stream=true`，其餘`stream=false`），結果只寫log；既有version-message follow的
+下一次同RID呼叫仍是保底核對與補送。不讓A等B，也不新增runner，見[交辦與回報接單後就送出](#relay-start-after-reply)。
 
 exact409 `conversation_locked`、N1明示already_queued／not_taken的純等待，不扣錯誤預算。
 同步路徑（`/reconcile`等）第二步POST的HTTP／傳輸結果未確認（包括400／404／502／timeout）回503
@@ -4319,6 +4320,17 @@ response-chain頁另回原`previous_response_id`，不自動掃完整chain或改
   照舊 `NATIVE_RESPONSE_UNCONFIRMED`、不重送。串流中的上鎖 409 會在 200 之後才出現，所以推進其他 holder、
   `/reconcile`、T5、routine、continuation 都維持 `stream=false`，保住 `conversation_locked` 判斷。
   回條仍 `needs_response` 時，工作台照舊用同一 RID 自動 reconcile。
+  **轉述回合（Neal 2026-11-19）**：A 收到 B 的結果後的 `agent_result` 回合，在 `/result` 第一次接單、回覆後送出時也帶
+  `stream=true`；回覆後推進的 holder 是 `agent_result` 時也一樣（`_advance_inflight` 只在 `confirm=False` 時）。這兩條路
+  不讀回條，上鎖只寫 log、由 A 的 follow 同步補送（`stream=false`），所以語意與 owner 那一次相同。仍是 `stream=false`：
+  `/send`、`/outcome`、同 RID 重送、同步推進、`/waiting-dispatch`（同步送出並讀回條；串流裡的上鎖會變成 503
+  `NATIVE_RESPONSE_UNCONFIRMED`，不再是等待中的 `NATIVE_TURN_BUSY`）。這些回合不能重播，工作台很快就放棄（見工作台 README）。
+  沒有人讀串流時回合照常跑完（azure-ai-agentserver-responses 2.2.0）：`store=true` 的串流在自己的 task 執行
+  （`hosting/_orchestrator.py` 3192–3196、3324–3326；沒有 task manager 時 4361 `asyncio.create_task(fallback_runner())`），
+  轉給連線的 `_relay_resilient_stream` 只綁連線、斷線不取消（3101–3103、3146–3150）；事件存進 `_event_subject.py`
+  的緩衝並 `put_nowait` 給無上限的訂閱佇列（44–46、69），沒人訂閱也不阻塞。API 本來就在讀到 `response.created` 後關連線，
+  與 owner 那一次相同（這是讀原始碼的依據，沒有新增「斷線後跑完」的測試）。轉述回合也繼承 owner 串流回合已知的 2.2.0 問題
+  （見[平台訊號期間的一次 GET](#responses-platform-signal-get)：SDK task 記成失敗、重播回 400）；FA 的回條與 `/status` 不受影響。
 - **唯讀轉送** `GET .../responses-turns/conversations/{cid}/requests/{rid}/stream?starting_after=<seq>`：
   先核 CID／RID 格式與 T1，再讀原 Hosted 回條核 profile／CID／session，`response_id` 只取自回條；用 API MI
   （平台只讓建立 session 的身分讀）呼叫官方 `GET /responses/{id}?stream=true&starting_after=N`。
@@ -5297,10 +5309,30 @@ client 不得因此改用新 RID 重送；已持有這個 RID 回條的，以回
 - 背景 POST 用的是這次接單時 `sessions.current()` 確認過的同一個 client／target（[API 讀取直接用已知的 session](#api-reader-cache)
   命中快取時也是同一個）；被拒時照舊交給 `sessions.moved`，和同步送出被拒一樣清快取，不換 RID、不重送。
 - 不變：入口 Entra／owner 核對、Hosted 的 session／expected version／Responses 啟用與 digest 核對、UNKNOWN 不重送、
-  `/reconcile`／T5／routine／continuation／群組啟動的同步行為。新對話仍先建平台對話（CID 是 Hosted 回條與 digest 的一部分）。
+  `/reconcile`／T5／routine／continuation／群組啟動的同步行為（T5 第一次接單自 2026-11-19 起也改到回覆後，見下段）。
+  新對話仍先建平台對話（CID 是 Hosted 回條與 digest 的一部分）。
 
 本機量測（替身數遠端呼叫，Responses lane，回覆前／回覆後）：新對話由 5／0（讀環境、建平台對話、Hosted 接單、
 Responses POST、Hosted 讀回條）降到 3／1；追問由 5／0 降到 3／1；整體少一次 Hosted 讀回條。
+
+<a id="relay-start-after-reply"></a>
+**交辦與回報接單後就送出（2026-11-19，CODE/offline，未部署）。** `POST /work-policy/v1/native-agent-messages/send`、
+`/result`、`/outcome` 第一次接單（原 RID 尚不存在、回條 `accepted`）時，API 先回 ACK，再在回覆送完後由同一請求的
+`BackgroundTasks` 用同 RID、同 body 送一次 Responses POST（`stream=false`；`/result` 的 `agent_result` 改 `stream=true`，
+見 [RTT B](#rtt-b-reply-preview)），不讀回條，錯誤只寫 log
+（`NATIVE_RESPONSE_PENDING ... after_reply=true`）。之前要等送方 VM 的 accepted follow 再打一次同一路由才送。
+
+- 為什麼：stage 2026-11-19 量測（`FA_TIMING`）兩段各空等約 4–5 秒。以一次交辦為例：B 的 `native_submit_slot`
+  在 00:52:41.245 完成，A 的 VM 存接單觀察、登錄 follow task、首次退避（`RetryPolicy(initial_delay=1)`，±25%）後，
+  第二次 `/send` 約 43.5 才到 API；API 再讀 B 的 session、重送同一 admission（44.23–44.43），Responses POST 到 B
+  `native_response_admit` 是 45.40，`native_start` 45.59。回報段 `api_result` 兩筆相隔約 5 秒，同一模式。
+- 保底不變：A／B 的 VM follow（`native_agent_tools._follow_accepted`）照舊在約 1 秒後用同 RID 再呼叫；讀到
+  `already_queued`／started 就停，`needs_response` 時同步補送並讀回條，失敗沿原 10 次預算。重送一律同步
+  （`defer` 只在原 RID 不存在時傳入），所以 503 `NATIVE_RESPONSE_UNCONFIRMED`、`reconcile_original` 與預算判斷不變。
+- 推論（未部署、未實測）：省下 follow 的登錄＋退避與第二次 API 往返；Responses POST 本身約 1 秒仍在。
+  交辦段 B 開跑約由 45.59 提前到 42.4（約 3 秒）；回報段兩筆 `api_result` 相隔約 5.1 秒，約省 5 秒。一趟約省 8 秒。
+- 測試：`test_native_responses_relay_api.py` 的 `test_t5_send_route_starts_the_recipient_right_after_its_acceptance_reply`、
+  `test_peer_return_route_starts_the_woken_sender_right_after_its_acceptance_reply`（result、unknown-notice）。
 
 #### Verified against：Responses 送出改到背景
 

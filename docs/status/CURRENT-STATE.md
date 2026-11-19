@@ -1,7 +1,7 @@
 # CURRENT-STATE — FA 開工摘要
 
 > **非權威快照**；先讀 AGENTS 與本檔，再按需讀來源。[維護規範](../CONVENTIONS.md#8-current-state)：60行／UTF-8 8KiB內。
-> 2026-11-18（+08）；核對origin/main `eaade8a4`；stage是第48版（2026.11.18-48，#1271，[紀錄](../progress.md#stage-v48-1118)）：舊Hosted job lane退役（舊路由410／404、舊對話唯讀、刪舊程式；這兩項只有本機測試，dev沒測到）＋#1242～#1244、#1248～#1250；SDK 1.0.26／runtime 1.0.103，API只送v3、閘門武裝，GUARD="1"（不能關、不退版）。
+> 2026-11-18（+08）；核對origin/main `8aa2eff9`；stage是第49版（2026.11.18-49，#1279，[紀錄](../progress.md#stage-v49-1118)）：舊Hosted job lane退役收尾（#1274、#1276）＋開網頁批准卡預設「這類動作」（#1273，dev沒測到）；SDK 1.0.26／runtime 1.0.103，API只送v3、閘門武裝，GUARD="1"（不能關、不退版）。
 > 本文不是操作批准；原資料、回條、unknown與費用上限保持，部署與帳本細節以來源為準。
 
 ## 現在在哪
@@ -10,9 +10,9 @@
 
 **環境（[ADR-0008](../adr/0008-environment-tiers-staging-cicd.md)）：** dev＝`faexample`；stage月USD200獨立[預算](../fa-cloud-budget-status.md)，只在改`deploy/stage/release.json`或手動時部署，**每次都需Neal核准；release PR流程（dev測試報告、免退版演練）依AGENTS**。合併者靠流程遵守（無branch protection，見ADR-0008 10-16）。
 
-**進行中：** 舊job lane退役：PR-E #1274、PR-F #1276都已合併，舊lane程式已刪，API端舊client方法與讀舊列模型刻意留（dev未測）；#1273開網頁批准卡預設「這類動作」已合併；以上都未上stage（[紀錄](../progress.md#stage-v48-1118)）。11-07起，API只送`foundry-native-v3`。`stage.json`與dev都武裝相容閘門（#934）；IDLE、RECONCILER仍"0"，快照URL未設。**ADR-0009前提重核（[ADR註記](../adr/0009-version-model-g-actual-version-idle-upgrade.md#platform-in-place-resume-2026-10-20)）：平台原地接續是主路徑，FA的換版（`cut`）是備援。** dev走`ci_deploy`（#919，`deploy/dev/`不匯出公開repo）。
+**進行中：** 舊job lane退役已隨第49版收尾；API端舊client方法與讀舊列模型刻意留（[紀錄](../progress.md#stage-v49-1118)）。11-07起，API只送`foundry-native-v3`。`stage.json`與dev都武裝相容閘門（#934）；IDLE、RECONCILER仍"0"，快照URL未設。**ADR-0009前提重核（[ADR註記](../adr/0009-version-model-g-actual-version-idle-upgrade.md#platform-in-place-resume-2026-10-20)）：平台原地接續是主路徑，FA的換版（`cut`）是備援。** dev走`ci_deploy`（#919，`deploy/dev/`不匯出公開repo）。
 
-**GitHub Actions：** repo為private、free方案（2000 Linux分鐘／月），Neal設USD10預算；11-18第48版deploy與public-sync跑成功。重型套件不跑PR／push。
+**GitHub Actions：** repo為private、free方案（2000 Linux分鐘／月），Neal設USD10預算；11-18第49版deploy與public-sync跑成功。重型套件不跑PR／push。
 
 **沿用設定（[第23版紀錄](../progress.md#stage-v23-1008)）：** 排程開（API時鐘＋對話提案）、打字預熱開、stage閒置逾時3600；feed app與工作台常駐；HITL A／B／t4開；A／B對話中換模型開；Teams connector第1波（Work IQ）旗標開；Teams逾時回覆補送（#827）仍關，需Neal。
 
@@ -26,7 +26,8 @@
 
 | 批次 | 結果 |
 |---|---|
-| stage第48版（11-18） | 舊job lane退役（#1261～#1270）＋第十七、十八輪安全部分（#1242～#1244、#1248～#1250）；dev run 4901測一般回合正常，410／404與舊對話唯讀dev沒測到；stage部署與public-sync成功；Neal 11-18在stage送回合，log讀回正常（[紀錄](../progress.md#stage-v48-1118)）。 |
+| stage第49版（11-18） | 舊lane收尾＋#1273；dev run 4902回合正常、`JOB_LANE_RETIRED` 0；#1273、舊對話唯讀、API退役路由410／404 dev都沒測到；stage部署與public-sync成功；stage真人回合待Neal（[紀錄](../progress.md#stage-v49-1118)）。 |
+| stage第48版（11-18） | 舊job lane退役（#1261～#1270）＋#1242～#1244、#1248～#1250；Neal在stage送回合，log正常（[紀錄](../progress.md#stage-v48-1118)）。 |
 | stage第47版（11-14）與第44～46版 | 第47版11-16真人回合完成（[讀回](../progress.md#stage-v47-turn-1116)）。44～46版見[44、45](../progress.md#stage-v44-v45-1107)、[46](../progress.md#stage-v46-1108)；44、45版真人回合仍待Neal。 |
 
 ## 下一步
@@ -47,7 +48,7 @@
 | stage「＋」IAM | #468：Neal本人實測「＋」仍待。風險#469，見[ADR-0008 §6](../adr/0008-environment-tiers-staging-cicd.md)。 |
 | ADR-0007／0006 | [Hosted原生優先](../adr/0007-foundry-hosted-native-first.md)：N0～N3與用量已合，live PASS；#306記憶風險例外不變；#284仍draft。ADR-0006 T1～T5已部署；T6a／T6b已實作未部署，私人記憶用量未入帳是已知缺口。 |
 | 退役Agent、SP v2／v3／role | 退役只有operator CLI（[deploy](../../deploy/README.md#retire-agent)）；SP都不升全域acceptance；dev tombstone待批。細節見[清單](../progress.md#current-state-trim-1116)。 |
-| 費用 | dev上限**USD900／停損880**（10-25，[紀錄](../fa-cloud-budget-status.md#dev-api-scale-zero-1025)；量的是整個訂用帳戶，含其他專案，Neal 11-18決定維持；預計11-19當天花費超過、約晚一天才看得到，之後付費dev工作暫停，[11-18](../progress.md#stage-v48-1118)）；stage月USD200另列。 |
+| 費用 | dev**停損USD950**（Neal 11-18從880調高，[紀錄](../fa-cloud-budget-status.md#dev-stop-loss-950-1118)）；量的是整個訂用帳戶本月累計，含其他專案；11-18 dev部署前829.51；stage月USD200另列。 |
 
 ## 來源入口
 

@@ -186,7 +186,7 @@ def _relay_app(monkeypatch, principal, **results):
         return SimpleNamespace(conversation_id="cid-a", request_id="rid-a")
     monkeypatch.setattr(native_agent_api, "_body", body)
     for name, value in results.items():
-        def call(self, principal, command, value=value):
+        def call(self, principal, command, value=value, **_):
             if isinstance(value, Problem):
                 raise value
             return value

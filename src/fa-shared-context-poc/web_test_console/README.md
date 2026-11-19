@@ -664,8 +664,15 @@ Responses 串流、API 提供唯讀轉送（見 [Shared Context README](../READM
 
 **怎麼結束、怎麼接續：**
 
+- **另一位助理的結果回來後的轉述回合**（Neal 2026-11-19）：頁面也替這個對話裡最新、回條還是 `accepted`／`started` 的
+  `agent_result` 回合開同一條串流（`runningPeerReturn`）。只影響即時文字，不改讀取節奏（`runningOwnTurn` 不變）。頁面要等
+  下一次讀到它的回條（等回覆期間約 3～5 秒）才會開。串流結束時沒有自己的回合，頁面立刻整段讀一次對話，帶回保存的回覆。
+  API 在 `/result` 第一次接單、回覆後送出時以 `stream=true` 建立這種回合（Shared Context README「RTT B」的轉述回合）。
+  A 的 follow 重送或排在別的回合後面才送出的，仍是 `stream=false`、不能重播，所以回條還是 `accepted` 時只照下方規則
+  每 0.4 秒再問 5 次（`LIVE_PEER_NOT_STARTED_TRIES`，自己的回合仍是 25 次），之後等回條顯示 `started` 再試一次；
+  回 `NATIVE_STREAM_UNAVAILABLE` 就停，照舊等保存的回覆。一個不能重播的轉述回合最多問 7 次。
 - 收到 `final_answer` 項目（代表已存檔）或終局事件：停止串流，立刻讀一次 `/status`，保存的回覆取代預覽。
-- 回合不再是「進行中的自己這一則」（完成、失敗、取消、不確定、換對話、登入失效）：同一次重畫就丟掉預覽，不把它留成結果。
+- 回合不再是「進行中的自己這一則」或上述轉述回合（完成、失敗、取消、不確定、換對話、登入失效）：同一次重畫就丟掉預覽，不把它留成結果。
 - 串流斷線（包含 API 的 230 秒上限）：0.5／1／2 秒後帶 `starting_after=<最後的 sequence_number>` 重接，最多 3 次；第二個以後的
   `response.in_progress` 清空預覽（官方重置規則）。
 - 頁面在 bridge 收到 submit 回條（`accepted`／`started`）之後才開串流。API 在回合開始前回 `NATIVE_RID_MISSING`（404）或
