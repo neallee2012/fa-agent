@@ -17,6 +17,7 @@ from shared_context.behavior_wire import WireModel
 from shared_context.m2_copilot import ToolOutput, ToolSpec
 from shared_context.native_turns import TURNS_STORE, NativeTurnRuntime, _json, _Rid
 from shared_context.sdk_pin import RUNTIME_VERSION
+from shared_context.sdk_pin import PINNED_RELEASE_TEXT
 from test_native_turn_wire import capture, submit
 from test_native_turns import Harness, IDENTITY, local_env
 
@@ -212,6 +213,7 @@ def test_factory_passes_native_consumers_without_changing_original_private_root(
     # Hosted settings for the factory only; the turn then uses local_env's offline state store (ee8ef6b7 reads it).
     with monkeypatch.context() as environment:
         environment.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
+        environment.setenv("FA_SDK_RELEASE", PINNED_RELEASE_TEXT)
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-hosted-config-only")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))

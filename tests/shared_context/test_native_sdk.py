@@ -20,6 +20,7 @@ from shared_context.behavior_sdk_state import NativeCheckpointScope
 from shared_context.errors import Problem
 from shared_context.native_turns import TURNS_STORE, NativeTurnControl, NativeTurnRuntime, _json, _Rid
 from shared_context.sdk_pin import RUNTIME_VERSION
+from shared_context.sdk_pin import PINNED_RELEASE_TEXT
 from test_native_turn_wire import capture, submit
 from test_m2_copilot import runtime_path
 from test_native_turns import Harness, IDENTITY, local_env
@@ -49,6 +50,7 @@ def test_native_factory_reuses_one_managed_identity_credential(local_env, monkey
     )
     with monkeypatch.context() as environment:
         environment.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
+        environment.setenv("FA_SDK_RELEASE", PINNED_RELEASE_TEXT)
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
@@ -118,6 +120,7 @@ def test_peer_result_is_sent_before_usage_and_memory_and_each_lands_once_after_r
     )
     with monkeypatch.context() as environment:
         environment.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
+        environment.setenv("FA_SDK_RELEASE", PINNED_RELEASE_TEXT)
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
@@ -165,6 +168,7 @@ def test_production_wires_a_waiting_responses_message_to_the_api_send(local_env,
     )
     with monkeypatch.context() as environment:
         environment.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
+        environment.setenv("FA_SDK_RELEASE", PINNED_RELEASE_TEXT)
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
@@ -418,6 +422,7 @@ def test_sk03_a_catalog_budget_capture_has_a_native_consumer(tmp_path):
 
 def test_native_environment_remains_explicit_and_never_falls_back_to_local(monkeypatch):
     monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
+    monkeypatch.setenv("FA_SDK_RELEASE", PINNED_RELEASE_TEXT)
     monkeypatch.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
     monkeypatch.setenv("AGENTSERVER_TASKS_BACKEND", "local")
     with pytest.raises(Problem) as rejected:
@@ -450,6 +455,7 @@ def test_native_factory_runs_under_bootstrap_owned_root_when_home_is_not_writabl
     monkeypatch.setattr(Path, "mkdir", bootstrap_permissions)
     with monkeypatch.context() as environment:
         environment.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
+        environment.setenv("FA_SDK_RELEASE", PINNED_RELEASE_TEXT)
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("HOME", str(home))

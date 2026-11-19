@@ -1,4 +1,4 @@
-"""Isolated Copilot SDK 1.0.26 / runtime 1.0.103 adapter.
+"""Isolated Copilot SDK adapter; the release it runs is ``sdk_pin``'s.
 
 ``api_url`` is the trusted Context API base URL, not a model-selected URL.
 Only its fixed M2, M3 or M4 chat/completions endpoint can receive model HTTP traffic.
@@ -34,7 +34,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
-from copilot import CopilotClient, CopilotRequestHandler, RuntimeConnection, ToolSet
+from copilot import CopilotClient, CopilotRequestHandler, JsonRpcError, RuntimeConnection, ToolSet
 from copilot.client import ModelCapabilities, ModelInfo, ModelLimits, ModelSupports
 from copilot.generated.rpc import (
     PermissionDecisionApproveOnce, PermissionDecisionReject, SessionUpdateOptionsParams, Verbosity,
@@ -2102,9 +2102,16 @@ class _SdkRun:
                 self.session = await self.client.create_session(session_id=turn.sdk_session_id, **options)
         # Runtime 1.0.103 asks Responses models for terse answers (text.verbosity "low"); 1.0.83 sent none, which OpenAI
         # documents as medium. The runtime adds verbosity only for models that support it. Not applied only shortens
-        # answers, so the turn goes on and the log says so.
-        result = await self.session.rpc.options.update(SessionUpdateOptionsParams(verbosity=Verbosity.MEDIUM))
-        if not result.success:
+        # answers, so the turn goes on and the log says so. Runtime 1.0.112 rejected an invalid value with JSON-RPC
+        # -32602 (invalid params); no tried model refused low or medium.
+        try:
+            applied = (await self.session.rpc.options.update(
+                SessionUpdateOptionsParams(verbosity=Verbosity.MEDIUM))).success
+        except JsonRpcError as error:
+            if error.code != -32602:
+                raise
+            applied = False
+        if not applied:
             logging.getLogger(__name__).warning("SDK_VERBOSITY_NOT_APPLIED")
 
     def _require_not_cancelled(self):

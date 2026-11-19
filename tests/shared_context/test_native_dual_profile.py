@@ -271,6 +271,7 @@ def test_the_runtime_declares_the_environment_profile_and_refuses_any_other(loca
     monkeypatch.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
     monkeypatch.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://offline-fixture.services.ai.azure.com/api/projects/offline")
+    monkeypatch.setenv("FA_SDK_RELEASE", native_sdk.PINNED_RELEASE_TEXT)  # as sync declares it
     # ADR-0009 M1: v1 is no longer declarable; 3d-ii: nor is v2, so only v3 starts.
     if profile == NATIVE_V3_PROFILE:
         assert native_sdk.native_runtime_from_environment(hosted).state_profile == profile
@@ -281,7 +282,7 @@ def test_the_runtime_declares_the_environment_profile_and_refuses_any_other(loca
     assert "must be explicitly enabled" in refused.value.body["error"]["message"]
 
 
-@pytest.mark.parametrize("declared", [None, "pin", "1.0.13/1.0.83", "1.0.26", "undeclared-newer"])
+@pytest.mark.parametrize("declared", [None, "pin", "1.0.13/1.0.83", "1.0.26", "undeclared-newer", "newer-pin"])
 def test_the_runtime_refuses_a_version_that_declares_another_sdk_release(local_env, monkeypatch, tmp_path, declared):
     """ADR-0009 §3 (c): the API trusts the pair a version's definition declares (FA_SDK_RELEASE) for Guard A/B, so an
     image under a definition naming another pair never starts; an undeclared one (published before it) still does."""
@@ -300,11 +301,14 @@ def test_the_runtime_refuses_a_version_that_declares_another_sdk_release(local_e
         monkeypatch.setenv(key, value)
     if declared in {None, "undeclared-newer"}:
         monkeypatch.delenv("FA_SDK_RELEASE", raising=False)
-        if declared:  # a newer image under a definition that declares nothing: the API takes it for 1.0.26/1.0.103
-            monkeypatch.setattr(native_sdk, "PINNED_RELEASE_TEXT", "1.0.28/1.0.105")
+        # Undeclared is what the API takes for 1.0.26/1.0.103: an image of that pair starts, a newer one does not.
+        monkeypatch.setattr(native_sdk, "PINNED_RELEASE_TEXT", "1.0.28/1.0.105" if declared else "1.0.26/1.0.103")
+    elif declared == "newer-pin":  # ADR-0009 M11: an image newer than the frozen wire pair still runs v3
+        monkeypatch.setattr(native_sdk, "PINNED_RELEASE_TEXT", "1.0.34/1.0.112")
+        monkeypatch.setenv("FA_SDK_RELEASE", "1.0.34/1.0.112")
     else:
         monkeypatch.setenv("FA_SDK_RELEASE", f"{SDK_VERSION}/{RUNTIME_VERSION}" if declared == "pin" else declared)
-    if declared in {None, "pin"}:
+    if declared in {None, "pin", "newer-pin"}:
         assert native_sdk.native_runtime_from_environment(hosted).state_profile == NATIVE_V3_PROFILE
         return
     with pytest.raises(Problem) as refused:

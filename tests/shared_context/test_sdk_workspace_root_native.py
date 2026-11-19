@@ -4,7 +4,6 @@ import json
 
 import httpx
 import pytest
-from copilot import CopilotClient
 
 from shared_context.behavior_assistant_boundary import AssistantModelBoundary
 from shared_context.behavior_sdk_files import SdkSessionFiles
@@ -14,7 +13,7 @@ from test_m2_copilot import runtime_path, workspace
 
 
 @pytest.mark.parametrize("legacy_workspace", [False, True], ids=["virtual", "legacy-native"])
-def test_fixed_sdk_resumes_without_original_host_work_directory(workspace, runtime_path, monkeypatch, legacy_workspace):
+def test_fixed_sdk_resumes_without_original_host_work_directory(workspace, runtime_path, legacy_workspace):
     async def scenario():
         sid = "sdk-workspace-legacy" if legacy_workspace else "sdk-workspace-virtual"
         previous = None
@@ -37,29 +36,31 @@ def test_fixed_sdk_resumes_without_original_host_work_directory(workspace, runti
                 return sse(request, {"content": "First original SDK reply." if number == 1 else "Original history restored."},
                            len(calls))
 
-            with monkeypatch.context() as patch:
-                if number == 1 and legacy_workspace:
-                    create = CopilotClient.create_session
-
-                    async def create_legacy(instance, **options):
-                        options["working_directory"] = str(work)
-                        return await create(instance, **options)
-
-                    patch.setattr(CopilotClient, "create_session", create_legacy)
-                outcome = await run_copilot(
-                    state_dir=workspace / f"sdk-{number}", working_directory=work, sdk_session_id=sid,
-                    resume=number == 2, prompt="Continue this controlled local SDK test.", tools=[],
-                    api_url="https://offline.invalid", token_provider=lambda: "OFFLINE",
-                    on_event=lambda _: None, runtime_path=runtime_path, timeout_seconds=30,
-                    http_transport=httpx.MockTransport(respond), instruction=True, session_files=fs,
-                    behavior_boundary=AssistantModelBoundary(reserve, text_reply=True),
-                    system_message="Controlled SDK workspace compatibility test.",
-                )
+            outcome = await run_copilot(
+                state_dir=workspace / f"sdk-{number}", working_directory=work, sdk_session_id=sid,
+                resume=number == 2, prompt="Continue this controlled local SDK test.", tools=[],
+                api_url="https://offline.invalid", token_provider=lambda: "OFFLINE",
+                on_event=lambda _: None, runtime_path=runtime_path, timeout_seconds=30,
+                http_transport=httpx.MockTransport(respond), instruction=True, session_files=fs,
+                behavior_boundary=AssistantModelBoundary(reserve, text_reply=True),
+                system_message="Controlled SDK workspace compatibility test.",
+            )
             assert outcome["sdk_stop"]["graceful"] is True
             assert not fs.failed
             if original_bytes is not None:
                 assert fs.previous.encoded() == original_bytes
             previous = fs.snapshot()
+            if number == 1 and legacy_workspace:
+                # Stands in for a state an FA before the virtual cwd saved with its host work directory: runtime
+                # 1.0.112 refuses to create a SessionFs session with a host cwd, so this 1.0.112 state is rewritten to
+                # one. A real runtime 1.0.83 Linux state was not tried (the 1.0.83 fixtures were made on Windows).
+                files = dict(previous.files)
+                legacy = {"workspace.yaml": ("cwd: /\n", "cwd: /home/legacy/work-1\n"),
+                          "events.jsonl": ('"cwd": "/"', '"cwd": "/home/legacy/work-1"')}
+                for name, (virtual, host) in legacy.items():
+                    assert files[name].count(virtual) == 1
+                    files[name] = files[name].replace(virtual, host)
+                previous = previous.model_copy(update={"files": files})
             if number == 1:
                 work.rename(workspace / "retained-original-work")
             else:

@@ -16,6 +16,16 @@ from .errors import Problem
 
 TARGETS = frozenset({"model.model_call_success", "model.messages_snapshot"})
 COMPACTION_EVENTS = ("session.compaction_start", "session.compaction_complete")
+# Runtime 1.0.112's generated SessionCompactionSummarizedData: a background summarizer settled; the matching complete
+# follows and stays authoritative. Ephemeral, so never in events.jsonl; only these runtimes may send it.
+SUMMARIZED = "session.compaction_summarized"
+SUMMARIZED_RUNTIMES = frozenset({"1.0.112"})
+# Runtimes that write no model.* diagnostics for a manual compaction; its complete event names its one direct request.
+# The turn that compacts needs the running runtime here; a saved state needs a writer no older than the first of them.
+UNDIAGNOSED_RUNTIMES = frozenset({"1.0.112"})
+# Runtimes seen to fail a turn-blocking compaction whose summarizer prompt itself overflows, then truncate instead;
+# that pair replaces no history. Gates the runtime that writes the pair; one the predecessor holds passed it then.
+FAILED_PAIR_RUNTIMES = frozenset({"1.0.112"})
 # Triggers the auto profile never accepts as the runtime's own threshold compaction. ``model_switch`` comes only from the
 # experimental ``session.model.switchTo`` preflight, which FA never calls; CTX-03 does not enable model-switch compaction.
 NOT_AUTOMATIC_TRIGGERS = ("", "manual", "model_switch")
@@ -325,12 +335,17 @@ def compaction_pair(events):
     return start, complete
 
 
-def automatic_pairs(events):
-    """auto profile: the runtime's own compactions, each a complete start/complete pair with its summary."""
-    found = [event for event in events if event["type"].startswith("session.compaction")]
-    if len(found) % 2 or any(event["type"] != COMPACTION_EVENTS[index % 2] for index, event in enumerate(found)):
+def automatic_pairs(events, inherited=0):
+    """auto profile: the runtime's own compactions, each a complete start/complete pair with its summary.
+
+    The first ``inherited`` events are the predecessor's, found equal to it in order (``validate_inherited``); a pair
+    among them was written by an earlier run.
+    """
+    found = [index for index, event in enumerate(events) if event["type"].startswith("session.compaction")]
+    if len(found) % 2 or any(events[index]["type"] != COMPACTION_EVENTS[n % 2] for n, index in enumerate(found)):
         unverified()
-    for start, complete in zip(found[::2], found[1::2]):
+    for begin, end in zip(found[::2], found[1::2]):
+        start, complete = events[begin], events[end]
         for event in (start, complete):
             envelope(event)
             if not isinstance(event["data"].get("trigger"), str) or event["data"]["trigger"] in NOT_AUTOMATIC_TRIGGERS:
@@ -338,11 +353,25 @@ def automatic_pairs(events):
             if event["data"].get("customInstructions") not in (None, ""):
                 raise Problem(409, "SDK_STATE_PRIVATE_MATERIAL", "custom compaction instructions are not supported")
         data = complete["data"]
-        if (start["id"] == complete["id"] or start["data"]["trigger"] != data["trigger"]
-                or data.get("success") is not True
+        if start["id"] == complete["id"] or start["data"]["trigger"] != data["trigger"]:
+            unverified()
+        if _failed_before_summarizing(start["data"], data, end < inherited):
+            continue
+        if (data.get("success") is not True
                 or not isinstance(data.get("summaryContent"), str) or not data["summaryContent"].strip()):
             unverified()
-    return found
+    return [events[index] for index in found]
+
+
+def _failed_before_summarizing(start, complete, inherited):
+    from . import sdk_pin
+    attempt = start.get("compactionAttemptId")
+    return ((inherited or sdk_pin.RUNTIME_VERSION in FAILED_PAIR_RUNTIMES) and isinstance(attempt, str) and attempt
+            and complete.get("compactionAttemptId") == attempt
+            and start.get("execution") == complete.get("execution") == "turn_blocking"
+            and complete.get("success") is False and complete.get("outcome") == "failed"
+            and complete.get("failureReason") == "context_limit"
+            and not {"summaryContent", "checkpointNumber", "checkpointPath", "messagesRemoved"} & complete.keys())
 
 
 def native_pair(events):
@@ -429,7 +458,7 @@ def validate_projected_state(state):
     events = events_from(state.files)
     targets = [event for event in events if event["type"] in TARGETS]
     ids = tuple(event.get("id") for event in targets)
-    if not ids or ids != state.projected_event_ids or len(set(ids)) != len(ids):
+    if ids != state.projected_event_ids or len(set(ids)) != len(ids) or not ids and not _direct_request(state, events):
         unverified()
     event_ids = [event.get("id") for event in events]
     if any(not isinstance(identity, str) or not identity for identity in event_ids) or len(set(event_ids)) != len(event_ids):
@@ -450,6 +479,23 @@ def validate_projected_state(state):
     for name, text in state.files.items():
         if name != "events.jsonl" and name not in public_sidecars:
             _private_sidecar(name, text)
+
+
+def _direct_request(state, events):
+    # A saved state names only its last writer. The compacting turn was checked exactly when saved (``snapshot``);
+    # this second check refuses only what no admitted runtime could have written.
+    if _number(state.runtime_version) < min(map(_number, UNDIAGNOSED_RUNTIMES)):
+        return False
+    start, complete = native_pair(events)
+    data = complete["data"]
+    used = data.get("compactionTokensUsed")
+    return (start["data"].get("execution") == data.get("execution") == "direct"
+            and isinstance(used, dict) and type(used.get("requestCount")) is int and used["requestCount"] == 1
+            and isinstance(data.get("clientRequestId"), str) and bool(data["clientRequestId"]))
+
+
+def _number(version):
+    return tuple(int(part) for part in version.split("."))
 
 
 def validate_native_files(files, events, *, model_provider=None):

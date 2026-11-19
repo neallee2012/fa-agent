@@ -24,6 +24,11 @@
   gpt-6.1-sol 的系統提示從 `instructions` 移到 `input[0]`（role `system`，帶 `prompt_cache_breakpoint`）、completions 的 runtime 不再送 `snippy`（FA 本來就拿掉）。
 - **1.0.103 對 SDK 1.0.28 候選（runtime 1.0.105，2026-11-04）**：no field differs；逐字比對三個記錄點，只有 `<current_datetime>` 不同。
   錄法：另建一個只裝 SDK 1.0.28 的 venv，本樹匯出後只把 `sdk_pin` 改成 1.0.28／1.0.105。
+- **1.0.103 對 SDK 1.0.34（runtime 1.0.112，2026-11-19）**：Responses 三個模型 `sent` 不變（`text.verbosity` 兩邊都是 `"medium"`），
+  只有 runtime 不再自帶 `reasoning.effort`（FA 本來就拿掉）。Chat Completions：每個模型第 2 個請求的 assistant 訊息不再帶
+  `refusal: null`；**gpt-4.1-mini（非推理模型）多送 `temperature: 0`（原本 1）、`top_p: 0.95`、`frequency_penalty: 0`、
+  `presence_penalty: 0`**，legacy 與 instruction 都是，經 gateway 原樣送到模型端點。推理模型沒有這四個欄位。
+  回答品質要在 dev 用真模型看；錄法同上，SDK 1.0.34 的 venv 跑本分支。
 - **怎麼讀**：超過 80 字的文字只比長度（提示含時間戳記，系統提示由 runtime 決定），`prompt_cache_key` 每個 session 都不同，只比有沒有；
   同一 runtime 錄兩次比對結果是「no field differs」。FA 在 session 上設 `verbosity=medium`，所以看到的是 `text.verbosity` 從無到 `"medium"`，
   不是 runtime 自己的 `"low"`。`messages`／`input` 依位置比，前面插入一項會讓後面每一項都顯示變動。
@@ -32,6 +37,44 @@
   推理模型（gpt-5.4-mini、gpt-6.1-sol）的 instruction completions 案例只對應改版前已受理的工作與重播；
   新工作在受理時就被導到 Responses（422 `REASONING_MODEL_REQUIRES_RESPONSES`）。
   `test_runtime_wire_diff.py` 只驗比對邏輯；錄製要真 runtime，不在 CI。
+
+<a id="sdk-1034-m11"></a>
+## SDK 1.0.34／runtime 1.0.112：M11 第一次一步升級（2026-11-19，CODE/offline，未部署）
+
+- **做法**：照 [ADR-0009 M11](../../docs/adr/0009-version-model-g-actual-version-idle-upgrade.md#m11-first-bump) 不換 profile、一次上線。
+  C1 `sdk_pin.WIRE_RELEASE`＝(1.0.26, 1.0.103)，`SENT_RELEASE` 與 `PROFILE_RELEASES` v3 固定指它；C2 拿掉 Hosted 的 profile＝pin 自檢，
+  `FA_SDK_RELEASE` 自檢保留；C3 pin、`requirements-hosted.txt`、Dockerfile 的 runtime 路徑；C4 profile 快照不含版本值、
+  v2 基準比對對新組合開 `M11_RELEASES_ADDED` 豁免；C5 `OLDER_RELEASES` 加 (1.0.26, 1.0.103) 與兩份 1.0.103 存檔 fixture；
+  C6 `seed_agents` 寫 `FA_SDK_RELEASE`。連線照舊是 stdio 子程序（`RuntimeConnection.for_stdio`），不用 in-process。
+- **verbosity**：SDK 1.0.31 的 release notes 說 `session.options.update` 會拒絕模型不支援的 verbosity。本機 runtime 1.0.112
+  只用不合法的值 `ultra` 觸發過拒絕，方式是丟 `JsonRpcError` -32602，不是回 `success=false`；`_open_session` 把 -32602 當成
+  沒套用，照舊記 `SDK_VERBOSITY_NOT_APPLIED`。FA 的 BYOK openai provider 下，gpt-4.1-mini、gpt-4o、gpt-5.4-mini、
+  claude-sonnet-4.5 與不認得的模型 ID 設 low／medium 都成功，沒看過模型不支援而被拒的情形。
+- **compaction（不換 profile 的 codec 修正）**：runtime 1.0.112 改了 compaction 的事件，三條新規則依寫入事件的 runtime
+  認形狀（`behavior_sdk_compaction`）：`SUMMARIZED_RUNTIMES` 看執行中的 pin，事件不進存檔；`FAILED_PAIR_RUNTIMES` 只管本回合
+  新寫的配對，前一份存檔原樣留下的在寫入當時已認過；`UNDIAGNOSED_RUNTIMES` 在 compaction 那回合存檔時看執行中的 pin，
+  載入時只做不精確的第二道：存檔標的版本不早於 1.0.112（規則見 CTX-03）。舊版本照舊規則；舊 image 解析標 1.0.112 的存檔時以
+  `literal_error` 拒絕（有測試），所以不必換 profile（ADR-0009 反例 7）。
+  (1)(2) 是總協調決定的範圍，(3) 是修本分支測試時另外加的。
+  (1) 自動 compaction 在 start 與 complete 之間多一個 `session.compaction_summarized`（SDK 1.0.34 生成的
+  `SessionCompactionSummarizedData`，`ephemeral`、不寫進 events.jsonl）：只收 auto profile 開著的那一次、`compactionAttemptId`
+  相同、`success` 為 true、只出現一次。(2) 手動 compaction 的 events.jsonl 不再有 `model.*` 診斷事件：改由 complete 事件證明
+  只有一次直接請求（start／complete 的 `execution` 都是 `direct`、`compactionTokensUsed.requestCount`＝1、有 `clientRequestId`），
+  缺一項就 `SDK_STATE_SOURCE_UNVERIFIED`。少了 `model.*` 也就少了從中取出的系統提示；摘要若原樣抄進系統提示，
+  同一次執行寫進 events.jsonl 的 `system.message` 內容就是要擋的字串，以 `SDK_STATE_PRIVATE_MATERIAL` 拒絕（真 runtime
+  1.0.112 測過；和 1.0.103 一樣只擋完整複本）。沒開 profile 時，本回合自己的 compaction 在 snapshot 一律拒絕。(3) 視窗小到連摘要
+  請求都放不下時，1.0.112 的 `turn_blocking` compaction 以 `success=false`、`outcome=failed`、`failureReason=context_limit`
+  結束、不換任何歷史，接著截斷；auto profile 只收這個形狀（同 attempt、沒有摘要／checkpoint／`messagesRemoved`）。
+  三組集合列的是「已知會寫出這個形狀的 runtime」，只增不減：1.0.112 寫進存檔的事件，之後不論哪一版在跑都照樣認得；
+  下一版自己寫出同樣形狀時，要有證據才加入，加入前它寫的照樣拒絕。
+- **其他 1.0.112 差異**：preToolUse hook 可能比 `tool.execution_start` 先到，Agent 轉交與操作紀錄改用 SDK 1.0.34 hook 的
+  `toolCallId` 對應呼叫（同參數的兩個呼叫照舊判 `tool_call_ambiguous`；hook 先到時，第一個呼叫會執行，第二個才被拒）；
+  1.0.112 不讓 SessionFs session 以 host 路徑建立，FA 從虛擬 `/` 起算，不受影響；把 1.0.112 存檔的 cwd 改寫成 host 路徑後
+  仍可接續（Windows 本機），真 1.0.83 Linux 存檔未驗。
+- **上線前**：C0 核對 stage 與 dev 的 API revision 含 #1191（Guard A／B）；本機 pip 設定的套件 proxy 只到 1.0.32rc3，
+  建 image 的環境要能拿到 PyPI 的 1.0.34（`0d9cffcc…` 與 PyPI 公布的 sha256 相同）。4d 跨 SDK 退回照舊關（ADR 反例 8）。
+- **證據**：Windows 本機、SDK 1.0.34 獨立 venv、真 runtime 1.0.112（sha256 `e82eed44…`，SDK 自己的 `download-runtime` 下載並核
+  checksum）、離線 provider。**未驗證**：Linux image、真模型、Hosted State store、API／Hosted 混搭的滾動部署。
 
 <a id="sdk-1026-3d-step3"></a>
 ## 3d 第 3 步：拿掉 v2 header 別名和 v2 重送（2026-11-04，CODE/offline，未部署）

@@ -35,6 +35,7 @@ class NativeOperationGuard:
         self.direct = set()
         self.observations = []
         self.starts = {}
+        self.refused_starts = set()
         self.sdk_session_id = None
         self.completion_checks = {}
         receipt = effects.receipt
@@ -150,11 +151,15 @@ class NativeOperationGuard:
     async def pre_tool(self, data, context, original):
         if data.get("toolName") != "task" or data.get("sessionId") != self.sdk_session_id:
             return None if original is None else await original(data, context)
+        named = data.get("toolCallId") if isinstance(data.get("toolCallId"), str) else None
+        if named:
+            # SDK 1.0.34 names the call in the hook; runtime 1.0.112 may call it before tool.execution_start.
+            self.starts.setdefault(named, ("task", data.get("toolArgs")))
         matches = [call_id for call_id, value in self.starts.items()
                    if value == ("task", data.get("toolArgs"))]
         if original is None:
             return {"permissionDecision": "deny", "permissionDecisionReason": _GUIDANCE}
-        if len(matches) != 1:
+        if len(matches) != 1 or named and matches != [named]:
             from .behavior_delegation_runtime import not_started
             # Nothing ran for this hook call: two calls with identical arguments cannot be told apart.
             return {"permissionDecision": "deny", "permissionDecisionReason": not_started(
@@ -168,6 +173,8 @@ class NativeOperationGuard:
                 await self.refused(packet, "NATIVE_OPERATION_REFUSED")
                 # The SDK never runs a denied call; a retry with the same arguments must match only itself.
                 self.starts.pop(packet["tool_call_id"], None)
+                # Runtime 1.0.112 may report its start after this hook; that late start must not bring it back.
+                self.refused_starts.add(packet["tool_call_id"])
                 return decision or {"permissionDecision": "deny", "permissionDecisionReason": _GUIDANCE}
             await self.dispatched(packet)
             self.direct.add(packet["tool_call_id"])
@@ -214,7 +221,7 @@ class NativeOperationGuard:
         if event.get("type") == "tool.execution_start":
             data = event.get("data") or {}
             call_id = data.get("tool_call_id", data.get("toolCallId"))
-            if isinstance(call_id, str):
+            if isinstance(call_id, str) and call_id not in self.refused_starts:
                 self.starts[call_id] = (data.get("tool_name", data.get("toolName")), data.get("arguments"))
             return
         if event.get("type") != "tool.execution_complete":

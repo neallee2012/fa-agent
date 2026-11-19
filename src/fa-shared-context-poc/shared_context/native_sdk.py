@@ -54,8 +54,7 @@ from .native_capability_tools import approved_skills_provider, mcp_api_provider
 from .native_sdk_profiles import NativeSdkStart, ORIGIN_ADDENDUM, check_start_capture, native_context
 from .native_assembly import NativeAssemblyCollector
 from .native_inference import NativeInferenceCollector
-from .sdk_pin import (PINNED_RELEASE_TEXT, PROFILE_RELEASES, RELEASE_ENV, RUNTIME_VERSION, SDK_VERSION,
-                      UNDECLARED_RELEASE)
+from .sdk_pin import PINNED_RELEASE_TEXT, RELEASE_ENV, SDK_VERSION, UNDECLARED_RELEASE
 
 _PROFILES = frozenset({
     "fa-instruction-v1", "fa-instruction-v2", "fa-instruction-v3", "fa-instruction-v4",
@@ -1397,10 +1396,6 @@ def native_runtime_from_environment(hosted):
     state_profile = os.environ.get("FA_NATIVE_TURNS")
     if state_profile not in ACCEPTED_STATE_PROFILES:
         raise Problem(403, "NATIVE_TURNS_DISABLED", "the native state profile must be explicitly enabled")
-    # ADR-0009 §3 (c): a profile names its SDK/runtime pair; declaring another image's profile would label new state
-    # with a pair this runtime does not write (a v3 image declaring v2 loses its work files at 3d-ii).
-    if PROFILE_RELEASES[state_profile] != (SDK_VERSION, RUNTIME_VERSION):
-        raise Problem(403, "NATIVE_TURNS_DISABLED", "the native state profile names another SDK/runtime release")
     # Guard A/B: the API reads this image's pair from the definition's declaration, so it must be this image's;
     # undeclared is what the API takes it for (a newer image under a definition that says nothing does not start).
     if os.environ.get(RELEASE_ENV, "/".join(UNDECLARED_RELEASE)) != PINNED_RELEASE_TEXT:

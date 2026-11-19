@@ -1,8 +1,9 @@
-"""ADR-0009 3d-i: a native Responses conversation saved by the older known release continues on the pinned runtime.
+"""ADR-0009 3d-i / M11 C5: a native Responses conversation saved by each older known release continues on the pin.
 
-``fixtures/native-responses-runtime-1.0.83/state`` is the local State store after one real turn:
-``native_responses_checkpoint_local.py`` run in a tree of e672599d (merge base) with SDK 1.0.13 and runtime 1.0.83.
-Its venv held this build's packages with only github-copilot-sdk at 1.0.13, which is that base's requirements-hosted.txt.
+``fixtures/native-responses-runtime-<runtime>/state`` is the local State store after one real turn:
+``native_responses_checkpoint_local.py`` run in a tree of that build with its SDK and runtime. 1.0.83: e672599d (merge
+base) with SDK 1.0.13; its venv held this build's packages with only github-copilot-sdk at 1.0.13, which is that base's
+requirements-hosted.txt. 1.0.103: main b5392911 with SDK 1.0.26, its body labeled v3.
 """
 import asyncio
 import json
@@ -11,6 +12,7 @@ import shutil
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from starlette.testclient import TestClient
 
 from shared_context.behavior_hosted import create_host
@@ -27,14 +29,17 @@ from test_native_auto_compaction import isolated
 from test_native_turn_wire import submit
 from test_native_turns import IDENTITY
 
-FIXTURE = Path(__file__).parent / "fixtures" / "native-responses-runtime-1.0.83"
+FIXTURES = Path(__file__).parent / "fixtures"
 FOLLOW_UP = "MARK-QUESTION-2: which shipment code did I give you?"
 REPLY = "MARK-ANSWER-2: AZ-7731."
 
 
-def test_a_responses_conversation_saved_by_runtime_1_0_83_continues_on_the_pinned_runtime(monkeypatch, runtime_path):
-    root = isolated(monkeypatch, "cross-version-responses")
-    shutil.copytree(FIXTURE / "state", root / "state")
+# The body keeps the profile its conversation was stored under: v2 for 1.0.83 (3d-i), v3 for 1.0.103.
+@pytest.mark.parametrize("saved_by, stored_profile", [("1.0.83", NATIVE_V2_PROFILE), ("1.0.103", NATIVE_V3_PROFILE)])
+def test_a_responses_conversation_saved_by_an_older_runtime_continues_on_the_pinned_runtime(
+        monkeypatch, runtime_path, saved_by, stored_profile):
+    root = isolated(monkeypatch, "xv-" + saved_by)
+    shutil.copytree(FIXTURES / ("native-responses-runtime-" + saved_by) / "state", root / "state")
     inputs, stops = [], []
 
     def provider(request):
@@ -77,14 +82,14 @@ def test_a_responses_conversation_saved_by_runtime_1_0_83_continues_on_the_pinne
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
         first = client.portal.call(runtime.read, "rid-1")
         old_ref, old_state = client.portal.call(checkpoint, first)
-        assert (old_ref.sdk_version, old_ref.runtime_version) in OLDER_RELEASES
+        assert (old_ref.sdk_version, old_ref.runtime_version) in OLDER_RELEASES and old_ref.runtime_version == saved_by
         assert old_ref.codec == "native-session-fs-responses-v1"
         saved = old_state.encoded().decode()
         assert ANSWER in saved
         assert not any(canary in saved for canary in ("PRIVATE_ENCRYPTED_REASONING_CANARY", "OFFLINE-native-MI", "nx-native-ckpt"))
 
         request = NativeSubmit(command=submit(rid="rid-2", cid=first.conversation_id, text=FOLLOW_UP).command,
-                               capture=first.capture, state_profile=NATIVE_V2_PROFILE)
+                               capture=first.capture, state_profile=stored_profile)
         accepted = client.post("/invocations", json=request.model_dump(mode="json"), headers={
             "x-client-fa-state-profile": NATIVE_V3_PROFILE, "x-agent-session-id": IDENTITY.session_id,
             "x-agent-invocation-id": "OFFLINE-platform-2", "x-agent-foundry-call-id": "OFFLINE-call-2"})

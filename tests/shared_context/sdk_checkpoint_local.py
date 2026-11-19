@@ -177,18 +177,24 @@ async def execute(root, phase, runtime):
         try:
             fs.snapshot()
         except Problem as error:
-            assert error.body["error"]["code"]=="SDK_STATE_PRIVATE_MATERIAL"
+            from shared_context import sdk_pin
+            from shared_context.behavior_sdk_compaction import UNDIAGNOSED_RUNTIMES
+            # Runtime 1.0.112 writes no private model snapshot for it; the uncontrolled compaction itself is refused.
+            code, blocked = (("SDK_STATE_SOURCE_UNVERIFIED", "unverified_source")
+                             if sdk_pin.RUNTIME_VERSION in UNDIAGNOSED_RUNTIMES else
+                             ("SDK_STATE_PRIVATE_MATERIAL", "private_material"))
+            assert error.body["error"]["code"]==code
             assert fs.files==before and (root/"create-reference.json").is_file()
             proof={"phase":phase,"python_pid":os.getpid(),"sdk_stop":result["sdk_stop"],
                 "sdk_session_id":sid,"conversation_id":cid,"native_compaction":native_compaction,
-                "checkpoint_status":"blocked_private_material","reference_published":False,
+                "checkpoint_status":"blocked_"+blocked,"reference_published":False,
                 "sdk_files_rewritten":False,"last_valid_checkpoint_retained":True,
                 "runtime_log_level":"error",
                 "offline_model_requests":len(calls),"tools":tools,"cloud_requests":0}
             (root/"compact-proof.json").write_text(json.dumps(proof,indent=2),encoding="utf-8")
             print(json.dumps(proof),flush=True)
             return
-        raise AssertionError("raw compaction model snapshots must not be published")
+        raise AssertionError("an uncontrolled compaction must not be published")
     assert any(private_system in text for text in fs.files.values()),"real SDK did not persist the private canary before filtering"
     state = fs.snapshot()
     assert private_system not in state.encoded().decode()

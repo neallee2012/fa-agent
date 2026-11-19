@@ -79,6 +79,8 @@ class SdkSessionFiles(SessionFsProvider):
         self._compaction_events = 0
         self._compaction_model_request = None
         self._auto_open = False
+        self._auto_attempt = None
+        self._auto_summarized = False
         self._inherited_compaction_ids = set()
         if state is not None and (state.codec in DIAG_CODECS or self.automatic):
             from .behavior_sdk_compaction import events_from
@@ -221,17 +223,36 @@ class SdkSessionFiles(SessionFsProvider):
                     directories=tuple(sorted(self.directories)), projected_event_ids=ids, model_provider=self.model_provider)
                 if self.compaction is not None:
                     validate_execution(events_from(state.files), self.compaction)
+                    from .behavior_sdk_compaction import UNDIAGNOSED_RUNTIMES, unverified
+                    from . import sdk_pin
+                    if not ids and sdk_pin.RUNTIME_VERSION not in UNDIAGNOSED_RUNTIMES:
+                        unverified()  # this turn's own compaction: its writer is the running runtime
             else:
                 if self.checkpoint_profile is not None:
                     from .behavior_sdk_compaction import automatic_pairs, events_from, COMPACTION_EVENTS, unverified
                     events = events_from(self.files)
                     if self.automatic:
-                        automatic_pairs(events)
+                        inherited = 0
+                        if self.previous is not None:
+                            from .behavior_checkpoint_privacy import public_events
+                            from .behavior_sdk_compaction import validate_inherited
+                            public, _ = public_events(self.files["events.jsonl"], model_provider=self.model_provider)
+                            validate_inherited(public, self.previous)  # the predecessor's events, unchanged and in order
+                            inherited = len(events_from(self.previous.files))
+                        automatic_pairs(events, inherited)
                     elif any(e["type"] in COMPACTION_EVENTS for e in events):
                         unverified()
                 state = SdkState(sdk_session_id=self.session_id, files=checkpoint_files(self.files,self._forbidden_values,
                     model_provider=self.model_provider), directories=tuple(sorted(self.directories)), model_provider=self.model_provider,
                     codec=RESPONSES_CODEC if self.model_provider == "openai-responses" else "session-fs-v1")
+                if self.checkpoint_profile is None:
+                    # No profile, no compaction of this turn's own. Runtime 1.0.112's carries no private model
+                    # snapshot for the privacy check above to refuse, so it is refused here.
+                    from .behavior_sdk_compaction import events_from, unverified
+                    prior = set() if self.previous is None else {e.get("id") for e in events_from(self.previous.files)}
+                    if any(e["type"].startswith("session.compaction") and e.get("id") not in prior
+                           for e in events_from(state.files)):
+                        unverified()
         except (ValueError, TypeError):
             raise Problem(409, "SDK_STATE_INCOMPLETE", "complete SDK filesystem state is unavailable") from None
         self.frozen = freeze
@@ -313,13 +334,23 @@ class SdkSessionFiles(SessionFsProvider):
             return
         if self.automatic:
             # The runtime's own threshold compaction: strictly start then complete; verified again at snapshot.
+            from .behavior_sdk_compaction import NOT_AUTOMATIC_TRIGGERS, SUMMARIZED, SUMMARIZED_RUNTIMES
+            from . import sdk_pin
+            if kind == SUMMARIZED:
+                if (sdk_pin.RUNTIME_VERSION not in SUMMARIZED_RUNTIMES or packet.get("ephemeral") is not True
+                        or not self._auto_open or self._auto_summarized or data.get("success") is not True
+                        or not isinstance(self._auto_attempt, str) or data.get("compactionAttemptId") != self._auto_attempt):
+                    self.checkpoint_error = "SDK_STATE_SOURCE_UNVERIFIED"
+                self._auto_summarized = True
+                return
             expected = "session.compaction_complete" if self._auto_open else "session.compaction_start"
-            from .behavior_sdk_compaction import NOT_AUTOMATIC_TRIGGERS
             if kind != expected or not isinstance(data.get("trigger"), str) or data["trigger"] in NOT_AUTOMATIC_TRIGGERS:
                 self.checkpoint_error = "SDK_STATE_SOURCE_UNVERIFIED"
             if data.get("customInstructions") not in (None, ""):
                 self.checkpoint_error = "SDK_STATE_PRIVATE_MATERIAL"
             self._auto_open = kind == "session.compaction_start"
+            self._auto_attempt = data.get("compactionAttemptId") if self._auto_open else None
+            self._auto_summarized = False
             return
         self._compaction_events += 1
         expected = ("session.compaction_start", "session.compaction_complete")

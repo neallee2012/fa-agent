@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from .behavior_wire import Digest, Identifier, WireModel
-from .sdk_pin import PROFILE_RELEASES
+from .sdk_pin import WIRE_RELEASE
 
 
 # ADR-0009 §3: the one profile whose material may be unlabeled. It is fixed, not ``NATIVE_STATE_PROFILE``: a v1 digest
@@ -17,9 +17,9 @@ NATIVE_V2_PROFILE = "foundry-native-v2"
 NATIVE_V3_PROFILE = "foundry-native-v3"
 # ADR-0009 3d-ii: the profile the API sends (and labels new material with) is v3; every 3d-i image accepts it.
 NATIVE_STATE_PROFILE = NATIVE_V3_PROFILE
-# ADR-0009 §3 (c): the (sdk, runtime) pair API-written material names follows the send profile, not this process's
-# pin: (1.0.26, 1.0.103) from 3d-ii. Records saved under the v2 pair still match (``behavior_wire.same_but_release``).
-SENT_RELEASE = PROFILE_RELEASES[NATIVE_STATE_PROFILE]
+# ADR-0009 M11 C1: the (sdk, runtime) pair API-written material names is the frozen wire pair, not this process's pin.
+# Records saved under the v2 pair still match (``behavior_wire.same_but_release``).
+SENT_RELEASE = WIRE_RELEASE
 NATIVE_RESPONSES_PROFILE = "foundry-responses-v1"
 # The template ``state_profile`` values a new selection may carry. A stored selection naming v2 is unaffected: its
 # same-RID replay and its stored template come before this check (``behavior_profile_selection``).

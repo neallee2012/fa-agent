@@ -4,12 +4,14 @@
 (d) the native checkpoint codecs this image reads. The snapshot is keyed by the profile this image declares and labels
 ``_Meta`` with (``RUNTIME_PROFILE``): a profile bump (ADR-0009 phase 2d) regenerates it by running only
 ``test_profile_snapshot_matches_the_current_profile`` with ``FA_REGENERATE_PROFILE_SNAPSHOT=1``, then reviews the diff.
+ADR-0009 M11 moved (c) out of the profile: the snapshot leaves the known SDK/runtime values out (``_release_neutral``),
+and ``test_sdk_pin`` with the cross-version resume tests hold the pin.
 
 ``NATIVE_STATE_PROFILE`` (the send profile) is v2 from 2d-ii and v3 from 3d-ii, while every DTO default
 (``default=UNLABELED_STATE_PROFILE, exclude_if=unlabeled_profile``) stays the unlabeled v1 profile, so stored v1 and
 unlabeled items still read as v1 and keep their bytes; 2d-i moved ``_Meta``'s label, and this snapshot's key, to v2,
 and 3d-i (SDK 1.0.26 / runtime 1.0.103) moves both to v3 while the send profile stays v2 until 3d-ii. From then the
-v2 baseline below compares only the wire, (a) and (b); this snapshot pins (c) and (d) (ADR-0009 §3).
+v2 baseline below compares only the wire, (a) and (b); this snapshot pins (d) (ADR-0009 §3, M11).
 
 JSON schema does not see ``exclude_if`` (which fields a dump leaves out); the profile-label tests below pin that part.
 
@@ -63,7 +65,7 @@ from shared_context.behavior_sdk_state import AUTO_PROFILE, NATIVE_CODECS, Check
 from shared_context.native_responses_wire import (
     NATIVE_V2_PROFILE, NATIVE_V3_PROFILE, UNLABELED_STATE_PROFILE, unlabeled_profile)
 from shared_context.native_turns import _decode, _json, _Meta
-from shared_context.sdk_pin import PROFILE_RELEASES
+from shared_context.sdk_pin import KNOWN_RELEASES, KnownRuntimeVersion, KnownSdkVersion
 from test_native_turn_wire import capture, submit
 
 SNAPSHOT = Path(__file__).parent / "fixtures" / "native_profile_snapshot.json"
@@ -112,9 +114,35 @@ def _schema(model, mode):
     return _shape(model.model_json_schema(mode=mode))
 
 
+# ADR-0009 M11 C4: a pure SDK bump only widens these two Literals (and moves the pin-valued defaults); the snapshot
+# leaves their values to test_sdk_pin and the cross-version resume tests.
+_KNOWN = {"<known-sdk>": set(typing.get_args(KnownSdkVersion)), "<known-runtime>": set(typing.get_args(KnownRuntimeVersion))}
+
+
+def _known_placeholder(node):
+    values = node.get("enum", [node["const"]] if "const" in node else None) if isinstance(node, dict) else None
+    return next((placeholder for placeholder, known in _KNOWN.items() if values is not None and set(values) == known),
+                None)
+
+
+def _release_neutral(node):
+    if isinstance(node, list):
+        return [_release_neutral(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    own = _known_placeholder(node)
+    placeholder = own or next(filter(None, map(_known_placeholder, node.get("anyOf", ()))), None)
+    out = {key: _release_neutral(value) for key, value in node.items() if not (own and key in {"enum", "const"})}
+    if own:
+        out["enum"] = [own]
+    if placeholder and out.get("default") in _KNOWN[placeholder]:
+        out["default"] = placeholder
+    return out
+
+
 def _model_shape(model):
     try:
-        return _digest({mode: _schema(model, mode) for mode in ("validation", "serialization")})
+        return _digest(_release_neutral({mode: _schema(model, mode) for mode in ("validation", "serialization")}))
     except Exception as error:  # a model without a JSON schema is still pinned by name and failure type
         return "no-json-schema:" + type(error).__name__
 
@@ -142,9 +170,9 @@ def current_snapshot():
     models = {key: _model_shape(model) for key, model in _collected().items()}
     return {
         "state_profile": RUNTIME_PROFILE,
-        "native_request": _digest(_shape(NATIVE_REQUEST.json_schema())),
+        "native_request": _digest(_release_neutral(_shape(NATIVE_REQUEST.json_schema()))),
         "models": dict(sorted(models.items())),
-        **_pins_and_codecs(),
+        "checkpoint": _pins_and_codecs()["checkpoint"],  # (c) the pin is test_sdk_pin's (ADR-0009 M11 C4)
     }
 
 
@@ -158,7 +186,7 @@ def test_profile_snapshot_matches_the_current_profile():
         "the snapshot belongs to another profile; regenerate it for the new profile (ADR-0009 §3)")
     changed = sorted(name for name in saved["models"].keys() | current["models"].keys()
                      if saved["models"].get(name) != current["models"].get(name))
-    changed += [part for part in ("native_request", "sdk", "checkpoint") if saved[part] != current[part]]
+    changed += [part for part in ("native_request", "checkpoint") if saved[part] != current[part]]
     assert not changed, (f"wire/state shapes changed under {RUNTIME_PROFILE}: {changed}; regenerate this snapshot if "
                          "test_v2_wire_is_additive_over_its_baseline passes, else bump the profile")
 
@@ -466,8 +494,13 @@ def wire_drift(h0, schema, classes, root_fields, root, prefix=""):
     return walk(root, schema, "", None, frozenset())
 
 
-# ADR-0009 3d-i's v3 values: 'foundry-native-v3' and SDK 1.0.26 / runtime 1.0.103.
-V3_ADDED = frozenset(f"enum value {value!r} added" for value in (NATIVE_V3_PROFILE, *PROFILE_RELEASES[NATIVE_V3_PROFILE]))
+# ADR-0009 3d-i's v3 values: 'foundry-native-v3' and SDK 1.0.26 / runtime 1.0.103; written out, since the pin moves on
+# while this stays what v3 added over the v2 baseline (M11 C4).
+V3_ADDED = frozenset(f"enum value {value!r} added" for value in (NATIVE_V3_PROFILE, "1.0.26", "1.0.103"))
+# ADR-0009 M11 C4: a pin newer than WIRE_RELEASE widens KnownSdkVersion/KnownRuntimeVersion. Its values reach the API
+# only in Hosted's own receipts (Guard B) and the Agent's state store (per-record 409 plus Guard A); API-sent template
+# settings name WIRE_RELEASE only (``behavior_profile_selection``), so they pass where v3's release values pass.
+M11_RELEASES_ADDED = frozenset(f"enum value {value!r} added" for pair in KNOWN_RELEASES for value in pair) - V3_ADDED
 SENT_TEMPLATE_SETTINGS = re.compile(r"\.settings<TemplateSettings>\.(sdk_version|runtime_version|state_profile)$")
 SENT_BODY_PROFILE = re.compile(r"NATIVE_REQUEST\[\w+\]<\w+>\.state_profile")
 
@@ -484,7 +517,7 @@ def _v3_value_old_images_never_receive(problem):
     ``native_routines``); the 3d-ii API sends v3, but only once its deploy gate finds no v2 SID serving, so no v2 image
     receives it. Any other request position fails."""
     where, _, change = problem.partition(": ")
-    if change not in V3_ADDED:
+    if change not in V3_ADDED | M11_RELEASES_ADDED:
         return False
     return (not where.startswith("NATIVE_REQUEST") or SENT_TEMPLATE_SETTINGS.search(where) is not None
             or SENT_BODY_PROFILE.fullmatch(where) is not None and change == f"enum value {NATIVE_V3_PROFILE!r} added")
@@ -611,28 +644,30 @@ def test_the_h0_and_v2_baselines_ignore_the_regenerate_flag(monkeypatch, tmp_pat
     assert (H0_FIXTURE.read_bytes(), V2_BASELINE.read_bytes()) == before
 
 
-def test_a_pin_or_codec_change_fails(monkeypatch, tmp_path):
-    """Under the baseline's own profile ``v2_drift`` refuses it; once the image declares a newer profile (ADR-0009
-    3d-i) the baseline compares wire only and the profile snapshot refuses it instead."""
+def test_a_codec_change_fails_and_a_pin_change_alone_does_not(monkeypatch, tmp_path):
+    """Under the baseline's own profile ``v2_drift`` refuses either; once the image declares a newer profile (ADR-0009
+    3d-i) the baseline compares wire only and the profile snapshot refuses a codec change. A pin change alone keeps the
+    profile (ADR-0009 M11): test_sdk_pin and the cross-version resume tests hold it instead."""
     monkeypatch.delenv("FA_REGENERATE_PROFILE_SNAPSHOT", raising=False)
     bumped = tmp_path / "requirements-hosted.txt"
     bumped.write_text(re.sub(r"(?m)^(github-copilot-sdk==)\S+", r"\g<1>0.0.0",
                              HOSTED_REQUIREMENTS.read_text(encoding="utf-8")), encoding="utf-8")
 
-    def refused(part):
-        with pytest.raises(AssertionError, match=f"'{part}'"):
-            test_profile_snapshot_matches_the_current_profile()
+    def under_v2(part):
         assert v2_drift() == []
         monkeypatch.setitem(globals(), "RUNTIME_PROFILE", NATIVE_V2_PROFILE)
         # The bumped pin itself differs from the v2 baseline, so "sdk changed" may come with it.
         assert f"{part} changed" in [problem.partition(":")[0] for problem in v2_drift()]
 
     monkeypatch.setitem(globals(), "HOSTED_REQUIREMENTS", bumped)
-    refused("sdk")
+    test_profile_snapshot_matches_the_current_profile()
+    under_v2("sdk")
     monkeypatch.undo()
     monkeypatch.delenv("FA_REGENERATE_PROFILE_SNAPSHOT", raising=False)
     monkeypatch.setitem(NATIVE_CODECS, "fa-h0-extra-codec", next(iter(NATIVE_CODECS.values())))
-    refused("checkpoint")
+    with pytest.raises(AssertionError, match="'checkpoint'"):
+        test_profile_snapshot_matches_the_current_profile()
+    under_v2("checkpoint")
 
 
 # 2026-10-17 (ADR-0009 §3, M7): the v2 wire is additive-only over its baseline, by H0's comparator made stricter.
@@ -716,6 +751,11 @@ def test_a_v3_value_passes_only_where_no_v2_image_receives_it(monkeypatch):
                f"{request}.source<NativeAgentOrigin>.state_profile: enum value 'foundry-native-v3' added",
                "behavior_sdk_state.SdkState.sdk_version: enum value '1.0.27' added"]
     assert _unlisted(passing + failing) == failing
+    from shared_context.sdk_pin import RUNTIME_VERSION, SDK_VERSION
+    pin = [f"enum value {value!r} added" for value in (SDK_VERSION, RUNTIME_VERSION)]
+    assert _unlisted([f"behavior_sdk_state.SdkState.sdk_version: {pin[0]}", f"{settings}.runtime_version: {pin[1]}"]) == []
+    assert _unlisted([f"{request}.capture<NativeTurnCapture>.sdk_version: {pin[0]}"]) == [
+        f"{request}.capture<NativeTurnCapture>.sdk_version: {pin[0]}"]
     # A real widening: a request's own state_profile gaining an SDK version string is caught.
     submit_model = behavior_native_turn_wire.NativeSubmit
     widened = _widened(submit_model, state_profile=(

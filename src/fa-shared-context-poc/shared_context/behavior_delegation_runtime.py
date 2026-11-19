@@ -85,6 +85,7 @@ class SdkDelegationRuntime(ABC):
         self.before_prepare = before_prepare
         self.read_user_files = read_user_files
         self.starts = {}
+        self._not_started = set()
         self.children: dict[str, _Child] = {}
         self._pending = set()
         self.failure = None
@@ -153,7 +154,7 @@ class SdkDelegationRuntime(ABC):
 
     def _record_task_start(self, data):
         identity = _field(data, "tool_call_id", "toolCallId")
-        if isinstance(identity, str):
+        if isinstance(identity, str) and identity not in self._not_started:
             arguments = data.get("arguments")
             self.starts[identity] = (arguments if identity not in self.starts or self.starts[identity] == arguments
                                      else None)
@@ -261,6 +262,8 @@ class SdkDelegationRuntime(ABC):
     def _denied(self, command, reason, message):
         # Nothing ran for this call: forget its start so a retry with the same arguments stays unambiguous.
         self.starts.pop(command.tool_call_id, None)
+        # Runtime 1.0.112 may report its start after this hook; that late start must not bring it back.
+        self._not_started.add(command.tool_call_id)
         return self._refused(reason, message)
 
     async def pre_tool(self, data, context):
@@ -275,10 +278,14 @@ class SdkDelegationRuntime(ABC):
             task = DelegationTask.model_validate(data.get("toolArgs"))
         except ValueError:
             return self._refused("unsupported_arguments", not_started("unsupported_arguments", _ARGUMENTS))
+        named = data.get("toolCallId") if isinstance(data.get("toolCallId"), str) else None
+        if named:
+            # SDK 1.0.34 names the call in the hook; runtime 1.0.112 may call it before tool.execution_start.
+            self._record_task_start({"toolCallId": named, "arguments": data.get("toolArgs")})
         candidates = [identity for identity, arguments in self.starts.items()
                       if arguments == data.get("toolArgs")]
-        if len(candidates) != 1:
-            reason = "tool_call_unmatched" if not candidates else "tool_call_ambiguous"
+        if len(candidates) != 1 or named and candidates != [named]:
+            reason = "tool_call_ambiguous" if len(candidates) > 1 else "tool_call_unmatched"
             return self._refused(reason, not_started(reason, " Give each subtask its own distinct prompt."))
         command = DelegationPrepare(tool_call_id=candidates[0], arguments=task)
         if len(command.model_dump_json().encode("utf-8")) > DELEGATION_PREPARE_BYTES:

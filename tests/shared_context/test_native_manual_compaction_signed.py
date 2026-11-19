@@ -62,3 +62,25 @@ def test_short_native_manual_compaction_keeps_signed_metadata_and_inherited_rest
     assert all(e["data"] == {} for e in events_from(compacted.files)
                if e["type"] in {"model.model_call_success", "model.messages_snapshot"})
     assert len(originals) == 3
+
+
+def test_a_summary_that_copies_the_system_prompt_is_never_saved(monkeypatch, runtime_path):
+    """Runtime 1.0.112 writes no model.* events for a manual compaction, so they name no private text; the system
+    prompt the same run writes to events.jsonl is the needle instead, and an exact copy in the summary is refused."""
+    def provider(calls, turn):
+        def respond(request):
+            messages = json.loads(request.content)["messages"]
+            compaction = "Please create a detailed summary of the conversation so far" in json.dumps(messages)
+            calls.append(compaction)
+            system = next(message["content"] for message in messages if message["role"] == "system")
+            reply = ("<overview>" + system + "</overview><checkpoint_title>Public conversation</checkpoint_title>"
+                     if compaction else REPLIES[turn() - 1])
+            return completion_stream(len(calls), {"role": "assistant", "content": reply}, "stop", prompt_tokens=100)
+        return respond
+
+    calls, receipts, saved, _ = run_turns(monkeypatch, runtime_path, "manual-private-summary", [manual_capture()] * 2,
+                                          paragraphs=1, provider=provider)
+    assert calls == [False, True, False]
+    assert receipts == [("completed", None, 1), ("unknown", "SDK_STATE_PRIVATE_MATERIAL", 2)]
+    # The last legal checkpoint stays the ordinary turn-1 state.
+    assert [ref.codec for ref, _ in saved] == ["native-session-fs-v1"]

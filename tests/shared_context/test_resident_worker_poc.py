@@ -42,7 +42,8 @@ def test_saved_release_passes_the_real_native_startup_readers(stored_turn):
     assert profile_from_template(c.control.policy, selected.command.template).worker_profile == POC
     after_exit = readers(c)
     assert after_exit[0] == "ok"
-    released = wire.AssistantSdkStop(pid=99, release=POC)
+    # The stored rows were recorded on runtime 1.0.103; the stop keeps the release that wrote it.
+    released = wire.AssistantSdkStop(pid=99, release=POC, runtime_version="1.0.103")
     # The release turn followed the exit turn on the same store.
     c = stored_turn("synthetic-release")
     row_key = key("text-archive", c.turn.binding.job_id)

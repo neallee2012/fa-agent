@@ -52,6 +52,7 @@ from shared_context.behavior_capabilities import (
 from shared_context.errors import Problem
 from shared_context.m3_auth import HumanApprover
 from shared_context.m3_models import ApprovalInput, CreateArtifact, VersionInput
+from shared_context.sdk_pin import PINNED_RELEASE_TEXT
 from shared_context.tool_catalog import build_catalog, load_catalog
 from hosted_versions_stub import deployed_versions
 from sdk_checkpoint_local import sse
@@ -161,6 +162,7 @@ def integrated(request, local_env, monkeypatch, tmp_path, runtime_path, signing_
     )
     with monkeypatch.context() as environment:
         environment.setenv("FA_NATIVE_TURNS", NATIVE_V3_PROFILE)
+        environment.setenv("FA_SDK_RELEASE", PINNED_RELEASE_TEXT)
         environment.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-factory-configuration")
         environment.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
         environment.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(runtime_path))
@@ -169,6 +171,7 @@ def integrated(request, local_env, monkeypatch, tmp_path, runtime_path, signing_
     monkeypatch.setenv("FOUNDRY_AGENT_SESSION_ID", target.session_id)
     monkeypatch.setenv("FOUNDRY_AGENT_NAME", target.agent_name)
     monkeypatch.setenv("FA_NATIVE_TURNS", NATIVE_V3_PROFILE)
+    monkeypatch.setenv("FA_SDK_RELEASE", PINNED_RELEASE_TEXT)
 
     api = api_application(composition)
     api_calls, bindings, closed, sdk_calls, sdk_outcomes, errors = [], [], [], [], [], []

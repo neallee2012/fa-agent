@@ -36,7 +36,10 @@ def test_real_sdk_large_tool_state_survives_a_new_client_and_process(tmp_path):
     assert (tmp_path/"create-reference.json").is_file(), "last valid checkpoint was removed"
     compacted=json.loads((tmp_path/"compact-proof.json").read_bytes())
     assert compacted["native_compaction"] and compacted["native_compaction"][-1]["success"] is True
-    assert compacted["checkpoint_status"]=="blocked_private_material"
+    from shared_context import sdk_pin
+    from shared_context.behavior_sdk_compaction import UNDIAGNOSED_RUNTIMES
+    assert compacted["checkpoint_status"]==("blocked_unverified_source" if sdk_pin.RUNTIME_VERSION in UNDIAGNOSED_RUNTIMES
+                                            else "blocked_private_material")
     assert not compacted["reference_published"] and not compacted["sdk_files_rewritten"]
     assert compacted["last_valid_checkpoint_retained"]
     assert (tmp_path/"create-reference.json").read_bytes()==original_reference

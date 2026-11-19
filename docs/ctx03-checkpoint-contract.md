@@ -22,7 +22,7 @@
 
 | 項目 | 本版契約的第一個適用範圍 |
 |---|---|
-| SDK／runtime | 執行時精確固定 Python SDK `1.0.26`／runtime `1.0.103`（`shared_context/sdk_pin.py`；2026-11-03 前是 `1.0.13`／`1.0.83`）；讀取時接受這個 build 的 `KNOWN_RELEASES`，每加一個舊版本都要有本版 runtime 接續該版存檔的測試；不接受相容版本推定（2026-11-02 Neal：SDK 版本是平台事實） |
+| SDK／runtime | 執行時精確固定 Python SDK `1.0.34`／runtime `1.0.112`（`shared_context/sdk_pin.py`；2026-11-19 前是 `1.0.26`／`1.0.103`，2026-11-03 前是 `1.0.13`／`1.0.83`）；讀取時接受這個 build 的 `KNOWN_RELEASES`，每加一個舊版本都要有本版 runtime 接續該版存檔的測試；不接受相容版本推定（2026-11-02 Neal：SDK 版本是平台事實） |
 | 已有實驗平台 | Windows x64；不同 Python／runtime process，同 SDK session／conversation |
 | 已有模型傳輸證據 | Offline OpenAI-compatible completions fixture；配置的模型名稱不是實際模型品質證明 |
 | 已驗 compaction 呼叫 | 原 default-positive 使用無參數 `history.compact()`；此歷史結果保留，不回填新的 trigger |
@@ -185,7 +185,9 @@ reader 只補和原 session.start、index/path/number精確吻合的格式，摘
 
 **2026-11-03（ADR-0009 3d-i）：** 固定版本換成 SDK `1.0.26`／runtime `1.0.103`，`KNOWN_RELEASES` 另含 (`1.0.13`, `1.0.83`)。紀錄裡的版本必須是其中**一整組**，`("1.0.26", "1.0.83")` 這類混搭一律拒絕（`behavior_wire.known_release`）；checkpoint 參照照 state 的那一組寫，載入時兩者必須相同。runtime 1.0.103 接續 1.0.83 存檔由 `test_sdk_checkpoint_cross_version_native.py` 驗（本機 runtime、離線 provider），拿掉這一組時同一份存檔在解析時被拒。
 
-新格式沿用 SDK／runtime version、SDK session、完整 `files`／`directories` 及現有 reference 的 tenant／team／agent／conversation／job／artifact／hash／parts 綁定；另保存有序的 `projected_event_ids`。Codec 名稱決定投影規則版本，不另加可由呼叫者自由選取的任意 filter。
+**2026-11-19（ADR-0009 M11 第一次一步升級，CODE/offline，未部署）：** 固定版本換成 SDK `1.0.34`／runtime `1.0.112`，`KNOWN_RELEASES` 另含 (`1.0.13`, `1.0.83`) 與 (`1.0.26`, `1.0.103`)。換固定版本不再換 Hosted state profile：API 寫進 template settings 與提示組裝紀錄的是凍結的 `WIRE_RELEASE`（1.0.26／1.0.103），它永遠留在 `KNOWN_RELEASES`；checkpoint、SDK 狀態與回條照舊標實際寫入的那一組。runtime 1.0.112 接續 1.0.83 與 1.0.103 存下的 CTX-03 checkpoint 與 native Responses 對話，由兩個跨版本測試逐一驗（本機 Windows runtime、離線 provider，兩份舊存檔也都是在 Windows 上產生的），這兩份存檔不必改 codec 就能接續；FA 舊版在 Linux 存下的 host cwd，只用把 1.0.112 存檔的 cwd 改寫成 host 路徑的存檔驗過（`test_sdk_workspace_root_native.py`），真 1.0.83 Linux 存檔未驗。runtime 1.0.112 改了 compaction 事件，codec 依**寫入事件的 runtime 版本**對 1.0.112 加三條規則，其他版本照舊：(1) 自動 compaction 收同一 attempt 的 `session.compaction_summarized`；它是 ephemeral、不進 events.jsonl，寫入者就是執行中的 runtime。(2) 摘要請求本身放不下時失敗的 `turn_blocking` 配對（不換歷史，之後截斷）：本回合新寫的，要執行中的 runtime 是 1.0.112；前一份存檔原樣留下的，寫入當時已照寫入者認過，只再驗形狀。(3) 手動 compaction 沒有 `model.*` 診斷時，以 complete 事件的 `execution=direct`、`requestCount`＝1 與 `clientRequestId` 證明只有一次請求，缺一項仍 `SDK_STATE_SOURCE_UNVERIFIED`；做 compaction 的那一回合存檔時，執行中的 runtime 必須是 1.0.112（精確，這是主要檢查）。載入時存檔只標最後寫入者、看不出是哪一版寫的，所以只做不精確的第二道：存檔標的版本（已知版本）不早於 1.0.112，形狀也完全符合，才收；不看 `session.start` 的版本（真 runtime 1.0.83 在那裡寫 `0.0.0`）。這樣放寬，損失只在同 Team 的 VM 竄改存檔這個情境；依 ADR-0006，同 Team 本來就互信。細節見 [README](../src/fa-shared-context-poc/README.md#sdk-1034-m11)。
+
+新格式沿用 SDK／runtime version、SDK session、完整 `files`／`directories` 及現有 reference 的 tenant／team／agent／conversation／job／artifact／hash／parts 綁定；另保存有序的 `projected_event_ids`。Codec 名稱決定投影規則版本，不另加可由呼叫者自由選取的任意 filter。同一個 codec 內，可以依**寫入事件的 runtime 版本**新增可認得的正式形狀，只增不減：較舊的 image 不認得新 runtime 版本，解析時就明確拒絕（`literal_error`）並保留最後合法狀態（`test_sdk_compaction_runtime_1_0_112.py` 用本分支程式把 pin 改回 1.0.26／1.0.103 模擬，沒有用真正的舊 image 程式驗；推論結果相同，因為 Literal 檢查在讀事件之前），所以不必換 codec 或 profile。只有新形狀無法依寫入版本判別，或舊 image 可能錯收時，才換 codec，並照 ADR-0009 換 profile（總協調 2026-11-19 決定，Neal 同意升級；第一次用於 runtime 1.0.112，見上方 2026-11-19 段）。
 
 伺服器必須從**已批准的部署／工作配置**決定可用 codec 與 producer／consumer profile，不能只信 upload body 自稱的版本或安全性。Hosted Adapter 的固定 SDK guard、API 的 scope／格式驗證與正式接線驗收各負其責；API 不為重新驗 raw shape 而要求上傳已禁止的原文。
 

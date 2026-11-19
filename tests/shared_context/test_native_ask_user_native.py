@@ -1,4 +1,4 @@
-"""B1 PA-11 on the pinned SDK 1.0.26 / runtime 1.0.103: ask_user reaches the turn's wait and its answer the model."""
+"""B1 PA-11 on the pinned SDK/runtime: ask_user reaches the turn's wait and its answer the model."""
 
 import asyncio
 import json
@@ -25,7 +25,10 @@ class Wait:
         pass
 
     async def user_input(self, request, invocation):
-        self.asked.append((dict(request), invocation))
+        request = dict(request)
+        # SDK 1.0.34 adds the runtime's pending-input id; NativeHitlRuntime.user_input does not read it.
+        assert isinstance(request.pop("requestId"), str)
+        self.asked.append((request, invocation))
         return {"answer": "blue", "wasFreeform": False}
 
 

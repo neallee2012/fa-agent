@@ -80,6 +80,139 @@ def test_reused_start_id_with_different_arguments_is_never_a_new_dispatch():
     run(scenario())
 
 
+def test_a_hook_that_names_its_call_is_reserved_under_that_id_before_the_start_event_arrives():
+    """SDK 1.0.34 puts toolCallId in the pre-tool hook; runtime 1.0.112 may call it before tool.execution_start."""
+    async def scenario():
+        prepared = []
+
+        async def api(action, command):
+            prepared.append((action, command.tool_call_id))
+            return reply(tool_call_id=command.tool_call_id, fresh=True)
+
+        async def current():
+            return True
+        bridge = DelegationRuntime("parent-job", "parent-sdk", api, current)
+        hook = {"sessionId": "parent-sdk", "toolName": "task", "toolCallId": "original-call", "toolArgs": TASK}
+        response = await bridge.pre_tool(hook, {"session_id": "parent-sdk"})
+        assert response["permissionDecision"] == "allow" and prepared[0] == ("prepare", "original-call")
+        bridge.observe(event("tool.execution_start", "late-start",
+                             {"toolName": "task", "toolCallId": "original-call", "arguments": TASK}))
+        assert bridge.starts == {"original-call": TASK}
+    run(scenario())
+
+
+def test_a_hook_whose_named_call_started_with_other_arguments_is_denied():
+    async def scenario():
+        calls = []
+
+        async def api(*args):
+            calls.append(args)
+
+        async def current():
+            return True
+        bridge = DelegationRuntime("parent-job", "parent-sdk", api, current)
+        bridge.observe(event("tool.execution_start", "start",
+                             {"toolName": "task", "toolCallId": "original-call", "arguments": TASK}))
+        other = {**TASK, "prompt": "Different content under the original ID."}
+        denied = await bridge.pre_tool({"sessionId": "parent-sdk", "toolName": "task", "toolCallId": "original-call",
+                                        "toolArgs": other}, {"session_id": "parent-sdk"})
+        assert denied["permissionDecision"] == "deny" and calls == []
+        # A named second call with an earlier call's arguments stays ambiguous, as without the id.
+        bridge.observe(event("tool.execution_start", "first-start",
+                             {"toolName": "task", "toolCallId": "first-call", "arguments": TASK}))
+        repeated = await bridge.pre_tool({"sessionId": "parent-sdk", "toolName": "task", "toolCallId": "second-call",
+                                          "toolArgs": TASK}, {"session_id": "parent-sdk"})
+        assert "[tool_call_ambiguous]" in repeated["permissionDecisionReason"] and calls == []
+    run(scenario())
+
+
+def test_a_late_start_event_of_a_call_denied_by_its_hook_does_not_make_the_retry_ambiguous():
+    async def scenario():
+        prepared, checks = [], []
+
+        async def api(action, command):
+            prepared.append((action, command.tool_call_id))
+            return reply(tool_call_id=command.tool_call_id, fresh=True)
+
+        async def current():
+            checks.append(True)
+            return len(checks) > 1
+        bridge = DelegationRuntime("parent-job", "parent-sdk", api, current)
+        hook = {"sessionId": "parent-sdk", "toolName": "task", "toolArgs": TASK}
+        denied = await bridge.pre_tool({**hook, "toolCallId": "first-call"}, {"session_id": "parent-sdk"})
+        assert "[current_authority_denied]" in denied["permissionDecisionReason"] and prepared == []
+        bridge.observe(event("tool.execution_start", "late-start",
+                             {"toolName": "task", "toolCallId": "first-call", "arguments": TASK}))
+        retried = await bridge.pre_tool({**hook, "toolCallId": "retry-call"}, {"session_id": "parent-sdk"})
+        assert retried["permissionDecision"] == "allow" and prepared[0] == ("prepare", "retry-call")
+    run(scenario())
+
+
+def test_the_operation_guard_ignores_a_late_start_event_of_a_call_its_hook_refused():
+    from shared_context.native_operations import NativeOperationGuard
+
+    async def scenario():
+        receipt = SimpleNamespace(request_id="parent-rid", continuation=None)
+        guard = NativeOperationGuard(SimpleNamespace(receipt=receipt), {"task": "a" * 64})
+        guard.sdk_session_id = "parent-sdk"
+        prepared, decisions = [], [{"permissionDecision": "deny"}, {"permissionDecision": "allow"}]
+
+        async def prepare(packet):
+            prepared.append(packet["tool_call_id"])
+            return "execute"
+
+        async def ignore(*args):
+            return None
+        guard.prepare, guard.dispatched, guard.refused = prepare, ignore, ignore
+
+        async def original(data, context):
+            return decisions.pop(0)
+        hook = {"sessionId": "parent-sdk", "toolName": "task", "toolArgs": TASK}
+        first = await guard.pre_tool({**hook, "toolCallId": "first-call"}, {"session_id": "parent-sdk"}, original)
+        guard.observe({"type": "tool.execution_start",
+                       "data": {"tool_name": "task", "tool_call_id": "first-call", "arguments": TASK}})
+        retried = await guard.pre_tool({**hook, "toolCallId": "retry-call"}, {"session_id": "parent-sdk"}, original)
+        return first, retried, prepared
+    first, retried, prepared = run(scenario())
+    assert first == {"permissionDecision": "deny"} and retried == {"permissionDecision": "allow"}
+    assert prepared == ["first-call", "retry-call"]
+
+
+@pytest.mark.parametrize(("named", "earlier"), [(True, False), (False, False), (True, True)],
+                         ids=["hook-names-call", "hook-without-call-id", "same-arguments-as-an-earlier-call"])
+def test_the_operation_guard_matches_a_task_hook_by_its_own_call_id_before_the_start_event(named, earlier):
+    from shared_context.native_operations import NativeOperationGuard
+
+    async def scenario():
+        receipt = SimpleNamespace(request_id="parent-rid", continuation=None)
+        guard = NativeOperationGuard(SimpleNamespace(receipt=receipt), {"task": "a" * 64})
+        guard.sdk_session_id = "parent-sdk"
+        if earlier:
+            guard.observe({"type": "tool.execution_start",
+                           "data": {"tool_name": "task", "tool_call_id": "earlier-call", "arguments": TASK}})
+        prepared, dispatched = [], []
+
+        async def prepare(packet):
+            prepared.append(packet["tool_call_id"])
+            return "execute"
+
+        async def mark(packet):
+            dispatched.append(packet["tool_call_id"])
+        guard.prepare, guard.dispatched = prepare, mark
+
+        async def original(data, context):
+            return {"permissionDecision": "allow"}
+        hook = {"sessionId": "parent-sdk", "toolName": "task", "toolArgs": TASK,
+                **({"toolCallId": "original-call"} if named else {})}
+        return await guard.pre_tool(hook, {"session_id": "parent-sdk"}, original), prepared, dispatched, guard.direct
+    decision, prepared, dispatched, direct = run(scenario())
+    if named and not earlier:
+        assert decision == {"permissionDecision": "allow"}
+        assert prepared == dispatched == ["original-call"] and direct == {"original-call"}
+    else:
+        assert decision["permissionDecision"] == "deny" and prepared == [] and direct == set()
+
+
 def reply(**updates):
     return DelegationReply(parent_job_id="parent-job", sdk_session_id="parent-sdk",
         delegation_id="original-delegation", tool_call_id="original-call",

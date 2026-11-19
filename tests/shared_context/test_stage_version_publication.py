@@ -249,6 +249,15 @@ def test_seed_matches_the_complete_definition_not_an_older_same_build_flag_set()
     assert desired["environment_variables"]["FA_NATIVE_HITL_ENABLED"] == "1"
 
 
+def test_a_seed_version_declares_the_pair_its_image_runs():
+    """ADR-0009 M11 C6: an undeclared definition is taken for 1.0.26/1.0.103, so a newer image under it would not start."""
+    from shared_context.sdk_pin import PINNED_RELEASE_TEXT, RELEASE_ENV
+    module = stage_module("seed_agents.py")
+    for agent in module.STAGE["agents"]:
+        desired = module.definition(agent, "registry.invalid/agent@sha256:" + "a" * 64)
+        assert desired["environment_variables"][RELEASE_ENV] == PINNED_RELEASE_TEXT, agent["name"]
+
+
 def test_console_overlay_over_a_first_install_replaces_each_flag_once(monkeypatch):
     # azd's first install sets these through web-console.bicep; the first upgrade then overlays the same names.
     module = stage_module()

@@ -502,10 +502,11 @@ def test_each_turn_of_one_native_conversation_sends_its_own_models_declared_capa
     assert receipts == [("completed", None, number) for number in (1, 2, 3)]
     assert sent == [(1, "OFFLINE-first", 512), (2, "OFFLINE-second", 1024), (3, "OFFLINE-unknown-context", 768)]
     # What each turn hands the SDK: that model's own prompt and context limits, none carried over from the last model.
+    # SDK 1.0.34 writes them in snake_case, the keys of runtime 1.0.112's ModelCapabilitiesOverrideLimits schema.
     assert wire == [
-        ("OFFLINE-first", {"limits": {"maxPromptTokens": 60000, "maxOutputTokens": 512,
-                                      "maxContextWindowTokens": 70000}}),
-        ("OFFLINE-second", {"limits": {"maxPromptTokens": 14000, "maxOutputTokens": 1024,
-                                       "maxContextWindowTokens": 20000}}),
-        ("OFFLINE-unknown-context", {"limits": {"maxOutputTokens": 768}}),
+        ("OFFLINE-first", {"limits": {"max_prompt_tokens": 60000, "max_output_tokens": 512,
+                                      "max_context_window_tokens": 70000}}),
+        ("OFFLINE-second", {"limits": {"max_prompt_tokens": 14000, "max_output_tokens": 1024,
+                                       "max_context_window_tokens": 20000}}),
+        ("OFFLINE-unknown-context", {"limits": {"max_output_tokens": 768}}),
     ]

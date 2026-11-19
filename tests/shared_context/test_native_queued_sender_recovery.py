@@ -17,6 +17,7 @@ from shared_context.native_agent_tools import NativeAgentRelayClient, _WaitingEn
 from shared_context.native_effects import NativeEffects
 from shared_context.native_operations import NativeOperationGuard
 from shared_context.native_turns import NativeTurnRuntime
+from shared_context.sdk_pin import PINNED_RELEASE_TEXT
 from test_native_agent_client import token
 from test_native_responses import ResponsesHarness, build_responses_host, response_submit
 from test_native_responses_relay import fast_follow, task_results, task_runs
@@ -47,6 +48,7 @@ def test_production_factory_binds_queue_recovery_to_its_own_sender(local_env, tm
 
     monkeypatch.setattr(NativeAgentRelayClient, "recover_queued", observed)
     monkeypatch.setenv("FA_NATIVE_TURNS", "foundry-native-v3")
+    monkeypatch.setenv("FA_SDK_RELEASE", PINNED_RELEASE_TEXT)
     monkeypatch.setenv("FOUNDRY_HOSTING_ENVIRONMENT", "OFFLINE-platform")
     monkeypatch.setenv("AGENTSERVER_TASKS_BACKEND", "hosted")
     monkeypatch.setenv("BEHAVIOR_ASSISTANT_RUNTIME_PATH", str(executable))

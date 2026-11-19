@@ -54,7 +54,7 @@ class TemplateRole(WireModel):
 
 
 class TemplateSettings(WireModel):
-    sdk_version: KnownSdkVersion = SENT_RELEASE[0]  # API-written: the send profile's pair (ADR-0009 §3 (c))
+    sdk_version: KnownSdkVersion = SENT_RELEASE[0]  # API-written: the frozen wire pair (ADR-0009 M11)
     runtime_version: KnownRuntimeVersion = SENT_RELEASE[1]
     _release = model_validator(mode="after")(known_release)
     mode: Literal["empty"] = "empty"

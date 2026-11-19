@@ -31,6 +31,7 @@ from deployment_config import load_config, write_x as _write_x
 
 sys.path.insert(0, str(HERE.parents[1] / "src" / "fa-shared-context-poc"))
 from shared_context.behavior_agent_versions import METADATA_DEFINITION, definition_matches, definition_sha256
+from shared_context.sdk_pin import PINNED_RELEASE_TEXT, RELEASE_ENV
 
 STAGE = None  # the selected profile, loaded by main() from --config or FA_DEPLOY_CONFIG
 PROTOCOLS = [{"protocol": name, "version": "2.0.0"} for name in ("invocations", "invocations_ws", "responses")]
@@ -55,7 +56,9 @@ def definition(agent, image):
         "container_configuration": {"image": image},
         "cpu": "2",
         "memory": "4Gi",
-        "environment_variables": {**_env(agent["kind"]), **agent.get("hosted_environment", {})},
+        # ADR-0009 M11 C6: the pair this image runs, as sync declares it; undeclared reads as 1.0.26/1.0.103.
+        "environment_variables": {**_env(agent["kind"]), **agent.get("hosted_environment", {}),
+                                  RELEASE_ENV: PINNED_RELEASE_TEXT},
         "protocol_versions": PROTOCOLS,
         "session_configuration": {"idle_timeout_seconds": STAGE["hosted_idle_timeout_seconds"]},
     }

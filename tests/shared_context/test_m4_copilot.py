@@ -179,6 +179,56 @@ def test_reply_hook_sees_final_parts_before_the_runtime_stops_and_never_changes_
                       if hook_fails else [])
 
 
+@pytest.mark.parametrize("refusal", ["success-false", "json-rpc-error"])
+def test_a_verbosity_the_runtime_refuses_only_logs_and_the_turn_goes_on(tmp_path, monkeypatch, caplog, refusal):
+    """Runtime 1.0.103 answered success=false; 1.0.112 raised JSON-RPC -32602 for an invalid value (``ultra``). SDK
+    1.0.31's release notes say a verbosity the model does not support is refused too; no tried model refused low or
+    medium. Either way the answer is only longer than asked, so the turn completes."""
+    from copilot import JsonRpcError
+
+    async def refuse(params):
+        if refusal == "json-rpc-error":
+            raise JsonRpcError(-32602, "Unsupported verbosity 'medium' for this model.")
+        return SimpleNamespace(success=False)
+
+    class FakeSession:
+        session_id = "same-sdk-session"
+        rpc = SimpleNamespace(options=SimpleNamespace(update=refuse))
+
+        async def send_and_wait(self, prompt, timeout):
+            return SimpleNamespace(data=SimpleNamespace(content="synthetic completion"))
+
+        async def get_events(self):
+            return []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def start(self):
+            pass
+
+        async def create_session(self, session_id, **options):
+            return FakeSession()
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setattr("shared_context.m2_copilot.CopilotClient", FakeClient)
+    work = tmp_path / "work"
+    work.mkdir()
+    with caplog.at_level(logging.WARNING, logger="shared_context.m2_copilot"):
+        result = asyncio.run(run_copilot(
+            state_dir=tmp_path / "sdk", working_directory=work, sdk_session_id="same-sdk-session", resume=False,
+            prompt="Read context.", tools=[], api_url="https://context.invalid",
+            token_provider=lambda: "synthetic-api-token", on_event=lambda event: None, runtime_path=Path(__file__),
+            http_transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+        ))
+    assert result["final_message"] == "synthetic completion"
+    assert [record.getMessage() for record in caplog.records if "VERBOSITY" in record.getMessage()] == [
+        "SDK_VERBOSITY_NOT_APPLIED"]
+
+
 @pytest.mark.parametrize("milestone", ["m5", "", "../m3", "M4"])
 def test_sdk_does_not_accept_arbitrary_model_prefix(tmp_path, milestone):
     with pytest.raises(ValueError, match="model milestone"):
