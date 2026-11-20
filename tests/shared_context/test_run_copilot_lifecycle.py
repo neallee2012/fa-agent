@@ -721,6 +721,35 @@ def test_a_compacting_task_turns_on_infinite_sessions(sdk):
     assert sdk.options()["infinite_sessions"] == {"enabled": True}
 
 
+def infinite_sessions(automatic):
+    # The native auto lane's checkpoint turn is built by native_sdk; test_native_auto_compaction runs it for real.
+    options = {}
+    m2_copilot._bind_turn_callbacks(
+        options, SimpleNamespace(native_hitl=None, session_files=session_files(automatic=automatic)),
+        SimpleNamespace(compact_task=object()), SimpleNamespace(live=None, hooks=None))
+    return options["infinite_sessions"]
+
+
+@pytest.mark.parametrize("percent,threshold", [(None, 0.65), ("80", 0.8), ("1", 0.01), ("94", 0.94)])
+def test_an_auto_profile_turn_hands_the_sdk_its_compaction_threshold(monkeypatch, percent, threshold):
+    if percent is None:
+        monkeypatch.delenv("FA_NATIVE_COMPACTION_PERCENT", raising=False)
+    else:
+        monkeypatch.setenv("FA_NATIVE_COMPACTION_PERCENT", percent)
+    assert infinite_sessions(automatic=True) == {"enabled": True, "background_compaction_threshold": threshold}
+    # The manual profile refuses the runtime's own compaction, so an earlier start would only fail it sooner.
+    assert infinite_sessions(automatic=False) == {"enabled": True}
+
+
+@pytest.mark.parametrize("percent", ["0", "95", "100", "0.65", "065", "65%", " 65", ""])
+def test_an_invalid_compaction_percent_is_refused(monkeypatch, percent):
+    monkeypatch.setenv("FA_NATIVE_COMPACTION_PERCENT", percent)
+    with pytest.raises(Problem) as refused:
+        infinite_sessions(automatic=True)
+    assert refused.value.body["error"]["code"] == "NATIVE_EXECUTION_UNAVAILABLE"
+    assert infinite_sessions(automatic=False) == {"enabled": True}
+
+
 def test_the_next_turn_reaches_a_kept_sdk_through_its_own_handlers(running):
     holder, options = resident_turn(running)
     running.run(**options)

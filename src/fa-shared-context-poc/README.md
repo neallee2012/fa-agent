@@ -5989,6 +5989,7 @@ Linux Hosted 依 `TZ` 的換算還要等 live 一回合讀回。
 （`trigger=threshold`）。native 原本只接受 FA 自己發起的 manual 壓縮，所以 runtime 一壓縮，`observe_compaction` 就把來源
 當成未驗證，之後的模型請求一律拒絕，RID 變 unknown；下一回合從同一份 checkpoint 恢復又會再壓縮、再失敗。
 結果是長對話到上限的 80% 就無法繼續。
+（runtime 1.0.112 起門檻設定有效，auto profile 預設改成 65%，見[自動壓縮提早到 65%](#native-compaction-threshold)。）
 
 **官方能力（SDK-first）**：固定 SDK 1.0.13 的 `InfiniteSessionConfig`（背景壓縮門檻預設 0.80、阻塞門檻預設 0.95）、
 `session.compaction_start／complete` 事件，見
@@ -6099,10 +6100,51 @@ standing 設定沒有這一項（stage `runtime/config.json` 也沒有），所�
 - `test_agent_onboarding.py::test_a_new_agents_first_selection_defaults_to_the_declared_model_capacity`：新 Agent 的 selection 帶容量，standing 不變。
 - 舊 build 已保存的 selection 續做時原樣重送（不帶容量）。
 - `test_native_auto_compaction.py::test_the_runtime_compacts_at_the_declared_input_limit_even_above_its_128000_default`：
-  真 runtime，沒宣告時第 5 回合壓縮，宣告 272000 時第 8 回合才壓縮。
+  真 runtime，沒宣告時第 5 回合壓縮，宣告 272000 時第 8 回合才壓縮（1.0.83、80%；現行數字見[自動壓縮提早到 65%](#native-compaction-threshold)）。
 - 拿掉預設時，第一則會失敗。
 
 只證明離線接線和 runtime 行為，不是 live 證據。
+
+<a id="native-compaction-threshold"></a>
+### 自動壓縮提早到 65%，可用 `FA_NATIVE_COMPACTION_PERCENT` 調整（2026-11-20，CODE/offline，未部署）
+
+**原因**：stage 2026-11-20 14:31、15:18，fa-stage-a 一個約 20.6 萬 token 的長對話（宣告上限 272000 的 76%）還沒到 runtime
+預設的 80%，每次模型呼叫都送整份，一回合 7–8 次呼叫打爆 `gpt-6.1-sol` 的 50 萬 TPM，兩回合都停在 `NATIVE_TURN_UNKNOWN`。
+Neal 決定讓壓縮提早到 65%，之後可用參數調整。
+
+**官方能力**：SDK 1.0.34 `InfiniteSessionConfig.background_compaction_threshold`（`copilot/session.py` 1788–1806，預設 0.80），
+create 與 resume 都轉成 `backgroundCompactionThreshold` 送給 runtime（`copilot/client.py` 3768–3781、4826–4839）。
+1.0.83 時代「不論怎麼設都 80%」在 runtime 1.0.112 不成立：設定有效，`session.compaction_complete` 的
+`attemptMetrics.triggerThreshold` 記下實際值。
+
+**版本前提**：門檻只在 runtime 1.0.112 起生效，也就是目前固定的 Hosted image（`sdk_pin.RUNTIME_VERSION`）。
+較早的 runtime 不理會這個設定，照樣約 80% 壓縮，也不報錯（1.0.83 實測，見上方「B1 TC S1」一節；1.0.103 沒測）。
+部署後要確認實際門檻，看壓縮那一回合 `session.compaction_complete` 事件的 `attemptMetrics.triggerThreshold`；
+FA 的 assembly 摘要不保留這個欄位，stage 上從哪裡讀到原始事件還沒驗證。
+
+**做法**：
+- 只對 auto profile（`auto-no-custom-v1`）的回合帶門檻（`m2_copilot._bind_turn_callbacks`）。manual profile 不接受 runtime 自己的壓縮，
+  門檻調低只會讓它更早失敗，所以 manual、job-bound 與沒選 profile 的對話不變。`buffer_exhaustion_threshold` 不動（runtime 預設 0.95）。
+- Hosted 環境變數 `FA_NATIVE_COMPACTION_PERCENT`：整數 1–94，沒設就是 65（`behavior_native_turn_wire.native_compaction_threshold`）。
+  其他值（`0`、`95`、`0.65`、`065`、空字串）一律拒絕：部署時 Agent sync 與 CI `meta` 以 `HOSTED_ENVIRONMENT_INVALID` 擋下；
+  Hosted 啟動時 `native_runtime_from_environment` 以 `NATIVE_EXECUTION_UNAVAILABLE` 停下，不退回預設。
+- 要改值時，放進 `deploy/<env>/<env>.json` 該 Agent 的 `hosted_environment`（例如 `"FA_NATIVE_COMPACTION_PERCENT": "70"`），
+  走一般部署。目前 dev、stage 與 azd 預設都沒有這個鍵，所以用 65。
+- 不換 profile：門檻是 SDK session 選項，不改 wire DTO、state store、SDK／runtime 版本或 codec 清單（ADR-0009 的四項）。
+  auto profile 的檢查只看事件成對、trigger、自訂指令與摘要，不看門檻；前一份存檔的事件原樣保留（`validate_inherited`）。
+- 既有對話：resume 也帶門檻，部署後已超過 65% 的 auto 對話會在下一回合壓縮（真 runtime 冷恢復實測，見下）。
+  壓縮在背景跑，觸發那一回合仍送完整 context。
+
+**界線**：65% 不保證不撞 TPM。272000×0.65 約 17.7 萬 token，一回合連續 3 次呼叫就超過 50 萬／分鐘；429 仍靠既有的有界重試。
+
+直接測項（真 runtime 1.0.112 的測項在 dev Hosted image 內以 `--network none` 跑，模型離線）：
+- `test_native_auto_compaction.py::test_the_runtime_compacts_at_the_declared_input_limit_even_above_its_128000_default`：
+  宣告 272000、每回合約加 3 萬 token；預設 65% 在第 7 回合壓縮，設 `"80"` 時第 8 回合；沒宣告時仍是第 4 回合。整個檔 15 passed。
+- 冷恢復探針（不提交）：前 6 回合不帶門檻、第 7 回合 `resume_session` 才帶 0.65，第 7 回合壓縮（`currentTokens` 190260，
+  `triggerThreshold` 0.65）；全程不帶時第 8 回合（221680，0.8）。
+- `test_run_copilot_lifecycle.py`：auto 回合把 0.65／0.8／0.01／0.94 放進 `infinite_sessions`，manual 不帶；不合法的值以
+  `NATIVE_EXECUTION_UNAVAILABLE` 拒絕。`test_agent_versions_pins.py`、`test_stage_ci_routines.py`：sync 與 CI 接受與拒絕的值相同。
+- 不是 Hosted、真模型或 live 證據；`buffer_exhaustion_threshold` 沒測。
 
 ### TC S3／S4：壓縮後原話可逐字讀回、已確認紀錄不被改寫（只加測試）
 
@@ -10894,7 +10936,7 @@ catalog 只描述組織預裝或連接了哪些工具，不授予任何權限；
   - `fa-memory-candidate-v1`：只有非vision的`stage_memory_candidate`，只暫存未生效建議。
   - `fa-image-delivery-v1`：只有非vision的`deliver_image`，把本回合最新一張截圖交給使用者，見下方「把截圖交給使用者」。
   - `fa-shell-v1`：只有非vision的`run_command`，在 Agent 自己的 Hosted sandbox 執行 bash 命令，見下方「在 Agent 自己的 sandbox 執行命令」。
-  - 兩個變數都未設定時，沒有任何 capability。一個模板最多選 12 個 capability（`MAX_CAPABILITIES`；原本 8 個的舊紀錄仍有效）。
+  - 兩個變數都未設定時，沒有任何 capability。一位助理能選幾項由 API 的 `FA_CAPABILITY_SELECTION_MAX` 決定，未設定是 12，見下方[能力上限可以設定](#capability-selection-max)。
   - `FA_CAPABILITY_TOOLBOX_ENTRIES`（N5）以逗號列出要載入的 `type: "toolbox"` entry；沒有列出的 toolbox entry 即使在 catalog 目錄裡也不載入，其他 entry 不受影響。見下方「N5：組織 connector 改走 Foundry toolbox」。
 - **選版**：`TemplateSettings.capabilities` 以 `{entry_id, entry_sha256}` 參照 entry，經既有 `agent-template/select`（需人類 approve）選定，只影響之後的新對話。
   - 選版時會對照目前的 catalog；參照不存在或 digest 不同時回 409 `CAPABILITY_SOURCES_CHANGED`。
@@ -10910,6 +10952,19 @@ catalog 只描述組織預裝或連接了哪些工具，不授予任何權限；
 - **後續接點**：Hosted 端的 prompt 組裝、`mcp_servers` 與 gateway 見 P3a；工具註冊與 API 代理見 P3b。
 
 直接測項：`tests/shared_context/test_capability_capture.py`（離線；包含捕獲、收窄、catalog 移除、選版拒絕、vision 拒絕與重建）。
+
+<a id="capability-selection-max"></a>
+#### 能力上限可以設定（2026-11-20）
+
+Neal 在 stage 替 fa-stage-a 勾第 13 項能力（Team MCP `team-XNews`）時被擋下：一位助理最多 12 項，而且寫死在程式裡。現在拆成兩個數字：
+
+- **能選幾項**：API 的 `FA_CAPABILITY_SELECTION_MAX`，1 到 128 的整數，未設定是 12（之前的 API 都照 12 擋）。值不合法時 API 不啟動（`load_runtime_capabilities`），`deploy/stage/ci_deploy.py` 的 `api_capability_limit` 在部署前用同一個規則擋。只在選版的入口檢查（`check_selectable`：助理設定的 select 與新增助理），超過回 422 `CAPABILITY_SELECTION_LIMIT`（帶 `limit`）。`agent-template/options` 多一個 `max_capabilities`，工作台的助理設定和新增助理都改用它。值是 12 時不送這個欄位：舊 bridge 的 `TemplateOptions` 不認得它，API 先換版時會回 502 `TEMPLATE_RESPONSE_INVALID`。工作台讀不到這個欄位時當成 12。
+- **存檔與傳給 Hosted 的上限**：`MAX_CAPABILITIES` 由 12 改成 128，固定不隨設定變。存起來的模板、selection 與每回合的 capture 只用這個數字驗證，所以之後把設定調低，舊紀錄照樣讀得回來。128 的理由：一項能力至少帶一個工具，而 Azure OpenAI 的 [quotas and limits](https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits) 寫 `/chat/completions` 一次最多 128 個 functions／tools。
+- **工具總數沒有另外擋**：Responses API（stage 用的 provider）的工具上限文件沒寫，也沒有實測，所以選版時不依工具數拒絕。能力多、工具合計超過模型上限時，錯誤會在回合時由模型回來。Team MCP 一個 server 最多 32 個工具，8 個就是 256，原本的 12 項上限也沒有擋住這件事。
+
+**換版順序**：128 是 Hosted 也會驗的 wire（`CapabilityCapture.grants`、`AgentTemplate` 的 `validate_refs`）。這版之前的 image 碰到超過 12 項的資料，有兩種結果。收到這種回合請求時回 422 `NATIVE_REQUEST_INVALID`（`native_turns.py` 解析 `NATIVE_REQUEST` 失敗），不帶 `not_dispatched`，不會觸發換版後同 RID 重送。讀到已經存下的這種狀態（回條、對話 meta）時，`native_turns._decode` 回 409 `NATIVE_STATE_INVALID`，那段對話會一直卡住，直到這個 Agent 換回這版以後的 image。所以 `deploy/stage/ci_deploy.py` 把規則寫成程式檢查：`FA_CAPABILITY_SELECTION_MAX` 大於 12 時，`switch_preconditions`（guard、sync、api 都會跑，dev 照 `deploy/README.md` 也跑這三步）讀服務中 API 的 commit，它的 `behavior_capabilities.MAX_CAPABILITIES` 不是 128、或讀不到 serving commit，就拒絕部署（`missing_capability_bound`）。完整部署會在 API 步驟之前用 sync 把每個 Agent 的定義換成同一版 image，所以照完整流程時，調高設定一定比換 image 晚一次部署。12 以下不讀 serving commit。這道檢查只看 API 的 commit，擋不住四種情況：只換 API 的部署（沒有跑 sync，Agent 還在舊 image）；sync 帶 `--defer-follow`，還停在舊版本、等閒置才換版的 session；閒置換版沒有換成或換了又退回的 Agent：換版前的健康檢查連續失敗、新版本被否決，Agent 留在舊版本（`HEALTH_VETO_COUNT`，log `NATIVE_UPGRADE_HEALTH_VETO`），或換版後 crash-loop、退回舊版本（`CRASH_LOOP_COUNT`，log `NATIVE_CRASH_LOOP`），兩者都在 `behavior_native_sessions.py`；平台醒來時把 session 帶回舊版本（ADR-0009 的漂移紀錄）。調高設定前，先確認每個 Agent 都在這版以後的 image 上。`test_native_profile_snapshot.py` 的 `CAPABILITY_BOUND_RAISED` 依這道檢查放行 v2 wire 的這個變化。dev、stage 與 azd 預設這次都不設；這版部署到 dev 之後，另開 PR 在 `deploy/dev/dev.json` 設 32。32 的理由：目前可選的項目約 20 個（10 個內建、2 個組織 catalog、Team MCP 最多 8 個），32 能全選且留餘裕。
+
+**退版**：已存了超過 12 項的模板或 selection，退回這版之前的 API 或 Hosted 會讀不回來。
 
 ### 能力的組裝、閘道與 Hosted session 需求（LOCAL，P3a）
 

@@ -2008,6 +2008,10 @@ def _bind_turn_callbacks(options, turn, prepared, wiring):
         # The pinned runtime omits checkpoint files when disabled.
         # Unexpected automatic starts are fenced by the model gateway.
         options["infinite_sessions"] = {"enabled": True}
+        if files is not None and files.automatic:
+            # Only auto accepts the runtime's own compaction; sent on create and resume alike.
+            from .behavior_native_turn_wire import native_compaction_threshold
+            options["infinite_sessions"]["background_compaction_threshold"] = native_compaction_threshold()
 
 
 def _session_options(turn, prepared, wiring):

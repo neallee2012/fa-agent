@@ -47,6 +47,10 @@ VALUE = "a deployment flag value is invalid"
     ({"FA_NATIVE_HITL_TTL_SECONDS": "0"}, 900, VALUE),
     ({"FA_NATIVE_HITL_TTL_SECONDS": "1234567"}, 900, VALUE),
     ({"FA_NATIVE_HITL_TTL_SECONDS": "6x"}, 900, VALUE),
+    ({"FA_NATIVE_COMPACTION_PERCENT": "0"}, 900, VALUE),
+    ({"FA_NATIVE_COMPACTION_PERCENT": "95"}, 900, VALUE),
+    ({"FA_NATIVE_COMPACTION_PERCENT": "0.65"}, 900, VALUE),
+    ({"FA_NATIVE_COMPACTION_PERCENT": "065"}, 900, VALUE),
     ({"TZ": "UTC\x00"}, 900, VALUE),
     ({"TZ": "UTC\r"}, 900, VALUE),
     ({"TZ": "UTC\n"}, 900, VALUE),
@@ -59,6 +63,7 @@ def test_each_unbounded_or_invalid_deployment_setting_is_refused_with_its_own_me
 @pytest.mark.parametrize("environment,idle", [
     (None, 120), ({}, 3600), ({"FA_NATIVE_HITL_TTL_SECONDS": "999999", "TZ": "UTC"}, 900),
     ({"FA_MEMORY_BACKEND": "cosmos", "FA_NATIVE_HITL_ENABLED": "0"}, 900),
+    ({"FA_NATIVE_COMPACTION_PERCENT": "1"}, 900), ({"FA_NATIVE_COMPACTION_PERCENT": "94"}, 900),
 ])
 def test_a_bounded_deployment_setting_is_returned_as_a_copy(environment, idle):
     checked = versions._check_environment(environment, idle)

@@ -101,6 +101,7 @@ MESSAGES = {
     "AGENT_ROLE_PROMPT_INVALID": "保存的角色說明無法通過核對；不顯示也不改用其他版本。",
     "AGENT_ROLE_PROMPT_MISSING": "這位助理的角色版本需要角色說明，但還沒有保存；沒有改用其他版本。",
     "CAPABILITY_SOURCES_CHANGED": "選定的能力已不在目前的組織清單；請重新讀取設定。",
+    "CAPABILITY_SELECTION_LIMIT": "選的能力超過這個部署允許的項數；原設定沒有改變，請先關掉幾項。",
     "TEMPLATE_SELECTION_UNAVAILABLE": "目前部署尚未提供新對話設定選擇或原回條 reader；原紀錄保留，不會改用其他入口或啟用 flags。",
     "TEMPLATE_SELECTION_INVALID": "新對話選擇請求不符合原 command 或完整模板的容量／格式；未送出。",
     "TEMPLATE_SELECTION_RESPONSE_INVALID": "新對話選擇回應未通過原請求、模板或回條核對；保持未確認，不重送。",

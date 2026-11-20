@@ -9680,9 +9680,10 @@ test("onboarding never preselects or sends a tool the agent-role profile cannot 
 });
 
 test("onboarding blocks more tools or skills than the server accepts and waits for the catalog",async()=>{
-  const many=Array.from({length:13},(_,i)=>ONBOARDING_CAP("tool-"+String(i).padStart(2,"0"),"mcp-api",["t"]));
+  const many=Array.from({length:6},(_,i)=>ONBOARDING_CAP("tool-"+String(i).padStart(2,"0"),"mcp-api",["t"]));
   const skills=Array.from({length:5},(_,i)=>ONBOARDING_SKILL("skill-"+i));
-  const options={options:{...ONBOARDING_OPTIONS.options,capabilities:many,skills},current:{capabilities:[],skills:[]},
+  const options={options:{...ONBOARDING_OPTIONS.options,capabilities:many,skills,max_capabilities:5},
+    current:{capabilities:[],skills:[]},
     unsupported:[]};
   const server=onboardingServer({posts:[],options});
   const ui=await open(agentChat("agent-one"),{onboarding:server.handle});
@@ -9691,8 +9692,19 @@ test("onboarding blocks more tools or skills than the server accepts and waits f
   fillOnboarding(ui,"研究員","找資料");
   const inputs=vm.runInContext("onboarding.inputs",ui.context);
   for(const input of inputs.filter(input=>input.faKind==="capability")){input.checked=true;input.events.change()}
-  assert.match(ui.text("onboarding-choice-note"),/工具最多 12 項/);
+  assert.match(ui.text("onboarding-choice-note"),/工具最多 5 項/);
   assert.equal(ui.nodes.get("onboarding-submit").disabled,true);
+  // An API at the default 12 (or older) leaves max_capabilities out.
+  const thirteen=Array.from({length:13},(_,i)=>ONBOARDING_CAP("tool-"+String(i).padStart(2,"0"),"mcp-api",["t"]));
+  const unset=onboardingServer({posts:[],options:{...options,options:{...ONBOARDING_OPTIONS.options,capabilities:thirteen}}});
+  const plain=await open(agentChat("agent-one"),{onboarding:unset.handle});
+  await openOnboarding(plain);
+  await plain.tick();await plain.tick();
+  fillOnboarding(plain,"研究員","找資料");
+  for(const input of vm.runInContext("onboarding.inputs",plain.context).filter(input=>input.faKind==="capability")){
+    input.checked=true;input.events.change()}
+  assert.match(plain.text("onboarding-choice-note"),/工具最多 12 項/);
+  assert.equal(plain.nodes.get("onboarding-submit").disabled,true);
   const offline=onboardingServer({posts:[],options:null});
   const other=await open(agentChat("agent-one"),{onboarding:offline.handle});
   await openOnboarding(other);
@@ -9978,7 +9990,12 @@ test("settings only lets an unavailable item be switched off and blocks capabili
   other.click("settings-tab-mcp");
   assert.equal(settingsRow(other,"WebIQ").children[1].disabled,true);
   assert.match(settingsRow(other,"WebIQ").children[0].children[2].textContent,/角色版本不能組合/);
-  assert.equal(ui.calls.some(call=>call.method==="POST")||other.calls.some(call=>call.method==="POST"),false);
+  const full=settingsOptions();full.max_capabilities=1;
+  const capped=await openSettingsPage(full);
+  capped.click("settings-tab-mcp");
+  assert.equal(settingsRow(capped,"WebIQ").children[1].disabled,true);
+  assert.match(settingsRow(capped,"WebIQ").children[0].children[2].textContent,/一位助理最多選 1 項能力/);
+  assert.equal([ui,other,capped].some(page=>page.calls.some(call=>call.method==="POST")),false);
 });
 
 test("settings can close unavailable MCP selections in one local edit without changing other choices",async()=>{

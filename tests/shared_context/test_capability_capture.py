@@ -13,7 +13,9 @@ from shared_context.behavior_capabilities import (
     available_grants,
     capture,
     check_captured,
+    check_selectable,
     load_runtime_capabilities,
+    selection_max,
 )
 from shared_context.behavior_history_prompt import HISTORY_PROFILE
 from shared_context.errors import Problem
@@ -49,6 +51,29 @@ def test_selection_refuses_unknown_changed_or_non_composable_entries(assistant_a
                                         capabilities=refs("WebSearch-MCP")))
     assert response.status_code == 422
     assert h.store._guard() == before
+
+
+def test_the_selection_limit_is_the_api_setting_and_a_bad_value_stops_startup(monkeypatch):
+    chosen = refs("WebSearch-MCP", "fa-desktop-v1")
+    monkeypatch.delenv("FA_CAPABILITY_SELECTION_MAX", raising=False)
+    assert selection_max() == 12
+    monkeypatch.setenv("FA_CAPABILITY_SELECTION_MAX", "1")
+    with pytest.raises(Problem) as refused:
+        check_selectable(chosen, HISTORY_PROFILE, GRANTS)
+    assert refused.value.status == 422
+    assert refused.value.body["error"] | {"message": None} == {
+        "code": "CAPABILITY_SELECTION_LIMIT", "message": None, "limit": 1}
+    monkeypatch.setenv("FA_CAPABILITY_SELECTION_MAX", "2")
+    assert check_selectable(chosen, HISTORY_PROFILE, GRANTS) == chosen
+    monkeypatch.setenv("FA_CAPABILITY_SELECTION_MAX", "128")
+    assert selection_max() == 128
+    monkeypatch.delenv("FA_TOOL_CATALOG_DIR", raising=False)
+    monkeypatch.delenv("FA_CAPABILITY_BUILTINS", raising=False)
+    for bad in ("0", "129", "012", "12 ", "-1", ""):
+        monkeypatch.setenv("FA_CAPABILITY_SELECTION_MAX", bad)
+        with pytest.raises(Problem) as stopped:
+            load_runtime_capabilities()
+        assert stopped.value.status == 503 and stopped.value.body["error"]["code"] == "CAPABILITY_CONFIGURATION", bad
 
 
 def test_capture_rules_are_intersection_and_record_only_checks():

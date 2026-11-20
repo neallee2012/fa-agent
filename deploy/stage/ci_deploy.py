@@ -81,7 +81,7 @@ def use_profile(config, *, require_runtime=True):
 VERSIONS = APP / "shared_context" / "behavior_agent_versions.py"
 # Overlay keys sync checks by value, not as "0"/"1" switches (behavior_agent_versions._check_environment).
 HOSTED_VALUE_KEYS = frozenset({"FA_NATIVE_TURNS", "FA_NATIVE_HITL_TTL_SECONDS", "FA_PRIVATE_MEMORY_STORE", "TZ",
-                               "FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL"})
+                               "FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL", "FA_NATIVE_COMPACTION_PERCENT"})
 # native_responses_wire.ACCEPTED_STATE_PROFILES, copied: meta cannot import shared_context. v3 only from ADR-0009 3d-ii.
 HOSTED_STATE_PROFILES = frozenset({"foundry-native-v3"})
 # ADR-0009 2d-i's one switch (src README#native-2di-switch): the API's FA_NATIVE_SESSION_GUARD_ENFORCE="1" also makes
@@ -102,6 +102,10 @@ API_2DI_SCHEMA = 2
 # the binding rows' ``idle_upgrade`` the new revision writes); 2 = 6a (c) (``idle_upgrade.waiting``); 3 = 4d (it also
 # decodes the ``rolled_back`` notices and the fence's ``rollback``); 4 = 4b-4 (the ``vetoed`` notice).
 API_IDLE_SCHEMA = 4
+# Copies of behavior_capabilities.DEFAULT_SELECTION_MAX and MAX_CAPABILITIES (the deploy never imports shared_context;
+# test_stage_ci_routines pins them): the selection limit every API before the 128 bound enforced, and that bound.
+CAPABILITY_DEFAULT = 12
+CAPABILITY_BOUND = 128
 IMAGES = {
     "api": ("fa-behavior-api", "Dockerfile.behavior-api"),
     "hosted": ("fa-behavior-assistant-desktop", "Dockerfile.behavior-assistant-desktop"),
@@ -143,6 +147,7 @@ def check():
     hosted_environment()
     api_routines()
     api_faults()
+    api_capability_limit()
     realtime()
     feed_config()
     api_secrets()
@@ -497,6 +502,8 @@ def _check_hosted(name, environment, idle_timeout_seconds):
             or environment.get("FA_MEMORY_BACKEND", "foundry") not in {"foundry", "cosmos"}
             or "FA_NATIVE_HITL_TTL_SECONDS" in environment
             and re.fullmatch(r"[1-9][0-9]{0,5}", environment["FA_NATIVE_HITL_TTL_SECONDS"]) is None
+            or "FA_NATIVE_COMPACTION_PERCENT" in environment
+            and re.fullmatch(r"[1-9]|[1-8][0-9]|9[0-4]", environment["FA_NATIVE_COMPACTION_PERCENT"]) is None
             or any("\x00" in value or "\r" in value or "\n" in value for value in environment.values())):
         raise SystemExit(f"{name}: hosted_environment accepts only the keys and values Agent sync accepts "
                          f"(shared_context/behavior_agent_versions.py _ENVIRONMENT_FLAGS)")
@@ -568,6 +575,18 @@ def api_faults():
         raise SystemExit("api_environment: FA_NATIVE_CUT_FAULT is a dev-only fault hook; stage refuses it")
 
 
+def api_capability_limit():
+    """FA_CAPABILITY_SELECTION_MAX, checked as the API checks it at startup (behavior_capabilities.selection_max): a bad
+    value would stop the new API revision. True when it raises the limit above CAPABILITY_DEFAULT, which
+    switch_preconditions allows only over a serving API with CAPABILITY_BOUND (src README#capability-selection-max)."""
+    value = STAGE["api_environment"].get("FA_CAPABILITY_SELECTION_MAX")
+    if value is not None and (not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,2}", value) is None
+                              or int(value) > CAPABILITY_BOUND):
+        raise SystemExit("api_environment: FA_CAPABILITY_SELECTION_MAX must be an integer from 1 to "
+                         f"{CAPABILITY_BOUND}")
+    return value is not None and int(value) > CAPABILITY_DEFAULT
+
+
 def _api_source(name, commit=None):
     """One shared_context file of this checkout, or of ``commit`` (the serving API's); None when it does not exist."""
     if commit is None:
@@ -578,11 +597,11 @@ def _api_source(name, commit=None):
     return found.stdout if found.returncode == 0 else None
 
 
-def api_2di_schema(commit=None, name="NATIVE_2DI_SCHEMA"):
-    """The module-level int ``name`` native_binding.py assigns (this checkout's, or ``commit``'s); 0 when it assigns
-    none or the source does not parse."""
+def api_2di_schema(commit=None, name="NATIVE_2DI_SCHEMA", source="native_binding.py"):
+    """The module-level int ``name`` ``source`` assigns (this checkout's, or ``commit``'s); 0 when it assigns none or
+    the source does not parse."""
     try:
-        tree = ast.parse(_api_source("native_binding.py", commit) or "")
+        tree = ast.parse(_api_source(source, commit) or "")
     except SyntaxError:
         return 0
     for node in tree.body:
@@ -603,6 +622,13 @@ def missing_idle(commit=None):
     else what it lacks."""
     found = api_2di_schema(commit, "NATIVE_IDLE_SCHEMA")
     return [] if found >= API_IDLE_SCHEMA else [f"native_binding.NATIVE_IDLE_SCHEMA={found}, needs {API_IDLE_SCHEMA}"]
+
+
+def missing_capability_bound(commit):
+    """[] when ``commit``'s API (and the Hosted image deployed with it) reads selections up to CAPABILITY_BOUND."""
+    found = api_2di_schema(commit, "MAX_CAPABILITIES", "behavior_capabilities.py")
+    return [] if found >= CAPABILITY_BOUND else [f"behavior_capabilities.MAX_CAPABILITIES={found}, "
+                                                 f"needs {CAPABILITY_BOUND}"]
 
 
 def native_2di():
@@ -657,6 +683,16 @@ def switch_preconditions(properties=None, base=None):
     ready = properties.get("latestReadyRevisionName") or ""
     if not ready and not _active_revisions(app):
         return  # no revision ever got ready and none is active (a first install stopped midway): nothing to converge
+    if api_capability_limit():
+        # An image before the bound reads a stored selection, capture or receipt above 12 as invalid: the conversation
+        # stays stuck until it runs a newer image. A full deploy syncs each Agent's definition to its image before its
+        # API step; not covered: an API-only deploy, and a session still on an older version (deferred follow, drift).
+        base = serving_commit(ready) if read else base
+        missing = ["the serving commit is unknown"] if base is None else missing_capability_bound(base)
+        if missing:
+            raise SystemExit(f"{app}: FA_CAPABILITY_SELECTION_MAX above {CAPABILITY_DEFAULT} needs every Agent on an "
+                             f"image with the {CAPABILITY_BOUND} capability bound, and the serving API lacks it "
+                             f"({missing}); deploy this commit with the setting unset first, then raise it")
     container = ((properties.get("template") or {}).get("containers") or [{}])[0]
     env = {item.get("name"): item.get("value") for item in container.get("env") or []}
     deployed = env.get(SESSION_GUARD)
@@ -676,7 +712,7 @@ def switch_preconditions(properties=None, base=None):
             raise SystemExit(f"{app}: turning 2d-i or the idle upgrade on needs one active revision, the latest ready "
                              f"one ({ready!r}; active {active}); wait for the old revision to deactivate, or an "
                              "operator deactivates it")
-    if read:
+    if read and base is None:  # not read above
         base = serving_commit(ready)
     missing = ["the serving commit is unknown"] if base is None else missing_2di(base) if turning else []
     # The new revision writes rows of this commit's NATIVE_IDLE_SCHEMA (``idle_upgrade`` from 4b-1 on); a draining

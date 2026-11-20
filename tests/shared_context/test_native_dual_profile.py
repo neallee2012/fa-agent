@@ -315,3 +315,25 @@ def test_the_runtime_refuses_a_version_that_declares_another_sdk_release(local_e
         native_sdk.native_runtime_from_environment(hosted)
     assert refused.value.body["error"]["code"] == "NATIVE_TURNS_DISABLED"
     assert "another SDK/runtime release" in refused.value.body["error"]["message"]
+
+
+@pytest.mark.parametrize("percent", ["0", "95", "100", "65%", " 65", ""])
+def test_the_runtime_does_not_start_with_an_invalid_compaction_percent(local_env, monkeypatch, tmp_path, percent):
+    """README#native-compaction-threshold: a bad FA_NATIVE_COMPACTION_PERCENT stops startup, not each auto turn."""
+    runtime_path = tmp_path / "OFFLINE-not-executed"
+    runtime_path.write_text("OFFLINE SDK boundary only", encoding="utf-8")
+    hosted = SimpleNamespace(
+        identity=IDENTITY, root=tmp_path / ".fa-assistant-v12",
+        api=SimpleNamespace(api_url="https://api.offline.invalid", audience="api://OFFLINE"))
+    monkeypatch.setattr("azure.identity.aio.ManagedIdentityCredential", lambda client_id=None: None)
+    for key, value in {"FA_NATIVE_TURNS": NATIVE_V3_PROFILE, "FOUNDRY_HOSTING_ENVIRONMENT": "OFFLINE-platform",
+                       "AGENTSERVER_TASKS_BACKEND": "hosted", "BEHAVIOR_ASSISTANT_RUNTIME_PATH": str(runtime_path),
+                       "FOUNDRY_PROJECT_ENDPOINT": "https://offline-fixture.services.ai.azure.com/api/projects/offline",
+                       "FA_SDK_RELEASE": native_sdk.PINNED_RELEASE_TEXT, "FA_NATIVE_COMPACTION_PERCENT": "70"}.items():
+        monkeypatch.setenv(key, value)
+    assert native_sdk.native_runtime_from_environment(hosted).state_profile == NATIVE_V3_PROFILE
+    monkeypatch.setenv("FA_NATIVE_COMPACTION_PERCENT", percent)
+    with pytest.raises(Problem) as refused:
+        native_sdk.native_runtime_from_environment(hosted)
+    assert refused.value.body["error"]["code"] == "NATIVE_EXECUTION_UNAVAILABLE"
+    assert "FA_NATIVE_COMPACTION_PERCENT" in refused.value.body["error"]["message"]

@@ -90,7 +90,7 @@ def test_ci_and_sync_accept_and_refuse_the_same_hosted_overlays():
     ci = load_ci()
     values = ["0", "1", "2", "true", "", "api", "foundry-native-v1", "foundry-native-v2", "foundry-native-v3",
               "foundry-native-v4", "600",
-              "0600", "Asia/Taipei", "a\nb", "x" * 2049, "foundry", "cosmos", "gpt-5.4-mini"]
+              "0600", "65", "94", "95", "0.65", "Asia/Taipei", "a\nb", "x" * 2049, "foundry", "cosmos", "gpt-5.4-mini"]
     cases = [{key: value} for key, value in itertools.product(sorted(versions._ENVIRONMENT_FLAGS), values)]
     cases += [{"AZURE_CLIENT_SECRET": "synthetic"}, {"FA_NATIVE_ROUTINE_CLOCK": "api"}, {}, ["not", "a", "dict"],
               {**HOSTED_ON, "FA_NATIVE_HITL_ENABLED": "1"}, {"FA_NATIVE_ROUTINES_ENABLED": 1}]
@@ -99,6 +99,19 @@ def test_ci_and_sync_accept_and_refuse_the_same_hosted_overlays():
     for idle in (119, 120, 3600, 3601, "3600"):
         assert stops(ci._check_hosted, "agent", {}, idle) == refused({}, idle), idle
 
+
+def test_ci_and_sync_refuse_exactly_the_compaction_percents_the_runtime_would_not_start_with():
+    """Agent sync and ci_deploy each copy native_compaction_threshold's rule; all three must agree."""
+    from shared_context.behavior_native_turn_wire import native_compaction_threshold
+    ci = load_ci()
+    for value in ("0", "1", "9", "10", "65", "89", "90", "94", "95", "99", "100", "065", "6.5", " 65", "65%", ""):
+        environment = {"FA_NATIVE_COMPACTION_PERCENT": value}
+        try:
+            native_compaction_threshold(environment)
+        except Problem:
+            assert refused(environment) and stops(ci._check_hosted, "agent", environment, 3600), value
+        else:
+            assert not refused(environment) and not stops(ci._check_hosted, "agent", environment, 3600), value
 
 def test_ci_and_sync_accept_the_cosmos_memory_overlay_azd_writes():
     # ADR-0011 (deploy/azd/profile.py): private with memory on gives every assistant these two values.
@@ -290,3 +303,27 @@ def test_stage_refuses_the_dev_only_cut_fault_hook(capsys):
         ci.meta()
     ci.STAGE["environment"] = "dev"
     ci.api_faults()
+
+
+def test_meta_refuses_exactly_the_capability_limits_the_api_would_not_start_with(monkeypatch):
+    """ci_deploy keeps its own copy of selection_max's rule (it never imports shared_context): both must agree."""
+    from shared_context.behavior_capabilities import DEFAULT_SELECTION_MAX, MAX_CAPABILITIES, selection_max
+    ci = load_ci()
+    assert (ci.CAPABILITY_DEFAULT, ci.CAPABILITY_BOUND) == (DEFAULT_SELECTION_MAX, MAX_CAPABILITIES)
+    bound = MAX_CAPABILITIES
+    for value in ("0", "1", "012", "twelve", "-1", "", str(DEFAULT_SELECTION_MAX), str(bound), str(bound + 1)):
+        monkeypatch.setenv("FA_CAPABILITY_SELECTION_MAX", value)
+        ci.STAGE["api_environment"]["FA_CAPABILITY_SELECTION_MAX"] = value
+        try:
+            selection_max()
+        except Problem:
+            with pytest.raises(SystemExit, match="FA_CAPABILITY_SELECTION_MAX"):
+                ci.api_capability_limit()
+        else:
+            assert ci.api_capability_limit() is (int(value) > DEFAULT_SELECTION_MAX), value
+            assert value not in {str(bound + 1), "0"}
+    ci.STAGE["api_environment"]["FA_CAPABILITY_SELECTION_MAX"] = 32  # a JSON number: the API only ever reads strings
+    with pytest.raises(SystemExit, match="FA_CAPABILITY_SELECTION_MAX"):
+        ci.api_capability_limit()
+    ci.STAGE["api_environment"].pop("FA_CAPABILITY_SELECTION_MAX")
+    assert ci.api_capability_limit() is False

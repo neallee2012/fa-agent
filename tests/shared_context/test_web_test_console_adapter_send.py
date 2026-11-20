@@ -661,7 +661,7 @@ def test_system_prompt_codes_are_conflicts_on_a_read(code):
 
 SELECTION_CODES = ["PROFILE_SELECTION_UNSUPPORTED", "PROFILE_SELECTION_DISABLED", "PROFILE_SELECTION_DENIED",
                    "PROFILE_SELECTION_CONFLICT", "PROFILE_SELECTION_SOURCES_CHANGED", "PROFILE_SELECTION_MISSING",
-                   "PROFILE_SELECTION_INVALID", "PROFILE_SELECTION_UNKNOWN"]
+                   "PROFILE_SELECTION_INVALID", "PROFILE_SELECTION_UNKNOWN", "CAPABILITY_SELECTION_LIMIT"]
 
 
 @pytest.mark.parametrize("path", [WP + "agent-template/select", WP + "agent-template/selection",

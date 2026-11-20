@@ -103,6 +103,9 @@ ACR、CAE、API UAMI（名稱／client ID／principal ID）、Table／備份 sto
 功能旗標（HITL、groups、routines、Responses lane、對話中換模型 `FA_NATIVE_MODEL_SWITCH`、`conversation_defaults` 等）放在
 [`deploy/azd/profile.defaults.json`](../deploy/azd/profile.defaults.json)。裡面沒有 tenant、訂閱、OID 或資源名稱；
 測試會檢查每個 key 都是 stage profile 已有的 key，避免自己發明旗標。
+自動壓縮門檻 `FA_NATIVE_COMPACTION_PERCENT`（整數 1–94）不在預設裡，程式預設 65，只在 runtime 1.0.112 起
+（目前固定的 Hosted image）生效，較早的 runtime 不理會、照樣約 80%；要改見
+[Shared Context README](../src/fa-shared-context-poc/README.md#native-compaction-threshold)。
 
 ## 4. 原 17 步對應到哪裡
 

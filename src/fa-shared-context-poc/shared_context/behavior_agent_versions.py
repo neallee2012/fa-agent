@@ -480,6 +480,8 @@ _ENVIRONMENT_FLAGS = frozenset({
     "FA_NATIVE_ROUTINES_ENABLED", "FA_NATIVE_ROUTINE_PROPOSALS",
     # Mid-conversation model switch (README#native-model-switch); unset or "0" keeps a conversation on its model.
     "FA_NATIVE_MODEL_SWITCH",
+    # Auto-profile compaction start, 1-94 percent of the prompt limit (README#native-compaction-threshold); unset is 65.
+    "FA_NATIVE_COMPACTION_PERCENT",
     # ADR-0011 long-term memory backend (behavior_private_memory.BACKEND_ENV) and its extraction chat deployment.
     "FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL",
 })
@@ -497,12 +499,14 @@ def _environment_shape_invalid(environment):
 
 def _flag_value_invalid(environment):
     switches = _ENVIRONMENT_FLAGS - {"FA_NATIVE_TURNS", "FA_NATIVE_HITL_TTL_SECONDS", "FA_PRIVATE_MEMORY_STORE", "TZ",
-                                     "FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL"}
+                                     "FA_MEMORY_BACKEND", "FA_MEMORY_EXTRACTION_MODEL", "FA_NATIVE_COMPACTION_PERCENT"}
     return bool(any(key in environment and environment[key] not in {"0", "1"} for key in switches)
                 or "FA_NATIVE_TURNS" in environment and environment["FA_NATIVE_TURNS"] not in ACCEPTED_STATE_PROFILES
                 or environment.get("FA_MEMORY_BACKEND", "foundry") not in {"foundry", "cosmos"}
                 or "FA_NATIVE_HITL_TTL_SECONDS" in environment
                 and re.fullmatch(r"[1-9][0-9]{0,5}", environment["FA_NATIVE_HITL_TTL_SECONDS"]) is None
+                or "FA_NATIVE_COMPACTION_PERCENT" in environment  # behavior_native_turn_wire.native_compaction_threshold
+                and re.fullmatch(r"[1-9]|[1-8][0-9]|9[0-4]", environment["FA_NATIVE_COMPACTION_PERCENT"]) is None
                 or any("\x00" in value or "\r" in value or "\n" in value for value in environment.values()))
 
 

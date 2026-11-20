@@ -76,7 +76,7 @@ FA 沒有叫 Connector 的產品物件。外部服務是 capability，分 `mcp-a
 - Hosted 用 Agent 自己的 managed identity 打 toolbox，並轉送原回合的 call id（`native_toolbox.py:408-415`）。同檔說明寫明 per-user OAuth 沒驗過（`native_toolbox.py:23-25`）。Copilot SDK 內建 MCP 預設關，`on_mcp_auth_request` 一律回 cancelled（`m2_copilot.py:1512`）。
 - toolbox 回 `-32006` 時，現在只記錯誤碼，訊息裡的 consent URL 被丟掉（`native_toolbox.py:238-245`）。如果錯誤發生在列工具，整個回合的 bind 失敗（`native_toolbox.py:484`）。
 - 批准照 toolbox `require_approval`。`always` 每次出卡，`never` 直接執行（`native_hitl_runtime.py:443`）。卡片等待時間 `FA_NATIVE_HITL_TTL_SECONDS` 預設 600 秒（`native_hitl_wire.py:90`），stage 也設 600（`deploy/stage/stage.json:37`）。
-- 每個 Agent 用 `/select` 選能力，只影響新對話，最多 12 項（`behavior_capabilities.py:28`）。Team MCP 加好後，owner 還要到每個 Agent 再勾一次。
+- 每個 Agent 用 `/select` 選能力，只影響新對話，最多幾項由 API 的 `FA_CAPABILITY_SELECTION_MAX` 決定，未設定是 12（[能力上限可以設定](../src/fa-shared-context-poc/README.md#capability-selection-max)）。Team MCP 加好後，owner 還要到每個 Agent 再勾一次。
 - API 叫 Hosted 時用 API 自己的憑證（`behavior_foundry.py:338-344`）。從 Foundry 看，每個回合的 caller 都是 API，排程回合也一樣。
 - stage 是單一 Team 模式（`deploy/stage/stage.json:110-111`）。toolbox 沒有 Team 層的存取控制（`docs/adr/0007-foundry-hosted-native-first.md:229`）。ADR-0006 A3 把 OAuth connector 列為「之後逐項送 Neal」（`docs/adr/0006-team-trust-boundary-grokbot-mode.md:190`）。
 - `src/fa-shared-context-poc` 裡沒有任何 per-user OAuth 連線、refresh 或撤銷的程式。

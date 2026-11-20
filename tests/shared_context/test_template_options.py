@@ -13,14 +13,17 @@ from test_m3_auth import jwk_client, signing_key
 from test_skills_capability import FILES, GRANTS, SKILLS_REF
 
 
-def test_options_offer_effective_skills_and_capabilities_that_selection_accepts(assistant_api, signing_key, jwk_client):
+def test_options_offer_effective_skills_and_capabilities_that_selection_accepts(
+        assistant_api, signing_key, jwk_client, monkeypatch):
     from shared_context.behavior_skill_draft import HISTORY_SKILL_DRAFT_PROFILE
     from test_skill_purpose_api import add_purpose_skill
     approved = add_purpose_skill(assistant_api, signing_key, jwk_client, name="approved-guide")
     add_purpose_skill(assistant_api, signing_key, jwk_client, name="waiting-guide", approve=False)
     h, control, human = configured(assistant_api)
     h.runtime.capability_grants = GRANTS
+    monkeypatch.setenv("FA_CAPABILITY_SELECTION_MAX", "30")
     options = template_options(control, h.assistant, human)
+    assert options.max_capabilities == 30
     assert [item.name for item in options.skills] == ["approved-guide"] and not options.more_skills
     assert options.skills[0].version_id == approved["version_id"]
     assert options.skills[0].metadata_sha256 == approved["metadata_sha256"]
@@ -35,6 +38,17 @@ def test_options_offer_effective_skills_and_capabilities_that_selection_accepts(
     selected, _ = select(h, request_id="choose-from-options", value=value)
     assert selected.status_code == 200, selected.text
 
+
+
+@pytest.mark.parametrize("limit,sent", [(None, None), ("12", None), ("13", 13), ("1", 1)])
+def test_options_send_the_limit_only_when_it_differs_from_the_default(assistant_api, monkeypatch, limit, sent):
+    """At 12 the reply has no ``max_capabilities``, as before the setting: a bridge older than it forbids the field
+    (502 TEMPLATE_RESPONSE_INVALID), and the console reads a missing field as 12."""
+    h, control, human = configured(assistant_api)
+    if limit is not None:
+        monkeypatch.setenv("FA_CAPABILITY_SELECTION_MAX", limit)
+    reply = template_options(control, h.assistant, human).model_dump(mode="json")
+    assert reply.get("max_capabilities") == sent and ("max_capabilities" in reply) is (sent is not None)
 
 def test_options_need_current_standing_read_scope(assistant_api):
     h, control, human = configured(assistant_api)

@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -25,7 +26,12 @@ from .behavior_wire import Digest, Identifier, WireModel
 from .errors import Problem
 from .tool_catalog import CatalogEntry, StdioEntry, ToolboxEntry, ToolCatalog, build_catalog, load_catalog
 
-MAX_CAPABILITIES = 12
+# Wire bound on a stored selection or capture, the same in every process: each capability adds at least one tool, and
+# Azure OpenAI documents 128 tools per /chat/completions request. How many a human may select is the setting below.
+MAX_CAPABILITIES = 128
+SELECTION_MAX_ENV = "FA_CAPABILITY_SELECTION_MAX"
+# Unset keeps the limit every earlier API enforced; an options reply without the field means the same.
+DEFAULT_SELECTION_MAX = 12
 _log = logging.getLogger(__name__)
 _TEAM_MCP_COLLISIONS_LOGGED: set[str] = set()
 # The memory variant is derived from its independent capture, not selectable as a template role.
@@ -246,8 +252,18 @@ def enabled_toolboxes(catalog: ToolCatalog | None, names: tuple[str, ...]) -> To
     return build_catalog([item for item in catalog.entries if item.entry_id not in toolboxes - set(names)])
 
 
+def selection_max() -> int:
+    """How many capabilities one human selection may name: ``FA_CAPABILITY_SELECTION_MAX``, 1 to MAX_CAPABILITIES."""
+    value = os.environ.get(SELECTION_MAX_ENV, str(DEFAULT_SELECTION_MAX))
+    if re.fullmatch(r"[1-9][0-9]{0,2}", value) is None or int(value) > MAX_CAPABILITIES:
+        raise Problem(503, "CAPABILITY_CONFIGURATION",
+                      f"{SELECTION_MAX_ENV} must be an integer from 1 to {MAX_CAPABILITIES}")
+    return int(value)
+
+
 def load_runtime_capabilities():
     """API startup: grants from the organization catalog and enabled FA builtins, plus the catalog itself."""
+    selection_max()  # a bad value stops startup, not each selection
     directory = os.environ.get("FA_TOOL_CATALOG_DIR")
     builtins = tuple(item for item in os.environ.get("FA_CAPABILITY_BUILTINS", "").split(",") if item)
     toolboxes = tuple(item for item in os.environ.get("FA_CAPABILITY_TOOLBOX_ENTRIES", "").split(",") if item)
@@ -393,6 +409,10 @@ def check_selectable(refs: tuple[CapabilityRef, ...], prompt_profile: str | None
         validate_refs(refs)
     except ValueError:
         raise Problem(422, "CAPABILITY_SELECTION_INVALID", "capability references must be distinct and ordered") from None
+    limit = selection_max()
+    if len(refs) > limit:
+        raise Problem(422, "CAPABILITY_SELECTION_LIMIT", f"one selection may name at most {limit} capabilities",
+                      limit=limit)
     if refs and prompt_profile not in CAPABILITY_BASE_PROFILES:
         raise Problem(422, "CAPABILITY_BASE_UNSUPPORTED", "this instruction profile does not compose capabilities")
     if (any(ref.entry_id == DELEGATE_READER_ENTRY_ID for ref in refs)

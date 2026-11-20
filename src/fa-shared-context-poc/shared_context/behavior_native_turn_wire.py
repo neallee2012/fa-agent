@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, Field, TypeAdapter, field_validator, model_validator
@@ -75,6 +76,20 @@ def native_model_switch_enabled(environ=None):
     if value not in (None, "0", "1"):
         raise Problem(503, "NATIVE_PROFILE_UNSUPPORTED", "FA_NATIVE_MODEL_SWITCH must be 0 or 1")
     return value == "1"
+
+
+# Hosted ENV like MODEL_SWITCH_ENV (README#native-compaction-threshold).
+COMPACTION_PERCENT_ENV = "FA_NATIVE_COMPACTION_PERCENT"
+
+
+def native_compaction_threshold(environ=None):
+    """The auto profile's ``background_compaction_threshold``: ``FA_NATIVE_COMPACTION_PERCENT`` (default 65) / 100.
+
+    Below the runtime's 95% ``buffer_exhaustion_threshold``, where a turn blocks until compaction finishes."""
+    value = (os.environ if environ is None else environ).get(COMPACTION_PERCENT_ENV, "65")
+    if re.fullmatch(r"[1-9]|[1-8][0-9]|9[0-4]", value) is None:
+        raise Problem(503, "NATIVE_EXECUTION_UNAVAILABLE", "FA_NATIVE_COMPACTION_PERCENT must be an integer from 1 to 94")
+    return int(value) / 100
 
 
 def automatic_omission_id(agent_id, source_sid, target_sid, target_version):

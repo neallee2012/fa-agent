@@ -33,7 +33,7 @@ from .behavior_assistant_boundary import AssistantModelBoundary
 from .behavior_assistant_wire import Empty, InstructionTask
 from .behavior_model_direct import DirectCompletions, DirectResponses
 from .behavior_model_direct_probe import SCOPE
-from .behavior_native_turn_wire import NativeHistory, NativeResult, TurnNumber, material_digest
+from .behavior_native_turn_wire import NativeHistory, NativeResult, TurnNumber, material_digest, native_compaction_threshold
 from .behavior_sdk_files import SdkSessionFiles, TOOL_OUTPUT_READ_GUIDANCE, TOOL_OUTPUT_READ_REFUSAL
 from .behavior_skill_prompt import assemble_prompt
 from .behavior_turn_usage import AGENT_TURN_USAGE_PATH, AgentTurnUsageReport
@@ -1396,6 +1396,7 @@ def native_runtime_from_environment(hosted):
     state_profile = os.environ.get("FA_NATIVE_TURNS")
     if state_profile not in ACCEPTED_STATE_PROFILES:
         raise Problem(403, "NATIVE_TURNS_DISABLED", "the native state profile must be explicitly enabled")
+    native_compaction_threshold()  # a bad value stops startup, not each auto-profile turn
     # Guard A/B: the API reads this image's pair from the definition's declaration, so it must be this image's;
     # undeclared is what the API takes it for (a newer image under a definition that says nothing does not start).
     if os.environ.get(RELEASE_ENV, "/".join(UNDECLARED_RELEASE)) != PINNED_RELEASE_TEXT:

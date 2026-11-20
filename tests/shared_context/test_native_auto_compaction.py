@@ -99,8 +99,11 @@ def completion_stream(number, delta, finish_reason, *, prompt_tokens):
     return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=raw.encode())
 
 
-def run_turns(monkeypatch, runtime_path, name, captures, paragraphs=60, provider=None, hitl_client=None):
-    """One conversation, one turn per capture; a different capture on a later turn is a model switch."""
+def run_turns(monkeypatch, runtime_path, name, captures, paragraphs=60, provider=None, hitl_client=None,
+              cold_from=None):
+    """One conversation, one turn per capture; a different capture on a later turn is a model switch.
+
+    ``cold_from``: the kept SDK stops before that turn, so it resumes the saved state in a new one."""
     root = isolated(monkeypatch, name)
     requests, receipts, saved = [], [], []
 
@@ -116,6 +119,8 @@ def run_turns(monkeypatch, runtime_path, name, captures, paragraphs=60, provider
     with TestClient(create_host(SimpleNamespace(identity=IDENTITY), native_runtime=runtime)) as client:
         cid = None
         for n, selected in enumerate(captures, 1):
+            if n == cold_from:
+                client.portal.call(executor.resident.aclose)
             rid = f"rid-{n}"
             text = ("MARK-TURN-1 " if n == 1 else "") + "".join(FILLER.format(i=n * 1000 + j) for j in range(paragraphs))
             request = NativeSubmit(command=submit(rid=rid, cid=cid, text=text).command, capture=selected)
@@ -210,10 +215,13 @@ def large_replies(requests, turn=lambda: None):
     return provider
 
 
-@pytest.mark.parametrize("declared,first", [(None, 4), (272000, 8)])
+@pytest.mark.parametrize("declared,percent,first", [(None, None, 4), (272000, None, 7), (272000, "80", 8)])
 def test_the_runtime_compacts_at_the_declared_input_limit_even_above_its_128000_default(
-        monkeypatch, runtime_path, declared, first):
-    """TC-04: gpt-5.4-mini's documented 272000 input reaches the pinned runtime, which compacts at 80% of it."""
+        monkeypatch, runtime_path, declared, percent, first):
+    """TC-04: gpt-5.4-mini's documented 272000 input reaches the pinned runtime, which compacts at FA's 65% of it
+    (FA_NATIVE_COMPACTION_PERCENT; the runtime's own default is 80%)."""
+    if percent is not None:
+        monkeypatch.setenv("FA_NATIVE_COMPACTION_PERCENT", percent)
     values = capture().model_dump(mode="json")
     settings = values["template"]["settings"]
     settings.update(model_provider=None, checkpoint_profile=AUTO)
@@ -224,12 +232,35 @@ def test_the_runtime_compacts_at_the_declared_input_limit_even_above_its_128000_
         values["model_capacity"] = model.capacity_snapshot().model_dump(mode="json")
         settings["model_capacity_profile"] = "fa-model-capacity-v1"
     selected = NativeTurnCapture.model_validate_json(json.dumps(values))
-    requests, receipts, _, _ = run_turns(monkeypatch, runtime_path, f"declared-{declared}", [selected] * first,
-                                         paragraphs=5, provider=large_replies)
+    requests, receipts, _, _ = run_turns(monkeypatch, runtime_path, f"declared-{declared}-{percent}",
+                                         [selected] * first, paragraphs=5, provider=large_replies)
     assert [status for status, _, _ in receipts] == ["completed"] * first, receipts
-    # Without a declaration runtime 1.0.103's 128000 default compacts at turn 4 (1.0.83: turn 5, ~120k); 272000
-    # waits until ~240k.
+    # Runtime 1.0.112, about 30k more per turn: 65% of its 128000 default still lands on turn 4; 65% of 272000 on turn 7
+    # (~209k); 80% of 272000 waits until turn 8 (~244k).
     assert [request["turn"] for request in requests if request["compaction"]] == [first]
+
+
+def test_a_cold_resume_sends_the_current_compaction_percent(monkeypatch, runtime_path):
+    """resume_session sends the threshold as create_session does: 80% through turn 6, then a cold turn 7 at 65%
+    compacts on turn 7 instead of 8. Models a restart onto a new FA_NATIVE_COMPACTION_PERCENT, which the threshold
+    reads when each session opens (m2_copilot._bind_turn_callbacks)."""
+    values = capture().model_dump(mode="json")
+    values["template"]["settings"].update(model_provider=None, checkpoint_profile=AUTO,
+                                          model_capacity_profile="fa-model-capacity-v1")
+    model = InstructionModel(id="gpt-5.4-mini", display_name="gpt-5.4-mini", context_window_tokens=400000,
+                             max_prompt_tokens=272000, max_output_tokens=128000)
+    values["model"] = model.model_dump(mode="json")
+    values["model_capacity"] = model.capacity_snapshot().model_dump(mode="json")
+    selected = NativeTurnCapture.model_validate_json(json.dumps(values))
+
+    def captures():
+        for n in range(1, 8):
+            monkeypatch.setenv("FA_NATIVE_COMPACTION_PERCENT", "80" if n < 7 else "65")
+            yield selected
+    requests, receipts, _, _ = run_turns(monkeypatch, runtime_path, "resume-percent", captures(),
+                                         paragraphs=5, provider=large_replies, cold_from=7)
+    assert [status for status, _, _ in receipts] == ["completed"] * 7, receipts
+    assert [request["turn"] for request in requests if request["compaction"]] == [7]
 
 
 def test_auto_profile_turns_still_complete_when_the_runtime_truncates_a_tiny_window(monkeypatch, runtime_path):

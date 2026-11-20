@@ -172,7 +172,7 @@ TeamConnectorState
 
 ### `AgentConnectorNarrowing`
 
-現有 `CapabilityCapture` 是手動選擇的白名單，最多 12 項，而且對話內只能縮小。不要把預設開啟的 connector 硬塞進這個結構。
+現有 `CapabilityCapture` 是手動選擇的白名單，項數上限由 API 的 `FA_CAPABILITY_SELECTION_MAX` 決定（未設定是 12，最多 128，見 [README](../src/fa-shared-context-poc/README.md#capability-selection-max)），而且對話內只能縮小。不要把預設開啟的 connector 硬塞進這個結構。
 
 ```text
 AgentConnectorNarrowing
@@ -399,7 +399,7 @@ P0 結論若顯示 app caller 無法使用 owner OAuth，停止 C1 到 G1。另�
 
 **Build.**
 
-- [x] 保留現有 `CapabilityCapture` 的白名單與最多 12 項規則。
+- [x] 保留現有 `CapabilityCapture` 的白名單與項數上限（當時是 12 項，2026-11-20 起可由 `FA_CAPABILITY_SELECTION_MAX` 調整）。
 - [x] 新增獨立 `ConnectorCapture`，不占手動 capability 名額。
 - [x] `ConnectorCapture` 只在新對話建立時加入當時已啟用且未被該 Agent 關閉的 connector。
 - [x] 對話內 connector capture 只能縮小，不能因 Team 後來新增 connector 而變大。
@@ -801,7 +801,7 @@ D1 註記（2026-10-10）：dev 報告在 [progress](progress.md#connector-m1-de
 3. 用 legacy `mcp_TeamsServer` 做正式主線。Microsoft 不建議新專案使用。
 4. 自建 Graph OpenAPI Teams connector。它會重做 Work IQ 已提供的路徑與工具發現。
 5. 把多個 OAuth connector 放進同一 toolbox。P0a 已證明一個未同意 source 會讓整份 `tools/list` 失敗。
-6. 把 connector 預設開啟硬塞進現有 12 項 capability whitelist。它會改壞既有 capture 不增權規則，也會讓 internal read、write entry 被當成兩個產品名額。
+6. 把 connector 預設開啟硬塞進現有的 capability whitelist（有項數上限）。它會改壞既有 capture 不增權規則，也會讓 internal read、write entry 被當成兩個產品名額。
 7. 用假 Connected 狀態。只有 Foundry 知道 token 是否仍有效，設定頁只能顯示 Added，實際呼叫才能證明當次可用。
 8. 自動重送 Teams write。Teams 發送不是 idempotent，未知結果必須保留 UNKNOWN。
 

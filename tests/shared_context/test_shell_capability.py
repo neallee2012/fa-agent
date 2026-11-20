@@ -35,14 +35,14 @@ def grant():
     return available_grants(None, ("fa-shell-v1",))["fa-shell-v1"]
 
 
-def test_builtin_is_one_run_command_tool_and_capabilities_allow_twelve():
+def test_builtin_is_one_run_command_tool_and_stored_selections_allow_one_request_of_tools():
     assert hosted.CAPABILITY_HANDLERS[shell.ENTRY_ID] is shell.shell_capability
     assert BUILTIN_CAPABILITIES[shell.ENTRY_ID].tools == ("run_command",) and not grant().vision
-    assert MAX_CAPABILITIES == 12
-    refs = tuple(CapabilityRef(entry_id=f"entry-{index:02d}", entry_sha256="0" * 64) for index in range(12))
+    assert MAX_CAPABILITIES == 128
+    refs = tuple(CapabilityRef(entry_id=f"entry-{index:03d}", entry_sha256="0" * 64) for index in range(128))
     assert validate_refs(refs) == refs
     with pytest.raises(ValueError):
-        validate_refs(refs + (CapabilityRef(entry_id="entry-12", entry_sha256="0" * 64),))
+        validate_refs(refs + (CapabilityRef(entry_id="entry-128", entry_sha256="0" * 64),))
     needs = session_needs(CapabilityCapture(head_selection_id=None, grants=(grant(),)))
     assert needs.custom_tools == ("run_command",) and needs.builtin_tools == ()
     text = addendum((grant(),))

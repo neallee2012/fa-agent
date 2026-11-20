@@ -1288,6 +1288,7 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     AGENT_ROLE_PROMPT_INVALID:"保存的角色說明無法通過核對；不顯示也不改用其他版本。",
     AGENT_ROLE_PROMPT_MISSING:"這位助理的角色版本需要角色說明，但還沒有保存；沒有改用其他版本。",
     CAPABILITY_SOURCES_CHANGED:"選定的能力已不在目前的組織清單；請重新讀取設定。",
+    CAPABILITY_SELECTION_LIMIT:"選的能力超過這個部署允許的項數；原設定沒有改變，請先關掉幾項。",
     AGENT_TEMPLATE_PROFILE_UNSUPPORTED:"這位助理還沒有可查的提示版本設定；不以其他版本代替。",
     TEMPLATE_SELECTION_UNAVAILABLE:"目前部署尚未提供新對話選擇或原回條 reader；原紀錄保持，不改用其他入口或啟用 flags。",
     TEMPLATE_SELECTION_INVALID:"選擇請求的完整模板、原 ID 或格式不符；未送出。",
@@ -1948,7 +1949,7 @@ function templateSelectionConfirmed(value,command,expectedHash){
 const AGENT_SETTINGS_TABS=["installed","skills","mcp","plugins","routines"],TEAM_SETTINGS_TABS=["team-mcp","team-connectors","team-skills","rules"];
 const SETTINGS_TABS=[...AGENT_SETTINGS_TABS,...TEAM_SETTINGS_TABS];
 const SETTINGS_SKILL_READER="fa-skills-v1",SETTINGS_SKILL_RESOURCES="fa-skill-resources-v1";
-const SETTINGS_MAX_SKILLS=4,SETTINGS_MAX_CAPABILITIES=12;
+const SETTINGS_MAX_SKILLS=4;
 const SETTINGS_BUILTIN_NAMES={
   "fa-desktop-v1":"桌面與瀏覽器操作","fa-delegate-v1":"交辦子任務","fa-delegate-reader-v1":"讀取使用者檔案",
   "fa-agent-collaboration-v1":"和同 Team 助理傳話",[SETTINGS_SKILL_READER]:"讀取已批准的 skill",
@@ -2047,7 +2048,8 @@ function settingsBlock(item){
     return "需要「讀取已批准的 skill」能力，但目前環境未提供。";
   if(item.group==="skill"&&draft.skills.size>=SETTINGS_MAX_SKILLS)return `一位助理最多選 ${SETTINGS_MAX_SKILLS} 個 skill。`;
   const added=(item.group==="skill"?0:1)+(addsReader?1:0);
-  if(added&&draft.capabilities.size+added>SETTINGS_MAX_CAPABILITIES)return `一位助理最多選 ${SETTINGS_MAX_CAPABILITIES} 項能力。`;
+  const most=options.max_capabilities??12;
+  if(added&&draft.capabilities.size+added>most)return `一位助理最多選 ${most} 項能力。`;
   return "";
 }
 function settingsToggle(item,on){
@@ -9097,7 +9099,7 @@ el("refresh-models").addEventListener("click",async()=>{
 el("refresh-agents").addEventListener("click",refreshAgentDirectory);
 // Onboarding is a thin view of the local record; every continue reuses the original request ID and body.
 const ONBOARDING_ROLE_MAX=2048,ONBOARDING_ACTIVE=new Set(["admitted","creating","registered"]);
-const ONBOARDING_MAX_CAPABILITIES=12,ONBOARDING_MAX_SKILLS=4,ONBOARDING_SKILLS_TOOL="fa-skills-v1";
+const ONBOARDING_MAX_SKILLS=4,ONBOARDING_SKILLS_TOOL="fa-skills-v1";
 // manifest: the newest confirmed link's manifest, which also lists every earlier link (restart with this one).
 const onboarding={busy:false,current:null,loaded:false,timer:null,error:null,options:null,optionsRead:false,inputs:[],
   optionsError:null,manifest:null};
@@ -9109,7 +9111,8 @@ function onboardingChoice(){
 }
 function onboardingChoiceProblem(choice){
   if(!onboarding.options)return onboarding.optionsError?friendlyError(onboarding.optionsError):"正在讀取 Team 已批准的工具與 skill…";
-  if(choice.capabilities.length>ONBOARDING_MAX_CAPABILITIES)return `工具最多 ${ONBOARDING_MAX_CAPABILITIES} 項。`;
+  const most=onboarding.options.options.max_capabilities??12;
+  if(choice.capabilities.length>most)return `工具最多 ${most} 項。`;
   if(choice.skills.length>ONBOARDING_MAX_SKILLS)return `skill 最多 ${ONBOARDING_MAX_SKILLS} 個。`;
   if(choice.skills.length&&!choice.capabilities.some(item=>item.entry_id===ONBOARDING_SKILLS_TOOL))
     return friendlyError({code:"AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED"});

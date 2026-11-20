@@ -13,7 +13,7 @@ from .behavior_sdk_state import CheckpointProfile, ModelProvider, native_default
 from .behavior_skill_prompt import InstructionPromptProfile, assemble_prompt
 from .behavior_skill_catalog import CatalogBudgetProfile
 from .behavior_attachments import TextAttachmentProfile
-from .behavior_capabilities import CapabilityRef, validate_refs
+from .behavior_capabilities import DEFAULT_SELECTION_MAX, MAX_CAPABILITIES, CapabilityRef, validate_refs
 from .behavior_text_files import UserTextFileProfile
 from .behavior_turn_origin import TurnOriginProfile
 from .behavior_wire import Digest, Identifier, SdkStartProfile, WireModel, WorkerProfile, known_release, same_but_release
@@ -262,6 +262,10 @@ class TemplateOptions(WireModel):
         default_factory=dict, exclude_if=lambda value: not value)
     capabilities: tuple[TemplateCapabilityOption, ...]
     composable_profiles: tuple[str, ...]
+    # The API's FA_CAPABILITY_SELECTION_MAX. Left out at the default, as every older API leaves it out, so an older
+    # bridge (its TemplateOptions has no such field) still reads the reply while the API and the console change version.
+    max_capabilities: Annotated[int, Field(ge=1, le=MAX_CAPABILITIES)] = Field(
+        default=DEFAULT_SELECTION_MAX, exclude_if=lambda value: value == DEFAULT_SELECTION_MAX)
     responses: TemplateResponsesOptions = Field(default_factory=TemplateResponsesOptions)
     authorization: Literal[False] = False
     activated: Literal[False] = False
@@ -271,7 +275,7 @@ def template_options(
     control: WorkPolicyControl, authority: AssistantAuthority, principal: BehaviorPrincipal,
 ) -> TemplateOptions:
     """Currently effective Team skills (the exact references selection verifies) and available capabilities."""
-    from .behavior_capabilities import CAPABILITY_BASE_PROFILES, runtime_grants
+    from .behavior_capabilities import CAPABILITY_BASE_PROFILES, runtime_grants, selection_max
     control._human(principal)
     if authority.runtime is not control.runtime:
         raise Problem(503, "AGENT_TEMPLATE_DISABLED", "the configured assistant authority is required")
@@ -308,4 +312,5 @@ def template_options(
         vision=grant.vision) for grant in sorted(runtime_grants(control.runtime).values(), key=lambda g: g.entry_id))
     return TemplateOptions(skills=tuple(sorted(skills, key=lambda item: item.name)), more_skills=more,
                            skill_titles={item.name: titles[item.name] for item in skills},
-                           capabilities=capabilities, composable_profiles=tuple(sorted(CAPABILITY_BASE_PROFILES)))
+                           capabilities=capabilities, composable_profiles=tuple(sorted(CAPABILITY_BASE_PROFILES)),
+                           max_capabilities=selection_max())

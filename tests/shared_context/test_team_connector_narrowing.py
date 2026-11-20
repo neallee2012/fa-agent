@@ -217,7 +217,7 @@ def test_saved_choices_pass_the_real_startup_and_migration_readers(team):
     assert readers() == baseline
 
 
-def test_a_turn_with_twelve_selected_capabilities_still_carries_its_connectors_to_hosted():
+def test_a_turn_with_the_most_selected_capabilities_still_carries_its_connectors_to_hosted():
     from shared_context.behavior_assistant_wire import InstructionTask
     from shared_context.behavior_capabilities import MAX_CAPABILITIES, CapabilityCapture, turn_grants
 
@@ -227,7 +227,7 @@ def test_a_turn_with_twelve_selected_capabilities_still_carries_its_connectors_t
         return toolbox_grant(entry_id, toolbox, server)
 
     selected = CapabilityCapture(head_selection_id=None, grants=tuple(
-        grant(f"team-s{index:02d}", "fa-team-team-one", f"s{index:02d}") for index in range(MAX_CAPABILITIES)))
+        grant(f"team-s{index:03d}", "fa-team-team-one", f"s{index:03d}") for index in range(MAX_CAPABILITIES)))
     connector = tuple(grant(connector_entry_id(label), "fa-connector-team-one-teams", label)
                       for label in ("teams_read", "teams_write"))
     tools = turn_grants(selected, connector)

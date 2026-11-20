@@ -456,3 +456,44 @@ def test_the_sync_job_gets_the_registered_v2_flag_only_with_the_switch_on(ci):
     guard_off_profile(ci)
     with pytest.raises(SystemExit, match="required from ADR-0009 2d-ii"):  # 2d-ii: no script without the switch
         ci._sync_script("registry/hosted@sha256:" + "a" * 64, follow=True)
+
+
+CAP = "FA_CAPABILITY_SELECTION_MAX"
+
+
+def test_raising_the_capability_limit_needs_a_serving_api_with_the_128_bound(ci, monkeypatch, served):
+    """An image before MAX_CAPABILITIES 128 reads a stored capture above 12 as 409 NATIVE_STATE_INVALID, so the setting
+    rises above 12 only in a deploy after the one that shipped the bound (src README#capability-selection-max)."""
+    switch_on(ci)
+    ci.STAGE["api_environment"][CAP] = "32"
+    old = ["behavior_capabilities.MAX_CAPABILITIES=12, needs 128"]
+    monkeypatch.setattr(ci, "missing_capability_bound", lambda commit: old if commit == "base" else [])
+    api_app(ci, monkeypatch, deployed="1")
+    for step in (ci.guard, ci.switch_preconditions):  # sync and api read the app themselves (the dev line)
+        with pytest.raises(SystemExit, match=f"{CAP} above 12 .*MAX_CAPABILITIES=12, needs 128.*unset first"):
+            step()
+    api_app(ci, monkeypatch, deployed="1", revision=f"{ci.STAGE['api_app']}--portal")
+    with pytest.raises(SystemExit, match="serving commit is unknown"):
+        ci.guard()
+    old.clear()
+    api_app(ci, monkeypatch, deployed="1")
+    ci.guard()
+    ci.switch_preconditions()
+
+
+@pytest.mark.parametrize("value", ["12", "5", None])
+def test_a_capability_limit_up_to_12_never_reads_the_serving_commit(ci, monkeypatch, value):
+    switch_on(ci)
+    if value is not None:
+        ci.STAGE["api_environment"][CAP] = value
+    monkeypatch.setattr(ci, "serving_commit", lambda revision: pytest.fail("the serving commit was read"))
+    monkeypatch.setattr(ci, "missing_capability_bound", lambda commit: pytest.fail("the bound was read"))
+    api_app(ci, monkeypatch, deployed="1")
+    ci.switch_preconditions()
+
+
+def test_the_capability_bound_check_reads_the_real_checkout():
+    from shared_context.behavior_capabilities import MAX_CAPABILITIES
+    real = load_ci()
+    assert real.api_2di_schema(name="MAX_CAPABILITIES", source="behavior_capabilities.py") == MAX_CAPABILITIES
+    assert real.missing_capability_bound("0" * 40) == ["behavior_capabilities.MAX_CAPABILITIES=0, needs 128"]
