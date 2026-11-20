@@ -7,7 +7,9 @@ from shared_context.errors import Problem
 def deployed_versions(monkeypatch, versions, *, others=False):
     """``versions``: one version for every Agent, or {agent_id: version}; a missing Agent is still following,
     or keeps its registered version when ``others`` (as a composition without a Foundry resolver does)."""
-    def current(runtime, target):
+    def current(runtime, target, *, require_responses=False):
+        if require_responses:
+            raise Problem(409, "NATIVE_TURNS_DISABLED", "this stub resolves no Responses build definition")
         if target is None:
             return None if isinstance(versions, dict) else versions
         value = versions.get(target.agent_id) if isinstance(versions, dict) else versions

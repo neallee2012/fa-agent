@@ -57,7 +57,17 @@ SWEEPS = {
     # infra/azd/main.bicep names: a prefix plus a 13-character uniqueString token (with or without a digit).
     "generated-name": re.compile(r"(?<![A-Za-z0-9_-])(?:cog-|wps-|stbk|stcon|cr|st)[a-z0-9]{13}(?![A-Za-z0-9_])"),
 }
+# These sweeps start a branch with an unanchored run, which re retried at every position inside a long token
+# (quadratic on the legacy_stores snapshot lines). sweep() runs a copy whose run may only start where the run
+# starts, and falls back to the sweep itself where the copy could differ.
+RUN_STARTS = {"email": "[A-Za-z0-9._%+-]+", "teams-id": "[A-Za-z0-9:%._-]*"}
+ANCHORED = {k: (re.compile(SWEEPS[k].pattern.replace(run, f"(?<!{run[:-1]}){run}"), SWEEPS[k].flags),
+                re.compile(run[:-1], SWEEPS[k].flags & re.I)) for k, run in RUN_STARTS.items()}
 HASHY = re.compile(r"(?<![0-9A-Za-z+/])(?:[0-9a-f]{32,}|[0-9A-F]{32,}|[A-Za-z0-9+/]{40,}={0,2})(?![0-9A-Za-z+/])")
+EDGE_BEFORE, EDGE_AFTER = "(?<![0-9A-Za-z])", "(?![0-9A-Za-z])"
+# The only non-ASCII characters re.I matches to ASCII letters or digits (checked against every code point);
+# mapping them first keeps `literal in text.lower()` true wherever an re.I literal matches.
+ASCII_FOLDS = str.maketrans({"\u0130": "i", "\u0131": "i", "\u212a": "k", "\u017f": "s"})
 SCANNED = re.compile(r"scanned ~(\d+) bytes")
 GITLEAKS_FILES = frozenset({".gitleaks.toml", ".gitleaksignore"})
 
@@ -179,14 +189,13 @@ def original_patterns(mapping: dict) -> list[tuple[str, re.Pattern]]:
     their public placeholder, prefixes and verify_absent strings by position."""
     checks = []
     for g, placeholder in mapping["guids"].items():
-        checks.append((f"guid -> {placeholder}",
-                       re.compile(rf"(?<![0-9A-Za-z]){re.escape(g)}(?![0-9A-Za-z])", re.I)))
+        checks.append((f"guid -> {placeholder}", re.compile(EDGE_BEFORE + re.escape(g) + EDGE_AFTER, re.I)))
         checks.append((f"guid-nohyphen -> {placeholder}", re.compile(re.escape(g.replace("-", "")), re.I)))
     if mapping.get("guid_prefix_scrub"):
         prefixes = sorted({g[:8].lower() for g in mapping["guids"]} |
                           {p.lower() for p in mapping.get("truncated_prefixes", [])})
         for i, p in enumerate(prefixes, 1):
-            checks.append((f"guid-prefix #{i}", re.compile(rf"(?<![0-9A-Za-z]){p}(?![0-9A-Za-z])", re.I)))
+            checks.append((f"guid-prefix #{i}", re.compile(EDGE_BEFORE + p + EDGE_AFTER, re.I)))
     for r in mapping["rules"]:
         if r["type"] == "literal":
             checks.append((f"rule {r['id']}", re.compile(re.escape(r["find"]), re.I if r.get("ignore_case") else 0)))
@@ -198,10 +207,25 @@ def original_patterns(mapping: dict) -> list[tuple[str, re.Pattern]]:
     return checks
 
 
+def required_literal(rx: re.Pattern) -> str | None:
+    """The literal every match of an original_patterns() regex contains (lowercased under re.I), or None when
+    the regex is not an escaped ASCII literal with optional word-edge lookarounds."""
+    body = rx.pattern.removeprefix(EDGE_BEFORE).removesuffix(EDGE_AFTER)
+    literal = re.sub(r"\\(.)", r"\1", body, flags=re.S)
+    if re.escape(literal) != body or not literal.isascii():
+        return None
+    return literal.lower() if rx.flags & re.I else literal
+
+
 def check_originals(files: dict[str, str], checks: list[tuple[str, re.Pattern]]) -> bool:
+    # A str `in` per file skips the regex where its literal is absent, instead of 300 case-insensitive scans.
+    literals = [required_literal(rx) for _, rx in checks]
     present = []
     for rel, text in files.items():
-        for name, rx in checks:
+        folded = text.translate(ASCII_FOLDS).lower()
+        for (name, rx), literal in zip(checks, literals):
+            if literal is not None and literal not in (folded if rx.flags & re.I else text):
+                continue
             for m in rx.finditer(text):
                 present.append(f"{name} at {rel}:{line_of(text, m.start())}")
     print(f"[2] originals: {len(checks)} patterns, {len(present)} occurrences left")
@@ -267,6 +291,20 @@ def guid_reason(guid: str, mapping: dict) -> str | None:
     return None
 
 
+def sweep(kind: str, line: str) -> list[re.Match]:
+    """The matches of SWEEPS[kind].finditer(line). A run-start match is also a match at every later start in the
+    same run, and the copy only skips those later starts. The two differ only where a match ends right after a
+    run character and the sweep can start a match there; such a line is rescanned with the sweep itself."""
+    if kind not in ANCHORED:
+        return list(SWEEPS[kind].finditer(line))
+    anchored, run_char = ANCHORED[kind]
+    found = list(anchored.finditer(line))
+    if any(m.end() < len(line) and run_char.match(line, m.end() - 1) and SWEEPS[kind].match(line, m.end())
+           for m in found):
+        return list(SWEEPS[kind].finditer(line))
+    return found
+
+
 def check_residual(files: dict[str, str], mapping: dict) -> bool:
     allow = [(re.compile(a["pattern"]), a["why"]) for a in mapping.get("residual_allow", [])]
     hits: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -274,8 +312,8 @@ def check_residual(files: dict[str, str], mapping: dict) -> bool:
         for ln, line in enumerate(text.splitlines(), 1):
             for m in GUID_RE.finditer(line):  # every path, tests/ included
                 hits[("guid", m.group(0).lower())].append(f"{rel}:{ln}")
-            for kind, rx in SWEEPS.items():
-                for m in rx.finditer(line):
+            for kind in SWEEPS:
+                for m in sweep(kind, line):
                     hits[(kind, m.group(1) if kind == "subscription-id" else m.group(0))].append(f"{rel}:{ln}")
     unreviewed, allowed = [], Counter()
     for (kind, val), where in sorted(hits.items()):

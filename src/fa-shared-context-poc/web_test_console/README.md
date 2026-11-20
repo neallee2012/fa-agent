@@ -1940,7 +1940,7 @@ source／callback／模型I/O的層級與原FAIL另見[評測](../../../docs/age
   - 結果不明時保留原紀錄，畫面只提供「核對原請求」，不換編號重送。之後重新讀取目前設定；不管成功或失敗，都不從畫面推斷結果。
   - 只影響之後的新對話。舊對話、已開始的工作和既有權限都不變。
 - **各分頁內容**：
-  - **Skills**：Team 已批准、目前生效的 skill。開啟 skill 時會自動帶上「讀取已批准的 skill」（`fa-skills-v1`）；只要還有 skill 或 skill 附檔開著，這一項就不能關。批准、停用和新增 skill 排在下一片（S2）。
+  - **Skills**：Team 已批准、目前生效的 skill，顯示 skill 的標題（不知道標題時才顯示內部 ID，兩個 skill 標題相同時在標題後附 ID 前 8 碼）；勾選、比對和送出仍用 ID。助理模板與新增助理的 skill 選項也顯示標題。開啟 skill 時會自動帶上「讀取已批准的 skill」（`fa-skills-v1`）；只要還有 skill 或 skill 附檔開著，這一項就不能關。批准、停用和新增 skill 排在下一片（S2）。
   - **MCP**：catalog 裡的 MCP 項目（例如 toolbox 的 WebIQ）。只能對這位助理開或關；新增或修改 MCP 要找部署線，金鑰不經過這個頁面。
   - **Plugins**：FA 內建能力（kind `fa-builtin`，對照 Copilot 的 Built-in）。只能開或關，不能在這裡新增或移除。
   - **已安裝**：目前新對話設定裡的項目，可以依 Skills／MCP／Plugins 篩選，也可以依名稱或工具搜尋（只在畫面上篩選，不呼叫 API）。

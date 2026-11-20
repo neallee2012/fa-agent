@@ -9293,7 +9293,7 @@ test("template options add approved skills and capabilities, then use the same i
   ui.holder.templateResponses={
     "/api/agent-template":{ok:true,json:async()=>base},
     "/api/agent-template/options":{ok:true,json:async()=>({schema_version:"fa-agent-template-options-v1",
-      skills:[guide],more_skills:false,capabilities:[skills],
+      skills:[guide],more_skills:false,capabilities:[skills],skill_titles:{"receipt-guide":"收據指南"},
       composable_profiles:["fa-instruction-history-skill-draft-v1","fa-instruction-history-v1"],
       authorization:false,activated:false})},
     "/api/agent-template/inspect":{ok:true,json:async()=>({...inspectedTemplate(),template_sha256:"5".repeat(64),
@@ -9304,6 +9304,7 @@ test("template options add approved skills and capabilities, then use the same i
   ui.click("load-template-options");await ui.tick();await ui.tick();
   const inputs=vm.runInContext("templateOptionInputs",ui.context);
   assert.equal(JSON.stringify(inputs.map(input=>[input.faKind,input.checked])),JSON.stringify([["skill",false],["capability",false]]));
+  assert.equal(ui.nodes.get("template-options").children[0].children[1].textContent," skill 收據指南（版本 11111111…）");
   assert.equal(ui.calls.some(call=>call.method==="POST"),false);
   for(const index of [0,1]){
     const current=vm.runInContext("templateOptionInputs",ui.context)[index];current.checked=true;current.events.change();
@@ -9383,7 +9384,7 @@ const ONBOARDING_CAP=(entry_id,kind,tools)=>({entry_id,entry_sha256:entry_id[0].
 const ONBOARDING_SKILL=name=>({name,version_id:"1".repeat(32),sha256:"a".repeat(64),metadata_sha256:"b".repeat(64)});
 const ONBOARDING_OPTIONS={
   options:{schema_version:"fa-agent-template-options-v1",authorization:false,activated:false,more_skills:false,
-    composable_profiles:[],skills:[ONBOARDING_SKILL("receipt-guide"),ONBOARDING_SKILL("tone")],
+    composable_profiles:[],skills:[ONBOARDING_SKILL("receipt-guide"),ONBOARDING_SKILL("tone")],skill_titles:{tone:"語氣"},
     capabilities:[ONBOARDING_CAP("lookup","mcp-api",["search"]),ONBOARDING_CAP("fa-skills-v1","fa-builtin",["read_skill"]),
       ONBOARDING_CAP("fa-files-v1","fa-builtin",["read_file"])]},
   current:{capabilities:[{entry_id:"fa-skills-v1",entry_sha256:"f".repeat(64)},{entry_id:"lookup",entry_sha256:"l".repeat(64)}],
@@ -9630,6 +9631,8 @@ test("onboarding tools and skills come from the Team catalog with the default Te
   const shown=JSON.parse(JSON.stringify(inputs.map(input=>[input.faKind,input.faRef.entry_id||input.faRef.name,input.checked])));
   assert.deepEqual(shown,[["capability","lookup",true],["capability","fa-skills-v1",true],
     ["capability","fa-files-v1",false],["skill","receipt-guide",true],["skill","tone",false]]);
+  assert.deepEqual(ui.nodes.get("onboarding-skills").children.filter(node=>node.children?.length).map(line=>line.children[1].textContent),
+    [" receipt-guide（版本 11111111…）"," 語氣（版本 11111111…）"],"a skill without a known title shows its ID");
   const groups=ui.nodes.get("onboarding-capabilities").children.filter(node=>node.className==="muted")
     .map(node=>node.textContent).slice();
   assert.deepEqual(groups,["MCP","內建工具"]);
@@ -9890,6 +9893,37 @@ test("settings stages switches and sends one inspected selection that changes on
   assert.equal(ui.calls.filter(call=>call.url==="/api/agent-template").length,2);
   assert.deepEqual(ui.calls.filter(call=>call.method==="POST").map(call=>call.url),
     ["/api/agent-template/inspect","/api/agent-template/select"]);
+});
+
+test("settings show a Team skill by its title; the ID stays the reference that is sent",async()=>{
+  const id="7f4472555db6".padEnd(64,"0"),untitled="e".repeat(64);
+  const skill={...settingsSkill,name:id},other={...settingsSkill,name:untitled};
+  const options={...settingsOptions(),skills:[skill,other],skill_titles:{[id]:"web-lookup"}};
+  const ui=await openSettingsPage(options);
+  ui.click("settings-tab-skills");
+  assert.deepEqual(settingsRows(ui).map(row=>row.children[0].children[0].textContent),[untitled,"web-lookup"],
+    "listed by what is shown; a skill without a known title falls back to its ID");
+  for(const query of ["web-look","7F4472555DB6"]){
+    ui.nodes.get("settings-search").value=query;ui.nodes.get("settings-search").events.input();
+    assert.deepEqual(settingsRows(ui).map(row=>row.children[0].children[0].textContent),["web-lookup"]);
+  }
+  ui.nodes.get("settings-search").value="";ui.nodes.get("settings-search").events.input();
+  settingsSwitch(ui,"web-lookup",true);settingsSwitch(ui,untitled,true);
+  assert.match(ui.text("settings-changes"),/開啟：eee+、web-lookup、讀取已批准的 skill/);
+  ui.holder.templateResponses["/api/agent-template/inspect"]={ok:true,json:async()=>({...inspectedTemplate(),template_sha256:"a".repeat(64)})};
+  ui.click("settings-apply");await ui.answer(true);await ui.tick();
+  const command=JSON.parse(ui.calls.find(call=>call.url==="/api/agent-template/select").body);
+  assert.deepEqual(command.template.skills,[skill,other],"posted by ID order, with no title");
+});
+
+test("settings tell apart two skills with the same title by the start of their IDs",async()=>{
+  const first="a1b2c3d4".padEnd(64,"0"),second="f9e8d7c6".padEnd(64,"0"),alone="c".repeat(64);
+  const options={...settingsOptions(),skills:[first,second,alone].map(name=>({...settingsSkill,name})),
+    skill_titles:{[first]:"web-lookup",[second]:"web-lookup",[alone]:"notes"}};
+  const ui=await openSettingsPage(options);
+  ui.click("settings-tab-skills");
+  assert.deepEqual(settingsRows(ui).map(row=>row.children[0].children[0].textContent),
+    ["notes","web-lookup（a1b2c3d4）","web-lookup（f9e8d7c6）"]);
 });
 
 test("settings cancel or a changed draft sends nothing; a lost select is only reconciled by its original ID",async()=>{

@@ -4,6 +4,22 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="stage-v51-1119"></a>
+## 2026-11-19：stage 第 51 版（Hosted 升 SDK 1.0.34／runtime 1.0.112）
+
+- **第 51 版**（#1288，`2026.11.19-51`，Neal 台灣時間 11-19 21:18 合併）：#1286（ADR-0009 M11，Hosted 升 copilot-sdk 1.0.34／runtime 1.0.112）。
+  - **部署**：deploy-staging run 44532178007 成功。public-sync run 44534435234（21:32～22:07，35 分鐘）含第二道全部成功。
+  - **dev 測試**（#1286 合併前，run r4906，PR HEAD `9f0228ee`）：接續舊版對話、新對話 4 回合、6 次存檔都沒有 409、沒有 checkpoint 拒收；profile 讀回 `auto-no-custom-v1`；A 的轉述回合 8.4 秒 → 3.9 秒。真 runtime 1.0.112 本機斷網跑 `test_native_auto_compaction.py`，14 passed。
+  - **#1287**（verify_export 約 17 分鐘 → 51 秒，11-19 22:10 合併）在第 51 版之後，實際耗時待下一版 release 量測。
+  - **沒有驗證**：第 51 版只有 CI 證據，沒有在 stage 實際送訊息；temperature 0 只套在 gpt-4.1-mini，dev 用的 gpt-5.4-mini 沒驗到；dev 第一次轉交被 A 的審查拒絕（`NATIVE_HITL_REVIEW_DENIED`）原因未查；`NATIVE_STREAM_NOT_STARTED` 從第 49 版 dev 測試（r52）的 3 筆變 8 筆。
+  - **待 Neal**：B 的 `web-lookup` Team Skill 由 Neal 自己建立；建好後重跑轉交測試，通過後 skill 與 R1／R2 在 stage 生效（來源：總協調紀錄，R1／R2 目前只在 dev）。`OLDER_RELEASES` 的 1.0.13／1.0.83 仍待確認（`sdk_pin.py`、ADR-0009）。
+
+<a id="stage-v50-1119"></a>
+## 2026-11-19：stage 第 50 版（Agent 轉交更快、轉交回合依規則審查）
+
+- **第 50 版**（#1284，`2026.11.19-50`）：#1281（Agent 轉交回合的審查只依 Team 規則，11-19 合併）、#1282（交辦與回報接單後立刻叫對方開跑，拿掉約 8 秒空等）、#1283（A 的轉述回合改成串流）。
+  - **部署**：deploy-staging run 44480003402 成功。public-sync run 44481786926 因 30 分鐘 timeout 被取消，但「Gate 2」步驟已 success；#1285 把 timeout 改成 60 分鐘。
+
 <a id="stage-v49-1118"></a>
 ## 2026-11-18：stage 第 49 版（舊 Hosted job lane 退役收尾）
 

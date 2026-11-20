@@ -9828,7 +9828,7 @@ ce1c的92／37未重跑或重標；原9ce的Std P2與其後修補沿革保持。
 |---|---|
 | `GET /work-policy/v1/agent-template` | 下載`fa-agent-template.json`；`Cache-Control: no-store`及`x-content-sha256`綁回傳bytes，GET不可帶body或query |
 | `POST /work-policy/v1/agent-template/inspect` | 以匯出的JSON作body，僅核本目的環境的current role/settings／已配置skill refs，不寫設定、不啟SDK、不套用模板 |
-| `GET /work-policy/v1/agent-template/options` | 唯讀列出可加入模板的項目：Team 目前有效的已批准 skill（v2 catalog 參照，最多 24 個，超過時 `more_skills=true`），以及目前可用的 capability 參照與可組合的 base profile。不選定、不授權，GET 不可帶 body 或 query |
+| `GET /work-policy/v1/agent-template/options` | 唯讀列出可加入模板的項目：Team 目前有效的已批准 skill（v2 catalog 參照，最多 24 個，超過時 `more_skills=true`；`skill_titles` 附上各 skill 的標題，只供畫面顯示，參照與選定仍用 skill 名稱），以及目前可用的 capability 參照與可組合的 base profile。不選定、不授權，GET 不可帶 body 或 query |
 
 `fa-agent-template-v1`只含版本化instruction角色的profile／prefix hash／capability catalog version、
 固定SDK/runtime/mode要求、checkpoint／start-gate／capacity profile參照，以及目前已批准skill的

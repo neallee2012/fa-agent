@@ -1734,7 +1734,7 @@ function renderTemplateOptions(ready){
     box.append(line,document.createElement("br"));
   };
   for(const item of templateOptions.skills)
-    row("skill",`skill ${item.name}（版本 ${item.version_id.slice(0,8)}…）`,item,chosenSkills.has(item.name));
+    row("skill",`skill ${skillTitle(templateOptions,item.name)}（版本 ${item.version_id.slice(0,8)}…）`,item,chosenSkills.has(item.name));
   for(const item of templateOptions.capabilities)
     row("capability",`${item.entry_id}：${item.tools.join("、")}${item.vision?"（需要能看圖的模型）":""}`,
         {entry_id:item.entry_id,entry_sha256:item.entry_sha256},chosenCaps.has(item.entry_id));
@@ -1821,7 +1821,7 @@ function renderTemplate(){
   const statuses={matches:"相符",unavailable:"目的環境未提供",version_changed:"版本或內容不同",unresolved_reference:"未解析的參照"};
   const lines=[result.references_match?"參照相符；沒有啟用或授權任何能力。":"參照有差異；沒有套用任何變更。",
     `角色：${label(result.role_matches)}；設定：${label(result.settings_match)}；技能選擇：${label(result.selection_matches)}`];
-  for(const item of result.skills)lines.push(`${item.name}：${statuses[item.status]||"未知，請重新核對"}`);
+  for(const item of result.skills)lines.push(`${skillTitle(templateOptions,item.name)}：${statuses[item.status]||"未知，請重新核對"}`);
   lines.push("目的環境仍需目前身分與讀權、合法資料來源、模型連線及 Connector／工具的獨立授權。");
   text("template-comparison",lines.join("\n"));
 }
@@ -1999,16 +1999,24 @@ function clearSettingsView(){
 function settingsGroup(entry){
   return entry.kind==="fa-builtin"||!entry.kind&&entry.entry_id in SETTINGS_BUILTIN_NAMES?"plugin":"mcp";
 }
+// The title is display only; the skill ID stays the reference that is compared and sent. A shared title gets the
+// start of its ID so the owner can tell the skills apart.
+function skillTitle(options,name){
+  const titles=options?.skill_titles||{},title=titles[name];
+  if(!title)return name;
+  return Object.entries(titles).some(([other,shown])=>other!==name&&shown===title)?`${title}（${name.slice(0,8)}）`:title;
+}
 function settingsItems(){
   if(!settingsView||!settingsDraft)return [];
   const {base,options}=settingsView,items=[];
   const installedSkills=new Map(base.skills.map(item=>[item.name,item]));
   const offeredSkills=new Map(options.skills.map(item=>[item.name,item]));
-  for(const name of [...new Set([...offeredSkills.keys(),...installedSkills.keys()])].sort()){
+  const names=[...new Set([...offeredSkills.keys(),...installedSkills.keys()])].map(name=>[skillTitle(options,name),name]);
+  for(const [title,name] of names.sort(([a,x],[b,y])=>a.localeCompare(b)||x.localeCompare(y))){
     const ref=installedSkills.get(name)||offeredSkills.get(name);
     // Options list only skills whose newest version is effective; an installed skill with a newer draft awaiting
     // approval is still effective, and the API rechecks every reference on select.
-    items.push({group:"skill",key:name,title:name,detail:"Team 已批准的 skill",
+    items.push({group:"skill",key:name,title,detail:"Team 已批准的 skill",
       ref:offeredSkills.get(name)||ref,available:offeredSkills.has(name)||installedSkills.has(name),
       installed:installedSkills.has(name)});
   }
@@ -9131,7 +9139,7 @@ function renderOnboardingOptions(){
   }
   if(!value.options.capabilities.length)caps.textContent="Team 目前沒有已批准的工具。";
   for(const item of value.options.skills)
-    row(skills,"skill",`${item.name}（版本 ${item.version_id.slice(0,8)}…）`,
+    row(skills,"skill",`${skillTitle(value.options,item.name)}（版本 ${item.version_id.slice(0,8)}…）`,
       {name:item.name,version_id:item.version_id,sha256:item.sha256,metadata_sha256:item.metadata_sha256},
       chosenSkills.has(item.name+":"+item.version_id+":"+item.sha256));
   if(!value.options.skills.length)skills.textContent="Team 目前沒有已批准的 skill。";

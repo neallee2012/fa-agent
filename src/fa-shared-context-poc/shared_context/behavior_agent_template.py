@@ -257,6 +257,9 @@ class TemplateOptions(WireModel):
     schema_version: Literal["fa-agent-template-options-v1"] = "fa-agent-template-options-v1"
     skills: Annotated[tuple[TemplateSkill, ...], Field(max_length=MAX_TEMPLATE_OPTION_SKILLS)]
     more_skills: bool
+    # Display only: the owner picks a skill by its title; references and selection keep the skill name (its ID).
+    skill_titles: dict[Identifier, Annotated[str, Field(min_length=1, max_length=256)]] = Field(
+        default_factory=dict, exclude_if=lambda value: not value)
     capabilities: tuple[TemplateCapabilityOption, ...]
     composable_profiles: tuple[str, ...]
     responses: TemplateResponsesOptions = Field(default_factory=TemplateResponsesOptions)
@@ -280,10 +283,12 @@ def template_options(
     if (actor is None or actor.oid != binding.agent_oid or actor.team != binding.team_id
             or authority.artifacts.context.auth.tenant_id != binding.tenant_id):
         raise Problem(403, "SKILL_IDENTITY_DENIED", "the original server-bound artifact identity is required")
-    names, after, more = [], None, False
+    names, titles, after, more = [], {}, None, False
     for _ in range(MAX_TEMPLATE_OPTION_PAGES):
         page = authority.artifacts.skill_reviews(actor, binding.team_id, after)
-        names.extend(entry.artifact_id for entry in page.entries if entry.status == "effective")
+        effective = [entry for entry in page.entries if entry.status == "effective"]
+        names.extend(entry.artifact_id for entry in effective)
+        titles.update((entry.artifact_id, entry.title) for entry in effective)
         if len(names) > MAX_TEMPLATE_OPTION_SKILLS or page.next_after is None:
             break
         after = page.next_after
@@ -302,4 +307,5 @@ def template_options(
         entry_id=grant.entry_id, entry_sha256=grant.entry_sha256, kind=grant.kind, tools=grant.tools,
         vision=grant.vision) for grant in sorted(runtime_grants(control.runtime).values(), key=lambda g: g.entry_id))
     return TemplateOptions(skills=tuple(sorted(skills, key=lambda item: item.name)), more_skills=more,
+                           skill_titles={item.name: titles[item.name] for item in skills},
                            capabilities=capabilities, composable_profiles=tuple(sorted(CAPABILITY_BASE_PROFILES)))

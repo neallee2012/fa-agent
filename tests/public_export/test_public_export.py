@@ -839,3 +839,33 @@ def test_verify_sweeps_azd_generated_names(repo, tmp_path, mapping_file, fake_gi
     assert verify(out, base, mapping_file, fake_gitleaks["binary"]) == (0 if ok else 1)
     if not ok:
         assert f"UNREVIEWED generated-name {name[:4]}... x1 e.g. tests/test_ids.py:1" in capsys.readouterr().out
+
+
+def test_anchored_sweeps_find_exactly_what_the_sweeps_find():
+    import random
+    # Tokens that build Teams IDs, emails and runs ending mid-token at runtime (split so this file never matches).
+    tokens = ["@", "%40", "%3A", "thread" + ".", "v2", "tacv2", "sky" + "pe", "@unq" + ".gbl.spaces", "19:", "19",
+              "a", "Z", "0", "1x", ".", "-", "_", ":", "%", "+", " ", '"', "/", "\u212a", "\u017f", "b.c" + "om",
+              "x" * 20, "Partition" + "Key", "odata" + ".type"]
+    rng = random.Random(1372)
+    lines = ["".join(rng.choice(tokens) for _ in range(rng.randint(1, 40))) for _ in range(20000)]
+    for kind in verify_export.ANCHORED:
+        # A RUN_STARTS string that no longer appears in the sweep would silently bring back the slow scan.
+        assert verify_export.ANCHORED[kind][0].pattern != verify_export.SWEEPS[kind].pattern
+        for line in lines:
+            assert ([m.span() for m in verify_export.sweep(kind, line)] ==
+                    [m.span() for m in verify_export.SWEEPS[kind].finditer(line)]), (kind, line)
+
+
+def test_originals_prefilter_keeps_case_insensitive_matches_through_unicode_folds(capsys):
+    checks = [("rule a", re.compile(re.escape("Skip-Kit"), re.I)),
+              ("rule b", re.compile(re.escape("Exact"))),
+              ("guid-prefix #1", re.compile(verify_export.EDGE_BEFORE + "abcd1234" + verify_export.EDGE_AFTER, re.I)),
+              ("rule c absent-regex", re.compile(r"(?i)q\d+"))]
+    assert [verify_export.required_literal(rx) for _, rx in checks] == ["skip-kit", "Exact", "abcd1234", None]
+    # The pre-filter is per file, so each Unicode fold variant sits alone in its own file.
+    files = {"a.txt": "\u017fkip-\u212ait", "d.txt": "s\u212a\u0130p-k\u0131t", "e.txt": "SKIP-KIT",
+             "b.txt": "exact Exact xABCD1234 ABCD1234", "c.txt": "\u0130 Q12"}
+    expected = [f"{name} at {rel}:1" for rel, text in files.items() for name, rx in checks for _ in rx.finditer(text)]
+    assert len(expected) == 6 and not verify_export.check_originals(files, checks)
+    assert [ln.removeprefix("    PRESENT ") for ln in capsys.readouterr().out.splitlines()[1:]] == expected

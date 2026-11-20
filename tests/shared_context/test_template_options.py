@@ -24,6 +24,8 @@ def test_options_offer_effective_skills_and_capabilities_that_selection_accepts(
     assert [item.name for item in options.skills] == ["approved-guide"] and not options.more_skills
     assert options.skills[0].version_id == approved["version_id"]
     assert options.skills[0].metadata_sha256 == approved["metadata_sha256"]
+    # Display only, beside the references: the owner picks by title, selection still sends the ID.
+    assert options.skill_titles == {"approved-guide": "Not the approved purpose"}
     assert [(item.entry_id, item.entry_sha256, item.tools) for item in options.capabilities] == [
         (SKILLS_REF.entry_id, SKILLS_REF.entry_sha256, ("read_skill",))]
     assert HISTORY_SKILL_DRAFT_PROFILE in options.composable_profiles

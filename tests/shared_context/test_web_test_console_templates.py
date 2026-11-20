@@ -741,6 +741,8 @@ def test_template_options_are_a_pure_signed_read_through_the_local_console(templ
     assert value["capabilities"][0]["entry_sha256"] == c.h.runtime.capability_grants["fa-skills-v1"].entry_sha256
     exported = c.h.client.get(PATH, headers=c.h.headers()).json()
     assert {item["name"] for item in exported["skills"]} <= {item["name"] for item in value["skills"]}
+    assert [item["name"] for item in value["skills"]] == ["receipt-guide"]
+    assert value["skill_titles"] == {"receipt-guide": "Not the approved purpose"}
     assert c.calls == [("GET", PATH + "/options")]
     assert c.h.transport.backing.rows == rows and c.h.artifacts.repository.data == artifacts
     assert c.journal.read_bytes() == journal and c.config.model_dump_json() == config
