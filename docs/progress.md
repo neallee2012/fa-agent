@@ -4,6 +4,23 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="stage-v53-1121"></a>
+## 2026-11-21：stage 第 53 版（長對話提早壓縮、能力上限可設定）
+
+- **第 53 版**（#1295，`2026.11.21-53`，Neal 台灣時間 11-21 07:23 合併，merge `e19c4313`）：#1292（auto profile 的自動壓縮門檻由 Hosted env `FA_NATIVE_COMPACTION_PERCENT` 決定，1–94，預設 65；runtime 預設是 80）、#1293（一位助理可選的能力數由 API env `FA_CAPABILITY_SELECTION_MAX` 決定，1–128，預設 12；`MAX_CAPABILITIES` 12 → 128；設定大於 12 時 ci_deploy 要求服務中 API 已有 128）、#1294（審查 P3）。這次部署不改 stage 的資源與權限。
+  - **部署**：deploy-staging run 44836455486 成功（07:23～07:37），最後的 follow 步驟成功。public-sync run 44838117222 成功（07:37～07:39），`gate 2: PASS`，公開 release `v2026.11.21-53`。release PR 前在本機跑的第一道（`gate1.sh`：verify、discover、清單比對、milestone）全程 5 分 20 秒，記在 #1295 本文；workflow 裡 public-sync 的「Export, scrub and verify」步驟 61 秒。
+  - **dev 測試**（run 4908，main `e38a69ae`，報告在 #1295 本文）：部署 8 步都成功；options 沒有 `max_capabilities`（值是 12 時不送）；舊對話接續、新對話 4 回合、A→B 轉交都正常。A 存檔→B 開跑 1.97 秒、B 存檔→A 喚醒開跑 5.56 秒。
+  - **能力上限調到 32**（Neal 11-21 決定）：dev 由 #1296 設定，run 4909 只跑 check → guard → build api → api（Hosted image 與 A／B 版本不變），讀回 API env 為 32、options 回 `max_capabilities` 32、工作台設定頁與新增助理都讀到 32，一個回合正常。本機 8765 的程式換成 `3f9716e7`，舊 bridge 不認得這個欄位會回 502。stage 由 #1297 設 32，下一次 stage release 才部署。
+  - **沒有驗證**：65% 門檻沒有在雲端讀回（dev 對話沒觸發壓縮），只在 docker 裡用 runtime 1.0.112 實跑；超過上限時的阻擋只有離線測試（A 只勾 11 項）；stage 上還沒有人送回合測第 53 版。
+
+<a id="stage-v52-1120"></a>
+## 2026-11-20：stage 第 52 版（助理設定顯示 skill 名稱）與模型用量上限
+
+- **第 52 版**（#1291，`2026.11.20-52`，Neal 台灣時間 11-20 13:46 合併，merge `41e1e036`）：#1290（Skills 分頁、範本與新增助理顯示 skill 名稱，不再顯示 64 碼 ID）、#1287（公開同步的 verify 變快）。
+  - **部署**：deploy-staging run 44683304205 成功（13:46～14:01）；public-sync run 44684857066 成功（14:01～14:04）。dev 測試報告在 #1291 本文。
+  - **模型用量上限**：部署後 A 的一個長對話（約 20.6 萬 token，模型上限 27.2 萬）在 14:31 與 15:18 重送時都失敗，log 是 `gpt-6.1-sol ... exceeded token rate limit`。stage 這個部署每分鐘 50 萬 token（dev／stage 共用），整份對話每次呼叫都送出，一回合 7、8 次呼叫就超過；SDK 重試約 4 秒就放棄，畫面顯示「結果不確定」。#1292 把壓縮提早到 65%，但不保證不再撞上限。提高 TPM、重試等到重置與改錯誤文案都待 Neal 決定。
+  - **沒有驗證**：fa-stage-b 的 Skills 分頁是否顯示 `web-lookup` 名稱，待 Neal 確認。
+
 <a id="stage-v51-1119"></a>
 ## 2026-11-19：stage 第 51 版（Hosted 升 SDK 1.0.34／runtime 1.0.112）
 

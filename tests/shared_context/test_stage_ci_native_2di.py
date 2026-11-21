@@ -28,6 +28,7 @@ def ci(monkeypatch):
     module = load_ci()
     monkeypatch.setattr(module, "release", lambda: "test")
     monkeypatch.setattr(module, "missing_2di", lambda commit=None: [])
+    module.STAGE["api_environment"].pop("FA_CAPABILITY_SELECTION_MAX", None)  # the CAP tests below set it
     return module
 
 

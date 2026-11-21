@@ -1,5 +1,11 @@
 # FA 雲端授權與 USD150 成本 preflight
 
+<a id="dev-stop-loss-1200-1121"></a>
+## 2026-11-21 dev 停損 USD950 → USD1200（Neal 決定）
+
+- **結論**：Neal 11-21 說「調到1200 usd」。停損改為 **USD1200**；量法不變，仍看 dev 所在**整個訂用帳戶**的本月累計（含其他專案）。其他規則不變（`budget_enforced=false`、不清帳、stage 另列每月 USD200）。
+- **起因**：11-20 讀到本月累計 USD945.36，離 950 不到 5 美元，第 53 版的 dev 測試因此暫停。調高後 dev 部署 r54（run 4908）、r55（run 4909）完成；11-21 07:29 讀到 USD970.07（Cost Management 約晚一天）。細節見 [progress](progress.md#stage-v53-1121)。
+
 <a id="dev-stop-loss-950-1118"></a>
 ## 2026-11-18 dev 停損 USD880 → USD950（Neal 決定）
 
