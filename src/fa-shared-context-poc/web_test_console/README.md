@@ -2,6 +2,28 @@
 
 第一次用工作台：部署後怎麼打開、送第一則訊息、看批准卡和回條，見根目錄 README 的 [前 10 分鐘](../../../README.md#first-10-minutes)。本頁下面是逐次變更紀錄。
 
+<a id="paste-as-txt"></a>
+## 貼上長文字自動變成 .txt 附件（Neal 2026-11-21，CODE/offline，未部署）
+
+以前在輸入框貼一大段文字，會出現「訊息過長，超出 N bytes」而不能送出。現在貼上（`paste`）時，如果貼進去會超過 `input_capacity.maximum`，
+而且這時能附檔，就不貼進框，改成附件 `pasted-text-N.txt`（N 取目前附件裡沒用過的最小號），走和「選擇檔案」同一條 `addUserFiles` 路：同樣的檢查、上傳與錯誤訊息。
+
+- **什麼時候會轉**：只在原生對話（`state_profile` 是 native／responses），且附檔設定是 `fa-user-text-files-v1`、選擇檔案可按、沒有檔案正在讀或上傳、
+  不是追加模式、附件合計還不到 4 份、文字在 10 MB 內且不含 NUL。上限是 8192 bytes，超出上限的文字一定也放不進 8192 bytes 的內嵌額度，
+  所以一律走大檔上傳（`PUT /api/instructions/{rid}/file-upload`）；非原生對話沒有上傳路，照舊貼進框並顯示超出提示。
+- **不丟已選的檔**：貼上的檔案加在已選檔案後面；「選擇檔案」仍是換掉這次的選擇，行為沒改。
+- **不丟文字**：上傳失敗、被移除或換了登入時，文字照常貼進原本的位置（框內已改過就接在最後；已換到別段對話就接在那段的草稿後面），
+  附件面板寫「貼上的文字沒能改成附件，已照常貼進訊息框。」加上原因；這個錯誤不會留著擋送出。
+- **看得到**：轉檔時打開附件面板，成功後寫「貼上的長文字已改成附件 pasted-text-N.txt；不需要可按「移除此文字檔」。」，「詳細」也加一句說明。
+- 沒新增 API，bridge 沒改。測試：`test_web_test_console_workbench.cjs` 新增 4 案（轉成附件並保留已選檔、短文字與非原生照常貼、上傳失敗與上傳中移除檔案時文字回到框內）。
+
+### Verified against（貼上變附件）
+
+- 程式基準：`origin/main` `45b5c215`。已讀 `index.html` 的 `addUserFiles`、`renderUserFiles`、`userFileIssue`、`invalidLiteralInput`、
+  `renderAttachmentToolbar`、輸入框 `input` 處理與 `renderComposer` 的超出提示；上限值讀自 `native.py`（8192）與 `instructions.py` 的 `INSTRUCTION_QUOTED_UTF8_LIMIT`（8192）。
+- DOM：`node --test tests/shared_context/test_web_test_console_workbench.cjs` 全數通過；新增 4 案在改動前的 `index.html` 上都失敗。
+- 沒驗：真瀏覽器的貼上（剪貼簿 CRLF 計量、游標位置、面板是否真的展開），只在 Node 替身驗證。
+
 <a id="legacy-readonly"></a>
 ## 舊版（job-bound）對話在工作台改成唯讀（Neal 2026-11-16，CODE/offline，未部署）
 

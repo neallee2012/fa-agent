@@ -574,7 +574,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <div id="user-image-selected"></div>
 <p id="user-image-note" class="reason" role="status"></p>
 <button id="clear-user-images" hidden disabled>清除這次選的圖片</button>
-<details id="attachment-details"><summary>詳細</summary><small>只有你選的檔案會在本機讀取。8192 bytes 以內的文字檔按「送出」才傳；更大的文字檔、PDF、Office 檔和圖片會在選好後立刻上傳給這位助理，送出時只帶名稱與雜湊。文字照原樣保留（含 BOM／CRLF），不解析或執行內容。圖片會在本機轉成 PNG（邊長最多 2000 px、每張最多 512 KiB）。檔案和來源附件合計最多 4 份，圖片另計最多 4 張。還沒送出的選擇只存在這個頁面。</small></details>
+<details id="attachment-details"><summary>詳細</summary><small>只有你選的檔案會在本機讀取。8192 bytes 以內的文字檔按「送出」才傳；更大的文字檔、PDF、Office 檔和圖片會在選好後立刻上傳給這位助理，送出時只帶名稱與雜湊。文字照原樣保留（含 BOM／CRLF），不解析或執行內容。圖片會在本機轉成 PNG（邊長最多 2000 px、每張最多 512 KiB）。檔案和來源附件合計最多 4 份，圖片另計最多 4 張。在原生對話貼上會超出訊息上限的長文字，會自動改成附件 pasted-text-N.txt 上傳。還沒送出的選擇只存在這個頁面。</small></details>
 <details id="attachment-picker" aria-label="文字來源附件" hidden><summary>從這段對話的來源附加</summary>
 <button id="read-attachment-sources" disabled>讀取本對話的來源候選</button>
 <p id="attachment-note" class="reason" role="status"></p>
@@ -765,6 +765,8 @@ const userFileDrafts=new Map(),userFileDownloads=new Set(),userFileDownloadError
 const userImageDrafts=new Map();
 let userImageBusy=false,userImageError=null,userImageRevision=0,userImageScope=null,userImageRenderKey=null;
 let userFileRevision=0,userFileScope=null,userFileReading=false,userFileUploading=null,userFileError=null,userFileRenderKey=null;
+// What happened to the last long paste: {draft,name} once it became a file, {draft,text} when it went into the box instead.
+let pasteNote=null;
 let userFileCapability=null,userFileCapabilityBusy=false,userFileCapabilityError=null,userFileDownloadRevision=0;
 const pendingCancellations=new Set();
 const cancellationObservations=new Map(),cancellationReadErrors=new Map(),cancellationReads=new Set();
@@ -1562,7 +1564,9 @@ function renderUserFiles(){
     !editable?"這則訊息的附件已送出，不能更換；下一則可以另選。":
     userFileCapabilityBusy||!userFileCapability?"正在讀取這段對話的附件設定…":
     userFileCapability.user_text_file_profile===null?
-      (imagesAllowed()?"這段對話只能附圖片。":friendlyError({code:"USER_FILES_DISABLED"})):"");
+      (imagesAllowed()?"這段對話只能附圖片。":friendlyError({code:"USER_FILES_DISABLED"})):
+    pasteNote?.draft===attachmentDraftKey()&&(pasteNote.text||files.some(item=>item.name===pasteNote.name))?
+      pasteNote.text||`貼上的長文字已改成附件 ${pasteNote.name}；不需要可按「移除此文字檔」。`:"");
   text("user-file-limit",userFileIssue()||(files.length?
     `${files.some(item=>!item.upload)?`訊息和小檔共 ${literalInputBytes(el("instruction").value,files)}／8192 bytes；`:""}${
       files.some(item=>item.upload)?"大檔已上傳；":""}附件合計 ${files.length+selectedAttachments().length}／4。`:
@@ -8504,15 +8508,16 @@ el("attachment-files").addEventListener("change",async()=>{
   const images=selected.filter(isUserImage),files=selected.filter(file=>!isUserImage(file));
   await Promise.all([files.length?addUserFiles(files):null,images.length?addUserImages(images):null]);
 });
-async function addUserFiles(selected){
+// kept: files already chosen that stay (a paste adds to them; the picker replaces them). True once the drafts are set.
+async function addUserFiles(selected,kept=[]){
   const input=el("attachment-files");
   const scope=userFileScopeKey(),revision=++userFileRevision,draft=attachmentDraftKey();
   const csrf=state.csrf,agent=selectedAgent,rid=state.composer.request_id;
-  userFileReading=true;userFileUploading=null;userFileError=null;userFileRenderKey=null;renderComposer();
+  userFileReading=true;userFileUploading=null;userFileError=null;userFileRenderKey=null;pasteNote=null;renderComposer();
   try{
     if(userFileCapability?.user_text_file_profile!=="fa-user-text-files-v1")
       throw {code:userFileCapability?"USER_FILES_DISABLED":"USER_FILE_CAPABILITY_UNAVAILABLE"};
-    const names=[...selectedAttachments().map(item=>item.name),...selected.map(item=>item.name)];
+    const names=[...selectedAttachments(),...kept,...selected].map(item=>item.name);
     if(names.length>4||new Set(names).size!==names.length)throw {code:"USER_FILE_INPUT_INVALID"};
     for(const file of selected){
       if(!/\.(txt|md|csv|json|pdf|docx|xlsx|pptx)$/i.test(file.name))throw {code:"USER_FILE_TYPE_UNSUPPORTED"};
@@ -8523,7 +8528,7 @@ async function addUserFiles(selected){
       if((file.size>8192||BINARY_USER_FILE.test(file.name))&&!nativeProfile(state.composer?.state_profile))
         throw {code:"USER_UPLOADS_UNSUPPORTED"};
     }
-    const decoded=[];
+    const decoded=[...kept];
     for(const file of selected){
       if(!userFileLive(revision,scope))return;
       const raw=await file.arrayBuffer();
@@ -8569,6 +8574,7 @@ async function addUserFiles(selected){
     }
     if(invalidLiteralInput(el("instruction").value,decoded,selectedAttachments()))throw {code:"USER_FILE_INPUT_INVALID"};
     userFileDrafts.set(draft,decoded);
+    return true;
   }catch(error){
     if(userFileLive(revision,scope))userFileError=error?.code?error:{code:"USER_FILE_READ_FAILED"};
   }finally{
@@ -9059,11 +9065,44 @@ el("login").addEventListener("click",()=>{
   if(el("login").disabled)return;
   if(remoteUser!==null)remoteSignIn();else run("/api/authenticate");
 });
-el("instruction").addEventListener("input",()=>{
+function instructionEdited(){
   const key=scopeKey(draftId);
+  if(pasteNote?.text)pasteNote=null;
   inputDrafts.set(key,el("instruction").value);draftEdits.set(key,(draftEdits.get(key)||0)+1);
   renderComposer();
   prewarmAgent();
+}
+el("instruction").addEventListener("input",instructionEdited);
+// A paste that would push the message past its limit goes up as a .txt attachment instead (native conversations only:
+// an overflowing paste never fits the 8192-byte inline budget, so it always needs the upload lane).
+el("instruction").addEventListener("paste",event=>{
+  const input=el("instruction"),pasted=(event.clipboardData?.getData("text/plain")||"").replace(/\r\n?/g,"\n"),c=state?.composer;
+  const start=input.selectionStart??input.value.length,end=input.selectionEnd??start,before=input.value;
+  const maximum=c?.input_capacity?.maximum,size=new TextEncoder().encode(pasted).length;
+  const files=selectedUserFiles(),taken=new Set([...selectedAttachments(),...files].map(item=>item.name));
+  const over=value=>new TextEncoder().encode(JSON.stringify(value)).length>maximum;
+  // Only the paste that tips the message over the limit; a box already over it takes pastes as text.
+  if(!pasted||!Number.isSafeInteger(maximum)||!c?.request_id||openingView()||c.append_target
+      ||over(before)||!over(before.slice(0,start)+pasted+before.slice(end))
+      ||input.disabled||el("attachment-files").disabled||userFileReading||userFileCapabilityBusy
+      ||userFileCapability?.user_text_file_profile!=="fa-user-text-files-v1"||!nativeProfile(c.state_profile)
+      ||taken.size>=4||size>10*1024*1024||pasted.includes("\0"))return;
+  event.preventDefault();
+  let n=1;while(taken.has(`pasted-text-${n}.txt`))n++;
+  const name=`pasted-text-${n}.txt`,key=scopeKey(draftId),bytes=new TextEncoder().encode(pasted);
+  activeAttachmentPicker="attachment-panel";
+  return addUserFiles([{name,size,arrayBuffer:async()=>bytes.buffer}],files).then(added=>{
+    if(added){pasteNote={draft:attachmentDraftKey(),name};renderComposer();return}
+    // Never lose the pasted text: put it where a normal paste would have, and say why it is not a file.
+    const why=userFileError?friendlyError(userFileError):"";
+    if(scopeKey(draftId)===key){
+      if(userFileError){userFileError=null;userFileRenderKey=null}
+      input.value=input.value===before?before.slice(0,start)+pasted+before.slice(end):input.value+pasted;
+      instructionEdited();
+      pasteNote={draft:attachmentDraftKey(),text:`貼上的文字沒能改成附件，已照常貼進訊息框。${why}`};
+      renderComposer();
+    }else inputDrafts.set(key,(inputDrafts.get(key)??"")+pasted);
+  });
 });
 el("instruction").addEventListener("compositionstart",()=>{composing=true});
 el("instruction").addEventListener("compositionend",()=>{composing=false});

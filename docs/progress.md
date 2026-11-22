@@ -4,6 +4,14 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="stage-v54-1121"></a>
+## 2026-11-21：stage 第 54 版（能力上限調到 128）
+
+- **第 54 版**（#1300，`2026.11.21-54`，Neal 台灣時間 11-21 09:59 合併，merge `ceaea1c9`）：實質生效的只有 #1299，把 dev 與 stage 的 API env `FA_CAPABILITY_SELECTION_MAX` 調到 128（Neal 11-21 決定；先前 #1296、#1297 設的 32 沒有上過 stage）。程式不變，不改 stage 的資源與權限。release PR 前在本機用 stage profile 實跑 `switch_preconditions`：對服務中的第 53 版 `e19c4313` 回 []，對第 52 版 `41e1e036` 會拒絕。
+  - **部署**：deploy-staging run 44853350618 成功（09:59～10:14），follow 步驟成功。public-sync run 44854768938 成功（10:14～10:17），`gate 2: PASS`，公開樹與第一道指紋 `917c2030` 相同，公開 release `v2026.11.21-54`。
+  - **dev 測試**：run 4909（`3f9716e7`，值 32）與 run 4910（`a2284505`，值 128）都只跑 check → guard → build api → api，Hosted image 與 A／B 版本不變。run 4910 的 API revision Healthy，options 回 `max_capabilities` 128、14 項能力；私人 bridge 讀 options 沒有 502，工作台讀到 128；B 回合正常存檔。
+  - **沒有驗證**：沒有在 dev 或 stage 實際勾超過 12 項並存檔；能力多時工具合計超過模型上限，錯誤要到回合才會出現（README `#capability-selection-max`）。
+
 <a id="stage-v53-1121"></a>
 ## 2026-11-21：stage 第 53 版（長對話提早壓縮、能力上限可設定）
 

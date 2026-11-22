@@ -1063,6 +1063,91 @@ test("the attachment panel says what it takes in one line and keeps the details 
   assert.match(html,/<details id="attachment-details"><summary>詳細<\/summary><small>[^<]*BOM／CRLF[^<]*<\/small><\/details>/);
 });
 
+// A paste past the message limit becomes an uploaded pasted-text-N.txt on a native conversation (only the upload lane
+// can hold it); anything else pastes as before, and a failed upload still puts the text in the box.
+async function nativePasteChat(upload){
+  const data=attachmentChat();data.composer.state_profile="foundry-native-v1";
+  const ui=await open(data);await readyFileInput(ui);ui.context.crypto??=globalThis.crypto;
+  if(upload)ui.holder.templateResponses={"/api/instructions/attachment-draft/file-upload":upload};
+  await chooseLiteral(ui,[selectedFile("note.txt","kept")]);
+  typeAttachmentText(ui,"Read this.");
+  return ui;
+}
+async function paste(ui,text){
+  let prevented=false;
+  await ui.nodes.get("instruction").events.paste({clipboardData:{getData:type=>type==="text/plain"?text:""},
+    preventDefault(){prevented=true}});
+  await ui.tick();
+  return prevented;
+}
+const chips=ui=>ui.nodes.get("user-file-selected").children.map(row=>row.children[0].value);
+
+test("a paste past the message limit becomes pasted-text-1.txt next to the files already chosen",async()=>{
+  const long="長".repeat(3000),bytes=Buffer.from(long),sha256=require("crypto").createHash("sha256").update(bytes).digest("hex");
+  const ui=await nativePasteChat({ok:true,json:async()=>({name:"pasted-text-1.txt",sha256,byte_length:bytes.length,
+    media_type:"text/plain"})});
+  assert.equal(await paste(ui,long),true);
+  const puts=ui.calls.filter(call=>call.method==="PUT");
+  assert.deepEqual(puts.map(call=>[call.url,call.headers["X-FA-File-Name"]]),
+    [["/api/instructions/attachment-draft/file-upload","pasted-text-1.txt"]]);
+  assert.equal(Buffer.from(puts[0].body).toString("utf8"),long);
+  assert.equal(ui.nodes.get("instruction").value,"Read this.");
+  assert.deepEqual(chips(ui),["note.txt","pasted-text-1.txt"]);
+  assert.equal(ui.nodes.get("attachment-panel").open,true);
+  assert.equal(ui.text("user-file-note"),"貼上的長文字已改成附件 pasted-text-1.txt；不需要可按「移除此文字檔」。");
+  assert.equal(ui.nodes.get("send-instruction").disabled,false);
+  ui.nodes.get("user-file-selected").children[1].children[2].events.click();await ui.tick();
+  assert.deepEqual(chips(ui),["note.txt"]);
+  assert.equal(ui.text("user-file-note"),"");
+});
+
+test("a paste that fits, or one on a non-native conversation, pastes as text",async()=>{
+  const ui=await nativePasteChat();
+  assert.equal(await paste(ui,"short"),false);
+  const legacy=await open(attachmentChat());await readyFileInput(legacy);
+  typeAttachmentText(legacy,"Read this.");
+  assert.equal(await paste(legacy,"x".repeat(9000)),false);
+  assert.equal([...ui.calls,...legacy.calls].some(call=>call.method==="PUT"),false);
+});
+
+test("a paste is measured as the box keeps it (LF), and a box already over the limit takes pastes as text",async()=>{
+  const ui=await nativePasteChat();
+  // 2000 CRLF lines would be ~10 KB of JSON; as LF they fit the 8192-byte limit.
+  assert.equal(await paste(ui,"a\r\n".repeat(2000)),false);
+  const over=await nativePasteChat();
+  over.nodes.get("instruction").value="x".repeat(9000);
+  assert.equal(await paste(over,"y".repeat(9000)),false);
+  assert.equal([...ui.calls,...over.calls].some(call=>call.method==="PUT"),false);
+});
+
+test("a paste whose upload fails goes into the box with the reason and keeps the chosen files",async()=>{
+  const ui=await nativePasteChat({ok:false,json:async()=>({error:{code:"LOCAL_FAILURE"}})});
+  const long="x".repeat(9000);
+  assert.equal(await paste(ui,long),true);
+  assert.equal(ui.nodes.get("instruction").value,"Read this."+long);
+  assert.deepEqual(chips(ui),["note.txt"]);
+  assert.match(ui.text("user-file-note"),/^貼上的文字沒能改成附件，已照常貼進訊息框。./);
+  assert.match(ui.text("input-capacity"),/訊息過長/);
+  typeAttachmentText(ui,"Read this.");
+  assert.equal(ui.text("user-file-note"),"");
+  assert.equal(ui.nodes.get("send-instruction").disabled,false);
+});
+
+test("a paste whose upload is abandoned by removing a chosen file still lands in the box",async()=>{
+  let answer;
+  const ui=await nativePasteChat(new Promise(resolve=>{answer=resolve}));
+  const long="x".repeat(9000),pasting=paste(ui,long);
+  for(let i=0;i<10&&!ui.calls.some(call=>call.method==="PUT");i++)await ui.tick();
+  ui.nodes.get("user-file-selected").children[0].children[2].events.click();
+  answer({ok:true,json:async()=>({name:"pasted-text-1.txt"})});
+  assert.equal(await pasting,true);
+  assert.equal(ui.nodes.get("instruction").value,"Read this."+long);
+  assert.deepEqual(chips(ui),[]);
+  assert.equal(ui.text("user-file-note"),"貼上的文字沒能改成附件，已照常貼進訊息框。");
+  typeAttachmentText(ui,"Read this.");
+  assert.equal(ui.nodes.get("send-instruction").disabled,false);
+});
+
 function questionItem(thread,{freeform=true}={}){
   const qid="e".repeat(64);
   return {thread_id:thread,label:"報告寄送",item:{schema_version:"fa-native-attention-v1",type:"question_required",
