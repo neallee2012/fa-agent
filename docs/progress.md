@@ -4,6 +4,14 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="stage-v55-1122"></a>
+## 2026-11-22：stage 第 55 版（工作台貼上長文字自動轉附件）
+
+- **第 55 版**（#1304，`2026.11.21-55`，Neal 台灣時間 11-22 09:46 合併，merge `6d059c84`）：實質生效的只有 #1303。在 native 對話的訊息框貼上文字，若這次貼上讓訊息超過 `input_capacity.maximum`（8192 bytes），文字改成 `pasted-text-N.txt`（換行統一成 LF）並走既有大檔上傳；轉不成時照常貼回訊息框並說明原因。只改工作台頁面、README 與前端測試，不改 stage 的資源與權限。
+  - **部署**：deploy-staging run 44973031096 成功（09:47～10:00），guard 讀到 `core changed: False; Hosted-only changed: 0`；sync、API、console（`console ready`）、follow 都成功。public-sync run 44974085504 成功（10:00～10:03），`gate 2: PASS`，公開樹與第一道指紋 `90292071` 相同。
+  - **dev 測試**：dev 沒有遠端工作台（`console_app` 為 null），API／Hosted 與 main 無差異，所以沒有重新部署。用私人 bridge 跑新頁面連 dev：貼上 200 行文字變成 18,800 bytes 的 `pasted-text-1.txt` 並上傳，助理回「200」正確；本機替身驗了轉不成時貼回訊息框。本機 8765 已換成 `146411c2`。
+  - **沒有驗證**：真人用作業系統剪貼簿按 Ctrl+V（測試用頁面送出的貼上事件）；stage 遠端工作台實際操作；這次 Agent 有沒有換到新版本（log 沒印，未讀雲端）。轉不成時游標跳到最後、瀏覽器「復原」接不上，未修。
+
 <a id="stage-v54-1121"></a>
 ## 2026-11-21：stage 第 54 版（能力上限調到 128）
 

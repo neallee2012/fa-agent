@@ -2402,6 +2402,7 @@ Neal 原本在對話裡說「你可以用cli去建立cronjob，每天幫我檢�
 |---|---|
 | `POST /native-hitl/v1/decisions`（routine 卡，`allow_once`） | 先以主人身分寫該卡草稿的 definition（ID 由卡片決定，重送讀回同一份），成功後才記決定；`allow_rule` 422；旗標不齊 409 `NATIVE_ROUTINE_PROPOSALS_DISABLED` |
 | `GET/POST /native-routines/v1/agents/{agent_id}/definitions`；`GET .../definitions/{routine_id}` | 原owner可讀；建立／改版／停用另需`Behavior.Approve`。`request_id`是此定義版本，`expected_version_id`核目前head；重述舊ID只回舊原件，不把head倒回去 |
+| `POST .../definitions/{routine_id}/delete`（Neal 2026-11-22） | 需`Behavior.Approve`；body `{request_id, expected_version_id}`，只刪head目前那個**已停用**的每日排程（啟用中回409 `NATIVE_ROUTINE_CHANGED`）。head記`deleted_at`並在同一筆CAS移出索引，回那個停用版本；不刪列，版本與批准紀錄保留。之後清單與`due`不列，`trigger`／`check` 403 `NATIVE_ROUTINE_INACTIVE`，再發布同`routine_id` 404 `NATIVE_ROUTINE_MISSING`；同一`request_id`重送只讀回原回條 |
 | 程序內 `NativeRoutineService.due`／`trigger` | 只接受 API 自己的 `NativeRoutineApiClock`（旗標 `FA_NATIVE_ROUTINE_CLOCK=api`），沒有 HTTP 路由。只送 owner 已批准且仍啟用定義的 `routine_id`／排定時刻；不能自填owner、content、RID或grant |
 | `POST .../reminders` | owner唯讀，body為`conversation_id`與可選`after`。回原未完成工作及排程原件參照；不啟SDK、不建批准卡 |
 | `POST /work-policy/v1/native-capabilities/routine/check`、`.../routine/reminders` | 原Agent的metadata核對／reader；不冒owner、不發新操作授權 |
@@ -10133,17 +10134,18 @@ runtime 1.0.83 scripted offline provider 單案）。這是 **LOCAL, not deploye
 
 ### Team owner skill review behavior API（LOCAL，未部署）
 
-設定頁的 Team 技能審核走 behavior API 的薄路由，不新增 writer、IAM、刪除或上傳路徑；
+設定頁的 Team 技能審核走 behavior API 的薄路由，不新增 writer、IAM 或上傳路徑（刪除見下方 `deletions`）；
 真正的保存、ETag、hash pinning、decision idempotency 仍由既有 `ArtifactService`／M3 契約處理。
 路由固定在 API root：
 
-- `GET /team-skills/v1/reviews?after=<artifact_id>`：列出本 Team skill review metadata。
+- `GET /team-skills/v1/reviews?after=<artifact_id>`：列出本 Team skill review metadata。助理起草的 skill 在 artifact 裡固定存 `Unapproved skill draft from user procedure`（RID 重送靠它核對，不改寫）；清單的 `title` 改顯示該版 `purpose`（超過 64 字截斷加「…」），沒有 purpose 時才顯示固定字串。Team 主人自己命名的 skill 照原標題。這個顯示名稱也是 `skill_titles` 的來源。
 - `GET /team-skills/v1/skills/{artifact}`：讀 skill artifact，回 `ETag`。
 - `GET /team-skills/v1/skills/{artifact}/versions/{version_id}`：讀 completed version metadata。
 - `GET /team-skills/v1/skills/{artifact}/versions/{version_id}/content`：用 server 端保存的 blob ETag 讀 bytes，回 `X-Artifact-SHA256`。
 - `GET /team-skills/v1/skills/{artifact}/versions/{version_id}/resources/{name}`：讀該 skill version manifest 內的小型 UTF-8 resource；未批准草稿的 completed version 也可讀。
 - `POST /team-skills/v1/skills/{artifact}/decisions`：需 `If-Match` 與 `Behavior.Approve`，body 是既有 `ApprovalInput`。
 - `POST /team-skills/v1/skills/{artifact}/deactivations`：需 `If-Match` 與 `Behavior.Approve`，body 是既有 `SkillDeactivationInput`。
+- `POST /team-skills/v1/skills/{artifact}/deletions`：需 `If-Match` 與 `Behavior.Approve`，body 是 `SkillDeletionInput`（`schema_version="fa-skill-deletion-v1"`、`decision_id`）。Neal 2026-11-22 要求 skill 可以刪除，見下方「刪除 skill」。
 - `POST /team-skills/v1/drafts`（Q4）：需 `Behavior.Approve`，body 是 `OwnerSkillDraftInput`（`schema_version`、`title`，以及和 Agent 草稿相同的 `arguments`：purpose、body、最多 4 個 resources），上限 128 KiB；回 `{"schema_version":"fa-team-owner-skill-draft-result-v1","entry":SkillReviewEntry}`。
 
 **Q4 的作者來源**：M3 原本只有 Agent 能建立版本。這次新增第二種伺服器推導的來源 `OwnerArtifactSource`
@@ -10161,6 +10163,22 @@ GET 需 `Behavior.Read`，POST 需 `Behavior.Approve`。Agent、其他 Team owne
 同一 `decision_id` 加同一 body 由 M3 回原紀錄且不再寫入；同 ID 不同 body 仍回
 `M3_DECISION_CONFLICT`，stale／missing `If-Match` 沿 M3 回 412／428。
 
+**刪除 skill（Neal 2026-11-22 要求）**：刪除 = 從審核清單、助理可選項與已安裝顯示消失，不能再用；
+Table 列、Blob、版本、批准與停用紀錄全部保留，不刪任何資料。
+- `ArtifactService.delete_skill` 在同一列 CAS 寫一筆 `ArtifactDocument.deletion`（`decision_id`、刪除者、時間、
+  `applied_revision`）；欄位沒有刪除時省略，舊資料 bytes 不變。任何狀態（待審核、已拒絕、已停用、沒有版本、
+  上傳未完成）都可刪；仍有生效版本時回 `M3_SKILL_EFFECTIVE`，工作台在同一次確認裡先送既有停用、再送刪除。
+- 同一 `decision_id` 重送回原紀錄、不再寫；換編號再刪回 `M3_SKILL_DELETED`；刪除編號不能和批准／停用共用。
+- 已刪除的 skill：`skill_reviews` 跳過（和 deliverable 一樣只推進 cursor，不漏項）；沒有生效版本，所以
+  catalog、新對話 capture、template options 與 Agent 讀取都和停用一樣讀不到；已選用它的助理開新對話會和停用時一樣回
+  `PROFILE_SELECTION_SOURCES_CHANGED`，直到那位助理的新對話設定不再含這份 skill；之後的上傳、補完、批准、停用都回
+  `M3_SKILL_DELETED`，不能再回到清單。Agent 以原 RID 重送：已有版本的回原回條、不重建；沒有版本的回
+  `SKILL_DRAFT_OUTCOME_UNKNOWN`。Team 主人以相同名稱與內容再存草稿會對到同一份已刪除的草稿，回 `M3_SKILL_DELETED`，
+  要改名稱或內容。
+- Agent 的 VM 薄轉送路徑沒有刪除（ADR-0006）；只有 Team 主人經工作台（Entra 入口）能刪。
+- 部署注意：讀同一個 M3 Table 的舊版程式看不懂 `deletion` 欄位，列出 Team skill 或 template options 時會回
+  `M3_STATE_INVALID`。第一次刪除之後，API 不能退回不含本片的版本；M3 context API 也要一起換版。
+
 #### Verified against（Team owner skill review behavior API）
 
 - 程式接點：`shared_context/team_skills_api.py`、`shared_context/behavior_server.py`，
@@ -10168,7 +10186,9 @@ GET 需 `Behavior.Read`，POST 需 `Behavior.Approve`。Agent、其他 Team owne
   與 resource helper；未修改 `m3_api.py` 或 M3 writer 語意。
 - 離線測項：`tests/shared_context/test_team_skills_api.py`，覆蓋 owner/read-only/agent/其他 owner、
   review/artifact/version/content/resource、approve/reject/deactivate、decision idempotency、
-  ETag 412/428、non-skill、invalid query/body、無 DELETE 與 authority unavailable。
+  ETag 412/428、non-skill、invalid query/body、無 DELETE 與 authority unavailable，以及刪除的權限、同編號重送與
+  同內容草稿不復原；`tests/shared_context/test_skill_deletion.py` 覆蓋各狀態刪除後不在清單、分頁不漏、
+  生效中須先停用且 catalog 讀不到、同編號只記一次、Agent RID 重送不重建。
   這是本機 fake Table/Blob/JWT 測試，沒有 Azure、Hosted、模型或網路呼叫。
 
 ### Team owner MCP toolbox API（改走官方 Toolbox API，LOCAL，預設關閉）

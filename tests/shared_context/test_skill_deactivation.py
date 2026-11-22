@@ -13,7 +13,7 @@ from shared_context.errors import Problem
 from shared_context.m3_auth import HumanApprover
 from shared_context.m3_models import (
     MAX_ARTIFACT_VERSIONS, ApprovalInput, ApprovalRecord, ArtifactDocument, ArtifactVersion, BlobReceipt,
-    CreateArtifact, SkillDeactivationInput, SkillDeactivationRecord, SkillPurpose, VersionInput, skill_metadata_sha256,
+    CreateArtifact, SkillDeactivationInput, SkillDeactivationRecord, SkillDeletionRecord, SkillPurpose, VersionInput, skill_metadata_sha256,
 )
 from shared_context.storage import MAX_PAYLOAD_BYTES, serialize
 from test_m3_artifacts import HUMAN, create, decision, m3, upload
@@ -293,7 +293,7 @@ def test_absent_deactivation_history_preserves_the_legacy_document_bytes():
     assert ArtifactDocument.model_validate({**document.model_dump(), "deactivations": []}).model_dump_json() == expected
 
 
-def test_twelve_bounded_skill_versions_and_deactivation_receipts_fit_one_cas_record():
+def test_twelve_bounded_skill_versions_deactivation_and_deletion_receipts_fit_one_cas_record():
     versions, receipts = [], []
     team, artifact = "t" * 64, "a" * 64
     purpose = SkillPurpose(schema_version="fa-skill-purpose-v1", description="漢" * 170 + "ab")
@@ -320,6 +320,8 @@ def test_twelve_bounded_skill_versions_and_deactivation_receipts_fit_one_cas_rec
     document = ArtifactDocument(
         kind="skill", title="漢" * 256, source_work="w" * 64, artifact_id=artifact, team=team,
         owner="o" * 64, owner_oid=A.oid, revision=999999999999,
-        versions=versions, deactivations=receipts,
+        versions=versions, deactivations=receipts, deletion=SkillDeletionRecord(
+            schema_version="fa-skill-deletion-v1", decision_id="f" * 32, deleted_by_oid=HUMAN.oid,
+            deleted_at="t" * 64, applied_revision=999999999999),
     )
     assert len(serialize(document.model_dump())) < MAX_PAYLOAD_BYTES

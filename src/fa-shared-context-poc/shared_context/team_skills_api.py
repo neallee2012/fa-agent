@@ -17,8 +17,8 @@ from .behavior_skill_draft import skill_draft_bytes, skill_purpose
 from .errors import Problem
 from .m3_auth import HumanApprover
 from .m3_models import (
-    OWNER_AUTHOR, ApprovalInput, ArtifactDocument, SkillDeactivationInput, SkillReviewEntry, VersionInput,
-    skill_resource_text, validate_id,
+    OWNER_AUTHOR, ApprovalInput, ArtifactDocument, SkillDeactivationInput, SkillDeletionInput, SkillReviewEntry,
+    VersionInput, skill_resource_text, validate_id,
 )
 from .native_skill_draft_api import NativeSkillDraftGateway
 from .native_skill_draft_wire import resource_manifest, resource_reference
@@ -163,6 +163,9 @@ def _draft_target(service, human, source, identifier, title):
     if (document.kind != "skill" or document.title != title or document.native_source != source
             or document.owner != OWNER_AUTHOR or document.owner_oid != human.oid or len(document.versions) > 1):
         raise Problem(409, "SKILL_DRAFT_TARGET_CONFLICT", "the derived owner draft slot holds other content")
+    if document.deletion is not None:
+        # The same name and content derive the deleted draft's slot; it stays deleted instead of reporting a save.
+        raise Problem(409, "M3_SKILL_DELETED", "this exact draft was deleted; change its name or content")
     return record, document
 
 
@@ -351,6 +354,21 @@ def install_team_skills_routes(app, composition) -> None:
             def apply():
                 _skill_record(service, human, artifact)
                 return service.deactivate_skill(human, service.approval.team, artifact, etag, body)
+
+            return _record_response(await run_in_threadpool(apply))
+        return await _reply(operation)
+
+    @router.post(PREFIX + "/skills/{artifact}/deletions")
+    async def delete(artifact: str, request: Request, principal=Depends(identity)):
+        async def operation():
+            service = _service(composition)
+            human = _owner_principal(service, principal, "approve")
+            body = await _body(request, SkillDeletionInput, max_body_bytes=DECISION_BODY_BYTES)
+            etag = _exact_header(request, "if-match")
+
+            def apply():
+                _skill_record(service, human, artifact)
+                return service.delete_skill(human, service.approval.team, artifact, etag, body)
 
             return _record_response(await run_in_threadpool(apply))
         return await _reply(operation)

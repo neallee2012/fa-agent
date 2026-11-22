@@ -1,9 +1,11 @@
-"""Owner view of one Agent's daily routines in settings: list them and disable one. The API decides everything.
+"""Owner view of one Agent's daily routines in settings: list, disable or delete one. The API decides everything.
 
 A routine is created only by the owner's allow on its approval card in a chat. Disabling saves a new, disabled version
 of the same routine against the exact version the owner saw (``expected_version_id``). Its request ID comes from that
-version, so a resend after an unknown reply finds the routine already disabled and writes nothing more. Nothing here
-edits, re-enables or deletes a routine.
+version, so a resend after an unknown reply finds the routine already disabled and writes nothing more. Deleting
+(Neal 2026-11-22) first disables an active routine the same way, then deletes the disabled version; the delete request
+ID comes from that version, so a resend replays the one deletion. A deleted routine leaves the list and never runs;
+its versions and approvals stay saved. Nothing here edits or re-enables a routine.
 """
 
 from functools import partial
@@ -21,8 +23,8 @@ _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 MESSAGES = {
     "ROUTINE_SETTINGS_UNAVAILABLE": "這個環境沒有開啟排程。",
     "ROUTINE_SETTINGS_NO_AGENT": "還不知道這位助理是哪一個；請先在對話裡送一則訊息，再回來查看排程。",
-    "ROUTINE_SETTINGS_OWNER_ONLY": "只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能停用排程。",
-    "ROUTINE_SETTINGS_CHANGED": "這個排程剛有變動，這次沒有停用；請重新讀取後再確認。",
+    "ROUTINE_SETTINGS_OWNER_ONLY": "只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能停用或刪除排程。",
+    "ROUTINE_SETTINGS_CHANGED": "這個排程剛有變動，這次沒有停用或刪除；請重新讀取後再確認。",
     "ROUTINE_SETTINGS_INVALID_REQUEST": "請從清單選一個排程；不接受其他內容。",
     "ROUTINE_SETTINGS_RESPONSE_INVALID": "排程的回應格式不符；不當成完成，請重新讀取。",
     "NATIVE_ROUTINES_DISABLED": "這個環境沒有開啟排程。",
@@ -90,6 +92,9 @@ class RoutineSettings:
                 "can_manage": self.console.vault.allows("Behavior.Approve")}
 
     def disable(self, routine_id, version_id):
+        return {"routine": self._disabled(routine_id, version_id).model_dump(mode="json")}
+
+    def _disabled(self, routine_id, version_id):
         require(_ID.fullmatch(routine_id) is not None and _ID.fullmatch(version_id) is not None,
                 "ROUTINE_SETTINGS_INVALID_REQUEST", 400)
         token = self._token(write=True)
@@ -98,7 +103,7 @@ class RoutineSettings:
                 "ROUTINE_SETTINGS_RESPONSE_INVALID", 502)
         if not current.definition.enabled:
             # Already off (this disable after an unknown reply, or an earlier one): nothing more to write.
-            return {"routine": current.model_dump(mode="json")}
+            return current
         require(current.definition.request_id == version_id, "ROUTINE_SETTINGS_CHANGED", 409)
         data = current.definition.model_dump(mode="json", include=set(NativeRoutineChange.model_fields))
         change = NativeRoutineChange.model_validate_json(json.dumps({
@@ -108,7 +113,18 @@ class RoutineSettings:
         saved = _decode(NativeRoutineView, self._send("POST", "/definitions", token, change.model_dump(mode="json")))
         require(saved.definition.request_id == change.request_id and not saved.definition.enabled
                 and self._mine(saved.definition), "ROUTINE_SETTINGS_RESPONSE_INVALID", 502)
-        return {"routine": saved.model_dump(mode="json")}
+        return saved
+
+    def delete(self, routine_id, version_id):
+        version_id = self._disabled(routine_id, version_id).definition.request_id
+        command = {"request_id": material_digest({
+            "kind": "fa-console-routine-delete-v1", "routine_id": routine_id, "version_id": version_id}),
+            "expected_version_id": version_id}
+        kept = _decode(NativeRoutineView, self._send(
+            "POST", f"/definitions/{routine_id}/delete", self._token(write=True), command))
+        require(kept.definition.routine_id == routine_id and kept.definition.request_id == version_id
+                and not kept.definition.enabled and self._mine(kept.definition), "ROUTINE_SETTINGS_RESPONSE_INVALID", 502)
+        return {"deleted": kept.model_dump(mode="json")}
 
 
 def routines_available(console):
@@ -143,3 +159,8 @@ def install_routine_settings_routes(app, requested_console):
     async def disable(routine_id: str, version_id: str, request: Request, console=Depends(requested_console)):
         await no_input(request)
         return await run_in_threadpool(control(console).disable, routine_id, version_id)
+
+    @app.post("/api/routines/{routine_id}/deletions/{version_id}")
+    async def delete(routine_id: str, version_id: str, request: Request, console=Depends(requested_console)):
+        await no_input(request)
+        return await run_in_threadpool(control(console).delete, routine_id, version_id)

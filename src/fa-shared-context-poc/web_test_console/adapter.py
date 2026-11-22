@@ -376,7 +376,7 @@ _NATIVE_TURNS = "/work-policy/v1/native-turns/"
 _RESPONSES_TURNS = "/work-policy/v1/responses-turns/"
 _TEMPLATE = "/work-policy/v1/agent-template"
 _ID = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
-_ROUTINE_DEFINITIONS = re.compile(r"/native-routines/v1/agents/" + _ID + "/definitions(/" + _ID + ")?")
+_ROUTINE_DEFINITIONS = re.compile(r"/native-routines/v1/agents/" + _ID + "/definitions(/" + _ID + "(/delete)?)?")
 _PARSED_PREFIXES = ("/team-skills/v1/", "/team-mcp/v1/", "/team-connectors/v1/", "/native-groups/v1/",
                     "/native-hitl/v1/", "/work-policy/v1/")
 _DELEGATION_READ = re.compile(r"/work-policy/v1/conversations/[^/]+/turns/[1-9][0-9]*/delegation")

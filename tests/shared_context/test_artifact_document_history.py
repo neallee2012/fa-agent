@@ -163,7 +163,7 @@ def test_saved_documents_that_keep_every_rule_still_load_unchanged(value):
 def test_the_document_schema_has_only_its_saved_fields():
     assert list(ArtifactDocument.model_fields) == [
         "kind", "title", "source_work", "schema_version", "artifact_id", "team", "owner", "owner_oid",
-        "native_source", "revision", "versions", "pending", "effective_version_id", "deactivations",
+        "native_source", "revision", "versions", "pending", "effective_version_id", "deactivations", "deletion",
     ]
     assert list(ArtifactDocument.__private_attributes__) == []
 

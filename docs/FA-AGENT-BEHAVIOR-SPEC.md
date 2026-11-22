@@ -3551,6 +3551,14 @@ Current catalog／read／model-source門檻沿既有接點觀察effectivity變�
 不自動重送POST；需要核未知回條時先show/readback。舊reader遇到新欄位可拒絕，
 不能宣稱mixed-version部署／rollback已驗；本輪沒有部署或改雲端權限。
 
+### 2026-11-22 本機接點：Team skill 刪除（Neal 要求）
+
+Team 主人可對任何狀態的 skill 提交 `fa-skill-deletion-v1`（decision ID），以 exact ETag 在同 row CAS 寫入
+`ArtifactDocument.deletion`；仍有生效版本時拒絕（`M3_SKILL_EFFECTIVE`），工作台先送上面的停用。刪除只是標記：
+版本、Blob、批准與停用回條都不刪不改；same decision ID 回原紀錄，decision ID 不能與 approval／deactivation 共用。
+已刪除的 skill 不進審核清單與可選項，之後的上傳、補完、批准、停用回 `M3_SKILL_DELETED`。舊 reader 遇到
+`deletion` 欄位會拒絕整列；細節見 [ADR-0006 補充](adr/0006-team-trust-boundary-grokbot-mode.md#skill-deletion)。
+
 ### 2026-09-26 本機前置：可攜模板參照與目的地檢視
 
 SK-11第一切片只匯出`fa-agent-template-v1`的role／skill／configuration版本參照，

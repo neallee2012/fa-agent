@@ -13,7 +13,7 @@ from .native_routine_auth import routine_clock_enabled
 from .native_routine_wire import (
     NATIVE_ROUTINE_ERRORS, NativeReminderQuery, NativeRoutineChange, NativeRoutineCheck, native_routines_enabled,
 )
-from .native_routines import NativeRoutineService
+from .native_routines import NativeRoutineDelete, NativeRoutineService
 
 PREFIX = "/native-routines/v1/agents/{agent_id}"
 
@@ -61,6 +61,11 @@ def install_native_routine_routes(app, composition, *, enabled):
     async def publish(request: Request, agent_id: str, principal=Depends(identity)):
         command = await _body(request, NativeRoutineChange, max_body_bytes=24 * 1024)
         return await _reply(lambda: service.publish(principal, agent_id, command))
+
+    @app.post(PREFIX + "/definitions/{routine_id}/delete")
+    async def delete(request: Request, agent_id: str, routine_id: str, principal=Depends(identity)):
+        command = await _body(request, NativeRoutineDelete, max_body_bytes=1024)
+        return await _reply(lambda: service.delete(principal, agent_id, routine_id, command))
 
     @app.get(PREFIX + "/definitions/{routine_id}")
     async def read(agent_id: str, routine_id: str, principal=Depends(identity)):

@@ -1348,6 +1348,8 @@ def test_native_skillify_enters_real_m3_approval_and_c2_read_without_a_second_up
     entry = next(item for item in listed["entries"] if item["artifact_id"] == draft.artifact_id)
     assert entry["status"] == "awaiting_decision" and entry["native_source"] == draft.native_source.model_dump(mode="json")
     record = service.get(human_m3, actor.team, draft.artifact_id)
+    assert entry["title"] == arguments["purpose"]
+    assert record.payload["title"] == "Unapproved skill draft from user procedure"
     version = service.version(human_m3, actor.team, draft.artifact_id, draft.version_id)
     assert version.approval is None
     assert version.native_source.model_dump(mode="json") == draft.native_source.model_dump(mode="json")

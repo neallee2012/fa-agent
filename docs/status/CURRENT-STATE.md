@@ -1,7 +1,7 @@
 # CURRENT-STATE — FA 開工摘要
 
 > **非權威快照**；先讀 AGENTS 與本檔，再按需讀來源。[維護規範](../CONVENTIONS.md#8-current-state)：60行／UTF-8 8KiB內。
-> 2026-11-21（+08）；核對origin/main `ceaea1c9`；stage是第54版（2026.11.21-54，#1300，[紀錄](../progress.md#stage-v54-1121)）：能力上限12→128（dev、stage同值）；第53版起長對話65%提早壓縮。API只送v3、閘門武裝，GUARD="1"（不能關、不退版）。
+> 2026-11-22（+08）；核對origin/main `6d059c84`；stage是第55版（2026.11.21-55，#1304，[紀錄](../progress.md#stage-v55-1122)）：工作台貼上長文字自動轉.txt附件；能力上限128（54）、長對話65%壓縮（53）。API只送v3、閘門武裝，GUARD="1"（不能關、不退版）。
 > 本文不是操作批准；原資料、回條、unknown與費用上限保持，以來源為準。
 
 ## 現在在哪
@@ -12,7 +12,7 @@
 
 **進行中：** 舊job lane退役已收尾，API端舊client方法與讀舊列模型刻意留（[紀錄](../progress.md#stage-v49-1118)）。11-07起，API只送`foundry-native-v3`。`stage.json`與dev都武裝相容閘門（#934）；IDLE、RECONCILER仍"0"，快照URL未設。**ADR-0009前提重核（[註記](../adr/0009-version-model-g-actual-version-idle-upgrade.md#platform-in-place-resume-2026-10-20)）：平台原地接續是主路徑，FA的換版（`cut`）是備援。** dev走`ci_deploy`（#919，`deploy/dev/`不匯出公開repo）。
 
-**GitHub Actions：** private repo、free方案（2000分鐘／月），Neal設USD10預算；11-21第54版deploy與public-sync成功；public-sync逾時已30→60分鐘（#1285）。重型套件不跑PR／push。
+**GitHub Actions：** private repo、free方案（2000分鐘／月），Neal設USD10預算；11-22第55版deploy與public-sync成功；public-sync逾時已30→60分鐘（#1285）。重型套件不跑PR／push。
 
 **沿用設定（[第23版紀錄](../progress.md#stage-v23-1008)）：** 排程開（API時鐘＋對話提案）、打字預熱開、stage閒置逾時3600；feed app、工作台常駐；HITL A／B／t4、A／B對話中換模型開；Teams connector第1波（Work IQ）旗標開；Teams逾時回覆補送（#827）仍關，需Neal。
 
@@ -26,7 +26,7 @@
 
 | 批次 | 結果 |
 |---|---|
-| stage第53、54版（11-21） | 第53版：#1292自動壓縮65%、#1293能力上限可設定、#1294（[紀錄](../progress.md#stage-v53-1121)）。第54版：能力上限128（#1299；dev run 4910已驗，[紀錄](../progress.md#stage-v54-1121)）。 |
+| stage第53～55版（11-21、22） | 53：#1292壓縮65%、#1293能力上限可設定（[紀錄](../progress.md#stage-v53-1121)）。54：上限128（#1299，[紀錄](../progress.md#stage-v54-1121)）。55：#1303貼上長文字轉附件（[紀錄](../progress.md#stage-v55-1122)）。 |
 | stage第50、51版（11-19） | #1281～#1283轉交更快（[50](../progress.md#stage-v50-1119)）；#1286升SDK（[51](../progress.md#stage-v51-1119)）。 |
 | 第44～49版 | 舊job lane退役（[48](../progress.md#stage-v48-1118)、[49](../progress.md#stage-v49-1118)）；[44、45](../progress.md#stage-v44-v45-1107)真人回合待Neal。 |
 
@@ -41,7 +41,7 @@
 | 項目 | 界線／來源 |
 |---|---|
 | 待Neal | 建B的`web-lookup` Team Skill；雲端Table裡未完成／UNKNOWN的舊job數量未核（本機連Table被擋；放行Table主機或Neal自跑查詢，[紀錄](../progress.md#legacy-job-lane-retire-1117)）；E改Responses選版；stage加Teams與relay、Entra redirect-URI租用戶寫入、Teams登入、PG稿`5055d28c`送否。Teams批准只收allow_once／deny，以主人oid為依據。stage A重建session要Neal核准。 |
-| 第48～54版未驗證 | #1273、舊對話唯讀、退役路由dev沒測到（[49](../progress.md#stage-v49-1118)）；temperature 0只套gpt-4.1-mini，dev的gpt-5.4-mini未驗到；dev首次轉交被A審查拒絕（`NATIVE_HITL_REVIEW_DENIED`）原因未查（r54再現）；`NATIVE_STREAM_NOT_STARTED`由第49版dev（r52）的3筆變8筆；第51～53版stage沒送訊息；第53版65%門檻雲端未讀回；勾超過12項只在dev讀回上限、沒實際存檔。 |
+| 第48～55版未驗證 | #1273、舊對話唯讀、退役路由dev沒測到（[49](../progress.md#stage-v49-1118)）；temperature 0只套gpt-4.1-mini，dev的gpt-5.4-mini未驗到；dev首次轉交被A審查拒絕（`NATIVE_HITL_REVIEW_DENIED`）原因未查（r54再現）；`NATIVE_STREAM_NOT_STARTED`由第49版dev（r52）的3筆變8筆；第51～53版stage沒送訊息；第53版65%門檻雲端未讀回；勾超過12項只在dev讀回上限、沒實際存檔；貼上轉附件沒用真Ctrl+V測、stage工作台沒實測。 |
 | WebIQ只留toolbox | dev三步都做完（[步驟](../../deploy/README.md#dev-webiq-env-removal)）；stage沒有這些步驟。 |
 | 接手必知（未修） | `native_turns.py`回合尾巴：Hosted存檔後才標completed（manual／diag／委派等回合會先停SDK，上限約15秒，auto不停）；#916已合併，dev沒碰到競態。 |
 | 每日routine | #957後10-26起completed；TPM仍dev／stage共用（[根因](../progress.md#stage-v35-1022)）。 |

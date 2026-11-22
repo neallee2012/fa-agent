@@ -432,3 +432,24 @@ def test_owner_draft_whose_bytes_never_landed_is_finished_by_sending_the_same_co
     assert resource.json()["text"] == OWNER_RESOURCE
     assert [item["artifact_id"] for item in c.client.get(PREFIX + "/reviews", headers=c.headers()).json()["entries"]] == [
         entry["artifact_id"]]
+
+
+def test_owner_deletes_a_draft_by_decision_id_and_the_same_content_cannot_bring_it_back(team_skills):
+    c = team_skills
+    entry = post_draft(c, owner_draft()).json()["entry"]
+    artifact, body = entry["artifact_id"], {"schema_version": "fa-skill-deletion-v1", "decision_id": "f" * 32}
+    record = c.client.get(PREFIX + f"/skills/{artifact}", headers=c.headers())
+    path = PREFIX + f"/skills/{artifact}/deletions"
+    for identity in ("read_only", "agent"):
+        refused = c.client.post(path, headers={**c.headers(identity), "If-Match": record.headers["etag"]}, json=body)
+        assert refused.status_code == 403 and refused.json()["error"]["code"] == "TEAM_SKILLS_OWNER_ONLY"
+    deleted = c.client.post(path, headers={**c.headers(), "If-Match": record.headers["etag"]}, json=body)
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["deletion"]["decision_id"] == body["decision_id"]
+    # A lost reply is resent with the same decision ID and the ETag read before it: the original record returns.
+    again = c.client.post(path, headers={**c.headers(), "If-Match": record.headers["etag"]}, json=body)
+    assert again.status_code == 200 and again.headers["etag"] == deleted.headers["etag"]
+    assert c.client.get(PREFIX + "/reviews", headers=c.headers()).json()["entries"] == []
+    resent = post_draft(c, owner_draft())
+    assert resent.status_code == 409 and resent.json()["error"]["code"] == "M3_SKILL_DELETED"
+    assert c.client.get(PREFIX + "/reviews", headers=c.headers()).json()["entries"] == []

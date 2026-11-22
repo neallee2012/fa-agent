@@ -13,7 +13,8 @@ from .m3_models import (
     PNG_SIGNATURE, ApprovalInput,
     ApprovalRecord, ArtifactDocument, ArtifactSource, ArtifactVersion, BlobReceipt, CreateArtifact, ETag, PendingVersion,
     NativeArtifactSource, OwnerArtifactSource,
-    SkillDeactivationInput, SkillDeactivationRecord, SkillResourceRead, SkillResourceReference, SkillReviewEntry,
+    SkillDeactivationInput, SkillDeactivationRecord, SkillDeletionInput, SkillDeletionRecord, SkillResourceRead,
+    SkillResourceReference, SkillReviewEntry,
     SkillReviewList, VersionInput, policy_text_is_visible, skill_metadata_sha256, skill_resource_text, validate_id,
 )
 from .service import ContextService, now
@@ -69,7 +70,7 @@ class ArtifactService:
         """One page of current team skill review states; metadata only, no bodies, resources or writes."""
         self.authorize(principal, team)
         cursor = None if after is None else self._key(team, after)[1]
-        # Deliverables share the artifact row range; they only advance the cursor.
+        # Deliverables and deleted skills share the artifact row range; they only advance the cursor.
         rows, more = self.repository.list_prefix(
             self._partition(team), "artifact:", MAX_SKILL_REVIEW_ENTRIES, after=cursor,
         )
@@ -80,7 +81,7 @@ class ArtifactService:
                 _etag.validate_python(record.etag, strict=True)
                 if row != self._key(team, document.artifact_id)[1] or document.team != team:
                     raise ValueError("artifact row does not match its stored identity")
-                if document.kind == "skill":
+                if document.kind == "skill" and document.deletion is None:
                     entries.append(SkillReviewEntry.from_document(document))
             except (ValidationError, ValueError, KeyError, TypeError, Problem) as exc:
                 raise Problem(502, "M3_STATE_INVALID", "artifact state could not be verified") from exc
@@ -126,7 +127,13 @@ class ArtifactService:
         return principal
 
     @staticmethod
+    def _not_deleted(document: ArtifactDocument) -> None:
+        if document.deletion is not None:
+            raise Problem(409, "M3_SKILL_DELETED", "the Team owner deleted this skill; it cannot change or return")
+
+    @staticmethod
     def _available(document: ArtifactDocument) -> None:
+        ArtifactService._not_deleted(document)
         if document.pending is not None:
             raise Problem(409, "M3_UPLOAD_UNKNOWN", "an upload is pending or unknown; reconcile it without resending bytes")
 
@@ -312,6 +319,7 @@ class ArtifactService:
         validate_id(version_id, version=True)
         record, document = self._load(principal, team, artifact)
         self._owner(principal, document)
+        self._not_deleted(document)
         self._match(record, etag)
         if document.pending is None or document.pending.version_id != version_id:
             raise Problem(409, "M3_UPLOAD_NOT_PENDING", "the requested upload is not the pending operation")
@@ -341,7 +349,7 @@ class ArtifactService:
             raise Problem(403, "M3_HUMAN_REQUIRED", "agent publication is not human approval")
         if document.kind == "deliverable":
             raise Problem(409, "M3_NOT_POLICY", "ordinary deliverables do not require policy activation")
-        if any(item.decision_id == body.decision_id for item in document.deactivations):
+        if body.decision_id in _non_approval_decisions(document):
             raise Problem(409, "M3_DECISION_CONFLICT", "a decision ID cannot be reused for another decision")
         prior = next((item.approval for item in document.versions
                       if item.approval and item.approval.decision_id == body.decision_id), None)
@@ -380,8 +388,10 @@ class ArtifactService:
             if prior.model_dump(include=set(SkillDeactivationInput.model_fields)) != body.model_dump():
                 raise Problem(409, "M3_DECISION_CONFLICT", "a decision ID cannot be reused for another decision")
             return record
-        if any(item.approval and item.approval.decision_id == body.decision_id for item in document.versions):
+        if (any(item.approval and item.approval.decision_id == body.decision_id for item in document.versions)
+                or (document.deletion is not None and document.deletion.decision_id == body.decision_id)):
             raise Problem(409, "M3_DECISION_CONFLICT", "a decision ID cannot be reused for another decision")
+        self._not_deleted(document)
         self._match(record, etag)
         if document.effective_version_id != body.version_id:
             raise Problem(409, "M3_EFFECTIVE_VERSION_CHANGED", "deactivation must name the current effective version")
@@ -395,6 +405,27 @@ class ArtifactService:
             applied_revision=document.revision + 1,
         ))
         document.effective_version_id = None
+        return self._save(record, document)
+
+    def delete_skill(self, principal: Principal, team: str, artifact: str,
+                     etag: str | None, body: SkillDeletionInput) -> Record:
+        """Hide a skill from every list and choice for good; nothing stored is removed or rewritten."""
+        record, document = self._load(principal, team, artifact)
+        if not isinstance(principal, HumanApprover):
+            raise Problem(403, "M3_HUMAN_REQUIRED", "skill deletion requires the configured human")
+        if document.kind != "skill":
+            raise Problem(409, "M3_NOT_SKILL", "only a skill can be deleted here")
+        if document.deletion is not None and document.deletion.decision_id == body.decision_id:
+            return record
+        if body.decision_id in _non_approval_decisions(document) or any(
+                item.approval and item.approval.decision_id == body.decision_id for item in document.versions):
+            raise Problem(409, "M3_DECISION_CONFLICT", "a decision ID cannot be reused for another decision")
+        self._not_deleted(document)
+        self._match(record, etag)
+        if document.effective_version_id is not None:
+            raise Problem(409, "M3_SKILL_EFFECTIVE", "deactivate the effective version before deleting the skill")
+        document.deletion = SkillDeletionRecord(
+            **body.model_dump(), deleted_by_oid=principal.oid, deleted_at=now(), applied_revision=document.revision + 1)
         return self._save(record, document)
 
     def effective(self, principal: Principal, team: str, artifact: str) -> ArtifactVersion:
@@ -455,3 +486,8 @@ class ArtifactService:
                                           native_source=version.native_source) != resource):
             raise Problem(409, "M3_SKILL_RESOURCE_CHANGED", "skill or resource changed during the read")
         return result
+
+
+def _non_approval_decisions(document: ArtifactDocument) -> set[str]:
+    return {item.decision_id for item in document.deactivations} | (
+        set() if document.deletion is None else {document.deletion.decision_id})

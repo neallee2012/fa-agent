@@ -15,14 +15,13 @@ from .behavior_native_turn_api import NativeTurnGateway
 from .behavior_native_turn_wire import material_digest
 from .behavior_skill_draft import SKILL_DRAFT_ERRORS, skill_draft_bytes, skill_draft_enabled, skill_purpose
 from .errors import Problem
-from .m3_models import ArtifactDocument, NativeArtifactSource, SkillReviewEntry, VersionInput
+from .m3_models import NATIVE_DRAFT_TITLE as TITLE, ArtifactDocument, NativeArtifactSource, SkillReviewEntry, VersionInput
 from .native_capability_api import NativeCapabilityGateway
 from .native_skill_draft_wire import (
     LEGACY_DRAFT_REQUEST_BYTES, RESOURCE_DRAFT_REQUEST_BYTES, NativeSkillDraftIntentRead, NativeSkillDraftReceipt,
     NativeSkillDraftView, NativeSkillDraftWrite, artifact_id, draft_material, resource_manifest, resource_reference,
 )
 
-TITLE = "Unapproved skill draft from user procedure"
 PREFIX = NATIVE_CAPABILITY_PREFIX + "/skill-draft"
 
 

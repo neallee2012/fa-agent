@@ -208,7 +208,7 @@ Neal：在「Agent Team 設定 → 批准規則」看不到規則細節，控制
   現在的修法不依賴這個答案。另外擋掉一個讀程式看到的競態：非預設助理的 `console.vault` 由 `AgentConsoles.authenticate` 直接換掉，
   正在跑的讀取會被 `native._current` 以 401 `LOGIN_REQUIRED` 拒絕，所以對話讀取進行中，背景換 token 先等它結束。
   第 38 版的輸入框寫「等待助理回覆…」，#1093 起寫「對話還沒讀到」。
-- **已停用的排程**：停用是發布新版本，新版本的 `approved_at` 是停用當下，畫面改標「停用於」。
+- **已停用的排程**：停用是發布新版本，新版本的 `approved_at` 是停用當下，畫面改標「停用於」。已停用的排程只剩「刪除」按鈕（2026-11-22）。
 - **唯讀交辦的舊回合卡住（推定原因）**：dev journal 核對到 B 走 `foundry-responses-v1`，實機未重現；下面的原因是離線重現得出的推定，不是現場定論。
   Responses 路線只重讀本機送出的回合，以及對話的最後一個和進行中的回合。收到的交辦沒有本機 `submit`，
   後面又有新回合時，看過還在跑的舊回合不再重讀，氣泡停在「正在回覆」、停止按鈕還在，重新載入也一樣，要一次 `/status` 才會更新。
@@ -319,9 +319,9 @@ Neal：在「Agent Team 設定 → 批准規則」看不到規則細節，控制
 - 頁面內確認：`test_web_test_console_workbench.cjs` 的 harness 把 `window.confirm`／`alert`／`prompt` 換成一呼叫就失敗的替身，
   不再預設回 true，所有 `window.confirm` stub 都拿掉，改用 `ui.answer(true|false)` 回答頁面內的確認框。
   新增 index.html 不含原生對話框呼叫的 guard、新問題把舊問題當取消（2 案）；Esc 案例另驗頁面任一處按 Esc 也關閉不送；
-  HITL 規則新增、skill 批准、排程停用、封存並開新 session 各驗「取消不送、確定（連按兩次）只送一次」。
+  HITL 規則新增、skill 批准、排程停用、排程刪除、封存並開新 session 各驗「取消不送、確定（連按兩次）只送一次」。
   另有 guard 要求每個 `confirmInPage(` 呼叫處都寫成 `await confirmInPage(`（不符就報 index.html 行號）；
-  表格測試（25 列，涵蓋全部 21 個呼叫處）逐一按下動作、按「取消」驗證沒送到該路徑，再按「確定」驗證剛好送一個；
+  表格測試（26 列，涵蓋全部 23 個呼叫處）逐一按下動作、按「取消」驗證沒送到該路徑，再按「確定」驗證剛好送一個；
   任一處拿掉 `await` 都會讓對應列失敗。另驗確認框開著時 `#app-shell` 是 `inert`，取消／確定／Esc／失效關閉後都恢復。
 
 <a id="connectors-settings"></a>
@@ -465,6 +465,10 @@ API、bridge、權限與請求內容都沒變。設定頁還是同一頁（`#set
   `POST /api/routines/{routine_id}/versions/{version_id}/disable`（body `{}`，走既有 ≤16 bytes 規則）要 `Behavior.Approve`：
   bridge 先讀目前版本，已停用就直接回那一份；仍啟用但不是畫面上那個版本回 409 `ROUTINE_SETTINGS_CHANGED`；
   否則送同內容、`enabled=false`、`expected_version_id`＝畫面版本的新版本，請求 ID 由那個版本決定。頁面停用前先跳一次確認。
+  `POST /api/routines/{routine_id}/deletions/{version_id}`（Neal 2026-11-22 要求；body `{}`，同樣要 `Behavior.Approve`）：
+  啟用中的先照上面停用，再對那個停用版本送 API `POST .../definitions/{routine_id}/delete`，刪除請求 ID 由停用版本決定，
+  所以回應不明時再按一次會讀到已停用的那一份、送同一個刪除請求，API 只讀回原回條。啟用中與已停用的排程都有「刪除」，
+  一次確認說明「會先停用再刪除」（已停用的不說）、刪除後清單看不到、不能再選、不會再執行、不能復原到清單，原內容與批准紀錄仍保存。
 - **Agent 編號**：agent 模式用 `X-Console-Agent` 的 prefix；單一 Agent 且沒有 Agent scope 的設定檔，用這個工作台自己的
   native 回合裡唯一的 Agent，還沒有回合時回 `ROUTINE_SETTINGS_NO_AGENT`（請先送一則訊息）。
 - adapter 讓 `/native-hitl/v1/*` 與 definitions 路徑上的 `NATIVE_ROUTINE_*` 錯誤碼原樣傳回，definitions 讀取可帶 `after`。
@@ -502,6 +506,10 @@ API、bridge、權限與請求內容都沒變。設定頁還是同一頁（`#set
 - DOM：`node --test --test-timeout=20000 tests/shared_context/test_web_test_console_workbench.cjs`：568 PASS（新增 6 案：卡片文案與
   只有一次批准、決定失敗提示核對、存檔紀錄重讀、分頁只在開啟時出現、停用綁畫面版本且回應遺失時重送同版本、取消確認或唯讀不送）。
 - 反向驗證：卡片又出現「以後允許這類」、摘要不寫排程內容、停用不核版本，各自讓對應測試失敗。
+- 2026-11-22 刪除（程式基準 main `04d3a004`）：`test_native_routine_clock.py` 兩案（刪除後清單看不到、隔天不觸發、重送同一刪除 ID 只讀回原回條、
+  不能再發布復活；啟用中的停用再刪除後，到點的 occurrence 不觸發、`trigger` 403）；`test_native_routine_proposals.py` 兩案（真 API＋bridge
+  刪除啟用中的排程後清單是空的、重送不多寫版本；批准卡決定遺失後重送不會讓已刪的排程復活）。DOM 新增 2 案（一次確認先停用再刪、
+  回應遺失重送同一路徑；確認表格加「排程刪除」列）。
 - 10-08 讀到排程回合：DOM 573 PASS（新增 5 案：切回對話讀一次並顯示排程回合、第一次打開先快讀最新回合再整段讀、推送讀進非本頁回合而別的助理不讀、
   快讀失敗（503／斷線）照退避不連續重讀）；反向：切換後不讀、快讀後不再整段讀、推送忽略非本頁回合、快讀失敗不清標記，各自讓對應測試失敗。
   推送：這位助理的 `turn.finished` 只帶 RID，所以凡不是本頁送的回合（排程、交辦或別段對話）都讀一次目前對話（同一事件只讀一次）。
@@ -2002,11 +2010,11 @@ source／callback／模型I/O的層級與原FAIL另見[評測](../../../docs/age
 
 > 2026-10-08 起 skill 審核（含 Q4 自己寫草稿）在左下 ⚙「Agent Team 設定」→ Team Skills，見[設定分拆](#settings-split)。
 
-設定頁的 Skills 分頁上方加了「skill 審核（整個 Team）」。owner 可以在這裡查看內容、批准、拒絕、停用，或用新 skill 取代舊的。API 端走 behavior API 的 `/team-skills/v1`（見[共用 README](../README.md#team-owner-skill-review-behavior-apilocal未部署)），沿用既有 M3 的資料、版本和決定規則；沒有新增 IAM，也沒有刪除。
+設定頁的 Skills 分頁上方加了「skill 審核（整個 Team）」。owner 可以在這裡查看內容、批准、拒絕、停用、刪除，或用新 skill 取代舊的。API 端走 behavior API 的 `/team-skills/v1`（見[共用 README](../README.md#team-owner-skill-review-behavior-apilocal未部署)），沿用既有 M3 的資料、版本和決定規則；沒有新增 IAM。刪除（Neal 2026-11-22 要求）只把 skill 標成已刪除，不刪任何資料。
 
 - **網頁代理**（`team_skills.py`）：
   - `GET /api/team-skills/reviews`、`/skills/{artifact}`、`/versions/{version_id}`（內容會核對 SHA256 和 UTF-8）、`/resources/{name}`。
-  - `POST /api/team-skills/skills/{artifact}/decisions|deactivations`，body 上限 2 KiB；bridge 只放行這兩條路徑，CSRF 和 Origin 規則不變。送出前先檢查 `Behavior.Approve`，沒有就直接回 `TEAM_SKILLS_OWNER_ONLY`，不往上游送。
+  - `POST /api/team-skills/skills/{artifact}/decisions|deactivations|deletions`，body 上限 2 KiB；bridge 只放行這三條路徑，CSRF 和 Origin 規則不變。送出前先檢查 `Behavior.Approve`，沒有就直接回 `TEAM_SKILLS_OWNER_ONLY`，不往上游送。
   - 讀到的 ETag 會用 `If-Match` 帶給 API。`adapter.send` 只允許這組路由帶 `If-Match`，也只允許審核清單帶 `after`。
 - **畫面**：
   - 狀態分為待審核、生效中、已拒絕、已停用、上傳未完成。
@@ -2018,6 +2026,11 @@ source／callback／模型I/O的層級與原FAIL另見[評測](../../../docs/age
   - 依序執行：① 批准新 skill；② 停用舊 skill 目前的版本；③ 重新讀取這位助理的新對話設定，把草稿裡的舊 skill 換成新的，自動帶出同一個「套用到新對話」確認視窗。
   - 每一步都只送一次；任何一步失敗就停下，畫面提供「繼續取代」，沿用原本的決定編號接著做。
   - 這位助理原本沒有選用舊 skill 時，不會自動開啟新的，只提示使用者自行開啟。
+- **刪除**：每份 skill（任何狀態）都有「刪除」。確認視窗說明：刪除後從清單和每位助理的可選項消失、不能放回清單；已選用它的助理之後讀不到它，開新對話會像停用時一樣被擋下（`PROFILE_SELECTION_SOURCES_CHANGED`）；原內容與批准紀錄仍保存在系統裡。
+  - 被擋下的助理：在它的 ⚙ 設定頁，已刪除或停用的 skill 會出現在「尚未套用。關閉：…」，按「套用到新對話」就把它移出設定，之後的新對話恢復。對話裡的錯誤提示也指向這一步。
+  - 生效中的 skill 在同一次確認裡先送停用、成功後才送刪除；兩者各有自己的決定編號。停用失敗就停下，「重新讀取並核對」補完停用後接著用原編號送刪除。
+  - 刪除失敗或回應不明，同樣先重新讀取核對，確認後才用同一編號重送。
+  - 審核清單某一頁剛好都是已刪除或非 skill 項目時，顯示「這一頁沒有 skill；按「載入更多」繼續。」，不當成 Team 沒有 skill。
 - 審核狀態會隨換助理或登出清掉，避免舊回應寫到新畫面。
 
 ### Verified against（S2）

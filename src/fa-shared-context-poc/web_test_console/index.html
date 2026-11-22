@@ -431,7 +431,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 </div>
 <section id="settings-skill-reviews" class="settings-reviews" role="tabpanel" hidden aria-label="Team Skills">
 <h3>skill 審核（整個 Team）</h3>
-<p class="reason">批准後這份 skill 對整個 Team 生效；要讓某位助理用，到助理清單那位助理右側的 ⚙ → Skills 打開並套用到新對話。批准本身不會開到任何助理。停用和拒絕都保留原內容與紀錄，不刪除。</p>
+<p class="reason">批准後這份 skill 對整個 Team 生效；要讓某位助理用，到助理清單那位助理右側的 ⚙ → Skills 打開並套用到新對話。批准本身不會開到任何助理。停用和拒絕都保留原內容與紀錄。「刪除」讓 skill 從這個清單和每位助理的可選項消失；已選用它的助理之後讀不到它，開新對話會像停用時一樣被擋下並提示 skill 已變動。生效中的會先停用再刪除。刪除後不能放回清單，原內容與批准紀錄仍保存在系統裡。</p>
 <details id="skill-new"><summary>新增 skill（自己寫一份草稿）</summary>
 <p class="reason">建立的是未批准的草稿，會出現在下方清單；查看內容後按「批准」才生效。相同內容只會建立一次。要修改既有 skill，請在這裡寫新的一份，再用「批准並取代」換掉舊的。</p>
 <label for="skill-new-title">名稱（一行，64 字內）</label><input id="skill-new-title" maxlength="64" autocomplete="off">
@@ -501,7 +501,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <div id="hitl-history-items"></div></details></details>
 </div>
 <div id="settings-routines" role="tabpanel" hidden>
-<p class="reason">排程只能在對話裡建立：助理提出每日時間和要做的事，你在批准卡上按「允許這次」才會生效。這裡列出這位助理的每日排程；停用會保存一個停用的新版本，下一次到點就不會執行。這裡不能修改或刪除；要改內容，請停用後在對話裡重新請助理提出。</p>
+<p class="reason">排程只能在對話裡建立：助理提出每日時間和要做的事，你在批准卡上按「允許這次」才會生效。這裡列出這位助理的每日排程；停用會保存一個停用的新版本，下一次到點就不會執行。刪除會先停用再從清單移除，之後不會再執行、不能復原到清單；原內容與批准紀錄仍保存在系統裡。這裡不能修改；要改內容，請停用或刪除後在對話裡重新請助理提出。</p>
 <div class="settings-tools"><button id="routines-read">重新讀取排程</button></div>
 <p id="routines-note" class="reason" role="status"></p>
 <div id="routines-list"></div>
@@ -1302,7 +1302,7 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     PROFILE_SELECTION_DISABLED:"後端尚未接通新對話設定選擇；不會自動啟用。",
     PROFILE_SELECTION_DENIED:"後端拒絕目前 human／Team 的選擇；模板預覽不是授權。",
     PROFILE_SELECTION_CONFLICT:"後端 CAS 拒絕：目前選擇或原 ID 內容已改變。請重新讀取，原意圖保留。",
-    PROFILE_SELECTION_SOURCES_CHANGED:"目的 Team 已批准的技能版本／hash 已改變；不替換原參照或重送。",
+    PROFILE_SELECTION_SOURCES_CHANGED:"這位助理選用的 Team skill 已停用、刪除或換了版本；沒有替換原參照或重送。請到助理清單這位助理右側的 ⚙ → Skills，確認變更後按「套用到新對話」。",
     PROFILE_SELECTION_MISSING:"後端找不到原選擇版本；不以目前設定補舊資料。",
     PROFILE_SELECTION_INVALID:"後端原選擇或回條無法核對；保留原請求。",
     PROFILE_SELECTION_UNKNOWN:"原選擇仍未確認；只核對保存的完整原 command，不換 ID 重送。",
@@ -1313,7 +1313,7 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     REMOTE_STATE_FULL:"遠端保存的紀錄已達容量上限；這次的變更沒有保存到遠端，也不會自動重送，已保存的紀錄不受影響。請交管理者處理後再操作。",
     PLATFORM_REQUEST_REJECTED:"雲端登入層拒絕了這個請求，沒有送到工作台，也沒有自動重送。請重新整理頁面；仍失敗時請按「重新登入」。",
     TEAM_SKILLS_UNAVAILABLE:"這個 API 版本還沒有 skill 審核入口；不會改走其他入口。",
-    TEAM_SKILLS_OWNER_ONLY:"只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能新增、批准、拒絕或停用 skill。",
+    TEAM_SKILLS_OWNER_ONLY:"只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能新增、批准、拒絕、停用或刪除 skill。",
     TEAM_SKILL_RESPONSE_INVALID:"skill 審核的回應格式不符；不當成完成，請重新讀取。",
     TEAM_SKILL_DRAFT_INVALID:"skill 草稿不符限制，沒有送出。名稱一行、64 字內；用途一行、512 bytes 內；本文 8 KiB 內；附檔最多 4 個、每個 8 KiB 內（中文約 2700 字），檔名只用英數和 . _ -。",
     SKILL_DRAFT_OUTCOME_UNKNOWN:"草稿保存結果未確認；內容還在表單裡。請重新讀取審核清單；用相同內容再送一次只會對到同一份草稿，不會另建。",
@@ -1362,8 +1362,8 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     TEAM_MCP_RESPONSE_INVALID:"MCP 設定的回應格式不符；不當成完成，請重新讀取。",
     ROUTINE_SETTINGS_UNAVAILABLE:"這個環境沒有開啟排程。",
     ROUTINE_SETTINGS_NO_AGENT:"還不知道這位助理是哪一個；請先在對話裡送一則訊息，再回來查看排程。",
-    ROUTINE_SETTINGS_OWNER_ONLY:"只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能停用排程。",
-    ROUTINE_SETTINGS_CHANGED:"這個排程剛有變動，這次沒有停用；請重新讀取後再確認。",
+    ROUTINE_SETTINGS_OWNER_ONLY:"只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能停用或刪除排程。",
+    ROUTINE_SETTINGS_CHANGED:"這個排程剛有變動，這次沒有停用或刪除；請重新讀取後再確認。",
     ROUTINE_SETTINGS_INVALID_REQUEST:"請從清單選一個排程；不接受其他內容。",
     ROUTINE_SETTINGS_RESPONSE_INVALID:"排程的回應格式不符；不當成完成，請重新讀取。",
     NATIVE_ROUTINES_DISABLED:"這個環境沒有開啟排程。",
@@ -1382,6 +1382,8 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     M3_DECISION_CONFLICT:"這個決定編號已用在另一個決定；不會覆寫。",
     M3_UPLOAD_UNKNOWN:"這個 skill 還有上傳未完成。助理起草的請等它核對完成；你自己寫的請用相同內容再送一次（不會另建）。",
     M3_STATE_UNCERTAIN:"寫入結果未確認；請重新讀取核對，同一決定編號重試不會重複生效。",
+    M3_SKILL_DELETED:"這份 skill 已刪除，不能再改或放回清單。你自己寫的同名同內容草稿也算同一份；請改名稱或內容再存。",
+    M3_SKILL_EFFECTIVE:"這份 skill 還在生效中；請重新讀取後再刪除（刪除會先停用）。",
   };
   return messages[error.code]||"這次操作沒有完成，原因見「支援明細」；不會自動重送或改稱成功。";
 }
@@ -2086,6 +2088,9 @@ function settingsChanges(){
     else if(before&&!after)changes.off.push(item.title);
     else if(before&&after&&JSON.stringify(before)!==JSON.stringify(after))changes.updated.push(item.title);
   }
+  // A deleted or deactivated skill has no row; dropping it is the change that lets this Agent start new conversations.
+  for(const name of settingsView.base.unavailable_skills||[])if(!settingsDraft.skills.has(name))
+    changes.off.push((skillReviews||[]).find(item=>item.artifact_id===name)?.title||`已刪除或停用的 skill（${name.slice(0,8)}）`);
   return changes;
 }
 function settingsChangeLines(changes){
@@ -2342,7 +2347,7 @@ function renderSettings(){
   el("settings-apply").disabled=!ready||settingsBusy||!settingsView||!lines.length||Boolean(blocked);
   renderSettingsSelections();
 }
-// S2: the owner reviews Team skills (approve, reject, deactivate, replace). Each decision carries one fixed decision ID;
+// S2: the owner reviews Team skills (approve, reject, deactivate, replace, delete). Each decision carries one fixed decision ID;
 // after a failed or lost reply the page reads the skill again and resends only that same ID, which the API records once.
 const SKILL_REVIEW_STATUS={awaiting_decision:"待審核",effective:"生效中",rejected:"已拒絕",deactivated:"已停用",
   upload_pending:"上傳未完成",no_version:"沒有版本"};
@@ -2399,18 +2404,20 @@ async function readSkillView(artifact,revision,agent){
   return entry;
 }
 function skillDecisionBody(kind,version,decision){
+  if(kind==="deletion")return {schema_version:"fa-skill-deletion-v1",decision_id:crypto.randomUUID().replaceAll("-","")};
   const body={decision_id:crypto.randomUUID().replaceAll("-",""),version_id:version.version_id,sha256:version.sha256};
   if(version.metadata_sha256)body.metadata_sha256=version.metadata_sha256;
   return kind==="deactivation"?{schema_version:"fa-skill-deactivation-v1",...body}:{...body,decision};
 }
 function skillRecorded(document,kind,body){
+  if(kind==="deletion")return document.deletion?.decision_id===body.decision_id;
   return kind==="deactivation"?(document.deactivations||[]).some(item=>item.decision_id===body.decision_id):
     document.versions.some(item=>item.approval?.decision_id===body.decision_id);
 }
 async function sendSkillDecision(artifact,kind,body,revision,agent){
   const pending={kind,body,state:"sending",error:null};skillDecisions.set(artifact,pending);renderSettings();
   try{
-    const value=await teamSkillCall(skillPath(artifact,kind==="deactivation"?"/deactivations":"/decisions"),
+    const value=await teamSkillCall(skillPath(artifact,{deactivation:"/deactivations",deletion:"/deletions"}[kind]||"/decisions"),
       {...body,etag:skillReviewViews.get(artifact).etag},agent);
     if(!skillLive(revision,agent))return false;
     if(value.decision_id!==body.decision_id||value.original_request_resent!==false||value.artifact?.artifact_id!==artifact
@@ -2447,9 +2454,27 @@ function deactivateSkill(entry){
     if(!view)return;
     const version=view.artifact.versions.find(item=>item.version_id===view.artifact.effective_version_id);
     if(!version)throw {code:"M3_NO_EFFECTIVE_VERSION"};
-    if(!await confirmInPage(`停用 skill「${entry.title}」目前生效的第 ${version.number} 版？\n停用後新對話不能再選它，已選用的助理之後也讀不到它；原內容和批准紀錄保留，不刪除。`)
+    if(!await confirmInPage(`停用 skill「${entry.title}」目前生效的第 ${version.number} 版？\n停用後新對話不能再選它，已選用的助理之後也讀不到它；原內容和批准紀錄保留，之後可以批准新版本。要讓它從清單消失請用「刪除」。`)
         ||!skillLive(revision,agent))return;
     await sendSkillDecision(entry.artifact_id,"deactivation",skillDecisionBody("deactivation",version),revision,agent);
+    if(skillLive(revision,agent))await loadSkillReviews(revision,agent);
+  });
+}
+// A deletion of an effective skill is deactivation then deletion under one confirm; each keeps its own decision ID.
+function deleteSkill(entry){
+  skillTask("decision",async(revision,agent)=>{
+    const view=await readSkillView(entry.artifact_id,revision,agent);
+    if(!view)return;
+    const effective=view.artifact.versions.find(item=>item.version_id===view.artifact.effective_version_id);
+    if(!await confirmInPage(`刪除 skill「${entry.title}」？\n${effective?`它目前生效中（第 ${effective.number} 版），會先停用再刪除。\n`:""}刪除後它從這個清單和每位助理的可選項消失，也不能放回清單；已選用它的助理之後讀不到它，開新對話會像停用時一樣被擋下。原內容和批准紀錄仍保存在系統裡。`)
+        ||!skillLive(revision,agent))return;
+    const deletion=skillDecisionBody("deletion");
+    if(effective&&!await sendSkillDecision(entry.artifact_id,"deactivation",skillDecisionBody("deactivation",effective),revision,agent)){
+      const pending=skillDecisions.get(entry.artifact_id);
+      if(pending)pending.next=deletion;
+      return;
+    }
+    await sendSkillDecision(entry.artifact_id,"deletion",deletion,revision,agent);
     if(skillLive(revision,agent))await loadSkillReviews(revision,agent);
   });
 }
@@ -2459,9 +2484,16 @@ function retrySkillDecision(artifact){
   skillTask("decision",async(revision,agent)=>{
     const view=await readSkillView(artifact,revision,agent);
     if(!view)return;
-    if(skillRecorded(view.artifact,pending.kind,pending.body)){pending.state="done";pending.error=null}
+    let done=skillRecorded(view.artifact,pending.kind,pending.body);
+    if(done){pending.state="done";pending.error=null}
     else if(await confirmInPage("重新讀取後還沒看到這個決定。用同一個決定編號再送一次？同一編號只會記一次，不會變成兩個決定。")
-        &&skillLive(revision,agent))await sendSkillDecision(artifact,pending.kind,pending.body,revision,agent);
+        &&skillLive(revision,agent)){
+      done=await sendSkillDecision(artifact,pending.kind,pending.body,revision,agent);
+      const failed=skillDecisions.get(artifact);
+      if(!done&&failed)failed.next=pending.next;
+    }
+    // The deletion that waited on its deactivation continues with its own original decision ID.
+    if(done&&pending.next&&skillLive(revision,agent))await sendSkillDecision(artifact,"deletion",pending.next,revision,agent);
     if(skillLive(revision,agent))await loadSkillReviews(revision,agent);
   });
 }
@@ -2476,9 +2508,11 @@ function replaceSkill(entry,oldArtifact){
     if(!viewed||version?.version_id!==viewed.version_id)throw {code:"M3_STALE_PROPOSAL"};
     if(!version||version.approval)throw {code:"M3_ALREADY_DECIDED"};
     if(!oldVersion)throw {code:"M3_NO_EFFECTIVE_VERSION"};
-    if(!await confirmInPage(`用「${entry.title}」第 ${version.number} 版取代「${old.artifact.title}」？\n會依序：1. 批准新 skill（整個 Team 生效）；2. 停用舊 skill；3. 打開目前選中的助理「${settingsAgentName()||"這位助理"}」的設定，在它的新對話設定把舊的換成新的，再請你確認套用。\n每一步都只送一次；任何一步失敗就停下，不會往下做。`)
+    // The artifact read carries the stored title; the list entry carries the name the owner sees everywhere else.
+    const oldTitle=(skillReviews||[]).find(item=>item.artifact_id===oldArtifact)?.title||oldArtifact;
+    if(!await confirmInPage(`用「${entry.title}」第 ${version.number} 版取代「${oldTitle}」？\n會依序：1. 批准新 skill（整個 Team 生效）；2. 停用舊 skill；3. 打開目前選中的助理「${settingsAgentName()||"這位助理"}」的設定，在它的新對話設定把舊的換成新的，再請你確認套用。\n每一步都只送一次；任何一步失敗就停下，不會往下做。`)
         ||!skillLive(revision,agent))return;
-    skillReplace={newArtifact:entry.artifact_id,newTitle:entry.title,oldArtifact,oldTitle:old.artifact.title,step:1,
+    skillReplace={newArtifact:entry.artifact_id,newTitle:entry.title,oldArtifact,oldTitle,step:1,
       // Known only when this Agent's settings were already read; otherwise the reread after step 2 lists the old
       // skill under unavailable_skills, which also counts as installed.
       hadOld:Boolean(settingsView?.base.skills.some(ref=>ref.name===oldArtifact)),
@@ -3141,7 +3175,8 @@ function renderSkillReviews(ready){
   const flow=skillReplace;
   text("settings-skill-review-note",skillReviewError?friendlyError(skillReviewError):skillReviewBusy?SKILL_REVIEW_BUSY[skillReviewBusy]:
     flow?`取代「${flow.oldTitle}」停在第 ${flow.step} 步；按「繼續取代」會用原本的決定編號接著做。`:
-    skillReviews===null?"尚未讀取，不以空清單當成沒有 skill。":skillReviews.length?"":"Team 目前沒有 skill。");
+    skillReviews===null?"尚未讀取，不以空清單當成沒有 skill。":skillReviews.length?"":
+    skillReviewNext?"這一頁沒有 skill；按「載入更多」繼續。":"Team 目前沒有 skill。");
   const list=el("settings-skill-review-list");list.replaceChildren();
   if(flow){
     const row=document.createElement("div");row.className="settings-review";
@@ -3176,6 +3211,7 @@ function renderSkillReviews(ready){
       if(!reviewed){const hint=document.createElement("small");hint.textContent="先查看內容，才能決定。";actions.append(hint)}
     }
     if(entry.status==="effective")actions.append(skillButton("停用",!idle,()=>deactivateSkill(entry)));
+    actions.append(skillButton("刪除",!idle,()=>deleteSkill(entry)));
     row.append(title,meta,actions);
     if(pending){
       const note=document.createElement("p");note.className="reason";
@@ -3201,8 +3237,9 @@ function renderSkillReviews(ready){
   }
 }
 // 排程 tab: this Agent's daily routines. They are created only by the owner's allow on an approval card in a chat;
-// here the owner can only disable one, which saves a disabled version against the exact version shown. A disable
-// whose reply was lost is clicked again: the bridge finds it already off or resends the same version request.
+// here the owner can disable one, which saves a disabled version against the exact version shown, or delete one, which
+// disables it first and then removes it from the list and the clock. A disable or delete whose reply was lost is
+// clicked again: the bridge finds it already off and resends the same version or delete request.
 let routineSettings=null,routineSettingsBusy="",routineSettingsError=null,routineSettingsRevision=0,routineSettingsNote="";
 function clearRoutineSettings(){
   routineSettingsRevision++;routineSettings=null;routineSettingsBusy="";routineSettingsError=null;routineSettingsNote="";
@@ -3248,12 +3285,31 @@ async function disableRoutine(view){
     await loadRoutineSettings(revision,agent);
   });
 }
+async function deleteRoutine(view){
+  const routine=view.definition,draft=routineDraft({...routine.schedule,content:routine.content});
+  const revision=routineSettingsRevision,agent=selectedAgent;
+  if(!draft||!await confirmInPage(`刪除這個排程？\n${routineText(draft)}\n${routine.enabled?"會先停用再刪除。":""}`+
+      "刪除後清單看不到、不能再選、不會再執行，也不能復原到清單；原內容與批准紀錄仍保存在系統裡。"+
+      "\n已在等批准的那次執行會從提醒清單消失，但仍可在它的對話裡批准。")
+      ||revision!==routineSettingsRevision||agent!==selectedAgent)return;
+  routineSettingsNote="";
+  routineSettingsTask("delete",async(revision,agent)=>{
+    const result=await routineCall(`/api/routines/${encodeURIComponent(routine.routine_id)}/deletions/`+
+      `${encodeURIComponent(routine.request_id)}`,true,agent);
+    if(!routineSettingsLive(revision,agent))return;
+    if(result?.deleted?.definition?.routine_id!==routine.routine_id||result.deleted.definition.enabled!==false)
+      throw {code:"ROUTINE_SETTINGS_RESPONSE_INVALID"};
+    routineSettingsNote="已刪除；清單看不到，也不會再執行。原內容與批准紀錄仍保存在系統裡。";
+    await loadRoutineSettings(revision,agent);
+  });
+}
 function renderRoutineSettings(ready){
   const idle=ready&&!routineSettingsBusy&&!settingsBusy;
   el("routines-read").disabled=!idle;
   text("routines-note",routineSettingsError?friendlyError(routineSettingsError):
     routineSettingsBusy==="read"?"正在讀取…":
     routineSettingsBusy==="disable"?"正在停用；回應不明時再按一次只會核對同一個版本，不會多寫。":
+    routineSettingsBusy==="delete"?"正在刪除；回應不明時再按一次只會核對同一筆刪除，不會多寫。":
     routineSettingsNote||(routineSettings===null?(ready?"尚未讀取。":"請先登入。"):
       routineSettings.routines.length?"":"這位助理目前沒有排程。"));
   const list=el("routines-list");list.replaceChildren();
@@ -3268,9 +3324,10 @@ function renderRoutineSettings(ready){
     // Disabling publishes a new version, so a disabled one's approved_at is when it was disabled.
     meta.textContent=`來源對話 ${routine.conversation_id.slice(0,8)} · ${routine.enabled?"批准於":"停用於"} ${hitlTime(routine.approved_at)}`;
     row.append(title,body,meta);
-    if(routine.enabled&&routineSettings.can_manage===true){
+    if(routineSettings.can_manage===true){
       const actions=document.createElement("div");actions.className="actions";
-      actions.append(skillButton("停用",!idle,()=>disableRoutine(view)));row.append(actions);
+      if(routine.enabled)actions.append(skillButton("停用",!idle,()=>disableRoutine(view)));
+      actions.append(skillButton("刪除",!idle,()=>deleteRoutine(view)));row.append(actions);
     }
     list.append(row);
   }
@@ -9233,7 +9290,7 @@ const ONBOARDING_STALE_CAUSES={
       org&&"如果是組織工具目錄的工具，請部署管理者確認組織目錄",
       "如果工具都還在，請部署線確認服務端版本"].filter(Boolean).join("；");
   },
-  PROFILE_SELECTION_SOURCES_CHANGED:"勾選的 skill 已不是 Team 目前批准的版本，請 Team 主人恢復原本批准的版本",
+  PROFILE_SELECTION_SOURCES_CHANGED:"勾選的 skill 已停用、刪除或換了版本，不再是 Team 目前批准的版本，也不能恢復成原本的版本；請聯絡部署線",
   SKILL_CATALOG_BUDGET_TOO_SMALL:"模型容量放不下勾選的 skill 數量，這是模型設定的問題，請聯絡部署線",
 };
 function onboardingMessage(v){

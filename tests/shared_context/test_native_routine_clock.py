@@ -197,6 +197,62 @@ def test_disabled_routine_does_not_run_its_next_occurrence(clock_api):
     assert len(case.remote.calls) == before and list(routine_records(case)) == [expected_rid(case, due)]
 
 
+def delete(case, version_id, request_id="delete-1"):
+    return case.client.post(case.routine_prefix + "/definitions/daily-summary/delete", headers=case.headers,
+                            json={"request_id": request_id, "expected_version_id": version_id})
+
+
+def listed(case):
+    response = case.client.get(case.routine_prefix + "/definitions", headers=case.headers)
+    assert response.status_code == 200, response.text
+    return response.json()["definitions"]
+
+
+def test_deleted_routine_leaves_the_list_never_fires_and_cannot_be_revived(clock_api):
+    case = clock_api
+    due = due_minute(case)
+    publish(case, due.strftime("%H:%M"))
+    case.c.h.time = due + timedelta(seconds=2)
+    assert case.clock.tick()["triggered"] == 1
+    case.remote.completed(expected_rid(case, due))
+    case.clock.tick()
+    refused = delete(case, "definition-1")
+    assert refused.status_code == 409 and refused.json()["error"]["code"] == "NATIVE_ROUTINE_CHANGED"
+    publish(case, due.strftime("%H:%M"), "definition-2", expected_version_id="definition-1", enabled=False)
+    for headers in (case.agent_headers, case.read_headers):
+        denied = case.client.post(case.routine_prefix + "/definitions/daily-summary/delete", headers=headers,
+                                  json={"request_id": "not-owner", "expected_version_id": "definition-2"})
+        assert denied.status_code in (401, 403), denied.text
+    assert [view["definition"]["request_id"] for view in listed(case)] == ["definition-2"], "only the owner deletes"
+    deleted = delete(case, "definition-2")
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["definition"]["request_id"] == "definition-2" and listed(case) == []
+    assert delete(case, "definition-2").json() == deleted.json(), "a resend replays the one deletion"
+    kept = case.client.get(case.routine_prefix + "/definitions/daily-summary", headers=case.headers)
+    assert kept.status_code == 200 and kept.json()["definition"]["request_id"] == "definition-2", "records are kept"
+    revived = case.client.post(case.routine_prefix + "/definitions", headers=case.headers, json=daily_definition(
+        "definition-3", expected_version_id="definition-2", enabled=True,
+        schedule={"kind": "daily", "time_zone": "UTC", "local_time": due.strftime("%H:%M")}))
+    assert revived.status_code == 404 and revived.json()["error"]["code"] == "NATIVE_ROUTINE_MISSING"
+    case.c.h.time = due + timedelta(days=1, seconds=2)
+    before = len(case.remote.calls)
+    assert case.clock.tick()["triggered"] == 0 and listed(case) == []
+    assert len(case.remote.calls) == before and list(routine_records(case)) == [expected_rid(case, due)]
+
+
+def test_an_active_routine_disabled_then_deleted_does_not_fire_its_due_occurrence(clock_api):
+    case = clock_api
+    due = due_minute(case)
+    publish(case, due.strftime("%H:%M"))
+    publish(case, due.strftime("%H:%M"), "definition-2", expected_version_id="definition-1", enabled=False)
+    assert delete(case, "definition-2").status_code == 200
+    case.c.h.time = due + timedelta(seconds=2)
+    assert case.clock.tick()["triggered"] == 0 and routine_records(case) == {}
+    trigger = case.trigger({"routine_id": "daily-summary", "scheduled_for": due.isoformat()})
+    assert trigger.status_code == 403 and trigger.json()["error"]["code"] == "NATIVE_ROUTINE_INACTIVE"
+    assert routine_records(case) == {}
+
+
 def test_one_failing_agent_or_occurrence_does_not_block_the_others(clock_api, monkeypatch, caplog):
     from shared_context.errors import Problem
     from shared_context.native_routines import NativeRoutineService

@@ -9533,7 +9533,7 @@ test("onboarding panel counts role bytes and shows the server quota limit withou
 test("onboarding selection stale shows the inner cause's own recovery and keeps the original request ID",async()=>{
   const rid="onboard-"+"a".repeat(24);
   for(const [cause,wording] of [["CAPABILITY_SOURCES_CHANGED",/讀不到其中一個勾選的工具（組織工具目錄或 Team MCP）/],
-    ["PROFILE_SELECTION_SOURCES_CHANGED",/skill 已不是 Team 目前批准的版本/],
+    ["PROFILE_SELECTION_SOURCES_CHANGED",/skill 已停用、刪除或換了版本/],
     ["SKILL_CATALOG_BUDGET_TOO_SMALL",/模型容量放不下/],["PROFILE_SELECTION_DENIED",/（PROFILE_SELECTION_DENIED）.*部署線/]]){
     const server=onboardingServer({posts:[{value:onboardingView({state:"UNKNOWN",code:"AGENT_ONBOARDING_SELECTION_STALE",cause})}]});
     const ui=await open(agentChat("agent-one"),{onboarding:server.handle});
@@ -10694,6 +10694,19 @@ test("settings keeps an installed skill applicable while a newer version of it a
   assert.deepEqual(command.template.skills,[settingsSkill]);
 });
 
+test("settings lets the owner drop a deleted or deactivated skill so the Agent can start new conversations again",async()=>{
+  const base=settingsBase();base.skills=[];base.unavailable_skills=["deleted-guide-0001"];
+  base.settings.capabilities=[{entry_id:"fa-skills-v1",entry_sha256:"6".repeat(64)}];
+  const ui=await openSettingsPage(settingsOptions(),base);
+  assert.equal(ui.text("settings-changes"),"尚未套用。關閉：已刪除或停用的 skill（deleted-）");
+  assert.equal(ui.nodes.get("settings-apply").disabled,false);
+  ui.holder.templateResponses["/api/agent-template/inspect"]={ok:true,json:async()=>({...inspectedTemplate(),template_sha256:"a".repeat(64)})};
+  ui.click("settings-apply");const confirmation=await ui.answer(true);await ui.tick();
+  assert.match(confirmation,/關閉：已刪除或停用的 skill（deleted-）/);
+  const command=JSON.parse(ui.calls.find(call=>call.url==="/api/agent-template/select").body);
+  assert.deepEqual(command.template.skills,[]);assert.deepEqual(command.template.unavailable_skills,[]);
+});
+
 // S2: owner skill review in the settings page (approve, reject, deactivate, replace).
 const skillApproval=id=>({decision_id:id,version_id:"1".repeat(32),sha256:"e".repeat(64),decision:"approve",
   metadata_sha256:"f".repeat(64),approver_oid:"owner",decided_at:when});
@@ -10791,7 +10804,9 @@ test("skill review: a failed decision is read back first and only resent with th
 test("skill review: deactivation names the effective version and keeps the original",async()=>{
   const ui=await openReviews();
   reviewButton(reviewRow(ui,"舊指南"),"停用").events.click();
-  assert.match(await ui.answer(true),/原內容和批准紀錄保留，不刪除/);await settleReviews(ui);
+  const message=await ui.answer(true);await settleReviews(ui);
+  assert.match(message,/原內容和批准紀錄保留，之後可以批准新版本。要讓它從清單消失請用「刪除」。/);
+  assert.doesNotMatch(message,/不刪除/);
   const posts=ui.calls.filter(call=>call.url==="/api/team-skills/skills/old-guide/deactivations");
   assert.equal(posts.length,1);
   const body=JSON.parse(posts[0].body);
@@ -10799,17 +10814,105 @@ test("skill review: deactivation names the effective version and keeps the origi
     version_id:"1".repeat(32),sha256:"e".repeat(64),metadata_sha256:"f".repeat(64),etag:"etag-old"});
 });
 
+// Neal 2026-11-22: a skill in any state can be deleted; an effective one is deactivated first under the same confirm.
+const deletedDoc=(doc,decision_id)=>({...doc,deletion:{schema_version:"fa-skill-deletion-v1",decision_id,
+  deleted_by_oid:"owner",deleted_at:when,applied_revision:3}});
+const onlyNewGuide=()=>reply({schema_version:"fa-skill-review-list-v1",team:"team",after:null,next_after:null,
+  entries:[reviewEntry("new-guide","新指南","awaiting_decision")]});
+function deactivatedOld(ui){
+  const body=JSON.parse(ui.calls.find(call=>call.url.endsWith("old-guide/deactivations")).body);
+  return {body,doc:skillDoc("old-guide","舊指南",{approval:skillApproval("0".repeat(32)),
+    deactivations:[{...body,etag:undefined,deactivated_by_oid:"owner",deactivated_at:when,applied_revision:2}]})};
+}
+
+test("skill review: deleting an effective skill deactivates then deletes under one confirm and it leaves the list",async()=>{
+  const ui=await openReviews();
+  reviewButton(reviewRow(ui,"舊指南"),"刪除").events.click();
+  const message=await ui.answer(true);await settleReviews(ui);
+  assert.match(message,/^刪除 skill「舊指南」？\n它目前生效中（第 1 版），會先停用再刪除。\n/);
+  assert.match(message,/也不能放回清單；已選用它的助理之後讀不到它，開新對話會像停用時一樣被擋下。原內容和批准紀錄仍保存在系統裡。$/);
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/deletions")),false,"the deletion waits for its deactivation");
+  const deactivation=deactivatedOld(ui);
+  ui.holder.pending({artifact:deactivation.doc,etag:"etag-2",decision_id:deactivation.body.decision_id,original_request_resent:false});
+  await settleReviews(ui);
+  const deletion=JSON.parse(ui.calls.find(call=>call.url==="/api/team-skills/skills/old-guide/deletions").body);
+  assert.deepEqual({...deletion,decision_id:null},{schema_version:"fa-skill-deletion-v1",decision_id:null,etag:"etag-2"});
+  assert.match(deletion.decision_id,/^[a-f0-9]{32}$/);assert.notEqual(deletion.decision_id,deactivation.body.decision_id);
+  ui.holder.templateResponses["/api/team-skills/reviews"]=onlyNewGuide();
+  ui.holder.pending({artifact:deletedDoc(deactivation.doc,deletion.decision_id),etag:"etag-3",
+    decision_id:deletion.decision_id,original_request_resent:false});
+  await settleReviews(ui);
+  assert.equal(reviewRow(ui,"舊指南"),undefined);
+  assert.ok(reviewRow(ui,"新指南"));
+  assert.equal(ui.calls.filter(call=>call.url.endsWith("/deletions")||call.url.endsWith("/deactivations")).length,2);
+});
+
+test("skill review: a draft deletion whose reply failed is read back and resent only with the same decision ID",async()=>{
+  const ui=await openReviews();
+  ui.holder.templateResponses["/api/team-skills/skills/new-guide/deletions"]={ok:false,json:async()=>({error:{code:"BACKEND_OFFLINE"}})};
+  reviewButton(reviewRow(ui,"新指南"),"刪除").events.click();
+  const message=await ui.answer(true);await settleReviews(ui);
+  assert.doesNotMatch(message,/先停用/);
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/deactivations")),false);
+  const first=JSON.parse(ui.calls.find(call=>call.url.endsWith("new-guide/deletions")).body);
+  assert.ok(reviewRow(ui,"新指南").children.some(node=>/決定沒有確認/.test(node.textContent)));
+  delete ui.holder.templateResponses["/api/team-skills/skills/new-guide/deletions"];
+  reviewButton(reviewRow(ui,"新指南"),"重新讀取並核對").events.click();
+  assert.match(await ui.answer(true),/用同一個決定編號再送一次/);await settleReviews(ui);
+  const posts=ui.calls.filter(call=>call.url.endsWith("new-guide/deletions"));
+  assert.equal(posts.length,2);assert.equal(JSON.parse(posts[1].body).decision_id,first.decision_id);
+  ui.holder.templateResponses["/api/team-skills/reviews"]=reply({schema_version:"fa-skill-review-list-v1",team:"team",
+    after:null,next_after:null,entries:[reviewEntry("old-guide","舊指南","effective")]});
+  ui.holder.pending({artifact:deletedDoc(skillDoc("new-guide","新指南"),first.decision_id),etag:"etag-2",
+    decision_id:first.decision_id,original_request_resent:false});
+  await settleReviews(ui);
+  assert.equal(reviewRow(ui,"新指南"),undefined);
+});
+
+test("skill review: when the deactivation before a deletion fails, the checked retry finishes it and then deletes",async()=>{
+  const ui=await openReviews();
+  ui.holder.templateResponses["/api/team-skills/skills/old-guide/deactivations"]={ok:false,json:async()=>({error:{code:"BACKEND_OFFLINE"}})};
+  reviewButton(reviewRow(ui,"舊指南"),"刪除").events.click();await ui.answer(true);await settleReviews(ui);
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/deletions")),false,"a failed deactivation stops before deleting");
+  delete ui.holder.templateResponses["/api/team-skills/skills/old-guide/deactivations"];
+  reviewButton(reviewRow(ui,"舊指南"),"重新讀取並核對").events.click();await ui.answer(true);await settleReviews(ui);
+  const deactivations=ui.calls.filter(call=>call.url.endsWith("old-guide/deactivations"));
+  assert.equal(deactivations.length,2);
+  const deactivation=deactivatedOld(ui);
+  ui.holder.pending({artifact:deactivation.doc,etag:"etag-2",decision_id:deactivation.body.decision_id,original_request_resent:false});
+  await settleReviews(ui);
+  const deletion=JSON.parse(ui.calls.find(call=>call.url.endsWith("old-guide/deletions")).body);
+  assert.equal(deletion.schema_version,"fa-skill-deletion-v1");assert.equal(deletion.etag,"etag-2");
+  assert.notEqual(deletion.decision_id,deactivation.body.decision_id);
+  assert.equal(ui.calls.filter(call=>call.url.endsWith("old-guide/deletions")).length,1,"the waiting deletion is sent once");
+});
+
+test("skill review: an empty page with more rows asks for the next page instead of saying there are no skills",async()=>{
+  const ui=await settingsUi();
+  skillReviewResponses(ui);
+  Object.assign(ui.holder.templateResponses,{"/api/team-mcp/servers":reply(teamMcpView()),
+    "/api/team-mcp/connections":reply(teamMcpConnections),
+    "/api/team-skills/reviews":reply({schema_version:"fa-skill-review-list-v1",team:"team",after:null,next_after:"deleted-guide",entries:[]})});
+  await openTeamSettings(ui,"team-skills");await settleReviews(ui);
+  assert.equal(ui.text("settings-skill-review-note"),"這一頁沒有 skill；按「載入更多」繼續。");
+  assert.equal(ui.nodes.get("settings-skill-review-more").hidden,false);
+});
+
 test("skill review: replace approves the new skill, deactivates the old one, then swaps them in one confirmed selection",async()=>{
   const base=settingsBase();
   base.skills=[{name:"old-guide",version_id:"1".repeat(32),sha256:"e".repeat(64),metadata_sha256:"f".repeat(64)}];
   base.settings.capabilities=[{entry_id:"fa-skills-v1",entry_sha256:"6".repeat(64)}];
   const ui=await openReviews(settingsOptions(),base);
+  // An Agent-written draft keeps a fixed stored title; the list shows its purpose, and replace must name it the same way.
+  ui.holder.templateResponses["/api/team-skills/skills/old-guide"]=reply({artifact:skillDoc("old-guide",
+    "Unapproved skill draft from user procedure",{approval:skillApproval("0".repeat(32)),effective:true}),etag:"etag-old"});
   reviewButton(reviewRow(ui,"新指南"),"查看內容").events.click();await settleReviews(ui);
   const after=settingsOptions();after.skills=[{name:"new-guide",version_id:"1".repeat(32),sha256:"e".repeat(64),metadata_sha256:"f".repeat(64)}];
   ui.holder.templateResponses["/api/agent-template/options"]=reply(after);
   reviewButton(reviewRow(ui,"新指南"),"批准並取代").events.click();
   const confirmations=[await ui.answer(true)];await settleReviews(ui);
   assert.match(confirmations[0],/1\. 批准新 skill.*2\. 停用舊 skill.*3\./s);
+  assert.match(confirmations[0],/取代「舊指南」？/);assert.doesNotMatch(confirmations[0],/Unapproved/);
   const approval=JSON.parse(ui.calls.find(call=>call.url.endsWith("new-guide/decisions")).body);
   ui.holder.pending({artifact:skillDoc("new-guide","新指南",{approval:skillApproval(approval.decision_id),effective:true}),
     etag:"etag-2",decision_id:approval.decision_id,original_request_resent:false});
@@ -12184,7 +12287,8 @@ test("routine settings: the owner disables one schedule against the version show
   assert.match(routineRows(ui)[1].children[0].textContent,/已停用/);
   // Disabling publishes a new version whose approved_at is the moment it was disabled (native_routines.publish).
   assert.match(routineRows(ui)[1].children[2].textContent,/來源對話 conversa · 停用於/);
-  assert.equal(routineRows(ui)[1].children.length,3,"a disabled schedule has no button");
+  assert.deepEqual(routineRows(ui)[1].children[3].children.map(button=>button.textContent),["刪除"],
+    "a disabled schedule can only be deleted");
   const path="/api/routines/r1/versions/v-r1/disable";
   ui.holder.templateResponses[path]={ok:false,json:async()=>({error:{code:"LOCAL_OFFLINE"}})};
   routineRows(ui)[0].children[3].children[0].events.click();ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
@@ -12200,7 +12304,29 @@ test("routine settings: the owner disables one schedule against the version show
   assert.equal(routinePosts(ui)[1].url,path,"the resend names the same version the owner saw");
   assert.equal(ui.text("routines-note"),"已停用；下一次到點不會執行。");
   assert.match(routineRows(ui)[0].children[0].textContent,/已停用/);
-  assert.equal(routineRows(ui)[0].children.length,3);
+  assert.deepEqual(routineRows(ui)[0].children[3].children.map(button=>button.textContent),["刪除"]);
+});
+
+test("routine settings: deleting an active schedule disables then deletes it in one confirmation, and a lost reply resends the same request",async()=>{
+  const ui=await openRoutineSettings(routinesRead([routineView("r1"),routineView("r2",{enabled:false})]));
+  assert.deepEqual(routineRows(ui)[0].children[3].children.map(button=>button.textContent),["停用","刪除"]);
+  const path="/api/routines/r1/deletions/v-r1";
+  ui.holder.templateResponses[path]={ok:false,json:async()=>({error:{code:"LOCAL_OFFLINE"}})};
+  routineRows(ui)[0].children[3].children[1].events.click();ui.holder.confirmation=await ui.answer(true);await settleReviews(ui);
+  assert.match(ui.holder.confirmation,/^刪除這個排程？\n每天 09:00（Asia\/Taipei）開新對話執行：「檢查 Foundry 有沒有新文章」\n會先停用再刪除。/);
+  assert.match(ui.holder.confirmation,/清單看不到、不能再選、不會再執行，也不能復原到清單；原內容與批准紀錄仍保存在系統裡。\n已在等批准的那次執行會從提醒清單消失，但仍可在它的對話裡批准。$/);
+  assert.deepEqual(routinePosts(ui).map(call=>[call.url,call.body]),[[path,"{}"]],"one request; the bridge disables first");
+  assert.match(ui.text("routines-note"),/沒有回應/);
+  assert.equal(routineRows(ui).length,2,"a lost reply keeps the row to press again");
+  ui.holder.templateResponses[path]=reply({deleted:routineView("r1",{enabled:false,version:"v-r1-off"})});
+  ui.setRoutines(routinesRead([routineView("r2",{enabled:false})]));
+  routineRows(ui)[0].children[3].children[1].events.click();await ui.answer(true);await settleReviews(ui,12);
+  assert.deepEqual(routinePosts(ui).map(call=>call.url),[path,path],"the resend names the same version the owner saw");
+  assert.equal(ui.text("routines-note"),"已刪除；清單看不到，也不會再執行。原內容與批准紀錄仍保存在系統裡。");
+  assert.equal(routineRows(ui).length,1);
+  assert.equal(routineRows(ui)[0].getAttribute("data-routine"),"r2");
+  routineRows(ui)[0].children[3].children[0].events.click();
+  assert.doesNotMatch(await ui.answer(false),/會先停用/,"a disabled schedule is deleted directly");
 });
 
 test("routine settings: a cancelled confirmation or a read-only login sends nothing; 確定 sends one disable",async()=>{
@@ -12213,7 +12339,7 @@ test("routine settings: a cancelled confirmation or a read-only login sends noth
   ui.click("page-confirm-ok");ui.click("page-confirm-ok");await settleReviews(ui);
   assert.deepEqual(routinePosts(ui).map(call=>[call.url,call.body]),[["/api/routines/r1/versions/v-r1/disable","{}"]]);
   const reader=await openRoutineSettings(routinesRead([routineView("r1")],false));
-  assert.equal(routineRows(reader)[0].children.length,3,"no disable button without Behavior.Approve");
+  assert.equal(routineRows(reader)[0].children.length,3,"no disable or delete button without Behavior.Approve");
   assert.equal(routinePosts(reader).length,0);
 });
 // dev 10-07 (#732 P4): a scheduled turn that ran while the owner looked at another Agent only showed after 更新回覆.
@@ -13048,6 +13174,8 @@ const confirmGatedActions=[
   },trigger:ui=>ui.click("settings-connectors-retry")},
   {name:"排程停用",url:"/api/routines/r1/versions/v-r1/disable",open:()=>openRoutineSettings(routinesRead([routineView("r1")])),
     trigger:ui=>routineRows(ui)[0].children[3].children[0].events.click()},
+  {name:"排程刪除",url:"/api/routines/r1/deletions/v-r1",open:()=>openRoutineSettings(routinesRead([routineView("r1")])),
+    trigger:ui=>routineRows(ui)[0].children[3].children[1].events.click()},
   {name:"HITL 規則新增",url:HITL_RULES,open:hitlRulesUi,
     trigger:ui=>{typeHitlRule(ui,"Ask before changing this workspace.");ui.click("save-hitl-rule")}},
   {name:"HITL 規則更新",url:HITL_RULES,open:hitlRulesUi,
@@ -13083,7 +13211,7 @@ for(const row of confirmGatedActions){
   });
 }
 test("the confirm-gated action table has one row per action",()=>{
-  assert.equal(confirmGatedActions.length,25);
+  assert.equal(confirmGatedActions.length,26);
   assert.equal(new Set(confirmGatedActions.map(row=>row.name)).size,confirmGatedActions.length);
 });
 

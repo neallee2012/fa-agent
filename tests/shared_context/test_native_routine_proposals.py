@@ -473,6 +473,64 @@ def test_console_disable_refuses_a_version_the_owner_did_not_see(routine_console
     assert c.ui.client.get("/api/routines").json()["routines"][0]["definition"]["enabled"] is True
 
 
+def test_console_deletes_an_active_schedule_once_and_it_leaves_the_list(routine_console):
+    c = routine_console
+    draft, pid = console_card(c)
+    thread = draft["thread_id"]
+    value = c.ui.client.get(f"/api/native-hitl/{thread}/pending/{pid}").json()
+    assert ui_post(c, f"/api/native-hitl/{thread}/decisions", {
+        "approval": value["readback"]["approval"], "choice": "allow_once",
+        "expected_rules_revision": value["rules"]["revision"], "expected_rules_etag": value["rules"]["etag"],
+        "rule": None}).status_code == 200
+    routine = c.ui.client.get("/api/routines").json()["routines"][0]["definition"]
+    assert routine["enabled"] is True
+    prefix = f"/native-routines/v1/agents/{routine['agent_id']}/definitions"
+
+    def writes():
+        return len([call for call in c.calls if call[0] == "POST" and call[1].startswith(prefix)])
+
+    path = f"/api/routines/{routine['routine_id']}/deletions/{routine['request_id']}"
+    deleted = ui_post(c, path)
+    assert deleted.status_code == 200, deleted.text
+    kept = deleted.json()["deleted"]["definition"]
+    assert (kept["routine_id"], kept["enabled"], kept["content"]) == (routine["routine_id"], False, routine["content"])
+    assert c.ui.client.get("/api/routines").json()["routines"] == []
+    before = writes()
+    assert ui_post(c, path).json() == deleted.json(), "a resend after an unknown reply replays the one deletion"
+    assert writes() == before + 1, "the resend writes no new version; it only re-reads the delete receipt"
+    assert c.ui.client.get("/api/routines").json()["routines"] == []
+    assert ui_post(c, f"/api/routines/{routine['routine_id']}/deletions/bad%20id").status_code == 400
+    assert ui_post(c, path, {"x": 1}).status_code == 403
+
+
+def test_a_resent_card_decision_does_not_revive_a_deleted_schedule(proposals, monkeypatch):
+    case = proposals
+    pending = proposed(case)
+    original = case.hitl.submit
+
+    def lost_once(principal, command):
+        if not lost_once.done:
+            lost_once.done = True
+            raise Problem(503, "BEHAVIOR_COMMIT_UNKNOWN", "OFFLINE lost decision write")
+        return original(principal, command)
+
+    lost_once.done = False
+    monkeypatch.setattr(case.hitl, "submit", lost_once)
+    assert decide(case, pending).status_code == 503
+    saved = definitions(case)[0]["definition"]
+    off = {key: saved[key] for key in ("routine_id", "conversation_id", "kind", "schedule", "content")}
+    assert case.client.post(case.routine_prefix + "/definitions", headers=case.headers, json={
+        **off, "request_id": "owner-off", "expected_version_id": saved["request_id"], "enabled": False}).status_code == 200
+    assert case.client.post(case.routine_prefix + f"/definitions/{saved['routine_id']}/delete", headers=case.headers,
+                            json={"request_id": "owner-delete", "expected_version_id": "owner-off"}).status_code == 200
+    assert decide(case, pending).status_code == 200
+    assert definitions(case) == [], "the card's resend reads its old version back and writes nothing"
+    case.c.h.time = case.due_at + timedelta(seconds=2)
+    dispatched = case.trigger({"routine_id": saved["routine_id"], "scheduled_for": case.due_at.isoformat()})
+    assert dispatched.status_code == 403 and dispatched.json()["error"]["code"] == "NATIVE_ROUTINE_INACTIVE"
+    assert case.due().json()["occurrences"] == []
+
+
 def test_console_routines_are_unavailable_without_native_routines(native_console):
     c = native_console
     assert c.ui.client.get("/api/state").json()["routines_available"] is False

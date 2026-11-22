@@ -47,6 +47,7 @@ ROUTES = [
     ("GET", "/api/team-skills/skills/{artifact}/versions/{version_id}/resources/{name}"),
     ("POST", "/api/team-skills/skills/{artifact}/decisions"),
     ("POST", "/api/team-skills/skills/{artifact}/deactivations"),
+    ("POST", "/api/team-skills/skills/{artifact}/deletions"),
     ("POST", "/api/team-skills/drafts"),
     ("GET", "/api/team-mcp/servers"),
     ("GET", "/api/team-mcp/connections"),
@@ -57,6 +58,7 @@ ROUTES = [
     ("POST", "/api/agent-connectors"),
     ("GET", "/api/routines"),
     ("POST", "/api/routines/{routine_id}/versions/{version_id}/disable"),
+    ("POST", "/api/routines/{routine_id}/deletions/{version_id}"),
     ("GET", "/"),
     ("GET", "/api/state"),
     ("GET", "/api/realtime/negotiate"),
@@ -224,6 +226,7 @@ INPUT_PATHS = [
     "/api/native-hitl/r1/consents", "/api/native-hitl/r1/consent-reconcile", "/api/groups/open", "/api/groups/list",
     "/api/agent-template/inspect", "/api/agent-template/select", "/api/agent-template/selection-reconcile",
     "/api/team-skills/drafts", "/api/team-skills/skills/s1/decisions", "/api/team-skills/skills/s1/deactivations",
+    "/api/team-skills/skills/s1/deletions",
     "/api/team-mcp/changes", "/api/team-connectors/changes", "/api/agent-connectors",
 ]
 GATED_PATHS = [

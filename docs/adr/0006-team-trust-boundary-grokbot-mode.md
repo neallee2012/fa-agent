@@ -321,6 +321,13 @@ CAP-06 PR1～PR5 仍由 1b60 負責，依本 ADR 調整（「團隊管理員」�
 - **理由**：Neal 10-07 16:41 問「為什麼需要新的雲端資源呢?」。Hosted Agent 只在有請求時讓 session 的 VM 醒著，閒置逾時後收回運算（[Hosted agents](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents)，10-07 查閱）；固定版 `github-copilot-sdk==1.0.13` 也沒有排程或定時喚醒 API（[PyPI 1.0.13 說明](https://pypi.org/project/github-copilot-sdk/1.0.13/)，10-07 查閱）。所以一定要有外部時鐘；而 API 本來就常駐，是不用新資源的最小選擇。
 - **Foundry Routines 的反例（dev 探針 P1，10-07 17:18）**：用 API 的 app token 建立 `authorization.identity="creator"` 的 routine，服務回 `creator' requires a human user principal … authenticated with a service principal (app) token`。官方文件寫 creator 可以是「人或服務主體」，實際只收真人委派 token。改用 agent 身分時，Entra 隔離讓它叫不到 API 建立的那台 VM；不帶 session 又會每次開新 VM，違反第 2 節。證據與連結見 [Shared Context README](../../src/fa-shared-context-poc/README.md#native-routine-api-clock)。
 - **信任邊界不變**：時鐘只能送 owner 已批准、目前仍啟用的定義的到期 occurrence；不能自填內容、RID 或授權，也沒有 HTTP 入口。去重沿用固定 RID＋CAS 意圖＋Hosted `rid:<RID>`，重啟或新舊 revision 重疊都不會重送。
+- **主人可以刪除排程（Neal 2026-11-22 要求）**：刪除只由 Team 主人從工作台（Entra 入口）發起，VM 薄轉送仍不提供刪除（第 3 節不變）。
+  生效中的排程先寫一個停用的新版本，再在同一次確認裡刪除。刪除是在 routine head 記 `deleted_at`，並在同一筆 CAS 把它從 definitions
+  索引拿掉；不刪 Table 列，各版本、批准與停用紀錄、occurrence 意圖都保留。刪除後清單看不到，時鐘的 `due` 不選它、`trigger`／`check`
+  回 403 `NATIVE_ROUTINE_INACTIVE`，再發布同一個 `routine_id` 回 404 `NATIVE_ROUTINE_MISSING`；批准卡重送決定只讀回舊版本，不會復活。
+  同一個刪除請求 ID 重送只讀回原回條。
+  版本落差：這版之前的 API image 嚴格解碼 head（`extra="forbid"`），讀到 `deleted_at` 會在 `_read` 回 409 `NATIVE_ROUTINE_INVALID`；所以第一次刪除後
+  API 不能退回這版之前。影響只是拒絕，不會讓已刪的排程復活。Hosted 不 import `native_routines`，不受影響。
 - **必須常駐**：時鐘需要 API `minReplicas=1`。`behavior-api.bicep` 預設是 0，只有 stage 參數檔設 1；dev 目前是 1。若 API 縮到 0 或改成多副本，要重新評估本節。縮到 0 時排程會延後、不會重送；多副本時去重仍成立，只是每個副本各讀一次。
 
 <a id="agent-retirement"></a>
@@ -348,6 +355,16 @@ CAP-06 PR1～PR5 仍由 1b60 負責，依本 ADR 調整（「團隊管理員」�
   四項由總協調 2026-10-15 確認。（2026-10-16 修訂，總協調依 Neal「修 1-20」決定：onboarding **失敗**留下的 Foundry agent
   也由 FA 刪除——只限它自己的那個、operator 預覽後確認，不寫 Team 資料。）做法見
   [deploy README](../../deploy/README.md#retire-agent)。
+
+<a id="skill-deletion"></a>
+## 補充：Team 主人刪除 skill 是標記，不是刪資料（2026-11-22）
+
+- **起因**：Neal 2026-11-22 要求 Team skill 可以刪除；原本只能停用，停用的 skill 一直留在審核清單。
+- **決定**：刪除是在 skill 的 M3 列同一筆 ETag／CAS 寫一筆 `deletion`（決定編號、誰、何時）。Table 列、Blob、版本、
+  批准與停用紀錄都不刪、不改寫；同一決定編號重送只記一次。生效中的 skill 先走既有停用，再刪除（工作台同一次確認）。
+- **效果**：已刪除的 skill 不出現在審核清單、助理可選項與已安裝顯示；沒有生效版本，所以已選用的助理和新對話都讀不到，
+  和停用一樣（已選用它的助理開新對話會被擋下，直到該助理的新對話設定不再含它）；之後的上傳、批准、停用一律拒絕，Agent 以原 RID 重送也不會讓它回到清單。
+- **界線不變**：只有 Team 主人經工作台（Entra 入口）能刪；第 3 節 VM 薄轉送路徑仍「不提供刪除」。
 
 ## 官方依據
 

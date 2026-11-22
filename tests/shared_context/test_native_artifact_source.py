@@ -142,3 +142,56 @@ def test_four_approved_native_drafts_fit_the_original_catalog_without_truncating
     with pytest.raises(Problem) as refused:
         source.read(A, A.team, names, changed)
     assert refused.value.body["error"]["code"] == "SKILL_SOURCE_CHANGED"
+
+
+def test_agent_drafts_list_under_their_purpose_while_owner_and_other_titles_stay_exact(m3):
+    from shared_context.m3_models import NATIVE_DRAFT_TITLE, OwnerArtifactSource
+
+    service, _repository, _store = m3
+    origin = native_source()
+    body = b"Follow the procedure."
+    long_purpose = "Look up current facts on the web and cite every source used in the answer clearly."
+
+    def draft(name, title, purpose, source=origin, actor=A):
+        created = service.create_native_skill(actor, A.team, name, title=title, native_source=source)
+        if purpose is None:
+            return created
+        metadata = VersionInput(filename="skill-draft.md", media_type="text/markdown",
+                                sha256=hashlib.sha256(body).hexdigest(),
+                                skill_purpose=SkillPurpose(schema_version="fa-skill-purpose-v1", description=purpose))
+        return service.upload(actor, A.team, name, V1, created.etag, metadata, body, native_source=source)
+
+    draft("a-short", NATIVE_DRAFT_TITLE, "Web lookup")
+    draft("b-long", NATIVE_DRAFT_TITLE, long_purpose)
+    draft("c-empty", NATIVE_DRAFT_TITLE, None)
+    draft("d-named", "Unapproved native procedure draft", "Ignored purpose")
+    owner = OwnerArtifactSource(kind="team-owner", tenant_id=TENANT, team_id=A.team, owner_oid=HUMAN.oid,
+                                submit_sha256="4" * 64)
+    draft("e-owner", NATIVE_DRAFT_TITLE, "Owner purpose", source=owner, actor=HUMAN)
+    titles = {entry.artifact_id: entry.title for entry in service.skill_reviews(HUMAN, A.team).entries}
+    assert titles["a-short"] == "Web lookup"
+    assert titles["b-long"] == long_purpose[:63].rstrip() + "…" and len(titles["b-long"]) <= 64
+    assert titles["c-empty"] == NATIVE_DRAFT_TITLE and titles["d-named"] == "Unapproved native procedure draft"
+    assert titles["e-owner"] == NATIVE_DRAFT_TITLE
+    stored = ArtifactDocument.model_validate(service.get(HUMAN, A.team, "a-short").payload)
+    assert stored.title == NATIVE_DRAFT_TITLE
+
+
+def test_a_resent_rid_still_finds_its_fixed_title_draft_and_original_receipt(m3):
+    from shared_context.m3_models import NATIVE_DRAFT_TITLE
+    from shared_context.native_skill_draft_api import NativeSkillDraftGateway
+    from shared_context.native_skill_draft_wire import artifact_id
+
+    service, _repository, _store = m3
+    origin = native_source()
+    identifier = artifact_id(TENANT, A.team, origin.agent_id, origin.conversation_id, origin.request_id)
+    body = b"Follow the procedure."
+    purpose = SkillPurpose(schema_version="fa-skill-purpose-v1", description="Web lookup")
+    created = service.create_native_skill(A, A.team, identifier, title=NATIVE_DRAFT_TITLE, native_source=origin)
+    service.upload(A, A.team, identifier, V1, created.etag, VersionInput(
+        filename="skill-draft.md", media_type="text/markdown", sha256=hashlib.sha256(body).hexdigest(),
+        skill_purpose=purpose), body, native_source=origin)
+    assert service.skill_reviews(HUMAN, A.team).entries[0].title == "Web lookup"
+    found, _record, document = NativeSkillDraftGateway._target(service, A, origin)
+    receipt, data = NativeSkillDraftGateway._receipt(service, A, found, document)
+    assert found == identifier and data == body and receipt.version_id == V1 and receipt.purpose == purpose

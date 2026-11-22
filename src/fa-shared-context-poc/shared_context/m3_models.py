@@ -79,6 +79,19 @@ class OwnerArtifactSource(StrictModel):
 
 # A draft's server-derived source: an Agent's native turn or the Team owner's own input.
 ArtifactSource = NativeArtifactSource | OwnerArtifactSource
+# Stored on every Agent-written draft and checked by its RID resend, so it never changes; lists show the purpose instead.
+NATIVE_DRAFT_TITLE = "Unapproved skill draft from user procedure"
+_DISPLAY_TITLE_MAX = 64
+
+
+def _display_title(document) -> str:
+    if document.title != NATIVE_DRAFT_TITLE or not isinstance(document.native_source, NativeArtifactSource):
+        return document.title
+    latest = document.versions[-1] if document.versions else document.pending
+    purpose = None if latest is None or latest.skill_purpose is None else latest.skill_purpose.description.strip()
+    if not purpose:
+        return document.title
+    return purpose if len(purpose) <= _DISPLAY_TITLE_MAX else purpose[:_DISPLAY_TITLE_MAX - 1].rstrip() + "…"
 
 
 def check_artifact_source(source_work, native_source):
@@ -261,6 +274,19 @@ class SkillDeactivationRecord(SkillDeactivationInput):
     applied_revision: Annotated[int, Field(ge=1)]
 
 
+class SkillDeletionInput(StrictModel):
+    """Delete a Team skill from every list and choice; versions, approvals and deactivations stay retained."""
+
+    schema_version: Literal["fa-skill-deletion-v1"]
+    decision_id: VersionId
+
+
+class SkillDeletionRecord(SkillDeletionInput):
+    deleted_by_oid: OwnerOid
+    deleted_at: Timestamp
+    applied_revision: Annotated[int, Field(ge=1)]
+
+
 class ArtifactVersion(VersionInput):
     source_work: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
     native_source: ArtifactSource | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -381,6 +407,10 @@ def _check_kind_rules(document):
         raise ValueError("ordinary deliverables do not activate policies")
     if document.deactivations and document.kind != "skill":
         raise ValueError("Only skills support explicit deactivation")
+    deletion = document.deletion
+    if deletion is not None and (document.kind != "skill" or document.effective_version_id is not None
+                                 or not deletion.applied_revision <= document.revision):
+        raise ValueError("Only a skill with no effective version can be deleted")
 
 
 def _version_named(document, version_id):
@@ -404,6 +434,8 @@ def _deactivated_versions(document) -> set[str]:
 def _check_decision_ids(document):
     decisions = [item.approval.decision_id for item in document.versions if item.approval]
     decisions.extend(item.decision_id for item in document.deactivations)
+    if document.deletion is not None:
+        decisions.append(document.deletion.decision_id)
     if len(decisions) != len(set(decisions)):
         raise ValueError("decision IDs cannot be reused")
 
@@ -433,6 +465,8 @@ class ArtifactDocument(CreateArtifact):
     deactivations: Annotated[list[SkillDeactivationRecord], Field(max_length=MAX_ARTIFACT_VERSIONS)] = Field(
         default_factory=list, exclude_if=lambda value: not value,
     )
+    # Deleted skills leave every list and choice; omitted until then so existing rows keep their exact bytes.
+    deletion: SkillDeletionRecord | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def valid_history(self):
@@ -495,7 +529,7 @@ class SkillReviewEntry(StrictModel):
         else:
             raise ValueError("An approved latest skill version must be effective or deactivated")
         return cls(
-            artifact_id=document.artifact_id, title=document.title, owner=document.owner,
+            artifact_id=document.artifact_id, title=_display_title(document), owner=document.owner,
             source_work=document.source_work, native_source=document.native_source, revision=document.revision, status=status,
             effective_version_id=document.effective_version_id,
             deactivated_version_ids=tuple(item.version_id for item in document.deactivations),

@@ -12,7 +12,7 @@ import re
 
 from shared_context.m3_models import (
     OWNER_AUTHOR, ApprovalInput, ArtifactDocument, ArtifactVersion, OwnerArtifactSource, SkillDeactivationInput,
-    SkillReviewEntry, SkillReviewList,
+    SkillDeletionInput, SkillReviewEntry, SkillReviewList,
 )
 from shared_context.team_skill_draft_wire import OWNER_DRAFT_REQUEST_BYTES, OwnerSkillDraftInput, owner_material
 
@@ -35,12 +35,12 @@ TEAM_SKILL_ERRORS = frozenset({
     "M3_TEAM_DENIED", "M3_IDENTITY_DENIED", "M3_HUMAN_REQUIRED", "M3_NOT_SKILL",
     "M3_SKILL_RESOURCE_DENIED", "M3_SKILL_RESOURCE_FORMAT", "M3_SKILL_RESOURCE_CHANGED",
     "SKILL_DRAFT_OUTCOME_UNKNOWN", "SKILL_DRAFT_TARGET_CONFLICT", "M3_NOT_OWNER", "M3_NATIVE_SOURCE_DENIED",
-    "M3_POLICY_FORMAT", "M3_VERSION_LIMIT",
+    "M3_POLICY_FORMAT", "M3_VERSION_LIMIT", "M3_SKILL_DELETED", "M3_SKILL_EFFECTIVE",
 })
 MESSAGES = {code: "skill 審核未通過核對；請重新讀取，不會自動重送。" for code in TEAM_SKILL_ERRORS}
 MESSAGES.update({
     "TEAM_SKILLS_UNAVAILABLE": "這個 API 版本還沒有 skill 審核入口；不會改走其他入口。",
-    "TEAM_SKILLS_OWNER_ONLY": "只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能新增、批准、拒絕或停用 skill。",
+    "TEAM_SKILLS_OWNER_ONLY": "只有這個 Team 的真人主人，且目前登入具備 Behavior.Approve，才能新增、批准、拒絕、停用或刪除 skill。",
     "TEAM_SKILL_NOT_SKILL": "這不是 skill；這裡只審核 skill。",
     "TEAM_SKILL_RESPONSE_INVALID": "skill 審核的回應格式不符；不當成完成，請重新讀取。",
     "TEAM_SKILL_INPUT_INVALID": "skill 決定的內容不完整；沒有送出。",
@@ -58,6 +58,8 @@ MESSAGES.update({
     "M3_EFFECTIVE_VERSION_CHANGED": "目前生效的版本已改變；請重新讀取後再停用。",
     "M3_UPLOAD_UNKNOWN": "這個 skill 還有上傳未完成。助理起草的請等它核對完成；你自己寫的請用相同內容再送一次（不會另建）。",
     "M3_STATE_UNCERTAIN": "寫入結果未確認；請重新讀取核對，同一決定編號重試不會重複生效。",
+    "M3_SKILL_DELETED": "這份 skill 已刪除，不能再改或放回清單。你自己寫的同名同內容草稿也算同一份；請改名稱或內容再存。",
+    "M3_SKILL_EFFECTIVE": "這份 skill 還在生效中；請重新讀取後再刪除（刪除會先停用）。",
 })
 
 
@@ -163,6 +165,9 @@ class TeamSkills:
     def deactivate(self, artifact, data):
         return self._write("deactivations", artifact, SkillDeactivationInput, data)
 
+    def delete(self, artifact, data):
+        return self._write("deletions", artifact, SkillDeletionInput, data)
+
     def draft(self, data):
         try:
             command = OwnerSkillDraftInput.model_validate(data)
@@ -189,6 +194,8 @@ class TeamSkills:
 
 def decided(document, command):
     """The returned record holds exactly this decision (a repeat of the same ID returns the original)."""
+    if isinstance(command, SkillDeletionInput):
+        return document.deletion is not None and document.deletion.decision_id == command.decision_id
     if isinstance(command, SkillDeactivationInput):
         return any(item.model_dump(include=set(SkillDeactivationInput.model_fields)) == command.model_dump()
                    for item in document.deactivations)
@@ -254,6 +261,10 @@ def install_team_skill_routes(app, requested_console):
     async def deactivate(artifact: str, request: Request, console=Depends(requested_console)):
         return await run_in_threadpool(control(console).deactivate, artifact, await body(request))
 
+    @app.post("/api/team-skills/skills/{artifact}/deletions")
+    async def delete(artifact: str, request: Request, console=Depends(requested_console)):
+        return await run_in_threadpool(control(console).delete, artifact, await body(request))
+
     @app.post("/api/team-skills/drafts")
     async def draft(request: Request, console=Depends(requested_console)):
         value = await body(request, MAX_DRAFT_BYTES, "TEAM_SKILL_DRAFT_INVALID")
@@ -262,4 +273,4 @@ def install_team_skill_routes(app, requested_console):
 
 def is_team_skill_write(path):
     return path == "/api/team-skills/drafts" or re.fullmatch(
-        r"/api/team-skills/skills/[A-Za-z0-9][A-Za-z0-9_-]{0,63}/(decisions|deactivations)", path) is not None
+        r"/api/team-skills/skills/[A-Za-z0-9][A-Za-z0-9_-]{0,63}/(decisions|deactivations|deletions)", path) is not None

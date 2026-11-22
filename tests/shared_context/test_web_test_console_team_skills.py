@@ -60,11 +60,22 @@ def test_console_reviews_and_decides_once_through_the_real_review_api(team_skill
         skills.decide(SKILL, {**body, "decision_id": "c" * 32, "etag": approved["etag"]})
     assert refused.value.code == "M3_ALREADY_DECIDED"
 
+    with pytest.raises(ConsoleError) as effective:
+        skills.delete(SKILL, {"schema_version": "fa-skill-deletion-v1", "decision_id": "f" * 32, "etag": approved["etag"]})
+    assert effective.value.code == "M3_SKILL_EFFECTIVE"
+
     deactivated = skills.deactivate(SKILL, {
         "schema_version": "fa-skill-deactivation-v1", "decision_id": "e" * 32, "version_id": version["version_id"],
         "sha256": version["sha256"], "metadata_sha256": version["metadata_sha256"], "etag": approved["etag"]})
     assert deactivated["artifact"]["effective_version_id"] is None
     assert skills.reviews()["entries"][0]["status"] == "deactivated"
+
+    deletion = {"schema_version": "fa-skill-deletion-v1", "decision_id": "f" * 32, "etag": deactivated["etag"]}
+    deleted = skills.delete(SKILL, deletion)
+    assert deleted["artifact"]["deletion"]["decision_id"] == "f" * 32 and deleted["original_request_resent"] is False
+    assert skills.delete(SKILL, deletion)["etag"] == deleted["etag"], "the same decision ID returns the original record"
+    assert skills.reviews()["entries"] == []
+    assert sent[-2][:2] == ("POST", f"/team-skills/v1/skills/{SKILL}/deletions")
 
 
 def test_read_only_owner_cannot_decide_and_nothing_is_sent(team_skills):
@@ -98,6 +109,7 @@ def test_if_match_and_review_cursor_are_limited_to_team_skill_routes():
     assert not is_team_skill_write("/api/team-skills/skills/../decisions")
     assert not is_team_skill_write("/api/team-skills/reviews")
     assert is_team_skill_write("/api/team-skills/drafts")
+    assert is_team_skill_write("/api/team-skills/skills/receipt-guide/deletions")
     assert not is_team_skill_write("/api/team-skills/drafts/x")
 
 
@@ -124,7 +136,7 @@ def test_console_routes_are_installed_once():
         "/api/team-skills/skills/{artifact}/versions/{version_id}",
         "/api/team-skills/skills/{artifact}/versions/{version_id}/resources/{name}",
         "/api/team-skills/skills/{artifact}/decisions", "/api/team-skills/skills/{artifact}/deactivations",
-        "/api/team-skills/drafts"})
+        "/api/team-skills/skills/{artifact}/deletions", "/api/team-skills/drafts"})
     assert not any(getattr(route, "methods", set()) & {"DELETE", "PUT", "PATCH"}
                    for route in app.routes if route.path.startswith("/api/team-skills"))
 

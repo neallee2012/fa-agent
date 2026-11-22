@@ -92,6 +92,7 @@ def test_native_drafts_never_block_team_options_or_hide_old_skills(
             metadata_sha256=version["metadata_sha256"], decision="approve"))
     options = template_options(control, h.assistant, human)
     assert tuple(item.name for item in options.skills) == (*names, "z-original-guide")
+    assert all(options.skill_titles[name] == "x" * 63 + "…" for name in names)
     assert all(item.metadata_sha256 is not None for item in options.skills)
     assert not options.authorization and not options.activated and not options.more_skills
     if purpose_bytes == 179:

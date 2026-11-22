@@ -60,11 +60,20 @@ class NativeRoutineHead(NativeRoutineRecord):
     version_id: Identifier
     pending: tuple[Identifier, ...] = Field(default=(), exclude_if=lambda value: not value)
     last_scheduled_for: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
+    # Deleted by its owner: off every list and the clock; the head, versions and intents stay (Neal 2026-11-22).
+    deleted_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class NativeRoutineVersion(NativeRoutineRecord):
     kind: Literal["native_routine_version"] = "native_routine_version"
     definition: NativeRoutineDefinition
+
+
+class NativeRoutineDelete(WireModel):
+    """The owner removes a disabled routine from every list and from the clock; its records stay (Neal 2026-11-22).
+    API-only: the workbench sends these two fields as plain JSON, so the pinned Hosted wire does not grow."""
+    request_id: Identifier
+    expected_version_id: Identifier
 
 
 class NativeRoutineIntent(NativeRoutineRecord):
@@ -222,6 +231,7 @@ class NativeRoutineService:
         return definition
 
     def read(self, principal, agent_id, routine_id):
+        # Still returns a deleted routine by id, so a resent delete request finds the same version and replays.
         _, control = self._context(principal, agent_id)
         return control.store.consistent_read(
             lambda: self._view(self._current_definition(control, agent_id, routine_id)))
@@ -272,6 +282,8 @@ class NativeRoutineService:
             control._human(principal, "approve")
             self._current(control, write=True, rows=rows)
             head = _scoped(control, agent_id, rows[head_key], NativeRoutineHead)
+            if head is not None and head.deleted_at is not None:
+                raise Problem(404, "NATIVE_ROUTINE_MISSING", "a deleted routine cannot be changed or revived")
             if (None if head is None else head.version_id) != command.expected_version_id:
                 raise Problem(409, "NATIVE_ROUTINE_CHANGED", "read the current routine version before changing it")
             if rows[version_key] is not None:
@@ -289,6 +301,48 @@ class NativeRoutineService:
 
         control.store.transact(request, changes)
         return self._view(self._version(control, agent_id, command.request_id))
+
+    def delete(self, principal, agent_id, routine_id, command):
+        """Only a disabled daily routine, at the version the owner saw; a resend of the request ID replays its receipt."""
+        command = NativeRoutineDelete.model_validate_json(command.model_dump_json())
+        _, control = self._context(principal, agent_id, write=True)
+        head_key = routine_key(control, "head", routine_id)
+        index_key = routine_key(control, "index", "definitions")
+        version_key = routine_key(control, "version", command.expected_version_id)
+        request = ControlRequest(
+            request_id=routine_key(control, "delete", command.request_id),
+            request_digest=material_digest({"owner": principal.oid, "agent": agent_id, "routine_id": routine_id,
+                                            "command": command.model_dump(mode="json")}),
+            read_set=(*self._authority_keys(control), head_key, index_key, version_key))
+
+        def changes(rows):
+            control._human(principal, "approve")
+            self._current(control, write=True, rows=rows)
+            head = _scoped(control, agent_id, rows[head_key], NativeRoutineHead)
+            if head is None or head.routine_id != routine_id:
+                raise Problem(404, "NATIVE_ROUTINE_MISSING", "the original routine is unavailable")
+            if head.version_id != command.expected_version_id:
+                raise Problem(409, "NATIVE_ROUTINE_CHANGED", "read the current routine version before deleting it")
+            result = {"routine_id": routine_id, "version_id": head.version_id}
+            if head.deleted_at is not None:
+                return ControlChanges(result=result)
+            saved = _scoped(control, agent_id, rows[version_key], NativeRoutineVersion)
+            if saved is None:
+                raise Problem(409, "NATIVE_ROUTINE_INVALID", "the original routine head names no saved version")
+            definition = self._scope(control, agent_id, saved.definition)
+            if definition.kind != "routine" or definition.enabled:
+                raise Problem(409, "NATIVE_ROUTINE_CHANGED", "only a disabled daily routine can be deleted")
+            index = _scoped(control, agent_id, rows[index_key], NativeRoutineIndex)
+            if index is None or routine_id not in index.routine_ids:
+                raise Problem(409, "NATIVE_ROUTINE_INVALID", "the original routine head and index differ")
+            return ControlChanges(writes=(
+                _write(head_key, head.model_copy(update={"deleted_at": control.runtime._now()}), rows[head_key]),
+                _write(index_key, index.model_copy(update={
+                    "routine_ids": tuple(key for key in index.routine_ids if key != routine_id)}), rows[index_key]),
+            ), result=result)
+
+        version_id = control.store.transact(request, changes).payload["result"]["version_id"]
+        return self._view(self._version(control, agent_id, version_id))
 
     def _clock(self, clock):
         if (not self.enabled or not isinstance(clock, NativeRoutineApiClock) or not routine_clock_enabled()
