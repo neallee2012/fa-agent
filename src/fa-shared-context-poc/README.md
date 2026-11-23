@@ -10989,7 +10989,7 @@ Neal 在 stage 替 fa-stage-a 勾第 13 項能力（Team MCP `team-XNews`）時�
 <a id="skill-selection-max"></a>
 #### skill 上限可以設定（2026-11-23，第一階段）
 
-Neal 決定一位助理最多選 32 個 skill，分兩次 release。這一版讓 API、Hosted、bridge 與工作台都讀得懂 32 個，但能存幾個由設定控制，預設仍是 4，所以部署後的行為和之前一樣。第二次 release 只改部署設定。
+Neal 決定一位助理最多選 32 個 skill，分兩次 release。這一版讓 API、Hosted、bridge 與工作台都讀得懂 32 個，但能存幾個由設定控制，預設是 4，所以第一次 release 部署後的行為和之前一樣。第二次 release 只改部署設定：stage 與 dev 的 `api_environment` 已設為 32，開放後不能退回第 57 版之前的 image。
 
 - **能選幾個**：API 的 `FA_SKILL_SELECTION_MAX`，1 到 32 的整數，未設定是 4。值不合法時 API 不啟動（`load_runtime_capabilities`），`deploy/stage/ci_deploy.py` 的 `api_skill_limit` 在部署前用同一個規則擋。只在選版的入口檢查（`check_selectable_skills`：助理設定的 select 與新增助理），超過回 422 `SKILL_SELECTION_LIMIT`（帶 `limit`）。`agent-template/options` 多一個 `max_skills`，值是 4 時不送（理由同 `max_capabilities`），工作台讀不到時當成 4。
 - **存檔與傳給 Hosted 的上限**：`m3_skills.MAX_SKILLS` 由 4 改成 32，固定不隨設定變。selection、模板、catalog、capture、assembly 與 turn context 只用這個數字驗證。每個 skill 的附檔、tool requirement、回合附檔等其他 4 都沒有動。
@@ -11001,7 +11001,11 @@ Neal 決定一位助理最多選 32 個 skill，分兩次 release。這一版讓
 - **給模型的目錄**：`present_catalog` 的描述超過 8192 bytes 時改成降級，不再丟 `ValidationError`。在只剩 64 碼 ID 的 `names` 之前，多一段「ID＋標題」，標題依序截到 96、32、12 個字。這一段仍標 `shortened`：不新增 stage 值，舊 image 讀得懂，Hosted 也只從描述取 `name`。
 - **沒有預算 profile 的 `read_skill` 說明**：原本是固定說明加上完整 catalog JSON。32 個填滿的 skill 會到 54 KB（典型 34.5 KB、約 1.3 萬 tokens），每次模型請求都帶。超過 8192 bytes 時改用上一段同一組降級（`bounded_description`），只是不進入省略：每個名字都留著，`enum` 也照舊列全部。設定是 4 時最大 4938 bytes，說明不變。
 - **回合紀錄（assembly）**：32 個填滿的 skill 紀錄約 16.5 KB，加上各段紀錄就超過 24 KiB，整份會退成空的 `summary_bound`。現在超過 4 個的每個 skill 再加 640 bytes（填滿的 `AssemblySkill` 是 557 bytes），32 個時上限 42496 bytes；4 個以內與之前相同。存放仍受 State store 單項 1 MB 與 `_fit_assembly` 保護。
-- **換版順序**：同上方能力上限。`FA_SKILL_SELECTION_MAX` 大於 4 時，`switch_preconditions` 讀服務中 API commit 的 `m3_skills.MAX_SKILLS`，不是 32 或讀不到 serving commit 就拒絕部署（`missing_skill_bound`）；這道檢查擋不住的情況與能力上限相同。`test_native_profile_snapshot.py` 的 `SKILL_BOUND_RAISED` 依這道檢查放行 v2 wire 的這個變化。第二階段在 `deploy/stage/stage.json` 與 `deploy/dev/dev.json` 的 `api_environment` 加 `"FA_SKILL_SELECTION_MAX": "32"`。
+- **換版順序**：同上方能力上限。`FA_SKILL_SELECTION_MAX` 大於 4 時，`switch_preconditions` 讀服務中 API commit 的 `m3_skills.MAX_SKILLS`，不是 32 或讀不到 serving commit 就拒絕部署（`missing_skill_bound`）；這道檢查擋不住的情況與能力上限相同。
+  不同的是，舊 image 讀不懂 skill 的地方有兩處，結果也不同。
+  **(1) 送出時（dispatch 前）**：還在第 57 版之前 image 上的 Agent（例如 stage 閒置換版關著、部署後還沒有回合結束），收到超過 4 個 skill 或超過 8192 bytes 模板的新 RID，會回 422 `NATIVE_REQUEST_INVALID`、訊息固定是 `only the typed native request is accepted`、不帶 `not_dispatched`。這個訊息每版 image 都只在解析 request 時、dispatch 之前出現，所以 API 對送單類操作（`_ADMISSION_OPERATIONS`）把它當成沒送出（`behavior_foundry._not_dispatched`），`older_image` 也認得它：row 的 SID 比選定版本舊時，交給背景換版（`send_refused`），主人的送出回 503 `AGENT_VERSION_FOLLOWING`（`server_following`）後同 RID 重送，Agent 間傳話與排程照既有的 `follow_older_image` 走。Agent 會在第一次被拒的送出時換到新 image，不必等舊對話的回合結束或手動 follow。仍擋不住：選定版本本身就是第 57 版之前的（只換 API 的部署、或 selector 被移回舊版），這時拒絕照原樣回給使用者（帶 `not_dispatched`，可同 RID 重送）；以及還沒有 binding row 的 Agent（它開新 session 時就在選定版本）。
+  **(2) 回合綁定 skill 時（dispatch 後）**：4 個以內的 skill、模板也在 8192 bytes 內，但用途長，catalog 超過 4096 bytes（設定 4 時 `SkillService.catalog` 回 413 擋住這種選取，設定 32 後存得進去）。舊 image 的模板只放 refs 解析得了，請求已 dispatch，`older_image` 接不到；回合開始後 `read_skill` 綁定時呼叫 `/skill-catalog`，舊 image 用 4096 bytes 上限解析回應失敗（舊版 `native_capability_tools.py` 的 `response_decode`），回合以 `unknown`＋`NATIVE_CAPABILITY_UNKNOWN` 結束（已配 turn number，所以不是 `NATIVE_TURN_NOT_STARTED`，工作台不會提示可重送）。舊對話的回合也一樣，因為每回合都重新綁定。API 讀到這個結束（主人等待、工作台輪詢、排程下一個 tick 讀回同一個 occurrence）時照既有的 `native_cut.turn_ended` 交給背景換版，下一個回合就在新 image 跑（`test_native_cut.py::test_a_turn_an_older_image_failed_at_its_skill_catalog_bind_moves_the_agent`）。代價：每個這種 Agent 至少有一個回合失敗，那則訊息或那次排程不會自動重送，要使用者再發一次。不保證只失敗一次：結束若在來源 session 已閒置後才被讀到，換版回 `source_idle` 不動，下一個失敗回合結束時再試；換版完成前就送出的下一則也會在舊 image 上失敗。考慮過的替代：API 端分辨呼叫者 image 並維持 4096 沒有用，因為超過就只能拒絕，回合一樣失敗；部署前要求所有 binding row 都在第 57 版之後也不可行，stage 閒置換版關著，沒有現成的立即換版指令（部署的 `sync --verify-follow` 只回報，`agent-versions` 只有 `sync`／`fence`／`patrol`），閒置的 Agent 會讓 release 永遠卡住。
+  `test_native_profile_snapshot.py` 的 `SKILL_BOUND_RAISED` 依這道檢查放行 v2 wire 的這個變化。第二階段已在 `deploy/stage/stage.json` 與 `deploy/dev/dev.json` 的 `api_environment` 加 `"FA_SKILL_SELECTION_MAX": "32"`。
 - **退版**：存了超過 4 個 skill 的模板或 selection，退回這版之前的 API 或 Hosted 會讀不回來。
 
 ### 能力的組裝、閘道與 Hosted session 需求（LOCAL，P3a）

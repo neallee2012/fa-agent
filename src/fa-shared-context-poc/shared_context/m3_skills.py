@@ -221,7 +221,8 @@ class ApprovedSkillSource:
                                    unavailable_count=len(selected) - len(entries))
         except ValueError:
             raise Problem(413, "SKILL_CATALOG_LIMIT", "complete optional catalog does not fit; nothing was truncated") from None
-        # Images before the 32-skill bound refuse a catalog over 4096 bytes; keep it until the limit is raised.
+        # Images before the 32-skill bound refuse a catalog over 4096 bytes; keep it until the limit is raised. After
+        # that, such an image's bind fails its dispatched turn, and the turn's end moves the Agent (native_cut.turn_ended).
         if (skill_selection_max() <= DEFAULT_SKILL_SELECTION_MAX
                 and len(catalog.model_dump_json().encode("utf-8")) > LEGACY_SKILL_CATALOG_BYTES):
             raise Problem(413, "SKILL_CATALOG_LIMIT", "complete optional catalog does not fit; nothing was truncated")

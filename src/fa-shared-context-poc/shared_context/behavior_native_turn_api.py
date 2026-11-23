@@ -225,8 +225,9 @@ def _prewarm_toolboxes(runtime):
 
 # ADR-0009 §4 steps 5-6: refusals of a row-located submit resolved in the request (never shown as version refusals).
 _BOUND_REFUSALS = frozenset({(409, "NATIVE_SESSION_CHANGED"), (403, "NATIVE_TURNS_DISABLED")})
-# ADR-0009 §3 P1: an older image's pre-admission refusals of a capture it can not run (``older_image``).
-_OLDER_IMAGE_REFUSALS = frozenset({"NATIVE_CAPTURE_CHANGED", "NATIVE_PROFILE_UNSUPPORTED"})
+# ADR-0009 §3 P1: an older image's pre-admission refusals of a capture it can not run (``older_image``); the 422 only
+# with ``not_dispatched``, which the client sets for the request parse alone (``behavior_foundry._not_dispatched``).
+_OLDER_IMAGE_REFUSALS = frozenset({"NATIVE_CAPTURE_CHANGED", "NATIVE_PROFILE_UNSUPPORTED", "NATIVE_REQUEST_INVALID"})
 # ADR-0009 §7a (e): the read-time status of an unfinished receipt an earlier (previous) SID accepted.
 EARLIER_VERSION_UNFINISHED = "NATIVE_EARLIER_VERSION_UNFINISHED"
 # Hosted's mark of a left ``started`` receipt whose progress stopped for N minutes (``native_left_receipts``).
@@ -236,7 +237,8 @@ SOURCE_STALLED = "NATIVE_SOURCE_STALLED"
 def older_image(composition, control, client, conflict, checked_since=None, *, cut=True):
     """ADR-0009 §3 P1 (2026-10-18, ``FA_NATIVE_SESSION_GUARD_ENFORCE``): the row's SID runs an older image than the
     selected version and refused this new RID before admission because it lacks the capture's prompt or profile
-    (``preflight``). Nothing ran there, so the background cut moves the Agent (files copied when the source has
+    (``preflight``) or its wire can not parse the capture (before the 32-skill bound: more than 4 skills, or a
+    template over 8192 bytes). Nothing ran there, so the background cut moves the Agent (files copied when the source has
     them; ``CutDriver`` runs one attempt per Agent at a time) and the same RID is resent. ``cut``: hand the Agent to
     the cut (the owner's submit does on the first attempt of each request). On the selected version's own SID the
     same codes stay refusals. ``checked_since``: the caller's selector read (None: one within

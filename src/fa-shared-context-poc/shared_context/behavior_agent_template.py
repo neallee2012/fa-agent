@@ -31,7 +31,9 @@ if TYPE_CHECKING:
     from .behavior_work_policy import WorkPolicyControl
 
 # 32 skill references and the capabilities beside them. Every image before MAX_SKILLS reads only 8192 bytes, so a new
-# selection keeps to that until the skill limit is raised (check_selectable_skills).
+# selection keeps to that until the skill limit is raised (check_selectable_skills); after that, such an image refuses
+# a larger capture before dispatch and the send moves the Agent to its selected version (behavior_native_turn_api.older_image).
+# Its skill catalog bound (m3_skills.LEGACY_SKILL_CATALOG_BYTES) fails a dispatched turn instead: see m3_skills.
 MAX_TEMPLATE_BYTES = 16 * 1024
 LEGACY_TEMPLATE_BYTES = 8192
 DestinationRequirements = tuple[

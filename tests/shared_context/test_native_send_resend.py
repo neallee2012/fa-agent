@@ -60,19 +60,40 @@ def test_a_replaced_409_is_resent_once_to_the_named_sid_and_the_row_is_repaired(
 
 # --- §3 P1: an older image refuses a changed prompt or an unknown profile before admission -------------------------
 
-OLDER_IMAGE_CODES = pytest.mark.parametrize("code", ["NATIVE_CAPTURE_CHANGED", "NATIVE_PROFILE_UNSUPPORTED"])
+# An image before the 32-skill bound (stage 57) can not parse a capture with more than 4 skills or a template over
+# 8192 bytes: its body parse answers 422 with this exact message and no ``not_dispatched``.
+UNPARSED = "NATIVE_REQUEST_INVALID"
+OLDER_IMAGE_CODES = pytest.mark.parametrize("code", ["NATIVE_CAPTURE_CHANGED", "NATIVE_PROFILE_UNSUPPORTED", UNPARSED])
+
+
+def older_refusal(code):
+    if code == UNPARSED:
+        return Problem(422, code, "only the typed native request is accepted")
+    return Problem(409, code, "OFFLINE this image runs another prompt or profile")
 
 
 def older_image(fixture, code):
-    """The source (41) runs an older image: its ``preflight`` refuses every new RID's capture, as ``native_sdk`` does
-    for a changed prompt prefix under the same profile or a profile ID it does not know. Returns the refused RIDs."""
+    """The source (41) runs an older image that refuses every new RID's capture: its ``preflight`` does, as
+    ``native_sdk`` does for a changed prompt prefix under the same profile or a profile ID it does not know; for
+    ``UNPARSED`` its request parse does, before dispatch and outside the admission checks that mark ``not_dispatched``.
+    Returns the refused RIDs."""
     refused = []
 
     def preflight(capture, **_options):
         refused.append(1)
-        raise Problem(409, code, "OFFLINE this image runs another prompt or profile")
+        raise older_refusal(code)
 
-    fixture.original.preflight = preflight
+    if code != UNPARSED:
+        fixture.original.preflight = preflight
+        return refused
+    dispatch = fixture.original.dispatch
+
+    async def unparsed(command):
+        if command.operation in {"submit", "agent_receive", "routine_receive", "continue"}:
+            preflight(None)
+        return await dispatch(command)
+
+    fixture.original.dispatch = unparsed
     return refused
 
 
@@ -131,16 +152,19 @@ def test_without_the_flag_the_follow_moves_the_agent_before_the_older_image_is_c
     _moved_with_files(fixture)
 
 
-def test_on_the_selected_versions_own_sid_the_refusal_stands_and_nothing_is_cut(file_api, monkeypatch):
+@pytest.mark.parametrize("code", ["NATIVE_CAPTURE_CHANGED", UNPARSED])
+def test_on_the_selected_versions_own_sid_the_refusal_stands_and_nothing_is_cut(file_api, monkeypatch, code):
     fixture = ready(file_api, monkeypatch)
     on_source_version(fixture, monkeypatch)
     enforcing(fixture, monkeypatch)
-    older_image(fixture, "NATIVE_CAPTURE_CHANGED")
+    older_image(fixture, code)
     cuts = []
     monkeypatch.setattr(native_cut, "send_refused", lambda *args: cuts.append(args))
     start = len(fixture.control_versions)
     refused = submit_on_source(fixture, "genuine-refusal")
-    assert refused.status_code == 409 and refused.json()["error"]["code"] == "NATIVE_CAPTURE_CHANGED", refused.text
+    error = refused.json()["error"]
+    assert (refused.status_code, error["code"]) == (older_refusal(code).status, code), refused.text
+    assert error.get("not_dispatched") is True and "server_following" not in error  # the client may resend, no wait
     assert cuts == [] and submits(fixture, start) == [fixture.source.session_id]
 
 
@@ -158,13 +182,19 @@ def test_a_common_send_never_consults_the_older_image_rule(file_api, monkeypatch
 
 # --- images from the 9aaa0824 floor to 580c980e: the two refusals carry no ``not_dispatched`` ----------------------
 
-@pytest.mark.parametrize("status, code, not_dispatched", [
-    (409, "NATIVE_CAPTURE_CHANGED", True), (409, "NATIVE_PROFILE_UNSUPPORTED", True),
-    (503, "NATIVE_PROFILE_UNSUPPORTED", False), (409, "NATIVE_SESSION_CHANGED", False)])
+@pytest.mark.parametrize("status, code, message, not_dispatched", [
+    (409, "NATIVE_CAPTURE_CHANGED", "OFFLINE older image", True),
+    (409, "NATIVE_PROFILE_UNSUPPORTED", "OFFLINE older image", True),
+    (503, "NATIVE_PROFILE_UNSUPPORTED", "OFFLINE older image", False),
+    (409, "NATIVE_SESSION_CHANGED", "OFFLINE older image", False),
+    (422, UNPARSED, "only the typed native request is accepted", True),
+    (422, UNPARSED, "OFFLINE another invalid request", False),
+    (400, UNPARSED, "only the typed native request is accepted", False)])
 def test_an_older_images_preflight_refusal_without_the_field_is_read_as_not_dispatched(
-        enforced_relay_case, monkeypatch, status, code, not_dispatched):
-    """Every image since the floor raises these two only before ``rid:<RID>`` (preflight and the conversation capture
-    check in ``_submit_locked``), so the client marks them as the field would; nothing else changes."""
+        enforced_relay_case, monkeypatch, status, code, message, not_dispatched):
+    """Every image since the floor raises the two preflight codes only before ``rid:<RID>`` (preflight and the
+    conversation capture check in ``_submit_locked``), and its body parse only before dispatch, so the client marks
+    them as the field would; nothing else changes."""
     import httpx
 
     from shared_context.behavior_native_turn_api import NativeTurnGateway
@@ -173,7 +203,7 @@ def test_an_older_images_preflight_refusal_without_the_field_is_read_as_not_disp
     case = enforced_relay_case
     foundry = case.clients[0]
     monkeypatch.setattr(foundry.http, "_transport", httpx.MockTransport(lambda request: httpx.Response(
-        status, json={"error": {"code": code, "message": "OFFLINE older image"}})))
+        status, json={"error": {"code": code, "message": message}})))
     with pytest.raises(Problem) as refused:
         NativeTurnGateway._invoke(foundry, NativeSubmit(command=case.sender.command, capture=case.sender.capture))
     assert refused.value.body["error"]["code"] == code
@@ -234,7 +264,8 @@ def test_a_handoff_an_older_image_refuses_is_delivered_after_the_cut_once_with_i
         if command.operation == "agent_receive":
             receives.append(command.command.request_id)
             if not cuts:
-                return httpx.Response(409, json={"error": {"code": code, "message": "OFFLINE older image"}})
+                refusal = older_refusal(code)
+                return httpx.Response(refusal.status, json=refusal.body)
         return transport.handle_request(request)
 
     monkeypatch.setattr(foundry.http, "_transport", httpx.MockTransport(older_until_cut))

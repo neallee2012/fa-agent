@@ -214,6 +214,28 @@ def test_busy_waits_for_the_next_turn_end_with_no_calls_meanwhile(file_api, monk
     assert abandon.row(fixture).hosted_session_id == fixture.destination.session_id
 
 
+def test_a_turn_an_older_image_failed_at_its_skill_catalog_bind_moves_the_agent(file_api, monkeypatch, caplog):
+    """An image before the 32-skill bound reads a skill catalog over 4096 bytes as invalid after dispatch, so its turn
+    ends ``unknown`` (``NATIVE_CAPABILITY_UNKNOWN``); reading that end moves the Agent to its selected version."""
+    fixture = ready(file_api, monkeypatch, files=False)
+    sessions(fixture).guard.enforce = True
+
+    async def bind_failed():
+        async with fixture.runtime._store(TURNS_STORE) as store:
+            item = await store.get_item("rid:original-rid")
+            record = dict(item.value)
+            receipt = {key: value for key, value in record["receipt"].items() if key != "result"}
+            record["receipt"] = {**receipt, "status": "unknown", "failure_code": "NATIVE_CAPABILITY_UNKNOWN"}
+            await store.set_item("rid:original-rid", record, if_match=item.etag)
+    fixture.hosted.portal.call(bind_failed)
+    caplog.set_level(logging.WARNING)
+    response = abandon.read_request(fixture, "original-rid")
+    assert response.status_code == 200 and response.json()["status"] == "unknown", response.text
+    finished(native_cut.native_cut_driver(fixture.case.composition), fixture.source.agent_id)
+    assert "NATIVE_UPGRADE_CUT_API outcome=ready" in caplog.text
+    assert abandon.row(fixture).hosted_session_id == fixture.destination.session_id
+
+
 def one_page_per_call(monkeypatch):
     """Each Hosted call's scan deadline passes after one receipt page of one key: a store with more receipts than one
     call's ``_SCAN_SECONDS`` reads (dev fa-context-a, 2026-11-04: 120-131 receipts per call, never finishing). The

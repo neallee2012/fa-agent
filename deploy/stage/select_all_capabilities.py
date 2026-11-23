@@ -15,7 +15,8 @@ stage uses the WebIQ toolbox, #415 Q9). Capabilities and skills come from the
 server's own options: every offered capability except the excluded ones and those the prompt profile cannot compose
 (the server's own `base_supports` rule; for example `fa-delegate-reader-v1` needs a profile that declares
 `read_user_file`, which fa-instruction-v3/v4 do not, so the API would refuse the whole selection with 422
-CAPABILITY_BASE_UNSUPPORTED), and every currently approved Team skill (at most 4). The "+" form pre-checks the default
+CAPABILITY_BASE_UNSUPPORTED), and every currently approved Team skill (at most the API's skill limit, `max_skills` in
+its options: FA_SKILL_SELECTION_MAX, 4 when unset or on an API before it). The "+" form pre-checks the default
 Agent's (A's) current selection; this CLI never treats that UI choice as implicit approval for another Agent.
 
 Safety (no blind resend): one intent file per Agent and request ID first (open mode "x"). Each change uses a new
@@ -52,13 +53,13 @@ from pydantic import ValidationError
 from shared_context.behavior_agent_template import AgentTemplate
 from shared_context.behavior_capabilities import base_supports
 from shared_context.behavior_skill_prompt import assemble_prompt
+from shared_context.m3_skills import DEFAULT_SKILL_SELECTION_MAX
 from shared_context.native_responses_wire import SENT_RELEASE
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared-context"))
 from deployment_config import config_path, load_config, write_x as _write_x
 
-MAX_SKILLS = 4
 TEMPLATE_KEYS = ("schema_version", "role", "settings", "skills", "unavailable_skills")
 
 
@@ -82,8 +83,9 @@ def template(options, defaults):
                            if item["entry_id"] not in defaults["excluded_capabilities"]
                            and base_supports(item["entry_id"], profile)), key=lambda item: item["entry_id"])
     skills = sorted(options["skills"], key=lambda item: item["name"])
-    if len(skills) > MAX_SKILLS or options.get("more_skills"):
-        raise SystemExit(f"more than {MAX_SKILLS} approved Team skills; the owner chooses which to pin")
+    limit = options.get("max_skills", DEFAULT_SKILL_SELECTION_MAX)  # left out at the default
+    if len(skills) > limit or options.get("more_skills"):
+        raise SystemExit(f"more than {limit} approved Team skills; the owner chooses which to pin")
     return {"schema_version": "fa-agent-template-v1",
             "role": {"profile": role.profile, "prefix_sha256": role.prefix_sha256,
                      "capability_catalog_version": role.capability_catalog_version},

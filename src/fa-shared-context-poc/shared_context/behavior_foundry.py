@@ -91,6 +91,9 @@ _START_CODES = frozenset({
 # The native operations Hosted admits a new RID through (``_submit_locked``) and the refusals it raises only before it.
 _ADMISSION_OPERATIONS = frozenset({"submit", "agent_receive", "routine_receive", "continue"})
 _PREFLIGHT_REFUSALS = frozenset({"NATIVE_CAPTURE_CHANGED", "NATIVE_PROFILE_UNSUPPORTED"})
+# Every image's request parse (native_turns.native_response) refuses a body its wire forbids with exactly this, before
+# dispatch, and raises it nowhere else.
+_UNTYPED = "only the typed native request is accepted"
 
 
 def _upstream_status(error):
@@ -241,7 +244,10 @@ def _not_dispatched(error, code, status, native_operation):
         # ADR-0009 §3 P1: every image since the 9aaa0824 floor raises these
         # two only before rid:<RID> (preflight, conversation capture check),
         # also those before 580c980e that never set the field.
-        or native_operation in _ADMISSION_OPERATIONS and status == 409 and code in _PREFLIGHT_REFUSALS)
+        or native_operation in _ADMISSION_OPERATIONS and status == 409 and code in _PREFLIGHT_REFUSALS
+        # An image before the 32-skill bound so refuses a capture with more than 4 skills or a template over 8192 bytes.
+        or native_operation in _ADMISSION_OPERATIONS and status == 422 and code == "NATIVE_REQUEST_INVALID"
+        and error.get("message") == _UNTYPED)
 
 
 def _refusal_identity(error, code):
@@ -272,7 +278,7 @@ def _old_image_marks(error, code, status, native_operation):
     # ADR-0009 5b: an image before it refuses a body with ``workspace``/``files_restore`` (its
     # wire forbids unknown fields) with exactly this message, after this API validated it.
     untyped = (status == 422 and native_operation in {"session_read", "session_cut"}
-               and error.get("message") == "only the typed native request is accepted")
+               and error.get("message") == _UNTYPED)
     return {**({"reserved": True} if reserved else {}), **({"untyped": True} if untyped else {})}
 
 

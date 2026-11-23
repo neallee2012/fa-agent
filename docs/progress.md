@@ -4,6 +4,15 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="stage-v57-1123"></a>
+## 2026-11-23：stage 第 57 版（skill 上限 32 第一階段）
+
+- **第 57 版**（#1314，`2026.11.23-57`，Neal 台灣時間 11-23 15:14 合併，merge `17ccceb0`）：Neal 2026-11-23 決定每位助理可選 skill 上限 32、選項列出所有已生效 skill、目錄放不下時保留名字、分兩次 release。
+  - **內容**（`7ed2cbb1..17ccceb0`）：#1312 文件（第 56 版紀錄）。#1313 skill 上限 32 第一階段：API、Hosted、工作台讀得懂 32，可存的選取數由 `FA_SKILL_SELECTION_MAX` 控制；stage 沒設，預設 4，使用者看到的行為不變。唯一刻意差異：skill 多、目錄在 token 預算內放不下時，模型看到「ID＋截短標題」，不再只剩雜湊。選項不再只列前 24 個，會列所有已生效 skill。詳見 release PR 本文。
+  - **部署**：deploy-staging run 45129636400 成功（15:14:20～15:28:20），guard 讀到 `serving 7ed2cbb1c174; core changed: True; Hosted-only changed: 0`；API、Hosted、console、feed 都換新；gate（decision: pass，0 refusals）、sync、api、console、follow 成功（follow 用 verify-follow，Agent 在下一個回合結束後才換版）。新的 skill 上限部署檢查在 stage 沒設 `FA_SKILL_SELECTION_MAX` 時不觸發，log 沒有相關輸出。image 前 12 碼：API `8961c3f04cb1`、Hosted `85b2eaeaddd3`、console `34ffe7c695da`、feed `3abbe309bbce`。public-sync run 45131331254 成功（15:28:22～15:32:38），`gate 2: PASS`，公開 tag `v2026.11.23-57`，公開樹 `cff50dfe`（與第一道指紋相同）。
+  - **dev 測試**（run 4912，部署 `705bd437`）：照 check → guard → build → gate → sync → api → follow 全部通過；A、B 換版後第一次讀取各回一次 409 `NATIVE_SESSION_CHANGED`（同第 54、56 版）；log 沒有 Traceback、AppExceptions 與 `SKILL_*`／`TEMPLATE_*`／`M3_*`／`CAPABILITY_*` 錯誤碼。設定為預設 4：A、B 的 Skills 分頁與排程分頁正常載入，`/api/agent-template/options` 回 200 且不輸出 `max_skills`，頁面退回 4；B 新對話「1+1=?」回 2。本機自動測試（skill 相關約 600 個、工作台 cjs 804 個）通過，失敗 1、錯誤 21 在 base 上同樣重現。部署前本月訂閱累計 USD 1108.91（有延遲），停損 1200。
+  - **沒有驗證**：stage 上沒有回合在 v57 上跑過，也沒查有多少 Agent 已換到 v57。設定大於 4 的行為（32 個 skill 的存檔、模板、目錄、選項）只在本機測，dev、stage 都沒開過；dev 的 Team 沒有已生效 skill，選項全列與目錄保留名字沒走到；assembly 紀錄讀回沒測；dev 沒排程，排程實刪沒測。另外：32 個 skill 時，一份模板最多約 50 項能力（skill 參照加能力一起算進模板位元組上限）；「可加入項目」選項清單任一 skill 讀取回 403 時，整份選項失敗，不是只略過那一個；`FA_SKILL_SELECTION_MAX` 開到 32 後不能退版（舊 image 讀到超過 4 個的選取、capture 或回條會判為無效）。第 56 版以前的未驗證事項仍在（見 CURRENT-STATE）。
+  - **第二階段**：#1315（stage 與 dev 的 `api_environment` 加 `FA_SKILL_SELECTION_MAX: "32"`）已開、未合併。審查發現：仍停在第 57 版之前 image 的 Agent，主人存超過 4 個 skill 後會一直失敗、不會自己恢復（P2，修正中）。dev 部署因訂閱本月累計超過停損，Neal 2026-11-23 核准這次例外。合併第 58 版 release 後不能退版；需 Neal 合併。
 <a id="stage-v56-1122"></a>
 ## 2026-11-22：stage 第 56 版（Team skill 與每日排程可刪除）
 

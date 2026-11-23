@@ -712,7 +712,9 @@ def switch_preconditions(properties=None, base=None):
         # An image before the bound reads a stored selection, capture or receipt above the default as invalid: the
         # conversation stays stuck until it runs a newer image. A full deploy syncs each Agent's definition to its image
         # before its API step; not covered: an API-only deploy, and a session still on an older version (deferred
-        # follow, drift).
+        # follow, drift). For skills, a new capture above such an image's skill or template bound is refused before
+        # dispatch and moves the Agent (behavior_native_turn_api.older_image); a skill catalog over its 4096 bytes fails
+        # the dispatched turn at its bind, and that turn's end moves the Agent (native_cut.turn_ended).
         base = serving_commit(ready) if read else base
     for name, default, bound, what, check in limits:
         missing = ["the serving commit is unknown"] if base is None else check(base)

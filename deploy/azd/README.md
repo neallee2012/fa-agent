@@ -366,7 +366,7 @@ profile 一律寫 `compatibility_gate_armed: true`（`FA_COMPAT_GATE_ARMED` 不�
 
 首次安裝最後一步，hook 以 Team 主人身分替兩位助理做「新對話選版」：
 Responses 通道、伺服器提供的全部能力（桌面、技能、Shell、瀏覽器、交辦、協作、圖片等；`WebIQ-MCP` 已於 2026-10-22 退場，排除設定留著給還提供它的舊 API image），
-以及 Team 已批准的技能（最多 4 個）。模板由 `select_all_capabilities.py` 依伺服器自己的選項算出，不從別的 Agent 複製；
+以及 Team 已批准的技能（最多到 API 的 skill 上限 `FA_SKILL_SELECTION_MAX`，沒設時 4 個）。模板由 `select_all_capabilities.py` 依伺服器自己的選項算出，不從別的 Agent 複製；
 之後的 `azd deploy` 不會改它，主人在工作台助理 ⚙ 設定頁的調整都保留。
 
 <a id="model-switch"></a>

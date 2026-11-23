@@ -49,6 +49,20 @@ def test_template_leaves_out_what_the_profile_cannot_compose_and_keeps_the_state
     assert check_selectable(template.settings.capabilities, profile, grants) == template.settings.capabilities
 
 
+@pytest.mark.parametrize("limit, approved, pinned", [(None, 4, True), (None, 5, False), (32, 32, True), (32, 33, False)])
+def test_every_approved_skill_is_pinned_up_to_the_apis_skill_limit(script, limit, approved, pinned):
+    """The options name the API's FA_SKILL_SELECTION_MAX (``max_skills``, left out at the default 4)."""
+    offered, _ = options()
+    skills = [{"name": f"{number:064x}", "version_id": f"{number:032x}", "sha256": f"{number:064x}"}
+              for number in range(approved, 0, -1)]
+    offered.update(skills=skills, **({} if limit is None else {"max_skills": limit}))
+    if not pinned:
+        with pytest.raises(SystemExit, match=f"more than {limit or 4} approved Team skills"):
+            script.template(offered, DEFAULTS)
+        return
+    assert script.template(offered, DEFAULTS)["skills"] == sorted(skills, key=lambda item: item["name"])
+
+
 def test_a_profile_that_declares_the_reader_keeps_it(script, monkeypatch):
     offered, grants = options()
     monkeypatch.setitem(DEFAULTS, "prompt_profile", "fa-instruction-agent-role-v4")
