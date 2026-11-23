@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field, TypeAdapter, field_validator, model_validator
@@ -18,14 +20,22 @@ if TYPE_CHECKING:
     from .auth import Actor
     from .m3_artifacts import ArtifactService
 
-MAX_SKILL_CATALOG_BYTES = 4096
+# Wire bound on a stored or sent skill selection and catalog, the same in every process. How many a human may select is
+# the setting below.
+MAX_SKILLS = 32
+SKILL_SELECTION_MAX_ENV = "FA_SKILL_SELECTION_MAX"
+# Unset keeps the limit every earlier image enforced; an options reply without max_skills means the same.
+DEFAULT_SKILL_SELECTION_MAX = 4
+# 32 entries at their field bounds (a 256-emoji title, a 512-byte purpose JSON escapes to 1024) measure 83 KB.
+MAX_SKILL_CATALOG_BYTES = 96 * 1024
+LEGACY_SKILL_CATALOG_BYTES = 4096
 SKILL_ERRORS = frozenset({
     "SKILL_ACCESS_DISABLED", "SKILL_IDENTITY_DENIED", "SKILL_APPROVAL_DENIED",
     "SKILL_SOURCE_DENIED", "SKILL_SOURCE_CHANGED", "SKILL_CATALOG_LIMIT",
     "M3_SKILL_RESOURCE_DENIED", "M3_SKILL_RESOURCE_CHANGED", "M3_SKILL_RESOURCE_FORMAT",
     "M3_NO_EFFECTIVE_VERSION", "M3_FILE_INTEGRITY", "M3_VERSION_NOT_FOUND",
 })
-SkillSelection = Annotated[tuple[Identifier, ...], Field(max_length=4)]
+SkillSelection = Annotated[tuple[Identifier, ...], Field(max_length=MAX_SKILLS)]
 _selection = TypeAdapter(SkillSelection)
 
 
@@ -34,6 +44,14 @@ def validate_selection(value: tuple[str, ...]) -> tuple[str, ...]:
     if len(set(selected)) != len(selected):
         raise ValueError("Approved skill selectors must be distinct")
     return selected
+
+
+def skill_selection_max() -> int:
+    """How many skills one human selection may name: ``FA_SKILL_SELECTION_MAX``, 1 to MAX_SKILLS."""
+    value = os.environ.get(SKILL_SELECTION_MAX_ENV, str(DEFAULT_SKILL_SELECTION_MAX))
+    if re.fullmatch(r"[1-9][0-9]?", value) is None or int(value) > MAX_SKILLS:
+        raise Problem(503, "SKILL_CONFIGURATION", f"{SKILL_SELECTION_MAX_ENV} must be an integer from 1 to {MAX_SKILLS}")
+    return int(value)
 
 
 class SkillEntry(WireModel):
@@ -68,14 +86,14 @@ class SkillEntry(WireModel):
 class SkillCatalog(WireModel):
     schema_version: Literal["fa-approved-skill-catalog-v1"] = "fa-approved-skill-catalog-v1"
     purpose: Literal["instruction-guidance-only"] = "instruction-guidance-only"
-    entries: Annotated[tuple[SkillEntry, ...], Field(max_length=4)] = ()
-    unavailable_count: Annotated[int, Field(ge=0, le=4)] = 0
+    entries: Annotated[tuple[SkillEntry, ...], Field(max_length=MAX_SKILLS)] = ()
+    unavailable_count: Annotated[int, Field(ge=0, le=MAX_SKILLS)] = 0
     tokens: None = None
 
     @model_validator(mode="after")
     def bounded(self):
         names = tuple(entry.name for entry in self.entries)
-        if names != tuple(sorted(set(names))) or len(names) + self.unavailable_count > 4:
+        if names != tuple(sorted(set(names))) or len(names) + self.unavailable_count > MAX_SKILLS:
             raise ValueError("Skill catalog must be bounded, distinct and ordered")
         if len(self.model_dump_json().encode("utf-8")) > MAX_SKILL_CATALOG_BYTES:
             raise ValueError("Complete skill catalog exceeds its byte bound")
@@ -111,7 +129,7 @@ class PurposeSkillEntry(SkillEntry):
 
 class PurposeSkillCatalog(SkillCatalog):
     schema_version: Literal["fa-approved-skill-catalog-v2"]
-    entries: Annotated[tuple[PurposeSkillEntry, ...], Field(max_length=4)] = ()
+    entries: Annotated[tuple[PurposeSkillEntry, ...], Field(max_length=MAX_SKILLS)] = ()
 
 
 class PurposeSkillReadResult(SkillReadResult):
@@ -199,10 +217,15 @@ class ApprovedSkillSource:
             ))
         try:
             catalog_type = PurposeSkillCatalog if purpose_enabled else SkillCatalog
-            return catalog_type(schema_version=schema_version, entries=tuple(entries),
-                                unavailable_count=len(selected) - len(entries))
+            catalog = catalog_type(schema_version=schema_version, entries=tuple(entries),
+                                   unavailable_count=len(selected) - len(entries))
         except ValueError:
             raise Problem(413, "SKILL_CATALOG_LIMIT", "complete optional catalog does not fit; nothing was truncated") from None
+        # Images before the 32-skill bound refuse a catalog over 4096 bytes; keep it until the limit is raised.
+        if (skill_selection_max() <= DEFAULT_SKILL_SELECTION_MAX
+                and len(catalog.model_dump_json().encode("utf-8")) > LEGACY_SKILL_CATALOG_BYTES):
+            raise Problem(413, "SKILL_CATALOG_LIMIT", "complete optional catalog does not fit; nothing was truncated")
+        return catalog
 
     def read(self, actor: Actor, team: str, selected: tuple[str, ...], expected: SkillEntry | PurposeSkillEntry,
              *, include_resources: bool = False,

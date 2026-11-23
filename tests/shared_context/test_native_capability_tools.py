@@ -215,6 +215,43 @@ def test_an_empty_skill_selection_binds_read_skill_without_reading_any_skill(ski
     assert refused.value.public_code == REFUSED and upstream.calls == []
 
 
+def test_thirty_two_captured_skills_bind_and_assemble(skilled_http, offline_mcp, monkeypatch):
+    """The design point: 32 skills, each title and purpose at its field bound, in a turn that records every part and
+    40 tools. Without a budget profile the tool description keeps every name within its byte bound (the complete JSON
+    is ~54 KB), and the assembly keeps every skill and tool record instead of falling to the empty summary."""
+    from types import SimpleNamespace
+    from shared_context.behavior_agent_template import TemplateSkill
+    from shared_context.behavior_skill_catalog import MAX_DESCRIPTION_BYTES
+    from shared_context.m3_skills import MAX_SKILLS, PurposeSkillCatalog, PurposeSkillEntry
+    from shared_context.native_assembly import _PART_SOURCES
+    (case, _), (loop, _) = skilled_http
+    names = tuple(f"guide-{i:02d}" for i in range(MAX_SKILLS))
+
+    def catalog(actor, team, selected, *, schema_version):
+        entries = tuple(PurposeSkillEntry(**{
+            **case.skills._entry(team).model_dump(), "name": name, "title": "標" * 256, "description": "述" * 170,
+            "metadata_sha256": f"{index:064x}"}) for index, name in enumerate(selected))
+        return PurposeSkillCatalog(schema_version=schema_version, entries=entries)
+    monkeypatch.setattr(case.skills, "catalog", catalog)
+    refs = tuple(TemplateSkill(name=item.name, version_id=item.version_id, sha256=item.sha256,
+                               metadata_sha256=item.metadata_sha256)
+                 for item in catalog(None, "team", names, schema_version="fa-approved-skill-catalog-v2").entries)
+    context = context_for(case, started(case, (SKILLS,), skills=refs, rid="many-skills-rid"))
+    context.assembly = NativeAssemblyCollector(context.receipt)
+    skill = bind(loop, context, Upstream(case))["read_skill"][0]
+    assert skill.parameters["properties"]["name"]["enum"] == list(names)
+    assert len(skill.description.encode("utf-8")) <= MAX_DESCRIPTION_BYTES
+    shown = json.loads(skill.description.split("\n")[1])["entries"]
+    assert [entry["name"] for entry in shown] == list(names) and all("title_excerpt" in entry for entry in shown)
+    for name in _PART_SOURCES:
+        context.assembly.text(name, name, source_sha256="f" * 64)
+    context.assembly.sdk_bound("system", "prompt", [SimpleNamespace(name=f"tool_{i:02d}", parameters={})
+                                                    for i in range(40)])
+    assembly = context.assembly.snapshot(complete=True)
+    assert assembly.reason is None and assembly.omitted_items == 0 and len(assembly.tools) == 40
+    assert [item.selected.name for item in assembly.skills] == list(names)
+
+
 def test_unserved_and_unreadable_api_answers_log_a_fixed_reason(skilled_http, offline_mcp, caplog):
     import logging
     (case, refs), (loop, _) = skilled_http

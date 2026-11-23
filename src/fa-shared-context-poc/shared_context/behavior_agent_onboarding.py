@@ -21,7 +21,7 @@ from pydantic import AwareDatetime, Field, field_validator, model_validator
 from .behavior_agent_message_wire import MAX_TEAM_AGENTS
 from .behavior_agent_role_prompt import AGENT_ROLE_V4_PROFILE, ROLE_PROFILES
 from .behavior_agent_role_prompt_versions import role_prompt_command, save_role_prompt
-from .behavior_agent_template import TemplateSkill
+from .behavior_agent_template import TemplateSkill, check_selectable_skills
 from .behavior_capabilities import CapabilityRefs, SKILLS_ENTRY_ID, check_selectable, runtime_grants, skills_selected
 from .behavior_foundry import PLATFORM_NO_RETRY, PLATFORM_READ_RETRY, FoundryTarget, _upstream_status
 from .behavior_operations import _Model, _parse, _row, _write, control_key
@@ -34,6 +34,7 @@ from .behavior_turn_origin import TurnOriginProfile
 from .behavior_wire import Command, Digest
 from .errors import Problem
 from .models import Identifier
+from .m3_skills import MAX_SKILLS
 from .source_materials import digest
 
 # B1 SP series: Agents created from now on use the shared native prompt; existing Agents keep their selection.
@@ -60,7 +61,7 @@ _REASONS = Literal["FOUNDRY_CREATE_REJECTED", "FOUNDRY_VERSION_FAILED"]
 SETUP_PENDING = "AGENT_SETUP_PENDING"
 
 
-SelectedSkills = Annotated[tuple[TemplateSkill, ...], Field(max_length=4)]
+SelectedSkills = Annotated[tuple[TemplateSkill, ...], Field(max_length=MAX_SKILLS)]
 
 
 class AgentSelection(_Model):
@@ -454,9 +455,10 @@ def _check_selection(composition, original, selection):
                       f"approved skills need the {SKILLS_ENTRY_ID} capability on the agent-role profile")
     origin, provider = _effective_turn_origin(composition, original), _effective_model_provider(composition, original)
     base = _with_provider(_with_origin(_role_profile(original.profile, selection), origin), provider)
-    profile = profile_from_template(SimpleNamespace(profile=base), _selection_template(
-        base, selection, _effective_state_profile(composition, original),
-        _effective_catalog_budget(composition, original, selection)))
+    template = _selection_template(base, selection, _effective_state_profile(composition, original),
+                                   _effective_catalog_budget(composition, original, selection))
+    check_selectable_skills(template)
+    profile = profile_from_template(SimpleNamespace(profile=base), template)
     control = composition.runtime.work_policy
     if profile.skill_catalog_budget_profile is not None:
         validate_catalog_budget(control.models.select(None).capacity_snapshot(), len(names),

@@ -106,6 +106,9 @@ API_IDLE_SCHEMA = 4
 # test_stage_ci_routines pins them): the selection limit every API before the 128 bound enforced, and that bound.
 CAPABILITY_DEFAULT = 12
 CAPABILITY_BOUND = 128
+# The same for m3_skills.DEFAULT_SKILL_SELECTION_MAX and MAX_SKILLS (src README#skill-selection-max).
+SKILL_DEFAULT = 4
+SKILL_BOUND = 32
 IMAGES = {
     "api": ("fa-behavior-api", "Dockerfile.behavior-api"),
     "hosted": ("fa-behavior-assistant-desktop", "Dockerfile.behavior-assistant-desktop"),
@@ -148,6 +151,7 @@ def check():
     api_routines()
     api_faults()
     api_capability_limit()
+    api_skill_limit()
     realtime()
     feed_config()
     api_secrets()
@@ -587,6 +591,16 @@ def api_capability_limit():
     return value is not None and int(value) > CAPABILITY_DEFAULT
 
 
+def api_skill_limit():
+    """FA_SKILL_SELECTION_MAX, checked as the API checks it at startup (m3_skills.skill_selection_max). True when it
+    raises the limit above SKILL_DEFAULT, which switch_preconditions allows only over a serving API with SKILL_BOUND."""
+    value = STAGE["api_environment"].get("FA_SKILL_SELECTION_MAX")
+    if value is not None and (not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]?", value) is None
+                              or int(value) > SKILL_BOUND):
+        raise SystemExit(f"api_environment: FA_SKILL_SELECTION_MAX must be an integer from 1 to {SKILL_BOUND}")
+    return value is not None and int(value) > SKILL_DEFAULT
+
+
 def _api_source(name, commit=None):
     """One shared_context file of this checkout, or of ``commit`` (the serving API's); None when it does not exist."""
     if commit is None:
@@ -629,6 +643,12 @@ def missing_capability_bound(commit):
     found = api_2di_schema(commit, "MAX_CAPABILITIES", "behavior_capabilities.py")
     return [] if found >= CAPABILITY_BOUND else [f"behavior_capabilities.MAX_CAPABILITIES={found}, "
                                                  f"needs {CAPABILITY_BOUND}"]
+
+
+def missing_skill_bound(commit):
+    """[] when ``commit``'s API (and the Hosted image deployed with it) reads selections up to SKILL_BOUND."""
+    found = api_2di_schema(commit, "MAX_SKILLS", "m3_skills.py")
+    return [] if found >= SKILL_BOUND else [f"m3_skills.MAX_SKILLS={found}, needs {SKILL_BOUND}"]
 
 
 def native_2di():
@@ -683,16 +703,23 @@ def switch_preconditions(properties=None, base=None):
     ready = properties.get("latestReadyRevisionName") or ""
     if not ready and not _active_revisions(app):
         return  # no revision ever got ready and none is active (a first install stopped midway): nothing to converge
-    if api_capability_limit():
-        # An image before the bound reads a stored selection, capture or receipt above 12 as invalid: the conversation
-        # stays stuck until it runs a newer image. A full deploy syncs each Agent's definition to its image before its
-        # API step; not covered: an API-only deploy, and a session still on an older version (deferred follow, drift).
+    limits = [(name, default, bound, what, check) for raised, name, default, bound, what, check in (
+        (api_capability_limit(), "FA_CAPABILITY_SELECTION_MAX", CAPABILITY_DEFAULT, CAPABILITY_BOUND, "capability",
+         missing_capability_bound),
+        (api_skill_limit(), "FA_SKILL_SELECTION_MAX", SKILL_DEFAULT, SKILL_BOUND, "skill", missing_skill_bound),
+    ) if raised]
+    if limits:
+        # An image before the bound reads a stored selection, capture or receipt above the default as invalid: the
+        # conversation stays stuck until it runs a newer image. A full deploy syncs each Agent's definition to its image
+        # before its API step; not covered: an API-only deploy, and a session still on an older version (deferred
+        # follow, drift).
         base = serving_commit(ready) if read else base
-        missing = ["the serving commit is unknown"] if base is None else missing_capability_bound(base)
+    for name, default, bound, what, check in limits:
+        missing = ["the serving commit is unknown"] if base is None else check(base)
         if missing:
-            raise SystemExit(f"{app}: FA_CAPABILITY_SELECTION_MAX above {CAPABILITY_DEFAULT} needs every Agent on an "
-                             f"image with the {CAPABILITY_BOUND} capability bound, and the serving API lacks it "
-                             f"({missing}); deploy this commit with the setting unset first, then raise it")
+            raise SystemExit(f"{app}: {name} above {default} needs every Agent on an image with the {bound} {what} "
+                             f"bound, and the serving API lacks it ({missing}); deploy this commit with the setting "
+                             "unset first, then raise it")
     container = ((properties.get("template") or {}).get("containers") or [{}])[0]
     env = {item.get("name"): item.get("value") for item in container.get("env") or []}
     deployed = env.get(SESSION_GUARD)

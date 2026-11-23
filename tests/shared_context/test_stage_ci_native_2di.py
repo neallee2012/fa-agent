@@ -8,6 +8,7 @@ Offline: ci_deploy is loaded from its file; ARM reads and job runs are replaced.
 
 import inspect
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,7 +29,8 @@ def ci(monkeypatch):
     module = load_ci()
     monkeypatch.setattr(module, "release", lambda: "test")
     monkeypatch.setattr(module, "missing_2di", lambda commit=None: [])
-    module.STAGE["api_environment"].pop("FA_CAPABILITY_SELECTION_MAX", None)  # the CAP tests below set it
+    for limit in ("FA_CAPABILITY_SELECTION_MAX", "FA_SKILL_SELECTION_MAX"):  # the limit tests below set them
+        module.STAGE["api_environment"].pop(limit, None)
     return module
 
 
@@ -460,18 +462,24 @@ def test_the_sync_job_gets_the_registered_v2_flag_only_with_the_switch_on(ci):
 
 
 CAP = "FA_CAPABILITY_SELECTION_MAX"
+SKILL = "FA_SKILL_SELECTION_MAX"
 
 
-def test_raising_the_capability_limit_needs_a_serving_api_with_the_128_bound(ci, monkeypatch, served):
-    """An image before MAX_CAPABILITIES 128 reads a stored capture above 12 as 409 NATIVE_STATE_INVALID, so the setting
-    rises above 12 only in a deploy after the one that shipped the bound (src README#capability-selection-max)."""
+@pytest.mark.parametrize("setting,check,old", [
+    (CAP, "missing_capability_bound", "behavior_capabilities.MAX_CAPABILITIES=12, needs 128"),
+    (SKILL, "missing_skill_bound", "m3_skills.MAX_SKILLS=4, needs 32"),
+])
+def test_raising_a_selection_limit_needs_a_serving_api_with_its_bound(ci, monkeypatch, served, setting, check, old):
+    """An image before MAX_CAPABILITIES 128 (MAX_SKILLS 32) reads a stored capture above 12 (4) as 409
+    NATIVE_STATE_INVALID, so the setting rises above its default only in a deploy after the one that shipped the
+    bound (src README#capability-selection-max, #skill-selection-max)."""
     switch_on(ci)
-    ci.STAGE["api_environment"][CAP] = "32"
-    old = ["behavior_capabilities.MAX_CAPABILITIES=12, needs 128"]
-    monkeypatch.setattr(ci, "missing_capability_bound", lambda commit: old if commit == "base" else [])
+    ci.STAGE["api_environment"][setting] = "32"
+    old = [old]
+    monkeypatch.setattr(ci, check, lambda commit: old if commit == "base" else [])
     api_app(ci, monkeypatch, deployed="1")
     for step in (ci.guard, ci.switch_preconditions):  # sync and api read the app themselves (the dev line)
-        with pytest.raises(SystemExit, match=f"{CAP} above 12 .*MAX_CAPABILITIES=12, needs 128.*unset first"):
+        with pytest.raises(SystemExit, match=f"{setting} above .*{re.escape(old[0])}.*unset first"):
             step()
     api_app(ci, monkeypatch, deployed="1", revision=f"{ci.STAGE['api_app']}--portal")
     with pytest.raises(SystemExit, match="serving commit is unknown"):
@@ -482,13 +490,13 @@ def test_raising_the_capability_limit_needs_a_serving_api_with_the_128_bound(ci,
     ci.switch_preconditions()
 
 
-@pytest.mark.parametrize("value", ["12", "5", None])
-def test_a_capability_limit_up_to_12_never_reads_the_serving_commit(ci, monkeypatch, value):
+@pytest.mark.parametrize("values", [{CAP: "12", SKILL: "4"}, {CAP: "5", SKILL: "1"}, {}])
+def test_limits_up_to_their_defaults_never_read_the_serving_commit(ci, monkeypatch, values):
     switch_on(ci)
-    if value is not None:
-        ci.STAGE["api_environment"][CAP] = value
+    ci.STAGE["api_environment"].update(values)
     monkeypatch.setattr(ci, "serving_commit", lambda revision: pytest.fail("the serving commit was read"))
     monkeypatch.setattr(ci, "missing_capability_bound", lambda commit: pytest.fail("the bound was read"))
+    monkeypatch.setattr(ci, "missing_skill_bound", lambda commit: pytest.fail("the bound was read"))
     api_app(ci, monkeypatch, deployed="1")
     ci.switch_preconditions()
 
@@ -498,3 +506,10 @@ def test_the_capability_bound_check_reads_the_real_checkout():
     real = load_ci()
     assert real.api_2di_schema(name="MAX_CAPABILITIES", source="behavior_capabilities.py") == MAX_CAPABILITIES
     assert real.missing_capability_bound("0" * 40) == ["behavior_capabilities.MAX_CAPABILITIES=0, needs 128"]
+
+
+def test_the_skill_bound_check_reads_the_real_checkout():
+    from shared_context.m3_skills import MAX_SKILLS
+    real = load_ci()
+    assert real.api_2di_schema(name="MAX_SKILLS", source="m3_skills.py") == MAX_SKILLS == real.SKILL_BOUND
+    assert real.missing_skill_bound("0" * 40) == ["m3_skills.MAX_SKILLS=0, needs 32"]

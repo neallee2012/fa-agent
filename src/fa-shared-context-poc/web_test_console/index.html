@@ -622,11 +622,11 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <pre id="template-current">尚未讀取目前選擇；不以本機預覽代替後端權威。</pre>
 <button id="export-template" disabled>下載目前模板 JSON</button>
 <a id="template-download" hidden download="fa-agent-template.json"></a>
-<p><label for="template-file">選擇要比對的 FA 模板（JSON，最多 8192 bytes）</label>
+<p><label for="template-file">選擇要比對的 FA 模板（JSON，最多 16384 bytes）</label>
 <input id="template-file" type="file" accept=".json,application/json" disabled></p>
 <button id="inspect-template" disabled>唯讀比對此檔案</button>
 <details id="template-options-box"><summary>加入已批准 skills 或 capability</summary>
-<p class="reason">從目前模板出發，勾選 Team 已批准的 skill（最多 4 個）與目前可用的 capability，建立待選模板並唯讀比對。這裡只列出參照，不會選定；選定仍需你確認，並由後端再次核對。</p>
+<p class="reason">從目前模板出發，勾選 Team 已批准的 skill 與目前可用的 capability，建立待選模板並唯讀比對。這裡只列出參照，不會選定；選定仍需你確認，並由後端再次核對。</p>
 <button id="load-template-options" disabled>讀取可加入項目</button>
 <div id="template-options"></div>
 <button id="build-template" disabled>以勾選項目建立待選模板並比對</button>
@@ -1279,7 +1279,7 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     CANCELLATION_RECEIPT_INVALID:"原取消世代不符合支援範圍，未送出任何取消。",
     CANCELLATION_RECEIPT_UNAVAILABLE:"後端尚未提供原取消回條核對；原未確認紀錄保留，不會重送。",
     ANSWER_DOWNLOAD_INVALID:"未取得可核對的原答案文字；沒有產生下載檔，也不會重新生成或確認收件。",
-    TEMPLATE_INVALID:"請選擇有效且不超過 8192 bytes 的 FA 模板 JSON；沒有套用任何設定。",
+    TEMPLATE_INVALID:"請選擇有效且不超過 16384 bytes 的 FA 模板 JSON；沒有套用任何設定。",
     TEMPLATE_UNAVAILABLE:"目前部署尚未提供模板參照，或來源已變更；沒有套用設定，請重新讀取。",
     TEMPLATE_RESPONSE_INVALID:"模板回應未通過來源或格式核對；沒有安裝、啟用工具或取得權限。",
     TEMPLATE_READ_FAILED:"模板讀取或比對未完成；原設定與聊天不變，請手動重試。",
@@ -1291,6 +1291,7 @@ AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED:"勾選 skill 時也要勾選 fa-skills-v1
     AGENT_ROLE_PROMPT_MISSING:"這位助理的角色版本需要角色說明，但還沒有保存；沒有改用其他版本。",
     CAPABILITY_SOURCES_CHANGED:"選定的能力已不在目前的組織清單；請重新讀取設定。",
     CAPABILITY_SELECTION_LIMIT:"選的能力超過這個部署允許的項數；原設定沒有改變，請先關掉幾項。",
+    SKILL_SELECTION_LIMIT:"選的 skill 超過這個部署允許的個數；原設定沒有改變，請先取消幾個。",
     AGENT_TEMPLATE_PROFILE_UNSUPPORTED:"這位助理還沒有可查的提示版本設定；不以其他版本代替。",
     TEMPLATE_SELECTION_UNAVAILABLE:"目前部署尚未提供新對話選擇或原回條 reader；原紀錄保持，不改用其他入口或啟用 flags。",
     TEMPLATE_SELECTION_INVALID:"選擇請求的完整模板、原 ID 或格式不符；未送出。",
@@ -1750,14 +1751,15 @@ function renderTemplateOptions(ready){
       (previous?previous.state_profile:templateBase.settings.state_profile)==="foundry-responses-v1");
   const picked=checkedTemplateOptions(),note=document.createElement("p");note.className="reason";
   const composable=templateOptions.composable_profiles.includes(templateBase.role.profile);
-  note.textContent=picked.skills.length>4?"一個模板最多 4 個 skill。":
+  const most=templateOptions.max_skills??4;
+  note.textContent=picked.skills.length>most?`一個模板最多 ${most} 個 skill。`:
     picked.capabilities.length&&!composable?"目前模板的角色不能組合 capability；後端會拒絕選定。":
     templateOptions.more_skills?"已批准的 skill 超過列出上限；只顯示前面的項目。":"";
   box.append(note);
-  el("build-template").disabled=!ready||templateBusy||picked.skills.length>4;
+  el("build-template").disabled=!ready||templateBusy||picked.skills.length>most;
 }
 async function inspectTemplateText(raw,revision){
-  if(new TextEncoder().encode(raw).length>8192){templateError={code:"TEMPLATE_INVALID"};return}
+  if(new TextEncoder().encode(raw).length>16384){templateError={code:"TEMPLATE_INVALID"};return}
   const response=await agentFetch("/api/agent-template/inspect",{method:"POST",
     headers:{"Content-Type":"application/json","X-Console-CSRF":state.csrf},
     credentials:"same-origin",cache:"no-store",body:raw});
@@ -1955,7 +1957,6 @@ function templateSelectionConfirmed(value,command,expectedHash){
 const AGENT_SETTINGS_TABS=["installed","skills","mcp","plugins","routines"],TEAM_SETTINGS_TABS=["team-mcp","team-connectors","team-skills","rules"];
 const SETTINGS_TABS=[...AGENT_SETTINGS_TABS,...TEAM_SETTINGS_TABS];
 const SETTINGS_SKILL_READER="fa-skills-v1",SETTINGS_SKILL_RESOURCES="fa-skill-resources-v1";
-const SETTINGS_MAX_SKILLS=4;
 const SETTINGS_BUILTIN_NAMES={
   "fa-desktop-v1":"桌面與瀏覽器操作","fa-delegate-v1":"交辦子任務","fa-delegate-reader-v1":"讀取使用者檔案",
   "fa-agent-collaboration-v1":"和同 Team 助理傳話",[SETTINGS_SKILL_READER]:"讀取已批准的 skill",
@@ -2052,7 +2053,8 @@ function settingsBlock(item){
   const addsReader=needsReader&&!draft.capabilities.has(SETTINGS_SKILL_READER);
   if(addsReader&&!options.capabilities.some(entry=>entry.entry_id===SETTINGS_SKILL_READER))
     return "需要「讀取已批准的 skill」能力，但目前環境未提供。";
-  if(item.group==="skill"&&draft.skills.size>=SETTINGS_MAX_SKILLS)return `一位助理最多選 ${SETTINGS_MAX_SKILLS} 個 skill。`;
+  const skills=options.max_skills??4;
+  if(item.group==="skill"&&draft.skills.size>=skills)return `一位助理最多選 ${skills} 個 skill。`;
   const added=(item.group==="skill"?0:1)+(addsReader?1:0);
   const most=options.max_capabilities??12;
   if(added&&draft.capabilities.size+added>most)return `一位助理最多選 ${most} 項能力。`;
@@ -2149,7 +2151,7 @@ async function loadSettings(keepMessages=false){
 }
 async function inspectSettingsCandidate(candidate,revision,agent){
   const raw=JSON.stringify(candidate);
-  if(new TextEncoder().encode(raw).length>8192){settingsError={code:"TEMPLATE_INVALID"};return null}
+  if(new TextEncoder().encode(raw).length>16384){settingsError={code:"TEMPLATE_INVALID"};return null}
   try{
     const {response,value}=await settingsPost("/api/agent-template/inspect",raw,agent);
     if(!settingsLive(revision,agent))return null;
@@ -8928,7 +8930,7 @@ el("inspect-template").addEventListener("click",async()=>{
   templateBusy=true;templateAction="inspect";templateError=null;templateResult=null;
   templateCandidate=null;templateNote="";renderTemplate();
   try{
-    if(!file||file.size>8192){templateError={code:"TEMPLATE_INVALID"};return}
+    if(!file||file.size>16384){templateError={code:"TEMPLATE_INVALID"};return}
     const raw=await file.text();
     if(revision!==templateRevision||state.authentication!=="AVAILABLE")return;
     await inspectTemplateText(raw,revision);
@@ -9195,7 +9197,7 @@ el("refresh-models").addEventListener("click",async()=>{
 el("refresh-agents").addEventListener("click",refreshAgentDirectory);
 // Onboarding is a thin view of the local record; every continue reuses the original request ID and body.
 const ONBOARDING_ROLE_MAX=2048,ONBOARDING_ACTIVE=new Set(["admitted","creating","registered"]);
-const ONBOARDING_MAX_SKILLS=4,ONBOARDING_SKILLS_TOOL="fa-skills-v1";
+const ONBOARDING_SKILLS_TOOL="fa-skills-v1";
 // manifest: the newest confirmed link's manifest, which also lists every earlier link (restart with this one).
 const onboarding={busy:false,current:null,loaded:false,timer:null,error:null,options:null,optionsRead:false,inputs:[],
   optionsError:null,manifest:null};
@@ -9209,7 +9211,8 @@ function onboardingChoiceProblem(choice){
   if(!onboarding.options)return onboarding.optionsError?friendlyError(onboarding.optionsError):"正在讀取 Team 已批准的工具與 skill…";
   const most=onboarding.options.options.max_capabilities??12;
   if(choice.capabilities.length>most)return `工具最多 ${most} 項。`;
-  if(choice.skills.length>ONBOARDING_MAX_SKILLS)return `skill 最多 ${ONBOARDING_MAX_SKILLS} 個。`;
+  const skills=onboarding.options.options.max_skills??4;
+  if(choice.skills.length>skills)return `skill 最多 ${skills} 個。`;
   if(choice.skills.length&&!choice.capabilities.some(item=>item.entry_id===ONBOARDING_SKILLS_TOOL))
     return friendlyError({code:"AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED"});
   return "";

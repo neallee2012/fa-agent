@@ -1974,7 +1974,7 @@ source／callback／模型I/O的層級與原FAIL另見[評測](../../../docs/age
   - **MCP**：catalog 裡的 MCP 項目（例如 toolbox 的 WebIQ）。只能對這位助理開或關；新增或修改 MCP 要找部署線，金鑰不經過這個頁面。
   - **Plugins**：FA 內建能力（kind `fa-builtin`，對照 Copilot 的 Built-in）。只能開或關，不能在這裡新增或移除。
   - **已安裝**：目前新對話設定裡的項目，可以依 Skills／MCP／Plugins 篩選，也可以依名稱或工具搜尋（只在畫面上篩選，不呼叫 API）。
-  - 目前環境沒有提供的項目只能關閉。角色版本不能組合能力時，開啟會被擋下並說明原因。數量上限沿用伺服器的規定（skill 4 個；能力的項數讀 options 的 `max_capabilities`，沒有這個欄位時是 12，見 [src README](../README.md#capability-selection-max)），最後仍由伺服器判斷。
+  - 目前環境沒有提供的項目只能關閉。角色版本不能組合能力時，開啟會被擋下並說明原因。數量上限沿用伺服器的規定（skill 個數讀 options 的 `max_skills`，沒有這個欄位時是 4，見 [src README](../README.md#skill-selection-max)；能力的項數讀 options 的 `max_capabilities`，沒有這個欄位時是 12，見 [src README](../README.md#capability-selection-max)），最後仍由伺服器判斷。
   - 已安裝項目的版本或 digest 若和目前提供的不同，草稿會改用目前提供的參照（後端會拒絕過期的 digest），畫面顯示「套用後改用目前批准的版本」，確認視窗也會列出。已安裝、但目前環境已不提供的**能力**只要還開著，「套用」就會停用；MCP可用「關閉不可用的 MCP」一次調整未套用勾選，仍走原核對及確認。已安裝的 skill 不在此列：選項清單只列最新版本已生效的 skill，所以有新版本在等批准的 skill 不會出現在清單裡，但舊版本仍有效，照樣可以套用；最後仍由後端核對。
   - 設定頁關著時切換助理或登出，進行中的讀取或送出會作廢，回到設定頁時重新讀取，不會卡在「忙碌」。原送出紀錄仍留在 journal，可以核對。
 - **批准規則**：原本聊天頁上的 `#hitl-rules-panel` 整塊搬到這個分頁，ID、函式、API、revision 和 owner＋`Behavior.Approve` 都不變，「尚未讀取，不以空清單當成沒有規則」也照舊。聊天選單的「Team 批准規則／原操作紀錄」改成直接開到這個分頁。
@@ -3117,7 +3117,7 @@ API prefix也涵蓋既有`/behavior/v1/...`的狀態、操作預覽／決定、p
 `base_supports` 共用同一套判斷）認定該範本無法組合的能力。新版能組合目前所有內建能力，所以這份清單目前是空的；舊的 agent-role v1 才不能組合 `fa-skillify-v1`。
 這些能力不會帶進預設勾選，面板上顯示為停用並附原因，所以照預設按「建立」不會再收到 422 `CAPABILITY_BASE_UNSUPPORTED`。
 server 端照舊明確拒絕，不會默默過濾。
-能力依 `kind` 分成 MCP（`mcp-api`／`mcp-hosted`）與內建工具（`fa-builtin`）。前端先擋超過12項工具、超過4個 skill、勾了 skill 卻沒勾
+能力依 `kind` 分成 MCP（`mcp-api`／`mcp-hosted`）與內建工具（`fa-builtin`）。前端先擋超過 options 上限的工具（`max_capabilities`，預設 12）與 skill（`max_skills`，預設 4）、勾了 skill 卻沒勾
 `fa-skills-v1`；目錄讀不到時停用送出並顯示原因。送出時依 `entry_id`／名稱排序，原樣放進 command（`capabilities`、`skills`），
 bridge 只核欄位形狀，是否在目錄內、sha 是否相符一律以 server 為準（拒絕視為 S0 前決定，可換新編號）。若建立後 Team 目錄才變，
 server 回 `AGENT_ONBOARDING_SELECTION_STALE`（不是上面那些 S0 前拒絕碼），8765 不記成終局，保留原編號續做、也不讓另開新編號；bridge 保留 server 附的 `cause`，畫面依 `cause` 說明該怎麼排除（工具讀不到、skill 版本變了、
@@ -3426,7 +3426,7 @@ TC-12原baseline／四個C／12情境保持，新的final另請同context做整�
 下載失敗不產生成功外觀的空檔。
 
 選取JSON不會自動上傳；按「唯讀比對此檔案」才送
-`POST /api/agent-template/inspect`。輸入上限8192 bytes，沿原same-origin／CSRF及當前read權；
+`POST /api/agent-template/inspect`。輸入上限16384 bytes（`MAX_TEMPLATE_BYTES`），沿原same-origin／CSRF及當前read權；
 未知欄位、重複JSON keys或額外credentials在本機拒絕，不傳給後端。
 Bridge重用`AgentTemplate`／`TemplateInspection` DTO，核原輸入digest、技能集合及一致的比對結果，
 不複製另一份schema；optional設定由原DTO保存。
@@ -3445,7 +3445,7 @@ Bridge重用`AgentTemplate`／`TemplateInspection` DTO，核原輸入digest、�
   - Team 目前**有效**的已批准 skill，參照和選版時核對的完全相同；
   - 目前部署可用的 capability，例如 `fa-skills-v1`、`fa-desktop-v1`。
   - 回應固定為 `authorization=false`、`activated=false`；未批准的草稿不會列出。
-- 勾選 skill（最多 4 個）與 capability 後，按「以勾選項目建立待選模板並比對」：
+- 勾選 skill（個數上限讀 options 的 `max_skills`，預設 4）與 capability 後，按「以勾選項目建立待選模板並比對」：
   - 工作台以目前模板為底，替換 `skills` 與 `settings.capabilities`，再走原本的唯讀比對；
   - 選定仍需讀取目前選擇，並由你確認後才送出，後端會再核對角色、skill 版本與 capability。
   - 目前角色不能組合 capability 時，畫面會提示；後端也會拒絕。
@@ -3487,7 +3487,7 @@ Bridge重用`AgentTemplate`／`TemplateInspection` DTO，核原輸入digest、�
 舊API／reader的404明示`TEMPLATE_SELECTION_UNAVAILABLE`，不fallback或自動開flags。
 
 仍沿原vault、Host／Origin／cookie／CSRF與strict JSON邊界。只對上表的精確POST路徑開body例外；
-模板上限8192 bytes，完整選擇command上限8704 bytes，本機原ID核對body上限256 bytes。
+模板上限16384 bytes，完整選擇command上限16896 bytes，本機原ID核對body上限256 bytes。
 重用shared `AgentTemplate`及server的current/result/receipt DTO，沒有另一份模板schema。
 選擇前以既有SQLite FULL transaction保存完整canonical command、原request ID、原`expected_selection_id`
 （包括null）、模板SHA、body SHA及config SHA。相同expected ID＋模板SHA的意圖不能靠雙擊、

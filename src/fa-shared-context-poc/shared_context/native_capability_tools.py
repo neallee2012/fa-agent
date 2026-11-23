@@ -27,7 +27,8 @@ from .behavior_capabilities import (
 )
 from .behavior_capability_calls import CapabilityCatalogResult
 from .behavior_skill_catalog import (
-    DESCRIPTION_PREFIX, SkillCatalogPresentation, catalog_digest, catalog_input_limit,
+    DESCRIPTION_PREFIX, MAX_DESCRIPTION_BYTES, SkillCatalogPresentation, bounded_description, catalog_digest,
+    catalog_input_limit,
 )
 from .behavior_native_capability_wire import (
     NATIVE_CAPABILITY_PREFIX, NativeCapabilityCall, NativeSkillRead, NativeSkillResourceRead, NativeTurnScope,
@@ -312,6 +313,9 @@ def approved_skills_provider(*, transport=None) -> NativeCapabilityProvider:
                           "install, grant or substitute them. Approved resource data can still be read.\n")
         if view is None:
             description = SKILL_DESCRIPTION + (resources_note if resources else "") + catalog.model_dump_json()
+            if len(description.encode("utf-8")) > MAX_DESCRIPTION_BYTES:
+                # Many skills without a budget: the budgeted lane's byte-bounded view, every name kept (also the enum).
+                description = bounded_description(catalog) + ("\n" + resources_note if resources else "")
         else:
             # The fixed resources note is outside the #75 count, which covers the budgeted catalog view only.
             description = view.description + ("\n" + resources_note if resources else "")

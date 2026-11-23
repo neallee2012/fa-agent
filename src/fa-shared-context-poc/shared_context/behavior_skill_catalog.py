@@ -10,7 +10,7 @@ from pydantic import Field, model_validator
 from .behavior_model_capacity import ModelCapacitySnapshot
 from .behavior_wire import Digest, WireModel
 from .errors import Problem
-from .m3_skills import SkillCatalog
+from .m3_skills import MAX_SKILLS, SkillCatalog
 
 CatalogBudgetProfile = Literal["fa-skill-catalog-budget-v1"]
 CATALOG_BUDGET_ERRORS = frozenset({
@@ -23,6 +23,7 @@ DESCRIPTION_PREFIX = (
     "not the complete approved purpose. Read the current body before use.\n"
 )
 LOOKUP = "Use read_skill(name) for omitted authorized names; omission does not mean unavailable."
+MAX_DESCRIPTION_BYTES = 8192
 
 
 def catalog_digest(catalog: SkillCatalog) -> str:
@@ -44,16 +45,52 @@ def catalog_input_limit(capacity: ModelCapacitySnapshot) -> int:
     return selected
 
 
-def _counted_description(items, omitted, unavailable, count_tokens):
-    text = ("No approved skills are currently available." if not items and not omitted
+def _description(items, omitted, unavailable):
+    return ("No approved skills are currently available." if not items and not omitted
             else DESCRIPTION_PREFIX + json.dumps({
                 "entries": items, "omitted_count": omitted,
                 "unavailable_count": unavailable, "lookup": LOOKUP,
             }, ensure_ascii=False, separators=(",", ":")))
+
+
+def _counted_description(items, omitted, unavailable, count_tokens):
+    text = _description(items, omitted, unavailable)
     tokens = count_tokens(text.encode("utf-8"))
     if type(tokens) is not int or tokens <= 0:
         raise Problem(503, "SKILL_CATALOG_TOKEN_COUNT_UNKNOWN", "catalog token count is unavailable; no zero fallback")
     return text, tokens
+
+
+def _excerpts(entry, length):
+    display = dict(entry)
+    for field in ("title", "description"):
+        value = display.get(field)
+        if isinstance(value, str) and len(value) > length:
+            del display[field]
+            display[field + "_excerpt"] = value[:length]
+            display[field + "_omitted_characters"] = len(value) - length
+    return display
+
+
+def _views(entries):
+    """Every name, each view shorter than the last."""
+    yield entries, "full"
+    yield [_excerpts(entry, 96) for entry in entries], "shortened"
+    # Many skills: each name with its title, cut shorter as needed, before the bare names (64-character IDs).
+    for length in (96, 32, 12):
+        yield [_excerpts({"name": entry["name"], "title": entry["title"]}, length) for entry in entries], "shortened"
+    yield [{"name": entry["name"]} for entry in entries], "names"
+
+
+def bounded_description(catalog: SkillCatalog) -> str:
+    """Without a budget profile: the first view within MAX_DESCRIPTION_BYTES. None omits a name (32 bare names with
+    the guidance take about 3 KB)."""
+    entries = [entry.model_dump(mode="json") for entry in catalog.entries]
+    for items, _ in _views(entries):
+        text = _description(items, 0, catalog.unavailable_count)
+        if len(text.encode("utf-8")) <= MAX_DESCRIPTION_BYTES:
+            return text
+    raise ValueError("Skill names exceed the description byte bound")
 
 
 def validate_catalog_budget(
@@ -76,16 +113,16 @@ class SkillCatalogPresentation(WireModel):
     input_limit_tokens: Annotated[int, Field(ge=50)]
     budget_tokens: Annotated[int, Field(gt=0)]
     description_tokens: Annotated[int, Field(gt=0)]
-    description: Annotated[str, Field(min_length=1, max_length=8192)]
+    description: Annotated[str, Field(min_length=1, max_length=MAX_DESCRIPTION_BYTES)]
     stage: Literal["full", "shortened", "names", "omitted"]
-    omitted_count: Annotated[int, Field(ge=0, le=4)]
-    unavailable_count: Annotated[int, Field(ge=0, le=4)]
+    omitted_count: Annotated[int, Field(ge=0, le=MAX_SKILLS)]
+    unavailable_count: Annotated[int, Field(ge=0, le=MAX_SKILLS)]
 
     @model_validator(mode="after")
     def fits(self):
         if (self.budget_tokens != self.input_limit_tokens // 50
                 or self.description_tokens > self.budget_tokens
-                or len(self.description.encode("utf-8")) > 8192
+                or len(self.description.encode("utf-8")) > MAX_DESCRIPTION_BYTES
                 or (self.stage != "omitted" and self.omitted_count != 0)):
             raise ValueError("Skill description exceeds or differs from its declared two-percent budget")
         return self
@@ -102,7 +139,7 @@ def present_catalog(
     def candidate(items, stage):
         omitted = len(entries) - len(items)
         text, tokens = _counted_description(items, omitted, catalog.unavailable_count, count_tokens)
-        if tokens > budget:
+        if tokens > budget or len(text.encode("utf-8")) > MAX_DESCRIPTION_BYTES:
             return None
         return SkillCatalogPresentation(
             catalog_sha256=catalog_digest(catalog), capacity_sha256=capacity.source_sha256,
@@ -111,26 +148,11 @@ def present_catalog(
             unavailable_count=catalog.unavailable_count,
         )
 
-    result = candidate(entries, "full")
-    if result is not None:
-        return result
-    shortened = []
-    for entry in entries:
-        display = dict(entry)
-        for field in ("title", "description"):
-            value = display.get(field)
-            if isinstance(value, str) and len(value) > 96:
-                del display[field]
-                display[field + "_excerpt"] = value[:96]
-                display[field + "_omitted_characters"] = len(value) - 96
-        shortened.append(display)
-    result = candidate(shortened, "shortened")
-    if result is not None:
-        return result
+    for items, stage in _views(entries):
+        result = candidate(items, stage)
+        if result is not None:
+            return result
     names = [{"name": entry["name"]} for entry in entries]
-    result = candidate(names, "names")
-    if result is not None:
-        return result
     # Exact names mentioned by the user survive omission first; no semantic ranking is claimed.
     names.sort(key=lambda entry: (
         not bool(re.search(r"(?<![\w-])" + re.escape(entry["name"]) + r"(?![\w-])", user_text, flags=re.ASCII)),

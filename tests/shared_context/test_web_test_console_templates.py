@@ -429,7 +429,7 @@ def test_invalid_selection_commands_never_reach_backend_or_journal(template_cons
     if damage == "duplicate-key":
         raw = b'{"expected_selection_id":null,' + raw[1:]
     if damage == "oversized":
-        raw = raw.ljust(8705, b" ")
+        raw = raw.ljust(16897, b" ")
     if damage == "nonfinite":
         raw = raw.replace(b'"expected_selection_id": null', b'"expected_selection_id": NaN')
     journal = c.journal.read_bytes()
@@ -442,8 +442,8 @@ def test_invalid_selection_commands_never_reach_backend_or_journal(template_cons
 
 def test_selection_command_accepts_the_exact_local_byte_limit(template_console):
     c = template_console
-    raw = selection_command(c).model_dump_json().encode().ljust(8704, b" ")
-    assert len(raw) == 8704
+    raw = selection_command(c).model_dump_json().encode().ljust(16896, b" ")
+    assert len(raw) == 16896
     response = c.browser.ui.post("/api/agent-template/select", content=raw,
         headers={**c.browser.headers, "Content-Type": "application/json"})
     assert response.status_code == 200, response.text
@@ -629,7 +629,7 @@ def test_invalid_files_do_not_reach_the_backend(template_console, change, status
     if change == "duplicate_key":
         raw = b'{"authorization":false,' + raw[1:]
     if change == "oversized":
-        raw += b" " * 8192
+        raw += b" " * 16384
     before = c.journal.read_bytes()
     result = c.browser.ui.post("/api/agent-template/inspect", content=raw,
         headers={**c.browser.headers, "Content-Type": "application/json"})

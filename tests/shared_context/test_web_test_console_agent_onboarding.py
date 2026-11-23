@@ -341,7 +341,7 @@ def test_chosen_tools_and_skills_are_sent_as_is_and_reused_on_resume(real_interf
     {"capabilities": CHOICE["capabilities"]},
     {"skills": CHOICE["skills"]},
     {**CHOICE, "capabilities": [{"entry_id": "fa-skills-v1", "entry_sha256": "c" * 64, "kind": "fa-builtin"}]},
-    {**CHOICE, "skills": CHOICE["skills"] * 5},
+    {**CHOICE, "skills": CHOICE["skills"] * 33},
     {**CHOICE, "skills": [{**CHOICE["skills"][0], "path": "C:/skills"}]},
 ])
 def test_browser_choice_must_be_exact_references(real_interface, tmp_path, change):
@@ -477,7 +477,7 @@ def test_onboarding_body_limit_fits_a_full_choice(real_interface, tmp_path):
     with httpx.Client(transport=httpx.MockTransport(server)) as upstream:
         ui, headers = open_ui(c, upstream, links)
         with ui:
-            big = ui.post("/api/agents/onboarding", content=b" " * 16385,
+            big = ui.post("/api/agents/onboarding", content=b" " * (64 * 1024 + 1),
                           headers={**headers, "Content-Type": "application/json"})
             assert big.status_code == 413
     assert server.posts == []

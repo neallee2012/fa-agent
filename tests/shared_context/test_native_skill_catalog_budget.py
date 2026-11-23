@@ -106,11 +106,16 @@ def upstream_for(case):
 
 
 def stage_limits(case, refs):
-    """Declared input limits that make the real counter land on each #75 stage for this catalog."""
-    native, limits, prompt = gateway(case), {}, 200_000
-    for stage in ("full", "shortened", "names", "omitted"):
-        scope = budget_started(case, refs, prompt_tokens=prompt, rid=f"probe-{stage}")
-        view = native.skill_catalog_presentation(case.principal, scope)
+    """Declared input limits that make the real counter land on each #75 stage for this catalog (``shortened`` has
+    several steps: every field excerpted, then each ID with its title cut shorter)."""
+    native, limits, prompt, order = gateway(case), {}, 200_000, ("full", "shortened", "names", "omitted")
+    for stage in order:
+        while True:
+            scope = budget_started(case, refs, prompt_tokens=prompt, rid=f"probe-{stage}")
+            view = native.skill_catalog_presentation(case.principal, scope)
+            if order.index(view.stage) >= order.index(stage):
+                break
+            prompt = (view.description_tokens - 1) * 50
         assert view.stage == stage, (stage, view.stage, prompt)
         limits[stage] = prompt
         prompt = (view.description_tokens - 1) * 50

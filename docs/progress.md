@@ -4,6 +4,16 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="stage-v56-1122"></a>
+## 2026-11-22：stage 第 56 版（Team skill 與每日排程可刪除）
+
+- **第 56 版**（#1310，`2026.11.22-56`，Neal 台灣時間 11-22 21:22 合併，merge `7ed2cbb1`）：Neal 2026-11-22 要求可以刪除；「刪除」的定義由總協調決定：看不到、不能用、不執行，資料與批准紀錄保留，不實體清除。
+  - **內容**：#1307 助理起草的 skill 在清單與助理設定顯示用途（purpose），不再是固定英文標題（系統從未存過這類 skill 的名字）。#1308 Team skill 可以刪除（紀錄保留，生效中的先停用再刪；已選用它的助理到 ⚙ → Skills 按套用即可恢復）。#1309 每日排程可以刪除（紀錄保留，啟用中的先停用再刪；刪除後不執行）。#1311 修 release PR 第一次 CI（compile-contracts）：排程刪除的工作台 bridge 路徑改成 `/api/routines/{routine_id}/deletions/{version_id}`，避開「不得刪 Agent 版本」的防護樣式。
+  - **不能退版**：第一次刪除後 API 不能退回這版之前（舊版讀到 `deletion`／`deleted_at` 會拒絕）。dev 已有一筆已刪除的測試 skill，dev 已不能退回 r4910。
+  - **部署**：deploy-staging run 45027190001 成功（21:22:58～21:37:39），guard 讀到 `serving 6d059c847942; core changed: True; Hosted-only changed: 0`；API、Hosted、console、feed 都換新；sync、follow 成功（follow 用 verify-follow，Agent 在下一個回合結束後才換版）。image 前 12 碼：API `31502c6a1b04`、Hosted `bc0a641c7d37`、console `418960a4735d`。public-sync run 45028474710 成功（21:37:42～21:40:44），`gate 2: PASS`，公開樹 `3ab2eb1244c6`。
+  - **dev 測試**（run 4911，部署 `70129054`）：skill 刪除實測通過；排程分頁正常，但 dev 沒有排程可刪；一般回合正常；#1307 的名稱顯示 dev 沒有 skill 可看。
+  - **沒有驗證／待辦**：stage 上沒實際操作過刪除與名稱顯示，也沒有回合在 v56 上跑過。生效中 skill 的「先停用再刪」與實際刪除排程，只有本機測試（需要人按批准）。新增助理流程未完成時刪掉它勾選的 skill，該助理會卡住（停用時就有，刪除後不可挽回），待另修。助理自己讀到的 skill catalog 標題仍是固定英文；要有真正名字需讓 Hosted 草稿工具多一個可省略的 name 欄位，未做。刪除 skill 後「新增 skill」表單下方的「已保存草稿…」提示沒清掉（小畫面問題）。已在等批准的那次排程執行，刪除後會從提醒清單消失（仍可在對話裡批准）。
+
 <a id="stage-v55-1122"></a>
 ## 2026-11-22：stage 第 55 版（工作台貼上長文字自動轉附件）
 

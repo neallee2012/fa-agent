@@ -136,7 +136,7 @@ def test_catalog_byte_limit_is_an_explicit_error_not_truncation(assistant_api):
 @pytest.mark.parametrize("selected,profile", [
     (("receipt-guide",), None), (("receipt-guide",), "fa-instruction-v1"),
     (("receipt-guide", "receipt-guide"), "fa-instruction-skills-v1"),
-    (("one", "two", "three", "four", "five"), "fa-instruction-skills-v1"),
+    (tuple(f"skill-{i:02d}" for i in range(33)), "fa-instruction-skills-v1"),
     (("../private",), "fa-instruction-skills-v1"),
 ])
 def test_server_configuration_rejects_ambiguous_unbounded_or_disabled_selectors(assistant_api, selected, profile):

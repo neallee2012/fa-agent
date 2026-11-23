@@ -5,7 +5,7 @@ from pydantic import AwareDatetime, Field
 
 from typing import Literal
 
-from .behavior_agent_template import AgentTemplate, TemplateRole, TemplateSkill
+from .behavior_agent_template import AgentTemplate, TemplateRole, TemplateSkill, check_selectable_skills
 from .behavior_assistant import AssistantProfile
 from .behavior_operations import _Model, _parse, control_key
 from .behavior_runtime import material
@@ -223,6 +223,7 @@ def select_profile(control, authority, principal, command, *, reconcile=False):
     profile = profile_from_template(policy, command.template)
     from .behavior_capabilities import check_selectable, runtime_grants
     check_selectable(profile.capabilities, profile.prompt_profile, runtime_grants(control.runtime))
+    check_selectable_skills(command.template)
     if profile.skill_catalog_budget_profile is not None:
         from .behavior_skill_catalog import validate_catalog_budget
         validate_catalog_budget(control.models.select(None).capacity_snapshot(),

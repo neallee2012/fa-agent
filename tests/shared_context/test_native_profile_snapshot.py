@@ -29,8 +29,8 @@ Coordinator decision 2026-10-17 (ADR-0009 §3, M7), two rules:
   release 31 image rejects what it does not know: it also fails on an enum / Literal value, a request variant or a
   model added since the baseline. What passes: a new optional field a dump leaves out by default, and anything listed
   in ``V2_ADDED_VALUES_OLD_IMAGES_NEVER_RECEIVE`` and 3d-i's v3 values where no v2 image receives them
-  (``_v3_value_old_images_never_receive``), and the capability bound raised under its deploy rule
-  (``CAPABILITY_BOUND_RAISED``). A change that passes needs no new profile: regenerate the
+  (``_v3_value_old_images_never_receive``), and the capability and skill bounds raised under their deploy rules
+  (``CAPABILITY_BOUND_RAISED``, ``SKILL_BOUND_RAISED``). A change that passes needs no new profile: regenerate the
   profile snapshot (above) and review the diff. ``FA_REGENERATE_PROFILE_SNAPSHOT`` does not touch the baseline; it is
   written only by ``python -c "import test_native_profile_snapshot as t; c='<commit>'; t.SNAPSHOT.with_name(
   f'native_v2_wire_{c}.json').write_text(t.v2_baseline_text(c), encoding='utf-8', newline='\\n')"`` (same
@@ -534,7 +534,7 @@ def _unlisted(problems):
 # than 12, and an API sends one only after a human selected more than FA_CAPABILITY_SELECTION_MAX's default 12. The
 # deploy check (ci_deploy switch_preconditions, missing_capability_bound) refuses that setting above 12 until the serving
 # API has this bound; what that check does not cover: src README#capability-selection-max.
-CAPABILITY_BOUND_RAISED = frozenset(change.format(where) for where in (
+CAPTURES = (
     "NATIVE_REQUEST[agent_receive]<NativeAgentReceive>.capture<NativeTurnCapture>",
     "NATIVE_REQUEST[continue]<NativeContinuationSubmit>.capture<NativeTurnCapture>",
     "NATIVE_REQUEST[routine_receive]<NativeRoutineSubmit>.capture<NativeTurnCapture>",
@@ -552,14 +552,32 @@ CAPABILITY_BOUND_RAISED = frozenset(change.format(where) for where in (
     "native_group_wire.NativeGroupStarted.receipt<NativeReceipt>.capture<NativeTurnCapture>",
     "native_turns._Meta.capture<NativeTurnCapture>",
     "native_turns._Rid.receipt<NativeReceipt>.capture<NativeTurnCapture>",
-) for change in ("{}.capabilities<CapabilityCapture>.grants: maxItems 12 -> 128",
-                 '{}.capabilities: new union variant {{"$ref": "#/$defs/CapabilityCapture"}} H0 cannot read'))
+)
+CAPABILITY_BOUND_RAISED = frozenset(change.format(where) for where in CAPTURES for change in (
+    "{}.capabilities<CapabilityCapture>.grants: maxItems 12 -> 128",
+    '{}.capabilities: new union variant {{"$ref": "#/$defs/CapabilityCapture"}} H0 cannot read'))
+# The skill wire bound 4 -> 32 (m3_skills.MAX_SKILLS), under the same rule for FA_SKILL_SELECTION_MAX above its default 4
+# (ci_deploy missing_skill_bound; src README#skill-selection-max).
+SKILL_BOUND_RAISED = frozenset(
+    [f"{where}.template<AgentTemplate>.{field}: maxItems 4 -> 32"
+     for where in CAPTURES for field in ("skills", "unavailable_skills")]
+    + [change.format(where) for where in (
+        "behavior_native_turn_wire.NativeReceipt.assembly",
+        "behavior_native_turn_wire.NativeTurnStatus.receipt<NativeReceipt>.assembly",
+        "native_group_wire.NativeGroupActivity.turns.items<NativeReceipt>.assembly",
+        "native_group_wire.NativeGroupStarted.receipt<NativeReceipt>.assembly",
+        "native_turns._Rid.receipt<NativeReceipt>.assembly",
+        "native_turns._Turn.assembly",
+    ) for change in ("{}<NativeAssembly>.skills: maxItems 4 -> 32",
+                     '{}: new union variant {{"$ref": "#/$defs/NativeAssembly"}} H0 cannot read')]
+    + ["native_assembly.NativeAssembly.skills: maxItems 4 -> 32"])
 
 
 def v2_drift():
     """Every way the code imported now is not additive over the v2 baseline (2026-10-17 rule): H0's comparator, but no
     enum / Literal value, request variant or model may be added either; a new optional field left out by default may."""
-    return [problem for problem in _unlisted(_drift(_v2_baseline())) if problem not in CAPABILITY_BOUND_RAISED]
+    return [problem for problem in _unlisted(_drift(_v2_baseline()))
+            if problem not in CAPABILITY_BOUND_RAISED | SKILL_BOUND_RAISED]
 
 
 def _drift(baseline):
@@ -750,9 +768,9 @@ def test_a_listed_value_inside_an_optional_model_is_not_a_new_union_variant(monk
                for problem in set(unlisted) - listed)
 
 
-def test_every_capability_bound_entry_still_names_a_drift_it_allows():
+def test_every_bound_entry_still_names_a_drift_it_allows():
     # a stale or mistyped entry allows nothing and would stay unnoticed
-    assert CAPABILITY_BOUND_RAISED <= set(_unlisted(_drift(_v2_baseline())))
+    assert CAPABILITY_BOUND_RAISED | SKILL_BOUND_RAISED <= set(_unlisted(_drift(_v2_baseline())))
 
 def test_a_new_v2_request_variant_or_model_fails(monkeypatch):
     # an operation a release 31 image does not know is refused (union_tag_invalid): reserve it before release 31

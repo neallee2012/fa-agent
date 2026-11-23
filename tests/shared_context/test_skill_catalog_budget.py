@@ -111,3 +111,23 @@ def test_empty_authorized_catalog_is_distinct_from_omitted_entries():
     result = present_catalog(empty, capacity(100), "", len)
     assert result.stage == "full" and result.omitted_count == 0 and result.unavailable_count == 2
     assert result.description_tokens > 0
+
+
+def test_many_skills_keep_each_name_with_its_title_and_degrade_at_the_byte_bound():
+    """32 skills overflow the 8192-byte description long before a large token budget: the view degrades instead of
+    failing, and each ID keeps its (shortened) title before only the bare 64-character IDs would be left."""
+    entries = tuple(PurposeSkillEntry(
+        name=hashlib.sha256(str(index).encode()).hexdigest(), title=f"每週業務報告整理與摘要第{index}份" * 6,
+        description="協助整理每週業務報告並產生摘要。" * 10, metadata_sha256="c" * 64, version_id=f"{index:032x}",
+        sha256="d" * 64, byte_length=100, team="team-one", native_submit_sha256="e" * 64,
+    ) for index in range(32))
+    original = PurposeSkillCatalog(schema_version="fa-approved-skill-catalog-v2",
+                                   entries=tuple(sorted(entries, key=lambda entry: entry.name)))
+    result = present_catalog(original, capacity(100000), "", len)
+    assert result.stage == "shortened" and result.omitted_count == 0
+    assert len(result.description.encode("utf-8")) <= 8192 < len(original.model_dump_json().encode("utf-8"))
+    packet = json.loads(result.description.split("\n", 1)[1])
+    assert [entry["name"] for entry in packet["entries"]] == [entry.name for entry in original.entries]
+    assert all(set(entry) == {"name", "title_excerpt", "title_omitted_characters"} for entry in packet["entries"])
+    assert all(shown["title_excerpt"] == entry.title[:len(shown["title_excerpt"])]
+               for shown, entry in zip(packet["entries"], original.entries))

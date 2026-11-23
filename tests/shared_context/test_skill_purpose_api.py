@@ -74,8 +74,8 @@ def test_new_prompt_record_rejects_unknown_version_or_forged_capabilities(field,
         SkillPurposePromptAssemblyRecord.model_validate_json(json.dumps(record))
 
 
-def test_new_catalog_preserves_four_entries_and_4096_byte_fail_closed_bound(
-    assistant_api, signing_key, jwk_client,
+def test_new_catalog_preserves_its_entries_and_fails_closed_at_its_byte_bound(
+    assistant_api, signing_key, jwk_client, monkeypatch,
 ):
     h = assistant_api
     names = ("receipt-guide", "guide-two", "guide-three", "guide-four")
@@ -90,10 +90,25 @@ def test_new_catalog_preserves_four_entries_and_4096_byte_fail_closed_bound(
     assert denied.value.status == 413
     assert denied.value.body["error"]["code"] == "SKILL_CATALOG_LIMIT"
     assert "receipt-guide" not in json.dumps(denied.value.body)
+    monkeypatch.setenv("FA_SKILL_SELECTION_MAX", "32")  # raised: the 96 KiB bound applies
+    assert len(h.assistant.skills.catalog(A, A.team, names, schema_version="fa-approved-skill-catalog-v2").entries) == 4
     profile = {**next(iter(h.runtime.profiles.values())).model_dump(), "prompt_profile": PROFILE}
-    AssistantProfile.model_validate({**profile, "skill_artifacts": names})
+    many = tuple(f"skill-{i:02d}" for i in range(33))
+    AssistantProfile.model_validate({**profile, "skill_artifacts": many[:32]})
     with pytest.raises(ValueError):
-        AssistantProfile.model_validate({**profile, "skill_artifacts": (*names, "fifth")})
+        AssistantProfile.model_validate({**profile, "skill_artifacts": many})
+
+
+def test_thirty_two_entries_at_their_field_bounds_fit_the_catalog_and_thirty_three_do_not():
+    from shared_context.m3_skills import MAX_SKILLS, PurposeSkillCatalog, PurposeSkillEntry
+    entries = tuple(PurposeSkillEntry(
+        name=f"skill-{i:02d}-" + "n" * 55, title="\U0001f4d8" * 256, version_id=f"{i:032x}", sha256="a" * 64,
+        byte_length=8192, team="t" * 64, native_submit_sha256="b" * 64, description='"' * 512,
+        metadata_sha256="c" * 64) for i in range(MAX_SKILLS + 1))
+    catalog = PurposeSkillCatalog(schema_version="fa-approved-skill-catalog-v2", entries=entries[:MAX_SKILLS])
+    assert len(catalog.model_dump_json().encode()) > 80 * 1024  # the worst case the 96 KiB bound is sized for
+    with pytest.raises(ValueError):
+        PurposeSkillCatalog(schema_version="fa-approved-skill-catalog-v2", entries=entries)
 
 
 def test_new_skill_description_does_not_change_the_8192_byte_body_boundary(assistant_api, signing_key, jwk_client):

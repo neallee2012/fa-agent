@@ -372,7 +372,7 @@ Deny 有 tool start／failed complete，不能寫成「沒有工具事件」。�
 | 接點 | 實作與限制 |
 |---|---|
 | Server profile | `fa-instruction-skills-v1` 與 `skill_artifacts` 只由受信設定選定，沿原 profile／configuration digest、WorkRegistration、immutable task；default OFF，舊缺省 bytes 保持 |
-| Catalog | 使用現有同 OID 的 server-bound `Actor`，核 Team、kind=skill、configured human 的有效批准及 immutable version；最多4個選定來源，4096 UTF-8 bytes，只回 metadata |
+| Catalog | 使用現有同 OID 的 server-bound `Actor`，核 Team、kind=skill、configured human 的有效批准及 immutable version；最多4個選定來源，4096 UTF-8 bytes（2026-11-23 起 32 個／96 KiB，見 src README#skill-selection-max），只回 metadata |
 | Body read | `read_skill` 只收當輪 catalog 名稱，不能指定 path／URL／row／身份；使用原 ArtifactService，讀取前後核目前批准、version/hash/source、8192-byte 正文與完整 receipt |
 | Model egress | `model_sources` 在 reserve／consume／provider 發送前重核當輪 catalog；不以 prompt、client manifest 或 fail-open hook 授權 |
 | History | 保存原 `_Session`／`TurnArchive.skill_catalog` 與 material；舊目錄變動目前會拒絕 cold restore／新回合，不改寫舊回條 |
@@ -491,7 +491,7 @@ SK-01仍partial；沒有宣稱Agent-private ACL、SK-02模型相關性、token�
 | Human approval | 原version/body SHA之外再pin metadata SHA；只改用途也需新版與新批准，olddecision／ack不能換字，unknown沿原reconcile不重送 |
 | Runtime | Server-only `fa-instruction-skill-purpose-v1`選v2catalog/read；初始只metadata，正文經原custom read_skill；current Actor/Team/approval與read前後/restore/egress gate不變 |
 | Legacy | v1 description仍null、舊None不多bytes；v2的legacy版本用途明確null，不推測內容 |
-| 容量 | 仍4entries／4096B catalog／8192B body，tokens unknown，非2%預算或降級策略 |
+| 容量 | 仍4entries／4096B catalog（2026-11-23 起 32／96 KiB）／8192B body，tokens unknown，非2%預算或降級策略 |
 
 新literal prefix為3002B、SHA256 `65abc3b54e0cf9be7109f379c547a0a4cf66b18642b764a8f847a5d26bf67879`。
 用途及目錄放在工具description，不進穩定prefix；描述是選用資料，不是操作批准或已載入正文的證據。

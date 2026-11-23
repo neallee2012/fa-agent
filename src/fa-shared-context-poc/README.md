@@ -3270,7 +3270,7 @@ Invocations／Responses 共用 `NativeSdkExecutor`、collector 及原保存路�
 `NativeUsageReporter`、`AgentTurnUsageRecord` 與原 CostLedger 都不變，不把 SDK 事件再算一次費用。
 
 只有必要資訊失收才將摘要標 `partial`；`recorded` 表示本次 observer 收尾，不等於已知道所有來源或 tokens。
-摘要最多 24 KiB、128 個工具、16 個事件，省略保留原因／數量；原 State store item 空間不足時改存
+摘要最多 24 KiB（超過 4 個 skill 時每個再加 640 bytes，見 [skill 上限](#skill-selection-max)）、128 個工具、16 個事件，省略保留原因／數量；原 State store item 空間不足時改存
 `partial/item_bound`。若連最小標記都放不下，省略 optional 欄並記固定 `FA_NATIVE_ASSEMBLY_DROPPED`
 警告，reader 解讀為 unknown／`not_recorded`，不犧牲原答覆或必要輸入容量。
 真正結果／checkpoint／CAS 失敗仍沿原錯誤與 unknown；不因新 metadata 重跑 SDK、查記憶或放寬 codec。
@@ -9871,7 +9871,7 @@ ce1c的92／37未重跑或重標；原9ce的Std P2與其後修補沿革保持。
 |---|---|
 | `GET /work-policy/v1/agent-template` | 下載`fa-agent-template.json`；`Cache-Control: no-store`及`x-content-sha256`綁回傳bytes，GET不可帶body或query |
 | `POST /work-policy/v1/agent-template/inspect` | 以匯出的JSON作body，僅核本目的環境的current role/settings／已配置skill refs，不寫設定、不啟SDK、不套用模板 |
-| `GET /work-policy/v1/agent-template/options` | 唯讀列出可加入模板的項目：Team 目前有效的已批准 skill（v2 catalog 參照，最多 24 個，超過時 `more_skills=true`；`skill_titles` 附上各 skill 的標題，只供畫面顯示，參照與選定仍用 skill 名稱），以及目前可用的 capability 參照與可組合的 base profile。不選定、不授權，GET 不可帶 body 或 query |
+| `GET /work-policy/v1/agent-template/options` | 唯讀列出可加入模板的項目：Team 目前有效的已批准 skill（v2 catalog 參照，列出前 16 頁 skill review 裡的全部，超過時 `more_skills=true`；`skill_titles` 附上各 skill 的標題，只供畫面顯示，參照與選定仍用 skill 名稱），以及目前可用的 capability 參照與可組合的 base profile。不選定、不授權，GET 不可帶 body 或 query |
 
 `fa-agent-template-v1`只含版本化instruction角色的profile／prefix hash／capability catalog version、
 固定SDK/runtime/mode要求、checkpoint／start-gate／capacity profile參照，以及目前已批准skill的
@@ -10985,6 +10985,24 @@ Neal 在 stage 替 fa-stage-a 勾第 13 項能力（Team MCP `team-XNews`）時�
 **換版順序**：128 是 Hosted 也會驗的 wire（`CapabilityCapture.grants`、`AgentTemplate` 的 `validate_refs`）。這版之前的 image 碰到超過 12 項的資料，有兩種結果。收到這種回合請求時回 422 `NATIVE_REQUEST_INVALID`（`native_turns.py` 解析 `NATIVE_REQUEST` 失敗），不帶 `not_dispatched`，不會觸發換版後同 RID 重送。讀到已經存下的這種狀態（回條、對話 meta）時，`native_turns._decode` 回 409 `NATIVE_STATE_INVALID`，那段對話會一直卡住，直到這個 Agent 換回這版以後的 image。所以 `deploy/stage/ci_deploy.py` 把規則寫成程式檢查：`FA_CAPABILITY_SELECTION_MAX` 大於 12 時，`switch_preconditions`（guard、sync、api 都會跑，dev 照 `deploy/README.md` 也跑這三步）讀服務中 API 的 commit，它的 `behavior_capabilities.MAX_CAPABILITIES` 不是 128、或讀不到 serving commit，就拒絕部署（`missing_capability_bound`）。完整部署會在 API 步驟之前用 sync 把每個 Agent 的定義換成同一版 image，所以照完整流程時，調高設定一定比換 image 晚一次部署。12 以下不讀 serving commit。這道檢查只看 API 的 commit，擋不住四種情況：只換 API 的部署（沒有跑 sync，Agent 還在舊 image）；sync 帶 `--defer-follow`，還停在舊版本、等閒置才換版的 session；閒置換版沒有換成或換了又退回的 Agent：換版前的健康檢查連續失敗、新版本被否決，Agent 留在舊版本（`HEALTH_VETO_COUNT`，log `NATIVE_UPGRADE_HEALTH_VETO`），或換版後 crash-loop、退回舊版本（`CRASH_LOOP_COUNT`，log `NATIVE_CRASH_LOOP`），兩者都在 `behavior_native_sessions.py`；平台醒來時把 session 帶回舊版本（ADR-0009 的漂移紀錄）。調高設定前，先確認每個 Agent 都在這版以後的 image 上。`test_native_profile_snapshot.py` 的 `CAPABILITY_BOUND_RAISED` 依這道檢查放行 v2 wire 的這個變化。dev 在 11-21 部署這版之後、stage 在第 53 版 release 部署且所有 Agent 換到新 image 之後設定（11-21 先設 32，同日 Neal 決定兩邊都調到上限 128）；azd 預設不設。設 128 等於選版時只受 wire 上限限制：能力多、工具合計超過模型上限時，錯誤在回合時才由模型回來（見上方「工具總數沒有另外擋」）。
 
 **退版**：已存了超過 12 項的模板或 selection，退回這版之前的 API 或 Hosted 會讀不回來。
+
+<a id="skill-selection-max"></a>
+#### skill 上限可以設定（2026-11-23，第一階段）
+
+Neal 決定一位助理最多選 32 個 skill，分兩次 release。這一版讓 API、Hosted、bridge 與工作台都讀得懂 32 個，但能存幾個由設定控制，預設仍是 4，所以部署後的行為和之前一樣。第二次 release 只改部署設定。
+
+- **能選幾個**：API 的 `FA_SKILL_SELECTION_MAX`，1 到 32 的整數，未設定是 4。值不合法時 API 不啟動（`load_runtime_capabilities`），`deploy/stage/ci_deploy.py` 的 `api_skill_limit` 在部署前用同一個規則擋。只在選版的入口檢查（`check_selectable_skills`：助理設定的 select 與新增助理），超過回 422 `SKILL_SELECTION_LIMIT`（帶 `limit`）。`agent-template/options` 多一個 `max_skills`，值是 4 時不送（理由同 `max_capabilities`），工作台讀不到時當成 4。
+- **存檔與傳給 Hosted 的上限**：`m3_skills.MAX_SKILLS` 由 4 改成 32，固定不隨設定變。selection、模板、catalog、capture、assembly 與 turn context 只用這個數字驗證。每個 skill 的附檔、tool requirement、回合附檔等其他 4 都沒有動。
+- **byte 上限**：
+  - 完整 catalog 由 4096 改成 96 KiB：32 個 entry 都在欄位上限（256 個 emoji 的標題、JSON 跳脫後 1024 bytes 的 512-byte 用途）實測 83 KB。設定還是 4 時，API 建 catalog 仍守 4096（`LEGACY_SKILL_CATALOG_BYTES`，舊 image 只讀到這麼大），超過照舊回 413 `SKILL_CATALOG_LIMIT`。
+  - 模板 `MAX_TEMPLATE_BYTES` 由 8192 改成 16 KiB：32 個 skill 參照約 9 KB，再加上能力參照。Table 一列 48 KiB、模板在選版紀錄裡存兩份（16 KiB 的模板那一列實測 40921 bytes），所以不再放大。32 個 skill 加上 stage 目前全部 12 項能力是 11.4 KB；32 個 skill 時最多放得下 50 個 32 字元 ID 的能力，128 項能力本身就約 17 KB，放不下（既有限制）。設定還是 4 時，新的選版仍守 8192（`LEGACY_TEMPLATE_BYTES`，舊 image 只讀到這麼大），超過回 422 `PROFILE_SELECTION_UNSUPPORTED`。
+  - 工作台新增助理的 body 由 16384 改成 64 KiB（128 個能力與 32 個 skill 參照約 32 KB）；`agent-template/options` 的回應上限由 128 KiB 改成 512 KiB。
+- **options 列出全部**：不再只列前 24 個已生效 skill，而是列出前 16 頁 skill review 裡的全部（最多 384 個），超過 16 頁才 `more_skills=true`。舊 bridge 的 `TemplateOptions` 最多讀 24 個：Team 超過 24 個已生效 skill 而 API 先換版時，舊 bridge 回 502 `TEMPLATE_RESPONSE_INVALID`，直到工作台也換版。
+- **給模型的目錄**：`present_catalog` 的描述超過 8192 bytes 時改成降級，不再丟 `ValidationError`。在只剩 64 碼 ID 的 `names` 之前，多一段「ID＋標題」，標題依序截到 96、32、12 個字。這一段仍標 `shortened`：不新增 stage 值，舊 image 讀得懂，Hosted 也只從描述取 `name`。
+- **沒有預算 profile 的 `read_skill` 說明**：原本是固定說明加上完整 catalog JSON。32 個填滿的 skill 會到 54 KB（典型 34.5 KB、約 1.3 萬 tokens），每次模型請求都帶。超過 8192 bytes 時改用上一段同一組降級（`bounded_description`），只是不進入省略：每個名字都留著，`enum` 也照舊列全部。設定是 4 時最大 4938 bytes，說明不變。
+- **回合紀錄（assembly）**：32 個填滿的 skill 紀錄約 16.5 KB，加上各段紀錄就超過 24 KiB，整份會退成空的 `summary_bound`。現在超過 4 個的每個 skill 再加 640 bytes（填滿的 `AssemblySkill` 是 557 bytes），32 個時上限 42496 bytes；4 個以內與之前相同。存放仍受 State store 單項 1 MB 與 `_fit_assembly` 保護。
+- **換版順序**：同上方能力上限。`FA_SKILL_SELECTION_MAX` 大於 4 時，`switch_preconditions` 讀服務中 API commit 的 `m3_skills.MAX_SKILLS`，不是 32 或讀不到 serving commit 就拒絕部署（`missing_skill_bound`）；這道檢查擋不住的情況與能力上限相同。`test_native_profile_snapshot.py` 的 `SKILL_BOUND_RAISED` 依這道檢查放行 v2 wire 的這個變化。第二階段在 `deploy/stage/stage.json` 與 `deploy/dev/dev.json` 的 `api_environment` 加 `"FA_SKILL_SELECTION_MAX": "32"`。
+- **退版**：存了超過 4 個 skill 的模板或 selection，退回這版之前的 API 或 Hosted 會讀不回來。
 
 ### 能力的組裝、閘道與 Hosted session 需求（LOCAL，P3a）
 
@@ -13019,7 +13037,7 @@ M3 作者寫入可選用途不是自動啟用 agent 功能，也不是給模型�
   effective 且 configured human 已批准的 skill 會列入；unavailable 項目不洩漏名稱或描述。
 - 新 `fa-approved-skill-read-v2` 要求 explicit schema，沿同一 `read_skill(name)` 取正文，
   核 catalog／version／body hash／metadata／當前批准後才回傳。初始 catalog 不讀 Blob 本文。
-- 仍最多 **4 entries／4096 UTF-8 bytes 完整 catalog**；整份放不下回
+- 仍最多 **4 entries／4096 UTF-8 bytes 完整 catalog**（2026-11-23 起 32 個／96 KiB，見 [skill 上限](#skill-selection-max)）；整份放不下回
   `SKILL_CATALOG_LIMIT`，不略掉或縮短描述。這不是 token 比例、2% 預算或相關度 ranking。
 - 舊 `fa-approved-skill-catalog-v1`／read shape 仍只回 `description=null`；
   舊 `skill_purpose=None`／`metadata_sha256=None` 不增加 M3 序列化 bytes。
@@ -13756,7 +13774,7 @@ raw SDK state、provider wire、private system/reasoning、journal DB 或 creden
 }
 ```
 
-`skill_artifacts` 最多四個、不重複的 M3 artifact ID；缺省為空且不新增舊序列化欄位。
+`skill_artifacts` 最多四個（2026-11-23 起 32 個）、不重複的 M3 artifact ID；缺省為空且不新增舊序列化欄位。
 非空 selector 必須搭配新 profile，並進入原 server configuration／standing policy／
 registration digest。既有安裝與目前配置不符時仍拒絕，不因修改 JSON 就取得啟用權。
 `InstructionSubmit`、使用者文字、model request 或工具參數不能挑 profile、Team、Actor、
@@ -13799,7 +13817,7 @@ catalog/read 不寫新的 approval、操作權或正文 cache；metadata 只沿�
 新固定 prefix 為 **2572 UTF-8 bytes**，SHA-256
 `14a9d2a605706db98e0e8cea877beec5ef9a86646dd21bc544049e0dabf4ab3e`。
 初始 model request 只有 prefix、目錄、工具 schema 與原使用者訊息，不預載 skill 正文。
-目錄完整 JSON 上限 **4096 UTF-8 bytes**；超限回 `SKILL_CATALOG_LIMIT`，不靜默截短條目或必要規則。
+目錄完整 JSON 上限 **4096 UTF-8 bytes**（2026-11-23 起 96 KiB）；超限回 `SKILL_CATALOG_LIMIT`，不靜默截短條目或必要規則。
 prefix／catalog tokens 均未知，不填零，也不把 byte bound 當 2% model-token 預算。
 安全的 `fa-skill-prompt-assembly-v1` metadata 是 server 重算的配置紀錄，
 不是 model/runtime attestation；公開 conversation metadata 不含目錄正文、完整 prefix、憑證或 private reasoning。

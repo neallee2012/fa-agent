@@ -354,12 +354,12 @@ def test_inspection_checks_the_exact_complete_byte_limit(template_case):
     assert h.client.post(PATH + "/inspect", content=limit + b" ", headers=headers).status_code == 413
 
 
-@pytest.mark.parametrize("count,status", [(4, 200), (5, 422)])
+@pytest.mark.parametrize("count,status", [(32, 200), (33, 422)])
 def test_imported_skill_references_have_a_complete_bounded_selection(template_case, count, status):
     h, _, _, _, _ = template_case
     data = export(h).json()
     reference = data["skills"][0]
-    data["skills"] = [{**reference, "name": f"missing-{i}"} for i in range(count)]
+    data["skills"] = [{**reference, "name": f"missing-{i:02d}"} for i in range(count)]
     result = inspect(h, data)
     assert result.status_code == status
     if status == 200:

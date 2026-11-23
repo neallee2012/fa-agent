@@ -15,10 +15,14 @@ from .behavior_agent_template import TemplateRole, TemplateSkill
 from .behavior_capabilities import CapabilityRef, EntryId
 from .behavior_sdk_state import CheckpointProfile, NativeCheckpointRef
 from .behavior_wire import Digest, ExactSourceRef, Identifier, ModelDeployment, WireModel, known_release
+from .m3_skills import DEFAULT_SKILL_SELECTION_MAX, MAX_SKILLS
 from .native_inference import NativeInference, NativeInferenceCollector
 from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion, RUNTIME_VERSION, SDK_VERSION
 
 MAX_ASSEMBLY_BYTES = 24 * 1024
+# Room for each skill past the 4 every earlier image recorded (a filled AssemblySkill is 557 bytes): 32 skills alone
+# would otherwise fill the summary bound, and a turn with 4 or fewer is bounded exactly as before.
+SKILL_RECORD_BYTES = 640
 
 Count = Annotated[int, Field(ge=0)]
 PartName = Literal[
@@ -186,7 +190,7 @@ class NativeAssembly(WireModel):
     selection: AssemblySelection | None = Field(default=None, exclude_if=lambda value: value is None)
     parts: Annotated[tuple[AssemblyPart, ...], Field(max_length=24)] = Field(
         default=(), exclude_if=lambda value: not value)
-    skills: Annotated[tuple[AssemblySkill, ...], Field(max_length=4)] = Field(
+    skills: Annotated[tuple[AssemblySkill, ...], Field(max_length=MAX_SKILLS)] = Field(
         default=(), exclude_if=lambda value: not value)
     skill_catalog_stage: Literal["full", "shortened", "names", "omitted"] | None = Field(
         default=None, exclude_if=lambda value: value is None)
@@ -499,12 +503,13 @@ class NativeAssemblyCollector:
                 checkpoint=self.checkpoint, events=tuple(self.events),
                 inference=inference,
             )
-            while len(result.model_dump_json().encode("utf-8")) > MAX_ASSEMBLY_BYTES and result.tools:
+            limit = MAX_ASSEMBLY_BYTES + SKILL_RECORD_BYTES * max(0, len(result.skills) - DEFAULT_SKILL_SELECTION_MAX)
+            while len(result.model_dump_json().encode("utf-8")) > limit and result.tools:
                 result = result.model_copy(update={
                     "state": "partial", "reason": "summary_bound", "tools": result.tools[:-1],
                     "omitted_items": result.omitted_items + 1,
                 })
-            if len(result.model_dump_json().encode("utf-8")) > MAX_ASSEMBLY_BYTES:
+            if len(result.model_dump_json().encode("utf-8")) > limit:
                 logging.getLogger(__name__).warning("FA_NATIVE_ASSEMBLY_PARTIAL reason=summary_bound")
                 return NativeAssembly(state="partial", reason="summary_bound", capture_digest=self.capture_digest,
                                       tools_reason="summary_bound", sdk_binding_reason="summary_bound")

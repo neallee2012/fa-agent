@@ -24,6 +24,7 @@ from pydantic import Field, JsonValue, model_validator
 
 from .behavior_wire import Digest, Identifier, WireModel
 from .errors import Problem
+from .m3_skills import skill_selection_max
 from .tool_catalog import CatalogEntry, StdioEntry, ToolboxEntry, ToolCatalog, build_catalog, load_catalog
 
 # Wire bound on a stored selection or capture, the same in every process: each capability adds at least one tool, and
@@ -264,6 +265,7 @@ def selection_max() -> int:
 def load_runtime_capabilities():
     """API startup: grants from the organization catalog and enabled FA builtins, plus the catalog itself."""
     selection_max()  # a bad value stops startup, not each selection
+    skill_selection_max()
     directory = os.environ.get("FA_TOOL_CATALOG_DIR")
     builtins = tuple(item for item in os.environ.get("FA_CAPABILITY_BUILTINS", "").split(",") if item)
     toolboxes = tuple(item for item in os.environ.get("FA_CAPABILITY_TOOLBOX_ENTRIES", "").split(",") if item)

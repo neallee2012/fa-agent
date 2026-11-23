@@ -17,7 +17,7 @@ from .behavior_capability_prompt import CapabilityAssemblyRecord, capability_rec
 from .behavior_user_turn import MAX_USER_TURN_SOURCES
 from .behavior_wire import Digest, Identifier, WireModel, same_but_release
 from .errors import Problem
-from .m3_skills import PurposeSkillEntry
+from .m3_skills import MAX_SKILLS, PurposeSkillEntry
 from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
 MAX_TURN_CONTEXT_BYTES = 16384
@@ -74,14 +74,14 @@ class TurnTokenUsage(WireModel):
 
 class HistoricalSkillCatalog(WireModel):
     catalog_schema: Literal["fa-approved-skill-catalog-v1", "fa-approved-skill-catalog-v2"]
-    entries: Annotated[tuple[TemplateSkill, ...], Field(max_length=4)]
-    unavailable_count: Annotated[int, Field(ge=0, le=4)]
+    entries: Annotated[tuple[TemplateSkill, ...], Field(max_length=MAX_SKILLS)]
+    unavailable_count: Annotated[int, Field(ge=0, le=MAX_SKILLS)]
     usage: Literal["historical-catalog-not-load-or-permission-proof"]
 
     @model_validator(mode="after")
     def bounded_names(self):
         names = tuple(entry.name for entry in self.entries)
-        if names != tuple(sorted(set(names))) or len(names) + self.unavailable_count > 4:
+        if names != tuple(sorted(set(names))) or len(names) + self.unavailable_count > MAX_SKILLS:
             raise ValueError("Historical catalog must keep its bounded ordered references")
         return self
 

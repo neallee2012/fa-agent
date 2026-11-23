@@ -18,8 +18,10 @@ from .behavior_text_files import UserTextFileProfile
 from .behavior_turn_origin import TurnOriginProfile
 from .behavior_wire import Digest, Identifier, SdkStartProfile, WireModel, WorkerProfile, known_release, same_but_release
 from .errors import Problem
-from .m3_models import VersionId
-from .m3_skills import PurposeSkillCatalog, SkillSelection, validate_selection
+from .m3_models import MAX_SKILL_REVIEW_ENTRIES, VersionId
+from .m3_skills import (
+    DEFAULT_SKILL_SELECTION_MAX, MAX_SKILLS, PurposeSkillCatalog, SkillSelection, skill_selection_max, validate_selection,
+)
 from .native_responses_wire import SENT_RELEASE, UNLABELED_STATE_PROFILE, NativeStateProfile, unlabeled_profile
 from .sdk_pin import KnownRuntimeVersion, KnownSdkVersion
 
@@ -28,7 +30,10 @@ if TYPE_CHECKING:
     from .behavior_auth import BehaviorPrincipal
     from .behavior_work_policy import WorkPolicyControl
 
-MAX_TEMPLATE_BYTES = 8192
+# 32 skill references and the capabilities beside them. Every image before MAX_SKILLS reads only 8192 bytes, so a new
+# selection keeps to that until the skill limit is raised (check_selectable_skills).
+MAX_TEMPLATE_BYTES = 16 * 1024
+LEGACY_TEMPLATE_BYTES = 8192
 DestinationRequirements = tuple[
     Literal["current-human-agent-team-binding"],
     Literal["current-standing-read-and-work-policy"],
@@ -90,7 +95,7 @@ class AgentTemplate(WireModel):
     schema_version: Literal["fa-agent-template-v1"] = "fa-agent-template-v1"
     role: TemplateRole
     settings: TemplateSettings
-    skills: Annotated[tuple[TemplateSkill, ...], Field(max_length=4)] = ()
+    skills: Annotated[tuple[TemplateSkill, ...], Field(max_length=MAX_SKILLS)] = ()
     unavailable_skills: SkillSelection = ()
     required_at_destination: DestinationRequirements = DESTINATION_REQUIREMENTS
     authorization: Literal[False] = False
@@ -117,11 +122,21 @@ class TemplateInspection(WireModel):
     role_matches: bool
     settings_match: bool
     selection_matches: bool
-    skills: Annotated[tuple[TemplateSkillInspection, ...], Field(max_length=4)]
+    skills: Annotated[tuple[TemplateSkillInspection, ...], Field(max_length=MAX_SKILLS)]
     references_match: bool
     required_at_destination: DestinationRequirements = DESTINATION_REQUIREMENTS
     authorization: Literal[False] = False
     activated: Literal[False] = False
+
+
+def check_selectable_skills(template: AgentTemplate) -> None:
+    """Selection entry points only (beside check_selectable): stored templates are read against MAX_SKILLS alone."""
+    limit = skill_selection_max()
+    if len(template.skills) + len(template.unavailable_skills) > limit:
+        raise Problem(422, "SKILL_SELECTION_LIMIT", f"one selection may name at most {limit} skills", limit=limit)
+    if limit <= DEFAULT_SKILL_SELECTION_MAX and len(template.model_dump_json().encode("utf-8")) > LEGACY_TEMPLATE_BYTES:
+        raise Problem(422, "PROFILE_SELECTION_UNSUPPORTED",
+                      f"a template over {LEGACY_TEMPLATE_BYTES} bytes needs the raised skill limit")
 
 
 def export_template(
@@ -229,10 +244,11 @@ def inspect_template(imported: AgentTemplate, current: AgentTemplate) -> Templat
     )
 
 
-MAX_TEMPLATE_OPTION_SKILLS = 24
 MAX_TEMPLATE_OPTION_PAGES = 16
-# Up to 24 skill refs plus every current grant (a full catalog is ~70 KB); the API response cap.
-MAX_TEMPLATE_OPTIONS_BYTES = 128 * 1024
+# Every effective skill of these pages, not only the first ones: a human selects up to the limit among all of them.
+MAX_TEMPLATE_OPTION_SKILLS = MAX_TEMPLATE_OPTION_PAGES * MAX_SKILL_REVIEW_ENTRIES
+# That many skill refs with their titles plus every current grant (a full catalog is ~70 KB); the API response cap.
+MAX_TEMPLATE_OPTIONS_BYTES = 512 * 1024
 
 
 class TemplateCapabilityOption(WireModel):
@@ -266,6 +282,9 @@ class TemplateOptions(WireModel):
     # bridge (its TemplateOptions has no such field) still reads the reply while the API and the console change version.
     max_capabilities: Annotated[int, Field(ge=1, le=MAX_CAPABILITIES)] = Field(
         default=DEFAULT_SELECTION_MAX, exclude_if=lambda value: value == DEFAULT_SELECTION_MAX)
+    # The API's FA_SKILL_SELECTION_MAX, left out at the default for the same reason.
+    max_skills: Annotated[int, Field(ge=1, le=MAX_SKILLS)] = Field(
+        default=DEFAULT_SKILL_SELECTION_MAX, exclude_if=lambda value: value == DEFAULT_SKILL_SELECTION_MAX)
     responses: TemplateResponsesOptions = Field(default_factory=TemplateResponsesOptions)
     authorization: Literal[False] = False
     activated: Literal[False] = False
@@ -293,15 +312,13 @@ def template_options(
         effective = [entry for entry in page.entries if entry.status == "effective"]
         names.extend(entry.artifact_id for entry in effective)
         titles.update((entry.artifact_id, entry.title) for entry in effective)
-        if len(names) > MAX_TEMPLATE_OPTION_SKILLS or page.next_after is None:
+        if page.next_after is None:
             break
         after = page.next_after
     else:
         more = True
-    if len(names) > MAX_TEMPLATE_OPTION_SKILLS:
-        names, more = names[:MAX_TEMPLATE_OPTION_SKILLS], True
     skills = []
-    # Listing references must not combine unrelated purposes into one selection's 4 KiB budget.
+    # Listing references must not combine unrelated purposes into one selection's catalog bounds.
     for name in names:
         catalog = authority.skills.catalog(actor, binding.team_id, (name,),
                                            schema_version="fa-approved-skill-catalog-v2")
@@ -313,4 +330,4 @@ def template_options(
     return TemplateOptions(skills=tuple(sorted(skills, key=lambda item: item.name)), more_skills=more,
                            skill_titles={item.name: titles[item.name] for item in skills},
                            capabilities=capabilities, composable_profiles=tuple(sorted(CAPABILITY_BASE_PROFILES)),
-                           max_capabilities=selection_max())
+                           max_capabilities=selection_max(), max_skills=skill_selection_max())

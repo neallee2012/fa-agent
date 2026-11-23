@@ -133,8 +133,8 @@ def install_agent_routes(app, agents, onboarding):
     @app.post("/api/agents/onboarding")
     async def create_agent(request: Request):
         available()
-        # Name, a 2048-byte role and up to 12 tool and 4 skill references stay well under this bound.
-        raw = await read_bounded(request, 16384, "AGENT_ONBOARDING_INPUT_INVALID", 413)
+        # Name, a 2048-byte role, 128 tool and 32 skill references (~32 KB) stay under this bound.
+        raw = await read_bounded(request, 64 * 1024, "AGENT_ONBOARDING_INPUT_INVALID", 413)
         return await run_in_threadpool(onboarding.create, onboarding_input(raw))
 
     @app.get("/api/agents/onboarding/options")

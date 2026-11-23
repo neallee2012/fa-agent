@@ -26,6 +26,7 @@ from shared_context.behavior_agent_template import TemplateSkill
 from shared_context.behavior_native_turn_wire import NativeSessionState
 from shared_context.behavior_capabilities import CapabilityRefs, base_supports
 from shared_context.behavior_work_policy import derive_work
+from shared_context.m3_skills import MAX_SKILLS
 
 from .adapter import ConsoleError, canonical, parse_config, require, sha, strict_json
 from .agent_connections import AgentConnection, AgentConnections
@@ -55,7 +56,7 @@ _REFUSED = {"AGENT_QUOTA_REACHED", "AGENT_NAME_TAKEN", "AGENT_ONBOARDING_INVALID
             # The server checks the chosen tools and skills before S0 writes anything.
             "AGENT_ONBOARDING_SKILLS_TOOL_REQUIRED", "AGENT_TEMPLATE_DISABLED", "CAPABILITY_SELECTION_INVALID",
             "CAPABILITY_BASE_UNSUPPORTED", "CAPABILITY_SOURCES_CHANGED", "PROFILE_SELECTION_SOURCES_CHANGED",
-            "CAPABILITY_SELECTION_LIMIT",
+            "CAPABILITY_SELECTION_LIMIT", "SKILL_SELECTION_LIMIT",
             "PROFILE_SELECTION_DENIED", "PROFILE_SELECTION_UNSUPPORTED", "SKILL_CATALOG_BUDGET_TOO_SMALL"}
 _SERVER_STATES = {"admitted", "creating", "registered", "ready", "failed"}
 
@@ -74,7 +75,8 @@ class OnboardingInput(wire.WireModel):
     display_name: Annotated[str, Field(min_length=1, max_length=64)]
     role_prompt: Annotated[str, Field(min_length=1, max_length=ROLE_PROMPT_MAX_BYTES)]
     capabilities: Annotated[CapabilityRefs | None, Field(exclude_if=lambda value: value is None)] = None
-    skills: Annotated[tuple[TemplateSkill, ...] | None, Field(max_length=4, exclude_if=lambda value: value is None)] = None
+    skills: Annotated[tuple[TemplateSkill, ...] | None,
+                      Field(max_length=MAX_SKILLS, exclude_if=lambda value: value is None)] = None
 
 
 _BASE_FIELDS = {"display_name", "role_prompt"}

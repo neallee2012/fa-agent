@@ -327,3 +327,24 @@ def test_meta_refuses_exactly_the_capability_limits_the_api_would_not_start_with
         ci.api_capability_limit()
     ci.STAGE["api_environment"].pop("FA_CAPABILITY_SELECTION_MAX")
     assert ci.api_capability_limit() is False
+
+
+def test_meta_refuses_exactly_the_skill_limits_the_api_would_not_start_with(monkeypatch):
+    from shared_context.m3_skills import DEFAULT_SKILL_SELECTION_MAX, MAX_SKILLS, skill_selection_max
+    ci = load_ci()
+    assert (ci.SKILL_DEFAULT, ci.SKILL_BOUND) == (DEFAULT_SKILL_SELECTION_MAX, MAX_SKILLS)
+    for value in ("0", "1", "04", "four", "-1", "", "4", "5", str(MAX_SKILLS), str(MAX_SKILLS + 1), "100"):
+        monkeypatch.setenv("FA_SKILL_SELECTION_MAX", value)
+        ci.STAGE["api_environment"]["FA_SKILL_SELECTION_MAX"] = value
+        try:
+            skill_selection_max()
+        except Problem:
+            with pytest.raises(SystemExit, match="FA_SKILL_SELECTION_MAX"):
+                ci.api_skill_limit()
+        else:
+            assert ci.api_skill_limit() is (int(value) > DEFAULT_SKILL_SELECTION_MAX), value
+    ci.STAGE["api_environment"]["FA_SKILL_SELECTION_MAX"] = 32  # a JSON number: the API only ever reads strings
+    with pytest.raises(SystemExit, match="FA_SKILL_SELECTION_MAX"):
+        ci.api_skill_limit()
+    ci.STAGE["api_environment"].pop("FA_SKILL_SELECTION_MAX")
+    assert ci.api_skill_limit() is False

@@ -8180,11 +8180,11 @@ test("template inspection sends only the selected file and never displays a matc
 test("oversized template files are rejected before reading or sending their contents",async()=>{
   const data=fixture();data.template_tools_available=true;
   const ui=await open(data);
-  ui.nodes.get("template-file").files=[{size:8193,text:async()=>{throw Error("Must not read oversized input")}}];
+  ui.nodes.get("template-file").files=[{size:16385,text:async()=>{throw Error("Must not read oversized input")}}];
   ui.nodes.get("template-file").events.change();
   ui.click("inspect-template");await ui.tick();
   assert.equal(ui.calls.length,1);
-  assert.match(ui.text("template-note"),/8192 bytes/);
+  assert.match(ui.text("template-note"),/16384 bytes/);
   assert.equal(ui.text("template-comparison"),"");
 });
 
@@ -9790,6 +9790,21 @@ test("onboarding blocks more tools or skills than the server accepts and waits f
     input.checked=true;input.events.change()}
   assert.match(plain.text("onboarding-choice-note"),/工具最多 12 項/);
   assert.equal(plain.nodes.get("onboarding-submit").disabled,true);
+  // Skills the same way: an API at the default 4 (or older) leaves max_skills out.
+  for(const [most,offered] of [[undefined,5],[6,7]]){
+    const choices={...options,options:{...ONBOARDING_OPTIONS.options,
+      skills:Array.from({length:offered},(_,i)=>ONBOARDING_SKILL("skill-"+i)),...(most?{max_skills:most}:{})}};
+    const page=await open(agentChat("agent-one"),{onboarding:onboardingServer({posts:[],options:choices}).handle});
+    await openOnboarding(page);
+    await page.tick();await page.tick();
+    fillOnboarding(page,"研究員","找資料");
+    const boxes=vm.runInContext("onboarding.inputs",page.context).filter(input=>input.faKind==="skill");
+    for(const input of boxes.slice(0,-1)){input.checked=true;input.events.change()}
+    assert.doesNotMatch(page.text("onboarding-choice-note"),/skill 最多/);
+    boxes.at(-1).checked=true;boxes.at(-1).events.change();
+    assert.match(page.text("onboarding-choice-note"),new RegExp(`skill 最多 ${most??4} 個`));
+    assert.equal(page.nodes.get("onboarding-submit").disabled,true);
+  }
   const offline=onboardingServer({posts:[],options:null});
   const other=await open(agentChat("agent-one"),{onboarding:offline.handle});
   await openOnboarding(other);
@@ -10080,7 +10095,14 @@ test("settings only lets an unavailable item be switched off and blocks capabili
   capped.click("settings-tab-mcp");
   assert.equal(settingsRow(capped,"WebIQ").children[1].disabled,true);
   assert.match(settingsRow(capped,"WebIQ").children[0].children[2].textContent,/一位助理最多選 1 項能力/);
-  assert.equal([ui,other,capped].some(page=>page.calls.some(call=>call.method==="POST")),false);
+  const offered=settingsOptions();offered.max_skills=1;offered.skills.push({...copy(settingsSkill),name:"tone-guide"});
+  const chosen=settingsBase();chosen.skills=[copy(settingsSkill)];
+  chosen.settings.capabilities.push({entry_id:"fa-skills-v1",entry_sha256:"6".repeat(64)});
+  const one=await openSettingsPage(offered,chosen);
+  one.click("settings-tab-skills");
+  assert.equal(settingsRow(one,"tone-guide").children[1].disabled,true);
+  assert.match(settingsRow(one,"tone-guide").children[0].children[2].textContent,/一位助理最多選 1 個 skill/);
+  assert.equal([ui,other,capped,one].some(page=>page.calls.some(call=>call.method==="POST")),false);
 });
 
 test("settings can close unavailable MCP selections in one local edit without changing other choices",async()=>{
