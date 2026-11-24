@@ -574,7 +574,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <div id="user-image-selected"></div>
 <p id="user-image-note" class="reason" role="status"></p>
 <button id="clear-user-images" hidden disabled>清除這次選的圖片</button>
-<details id="attachment-details"><summary>詳細</summary><small>只有你選的檔案會在本機讀取。8192 bytes 以內的文字檔按「送出」才傳；更大的文字檔、PDF、Office 檔和圖片會在選好後立刻上傳給這位助理，送出時只帶名稱與雜湊。文字照原樣保留（含 BOM／CRLF），不解析或執行內容。圖片會在本機轉成 PNG（邊長最多 2000 px、每張最多 512 KiB）。檔案和來源附件合計最多 4 份，圖片另計最多 4 張。在原生對話貼上會超出訊息上限的長文字，會自動改成附件 pasted-text-N.txt 上傳。還沒送出的選擇只存在這個頁面。</small></details>
+<details id="attachment-details"><summary>詳細</summary><small>只有你選的檔案會在本機讀取。8192 bytes 以內的文字檔按「送出」才傳；更大的文字檔、PDF、Office 檔和圖片會在選好後立刻上傳給這位助理，送出時只帶名稱與雜湊。文字照原樣保留（含 BOM／CRLF），不解析或執行內容。圖片會在本機轉成 PNG（邊長最多 2000 px、每張最多 512 KiB）。檔案和來源附件合計最多 4 份，圖片另計最多 4 張。在原生對話貼上會超出訊息上限的長文字，會自動改成附件 pasted-text-N.txt 上傳。沒打字只附檔也能送出，這則訊息會是「請閱讀並處理附件內容。」。還沒送出的選擇只存在這個頁面。</small></details>
 <details id="attachment-picker" aria-label="文字來源附件" hidden><summary>從這段對話的來源附加</summary>
 <button id="read-attachment-sources" disabled>讀取本對話的來源候選</button>
 <p id="attachment-note" class="reason" role="status"></p>
@@ -1442,6 +1442,13 @@ function literalFilesBody(files){return files.filter(file=>!file.upload).map(fil
 function uploadsBody(files){
   return files.filter(file=>file.upload).map(({name,sha256,byte_length,media_type})=>({name,sha256,byte_length,media_type}));
 }
+// The wire, API and Hosted take only typed text, so a blank box with something attached sends this visible sentence.
+const ATTACHMENTS_ONLY_TEXT="請閱讀並處理附件內容。";
+function outgoingText(){
+  const value=el("instruction").value;
+  return value.trim()||!(selectedAttachments().length||selectedUserFiles().length||selectedUserImages().length)?
+    value:ATTACHMENTS_ONLY_TEXT;
+}
 function literalInputBytes(content,files){
   return new TextEncoder().encode(JSON.stringify({content,files:literalFilesBody(files)})).length;
 }
@@ -1462,7 +1469,7 @@ function userFileIssue(){
   if(userFileReading)return userFileUploading?`正在上傳 ${userFileUploading}；完成前不能送出。`:"正在讀取你選取的文字檔；完成核對前不能送出。";
   if(userFileError)return friendlyError(userFileError);
   if(!files.length)return "";
-  if(invalidLiteralInput(el("instruction").value,files,selectedAttachments()))return friendlyError({code:"USER_FILE_INPUT_INVALID"});
+  if(invalidLiteralInput(outgoingText(),files,selectedAttachments()))return friendlyError({code:"USER_FILE_INPUT_INVALID"});
   if(userFileCapabilityError)return friendlyError({code:"USER_FILE_CAPABILITY_UNAVAILABLE"});
   if(userFileCapabilityBusy||!userFileCapability)return "正在讀取這段對話的附件設定，完成後才能送出。";
   if(userFileCapability.user_text_file_profile!=="fa-user-text-files-v1")return "這段對話沒有開啟附檔，請移除已選的檔案。";
@@ -1571,7 +1578,7 @@ function renderUserFiles(){
     pasteNote?.draft===attachmentDraftKey()&&(pasteNote.text||files.some(item=>item.name===pasteNote.name))?
       pasteNote.text||`貼上的長文字已改成附件 ${pasteNote.name}；不需要可按「移除此文字檔」。`:"");
   text("user-file-limit",userFileIssue()||(files.length?
-    `${files.some(item=>!item.upload)?`訊息和小檔共 ${literalInputBytes(el("instruction").value,files)}／8192 bytes；`:""}${
+    `${files.some(item=>!item.upload)?`訊息和小檔共 ${literalInputBytes(outgoingText(),files)}／8192 bytes；`:""}${
       files.some(item=>item.upload)?"大檔已上傳；":""}附件合計 ${files.length+selectedAttachments().length}／4。`:
     ""));
   const key=JSON.stringify([scope,ready,editable,metadata]);
@@ -5944,7 +5951,7 @@ function renderComposer(){
     !messagePending(composer.request_id)?state.tasks?.find(task=>task.task_id===composer.request_id):null;
   const sentOnce=Boolean(sentTask)&&sentTask.submission?.state!=="NOT_SENT"&&sentTask.not_accepted!==true&&
     sentTask.native_receipt?.status!=="busy_refused";
-  if(sentOnce&&el("instruction").value===composer.content)clearSentDraft(composer.thread_id,composer.request_id,selectedAgent);
+  if(sentOnce&&outgoingText()===composer.content)clearSentDraft(composer.thread_id,composer.request_id,selectedAgent);
   const unresolvedSentDraft=pendingAppendDraft();
   // #916 H9: while an unsettled append of a turn that has ended is being read, a new message waits, so it cannot go
   // out ahead of an append the read finds not_applied and resends. Only while that read runs: an append that stays
@@ -6019,7 +6026,7 @@ function renderComposer(){
     drafts=>(drafts.get(attachmentDraftKey(composer))||[]).length));
   el("send-instruction").disabled=Boolean(opening)||!canCompose||busy||messageBusy||appendBusy||appendUnknown||Boolean(unresolvedSentDraft)||appendChecking||threadLoading
     ||!(composer?.can_submit||composer?.can_follow_up||composer?.can_append)
-    ||(!appendTarget&&!selectedModel)||!instructionValid(el("instruction").value,maximum)
+    ||(!appendTarget&&!selectedModel)||!instructionValid(outgoingText(),maximum)
     ||(appendTarget?appendHasFiles:Boolean(attachmentIssue())||Boolean(userFileIssue())||Boolean(userImageIssue()));
   el("new-instruction").disabled=!scopeAvailable()||busy||Boolean(opening)||messageBusy||threadLoading||!composer?.can_follow_up;
   const last=composer?.conversation?.turns?.at(-1);
@@ -6063,7 +6070,8 @@ function renderComposer(){
     Boolean(composer?.command_incomplete)||Boolean(composer&&!opening&&!models.length));
   text("send-instruction",appendBusy?"追加中":appendTarget?"追加":messageBusy?"送出中":"送出");
   el("instruction").placeholder=opening?"新對話開好後即可送出；可以先輸入…":
-    canCompose?(appendTarget?"補充正在進行的工作…":composer?.can_follow_up||composer?.conversation_id?"接著問…":"傳送訊息…"):
+    canCompose?(appendTarget?"補充正在進行的工作…":outgoingText()!==el("instruction").value?
+      `沒打字也能送出，會帶「${ATTACHMENTS_ONLY_TEXT}」`:composer?.can_follow_up||composer?.conversation_id?"接著問…":"傳送訊息…"):
     state.authentication!=="AVAILABLE"?"連線後開始聊天":last?.state==="cancelled"?
       "回覆已取消，請從選單查看接續方式":
     composer?.follow_up_blocker==="NATIVE_SUBMISSION_NOT_ACCEPTED"&&composer.can_new_conversation?
@@ -6075,7 +6083,7 @@ function renderComposer(){
   const used=new TextEncoder().encode(JSON.stringify(el("instruction").value)).length;
   el("input-capacity").hidden=!Number.isSafeInteger(maximum)||used<=maximum;
   text("input-capacity",Number.isSafeInteger(maximum)&&used>maximum?`訊息過長，超出 ${used-maximum} bytes`:"");
-  if(!opening&&canCompose&&el("instruction").value&&!instructionValid(el("instruction").value,maximum)){
+  if(!opening&&canCompose&&el("instruction").value&&!instructionValid(outgoingText(),maximum)){
     text("instruction-reason",used>maximum?"請縮短訊息；不會自動截斷內容。":"請輸入訊息。");
   }
   resizeComposer();
@@ -8020,7 +8028,7 @@ async function sendChat(){
   // The conversation's current model (threadModel); a different pick here is a switch (only where the server allows one).
   const switchedFrom=native&&modelSwitchEnabled(composer)?threadModel(originThread):null;
   const originAgent=selectedAgent,scope=agentRevision;
-  const content=el("instruction").value,model=el("model").value,csrf=state.csrf;
+  const content=outgoingText(),model=el("model").value,csrf=state.csrf;
   const attachments=JSON.parse(JSON.stringify(selectedAttachments())),originalAttachmentKey=attachmentDraftKey(composer);
   const fileDrafts=[...selectedUserFiles()],files=literalFilesBody(fileDrafts),uploads=uploadsBody(fileDrafts);
   const imageDrafts=[...selectedUserImages()];

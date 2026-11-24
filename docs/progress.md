@@ -4,6 +4,14 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="stage-v58-1123"></a>
+## 2026-11-23：stage 第 58 版（skill 上限 32 第二階段）
+
+- **第 58 版**（#1317，`2026.11.23-58`，Neal 台灣時間 11-23 17:48 合併，merge `00e00a67`）：每位助理可選 skill 從 4 變 32。**存超過 4 個 skill（或模板超過 8192 bytes、catalog 超過 4096 bytes）後，不能退回第 57 版之前的 image**（Neal 2026-11-23 同意）。
+  - **內容**（`17ccceb0..00e00a67`）：#1316 文件（第 57 版紀錄）。#1315 skill 上限 32 第二階段：stage 與 dev 的 `api_environment` 設 `FA_SKILL_SELECTION_MAX: "32"`；API 修正：停在第 57 版之前 image 的助理收到超過 4 個 skill 的請求時，舊 image 解析失敗，API 判為沒送出，換版後同 RID 重送；`select_all_capabilities.py` 讀 API 上限。已知代價、部署當中的短暫視窗見 release PR 本文。
+  - **部署**：deploy-staging run 45150307431 成功（17:48:13～18:02:24），guard 讀到 `serving 17ccceb0093a; core changed: True; Hosted-only changed: 0`；gate decision: pass（0 refusals）；build、sync、api、console、feed、follow 步驟都成功。follow 步驟 log 只印 `sync job-fa-agent-sync-stage-468r9gb Succeeded`，沒有逐 Agent 輸出。image 前 12 碼：API `1f8db3d663fd`、Hosted `21c23324972d`、console `620cc7a53238`、feed `690adc4c263a`。public-sync run 45152434151 成功（18:02:27～18:06:19），`gate 2: PASS`，公開 tag `v2026.11.23-58`，公開樹 `00c6766b`（與第一道指紋相同）。
+  - **dev 測試**：兩次 dev 部署都在訂閱本月累計超過停損線時進行，由 Neal 2026-11-23 逐次核准例外，停損線不變。run 4913（`b8103991`）只有設定：guard 為 core changed False，只跑 check、guard、gate、api，API revision 讀回 `FA_SKILL_SELECTION_MAX=32`；A、B options 回 `max_skills: 32`；B 簡單回合回 2（按了一次 Teams 同意卡的「先不用」）。run 4914（#1315 最終版 `d3aa1d50`）：check、guard、build hosted、build api、gate、sync、api、follow 全部 rc=0；guard 為 core changed True；環境變數讀回 32，舊 revision 流量 0；A 219→220、B 179→180；A、B 換版後第一次讀取各回一次 409 `NATIVE_SESSION_CHANGED`；log 沒有 Traceback、AppExceptions 與 `SKILL_*`／`TEMPLATE_*`；A 新對話「1+1=?」回 2，存檔正常；A、B 的 Skills 與排程分頁正常，options 回 `max_skills: 32`、`max_capabilities: 128`，只看沒套用。
+  - **沒有驗證**：stage 沒有回合在第 58 版上跑過，也沒查有多少 Agent 還停在第 57 版之前 image。存 5 個以上 skill 在 dev、stage 都沒實測（dev 的 Team 沒有已生效 skill；存檔、模板、目錄只有本機測）；選項全列、目錄保留名字、assembly 紀錄讀回、頁面直接顯示「32」沒走到。dev B 的回合被 Teams 同意卡擋住沒驗到，留有一筆待連線請求，需 Neal 在工作台處理那張卡。舊 image 失敗路徑（超過 4 個 skill 判沒送出、換版後同 RID 重送；catalog 超過 4096 bytes 的第一個回合失敗）只讀原始碼。32 個 skill 時，一份模板最多約 50 項能力；選項清單任一 skill 讀取回 403 時整份失敗。API 沒有 HTTP status，dev 不能統計 5xx。第 56 版以前的未驗證事項仍在（見 CURRENT-STATE）。
 <a id="stage-v57-1123"></a>
 ## 2026-11-23：stage 第 57 版（skill 上限 32 第一階段）
 

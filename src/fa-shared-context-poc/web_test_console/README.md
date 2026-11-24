@@ -2,6 +2,16 @@
 
 第一次用工作台：部署後怎麼打開、送第一則訊息、看批准卡和回條，見根目錄 README 的 [前 10 分鐘](../../../README.md#first-10-minutes)。本頁下面是逐次變更紀錄。
 
+<a id="attachments-only-send"></a>
+## 只附檔、沒打字也能送出（Neal 2026-11-24，CODE/standin，未部署）
+
+以前文字框空白時送出鍵一定是灰的，所以「貼上長文字變成附件」或「選了檔案不打字」都送不出去。現在只要有附件（檔案、來源附件或圖片），
+文字框空白也能送出；這則訊息的內容是固定的「請閱讀並處理附件內容。」，對話裡照樣顯示這句，輸入框提示也先寫出來。
+
+- **為什麼是固定句子**：wire（`InstructionSubmit.transport_text`）、API 與 Hosted（`m2_copilot.py` 的「Attached files require the original
+  typed instruction」）都要求有文字；只改工作台，舊的 Hosted image 也照常接得住，模型照舊從附件清單讀檔。
+- 這句算進「訊息和小檔共 N／8192 bytes」；追加模式仍不能帶附件。測試：`test_web_test_console_workbench.cjs` 新增 2 案。
+
 <a id="paste-as-txt"></a>
 ## 貼上長文字自動變成 .txt 附件（Neal 2026-11-21，CODE/offline，未部署）
 

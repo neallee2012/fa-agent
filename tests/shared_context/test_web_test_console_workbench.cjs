@@ -1101,6 +1101,40 @@ test("a paste past the message limit becomes pasted-text-1.txt next to the files
   assert.equal(ui.text("user-file-note"),"");
 });
 
+// Neal 2026-11-24: a blank box with something attached can be sent; the turn carries a fixed, visible sentence.
+test("a pasted long text with a blank box sends the fixed sentence and the upload",async()=>{
+  const long="長".repeat(5000),bytes=Buffer.from(long),sha256=require("crypto").createHash("sha256").update(bytes).digest("hex");
+  const ui=await nativePasteChat({ok:true,json:async()=>({name:"pasted-text-1.txt",sha256,byte_length:bytes.length,
+    media_type:"text/plain"})});
+  typeAttachmentText(ui,"");
+  assert.equal(await paste(ui,long),true);
+  assert.equal(ui.nodes.get("instruction").value,"");
+  assert.equal(ui.nodes.get("instruction").placeholder,"沒打字也能送出，會帶「請閱讀並處理附件內容。」");
+  assert.equal(ui.nodes.get("send-instruction").disabled,false);
+  ui.click("send-instruction");await ui.tick();
+  const body=JSON.parse(ui.calls.filter(call=>call.method==="POST").at(-1).body);
+  assert.equal(body.content,"請閱讀並處理附件內容。");
+  assert.deepEqual(body.files.map(file=>file.name),["note.txt"]);
+  assert.deepEqual(body.uploads,[{name:"pasted-text-1.txt",sha256,byte_length:bytes.length,media_type:"text/plain"}]);
+});
+
+test("a chosen file with a blank box sends; nothing attached or a file over the limit with the sentence does not",async()=>{
+  const ui=await open(attachmentChat());await readyFileInput(ui);
+  typeAttachmentText(ui,"   ");
+  assert.equal(ui.nodes.get("send-instruction").disabled,true);
+  const fixed=Buffer.byteLength(JSON.stringify({content:"請閱讀並處理附件內容。",files:[{name:"one.txt",text:""}]}));
+  await chooseLiteral(ui,[selectedFile("one.txt","x".repeat(8192-fixed+1))]);
+  assert.equal(ui.nodes.get("send-instruction").disabled,true);
+  await chooseLiteral(ui,[selectedFile("one.txt","x".repeat(8192-fixed))]);
+  assert.equal(ui.text("user-file-limit"),"訊息和小檔共 8192／8192 bytes；附件合計 1／4。");
+  assert.equal(ui.nodes.get("send-instruction").disabled,false);
+  ui.click("send-instruction");await ui.tick();
+  const posts=ui.calls.filter(call=>call.method==="POST");
+  assert.equal(posts.length,1);
+  assert.deepEqual(JSON.parse(posts[0].body),{content:"請閱讀並處理附件內容。",model:"offline-chat-a",
+    files:[{name:"one.txt",text:"x".repeat(8192-fixed)}]});
+});
+
 test("a paste that fits, or one on a non-native conversation, pastes as text",async()=>{
   const ui=await nativePasteChat();
   assert.equal(await paste(ui,"short"),false);
