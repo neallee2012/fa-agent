@@ -33,6 +33,9 @@ from .source_materials import digest
 from .team_mcp_wire import (
     MAX_TEAM_MCP_SERVERS, TeamMcpChange, TeamMcpChangeResult, TeamMcpConnection, TeamMcpConnections, TeamMcpServer, TeamMcpServerInput, TeamMcpView, team_mcp_grant, team_toolbox_name,
 )
+from .team_toolbox_skills import (
+    MAX_SKILL_ZIP_BYTES, MAX_TOOLBOX_SKILLS, TeamToolboxSkill, TeamToolboxSkills, refused, toolbox_skill,
+)
 
 _log = logging.getLogger(__name__)
 _SAFE_CREDENTIAL_TYPES = {"none", "aad", "managedidentity", "agenticidentity", "agenticidentitytoken_preview",
@@ -40,6 +43,8 @@ _SAFE_CREDENTIAL_TYPES = {"none", "aad", "managedidentity", "agenticidentity", "
 _MCP_CONNECTION_TYPES = {"remotetool", "remotetool_preview", "customkeys"}
 # The keys FA writes for one MCP server; a tool entry with anything else is kept as it is, never edited here.
 _MANAGED_KEYS = {"type", "server_label", "server_url", "allowed_tools", "require_approval", "project_connection_id"}
+# Version fields FA never edits (skills and policies attached in the portal, the description): a new version keeps them.
+_CARRIED_FIELDS = ("description", "skills", "policies")
 _TEAM_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _TEAM_LOCKS_GUARD = threading.Lock()
 # A lost-ACK resend happens right after the original; the newest versions are enough to find its version.
@@ -193,14 +198,42 @@ class TeamMcpFoundryClient:
             return None
         return self._call(op)
 
-    def create_version(self, name: str, *, tools: list[dict], metadata: dict[str, str]) -> str:
+    def create_version(self, name: str, *, tools: list[dict], metadata: dict[str, str], base: str | None = None) -> str:
+        """A new version with these tools and metadata; the base version's other fields carry over unchanged."""
         def op(project):
-            created = project.toolboxes.create_version(
-                name, body={"description": "FA Team MCP", "metadata": metadata, "tools": tools})
+            body = {"description": "FA Team MCP"}
+            if base is not None:
+                source = _plain(project.toolboxes.get_version(name, base))
+                body.update({key: source[key] for key in _CARRIED_FIELDS if source.get(key)})
+                skills = body.pop("skills", None) or []
+                kept = [item for item in skills if _skill_exists(project.beta.skills, item)]
+                if kept:
+                    body["skills"] = kept
+                if len(kept) < len(skills):
+                    _log.warning("toolbox %s: version %s references deleted skills %s; the new version drops them",
+                                 name, base, [item.get("name") for item in skills if item not in kept])
+            created = project.toolboxes.create_version(name, body={**body, "metadata": metadata, "tools": tools})
             version = _field(created, "version")
             if not isinstance(version, str) or not version:
                 raise TeamMcpFoundryError(None)
             return version
+        return self._call(op)
+
+    def toolbox_skills(self, name: str) -> tuple[str | None, list[TeamToolboxSkill], int]:
+        """The default version, its first skill references as import candidates, and how many more it has."""
+        def op(project):
+            try:
+                default = _field(project.toolboxes.get(name), "default_version")
+            except Exception as error:
+                if _status(error) == 404:
+                    return None, [], 0
+                raise
+            if not default:
+                return None, [], 0
+            references = list(_field(project.toolboxes.get_version(name, default), "skills") or ())
+            return (str(default), [_skill_candidate(project.beta.skills, _plain(item))
+                                   for item in references[:MAX_TOOLBOX_SKILLS]],
+                    max(0, len(references) - MAX_TOOLBOX_SKILLS))
         return self._call(op)
 
     def promote(self, name: str, version: str) -> None:
@@ -281,6 +314,53 @@ def _connection(item) -> TeamMcpConnection:
         credential = "None"
     ctype, credential = getattr(ctype, "value", ctype), getattr(credential, "value", credential)
     return TeamMcpConnection(name=name, connection_type=str(ctype), credential_type=str(credential))
+
+
+def _skill_exists(skills, reference) -> bool:
+    """False only when the Skills API says a referenced skill (or its pinned version) is gone. Foundry lets a portal
+    user delete a skill a toolbox still names, then refuses (400) every new version naming it, which would block all
+    Team MCP changes (ADR-0014, dev 2026-11-26). Other references are kept; any other error fails the change."""
+    name = reference.get("name") if isinstance(reference, dict) else None
+    if not isinstance(name, str) or not name or reference.get("type") != "skill_reference":
+        return True
+    try:
+        if reference.get("version"):
+            skills.get_version(name, str(reference["version"]))
+        else:
+            skills.get(name)
+    except Exception as error:
+        if _status(error) == 404:
+            return False
+        raise
+    return True
+
+
+def _capped(chunks, limit: int) -> bytes | None:
+    data = bytearray()
+    for chunk in chunks:
+        data.extend(chunk)
+        if len(data) > limit:
+            return None
+    return bytes(data)
+
+
+def _skill_candidate(skills, reference: dict) -> TeamToolboxSkill:
+    """One toolbox skill reference read through the Skills API: its pinned version, or the skill's default."""
+    name = reference.get("name")
+    if reference.get("type") != "skill_reference" or not isinstance(name, str) or not name:
+        return refused(str(name or reference.get("type") or "?"), "unsupported_type")
+    try:
+        version = reference.get("version") or _field(skills.get(name), "default_version")
+        if not version:
+            return refused(name, "unavailable")
+        version = str(version)
+        description = _field(skills.get_version(name, version), "description")
+        archive = _capped(skills.download_version(name, version), MAX_SKILL_ZIP_BYTES)
+    except Exception as error:
+        if _status(error) == 404:
+            return refused(name, "unavailable")
+        raise
+    return toolbox_skill(name, version, description, archive)
 
 
 def _server(tool: dict, version: str) -> TeamMcpServer | None:
@@ -421,6 +501,17 @@ class TeamMcpService:
         self._authorize(principal)
         return self._view(principal, *self._read(self.foundry_factory(), principal.team))
 
+    def toolbox_skills(self, principal) -> TeamToolboxSkills:
+        """Skills on the Team toolbox's default version, for the owner to import as drafts; nothing is written."""
+        self._authorize(principal)
+        toolbox = team_toolbox_name(principal.team)
+        try:
+            default, skills, omitted = self.foundry_factory().toolbox_skills(toolbox)
+        except Exception as error:
+            raise self._read_failure(error) from None
+        return TeamToolboxSkills(team_id=principal.team, toolbox=toolbox, default_version=default,
+                                 skills=tuple(skills), omitted=omitted)
+
     def _connections_raw(self) -> tuple[TeamMcpConnection, ...]:
         try:
             return tuple(sorted(self.foundry_factory().list_connections(), key=lambda item: item.name))
@@ -546,7 +637,7 @@ class TeamMcpService:
             if connection is not None:
                 metadata["fa_connection"] = connection
             try:
-                version = foundry.create_version(toolbox, tools=changed, metadata=metadata)
+                version = foundry.create_version(toolbox, tools=changed, metadata=metadata, base=default)
             except Exception as error:
                 raise _write_failure(error, "toolbox version") from None
             return self._finish(foundry, principal, command, version, connection)

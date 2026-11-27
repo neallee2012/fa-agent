@@ -82,6 +82,20 @@ def test_a_bad_feed_url_is_refused_before_anything_is_sent(team_mcp):
     assert all(method == "GET" for method, _, _ in sent) and team_mcp.foundry.puts == []
 
 
+def test_console_reads_toolbox_skills_with_eight_bodies_inside_its_limit(team_mcp):
+    from shared_context.team_toolbox_skills import MAX_TOOLBOX_SKILLS, TeamToolboxSkill
+
+    # Each body at its 8192-byte bound and all newlines, so the JSON escape doubles it: the largest real response.
+    body = "#" + "\n" * 8191
+    team_mcp.foundry.skills = ("v6", [TeamToolboxSkill(name=f"s{index}", skill_version="1", description="d" * 512,
+                                                       body=body, sha256="a" * 64)
+                                      for index in range(MAX_TOOLBOX_SKILLS)], 1)
+    reader, sent = console_for(team_mcp, "read_only")
+    value = reader.skills()
+    assert value["default_version"] == "v6" and value["omitted"] == 1 and len(value["skills"]) == MAX_TOOLBOX_SKILLS
+    assert value["skills"][0]["body"] == body and sent == [("GET", "/team-mcp/v1/skills", b"")]
+
+
 def test_read_only_and_invalid_changes_are_not_sent(team_mcp):
     reader, sent = console_for(team_mcp, "read_only")
     view = reader.servers()
@@ -117,6 +131,6 @@ def test_console_routes_have_no_delete_or_resume():
     app = FastAPI()
     install_team_mcp_routes(app, lambda: None)
     paths = sorted(route.path for route in app.routes if route.path.startswith("/api/team-mcp"))
-    assert paths == ["/api/team-mcp/changes", "/api/team-mcp/connections", "/api/team-mcp/servers"]
+    assert paths == ["/api/team-mcp/changes", "/api/team-mcp/connections", "/api/team-mcp/servers", "/api/team-mcp/skills"]
     assert not any(getattr(route, "methods", set()) & {"DELETE", "PUT", "PATCH"}
                    for route in app.routes if route.path.startswith("/api/team-mcp"))

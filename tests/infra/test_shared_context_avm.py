@@ -250,6 +250,7 @@ def test_avm_network_registry_and_monitoring_keep_existing_explicit_settings(com
         "createObject('value', createArray('192.168.96.0/24')))]")
     workspace = settings(compiled["stage-monitoring.bicep"], "stage-log-analytics")
     assert workspace["dataRetention"] == 30 and workspace["dailyQuotaGb"] == "[parameters('dailyQuotaGb')]"
+    assert workspace["features"] == {"enableLogAccessUsingOnlyResourcePermissions": True}
     realtime = settings(compiled["realtime.bicep"], "fa-realtime-webpubsub")
     assert realtime["capacity"] == 1 and realtime["disableLocalAuth"] is True and realtime["disableAadAuth"] is False
 

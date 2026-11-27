@@ -10209,6 +10209,13 @@ grants；`FA_TEAM_MCP_SINGLE_TEAM=1` 表示單 Team project。多 Team project �
   `request_id`、`expected_version`（讀到的 `default_version`）、`operation`、`server_label`、`server`（含
   `require_approval: always|never`）、選填 `new_connection`（`header_name`、`secret`））。上限 16 KiB。
   `/pending/resume` 已移除：結果不明時用同一個 `request_id` 重送同一份內容。
+  建新版本時從它所根據的預設版本原樣帶過 `description`、`skills`、`policies`，入口網站掛的 skill 不會掉
+  （[ADR-0014](../../docs/adr/0014-team-toolbox-skills.md)）。例外是已在入口網站刪除的 skill（Skills API 回 404）：
+  Foundry 會拒絕引用它的新版本，所以不帶，並記 warning。
+- `GET /team-mcp/v1/skills`：Team owner、不收 query／body，回 `TeamToolboxSkills`（`schema_version="fa-team-toolbox-skills-v1"`、
+  `default_version`、最多 8 個 `skills[]`、其餘數量 `omitted`）。用 SDK 讀預設版本的 `skill_reference`，每個 zip 最多讀
+  64 KiB；只有單一 `SKILL.md`（≤8 KiB）且主人草稿驗證會接受的才帶 `body` 與 `sha256`，其餘只帶 `refusal`。只讀，不寫任何東西；
+  匯入仍走主人草稿與批准（ADR-0014）。
 
 API 只做三件事：
 1. **核對 Team owner**（原 JWT＋Team registry）。

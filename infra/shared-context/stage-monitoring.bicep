@@ -31,6 +31,11 @@ module workspace 'br/public:avm/res/operational-insights/workspace:0.16.1' = {
     skuName: 'PerGB2018'
     dataRetention: 30
     dailyQuotaGb: dailyQuotaGb
+    // AVM defaults this to false (workspace permissions only); Foundry trace-to-dataset jobs query as the
+    // project identity, which only holds Reader on the App Insights component, so they found no traces.
+    features: {
+      enableLogAccessUsingOnlyResourcePermissions: true
+    }
   }
 }
 

@@ -13,7 +13,9 @@ condition does.
 public_baseline.json holds the leaves of infra/azd/main.bicep, foundation.bicep and foundry.bicep compiled from main
 at 6ec23c65 (before this option) with Bicep 0.48.1. Since then only main.bicep's outputs changed: ADR-0011 added
 FA_COSMOS_ENDPOINT, which is '' on public, and ADR-0006 FA_AGENT_ONBOARDING_ACCOUNT_ROLE, which is false on public
-(no resource changed). To regenerate it from a compiled template, run this
+(no resource changed). On 2026-11-25 the stage-log-analytics leaf gained
+features.enableLogAccessUsingOnlyResourcePermissions=true (Foundry trace jobs read as the project identity).
+To regenerate it from a compiled template, run this
 file with the template path; only do that for an intended change to the public deployment.
 """
 
@@ -545,10 +547,11 @@ def test_only_the_api_identity_gets_the_five_action_memory_role_on_the_container
 
 # Private without FA_VNET_RESOURCE_ID deploys identical resources (a normalized leaf comparison, not byte-identical
 # JSON): sha256 of the canonical private leaves of infra/azd/main.bicep on main at e9692be1 (without phase 2b), as
-# computed below, less the project capability host added on 2026-10-28; a changed value means it deploys something
+# computed below, less the project capability host added on 2026-10-28, then with stage-log-analytics given
+# features.enableLogAccessUsingOnlyResourcePermissions=true on 2026-11-25; a changed value means it deploys something
 # different. Diff with
 # `python tests/infra/test_network_mode.py <compiled.json> private` against that commit's output.
-PRIVATE_DEFAULT_SHA256 = "adaf9eb46f887c8a0e27774fdd6a1a21c441fa02527667bcccc8f501923f2b80"
+PRIVATE_DEFAULT_SHA256 = "3a4b8401f68c21d6e690025f5b62fd3e01f00bcefffd8a90c01ba6cf90991ac9"
 USER_VNET = "/subscriptions/s/resourceGroups/rg-net/providers/Microsoft.Network/virtualNetworks/vnet-hub"
 BYO = {"vnetResourceId": USER_VNET, "apiSubnetName": "app", "agentSubnetName": "agents",
        "privateEndpointSubnetName": "endpoints"}

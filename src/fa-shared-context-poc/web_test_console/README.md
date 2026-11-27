@@ -2119,7 +2119,10 @@ revision 或 pending。API 沒開（`FA_TEAM_MCP_ENABLED`）時只說明「這�
 - **只送一次**：每個變更由頁面產生固定的 `request_id`，帶上讀到的 `default_version`；確認後只送一次
   `POST /api/team-mcp/changes`。結果不明（`TEAM_MCP_OUTCOME_UNKNOWN`、離線或回應格式不符）時顯示「用原編號重送」，
   按下後送出完全相同的 body；未確認前不能做新的變更。完成後重讀助理設定，新的 MCP 出現在下方開關裡。
-- **網頁代理**（`team_mcp.py`）：路由 `GET /api/team-mcp/servers`、`/connections`；`POST /api/team-mcp/changes`
+- **從 Team toolbox 帶入 skill**（ADR-0014）：「新增 skill」表單上方的「從 Team toolbox 帶入」讀
+  `GET /api/team-mcp/skills`，下拉選單列出預設版本的 skill，不能帶入的會寫原因且不能選。選一個只把名稱、描述、本文填進表單；
+  表單已有內容時先問要不要取代。存草稿、批准仍是主人自己按，所以批准綁的是 FA 自己那份內容的 sha256。
+- **網頁代理**（`team_mcp.py`）：路由 `GET /api/team-mcp/servers`、`/connections`、`/skills`；`POST /api/team-mcp/changes`
   （上限 16 KiB）。`/pending/resume` 已移除。bridge 只放行這一條 POST，CSRF 與 Origin 規則不變；
   代理不寫 journal、不記 body。送出前檢查 `Behavior.Approve` 並用和 API 相同的 `TeamMcpChange` 檢查格式；
   金鑰在檢查後只寫回送出的 body。回應必須是同一個 `request_id` 且狀態為 applied 才算完成。
@@ -2141,6 +2144,7 @@ revision 或 pending。API 沒開（`FA_TEAM_MCP_ENABLED`）時只說明「這�
   - 環境沒開放：不顯示表單、不送出；非 owner 整區隱藏；唯讀登入不顯示表單；
   - 修改：保留不在清單裡的原 connection 與原批准設定；
   - Toolbox 批准卡：名稱與完整參數、無「以後允許這類」、只送一次 `allow_once`。
+  - 帶入 toolbox skill：只填表單、不存草稿也不批准，不能帶入的選不了，取代已填內容前先問，問的時候清單被清掉就不填。
   - 完整 DOM 620 PASS。
 - `test_web_test_console_team_mcp.py`：接真 `/team-mcp/v1` 路由與假 Foundry，同編號重送不建第二版、金鑰只送一次、
   唯讀與格式錯誤不送出、bridge 只放行 changes、無 resume／DELETE。

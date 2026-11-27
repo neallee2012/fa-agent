@@ -47,6 +47,7 @@ class FakeFoundry:
         ]
         self.toolboxes, self.created, self.promoted, self.puts, self.arm = {}, [], [], [], {}
         self.fail, self.reads = {}, 0
+        self.skills = (None, [], 0)
 
     def _maybe(self, stage):
         if stage in self.fail:
@@ -65,6 +66,11 @@ class FakeFoundry:
         version = next(item for item in box["versions"] if item["version"] == box["default"])
         return box["default"], copy.deepcopy(version["tools"])
 
+    def toolbox_skills(self, name):
+        self._maybe("skills")
+        self.skills_read = name
+        return self.skills
+
     def default_version(self, name):
         box = self.toolboxes.get(name)
         return None if box is None else box["default"]
@@ -75,7 +81,7 @@ class FakeFoundry:
                 return {"version": item["version"], "metadata": dict(item["metadata"])}
         return None
 
-    def create_version(self, name, *, tools, metadata):
+    def create_version(self, name, *, tools, metadata, base=None):
         self._maybe("create_before")
         box = self.toolboxes.setdefault(name, {"default": None, "versions": []})
         version = f"v{len(box['versions']) + 1}"
@@ -83,7 +89,7 @@ class FakeFoundry:
         if box["default"] is None:
             box["default"] = version
         self.created.append({"toolbox": name, "version": version, "tools": copy.deepcopy(tools),
-                             "metadata": dict(metadata)})
+                             "metadata": dict(metadata), "base": base})
         self._maybe("create_after")
         return version
 
@@ -261,6 +267,32 @@ def test_tools_this_page_does_not_manage_are_kept_and_never_edited(team_mcp):
     assert c.foundry.created[-1]["tools"][:2] == other
     assert post(c, change(c, "9" * 32, "disable", "Alpha")).status_code == 200
     assert c.foundry.created[-1]["tools"] == other
+
+
+def test_the_owner_reads_their_own_toolbox_skills_and_nobody_else_can(team_mcp):
+    from shared_context.team_toolbox_skills import TeamToolboxSkill
+
+    c = team_mcp
+    skill = TeamToolboxSkill(name="review", skill_version="1", description="Review a change", body="# Review\n",
+                             sha256="a" * 64)
+    c.foundry.skills = ("v3", [skill], 2)
+    response = c.client.get(PREFIX + "/skills", headers=c.headers())
+    assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
+    assert response.json() == {"schema_version": "fa-team-toolbox-skills-v1", "team_id": A.team, "toolbox": TOOLBOX,
+                               "default_version": "v3", "skills": [skill.model_dump(mode="json")], "omitted": 2}
+    assert c.client.get(PREFIX + "/skills", headers=c.headers("second")).json()["toolbox"] == "fa-team-team-two"
+    assert c.foundry.skills_read == "fa-team-team-two"
+    assert code(c.client.get(PREFIX + "/skills", headers=c.headers("agent"))) == "TEAM_MCP_OWNER_ONLY"
+    assert code(c.client.get(PREFIX + "/skills?version=6", headers=c.headers())) == "TEAM_MCP_INVALID"
+    c.foundry.fail["skills"] = 503
+    assert code(c.client.get(PREFIX + "/skills", headers=c.headers())) == "TEAM_MCP_OUTCOME_UNKNOWN"
+
+
+def test_each_change_builds_on_the_default_version_so_its_other_fields_carry_over(team_mcp):
+    c = team_mcp
+    assert post(c, change(c, "1a" * 16, "add", "Alpha")).status_code == 200
+    assert post(c, change(c, "1b" * 16, "add", "Beta")).status_code == 200
+    assert [item["base"] for item in c.foundry.created] == [None, "v1"]
 
 
 def test_multiteam_hides_and_refuses_secret_connections_but_offers_the_teams_own(team_mcp):
@@ -637,6 +669,63 @@ def test_sdk_wrapper_uses_official_versions_metadata_and_default_and_never_delet
     assert client.read_toolbox("fa-team-t") == (version, [tool]) and client.default_version("fa-team-t") == version
     assert ("list_versions", "fa-team-t", 100, "desc") in toolboxes.calls
     assert not any(call[0].startswith("delete") for call in toolboxes.calls)
+
+
+def test_a_new_version_keeps_the_portal_skills_policies_and_description_of_its_base(monkeypatch):
+    import azure.ai.projects as projects
+    from azure.ai.projects.models import ToolboxVersionObject
+
+    from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+
+    toolboxes = _FakeToolboxes()
+    skills = [{"type": "skill_reference", "name": "state-change-authorization"}]
+    gone = [{"type": "skill_reference", "name": "deleted-in-portal"},
+            {"type": "skill_reference", "name": "state-change-authorization", "version": "9"}]
+    policies = {"rai_config": {"rai_policy_name": "strict"}}
+    tool = {"type": "mcp", "server_label": "Docs", "server_url": "https://mcp.example.test/docs",
+            "require_approval": "always", "allowed_tools": ["search"]}
+    for number, refs in (("1", skills + gone), ("2", gone)):
+        toolboxes.versions.append(ToolboxVersionObject({
+            "object": "toolbox.version", "id": "id", "name": "fa-team-t", "version": number,
+            "description": "Portal edit", "metadata": {}, "tools": [tool], "skills": refs, "policies": policies,
+            "created_at": 1}))
+    outage = []
+
+    def missing(*names):
+        if outage:
+            raise HttpResponseError("busy", response=SimpleNamespace(status_code=503, reason="busy", headers={}))
+        if names[0] == "deleted-in-portal" or names[1:] == ("9",):
+            error = ResourceNotFoundError("gone")
+            error.status_code = 404
+            raise error
+
+    class FakeProject:
+        def __init__(self, **kwargs):
+            self.toolboxes = toolboxes
+            self.beta = SimpleNamespace(skills=SimpleNamespace(get=missing, get_version=missing))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(projects, "AIProjectClient", FakeProject)
+    client = TeamMcpFoundryClient("https://project.test", object())
+    client.create_version("fa-team-t", tools=[tool], metadata={"fa_request_id": "b" * 32}, base="1")
+    body = toolboxes.calls[-1][2]
+    assert (body["skills"], body["policies"], body["description"]) == (skills, policies, "Portal edit"), \
+        "a skill deleted in the portal is dropped, since Foundry refuses a version that names it"
+    assert body["tools"] == [tool] and body["metadata"] == {"fa_request_id": "b" * 32}
+    client.create_version("fa-team-t", tools=[tool], metadata={}, base="2")
+    assert "skills" not in toolboxes.calls[-1][2] and toolboxes.calls[-1][2]["policies"] == policies
+    outage.append(True)
+    before = len(toolboxes.calls)
+    with pytest.raises(TeamMcpFoundryError):
+        client.create_version("fa-team-t", tools=[tool], metadata={}, base="1")
+    assert not any(call[0] == "create_version" for call in toolboxes.calls[before:]), "an outage never drops a skill"
+    client.create_version("fa-team-t", tools=[tool], metadata={})
+    assert toolboxes.calls[-1][2] == {"description": "FA Team MCP", "metadata": {}, "tools": [tool]}
 
 
 def test_a_failed_grants_read_is_reused_briefly_so_an_outage_waits_once(monkeypatch, team_mcp):

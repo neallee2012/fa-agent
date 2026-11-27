@@ -4,6 +4,15 @@
 
 **閱讀分工：** 新工作階段先讀 [CURRENT-STATE](status/CURRENT-STATE.md)。本檔保留詳細事件、結果與歷史；以下「目前／下一步」屬各段日期的觀察，不自動代表最新工作狀態或操作批准。維護方式見 [CONVENTIONS](CONVENTIONS.md#8-current-state)。
 
+<a id="stage-v59-1124"></a>
+## 2026-11-24：stage 第 59 版（只附檔也能送出）
+
+- **第 59 版**（#1320，`2026.11.24-59`，Neal 台灣時間 11-24 09:33 合併，merge `ba2960ca`）：工作台文字框空白但有附檔（貼上長文字轉成的附件、選的檔案或圖片）時，送出鍵可按，送出可見固定句「請閱讀並處理附件內容。」。只改工作台，wire、API、Hosted 都沒改，可以退回第 58 版；第 58 版起不能退回第 57 版以前 image 的限制不變。
+  - **內容**（`00e00a67..ba2960ca`）：#1318 文件（第 58 版紀錄）。#1319 工作台修正（`web_test_console/index.html`、README、工作台測試）。附件字數上限檢查也用實際送出的固定句計算；有打字時行為不變，追加模式仍不能帶附件。詳見 release PR 本文。
+  - **部署**：deploy-staging run 45305969769 成功（09:34:01～09:48:44），guard 讀到 `serving 00e00a67d31a; core changed: False; Hosted-only changed: 0`；gate decision: pass（0 refusals）；API revision ready、console ready、follow 的 sync job Succeeded。image 前 12 碼：API `bcfffbc179ba`、Hosted `4831a800fced`、console `406e1b4a9bee`、feed `d9f3f853a89c`。public-sync run 45307801624 成功（09:48:57～09:53:03），`gate 2: PASS`，公開 tag `v2026.11.24-59`，公開樹 `eb9956f9`（與第一道指紋相同）。
+  - **Agent 版本（推論，未讀回）**：core 沒變，但 Hosted image digest 與第 58 版（`21c23324972d`）不同；依 `behavior_agent_versions.py` 的 definition hash 含 Hosted digest，推論 sync 發布了程式相同的新 Agent 版本。實際有沒有發布、哪些 Agent 換版，沒有讀 stage 的 job log，未讀回。
+  - **dev 測試**：dev 沒有遠端工作台，沒部署；用本機私人工作台（#1319 程式）連 dev，只用 A。完整報告見 #1320 本文「dev 測試報告」。小檔只附檔、文字框空白：送出鍵可按，助理回 7，存檔正常。真 Ctrl+V 貼上 18 KB（尾行「只回覆暗號」）：轉成附件，助理讀到附件，但視為附件內的指令而忽略（附件當資料，預期）。真 Ctrl+V 貼上 12 KB 會議紀錄、開頭請整理三點：助理照做，內容對得上。log 沒有 Traceback、AppExceptions、ERROR（API 沒有 HTTP status，不能統計 5xx）。訂閱本月累計 USD 1171.54（停損 1200 內）。
+  - **沒有驗證**：多附檔、圖片／PDF、附檔加文字的混合送出；送出失敗後文字框的狀態；只附檔的第一次送出不預熱 VM、不預取下一則 request ID（只影響速度）；stage 沒實測這個修正；stage 有沒有發布新 Agent 版本沒讀回；若有，換版後第一次讀取可能回 409 `NATIVE_SESSION_CHANGED`（前幾版見過），stage 沒驗。「貼上轉附件沒真 Ctrl+V」在 dev 已補測（stage 仍沒實測）。第 58 版以前的未驗證事項仍在（見 CURRENT-STATE）。
 <a id="stage-v58-1123"></a>
 ## 2026-11-23：stage 第 58 版（skill 上限 32 第二階段）
 

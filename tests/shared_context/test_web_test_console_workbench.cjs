@@ -11110,6 +11110,49 @@ test("owner skill draft: one confirmed save, then the list shows the owner's dra
   assert.equal(ui.calls.filter(call=>call.url.endsWith("/decisions")).length,0,"saving a draft never approves it");
 });
 
+// ADR-0014: a skill on the Team toolbox only fills the draft form; saving and approving stay the owner's steps.
+const toolboxSkill=(name,extra={})=>({name,skill_version:"1",description:"整理收據時使用",body:"# "+name+"\n步驟一",
+  sha256:"a".repeat(64),refusal:null,...extra});
+test("toolbox skills fill the draft form only, never save or approve, and refused ones cannot be picked",async()=>{
+  const ui=await openReviews();
+  ui.holder.templateResponses["/api/team-mcp/skills"]=reply({schema_version:"fa-team-toolbox-skills-v1",team_id:"team",
+    toolbox:"fa-team-team",default_version:"6",omitted:1,skills:[toolboxSkill("收據指南"),
+      {...toolboxSkill("多檔"),body:null,sha256:null,refusal:"multiple_files"}]});
+  ui.click("skill-import-read");await settleReviews(ui);
+  assert.equal(ui.calls.filter(call=>call.url==="/api/team-mcp/skills").length,1);
+  assert.equal(ui.text("skill-import-note"),
+    "toolbox 預設版本（第 6 版）有 3 個 skill，1 個可以帶入（只列出前 2 個）。選一個會填進下方表單，確認後按「建立草稿」。");
+  const pick=ui.nodes.get("skill-import-pick");
+  assert.equal(pick.hidden,false);
+  assert.deepEqual(pick.children.map(node=>[node.textContent,node.disabled]),
+    [["選擇要帶入的 skill",false],["收據指南",false],["多檔（不能帶入：含 SKILL.md 以外的檔案，目前不支援）",true]]);
+  assert.deepEqual(pick.children.map(node=>node.value),["","0","1"]);
+  pick.value="1";pick.events.change();
+  assert.equal(ui.nodes.get("skill-new-title").value,"","a refused skill fills nothing");
+  pick.value="0";pick.events.change();
+  assert.deepEqual(["skill-new-title","skill-new-purpose","skill-new-body"].map(id=>ui.nodes.get(id).value),
+    ["收據指南","整理收據時使用","# 收據指南\n步驟一"]);
+  assert.match(ui.text("skill-new-note"),/已帶入 toolbox 的「收據指南」（skill 第 1 版）.*批准前不會生效/);
+  assert.equal(ui.nodes.get("skill-new-save").disabled,false);
+  assert.equal(draftPosts(ui).length,0,"picking never saves a draft");
+  assert.equal(ui.calls.some(call=>call.url.endsWith("/decisions")),false,"picking never approves");
+  ui.nodes.get("skill-new-title").value="我改過的標題";
+  pick.value="0";pick.events.change();await ui.answer(false);
+  assert.equal(ui.nodes.get("skill-new-title").value,"我改過的標題","declining keeps what the owner typed");
+  pick.value="0";pick.events.change();await ui.answer(true);
+  assert.equal(ui.nodes.get("skill-new-title").value,"收據指南","confirming replaces the form");
+  ui.nodes.get("skill-new-title").value="我改過的標題";
+  pick.value="0";pick.events.change();
+  for(let i=0;i<20&&ui.nodes.get("page-confirm").hidden;i++)await ui.tick();
+  vm.runInContext("clearSkillImports()",ui.context);
+  await ui.answer(true);
+  assert.equal(ui.nodes.get("skill-new-title").value,"我改過的標題","a list dropped while asking (sign-out, agent switch) fills nothing");
+  ui.holder.templateResponses["/api/team-mcp/skills"]={ok:false,json:async()=>({error:{code:"TEAM_MCP_OWNER_ONLY"}})};
+  ui.click("skill-import-read");await settleReviews(ui);
+  assert.equal(ui.nodes.get("skill-import-pick").hidden,true);
+  assert.match(ui.text("skill-import-note"),/只有這個 Team 的真人主人/);
+});
+
 test("owner skill draft: a lost reply keeps the form and resending sends the identical content",async()=>{
   const ui=await openReviews();
   fillSkillNew(ui);

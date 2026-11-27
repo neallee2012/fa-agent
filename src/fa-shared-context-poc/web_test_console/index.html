@@ -434,6 +434,9 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;margin:8px 0;backgr
 <p class="reason">批准後這份 skill 對整個 Team 生效；要讓某位助理用，到助理清單那位助理右側的 ⚙ → Skills 打開並套用到新對話。批准本身不會開到任何助理。停用和拒絕都保留原內容與紀錄。「刪除」讓 skill 從這個清單和每位助理的可選項消失；已選用它的助理之後讀不到它，開新對話會像停用時一樣被擋下並提示 skill 已變動。生效中的會先停用再刪除。刪除後不能放回清單，原內容與批准紀錄仍保存在系統裡。</p>
 <details id="skill-new"><summary>新增 skill（自己寫一份草稿）</summary>
 <p class="reason">建立的是未批准的草稿，會出現在下方清單；查看內容後按「批准」才生效。相同內容只會建立一次。要修改既有 skill，請在這裡寫新的一份，再用「批准並取代」換掉舊的。</p>
+<div class="skill-import"><button id="skill-import-read">從 Team toolbox 帶入</button>
+<select id="skill-import-pick" hidden aria-label="Team toolbox 上的 skill"></select>
+<p id="skill-import-note" class="reason" role="status"></p></div>
 <label for="skill-new-title">名稱（一行，64 字內）</label><input id="skill-new-title" maxlength="64" autocomplete="off">
 <label for="skill-new-purpose">用途（一行，助理依這段判斷何時使用；512 bytes 內）</label><input id="skill-new-purpose" autocomplete="off">
 <label for="skill-new-body">SKILL.md 本文（8 KiB 內）</label><textarea id="skill-new-body" rows="8"></textarea>
@@ -2367,7 +2370,7 @@ let skillReviews=null,skillReviewNext=null,skillReviewBusy="",skillReviewError=n
 const skillReviewViews=new Map(),skillDecisions=new Map();
 function clearSkillReviews(){
   skillReviewRevision++;skillReviews=null;skillReviewNext=null;skillReviewBusy="";skillReviewError=null;skillReplace=null;
-  skillReviewViews.clear();skillDecisions.clear();skillNewNote="";skillNewError=null;
+  skillReviewViews.clear();skillDecisions.clear();skillNewNote="";skillNewError=null;clearSkillImports();
 }
 function skillLive(revision,agent){
   return revision===skillReviewRevision&&agent===selectedAgent&&state.authentication==="AVAILABLE";
@@ -2626,7 +2629,69 @@ function saveSkillDraft(){
     if(skillLive(revision,agent)&&entry.status==="awaiting_decision")await readSkillView(entry.artifact_id,revision,agent);
   });
 }
+// ADR-0014: skills attached to the Team toolbox's default version. Picking one only fills this form; the owner still
+// saves the draft and approves it below, so approval binds FA's own copy.
+let skillImports=[],skillImportsDrawn=null,skillImportNote="",skillImportBusy=false,skillImportRevision=0;
+const SKILL_IMPORT_REFUSAL={unsupported_type:"不是 skill 參照",unavailable:"讀不到這個 skill",
+  too_large:"內容太大（SKILL.md 超過 8 KiB 或整包超過 64 KiB）",
+  multiple_files:"含 SKILL.md 以外的檔案，目前不支援",no_skill_md:"沒有 SKILL.md",invalid_name:"名稱要一行、64 字內",
+  invalid_purpose:"描述要一行、512 bytes 內",invalid_body:"本文不是 UTF-8 或含不可見字元"};
+function clearSkillImports(){skillImportRevision++;skillImports=[];skillImportNote="";skillImportBusy=false}
+async function readSkillImports(){
+  if(skillImportBusy)return;
+  const revision=++skillImportRevision,agent=selectedAgent;
+  skillImportBusy=true;skillImports=[];skillImportNote="讀取 Team toolbox…";renderSkillImport();
+  let value;
+  try{value=await teamMcpCall("/api/team-mcp/skills",undefined,agent)}
+  catch(error){
+    if(revision!==skillImportRevision)return;
+    skillImportBusy=false;skillImportNote=friendlyError(error?.code?error:{code:"LOCAL_OFFLINE"});renderSkillImport();
+    return;
+  }
+  if(revision!==skillImportRevision)return;
+  skillImportBusy=false;
+  skillImports=Array.isArray(value?.skills)?value.skills:[];
+  const total=skillImports.length+(value?.omitted||0),ready=skillImports.filter(item=>!item.refusal).length;
+  skillImportNote=value?.default_version==null?"這個 Team 還沒有 toolbox。":
+    !total?`toolbox 預設版本（第 ${value.default_version} 版）沒有掛 skill。`:
+    `toolbox 預設版本（第 ${value.default_version} 版）有 ${total} 個 skill，${ready} 個可以帶入`+
+    (value.omitted?`（只列出前 ${skillImports.length} 個）`:"")+"。選一個會填進下方表單，確認後按「建立草稿」。";
+  renderSkillImport();
+}
+function renderSkillImport(){
+  const pick=el("skill-import-pick");
+  el("skill-import-read").disabled=skillImportBusy||skillReviewBusy==="draft";
+  pick.disabled=skillReviewBusy==="draft";
+  pick.hidden=!skillImports.length;
+  text("skill-import-note",skillImportNote);
+  if(skillImportsDrawn===skillImports)return;
+  skillImportsDrawn=skillImports;
+  pick.replaceChildren();
+  const none=document.createElement("option");none.value="";none.textContent="選擇要帶入的 skill";pick.append(none);
+  skillImports.forEach((item,index)=>{
+    const option=document.createElement("option");option.value=String(index);option.disabled=Boolean(item.refusal);
+    option.textContent=item.refusal?`${item.name}（不能帶入：${SKILL_IMPORT_REFUSAL[item.refusal]||item.refusal}）`:item.name;
+    pick.append(option);
+  });
+  pick.value="";
+}
+async function pickSkillImport(){
+  const pick=el("skill-import-pick"),item=pick.value===""?null:skillImports[Number(pick.value)];
+  if(!item||item.refusal)return;
+  const filled=skillNewFiles.length||["skill-new-title","skill-new-purpose","skill-new-body"].some(id=>el(id).value.trim());
+  if(filled&&!await confirmInPage(`用 toolbox 的「${item.name}」取代表單目前的內容？\n已填的標題、描述、本文和附檔會被清掉。`)){
+    pick.value="";return;
+  }
+  pick.value="";
+  if(!skillImports.includes(item)||skillReviewBusy==="draft")return;
+  resetSkillNew();
+  el("skill-new-title").value=item.name;el("skill-new-purpose").value=item.description||"";el("skill-new-body").value=item.body;
+  skillNewError=null;
+  skillNewNote=`已帶入 toolbox 的「${item.name}」（skill 第 ${item.skill_version} 版）。確認內容後按「建立草稿」；批准前不會生效。`;
+  renderSkillNew();
+}
 function renderSkillNew(idle=settingsReady()&&!skillReviewBusy&&!settingsBusy){
+  renderSkillImport();
   const draft=skillNewDraft(),saving=skillReviewBusy==="draft";
   for(const id of ["skill-new-title","skill-new-purpose","skill-new-body","skill-new-files"])el(id).disabled=saving;
   el("skill-new-save").disabled=!idle||draft.problems.length>0;
@@ -9084,6 +9149,8 @@ for(const id of ["skill-new-title","skill-new-purpose","skill-new-body"])el(id).
 });
 el("skill-new-files").addEventListener("change",()=>readSkillNewFiles());
 el("skill-new-save").addEventListener("click",saveSkillDraft);
+el("skill-import-read").addEventListener("click",readSkillImports);
+el("skill-import-pick").addEventListener("change",pickSkillImport);
 el("team-mcp-read").addEventListener("click",()=>{
   if(el("team-mcp-read").disabled)return;
   teamMcpNote="";teamMcpError=null;teamMcpUnavailable=false;teamMcpTask("read",(revision,agent)=>loadTeamMcp(revision,agent));

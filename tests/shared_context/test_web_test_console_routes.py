@@ -51,6 +51,7 @@ ROUTES = [
     ("POST", "/api/team-skills/drafts"),
     ("GET", "/api/team-mcp/servers"),
     ("GET", "/api/team-mcp/connections"),
+    ("GET", "/api/team-mcp/skills"),
     ("POST", "/api/team-mcp/changes"),
     ("GET", "/api/team-connectors"),
     ("POST", "/api/team-connectors/changes"),

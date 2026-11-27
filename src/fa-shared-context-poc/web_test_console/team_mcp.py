@@ -11,11 +11,14 @@ import json
 import re
 
 from shared_context.team_mcp_wire import TeamMcpChange, TeamMcpChangeResult, TeamMcpConnections, TeamMcpView
+from shared_context.team_toolbox_skills import TeamToolboxSkills
 
 from .adapter import ConsoleError, PullAdapter, decode, owner_token, require, strict_json
 
 PREFIX = "/team-mcp/v1"
 MAX_READ_BYTES = 128 * 1024
+# The API's Team MCP response bound: up to eight SKILL.md bodies.
+MAX_SKILLS_BYTES = 256 * 1024
 MAX_CHANGE_BYTES = 16 * 1024
 _REQUEST_ID = re.compile(r"[a-f0-9]{32}")
 TEAM_MCP_ERRORS = frozenset({
@@ -80,6 +83,10 @@ class TeamMcp:
     def connections(self):
         return _decode(TeamMcpConnections, self.adapter.call("GET", "/connections", self._token())).model_dump(mode="json")
 
+    def skills(self):
+        raw = self.adapter.call("GET", "/skills", self._token(), limit=MAX_SKILLS_BYTES)
+        return _decode(TeamToolboxSkills, raw).model_dump(mode="json")
+
     def change(self, data):
         try:
             command = TeamMcpChange.model_validate_json(json.dumps(data))
@@ -133,6 +140,11 @@ def install_team_mcp_routes(app, requested_console):
     async def connections(request: Request, console=Depends(requested_console)):
         await read(request)
         return await run_in_threadpool(control(console).connections)
+
+    @app.get("/api/team-mcp/skills")
+    async def skills(request: Request, console=Depends(requested_console)):
+        await read(request)
+        return await run_in_threadpool(control(console).skills)
 
     @app.post("/api/team-mcp/changes")
     async def change(request: Request, console=Depends(requested_console)):

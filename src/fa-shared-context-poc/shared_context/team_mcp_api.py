@@ -170,6 +170,17 @@ def install_team_mcp_routes(app, composition, *, environ=None, foundry_factory=N
             raise
         return await _reply(request, lambda: service.connections(principal))
 
+    @router.get(PREFIX + "/skills")
+    async def skills(request: Request, principal=Depends(identity)):
+        try:
+            service._authorize(principal)
+            await _no_body_or_query(request)
+        except Problem as error:
+            if error.body["error"]["code"] in TEAM_MCP_ERRORS:
+                return _problem(error)
+            raise
+        return await _reply(request, lambda: service.toolbox_skills(principal))
+
     @router.post(PREFIX + "/changes")
     async def changes(request: Request, principal=Depends(identity)):
         try:
